@@ -59,7 +59,7 @@
 //! through the shared ETag store, (3) on the very entry `forge wait-checks`
 //! keeps; a tested base and a compare answer are kept once read ([`memo`]);
 //! every request is spaced, and a secondary-limit answer holds every later
-//! request host-wide until it clears ([`budget`]).
+//! request on that credential until it clears ([`budget`]).
 
 use super::evidence::{
     compare_usable, parse_tested_base, strip_validated_restamps, to_file_set, ChangedFile,
@@ -100,14 +100,16 @@ fn conditional<T>(
     store: Option<&Path>,
     read: impl FnOnce(&mut GhReads) -> Result<T, ReadError>,
 ) -> Result<T, String> {
-    budget::before_request()?;
+    let scope = budget::scope(nwo);
+    budget::before_request(&scope)?;
     let reads = GhReads::new(
         PathBuf::from(gh),
         None,
         store.map_or_else(PathBuf::new, Path::to_path_buf),
         Some(nwo),
     )?
-    .with_caller(CALLER);
+    .with_caller(CALLER)
+    .with_page_pacing(budget::pace);
     let mut reads = if store.is_some() {
         reads
     } else {
@@ -115,9 +117,9 @@ fn conditional<T>(
     };
     let out = read(&mut reads);
     match (&out, reads.secondary_retry_at()) {
-        (_, Some(at)) => budget::note_secondary(Some(at)),
+        (_, Some(at)) => budget::note_secondary(&scope, Some(at)),
         (Err(e), None) if crate::forge_call_stats::is_secondary_limit(None, e.reason()) => {
-            budget::note_secondary(None);
+            budget::note_secondary(&scope, None);
         }
         _ => {}
     }
@@ -130,8 +132,9 @@ fn conditional<T>(
 ///
 /// Paced, and refused without a request while a secondary-limit hold is in
 /// force ([`budget`], #11418).
-fn gh_api(gh: &str, args: &[&str]) -> Result<String, String> {
-    budget::before_request()?;
+fn gh_api(gh: &str, nwo: &str, args: &[&str]) -> Result<String, String> {
+    let scope = budget::scope(nwo);
+    budget::before_request(&scope)?;
     let out = crate::gh_invocation::GhInvocation::new(
         crate::gh_invocation::Operation::new(CALLER),
         crate::gh_invocation::AccessIntent::Read,
@@ -151,7 +154,7 @@ fn gh_api(gh: &str, args: &[&str]) -> Result<String, String> {
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         if crate::forge_call_stats::is_secondary_limit(None, &stderr) {
-            budget::note_secondary(None);
+            budget::note_secondary(&scope, None);
         }
         let trimmed = stderr.trim();
         let hint = if trimmed.is_empty() {
@@ -353,6 +356,7 @@ fn fetch_required(
     let query = "query($owner: String!, $name: String!, $ref: String!) { repository(owner: $owner, name: $name) { ref(qualifiedName: $ref) { branchProtectionRule { requiredStatusCheckContexts } } } }";
     let classic = match gh_api(
         gh,
+        nwo,
         &[
             "graphql",
             &format!("-fquery={query}"),
@@ -484,9 +488,9 @@ pub fn actions_job_id(app_slug: Option<&str>, details_url: Option<&str>) -> Opti
 /// (#9057). A `gh` predating the flag rejects it, so retry without it.
 fn fetch_job_log(gh: &str, nwo: &str, job_id: u64) -> Result<String, String> {
     let path = format!("repos/{nwo}/actions/jobs/{job_id}/logs");
-    match gh_api(gh, &[&path, "--allow-escape-sequences"]) {
+    match gh_api(gh, nwo, &[&path, "--allow-escape-sequences"]) {
         Err(e) if crate::ci_telemetry::api::mentions_unknown_escape_flag(&e) => {
-            gh_api(gh, &[&path])
+            gh_api(gh, nwo, &[&path])
         }
         other => other,
     }
@@ -496,6 +500,7 @@ fn fetch_job_log(gh: &str, nwo: &str, job_id: u64) -> Result<String, String> {
 fn fetch_pr_files(gh: &str, nwo: &str, pr: &str) -> Result<Vec<ChangedFile>, String> {
     let out = gh_api(
         gh,
+        nwo,
         &[
             &format!("repos/{nwo}/pulls/{pr}/files"),
             "--paginate",
@@ -532,6 +537,7 @@ fn fetch_compare(
 ) -> Result<(String, Vec<ChangedFile>), String> {
     let out = gh_api(
         gh,
+        nwo,
         &[
             &format!("repos/{nwo}/compare/{base}...{head}"),
             "--jq",
@@ -583,6 +589,7 @@ fn fetch_compare(
 fn fetch_pr_ci_file(gh: &str, nwo: &str, pr: &str) -> Result<Option<ChangedFile>, String> {
     let out = gh_api(
         gh,
+        nwo,
         &[
             &format!("repos/{nwo}/pulls/{pr}/files"),
             "--paginate",
@@ -636,6 +643,7 @@ fn pr_ci_scope(gh: &str, nwo: &str, pr: &str, head_sha: &str, pr_files: &[Change
 fn fetch_workflow(gh: &str, nwo: &str, sha: &str) -> Result<String, String> {
     gh_api(
         gh,
+        nwo,
         &[
             "-H",
             "Accept: application/vnd.github.raw",
@@ -817,6 +825,7 @@ fn compare_memoised(
 fn fetch_declaration(gh: &str, nwo: &str, tip_sha: &str) -> Result<String, String> {
     gh_api(
         gh,
+        nwo,
         &[
             "-H",
             "Accept: application/vnd.github.raw",

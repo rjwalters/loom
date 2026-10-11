@@ -620,7 +620,7 @@ pub(crate) fn repo_scope(cwd: Option<&Path>, target: &Target) -> String {
 }
 
 /// The forge host: the remote's, else `GH_HOST`, else `github.com`.
-fn host_scope(target: &Target) -> String {
+pub(crate) fn host_scope(target: &Target) -> String {
     target
         .host
         .clone()

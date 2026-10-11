@@ -128,10 +128,15 @@ The guard's live reads are cheap to repeat and cannot burst:
   it is sent every time.
 - The base a finished job tested, and a `compare` between two SHAs, are kept
   once read. A repeated run does not download the job logs again.
-- Requests are spaced 200 ms apart (`LOOM_STALE_CHECKS_MIN_GAP_MS` overrides;
-  `0` turns the spacing off).
+- Requests are spaced 200 ms apart, including later pages of a check-runs
+  read (`LOOM_STALE_CHECKS_MIN_GAP_MS` overrides; `0` turns the spacing off).
 - When GitHub answers with a secondary rate limit, the guard sends nothing more
-  until `retry-after` (else `x-ratelimit-reset`, else one minute). The hold is
-  host-wide, so the next merge pass fails closed at once instead of retrying.
+  on that credential until `retry-after`. Without `retry-after` it waits for
+  `x-ratelimit-reset` only when `x-ratelimit-remaining` is `0`, otherwise one
+  minute. A hold never lasts more than an hour, even if the stored value says
+  otherwise. The hold is per forge host, credential and repo owner, and is
+  shared by every process on the host. So the next merge pass on the same
+  credential fails closed at once instead of retrying. Another token or owner
+  is not held.
   The ledger records these answers as `secondary_limited`, apart from primary
   `rate_limited` (`loom-daemon forge calls`, column `2ND-LIM`).

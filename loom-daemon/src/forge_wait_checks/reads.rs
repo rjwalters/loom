@@ -91,6 +91,8 @@ pub struct GhReads {
     persist: bool,
     /// When the last secondary-limit refusal clears, epoch seconds (#11418).
     secondary_retry_at: Option<i64>,
+    /// Run before each check-runs page after the first.
+    page_pace: Option<fn()>,
 }
 
 impl GhReads {
@@ -119,6 +121,7 @@ impl GhReads {
             caller: CALLER,
             persist: true,
             secondary_retry_at: None,
+            page_pace: None,
         })
     }
 
@@ -130,8 +133,16 @@ impl GhReads {
         self
     }
 
+    /// Call `pace` before each check-runs page after the first, so a long
+    /// read does not burst (the merge guard's spacing, #11418).
+    #[must_use]
+    pub fn with_page_pacing(mut self, pace: fn()) -> Self {
+        self.page_pace = Some(pace);
+        self
+    }
+
     /// When GitHub's last secondary-limit refusal to these reads clears
-    /// (`retry-after`, else `x-ratelimit-reset`, else a minute), if any.
+    /// (see [`denial::retry_at`]), if any.
     #[must_use]
     pub fn secondary_retry_at(&self) -> Option<i64> {
         self.secondary_retry_at
@@ -197,6 +208,9 @@ impl GhReads {
         let mut page = 1;
         while (rows.len() as u64) < total && rows.len() == page * PER_PAGE {
             page += 1;
+            if let Some(pace) = self.page_pace {
+                pace();
+            }
             let body =
                 self.get(&format!("{base}&page={page}"), ops::CI_CHECK_RUNS_FOR_SHA, None)?;
             let more = parse(&body, "check-runs page")?;

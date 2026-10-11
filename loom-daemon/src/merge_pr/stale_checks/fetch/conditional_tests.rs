@@ -279,7 +279,7 @@ fn a_secondary_limit_holds_every_later_request_until_retry_after() {
     let error = fetch_check_runs(f.gh(), "o/r", SHA).unwrap_err();
     assert!(error.contains("secondary-rate-limit"), "{error}");
     let now = chrono::Utc::now().timestamp();
-    let until = budget::hold_until(now).expect("a hold is in force");
+    let until = budget::hold_until(&budget::scope("o/r"), now).expect("a hold is in force");
     assert!((now + 115..=now + 121).contains(&until), "{until} vs {now}");
 
     // The next read is refused without spawning gh at all.
@@ -290,7 +290,7 @@ fn a_secondary_limit_holds_every_later_request_until_retry_after() {
 
     // The hold is on disk, so another process on this host honours it too.
     budget::reset_for_test();
-    assert_eq!(budget::hold_until(now), Some(until));
+    assert_eq!(budget::hold_until(&budget::scope("o/r"), now), Some(until));
 }
 
 #[test]
@@ -300,7 +300,7 @@ fn a_secondary_limit_on_a_plain_read_holds_too() {
     f.refuse(log, 403, "", SECONDARY);
     assert!(tested_base(f.gh(), "o/r", 7, "f8f004b17").is_err());
     let now = chrono::Utc::now().timestamp();
-    assert!(budget::hold_until(now).is_some_and(|t| t > now + 50));
+    assert!(budget::hold_until(&budget::scope("o/r"), now).is_some_and(|t| t > now + 50));
     assert!(tested_base(f.gh(), "o/r", 8, "f8f004b17").is_err());
     assert_eq!(f.calls().len(), 1, "the second log was never asked for");
 }
@@ -315,18 +315,78 @@ fn a_primary_rate_limit_sets_no_secondary_hold() {
         r#"{"message":"API rate limit exceeded for installation."}"#,
     );
     assert!(fetch_check_runs(f.gh(), "o/r", SHA).is_err());
-    assert_eq!(budget::hold_until(chrono::Utc::now().timestamp()), None);
+    assert_eq!(budget::hold_until(&budget::scope("o/r"), chrono::Utc::now().timestamp()), None);
 }
 
 #[test]
 fn back_to_back_requests_are_spaced() {
     let _f = Forge::new();
-    budget::before_request().unwrap();
-    budget::before_request().unwrap();
+    budget::before_request("s").unwrap();
+    budget::before_request("s").unwrap();
     let slept = budget::slept_for_test();
     assert_eq!(slept.len(), 1, "{slept:?}");
     assert!(
         slept[0] > budget::DEFAULT_GAP / 2 && slept[0] <= budget::DEFAULT_GAP,
         "{slept:?}"
     );
+}
+
+#[test]
+fn a_hold_on_one_credential_or_owner_does_not_block_another() {
+    let f = Forge::new();
+    f.refuse(&runs_url(SHA), 403, "Retry-After: 120\r\n", SECONDARY);
+    assert!(fetch_check_runs(f.gh(), "o/r", SHA).is_err());
+    let now = chrono::Utc::now().timestamp();
+    assert!(budget::hold_until(&budget::scope("o/r"), now).is_some());
+
+    // Another owner (its own reader App installation) is not held.
+    assert_eq!(budget::hold_until(&budget::scope("p/r"), now), None);
+    let sent = f.calls().len();
+    let _ = fetch_base_tip(f.gh(), "p/r", "main", Some(f.store()));
+    assert!(f.calls().len() > sent, "the other owner's read was sent");
+
+    // Another token on the same owner is not held either.
+    let token_a = budget::scope_with("github.com", "default;aaaa", "o/r");
+    let token_b = budget::scope_with("github.com", "default;bbbb", "o/r");
+    budget::note_secondary(&token_a, Some(now + 120));
+    assert!(budget::hold_until(&token_a, now).is_some());
+    assert_eq!(budget::hold_until(&token_b, now), None);
+    assert!(budget::before_request(&token_b).is_ok());
+}
+
+#[test]
+fn a_secondary_limit_without_retry_after_holds_a_minute_not_until_the_primary_reset() {
+    let f = Forge::new();
+    let now = chrono::Utc::now().timestamp();
+    f.refuse(
+        &runs_url(SHA),
+        403,
+        &format!("X-Ratelimit-Remaining: 2000\r\nX-Ratelimit-Reset: {}\r\n", now + 3600),
+        SECONDARY,
+    );
+    assert!(fetch_check_runs(f.gh(), "o/r", SHA).is_err());
+    let until = budget::hold_until(&budget::scope("o/r"), now).expect("held");
+    assert!((now + 55..=now + 62).contains(&until), "{until} vs {now}");
+}
+
+#[test]
+fn a_stored_hold_past_the_cap_is_read_as_the_cap() {
+    let _f = Forge::new();
+    let scope = budget::scope("o/r");
+    let now = chrono::Utc::now().timestamp();
+    budget::plant_hold_for_test(&scope, now + 86_400);
+    assert!(budget::hold_file_for_test(&scope).is_some_and(|p| p.exists()));
+    assert_eq!(budget::hold_until(&scope, now), Some(now + 3600));
+    // Read back by a fresh process (memory cleared), the disk value is capped too.
+    budget::reset_for_test();
+    assert_eq!(budget::hold_until(&scope, now), Some(now + 3600));
+}
+
+#[test]
+fn later_check_runs_pages_are_spaced() {
+    let f = Forge::new();
+    f.serve(&runs_url(SHA), &page(150, 100, 0));
+    f.serve(&format!("{}&page=2", runs_url(SHA)), &page(150, 50, 100));
+    fetch_check_runs(f.gh(), "o/r", SHA).unwrap();
+    assert_eq!(budget::slept_for_test().len(), 1, "page 2 waited out the spacing");
 }
