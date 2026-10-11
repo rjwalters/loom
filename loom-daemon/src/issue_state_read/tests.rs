@@ -187,7 +187,8 @@ fn the_reply_wire_form_carries_no_credential_field() {
 
 fn uid() -> u32 {
     use std::os::unix::fs::MetadataExt;
-    std::fs::metadata("/proc/self").unwrap().uid()
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::metadata(dir.path()).unwrap().uid()
 }
 
 fn locked_dir() -> tempfile::TempDir {
