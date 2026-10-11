@@ -616,18 +616,14 @@ if [ "$PRIORITY_1" -eq 0 ] && [ "$PRIORITY_2" -eq 0 ]; then
       # must keep their Signed-off-by: trailer — use `git commit --amend --signoff`
       # when re-authoring a commit during the rebase. See defaults/docs/commit-signoff.md.
 
-      # Version-bearing-file sync gate (#7168, largely moot after #7743): no
-      # PR may carry an edit to a version-bearing file's value anymore (bumps
-      # are version-bump-on-merge.yml's job, once, after merge), so a rebase
-      # now lands exactly origin/main's values with nothing of yours to go
-      # stale. Kept as cheap defense-in-depth -- this path pushes directly,
-      # never through create-pr.sh. If it fires, that is an anomaly: do NOT
-      # hand-edit a version-bearing file or run `version.sh bump patch` --
-      # stop, do not push, report it on the PR.
+      # Version gate, then discard guard (#9282): both as in "PR Has Merge
+      # Conflicts" below. Either blocking: do NOT push.
       if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-check-gate.sh --fix-hint "then push."; then
-        echo "Aborting: version-bearing files are out of sync after rebase (see BLOCKER:/Fix: above) -- unexpected under #7743; report, do not hand-bump." >&2
         exit 1
       fi
+      loom-daemon forge rebase-guard --base origin/main; RG=$?
+      [ "$RG" = 0 ] && exit 1
+      [ "$RG" = 1 ] || echo "WARNING: rebase-guard gave no answer (rc=$RG) - pushing UNCHECKED (#9282)" >&2
       git push --force-with-lease
 
       # Comment but don't add labels
@@ -971,9 +967,12 @@ invisible until CI's "Installer Integration Tests" fails:
 ```bash
 # Run in the worktree, after `git rebase`, BEFORE `git push --force-with-lease`.
 if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-check-gate.sh --fix-hint "then push."; then
-  echo "Aborting: version-bearing files are out of sync after rebase (see BLOCKER:/Fix: above)." >&2
   exit 1
 fi
+# Discard guard (#9282), as in "PR Has Merge Conflicts": rc 0 = do NOT push.
+loom-daemon forge rebase-guard --base origin/main; RG=$?
+[ "$RG" = 0 ] && exit 1
+[ "$RG" = 1 ] || echo "WARNING: rebase-guard gave no answer (rc=$RG) - pushing UNCHECKED (#9282)" >&2
 git push --force-with-lease
 ```
 
@@ -1400,20 +1399,24 @@ git add <file>
 # Continue rebase after all conflicts resolved
 git rebase --continue
 
-# Version-bearing-file sync gate (#7168, largely moot after #7743): no PR may
-# carry an edit to a version-bearing file's value anymore (bumps are
-# version-bump-on-merge.yml's job, once, after merge), so a rebase now lands
-# exactly origin/main's values with nothing of yours to go stale. Kept as
-# cheap defense-in-depth -- this path pushes directly, never through
-# create-pr.sh. If it fires, that is an anomaly: do NOT hand-edit a
-# version-bearing file or run `version.sh bump patch` -- stop, do not push,
-# report it on the PR.
+# Version gate (#7168; largely moot after #7743, kept as defense-in-depth:
+# this path pushes directly, never through create-pr.sh). If it fires, do
+# NOT hand-edit a version-bearing file or run `version.sh bump patch` --
+# stop, do not push, report it on the PR.
 if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-check-gate.sh --fix-hint "then push."; then
   echo "Aborting: version-bearing files are out of sync after rebase (see BLOCKER:/Fix: above) -- unexpected under #7743; report, do not hand-bump." >&2
   exit 1
 fi
 
-# Force push (PR branch is safe to force push)
+# Discard guard (#9282): a rebase that "succeeded cleanly", CI-green, can still
+# drop a hand-made merge resolution or empty the PR. rc 0 = BLOCKED: do NOT
+# push, however urgent. Apply its Fix: (merge origin/main in instead of
+# rebasing) or stop and report its BLOCKER: on the PR. Other rc = no answer.
+loom-daemon forge rebase-guard --base origin/main; RG=$?
+[ "$RG" = 0 ] && exit 1
+[ "$RG" = 1 ] || echo "WARNING: rebase-guard gave no answer (rc=$RG) - pushing UNCHECKED (#9282)" >&2
+
+# Force push
 git push --force-with-lease
 
 # Verify CI passes after rebase
@@ -1479,9 +1482,9 @@ When you **only** resolve merge conflicts without making substantive code change
 
 <!-- loom:conflict-only -->
 
-Changes:
-- Resolved conflicts in `src/foo.ts` (accepted upstream changes)
-- Resolved conflicts in `package-lock.json` (regenerated)
+Head before resolution: `<sha>`. Per conflicted file, the side kept and why:
+- `src/foo.ts`: kept main's side, because <reason>
+- `package-lock.json`: regenerated, because <reason>
 
 No substantive code changes made - only conflict resolution.
 EOF

@@ -227,6 +227,25 @@ esac
 STUB
 chmod +x "$STUB_DIR/git"
 
+# --- Stub loom-daemon on PATH (#9282) ---
+#   loom-daemon forge rebase-guard ... -> record + exit $LOOM_TEST_GUARD_EXIT
+#   (default 1 = verified safe; 0 = blocked, with a token; else = no answer).
+# git is a stub here, so the child's "remote head carries a hand-resolved
+# merge" is the verb's ANSWER, not a git shape: the shapes themselves are
+# covered against real git in loom-daemon/src/rebase_guard/tests.rs.
+cat > "$STUB_DIR/loom-daemon" <<'STUB'
+#!/usr/bin/env bash
+echo "loom-daemon $*" >> "${LOOM_TEST_STUB_DIR:?}/daemon-calls.log"
+rc="${LOOM_TEST_GUARD_EXIT:-1}"
+if [[ "$rc" == "0" ]]; then
+  echo "RESOLUTION_DISCARDED 0123abc"
+  echo "BLOCKER: rebase-guard (stub)" >&2
+fi
+exit "$rc"
+STUB
+chmod +x "$STUB_DIR/loom-daemon"
+unset LOOM_DAEMON_BIN
+
 export LOOM_TEST_STUB_DIR="$STUB_DIR"
 export PATH="$STUB_DIR:$PATH"
 
@@ -257,15 +276,18 @@ clear_ls_remote_sha() { rm -f "$STUB_DIR/ls-remote-sha"; }
 reset_state() {
     : > "$STUB_DIR/gh-calls.log"
     : > "$STUB_DIR/git-calls.log"
+    : > "$STUB_DIR/daemon-calls.log"
     DRY_RUN=false
     RSC_FAILURE=0
     unset LOOM_TEST_REBASE_EXIT
+    unset LOOM_TEST_GUARD_EXIT
     unset LOOM_TEST_PUSH_EXIT
     clear_rev_parse_sha
     clear_ls_remote_sha
 }
 read_gh()  { cat "$STUB_DIR/gh-calls.log" 2>/dev/null || true; }
 read_git() { cat "$STUB_DIR/git-calls.log" 2>/dev/null || true; }
+read_daemon() { cat "$STUB_DIR/daemon-calls.log" 2>/dev/null || true; }
 
 echo "Testing _rebase_stacked_children behavior..."
 
@@ -298,6 +320,9 @@ assert_contains "$(read_git)" "git push --force-with-lease" \
 assert_not_contains "$(read_gh)" "pr edit" "(c) Safe stale child -> PR base NOT retargeted"
 assert_eq "" "$(read_gh)" "(c) Safe stale child -> no deferred comment"
 assert_eq "0" "$RSC_FAILURE" "(c) Safe stale child -> RSC_FAILURE stays 0"
+assert_contains "$(read_daemon)" \
+  "loom-daemon forge rebase-guard --base origin/feature/issue-100 --old origin/feature/issue-201 --new feature/issue-201" \
+  "(c) Safe stale child -> rebase-guard asked about the head the push replaces (#9282)"
 
 # (c2) Same as (c), but version-check-gate.sh (real script, #7168) reports a
 #      mismatch via LOOM_VERSION_CHECK_SCRIPT -> rebase runs, but the push is
@@ -336,7 +361,47 @@ clear_uptodate "feature/issue-201"   # stale
 _rebase_stacked_children "feature/issue-100"
 assert_eq "0" "$RSC_FAILURE" "(c3) Dry-run -> version-check-gate skipped, RSC_FAILURE stays 0"
 unset LOOM_VERSION_CHECK_SCRIPT
+assert_eq "" "$(read_daemon)" "(c3) Dry-run -> rebase-guard not asked either (#9282)"
 DRY_RUN=false
+
+# (c4) #9282: the child's remote head carries a hand-resolved merge the rebase
+#      flattened -> rebase-guard answers BLOCKED (rc 0): the rebase ran, the
+#      push is NEVER attempted, and this child fails with RSC_FAILURE=2.
+reset_state
+export LOOM_TEST_GUARD_EXIT=0
+write_prlist "feature/issue-100" '[{"number":501,"headRefName":"feature/issue-201"}]'
+clear_uptodate "feature/issue-201"   # stale
+OUT_C4_FILE="$(mktemp)"
+_rebase_stacked_children "feature/issue-100" >"$OUT_C4_FILE" 2>&1
+OUT_C4="$(cat "$OUT_C4_FILE")"
+rm -f "$OUT_C4_FILE"
+assert_contains "$(read_git)" "git rebase -- origin/feature/issue-100 feature/issue-201" \
+  "(c4) Discarded resolution -> rebase still ran"
+assert_not_contains "$(read_git)" "git push" \
+  "(c4) Discarded resolution -> push NEVER attempted"
+assert_eq "2" "$RSC_FAILURE" "(c4) Discarded resolution -> RSC_FAILURE=2"
+assert_contains "$OUT_C4" "RESOLUTION_DISCARDED" "(c4) The verb's finding is surfaced"
+assert_contains "$OUT_C4" "Not pushing 'feature/issue-201'" \
+  "(c4) Failure is reported against the child branch"
+
+# (c5) #9282: rebase-guard gives NO answer (a loom-daemon predating the verb
+#      exits 2) -> a loud warning, and the push still happens: a script newer
+#      than the installed binary must not strand every stacked rebase.
+reset_state
+export LOOM_TEST_GUARD_EXIT=2
+write_prlist "feature/issue-100" '[{"number":501,"headRefName":"feature/issue-201"}]'
+clear_uptodate "feature/issue-201"   # stale
+OUT_C5_FILE="$(mktemp)"
+_rebase_stacked_children "feature/issue-100" >"$OUT_C5_FILE" 2>&1
+OUT_C5="$(cat "$OUT_C5_FILE")"
+rm -f "$OUT_C5_FILE"
+assert_contains "$OUT_C5" "rebase-guard gave no answer (rc=2) for 'feature/issue-201'" \
+  "(c5) Unanswered guard -> warned, naming the exit code and the child"
+assert_contains "$OUT_C5" "UNCHECKED" "(c5) Unanswered guard -> the warning says the push is unchecked"
+assert_contains "$(read_git)" "git push --force-with-lease" \
+  "(c5) Unanswered guard -> push still attempted (non-blocking)"
+assert_eq "0" "$RSC_FAILURE" "(c5) Unanswered guard -> RSC_FAILURE stays 0"
+unset LOOM_TEST_GUARD_EXIT
 
 # (d) One stale, unsafe child (issue 202 loom:building) -> deferred comment, no rebase.
 reset_state

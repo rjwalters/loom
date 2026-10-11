@@ -1248,40 +1248,35 @@ if [ "$MERGE_STATE" = "DIRTY" ]; then
 
     git fetch origin main
 
-    # Commits ahead pre-rebase, for the payload-drop guard below (#8298).
-    PRE_REBASE_AHEAD=$(git rev-list --count origin/main..HEAD)
-
     # Attempt rebase
     if git rebase origin/main; then
-        # Version-bearing-file sync gate (#7168/#7341, moot after #7743): gate
-        # BEFORE push since this auto-rebase pushes directly. On failure,
-        # never hand-patch the version-bearing files yourself or run
-        # `version.sh bump` -- fall back below instead.
+        # Version gate (#7168/#7341, moot after #7743), BEFORE this direct
+        # push. On failure, never hand-patch the version-bearing files yourself
+        # or run `version.sh bump` -- fall back below instead.
         GATE_OK=true
         if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-check-gate.sh --fix-hint "then push."; then
             echo "Version-bearing files out of sync after rebase (see BLOCKER:/Fix: above) - falling back to change request"
             GATE_OK=false
         fi
-        # Payload-drop guard (#8298): rebase succeeded but the tree is now
-        # identical to origin/main, silently dropping this PR's content (only
-        # flagged when the branch had real commits ahead pre-rebase).
-        if [ "$GATE_OK" = true ] && [ "$PRE_REBASE_AHEAD" -gt 0 ] && git diff --quiet origin/main HEAD; then
-            echo "Rebase silently dropped PR payload (empty diff vs origin/main) - falling back to change request"
-            GATE_OK=false
+        # Discard guard (#9282, was #8298): rc 0 = BLOCKED -- a clean, CI-green
+        # rebase can still empty the PR or drop a hand-made merge resolution.
+        if [ "$GATE_OK" = true ]; then
+            loom-daemon forge rebase-guard --base origin/main; RG=$?
+            [ "$RG" = 0 ] && GATE_OK=false
+            [ "$RG" -le 1 ] || echo "WARNING: rebase-guard gave no answer (rc=$RG) - pushing UNCHECKED (#9282)" >&2
         fi
-        # Rebase succeeded - push changes
         if [ "$GATE_OK" = true ] && git push --force-with-lease; then
             echo "Rebase successful - proceeding with evaluation"
             gh pr comment $PR_NUMBER --body "🔀 Automatically rebased branch to resolve merge conflicts. Proceeding with code evaluation."
             # Continue with normal evaluation
         else
-            echo "Push failed - falling back to change request"
+            echo "Not pushed - falling back to change request"
             git rebase --abort 2>/dev/null || true
             # Fall back: merge-conflict + changes-requested
             ./.loom/scripts/post-verdict.sh $PR_NUMBER changes-requested "$VERDICT_SHA" --body "$(cat <<'EOF'
 ❌ **Changes Requested - Merge Conflict**
 
-Automated rebase succeeded but push failed (possibly due to branch protection or concurrent changes).
+Automated rebase succeeded but was not pushed: the push failed, or `loom-daemon forge rebase-guard --base origin/main` found it would discard PR content (then merge `origin/main` in instead of rebasing).
 
 Please rebase your branch manually and push:
 ```bash
@@ -1329,7 +1324,7 @@ fi
 | Concurrent push during rebase | `--force-with-lease` fails safely, fall back |
 | Detached HEAD after checkout | Skip rebase, fall back to change request |
 | Rebase succeeds but CI may fail | Continue to evaluation - CI verification handles this |
-| Rebase succeeds but diff vs `origin/main` is empty | Payload-drop guard fires (#8298); fall back to change request |
+| Rebase would empty the PR or drop a hand-made merge resolution | `rebase-guard` blocks (#9282); fall back to change request |
 
 ### If BEHIND: Attempt Rebase
 
@@ -1338,13 +1333,15 @@ fi
 git fetch origin main
 git rebase origin/main
 
-# Version-bearing-file sync gate (#7168/#7341, moot after #7743) -- see
-# DIRTY path's gate above. On failure, abort and request changes naming
-# the file(s) to revert to origin/main's values.
+# Version gate, then discard guard (#9282) -- see DIRTY path. Either
+# blocking: do NOT push, even on an approved PR; use DIRTY's change-request
+# fallback and quote the BLOCKER:/Fix: (revert file(s) / merge, not rebase).
 if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-check-gate.sh --fix-hint "then push."; then
-  echo "Version-bearing files out of sync after rebase (see BLOCKER:/Fix: above) - aborting push"
   exit 1
 fi
+loom-daemon forge rebase-guard --base origin/main; RG=$?
+[ "$RG" = 0 ] && exit 1
+[ "$RG" = 1 ] || echo "WARNING: rebase-guard gave no answer (rc=$RG) - pushing UNCHECKED (#9282)" >&2
 
 # If rebase succeeds (no conflicts)
 git push --force-with-lease
@@ -1371,12 +1368,13 @@ echo "Branch rebased successfully, continuing evaluation"
 # git add <resolved-files>
 git rebase --continue
 
-# Version-bearing-file sync gate (#7168, extended #7341): same reasoning as
-# the DIRTY/BEHIND paths above -- gate before this direct push too.
+# Version gate, then discard guard (#9282): exactly as DIRTY/BEHIND above.
 if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-check-gate.sh --fix-hint "then push."; then
-  echo "Version-bearing files out of sync after rebase (see BLOCKER:/Fix: above) - aborting push"
   exit 1
 fi
+loom-daemon forge rebase-guard --base origin/main; RG=$?
+[ "$RG" = 0 ] && exit 1
+[ "$RG" = 1 ] || echo "WARNING: rebase-guard gave no answer (rc=$RG) - pushing UNCHECKED (#9282)" >&2
 
 git push --force-with-lease
 gh pr comment <number> --body "🔀 Rebased branch and resolved merge conflict (both sides added entries to config)"

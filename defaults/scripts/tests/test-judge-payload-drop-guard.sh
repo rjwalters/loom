@@ -1,17 +1,24 @@
 #!/usr/bin/env bash
-# test-judge-payload-drop-guard.sh - Behavioral coverage for issue #8298.
+# test-judge-payload-drop-guard.sh - Behavioral coverage for issues #8298
+# and #9282.
 #
 # THE FAILURE MODE THIS GUARDS AGAINST
 #
 # judge.md's "If DIRTY: Attempt Automated Rebase" workflow runs
 # `git rebase origin/main` and, on exit 0, proceeds straight to
 # `git push --force-with-lease`. The incident: two independent single-line
-# edits on adjacent lines with no separating context in the same file
-# (`.loom/install-metadata.json`'s `loom_version` line and `loom_commit`
-# line) let git's own cherry-equivalence detection ("skipped previously
-# applied commit") silently drop the PR branch's commit during rebase --
-# `git rebase` reports success (exit 0, no conflict) but the resulting tree
-# is byte-identical to `origin/main`, discarding the PR's actual payload.
+# edits on adjacent lines of `.loom/install-metadata.json` (`loom_version`
+# and `loom_commit`), a path carrying `merge=ours`, so the replayed PR commit
+# resolves to nothing -- `git rebase` reports success (exit 0, no conflict)
+# but the resulting tree is byte-identical to `origin/main`, discarding the
+# PR's actual payload.
+#
+# Since #9282 the block no longer carries its own empty-diff predicate: it
+# asks `loom-daemon forge rebase-guard`, which also reports a hand-made merge
+# resolution the rebase dropped. This suite covers the WIRING -- what the
+# block does with each of the verb's three answers -- through a stub on PATH.
+# What the verb itself answers for which git shape is covered by the Rust
+# fixtures in loom-daemon/src/rebase_guard/tests.rs.
 #
 # WHAT THIS SUITE DOES
 #
@@ -21,14 +28,17 @@
 # in judge.md and RUNS it (real `git`, stubbed `gh`/`post-verdict.sh`)
 # against purpose-built git fixtures:
 #
-#   1. The exact repro shape (#8298): a rebase that git silently drops via
-#      cherry-equivalence must be caught by the new payload-drop guard --
-#      the push must never happen, and the SAME merge-conflict fallback
-#      (`loom:merge-conflict` + `loom:changes-requested`) already used for
-#      "rebase failed (complex conflicts)" must fire.
+#   1. The exact repro shape (#8298): a rebase that silently empties the PR
+#      must be blocked -- the push must never happen, and the SAME
+#      merge-conflict fallback (`loom:merge-conflict` +
+#      `loom:changes-requested`) already used for "rebase failed (complex
+#      conflicts)" must fire.
 #   2. The common case: a genuinely successful rebase (real content
 #      difference vs origin/main afterward) must be UNAFFECTED -- push still
 #      proceeds, no false positive.
+#   3. RESOLUTION_DISCARDED (#9282) blocks the push the same way.
+#   4. An unanswered guard (a daemon predating the verb) warns loudly and
+#      does NOT block the push.
 #
 # Hermetic: local git fixtures (a local bare "origin") under a private
 # TMPDIR. No forge, no network.
@@ -109,11 +119,13 @@ FENCE_SRC="$(awk '
     infence { print }
 ' "$JUDGE_MD")"
 
-if [[ -z "$FENCE_SRC" || "$FENCE_SRC" != *"PRE_REBASE_AHEAD"* ]]; then
-    echo "FATAL: could not extract the DIRTY-rebase fence (with the #8298 guard) from $JUDGE_MD" >&2
+if [[ -z "$FENCE_SRC" || "$FENCE_SRC" != *"forge rebase-guard --base origin/main"* ]]; then
+    echo "FATAL: could not extract the DIRTY-rebase fence (with the #9282 rebase-guard call) from $JUDGE_MD" >&2
     exit 1
 fi
-pass "extracted the shipped DIRTY-rebase block (with PRE_REBASE_AHEAD) from judge.md"
+pass "extracted the shipped DIRTY-rebase block (with the rebase-guard call) from judge.md"
+assert_not_contains "$FENCE_SRC" "PRE_REBASE_AHEAD" \
+    "the block no longer carries its own inline empty-diff predicate (#9282)"
 
 # The first line is a literal `PR_NUMBER=<number>` placeholder for a human/
 # agent to fill in -- replace it with a real value so the block is runnable,
@@ -135,8 +147,8 @@ pass "the shipped DIRTY-rebase block parses as bash"
 # =====================================================================
 run_dirty_block() {
     # Runs the extracted block in $1 (a repo dir already checked out on the
-    # PR branch, with origin fetched). Stubs `gh` and `post-verdict.sh`;
-    # everything else (fetch/rebase/diff/push) is real git.
+    # PR branch, with origin fetched). Stubs `gh`, `post-verdict.sh` and
+    # `loom-daemon`; everything else (fetch/rebase/diff/push) is real git.
     local repo="$1"
     (
         cd "$repo" || exit 1
@@ -185,6 +197,25 @@ esac
 STUB
     chmod +x "$repo/.loom/stub-bin/gh"
 
+    # `loom-daemon forge rebase-guard` stand-in. GUARD_MODE picks the answer:
+    #   emptied (default) -- the verb's EMPTIED predicate in miniature: blocked
+    #                        (rc 0) when HEAD's tree equals the base's, else
+    #                        safe (rc 1);
+    #   discarded         -- RESOLUTION_DISCARDED, rc 0;
+    #   predates          -- clap's "unrecognized subcommand", rc 2.
+    cat > "$repo/.loom/stub-bin/loom-daemon" <<'STUB'
+#!/usr/bin/env bash
+echo "$*" >> "$(git rev-parse --show-toplevel 2>/dev/null)/daemon.calls"
+[[ "$1 $2 $3" == "forge rebase-guard --base" ]] || exit 64
+case "${GUARD_MODE:-emptied}" in
+    discarded) echo "RESOLUTION_DISCARDED 0123abc"; echo "BLOCKER: stub" >&2; exit 0 ;;
+    predates) echo "error: unrecognized subcommand 'rebase-guard'" >&2; exit 2 ;;
+esac
+if git diff --quiet "$4" HEAD; then echo "EMPTIED"; echo "BLOCKER: stub" >&2; exit 0; fi
+exit 1
+STUB
+    chmod +x "$repo/.loom/stub-bin/loom-daemon"
+
     printf '%s' "$repo"
 }
 
@@ -192,9 +223,9 @@ WORKROOT="$(mktemp -d)"
 trap 'rm -rf "$WORKROOT"' EXIT
 
 # =====================================================================
-# Case 1: the #8298 repro shape -- git's own cherry-equivalence detection
-# silently drops the PR commit during rebase (adjacent single-line JSON
-# edits, no separating context, resolving to a content-identical patch).
+# Case 1: the #8298 repro shape -- adjacent single-line JSON edits on a
+# `merge=ours` path, so the replayed PR commit resolves to nothing and the
+# rebase drops it while reporting success.
 # =====================================================================
 echo
 echo "--- #8298 repro: rebase silently drops the PR's payload ---"
@@ -202,6 +233,8 @@ echo "--- #8298 repro: rebase silently drops the PR's payload ---"
 BASE1="$WORKROOT/case1"
 REPO1="$(make_fixture "$BASE1")"
 
+echo "install-metadata.json merge=ours" > "$REPO1/.gitattributes"
+(cd "$REPO1" && git config merge.ours.driver true)
 cat > "$REPO1/install-metadata.json" <<'EOF'
 {
   "loom_version": "1.1",
@@ -224,12 +257,12 @@ EOF
 (cd "$REPO1" && git checkout -q main)
 cat > "$REPO1/install-metadata.json" <<'EOF'
 {
-  "loom_version": "1.1",
-  "loom_commit": "bbbb"
+  "loom_version": "1.2",
+  "loom_commit": "aaaa"
 }
 EOF
 (cd "$REPO1" && GIT_AUTHOR_DATE="2026-01-02T00:00:00" GIT_COMMITTER_DATE="2026-01-02T00:00:00" \
-    git commit -qam "chore: resync installed Loom surfaces (main)" && git push -q origin HEAD:main)
+    git commit -qam "chore: bump version (main)" && git push -q origin HEAD:main)
 
 (cd "$REPO1" && git checkout -q feature/issue-999)
 PRE_AHEAD="$(cd "$REPO1" && git rev-list --count origin/main..HEAD 2>/dev/null || echo "?")"
@@ -237,12 +270,18 @@ assert_eq "1" "$PRE_AHEAD" "sanity: the PR branch carries one real commit ahead 
 
 OUT1="$(run_dirty_block "$REPO1" 2>&1)"
 
-assert_contains "$OUT1" "Rebase silently dropped PR payload" \
-    "the payload-drop guard fires and logs why"
+assert_contains "$OUT1" "EMPTIED" \
+    "the guard's blocked answer is surfaced"
+assert_contains "$OUT1" "Not pushed - falling back to change request" \
+    "the block reports that it did not push"
 assert_not_contains "$OUT1" "Rebase successful - proceeding with evaluation" \
     "the success path never runs"
 assert_eq "0" "$(cd "$REPO1" && git rev-list --count origin/main..HEAD)" \
     "sanity: git really did collapse the branch to origin/main's content (the underlying hazard)"
+assert_contains "$(cat "$REPO1/daemon.calls" 2>/dev/null)" "forge rebase-guard --base origin/main" \
+    "the block asked loom-daemon forge rebase-guard"
+assert_eq "1" "$(git --git-dir="$BASE1/origin.git" rev-list --count main..feature/issue-999)" \
+    "the emptied branch was NOT pushed: origin still holds the PR's commit"
 
 CALLS1="$(cat "$REPO1/post-verdict.calls" 2>/dev/null || echo "")"
 assert_contains "$CALLS1" "changes-requested" \
@@ -286,8 +325,10 @@ OUT2="$(run_dirty_block "$REPO2" 2>&1)"
 
 assert_contains "$OUT2" "Rebase successful - proceeding with evaluation" \
     "the normal success path runs when the rebase genuinely changes content"
-assert_not_contains "$OUT2" "Rebase silently dropped PR payload" \
-    "the payload-drop guard does NOT fire on a real, non-empty rebase result (no false positive)"
+assert_not_contains "$OUT2" "Not pushed - falling back to change request" \
+    "the guard does NOT block a real, non-empty rebase result (no false positive)"
+assert_not_contains "$OUT2" "WARNING: rebase-guard gave no answer" \
+    "a safe answer (rc 1) is not reported as unanswered"
 
 POST_REBASE_DIFF_EMPTY2=0
 (cd "$REPO2" && git diff --quiet origin/main HEAD) && POST_REBASE_DIFF_EMPTY2=1
@@ -301,6 +342,71 @@ REMOTE_PR_HEAD2="$(git --git-dir="$BASE2/origin.git" rev-parse feature/issue-999
 LOCAL_HEAD2="$(cd "$REPO2" && git rev-parse HEAD)"
 assert_eq "$REMOTE_PR_HEAD2" "$LOCAL_HEAD2" \
     "the push actually landed on the (local, hermetic) origin -- the common case still pushes"
+
+# make_behind_fixture <workdir> -- the Case 2 shape: one real PR commit, main
+# moved in an unrelated file, so the rebase is clean and non-empty.
+make_behind_fixture() {
+    local repo
+    repo="$(make_fixture "$1")"
+    (
+        cd "$repo" || exit 1
+        echo "unrelated base content" > other.txt
+        git add -A && git commit -qm base && git push -q origin HEAD:main
+        git checkout -qb feature/issue-999
+        echo "PR-only change" >> other.txt
+        git commit -qam "pr: add a line" && git push -qu origin feature/issue-999
+        git checkout -q main
+        echo "main-only change" > main-only.txt
+        git add -A && git commit -qam "main: unrelated file" && git push -q origin HEAD:main
+        git checkout -q feature/issue-999
+    ) >/dev/null
+    printf '%s' "$repo"
+}
+
+# =====================================================================
+# Case 3 (#9282): RESOLUTION_DISCARDED blocks the push exactly like EMPTIED,
+# on a rebase whose result is clean and non-empty.
+# =====================================================================
+echo
+echo "--- #9282: a dropped hand-made merge resolution blocks the push ---"
+
+BASE3="$WORKROOT/case3"
+REPO3="$(make_behind_fixture "$BASE3")"
+REMOTE_BEFORE3="$(git --git-dir="$BASE3/origin.git" rev-parse feature/issue-999)"
+
+OUT3="$(GUARD_MODE=discarded run_dirty_block "$REPO3" 2>&1)"
+
+assert_contains "$OUT3" "RESOLUTION_DISCARDED" "the guard's blocked answer is surfaced"
+assert_not_contains "$OUT3" "Rebase successful - proceeding with evaluation" \
+    "the success path never runs"
+assert_eq "$REMOTE_BEFORE3" "$(git --git-dir="$BASE3/origin.git" rev-parse feature/issue-999)" \
+    "the push never happened: origin's PR head is unchanged"
+assert_contains "$(cat "$REPO3/post-verdict.calls" 2>/dev/null)" "changes-requested" \
+    "falls back through the existing post-verdict.sh changes-requested path"
+assert_contains "$(cat "$REPO3/gh.calls" 2>/dev/null)" "loom:merge-conflict" \
+    "reuses the existing loom:merge-conflict label"
+
+# =====================================================================
+# Case 4 (#9282): an UNANSWERED guard does not block. A role prompt newer
+# than the installed binary must not strand every rebase in the fleet -- but
+# it must say, loudly, that the push went out unchecked.
+# =====================================================================
+echo
+echo "--- #9282: a daemon predating the verb warns and does not block ---"
+
+BASE4="$WORKROOT/case4"
+REPO4="$(make_behind_fixture "$BASE4")"
+
+OUT4="$(GUARD_MODE=predates run_dirty_block "$REPO4" 2>&1)"
+
+assert_contains "$OUT4" "WARNING: rebase-guard gave no answer (rc=2) - pushing UNCHECKED (#9282)" \
+    "the unanswered guard is reported loudly, with its exit code"
+assert_contains "$OUT4" "Rebase successful - proceeding with evaluation" \
+    "the push still proceeds (non-blocking by design)"
+assert_eq "$(cd "$REPO4" && git rev-parse HEAD)" "$(git --git-dir="$BASE4/origin.git" rev-parse feature/issue-999)" \
+    "the rebased head landed on origin"
+assert_eq "" "$(cat "$REPO4/post-verdict.calls" 2>/dev/null || echo "")" \
+    "no change request is posted for an unanswered guard"
 
 echo
 echo "Results: $TESTS_PASSED/$TESTS_RUN passed, $TESTS_FAILED failed"
