@@ -535,3 +535,51 @@ fn a_wedged_gh_fails_the_prless_hold_closed_without_a_label_edit() {
     let calls = calls(&log);
     assert!(position(&calls, "issue edit").is_none(), "no second timeout: {calls:?}");
 }
+
+/// #11437: the no-op hold writes its record and label on a cross-owner
+/// (2AMLogic-style) workspace whose only write credential is its own
+/// per-owner one; the process credential there is read-only. The hold goes
+/// through the registry facade and never re-vets with the process credential.
+#[test]
+#[serial]
+fn the_prless_hold_writes_on_a_cross_owner_root() {
+    use crate::credential_preflight::{clear_owner_root_registry, register_root_gh_config_dir};
+    use crate::write_scope_test_support::WritableRoot;
+
+    std::env::remove_var("LOOM_REPO");
+    clear_owner_root_registry();
+    let dir = tempdir().unwrap();
+    let base = std::fs::canonicalize(dir.path()).unwrap();
+    let root = base.join("2amlogic-root");
+    // Process credential: pull only. The owner's credential is registered.
+    let fixture = WritableRoot::read_only(&root, None);
+    let owner_dir = base.join("gh-config-2amlogic");
+    std::fs::create_dir_all(&owner_dir).unwrap();
+    register_root_gh_config_dir(&root, &owner_dir);
+
+    let view = view_answer(121);
+    let (mut reg, log, payloads) = registry(
+        &root,
+        &Script {
+            view: &view,
+            view_sleep: 0,
+            patch_exit: 0,
+        },
+    );
+    hold_at_threshold(&mut reg, 121);
+
+    assert!(reg.prless_retry_held(121));
+    let calls = calls(&log);
+    assert!(
+        position(&calls, "api -X PATCH repos/").is_some(),
+        "no body write on the cross-owner root: {calls:?}"
+    );
+    assert!(
+        position(&calls, "issue edit 121 --add-label loom:blocked --remove-label loom:issue")
+            .is_some(),
+        "no label edit on the cross-owner root: {calls:?}"
+    );
+    assert_eq!(patched_bodies(&payloads).len(), 1);
+    drop(fixture);
+    clear_owner_root_registry();
+}

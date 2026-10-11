@@ -180,8 +180,17 @@ pub fn maybe_run(gh_bin: &Path, root: &Path) -> Option<Report> {
     observer.finish(root, &report);
     log::info!("stale_blocked_release: {} — {} (#10556)", root.display(), report.summary());
     if let Some(f) = report.failed.first() {
-        let (n, root) = (report.failed.len(), root.display());
-        log::warn!("stale_blocked_release: {root} — {n} write(s) failed; #{}: {}", f.number, f.why);
+        let (n, slug) = (report.failed.len(), root.display().to_string());
+        // #11437: a persistent refusal repeats every pass; warn once per
+        // workspace per hour and count the repeats that were swallowed.
+        if let Some(suppressed) = failure_warn_due(&slug, Instant::now()) {
+            log::warn!(
+                "stale_blocked_release: {slug} — {n} write(s) failed; #{}: {} \
+                 ({suppressed} identical warning(s) suppressed in the last hour)",
+                f.number,
+                f.why
+            );
+        }
     }
     Some(report)
 }
@@ -190,7 +199,13 @@ pub fn maybe_run(gh_bin: &Path, root: &Path) -> Option<Report> {
 #[must_use]
 pub fn run_for_root(root: &Path, repo: Option<&str>, cfg: &Config) -> Report {
     let mut gather = GhStaleBlockedForge::new(root, repo);
-    let mut park = GhForge::new(root.to_path_buf(), repo.map(str::to_string));
+    // #11437: vet the park writes under the root's own credential, as the
+    // tick's gate and `GhReleaseForge` do — not the daemon process's.
+    let mut park = GhForge::for_root_credential(
+        root.to_path_buf(),
+        repo.map(str::to_string),
+        PathBuf::from(crate::gh_invocation::gh_bin()),
+    );
     let mut extra = GhReleaseForge::new(root, repo);
     let mut report = run(
         &mut gather,
@@ -204,6 +219,32 @@ pub fn run_for_root(root: &Path, repo: Option<&str>, cfg: &Config) -> Report {
         report.enumerate_error = Some(why);
     }
     report
+}
+
+/// Minimum seconds between two write-failure warnings for one workspace.
+pub const FAILURE_WARN_SECS: u64 = 3600;
+
+/// Per workspace: when it last warned, and repeats suppressed since.
+static FAILURE_WARNED: LazyLock<Mutex<HashMap<String, (Instant, u64)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// `Some(suppressed_since_last_warning)` when `slug` may warn at `now`
+/// (recording it); `None` (counting the suppression) otherwise.
+fn failure_warn_due(slug: &str, now: Instant) -> Option<u64> {
+    let mut map = FAILURE_WARNED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match map.get_mut(slug) {
+        Some((prev, count)) if now.duration_since(*prev).as_secs() < FAILURE_WARN_SECS => {
+            *count += 1;
+            None
+        }
+        entry => {
+            let suppressed = entry.map_or(0, |(_, c)| *c);
+            map.insert(slug.to_string(), (now, 0));
+            Some(suppressed)
+        }
+    }
 }
 
 /// Minimum seconds between two zero-row cross-checks of one repo.

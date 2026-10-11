@@ -106,3 +106,82 @@ fn cross_owner_root_write_is_vetted_under_the_roots_own_credential() {
     drop(fixture);
     clear_owner_root_registry();
 }
+
+/// #11437: the re-park body write and the label writes (`run_for_root`'s park
+/// forge) are vetted under the root's own credential too.
+#[test]
+#[serial_test::serial]
+fn park_forge_writes_are_vetted_under_the_roots_own_credential() {
+    use crate::operator_decision::cli::{Forge, GhForge};
+
+    clear_owner_root_registry();
+    let dir = tempfile::tempdir().unwrap();
+    let base = std::fs::canonicalize(dir.path()).unwrap();
+    let root = base.join("other-owner");
+    let fixture = WritableRoot::register(&root);
+    let owner_dir = base.join("gh-config-by-owner");
+    std::fs::create_dir_all(&owner_dir).unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let gh = owner_scoped_gh(bin.path(), &fixture.repo, &owner_dir);
+    let _env = GhBinEnv::set(&gh);
+    let refused =
+        |e: &Result<(), String>| e.as_ref().is_err_and(|m| m.contains("refusing the write"));
+
+    // CLI default: the process credential (`pull`) refuses, as before.
+    let mut cli = GhForge::new(root.clone(), None);
+    assert!(refused(&cli.set_body(1, "x")), "default stays process-credential");
+
+    // Cross-owner root, no registered credential: still refused.
+    let mut park = GhForge::for_root_credential(root.clone(), None, gh.clone());
+    assert!(refused(&park.set_body(1, "x")));
+
+    // With the owner's WRITE credential registered, neither the body nor the
+    // label writes are refused by the scope check (the fake `gh` then fails
+    // the write call itself, which is not a refusal).
+    register_root_gh_config_dir(&root, &owner_dir);
+    let mut park = GhForge::for_root_credential(root.clone(), None, gh.clone());
+    assert!(!refused(&park.set_body(1, "x")));
+    assert!(!refused(&park.add_labels(1, &["loom:blocked".to_string()])));
+    assert!(!refused(&park.remove_label(1, "loom:issue")));
+    // An explicit repo is vetted the same way.
+    let mut park =
+        GhForge::for_root_credential(root.clone(), Some(fixture.repo.clone()), gh.clone());
+    assert!(!refused(&park.set_body(1, "x")));
+    // The CLI default keeps vetting under the process credential.
+    let mut cli = GhForge::new(root.clone(), None);
+    assert!(refused(&cli.set_body(1, "x")), "CLI callers are unchanged");
+
+    // Negative: a root whose own credential is read-only still refuses.
+    let ro_root = base.join("ro-owner");
+    let ro = WritableRoot::read_only(&ro_root, None);
+    register_root_gh_config_dir(&ro_root, &owner_dir);
+    let mut park = GhForge::for_root_credential(ro_root, None, ro.gh.clone());
+    assert!(refused(&park.set_body(1, "x")), "read-only root credential refuses");
+
+    let scope = crate::write_scope::probe::CacheScope::GitHub;
+    if let Some(key) = crate::write_scope::probe::cache_key(None, &scope, &fixture.repo) {
+        let _ = std::fs::remove_file(
+            crate::write_scope::probe::cache_dir().join(format!("{key}.json")),
+        );
+    }
+    drop((fixture, ro));
+    clear_owner_root_registry();
+}
+
+/// #11437: the repeated write-failure warning is once per workspace per hour,
+/// and the next one reports how many were swallowed.
+#[test]
+fn failure_warning_is_rate_limited_per_workspace_with_a_counter() {
+    use super::{failure_warn_due, FAILURE_WARN_SECS};
+    use std::time::{Duration, Instant};
+
+    let t0 = Instant::now();
+    let slug = "/tmp/rate-limit-test-11437";
+    assert_eq!(failure_warn_due(slug, t0), Some(0));
+    assert_eq!(failure_warn_due(slug, t0 + Duration::from_secs(60)), None);
+    assert_eq!(failure_warn_due(slug, t0 + Duration::from_secs(120)), None);
+    assert_eq!(failure_warn_due("/tmp/other-11437", t0), Some(0));
+    let later = t0 + Duration::from_secs(FAILURE_WARN_SECS + 1);
+    assert_eq!(failure_warn_due(slug, later), Some(2));
+    assert_eq!(failure_warn_due(slug, later + Duration::from_secs(1)), None);
+}
