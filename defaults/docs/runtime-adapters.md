@@ -1514,9 +1514,6 @@ The sweep's total per tap is the fold of the parent rows and the phase rows
 
 Before attaching evidence, remove account names and host paths.
 
-Not covered yet: the escalated Claude Doctor attribution from #11359. Its
-record format has not landed, and the matching test is `#[ignore]`d.
-
 ### Bounding the metered backstop tier (issue #8555)
 
 The backstop tap is the only entry in a preference list with a **marginal
