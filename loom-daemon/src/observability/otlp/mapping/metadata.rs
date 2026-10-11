@@ -142,8 +142,8 @@ pub(super) fn phase_durations(entries: &[PhaseDuration]) -> Option<KeyValue> {
     ))
 }
 
-/// `loom.phase_tap_usage` (Issue #11488): one kvlist per `(role, tap)` for
-/// out-of-process phases. An unreported counter is an absent key, never `0`.
+/// `loom.phase_tap_usage` (Issue #11488): one kvlist per `(role, tap, model)`
+/// for out-of-process phases. An unreported counter is an absent key, never `0`.
 pub(super) fn phase_tap_usage(rows: &[PhaseTapUsageRow]) -> Option<KeyValue> {
     if rows.is_empty() {
         return None;

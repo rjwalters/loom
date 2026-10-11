@@ -1,7 +1,8 @@
 //! Per-phase tap usage on `sweep.outcome` (Issue #11488).
 //!
 //! The host-local outcome journal carries one [`PhaseTapAccounting`] row per
-//! `(role, tap)` for out-of-process phases (`worker run`, Issue #11360). The
+//! `(role, tap, model)` for out-of-process phases (`worker run`, Issue
+//! #11360). The
 //! paired telemetry record used to carry only a `tap_phase_keys` flag, which
 //! reaches SigNoz but cannot be counted or priced. [`PhaseTapUsageRow`] is the
 //! same row, flattened and with the launch record's model, built *from* the

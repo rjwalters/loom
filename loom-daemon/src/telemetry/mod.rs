@@ -952,9 +952,10 @@ pub struct SweepOutcomeRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub no_phase_cause: Option<NoPhaseCause>,
     /// Usage of out-of-process phases (`worker run`, Issues #11360/#11488),
-    /// one row per `(role, tap)`, built from the same rows the host-local
-    /// outcome journal carries. Absent (never an empty array) when no phase
-    /// ran out of process, so such a record serializes as it did before.
+    /// one row per `(role, tap, model)`, built from the same rows the
+    /// host-local outcome journal carries. Absent (never an empty array) when
+    /// no phase ran out of process, so such a record serializes as it did
+    /// before.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub phase_tap_usage: Vec<PhaseTapUsageRow>,
     /// 1-based count of terminal sweeps for this repo#issue in this host's
