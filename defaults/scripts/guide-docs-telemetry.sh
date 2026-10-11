@@ -199,6 +199,7 @@ case "$CMD" in
                 }
             }')"
         printf '%s\n' "$LINE" >> "$LOG_FILE"
+        # requires-daemon: telemetry optional   J2 shadow only (#11348): an absent or pre-#11348 binary fails the append, which `|| true` discards -- the legacy log line above is already written.
         printf '%s\n' "$LINE" | "${LOOM_DAEMON_BIN:-loom-daemon}" telemetry append --stream shell --workspace "$REPO_ROOT" >/dev/null 2>&1 || true  # J2 shadow, after legacy (#11348)
 
         print_success "recorded doc-maintenance telemetry for PR #${PR_NUMBER} -> $LOG_FILE"
