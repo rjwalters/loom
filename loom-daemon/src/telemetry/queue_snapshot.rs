@@ -88,6 +88,12 @@ pub struct QueueSnapshotRow {
     /// number (`open_pr`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// Why a `workspace_halted` row is held (#11417): the closed
+    /// `work_finder::halt_cause` vocabulary, same tokens as the SigNoz
+    /// `loom.queue.halt_cause` attribute. Absent on other dispositions and
+    /// when the cause is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub halt_cause: Option<String>,
     /// The dispatch-plan fields (Issue #9288), flattened beside `rank`:
     /// `position`, `plan_state`, `keys`, `gate`, `in_slice`, `hot`,
     /// `owning_shard`, `repo_cap`. The `keys` names are the seven
