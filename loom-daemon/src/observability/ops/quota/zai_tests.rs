@@ -116,3 +116,92 @@ fn error_display_never_carries_key_or_body() {
 async fn no_seats_means_no_rows_and_no_request() {
     assert!(sample(Vec::new()).await.is_empty());
 }
+
+// --- real fetch path against a controlled loopback endpoint ---------------
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+/// One-shot loopback server. Returns its URL and a handle yielding the raw
+/// request text. `reply` is the full raw response; `None` never answers.
+async fn serve_once(reply: Option<String>) -> (String, tokio::task::JoinHandle<String>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/quota", listener.local_addr().unwrap());
+    let handle = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = vec![0u8; 8192];
+        let mut req = Vec::new();
+        loop {
+            let n = sock.read(&mut buf).await.unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            req.extend_from_slice(&buf[..n]);
+            if req.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        match reply {
+            Some(r) => {
+                let _ = sock.write_all(r.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+            None => tokio::time::sleep(Duration::from_secs(5)).await,
+        }
+        String::from_utf8_lossy(&req).into_owned()
+    });
+    (url, handle)
+}
+
+fn http(status: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+fn client(timeout: Duration) -> reqwest::Client {
+    reqwest::Client::builder().timeout(timeout).build().unwrap()
+}
+
+#[tokio::test]
+async fn fetch_success_parses_and_sends_key_only_in_authorization_header() {
+    let key = "fake-zai-key-abc123";
+    let (url, server) = serve_once(Some(http("200 OK", BODY))).await;
+    let q = fetch_from(&client(Duration::from_secs(5)), &url, key)
+        .await
+        .unwrap();
+    assert_eq!(q.five_hour.unwrap().fraction, Some(0.25));
+    assert_eq!(q.weekly.unwrap().fraction, Some(0.25));
+
+    let request = server.await.unwrap();
+    let (request_line, headers) = request.split_once("\r\n").unwrap();
+    assert!(request_line.starts_with("GET /quota "));
+    assert!(!request_line.contains(key), "key must not be in the URL");
+    let carrying: Vec<&str> = headers.lines().filter(|l| l.contains(key)).collect();
+    assert_eq!(carrying.len(), 1, "key appears in exactly one header");
+    assert!(carrying[0]
+        .to_ascii_lowercase()
+        .starts_with("authorization:"));
+}
+
+#[tokio::test]
+async fn fetch_non_2xx_is_a_status_error_without_leaking() {
+    let key = "fake-zai-key-abc123";
+    let (url, _server) = serve_once(Some(http("503 Service Unavailable", "{}"))).await;
+    let err = fetch_from(&client(Duration::from_secs(5)), &url, key)
+        .await
+        .unwrap_err();
+    assert_eq!(err, ZaiError::Status(503));
+    let shown = format!("{err} {err:?}");
+    assert!(!shown.contains(key) && !shown.contains("127.0.0.1"));
+}
+
+#[tokio::test]
+async fn fetch_timeout_is_a_timeout_error() {
+    let (url, server) = serve_once(None).await;
+    let err = fetch_from(&client(Duration::from_millis(200)), &url, "fake-zai-key-abc123")
+        .await
+        .unwrap_err();
+    assert_eq!(err, ZaiError::Timeout);
+    server.abort();
+}

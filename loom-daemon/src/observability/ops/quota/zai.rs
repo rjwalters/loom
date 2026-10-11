@@ -228,8 +228,15 @@ impl ZaiCache {
 }
 
 async fn fetch(client: &reqwest::Client, key: &str) -> Result<ZaiQuota, ZaiError> {
+    fetch_from(client, QUOTA_URL, key).await
+}
+
+/// Test seam: the real fetch path against an injected `url`. Production only
+/// ever calls it with the fixed [`QUOTA_URL`] (there is deliberately no env or
+/// config override, so the key cannot be redirected to another host).
+async fn fetch_from(client: &reqwest::Client, url: &str, key: &str) -> Result<ZaiQuota, ZaiError> {
     let response = client
-        .get(QUOTA_URL)
+        .get(url)
         .header(reqwest::header::AUTHORIZATION, key)
         .send()
         .await
@@ -257,9 +264,11 @@ async fn fetch(client: &reqwest::Client, key: &str) -> Result<ZaiQuota, ZaiError
 static CACHE: Mutex<Option<ZaiCache>> = Mutex::new(None);
 
 /// A provisioned seat: its non-secret name, its key, and its bad-mark facts.
+/// `key` is `None` when the credential could not be read: the seat still gets
+/// an UNKNOWN row, but no request is attempted for it.
 pub struct Seat {
     pub name: String,
-    pub key: String,
+    pub key: Option<String>,
     pub marked_exhausted: bool,
     pub mark_resets_at: Option<DateTime<Utc>>,
 }
@@ -279,6 +288,10 @@ pub async fn sample(seats: Vec<Seat>) -> Vec<TokenAccountState> {
         let cache = guard.get_or_insert_with(ZaiCache::default);
         cache.retain(&names);
         for seat in &seats {
+            if seat.key.is_none() {
+                readings.insert(seat.name.clone(), None);
+                continue;
+            }
             match cache.cached(&seat.name, now) {
                 Some(reading) => {
                     readings.insert(seat.name.clone(), reading);
@@ -293,7 +306,7 @@ pub async fn sample(seats: Vec<Seat>) -> Vec<TokenAccountState> {
                 .iter()
                 .map(|seat| {
                     let client = client.clone();
-                    let key = seat.key.clone();
+                    let key = seat.key.clone().unwrap_or_default();
                     tokio::spawn(async move { fetch(&client, &key).await })
                 })
                 .collect();

@@ -1131,10 +1131,22 @@ fn sample_registry_provider_accounts(workspace_root: &Path) -> Vec<TokenAccountS
 }
 
 /// The enabled `zai` api-keys seats as quota-poll inputs. A seat whose key
-/// cannot be read is left out (its pool state still reaches the pool gauges
-/// through `ops::quota`); the key never leaves this struct.
+/// cannot be read is kept with `key: None` so it still gets an UNKNOWN row
+/// (no request is attempted); the key never leaves this struct.
 fn zai_seats(workspace_root: &Path) -> Vec<super::ops::quota::zai::Seat> {
-    use crate::api_keys_pool::{paths, registry, select, Ineligible};
+    zai_seats_with(workspace_root, |root, provider, name| {
+        crate::api_keys_pool::registry::read_credential(root, provider, name)
+            .map(|credential| credential.value)
+    })
+}
+
+/// [`zai_seats`] with an injectable credential reader (test seam for the
+/// read-failure path, which a well-formed on-disk seat cannot reach).
+fn zai_seats_with(
+    workspace_root: &Path,
+    read: impl Fn(&Path, &str, &str) -> Result<String, String>,
+) -> Vec<super::ops::quota::zai::Seat> {
+    use crate::api_keys_pool::{paths, select, Ineligible};
     let provider = super::ops::quota::zai::ZAI_PROVIDER;
     let roots = paths::pool_roots(workspace_root);
     let Ok(accounts) = select::list_accounts_in(&roots, Some(provider)) else {
@@ -1146,17 +1158,16 @@ fn zai_seats(workspace_root: &Path) -> Vec<super::ops::quota::zai::Seat> {
     accounts
         .into_iter()
         .filter(|account| account.enabled && account.ineligible != Some(Ineligible::Malformed))
-        .filter_map(|account| {
-            let credential =
-                registry::read_credential(&provider_root, provider, &account.name).ok()?;
-            Some(super::ops::quota::zai::Seat {
+        .map(|account| {
+            let key = read(&provider_root, provider, &account.name).ok();
+            super::ops::quota::zai::Seat {
                 marked_exhausted: account.ineligible == Some(Ineligible::Exhausted),
                 mark_resets_at: account
                     .resets_at
                     .and_then(|at| DateTime::<Utc>::from_timestamp(i64::try_from(at).ok()?, 0)),
                 name: account.name,
-                key: credential.value,
-            })
+                key,
+            }
         })
         .collect()
 }
