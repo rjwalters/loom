@@ -208,3 +208,23 @@ fn ingest_page_is_a_noop_when_off_and_records_when_on() {
     assert_eq!(lock().clock(), 2);
     configure(false, BASE);
 }
+
+#[test]
+fn a_forgotten_hold_polls_next_time_and_forgetting_an_unknown_workspace_is_a_no_op() {
+    // #11139 x #9255: a listing that fell short of the whole queue must not
+    // be served from the hold, so the work finder forgets it right after
+    // the poll; the next read polls again.
+    let mut g = gate(true);
+    let t0 = Instant::now();
+    poll(&mut g, PollReason::FirstPoll, vec![1, 2], t0);
+    assert_eq!(decide(&mut g, true, t0 + BASE), Decision::Skip);
+    g.forget_held(WS);
+    assert_eq!(g.held(WS), None);
+    assert_eq!(decide(&mut g, true, t0 + BASE), Decision::Poll(PollReason::FirstPoll));
+    g.forget_held("/ws/never-polled");
+    assert!(g
+        .snapshot(true, t0)
+        .workspaces
+        .iter()
+        .all(|w| w.workspace != "/ws/never-polled"));
+}

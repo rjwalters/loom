@@ -100,9 +100,21 @@ impl WorkSource for GhWorkSource {
         // gated.
         let repo = self.repo.clone();
         let cwd = self.cwd.clone();
-        crate::forge_events::poll_gate::gated_list(cwd.as_deref(), repo.as_deref(), || {
-            self.list_ready_issues_uncached()
-        })
+        let listed =
+            crate::forge_events::poll_gate::gated_list(cwd.as_deref(), repo.as_deref(), || {
+                self.list_ready_issues_uncached()
+            });
+        // #11139: a fresh listing that fell short is never held, so a gated
+        // tick cannot serve partial rows as the whole queue. (A held listing
+        // leaves `complete` at its per-tick default, `true`.)
+        if !self.complete {
+            crate::forge_events::poll_gate::forget_held(cwd.as_deref());
+        }
+        listed
+    }
+
+    fn listing_complete(&self) -> bool {
+        self.complete
     }
 }
 
@@ -183,10 +195,6 @@ impl GhWorkSource {
             });
         }
         Ok(items)
-    }
-
-    fn listing_complete(&self) -> bool {
-        self.complete
     }
 }
 

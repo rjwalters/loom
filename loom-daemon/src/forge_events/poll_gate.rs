@@ -256,6 +256,11 @@ impl<T: Clone> PollGate<T> {
 
     /// Record a successful poll. `fingerprint` summarizes the result so a
     /// hard-cap re-poll that changed it (with no event) counts as lossy.
+    // Each argument is one independent fact about the poll that just ran
+    // (which workspace, its repo, why it polled, the pre-poll event clock, the
+    // result and its fingerprint, when); a carrier struct would be built at the
+    // single production call site only to be taken apart here.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_poll(
         &mut self,
         key: &str,
@@ -295,6 +300,20 @@ impl<T: Clone> PollGate<T> {
                 gated: false,
             },
         );
+    }
+
+    /// Drop `key`'s held listing, so its next read polls (`FirstPoll`).
+    ///
+    /// A listing that fell short of the whole queue (#11139: a later page
+    /// failed, the page cap, a mid-walk change) must never be served from
+    /// the hold: a gated tick would report the partial rows as the complete
+    /// queue, and a consumer that reads a missing row as "left the queue"
+    /// would act on it.
+    pub fn forget_held(&mut self, key: &str) {
+        if let Some(ws) = self.workspaces.get_mut(key) {
+            ws.held = None;
+            ws.gated = false;
+        }
     }
 
     #[must_use]
@@ -403,6 +422,21 @@ fn repo_for_root(root: &std::path::Path) -> Option<String> {
     crate::forge_cmd::parse_nwo_from_remote_url(url.trim())
 }
 
+/// The gate's key for a workspace root (the one [`gated_list`] uses).
+fn workspace_key(root: Option<&std::path::Path>) -> String {
+    root.map_or_else(|| "<cwd>".to_string(), |r| r.display().to_string())
+}
+
+/// Forget `root`'s held listing after a poll whose listing was incomplete
+/// (#11139), so the next read polls rather than serving partial rows as the
+/// whole queue. A no-op while gating is off.
+pub fn forget_held(root: Option<&std::path::Path>) {
+    let mut gate = lock();
+    if gate.enabled() {
+        gate.forget_held(&workspace_key(root));
+    }
+}
+
 /// Run `list` (one workspace's discovery listing) under the gate.
 ///
 /// Gate off (the default), feed not `healthy`, or repo unresolvable: `list`
@@ -422,7 +456,7 @@ pub fn gated_list<E>(
         return list();
     }
     let healthy = super::global_state() == ForgeEventsState::Healthy;
-    let key = root.map_or_else(|| "<cwd>".to_string(), |r| r.display().to_string());
+    let key = workspace_key(root);
     let known_repo = lock().workspaces.get(&key).map(|ws| ws.repo.clone());
     let repo = repo_override
         .map(str::to_string)

@@ -120,6 +120,13 @@ fn gated_list_follows_the_feed_state_events_and_clamped_pages() {
         assert!(polled);
     }
 
+    // #11139: the work finder forgets a hold whose listing fell short of the
+    // whole queue; the next read polls instead of serving the partial rows.
+    assert!(!read(&[8]).1, "healthy and quiet: the hold is served");
+    forget_held(None);
+    assert!(read(&[8]).1, "a forgotten hold polls");
+    assert!(!read(&[8]).1, "and is held again once a whole listing is recorded");
+
     configure(false, BASE);
 }
 
