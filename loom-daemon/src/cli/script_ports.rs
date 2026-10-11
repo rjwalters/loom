@@ -421,13 +421,23 @@ pub(crate) enum ScriptPortCommand {
     /// manifest or an unrecognized `launch` key.
     RuntimeLaunchEnv(super::runtime_launch_cmd::RuntimeLaunchEnvArgs),
 
-    /// The fleet-wide `loom:blocked` re-check (#8927): every open
-    /// `loom:blocked` issue whose cited blocker has since closed/merged (a
-    /// stale block), plus every one carrying the label with no parseable
-    /// blocker reference at all (an undocumented block). The fourth pre-wave
-    /// advisory check, backing `check-stale-blocked.sh`. Strictly read-only,
-    /// **always exit 0** — it reports, it never relabels. Not a port: brand-new
-    /// logic, native from the start per the shell-language policy.
+    /// The per-repository `loom:blocked` re-check (#8927): one invocation
+    /// examines one repository (the one `--repo` / `--repo-root` resolves) and
+    /// reports every open `loom:blocked` issue or PR whose cited blocker has
+    /// since closed/merged (a stale block), plus every one carrying the label
+    /// with no parseable blocker reference at all (an undocumented block). The
+    /// fourth pre-wave advisory check, backing `check-stale-blocked.sh`.
+    /// Strictly read-only, **always exit 0** — it reports, it never relabels.
+    ///
+    /// Do not loop it across many repositories by hand (#9191): each
+    /// invocation is a fresh process with no rate-limit breaker (that exists
+    /// only in the running daemon), so a refusal stops nothing and reaches no
+    /// later repository, and the budget floor cannot see a GitHub secondary
+    /// rate limit. See `.loom/docs/github-authentication.md`
+    /// -> "Secondary rate limits and hand-rolled loops".
+    ///
+    /// Not a port: brand-new logic, native from the start per the
+    /// shell-language policy.
     CheckStaleBlocked(super::stale_blocked::StaleBlockedArgs),
 
     /// The `PreToolUse` decision for the `mcp__loom__*` tool namespace (#9108),
