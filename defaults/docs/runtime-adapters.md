@@ -1338,12 +1338,14 @@ Only native runtimes (`pi`, `opencode`, `kimi`) are checked, and only when the
 profile declares a provider for that harness. `loom-daemon validate` rejects an
 `excludedRoles` entry that is not a known role name.
 
-**GLM-first Doctor (this repo's committed config).** `.loom/config.json` sets
-`rolePreference.doctor` to `[{"runtime":"opencode","modelProfile":"zai-flash"},
-"claude"]`: a Doctor tick runs on a Z.ai seat while the `zai` api-keys pool has a
-selectable account, and falls through to Claude when it is dry. (A host with no
-`zai` accounts registered at all is *unobservable*, not dry — the tap is taken and
-the harness's own auth store is used; see the availability rule above.)
+**GLM-first Builder and Doctor (this repo's committed config).**
+`.loom/config.json` sets `rolePreference.builder` and `.doctor` to
+`[{"runtime":"opencode","modelProfile":"zai-flash"}, "claude"]` (a sweep's
+Builder phase resolves through it via `worker run`, #11303): the role runs on a
+Z.ai seat while the `zai` api-keys pool has a selectable account, else on Claude.
+A host with **no** `zai` pool counts as unavailable, not unobservable: guarded
+launches never reuse OpenCode's own login, so unless an exported key,
+`LOOM_NATIVE_AUTH_FILE`, or a gateway route supplies it, the tap is skipped.
 `rolePreference.judge` is `["codex", "claude"]`; `zai-flash`'s `excludedRoles`
 would skip a GLM Judge entry anyway. A machine-tier pin such as
 `runtimes.roles.doctor = "claude"` still wins outright.

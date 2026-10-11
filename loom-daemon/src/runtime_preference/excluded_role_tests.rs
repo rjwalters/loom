@@ -4,9 +4,12 @@
 //! binding, or an env pin.
 //!
 //! Hermetic: [`ClearedRuntimeEnv`] clears `LOOM_RUNTIME*`,
-//! `LOOM_MODEL_PROFILE` and `ZAI_API_KEY` / `ZHIPU_API_KEY` (#10767), so an
-//! exported key cannot make the `zai` pool stop being the wall.
+//! `LOOM_MODEL_PROFILE`, `ZAI_API_KEY` / `ZHIPU_API_KEY` (#10767),
+//! `LOOM_NATIVE_AUTH_FILE` and `LOOM_SHARED_API_KEYS_DIR`, so neither an
+//! exported key, an auth snapshot nor a host-wide pool can make the per-repo
+//! `zai` pool stop being the wall.
 use super::tests::{fixture, provision_claude_pool, write_config, ClearedRuntimeEnv};
+use super::unprovisioned_tests::provision_zai_pool;
 use super::{resolve_runtime, Decision, PreferenceSource, StaticReason};
 use crate::runtime_admission::{resolve_and_admit, RuntimeSource};
 use crate::worker_spawn::profiles::EXCLUDED_ROLE;
@@ -14,16 +17,6 @@ use std::path::Path;
 
 fn zai_tap() -> serde_json::Value {
     serde_json::json!({"runtime": "opencode", "modelProfile": "zai-flash"})
-}
-
-/// Register one `zai` api-key account, enabled or not.
-fn provision_zai_pool(root: &Path, enabled: bool) {
-    let pool = crate::api_keys_pool::paths::per_repo_api_keys_dir(root);
-    if !pool.join("zai/alpha.env").exists() {
-        crate::api_keys_pool::registry::add(&pool, "zai", "alpha", "ZAI_API_KEY", "fake", false)
-            .unwrap();
-    }
-    crate::api_keys_pool::registry::set_enabled(&pool, "zai", "alpha", enabled).unwrap();
 }
 
 fn shipped_config() -> serde_json::Value {
@@ -38,42 +31,56 @@ fn chosen(decision: &Decision) -> (String, Option<String>) {
     (chosen.admitted.runtime.clone(), chosen.tap.model_profile.clone())
 }
 
-/// Acceptance 1: with a selectable `zai` account a Doctor tick resolves
-/// `opencode:zai-flash`; with the pool dry it falls through to `claude`.
+/// Resolve `role` against the committed `rolePreference.<role>` list,
+/// verbatim, asserting it is `[opencode:zai-flash, claude]`.
+fn write_shipped_role_preference(root: &Path, role: &str) {
+    let list = shipped_config()["runtimes"]["rolePreference"][role].clone();
+    assert_eq!(list, serde_json::json!([zai_tap(), "claude"]), "{role}");
+    write_config(root, &serde_json::json!({"runtimes": {"rolePreference": {role: list}}}));
+}
+
+fn assert_fell_through_to_claude(decision: &Decision, role: &str) {
+    assert_eq!(chosen(decision), ("claude".into(), None), "{role}");
+    let Decision::Preference { resolution, .. } = decision else {
+        unreachable!()
+    };
+    assert_eq!(resolution.skipped.len(), 1, "{role}");
+    let reason = resolution.skipped[0].reason.to_string();
+    assert!(reason.starts_with("unavailable("), "{role}: {reason}");
+}
+
+/// Acceptance 1 (Doctor, #11400) and the operator's Builder addition: with a
+/// selectable `zai` account the role resolves `opencode:zai-flash`; with no
+/// zai pool on the host at all, or with every account disabled, it falls
+/// through to `claude`. "No pool at all" is the common state of an
+/// unprovisioned fleet host: a guarded launch never reuses OpenCode's own
+/// login, so selecting the tap there would fail every tick at the provider.
 #[test]
 #[serial_test::serial]
-fn doctor_runs_glm_first_and_falls_through_to_claude_when_the_zai_pool_is_dry() {
+fn doctor_and_builder_run_glm_first_and_fall_through_to_claude_without_a_zai_seat() {
     let _env = ClearedRuntimeEnv::new();
-    let dir = fixture();
-    provision_claude_pool(dir.path(), 2);
-    // The committed fleet list, verbatim.
-    let doctor = shipped_config()["runtimes"]["rolePreference"]["doctor"].clone();
-    assert_eq!(doctor, serde_json::json!([zai_tap(), "claude"]));
-    write_config(
-        dir.path(),
-        &serde_json::json!({"runtimes": {"rolePreference": {"doctor": doctor}}}),
-    );
+    for role in ["doctor", "builder"] {
+        let dir = fixture();
+        provision_claude_pool(dir.path(), 2);
+        write_shipped_role_preference(dir.path(), role);
 
-    provision_zai_pool(dir.path(), true);
-    let decision = resolve_runtime(dir.path(), "doctor", None, 0).unwrap();
-    assert_eq!(chosen(&decision), ("opencode".into(), Some("zai-flash".into())));
-    let Decision::Preference { source, .. } = &decision else {
-        unreachable!()
-    };
-    assert_eq!(*source, PreferenceSource::RolePreference);
+        // No zai pool on this host, no exported key, no auth snapshot.
+        let decision = resolve_runtime(dir.path(), role, None, 0).unwrap();
+        assert_fell_through_to_claude(&decision, role);
 
-    // Same account, disabled: nothing selectable, so the walk falls through.
-    provision_zai_pool(dir.path(), false);
-    let decision = resolve_runtime(dir.path(), "doctor", None, 0).unwrap();
-    assert_eq!(chosen(&decision), ("claude".into(), None));
-    let Decision::Preference { resolution, .. } = &decision else {
-        unreachable!()
-    };
-    assert_eq!(resolution.skipped.len(), 1);
-    assert!(resolution.skipped[0]
-        .reason
-        .to_string()
-        .starts_with("unavailable("));
+        provision_zai_pool(dir.path(), true);
+        let decision = resolve_runtime(dir.path(), role, None, 0).unwrap();
+        assert_eq!(chosen(&decision), ("opencode".into(), Some("zai-flash".into())), "{role}");
+        let Decision::Preference { source, .. } = &decision else {
+            unreachable!()
+        };
+        assert_eq!(*source, PreferenceSource::RolePreference, "{role}");
+
+        // Same account, disabled: nothing selectable, so the walk falls through.
+        provision_zai_pool(dir.path(), false);
+        let decision = resolve_runtime(dir.path(), role, None, 0).unwrap();
+        assert_fell_through_to_claude(&decision, role);
+    }
 }
 
 /// Acceptance 2, preference half: a zai-flash entry is skipped for Judge and
@@ -123,7 +130,9 @@ fn a_bare_opencode_entry_is_judged_against_the_default_profile() {
     let decision = resolve_runtime(dir.path(), "judge", None, 0).unwrap();
     assert_eq!(chosen(&decision).0, "claude");
 
-    // A default profile that excludes nothing admits it.
+    // A default profile that excludes nothing admits it (its credential
+    // exported, so availability does not pass it over as unprovisioned).
+    std::env::set_var("GEMINI_API_KEY", "exported");
     write_config(
         dir.path(),
         &serde_json::json!({"runtimes": {
@@ -132,6 +141,7 @@ fn a_bare_opencode_entry_is_judged_against_the_default_profile() {
         }}),
     );
     let decision = resolve_runtime(dir.path(), "judge", None, 0).unwrap();
+    std::env::remove_var("GEMINI_API_KEY");
     assert_eq!(chosen(&decision).0, "opencode");
 }
 
