@@ -85,6 +85,11 @@ pub struct TickReport {
     /// the open-PR listing, with no `dispatch()` attempt and so no
     /// [`Admission`] and no dispatch backoff. The remainder are refusals
     /// `dispatch()`'s own guard still made (the listing could not be read).
+    ///
+    /// In-process only: it is not on the tick line and not exported in
+    /// `loom.dispatch.decisions`. Tests read it to tell the two paths apart;
+    /// an operator tells them apart by the admission span, which only an
+    /// in-dispatch refusal has.
     pub pr_open_prefiltered: usize,
     /// Issues skipped because a **peer host** advertised a live soft claim over
     /// the safehouse room (Issue #4028, Phase 1). Counted under its **own**

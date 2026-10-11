@@ -53,6 +53,19 @@
 //! it either way, and it no longer arms the failure's backoff. Candidates
 //! without an open PR still meet those checks unchanged.
 //!
+//! # The #6788 memo
+//!
+//! The guard's verified-open-PR memo used to be written by the 2.6 probe each
+//! time a PR-blocked candidate was refused. Those candidates no longer reach
+//! 2.6, so [`blocked_in`] folds what the listing verified into the memo
+//! instead: `Open(pr)` records or refreshes the entry, a verified "no open
+//! PR" removes it, and an unreadable listing changes nothing. That keeps the
+//! guard's fallback alive for the tick the listing cannot be read: a fresh
+//! entry refuses at 2.5, and an entry of any age gives the known-PR recheck
+//! (`GET pulls/{pr}`) something to recheck when GraphQL and the timeline fail
+//! too. Removal is what frees an issue on the tick its PR is gone, rather
+//! than up to 900 s later.
+//!
 //! # Cost
 //!
 //! No forge read at all on a tick where no candidate reaches the dispatch
@@ -77,6 +90,7 @@ use super::tick_report::record_dispatch_outcome;
 use super::{PriorityCandidate, TickReport, WorkDispatcher};
 use crate::sweep_registry::SweepRegistry;
 use crate::types::QueueDisposition as Qd;
+use crate::worktree_ops::gh::OpenPrProbe;
 
 /// The conditional-read caller name of the pre-filter's listing read.
 const CALLER: &str = "work_finder.open_pr_prefilter";
@@ -148,10 +162,13 @@ impl OpenPrPrefilter {
 /// issues in `candidates` with a verified open linked PR, from one read of the
 /// workspace's open-PR listing. Empty whenever that cannot be verified.
 ///
-/// The registry lock is held only to copy the three inputs of the read
-/// (`SweepRegistry::open_pr_listing_target`) and is released before `gh` runs,
-/// so the read never stalls a status IPC call the way the in-`dispatch()`
-/// guard chain can (#9573).
+/// The registry lock is taken twice, briefly, and never across the listing
+/// read: once to copy the three inputs of the read
+/// (`SweepRegistry::open_pr_listing_target`), and once after it to fold the
+/// verified verdicts into the #6788 memo
+/// (`SweepRegistry::fold_listing_verdicts`). Resolving the repo in the first
+/// can itself call `gh` (see that method); the listing read cannot stall a
+/// status IPC call the way the in-`dispatch()` guard chain can (#9573).
 #[must_use]
 pub fn blocked_in(registry: &Arc<Mutex<SweepRegistry>>, candidates: &[u32]) -> HashMap<u32, u32> {
     if candidates.is_empty() {
@@ -169,16 +186,34 @@ pub fn blocked_in(registry: &Arc<Mutex<SweepRegistry>>, candidates: &[u32]) -> H
     };
     let timeout = Some(crate::sweep_registry::reaper::reap_gh_timeout());
     let asked = (owner_repo.as_str(), candidates);
+    let read_started = chrono::Utc::now();
     let listed =
         crate::worktree_ops::linked_pr_listing::probe_many(CALLER, &gh, &root, asked, timeout);
-    let Some(blocked) = listed else {
+    let Some(verdicts) = listed else {
         log::debug!(
             "work_finder: open-PR pre-filter for {owner_repo} has no listing this tick; all {} \
-             candidate(s) go to dispatch() and its own guard (#8865)",
+             candidate(s) go to dispatch() and its own guard, and the open-PR memo is left as \
+             it was (#8865)",
             candidates.len()
         );
         return HashMap::new();
     };
+    // Keep the #6788 memo fed: these candidates no longer reach the 2.6 probe
+    // that used to write it. A second short lock, after the read, no forge
+    // call inside it.
+    match registry.lock() {
+        Ok(reg) => reg.fold_listing_verdicts(read_started, &verdicts),
+        Err(poisoned) => {
+            log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
+        }
+    }
+    let blocked: HashMap<u32, u32> = verdicts
+        .iter()
+        .filter_map(|(issue, verdict)| match verdict {
+            OpenPrProbe::Open(pr) => Some((*issue, *pr)),
+            OpenPrProbe::NoneOpen | OpenPrProbe::ProbeFailed => None,
+        })
+        .collect();
     log::debug!(
         "work_finder: open-PR pre-filter for {owner_repo}: {} of {} candidate(s) have an open \
          linked PR, from one listing read (#8865)",

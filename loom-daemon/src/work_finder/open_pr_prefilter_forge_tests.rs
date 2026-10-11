@@ -24,7 +24,8 @@ use serial_test::serial;
 use super::super::*;
 use crate::claim_reconciliation::open_pr_listing::test_support::{listing, row, Row};
 use crate::sweep_registry::test_support::{
-    fake_gh_graphql_arm, state_probe_json, touch_sweep_command,
+    fake_gh_graphql_arm, fake_gh_pulls_state_arm, fake_gh_timeline_rest_arm, state_probe_json,
+    touch_sweep_command,
 };
 use crate::sweep_registry::{SweepRegistry, SweepRegistryConfig};
 use crate::write_scope_test_support::WritableRoot;
@@ -61,6 +62,7 @@ impl Env {
             "LOOM_MODEL_PROFILE",
             "LOOM_MODEL_EXPERIMENT",
             "LOOM_BACKSTOP_LEASE_DIR",
+            "LOOM_OPEN_PR_MEMO",
         ];
         let emptied = [
             "LOOM_CONFIG_DEFAULTS_FILE",
@@ -98,6 +100,9 @@ impl Drop for Env {
 enum Pulls {
     /// `200` with these rows and an ETag; `304` when the ETag is presented.
     Rows(Vec<Row>),
+    /// The listing after it changed: `200` with these rows whatever ETag is
+    /// presented.
+    Changed(Vec<Row>),
     /// A forge outage (`502`).
     Failing,
 }
@@ -106,7 +111,9 @@ enum Pulls {
 struct Fixture {
     registry: Arc<Mutex<SweepRegistry>>,
     log: PathBuf,
-    _ws: WritableRoot,
+    /// The script the registry's `gh` runs; [`Self::reanswer`] rewrites it.
+    inner: PathBuf,
+    ws: WritableRoot,
     _env: Env,
     _dir: tempfile::TempDir,
 }
@@ -128,25 +135,8 @@ impl Fixture {
         let ws = WritableRoot::register_with_gh(&root, &inner);
         let log = root.join("gh.log");
 
-        let pulls_arm = match pulls(&ws.repo) {
-            Pulls::Rows(rows) => pages_arm(&root, &rows),
-            Pulls::Failing => "case \"$*\" in api*'pulls?state=open'*)\n  \
-                 echo 'gh: Something went wrong (HTTP 502)' >&2; exit 1 ;;\nesac\n"
-                .to_string(),
-        };
-        let script = format!(
-            "#!/usr/bin/env bash\n\
-             printf '%s\\n' \"$*\" >> \"{log}\"\n\
-             {pulls_arm}\
-             {gql}\
-             if [[ \"$1\" == repo && \"$2\" == view ]]; then printf '{repo}\\n'; exit 0; fi\n\
-             if [[ \"$1\" == api && \"$2\" == repos/* ]]; then printf '%s\\n' '{state}'; exit 0; fi\n\
-             exit 0\n",
-            log = log.display(),
-            gql = fake_gh_graphql_arm(graphql_prs, 0),
-            repo = ws.repo,
-            state = state_probe_json("open", false),
-        );
+        let script =
+            fake_gh(&root, &ws.repo, pulls(&ws.repo), &fake_gh_graphql_arm(graphql_prs, 0));
         write_executable(&inner, &script);
 
         let spawn = root.join(".loom/scripts/spawn-claude.sh");
@@ -162,10 +152,26 @@ impl Fixture {
         Self {
             registry: Arc::new(Mutex::new(SweepRegistry::new(config))),
             log,
-            _ws: ws,
+            inner,
+            ws,
             _env: env,
             _dir: dir,
         }
+    }
+
+    /// Change what the forge answers from now on: the listing, and the legs
+    /// behind it (see [`fake_gh`]).
+    fn reanswer(&self, pulls: impl FnOnce(&str) -> Pulls, legs: &str) {
+        let root = self.inner.parent().unwrap();
+        let script = fake_gh(root, &self.ws.repo, pulls(&self.ws.repo), legs);
+        write_executable(&self.inner, &script);
+    }
+
+    /// The fresh #6788 memo entry's PR for `issue`, if any.
+    fn fresh_memo(&self, issue: u32) -> Option<u32> {
+        let reg = self.registry.lock().unwrap();
+        reg.fresh_open_pr_memo(issue, chrono::Utc::now())
+            .map(|memo| memo.pr)
     }
 
     fn dispatcher(&self) -> RegistryDispatcher {
@@ -216,6 +222,42 @@ struct Calls {
     graphql: usize,
 }
 
+/// The fake `gh`: logs each call, answers the open-PR listing per `pulls`,
+/// then `legs` (arms for the guard's other reads, tried before the catch-all),
+/// then `repo view` and an open-issue body for any other `api repos/…` read.
+fn fake_gh(root: &Path, repo: &str, pulls: Pulls, legs: &str) -> String {
+    let pulls_arm = match pulls {
+        Pulls::Rows(rows) => pages_arm(root, &rows, true),
+        Pulls::Changed(rows) => pages_arm(root, &rows, false),
+        Pulls::Failing => "case \"$*\" in api*'pulls?state=open'*)\n  \
+             echo 'gh: Something went wrong (HTTP 502)' >&2; exit 1 ;;\nesac\n"
+            .to_string(),
+    };
+    format!(
+        "#!/usr/bin/env bash\n\
+         printf '%s\\n' \"$*\" >> \"{log}\"\n\
+         {pulls_arm}\
+         {legs}\
+         if [[ \"$1\" == repo && \"$2\" == view ]]; then printf '{repo}\\n'; exit 0; fi\n\
+         if [[ \"$1\" == api && \"$2\" == repos/* ]]; then printf '%s\\n' '{state}'; exit 0; fi\n\
+         exit 0\n",
+        log = root.join("gh.log").display(),
+        state = state_probe_json("open", false),
+    )
+}
+
+/// [`fake_gh`] legs for the #6788 outage shape: the closes-graph and the
+/// timeline walk both fail, and only the targeted `pulls/<n>` read answers
+/// (`open`).
+fn only_the_pull_read_answers() -> String {
+    format!(
+        "{}{}{}",
+        fake_gh_graphql_arm("", 1),
+        fake_gh_timeline_rest_arm("", 1),
+        fake_gh_pulls_state_arm("open", 0)
+    )
+}
+
 fn write_executable(path: &Path, script: &str) {
     use std::os::unix::fs::PermissionsExt;
     std::fs::write(path, script).unwrap();
@@ -227,12 +269,12 @@ fn write_executable(path: &Path, script: &str) {
 
 /// A `bash` arm serving `rows` as 100-row listing pages from files under
 /// `root`, each `200` with a per-page ETag, or `304` (exit 1, like real
-/// `gh`) when the caller presents one.
-fn pages_arm(root: &Path, rows: &[Row]) -> String {
-    let mut arm = String::from(
-        "case \"$*\" in api*'pulls?state=open'*'If-None-Match'*)\n  \
-         printf 'HTTP/2.0 304 Not Modified\\r\\n\\r\\n'; exit 1 ;;\nesac\n",
-    );
+/// `gh`) when the caller presents one and `conditional` is set.
+fn pages_arm(root: &Path, rows: &[Row], conditional: bool) -> String {
+    let not_modified = "case \"$*\" in api*'pulls?state=open'*'If-None-Match'*)\n  \
+         printf 'HTTP/2.0 304 Not Modified\\r\\n\\r\\n'; exit 1 ;;\nesac\n";
+    let mut arm = String::from(if conditional { not_modified } else { "" });
+    let tag = if conditional { "p" } else { "q" };
     let pages: Vec<&[Row]> = if rows.is_empty() {
         vec![rows]
     } else {
@@ -245,7 +287,7 @@ fn pages_arm(root: &Path, rows: &[Row]) -> String {
         std::fs::write(&file, listing(page)).unwrap();
         arm.push_str(&format!(
             "case \"$*\" in api*'pulls?state=open'*'&page={n}'|api*'pulls?state=open'*'&page={n} '*)\n  \
-             printf 'HTTP/2.0 200 OK\\r\\nEtag: W/\"p{n}\"\\r\\n\\r\\n'; cat '{file}'; exit 0 ;;\nesac\n",
+             printf 'HTTP/2.0 200 OK\\r\\nEtag: W/\"{tag}{n}\"\\r\\n\\r\\n'; cat '{file}'; exit 0 ;;\nesac\n",
             n = i + 1,
             file = file.display(),
         ));
@@ -473,6 +515,93 @@ fn an_unblocked_candidate_is_dispatched_in_the_same_tick() {
     assert!(!fx.backed_off().contains(&8901));
 }
 
+/// The #6788 backstop stays fed (PR #11430 review). A pre-filtered tick
+/// records the verified PR in the memo although the 2.6 probe never ran for
+/// it, so on a following tick where the listing, the closes-graph and the
+/// timeline all fail, `dispatch()` still refuses the issue: at 2.5 while the
+/// entry is fresh, and through the `pulls/<n>` recheck once it is not.
+#[test]
+#[serial]
+fn a_prefiltered_block_still_holds_when_every_probe_leg_fails() {
+    let fx = Fixture::new(|repo| Pulls::Rows(vec![closing(repo, 9951, 8951)]), "");
+    let (first, _) = tick_one(fx.dispatcher(), &[8951], 5);
+    assert_eq!(first.pr_open_prefiltered, 1);
+    assert_eq!(fx.fresh_memo(8951), Some(9951), "the pre-filter recorded its verified verdict");
+
+    // Outage, memo still fresh: refused at 2.5 without a probe.
+    fx.reanswer(|_| Pulls::Failing, &only_the_pull_read_answers());
+    let before = fx.calls().len();
+    let (fresh, _) = tick_one(fx.dispatcher(), &[8951], 5);
+    assert_eq!((fresh.skipped_pr_open, fresh.pr_open_prefiltered), (1, 0));
+    assert_eq!((fresh.dispatched, fresh.errors), (0, 0));
+    assert_eq!(fresh.admissions.len(), 1, "refused by dispatch() itself");
+    assert_eq!(fx.tally_from(before).graphql, 0, "{:?}", fx.calls());
+
+    // Same outage with the entry past its freshness window (and the #4485
+    // window the refusal above armed cleared): the known-PR recheck holds.
+    {
+        let mut reg = fx.registry.lock().unwrap();
+        reg.seed_open_pr_memo(8951, 9951, chrono::Utc::now() - chrono::Duration::hours(3));
+        reg.clear_dispatch_backoff(8951);
+    }
+    assert_eq!(fx.fresh_memo(8951), None);
+    let before = fx.calls().len();
+    let (stale, _) = tick_one(fx.dispatcher(), &[8951], 5);
+    assert_eq!((stale.skipped_pr_open, stale.pr_open_prefiltered), (1, 0));
+    assert_eq!((stale.dispatched, stale.errors), (0, 0));
+    let calls = fx.calls()[before..].to_vec();
+    assert!(calls.iter().any(|c| c.contains("graphql")), "the probe ran: {calls:?}");
+    assert!(calls.iter().any(|c| c.contains("pulls/9951")), "the recheck ran: {calls:?}");
+
+    // Control: the same outage with no pre-filtered tick before it has no
+    // entry to recheck, and the guard falls open (the documented contract).
+    let cold = Fixture::new(|_| Pulls::Failing, "");
+    cold.reanswer(|_| Pulls::Failing, &only_the_pull_read_answers());
+    let (open, _) = tick_one(cold.dispatcher(), &[8951], 5);
+    assert_eq!((open.dispatched, open.skipped_pr_open), (1, 0));
+}
+
+/// A PR that closes frees its issue on the next tick (PR #11430 review): the
+/// listing's verified "no open PR" removes the memo entry the earlier tick
+/// recorded, so 2.5 does not refuse the issue for the rest of the 900 s
+/// freshness window and no backoff is armed.
+#[test]
+#[serial]
+fn a_closed_pr_frees_its_issue_on_the_next_tick() {
+    let fx = Fixture::new(|repo| Pulls::Rows(vec![closing(repo, 9961, 8961)]), "");
+    let (first, _) = tick_one(fx.dispatcher(), &[8961], 5);
+    assert_eq!((first.pr_open_prefiltered, first.dispatched), (1, 0));
+    assert_eq!(fx.fresh_memo(8961), Some(9961));
+
+    fx.reanswer(|_| Pulls::Changed(Vec::new()), &fake_gh_graphql_arm("", 0));
+    let (next, _) = tick_one(fx.dispatcher(), &[8961], 5);
+    assert_eq!(fx.fresh_memo(8961), None, "the verified absence removed the entry");
+    assert_eq!((next.dispatched, next.skipped_pr_open, next.errors), (1, 0, 0));
+    assert_eq!(fx.failure_count(8961), 0, "no open-PR backoff was armed");
+}
+
+/// An unreadable listing is no verdict: it neither records nor removes a memo
+/// entry.
+#[test]
+#[serial]
+fn an_unreadable_listing_leaves_the_memo_alone() {
+    let fx = Fixture::new(|_| Pulls::Failing, "");
+    let at = chrono::Utc::now() - chrono::Duration::hours(3);
+    fx.registry
+        .lock()
+        .unwrap()
+        .seed_open_pr_memo(8971, 9971, at);
+    assert!(fx.dispatcher().open_pr_blocked(&[8971, 8972]).is_empty());
+    let reg = fx.registry.lock().unwrap();
+    let later = at + chrono::Duration::seconds(1);
+    assert_eq!(
+        reg.fresh_open_pr_memo(8971, later)
+            .map(|m| (m.pr, m.verified_at)),
+        Some((9971, at))
+    );
+    assert!(reg.fresh_open_pr_memo(8972, chrono::Utc::now()).is_none());
+}
+
 /// Guards off (`skip_label_flip`, as in a credential-less fixture): the
 /// pre-filter reads nothing, mirroring steps 2.5/2.6.
 #[test]
@@ -504,7 +633,9 @@ fn measurement_attempts_and_forge_calls_per_tick() {
         // Resolve the repo and warm the listing's ETag first, as a running
         // daemon has (its reconciliation passes read this listing every pass):
         // the measured tick then sees conditional `304` reads on both paths.
-        let _ = fx.dispatcher().open_pr_blocked(&numbers);
+        // Asked about an issue outside the set, so the warm-up leaves no
+        // #6788 memo entry for a measured candidate: both paths start cold.
+        let _ = fx.dispatcher().open_pr_blocked(&[1]);
         let skip = fx.calls().len();
         let started = Instant::now();
         let report = if before {

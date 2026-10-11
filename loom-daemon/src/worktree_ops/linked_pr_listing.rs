@@ -88,31 +88,33 @@ pub(crate) fn probe(
     }
 }
 
-/// [`probe`] for many issues from ONE listing read (#8865): every issue in
-/// `issues` with a verified open linked PR, mapped to that PR. `None` when
-/// the listing could not be read, which is no verdict for any of them.
+/// [`probe`] for many issues from ONE listing read (#8865): the verified
+/// verdict of each issue in `issues`, in that order. `None` when the listing
+/// could not be read, which is no verdict for any of them.
 ///
 /// The read, the repo, the classifier and the trust rule are [`probe`]'s, so
-/// an issue is in the map exactly when [`probe`] over the same rows would
-/// answer `Open` for it. An issue absent from a `Some` map is NOT a verified
-/// "no PR" a caller may act on: the work finder's pre-filter, the one caller,
-/// only ever drops the issues that are present.
+/// an issue's verdict here is exactly what [`probe`] over the same rows would
+/// answer for it: `Open(pr)` or `NoneOpen`. An issue the classifier could not
+/// answer for (`ProbeFailed`) is left out, so every pair returned is a
+/// verified one. `NoneOpen` is the same verified absence the 2.6 guard's leg
+/// 0 acts on; the work finder's pre-filter, the one caller, uses it only to
+/// invalidate the #6788 memo and never as a permit.
 pub(crate) fn probe_many(
     caller: &'static str,
     gh_bin: &Path,
     root: &Path,
     (owner_repo, issues): (&str, &[u32]),
     timeout: Option<Duration>,
-) -> Option<HashMap<u32, u32>> {
+) -> Option<Vec<(u32, OpenPrProbe)>> {
     let rows = read_rows(caller, gh_bin, root, owner_repo, timeout)?;
     let policy = TrustPolicy::for_root(root);
-    let open = issues.iter().filter_map(|&issue| {
+    let verified = issues.iter().filter_map(|&issue| {
         match classify_open_linked_pr_rows(&rows, issue, owner_repo, &policy) {
-            OpenPrProbe::Open(pr) => Some((issue, pr)),
-            OpenPrProbe::NoneOpen | OpenPrProbe::ProbeFailed => None,
+            OpenPrProbe::ProbeFailed => None,
+            verdict => Some((issue, verdict)),
         }
     });
-    Some(open.collect())
+    Some(verified.collect())
 }
 
 /// The open-PR listing of `owner_repo`, or `None` when it could not be read
