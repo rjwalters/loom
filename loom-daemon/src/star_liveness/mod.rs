@@ -95,6 +95,7 @@ pub mod inherited_star;
 pub mod intents;
 pub mod landing;
 pub mod levels;
+pub mod loom_ui;
 pub mod materialize;
 pub mod parent_link;
 pub mod progress;
