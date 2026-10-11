@@ -243,7 +243,7 @@ impl<'a> Clones<'a> {
         now: Instant,
     ) -> Self {
         Self {
-            cloner: Some(cloner).filter(|_| config.max_per_pass > 0),
+            cloner: (config.max_per_pass > 0).then_some(cloner),
             config,
             memory: Some(memory),
             now,
