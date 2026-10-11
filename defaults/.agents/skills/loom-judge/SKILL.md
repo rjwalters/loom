@@ -976,7 +976,7 @@ change the stand-down behavior to accommodate this sweep.
 
 ### Fallback Queue (Review Only)
 
-`pr-queue --role judge` includes trusted interactive fallback work alongside labeled work when human preference is enabled. Otherwise fallback admission waits for an empty labeled queue. Origin grants review priority only: fallback review never adds workflow labels or authorizes branch changes/automated landing.
+`pr-queue --role judge` lists fallback beside labeled work for trusted interactive PRs (preference on) and, after labeled rows, unlabeled same-repo `feature/issue-<N>` PRs. Other shapes and forks wait for an empty labeled queue. Fallback review never adds labels or authorizes branch changes/automated landing.
 
 **Incident this section guards against (#5455)**: PR #4972 — a 2-line
 Dependabot `Cargo.lock` bump — accumulated **199 fallback-mode Judge
