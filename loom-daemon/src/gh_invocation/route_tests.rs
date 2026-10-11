@@ -102,7 +102,8 @@ fn the_method_follows_ghs_rule() {
     assert_eq!(method(&["api", "repos/a/b/issues", "-f", "title=t"]), Some("POST"));
     assert_eq!(method(&["api", "graphql", "-fquery=x"]), Some("POST"));
     assert_eq!(method(&["api", "-X", "GET", "search/issues", "-f", "q=x"]), Some("GET"));
-    assert_eq!(method(&["api", "-X", "BREW", "repos/a/b"]), Some("OTHER"));
+    assert_eq!(method(&["api", "-X", "BREW", "repos/a/b"]), Some("_OTHER"));
+    assert_eq!(method(&["api", "repos/a/b", "-X"]), Some("_OTHER"));
 }
 
 #[test]

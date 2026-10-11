@@ -145,21 +145,21 @@ fn command_of(pos: &[&str]) -> &'static str {
 }
 
 /// `gh api`'s method: `-X`/`--method` if given, else `POST` when any field
-/// or `--input` is given, else `GET`. Anything outside the set is `OTHER`.
+/// or `--input` is given, else `GET`. Anything outside the set is `_OTHER` (OTel semconv).
 fn api_method(flags: &[Flag<'_>]) -> &'static str {
     let explicit = flags
         .iter()
         .rfind(|f| f.name == "-X" || f.name == "--method");
     if let Some(flag) = explicit {
         let Some(value) = flag.value else {
-            return "OTHER";
+            return "_OTHER";
         };
         let upper = value.to_ascii_uppercase();
         return METHODS
             .iter()
             .find(|m| **m == upper)
             .copied()
-            .unwrap_or("OTHER");
+            .unwrap_or("_OTHER");
     }
     let fields = ["-f", "--raw-field", "-F", "--field", "--input"];
     if flags.iter().any(|f| fields.contains(&f.name)) {
