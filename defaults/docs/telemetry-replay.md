@@ -322,7 +322,7 @@ every emitting host as `covered`, or `unknown` with the SQL's reason
 An uncovered host is never shown as empty. No row is capped and no host is
 elected; it computes no estimate or statistic.
 
-- **Reader config**: reads go through the telemetry-reader (2AMLogic/2am#3704),
+- **Reader config**: reads go through the telemetry-reader (a query broker),
   never to ClickHouse directly. Its base URL comes from `--endpoint`, then
   `TELEMETRY_READER_URL`, then `telemetry.signoz.endpoint`; no address is
   built in. There is **no credential**: the reader identifies the caller by

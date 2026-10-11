@@ -173,7 +173,7 @@ impl SignozRead for FileRows {
     }
 }
 
-/// The telemetry-reader (2AMLogic/2am#3704, #3855): `POST <base>/v1/query`
+/// The telemetry-reader (an authenticated query broker): `POST <base>/v1/query`
 /// with the statement as the body and each bound value as a `param_<name>`
 /// URL parameter.
 ///
@@ -320,7 +320,7 @@ pub struct EndpointConfig {
 
 /// The configuration key.
 pub const ENDPOINT_CONFIG_KEY: &str = "telemetry.signoz";
-/// The environment variable naming the reader's base (2am's client
+/// The environment variable naming the reader's base (the reader clients'
 /// convention); it wins over the configuration.
 pub const ENDPOINT_ENV: &str = "TELEMETRY_READER_URL";
 /// The retired ETA-era block, no longer read.
