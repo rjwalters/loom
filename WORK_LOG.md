@@ -6,8 +6,30 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-10-11
+
+- **PR #11383**: feat(journal): shared bounded journal core and verify seam (Phase 2a)
+- **PR #11382**: fix(sweep): base-conflict rebase pass no longer spends the Doctor-cycle cap
+- **PR #11379**: fix(stashes): fail a run whose every issue-state lookup fails (#8876 Part B)
+- **PR #11380**: docs(stale-blocked): describe check-stale-blocked as per-repository and document the hand-rolled loop hazard
+- **PR #11378**: feat(fleet_state): pre-ready triage_wait/approval_wait stage outcomes (#11368)
+- **Issue #11345** (closed): [Epic #9908] Phase 2a: Shared bounded journal core and verification seam
+- **Issue #9265** (closed): Sweep Doctor-cycle cap counts merge-conflict-only rebases caused by main moving
+- **Issue #9191** (closed): check-stale-blocked calls itself fleet-wide but is per-repo, and the obvious fleet loop triggers secondary rate limiting
+- **Issue #11368** (closed): eta.stage_outcome: add pre-ready stages triage_wait and approval_wait
+
 ### 2026-10-10
 
+- **PR #11375**: telemetry: record resolved effort and full model ids on sweep facts (#11370)
+- **PR #11374**: fix(champion): gate the negated-reference reopen on closed-by-merge attribution
+- **PR #11373**: test: pin #9973 reset-test holder (detached git maintenance) with trace2 regression
+- **PR #11372**: eta.stage_outcome: forge-dated entered_at + entered_at_source; one ready_wait exit fact per claim (#11367)
+- **PR #11371**: fix(tokens): make check --source probe really probe bad-marked accounts and report probed + the standing mark
+- **Issue #11370** (closed): sweep facts: loom.effort absent on 100% of sweep.started/outcome (record the resolved effort); loom.model mixes aliases and ''
+- **Issue #8942** (closed): Champion Step 4 negation-guard reopen doesn't confirm the close came from this merge
+- **Issue #9973** (closed): Flaky: worktree_cli::reset rescue test unexpectedly hits the live-process veto under nextest
+- **Issue #11367** (closed): eta.stage_outcome: most wait-stage exits lack entered_at/dwell_sec (ready_wait 0 of 1,396), ready_wait 'unknown' floods, no pre-ready stages
+- **Issue #8972** (closed): tokens check --source probe does not probe a bad-marked account — it echoes the stored reason, so a stale bad-mark reads as confirmed
 - **Issue #8911** (closed): extraSkipLabels is bypassed by find-work tiers 1 and 2 (only the tier-3 fallback filters on skip-labels.sh)
 - **PR #11365**: fix(builder): apply the skip-label set to every find-work tier (#8911)
 - **Issue #11195** (closed): Docker image retention removes nothing on containerd-store workers: digest-only untagged images and unused third-party images (37.9 GB reclaimable on fleet worker)
