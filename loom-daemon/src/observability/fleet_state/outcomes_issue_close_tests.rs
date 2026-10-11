@@ -261,13 +261,144 @@ fn a_nearby_merged_pr_without_a_closing_reference_does_not_make_a_hand_close_a_m
             "https://api.github.com/repos/rjwalters/loom",
         ),
         pr_reference_with(near, "Closes #11401", "https://api.github.com/repos/rjwalters/other"),
+        // A qualified reference naming a different repository closes that
+        // repository's issue, never this one (#11402).
+        pr_reference_with(
+            near,
+            "Closes other/repo#11401",
+            "https://api.github.com/repos/rjwalters/loom",
+        ),
+        pr_reference_with(
+            near,
+            "Does not close rjwalters/loom#11401",
+            "https://api.github.com/repos/rjwalters/loom",
+        ),
     ] {
         let timeline = serde_json::json!([reference]);
         assert_eq!(
             IssueFacts::closed(REPO, NUMBER, at, std::slice::from_ref(&events), &[timeline]),
-            IssueFacts::NotMerged(at)
+            IssueFacts::NotMerged(at),
+            "{reference}"
         );
     }
+}
+
+/// A repository-qualified closing reference (`Closes rjwalters/loom#N`) is
+/// evidence of the merge close just like a bare `#N`; its `closed` event has
+/// a null `commit_id` (#11402).
+#[test]
+fn a_repository_qualified_closing_reference_with_a_null_commit_is_a_merge() {
+    let at = t0();
+    let events = serde_json::json!([closed_event("2026-10-09T12:00:02Z", None)]);
+    let timeline = serde_json::json!([pr_reference_with(
+        Some("2026-10-09T11:59:59Z"),
+        "Fixes rjwalters/loom#11401.",
+        "https://api.github.com/repos/rjwalters/loom",
+    ),]);
+    assert_eq!(
+        IssueFacts::closed(REPO, NUMBER, at, &[events], &[timeline]),
+        IssueFacts::Merged(at)
+    );
+}
+
+/// A Development-sidebar link closes the linked same-repository issue when
+/// the PR merges, with no closing keyword in the body at all and a null
+/// `commit_id` on the `closed` event (#11402).
+fn sidebar_link(merged_at: Option<&str>, repository_url: &str) -> serde_json::Value {
+    sidebar_link_at("2026-10-09T11:00:00Z", merged_at, repository_url)
+}
+
+/// [`sidebar_link`] with the link's own instant: a `disconnected` event
+/// only revokes a link that was taken out earlier.
+fn sidebar_link_at(
+    created_at: &str,
+    merged_at: Option<&str>,
+    repository_url: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "event": "connected",
+        "created_at": created_at,
+        "source_issue": {
+            "number": 9,
+            "body": "Implements the fix. No closing keyword here.",
+            "repository_url": repository_url,
+            "pull_request": {"merged_at": merged_at},
+        },
+    })
+}
+
+/// A `disconnected` event revoking the sidebar link to PR #9 at `at`.
+fn revoked_sidebar_link(at: &str) -> serde_json::Value {
+    serde_json::json!({
+        "event": "disconnected",
+        "created_at": at,
+        "source_issue": {
+            "number": 9,
+            "repository_url": "https://api.github.com/repos/rjwalters/loom",
+        },
+    })
+}
+
+#[test]
+fn a_development_sidebar_link_to_a_merged_pr_is_a_merge_with_a_null_commit() {
+    let at = t0();
+    let events = serde_json::json!([closed_event("2026-10-09T12:00:02Z", None)]);
+    let timeline = serde_json::json!([sidebar_link(
+        Some("2026-10-09T11:59:59Z"),
+        "https://api.github.com/repos/rjwalters/loom",
+    )]);
+    assert_eq!(
+        IssueFacts::closed(REPO, NUMBER, at, &[events], &[timeline]),
+        IssueFacts::Merged(at)
+    );
+}
+
+/// A sidebar link proves a link, not a close, unless a merge in this
+/// repository sits within the close window: another repository's PR, or an
+/// unmerged one, leaves a hand close `abandoned`.
+#[test]
+fn a_sidebar_link_to_a_pr_that_cannot_close_this_repo_is_not_a_merge() {
+    let at = t0();
+    let events = serde_json::json!([closed_event("2026-10-09T12:00:02Z", None)]);
+    for link in [
+        sidebar_link(Some("2026-10-09T11:59:59Z"), "https://api.github.com/repos/rjwalters/other"),
+        sidebar_link(None, "https://api.github.com/repos/rjwalters/loom"),
+    ] {
+        let timeline = serde_json::json!([link]);
+        assert_eq!(
+            IssueFacts::closed(REPO, NUMBER, at, std::slice::from_ref(&events), &[timeline]),
+            IssueFacts::NotMerged(at),
+            "{link}"
+        );
+    }
+}
+
+/// A sidebar link a later `disconnected` event revoked closes nothing on
+/// merge: the hand close stays `abandoned`. A disconnect that predates a
+/// later reconnect leaves the link standing (#11402).
+#[test]
+fn a_revoked_sidebar_link_does_not_make_a_hand_close_a_merge() {
+    let at = t0();
+    let events = serde_json::json!([closed_event("2026-10-09T12:00:02Z", None)]);
+    let merged = (Some("2026-10-09T11:59:59Z"), "https://api.github.com/repos/rjwalters/loom");
+    // Revoked: the disconnect postdates the link.
+    let timeline = serde_json::json!([
+        sidebar_link(merged.0, merged.1),
+        revoked_sidebar_link("2026-10-09T11:00:05Z"),
+    ]);
+    assert_eq!(
+        IssueFacts::closed(REPO, NUMBER, at, std::slice::from_ref(&events), &[timeline]),
+        IssueFacts::NotMerged(at)
+    );
+    // Reconnected: the disconnect predates the link that stands at merge.
+    let timeline = serde_json::json!([
+        revoked_sidebar_link("2026-10-09T11:00:05Z"),
+        sidebar_link_at("2026-10-09T11:00:10Z", merged.0, merged.1),
+    ]);
+    assert_eq!(
+        IssueFacts::closed(REPO, NUMBER, at, std::slice::from_ref(&events), &[timeline]),
+        IssueFacts::Merged(at)
+    );
 }
 
 #[test]
