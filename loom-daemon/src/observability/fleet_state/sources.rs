@@ -240,17 +240,32 @@ async fn review_listings(roots: &[(PathBuf, String)]) -> Vec<RepoListing> {
 ///
 /// The walk failed, read `MAX_PAGES` full pages or saw the listing shift: the
 /// set may be incomplete, so the repo has no curated listing this pass.
+#[cfg(test)]
 fn curated_listing_with(
     gh: &Path,
     root: &Path,
     repo: Option<&str>,
+) -> anyhow::Result<BTreeMap<u32, Option<DateTime<Utc>>>> {
+    label_listing_with(gh, root, repo, super::outcomes::CURATED_LABEL)
+}
+
+/// [`curated_listing_with`] for any issue label (`loom:triage`, #11398).
+///
+/// # Errors
+///
+/// As [`curated_listing_with`].
+fn label_listing_with(
+    gh: &Path,
+    root: &Path,
+    repo: Option<&str>,
+    label: &str,
 ) -> anyhow::Result<BTreeMap<u32, Option<DateTime<Utc>>>> {
     let items = crate::forge_listing::list_issues_cached_all_as(
         CALLER,
         gh,
         Some(root),
         repo,
-        super::outcomes::CURATED_LABEL,
+        label,
         "open",
     )?;
     Ok(items
@@ -260,15 +275,16 @@ fn curated_listing_with(
         .collect())
 }
 
-/// Each managed repo's curated listing; an incomplete one leaves the repo out
-/// (a partial listing would read as issues arriving).
-async fn curated_listings(roots: &[(PathBuf, String)]) -> Curated {
+/// Each managed repo's listing of open `label` issues; an incomplete one
+/// leaves the repo out (a partial listing would read as issues arriving or
+/// leaving).
+async fn label_listings(roots: &[(PathBuf, String)], label: &'static str) -> Curated {
     let mut out = Curated::new();
     for (root, slug) in roots {
         let root = root.clone();
         let result = tokio::task::spawn_blocking(move || {
             let gh = PathBuf::from(crate::gh_invocation::gh_bin());
-            curated_listing_with(&gh, &root, None)
+            label_listing_with(&gh, &root, None, label)
         })
         .await;
         match result {
@@ -276,10 +292,10 @@ async fn curated_listings(roots: &[(PathBuf, String)]) -> Curated {
                 out.insert(slug.clone(), listing);
             }
             Ok(Err(error)) => {
-                log::debug!("fleet.state: curated listing of {slug} incomplete: {error:#}");
+                log::debug!("fleet.state: {label} listing of {slug} incomplete: {error:#}");
             }
             Err(join_error) => {
-                log::debug!("fleet.state: curated listing of {slug} panicked: {join_error}");
+                log::debug!("fleet.state: {label} listing of {slug} panicked: {join_error}");
             }
         }
     }
@@ -485,7 +501,7 @@ pub(super) async fn gather(
     slug_cache: &mut HashMap<String, String>,
     host_id: &str,
     now: DateTime<Utc>,
-) -> (FleetInput, Reused, Curated) {
+) -> (FleetInput, Reused, Curated, Curated) {
     // Resolves every provisioned root, so the registries' roots are cached.
     let roots = managed_roots(workspace_pool, slug_cache).await;
     let managed: BTreeSet<String> = roots.iter().map(|(_, slug)| slug.clone()).collect();
@@ -493,7 +509,8 @@ pub(super) async fn gather(
         slug_cache.get(root).map(|s| s.to_ascii_lowercase())
     });
     let listings = review_listings(&roots).await;
-    let curated = curated_listings(&roots).await;
+    let curated = label_listings(&roots, super::outcomes::CURATED_LABEL).await;
+    let triage = label_listings(&roots, super::outcomes::close::TRIAGE_LABEL).await;
     let ready = ready_queue(&managed, slug_cache).await;
     let main_ci = main_ci_by_slug(
         roots
@@ -526,7 +543,7 @@ pub(super) async fn gather(
         listings,
         ready,
     };
-    (input, reused, curated)
+    (input, reused, curated, triage)
 }
 
 /// A tick pass's input (#11161): the registries and the work finder's last

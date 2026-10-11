@@ -272,6 +272,21 @@ fn every_stage_outcome_carries_a_fact_id_or_a_reason() {
     }
 }
 
+/// An item whose issue closed leaves with `abandoned` at the forge's close
+/// instant (#11398): any host, polling at any time, shares the fact id.
+#[test]
+fn an_abandoned_exit_is_one_fact_across_hosts() {
+    let closed = |observed: i64| StageOutcomeRecord {
+        exit: StageExit::Abandoned,
+        next_stage: None,
+        ..stage_record(9, FleetStage::SweepCurator, FleetStage::SweepBuilder, observed)
+    };
+    let a = ids("host-a", &TelemetryRecord::StageOutcome(closed(30)), 0).0;
+    let b = ids("host-b", &TelemetryRecord::StageOutcome(closed(30)), 400).0;
+    assert_eq!(a.len(), 16);
+    assert_eq!(a, b);
+}
+
 #[test]
 fn a_pr_closed_reopened_and_closed_again_is_two_facts() {
     let first = TelemetryRecord::PrResolved(pr_record(7, PrResolution::Closed, 0));
@@ -309,7 +324,7 @@ fn fact_id_differs_across_natural_keys() {
 fn two_hosts_running_the_producer_at_different_times_emit_one_fact() {
     use crate::observability::fleet_state::history::HistoryEvent;
     use crate::observability::fleet_state::outcomes::{
-        diff, listed, remember, ForgeReads, LabelHistory, Memory, Pass, PullFacts,
+        diff, listed, remember, ForgeReads, IssueFacts, LabelHistory, Memory, Pass, PullFacts,
     };
     use crate::observability::fleet_state::{build_view, FleetInput, ListedPr, RepoListing};
     use std::collections::BTreeMap;
@@ -319,6 +334,10 @@ fn two_hosts_running_the_producer_at_different_times_emit_one_fact() {
         fn pull(&mut self, _: &str, _: u32) -> Option<PullFacts> {
             None
         }
+        fn issue(&mut self, _: &str, _: u32) -> Option<IssueFacts> {
+            Some(IssueFacts::Open)
+        }
+
         fn label_history(&mut self, _: &str, _: u32) -> Option<LabelHistory> {
             Some(LabelHistory {
                 events: vec![(self.0, HistoryEvent::Labeled("loom:pr".to_string()))],
@@ -379,7 +398,7 @@ fn two_hosts_running_the_producer_at_different_times_emit_one_fact() {
 fn a_claimed_ready_issue_is_one_fact_across_hosts() {
     use crate::observability::fleet_state::history::HistoryEvent;
     use crate::observability::fleet_state::outcomes::{
-        diff, listed, remember, ForgeReads, LabelHistory, Memory, Pass, PullFacts,
+        diff, listed, remember, ForgeReads, IssueFacts, LabelHistory, Memory, Pass, PullFacts,
     };
     use crate::observability::fleet_state::{
         build_view, FleetInput, HeldSweep, ReadyItem, ReadyQueue,
@@ -392,6 +411,10 @@ fn a_claimed_ready_issue_is_one_fact_across_hosts() {
         fn pull(&mut self, _: &str, _: u32) -> Option<PullFacts> {
             None
         }
+        fn issue(&mut self, _: &str, _: u32) -> Option<IssueFacts> {
+            Some(IssueFacts::Open)
+        }
+
         fn label_history(&mut self, _: &str, _: u32) -> Option<LabelHistory> {
             let label = |l: &str| l.to_string();
             Some(LabelHistory {
@@ -469,4 +492,91 @@ fn a_claimed_ready_issue_is_one_fact_across_hosts() {
     let (fact_b, _) = host("host-b", false, 60, 360);
     assert_eq!(fact_a.len(), 16);
     assert_eq!(fact_a, fact_b, "one claim, one fact");
+}
+
+/// End to end through the producer (#11398): an issue closed by hand as
+/// `completed` mid-sweep, with no closing commit, is one `abandoned` exit at
+/// its `closed_at` with dwell, and two hosts on different cadences map it to
+/// one fact.
+#[test]
+fn a_hand_closed_issue_mid_sweep_is_one_abandoned_fact_across_hosts() {
+    use crate::observability::fleet_state::outcomes::{
+        diff, listed, remember, ForgeReads, IssueFacts, LabelHistory, Memory, Pass, PullFacts,
+    };
+    use crate::observability::fleet_state::{build_view, FleetInput, HeldSweep};
+    use std::collections::BTreeMap;
+
+    let closed_at = ts() + Duration::seconds(100);
+    struct Forge(DateTime<Utc>);
+    impl ForgeReads for Forge {
+        fn pull(&mut self, _: &str, _: u32) -> Option<PullFacts> {
+            None
+        }
+        fn issue(&mut self, _: &str, _: u32) -> Option<IssueFacts> {
+            let close = serde_json::json!([{
+                "event": "closed",
+                "created_at": "2026-10-11T00:00:00Z",
+                "commit_id": null,
+            }]);
+            Some(IssueFacts::closed("rjwalters/loom", 1, self.0, &[close], &[]))
+        }
+        fn label_history(&mut self, _: &str, _: u32) -> Option<LabelHistory> {
+            None
+        }
+    }
+    let input = |held: bool| FleetInput {
+        host_id: "h".to_string(),
+        managed: ["o/r".to_string()].into(),
+        held: held
+            .then(|| HeldSweep {
+                repo: "o/r".to_string(),
+                issue: 7,
+                stage: FleetStage::SweepCurator,
+                entered_at: ts(),
+                entered_at_lower_bound: false,
+                pr: None,
+                overflow: false,
+                start: Default::default(),
+                sweep_id: None,
+            })
+            .into_iter()
+            .collect(),
+        listings: Vec::new(),
+        listed_at: None,
+        ready: None,
+        capacity: None,
+        main_ci: BTreeMap::new(),
+    };
+    let host = |name: &str, first: i64, step: i64| {
+        let mut memory = Memory::default();
+        let mut prev = None;
+        let mut all = Vec::new();
+        for (i, held) in [true, false, false].into_iter().enumerate() {
+            let now = ts() + Duration::seconds(first + step * i as i64);
+            let fleet = input(held);
+            let view = build_view(&fleet, prev.as_ref(), now);
+            let listed = listed(&fleet.listings);
+            let pass = Pass {
+                view: &view,
+                listed: &listed,
+                managed: &fleet.managed,
+                now,
+            };
+            all.extend(diff(&mut memory, &pass, &mut Forge(closed_at), &provenance()));
+            memory = remember(memory, &pass);
+            prev = Some(view);
+        }
+        assert_eq!(all.len(), 1, "exactly one exit: {all:?}");
+        let TelemetryRecord::StageOutcome(r) = &all[0] else {
+            panic!("{all:?}");
+        };
+        assert_eq!((r.exit, r.left_at), (StageExit::Abandoned, closed_at));
+        assert_eq!((r.forge_transition_at, r.dwell_sec), (Some(closed_at), Some(100)));
+        ids(name, &all[0], first)
+    };
+    let (fact_a, record_a) = host("host-a", 30, 120);
+    let (fact_b, record_b) = host("host-b", 60, 400);
+    assert_eq!(fact_a.len(), 16);
+    assert_eq!(fact_a, fact_b, "one close, one fact");
+    assert_ne!(record_a, record_b);
 }

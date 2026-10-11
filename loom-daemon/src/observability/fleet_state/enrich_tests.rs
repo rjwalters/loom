@@ -39,6 +39,13 @@ impl ForgeReads for Forge {
     fn pull(&mut self, _: &str, _: u32) -> Option<PullFacts> {
         None
     }
+    fn issue(
+        &mut self,
+        _: &str,
+        _: u32,
+    ) -> Option<crate::observability::fleet_state::outcomes::IssueFacts> {
+        Some(crate::observability::fleet_state::outcomes::IssueFacts::Open)
+    }
 
     fn label_history(&mut self, _: &str, n: u32) -> Option<LabelHistory> {
         self.reads.push(n);
