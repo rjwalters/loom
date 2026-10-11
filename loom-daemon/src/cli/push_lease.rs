@@ -476,7 +476,6 @@ mod tests {
             "a pin re-read from the forge after the fix work can be a sibling's push"
         );
         assert!(doctor.contains(r#"PUSH_LEASE_SHA="${PUSH_LEASE_SHA:-${CLAIM_HEAD_SHA:?}}""#));
-        let guard = r#"git merge-base --is-ancestor "$PUSH_LEASE_SHA" HEAD"#;
         let re_pin = "{ PUSH_LEASE_SHA=$(git rev-parse HEAD); PUSH_LEASE_OK=$PUSH_LEASE_SHA; CLAIM_HEAD_SHA=$PUSH_LEASE_SHA; }";
         assert!(doctor.matches(re_pin).count() >= 2, "both rewrite recipes re-pin");
         // Every fenced block that rebases onto main and pushes a pinned lease

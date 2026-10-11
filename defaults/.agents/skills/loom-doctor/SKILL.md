@@ -990,7 +990,7 @@ git push --force-with-lease="$BRANCH:$PUSH_LEASE_SHA" &&
   { PUSH_LEASE_SHA=$(git rev-parse HEAD); PUSH_LEASE_OK=$PUSH_LEASE_SHA; CLAIM_HEAD_SHA=$PUSH_LEASE_SHA; }  # own push: re-pin
 ```
 
-Never hand-bump `VERSION` & co. here (#7743, #7341): if the gate fires, stop and report on the PR.
+Never hand-bump `VERSION` & co. here (#7743; `bef3e07a`, #7341): if the gate fires, stop and report on the PR.
 
 **Standing down** (a concurrent fix already landed):
 
