@@ -160,6 +160,7 @@ fn a_sweep_row_with_a_lower_bound_entry_is_dated_again_each_pass_without_a_read(
         pr: Some(21),
         overflow: false,
         start: Default::default(),
+        sweep_id: None,
     }];
     let mut memory = EnrichMemory::default();
     let first = run(&inp, None, &mut memory, &mut forge, t0());
@@ -288,6 +289,7 @@ fn a_sweep_row_takes_the_linked_prs_flags_and_keeps_its_earlier_star() {
         pr: Some(21),
         overflow: false,
         start: Default::default(),
+        sweep_id: None,
     }];
     let mut prev = build_view(&input(vec![]), None, t0());
     let mut earlier = FleetStateRow::new(20, FleetStage::ReadyWait, t0());

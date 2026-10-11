@@ -1,10 +1,13 @@
 //! `loom.fact_id` -- the cross-host id of outcome facts (Issues #11125,
-//! #11126): keyed on forge-observed instants only.
+//! #11126): keyed on forge-observed instants, else the holding sweep's id or
+//! a forge-dated entry (#11401), and never host- or emission-dependent.
 
 use super::*;
 use crate::telemetry::kinds::fleet_state::FleetStage;
 use crate::telemetry::kinds::pr_resolved::{PrResolution, PrResolvedRecord};
-use crate::telemetry::kinds::stage_outcome::{EnteredAtSource, StageExit, StageOutcomeRecord};
+use crate::telemetry::kinds::stage_outcome::{
+    EnteredAtSource, FactIdMissingReason, StageExit, StageOutcomeRecord,
+};
 use crate::telemetry::provenance::Provenance;
 use chrono::Duration;
 
@@ -53,6 +56,8 @@ fn stage_record(issue: u32, stage: FleetStage, next: FleetStage, poll: i64) -> S
         observed_at: ts() + Duration::seconds(poll),
         resolution_sec: Some(0),
         forge_transition_at: Some(ts()),
+        sweep_id: None,
+        fact_id_missing_reason: None,
         loom: provenance(),
     }
 }
@@ -108,20 +113,163 @@ fn two_hosts_polling_one_transition_at_different_times_share_the_fact_id() {
     assert_eq!(a, b);
 }
 
+/// The value of `key` on the log `record` maps to from `host`, or "".
+fn attr_of(host: &str, record: &TelemetryRecord, key: &str) -> String {
+    let log = log_record_for(&envelope(host, record.clone())).expect("maps to a log");
+    log.attributes
+        .iter()
+        .find(|kv| kv.key == key)
+        .and_then(|kv| match kv.value.as_ref()?.value.as_ref()? {
+            any_value::Value::StringValue(s) => Some(s.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// A sweep-stage exit with no forge instant: what `outcomes` builds for a
+/// row of this host's sweep `sweep`, entered at checkpoint `entered`.
+fn sweep_record(sweep: &str, entered: i64) -> StageOutcomeRecord {
+    StageOutcomeRecord {
+        forge_transition_at: None,
+        sweep_id: Some(sweep.to_string()),
+        entered_at: Some(ts() - Duration::seconds(entered)),
+        entered_at_source: Some(EnteredAtSource::Checkpoint),
+        resolution_sec: Some(300),
+        fact_id_missing_reason: Some(FactIdMissingReason::NoForgeInstant),
+        ..stage_record(9, FleetStage::SweepCurator, FleetStage::SweepBuilder, 30)
+    }
+}
+
 #[test]
-fn a_transition_with_no_forge_instant_carries_no_fact_id() {
+fn a_transition_with_nothing_to_key_on_carries_a_reason_instead() {
     let record = StageOutcomeRecord {
         forge_transition_at: None,
         ..stage_record(9, FleetStage::SweepCurator, FleetStage::SweepBuilder, 30)
     };
-    let (fact, record_id) = ids("host-a", &TelemetryRecord::StageOutcome(record), 0);
-    assert_eq!(fact, "", "no forge instant, no fact id");
+    let record = TelemetryRecord::StageOutcome(record);
+    let (fact, record_id) = ids("host-a", &record, 0);
+    assert_eq!(fact, "", "no key, no fact id");
     assert_eq!(record_id.len(), 16);
+    assert_eq!(
+        attr_of("host-a", &record, "loom.fact_id_missing_reason"),
+        "no_forge_instant",
+        "an unset reason still reads as one"
+    );
+    let failed = TelemetryRecord::StageOutcome(StageOutcomeRecord {
+        forge_transition_at: None,
+        fact_id_missing_reason: Some(FactIdMissingReason::ForgeReadFailed),
+        ..stage_record(9, FleetStage::ReviewWait, FleetStage::MergeWait, 30)
+    });
+    assert_eq!(attr_of("h", &failed, "loom.fact_id_missing_reason"), "forge_read_failed");
     let pr = PrResolvedRecord {
         closed_at: None,
         ..pr_record(7, PrResolution::Merged, 0)
     };
     assert_eq!(ids("host-a", &TelemetryRecord::PrResolved(pr), 0).0, "");
+}
+
+/// #11401: a sweep stage has no forge instant, so it keys on the sweep id;
+/// the host, `observed_at`, `left_at` and emission time do not matter.
+#[test]
+fn a_sweep_stage_exit_is_keyed_on_its_sweep_id() {
+    let a = TelemetryRecord::StageOutcome(sweep_record("sweep-issue-9-1", 600));
+    let b = TelemetryRecord::StageOutcome(StageOutcomeRecord {
+        observed_at: ts() + Duration::seconds(999),
+        left_at: ts() + Duration::seconds(240),
+        ..sweep_record("sweep-issue-9-1", 600)
+    });
+    let (fact_a, rec_a) = ids("host-a", &a, 0);
+    let (fact_b, rec_b) = ids("host-b", &b, 90);
+    assert_eq!(fact_a.len(), 16);
+    assert_eq!(fact_a, fact_b, "stable across re-emission and hosts");
+    assert_ne!(rec_a, rec_b);
+    assert_eq!(attr_of("host-a", &a, "loom.fact_id_missing_reason"), "", "keyed: no reason");
+    let other = TelemetryRecord::StageOutcome(sweep_record("sweep-issue-9-2", 600));
+    assert_ne!(fact_a, ids("h", &other, 0).0, "another sweep, another fact");
+    let reentry = TelemetryRecord::StageOutcome(sweep_record("sweep-issue-9-1", 60));
+    assert_ne!(fact_a, ids("h", &reentry, 0).0, "a re-entry within the sweep is another fact");
+}
+
+/// No re-keying: an id derived from a forge instant is exactly the #11125 key,
+/// whatever sweep id or entry the record also carries.
+#[test]
+fn a_forge_instant_id_is_unchanged() {
+    let base = stage_record(9, FleetStage::ReviewWait, FleetStage::MergeWait, 30);
+    let golden = super::super::fact_id::derive(
+        "eta.stage_outcome",
+        &[
+            "o/r",
+            "9",
+            "review_wait",
+            "merge_wait",
+            &crate::telemetry::trace::instant(ts()),
+        ],
+    );
+    let with_extras = StageOutcomeRecord {
+        sweep_id: Some("sweep-issue-9-1".to_string()),
+        entered_at: Some(ts() - Duration::seconds(60)),
+        entered_at_source: Some(EnteredAtSource::Forge),
+        ..base.clone()
+    };
+    for record in [base, with_extras] {
+        assert_eq!(ids("h", &TelemetryRecord::StageOutcome(record), 0).0, golden);
+    }
+}
+
+/// A failed exit read with a forge-dated entry keys on the entry; a
+/// checkpoint entry without a sweep id is no key.
+#[test]
+fn a_forge_dated_entry_keys_an_exit_with_no_forge_instant() {
+    let entry = |source| StageOutcomeRecord {
+        forge_transition_at: None,
+        entered_at: Some(ts() - Duration::seconds(600)),
+        entered_at_source: Some(source),
+        fact_id_missing_reason: Some(FactIdMissingReason::ForgeReadFailed),
+        ..stage_record(9, FleetStage::MergeHold, FleetStage::MergeWait, 30)
+    };
+    let forge = TelemetryRecord::StageOutcome(entry(EnteredAtSource::Forge));
+    let (fact, _) = ids("host-a", &forge, 0);
+    assert_eq!(fact.len(), 16);
+    assert_eq!(fact, ids("host-b", &forge, 300).0);
+    assert_eq!(attr_of("h", &forge, "loom.fact_id_missing_reason"), "");
+    let checkpoint = TelemetryRecord::StageOutcome(entry(EnteredAtSource::Checkpoint));
+    assert_eq!(ids("h", &checkpoint, 0).0, "");
+    assert_eq!(attr_of("h", &checkpoint, "loom.fact_id_missing_reason"), "forge_read_failed");
+}
+
+/// Every combination of the key sources maps to exactly one of
+/// `loom.fact_id` and `loom.fact_id_missing_reason`, never neither.
+#[test]
+fn every_stage_outcome_carries_a_fact_id_or_a_reason() {
+    let sources = [
+        None,
+        Some(EnteredAtSource::Forge),
+        Some(EnteredAtSource::Checkpoint),
+        Some(EnteredAtSource::Unknown),
+    ];
+    for forge_at in [None, Some(ts())] {
+        for sweep in [None, Some(""), Some("sweep-issue-9-1")] {
+            for entered in [None, Some(ts() - Duration::seconds(60))] {
+                for source in sources {
+                    for reason in [None, Some(FactIdMissingReason::ForgeReadFailed)] {
+                        let r = StageOutcomeRecord {
+                            forge_transition_at: forge_at,
+                            sweep_id: sweep.map(str::to_string),
+                            entered_at: entered,
+                            entered_at_source: source,
+                            fact_id_missing_reason: reason,
+                            ..stage_record(9, FleetStage::Doctor, FleetStage::ReviewWait, 30)
+                        };
+                        let record = TelemetryRecord::StageOutcome(r.clone());
+                        let fact = ids("h", &record, 0).0;
+                        let why = attr_of("h", &record, "loom.fact_id_missing_reason");
+                        assert!(fact.is_empty() != why.is_empty(), "{fact:?} {why:?} {r:?}");
+                        assert_eq!(fact.is_empty(), !r.has_fact_key(), "{r:?}");
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -268,6 +416,7 @@ fn a_claimed_ready_issue_is_one_fact_across_hosts() {
                 pr: None,
                 overflow: false,
                 start: Default::default(),
+                sweep_id: None,
             })
             .into_iter()
             .collect(),

@@ -185,6 +185,8 @@ pub struct HeldSweep {
     pub overflow: bool,
     /// The sweep's dispatch-time facts (#11280), when this daemon has them.
     pub start: SweepStartFacts,
+    /// The sweep's id (#11401), keying its stages' `loom.fact_id`.
+    pub sweep_id: Option<String>,
 }
 
 /// One open item from a repo's review listings.
@@ -393,6 +395,7 @@ pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Ut
                 FleetSlot::Regular
             }),
             start: sweep.start.clone(),
+            sweep_id: sweep.sweep_id.clone(),
             ..FleetStateRow::new(sweep.issue, sweep.stage, sweep.entered_at)
         };
         offer(&mut candidates, &sweep.repo, Source::Held, row);

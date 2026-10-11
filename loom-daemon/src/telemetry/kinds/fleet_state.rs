@@ -255,6 +255,12 @@ pub struct FleetStateRow {
     /// on `fleet-state/v1`.
     #[serde(flatten)]
     pub start: SweepStartFacts,
+    /// A sweep row only: the id of this host's sweep that holds the item
+    /// (#11401), the `loom.fact_id` key of the row's `eta.stage_outcome` when
+    /// no forge instant dates the exit. Present exactly when `host` is.
+    /// Additive on `fleet-state/v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sweep_id: Option<String>,
     /// `ready_wait` only: this host's planner rank, the 1-based position in
     /// the work finder's dispatch order on its last tick.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -334,6 +340,7 @@ impl FleetStateRow {
             host: None,
             slot: None,
             start: SweepStartFacts::default(),
+            sweep_id: None,
             rank: None,
             star: false,
             star_at: None,

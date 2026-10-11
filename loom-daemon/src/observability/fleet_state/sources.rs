@@ -149,6 +149,7 @@ fn held_sweeps(
                 pr,
                 overflow: info.overflow,
                 start: starts.get(&info.sweep_id).cloned().unwrap_or_default(),
+                sweep_id: Some(info.sweep_id.clone()),
             });
         }
     }
