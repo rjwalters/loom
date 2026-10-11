@@ -159,8 +159,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
                 force,
                 ignore_host_constraint,
                 allow_local,
-                runtime,
-                model_profile,
+                tap,
             } => {
                 handle_dispatch_command(
                     issue,
@@ -171,8 +170,8 @@ pub(crate) async fn run_daemon() -> Result<()> {
                     force,
                     ignore_host_constraint,
                     allow_local,
-                    runtime,
-                    model_profile,
+                    tap.runtime,
+                    tap.model_profile,
                 )
                 .await
             }

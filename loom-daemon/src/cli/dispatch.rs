@@ -209,6 +209,21 @@ fn heavy_local_refusal(
 ///
 /// # Host-class gate (#9034)
 ///
+/// Per-dispatch runtime tap flags for `loom-daemon dispatch` (#11284), kept here
+/// (flattened into `Commands::Dispatch`) so `main.rs` does not grow.
+#[derive(clap::Args, Debug, Clone, Default)]
+pub(crate) struct DispatchTapArgs {
+    /// Run the sweep's Builder and Doctor phases on this runtime (#11284),
+    /// e.g. `opencode`. An unavailable or unadmitted runtime is refused,
+    /// never silently replaced. Curator/Judge keep their role policy.
+    #[arg(long, value_name = "RUNTIME")]
+    pub(crate) runtime: Option<String>,
+
+    /// Model profile for `--runtime` (e.g. `zai-flash`). Requires `--runtime`.
+    #[arg(long, value_name = "PROFILE", requires = "runtime")]
+    pub(crate) model_profile: Option<String>,
+}
+
 /// Same fetch, same client-side timing: unless `allow_local` is set, refuses
 /// a `loom:heavy` issue when this host resolves to `host_class: local-dev`
 /// (env `LOOM_HOST_CLASS` / `autonomous.workFinder.hostClass`), mirroring

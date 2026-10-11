@@ -86,7 +86,7 @@ pub(super) async fn dispatch_sweep_nonblocking(
         .await
         {
             Ok(Ok(plan)) => (repo_root, plan),
-            Ok(Err(response)) => return response,
+            Ok(Err(response)) => return *response,
             Err(error) => return dispatch_error_response(&kind, error.into()),
         }
     };
@@ -164,7 +164,7 @@ pub(super) async fn dispatch_sweep_nonblocking(
             // `Err`: nothing is recorded.
             if matches!(&result, Ok(outcome) if outcome.was_new) {
                 if let Err(response) = tap_plan.commit(&tap_root) {
-                    return response;
+                    return *response;
                 }
             }
             return dispatch_result_to_response(&kind, result);
@@ -175,7 +175,7 @@ pub(super) async fn dispatch_sweep_nonblocking(
     // before the worker's phase runner can read it.
     let tap_rollback = match tap_plan.commit(&tap_root) {
         Ok(rollback) => rollback,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
 
     // Phase 2 (UNLOCKED): poll the child for its account-selection log line.

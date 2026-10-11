@@ -137,7 +137,7 @@ impl Planned {
     ///
     /// # Errors
     /// A ready-to-send [`Response`] if the record cannot be written.
-    pub fn commit(self, root: &Path) -> Result<Option<Rollback>, Response> {
+    pub fn commit(self, root: &Path) -> Result<Option<Rollback>, Box<Response>> {
         let (issue, tap) = match self {
             Planned::Nothing => return Ok(None),
             Planned::Clear(issue) => (issue, None),
@@ -150,10 +150,12 @@ impl Planned {
         };
         match tap {
             None => clear(root, issue),
-            Some(tap) => save(root, issue, &tap).map_err(|e| Response::Error {
-                message: format!(
-                    "dispatch_sweep: cannot record runtime override for #{issue}: {e}"
-                ),
+            Some(tap) => save(root, issue, &tap).map_err(|e| {
+                Box::new(Response::Error {
+                    message: format!(
+                        "dispatch_sweep: cannot record runtime override for #{issue}: {e}"
+                    ),
+                })
             })?,
         }
         Ok(Some(rollback))
@@ -165,26 +167,29 @@ impl Planned {
 /// dispatch has been accepted.
 ///
 /// # Errors
-/// A ready-to-send [`Response`]: `Error` for a malformed or unsupported
+/// A boxed (keeps `Err` small, `clippy::result_large_err`) ready-to-send
+/// [`Response`]: `Error` for a malformed or unsupported
 /// request, `RuntimeRejected` when the tap is unavailable or unadmitted.
 pub fn validate_request(
     root: &Path,
     kind: &SweepKind,
     runtime: Option<&str>,
     model_profile: Option<&str>,
-) -> Result<Planned, Response> {
-    let tap = parse_explicit_tap(runtime, model_profile).map_err(|message| Response::Error {
-        message: format!("dispatch_sweep: {message}"),
+) -> Result<Planned, Box<Response>> {
+    let tap = parse_explicit_tap(runtime, model_profile).map_err(|message| {
+        Box::new(Response::Error {
+            message: format!("dispatch_sweep: {message}"),
+        })
     })?;
     let issue = match (kind, &tap) {
         (SweepKind::Issue(issue), _) => u64::from(*issue),
         (SweepKind::PrSet(_), None) => return Ok(Planned::Nothing),
         (SweepKind::PrSet(_), Some(_)) => {
-            return Err(Response::Error {
+            return Err(Box::new(Response::Error {
                 message: "dispatch_sweep: runtime/modelProfile is only supported for issue \
                           sweeps (a PR-set sweep has no issue to key the override on)"
                     .to_string(),
-            })
+            }))
         }
     };
     let Some(tap) = tap else {
@@ -192,7 +197,8 @@ pub fn validate_request(
     };
     // The first coding phase is the one that has to launch; Doctor is judged
     // again when it launches, against the same recorded tap.
-    resolve_for_dispatch_tap(root, "builder", &tap).map_err(Response::RuntimeRejected)?;
+    resolve_for_dispatch_tap(root, "builder", &tap)
+        .map_err(|e| Box::new(Response::RuntimeRejected(e)))?;
     Ok(Planned::Save(issue, tap))
 }
 
@@ -231,16 +237,19 @@ mod tests {
     fn malformed_request_is_an_error_response() {
         let dir = tempfile::tempdir().unwrap();
         let r = validate_request(dir.path(), &SweepKind::Issue(1), None, Some("zai-flash"));
-        assert!(matches!(r, Err(Response::Error { .. })), "{r:?}");
+        assert!(matches!(r.as_ref().map_err(|e| &**e), Err(Response::Error { .. })), "{r:?}");
         let r = validate_request(dir.path(), &SweepKind::PrSet(vec![3]), Some("claude"), None);
-        assert!(matches!(r, Err(Response::Error { .. })), "{r:?}");
+        assert!(matches!(r.as_ref().map_err(|e| &**e), Err(Response::Error { .. })), "{r:?}");
     }
 
     #[test]
     fn unadmitted_tap_is_refused_and_nothing_is_recorded() {
         let dir = tempfile::tempdir().unwrap();
         let r = validate_request(dir.path(), &SweepKind::Issue(1), Some("no-such-rt"), None);
-        assert!(matches!(r, Err(Response::RuntimeRejected(_))), "{r:?}");
+        assert!(
+            matches!(r.as_ref().map_err(|e| &**e), Err(Response::RuntimeRejected(_))),
+            "{r:?}"
+        );
         assert_eq!(load(dir.path(), 1), None);
     }
 

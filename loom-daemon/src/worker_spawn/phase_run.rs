@@ -1032,7 +1032,10 @@ mod tests {
             Some("opencode"),
             Some("zai-flash"),
         );
-        assert!(matches!(refused, Err(crate::types::Response::RuntimeRejected(_))));
+        assert!(matches!(
+            refused.as_ref().map_err(|e| &**e),
+            Err(crate::types::Response::RuntimeRejected(_))
+        ));
         assert!(crate::dispatch_tap::load(dir.path(), 77).is_none());
     }
 

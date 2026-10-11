@@ -25,6 +25,7 @@ import {
   sendDaemonRequest,
   sendDaemonStreamRequest,
 } from "../shared/daemon.js";
+import { DISPATCH_OPTION_PROPERTIES, dispatchOptionBodyFields, extractDispatchOptions, type DispatchOptions } from "./sweep-dispatch-options.js";
 
 // ============================================================================
 // Per-call IPC timeouts (issue #3945)
@@ -503,10 +504,7 @@ async function dispatchSweep(args: {
   effort?: string;
   depends_on?: number;
   workspace_root?: string;
-  force?: boolean;
-  runtime?: string;
-  model_profile?: string;
-}): Promise<
+} & DispatchOptions): Promise<
   | { success: true; result: DispatchResponse["payload"] }
   | { success: false; error: string; runtime_rejection?: RuntimeRejection }
 > {
@@ -538,13 +536,8 @@ async function dispatchSweep(args: {
         // Rust-side field is a bare `bool` (not `Option<bool>`) — sending
         // `null` here would fail serde deserialization on every dispatch, so
         // this MUST default to `false`, never `null`/omitted.
-        force: args.force ?? false,
-        // Issue #11284: optional per-dispatch runtime / model profile for the
-        // sweep's Builder and Doctor phases. `null` (the default) keeps the
-        // role policy; an unavailable or unadmitted tap is refused by the
-        // daemon, never silently replaced.
-        runtime: args.runtime ?? null,
-        model_profile: args.model_profile ?? null,
+        // `force` (#4317) and runtime/model_profile (#11284); see sweep-dispatch-options.ts.
+        ...dispatchOptionBodyFields(args),
       },
     }, Math.max(DISPATCH_TIMEOUT_MS, resolveDaemonIpcTimeoutMs()))) as DaemonResponse;
 
@@ -915,35 +908,7 @@ export const sweepTools: Tool[] = [
             "root they intend to target, e.g. `$(git rev-parse " +
             "--show-toplevel)`, rather than relying on omission.",
         },
-        force: {
-          type: "boolean",
-          description:
-            "Optional operator override for the host-distress circuit " +
-            "breaker (issue #4235). A tripped breaker represents sustained, " +
-            "already-observed host distress, so it hard-blocks an explicit " +
-            "dispatch_sweep by default. Set to `true` to say \"I know the " +
-            "host is distressed, dispatch anyway\" and bypass that block. " +
-            "Omit (or pass `false`) to preserve the default refuse-when-" +
-            "tripped behavior — mirrors the CLI's `loom-daemon dispatch <N> " +
-            "--force`.",
-        },
-        runtime: {
-          type: "string",
-          description:
-            "Optional (issue #11284): run this sweep's Builder and Doctor " +
-            "phases on an explicit runtime (e.g. `opencode`). Curator, " +
-            "Judge and the orchestrator keep their role policy. An " +
-            "unavailable or unadmitted runtime/profile is refused with the " +
-            "reason - it never falls through to the preference list. Omit " +
-            "to keep the configured role preference.",
-        },
-        model_profile: {
-          type: "string",
-          description:
-            "Optional model profile paired with `runtime` (e.g. " +
-            "`zai-flash`; `modelProfile` is accepted as an alias). Requires " +
-            "`runtime`.",
-        },
+        ...DISPATCH_OPTION_PROPERTIES,
       },
       required: ["kind"],
     },
@@ -1384,16 +1349,8 @@ export async function handleSweepTool(
         args.depends_on > 0
           ? (args.depends_on as number)
           : undefined;
-      // Issue #4317: defensive extraction — only a literal boolean `true`
-      // forwards as `true` (e.g. the string `"true"` or `1` must NOT).
-      const force = args?.force === true;
-      // Issue #11284: optional per-dispatch tap. Blank strings are unset;
-      // shape/combination errors are reported by the daemon with an
-      // actionable message.
-      const nonEmpty = (v: unknown): string | undefined =>
-        typeof v === "string" && v.trim().length > 0 ? v.trim() : undefined;
-      const runtime = nonEmpty(args?.runtime);
-      const modelProfile = nonEmpty(args?.model_profile) ?? nonEmpty(args?.modelProfile);
+      // #4317 / #11284: defensive extraction of force + runtime/model_profile.
+      const dispatchOptions = extractDispatchOptions(args);
 
       const result = await dispatchSweep({
         kind: normalized,
@@ -1402,9 +1359,7 @@ export async function handleSweepTool(
         effort,
         depends_on: dependsOn,
         workspace_root: extractWorkspaceRoot(args),
-        force,
-        runtime,
-        model_profile: modelProfile,
+        ...dispatchOptions,
       });
       if (!result.success) {
         // Issue #4494: a capability refusal renders the structured fields as

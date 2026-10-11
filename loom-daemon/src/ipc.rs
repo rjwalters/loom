@@ -2945,7 +2945,7 @@ fn handle_request(
                 model_profile.as_deref(),
             ) {
                 Ok(plan) => plan,
-                Err(response) => return response,
+                Err(response) => return *response,
             };
 
             // Headroom advisory (#4234, Gap 1 of #4231's decomposition): consult
@@ -2988,7 +2988,7 @@ fn handle_request(
                     // in-flight sweep itself: leave its record alone.
                     if outcome.was_new {
                         if let Err(response) = tap_plan.commit(&repo_root) {
-                            return response;
+                            return *response;
                         }
                     }
                     Response::SweepDispatched {

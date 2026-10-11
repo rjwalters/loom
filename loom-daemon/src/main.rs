@@ -356,15 +356,8 @@ enum Commands {
         #[arg(long)]
         allow_local: bool,
 
-        /// Run the sweep's Builder and Doctor phases on this runtime (#11284),
-        /// e.g. `opencode`. An unavailable or unadmitted runtime is refused,
-        /// never silently replaced. Curator/Judge keep their role policy.
-        #[arg(long, value_name = "RUNTIME")]
-        runtime: Option<String>,
-
-        /// Model profile for `--runtime` (e.g. `zai-flash`). Requires `--runtime`.
-        #[arg(long, value_name = "PROFILE", requires = "runtime")]
-        model_profile: Option<String>,
+        #[command(flatten)]
+        tap: cli::dispatch::DispatchTapArgs,
     },
 
     /// Cancel a running sweep via the running daemon (Issue #4980): the `dispatch`
