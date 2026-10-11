@@ -320,7 +320,7 @@ previous_review_label() {
   local label
   label=$(gh api --paginate "repos/{owner}/{repo}/issues/${number}/events?per_page=100" --jq \
     ".[] | select(.event == \"labeled\" and (.label.name == \"loom:review-requested\" or .label.name == \"loom:changes-requested\")) | .label.name" \
-    2>/dev/null | head -1)  # per-issue + --paginate (#8742 review; repo-wide walk: ~300 calls on a miss, ~6-day horizon); newest-first: first match is the latest; ends pagination
+    2>/dev/null | tail -1)  # per-issue + --paginate (#8742 review; repo-wide walk: ~300 calls on a miss, ~6-day horizon); events ascend oldest-first, so the LAST match is the latest; paging runs to the end (accepted cost)
   if [ "$label" = "loom:changes-requested" ]; then
     echo "loom:changes-requested"
   else

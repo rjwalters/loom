@@ -15,25 +15,31 @@
 # The fix routes both helpers through the per-issue endpoint WITH
 # pagination: `gh api --paginate repos/{owner}/{repo}/issues/$N/events`.
 # That bounds the walk by the issue's own event count, with no repo-wide
-# horizon. The `head -1` / newest-first ordering semantics the Judge
-# verified are kept unchanged.
+# horizon. Ordering: the per-issue endpoint returns events OLDEST-FIRST
+# (chronologically ascending — verified by the Judge against this PR's own
+# event history), so `previous_review_label()` takes the LAST match
+# (`tail -1`); `was_previously_approved()` is existence-only, so its
+# `head -1` has no order dependence.
 #
 # Verifies that:
 #   1. All three shipped copies (guide.md, the loom-guide SKILL.md mirror,
 #      park-record.md) call the per-issue endpoint
 #      `repos/{owner}/{repo}/issues/${number}/events?per_page=100` with
 #      `--paginate`, and no repo-wide `repos/{owner}/{repo}/issues/events`
-#      call remains in any of them.
+#      call remains in any of them; no "newest-first" ordering claim
+#      remains either (the endpoint is ascending).
 #   2. THE REGRESSION, executed rather than grepped: the extracted
 #      `was_previously_approved()` finds a `loom:issue` labeled event that
 #      sits beyond the first 100 events of the issue (an unpaged per-issue
 #      read would truncate it away — the original #8742 defect in mirror
 #      image), and returns "false" without matching when the issue was
 #      never approved.
-#   3. `previous_review_label()` keeps its verified ordering semantics:
-#      newest-first (`head -1` wins), defaulting to `loom:review-requested`
-#      on empty/ambiguous history — and paginates to a review label that
-#      sits beyond the first page.
+#   3. `previous_review_label()` restores the LATEST review label under
+#      ascending event order: a `changes-requested` followed by a later
+#      `review-requested` restores `loom:review-requested`, and vice versa
+#      — both cases fail against the old `head -1` code — defaulting to
+#      `loom:review-requested` on empty/ambiguous history, and paginating
+#      to a review label that sits beyond the first page.
 #
 # Hermetic: the `gh` CLI is replaced by a stub function that emulates
 # `--paginate` (all events) vs unpaged (first per_page slice), validates the
@@ -125,10 +131,15 @@ for f in "$GUIDE_MD" "$SKILL_MD" "$PARK_MD"; do
         "$(basename "$f"): no repo-wide issues/events walk remains"
 done
 
-# `head -1` newest-first semantics survive in both helpers (Judge-verified;
-# the fix is endpoint-only).
-assert_grep 'head -1' "$GUIDE_MD" "guide.md: was_previously_approved keeps head -1 newest-first"
-assert_grep 'head -1' "$PARK_MD" "park-record.md: previous_review_label keeps head -1 newest-first"
+# `was_previously_approved` keeps `head -1` (existence-only: any match
+# satisfies it, no order dependence); `previous_review_label` takes the
+# LAST match — the endpoint is ascending, so `tail -1` is the latest.
+assert_grep 'head -1' "$GUIDE_MD" "guide.md: was_previously_approved keeps head -1 (existence-only)"
+assert_grep 'tail -1' "$PARK_MD" "park-record.md: previous_review_label takes the last (newest) match"
+for f in "$GUIDE_MD" "$SKILL_MD" "$PARK_MD"; do
+    assert_not_grep 'newest-first' "$f" \
+        "$(basename "$f"): no false newest-first ordering claim remains"
+done
 
 # ---------------------------------------------------------------------------
 # Executable regression harness: extract the real functions from the shipped
@@ -199,9 +210,10 @@ gh() {
     fi
 }
 
-# Fixture writers. Events are ordered newest-first (GitHub semantics), so
-# index 0 is the MOST RECENT event; a "beyond the first page" event is
-# therefore the OLDEST one, appended last.
+# Fixture writers. Events are ordered OLDEST-FIRST (GitHub's per-issue
+# events endpoint returns them chronologically ascending), so index 0 is
+# the EARLIEST event; a "beyond the first page" event is the NEWEST one,
+# appended last.
 filler_event() { # $1 = kind
     printf '{"event":"%s"}' "$1"
 }
@@ -291,18 +303,20 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Test 5: previous_review_label — newest-first ordering semantics preserved.
+# Test 5: previous_review_label — ascending order, last match is the latest.
+# Both orderings below FAIL against the old `head -1` code (which returned
+# the first — i.e. oldest — match) and pass with `tail -1`.
 # ---------------------------------------------------------------------------
 echo ""
-echo "Test 5: previous_review_label keeps newest-first ordering"
+echo "Test 5: previous_review_label restores the LATEST review label (ascending order)"
 
 write_fixture 4301 0 "$(labeled_event loom:changes-requested)" "$(labeled_event loom:review-requested)"
-assert_eq "$(previous_review_label 4301)" "loom:changes-requested" \
-    "changes-requested as the newest event restores loom:changes-requested"
+assert_eq "$(previous_review_label 4301)" "loom:review-requested" \
+    "changes-requested followed by a later review-requested restores loom:review-requested"
 
 write_fixture 4302 0 "$(labeled_event loom:review-requested)" "$(labeled_event loom:changes-requested)"
-assert_eq "$(previous_review_label 4302)" "loom:review-requested" \
-    "review-requested as the newest event restores loom:review-requested"
+assert_eq "$(previous_review_label 4302)" "loom:changes-requested" \
+    "review-requested followed by a later changes-requested restores loom:changes-requested"
 
 write_fixture 4303 0 "$(filler_event closed)"
 assert_eq "$(previous_review_label 4303)" "loom:review-requested" \

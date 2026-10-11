@@ -607,7 +607,7 @@ was_previously_approved() {
   local number="$1"
   # True if `loom:issue` appears anywhere in the issue's label event history.
   # Per-issue /events + --paginate (#8742: repo-wide walk = ~300 calls on a
-  # miss, ~6-day horizon); newest-first, so `head -1` ends paging.
+  # miss, ~6-day horizon); ascending; existence-only, so `head -1` suffices.
   [ -n "$(gh api --paginate "repos/{owner}/{repo}/issues/${number}/events?per_page=100" \
     --jq ".[] | select(.event == \"labeled\" and .label.name == \"loom:issue\") | 1" 2>/dev/null | head -1)" ] && echo true || echo false
 }
