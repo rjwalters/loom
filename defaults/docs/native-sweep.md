@@ -81,7 +81,8 @@ A Claude-orchestrated sweep can run only its Builder and Doctor phases on
 another runtime (e.g. `opencode:zai-flash`) via `runtimes.rolePreference`.
 Before each such phase the orchestrator calls
 `loom-daemon worker run --role builder --issue N --json` (Doctor:
-`--role doctor --pr N`). The command resolves the role's runtime (an inherited
+`--role doctor --pr N`; a stacked Builder adds `--base feature/issue-<parent>`).
+The command resolves the role's runtime (an inherited
 daemon-dispatch `LOOM_RUNTIME` pin is ignored; `LOOM_RUNTIME_<ROLE>` still wins); when that is
 `claude` it prints `outcome=delegate-to-claude` and exits 0 without launching
 (dispatch the Task subagent as before). Otherwise it blocks, launches the guarded
