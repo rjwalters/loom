@@ -159,7 +159,7 @@ missing tier).
 Enforcement:
 
 - `loom-daemon validate --strict` (CI runs the narrower `validate . --fleet-policy-only`) exits 2 on a Fleet key present in
-  a tracked repo tier unless `.loom/fleet-policy-allow.json` has an entry
+  a tracked repo tier (a `null` value counts: it clears the tier-1 value) unless `.loom/fleet-policy-allow.json` has an entry
   `{"key": "...", "reason": "..."}` for it. An entry with an empty reason is
   itself rejected. Use the allow-list only for a deliberate per-repo override.
 - The install template (`defaults/config.json`) seeds no Fleet keys.

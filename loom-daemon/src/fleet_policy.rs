@@ -105,9 +105,11 @@ fn tracked_tiers(repo_root: &Path) -> [PathBuf; 2] {
     ]
 }
 
-/// Fleet-class keys present (non-null) in the tracked tiers that lack an
-/// allow-list entry with a non-empty reason, plus allow-list entries with an
-/// empty reason (reported against [`ALLOW_LIST_REL`]).
+/// Fleet-class keys present in the tracked tiers that lack an allow-list
+/// entry with a non-empty reason, plus allow-list entries with an empty
+/// reason (reported against [`ALLOW_LIST_REL`]). A `null` value counts: the
+/// resolver's merge replaces a lower tier's value with `null`, so a tracked
+/// `"runtimes": null` clears fleet policy and needs a reason like any override.
 #[must_use]
 pub fn check(repo_root: &Path) -> Vec<Finding> {
     let allow = read_allow_list(repo_root);
@@ -124,8 +126,8 @@ pub fn check(repo_root: &Path) -> Vec<Finding> {
     for file in tracked_tiers(repo_root) {
         let doc = soft_read_json_object(&file);
         let Some(obj) = doc.as_object() else { continue };
-        for (key, val) in obj {
-            if val.is_null() || class_of(key) != Some(KeyClass::Fleet) {
+        for key in obj.keys() {
+            if class_of(key) != Some(KeyClass::Fleet) {
                 continue;
             }
             let allowed = allow.iter().any(|(k, r)| k == key && !r.trim().is_empty());
@@ -320,13 +322,47 @@ mod tests {
     }
 
     #[test]
-    fn repo_and_null_keys_are_not_findings() {
+    fn repo_and_comment_keys_are_not_findings() {
         let dir = tempdir().unwrap();
         write(
             &dir.path().join(LEGACY_CONFIG_REL),
-            r#"{"terminals":[],"version":"2","runtimes":null}"#,
+            r#"{"_comment":"x","terminals":[],"version":"2","buildGate":{}}"#,
         );
         assert!(check(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn null_fleet_key_in_either_tracked_tier_is_a_finding() {
+        // The resolver's merge replaces a lower tier with null, so a null
+        // fleet key clears fleet-gitops policy and must not bypass the guard.
+        for rel in [LEGACY_CONFIG_REL, PROJECT_CONFIG_REL] {
+            let dir = tempdir().unwrap();
+            write(&dir.path().join(rel), r#"{"runtimes":null,"autonomous":null}"#);
+            let f = check(dir.path());
+            let mut keys: Vec<_> = f.iter().map(|x| x.key.as_str()).collect();
+            keys.sort_unstable();
+            assert_eq!(keys, ["autonomous", "runtimes"], "{rel}: {f:?}");
+            assert!(f.iter().all(|x| x.file == dir.path().join(rel)), "{rel}: {f:?}");
+        }
+    }
+
+    #[test]
+    fn null_fleet_key_is_cleared_only_by_a_reasoned_allow_entry() {
+        for rel in [LEGACY_CONFIG_REL, PROJECT_CONFIG_REL] {
+            let dir = tempdir().unwrap();
+            write(&dir.path().join(rel), r#"{"runtimes":null,"autonomous":null}"#);
+            write(
+                &dir.path().join(ALLOW_LIST_REL),
+                r#"{"allow":[{"key":"runtimes","reason":"cleared on purpose, see #11441"},
+                            {"key":"autonomous","reason":""}]}"#,
+            );
+            let f = check(dir.path());
+            // `autonomous` stays a finding (empty reason) and the empty-reason
+            // entry is itself reported; reasoned `runtimes` is allowed.
+            assert_eq!(f.len(), 2, "{rel}: {f:?}");
+            assert!(f.iter().all(|x| x.key == "autonomous"), "{rel}: {f:?}");
+            assert!(f.iter().any(|x| x.file == dir.path().join(rel)), "{rel}: {f:?}");
+        }
     }
 
     #[test]
