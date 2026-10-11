@@ -7,8 +7,17 @@
 //! `loom_daemon::journal`. A later slice (2b-2e) that wires a producer
 //! extends [`ALLOWED`] deliberately, in review.
 //!
-//! Sanctioned producers so far: Phase 2e (#11349) — `src/config_journal/`,
-//! the config-change journal producer.
+//! Sanctioned producers so far:
+//! - Phase 2b (#11346) — execution-journal shadow writes. The sweep-registry
+//!   seam `src/sweep_registry/journal_shadow.rs` (lock/resume-handle callers
+//!   in `sweep_registry/` reach the core only through it), plus the exact
+//!   call-site files of the other daemon producers: `sweep_journal.rs`,
+//!   `sweep_outcomes.rs`, `sweep_registry/prless_retry/durable.rs`,
+//!   `worker_spawn/mod.rs`, `script_helpers/validate_phase.rs`, and the
+//!   startup verification hook in `daemon_service.rs`. Exact files, not
+//!   directories, so a new caller elsewhere still fails here.
+//! - Phase 2e (#11349) — `src/config_journal/`, the config-change journal
+//!   producer.
 //!
 //! A Rust test, not a `scripts/check-*.sh`, per the shell-language policy.
 
@@ -25,6 +34,22 @@ const ALLOWED: &[&str] = &[
     "src/cli/journal_cli.rs",
     // Phase 2e (#11349): sanctioned producer, admitted in review.
     "src/config_journal/",
+    // Phase 2b (#11346): execution-journal shadow-write producers, admitted
+    // in review. Exact files only (no directory prefixes).
+    // The sweep-registry seam: lock + resume-handle shadow writes go via it.
+    "src/sweep_registry/journal_shadow.rs",
+    // PR-less retry counter: shadow `prless_counted` / `prless_cleared`.
+    "src/sweep_registry/prless_retry/durable.rs",
+    // Host sweeps journal (`~/.loom/sweeps.json`) upsert/remove shadow.
+    "src/sweep_journal.rs",
+    // Sweep outcome ledger append shadow.
+    "src/sweep_outcomes.rs",
+    // Worker launch record shadow.
+    "src/worker_spawn/mod.rs",
+    // Phase-validation recovery event shadow.
+    "src/script_helpers/validate_phase.rs",
+    // Daemon startup: one-shot shadow-store verification log.
+    "src/daemon_service.rs",
 ];
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
