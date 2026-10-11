@@ -111,7 +111,7 @@ pub mod handoff;
 pub mod resolve;
 pub mod sandbox_hold;
 
-pub use availability::{availability, Availability, CredentialSource};
+pub use availability::{availability, availability_in, Availability, BinaryEnv, CredentialSource};
 pub use ceiling::{BackstopCeiling, ComplexityTier, Intent, Reservation};
 pub use resolve::{
     CeilingSkip, ChosenTap, PreferenceStamp, Resolution, SkipReason, SkippedTap, Tap,
@@ -714,6 +714,22 @@ pub fn resolve_runtime_contained(
     context: DispatchContext<'_>,
     preparer: &mut dyn ContainmentPreparer,
 ) -> Result<Decision, RuntimeRejection> {
+    let binary_env = availability::BinaryEnv::from_process();
+    resolve_runtime_in(root, role, explicit, now, context, preparer, &binary_env)
+}
+
+/// [`resolve_runtime_contained`] with the tier-3 binary gate's environment
+/// reads injected (#9368), so a test of the walk decides which CLIs are
+/// "installed" without mutating `PATH` or depending on the host.
+fn resolve_runtime_in(
+    root: &Path,
+    role: &str,
+    explicit: Option<&str>,
+    now: u64,
+    context: DispatchContext<'_>,
+    preparer: &mut dyn ContainmentPreparer,
+    binary_env: &availability::BinaryEnv,
+) -> Result<Decision, RuntimeRejection> {
     let Some(canonical) = canonical_role(role) else {
         // Unknown roles are not this module's error to shape: hand straight
         // back the rejection `resolve_and_admit` already produces for them.
@@ -791,7 +807,7 @@ pub fn resolve_runtime_contained(
                     preparer.borrow_mut().release();
                 }
             };
-            match availability::availability(root, tap, admitted, now) {
+            match availability::availability_in(root, tap, admitted, now, binary_env) {
                 state if state.is_spawnable() => {}
                 state => {
                     release();
@@ -834,6 +850,9 @@ pub fn resolve_runtime_contained(
     })
 }
 
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod binary_tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod containment_tests;
