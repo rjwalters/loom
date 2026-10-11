@@ -175,5 +175,27 @@ pub(crate) fn protection(selected: &SectionSet) -> Option<ProtectionReport> {
     }
 }
 
+/// Repo-tier overrides of fleet-policy keys per managed repo (#11441): the key
+/// with the fleet (tier 1) value and the effective value. Silent when no repo
+/// overrides anything or in `--json` mode. Client-side and host-local, like `protection`.
+pub(crate) fn print_fleet_overrides(report: &DaemonStatusReport, json: bool) {
+    if json {
+        return;
+    }
+    for repo in report.per_repo.iter().filter(|r| !r.root_missing) {
+        let lines = loom_daemon::fleet_policy::render_overrides(&repo.root);
+        if lines.is_empty() {
+            continue;
+        }
+        println!(
+            "\nFleet-policy overrides in {} (tracked repo tier shadows fleet-gitops):",
+            repo.root.display()
+        );
+        for line in lines {
+            println!("  {line}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests;

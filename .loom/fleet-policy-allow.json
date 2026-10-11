@@ -1,0 +1,12 @@
+{
+  "_comment": "Deliberate per-repo overrides of fleet-policy keys (Issue #11441). Every entry needs a non-empty reason; `loom-daemon validate --strict` (CI) rejects a fleet key committed in .loom/config.json or .loom-project/project.json without one. Remove entries as the values move to fleet-gitops.",
+  "allow": [
+    {"key": "runtimes", "reason": "Pending fleet-gitops migration (#11441 slice 2): runtimes.{preference,rolePreference,roles} move to config.defaults/config.hosts.<h>, then this key is deleted from .loom/config.json."},
+    {"key": "autonomous", "reason": "Pending fleet-gitops migration (#11441 slice 2): fleet autonomous policy (roleRunner, workFinder, autoUpdate, ...) moves to fleet-gitops, then this key is deleted."},
+    {"key": "safehouse", "reason": "Pending fleet-gitops migration (#11441 slice 2): safehouse persona/room policy moves to fleet-gitops."},
+    {"key": "observability", "reason": "Pending fleet-gitops migration (#11441 slice 2): telemetry endpoint/batching policy moves to fleet-gitops."},
+    {"key": "offlineMode", "reason": "Pending fleet-gitops migration (#11441 slice 2): offlineMode is fleet-wide and moves to fleet-gitops."},
+    {"key": "guide", "reason": "Pending fleet-gitops migration (#11441 slice 2): guide.docsMaintenance pool-pressure knobs are rate-limit policy and move to fleet-gitops."},
+    {"key": "sweep", "reason": "Pending fleet-gitops migration (#11441 slice 2): sweep.modelExperiment is fleet policy and moves to fleet-gitops."}
+  ]
+}
