@@ -289,8 +289,7 @@ impl CapView {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapacityWait {
     /// The work finder's gate: `capacity`, `ramp`, `saturation`,
-    /// `build-backoff`, `repo-cap`, `repo-slice`, `host-affinity` or
-    /// `host-class`.
+    /// `build-backoff`, `repo-cap`, `repo-slice` or `host-affinity`.
     pub gate: String,
     /// For the `capacity` gate: which cap term binds, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -311,11 +310,11 @@ pub struct CapacityWait {
 
 impl CapacityWait {
     /// Whether this is a queue wait (a capacity-style gate that frees up as
-    /// work ahead completes), as opposed to a host refusal (`host-affinity`,
-    /// `host-class`), which no amount of waiting on this host resolves.
+    /// work ahead completes), as opposed to a host refusal (`host-affinity`),
+    /// which no amount of waiting on this host resolves.
     #[must_use]
     pub fn queued(&self) -> bool {
-        !matches!(self.gate.as_str(), "host-affinity" | "host-class")
+        self.gate != "host-affinity"
     }
 
     /// The short phrase naming what limits it, e.g. `disk-limited`.
@@ -332,7 +331,6 @@ impl CapacityWait {
             ("repo-cap", _) => "per-repo cap",
             ("repo-slice", _) => "outside this host's repo slice",
             ("host-affinity", _) => "host affinity names another host",
-            ("host-class", _) => "heavy sweep refused on this host class",
             _ => "deferred",
         }
     }

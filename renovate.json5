@@ -53,7 +53,7 @@
   // sets its own `labels` REPLACES this array, so it must repeat
   // `loom:review-requested` (or use `addLabels`). CI enforces this via
   // `loom-daemon check-renovate-labels` (#9418).
-  "labels": ["dependencies", "loom:review-requested"],
+  "labels": ["loom:review-requested"],
 
   // --- Schedule ---
 
