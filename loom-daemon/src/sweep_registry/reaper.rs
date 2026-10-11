@@ -1090,7 +1090,7 @@ impl SweepRegistry {
                             // #4463: never restore the label when a newer sweep
                             // owns the lock — it is actively building.
                             if !self.config.skip_label_flip && !superseded {
-                                let _ = self.restore_label_to_ready(issue);
+                                let _ = self.restore_label_after_reap(issue, &sweep_id);
                                 self.note_label_flip(issue); // #4485 flap detection
                             }
                             let checkpoint_phase = read_checkpoint_phase(&checkpoint);
@@ -1740,7 +1740,7 @@ impl SweepRegistry {
                             // #4463: skip the restore when a newer sweep owns
                             // the lock (superseded) — it holds the live claim.
                             if !self.config.skip_label_flip && !produced_pr && !superseded {
-                                let _ = self.restore_label_to_ready(issue);
+                                let _ = self.restore_label_after_reap(issue, &sweep_id);
                                 self.note_label_flip(issue); // #4485 flap detection
                             }
                             // #7528: the claim restore above is deliberately

@@ -76,7 +76,7 @@ pub mod visibility;
 pub use ci::{CiDurationRecord, CiJobLogRecord, CiJobRecord, CiRunRecord};
 pub use disposition::{
     apply_noop_loop_class, classify_disposition, result_for_disposition, DispositionSignals,
-    IssueEndState, SweepDisposition, NO_PHASE_SIGNAL_CLASS,
+    IssueEndState, SweepDisposition, NO_PHASE_SIGNAL_CLASS, SPAWN_DEATH_CLASS,
 };
 pub use envelope::TelemetryEnvelope;
 pub use kinds::{

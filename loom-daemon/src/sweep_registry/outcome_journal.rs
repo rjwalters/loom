@@ -976,6 +976,7 @@ impl SweepRegistry {
             judge_verdicts: judge_verdicts.as_deref(),
             doctor_cycles,
             issue_end_state,
+            exit_code,
         };
         let (disposition, failure_class) = telemetry::classify_disposition(&signals);
         let reported_result = telemetry::result_for_disposition(&signals, disposition);
@@ -992,12 +993,14 @@ impl SweepRegistry {
             });
 
         // Issue #10156: an `after-curator` stop that is part of a no-op loop is
-        // its own outcome class instead of `unclassified`.
+        // its own outcome class instead of `unclassified` — and so (#11438) is
+        // the clean-exit `no-phase-signal`/`spawn-death` form of the same loop.
         let failure_class = telemetry::apply_noop_loop_class(
             disposition,
             failure_class,
             self.noop_loop_kind(issue, sweep_id)
                 .map(ParkKind::failure_class),
+            exit_code == Some(0),
         );
         let process_result = result;
         let result = reported_result;
