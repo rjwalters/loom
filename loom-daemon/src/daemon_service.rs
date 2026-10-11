@@ -1559,6 +1559,8 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // The bus handle (#9321) carries each new escalation / recovery onto
     // `operator_priority.escalation` so the Safehouse sink relays it into the
     // team's Matrix room rather than leaving the ask as a forge comment only.
+    // #11295: loom-ui's Alerts page, before its producers below start.
+    let _loom_ui_alerts = loom_daemon::loom_ui_alerts::start(&sweep_workspace);
     let _star_liveness = _work_finder_handle.is_some().then(|| {
         loom_daemon::star_liveness::task::spawn(sweep_workspace.clone(), Some(event_bus.clone()))
     });

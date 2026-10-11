@@ -1,7 +1,7 @@
 //! The alert thread and its delivery sinks (#10164).
 //!
 //! No forge access: status comes from the daemon's own IPC socket, delivery is
-//! the event bus. Loom sends no mail (#11087): human-facing notification is
+//! the event bus and loom-ui (#11295). Loom sends no mail (#11087): human-facing notification is
 //! derived outside Loom.
 
 use std::io::{BufRead, BufReader, Write};
@@ -137,10 +137,12 @@ pub fn spawn(
         );
         return None;
     }
-    let Some(bus) = bus else {
+    // #11295: loom-ui is a second output, independent of the bus (Matrix).
+    let loom_ui = crate::loom_ui_alerts::is_active();
+    if bus.is_none() && !loom_ui {
         log::info!("fleet_alert: no delivery sink available; alerting is a no-op");
         return None;
-    };
+    }
     let state_path = workspace_root
         .join(".loom")
         .join("logs")
@@ -148,7 +150,13 @@ pub fn spawn(
     let spawned = std::thread::Builder::new()
         .name("fleet-alert".to_string())
         .spawn(move || {
-            let sinks: Vec<Box<dyn AlertSink>> = vec![Box::new(BusSink(bus))];
+            let mut sinks: Vec<Box<dyn AlertSink>> = Vec::new();
+            if let Some(bus) = bus {
+                sinks.push(Box::new(BusSink(bus)));
+            }
+            if loom_ui {
+                sinks.push(Box::new(super::loom_ui::LoomUiSink));
+            }
             let mut state =
                 AlertState::load(&state_path, settings.debounce_ticks, settings.reminder);
             let host = crate::sweep_registry::host_identity();

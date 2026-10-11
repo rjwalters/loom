@@ -63,6 +63,7 @@ use crate::types::{Event, SweepKind};
 /// file is over `.loom/docs/file-size-policy.md`'s threshold and frozen.
 mod completion_runtime;
 mod forge_gate;
+pub mod loom_ui_watch;
 
 // ============================================================================
 // Constants
@@ -2981,7 +2982,8 @@ pub fn spawn_sink(
         config.persona,
         socket.display()
     );
-    // Empty topic set ⇒ receive every event; we filter in `event_to_envelope`.
+    loom_ui_watch::spawn(runtime, state.clone()); // #11295: safehouse.unreachable
+                                                  // Empty topic set ⇒ receive every event; we filter in `event_to_envelope`.
     let subscription = bus.subscribe(Vec::<String>::new());
     Some(runtime.spawn(async move {
         run_sink(
