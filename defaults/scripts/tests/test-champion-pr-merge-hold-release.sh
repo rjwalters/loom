@@ -72,7 +72,7 @@ extract_block() {
 
 PRECHECK="$(extract_block '**Run this precheck before judging the axes**')"
 HOLD_BEHAVIOR="$(extract_block '**Hold behavior** — name the')"
-CENSUS_RELEASED="$(grep -A2 -F 'RELEASED=$("$GH_READ" pr list' "$CHAMPION_MD")"
+CENSUS_RELEASED="$(grep -A3 -F 'RELEASED=$("$GH_READ" pr list' "$CHAMPION_MD")"
 
 WORK="$(mktemp -d)" && trap 'rm -rf "$WORK"' EXIT
 mkdir -p "$WORK/.loom/scripts"
@@ -131,9 +131,9 @@ pr_json() { # <head> <labels...>
     local head="$1"; shift
     jq -n --arg h "$head" --args '{headRefOid: $h, commits: [{committedDate: "2026-10-08T00:00:00Z"}], labels: [$ARGS.positional[] | {name: .}]}' "$@"
 }
-unlabeled_event() { # <created_at>
-    jq -n --arg at "$1" '[{event: "labeled", label: {name: "loom:pr"}, actor: {login: "judge"}, created_at: "2026-10-08T00:00:00Z"},
-                          {event: "unlabeled", label: {name: "loom:operator"}, actor: {login: "rjwalters"}, created_at: $at}]'
+unlabeled_event() { # <created_at> [actor-login] [actor-type]
+    jq -n --arg at "$1" --arg who "${2:-rjwalters}" --arg type "${3:-User}" '[{event: "labeled", label: {name: "loom:pr"}, actor: {login: "judge"}, created_at: "2026-10-08T00:00:00Z"},
+                          {event: "unlabeled", label: {name: "loom:operator"}, actor: {login: $who, type: $type}, created_at: $at}]'
 }
 
 # Run the extracted precheck once; print the decision variables and the stub log.
@@ -182,8 +182,11 @@ assert_doc_contains '"Reverting cannot undo forge labels already changed" or "a 
     "the reasoning behind the #10280/#11321 holds is named and rejected"
 assert_doc_contains '1. **Irreversible migration, no rollback step**' "kept set item 1: irreversible migrations"
 assert_doc_contains '2. **The merge gate itself**' "kept set item 2: the merge gate"
-assert_doc_contains 'A transition that only routes work between roles (Judge/Doctor/Builder hand-backs, claims) is not the gate.' \
-    "kept set item 2 cannot be stretched to role hand-backs"
+assert_doc_contains 'Writing a verdict label (the Judge'"'"'s `loom:pr` approval) is part of the gate, not a role hand-back' \
+    "kept set item 2: verdict-label writes are the gate, not a hand-back"
+for producer in post-verdict.sh verdict-staleness-guard.sh reconcile_pr_verdicts comment_trust.rs 'forge trusted-comments' check-review-feedback.sh; do
+    assert_doc_contains "\`$producer\`" "kept set item 2 names gate-input producer $producer"
+done
 assert_doc_contains '3. **The other red entries in the table above**, unchanged.' "kept set item 3: existing red entries"
 echo
 
@@ -232,6 +235,16 @@ assert_lacks "$OUT" "EDIT" "no repair on an unread event list"
 FIX_EVENTS_FAIL=0
 echo
 
+echo "Test 7b: label removed after the hold by a BOT (Champion's own Step 2 / Hold Cleared write) -> not a release; repaired"
+for bot in 'loom-fleet-dispatch[bot] Bot' 'loom-fleet-dispatch[bot] User' 'loom-app Bot'; do
+    read -r login type <<<"$bot"
+    FIX_EVENTS=$(unlabeled_event "2026-10-10T12:00:00Z" "$login" "$type")
+    OUT=$(run_precheck)
+    assert_contains "$OUT" "BLOCKED=true PRIOR=true MANUAL=false" "removal by $login ($type) does not release the hold"
+    assert_contains "$OUT" "EDIT pr edit 10280 --add-label loom:operator" "label repaired after $login ($type) removal"
+done
+echo
+
 echo "Test 8: head moved AND label removed -> (c) is the reason, MANUAL still set for the outcome rule"
 FIX_PR=$(pr_json "abcdef1234567890" loom:pr); FIX_EVENTS=$(unlabeled_event "2026-10-10T12:00:00Z")
 OUT=$(run_precheck)
@@ -266,13 +279,14 @@ FIX_LIST=$(jq -n '[
   {number: 10280, comments: [{body: "<!-- champion:merge-risk-hold -->\nheld"}]},
   {number: 9001,  comments: [{body: "<!-- champion:critical-file-hold -->\nheld"}]},
   {number: 9002,  comments: [{body: "LGTM"}]},
-  {number: 9003,  comments: [{body: "quoting <!-- champion:merge-risk-hold --> in prose"}]}
+  {number: 9003,  comments: [{body: "quoting <!-- champion:merge-risk-hold --> in prose"}]},
+  {number: 9004,  comments: [{body: "<!-- champion:critical-file-hold -->\nheld"}, {body: "<!-- champion:critical-file-hold-cleared -->\nnarrowed"}]}
 ]')
 OUT=$(
     GH_READ=gh_read
     eval "$CENSUS_RELEASED"
 )
-assert_eq "Released holds, not yet merged: #10280 #9001" "$OUT" "exactly the marker-bearing PRs are listed"
+assert_eq "Released holds, not yet merged: #10280 #9001" "$OUT" "exactly the marker-bearing PRs are listed (auto-cleared critical-file hold #9004 excluded)"
 FIX_LIST='[]'
 OUT=$(
     GH_READ=gh_read

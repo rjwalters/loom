@@ -591,7 +591,7 @@ four-axis judgment below.
 
 **Claim/label machinery is not red by itself (#11416).** Loom's own claim, lease, label-transition, dispatch and hand-back code is judged like any other code. Writing labels or claims *when it runs* is not a one-way action: `git revert` restores the old writer, and the state it wrote is re-derivable (janitors, lease reapers, `loom-recover-orphans` and the next tick repair a stranded claim or misrouted label). "Reverting cannot undo forge labels already changed" or "a defect could strand work fleet-wide" is **not** a red reason. Judge-approved + CI green + revert restores the behavior -> green on blast radius and revertability. "Mediates merging" in the table means kept-set item 2, nothing wider. **Kept set** — only these stay red, held for an operator (name the item in the hold bullet):
 1. **Irreversible migration, no rollback step**: a bulk relabel, or a rename/delete in `.github/labels.yml`, of live labels without a restore step; a lease/checkpoint/registry format the previous release cannot read.
-2. **The merge gate itself** — code whose output is *whether a PR merges*: criteria #1-#6 and the sticky-hold logic (this file, `champion-critical-file-hold.md`), `merge-pr.sh`'s verdict/label/ordering guards. The gate cannot vouch for a change to itself. A transition that only routes work between roles (Judge/Doctor/Builder hand-backs, claims) is not the gate.
+2. **The merge gate itself** — code whose output decides *whether a PR merges*: criteria #1-#6 and the sticky-hold logic (this file, `champion-critical-file-hold.md`); `merge-pr.sh`'s verdict/label/ordering guards; any code that writes or invalidates a verdict label or marker (`post-verdict.sh`, `verdict-staleness-guard.sh`, the daemon's `reconcile_pr_verdicts`, `check-review-feedback.sh`) or decides whose markers and comments are trusted (`comment_trust.rs`, `forge trusted-comments`). The gate cannot vouch for a change to itself. Writing a verdict label (the Judge's `loom:pr` approval) is part of the gate, not a role hand-back; only routing that cannot make a PR mergeable (Builder/Doctor hand-backs, claims) is outside it.
 3. **The other red entries in the table above**, unchanged. Criterion #3 critical files fail #3 regardless.
 
 **Decision rule**:
@@ -738,15 +738,15 @@ else
   fi
 
   # (e) A human removed `loom:operator` after the hold (#11416; was #7048's
-  #     "respected, still held"). The hold notice names this as the operator's
-  #     release, so it is one. Proof is an `unlabeled` event after HOLD_AT, not
-  #     bare absence: a failed `--add-label` on the hold tick is no release.
-  #     Computed even when (a)-(d) fired — "Outcomes" reads the flag.
+  #     "respected, still held"). Proof is a non-bot `unlabeled` event after
+  #     HOLD_AT, not bare absence (a failed `--add-label` is no release). Bot
+  #     removals are Champion's own (Step 2, critical-file "Hold Cleared") and
+  #     never count, like (b). Computed even when (a)-(d) fired.
   OPERATOR_LABEL_NOW=$(jq -r '[.labels[].name] | any(. == "loom:operator")' <<<"$PR_JSON")
   MANUAL_RELEASE_SINCE_HOLD=false; LABEL_REPAIR=false
   if [ "$OPERATOR_LABEL_NOW" = false ]; then
     if REMOVED_BY=$(gh api "repos/{owner}/{repo}/issues/$PR_NUMBER/events" --paginate --jq \
-      ".[] | select(.event == \"unlabeled\" and .label.name == \"loom:operator\" and .created_at > \"$HOLD_AT\") | \"\(.actor.login) at \(.created_at)\"" 2>/dev/null); then
+      ".[] | select(.event == \"unlabeled\" and .label.name == \"loom:operator\" and .created_at > \"$HOLD_AT\" and .actor.type != \"Bot\" and ((.actor.login // \"\") | endswith(\"[bot]\") | not)) | \"\(.actor.login) at \(.created_at)\"" 2>/dev/null); then
       REMOVED_BY=$(tail -n 1 <<<"$REMOVED_BY")
       [ -z "$REMOVED_BY" ] && LABEL_REPAIR=true   # read OK, no removal on record
     else
@@ -783,7 +783,7 @@ fi
 | `PRIOR_HOLD=false` | Judge the four axes normally. No behavior change from before #4742. |
 | `PRIOR_HOLD=true`, no `RELEASE_REASON` | **HOLD the merge, silently.** The PR is not merged this pass regardless of how the axes read this tick, and no comment is posted (anti-spam guard already covers it). It is **not** skipped, though: `MERGE_BLOCKED_BY_HOLD=true` routes it to the **Held-PR Health Pass** (#6720), which still evaluates criteria #4/#5/#6. |
 | `PRIOR_HOLD=true`, released by `loom:auto-merge-ok` (`HOLD_OVERRIDE=true`) | Criterion #2 **PASS** by override — the axes are not re-scored. Continue to #3. Step 2's reversal block is **mandatory**. |
-| `PRIOR_HOLD=true`, released by (b), (c), (d), or (e) | Re-judge the four axes normally. Now green -> **PASS**, continue to #3, and Step 2's reversal block is **mandatory**. Still red **and** `MANUAL_RELEASE_SINCE_HOLD=true` **and** the concern is byte-identical to the prior hold's bullet -> **PASS** the same way: a human released exactly that concern (#11416). When your concern *is* the one on record, copy the prior bullet verbatim; write a new bullet only for a concern it does not name. Still red otherwise -> the hold persists: `MERGE_BLOCKED_BY_HOLD=true`, "Hold behavior" below, then the **Held-PR Health Pass**. |
+| `PRIOR_HOLD=true`, released by (b), (c), (d), or (e) | Re-judge the four axes normally. Now green -> **PASS**, continue to #3, and Step 2's reversal block is **mandatory**. Still red **and** `MANUAL_RELEASE_SINCE_HOLD=true` **and** the concern is byte-identical to the prior hold's bullet -> **PASS** the same way: a human released exactly that concern (#11416); "Hold behavior"'s first branch executes it (no notice, no label). When your concern *is* the one on record, copy the prior bullet verbatim; write a new bullet only for a concern it does not name. Still red otherwise -> the hold persists: `MERGE_BLOCKED_BY_HOLD=true`, "Hold behavior" below, then the **Held-PR Health Pass**. |
 
 **Once released, stays released.** A release signal is consumed by the change
 itself, not by a counter: after a new commit lands, later ticks keep seeing
@@ -817,9 +817,11 @@ tripping release path (b) or (d).
 - **A human `--remove-label loom:operator` IS release (e) (#11416)** — before,
   #7048 only stopped the label being reasserted while the precheck still
   refused the PR, so it sat as plain `loom:pr`, unmerged and out of the census
-  (#10280). Only write-access actors can remove a label, so the trust surface
-  is unchanged. A missing label with no `unlabeled` event after the hold is
-  repaired, not released.
+  (#10280). Only a non-bot actor counts (type `Bot` or a `[bot]` login is
+  Champion's own write, so a failed merge after Step 2 is never read as a
+  release). Limit: where agents run under the operator's own user token, the
+  two are indistinguishable. A missing label with no human removal after the
+  hold is repaired, not released.
 
 **Reversal is one mandatory comment, and the idempotency guard must not eat it.**
 Whenever `PRIOR_HOLD=true` and this PR proceeds to merge, Step 2's pre-merge
@@ -1524,7 +1526,8 @@ whose `loom:operator` a human removed is released (precheck (e)) and merges
 next tick unless criteria #3-#6 block it; a critical-file one waits for the
 operator's own merge (`champion-critical-file-hold.md`, #9016). Either way the
 PR no longer carries the label, so `RELEASED` below lists every open `loom:pr`
-PR still bearing a hold marker without it — never silently plain approved.
+PR still bearing a hold marker without it — never silently plain approved
+(a critical-file hold whose last marker is `-cleared` was auto-cleared, not listed).
 A sticky hold missing its label with no removal on record gets the label back
 (precheck), so it stays in `HELD_COUNT`.
 
@@ -1551,7 +1554,8 @@ fi
 
 echo "Merge-risk holds: $HELD_COUNT open PR(s) — $HELD_CONFLICTING conflicting, $HELD_AT_DOCTOR out at Doctor, oldest ${OLDEST_DAYS}d"
 RELEASED=$("$GH_READ" pr list --label "loom:pr" --search "-label:loom:operator" --state open --limit 500 --json number,comments \
-  --jq '[.[] | select(any(.comments[].body; startswith("<!-- champion:merge-risk-hold -->") or startswith("<!-- champion:critical-file-hold -->"))) | "#\(.number)"] | join(" ")')
+  --jq '"<!-- champion:critical-file-hold" as $cf | [.[] | select(any(.comments[].body; startswith("<!-- champion:merge-risk-hold -->"))
+    or ([.comments[].body | select(startswith($cf))] | last // "" | startswith($cf + " -->"))) | "#\(.number)"] | join(" ")')
 echo "Released holds, not yet merged: ${RELEASED:-none}"
 ```
 
