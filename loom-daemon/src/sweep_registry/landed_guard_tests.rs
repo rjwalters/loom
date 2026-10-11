@@ -91,6 +91,10 @@ fn dispatch_is_refused_after_a_landing_in_the_journal() {
     let later = landed_at + chrono::Duration::minutes(31);
     assert!(registry.refuse_recent_landing(3079, later).is_ok());
     std::env::remove_var("LOOM_REPO");
+    assert!(
+        registry.refuse_recent_landing(3079, landed_at).is_ok(),
+        "an unresolved repo fails open"
+    );
 }
 
 /// The 2.5 read finds the issue closed: refused as `already_landed`. A PR
