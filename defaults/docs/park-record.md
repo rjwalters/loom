@@ -150,7 +150,9 @@ These writers differ from `apply` in two documented ways:
   (`stale_blocked::undeclared`), separate from **UNDOCUMENTED** (no blocker
   reference anywhere). Its forge reads are batched (#10480: one REST + ETag
   listing, REST blocker reads, one GraphQL query per 100 issues) and run under
-  a **budget floor**: after the listing it reads the free `/rate_limit` probe,
+  a **budget floor**: after the listing it reads the budget probe (free REST
+  `/rate_limit` plus a GraphQL `rateLimit` query that costs a point; the
+  daemon reuses one reading per credential for 120 s, #11301),
   and if the run's projected cost would leave fewer than
   `--min-graphql-remaining` GraphQL points or `--min-core-remaining` core
   requests (default 1000 each; `0` disables) it gathers nothing and reports
@@ -158,7 +160,8 @@ These writers differ from `apply` in two documented ways:
   re-checked between reads from the forge's own rate-limit answers, so a run
   stops part-way rather than draining the bucket. `--json` adds a
   `forge_cost` object (`graphql_queries`, `graphql_points` from
-  `rateLimit.cost`, `rest_requests`, `rest_not_modified`, `budget_before`,
+  `rateLimit.cost`, `rest_requests`, `rest_not_modified`, `budget_before`
+  (`cached: true` when that reading was reused),
   `projected`, `floor`, `budget_refused`, `budget_stopped`). It first reads
   the repository's `archived` flag (#10562, one REST + ETag read shared with
   `release-stale-blocked` and the role runner): an archived repository is

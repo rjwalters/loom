@@ -24,6 +24,7 @@ fn budget(core: u64, graphql: u64) -> Budget {
     Budget {
         core_remaining: core,
         graphql_remaining: graphql,
+        cached: false,
     }
 }
 

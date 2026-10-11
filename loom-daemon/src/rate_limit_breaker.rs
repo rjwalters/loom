@@ -719,6 +719,7 @@ pub mod forge {
     use crate::cmd_out::CmdOutcome;
     use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
     use chrono::{DateTime, Utc};
+    use std::path::PathBuf;
     use std::time::Duration;
 
     /// Deadline for the probe. It runs inside a gh error arm, so a wedged
@@ -730,7 +731,8 @@ pub mod forge {
     /// (spawn error, timeout, non-zero exit, unparseable JSON) — the caller
     /// falls back to the configured cooldown. `GET /rate_limit` does not
     /// count against the primary rate limit, so this probe is safe to run
-    /// *during* exhaustion.
+    /// *during* exhaustion; its GraphQL `rateLimit` leg is charged (≥ 1
+    /// point), so a caller that probes on a schedule memoises it (#11301).
     #[must_use]
     pub fn probe_budget(now: DateTime<Utc>) -> Option<BudgetSnapshot> {
         probe_budget_ctx(&FailureContext::default(), now)
@@ -757,12 +759,24 @@ pub mod forge {
         parse_budget(&core_body, parse_graphql_probe(&gql_out, now), now)
     }
 
-    fn run_probe(
-        ctx: &FailureContext,
-        op: &'static str,
-        args: &[&str],
-        tolerate_failure: bool,
-    ) -> Option<String> {
+    /// The `GH_CONFIG_DIR` the probe's `gh` runs under for `ctx`: the
+    /// facade's own choice for the probe invocation (the explicit dir, else
+    /// the root's per-owner registration), else the daemon's process-global
+    /// one; `None` when `gh` would fall back to its default profile. Both legs
+    /// share it. A memo of the reading keys on it (#11301).
+    #[must_use]
+    pub fn probe_config_dir(ctx: &FailureContext) -> Option<PathBuf> {
+        invocation(ctx, "api.rate_limit", &["api", "rate_limit"])
+            .env_plan(None)
+            .into_iter()
+            .find(|e| e.key == "GH_CONFIG_DIR")
+            .and_then(|e| e.value)
+            .or_else(|| std::env::var_os("GH_CONFIG_DIR"))
+            .filter(|d| !d.is_empty())
+            .map(PathBuf::from)
+    }
+
+    fn invocation(ctx: &FailureContext, op: &'static str, args: &[&str]) -> GhInvocation {
         let mut inv = GhInvocation::new(
             Operation::new(op),
             AccessIntent::Read,
@@ -771,6 +785,9 @@ pub mod forge {
         )
         .args(args.iter().copied())
         .gh_config_dir(ctx.config_dir.as_deref())
+        // The answer is the asker's own budget: never a reader App's, so
+        // [`probe_config_dir`] is the whole credential story (#11301).
+        .writer_identity()
         // #10089: both legs (REST `rate_limit`, GraphQL `rateLimit`) are
         // budget readings, never `unknown`.
         .forge_op(crate::forge_call_stats::ops::QUOTA_RATE_LIMIT_READING);
@@ -780,7 +797,16 @@ pub mod forge {
         if let Some(program) = &ctx.program {
             inv = inv.program(program);
         }
-        let outcome = inv.run();
+        inv
+    }
+
+    fn run_probe(
+        ctx: &FailureContext,
+        op: &'static str,
+        args: &[&str],
+        tolerate_failure: bool,
+    ) -> Option<String> {
+        let outcome = invocation(ctx, op, args).run();
         let CmdOutcome::Ran(output) = outcome else {
             return None;
         };

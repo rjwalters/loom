@@ -27,9 +27,9 @@
 //! # Budget floor
 //!
 //! Before any evidence read the run's projected cost is checked against the
-//! free budget probe, and re-checked between reads from the forge's own
-//! answers; a run that would cross the floor stops and reports the rest as
-//! unevaluated. See [`super::budget`]. What was spent is returned as a
+//! budget probe (memoised per credential, #11301), and re-checked between
+//! reads from the forge's own answers; a run that would cross the floor stops
+//! and reports the rest as unevaluated. See [`super::budget`]. What was spent is returned as a
 //! [`ForgeCost`].
 //!
 //! # Fail safe, unchanged
@@ -50,6 +50,7 @@ use anyhow::{anyhow, Result};
 use serde::Deserialize;
 
 use super::budget::{self, Budget, Floor, ForgeCost, Guard, Meter};
+use super::budget_cache::{self, CredentialKey};
 use super::{classify, park_self_block, Artifact, Evidence, RemoteRef, Verdict};
 use crate::dep_recheck::{extract, named, premise, recheck};
 use crate::forge_call_stats::{ops, ForgeOp};
@@ -139,8 +140,9 @@ pub trait StaleBlockedForge {
     /// The whole batch did not answer.
     fn closing_refs_batch(&mut self, issues: &[u32]) -> Result<HashMap<u32, Vec<ClosingRef>>>;
 
-    /// The live budget from the free `/rate_limit` + GraphQL `rateLimit`
-    /// probe; `None` when it did not answer.
+    /// The live budget from the `/rate_limit` (free) + GraphQL `rateLimit`
+    /// (charged) probe, or its memoised reading ([`super::budget_cache`]);
+    /// `None` when it did not answer.
     fn budget(&mut self) -> Option<Budget>;
 
     /// Whether the rate-limit breaker is suppressing forge calls.
@@ -655,6 +657,9 @@ pub struct GhStaleBlockedForge {
     slug: String,
     /// What this run's evidence reads have spent.
     meter: Meter,
+    /// The credential the budget probe runs under, once [`Self::budget`]
+    /// named it (#11301).
+    budget_key: Option<CredentialKey>,
 }
 
 impl GhStaleBlockedForge {
@@ -674,6 +679,7 @@ impl GhStaleBlockedForge {
             repo,
             slug,
             meter: Meter::default(),
+            budget_key: None,
         }
     }
 
@@ -791,6 +797,11 @@ impl StaleBlockedForge for GhStaleBlockedForge {
         let stdout = String::from_utf8_lossy(&out.stdout);
         let (cost, remaining) = parse_rate_limit(&stdout);
         self.meter.graphql(cost, remaining);
+        // Same root and program as the budget probe, and `api graphql` never
+        // takes a reader route: this is the probe's own credential (#11301).
+        if let (Some(key), Some(left)) = (&self.budget_key, remaining) {
+            budget_cache::note_graphql(key, left);
+        }
         parse_closing_refs(&stdout, issues).ok_or_else(|| {
             let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
             crate::rate_limit_breaker::global_observe_failure(&stderr, CALLER);
@@ -803,12 +814,10 @@ impl StaleBlockedForge for GhStaleBlockedForge {
             &self.root,
             self.gh_bin.to_string_lossy().into_owned(),
         );
-        crate::rate_limit_breaker::forge::probe_budget_ctx(&ctx, chrono::Utc::now()).map(|b| {
-            Budget {
-                core_remaining: b.core_remaining,
-                graphql_remaining: b.graphql_remaining,
-            }
-        })
+        let key = self
+            .budget_key
+            .get_or_insert_with(|| CredentialKey::for_probe(&ctx));
+        budget_cache::read(key, &ctx)
     }
 
     fn breaker_open(&mut self) -> bool {

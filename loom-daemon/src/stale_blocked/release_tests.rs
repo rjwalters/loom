@@ -181,6 +181,7 @@ impl World {
         self.gather.budget = Some(Budget {
             core_remaining,
             graphql_remaining,
+            cached: false,
         });
     }
 
@@ -554,6 +555,7 @@ fn budget_refusal_reads_nothing_and_writes_nothing() {
     w.gather.budget = Some(Budget {
         core_remaining: 10,
         graphql_remaining: 10,
+        cached: false,
     });
     let r = w.run();
     assert_eq!(r.unevaluated.len(), 1);

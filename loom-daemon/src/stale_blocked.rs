@@ -64,6 +64,8 @@ use crate::dep_recheck::{extract, named, premise, recheck};
 
 pub mod batch;
 pub mod budget;
+// The budget probe's reading, shared per credential for a TTL (#11301).
+pub mod budget_cache;
 pub mod notify;
 pub mod release;
 pub mod release_gh;
@@ -458,6 +460,9 @@ mod batch_tests;
 
 #[cfg(test)]
 mod budget_tests;
+
+#[cfg(test)]
+mod budget_cache_tests;
 
 #[cfg(test)]
 mod release_tests;

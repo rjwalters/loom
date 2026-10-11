@@ -6,19 +6,23 @@
 //! one epic #10332 is keeping clear. So the run checks before it spends:
 //!
 //! - **Before gathering**: after the candidate listing (a free `304` when
-//!   nothing moved), the free `/rate_limit` + GraphQL `rateLimit` probe
+//!   nothing moved), the budget probe
 //!   ([`crate::rate_limit_breaker::forge::probe_budget_ctx`]) is compared with
-//!   the run's projected cost ([`project`]). If the run would take either
+//!   the run's projected cost ([`project`]). The probe is two reads: REST
+//!   `/rate_limit`, which is free, and the GraphQL `rateLimit` query, which
+//!   is charged (≥ 1 point) — so its reading is memoised per credential for a
+//!   short TTL ([`super::budget_cache`], #11301). If the run would take either
 //!   bucket below its floor, nothing is gathered: every artifact is reported
 //!   *not evaluated*, and the advisory still exits 0 ([`refusal`]).
 //! - **Mid-run**: each GraphQL batch's own `rateLimit.remaining` and each REST
 //!   response's `x-ratelimit-remaining` feed a [`Meter`]; before every further
 //!   read a [`Guard`] checks the latest reading against the floor, and stops.
-//!   What it did not read is reported not evaluated, never clear.
+//!   What it did not read is reported not evaluated, never clear. The guard
+//!   reads only these live answers, never the memoised pre-run reading.
 //!
-//! A probe that does not answer is not a refusal: refusing on a failed *free*
-//! read would make the advisory silently vanish. The run proceeds and reports
-//! `budget_before: null`.
+//! A probe that does not answer is not a refusal: refusing on a failed
+//! *budget* read would make the advisory silently vanish. The run proceeds and
+//! reports `budget_before: null`.
 //!
 //! A floor of `0` disables that bucket's check.
 
@@ -53,11 +57,14 @@ impl Default for Floor {
     }
 }
 
-/// The live budget, as the free probe read it.
+/// The live budget, as the probe read it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Budget {
     pub core_remaining: u64,
     pub graphql_remaining: u64,
+    /// The reading came from [`super::budget_cache`]: an earlier probe on the
+    /// same credential answered it, and this run made no budget call (#11301).
+    pub cached: bool,
 }
 
 /// What this run has spent so far, and the latest remaining figures the
