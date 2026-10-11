@@ -107,20 +107,45 @@ pub struct PullFacts {
 pub enum IssueFacts {
     /// Still open.
     Open,
-    /// Its latest `closed` event carries a `commit_id`: a merge (or a pushed
-    /// commit) closed it, at `closed_at`.
+    /// A merge closed it at `closed_at`: its latest `closed` event carries a
+    /// `commit_id`, or a PR that references it merged within
+    /// [`MERGE_CLOSE_WINDOW_SECS`] of `closed_at`. A merge-close through a
+    /// `Closes #N` body leaves `commit_id` null, so the PR is the evidence.
     Merged(DateTime<Utc>),
-    /// Its latest `closed` event has no `commit_id`, so no merge closed it
-    /// (whatever its `state_reason`), at `closed_at`.
+    /// No closing commit and no merged PR referencing it near `closed_at`
+    /// (whatever its `state_reason`): a hand close, at `closed_at`.
     NotMerged(DateTime<Utc>),
     /// Closed at `closed_at`, but no `closed` event says how.
     ClosedUnresolved(DateTime<Utc>),
 }
 
+/// How far a referencing PR's `merged_at` may sit from the issue's
+/// `closed_at` and still count as having closed it. GitHub closes the issue
+/// within seconds of the merge.
+pub const MERGE_CLOSE_WINDOW_SECS: i64 = 120;
+
+/// Whether a `cross-referenced` timeline event is a merged PR whose merge is
+/// within [`MERGE_CLOSE_WINDOW_SECS`] of `closed_at`.
+fn merged_pr_near(closed_at: DateTime<Utc>, event: &serde_json::Value) -> bool {
+    event["event"] == "cross-referenced"
+        && !event["source"]["issue"]["pull_request"].is_null()
+        && parse_instant(event["source"]["issue"]["pull_request"]["merged_at"].as_str())
+            .is_some_and(|m| (closed_at - m).num_seconds().abs() <= MERGE_CLOSE_WINDOW_SECS)
+}
+
 impl IssueFacts {
-    /// Classify an issue closed at `closed_at` from its events pages.
+    /// Classify an issue closed at `closed_at` from its events pages and its
+    /// timeline pages (the source of the PR that closed it, #11398).
     #[must_use]
-    pub fn closed(closed_at: DateTime<Utc>, events: &[serde_json::Value]) -> Self {
+    pub fn closed(
+        closed_at: DateTime<Utc>,
+        events: &[serde_json::Value],
+        timeline: &[serde_json::Value],
+    ) -> Self {
+        let merged_by_pr = timeline
+            .iter()
+            .flat_map(|page| page.as_array().into_iter().flatten())
+            .any(|e| merged_pr_near(closed_at, e));
         let last_close = events
             .iter()
             .flat_map(|page| page.as_array().into_iter().flatten())
@@ -131,6 +156,7 @@ impl IssueFacts {
             Some((_, e)) if e["commit_id"].as_str().is_some_and(|c| !c.is_empty()) => {
                 IssueFacts::Merged(closed_at)
             }
+            Some(_) if merged_by_pr => IssueFacts::Merged(closed_at),
             Some(_) => IssueFacts::NotMerged(closed_at),
             None => IssueFacts::ClosedUnresolved(closed_at),
         }
@@ -1161,23 +1187,29 @@ impl ForgeReads for GhForgeReads {
         let Some(closed_at) = parse_instant(issue["closed_at"].as_str()) else {
             return Some(IssueFacts::Open);
         };
-        // Whether a merge closed it is on the `closed` event's `commit_id`;
-        // a failed page is a failed read, retried next pass.
-        let mut pages = Vec::new();
-        for page in 1.. {
-            let events = crate::observability::ops::stage_dwell::gh_json(
-                &root,
-                &format!(
-                    "repos/{repo}/issues/{number}/events?per_page={EVENTS_PAGE_SIZE}&page={page}"
-                ),
-            )?;
-            let len = events.as_array()?.len();
-            pages.push(events);
-            if len < EVENTS_PAGE_SIZE {
-                break;
+        // Whether a merge closed it is on the `closed` event's `commit_id`
+        // or, for a `Closes #N` merge (null `commit_id`), a merged PR in the
+        // timeline; a failed page is a failed read, retried next pass.
+        let mut read_pages = |kind: &str| -> Option<Vec<serde_json::Value>> {
+            let mut pages = Vec::new();
+            for page in 1.. {
+                let batch = crate::observability::ops::stage_dwell::gh_json(
+                    &root,
+                    &format!(
+                        "repos/{repo}/issues/{number}/{kind}?per_page={EVENTS_PAGE_SIZE}&page={page}"
+                    ),
+                )?;
+                let len = batch.as_array()?.len();
+                pages.push(batch);
+                if len < EVENTS_PAGE_SIZE {
+                    break;
+                }
             }
-        }
-        Some(IssueFacts::closed(closed_at, &pages))
+            Some(pages)
+        };
+        let events = read_pages("events")?;
+        let timeline = read_pages("timeline")?;
+        Some(IssueFacts::closed(closed_at, &events, &timeline))
     }
 
     fn label_history(&mut self, repo: &str, number: u32) -> Option<LabelHistory> {

@@ -2339,8 +2339,10 @@ is the new stage). A row that left the view gives one record with no
 `next_stage`: `landed` when its PR merged, `cut_short` when it closed or is
 still open without review labels. A row with no resolved PR (a sweep stage)
 reads its issue instead (#11398): `landed` at the issue's `closed_at` when its
-latest `closed` event carries a `commit_id` (a merge closed it), `abandoned`
-at `closed_at` when that event has no `commit_id` (a hand close, whatever its
+latest `closed` event carries a `commit_id`, or a PR referencing the issue
+merged within 120s of `closed_at` (a `Closes #N` merge leaves `commit_id`
+null, so the timeline's merged PR is the evidence), `abandoned`
+at `closed_at` when neither holds (a hand close, whatever its
 `state_reason`), `unknown` at `closed_at` when no `closed` event is found, and
 `unknown` with no forge instant while it is still open. Every close keeps its
 `closed_at` as `forge_transition_at`, so it has a `loom.fact_id`. A failed issue read emits nothing and is retried each pass; after
