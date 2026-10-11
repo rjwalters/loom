@@ -198,10 +198,11 @@ WRITE_REPO=""
 # binary predating the subcommand — is merge.
 # requires-daemon: branch-update optional   #10771 — no answer is read as merge: the child is retargeted, never rewritten
 BRANCH_UPDATE_STRATEGY="$("$DAEMON_BIN" branch-update strategy 2>/dev/null)" || BRANCH_UPDATE_STRATEGY=merge
+retarget_child_base() { gh pr edit "$CHILD_PR" ${WRITE_REPO:+--repo "$WRITE_REPO"} --base "$DEFAULT_BRANCH"; }  # step 3's one call site
 if [[ "$BRANCH_UPDATE_STRATEGY" != "rebase" ]]; then
     info "PR branches here are not rebased (loom-daemon branch-update strategy: merge, #10771) — '$CHILD_BRANCH' is not rewritten, only its base is retargeted to $DEFAULT_BRANCH. If the PR then shows conflicts or the parent's commits (a squash-merged parent), merge $DEFAULT_BRANCH into it and push plainly."
     [[ "$DRY_RUN" == "true" ]] && { ok "Dry run complete — would retarget PR #$CHILD_PR's base to $DEFAULT_BRANCH (no rewrite)."; exit 0; }
-    gh pr edit "$CHILD_PR" ${WRITE_REPO:+--repo "$WRITE_REPO"} --base "$DEFAULT_BRANCH" || { err "Failed to retarget PR #$CHILD_PR base to $DEFAULT_BRANCH. Retarget it manually."; exit 2; }
+    retarget_child_base || { err "Failed to retarget PR #$CHILD_PR base to $DEFAULT_BRANCH. Retarget it manually."; exit 2; }
     ok "Reconciled (merge mode): PR #$CHILD_PR now targets $DEFAULT_BRANCH; '$CHILD_BRANCH' was not rewritten. Bring it up to date with a merge and a plain push if it is behind."
     exit 0
 fi
@@ -301,7 +302,7 @@ fi
 # 3. Retarget the child PR's base to the default branch NAME (not the commit —
 #    a PR base is a branch).
 info "Step 3/3: gh pr edit $CHILD_PR --base $DEFAULT_BRANCH"
-if ! run gh pr edit "$CHILD_PR" ${WRITE_REPO:+--repo "$WRITE_REPO"} --base "$DEFAULT_BRANCH"; then
+if ! run retarget_child_base; then
     err "Failed to retarget PR #$CHILD_PR base to $DEFAULT_BRANCH. Retarget it manually."
     exit 2
 fi
