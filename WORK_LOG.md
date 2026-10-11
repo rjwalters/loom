@@ -8,6 +8,37 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-10-11
 
+- **PR #10173**: feat: daemon-enforced hold for no-op dispatch loops (#10156)
+- **PR #11428**: feat(stashes): read issue state via the daemon's forge routing (#8876)
+- **PR #11427**: fix(runtime-preference): skip a tier-3 tap whose CLI binary is not installed
+- **PR #11303**: feat(worker): worker run --role builder|doctor (Slice 1 of #11285)
+- **PR #11413**: fix(work-finder): make loom:epic a skip label so an approved epic is never dispatched
+- **PR #11397**: feat(observability): sample Z.ai seat quota into tokens.snapshot
+- **PR #11409**: eta.stage_outcome: derive fact_id deterministically for every exit, else a missing reason
+- **PR #11408**: fix: exempt a bare "What happened" heading from the incident-report trigger
+- **PR #11404**: fix(sweep): skip loom:epic containers in Mode A/B pre-flight without requeueing them
+- **PR #11395**: fix(daemon): re-mint and retry once when a forge write is refused as not accessible by the integration
+- **PR #11392**: feat: J3 configuration shadow journal records (#11349)
+- **PR #11393**: feat(fleet.state): forge-dated entered_at, rework, conflict/ci_fail, holds, star/level on every row
+- **PR #11390**: fix(install): make the shipped issue templates repo-neutral
+- **PR #11387**: fix(resync): recognise the daemon's resync commit subject in the local-fix guard
+- **Issue #10156** (closed): Daemon re-dispatches human-gated/blocked issues forever after no-op sweeps (275 after-curator loops, ~600M tokens/24h)
+- **Issue #8876** (closed): loom-daemon stashes can never retire anything on a private repo: it reads issue state via ambient gh auth, not the App credential the daemon already mints
+- **Issue #9368** (closed): runtimes: preference fall-through taps a runtime whose binary is absent — hard failure instead of a clean skip
+- **Issue #11421** (closed): Auditor Capability Request: install build toolchain on auditor host
+- **Issue #11399** (closed): Daemon re-queues a loom:issue epic after the sweep session skips it: reaper restores loom:issue, work finder has no loom:epic skip
+- **Issue #11396** (closed): Z.ai seats are invisible on loom-ui Tokens/Q1: sample the api-keys pool's quota into the collector's account readings
+- **Issue #8984** (closed): link_dogfood_agent_skills falsely reports success on non-unix (no #6440-style fallback)
+- **Issue #11401** (closed): eta.stage_outcome: fact_id is empty on 100% of sweep-stage and merge_hold exits and 6-18% of others; derive it deterministically
+- **Issue #9549** (closed): premise-check: a bare 'What happened' heading gates ordinary bug reports as incident reports
+- **Issue #8881** (closed): sweep-wave-lifecycle.md Mode A/B pre-flight has no loom:epic skip rule — sessions improvise, often restoring loom:issue
+- **Issue #9247** (closed): daemon: re-mint and retry once when a write hits 'Resource not accessible by integration' (public-repo sibling of #6171)
+- **Issue #11349** (closed): [Epic #9908] Phase 2e: Configuration snapshot journal shadow records
+- **Issue #11391** (closed): fleet.state rows: forge-dated entered_at (96% are lower bounds after a restart), plus rework, conflict/ci_fail, all holds, and star/level on every row, for the ETA fit features
+- **Issue #9001** (closed): Rebasing a resync PR can silently drop its install-metadata.json payload with no conflict signal
+- **Issue #8862** (closed): Installed issue templates send consumer-repo issue filers to Loom's own Discussions
+- **Issue #8920** (closed): resync-installed.sh's local-fix guard does not recognise the daemon's resync commit as routine lineage (residual of the stale-copy false positives)
+
 - **PR #11383**: feat(journal): shared bounded journal core and verify seam (Phase 2a)
 - **PR #11382**: fix(sweep): base-conflict rebase pass no longer spends the Doctor-cycle cap
 - **PR #11379**: fix(stashes): fail a run whose every issue-state lookup fails (#8876 Part B)
