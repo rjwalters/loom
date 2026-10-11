@@ -153,6 +153,10 @@ pub struct Memory {
     /// Issues whose history read failed, retried each pass while they are
     /// still curated or ready.
     pub pre_ready_retry: BTreeSet<(String, u32)>,
+    /// Label histories this pass already read for the row enrichment
+    /// (#11391), set by the caller before [`diff`], which takes them as its
+    /// per-pass cache so no history is read twice.
+    pub warm: BTreeMap<(String, u32), Option<LabelHistory>>,
     /// The previous view.
     pub view: Option<FleetView>,
     /// When the previous pass ran.
@@ -183,7 +187,7 @@ fn stage_labels(stage: FleetStage) -> Vec<&'static str> {
 /// The forge instant at or before `bound` at which `history` says the item
 /// entered `stage`: the label that puts it there (for `merge_wait`, also a
 /// released hold). `None` for a stage no label enters.
-fn forge_entry(
+pub(super) fn forge_entry(
     history: &LabelHistory,
     stage: FleetStage,
     bound: DateTime<Utc>,
@@ -590,7 +594,7 @@ pub fn diff(
         loom,
         now: pass.now,
         prev_at,
-        histories: BTreeMap::new(),
+        histories: std::mem::take(&mut memory.warm),
     };
     let mut out = Vec::new();
     pre_ready_pass(memory, prev, pass, &mut diff, &mut out);
@@ -832,6 +836,7 @@ pub fn remember(memory: Memory, pass: &Pass<'_>) -> Memory {
         unread: memory.unread,
         settled: memory.settled,
         pending_ready: memory.pending_ready,
+        warm: BTreeMap::new(),
         view: Some(pass.view.clone()),
         at: Some(pass.now),
     }
