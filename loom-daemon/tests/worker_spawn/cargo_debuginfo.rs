@@ -48,7 +48,7 @@ fn cargo_debuginfo_is_capped_for_sweep_and_role_runs_unless_already_chosen() {
     legacy(d.path(), "claude");
     let roles = d.path().join(".loom/roles");
     std::fs::create_dir_all(&roles).unwrap();
-    std::fs::write(roles.join("curator.json"), r#"{"runtimeRequirements":[]}"#).unwrap();
+    std::fs::write(roles.join("guide.json"), r#"{"runtimeRequirements":[]}"#).unwrap();
     let capped = [
         "line-tables-only".to_string(),
         "line-tables-only".to_string(),
@@ -61,7 +61,7 @@ fn cargo_debuginfo_is_capped_for_sweep_and_role_runs_unless_already_chosen() {
             .env("LOOM_ROLE", "builder");
     };
     let role = |c: &mut Command| {
-        c.env("LOOM_ROLE", "curator");
+        c.env("LOOM_ROLE", "guide");
     };
     assert_eq!(debuginfo(d.path(), "claude", &sweep), capped);
     assert_eq!(debuginfo(d.path(), "claude", &role), capped);

@@ -292,6 +292,7 @@ mod tests {
             provider_definition: std::collections::BTreeMap::new(),
             allowed_efforts: Vec::new(),
             billing: None,
+            excluded_roles: Vec::new(),
         }
     }
 
