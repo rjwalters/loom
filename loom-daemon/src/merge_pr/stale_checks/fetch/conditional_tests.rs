@@ -390,3 +390,41 @@ fn later_check_runs_pages_are_spaced() {
     fetch_check_runs(f.gh(), "o/r", SHA).unwrap();
     assert_eq!(budget::slept_for_test().len(), 1, "page 2 waited out the spacing");
 }
+
+#[test]
+fn writing_a_hold_prunes_expired_holds_and_keeps_live_ones() {
+    let f = Forge::new();
+    let now = chrono::Utc::now().timestamp();
+    let expired = budget::scope_with("github.com", "default;aaaa", "o/r");
+    let live = budget::scope_with("github.com", "default;bbbb", "o/r");
+    budget::plant_hold_for_test(&expired, now - 10);
+    let expired_file = budget::hold_file_for_test(&expired).unwrap();
+    assert!(expired_file.exists());
+    let other = f.store().join("checks-unrelated.json");
+    std::fs::write(&other, "{}").unwrap();
+
+    budget::note_secondary(&live, Some(now + 120));
+
+    assert!(!expired_file.exists(), "the expired hold was pruned");
+    assert!(budget::hold_file_for_test(&live).unwrap().exists(), "the live hold stays");
+    assert!(other.exists(), "only hold files are pruned");
+    assert!(budget::hold_until(&live, now).is_some());
+}
+
+#[test]
+fn a_hold_file_older_than_the_horizon_is_pruned_whatever_it_says() {
+    let f = Forge::new();
+    let now = chrono::Utc::now().timestamp();
+    let stale = budget::scope_with("github.com", "default;cccc", "o/r");
+    budget::plant_hold_for_test(&stale, now + 86_400);
+    let file = budget::hold_file_for_test(&stale).unwrap();
+    let three_hours_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3 * 3600);
+    std::fs::File::options()
+        .write(true)
+        .open(&file)
+        .unwrap()
+        .set_modified(three_hours_ago)
+        .unwrap();
+    budget::prune(f.store(), now);
+    assert!(!file.exists());
+}
