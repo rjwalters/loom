@@ -245,6 +245,16 @@ for bot in 'loom-fleet-dispatch[bot] Bot' 'loom-fleet-dispatch[bot] User' 'loom-
 done
 echo
 
+echo "Test 7c: removal with unidentified actor (null actor, missing/empty login or type) -> not a release; repaired"
+for actor in 'null' '{"type":"User"}' '{"login":"","type":"User"}' '{"login":"rjwalters"}'; do
+    FIX_EVENTS=$(jq -n --argjson a "$actor" '[{event: "labeled", label: {name: "loom:pr"}, actor: {login: "judge"}, created_at: "2026-10-08T00:00:00Z"},
+                          {event: "unlabeled", label: {name: "loom:operator"}, actor: $a, created_at: "2026-10-10T12:00:00Z"}]')
+    OUT=$(run_precheck)
+    assert_contains "$OUT" "BLOCKED=true PRIOR=true MANUAL=false" "unidentified actor $actor does not release the hold"
+    assert_contains "$OUT" "EDIT pr edit 10280 --add-label loom:operator" "label repaired for actor $actor"
+done
+echo
+
 echo "Test 8: head moved AND label removed -> (c) is the reason, MANUAL still set for the outcome rule"
 FIX_PR=$(pr_json "abcdef1234567890" loom:pr); FIX_EVENTS=$(unlabeled_event "2026-10-10T12:00:00Z")
 OUT=$(run_precheck)

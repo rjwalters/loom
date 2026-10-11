@@ -738,7 +738,7 @@ else
   fi
 
   # (e) A human removed `loom:operator` after the hold (#11416; was #7048's
-  #     "respected, still held"). Proof is a non-bot `unlabeled` event after
+  #     "respected, still held"). Proof is a human-identified `unlabeled` event after
   #     HOLD_AT, not bare absence (a failed `--add-label` is no release). Bot
   #     removals are Champion's own (Step 2, critical-file "Hold Cleared") and
   #     never count, like (b). Computed even when (a)-(d) fired.
@@ -746,7 +746,7 @@ else
   MANUAL_RELEASE_SINCE_HOLD=false; LABEL_REPAIR=false
   if [ "$OPERATOR_LABEL_NOW" = false ]; then
     if REMOVED_BY=$(gh api "repos/{owner}/{repo}/issues/$PR_NUMBER/events" --paginate --jq \
-      ".[] | select(.event == \"unlabeled\" and .label.name == \"loom:operator\" and .created_at > \"$HOLD_AT\" and .actor.type != \"Bot\" and ((.actor.login // \"\") | endswith(\"[bot]\") | not)) | \"\(.actor.login) at \(.created_at)\"" 2>/dev/null); then
+      ".[] | select(.event == \"unlabeled\" and .label.name == \"loom:operator\" and .created_at > \"$HOLD_AT\" and .actor.type == \"User\" and ((.actor.login // \"\") | length > 0 and (endswith(\"[bot]\") | not))) | \"\(.actor.login) at \(.created_at)\"" 2>/dev/null); then
       REMOVED_BY=$(tail -n 1 <<<"$REMOVED_BY")
       [ -z "$REMOVED_BY" ] && LABEL_REPAIR=true   # read OK, no removal on record
     else
@@ -817,9 +817,8 @@ tripping release path (b) or (d).
 - **A human `--remove-label loom:operator` IS release (e) (#11416)** — before,
   #7048 only stopped the label being reasserted while the precheck still
   refused the PR, so it sat as plain `loom:pr`, unmerged and out of the census
-  (#10280). Only a non-bot actor counts (type `Bot` or a `[bot]` login is
-  Champion's own write, so a failed merge after Step 2 is never read as a
-  release). Limit: where agents run under the operator's own user token, the
+  (#10280). Only a positively identified human counts (`actor.type == "User"`, non-empty login, no `[bot]` suffix); type `Bot`, a `[bot]` login, or a null/missing actor or login is
+  not a release, so a failed merge after Step 2 is never read as one. Limit: where agents run under the operator's own user token, the
   two are indistinguishable. A missing label with no human removal after the
   hold is repaired, not released.
 
