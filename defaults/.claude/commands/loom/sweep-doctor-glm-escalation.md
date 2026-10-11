@@ -14,19 +14,20 @@ from `doctor-rejection`); do not guess a value.
 
 ## State
 
-Written only through `sweep-checkpoint.sh`. Scope `N` is the PR's single closing issue; with
-zero/multiple closing issues pass `-`. State lives in the issue checkpoint when one exists,
+Written only through `sweep-checkpoint.sh`. Scope `N` is the PR's single closing issue (in
+scope even with no checkpoint file yet: still write `doctor-done`, which creates it); with
+zero/multiple closing issues pass `-` and write no `doctor-done`. State lives in the issue checkpoint when one exists,
 else in a PR-scoped `pr-P-doctor.json` beside it (no phase, never listed, so no phase is
 faked to hold it); the first issue `write` adopts it. Record the first attempt **before**
 its `doctor-done` write, so a checkpoint-less Mode C entry loses nothing. Later `write`s
 retain it; `curator-done`/`builder-done` or `delete` resets it (`doctor-clear N|- --pr P`
-at merge/park drops it all); an absent key (legacy) means zero. Keyed to the PR number.
+right after `merge-pr.sh` succeeds, or when the PR is parked, drops it all); an absent key (legacy) means zero. Keyed to the PR number.
 
 ## Procedure
 
 1. **After every completed Doctor attempt** (it pushed and re-labeled the PR), before the
    follow-up Judge, record the head it produced and where it ACTUALLY ran, from the
-   `worker run --json` report (`runtime`, `model_profile`), not from configuration.
+   `worker run --json` report (`runtime`, `model_profile`), not from configuration (no `runtime` in the report: treat as a launcher failure, record nothing).
    `--kind fix` answers Judge feedback; `--kind rebase` is a conflict-only rebase pass
    (recorded, never counted):
    ```bash
