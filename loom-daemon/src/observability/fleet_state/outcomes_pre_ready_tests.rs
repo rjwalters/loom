@@ -349,3 +349,24 @@ fn missing_history_or_entry_gives_no_fabricated_exit_and_a_failed_read_is_retrie
     assert_eq!(pre_ready(&out[2]).len(), 1, "{out:?}");
     assert!(pre_ready(&out[3]).is_empty(), "{out:?}");
 }
+
+#[test]
+fn a_pending_retry_survives_an_incomplete_curated_listing() {
+    let created = t0() - Duration::hours(2);
+    let mut forge = curated_then_approved_forge();
+    forge.histories.get_mut(&ISSUE).unwrap().events.pop();
+    forge.history_fail_reads = 1;
+    let inputs: Vec<FleetInput> = (0..4).map(|_| ready(&[], Vec::new())).collect();
+    // Complete listing with a failed history read, then a failed listing
+    // (the repo is absent), then a complete listing again.
+    let listings = [
+        curated(&[], created),
+        curated(&[ISSUE], created),
+        Curated::new(),
+        curated(&[ISSUE], created),
+    ];
+    let out = run_curated(&inputs, &listings, Duration::minutes(5), &mut forge);
+    assert!(pre_ready(&out[1]).is_empty(), "{out:?}");
+    let total: usize = out.iter().map(|o| pre_ready(o).len()).sum();
+    assert_eq!(total, 1, "exactly one triage outcome: {out:?}");
+}

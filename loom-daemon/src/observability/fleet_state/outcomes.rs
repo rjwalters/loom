@@ -501,7 +501,6 @@ fn pre_ready_pass<F: ForgeReads>(
     diff: &mut Diff<'_, F>,
     out: &mut Vec<TelemetryRecord>,
 ) {
-    let empty_curated = BTreeMap::new();
     let curated_now = memory.curated_now.clone().unwrap_or_default();
     let curated_of = |repo: &str, issue: u32| {
         curated_now
@@ -542,12 +541,16 @@ fn pre_ready_pass<F: ForgeReads>(
         }
     }
     for (repo, issue) in &memory.pre_ready_retry {
-        let created = match (
-            curated_now.get(repo).unwrap_or(&empty_curated).get(issue),
-            ready_row(pass.view, repo, *issue),
-        ) {
-            (None, None) => continue,
-            (c, r) => r.flatten().or_else(|| c.copied().flatten()),
+        // A repo missing from `curated_now` had no complete listing this
+        // pass: that is no evidence the issue left, so keep the retry.
+        let listing = curated_now.get(repo);
+        let created = match (listing.and_then(|c| c.get(issue)), ready_row(pass.view, repo, *issue))
+        {
+            (None, None) if listing.is_some() => continue,
+            (c, r) => r
+                .flatten()
+                .or_else(|| c.copied().flatten())
+                .or_else(|| curated_of(repo, *issue).flatten()),
         };
         candidates.entry((repo.clone(), *issue)).or_insert(created);
     }
