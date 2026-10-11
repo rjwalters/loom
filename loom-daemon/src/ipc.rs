@@ -709,6 +709,8 @@ async fn handle_client(
             depends_on,
             workspace_root,
             force,
+            runtime,
+            model_profile,
         } = request
         {
             let response = dispatch_sweep_nonblocking(
@@ -722,6 +724,8 @@ async fn handle_client(
                 depends_on,
                 workspace_root,
                 force,
+                runtime,
+                model_profile,
             )
             .await;
             let response_json = serde_json::to_string(&response)?;
@@ -2844,6 +2848,8 @@ fn handle_request(
             depends_on,
             workspace_root,
             force,
+            runtime,
+            model_profile,
         } => {
             // Host-distress circuit breaker (#4235): a *tripped* breaker
             // represents SUSTAINED, already-observed host distress across
@@ -2928,6 +2934,18 @@ fn handle_request(
             // autonomous work-finder / epic-supervisor dispatch paths so every
             // daemon-dispatched child is pinned to an explicit model.
             let repo_root = sr.config().workspace_root.clone();
+
+            // Per-dispatch runtime/modelProfile (#11284): validate (refusing an
+            // unavailable or unadmitted tap, no silent fallback) and record it
+            // for the Builder/Doctor phases.
+            if let Err(response) = crate::dispatch_tap::apply_request(
+                &repo_root,
+                &kind,
+                runtime.as_deref(),
+                model_profile.as_deref(),
+            ) {
+                return response;
+            }
 
             // Headroom advisory (#4234, Gap 1 of #4231's decomposition): consult
             // the same dynamic concurrency cap the autonomous work finder

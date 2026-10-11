@@ -12,6 +12,8 @@ pub(super) async fn dispatch_sweep_nonblocking(
     depends_on: Option<u32>,
     workspace_root: Option<String>,
     force: bool,
+    runtime: Option<String>,
+    model_profile: Option<String>,
 ) -> Response {
     // Host-distress circuit breaker (#4235) — unchanged from the previous
     // synchronous arm; a pure, lock-free global snapshot read.
@@ -58,6 +60,33 @@ pub(super) async fn dispatch_sweep_nonblocking(
         Ok(target) => target,
         Err(response) => return response,
     };
+
+    // Per-dispatch runtime/modelProfile (#11284): validate and record before
+    // anything is claimed or spawned; a refused tap never reaches the guards.
+    {
+        let repo_root = target
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .config()
+            .workspace_root
+            .clone();
+        let (runtime, model_profile) = (runtime.clone(), model_profile.clone());
+        let tap_kind = kind.clone();
+        match tokio::task::spawn_blocking(move || {
+            crate::dispatch_tap::apply_request(
+                &repo_root,
+                &tap_kind,
+                runtime.as_deref(),
+                model_profile.as_deref(),
+            )
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(response)) => return response,
+            Err(error) => return dispatch_error_response(&kind, error.into()),
+        }
+    }
 
     let prepare_target = target.clone();
     let prepare_kind = kind.clone();

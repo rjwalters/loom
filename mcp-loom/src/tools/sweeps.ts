@@ -504,6 +504,8 @@ async function dispatchSweep(args: {
   depends_on?: number;
   workspace_root?: string;
   force?: boolean;
+  runtime?: string;
+  model_profile?: string;
 }): Promise<
   | { success: true; result: DispatchResponse["payload"] }
   | { success: false; error: string; runtime_rejection?: RuntimeRejection }
@@ -537,6 +539,12 @@ async function dispatchSweep(args: {
         // `null` here would fail serde deserialization on every dispatch, so
         // this MUST default to `false`, never `null`/omitted.
         force: args.force ?? false,
+        // Issue #11284: optional per-dispatch runtime / model profile for the
+        // sweep's Builder and Doctor phases. `null` (the default) keeps the
+        // role policy; an unavailable or unadmitted tap is refused by the
+        // daemon, never silently replaced.
+        runtime: args.runtime ?? null,
+        model_profile: args.model_profile ?? null,
       },
     }, Math.max(DISPATCH_TIMEOUT_MS, resolveDaemonIpcTimeoutMs()))) as DaemonResponse;
 
@@ -918,6 +926,23 @@ export const sweepTools: Tool[] = [
             "Omit (or pass `false`) to preserve the default refuse-when-" +
             "tripped behavior — mirrors the CLI's `loom-daemon dispatch <N> " +
             "--force`.",
+        },
+        runtime: {
+          type: "string",
+          description:
+            "Optional (issue #11284): run this sweep's Builder and Doctor " +
+            "phases on an explicit runtime (e.g. `opencode`). Curator, " +
+            "Judge and the orchestrator keep their role policy. An " +
+            "unavailable or unadmitted runtime/profile is refused with the " +
+            "reason - it never falls through to the preference list. Omit " +
+            "to keep the configured role preference.",
+        },
+        model_profile: {
+          type: "string",
+          description:
+            "Optional model profile paired with `runtime` (e.g. " +
+            "`zai-flash`; `modelProfile` is accepted as an alias). Requires " +
+            "`runtime`.",
         },
       },
       required: ["kind"],
@@ -1362,6 +1387,13 @@ export async function handleSweepTool(
       // Issue #4317: defensive extraction — only a literal boolean `true`
       // forwards as `true` (e.g. the string `"true"` or `1` must NOT).
       const force = args?.force === true;
+      // Issue #11284: optional per-dispatch tap. Blank strings are unset;
+      // shape/combination errors are reported by the daemon with an
+      // actionable message.
+      const nonEmpty = (v: unknown): string | undefined =>
+        typeof v === "string" && v.trim().length > 0 ? v.trim() : undefined;
+      const runtime = nonEmpty(args?.runtime);
+      const modelProfile = nonEmpty(args?.model_profile) ?? nonEmpty(args?.modelProfile);
 
       const result = await dispatchSweep({
         kind: normalized,
@@ -1371,6 +1403,8 @@ export async function handleSweepTool(
         depends_on: dependsOn,
         workspace_root: extractWorkspaceRoot(args),
         force,
+        runtime,
+        model_profile: modelProfile,
       });
       if (!result.success) {
         // Issue #4494: a capability refusal renders the structured fields as

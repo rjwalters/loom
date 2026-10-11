@@ -287,9 +287,30 @@ pub fn cli(args: RunArgs) -> anyhow::Result<()> {
 
 /// Resolve the role's runtime the way a dispatch does (#8554). `Err` carries
 /// the exit code: 75 no seat, 78 config.
+#[cfg(test)]
 fn admit(
     root: &Path,
     role: Role,
+) -> Result<
+    (
+        crate::runtime_admission::ResolvedRuntime,
+        Option<crate::runtime_preference::Reservation>,
+    ),
+    LaunchError,
+> {
+    admit_for_issue(root, role, None)
+}
+
+/// [`admit`] for a phase of the sweep on `issue` (the Builder's `--issue`; a
+/// Doctor passes `None` and inherits the sweep's issue from the daemon's
+/// `LOOM_SWEEP_CLAIM_OWNED`). A per-dispatch explicit tap recorded for that
+/// issue (#11284) is applied here, for Builder and Doctor only: it pins the
+/// runtime, and an unavailable or unadmitted tap is refused with its reason
+/// rather than falling through to the role preference.
+fn admit_for_issue(
+    root: &Path,
+    role: Role,
+    issue: Option<u64>,
 ) -> Result<
     (
         crate::runtime_admission::ResolvedRuntime,
@@ -303,11 +324,20 @@ fn admit(
     ) {
         std::env::remove_var("LOOM_RUNTIME");
     }
-    let mut admission = crate::runtime_preference::resolve_for_dispatch(root, role.as_str(), None)
-        .map_err(|r| LaunchError {
-            code: rejection_exit_code(&r.reason),
-            message: r.diagnostic(),
-        })?;
+    let explicit = crate::dispatch_tap::phase_issue(issue)
+        .and_then(|issue| crate::dispatch_tap::load(root, issue));
+    let resolved = match &explicit {
+        Some(tap) => crate::runtime_preference::explicit_tap::resolve_for_dispatch_tap(
+            root,
+            role.as_str(),
+            tap,
+        ),
+        None => crate::runtime_preference::resolve_for_dispatch(root, role.as_str(), None),
+    };
+    let mut admission = resolved.map_err(|r| LaunchError {
+        code: rejection_exit_code(&r.reason),
+        message: r.diagnostic(),
+    })?;
     let backstop = admission.backstop.take();
     let admitted = admission
         .admitted
@@ -466,7 +496,7 @@ fn run(args: &RunArgs, role: Role) -> Result<i32, LaunchError> {
         return Ok(0);
     }
     let root = super::workspace(None)?;
-    let (admitted, backstop) = admit(&root, role)?;
+    let (admitted, backstop) = admit_for_issue(&root, role, args.issue)?;
     let model_profile = admitted
         .preference
         .as_ref()
@@ -825,6 +855,7 @@ mod tests {
                 "LOOM_RUNTIME_BUILDER",
                 "LOOM_RUNTIME_DOCTOR",
                 "LOOM_WORKTREE_ROOT",
+                "LOOM_SWEEP_CLAIM_OWNED",
                 // #11400: the zai-flash tap needs a seat from the fixture.
                 "ZAI_API_KEY",
                 "LOOM_NATIVE_AUTH_FILE",
@@ -909,6 +940,100 @@ mod tests {
         std::env::remove_var("LOOM_ROLE");
         std::env::set_var("LOOM_RUNTIME", "claude");
         assert_eq!(admit(dir.path(), Role::Doctor).unwrap().0.runtime, "claude");
+    }
+
+    /// A fixture whose role preference is Claude-only, optionally with a
+    /// selectable zai seat, so any opencode launch can only come from an
+    /// explicit per-dispatch tap (#11284).
+    fn explicit_tap_fixture(with_seat: bool) -> tempfile::TempDir {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        for kind in ["roles", "runtimes"] {
+            let to = dir.path().join(".loom").join(kind);
+            std::fs::create_dir_all(&to).unwrap();
+            for entry in std::fs::read_dir(repo.join("defaults").join(kind))
+                .unwrap()
+                .flatten()
+            {
+                let p = entry.path();
+                if p.extension().and_then(|e| e.to_str()) == Some("json") {
+                    std::fs::copy(&p, to.join(p.file_name().unwrap())).unwrap();
+                }
+            }
+        }
+        for rt in ["claude", "opencode"] {
+            write_exec(&dir.path().join(format!(".loom/scripts/spawn-{rt}.sh")), "#!/bin/sh\n");
+        }
+        let config = serde_json::json!({
+            "runtimes": {"rolePreference": {"builder": ["claude"], "doctor": ["claude"]}}
+        });
+        std::fs::write(dir.path().join(".loom/config.json"), config.to_string()).unwrap();
+        if with_seat {
+            let pool = crate::api_keys_pool::paths::per_repo_api_keys_dir(dir.path());
+            crate::api_keys_pool::registry::add(&pool, "zai", "a", "ZAI_API_KEY", "k", false)
+                .unwrap();
+        }
+        dir
+    }
+
+    fn zai_flash() -> crate::runtime_preference::Tap {
+        crate::runtime_preference::Tap {
+            runtime: "opencode".into(),
+            model_profile: Some("zai-flash".into()),
+        }
+    }
+
+    /// #11284: an explicit tap recorded at dispatch reaches Builder (by
+    /// `--issue`) and Doctor (by the daemon's `LOOM_SWEEP_CLAIM_OWNED`), and
+    /// keeps doing so on a retry or a resumed sweep (each is a fresh `admit`).
+    /// Without a record the role preference (Claude here) is unchanged.
+    #[test]
+    #[serial_test::serial]
+    fn explicit_tap_steers_builder_and_doctor_across_retries() {
+        let _env = EnvGuard::clear();
+        let dir = explicit_tap_fixture(true);
+        // The Claude-only preference has no token pool in this fixture, so
+        // without a record the launch is (correctly) unservable: the tap
+        // below succeeds only because it bypasses the preference list.
+        assert!(admit_for_issue(dir.path(), Role::Builder, Some(42)).is_err());
+
+        crate::dispatch_tap::save(dir.path(), 42, &zai_flash()).unwrap();
+        std::env::set_var("LOOM_SWEEP_CLAIM_OWNED", "42");
+        for attempt in 0..3 {
+            let (b, _) = admit_for_issue(dir.path(), Role::Builder, Some(42)).unwrap();
+            assert_eq!(b.runtime, "opencode", "builder attempt {attempt}");
+            let (d, _) = admit_for_issue(dir.path(), Role::Doctor, None).unwrap();
+            assert_eq!(d.runtime, "opencode", "doctor retry {attempt}");
+            let stamp = d.preference.unwrap();
+            assert_eq!(stamp.tap, "opencode:zai-flash");
+            assert_eq!(stamp.model_profile.as_deref(), Some("zai-flash"));
+        }
+        // A different issue is untouched.
+        assert!(admit_for_issue(dir.path(), Role::Builder, Some(43)).is_err());
+    }
+
+    /// #11284: an explicit tap with no spawnable seat is refused with the
+    /// reason, not handed to the Claude preference.
+    #[test]
+    #[serial_test::serial]
+    fn unavailable_explicit_tap_is_refused_not_replaced() {
+        let _env = EnvGuard::clear();
+        let dir = explicit_tap_fixture(false);
+        crate::dispatch_tap::save(dir.path(), 42, &zai_flash()).unwrap();
+        for role in [Role::Builder, Role::Doctor] {
+            let err = admit_for_issue(dir.path(), role, Some(42)).err().unwrap();
+            assert!(err.message.contains("opencode:zai-flash"), "{role:?}: {}", err.message);
+            assert!(err.message.contains("refusing"), "{role:?}: {}", err.message);
+        }
+        // The dispatch-time check agrees and records nothing for a new issue.
+        let refused = crate::dispatch_tap::apply_request(
+            dir.path(),
+            &crate::types::SweepKind::Issue(77),
+            Some("opencode"),
+            Some("zai-flash"),
+        );
+        assert!(matches!(refused, Err(crate::types::Response::RuntimeRejected(_))));
+        assert!(crate::dispatch_tap::load(dir.path(), 77).is_none());
     }
 
     /// #11303 review (P1 at d7fa7f835): setup and reuse resolve the helpers'
