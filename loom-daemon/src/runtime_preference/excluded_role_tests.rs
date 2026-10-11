@@ -31,22 +31,41 @@ fn chosen(decision: &Decision) -> (String, Option<String>) {
     (chosen.admitted.runtime.clone(), chosen.tap.model_profile.clone())
 }
 
-/// Resolve `role` against the committed `rolePreference.<role>` list,
-/// verbatim, asserting it is `[opencode:zai-flash, claude]`.
-fn write_shipped_role_preference(root: &Path, role: &str) {
-    let list = shipped_config()["runtimes"]["rolePreference"][role].clone();
-    assert_eq!(list, serde_json::json!([zai_tap(), "claude"]), "{role}");
-    write_config(root, &serde_json::json!({"runtimes": {"rolePreference": {role: list}}}));
+/// Resolve `role` against the fleet's routing, as fleet-gitops
+/// `config.defaults.runtimes` renders it into the machine tier (#11450): plain
+/// string entries (its schema has no `{runtime, modelProfile}` objects) on the
+/// bundled `zai-flash` default profile. This repo's `.loom/config.json` no
+/// longer carries it.
+fn write_fleet_role_preference(root: &Path, role: &str) {
+    let list = match role {
+        "builder" => serde_json::json!(["opencode", "claude"]),
+        "doctor" => serde_json::json!(["opencode", "codex", "claude"]),
+        other => unreachable!("{other}"),
+    };
+    write_config(
+        root,
+        &serde_json::json!({"runtimes": {
+            "defaultModelProfile": "zai-flash",
+            "rolePreference": {role: list}
+        }}),
+    );
 }
 
+/// Claude is chosen; the `opencode` entry was passed over as unavailable (no
+/// selectable zai seat), and any other skip is Doctor's Codex step, which the
+/// admission gate refuses (`worktreeIsolation` is only `partial`).
 fn assert_fell_through_to_claude(decision: &Decision, role: &str) {
     assert_eq!(chosen(decision), ("claude".into(), None), "{role}");
     let Decision::Preference { resolution, .. } = decision else {
         unreachable!()
     };
-    assert_eq!(resolution.skipped.len(), 1, "{role}");
     let reason = resolution.skipped[0].reason.to_string();
     assert!(reason.starts_with("unavailable("), "{role}: {reason}");
+    for skip in &resolution.skipped[1..] {
+        let reason = skip.reason.to_string();
+        assert!(reason.starts_with("not-admitted("), "{role}: {reason}");
+    }
+    assert_eq!(resolution.skipped.len(), if role == "doctor" { 2 } else { 1 }, "{role}");
 }
 
 /// Acceptance 1 (Doctor, #11400) and the operator's Builder addition: with a
@@ -62,7 +81,7 @@ fn doctor_and_builder_run_glm_first_and_fall_through_to_claude_without_a_zai_sea
     for role in ["doctor", "builder"] {
         let dir = fixture();
         provision_claude_pool(dir.path(), 2);
-        write_shipped_role_preference(dir.path(), role);
+        write_fleet_role_preference(dir.path(), role);
 
         // No zai pool on this host, no exported key, no auth snapshot.
         let decision = resolve_runtime(dir.path(), role, None, 0).unwrap();
@@ -70,7 +89,9 @@ fn doctor_and_builder_run_glm_first_and_fall_through_to_claude_without_a_zai_sea
 
         provision_zai_pool(dir.path(), true);
         let decision = resolve_runtime(dir.path(), role, None, 0).unwrap();
-        assert_eq!(chosen(&decision), ("opencode".into(), Some("zai-flash".into())), "{role}");
+        // A bare entry carries no per-tap profile; it was judged against the
+        // `zai-flash` default, which is why the zai pool decides it.
+        assert_eq!(chosen(&decision), ("opencode".into(), None), "{role}");
         let Decision::Preference { source, .. } = &decision else {
             unreachable!()
         };
@@ -242,10 +263,6 @@ fn validate_rejects_an_unknown_excluded_role() {
     let shipped = shipped_config();
     assert_eq!(check_excluded_roles_config(&shipped), Vec::<String>::new());
     assert_eq!(super::check_runtimes_preference_config(&shipped), Vec::<String>::new());
-    assert_eq!(
-        shipped["runtimes"]["rolePreference"]["judge"],
-        serde_json::json!(["codex", "claude"])
-    );
     let bad = serde_json::json!({"runtimes": {"modelProfiles": {
         "glm": {"model": "m", "providers": {"opencode": "p"}, "excludedRoles": ["judge", "reviewer"]},
         "worse": {"model": "m", "providers": {}, "excludedRoles": "judge"}
