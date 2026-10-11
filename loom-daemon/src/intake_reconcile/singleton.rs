@@ -89,7 +89,9 @@
 //! shed, failed or early-stopped pass records its outcome but keeps the
 //! previous stamp. The `fleet_outputs::SINGLETON_OUTPUTS` row for this job
 //! (record kind [`PASS_HEARTBEAT_KIND`]) judges that stamp against twice the
-//! pass cadence (default 600 s).
+//! default pass cadence — a fixed 600 s; the
+//! `LOOM_INTAKE_RECONCILE_INTERVAL_SECS` override does not move the row's
+//! deadline.
 //!
 //! # Rate limits
 //!

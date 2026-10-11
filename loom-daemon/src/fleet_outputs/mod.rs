@@ -157,8 +157,9 @@ pub const SINGLETON_OUTPUTS: &[SingletonOutput] = &[
         &[gauges::ENABLED_KEY, gauges::QUEUE_BLOCKED_KEY],
     ),
     // Intake reconcile (#10924): the captain's pass over the registered repos
-    // completes every LOOM_INTAKE_RECONCILE_INTERVAL_SECS (default 300 s)
-    // whether or not anything was labelled, so its durable output is the
+    // runs on the built-in default cadence (300 s) whether or not anything
+    // was labelled — the LOOM_INTAKE_RECONCILE_INTERVAL_SECS override does
+    // not move this row's deadline — so its durable output is the
     // completed-pass heartbeat (`PassHeartbeat`, on the captain). A pass that
     // is stopped early by the breaker, or shed or failed a listing, keeps the
     // previous stamp: only a completed scan counts as output. Critical, not
