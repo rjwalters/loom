@@ -225,6 +225,7 @@ fn outcome(issue: u32) -> crate::sweep_outcomes::OutcomeRecord {
         jev_confidence: None,
         tap_usage: None,
         tap_usage_all: Vec::new(),
+        phase_tap_usage: Vec::new(),
         duration_sec: 12,
     }
 }
