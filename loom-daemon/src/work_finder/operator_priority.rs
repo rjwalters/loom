@@ -109,7 +109,12 @@ impl WorkItem {
 /// A starred epic or proposal ([`CHAMPION_PATH_LABELS`]) is dropped from the
 /// starred rows too: the star does not make it build work. It keeps its
 /// Champion path (a starred epic is curated, then taken first by Champion's
-/// epic queue; #9244 slice B). The `loom:issue` rows are left as they are.
+/// epic queue; #9244 slice B). The `loom:issue` rows are not filtered here:
+/// an epic among them is dropped later by the ordinary skip filter, because
+/// `loom:epic` is a [`SKIP_LABELS`](super::SKIP_LABELS) entry (#11399), and so
+/// is counted and shown as a skipped row instead of vanishing. A promoted
+/// proposal (`loom:architect` and the like) on a `loom:issue` row stays
+/// dispatchable.
 #[must_use]
 pub fn merge_starred(mut ready: Vec<WorkItem>, starred: Vec<WorkItem>) -> Vec<WorkItem> {
     let listed: HashSet<u32> = ready.iter().map(|i| i.number).collect();
