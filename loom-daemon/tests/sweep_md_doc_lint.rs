@@ -335,6 +335,16 @@ fn sweep_md_documents_refusal_fallback() {
     );
 }
 
+/// #9265: a base-conflict Doctor with no Judge rejection outstanding is a
+/// "rebase pass" — outside `sweep.max_doctor_cycles`, bounded by its own budget
+/// of 3, parked with its own reason. Body:
+/// [`doc_lint_support::check_rebase_pass_carve_out`].
+#[test]
+fn sweep_md_documents_rebase_pass_carve_out_and_budget() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(SWEEP_SKILL_DIR_RELATIVE);
+    doc_lint_support::check_rebase_pass_carve_out(&read_sweep_md(), &dir);
+}
+
 /// #3702: the hard invariant that Judge model resolution can never resolve to
 /// `fable`, regardless of ladder contents or any marker.
 #[test]
