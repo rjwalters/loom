@@ -56,13 +56,17 @@
 #     conflicted rebase is aborted so remaining children still process.
 #   - Refuses to run with a dirty working tree (a rebase would fail confusingly).
 #   - GitHub-only, and only for a <parent-branch> matching feature/issue-<N>.
+#   - Rebases only where `loom-daemon branch-update strategy` says `rebase`
+#     (#10771). In a merge-only repo (the default answer, and the answer when
+#     anything is unknown) a stale child is reported, never rewritten:
+#     merge-based de-stacking is #9808.
 #
 # Options:
 #   --dry-run   Report the per-child outcome without executing git/gh mutations.
 #   --help,-h   Show this help.
 #
 # Exit codes:
-#   0 = rebased, deferred, or no-op (or dry-run printed)
+#   0 = rebased, deferred, skipped (merge-only repo), or no-op (or dry-run)
 #   1 = usage / precondition failure
 #   2 = a git/gh step failed (rebase conflict, rejected force-with-lease push)
 
@@ -82,7 +86,7 @@ info() { echo -e "${BLUE}ℹ $1${NC}" >&2; }
 warn() { echo -e "${YELLOW}⚠ $1${NC}" >&2; }
 
 show_help() {
-    sed -n '2,67p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,71p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 DRY_RUN=false
@@ -138,6 +142,14 @@ source "$SCRIPT_DIR/lib/locate-daemon-bin.sh"
 DAEMON_BIN="$(loom_daemon_self_bin_override || loom_locate_daemon_bin "$SCRIPT_DIR/../.." || true)"
 loom_daemon_version_preflight push-lease "$DAEMON_BIN"
 
+# #10771: may PR branches here be rebased at all? A rebase + force-push in a
+# repo that bars rebase deletes other agents' merge commits and orphans every
+# head a reviewer signed. Anything but an explicit `rebase` answer — including
+# a binary predating the subcommand — is merge, which skips every child.
+# requires-daemon: branch-update optional   #10771 — a binary without it answers nothing, which is read as merge: children are reported, never rewritten
+BRANCH_UPDATE_STRATEGY="$("$DAEMON_BIN" branch-update strategy 2>/dev/null)" || BRANCH_UPDATE_STRATEGY=merge
+[[ "$BRANCH_UPDATE_STRATEGY" == "rebase" ]] || BRANCH_UPDATE_STRATEGY=merge
+
 # Ref-operand validator (#9106). REQUIRED, not defensive: every git call in this
 # script takes a branch name as a bare operand, and the child names come
 # straight off the forge (`gh pr list --json headRefName`). A missing validator
@@ -191,6 +203,12 @@ _process_one_stacked_child() {
     # If so the child already contains everything the parent has — no-op.
     if git merge-base --is-ancestor "origin/$parent_branch" "origin/$child_branch" >/dev/null 2>&1; then
         info "Child PR #$child_pr ($child_branch) already contains parent tip — up to date, skipping"
+        return 0
+    fi
+
+    # #10771: in a merge-only repo, never rewrite the child. Reported, exit 0.
+    if [[ "${BRANCH_UPDATE_STRATEGY:-}" == "merge" ]]; then
+        warn "Child PR #$child_pr ($child_branch) is stale relative to '$parent_branch', but this repository's PR branches are not rebased (loom-daemon branch-update strategy: merge, #10771) — not rewriting it. Update it with a merge and a plain push in its worktree: git merge origin/$parent_branch && git push origin HEAD:$child_branch (merge-based de-stacking: #9808)."
         return 0
     fi
 

@@ -399,6 +399,26 @@ assert_contains "$ALL_LOG_C" \
   "loom-daemon push-lease pin-flag --remote origin --branch feature/issue-201 --local-ref refs/heads/feature/issue-201" \
   "(c) the pin is built by the loom-daemon subcommand, with the local-ref ancestry check wired (#9487)"
 
+# (c-merge) #10771: same stale, safe child, but this repo's PR branches are
+#     not rebased (loom-daemon branch-update strategy = merge). The child is
+#     reported and left alone: no pin, no rebase, no push, no comment, and not a
+#     failure — rewriting it would delete other agents' merge commits.
+reset_state
+BRANCH_UPDATE_STRATEGY=merge
+write_prlist "feature/issue-100" '[{"number":501,"headRefName":"feature/issue-201"}]'
+clear_uptodate "feature/issue-201"   # stale
+OUT_CM_FILE="$(mktemp)"
+_rebase_stacked_children "feature/issue-100" >"$OUT_CM_FILE" 2>&1
+OUT_CM="$(cat "$OUT_CM_FILE")"
+rm -f "$OUT_CM_FILE"
+assert_not_contains "$(read_git)" "rebase" "(c-merge) merge-only repo -> no rebase attempted (#10771)"
+assert_not_contains "$(read_git)" "push" "(c-merge) merge-only repo -> nothing pushed, let alone forced (#10771)"
+assert_not_contains "$(read_all)" "push-lease pin-flag" "(c-merge) merge-only repo -> no lease is even built"
+assert_eq "" "$(read_gh)" "(c-merge) merge-only repo -> no comment posted"
+assert_eq "0" "$RSC_FAILURE" "(c-merge) merge-only repo -> a policy skip is not a failure"
+assert_contains "$OUT_CM" "git merge origin/feature/issue-100" "(c-merge) the skip names the merge-based remedy"
+unset BRANCH_UPDATE_STRATEGY
+
 # (c2) Same as (c), but version-check-gate.sh (real script, #7168) reports a
 #      mismatch via LOOM_VERSION_CHECK_SCRIPT -> rebase runs, but the push is
 #      NEVER attempted and RSC_FAILURE=2 (mirrors the rebase-conflict path).
@@ -599,6 +619,10 @@ assert_contains "$src" "PUSH-LEASE-RACE-DETECTED" \
   "script logs a greppable marker when a reported rejection is actually landed"
 assert_contains "$src" 'source "$SCRIPT_DIR/lib/push-lease-verify.sh"' \
   "script sources the shared push-lease-verify helper"
+assert_contains "$src" 'BRANCH_UPDATE_STRATEGY="$("$DAEMON_BIN" branch-update strategy 2>/dev/null)" || BRANCH_UPDATE_STRATEGY=merge' \
+  "script asks loom-daemon branch-update strategy, failing toward merge (#10771)"
+assert_contains "$src" '[[ "$BRANCH_UPDATE_STRATEGY" == "rebase" ]] || BRANCH_UPDATE_STRATEGY=merge' \
+  "any answer but an explicit rebase is merge (#10771)"
 assert_contains "$src" '"$SCRIPT_DIR/version-check-gate.sh"' \
   "safe path runs the shared version-check-gate.sh after rebase, before push (#7168)"
 

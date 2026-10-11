@@ -43,6 +43,12 @@
 # apparently-clean rebase silently drop the just-merged parent's
 # implementation (#8583). A fetch failure refuses instead of degrading.
 #
+# Merge-only repos (#10771): where `loom-daemon branch-update strategy` does
+# not say `rebase` (the default, and the answer when anything is unknown), the
+# child is NOT rewritten. The parent merged as a merge commit, so its commits
+# are already in the default branch; step 3's retarget alone is correct and
+# the rebase + force-push of steps 1-2 are skipped.
+#
 # Safety:
 #   - Uses --force-with-lease (NEVER a bare --force) so a concurrent push to the
 #     child branch aborts the rebase rather than clobbering it, and PINS the
@@ -85,7 +91,7 @@ info() { echo -e "${BLUE}ℹ $1${NC}" >&2; }
 warn() { echo -e "${YELLOW}⚠ $1${NC}" >&2; }
 
 show_help() {
-    sed -n '2,69p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,75p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 DRY_RUN=false
@@ -171,6 +177,27 @@ DAEMON_BIN="$(loom_daemon_self_bin_override || loom_locate_daemon_bin "$REPO_ROO
 if [[ -z "$DAEMON_BIN" ]]; then
     err "loom-daemon not found — required for 'reconcile-stack' (#8583). Build it (cargo build --release --package loom-daemon) or set LOOM_DAEMON_SELF_BIN=/path/to/loom-daemon. Refusing rather than rebasing onto an unverified destination."
     exit 1
+fi
+
+# #10771: may this repo's PR branches be rebased at all? If not, retarget only:
+# a rebase + force-push here deletes merge commits other agents pushed to the
+# child and orphans every head a reviewer signed. Anything but an explicit
+# `rebase` answer — including a binary predating the subcommand — is merge.
+# requires-daemon: branch-update optional   #10771 — no answer is read as merge: the child is retargeted, never rewritten
+BRANCH_UPDATE_STRATEGY="$("$DAEMON_BIN" branch-update strategy 2>/dev/null)" || BRANCH_UPDATE_STRATEGY=merge
+if [[ "$BRANCH_UPDATE_STRATEGY" != "rebase" ]]; then
+    info "PR branches here are not rebased (loom-daemon branch-update strategy: merge, #10771) — '$CHILD_BRANCH' is not rewritten; its parent's commits reached $DEFAULT_BRANCH by merge commit, so retargeting the base is the whole reconcile."
+    if [[ "$DRY_RUN" == "true" ]]; then
+        ok "Dry run complete — would run: gh pr edit $CHILD_PR --base $DEFAULT_BRANCH"
+        exit 0
+    fi
+    WRITE_REPO="$(source "$SCRIPT_DIR/lib/forge-helpers.sh" && loom_write_repo "${LOOM_REPO:-}")" || { err "Refusing to reconcile: loom-daemon forge may-write refused this checkout's repo (#9548). Nothing was mutated."; exit 1; }
+    if ! gh pr edit "$CHILD_PR" ${WRITE_REPO:+--repo "$WRITE_REPO"} --base "$DEFAULT_BRANCH"; then
+        err "Failed to retarget PR #$CHILD_PR base to $DEFAULT_BRANCH. Retarget it manually."
+        exit 2
+    fi
+    ok "Reconciled (merge mode): PR #$CHILD_PR now targets $DEFAULT_BRANCH; '$CHILD_BRANCH' was not rewritten. Bring it up to date with a merge and a plain push if it is behind."
+    exit 0
 fi
 
 # #9487: capture the child branch's LIVE remote head NOW — before step 1's

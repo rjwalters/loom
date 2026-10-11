@@ -570,10 +570,29 @@ mod tests {
         rest[open..open + close].to_string()
     }
 
+    /// A `PATH` whose `loom-daemon` answers `branch-update strategy` with
+    /// `mode` (#10771). These flows exercise the rebase path's pinned lease;
+    /// the merge path, run against the real binary, is in
+    /// `tests/branch_update_cli.rs`.
+    fn strategy_path(mode: &str) -> (tempfile::TempDir, String) {
+        let bin = tempfile::tempdir().expect("tempdir");
+        let stub = bin.path().join("loom-daemon");
+        std::fs::write(&stub, format!("#!/bin/sh\necho {mode}\n")).expect("write stub");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+        let path =
+            format!("{}:{}", bin.path().display(), std::env::var("PATH").unwrap_or_default());
+        (bin, path)
+    }
+
     /// Run the prompt's own "Verify the pin" and "Pin the lease" blocks, in
     /// order, in `work`; `between` lists shell steps run before each push.
     /// Returns (exit status ok, stderr).
     fn doctor_flow(work: &Path, pushes: &[&str]) -> (bool, String) {
+        let (_bin, path) = strategy_path("rebase");
         let mut script = String::from("set -e\nCLAIM_HEAD_SHA=$(git rev-parse HEAD)\n");
         script.push_str(&prompt_block("### Verify the pin"));
         for step in pushes {
@@ -585,6 +604,7 @@ mod tests {
             .arg("-c")
             .arg(&script)
             .current_dir(work)
+            .env("PATH", &path)
             .env("GIT_AUTHOR_NAME", "t")
             .env("GIT_AUTHOR_EMAIL", "t@t")
             .env("GIT_COMMITTER_NAME", "t")
@@ -653,6 +673,7 @@ mod tests {
     #[test]
     fn the_push_block_refuses_an_unverified_pin() {
         let (_tmp, _origin, work) = fixture_with_main();
+        let (_bin, path) = strategy_path("rebase");
         let script = format!(
             "set -e\nCLAIM_HEAD_SHA=$(git rev-parse HEAD)\n{AMEND}\n{}",
             prompt_block("### Pin the lease")
@@ -661,6 +682,7 @@ mod tests {
             .arg("-c")
             .arg(&script)
             .current_dir(&work)
+            .env("PATH", &path)
             .env("GIT_AUTHOR_NAME", "t")
             .env("GIT_AUTHOR_EMAIL", "t@t")
             .env("GIT_COMMITTER_NAME", "t")

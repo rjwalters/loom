@@ -269,6 +269,9 @@ teardown_sandbox() {
 }
 
 # Run reconcile-stack.sh from $1 (a cwd), capturing combined output + exit code.
+# The scenarios above Scenario M exercise the rebase path, so the policy is
+# pinned to `rebase` unless the caller sets LOOM_BRANCH_UPDATE_STRATEGY
+# (empty = unset, i.e. the daemon's own `auto` answer) (#10771).
 # Result in RUN_OUT / RUN_RC. gh stub + git file-protocol are made available.
 # Extra positional args (e.g. --dry-run) are forwarded to reconcile-stack.sh.
 # LOOM_VERSION_CHECK_SCRIPT, when set in the caller's environment, is
@@ -283,6 +286,8 @@ run_reconcile() {
         cd "$cwd" &&
         PATH="$GIT_STUB_DIR:$GH_STUB_DIR:$PATH" \
         LOOM_DEFAULT_BRANCH="main" \
+        LOOM_BRANCH_UPDATE_STRATEGY="${LOOM_BRANCH_UPDATE_STRATEGY-rebase}" \
+        LOOM_GH_NO_POLICY_LAUNCHER=1 \
         LOOM_TEST_FAKE_REJECT="${LOOM_TEST_FAKE_REJECT:-0}" \
         LOOM_TEST_PUSH_RACE_SCRIPT="${LOOM_TEST_PUSH_RACE_SCRIPT:-}" \
         LOOM_VERSION_CHECK_SCRIPT="${LOOM_VERSION_CHECK_SCRIPT:-}" \
@@ -685,6 +690,31 @@ assert_eq "$CHILD_BEFORE_K" "$(git_q -C "$MAIN" rev-parse "$CHILD_BR")" \
 assert_eq "" "$(cat "$GH_EDIT_LOG")" "K: the child PR was not retargeted either"
 
 teardown_sandbox
+
+# ─────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "Scenario M: a merge-only repo retargets the child and never rewrites it (#10771)"
+for M_MODE in merge auto-unknown; do
+    setup_sandbox
+    CHILD_BEFORE_M="$(git_q -C "$MAIN" rev-parse "$CHILD_BR")"
+    REMOTE_BEFORE_M="$(git_q -C "$MAIN" ls-remote origin "refs/heads/$CHILD_BR" | cut -f1)"
+    if [[ "$M_MODE" == "merge" ]]; then
+        LOOM_BRANCH_UPDATE_STRATEGY=merge run_reconcile "$MAIN"
+    else
+        # No override: the daemon asks the forge, the gh stub cannot answer
+        # `api repos/...`, and unknown must fail toward merge.
+        LOOM_BRANCH_UPDATE_STRATEGY="" run_reconcile "$MAIN"
+    fi
+    assert_eq "0" "$RUN_RC" "M ($M_MODE): reconcile exits 0"
+    assert_contains "$RUN_OUT" "#10771" "M ($M_MODE): the output names the merge-only policy"
+    assert_eq "$CHILD_BEFORE_M" "$(git_q -C "$MAIN" rev-parse "$CHILD_BR")" \
+      "M ($M_MODE): the local child branch was not rewritten"
+    assert_eq "$REMOTE_BEFORE_M" "$(git_q -C "$MAIN" ls-remote origin "refs/heads/$CHILD_BR" | cut -f1)" \
+      "M ($M_MODE): nothing was pushed to the child branch"
+    assert_contains "$(cat "$GH_EDIT_LOG")" "pr edit $CHILD_PR --repo owner/repo --base main" \
+      "M ($M_MODE): the child PR base is still retargeted to the default branch"
+    teardown_sandbox
+done
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Source guards: fail loudly if a refactor drops either fix.

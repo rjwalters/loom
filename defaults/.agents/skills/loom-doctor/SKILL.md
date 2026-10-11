@@ -608,23 +608,10 @@ if [ "$PRIORITY_1" -eq 0 ] && [ "$PRIORITY_2" -eq 0 ]; then
     # Check for merge conflicts (ask the forge; `git merge-tree origin/main`
     # alone is not a valid invocation — it needs the base + two commits).
     if [ "$(gh pr view "$UNLABELED_PR" --json mergeable --jq '.mergeable')" = "CONFLICTING" ]; then
-      # Pin = the head just checked out, BEFORE the rebase; never the forge (#9487).
+      # Pin = the head just checked out, BEFORE the update; never the forge (#9487).
       PUSH_LEASE_SHA=$(git rev-parse HEAD)
-      # Resolve conflicts
-      git fetch origin main
-      git rebase origin/main
-      # ... resolve conflicts ...
-      # DCO: a commit re-authored during the rebase keeps its Signed-off-by
-      # trailer via `git commit --amend --signoff` (defaults/docs/commit-signoff.md).
-
-      # Version-bearing-file sync gate (#7168; see "Pin the lease" for why).
-      # If it fires that is an anomaly: never hand-edit a version-bearing file
-      # or run `version.sh bump` -- stop, do not push, report it on the PR.
-      if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-check-gate.sh --fix-hint "then push."; then
-        echo "Aborting: version-bearing files are out of sync after rebase (see BLOCKER:/Fix: above) -- unexpected under #7743; report, do not hand-bump." >&2
-        exit 1
-      fi
-      git push --force-with-lease="$PR_BRANCH:$PUSH_LEASE_SHA" || exit 1
+      # Now run "PR Has Merge Conflicts" (below) top to bottom: merge (or rebase,
+      # per `branch-update strategy`, #10771), resolve, version gate, push.
 
       # Comment but don't add labels
       ./.loom/scripts/post-comment.sh $UNLABELED_PR --pr --body "🔧 Fixed merge conflicts with main branch."
@@ -730,7 +717,7 @@ gh pr edit 588 --remove-label "loom:treating" --add-label "loom:review-requested
    - This prevents multiple fix-push-fail cycles
 9. **Commit and push**: Push your fixes to the PR branch
    - **Pre-push head-SHA recheck (MANDATORY)**: before the push, re-compare the PR's `headRefOid` against the `CLAIM_HEAD_SHA` you captured in step 2 — see "Pre-Push Head-SHA Recheck" below. If the head moved, another agent pushed while you were working; re-verify the blocker is still unaddressed and stand down rather than duplicating (or clobbering) their fix.
-   - **Then run "Pin the lease" below, top to bottom**: the pre-open rebase onto `origin/main` (MANDATORY, #7668, as `builder-pr.md` § "Pre-Push Rebase") and the pinned push (#9487). Never rebase before it. On a conflict resolve in place (`git add`, `git rebase --continue`), resume at its version gate, not "PR Has Merge Conflicts". No-op if `main` hasn't moved.
+   - **Then run "Pin the lease" below, top to bottom**: the pre-open update from `origin/main` (MANDATORY, #7668, as `builder-pr.md` § "Pre-Push Rebase"; a merge unless `loom-daemon branch-update strategy` says rebase, #10771) and the push (#9487). Never update before it. On a conflict resolve in place (`git add`, then `git commit --no-edit` or `git rebase --continue`), resume at its version gate, not "PR Has Merge Conflicts". No-op if `main` hasn't moved.
    - **DCO / sign-off**: if `commit.signoff` is `true` in `.loom/config.json` (read it the same way as `buildGate.command`), or the repo has a DCO / required `sign-off` check, add `--signoff` to **every** commit you author — including `git commit --amend --signoff` when re-authoring during a rebase — so each carries a `Signed-off-by:` trailer. Harmless when not required; git will not add a duplicate trailer. Reference: `defaults/docs/commit-signoff.md`.
    - **9a. Rebase any stacked children** (best-effort): if the just-pushed branch matches `feature/issue-<N>` (i.e. you amended a stacked *parent*), run:
      ```bash
@@ -952,8 +939,8 @@ git fetch origin && git log --oneline "$CLAIM_HEAD_SHA..origin/$(git branch --sh
 | Finding | Action |
 |---------|--------|
 | The concurrent push already fixes the blocker (checks green / Judge feedback addressed) | **Stand down.** Do not push. Comment, drop your claim, and exit (see below). |
-| The blocker is still unaddressed, and the new commits are unrelated (e.g. a rebase onto main, an unrelated fix) | Rebase your work onto the new head, re-run local checks, then **re-pin** `PUSH_LEASE_SHA=$CURRENT_HEAD_SHA`, re-run "Verify the pin" before any further amend, and push (below). Never `--force`. |
-| Your work and theirs overlap partially | Keep only the parts still needed, rebase, re-run local checks, then re-pin and push as above. |
+| The blocker is still unaddressed, and the new commits are unrelated (e.g. a merge of main, an unrelated fix) | Bring your work onto the new head (merge it in; rebase only in rebase mode), re-run local checks, then **re-pin** `PUSH_LEASE_SHA=$CURRENT_HEAD_SHA`, re-run "Verify the pin" before any further amend, and push (below). Never `--force`. |
+| Your work and theirs overlap partially | Keep only the parts still needed, update as above, re-run local checks, then re-pin and push. |
 | You cannot tell | Prefer standing down and commenting — a duplicate fix costs more than a deferred one. |
 
 ### Verify the pin — after setup, BEFORE any edit or rewrite (#9487)
@@ -974,19 +961,26 @@ The recheck above is the *social* layer; this one is **mandatory**. A bare
 linked worktree**: a sibling's `git fetch` makes your push delete their commit
 (PR #9483). Pin the head you built on; never "freshen" it. Why: `defaults/docs/push-lease-pinning.md`.
 
+**Merge mode (#10771)**, the default unless the repo allows rebase merges:
+never rebase, amend or force a commit already on the remote; add commits. A
+rejected plain push means someone pushed: redo the Head-SHA Recheck (merge
+their head in, or stand down), never force.
+
 ```bash
 BRANCH=$(git branch --show-current)
+BRANCH_UPDATE=$(loom-daemon branch-update strategy) || BRANCH_UPDATE=merge  # unknown = merge
 # CLAIM_HEAD_SHA (step 2, read BEFORE checkout); re-pin only per the table / last line.
 PUSH_LEASE_SHA="${PUSH_LEASE_SHA:-$CLAIM_HEAD_SHA}"
 [ -n "$PUSH_LEASE_SHA" ] || { echo "No pin: STOP. Do not push or re-read the head." >&2; exit 1; }
 # git accepts ANY full-SHA pin, even unfetched: "Verify the pin" must have run first.
 [ "${PUSH_LEASE_OK:-}" = "$PUSH_LEASE_SHA" ] || { echo "Pin unverified: STOP." >&2; exit 1; }
-git fetch origin main && git rebase origin/main || exit 1  # conflict: resolve, add, --continue, resume here
+git fetch origin main || exit 1
+if [ "$BRANCH_UPDATE" = rebase ]; then git rebase origin/main; else git merge --no-ff -m "Merge origin/main into $BRANCH (Doctor: update before push)" origin/main; fi || exit 1  # conflict: resolve, add, `--continue` / `git commit --no-edit`, resume here
 if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-check-gate.sh --fix-hint "then push."; then
-  echo "Aborting: version-bearing files out of sync after rebase (see BLOCKER:/Fix:)." >&2
+  echo "Aborting: version-bearing files out of sync after update (see BLOCKER:/Fix:)." >&2
   exit 1
 fi
-git push --force-with-lease="$BRANCH:$PUSH_LEASE_SHA" &&
+if [ "$BRANCH_UPDATE" = rebase ]; then git push --force-with-lease="$BRANCH:$PUSH_LEASE_SHA"; else git push origin "HEAD:$BRANCH"; fi &&
   { PUSH_LEASE_SHA=$(git rev-parse HEAD); PUSH_LEASE_OK=$PUSH_LEASE_SHA; CLAIM_HEAD_SHA=$PUSH_LEASE_SHA; }  # own push: re-pin
 ```
 
@@ -1049,8 +1043,8 @@ write that actually matters, not just at claim time.
       on a fresh claim; reclaimed only on a stale one)
 - [ ] I re-compared the PR's `headRefOid` against `CLAIM_HEAD_SHA` immediately
       before pushing, and on a mismatch re-verified the blocker (or stood down)
-- [ ] Every force-push pinned a SHA in my HEAD (`--force-with-lease=<branch>:<sha>`),
-      re-pinned after my own push, never bare (#9487)
+- [ ] Merge mode: no rebase, amend or force push; rebase mode: every force-push pinned a
+      SHA in my HEAD (`--force-with-lease=<branch>:<sha>`), re-pinned, never bare (#9487, #10771)
 - [ ] I re-read the PR's labels immediately before the completion write (Verdict-Time
       CAS Recheck above), and aborted/stood down on a lost claim or a raced verdict
       label instead of writing over it
@@ -1400,25 +1394,22 @@ PUSH_LEASE_SHA="${PUSH_LEASE_SHA:-${CLAIM_HEAD_SHA:?}}"
 BRANCH=$(git branch --show-current)
 # Nothing rewritten yet? Verify now (an amend fails safe).
 [ "${PUSH_LEASE_OK:-}" = "$PUSH_LEASE_SHA" ] || { git merge-base --is-ancestor "$PUSH_LEASE_SHA" HEAD && PUSH_LEASE_OK=$PUSH_LEASE_SHA; } || { echo "Pin not in HEAD: STOP." >&2; exit 1; }
+BRANCH_UPDATE=$(loom-daemon branch-update strategy) || BRANCH_UPDATE=merge  # #10771; unknown = merge
 
 git fetch origin main
-git rebase origin/main
-
-# On a conflict git stops and names the files: resolve each (<<<<<<< markers),
-# then `git add <file>` and continue.
-git rebase --continue
+if [ "$BRANCH_UPDATE" = rebase ]; then git rebase origin/main; else git merge --no-ff -m "Merge origin/main into $BRANCH (Doctor: resolve conflicts)" origin/main; fi
+# Conflict: resolve each file, `git add` it, then `git commit --no-edit` (merge) or `git rebase --continue`.
 
 # Version-bearing-file sync gate (#7168): if it fires, stop and report; never hand-bump.
 if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-check-gate.sh --fix-hint "then push."; then
-  echo "Aborting: version-bearing files are out of sync after rebase (see BLOCKER:/Fix: above) -- unexpected under #7743; report, do not hand-bump." >&2
+  echo "Aborting: version-bearing files are out of sync after update (see BLOCKER:/Fix: above) -- unexpected under #7743; report, do not hand-bump." >&2
   exit 1
 fi
 
-# Force push with the lease PINNED (never bare -- #9487); re-pin to your own push
-git push --force-with-lease="$BRANCH:$PUSH_LEASE_SHA" &&
+# Merge: plain push (rejected: Head-SHA Recheck, never force). Rebase: PINNED lease.
+if [ "$BRANCH_UPDATE" = rebase ]; then git push --force-with-lease="$BRANCH:$PUSH_LEASE_SHA"; else git push origin "HEAD:$BRANCH"; fi &&
   { PUSH_LEASE_SHA=$(git rev-parse HEAD); PUSH_LEASE_OK=$PUSH_LEASE_SHA; CLAIM_HEAD_SHA=$PUSH_LEASE_SHA; }
 
-# Verify CI passes after rebase
 loom-daemon forge wait-checks 42 --timeout 20
 ```
 

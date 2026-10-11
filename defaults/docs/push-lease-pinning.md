@@ -7,6 +7,12 @@ work rewrote the branch.
 
 Filed as issue #9487 after a live data-loss near-miss on PR #9483.
 
+This applies only where PR branches may be rebased at all. In a repository
+whose merge settings bar rebase (the default answer of
+`loom-daemon branch-update strategy`), there is no force push to pin: the
+branch is updated by merging and pushed plain. See
+[branch-update-strategy.md](branch-update-strategy.md) (#10771).
+
 ## Why the bare flag is unsafe here
 
 `git push --force-with-lease` with no `=<ref>:<expect>` value compares the
