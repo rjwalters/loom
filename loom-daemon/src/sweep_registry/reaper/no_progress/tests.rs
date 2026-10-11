@@ -173,3 +173,32 @@ fn an_empty_sampled_phase_history_still_counts_as_no_progress() {
         "and it must still arm the per-issue dispatch backoff"
     );
 }
+
+/// Issue #11438: a dispatch that self-reported a no-op release
+/// (`RecordNoopRelease` over IPC — #8912's dispatch-scoped record) reached a
+/// deliberate conclusion. The #4366 backstop must not charge it as
+/// no-progress: that charge journaled `result=failure`, which the disposition
+/// classifier then turned into `env_failure` + `unclassified:spawn-death`
+/// and a `retry_after_env_failure` re-dispatch of the very loop the sweep
+/// had just reported ending.
+#[test]
+fn a_self_reported_noop_release_is_never_no_progress() {
+    let dir = tempdir().unwrap();
+    let mut registry = no_progress_test_registry(dir.path(), "OPEN", "", false);
+
+    // The sweep self-reports while still Running, then exits 0 with no
+    // checkpoint — the exact under-60-s shape from the loom-ui#3508 timeline.
+    let reported = insert_clean_exit_running(&mut registry, 114_380, 0);
+    registry.record_noop_release(114_380, Some("no build work here".into()));
+    assert!(registry.noop_release_covers_dispatch(114_380, &reported));
+    assert!(
+        !registry.is_no_progress(114_380, &reported, Some(OpenPrProbe::NoneOpen)),
+        "a deliberate no-op conclusion is never \"no progress\" (#11438)"
+    );
+
+    // The guard on the fix: the identical VERIFIED shape with no self-report
+    // still counts — the carve-out is scoped to the reporting dispatch only.
+    let unreported = insert_clean_exit_running(&mut registry, 114_380, 1);
+    assert!(!registry.noop_release_covers_dispatch(114_380, &unreported));
+    assert!(registry.is_no_progress(114_380, &unreported, Some(OpenPrProbe::NoneOpen)));
+}

@@ -848,8 +848,10 @@ impl SweepRegistry {
             // #4463/#5017/#5282: a claim held elsewhere (locally superseded OR
             // forge-superseded) means a different sweep now holds the claim —
             // never restore the label out from under it.
+            // #11438: a dispatch that self-reported a no-op release before the
+            // cancel landed deliberately left `loom:issue` off — keep it off.
             if !self.config.skip_label_flip && !produced_pr && !claim_held_elsewhere {
-                let _ = self.restore_label_to_ready(*issue);
+                let _ = self.restore_label_after_reap(*issue, sweep_id);
                 self.note_label_flip(*issue); // #4485 flap detection
             }
             // Durable terminal-outcome record (Issue #4644) — a cancel is a
@@ -1090,7 +1092,7 @@ impl SweepRegistry {
                             // #4463: never restore the label when a newer sweep
                             // owns the lock — it is actively building.
                             if !self.config.skip_label_flip && !superseded {
-                                let _ = self.restore_label_to_ready(issue);
+                                let _ = self.restore_label_after_reap(issue, &sweep_id);
                                 self.note_label_flip(issue); // #4485 flap detection
                             }
                             let checkpoint_phase = read_checkpoint_phase(&checkpoint);
@@ -1741,7 +1743,7 @@ impl SweepRegistry {
                             // #4463: skip the restore when a newer sweep owns
                             // the lock (superseded) — it holds the live claim.
                             if !self.config.skip_label_flip && !produced_pr && !superseded {
-                                let _ = self.restore_label_to_ready(issue);
+                                let _ = self.restore_label_after_reap(issue, &sweep_id);
                                 self.note_label_flip(issue); // #4485 flap detection
                             }
                             // #7528: the claim restore above is deliberately
