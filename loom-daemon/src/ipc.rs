@@ -5,6 +5,7 @@ use crate::event_bus::EventBus;
 use crate::forge_parser::parse_forge_events;
 use crate::git_parser;
 use crate::git_utils;
+use crate::issue_state_read;
 use crate::main_health_gate::WorkspaceHealthStates;
 use crate::role_validation;
 use crate::sweep_registry::{
@@ -725,6 +726,22 @@ async fn handle_client(
             .await;
             let response_json = serde_json::to_string(&response)?;
             writer.write_all(response_json.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+            continue;
+        }
+
+        // ReadIssueState (#8876): a blocking `gh` read, kept off the runtime.
+        if let Request::ReadIssueState {
+            workspace_root,
+            repo,
+            issue,
+        } = request
+        {
+            let reply =
+                issue_state_read::daemon::handle_blocking(workspace_root, repo, issue).await;
+            writer
+                .write_all(serde_json::to_string(&Response::IssueState(reply))?.as_bytes())
+                .await?;
             writer.write_all(b"\n").await?;
             continue;
         }
@@ -3348,6 +3365,9 @@ fn handle_request(
                 .count();
             build_restart_decision(in_flight).0
         }
+        Request::ReadIssueState { .. } => Response::Error {
+            message: "internal: ReadIssueState is handled by handle_client".to_string(),
+        },
         Request::DrainAndRestartDaemon { .. } | Request::AbortDrain => {
             // Structurally unreachable: `handle_client` intercepts both drain
             // requests (#4090) before dispatching here, because a drain must ack
