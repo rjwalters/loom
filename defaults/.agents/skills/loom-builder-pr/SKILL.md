@@ -759,15 +759,16 @@ Loom-Issue: rjwalters/loom#123
 **Write both as PLAIN TEXT — never in backticks (#8796).** A trailer inside an inline code span
 (or a fenced block) is **silently ignored** — merge-pr.sh blanks code spans before matching,
 deliberately (#5234), so the PR looks correct to a reviewer and to Judge while the #3667 reset
-never fires and the issue is stranded at `loom:building` with nothing logged (the
-rjwalters/kicad-tools PR #5686 / #5240 incident).
+never fires and the issue is stranded at `loom:building` with nothing logged.
 
 ```markdown
 Part of #123              <- declaration: parsed, the label reset fires on merge
 `Part of #123`            <- code span: NOT a declaration, reset silently skipped
 ```
 
-**Both the PR body and the commit messages must carry the same reference.** GitHub harvests closing keywords from the PR body and the merge commit's subject (this repo merges with merge commits, #9105) — individual commit bodies are not parsed, but keep the reference consistent in them anyway. When in doubt, prefer `Part of #N`.
+**Both the PR body and the commit messages must carry the same reference.** GitHub harvests closing keywords from the PR body and the merge commit's subject (this repo merges with merge commits, #9105). Prefer `Part of #N`.
+
+If a `Part of #N` remainder needs a human, add `<!-- loom:remainder-hold reason="..." -->` to the issue body before merge (parks it `loom:operator`; see label-state-machine.md).
 
 #### A stray closing keyword ANYWHERE in the body defeats `Part of #N` (#4569)
 

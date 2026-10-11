@@ -198,10 +198,8 @@ fn preflight_reports_an_unanswered_lookup_as_such() {
 fn a_live_read_without_knowable_since_is_refused_before_any_query() {
     let mut p = params();
     p.knowable_since = None;
-    let http = ClickhouseHttp {
+    let http = TelemetryReader {
         endpoint: "http://127.0.0.1:1".into(),
-        user: None,
-        credential_file: None,
         timeout: std::time::Duration::from_secs(1),
     };
     assert_eq!(fetch(&http, &p).unwrap_err(), MISSING_KNOWABLE_SINCE);
