@@ -67,6 +67,7 @@ use chrono::{DateTime, Duration, Utc};
 use super::history::{labeled, unlabeled, HistoryEvent};
 pub use super::history::{LabelHistory, EVENTS_PAGE_SIZE};
 use super::{FleetView, RepoListing, Source, MERGE_HOLD_LABELS, REVIEW_LABELS, TREATING};
+use crate::merge_pr::refs::has_unnegated_closing_ref;
 use crate::telemetry::kinds::fleet_state::{FleetStage, FleetStateRow};
 use crate::telemetry::kinds::pr_resolved::{PrResolution, PrResolvedRecord};
 use crate::telemetry::kinds::stage_outcome::{
@@ -108,7 +109,7 @@ pub enum IssueFacts {
     /// Still open.
     Open,
     /// A merge closed it at `closed_at`: its latest `closed` event carries a
-    /// `commit_id`, or a PR that references it merged within
+    /// `commit_id`, or a PR whose body closes it merged within
     /// [`MERGE_CLOSE_WINDOW_SECS`] of `closed_at`. A merge-close through a
     /// `Closes #N` body leaves `commit_id` null, so the PR is the evidence.
     Merged(DateTime<Utc>),
@@ -124,20 +125,38 @@ pub enum IssueFacts {
 /// within seconds of the merge.
 pub const MERGE_CLOSE_WINDOW_SECS: i64 = 120;
 
-/// Whether a `cross-referenced` timeline event is a merged PR whose merge is
-/// within [`MERGE_CLOSE_WINDOW_SECS`] of `closed_at`.
-fn merged_pr_near(closed_at: DateTime<Utc>, event: &serde_json::Value) -> bool {
+/// Whether a `cross-referenced` timeline event is a merged PR in `repo`
+/// whose body closes `number` (a `Closes`/`Fixes`/`Resolves` keyword, not a
+/// bare mention) and whose merge is within [`MERGE_CLOSE_WINDOW_SECS`] of
+/// `closed_at`.
+fn merged_pr_near(
+    closed_at: DateTime<Utc>,
+    repo: &str,
+    number: u32,
+    event: &serde_json::Value,
+) -> bool {
+    let source = &event["source"]["issue"];
     event["event"] == "cross-referenced"
-        && !event["source"]["issue"]["pull_request"].is_null()
-        && parse_instant(event["source"]["issue"]["pull_request"]["merged_at"].as_str())
+        && !source["pull_request"].is_null()
+        && source["repository_url"].as_str().is_some_and(|u| {
+            u.to_ascii_lowercase()
+                .ends_with(&format!("/repos/{}", repo.to_ascii_lowercase()))
+        })
+        && source["body"]
+            .as_str()
+            .is_some_and(|b| has_unnegated_closing_ref(b, u64::from(number)))
+        && parse_instant(source["pull_request"]["merged_at"].as_str())
             .is_some_and(|m| (closed_at - m).num_seconds().abs() <= MERGE_CLOSE_WINDOW_SECS)
 }
 
 impl IssueFacts {
-    /// Classify an issue closed at `closed_at` from its events pages and its
-    /// timeline pages (the source of the PR that closed it, #11398).
+    /// Classify issue `number` of `repo`, closed at `closed_at`, from its
+    /// events pages and its timeline pages (the source of the PR that closed
+    /// it, #11398).
     #[must_use]
     pub fn closed(
+        repo: &str,
+        number: u32,
         closed_at: DateTime<Utc>,
         events: &[serde_json::Value],
         timeline: &[serde_json::Value],
@@ -145,7 +164,7 @@ impl IssueFacts {
         let merged_by_pr = timeline
             .iter()
             .flat_map(|page| page.as_array().into_iter().flatten())
-            .any(|e| merged_pr_near(closed_at, e));
+            .any(|e| merged_pr_near(closed_at, repo, number, e));
         let last_close = events
             .iter()
             .flat_map(|page| page.as_array().into_iter().flatten())
@@ -1209,7 +1228,7 @@ impl ForgeReads for GhForgeReads {
         };
         let events = read_pages("events")?;
         let timeline = read_pages("timeline")?;
-        Some(IssueFacts::closed(closed_at, &events, &timeline))
+        Some(IssueFacts::closed(repo, number, closed_at, &events, &timeline))
     }
 
     fn label_history(&mut self, repo: &str, number: u32) -> Option<LabelHistory> {

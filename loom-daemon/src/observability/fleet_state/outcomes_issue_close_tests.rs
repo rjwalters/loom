@@ -32,6 +32,8 @@ fn vanishing(passes: usize) -> Vec<FleetInput> {
     inputs
 }
 
+const NUMBER: u32 = 11401;
+
 #[test]
 fn an_issue_closed_not_planned_mid_sweep_is_one_abandoned_exit_at_the_close_time() {
     let (closed, mut forge) = closed_at_7(IssueFacts::NotMerged);
@@ -73,7 +75,7 @@ fn a_hand_completed_close_is_one_abandoned_exit_at_the_close_time() {
     let events = serde_json::json!([closed_event("2026-10-09T12:07:00Z", None)]);
     forge
         .issues
-        .insert(20, IssueFacts::closed(at, &[events], &[]));
+        .insert(20, IssueFacts::closed(REPO, NUMBER, at, &[events], &[]));
     let out = run(&vanishing(2), Duration::minutes(10), &mut forge);
     let r = stages(&out[1]);
     assert_eq!(r.len(), 1, "{out:?}");
@@ -171,14 +173,14 @@ fn a_closed_event_with_a_commit_is_a_merge() {
         {"event": "labeled", "created_at": "2026-10-09T10:00:00Z", "label": {"name": "loom:issue"}},
         closed_event("2026-10-09T12:00:00Z", Some("abc123")),
     ]);
-    assert_eq!(IssueFacts::closed(at, &[page], &[]), IssueFacts::Merged(at));
+    assert_eq!(IssueFacts::closed(REPO, NUMBER, at, &[page], &[]), IssueFacts::Merged(at));
 }
 
 #[test]
 fn a_closed_event_with_no_commit_is_unmerged() {
     let at = t0();
     let page = serde_json::json!([closed_event("2026-10-09T12:00:00Z", None)]);
-    assert_eq!(IssueFacts::closed(at, &[page], &[]), IssueFacts::NotMerged(at));
+    assert_eq!(IssueFacts::closed(REPO, NUMBER, at, &[page], &[]), IssueFacts::NotMerged(at));
 }
 
 #[test]
@@ -192,23 +194,39 @@ fn only_the_latest_close_says_how_it_closed() {
             closed_event("2026-10-09T12:00:00Z", None),
         ]),
     ];
-    assert_eq!(IssueFacts::closed(at, &pages, &[]), IssueFacts::NotMerged(at));
+    assert_eq!(IssueFacts::closed(REPO, NUMBER, at, &pages, &[]), IssueFacts::NotMerged(at));
 }
 
 #[test]
 fn no_closed_event_keeps_the_close_instant_unresolved() {
     let page = serde_json::json!([]);
-    assert_eq!(IssueFacts::closed(t0(), &[page], &[]), IssueFacts::ClosedUnresolved(t0()));
+    assert_eq!(
+        IssueFacts::closed(REPO, NUMBER, t0(), &[page], &[]),
+        IssueFacts::ClosedUnresolved(t0())
+    );
 }
 
 /// A `Closes #N` merge leaves the `closed` event's `commit_id` null (the real
 /// response for #11401, closed 2s after PR #11409 merged); the merged PR in
 /// the timeline is the evidence.
 fn pr_reference(merged_at: Option<&str>) -> serde_json::Value {
+    pr_reference_with(merged_at, "Closes #11401", "https://api.github.com/repos/rjwalters/loom")
+}
+
+fn pr_reference_with(
+    merged_at: Option<&str>,
+    body: &str,
+    repository_url: &str,
+) -> serde_json::Value {
     serde_json::json!({
         "event": "cross-referenced",
         "created_at": "2026-10-09T11:00:00Z",
-        "source": {"issue": {"number": 9, "pull_request": {"merged_at": merged_at}}},
+        "source": {"issue": {
+            "number": 9,
+            "body": body,
+            "repository_url": repository_url,
+            "pull_request": {"merged_at": merged_at},
+        }},
     })
 }
 
@@ -220,7 +238,36 @@ fn a_merge_close_with_a_null_commit_is_a_merge_through_the_referencing_pr() {
         {"event": "labeled", "created_at": "2026-10-09T10:00:00Z"},
         pr_reference(Some("2026-10-09T11:59:59Z")),
     ]);
-    assert_eq!(IssueFacts::closed(at, &[events], &[timeline]), IssueFacts::Merged(at));
+    assert_eq!(
+        IssueFacts::closed(REPO, NUMBER, at, &[events], &[timeline]),
+        IssueFacts::Merged(at)
+    );
+}
+
+/// A merged PR that only mentions the issue (or closes a different one, or
+/// lives in another repo) is not what closed it: a hand close right after
+/// its merge stays `abandoned`.
+#[test]
+fn a_nearby_merged_pr_without_a_closing_reference_does_not_make_a_hand_close_a_merge() {
+    let at = t0();
+    let events = serde_json::json!([closed_event("2026-10-09T12:00:02Z", None)]);
+    let near = Some("2026-10-09T11:59:59Z");
+    for reference in [
+        pr_reference_with(near, "Related to #11401", "https://api.github.com/repos/rjwalters/loom"),
+        pr_reference_with(near, "Closes #7", "https://api.github.com/repos/rjwalters/loom"),
+        pr_reference_with(
+            near,
+            "Does not close #11401",
+            "https://api.github.com/repos/rjwalters/loom",
+        ),
+        pr_reference_with(near, "Closes #11401", "https://api.github.com/repos/rjwalters/other"),
+    ] {
+        let timeline = serde_json::json!([reference]);
+        assert_eq!(
+            IssueFacts::closed(REPO, NUMBER, at, std::slice::from_ref(&events), &[timeline]),
+            IssueFacts::NotMerged(at)
+        );
+    }
 }
 
 #[test]
@@ -233,7 +280,7 @@ fn an_unmerged_or_long_past_referencing_pr_does_not_make_a_hand_close_a_merge() 
     ] {
         let timeline = serde_json::json!([reference]);
         assert_eq!(
-            IssueFacts::closed(at, std::slice::from_ref(&events), &[timeline]),
+            IssueFacts::closed(REPO, NUMBER, at, std::slice::from_ref(&events), &[timeline]),
             IssueFacts::NotMerged(at)
         );
     }

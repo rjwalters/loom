@@ -518,7 +518,7 @@ fn a_hand_closed_issue_mid_sweep_is_one_abandoned_fact_across_hosts() {
                 "created_at": "2026-10-11T00:00:00Z",
                 "commit_id": null,
             }]);
-            Some(IssueFacts::closed(self.0, &[close], &[]))
+            Some(IssueFacts::closed("rjwalters/loom", 1, self.0, &[close], &[]))
         }
         fn label_history(&mut self, _: &str, _: u32) -> Option<LabelHistory> {
             None
