@@ -121,7 +121,7 @@ pub fn hold_names(labels: &[String]) -> Vec<String> {
     }
     if MERGE_HOLD_LABELS
         .iter()
-        .any(|l| has(l) && !covered.contains(&l))
+        .any(|l| has(l) && !covered.contains(l))
     {
         holds.push("other".to_string());
     }
