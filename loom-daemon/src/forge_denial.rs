@@ -153,6 +153,19 @@ pub fn describe(denial: Denial, endpoint: &str, write: bool, message: Option<&st
     out
 }
 
+/// When a rate-limit refusal clears, epoch seconds: `retry-after`, else a
+/// future `x-ratelimit-reset`, else a minute from `now`; never past an hour.
+#[must_use]
+pub fn retry_at(headers: &RateLimitHeaders, now: i64) -> i64 {
+    let at = headers
+        .retry_after_secs
+        .and_then(|s| i64::try_from(s).ok())
+        .map(|s| now.saturating_add(s))
+        .or(headers.reset_epoch.filter(|&t| t > now))
+        .unwrap_or(now + 60);
+    at.clamp(now + 1, now + 3600)
+}
+
 /// GitHub's `message` from a JSON error body, if it has one.
 #[must_use]
 pub fn body_message(body: &str) -> Option<String> {

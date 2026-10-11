@@ -87,6 +87,10 @@ pub struct GhReads {
     target: Target,
     memo: HashMap<String, DiskEntry>,
     caller: &'static str,
+    /// `false`: no entry is read or written (a caller with no store).
+    persist: bool,
+    /// When the last secondary-limit refusal clears, epoch seconds (#11418).
+    secondary_retry_at: Option<i64>,
 }
 
 impl GhReads {
@@ -113,7 +117,30 @@ impl GhReads {
             target,
             memo: HashMap::new(),
             caller: CALLER,
+            persist: true,
+            secondary_retry_at: None,
         })
+    }
+
+    /// Read nothing from and write nothing to the store: every read is
+    /// unconditional (the merge guard in a test build with no store).
+    #[must_use]
+    pub fn ephemeral(mut self) -> Self {
+        self.persist = false;
+        self
+    }
+
+    /// When GitHub's last secondary-limit refusal to these reads clears
+    /// (`retry-after`, else `x-ratelimit-reset`, else a minute), if any.
+    #[must_use]
+    pub fn secondary_retry_at(&self) -> Option<i64> {
+        self.secondary_retry_at
+    }
+
+    /// One conditional `GET` of `url` (a REST path naming this repo),
+    /// persisted under the check-runs prefix like [`Self::check_runs`].
+    pub fn read(&mut self, url: &str, op: ForgeOp) -> Result<String, ReadError> {
+        self.get_checks_entry(url, op)
     }
 
     /// Record reads under `caller` instead of [`CALLER`] (the agent `gh`
@@ -221,10 +248,19 @@ impl GhReads {
     /// The base branch's required status-check contexts, plus any notices
     /// (e.g. a plan-gated source) the caller must print.
     pub fn required(&self, base_ref: &str) -> Result<(Vec<String>, Vec<String>), String> {
-        required_contexts(&self.gh_bin.to_string_lossy(), self.nwo(), base_ref)
+        let store = self.persist.then_some(self.store_dir.as_path());
+        crate::merge_pr::stale_checks::fetch::required_contexts_in(
+            &self.gh_bin.to_string_lossy(),
+            self.nwo(),
+            base_ref,
+            store,
+        )
     }
 
     fn get_checks_entry(&mut self, url: &str, op: ForgeOp) -> Result<String, ReadError> {
+        if !self.persist {
+            return self.get(url, op, None);
+        }
         let key = store::cache_key(self.cwd.as_deref(), &self.target, url);
         let path = store::entry_path_with_prefix(&self.store_dir, CHECKS_PREFIX, &key);
         self.get(url, op, Some(&path))
@@ -270,7 +306,20 @@ impl GhReads {
                 }
                 Ok(r.body)
             }
-            Some(r) if matches!(r.status, 401 | 403 | 429) => Err(denied(url, &r, &stderr)),
+            Some(r) if matches!(r.status, 401 | 403 | 429) => {
+                let refused = denied(url, &r, &stderr);
+                if matches!(
+                    refused,
+                    ReadError::Denied {
+                        denial: Denial::SecondaryRateLimit,
+                        ..
+                    }
+                ) {
+                    let now = chrono::Utc::now().timestamp();
+                    self.secondary_retry_at = Some(denial::retry_at(&r.ratelimit, now));
+                }
+                Err(refused)
+            }
             Some(r) if matches!(r.status, 404 | 410 | 422) => {
                 Err(ReadError::Fatal(format!("HTTP {} for {url}", r.status)))
             }

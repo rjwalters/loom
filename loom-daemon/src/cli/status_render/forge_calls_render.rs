@@ -36,19 +36,20 @@ pub fn render_forge_calls_lines(report: &DaemonStatusReport, now: DateTime<Utc>)
             lines.extend(rows.iter().map(render_row));
         }
     }
-    let totals = fc.since_start.iter().fold([0_u64; 4], |mut acc, r| {
+    let totals = fc.since_start.iter().fold([0_u64; 5], |mut acc, r| {
         acc[0] += r.ok;
         acc[1] += r.not_modified;
         acc[2] += r.rate_limited;
         acc[3] += r.error;
+        acc[4] += r.secondary_limited;
         acc
     });
     let since = fc
         .since
         .map_or_else(|| "start".to_string(), |s| s.format("%Y-%m-%d %H:%M UTC").to_string());
     lines.push(format!(
-        "  this daemon since {since}: {} × 200, {} × 304, {} limited, {} error",
-        totals[0], totals[1], totals[2], totals[3]
+        "  this daemon since {since}: {} × 200, {} × 304, {} limited, {} secondary-limited, {} error",
+        totals[0], totals[1], totals[2], totals[4], totals[3]
     ));
     if !fc.budget.is_empty() {
         let own = |pool: &str| -> Option<u64> {
@@ -256,7 +257,10 @@ mod tests {
         assert!(wf.contains("core") && wf.trim_end().ends_with("75%"), "{wf}");
         let rc = lines.iter().find(|l| l.contains("role_collision")).unwrap();
         assert!(rc.trim_end().ends_with('-'), "{rc}");
-        assert!(text.contains("2 × 200, 5 × 304, 0 limited, 0 error"), "{text}");
+        assert!(
+            text.contains("2 × 200, 5 × 304, 0 limited, 0 secondary-limited, 0 error"),
+            "{text}"
+        );
         assert!(
             text.contains("budget: core 4034 left, resets in 30m (headers, 12s ago)"),
             "{text}"

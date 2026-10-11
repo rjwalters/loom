@@ -2418,6 +2418,9 @@ pub struct ForgeBucketStatus {
     pub charged: u64,
     pub not_modified: u64,
     pub rate_limited: u64,
+    /// Secondary (burst) limits, apart from primary `rate_limited` (#11418).
+    #[serde(default)]
+    pub secondary_limited: u64,
     #[serde(default)]
     pub used: Option<u64>,
     #[serde(default)]
@@ -2434,6 +2437,9 @@ pub struct ForgeIdentityRoleCounts {
     pub ok: u64,
     pub not_modified: u64,
     pub rate_limited: u64,
+    /// Secondary (burst) limits, apart from primary `rate_limited` (#11418).
+    #[serde(default)]
+    pub secondary_limited: u64,
     pub error: u64,
     /// Reads shed without a request (W4-C).
     #[serde(default)]
@@ -2462,6 +2468,9 @@ pub struct ForgeOperationCounts {
     pub ok: u64,
     pub not_modified: u64,
     pub rate_limited: u64,
+    /// Secondary (burst) limits, apart from primary `rate_limited` (#11418).
+    #[serde(default)]
+    pub secondary_limited: u64,
     pub error: u64,
     /// Reads shed without a request (W4-C).
     #[serde(default)]
@@ -2481,6 +2490,9 @@ pub struct ForgeCallCounts {
     pub not_modified: u64,
     /// Rate-limited responses.
     pub rate_limited: u64,
+    /// Secondary (burst) limits, apart from primary `rate_limited` (#11418).
+    #[serde(default)]
+    pub secondary_limited: u64,
     /// Any other failure.
     pub error: u64,
     /// Reads a reader route deferred without a request (W4-C): charged
