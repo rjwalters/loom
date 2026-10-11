@@ -235,6 +235,7 @@ pub mod dispatch_plan_merge;
 pub mod halt_cause;
 mod labels;
 pub mod main_red_fix;
+pub mod open_pr_prefilter;
 pub mod operator_priority;
 mod ordering;
 pub mod ready_queue;
@@ -816,6 +817,17 @@ pub trait WorkDispatcher {
     ) -> Result<bool> {
         let _ = overflow;
         self.dispatch(issue, complexity)
+    }
+
+    /// The batched open-PR pre-filter (#8865, [`open_pr_prefilter`]): the
+    /// issues in `candidates` with a VERIFIED open linked PR, each mapped to
+    /// that PR. Asked at most once per workspace per tick; the multi-workspace
+    /// tick skips those candidates without calling
+    /// [`dispatch_with`](Self::dispatch_with). It can only remove candidates:
+    /// anything not verified (unreadable listing included) must be left out,
+    /// and still meets `dispatch()`'s own open-PR guard. Defaults to empty.
+    fn open_pr_blocked(&self, _candidates: &[u32]) -> HashMap<u32, u32> {
+        HashMap::new()
     }
 
     /// Whether a live sweep on this host is already marked `overflow`
@@ -2025,6 +2037,9 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
     // like `occupancy` — see `tick_with_admission_cap`'s single-workspace
     // analogue for the full rationale.
     let mut admitted_this_tick: usize = 0;
+    // #8865: one open-PR listing read per workspace answers for all of its
+    // candidates, lazily at the first one to reach the dispatch point.
+    let mut open_prs = open_pr_prefilter::OpenPrPrefilter::new(&candidates);
 
     // Pass 2 (mutable dispatcher calls): fill the single shared concurrency
     // budget in the sorted global order, routing each candidate back to its
@@ -2076,15 +2091,10 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
             continue;
         }
         let dispatcher = &mut workspaces[cand.workspace_idx].1;
-        let started = chrono::Utc::now();
-        let outcome = dispatcher.dispatch_with(cand.number, cand.complexity.as_deref(), over);
-        let (disposition, mut detail) = record_dispatch_outcome(
-            &mut report,
-            cand.number,
-            cand.workspace_idx,
-            started,
-            &outcome,
-        );
+        // A candidate with a verified open linked PR is resolved `OpenPr`
+        // here without a dispatch attempt; every other one is dispatched and
+        // counted (`record_dispatch_outcome`) exactly as before (#8865).
+        let (disposition, mut detail) = open_prs.dispatch(dispatcher, &cand, over, &mut report);
         if disposition == Qd::Dispatched && over {
             overflow.take(&mut report);
             detail = Some("overflow".to_string());

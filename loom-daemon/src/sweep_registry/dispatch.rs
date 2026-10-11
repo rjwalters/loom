@@ -6,6 +6,8 @@ mod log_paths;
 
 use super::*;
 
+// Issue #8865: per-cause streak and log wording of the dispatch backoff.
+mod backoff_cause;
 pub(super) mod child_env_markers;
 
 // Issue #10348: the dispatched `sweep-lease-renew.sh start` command.
@@ -1219,10 +1221,11 @@ impl SweepRegistry {
         let max_secs =
             i64::try_from(self.dispatch_backoff_config.max.as_secs()).unwrap_or(i64::MAX);
         let consecutive = match self.dispatch_backoff.get(&issue) {
-            Some(prev) if (now - prev.last_failure_at).num_seconds() <= max_secs => {
+            Some(prev) if backoff_cause::continues(prev, cause, now, max_secs) => {
                 prev.consecutive.saturating_add(1)
             }
-            // No prior record, or the streak went cold — start a fresh streak.
+            // No prior record, the streak went cold, or it was the other
+            // cause's streak (#8865) — start a fresh streak.
             _ => 1,
         };
         let delay = backoff_delay(
@@ -1241,11 +1244,7 @@ impl SweepRegistry {
                 cause,
             },
         );
-        log::info!(
-            "sweep_registry: issue #{issue} dispatch backoff armed — {consecutive} consecutive \
-             failed dispatch(es), next attempt allowed in {}s (#4485; cause={cause:?})",
-            delay.as_secs()
-        );
+        backoff_cause::log_armed(issue, consecutive, delay, cause);
         // Issue #7477: broadcast the armed window fleet-wide so a peer host
         // does not immediately re-attempt the same failing candidate this
         // host just backed off on — see `publish_peer_cooldown_claim`'s doc
@@ -2178,12 +2177,8 @@ impl SweepRegistry {
         if resume_bypass_pr.is_none() {
             if let Some(remaining) = self.dispatch_backoff_remaining(issue_number, Utc::now()) {
                 let consecutive = self.dispatch_failure_count(issue_number);
-                log::info!(
-                    "sweep_registry: refusing to dispatch issue #{issue_number} — \
-                     {consecutive} consecutive failed dispatch(es), {}s of backoff remaining \
-                     (#4485)",
-                    remaining.as_secs()
-                );
+                let window = self.dispatch_backoff.get(&issue_number);
+                backoff_cause::log_refused(issue_number, window, remaining);
                 return Err(DispatchBackoffError {
                     issue: issue_number,
                     consecutive,
