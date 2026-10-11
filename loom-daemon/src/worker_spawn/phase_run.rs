@@ -1026,7 +1026,7 @@ mod tests {
             assert!(err.message.contains("refusing"), "{role:?}: {}", err.message);
         }
         // The dispatch-time check agrees and records nothing for a new issue.
-        let refused = crate::dispatch_tap::apply_request(
+        let refused = crate::dispatch_tap::validate_request(
             dir.path(),
             &crate::types::SweepKind::Issue(77),
             Some("opencode"),

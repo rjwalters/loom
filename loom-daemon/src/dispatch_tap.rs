@@ -95,24 +95,90 @@ pub fn phase_issue(issue: Option<u64>) -> Option<u64> {
     })
 }
 
-/// Validate and record (or clear) the per-dispatch tap of a `DispatchSweep`
-/// request. `Ok(())` means dispatch may proceed.
+/// What an accepted dispatch should do to the per-issue record. Built by
+/// [`validate_request`] with no side effects; applied by [`Planned::commit`]
+/// only once the dispatch has passed the claim / open-PR / lease guards and
+/// spawned, so a rejected duplicate or racing `dispatch N` can never clear or
+/// overwrite the record of the sweep already in flight.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Planned {
+    /// No issue to key on (a tap-less PR-set sweep): nothing to do.
+    Nothing,
+    /// A tap-less dispatch: forget any stale override.
+    Clear(u64),
+    /// Record this validated tap.
+    Save(u64, Tap),
+}
+
+/// The prior on-disk state of a record, so a dispatch that fails after
+/// [`Planned::commit`] can put it back.
+#[derive(Debug)]
+pub struct Rollback {
+    root: PathBuf,
+    issue: u64,
+    prior: Option<Vec<u8>>,
+}
+
+impl Rollback {
+    /// Restore the record exactly as it was before the commit.
+    pub fn restore(self) {
+        match self.prior {
+            Some(bytes) => {
+                let _ = std::fs::create_dir_all(dir(&self.root));
+                let _ = std::fs::write(path(&self.root, self.issue), bytes);
+            }
+            None => clear(&self.root, self.issue),
+        }
+    }
+}
+
+impl Planned {
+    /// Apply the plan. Returns a [`Rollback`] when the record was touched.
+    ///
+    /// # Errors
+    /// A ready-to-send [`Response`] if the record cannot be written.
+    pub fn commit(self, root: &Path) -> Result<Option<Rollback>, Response> {
+        let (issue, tap) = match self {
+            Planned::Nothing => return Ok(None),
+            Planned::Clear(issue) => (issue, None),
+            Planned::Save(issue, tap) => (issue, Some(tap)),
+        };
+        let rollback = Rollback {
+            root: root.to_path_buf(),
+            issue,
+            prior: std::fs::read(path(root, issue)).ok(),
+        };
+        match tap {
+            None => clear(root, issue),
+            Some(tap) => save(root, issue, &tap).map_err(|e| Response::Error {
+                message: format!(
+                    "dispatch_sweep: cannot record runtime override for #{issue}: {e}"
+                ),
+            })?,
+        }
+        Ok(Some(rollback))
+    }
+}
+
+/// Validate the per-dispatch tap of a `DispatchSweep` request WITHOUT any side
+/// effect. `Ok` means dispatch may proceed; call [`Planned::commit`] once the
+/// dispatch has been accepted.
 ///
 /// # Errors
 /// A ready-to-send [`Response`]: `Error` for a malformed or unsupported
 /// request, `RuntimeRejected` when the tap is unavailable or unadmitted.
-pub fn apply_request(
+pub fn validate_request(
     root: &Path,
     kind: &SweepKind,
     runtime: Option<&str>,
     model_profile: Option<&str>,
-) -> Result<(), Response> {
+) -> Result<Planned, Response> {
     let tap = parse_explicit_tap(runtime, model_profile).map_err(|message| Response::Error {
         message: format!("dispatch_sweep: {message}"),
     })?;
     let issue = match (kind, &tap) {
         (SweepKind::Issue(issue), _) => u64::from(*issue),
-        (SweepKind::PrSet(_), None) => return Ok(()),
+        (SweepKind::PrSet(_), None) => return Ok(Planned::Nothing),
         (SweepKind::PrSet(_), Some(_)) => {
             return Err(Response::Error {
                 message: "dispatch_sweep: runtime/modelProfile is only supported for issue \
@@ -122,15 +188,12 @@ pub fn apply_request(
         }
     };
     let Some(tap) = tap else {
-        clear(root, issue);
-        return Ok(());
+        return Ok(Planned::Clear(issue));
     };
     // The first coding phase is the one that has to launch; Doctor is judged
     // again when it launches, against the same recorded tap.
     resolve_for_dispatch_tap(root, "builder", &tap).map_err(Response::RuntimeRejected)?;
-    save(root, issue, &tap).map_err(|e| Response::Error {
-        message: format!("dispatch_sweep: cannot record runtime override for #{issue}: {e}"),
-    })
+    Ok(Planned::Save(issue, tap))
 }
 
 #[cfg(test)]
@@ -167,25 +230,62 @@ mod tests {
     #[test]
     fn malformed_request_is_an_error_response() {
         let dir = tempfile::tempdir().unwrap();
-        let r = apply_request(dir.path(), &SweepKind::Issue(1), None, Some("zai-flash"));
+        let r = validate_request(dir.path(), &SweepKind::Issue(1), None, Some("zai-flash"));
         assert!(matches!(r, Err(Response::Error { .. })), "{r:?}");
-        let r = apply_request(dir.path(), &SweepKind::PrSet(vec![3]), Some("claude"), None);
+        let r = validate_request(dir.path(), &SweepKind::PrSet(vec![3]), Some("claude"), None);
         assert!(matches!(r, Err(Response::Error { .. })), "{r:?}");
     }
 
     #[test]
     fn unadmitted_tap_is_refused_and_nothing_is_recorded() {
         let dir = tempfile::tempdir().unwrap();
-        let r = apply_request(dir.path(), &SweepKind::Issue(1), Some("no-such-rt"), None);
+        let r = validate_request(dir.path(), &SweepKind::Issue(1), Some("no-such-rt"), None);
         assert!(matches!(r, Err(Response::RuntimeRejected(_))), "{r:?}");
         assert_eq!(load(dir.path(), 1), None);
     }
 
+    /// Review of #11493: validation alone never touches the record, so a
+    /// dispatch the guards reject (or that fails to spawn) leaves it as it was.
     #[test]
-    fn dispatch_without_a_tap_clears_a_stale_record() {
+    fn validation_has_no_side_effects_tapless_and_different_tap() {
         let dir = tempfile::tempdir().unwrap();
         save(dir.path(), 1, &tap()).unwrap();
-        apply_request(dir.path(), &SweepKind::Issue(1), None, None).unwrap();
+        // Rejected duplicate with no tap: the in-flight record survives.
+        let planned = validate_request(dir.path(), &SweepKind::Issue(1), None, None).unwrap();
+        assert_eq!(planned, Planned::Clear(1));
+        assert_eq!(load(dir.path(), 1), Some(tap()));
+        // Rejected duplicate with a different tap: still the original.
+        // (Admission of a real tap needs a runtime fixture; the plan type is
+        // what carries it, and building it must not touch disk either.)
+        let other = Tap::runtime("claude");
+        let planned = Planned::Save(1, other);
+        assert!(matches!(planned, Planned::Save(1, _)));
+        assert_eq!(load(dir.path(), 1), Some(tap()));
+    }
+
+    #[test]
+    fn failed_dispatch_leaves_no_record() {
+        let dir = tempfile::tempdir().unwrap();
+        // Dispatch refused/failed before acceptance: commit is never called.
+        let planned = validate_request(dir.path(), &SweepKind::Issue(2), None, None).unwrap();
+        drop(planned);
+        assert_eq!(load(dir.path(), 2), None);
+        // Failure after commit (post-spawn) rolls back to the prior state.
+        let planned = Planned::Save(2, tap());
+        let rollback = planned.commit(dir.path()).unwrap().unwrap();
+        assert_eq!(load(dir.path(), 2), Some(tap()));
+        rollback.restore();
+        assert_eq!(load(dir.path(), 2), None);
+    }
+
+    #[test]
+    fn commit_applies_and_rollback_restores_prior_record() {
+        let dir = tempfile::tempdir().unwrap();
+        save(dir.path(), 1, &tap()).unwrap();
+        let rb = Planned::Clear(1).commit(dir.path()).unwrap().unwrap();
         assert_eq!(load(dir.path(), 1), None);
+        rb.restore();
+        assert_eq!(load(dir.path(), 1), Some(tap()));
+        assert!(Planned::Nothing.commit(dir.path()).unwrap().is_none());
     }
 }
