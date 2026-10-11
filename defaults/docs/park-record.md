@@ -318,9 +318,9 @@ itself.
 previous_review_label() {
   local number="$1"
   local label
-  label=$(gh api --paginate "repos/{owner}/{repo}/issues/events?per_page=100" --jq \
-    ".[] | select(.issue.number == ${number} and .event == \"labeled\" and (.label.name == \"loom:review-requested\" or .label.name == \"loom:changes-requested\")) | .label.name" \
-    2>/dev/null | head -1)  # newest-first: first match is the latest; ends pagination
+  label=$(gh api --paginate "repos/{owner}/{repo}/issues/${number}/events?per_page=100" --jq \
+    ".[] | select(.event == \"labeled\" and (.label.name == \"loom:review-requested\" or .label.name == \"loom:changes-requested\")) | .label.name" \
+    2>/dev/null | head -1)  # per-issue + --paginate (#8742 review; repo-wide walk: ~300 calls on a miss, ~6-day horizon); newest-first: first match is the latest; ends pagination
   if [ "$label" = "loom:changes-requested" ]; then
     echo "loom:changes-requested"
   else

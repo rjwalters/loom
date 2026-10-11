@@ -265,6 +265,7 @@ defaults/scripts/tests/nextest-daemon-guard.sh                                 t
 defaults/scripts/tests/run-ci-suites.sh                                        test        Shell test harness/fixture for the suites in defaults/scripts/tests/ — follows its subject (#7758).
 defaults/scripts/tests/test-agent-destroy.sh                                   test        Tests `agent-destroy` — shell because its subject is shell; follows its subject, never an independent reason (#7758).
 defaults/scripts/tests/test-app-permission-fallback.sh                         test        Tests `app-permission-fallback` — shell because its subject is shell; follows its subject, never an independent reason (#7758).
+defaults/scripts/tests/test-approval-history-per-issue-events.sh               test        Tests `approval-history-per-issue-events` — shell because its subject is shell; follows its subject, never an independent reason (#7758).
 defaults/scripts/tests/test-archive-transcripts.sh                             test        Tests `archive-transcripts` — shell because its subject is shell; follows its subject, never an independent reason (#7758).
 defaults/scripts/tests/test-blame-issue.sh                                     test        Tests `blame-issue` — shell because its subject is shell; follows its subject, never an independent reason (#7758).
 defaults/scripts/tests/test-body-repo-affinity.sh                              test        Tests `body-repo-affinity` — shell because its subject is shell; follows its subject, never an independent reason (#7758).
