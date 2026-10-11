@@ -723,7 +723,7 @@ fn merge_config_file(
         crate::fleet_policy::strip_legacy_template_seeds(&mut existing_val, &template_val);
     if !stripped_seeds.is_empty() {
         log::info!(
-            "init: config.json: stripped legacy template seed fleet key(s) {} — the current template no longer seeds them; fleet policy resolves from fleet-gitops (tier 1). Check for remaining per-repo overrides with `loom-daemon validate --workspace <path> --fleet-policy-only`.",
+            "init: config.json: stripped legacy template seed fleet key(s) {} — the current template no longer seeds them; fleet policy resolves from fleet-gitops (tier 1). Check for remaining per-repo overrides with `loom-daemon validate <path> --fleet-policy-only`.",
             summarize_list(&stripped_seeds)
         );
     }

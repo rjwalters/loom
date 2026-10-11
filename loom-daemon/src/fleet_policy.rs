@@ -143,33 +143,40 @@ fn allow_covers(key: &str, allow: &[(String, String)]) -> bool {
     })
 }
 
-/// Is the subtree at `path` **entirely** carved out to Repo/Host by sub-key
-/// rows, leaving no fleet policy in it? Only a non-empty object all of whose
-/// children are carved (or recursively carved) qualifies — a leaf, array,
-/// `null`, or empty object is fleet content by presence, matching the old
-/// top-level guard's strictness. An `autonomous` holding only
-/// `workFinder.extraSkipLabels` is fully carved; one that also sets
+/// Is the subtree at `path` **entirely** exempt — carved out to Repo/Host by
+/// sub-key rows or covered by a reasoned allow-list entry — leaving no
+/// unallowed fleet policy in it? Only a non-empty object all of whose children
+/// are exempt (or recursively exempt) qualifies — a leaf, array, `null`, or
+/// empty object is fleet content by presence, matching the old top-level
+/// guard's strictness. An `autonomous` holding only
+/// `workFinder.extraSkipLabels` (or only allow-listed leaves such as
+/// `roleRunner.onIdle`) is fully exempt; one that also sets an unallowed
 /// `workFinder.enabled` is not.
-fn subtree_fully_carved(path: &str, v: &Value) -> bool {
+fn subtree_fully_exempt(path: &str, v: &Value, allow: &[(String, String)]) -> bool {
     match v {
         Value::Object(map) if !map.is_empty() => map.iter().all(|(k, child)| {
             let child_path = format!("{path}.{k}");
-            match class_of(&child_path) {
-                Some(KeyClass::Repo) | Some(KeyClass::Host) => true,
-                _ => subtree_fully_carved(&child_path, child),
-            }
+            allow_covers(&child_path, allow)
+                || matches!(class_of(&child_path), Some(KeyClass::Repo) | Some(KeyClass::Host))
+                || subtree_fully_exempt(&child_path, child, allow)
         }),
         _ => false,
     }
 }
 
-/// Dotted paths of the fleet nodes in one tracked-tier document: the topmost
-/// node of each Fleet-classified subtree that is not fully carved out by
-/// sub-key rows. Stops descending at a flagged node (one finding covers its
-/// whole subtree) and at fully-carved Fleet nodes.
-fn collect_fleet_paths(path: &str, v: &Value, out: &mut Vec<String>) {
+/// Dotted paths of the unallowed fleet nodes in one tracked-tier document:
+/// the topmost node of each Fleet-classified subtree that is not fully exempt
+/// (carved out by sub-key rows and/or covered by dotted allow-list entries).
+/// Exemptions are evaluated within the subtree **before** coalescing, so an
+/// allow entry for `autonomous.roleRunner.onIdle` exempts that leaf, while an
+/// unallowed sibling still yields one finding at `autonomous`. Stops
+/// descending at a flagged node (one finding covers its whole subtree).
+fn collect_fleet_paths(path: &str, v: &Value, allow: &[(String, String)], out: &mut Vec<String>) {
+    if allow_covers(path, allow) {
+        return;
+    }
     if class_of(path) == Some(KeyClass::Fleet) {
-        if !subtree_fully_carved(path, v) {
+        if !subtree_fully_exempt(path, v, allow) {
             out.push(path.to_string());
         }
         return;
@@ -177,7 +184,7 @@ fn collect_fleet_paths(path: &str, v: &Value, out: &mut Vec<String>) {
     if let Value::Object(map) = v {
         for (k, child) in map {
             let child_path = format!("{path}.{k}");
-            collect_fleet_paths(&child_path, child, out);
+            collect_fleet_paths(&child_path, child, allow, out);
         }
     }
 }
@@ -212,12 +219,9 @@ pub fn check(repo_root: &Path) -> Vec<Finding> {
         let Some(obj) = doc.as_object() else { continue };
         let mut fleet_paths = Vec::new();
         for (key, val) in obj {
-            collect_fleet_paths(key, val, &mut fleet_paths);
+            collect_fleet_paths(key, val, &allow, &mut fleet_paths);
         }
         for path in fleet_paths {
-            if allow_covers(&path, &allow) {
-                continue;
-            }
             out.push(Finding {
                 key: path.clone(),
                 file: file.clone(),
@@ -319,8 +323,12 @@ fn collect_leaves(prefix: &str, v: &Value, out: &mut Vec<(String, Value)>) {
     }
 }
 
-/// Pure core of [`overrides`]: compare each fleet-key leaf of the tracked
-/// tier contributions against `tier1`. A leaf equal to tier 1 is not an override.
+/// Pure core of [`overrides`]: compare each fleet-class leaf of the tracked
+/// tier contributions against `tier1`. Every collected leaf is classified
+/// with [`class_of`] on its own dotted path, so the sub-key rows apply exactly
+/// as in [`check`]: `forge.githubApp.*` (Fleet under a Repo parent) is
+/// reported and `autonomous.workFinder.extraSkipLabels` (Repo carve-out under
+/// a Fleet parent) is not. A leaf equal to tier 1 is not an override.
 #[must_use]
 pub fn overrides_against(
     tier1: &Value,
@@ -329,25 +337,25 @@ pub fn overrides_against(
 ) -> Vec<Override> {
     let mut out = Vec::new();
     for (file, doc) in tiers {
-        let Some(obj) = doc.as_object() else { continue };
-        for (key, val) in obj {
-            if class_of(key) != Some(KeyClass::Fleet) {
+        if !doc.is_object() {
+            continue;
+        }
+        let mut leaves = Vec::new();
+        collect_leaves("", doc, &mut leaves);
+        for (path, leaf) in leaves {
+            if class_of(&path) != Some(KeyClass::Fleet) {
                 continue;
             }
-            let mut leaves = Vec::new();
-            collect_leaves(key, val, &mut leaves);
-            for (path, leaf) in leaves {
-                let t1 = get_path(tier1, &path).filter(|v| !v.is_null());
-                if t1 == Some(&leaf) {
-                    continue;
-                }
-                out.push(Override {
-                    key: path.clone(),
-                    file: file.clone(),
-                    tier1: t1.cloned(),
-                    effective: get_path(effective, &path).cloned().unwrap_or(Value::Null),
-                });
+            let t1 = get_path(tier1, &path).filter(|v| !v.is_null());
+            if t1 == Some(&leaf) {
+                continue;
             }
+            out.push(Override {
+                key: path.clone(),
+                file: file.clone(),
+                tier1: t1.cloned(),
+                effective: get_path(effective, &path).cloned().unwrap_or(Value::Null),
+            });
         }
     }
     out
@@ -439,7 +447,7 @@ mod tests {
         let doc = soft_read_json_object(&root.join("defaults/config.json"));
         for (key, val) in doc.as_object().unwrap() {
             let mut paths = Vec::new();
-            collect_fleet_paths(key, val, &mut paths);
+            collect_fleet_paths(key, val, &[], &mut paths);
             assert!(paths.is_empty(), "template seeds fleet key(s) {paths:?}");
         }
     }
@@ -605,6 +613,143 @@ mod tests {
             r#"{"allow":[{"key":"forge","reason":"migrating, see #11441"}]}"#,
         );
         assert!(check(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn dotted_allow_entry_under_a_fleet_parent_exempts_only_that_leaf() {
+        // Judge P2 (#11475): exemptions are evaluated within the Fleet subtree
+        // before coalescing, so a leaf-level allow entry takes effect.
+        let allow = r#"{"allow":[{"key":"autonomous.roleRunner.onIdle",
+                                   "reason":"intentional repo schedule"}]}"#;
+
+        let dir = tempdir().unwrap();
+        write(
+            &dir.path().join(LEGACY_CONFIG_REL),
+            r#"{"autonomous":{"roleRunner":{"onIdle":["auditor"]}}}"#,
+        );
+        write(&dir.path().join(ALLOW_LIST_REL), allow);
+        assert!(check(dir.path()).is_empty(), "allowed leaf alone must pass");
+
+        // An unallowed sibling still fails, coalesced at the Fleet parent.
+        let dir = tempdir().unwrap();
+        write(
+            &dir.path().join(LEGACY_CONFIG_REL),
+            r#"{"autonomous":{"roleRunner":{"onIdle":["auditor"]},
+                              "workFinder":{"enabled":true}}}"#,
+        );
+        write(&dir.path().join(ALLOW_LIST_REL), allow);
+        let f = check(dir.path());
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].key, "autonomous");
+
+        // Allowed leaf plus the Repo carve-out together still pass.
+        let dir = tempdir().unwrap();
+        write(
+            &dir.path().join(LEGACY_CONFIG_REL),
+            r#"{"autonomous":{"roleRunner":{"onIdle":["auditor"]},
+                              "workFinder":{"extraSkipLabels":["journal"]}}}"#,
+        );
+        write(&dir.path().join(ALLOW_LIST_REL), allow);
+        assert!(check(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn top_level_allow_entry_still_covers_fleet_parent_sub_keys() {
+        let dir = tempdir().unwrap();
+        write(
+            &dir.path().join(LEGACY_CONFIG_REL),
+            r#"{"autonomous":{"roleRunner":{"onIdle":["auditor"]},"workFinder":{"enabled":true}}}"#,
+        );
+        write(
+            &dir.path().join(ALLOW_LIST_REL),
+            r#"{"allow":[{"key":"autonomous","reason":"migrating, see #11441"}]}"#,
+        );
+        assert!(check(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn empty_reason_dotted_allow_entry_does_not_exempt_the_leaf() {
+        let dir = tempdir().unwrap();
+        write(
+            &dir.path().join(LEGACY_CONFIG_REL),
+            r#"{"autonomous":{"roleRunner":{"onIdle":["auditor"]}}}"#,
+        );
+        write(
+            &dir.path().join(ALLOW_LIST_REL),
+            r#"{"allow":[{"key":"autonomous.roleRunner.onIdle","reason":""}]}"#,
+        );
+        let mut keys: Vec<_> = check(dir.path()).into_iter().map(|x| x.key).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["autonomous", "autonomous.roleRunner.onIdle"]);
+    }
+
+    #[test]
+    fn status_reports_fleet_sub_keys_under_a_repo_parent() {
+        // Judge P2 (#11475): `forge` is Repo, but `forge.githubApp` is Fleet,
+        // so status must report it — agreeing with `check`.
+        let tier1 = json!({});
+        let repo = json!({"forge": {"type": "github", "githubApp": {"appId": 1},
+                                    "identities": {"a": "b"}, "readPool": {"size": 2}}});
+        let effective = crate::config_resolver::deep_merge(&tier1, &repo);
+        let o = overrides_against(&tier1, &[(PathBuf::from("r.json"), repo)], &effective);
+        let mut keys: Vec<_> = o.iter().map(|x| x.key.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "forge.githubApp.appId",
+                "forge.identities.a",
+                "forge.readPool.size"
+            ],
+            "{o:?}"
+        );
+        assert_eq!(
+            o.iter()
+                .find(|x| x.key == "forge.githubApp.appId")
+                .unwrap()
+                .effective,
+            json!(1)
+        );
+    }
+
+    #[test]
+    fn status_does_not_report_repo_carve_outs_under_a_fleet_parent() {
+        // Judge P2 (#11475): `extraSkipLabels` is a Repo carve-out; status
+        // must not list it as a fleet override, while a real fleet sibling is.
+        let tier1 = json!({});
+        let repo = json!({"autonomous": {"workFinder": {"extraSkipLabels": ["journal"]}}});
+        let effective = crate::config_resolver::deep_merge(&tier1, &repo);
+        let o = overrides_against(&tier1, &[(PathBuf::from("r.json"), repo)], &effective);
+        assert!(o.is_empty(), "{o:?}");
+
+        let repo = json!({"autonomous": {"workFinder": {"extraSkipLabels": ["journal"],
+                                                        "enabled": true}}});
+        let effective = crate::config_resolver::deep_merge(&tier1, &repo);
+        let o = overrides_against(&tier1, &[(PathBuf::from("r.json"), repo)], &effective);
+        assert_eq!(o.len(), 1, "{o:?}");
+        assert_eq!(o[0].key, "autonomous.workFinder.enabled");
+    }
+
+    #[test]
+    fn status_and_validate_agree_on_sub_key_classification() {
+        // Both directions in one repo: validate flags exactly the subtrees
+        // whose leaves status reports.
+        let dir = tempdir().unwrap();
+        let body = r#"{"forge":{"type":"github","githubApp":{"appId":1}},
+                       "autonomous":{"workFinder":{"extraSkipLabels":["journal"]}}}"#;
+        write(&dir.path().join(LEGACY_CONFIG_REL), body);
+        let findings: Vec<_> = check(dir.path()).into_iter().map(|x| x.key).collect();
+        assert_eq!(findings, ["forge.githubApp"]);
+
+        let repo: Value = serde_json::from_str(body).unwrap();
+        let tier1 = json!({});
+        let effective = crate::config_resolver::deep_merge(&tier1, &repo);
+        let o = overrides_against(&tier1, &[(PathBuf::from("r.json"), repo)], &effective);
+        let keys: Vec<_> = o.iter().map(|x| x.key.as_str()).collect();
+        assert_eq!(keys, ["forge.githubApp.appId"]);
+        assert!(keys
+            .iter()
+            .all(|k| findings.iter().any(|f| k.starts_with(f.as_str()))));
     }
 
     #[test]

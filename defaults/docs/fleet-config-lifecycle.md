@@ -166,7 +166,11 @@ while `autonomous` that also sets any other knob (e.g. `roleRunner.onIdle`,
 `workFinder.enabled`) is flagged once, at `autonomous`. A Repo parent
 holding a Fleet sub-key is flagged at the sub-key (`forge.githubApp`).
 An allow-list entry may name a dotted path, and a top-level entry covers its
-sub-keys (an entry for `forge` allows a `forge.githubApp` override).
+sub-keys (an entry for `forge` allows a `forge.githubApp` override). A dotted
+entry under a Fleet parent exempts just that subtree: with an entry for
+`autonomous.roleRunner.onIdle`, an `autonomous` holding only that leaf passes,
+while one that also sets an unallowed sibling (`workFinder.enabled`) is still
+flagged at `autonomous`.
 
 This supersedes the "Project (default) or Local" ownership of `autonomous.*`,
 `safehouse.*` and `observability.*` in `docs/design/config-resolution-tiers.md`
@@ -193,9 +197,11 @@ Enforcement:
   left in place, logged (`init: config.json: stripped legacy template seed
   …`), and reported by validate so the operator can migrate it or allow-list
   it with a reason. The strip is byte-idempotent — a second run is a no-op.
-- `loom-daemon status` lists, per managed repo, each tracked-tier leaf of a
-  Fleet key that differs from tier 1, with the fleet value and the effective
-  value (a value equal to tier 1 is not reported).
+- `loom-daemon status` lists, per managed repo, each tracked-tier leaf
+  classified Fleet (sub-key rows apply per leaf, so `forge.githubApp.*` is
+  reported and `autonomous.workFinder.extraSkipLabels` is not) that differs
+  from tier 1, with the fleet value and the effective value (a value equal to
+  tier 1 is not reported).
 
 Per-repo fleet report over the roster (#11451): check out each roster repo and
 run the narrow validator; whatever it reports is the remaining set of per-repo
@@ -209,7 +215,7 @@ mkdir -p /tmp/fleet-audit && rm -rf /tmp/fleet-audit/*
 for r in $(yq -r '.repos[] | select(.fleet) | .full_name' repos.yml); do
   short="${r#*/}"
   if git clone -q --depth 1 "git@github.com:$r" "/tmp/fleet-audit/$short"; then
-    loom-daemon validate --workspace "/tmp/fleet-audit/$short" --fleet-policy-only \
+    loom-daemon validate "/tmp/fleet-audit/$short" --fleet-policy-only \
       && echo "$r: clean" || echo "$r: FINDINGS (see stderr above)"
   else
     echo "$r: clone failed"
