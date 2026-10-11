@@ -361,19 +361,24 @@ pub fn check_sample_wire_payloads(content: &str) {
 /// function, not just matched as text. If the doc lists a signature the real
 /// detector no longer recognizes (or vice versa), this fails on the actual
 /// classification behavior instead of only on wording.
+///
+/// The doc spells the two `api rate limit` signatures with `·` for a space so
+/// that printing it cannot trip Claude Code's rate-limit hint (#11411); the
+/// detector is fed the joined form.
 pub fn check_rate_limit_signature_table(content: &str) {
-    let signatures: &[&str] = &[
-        "api rate limit exceeded",
-        "api rate limit already exceeded",
+    let table: &[&str] = &[
+        "api rate limit·exceeded",
+        "api rate limit·already exceeded",
         "secondary rate limit",
         "abuse detection mechanism",
         "was submitted too quickly",
     ];
-    for signature in signatures {
+    for documented in table {
+        let signature = documented.replace('·', " ");
         assert!(
-            content.contains(signature),
+            content.contains(documented),
             "sweep.md's GraphQL-exhaustion detection is missing the rate-limit \
-             signature `{signature}` (#4670) — the table must mirror \
+             signature `{documented}` (#4670) — the table must mirror \
              check-duplicate.sh's is_rate_limit_error() / \
              rate_limit_breaker.rs's RATE_LIMIT_SIGNATURES, not a new one"
         );
