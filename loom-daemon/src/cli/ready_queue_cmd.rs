@@ -334,7 +334,7 @@ mod tests {
         assert!(first < text.find("loom#11").unwrap());
         assert!(text.contains("waiting: concurrency cap full"));
         assert!(text.contains("[starred]"));
-        assert!(!text.contains("[urgent]"), "loom:urgent is no longer a row flag");
+        assert!(!text.contains("[urgent]"), "urgent is no longer a row flag (#9244)");
         assert!(!text.contains("STALE"));
     }
 

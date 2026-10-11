@@ -347,15 +347,6 @@ enum Commands {
         #[arg(long)]
         ignore_host_constraint: bool,
 
-        /// Override the host-class gate (Issue #9034): by default, dispatching a
-        /// `loom:heavy` issue on a host classified `host_class: local-dev`
-        /// (`autonomous.workFinder.hostClass` / `LOOM_HOST_CLASS`) refuses with a
-        /// clear message. Pass `--allow-local` to dispatch anyway — an operator
-        /// hand-dispatching a known-heavy issue on their own machine on purpose is
-        /// not the case this gate exists to stop.
-        #[arg(long)]
-        allow_local: bool,
-
         #[command(flatten)]
         tap: cli::dispatch::DispatchTapArgs,
     },

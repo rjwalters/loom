@@ -7,8 +7,8 @@
 //! `crate::work_finder::candidate_cmp` (#9244): `loom:operator-priority`
 //! (starred) first, starred issues by starred-at, then red-main fixes (only
 //! while that repo's `main` is verified red), then workspace priority, then
-//! oldest `createdAt`, then issue number. `loom:urgent` and `tier:*` labels
-//! do not affect dispatch order.
+//! oldest `createdAt`, then issue number. `tier:*` labels do not affect
+//! dispatch order.
 
 use serde::{Deserialize, Serialize};
 
@@ -59,9 +59,6 @@ pub enum QueueDisposition {
     WorkspaceCommandsMissing,
     /// Not for this host: a host-affinity constraint names another host.
     HostConstraint,
-    /// Not for this host: it carries `loom:heavy` and this host is
-    /// classified `local-dev`, with no override set (Issue #9034).
-    HostClassRefused,
     /// Blocked: it carries a skip/park label (or lacks a required capability).
     Parked,
     /// Blocked: a hard-exclusion rule applies (e.g. the `external` label).
@@ -106,7 +103,7 @@ impl QueueDisposition {
     /// ([`Self::LabelledBlocked`] and [`Self::Unknown`] excluded). The queue-depth metrics (Issue #8852, phase 2) emit one
     /// point per entry every tick, zeros included, so an empty queue reads as
     /// `0` rather than as a missing series.
-    pub const ALL: [Self; 27] = [
+    pub const ALL: [Self; 26] = [
         Self::Dispatched,
         Self::InFlight,
         Self::DeferredCapacity,
@@ -119,7 +116,6 @@ impl QueueDisposition {
         Self::WorkspaceHalted,
         Self::WorkspaceCommandsMissing,
         Self::HostConstraint,
-        Self::HostClassRefused,
         Self::Parked,
         Self::HardExclusion,
         Self::RecheckInterval,
@@ -153,7 +149,6 @@ impl QueueDisposition {
             Self::WorkspaceHalted => "workspace_halted",
             Self::WorkspaceCommandsMissing => "workspace_commands_missing",
             Self::HostConstraint => "host_constraint",
-            Self::HostClassRefused => "host_class_refused",
             Self::Parked => "parked",
             Self::HardExclusion => "hard_exclusion",
             Self::RecheckInterval => "recheck_interval",
@@ -209,7 +204,6 @@ impl QueueDisposition {
             }
             Self::WorkspaceCommandsMissing => "blocked: workspace missing sweep command",
             Self::HostConstraint => "not for this host (host affinity)",
-            Self::HostClassRefused => "blocked: heavy sweep refused on local-dev host_class",
             Self::Parked => "blocked: skip/park label",
             Self::HardExclusion => "blocked: hard-exclusion rule",
             Self::RecheckInterval => "waiting: issue's recheck interval",
@@ -241,8 +235,8 @@ pub struct ReadyQueueRow {
     pub issue: u32,
     /// The owning workspace's priority tier (lower dispatches first).
     pub workspace_priority: u32,
-    /// Deprecated (#9244): always `false`. `loom:urgent` no longer affects
-    /// dispatch order; the field stays on the wire for one release.
+    /// Deprecated (#9244): always `false`. Its label was deleted in #11105;
+    /// the field stays on the wire only for compatibility.
     pub urgent: bool,
     /// Whether the issue is starred (`loom:operator-priority`, #9244).
     #[serde(default)]
@@ -351,11 +345,6 @@ mod tests {
         assert_eq!(QueueDisposition::Dispatched.state(), "running");
         assert_eq!(QueueDisposition::DeferredCapacity.state(), "ready");
         assert_eq!(QueueDisposition::OpenPr.state(), "blocked");
-        // #9034: a host-class refusal is `blocked`, not `ready` — it never
-        // self-resolves by waiting, the way a capacity/ramp/saturation defer
-        // does.
-        assert_eq!(QueueDisposition::HostClassRefused.state(), "blocked");
-        assert_eq!(QueueDisposition::HostClassRefused.as_str(), "host_class_refused");
     }
 
     /// Issue #9410: the build back-off disposition round-trips, is a
@@ -363,7 +352,7 @@ mod tests {
     #[test]
     fn build_backoff_disposition_round_trips_and_old_summaries_parse() {
         let d = QueueDisposition::DeferredBuildBackoff;
-        assert_eq!(QueueDisposition::ALL.len(), 27);
+        assert_eq!(QueueDisposition::ALL.len(), 26);
         assert!(QueueDisposition::ALL.contains(&d));
         let json = serde_json::to_value(d).unwrap();
         assert_eq!(json, serde_json::json!("deferred_build_backoff"));

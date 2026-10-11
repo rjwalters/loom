@@ -322,31 +322,8 @@ fn overflow_still_yields_to_the_saturation_brake_and_the_ramp_cap() {
     assert_eq!(report.unwrap().deferred_saturation, 1);
 }
 
-/// A full dispatcher on a `local-dev` host (#9034), for the host-class gate.
-struct LocalDev(RecordingDispatcher);
-
-impl WorkDispatcher for LocalDev {
-    fn in_flight(&self) -> HashSet<u32> {
-        self.0.in_flight()
-    }
-    fn heavy_local_policy(&self) -> host_class::HeavyLocalPolicy {
-        host_class::HeavyLocalPolicy {
-            class: host_class::HostClass::LocalDev,
-            allow_heavy_local: false,
-        }
-    }
-    fn dispatch(&mut self, issue: u32, complexity: Option<&str>) -> Result<bool> {
-        self.0.dispatch(issue, complexity)
-    }
-}
-
 #[test]
-fn overflow_still_yields_to_the_host_class_and_pool_gates() {
-    let heavy = || vec![starred(1, &[host_class::LOOM_HEAVY_LABEL])];
-    let mut multi = vec![(FakeSource::once(heavy()), LocalDev(full(2)))];
-    let report = tick_multi(&mut multi, &[100], 2, &[false]);
-    assert_eq!((report.dispatched, report.skipped_host_class), (0, 1));
-
+fn overflow_still_yields_to_the_pool_gates() {
     // A pool / pre-flight hold arrives as a per-root halt with no verified
     // red main behind it: the starred issue waits like everything else.
     let lane = RedMainLane {
