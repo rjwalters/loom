@@ -147,6 +147,86 @@ fn resolved_hash_repeats_append_nothing_and_body_is_once_per_hash() {
     assert!(recs[2].envelope.data["body"].is_object());
 }
 
+fn set_config(ws: &tempfile::TempDir, config: &Value) {
+    std::fs::write(ws.path().join(crate::config_resolver::LEGACY_CONFIG_REL), config.to_string())
+        .unwrap();
+}
+
+/// `(effective_hash, tiers_digest)` of each `config.resolved` record.
+fn resolved_states(env: &Env) -> Vec<(String, String)> {
+    env.records()
+        .iter()
+        .filter(|r| r.envelope.kind == KIND_RESOLVED)
+        .map(|r| {
+            let d = &r.envelope.data;
+            (
+                d["effective_hash"].as_str().unwrap().into(),
+                d["tiers_digest"].as_str().unwrap().into(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+#[serial]
+fn resolved_records_a_return_to_an_earlier_hash() {
+    let env = Env::new(true);
+    let a = json!({"autonomous": {"workFinder": {"maxConcurrent": 2}}});
+    let b = json!({"autonomous": {"workFinder": {"maxConcurrent": 5}}});
+    let ws = workspace(&a);
+    record_resolved(ws.path());
+    set_config(&ws, &b);
+    record_resolved(ws.path());
+    set_config(&ws, &a);
+    record_resolved(ws.path()); // A -> B -> A: the return is a transition
+    record_resolved(ws.path()); // consecutive identical state: nothing
+    let states = resolved_states(&env);
+    assert_eq!(states.len(), 3, "{states:?}");
+    assert_eq!(states[2], states[0], "newest record must be the current state A");
+    assert_ne!(states[1].0, states[0].0);
+    let recs = env.records();
+    assert!(recs[0].envelope.data["body"].is_object());
+    assert!(recs[1].envelope.data["body"].is_object());
+    assert!(recs[2].envelope.data.get("body").is_none(), "body is stored once per hash");
+}
+
+#[test]
+#[serial]
+fn resolved_records_a_return_to_earlier_tiers_under_one_hash() {
+    let env = Env::new(true);
+    let x = json!({"autonomous": {"workFinder": {"maxConcurrent": 2}}});
+    let y = json!({"autonomous": {"workFinder": {"maxConcurrent": 2}}, "other": 1});
+    let ws = workspace(&x);
+    record_resolved(ws.path());
+    set_config(&ws, &y);
+    record_resolved(ws.path());
+    set_config(&ws, &x);
+    record_resolved(ws.path()); // X -> Y -> X under one hash
+    record_resolved(ws.path());
+    let states = resolved_states(&env);
+    assert_eq!(states.len(), 3, "{states:?}");
+    assert!(states.iter().all(|s| s.0 == states[0].0), "one planner hash");
+    assert_ne!(states[1].1, states[0].1);
+    assert_eq!(states[2], states[0], "newest record must be the current tiers X");
+}
+
+#[test]
+#[serial]
+fn resolved_state_is_scoped_per_workspace() {
+    let env = Env::new(true);
+    let cfg = json!({"autonomous": {"workFinder": {"maxConcurrent": 2}}});
+    let (w1, w2) = (workspace(&cfg), workspace(&cfg));
+    record_resolved(w1.path());
+    record_resolved(w2.path()); // same config, other workspace: its own state
+    record_resolved(w1.path());
+    record_resolved(w2.path());
+    let recs = env.records();
+    assert_eq!(recs.len(), 2);
+    assert_eq!(recs[0].envelope.data["workspace"], w1.path().display().to_string());
+    assert_eq!(recs[1].envelope.data["workspace"], w2.path().display().to_string());
+    assert!(recs[1].envelope.data.get("body").is_none(), "hash body already stored");
+}
+
 #[test]
 #[serial]
 fn credentials_never_reach_the_journal() {
@@ -155,6 +235,7 @@ fn credentials_never_reach_the_journal() {
         "autonomous": {"workFinder": {"maxConcurrent": 2}},
         "forge": {"apiToken": SECRET, "note": format!("see {SECRET}")},
         "password": "hunter2-hunter2",
+        "remote": "https://bot:urlsecret42@git.example.com/o/r.git",
     }));
     record_resolved(ws.path());
     record_sync(&status("timer", Some(&format!("auth failed with {SECRET}"))));
@@ -162,7 +243,12 @@ fn credentials_never_reach_the_journal() {
     assert!(raw.contains("config.resolved") && raw.contains("fleet.sync"));
     assert!(!raw.contains(SECRET), "token leaked into the journal");
     assert!(!raw.contains("hunter2"), "password leaked into the journal");
+    assert!(!raw.contains("urlsecret42"), "URL userinfo leaked into the journal");
     assert!(raw.contains(REDACTED));
+    assert_eq!(
+        redact_userinfo("see ssh://u:p@h/x and http://h/y"),
+        "see ssh://<redacted>@h/x and http://h/y"
+    );
 }
 
 #[test]
@@ -211,13 +297,19 @@ fn sync_records_rebuild_the_legacy_snapshot_and_dedupe_unchanged_passes() {
     later.at = Utc.with_ymd_and_hms(2026, 10, 11, 1, 7, 3).unwrap();
     crate::fleet_sync::publish(&later); // same state, later `at`: not re-journaled
     assert_eq!(env.records().len(), 1);
-    assert!(
-        divergence(&env.root(), env.dir.path()).is_clean() || {
-            // the legacy file now carries the later `at`; only `at` may differ
-            let r = divergence(&env.root(), env.dir.path());
-            r.divergences.iter().all(|d| d.field == "at")
-        }
-    );
+    // The legacy file now carries the later `at`; that is not a divergence.
+    let r = divergence(&env.root(), env.dir.path());
+    assert!(r.is_clean(), "{r:?}");
+
+    // A genuine state difference in the legacy file IS reported.
+    let path = env.dir.path().join(crate::fleet_sync::STATUS_FILENAME);
+    let mut legacy: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    legacy["pass"] = json!("manual");
+    std::fs::write(&path, legacy.to_string()).unwrap();
+    let r = divergence(&env.root(), env.dir.path());
+    assert_eq!(r.total, 1, "{r:?}");
+    assert_eq!(r.divergences[0].field, "pass");
+
     crate::fleet_sync::publish(&status("timer", Some("boom")));
     let recs = env.records();
     assert_eq!(recs.len(), 2);

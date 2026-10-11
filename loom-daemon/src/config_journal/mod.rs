@@ -23,7 +23,8 @@
 //! - **A shadow failure never fails the operation.** Every entry point
 //!   returns `()`; errors (and panics) are logged once at WARN and dropped.
 //! - **No credentials.** Bodies and status records are redacted by key name
-//!   and by value shape ([`redact`]) before they reach the journal.
+//!   and by value shape (token shapes, URL userinfo; [`redact`]) before they
+//!   reach the journal.
 //!
 //! Divergence between the journal's projections and the legacy C6/C7 files
 //! is reported by [`divergence`] (bounded, normalised) and surfaced by
@@ -153,9 +154,22 @@ pub fn redact(value: &Value) -> Value {
                 .collect(),
         ),
         Value::Array(items) => Value::Array(items.iter().map(redact).collect()),
-        Value::String(s) => Value::String(crate::forge_egress::report::redact(s)),
+        Value::String(s) => Value::String(redact_userinfo(&crate::forge_egress::report::redact(s))),
         other => other.clone(),
     }
+}
+
+/// Blank URL userinfo (`scheme://user:secret@host` → `scheme://<redacted>@host`)
+/// in any string, whatever key it sits under.
+fn redact_userinfo(s: &str) -> String {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        #[allow(clippy::expect_used)]
+        regex::Regex::new(r"([A-Za-z][A-Za-z0-9+.\-]*://)[^/\s@]+@")
+            .expect("static userinfo regex compiles")
+    });
+    re.replace_all(s, format!("${{1}}{REDACTED}@").as_str())
+        .into_owned()
 }
 
 // ----------------------------------------------------------------------
@@ -182,32 +196,47 @@ fn tier_metadata(repo_root: &Path) -> Vec<Value> {
 }
 
 /// Shadow-record the effective config `repo_root` now resolves to. Cheap to
-/// repeat: an unchanged `(hash, tiers)` appends nothing.
+/// repeat: an unchanged `(hash, tiers)` for this workspace appends nothing.
 pub fn record_resolved(repo_root: &Path) {
     if !enabled() {
         return;
     }
     shadow("config.resolved", |s| {
         let effective = crate::config_resolver::resolve_effective_config(repo_root);
-        append_resolved(s, &effective, tier_metadata(repo_root))
+        let workspace = repo_root.display().to_string();
+        append_resolved(s, &workspace, &effective, tier_metadata(repo_root))
     });
 }
 
+/// Two concerns, kept apart:
+///
+/// - **Transitions** (current state): a record is appended whenever the
+///   `(effective_hash, tiers_digest)` of `workspace` differs from that
+///   workspace's newest `config.resolved` record — including a *return* to an
+///   earlier state (A → B → A, or tiers X → Y → X under one hash). The newest
+///   record for a workspace is therefore always its current state.
+/// - **Body storage**: the redacted body rides on the first record for a
+///   hash, keyed on the hash (`append_if_new`); every later transition to an
+///   already-stored hash is appended body-less, unkeyed.
 pub(crate) fn append_resolved(
     s: &Stream,
+    workspace: &str,
     effective: &Value,
     tiers: Vec<Value>,
 ) -> Result<(), JournalError> {
     let hash = crate::observability::fleet_state::planner_config_hash(effective);
     let tiers_digest = sha256_hex(Value::Array(tiers.clone()).to_string().as_bytes());
+    if latest_state(s, workspace).is_some_and(|(h, t)| h == hash && t == tiers_digest) {
+        return Ok(());
+    }
     let mut data = json!({
         "schema": SCHEMA,
+        "workspace": workspace,
         "effective_hash": hash,
         "tiers_digest": tiers_digest,
         "tiers": tiers,
         "body": redact(effective),
     });
-    // The body is carried once per hash: the first sight keys on the hash.
     match s.append_if_new(KIND_RESOLVED, &hash, data.clone()) {
         Ok(AppendOutcome::Appended(_)) => return Ok(()),
         Ok(AppendOutcome::Duplicate { .. }) => {}
@@ -221,33 +250,22 @@ pub(crate) fn append_resolved(
         }
         Err(e) => return Err(e),
     }
-    // Hash already journaled: record tier changes only, without the body.
-    if latest_tiers_digest(s, &hash).as_deref() == Some(tiers_digest.as_str()) {
-        return Ok(());
-    }
+    // Body already stored for this hash: record the transition without it.
     data.as_object_mut().map(|m| m.remove("body"));
-    let key = format!("{hash}:{tiers_digest}");
-    s.append_if_new(KIND_RESOLVED, &key, data).map(|_| ())
+    s.append(KIND_RESOLVED, None, data).map(|_| ())
 }
 
-/// The tier digest of the newest `config.resolved` record for `hash`.
-fn latest_tiers_digest(s: &Stream, hash: &str) -> Option<String> {
+/// `(effective_hash, tiers_digest)` of the newest `config.resolved` record
+/// for `workspace`, if any.
+fn latest_state(s: &Stream, workspace: &str) -> Option<(String, String)> {
+    let field = |d: &Value, k: &str| d.get(k).and_then(Value::as_str).map(str::to_owned);
     let mut found = None;
     for rec in s.reader(Position::START).flatten() {
+        let d = &rec.envelope.data;
         if rec.envelope.kind == KIND_RESOLVED
-            && rec
-                .envelope
-                .data
-                .get("effective_hash")
-                .and_then(Value::as_str)
-                == Some(hash)
+            && d.get("workspace").and_then(Value::as_str) == Some(workspace)
         {
-            found = rec
-                .envelope
-                .data
-                .get("tiers_digest")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
+            found = field(d, "effective_hash").zip(field(d, "tiers_digest"));
         }
     }
     found
@@ -348,6 +366,11 @@ pub fn record_pending_cleared() {
 // fleet.sync
 // ----------------------------------------------------------------------
 
+/// `FleetSyncStatus` fields that change on every pass without a state change.
+/// [`record_sync`] does not re-journal a snapshot differing only in these, so
+/// [`divergence`] must not compare them either (one list, both sides).
+const SYNC_VOLATILE: &[&str] = &["at"];
+
 fn last_sync_digest() -> &'static Mutex<Option<(PathBuf, String)>> {
     static CELL: OnceLock<Mutex<Option<(PathBuf, String)>>> = OnceLock::new();
     CELL.get_or_init(|| Mutex::new(None))
@@ -363,7 +386,11 @@ pub fn record_sync(status: &crate::fleet_sync::FleetSyncStatus) {
         let mut body = redact(&serde_json::to_value(status).map_err(JournalError::Encode)?);
         let digest = {
             let mut stable = body.clone();
-            stable.as_object_mut().map(|m| m.remove("at"));
+            if let Some(m) = stable.as_object_mut() {
+                for k in SYNC_VOLATILE {
+                    m.remove(*k);
+                }
+            }
             sha256_hex(stable.to_string().as_bytes())
         };
         let root = s.dir().to_path_buf();
@@ -564,13 +591,13 @@ pub fn divergence(root: &Path, loom_dir: &Path) -> DivergenceReport {
         match (legacy, expected) {
             (None, None) => {}
             (Some(l), Some((j, truncated))) => {
-                // The legacy file is not redacted; compare it redacted.
-                let ignore: &[&str] = if truncated {
-                    &["workspaces", "checkouts"]
-                } else {
-                    &[]
-                };
-                diff_objects(&mut report, "fleet_sync_status", &redact(&l), &j, ignore);
+                // The legacy file is not redacted; compare it redacted. Fields
+                // the writer deliberately does not re-journal are not compared.
+                let mut ignore: Vec<&str> = SYNC_VOLATILE.to_vec();
+                if truncated {
+                    ignore.extend(["workspaces", "checkouts"]);
+                }
+                diff_objects(&mut report, "fleet_sync_status", &redact(&l), &j, &ignore);
             }
             (l, j) => report.push(Divergence {
                 store: "fleet_sync_status",
