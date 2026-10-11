@@ -28,6 +28,11 @@ impl Env {
             "LOOM_SPAWN_NO_EXPORT",
             "LOOM_CODEX_NO_EXEC",
             ceiling::MAX_CONCURRENT_ENV,
+            // #11400: the opencode backstop's credential comes from the zai
+            // seat `workspace` provisions, never the launching shell.
+            "ZAI_API_KEY",
+            "LOOM_NATIVE_AUTH_FILE",
+            crate::api_keys_pool::paths::SHARED_API_KEYS_DIR_ENV,
         ];
         let prior = keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
         for key in keys {
@@ -79,6 +84,8 @@ fn workspace(preference: Option<serde_json::Value>) -> tempfile::TempDir {
         None => serde_json::json!({}),
     };
     fs::write(dir.path().join(".loom/config.json"), config.to_string()).unwrap();
+    // A selectable zai seat, so the bare `opencode` backstop is available.
+    super::unprovisioned_tests::provision_zai_pool(dir.path(), true);
     dir
 }
 

@@ -941,17 +941,18 @@ impl SweepRegistry {
         // disposition and its mandatory `failure_class` come back as one value
         // so the "env_failure/substantive_failure/unknown must say why"
         // invariant cannot be half-applied; see `telemetry::disposition`.
-        let (disposition, failure_class) =
-            telemetry::classify_disposition(&telemetry::DispositionSignals {
-                result,
-                pr_number,
-                failure_class: failure_class.as_deref(),
-                phase_durations: &phase_durations,
-                total_duration_sec: duration_sec,
-                judge_verdicts: judge_verdicts.as_deref(),
-                doctor_cycles,
-                issue_end_state,
-            });
+        let signals = telemetry::DispositionSignals {
+            result,
+            pr_number,
+            failure_class: failure_class.as_deref(),
+            phase_durations: &phase_durations,
+            total_duration_sec: duration_sec,
+            judge_verdicts: judge_verdicts.as_deref(),
+            doctor_cycles,
+            issue_end_state,
+        };
+        let (disposition, failure_class) = telemetry::classify_disposition(&signals);
+        let reported_result = telemetry::result_for_disposition(&signals, disposition);
         // Issue #10642: a synthesized `no-phase-signal` class says nothing on
         // its own, so attach what is known about how the run ended.
         let no_phase_cause = (failure_class.as_deref() == Some(telemetry::NO_PHASE_SIGNAL_CLASS))
@@ -972,6 +973,8 @@ impl SweepRegistry {
             self.noop_loop_kind(issue, sweep_id)
                 .map(ParkKind::failure_class),
         );
+        let process_result = result;
+        let result = reported_result;
 
         let outcome_record = telemetry::SweepOutcomeRecord {
             repo,
@@ -1040,7 +1043,7 @@ impl SweepRegistry {
         // window, lose) the `sweep.outcome` record. See `writeback`'s module
         // doc for the full fail-open contract.
         let writeback_record =
-            (result == telemetry::SweepResult::Success).then(|| outcome_record.clone());
+            (process_result == telemetry::SweepResult::Success).then(|| outcome_record.clone());
         let result_name = serde_json::to_value(result)
             .ok()
             .and_then(|v| v.as_str().map(str::to_owned))

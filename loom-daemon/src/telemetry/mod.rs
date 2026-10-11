@@ -75,8 +75,8 @@ pub mod trace;
 pub mod visibility;
 pub use ci::{CiDurationRecord, CiJobLogRecord, CiJobRecord, CiRunRecord};
 pub use disposition::{
-    apply_noop_loop_class, classify_disposition, DispositionSignals, IssueEndState,
-    SweepDisposition, NO_PHASE_SIGNAL_CLASS,
+    apply_noop_loop_class, classify_disposition, result_for_disposition, DispositionSignals,
+    IssueEndState, SweepDisposition, NO_PHASE_SIGNAL_CLASS,
 };
 pub use envelope::TelemetryEnvelope;
 pub use kinds::{
@@ -367,7 +367,12 @@ pub mod trigger {
     pub const STALE_BASE_REJUDGE: &str = "stale_base_rejudge";
     /// Dispatched to fix a CI failure.
     pub const CI_FAILURE_FIX: &str = "ci_failure_fix";
-    /// A human or external tool asked for this sweep.
+    /// Re-dispatch after the previous attempt succeeded: it landed, found the
+    /// work already done, or the Curator closed or rescoped the issue (Issue
+    /// #11429). Inferred from the journal; says nothing about who dispatched.
+    pub const REDISPATCH_AFTER_SUCCESS: &str = "redispatch_after_success";
+    /// A human or external tool asked for this sweep. Reserved for a dispatch
+    /// path that knows an operator acted; the journal inference never sets it.
     pub const OPERATOR_REDISPATCH: &str = "operator_redispatch";
     /// The dispatch reason was not observable. Counted, never silently merged.
     pub const UNKNOWN: &str = "unknown";

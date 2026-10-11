@@ -302,15 +302,16 @@ fn ie5_reports_what_fraction_of_attempts_it_can_attribute() {
     let conn = seeded();
     let rows = query(&conn, &committed_statements()[4]);
     assert_eq!(rows.len(), 1);
-    // attempts, no_trigger, operator_redispatch, unknown_trigger,
-    // no_timeline_read, no_attempt_index, attributed_pct
+    // attempts, no_trigger, operator_redispatch, redispatch_after_success,
+    // unknown_trigger, no_timeline_read, no_attempt_index, attributed_pct
     assert_eq!(rows[0][0], "4", "{:?}", rows[0]);
     assert_eq!(rows[0][1], "1", "one pre-#9444 record: {:?}", rows[0]);
     assert_eq!(rows[0][2], "0");
     assert_eq!(rows[0][3], "0");
-    assert_eq!(rows[0][4], "1", "the same record had no timeline read");
-    assert_eq!(rows[0][5], "1", "…and no attempt_index");
-    assert_eq!(rows[0][6], "75.0", "three of four attributable: {:?}", rows[0]);
+    assert_eq!(rows[0][4], "0");
+    assert_eq!(rows[0][5], "1", "the same record had no timeline read");
+    assert_eq!(rows[0][6], "1", "…and no attempt_index");
+    assert_eq!(rows[0][7], "75.0", "three of four attributable: {:?}", rows[0]);
 }
 
 /// The window is a bound parameter, not a literal edited into the SQL: a
@@ -330,7 +331,7 @@ fn the_window_is_bound_not_baked_in() {
         );
         // IE5 is an unfiltered aggregate, so it always returns one row — but
         // that row must report zero attempts, not the whole table's.
-        if rows.len() == 1 && rows[0].len() == 7 {
+        if rows.len() == 1 && rows[0].len() == 8 {
             assert_eq!(rows[0][0], "0", "IE5 over an empty window: {rows:?}");
         } else {
             assert!(rows.is_empty(), "a window with no records must return no rows: {rows:?}");

@@ -400,11 +400,46 @@ fn run_preflight(
             .as_deref()
             .and_then(prompt::role_invocation)
             .map(|(r, _)| r);
+        // #11400: judge exclusion against the profile this launch will select —
+        // an explicit `--profile` — not the env/default profile it overrides.
+        let launch_profile = options
+            .profile
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty());
         for role in role.as_deref().into_iter().chain(prompt_role) {
-            crate::runtime_admission::resolve_and_admit(root, role, Some(&runtime))
-                .map_err(|e| LaunchError::config(e.diagnostic()))?;
+            crate::runtime_admission::resolve_and_admit_profiled(
+                root,
+                role,
+                Some(&runtime),
+                launch_profile,
+                crate::runtime_admission::AdmissionContext::Host,
+            )
+            .map_err(|e| LaunchError::config(e.diagnostic()))?;
         }
         let mut selection = profiles::select(&runtime, &options, &config)?;
+        // #11400: the profile actually selected (an explicit `--profile` may
+        // differ from the one admission judged) must not exclude this role.
+        if let Some(name) = selection.profile.as_deref() {
+            for role in role.as_deref().into_iter().chain(prompt_role) {
+                let Some(canonical) = crate::runtime_admission::canonical_role(role) else {
+                    continue;
+                };
+                // A native sweep runs every phase in this one session.
+                let phases: &[&str] = if canonical == "sweep-lifecycle" {
+                    &["builder", "curator", "judge", "doctor"]
+                } else {
+                    &[canonical]
+                };
+                for &checked in phases {
+                    if profiles::excluded_role(&runtime, Some(name), checked, &config).is_some() {
+                        return Err(LaunchError::config(format!(
+                            "model profile {name:?} excludes role {checked:?} (excludedRoles, #11400)"
+                        )));
+                    }
+                }
+            }
+        }
         trace_identity.insert("loom.provider".into(), selection.provider.clone());
         trace_identity.insert("loom.model".into(), selection.model.clone());
         if let Some(effort) = &selection.effort {

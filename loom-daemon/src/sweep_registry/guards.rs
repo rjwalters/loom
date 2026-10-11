@@ -26,6 +26,7 @@ mod gh_exec;
 /// Conditional 2.5/2.7 issue reads (W9), a child module because this file is
 /// frozen by `scripts/file-size-baseline.txt`.
 pub(crate) mod issue_snapshot;
+pub(crate) use issue_snapshot::IssueGate;
 mod rate_limit_report;
 #[cfg(test)]
 mod rate_limit_report_tests;
@@ -491,45 +492,7 @@ impl SweepRegistry {
     /// merged PR as `state: "closed"`, but an Issue-shaped node reporting `MERGED`
     /// must never fall through to the fail-open arm again.
     pub(crate) fn issue_is_closed_or_pr(&self, issue: u32) -> Option<bool> {
-        // `gh api` cannot infer the repo from the working directory; this helper
-        // prefers the process-global LOOM_REPO override and falls back to
-        // `gh repo view` in the workspace root, so the override keeps working
-        // exactly as it did with `gh issue view --repo`. Returns `None` (fail
-        // open) when the repo cannot be resolved.
-        let (owner, repo) = self.resolve_owner_repo()?;
-        let gh = self.resolved_gh();
-        let mut cmd = self.gh_inv("guard.issue_state", AccessIntent::Read, &gh);
-        cmd = cmd
-            .arg("api")
-            .arg(format!("repos/{owner}/{repo}/issues/{issue}"))
-            .arg("--jq")
-            .arg("{state, is_pr: (.pull_request != null)}");
-        // Resolve against this registry's own workspace, matching the label-flip
-        // helpers and the other dispatch-path probes (#3937).
-        let output = self.run_counted(cmd).ok()??;
-        if !output.status.success() {
-            return None;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).ok()?;
-        // A PR is terminal for dispatch purposes in EVERY state — an open PR is
-        // still not an issue anyone can build.
-        if parsed.get("is_pr")?.as_bool()? {
-            return Some(true);
-        }
-        match parsed
-            .get("state")?
-            .as_str()?
-            .trim()
-            .to_ascii_uppercase()
-            .as_str()
-        {
-            "CLOSED" | "MERGED" => Some(true),
-            "OPEN" => Some(false),
-            // Reserved for genuine lookup failures only: an unrecognized state
-            // string is an unparseable answer, not a verdict.
-            _ => None,
-        }
+        self.issue_gate_via_rest(issue).map(IssueGate::closed_or_pr)
     }
 
     /// Best-effort probe for an **open** pull request linked to `issue` via

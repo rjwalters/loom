@@ -16,9 +16,11 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
 
-/// A role with no `runtimeRequirements`, so every tier-3 runtime is admitted
-/// and only availability decides the walk.
-const ROLE: &str = "curator";
+/// A role with no `runtimeRequirements` that no default model profile lists
+/// in `excludedRoles` (#11400: a bare `opencode` resolves to `zai-flash`,
+/// which excludes `judge`/`curator`), so every runtime is admitted and only
+/// availability decides the walk.
+const ROLE: &str = "guide";
 
 /// A directory standing in for one `PATH` entry.
 struct Bin(tempfile::TempDir);

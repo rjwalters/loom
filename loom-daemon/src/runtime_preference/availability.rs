@@ -27,9 +27,8 @@
 //! - A native harness may authenticate through its **own** auth store, which
 //!   the daemon cannot read (`runtime-model-trials.md`). An absent
 //!   `credentialEnv` is not proof of an empty credential source.
-//! - A provider with **no registered API-key accounts** is not pooled on this
-//!   host at all; `worker_spawn::credential`'s ladder falls through to the
-//!   harness's own store, so there is no wall to gate on.
+//! - A profile with **no remote credential** (a local, unauthenticated
+//!   provider) needs nothing the daemon could count.
 //! - A Codex tap whose adapter would select from a *different* account
 //!   provider, or whose credential is pinned by environment, does not consult
 //!   the codex pool — so a dry codex pool is not its wall.
@@ -40,11 +39,17 @@
 //!   relative binary path), is not provably uninstalled. Only a *known* name
 //!   that resolves nowhere is passed over — see [`generic`].
 //!
-//! The one deliberate fail-closed case is an **unreadable** pool: accounts may
-//! be registered and deliberately disabled to stop spend, and
+//! Two cases are deliberately fail-closed. An **unreadable** pool: accounts
+//! may be registered and deliberately disabled to stop spend, and
 //! `worker_spawn::credential::resolve` refuses (exit 78) rather than launch on
-//! the ambient credential. A tap that would refuse at spawn must be passed
-//! over here, not selected and then killed.
+//! the ambient credential. And an **unprovisioned** credential (#11400): a
+//! native tap whose single remote credential variable is unset, whose provider
+//! has no API-key pool on this host, with no `LOOM_NATIVE_AUTH_FILE` and no LLM
+//! gateway route. Every preference walk is for a role, and role launches are
+//! guarded: they redirect `HOME`/`XDG_*` and never reuse the harness's own
+//! login (`guardrail-parity-native.md`; `worker_spawn::harness` only prints a
+//! hint), so such a launch is certain to fail at the provider. A tap that
+//! would fail at spawn must be passed over here, not selected and then killed.
 
 use super::resolve::{SkipReason, Tap};
 use crate::role_runner::{PoolHold, PoolStateFile};
@@ -435,10 +440,14 @@ fn codex(root: &Path, admitted: &ResolvedRuntime, now: u64) -> Availability {
 /// 1. Every source variable already exported ⇒ the pool is never consulted.
 /// 2. Exactly one unset variable with a derivable pool provider that is
 ///    *pooled on this host* ⇒ the pool is the wall; count it.
-/// 3. Anything else (unresolvable profile, no pool provider, provider not
-///    pooled) ⇒ the harness's own auth store decides, which is unobservable.
+/// 3. A single unset variable whose provider is *not* pooled here ⇒ the guarded
+///    launch has no credential unless `LOOM_NATIVE_AUTH_FILE` supplies one, so
+///    it is [`PoolHold::Unprovisioned`] (#11400); with the auth file set it is
+///    unobservable (the snapshot's account health is not countable).
+/// 4. Anything else (unresolvable profile, no pool provider, gateway route) ⇒
+///    unobservable, and a real failure surfaces loudly at launch.
 ///
-/// An unreadable pool directory is the fail-closed case, matching the ladder's
+/// An unreadable pool directory is fail-closed too, matching the ladder's
 /// step 3 refusal.
 fn native(root: &Path, tap: &Tap, runtime: &str) -> Availability {
     let config = crate::config_resolver::resolve_effective_config(root);
@@ -483,8 +492,24 @@ fn native(root: &Path, tap: &Tap, runtime: &str) -> Availability {
         provider: provider.clone(),
     };
     match crate::api_keys_pool::is_pooled(root, &provider) {
-        // Not pooled on this host: the harness's own auth store decides.
-        Ok(false) => return ungated(CredentialSource::Unobservable),
+        // Not pooled on this host. A guarded role launch never reuses the
+        // harness's own login, so only an external auth snapshot can supply
+        // the credential (#11400). Kimi refuses that snapshot at provision
+        // time, so it never counts there.
+        Ok(false) if runtime != "kimi" && native_auth_file_set() => {
+            return ungated(CredentialSource::Unobservable)
+        }
+        Ok(false) => {
+            return Availability::Exhausted {
+                source,
+                hold: PoolHold::Unprovisioned,
+                detail: format!(
+                    "{source_var} is unset and provider {provider:?} has no API-key pool on \
+                     this host (no LOOM_NATIVE_AUTH_FILE, no LLM gateway route); a guarded \
+                     launch would have no credential — loom-daemon api-keys add {provider} <account>; #11400"
+                ),
+            }
+        }
         Ok(true) => {}
         Err(error) => {
             return Availability::Exhausted {
@@ -540,4 +565,11 @@ fn native(root: &Path, tap: &Tap, runtime: &str) -> Availability {
             entry.total, entry.exhausted, entry.disabled, entry.at_capacity
         ),
     }
+}
+
+/// Whether an external native auth snapshot is configured — the one way a
+/// guarded launch can authenticate without an env or pooled credential
+/// (`native_tools::provision::state::prepare` reads the same variable).
+fn native_auth_file_set() -> bool {
+    std::env::var_os("LOOM_NATIVE_AUTH_FILE").is_some_and(|value| !value.is_empty())
 }

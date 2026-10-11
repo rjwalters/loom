@@ -175,7 +175,8 @@ pub struct QueueLandingRow {
 /// paths (#9781; the daemon formats `file overlap: <paths>`, never forge free
 /// text), and a `workspace_halted` row's closed-vocabulary hold
 /// cause (#9017 — `main_red`, `gate_pending`, `token_pool`, …, emitted by
-/// `work_finder::halt_cause`, never free-form text).
+/// `work_finder::halt_cause`, never free-form text), and an `already_landed`
+/// row's evidence (#11429: `forge_closed` or `journal_landed`).
 #[must_use]
 pub fn exportable_detail(disposition: QueueDisposition, detail: Option<&str>) -> Option<String> {
     match disposition {
@@ -183,7 +184,8 @@ pub fn exportable_detail(disposition: QueueDisposition, detail: Option<&str>) ->
         | QueueDisposition::OpenPr
         | QueueDisposition::LabelledBlocked
         | QueueDisposition::DeferredFileOverlap
-        | QueueDisposition::WorkspaceHalted => detail.map(str::to_string),
+        | QueueDisposition::WorkspaceHalted
+        | QueueDisposition::AlreadyLanded => detail.map(str::to_string),
         _ => None,
     }
 }

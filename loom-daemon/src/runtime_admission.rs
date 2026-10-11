@@ -627,10 +627,31 @@ pub fn resolve_and_admit_in(
     explicit: Option<&str>,
     context: AdmissionContext<'_>,
 ) -> Result<ResolvedRuntime, RuntimeRejection> {
+    resolve_and_admit_profiled(root, role, explicit, None, context)
+}
+
+/// [`resolve_and_admit_in`] for a launch whose model profile is already known
+/// (#11400) — a preference tap's `modelProfile`. `None` judges the profile the
+/// launch would fall back to (`LOOM_MODEL_PROFILE`, then
+/// `runtimes.defaultModelProfile`, then the bundled default); see
+/// [`crate::worker_spawn::profiles::excluded_role`].
+///
+/// # Errors
+/// As [`resolve_and_admit`], plus a refusal with unmet capability
+/// [`crate::worker_spawn::profiles::EXCLUDED_ROLE`] when the profile lists this
+/// role in its `excludedRoles`.
+pub fn resolve_and_admit_profiled(
+    root: &Path,
+    role: &str,
+    explicit: Option<&str>,
+    model_profile: Option<&str>,
+    context: AdmissionContext<'_>,
+) -> Result<ResolvedRuntime, RuntimeRejection> {
     resolve_and_admit_with(
         root,
         role,
         explicit,
+        model_profile,
         context,
         crate::daemon_bin_resolve::resolve_daemon_bin,
     )
@@ -644,6 +665,7 @@ fn resolve_and_admit_with(
     root: &Path,
     role: &str,
     explicit: Option<&str>,
+    model_profile: Option<&str>,
     context: AdmissionContext<'_>,
     resolve_native_adapter: impl FnOnce() -> Result<PathBuf, String>,
 ) -> Result<ResolvedRuntime, RuntimeRejection> {
@@ -808,6 +830,30 @@ fn resolve_and_admit_with(
     if !unmet.is_empty() {
         return Err(reject(format!("unmet capabilities: {}", unmet.join(", ")), unmet));
     }
+    // #11400: a model profile may exclude roles outright (zai-flash: Judge and
+    // Curator). Checked for whatever source chose this runtime, so a pin is
+    // refused with the reason and a preference entry is skipped as
+    // `not-admitted(excludedRole)`. A sweep is checked as Builder here and as
+    // each in-session phase below.
+    if crate::worker_spawn::is_native(&runtime) {
+        let config = crate::config_resolver::resolve_effective_config(root);
+        for checked in [canonical, lookup_role] {
+            if let Some(profile) = crate::worker_spawn::profiles::excluded_role(
+                &runtime,
+                model_profile,
+                checked,
+                &config,
+            ) {
+                return Err(reject(
+                    format!(
+                        "model profile {profile:?} excludes role {checked:?} (excludedRoles); \
+                         choose another runtime or modelProfile for this role"
+                    ),
+                    vec![crate::worker_spawn::profiles::EXCLUDED_ROLE.to_string()],
+                ));
+            }
+        }
+    }
     let execution = proof.filter(|_| !contained.is_empty()).map(|proof| {
         let mut native = BTreeMap::new();
         for capability in contained.iter().map(String::as_str).chain(["hooks"]) {
@@ -817,12 +863,13 @@ fn resolve_and_admit_with(
     });
     if canonical == "sweep-lifecycle" && crate::worker_spawn::is_native(&runtime) {
         for phase in ["curator", "judge", "doctor"] {
-            resolve_and_admit_in(root, phase, Some(&runtime), context).map_err(|error| {
-                reject(
-                    format!("native sweep phase {phase}: {}", error.reason),
-                    error.unmet_capabilities,
-                )
-            })?;
+            resolve_and_admit_profiled(root, phase, Some(&runtime), model_profile, context)
+                .map_err(|error| {
+                    reject(
+                        format!("native sweep phase {phase}: {}", error.reason),
+                        error.unmet_capabilities,
+                    )
+                })?;
         }
     }
     Ok(ResolvedRuntime {

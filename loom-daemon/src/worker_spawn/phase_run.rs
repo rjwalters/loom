@@ -732,6 +732,10 @@ mod tests {
                 "LOOM_RUNTIME_BUILDER",
                 "LOOM_RUNTIME_DOCTOR",
                 "LOOM_WORKTREE_ROOT",
+                // #11400: the zai-flash tap needs a seat from the fixture.
+                "ZAI_API_KEY",
+                "LOOM_NATIVE_AUTH_FILE",
+                crate::api_keys_pool::paths::SHARED_API_KEYS_DIR_ENV,
             ];
             let prior = keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
             for k in keys {
@@ -789,6 +793,9 @@ mod tests {
             "runtimes": {"rolePreference": {"builder": flash, "doctor": flash}}
         });
         std::fs::write(dir.path().join(".loom/config.json"), config.to_string()).unwrap();
+        // A selectable zai seat: with none, the walk passes zai-flash over.
+        let pool = crate::api_keys_pool::paths::per_repo_api_keys_dir(dir.path());
+        crate::api_keys_pool::registry::add(&pool, "zai", "a", "ZAI_API_KEY", "k", false).unwrap();
         let orchestrator = || {
             std::env::set_var("LOOM_RUNTIME", "claude");
             std::env::set_var("LOOM_ROLE", "sweep-lifecycle");
