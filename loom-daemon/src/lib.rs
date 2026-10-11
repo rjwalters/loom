@@ -353,6 +353,7 @@ pub mod signoz_read;
 pub mod stale_blocked;
 pub mod star_liveness;
 pub mod startup_adoption;
+pub mod stash_issue_state;
 pub mod stash_retirement;
 /// Root-count-aware cost model for `build_daemon_status` and the `status`/
 /// `health` IPC probes that wait on it (#8163). A sibling module rather than
