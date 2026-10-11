@@ -388,6 +388,15 @@ pub(crate) enum ScriptPortCommand {
     #[command(subcommand)]
     PushLease(super::push_lease::PushLeaseCommand),
 
+    /// May this repository's PR branches be rebased (#10771)? `strategy`
+    /// prints `merge` or `rebase` for the roles and stack scripts that bring a
+    /// PR branch up to date. `merge` (the answer whenever the forge does not
+    /// positively allow rebase merges, or anything is unknown) means merge the
+    /// default branch in and push without force — a rebase in a merge-only
+    /// repo deletes other agents' merge commits and orphans reviewed heads.
+    #[command(subcommand)]
+    BranchUpdate(super::branch_update::BranchUpdateCommand),
+
     /// Generate `.agents/skills/loom-<name>/SKILL.md` from every
     /// `defaults/roles/<name>.md` role prompt (#8673) — the cross-vendor
     /// skill-discovery surface Codex, Kimi Code, Mistral Vibe, and Grok read
@@ -667,6 +676,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::OperatorDecision(cmd) => cmd.run(),
             ScriptPortCommand::ReconcileStack(args) => args.run(),
             ScriptPortCommand::PushLease(cmd) => cmd.run(),
+            ScriptPortCommand::BranchUpdate(cmd) => cmd.run(),
             ScriptPortCommand::GenerateAgentSkills(args) => args.run(),
             ScriptPortCommand::GitBlobLines(args) => args.run(),
             ScriptPortCommand::AffectedFiles(cmd) => cmd.run(),
