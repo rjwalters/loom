@@ -99,13 +99,14 @@ Check for an argument passed via the slash command:
 **Arguments**: `$ARGUMENTS`
 
 If a number is provided (e.g., `/curator 42`):
-1. **FIRST, run the pool gate (above), then claim immediately**:
+1. **FIRST, run the pool gate (above) and the kind probe, then claim immediately**:
    ```bash
+   gh issue view <number> --json url --jq .url   # /pull/<n>: a PR, not an issue
    gh api repos/{owner}/{repo}/issues/<number>/labels -f 'labels[]=loom:curating'
    ```
 2. **Skip** "Finding Work" and curate directly
 
-**CRITICAL**: the pool gate, then this claim, BEFORE any other work; `loom:curating` is the claim. Gate fails: no claim, report it deferred.
+**CRITICAL**: pool gate, kind probe, then claim, BEFORE any other work; `loom:curating` is the claim. Gate fails: no claim, report it deferred. **Kind probe: a `/pull/` URL or a failed read means refuse** (no label or body write, #9929); `gh issue edit`/the labels API accept a PR number silently. Applies to every claim path (supplied, resumed, discovered).
 
 **If the named issue already carries `loom:curating`** (another's or a dead
 claim), do not add the label blindly: run the "Stale
@@ -130,7 +131,7 @@ The workflow with two-gate approval:
 
 ### Who promotes `loom:curated` → `loom:issue`
 
-This is the single authoritative statement of `loom:issue` promotion ownership. `.github/labels.yml`'s `loom:issue` `Applied by:` field and `/loom:sweep`'s Approval gate (Wave Lifecycle, step 3) both point back here instead of restating the rule — if a third place asserts who can promote and it disagrees with this section, this section wins; fix the other one (see #4163, which this section resolves).
+The single authoritative statement of `loom:issue` promotion ownership (#4163). `.github/labels.yml`'s `Applied by:` and `/loom:sweep`'s Approval gate point back here; if another place disagrees, this section wins — fix the other one.
 
 Four things can add `loom:issue` to a `loom:curated` issue. **The Curator is only the fourth:**
 
@@ -139,7 +140,7 @@ Four things can add `loom:issue` to a `loom:curated` issue. **The Curator is onl
 3. **The `/loom:sweep` orchestrator's Approval gate**, for an issue already in the sweep's resolved candidate set. The operator approved its inclusion one step earlier (naming the issue, confirming a Mode B/C preview, or triggering the daemon dispatch); the gate *executes* that approval, it does not originate one.
 4. **The Curator, for a `loom:operator-priority` (starred) issue only** (#9244): the star is the operator's Tier-3 approval, so Curator executes it right after curating (Priority 0 below; not for a `loom:epic`). Champion's evaluation is skipped for it.
 
-A Curator subagent that finds `loom:curated` with no `loom:issue` should do exactly what the rest of this file says elsewhere: leave the label alone and move on — including when the Curator is itself running inside a `/loom:sweep` invocation. Promoting is never the Curator's call for an unstarred issue.
+A Curator that finds `loom:curated` with no `loom:issue` leaves the label alone and moves on — even inside a `/loom:sweep`. Promoting is never the Curator's call for an unstarred issue.
 
 **IMPORTANT: Ignore Hard-Excluded Issues**
 
@@ -402,7 +403,7 @@ That re-check never removes the label or auto-releases the issue.
 **Before starting enhancement work on an issue, claim it to prevent duplicate work:**
 
 ```bash
-# Pool gate first, then claim
+# Pool gate and kind probe (Argument Handling) first, then claim
 gh api repos/{owner}/{repo}/issues/<number>/labels -f 'labels[]=loom:curating'
 ```
 

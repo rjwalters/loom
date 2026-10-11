@@ -69,8 +69,10 @@
 //! the target actually is. Without this leg, every downstream step accepts a
 //! PR number silently: `gh issue edit <pr> --add-label loom:building`
 //! succeeds, and the issue lifecycle proceeds on something that can never
-//! close. That is the #9929 incident's signature — a pull request carrying
-//! `loom:curating` → `loom:curated`, stranded outside both pipelines.
+//! close. That matches the #9929 incident's signature — a pull request
+//! carrying `loom:curating` → `loom:curated` — but the route by which it got
+//! there is unconfirmed; this leg guards Builder-style `check-claim` callers,
+//! and Curator is covered separately by its own kind probe in `curator.md`.
 //!
 //! # Cost
 //!
