@@ -240,10 +240,22 @@ static FAILURE_WARNED: LazyLock<Mutex<FailureWarnings>> =
 /// warned within the window warns immediately, so the count only ever covers
 /// repeats of the reason it is printed with.
 fn failure_warn_due(slug: &str, why: &str, now: Instant) -> Option<u64> {
-    let window = Duration::from_secs(FAILURE_WARN_SECS);
     let mut map = FAILURE_WARNED
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    failure_warn_due_in(&mut map, slug, why, now)
+}
+
+/// [`failure_warn_due`] against an explicit map, so tests feeding synthetic
+/// `Instant`s each own their state (the eviction below is relative to `now`,
+/// so a shared map lets one test's clock evict another test's keys).
+fn failure_warn_due_in(
+    map: &mut FailureWarnings,
+    slug: &str,
+    why: &str,
+    now: Instant,
+) -> Option<u64> {
+    let window = Duration::from_secs(FAILURE_WARN_SECS);
     let key = (slug.to_string(), why.to_string());
     if let Some((prev, count)) = map.get_mut(&key) {
         if now.saturating_duration_since(*prev) < window {

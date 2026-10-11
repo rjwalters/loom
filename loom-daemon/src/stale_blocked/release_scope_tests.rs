@@ -179,8 +179,12 @@ fn park_forge_writes_are_vetted_under_the_roots_own_credential() {
 /// were swallowed.
 #[test]
 fn failure_warning_same_reason_is_suppressed_with_a_counter() {
-    use super::{failure_warn_due, FAILURE_WARN_SECS};
+    use super::{failure_warn_due_in, FailureWarnings, FAILURE_WARN_SECS};
     use std::time::{Duration, Instant};
+
+    let mut map = FailureWarnings::new();
+    let mut failure_warn_due =
+        |slug: &str, why: &str, now: Instant| failure_warn_due_in(&mut map, slug, why, now);
 
     let t0 = Instant::now();
     let (slug, why) = ("/tmp/rate-limit-same-11437", "refusing the write (#9548): pull only");
@@ -197,8 +201,12 @@ fn failure_warning_same_reason_is_suppressed_with_a_counter() {
 /// first reason keeps its own window and counter.
 #[test]
 fn failure_warning_changed_reason_warns_immediately() {
-    use super::{failure_warn_due, FAILURE_WARN_SECS};
+    use super::{failure_warn_due_in, FailureWarnings, FAILURE_WARN_SECS};
     use std::time::{Duration, Instant};
+
+    let mut map = FailureWarnings::new();
+    let mut failure_warn_due =
+        |slug: &str, why: &str, now: Instant| failure_warn_due_in(&mut map, slug, why, now);
 
     let t0 = Instant::now();
     let slug = "/tmp/rate-limit-changed-11437";
@@ -220,8 +228,12 @@ fn failure_warning_changed_reason_warns_immediately() {
 /// failure reason.
 #[test]
 fn failure_warning_counters_are_per_workspace() {
-    use super::{failure_warn_due, FAILURE_WARN_SECS};
+    use super::{failure_warn_due_in, FailureWarnings, FAILURE_WARN_SECS};
     use std::time::{Duration, Instant};
+
+    let mut map = FailureWarnings::new();
+    let mut failure_warn_due =
+        |slug: &str, why: &str, now: Instant| failure_warn_due_in(&mut map, slug, why, now);
 
     let t0 = Instant::now();
     let why = "refusing the write (#9548): pull only";
