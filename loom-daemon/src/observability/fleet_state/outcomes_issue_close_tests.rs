@@ -13,6 +13,7 @@ fn held_curator() -> HeldSweep {
         pr: None,
         overflow: false,
         start: Default::default(),
+        sweep_id: None,
     }
 }
 

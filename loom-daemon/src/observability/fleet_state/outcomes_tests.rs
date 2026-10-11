@@ -627,23 +627,6 @@ fn a_ready_exit_waits_for_its_forge_departure() {
 }
 
 #[test]
-fn a_closed_ready_issue_is_cut_short_at_the_close() {
-    let at = t0() + Duration::minutes(3);
-    let mut forge = ready_forge();
-    forge.event(ISSUE, at, HistoryEvent::Closed);
-    let out = run(
-        &[ready(&[ISSUE], Vec::new()), ready(&[], Vec::new())],
-        Duration::minutes(5),
-        &mut forge,
-    );
-    let r = stages(&out[1])[0];
-    assert_eq!((r.exit, r.next_stage), (StageExit::CutShort, None));
-    assert_eq!(r.forge_transition_at, Some(at));
-    assert_eq!(r.dwell_sec, None);
-    assert_eq!(r.entered_at, Some(t0() - Duration::minutes(30)));
-}
-
-#[test]
 fn a_ready_exit_the_forge_never_shows_is_one_unknown_after_the_cap() {
     let mut forge = ready_forge();
     let mut inputs = vec![ready(&[ISSUE], Vec::new())];
@@ -1049,3 +1032,6 @@ mod fact_id_tests;
 
 #[path = "outcomes_issue_close_tests.rs"]
 mod issue_close_tests;
+
+#[path = "outcomes_close_tests.rs"]
+mod close_tests;

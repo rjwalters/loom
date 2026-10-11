@@ -32,7 +32,8 @@
 //! queue sees a claimed issue leave it, so the exit is read from the issue's
 //! history alone: the first `unlabeled loom:issue` or `closed` after the
 //! entry is the instant, and a `loom:building` label by then is `advance`
-//! to `sweep.curator`, anything else `cut_short`. Every host then emits the
+//! to `sweep.curator`, a close takes the issue-close classification
+//! (#11398), anything else `cut_short`. Every host then emits the
 //! same fact id. A row that left the view while the forge shows no
 //! departure yet (a peer's live claim, label lag) is pending: no record,
 //! dropped if the row comes back, emitted once the departure shows, and
@@ -52,8 +53,11 @@
 //!
 //! A `ready_wait` row that leaves the view is not a record unless the repo's
 //! ready listing was whole in both passes (never before #11139): the work
-//! finder's listing can drop a row that is still ready. A row of a repo no
-//! longer managed is not a record either.
+//! finder's listing can drop a row that is still ready.
+//!
+//! **Closes and removals (#11398).** A stay its issue's close ends, in any
+//! stage, takes the issue-close classification ([`IssueFacts::exit`]); a
+//! repo gone from the fleet ends its stays once. See [`close`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -231,6 +235,18 @@ pub struct Memory {
     /// This pass's complete curated listings, set by the caller before
     /// [`diff`] and moved into `curated` by [`remember`].
     pub curated_now: Option<Curated>,
+    /// Each repo's last complete `loom:triage` listing (#11398).
+    pub triage: Curated,
+    /// This pass's complete triage listings, set like `curated_now`.
+    pub triage_now: Option<Curated>,
+    /// Issues gone from a curated or triage listing whose issue or history
+    /// read failed, retried each pass (#11398).
+    pub pre_ready_gone: BTreeMap<(String, u32), close::PendingPreReady>,
+    /// The previous pass's managed repos (#11398).
+    pub managed: BTreeSet<String>,
+    /// Repos gone from the managed set, with the stays they held, until the
+    /// removal holds for [`close::REPO_REMOVAL_CONFIRM_PASSES`] passes.
+    pub absent: BTreeMap<String, close::AbsentRepo>,
     /// Pre-ready exits already emitted: `(repo, issue, stage, left)`.
     pub pre_ready_done: BTreeSet<(String, u32, FleetStage, DateTime<Utc>)>,
     /// Issues whose history read failed, retried each pass while they are
@@ -321,6 +337,14 @@ struct Leaving {
     next_stage: Option<FleetStage>,
     /// The forge's instant for the move, when known.
     forge_at: Option<DateTime<Utc>>,
+}
+
+/// How the forge shows a `ready_wait` row left.
+enum ReadyLeft {
+    /// A claim or an unlabel.
+    Moved(Leaving),
+    /// The issue's close, at this instant.
+    Closed(DateTime<Utc>),
 }
 
 struct Diff<'a, F> {
@@ -433,9 +457,15 @@ impl<F: ForgeReads> Diff<'_, F> {
     }
 
     /// How a `ready_wait` row left, from the issue's history alone so every
-    /// host reads the same exit, next stage and instant. `None` while the
-    /// forge shows no departure yet, or when the read failed.
-    fn ready_departure(&mut self, repo: &str, issue: u32, was: &FleetStateRow) -> Option<Leaving> {
+    /// host reads the same exit, next stage and instant; a close is
+    /// [`ReadyLeft::Closed`], classified by the caller (#11398). `None` while
+    /// the forge shows no departure yet, or when the read failed.
+    fn ready_departure(
+        &mut self,
+        repo: &str,
+        issue: u32,
+        was: &FleetStateRow,
+    ) -> Option<ReadyLeft> {
         let bound = if was.entered_at_lower_bound {
             self.now
         } else {
@@ -449,10 +479,11 @@ impl<F: ForgeReads> Diff<'_, F> {
         if left > now {
             return None;
         }
-        let closed = history.any_within(left, left, |e| *e == HistoryEvent::Closed);
-        let claimed =
-            !closed && history.any_within(entered, left + slack, |e| labeled(e, &[CLAIM_LABEL]));
-        Some(Leaving {
+        if history.any_within(left, left, |e| *e == HistoryEvent::Closed) {
+            return Some(ReadyLeft::Closed(left));
+        }
+        let claimed = history.any_within(entered, left + slack, |e| labeled(e, &[CLAIM_LABEL]));
+        Some(ReadyLeft::Moved(Leaving {
             exit: if claimed {
                 StageExit::Advance
             } else {
@@ -460,7 +491,7 @@ impl<F: ForgeReads> Diff<'_, F> {
             },
             next_stage: claimed.then_some(FleetStage::SweepCurator),
             forge_at: Some(left),
-        })
+        }))
     }
 
     /// The pre-ready exits of `issue`, each at most once. `ready` is whether
@@ -716,6 +747,7 @@ pub fn diff(
     };
     let mut out = Vec::new();
     pre_ready_pass(memory, prev, pass, &mut diff, &mut out);
+    close::pre_ready_departures(memory, pass, &mut diff, &mut out);
     if first {
         return out;
     }
@@ -764,6 +796,7 @@ pub fn diff(
     let mut settled = std::mem::take(&mut memory.settled);
     let mut pending = settle_pending_ready(memory, pass, &mut diff, &mut out);
     let mut pending_issue = settle_pending_issue(memory, pass, &mut diff, &mut out);
+    let mut gone = Vec::new();
 
     let empty = super::RepoView::default();
     for (repo, was_repo) in &prev.repos {
@@ -773,6 +806,13 @@ pub fn diff(
                 .pr
                 .is_some_and(|pr| settled.contains(&(repo.clone(), pr)))
             {
+                continue;
+            }
+            // A row of a repo out of the fleet: [`close::track_removed`]
+            // ends its stay once the removal holds (#11398).
+            if !pass.managed.contains(repo) && !now_repo.rows.contains_key(&issue) {
+                let source = was_repo.sources.get(&issue).copied();
+                gone.push((repo.clone(), issue, was.clone(), source));
                 continue;
             }
             // A PR that left the review listings and merged or closed ends
@@ -807,10 +847,8 @@ pub fn diff(
                         continue;
                     }
                     let source = was_repo.sources.get(&issue).copied();
-                    match diff.ready_departure(repo, issue, was) {
-                        Some(leaving) => out.push(TelemetryRecord::StageOutcome(
-                            diff.record(repo, issue, was, source, leaving),
-                        )),
+                    match diff.ready_exit(repo, issue, was, source) {
+                        Some(record) => out.push(TelemetryRecord::StageOutcome(record)),
                         None => {
                             let waiting = PendingReady {
                                 row: was.clone(),
@@ -847,9 +885,6 @@ pub fn diff(
                     ));
                 }
                 None => {
-                    if !pass.managed.contains(repo) {
-                        continue;
-                    }
                     let facts = was.pr.and_then(|pr| resolved.get(&(repo.clone(), pr)));
                     let source = was_repo.sources.get(&issue).copied();
                     let (exit, forge_at) = match facts {
@@ -895,6 +930,12 @@ pub fn diff(
             }
         }
     }
+    let waiting = close::Waiting {
+        rows: gone,
+        ready: &mut pending,
+        issue: &mut pending_issue,
+    };
+    close::track_removed(memory, pass, &mut diff, waiting, &mut out);
     settled.retain(|(repo, pr)| {
         pass.view
             .repos
@@ -908,8 +949,9 @@ pub fn diff(
 }
 
 /// Settle the `ready_wait` rows still awaiting their forge departure: drop
-/// one whose row is back in `ready_wait` (or whose repo is no longer
-/// managed), emit one whose departure the forge now shows, and emit one
+/// one whose row is back in `ready_wait`, keep one whose repo left the
+/// fleet for [`close::track_removed`], emit one whose departure the forge
+/// now shows (a close classified as in [`Diff::ready_exit`]), and emit one
 /// past [`PENDING_READY_MAX_PASSES`] as the view saw it (`unknown` unless
 /// this host's own claim showed the next stage), with no forge exit instant.
 /// Returns those still waiting.
@@ -927,11 +969,15 @@ fn settle_pending_ready<F: ForgeReads>(
             .get(&repo)
             .and_then(|r| r.rows.get(&issue))
             .is_some_and(|row| row.stage == FleetStage::ReadyWait);
-        if back || !pass.managed.contains(&repo) {
+        if back {
             continue;
         }
-        if let Some(leaving) = diff.ready_departure(&repo, issue, &waiting.row) {
-            let record = diff.record(&repo, issue, &waiting.row, waiting.source, leaving);
+        // A repo out of the fleet: [`close::track_removed`] ends the stay.
+        if !pass.managed.contains(&repo) {
+            kept.insert((repo, issue), waiting);
+            continue;
+        }
+        if let Some(record) = diff.ready_exit(&repo, issue, &waiting.row, waiting.source) {
             out.push(TelemetryRecord::StageOutcome(record));
             continue;
         }
@@ -960,7 +1006,8 @@ fn settle_pending_ready<F: ForgeReads>(
 }
 
 /// Settle the vanished rows whose issue read failed (#11398): drop one whose
-/// row is back or whose repo is no longer managed, emit one whose issue now
+/// row is back, keep one whose repo left the fleet for
+/// [`close::track_removed`], emit one whose issue now
 /// reads (see [`IssueFacts::exit`]),
 /// and emit one past [`PENDING_ISSUE_MAX_PASSES`] as `unknown` at the pass
 /// that first saw it gone, with no fact id. Returns those still waiting.
@@ -977,7 +1024,12 @@ fn settle_pending_issue<F: ForgeReads>(
             .repos
             .get(&repo)
             .is_some_and(|r| r.rows.contains_key(&issue));
-        if back || !pass.managed.contains(&repo) {
+        if back {
+            continue;
+        }
+        // A repo out of the fleet: [`close::track_removed`] ends the stay.
+        if !pass.managed.contains(&repo) {
+            kept.insert((repo, issue), waiting);
             continue;
         }
         let (exit, forge_at) = match diff.forge.issue(&repo, issue) {
@@ -1016,9 +1068,17 @@ pub fn remember(memory: Memory, pass: &Pass<'_>) -> Memory {
     let mut curated = memory.curated;
     curated.retain(|repo, _| pass.managed.contains(repo));
     curated.extend(memory.curated_now.unwrap_or_default());
+    let mut triage = memory.triage;
+    triage.retain(|repo, _| pass.managed.contains(repo));
+    triage.extend(memory.triage_now.unwrap_or_default());
     Memory {
         curated,
         curated_now: None,
+        triage,
+        triage_now: None,
+        pre_ready_gone: memory.pre_ready_gone,
+        managed: pass.managed.clone(),
+        absent: memory.absent,
         pre_ready_done: memory.pre_ready_done,
         pre_ready_retry: memory.pre_ready_retry,
         listed,
@@ -1076,8 +1136,13 @@ fn parse_instant(raw: Option<&str>) -> Option<DateTime<Utc>> {
 }
 
 impl GhForgeReads {
+    /// The checkout to run `gh api` in. Every read names the repo in its
+    /// path, so a repo gone from the fleet (#11398) reads from any checkout.
     fn root(&self, repo: &str) -> Option<&Path> {
-        self.roots.get(repo).map(PathBuf::as_path)
+        self.roots
+            .get(repo)
+            .or_else(|| self.roots.values().next())
+            .map(PathBuf::as_path)
     }
 }
 
@@ -1133,6 +1198,9 @@ impl ForgeReads for GhForgeReads {
         })
     }
 }
+
+#[path = "outcomes_close.rs"]
+pub mod close;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
