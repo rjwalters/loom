@@ -795,25 +795,44 @@ jobs:
           if [ -f .loom/config.json ]; then
             jq -e . .loom/config.json > /dev/null
           fi
-      - name: Check optional workflow templates parse as YAML (#9078)
+      - name: Check shipped YAML templates parse and are repo-neutral (#9078/#8862)
         if: ${{ !cancelled() }}
-        # Templates under defaults/optional/github-workflows/ are not live
-        # workflows here, so GitHub never parses them; a broken one (#9078: an
-        # unindented block-scalar line) only fails in the repo that copies it.
+        # Neither tree is live here, so GitHub never parses these files; a
+        # regression only shows up in the repo that installs or copies them.
+        #   - defaults/optional/github-workflows/: opt-in workflow templates.
+        #     #9078: an unindented block-scalar line made one unparseable.
+        #   - defaults/.github/ISSUE_TEMPLATE/: installed into every consumer
+        #     repo as a plain byte copy, with no placeholder substitution.
+        #     #8862: they sent the consumer's issue filers to Loom's own
+        #     Discussions. So a Loom repo URL is wrong there, and so is a
+        #     `{{PLACEHOLDER}}`, which would be installed literally.
         # An empty glob or a missing PyYAML fails this step rather than passing.
         run: |
           python3 - <<'EOF'
           import glob, sys, yaml
-          files = sorted(glob.glob('defaults/optional/github-workflows/*.y*ml'))
-          if not files:
-              sys.exit('no templates found: the glob is stale')
+          PARSE_ONLY = 'defaults/optional/github-workflows/*.y*ml'
+          INSTALLED = 'defaults/.github/ISSUE_TEMPLATE/*.y*ml'
+          FORBIDDEN = ('github.com/rjwalters/loom', '{' * 2)
           bad = 0
-          for f in files:
-              try:
-                  yaml.safe_load(open(f))
-              except yaml.YAMLError as e:
-                  print(f'::error file={f}::{e}'.replace('\n', ' '))
-                  bad += 1
+          for pattern in (PARSE_ONLY, INSTALLED):
+              files = sorted(glob.glob(pattern))
+              if not files:
+                  sys.exit(f'no templates found for {pattern}: the glob is stale')
+              for f in files:
+                  text = open(f, encoding='utf-8').read()
+                  try:
+                      yaml.safe_load(text)
+                  except yaml.YAMLError as e:
+                      print(f'::error file={f}::{e}'.replace('\n', ' '))
+                      bad += 1
+                  if pattern != INSTALLED:
+                      continue
+                  for n, line in enumerate(text.splitlines(), 1):
+                      for needle in FORBIDDEN:
+                          if needle in line.lower():
+                              print(f'::error file={f},line={n}::installed into consumer '
+                                    f'repos verbatim, must not contain {needle!r}')
+                              bad += 1
           sys.exit(1 if bad else 0)
           EOF
 
@@ -1972,6 +1991,9 @@ jobs:
       - name: check-main-clean (#3513, #11075)
         if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-check-main-clean.sh
+      - name: check-main-clean build trees (#11149)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
+        run: bash defaults/scripts/tests/test-check-main-clean-build-trees.sh
       # #9390: provision-codex-hooks.sh verify is a stub over `loom-daemon
       # codex-hooks verify`; the suite pins this job's shared build.
       - name: provision-codex-hooks (#4495, #5005, #9390)

@@ -335,6 +335,16 @@ fn sweep_md_documents_refusal_fallback() {
     );
 }
 
+/// #9265: a base-conflict Doctor with no Judge rejection outstanding is a
+/// "rebase pass" — outside `sweep.max_doctor_cycles`, bounded by its own budget
+/// of 3, parked with its own reason. Body:
+/// [`doc_lint_support::check_rebase_pass_carve_out`].
+#[test]
+fn sweep_md_documents_rebase_pass_carve_out_and_budget() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(SWEEP_SKILL_DIR_RELATIVE);
+    doc_lint_support::check_rebase_pass_carve_out(&read_sweep_md(), &dir);
+}
+
 /// #3702: the hard invariant that Judge model resolution can never resolve to
 /// `fable`, regardless of ladder contents or any marker.
 #[test]
@@ -923,6 +933,21 @@ fn sweep_md_documents_orphan_recovery_gate_warning() {
 #[test]
 fn sweep_md_step_1b_publishes_an_in_session_lease_after_step_1a() {
     doc_lint_support::check_step_1b_lease_publish(&read_sweep_md());
+}
+
+/// #8881: Mode A/B pre-flight skips a `loom:epic` container — even a
+/// daemon-dispatched `--claim-owned` one — and releases the claim without
+/// restoring `loom:issue`. Reads `sweep-wave-lifecycle.md` ALONE: the
+/// concatenated skill already carries `loom:epic` in the `all` taxonomy, so an
+/// unscoped check would pass without the rule. Body (line-sliced, recipe
+/// executed): [`doc_lint_support::check_mode_ab_epic_preflight_skip`].
+#[test]
+fn sweep_md_mode_ab_preflight_skips_epics_without_requeueing_them() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join(SWEEP_SKILL_DIR_RELATIVE)
+        .join("sweep-wave-lifecycle.md");
+    let wave = fs::read_to_string(&path).expect("read sweep-wave-lifecycle.md");
+    doc_lint_support::check_mode_ab_epic_preflight_skip(&wave);
 }
 
 /// #6320's second point: `--no-daemon` names dispatch, not isolation. The

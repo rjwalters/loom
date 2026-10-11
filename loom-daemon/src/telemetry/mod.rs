@@ -68,7 +68,9 @@ pub mod provenance;
 pub mod queue_snapshot;
 pub mod repo_identity;
 mod start_facts;
-pub use start_facts::{model_source, SweepStartFacts, SWEEP_START_FACT_LOG_ATTRIBUTE_KEYS};
+pub use start_facts::{
+    effort_source, model_source, SweepStartFacts, SWEEP_START_FACT_LOG_ATTRIBUTE_KEYS,
+};
 pub mod trace;
 pub mod visibility;
 pub use ci::{CiDurationRecord, CiJobLogRecord, CiJobRecord, CiRunRecord};
@@ -1650,6 +1652,11 @@ pub struct HostHealthRecord {
     /// empty-is-unknown and `#[serde(default)]` contract as `exported_kinds`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exporters: Vec<String>,
+    /// Whether this daemon exports OTLP (Issue #11353):
+    /// `no_exporter` / `failing` / `ok` / `exempt` (+ detail). `None` means
+    /// "not reported" (a pre-#11353 daemon), never "ok".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub otlp_export: Option<crate::observability::otlp_health::OtlpExportHealth>,
     /// This host's memory/pressure readings at the sampling moment — the
     /// "deferred vs killed vs timed out" slice (RAM, compressed memory,
     /// swap and its rates, PSI class, kernel OOM counter) — see

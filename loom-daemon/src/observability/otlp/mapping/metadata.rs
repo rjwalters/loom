@@ -32,6 +32,7 @@ pub(super) fn start_facts(facts: &SweepStartFacts) -> Vec<KeyValue> {
     for (key, value) in [
         ("loom.model", &facts.model),
         ("loom.effort", &facts.effort),
+        ("loom.effort_source", &facts.effort_source),
         ("loom.model_source", &facts.model_source),
         ("loom.runtime", &facts.runtime),
     ] {
@@ -153,6 +154,11 @@ pub(super) fn outcome(record: &SweepOutcomeRecord) -> Vec<KeyValue> {
     let mut attrs = Vec::new();
     // Config is otherwise a free-form map (including token_account). Export
     // only known execution settings, retaining legacy config.runtime queries.
+    for key in ["effort_source", "model_source"] {
+        if let Some(value) = record.config.get(key).filter(|value| text(value)) {
+            attrs.push(kv_string(&format!("loom.{key}"), value.clone()));
+        }
+    }
     for key in ["runtime", "provider", "configured_model", "arm"] {
         if let Some(value) = record.config.get(key).filter(|value| text(value)) {
             attrs.push(kv_string(&format!("loom.config.{key}"), value.clone()));

@@ -171,6 +171,9 @@ unknowns = [
 [[operation.callers]]
 kind = "script"
 path = "defaults/scripts/check-duplicate.sh"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/cli/duplicate_closed_search.rs"
 
 # --- issue-mutation-lifecycle ------------------------------------------------
 

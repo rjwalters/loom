@@ -284,6 +284,10 @@ pub struct TickReport {
     /// (#9244) was still unused when the tick finished, or `None` when the
     /// tick did not record it (Issue #9288).
     pub overflow_free: Option<bool>,
+    /// The tick's workspace draws (#11103): seed, and each draw's candidates,
+    /// weights, roll and pick, in order. `None` when nothing was drawn (an
+    /// idle tick, and the single-workspace tick).
+    pub workspace_draw: Option<super::workspace_draw::DrawLog>,
 }
 
 impl TickReport {
@@ -335,6 +339,7 @@ impl TickReport {
             in_slice: None,
             repo_cap: None,
             overflow_free: None,
+            workspace_draw: None,
             ..self
         }
     }

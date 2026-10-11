@@ -425,7 +425,9 @@ pub fn script_runner_factory() -> RunnerFactory {
 /// the demand ledger (#9392) — the same listing, no second call. Changes debt
 /// leaves out PRs Doctor will not drain (`loom:blocked` /
 /// `loom:operator-only`, #9421); review debt is unfiltered
-/// ([`demand::count_axis_rows`]).
+/// ([`demand::count_axis_rows`]). The gate opens on
+/// [`demand::listing_has_work`], so an all-parked Doctor queue stays shut
+/// (#9435).
 #[must_use]
 pub fn forge_queue_probe() -> QueueProbe {
     Arc::new(|root, labels| {
@@ -442,7 +444,7 @@ pub fn forge_queue_probe() -> QueueProbe {
             .map_err(|e| e.to_string())?;
             demand::record_listing(demand::global(), root, label, &rows);
             crate::observability::pick_decision::record_gate_listing(root, label, &rows);
-            if !rows.is_empty() {
+            if demand::listing_has_work(label, &rows) {
                 return Ok(true);
             }
         }

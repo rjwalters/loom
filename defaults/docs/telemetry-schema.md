@@ -232,7 +232,7 @@ cycle) is added only when loom-ui's error tracking shows it is needed.
 | Record | Signal | Owner (emit site, under `loom-daemon/src/`) |
 |---|---|---|
 | [`sweep.outcome`](#sweepoutcome) | log, native + OTLP | `sweep_registry/outcome_journal.rs`, `observability/collector.rs`, `sweep_registry/prless_retry/durable.rs`, `observability/backfill.rs` |
-| [`sweep.started`](#sweepstarted) / [`sweep.phase`](#sweepphase) / [`sweep.completed`](#sweepcompleted) / [`sweep.identity`](#sweepidentity) | log, native + OTLP | `observability/collector.rs` (+ `collector/identity.rs`), `observability/queue.rs`, `observability/shutdown.rs`, `observability/backfill.rs`; `sweep.started` carries the dispatch facts (`model`, `effort`, `model_source`, `runtime`, `attempt_index`, `trigger`, `previous_sweep_id`, #11280) from `sweep_registry/start_facts.rs` |
+| [`sweep.started`](#sweepstarted) / [`sweep.phase`](#sweepphase) / [`sweep.completed`](#sweepcompleted) / [`sweep.identity`](#sweepidentity) | log, native + OTLP | `observability/collector.rs` (+ `collector/identity.rs`), `observability/queue.rs`, `observability/shutdown.rs`, `observability/backfill.rs`; `sweep.started` carries the dispatch facts (`model`, `effort`, `effort_source`, `model_source`, `runtime`, `attempt_index`, `trigger`, `previous_sweep_id`, #11280) from `sweep_registry/start_facts.rs` |
 | Phase spans (`trace.span`: `loom.phase`, `loom.role_attempt`) | span, OTLP only | `observability/lifecycle.rs` → `observability/otlp/traces.rs`; see [`tracing.md`](tracing.md#owned-lifecycle-instrumentation) |
 | [`pick.decision`](#pickdecision) | log, OTLP only | `observability/pick_decision.rs` (from `role_tick_telemetry.rs` and `work_finder/tick_summary.rs`) |
 | [`queue.snapshot`](#queuesnapshot) (whole ready queue per tick) | native only | `observability/queue_snapshot.rs` |
@@ -366,26 +366,44 @@ A sweep began work on an issue.
 }
 ```
 
-**Dispatch facts** (Issue #11280): `model`, `effort`, `model_source`,
+**Dispatch facts** (Issue #11280): `model`, `effort`, `effort_source`, `model_source`,
 `runtime`, `attempt_index`, `trigger` and `previous_sweep_id` are what the
 dispatch knew when the sweep started, under the same names `sweep.outcome`
 uses, so a reader joins the two by name. A fit or a live estimate can then
 use them at the sweep's start instead of waiting for its outcome. The same
 values ride the native envelope and the OTLP log (`loom.model`,
-`loom.effort`, `loom.model_source`, `loom.runtime`, `loom.attempt_index`,
+`loom.effort`, `loom.effort_source`, `loom.model_source`, `loom.runtime`, `loom.attempt_index`,
 `loom.trigger`, `loom.previous_sweep_id`; `SWEEP_START_FACT_LOG_ATTRIBUTE_KEYS`,
 kept by the collector's `transform/privacy` `keep_keys`, contract-tested), and
 every running row of [`fleet.state`](#fleetstate). Each is omitted when
 unknown, never guessed. They come from the dispatch itself, with no forge read.
 
-- `model` / `effort`: the model and effort level the sweep was launched with
-  (empty-means-unset, mirroring `SweepInfo`). `model` is absent when the
-  runtime picks its own (for example Codex with no configured model).
+- `model`: the **full model id** the sweep was launched with. An alias
+  (`sonnet`, `opus`, `haiku`) is resolved to its id (`claude-sonnet-5-5`, ...)
+  through the single `MODEL_ALIAS_IDS` table in
+  `sweep_registry/resolved_facts.rs`, a full id passes through, and a
+  trailing `@effort` suffix is dropped, so one model is one bucket. It is
+  never `''` and never an alias: when no id can be named (empty, or the
+  runtime picks its own, for example Codex with no configured model) it is
+  absent and `model_source=unknown` (#11370).
+- `effort`: the **resolved** effort, the level that applies, not only an
+  explicit request (#11370). Order: the dispatch's explicit effort, else the
+  `LOOM_EFFORT` the daemon's environment gives the child (applied by
+  `spawn-claude.sh`), else, for the `claude` runtime, the CLI's own session
+  default, the shipped constant `CLAUDE_DEFAULT_EFFORT` (`medium`; the daemon
+  cannot read the CLI's setting, so keep the constant in step with it). Absent
+  only when the runtime has no effort setting. Reporting does not change the
+  `--effort` the child receives.
+- `effort_source`: `explicit` when the dispatch named the effort, `default`
+  for the `LOOM_EFFORT` or runtime default. Absent exactly when `effort` is.
+  `sweep.outcome` carries the same value as `config.effort_source` and
+  `loom.effort_source`, and `config.model_source=unknown` /
+  `loom.model_source` when its `model` is absent.
   `sweep.outcome`'s `model` can later name a different model when the sweep
   mostly ran another one (#9465).
 - `model_source`: `explicit` when the dispatch request named the model,
   `default` when the daemon chose it (`autonomous.model`, an experiment arm,
-  the runtime default) or the runtime does. A watchdog or reaper re-dispatch
+  the runtime default), `unknown` when no id can be named (`model` absent). A watchdog or reaper re-dispatch
   passes the previous sweep's model on, so it reads `explicit`.
 - `attempt_index` / `trigger` / `previous_sweep_id`: the
   [attempt lineage](#sweepoutcome) `sweep.outcome` reports, derived the same
@@ -2321,11 +2339,29 @@ nanoseconds). `forge_transition_at` is the forge's own instant: the new review
 label's `labeled` event (one paginated issue-events read per actual move,
 with no per-pass limit, every page of the history, and only when it falls
 inside the pass window), or the PR's
-`merged_at` / `closed_at`. Every part is the same on every host, whatever its
-polling time. **A transition with no forge instant** (a sweep stage, a ready
-row, a failed read) **is emitted without
-`loom.fact_id`**; readers dedupe it by `(repo, issue, next_stage)` within a
-short window (see [`telemetry-replay.md`](telemetry-replay.md)).
+`merged_at` / `closed_at`, or for a hold release (`merge_hold` →
+`merge_wait`) the hold label's `unlabeled` event (#11401). Every part is the
+same on every host, whatever its polling time.
+
+**A transition with no forge instant (#11401)** keys on, first match:
+
+1. the holding sweep: `derived_hex(["loom.fact", "eta.stage_outcome", repo,
+   issue, stage, next_stage, "sweep", sweep_id, entered_at], 16)`, where
+   `entered_at` is the sweep checkpoint's (empty otherwise). A row of this
+   host's sweep (`sweep.curator`, `sweep.builder`, and `review_wait` /
+   `doctor` / `merge_wait` while the sweep holds the item) carries the
+   additive body field `sweep_id`; only that host emits it.
+2. the forge-dated entry (`entered_at_source = forge`):
+   `derived_hex(["loom.fact", "eta.stage_outcome", repo, issue, stage,
+   next_stage, "entry", entered_at], 16)`.
+
+With neither, the record has **no `loom.fact_id` and carries
+`loom.fact_id_missing_reason`** instead: `forge_read_failed` (a history or
+`pulls/{n}` read this pass needed failed) or `no_forge_instant`. Every record
+carries exactly one of the two, and `host.export` counts the second kind
+(`fact_id_missing_total`). Ids keyed on a forge instant are unchanged by
+#11401. The body field `fact_id_missing_reason` is the producer's view of why
+no forge instant dates the exit, present even when a fallback key applies.
 
 The log record's **time is `left_at`** and its **observed timestamp is
 `observed_at`**. The body is the record's JSON. The scalars ride as
@@ -2351,7 +2387,7 @@ pass interval. `forge_transition_at` is new (additive).
 | `repo` | string | `owner/repo` (lowercased) |
 | `issue` | integer | the issue |
 | `pr_number` | integer? | the PR, when known |
-| `stage` | string | the stage left: `ready_wait`, `sweep.curator`, `sweep.builder`, `review_wait`, `doctor`, `merge_wait`, `merge_hold` |
+| `stage` | string | the stage left: `triage_wait`, `approval_wait` (#11368, never a `fleet.state` row), `ready_wait`, `sweep.curator`, `sweep.builder`, `review_wait`, `doctor`, `merge_wait`, `merge_hold` |
 | `entered_at` | RFC3339? | present only when the entry has an exact source: a sweep's own checkpoint timestamp. Absent for a polled (review or ready) row, whose entry fell between two passes, and for a stage first seen mid-way |
 | `left_at` | RFC3339 | the event time: `forge_transition_at` when known, else the observing pass |
 | `dwell_sec` | integer? | `left_at − entered_at`, only when the stage completed with an exact entry; never a lower bound |
@@ -2553,19 +2589,24 @@ Each row:
 | `issue` | integer | issue number |
 | `stage` | string | `ready_wait`, `sweep.curator`, `sweep.builder`, `review_wait`, `doctor`, `merge_wait`, `merge_hold` |
 | `entered_at` | RFC 3339 | when the item entered `stage` |
-| `entered_at_lower_bound` | bool, optional | present (`true`) when `entered_at` is only a lower bound, for example when the item was first seen mid-stage after a restart |
+| `entered_at_lower_bound` | bool, optional | present (`true`) when `entered_at` is only a lower bound. Since #11391 a lower-bound row of a stage a label enters (`ready_wait`, `review_wait`, `doctor`, `merge_wait`, `merge_hold`) is dated by that label's `labeled` event in the item's forge history (the same read `eta.stage_outcome` uses, #11367) and is exact; only a row the forge cannot date (a sweep's `sweep.curator` / `sweep.builder` stage, a history with no such event, a failed or not-yet-read history) keeps the bound. At most 100 new histories are read per pass, so after a restart the rest follow over the next passes |
 | `pr` | integer, optional | the PR, when known |
 | `host` | string, optional | the host whose sweep holds the item. Present **only** when the emitting host runs it; absent rather than guessed otherwise |
 | `slot` | `regular` / `overflow`, optional | the dispatch slot that sweep holds (`overflow` = the host's single `loom:operator-priority` overflow slot, #9244). Present exactly when `host` is |
-| `model`, `effort`, `model_source`, `runtime`, `attempt_index`, `trigger`, `previous_sweep_id` | optional | a row of a sweep this host runs (`sweep.curator`, `sweep.builder`, `review_wait`, `doctor`, `merge_wait`): the [dispatch facts](#sweepstarted) its `sweep.started` carried, with the same values (#11280). Absent for a sweep this daemon did not dispatch (adopted after a restart), and each one absent when unknown. Additive on `fleet-state/v1` |
+| `sweep_id` | string, optional | the id of this host's sweep that holds the item, the `loom.fact_id` key of the row's `eta.stage_outcome` when no forge instant dates the exit (#11401). Present exactly when `host` is. Additive on `fleet-state/v1` |
+| `model`, `effort`, `effort_source`, `model_source`, `runtime`, `attempt_index`, `trigger`, `previous_sweep_id` | optional | a row of a sweep this host runs (`sweep.curator`, `sweep.builder`, `review_wait`, `doctor`, `merge_wait`): the [dispatch facts](#sweepstarted) its `sweep.started` carried, with the same values (#11280). Absent for a sweep this daemon did not dispatch (adopted after a restart), and each one absent when unknown. Additive on `fleet-state/v1` |
 | `rank` | integer, optional | `ready_wait` only: this host's planner rank (1-based position in its dispatch order on the last work-finder tick). Per host: two hosts' ranks for one issue are two true answers |
-| `star` | bool, optional | `ready_wait` only: starred at any level (absent = `false`) |
+| `star` | bool, optional | starred at any level (absent = `false`). Every row since #11391: a PR row reads the PR's `loom:operator-priority` / level labels, and a row keeps the star an earlier row of the item carried (a `ready_wait` row is rebuilt from the tick, so an un-star shows there) |
 | `star_at` | RFC 3339, optional | `ready_wait` only: when it was starred, when known |
-| `level` | integer, optional | `ready_wait` only: effective operator priority level (absent = `0`) |
+| `level` | integer, optional | effective operator priority level (absent = `0`); on every row, like `star` (#11391) |
 | `fleet_priority` | integer, optional | `ready_wait` only: the repo's fleet (workspace) priority tier; lower dispatches first |
 | `created_at` | RFC 3339, optional | `ready_wait` only: the issue's creation instant, the planner's age input (age = `as_of - created_at`; the instant is sent so an unchanged row stays unchanged) |
 | `main_red_fix` | bool, optional | `ready_wait` only: a red-main fix the planner boosted this tick (absent = `false`) |
 | `hold_kind` | string, optional | the item is under a hold now: one of `operator`, `operator_only`, `operator_decision`, `merge_risk`, `critical_file`, `ac_hold`, `blocked`, `other` (the long-standing snake_case hold names). Derived from the PR's labels; the emitter does not read Champion's comments, so it reports `operator` where Champion applied `merge_risk` / `critical_file` / `ac_hold` and leaves that split to the reader. Additive on `fleet-state/v1`; absent = not held (or an older emitter) |
+| `holds` | array of string, optional | every hold the PR's labels name now (#11391), strongest first: `operator_decision`, `operator_only`, `operator`, `blocked`, `sequenced`, `other`. `hold_kind` is the winning one; a row with two holds no longer loses one. Absent = none. Additive on `fleet-state/v1` |
+| `rework` | integer, optional | Judge rejections the item's PR has taken (#11391): each arrival of `loom:changes-requested` in the PR's label history, except a repeat with no `loom:review-requested` / `loom:pr` arrival between (a relabel inside one attempt). Counted once per PR from the history, then +1 each time the row enters `doctor`. It does not read comments, so a daemon base-conflict flag that `sweep.outcome` excludes can count here. Absent = `0` or not read. Additive on `fleet-state/v1` |
+| `conflict` | bool, optional | the PR carries `loom:merge-conflict` (#11391; from the review listing, no extra read). Absent = `false` |
+| `ci_fail` | bool, optional | the PR carries `loom:ci-failure` (#11391; same listing). Absent = `false` |
 | `held_since` | RFC 3339, optional | when the current hold began. Present exactly when `hold_kind` is |
 | `held_since_lower_bound` | bool, optional | present (`true`) when `held_since` is the first pass that saw the hold, not an observed transition |
 | `hold_released_at` | RFC 3339, optional | the hold cleared: the pass that first saw it clear. The clearing delta carries it with `hold_kind` / `held_since` absent, and it is kept while the row is otherwise unchanged. A held item that merges or closes gets none: its removal is the end |
@@ -2990,9 +3031,11 @@ elected, there are no caps, and no rate or estimate is computed in the daemon.
 | `exporters[].queue_depth` | integer | envelopes queued, waiting for a flush |
 | `exporters[].dropped_total` | integer | envelopes dropped (oldest first) at a full queue |
 | `exporters[].last_flush_ok_at` | RFC3339? | last acked batch; omitted when none this process (unknown, not a fabricated time) |
+| `fact_id_missing_total` | integer | `eta.stage_outcome` exits this process emitted without a `loom.fact_id` (each carried `loom.fact_id_missing_reason`, #11401); cumulative per process lifetime like `dropped_total`; `0` on records from before #11401 |
 
 Attributes: `loom.host_export.exporters` (count), `.queue_depth` (sum),
-`.dropped_total` (sum), `.last_flush_ok_at` (latest).
+`.dropped_total` (sum), `.last_flush_ok_at` (latest),
+`.fact_id_missing_total`.
 
 **`dropped_total` is cumulative per process lifetime.** It restarts at 0 when
 the daemon restarts, so a reader computing "drops in a window" must treat a

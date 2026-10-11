@@ -31,6 +31,9 @@ mod rate_limit_report;
 mod rate_limit_report_tests;
 /// The dispatch path's memo gating (resume reads live) and refusal ledger (W9).
 pub(crate) mod refusal_memo;
+/// #9247: the claim flip's one re-mint-and-retry.
+#[cfg(test)]
+mod stale_token_tests;
 
 /// Three-state result of the open-linked-PR probe (Issue #4452).
 ///
@@ -1250,7 +1253,16 @@ impl SweepRegistry {
         resolved
     }
 
+    /// The claim flip, re-run once after a forced per-owner re-mint when it is
+    /// refused as not accessible by the integration (#9247).
     pub(crate) fn flip_label_to_building(&self, issue: u32) -> Result<()> {
+        let root = &self.config.workspace_root;
+        crate::stale_token_retry::run("guard.flip_building", root, || {
+            self.flip_building_once(issue)
+        })
+    }
+
+    fn flip_building_once(&self, issue: u32) -> Result<()> {
         let gh = self.resolved_gh();
         let mut cmd = self.gh_inv("guard.flip_building", AccessIntent::Write, &gh);
         cmd = cmd

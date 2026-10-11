@@ -50,13 +50,24 @@ impl SweepRegistry {
             return;
         };
         let (kind, model, effort) = (info.kind.clone(), info.model.clone(), info.effort.clone());
+        let launch_runtime = info.runtime.clone();
         let runtime = admission.admitted.as_ref().map(|a| a.runtime.clone());
         let start = match (&kind, model_source) {
             (SweepKind::Issue(issue), Some(source)) => {
                 let lineage = self.attempt_lineage(*issue, sweep_id);
+                // #11370: report the resolved facts, not the literal launch
+                // arguments (those stay on `SweepInfo` and the child's argv).
+                let model = model.as_deref().and_then(normalize_model_id);
+                let source = if model.is_some() {
+                    source
+                } else {
+                    crate::telemetry::model_source::UNKNOWN
+                };
+                let resolved = resolve_effort_from_env(effort.as_deref(), Some(&launch_runtime));
                 let facts = SweepStartFacts {
                     model,
-                    effort,
+                    effort: resolved.as_ref().map(|r| r.0.clone()),
+                    effort_source: resolved.map(|r| r.1.to_string()),
                     model_source: Some(source.to_string()),
                     runtime: runtime.clone(),
                     attempt_index: lineage.as_ref().map(|l| l.0),

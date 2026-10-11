@@ -209,6 +209,7 @@ fn cand(number: u32, operator_priority: bool, main_red_fix: bool) -> PriorityCan
         main_red_fix,
         created_at: None,
         number,
+        level: crate::priority_pick::Level::default(),
         complexity: None,
     }
 }

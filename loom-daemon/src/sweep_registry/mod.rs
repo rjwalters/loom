@@ -124,6 +124,7 @@ mod model;
 mod noop_cooldown;
 mod outcome_journal;
 mod overflow;
+mod resolved_facts;
 // `pub`: the daemon-hold record contract (`is_daemon_hold`, #10161) is read
 // by the stale-blocked readers (#10556, #10558).
 pub mod park_hold;
@@ -180,6 +181,8 @@ pub use quarantine::*;
 pub use quarantine_escalation::*;
 #[allow(unused_imports)]
 pub use reaper::*;
+#[allow(unused_imports)]
+pub use resolved_facts::*;
 #[allow(unused_imports)]
 pub use stacking::*;
 #[allow(unused_imports)]

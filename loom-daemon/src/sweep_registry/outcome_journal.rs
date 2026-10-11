@@ -465,9 +465,17 @@ impl SweepRegistry {
         exit_code: Option<i32>,
     ) {
         let info = self.entries.get(sweep_id);
-        let model = info.and_then(|i| i.model.clone());
-        let effort = info.and_then(|i| i.effort.clone());
         let runtime = info.map(|i| i.runtime.clone());
+        // Issue #11370: the resolved facts `sweep.started` reported, not the
+        // literal launch arguments: a full model id (absent, with
+        // `model_source=unknown`, when none can be named) and the effort that
+        // applied with where it came from. Only an entry we hold has either.
+        let model = info
+            .and_then(|i| i.model.as_deref())
+            .and_then(normalize_model_id);
+        let resolved_effort = info
+            .and_then(|i| resolve_effort_from_env(i.effort.as_deref(), Some(i.runtime.as_str())));
+        let effort = resolved_effort.as_ref().map(|r| r.0.clone());
         // Issue #8056: survives both a missing entry and an entry whose
         // dispatch-time account capture timed out — see `resolve_token_account`.
         let token_name = self.resolve_token_account(sweep_id, issue);
@@ -486,6 +494,15 @@ impl SweepRegistry {
             config.insert("runtime".to_string(), runtime);
         }
         config.insert("token_account".to_string(), token_name);
+        if let Some((_, source)) = &resolved_effort {
+            config.insert("effort_source".to_string(), (*source).to_string());
+        }
+        if info.is_some() && model.is_none() {
+            config.insert(
+                "model_source".to_string(),
+                crate::telemetry::model_source::UNKNOWN.to_string(),
+            );
+        }
         // Issue #8447: the API-key pool's attribution beside the OAuth pool's,
         // in the same free-form map (additive per #4703 — no schema bump).
         // Names only, never key material. Keys are omitted rather than set to
@@ -1062,6 +1079,8 @@ impl SweepRegistry {
             ("loom.failure_class", outcome_record.failure_class.as_ref()),
             ("loom.configured_model", outcome_record.model.as_ref()),
             ("loom.effort", outcome_record.effort.as_ref()),
+            ("loom.effort_source", outcome_record.config.get("effort_source")),
+            ("loom.model_source", outcome_record.config.get("model_source")),
             ("loom.runtime", outcome_record.config.get("runtime")),
             ("loom.provider", outcome_record.config.get("provider")),
         ] {

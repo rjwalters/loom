@@ -150,6 +150,7 @@ pub mod cmd_out;
 pub mod codex_sandbox_noop;
 pub mod codex_usage;
 pub mod comment_trust;
+pub mod config_journal;
 pub mod config_resolver;
 pub mod cpu_headroom;
 pub mod credential_preflight;
@@ -251,6 +252,7 @@ pub mod ipc;
 pub mod issue_creation_mutex;
 pub mod jev_merge_risk;
 pub mod jev_tier;
+pub mod journal;
 pub mod kimi_usage;
 pub mod label_registry;
 pub mod launch_env;
@@ -351,8 +353,10 @@ pub mod shell_budget;
 pub mod short_hash;
 pub mod signoz_read;
 pub mod stale_blocked;
+pub(crate) mod stale_token_retry;
 pub mod star_liveness;
 pub mod startup_adoption;
+pub mod stash_issue_state;
 pub mod stash_retirement;
 /// Root-count-aware cost model for `build_daemon_status` and the `status`/
 /// `health` IPC probes that wait on it (#8163). A sibling module rather than

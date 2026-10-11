@@ -1577,6 +1577,11 @@ pub fn build_daemon_status_for(
         // a daemon with observability off — the singular field above already
         // distinguishes that state.
         observability_exports: crate::observability::global_export_statuses(),
+        // OTLP-export health (#11353): evaluated from config + live exporter
+        // status, so a daemon with no exporter at all still answers.
+        otlp_export: Some(crate::observability::otlp_health::check_global(
+            &crate::observability::read_config(workspace_root),
+        )),
         // Forge event-feed consumer (ADR-0021, #8765) — same process-global
         // snapshot pattern. Always `Some` from a daemon of this vintage: a
         // consumer that never started reports `disabled`, so "is my cursor

@@ -220,10 +220,14 @@ fn a_repo_with_more_than_a_page_of_ready_issues_yields_every_one() {
     assert_eq!(numbers, (1..=250).rev().collect::<Vec<_>>(), "listing order kept");
     assert!(src.listing_complete());
     assert_eq!(planner_order(&items), (1..=250).collect::<Vec<_>>());
-    // Single-workspace order: unstarred work keeps its listing order.
+    // Single-workspace order (#11103): level, oldest, number — the oldest
+    // first here too, whatever the listing order.
     let mut lanes = items.clone();
     super::super::ready_queue::sort_lanes(&mut lanes, false);
-    assert_eq!(lanes.iter().map(|i| i.number).collect::<Vec<_>>(), numbers);
+    assert_eq!(
+        lanes.iter().map(|i| i.number).collect::<Vec<_>>(),
+        (1..=250).collect::<Vec<_>>()
+    );
     // Three pages, then the conditional re-reads of pages 1 and 2.
     assert_eq!(ready_requests(dir.path()), 5);
 }

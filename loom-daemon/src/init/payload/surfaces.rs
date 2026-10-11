@@ -119,6 +119,12 @@ pub(crate) const INSTALL_TIME_ONLY: &[(&str, &str)] = &[
          that renames or retires a config key must keep reading the old one",
     ),
     (
+        ".loom/config/",
+        "consumer-editable configuration (skill-routes.json): the installer copies each file \
+         only when it is absent (#9129), so a resync never overwrites an edit or re-creates a \
+         deleted file, which is the documented way to switch the skill router off",
+    ),
+    (
         "package.json",
         "the loom-workspace stub's `version` removal is a one-time migration (#4285)",
     ),

@@ -61,6 +61,8 @@ use crate::telemetry::kinds::fleet_state::{
 };
 use crate::telemetry::{RepoVisibility, SweepStartFacts, TelemetryEnvelope, TelemetryRecord};
 
+pub mod enrich;
+pub mod history;
 pub mod outcomes;
 mod sources;
 
@@ -96,6 +98,68 @@ pub fn hold_kind(labels: &[String]) -> Option<FleetHoldKind> {
     }
 }
 
+/// Every hold the labels in `labels` name, strongest first (#11391): the
+/// names `hold_kind` uses, plus `sequenced`. `other` is a merge-hold label
+/// that none of the named holds covers. Pure.
+#[must_use]
+pub fn hold_names(labels: &[String]) -> Vec<String> {
+    let has = |label: &str| labels.iter().any(|l| l == label);
+    let named: [(&[&str], &str); 5] = [
+        (&["loom:operator-decision"], "operator_decision"),
+        (&["loom:operator-only", "loom:operator-mechanical"], "operator_only"),
+        (&["loom:operator"], "operator"),
+        (&["loom:blocked"], "blocked"),
+        (&["loom:sequenced"], "sequenced"),
+    ];
+    let mut holds: Vec<String> = Vec::new();
+    let mut covered: Vec<&str> = Vec::new();
+    for (names, hold) in named {
+        covered.extend(names);
+        if names.iter().any(|l| has(l)) {
+            holds.push(hold.to_string());
+        }
+    }
+    if MERGE_HOLD_LABELS
+        .iter()
+        .any(|l| has(l) && !covered.contains(l))
+    {
+        holds.push("other".to_string());
+    }
+    holds
+}
+
+/// What one listed PR's labels say about the row of the issue it links.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct PrFacts {
+    hold_kind: Option<FleetHoldKind>,
+    holds: Vec<String>,
+    conflict: bool,
+    ci_fail: bool,
+    level: u8,
+}
+
+impl PrFacts {
+    fn from_labels(labels: &[String]) -> Self {
+        let has = |label: &str| labels.iter().any(|l| l == label);
+        PrFacts {
+            hold_kind: hold_kind(labels),
+            holds: hold_names(labels),
+            conflict: has("loom:merge-conflict"),
+            ci_fail: has("loom:ci-failure"),
+            level: crate::operator_levels::level(labels),
+        }
+    }
+
+    fn apply(&self, row: &mut FleetStateRow) {
+        row.hold_kind = self.hold_kind;
+        row.holds.clone_from(&self.holds);
+        row.conflict = self.conflict;
+        row.ci_fail = self.ci_fail;
+        row.level = row.level.max(self.level);
+        row.star |= self.level >= 1;
+    }
+}
+
 /// Where a row came from, in ascending precedence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Source {
@@ -121,6 +185,8 @@ pub struct HeldSweep {
     pub overflow: bool,
     /// The sweep's dispatch-time facts (#11280), when this daemon has them.
     pub start: SweepStartFacts,
+    /// The sweep's id (#11401), keying its stages' `loom.fact_id`.
+    pub sweep_id: Option<String>,
 }
 
 /// One open item from a repo's review listings.
@@ -329,6 +395,7 @@ pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Ut
                 FleetSlot::Regular
             }),
             start: sweep.start.clone(),
+            sweep_id: sweep.sweep_id.clone(),
             ..FleetStateRow::new(sweep.issue, sweep.stage, sweep.entered_at)
         };
         offer(&mut candidates, &sweep.repo, Source::Held, row);
@@ -336,9 +403,9 @@ pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Ut
 
     let mut observed: BTreeMap<Source, BTreeSet<String>> = BTreeMap::new();
     let mut census: BTreeMap<String, FleetPrCensus> = BTreeMap::new();
-    // Label-derived hold kind of every listed PR that names an issue, so a
+    // Label-derived facts of every listed PR that names an issue, so a
     // sweep-owned row (which wins on precedence) can still carry the hold.
-    let mut pr_holds: BTreeMap<(String, u32), Option<FleetHoldKind>> = BTreeMap::new();
+    let mut pr_facts: BTreeMap<(String, u32), PrFacts> = BTreeMap::new();
     for listing in &input.listings {
         observed
             .entry(Source::Review)
@@ -355,17 +422,21 @@ pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Ut
                 .entry(stage.map_or("held", FleetStage::as_str).to_string())
                 .or_default() += 1;
             if let Some(issue) = pr.issue {
-                let slot = pr_holds
+                // The first PR naming the issue that holds wins, as before.
+                let facts = PrFacts::from_labels(&pr.labels);
+                let slot = pr_facts
                     .entry((listing.repo.clone(), issue))
-                    .or_insert(None);
-                *slot = slot.or_else(|| hold_kind(&pr.labels));
+                    .or_insert_with(|| facts.clone());
+                if slot.hold_kind.is_none() && facts.hold_kind.is_some() {
+                    *slot = facts;
+                }
             }
             if let (Some(stage), Some(issue)) = (stage, pr.issue) {
-                let row = FleetStateRow {
+                let mut row = FleetStateRow {
                     pr: Some(pr.number),
-                    hold_kind: hold_kind(&pr.labels),
                     ..FleetStateRow::new(issue, stage, now)
                 };
+                PrFacts::from_labels(&pr.labels).apply(&mut row);
                 offer(&mut candidates, &listing.repo, Source::Review, row);
             }
         }
@@ -441,11 +512,35 @@ pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Ut
             .get(&Source::Review)
             .is_some_and(|set| set.contains(&repo));
         if source == Source::Held {
-            row.hold_kind = if review_read {
-                pr_holds.get(&(repo.clone(), issue)).copied().flatten()
-            } else {
-                was.and_then(|w| w.hold_kind)
-            };
+            if review_read {
+                pr_facts
+                    .get(&(repo.clone(), issue))
+                    .cloned()
+                    .unwrap_or_default()
+                    .apply(&mut row);
+            } else if let Some(was) = was {
+                row.hold_kind = was.hold_kind;
+                row.holds.clone_from(&was.holds);
+                row.conflict = was.conflict;
+                row.ci_fail = was.ci_fail;
+            }
+        }
+        // Facts a row carries from the item's earlier rows (#11391): the
+        // star and level an earlier (ready) row read, and the Judge
+        // rejections counted so far, one more when it just entered `doctor`.
+        if let Some(was) = was {
+            // A ready row is rebuilt from the tick, so an un-star shows.
+            if source != Source::Ready {
+                row.star |= was.star;
+                row.level = row.level.max(was.level);
+                if row.star_at.is_none() {
+                    row.star_at = was.star_at;
+                }
+            }
+            row.rework = row.rework.max(was.rework);
+            if row.stage == FleetStage::Doctor && was.stage != FleetStage::Doctor {
+                row.rework += 1;
+            }
         }
         let hold_source = if source == Source::Held {
             Source::Review
@@ -693,71 +788,94 @@ struct PassState {
     prev: Option<FleetView>,
     emitted: Option<Emitted>,
     outcomes: outcomes::Memory,
+    enrich: enrich::EnrichMemory,
 }
 
 static STATE: Mutex<PassState> = Mutex::new(PassState {
     prev: None,
     emitted: None,
+    enrich: enrich::EnrichMemory::new(),
     outcomes: outcomes::Memory {
         listed: BTreeMap::new(),
         unread: BTreeMap::new(),
         settled: BTreeSet::new(),
+        pending_ready: BTreeMap::new(),
+        curated: BTreeMap::new(),
+        curated_now: None,
+        pre_ready_done: BTreeSet::new(),
+        pre_ready_retry: BTreeSet::new(),
+        warm: BTreeMap::new(),
         view: None,
         at: None,
     },
 });
 
-/// Emit this pass's outcome facts and remember the pass for the next diff.
-/// The forge reads run off the event loop.
+/// Date `view`'s rows from the forge (#11391), emit this pass's outcome
+/// facts and remember the pass for the next diff, and return the enriched
+/// view. The forge reads run off the event loop; `view` comes back as given
+/// when they fail.
 async fn record_outcomes(
     sink: &FleetStateSink,
     input: &FleetInput,
-    view: &FleetView,
+    curated: outcomes::Curated,
+    view: FleetView,
     now: DateTime<Utc>,
     workspace_pool: &crate::workspace_pool::WorkspacePool,
     slug_cache: &mut std::collections::HashMap<String, String>,
-) {
-    let mut memory = STATE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .outcomes
-        .clone();
+) -> FleetView {
+    let (mut memory, mut enrich_memory) = {
+        let state = STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (state.outcomes.clone(), state.enrich.clone())
+    };
+    memory.curated_now = Some(curated);
     let roots = sources::managed_roots(workspace_pool, slug_cache)
         .await
         .into_iter()
         .map(|(root, slug)| (slug, root))
         .collect();
     let listed = outcomes::listed(&input.listings);
-    let (view, managed) = (view.clone(), input.managed.clone());
+    let managed = input.managed.clone();
+    let original = view.clone();
     let joined = tokio::task::spawn_blocking(move || {
+        let mut view = view;
+        let mut forge = outcomes::GhForgeReads { roots };
+        let mut histories = enrich::Histories::new();
+        enrich::enrich(&mut view, &mut enrich_memory, &mut forge, &mut histories, now);
+        memory.warm = histories;
         let pass = outcomes::Pass {
             view: &view,
             listed: &listed,
             managed: &managed,
             now,
         };
-        let mut forge = outcomes::GhForgeReads { roots };
         let records = outcomes::diff(
             &mut memory,
             &pass,
             &mut forge,
             &crate::telemetry::provenance::Provenance::current(),
         );
-        (records, outcomes::remember(memory, &pass))
+        let memory = outcomes::remember(memory, &pass);
+        (records, memory, enrich_memory, view)
     })
     .await;
-    let (records, memory) = match joined {
+    let (records, memory, enrich_memory, view) = match joined {
         Ok(done) => done,
         Err(join_error) => {
             log::warn!("fleet.state: outcome diff panicked: {join_error}");
-            return;
+            return original;
         }
     };
-    STATE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .outcomes = memory;
+    {
+        let mut state = STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.outcomes = memory;
+        state.enrich = enrich_memory;
+    }
     outcomes::offer(records, sink);
+    view
 }
 
 /// Held for a whole pass, so a tick pass and a collector pass never diff
@@ -804,14 +922,14 @@ pub(super) async fn record(
     };
     let _pass = pass_lock().lock().await;
     let now = Utc::now();
-    let (input, mut reused) =
+    let (input, mut reused, curated) =
         sources::gather(workspace_root, workspace_pool, slug_cache, &sink.host_id, now).await;
     let state = STATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
     let view = build_view(&input, state.prev.as_ref(), now);
-    record_outcomes(sink, &input, &view, now, workspace_pool, slug_cache).await;
+    let view = record_outcomes(sink, &input, curated, view, now, workspace_pool, slug_cache).await;
     for repo in view.repos.keys().chain(&input.managed) {
         if !reused.visibility.contains_key(repo) {
             let visibility = super::collector::resolve_visibility(repo).await;

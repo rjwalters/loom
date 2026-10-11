@@ -57,6 +57,13 @@ pub static CHAMPION_PATH_LABELS: crate::label_registry::LabelSet =
 pub const STARRED_AT_RETRY: Duration = Duration::from_secs(600);
 
 impl WorkItem {
+    /// Whether the issue carries `loom:very-important` (#11103): the new top
+    /// level, which shares the star's overflow slot and build back-off bypass.
+    #[must_use]
+    pub fn is_very_important(&self) -> bool {
+        crate::priority_pick::Level::of(&self.labels) == crate::priority_pick::Level::VeryImportant
+    }
+
     /// True when the issue is starred at any level (#9244, #10307): it
     /// carries a level label ([`crate::operator_levels`], own or inherited),
     /// or blocks a starred issue and inherits its star (#9244 C). Dispatch
