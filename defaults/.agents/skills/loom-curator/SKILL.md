@@ -750,7 +750,7 @@ them into the one you are curating. Never absorb a sibling that has:
 > - **`10`** (an `unknown` path: on neither): a typo, or a file the issue creates that you did not mark. If you can tell which, fix the section (correct the path, or mark it new) and re-run (two fixes at most). Still `10`, or you cannot tell: name the paths in your curator comment, ask which it is, and continue curating. **Never `loom:blocked`**, with one exception: a path an open issue/PR is to create is a dependency, parked with `park-record apply --blocked-by <that number>` (`.loom/docs/park-record.md`).
 > - **anything else** (`3`; `2`/`127` from a daemon without this verb): the check did not run. Say so in your curator comment and continue: never park on it, never report it as passed.
 >
-> **Mark a file the issue creates** with `(new)` after its path, or list it under a `### New files` sub-heading; unmarked, it reads as `unknown`. Mark only what this issue creates: a path that is in your working tree but not pushed stays unmarked (`11`).
+> **Mark a file the issue creates** with `(new)` after its path, or list it under a `### New files` sub-heading; unmarked, it reads as `unknown`.
 
 ### Date-stamp volatile facts
 

@@ -9,10 +9,14 @@
 //!
 //! | Class | Condition | Verdict |
 //! |---|---|---|
-//! | `present` | on the base tree (also when reached through a symlink, or a bare file name matching a base file) | clear |
-//! | `new` | absent from the base, marked new | clear |
+//! | `present` | on the base tree (also when reached through a symlink), or a bare file name matching a base file that is not in the working tree | clear |
+//! | `uncommitted` | absent from the base, present in the working tree (a new marker does not matter) | park |
+//! | `new` | absent from the base and the working tree, marked new | clear |
 //! | `unknown` | absent from the base and the working tree, unmarked | ask, do not park |
-//! | `uncommitted` | absent from the base, present in the working tree, unmarked | park |
+//!
+//! A path in the working tree but not on the base is `uncommitted` whatever
+//! its line says: a Builder that creates it in a fresh worktree would collide
+//! with the Curator's untracked copy on `git pull`.
 //!
 //! # Marker grammar (defined here and nowhere else)
 //!
@@ -54,12 +58,13 @@ pub const EXIT_UNCOMMITTED: i32 = 11;
 pub enum PathClass {
     /// On the base tree.
     Present,
-    /// Absent from the base and marked as created by the issue.
+    /// Absent from the base and the working tree, marked as created by the
+    /// issue.
     New,
     /// Absent from the base and the working tree, unmarked: a file the issue
     /// creates without saying so, or a typo.
     Unknown,
-    /// Absent from the base, present in the working tree, unmarked.
+    /// Absent from the base, present in the working tree.
     Uncommitted,
 }
 
@@ -125,9 +130,16 @@ fn has_new_marker(line: &str) -> bool {
         .any(|m| prose.contains(m))
 }
 
-/// `path` normalised for lookup, or `None` when it cannot name one concrete
-/// repo-relative file: a glob or placeholder, a URL, an `owner/repo#N`
-/// reference, a command-line flag, or a path outside the repo.
+/// Whether `path` carries glob or placeholder characters. Such a span is
+/// usually a pattern, but `app/[id]/page.tsx` and `routes/$id.tsx` are real
+/// file names, so [`check`] keeps it only when it exists literally.
+fn glob_shaped(path: &str) -> bool {
+    path.contains(['*', '?', '<', '>', '{', '}', '[', ']', '$', '#', '…'])
+}
+
+/// `path` normalised for lookup, or `None` when it cannot name a repo-relative
+/// file: a URL, a command-line flag, or a path outside the repo. Glob-shaped
+/// spans are kept here; see [`glob_shaped`].
 fn concrete(path: &str) -> Option<String> {
     // `as_path` drops a `:42` suffix; a `:40-60` line range is cited as often.
     let p = match path.rsplit_once(':') {
@@ -145,12 +157,11 @@ fn concrete(path: &str) -> Option<String> {
     let skip = p.is_empty()
         || p.starts_with(['/', '~', '-'])
         || p.contains("://")
-        || p.contains(['*', '?', '<', '>', '{', '}', '[', ']', '$', '#', '…'])
         || p.split('/').any(|seg| seg == ".." || seg == "...");
     (!skip).then(|| p.to_string())
 }
 
-/// Every concrete path listed under an `Affected Files` heading, mapped to
+/// Every path listed under an `Affected Files` heading, mapped to
 /// whether it is marked new. Empty when the section is absent or names no
 /// path ("To be determined").
 #[must_use]
@@ -180,21 +191,26 @@ pub fn listed_paths(body: &str) -> BTreeMap<String, bool> {
     listed
 }
 
-/// Classify `listed` given the two facts the check needs about a path.
+/// Classify `listed` given the facts the check needs about a path: whether it
+/// is on the base, whether it is in the working tree, and whether it is a bare
+/// name matching a base file (`by_name`, only ever `unknown` to `present`).
 pub fn classify(
     listed: &BTreeMap<String, bool>,
     on_base: impl Fn(&str) -> bool,
     in_tree: impl Fn(&str) -> bool,
+    by_name: impl Fn(&str) -> bool,
 ) -> Report {
     let entries = listed
         .iter()
         .map(|(path, marked_new)| {
             let class = if on_base(path) {
                 PathClass::Present
-            } else if *marked_new {
-                PathClass::New
             } else if in_tree(path) {
                 PathClass::Uncommitted
+            } else if *marked_new {
+                PathClass::New
+            } else if by_name(path) {
+                PathClass::Present
             } else {
                 PathClass::Unknown
             };
@@ -268,16 +284,20 @@ pub fn check(body: &str, workspace: &Path, base: &str) -> Result<Report, String>
             .unwrap_or(false)
     };
 
+    let on_base = |path: &str| tree.contains(path) || resolved_on_base(path);
+    let in_tree = |path: &str| root.join(path).symlink_metadata().is_ok();
     // A slash-less span is as often shorthand for a file named in full
     // elsewhere ("lower the `curator.md` entry") as a root-level file, so one
-    // that matches the basename of a base file is that file, not a miss.
+    // that matches the basename of a base file is that file, not a miss. It
+    // is consulted only after the working tree, so it cannot hide a root file
+    // that exists nowhere but there.
     let mentions_base_file = |path: &str| !path.contains('/') && basenames.contains(path);
 
-    Ok(classify(
-        &listed_paths(body),
-        |path| tree.contains(path) || mentions_base_file(path) || resolved_on_base(path),
-        |path| root.join(path).symlink_metadata().is_ok(),
-    ))
+    // A glob-shaped span is a pattern unless it names a real file.
+    let mut listed = listed_paths(body);
+    listed.retain(|path, _| !glob_shaped(path) || on_base(path) || in_tree(path));
+
+    Ok(classify(&listed, on_base, in_tree, mentions_base_file))
 }
 
 #[cfg(test)]

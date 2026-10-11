@@ -120,16 +120,80 @@ fn working_tree_only_path_is_the_parking_verdict() {
     assert_eq!(report.exit_code(), EXIT_UNCOMMITTED);
 }
 
-/// A new marker never hides a file that is already on the base, and it also
-/// keeps a working-tree draft of a file the issue creates from parking.
+/// A new marker hides neither a file on the base nor one in the working
+/// tree: an untracked draft is the parking case whatever its line says.
 #[test]
 fn marker_precedence() {
     let repo = fixture();
-    let body = "## Affected Files\n\n- `src/kept.rs` (new)\n- `src/draft.rs` (new)\n";
+    let body = "\
+## Affected Files
+
+- `src/kept.rs` (new)
+- `src/draft.rs` (new)
+- `src/made.rs` (new)
+
+### New files
+
+- `src/draft2.rs`
+";
+    fs::write(repo.path().join("src/draft2.rs"), "").unwrap();
     let report = check(body, repo.path(), "HEAD").unwrap();
     assert_eq!(class_of(&report, "src/kept.rs"), PathClass::Present);
-    assert_eq!(class_of(&report, "src/draft.rs"), PathClass::New);
-    assert_eq!(report.exit_code(), EXIT_CLEAR);
+    assert_eq!(class_of(&report, "src/draft.rs"), PathClass::Uncommitted);
+    assert_eq!(class_of(&report, "src/draft2.rs"), PathClass::Uncommitted);
+    assert_eq!(class_of(&report, "src/made.rs"), PathClass::New);
+    assert_eq!(report.exit_code(), EXIT_UNCOMMITTED);
+}
+
+/// A marker spreads to every path on its line; an untracked one among them
+/// still parks.
+#[test]
+fn line_marker_does_not_hide_an_untracked_path_on_the_same_line() {
+    let repo = fixture();
+    let body = "## Affected Files\n\n- `src/kept.rs` - move helpers into `src/draft.rs` (new)\n";
+    let report = check(body, repo.path(), "HEAD").unwrap();
+    assert_eq!(class_of(&report, "src/draft.rs"), PathClass::Uncommitted);
+    assert_eq!(report.exit_code(), EXIT_UNCOMMITTED);
+}
+
+/// An untracked root file is not a mention of a same-named base file in a
+/// subdirectory.
+#[test]
+fn untracked_root_file_is_not_hidden_by_a_base_basename() {
+    let repo = fixture();
+    let root = repo.path();
+    fs::write(root.join("kept.rs"), "").unwrap();
+    fs::write(root.join("draft.rs"), "").unwrap();
+    let body = "## Affected Files\n\n- `kept.rs`\n- `draft.rs`\n";
+    let report = check(body, root, "HEAD").unwrap();
+    assert_eq!(class_of(&report, "kept.rs"), PathClass::Uncommitted);
+    assert_eq!(class_of(&report, "draft.rs"), PathClass::Uncommitted);
+    assert_eq!(report.exit_code(), EXIT_UNCOMMITTED);
+}
+
+/// Glob-shaped spans that are real files in the working tree are checked;
+/// ones that exist nowhere are patterns and are skipped.
+#[test]
+fn glob_shaped_span_that_exists_on_disk_is_classified() {
+    let repo = fixture();
+    let root = repo.path();
+    fs::create_dir_all(root.join("app/[id]")).unwrap();
+    fs::write(root.join("app/[id]/page.tsx"), "").unwrap();
+    fs::create_dir(root.join("routes")).unwrap();
+    fs::write(root.join("routes/$id.tsx"), "").unwrap();
+    let body = "\
+## Affected Files
+
+- `app/[id]/page.tsx`
+- `routes/$id.tsx`
+- `src/*.rs` - every module
+- `src/<name>.rs` - placeholder
+";
+    let report = check(body, root, "HEAD").unwrap();
+    assert_eq!(class_of(&report, "app/[id]/page.tsx"), PathClass::Uncommitted);
+    assert_eq!(class_of(&report, "routes/$id.tsx"), PathClass::Uncommitted);
+    assert_eq!(report.entries.len(), 2, "{report:?}");
+    assert_eq!(report.exit_code(), EXIT_UNCOMMITTED);
 }
 
 #[test]
@@ -254,10 +318,7 @@ fn spans_that_cannot_name_one_repo_file_are_not_checked() {
     let body = "\
 ## Affected Files
 
-- `src/*.rs` - every module
-- `src/<name>.rs` - placeholder
 - `https://example.com/a/b.md`
-- `owner/repo#12`
 - `/tmp/scratch.txt` and `~/notes.md`
 - `../sibling/x.rs`
 - `--body-file=/x/y.md`
