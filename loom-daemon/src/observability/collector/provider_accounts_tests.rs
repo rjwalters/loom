@@ -173,3 +173,26 @@ async fn unreadable_zai_credential_still_yields_an_unknown_row() {
     assert_eq!(row.usage_fraction_weekly, None);
     assert!(!row.exhausted);
 }
+
+#[tokio::test]
+async fn malformed_zai_seat_is_kept_as_an_unknown_row() {
+    use std::os::unix::fs::PermissionsExt;
+    let workspace = tempfile::tempdir().unwrap();
+    let dir = workspace.path().join(".loom/api-keys/zai");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("seat-garbled.env");
+    std::fs::write(&file, "not an env line\n").unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let seats = zai_seats(workspace.path());
+    let seat = seats.iter().find(|s| s.name == "seat-garbled");
+    assert!(seat
+        .expect("malformed seat must not be dropped")
+        .key
+        .is_none());
+
+    let rows = crate::observability::ops::quota::zai::sample(seats).await;
+    let row = rows.iter().find(|r| r.account == "seat-garbled").unwrap();
+    assert_eq!(row.usage_fraction, None);
+    assert_eq!(row.usage_fraction_weekly, None);
+}

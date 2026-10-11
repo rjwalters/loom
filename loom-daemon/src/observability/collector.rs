@@ -1157,9 +1157,12 @@ fn zai_seats_with(
     };
     accounts
         .into_iter()
-        .filter(|account| account.enabled && account.ineligible != Some(Ineligible::Malformed))
+        .filter(|account| account.enabled)
         .map(|account| {
-            let key = read(&provider_root, provider, &account.name).ok();
+            // A malformed/unreadable entry is kept (UNKNOWN row), never polled.
+            let key = (account.ineligible != Some(Ineligible::Malformed))
+                .then(|| read(&provider_root, provider, &account.name).ok())
+                .flatten();
             super::ops::quota::zai::Seat {
                 marked_exhausted: account.ineligible == Some(Ineligible::Exhausted),
                 mark_resets_at: account
