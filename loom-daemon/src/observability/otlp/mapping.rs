@@ -583,16 +583,9 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             // already-reviewed, small, operator-facing JSON (never
             // free-form transcript content), so it is carried whole as one
             // compact-JSON string attribute rather than re-typed per topic.
-            let mut attributes = vec![
-                kv_string("loom.topic", r.topic.clone()),
-                kv_string("loom.payload", serde_json::to_string(&r.payload).unwrap_or_default()),
-            ];
-            // Issue #10023: lifecycle topics lift their queryable fields into
-            // typed attributes and carry the whole payload in the body.
-            if lifecycle::is_lifecycle(&r.topic) {
-                attributes.extend(lifecycle::attributes(&r.payload));
-                body_override = serde_json::to_string(&r.payload).ok();
-            }
+            // Issue #10023: lifecycle topics also lift their queryable fields
+            // into typed attributes and carry the whole payload in the body.
+            let attributes = lifecycle::daemon_event(&r.topic, &r.payload, &mut body_override);
             (
                 "daemon.event",
                 SeverityNumber::Info,

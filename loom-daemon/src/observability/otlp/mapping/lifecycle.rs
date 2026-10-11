@@ -13,8 +13,27 @@ use opentelemetry_proto::tonic::common::v1::KeyValue;
 use crate::observability::daemon_lifecycle::{TOPIC_HEARTBEAT, TOPIC_SHUTDOWN, TOPIC_START};
 
 /// Whether `topic` is one of the three lifecycle topics.
-pub(super) fn is_lifecycle(topic: &str) -> bool {
+fn is_lifecycle(topic: &str) -> bool {
     matches!(topic, TOPIC_START | TOPIC_SHUTDOWN | TOPIC_HEARTBEAT)
+}
+
+/// The attributes for a generic `daemon.event` log (Issue #8760): the topic and
+/// the whole payload as one compact-JSON string. A lifecycle topic additionally
+/// gets its typed attributes and sets `body` to the full payload JSON.
+pub(super) fn daemon_event(
+    topic: &str,
+    payload: &serde_json::Value,
+    body: &mut Option<String>,
+) -> Vec<KeyValue> {
+    let mut out = vec![
+        super::kv_string("loom.topic", topic),
+        super::kv_string("loom.payload", serde_json::to_string(payload).unwrap_or_default()),
+    ];
+    if is_lifecycle(topic) {
+        out.extend(attributes(payload));
+        *body = serde_json::to_string(payload).ok();
+    }
+    out
 }
 
 /// `(payload field, attribute key)` for string-valued fields.
