@@ -1341,6 +1341,17 @@ crash-signal reader takes the entire rest of that line as the runtime name, so
 appending to it would report a runtime called `"opencode tier=2"`. "How much work
 is going to the backstop" reduces to counting markers whose `tier` is not `0`.
 
+**An uninstalled tier-3 tap is skipped, not launched (#9368).** A tier-3
+generic runtime (`gemini`, `aider`, operator-defined) has no credential pool, so
+the one thing the walk can observe about it is its CLI binary: when the name is
+known (`LOOM_GENERIC_CLI_BIN`, else the manifest's `launch.cliBin`) and it is
+not an executable file on the daemon's `PATH`, the tap is passed over as
+`unavailable(binary: 'gemini' not found in PATH …)` and the walk continues, or
+holds if nothing below qualifies. Without a known name (no `launch.cliBin`) the
+tap stays ungated and `spawn-generic.sh`'s own exit-127 check remains the
+backstop, so declare `cliBin` in any tier-3 manifest you list in a preference.
+`claude`, `codex` and the native harnesses are never `PATH`-checked.
+
 Each dispatch seam emits that marker to the **daemon log** (`loom-daemon logs`),
 which is where all three resolve, and (#8599) the daemon carries it to the child
 in `LOOM_RUNTIME_PREFERENCE_MARKER` so `worker_spawn::launch` writes the same
@@ -1352,6 +1363,26 @@ writes a byte-identical log. A role tick additionally records the decision
 durably in `role_tick.outcome` as `preference_tier` / `preference_tap` (absent,
 never a fabricated `0`, when no list decided it) — so "how much work is going to
 the backstop" is a query over the journal, not a grep of the daemon log.
+
+### Per-phase runtime: `loom-daemon worker run` (issue #11285)
+
+`loom-daemon worker run --role builder|doctor (--issue N [--base BRANCH] | --pr N) [--json] [--timeout SECS]`
+resolves the role through `resolve_for_dispatch` (so `runtimes.rolePreference.<role>`
+applies; a parent dispatch's inherited `LOOM_RUNTIME`+`LOOM_ROLE` pin is dropped
+first, `LOOM_RUNTIME_<ROLE>` still wins), creates a missing worktree via
+`worktree.sh N [--base BRANCH]` / `pr-worktree.sh`, then launches the guarded native worker (`spawn-worker.sh`) in the
+issue worktree with the chosen tap pinned through `launch_env::apply_launch_env`,
+so the launch record shows the real runtime and model profile. A `claude`
+resolution prints `outcome=delegate-to-claude` and exits 0 without launching.
+Exit codes: 0 artifact, 1 no artifact, 2 usage (Judge/Curator refused),
+75 no eligible runtime/seat, 78 config, 124 timeout. The `/loom:sweep`
+orchestrator calls it before Builder/Doctor Task dispatch; see
+`native-sweep.md` and `sweep-execution-model.md`.
+
+Because a phase can outlast the Bash tool cap (120s default / 600s max), the
+orchestrator runs it as a background Bash process writing `exit` and
+`report.json` files and polls in-turn with bounded waits until the exit file
+exists; the recipe is in `native-sweep.md` "Waiting for `worker run`".
 
 ### Bounding the metered backstop tier (issue #8555)
 

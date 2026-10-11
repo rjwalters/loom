@@ -12,6 +12,8 @@
 //!
 //! **OTLP only.** **Provenance is required.**
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +29,7 @@ pub const FLEET_STATE_EVENT: &str = "fleet.state";
 /// list each one (contract-tested).
 pub const OUTCOME_FACT_LOG_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.fact_id",
+    "loom.fact_id_missing_reason",
     "loom.eta.authority",
     "loom.eta.version",
     "loom.eta.revision",
@@ -124,6 +127,43 @@ impl EnteredAtSource {
     }
 }
 
+/// Why an `eta.stage_outcome` carries no `loom.fact_id` (#11401).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FactIdMissingReason {
+    /// A forge read this pass needed (the item's label history, or the PR)
+    /// failed.
+    ForgeReadFailed,
+    /// Every read succeeded, and no forge instant dates the exit or the entry.
+    NoForgeInstant,
+}
+
+impl FactIdMissingReason {
+    /// The wire name.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FactIdMissingReason::ForgeReadFailed => "forge_read_failed",
+            FactIdMissingReason::NoForgeInstant => "no_forge_instant",
+        }
+    }
+}
+
+/// Exits emitted without a `loom.fact_id` this process (#11401), reported by
+/// `host.export`. Cumulative per process lifetime.
+static FACT_ID_MISSING_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Count one emitted exit that carries no `loom.fact_id`.
+pub fn note_fact_id_missing() {
+    FACT_ID_MISSING_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Exits emitted without a `loom.fact_id` since this process started.
+#[must_use]
+pub fn fact_id_missing_total() -> u64 {
+    FACT_ID_MISSING_TOTAL.load(Ordering::Relaxed)
+}
+
 /// One stage an item left.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StageOutcomeRecord {
@@ -165,10 +205,22 @@ pub struct StageOutcomeRecord {
     pub resolution_sec: Option<i64>,
     /// The forge's own instant for the transition (a label event's
     /// `created_at`, a PR's `merged_at` / `closed_at`), identical on every
-    /// host. The `loom.fact_id` key; absent when no forge instant is known,
-    /// and then the record carries no `loom.fact_id`.
+    /// host. The primary `loom.fact_id` key; absent when no forge instant is
+    /// known, and then the fact id falls back to `sweep_id`, else a
+    /// forge-dated `entered_at` (#11401).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forge_transition_at: Option<DateTime<Utc>>,
+    /// The id of this host's sweep that held the item in the stage (#11401):
+    /// the `loom.fact_id` key of an exit with no forge instant. Only the
+    /// sweep's host emits a sweep row's exit, so it is stable. Absent for an
+    /// item no sweep of this host held.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sweep_id: Option<String>,
+    /// Why no forge instant dates the exit, as the producer saw it (#11401).
+    /// Exported as `loom.fact_id_missing_reason` only when the record has no
+    /// fact id ([`StageOutcomeRecord::missing_fact_id_reason`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fact_id_missing_reason: Option<FactIdMissingReason>,
     /// The observing build.
     pub loom: Provenance,
 }
@@ -178,6 +230,35 @@ impl StageOutcomeRecord {
     #[must_use]
     pub fn has_provenance(&self) -> bool {
         self.loom.is_valid()
+    }
+
+    /// The forge-dated entry, when `entered_at` came from the forge.
+    #[must_use]
+    pub fn forge_entered_at(&self) -> Option<DateTime<Utc>> {
+        self.entered_at
+            .filter(|_| self.entered_at_source == Some(EnteredAtSource::Forge))
+    }
+
+    /// Whether some `loom.fact_id` key is known: a forge transition instant,
+    /// the holding sweep's id, or a forge-dated entry. Mirrors the mapper's
+    /// `fact_id::of`, so a record has exactly one of a fact id and a
+    /// [`missing_fact_id_reason`](Self::missing_fact_id_reason).
+    #[must_use]
+    pub fn has_fact_key(&self) -> bool {
+        self.forge_transition_at.is_some()
+            || self.sweep_id.as_deref().is_some_and(|id| !id.is_empty())
+            || self.forge_entered_at().is_some()
+    }
+
+    /// Why the record carries no `loom.fact_id`; `None` when it carries one.
+    /// Never `None` without a fact id: an unset reason reads as
+    /// `no_forge_instant`.
+    #[must_use]
+    pub fn missing_fact_id_reason(&self) -> Option<FactIdMissingReason> {
+        (!self.has_fact_key()).then(|| {
+            self.fact_id_missing_reason
+                .unwrap_or(FactIdMissingReason::NoForgeInstant)
+        })
     }
 }
 

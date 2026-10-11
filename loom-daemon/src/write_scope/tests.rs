@@ -468,6 +468,10 @@ fn daemon_write_paths_are_scoped() {
             Via(DISPATCH, "body park record of a dispatched sweep's quarantine / PR-less hold"),
         ),
         (
+            "sweep_registry/noop_cooldown/hold.rs",
+            Via(DISPATCH, "acts on dispatched sweeps"),
+        ),
+        (
             "sweep_registry/outcome_journal/writeback.rs",
             Via(DISPATCH, "dispatched sweeps"),
         ),

@@ -1,18 +1,22 @@
 //! `loom-daemon stashes list` / `retire` handlers (Issue #5693).
 //!
-//! Pure local git/`gh` operation — unlike `Quarantine` (in-memory insta-crash
-//! pauses in a running daemon), everything this command needs lives in the
-//! repo's own `refs/stash` and the forge, so it never touches the daemon's
-//! Unix socket and runs on the sync `handle_cli_command` path.
+//! Unlike `Quarantine` (in-memory insta-crash pauses in a running daemon),
+//! everything this command needs lives in the repo's own `refs/stash` and the
+//! forge, so it runs on the sync `handle_cli_command` path and works with the
+//! daemon down. A live daemon is used only for the issue-state read of a
+//! managed repo (#8876, `issue_state_read`); without one the read is the
+//! policy-gated standalone path.
 
 use anyhow::Result;
 
+use loom_daemon::forge_egress::policy::PolicySources;
+use loom_daemon::issue_state_read::client::{DaemonLink, LocalRead, RoutedLookup, SocketLink};
 use loom_daemon::quarantine_stash_status::StashOrigin;
 use loom_daemon::repo_root::resolve_repo_root;
 use loom_daemon::stash_issue_state::{IssueStateSummary, RecordingLookup};
 use loom_daemon::stash_retirement::{
-    self, AnyStashEntry, DropOutcome, GhIssueStateLookup, IssueStateLookup, PathVerdict,
-    QuarantineStashEntry, RetireVerdict, RetirementReport, RETIREMENT_LOG_RELPATH,
+    self, AnyStashEntry, DropOutcome, IssueStateLookup, PathVerdict, QuarantineStashEntry,
+    RetireVerdict, RetirementReport, RETIREMENT_LOG_RELPATH,
 };
 
 use crate::StashesAction;
@@ -93,14 +97,36 @@ fn run(
     json: bool,
 ) -> Result<()> {
     let repo_root = resolve_repo_root(workspace)?;
-    let mut lookup = GhIssueStateLookup::new(repo_root.clone());
     let opts = RunOptions {
         issue_filter,
         execute,
         show_paths,
         json,
     };
-    run_with(&repo_root, &opts, &mut lookup)
+    // #8876: the route is chosen once per run (daemon-assisted read, else the
+    // policy-gated standalone read). Its description goes to stderr so
+    // `--json` stdout stays machine-readable.
+    let link = daemon_link(&repo_root);
+    let local = LocalRead {
+        root: repo_root.clone(),
+        sources: PolicySources::from_process(Some(&repo_root)),
+    };
+    let mut lookup = RoutedLookup::new(link.as_ref().map(|l| l as &dyn DaemonLink), &local);
+    let result = run_with(&repo_root, &opts, &mut lookup);
+    eprintln!("issue-state route: {}", lookup.route_description());
+    result
+}
+
+/// The daemon link for `repo_root`, or `None` when its `origin` has no
+/// supported slug (then only the standalone read applies).
+fn daemon_link(repo_root: &std::path::Path) -> Option<SocketLink> {
+    let slug = loom_daemon::release_resolve::host::repo_slug(repo_root)?;
+    let socket = super::common::resolve_socket_path().ok()?;
+    Some(SocketLink {
+        socket,
+        root: repo_root.to_path_buf(),
+        slug,
+    })
 }
 
 struct RunOptions {

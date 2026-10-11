@@ -135,6 +135,8 @@ fn stage_outcome_keeps_its_wire_tag_and_every_attribute_key_but_open_estimates()
         observed_at,
         resolution_sec: Some(0),
         forge_transition_at: Some(left_at),
+        sweep_id: None,
+        fact_id_missing_reason: None,
         loom: provenance(),
     };
     let envelope = TelemetryEnvelope::new("host-a", TelemetryRecord::StageOutcome(record.clone()));
@@ -202,6 +204,8 @@ fn every_outcome_fact_key_is_emitted_by_some_record() {
         observed_at: at,
         resolution_sec: Some(0),
         forge_transition_at: Some(at),
+        sweep_id: None,
+        fact_id_missing_reason: None,
         loom: provenance(),
     };
     let pr = PrResolvedRecord {
@@ -215,9 +219,15 @@ fn every_outcome_fact_key_is_emitted_by_some_record() {
         closed_at: Some(at),
         loom: provenance(),
     };
+    // #11401: an exit with nothing to key on carries a reason instead.
+    let unkeyed = StageOutcomeRecord {
+        forge_transition_at: None,
+        ..stage.clone()
+    };
     let mut emitted = BTreeSet::new();
     for record in [
         TelemetryRecord::StageOutcome(stage),
+        TelemetryRecord::StageOutcome(unkeyed),
         TelemetryRecord::PrResolved(pr),
     ] {
         let log = log_record_for(&TelemetryEnvelope::new("h", record)).unwrap();

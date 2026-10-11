@@ -7,6 +7,9 @@
 //! `loom_daemon::journal`. A later slice (2b-2e) that wires a producer
 //! extends [`ALLOWED`] deliberately, in review.
 //!
+//! Sanctioned producers so far: Phase 2e (#11349) — `src/config_journal/`,
+//! the config-change journal producer.
+//!
 //! A Rust test, not a `scripts/check-*.sh`, per the shell-language policy.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -17,7 +20,12 @@ use std::path::{Path, PathBuf};
 use regex::Regex;
 
 /// Paths (relative to the crate root) allowed to reference the core.
-const ALLOWED: &[&str] = &["src/journal/", "src/cli/journal_cli.rs"];
+const ALLOWED: &[&str] = &[
+    "src/journal/",
+    "src/cli/journal_cli.rs",
+    // Phase 2e (#11349): sanctioned producer, admitted in review.
+    "src/config_journal/",
+];
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in fs::read_dir(dir).unwrap() {

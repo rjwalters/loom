@@ -451,6 +451,16 @@ pub enum Request {
     },
     /// List the managed workspaces in the machine-level registry.
     ListWorkspaces,
+    /// Read one issue's OPEN/CLOSED state for a managed repo under the
+    /// daemon's own forge routing (#8876). The only inputs are a registered
+    /// root, the `owner/repo` slug of its `origin` remote, and an issue
+    /// number: no endpoint, no command, no credential. The daemon re-derives
+    /// the slug itself and answers [`crate::issue_state_read::IssueStateReply`].
+    ReadIssueState {
+        workspace_root: String,
+        repo: String,
+        issue: u64,
+    },
     // ========================================================================
     // Durable Watch Registry Requests (Issue #3971)
     // ========================================================================
@@ -803,6 +813,9 @@ pub enum Response {
     WorkspaceList {
         workspaces: Vec<crate::workspace_registry::Workspace>,
     },
+    /// Result of a `ReadIssueState` request (#8876): a validated state and a
+    /// non-secret route label, never a credential.
+    IssueState(crate::issue_state_read::IssueStateReply),
     // ========================================================================
     // Durable Watch Registry Responses (Issue #3971)
     // ========================================================================

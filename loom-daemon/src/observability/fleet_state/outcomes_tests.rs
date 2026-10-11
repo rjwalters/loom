@@ -286,6 +286,7 @@ fn held_merge_wait() -> HeldSweep {
         pr: Some(21),
         overflow: false,
         start: Default::default(),
+        sweep_id: None,
     }
 }
 
@@ -514,6 +515,7 @@ fn claimed() -> FleetInput {
             pr: None,
             overflow: false,
             start: Default::default(),
+            sweep_id: None,
         }],
     )
 }
@@ -633,9 +635,10 @@ fn a_ready_exit_the_forge_never_shows_is_one_unknown_after_the_cap() {
     }
     let r = stages(&out[cap + 1])[0];
     assert_eq!((r.exit, r.next_stage), (StageExit::Unknown, None));
-    assert_eq!(r.forge_transition_at, None, "no fact id");
+    assert_eq!(r.forge_transition_at, None, "no forge exit instant");
     assert_eq!(r.left_at, t0() + Duration::minutes(5), "the pass that saw it gone");
     assert_eq!(r.entered_at, Some(t0() - Duration::minutes(30)));
+    assert!(r.has_fact_key(), "keyed on the forge-dated entry (#11401)");
 }
 
 #[test]
@@ -763,6 +766,7 @@ fn a_held_sweep_advancing_is_a_stage_outcome_without_a_forge_instant() {
         pr: None,
         overflow: false,
         start: Default::default(),
+        sweep_id: None,
     };
     let mut forge = Forge::default();
     let out = run(
@@ -1019,3 +1023,6 @@ fn a_failed_events_page_is_a_failed_read() {
 
 #[path = "outcomes_pre_ready_tests.rs"]
 mod pre_ready_tests;
+
+#[path = "outcomes_fact_id_tests.rs"]
+mod fact_id_tests;

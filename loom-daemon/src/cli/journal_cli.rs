@@ -39,16 +39,23 @@ enum JournalCommand {
         /// machine-level root (`LOOM_JOURNAL_DIR`, else `~/.loom/journal`).
         #[arg(long, value_name = "PATH", env = "LOOM_JOURNAL_ROOT")]
         root: Option<PathBuf>,
-        /// Concern verification: rebuild this concern's projections and diff
-        /// them against its legacy stores (read-only). Only `execution`.
-        #[arg(long, value_name = "CONCERN", value_parser = ["execution"])]
-        concern: Option<String>,
         /// Verify only this stream (repeatable). Default: every stream.
         #[arg(long = "stream", value_name = "NAME")]
         streams: Vec<String>,
         /// Print the report as JSON.
         #[arg(long)]
         json: bool,
+        /// Verify one concern. `execution` (J1, #11346) rebuilds the
+        /// execution projections and diffs them against the legacy stores
+        /// (read-only). `config` (J3, #11349) restricts to the `config`
+        /// stream and also diffs the rebuilt C6/C7 projections against the
+        /// legacy files in `--loom-dir`; exits 1 on divergence.
+        #[arg(long, value_name = "CONCERN", value_parser = ["execution", "config"])]
+        concern: Option<String>,
+        /// Legacy state directory for `--concern config` (default: the
+        /// daemon's `~/.loom`).
+        #[arg(long, value_name = "PATH")]
+        loom_dir: Option<PathBuf>,
     },
 }
 
@@ -56,10 +63,10 @@ pub(crate) fn dispatch(args: JournalArgs) -> Result<()> {
     let code = match args.command {
         JournalCommand::Verify {
             root,
-            concern: Some(_),
+            concern,
             json,
             ..
-        } => {
+        } if concern.as_deref() == Some("execution") => {
             let get = |k: &str| std::env::var(k).ok();
             let root = root.or_else(|| execution::default_root(&get, dirs::home_dir().as_deref()));
             match root {
@@ -72,16 +79,32 @@ pub(crate) fn dispatch(args: JournalArgs) -> Result<()> {
         }
         JournalCommand::Verify {
             root,
-            streams,
+            mut streams,
             json,
-            concern: None,
-        } => match root {
-            Some(root) => run_verify(&verify(&root, &VerifyOptions { streams }), json)?,
-            None => {
+            concern,
+            loom_dir,
+        } => {
+            let Some(root) = root else {
                 eprintln!("journal verify: --root (or LOOM_JOURNAL_ROOT) is required");
-                2
+                std::process::exit(2);
+            };
+            if concern.is_some() {
+                streams = vec![loom_daemon::config_journal::STREAM.to_owned()];
             }
-        },
+            let report = verify(&root, &VerifyOptions { streams });
+            let code = run_verify(&report, json)?;
+            if concern.is_some() {
+                let dir = loom_dir.or_else(loom_daemon::fleet_store::pending_restart::loom_dir);
+                let div = dir.map(|d| loom_daemon::config_journal::divergence(&root, &d));
+                if let Some(div) = div {
+                    println!("{}", serde_json::to_string_pretty(&div)?);
+                    if !div.is_clean() && code == 0 {
+                        std::process::exit(1);
+                    }
+                }
+            }
+            code
+        }
     };
     if code != 0 {
         std::process::exit(code);
