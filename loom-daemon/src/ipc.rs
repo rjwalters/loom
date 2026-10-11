@@ -711,6 +711,7 @@ async fn handle_client(
             force,
             runtime,
             model_profile,
+            dispatch_origin,
         } = request
         {
             let response = dispatch_sweep_nonblocking(
@@ -726,6 +727,8 @@ async fn handle_client(
                 force,
                 runtime,
                 model_profile,
+                // #11444: absent on the wire records `unknown`, never `operator`.
+                crate::sweep_registry::DispatchOrigin::from_request(dispatch_origin),
             )
             .await;
             let response_json = serde_json::to_string(&response)?;
@@ -2850,6 +2853,7 @@ fn handle_request(
             force,
             runtime,
             model_profile,
+            dispatch_origin,
         } => {
             // Host-distress circuit breaker (#4235): a *tripped* breaker
             // represents SUSTAINED, already-observed host distress across
@@ -2982,6 +2986,7 @@ fn handle_request(
                 crate::sweep_registry::DispatchModel::Request(model.as_deref()),
                 effort.as_deref(),
                 depends_on,
+                crate::sweep_registry::DispatchOrigin::from_request(dispatch_origin),
             ) {
                 Ok(outcome) => {
                     // Accepted and spawned. An idempotency hit is the

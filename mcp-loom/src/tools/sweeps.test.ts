@@ -10,6 +10,7 @@
  */
 
 import { describe, expect, it } from "vitest";
+import { buildDispatchSweepPayload } from "./sweep-dispatch-payload.js";
 import {
   extractRuntimeRejection,
   formatDispatchTokenLine,
@@ -173,5 +174,32 @@ describe("dispatch_sweep per-dispatch tap schema (issue #11284)", () => {
 
   it("keeps them optional so legacy callers are unchanged", () => {
     expect(schema.required).toEqual(["kind"]);
+  });
+});
+
+/**
+ * Issue #11444: the `dispatch_sweep` tool is an operator surface, so its
+ * request names `dispatch_origin: "operator"`. The daemon records an absent
+ * origin as `unknown`, so the field must always be sent.
+ */
+describe("buildDispatchSweepPayload", () => {
+  it("names the operator as the dispatch origin", () => {
+    const payload = buildDispatchSweepPayload({ kind: { type: "Issue", value: 11444 } });
+    expect(payload.dispatch_origin).toBe("operator");
+  });
+
+  it("keeps the existing wire defaults", () => {
+    expect(buildDispatchSweepPayload({ kind: { type: "Issue", value: 7 } })).toEqual({
+      kind: { type: "Issue", value: 7 },
+      idempotency_key: null,
+      model: null,
+      effort: null,
+      depends_on: null,
+      workspace_root: null,
+      force: false,
+      runtime: null,
+      model_profile: null,
+      dispatch_origin: "operator",
+    });
   });
 });

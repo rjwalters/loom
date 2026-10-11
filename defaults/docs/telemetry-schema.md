@@ -232,7 +232,7 @@ cycle) is added only when loom-ui's error tracking shows it is needed.
 | Record | Signal | Owner (emit site, under `loom-daemon/src/`) |
 |---|---|---|
 | [`sweep.outcome`](#sweepoutcome) | log, native + OTLP | `sweep_registry/outcome_journal.rs`, `observability/collector.rs`, `sweep_registry/prless_retry/durable.rs`, `observability/backfill.rs` |
-| [`sweep.started`](#sweepstarted) / [`sweep.phase`](#sweepphase) / [`sweep.completed`](#sweepcompleted) / [`sweep.identity`](#sweepidentity) | log, native + OTLP | `observability/collector.rs` (+ `collector/identity.rs`), `observability/queue.rs`, `observability/shutdown.rs`, `observability/backfill.rs`; `sweep.started` carries the dispatch facts (`model`, `effort`, `effort_source`, `model_source`, `runtime`, `attempt_index`, `trigger`, `previous_sweep_id`, #11280) from `sweep_registry/start_facts.rs` |
+| [`sweep.started`](#sweepstarted) / [`sweep.phase`](#sweepphase) / [`sweep.completed`](#sweepcompleted) / [`sweep.identity`](#sweepidentity) | log, native + OTLP | `observability/collector.rs` (+ `collector/identity.rs`), `observability/queue.rs`, `observability/shutdown.rs`, `observability/backfill.rs`; `sweep.started` carries the dispatch facts (`model`, `effort`, `effort_source`, `model_source`, `runtime`, `attempt_index`, `trigger`, `previous_sweep_id`, #11280; `dispatch_origin`, #11444) from `sweep_registry/start_facts.rs` |
 | Phase spans (`trace.span`: `loom.phase`, `loom.role_attempt`) | span, OTLP only | `observability/lifecycle.rs` → `observability/otlp/traces.rs`; see [`tracing.md`](tracing.md#owned-lifecycle-instrumentation) |
 | [`pick.decision`](#pickdecision) | log, OTLP only | `observability/pick_decision.rs` (from `role_tick_telemetry.rs` and `work_finder/tick_summary.rs`) |
 | [`queue.snapshot`](#queuesnapshot) (whole ready queue per tick) | native only | `observability/queue_snapshot.rs` |
@@ -362,6 +362,7 @@ A sweep began work on an issue.
   "attempt_index": 2,
   "trigger": "retry_after_env_failure",
   "previous_sweep_id": "sweep-issue-4703-1",
+  "dispatch_origin": "work_finder",
   "story_points": 5
 }
 ```
@@ -373,7 +374,7 @@ uses, so a reader joins the two by name. A fit or a live estimate can then
 use them at the sweep's start instead of waiting for its outcome. The same
 values ride the native envelope and the OTLP log (`loom.model`,
 `loom.effort`, `loom.effort_source`, `loom.model_source`, `loom.runtime`, `loom.attempt_index`,
-`loom.trigger`, `loom.previous_sweep_id`; `SWEEP_START_FACT_LOG_ATTRIBUTE_KEYS`,
+`loom.trigger`, `loom.previous_sweep_id`, `loom.dispatch_origin`; `SWEEP_START_FACT_LOG_ATTRIBUTE_KEYS`,
 kept by the collector's `transform/privacy` `keep_keys`, contract-tested), and
 every running row of [`fleet.state`](#fleetstate). Each is omitted when
 unknown, never guessed. They come from the dispatch itself, with no forge read.
@@ -410,6 +411,26 @@ unknown, never guessed. They come from the dispatch itself, with no forge read.
   way from this host's outcome journal at dispatch. Absent when the journal
   cannot be read or the repo slug does not resolve. Absent for every PR-set
   dispatch.
+- `dispatch_origin` (Issue #11444): who asked for the sweep. A closed set
+  (`DispatchOrigin` in `telemetry/start_facts.rs`):
+
+  | Value | Dispatch path |
+  |---|---|
+  | `operator` | `loom-daemon dispatch`, the `dispatch_sweep` MCP tool, Safehouse ChatOps `dispatch` |
+  | `work_finder` | the autonomous work finder |
+  | `epic_supervisor` | the epic supervisor's next-phase dispatch |
+  | `watchdog` | a registry watchdog re-dispatch (startup, mid-build death, review stall) |
+  | `reaper_retry` | the reaper's resume of a crashed sweep |
+  | `unknown` | an IPC `DispatchSweep` request that did not name an origin (a legacy client), or named one this daemon does not know |
+
+  Every production dispatch path names its origin; none defaults to
+  `operator`. The origin on an IPC request is what the client says (telemetry,
+  not authorization). Present on every `Issue` dispatch's `sweep.started`;
+  absent for a PR-set dispatch, which has no start facts. A roll resume
+  (#10832) relaunches the same session and emits no `sweep.started`.
+  `trigger` is `operator_redispatch` exactly when `dispatch_origin=operator`
+  and the journal shows a previous attempt; an operator's first dispatch
+  stays `first`, and every other origin keeps the journal-derived trigger.
 
 `runtime` is the admitted runtime adapter (`claude`, `codex`,
 …) copied from the `sweep.global.dispatch` event — the same value
@@ -1145,8 +1166,17 @@ is counted. All three are absent when the journal could not be read or the repo
 slug never resolved. `redispatch_after_success` (Issue #11429) means the
 previous attempt landed, found the work already done, or was closed or
 rescoped by the Curator. Records written before #11429 call that case
-`operator_redispatch`. That name is now reserved for a dispatch that an
-operator is known to have asked for, and no dispatch path sets it yet.
+`operator_redispatch`. Since #11444 that name means an operator re-dispatched
+the issue: it is set only when the sweep's `dispatch_origin` is `operator` and
+a previous attempt exists, and the journal inference never produces it.
+
+**`dispatch_origin`** (Issue #11444): who asked for this sweep, one of the
+[`sweep.started` values](#sweepstarted) (`operator`, `work_finder`,
+`epic_supervisor`, `watchdog`, `reaper_retry`, `unknown`). Copied from the
+sweep's start facts, so it and `trigger` equal what `sweep.started` reported.
+Exported as `loom.dispatch_origin` on the OTLP log and the trace metadata.
+Absent on lines written before #11444 and on sweeps this daemon did not
+dispatch (adopted after a restart, PR-set); never fabricated.
 
 **`rework_events`** (array of `{kind, reason?, classification?,
 duration_sec?}`) — in-sweep rework observed by the terminal turn from two
@@ -2649,7 +2679,7 @@ Each row:
 | `host` | string, optional | the host whose sweep holds the item. Present **only** when the emitting host runs it; absent rather than guessed otherwise |
 | `slot` | `regular` / `overflow`, optional | the dispatch slot that sweep holds (`overflow` = the host's single `loom:operator-priority` overflow slot, #9244). Present exactly when `host` is |
 | `sweep_id` | string, optional | the id of this host's sweep that holds the item, the `loom.fact_id` key of the row's `eta.stage_outcome` when no forge instant dates the exit (#11401). Present exactly when `host` is. Additive on `fleet-state/v1` |
-| `model`, `effort`, `effort_source`, `model_source`, `runtime`, `attempt_index`, `trigger`, `previous_sweep_id` | optional | a row of a sweep this host runs (`sweep.curator`, `sweep.builder`, `review_wait`, `doctor`, `merge_wait`): the [dispatch facts](#sweepstarted) its `sweep.started` carried, with the same values (#11280). Absent for a sweep this daemon did not dispatch (adopted after a restart), and each one absent when unknown. Additive on `fleet-state/v1` |
+| `model`, `effort`, `effort_source`, `model_source`, `runtime`, `attempt_index`, `trigger`, `previous_sweep_id`, `dispatch_origin` | optional | a row of a sweep this host runs (`sweep.curator`, `sweep.builder`, `review_wait`, `doctor`, `merge_wait`): the [dispatch facts](#sweepstarted) its `sweep.started` carried, with the same values (#11280). Absent for a sweep this daemon did not dispatch (adopted after a restart), and each one absent when unknown. Additive on `fleet-state/v1` |
 | `rank` | integer, optional | `ready_wait` only: this host's planner rank (1-based position in its dispatch order on the last work-finder tick). Per host: two hosts' ranks for one issue are two true answers |
 | `star` | bool, optional | starred at any level (absent = `false`). Every row since #11391: a PR row reads the PR's `loom:operator-priority` / level labels, and a row keeps the star an earlier row of the item carried (a `ready_wait` row is rebuilt from the tick, so an un-star shows there) |
 | `star_at` | RFC 3339, optional | `ready_wait` only: when it was starred, when known |

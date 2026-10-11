@@ -474,6 +474,7 @@ fn test_dispatch_sweep_still_dispatches_under_synthetic_low_headroom() {
                 force: false,
                 runtime: None,
                 model_profile: None,
+                dispatch_origin: None,
             },
             &tm,
             &db,
@@ -567,6 +568,7 @@ fn test_sweep_requests_route_to_explicit_workspace_root() {
             force: false,
             runtime: None,
             model_profile: None,
+            dispatch_origin: None,
         },
         &tm,
         &db,
@@ -700,6 +702,7 @@ fn test_list_sweeps_all_workspaces_fans_out_across_registered_roots() {
             force: false,
             runtime: None,
             model_profile: None,
+            dispatch_origin: None,
         },
         &tm,
         &db,
@@ -723,6 +726,7 @@ fn test_list_sweeps_all_workspaces_fans_out_across_registered_roots() {
             force: false,
             runtime: None,
             model_profile: None,
+            dispatch_origin: None,
         },
         &tm,
         &db,
@@ -801,6 +805,7 @@ fn test_list_sweeps_all_workspaces_false_preserves_single_workspace_behavior() {
             force: false,
             runtime: None,
             model_profile: None,
+            dispatch_origin: None,
         },
         &tm,
         &db,
@@ -885,6 +890,7 @@ fn test_list_sweeps_all_workspaces_true_ignores_explicit_workspace_root() {
             force: false,
             runtime: None,
             model_profile: None,
+            dispatch_origin: None,
         },
         &tm,
         &db,
@@ -984,6 +990,7 @@ fn test_dispatch_sweep_absent_workspace_root_targets_single_registration() {
             force: false,
             runtime: None,
             model_profile: None,
+            dispatch_origin: None,
         },
         &tm,
         &db,
@@ -1071,6 +1078,7 @@ fn test_dispatch_sweep_ambiguous_registry_errors_without_explicit_param() {
             force: false,
             runtime: None,
             model_profile: None,
+            dispatch_origin: None,
         },
         &tm,
         &db,
@@ -1123,6 +1131,7 @@ fn test_dispatch_sweep_unregistered_explicit_workspace_root_is_structured_error(
             force: false,
             runtime: None,
             model_profile: None,
+            dispatch_origin: None,
         },
         &tm,
         &db,
@@ -1197,6 +1206,7 @@ fn test_dispatch_sweep_unregistered_delegated_target_hint_names_delegate() {
             force: false,
             runtime: None,
             model_profile: None,
+            dispatch_origin: None,
         },
         &tm,
         &db,
@@ -1255,6 +1265,7 @@ fn test_dispatch_sweep_succeeds_into_a_registered_delegated_workspace() {
             force: false,
             runtime: None,
             model_profile: None,
+            dispatch_origin: None,
         },
         &tm,
         &db,
@@ -1306,6 +1317,7 @@ fn test_dispatch_sweep_registered_workspace_missing_spawn_bin_surfaces_inner_err
             force: false,
             runtime: None,
             model_profile: None,
+            dispatch_origin: None,
         },
         &tm,
         &db,
@@ -1379,6 +1391,7 @@ fn test_dispatch_sweep_wedge_guard_names_resolved_workspace_not_cwd() {
             force: false,
             runtime: None,
             model_profile: None,
+            dispatch_origin: None,
         },
         &tm,
         &db,
@@ -1446,6 +1459,7 @@ fn test_handle_request_dispatch_sweep_happy_path() {
             force: false,
             runtime: None,
             model_profile: None,
+            dispatch_origin: None,
         },
         &tm,
         &db,
@@ -1531,6 +1545,7 @@ fn test_handle_request_dispatch_sweep_exports_claim_ownership_marker() {
             force: false,
             runtime: None,
             model_profile: None,
+            dispatch_origin: None,
         },
         &tm,
         &db,
@@ -1658,6 +1673,7 @@ fn test_handle_request_dispatch_sweep_accepts_prset() {
             force: false,
             runtime: None,
             model_profile: None,
+            dispatch_origin: None,
         },
         &tm,
         &db,
@@ -1863,6 +1879,7 @@ async fn dispatch_sweep_nonblocking_burst_acks_well_under_the_client_deadline() 
                 false,
                 None,
                 None,
+                crate::sweep_registry::DispatchOrigin::Unknown,
             )
             .await
         }));
@@ -1978,6 +1995,7 @@ async fn list_sweeps_is_not_starved_behind_a_concurrent_dispatch_burst() {
                 false,
                 None,
                 None,
+                crate::sweep_registry::DispatchOrigin::Unknown,
             )
             .await
         }));
@@ -2145,6 +2163,7 @@ fn test_dispatch_sweep_deserializes_without_model_field() {
             force: _,
             runtime: _,
             model_profile: _,
+            dispatch_origin: _,
         } => {
             assert!(matches!(kind, SweepKind::Issue(42)));
             assert!(idempotency_key.is_none());
@@ -2167,6 +2186,7 @@ fn test_dispatch_sweep_serde_round_trip_with_model() {
         force: false,
         runtime: None,
         model_profile: None,
+        dispatch_origin: None,
     };
     let json = serde_json::to_string(&request).expect("serialize");
     let back: Request = serde_json::from_str(&json).expect("deserialize");
@@ -2181,6 +2201,7 @@ fn test_dispatch_sweep_serde_round_trip_with_model() {
             force: _,
             runtime: _,
             model_profile: _,
+            dispatch_origin: _,
         } => {
             assert!(matches!(kind, SweepKind::Issue(7)));
             assert_eq!(idempotency_key.as_deref(), Some("key-B"));
@@ -2203,6 +2224,7 @@ fn test_dispatch_sweep_serde_round_trip_without_model() {
         force: false,
         runtime: None,
         model_profile: None,
+        dispatch_origin: None,
     };
     let json = serde_json::to_string(&request).expect("serialize");
     let back: Request = serde_json::from_str(&json).expect("deserialize");
@@ -2242,6 +2264,7 @@ fn test_dispatch_sweep_serde_round_trip_with_effort() {
         force: false,
         runtime: None,
         model_profile: None,
+        dispatch_origin: None,
     };
     let json = serde_json::to_string(&request).expect("serialize");
     let back: Request = serde_json::from_str(&json).expect("deserialize");
@@ -2266,6 +2289,7 @@ fn test_dispatch_sweep_serde_round_trip_with_empty_effort() {
         force: false,
         runtime: None,
         model_profile: None,
+        dispatch_origin: None,
     };
     let json = serde_json::to_string(&request).expect("serialize");
     let back: Request = serde_json::from_str(&json).expect("deserialize");
@@ -2308,6 +2332,7 @@ fn test_dispatch_sweep_serde_round_trip_with_depends_on() {
         force: false,
         runtime: None,
         model_profile: None,
+        dispatch_origin: None,
     };
     let json = serde_json::to_string(&request).expect("serialize");
     let back: Request = serde_json::from_str(&json).expect("deserialize");
@@ -3255,6 +3280,7 @@ fn test_handle_request_cancel_sweep_from_cli_frame_runs_the_shared_path() {
             force: false,
             runtime: None,
             model_profile: None,
+            dispatch_origin: None,
         },
         &tm,
         &db,
@@ -3326,6 +3352,7 @@ fn test_handle_request_get_sweep_status_returns_existing() {
             force: false,
             runtime: None,
             model_profile: None,
+            dispatch_origin: None,
         },
         &tm,
         &db,
@@ -5192,3 +5219,5 @@ fn dispatch_sweep_runtime_and_profile_are_wire_compatible() {
         other => panic!("unexpected request: {other:?}"),
     }
 }
+// #11444 dispatch-origin tests: a sibling module, as above.
+mod dispatch_origin;

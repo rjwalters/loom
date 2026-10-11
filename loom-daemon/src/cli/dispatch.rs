@@ -54,6 +54,9 @@ fn build_dispatch_request_with_tap(
         force,
         runtime,
         model_profile,
+        // #11444: a human ran `loom-daemon dispatch`. The daemon records an
+        // absent origin as `unknown`, so the CLI must say so explicitly.
+        dispatch_origin: Some(loom_daemon::telemetry::DispatchOrigin::Operator),
     }
 }
 
@@ -429,9 +432,15 @@ mod dispatch_tests {
                 force,
                 runtime: _,
                 model_profile: _,
+                dispatch_origin,
             } => {
                 assert_eq!(kind, SweepKind::Issue(3952));
                 assert_eq!(idempotency_key, None);
+                assert_eq!(
+                    dispatch_origin,
+                    Some(loom_daemon::telemetry::DispatchOrigin::Operator),
+                    "the operator CLI must name its origin (#11444)"
+                );
                 assert_eq!(model.as_deref(), Some("sonnet"));
                 assert_eq!(effort.as_deref(), Some("high"));
                 assert_eq!(depends_on, Some(3945));

@@ -1580,6 +1580,7 @@ impl SweepRegistry {
             None,
             None,
             Some(resume_pr),
+            DispatchOrigin::ReaperRetry,
         )
     }
 
@@ -1596,6 +1597,7 @@ impl SweepRegistry {
     /// IPC handler for `DispatchSweep`, `ipc.rs::dispatch_sweep_nonblocking`).
     /// Kept for `dispatch()` / `dispatch_resume_after_crash()` and unit
     /// tests, where lock contention is irrelevant.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn dispatch_inner(
         &mut self,
         kind: &SweepKind,
@@ -1604,6 +1606,7 @@ impl SweepRegistry {
         effort: Option<&str>,
         depends_on: Option<u32>,
         resume_bypass_pr: Option<u32>,
+        origin: DispatchOrigin,
     ) -> Result<DispatchOutcome> {
         match self.begin_issue_dispatch_with_model(
             kind,
@@ -1612,6 +1615,7 @@ impl SweepRegistry {
             effort,
             depends_on,
             resume_bypass_pr,
+            origin,
         )? {
             BeginIssueDispatch::Done(result) => result,
             BeginIssueDispatch::Spawned(mut prepared) => {
@@ -1701,6 +1705,7 @@ impl SweepRegistry {
         depends_on: Option<u32>,
         resume_bypass_pr: Option<u32>,
         prepared_launch: Option<private_dispatch::PreparedLaunch>,
+        dispatch_origin: DispatchOrigin,
     ) -> Result<BeginIssueDispatch> {
         // 1. Idempotency dedup against Running entries.
         if let Some(ref key) = idempotency_key {
@@ -2574,6 +2579,7 @@ impl SweepRegistry {
             admission,
             story_points,
             model_source,
+            dispatch_origin,
             mid_spawn: self.roll_gate.enter(),
         })))
     }
@@ -2612,6 +2618,7 @@ impl SweepRegistry {
             mut admission,
             story_points,
             model_source,
+            dispatch_origin,
             mid_spawn: _mid_spawn, // #10974: held until the entry is recorded
         } = prepared;
 
@@ -2841,7 +2848,13 @@ impl SweepRegistry {
         //    #9432: `story_points` is the size estimate resolved at step 2.71
         //    from the labels the park guard already read. #11280: the event
         //    also carries this sweep's start facts (`start_facts.rs`).
-        self.emit_dispatch(&sweep_id, &admission, story_points, Some(model_source));
+        //    #11444: and who asked for it (`dispatch_origin`).
+        self.emit_dispatch(
+            &sweep_id,
+            &admission,
+            story_points,
+            Some((model_source, dispatch_origin)),
+        );
 
         Ok(DispatchOutcome {
             sweep_id,
@@ -3424,6 +3437,7 @@ pub(crate) fn dispatch_model_releasing_poll_lock(
     model: DispatchModel<'_>,
     effort: Option<&str>,
     depends_on: Option<u32>,
+    origin: DispatchOrigin,
 ) -> Result<DispatchOutcome> {
     let prepared_launch = if tokio::runtime::Handle::try_current().is_ok() {
         tokio::task::block_in_place(|| {
@@ -3446,6 +3460,7 @@ pub(crate) fn dispatch_model_releasing_poll_lock(
             depends_on,
             None,
             prepared_launch,
+            origin,
         )
     };
 

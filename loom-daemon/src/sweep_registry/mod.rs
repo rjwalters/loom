@@ -110,6 +110,8 @@ pub mod containment_signal;
 // `is_pid_alive` reaches every consumer (the reaper, the orphan reaper, and
 // #9464's claim-label heal) without a re-export line in this ratcheted file.
 pub(crate) mod crash_signals;
+/// Who asked for a dispatch (#11444); every dispatch-core entry takes one.
+pub use crate::telemetry::DispatchOrigin;
 // `generate_sweep_id` lives with the `SweepKind` it names (model.rs) — moved out
 // of this ratcheted file; re-exported for the existing callers.
 pub use model::generate_sweep_id;
