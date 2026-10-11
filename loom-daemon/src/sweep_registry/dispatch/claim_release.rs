@@ -28,6 +28,27 @@ impl SweepRegistry {
         }
     }
 
+    /// Remove `loom:building` and nothing else — no probes, never `--add-label`.
+    fn remove_building_claim(&self, issue_number: u32) -> Result<()> {
+        let mut args = vec![
+            "issue".to_string(),
+            "edit".to_string(),
+            issue_number.to_string(),
+            "--remove-label".to_string(),
+            "loom:building".to_string(),
+        ];
+        args.extend(crate::claim_reconciliation::gh_call::loom_repo_flag());
+        match self.gh_write("restore.label", &args)? {
+            None => anyhow::bail!("removing `loom:building` from #{issue_number} timed out"),
+            Some(out) if !out.status.success() => anyhow::bail!(
+                "removing `loom:building` from #{issue_number} failed ({}): {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+            Some(_) => Ok(()),
+        }
+    }
+
     /// 4e. Post-claim closed-issue re-verification (Issue #11304).
     ///
     /// The 2.5 guard is deliberately fail-open — a forge lookup error, breaker
@@ -38,9 +59,11 @@ impl SweepRegistry {
     /// stale from a `304`). Only a positive CLOSED/PR answer releases the
     /// claim; a `None` (probe error) stays fail-open and returns `Ok(())`.
     ///
-    /// The release goes through `restore_label_to_ready`, whose #9463
-    /// carve-out removes `loom:building` but never re-adds `loom:issue` to a
-    /// closed issue. The caller must not have spawned a child yet.
+    /// The release is remove-only ([`Self::remove_building_claim`]): the
+    /// positive CLOSED/PR answer is already in hand, so it must not go through
+    /// `restore_label_to_ready`, whose independent state probes can fail and
+    /// fall back to re-adding `loom:issue` to the known-closed issue. The
+    /// caller must not have spawned a child yet.
     pub(super) fn release_claim_if_closed_after_flip(
         &mut self,
         issue_number: u32,
@@ -55,7 +78,7 @@ impl SweepRegistry {
              PR) right after the claim flip (#11304) - the pre-flip guard failed open. \
              Releasing the claim instead of spawning a builder."
         );
-        let restore = self.restore_label_to_ready(issue_number);
+        let restore = self.remove_building_claim(issue_number);
         if restore.is_ok() {
             self.note_label_flip(issue_number); // #4485 flap detection
         }

@@ -29,16 +29,20 @@ fn registry(
     post_flip_stdout: &str,
     post_flip_exit: i32,
 ) -> (SweepRegistry, PathBuf, PathBuf) {
-    registry_with_edit_exit(ws, post_flip_stdout, post_flip_exit, 0)
+    registry_with_edit_exit(ws, post_flip_stdout, post_flip_exit, 0, None)
 }
 
 /// As [`registry`], but every `issue edit --remove-label loom:building` exits
-/// `remove_exit` (non-zero simulates a failed claim release).
+/// `remove_exit` (non-zero simulates a failed claim release). With
+/// `later_stdout`, only the first post-flip state read gets `post_flip_stdout`;
+/// later reads get `later_stdout` (e.g. OPEN, which would make a probing
+/// cleanup re-add `loom:issue`).
 fn registry_with_edit_exit(
     ws: &Path,
     post_flip_stdout: &str,
     post_flip_exit: i32,
     remove_exit: i32,
+    later_stdout: Option<&str>,
 ) -> (SweepRegistry, PathBuf, PathBuf) {
     touch_sweep_command(ws);
     let gh_log = ws.join("gh-invocations.log");
@@ -56,6 +60,8 @@ fn registry_with_edit_exit(
          fi\n\
          if [[ \"$1\" == \"api\" && \"$2\" == repos/* ]]; then\n\
          if [[ ! -e \"{flipped}\" ]]; then exit 1; fi\n\
+         if [[ -n '{later}' && \"$2\" =~ /issues/[0-9]+$ && -e \"{answered}\" ]]; then printf '%s\\n' '{later}'; exit 0; fi\n\
+         if [[ \"$2\" =~ /issues/[0-9]+$ ]]; then touch \"{answered}\"; fi\n\
          printf '%s\\n' '{state}'\n\
          exit {exit}\n\
          fi\n\
@@ -69,6 +75,8 @@ fn registry_with_edit_exit(
         state = post_flip_stdout,
         exit = post_flip_exit,
         remove_exit = remove_exit,
+        later = later_stdout.unwrap_or(""),
+        answered = ws.join("answered").display(),
     );
     make_executable(&fake_gh, &script);
     let spawn_marker = ws.join("spawn-called");
@@ -163,7 +171,7 @@ fn failed_label_release_is_reported_not_swallowed() {
     let dir = tempdir().unwrap();
     let ws = dir.path();
     let (mut reg, _gh_log, spawn_marker) =
-        registry_with_edit_exit(ws, &state_probe_json("closed", false), 0, 1);
+        registry_with_edit_exit(ws, &state_probe_json("closed", false), 0, 1, None);
 
     let err = reg
         .dispatch(&SweepKind::Issue(11307), None, None, None, None)
@@ -179,5 +187,30 @@ fn failed_label_release_is_reported_not_swallowed() {
     assert!(
         !ws.join(".loom/locks/issues/11307").exists(),
         "local claim lock is still unwound"
+    );
+}
+
+#[test]
+#[serial]
+fn confirmed_closed_release_is_remove_only_even_if_later_probes_say_open() {
+    let dir = tempdir().unwrap();
+    let ws = dir.path();
+    let open = state_probe_json("open", false);
+    let (mut reg, gh_log, spawn_marker) =
+        registry_with_edit_exit(ws, &state_probe_json("closed", false), 0, 0, Some(&open));
+
+    reg.dispatch(&SweepKind::Issue(11308), None, None, None, None)
+        .unwrap_err();
+    assert!(!spawn_marker.exists());
+    let edits = edit_calls(&gh_log);
+    assert!(
+        edits
+            .iter()
+            .any(|l| l.contains("--remove-label loom:building")),
+        "the loom:building claim must be removed: {edits:?}"
+    );
+    assert!(
+        !edits.iter().any(|l| l.contains("--add-label loom:issue")),
+        "the confirmed-closed answer must be carried into cleanup: {edits:?}"
     );
 }
