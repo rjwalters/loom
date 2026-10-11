@@ -630,6 +630,7 @@ impl WorkDispatcher for RegistryDispatcher {
             crate::sweep_registry::DispatchModel::Autonomous { complexity },
             None,
             None,
+            crate::sweep_registry::DispatchOrigin::WorkFinder,
         )?;
         if overflow && outcome.was_new {
             // Record the over-limit admission on the sweep itself (#9244), so

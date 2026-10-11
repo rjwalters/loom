@@ -1535,7 +1535,7 @@ impl SweepRegistry {
                                             // end to end under `&mut self`, so
                                             // it cannot let its caller release
                                             // the registry mutex for the poll.
-                                            // Calling `begin_issue_dispatch`
+                                            // Calling the begin step
                                             // directly instead — the same
                                             // first step
                                             // `dispatch_resume_after_crash`
@@ -1545,13 +1545,14 @@ impl SweepRegistry {
                                             // so a `Spawned` child's poll can
                                             // be deferred to the caller instead
                                             // of run here inline.
-                                            match self.begin_issue_dispatch(
+                                            match self.begin_issue_dispatch_with_model(
                                                 &SweepKind::Issue(issue),
                                                 None,
-                                                None,
+                                                DispatchModel::Resolved(None),
                                                 None,
                                                 None,
                                                 Some(pr),
+                                                DispatchOrigin::ReaperRetry,
                                             ) {
                                                 Ok(BeginIssueDispatch::Done(result)) => {
                                                     self.log_and_emit_resume_result(
