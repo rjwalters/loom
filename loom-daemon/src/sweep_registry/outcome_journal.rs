@@ -1046,6 +1046,9 @@ impl SweepRegistry {
             test_lines: landing_size.as_ref().map(|size| size.test_lines),
             tokens_status_reason,
             no_phase_cause,
+            phase_tap_usage: crate::telemetry::phase_tap_usage::rows_from(
+                &tap_region.phase_workers,
+            ),
         };
         // Issue #9441: both disposition invariants hold on every record this
         // daemon writes. A debug assertion rather than a runtime guard — the

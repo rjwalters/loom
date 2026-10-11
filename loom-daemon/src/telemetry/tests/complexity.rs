@@ -55,6 +55,7 @@ fn sweep_outcome_omits_complexity_when_no_marker_was_read() {
         tokens_status: None,
         tokens_status_reason: None,
         no_phase_cause: None,
+        phase_tap_usage: Vec::new(),
         attempt_index: None,
         previous_sweep_id: None,
         trigger: None,

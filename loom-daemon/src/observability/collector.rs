@@ -825,6 +825,7 @@ fn terminal_records(
             tokens_status: None,
             tokens_status_reason: None,
             no_phase_cause: None,
+            phase_tap_usage: Vec::new(),
             // Issues #9444/#9465/#9466: terminal facts the reaper-side journal
             // (the real `sweep.outcome`) computes. Absent, never fabricated.
             attempt_index: None,

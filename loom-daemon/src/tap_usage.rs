@@ -429,18 +429,35 @@ fn launch_blocks(
     contents: &str,
     header_anchor: &str,
 ) -> Option<Vec<(Option<TapAttribution>, TapUsage)>> {
+    Some(
+        launch_blocks_with_model(contents, header_anchor)?
+            .into_iter()
+            .map(|(tap, _model, usage)| (tap, usage))
+            .collect(),
+    )
+}
+
+/// One launch block: its tap (when attributable), recorded model, and usage.
+type LaunchBlock = (Option<TapAttribution>, Option<String>, TapUsage);
+
+/// [`launch_blocks`] plus the model each `# LOOM_LAUNCH` record names (Issue
+/// #11488). The model is deliberately not part of [`TapAttribution`]: it is
+/// not in the tap key, and adding it there would change every existing
+/// journal line.
+fn launch_blocks_with_model(contents: &str, header_anchor: &str) -> Option<Vec<LaunchBlock>> {
     let region = &contents[contents.rfind(header_anchor)?..];
-    let mut blocks: Vec<(Option<TapAttribution>, TapUsage)> = Vec::new();
+    let mut blocks: Vec<LaunchBlock> = Vec::new();
     for line in region.lines() {
         if let Some(record) = line.trim().strip_prefix(LAUNCH_RECORD_PREFIX) {
-            blocks.push((parse_launch_tap(record), TapUsage::default()));
+            let model = crate::launch_record::parse_launch_runtime(record).and_then(|r| r.model);
+            blocks.push((parse_launch_tap(record), model, TapUsage::default()));
             continue;
         }
         let usage = line_usage(line);
         // Usage ahead of the first record belongs to no launch in this region
         // — `blocks` is still empty, so it is charged to nobody.
         if let (Some(block), Some(usage)) = (blocks.last_mut(), usage) {
-            block.1.absorb(&usage);
+            block.2.absorb(&usage);
         }
     }
     Some(blocks)
@@ -572,6 +589,10 @@ impl RegionAccounting {
 pub struct PhaseTapAccounting {
     /// The phase role (`builder`, `doctor`) the log's file name records.
     pub role: String,
+    /// The model the launch record named (Issue #11488), when it recorded one.
+    /// It is not in the tap key, so a reader cannot recover it from `tap`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     #[serde(flatten)]
     pub accounting: TapAccounting,
 }
@@ -598,14 +619,23 @@ where
     };
     let mut rows: Vec<PhaseTapAccounting> = Vec::new();
     for (role, contents) in logs {
-        for accounting in account_launch_logs(contents, &anchor) {
+        let blocks = launch_blocks_with_model(contents, &anchor).unwrap_or_default();
+        for (tap, model, usage) in blocks {
+            let Some(tap) = tap else { continue };
+            let accounting = TapAccounting { tap, usage };
             match rows
                 .iter_mut()
                 .find(|row| row.role == role && row.accounting.key() == accounting.key())
             {
-                Some(row) => row.accounting.usage.absorb(&accounting.usage),
+                Some(row) => {
+                    row.accounting.usage.absorb(&accounting.usage);
+                    if row.model.is_none() {
+                        row.model = model;
+                    }
+                }
                 None => rows.push(PhaseTapAccounting {
                     role: role.to_string(),
+                    model,
                     accounting,
                 }),
             }

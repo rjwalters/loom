@@ -998,6 +998,7 @@ mod tests {
                 tokens_status: None,
                 tokens_status_reason: None,
                 no_phase_cause: None,
+                phase_tap_usage: Vec::new(),
                 attempt_index: None,
                 previous_sweep_id: None,
                 trigger: None,

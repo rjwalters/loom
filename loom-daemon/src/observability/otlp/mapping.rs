@@ -347,6 +347,9 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             if let Some(phases) = metadata::phase_durations(&r.phase_durations) {
                 attributes.push(phases);
             }
+            if let Some(usage) = metadata::phase_tap_usage(&r.phase_tap_usage) {
+                attributes.push(usage);
+            }
             (
                 "sweep.outcome",
                 severity_for_result(r.result),

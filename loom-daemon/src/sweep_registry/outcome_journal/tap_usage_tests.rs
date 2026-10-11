@@ -453,6 +453,32 @@ fn a_mixed_sweeps_phase_logs_reach_the_journal_once_beside_the_parent() {
     );
     // The journal line round-trips: `read_all` drops any line it cannot parse.
     assert!(outcome_line(&registry, mixed::ISSUE).contains("\"phase_tap_usage\""));
+
+    // Issue #11488: `sweep.outcome` carries the SAME rows (same roles, taps
+    // and counters), plus the launch record's model.
+    let telemetry_record = sweep_outcomes::read_all_sweep_outcomes(
+        &registry.config().resolve_outcome_telemetry_path(),
+    )
+    .into_iter()
+    .find(|r| r.issue == mixed::ISSUE)
+    .expect("sweep.outcome journaled");
+    assert_eq!(
+        telemetry_record.phase_tap_usage,
+        crate::telemetry::phase_tap_usage::rows_from(&record.phase_tap_usage)
+    );
+    assert_eq!(telemetry_record.phase_tap_usage.len(), 2);
+    for (row, journal) in telemetry_record
+        .phase_tap_usage
+        .iter()
+        .zip(&record.phase_tap_usage)
+    {
+        assert_eq!(row.role, journal.role);
+        assert_eq!(row.tap, journal.accounting.key());
+        assert_eq!(row.input, journal.accounting.usage.input);
+        assert_eq!(row.output, journal.accounting.usage.output);
+        assert_eq!(row.model.as_deref(), Some("glm-fixture-flash"));
+    }
+    assert!(raw.contains("\"phase_tap_usage\""), "{raw}");
 }
 
 /// AC 3 + 4 end to end: a Claude parent (no tap of its own) whose Builder
@@ -494,6 +520,41 @@ fn a_fallback_and_resumed_sweep_journals_only_its_own_phases_and_no_invented_cou
     let raw = std::fs::read_to_string(registry.config().resolve_outcome_telemetry_path())
         .expect("telemetry journal written");
     assert!(raw.contains(&format!("\"tap_phase_keys\":\"doctor={GLM_KEY}\"")), "{raw}");
-    assert!(!raw.contains("\"tap\":"), "no parent tap is fabricated: {raw}");
+    // The per-phase rows (#11488) carry their own `tap`; only `config.tap` names the parent's.
+    let journaled: serde_json::Value =
+        serde_json::from_str(raw.lines().next().expect("journal line")).unwrap();
+    assert!(
+        journaled["record"]["config"].get("tap").is_none(),
+        "no parent tap is fabricated: {raw}"
+    );
     assert!(!raw.contains("tap_input_tokens"), "no counter may be invented: {raw}");
+
+    // Issue #11488: the unmeasured row keeps role + tap and writes no counters.
+    let telemetry_record = sweep_outcomes::read_all_sweep_outcomes(
+        &registry.config().resolve_outcome_telemetry_path(),
+    )
+    .into_iter()
+    .find(|r| r.issue == mixed::ISSUE)
+    .expect("sweep.outcome journaled");
+    assert_eq!(telemetry_record.phase_tap_usage.len(), 1);
+    let row = serde_json::to_value(&telemetry_record.phase_tap_usage[0]).unwrap();
+    let keys: Vec<&str> = row
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    for counter in [
+        "input",
+        "output",
+        "reasoning",
+        "cache_read",
+        "cache_write",
+        "cost_estimate",
+        "usage_events",
+    ] {
+        assert!(!keys.contains(&counter), "unmeasured row must omit {counter}: {row}");
+    }
+    assert_eq!(row["role"], "doctor");
+    assert_eq!(row["tap"], GLM_KEY);
 }
