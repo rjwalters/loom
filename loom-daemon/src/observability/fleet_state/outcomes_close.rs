@@ -18,9 +18,9 @@
 //!   set for [`REPO_REMOVAL_CONFIRM_PASSES`] passes. An empty managed set
 //!   is an enumeration that failed, never a removal, and a repo back before
 //!   then was a blip: its stays return to the ordinary diff. Once the removal
-//!   holds, each stay is read once (`issues/{n}`): a merge or known-unmerged
-//!   close is `landed` / `abandoned` at the forge's `closed_at`; anything
-//!   else (still open, unresolved close, failed read) is `unknown` at the
+//!   holds, each stay is read once (`issues/{n}`): a close is `landed` /
+//!   `abandoned` (`unknown` when no `closed` event says how) at the forge's
+//!   `closed_at`; a still-open issue or a failed read is `unknown` at the
 //!   pass that first saw it gone, with no forge instant.
 
 use super::*;

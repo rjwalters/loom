@@ -79,11 +79,11 @@ fn a_closed_ready_issue_takes_the_issue_close_classification() {
 
 #[test]
 fn a_ready_close_with_no_known_closer_is_unknown_at_the_close() {
-    let mut forge = ready_closed(Some(|_| IssueFacts::ClosedUnresolved));
+    let mut forge = ready_closed(Some(IssueFacts::ClosedUnresolved));
     let r = only_one(&ready_close_run(&mut forge, 5), FleetStage::ReadyWait, 1);
-    assert_eq!((r.exit, r.forge_transition_at), (StageExit::Unknown, None));
+    assert_eq!((r.exit, r.forge_transition_at), (StageExit::Unknown, Some(minutes(3))));
     assert_eq!((r.left_at, r.dwell_sec), (minutes(3), None));
-    assert!(r.has_fact_key(), "keyed on the forge-dated entry");
+    assert!(r.has_fact_key(), "keyed on the forge close");
 }
 
 #[test]

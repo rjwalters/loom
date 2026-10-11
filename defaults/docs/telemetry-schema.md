@@ -2340,10 +2340,10 @@ is the new stage). A row that left the view gives one record with no
 still open without review labels. A row with no resolved PR (a sweep stage)
 reads its issue instead (#11398): `landed` at the issue's `closed_at` when its
 latest `closed` event carries a `commit_id` (a merge closed it), `abandoned`
-at `closed_at` when it was closed by hand as `not_planned` or `duplicate`,
-and `unknown` (no forge instant) when it is still open or closed by hand as
-`completed` / with no reason, which may have been a merge the forge did not
-link. A failed issue read emits nothing and is retried each pass; after
+at `closed_at` when that event has no `commit_id` (a hand close, whatever its
+`state_reason`), `unknown` at `closed_at` when no `closed` event is found, and
+`unknown` with no forge instant while it is still open. Every close keeps its
+`closed_at` as `forge_transition_at`, so it has a `loom.fact_id`. A failed issue read emits nothing and is retried each pass; after
 `PENDING_ISSUE_MAX_PASSES` (12) failed retries it is one `unknown` stamped at
 the pass that first saw the row gone, with no forge instant, and is never
 emitted again. A transferred or deleted issue answers 404 to that read, so
@@ -2375,8 +2375,8 @@ triage listings). An **empty** managed set is a failed enumeration, never a
 removal, and a repo back within `REPO_REMOVAL_CONFIRM_PASSES` (3) passes was a
 blip: its stays return to the ordinary diff. Once the removal holds, each stay
 ends exactly once: its issue is read (from any checkout; the path names the
-repo) and a merge / known-unmerged close is `landed` / `abandoned` at
-`closed_at`; anything else (open, unresolved close, failed read) is
+repo) and a close takes the classification above at `closed_at`; an open
+issue or a failed read is
 `unknown` at the pass that first saw the stay gone, with no forge instant
 (keyed per #11401 below when it has a sweep id or forge-dated entry). A row
 of the removed repo that vanishes later ends the same way, at once. **Every host that observes a transition emits it**; nothing is
@@ -2444,7 +2444,7 @@ pass interval. `forge_transition_at` is new (additive).
 | `entered_at` | RFC3339? | present only when the entry has an exact source: a sweep's own checkpoint timestamp. Absent for a polled (review or ready) row, whose entry fell between two passes, and for a stage first seen mid-way |
 | `left_at` | RFC3339 | the event time: `forge_transition_at` when known, else the observing pass |
 | `dwell_sec` | integer? | `left_at − entered_at`, only when the stage completed with an exact entry; never a lower bound |
-| `exit` | string | `advance`, `pass` (`review_wait` → `merge_wait`), `rework` (into `doctor`), `hold`, `released`, `landed`, `cut_short` (PR closed unmerged, or ended without completing), `abandoned` (#11398: the issue was closed by hand as `not_planned` / `duplicate`, with no commit closing it, ending a stay with no resolved PR: a sweep stage, `ready_wait`, `triage_wait`, `approval_wait`, or a stay of a repo removed from the fleet; `left_at` is the close instant, `dwell_sec` and `loom.fact_id` are set. A merge-closed issue is `landed`; an open, `completed`-by-hand, transferred/404 or never-readable issue is `unknown` — see the producer notes above), `unknown`. `judged` is no longer produced |
+| `exit` | string | `advance`, `pass` (`review_wait` → `merge_wait`), `rework` (into `doctor`), `hold`, `released`, `landed`, `cut_short` (PR closed unmerged, or ended without completing), `abandoned` (#11398: the issue was closed with no commit closing it, whatever its `state_reason`, ending a stay with no resolved PR: a sweep stage, `ready_wait`, `triage_wait`, `approval_wait`, or a stay of a repo removed from the fleet; `left_at` is the close instant, `dwell_sec` and `loom.fact_id` are set. A merge-closed issue is `landed`; a close with no `closed` event is `unknown` at `closed_at`; an open, transferred/404 or never-readable issue is `unknown` — see the producer notes above), `unknown`. `judged` is no longer produced |
 | `next_stage` | string? | the stage entered next; absent when the item left the view |
 | `event` | string | the observing source: `fleet.state` |
 | `observed_at` | RFC3339 | when this daemon observed it (knowable-at) |

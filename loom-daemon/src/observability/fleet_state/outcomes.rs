@@ -110,22 +110,17 @@ pub enum IssueFacts {
     /// Its latest `closed` event carries a `commit_id`: a merge (or a pushed
     /// commit) closed it, at `closed_at`.
     Merged(DateTime<Utc>),
-    /// Closed by hand with `state_reason` `not_planned` or `duplicate`, so
-    /// known unmerged, at `closed_at`.
+    /// Its latest `closed` event has no `commit_id`, so no merge closed it
+    /// (whatever its `state_reason`), at `closed_at`.
     NotMerged(DateTime<Utc>),
-    /// Closed, but nothing says whether work landed: a hand close as
-    /// `completed` (or with no reason), or no `closed` event found.
-    ClosedUnresolved,
+    /// Closed at `closed_at`, but no `closed` event says how.
+    ClosedUnresolved(DateTime<Utc>),
 }
 
 impl IssueFacts {
-    /// Classify a closed issue from its `state_reason` and its events pages.
+    /// Classify an issue closed at `closed_at` from its events pages.
     #[must_use]
-    pub fn closed(
-        closed_at: DateTime<Utc>,
-        state_reason: Option<&str>,
-        events: &[serde_json::Value],
-    ) -> Self {
+    pub fn closed(closed_at: DateTime<Utc>, events: &[serde_json::Value]) -> Self {
         let last_close = events
             .iter()
             .flat_map(|page| page.as_array().into_iter().flatten())
@@ -136,22 +131,21 @@ impl IssueFacts {
             Some((_, e)) if e["commit_id"].as_str().is_some_and(|c| !c.is_empty()) => {
                 IssueFacts::Merged(closed_at)
             }
-            Some(_) if matches!(state_reason, Some("not_planned" | "duplicate")) => {
-                IssueFacts::NotMerged(closed_at)
-            }
-            _ => IssueFacts::ClosedUnresolved,
+            Some(_) => IssueFacts::NotMerged(closed_at),
+            None => IssueFacts::ClosedUnresolved(closed_at),
         }
     }
 
     /// The exit and forge instant a vanished row with no resolved PR takes:
-    /// `landed` at a merge close, `abandoned` at a known-unmerged close,
-    /// else `unknown` with no forge instant (so no fact id).
+    /// `landed` at a merge close, `abandoned` at an unmerged close, `unknown`
+    /// at an unresolved close, and `unknown` with no forge instant while open.
     #[must_use]
     pub fn exit(self) -> (StageExit, Option<DateTime<Utc>>) {
         match self {
             IssueFacts::Merged(at) => (StageExit::Landed, Some(at)),
             IssueFacts::NotMerged(at) => (StageExit::Abandoned, Some(at)),
-            IssueFacts::Open | IssueFacts::ClosedUnresolved => (StageExit::Unknown, None),
+            IssueFacts::ClosedUnresolved(at) => (StageExit::Unknown, Some(at)),
+            IssueFacts::Open => (StageExit::Unknown, None),
         }
     }
 }
@@ -1183,7 +1177,7 @@ impl ForgeReads for GhForgeReads {
                 break;
             }
         }
-        Some(IssueFacts::closed(closed_at, issue["state_reason"].as_str(), &pages))
+        Some(IssueFacts::closed(closed_at, &pages))
     }
 
     fn label_history(&mut self, repo: &str, number: u32) -> Option<LabelHistory> {
