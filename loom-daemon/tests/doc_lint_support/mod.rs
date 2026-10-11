@@ -781,3 +781,108 @@ pub fn check_step_1b_lease_publish(content: &str) {
          renewal (nothing to pin it to) — got: {renew_calls:?}"
     );
 }
+
+/// #9265: a Doctor dispatched for a base conflict, with no Judge rejection
+/// outstanding, is a "rebase pass" — it sits OUTSIDE `sweep.max_doctor_cycles`
+/// and is bounded by its own fixed budget with its own park reason.
+///
+/// The regression this pins is the pre-#9265 rule, which charged every Doctor
+/// pass to the quality cap: an approved PR whose base merely moved was parked
+/// as `doctor cycle exhausted` with no route back (#10551, 2026-10-06).
+///
+/// Paragraph-scoped on purpose. "Does not consume a Doctor cycle" also appears
+/// in the refusal / credit / spend-limit fallbacks, so a whole-skill
+/// `contains()` would keep passing with the rebase-pass carve-out deleted.
+/// `skill_dir` is the directory holding the `sweep-*.md` siblings; the two
+/// lifecycle files are read separately because each must carry its own route.
+pub fn check_rebase_pass_carve_out(content: &str, skill_dir: &Path) {
+    let paragraph = |anchor: &str| -> &str {
+        content
+            .split("\n\n")
+            .find(|p| p.contains(anchor))
+            .unwrap_or_else(|| {
+                panic!("no paragraph in the sweep skill contains `{anchor}` (#9265)")
+            })
+    };
+
+    // PROSE (tolerant any-of) inside a CONTRACT-anchored paragraph: the term
+    // `rebase pass` is the vocabulary both lifecycles point at.
+    let pass = paragraph("is a **rebase pass**");
+    let no_cost_phrases: &[&str] = &[
+        "without consuming a Doctor cycle",
+        "without spending a Doctor cycle",
+        "does not consume a Doctor cycle",
+        "not consume a Doctor cycle",
+    ];
+    let pass_plain = pass.replace("**", "");
+    assert!(
+        no_cost_phrases.iter().any(|p| pass_plain.contains(p)),
+        "the rebase-pass paragraph must state the pass does not consume a Doctor cycle (#9265)"
+    );
+    for needle in [
+        "`attempt`",
+        "escalation ladder",
+        "loom:changes-requested",
+        "sweep.max_doctor_cycles",
+    ] {
+        assert!(
+            pass.contains(needle),
+            "the rebase-pass paragraph must mention `{needle}`: the carve-out is conditioned on no \
+             outstanding Judge rejection, leaves `attempt` and the ladder alone, and a later \
+             rejection still counts against the cap (#9265)"
+        );
+    }
+
+    // CONTRACT: the budget number, and a park reason distinct from the cap's.
+    let budget = paragraph("**Rebase budget:");
+    assert!(
+        budget.contains("3 rebase passes per PR"),
+        "the rebase budget must name its bound — 3 rebase passes per PR per sweep run (#9265)"
+    );
+    let reason = budget
+        .split("--reason \"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect(
+            "the rebase-budget paragraph must carry a `park-record apply --reason \"…\"` (#9265)",
+        );
+    assert!(
+        reason.contains("rebase budget exhausted") && reason.contains("main is moving"),
+        "the rebase-budget park reason must name rebase churn, got `{reason}` (#9265)"
+    );
+    for forbidden in ["doctor cycle exhausted", "doctor cap"] {
+        assert!(
+            !budget.to_lowercase().contains(forbidden),
+            "the rebase-budget park reason / log line must not reuse the quality cap's \
+             `{forbidden}` vocabulary (#9265)"
+        );
+    }
+
+    // The quality cap itself is untouched: its own reason and the
+    // distinct-defect exception are still documented.
+    assert!(
+        content.contains("--reason \"doctor cap\"") && content.contains("distinct defect"),
+        "the Judge-rejection cap's own park reason and the distinct-defect exception must survive (#9265)"
+    );
+    assert!(
+        !content.contains("a revalidation Doctor counts against"),
+        "step 7 must no longer charge a revalidation (base-conflict) Doctor to \
+         `sweep.max_doctor_cycles` (#9265)"
+    );
+
+    // Both lifecycles route an approved-but-conflicting PR without the cap.
+    for name in ["sweep-wave-lifecycle.md", "sweep-mode-c-lifecycle.md"] {
+        let text = fs::read_to_string(skill_dir.join(name)).expect("sweep lifecycle sibling");
+        assert!(
+            text.contains("rebase pass") && text.contains("do not consult the Doctor-cycle cap"),
+            "`{name}` must route an approved PR that is CONFLICTING at merge time through a \
+             rebase pass → re-Judge → merge, without consulting the Doctor-cycle cap (#9265)"
+        );
+    }
+    let summary =
+        fs::read_to_string(skill_dir.join("sweep-summary-output.md")).expect("summary sibling");
+    assert!(
+        summary.contains("blocked (rebase budget exhausted"),
+        "`sweep-summary-output.md` must carry the rebase-churn summary vocabulary (#9265)"
+    );
+}
