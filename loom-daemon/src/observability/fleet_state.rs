@@ -800,6 +800,7 @@ static STATE: Mutex<PassState> = Mutex::new(PassState {
         unread: BTreeMap::new(),
         settled: BTreeSet::new(),
         pending_ready: BTreeMap::new(),
+        pending_issue: BTreeMap::new(),
         curated: BTreeMap::new(),
         curated_now: None,
         pre_ready_done: BTreeSet::new(),

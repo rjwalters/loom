@@ -2404,7 +2404,7 @@ pass interval. `forge_transition_at` is new (additive).
 | `entered_at` | RFC3339? | present only when the entry has an exact source: a sweep's own checkpoint timestamp. Absent for a polled (review or ready) row, whose entry fell between two passes, and for a stage first seen mid-way |
 | `left_at` | RFC3339 | the event time: `forge_transition_at` when known, else the observing pass |
 | `dwell_sec` | integer? | `left_at − entered_at`, only when the stage completed with an exact entry; never a lower bound |
-| `exit` | string | `advance`, `pass` (`review_wait` → `merge_wait`), `rework` (into `doctor`), `hold`, `released`, `landed`, `cut_short` (closed unmerged, or ended without completing), `unknown`. `judged` is no longer produced |
+| `exit` | string | `advance`, `pass` (`review_wait` → `merge_wait`), `rework` (into `doctor`), `hold`, `released`, `landed`, `cut_short` (PR closed unmerged, or ended without completing), `abandoned` (#11398: the issue closed without a merge while the item sat in the stage, `left_at` is the issue's `closed_at`, `dwell_sec` and `loom.fact_id` are set; a failed issue read is retried each pass and never emitted timeless, and an issue still open or never readable stays `unknown`), `unknown`. `judged` is no longer produced |
 | `next_stage` | string? | the stage entered next; absent when the item left the view |
 | `event` | string | the observing source: `fleet.state` |
 | `observed_at` | RFC3339 | when this daemon observed it (knowable-at) |

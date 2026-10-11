@@ -272,6 +272,21 @@ fn every_stage_outcome_carries_a_fact_id_or_a_reason() {
     }
 }
 
+/// An item whose issue closed leaves with `abandoned` at the forge's close
+/// instant (#11398): any host, polling at any time, shares the fact id.
+#[test]
+fn an_abandoned_exit_is_one_fact_across_hosts() {
+    let closed = |observed: i64| StageOutcomeRecord {
+        exit: StageExit::Abandoned,
+        next_stage: None,
+        ..stage_record(9, FleetStage::SweepCurator, FleetStage::SweepBuilder, observed)
+    };
+    let a = ids("host-a", &TelemetryRecord::StageOutcome(closed(30)), 0).0;
+    let b = ids("host-b", &TelemetryRecord::StageOutcome(closed(30)), 400).0;
+    assert_eq!(a.len(), 16);
+    assert_eq!(a, b);
+}
+
 #[test]
 fn a_pr_closed_reopened_and_closed_again_is_two_facts() {
     let first = TelemetryRecord::PrResolved(pr_record(7, PrResolution::Closed, 0));
@@ -309,7 +324,7 @@ fn fact_id_differs_across_natural_keys() {
 fn two_hosts_running_the_producer_at_different_times_emit_one_fact() {
     use crate::observability::fleet_state::history::HistoryEvent;
     use crate::observability::fleet_state::outcomes::{
-        diff, listed, remember, ForgeReads, LabelHistory, Memory, Pass, PullFacts,
+        diff, listed, remember, ForgeReads, IssueFacts, LabelHistory, Memory, Pass, PullFacts,
     };
     use crate::observability::fleet_state::{build_view, FleetInput, ListedPr, RepoListing};
     use std::collections::BTreeMap;
@@ -319,6 +334,10 @@ fn two_hosts_running_the_producer_at_different_times_emit_one_fact() {
         fn pull(&mut self, _: &str, _: u32) -> Option<PullFacts> {
             None
         }
+        fn issue(&mut self, _: &str, _: u32) -> Option<IssueFacts> {
+            Some(IssueFacts { closed_at: None })
+        }
+
         fn label_history(&mut self, _: &str, _: u32) -> Option<LabelHistory> {
             Some(LabelHistory {
                 events: vec![(self.0, HistoryEvent::Labeled("loom:pr".to_string()))],
@@ -379,7 +398,7 @@ fn two_hosts_running_the_producer_at_different_times_emit_one_fact() {
 fn a_claimed_ready_issue_is_one_fact_across_hosts() {
     use crate::observability::fleet_state::history::HistoryEvent;
     use crate::observability::fleet_state::outcomes::{
-        diff, listed, remember, ForgeReads, LabelHistory, Memory, Pass, PullFacts,
+        diff, listed, remember, ForgeReads, IssueFacts, LabelHistory, Memory, Pass, PullFacts,
     };
     use crate::observability::fleet_state::{
         build_view, FleetInput, HeldSweep, ReadyItem, ReadyQueue,
@@ -392,6 +411,10 @@ fn a_claimed_ready_issue_is_one_fact_across_hosts() {
         fn pull(&mut self, _: &str, _: u32) -> Option<PullFacts> {
             None
         }
+        fn issue(&mut self, _: &str, _: u32) -> Option<IssueFacts> {
+            Some(IssueFacts { closed_at: None })
+        }
+
         fn label_history(&mut self, _: &str, _: u32) -> Option<LabelHistory> {
             let label = |l: &str| l.to_string();
             Some(LabelHistory {

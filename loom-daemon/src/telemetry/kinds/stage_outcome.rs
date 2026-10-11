@@ -69,6 +69,11 @@ pub enum StageExit {
     /// Cut short: the PR closed unmerged, or the stage ended without
     /// completing. There is no dwell.
     CutShort,
+    /// The issue was closed without a merge while the item sat in the stage
+    /// (done elsewhere, rescoped, abandoned), or it left the fleet. Unlike
+    /// `CutShort` the stay completed at the forge's close instant, so it has
+    /// a dwell (#11398).
+    Abandoned,
     /// Nothing observed says how.
     Unknown,
 }
@@ -86,6 +91,7 @@ impl StageExit {
             StageExit::Judged => "judged",
             StageExit::Landed => "landed",
             StageExit::CutShort => "cut_short",
+            StageExit::Abandoned => "abandoned",
             StageExit::Unknown => "unknown",
         }
     }

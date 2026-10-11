@@ -85,11 +85,34 @@ const PRE_READY_MEMORY_DAYS: i64 = 14;
 /// it is emitted as `unknown` (about an hour at the collector's cadence).
 pub const PENDING_READY_MAX_PASSES: u32 = 12;
 
+/// Failed issue reads a vanished row waits through before it is emitted as
+/// `unknown` without a fact id (#11398).
+pub const PENDING_ISSUE_MAX_PASSES: u32 = 12;
+
 /// A PR's state from one `pulls/{n}` read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PullFacts {
     pub merged_at: Option<DateTime<Utc>>,
     pub closed_at: Option<DateTime<Utc>>,
+}
+
+/// An issue's state from one `issues/{n}` read (#11398).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IssueFacts {
+    /// When the issue was closed; `None` while it is open.
+    pub closed_at: Option<DateTime<Utc>>,
+}
+
+/// A row that vanished with no resolved PR whose issue read failed, awaiting
+/// a successful read (#11398).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingIssue {
+    pub row: FleetStateRow,
+    pub source: Option<Source>,
+    /// The pass that first saw it gone.
+    pub since: DateTime<Utc>,
+    /// Failed reads so far.
+    pub passes: u32,
 }
 
 /// The per-item forge reads, injected so the diff is testable offline.
@@ -99,6 +122,8 @@ pub trait ForgeReads {
     /// The label history of issue or PR `number`, or `None` when the read
     /// failed.
     fn label_history(&mut self, repo: &str, number: u32) -> Option<LabelHistory>;
+    /// Issue `number` in `repo`, or `None` when the read failed.
+    fn issue(&mut self, repo: &str, number: u32) -> Option<IssueFacts>;
 }
 
 /// Open PR number → the issue its body links, per completely listed repo.
@@ -149,6 +174,9 @@ pub struct Memory {
     /// Departed `ready_wait` rows awaiting their forge departure, by
     /// `(repo, issue)`.
     pub pending_ready: BTreeMap<(String, u32), PendingReady>,
+    /// Vanished rows with no resolved PR whose issue read failed (#11398),
+    /// retried each pass.
+    pub pending_issue: BTreeMap<(String, u32), PendingIssue>,
     /// Each repo's last complete `loom:curated` listing (#11368).
     pub curated: Curated,
     /// This pass's complete curated listings, set by the caller before
@@ -686,6 +714,7 @@ pub fn diff(
     memory.unread = unread;
     let mut settled = std::mem::take(&mut memory.settled);
     let mut pending = settle_pending_ready(memory, pass, &mut diff, &mut out);
+    let mut pending_issue = settle_pending_issue(memory, pass, &mut diff, &mut out);
 
     let empty = super::RepoView::default();
     for (repo, was_repo) in &prev.repos {
@@ -773,6 +802,7 @@ pub fn diff(
                         continue;
                     }
                     let facts = was.pr.and_then(|pr| resolved.get(&(repo.clone(), pr)));
+                    let source = was_repo.sources.get(&issue).copied();
                     let (exit, forge_at) = match facts {
                         Some(PullFacts {
                             merged_at: Some(at),
@@ -783,14 +813,35 @@ pub fn diff(
                             ..
                         }) => (StageExit::CutShort, Some(*at)),
                         Some(_) => (StageExit::CutShort, None),
-                        None => (StageExit::Unknown, None),
+                        // No PR said how: the issue's own close is the
+                        // departure (#11398).
+                        None => match diff.forge.issue(repo, issue) {
+                            Some(IssueFacts {
+                                closed_at: Some(at),
+                            }) => (StageExit::Abandoned, Some(at)),
+                            Some(IssueFacts { closed_at: None }) => (StageExit::Unknown, None),
+                            None => {
+                                log::debug!(
+                                    "fleet.state: issues/{issue} of {repo} unread; retrying next pass"
+                                );
+                                pending_issue.insert(
+                                    (repo.clone(), issue),
+                                    PendingIssue {
+                                        row: was.clone(),
+                                        source,
+                                        since: pass.now,
+                                        passes: 0,
+                                    },
+                                );
+                                continue;
+                            }
+                        },
                     };
                     let leaving = Leaving {
                         exit,
                         next_stage: None,
                         forge_at,
                     };
-                    let source = was_repo.sources.get(&issue).copied();
                     out.push(TelemetryRecord::StageOutcome(
                         diff.record(repo, issue, was, source, leaving),
                     ));
@@ -806,6 +857,7 @@ pub fn diff(
     });
     memory.settled = settled;
     memory.pending_ready = pending;
+    memory.pending_issue = pending_issue;
     out
 }
 
@@ -861,6 +913,56 @@ fn settle_pending_ready<F: ForgeReads>(
     kept
 }
 
+/// Settle the vanished rows whose issue read failed (#11398): drop one whose
+/// row is back or whose repo is no longer managed, emit one whose issue now
+/// reads (`abandoned` at the close instant, or `unknown` while it is open),
+/// and emit one past [`PENDING_ISSUE_MAX_PASSES`] as `unknown` at the pass
+/// that first saw it gone, with no fact id. Returns those still waiting.
+fn settle_pending_issue<F: ForgeReads>(
+    memory: &mut Memory,
+    pass: &Pass<'_>,
+    diff: &mut Diff<'_, F>,
+    out: &mut Vec<TelemetryRecord>,
+) -> BTreeMap<(String, u32), PendingIssue> {
+    let mut kept = BTreeMap::new();
+    for ((repo, issue), waiting) in std::mem::take(&mut memory.pending_issue) {
+        let back = pass
+            .view
+            .repos
+            .get(&repo)
+            .is_some_and(|r| r.rows.contains_key(&issue));
+        if back || !pass.managed.contains(&repo) {
+            continue;
+        }
+        let (exit, forge_at) = match diff.forge.issue(&repo, issue) {
+            Some(IssueFacts {
+                closed_at: Some(at),
+            }) => (StageExit::Abandoned, Some(at)),
+            Some(IssueFacts { closed_at: None }) => (StageExit::Unknown, None),
+            None => {
+                let passes = waiting.passes + 1;
+                if passes < PENDING_ISSUE_MAX_PASSES {
+                    kept.insert((repo, issue), PendingIssue { passes, ..waiting });
+                    continue;
+                }
+                (StageExit::Unknown, None)
+            }
+        };
+        let leaving = Leaving {
+            exit,
+            next_stage: None,
+            forge_at,
+        };
+        let mut record = diff.record(&repo, issue, &waiting.row, waiting.source, leaving);
+        if forge_at.is_none() {
+            record.left_at = waiting.since;
+            record.dwell_sec = dwell(record.exit, record.entered_at, record.left_at);
+        }
+        out.push(TelemetryRecord::StageOutcome(record));
+    }
+    kept
+}
+
 /// The next pass's memory: this pass's view and time, and each repo's latest
 /// complete listing (a repo whose listing failed keeps its earlier one).
 #[must_use]
@@ -880,6 +982,7 @@ pub fn remember(memory: Memory, pass: &Pass<'_>) -> Memory {
         unread: memory.unread,
         settled: memory.settled,
         pending_ready: memory.pending_ready,
+        pending_issue: memory.pending_issue,
         warm: BTreeMap::new(),
         view: Some(pass.view.clone()),
         at: Some(pass.now),
@@ -944,6 +1047,16 @@ impl ForgeReads for GhForgeReads {
         Some(PullFacts {
             merged_at: parse_instant(pull["merged_at"].as_str()),
             closed_at: parse_instant(pull["closed_at"].as_str()),
+        })
+    }
+
+    fn issue(&mut self, repo: &str, number: u32) -> Option<IssueFacts> {
+        let issue = crate::observability::ops::stage_dwell::gh_json(
+            self.root(repo)?,
+            &format!("repos/{repo}/issues/{number}"),
+        )?;
+        Some(IssueFacts {
+            closed_at: parse_instant(issue["closed_at"].as_str()),
         })
     }
 
