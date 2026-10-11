@@ -364,7 +364,7 @@ When the user explicitly instructs you to evaluate a specific PR by number:
 # PR has: no loom labels yet
 
 # ✅ Proceed immediately (lease first, as in Primary Queue step 2)
-loom-daemon lease pr claim 599 --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"; [ $? -le 2 ] && gh pr edit 599 --add-label "loom:reviewing"
+loom-daemon lease pr claim 599 --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"; [[ $? =~ ^[02]$ ]] && gh pr edit 599 --add-label "loom:reviewing"
 ./.loom/scripts/post-comment.sh 599 --pr --body "Starting evaluation of this PR"
 
 # Check out and evaluate (worktree-aware — see "PR Branch Isolation",
@@ -513,7 +513,7 @@ Full policy, TTL/invalidation semantics, and the manual verification steps:
 
 0. **Sweep stale verdicts first**: run the Stale-Verdict Sweep (see below) over the open `loom:pr` / `loom:changes-requested` PRs. Any PR it re-queues joins step 1's queue on this same pass.
 1. **Find work**: `loom-daemon pr-queue --role judge`. Walk its JSON rows in order; `mode=workflow` uses this workflow, `mode=fallback` uses Fallback Queue below. Follow `.loom/docs/pr-planning.md`; skip non-actionable rows and continue. Never change origin or the operator star.
-2. **Claim PR** (run the "Stale `loom:reviewing` Claim Check" below first): take the PR lease, then add the label only once it is held — `loom-daemon lease pr claim <number> --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"; [ $? -le 2 ] && gh pr edit <number> --add-label "loom:reviewing"`. Exit 4/5: stand down, touch no worktree (see "PR Lease")
+2. **Claim PR** (run the "Stale `loom:reviewing` Claim Check" below first): take the PR lease, then add the label only once it is held — `loom-daemon lease pr claim <number> --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"; [[ $? =~ ^[02]$ ]] && gh pr edit <number> --add-label "loom:reviewing"`. Any other exit: stand down, touch no worktree (see "PR Lease")
 3. **Check merge state**: Check for conflicts and attempt automated rebase if DIRTY (see Automated Rebase for DIRTY PRs below)
    ```bash
    # Plain `gh` — merge state is verdict-gating and must be live (see "Cached Forge Reads")
@@ -544,6 +544,7 @@ Full policy, TTL/invalidation semantics, and the manual verification steps:
 11. **Update labels** (⚠️ NEVER use `gh pr review` - see warning at top of file). **Run the Verdict-Time CAS Recheck (see below) immediately before this step** — abort instead of writing if it finds your claim lost, another Judge's verdict already landed, or the head SHA moved off `REVIEW_HEAD_SHA`. It yields `$VERDICT_SHA`, which `post-verdict.sh` MUST be given (see "Verdict SHA Marker") — the script stamps the `<!-- loom:verdict-sha ... -->` marker itself. The script applies the label (the PRIMARY deliverable) itself; see Label Workflow for exits 7/8:
    - If approved: `post-verdict.sh <number> approved "$VERDICT_SHA" --body ...` (blue `loom:pr` - ready for Champion auto-merge)
    - If changes needed: `post-verdict.sh <number> changes-requested "$VERDICT_SHA" --body ...` (amber - Doctor will address)
+   - Then release the PR lease: `loom-daemon lease pr release <number> --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"` (also on any stand-down)
 
 ### Stale `loom:reviewing` Claim Check (Step 2)
 
@@ -646,7 +647,7 @@ reclaim comment:
 
 ```bash
 # The lease first: a live peer lease (exit 4) means stand down, label untouched.
-loom-daemon lease pr claim $N --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"; [ $? -le 2 ] &&
+loom-daemon lease pr claim $N --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"; [[ $? =~ ^[02]$ ]] &&
 gh pr edit $N --remove-label "loom:reviewing" &&
 gh pr comment $N --body "Reclaiming loom:reviewing claim: $STANDDOWN_COUNT consecutive stand-down passes have accumulated against claim $CLAIMED_AT (age ≥ ${LOOM_STALE_REVIEWING_MINUTES:-30}m) with no actual review progress (bounded fallback, LOOM_MAX_STANDDOWN_STREAK=${LOOM_MAX_STANDDOWN_STREAK:-3}) — breaking the livelock." &&
 gh pr edit $N --add-label "loom:reviewing"
@@ -657,7 +658,7 @@ gh pr edit $N --add-label "loom:reviewing"
 
 ```bash
 # The lease first: a live peer lease (exit 4) means stand down, label untouched.
-loom-daemon lease pr claim $N --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"; [ $? -le 2 ] &&
+loom-daemon lease pr claim $N --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"; [[ $? =~ ^[02]$ ]] &&
 gh pr edit $N --remove-label "loom:reviewing" &&
 gh pr comment $N --body "Reclaiming stale loom:reviewing claim (idle ${IDLE_MINUTES}m > ${LOOM_STALE_REVIEWING_MINUTES:-30}m with no claimant activity) — a prior Judge's parent sweep likely died mid-review." &&
 gh pr edit $N --add-label "loom:reviewing"
@@ -705,8 +706,9 @@ comment id, and renews yours while your session lives
 
 - **claim** exit **0** = held: add `loom:reviewing` (**2** = an older
   `loom-daemon` without `lease pr`: label alone, as before). **4** = a peer's
-  live lease wins (a lost race posts your yield record), **5** = unreadable:
-  stand down **before** any worktree or label action and continue the batch;
+  live lease wins (a lost race posts your yield record), **5** = unreadable,
+  any other code (**1** = `loom-daemon` failed to start) = unknown: never
+  "label-only" — stand down **before** any worktree or label action and continue the batch;
   leave the peer's `loom:reviewing` alone.
 - **fence** is part of the Verdict-Time CAS Recheck below.
 - **release** after the verdict write or any stand-down:
@@ -741,8 +743,8 @@ N=<pr-number>
 # from memory) reinstates exactly the race it closes. See "Cached Forge Reads".
 # One read serves both arms: the label state AND the head SHA your verdict is
 # about to be stamped with (#5686).
-# The lease fence first: exit 3 or 4 means the claim is lost (row 2 below).
-loom-daemon lease pr fence $N --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"; [ $? -le 2 ] || echo "CLAIM LOST"
+# The lease fence first: any exit but 0 or 2 means the claim is lost (row 2 below).
+loom-daemon lease pr fence $N --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"; [[ $? =~ ^[02]$ ]] || echo "CLAIM LOST"
 CURRENT=$(gh pr view $N --json labels,headRefOid)
 CURRENT_LABELS=$(printf '%s\n' "$CURRENT" | jq -r '[.labels[].name] | join(",")')
 VERDICT_SHA=$(printf '%s\n' "$CURRENT" | jq -r '.headRefOid')
@@ -2137,10 +2139,10 @@ git add -A
 git commit -m "Remove unused import (during evaluation)"
 ```
 
-**Step 4: Push to the PR branch**
+**Step 4: Push to the PR branch** (behind the lease fence; any exit but 0 or 2 = claim lost, do not push)
 
 ```bash
-git push
+loom-daemon lease pr fence <number> --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"; [[ $? =~ ^[02]$ ]] && git push
 ```
 
 **Step 5: Note the fix in your approval comment** (run the Verdict-Time CAS Recheck immediately before the `gh pr edit` below)

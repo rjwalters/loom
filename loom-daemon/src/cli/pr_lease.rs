@@ -798,7 +798,13 @@ impl Ctx {
             }
             ClaimState::HeldBySelf { id } => {
                 self.say(&format!("already held by this claimant (comment {id}); re-attaching"));
-                self.start_renewal(id, self.gh.story_issue(self.pr()));
+                // The renewer ages its guard from the lease's last forge write.
+                let leased_at = rows
+                    .iter()
+                    .flatten()
+                    .find(|r| r.id == id)
+                    .map_or_else(self.now, |r| r.updated_at);
+                self.start_renewal(id, self.gh.story_issue(self.pr()), leased_at);
                 println!("{} {}", self.me.host, self.me.sweep);
                 return EXIT_HELD;
             }
@@ -807,6 +813,9 @@ impl Ctx {
         let story = self.gh.story_issue(self.pr());
         let provenance = provenance_line(&self.gh.root, &self.me, story);
         let body = lease_body(&self.me, self.pr(), None, &provenance);
+        // Before the post, so the renewer's guard never overestimates the
+        // lease's remaining life.
+        let leased_at = (self.now)();
         let Some(own_id) = self.gh.post(self.pr(), &body) else {
             self.say("could not post the lease comment; no claim taken — stand down");
             return EXIT_UNVERIFIED;
@@ -836,7 +845,7 @@ impl Ctx {
                 EXIT_PEER
             }
             Ordering::Won | Ordering::Unverified => {
-                self.start_renewal(own_id, story);
+                self.start_renewal(own_id, story, leased_at);
                 self.say(&format!(
                     "lease {own_id} held (host={} sweep={}); add `{}` now",
                     self.me.host,
@@ -875,7 +884,7 @@ impl Ctx {
         Ordering::Won
     }
 
-    fn start_renewal(&self, comment_id: u64, story: Option<u32>) {
+    fn start_renewal(&self, comment_id: u64, story: Option<u32>, leased_at: DateTime<Utc>) {
         if !self.manage_renewer {
             return;
         }
@@ -883,7 +892,7 @@ impl Ctx {
             self.say("no --watch-pid: lease not renewed, it ages out at the TTL");
             return;
         };
-        let line = renew::spawn(self, comment_id, watch_pid, story);
+        let line = renew::spawn(self, comment_id, watch_pid, story, leased_at);
         self.say(&line);
     }
 

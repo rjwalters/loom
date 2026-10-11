@@ -667,7 +667,7 @@ When the user explicitly instructs you to work on a specific PR by number:
 # PR has: no loom labels yet
 
 # ✅ Proceed immediately (still run the stale-claim check if loom:treating is present)
-loom-daemon lease pr claim 588 --role doctor --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"; [ $? -le 2 ] && gh pr edit 588 --add-label "loom:treating"
+loom-daemon lease pr claim 588 --role doctor --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"; [[ $? =~ ^[02]$ ]] && gh pr edit 588 --add-label "loom:treating"
 CLAIM_HEAD_SHA=$(gh pr view 588 --json headRefOid --jq '.headRefOid')
 ./.loom/scripts/post-comment.sh 588 --pr --body "Addressing issues on this PR per user request"
 
@@ -711,7 +711,7 @@ gh pr edit 588 --remove-label "loom:treating" --add-label "loom:review-requested
 2. **Claim the PR** (run the "Stale `loom:treating` Claim Check" below **first**): take the PR lease ("PR Lease" below), add `loom:treating` only once it is held, and record the head SHA you start from
    ```bash
    loom-daemon lease pr claim <number> --role doctor --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"
-   [ $? -le 2 ] && gh pr edit <number> --add-label "loom:treating"   # else: stand down, touch no worktree
+   [[ $? =~ ^[02]$ ]] && gh pr edit <number> --add-label "loom:treating"   # else: stand down, touch no worktree
    CLAIM_HEAD_SHA=$(gh pr view <number> --json headRefOid --jq '.headRefOid')
    ```
 3. **Check PR details**: `gh pr view <number>` - look for "Changes requested" reviews or conflicts
@@ -848,7 +848,7 @@ Use this reclaim comment:
 
 ```bash
 # The lease first: a live peer lease (exit 4) means stand down, label untouched.
-loom-daemon lease pr claim $N --role doctor --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"; [ $? -le 2 ] &&
+loom-daemon lease pr claim $N --role doctor --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"; [[ $? =~ ^[02]$ ]] &&
 gh pr edit $N --remove-label "loom:treating" &&
 ./.loom/scripts/post-comment.sh $N --pr --body "Reclaiming loom:treating claim: $STANDDOWN_COUNT stand-down passes, no fix progress for ${LOOM_STALE_TREATING_MINUTES:-60}m (bounded by LOOM_MAX_STANDDOWN_STREAK=${LOOM_MAX_STANDDOWN_STREAK:-3}) — breaking the livelock." &&
 gh pr edit $N --add-label "loom:treating"
@@ -860,7 +860,7 @@ CLAIM_HEAD_SHA=$(gh pr view $N --json headRefOid --jq '.headRefOid')
 
 ```bash
 # The lease first: a live peer lease (exit 4) means stand down, label untouched.
-loom-daemon lease pr claim $N --role doctor --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"; [ $? -le 2 ] &&
+loom-daemon lease pr claim $N --role doctor --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"; [[ $? =~ ^[02]$ ]] &&
 gh pr edit $N --remove-label "loom:treating" &&
 ./.loom/scripts/post-comment.sh $N --pr --body "Reclaiming stale loom:treating claim (idle ${IDLE_MINUTES}m > ${LOOM_STALE_TREATING_MINUTES:-60}m, no claimant activity) — the prior process likely died mid-fix." &&
 gh pr edit $N --add-label "loom:treating"
@@ -901,13 +901,14 @@ comment id, and renews yours while your session lives
 
 - **claim** exit **0** = held: add `loom:treating` (**2** = an older
   `loom-daemon` without `lease pr`: label alone, as before). **4** = a peer's
-  live lease wins (a lost race posts your yield record), **5** = unreadable:
-  stand down **before** any worktree, snapshot or label action, next PR. Never
+  live lease wins (a lost race posts your yield record), **5** = unreadable,
+  any other code (**1** = `loom-daemon` failed to start) = unknown: never
+  "label-only" — stand down **before** any worktree, snapshot or label action, next PR. Never
   reset, snapshot or kill anything in a worktree a peer's lease holds, and leave
   its `loom:treating` alone.
 - **fence** immediately before every push (step 9) and the completion write
   (step 11): `loom-daemon lease pr fence <n> --role doctor --watch-pid …`;
-  exit 3 or 4 = claim lost, stand down.
+  any exit but 0 or 2 = claim lost, stand down.
 - **release** when you finish or stand down: `loom-daemon lease pr release <n>
   --role doctor --watch-pid …`.
 

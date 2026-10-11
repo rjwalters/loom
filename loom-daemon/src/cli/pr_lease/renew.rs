@@ -10,23 +10,42 @@
 //! identity still matches.
 //!
 //! Each cycle (default every 300 s, `SWEEP_LEASE_RENEW_INTERVAL_SECS`) makes
-//! two requests: one `GET issues/<pr>` (state and labels) and one PATCH of
-//! the lease comment — 24/h per held lease, the issue renewer's dispatched
-//! budget. It stops when the watched session dies, at the age cap (4 h, like
-//! `lease ensure`), on `release`, when the PR closes, when the lease comment
-//! is gone, or when the role's claim label has been absent for two
-//! consecutive cycles. That last one is the backstop for a claimant that
+//! up to three requests: one `GET issues/<pr>` (state and labels), one read
+//! of the PR's `loom:pr-lease*` comments, and one PATCH of the lease comment
+//! — 36/h per held lease. It stops when the watched session dies, at the age
+//! cap (4 h, like `lease ensure`), on `release`, when the PR closes, when the
+//! lease comment is gone, or when the role's claim label has been absent for
+//! two consecutive cycles. That last one is the backstop for a claimant that
 //! finished without calling `release`: the label is the projection the role
 //! removes when it is done, and two cycles tolerate a reclaim's
 //! remove-then-add.
+//!
+//! ## A renewal never revives an expired lease
+//!
+//! A PATCH refreshes `updated_at`, and the lease's comment `id` is older than
+//! any claim a peer made after it expired, so renewing a lease that has
+//! already aged out would make it the earliest live lease again and take the
+//! claim from that peer mid-flight. Two guards run before every PATCH:
+//!
+//! - **Wall clock.** The loop stops once the last successful renewal (or the
+//!   claim itself) is within [`RENEW_MARGIN_SECS`] of the TTL. Measured with
+//!   `chrono::Utc::now()`, never `Instant`: on macOS `Instant` does not
+//!   advance while the machine sleeps, which is exactly the lid-closed case.
+//!   The 4 h cap uses the same wall clock.
+//! - **The forge.** It re-reads the role's leases and renews only while its
+//!   own comment is still this role's earliest live lease. A peer holding the
+//!   claim, or its own lease no longer live, stops the loop. An unreadable
+//!   list falls back to the wall-clock guard alone.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Utc};
+
 use super::super::lease_renewer::{self, Key, Store};
-use super::{lease_body, provenance_line, Ctx, Gh, Identity, Role};
+use super::{claim_state, lease_body, provenance_line, ClaimState, Ctx, Gh, Identity, Role};
 
 /// Renewal cadence, shared with the issue renewer's knob.
 const INTERVAL_ENV: &str = "SWEEP_LEASE_RENEW_INTERVAL_SECS";
@@ -35,6 +54,10 @@ pub(crate) const DEFAULT_INTERVAL_SECS: u64 = 300;
 pub(crate) const DEFAULT_MAX_AGE_SECS: u64 = 14_400;
 /// Consecutive cycles without the claim label before the loop stops.
 pub(crate) const LABEL_MISS_LIMIT: u32 = 2;
+/// Stop this far short of the TTL: a renewal checked just inside it must
+/// still land (one `gh` call, bounded by its timeout) before the lease ages
+/// out. Clamped to a quarter of the TTL for short TTLs.
+pub(crate) const RENEW_MARGIN_SECS: u64 = 60;
 /// How often a sleeping loop re-checks the watched session.
 const POLL: Duration = Duration::from_secs(5);
 
@@ -58,6 +81,11 @@ pub(crate) struct RenewLoopArgs {
     pub(crate) max_age: u64,
     #[arg(long, default_value_t = DEFAULT_INTERVAL_SECS)]
     pub(crate) interval: u64,
+    /// Wall-clock time (RFC 3339) at or before the lease's last write — the
+    /// claim's post, or the re-attached lease's `updated_at`. The renewal
+    /// guard ages from here. Default: the loop's own start.
+    #[arg(long)]
+    pub(crate) leased_at: Option<DateTime<Utc>>,
     #[arg(long)]
     pub(crate) workspace: PathBuf,
 }
@@ -86,11 +114,35 @@ pub(crate) enum Step {
     Stop(&'static str),
 }
 
+/// The clocks one cycle reads, all wall-clock seconds.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Clocks {
+    /// Since the renewer started (the 4 h cap).
+    pub(crate) elapsed_secs: i64,
+    pub(crate) cap_secs: u64,
+    /// Since the last successful renewal, or the claim.
+    pub(crate) since_renewal_secs: i64,
+    pub(crate) ttl_secs: u64,
+}
+
+impl Clocks {
+    /// The lease is too old to renew: within the margin of the TTL.
+    fn lease_aged_out(&self) -> bool {
+        let margin = RENEW_MARGIN_SECS.min(self.ttl_secs / 4);
+        let limit = self.ttl_secs.saturating_sub(margin);
+        i64::try_from(limit).is_ok_and(|limit| self.since_renewal_secs >= limit)
+    }
+}
+
+/// Seconds from `then` to `now` on the wall clock.
+pub(crate) fn wall_secs(now: DateTime<Utc>, then: DateTime<Utc>) -> i64 {
+    now.signed_duration_since(then).num_seconds()
+}
+
 /// The per-cycle decision. Pure; `misses` carries the label-absent streak.
 pub(crate) fn decide(
     watch_alive: bool,
-    elapsed_secs: u64,
-    cap_secs: u64,
+    clocks: Clocks,
     owner_code: i32,
     pr_state: Option<&(bool, Vec<String>)>,
     label: &str,
@@ -99,8 +151,14 @@ pub(crate) fn decide(
     if !watch_alive {
         return Step::Stop("the watched session ended");
     }
-    if elapsed_secs >= cap_secs {
+    if i64::try_from(clocks.cap_secs).is_ok_and(|cap| clocks.elapsed_secs >= cap) {
         return Step::Stop("the age cap passed");
+    }
+    if clocks.lease_aged_out() {
+        return Step::Stop(
+            "the lease went a TTL without a renewal; it may have expired and been claimed by a \
+             peer, so renewing could revive it",
+        );
     }
     if owner_code == lease_renewer::EXIT_STOP {
         return Step::Stop("released, or ownership passed to another renewer");
@@ -120,6 +178,25 @@ pub(crate) fn decide(
         Step::Stop("the claim label is gone (claimant finished without release)")
     } else {
         Step::Skip
+    }
+}
+
+/// The forge guard before a PATCH: renew only while `comment_id` is still
+/// this role's earliest live lease. `None` (unreadable list) defers to the
+/// wall-clock guard [`decide`] already applied. Pure.
+pub(crate) fn forge_guard(state: Option<&ClaimState>, comment_id: u64) -> Step {
+    match state {
+        None | Some(ClaimState::Unknown) => Step::Renew,
+        Some(ClaimState::HeldBySelf { id }) if *id == comment_id => Step::Renew,
+        Some(ClaimState::HeldBySelf { .. }) => {
+            Step::Stop("another lease of this claimant is the earliest; not this comment")
+        }
+        Some(ClaimState::HeldByPeer { .. }) => {
+            Step::Stop("a peer holds this role's earliest live lease")
+        }
+        Some(ClaimState::Free) => {
+            Step::Stop("this lease is no longer live; renewing would revive it")
+        }
     }
 }
 
@@ -147,7 +224,13 @@ fn repo_of(root: &Path) -> String {
 }
 
 /// Start the detached loop; returns the line to report.
-pub(crate) fn spawn(ctx: &Ctx, comment_id: u64, watch_pid: u32, story: Option<u32>) -> String {
+pub(crate) fn spawn(
+    ctx: &Ctx,
+    comment_id: u64,
+    watch_pid: u32,
+    story: Option<u32>,
+    leased_at: DateTime<Utc>,
+) -> String {
     let interval = std::env::var(INTERVAL_ENV)
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
@@ -165,6 +248,10 @@ pub(crate) fn spawn(ctx: &Ctx, comment_id: u64, watch_pid: u32, story: Option<u3
         .args(["--comment-id", &comment_id.to_string()])
         .args(["--watch-pid", &watch_pid.to_string()])
         .args(["--interval", &interval.to_string()])
+        .args([
+            "--leased-at",
+            &leased_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        ])
         .arg("--workspace")
         .arg(&ctx.gh.root)
         .stdin(Stdio::null())
@@ -257,7 +344,13 @@ pub(crate) fn run_loop(args: &RenewLoopArgs) {
         return;
     }
     let provenance = provenance_line(&root, &me, args.story_issue);
-    let started = Instant::now();
+    let policy = loom_daemon::comment_trust::TrustPolicy::for_root(&root);
+    let ttl_minutes = loom_daemon::claim_reconciliation::resolve_lease_ttl_minutes();
+    let ttl = chrono::Duration::seconds((ttl_minutes * 60.0) as i64);
+    // Wall clock throughout (#9401 review): `Instant` stands still while a
+    // Mac sleeps, so a lid-closed renewer would wake believing its lease fresh.
+    let started = Utc::now();
+    let mut last_renewed = args.leased_at.unwrap_or(started).min(started);
     let mut misses = 0;
     say(&format!("renewer {own} started for comment {} (pid {watch})", args.comment_id));
     loop {
@@ -269,15 +362,28 @@ pub(crate) fn run_loop(args: &RenewLoopArgs) {
         } else {
             None
         };
-        let step = decide(
+        let now = Utc::now();
+        let clocks = Clocks {
+            elapsed_secs: wall_secs(now, started),
+            cap_secs: args.max_age,
+            since_renewal_secs: wall_secs(now, last_renewed),
+            ttl_secs: u64::try_from(ttl.num_seconds()).unwrap_or(0),
+        };
+        let mut step = decide(
             watch_alive,
-            started.elapsed().as_secs(),
-            args.max_age,
+            clocks,
             owner_code,
             state.as_ref(),
             me.role.claim_label(),
             &mut misses,
         );
+        if step == Step::Renew {
+            let rows = gh.read_rows(args.pr, &policy);
+            let state = rows
+                .as_deref()
+                .map(|rows| claim_state(Some(rows), &me, Utc::now(), ttl));
+            step = forge_guard(state.as_ref(), args.comment_id);
+        }
         match step {
             Step::Stop(why) => {
                 say(&format!("renewer stopping: {why}"));
@@ -285,9 +391,15 @@ pub(crate) fn run_loop(args: &RenewLoopArgs) {
             }
             Step::Skip => say("cycle skipped (PR state unreadable, or claim label absent)"),
             Step::Renew => {
-                let body = lease_body(&me, args.pr, Some(chrono::Utc::now()), &provenance);
+                // Taken BEFORE the PATCH: the forge's `updated_at` is no
+                // earlier, so the guard never overestimates the lease's life.
+                let attempt = Utc::now();
+                let body = lease_body(&me, args.pr, Some(attempt), &provenance);
                 match gh.patch(args.comment_id, &body) {
-                    Ok(()) => say("renewed"),
+                    Ok(()) => {
+                        last_renewed = attempt;
+                        say("renewed");
+                    }
                     Err(true) => {
                         say("renewer stopping: the lease comment is gone");
                         return;

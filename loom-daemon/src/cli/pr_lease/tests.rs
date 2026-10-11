@@ -5,7 +5,9 @@
 //! comment list on disk, so the pre-check, the post, the read-back and the
 //! yield record are observed exactly as a claimant sees them.
 
-use super::renew::{decide, Step, LABEL_MISS_LIMIT};
+use super::renew::{
+    decide, forge_guard, wall_secs, Clocks, Step, LABEL_MISS_LIMIT, RENEW_MARGIN_SECS,
+};
 use super::*;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -229,36 +231,163 @@ fn the_renewer_stops_and_skips_on_the_right_signals() {
     let closed = (false, vec!["loom:treating".to_string()]);
     let ok = lease_renewer_exit_renew();
     let mut m = 0;
-    assert_eq!(decide(true, 10, 100, ok, Some(&open), "loom:treating", &mut m), Step::Renew);
+    assert_eq!(
+        decide(true, fresh(10, 100), ok, Some(&open), "loom:treating", &mut m),
+        Step::Renew
+    );
     assert!(matches!(
-        decide(false, 10, 100, ok, Some(&open), "loom:treating", &mut m),
+        decide(false, fresh(10, 100), ok, Some(&open), "loom:treating", &mut m),
         Step::Stop(_)
     ));
     assert!(matches!(
-        decide(true, 100, 100, ok, Some(&open), "loom:treating", &mut m),
+        decide(true, fresh(100, 100), ok, Some(&open), "loom:treating", &mut m),
         Step::Stop(_)
     ));
     assert!(matches!(
-        decide(true, 10, 100, 3, Some(&open), "loom:treating", &mut m),
+        decide(true, fresh(10, 100), 3, Some(&open), "loom:treating", &mut m),
         Step::Stop(_)
     ));
     assert!(matches!(
-        decide(true, 10, 100, ok, Some(&closed), "loom:treating", &mut m),
+        decide(true, fresh(10, 100), ok, Some(&closed), "loom:treating", &mut m),
         Step::Stop(_)
     ));
-    assert_eq!(decide(true, 10, 100, ok, None, "loom:treating", &mut m), Step::Skip);
+    assert_eq!(decide(true, fresh(10, 100), ok, None, "loom:treating", &mut m), Step::Skip);
     // The label must be gone for LABEL_MISS_LIMIT consecutive cycles.
     m = 0;
     for _ in 1..LABEL_MISS_LIMIT {
-        assert_eq!(decide(true, 10, 100, ok, Some(&bare), "loom:treating", &mut m), Step::Skip);
+        assert_eq!(
+            decide(true, fresh(10, 100), ok, Some(&bare), "loom:treating", &mut m),
+            Step::Skip
+        );
     }
     assert!(matches!(
-        decide(true, 10, 100, ok, Some(&bare), "loom:treating", &mut m),
+        decide(true, fresh(10, 100), ok, Some(&bare), "loom:treating", &mut m),
         Step::Stop(_)
     ));
     m = 1;
-    assert_eq!(decide(true, 10, 100, ok, Some(&open), "loom:treating", &mut m), Step::Renew);
+    assert_eq!(
+        decide(true, fresh(10, 100), ok, Some(&open), "loom:treating", &mut m),
+        Step::Renew
+    );
     assert_eq!(m, 0, "a present label resets the streak");
+}
+
+/// Clocks for a lease renewed a minute ago, `elapsed` into a `cap` lifetime.
+fn fresh(elapsed: i64, cap: u64) -> Clocks {
+    Clocks {
+        elapsed_secs: elapsed,
+        cap_secs: cap,
+        since_renewal_secs: 60,
+        ttl_secs: 900,
+    }
+}
+
+#[test]
+fn the_renewer_stops_once_its_last_renewal_is_a_ttl_old_by_the_wall_clock() {
+    let open = (true, vec!["loom:treating".to_string()]);
+    let ok = lease_renewer_exit_renew();
+    let mut m = 0;
+    let at = |since: i64| Clocks {
+        since_renewal_secs: since,
+        ..fresh(10, 14_400)
+    };
+    // Inside the TTL less the margin: renew.
+    let limit = i64::try_from(900 - RENEW_MARGIN_SECS).unwrap();
+    assert_eq!(
+        decide(true, at(limit - 1), ok, Some(&open), "loom:treating", &mut m),
+        Step::Renew
+    );
+    // At or past it, even with the PR open and labelled and the forge
+    // unreadable: stop, never renew.
+    for since in [limit, 900, 20 * 60, 3 * 3600] {
+        assert!(
+            matches!(decide(true, at(since), ok, None, "loom:treating", &mut m), Step::Stop(_)),
+            "{since}"
+        );
+        assert!(matches!(
+            decide(true, at(since), ok, Some(&open), "loom:treating", &mut m),
+            Step::Stop(_)
+        ));
+    }
+    // A short TTL clamps the margin to a quarter of it.
+    let short = Clocks {
+        since_renewal_secs: 44,
+        ttl_secs: 60,
+        ..fresh(10, 14_400)
+    };
+    assert_eq!(decide(true, short, ok, Some(&open), "loom:treating", &mut m), Step::Renew);
+    let short = Clocks {
+        since_renewal_secs: 45,
+        ..short
+    };
+    assert!(matches!(
+        decide(true, short, ok, Some(&open), "loom:treating", &mut m),
+        Step::Stop(_)
+    ));
+}
+
+#[test]
+fn the_age_cap_and_the_renewal_age_are_wall_clock() {
+    // A Mac asleep 5 h: `Instant` would read ~0 elapsed; the wall clock
+    // reads 5 h, past both the cap and the TTL.
+    let started = now() - chrono::Duration::hours(5);
+    let woke = now();
+    let clocks = Clocks {
+        elapsed_secs: wall_secs(woke, started),
+        cap_secs: 14_400,
+        since_renewal_secs: wall_secs(woke, started),
+        ttl_secs: 900,
+    };
+    let open = (true, vec!["loom:reviewing".to_string()]);
+    let mut m = 0;
+    assert_eq!(
+        decide(true, clocks, lease_renewer_exit_renew(), Some(&open), "loom:reviewing", &mut m),
+        Step::Stop("the age cap passed")
+    );
+    assert_eq!(wall_secs(woke, started), 5 * 3600);
+}
+
+#[test]
+fn a_woken_renewer_never_revives_an_expired_lease_a_peer_has_since_claimed() {
+    // A's lease (comment 100) went 20 min without a renewal (host asleep, or
+    // three unreadable cycles); it aged out and peer B claimed (comment 200).
+    let a = who(Role::Doctor, "sweep-a");
+    let b = who(Role::Doctor, "sweep-b");
+    let rows = vec![lease(100, 20, &a), lease(200, 1, &b)];
+    assert_eq!(state(&rows, &b), ClaimState::HeldBySelf { id: 200 });
+    // A's renewer wakes. The wall-clock guard stops it before any PATCH…
+    let open = (true, vec!["loom:treating".to_string()]);
+    let woke = Clocks {
+        since_renewal_secs: 20 * 60,
+        ..fresh(30 * 60, 14_400)
+    };
+    let mut m = 0;
+    assert!(matches!(
+        decide(true, woke, lease_renewer_exit_renew(), Some(&open), "loom:treating", &mut m),
+        Step::Stop(_)
+    ));
+    // …and the forge guard stops it independently: B holds the claim.
+    let seen_by_a = state(&rows, &a);
+    assert!(matches!(seen_by_a, ClaimState::HeldByPeer { id: 200, .. }));
+    assert!(matches!(forge_guard(Some(&seen_by_a), 100), Step::Stop(_)));
+    // With no peer yet, A's aged-out lease reads Free: still no renewal.
+    let alone = vec![lease(100, 20, &a)];
+    assert!(matches!(forge_guard(Some(&state(&alone, &a)), 100), Step::Stop(_)));
+    // Nothing was renewed, so B's fence still passes and A's refuses.
+    assert_eq!(fence(Some(&rows), &b, now(), ttl()), Fence::Pass);
+    assert_eq!(fence(Some(&rows), &a, now(), ttl()), Fence::Superseded(b));
+}
+
+#[test]
+fn the_forge_guard_renews_only_the_holders_own_earliest_live_lease() {
+    let a = who(Role::Judge, "sweep-a");
+    let rows = vec![lease(100, 4, &a)];
+    assert_eq!(forge_guard(Some(&state(&rows, &a)), 100), Step::Renew);
+    // A different comment of the same identity is the earliest: not ours.
+    assert!(matches!(forge_guard(Some(&state(&rows, &a)), 300), Step::Stop(_)));
+    // Unreadable: defer to the wall-clock guard `decide` already applied.
+    assert_eq!(forge_guard(None, 100), Step::Renew);
+    assert_eq!(forge_guard(Some(&ClaimState::Unknown), 100), Step::Renew);
 }
 
 fn lease_renewer_exit_renew() -> i32 {
@@ -420,4 +549,60 @@ fn claim_refuses_without_writing_when_write_scope_denies_the_repo() {
     c.gh.write_repo = Err("not a managed repository".to_string());
     assert_eq!(c.claim(), EXIT_UNVERIFIED);
     assert!(posted(dir.path()).is_empty(), "#9548: no write to an unvetted repo");
+}
+
+// ---- prompt gates ---------------------------------------------------------
+
+/// The role prompts gate on `lease pr claim` / `fence` exit codes. Only 0
+/// (held) and 2 (an older `loom-daemon` without the verb: label-only) may
+/// proceed; `[ $? -le 2 ]` also let exit 1 (`EXIT_STARTUP_FAILURE`, a new
+/// binary that failed before dispatch) through, failing open (#9401 review).
+#[test]
+fn prompt_lease_gates_proceed_only_on_exit_0_or_2() {
+    const GATE: &str = "[[ $? =~ ^[02]$ ]]";
+    let prompts: [(&str, &str, usize); 4] = [
+        (
+            "doctor.md",
+            include_str!("../../../../defaults/.claude/commands/loom/doctor.md"),
+            4,
+        ),
+        (
+            "judge.md",
+            include_str!("../../../../defaults/.claude/commands/loom/judge.md"),
+            6,
+        ),
+        (
+            "loom-doctor/SKILL.md",
+            include_str!("../../../../defaults/.agents/skills/loom-doctor/SKILL.md"),
+            4,
+        ),
+        (
+            "loom-judge/SKILL.md",
+            include_str!("../../../../defaults/.agents/skills/loom-judge/SKILL.md"),
+            6,
+        ),
+    ];
+    for (name, text, gates) in prompts {
+        let lines: Vec<&str> = text.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            assert!(
+                !(line.contains("$?") && line.contains("-le ")),
+                "{name}:{}: a `-le` exit gate lets exit 1 through: {line}",
+                i + 1
+            );
+            // Every claim/fence whose exit is tested (on its line or the
+            // next) uses the 0-or-2 gate.
+            if line.contains("loom-daemon lease pr claim")
+                || line.contains("loom-daemon lease pr fence")
+            {
+                let tested = std::iter::once(*line)
+                    .chain(lines.get(i + 1).copied())
+                    .find(|l| l.contains("$?"));
+                if let Some(t) = tested {
+                    assert!(t.contains(GATE), "{name}:{}: gate must be `{GATE}`: {t}", i + 1);
+                }
+            }
+        }
+        assert_eq!(text.matches(GATE).count(), gates, "{name}: gate count");
+    }
 }

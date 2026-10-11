@@ -721,11 +721,21 @@ the same lease semantics, **keyed by role**:
 - **Renewal** is a detached `lease pr renew-loop`, one per
   `(repo, host, sweep#pr-<role>, pr)` through the issue renewer's ownership
   store (#10229). Every 300 s (`SWEEP_LEASE_RENEW_INTERVAL_SECS`) it makes one
-  `GET issues/<pr>` and one PATCH, adding a `loom:pr-lease-renewed at=` line so
-  `updated_at` advances. It stops when the watched session dies, at the 4 h cap,
-  on `release`, when the PR closes, when the comment is gone, or after the
-  role's claim label has been absent for two consecutive cycles. That last one
-  is the backstop for a claimant that finished without releasing.
+  `GET issues/<pr>`, one read of the lease comments and one PATCH, adding a
+  `loom:pr-lease-renewed at=` line so `updated_at` advances. It stops when the
+  watched session dies, at the 4 h cap, on `release`, when the PR closes, when
+  the comment is gone, or after the role's claim label has been absent for two
+  consecutive cycles. That last one is the backstop for a claimant that
+  finished without releasing.
+- **A renewal never revives an expired lease.** A PATCH would make an aged-out
+  lease live again, and its older comment `id` would then outrank a peer that
+  claimed after it expired. So the renewer stops, without patching, once its
+  last successful renewal (or the claim) is within 60 s of the TTL, and it
+  renews only while the re-read shows its own comment as the role's earliest
+  live lease. Both the TTL age and the 4 h cap use the wall clock: on macOS,
+  `Instant` does not advance while the machine sleeps, so a lid-closed renewer
+  would otherwise wake believing its lease fresh. An unreadable re-read falls
+  back to the wall-clock guard alone.
 - **`fence`** runs before every Doctor push and completion write, and inside
   the Judge's Verdict-Time CAS Recheck. Exit 0 if this claimant holds the
   earliest live lease, or if there is no evidence either way (an unreadable
@@ -745,7 +755,9 @@ the same lease semantics, **keyed by role**:
 - **Older binaries.** A `loom-daemon` without `lease pr` exits 2 (clap's usage
   error), which no verb here uses. The role prompts read 2 as "claim by label
   alone, as before", so prompts that resync ahead of the binary degrade to the
-  old behaviour instead of standing every Doctor and Judge down.
+  old behaviour instead of standing every Doctor and Judge down. Only 0 and 2
+  proceed (`[[ $? =~ ^[02]$ ]]`). Exit 1 is `loom-daemon`'s startup failure, an
+  unknown state, and stands down like 3, 4 and 5.
 
 **Not yet covered (#11118):** the daemon's `claim_reconciliation` still ages
 `loom:treating` and `loom:reviewing` by label events, not by these leases
@@ -757,3 +769,18 @@ read the lease is #10235's job. The role runner's Doctor lanes also do not
 consult PR leases before they dispatch. A Doctor spawned onto a PR with a live
 peer lease stands down at `claim`, which costs one agent start and no
 duplicated work.
+
+**Known limits.**
+
+- *Siblings of one in-session sweep share an identity.* Subagents of one
+  session see the same `LOOM_SWEEP_RUN_ID` and the same session pid, and
+  neither the environment nor the pid tree gives a cheap per-agent
+  discriminator. A second Doctor (or Judge) of the same sweep on the same PR
+  therefore resolves `held-self`, re-attaches and proceeds. In that case the
+  sweep orchestrator is the arbiter: it must not dispatch two agents of one
+  role onto one PR. A per-agent identity belongs with #11118's
+  `claim_state(item)`.
+- *Read-back lag.* If a peer's earlier lease takes longer to become visible
+  than the read-back plus about 1 s of confirmation re-reads, both claimants
+  pass `claim`, as on the issue path (#6287). The later one's `fence` stops it
+  before it pushes, but not before its worktree resync and snapshot steps.
