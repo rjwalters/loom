@@ -575,7 +575,12 @@ fn run_preflight(
             Some(profile) => crate::runtime_preference::Tap::with_profile(&runtime, profile),
             None => crate::runtime_preference::Tap::runtime(&runtime),
         };
-        writeln!(log, "# LOOM_LAUNCH {}", serde_json::json!({"schema":1,"runtime":runtime,"tap":tap.to_string(),"provider":selection.provider,"model":selection.model,"profile":selection.profile,"effort":selection.effort,"credentialSource":credential.source.as_str(),"credentialProvider":credential.provider,"credentialAccount":credential.account,"usage":"native-json-events","billing":"not-measured","llmBilling":llm_billing.billing,"llmCredentialKind":llm_billing.credential_kind,"prompt_bytes":expanded.as_deref().map(str::len)})).map_err(|e| LaunchError::config(e.to_string()))?;
+        let launch = serde_json::json!({"schema":1,"runtime":runtime,"tap":tap.to_string(),"provider":selection.provider,"model":selection.model,"profile":selection.profile,"effort":selection.effort,"credentialSource":credential.source.as_str(),"credentialProvider":credential.provider,"credentialAccount":credential.account,"usage":"native-json-events","billing":"not-measured","llmBilling":llm_billing.billing,"llmCredentialKind":llm_billing.credential_kind,"prompt_bytes":expanded.as_deref().map(str::len)}).to_string();
+        writeln!(log, "# LOOM_LAUNCH {launch}").map_err(|e| LaunchError::config(e.to_string()))?;
+        // J1 shadow (#11346): attribution only, after the legacy line is written.
+        if let Some(log_path) = options.log.as_deref() {
+            crate::journal::execution::launch_recorded(root, log_path, &launch);
+        }
         if let Some(route) = &gateway {
             writeln!(log, "{}", route.marker(&runtime))
                 .map_err(|e| LaunchError::config(e.to_string()))?;

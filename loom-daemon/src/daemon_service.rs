@@ -415,6 +415,8 @@ pub(crate) async fn run_daemon() -> Result<()> {
         ),
         Err(e) => log::warn!("sweep_registry: reconstruction failed: {e}"),
     }
+    // #11346: J1 concern verification (logged, off-thread; no-op when disabled).
+    loom_daemon::journal::execution::log_startup_verification();
 
     // #6171: record the daemon's own primary workspace root once, before any
     // forge call that could trigger a forced per-owner credential refresh
