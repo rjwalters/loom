@@ -42,12 +42,12 @@ pub const SUPPORTS_INSTALLED: &str = "0.19.0";
 /// It must be at least every hard `# requires-daemon: <sub> >= <version>`
 /// floor in the shipped shell (`defaults/`); the CI harness and the unit test
 /// `no_shipped_hard_floor_is_above_requires_daemon` both enforce that.
-/// 0.19.1039 is the highest such floor today (`push-lease`, #9487).
+/// 0.19.1038 is the highest such floor today (`push-lease`, #9487).
 ///
 /// Keep this on one line in exactly this shape: the installer
 /// (`scripts/install/loom-source-path.sh`) reads it from this file with
 /// `sed`, because the tree it installs can be newer than any binary it has.
-pub const REQUIRES_DAEMON: &str = "0.19.1039";
+pub const REQUIRES_DAEMON: &str = "0.19.1038";
 
 // compat:invoked-files:begin
 /// The installed files this daemon executes in a workspace. An installed tree
