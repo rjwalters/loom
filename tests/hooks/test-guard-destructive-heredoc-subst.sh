@@ -158,6 +158,173 @@ rm -rf "$WT8035_REPO"
 
 echo ""
 
+echo -e "${YELLOW}--- Direct file-write heredocs vs. the catastrophic scan (#9870) ---${NC}"
+# =========================================================================
+# #9870 — `cat > file <<'EOF' ... EOF` whose body only MENTIONS a
+# catastrophic-tier phrase
+# =========================================================================
+#
+# mask_catastrophic_filesink_heredocs() narrows the UNGATED denial floor, so
+# this block is mostly negative: the pass is a whole-command sink allowlist,
+# and every shape outside it must keep denying at the catastrophic tier (the
+# deny helper below pins the REASON, so a deny arriving from some other tier
+# cannot make a regression here look green).
+#
+# NOTHING IN THIS BLOCK EXECUTES. Every command is a STRING handed to the guard
+# as JSON. The phrases live in single-quoted variables, and the `$(` / backtick
+# openers are spelled through DS/BT so this file contains no live substitution
+# of them.
+P9870_REPO='gh repo delete o/r'
+P9870_RM='rm -rf /'
+P9870_PUSH='git push --force origin main'
+NL=$'\n'
+TAB=$'\t'
+DS='$('
+BT='`'
+# hd9870 <opener line> <body> <terminator line> -> one multi-line command string.
+hd9870() { printf '%s\n%s\n%s' "$1" "$2" "$3"; }
+deny9870() { assert_deny_reason_matches "$1" "$2" 'dangerous pattern'; }
+
+# --- ALLOW: the intended shape, each phrase, `>` and `>>` -------------------
+for p9870 in "$P9870_REPO" "$P9870_RM" "$P9870_PUSH"; do
+    assert_allow "catastrophic (#9870): cat > file <<'EOF' whose body mentions '$p9870' allows" \
+        "$(hd9870 "cat > notes/x.md <<'EOF'" "never run $p9870" "EOF")"
+    assert_allow "catastrophic (#9870): cat >> file <<'EOF' whose body mentions '$p9870' allows" \
+        "$(hd9870 "cat >> notes/x.md <<'EOF'" "never run $p9870" "EOF")"
+done
+assert_allow "catastrophic (#9870): a double-quoted <<\"EOF\" delimiter allows" \
+    "$(hd9870 'cat > notes/x.md <<"EOF"' "never run $P9870_REPO" "EOF")"
+assert_allow "catastrophic (#9870): heredoc-before-redirect order (cat <<'EOF' > file) allows" \
+    "$(hd9870 "cat <<'EOF' > notes/x.md" "never run $P9870_RM" "EOF")"
+assert_allow "catastrophic (#9870): <<-'EOF' with a tab-indented terminator allows" \
+    "$(hd9870 "cat > notes/x.md <<-'EOF'" "${TAB}never run $P9870_PUSH" "${TAB}EOF")"
+assert_allow "catastrophic (#9870): no blanks around the operators (cat >f<<'EOF') allows" \
+    "$(hd9870 "cat >notes/x.md<<'EOF'" "never run $P9870_REPO" "EOF")"
+assert_allow "catastrophic (#9870): a quoted body is inert even when it spells \$( ) around the phrase" \
+    "$(hd9870 "cat > notes/x.md <<'EOF'" "example: ${DS} $P9870_REPO ) and ${BT}$P9870_RM${BT}" "EOF")"
+assert_allow "catastrophic (#9870): two qualifying blocks separated by a blank line both allow" \
+    "$(hd9870 "cat > a.md <<'EOF'" "never run $P9870_REPO" "EOF")${NL}${NL}$(hd9870 "cat >> b.md <<'B2'" "never run $P9870_RM" "B2")"
+assert_allow "catastrophic (#9870): leading and trailing blank lines around the block allow" \
+    "${NL}  ${NL}$(hd9870 "  cat > notes/x.md <<'EOF'" "never run $P9870_REPO" "EOF")${NL}"
+
+# --- DENY: delimiter not provably quoted, or block not closed ---------------
+deny9870 "catastrophic (#9870): an UNQUOTED delimiter still denies" \
+    "$(hd9870 "cat > notes/x.md <<EOF" "never run $P9870_REPO" "EOF")"
+deny9870 "catastrophic (#9870): an UNQUOTED delimiter with a live \$( ) body still denies" \
+    "$(hd9870 "cat > notes/x.md <<EOF" "${DS} $P9870_REPO )" "EOF")"
+deny9870 "catastrophic (#9870): an UNQUOTED delimiter with a live backtick body still denies" \
+    "$(hd9870 "cat > notes/x.md <<EOF" "${BT} $P9870_REPO ${BT}" "EOF")"
+deny9870 "catastrophic (#9870): a backslash-escaped <<\\EOF delimiter still denies (out of scope, fail closed)" \
+    "$(hd9870 "cat > notes/x.md <<\\EOF" "never run $P9870_REPO" "EOF")"
+deny9870 "catastrophic (#9870): a half-quoted delimiter (<<'EOF) still denies" \
+    "$(hd9870 "cat > notes/x.md <<'EOF" "never run $P9870_REPO" "EOF")"
+deny9870 "catastrophic (#9870): an UNCLOSED heredoc still denies" \
+    "cat > notes/x.md <<'EOF'${NL}never run $P9870_REPO"
+deny9870 "catastrophic (#9870): a terminator with trailing blanks does not close the block" \
+    "$(hd9870 "cat > notes/x.md <<'EOF'" "never run $P9870_REPO" "EOF ")"
+deny9870 "catastrophic (#9870): a tab-indented terminator does not close a plain << block" \
+    "$(hd9870 "cat > notes/x.md <<'EOF'" "never run $P9870_REPO" "${TAB}EOF")"
+deny9870 "catastrophic (#9870): a herestring (<<<) is not a heredoc" \
+    "cat > notes/x.md <<<'never run $P9870_REPO'"
+deny9870 "catastrophic (#9870): a body that ends EARLY leaves the following line live" \
+    "$(hd9870 "cat > notes/x.md <<'EOF'" "harmless" "EOF")${NL}$P9870_REPO${NL}EOF"
+
+# --- DENY: opener line is not exactly one bare `cat` + one redirect ---------
+deny9870 "catastrophic (#9870): opener piped onward (| bash) still denies" \
+    "$(hd9870 "cat > notes/x.md <<'EOF' | bash" "$P9870_REPO" "EOF")"
+deny9870 "catastrophic (#9870): opener followed by ';' still denies" \
+    "$(hd9870 "cat > notes/x.md <<'EOF'; true" "never run $P9870_REPO" "EOF")"
+deny9870 "catastrophic (#9870): opener chained with && still denies" \
+    "$(hd9870 "true && cat > notes/x.md <<'EOF'" "never run $P9870_REPO" "EOF")"
+deny9870 "catastrophic (#9870): opener inside \$( ) still denies" \
+    "$(hd9870 "x=${DS}cat > notes/x.md <<'EOF'" "never run $P9870_REPO" "EOF")${NL})"
+deny9870 "catastrophic (#9870): opener inside backticks still denies" \
+    "$(hd9870 "x=${BT}cat > notes/x.md <<'EOF'" "never run $P9870_REPO" "EOF")${NL}${BT}"
+deny9870 "catastrophic (#9870): opener inside a ( subshell ) still denies" \
+    "$(hd9870 "(cat > notes/x.md <<'EOF'" "never run $P9870_REPO" "EOF")${NL}) | bash"
+deny9870 "catastrophic (#9870): opener inside a { group; } still denies" \
+    "$(hd9870 "{ cat > notes/x.md <<'EOF'" "never run $P9870_REPO" "EOF")${NL}} | bash"
+deny9870 "catastrophic (#9870): opener backgrounded with & still denies" \
+    "$(hd9870 "cat > notes/x.md <<'EOF' &" "never run $P9870_REPO" "EOF")"
+deny9870 "catastrophic (#9870): opener with a line continuation still denies" \
+    "$(hd9870 "cat > notes/x.md <<'EOF' \\" "never run $P9870_REPO" "EOF")"
+deny9870 "catastrophic (#9870): cat with an extra file argument still denies" \
+    "$(hd9870 "cat other.txt > notes/x.md <<'EOF'" "never run $P9870_REPO" "EOF")"
+deny9870 "catastrophic (#9870): cat with a '-' argument still denies" \
+    "$(hd9870 "cat - > notes/x.md <<'EOF'" "never run $P9870_REPO" "EOF")"
+deny9870 "catastrophic (#9870): cat with a flag still denies" \
+    "$(hd9870 "cat -n > notes/x.md <<'EOF'" "never run $P9870_REPO" "EOF")"
+deny9870 "catastrophic (#9870): a second stdout redirect still denies" \
+    "$(hd9870 "cat > notes/x.md > notes/y.md <<'EOF'" "never run $P9870_REPO" "EOF")"
+deny9870 "catastrophic (#9870): a second (stderr) redirect still denies" \
+    "$(hd9870 "cat > notes/x.md 2> notes/err.txt <<'EOF'" "never run $P9870_REPO" "EOF")"
+deny9870 "catastrophic (#9870): an fd-duplicating redirect (>&2) still denies" \
+    "$(hd9870 "cat >&2 <<'EOF'" "never run $P9870_REPO" "EOF")"
+deny9870 "catastrophic (#9870): a process-substitution target (> >(bash)) still denies" \
+    "$(hd9870 "cat > >(bash) <<'EOF'" "$P9870_REPO" "EOF")"
+deny9870 "catastrophic (#9870): no redirect at all (body goes to stdout) still denies" \
+    "$(hd9870 "cat <<'EOF'" "never run $P9870_REPO" "EOF")"
+deny9870 "catastrophic (#9870): an assignment prefix on the opener still denies" \
+    "$(hd9870 "X=1 cat > notes/x.md <<'EOF'" "never run $P9870_REPO" "EOF")"
+deny9870 "catastrophic (#9870): sudo cat still denies" \
+    "$(hd9870 "sudo cat > notes/x.md <<'EOF'" "never run $P9870_REPO" "EOF")"
+deny9870 "catastrophic (#9870): a path-qualified /bin/cat still denies" \
+    "$(hd9870 "/bin/cat > notes/x.md <<'EOF'" "never run $P9870_REPO" "EOF")"
+deny9870 "catastrophic (#9870): tee (copies the body to stdout) still denies" \
+    "$(hd9870 "tee notes/x.md <<'EOF'" "never run $P9870_REPO" "EOF")"
+deny9870 "catastrophic (#9870): a catastrophic command ON the opener line still denies" \
+    "$(hd9870 "cat > notes/x.md <<'EOF'; $P9870_REPO" "harmless" "EOF")"
+
+# --- DENY: target is not a plain literal file -------------------------------
+# shellcheck disable=SC2016,SC2088  # the unexpanded $F / ~ spellings ARE the test data
+for t9870 in /dev/stdout /dev/fd/1 /proc/self/fd/1 /DEV/stdout ../../dev/stdout notes/../x.md \
+             '"$F"' '$F' '${F}' "x${DS}date).md" "x${BT}date${BT}.md" '~/x.md' 'x*.md' '{a,b}.md' \
+             '"notes/x.md"' "'notes/x.md'" '=x'; do
+    deny9870 "catastrophic (#9870): target $t9870 still denies" \
+        "$(hd9870 "cat > $t9870 <<'EOF'" "never run $P9870_REPO" "EOF")"
+done
+
+# --- DENY: anything else in the command (write-then-execute and friends) ----
+W9870=$(hd9870 "cat > x.sh <<'EOF'" "$P9870_REPO" "EOF")
+for run9870 in 'bash x.sh' 'sh ./x.sh' '. x.sh' 'source x.sh' 'chmod +x x.sh && ./x.sh' \
+               'bash ./*.sh' 'for f in *; do bash "$f"; done' 'true'; do
+    deny9870 "catastrophic (#9870): write-then-'$run9870' in the same command still denies" \
+        "$W9870${NL}$run9870"
+done
+deny9870 "catastrophic (#9870): a catastrophic command AFTER the closing delimiter still denies" \
+    "$(hd9870 "cat > notes/x.md <<'EOF'" "harmless" "EOF")${NL}$P9870_REPO"
+deny9870 "catastrophic (#9870): a catastrophic command BEFORE the opener still denies" \
+    "$P9870_PUSH${NL}$(hd9870 "cat > notes/x.md <<'EOF'" "harmless" "EOF")"
+deny9870 "catastrophic (#9870): any command line before the opener leaves the body visible" \
+    "cd /tmp${NL}$(hd9870 "cat > notes/x.md <<'EOF'" "never run $P9870_REPO" "EOF")"
+deny9870 "catastrophic (#9870): a comment line before the opener leaves the body visible" \
+    "# write a note${NL}$(hd9870 "cat > notes/x.md <<'EOF'" "never run $P9870_REPO" "EOF")"
+# The two same-command bypasses a per-block rule would have: an opener that is
+# really INSIDE a quoted string (no heredoc exists; the "body" runs after the
+# closing quote), and `cat` rebound to an interpreter.
+deny9870 "catastrophic (#9870): an opener inside an open double-quoted string still denies" \
+    "echo \"${NL}$(hd9870 "cat > notes/x.md <<'EOF'" "\"; $P9870_REPO; : \"" "EOF")${NL}\""
+deny9870 "catastrophic (#9870): cat rebound to a shell function first still denies" \
+    "cat() { bash; }${NL}$(hd9870 "cat > notes/x.md <<'EOF'" "$P9870_REPO" "EOF")"
+
+# --- DENY: two heredocs where only one qualifies (no partial masking) -------
+deny9870 "catastrophic (#9870): qualifying block then bash <<'E2' carrying the phrase still denies" \
+    "$(hd9870 "cat > notes/x.md <<'EOF'" "harmless" "EOF")${NL}$(hd9870 "bash <<'E2'" "$P9870_REPO" "E2")"
+deny9870 "catastrophic (#9870): bash <<'E2' then a qualifying block carrying the phrase still denies" \
+    "$(hd9870 "bash <<'E2'" "true" "E2")${NL}$(hd9870 "cat > notes/x.md <<'EOF'" "never run $P9870_REPO" "EOF")"
+deny9870 "catastrophic (#9870): qualifying block carrying the phrase then a non-qualifying one still denies" \
+    "$(hd9870 "cat > notes/x.md <<'EOF'" "never run $P9870_REPO" "EOF")${NL}$(hd9870 "cat > notes/y.md <<E2" "harmless" "E2")"
+
+# --- DENY: a heredoc fed to anything that is not a file-writing cat ---------
+for sink9870 in 'ssh host' 'bash' 'sh -s' 'zsh' 'python3' 'python' 'psql db' 'sudo -s' 'xargs -I{} sh -c {}' 'eval'; do
+    deny9870 "catastrophic (#9870): '$sink9870 <<EOF' (quoted) carrying the phrase still denies" \
+        "$(hd9870 "$sink9870 <<'EOF'" "$P9870_RM" "EOF")"
+done
+deny9870 "catastrophic (#9870): gh issue comment --body-file - <<'EOF' still denies (out of scope)" \
+    "$(hd9870 "gh issue comment 1 --body-file - <<'EOF'" "never run $P9870_REPO" "EOF")"
+
+echo ""
+
 # =========================================================================
 
 print_summary
