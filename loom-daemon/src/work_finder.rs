@@ -300,13 +300,8 @@ pub struct WorkItem {
     /// last-dispatch clock. `None` (a synthetic item, or a listing without
     /// timestamps) simply disables the recheck-interval check for that item.
     pub updated_at: Option<String>,
-    /// When the issue was starred (`loom:operator-priority`, #9244), from the
-    /// cached `labeled` timeline event. `None` for an unstarred issue, or a
-    /// starred one whose event is unknown (ordering then falls back to
-    /// `createdAt`). See [`operator_priority`].
-    pub operator_priority_at: Option<String>,
-    /// Set when this issue blocks a starred issue and inherits its star
-    /// (#9244 C): the starred issue's number. See [`crate::star_liveness::inherit`].
+    /// Set by `star_liveness` (#11104) when this issue blocks a starred
+    /// issue. Dispatch never reads it (#11508).
     pub operator_priority_inherited_from: Option<u32>,
     /// Who filed the issue, when the listing supplied it (#10118). Only a
     /// trusted author's red-main-fix marker admits an unpromoted row (#9548);
@@ -331,7 +326,6 @@ impl WorkItem {
             created_at,
             body: None,
             updated_at: None,
-            operator_priority_at: None,
             operator_priority_inherited_from: None,
             author: None,
         }
@@ -1018,13 +1012,12 @@ pub fn tick_with_saturation_brake(
     tick_with_lanes(source, dispatcher, caps, halted, saturation_held, RedMainLane::default())
 }
 
-/// Like [`tick_with_saturation_brake`], plus the #9244 lanes: starred and
-/// red-main-fix candidates sort first ([`ready_queue::sort_lanes`]; ordinary work
-/// keeps its listing order), a halted repo whose `main` is verified red still
-/// admits its `<!-- loom:main-red-fix -->` issues and nothing else (`lane`),
-/// and one starred issue refused only by the concurrency cap may take the
-/// host's [`OverflowSlot`]. `caps` is `(cap terms, max_admissions_per_tick)`;
-/// the effective cap is [`CapTerms::effective`].
+/// Like [`tick_with_saturation_brake`], plus the in-workspace priority order
+/// ([`ready_queue::sort_lanes`]: level, oldest, number) and the #9244 red-main
+/// lane: a halted repo whose `main` is verified red still admits its
+/// `<!-- loom:main-red-fix -->` issues and nothing else (`lane`). `caps` is
+/// `(cap terms, max_admissions_per_tick)`; the effective cap is
+/// [`CapTerms::effective`].
 ///
 /// # Errors
 ///
@@ -1039,7 +1032,7 @@ pub fn tick_with_lanes(
 ) -> Result<TickReport> {
     let mut ready = source.list_ready_issues()?;
     // #10118: unpromoted red-main fixes stay only while `main` is red.
-    let red = main_red_fix::evaluate(lane, &mut ready, dispatcher);
+    main_red_fix::evaluate(lane, &mut ready, dispatcher);
     let mut report = TickReport {
         seen: ready.len(),
         // Record the brake's engagement even on a tick that defers nothing, so a
@@ -1049,8 +1042,8 @@ pub fn tick_with_lanes(
         ..TickReport::default()
     };
     report.note_listing(0, source.listing_complete());
-    ready_queue::sort_lanes(&mut ready, red);
-    let (max_concurrent, mut overflow) = OverflowSlot::open(dispatcher.overflow_in_flight(), terms);
+    ready_queue::sort_lanes(&mut ready);
+    let (max_concurrent, _) = OverflowSlot::open(dispatcher.overflow_in_flight(), terms);
 
     // Reactive backstop: a red `main` halts all new dispatch this tick — except
     // its verified red-main fixes (#9244), which the loop below lets through.
@@ -1259,11 +1252,9 @@ pub fn tick_with_lanes(
             report.deferred_saturation += 1;
             continue;
         }
-        // 3. Fixed concurrency cap — defer the rest to a future tick, unless
-        //    this starred issue can take the host's overflow slot (#9244).
-        let over = occupancy >= max_concurrent
-            && overflow.admits(item.is_operator_priority() || item.is_very_important(), occupancy);
-        if occupancy >= max_concurrent && !over {
+        // 3. Fixed concurrency cap — defer the rest to a future tick. No
+        //    priority overflows it (#11508).
+        if occupancy >= max_concurrent {
             report.deferred_capacity += 1;
             continue;
         }
@@ -1279,15 +1270,12 @@ pub fn tick_with_lanes(
         // 4. Dispatch. The registry's idempotency key + claim lock make a
         //    double-dispatch of an already-running issue a no-op / loud error.
         let started = chrono::Utc::now();
-        let outcome = dispatcher.dispatch_with(item.number, item.complexity(), over);
+        let outcome = dispatcher.dispatch_with(item.number, item.complexity(), false);
         if record_dispatch_outcome(&mut report, item.number, 0, started, &outcome).0
             == Qd::Dispatched
         {
             occupancy += 1;
             admitted_this_tick += 1;
-            if over {
-                overflow.take(&mut report);
-            }
         }
     }
 
@@ -1601,10 +1589,9 @@ pub fn tick_multi_with_repo_cap<S: WorkSource, D: WorkDispatcher>(
 /// Like [`tick_multi_with_repo_cap`], but additionally honors the **build
 /// back-off** (#9410, [`build_backoff`]): `build_backoff_held` is parallel to
 /// `workspaces` (#10624 — a repo's own debt, or the optional host ceiling);
-/// pass 2 defers each candidate of a held workspace that is neither starred
-/// (`loom:operator-priority`) nor a verified red-main fix
-/// ([`Qd::DeferredBuildBackoff`]). Checked after the saturation brake and
-/// before the overflow / cap gates; in-flight sweeps are untouched. An empty
+/// pass 2 defers every candidate of a held workspace, whatever its priority
+/// ([`Qd::DeferredBuildBackoff`], #11508). Checked after the saturation brake
+/// and before the cap gates; in-flight sweeps are untouched. An empty
 /// or all-`false` slice is [`tick_multi_with_repo_cap`] byte-for-byte.
 /// `halt_causes` is threaded through unchanged — see
 /// [`tick_multi_with_repo_cap`] for its contract (#9017).
@@ -1639,9 +1626,8 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
     let mut occupancy: usize = per_repo_occupancy.iter().sum();
     // #11094: `max_concurrent_per_repo` may carry the tick's per-repo RAM budget.
     let mut cap = RepoCap::from_limits(max_concurrent_per_repo.into(), per_repo_occupancy);
-    // The host's single `loom:operator-priority` overflow slot (#9244), taken
-    // up front when any workspace already has a live overflow sweep.
-    let (max_concurrent, mut overflow) = OverflowSlot::for_workspaces(workspaces, terms);
+    // The inert overflow slot (#11508) only reports a live legacy overflow sweep.
+    let (max_concurrent, overflow) = OverflowSlot::for_workspaces(workspaces, terms);
 
     // Snapshot each workspace's quarantined set (#3939) alongside its in-flight
     // set. Quarantined candidates are dropped in pass 1 *before* the global sort
@@ -1798,7 +1784,7 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
         // dropped from `ready` (and from `seen`) unless `main` is red.
         report.note_listing(idx, source.listing_complete());
         let lane = lanes.get(idx).copied().unwrap_or_default();
-        let red = main_red_fix::evaluate(lane, &mut ready, dispatcher);
+        main_red_fix::evaluate(lane, &mut ready, dispatcher);
         report.seen += ready.len();
         let workspace_priority = priorities
             .get(idx)
@@ -1814,7 +1800,7 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
         let repo_halted = halted.get(idx).copied().unwrap_or(false);
         if repo_halted && !lane.admits_fixes_while_halted() {
             // #9017: name WHICH hold tripped, not just that one did.
-            halt_cause::record_halted(q, &ready, idx, workspace_priority, red, halt_causes);
+            halt_cause::record_halted(q, &ready, idx, workspace_priority, halt_causes);
             continue;
         }
 
@@ -1826,7 +1812,7 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
         if commands_missing[idx] {
             report.skipped_workspace_commands_missing += ready.len();
             for item in &ready {
-                let key = ready_queue::key_of(idx, workspace_priority, item, red);
+                let key = ready_queue::key_of(idx, workspace_priority, item);
                 ready_queue::record_skip(q, key, item, Qd::WorkspaceCommandsMissing, None);
             }
             continue;
@@ -1837,7 +1823,7 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
 
         for item in ready {
             cap.note_surface(idx, &item, in_flight.contains(&item.number));
-            let key = ready_queue::key_of(idx, workspace_priority, &item, red);
+            let key = ready_queue::key_of(idx, workspace_priority, &item);
             // `held_until` (Issue #9311): `None` for every disposition but
             // the five time-boxed holds below, which pass their computed
             // expiry explicitly as the third argument.
@@ -2004,23 +1990,17 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
             ready_queue::resolve(q, &cand, Qd::DeferredSaturation, None);
             continue;
         }
-        // Build back-off (#9410), per repo since #10624: a WIP policy, so a star
-        // (a human's "now") and a red-main fix (which drains merge debt) both
-        // bypass it.
+        // Build back-off (#9410), per repo since #10624: a WIP policy no
+        // priority bypasses (#11508).
         if build_backoff::defers(build_backoff_held, &cand) {
             report.deferred_build_backoff += 1;
             ready_queue::resolve(q, &cand, Qd::DeferredBuildBackoff, None);
             continue;
         }
-        // #9244 overflow: a starred candidate refused ONLY by the global and/or
-        // per-repo cap may take the host's single over-limit slot. The ramp cap
-        // is not a queue limit, so it still applies (checked below).
-        let over = (occupancy >= max_concurrent || cap.at_cap(cand.workspace_idx))
-            && overflow.admits(cand.operator_priority || cand.is_very_important(), occupancy);
         // Shared global cap across all workspaces — defer once the combined
         // occupancy hits the budget, regardless of which workspace still has
         // ready items.
-        if occupancy >= max_concurrent && !over {
+        if occupancy >= max_concurrent {
             report.deferred_capacity += 1;
             ready_queue::resolve(q, &cand, Qd::DeferredCapacity, None);
             continue;
@@ -2036,19 +2016,15 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
         // of the admission gates, so a deferral only ever names a repo that the
         // machine-level gates above would have admitted. Work-conserving by
         // construction: the `continue` hands this slot to the next candidate,
-        // in another repo. The RAM charge binds an overflow candidate too.
-        if cap.defer_admission(&cand, over, &mut report) {
+        // in another repo.
+        if cap.defer_admission(&cand, &mut report) {
             continue;
         }
         let dispatcher = &mut workspaces[cand.workspace_idx].1;
         // A candidate with a verified open linked PR is resolved `OpenPr`
         // here without a dispatch attempt; every other one is dispatched and
         // counted (`record_dispatch_outcome`) exactly as before (#8865).
-        let (disposition, mut detail) = open_prs.dispatch(dispatcher, &cand, over, &mut report);
-        if disposition == Qd::Dispatched && over {
-            overflow.take(&mut report);
-            detail = Some("overflow".to_string());
-        }
+        let (disposition, detail) = open_prs.dispatch(dispatcher, &cand, false, &mut report);
         ready_queue::resolve(&mut report.queue, &cand, disposition, detail);
         if disposition == Qd::Dispatched {
             occupancy += 1;

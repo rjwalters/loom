@@ -270,12 +270,11 @@ pub fn record_halted(
     ready: &[WorkItem],
     idx: usize,
     workspace_priority: u32,
-    red: bool,
     causes: Option<&[Option<HaltCause>]>,
 ) {
     let cause = causes.and_then(|c| c.get(idx).copied()).flatten();
     for item in ready {
-        let key = ready_queue::key_of(idx, workspace_priority, item, red);
+        let key = ready_queue::key_of(idx, workspace_priority, item);
         let detail = cause.map(|c| c.as_str().to_string());
         ready_queue::record_skip(rows, key, item, QueueDisposition::WorkspaceHalted, detail);
     }

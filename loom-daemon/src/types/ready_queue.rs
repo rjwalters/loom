@@ -238,15 +238,13 @@ pub struct ReadyQueueRow {
     /// Deprecated (#9244): always `false`. Its label was deleted in #11105;
     /// the field stays on the wire only for compatibility.
     pub urgent: bool,
-    /// Whether the issue is starred (`loom:operator-priority`, #9244).
+    /// Deprecated (#11508): always `false`. The star (#9244) is no longer an
+    /// ordering key; the row's level is its plan `keys` entry `level`. The
+    /// field stays on the wire only for compatibility.
     #[serde(default)]
     pub operator_priority: bool,
-    /// When it was starred, when known (#9244). Absent for an unstarred
-    /// issue, or a starred one ordered by its `createdAt` fallback.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub operator_priority_at: Option<String>,
-    /// Whether it is a red-main fix boosted this tick: it carries
-    /// `<!-- loom:main-red-fix -->` and its repo's `main` is verified red.
+    /// Deprecated (#11508): always `false`. The red-main-fix ordering boost
+    /// is gone; the field stays on the wire only for compatibility.
     #[serde(default)]
     pub main_red_fix: bool,
     /// The issue's `createdAt`, when the listing supplied it.

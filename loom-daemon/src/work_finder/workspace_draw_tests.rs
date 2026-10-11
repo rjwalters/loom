@@ -1,5 +1,6 @@
 use super::*;
 use crate::priority_pick::{IMPORTANT_LABEL, VERY_IMPORTANT_LABEL};
+use crate::work_finder::WorkItem;
 
 fn item(n: u32, created: Option<&str>, labels: &[&str]) -> WorkItem {
     let mut all = vec!["loom:issue".to_string()];
@@ -8,7 +9,7 @@ fn item(n: u32, created: Option<&str>, labels: &[&str]) -> WorkItem {
 }
 
 fn cand(idx: usize, n: u32, created: Option<&str>, labels: &[&str]) -> PriorityCandidate {
-    super::super::ready_queue::key_of(idx, 0, &item(n, created, labels), false)
+    super::super::ready_queue::key_of(idx, 0, &item(n, created, labels))
 }
 
 fn numbers(c: &[PriorityCandidate]) -> Vec<(usize, u32)> {
@@ -31,7 +32,7 @@ fn fixture() -> Vec<WorkItem> {
 #[test]
 fn in_workspace_order_is_level_then_oldest_then_number() {
     let mut items = fixture();
-    super::super::ready_queue::sort_lanes(&mut items, false);
+    super::super::ready_queue::sort_lanes(&mut items);
     let order: Vec<u32> = items.iter().map(|i| i.number).collect();
     // very-important; important by age (2 and 4 tie on age -> number); then
     // the unlabelled by age (8 and 9 tie -> number); the undated last.
@@ -43,24 +44,27 @@ fn in_workspace_order_is_independent_of_listing_order() {
     let mut a = fixture();
     let mut b = fixture();
     b.reverse();
-    super::super::ready_queue::sort_lanes(&mut a, false);
-    super::super::ready_queue::sort_lanes(&mut b, false);
+    super::super::ready_queue::sort_lanes(&mut a);
+    super::super::ready_queue::sort_lanes(&mut b);
     let na: Vec<u32> = a.iter().map(|i| i.number).collect();
     let nb: Vec<u32> = b.iter().map(|i| i.number).collect();
     assert_eq!(na, nb);
 }
 
+/// #11508: the level comes only from `loom:important` /
+/// `loom:very-important`. The legacy star labels and a red-main-fix marker
+/// carry no level (the bridge is gone).
 #[test]
-fn legacy_signals_bridge_onto_the_new_levels() {
-    let star = item(1, None, &["loom:operator-priority"]);
-    assert_eq!(effective_level(&star, false), Level::Important);
-    let high = item(2, None, &["loom:operator-high-priority"]);
-    assert_eq!(effective_level(&high, false), Level::VeryImportant);
-    let plain = item(3, None, &[]);
-    assert_eq!(effective_level(&plain, false), Level::Default);
-    assert_eq!(effective_level(&plain, true), Level::VeryImportant, "verified red-main fix");
-    let both = item(4, None, &["loom:operator-priority", VERY_IMPORTANT_LABEL]);
-    assert_eq!(effective_level(&both, false), Level::VeryImportant, "the higher level wins");
+fn the_level_comes_only_from_the_two_priority_labels() {
+    let key = |i: &WorkItem| super::super::ready_queue::key_of(0, 0, i).level;
+    assert_eq!(key(&item(1, None, &["loom:operator-priority"])), Level::Default);
+    assert_eq!(key(&item(2, None, &["loom:operator-high-priority"])), Level::Default);
+    assert_eq!(key(&item(3, None, &["loom:high-priority-inherited"])), Level::Default);
+    let fix = item(4, None, &[]).with_body(Some("<!-- loom:main-red-fix -->".into()));
+    assert_eq!(key(&fix), Level::Default, "a red-main fix is labelled, not bridged");
+    assert_eq!(key(&item(5, None, &[IMPORTANT_LABEL])), Level::Important);
+    let both = item(6, None, &["loom:operator-priority", VERY_IMPORTANT_LABEL]);
+    assert_eq!(key(&both), Level::VeryImportant);
 }
 
 #[test]

@@ -95,7 +95,6 @@ pub fn blocked_rows(repo: &QueueRepoRef, listing: &[RestIssue]) -> Vec<QueueSnap
                 // Deprecated by #9244: always false on the wire.
                 urgent: false,
                 operator_priority: crate::operator_levels::is_starred(&item.labels),
-                operator_priority_at: None,
                 created_at: item.created_at.clone(),
                 tier: item.labels.iter().find(|l| l.starts_with("tier:")).cloned(),
                 disposition,

@@ -4,7 +4,7 @@
 //! When a repo's PR debt is high, its finished work is piling up faster than
 //! Judge / Doctor / Champion drain it, so admitting another issue build in that
 //! repo only makes the pile bigger. While a repo's back-off is **engaged** the
-//! work finder admits no new unstarred issue builds **in that repo**; other
+//! work finder admits no new issue builds **in that repo**; other
 //! repos are untouched, sweeps already in flight are untouched, and the freed
 //! slots go to whatever else is ready.
 //!
@@ -14,7 +14,7 @@
 //!   builds — the #9410 host-wide total did, starving zero-debt repos.
 //! - **Optional host ceiling.** `hostHigh` / `hostLow` (absent = off) apply
 //!   the pre-#10624 host-total rule on top: while engaged, every repo's
-//!   unstarred builds are held. For an operator who wants the fleet to spend
+//!   builds are held. For an operator who wants the fleet to spend
 //!   more effort reviewing than building.
 //! - **Input.** The #9392 demand ledger
 //!   ([`crate::role_runner::demand::global`]), read once per root per tick
@@ -28,8 +28,8 @@
 //!   runner off, demand width disabled, every entry older than `staleSecs` —
 //!   never engages, and releases an engaged back-off. A partly observed one
 //!   sums what it has, which can only err toward not engaging.
-//! - **Bypass.** `loom:operator-priority` (starred) and verified red-main-fix
-//!   candidates are admitted anyway (see `tick_multi_with_build_backoff`).
+//! - **No bypass.** Priority changes order, never admission (#11508): a
+//!   `loom:important` / `loom:very-important` candidate is held like any other.
 //!
 //! Config: `autonomous.workFinder.buildBackoff.{enabled, high, low, hostHigh,
 //! hostLow}`, re-read every tick from the daemon's primary workspace. No env
@@ -355,7 +355,7 @@ pub struct BuildBackoff {
 }
 
 impl BuildBackoff {
-    /// Whether new unstarred issue builds are held.
+    /// Whether new issue builds are held.
     #[must_use]
     pub fn held(&self) -> bool {
         self.engaged
@@ -581,13 +581,12 @@ pub fn any_held(held: &[bool], workspaces: usize) -> bool {
 }
 
 /// Whether pass 2 defers `cand`: its workspace is held (by its own repo's
-/// debt or the host ceiling) and it is neither starred nor a verified
-/// red-main fix — the two bypasses #9410 defined. `held` is parallel to the
-/// tick's workspaces; an index past its end is not held.
+/// debt or the host ceiling). No priority bypasses it (#11508: priority
+/// changes order, never admission). `held` is parallel to the tick's
+/// workspaces; an index past its end is not held.
 #[must_use]
 pub fn defers(held: &[bool], cand: &PriorityCandidate) -> bool {
     held.get(cand.workspace_idx) == Some(&true)
-        && !(cand.operator_priority || cand.main_red_fix || cand.is_very_important())
 }
 
 /// This tick's build back-off deferrals per repo, most-deferred first (ties

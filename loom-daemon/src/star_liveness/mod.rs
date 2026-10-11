@@ -87,6 +87,7 @@ pub use crate::types::{AskKind, LandingStage, OperatorAsk, StarLandingRow};
 
 pub mod captain;
 pub mod collect;
+pub mod dispatch_shim;
 pub mod edges;
 pub mod escalate;
 pub mod forge;

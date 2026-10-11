@@ -25,9 +25,14 @@ shared concurrency budget is filled in that order. The RNG is seeded once
 per tick, and the seed plus every draw are exported as
 `pick.decision.workspace_draw` (and the published plan's `position` is the
 draw order). The single-workspace tick uses the in-workspace order alone.
-Until the old labels are migrated, a legacy bridge maps
-`loom:operator-priority` to important, and `loom:operator-high-priority` and
-a verified red-main fix to very important.
+Since #11508 the level comes only from the two labels: there is no legacy
+bridge, so `loom:operator-priority` / `loom:operator-high-priority` carry no
+dispatch weight until they are migrated (table below).
+
+**Priority changes order, never eligibility or admission** (operator ruling,
+#11508). A priority issue is dispatched only once it is `loom:issue` (there is
+no priority side listing), and no priority exempts a candidate from any gate
+(caps, build back-off, file overlap, repo-sharding slice).
 
 ## Selection: workspace first, then issue
 
@@ -51,8 +56,8 @@ a verified red-main fix to very important.
    (`loom:very-important`, then `loom:important`, then none); oldest
    `createdAt` first; issue number ascending.
 
-**Removed ordering keys** (they go away as the rollout lands): the starred-at
-time and its `starred_at_store`, the red-main-fix key (whoever finds a
+**Removed ordering keys** (gone from dispatch since #11508): the star, the
+starred-at time and its restart store, the red-main-fix key (whoever finds a
 red-main fix labels it `loom:very-important`), the inherited-level key, and
 the cross-workspace tier and round-robin interleave.
 

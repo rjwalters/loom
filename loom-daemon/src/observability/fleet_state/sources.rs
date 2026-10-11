@@ -308,7 +308,7 @@ fn level(row: &ReadyQueueRow) -> u8 {
     row.plan
         .keys
         .iter()
-        .find(|k| k.name == "operator_priority_level")
+        .find(|k| k.name == "level")
         .and_then(|k| k.value.as_u64())
         .and_then(|n| u8::try_from(n).ok())
         .unwrap_or(u8::from(row.operator_priority))
@@ -349,7 +349,7 @@ fn ready_from_tick(
                 issue: row.issue,
                 rank: small(row.rank),
                 star: row.operator_priority,
-                star_at: parse_instant(row.operator_priority_at.as_deref()),
+                star_at: None,
                 level: level(row),
                 fleet_priority: row.workspace_priority,
                 created_at: parse_instant(row.created_at.as_deref()),
