@@ -1,6 +1,7 @@
-//! `loom-daemon check-stale-blocked` — the fleet-wide `loom:blocked` re-check
-//! (issue #8927), backing `defaults/scripts/check-stale-blocked.sh`'s Shape-A
-//! stub.
+//! `loom-daemon check-stale-blocked` — the per-repository `loom:blocked`
+//! re-check (issue #8927), backing `defaults/scripts/check-stale-blocked.sh`'s
+//! Shape-A stub. One invocation examines one repository; see "One repository
+//! per invocation" below.
 //!
 //! The fourth pre-wave advisory check, alongside `check-host-sleep.sh` (#3350),
 //! `check-main-freshness.sh` (#3770) and `check-quarantine-stashes.sh` (#5185).
@@ -26,6 +27,19 @@
 //! answers. `--json` carries what the run spent as `forge_cost`; the human
 //! report prints the same numbers as one stderr line unless `--quiet`.
 //! The logic is [`loom_daemon::stale_blocked::budget`].
+//!
+//! # One repository per invocation (#9191)
+//!
+//! `--repo` / `--repo-root` resolve exactly one repository and nothing here
+//! walks a workspace registry. A caller that wants several repositories has to
+//! invoke this once per repository, and that loop is not protected by anything
+//! in this process: the floor above reads the hourly buckets, which a GitHub
+//! secondary (burst) limit does not appear in, and the rate-limit breaker is
+//! process-local, so a refusal seen in one invocation is gone in the next.
+//! `.loom/docs/github-authentication.md` -> "Secondary rate limits and
+//! hand-rolled loops" has the caller-side rules. The daemon's own walk of
+//! every registered workspace is the *write* pass, `release-stale-blocked`,
+//! which runs in one process behind the breaker.
 //!
 //! # Why every failure is still exit 0
 //!
@@ -81,8 +95,9 @@ pub(crate) struct StaleBlockedArgs {
     #[arg(long)]
     pub json: bool,
 
-    /// Repository to scan, as `owner/name`. Defaults to whatever `gh` resolves
-    /// from `--repo-root`.
+    /// The one repository to scan, as `owner/name`. Defaults to whatever `gh`
+    /// resolves from `--repo-root`. Not repeatable: for several repositories,
+    /// pace separate invocations and stop at the first rate-limit refusal.
     #[arg(long, value_name = "OWNER/NAME")]
     pub repo: Option<String>,
 
@@ -567,6 +582,52 @@ fn print_json(s: &Sections<'_>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #9191: the command examines one repository per invocation, and its
+    /// help must say so. "Fleet-wide" invited a hand-rolled loop over many
+    /// repositories, which is the one caller shape that is unsafe to write.
+    /// Both renderings are pinned: the one-line summary `loom-daemon --help`
+    /// lists, and the subcommand's own `--help`.
+    #[test]
+    fn help_says_per_repository_and_never_fleet_wide() {
+        use crate::cli::whole_cli_parse::{on_stack, MAIN_THREAD_STACK};
+        let (summary, long) = on_stack("stale-blocked-help", MAIN_THREAD_STACK, || {
+            use clap::CommandFactory;
+            let mut cli = <crate::Cli as CommandFactory>::command();
+            cli.build();
+            let sub = cli
+                .find_subcommand_mut("check-stale-blocked")
+                .expect("check-stale-blocked is registered");
+            let summary = sub.get_about().map(ToString::to_string).unwrap_or_default();
+            (summary, sub.render_long_help().to_string())
+        });
+        // Help is re-wrapped to the terminal width, so compare on single spaces.
+        let flat = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+        let (summary, long) = (flat(&summary), flat(&long));
+
+        for (name, text) in [("summary", &summary), ("--help", &long)] {
+            assert!(
+                !text.to_lowercase().contains("fleet-wide"),
+                "{name} must not call the command fleet-wide: {text}"
+            );
+            assert!(
+                text.contains("per-repository"),
+                "{name} must say the command is per-repository: {text}"
+            );
+            assert!(
+                text.contains("one invocation examines one repository"),
+                "{name} must state the one-repository scope: {text}"
+            );
+        }
+        assert!(
+            long.contains("Do not loop it across many repositories by hand"),
+            "--help must warn against the hand-rolled loop: {long}"
+        );
+        assert!(
+            long.contains("github-authentication.md"),
+            "--help must point at the doc section: {long}"
+        );
+    }
 
     fn unticked() -> Finding {
         Finding {
