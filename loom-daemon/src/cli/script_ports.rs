@@ -736,6 +736,12 @@ pub(crate) enum MergePrCommand {
     /// 2 = forge unreachable (caller warns).
     CiResult(super::merge_pr_ci_result::CiResultArgs),
 
+    /// Refuse a plain (non-`--auto`) merge whose head has a required context
+    /// that concluded red (#10688); hold (exit 3) on a missing/pending one.
+    /// `--allow-red-required <ctx>` overrides named contexts with an audit
+    /// comment. Exit 0 = clean/bypassed, 1 = refuse, 2 = forge unreadable.
+    RequiredChecks(super::merge_pr_required_checks::RequiredChecksArgs),
+
     /// The stale-cached-mergeable recheck decision (#6104): once REST
     /// `.mergeable` has read `false`, classify the backoff re-reads plus the
     /// local `git merge-tree` corroboration into `merge:` / `refuse-stale:` /
@@ -1095,6 +1101,7 @@ impl MergePrCommand {
             MergePrCommand::TreeChecks(args) => args.run(),
             MergePrCommand::ChainLock(args) => args.run(),
             MergePrCommand::CiResult(args) => args.run(),
+            MergePrCommand::RequiredChecks(args) => args.run(),
             MergePrCommand::HeadSyncRetry(args) => args.run(),
             MergePrCommand::RedateChecks(args) => args.run(),
             MergePrCommand::RedateReport(args) => args.run(),
