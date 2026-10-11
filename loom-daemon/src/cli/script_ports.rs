@@ -430,9 +430,10 @@ pub(crate) enum ScriptPortCommand {
     /// Strictly read-only, **always exit 0** — it reports, it never relabels.
     ///
     /// Do not loop it across many repositories by hand (#9191): each
-    /// invocation is a fresh process, so the rate-limit breaker carries nothing
-    /// from one repository to the next, and the budget floor cannot see a
-    /// GitHub secondary rate limit. See `.loom/docs/github-authentication.md`
+    /// invocation is a fresh process with no rate-limit breaker (that exists
+    /// only in the running daemon), so a refusal stops nothing and reaches no
+    /// later repository, and the budget floor cannot see a GitHub secondary
+    /// rate limit. See `.loom/docs/github-authentication.md`
     /// -> "Secondary rate limits and hand-rolled loops".
     ///
     /// Not a port: brand-new logic, native from the start per the

@@ -818,13 +818,13 @@ stopped it, and why it was hard to diagnose:
   a GraphQL-backed read (`gh api graphql`, `gh issue view`) is both the way to
   confirm the credential is otherwise healthy and the workaround until the
   throttle lifts.
-- **The breaker is process-local.** It does recognise a secondary-limit
-  refusal, but only inside the process that saw it. A loop of separate
-  invocations starts a fresh process per repository, so a trip in one
-  repository is not carried to the next and the loop keeps bursting. Inside the
-  daemon one process sees every workspace, which is why its own
-  every-workspace pass (`release-stale-blocked`) is gated on the breaker and a
-  shell loop is not.
+- **A one-shot CLI invocation has no breaker.** The breaker exists only in the
+  running daemon process; `loom-daemon check-stale-blocked` runs inline and
+  never registers one, so a secondary-limit refusal neither stops the rest of
+  that invocation nor reaches the next one, and a loop of them keeps bursting.
+  The classifier does match secondary-limit phrasing, which is why the
+  daemon's own every-workspace pass (`release-stale-blocked`) is gated on the
+  breaker and a shell loop is not.
 
 If you do have to visit several repositories from a shell, pace the
 invocations, and stop the whole loop at the first rate-limit refusal instead

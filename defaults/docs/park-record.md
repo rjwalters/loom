@@ -169,9 +169,10 @@ These writers differ from `apply` in two documented ways:
   this pass, the notifier and the release pass: it is `loom:blocked` only to
   stay out of curation and has no blocker to cite (#9397).
   **Do not loop it over many repositories by hand.** The budget floor reads
-  the hourly buckets, which a secondary rate limit never shows in, and the
-  rate-limit breaker is process-local, so neither carries a refusal from one
-  invocation to the next. A caller that needs several repositories must pace
+  the hourly buckets, which a secondary rate limit never shows in, and a
+  one-shot CLI invocation has no rate-limit breaker (it exists only in the
+  running daemon), so nothing carries a refusal from one invocation to the
+  next. A caller that needs several repositories must pace
   the invocations and stop at the first one that reports a rate-limit refusal
   (it still exits 0, so read the report, not the exit code). Why, and what to
   check instead: [github-authentication.md → Secondary rate limits and

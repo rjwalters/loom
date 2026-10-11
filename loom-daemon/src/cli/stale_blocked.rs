@@ -34,8 +34,9 @@
 //! walks a workspace registry. A caller that wants several repositories has to
 //! invoke this once per repository, and that loop is not protected by anything
 //! in this process: the floor above reads the hourly buckets, which a GitHub
-//! secondary (burst) limit does not appear in, and the rate-limit breaker is
-//! process-local, so a refusal seen in one invocation is gone in the next.
+//! secondary (burst) limit does not appear in, and this one-shot process has
+//! no rate-limit breaker (it exists only in the running daemon), so a refusal
+//! stops nothing here and reaches no later invocation.
 //! `.loom/docs/github-authentication.md` -> "Secondary rate limits and
 //! hand-rolled loops" has the caller-side rules. The daemon's own walk of
 //! every registered workspace is the *write* pass, `release-stale-blocked`,
