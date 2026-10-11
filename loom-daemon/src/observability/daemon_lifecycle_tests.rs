@@ -186,6 +186,57 @@ async fn shutdown_record_is_enqueued_before_and_exported_by_the_final_drain() {
     task.abort();
 }
 
+/// Like [`Capture`], but every export is slow, so heartbeat ticks land while
+/// the final drain is still in flight.
+struct SlowCapture(Arc<Mutex<Vec<String>>>);
+
+impl Exporter for SlowCapture {
+    async fn emit_batch(&self, batch: &[TelemetryEnvelope]) -> Result<(), ExportError> {
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        Capture(self.0.clone()).emit_batch(batch).await
+    }
+}
+
+/// Regression: the real heartbeat task keeps ticking while the final drain
+/// exports slowly. `daemon.shutdown` must still be the last lifecycle record,
+/// both exported and retained — no heartbeat may be enqueued after it.
+#[tokio::test]
+#[serial]
+async fn heartbeat_never_lands_after_shutdown_during_a_slow_final_drain() {
+    let dir = tempfile::tempdir().unwrap();
+    let queue = Arc::new(DurableQueue::open(dir.path().join("q.jsonl"), 500));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let sink: Arc<dyn QueueSink> = queue.clone();
+    start(sink.clone(), "host-under-test".into(), Instant::now());
+    let heartbeat = spawn_heartbeat(
+        sink,
+        "host-under-test".into(),
+        Vec::new(),
+        Duration::from_millis(5),
+        Instant::now(),
+    );
+    let sender = super::super::shutdown::spawn_sender(
+        queue.clone(),
+        SlowCapture(seen.clone()),
+        1,
+        Duration::from_secs(3600),
+        Arc::new(ExportStatus::started("host-under-test", "http://localhost", "otlp", 3600)),
+    );
+    // Let several heartbeats accumulate so the drain is long and ticks keep
+    // firing throughout it.
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    super::super::shutdown::finish(crate::ipc::EXIT_SHUTDOWN, Duration::from_secs(30)).await;
+    // Give a (buggy) still-running heartbeat several more ticks to misbehave.
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    let seen = seen.lock().unwrap().clone();
+    assert!(seen.iter().any(|t| t == TOPIC_HEARTBEAT), "heartbeats ran: {seen:?}");
+    assert_eq!(seen.last().map(String::as_str), Some(TOPIC_SHUTDOWN), "{seen:?}");
+    assert_eq!(seen.iter().filter(|t| *t == TOPIC_SHUTDOWN).count(), 1);
+    assert!(queue.is_empty(), "nothing retained behind the shutdown record");
+    assert!(heartbeat.is_finished(), "the heartbeat loop stops after shutdown");
+    sender.abort();
+}
+
 /// The gateway's log allowlist must keep every typed lifecycle attribute —
 /// an attribute the collector drops is one no SigNoz query can read.
 #[test]

@@ -230,8 +230,36 @@ pub fn record_shutdown(code: i32) -> bool {
     true
 }
 
+/// Enqueue one heartbeat unless `daemon.shutdown` already consumed the sink
+/// (or a different queue has since registered). The offer happens *under* the
+/// [`SINK`] lock, the same lock [`record_shutdown`] takes the sink under, so
+/// every heartbeat is either wholly ordered before the shutdown record or
+/// refused — a tick racing the final drain can never land after it. Returns
+/// whether the heartbeat was enqueued.
+fn offer_heartbeat(
+    queue: &Arc<dyn QueueSink>,
+    host_id: &str,
+    sources: &[ExportHealthSource],
+    started: Instant,
+) -> bool {
+    let guard = SINK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match guard.as_ref() {
+        Some(sink) if Arc::ptr_eq(&sink.queue, queue) => {
+            queue.offer(TelemetryEnvelope::new(
+                host_id.to_string(),
+                heartbeat_record(sources, started.elapsed()),
+            ));
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Spawn the heartbeat loop. The first heartbeat fires one `interval` after
-/// start (`daemon.start` already marks the beginning).
+/// start (`daemon.start` already marks the beginning). The loop ends on its
+/// own once `daemon.shutdown` has been recorded.
 pub fn spawn_heartbeat(
     queue: Arc<dyn QueueSink>,
     host_id: String,
@@ -245,10 +273,9 @@ pub fn spawn_heartbeat(
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            queue.offer(TelemetryEnvelope::new(
-                host_id.clone(),
-                heartbeat_record(&sources, started.elapsed()),
-            ));
+            if !offer_heartbeat(&queue, &host_id, &sources, started) {
+                return;
+            }
         }
     })
 }
