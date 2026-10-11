@@ -280,6 +280,9 @@ pub fn assemble_export(params: &CheckParams, export: &str) -> Result<Check, Stri
 /// it returned rows this reader cannot parse.
 pub fn fetch(http: &ClickhouseHttp, params: &CheckParams) -> Result<Check, String> {
     let (check_sql, report_sql) = check_and_report_queries(REPLAY_QUERIES)?;
+    if params.replay.knowable_since.is_none() {
+        return Err(super::MISSING_KNOWABLE_SINCE.to_string());
+    }
     let bound = params.params();
     let post = |sql: &str, which: &str| {
         http.post_with(&format!("{sql}\nFORMAT JSONEachRow"), &bound)
