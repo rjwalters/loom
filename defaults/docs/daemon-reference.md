@@ -7553,6 +7553,7 @@ let one of them be read as the sentinel:
 | `LOOM-CHECKS-TIMEOUT <sha> <pending>` | 2 | the deadline passed with checks pending — including zero rows while required contexts exist (never `NONE`) |
 | `LOOM-CHECKS-ERROR <reason>` | 3 | unreadable or truncated rollup, a classified refusal (see below) or 404, repeated read failures, a required-context lookup still failing after 3 attempts when the wait would otherwise settle (`required-lookup-failed: …`), or Gitea |
 | `LOOM-CHECKS-HEAD-MOVED <old> <new>` | 4 | PR mode: the head changed mid-wait, so no verdict for `<old>` applies to `<new>` |
+| `LOOM-CHECKS-NO-RUN <sha>` | 5 | #11389: after a grace period (`LOOM_WAIT_CHECKS_NO_RUN_GRACE`, default 120s), with nothing observed still running, the head has zero `github-actions` check suites — no workflow run exists, usually because of a skip-CI marker in the head commit message (stderr hint). A queued Actions suite is a run: the wait continues. A failed suite lookup falls back to `TIMEOUT` |
 
 `--timeout 0` is one snapshot poll. Default mode settles on every observed check,
 and before `GREEN` also waits for a required context that has not registered yet
