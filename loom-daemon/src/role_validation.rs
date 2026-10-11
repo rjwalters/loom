@@ -315,6 +315,12 @@ pub fn validate_from_config(config: &serde_json::Value, mode: ValidationMode) ->
         result.errors.extend(excluded_errors);
     }
 
+    let escalation_errors = crate::doctor_escalation::check_config(config);
+    if !escalation_errors.is_empty() {
+        result.valid = false;
+        result.errors.extend(escalation_errors);
+    }
+
     result
 }
 

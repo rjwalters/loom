@@ -42,6 +42,10 @@ pub struct RunArgs {
     /// e.g. `feature/issue-<parent>` (passed to `worktree.sh --base`).
     #[arg(long, value_name = "BRANCH", requires = "issue")]
     base: Option<String>,
+    /// Doctor only (#11359): skip the role preference and hand the attempt to
+    /// the Claude escalation ladder. Never re-enters the GLM tap.
+    #[arg(long, value_name = "WHY")]
+    escalate_claude: Option<String>,
 }
 
 /// The Builder's pre-launch PR snapshot. An unreadable one is refused rather
@@ -107,6 +111,33 @@ pub struct Report {
     /// otherwise reach the caller with no reason).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diagnostic: Option<String>,
+    /// Why this attempt bypassed the preference list (#11359).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub escalation_reason: Option<String>,
+}
+
+/// An operator pin to a non-Claude runtime contradicts a Claude escalation and
+/// is refused with a bounded diagnostic rather than honoured silently.
+pub fn escalation_pin_conflict(
+    doctor_pin: Option<&str>,
+    global_pin: Option<&str>,
+    global_role: Option<&str>,
+) -> Option<String> {
+    let global = global_pin.filter(|_| !is_inherited_dispatch_pin(global_pin, global_role));
+    [
+        ("LOOM_RUNTIME_DOCTOR", doctor_pin),
+        ("LOOM_RUNTIME", global),
+    ]
+    .into_iter()
+    .find_map(|(name, v)| {
+        let v = v?.trim();
+        (!v.is_empty() && v != "claude").then(|| {
+            format!(
+                "{name}={v} pins the Doctor to a non-Claude runtime, which contradicts the \
+                     GLM-rejection escalation to Claude; unset the pin or set it to claude"
+            )
+        })
+    })
 }
 
 /// Bytes of worker stderr kept as the `diagnostic` on a failed launch.
@@ -376,6 +407,31 @@ fn launch_bounded(
 }
 
 fn run(args: &RunArgs, role: Role) -> Result<i32, LaunchError> {
+    if let Some(reason) = args.escalate_claude.as_deref() {
+        if role != Role::Doctor {
+            return Err(LaunchError::config("--escalate-claude applies to doctor only"));
+        }
+        if let Some(conflict) = escalation_pin_conflict(
+            std::env::var("LOOM_RUNTIME_DOCTOR").ok().as_deref(),
+            std::env::var("LOOM_RUNTIME").ok().as_deref(),
+            std::env::var("LOOM_ROLE").ok().as_deref(),
+        ) {
+            return Err(LaunchError::config(conflict));
+        }
+        let report = Report {
+            role: role.as_str().into(),
+            issue: None,
+            pr: args.pr,
+            runtime: "claude".into(),
+            model_profile: None,
+            outcome: "delegate-to-claude".into(),
+            log_path: None,
+            diagnostic: None,
+            escalation_reason: Some(reason.to_owned()),
+        };
+        emit(args, &report);
+        return Ok(0);
+    }
     let root = super::workspace(None)?;
     let (admitted, backstop) = admit(&root, role)?;
     let model_profile = admitted
@@ -391,6 +447,7 @@ fn run(args: &RunArgs, role: Role) -> Result<i32, LaunchError> {
         outcome: "delegate-to-claude".into(),
         log_path: None,
         diagnostic: None,
+        escalation_reason: None,
     };
     if delegates_to_claude(&admitted.runtime) {
         emit(args, &report);
@@ -894,5 +951,37 @@ mod tests {
         assert!(
             Cli::try_parse_from(["x", "--role", "builder", "--issue", "1", "--pr", "2"]).is_err()
         );
+    }
+    #[test]
+    fn claude_escalation_refuses_non_claude_pins_but_ignores_inherited_ones() {
+        assert!(escalation_pin_conflict(None, None, None).is_none());
+        assert!(escalation_pin_conflict(Some("claude"), None, None).is_none());
+        assert!(escalation_pin_conflict(None, Some(" "), None).is_none());
+        let doc = escalation_pin_conflict(Some("opencode"), None, None).unwrap();
+        assert!(doc.contains("LOOM_RUNTIME_DOCTOR=opencode"), "{doc}");
+        assert!(escalation_pin_conflict(None, Some("opencode"), None).is_some());
+        // A global pin that arrived with LOOM_ROLE is the parent phase's own.
+        assert!(escalation_pin_conflict(None, Some("opencode"), Some("sweep")).is_none());
+    }
+
+    #[test]
+    fn escalate_claude_flag_parses_for_doctor() {
+        use clap::Parser;
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: RunArgs,
+        }
+        let ok = Cli::try_parse_from([
+            "x",
+            "--role",
+            "doctor",
+            "--pr",
+            "5",
+            "--escalate-claude",
+            "why",
+        ])
+        .unwrap();
+        assert_eq!(ok.args.escalate_claude.as_deref(), Some("why"));
     }
 }
