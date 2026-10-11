@@ -21,6 +21,8 @@ use std::collections::{BTreeSet, HashMap};
 
 use super::PriorityCandidate;
 
+pub mod check;
+
 /// The set of file paths a Curator body names under `## Affected Files`, or
 /// `None` when the surface is unknown (no section or no paths).
 #[must_use]
