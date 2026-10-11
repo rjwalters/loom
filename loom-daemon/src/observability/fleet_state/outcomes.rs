@@ -1190,7 +1190,7 @@ impl ForgeReads for GhForgeReads {
         // Whether a merge closed it is on the `closed` event's `commit_id`
         // or, for a `Closes #N` merge (null `commit_id`), a merged PR in the
         // timeline; a failed page is a failed read, retried next pass.
-        let mut read_pages = |kind: &str| -> Option<Vec<serde_json::Value>> {
+        let read_pages = |kind: &str| -> Option<Vec<serde_json::Value>> {
             let mut pages = Vec::new();
             for page in 1.. {
                 let batch = crate::observability::ops::stage_dwell::gh_json(

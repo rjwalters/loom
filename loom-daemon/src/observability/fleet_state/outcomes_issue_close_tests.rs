@@ -233,7 +233,7 @@ fn an_unmerged_or_long_past_referencing_pr_does_not_make_a_hand_close_a_merge() 
     ] {
         let timeline = serde_json::json!([reference]);
         assert_eq!(
-            IssueFacts::closed(at, &[events.clone()], &[timeline]),
+            IssueFacts::closed(at, std::slice::from_ref(&events), &[timeline]),
             IssueFacts::NotMerged(at)
         );
     }
