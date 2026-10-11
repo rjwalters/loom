@@ -18,10 +18,11 @@ Written only through `sweep-checkpoint.sh`. Scope `N` is the PR's single closing
 scope even with no checkpoint file yet: still write `doctor-done`, which creates it); with
 zero/multiple closing issues pass `-` and write no `doctor-done`. State lives in the issue checkpoint when one exists,
 else in a PR-scoped `pr-P-doctor.json` beside it (no phase, never listed, so no phase is
-faked to hold it); the first issue `write` adopts it. Record the first attempt **before**
+faked to hold it); the first issue `write` adopts it and removes that file. Record the first attempt **before**
 its `doctor-done` write, so a checkpoint-less Mode C entry loses nothing. Later `write`s
-retain it; `curator-done`/`builder-done` or `delete` resets it (`doctor-clear N|- --pr P`
-right after `merge-pr.sh` succeeds, or when the PR is parked, drops it all); an absent key (legacy) means zero. Keyed to the PR number.
+retain it; `curator-done`/`builder-done` resets it (the PR file too, given `--pr-number`);
+`delete N [--pr P]` resets both stores (pass `--pr` when no checkpoint names P). `doctor-clear N|- --pr P`
+right after `merge-pr.sh` succeeds, or when the PR is parked, drops it all; an absent key (legacy) means zero. Keyed to the PR number.
 
 ## Procedure
 

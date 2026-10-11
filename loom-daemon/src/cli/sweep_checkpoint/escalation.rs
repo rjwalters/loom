@@ -26,24 +26,50 @@ fn state_of(path: &Path) -> Option<Value> {
     load(path).ok().flatten().and_then(|r| r.get(KEY).cloned())
 }
 
+fn remove_pr_file(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(io_error(e)),
+    }
+}
+
 /// Checkpoint `write` rebuilds the whole record, so carry the escalation state
-/// over it (adopting PR-scoped state recorded before the checkpoint existed).
+/// over it, adopting PR-scoped state recorded before the checkpoint existed
+/// (the PR file is retired once adopted, so `delete` has one store to reset).
 /// A new lineage (Curator/Builder completion) resets it deliberately.
-pub(super) fn carry_forward(target: &Path, record: &mut Value) {
+pub(super) fn carry_forward(target: &Path, record: &mut Value) -> Result<()> {
     let scoped = record["pr_number"]
         .as_u64()
         .zip(target.parent())
         .map(|(pr, dir)| pr_path(dir, pr));
     if matches!(record["phase"].as_str(), Some("curator-done" | "builder-done")) {
-        if let Some(path) = scoped {
-            let _ = std::fs::remove_file(path);
-        }
-        return;
+        return scoped.as_deref().map_or(Ok(()), remove_pr_file);
     }
-    let pr_scoped = scoped.and_then(|path| state_of(&path));
+    let pr_scoped = scoped.as_deref().and_then(state_of);
     if let Some(state) = state_of(target).or(pr_scoped) {
         record[KEY] = state;
+        if let Some(path) = scoped.as_deref() {
+            remove_pr_file(path)?;
+        }
     }
+    Ok(())
+}
+
+/// `delete ISSUE [--pr P]` ends the lineage in both stores. `P` defaults to the
+/// checkpoint's `pr_number`; pass `--pr` when no checkpoint was ever written
+/// (history then lives only in the PR-scoped file).
+pub(super) fn reset_on_delete(dir: &Path, target: &Path, args: &[String]) -> Result<()> {
+    let pr = match args {
+        // Best effort: an unreadable checkpoint names no PR, and must stay deletable.
+        [] => load(target)
+            .ok()
+            .flatten()
+            .and_then(|r| r["pr_number"].as_u64()),
+        [flag, value] if flag == "--pr" => Some(u64::from(number(value)?)),
+        _ => return Err(invalid("delete takes ISSUE [--pr P]")),
+    };
+    pr.map_or(Ok(()), |pr| remove_pr_file(&pr_path(dir, pr)))
 }
 
 fn load(target: &Path) -> Result<Option<Value>> {

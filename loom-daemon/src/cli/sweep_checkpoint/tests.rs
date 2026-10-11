@@ -546,3 +546,69 @@ fn restart_after_doctor_completion_before_review_keeps_attempt_identity() {
     .unwrap();
     assert!(reject(r, "a1").starts_with("counted count=1"));
 }
+
+fn pr_file(root: &Path) -> std::path::PathBuf {
+    root.join(".loom/sweep-checkpoint/pr-43-doctor.json")
+}
+
+fn latched_without_checkpoint(root: &Path) {
+    set_k(root, r#"{"sweep":{"glmDoctorRejectionsBeforeEscalation":1}}"#);
+    doctor(root, "a1", "opencode", "glm-5.3");
+    assert!(reject(root, "a1").contains("escalated=true"));
+    assert!(route(root, "2", "1").starts_with("route=claude"));
+}
+
+#[test]
+fn delete_before_adoption_resets_the_pr_scoped_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = dir.path();
+    latched_without_checkpoint(r);
+    // No issue file yet: `--pr` identifies the history to drop.
+    invoke(r, &["delete", "42", "--pr", "43"]).unwrap();
+    assert!(!pr_file(r).exists());
+    assert_eq!(route(r, "2", "1"), "route=preference\n");
+    // The old rejection is not countable again.
+    assert!(reject(r, "a1").starts_with("not-counted"));
+}
+
+#[test]
+fn delete_after_adoption_resets_and_adoption_retires_the_pr_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = dir.path();
+    latched_without_checkpoint(r);
+    invoke(
+        r,
+        &[
+            "write",
+            "42",
+            "doctor-done",
+            "--pr-number",
+            "43",
+            "--attempt",
+            "2",
+        ],
+    )
+    .unwrap();
+    assert!(!pr_file(r).exists(), "adopted state leaves one store");
+    assert!(route(r, "2", "1").starts_with("route=claude"));
+    invoke(r, &["delete", "42"]).unwrap();
+    assert_eq!(route(r, "2", "1"), "route=preference\n");
+    assert!(reject(r, "a1").starts_with("not-counted"));
+}
+
+#[test]
+fn delete_surfaces_cleanup_errors_and_rejects_bad_arguments() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = dir.path();
+    latched_without_checkpoint(r);
+    // A directory where the PR file should be makes the removal fail loudly.
+    std::fs::remove_file(pr_file(r)).unwrap();
+    std::fs::create_dir(pr_file(r)).unwrap();
+    assert_eq!(invoke(r, &["delete", "42", "--pr", "43"]).unwrap_err().0, 3);
+    assert_eq!(invoke(r, &["delete", "42", "--bogus"]).unwrap_err().0, 1);
+    // A corrupt checkpoint names no PR but is still deletable.
+    let issue = r.join(".loom/sweep-checkpoint/issue-42.json");
+    std::fs::write(&issue, b"{not json").unwrap();
+    invoke(r, &["delete", "42"]).unwrap();
+    assert!(!issue.exists());
+}

@@ -114,7 +114,7 @@ fn execute(root: &Path, args: &[String], out: &mut impl Write) -> Result<()> {
             | "doctor-route"
             | "doctor-clear"
     ) {
-        return Err(invalid("usage: sweep-checkpoint doctor-attempt ISSUE|- --pr N --head SHA --runtime RT [--profile P] [--kind fix|rebase]; doctor-rejection ISSUE|- --pr N --head SHA; doctor-route ISSUE|- --pr N --attempt A --cap C; doctor-clear ISSUE|- --pr N; write ISSUE PHASE [--task-id ID] [--pr-number N] [--attempt N] [--model M]; begin ISSUE ROLE [--attempt N] [--model M]; read/phase/attempt/model/exists/delete ISSUE; jev ISSUE TIER CONFIDENCE; list"));
+        return Err(invalid("usage: sweep-checkpoint doctor-attempt ISSUE|- --pr N --head SHA --runtime RT [--profile P] [--kind fix|rebase]; doctor-rejection ISSUE|- --pr N --head SHA; doctor-route ISSUE|- --pr N --attempt A --cap C; doctor-clear ISSUE|- --pr N; write ISSUE PHASE [--task-id ID] [--pr-number N] [--attempt N] [--model M]; begin ISSUE ROLE [--attempt N] [--model M]; read/phase/attempt/model/exists ISSUE; delete ISSUE [--pr P]; jev ISSUE TIER CONFIDENCE; list"));
     }
     let issue_text = args.get(1).ok_or_else(|| invalid("issue is required"))?;
     if let Some(verb) = command.strip_prefix("doctor-") {
@@ -141,7 +141,7 @@ fn execute(root: &Path, args: &[String], out: &mut impl Write) -> Result<()> {
     }
     if command == "write" {
         let mut record = parse_write(&args[2..])?;
-        escalation::carry_forward(&target, &mut record);
+        escalation::carry_forward(&target, &mut record)?;
         persist(&dir, &target, &record)?;
         // Telemetry remains best effort, and only follows a successful durable write.
         loom_daemon::observability::lifecycle::checkpoint_completed(
@@ -162,6 +162,7 @@ fn execute(root: &Path, args: &[String], out: &mut impl Write) -> Result<()> {
         return Ok(());
     }
     if command == "delete" {
+        escalation::reset_on_delete(&dir, &target, &args[2..])?;
         return match std::fs::remove_file(&target) {
             Ok(()) => {
                 std::fs::File::open(&dir)
