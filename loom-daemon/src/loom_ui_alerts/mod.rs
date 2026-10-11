@@ -237,7 +237,7 @@ fn acceptable_url(raw: &str) -> Result<(), String> {
     if !url.username().is_empty() || url.password().is_some() {
         return Err("URL carries credentials".to_string());
     }
-    let loopback = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]" | "::1"));
+    let loopback = is_loopback(&url);
     if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
         return Err(format!("{raw} is not https"));
     }
@@ -245,6 +245,38 @@ fn acceptable_url(raw: &str) -> Result<(), String> {
         return Err(format!("{raw} points at the reserved placeholder domain {host}"));
     }
     Ok(())
+}
+
+fn is_loopback(url: &reqwest::Url) -> bool {
+    matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]" | "::1"))
+}
+
+/// A `LOOM_LOOM_UI_ALERTS_URL` override may move the path, never the key: it
+/// must be https on the same host and port as `observability.endpoint` (the
+/// host the key already goes to), or loopback (tests, an on-host proxy).
+///
+/// # Errors
+/// Unparseable, or another host than the ingest endpoint's.
+pub fn override_allowed(override_url: &str, endpoint: Option<&str>) -> Result<(), String> {
+    let url = reqwest::Url::parse(override_url)
+        .map_err(|e| format!("unparseable {URL_ENV} {override_url}: {e}"))?;
+    if is_loopback(&url) {
+        return Ok(());
+    }
+    let ingest = endpoint
+        .and_then(|e| reqwest::Url::parse(e.trim()).ok())
+        .ok_or_else(|| format!("{URL_ENV} needs observability.endpoint to compare against"))?;
+    let same = url.scheme() == "https"
+        && url.host_str() == ingest.host_str()
+        && url.port_or_known_default() == ingest.port_or_known_default();
+    if same {
+        Ok(())
+    } else {
+        Err(format!(
+            "{URL_ENV} {override_url} is not https on the ingest endpoint's host; ignoring the \
+             output rather than sending the key elsewhere"
+        ))
+    }
 }
 
 fn env_off() -> bool {
@@ -271,7 +303,10 @@ pub fn resolve_target(root: &Path) -> Result<Target, String> {
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
     {
-        Some(url) => url,
+        Some(url) => {
+            override_allowed(&url, crate::observability::resolve_endpoint(&config).as_deref())?;
+            url
+        }
         None => {
             let endpoint = crate::observability::resolve_endpoint(&config)
                 .ok_or_else(|| "observability.endpoint is not set".to_string())?;
@@ -308,8 +343,10 @@ impl HttpTransport {
     /// # Errors
     /// The HTTP client cannot be built (no TLS backend).
     pub fn new(target: Target) -> Result<Self, String> {
+        // No redirects: the bearer key goes to this one URL and nowhere else.
         let client = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| e.to_string())?;
         Ok(Self { client, target })

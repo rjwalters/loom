@@ -9,6 +9,11 @@
 //!
 //! Spawned only when narration is enabled with a socket, so "not configured"
 //! here means the sink has not connected yet and counts as unreachable.
+//!
+//! The tracker lives in memory, so a daemon restarted while the incident was
+//! open would never resolve it. The first healthy sample after start therefore
+//! always sends one `resolved`; for an incident loom-ui does not hold that is
+//! a no-op (`outcome: unknown`).
 
 use std::time::{Duration, Instant};
 
@@ -23,10 +28,24 @@ pub const SAMPLE: Duration = Duration::from_secs(30);
 pub const RULE: &str = "safehouse.unreachable";
 
 /// Debounce over state samples. Pure, injected clock.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Tracker {
     bad_since: Option<Instant>,
+    /// This process opened the incident.
     open: bool,
+    /// A previous process may have left it open: resolve on the first healthy
+    /// sample.
+    startup_resolve_owed: bool,
+}
+
+impl Default for Tracker {
+    fn default() -> Self {
+        Self {
+            bad_since: None,
+            open: false,
+            startup_resolve_owed: true,
+        }
+    }
 }
 
 impl Tracker {
@@ -34,11 +53,14 @@ impl Tracker {
     pub fn observe(&mut self, healthy: bool, now: Instant, sustain: Duration) -> Option<State> {
         if healthy {
             self.bad_since = None;
-            return std::mem::take(&mut self.open).then_some(State::Resolved);
+            let owed =
+                std::mem::take(&mut self.open) | std::mem::take(&mut self.startup_resolve_owed);
+            return owed.then_some(State::Resolved);
         }
         let since = *self.bad_since.get_or_insert(now);
         if !self.open && now.duration_since(since) >= sustain {
             self.open = true;
+            self.startup_resolve_owed = false;
             return Some(State::Open);
         }
         None
@@ -88,10 +110,37 @@ pub fn spawn(runtime: &tokio::runtime::Handle, cell: SharedSafehouseState) {
 mod tests {
     use super::*;
 
+    /// A tracker past its startup resolve.
+    fn settled(t0: Instant) -> Tracker {
+        let mut t = Tracker::default();
+        assert_eq!(t.observe(true, t0, SUSTAIN), Some(State::Resolved));
+        t
+    }
+
     #[test]
-    fn a_short_blip_posts_nothing() {
+    fn the_first_healthy_sample_after_start_resolves_once() {
+        // A restart forgets an open incident; the startup resolve closes it.
         let mut t = Tracker::default();
         let t0 = Instant::now();
+        assert_eq!(t.observe(true, t0, SUSTAIN), Some(State::Resolved));
+        assert_eq!(t.observe(true, t0 + SAMPLE, SUSTAIN), None);
+    }
+
+    #[test]
+    fn unhealthy_at_start_opens_after_sustain_and_resolves_once() {
+        let mut t = Tracker::default();
+        let t0 = Instant::now();
+        assert_eq!(t.observe(false, t0, SUSTAIN), None);
+        assert_eq!(t.observe(false, t0 + SUSTAIN, SUSTAIN), Some(State::Open));
+        assert_eq!(t.observe(false, t0 + SUSTAIN * 2, SUSTAIN), None);
+        assert_eq!(t.observe(true, t0 + SUSTAIN * 3, SUSTAIN), Some(State::Resolved));
+        assert_eq!(t.observe(true, t0 + SUSTAIN * 4, SUSTAIN), None);
+    }
+
+    #[test]
+    fn a_short_blip_posts_nothing() {
+        let t0 = Instant::now();
+        let mut t = settled(t0);
         assert_eq!(t.observe(false, t0, SUSTAIN), None);
         assert_eq!(t.observe(false, t0 + Duration::from_secs(60), SUSTAIN), None);
         assert_eq!(t.observe(true, t0 + Duration::from_secs(90), SUSTAIN), None);
@@ -99,8 +148,8 @@ mod tests {
 
     #[test]
     fn sustained_unreachable_opens_once_and_reconnect_resolves() {
-        let mut t = Tracker::default();
         let t0 = Instant::now();
+        let mut t = settled(t0);
         assert_eq!(t.observe(false, t0, SUSTAIN), None);
         assert_eq!(t.observe(false, t0 + SUSTAIN, SUSTAIN), Some(State::Open));
         assert_eq!(t.observe(false, t0 + SUSTAIN * 2, SUSTAIN), None);

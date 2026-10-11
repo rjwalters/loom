@@ -331,7 +331,7 @@ fn one_shot_server(status: u16) -> (String, std::thread::JoinHandle<String>) {
         let body = r#"{"error":"field: source"}"#;
         let reply = format!(
             "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
-             connection: close\r\n\r\n{body}",
+             location: http://127.0.0.1:1/elsewhere\r\nconnection: close\r\n\r\n{body}",
             body.len()
         );
         let _ = stream.write_all(reply.as_bytes());
@@ -375,4 +375,25 @@ fn post_blocking_with_nothing_listening_is_a_retry() {
     let target = Target::new(format!("http://127.0.0.1:{port}/api/alerts/external"), "k".into());
     let got = post_blocking(&target, &alert("r", "k", State::Open), Duration::from_secs(10));
     assert!(matches!(got, Delivery::Retry(_)), "{got:?}");
+}
+
+#[test]
+fn a_url_override_cannot_move_the_key_to_another_host() {
+    let ingest = Some("https://loom-ui.2amlogic.dev/ingest");
+    assert!(override_allowed("https://loom-ui.2amlogic.dev/v2/api/alerts/external", ingest).is_ok());
+    assert!(override_allowed("http://127.0.0.1:8787/api/alerts/external", None).is_ok());
+    assert!(override_allowed("https://evil.example.net/api/alerts/external", ingest).is_err());
+    assert!(override_allowed("http://loom-ui.2amlogic.dev/api/alerts/external", ingest).is_err());
+    assert!(override_allowed("https://loom-ui.2amlogic.dev:8443/x", ingest).is_err());
+    assert!(override_allowed("https://loom-ui.2amlogic.dev/x", None).is_err());
+}
+
+#[test]
+fn a_redirect_is_not_followed_so_the_key_goes_nowhere_else() {
+    // A 302 is a non-429 4xx/3xx answer: dropped, never followed.
+    let (url, server) = one_shot_server(302);
+    let target = Target::new(url, "k".into());
+    let got = post_blocking(&target, &alert("r", "k", State::Open), Duration::from_secs(10));
+    server.join().unwrap();
+    assert!(matches!(got, Delivery::Dropped(ref why) if why.contains("302")), "{got:?}");
 }
