@@ -235,6 +235,8 @@ already has every property needed here:
   "Single writer" means one module and one lock. The daemon and the
   `loom-daemon` CLI subcommands (for example `sweep-checkpoint write`) are the
   same crate, so they share it. Q2 discusses why IPC was not chosen.
+  *Implemented deviation (2a, #11345):* the lock is a stable per-stream
+  `<stream>/.lock` file, not the active segment, whose identity changes on rotation.
 - **Segments**: `<journal>/<stream>/<seq:010>.jsonl`. A new segment starts
   at a size bound. The segment holding the oldest unacknowledged cursor
   position is never deleted. This is the #11045 rule (`ci_telemetry/rotation.rs`)
