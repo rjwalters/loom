@@ -9,9 +9,9 @@ use chrono::{DateTime, Utc};
 
 use super::ready_queue;
 use crate::sweep_registry::{
-    ClaimLockDispatchError, CollisionDispatchError, DispatchBackoffError, LeaseOrderDispatchError,
-    LiveClaimDispatchError, OpenPrDispatchError, ParkedIssueDispatchError,
-    TokenSelectionDispatchError, WorkspaceCommandsMissingDispatchError,
+    AlreadyLandedDispatchError, ClaimLockDispatchError, CollisionDispatchError,
+    DispatchBackoffError, LeaseOrderDispatchError, LiveClaimDispatchError, OpenPrDispatchError,
+    ParkedIssueDispatchError, TokenSelectionDispatchError, WorkspaceCommandsMissingDispatchError,
 };
 use crate::types::QueueDisposition as Qd;
 
@@ -143,6 +143,8 @@ pub struct TickReport {
     /// apparently-healthy sweep that produced nothing** and would otherwise be
     /// re-offered on the very next tick.
     pub skipped_prless_retry: usize,
+    /// Issues refused because their work already landed (Issue #11429).
+    pub skipped_already_landed: usize,
     /// Issues skipped because they self-declared a `<!-- loom:recheck-interval=
     /// <value> -->` marker (Issue #6685) and their own `updatedAt` is still
     /// within that interval — see [`WorkItem::is_within_recheck_interval`](super::WorkItem::is_within_recheck_interval).
@@ -469,6 +471,12 @@ fn classify(report: &mut TickReport, issue: u32, outcome: &Result<bool>) -> Outc
             parked.label
         );
         Outcome::new(Qd::Parked, Some(parked.label.to_string()), "refused", "labeled")
+    } else if let Some(landed) = e.downcast_ref::<AlreadyLandedDispatchError>() {
+        // #11429: the issue is closed, or this host just landed it.
+        report.skipped_already_landed += 1;
+        log::info!("work_finder: skipping issue #{issue} — {e}");
+        let detail = Some(landed.detail().to_string());
+        Outcome::new(Qd::AlreadyLanded, detail, "refused", "already_landed")
     } else if e.downcast_ref::<DispatchBackoffError>().is_some() {
         // Dispatch backoff (#4485), possibly armed mid-tick by a reap.
         report.skipped_backoff += 1;

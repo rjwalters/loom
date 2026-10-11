@@ -781,7 +781,7 @@ fn terminal_records(
             config: std::collections::BTreeMap::new(),
             phase_durations: Vec::<PhaseDuration>::new(),
             total_duration_sec,
-            result,
+            result: crate::telemetry::result_for_disposition(result, disposition),
             disposition,
             pr_number,
             // Token fields (and `tokens_status`) are filled by

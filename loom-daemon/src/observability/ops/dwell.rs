@@ -98,6 +98,7 @@ pub fn wait_class(disposition: QueueDisposition) -> Option<WaitClass> {
         | D::PeerClaim
         | D::OpenPr
         | D::OpenPrBackoff
+        | D::AlreadyLanded
         | D::RecheckInterval
         | D::LabelledBlocked
         | D::Unknown => None,

@@ -1914,6 +1914,11 @@ impl SweepRegistry {
         //     W9: a resume never consults the memo (`dispatch_open_pr_memo`,
         //     see `guards/refusal_memo.rs`), and the probe below is a
         //     conditional read whose verdict comes from the body it serves.
+        // #11429: a `landed` outcome on this host's journal refuses first, at no
+        //     forge cost; a crash resume of the issue's own sweep is exempt.
+        if resume_bypass_pr.is_none() {
+            self.refuse_recent_landing(issue_number, Utc::now())?;
+        }
         if !self.config.skip_label_flip {
             if let Some(memo) = self.dispatch_open_pr_memo(issue_number, resume_bypass_pr) {
                 self.record_open_pr_guard_backoff(issue_number);
@@ -1924,14 +1929,8 @@ impl SweepRegistry {
                 .into());
             }
 
-            if self.guard_closed_or_pr(issue_number) == Some(true) {
-                return Err(anyhow!(
-                    "refusing to dispatch issue #{issue_number}: it is closed on the forge, or \
-                     the number resolves to a pull request rather than an open issue (#4088/#4504 \
-                     closed-issue guard). A watchdog re-dispatch must not re-claim a closed/merged \
-                     issue or a PR number."
-                ));
-            }
+            // #11429: a closed issue is refused as `already_landed`.
+            self.refuse_closed_issue(issue_number)?;
         }
 
         // 2.6 Open-PR guard (Issue #4123). Every in-memory dedup signal — the

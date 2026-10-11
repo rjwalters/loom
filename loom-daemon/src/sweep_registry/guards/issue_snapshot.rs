@@ -75,6 +75,8 @@ pub(crate) struct IssueView {
     /// `Some(true)` closed or a PR, `Some(false)` an open issue, `None` an
     /// unrecognised state.
     pub(crate) closed_or_pr: Option<bool>,
+    /// The number is a pull request, in any state.
+    pub(crate) is_pr: bool,
     /// Label names, as [`SweepRegistry::current_labels_via_rest`] gives them.
     pub(crate) labels: Vec<String>,
 }
@@ -103,8 +105,34 @@ pub(crate) fn parse_issue_view(body: &str) -> Option<IssueView> {
     };
     Some(IssueView {
         closed_or_pr,
+        is_pr,
         labels,
     })
+}
+
+/// What step 2.5 read about an issue number (Issue #11429 splits the PR case
+/// from the closed issue, so a closed issue can be refused as `already_landed`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IssueGate {
+    Open,
+    Closed,
+    PullRequest,
+}
+
+impl IssueGate {
+    /// The pre-#11429 2.5 verdict: anything but an open issue is terminal.
+    #[must_use]
+    pub(crate) fn closed_or_pr(self) -> bool {
+        self != Self::Open
+    }
+
+    fn from_view(view: &IssueView) -> Option<Self> {
+        if view.is_pr {
+            return Some(Self::PullRequest);
+        }
+        view.closed_or_pr
+            .map(|closed| if closed { Self::Closed } else { Self::Open })
+    }
 }
 
 /// Whether the conditional reads are on: the kill switch, and a daemon store
@@ -134,9 +162,51 @@ impl SweepRegistry {
     /// Step 2.5: is `issue` closed or a PR? The conditional read, else
     /// [`Self::issue_is_closed_or_pr`].
     pub(crate) fn guard_closed_or_pr(&self, issue: u32) -> Option<bool> {
+        self.guard_issue_gate(issue).map(IssueGate::closed_or_pr)
+    }
+
+    /// Step 2.5 as an [`IssueGate`]: the conditional read, else
+    /// [`Self::issue_gate_via_rest`].
+    pub(crate) fn guard_issue_gate(&self, issue: u32) -> Option<IssueGate> {
         match self.conditional_issue_view(issue, "guard.issue_view", STATE_PREFIX, false) {
-            Some(view) => view.closed_or_pr,
-            None => self.issue_is_closed_or_pr(issue),
+            Some(view) => IssueGate::from_view(&view),
+            None => self.issue_gate_via_rest(issue),
+        }
+    }
+
+    /// The unconditional 2.5 read (see [`Self::issue_is_closed_or_pr`] for why
+    /// it is REST). `None` when the repo cannot be resolved or the answer does
+    /// not parse into `{state, is_pr}`.
+    pub(crate) fn issue_gate_via_rest(&self, issue: u32) -> Option<IssueGate> {
+        let (owner, repo) = self.resolve_owner_repo()?;
+        let gh = self.resolved_gh();
+        let cmd = self
+            .gh_inv("guard.issue_state", AccessIntent::Read, &gh)
+            .arg("api")
+            .arg(format!("repos/{owner}/{repo}/issues/{issue}"))
+            .arg("--jq")
+            .arg("{state, is_pr: (.pull_request != null)}");
+        let output = self.run_counted(cmd).ok()??;
+        if !output.status.success() {
+            return None;
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).ok()?;
+        if parsed.get("is_pr")?.as_bool()? {
+            return Some(IssueGate::PullRequest);
+        }
+        match parsed
+            .get("state")?
+            .as_str()?
+            .trim()
+            .to_ascii_uppercase()
+            .as_str()
+        {
+            // REST reports a merged PR as `closed`; `MERGED` on an issue-shaped
+            // node must still never fall through to the fail-open arm (#4504).
+            "CLOSED" | "MERGED" => Some(IssueGate::Closed),
+            "OPEN" => Some(IssueGate::Open),
+            _ => None,
         }
     }
 

@@ -972,6 +972,8 @@ impl SweepRegistry {
             self.noop_loop_kind(issue, sweep_id)
                 .map(ParkKind::failure_class),
         );
+        let process_result = result;
+        let result = telemetry::result_for_disposition(result, disposition);
 
         let outcome_record = telemetry::SweepOutcomeRecord {
             repo,
@@ -1040,7 +1042,7 @@ impl SweepRegistry {
         // window, lose) the `sweep.outcome` record. See `writeback`'s module
         // doc for the full fail-open contract.
         let writeback_record =
-            (result == telemetry::SweepResult::Success).then(|| outcome_record.clone());
+            (process_result == telemetry::SweepResult::Success).then(|| outcome_record.clone());
         let result_name = serde_json::to_value(result)
             .ok()
             .and_then(|v| v.as_str().map(str::to_owned))

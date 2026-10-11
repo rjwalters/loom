@@ -285,6 +285,20 @@ pub fn apply_noop_loop_class(
     }
 }
 
+/// The `result` a `sweep.outcome` reports for `disposition` (Issue #11429).
+/// A sweep that landed its work, or found it already done, is a `success`
+/// even when its process exited non-zero. `cancelled` and `blocked` are kept:
+/// they name a deliberate stop, not the work.
+#[must_use]
+pub fn result_for_disposition(result: SweepResult, disposition: SweepDisposition) -> SweepResult {
+    match (result, disposition) {
+        (SweepResult::Failure, SweepDisposition::Landed | SweepDisposition::NoopAlreadyDone) => {
+            SweepResult::Success
+        }
+        _ => result,
+    }
+}
+
 /// Whether `class` names an *environmental* fault — the run broke, rather than
 /// the work being hard (Issue #9441).
 ///
@@ -887,6 +901,46 @@ mod tests {
             Some("noop-loop:blocked"),
         );
         assert_eq!(other.as_deref(), Some("unclassified:after-builder"));
+    }
+
+    /// Issue #11429: no `sweep.outcome` is `failure` with a `landed` or
+    /// `noop_already_done` disposition.
+    #[test]
+    fn landed_and_already_done_report_success() {
+        let reported = |signals: &DispositionSignals<'_>| {
+            let (disposition, _) = classify_disposition(signals);
+            (disposition, result_for_disposition(signals.result, disposition))
+        };
+        let judged = phases(&["builder", "judge"]);
+        let landed = DispositionSignals {
+            pr_number: Some(149),
+            phase_durations: &judged,
+            total_duration_sec: 900,
+            ..base(SweepResult::Failure)
+        };
+        assert_eq!(reported(&landed), (SweepDisposition::Landed, SweepResult::Success));
+        let already_done = DispositionSignals {
+            issue_end_state: Some(IssueEndState::ClosedBeforeDispatch),
+            ..base(SweepResult::Failure)
+        };
+        assert_eq!(
+            reported(&already_done),
+            (SweepDisposition::NoopAlreadyDone, SweepResult::Success)
+        );
+        let rejected = DispositionSignals {
+            phase_durations: &judged,
+            total_duration_sec: 900,
+            ..base(SweepResult::Failure)
+        };
+        assert_eq!(
+            reported(&rejected),
+            (SweepDisposition::SubstantiveFailure, SweepResult::Failure)
+        );
+        let cancelled = DispositionSignals {
+            pr_number: Some(149),
+            ..base(SweepResult::Cancelled)
+        };
+        assert_eq!(reported(&cancelled), (SweepDisposition::Landed, SweepResult::Cancelled));
     }
 
     /// The 2,810-record shape: stopped after the Curator, with no forge

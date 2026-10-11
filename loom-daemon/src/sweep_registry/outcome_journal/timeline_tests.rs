@@ -292,8 +292,10 @@ fn a_failing_timeline_fetch_omits_both_fields_and_still_writes_the_record() {
         raw.get("doctor_cycles").is_none(),
         "an unreadable timeline must omit doctor_cycles, never report 0: {raw}"
     );
-    // The rest of the record is untouched by the failed read.
-    assert_eq!(raw["result"], "failure");
+    // The rest of the record is untouched by the failed read. A PR makes it
+    // `landed`, which reports `success` (#11429).
+    assert_eq!(raw["disposition"], "landed");
+    assert_eq!(raw["result"], "success");
     assert_eq!(raw["pr_number"], 8301);
     assert_eq!(raw["total_duration_sec"], 420);
     assert_eq!(raw["failure_class"], "preflight-no-cli-start");

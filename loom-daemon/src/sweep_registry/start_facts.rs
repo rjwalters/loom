@@ -22,18 +22,23 @@ impl SweepRegistry {
         issue: u32,
         sweep_id: &str,
     ) -> Option<(u32, Option<String>, &'static str)> {
-        let slug = if self.config.skip_label_flip {
-            repo_slug_from_env()
-        } else {
-            self.resolve_owner_repo()
-                .map(|(owner, repo)| format!("{owner}/{repo}"))
-        }?;
+        let slug = self.journal_repo_slug()?;
         // `None` on an unreadable journal: unknown lineage is omitted, never
         // published as a known first attempt.
         let prior = sweep_outcomes::try_read_all_sweep_outcomes(
             &self.config.resolve_outcome_telemetry_path(),
         )?;
         lineage::derive_lineage(&prior, &slug, issue, sweep_id)
+    }
+
+    /// The `repo` this host's outcome journal records for this workspace.
+    pub(super) fn journal_repo_slug(&self) -> Option<String> {
+        if self.config.skip_label_flip {
+            repo_slug_from_env()
+        } else {
+            self.resolve_owner_repo()
+                .map(|(owner, repo)| format!("{owner}/{repo}"))
+        }
     }
 
     /// Emit `sweep.global.dispatch` for the entry just recorded under

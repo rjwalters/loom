@@ -124,6 +124,7 @@ fn parse_issue_view_reads_state_pr_ness_and_labels_like_the_unconditional_probes
         parse_issue_view(open),
         Some(IssueView {
             closed_or_pr: Some(false),
+            is_pr: false,
             labels: vec!["loom:issue".into(), "points:3".into()],
         })
     );

@@ -112,6 +112,52 @@ fn a_lost_lease_order_race_is_lease_order_lost_not_backoff() {
     assert_eq!(report.admissions[0].result, "refused");
 }
 
+fn already_landed(issue: u32) -> anyhow::Error {
+    crate::sweep_registry::AlreadyLandedDispatchError {
+        issue,
+        evidence: crate::sweep_registry::LandedEvidence::ForgeClosed,
+    }
+    .into()
+}
+
+/// Issue #11429: an already-landed refusal is its own skip, on the queue row,
+/// the decisions metric and the tick's `pick.decision`.
+#[test]
+fn an_already_landed_refusal_is_recorded_as_a_pick_decision_skip() {
+    use crate::telemetry::kinds::pick_decision::PickSkipReason;
+    let mut multi = vec![(
+        Source(items(&[3079, 1129])),
+        Refusing {
+            refuse: already_landed,
+            ok: HashSet::from([1129]),
+        },
+    )];
+    let report = tick_multi(&mut multi, &[], 4, &[false]);
+    assert_eq!(report.skipped_already_landed, 1);
+    let row = report.queue.iter().find(|r| r.key.number == 3079).unwrap();
+    assert_eq!(row.disposition, Some(Qd::AlreadyLanded));
+    assert_eq!(row.detail.as_deref(), Some("forge_closed"));
+    assert_eq!(reason(&report, "already_landed"), 1);
+    assert_eq!(reason(&report, "error"), 0);
+    assert_partition(&report, 2);
+    let landed = report.admissions.iter().find(|a| a.issue == 3079).unwrap();
+    assert_eq!((landed.result, landed.reason), ("refused", "already_landed"));
+
+    let now = Utc::now();
+    let summary = crate::work_finder::tick_summary(&report, 4, now, &[], None);
+    let record = crate::observability::pick_decision::work_finder_record(
+        &summary,
+        "host-test",
+        now,
+        now,
+        |_| "rjwalters/loom".to_string(),
+    );
+    let skip = record.skipped.iter().find(|s| s.number == 3079).unwrap();
+    assert_eq!(skip.reason, PickSkipReason::AlreadyLanded);
+    assert_eq!(skip.reason.as_str(), "already_landed");
+    assert!(record.acted.iter().any(|a| a.number == 1129));
+}
+
 #[test]
 fn a_token_selection_failure_is_token_selection_failed_not_error() {
     let mut multi = vec![(
