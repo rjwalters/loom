@@ -113,6 +113,15 @@ pub enum FleetStage {
     /// Approved, held for a human by an operator hold label.
     #[serde(rename = "merge_hold")]
     MergeHold,
+    /// Pre-ready: from the issue's creation (or latest reopen) until
+    /// `loom:curated`, or `loom:issue` for a one-step promotion (#11368).
+    /// Only ever an `eta.stage_outcome` stage; never a `fleet.state` row.
+    #[serde(rename = "triage_wait")]
+    TriageWait,
+    /// Pre-ready: from `loom:curated` until `loom:issue` (#11368). Only ever
+    /// an `eta.stage_outcome` stage; never a `fleet.state` row.
+    #[serde(rename = "approval_wait")]
+    ApprovalWait,
 }
 
 impl FleetStage {
@@ -127,6 +136,8 @@ impl FleetStage {
             FleetStage::Doctor => "doctor",
             FleetStage::MergeWait => "merge_wait",
             FleetStage::MergeHold => "merge_hold",
+            FleetStage::TriageWait => "triage_wait",
+            FleetStage::ApprovalWait => "approval_wait",
         }
     }
 }
@@ -244,17 +255,26 @@ pub struct FleetStateRow {
     /// on `fleet-state/v1`.
     #[serde(flatten)]
     pub start: SweepStartFacts,
+    /// A sweep row only: the id of this host's sweep that holds the item
+    /// (#11401), the `loom.fact_id` key of the row's `eta.stage_outcome` when
+    /// no forge instant dates the exit. Present exactly when `host` is.
+    /// Additive on `fleet-state/v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sweep_id: Option<String>,
     /// `ready_wait` only: this host's planner rank, the 1-based position in
     /// the work finder's dispatch order on its last tick.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rank: Option<u32>,
-    /// `ready_wait` only: starred (`loom:operator-priority`, any level).
+    /// Starred (`loom:operator-priority`, any level). On every row since
+    /// #11391: a PR row reads it from the PR's labels, any row keeps what an
+    /// earlier row of the item carried.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub star: bool,
     /// `ready_wait` only: when it was starred, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub star_at: Option<DateTime<Utc>>,
-    /// `ready_wait` only: the effective operator priority level (0 absent).
+    /// The effective operator priority level (0 absent). On every row, like
+    /// `star` (#11391).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub level: u8,
     /// `ready_wait` only: the repo's fleet priority (the workspace priority
@@ -286,6 +306,25 @@ pub struct FleetStateRow {
     /// leaves while held gets none: its removal is the end.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hold_released_at: Option<DateTime<Utc>>,
+    /// Judge rejections the item's PR has taken (#11391). Absent = none or
+    /// not read.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub rework: u32,
+    /// The PR carries `loom:merge-conflict` (#11391). Absent = `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub conflict: bool,
+    /// The PR carries `loom:ci-failure` (#11391). Absent = `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ci_fail: bool,
+    /// Every hold the PR's labels name now (#11391), beside `hold_kind`
+    /// (the one that wins): `operator_decision`, `operator_only`, `operator`,
+    /// `blocked`, `sequenced`, `other`. Absent = none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub holds: Vec<String>,
+}
+
+fn is_zero_u32(n: &u32) -> bool {
+    *n == 0
 }
 
 impl FleetStateRow {
@@ -301,6 +340,7 @@ impl FleetStateRow {
             host: None,
             slot: None,
             start: SweepStartFacts::default(),
+            sweep_id: None,
             rank: None,
             star: false,
             star_at: None,
@@ -312,6 +352,10 @@ impl FleetStateRow {
             held_since: None,
             held_since_lower_bound: false,
             hold_released_at: None,
+            rework: 0,
+            conflict: false,
+            ci_fail: false,
+            holds: Vec::new(),
         }
     }
 }

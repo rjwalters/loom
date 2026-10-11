@@ -950,13 +950,14 @@ fn fetch_markers(
 pub struct PlanReport {
     pub open_prs: usize,
     pub groups: Vec<SequenceGroup>,
-    /// Edges already satisfied by an identical marker — no write would occur.
+    /// Suppressed edges whose follower's trusted marker already states this
+    /// very order (same `LandingKey`). Disjoint from `skipped_held` (#9771).
     pub already_planned: usize,
     pub holders: usize,
-    /// Edges suppressed because the follower already carries an ordering
-    /// state (trusted marker or hold label) or a sticky operator release
-    /// (#10398) — reported so the dry-run's "what would the pass write"
-    /// matches the live pass edge for edge (Judge re-review of #9707).
+    /// Every other suppressed edge: the follower carries a different order
+    /// (marker or hold label) or a sticky operator release (#10398). With
+    /// `already_planned`, leaves `groups` holding exactly what the live pass
+    /// would write (Judge re-review of #9707).
     pub skipped_held: usize,
     /// Existing holds Phase 1 would release as no-overlap (#10077):
     /// `(follower, predecessor)`.
@@ -1000,6 +1001,14 @@ pub fn plan_report(gh_bin: &Path, root: &Path) -> Result<PlanReport> {
     let bin = gh_bin.to_string_lossy().to_string();
     for g in &mut report.groups {
         g.edges.retain(|e| {
+            // #10634: the order key, not the plan id — the live pass keeps a
+            // comment whose key matches, whatever plan id it carries.
+            if markers.get(&e.follower).is_some_and(|m| {
+                landing::LandingKey::of(m) == landing::LandingKey::of(&edge_marker(e))
+            }) {
+                report.already_planned += 1;
+                return false;
+            }
             if markers.contains_key(&e.follower) || holder_numbers.contains(&e.follower) {
                 report.skipped_held += 1;
                 return false;
@@ -1014,17 +1023,6 @@ pub fn plan_report(gh_bin: &Path, root: &Path) -> Result<PlanReport> {
             }
             true
         });
-    }
-    for g in &report.groups {
-        for e in &g.edges {
-            // #10634: the order key, not the plan id — the live pass keeps a
-            // comment whose key matches, whatever plan id it carries.
-            if markers.get(&e.follower).is_some_and(|m| {
-                landing::LandingKey::of(m) == landing::LandingKey::of(&edge_marker(e))
-            }) {
-                report.already_planned += 1;
-            }
-        }
     }
     Ok(report)
 }

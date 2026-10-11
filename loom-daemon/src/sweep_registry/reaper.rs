@@ -969,9 +969,10 @@ impl SweepRegistry {
         // has aged past the configured window before this tick's work. Cheap
         // early-return when nothing is quarantined.
         self.expire_quarantine();
-        // Retry any previously-failed quarantine label restores (Issue #4110).
-        // Cheap early-return when nothing is pending.
-        self.retry_pending_quarantine_releases();
+        // Retry any previously-failed quarantine label restores (Issue #4110)
+        // and release no-op holds whose inputs changed (Issue #10156). Cheap
+        // early-return when nothing is pending or held.
+        self.release_pending_holds();
         // SIGKILL-escalate any orphaned process group that survived a
         // crash-path SIGTERM (Issue #4980). Cheap early-return when nothing is
         // pending; never blocks (the grace is deadline-based, not slept).
@@ -1019,6 +1020,11 @@ impl SweepRegistry {
             // yielding the real exit code. Reconstructed entries with no
             // handle fall back to the `kill(pid, 0)` probe.
             let (is_dead, exit_code) = self.poll_liveness(&sweep_id, pid);
+            // #11286: a live native sweep's seat is marked the moment its log
+            // says the allowance is gone, not only once the run exits.
+            if !is_dead {
+                self.watch_in_run_exhaustion(&sweep_id);
+            }
             if is_dead {
                 // Issue #4980 crash-path reap: the tracked leader is gone, but
                 // its process group may still hold a live `claude` agent and

@@ -128,17 +128,15 @@ cat '{d}'/"$k.body"
         self.serve(&runs_url(sha), &json!({"total_count": rows.len(), "check_runs": rows}));
     }
 
-    /// The required-context lookup's two `--jq` reads (rulesets, classic).
+    /// The required-context lookup's two reads: the conditional rulesets
+    /// read (#11418) and the classic GraphQL `--jq` read.
     fn required(&self, contexts: &[&str]) {
-        let out = contexts
-            .iter()
-            .map(|c| format!("{c}\n"))
-            .collect::<String>();
-        let rules = self
-            .dir
-            .path()
-            .join(format!("{}.out", key("repos/o/r/rules/branches/main")));
-        std::fs::write(rules, out).unwrap();
+        let checks: Vec<Value> = contexts.iter().map(|c| json!({"context": c})).collect();
+        self.serve(
+            "repos/o/r/rules/branches/main",
+            &json!([{"type": "required_status_checks",
+                     "parameters": {"required_status_checks": checks}}]),
+        );
         std::fs::write(self.dir.path().join("graphql.out"), "").unwrap();
     }
 
@@ -348,7 +346,11 @@ fn zero_rows_with_a_required_context_times_out_never_none() {
             pending: vec!["Backend".into()]
         }
     );
-    let lookups = f.calls().iter().filter(|c| c.starts_with("OUT")).count();
+    let lookups = f
+        .calls()
+        .iter()
+        .filter(|c| c.ends_with("rules/branches/main") || c.ends_with(" graphql"))
+        .count();
     assert_eq!(lookups, 2, "the required lookup runs once per wait (two sources)");
 }
 
@@ -563,14 +565,19 @@ fn a_second_snapshot_process_revalidates_and_records_under_its_caller() {
     let f = Forge::new();
     f.runs(SHA, &[run("build", "completed", Some("success"))]);
     let before = counts();
-    for _ in 0..2 {
+    let mut first_run = 0;
+    for i in 0..2 {
         let o = go(&f, Selector::Pr(42), &opts(0), &mut FakeClock::new());
         assert_eq!(o, Outcome::Green { sha: SHA.into() });
+        if i == 0 {
+            first_run = f.calls().len();
+        }
     }
+    // The GraphQL leg of the required lookup has no ETag (`OUT`).
     let second: Vec<String> = f
         .calls()
         .into_iter()
-        .skip(3)
+        .skip(first_run)
         .filter(|c| !c.starts_with("OUT"))
         .collect();
     assert!(second.iter().all(|c| c.starts_with("304 inm")), "{second:#?}");
@@ -585,7 +592,7 @@ impl Forge {
     /// (not plan-gated), as a GraphQL-exhausted classic leg would.
     fn required_fails(&self) {
         let rules = key("repos/o/r/rules/branches/main");
-        let _ = std::fs::remove_file(self.dir.path().join(format!("{rules}.out")));
+        let _ = std::fs::remove_file(self.dir.path().join(format!("{rules}.body")));
     }
 
     fn lookups(&self) -> usize {

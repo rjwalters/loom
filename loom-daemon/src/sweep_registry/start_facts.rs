@@ -22,18 +22,23 @@ impl SweepRegistry {
         issue: u32,
         sweep_id: &str,
     ) -> Option<(u32, Option<String>, &'static str)> {
-        let slug = if self.config.skip_label_flip {
-            repo_slug_from_env()
-        } else {
-            self.resolve_owner_repo()
-                .map(|(owner, repo)| format!("{owner}/{repo}"))
-        }?;
+        let slug = self.journal_repo_slug()?;
         // `None` on an unreadable journal: unknown lineage is omitted, never
         // published as a known first attempt.
         let prior = sweep_outcomes::try_read_all_sweep_outcomes(
             &self.config.resolve_outcome_telemetry_path(),
         )?;
         lineage::derive_lineage(&prior, &slug, issue, sweep_id)
+    }
+
+    /// The `repo` this host's outcome journal records for this workspace.
+    pub(super) fn journal_repo_slug(&self) -> Option<String> {
+        if self.config.skip_label_flip {
+            repo_slug_from_env()
+        } else {
+            self.resolve_owner_repo()
+                .map(|(owner, repo)| format!("{owner}/{repo}"))
+        }
     }
 
     /// Emit `sweep.global.dispatch` for the entry just recorded under
@@ -50,13 +55,24 @@ impl SweepRegistry {
             return;
         };
         let (kind, model, effort) = (info.kind.clone(), info.model.clone(), info.effort.clone());
+        let launch_runtime = info.runtime.clone();
         let runtime = admission.admitted.as_ref().map(|a| a.runtime.clone());
         let start = match (&kind, model_source) {
             (SweepKind::Issue(issue), Some(source)) => {
                 let lineage = self.attempt_lineage(*issue, sweep_id);
+                // #11370: report the resolved facts, not the literal launch
+                // arguments (those stay on `SweepInfo` and the child's argv).
+                let model = model.as_deref().and_then(normalize_model_id);
+                let source = if model.is_some() {
+                    source
+                } else {
+                    crate::telemetry::model_source::UNKNOWN
+                };
+                let resolved = resolve_effort_from_env(effort.as_deref(), Some(&launch_runtime));
                 let facts = SweepStartFacts {
                     model,
-                    effort,
+                    effort: resolved.as_ref().map(|r| r.0.clone()),
+                    effort_source: resolved.map(|r| r.1.to_string()),
                     model_source: Some(source.to_string()),
                     runtime: runtime.clone(),
                     attempt_index: lineage.as_ref().map(|l| l.0),

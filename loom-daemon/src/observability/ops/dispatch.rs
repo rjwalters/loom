@@ -29,7 +29,7 @@ use crate::work_finder::{Admission, TickReport};
 /// `claim_collision`, `claim_lock_held`), so their parents are reported net of
 /// them: every candidate lands in exactly one reason.
 #[must_use]
-pub fn decision_counts(report: &TickReport) -> [(&'static str, usize); 25] {
+pub fn decision_counts(report: &TickReport) -> [(&'static str, usize); 27] {
     let classified_errors =
         report.refused_token_selection + report.refused_claim_collision + report.refused_claim_lock;
     [
@@ -50,6 +50,8 @@ pub fn decision_counts(report: &TickReport) -> [(&'static str, usize); 25] {
         ("noop_cooldown", report.skipped_noop_cooldown),
         ("declined", report.skipped_declined),
         ("prless_retry", report.skipped_prless_retry),
+        ("already_landed", report.skipped_already_landed),
+        ("already_closed", report.skipped_already_closed),
         ("recheck_interval", report.skipped_recheck_interval),
         ("host_constraint", report.skipped_host_constraint),
         ("capacity", report.deferred_capacity),

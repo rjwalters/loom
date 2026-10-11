@@ -16,6 +16,17 @@ pub mod model_source {
     /// The daemon chose it (config, experiment arm or runtime default), or
     /// the runtime picks its own (no `model`).
     pub const DEFAULT: &str = "default";
+    /// No model id could be named (empty, or the runtime picks its own); the
+    /// `model` fact is then absent (#11370).
+    pub const UNKNOWN: &str = "unknown";
+}
+
+/// `effort_source` values (#11370).
+pub mod effort_source {
+    /// The dispatch request named the effort.
+    pub const EXPLICIT: &str = "explicit";
+    /// A config, environment or runtime default applies.
+    pub const DEFAULT: &str = "default";
 }
 
 /// The OTLP log attributes `sweep.started` exports for these facts. The
@@ -24,6 +35,7 @@ pub mod model_source {
 pub const SWEEP_START_FACT_LOG_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.model",
     "loom.effort",
+    "loom.effort_source",
     "loom.model_source",
     "loom.runtime",
     "loom.attempt_index",
@@ -42,7 +54,12 @@ pub struct SweepStartFacts {
     /// The reasoning-effort level, when one was set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
-    /// [`model_source::EXPLICIT`] or [`model_source::DEFAULT`].
+    /// [`effort_source::EXPLICIT`] or [`effort_source::DEFAULT`]; absent with
+    /// `effort` (#11370).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_source: Option<String>,
+    /// [`model_source::EXPLICIT`], [`model_source::DEFAULT`] or
+    /// [`model_source::UNKNOWN`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_source: Option<String>,
     /// The admitted runtime adapter (`claude`, `codex`, ...). Never defaulted.

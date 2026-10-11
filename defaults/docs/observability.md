@@ -16,6 +16,7 @@
 - [2. What gets sent: the wire schema](#2-what-gets-sent-the-wire-schema)
 - [3. Exporters: HTTPS (default) or OTLP (opt-in)](#3-exporters-https-default-or-otlp-opt-in)
 - [3b. Confirming telemetry is actually flowing](#3b-confirming-telemetry-is-actually-flowing)
+- [3b-2. Every daemon must export OTLP: `otlp_export` (Issue #11353)](#3b-2-every-daemon-must-export-otlp-otlp_export-issue-11353)
 - [3c. Operational signals from daemon loops (Issue #8860)](#3c-operational-signals-from-daemon-loops-issue-8860)
 - [3d. Agent telemetry relay (Issue #10964)](#3d-agent-telemetry-relay-issue-10964)
 - [4. The backend: deploy your own Cloudflare Worker](#4-the-backend-deploy-your-own-cloudflare-worker)
@@ -482,6 +483,40 @@ new config knob, an HTTP scrape in the sender loop, and a new state wired
 through every surface. Tracked separately — until it exists, the end-to-end
 check is external and the daemon says so instead of implying otherwise.
 
+## 3b-2. Every daemon must export OTLP: `otlp_export` (Issue #11353)
+
+A daemon that does not export to SigNoz looks healthy everywhere else, so the
+condition is a first-class health check with four states, shown on the
+`OTLP export:` line of `loom-daemon status`, as `otlp_export` in
+`status --json`, and as `otlp_export` on the `host.health` record:
+
+| State | Meaning |
+|---|---|
+| `no_exporter` | The resolved `observability.exporters` has no usable `otlp` entry (or observability is off), or the binary was built without the `otlp` feature (#10700). |
+| `failing` | An `otlp` exporter is configured, but no batch was acked within the window, or the OTLP queue's `dropped_total` grew within the window. |
+| `ok` | The last successful export is recent (a fresh exporter gets the window as startup grace). |
+| `exempt` | The host opted out; the reason is shown. |
+
+Precedence is `exempt`, `no_exporter`, `failing`, `ok`. A line is logged at
+daemon start and on each change of state, never per tick: WARN for `no_exporter`
+and `failing`, INFO for recovery to `ok` and entry into `exempt`.
+
+```json
+{ "observability": {
+    "otlp_required": false,
+    "otlp_exempt_reason": "robb-studio: no SigNoz route, see 2am#3649",
+    "otlp_failure_window_minutes": 15
+} }
+```
+
+`otlp_required: false` takes effect only with a non-empty `otlp_exempt_reason`;
+without one the daemon warns and treats the host as not exempt. The window
+defaults to 15 minutes. The `host.health` field is carried in the record body
+on the native HTTPS path. Over OTLP, where `host.health` becomes gauges, the
+state is the `loom.host.otlp_export` gauge (value 1) with a `state` label and,
+when exempt, a `reason` label; both labels are already on the collector's
+datapoint allowlist.
+
 ## 3c. Operational signals from daemon loops (Issue #8860)
 
 `observability::ops` is the shared path every daemon loop uses to put a
@@ -611,6 +646,7 @@ vocabulary (`loom.queue.disposition`'s wire values):
 | "build back-off" / "WIP limit" (PR debt high) | `deferred_build_backoff` (decisions reason `build_backoff`, tick result `build_backoff_held`, #9410) |
 | "dependency blocked" | Loom has no issue-dependency gate. Nearest: `parked` (a `PARK_LABELS`/`SKIP_LABELS` entry, e.g. `loom:blocked`, alongside `loom:issue`) or `labelled_blocked` (`loom:blocked` without `loom:issue` — forge-side only, from `queue.snapshot`, never a tick outcome so it never appears on a `loom.dispatch.disposition` span) |
 | "lower tier" (ranked behind others) | `deferred_capacity` (machine concurrency cap full), `deferred_ramp_cap` (per-tick admission cap), `deferred_repo_cap` (per-repo cap), or `deferred_out_of_slice` (repo sharding) — `tier:*` labels do not affect dispatch order, only `loom.queue.rank` does |
+| "waiting on overlapping work" (same files) | `deferred_file_overlap` (#9781): its `## Affected Files` share a path with same-repo work admitted earlier this tick or already in flight; the row's `detail` (and the `pick.decision` skip's `detail`) names the shared paths. A one-tick scheduling deferral, never a label or hold — see `daemon-reference.md` §"Same-repo file-overlap deferral" |
 | "repo locked by an open PR" | `open_pr` (the #4123 guard's `pr-open-skip`). Since #9674 the repo's `open_pr` rows carry the repo-level `lockout.frozen_candidates_count` / `lockout.frozen_points_sum` / `lockout.duration_seconds` attributes, so rank which repo's lockout is starving the most ready work by grouping those spans on `loom.repo` |
 
 A `workspace_halted` row names its cause on `loom.queue.halt_cause` (#9673):
@@ -687,11 +723,16 @@ without an exporter, `loom-daemon forge calls --by bucket` shows the same
 picture from the local forge-call sink. Each `invoke github` span carries the
 same facts per call (#10343): `github.http.{status,not_modified,requests,source}`
 (`unknown` when `gh` gave no HTTP evidence — never guessed),
-`github.billing` (`ok`|`not_modified`|`rate_limited`|`error`|`not_sent`) and
+`github.billing` (`ok`|`not_modified`|`rate_limited`|`secondary_limited`|`error`|`not_sent`) and
 the bucket join keys `github.{resource,account,cred_owner,role}`. Since
 #10752 a span also carries `github.repo`, a write carries `github.number`, and
 a call made by a daemon pass inside its caller scope carries `github.caller`
-(the `loom:blocked` release pass: `stale_blocked_release`). That pass also
+(the `loom:blocked` release pass: `stale_blocked_release`). Since #11407
+every span also names the endpoint: `github.route` (a template such as
+`/repos/{owner}/{repo}/pulls/{n}`, from the same finite table as gh-shim's
+`github.api.route`), `http.request.method`, and `github.command` (`pr view`
+for an agent front read), so `api.rest` and `agent_gh_front` spend can be
+ranked by route. That pass also
 emits a `pass.summary` log per pass and a `pass.verdict` per artifact; see
 [`telemetry-schema.md`](telemetry-schema.md) and
 `defaults/observability/signoz/pass-queries.sql`.

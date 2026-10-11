@@ -97,3 +97,11 @@ docs/eta.md
 commands/loom/mail-send.md
 docs/inbox-mail.md
 scripts/tests/test-inbox-mail.sh
+
+# #11112 (slice 2) — the Concierge role (safehouse room intent -> daemon
+# verbs) removed with the Matrix integration; operators steer through labels
+# and issues. Its generated .agents/skills/loom-concierge/ mirror has no
+# retired-list arm (resync_agent_skills is marker-gated, #8673).
+roles/concierge.md
+roles/concierge.json
+commands/loom/concierge.md

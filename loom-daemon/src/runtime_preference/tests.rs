@@ -8,6 +8,7 @@
 use super::availability::{availability, Availability, CredentialSource};
 use super::ceiling;
 use super::resolve::{resolve, SkipReason, Tap};
+use super::unprovisioned_tests::backstop_fixture;
 use super::{
     check_runtimes_preference_config, preference_for, resolve_runtime, Decision, PreferenceSource,
     StaticReason,
@@ -53,8 +54,21 @@ pub(super) struct ClearedRuntimeEnv {
     _profile_root_lock: crate::tokens_pool::profile_root_env::ProfileRootLock,
 }
 
-const ISOLATED_VARS: [&str; 10] = [
+const ISOLATED_VARS: [&str; 17] = [
     "LOOM_RUNTIME",
+    "LOOM_RUNTIME_DOCTOR",
+    // #11400: either one changes whether an unpooled native tap has a
+    // credential (an auth snapshot, or a host-wide zai pool).
+    "LOOM_NATIVE_AUTH_FILE",
+    crate::api_keys_pool::paths::SHARED_API_KEYS_DIR_ENV,
+    // #11400: picks the profile whose `excludedRoles` admission checks.
+    "LOOM_MODEL_PROFILE",
+    // #10767: an exported key makes a pooled native tap ungated, so the
+    // api-key pool would stop being the wall these tests exercise.
+    "ZAI_API_KEY",
+    "ZHIPU_API_KEY",
+    // quick-flash's credential, which tests export to stand in for one.
+    "GEMINI_API_KEY",
     "LOOM_RUNTIME_BUILDER",
     "LOOM_RUNTIME_JUDGE",
     "LOOM_RUNTIME_CURATOR",
@@ -418,7 +432,7 @@ pub(super) fn fixture() -> tempfile::TempDir {
     dir
 }
 
-fn write_config(root: &Path, config: &serde_json::Value) {
+pub(super) fn write_config(root: &Path, config: &serde_json::Value) {
     fs::create_dir_all(root.join(".loom")).unwrap();
     fs::write(root.join(".loom/config.json"), config.to_string()).unwrap();
 }
@@ -426,7 +440,7 @@ fn write_config(root: &Path, config: &serde_json::Value) {
 /// Re-provision the Claude token pool with exactly `count` accounts. Zero is
 /// the "no pool at all" state the preflight reports as `NoTokenPool`; the
 /// directory is rebuilt each call so a later call genuinely *empties* it.
-fn provision_claude_pool(root: &Path, count: usize) {
+pub(super) fn provision_claude_pool(root: &Path, count: usize) {
     let dir = root.join(".loom/tokens");
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
@@ -538,7 +552,7 @@ fn a_healthy_claude_pool_keeps_the_work_on_claude() {
 #[serial_test::serial]
 fn an_exhausted_claude_pool_falls_through_instead_of_holding() {
     let _env = ClearedRuntimeEnv::new();
-    let dir = fixture();
+    let dir = backstop_fixture();
     write_config(
         dir.path(),
         &serde_json::json!({"runtimes": {"preference": ["claude", "opencode"]}}),
@@ -889,25 +903,6 @@ fn claude_availability_agrees_with_the_preflight_gate() {
     );
 }
 
-/// A native tap whose provider is not pooled on this host is reported
-/// available, never passed over: `worker_spawn::credential`'s ladder falls
-/// through to the harness's own auth store there, so there is no wall to gate
-/// on. This is the mirror of `runtime_preflight`'s "never skip a launch that
-/// could have succeeded" — a false "unavailable" on a subscription tier
-/// silently routes paid-for work onto a metered endpoint.
-#[test]
-#[serial_test::serial]
-fn an_unpooled_native_provider_is_never_passed_over() {
-    let _env = ClearedRuntimeEnv::new();
-    let dir = fixture();
-    let admitted = resolve_and_admit(dir.path(), "builder", Some("opencode")).unwrap();
-    // No `zai` API-key accounts are registered in this workspace.
-    let state = availability(dir.path(), &Tap::runtime("opencode"), &admitted, 0);
-    assert!(state.is_spawnable(), "{state:?}");
-    assert_eq!(state.source(), &CredentialSource::Unobservable);
-    assert!(state.skip_reason().is_none());
-}
-
 /// …and once the provider IS pooled, the pool becomes the wall: an all-
 /// disabled pool is exhausted, and registering a usable account clears it.
 /// Same provider, same profile — only the pool's contents differ.
@@ -1007,14 +1002,15 @@ fn dispatch_resolve(root: &Path, role: &str, complexity: Option<&str>) -> Decisi
     let context = super::DispatchContext {
         complexity,
         intent: ceiling::Intent::Dispatch,
+        role_tick: false,
     };
     super::resolve_runtime_for(root, role, None, 0, context).unwrap()
 }
 
 /// A fixture whose Claude pool is unprovisioned (so the walk falls through to
-/// the backstop tap) with a ceiling of `max` concurrent backstop dispatches.
+/// the backstop tap, which has a selectable `zai` seat) with a ceiling of `max` concurrent backstop dispatches.
 fn ceiling_fixture(max: u32) -> tempfile::TempDir {
-    let dir = fixture();
+    let dir = backstop_fixture();
     write_config(
         dir.path(),
         &serde_json::json!({
@@ -1146,7 +1142,7 @@ fn a_recovered_higher_tap_is_still_preferred_while_the_backstop_is_at_its_ceilin
 fn the_eligibility_filter_keeps_low_value_work_off_the_metered_tap() {
     let _env = ClearedRuntimeEnv::new();
     let _leases = ScopedLeaseDir::new();
-    let dir = fixture();
+    let dir = backstop_fixture();
     write_config(
         dir.path(),
         &serde_json::json!({
@@ -1185,7 +1181,7 @@ fn the_eligibility_filter_keeps_low_value_work_off_the_metered_tap() {
 fn an_unconfigured_ceiling_touches_no_state_and_bounds_nothing() {
     let _env = ClearedRuntimeEnv::new();
     let _leases = ScopedLeaseDir::new();
-    let dir = fixture();
+    let dir = backstop_fixture();
     write_config(
         dir.path(),
         &serde_json::json!({"runtimes": {"preference": ["claude", "opencode"]}}),

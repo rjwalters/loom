@@ -43,6 +43,10 @@ pub enum QueueDisposition {
     /// concurrency budget's slots (#9090). The machine-level cap was NOT full;
     /// the slot went to another repo's candidate in the same tick.
     DeferredRepoCap,
+    /// Waiting: its `## Affected Files` overlap a same-repo candidate admitted
+    /// earlier this tick (or an in-flight one); the row's `detail` names the
+    /// shared paths (#9781). A scheduling signal only.
+    DeferredFileOverlap,
     /// Blocked: the work finder is holding dispatch for its whole repo. The
     /// hold has several possible causes (verified-red `main`, a main-health
     /// gate still running, a pre-flight advisory hold, an unusable token pool,
@@ -79,6 +83,11 @@ pub enum QueueDisposition {
     OpenPr,
     /// The dispatch attempt failed.
     DispatchError,
+    /// Skipped: its work already landed. The issue is closed, or this host
+    /// recorded a `landed` sweep for it moments ago (Issue #11429).
+    AlreadyLanded,
+    /// Skipped: the issue is closed as not planned (Issue #11429).
+    AlreadyClosed,
     /// Blocked on the forge: the issue carries `loom:blocked` without
     /// `loom:issue`, so the work finder never lists it (Issue #8957). Only in
     /// `queue.snapshot`, added by the collector from its own cached forge
@@ -94,7 +103,7 @@ impl QueueDisposition {
     /// ([`Self::LabelledBlocked`] and [`Self::Unknown`] excluded). The queue-depth metrics (Issue #8852, phase 2) emit one
     /// point per entry every tick, zeros included, so an empty queue reads as
     /// `0` rather than as a missing series.
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 26] = [
         Self::Dispatched,
         Self::InFlight,
         Self::DeferredCapacity,
@@ -103,6 +112,7 @@ impl QueueDisposition {
         Self::DeferredBuildBackoff,
         Self::DeferredOutOfSlice,
         Self::DeferredRepoCap,
+        Self::DeferredFileOverlap,
         Self::WorkspaceHalted,
         Self::WorkspaceCommandsMissing,
         Self::HostConstraint,
@@ -118,6 +128,8 @@ impl QueueDisposition {
         Self::PeerClaim,
         Self::OpenPr,
         Self::DispatchError,
+        Self::AlreadyLanded,
+        Self::AlreadyClosed,
     ];
 
     /// The snake_case wire name (identical to the serde form; pinned by a
@@ -133,6 +145,7 @@ impl QueueDisposition {
             Self::DeferredBuildBackoff => "deferred_build_backoff",
             Self::DeferredOutOfSlice => "deferred_out_of_slice",
             Self::DeferredRepoCap => "deferred_repo_cap",
+            Self::DeferredFileOverlap => "deferred_file_overlap",
             Self::WorkspaceHalted => "workspace_halted",
             Self::WorkspaceCommandsMissing => "workspace_commands_missing",
             Self::HostConstraint => "host_constraint",
@@ -148,6 +161,8 @@ impl QueueDisposition {
             Self::PeerClaim => "peer_claim",
             Self::OpenPr => "open_pr",
             Self::DispatchError => "dispatch_error",
+            Self::AlreadyLanded => "already_landed",
+            Self::AlreadyClosed => "already_closed",
             Self::LabelledBlocked => "labelled_blocked",
             Self::Unknown => "unknown",
         }
@@ -165,7 +180,8 @@ impl QueueDisposition {
             | Self::DeferredSaturation
             | Self::DeferredBuildBackoff
             | Self::DeferredOutOfSlice
-            | Self::DeferredRepoCap => "ready",
+            | Self::DeferredRepoCap
+            | Self::DeferredFileOverlap => "ready",
             _ => "blocked",
         }
     }
@@ -182,6 +198,7 @@ impl QueueDisposition {
             Self::DeferredBuildBackoff => "waiting: build back-off (review/merge debt high)",
             Self::DeferredOutOfSlice => "waiting: outside this host's repo slice",
             Self::DeferredRepoCap => "waiting: this repo is at its per-repo cap",
+            Self::DeferredFileOverlap => "waiting: affected files overlap in-flight work",
             Self::WorkspaceHalted => {
                 "blocked: repo dispatch held (red main, gate, token pool, drain or breaker)"
             }
@@ -199,6 +216,8 @@ impl QueueDisposition {
             Self::PeerClaim => "held by a peer host",
             Self::OpenPr => "blocked: open linked PR",
             Self::DispatchError => "dispatch failed",
+            Self::AlreadyLanded => "skipped: work already landed",
+            Self::AlreadyClosed => "skipped: issue closed as not planned",
             Self::LabelledBlocked => "blocked: labelled loom:blocked",
             Self::Unknown => "unknown",
         }
@@ -333,7 +352,7 @@ mod tests {
     #[test]
     fn build_backoff_disposition_round_trips_and_old_summaries_parse() {
         let d = QueueDisposition::DeferredBuildBackoff;
-        assert_eq!(QueueDisposition::ALL.len(), 23);
+        assert_eq!(QueueDisposition::ALL.len(), 26);
         assert!(QueueDisposition::ALL.contains(&d));
         let json = serde_json::to_value(d).unwrap();
         assert_eq!(json, serde_json::json!("deferred_build_backoff"));

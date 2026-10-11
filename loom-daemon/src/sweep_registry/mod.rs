@@ -118,12 +118,15 @@ mod decline_cooldown;
 mod dispatch;
 mod guards;
 mod heartbeat_broadcast;
+mod journal_shadow;
+mod landed_guard;
 mod lease_episode;
 mod locks;
 mod model;
 mod noop_cooldown;
 mod outcome_journal;
 mod overflow;
+mod resolved_facts;
 // `pub`: the daemon-hold record contract (`is_daemon_hold`, #10161) is read
 // by the stale-blocked readers (#10556, #10558).
 pub mod park_hold;
@@ -165,6 +168,8 @@ pub use dispatch::*;
 #[allow(unused_imports)]
 pub use guards::*;
 #[allow(unused_imports)]
+pub use landed_guard::*;
+#[allow(unused_imports)]
 pub use locks::*;
 #[allow(unused_imports)]
 pub use model::*;
@@ -180,6 +185,8 @@ pub use quarantine::*;
 pub use quarantine_escalation::*;
 #[allow(unused_imports)]
 pub use reaper::*;
+#[allow(unused_imports)]
+pub use resolved_facts::*;
 #[allow(unused_imports)]
 pub use stacking::*;
 #[allow(unused_imports)]
@@ -656,7 +663,7 @@ pub struct SweepRegistry {
     /// outcome classification, so it never overlaps or interferes with
     /// [`quarantined`](Self::quarantined) or
     /// [`dispatch_backoff`](Self::dispatch_backoff) above.
-    noop_cooldown: HashMap<u32, NoopCooldownState>,
+    noop_cooldown: NoopCooldownTable,
     /// Hard-exclusion decline cooldown parameters (Issue #7528). Set at
     /// provision time from the resolved env > config > default value,
     /// mirroring [`noop_cooldown_config`](Self::noop_cooldown_config).
@@ -1143,7 +1150,7 @@ impl SweepRegistry {
             dispatch_backoff_config: DispatchBackoffConfig::default(),
             dispatch_backoff: HashMap::new(),
             noop_cooldown_config: NoopCooldownConfig::default(),
-            noop_cooldown: HashMap::new(),
+            noop_cooldown: NoopCooldownTable::default(),
             decline_cooldown_config: DeclineCooldownConfig::default(),
             decline_cooldown: HashMap::new(),
             prless_retry_config: PrlessRetryConfig::default(),

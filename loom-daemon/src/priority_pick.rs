@@ -33,10 +33,11 @@ pub const IMPORTANT_LABEL: &str = "loom:important";
 pub const VERY_IMPORTANT_LABEL: &str = "loom:very-important";
 
 /// An issue's priority level. Declaration order is ascending importance.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Level {
     /// No priority label.
+    #[default]
     Default,
     /// `loom:important`.
     Important,

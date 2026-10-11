@@ -25,7 +25,7 @@
 
 If Mode C was selected, the wave lifecycle is the **back half** of the issue-side lifecycle: **no Curator, no Approval gate, no Builder**. Each PR is routed by its current label to Judge, Doctor→Judge, or Merge directly.
 
-> **Stage skip is explicit and load-bearing for Mode C.** The issue-side "MANDATORY: do not skip any stage" rule applies to the **issue** lifecycle. For an existing open PR, the Curator and Builder stages already ran (the PR exists, so the issue was implemented). Re-running them would be incorrect and wasteful. Mode C's wave lifecycle is the symmetric counterpart that handles the post-Builder phases without touching the front half.
+> **Stage skip is explicit and load-bearing for Mode C.** The issue-side "MANDATORY: do not skip any stage" rule applies to the **issue** lifecycle. For an existing open PR, the Curator and Builder stages already ran (the PR exists, so the issue was implemented). Re-running them would be incorrect and wasteful; Mode C handles only the post-Builder phases.
 
 For each PR `P` in the candidate list, processed sequentially one PR per wave (size-1 waves):
 
@@ -55,17 +55,17 @@ Apply the following skip rules (each "skip" logs the reason; the PR does NOT con
 **`loom:reviewing`/`loom:treating` are claim *overlays*, not one of the three state labels the "two or more" conflict-skip row above counts (Issue #6167).** A PR carrying `loom:review-requested` **and** `loom:reviewing` together (a Judge has claimed it and is mid-review — or died mid-review) still has exactly **one** of `{loom:review-requested, loom:changes-requested, loom:pr}`, so it does not hit the conflict-skip row and routes normally to **C1a**. A *stale* `loom:reviewing` next to an actionable state label is therefore **recoverable, not a human-attention case**:
 
 - judge.md's own "Stale `loom:reviewing` Claim Check" (Step 2, before claiming in C1a) reclaims it inline the moment a Judge is actually dispatched for that PR.
-- The sweep-start orphan-recovery pass (`recover-orphaned-shepherds.sh --recover` under the `all` sentinel — see "Build-everything sentinel" below) now also reclaims stale `loom:reviewing`/`loom:treating` claims proactively, across the whole PR set, before any PR-specific Judge/Doctor is even dispatched — so a dead Judge's claim on a PR nobody re-visits cannot sit unrecovered (kicad-tools #4791/#4792, ~36h stale). Doctor's `loom:treating` claim label is the identical overlay for `loom:changes-requested`/C1b and is handled the same way.
+- The sweep-start orphan-recovery pass (`recover-orphaned-shepherds.sh --recover` under the `all` sentinel — see "Build-everything sentinel" below) now also reclaims stale `loom:reviewing`/`loom:treating` claims proactively, across the whole PR set, before any Judge/Doctor is dispatched — so a dead Judge's claim on a PR nobody re-visits cannot sit unrecovered (kicad-tools #4791/#4792, ~36h stale). Doctor's `loom:treating` is the identical overlay for `loom:changes-requested`/C1b, handled the same way.
 
-Determine the **closing issue number** (used for checkpoint scope below) from `closingIssuesReferences`. This is the GitHub-native `Closes/Fixes/Resolves #N` parser (matches the convention used by the issue-side pre-flight via `closedByPullRequestsReferences`). Record up to one closing issue number per PR:
+Determine the **closing issue number** (used for checkpoint scope below) from `closingIssuesReferences`. This is the GitHub-native `Closes/Fixes/Resolves #N` parser (matching the issue-side pre-flight's `closedByPullRequestsReferences`). Record up to one closing issue number per PR:
 
-- **0 closing issues** → no checkpoint scope for this PR. Log a warning at PR start (`PR #P lacks a Closes #N reference; skipping per-issue checkpoint for this PR`) and proceed without checkpointing. Mid-phase resume after a kill will not be available for this PR — Judge / Doctor / Merge will simply re-run from scratch on the next sweep, which is acceptable since the operations are idempotent at the GitHub-state level (Judge re-runs if `loom:review-requested` is still set; Merge re-runs only if the PR is still open and labeled `loom:pr`).
+- **0 closing issues** → no checkpoint scope for this PR. Log a warning at PR start (`PR #P lacks a Closes #N reference; skipping per-issue checkpoint for this PR`) and proceed without checkpointing. Mid-phase resume after a kill is then unavailable — Judge / Doctor / Merge re-run from scratch on the next sweep, acceptable since they are idempotent at the GitHub-state level (Judge re-runs if `loom:review-requested` is still set; Merge re-runs only if the PR is still open and labeled `loom:pr`).
 - **1 closing issue** → use that issue number `N` as the checkpoint key. The existing `./.loom/scripts/sweep-checkpoint.sh` is keyed by issue number (#3373) and is reused as-is. **Read the existing checkpoint** before dispatching Judge:
   ```bash
   CHECKPOINT_PHASE=$(./.loom/scripts/sweep-checkpoint.sh phase N)
   ```
   If `CHECKPOINT_PHASE == "merge-done"`, the closing issue was already merged in a previous sweep — skip this PR with `already merged (per checkpoint)` and delete the stale checkpoint.
-- **2 or more closing issues** → log all closing issue numbers and skip checkpointing (multi-closing PRs are uncommon). Proceed with Judge/Doctor/Merge as normal.
+- **2 or more closing issues** → log all closing issue numbers and skip checkpointing. Proceed with Judge/Doctor/Merge as normal.
 
 ### C1. Per-PR routing by current label
 
@@ -96,7 +96,8 @@ If the PR entered the wave already labeled `loom:changes-requested` (e.g., from 
 - Load and follow the instructions in `.claude/commands/loom/doctor.md` for this PR.
 - Dispatch `loom-doctor` as a **single subagent Task** from this orchestrator session. Do **NOT** invoke `/loom:sweep` or `/loom:doctor` slash-commands as subagents — see "CRITICAL: One level deep".
 - If a previous Doctor attempt for this PR died mid-flight without a fresh `doctor-done` checkpoint (rate limit, crash), re-verify forge state (pushed commit? already re-labeled `loom:review-requested`?) and complete only the missing steps rather than duplicating the pushed fix — see "Mid-phase-death recovery" in the Wave Lifecycle (inherited here, same as the Doctor-cycle cap).
-- **Model escalation (#3481)**: Mode C inherits the issue-side rule unchanged — this Doctor is dispatched because of a `loom:changes-requested` rejection, so resolve its model per "Model escalation on Judge rejection" in the Execution Model: pass `ladder[1]` from `sweep.escalation` (default ladder: `opus`, resolved through `resolve-model.sh` to `claude-opus-5` — #3982) via the Task tool's `model` parameter, **unless** a tier-1/tier-2 pin applies (pins win) or escalation is disabled (`[]`/`false`). The pinned ID degrades to its alias on this Task-tool dispatch — run it through `resolve-model.sh --task-alias` (see "Pinned-ID degradation on Task-tool dispatch", #4282).
+- **Model escalation (#3481)**: Mode C inherits the issue-side rule unchanged — this Doctor is dispatched because of a `loom:changes-requested` rejection, so resolve its model per "Model escalation on Judge rejection" in the Execution Model: pass `ladder[1]` from `sweep.escalation` via the Task tool's `model` parameter, **unless** a tier-1/tier-2 pin applies (pins win) or escalation is disabled (`[]`/`false`). Run a pinned ID through `resolve-model.sh --task-alias` (#4282).
+- **GLM Doctor rejections (#11359)**: same rule as the Wave Lifecycle §6 — when a GLM tap can serve Doctor, run the record/route steps of `sweep-doctor-glm-escalation.md` around each Doctor; K never extends the cap.
 - Doctor addresses the judge feedback, commits the fixes, pushes, and re-labels the PR `loom:review-requested`.
 - If a closing-issue checkpoint is in scope, write `doctor-done` (with the attempt counter and the model the Doctor actually ran on — escalated or pinned, #3482) **before** the follow-up Judge:
   ```bash
@@ -156,7 +157,8 @@ It merges via the forge API and cleans up the worktree. `--auto` waits for the h
 **On merge failure** (non-zero; exit **6**: log `PR #P held by chain lock`, #10448):
 - Classify `<reason>` through "Forge write failure diagnosis (#6425)" above **before** writing the log line — do not assert a permission/credential diagnosis without running `forge_write_permission_confirmed` and getting positive evidence. Log `PR #P merge failed: <reason>` using that section's vocabulary (`forge-transient: …`, `permission fault not confirmed — will retry`, or the confirmed-and-cited form).
 - Do **NOT** delete the checkpoint (leave at `judge-done` or earlier) so the next sweep retries.
-- Advance to the next PR.
+- **Approved but conflicting (#9265).** If the refusal was for merge conflicts and `gh pr view P --json mergeable` confirms `CONFLICTING`, `main` moved under an approved PR — do not consult the Doctor-cycle cap. Run a **rebase pass** → re-Judge (**C1a**) → **C2**; procedure, rebase budget (3 per PR per run) and park reason: "Doctor-cycle cap" in the Execution Model.
+- Otherwise advance to the next PR.
 
 ### C3. Wave settled → advance to next PR
 
@@ -186,5 +188,5 @@ When the entire PR list has been processed, print a per-PR summary:
 Total: 3 merged, 1 blocked, 2 skipped, 1 rate-limited (unresumable).
 ```
 
-`rate-limited (...)` here carries the same meaning as in the issue-set Summary Output (see "`rate-limited` vs `blocked`" there): the reason reuses `TOKEN_EXPIRED` / `TOKEN_EXHAUSTED` / `MODEL_CREDITS_EXHAUSTED` from `.loom/scripts/lib/classify-error.sh`, a `resumed:` or `downgraded:` outcome already succeeded (via mid-phase-death recovery and the credit-exhaustion model fallback respectively), and only an `unresumable:` outcome needs a human — distinct from `blocked (...)`, which means the work itself failed. Mode C inherits the credit-exhaustion fallback unchanged: a Judge or Doctor killed by `MODEL_CREDITS_EXHAUSTED` at C1a/C1b is re-dispatched one rung down for the same PR, same attempt, without consuming a Doctor cycle. Mode C likewise inherits the spend-limit fallback unchanged: a Judge or Doctor killed by the `"spend limit"` signature at C1a/C1b is re-dispatched for the same PR, same attempt, with the `model` param omitted first (see "Spend-limit fallback" above), without consuming a Doctor cycle.
+`rate-limited (...)` here carries the same meaning as in the issue-set Summary Output (see "`rate-limited` vs `blocked`" there): the reason reuses `TOKEN_EXPIRED` / `TOKEN_EXHAUSTED` / `MODEL_CREDITS_EXHAUSTED` from `.loom/scripts/lib/classify-error.sh`, a `resumed:` or `downgraded:` outcome already succeeded, and only an `unresumable:` outcome needs a human — distinct from `blocked (...)`, which means the work itself failed or, as `blocked (rebase budget exhausted …)`, that `main` kept moving under an approved PR. Mode C inherits the credit-exhaustion and spend-limit fallbacks unchanged: a Judge or Doctor killed at C1a/C1b by `MODEL_CREDITS_EXHAUSTED` is re-dispatched one rung down, and one killed by the `"spend limit"` signature with the `model` param omitted first (see "Spend-limit fallback" above) — same PR, same attempt, without consuming a Doctor cycle.
 

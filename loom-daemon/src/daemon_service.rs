@@ -131,10 +131,6 @@ pub(crate) async fn run_daemon() -> Result<()> {
             // `jev-merge-risk` (issue #8543), so it needs the async runtime
             // for the same reason.
             Commands::JevTier { issue } => loom_daemon::jev_tier::run(issue).await,
-            // `concierge` connects to safehoused over its Unix socket to read
-            // the room and to relay a vetted command (Issue #7947), so it needs
-            // the async runtime for the same reason `quarantine` does.
-            Commands::Concierge(args) => args.action.run().await,
             // `hyperparams` prints the resolved hyperparameter vector
             // (Issue #9683) — pure config resolution, no live daemon, so it
             // needs neither the socket nor the async runtime.
@@ -162,6 +158,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
                 depends_on,
                 force,
                 ignore_host_constraint,
+                tap,
             } => {
                 handle_dispatch_command(
                     issue,
@@ -171,6 +168,8 @@ pub(crate) async fn run_daemon() -> Result<()> {
                     depends_on,
                     force,
                     ignore_host_constraint,
+                    tap.runtime,
+                    tap.model_profile,
                 )
                 .await
             }
@@ -417,6 +416,8 @@ pub(crate) async fn run_daemon() -> Result<()> {
         ),
         Err(e) => log::warn!("sweep_registry: reconstruction failed: {e}"),
     }
+    // #11346: J1 concern verification (logged, off-thread; no-op when disabled).
+    loom_daemon::journal::execution::log_startup_verification();
 
     // #6171: record the daemon's own primary workspace root once, before any
     // forge call that could trigger a forced per-owner credential refresh

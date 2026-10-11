@@ -11,6 +11,7 @@ fn params() -> ReplayParams {
         as_of: Utc.with_ymd_and_hms(2026, 10, 4, 13, 0, 0).unwrap(),
         window_sec: DEFAULT_WINDOW_SEC,
         repo: String::new(),
+        knowable_since: Some(Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()),
     }
 }
 
@@ -20,8 +21,10 @@ fn the_committed_sql_splits_into_the_state_and_coverage_queries() {
     for q in [&state, &coverage] {
         assert!(q.starts_with("WITH samples AS"), "{q}");
         // Knowable-at decides membership; no comment survives the split.
-        assert!(q.contains("created_at < {t:DateTime64(3)}"), "{q}");
+        assert!(q.contains("knowable_at < {t:DateTime64(3)}"), "{q}");
         assert!(!q.contains("--"), "{q}");
+        assert!(!q.contains("created_at"), "{q}");
+        assert!(q.contains("fromUnixTimestamp64Milli(inserted_at_unix_milli)"), "{q}");
         assert!(!q.ends_with(';'));
     }
     assert!(state.contains("FROM live"), "{state}");
@@ -66,6 +69,7 @@ fn parameters_bind_the_instant_in_utc_the_window_and_the_repo_scope() {
             ("repo".to_string(), "rjwalters/loom".to_string()),
             ("span".to_string(), "0".to_string()),
             ("step".to_string(), "300".to_string()),
+            ("knowable_since".to_string(), "2026-01-01 00:00:00.000".to_string()),
         ]
     );
 }
@@ -133,4 +137,72 @@ fn an_empty_store_is_an_empty_report_not_an_error() {
     let replay = assemble(&params(), "", "").unwrap();
     assert!(replay.hosts.is_empty() && replay.state.is_empty());
     assert!(render(&replay).contains("hosts: 0 (0 covered)"));
+}
+
+#[test]
+fn an_instant_before_the_column_existed_is_unknown_never_reconstructed() {
+    let mut p = params();
+    p.as_of = Utc.with_ymd_and_hms(2025, 12, 31, 23, 0, 0).unwrap();
+    assert!(p.before_knowable());
+    // Whatever rows an export holds, none of them is used.
+    let replay = assemble(&p, STATE, COVERAGE).unwrap();
+    assert_eq!(replay.unknown_reason.as_deref(), Some(NO_KNOWABLE_AT));
+    assert!(replay.hosts.is_empty() && replay.state.is_empty());
+    let text = render(&replay);
+    assert!(text.contains("unknown: no_knowable_at"), "{text}");
+    assert!(!text.contains("hosts:"), "{text}");
+    // At or after the instant the replay proceeds as usual.
+    p.as_of = p.knowable_since.unwrap();
+    assert!(!p.before_knowable());
+    assert!(assemble(&p, STATE, COVERAGE)
+        .unwrap()
+        .unknown_reason
+        .is_none());
+}
+
+fn ok(rows: &str) -> impl FnOnce(&str, &[(String, String)]) -> Result<String, ReadError> + '_ {
+    move |_, _| Ok(rows.to_string())
+}
+
+#[test]
+fn preflight_passes_when_the_knowable_at_column_is_present() {
+    let mut seen = None;
+    let result = preflight_with(|sql, params| {
+        seen = Some((sql.to_string(), params.to_vec()));
+        Ok("{\"n\":\"1\"}\n".to_string())
+    });
+    assert_eq!(result, Ok(()));
+    let (sql, params) = seen.unwrap();
+    assert!(sql.contains("system.columns") && sql.contains("distributed_logs_v2"), "{sql}");
+    assert_eq!(params, [("column".to_string(), KNOWABLE_AT_COLUMN.to_string())]);
+}
+
+#[test]
+fn preflight_names_the_absent_column_without_clickhouse_text() {
+    for rows in ["{\"n\":0}\n", "{\"n\":\"0\"}", ""] {
+        let err = preflight_with(ok(rows)).unwrap_err();
+        assert_eq!(err, "knowable-at column `inserted_at_unix_milli` absent on the store");
+        assert!(!err.contains("UNKNOWN_IDENTIFIER") && !err.contains("Code:"), "{err}");
+    }
+}
+
+#[test]
+fn preflight_reports_an_unanswered_lookup_as_such() {
+    let err = preflight_with(|_, _| Err(ReadError::Unavailable("connection refused".into())))
+        .unwrap_err();
+    assert!(err.starts_with("column check: store unavailable"), "{err}");
+    assert!(!err.contains("absent on the store"), "{err}");
+}
+
+#[test]
+fn a_live_read_without_knowable_since_is_refused_before_any_query() {
+    let mut p = params();
+    p.knowable_since = None;
+    let http = ClickhouseHttp {
+        endpoint: "http://127.0.0.1:1".into(),
+        user: None,
+        credential_file: None,
+        timeout: std::time::Duration::from_secs(1),
+    };
+    assert_eq!(fetch(&http, &p).unwrap_err(), MISSING_KNOWABLE_SINCE);
 }

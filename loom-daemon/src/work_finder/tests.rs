@@ -1987,7 +1987,8 @@ fn test_tick_lease_order_refusal_counts_as_backoff_skip_not_error() {
 fn test_park_labels_are_the_non_building_subset_of_skip_labels() {
     // #4444: the dispatch-time guard keys on PARK_LABELS, so the two
     // constants must stay in lockstep — SKIP_LABELS is exactly
-    // BUILDING_LABEL + PARK_LABELS + OPERATOR_HOLD_LABEL, and PARK_LABELS
+    // BUILDING_LABEL + PARK_LABELS + OPERATOR_HOLD_LABEL + `loom:epic`
+    // (#11399) + the decision sub-kind, and PARK_LABELS
     // must never contain `loom:building` (a guard that refused it would break
     // the watchdogs' and the reaper's re-dispatch of the daemon's OWN claim).
     assert!(
@@ -2001,12 +2002,15 @@ fn test_park_labels_are_the_non_building_subset_of_skip_labels() {
             "{park} is a park label, so the work-finder query must skip it too"
         );
     }
-    let mut expected: Vec<&str> = vec![BUILDING_LABEL];
-    expected.extend_from_slice(&PARK_LABELS);
-    expected.extend([OPERATOR_HOLD_LABEL, labels::OPERATOR_DECISION_LABEL]);
+    let mut expected = [&[BUILDING_LABEL], PARK_LABELS.as_slice()].concat();
+    expected.extend([
+        OPERATOR_HOLD_LABEL,
+        labels::EPIC_LABEL,
+        labels::OPERATOR_DECISION_LABEL,
+    ]);
     assert_eq!(
         *SKIP_LABELS, expected,
-        "SKIP_LABELS is BUILDING_LABEL + PARK_LABELS + OPERATOR_HOLD_LABEL + the decision sub-kind"
+        "SKIP_LABELS is the claim + the parks + the hold + the epic container + the decision sub-kind"
     );
 }
 
@@ -2014,7 +2018,8 @@ fn test_park_labels_are_the_non_building_subset_of_skip_labels() {
 // sibling file rather than being appended here: this module is over the
 // 1000-line ratchet threshold and frozen at its current size
 // (`.loom/docs/file-size-policy.md`), the same pattern `roster_fence`
-// already uses in this file.
+// already uses in this file. `epic_container` (#11399) follows it.
+mod epic_container;
 mod operator_hold;
 
 #[test]
@@ -2523,6 +2528,7 @@ mod maintain_only;
 mod operator_priority;
 mod ordering;
 mod ram_budget;
+mod workspace_draw;
 
 // ===================================================================
 // WorkItem

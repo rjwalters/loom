@@ -168,6 +168,8 @@ pub struct RepoCap {
     ram: Option<crate::ram_headroom::RamBudget>,
     /// The tick's per-repo disk budget (#11191); `None` ⇒ no disk gate here.
     disk: Option<crate::disk_admission::DiskBudget>,
+    /// The same-tick affected-files overlap gate (#9781).
+    overlap: super::affected_files::OverlapGate,
 }
 
 impl RepoCap {
@@ -190,6 +192,7 @@ impl RepoCap {
             occupancy,
             ram: limits.ram,
             disk: limits.disk,
+            overlap: super::affected_files::OverlapGate::default(),
         }
     }
 
@@ -267,7 +270,33 @@ impl RepoCap {
             ready_queue::resolve(&mut report.queue, cand, Qd::DeferredCapacity, Some(detail));
             return true;
         }
-        !over && self.defer(cand, report)
+        if !over && self.defer(cand, report) {
+            return true;
+        }
+        let shared = self.overlap.overlapping(cand);
+        if shared.is_empty() {
+            return false;
+        }
+        // #9781: scheduling signal only — no label, hold, or stacking edge.
+        let detail = ready_queue::short_detail(&format!("file overlap: {}", shared.join(", ")));
+        ready_queue::resolve(&mut report.queue, cand, Qd::DeferredFileOverlap, Some(detail));
+        true
+    }
+
+    /// Record a listed item's `## Affected Files` surface (#9781); `in_flight`
+    /// marks an item this dispatcher already holds, and a listed
+    /// `loom:building` item occupies its surface regardless. Reads only the
+    /// listing's own body and labels.
+    pub fn note_surface(&mut self, idx: usize, item: &super::WorkItem, in_flight: bool) {
+        let occupying = in_flight || item.labels.iter().any(|l| l == super::BUILDING_LABEL);
+        self.overlap
+            .note(idx, item.number, item.body.as_deref(), occupying);
+    }
+
+    /// [`Self::admit`] for a whole candidate: also occupies its surface.
+    pub fn admit_candidate(&mut self, cand: &PriorityCandidate) {
+        self.overlap.occupy(cand);
+        self.admit(cand.workspace_idx);
     }
 
     /// The cap and the per-workspace occupancy as they stand now — at the
@@ -307,17 +336,18 @@ pub struct RepoCapSnapshot {
 /// slice partition, then (when a per-repo cap is configured) the #9090 track
 /// affinity partition.
 ///
-/// **Lane candidates are exempt** (#9244): a starred or red-main-fix candidate
-/// stays at the head of the list, in its [`candidate_cmp`](super::candidate_cmp)
-/// order, and both partitions apply only to the ordinary tail behind it.
+/// **Lane candidates are exempt** (#9244): a starred, red-main-fix or
+/// `loom:very-important` (#11103) candidate stays at the head of the list, in
+/// its workspace-draw order, and both partitions apply only to the ordinary
+/// tail behind it.
 /// Affinity would otherwise float every hot-repo candidate ahead of a starred
 /// issue in a cold repo, and the slice would defer a starred issue whose repo
 /// another host prefers; either breaks "starred first, fleet-wide". A lane
 /// candidate's repo still counts toward the slice's "is my slice empty?"
 /// question, so the #6243 fallback behaves as before.
 ///
-/// Both partitions are **stable**, so `candidate_cmp` still decides order
-/// within each group and the comparator itself is untouched. With
+/// Both partitions are **stable**, so the workspace-draw order still decides
+/// order within each group. With
 /// `preferred_slice: None` and a disabled `cap` this returns `candidates`
 /// unchanged.
 ///
@@ -344,11 +374,15 @@ fn shape(
     cap: &RepoCap,
     report: &mut TickReport,
 ) -> Vec<PriorityCandidate> {
-    // `candidates` is sorted by `candidate_cmp`, whose first keys are the
-    // lanes, so this partition keeps the head exactly as sorted.
-    let (lanes, rest): (Vec<_>, Vec<_>) = candidates
-        .into_iter()
-        .partition(|c| c.operator_priority || c.main_red_fix);
+    // `candidates` is in workspace-draw order (#11103); this stable partition
+    // lifts the lane candidates to the head, keeping their draw order. A
+    // `loom:very-important` candidate is a lane too: its workspace won the
+    // draw, so affinity and the slice must not push it back.
+    let (lanes, rest): (Vec<_>, Vec<_>) = candidates.into_iter().partition(|c| {
+        c.operator_priority
+            || c.main_red_fix
+            || c.level == crate::priority_pick::Level::VeryImportant
+    });
     let in_slice = |c: &PriorityCandidate| {
         preferred_slice.is_none_or(|s| s.get(c.workspace_idx).copied().unwrap_or(true))
     };

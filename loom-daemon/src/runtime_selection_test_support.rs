@@ -49,7 +49,9 @@ fn is_runtime_selection_var(name: &OsStr) -> bool {
     let Some(name) = name.to_str() else {
         return false;
     };
-    if name == "LOOM_RUNTIME" {
+    // `LOOM_MODEL_PROFILE` decides which profile's `excludedRoles` admission
+    // checks for a native runtime (#11400), so it selects as much as a pin.
+    if name == "LOOM_RUNTIME" || name == "LOOM_MODEL_PROFILE" {
         return true;
     }
     name.strip_prefix("LOOM_RUNTIME_")
@@ -143,6 +145,7 @@ mod tests {
             "LOOM_RUNTIME_SWEEP_LIFECYCLE",
             "LOOM_RUNTIME_JUDGE",
             "LOOM_RUNTIME_BUILDER",
+            "LOOM_MODEL_PROFILE",
         ] {
             assert!(is_runtime_selection_var(OsStr::new(name)), "{name} must be cleared");
         }

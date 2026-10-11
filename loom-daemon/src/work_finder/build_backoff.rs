@@ -586,7 +586,8 @@ pub fn any_held(held: &[bool], workspaces: usize) -> bool {
 /// tick's workspaces; an index past its end is not held.
 #[must_use]
 pub fn defers(held: &[bool], cand: &PriorityCandidate) -> bool {
-    held.get(cand.workspace_idx) == Some(&true) && !(cand.operator_priority || cand.main_red_fix)
+    held.get(cand.workspace_idx) == Some(&true)
+        && !(cand.operator_priority || cand.main_red_fix || cand.is_very_important())
 }
 
 /// This tick's build back-off deferrals per repo, most-deferred first (ties

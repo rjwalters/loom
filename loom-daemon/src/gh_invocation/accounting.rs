@@ -277,6 +277,9 @@ pub(super) fn record(
     } else {
         let classified = match outcome {
             InvokeOutcome::Ok => Outcome::Ok,
+            InvokeOutcome::ExitNonzero if forge_call_stats::is_secondary_limit(None, stderr) => {
+                Outcome::SecondaryLimited
+            }
             InvokeOutcome::ExitNonzero
                 if crate::rate_limit_breaker::indicates_rate_limit(stderr) =>
             {
@@ -426,6 +429,7 @@ fn record_metric(
             Outcome::Ok => CallOutcome::Ok,
             Outcome::NotModified => CallOutcome::NotModified,
             Outcome::RateLimited => CallOutcome::RateLimited,
+            Outcome::SecondaryLimited => CallOutcome::SecondaryLimited,
             Outcome::Error => CallOutcome::Error,
             Outcome::Shed => CallOutcome::Shed,
         },

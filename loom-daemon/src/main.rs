@@ -245,22 +245,6 @@ enum Commands {
         action: FleetAction,
     },
 
-    /// The operator-agent persona's I/O surface (Issue #7947, Phase 3b of
-    /// #4196): read room intent, vet a typed command, relay it to the daemon.
-    ///
-    /// `concierge relay` is the ONLY sanctioned path from a natural-language
-    /// read of a room message to a daemon command, and it refuses `--verb
-    /// confirm` unconditionally — a confirmation nonce is answered by the human
-    /// it was shown to, never by the persona. Off unless
-    /// `safehouse.concierge` names at least one allowed sender; `concierge
-    /// check` reports which.
-    ///
-    /// A one-line tuple variant wrapping `ConciergeArgs` (which carries the
-    /// `#[command(subcommand)]`), for the same reason `Telemetry` above is:
-    /// this file is frozen by the file-size ratchet, so the subcommand's shape
-    /// and docs live in `cli::concierge` and only the dispatch arm is here.
-    Concierge(cli::concierge::ConciergeArgs),
-
     /// Manage insta-crash quarantines (Issue #3939): the in-memory pauses the
     /// daemon applies to issues whose sweeps insta-crash repeatedly. Connects to
     /// the running daemon over its Unix socket, since the quarantine state lives
@@ -362,6 +346,9 @@ enum Commands {
         /// bail-out on a host that was never meant to run it.
         #[arg(long)]
         ignore_host_constraint: bool,
+
+        #[command(flatten)]
+        tap: cli::dispatch::DispatchTapArgs,
     },
 
     /// Cancel a running sweep via the running daemon (Issue #4980): the `dispatch`
@@ -1096,6 +1083,11 @@ enum Commands {
         /// Show verbose output including configured roles
         #[arg(long, short)]
         verbose: bool,
+
+        /// Run only the fleet-policy shadow check (#11441) and exit 2 on any
+        /// finding; skips role validation. Used by the CI guard.
+        #[arg(long)]
+        fleet_policy_only: bool,
     },
 
     /// Inspect the durable `sweep.outcome` telemetry journal (Issue #4704,
@@ -1123,6 +1115,9 @@ enum Commands {
     /// = drift detector), diff/apply the `roster`, and report the desired run
     /// `state`. Args live in `cli::fleet_config` (main.rs is size-frozen).
     FleetConfig(cli::fleet_config::FleetConfigArgs),
+
+    /// The shared bounded journal core (#11345): `verify` a journal root.
+    Journal(cli::journal_cli::JournalArgs),
 }
 
 /// Sub-actions for `loom-daemon checkpoint` (issue #4275).
@@ -2373,9 +2368,11 @@ async fn handle_cli_command(command: Commands) -> Result<()> {
             format,
             strict,
             verbose,
-        } => handle_validate_command(&workspace, &format, strict, verbose),
+            fleet_policy_only,
+        } => handle_validate_command(&workspace, &format, strict, verbose, fleet_policy_only),
         Commands::SweepOutcomes(args) => cli::sweep_outcomes_cli::dispatch(args),
         Commands::FleetConfig(args) => cli::fleet_config::dispatch(args),
+        Commands::Journal(args) => cli::journal_cli::dispatch(args),
         Commands::Stats {
             command,
             role,
@@ -2535,7 +2532,6 @@ async fn handle_cli_command(command: Commands) -> Result<()> {
         // Async commands are dispatched by main before reaching this sync handler.
         Commands::JevMergeRisk { .. }
         | Commands::JevTier { .. }
-        | Commands::Concierge(..)
         | Commands::Hyperparams(..)
         | Commands::Quarantine { .. }
         | Commands::DispatchBackoff { .. }

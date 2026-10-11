@@ -540,10 +540,12 @@ prepare_loom_metadata_env() {
   export LOOM_COMMIT
 }
 
-# Post-`loom-daemon init` artifacts that loom-daemon does not write itself.
-# Invoked by both the `--quick` reinstall branch and the fresh `--quick`
-# install case so neither path drops:
-#   - .loom/config/skill-routes.json (port of scripts/install-loom.sh:1032-1048)
+# Post-`loom-daemon init` artifacts. Invoked by both the `--quick` reinstall
+# branch and the fresh `--quick` install case so neither path drops:
+#   - .loom/config/skill-routes.json (port of scripts/install-loom.sh:1032-1048).
+#     `loom-daemon init` copies this itself as of #9129, with the same
+#     copy-if-absent rule, so step 1 below finds the file present and skips. It
+#     stays as a no-op for a daemon binary that predates #9129.
 #   - .loom/loom-source-path        (port of scripts/install-loom.sh:1067-1074)
 #   - .loom/install-metadata.json   (port of scripts/install-loom.sh:1261-1270)
 #

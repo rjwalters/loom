@@ -91,11 +91,15 @@ pub enum PickSkipReason {
     /// The role ran, its actions were observed, and it did not act on this
     /// candidate (and no label explains why).
     NotSelected,
+    /// The item's work already landed (Issue #11429).
+    AlreadyLanded,
+    /// The issue is closed as not planned (Issue #11429).
+    AlreadyClosed,
 }
 
 impl PickSkipReason {
     /// Every reason, in declaration order (pinned by a test against the docs).
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 15] = [
         Self::OverlapChain,
         Self::PrOpenSkip,
         Self::OperatorHold,
@@ -109,6 +113,8 @@ impl PickSkipReason {
         Self::Error,
         Self::TickSkipped,
         Self::NotSelected,
+        Self::AlreadyLanded,
+        Self::AlreadyClosed,
     ];
 
     /// The snake_case wire name (identical to the serde form).
@@ -128,6 +134,8 @@ impl PickSkipReason {
             Self::Error => "error",
             Self::TickSkipped => "tick_skipped",
             Self::NotSelected => "not_selected",
+            Self::AlreadyLanded => "already_landed",
+            Self::AlreadyClosed => "already_closed",
         }
     }
 
@@ -147,6 +155,7 @@ impl PickSkipReason {
             | Qd::DeferredSaturation
             | Qd::DeferredOutOfSlice
             | Qd::DeferredRepoCap => Self::Cap,
+            Qd::DeferredFileOverlap => Self::OverlapChain,
             Qd::DeferredBuildBackoff
             | Qd::RecheckInterval
             | Qd::DispatchBackoff
@@ -160,6 +169,8 @@ impl PickSkipReason {
             Qd::Parked | Qd::HardExclusion | Qd::Declined => Self::OperatorHold,
             Qd::OpenPrBackoff | Qd::OpenPr => Self::PrOpenSkip,
             Qd::DispatchError => Self::Error,
+            Qd::AlreadyLanded => Self::AlreadyLanded,
+            Qd::AlreadyClosed => Self::AlreadyClosed,
         })
     }
 }
@@ -206,6 +217,52 @@ pub struct PickSkip {
     pub repo: String,
     pub number: u32,
     pub reason: PickSkipReason,
+    /// Daemon-templated specifics of the skip, when the reason has them.
+    /// Today only a work-finder file-overlap deferral (#9781) sets it: the
+    /// shared `## Affected Files` paths (`file overlap: a, b`, bounded to one
+    /// short line). Additive and optional; absent everywhere else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// One workspace in a [`PickDraw`], with its draw weight.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PickDrawCandidate {
+    /// Forge `owner/repo`, or `repo_unresolved`.
+    pub repo: String,
+    /// Its draw weight (from the workspace's `fleet_priority`).
+    pub weight: u64,
+}
+
+/// One weighted workspace draw of the work finder (#11103).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PickDraw {
+    /// `very-important` when only workspaces with `loom:very-important` work
+    /// next were drawn over, `all` otherwise.
+    pub pool: String,
+    /// The workspaces drawn over, with weights.
+    pub candidates: Vec<PickDrawCandidate>,
+    /// Sum of the weights.
+    pub total_weight: u64,
+    /// The RNG value in `0..total_weight` that chose the pick.
+    pub roll: u64,
+    /// The drawn workspace.
+    pub picked: String,
+    /// The issue the draw placed next in the dispatch order.
+    pub number: u32,
+}
+
+/// The work finder's workspace draws for one tick (#11103): enough to replay
+/// the dispatch order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PickWorkspaceDraw {
+    /// The tick's RNG seed, as decimal text (a `u64` does not survive a
+    /// JSON number in every reader).
+    pub seed: String,
+    /// How many draws the tick made, before the cap.
+    pub draws_total: usize,
+    /// The first draws, in order (at most [`MAX_PICK_CANDIDATES`]).
+    pub draws: Vec<PickDraw>,
 }
 
 /// What the tick concluded about one ranked candidate.
@@ -215,6 +272,8 @@ pub enum PickVerdict {
     Acted(&'static str),
     /// Skipped, with the closed-set reason.
     Skipped(PickSkipReason),
+    /// Skipped, with the reason and its [`PickSkip::detail`].
+    SkippedWithDetail(PickSkipReason, String),
     /// Considered; the daemon cannot see what the role did with it (a role
     /// agent chooses among its queue itself).
     Undecided,
@@ -253,6 +312,10 @@ pub struct PickDecisionRecord {
     /// unexplained candidate is then neither acted nor skipped).
     #[serde(default)]
     pub decisions_observed: bool,
+    /// The work finder's workspace draws (#11103); `None` for role ticks and
+    /// for a work-finder tick with nothing to draw.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_draw: Option<PickWorkspaceDraw>,
 }
 
 /// Identity of the tick a record describes.
@@ -291,7 +354,16 @@ impl PickDecisionRecord {
                     repo: candidate.repo.clone(),
                     number: candidate.number,
                     reason,
+                    detail: None,
                 }),
+                PickVerdict::SkippedWithDetail(reason, detail) if listed => {
+                    skipped.push(PickSkip {
+                        repo: candidate.repo.clone(),
+                        number: candidate.number,
+                        reason,
+                        detail: Some(detail),
+                    });
+                }
                 _ => {}
             }
             if listed {
@@ -312,6 +384,7 @@ impl PickDecisionRecord {
             skipped,
             candidate_source: source::NONE.to_string(),
             decisions_observed: false,
+            workspace_draw: None,
         }
     }
 
@@ -326,6 +399,17 @@ impl PickDecisionRecord {
     pub fn with_source(mut self, candidate_source: &str, decisions_observed: bool) -> Self {
         self.candidate_source = candidate_source.to_string();
         self.decisions_observed = decisions_observed;
+        self
+    }
+
+    /// Attach the work finder's workspace draws (#11103), capping the list at
+    /// [`MAX_PICK_CANDIDATES`].
+    #[must_use]
+    pub fn with_workspace_draw(mut self, draw: Option<PickWorkspaceDraw>) -> Self {
+        self.workspace_draw = draw.map(|mut d| {
+            d.draws.truncate(MAX_PICK_CANDIDATES);
+            d
+        });
         self
     }
 

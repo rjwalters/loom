@@ -2187,6 +2187,7 @@ from an older template is brought up to date.
 | Surface | Why |
 |---|---|
 | `.loom/config.json` | Consumer configuration. The installer merges it on a reinstall and nothing migrates a key afterwards, so **a release that renames or retires a config key must keep reading the old key**. Fleet-wide configuration reaches hosts through the fleet store instead |
+| `.loom/config/` (`skill-routes.json`) | Consumer-editable configuration. The installer, `loom-daemon init` included, copies each `defaults/config/*.json` only when the file is absent (#9129); only `scripts/install-loom.sh --force`/`--clean` overwrites one. A resync never overwrites an edit and never re-creates a deleted file, which is the documented way to switch the skill router off. Put local routes in `skill-routes.local.json` |
 | `package.json` (`loom-workspace` stub) | The removal of its `version` field is a one-time migration (#4285) |
 | root `CLAUDE.md` | Repo-customized. Removing a leftover `**Loom Version**` header is a one-time migration (#6612, #8147) |
 | `.gitattributes` `merge=ours` block and the local `merge.ours.driver` | They resolve per-host resync commits that conflict on the stamp (#4528). The daemon resync has one writer per change. An existing block is left as it is, and local git config cannot be committed |
@@ -2972,12 +2973,12 @@ ordering (superseded by the weighted draw in [`priority-model.md`](priority-mode
 - **Work-finder ordering** — `work_finder::tick_multi` now takes a
   `priorities: &[u32]` slice parallel to the workspaces. Instead of dispatching
   each repo's backlog in registration order, it gathers **every** eligible
-  candidate across all workspaces into one queue, sorts it by `candidate_cmp` —
-  **(workspace priority asc, issue age asc/oldest-first, issue number asc)**,
-  behind the two #9244 lanes below — and fills the single shared concurrency
-  budget in that global order. The cap/budget mechanics (#3811/#3930) are unchanged; this only
-  orders the queue. `createdAt` is added to the `gh issue list --json` fields for
-  the age key.
+  candidate across all workspaces and orders them by **weighted workspace
+  draws** (#11103, [`priority-model.md`](priority-model.md)): each draw picks a
+  workspace weighted by its priority and places its next issue (level, oldest,
+  number). It fills the single shared concurrency budget in that order. The
+  cap/budget mechanics (#3811/#3930) are unchanged; this only orders the queue.
+  `candidate_cmp` (below) now only ranks the published ready-queue rows.
 
 - **Epic supervisor** — `spawn_multi_supervisor_thread` reorders its cached
   per-repo supervisors by workspace priority each tick (stable within a tier) before
@@ -2987,10 +2988,10 @@ ordering (superseded by the weighted draw in [`priority-model.md`](priority-mode
   **Managed repos** table (a `PRIO` column) and the `--json` `per_repo[].priority`
   field, with the breakdown sorted highest-priority first.
 
-**Starvation stance (v1):** strict priority is intentional — tool repos are small
-queues that drain fast. A permanently-full higher tier **will** starve lower tiers;
-fairness knobs (per-tier slot reservations) and cross-repo dependency awareness are
-explicit follow-ups, deferred until observed to matter.
+**Starvation stance:** since #11103 the cross-repo order is a weighted draw, not
+strict tiers: a default-priority repo is drawn less often than a tool repo, never
+starved. A repo with `loom:very-important` work next wins the draw outright.
+Cross-repo dependency awareness stays a role judgment (label the blocker).
 
 **`tier:*` labels do not affect dispatch order.** `tier:goal-advancing` and its
 siblings are triage metadata; no daemon code reads them. Only the six keys
@@ -3047,8 +3048,8 @@ below order the queue.
 5. `createdAt`, oldest first.
 6. Issue number ascending.
 
-The single-workspace tick sorts by keys 1-3 only, so its listing order is
-unchanged when nothing is starred or red.
+Since #11103 these keys rank the ready-queue rows only; dispatch follows the
+workspace draw, and the single-workspace tick uses level, oldest, number.
 
 **Starred issues outside `loom:issue`.** Besides the `loom:issue` listing, each
 tick makes a second ETag-cached listing of open `loom:operator-priority` issues
@@ -3388,7 +3389,10 @@ by `candidate_cmp`, with what the tick did with it:
   `host_constraint`, `workspace_halted` (the whole repo's dispatch is held: red
   `main`, a gate in flight, a pre-flight or token-pool hold, a drain, or the
   host-distress breaker; the row does not say which), `workspace_commands_missing`,
-  `dispatch_error` (with the error text)
+  `dispatch_error` (with the error text), `already_landed` (#11429: the issue
+  is closed, or this host recorded a `landed` sweep for it in the last 30
+  minutes; detail `forge_closed` or `journal_landed`), `already_closed`
+  (#11429: the issue is closed as not planned)
 
 Each disposition is recorded next to the `TickReport` counter it matches, so the
 rows and the counters agree. Issues dropped before the sort are still ranked by the same
@@ -4660,6 +4664,14 @@ Each tick:
    `Pending` entry in the sweep registry — the authoritative dedup, robust to
    `loom:issue → loom:building` label-flip lag) or that defensively carry any
    skip label (`loom:building` / `loom:blocked` / `loom:operator-only`).
+   A `loom:epic` issue is never a work-finder candidate either, even when it
+   also carries `loom:issue` (#11399): an epic is a tracking container, and
+   only its `loom:epic-phase` children are build work. It is counted as
+   `labeled-skip` and keeps a `parked` ready-queue row naming `loom:epic`
+   (so the coarse pick-decision reason reads `operator_hold`, as it does for
+   every `parked` row, although no human hold is set). The label is a skip,
+   not a park: an explicit `dispatch_sweep` on an epic still runs, and the
+   epic supervisor is unaffected.
 3. Dispatches the remainder through the existing `SweepRegistry::dispatch()`
    path — up to a **work-driven dynamic cap** (Phase B, #3811) recomputed every
    tick and counted against the current live sweep occupancy. `dispatch()`
@@ -4883,6 +4895,30 @@ automatic. It composes with [repo sharding (#6243)](dispatcher-repo-sharding.md)
 in a fixed order: the sharding slice partition runs first, affinity reorders
 within its result, and the cap gates admission last. Starred and red-main-fix
 candidates are exempt from both partitions (#9244).
+
+#### Same-repo file-overlap deferral (#9781)
+
+Two same-repo issues that edit the same files and build in parallel cost a
+Doctor rebase cycle as soon as the first PR merges. Pass 2 therefore defers a
+candidate whose Curator `## Affected Files` paths intersect the surface already
+**occupied** in its repo: candidates admitted earlier this tick, plus in-flight
+items the tick's own `loom:issue` listing still carries a body for. It runs
+after the capacity, ramp, RAM and per-repo-cap gates, so it is work-conserving
+— the slot goes to the next candidate in order. Always on; no config.
+
+- **Disposition** `deferred_file_overlap` (state `ready`, plan gate
+  `file_overlap`); the row's `detail` is `file overlap: <paths>`, and the
+  `pick.decision` skip (`overlap_chain`) carries the same `detail`.
+- **Surface** = backtick-quoted paths under an `Affected Files` heading (a span
+  with a `/`, or a root file with a known extension such as `CLAUDE.md`). No
+  section, "To be determined", or no paths ⇒ *unknown*: never deferred and
+  never occupying — same rule as `/loom:sweep`'s overlap-aware waves.
+- **Scheduling signal only**: no label, hold, stacking edge or extra forge read.
+  Starred and red-main-fix candidates are never deferred but still occupy.
+- **v1 limitation**: an in-flight issue absent from the `loom:issue` listing
+  (the usual case once it flips to `loom:building`) is not seen, so the gate
+  mainly separates same-tick admissions; the reactive Doctor rebase stays the
+  backstop.
 
 #### Why there is no CPU term in admission (#4512)
 
@@ -6500,9 +6536,35 @@ says** (#10954): the loop is spawned on every host with a fleet store, and
   not staggered. A roll is a pause, a restart and a resume (#10831, #10832), so
   hosts rolling together is accepted. Two hosts that roll minutes apart across
   a new release can land on different versions, both at or above the floor.
-- **Backoff still applies.** A failed fetch backs off as before, and a roll
-  whose new binary did not take is held back per target by the failed-roll
-  guard (#10832) inside the pause-and-roll itself.
+- **Backoff still applies, and a failed roll is never retried in a loop.** A
+  failed fetch backs off as before. A roll whose new binary did not take is
+  held back per target (#10880): before a version roll is armed, the loop
+  writes a `roll_attempt` record (target, version, tag, `target_source`,
+  attempt count) into `auto_update_state.json`. A daemon that starts running
+  a version **below** that record's has watched the attempt fail, whatever
+  binary saved the file, and neither fetches nor arms that target until
+  `not_before`: 15 min after the first failure, doubling to a 6 h ceiling and
+  continuing every 6 h, never terminal. This holds for every
+  `target_source`, floor included, and the tick reports `defer`. A different
+  target (a newer release, or the same version re-published under a new
+  checksum) is tried at once and starts the count over. The record is cleared
+  by the first tick on a binary at or above its version once that process has
+  been up for the 90 s startup grace, so a candidate that dies early leaves it
+  for the binary that comes back. Times are clamped on load (an arm time in
+  the future becomes now, a retry time past now + 6 h becomes now + 6 h). A
+  binary older than #10880 ignores the key; deleting the file clears it, and a
+  manual update is not gated by it. The pause-side guard of #10832
+  (`roll-failed-target.json`, checked by H3) stays as a backstop.
+- **A held roll alerts on every tick.** While a release roll is held by the
+  failed-roll guard, by fetch backoff after three or more consecutive
+  failures, or by a terminal fetch failure, every tick logs `FLOOR ROLL
+  FAILING: …` at **ERROR** when the host is below its floor (`ROLL HELD: …` at
+  WARN otherwise), naming the floor, the running version, the target, the
+  attempt count, the last failure and the next retry. The same text is in
+  `last tick:` and the `auto_update.tick` record's `roll_held`. Dispatch
+  continues on the running version. A **terminal** fetch failure on a floor
+  target is not final: it is retried every 6 h. Any other target keeps the
+  old rule (no retry until a new release).
 - **Every fleet host runs the loop, `autoUpdate.enabled` or not** (#10954).
   The mode is chosen once at startup, after the startup fleet-sync pass has
   classified the host: a store that is named but unusable is a fleet host
@@ -7199,8 +7261,8 @@ after a daemon restart), or if the recheck itself cannot answer, or if the PR is
 no longer open, the probe still concedes and dispatch still proceeds — a genuine
 forge outage can never wedge the daemon. Disable with `LOOM_OPEN_PR_MEMO=0`.
 
-**The memo only refuses (W9).** A memo answer is never renewed and never
-outlives 15 minutes; past that, the next attempt probes live, and leg 0 of that
+**The memo only refuses (W9).** A memo answer never outlives 15 minutes from
+its last verified forge answer; past that, the next attempt probes live, and leg 0 of that
 probe (the ETag'd open-PR listing, #10514) is a free `304` on an unchanged
 repo. A crash resume (#4256) is the one decision where an `Open(pr)` answer
 *permits* a dispatch, so it never consults the fresh memo: the reaper's
@@ -7627,6 +7689,28 @@ error, timeout, or unparseable output lets dispatch proceed, so a `gh` outage ca
 never wedge the daemon. It is GitHub-only (uses the `closedByPullRequestsReferences`
 closes-graph, filtered to `state == "OPEN"`); a Gitea workspace fails open and
 keeps today's behavior.
+
+**Batched pre-filter (#8865).** The multi-workspace tick no longer pays a full
+`dispatch()` attempt per PR-blocked candidate. The first candidate of a
+workspace to reach the dispatch point triggers ONE read of that workspace's
+ETag-cached open-PR listing, classified for all of its candidates with the
+guard's own classifier (`work_finder/open_pr_prefilter.rs`). A candidate with a
+verified open linked PR is counted in `pr-open-skip` and reported `open_pr`
+without a dispatch attempt: no `work_finder: attempting issue` line, no
+`loom.dispatch.admission` span, no dispatch backoff, and so no `pr-open-backoff`
+ticks in between. Its skip line is logged when the block starts, not every tick.
+The pre-filter only removes candidates and fails open: with the listing
+unreadable every candidate goes to `dispatch()` and the step 2.6 guard above,
+which is unchanged and still the authority for every route. A tick in which
+nothing reaches the dispatch point (at capacity, saturated, halted) makes no
+read. Each read that succeeds also feeds the #6788 memo, which the 2.6 probe no
+longer writes for these candidates: a verified open PR records or refreshes the
+issue's entry, a verified absence removes it (a closed PR frees its issue that
+tick), an unreadable listing changes nothing. So when the listing cannot be
+read, 2.5 refuses on the fresh entry, and the known-PR recheck still has its PR
+if every other leg fails. An open-PR refusal that `dispatch()` still makes arms the #4485 ladder as
+before, but as its own streak, logged as a guard refusal rather than as
+`consecutive failed dispatch(es)`.
 
 **A large held-PR backlog can masquerade as work starvation here — a distinct
 mechanism from #5715.** Because the guard keys on openness only, a PR that
@@ -9374,7 +9458,8 @@ flows outside GitHub-hosted CI (see `docker/worker/README.md` and
       "keepLastN": 2,
       "minIntervalSecs": 1800,
       "trackedRepos": ["loom-worker", "loom-worker-session"],
-      "allowlist": ["eda"]
+      "allowlist": ["eda"],
+      "unusedMaxAgeDays": 7
     }
   }
 }
@@ -9387,6 +9472,19 @@ flows outside GitHub-hosted CI (see `docker/worker/README.md` and
 | `LOOM_DOCKER_IMAGE_RETENTION_MIN_INTERVAL_SECS` | `autonomous.dockerImageRetention.minIntervalSecs` | env > config > default | `1800` (30 min) |
 | — | `autonomous.dockerImageRetention.trackedRepos` | config > default | `loom-worker`, `loom-worker-session`, `loom-worker-native`, and their `ghcr.io/rjwalters/...` aliases |
 | — | `autonomous.dockerImageRetention.allowlist` | config > default | `[]` (empty — a shared long-lived image must be opted in explicitly) |
+| `LOOM_DOCKER_IMAGE_RETENTION_UNUSED_MAX_AGE_DAYS` | `autonomous.dockerImageRetention.unusedMaxAgeDays` | env > config > default | `7` |
+
+**Untagged images and disk pressure (#11195).** An image is untagged when every
+`RepoTags` entry is `<none>:<none>` or a digest ref (`repo@sha256:...`, the shape
+a superseded image keeps on containerd-store hosts); these are removed on every
+pass. An image that also has a real `repo:tag` alias is not untagged. When free
+space on the Docker data volume is below `autonomous.worktreeReaper.diskWarnFreeGb`,
+images that no container (running or stopped) references and that are at least
+`unusedMaxAgeDays` old are also removed, largest first, until the free-space
+deficit is covered. Docker has no portable "last used" time, so the age is the
+image's **creation** time (conservative toward removal, but only under pressure).
+Container-referenced and `allowlist`ed images are never removed. Below the floor
+the pass logs an INFO line with the bytes it left reclaimable.
 
 **Expected steady-state footprint.** On a container-enabled host running these
 flows regularly, steady state is: the `keepLastN` newest images per tracked
@@ -10752,7 +10850,6 @@ a unit test, so this list and the code cannot drift apart silently:
 | `hermit` | 600s (10 min) | yes |
 | `guide` | 900s (15 min) | yes |
 | `architect` | 3600s (1 h) | **no** — idle-addressable-only (#5656) |
-| `concierge` | 300s (5 min) | **no** — config-gated operator-agent persona (#7947) |
 
 At startup each spawned loop logs one line naming both the resolved cadence and
 the tier that supplied it:
@@ -10822,40 +10919,6 @@ naming it in `roles` (1h default cadence). Both paths pass the resolved
 per-invocation cap through as `/loom:architect --max-proposals <n>`; see
 `architectMaxProposals` in the config table above.
 
-### Config-gated roles: `concierge` (#7947)
-
-`architect`'s carve-out above is about *cadence*: name it in `roles` and it
-ticks. **`concierge` needs a second opt-in that `roles` cannot supply.**
-
-It is the operator-agent persona (Phase 3b of #4196) — the session that reads
-free-form prose out of a safehouse room and steers the daemon through Phase 3a's
-typed ChatOps verbs. It is an **inbound control channel**, so a repo that merely
-forgot to pin `roles` must never acquire one. Two independent gates:
-
-1. `interval_default: false`, like `architect` — excluded from the "unset
-   `roles` ⇒ all defaults" fallback.
-2. `role_runner::role_is_config_gated()`, checked inside `decide_root_tick`
-   after the master switch and before sharding: the tick is refused unless
-   `safehouse.concierge` resolves for that root (block present, `enabled` not
-   `false`, and **at least one usable Matrix ID in `allowedSenders`** — an empty
-   allowlist is deny-all, never allow-everyone).
-
-`role_is_config_gated` is written as a general predicate, not an inline
-`if spec.name == "concierge"`, so the next role with a config prerequisite has
-an obvious place to declare it — and a unit test pins that `concierge` is
-currently the *only* gated role, so an existing role cannot acquire a gate (and
-silently stop ticking everywhere) by accident.
-
-```bash
-loom-daemon concierge check     # exit 1 = off; prints which gate is closed
-```
-
-It also has no forge queue, so `role_collision::probe_target_for_role` returns
-`None` for it and pre-tick collision detection is a documented no-op (#4623) —
-its trigger source is a room, not a label. Budget bounds
-(`maxMessagesPerTick`, `maxTurnsPerDay`) live in a daemon-owned ledger rather
-than the prompt, because a daily cap spans sessions; full rationale in
-[`safehouse.md` § Operator-agent persona](safehouse.md).
 
 `onIdle` (#4364) lists the subset of the shipped roles to *also* fire on the
 work-finder **idle edge** — the moment a workspace transitions from busy to

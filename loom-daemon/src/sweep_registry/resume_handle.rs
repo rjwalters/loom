@@ -365,10 +365,13 @@ impl SweepRegistry {
             .join("owner.json");
         let result = std::fs::read_to_string(&path)
             .map_err(anyhow::Error::from)
-            .and_then(|raw| Ok(serde_json::from_str::<LockOwner>(&raw)?))
-            .and_then(|mut owner| {
+            .and_then(|raw| Ok((serde_json::from_str::<LockOwner>(&raw)?, raw)))
+            .and_then(|(mut owner, raw)| {
                 session.stamp(&mut owner, model, effort);
                 std::fs::write(&path, serde_json::to_string_pretty(&owner)?)?;
+                let before = serde_json::from_str(&raw).unwrap_or_default();
+                let ns = super::journal_shadow::LockNs::Issue;
+                self.shadow_owner_updated(ns, issue, &before, &owner);
                 Ok(())
             });
         if let Err(e) = result {

@@ -251,11 +251,27 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: RollTrigger>(
                 to_artifact_sha256: info.asset_sha256.clone().filter(|s| !s.is_empty()),
                 label: Some(supersede::artifact_roll_target(&info)),
             };
+            // #10880: record the attempt and write it to disk before the
+            // arm, so the binary that comes back can tell the roll did not
+            // take. A refused arm is undone.
+            let previous = matches!(outcome, RebuildOutcome::Success)
+                .then(|| state.arm_attempt(&target, &tag));
             state.persist_before_arm(&outcome);
-            let drain_accepted =
-                matches!(outcome, RebuildOutcome::Success) && trigger.trigger_pause_roll(&target);
+            let drain_accepted = previous.is_some() && trigger.trigger_pause_roll(&target);
+            if let Some(previous) = previous.filter(|_| !drain_accepted) {
+                state.attempt.undo(previous);
+            }
             summary.roll_armed = drain_accepted;
+            state.attempt.note_outcome(now, &outcome);
             let mut note = state.record_artifact_roll(now, &outcome, drain_accepted, &info);
+            if matches!(outcome, RebuildOutcome::Terminal(_))
+                && target.source == pause_manifest::TargetSource::Floor
+            {
+                note = format!(
+                    "{note} [floor target: retried after the {}s ceiling, never abandoned]",
+                    roll_attempt::CEILING.as_secs()
+                );
+            }
             if low_priority {
                 note = format!(
                     "{note} [{in_flight} in-flight sweep(s): fetched immediately at reduced \
@@ -271,7 +287,20 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: RollTrigger>(
     // decided (the floor-driven cause, or the unsatisfiable-floor alert). The
     // alert is never a gate: nothing above was held back for it, no pause is
     // started for it, and dispatch is untouched.
-    let note = format!("{note}{}{}", state.floor.note_suffix(), state.repo_ahead.note_suffix());
+    let mut note = format!("{note}{}{}", state.floor.note_suffix(), state.repo_ahead.note_suffix());
+    // #10880: a release roll held by the failed-roll gate, by fetch backoff
+    // after three or more failures, or by a terminal failure alerts on every
+    // tick: ERROR below the floor, WARN otherwise. Never a gate on dispatch.
+    if let Some(held) = state.held_roll(now, last_check) {
+        let text = roll_attempt::held_note(&held);
+        if held.floor.is_some() {
+            log::error!("auto_update: {text}");
+        } else {
+            log::warn!("auto_update: {text}");
+        }
+        note = format!("{note} [{text}]");
+        summary.roll_held = Some(held);
+    }
     // #10866: the note and the record's `floor_stall` are state and are set on
     // every tick the stall stands. Only the ERROR line is rate-limited.
     summary.floor_alerted = state
@@ -329,7 +358,7 @@ fn log_roll_outcome(outcome: &RebuildOutcome, note: &str) {
 }
 
 /// The text of a caught panic payload.
-fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+pub(super) fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     payload
         .downcast_ref::<&str>()
         .map(|s| (*s).to_string())
@@ -378,7 +407,14 @@ pub(super) fn guarded_tick<P: AutoUpdateProbe, T: RollTrigger>(
         status.publish(state.snapshot(true, started_at, note.clone(), &unresolved));
         TickSummary::new(None).finish(TickDecisionKind::Panic, note, &unresolved, None)
     });
+    // #10880 rule 5: a roll that reached this binary, up past its startup
+    // grace, took; forget the attempt.
+    state
+        .attempt
+        .confirm(Instant::now(), env!("CARGO_PKG_VERSION"));
     // #10713: persist after every tick (a no-op unless attached at spawn).
+    // #10880 item 4: `persist_state` runs under its own `catch_unwind`, apart
+    // from the tick's, so a tick that panicked still persists.
     state.persist_state();
     tick_telemetry::emit(&summary, state.consecutive_failures, started_at, started.elapsed());
     summary

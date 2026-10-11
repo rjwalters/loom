@@ -393,6 +393,13 @@ pub(crate) enum ScriptPortCommand {
     /// `contract`-category script per the shell language policy.
     GitBlobLines(super::git_blob_lines::GitBlobLinesArgs),
 
+    /// Curator's Affected-Files preflight (#9400): `affected-files check`
+    /// classifies each listed path against the build base. Not a port: it
+    /// replaces a bash loop inlined in the Curator prompt, which parked every
+    /// issue that listed a file it creates.
+    #[command(subcommand)]
+    AffectedFiles(super::affected_files_check::AffectedFilesCommand),
+
     /// The fleet singleton-job captain gate (#8848), shell-facing half: is
     /// THIS host the one declared to run `<job-name>`? Exit 0 arm, 3 another
     /// host is the captain, 4 no `fleet.captain` declared at all — three
@@ -421,13 +428,23 @@ pub(crate) enum ScriptPortCommand {
     /// manifest or an unrecognized `launch` key.
     RuntimeLaunchEnv(super::runtime_launch_cmd::RuntimeLaunchEnvArgs),
 
-    /// The fleet-wide `loom:blocked` re-check (#8927): every open
-    /// `loom:blocked` issue whose cited blocker has since closed/merged (a
-    /// stale block), plus every one carrying the label with no parseable
-    /// blocker reference at all (an undocumented block). The fourth pre-wave
-    /// advisory check, backing `check-stale-blocked.sh`. Strictly read-only,
-    /// **always exit 0** — it reports, it never relabels. Not a port: brand-new
-    /// logic, native from the start per the shell-language policy.
+    /// The per-repository `loom:blocked` re-check (#8927): one invocation
+    /// examines one repository (the one `--repo` / `--repo-root` resolves) and
+    /// reports every open `loom:blocked` issue or PR whose cited blocker has
+    /// since closed/merged (a stale block), plus every one carrying the label
+    /// with no parseable blocker reference at all (an undocumented block). The
+    /// fourth pre-wave advisory check, backing `check-stale-blocked.sh`.
+    /// Strictly read-only, **always exit 0** — it reports, it never relabels.
+    ///
+    /// Do not loop it across many repositories by hand (#9191): each
+    /// invocation is a fresh process with no rate-limit breaker (that exists
+    /// only in the running daemon), so a refusal stops nothing and reaches no
+    /// later repository, and the budget floor cannot see a GitHub secondary
+    /// rate limit. See `.loom/docs/github-authentication.md`
+    /// -> "Secondary rate limits and hand-rolled loops".
+    ///
+    /// Not a port: brand-new logic, native from the start per the
+    /// shell-language policy.
     CheckStaleBlocked(super::stale_blocked::StaleBlockedArgs),
 
     /// The `PreToolUse` decision for the `mcp__loom__*` tool namespace (#9108),
@@ -551,6 +568,15 @@ pub(crate) enum ScriptPortCommand {
     #[command(subcommand)]
     ResyncPin(super::resync_pin_cmd::ResyncPinCommand),
 
+    /// Resync a workspace's installed Loom files from the payload embedded
+    /// in this binary, with no Loom source tree (#8961). What
+    /// `resync-installed.sh` hands off to when no `defaults/` tree resolves.
+    /// Writes the working tree only: no commit, no push. Refuses rather than
+    /// downgrade, and only a verified official release build applies. Exit 0
+    /// applied or in sync, 1 refused or failed, 2 `--dry-run` found changes.
+    /// Not a port: brand-new logic, native per the shell-language policy.
+    ResyncPayload(super::resync_payload_cmd::ResyncPayloadArgs),
+
     /// The versioned forge **operation inventory** and its accounting (#9777,
     /// phase 1 of epic #9769): the coverage validator, the unclassified-call
     /// change gate, the four-axis coverage report and the hosted-probe
@@ -629,6 +655,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::ReconcileStack(args) => args.run(),
             ScriptPortCommand::GenerateAgentSkills(args) => args.run(),
             ScriptPortCommand::GitBlobLines(args) => args.run(),
+            ScriptPortCommand::AffectedFiles(cmd) => cmd.run(),
             ScriptPortCommand::FleetCaptain(args) => args.run(),
             ScriptPortCommand::RoleToolPolicy(cmd) => cmd.run(),
             ScriptPortCommand::RuntimeLaunchEnv(args) => args.run(),
@@ -648,6 +675,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::MergeGroupCi(cmd) => cmd.run(),
             ScriptPortCommand::ForgeProbe(args) => args.run(),
             ScriptPortCommand::ResyncPin(cmd) => cmd.run(),
+            ScriptPortCommand::ResyncPayload(args) => args.run(),
         }
     }
 }
@@ -947,6 +975,13 @@ pub(crate) enum MergePrCommand {
     /// decision — see `cli::merge_pr_closed_building`.
     ClosedBuilding(super::merge_pr_closed_building::ClosedBuildingArgs),
 
+    /// Did THIS PR's merge close `--issue` (#8942)? The gate in front of
+    /// Champion Step 4's negated-reference reopen. Facts on stdin (the
+    /// `--print-query` GraphQL response and/or REST issue + pull objects);
+    /// exit 0 = yes, 1 = no, 3 = could not answer, each with one
+    /// `LOOM-CLOSED-BY-MERGE` line — see `cli::merge_pr_closed_by_merge`.
+    ClosedByMerge(super::merge_pr_closed_by_merge::ClosedByMergeArgs),
+
     /// The post-merge stacked-child reconcile PLAN (#3747 item 1): the
     /// parent-branch gate, the `[{number, headRefName}]` children-rollup parse
     /// (on stdin) and each child's derived issue number. Prints
@@ -1067,6 +1102,7 @@ impl MergePrCommand {
             MergePrCommand::PartialComment(args) => args.run(),
             MergePrCommand::ClassifyResponse(args) => args.run(),
             MergePrCommand::ClosedBuilding(args) => args.run(),
+            MergePrCommand::ClosedByMerge(args) => args.run(),
             MergePrCommand::ReconcilePlan(args) => args.run(),
             MergePrCommand::ReconcileChild(args) => args.run(),
             MergePrCommand::RetargetChildren(args) => args.run(),

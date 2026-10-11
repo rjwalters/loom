@@ -56,6 +56,7 @@
 //! installs nothing, and every rotation request there is refused.
 
 pub mod exec;
+pub mod observe;
 pub mod registry;
 pub mod rotate_client;
 pub mod rotation;
@@ -126,6 +127,10 @@ pub struct ProfileProxy {
     /// environment cannot be proxied by this slice; see the follow-ups.
     #[serde(default)]
     pub base_url_env: Vec<String>,
+    /// Opt this profile in to passive per-request telemetry (#11300). Takes
+    /// effect only when [`observe::enabled`] is also true; default off.
+    #[serde(default)]
+    pub observe: bool,
 }
 
 impl ProfileProxy {
@@ -218,10 +223,16 @@ impl std::fmt::Debug for Prepared {
 /// `Ok(None)` means "env-passthrough, unchanged" and is reached only when the
 /// feature is off or the profile declares no `credentialProxy`. Every other
 /// outcome is `Err`.
+///
+/// `runtime` is the launcher's already-resolved runtime (role binding, env,
+/// `runtimes.default` or built-in default — see
+/// `worker_spawn::resolve_launch_runtime`); observe-mode attribution uses it
+/// verbatim rather than rereading `LOOM_RUNTIME`.
 pub fn prepare(
     root: &std::path::Path,
     selection: &Selection,
     config: &Value,
+    runtime: &str,
 ) -> Result<Option<Prepared>, LaunchError> {
     if !enabled(config) {
         return Ok(None);
@@ -286,6 +297,12 @@ pub fn prepare(
             account,
             model_class: bad_marks::normalize_model_class(&selection.model),
         });
+    let observe = (declared.observe && observe::enabled(config)).then(|| {
+        let seat = pool_attribution
+            .as_ref()
+            .map_or("-", |attribution| attribution.account.as_str());
+        observe_context(runtime, selection, seat)
+    });
     arm(
         secret,
         provider,
@@ -294,8 +311,23 @@ pub fn prepare(
         &[source.as_str(), target.as_str()],
         vec![crate::api_keys_pool::paths::per_repo_api_keys_dir(root)],
         pool_attribution,
+        observe,
     )
     .map(Some)
+}
+
+/// Observe-mode tags for a launch on `runtime` (the launcher's resolved
+/// runtime, never reread from the environment) with `selection`'s profile.
+fn observe_context(runtime: &str, selection: &Selection, seat: &str) -> observe::ObserveContext {
+    let profile = selection
+        .profile
+        .clone()
+        .unwrap_or_else(|| selection.provider.clone());
+    let tap = match selection.profile.as_deref() {
+        Some(p) => crate::runtime_preference::Tap::with_profile(runtime, p),
+        None => crate::runtime_preference::Tap::runtime(runtime),
+    };
+    observe::ObserveContext::from_env(seat, &tap.to_string(), &profile, runtime)
 }
 
 /// The pool attribution [`arm`] needs so the proxy can bad-mark this launch's
@@ -320,6 +352,7 @@ struct PoolAttribution {
 /// `credential_names` are every environment variable the container might read
 /// the credential from: each is assigned the placeholder AND withheld from
 /// by-name forwarding.
+#[allow(clippy::too_many_arguments)] // one record shape; each argument is a distinct launch fact
 fn arm(
     secret: String,
     provider: String,
@@ -328,6 +361,7 @@ fn arm(
     credential_names: &[&str],
     mask_dirs: Vec<std::path::PathBuf>,
     pool_attribution: Option<PoolAttribution>,
+    observe: Option<observe::ObserveContext>,
 ) -> Result<Prepared, LaunchError> {
     let (bind_ip, container_host) = resolve_bind();
     let bound = server::Bound::bind(bind_ip).map_err(|e| {
@@ -346,6 +380,9 @@ fn arm(
             attribution.account,
             attribution.model_class,
         );
+    }
+    if let Some(context) = observe {
+        record = record.with_observe(context);
     }
     registry.insert(&placeholder, record);
 

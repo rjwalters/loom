@@ -1107,7 +1107,7 @@
       "applied_by": null,
       "removed_by": null,
       "park": false,
-      "skip": false,
+      "skip": true,
       "hold": false,
       "operator_gate": false,
       "blocked_colabel": false,

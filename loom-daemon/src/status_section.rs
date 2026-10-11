@@ -138,6 +138,7 @@ impl StatusSection {
                     "observability_host_id_mismatch",
                     "observability_export",
                     "observability_exports",
+                    "otlp_export",
                 ],
             ),
             S::ForgeEvents => ("forge_events", &["forge_events"]),

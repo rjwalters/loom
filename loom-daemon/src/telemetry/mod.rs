@@ -68,13 +68,15 @@ pub mod provenance;
 pub mod queue_snapshot;
 pub mod repo_identity;
 mod start_facts;
-pub use start_facts::{model_source, SweepStartFacts, SWEEP_START_FACT_LOG_ATTRIBUTE_KEYS};
+pub use start_facts::{
+    effort_source, model_source, SweepStartFacts, SWEEP_START_FACT_LOG_ATTRIBUTE_KEYS,
+};
 pub mod trace;
 pub mod visibility;
 pub use ci::{CiDurationRecord, CiJobLogRecord, CiJobRecord, CiRunRecord};
 pub use disposition::{
-    classify_disposition, DispositionSignals, IssueEndState, SweepDisposition,
-    NO_PHASE_SIGNAL_CLASS,
+    apply_noop_loop_class, classify_disposition, result_for_disposition, DispositionSignals,
+    IssueEndState, SweepDisposition, NO_PHASE_SIGNAL_CLASS,
 };
 pub use envelope::TelemetryEnvelope;
 pub use kinds::{
@@ -365,7 +367,12 @@ pub mod trigger {
     pub const STALE_BASE_REJUDGE: &str = "stale_base_rejudge";
     /// Dispatched to fix a CI failure.
     pub const CI_FAILURE_FIX: &str = "ci_failure_fix";
-    /// A human or external tool asked for this sweep.
+    /// Re-dispatch after the previous attempt succeeded: it landed, found the
+    /// work already done, or the Curator closed or rescoped the issue (Issue
+    /// #11429). Inferred from the journal; says nothing about who dispatched.
+    pub const REDISPATCH_AFTER_SUCCESS: &str = "redispatch_after_success";
+    /// A human or external tool asked for this sweep. Reserved for a dispatch
+    /// path that knows an operator acted; the journal inference never sets it.
     pub const OPERATOR_REDISPATCH: &str = "operator_redispatch";
     /// The dispatch reason was not observable. Counted, never silently merged.
     pub const UNKNOWN: &str = "unknown";
@@ -1650,6 +1657,11 @@ pub struct HostHealthRecord {
     /// empty-is-unknown and `#[serde(default)]` contract as `exported_kinds`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exporters: Vec<String>,
+    /// Whether this daemon exports OTLP (Issue #11353):
+    /// `no_exporter` / `failing` / `ok` / `exempt` (+ detail). `None` means
+    /// "not reported" (a pre-#11353 daemon), never "ok".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub otlp_export: Option<crate::observability::otlp_health::OtlpExportHealth>,
     /// This host's memory/pressure readings at the sampling moment — the
     /// "deferred vs killed vs timed out" slice (RAM, compressed memory,
     /// swap and its rates, PSI class, kernel OOM counter) — see

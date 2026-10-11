@@ -18,8 +18,15 @@
 //!   exhaustion, rate limit, cancel) from "the work was hard" (Judge rejected,
 //!   Doctor loop exhausted).
 //!
-//! [`SweepDisposition`] is that missing axis. It is **additive**: `result` is
-//! unchanged and still emitted, so every existing consumer keeps working.
+//! [`SweepDisposition`] is that missing axis. It does not replace `result`,
+//! which is still emitted. Since Issue #11429 the `sweep.outcome` `result` is
+//! derived from both ([`result_for_disposition`]): a `failure` is reported as
+//! `success` when the disposition is `noop_already_done`, or `landed` with no
+//! rejection or rework signal (the Judge approved and never requested
+//! changes, and no classifier labelled a crash, death or exhausted Doctor
+//! loop). A `landed` sweep with such a signal stays `failure`. The paired
+//! `sweep.completed` record and `sweep-outcomes.jsonl` keep the process
+//! result.
 //!
 //! # A derivation, not new instrumentation
 //!
@@ -235,6 +242,17 @@ impl DispositionSignals<'_> {
             .is_some_and(|v| v.iter().any(|verdict| verdict.verdict == "fail"))
     }
 
+    /// Whether a PR landed with no rejection or rework signal: the Judge
+    /// approved it and never requested changes, and no classifier labelled
+    /// the transition (a crash, a death or an exhausted Doctor loop). Unread
+    /// Judge verdicts are not proof of a clean landing.
+    fn landed_clean(&self) -> bool {
+        let approved_only = self
+            .judge_verdicts
+            .is_some_and(|v| !v.is_empty() && v.iter().all(|verdict| verdict.verdict == "pass"));
+        approved_only && self.failure_class.is_none()
+    }
+
     /// Whether the Doctor loop ran at least once.
     fn doctor_looped(&self) -> bool {
         self.doctor_cycles.is_some_and(|cycles| cycles > 0)
@@ -263,6 +281,46 @@ impl DispositionSignals<'_> {
                 .copied()
                 .unwrap_or("other"),
         )
+    }
+}
+
+/// Re-class an `unclassified:after-curator` stop that belongs to a no-op loop
+/// (Issue #10156) as `loop_class` (`noop-loop:human-gate` /
+/// `noop-loop:blocked`). Anything else — another disposition, another class,
+/// or no loop — passes through, so a first-time Curator-only stop stays
+/// `after-curator`.
+#[must_use]
+pub fn apply_noop_loop_class(
+    disposition: SweepDisposition,
+    class: Option<String>,
+    loop_class: Option<&str>,
+) -> Option<String> {
+    match (disposition, class.as_deref(), loop_class) {
+        (SweepDisposition::Unknown, Some("unclassified:after-curator"), Some(lc)) => {
+            Some(lc.to_string())
+        }
+        _ => class,
+    }
+}
+
+/// The `result` a `sweep.outcome` reports (Issue #11429). A `failure` becomes
+/// `success` only for `noop_already_done`, and for a `landed` sweep with no
+/// rejection or rework signal ([`DispositionSignals::landed_clean`]). Every
+/// other combination keeps the process result.
+#[must_use]
+pub fn result_for_disposition(
+    signals: &DispositionSignals<'_>,
+    disposition: SweepDisposition,
+) -> SweepResult {
+    let clean = match disposition {
+        SweepDisposition::NoopAlreadyDone => true,
+        SweepDisposition::Landed => signals.landed_clean(),
+        _ => false,
+    };
+    if signals.result == SweepResult::Failure && clean {
+        SweepResult::Success
+    } else {
+        signals.result
     }
 }
 
@@ -846,6 +904,112 @@ mod tests {
         let (disposition, class) = classify_disposition(&signals);
         assert_eq!(disposition, SweepDisposition::Unknown);
         assert_eq!(class.as_deref(), Some("unclassified:no-phase-signal"));
+    }
+
+    #[test]
+    fn noop_loop_reclasses_only_the_after_curator_stop() {
+        let signals = DispositionSignals {
+            phase_durations: &phases(&["curator"]),
+            total_duration_sec: 400,
+            ..base(SweepResult::Failure)
+        };
+        let (disposition, class) = classify_disposition(&signals);
+        assert_eq!(class.as_deref(), Some("unclassified:after-curator"));
+        let none = apply_noop_loop_class(disposition, class.clone(), None);
+        assert_eq!(none.as_deref(), Some("unclassified:after-curator"));
+        let looped = apply_noop_loop_class(disposition, class, Some("noop-loop:human-gate"));
+        assert_eq!(looped.as_deref(), Some("noop-loop:human-gate"));
+        // A different class is never overwritten.
+        let other = apply_noop_loop_class(
+            SweepDisposition::Unknown,
+            Some("unclassified:after-builder".into()),
+            Some("noop-loop:blocked"),
+        );
+        assert_eq!(other.as_deref(), Some("unclassified:after-builder"));
+    }
+
+    fn reported(signals: &DispositionSignals<'_>) -> (SweepDisposition, SweepResult) {
+        let (disposition, _) = classify_disposition(signals);
+        (disposition, result_for_disposition(signals, disposition))
+    }
+
+    /// Issue #11429: a clean landing (approved, never rejected, no classifier
+    /// label) is a `success` even when the process exited non-zero.
+    #[test]
+    fn a_clean_landing_reports_success() {
+        let judged = phases(&["builder", "judge", "merge"]);
+        let approved = verdicts(&["pass"]);
+        let landed = DispositionSignals {
+            pr_number: Some(149),
+            phase_durations: &judged,
+            total_duration_sec: 900,
+            judge_verdicts: Some(&approved),
+            ..base(SweepResult::Failure)
+        };
+        assert_eq!(reported(&landed), (SweepDisposition::Landed, SweepResult::Success));
+    }
+
+    /// Issue #11429: a landed PR with a rejection or rework signal stays a
+    /// `failure`: a Judge rejection (even one the Doctor later fixed), a
+    /// classifier label, or Judge verdicts that were never read.
+    #[test]
+    fn a_landing_with_a_rejection_signal_stays_failure() {
+        let judged = phases(&["builder", "judge", "doctor"]);
+        let rejected = verdicts(&["fail"]);
+        let reworked = verdicts(&["fail", "pass"]);
+        let approved = verdicts(&["pass"]);
+        let landed = |judge_verdicts, failure_class| DispositionSignals {
+            pr_number: Some(149),
+            phase_durations: &judged,
+            total_duration_sec: 900,
+            judge_verdicts,
+            failure_class,
+            ..base(SweepResult::Failure)
+        };
+        for signals in [
+            landed(Some(&rejected), None),
+            landed(Some(&reworked), None),
+            landed(Some(&approved), Some("doctor-cycles-exhausted")),
+            landed(Some(&[]), None),
+            landed(None, None),
+        ] {
+            assert_eq!(
+                reported(&signals),
+                (SweepDisposition::Landed, SweepResult::Failure),
+                "{signals:?}"
+            );
+        }
+    }
+
+    /// Issue #11429: `noop_already_done` is always a `success`; other
+    /// dispositions keep the process result, and a cancel stays `cancelled`.
+    #[test]
+    fn already_done_reports_success_and_other_results_are_kept() {
+        let already_done = DispositionSignals {
+            issue_end_state: Some(IssueEndState::ClosedBeforeDispatch),
+            ..base(SweepResult::Failure)
+        };
+        assert_eq!(
+            reported(&already_done),
+            (SweepDisposition::NoopAlreadyDone, SweepResult::Success)
+        );
+        let judged = phases(&["builder", "judge"]);
+        let substantive = DispositionSignals {
+            phase_durations: &judged,
+            total_duration_sec: 900,
+            ..base(SweepResult::Failure)
+        };
+        assert_eq!(
+            reported(&substantive),
+            (SweepDisposition::SubstantiveFailure, SweepResult::Failure)
+        );
+        let approved = verdicts(&["pass"]);
+        let cancelled = DispositionSignals {
+            pr_number: Some(149),
+            judge_verdicts: Some(&approved),
+            ..base(SweepResult::Cancelled)
+        };
+        assert_eq!(reported(&cancelled), (SweepDisposition::Landed, SweepResult::Cancelled));
     }
 
     /// The 2,810-record shape: stopped after the Curator, with no forge

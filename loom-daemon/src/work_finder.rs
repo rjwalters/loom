@@ -228,12 +228,14 @@ pub const DEFAULT_MAX_ADMISSIONS_PER_TICK: usize = 3;
 /// config). See [`resolve_extra_skip_labels_with_config`].
 pub const WORK_FINDER_EXTRA_SKIP_LABELS_ENV: &str = "LOOM_WORK_FINDER_EXTRA_SKIP_LABELS";
 
+pub mod affected_files;
 pub mod build_backoff;
 pub mod dispatch_plan;
 pub mod dispatch_plan_merge;
 pub mod halt_cause;
 mod labels;
 pub mod main_red_fix;
+pub mod open_pr_prefilter;
 pub mod operator_priority;
 mod ordering;
 pub mod ready_queue;
@@ -241,6 +243,7 @@ mod recheck_interval;
 mod tick_line;
 mod tick_report;
 mod tick_summary;
+pub mod workspace_draw;
 use crate::types::QueueDisposition as Qd;
 pub use labels::{BUILDING_LABEL, OPERATOR_HOLD_LABEL, PARK_LABELS, SKIP_LABELS};
 pub use main_red_fix::RedMainLane;
@@ -793,6 +796,17 @@ pub trait WorkDispatcher {
         self.dispatch(issue, complexity)
     }
 
+    /// The batched open-PR pre-filter (#8865, [`open_pr_prefilter`]): the
+    /// issues in `candidates` with a VERIFIED open linked PR, each mapped to
+    /// that PR. Asked at most once per workspace per tick; the multi-workspace
+    /// tick skips those candidates without calling
+    /// [`dispatch_with`](Self::dispatch_with). It can only remove candidates:
+    /// anything not verified (unreadable listing included) must be left out,
+    /// and still meets `dispatch()`'s own open-PR guard. Defaults to empty.
+    fn open_pr_blocked(&self, _candidates: &[u32]) -> HashMap<u32, u32> {
+        HashMap::new()
+    }
+
     /// Whether a live sweep on this host is already marked `overflow`
     /// (#9244): the [`OverflowSlot`] is then taken for the whole tick.
     /// Defaults to `false`.
@@ -1247,8 +1261,8 @@ pub fn tick_with_lanes(
         }
         // 3. Fixed concurrency cap — defer the rest to a future tick, unless
         //    this starred issue can take the host's overflow slot (#9244).
-        let over =
-            occupancy >= max_concurrent && overflow.admits(item.is_operator_priority(), occupancy);
+        let over = occupancy >= max_concurrent
+            && overflow.admits(item.is_operator_priority() || item.is_very_important(), occupancy);
         if occupancy >= max_concurrent && !over {
             report.deferred_capacity += 1;
             continue;
@@ -1332,16 +1346,14 @@ pub fn tick_with_lanes(
 /// workspace `i`'s dispatch tier (lower = higher priority; a missing entry
 /// defaults to [`crate::workspace_registry::DEFAULT_WORKSPACE_PRIORITY`]).
 /// Rather than dispatching each workspace's backlog in registration order, this
-/// gathers every eligible candidate across all workspaces into one queue, sorts
-/// it by [`candidate_cmp`] — **(starred first, starred-at, red-main fix,
-/// workspace priority asc, issue age asc, number asc)** (#9244) — and then
-/// fills the single shared concurrency budget in that global order. So a deep, old product-repo backlog never
-/// starves a small higher-priority tool repo: the tool repo's candidates are
-/// dispatched first even though the product repo has older / more work. The
-/// cap/budget mechanics are unchanged — this only orders the queue.
-///
-/// Strict priority is intentional (v1): a permanently-full higher tier starves
-/// lower tiers. Fairness reservations are an explicit follow-up.
+/// gathers every eligible candidate across all workspaces and orders them by
+/// **weighted workspace draws** ([`workspace_draw`], #11103): each draw picks a
+/// workspace at random weighted by its priority (a workspace with
+/// `loom:very-important` work next wins), then takes that workspace's next
+/// candidate by level, oldest `createdAt`, number. The single shared
+/// concurrency budget is filled in that order, so a higher-priority tool repo
+/// is usually served first without a permanently-full tier starving the rest.
+/// The cap/budget mechanics are unchanged — this only orders the queue.
 /// Compute, per root (parallel to `roots`), whether the work-finder should hold
 /// new dispatch off that root this tick — the `halted` slice `tick_multi`
 /// consumes.
@@ -1515,7 +1527,7 @@ pub fn tick_multi_with_saturation_brake<S: WorkSource, D: WorkDispatcher>(
 /// The per-repo counter is seeded from each dispatcher's OWN
 /// [`WorkDispatcher::occupancy`] — the same per-repo value this function
 /// already sums for its global seed — so it costs no extra forge/registry
-/// reads. [`candidate_cmp`] is untouched.
+/// reads. The workspace-draw order ([`workspace_draw`]) is untouched.
 ///
 /// # Repo-sharding slice preference (#6243)
 ///
@@ -1525,9 +1537,9 @@ pub fn tick_multi_with_saturation_brake<S: WorkSource, D: WorkDispatcher>(
 /// [`crate::role_shard::decide`]'s `owned` verdict per root, see
 /// [`spawn_multi_work_finder_task`]).
 ///
-/// The already-globally-sorted candidate list (by [`candidate_cmp`]) is split
+/// The already-ordered candidate list (by [`workspace_draw`]) is split
 /// into in-slice / out-of-slice while preserving each partition's relative
-/// order, so `candidate_cmp`'s ordering guarantees hold WITHIN either
+/// order, so the draw order holds WITHIN either
 /// partition unchanged. Out-of-slice candidates are dispatched THIS TICK only
 /// when the slice was completely empty at the top of the tick
 /// (work-conservation, #6243's AC) — never interleaved by priority with
@@ -1824,6 +1836,7 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
         let now = chrono::Utc::now();
 
         for item in ready {
+            cap.note_surface(idx, &item, in_flight.contains(&item.number));
             let key = ready_queue::key_of(idx, workspace_priority, &item, red);
             // `held_until` (Issue #9311): `None` for every disposition but
             // the five time-boxed holds below, which pass their computed
@@ -1958,13 +1971,13 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
         }
     }
 
-    // Global priority sort (#3946, #9244): starred, starred-at, red-main fix,
-    // workspace priority, age, number.
-    candidates.sort_by(candidate_cmp);
+    // Workspace-first order (#11103): weighted workspace draws, each placing
+    // the drawn workspace's next candidate (level, oldest, number).
+    let candidates = workspace_draw::order(candidates, priorities, &mut report);
 
     // Candidate-list shaping (`repo_cap::shape_queue`): the #6243 repo-sharding
     // slice partition, then #9090's track-affinity partition. Both are stable
-    // partitions of the ALREADY-sorted list, so `candidate_cmp` still decides
+    // partitions of the ALREADY-drawn list, so the draw order still decides
     // order within each group; with `preferred_slice: None` and no per-repo cap
     // the list is byte-for-byte unchanged, and every pre-#6243/#9090
     // priority-ordering test stays exactly as it was.
@@ -1974,6 +1987,9 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
     // like `occupancy` — see `tick_with_admission_cap`'s single-workspace
     // analogue for the full rationale.
     let mut admitted_this_tick: usize = 0;
+    // #8865: one open-PR listing read per workspace answers for all of its
+    // candidates, lazily at the first one to reach the dispatch point.
+    let mut open_prs = open_pr_prefilter::OpenPrPrefilter::new(&candidates);
 
     // Pass 2 (mutable dispatcher calls): fill the single shared concurrency
     // budget in the sorted global order, routing each candidate back to its
@@ -2000,7 +2016,7 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
         // per-repo cap may take the host's single over-limit slot. The ramp cap
         // is not a queue limit, so it still applies (checked below).
         let over = (occupancy >= max_concurrent || cap.at_cap(cand.workspace_idx))
-            && overflow.admits(cand.operator_priority, occupancy);
+            && overflow.admits(cand.operator_priority || cand.is_very_important(), occupancy);
         // Shared global cap across all workspaces — defer once the combined
         // occupancy hits the budget, regardless of which workspace still has
         // ready items.
@@ -2025,15 +2041,10 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
             continue;
         }
         let dispatcher = &mut workspaces[cand.workspace_idx].1;
-        let started = chrono::Utc::now();
-        let outcome = dispatcher.dispatch_with(cand.number, cand.complexity.as_deref(), over);
-        let (disposition, mut detail) = record_dispatch_outcome(
-            &mut report,
-            cand.number,
-            cand.workspace_idx,
-            started,
-            &outcome,
-        );
+        // A candidate with a verified open linked PR is resolved `OpenPr`
+        // here without a dispatch attempt; every other one is dispatched and
+        // counted (`record_dispatch_outcome`) exactly as before (#8865).
+        let (disposition, mut detail) = open_prs.dispatch(dispatcher, &cand, over, &mut report);
         if disposition == Qd::Dispatched && over {
             overflow.take(&mut report);
             detail = Some("overflow".to_string());
@@ -2042,7 +2053,7 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
         if disposition == Qd::Dispatched {
             occupancy += 1;
             admitted_this_tick += 1;
-            cap.admit(cand.workspace_idx);
+            cap.admit_candidate(&cand);
         }
     }
 
