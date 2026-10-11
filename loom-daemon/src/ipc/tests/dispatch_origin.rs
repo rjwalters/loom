@@ -31,6 +31,8 @@ fn dispatch_request(issue: u32, dispatch_origin: Option<DispatchOrigin>) -> Requ
         depends_on: None,
         workspace_root: None,
         force: false,
+        runtime: None,
+        model_profile: None,
         dispatch_origin,
     }
 }
@@ -77,6 +79,8 @@ async fn nonblocking_ipc_dispatch_records_the_operator_origin() {
         None,
         None,
         false,
+        None,
+        None,
         DispatchOrigin::from_request(Some(DispatchOrigin::Operator)),
     )
     .await;

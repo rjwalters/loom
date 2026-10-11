@@ -5205,6 +5205,9 @@ fn dispatch_sweep_runtime_and_profile_are_wire_compatible() {
         force: false,
         runtime: Some("opencode".into()),
         model_profile: Some("zai-flash".into()),
+        // `skip_serializing_if` keeps this off the wire, so the round trip
+        // still exercises the exact legacy payload shape.
+        dispatch_origin: None,
     };
     let round: Request = serde_json::from_str(&serde_json::to_string(&tapped).unwrap()).unwrap();
     match round {
