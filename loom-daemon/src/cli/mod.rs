@@ -20,6 +20,7 @@ pub(crate) mod whole_cli_parse;
 pub(crate) mod accounts;
 pub(crate) mod accounts_args;
 pub(crate) mod accounts_session;
+mod affected_files_check;
 mod agent_skills;
 pub(crate) mod api_keys;
 pub(crate) mod attend_hook;

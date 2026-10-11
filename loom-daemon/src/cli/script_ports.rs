@@ -393,6 +393,13 @@ pub(crate) enum ScriptPortCommand {
     /// `contract`-category script per the shell language policy.
     GitBlobLines(super::git_blob_lines::GitBlobLinesArgs),
 
+    /// Curator's Affected-Files preflight (#9400): `affected-files check`
+    /// classifies each listed path against the build base. Not a port: it
+    /// replaces a bash loop inlined in the Curator prompt, which parked every
+    /// issue that listed a file it creates.
+    #[command(subcommand)]
+    AffectedFiles(super::affected_files_check::AffectedFilesCommand),
+
     /// The fleet singleton-job captain gate (#8848), shell-facing half: is
     /// THIS host the one declared to run `<job-name>`? Exit 0 arm, 3 another
     /// host is the captain, 4 no `fleet.captain` declared at all — three
@@ -648,6 +655,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::ReconcileStack(args) => args.run(),
             ScriptPortCommand::GenerateAgentSkills(args) => args.run(),
             ScriptPortCommand::GitBlobLines(args) => args.run(),
+            ScriptPortCommand::AffectedFiles(cmd) => cmd.run(),
             ScriptPortCommand::FleetCaptain(args) => args.run(),
             ScriptPortCommand::RoleToolPolicy(cmd) => cmd.run(),
             ScriptPortCommand::RuntimeLaunchEnv(args) => args.run(),
