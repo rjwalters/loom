@@ -64,6 +64,13 @@ pub(crate) struct ReplayArgs {
           value_parser = clap::value_parser!(u32).range(1..))]
     pub step_sec: u32,
 
+    /// The instant the store's knowable-at column
+    /// (`inserted_at_unix_milli`) began to hold real insert times, i.e. the
+    /// store owner's ALTER instant (RFC 3339). A replay at an instant before
+    /// it reports `unknown` (`no_knowable_at`). Required for a live read.
+    #[arg(long, value_name = "RFC3339")]
+    pub knowable_since: Option<String>,
+
     /// Lookback for each host's base anchor and its chain, in seconds.
     #[arg(long, value_name = "SECONDS", default_value_t = DEFAULT_WINDOW_SEC)]
     pub window_sec: u32,
@@ -127,6 +134,7 @@ impl ReplayArgs {
             as_of,
             window_sec: self.window_sec,
             repo: self.repo.trim().to_string(),
+            knowable_since: self.knowable_since()?,
         };
         let replay = match &self.from_file {
             Some(path) => {
@@ -134,7 +142,17 @@ impl ReplayArgs {
                     .map_err(|e| anyhow!("could not read {}: {e}", path.display()))?;
                 telemetry_replay::assemble_export(&params, &export).map_err(|e| anyhow!(e))?
             }
-            None => telemetry_replay::fetch(&self.http()?, &params).map_err(|e| anyhow!(e))?,
+            None => {
+                if params.knowable_since.is_none() {
+                    bail!("{}", telemetry_replay::MISSING_KNOWABLE_SINCE);
+                }
+                let http = self.http()?;
+                if let Err(why) = telemetry_replay::preflight(&http) {
+                    eprintln!("[telemetry-replay] {why}");
+                    std::process::exit(EXIT_UNREADABLE);
+                }
+                telemetry_replay::fetch(&http, &params).map_err(|e| anyhow!(e))?
+            }
         };
         if self.json {
             println!("{}", serde_json::to_string_pretty(&replay)?);
@@ -163,6 +181,10 @@ impl ReplayArgs {
                 as_of,
                 window_sec: self.window_sec,
                 repo: self.repo.trim().to_string(),
+                knowable_since: self.knowable_since().unwrap_or_else(|e| {
+                    eprintln!("[telemetry-replay] {e}");
+                    std::process::exit(EXIT_UNREADABLE);
+                }),
             },
             span_sec: self.span_sec,
             step_sec: self.step_sec,
@@ -172,15 +194,20 @@ impl ReplayArgs {
             Some(path) => std::fs::read_to_string(path)
                 .map_err(|e| format!("could not read {}: {e}", path.display()))
                 .and_then(|export| check::assemble_export(&params, &export)),
-            None => self
-                .http()
-                .map_err(|e| e.to_string())
-                .and_then(|http| check::fetch(&http, &params)),
+            None => self.http().map_err(|e| e.to_string()).and_then(|http| {
+                // Preflight the knowable-at column: never the raw ClickHouse error.
+                telemetry_replay::preflight(&http)?;
+                check::fetch(&http, &params)
+            }),
         };
         let checked = match result {
             Ok(checked) => checked,
             Err(why) => {
-                eprintln!("[telemetry-replay] --check could not read the store: {why}");
+                if why.starts_with("knowable-at column") {
+                    eprintln!("[telemetry-replay] {why}");
+                } else {
+                    eprintln!("[telemetry-replay] --check could not read the store: {why}");
+                }
                 std::process::exit(EXIT_UNREADABLE);
             }
         };
@@ -190,6 +217,17 @@ impl ReplayArgs {
             print!("{}", check::render(&checked));
         }
         std::process::exit(checked.exit_code());
+    }
+
+    fn knowable_since(&self) -> Result<Option<DateTime<Utc>>> {
+        self.knowable_since
+            .as_deref()
+            .map(|raw| {
+                DateTime::parse_from_rfc3339(raw)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .map_err(|e| anyhow!("invalid --knowable-since {raw:?}: {e}"))
+            })
+            .transpose()
     }
 
     fn http(&self) -> Result<ClickhouseHttp> {

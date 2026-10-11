@@ -5,13 +5,24 @@
 -- Question answered: what did the fleet look like at instant `t`, as a daemon
 -- running at `t` could have known it?
 --
--- Knowable-at: every membership filter below is on `created_at`, SigNoz's own
--- insert clock on signoz_logs.distributed_logs_v2 (see session-output.md,
--- "Querying end-to-end latency"). It is NEVER `timestamp` (event time) and
--- never the producer's `observed_timestamp`: a record delayed in the export
--- queue claims an early producer value. Event time orders and groups rows
--- inside a reconstruction; it does not decide membership. Whether `created_at`
--- is never earlier than `observed_timestamp` is checked by query 0 below.
+-- Knowable-at: every membership filter below is on `inserted_at_unix_milli`
+-- (Int64, epoch milliseconds), the backend-side insert clock on
+-- signoz_logs.distributed_logs_v2 (and logs_v2), the same column SigNoz keeps
+-- on its metrics tables. It is exposed to each query as the `knowable_at`
+-- alias, `fromUnixTimestamp64Milli(inserted_at_unix_milli)`, defined once per
+-- query. It is NEVER `timestamp` (event time) and never the producer's
+-- `observed_timestamp`: a record delayed in the export queue claims an early
+-- producer value. Event time orders and groups rows inside a reconstruction;
+-- it does not decide membership. Whether `knowable_at` is never earlier than
+-- `observed_timestamp` is checked by query 0 below.
+--
+-- The column is not part of SigNoz's stock logs schema: the harness-ops store
+-- owner adds it (`ALTER TABLE ... ADD COLUMN IF NOT EXISTS inserted_at_unix_milli
+-- Int64 DEFAULT toUnixTimestamp64Milli(now64(3))`; telemetry-replay.md). A row
+-- that predates the ALTER has no stored value; the read-time DEFAULT says
+-- "knowable now", which never leaks into the past. An instant `t` earlier than
+-- the ALTER instant (parameter `knowable_since`) is therefore UNKNOWN, with
+-- reason `no_knowable_at`, never reconstructed from `observed_timestamp`.
 --
 -- Duplicates: delivery is at least once. Deliveries dedupe on
 -- `loom.record_id` (`LIMIT 1 BY`, earliest knowable-at kept). Outcome facts
@@ -39,12 +50,18 @@
 --                          the state at t only; bind 0 for them.
 --   step    UInt32         seconds between sample instants (any value >= 1
 --                          when span = 0; 300 = one fleet.state pass)
+--   knowable_since DateTime64(3)  the instant the knowable-at column began to
+--                          hold real insert times (the ALTER instant). An
+--                          instant t before it is `no_knowable_at`
 --   threshold UInt32       queries 6-7: seconds a covered host may disagree
 --                          with the forge before the check fails (600)
 
 -- 0. Verify the knowable-at column on the live store. Second column must be 0.
+--    (`telemetry-replay` first checks `system.columns` for the column and exits
+--    2 if it is absent; run this on a store where it is present.)
+WITH fromUnixTimestamp64Milli(inserted_at_unix_milli) AS knowable_at
 SELECT count() AS rows,
-       countIf(created_at < fromUnixTimestamp64Nano(toInt64(observed_timestamp))) AS earlier_than_observed
+       countIf(knowable_at < fromUnixTimestamp64Nano(toInt64(observed_timestamp))) AS earlier_than_observed
 FROM signoz_logs.distributed_logs_v2
 WHERE timestamp > toUnixTimestamp64Nano(now64(9) - INTERVAL 1 DAY);
 
@@ -91,21 +108,22 @@ fleet_logs AS (                 -- fleet.state log records (chunks) any instant 
            toUInt32(attributes_number['loom.fleet.chunk_index'])          AS chunk_index,
            greatest(toUInt32(attributes_number['loom.fleet.chunk_count']), 1) AS chunk_count,
            JSONExtractArrayRaw(body, 'repos')                             AS repos,
-           created_at
+           fromUnixTimestamp64Milli(inserted_at_unix_milli)               AS knowable_at
     FROM signoz_logs.distributed_logs_v2
     WHERE attributes_string['loom.kind'] = 'fleet.state'
-      AND created_at < {t:DateTime64(3)}                  -- knowable-at, not event time
-      AND created_at >= {t:DateTime64(3)} - toIntervalSecond({span:UInt32} + {window:UInt32})
+      AND knowable_at < {t:DateTime64(3)}                 -- knowable-at, not event time
+      AND knowable_at >= {t:DateTime64(3)} - toIntervalSecond({span:UInt32} + {window:UInt32})
 ),
 recs AS (                       -- per instant: delivered records knowable before it, deduped
     SELECT s.t AS t, l.emitter AS emitter, l.record_id AS record_id, l.is_anchor AS is_anchor,
            l.as_of AS as_of, l.anchor_as_of AS anchor_as_of, l.prev_as_of AS prev_as_of,
            l.chunk_index AS chunk_index, l.chunk_count AS chunk_count, l.repos AS repos,
-           l.created_at AS created_at
+           l.knowable_at AS knowable_at
     FROM fleet_logs l CROSS JOIN samples s
-    WHERE l.created_at < s.t                              -- knowable-at, not event time
-      AND l.created_at >= s.t - toIntervalSecond({window:UInt32})
-    ORDER BY created_at
+    WHERE l.knowable_at < s.t                             -- knowable-at, not event time
+      AND l.knowable_at >= s.t - toIntervalSecond({window:UInt32})
+      AND s.t >= {knowable_since:DateTime64(3)}           -- before the column existed: no_knowable_at
+    ORDER BY knowable_at
     LIMIT 1 BY t, record_id
 ),
 records AS (                    -- one row per logical record, chunks reassembled
@@ -214,33 +232,38 @@ ORDER BY distinct_stages DESC, entered_at_spread_sec DESC;
 --    "unknown", not "nothing happened". `no_anchor` means no `fleet.state`
 --    record inside `window`. `anchor_age_sec` and `last_as_of` show how stale
 --    the base anchor and the chain's newest record are. Prepend the replay
---    prefix.
+--    prefix. `no_knowable_at` (instead of `no_anchor`) means `t` is before the
+--    knowable-at column existed; nothing about that instant can be rebuilt.
 SELECT k.emitter                                             AS emitter,
-       if(s.emitter = '', 'no_anchor', s.state)              AS state,
+       if(s.emitter = '',
+          if({t:DateTime64(3)} < {knowable_since:DateTime64(3)}, 'no_knowable_at', 'no_anchor'),
+          s.state)                                           AS state,
        s.emitter != '' AND s.state = 'complete'              AS covered,
        if(s.emitter = '', NULL, s.base)                      AS anchor_as_of,
        if(s.emitter = '', NULL, s.last_as_of)                AS last_as_of,
        if(s.emitter = '', NULL, dateDiff('second', s.base, {t:DateTime64(3)})) AS anchor_age_sec
 FROM (
+    WITH fromUnixTimestamp64Milli(inserted_at_unix_milli) AS knowable_at
     SELECT DISTINCT resources_string['host.name'] AS emitter
     FROM signoz_logs.distributed_logs_v2
     WHERE attributes_string['loom.kind'] IN ('fleet.state', 'host.health')
-      AND created_at < {t:DateTime64(3)}
-      AND created_at >= {t:DateTime64(3)} - INTERVAL 1 DAY
+      AND knowable_at < {t:DateTime64(3)}
+      AND knowable_at >= {t:DateTime64(3)} - INTERVAL 1 DAY
 ) k
 LEFT JOIN (SELECT * FROM status WHERE t = {t:DateTime64(3)}) s ON k.emitter = s.emitter
 ORDER BY emitter;
 
 -- 4. Volume and anchor completeness (last 7 days; no row cap).
 --    (a) bytes and rows per day, rows per anchor.
-SELECT toDate(created_at)                              AS day,
+WITH fromUnixTimestamp64Milli(inserted_at_unix_milli) AS knowable_at
+SELECT toDate(knowable_at)                             AS day,
        count()                                         AS rows,
        sum(length(body))                               AS body_bytes,
        countIf(JSONExtractBool(body, 'anchor'))        AS anchors,
        round(count() / nullIf(countIf(JSONExtractBool(body, 'anchor')), 0), 2) AS rows_per_anchor
 FROM signoz_logs.distributed_logs_v2
 WHERE attributes_string['loom.kind'] = 'fleet.state'
-  AND created_at > now64(3) - INTERVAL 7 DAY
+  AND knowable_at > now64(3) - INTERVAL 7 DAY
 GROUP BY day ORDER BY day;
 
 --    (b) records (anchors and deltas) whose received chunks differ from
@@ -248,6 +271,7 @@ GROUP BY day ORDER BY day;
 --    delta: the replay prefix marks its host `incomplete_anchor` or
 --    `incomplete_delta`. Chunk attributes are provisional until #10283 settles
 --    the names.
+WITH fromUnixTimestamp64Milli(inserted_at_unix_milli) AS knowable_at
 SELECT resources_string['host.name']                       AS emitter,
        JSONExtractString(body, 'as_of')                    AS as_of,
        any(JSONExtractBool(body, 'anchor'))                AS anchor,
@@ -255,24 +279,26 @@ SELECT resources_string['host.name']                       AS emitter,
        uniqExact(attributes_number['loom.fleet.chunk_index']) AS chunks_received
 FROM signoz_logs.distributed_logs_v2
 WHERE attributes_string['loom.kind'] = 'fleet.state'
-  AND created_at > now64(3) - INTERVAL 7 DAY
+  AND knowable_at > now64(3) - INTERVAL 7 DAY
 GROUP BY emitter, as_of
 HAVING chunk_count > 0 AND chunks_received != chunk_count
 ORDER BY as_of DESC;
 
 --    (c) hosts that sent no anchor in the last 2 hours.
 SELECT emitter FROM (
+    WITH fromUnixTimestamp64Milli(inserted_at_unix_milli) AS knowable_at
     SELECT DISTINCT resources_string['host.name'] AS emitter
     FROM signoz_logs.distributed_logs_v2
     WHERE attributes_string['loom.kind'] IN ('fleet.state', 'host.health')
-      AND created_at > now64(3) - INTERVAL 7 DAY
+      AND knowable_at > now64(3) - INTERVAL 7 DAY
 ) known
 WHERE emitter NOT IN (
+    WITH fromUnixTimestamp64Milli(inserted_at_unix_milli) AS knowable_at
     SELECT resources_string['host.name']
     FROM signoz_logs.distributed_logs_v2
     WHERE attributes_string['loom.kind'] = 'fleet.state'
       AND JSONExtractBool(body, 'anchor')
-      AND created_at > now64(3) - INTERVAL 2 HOUR
+      AND knowable_at > now64(3) - INTERVAL 2 HOUR
 )
 ORDER BY emitter;
 
@@ -282,17 +308,18 @@ ORDER BY emitter;
 --    corroborates it, and a missing webhook row is not a missing outcome.
 --    A record with no forge instant carries no fact id and is not returned
 --    here; see telemetry-replay.md "No forge instant, no fact id" (#11126).
+WITH fromUnixTimestamp64Milli(inserted_at_unix_milli) AS knowable_at
 SELECT attributes_string['loom.kind']    AS kind,
        attributes_string['loom.fact_id'] AS fact_id,
        attributes_string['loom.repo']    AS repo,
        fromUnixTimestamp64Nano(toInt64(timestamp)) AS event_time,
-       created_at                        AS knowable_at
+       knowable_at
 FROM signoz_logs.distributed_logs_v2
 WHERE attributes_string['loom.kind'] IN ('pr.resolved', 'eta.stage_outcome')
   AND attributes_string['loom.fact_id'] != ''
-  AND created_at < {t:DateTime64(3)}
+  AND knowable_at < {t:DateTime64(3)}
   AND ({repo:String} = '' OR attributes_string['loom.repo'] = {repo:String})
-ORDER BY created_at
+ORDER BY knowable_at
 LIMIT 1 BY attributes_string['loom.fact_id'];
 
 -- Agreement with the forge (#10196 R7, #11128): queries 6 and 7.
@@ -456,15 +483,18 @@ runs AS (                       -- each disagreement: a run of consecutive cover
     GROUP BY emitter, repo, issue, pr, island
 ),
 hosts AS (                      -- every host seen in the last day before the first instant
+    WITH fromUnixTimestamp64Milli(inserted_at_unix_milli) AS knowable_at
     SELECT DISTINCT resources_string['host.name'] AS emitter
     FROM signoz_logs.distributed_logs_v2
     WHERE attributes_string['loom.kind'] IN ('fleet.state', 'host.health')
-      AND created_at < {t:DateTime64(3)}
-      AND created_at >= {t:DateTime64(3)} - toIntervalSecond({span:UInt32}) - INTERVAL 1 DAY
+      AND knowable_at < {t:DateTime64(3)}
+      AND knowable_at >= {t:DateTime64(3)} - toIntervalSecond({span:UInt32}) - INTERVAL 1 DAY
 ),
 host_samples AS (               -- every host at every instant: its chain state, or no_anchor
     SELECT h.emitter AS emitter, s.t AS t,
-           if(st.emitter = '', 'no_anchor', st.state) AS state
+           if(st.emitter = '',
+              if(s.t < {knowable_since:DateTime64(3)}, 'no_knowable_at', 'no_anchor'),
+              st.state) AS state
     FROM hosts h CROSS JOIN samples s
     LEFT JOIN status st ON st.emitter = h.emitter AND st.t = s.t
 ),
