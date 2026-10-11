@@ -38,8 +38,9 @@
 //! unless it was a one-step promotion) and `approval_wait` (the latest
 //! `loom:curated` before the `loom:issue` label, to that label) are read from
 //! an issue's history when it first shows in a complete `loom:curated`
-//! listing or enters `ready_wait`. They are never `fleet.state` rows. A repo
-//! whose curated listing was incomplete is skipped; one issue's exit is
+//! listing or enters `ready_wait`, including the first pass and the first
+//! complete listing after failed ones. They are never `fleet.state` rows. A
+//! repo whose curated listing was incomplete is skipped; one issue's exit is
 //! emitted once (its forge instants key the fact id), and a failed history
 //! read is retried next pass.
 //!
@@ -519,11 +520,13 @@ fn pre_ready_pass<F: ForgeReads>(
     // (repo, issue) -> creation instant, when known.
     let mut candidates: BTreeMap<(String, u32), Option<DateTime<Utc>>> = BTreeMap::new();
     for (repo, items) in &curated_now {
-        // No earlier complete listing: nothing is known to be new.
-        let Some(was) = memory.curated.get(repo) else {
-            continue;
-        };
-        for (&issue, &created) in items.iter().filter(|(n, _)| !was.contains_key(n)) {
+        // No earlier complete listing (startup, or earlier reads failed):
+        // every curated issue is new to what has been observed.
+        let was = memory.curated.get(repo);
+        for (&issue, &created) in items
+            .iter()
+            .filter(|(n, _)| was.is_none_or(|was| !was.contains_key(n)))
+        {
             candidates.insert((repo.clone(), issue), created);
         }
     }
@@ -573,9 +576,11 @@ pub fn diff(
     forge: &mut impl ForgeReads,
     loom: &Provenance,
 ) -> Vec<TelemetryRecord> {
-    let (Some(prev), Some(prev_at)) = (memory.view.clone(), memory.at) else {
-        return Vec::new();
-    };
+    // The first pass has no earlier view to diff, but its complete curated
+    // listing and ready rows already show pre-ready exits (#11368).
+    let first = memory.view.is_none() || memory.at.is_none();
+    let prev = memory.view.clone().unwrap_or_default();
+    let prev_at = memory.at.unwrap_or(pass.now);
     let prev = &prev;
     let mut diff = Diff {
         forge,
@@ -586,6 +591,9 @@ pub fn diff(
     };
     let mut out = Vec::new();
     pre_ready_pass(memory, prev, pass, &mut diff, &mut out);
+    if first {
+        return out;
+    }
 
     let mut resolved: BTreeMap<(String, u32), PullFacts> = BTreeMap::new();
     let mut unread = std::mem::take(&mut memory.unread);
