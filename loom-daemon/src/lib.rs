@@ -353,6 +353,7 @@ pub mod shell_budget;
 pub mod short_hash;
 pub mod signoz_read;
 pub mod stale_blocked;
+pub(crate) mod stale_token_retry;
 pub mod star_liveness;
 pub mod startup_adoption;
 pub mod stash_issue_state;
