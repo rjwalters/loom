@@ -179,6 +179,10 @@ if [[ -z "$DAEMON_BIN" ]]; then
     exit 1
 fi
 
+# Step 3's retarget, shared by the merge-mode path below: the child PR's base
+# becomes the default branch NAME (a PR base is a branch, not a commit).
+retarget_child_base() { gh pr edit "$CHILD_PR" ${WRITE_REPO:+--repo "$WRITE_REPO"} --base "$DEFAULT_BRANCH"; }
+
 # #10771: may this repo's PR branches be rebased at all? If not, retarget only:
 # a rebase + force-push here deletes merge commits other agents pushed to the
 # child and orphans every head a reviewer signed. Anything but an explicit
@@ -188,11 +192,11 @@ BRANCH_UPDATE_STRATEGY="$("$DAEMON_BIN" branch-update strategy 2>/dev/null)" || 
 if [[ "$BRANCH_UPDATE_STRATEGY" != "rebase" ]]; then
     info "PR branches here are not rebased (loom-daemon branch-update strategy: merge, #10771) — '$CHILD_BRANCH' is not rewritten; its parent's commits reached $DEFAULT_BRANCH by merge commit, so retargeting the base is the whole reconcile."
     if [[ "$DRY_RUN" == "true" ]]; then
-        ok "Dry run complete — would run: gh pr edit $CHILD_PR --base $DEFAULT_BRANCH"
+        ok "Dry run complete — would retarget PR #$CHILD_PR's base to $DEFAULT_BRANCH (no rewrite)."
         exit 0
     fi
     WRITE_REPO="$(source "$SCRIPT_DIR/lib/forge-helpers.sh" && loom_write_repo "${LOOM_REPO:-}")" || { err "Refusing to reconcile: loom-daemon forge may-write refused this checkout's repo (#9548). Nothing was mutated."; exit 1; }
-    if ! gh pr edit "$CHILD_PR" ${WRITE_REPO:+--repo "$WRITE_REPO"} --base "$DEFAULT_BRANCH"; then
+    if ! retarget_child_base; then
         err "Failed to retarget PR #$CHILD_PR base to $DEFAULT_BRANCH. Retarget it manually."
         exit 2
     fi
@@ -308,7 +312,7 @@ fi
 # 3. Retarget the child PR's base to the default branch NAME (not the commit —
 #    a PR base is a branch).
 info "Step 3/3: gh pr edit $CHILD_PR --base $DEFAULT_BRANCH"
-if ! run gh pr edit "$CHILD_PR" ${WRITE_REPO:+--repo "$WRITE_REPO"} --base "$DEFAULT_BRANCH"; then
+if ! run retarget_child_base; then
     err "Failed to retarget PR #$CHILD_PR base to $DEFAULT_BRANCH. Retarget it manually."
     exit 2
 fi
