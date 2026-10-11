@@ -2972,19 +2972,27 @@ pub fn spawn_multi_work_finder_task(
             // before this tick's cap is finalized. See the single-workspace
             // loop above and `EagerTrigger::tick_admission`.
             // Fill the seats (#11284): free Z.ai seats raise the configured
-            // term of the cap — `min(disk, ram, max(configured_max, seats))`
-            // — so flat-rate seats left idle by a ceiling sized for metered
-            // pools run backlog instead. Observed from `fallback_root`, the
-            // same anchor every other machine-level knob resolves from, and
-            // logged once per change (mirroring `was_healthy_tokens` below).
+            // term of the cap — `min(disk, ram, max(configured_max, live +
+            // seats))` — so flat-rate seats left idle by a ceiling sized for
+            // metered pools run backlog instead. The floor is sized over
+            // live occupancy (second review): N free seats admit N launches
+            // on top of the sweeps already running — seat-holding and
+            // metered alike — instead of competing with them for the same
+            // slots. Observed from `fallback_root`, the same anchor every
+            // other machine-level knob resolves from, and logged once per
+            // change (mirroring `was_healthy_tokens` below).
             let seat_floor = SeatFloor::observe(&fallback_root);
-            let configured_seated = seat_floor.raise(configured_max);
-            if was_seat_floor != Some(seat_floor.free) {
+            let live_occupancy = forge::live_occupancy_across_roots(&pool, &roots);
+            let seated_ceiling = seat_floor.ceiling_over(live_occupancy);
+            let configured_seated = seat_floor.raise(configured_max, live_occupancy);
+            if was_seat_floor != Some(seated_ceiling) {
                 log::info!(
-                    "work_finder: zai free seats {} -> {} (accounts={}, capacity={}, \
-                     reserved={}{}), ceiling term configured_max={configured_max} -> \
+                    "work_finder: zai seat ceiling {} -> {} (live={}, free={}, accounts={}, \
+                     capacity={}, reserved={}{}), ceiling term configured_max={configured_max} -> \
                      {configured_seated} — disk/ram and every dispatch hold still bind (#11284)",
                     was_seat_floor.map_or(0, |s| s),
+                    seated_ceiling,
+                    live_occupancy,
                     seat_floor.free,
                     seat_floor.accounts,
                     seat_floor.capacity,
@@ -2994,7 +3002,7 @@ pub fn spawn_multi_work_finder_task(
                         .as_ref()
                         .map_or_else(String::new, |n| format!("; {n}"))
                 );
-                was_seat_floor = Some(seat_floor.free);
+                was_seat_floor = Some(seated_ceiling);
             }
             let (disk, disk_budget) = eager_trigger
                 .tick_admission(&roots, &fallback_root, ram, configured_seated)
@@ -3246,7 +3254,8 @@ pub fn spawn_multi_work_finder_task(
                 "work_finder: dynamic cap = {max_concurrent} (pool={pool_size}, \
                  healthy_tokens={token_limit} [informational only, not capacity-limiting \
                  since #5270], disk={disk}, ram={ram}, \
-                 max(configured_max={configured_max}, zai_free_seats={}) [#11284], \
+                 max(configured_max={configured_max}, occupancy={} + zai_free_seats={}) \
+                 [#11284], \
                  max_admissions_per_tick={max_admissions_per_tick}, any_halted={any_halted}, \
                  per_repo_cap={max_concurrent_per_repo:?} (#9090), \
                  preflight_held={preflight_held_count}, \
@@ -3254,6 +3263,7 @@ pub fn spawn_multi_work_finder_task(
                  build_backoff_held={build_backoff_held} (#9410), \
                  observed_idle={}, workspaces={}, priorities={priorities:?}, \
                  shard_slice={in_slice_count}/{} preferred (#6243/#6374))",
+                live_occupancy,
                 seat_floor.free,
                 format_idle(idle),
                 pairs.len(),
@@ -3270,7 +3280,7 @@ pub fn spawn_multi_work_finder_task(
             let report = tick_multi_with_build_backoff(
                 &mut pairs,
                 &priorities,
-                CapTerms::observed_with_seat_floor(configured_max, seat_floor.free, disk, ram),
+                CapTerms::observed_with_seat_floor(configured_max, seated_ceiling, disk, ram),
                 &halted,
                 Some(&halt_causes),
                 max_admissions_per_tick,
@@ -3305,6 +3315,7 @@ pub fn spawn_multi_work_finder_task(
                 disk,
                 ram,
                 configured_max,
+                live_occupancy,
                 seat_floor: seat_floor.free,
                 max_admissions_per_tick,
                 workspaces: pairs.len(),
@@ -3525,7 +3536,7 @@ pub mod repo_cap;
 pub use repo_cap::{tick_multi_with_sharding, RepoCap};
 
 pub mod seat_floor;
-pub use seat_floor::SeatFloor;
+pub use seat_floor::{seated_raise, SeatFloor};
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]

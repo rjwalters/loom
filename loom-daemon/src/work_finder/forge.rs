@@ -495,15 +495,7 @@ impl WorkDispatcher for RegistryDispatcher {
     /// `in_flight()`, so a child whose process already exited never
     /// over-counts either.
     fn occupancy(&self) -> usize {
-        let mut reg = match self.registry.lock() {
-            Ok(r) => r,
-            Err(poisoned) => {
-                log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
-                return 0;
-            }
-        };
-        reg.reap_liveness();
-        reg.occupied_issues().len()
+        discounted_occupancy(&self.registry)
     }
 
     fn collisions(&self) -> u64 {
@@ -645,6 +637,39 @@ impl WorkDispatcher for RegistryDispatcher {
         }
         Ok(outcome.was_new)
     }
+}
+
+/// One registry's discounted occupancy (Issue #4003): lock, reap-on-read,
+/// count the occupied issues — the exact figure
+/// [`RegistryDispatcher::occupancy`] returns, shared with
+/// [`live_occupancy_across_roots`].
+fn discounted_occupancy(registry: &Arc<Mutex<SweepRegistry>>) -> usize {
+    let mut reg = match registry.lock() {
+        Ok(r) => r,
+        Err(poisoned) => {
+            log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
+            return 0;
+        }
+    };
+    reg.reap_liveness();
+    reg.occupied_issues().len()
+}
+
+/// The machine-level live occupancy across every registered root (#11284,
+/// second review): the sum of each registry's discounted occupancy — the same
+/// per-registry figure the multi-workspace tick seeds its shared occupancy
+/// budget from — read pre-dispatch so the Z.ai seat floor can size the
+/// ceiling to the sweeps already running (N free seats admit N launches *on
+/// top of* current occupancy, not instead of it).
+#[must_use]
+pub fn live_occupancy_across_roots(
+    pool: &crate::workspace_pool::WorkspacePool,
+    roots: &[PathBuf],
+) -> usize {
+    roots
+        .iter()
+        .map(|root| discounted_occupancy(&pool.get_or_provision(root)))
+        .sum()
 }
 
 /// Build the per-tick `(source, dispatcher)` pair for every root (#3924).

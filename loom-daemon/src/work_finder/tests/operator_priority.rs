@@ -543,6 +543,37 @@ fn free_seats_raise_admission_but_never_the_safety_gates() {
     assert_eq!(CapTerms::with_seat_floor(2, 5, usize::MAX, 4).effective(), 4);
 }
 
+/// #11284 second review: the seated ceiling is sized over live occupancy, so
+/// free seats admit launches **on top of** the sweeps already running — not
+/// instead of them. With configured 2, two launches already in flight (their
+/// leases hold two seats), and four seats free, the cap must be 6. The
+/// pre-fix floor (`free` alone) capped at 4 and stranded two seats behind the
+/// two running launches — a case only a pre-existing-occupancy test can
+/// expose.
+#[test]
+fn free_seats_admit_on_top_of_running_launches() {
+    let terms = CapTerms::with_seat_floor(2, /* live 2 + free 4 */ 6, usize::MAX, usize::MAX);
+    assert_eq!(terms.effective(), 6);
+    let lane = RedMainLane::default();
+    let mut dispatcher = full(2);
+    let report = tick_with_lanes(
+        &mut FakeSource::once(vec![issue(1), issue(2), issue(3), issue(4), issue(5)]),
+        &mut dispatcher,
+        (terms, usize::MAX),
+        false,
+        false,
+        lane,
+    )
+    .unwrap();
+    assert_eq!(
+        report.dispatched, 4,
+        "every free seat admits a launch on top of the two already running"
+    );
+    // Disk still clamps the seated ceiling (#5270): a seat buys nothing past
+    // what the host can hold.
+    assert_eq!(CapTerms::with_seat_floor(2, 6, 3, usize::MAX).effective(), 3);
+}
+
 // ---- Operator priority levels (#10307) -----------------------------------
 
 fn at_level(n: u32, label: &str, extra: &[&str]) -> WorkItem {

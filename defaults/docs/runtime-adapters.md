@@ -1267,8 +1267,13 @@ also serves — is what binds, not the seats and not disk/RAM. The work finder
 therefore re-derives the ceiling every tick as:
 
 ```text
-dynamic cap = min(disk headroom, ram headroom, max(configured_max, free zai seats))
+dynamic cap = min(disk headroom, ram headroom,
+                  max(configured_max, live occupancy + free zai seats))
 ```
+
+The floor is sized **over live occupancy**: N free seats admit N launches *on
+top of* the sweeps already running — seat-holding and metered alike — so
+free seats never compete with running launches for the same slots.
 
 - **What a free seat is.** For every **selectable** Z.ai-pool account
   (provider namespace `zai`, `zai-coding-plan`, `zhipuai`,
@@ -1294,10 +1299,11 @@ dynamic cap = min(disk headroom, ram headroom, max(configured_max, free zai seat
   launched sweeps hold leases, so free seats — and the floor — drop.
 - **Status.** `loom-daemon status` prints the observation under the dynamic
   cap (`zai seats: 2 free of 6 across 2 selectable account(s), 4 held by
-  running launches`), names `max(configured max, zai free seats)` in the cap
-  formula, and `--json` carries it as `dynamic_cap.zai_seats` (counts only —
-  account names and credentials never enter the status wire). The per-tick
-  log line shows `zai_free_seats=` in the axis line, and a starred issue
+  running launches`), names `max(configured max, in-flight + zai free
+  seats)` in the cap formula, and `--json` carries it as
+  `dynamic_cap.zai_seats` (counts only — account names and credentials
+  never enter the status wire). The per-tick log line shows
+  `occupancy=N + zai_free_seats=M` in the axis line, and a starred issue
   waiting on a seated cap reads `at the free-seat cap (#11284)`, not
   "configured cap full".
 - **Failure direction.** An unreadable pool contributes nothing and is named

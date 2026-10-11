@@ -15,8 +15,11 @@ pub struct TickLine<'a> {
     pub disk: usize,
     pub ram: usize,
     pub configured_max: usize,
-    /// Free Z.ai seats (#11284) — the figure that may be raising
-    /// `configured_max` into this line's `ceiling=`.
+    /// Live occupancy at seat-floor observation time (#11284) — with
+    /// `seat_floor` it is the two components of the seated ceiling.
+    pub live_occupancy: usize,
+    /// Free Z.ai seats (#11284) — with `live_occupancy`, the figure that may
+    /// be raising `configured_max` into this line's `ceiling=`.
     pub seat_floor: usize,
     pub max_admissions_per_tick: usize,
     pub workspaces: usize,
@@ -52,7 +55,8 @@ pub fn render(report: &TickReport, t: &TickLine<'_>) -> String {
     format!(
         "work_finder: tick — cap {} (pool={}, healthy={} [fallback_root probe only], \
          min_workspace_healthy={} [minimum across every registered workspace's own resolved \
-         pool, #7527], disk={} [{}], ram={}, ceiling=max({}, zai_free_seats={}) [#11284], \
+         pool, #7527], disk={} [{}], ram={}, ceiling=max({}, occupancy={} + \
+         zai_free_seats={}) [#11284], \
          ramp_cap={}); {} workspace(s), \
          {} seen, {} dispatched, {} labeled-skip, {} in-flight-skip, \
          {} quarantine-skip, {} workspace-commands-missing-skip, \
@@ -74,6 +78,7 @@ pub fn render(report: &TickReport, t: &TickLine<'_>) -> String {
         t.disk_note,
         t.ram,
         t.configured_max,
+        t.live_occupancy,
         t.seat_floor,
         t.max_admissions_per_tick,
         t.workspaces,
@@ -129,6 +134,7 @@ mod tests {
             disk: 2,
             ram: 9,
             configured_max: 12,
+            live_occupancy: 0,
             seat_floor: 0,
             max_admissions_per_tick: 2,
             workspaces: 1,
@@ -137,6 +143,7 @@ mod tests {
         assert!(worth_logging(&report));
         let line = render(&report, &t);
         assert!(line.contains(&format!("disk=2 [{note}]")), "{line}");
+        assert!(line.contains("ceiling=max(12, occupancy=0 + zai_free_seats=0)"), "{line}");
         assert!(line.contains("1 dispatched"), "{line}");
         assert!(!worth_logging(&TickReport::default()));
     }

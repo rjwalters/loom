@@ -1258,7 +1258,7 @@ pub struct DaemonStatusReport {
     /// tunes for a host, empirically, from the observed idle fraction above.
     pub configured_max: usize,
     /// The effective dynamic concurrency cap —
-    /// `min(disk_headroom, ram_headroom, max(configured_max, zai free seats))`
+    /// `min(disk_headroom, ram_headroom, max(configured_max, live occupancy + zai free seats))`
     /// (`resolve_dynamic_max_concurrent`; the CPU term that sat in this `min`
     /// from #3978 was removed in #4512, and the token axis was removed
     /// entirely in #5270 — see [`Self::ram_headroom`]; the Z.ai free-seat

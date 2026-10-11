@@ -12,8 +12,15 @@
 //! *free seats themselves* raise the ceiling, per tick:
 //!
 //! ```text
-//! dynamic cap = min(disk headroom, ram headroom, max(configured_max, free zai seats))
+//! dynamic cap = min(disk headroom, ram headroom,
+//!                   max(configured_max, live occupancy + free zai seats))
 //! ```
+//!
+//! The floor is sized **over live occupancy** (second review): the ceiling it
+//! justifies must leave room for every free seat *on top of* the sweeps
+//! already running — seat-holding and metered alike — so N free seats admit
+//! N more launches (`cap − occupancy == free`) instead of free seats
+//! competing with running launches for the same N slots.
 //!
 //! Disk and RAM stay safety gates (#5270) — a seat never buys a sweep the
 //! host cannot hold. Drain, the host breaker, the saturation brake, the
@@ -133,13 +140,46 @@ impl SeatFloor {
         floor
     }
 
-    /// The configured ceiling with this floor applied:
-    /// `max(configured, free)`. A floor of zero returns `configured`
-    /// unchanged.
+    /// The total-occupancy ceiling the seats justify over the sweeps already
+    /// running (#11284, second review): `occupancy + free`, or `0` when there
+    /// are no free seats (a floor of zero is no floor — it must not pin the
+    /// cap to current occupancy either). Sizing the ceiling this way is what
+    /// makes `cap − occupancy == free`: every free seat is an admission.
     #[must_use]
-    pub fn raise(&self, configured: usize) -> usize {
-        configured.max(self.free)
+    pub fn ceiling_over(&self, occupancy: usize) -> usize {
+        if self.free == 0 {
+            0
+        } else {
+            occupancy + self.free
+        }
     }
+
+    /// The configured ceiling with this floor applied:
+    /// `max(configured, occupancy + free)`. A floor of zero returns
+    /// `configured` unchanged.
+    #[must_use]
+    pub fn raise(&self, configured: usize, occupancy: usize) -> usize {
+        configured.max(self.ceiling_over(occupancy))
+    }
+}
+
+impl From<SeatFloor> for crate::types::ZaiSeats {
+    fn from(floor: SeatFloor) -> Self {
+        Self {
+            free: floor.free,
+            accounts: floor.accounts,
+            capacity: floor.capacity,
+            reserved: floor.reserved,
+        }
+    }
+}
+
+/// [`SeatFloor::observe`] + [`SeatFloor::raise`] in one step for the
+/// advisory surfaces (#11284): the configured ceiling with the observed
+/// floor applied over `occupancy`.
+#[must_use]
+pub fn seated_raise(workspace: &Path, configured: usize, occupancy: usize) -> usize {
+    SeatFloor::observe(workspace).raise(configured, occupancy)
 }
 
 #[cfg(test)]
@@ -183,7 +223,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let floor = SeatFloor::observe(tmp.path());
         assert_eq!(floor, SeatFloor::default());
-        assert_eq!(floor.raise(3), 3);
+        assert_eq!(floor.raise(3, 0), 3);
     }
 
     #[test]
@@ -198,10 +238,40 @@ mod tests {
         assert_eq!(floor.capacity, 5);
         assert_eq!(floor.reserved, 1);
         assert_eq!(floor.free, 4);
-        assert_eq!(floor.raise(2), 4);
-        assert_eq!(floor.raise(9), 9);
+        assert_eq!(floor.raise(2, 0), 4);
+        assert_eq!(floor.raise(9, 0), 9);
         hold.release();
         assert_eq!(SeatFloor::observe(tmp.path()).free, 5, "released seat frees");
+    }
+
+    /// The #11284 second-review scenario: configured 2, two launches already
+    /// running (their leases hold two seats), four seats still free. The
+    /// ceiling must admit all four free seats on top of the two running —
+    /// `occupancy + free`, not `free` alone, which would strand two seats
+    /// behind the two launches already inside the cap.
+    #[test]
+    fn the_floor_admits_every_free_seat_on_top_of_running_launches() {
+        let floor = SeatFloor {
+            free: 4,
+            accounts: 2,
+            capacity: 6,
+            reserved: 2,
+            note: None,
+        };
+        assert_eq!(floor.ceiling_over(2), 6);
+        assert_eq!(floor.raise(2, 2), 6, "four free seats admit four more launches");
+        assert_eq!(floor.raise(2, 0), 4, "from idle the floor is the free count");
+        assert_eq!(floor.raise(9, 2), 9, "a configured ceiling above the seats stands");
+        // Metered (non-seat) launches count as occupancy too: they add on top
+        // of seat capacity rather than eating the seats' admissions.
+        assert_eq!(floor.raise(2, 7), 11);
+    }
+
+    #[test]
+    fn a_floor_of_zero_never_lifts_even_under_occupancy() {
+        let floor = SeatFloor::default();
+        assert_eq!(floor.ceiling_over(9), 0);
+        assert_eq!(floor.raise(2, 9), 2);
     }
 
     #[test]

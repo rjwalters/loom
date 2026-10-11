@@ -226,6 +226,7 @@ fn grouping_by_tap_separates_the_metered_backstop_from_the_subscriptions() {
 /// merged PRs — per tap, and keeps missing evidence apart from zero on each.
 #[test]
 fn the_tap_cut_carries_first_pass_doctor_and_merged_with_missing_apart_from_zero() {
+    const ZAI_TAP: &str = "opencode:zai-flash@api_keys:zai";
     let tapped =
         |sweep: &str, tap: &str, verdict: Option<&str>, doctored: bool, pr: Option<u32>| {
             let mut r = record(sweep, "o/r", None, SweepResult::Success, 100);
@@ -243,8 +244,8 @@ fn the_tap_cut_carries_first_pass_doctor_and_merged_with_missing_apart_from_zero
             entry(r, day(10), "h1")
         };
     let records = vec![
-        tapped("s1", "opencode:zai-flash@api_keys:zai", Some("pass"), true, Some(7)),
-        tapped("s2", "opencode:zai-flash@api_keys:zai", Some("fail"), false, Some(8)),
+        tapped("s1", ZAI_TAP, Some("pass"), true, Some(7)),
+        tapped("s2", ZAI_TAP, Some("fail"), false, Some(8)),
         // Never judged, never doctored, no PR: missing evidence, not zero.
         tapped("s3", "claude@claude_tokens", None, false, None),
     ];
@@ -262,7 +263,7 @@ fn the_tap_cut_carries_first_pass_doctor_and_merged_with_missing_apart_from_zero
             .find(|r| r.group == g)
             .unwrap_or_else(|| panic!("missing tap row {g}: {:?}", report.rows))
     };
-    let zai = row("opencode:zai-flash@api_keys:zai");
+    let zai = row(ZAI_TAP);
     assert_eq!(zai.first_pass_judged, 2);
     assert!((zai.first_pass_approval_rate.unwrap() - 0.5).abs() < 1e-9);
     assert!((zai.doctor_phase_rate - 0.5).abs() < 1e-9);
@@ -282,11 +283,7 @@ fn the_tap_cut_carries_first_pass_doctor_and_merged_with_missing_apart_from_zero
         &mut ForgeDown,
         vec!["/ws".into()],
     );
-    let zai = report
-        .rows
-        .iter()
-        .find(|r| r.group == "opencode:zai-flash@api_keys:zai")
-        .unwrap();
+    let zai = report.rows.iter().find(|r| r.group == ZAI_TAP).unwrap();
     assert_eq!(zai.merged_prs, None, "join down is unknown, not zero");
 }
 

@@ -204,9 +204,10 @@ pub enum CapLimiter {
     Disk,
     /// Available-RAM headroom.
     Ram,
-    /// The Z.ai free-seat floor (#11284): free seats raised the configured
-    /// term and every seat is now taken — the cap is doing exactly what the
-    /// seats pay for, neither a shortage nor an operator setting.
+    /// The Z.ai seated ceiling (#11284): seats raised the configured term
+    /// and every launch they justify is now running — the cap is doing
+    /// exactly what the seats pay for, neither a shortage nor an operator
+    /// setting.
     SeatFloor,
     /// A limiter this client does not know (forward compatibility).
     #[serde(other)]
@@ -228,10 +229,11 @@ impl CapLimiter {
 }
 
 /// The terms of one tick's concurrency cap (Issue #10214): `min(configured,
-/// disk headroom, ram headroom)`, with the Z.ai free-seat floor (#11284)
-/// raising the configured term to `max(configured, seat_floor)` first. A
-/// headroom term is `None` when it was unmeasurable (the work finder then
-/// skips that clamp).
+/// disk headroom, ram headroom)`, with the Z.ai seated ceiling (#11284)
+/// raising the configured term to `max(configured, seat_floor)` first —
+/// `seat_floor` being live occupancy + free seats, so every free seat is an
+/// admission on top of the sweeps already running. A headroom term is `None`
+/// when it was unmeasurable (the work finder then skips that clamp).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapView {
     /// The configured `maxConcurrent`.
@@ -243,8 +245,10 @@ pub struct CapView {
     /// RAM headroom: how many sweeps available memory can hold.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ram: Option<usize>,
-    /// Free Z.ai seats observed this tick (#11284); `None` when the tick
-    /// carried no seat observation (a floor of zero is `Some(0)`, not this).
+    /// The Z.ai seated ceiling (#11284): live occupancy + free seats — the
+    /// total-occupancy level the seats justify. `None` when the tick carried
+    /// no seat observation (a floor of zero is `Some(0)`, not this). Raw seat
+    /// counts (free/capacity/reserved) travel on `ZaiSeats`, never here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seat_floor: Option<usize>,
 }
@@ -263,7 +267,8 @@ impl CapView {
         }
     }
 
-    /// [`Self::from_terms`] with the seat floor applied (#11284).
+    /// [`Self::from_terms`] with the seat floor applied (#11284): `seat_floor`
+    /// is the seated ceiling (live occupancy + free seats, 0 for none).
     #[must_use]
     pub fn from_terms_with_seat_floor(
         configured: usize,
@@ -293,7 +298,8 @@ impl CapView {
 
     /// The term that binds. A headroom term binds only when it is strictly
     /// below the seated cap; disk wins a disk / RAM tie. The seat floor
-    /// binds when it alone lifted the cap (free seats all taken).
+    /// binds when it alone lifted the cap (every seat the pool would
+    /// justify is running).
     #[must_use]
     pub fn limiter(&self) -> CapLimiter {
         let disk = self.disk.unwrap_or(usize::MAX);

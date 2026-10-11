@@ -1903,7 +1903,7 @@ pub(crate) fn print_status_human(
     let seats = seat_line::render(report);
     if seats.is_some() {
         println!(
-            "  = min(disk headroom {}, ram headroom {}, max(configured max {}, zai free seats))",
+            "  = min(disk headroom {}, ram headroom {}, max(configured max {}, in-flight + zai free seats))",
             report.disk_headroom, report.ram_headroom, report.configured_max
         );
     } else {

@@ -2,10 +2,11 @@
 //! `loom-daemon status` (#11284) — a sibling module because
 //! `status_render.rs` is a frozen over-threshold ledger entry.
 //!
-//! The cap's formula line above this names `max(configured max, zai free
-//! seats)` as its third term; this line is the observation behind it, printed
-//! from the daemon's report (never re-probed client-side) so what the
-//! operator reads and what dispatch admitted against are the same numbers.
+//! The cap's formula line above this names
+//! `max(configured max, in-flight + zai free seats)` as its third term; this
+//! line is the observation behind it, printed from the daemon's report
+//! (never re-probed client-side) so what the operator reads and what
+//! dispatch admitted against are the same numbers.
 //! Occupancy is deliberately restated here — `reserved` counts the in-flight
 //! lease holds on the counted accounts, which is the seat-side counterpart of
 //! the sweep counts printed above the cap block.

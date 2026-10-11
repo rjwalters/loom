@@ -691,10 +691,11 @@ pub struct CapTerms {
     pub configured: usize,
     /// `min(disk headroom, ram headroom)`: how many sweeps the host can hold.
     pub headroom: usize,
-    /// The Z.ai free-seat floor (#11284): `0` when none. Raises only the
-    /// `configured` term (see [`Self::effective`]), never the resource
-    /// gates — and never the overflow slot's `occupancy <= configured`
-    /// bound, which stays keyed on the operator's own ceiling.
+    /// The Z.ai seated ceiling (#11284): `live occupancy + free seats`, `0`
+    /// when there are none. Raises only the `configured` term (see
+    /// [`Self::effective`]), never the resource gates — and never the
+    /// overflow slot's `occupancy <= configured` bound, which stays keyed on
+    /// the operator's own ceiling.
     pub seat_floor: usize,
 }
 
@@ -709,8 +710,10 @@ impl CapTerms {
         }
     }
 
-    /// [`Self::new`] with the seat floor applied (#11284): the effective cap
-    /// becomes `min(max(configured, seat_floor), headroom)`.
+    /// [`Self::new`] with the seat floor applied (#11284): `seat_floor` is
+    /// the seated ceiling — `live occupancy + free seats` (0 for none), the
+    /// caller having read live occupancy — and the effective cap becomes
+    /// `min(max(configured, seat_floor), headroom)`.
     #[must_use]
     pub fn with_seat_floor(
         configured: usize,
@@ -739,7 +742,8 @@ impl CapTerms {
 
     /// [`Self::with_seat_floor`] for a production tick: records the seated
     /// terms (Issue #10214) the same way [`Self::observed`] records the bare
-    /// ones.
+    /// ones. `seat_floor` is the seated ceiling (`live occupancy + free
+    /// seats`, 0 for none).
     #[must_use]
     pub fn observed_with_seat_floor(
         configured: usize,
