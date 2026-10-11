@@ -101,6 +101,7 @@ pub fn blocked_rows(repo: &QueueRepoRef, listing: &[RestIssue]) -> Vec<QueueSnap
                 disposition,
                 state: disposition.state().to_string(),
                 reason: disposition.reason().to_string(),
+                halt_cause: None,
                 detail: (!holds.is_empty()).then(|| holds.join(", ")),
                 // Outside the dispatch order: `blocked`, no position (#9288).
                 plan: crate::types::RowPlan {

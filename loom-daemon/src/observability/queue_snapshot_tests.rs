@@ -301,3 +301,23 @@ fn deferred_file_overlap_row_exports_its_shared_paths_in_the_serialized_snapshot
         "dispatch-error text stays excluded"
     );
 }
+
+#[test]
+fn workspace_halted_rows_carry_halt_cause_and_name_it_in_reason() {
+    let s = summary(vec![
+        row(1, PUBLIC_ROOT, 10, Qd::WorkspaceHalted, Some("main_red")),
+        row(2, PUBLIC_ROOT, 11, Qd::WorkspaceHalted, None),
+        row(3, PUBLIC_ROOT, 12, Qd::WorkspaceHalted, Some("free text")),
+        row(4, PUBLIC_ROOT, 13, Qd::DeferredCapacity, Some("main_red")),
+    ]);
+    let rows = build_record(&s, &repos()).rows;
+    assert_eq!(rows[0].halt_cause.as_deref(), Some("main_red"));
+    assert_eq!(rows[0].reason, "blocked: repo dispatch held — main red");
+    for r in &rows[1..3] {
+        assert_eq!(r.halt_cause, None);
+        assert_eq!(r.reason, Qd::WorkspaceHalted.reason());
+    }
+    assert_eq!(rows[3].halt_cause, None);
+    let json = serde_json::to_value(&rows[1]).unwrap();
+    assert!(json.get("halt_cause").is_none());
+}

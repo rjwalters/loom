@@ -31,6 +31,7 @@ use crate::telemetry::queue_snapshot::{
 };
 use crate::telemetry::{QueueSnapshotRecord, TelemetryEnvelope, TelemetryRecord};
 use crate::types::WorkFinderTickSummary;
+use crate::work_finder::halt_cause::HaltCause;
 
 /// Offers `queue.snapshot` envelopes, stamped with this daemon's host id, to
 /// the native exporters' queues.
@@ -116,6 +117,9 @@ pub fn build_record(
             rows_truncated += 1;
             continue;
         }
+        let cause = (row.disposition == crate::types::QueueDisposition::WorkspaceHalted)
+            .then(|| row.detail.as_deref().and_then(HaltCause::from_wire))
+            .flatten();
         rows.push(QueueSnapshotRow {
             rank: row.rank,
             repo: repo.repo.clone(),
@@ -129,7 +133,9 @@ pub fn build_record(
             tier: row.tier.clone(),
             disposition: row.disposition,
             state: row.disposition.state().to_string(),
-            reason: row.disposition.reason().to_string(),
+            reason: cause
+                .map_or_else(|| row.disposition.reason().to_string(), HaltCause::halted_reason),
+            halt_cause: cause.map(|c| c.as_str().to_string()),
             detail: exportable_detail(row.disposition, row.detail.as_deref()),
             plan: row.plan.clone(),
         });
