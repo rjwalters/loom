@@ -136,19 +136,11 @@ source "$SCRIPT_DIR/lib/push-lease-verify.sh"
 # (the live PR #9483 incident, #9487). Finding the binary is part of that
 # call-site; an unresolvable one leaves $DAEMON_BIN empty, and the per-child
 # call then fails closed (the child is SKIPPED, never pushed with a bare lease).
-# requires-daemon: push-lease >= 0.19.1038   #9487 — the pinned-lease builder. Declared at this repo's VERSION because the subcommand lands WITH this marker; the first release actually carrying it is the post-merge bump. A binary predating it is refused here with the floor and the roll command rather than degraded to the bare lease
+# requires-daemon: push-lease >= 0.19.1075   #9487 — the pinned-lease builder. Declared at this repo's VERSION because the subcommand lands WITH this marker; the first release actually carrying it is the post-merge bump. A binary predating it is refused here with the floor and the roll command rather than degraded to the bare lease
 # shellcheck source=lib/locate-daemon-bin.sh
 source "$SCRIPT_DIR/lib/locate-daemon-bin.sh"
 DAEMON_BIN="$(loom_daemon_self_bin_override || loom_locate_daemon_bin "$SCRIPT_DIR/../.." || true)"
 loom_daemon_version_preflight push-lease "$DAEMON_BIN"
-
-# #10771: may PR branches here be rebased at all? A rebase + force-push in a
-# repo that bars rebase deletes other agents' merge commits and orphans every
-# head a reviewer signed. Anything but an explicit `rebase` answer — including
-# a binary predating the subcommand — is merge, which skips every child.
-# requires-daemon: branch-update optional   #10771 — a binary without it answers nothing, which is read as merge: children are reported, never rewritten
-BRANCH_UPDATE_STRATEGY="$("$DAEMON_BIN" branch-update strategy 2>/dev/null)" || BRANCH_UPDATE_STRATEGY=merge
-[[ "$BRANCH_UPDATE_STRATEGY" == "rebase" ]] || BRANCH_UPDATE_STRATEGY=merge
 
 # Ref-operand validator (#9106). REQUIRED, not defensive: every git call in this
 # script takes a branch name as a bare operand, and the child names come
@@ -156,6 +148,13 @@ BRANCH_UPDATE_STRATEGY="$("$DAEMON_BIN" branch-update strategy 2>/dev/null)" || 
 # must stop the run, never degrade it to the unvalidated behaviour.
 # shellcheck source=lib/default-branch.sh
 source "$SCRIPT_DIR/lib/default-branch.sh"
+# #10771: may PR branches here be rebased at all? A rebase + force-push in a
+# repo that bars rebase deletes other agents' merge commits and orphans every
+# head a reviewer signed. Anything but an explicit `rebase` answer from
+# `loom-daemon branch-update strategy` — including a binary predating the
+# subcommand — is merge, which reports every stale child and rewrites none.
+# requires-daemon: branch-update optional   #10771 — a binary without it answers nothing, which is read as merge: children are reported, never rewritten
+BRANCH_UPDATE_STRATEGY="$("$DAEMON_BIN" branch-update strategy 2>/dev/null)" || BRANCH_UPDATE_STRATEGY=merge
 
 REPO_NWO="$(forge_get_repo_nwo "gh" 2>/dev/null || true)"
 # #9548: a real run pushes child branches and comments on child PRs, so it acts
@@ -207,11 +206,18 @@ _process_one_stacked_child() {
     fi
 
     # #10771: in a merge-only repo, never rewrite the child. Reported, exit 0.
-    if [[ "${BRANCH_UPDATE_STRATEGY:-}" == "merge" ]]; then
+    if [[ "${BRANCH_UPDATE_STRATEGY:-}" != "rebase" ]]; then
         warn "Child PR #$child_pr ($child_branch) is stale relative to '$parent_branch', but this repository's PR branches are not rebased (loom-daemon branch-update strategy: merge, #10771) — not rewriting it. Update it with a merge and a plain push in its worktree: git merge origin/$parent_branch && git push origin HEAD:$child_branch (merge-based de-stacking: #9808)."
         return 0
     fi
 
+    # Stale relative to the parent's current tip. Derive the child ISSUE number
+    # from its head branch (feature/issue-<N>) for the safe/unsafe split. A
+    # non-feature/issue-N child has no loom:building claim to race → treated safe.
+    local child_issue=""
+    if [[ "$child_branch" =~ ^feature/issue-([0-9]+)$ ]]; then
+        child_issue="${BASH_REMATCH[1]}"
+    fi
     # #9487: build this child's PINNED --force-with-lease argument HERE, before
     # the rebase rewrites the branch, by reading origin's live head. Left
     # implicit at push time the bare flag compares against
@@ -229,14 +235,6 @@ _process_one_stacked_child() {
     if [[ $pin_rc -ne 0 || -z "$child_lease_arg" ]]; then
         warn "No pinned force-with-lease value for '$child_branch' (loom-daemon push-lease pin-flag exit $pin_rc — see above, #9487; 'unrecognized subcommand' = this loom-daemon predates #9487: roll it) — skipping child PR #$child_pr rather than pushing with the bare lease."
         RSC_FAILURE=2; return 0
-    fi
-
-    # Stale relative to the parent's current tip. Derive the child ISSUE number
-    # from its head branch (feature/issue-<N>) for the safe/unsafe split. A
-    # non-feature/issue-N child has no loom:building claim to race → treated safe.
-    local child_issue=""
-    if [[ "$child_branch" =~ ^feature/issue-([0-9]+)$ ]]; then
-        child_issue="${BASH_REMATCH[1]}"
     fi
 
     # (docs/gh-cached.md policy: claim arbitration stays on plain `gh`, #9953.)

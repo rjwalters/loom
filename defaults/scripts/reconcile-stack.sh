@@ -45,9 +45,10 @@
 #
 # Merge-only repos (#10771): where `loom-daemon branch-update strategy` does
 # not say `rebase` (the default, and the answer when anything is unknown), the
-# child is NOT rewritten. The parent merged as a merge commit, so its commits
-# are already in the default branch; step 3's retarget alone is correct and
-# the rebase + force-push of steps 1-2 are skipped.
+# child is NOT rewritten: step 3's retarget runs and the rebase + force-push
+# of steps 1-2 are skipped. A merge-committed parent leaves nothing more to do;
+# a squash-merged one can leave the PR showing its commits or conflicting,
+# which an ordinary merge of the default branch into the child fixes.
 #
 # Safety:
 #   - Uses --force-with-lease (NEVER a bare --force) so a concurrent push to the
@@ -91,7 +92,7 @@ info() { echo -e "${BLUE}ℹ $1${NC}" >&2; }
 warn() { echo -e "${YELLOW}⚠ $1${NC}" >&2; }
 
 show_help() {
-    sed -n '2,75p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,76p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 DRY_RUN=false
@@ -179,31 +180,33 @@ if [[ -z "$DAEMON_BIN" ]]; then
     exit 1
 fi
 
-# Step 3's retarget, shared by the merge-mode path below: the child PR's base
-# becomes the default branch NAME (a PR base is a branch, not a commit).
-retarget_child_base() { gh pr edit "$CHILD_PR" ${WRITE_REPO:+--repo "$WRITE_REPO"} --base "$DEFAULT_BRANCH"; }
-
+# 1. Fetch + pin the remote default-branch tip, route to the worktree holding
+#    the child branch, resolve the parent ref (branch name, else the #7982
+#    pin, whose ancestry is checked per #8010), then replay ONLY the child's
+#    own commits onto the pinned commit. Exit 1 = a prerequisite refused and
+#    nothing was mutated; exit 2 = the rebase itself failed.
+# requires-daemon: reconcile-stack >= 0.19.271   #8583 — the reconciliation planner/executor. Declared at this repo's VERSION because the subcommand lands WITH this marker; the first release actually carrying it is the post-merge bump. A binary predating it refuses with clap's "unrecognized subcommand", which this script reports as a precondition failure rather than proceeding
+# #9548: a real run pushes the child and retargets its PR, so it acts only on a
+# repo this installation manages and can write, named on the PR edit.
+# forge-helpers.sh is sourced in the subshell because it sets -e.
+WRITE_REPO=""
+[[ "$DRY_RUN" == "true" ]] || WRITE_REPO="$(source "$SCRIPT_DIR/lib/forge-helpers.sh" && loom_write_repo "${LOOM_REPO:-}")" || { err "Refusing to reconcile: loom-daemon forge may-write refused this checkout's repo (#9548). Nothing was mutated."; exit 1; }
 # #10771: may this repo's PR branches be rebased at all? If not, retarget only:
 # a rebase + force-push here deletes merge commits other agents pushed to the
 # child and orphans every head a reviewer signed. Anything but an explicit
-# `rebase` answer — including a binary predating the subcommand — is merge.
+# `rebase` answer from `loom-daemon branch-update strategy` — including a
+# binary predating the subcommand — is merge.
 # requires-daemon: branch-update optional   #10771 — no answer is read as merge: the child is retargeted, never rewritten
 BRANCH_UPDATE_STRATEGY="$("$DAEMON_BIN" branch-update strategy 2>/dev/null)" || BRANCH_UPDATE_STRATEGY=merge
 if [[ "$BRANCH_UPDATE_STRATEGY" != "rebase" ]]; then
-    info "PR branches here are not rebased (loom-daemon branch-update strategy: merge, #10771) — '$CHILD_BRANCH' is not rewritten; its parent's commits reached $DEFAULT_BRANCH by merge commit, so retargeting the base is the whole reconcile."
-    if [[ "$DRY_RUN" == "true" ]]; then
-        ok "Dry run complete — would retarget PR #$CHILD_PR's base to $DEFAULT_BRANCH (no rewrite)."
-        exit 0
-    fi
-    WRITE_REPO="$(source "$SCRIPT_DIR/lib/forge-helpers.sh" && loom_write_repo "${LOOM_REPO:-}")" || { err "Refusing to reconcile: loom-daemon forge may-write refused this checkout's repo (#9548). Nothing was mutated."; exit 1; }
-    if ! retarget_child_base; then
-        err "Failed to retarget PR #$CHILD_PR base to $DEFAULT_BRANCH. Retarget it manually."
-        exit 2
-    fi
+    info "PR branches here are not rebased (loom-daemon branch-update strategy: merge, #10771) — '$CHILD_BRANCH' is not rewritten, only its base is retargeted to $DEFAULT_BRANCH. If the PR then shows conflicts or the parent's commits (a squash-merged parent), merge $DEFAULT_BRANCH into it and push plainly."
+    [[ "$DRY_RUN" == "true" ]] && { ok "Dry run complete — would retarget PR #$CHILD_PR's base to $DEFAULT_BRANCH (no rewrite)."; exit 0; }
+    gh pr edit "$CHILD_PR" ${WRITE_REPO:+--repo "$WRITE_REPO"} --base "$DEFAULT_BRANCH" || { err "Failed to retarget PR #$CHILD_PR base to $DEFAULT_BRANCH. Retarget it manually."; exit 2; }
     ok "Reconciled (merge mode): PR #$CHILD_PR now targets $DEFAULT_BRANCH; '$CHILD_BRANCH' was not rewritten. Bring it up to date with a merge and a plain push if it is behind."
     exit 0
 fi
-
+RECONCILE_ARGS=(--child-branch "$CHILD_BRANCH" --parent-branch "$PARENT_BRANCH" --default-branch "$DEFAULT_BRANCH" --repo-dir "$PWD")
+[[ "$DRY_RUN" == "true" ]] || RECONCILE_ARGS+=(--rebase)
 # #9487: capture the child branch's LIVE remote head NOW — before step 1's
 # rebase rewrites anything — and pin step 2's --force-with-lease to it. A bare
 # --force-with-lease compares against refs/remotes/origin/<child>, a ref SHARED
@@ -217,7 +220,7 @@ fi
 # `loom-daemon push-lease pin-flag` (cli/push_lease.rs) per the shell language
 # policy: exit 3 = origin could not be queried, 4 = origin holds commits this
 # clone never incorporated. There is deliberately no bare-flag fallback.
-# requires-daemon: push-lease >= 0.19.1038   #9487 — the pinned-lease builder. Declared at this repo's VERSION because the subcommand lands WITH this marker; the first release actually carrying it is the post-merge bump. A binary predating it is refused here with the floor rather than degraded to the bare lease
+# requires-daemon: push-lease >= 0.19.1075   #9487 — the pinned-lease builder. Declared at this repo's VERSION because the subcommand lands WITH this marker; the first release actually carrying it is the post-merge bump. A binary predating it is refused here with the floor rather than degraded to the bare lease
 loom_daemon_version_preflight push-lease "$DAEMON_BIN"
 PIN_RC=0
 PUSH_LEASE_ARG="$("$DAEMON_BIN" push-lease pin-flag --remote origin --branch "$CHILD_BRANCH" --local-ref "refs/heads/$CHILD_BRANCH")" || PIN_RC=$?
@@ -226,20 +229,6 @@ if [[ $PIN_RC -ne 0 ]]; then
     exit 1
 fi
 info "Pinned force-with-lease argument for '$CHILD_BRANCH': $PUSH_LEASE_ARG"
-
-# 1. Fetch + pin the remote default-branch tip, route to the worktree holding
-#    the child branch, resolve the parent ref (branch name, else the #7982
-#    pin, whose ancestry is checked per #8010), then replay ONLY the child's
-#    own commits onto the pinned commit. Exit 1 = a prerequisite refused and
-#    nothing was mutated; exit 2 = the rebase itself failed.
-# requires-daemon: reconcile-stack >= 0.19.271   #8583 — the reconciliation planner/executor. Declared at this repo's VERSION because the subcommand lands WITH this marker; the first release actually carrying it is the post-merge bump. A binary predating it refuses with clap's "unrecognized subcommand", which this script reports as a precondition failure rather than proceeding
-# #9548: a real run pushes the child and retargets its PR, so it acts only on a
-# repo this installation manages and can write, named on the PR edit.
-# forge-helpers.sh is sourced in the subshell because it sets -e.
-WRITE_REPO=""
-[[ "$DRY_RUN" == "true" ]] || WRITE_REPO="$(source "$SCRIPT_DIR/lib/forge-helpers.sh" && loom_write_repo "${LOOM_REPO:-}")" || { err "Refusing to reconcile: loom-daemon forge may-write refused this checkout's repo (#9548). Nothing was mutated."; exit 1; }
-RECONCILE_ARGS=(--child-branch "$CHILD_BRANCH" --parent-branch "$PARENT_BRANCH" --default-branch "$DEFAULT_BRANCH" --repo-dir "$PWD")
-[[ "$DRY_RUN" == "true" ]] || RECONCILE_ARGS+=(--rebase)
 # Refuse a too-old binary with the floor and the roll command (#8385) rather
 # than letting clap's bare "unrecognized subcommand" be the whole diagnosis.
 loom_daemon_version_preflight reconcile-stack "$DAEMON_BIN"
@@ -312,7 +301,7 @@ fi
 # 3. Retarget the child PR's base to the default branch NAME (not the commit —
 #    a PR base is a branch).
 info "Step 3/3: gh pr edit $CHILD_PR --base $DEFAULT_BRANCH"
-if ! run retarget_child_base; then
+if ! run gh pr edit "$CHILD_PR" ${WRITE_REPO:+--repo "$WRITE_REPO"} --base "$DEFAULT_BRANCH"; then
     err "Failed to retarget PR #$CHILD_PR base to $DEFAULT_BRANCH. Retarget it manually."
     exit 2
 fi

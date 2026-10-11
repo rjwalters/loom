@@ -1238,7 +1238,8 @@ if [ "$MERGE_STATE" = "DIRTY" ]; then
         if [ "$BRANCH_UPDATE" = rebase ]; then git rebase origin/main; else git merge --no-ff -m "Merge origin/main into $BRANCH (Judge: resolve conflicts)" origin/main; fi || GATE_OK=false
     fi
     # Version-bearing-file sync gate (#7168/#7341, moot after #7743): gate BEFORE
-    # the push. On failure never hand-patch those files or `version.sh bump`.
+    # the push. On failure never hand-patch the version-bearing files yourself
+    # or run `version.sh bump`.
     if [ "$GATE_OK" = true ] && [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-check-gate.sh --fix-hint "then push."; then
         GATE_OK=false
     fi

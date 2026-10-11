@@ -149,9 +149,9 @@ if [ "$BRANCH_UPDATE" = rebase ]; then git rebase origin/main; else git merge --
 # If conflicts occur: edit the files, `git add <resolved-files>`, then
 # `git commit --no-edit` (merge) or `git rebase --continue` (rebase)
 
-# Version-bearing-file sync gate (#7168, #7341, #7743) before a direct push. If it
-# fires your branch carries a version-bearing edit: never hand-patch or
-# `version.sh bump` -- `git checkout origin/main -- <files>`, commit, re-gate.
+# Version-bearing-file sync gate (#7168, #7341, #7743). If it
+# fires your branch carries a version-bearing edit. Never hand-patch VERSION/CLAUDE.md/etc
+# or `version.sh bump` -- `git checkout origin/main -- <files>`, commit, re-gate.
 if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-check-gate.sh --fix-hint "then push."; then
   echo "Version-bearing files out of sync after update (see BLOCKER:/Fix: above) - revert, never bump"
   exit 1

@@ -283,6 +283,9 @@ DRY_RUN=false
 RSC_FAILURE=0
 # The real script resolves this above the extracted run()..main span (#9487).
 DAEMON_BIN="$STUB_DIR/loom-daemon"
+# Also resolved above the span (#10771). Pinned to `rebase` for the rebase
+# cases: anything else, unset included, is merge and rewrites no child.
+BRANCH_UPDATE_STRATEGY=rebase
 
 # Canned issue fixtures (child issue label state).
 cat > "$STUB_DIR/issue-201.json" <<'EOF'
@@ -403,21 +406,23 @@ assert_contains "$ALL_LOG_C" \
 #     not rebased (loom-daemon branch-update strategy = merge). The child is
 #     reported and left alone: no pin, no rebase, no push, no comment, and not a
 #     failure — rewriting it would delete other agents' merge commits.
+for CM_MODE in merge unset; do
 reset_state
-BRANCH_UPDATE_STRATEGY=merge
+if [[ "$CM_MODE" == unset ]]; then unset BRANCH_UPDATE_STRATEGY; else BRANCH_UPDATE_STRATEGY=merge; fi
 write_prlist "feature/issue-100" '[{"number":501,"headRefName":"feature/issue-201"}]'
 clear_uptodate "feature/issue-201"   # stale
 OUT_CM_FILE="$(mktemp)"
 _rebase_stacked_children "feature/issue-100" >"$OUT_CM_FILE" 2>&1
 OUT_CM="$(cat "$OUT_CM_FILE")"
 rm -f "$OUT_CM_FILE"
-assert_not_contains "$(read_git)" "rebase" "(c-merge) merge-only repo -> no rebase attempted (#10771)"
-assert_not_contains "$(read_git)" "push" "(c-merge) merge-only repo -> nothing pushed, let alone forced (#10771)"
-assert_not_contains "$(read_all)" "push-lease pin-flag" "(c-merge) merge-only repo -> no lease is even built"
-assert_eq "" "$(read_gh)" "(c-merge) merge-only repo -> no comment posted"
-assert_eq "0" "$RSC_FAILURE" "(c-merge) merge-only repo -> a policy skip is not a failure"
-assert_contains "$OUT_CM" "git merge origin/feature/issue-100" "(c-merge) the skip names the merge-based remedy"
-unset BRANCH_UPDATE_STRATEGY
+assert_not_contains "$(read_git)" "rebase" "(c-merge/$CM_MODE) merge-only repo -> no rebase attempted (#10771)"
+assert_not_contains "$(read_git)" "push" "(c-merge/$CM_MODE) merge-only repo -> nothing pushed, let alone forced (#10771)"
+assert_not_contains "$(read_all)" "push-lease pin-flag" "(c-merge/$CM_MODE) merge-only repo -> no lease is even built"
+assert_eq "" "$(read_gh)" "(c-merge/$CM_MODE) merge-only repo -> no comment posted"
+assert_eq "0" "$RSC_FAILURE" "(c-merge/$CM_MODE) merge-only repo -> a policy skip is not a failure"
+assert_contains "$OUT_CM" "git merge origin/feature/issue-100" "(c-merge/$CM_MODE) the skip names the merge-based remedy"
+done
+BRANCH_UPDATE_STRATEGY=rebase
 
 # (c2) Same as (c), but version-check-gate.sh (real script, #7168) reports a
 #      mismatch via LOOM_VERSION_CHECK_SCRIPT -> rebase runs, but the push is
@@ -621,7 +626,7 @@ assert_contains "$src" 'source "$SCRIPT_DIR/lib/push-lease-verify.sh"' \
   "script sources the shared push-lease-verify helper"
 assert_contains "$src" 'BRANCH_UPDATE_STRATEGY="$("$DAEMON_BIN" branch-update strategy 2>/dev/null)" || BRANCH_UPDATE_STRATEGY=merge' \
   "script asks loom-daemon branch-update strategy, failing toward merge (#10771)"
-assert_contains "$src" '[[ "$BRANCH_UPDATE_STRATEGY" == "rebase" ]] || BRANCH_UPDATE_STRATEGY=merge' \
+assert_contains "$src" 'if [[ "${BRANCH_UPDATE_STRATEGY:-}" != "rebase" ]]; then' \
   "any answer but an explicit rebase is merge (#10771)"
 assert_contains "$src" '"$SCRIPT_DIR/version-check-gate.sh"' \
   "safe path runs the shared version-check-gate.sh after rebase, before push (#7168)"

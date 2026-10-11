@@ -49,7 +49,8 @@ through to the next tier.
 
 A forge answer is cached for ten minutes in the git common dir, so one role
 run's several calls cost one API read. Unknown answers are never cached.
-`--no-cache` forces a fresh read.
+`--no-cache` forces a fresh read; a cached `rebase` can outlive an operator
+disabling rebase merges by up to those ten minutes.
 
 ## Contract
 
