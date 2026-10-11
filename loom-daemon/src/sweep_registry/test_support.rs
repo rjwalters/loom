@@ -1229,6 +1229,10 @@ pub(crate) use git_worktree_fixture::make_dirty_git_worktree;
 // It is an inherent method, so there is nothing to re-export here.
 mod activity_window;
 
+// `SweepRegistry::seed_entry_for_test` (Issue #11123) likewise lives in a child
+// module, `seed_entry`, to keep it out of the over-threshold `mod.rs`.
+mod seed_entry;
+
 /// [`make_dirty_git_worktree`] plus the other half of what a fixture worktree
 /// has always meant: **dirty and QUIET** (Issue #8487).
 ///

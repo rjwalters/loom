@@ -2,7 +2,8 @@
 //! `loom-daemon tokens check` (issue #8347, part of #8063).
 //!
 //! Uses `--source monitor` with `LOOM_CLAUDE_MONITOR_DIR` pointed at a seeded
-//! `ranking.json` so a report carrying real `7d_utilization` values is
+//! `ranking.json` (an inherited `LOOM_LLM_MONITOR_DIR` is removed — it would
+//! win, #8849) so a report carrying real `7d_utilization` values is
 //! produced without a probe — deterministic and network-free (the probe
 //! transport itself is already covered by `tokens_pool::check`'s unit tests).
 //! `LOOM_ACTIVITY_DB` redirects the sample write to a temp database so no
@@ -86,6 +87,7 @@ fn run_check(workspace: &Path, monitor_dir: &Path, db_path: &Path, extra: &[&str
 
     let out = Command::new(env!("CARGO_BIN_EXE_loom-daemon"))
         .args(&args)
+        .env_remove("LOOM_LLM_MONITOR_DIR")
         .env("LOOM_CLAUDE_MONITOR_DIR", monitor_dir)
         .env("LOOM_ACTIVITY_DB", db_path)
         .env("LOOM_SHARED_TOKENS_DIR", "")

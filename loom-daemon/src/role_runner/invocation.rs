@@ -195,6 +195,7 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
                     self.load_per_core_override,
                     backstop,
                     containment.take().map(|(selection, _)| selection),
+                    self.roll_resume.as_ref(),
                 )
             });
         self.trace_context = context;

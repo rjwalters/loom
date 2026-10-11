@@ -57,6 +57,13 @@ pub static CHAMPION_PATH_LABELS: crate::label_registry::LabelSet =
 pub const STARRED_AT_RETRY: Duration = Duration::from_secs(600);
 
 impl WorkItem {
+    /// Whether the issue carries `loom:very-important` (#11103): the new top
+    /// level, which shares the star's overflow slot and build back-off bypass.
+    #[must_use]
+    pub fn is_very_important(&self) -> bool {
+        crate::priority_pick::Level::of(&self.labels) == crate::priority_pick::Level::VeryImportant
+    }
+
     /// True when the issue is starred at any level (#9244, #10307): it
     /// carries a level label ([`crate::operator_levels`], own or inherited),
     /// or blocks a starred issue and inherits its star (#9244 C). Dispatch
@@ -102,7 +109,12 @@ impl WorkItem {
 /// A starred epic or proposal ([`CHAMPION_PATH_LABELS`]) is dropped from the
 /// starred rows too: the star does not make it build work. It keeps its
 /// Champion path (a starred epic is curated, then taken first by Champion's
-/// epic queue; #9244 slice B). The `loom:issue` rows are left as they are.
+/// epic queue; #9244 slice B). The `loom:issue` rows are not filtered here:
+/// an epic among them is dropped later by the ordinary skip filter, because
+/// `loom:epic` is a [`SKIP_LABELS`](super::SKIP_LABELS) entry (#11399), and so
+/// is counted and shown as a skipped row instead of vanishing. A promoted
+/// proposal (`loom:architect` and the like) on a `loom:issue` row stays
+/// dispatchable.
 #[must_use]
 pub fn merge_starred(mut ready: Vec<WorkItem>, starred: Vec<WorkItem>) -> Vec<WorkItem> {
     let listed: HashSet<u32> = ready.iter().map(|i| i.number).collect();

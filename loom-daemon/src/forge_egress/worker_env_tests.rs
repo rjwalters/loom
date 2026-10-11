@@ -285,8 +285,9 @@ fn legacy_args_only_without_a_managed_launcher() {
     assert_eq!(Admission::default().docker_args(lookup(&[])), ["-v", mount.as_str()]);
 }
 
-/// #10607: `container-args` parity-mounts the agent `gh` front's sink
-/// read-write under every admission, so `spawn-claude.sh` never grows.
+/// #10607: `container-args` mounts the agent `gh` front's sink — its
+/// `contained/` subdirectory, at the sink's path — read-write under every
+/// admission, so `spawn-claude.sh` never grows.
 #[test]
 fn container_args_parity_mount_the_agent_front_sink_read_write() {
     let sink = tempfile::tempdir().unwrap();
@@ -294,7 +295,7 @@ fn container_args_parity_mount_the_agent_front_sink_read_write() {
     let lookup = move |k: &str| -> Option<std::ffi::OsString> {
         (k == "LOOM_FORGE_CALL_STATS_DIR").then(|| dir.clone().into_os_string())
     };
-    let spec = format!("{0}:{0}", sink.path().display());
+    let spec = format!("{0}/contained:{0}", sink.path().display());
     // The mount is only for the daemon's own (private) sink, never an
     // arbitrary directory an env var names.
     #[cfg(unix)]

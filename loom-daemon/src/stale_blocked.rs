@@ -1,5 +1,6 @@
-//! `check-stale-blocked` — the fleet-wide re-check of every open `loom:blocked`
-//! issue (issue #8927, items 3 + 4 of that issue's own fix list).
+//! `check-stale-blocked` — the per-repository re-check of every open
+//! `loom:blocked` issue (issue #8927, items 3 + 4 of that issue's own fix
+//! list). One invocation covers one repository (#9191).
 //!
 //! # The gap this closes
 //!
@@ -72,6 +73,9 @@ pub mod release_task;
 // The release pass's per-artifact verdicts and their SigNoz export (#10752).
 pub mod release_items;
 pub mod release_telemetry;
+
+// Champion's merge-risk hold digest is exempt from the gather (#9397).
+pub mod digest;
 
 /// Which kind of artifact a finding is about.
 ///
@@ -388,7 +392,7 @@ pub fn classify(e: &Evidence) -> Verdict {
 /// called from `merge-pr.sh`'s post-merge path). It narrows the open
 /// `loom:blocked` population to the artifacts that named a just-closed
 /// issue/PR, so the close path neither re-reports blocks that were already
-/// stale (the fleet-wide advisory's job) nor pays for a full [`Evidence`]
+/// stale (the `check-stale-blocked` advisory's job) nor pays for a full [`Evidence`]
 /// gather on every artifact — this runs on text already fetched, with no
 /// state lookups.
 ///

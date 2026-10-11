@@ -77,6 +77,8 @@ pub mod agent;
 pub mod buckets;
 #[path = "forge_call_stats_counters.rs"]
 pub mod counters;
+#[path = "forge_call_stats_ingest.rs"]
+pub mod ingest;
 #[path = "forge_call_stats_ops.rs"]
 pub mod ops;
 #[path = "forge_call_stats_sink.rs"]
@@ -98,8 +100,12 @@ pub enum Outcome {
     Ok,
     /// `304 Not Modified` — a free ETag hit.
     NotModified,
-    /// Rate-limited (classified like the breaker does).
+    /// Rate-limited (classified like the breaker does): the primary pool.
     RateLimited,
+    /// A secondary (burst / concurrency) limit, per
+    /// [`crate::forge_denial::Denial::SecondaryRateLimit`] (#11418). Kept
+    /// apart from [`Outcome::RateLimited`]: it says nothing about the pool.
+    SecondaryLimited,
     /// Any other failure.
     Error,
     /// Not sent (W4-C): a Hygiene / Observability read deferred because
@@ -399,12 +405,26 @@ pub fn classify(response: Option<&HttpResponse>, exit_ok: bool, stderr: &str) ->
     let outcome = match status {
         Some(304) => Outcome::NotModified,
         Some(200..=299) if exit_ok => Outcome::Ok,
+        _ if is_secondary_limit(response, stderr) => Outcome::SecondaryLimited,
         _ if crate::rate_limit_breaker::indicates_rate_limit(stderr) => Outcome::RateLimited,
         Some(429) => Outcome::RateLimited,
         Some(403) if exhausted => Outcome::RateLimited,
         _ => Outcome::Error,
     };
     (pool, outcome)
+}
+
+/// Is this refusal a secondary limit? The same test as
+/// [`crate::forge_denial::classify`], so the ledger and a caller's denial
+/// handling cannot disagree.
+#[must_use]
+pub fn is_secondary_limit(response: Option<&HttpResponse>, stderr: &str) -> bool {
+    let text = match response {
+        Some(r) => format!("{}\n{stderr}", r.body),
+        None => stderr.to_string(),
+    };
+    crate::forge_denial::classify(response.map(|r| r.status), &text, response.map(|r| &r.ratelimit))
+        == Some(crate::forge_denial::Denial::SecondaryRateLimit)
 }
 
 /// Record one `gh api --include` call by `caller` (see [`classify`]) with the
@@ -586,6 +606,7 @@ struct Counts {
     ok: u64,
     not_modified: u64,
     rate_limited: u64,
+    secondary_limited: u64,
     error: u64,
     shed: u64,
 }
@@ -596,6 +617,7 @@ fn bump(c: &mut Counts, outcome: Outcome) {
         Outcome::Ok => c.ok += 1,
         Outcome::NotModified => c.not_modified += 1,
         Outcome::RateLimited => c.rate_limited += 1,
+        Outcome::SecondaryLimited => c.secondary_limited += 1,
         Outcome::Error => c.error += 1,
         Outcome::Shed => c.shed += 1,
     }
@@ -728,6 +750,7 @@ impl Aggregate {
                 ok: c.ok,
                 not_modified: c.not_modified,
                 rate_limited: c.rate_limited,
+                secondary_limited: c.secondary_limited,
                 error: c.error,
                 shed: c.shed,
             })
@@ -743,6 +766,7 @@ impl Aggregate {
                 ok: c.ok,
                 not_modified: c.not_modified,
                 rate_limited: c.rate_limited,
+                secondary_limited: c.secondary_limited,
                 error: c.error,
                 shed: c.shed,
             })
@@ -761,6 +785,7 @@ impl Aggregate {
                 ok: c.ok,
                 not_modified: c.not_modified,
                 rate_limited: c.rate_limited,
+                secondary_limited: c.secondary_limited,
                 error: c.error,
                 shed: c.shed,
             })

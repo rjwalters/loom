@@ -1,15 +1,16 @@
-//! Issue #8514: what `run_tick` does when a roll is **already armed**.
+//! Issue #8514: what `run_tick` does when a roll is **already armed**, adapted
+//! to the pause trigger (#10831).
 //!
-//! #6007 made that case an unconditional skip — correct while the armed roll is
-//! still the right one to be waiting for, and wrong once a newer release has
-//! overtaken it: the host kept dispatch paused for up to its whole
-//! paused-dispatch budget converging on a binary that was already stale.
+//! An armed roll is normally an unconditional skip: the binary is provisioned
+//! and the restart is coming. It is wrong once a newer release has overtaken
+//! the roll's target and the roll could still be replaced.
 //!
 //! This module pins both halves end to end through `run_tick`: the skip is
-//! preserved verbatim for every shape that is not a superseded pending roll
-//! (that is the #6007 fail-safe, and the livelock it was built to prevent lives
-//! behind it), and exactly one shape — a *pending* auto-update roll whose
-//! artifact has been overtaken — supersedes instead.
+//! preserved for every shape that is not a supersedable roll (a pause that has
+//! already stopped agents, a teardown, an operator drain, the same artifact),
+//! and exactly one shape — a pause roll that has not stopped anything yet and
+//! whose artifact has been overtaken — supersedes instead. It also pins that
+//! each roll decision reaches `trigger_pause_roll` with its `target_source`.
 //!
 //! A sibling module rather than more lines in `tests.rs`, per
 //! `.loom/docs/file-size-policy.md` (that file is over the ratchet threshold).
@@ -18,18 +19,16 @@ use super::*;
 use crate::auto_update::supersede::ArmedRoll;
 use std::sync::Mutex;
 
-/// Issue #6007 — while a roll is already armed (in particular one *retained*
-/// across a refused deadline: dispatch paused, restart re-arming itself at
-/// quiescence) the loop must not rebuild or re-trigger. The binary is already
-/// provisioned, and a redundant `cargo build` would compete for CPU with the
-/// very in-flight sweeps the pending roll is waiting on.
+/// While a roll is already armed the loop must not rebuild or re-trigger. The
+/// binary is already provisioned, and a redundant `cargo build` would compete
+/// for CPU with the agents the pause is stopping.
 #[test]
 fn test_run_tick_skips_while_a_roll_is_already_armed() {
     struct PendingRollTrigger {
         calls: Arc<AtomicUsize>,
     }
-    impl DrainTrigger for PendingRollTrigger {
-        fn trigger(&self) -> bool {
+    impl RollTrigger for PendingRollTrigger {
+        fn trigger_pause_roll(&self, _target: &RollTarget) -> bool {
             self.calls.fetch_add(1, Ordering::SeqCst);
             true
         }
@@ -44,7 +43,7 @@ fn test_run_tick_skips_while_a_roll_is_already_armed() {
         check: stale("c1"),
         tree_clean: Some(true),
         dirty_paths: Vec::new(),
-        // Busy host — exactly the shape that made the roll go pending.
+        // A busy host: the roll no longer waits for it to go idle.
         in_flight: 3,
         rebuild_outcome: RebuildOutcome::Success,
         rebuild_calls: rebuild_calls.clone(),
@@ -59,7 +58,7 @@ fn test_run_tick_skips_while_a_roll_is_already_armed() {
     run_tick(&mut state, &status, &mut probe, &trigger, Duration::from_secs(0), DEFER);
 
     assert_eq!(rebuild_calls.load(Ordering::SeqCst), 0, "no redundant rebuild");
-    assert_eq!(trigger_calls.load(Ordering::SeqCst), 0, "no redundant drain trigger");
+    assert_eq!(trigger_calls.load(Ordering::SeqCst), 0, "no redundant roll trigger");
     let snap = status.snapshot();
     assert!(
         snap.note
@@ -73,13 +72,16 @@ fn test_run_tick_skips_while_a_roll_is_already_armed() {
 // ---- #8514: supersede-not-stack --------------------------------------
 
 /// A trigger standing in for a daemon that already has a roll armed. It reports
-/// the armed roll's identity, records every `trigger_for` target, and — when
-/// superseded — flips to "no roll armed" exactly as `DrainState::abort()` does.
+/// the armed roll's identity, records every `trigger_pause_roll` target, and —
+/// when superseded — flips to "no roll armed" exactly as
+/// `DrainState::abort_pause_roll()` does.
 struct ArmedTrigger {
     armed: Mutex<Option<ArmedRoll>>,
     /// Whether `supersede_roll` should claim it actually discarded a roll.
     supersede_succeeds: bool,
     targets: Arc<Mutex<Vec<Option<String>>>>,
+    /// The `target_source` of every triggered roll.
+    sources: Arc<Mutex<Vec<pause_manifest::TargetSource>>>,
     supersedes: Arc<Mutex<Vec<(String, String)>>>,
 }
 
@@ -89,6 +91,7 @@ impl ArmedTrigger {
             armed: Mutex::new(Some(armed)),
             supersede_succeeds: true,
             targets: Arc::new(Mutex::new(Vec::new())),
+            sources: Arc::new(Mutex::new(Vec::new())),
             supersedes: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -96,22 +99,16 @@ impl ArmedTrigger {
     fn pending(target: Option<&str>) -> Self {
         Self::new(ArmedRoll {
             target: target.map(str::to_string),
-            pending: true,
+            committed: false,
             then_exit: false,
-            refusals: 1,
         })
     }
 }
 
-impl DrainTrigger for ArmedTrigger {
-    fn trigger(&self) -> bool {
-        true
-    }
-    fn trigger_for(&self, target: Option<&str>) -> bool {
-        self.targets
-            .lock()
-            .unwrap()
-            .push(target.map(str::to_string));
+impl RollTrigger for ArmedTrigger {
+    fn trigger_pause_roll(&self, target: &RollTarget) -> bool {
+        self.targets.lock().unwrap().push(target.label.clone());
+        self.sources.lock().unwrap().push(target.source.clone());
         true
     }
     fn roll_in_progress(&self) -> bool {
@@ -151,7 +148,7 @@ fn busy_artifact_probe(
             hours_behind: None,
         },
         tree_clean: None,
-        // Exactly the shape that makes a roll go pending: sweeps in flight.
+        // Sweeps in flight: a pause roll starts anyway.
         in_flight: 3,
         fetch_outcome: RebuildOutcome::Success,
         fetch_calls: fetch_calls.clone(),
@@ -160,9 +157,9 @@ fn busy_artifact_probe(
 }
 
 /// The issue's headline case: a newer release published while the roll to the
-/// previous one is still pending must SUPERSEDE it — the host stops waiting out
-/// its paused-dispatch budget for a binary that is already stale, and re-arms
-/// for the new one instead.
+/// previous one is still pending (no agent stopped yet) must SUPERSEDE it — the
+/// host does not restart onto a binary that is already stale, and re-arms for
+/// the new one instead.
 #[test]
 fn test_run_tick_supersedes_a_pending_roll_when_a_newer_artifact_resolves() {
     let fetch_calls = Arc::new(AtomicUsize::new(0));
@@ -191,6 +188,38 @@ fn test_run_tick_supersedes_a_pending_roll_when_a_newer_artifact_resolves() {
         &[Some(format!("v0.19.30@{SHA_B}"))],
         "the replacement roll must be labelled with the artifact it rolls to"
     );
+    assert_eq!(
+        trigger.sources.lock().unwrap().as_slice(),
+        &[pause_manifest::TargetSource::AutoUpdate],
+        "an ordinary artifact roll enters the pause path as `autoupdate`"
+    );
+}
+
+/// #10831: a source rebuild (the checkout is ahead of the running binary)
+/// enters the same pause path, as `repo_ahead`, with no artifact label.
+#[test]
+fn test_a_source_rebuild_enters_the_pause_path_as_repo_ahead() {
+    let mut probe = FakeProbe {
+        check: stale("c1"),
+        tree_clean: Some(true),
+        dirty_paths: Vec::new(),
+        in_flight: 0,
+        rebuild_outcome: RebuildOutcome::Success,
+        rebuild_calls: Arc::new(AtomicUsize::new(0)),
+        low_priority_calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let trigger = ArmedTrigger::pending(None);
+    *trigger.armed.lock().unwrap() = None;
+    let status = AutoUpdateStatus::new(true);
+    let mut state = AutoUpdateState::new_with_record_path(None);
+
+    run_tick(&mut state, &status, &mut probe, &trigger, Duration::from_secs(0), DEFER);
+
+    assert_eq!(
+        trigger.sources.lock().unwrap().as_slice(),
+        &[pause_manifest::TargetSource::RepoAhead]
+    );
+    assert_eq!(trigger.targets.lock().unwrap().as_slice(), &[None]);
 }
 
 /// Superseding is not a licence to churn: a pending roll that already targets
@@ -214,19 +243,18 @@ fn test_run_tick_does_not_supersede_a_pending_roll_for_the_same_artifact() {
     assert!(note.contains("already targets"), "note: {note}");
 }
 
-/// A FIRST-ATTEMPT drain is still inside the deadline it was given, so a newer
-/// artifact does not yank it out from under the supervisor — #6007's fail-safe
-/// window is preserved exactly.
+/// A pause that has already stopped agents is past the point of no return: a
+/// newer artifact does not yank it out from under the supervisor (design §10,
+/// "once H4 has started it is too late to supersede").
 #[test]
-fn test_run_tick_never_supersedes_a_first_attempt_drain() {
+fn test_run_tick_never_supersedes_a_committed_pause() {
     let fetch_calls = Arc::new(AtomicUsize::new(0));
     let rebuild_calls = Arc::new(AtomicUsize::new(0));
     let mut probe = busy_artifact_probe("0.19.30", SHA_B, &fetch_calls, &rebuild_calls);
     let trigger = ArmedTrigger::new(ArmedRoll {
         target: Some("v0.19.24@aaaa".to_string()),
-        pending: false,
+        committed: true,
         then_exit: false,
-        refusals: 0,
     });
     let status = AutoUpdateStatus::new(true);
     let tmp = tempfile::tempdir().unwrap();
@@ -237,7 +265,7 @@ fn test_run_tick_never_supersedes_a_first_attempt_drain() {
     assert!(trigger.supersedes.lock().unwrap().is_empty(), "no supersede");
     assert_eq!(fetch_calls.load(Ordering::SeqCst), 0, "no fetch");
     let note = status.snapshot().note.unwrap_or_default();
-    assert!(note.contains("first attempt"), "note: {note}");
+    assert!(note.contains("too late"), "note: {note}");
 }
 
 /// A `fleet drain` teardown (`then_exit`) is an operator tearing the host down.
@@ -250,9 +278,8 @@ fn test_run_tick_never_supersedes_a_teardown_drain() {
     let mut probe = busy_artifact_probe("0.19.30", SHA_B, &fetch_calls, &rebuild_calls);
     let trigger = ArmedTrigger::new(ArmedRoll {
         target: Some("v0.19.24@aaaa".to_string()),
-        pending: true,
+        committed: false,
         then_exit: true,
-        refusals: 1,
     });
     let status = AutoUpdateStatus::new(true);
     let tmp = tempfile::tempdir().unwrap();

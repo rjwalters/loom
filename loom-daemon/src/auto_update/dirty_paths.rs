@@ -1,6 +1,5 @@
 //! The dirty-tree refusal's path detail (Issue #7608), moved verbatim out of
-//! `auto_update.rs` (frozen by `.loom/docs/file-size-policy.md`) to make room for the
-//! roll-window hooks (#9132).
+//! `auto_update.rs` (frozen by `.loom/docs/file-size-policy.md`).
 
 /// Append the first three `paths` (plus a count of any remainder) to `reason`
 /// (Issue #7608) — e.g. `"<reason> — dirty paths (2): foo.rs, bar.rs"`, or

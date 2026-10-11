@@ -183,8 +183,13 @@ PROJECT_HOOKS_WIRED=0
 # `gh` front first on an interactive session's PATH via `$CLAUDE_ENV_FILE`
 # (inherited by Task subagents). Matcher "" covers startup/resume/clear/compact;
 # the hook is fail-open and stdout-silent, and `LOOM_GH_SHIM=0` opts out.
-_PHOOK_TYPES=(PreToolUse PreToolUse PreToolUse PreToolUse UserPromptSubmit UserPromptSubmit Stop SessionStart)
-_PHOOK_MATCHERS=(Bash Bash "Edit|Write" "mcp__loom__.*" "" "" "" "")
+#
+# `roll-pause.sh` (#10830) is wired three times, match-all: PreToolUse parks a
+# daemon-dispatched agent's tool calls at a roll's safe point, and PostToolUse /
+# PostToolUseFailure close its in-flight ledger. It exits at once unless
+# LOOM_DAEMON_ITEM_ID is set, so attended sessions pay one `bash` start per call.
+_PHOOK_TYPES=(PreToolUse PreToolUse PreToolUse PreToolUse UserPromptSubmit UserPromptSubmit Stop SessionStart PreToolUse PostToolUse PostToolUseFailure)
+_PHOOK_MATCHERS=(Bash Bash "Edit|Write" "mcp__loom__.*" "" "" "" "" "*" "*" "*")
 _PHOOK_NAMES=(
     guard-destructive.sh
     guard-loom-workflow.sh
@@ -194,6 +199,9 @@ _PHOOK_NAMES=(
     methodology-inject.sh
     guard-background-subagents.sh
     gh-front-env.sh
+    roll-pause.sh
+    roll-pause.sh
+    roll-pause.sh
 )
 
 # Emit the fail-open, workspace-gated, transition-deferring command wrapper for a

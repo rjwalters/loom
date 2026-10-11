@@ -39,16 +39,30 @@ pipeline state already lives.
 - [PR verdict-label mutual exclusion: three independent layers (#8112)](#pr-verdict-label-mutual-exclusion-three-independent-layers-8112)
 - [Follow-up work](#follow-up-work)
 - [Label registry: the source of truth (#10013)](#label-registry-the-source-of-truth-10013)
+- [No-op hold (#10156)](#no-op-hold-10156)
 <!-- toc:end -->
 
 ## Two ways to reach a human (#10000)
 
-An agent reaches a human in exactly two ways: a call is a decision, a human task is a mail.
+Loom signals a human ask with **labels only** (#11087). It sends no mail and
+posts to no inbox or chat; a notifier failure can never reach a role's tick.
 
-1. **It needs a call made:** file a decision (`loom:operator-decision`, 2 to 4 ranked options, each with a why).
-2. **It needs a human to do something:** send one keyed mail to the loom-ui inbox saying in a sentence what to do, and resolve it when the item clears. Helper, key scheme and no-op-when-unconfigured behavior: [`inbox-mail.md`](inbox-mail.md).
+1. **A decision** (a call to make): `loom:operator-decision`, with 2 to 4
+   ranked options, each with a why.
+2. **A task** (something for a human to do): a human-gated label plus a park
+   record whose `reason="…"` says in one sentence what to do.
 
-Nothing else asks a human. The `loom:operator*` labels keep their engine meaning (skip, hold, dispatch lanes) and no label is removed; they are engine-internal, not how a human finds out. First user: the Champion critical-file hold (one mail once the PR is otherwise mergeable). Remaining holds are tracked on #10000.
+**Notifier contract.** The registry property `human_gated`
+(`loom-daemon labels list --property human_gated`) is the authoritative set of
+labels that mean "a human must act": `loom:operator`, `loom:operator-only` and
+its `-mechanical` / `-decision` / `-objective` sub-kinds, and `external`
+(maintainer approval). Not in it: `loom:operator-blocked` (self-clearing),
+`loom:needs-capability` (an agent capability gap), `loom:decision-malformed`
+(Curator repairs it), and the curation and claim labels. An external notifier
+(the 2am `github-events` worker) reads that property instead of hard-coding
+names, turns a human-gated label being added into a notification, and resolves
+it when the label is removed or the item closes or merges. Pinned by
+`label_registry::tests::human_gated_is_exactly_the_human_must_act_labels`.
 
 ## Definition
 
@@ -89,7 +103,7 @@ guard consults.
 
 ## `loom:operator-priority` is not a hold (#9244)
 
-`loom:operator-priority` (the operator's "star") shares a prefix with
+`loom:operator-priority` (the operator's "star"; being replaced by `loom:important` / `loom:very-important`, see [`priority-model.md`](priority-model.md)) shares a prefix with
 `loom:operator` but means the opposite: not "the engine stopped, a human must
 act" but "a human wants this landed ASAP, act now". It is the one "land this
 ASAP" signal; the older urgent label is retired (its `labels.yml` description
@@ -999,7 +1013,8 @@ above. Nothing about the guard changes for any other blocking label.
 label's name, description, color, `kind`, `applied_by`/`removed_by`, and the
 boolean properties the daemon's label tables encode (`park`, `skip`,
 `hold`, `operator_gate`, `blocked_colabel`, `hard_exclusion`, `champion_path`,
-`human_gated`, `merge_hold`, `operator_hold`, `contradicts_approval`). It is embedded in `loom-daemon`; query
+`human_gated` (the notifier contract, see "Two ways to reach a human"),
+`merge_hold`, `operator_hold`, `contradicts_approval`). It is embedded in `loom-daemon`; query
 it with `loom-daemon labels list --property park` / `labels get <name>`
 (non-zero exit on an unknown label or property).
 
@@ -1016,3 +1031,7 @@ against `requires_base`/`remove_with` (#5671). Changes go in the registry.
 `propagate` holds #10012's propagation table (`null` = never propagates);
 `star_liveness::propagation_rules` derives its rules from it.
 `stale_after_minutes` and `lifecycle` are inert.
+
+## No-op hold (#10156)
+
+A sweep that ends as a no-op (the `noop-cooldown record` IPC, or a Curator-only stop the reaper classifies) is counted per issue. After `autonomous.workFinder.noopCooldown.holdThreshold` consecutive no-ops (default 3, env `LOOM_WORK_FINDER_NOOP_HOLD_THRESHOLD`, `0` disables) with an unchanged fingerprint (labels minus claim churn, non-bot comments, linked-PR state, `## Dependencies` state), the daemon parks the issue: `loom:blocked` when dependencies are named, otherwise `loom:operator-only` + `loom:operator-decision`, with one `<!-- loom:noop-hold (#10156) -->` comment. `loom:operator-priority` does not exempt an issue and is never touched. To unpark, remove the park labels and re-add `loom:issue`; any new comment, label change, linked-PR change or dependency change also restarts the count.

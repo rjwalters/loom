@@ -439,9 +439,9 @@ fn failed_slugs(
     summary: &WorkFinderTickSummary,
     repos: &HashMap<String, QueueRepoRef>,
 ) -> Vec<String> {
+    // #11139: a partial listing's missing rows are as unknown as a failed one's.
     summary
-        .listing_failed
-        .iter()
+        .listing_not_whole()
         .filter_map(|root| repos.get(root).map(|r| r.repo.clone()))
         .collect()
 }
@@ -628,7 +628,7 @@ pub(in crate::observability) async fn record(slug_cache: &mut HashMap<String, St
         .queue
         .iter()
         .map(|r| r.repo.as_str())
-        .chain(summary.listing_failed.iter().map(String::as_str))
+        .chain(summary.listing_not_whole().map(String::as_str))
         .collect();
     let repos = super::super::repo_ref::resolve_repo_refs(roots, slug_cache).await;
     let (rows, dropped) = build_rows(&summary, &repos);

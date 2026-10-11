@@ -9,9 +9,10 @@ use chrono::{DateTime, Utc};
 
 use super::ready_queue;
 use crate::sweep_registry::{
-    ClaimLockDispatchError, CollisionDispatchError, DispatchBackoffError, LeaseOrderDispatchError,
-    LiveClaimDispatchError, OpenPrDispatchError, ParkedIssueDispatchError,
-    TokenSelectionDispatchError, WorkspaceCommandsMissingDispatchError,
+    AlreadyLandedDispatchError, ClaimLockDispatchError, CollisionDispatchError,
+    DispatchBackoffError, LandedEvidence, LeaseOrderDispatchError, LiveClaimDispatchError,
+    OpenPrDispatchError, ParkedIssueDispatchError, TokenSelectionDispatchError,
+    WorkspaceCommandsMissingDispatchError,
 };
 use crate::types::QueueDisposition as Qd;
 
@@ -80,6 +81,17 @@ pub struct TickReport {
     /// with the parent sweep, so without this guard an issue whose approved PR is
     /// still open would be re-dispatched the moment its sweep exits.
     pub skipped_pr_open: usize,
+    /// The subset of [`skipped_pr_open`](Self::skipped_pr_open) the batched
+    /// open-PR pre-filter (#8865, [`super::open_pr_prefilter`]) skipped from
+    /// the open-PR listing, with no `dispatch()` attempt and so no
+    /// [`Admission`] and no dispatch backoff. The remainder are refusals
+    /// `dispatch()`'s own guard still made (the listing could not be read).
+    ///
+    /// In-process only: it is not on the tick line and not exported in
+    /// `loom.dispatch.decisions`. Tests read it to tell the two paths apart;
+    /// an operator tells them apart by the admission span, which only an
+    /// in-dispatch refusal has.
+    pub pr_open_prefiltered: usize,
     /// Issues skipped because a **peer host** advertised a live soft claim over
     /// the safehouse room (Issue #4028, Phase 1). Counted under its **own**
     /// distinct reason — never folded into [`collisions`](Self::collisions)
@@ -143,6 +155,10 @@ pub struct TickReport {
     /// apparently-healthy sweep that produced nothing** and would otherwise be
     /// re-offered on the very next tick.
     pub skipped_prless_retry: usize,
+    /// Issues refused because their work already landed (Issue #11429).
+    pub skipped_already_landed: usize,
+    /// Issues refused because they are closed as not planned (Issue #11429).
+    pub skipped_already_closed: usize,
     /// Issues skipped because they self-declared a `<!-- loom:recheck-interval=
     /// <value> -->` marker (Issue #6685) and their own `updatedAt` is still
     /// within that interval — see [`WorkItem::is_within_recheck_interval`](super::WorkItem::is_within_recheck_interval).
@@ -237,6 +253,11 @@ pub struct TickReport {
     /// Workspaces whose ready-issue listing failed this tick, so their
     /// backlog is missing from [`Self::queue`] (Issue #8852).
     pub listing_failed: Vec<usize>,
+    /// Workspaces whose ready-issue listing returned only part of its queue
+    /// this tick (#11139): a later page failed, the page cap was hit, or the
+    /// listing moved mid-walk. Their rows ARE in [`Self::queue`], but a
+    /// missing row is not evidence the issue left the queue.
+    pub listing_incomplete: Vec<usize>,
     /// The subset of [`skipped_backoff`](Self::skipped_backoff) that lost the
     /// lease-order tie-break (`LeaseOrderDispatchError`, #6287). A subset, so
     /// the `backoff-skip` tally and `loom-daemon health` are unchanged;
@@ -279,9 +300,36 @@ pub struct TickReport {
     /// (#9244) was still unused when the tick finished, or `None` when the
     /// tick did not record it (Issue #9288).
     pub overflow_free: Option<bool>,
+    /// The tick's workspace draws (#11103): seed, and each draw's candidates,
+    /// weights, roll and pick, in order. `None` when nothing was drawn (an
+    /// idle tick, and the single-workspace tick).
+    pub workspace_draw: Option<super::workspace_draw::DrawLog>,
 }
 
 impl TickReport {
+    /// Record whether workspace `idx`'s listing came back whole (#11139).
+    pub fn note_listing(&mut self, idx: usize, complete: bool) {
+        if !complete {
+            self.listing_incomplete.push(idx);
+        }
+    }
+
+    /// Workspaces whose backlog this tick does not hold whole: the failed
+    /// listings and the incomplete ones, each once, in index order (#11139).
+    /// A consumer that reads a missing row as "left the queue" uses this.
+    #[must_use]
+    pub fn listing_not_whole(&self) -> Vec<usize> {
+        let mut idxs: Vec<usize> = self
+            .listing_failed
+            .iter()
+            .chain(&self.listing_incomplete)
+            .copied()
+            .collect();
+        idxs.sort_unstable();
+        idxs.dedup();
+        idxs
+    }
+
     /// An empty report for a multi-workspace tick run under these admission
     /// knobs.
     #[must_use]
@@ -307,6 +355,7 @@ impl TickReport {
             in_slice: None,
             repo_cap: None,
             overflow_free: None,
+            workspace_draw: None,
             ..self
         }
     }
@@ -436,6 +485,17 @@ fn classify(report: &mut TickReport, issue: u32, outcome: &Result<bool>) -> Outc
             parked.label
         );
         Outcome::new(Qd::Parked, Some(parked.label.to_string()), "refused", "labeled")
+    } else if let Some(landed) = e.downcast_ref::<AlreadyLandedDispatchError>() {
+        // #11429: the issue is closed, or this host just landed it.
+        log::info!("work_finder: skipping issue #{issue} — {e}");
+        if landed.evidence == LandedEvidence::ForgeClosedNotPlanned {
+            report.skipped_already_closed += 1;
+            Outcome::new(Qd::AlreadyClosed, None, "refused", "already_closed")
+        } else {
+            report.skipped_already_landed += 1;
+            let detail = Some(landed.detail().to_string());
+            Outcome::new(Qd::AlreadyLanded, detail, "refused", "already_landed")
+        }
     } else if e.downcast_ref::<DispatchBackoffError>().is_some() {
         // Dispatch backoff (#4485), possibly armed mid-tick by a reap.
         report.skipped_backoff += 1;
@@ -464,6 +524,13 @@ fn classify(report: &mut TickReport, issue: u32, outcome: &Result<bool>) -> Outc
         report.skipped_workspace_commands_missing += 1;
         log::warn!("work_finder: skipping issue #{issue} — {e}");
         Outcome::new(Qd::WorkspaceCommandsMissing, why, "refused", "workspace_commands_missing")
+    } else if let Some(held) = e.downcast_ref::<crate::workspace_hold::WorkspaceHeldDispatchError>()
+    {
+        // Defense in depth (#10719): the per-tick pre-filter holds the whole
+        // workspace; reaching here means the hold was set mid-tick.
+        log::info!("work_finder: skipping issue #{issue} — {e}");
+        let cause = held.kind.halt_cause().as_str();
+        Outcome::new(Qd::WorkspaceHalted, Some(cause.to_string()), "refused", cause)
     } else if e.downcast_ref::<TokenSelectionDispatchError>().is_some() {
         // Empty/unusable token pool (#4689, typed by #6614): a real failure,
         // still on `errors`, named because the remedy is the pool. The registry

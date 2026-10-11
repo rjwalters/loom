@@ -131,6 +131,12 @@ pub struct WorkFinderTickSummary {
     /// missing from [`Self::queue`], which is then incomplete, not empty.
     #[serde(default)]
     pub listing_failed: Vec<String>,
+    /// Repos whose ready-issue listing returned only part of its queue on
+    /// this tick (#11139: a later page failed, the page cap, a mid-walk
+    /// change). Their rows are in [`Self::queue`], but not all of them: a
+    /// consumer must not read a missing row as "left the queue".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub listing_incomplete: Vec<String>,
     /// The dispatch plan this tick's rows were annotated with (Issue #9288):
     /// slots, tick interval, shard posture, scope and key ordering. `None`
     /// for a single-workspace tick (which records no rows) and for a
@@ -353,6 +359,14 @@ impl CapacityWait {
 }
 
 impl WorkFinderTickSummary {
+    /// Repos whose backlog this tick does not hold whole: those in
+    /// [`Self::listing_failed`] and those in [`Self::listing_incomplete`]
+    /// (#11139). A consumer that reads a missing row as "left the queue" or
+    /// "not held" uses this, not `listing_failed` alone.
+    pub fn listing_not_whole(&self) -> impl Iterator<Item = &String> {
+        self.listing_failed.iter().chain(&self.listing_incomplete)
+    }
+
     /// The single-line skip-reason summary `loom-daemon health` renders —
     /// only the non-zero terms, so a clean tick reads `12 seen, 2 dispatched`
     /// rather than a wall of zeros.
@@ -382,6 +396,9 @@ impl WorkFinderTickSummary {
             if n > 0 {
                 parts.push(format!("{n} {label}"));
             }
+        }
+        if !self.listing_incomplete.is_empty() {
+            parts.push(format!("{} listing-incomplete", self.listing_incomplete.len()));
         }
         if self.collisions > 0 {
             parts.push(format!("{} cross-host-collision(s)", self.collisions));

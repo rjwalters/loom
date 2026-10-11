@@ -211,6 +211,36 @@ fn a_lock_expires_at_the_cap() {
     }
 }
 
+// --- #11221: the cap is sized above measured required-CI duration (~45 min) ---
+
+#[test]
+fn the_default_cap_is_two_hours_and_never_clamped() {
+    assert_eq!(DEFAULT_CAP_SECS, 7200);
+    const { assert!(DEFAULT_CAP_SECS <= MAX_CAP_SECS) };
+    assert_eq!(resolve_cap(None, &json!({})), 7200);
+}
+
+#[test]
+fn a_two_hour_cap_resolves_unclamped_from_env_and_config() {
+    assert_eq!(resolve_cap(Some("7200"), &json!({})), 7200);
+    let cfg = json!({"champion": {"chainLockCapSecs": 7200}});
+    assert_eq!(resolve_cap(None, &cfg), 7200);
+}
+
+#[test]
+fn a_default_cap_lock_outlives_required_ci_and_expires_at_two_hours() {
+    let lock = observed(DEFAULT_CAP_SECS, "2026-10-05T12:00:00Z");
+    let live = evaluate(&lock, &holder(9), DEFAULT_CAP_SECS, at("2026-10-05T12:45:00Z"), pending);
+    assert_eq!(
+        live.unwrap(),
+        Liveness::Live {
+            expires_at: at("2026-10-05T14:00:00Z")
+        }
+    );
+    let gone = evaluate(&lock, &holder(9), DEFAULT_CAP_SECS, at("2026-10-05T14:00:00Z"), pending);
+    assert_eq!(gone.unwrap(), Liveness::Expired(Expiry::Cap));
+}
+
 #[test]
 fn the_cap_is_measured_from_created_at_not_the_embedded_timestamp() {
     let mut lock = observed(1200, "2026-10-05T12:00:00Z");
@@ -461,6 +491,12 @@ fn stub_gh(dir: &Path) -> String {
         r#"#!/usr/bin/env bash
 printf '%s\n' "$*" >> "{d}/argv.log"
 if [ "$2" = "--include" ]; then
+  case "$3" in
+    repos/o/r/commits/*/check-runs*)
+      [ -f "{d}/runs.json" ] || exit 1
+      printf 'HTTP/2.0 200 OK\n\n'; cat "{d}/runs.json"; exit 0 ;;
+    repos/o/r/rules/branches/*) printf 'HTTP/2.0 200 OK\n\n[]'; exit 0 ;;
+  esac
   [ -f "{d}/comments.json" ] || exit 1
   page=1
   [[ "$3" =~ \&page=([0-9]+) ]] && page="${{BASH_REMATCH[1]}}"

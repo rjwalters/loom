@@ -21,8 +21,9 @@ It:
     `user/<uid>` — #4130, so it can also be (re)started headlessly over SSH)
     so it survives the launching session's death instead of a plain `nohup ...
     &`; on a systemd Linux host, installs + enables a `systemd --user` service
-    (#4268) that mirrors the launchd contract (Restart=on-success,
-    disable-on-stop, LOOM_DAEMON_SUPERVISOR=systemd) — see --no-systemd for the
+    (#4268) that mirrors the launchd contract (Restart=always minus the
+    stay-down exit codes, OOMPolicy=continue (#11058), disable-on-stop,
+    LOOM_DAEMON_SUPERVISOR=systemd) — see --no-systemd for the
     escape hatch; on a non-systemd Linux host (or with --no-systemd) it stays a
     plain nohup background job,
   - arms the autonomy-loss watchdog (#4011): on Darwin a SECOND launchd

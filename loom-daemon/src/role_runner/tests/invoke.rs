@@ -340,6 +340,12 @@ fn run_role_with_timeout_leaves_gh_config_dir_untouched_for_an_unregistered_root
 #[test]
 #[serial]
 fn test_invoke_appends_resolved_model_defaulting_to_sonnet() {
+    // #9360: "with no config" has to mean no ambient runtime pin either — an
+    // inherited `LOOM_RUNTIME=opencode` (every native dispatch worker's agent
+    // session) selects `resolve_dispatch_model`'s native branch, which has no
+    // shipped default, and the `--model` token asserted below is then never
+    // emitted at all.
+    let _runtime_env = ClearedLoomRuntimeEnv::new();
     let tmp = tempfile::tempdir().unwrap();
     let script =
         write_fake_script(tmp.path(), "fake-spawn.sh", "printf '%s\\n' \"$@\" > argv.txt; exit 0");

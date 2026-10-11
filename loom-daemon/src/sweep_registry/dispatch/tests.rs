@@ -5,11 +5,14 @@ use std::os::unix::fs::PermissionsExt;
 use std::time::SystemTime;
 use tempfile::tempdir;
 
-// The runtime-env guard lives in its own sibling file so this over-threshold
-// file does not grow (#9964, `.loom/docs/file-size-policy.md`).
-#[path = "cleared_runtime_env.rs"]
-mod cleared_runtime_env;
-use cleared_runtime_env::ClearedLoomRuntimeEnv;
+// RAII guard that clears the ambient runtime-selection env vars for the scope
+// of a test and restores them on drop. Some host/dev-container shells export
+// `LOOM_RUNTIME` (the `spawn-worker.sh` runtime selector) and every Loom agent
+// session is spawned with it pinned, where that ambient value silently outranks
+// the `runtimes.default` config precedence these tests exercise (#4739). The
+// local copy this alias replaced cleared only the global var, never the per-role
+// `LOOM_RUNTIME_<ROLE>` pin that decides the same binding (#9360).
+use crate::runtime_selection_test_support::ClearedRuntimeSelectionEnv as ClearedLoomRuntimeEnv;
 
 /// As [`ClearedLoomRuntimeEnv`] but for `GH_CONFIG_DIR` (#6529): the test
 /// process — or a PREVIOUS test in this same `#[serial]` suite — may

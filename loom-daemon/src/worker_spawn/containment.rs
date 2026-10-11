@@ -330,7 +330,19 @@ fn forwarded_by_name(name: &str) -> bool {
     }
     name.starts_with("LOOM_")
         || name.starts_with("SAFEHOUSE")
-        || matches!(name, "GH_TOKEN" | "GITHUB_TOKEN" | "NO_COLOR" | "TERM" | "CARGO_TARGET_DIR")
+        || matches!(
+            name,
+            "GH_TOKEN"
+                | "GITHUB_TOKEN"
+                | "NO_COLOR"
+                | "TERM"
+                | "CARGO_TARGET_DIR"
+                // An operator's own debuginfo choice (#11190): the in-container
+                // seam only keeps a value it can see as ambient, so without
+                // these it would inject its default over the host's setting.
+                | "CARGO_PROFILE_DEV_DEBUG"
+                | "CARGO_PROFILE_TEST_DEBUG"
+        )
 }
 
 /// Build the `docker run` command that re-execs `spawn-worker.sh` inside the
@@ -405,9 +417,11 @@ pub fn docker_command_with(
     // is the container boundary itself, not a flag.
     // #10607: the agent `gh` front's sink, resolved ONCE so the mount below
     // and the `-e` assignment further down always name the same directory —
-    // and only a directory that is a sink (`worker_sink_dir`).
-    let sink = crate::forge_call_stats::agent::worker_sink_dir();
-    let mounts = extra_mounts(&root, log, workspace, egress.is_some(), sink.as_deref());
+    // and only a directory that is a sink (`worker_sink_dir`). What is
+    // mounted there is the sink's `contained/` subdirectory only.
+    let sink = crate::forge_call_stats::agent::worker_sink_dir()
+        .and_then(|dir| crate::forge_call_stats::agent::container_mount(&dir));
+    let mounts = extra_mounts(&root, log, workspace, egress.is_some(), sink.as_ref());
     for (host, container, read_only) in mounts {
         command.arg("-v").arg(mount(&host, &container, read_only));
     }
@@ -458,15 +472,19 @@ pub fn docker_command_with(
         .arg(format!("LOOM_NATIVE_CONTAINMENT={KIND}"));
     // #10607: the host sink the front writes, by assignment (and mounted in
     // `extra_mounts`); the by-name pass below must not re-read the host's.
-    if let Some(dir) = &sink {
+    if let Some((_, dir)) = &sink {
         let key = crate::forge_call_stats::agent::SINK_DIR_ENV;
         command.arg("-e").arg(format!("{key}={}", dir.display()));
     }
 
     // --- Env passthrough, BY NAME ----------------------------------------
+    // #11190: a debuginfo variable set but EMPTY is not forwarded — by name,
+    // docker would hand the container the empty value, which cargo rejects
+    // outright wherever the in-container seam does not overwrite it.
     let mut names: Vec<String> = std::env::vars_os()
-        .filter_map(|(k, _)| k.into_string().ok())
-        .filter(|k| forwarded_by_name(k))
+        .filter_map(|(k, v)| k.into_string().ok().map(|k| (k, v)))
+        .filter(|(k, v)| forwarded_by_name(k) && !super::cargo_debuginfo::is_empty_cap_var(k, v))
+        .map(|(k, _)| k)
         .collect();
     names.extend(
         credentials
@@ -661,7 +679,7 @@ fn extra_mounts(
     log: Option<&Path>,
     workspace: &Path,
     managed_gh: bool,
-    sink: Option<&Path>,
+    sink: Option<&(PathBuf, PathBuf)>,
 ) -> Vec<(PathBuf, String, bool)> {
     let mut out = Vec::new();
     let home = std::env::var_os("HOME").map(PathBuf::from);
@@ -706,10 +724,11 @@ fn extra_mounts(
         }
     }
     // #10607: the agent `gh` front's sink (the daemon's, already checked to
-    // be a sink by the caller), parity-mounted read-write so a contained
-    // worker's rows outlive `--rm`.
-    if let Some(dir) = sink.filter(|d| !d.starts_with(workspace)) {
-        out.push((dir.to_path_buf(), dir.display().to_string(), false));
+    // be a sink by the caller): its `contained/` subdirectory, mounted
+    // read-write at the sink's path so a contained worker's rows outlive
+    // `--rm` and the host's own rows stay out of its reach.
+    if let Some((host, dir)) = sink.filter(|(_, d)| !d.starts_with(workspace)) {
+        out.push((host.clone(), dir.display().to_string(), false));
     }
     out
 }

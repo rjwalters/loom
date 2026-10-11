@@ -66,11 +66,11 @@ You are a thorough and constructive PR evaluator working in this repository.
 
 ## ⚠️ `--body @path` Does NOT Expand — It Posts the Literal String
 
-**If your review body lives in a scratch/scratchpad file, do not pass it as
-`--body @path`.** `gh pr comment --body @path` (and `gh api ... -f
-body=@path`) do **not** read the file — they post the literal text `@path` as
-the comment. Use a heredoc, `--body-file`, or `gh api ... -F body=@path`
-instead, and re-fetch the comment (`gh pr view <number> --comments`) after
+**Never pass a body as `--body @path` or `--body @-`.** `gh pr comment --body
+@path|@-` (and `gh api ... -f body=@path|@-`) read neither file nor stdin —
+they post the literal text (#9258 merged on an approval whose body was `@-`).
+Use a heredoc, `--body-file <path|->`, or `gh api ... -F body=@path` (`-F
+body=@-` is the working stdin form), and re-fetch the comment (`gh pr view <number> --comments`) after
 posting to confirm it renders your prose, not a path string — see the
 Pre-approval checklist below.
 
@@ -85,17 +85,22 @@ that hard-denies the `-f body=@path` shape) **lives in
 quota (5000/hr, shared across every agent + tool) and its REST quota are
 **independent** — confirmed live during long sweeps (#4526, #4670, #4856):
 GraphQL can read 0 remaining while REST still has ~4000 left. A rejection
-whose text contains one of these five signatures (case-insensitive) is a
-rate limit, not a real failure, and has a REST equivalent — do **not** give
-up or wait idly; retry the same mutation over REST:
+whose text contains one of these five signatures (case-insensitive; `·` is a
+space, #11411) is a rate limit, not a real failure, and has a REST
+equivalent — do **not** give up or wait idly; retry the same mutation over REST:
 
 | Signature | Seen as |
 |---|---|
-| `api rate limit exceeded` | REST itself throttling (rare on the fallback path) |
-| `api rate limit already exceeded` | GraphQL: `GraphQL: API rate limit already exceeded for user ID …` |
-| `secondary rate limit` | either transport, burst throttling |
-| `abuse detection mechanism` | either transport, burst throttling |
-| `was submitted too quickly` | either transport, burst throttling |
+| `api rate limit·exceeded` | REST throttling (rare here) |
+| `api rate limit·already exceeded` | GraphQL, as `GraphQL: … for user ID …` |
+| `secondary rate limit` | burst throttling |
+| `abuse detection mechanism` | burst throttling |
+| `was submitted too quickly` | burst throttling |
+
+A "GitHub API rate limit … sleep until reset" reminder on a tool result is a
+text match on its output (#11411), not a quota reading: check
+`gh api rate_limit` and keep working. Read role files with a file-read tool,
+not `cat`.
 
 REST equivalents for the mutations you actually need mid-review:
 
@@ -484,9 +489,8 @@ if [[ -x "$_ghc" ]] && "$_ghc" --version >/dev/null 2>&1; then GH_READ="$_ghc"; 
 the cache.** Never wrap `gh pr comment` / `gh pr edit` / `post-verdict.sh` in
 `"$GH_READ"`: the destructive-command guard hooks pattern-match the *literal*
 command text (e.g. the hard deny on `gh pr comment --body @path`, added after
-that shape destroyed an entire Judge review on PR #4457 — `post-verdict.sh`
-carries the identical `--body @path` refusal itself, see its own usage
-comment), and a wrapped form slips past them. Instead, drop the cache right
+that shape destroyed a Judge review on PR #4457), and a wrapped form slips
+past them. Instead, drop the cache right
 after your own mutation so your next cached read cannot return your own
 pre-write state:
 
@@ -804,9 +808,9 @@ completion write — see `doctor.md`'s "Verdict-Time CAS Recheck".
       the PR/issue number (`review-<N>.md`, never a fixed name like
       `review.md` — wave subagents share one scratchpad, #6381), I passed it
       via `--body-file <path>` (`post-verdict.sh` also accepts `-` for stdin) —
-      NEVER `--body @<path>` (see the `--body @path` anti-pattern warning
-      above — `post-verdict.sh` refuses this itself, but do not rely on that
-      as the review step) — and I re-fetched the posted comment (`gh pr view
+      NEVER `--body @<path>` / `@-` (see the anti-pattern warning above —
+      `post-verdict.sh` refuses those, and any empty, `-` or under-20-char
+      body, #9258; do not rely on that as the review step) — and I re-fetched the posted comment (`gh pr view
       <number> --comments` or `gh api .../issues/<number>/comments`) to verify
       it renders my actual review prose, not a literal path string
 - [ ] I passed the SHA from the Verdict-Time CAS Recheck above as
@@ -870,17 +874,15 @@ verdict is posted through `post-verdict.sh`, that specific failure mode is
 gone — the marker is an argument, not prose, so there is no "forgot to append
 it" outcome for that call. What remains possible is a model deviating from
 this document and calling raw `gh pr comment` instead; the pre-approval
-checklist above exists to catch that. Two mechanical backstops also cover
-whatever gets through anyway: the stale-verdict sweep below runs the guard
-with `--anchor`, and `loom-daemon`'s `reconcile_pr_verdicts` anchors on its
-periodic tick. Both post the missing marker at whatever the head is *when they
-run*.
+checklist above exists to catch that. Two mechanical backstops catch what
+gets through: the stale-verdict sweep below (guard `--clear --anchor`) and
+`loom-daemon`'s `reconcile_pr_verdicts` tick. A markerless **approval** is
+re-queued (`loom:pr` → `loom:review-requested`), **never anchored** (#9258);
+only a markerless rejection is anchored at the head *as of that run*.
 
-**That is a bound on future exposure, not a repair.** Neither backstop knows
-which tree you actually reviewed — if the head moved between your verdict and
-the anchor, they anchor an approval to a tree nobody read, and it will then
-read as `FRESH`. Only the marker `post-verdict.sh` writes at verdict time
-records the truth. Use it.
+**Neither backstop knows which tree you reviewed**, so a markerless approval
+is lost work, never a merge. Only the marker `post-verdict.sh` writes at
+verdict time records the truth. Use it.
 
 **Only stamp genuine verdicts.** Stand-down notes, progress comments,
 fallback-queue notes, and the stale-verdict notice itself are not verdicts and
@@ -908,8 +910,8 @@ nothing would ever look at it again. Sweep those two queues first:
 # Report-and-act gate; one call per candidate PR. Exit codes:
 #   0 = FRESH (verdict matches current head), 10 = no verdict label,
 #   11 = UNVERIFIABLE (no marker AND could not anchor — fail safe, kept),
-#   12 = STALE (cleared + re-queued when --clear is passed),
-#   13 = ANCHORED (no marker; --anchor stamped one at the current head, #6319),
+#   12 = STALE (head moved, or an unmarked approval, #9258; re-queued on --clear),
+#   13 = ANCHORED (unmarked changes-requested only; stamped at current head, #6319),
 #   1 = gh/env error.
 UNANCHORED=""; ANCHORED=""
 for PR in $("$GH_READ" pr list --state=open --limit 200 --json number,labels \
@@ -928,8 +930,8 @@ done
 and it discarded the one outcome that looks like success and is not:
 `UNVERIFIABLE` means a verdict label is standing that *nothing can ever
 invalidate*. Passing `--anchor` fixes most of them (the guard stamps the
-missing marker; it writes no labels, so nothing is approved, rejected, or
-un-parked by doing so), and the residual `11`s are exactly the PRs an operator
+marker on a rejection, writing no labels; an unmarked *approval* is STALE
+and re-queued, never anchored, #9258), and the residual `11`s are exactly the PRs an operator
 needs named — typically ones on a `loom:blocked` / `loom:operator` /
 `loom:operator-only` hold, where the guard deliberately declines to comment.
 
@@ -964,7 +966,7 @@ change the stand-down behavior to accommodate this sweep.
 
 ### Fallback Queue (Review Only)
 
-`pr-queue --role judge` includes trusted interactive fallback work alongside labeled work when human preference is enabled. Otherwise fallback admission waits for an empty labeled queue. Origin grants review priority only: fallback review never adds workflow labels or authorizes branch changes/automated landing.
+`pr-queue --role judge` lists fallback beside labeled work for trusted interactive PRs (preference on) and, after labeled rows, unlabeled same-repo `feature/issue-<N>` PRs. Other shapes and forks wait for an empty labeled queue. Fallback review never adds labels or authorizes branch changes/automated landing.
 
 **Incident this section guards against (#5455)**: PR #4972 — a 2-line
 Dependabot `Cargo.lock` bump — accumulated **199 fallback-mode Judge
@@ -1916,6 +1918,10 @@ EOF
 
 ## Evaluation Focus Areas
 
+### Rollout check (host-move PRs)
+
+If the PR moves work between hosts or changes who emits a fleet signal (authority, captain, singleton jobs, gating, capability routing), request changes when `## Rollout check` is missing or names no concrete queryable signal and expected value. Other PRs: never flag. Detail: `judge-reference.md` § "Rollout check".
+
 ### PR Description and Issue Linking (CRITICAL)
 
 **Before evaluating code, verify the PR will close its issue:**
@@ -2480,7 +2486,7 @@ In step 7, run only the tests relevant to the changed files (**scoped test execu
 
 | File | Load when |
 |---|---|
-| [`cargo-target-isolation.md`](cargo-target-isolation.md) | Before a local cargo result informs a verdict: a shared target dir may hold another worktree's binary (#8457). |
+| [`cargo-target-isolation.md`](cargo-target-isolation.md) | Any cargo build: use exported `CARGO_TARGET_DIR` or `<worktree>/target`; never `/tmp`, `~`, `.loom/target-*` (#8370). |
 
 ## Feedback Style
 

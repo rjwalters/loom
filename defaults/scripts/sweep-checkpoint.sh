@@ -78,8 +78,9 @@
 #
 # Usage:
 #   sweep-checkpoint.sh write <issue> <phase> [--task-id ID] [--pr-number N] [--attempt N] [--model M]
+#   sweep-checkpoint.sh begin <issue> <role> [--attempt N] [--model M]  # Telemetry only (#9935): open the phase's role-attempt span at dispatch; never touches the checkpoint file; no-op without an inherited trace
 #   sweep-checkpoint.sh read <issue>
-#   sweep-checkpoint.sh delete <issue>
+#   sweep-checkpoint.sh delete <issue> [--pr P]  # Also drops PR P's GLM-Doctor state (#11359); P defaults to the checkpoint's pr_number
 #   sweep-checkpoint.sh phase <issue>          # Print phase string only (or empty)
 #   sweep-checkpoint.sh attempt <issue>        # Print attempt number (empty if absent = attempt 1)
 #   sweep-checkpoint.sh model <issue>          # Print model string (empty if absent = default/unknown)
@@ -90,7 +91,7 @@
 # Exit codes:
 #   0 - success
 #   1 - usage / not found
-#   2 - invalid phase
+#   2 - invalid phase (or invalid role for begin)
 #   3 - I/O error
 
 # The native helper owns persistence and lifecycle tracing (#8525).

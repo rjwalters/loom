@@ -71,6 +71,17 @@ pub(crate) enum ScriptPortCommand {
     /// leaves the session classified as before.
     CodexSandboxNoop(super::codex_sandbox_noop_cli::CodexSandboxNoopArgs),
 
+    /// The daemon-roll pause hook and pause state (#10830). `hook` is inert
+    /// unless LOOM_DAEMON_ITEM_ID is set; an older binary lacking it leaves
+    /// every tool call unparked.
+    #[command(subcommand)]
+    RollPause(super::roll_pause_cli::RollPauseCommand),
+
+    /// Session handles for a roll resume (#10830): Claude `--session-id` /
+    /// `--resume` args, the Codex resume check, live Codex id capture.
+    #[command(subcommand)]
+    AgentResume(super::roll_pause_cli::AgentResumeCommand),
+
     /// The installed-Loom / daemon compatibility contract (#10716): `show`
     /// this daemon's claims (and a repo's), `check` them across adjacent
     /// releases in CI. Here, not in a script, per the shell-language policy.
@@ -88,19 +99,6 @@ pub(crate) enum ScriptPortCommand {
     /// lives here because `main.rs` is frozen by the file-size ratchet and this
     /// flattened enum is what keeps a new top-level subcommand free.
     ShellBudget(super::shell_budget::ShellBudgetArgs),
-
-    /// Seed and evaluate the ETA estimators (#9325, Phase 2 of #9289).
-    ///
-    /// `eta backfill` populates the stage-sample journal from `pr-latency`
-    /// history so the heuristics have a baseline on day one; `eta backtest`
-    /// replays a heuristic against real outcomes leak-free and scores it.
-    ///
-    /// Not a script port either: it lives here for the same
-    /// frozen-`main.rs` reason as `shell-budget` above, which is also what
-    /// keeps `eta` a real nested subcommand (`loom-daemon eta backfill`,
-    /// not a flattened top-level `backfill`) at zero cost to `main.rs`.
-    #[command(subcommand)]
-    Eta(super::eta_cmd::EtaCommand),
 
     /// `merge-pr.sh`'s closing-reference / partial-increment analysis (#8191,
     /// slice 1). Reads the PR body on stdin — it is untrusted external content
@@ -151,6 +149,8 @@ pub(crate) enum ScriptPortCommand {
     /// all path interpolation — four `ln -s "$src" "$dst"` pairs and a
     /// `find | read` loop — which is #7858's class. Exit 0 always: this is
     /// best-effort by contract and the worktree already exists.
+    /// `--retire-aliases` instead unlinks the pnpm `node_modules` aliases
+    /// pre-#8944 worktrees still carry (#9152; exit 1 if an unlink failed).
     WorktreeLink(super::worktree_link::WorktreeLinkArgs),
 
     /// `worktree.sh`'s crash-debris pre-flight (#8195, slice 5): the stale
@@ -320,6 +320,12 @@ pub(crate) enum ScriptPortCommand {
     /// self-replacement design and why `resolve_daemon_bin()` is the wrong
     /// helper for the post-roll version check.
     DaemonUpdate(super::daemon_update::DaemonUpdateArgs),
+    /// The atomic binary write behind `provision-daemon.sh` (#10983): `stage`
+    /// a candidate beside the destination, then `publish` it by rename,
+    /// keeping the binary it replaces. The script requires it; see
+    /// `cli/install_binary.rs`.
+    #[command(subcommand)]
+    InstallBinary(super::install_binary::InstallBinaryCommand),
 
     /// The combined "not a work item" label list for a role prompt's
     /// unfiltered fallback query (#8255): the fleet-wide hard exclusions
@@ -387,6 +393,13 @@ pub(crate) enum ScriptPortCommand {
     /// `contract`-category script per the shell language policy.
     GitBlobLines(super::git_blob_lines::GitBlobLinesArgs),
 
+    /// Curator's Affected-Files preflight (#9400): `affected-files check`
+    /// classifies each listed path against the build base. Not a port: it
+    /// replaces a bash loop inlined in the Curator prompt, which parked every
+    /// issue that listed a file it creates.
+    #[command(subcommand)]
+    AffectedFiles(super::affected_files_check::AffectedFilesCommand),
+
     /// The fleet singleton-job captain gate (#8848), shell-facing half: is
     /// THIS host the one declared to run `<job-name>`? Exit 0 arm, 3 another
     /// host is the captain, 4 no `fleet.captain` declared at all — three
@@ -415,13 +428,23 @@ pub(crate) enum ScriptPortCommand {
     /// manifest or an unrecognized `launch` key.
     RuntimeLaunchEnv(super::runtime_launch_cmd::RuntimeLaunchEnvArgs),
 
-    /// The fleet-wide `loom:blocked` re-check (#8927): every open
-    /// `loom:blocked` issue whose cited blocker has since closed/merged (a
-    /// stale block), plus every one carrying the label with no parseable
-    /// blocker reference at all (an undocumented block). The fourth pre-wave
-    /// advisory check, backing `check-stale-blocked.sh`. Strictly read-only,
-    /// **always exit 0** — it reports, it never relabels. Not a port: brand-new
-    /// logic, native from the start per the shell-language policy.
+    /// The per-repository `loom:blocked` re-check (#8927): one invocation
+    /// examines one repository (the one `--repo` / `--repo-root` resolves) and
+    /// reports every open `loom:blocked` issue or PR whose cited blocker has
+    /// since closed/merged (a stale block), plus every one carrying the label
+    /// with no parseable blocker reference at all (an undocumented block). The
+    /// fourth pre-wave advisory check, backing `check-stale-blocked.sh`.
+    /// Strictly read-only, **always exit 0** — it reports, it never relabels.
+    ///
+    /// Do not loop it across many repositories by hand (#9191): each
+    /// invocation is a fresh process with no rate-limit breaker (that exists
+    /// only in the running daemon), so a refusal stops nothing and reaches no
+    /// later repository, and the budget floor cannot see a GitHub secondary
+    /// rate limit. See `.loom/docs/github-authentication.md`
+    /// -> "Secondary rate limits and hand-rolled loops".
+    ///
+    /// Not a port: brand-new logic, native from the start per the
+    /// shell-language policy.
     CheckStaleBlocked(super::stale_blocked::StaleBlockedArgs),
 
     /// The `PreToolUse` decision for the `mcp__loom__*` tool namespace (#9108),
@@ -441,6 +464,13 @@ pub(crate) enum ScriptPortCommand {
     /// `contract`-category `check-guard-scan-contracts.sh`, which the
     /// shell-language policy and the #7810 shell-budget gate both send here.
     CheckGuardWiring(super::check_guard_wiring::CheckGuardWiringArgs),
+
+    /// The Renovate-side routing contract (#9418): every `labels` array in the
+    /// repo's Renovate config (top-level, `packageRules`, `vulnerabilityAlerts`,
+    /// `lockFileMaintenance`, …) contains `loom:review-requested`. Exit 1 on
+    /// any violation; no Renovate config is a clean no-op. Counterpart of
+    /// `check-dependabot-labels.sh` (#7577), in Rust per the shell policy.
+    CheckRenovateLabels(super::check_renovate_labels::CheckRenovateLabelsArgs),
 
     /// Guard configuration diagnostics (#10434): `guards status` shows each
     /// guard category's effective value and source, hook wiring, a decision-log
@@ -531,6 +561,22 @@ pub(crate) enum ScriptPortCommand {
     /// `super::forge_probe_cmd` for the exit-code and credential contract.
     ForgeProbe(super::forge_probe_cmd::ForgeProbeArgs),
 
+    /// `.loom/resync-ignore` pin fork-point provenance (#8726): `add` pins a
+    /// path and records the upstream commit it forked from in the additive
+    /// `.loom/resync-pin-base` sidecar; `status` reports per-pin drift. Not a
+    /// port: brand-new logic, native per the shell-language policy.
+    #[command(subcommand)]
+    ResyncPin(super::resync_pin_cmd::ResyncPinCommand),
+
+    /// Resync a workspace's installed Loom files from the payload embedded
+    /// in this binary, with no Loom source tree (#8961). What
+    /// `resync-installed.sh` hands off to when no `defaults/` tree resolves.
+    /// Writes the working tree only: no commit, no push. Refuses rather than
+    /// downgrade, and only a verified official release build applies. Exit 0
+    /// applied or in sync, 1 refused or failed, 2 `--dry-run` found changes.
+    /// Not a port: brand-new logic, native per the shell-language policy.
+    ResyncPayload(super::resync_payload_cmd::ResyncPayloadArgs),
+
     /// The versioned forge **operation inventory** and its accounting (#9777,
     /// phase 1 of epic #9769): the coverage validator, the unclassified-call
     /// change gate, the four-axis coverage report and the hosted-probe
@@ -568,10 +614,11 @@ impl ScriptPortCommand {
             ScriptPortCommand::ReleaseResolve(args) => args.run(),
             ScriptPortCommand::ReleaseExplain(args) => args.run(),
             ScriptPortCommand::CodexSandboxNoop(args) => args.run(),
+            ScriptPortCommand::RollPause(cmd) => cmd.run(),
+            ScriptPortCommand::AgentResume(cmd) => cmd.run(),
             ScriptPortCommand::InstallCompat(cmd) => cmd.run(),
             ScriptPortCommand::MergePr(cmd) => cmd.run(),
             ScriptPortCommand::ShellBudget(args) => args.run(),
-            ScriptPortCommand::Eta(cmd) => cmd.run(),
             ScriptPortCommand::MergePrRefs(cmd) => cmd.run(),
             ScriptPortCommand::WorktreeLock(cmd) => cmd.run(),
             ScriptPortCommand::CargoTargetDir(cmd) => cmd.run(),
@@ -598,6 +645,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::DaemonStart(args) => args.run(),
             ScriptPortCommand::Host(cmd) => cmd.run(),
             ScriptPortCommand::DaemonUpdate(args) => args.run(),
+            ScriptPortCommand::InstallBinary(cmd) => cmd.run(),
             ScriptPortCommand::FleetSend(args) => args.run(),
             ScriptPortCommand::SkipLabels(args) => args.run(),
             ScriptPortCommand::WorktreeState(cmd) => cmd.run(),
@@ -607,12 +655,14 @@ impl ScriptPortCommand {
             ScriptPortCommand::ReconcileStack(args) => args.run(),
             ScriptPortCommand::GenerateAgentSkills(args) => args.run(),
             ScriptPortCommand::GitBlobLines(args) => args.run(),
+            ScriptPortCommand::AffectedFiles(cmd) => cmd.run(),
             ScriptPortCommand::FleetCaptain(args) => args.run(),
             ScriptPortCommand::RoleToolPolicy(cmd) => cmd.run(),
             ScriptPortCommand::RuntimeLaunchEnv(args) => args.run(),
             ScriptPortCommand::CheckStaleBlocked(args) => args.run(),
             ScriptPortCommand::GuardMcpTools(args) => args.run(),
             ScriptPortCommand::CheckGuardWiring(args) => args.run(),
+            ScriptPortCommand::CheckRenovateLabels(args) => args.run(),
             ScriptPortCommand::Guards(cmd) => cmd.run(),
             ScriptPortCommand::PrLatency(args) => args.run(),
             ScriptPortCommand::ParkRecord(cmd) => cmd.run(),
@@ -624,6 +674,8 @@ impl ScriptPortCommand {
             ScriptPortCommand::ForgeInventory(cmd) => cmd.run(),
             ScriptPortCommand::MergeGroupCi(cmd) => cmd.run(),
             ScriptPortCommand::ForgeProbe(args) => args.run(),
+            ScriptPortCommand::ResyncPin(cmd) => cmd.run(),
+            ScriptPortCommand::ResyncPayload(args) => args.run(),
         }
     }
 }
@@ -843,6 +895,13 @@ pub(crate) enum MergePrCommand {
     /// — see `cli::merge_pr_version_policy`.
     VersionPolicy(super::merge_pr_version_policy::VersionPolicyArgs),
 
+    /// The pre-merge `workflow` token-scope guard (#10539): refuse a PR that
+    /// touches `.github/workflows/` when the `gh` token's `X-OAuth-Scopes` is
+    /// present and lacks `workflow`. Exit 1 = block (message on stdout), 0 =
+    /// proceed; fails open on any lookup error — see
+    /// `cli::merge_pr_workflow_scope`.
+    WorkflowScope(super::merge_pr_workflow_scope::WorkflowScopeArgs),
+
     /// The pre-merge merge-ordering guard (#3747 item 2, reshaped by #7982):
     /// discover open CHILD PRs still targeting this parent branch and
     /// ESTABLISH the postcondition `reconcile-stack.sh` needs by pinning the
@@ -915,6 +974,13 @@ pub(crate) enum MergePrCommand {
     /// Exit 0 with the decision, 2 = stdin unreadable. Silence is never a
     /// decision — see `cli::merge_pr_closed_building`.
     ClosedBuilding(super::merge_pr_closed_building::ClosedBuildingArgs),
+
+    /// Did THIS PR's merge close `--issue` (#8942)? The gate in front of
+    /// Champion Step 4's negated-reference reopen. Facts on stdin (the
+    /// `--print-query` GraphQL response and/or REST issue + pull objects);
+    /// exit 0 = yes, 1 = no, 3 = could not answer, each with one
+    /// `LOOM-CLOSED-BY-MERGE` line — see `cli::merge_pr_closed_by_merge`.
+    ClosedByMerge(super::merge_pr_closed_by_merge::ClosedByMergeArgs),
 
     /// The post-merge stacked-child reconcile PLAN (#3747 item 1): the
     /// parent-branch gate, the `[{number, headRefName}]` children-rollup parse
@@ -1025,6 +1091,7 @@ impl MergePrCommand {
             MergePrCommand::CheckRunsStreak(args) => args.run(),
             MergePrCommand::CheckRunsRollup(args) => args.run(),
             MergePrCommand::VersionPolicy(args) => args.run(),
+            MergePrCommand::WorkflowScope(args) => args.run(),
             MergePrCommand::StackedChildren(args) => args.run(),
             MergePrCommand::WorktreePrimary(args) => args.run(),
             MergePrCommand::WorktreeBranchFor(args) => args.run(),
@@ -1035,6 +1102,7 @@ impl MergePrCommand {
             MergePrCommand::PartialComment(args) => args.run(),
             MergePrCommand::ClassifyResponse(args) => args.run(),
             MergePrCommand::ClosedBuilding(args) => args.run(),
+            MergePrCommand::ClosedByMerge(args) => args.run(),
             MergePrCommand::ReconcilePlan(args) => args.run(),
             MergePrCommand::ReconcileChild(args) => args.run(),
             MergePrCommand::RetargetChildren(args) => args.run(),

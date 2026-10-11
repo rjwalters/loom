@@ -1,0 +1,117 @@
+//! #8370: a role tick's Loom-owned `CARGO_TARGET_DIR` (planned by the runner,
+//! created by the spawn) is gone once the tick returns, on every outcome.
+
+use super::*;
+
+/// The child creates the dir it was handed and records its path, then exits
+/// with `exit`. Returns the outcome and the path the child saw.
+fn tick(exit: i32) -> (RoleTickOutcome, PathBuf, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let seen = root.join("seen-run-target-dir");
+    let script = write_fake_script(
+        &root.join("bin"),
+        "spawn-worker.sh",
+        &format!(
+            "mkdir -p \"$LOOM_RUN_TARGET_DIR\" && echo x > \"$LOOM_RUN_TARGET_DIR/artifact\" && \
+             printf '%s' \"$LOOM_RUN_TARGET_DIR\" > '{}'\nexit {exit}",
+            seen.display()
+        ),
+    );
+    let ws = crate::write_scope_test_support::WritableRoot::register(root);
+    let outcome = run_role_with_timeout(
+        &script,
+        root,
+        &ws.gh,
+        "doctor",
+        "/loom:doctor",
+        root.join("logs"),
+        Duration::from_secs(30),
+        "",
+        "default",
+        "",
+        "default",
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    let dir = PathBuf::from(fs::read_to_string(&seen).unwrap());
+    (outcome, dir, tmp)
+}
+
+#[test]
+#[serial]
+fn a_finished_role_tick_removes_its_run_target_dir_on_every_outcome() {
+    let _env = ClearedLoomRuntimeEnv::new();
+    for (exit, want_success) in [(0, true), (3, false)] {
+        let (outcome, dir, tmp) = tick(exit);
+        assert_eq!(matches!(outcome, RoleTickOutcome::Success), want_success, "{outcome:?}");
+        assert!(crate::run_target_dir::is_run_target_dir(&dir), "{}", dir.display());
+        assert!(dir.starts_with(crate::run_target_dir::targets_root(tmp.path())));
+        assert!(!dir.exists(), "run dir must be removed at run end (exit {exit})");
+    }
+}
+
+/// Judge finding 4 (#11013): the child exiting is not the tick's whole process
+/// group exiting. A descendant the harness backgrounded may still be building
+/// into the run dir, so it is left for the orphan sweep.
+#[cfg(unix)]
+#[test]
+#[serial]
+fn a_tick_that_leaves_a_live_descendant_keeps_its_run_target_dir() {
+    let _env = ClearedLoomRuntimeEnv::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let seen = root.join("seen-run-target-dir");
+    let pgid_file = root.join("pgid");
+    let script = write_fake_script(
+        &root.join("bin"),
+        "spawn-worker.sh",
+        &format!(
+            "mkdir -p \"$LOOM_RUN_TARGET_DIR\" && echo x > \"$LOOM_RUN_TARGET_DIR/artifact\" && \
+             printf '%s' \"$LOOM_RUN_TARGET_DIR\" > '{}'\nprintf '%s' $$ > '{}'\n\
+             sleep 60 >/dev/null 2>&1 </dev/null &\nexit 0",
+            seen.display(),
+            pgid_file.display()
+        ),
+    );
+    let ws = crate::write_scope_test_support::WritableRoot::register(root);
+    let outcome = run_role_with_timeout(
+        &script,
+        root,
+        &ws.gh,
+        "doctor",
+        "/loom:doctor",
+        root.join("logs"),
+        Duration::from_secs(30),
+        "",
+        "default",
+        "",
+        "default",
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    let dir = PathBuf::from(fs::read_to_string(&seen).unwrap());
+    let pgid: u32 = fs::read_to_string(&pgid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let kept = dir.join("artifact").is_file();
+    let group_was_alive = crate::run_target_dir::process_group_alive(pgid);
+    // Reap the stand-in for the detached build before asserting anything.
+    // SAFETY: `pgid` is the group this test's own child led (it wrote `$$`),
+    // and is > 1.
+    unsafe {
+        libc::kill(-i32::try_from(pgid).unwrap(), libc::SIGKILL);
+    }
+    assert!(pgid > 1);
+    assert!(matches!(outcome, RoleTickOutcome::Success), "{outcome:?}");
+    assert!(group_was_alive, "the backgrounded sleep should have outlived the script");
+    assert!(kept, "run dir must survive while the tick's group has a live member");
+}

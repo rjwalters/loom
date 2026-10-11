@@ -27,7 +27,9 @@ case "$*" in
     exit 1 ;;
 esac
 echo "$n 200" >> "$d/calls.log"
-printf 'HTTP/2.0 200 OK\r\nEtag: W/"%s"\r\n\r\n' "$e"
+printf 'HTTP/2.0 200 OK\r\nEtag: W/"%s"\r\n' "$e"
+[ "$(grep -o '"number"' "$d/page$n.json" | wc -l)" -ge 100 ] && [ ! -f "$d/last$n" ] && printf 'Link: <https://api.github.com/next>; rel="next"\r\n'
+printf '\r\n'
 cat "$d/page$n.json"
 # A scripted change: after page N is served once, its next version lands.
 if [ -f "$d/next$n.json" ]; then

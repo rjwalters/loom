@@ -12,6 +12,20 @@ pub(crate) enum DispatchModel<'a> {
 }
 
 impl DispatchModel<'_> {
+    /// `telemetry::model_source` for this request (#11280): `explicit` when
+    /// the caller named a non-empty model, `default` when the daemon or the
+    /// runtime chooses it.
+    pub(crate) fn source(self) -> &'static str {
+        match self {
+            Self::Resolved(Some(model)) | Self::Request(Some(model))
+                if !model.trim().is_empty() =>
+            {
+                crate::telemetry::model_source::EXPLICIT
+            }
+            _ => crate::telemetry::model_source::DEFAULT,
+        }
+    }
+
     pub(crate) fn resolve(
         self,
         config: &SweepRegistryConfig,

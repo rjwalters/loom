@@ -212,12 +212,6 @@ owner = "daemon-cli"
 removal_issue = 9799
 
 [[bypass]]
-path = "loom-daemon/src/cli/eta_cmd.rs"
-calls = 4
-owner = "daemon-cli"
-removal_issue = 9799
-
-[[bypass]]
 path = "loom-daemon/src/cli/merge_pr_consolidate.rs"
 calls = 11
 owner = "daemon-cli"
@@ -412,6 +406,12 @@ removal_issue = 9799
 [[bypass]]
 path = "loom-daemon/src/sweep_registry/guards.rs"
 calls = 4
+owner = "daemon-sweep"
+removal_issue = 9799
+
+[[bypass]]
+path = "loom-daemon/src/sweep_registry/noop_cooldown/hold.rs"
+calls = 3
 owner = "daemon-sweep"
 removal_issue = 9799
 

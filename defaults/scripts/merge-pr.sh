@@ -139,7 +139,7 @@
 #       reported, so merging now would move the base under it again (the
 #       #10163 livelock). Checked only under --auto or LOOM_CHAIN_LOCK_GUARD=1,
 #       before anything is written; nothing merged, nothing failed. Bounded
-#       by LOOM_CHAIN_LOCK_CAP_SECS (default 1200, max 3600);
+#       by LOOM_CHAIN_LOCK_CAP_SECS (default 7200, max 10800);
 #       LOOM_CHAIN_LOCK_OVERRIDE=1 bypasses it. Same caller contract as exits
 #       3/4/5 — re-queue, never a failure comment.
 
@@ -483,8 +483,9 @@ fi
 # existed. Labels here are verdict-gating/merge-gating data, i.e. the
 # deliberately-uncached class in docs/gh-cached.md, the same class the 15+
 # `forge_get_pr_nocache` rechecks further down already belong to.
-PR_JSON=$(forge_get_pr_nocache "$REPO_NWO" "$PR_NUMBER" "$GH") || \
-  error "Could not fetch PR #$PR_NUMBER"
+# A failed fetch names its cause -- status, meaning, forge message (#9192).
+_PRF_ERR="$(mktemp)"
+PR_JSON=$(forge_get_pr_nocache "$REPO_NWO" "$PR_NUMBER" "$GH" 2>"$_PRF_ERR") || error "Could not fetch PR #$PR_NUMBER -- $(forge_fetch_error_cause "$(cat "$_PRF_ERR"; rm -f "$_PRF_ERR")" "$PR_JSON")"; rm -f "$_PRF_ERR"; unset _PRF_ERR
 
 # Combined onto two lines (net code-line offset for the #8112 guard added
 # below — file-size-policy.md's "remove at least as much as you added"; a
@@ -621,6 +622,11 @@ _check_defaults_version_bump_collision() {
 # Invoke this guard too, before either merge path attempts the actual merge
 # API call — same reasoning as _check_no_open_stacked_children above.
 _check_defaults_version_bump_collision
+
+# Pre-merge workflow-scope guard (#10539): `loom-daemon merge-pr workflow-scope`.
+# Exit 1 = PR touches .github/workflows/ and the token lacks `workflow`; anything else proceeds (fail open, so an older daemon is a skip).
+_check_workflow_scope() { local out rc=0; [[ "${FORGE_TYPE:-github}" == "github" ]] || return 0; out="$("${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr workflow-scope --repo "$REPO_NWO" --pr "$PR_NUMBER" 2>/dev/null)" || rc=$?; [[ $rc -eq 1 ]] || return 0; [[ "${DRY_RUN:-false}" != "true" ]] || { warning "[dry-run] Would BLOCK: $out"; return 0; }; error "$out"; }
+_check_workflow_scope
 
 # _trusted_pr_comments <nwo> <pr> -- emit the bodies of `<nwo>`'s PR <pr>`
 # comments whose authors Loom trusts as control-signal sources (#9548): a repo

@@ -279,6 +279,24 @@
   description: "Land ASAP, not a hold. Applied by: humans/loom-ui; inherited by a starred parent's children"
   color: "CA8A04"  # yellow-600 - matches loom-ui's star
 
+# loom:important (#11103) is the middle of Loom's three priority levels (none /
+# important / very important). Within a workspace the queue order is level,
+# then oldest createdAt, then issue number. NOT a hold, never inherited by the
+# daemon: whoever sets the priority labels a blocker too. Applied by / removed
+# by: the operator, Guide and Champion alike.
+- name: loom:important
+  description: "Priority level 2 of 3: dispatched before unlabeled work (not a hold). Anyone may set."
+  color: "CA8A04"  # yellow-600 - the middle priority level
+
+# loom:very-important (#11103) is the top priority level. A workspace holding
+# dispatchable very-important work wins the workspace draw; a flood cap is
+# follow-up #11278, not enforced yet (see priority-model.md). NOT a hold,
+# never inherited by the daemon. Applied by / removed by: the operator, Guide
+# and Champion alike.
+- name: loom:very-important
+  description: "Priority level 3 of 3: wins the workspace draw (not a hold; cap lands in #11278). Anyone may set."
+  color: "B45309"  # amber-700 - one shade above important
+
 # loom:operator-high-priority (#10307) is operator priority LEVEL 2, the
 # double star: above loom:operator-priority, which it nests over (level >= 2
 # counts as starred everywhere; a level-2 item need not also carry the star).

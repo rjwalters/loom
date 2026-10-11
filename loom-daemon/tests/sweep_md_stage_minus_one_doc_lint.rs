@@ -234,6 +234,7 @@ fn run_bash_in(dir: &Path, script: &str, env: &[(&str, String)], unset: &[&str])
 /// extracted block — every one of them changes the block's decision.
 const POOL_ENV_LEAKS: &[&str] = &[
     "LOOM_ACCOUNTS_ENV",
+    "LOOM_LLM_MONITOR_DIR",
     "LOOM_CLAUDE_MONITOR_DIR",
     "LOOM_WORKTREE_ROOT",
     "LOOM_PER_WORKTREE_GB",
@@ -696,8 +697,9 @@ struct PoolCase {
     legacy_env_keys: Option<usize>,
     /// Same, for the claude-monitor master.
     monitor_keys: Option<usize>,
-    /// Reach the monitor master through `$HOME/.claude-monitor` instead of an
-    /// explicit `LOOM_CLAUDE_MONITOR_DIR`.
+    /// Reach the monitor master through `$HOME/.claude-monitor` (a 1.x host, no
+    /// `~/.llm-monitor`) instead of an explicit `LOOM_CLAUDE_MONITOR_DIR`. The
+    /// llm-monitor precedence matrix lives in `sweep_md_probe_pool_monitor_dir.rs`.
     monitor_via_home_default: bool,
     /// Same, for the opt-in home master.
     home_master_keys: Option<usize>,

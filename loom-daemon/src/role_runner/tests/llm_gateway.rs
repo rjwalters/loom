@@ -96,6 +96,7 @@ fn tick(runtime: &str) -> String {
         None,
         None,
         None,
+        None,
     );
     std::env::remove_var("LOOM_LLM_GATEWAY_URL");
     std::env::remove_var("LOOM_LLM_GATEWAY_VK");

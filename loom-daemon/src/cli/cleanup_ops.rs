@@ -128,6 +128,8 @@ pub(crate) fn handle_clean_command(
     let exit_code = clean::run_clean(&repo_root, &opts);
     if !worktrees_only && !branches_only && !tmux_only {
         clean_native_launch_state(dry_run, force);
+        clean_cargo_target_orphans(&repo_root, dry_run, force);
+        clean_idle_worktree_targets(&repo_root);
     }
     if exit_code != 0 {
         std::process::exit(exit_code);
@@ -170,6 +172,66 @@ fn clean_native_launch_state(dry_run: bool, force: bool) {
     if !remove && !report.is_empty() {
         println!("  Re-run with --force/-y to reclaim this space");
     }
+}
+
+/// Report (and, with `--force`/`-y`, remove) orphaned cargo target dirs under
+/// `.loom/targets/` and the known improvised prefixes — issue #8370. Same
+/// report-unless-forced rule as [`clean_native_launch_state`], for the same
+/// reason; `--dry-run` never removes and reports the bytes it would free.
+fn clean_cargo_target_orphans(repo_root: &std::path::Path, dry_run: bool, force: bool) {
+    use loom_daemon::target_orphan_reclaim as orphans;
+
+    let config = orphans::read_config(repo_root);
+    if !orphans::resolve_enabled(&config) {
+        return;
+    }
+    println!();
+    println!("Cleaning Orphaned Cargo Target Dirs\n");
+    let remove = force && !dry_run;
+    let report = orphans::run_now(repo_root, orphans::resolve_ages(&config), !remove);
+    let listed = if remove {
+        &report.removed
+    } else {
+        &report.eligible
+    };
+    for candidate in listed {
+        println!(
+            "  {} {} ({})",
+            if remove { "removed" } else { "orphaned" },
+            candidate.path.display(),
+            loom_daemon::tmpfs_reclaim::human_size(candidate.size_bytes)
+        );
+    }
+    for (path, why) in &report.failed {
+        println!("  error: {}: {why}", path.display());
+    }
+    println!("  {}", report.log_line());
+    if !remove && !report.eligible.is_empty() {
+        println!("  Re-run with --force/-y to reclaim this space");
+    }
+    orphans::log_report(&report);
+}
+
+/// Report the build caches of kept but idle `issue-<N>` / `pr-<N>` worktrees
+/// in this repo — issue #11071, the `category=worktree_target_idle` the
+/// daemon's reaper and below-floor tier trim. Report-only even with
+/// `--force`/`-y`: the fleet's scheduled `clean --deep --safe -y` must not
+/// gain a free-space-blind trim of every kept worktree's cache as a side
+/// effect; the daemon's own passes own the removal.
+fn clean_idle_worktree_targets(repo_root: &std::path::Path) {
+    use loom_daemon::worktree_reaper as reaper;
+
+    println!();
+    println!("Idle Worktree Build Caches (report only)\n");
+    let report = reaper::clean_idle_targets(&[repo_root.to_path_buf()], true);
+    for a in &report.removed {
+        println!(
+            "  idle {} ({})",
+            a.path().display(),
+            loom_daemon::tmpfs_reclaim::human_size(a.bytes)
+        );
+    }
+    println!("  category={} {}", reaper::IDLE_TARGET_CATEGORY, report.detail());
 }
 
 pub(crate) fn handle_cleanup_command(action: CleanupAction) -> Result<()> {

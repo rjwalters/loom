@@ -100,6 +100,7 @@ const SWEEP_SKILL_FILES: &[&str] = &[
     "sweep-dry-run.md",
     "sweep-mode-c-lifecycle.md",
     "sweep-wave-lifecycle.md",
+    "sweep-doctor-glm-escalation.md",
     "sweep-summary-output.md",
     "sweep-run-hygiene.md",
     "sweep-reference.md",
@@ -333,6 +334,52 @@ fn sweep_md_documents_refusal_fallback() {
         "sweep.md must state the refusal fallback re-dispatches without \
          consuming a Doctor cycle (#3702) — asserted via a tolerant phrasing set"
     );
+}
+
+/// #9265: a base-conflict Doctor with no Judge rejection outstanding is a
+/// "rebase pass" — outside `sweep.max_doctor_cycles`, bounded by its own budget
+/// of 3, parked with its own reason. Body:
+/// [`doc_lint_support::check_rebase_pass_carve_out`].
+#[test]
+fn sweep_md_documents_rebase_pass_carve_out_and_budget() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(SWEEP_SKILL_DIR_RELATIVE);
+    doc_lint_support::check_rebase_pass_carve_out(&read_sweep_md(), &dir);
+}
+
+/// #11359: both orchestration entry paths (issue-side §6 and Mode C C1b) and the
+/// Execution Model hand off to the one GLM-Doctor escalation doc, which names the
+/// config key, the three checkpoint verbs and the cap-stays-authoritative rule.
+/// Routing behavior itself is tested in `doctor_escalation` / `sweep_checkpoint`.
+#[test]
+fn sweep_md_documents_glm_doctor_escalation_on_both_entry_paths() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(SWEEP_SKILL_DIR_RELATIVE);
+    let read = |n: &str| fs::read_to_string(dir.join(n)).unwrap();
+    for entry in [
+        "sweep-wave-lifecycle.md",
+        "sweep-mode-c-lifecycle.md",
+        "sweep-execution-model.md",
+    ] {
+        assert!(
+            read(entry).contains("sweep-doctor-glm-escalation.md"),
+            "{entry} must hand off to sweep-doctor-glm-escalation.md"
+        );
+    }
+    let doc = read("sweep-doctor-glm-escalation.md");
+    for needle in [
+        "sweep.glmDoctorRejectionsBeforeEscalation",
+        "doctor-attempt",
+        "doctor-rejection",
+        "doctor-route",
+        "doctor-clear",
+        "--kind rebase",
+        "pr-P-doctor.json",
+        "--escalate-claude",
+        "route=cap-exhausted",
+        "never changes `sweep.max_doctor_cycles`",
+    ] {
+        assert!(doc.contains(needle), "missing {needle}");
+    }
+    assert!(read("sweep.md").contains("sweep-doctor-glm-escalation.md"));
 }
 
 /// #3702: the hard invariant that Judge model resolution can never resolve to
@@ -923,6 +970,21 @@ fn sweep_md_documents_orphan_recovery_gate_warning() {
 #[test]
 fn sweep_md_step_1b_publishes_an_in_session_lease_after_step_1a() {
     doc_lint_support::check_step_1b_lease_publish(&read_sweep_md());
+}
+
+/// #8881: Mode A/B pre-flight skips a `loom:epic` container — even a
+/// daemon-dispatched `--claim-owned` one — and releases the claim without
+/// restoring `loom:issue`. Reads `sweep-wave-lifecycle.md` ALONE: the
+/// concatenated skill already carries `loom:epic` in the `all` taxonomy, so an
+/// unscoped check would pass without the rule. Body (line-sliced, recipe
+/// executed): [`doc_lint_support::check_mode_ab_epic_preflight_skip`].
+#[test]
+fn sweep_md_mode_ab_preflight_skips_epics_without_requeueing_them() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join(SWEEP_SKILL_DIR_RELATIVE)
+        .join("sweep-wave-lifecycle.md");
+    let wave = fs::read_to_string(&path).expect("read sweep-wave-lifecycle.md");
+    doc_lint_support::check_mode_ab_epic_preflight_skip(&wave);
 }
 
 /// #6320's second point: `--no-daemon` names dispatch, not isolation. The

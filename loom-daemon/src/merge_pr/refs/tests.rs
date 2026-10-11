@@ -385,6 +385,57 @@ fn non_closing_keywords_and_other_issues_are_not_references() {
     assert!(!has_unnegated_closing_ref("", 42));
 }
 
+// --- #11402: repository-qualified closing references ---
+
+#[test]
+fn a_qualified_reference_naming_this_repo_is_a_closing_reference() {
+    for body in [
+        "Closes rjwalters/loom#42",
+        "Fixes rjwalters/loom#42.",
+        "resolves RJWALTERS/LOOM#42",
+        "Closes rjwalters/loom#42, and #43 for good measure",
+    ] {
+        assert!(has_unnegated_closing_ref_in_repo(body, "rjwalters/loom", 42), "{body:?}");
+        // The bare parser deliberately cannot see the qualified shape.
+        assert!(!has_unnegated_closing_ref(body, 42), "{body:?}");
+    }
+}
+
+#[test]
+fn a_qualified_reference_naming_another_repo_is_never_this_reference() {
+    for body in [
+        "Closes other/repo#42",
+        "Closes rjwalters/loomx#42",
+        "Related to rjwalters/loom#42",
+    ] {
+        assert!(!has_unnegated_closing_ref_in_repo(body, "rjwalters/loom", 42), "{body:?}");
+    }
+}
+
+#[test]
+fn the_repo_aware_parser_keeps_the_bare_and_negation_rules() {
+    assert!(has_unnegated_closing_ref_in_repo("Closes #42", "rjwalters/loom", 42));
+    assert!(!has_unnegated_closing_ref_in_repo("Closes #43", "rjwalters/loom", 42));
+    assert!(!has_unnegated_closing_ref_in_repo(
+        "Does not close rjwalters/loom#42",
+        "rjwalters/loom",
+        42
+    ));
+    assert!(!has_unnegated_closing_ref_in_repo("Doesn't fix #42", "rjwalters/loom", 42));
+    // A negated qualified ref does not suppress a genuine bare close later
+    // in the body, and vice versa: each clause stands alone.
+    assert!(has_unnegated_closing_ref_in_repo(
+        "Does not close rjwalters/loom#42. Closes #42 here.",
+        "rjwalters/loom",
+        42,
+    ));
+    assert!(has_unnegated_closing_ref_in_repo(
+        "Does not close #42. Closes rjwalters/loom#42 here.",
+        "rjwalters/loom",
+        42,
+    ));
+}
+
 // --- Judge review on PR #8823: tri-state status, no-reference vs negated ---
 
 #[test]

@@ -222,6 +222,15 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     ".loom/exit-codes/",
     ".loom/sweep-checkpoint/",
     ".loom/sweep-run/",
+    // Loom-owned per-run cargo target dirs (#8370): `worker_spawn` exports one
+    // as CARGO_TARGET_DIR for every role run, and `role_runner` / the orphan
+    // sweep remove them. Gigabytes of build output, never committable.
+    ".loom/targets/",
+    // Per-role/ad-hoc cargo target dirs under other names (#11075) — any dir
+    // cargo writes a CACHEDIR.TAG into must stay out of `git status` and so
+    // out of quarantine stashes.
+    ".loom/target*/",
+    ".cargo-target*/",
     // `.loom/state/` is daemon-written, per-host runtime state, ignored
     // WHOLESALE (#9592). It used to be ignored one subsystem at a time
     // (`ci-telemetry/` #8824, `fleet-captain/` #8901, `eta/` #9544), and each
@@ -241,12 +250,6 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     // the last matching pattern). Add a negation here only for a file a human
     // writes and wants committed — never for anything the daemon writes.
     "!.loom/state/detect-unlabeled-epics-dismissed",
-    // Concierge budget ledger (#7947): the per-day turn / per-tick relay
-    // counters the operator-agent persona consults at the top of every turn.
-    // Machine-local and disposable — deleting it costs at most one day's spent
-    // budget — but it must never be committed, or one host's spend would
-    // arrive as another host's starting balance.
-    ".loom/concierge/",
     ".loom/stats/",
     ".loom/diagnostics/",
     ".loom/guide-docs-state.json",
@@ -1052,7 +1055,6 @@ mod tests {
         };
 
         let writers = [
-            crate::observability::eta::pending_path(root),
             crate::ci_telemetry::state_dir(root).join("seen.jsonl"),
             crate::fleet_captain::shell_arm_registry_path(root),
             // A subsystem added after this test: must need no registration.
@@ -1182,16 +1184,16 @@ mod tests {
             // #9592: all daemon-written `.loom/state/` runtime state (the
             // pending-ETA ledger was committed once by a resync, 101aa8f66).
             ".loom/state/*",
-            // #7947: the concierge budget ledger. Committing it would hand one
-            // host's spent turn budget to every other host as a starting
-            // balance.
-            ".loom/concierge/",
             ".loom/diagnostics/",
             ".loom/guide-docs-state.json",
             ".loom/metrics_state.json",
             ".loom/manifest.json",
             ".loom/stuck-config.json",
             ".loom/metrics/",
+            // #8370: Loom-owned per-run cargo target dirs.
+            ".loom/targets/",
+            ".loom/target*/",
+            ".cargo-target*/",
             ".loom/usage-cache.json",
             ".loom/claude-config/",
             ".loom/native-tools/",

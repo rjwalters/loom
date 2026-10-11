@@ -13,7 +13,11 @@
 #
 # Rule:
 #   - pull_request: `changes` (Detect Changes) must be `success`. On push and
-#     merge_group it is legitimately `skipped` (no path filter there).
+#     merge_group it is legitimately `skipped` (it is PR-only). Push has one
+#     filter of its own, `changes-push` (#10825, the image jobs only): those
+#     jobs skip only when it succeeded with docker=false, and a failed or
+#     cancelled `changes-push` fails this gate by the next rule, so no extra
+#     case is needed here.
 #   - any job `failure` / `cancelled` (or any result other than success/skipped)
 #     fails the gate.
 #   - a `skipped` job passes only when the path filter really ran (`changes`

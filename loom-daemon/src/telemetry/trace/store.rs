@@ -4,9 +4,10 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::fs::{File, OpenOptions};
+use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 pub const TRACEPARENT_ENV: &str = "LOOM_TRACEPARENT";
 /// The standard W3C `traceparent` env var (#9215), mirrored from
@@ -20,6 +21,11 @@ pub const W3C_TRACEPARENT_ENV: &str = "TRACEPARENT";
 pub const CONTEXT_FILE_ENV: &str = "LOOM_TRACE_CONTEXT_FILE";
 const MAX_CONTEXT_BYTES: u64 = 4096;
 const MAX_ACTIVE_CONTEXTS: usize = 1024;
+/// How long [`TraceStore`] waits for its directory lock before reporting the
+/// store busy. Every holder does a few small file operations, so a real
+/// holder is gone in milliseconds; this bounds the wait when one is not.
+const LOCK_WAIT: Duration = Duration::from_millis(500);
+const LOCK_POLL: Duration = Duration::from_millis(5);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionContext {
@@ -117,7 +123,15 @@ impl TraceStore {
             .join(format!("{}.json", Self::identity(workspace, execution)))
     }
 
-    /// Nonblocking lock: unavailable local telemetry must never stall dispatch.
+    /// Bounded lock: unavailable local telemetry must never stall dispatch,
+    /// so a lock still held after [`LOCK_WAIT`] is an error, not a wait.
+    ///
+    /// It is not a single attempt (#10955). `flock` belongs to the open file
+    /// description, and a child forked by another thread while this file is
+    /// open shares that description until its `exec` closes it. For that
+    /// moment the lock outlives the `File` that took it, and the next caller
+    /// in a process that spawns children (the daemon, or a threaded test run)
+    /// found the store "busy" with nobody using it.
     fn lock(&self) -> Result<File> {
         std::fs::create_dir_all(&self.directory)?;
         #[cfg(unix)]
@@ -130,8 +144,16 @@ impl TraceStore {
             .truncate(false)
             .write(true)
             .open(self.directory.join(".lock"))?;
-        file.try_lock().context("trace context store busy")?;
-        Ok(file)
+        let deadline = Instant::now() + LOCK_WAIT;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(file),
+                Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    std::thread::sleep(LOCK_POLL);
+                }
+                Err(e) => return Err(e).context("trace context store busy"),
+            }
+        }
     }
 
     pub fn load_or_create(&self, workspace: &Path, execution: &str) -> Result<ExecutionContext> {

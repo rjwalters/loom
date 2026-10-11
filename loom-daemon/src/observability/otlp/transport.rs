@@ -58,13 +58,14 @@ pub(super) async fn post<T: Serialize + Sync>(
     client: &reqwest::Client,
     endpoint: &str,
     key: &str,
+    extra_headers: &super::RequestHeaders,
     signal: Signal,
     items: u64,
     body: &T,
 ) -> ResponseOutcome {
-    let result = client
-        .post(endpoint)
-        .bearer_auth(key)
+    // `apply` is `bearer_auth(key)` when there are no extra headers (#10961).
+    let result = extra_headers
+        .apply(client.post(endpoint), key)
         .json(body)
         .send()
         .await;

@@ -105,6 +105,8 @@ fn queue_gauges_map_to_otlp_gauges_and_queue_snapshot_maps_to_nothing() {
             counts: crate::telemetry::queue_snapshot::QueueStateCounts::default(),
             listing_failed: Vec::new(),
             listing_failed_unresolved: 0,
+            listing_incomplete: Vec::new(),
+            listing_incomplete_unresolved: 0,
             rows: Vec::new(),
             unresolved_rows: 0,
             rows_truncated: 0,

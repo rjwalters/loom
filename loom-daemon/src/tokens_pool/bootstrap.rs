@@ -14,9 +14,11 @@
 //! (case-insensitive) so a set of Claude accounts can be declared **once** and
 //! shared across every workspace. In **precedence order, highest first**:
 //!
-//! 1. **claude-monitor master (#3698)** — `~/.claude-monitor/accounts.env` when
-//!    present (dir via [`super::monitor::claude_monitor_dir`], overridable with
-//!    `LOOM_CLAUDE_MONITOR_DIR`). EMAIL+KEY-only entries auto-derive their token
+//! 1. **llm-monitor master (#3698, formerly claude-monitor)** —
+//!    `<monitor-dir>/accounts.env` when present (dir via
+//!    [`super::monitor::claude_monitor_dir`]: `LOOM_LLM_MONITOR_DIR`, else the
+//!    deprecated `LOOM_CLAUDE_MONITOR_DIR`, else `~/.llm-monitor`, else the 1.x
+//!    `~/.claude-monitor`; #8849). EMAIL+KEY-only entries auto-derive their token
 //!    filename (see [`derive_token_filename`]). Soft dependency: pure file
 //!    detection, no import of any claude-monitor package.
 //! 2. **Home master (#3695)** — **opt-in only** (#3704). Consulted only when
@@ -263,8 +265,8 @@ fn default_home_accounts_env() -> Option<PathBuf> {
     }
 }
 
-/// Resolve claude-monitor's master accounts file (#3698):
-/// `<claude-monitor-dir>/accounts.env`. The path may not exist on disk.
+/// Resolve llm-monitor's master accounts file (#3698):
+/// `<monitor-dir>/accounts.env` (shared resolver, #8849). The path may not exist on disk.
 fn default_claude_monitor_accounts_env() -> PathBuf {
     claude_monitor_dir().join(MONITOR_ACCOUNTS_ENV_NAME)
 }
@@ -1097,6 +1099,7 @@ pub fn bootstrap_tokens(opts: &BootstrapOptions) -> Result<BootstrapResult, Boot
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tokens_pool::monitor_dir::test_env::MonitorDirEnvGuard;
     use std::fs;
 
     // ---- derive_token_filename ----------------------------------------
@@ -1542,17 +1545,18 @@ mod tests {
         tmp
     }
 
-    fn isolate_env() {
+    fn isolate_env() -> MonitorDirEnvGuard {
         // Disable the home + monitor sources so tests never touch a real
-        // ~/.loom or ~/.claude-monitor.
+        // ~/.loom, ~/.llm-monitor, or ~/.claude-monitor. The guard clears an
+        // inherited LOOM_LLM_MONITOR_DIR too (#8849) and restores both on drop.
         std::env::set_var(HOME_ACCOUNTS_ENV_VAR, "");
-        std::env::set_var("LOOM_CLAUDE_MONITOR_DIR", "/nonexistent-monitor-xyz-4105");
+        MonitorDirEnvGuard::legacy("/nonexistent-monitor-xyz-4105")
     }
 
     #[test]
     #[serial_test::serial]
     fn bootstrap_repo_only_writes_pool_and_index() {
-        isolate_env();
+        let _monitor_env = isolate_env();
         let repo = scratch_repo(
             "ACCOUNT_EMAIL_1=alice@example.com\n\
              ACCOUNT_KEY_1=sk-ant-oat01-a\n\
@@ -1580,13 +1584,12 @@ mod tests {
         // Issue #9135: nothing lands in the repo-local `.loom/tokens` path.
         assert!(!repo.path().join(".loom").join("tokens").exists());
         std::env::remove_var(HOME_ACCOUNTS_ENV_VAR);
-        std::env::remove_var("LOOM_CLAUDE_MONITOR_DIR");
     }
 
     #[test]
     #[serial_test::serial]
     fn bootstrap_dry_run_writes_no_files() {
-        isolate_env();
+        let _monitor_env = isolate_env();
         let repo = scratch_repo("ACCOUNT_EMAIL_1=a@x.com\nACCOUNT_KEY_1=sk-ant-oat01-k\n");
         let opts = BootstrapOptions {
             repo_root: repo.path().to_path_buf(),
@@ -1600,13 +1603,12 @@ mod tests {
         assert_eq!(result.effective.len(), 1);
         assert!(!repo.path().join("pool").join("index.json").exists());
         std::env::remove_var(HOME_ACCOUNTS_ENV_VAR);
-        std::env::remove_var("LOOM_CLAUDE_MONITOR_DIR");
     }
 
     #[test]
     #[serial_test::serial]
     fn bootstrap_no_source_errors() {
-        isolate_env();
+        let _monitor_env = isolate_env();
         let tmp = tempfile::tempdir().unwrap();
         fs::create_dir_all(tmp.path().join(".loom")).unwrap();
         let opts = BootstrapOptions {
@@ -1622,13 +1624,12 @@ mod tests {
             other => panic!("expected NoSource, got {other:?}"),
         }
         std::env::remove_var(HOME_ACCOUNTS_ENV_VAR);
-        std::env::remove_var("LOOM_CLAUDE_MONITOR_DIR");
     }
 
     #[test]
     #[serial_test::serial]
     fn bootstrap_no_home_ignores_home_master() {
-        isolate_env();
+        let _monitor_env = isolate_env();
         let repo = scratch_repo("ACCOUNT_EMAIL_1=a@x.com\nACCOUNT_KEY_1=sk-ant-oat01-repo-key\n");
         // Point a home master at a file that WOULD add an account, then disable
         // it with home_env_path = Some(None).
@@ -1652,13 +1653,12 @@ mod tests {
         assert_eq!(result.effective[0].email, "a@x.com");
         assert!(result.home_env.is_none());
         std::env::remove_var(HOME_ACCOUNTS_ENV_VAR);
-        std::env::remove_var("LOOM_CLAUDE_MONITOR_DIR");
     }
 
     #[test]
     #[serial_test::serial]
     fn bootstrap_partial_triple_warns_without_aborting() {
-        isolate_env();
+        let _monitor_env = isolate_env();
         let repo = scratch_repo(
             "ACCOUNT_EMAIL_1=a@x.com\nACCOUNT_KEY_1=sk-ant-oat01-k\n\
              ACCOUNT_EMAIL_2=orphan@x.com\n",
@@ -1678,13 +1678,12 @@ mod tests {
             .iter()
             .any(|w| w.contains("incomplete triple")));
         std::env::remove_var(HOME_ACCOUNTS_ENV_VAR);
-        std::env::remove_var("LOOM_CLAUDE_MONITOR_DIR");
     }
 
     #[test]
     #[serial_test::serial]
     fn bootstrap_duplicate_filename_aborts() {
-        isolate_env();
+        let _monitor_env = isolate_env();
         // Two distinct emails forced onto the same token filename.
         let repo = scratch_repo(
             "ACCOUNT_EMAIL_1=a@x.com\nACCOUNT_KEY_1=k1\nACCOUNT_TOKEN_FILE_1=dup.token\n\
@@ -1703,13 +1702,12 @@ mod tests {
             other => panic!("expected DuplicateFile, got {other:?}"),
         }
         std::env::remove_var(HOME_ACCOUNTS_ENV_VAR);
-        std::env::remove_var("LOOM_CLAUDE_MONITOR_DIR");
     }
 
     #[test]
     #[serial_test::serial]
     fn bootstrap_shared_tokens_dir_override() {
-        isolate_env();
+        let _monitor_env = isolate_env();
         let repo = scratch_repo("ACCOUNT_EMAIL_1=a@x.com\nACCOUNT_KEY_1=sk-ant-oat01-k\n");
         let shared = tempfile::tempdir().unwrap();
         let shared_pool = shared.path().join("pool");
@@ -1727,6 +1725,5 @@ mod tests {
         // The repo-local pool was NOT written.
         assert!(!repo.path().join(".loom").join("tokens").exists());
         std::env::remove_var(HOME_ACCOUNTS_ENV_VAR);
-        std::env::remove_var("LOOM_CLAUDE_MONITOR_DIR");
     }
 }

@@ -353,9 +353,7 @@ mod tests {
                 issue,
                 sweep_id: format!("sweep-issue-{issue}-0"),
                 started_at: chrono::Utc::now(),
-                model: None,
-                effort: None,
-                runtime: None,
+                facts: Default::default(),
             }),
         )
     }

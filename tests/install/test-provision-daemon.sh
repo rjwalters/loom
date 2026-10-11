@@ -83,6 +83,56 @@ file_mtime() {
   printf '%s\n' "$v"
 }
 
+# ---------------------------------------------------------------------------
+# Test double for `loom-daemon install-binary` (#10983).
+#
+# provision_machine_daemon no longer writes the destination itself: it asks a
+# loom-daemon to `install-binary stage` the candidate beside the destination
+# and, after its own loadability check and signing, to `install-binary
+# publish` it. This suite has no compiled daemon (it is CI-wired on a runner
+# that builds none, and every "daemon" it installs is a bash fixture), so it
+# pins a stand-in through LOOM_DAEMON_INSTALL_HELPER, the same seam the Rust
+# updater uses to name its own running binary.
+#
+# What this suite therefore covers is the SCRIPT's half: that it stages
+# beside the destination, checks and signs the staged file, publishes only
+# through the helper, and leaves the destination alone when any step fails.
+# The helper's own half (the fsync'ed write-then-rename, the byte-identical
+# retained copy, its sha256, the transaction record, the refusal) is the Rust
+# in loom-daemon/src/daemon_update/provision.rs, tested there and, against
+# THIS script with the real binary, in
+# loom-daemon/tests/integration_install_binary.rs.
+#
+# FAKE_HELPER_REFUSE=1 makes `publish` refuse the way the real one does when
+# it cannot keep the previous binary: say why, remove the staged file, exit 1.
+# ---------------------------------------------------------------------------
+FAKE_HELPER="$WORKDIR/fake-install-helper"
+cat > "$FAKE_HELPER" <<'EOF_HELPER'
+#!/usr/bin/env bash
+[[ "${1:-}" == "install-binary" ]] || exit 2
+case "${2:-}" in
+  stage)
+    staged="${4%/*}/.loom-daemon.loom-install.$$.0.0"
+    cp "$3" "$staged" && chmod 755 "$staged" || exit 1
+    echo "$staged"
+    ;;
+  publish)
+    if [[ -n "${FAKE_HELPER_REFUSE:-}" ]]; then
+      echo "Refusing to install: the current binary could not be kept at $4.previous" >&2
+      rm -f "$3"
+      exit 1
+    fi
+    if [[ -e "$4" ]]; then
+      cp "$4" "$4.previous.tmp" && mv -f "$4.previous.tmp" "$4.previous" || { rm -f "$3"; exit 1; }
+    fi
+    mv -f "$3" "$4"
+    ;;
+  *) exit 2 ;;
+esac
+EOF_HELPER
+chmod +x "$FAKE_HELPER"
+export LOOM_DAEMON_INSTALL_HELPER="$FAKE_HELPER"
+
 # Build a fake loom-daemon binary that prints $1 as its --version.
 make_fake_bin() {
   local path="$1" ver="$2"
@@ -144,7 +194,7 @@ chmod +x "$FAKE_FILE_DIR/file"
 # host has installed. Used by test 36 to assert the soft-pass contract.
 NO_FILE_DIR="$WORKDIR/no-file-bin"
 mkdir -p "$NO_FILE_DIR"
-for tool in uname mkdir install cp chmod rm ln readlink env bash sh head; do
+for tool in uname mkdir install cp mv chmod rm ln readlink env bash sh head; do
   tool_path="$(command -v "$tool" 2>/dev/null || true)"
   [[ -n "$tool_path" ]] && ln -sf "$tool_path" "$NO_FILE_DIR/$tool"
 done
@@ -281,12 +331,13 @@ assert_eq "non-Darwin: codesign is never invoked" "0" "$( [[ -e "$CODESIGN_MARKE
 
 # ---------- test 9: signing helper — codesign absent from PATH ----------
 # A curated PATH containing only the handful of tools provision_machine_daemon
-# actually needs (uname, mkdir, install, cp, chmod, env, bash/sh), deliberately
+# actually needs (uname, mkdir, install, cp, chmod, env, bash/sh, plus the mv
+# and rm the install-helper test double uses, #10983), deliberately
 # excluding codesign. Provisioning must still succeed with at most a warning
 # and never attempt to invoke a missing codesign.
 NO_CODESIGN_DIR="$WORKDIR/no-codesign-bin"
 mkdir -p "$NO_CODESIGN_DIR"
-for tool in uname mkdir install cp chmod env bash sh; do
+for tool in uname mkdir install cp mv rm chmod env bash sh; do
   tool_path="$(command -v "$tool" 2>/dev/null || true)"
   [[ -n "$tool_path" ]] && ln -sf "$tool_path" "$NO_CODESIGN_DIR/$tool"
 done
@@ -333,7 +384,12 @@ rc10=$?
 assert_eq "codesign success: provision returns 0" "0" "$rc10"
 codesign_args="$(cat "$CODESIGN_ARGS_FILE" 2>/dev/null || echo "<missing>")"
 assert_contains "codesign success: invoked with the stable identifier" "$codesign_args" "--identifier com.rjwalters.loom-daemon"
-assert_contains "codesign success: signs the installed DEST binary, not the source" "$codesign_args" "$DEST10/loom-daemon"
+# #10983: the file signed is the one STAGED beside the destination, before it
+# is published -- still the installed bytes, never the source, and no longer a
+# rewrite of the live path after the fact.
+assert_contains "codesign success: signs the staged copy beside DEST, not the source" "$codesign_args" "$DEST10/.loom-daemon.loom-install."
+assert_eq "codesign success: no staged file is left behind" "0" \
+  "$(find "$DEST10" -maxdepth 1 -name '.loom-daemon.loom-install.*' 2>/dev/null | wc -l | tr -d ' ')"
 
 # ---------- test 11: LOOM_CODESIGN_IDENTITY (#4244) — identity found in the
 # keychain -> codesign is invoked WITH that identity (not "-s -"). Fakes
@@ -1202,9 +1258,10 @@ assert_contains "unloadable fresh install: names the loadability check" "$out41"
 assert_contains "unloadable fresh install: reports the quarantine move" "$out41" "quarantined unloadable binary"
 assert_contains "unloadable fresh install: notes no previous binary to restore" "$out41" "no previous working binary to restore"
 
-# ---------- test 42: an unloadable UPGRADE quarantines the bad binary and
-# restores the previous WORKING binary, so the host is never left with
-# nothing runnable at $dest_bin. ----------
+# ---------- test 42: an unloadable UPGRADE quarantines the bad candidate and
+# never touches the previous WORKING binary (#10983: the check runs on the
+# staged file, so there is nothing to restore), so the host is never left
+# with nothing runnable at $dest_bin. ----------
 SRC42_GOOD="$WORKDIR/src42-good/loom-daemon"
 SRC42_BAD="$WORKDIR/src42-bad/loom-daemon"
 mkdir -p "$WORKDIR/src42-good" "$WORKDIR/src42-bad"
@@ -1215,17 +1272,25 @@ DEST42="$WORKDIR/dest42"
 _out42_first=$(LOOM_DAEMON_BIN_DIR="$DEST42" provision_machine_daemon "$SRC42_GOOD" 2>&1)
 rc42_first=$?
 assert_eq "unloadable upgrade: the good first install returns 0" "0" "$rc42_first"
+mtime42_before=$(file_mtime "$DEST42/loom-daemon")
+inode42_before=$(ls -i "$DEST42/loom-daemon" | awk '{print $1}')
 
 out42=$(LOOM_DAEMON_BIN_DIR="$DEST42" provision_machine_daemon "$SRC42_BAD" 2>&1)
 rc42=$?
 assert_eq "unloadable upgrade: provision returns 1 (soft failure)" "1" "$rc42"
-assert_eq "unloadable upgrade: dest binary is restored and still executable" "1" \
+assert_eq "unloadable upgrade: dest binary is still executable" "1" \
   "$( [[ -x "$DEST42/loom-daemon" ]] && echo 1 || echo 0 )"
-assert_eq "unloadable upgrade: restored binary reports the PREVIOUS working version" \
+assert_eq "unloadable upgrade: dest binary reports the PREVIOUS working version" \
   "loom-daemon 0.19.330" "$("$DEST42/loom-daemon" --version 2>/dev/null)"
+assert_eq "unloadable upgrade: dest binary is the SAME file, never replaced (inode unchanged)" \
+  "$inode42_before" "$(ls -i "$DEST42/loom-daemon" | awk '{print $1}')"
+assert_eq "unloadable upgrade: dest binary was not rewritten (mtime unchanged)" \
+  "$mtime42_before" "$(file_mtime "$DEST42/loom-daemon")"
 assert_eq "unloadable upgrade: exactly one quarantined copy exists" "1" \
   "$(find "$DEST42" -maxdepth 1 -name 'loom-daemon.badglibc-*' 2>/dev/null | wc -l | tr -d ' ')"
-assert_contains "unloadable upgrade: reports the restore" "$out42" "restored the previous working binary"
+assert_eq "unloadable upgrade: no staged file is left behind" "0" \
+  "$(find "$DEST42" -maxdepth 1 -name '.loom-daemon.loom-install.*' 2>/dev/null | wc -l | tr -d ' ')"
+assert_contains "unloadable upgrade: says the working binary was left untouched" "$out42" "was left untouched"
 
 # ---------- test 43: a second same-day quarantine does not clobber the
 # first -- both failed attempts stay on disk as evidence. ----------
@@ -1236,11 +1301,86 @@ out43=$(LOOM_DAEMON_BIN_DIR="$DEST42" provision_machine_daemon "$SRC43_BAD2" 2>&
 rc43=$?
 assert_eq "second same-day quarantine: provision still returns 1" "1" "$rc43"
 assert_contains "second same-day quarantine: reports the quarantine move" "$out43" "quarantined unloadable binary"
-assert_contains "second same-day quarantine: reports the restore" "$out43" "restored the previous working binary"
+assert_contains "second same-day quarantine: says the working binary was left untouched" "$out43" "was left untouched"
 assert_eq "second same-day quarantine: TWO quarantined copies now exist (neither clobbered)" "2" \
   "$(find "$DEST42" -maxdepth 1 -name 'loom-daemon.badglibc-*' 2>/dev/null | wc -l | tr -d ' ')"
-assert_eq "second same-day quarantine: restored binary still reports the working version" \
+assert_eq "second same-day quarantine: dest binary still reports the working version" \
   "loom-daemon 0.19.330" "$("$DEST42/loom-daemon" --version 2>/dev/null)"
+
+# ---------------------------------------------------------------------------
+# Stage-then-publish through the install helper (issue #10983)
+# ---------------------------------------------------------------------------
+
+# ---------- test 44: an upgrade is published through the helper, which keeps
+# the binary it replaces as loom-daemon.previous. ----------
+SRC44_OLD="$WORKDIR/src44-old/loom-daemon"
+SRC44_NEW="$WORKDIR/src44-new/loom-daemon"
+mkdir -p "$WORKDIR/src44-old" "$WORKDIR/src44-new"
+make_fake_bin "$SRC44_OLD" "0.19.900"
+make_fake_bin "$SRC44_NEW" "0.19.901"
+DEST44="$WORKDIR/dest44"
+_out44_first=$(LOOM_DAEMON_BIN_DIR="$DEST44" provision_machine_daemon "$SRC44_OLD" 2>&1)
+assert_eq "retained: a first-ever install keeps no previous copy" "0" \
+  "$( [[ -e "$DEST44/loom-daemon.previous" ]] && echo 1 || echo 0 )"
+out44=$(LOOM_DAEMON_BIN_DIR="$DEST44" provision_machine_daemon "$SRC44_NEW" 2>&1)
+rc44=$?
+assert_eq "retained: the upgrade returns 0" "0" "$rc44"
+assert_eq "retained: dest is the new version" "loom-daemon 0.19.901" "$("$DEST44/loom-daemon" --version 2>/dev/null)"
+assert_eq "retained: loom-daemon.previous is byte-identical to the binary that was live" "0" \
+  "$(cmp -s "$SRC44_OLD" "$DEST44/loom-daemon.previous"; echo $?)"
+assert_eq "retained: the previous copy still runs" "loom-daemon 0.19.900" "$("$DEST44/loom-daemon.previous" --version 2>/dev/null)"
+assert_eq "retained: no staged file is left behind" "0" \
+  "$(find "$DEST44" -maxdepth 1 -name '.loom-daemon.loom-install.*' 2>/dev/null | wc -l | tr -d ' ')"
+assert_contains "retained: reports the install" "$out44" "installed loom-daemon"
+
+# ---------- test 45: the helper REFUSES to publish (it could not keep the
+# previous binary): the script fails, says so, and the live binary is the
+# same file it was. ----------
+SRC45_NEWER="$WORKDIR/src45-newer/loom-daemon"
+mkdir -p "$WORKDIR/src45-newer"
+make_fake_bin "$SRC45_NEWER" "0.19.902"
+inode45_before=$(ls -i "$DEST44/loom-daemon" | awk '{print $1}')
+out45=$(FAKE_HELPER_REFUSE=1 LOOM_DAEMON_BIN_DIR="$DEST44" provision_machine_daemon "$SRC45_NEWER" 2>&1)
+rc45=$?
+assert_eq "refused publish: provision returns 1" "1" "$rc45"
+assert_eq "refused publish: dest still reports the version that was live" \
+  "loom-daemon 0.19.901" "$("$DEST44/loom-daemon" --version 2>/dev/null)"
+assert_eq "refused publish: dest is the SAME file (inode unchanged)" \
+  "$inode45_before" "$(ls -i "$DEST44/loom-daemon" | awk '{print $1}')"
+assert_contains "refused publish: the helper's reason reaches the operator" "$out45" "Refusing to install"
+assert_contains "refused publish: the script says dest was left untouched" "$out45" "it was left untouched"
+assert_eq "refused publish: no staged file is left behind" "0" \
+  "$(find "$DEST44" -maxdepth 1 -name '.loom-daemon.loom-install.*' 2>/dev/null | wc -l | tr -d ' ')"
+
+# ---------- test 46: NO helper can stage (none pinned; the candidate and the
+# installed binary are fixtures that do not know `install-binary`): nothing
+# is installed, and there is no in-place fallback. ----------
+out46=$(LOOM_DAEMON_INSTALL_HELPER="" LOOM_DAEMON_BIN_DIR="$DEST44" provision_machine_daemon "$SRC45_NEWER" 2>&1)
+rc46=$?
+assert_eq "no helper: provision returns 1" "1" "$rc46"
+assert_eq "no helper: dest still reports the version that was live" \
+  "loom-daemon 0.19.901" "$("$DEST44/loom-daemon" --version 2>/dev/null)"
+assert_eq "no helper: dest is the SAME file (inode unchanged)" \
+  "$inode45_before" "$(ls -i "$DEST44/loom-daemon" | awk '{print $1}')"
+assert_contains "no helper: names what is missing" "$out46" "install-binary"
+assert_contains "no helper: names the override" "$out46" "LOOM_DAEMON_INSTALL_HELPER"
+
+# ---------- test 47: a helper that is not a loom-daemon and prints something
+# other than a staged path beside the destination is not trusted. ----------
+BAD_HELPER="$WORKDIR/bad-install-helper"
+cat > "$BAD_HELPER" <<EOF_BAD
+#!/usr/bin/env bash
+echo "$WORKDIR/src45-newer/loom-daemon"
+EOF_BAD
+chmod +x "$BAD_HELPER"
+out47=$(LOOM_DAEMON_INSTALL_HELPER="$BAD_HELPER" LOOM_DAEMON_BIN_DIR="$DEST44" provision_machine_daemon "$SRC45_NEWER" 2>&1)
+rc47=$?
+assert_eq "untrusted helper output: provision returns 1" "1" "$rc47"
+assert_eq "untrusted helper output: dest is the SAME file (inode unchanged)" \
+  "$inode45_before" "$(ls -i "$DEST44/loom-daemon" | awk '{print $1}')"
+assert_eq "untrusted helper output: the candidate source was not moved or removed" "1" \
+  "$( [[ -x "$SRC45_NEWER" ]] && echo 1 || echo 0 )"
+assert_contains "untrusted helper output: says it could not stage" "$out47" "could not stage"
 
 # ---------- summary ----------
 echo ""

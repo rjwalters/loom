@@ -9,7 +9,7 @@ use chrono::{Duration as Cd, TimeZone, Utc};
 
 use super::capacity::{KEY_CAPACITY_LIMITED, KEY_STAR_BACKLOG};
 use super::state::{AlertState, Kind, Transition};
-use super::task::{inbox_payload, run_tick, AlertSink};
+use super::task::{run_tick, AlertSink, TickContext};
 use super::{classify, TokenCause};
 use crate::types::{
     CapView, CapacityReport, DaemonStatusReport, QueueDisposition, ReadyQueueRow,
@@ -68,14 +68,14 @@ fn disk_limited() -> CapView {
     }
 }
 
-/// An inbox stand-in: the only sink, as on a host with Safehouse disabled.
-struct Inbox(Arc<Mutex<Vec<serde_json::Value>>>);
-impl AlertSink for Inbox {
+/// A recording sink: every delivered transition as `(kind, key)`.
+struct Recorder(Arc<Mutex<Vec<(Kind, String)>>>);
+impl AlertSink for Recorder {
     fn name(&self) -> &'static str {
-        "inbox"
+        "recorder"
     }
-    fn deliver(&self, t: &Transition, host: &str) -> Result<(), String> {
-        self.0.lock().unwrap().push(inbox_payload(t, host));
+    fn deliver(&self, t: &Transition, _host: &str) -> Result<(), String> {
+        self.0.lock().unwrap().push((t.kind, t.key.clone()));
         Ok(())
     }
 }
@@ -87,7 +87,7 @@ fn t0() -> chrono::DateTime<Utc> {
 #[test]
 fn a_disk_limited_cap_and_a_starred_backlog_each_name_the_numbers() {
     let c = classify(&status(disk_limited(), 106), t0(), WINDOW, TokenCause::Exhausted);
-    let keys: Vec<_> = c.iter().map(|c| c.key).collect();
+    let keys: Vec<_> = c.iter().map(|c| c.key.as_str()).collect();
     assert_eq!(keys, vec![KEY_CAPACITY_LIMITED, KEY_STAR_BACKLOG]);
     let cap = &c[0];
     assert!(cap.headline.contains("Disk headroom"), "{}", cap.headline);
@@ -115,14 +115,14 @@ fn a_configured_cap_with_a_short_queue_asks_nothing() {
     assert!(classify(&status(configured, 12), t0(), WINDOW, TokenCause::Exhausted).is_empty());
     // A disk-limited cap is an ask even with nothing starred.
     let c = classify(&status(disk_limited(), 0), t0(), WINDOW, TokenCause::Exhausted);
-    assert_eq!(c.iter().map(|c| c.key).collect::<Vec<_>>(), vec![KEY_CAPACITY_LIMITED]);
+    assert_eq!(c.iter().map(|c| c.key.as_str()).collect::<Vec<_>>(), vec![KEY_CAPACITY_LIMITED]);
     assert!(!c[0].headline.contains("starred"));
 }
 
 #[test]
-fn each_ask_reaches_the_inbox_exactly_once_without_safehouse() {
-    let inbox = Arc::new(Mutex::new(Vec::new()));
-    let sinks: Vec<Box<dyn AlertSink>> = vec![Box::new(Inbox(inbox.clone()))];
+fn each_ask_reaches_the_sink_exactly_once() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let sinks: Vec<Box<dyn AlertSink>> = vec![Box::new(Recorder(sent.clone()))];
     let mut st = AlertState::new(3, Duration::from_secs(6 * 3600));
     // Three hours at 1-minute ticks while the backlog shifts between 100 and
     // 110 stars: the headline moves, the asks do not repeat.
@@ -131,20 +131,22 @@ fn each_ask_reaches_the_inbox_exactly_once_without_safehouse() {
         run_tick(
             &mut st,
             &sinks,
-            Some(&s),
+            &TickContext {
+                status: Some(&s),
+                window: WINDOW,
+                host: "worker-1",
+                pool_dir: None,
+                outputs: None,
+            },
             t0() + Cd::minutes(i64::from(m)),
-            WINDOW,
-            "worker-1",
-            None,
         );
     }
-    let sent = inbox.lock().unwrap().clone();
-    let keys: Vec<&str> = sent.iter().map(|p| p["key"].as_str().unwrap()).collect();
+    let delivered = sent.lock().unwrap().clone();
     assert_eq!(
-        keys,
+        delivered,
         vec![
-            "mail-worker-1-fleet-degraded-capacity-limited",
-            "mail-worker-1-fleet-degraded-star-backlog",
+            (Kind::Started, KEY_CAPACITY_LIMITED.to_string()),
+            (Kind::Started, KEY_STAR_BACKLOG.to_string()),
         ]
     );
     // Freeing disk clears the capacity ask (and, with 6 slots, the backlog).
@@ -157,11 +159,14 @@ fn each_ask_reaches_the_inbox_exactly_once_without_safehouse() {
         cleared.extend(run_tick(
             &mut st,
             &sinks,
-            Some(&status(freed, 12)),
+            &TickContext {
+                status: Some(&status(freed, 12)),
+                window: WINDOW,
+                host: "worker-1",
+                pool_dir: None,
+                outputs: None,
+            },
             t0() + Cd::minutes(m),
-            WINDOW,
-            "worker-1",
-            None,
         ));
     }
     assert_eq!(cleared.len(), 2);

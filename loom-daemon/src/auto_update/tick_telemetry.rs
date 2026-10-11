@@ -11,10 +11,10 @@ use chrono::{DateTime, Utc};
 
 use super::supersede::ArmedRoll;
 use super::{ArtifactResolution, UpdateCheck};
-use crate::eta::Provenance;
 use crate::telemetry::kinds::auto_update_tick::{
-    AutoUpdateTickRecord, DrainSnapshot, TickDecisionKind,
+    AutoUpdateTickRecord, DrainSnapshot, RollHeld, TickDecisionKind,
 };
+use crate::telemetry::provenance::Provenance;
 use crate::telemetry::TelemetryRecord;
 
 /// One tick's decision and the readings it was made from.
@@ -39,6 +39,13 @@ pub struct TickSummary {
     /// #10712: the unsatisfiable-floor stall standing after this tick, as its
     /// alert text. Raises the record to ERROR.
     pub floor_stall: Option<String>,
+    /// #10866: this tick logged the unsatisfiable-floor ERROR line (the stall
+    /// started, changed, or its reminder came due). Not on the tick record:
+    /// `floor_stall` there is the standing condition.
+    pub floor_alerted: bool,
+    /// #10880: the held-roll alert this tick raised (ERROR below the floor,
+    /// WARN otherwise). Set on every tick the roll stays held.
+    pub roll_held: Option<RollHeld>,
 }
 
 impl TickSummary {
@@ -55,11 +62,17 @@ impl TickSummary {
             in_flight: None,
             drain: armed.map_or_else(DrainSnapshot::default, |roll| DrainSnapshot {
                 armed: true,
-                pending: roll.pending,
-                refusals: roll.refusals,
+                // #10831: no roll is retained across a deadline any more, so
+                // `pending` now reports a roll that can no longer be
+                // superseded and `refusals` is always 0 (fields kept so the
+                // record's shape is unchanged).
+                pending: roll.committed,
+                refusals: 0,
                 target: roll.target.clone(),
             }),
             floor_stall: None,
+            floor_alerted: false,
+            roll_held: None,
         }
     }
 
@@ -112,6 +125,7 @@ pub fn record(
         in_flight: summary.in_flight.map(|n| n as u64),
         drain: summary.drain.clone(),
         floor_stall: summary.floor_stall.clone(),
+        roll_held: summary.roll_held.clone(),
         consecutive_failures,
         duration_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
         loom,

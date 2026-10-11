@@ -40,6 +40,7 @@ pub mod evidence;
 pub mod fetch;
 pub mod glibc;
 pub mod signature;
+pub mod source;
 
 pub use evidence::{fetch_and_verify_with_evidence, SignatureEvidence};
 pub use fetch::{

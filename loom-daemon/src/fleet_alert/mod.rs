@@ -15,8 +15,8 @@
 //! - [`capacity`] (pure, #10214) adds the host-level capacity asks: disk or
 //!   RAM headroom holding the cap below `maxConcurrent`, and a starred
 //!   backlog more than 3x the cap.
-//! - [`task`] delivers each transition to independent sinks: the event bus
-//!   (relayed to Matrix by Safehouse) and the loom-ui inbox.
+//! - [`task`] delivers each transition to its sinks: the event bus (relayed
+//!   to Matrix by Safehouse). Loom sends no inbox mail (#11087).
 //!
 //! **No forge calls anywhere in this path**: the whole point is that the alert
 //! still arrives while `gh` is rate-limited. `loom-daemon health` output and
@@ -32,6 +32,7 @@ use crate::types::DaemonStatusReport;
 
 pub mod capacity;
 pub mod causes;
+pub mod outputs;
 pub mod state;
 pub mod task;
 
@@ -42,7 +43,7 @@ mod tests;
 
 pub use causes::TokenCause;
 
-/// Condition keys (stable; used in the inbox mail key and persisted state).
+/// Condition keys (stable; used in the event key and persisted state).
 pub const KEY_TOKENS: &str = "tokens-zero-healthy";
 pub const KEY_DISPATCH: &str = "dispatch-halted";
 pub const KEY_ROLES: &str = "roles-persistent";
@@ -51,11 +52,13 @@ pub const KEY_ROLES: &str = "roles-persistent";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Condition {
     /// Stable identity (`KEY_*`).
-    pub key: &'static str,
+    pub key: String,
     /// What is wrong, one or two lines.
     pub headline: String,
     /// What to do about it.
     pub fix: String,
+    /// Evaluator severity: `true` for a critical condition, else normal.
+    pub critical: bool,
 }
 
 /// Evaluate a status report. `token_cause` is the best-effort reason the pool
@@ -76,7 +79,8 @@ pub fn classify(
     if tokens_zero {
         let (why, fix) = causes::token_text(token_cause);
         out.push(Condition {
-            key: KEY_TOKENS,
+            key: KEY_TOKENS.to_string(),
+            critical: false,
             headline: format!(
                 "Token pool has ZERO healthy accounts ({}/{} healthy, {} exhausted): {why}. \
                  Every dispatch dies at token selection.",
@@ -92,14 +96,16 @@ pub fn classify(
         .is_some_and(|t| t.halted);
     if status.main_health_gate_halted {
         out.push(Condition {
-            key: KEY_DISPATCH,
+            key: KEY_DISPATCH.to_string(),
+            critical: false,
             headline: "Dispatch is HALTED by the main-health gate (main is red).".to_string(),
             fix: "Fix or revert the commit that broke main; dispatch resumes on its own."
                 .to_string(),
         });
     } else if tick_halted && !tokens_zero {
         out.push(Condition {
-            key: KEY_DISPATCH,
+            key: KEY_DISPATCH.to_string(),
+            critical: false,
             headline: "Dispatch is HALTED: the last work-finder tick halted.".to_string(),
             fix: "Run `loom-daemon health` and read the dispatch section for the halt reason."
                 .to_string(),
@@ -122,7 +128,8 @@ pub fn classify(
         names.sort();
         names.dedup();
         out.push(Condition {
-            key: KEY_ROLES,
+            key: KEY_ROLES.to_string(),
+            critical: false,
             headline: format!(
                 "{} role(s) have PERSISTENT failures: {}.",
                 names.len(),

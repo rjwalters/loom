@@ -23,6 +23,7 @@ pub fn gate(d: QueueDisposition) -> Option<&'static str> {
         QueueDisposition::DeferredBuildBackoff => "build-backoff",
         QueueDisposition::DeferredOutOfSlice => "repo-slice",
         QueueDisposition::DeferredRepoCap => "repo-cap",
+        QueueDisposition::DeferredFileOverlap => "file-overlap",
         QueueDisposition::HostConstraint => "host-affinity",
         QueueDisposition::HostClassRefused => "host-class",
         _ => return None,

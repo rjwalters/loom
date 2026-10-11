@@ -2,9 +2,10 @@
 //!
 //! One log record per tick. The **body** is the record's JSON, so ClickHouse
 //! can `JSONExtract` the ranked candidate list (see `telemetry-schema.md` for
-//! the rank query). The attributes are `loom.kind` (`pick.decision`, the key
-//! the SigNoz queries filter on, #9881) and `loom.role`; both are already on
-//! the collector's `keep_keys` allowlist, so no collector change is needed.
+//! the rank query). The one attribute here is `loom.role`; `log_record_for`
+//! adds `loom.kind` (`pick.decision`, the key the SigNoz queries filter on,
+//! #9881) to every log kind centrally (#10899). Both are already on the
+//! collector's `keep_keys` allowlist, so no collector change is needed.
 //! The record time is the tick's `ended_at`.
 
 use opentelemetry_proto::tonic::common::v1::KeyValue;
@@ -21,10 +22,7 @@ pub(super) fn log_parts(
     let TelemetryRecord::PickDecision(r) = record else {
         return None;
     };
-    let attributes = vec![
-        kv_string("loom.kind", record.kind().to_string()),
-        kv_string("loom.role", r.role.clone()),
-    ];
+    let attributes = vec![kv_string("loom.role", r.role.clone())];
     let body = serde_json::to_string(r).unwrap_or_default();
     Some(("pick.decision", SeverityNumber::Info, nanos(r.ended_at), attributes, body))
 }

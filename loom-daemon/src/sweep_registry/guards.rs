@@ -26,11 +26,15 @@ mod gh_exec;
 /// Conditional 2.5/2.7 issue reads (W9), a child module because this file is
 /// frozen by `scripts/file-size-baseline.txt`.
 pub(crate) mod issue_snapshot;
+pub(crate) use issue_snapshot::IssueGate;
 mod rate_limit_report;
 #[cfg(test)]
 mod rate_limit_report_tests;
 /// The dispatch path's memo gating (resume reads live) and refusal ledger (W9).
 pub(crate) mod refusal_memo;
+/// #9247: the claim flip's one re-mint-and-retry.
+#[cfg(test)]
+mod stale_token_tests;
 
 /// Three-state result of the open-linked-PR probe (Issue #4452).
 ///
@@ -488,45 +492,7 @@ impl SweepRegistry {
     /// merged PR as `state: "closed"`, but an Issue-shaped node reporting `MERGED`
     /// must never fall through to the fail-open arm again.
     pub(crate) fn issue_is_closed_or_pr(&self, issue: u32) -> Option<bool> {
-        // `gh api` cannot infer the repo from the working directory; this helper
-        // prefers the process-global LOOM_REPO override and falls back to
-        // `gh repo view` in the workspace root, so the override keeps working
-        // exactly as it did with `gh issue view --repo`. Returns `None` (fail
-        // open) when the repo cannot be resolved.
-        let (owner, repo) = self.resolve_owner_repo()?;
-        let gh = self.resolved_gh();
-        let mut cmd = self.gh_inv("guard.issue_state", AccessIntent::Read, &gh);
-        cmd = cmd
-            .arg("api")
-            .arg(format!("repos/{owner}/{repo}/issues/{issue}"))
-            .arg("--jq")
-            .arg("{state, is_pr: (.pull_request != null)}");
-        // Resolve against this registry's own workspace, matching the label-flip
-        // helpers and the other dispatch-path probes (#3937).
-        let output = self.run_counted(cmd).ok()??;
-        if !output.status.success() {
-            return None;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).ok()?;
-        // A PR is terminal for dispatch purposes in EVERY state — an open PR is
-        // still not an issue anyone can build.
-        if parsed.get("is_pr")?.as_bool()? {
-            return Some(true);
-        }
-        match parsed
-            .get("state")?
-            .as_str()?
-            .trim()
-            .to_ascii_uppercase()
-            .as_str()
-        {
-            "CLOSED" | "MERGED" => Some(true),
-            "OPEN" => Some(false),
-            // Reserved for genuine lookup failures only: an unrecognized state
-            // string is an unparseable answer, not a verdict.
-            _ => None,
-        }
+        self.issue_gate_via_rest(issue).map(IssueGate::closed_or_pr)
     }
 
     /// Best-effort probe for an **open** pull request linked to `issue` via
@@ -1250,7 +1216,16 @@ impl SweepRegistry {
         resolved
     }
 
+    /// The claim flip, re-run once after a forced per-owner re-mint when it is
+    /// refused as not accessible by the integration (#9247).
     pub(crate) fn flip_label_to_building(&self, issue: u32) -> Result<()> {
+        let root = &self.config.workspace_root;
+        crate::stale_token_retry::run("guard.flip_building", root, || {
+            self.flip_building_once(issue)
+        })
+    }
+
+    fn flip_building_once(&self, issue: u32) -> Result<()> {
         let gh = self.resolved_gh();
         let mut cmd = self.gh_inv("guard.flip_building", AccessIntent::Write, &gh);
         cmd = cmd
@@ -2725,14 +2700,15 @@ exit 0
         let cwds: Vec<_> = recorded.lines().filter(|l| !l.is_empty()).collect();
         assert_eq!(
             cwds.len(),
-            6,
+            7,
             "expected the flip (1 call) + restore (Issue #4206's pre-check `loom:blocked` \
              probe, Issue #4887's follow-up `loom:operator-only` probe — the fake `gh` prints \
              nothing so both park probes read as absent, Issue #4653's `is_pr` probe's \
              `resolve_owner_repo` lookup — which bails before the second `gh api` call since \
              the fake `gh` prints nothing for `repo view` — Issue #9463's closed-state probe \
-             (an unverifiable state fails open to the restore) — then the edit — 5 calls) to \
-             invoke gh six times total; got cwds: {cwds:?}"
+             (an unverifiable state fails open to the restore) — Issue #10955's label-history \
+             read (an empty history fails open to the restore) — then the edit — 6 calls) to \
+             invoke gh seven times total; got cwds: {cwds:?}"
         );
         for cwd in &cwds {
             let got = std::fs::canonicalize(cwd).unwrap();

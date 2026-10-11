@@ -818,10 +818,11 @@ fn port_bin() -> PathBuf {
 // Divergence classes — recognised by MECHANISM
 // ---------------------------------------------------------------------------
 
-/// The 12-line `Environment:` block #10470 added to `--help` for the opt-in
-/// required-signature mode. It is spelled out here, independently of
-/// `help.txt`, so the class below verifies the EXACT intended text rather than
-/// "whatever the port prints".
+/// The `Environment:` block #10470 (the first two entries, 12 lines) and
+/// #10473 (`LOOM_DAEMON_UPDATE_APPROVED_SOURCE_ANCHOR`, 14 lines, directly
+/// after them) added to `--help` for the opt-in required-signature mode. It is
+/// spelled out here, independently of `help.txt`, so the class below verifies
+/// the EXACT intended text rather than "whatever the port prints".
 const REQUIRE_SIGNATURE_HELP_BLOCK: &str =
     "  LOOM_DAEMON_UPDATE_REQUIRE_SIGNATURE  1/true/yes/on switches signature
                          handling from the default \"present-only\" mode
@@ -835,6 +836,20 @@ const REQUIRE_SIGNATURE_HELP_BLOCK: &str =
                          derived keyless identity to this workflow file
                          (e.g. release.yml) instead of `[^@]+`. Default:
                          unset.
+  LOOM_DAEMON_UPDATE_APPROVED_SOURCE_ANCHOR  Required-mode companion
+                         (#10473): a full 40-hex commit SHA. The release tag
+                         must resolve to it or a descendant (gh api compare:
+                         identical/ahead), else REFUSED before the candidate
+                         runs. Distinct refusals: configuration error (short
+                         or non-hex anchor), source assurance unavailable
+                         (gh/API failure -- not tampering), not a descendant
+                         of approved source, tag movement, asset replacement.
+                         The last two compare against a local adoption record
+                         (~/.loom/daemon-update/release-adoption.json) written
+                         on each required-mode success; it lives on this
+                         host, so it catches drift, not a host compromise.
+                         Default: unset (evidence reports
+                         source_check=not_configured).
 ";
 
 /// The line the added block sits directly in front of in the help text.
@@ -871,8 +886,9 @@ const SYMLINKED_DEST_ANCHOR: &str = "  LOOM_DAEMON_BIN_DIR ";
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
 enum Divergence {
-    /// MECHANISM: #10470 added documentation for the opt-in required-signature
-    /// mode to `--help`, which the frozen pre-port shell cannot contain. The
+    /// MECHANISM: #10470 (and its #10473 source-anchor companion) added
+    /// documentation for the opt-in required-signature mode to `--help`,
+    /// which the frozen pre-port shell cannot contain. The
     /// port's stdout must equal the shell's stdout with exactly
     /// [`REQUIRE_SIGNATURE_HELP_BLOCK`] inserted immediately before the single
     /// `LOOM_PID_FILE` entry. Exit code and stderr must be identical. Risk
@@ -899,6 +915,28 @@ enum Divergence {
     /// identical. Risk direction: documentation only. Any other difference (an
     /// extra, misplaced, or tampered block) stays unexplained.
     HelpDocumentsSymlinkedDest,
+    /// MECHANISM: #11044 documented the fleet floor confirmation in `--help`
+    /// (a section, the `--yes` / `--to-floor` usage lines, two environment
+    /// entries and the exit-code-1 case), which the frozen pre-port shell
+    /// cannot contain. The port's stdout must equal the shell's stdout with
+    /// exactly the four [`FLOOR_CHECK_INSERTS`] blocks, all of them, each
+    /// inserted immediately before its single anchor line. Exit code and
+    /// stderr must be identical. Risk direction: documentation only for every
+    /// case in this corpus — the check speaks only on a fleet host, and the
+    /// corpus pins `$HOME` and the config tiers to a fixture with no fleet
+    /// store. Any other difference stays unexplained.
+    HelpDocumentsFleetFloorCheck,
+    /// MECHANISM: #11069 stopped the stale-entry-point advisory from telling
+    /// the operator to `rm` entries `--prune-stale-entry-points` would not
+    /// remove (it had told them to delete provisioning's rollback copy). For
+    /// an advisory listing only non-Python, non-shim entries, the port's
+    /// stderr must equal the shell's stderr with exactly
+    /// `stale_remediation::STALE_REMEDIATION_SHELL` replaced, once, by
+    /// `stale_remediation::STALE_REMEDIATION_UNRELATED`. The header, every per-entry line and
+    /// the suppression line are unchanged. Risk direction: advisory text only
+    /// — the scan, the exit code and the prune are untouched. Any other stderr
+    /// difference stays unexplained.
+    StaleAdvisoryNoRmForUnprunableEntries,
 }
 
 /// Classify one difference, or return `Err` for "unexplained".
@@ -906,46 +944,59 @@ enum Divergence {
 /// stdout and stderr are classified independently — a half that no class
 /// explains is a finding whatever the other half did.
 fn classify(shell: &Answer, port: &Answer) -> Result<Vec<Divergence>, ()> {
-    if shell.rc != port.rc || shell.stderr != port.stderr {
+    if shell.rc != port.rc {
         return Err(());
     }
+    let mut found = Vec::new();
+    if shell.stderr != port.stderr {
+        if !stale_remediation::explains(&shell.stderr, &port.stderr) {
+            return Err(());
+        }
+        found.push(Divergence::StaleAdvisoryNoRmForUnprunableEntries);
+    }
     if shell.stdout == port.stdout {
-        return Ok(Vec::new());
+        return Ok(found);
     }
     // `--help` now carries several documented additions, so accept any
     // combination of them — never anything else.
-    let additions: [(Divergence, &str, &str); 3] = [
-        (Divergence::HelpDocumentsTagPin, TAG_PIN_ANCHOR, TAG_PIN_HELP_LINE),
+    // Each class is one or more (anchor, block) insertions, applied together.
+    let additions: [(Divergence, &[(&str, &str)]); 4] = [
+        (Divergence::HelpDocumentsTagPin, &[(TAG_PIN_ANCHOR, TAG_PIN_HELP_LINE)]),
         (
             Divergence::HelpDocumentsSymlinkedDest,
-            SYMLINKED_DEST_ANCHOR,
-            SYMLINKED_DEST_HELP_BLOCK,
+            &[(SYMLINKED_DEST_ANCHOR, SYMLINKED_DEST_HELP_BLOCK)],
         ),
         (
             Divergence::HelpDocumentsRequireSignature,
-            HELP_BLOCK_ANCHOR,
-            REQUIRE_SIGNATURE_HELP_BLOCK,
+            &[(HELP_BLOCK_ANCHOR, REQUIRE_SIGNATURE_HELP_BLOCK)],
         ),
+        (Divergence::HelpDocumentsFleetFloorCheck, &FLOOR_CHECK_INSERTS),
     ];
     for mask in 1u8..(1 << additions.len()) {
         let mut expected = shell.stdout.clone();
         let mut classes = Vec::new();
         let mut applicable = true;
-        for (i, (class, anchor, block)) in additions.iter().enumerate() {
+        for (i, (class, inserts)) in additions.iter().enumerate() {
             if mask & (1 << i) == 0 {
                 continue;
             }
-            match insert_before_unique(&expected, anchor, block) {
-                Some(next) => expected = next,
-                None => {
-                    applicable = false;
-                    break;
+            for (anchor, block) in *inserts {
+                match insert_before_unique(&expected, anchor, block) {
+                    Some(next) => expected = next,
+                    None => {
+                        applicable = false;
+                        break;
+                    }
                 }
+            }
+            if !applicable {
+                break;
             }
             classes.push(*class);
         }
         if applicable && expected == port.stdout {
-            return Ok(classes);
+            found.extend(classes);
+            return Ok(found);
         }
     }
     Err(())
@@ -994,6 +1045,19 @@ fn the_help_divergence_class_is_narrow() {
     // A tampered block.
     let tampered = with_block(good.stdout.replace("Default: off.", "Default: on."));
     assert_eq!(classify(&base, &tampered), Err(()));
+    // A tampered #10473 entry, and the block missing it (the #10470-only
+    // text): the class pins the whole addition, not just its first part.
+    let tampered_anchor = with_block(good.stdout.replace("identical/ahead", "behind"));
+    assert_eq!(classify(&base, &tampered_anchor), Err(()));
+    let without_anchor = REQUIRE_SIGNATURE_HELP_BLOCK
+        .split("  LOOM_DAEMON_UPDATE_APPROVED_SOURCE_ANCHOR")
+        .next()
+        .unwrap();
+    let partial = with_block(base.stdout.replace(
+        &format!("\n{HELP_BLOCK_ANCHOR}"),
+        &format!("\n{without_anchor}{HELP_BLOCK_ANCHOR}"),
+    ));
+    assert_eq!(classify(&base, &partial), Err(()));
     // Right stdout, but rc or stderr drifted.
     assert_eq!(
         classify(
@@ -1500,3 +1564,10 @@ fn the_oracle_is_host_portable() {
 // invisible to that discovery (Cargo only globs `tests/*.rs`, not `tests/*/*.rs`).
 #[path = "differential_daemon_update/corpus.rs"]
 mod corpus;
+
+#[path = "differential_daemon_update/floor_check_help.rs"]
+mod floor_check_help;
+use floor_check_help::FLOOR_CHECK_INSERTS;
+
+#[path = "differential_daemon_update/stale_remediation.rs"]
+mod stale_remediation;

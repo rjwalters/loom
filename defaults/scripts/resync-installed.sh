@@ -12,20 +12,18 @@
 # (check-main-freshness.sh) DETECTS the drift with a warning; this script FIXES
 # it. The intended flow is: "freshness warning says you're stale -> run resync."
 #
-# PRECONDITION (#6202): that flow only works when a defaults/ SOURCE tree can
-# be resolved (see resolve_defaults() below) — this checkout IS the Loom
-# source repo, OR the gitignored `.loom/loom-source-path` sidecar points at a
-# local clone of it. Neither holds on a checkout that never ran the Loom
-# installer locally (a fresh developer clone, a CI checkout, a machine that
-# received the repo rather than installing into it) — the exact population
-# most likely to be running stale surfaces, since they never ran the
-# installer that would have refreshed them. On that population this script
-# fails on first use with "Could not locate a defaults/ source tree to sync
-# from"; check-main-freshness.sh now detects the same gap and says so before
-# you get here (see its own #6202 note), but if you landed on this file
-# directly: clone https://github.com/rjwalters/loom locally, then either
-# re-run its installer against this repo or write the sidecar yourself
-# (`echo /path/to/local/loom-clone > .loom/loom-source-path`).
+# SOURCE (#6202, #8961): the files come from a defaults/ SOURCE tree (see
+# resolve_defaults() below) — this checkout IS the Loom source repo, OR the
+# gitignored `.loom/loom-source-path` sidecar points at a local clone of it.
+# Neither holds on a checkout that never ran the Loom installer locally (a
+# fresh developer clone, a CI checkout, a re-clone): the sidecar is host-local
+# and does not come with the repo. There this script hands off to `loom-daemon
+# resync-payload`, which resyncs from the payload embedded in the installed
+# daemon: same pins and symlink rules, never a downgrade, official release
+# builds only, and without this script's own extra steps (it names them).
+# Only with no source tree AND no daemon able to do that does it fail with
+# "Could not locate a defaults/ source tree to sync from": install or update
+# loom-daemon, or point .loom/loom-source-path at a local Loom source clone.
 #
 # It is idempotent (a no-op when already in sync), reports per-file
 # updated/created/removed/unchanged/skipped, only ever touches files that
@@ -157,6 +155,25 @@
 # into one. The marker is the tractable, low-risk half of the fix; the
 # reordering is a larger, riskier restructuring of the self-update deferral
 # #4669 established.
+#
+# DAEMON RESYNC (#10895): `loom-daemon`'s workspace resync (#10718) refreshes
+# the same installed files from the release the daemon is running, with no
+# checkout of the Loom source. Its surfaces are one table,
+# loom-daemon/src/init/payload/surfaces.rs, and a parity test
+# (init/resync_surface_parity_tests.rs) fails when a surface this script
+# writes is in neither that table nor its install-time-only list. It covers:
+# every pure-copy surface above, `.agents/skills/` (same marker gate),
+# `.claude/README.md` and `.github/CONFIGURATION.md` (when present),
+# `.claude/biome.jsonc`, the managed `.gitignore` block, the retired-payload
+# sweep, and `.loom/CLAUDE.md` / `.loom/AGENTS.md` (re-rendered from the
+# template with the install date the file carries, which this script does not
+# do). It honors `.loom/resync-ignore` in the forms this script reports.
+#
+# Still done ONLY here or by the installer, never by the daemon resync: the
+# package.json stub `version` removal (#4285), the root CLAUDE.md version
+# header removal (#6612), the `merge=ours` driver (#4528), the forge label
+# drift check, and anything in .loom/config.json (out of scope below too).
+# Adding a surface here means deciding it there in the same change.
 #
 # EXPLICITLY OUT OF SCOPE (never touched by resync — updated by other mechanisms):
 #   .loom/config.json       - operator-owned; needs merge-semantics design.
@@ -793,11 +810,12 @@ resolve_defaults() {
     return 1
 }
 
+# requires-daemon: resync-payload optional   #8961 no source tree: resync from the daemon's embedded payload; an absent/older binary (no such verb) or a refusal (exit 1) keeps the failure below.
 if ! resolve_defaults; then
-    err "Could not locate a defaults/ source tree to sync from."
-    err "Looked in: \$REPO_ROOT/defaults, .loom/loom-source-path, .loom/install-metadata.json."
-    err "Re-run the Loom installer, or set .loom/loom-source-path to the Loom source repo."
-    exit 1
+    _rp="${LOOM_DAEMON_BIN:-$(command -v loom-daemon || echo "${LOOM_DAEMON_BIN_DIR:-$HOME/.local/bin}/loom-daemon")}"; _rpa=(--workspace "$REPO_ROOT"); [[ "$DRY_RUN" -eq 1 ]] && _rpa+=(--dry-run); _rpw="found no loom-daemon that has it (looked at $_rp: missing or too old)"
+    if [[ -z "$OUTPUT_DIR" ]] && "$_rp" resync-payload --help >/dev/null 2>&1; then "$_rp" resync-payload "${_rpa[@]}"; _rprc=$?; [[ "$_rprc" -eq 1 ]] || exit "$_rprc"; _rpw="$_rp refused or failed (see above)"; fi
+    err "Could not locate a defaults/ source tree to sync from: no \$REPO_ROOT/defaults, no usable path in the gitignored .loom/loom-source-path sidecar (missing on a fresh clone), no loom_source in .loom/install-metadata.json."
+    err "Fallback \`loom-daemon resync-payload\` (the daemon's embedded payload, #8961): $_rpw. Install or update loom-daemon, or set .loom/loom-source-path to a local clone of the Loom source repo."; exit 1
 fi
 SOURCE_ROOT="$(dirname "$DEFAULTS_DIR")"
 
@@ -1234,7 +1252,7 @@ record_blocked() {
 # a real anchoring bug: an installed file's genuinely-last commit is normally
 # provided verbatim by `git log`, not hand-typed, but nothing prevented a
 # hand-amended or hand-rebased subject from taking this exact shape.
-RESYNC_COMMIT_SUBJECT_RE='^(chore: install Loom v[0-9][^[:space:]]*( \(#[0-9]+\))?$|chore: resync installed Loom surfaces( \(#[0-9]+\))?$|(\[skip ci\] )?chore\(loom\): Install Loom [^[:space:]]+ orchestration framework( \(#[0-9]+\))?$)'
+RESYNC_COMMIT_SUBJECT_RE='^(chore: install Loom v[0-9][^[:space:]]*( \(#[0-9]+\))?$|chore: resync installed Loom surfaces( \(#[0-9]+\))?$|(\[skip ci\] )?chore\(loom\): Install Loom [^[:space:]]+ orchestration framework( \(#[0-9]+\))?$|chore\(loom\): resync installed Loom to v[0-9]+\.[0-9]+\.[0-9]+( \(#[0-9]+\))?$)'
 
 # removed_line_count <src> <dst>
 #   Count of non-blank lines present in dst but ABSENT from src (a line-SET
@@ -1555,7 +1573,7 @@ dst_matches_installed_version() {
 # it). Every real #9178 subject is untouched by it: "Install Loom v0.19.174 and
 # Repo Skills v0.11.17 (#7)", "tooling: install Repo Skills and Loom into the
 # map repo" and "Upgrade Loom to 0.18.0 (...)" carry none of these prefixes.
-ROUTINE_SUBJECT_PREFIX_RE='^(\[skip ci\] )?(chore: install Loom v|chore: resync installed Loom surfaces|chore\(loom\): Install Loom )'
+ROUTINE_SUBJECT_PREFIX_RE='^(\[skip ci\] )?(chore: install Loom v|chore: resync installed Loom surfaces|chore\(loom\): Install Loom |chore\(loom\): resync installed Loom to v)'
 
 INSTALL_BASELINE_COMMIT=""
 INSTALL_BASELINE_RESOLVED=0

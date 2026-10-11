@@ -69,6 +69,7 @@ impl ReleaseResolveArgs {
                 || std::env::var("LOOM_DAEMON_UPDATE_FETCH")
                     .map(|v| matches!(v.trim(), "0" | "false" | "no" | "off"))
                     .unwrap_or(false),
+            min_version: None,
         };
 
         let resolution = resolve(&inputs);

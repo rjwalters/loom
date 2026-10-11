@@ -138,3 +138,40 @@ fn the_binding_key_is_content_addressed_and_stable() {
     assert!(key.chars().all(|c| c.is_ascii_hexdigit()));
     assert_eq!(key, binding_key());
 }
+
+/// The module default-exports `{ id, server, setup }` (#11283): 1.18.x's
+/// `readV1Plugin` reads `server` and ignores other keys; 2.x's plugin loader
+/// requires `{ id, setup }` (or `effect`) and rejects `server`-only. Source
+/// shape only: neither major has been loaded live (#11308).
+#[test]
+fn opencode_plugin_default_exports_object_with_server_and_setup() {
+    let src = include_str!("../opencode.mjs");
+    assert!(
+        src.contains("export default { id: \"loom\", server, setup };"),
+        "default export must be the plain object {{ id, server, setup }}"
+    );
+    assert!(
+        !src.contains("export default async function") && !src.contains("export default function"),
+        "default export must be an object, not a function"
+    );
+    assert!(src.contains("async function server()"), "1.x server hook present");
+    assert!(src.contains("async function setup(context)"), "2.x setup hook present");
+    assert!(
+        src.contains("context.tool.transform"),
+        "setup registers tools via the 2.x tool editor"
+    );
+}
+
+/// The existing receipt/fail-closed behaviour is unchanged (source-text pin): receipt write precedes the
+/// fail-closed context check, and the four loom_* tools are still returned.
+#[test]
+fn opencode_plugin_keeps_receipt_and_fail_closed_behaviour_for_1x() {
+    let src = include_str!("../opencode.mjs");
+    let receipt = src.find("LOOM_NATIVE_READINESS_RECEIPT").unwrap();
+    let guard = src.find("Loom native tool context is missing").unwrap();
+    assert!(receipt < guard, "receipt is written before anything can throw");
+    for name in ["read", "write", "edit", "bash"] {
+        assert!(src.contains(&format!("{name}: [")), "tool spec {name} present");
+    }
+    assert!(src.contains("`loom_${name}`"));
+}

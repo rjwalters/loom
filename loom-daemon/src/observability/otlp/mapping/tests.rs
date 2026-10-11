@@ -5,7 +5,11 @@
 
 use super::*;
 
+mod fact_id;
+mod host_name;
+mod loom_kind;
 mod record_id;
+mod start_facts;
 use crate::telemetry::{
     HostHealthRecord, MemoryPressureSummary, PhaseDuration, SweepCompletedRecord, SweepDisposition,
     SweepOutcomeRecord, SweepPhaseRecord, SweepStartedRecord, TokenAccountState,
@@ -34,9 +38,12 @@ fn sweep_started_envelope() -> TelemetryEnvelope {
             issue: 4858,
             sweep_id: "sweep-issue-4858-0".to_string(),
             started_at: ts(),
-            model: Some("opus".to_string()),
-            effort: Some("high".to_string()),
-            runtime: Some("claude".to_string()),
+            facts: crate::telemetry::SweepStartFacts {
+                model: Some("opus".to_string()),
+                effort: Some("high".to_string()),
+                runtime: Some("claude".to_string()),
+                ..Default::default()
+            },
         }),
     )
 }
@@ -139,6 +146,7 @@ fn sweep_outcome_envelope() -> TelemetryEnvelope {
             complexity: None,
             tokens_status: None,
             tokens_status_reason: None,
+            no_phase_cause: None,
             attempt_index: None,
             previous_sweep_id: None,
             trigger: None,
@@ -218,6 +226,7 @@ fn host_health_envelope() -> TelemetryEnvelope {
             captainless_singleton_jobs: Vec::new(),
             exported_kinds: Vec::new(),
             exporters: Vec::new(),
+            otlp_export: None,
             memory: Some(MemoryPressureSummary {
                 mem_total_bytes: Some(34_359_738_368),
                 mem_available_bytes: Some(4_294_967_296),
@@ -560,6 +569,54 @@ fn role_tick_health_with_no_ticks_sampled_reports_zero_not_no_metric() {
 }
 
 #[test]
+fn otlp_export_state_rides_a_state_labelled_gauge() {
+    use crate::observability::otlp_health::{OtlpExportHealth, OtlpExportState};
+    let gauge_for = |health: Option<OtlpExportHealth>| {
+        let mut record = host_health_envelope();
+        if let TelemetryRecord::HostHealth(r) = &mut record.record {
+            r.otlp_export = health;
+        }
+        let request = build_metrics_request(&[record]).unwrap();
+        let metrics = &request.resource_metrics[0].scope_metrics[0].metrics;
+        metrics
+            .iter()
+            .find(|m| m.name == "loom.host.otlp_export")
+            .cloned()
+    };
+    let attr = |m: &Metric, key: &str| -> Option<String> {
+        let Some(metric::Data::Gauge(g)) = &m.data else {
+            panic!("gauge expected")
+        };
+        g.data_points[0]
+            .attributes
+            .iter()
+            .find(|kv| kv.key == key)
+            .and_then(|kv| match kv.value.as_ref()?.value.as_ref()? {
+                any_value::Value::StringValue(s) => Some(s.clone()),
+                _ => None,
+            })
+    };
+    // Absent stays absent (pre-#11353 daemon), never a fabricated ok.
+    assert!(gauge_for(None).is_none());
+    // Exempt carries its reason as the `reason` label.
+    let exempt = gauge_for(Some(OtlpExportHealth {
+        state: OtlpExportState::Exempt,
+        detail: Some("air-gapped lab".into()),
+    }))
+    .unwrap();
+    assert_eq!(attr(&exempt, "state").as_deref(), Some("exempt"));
+    assert_eq!(attr(&exempt, "reason").as_deref(), Some("air-gapped lab"));
+    // Other states carry only the state label.
+    let failing = gauge_for(Some(OtlpExportHealth {
+        state: OtlpExportState::Failing,
+        detail: Some("no ack for 20m".into()),
+    }))
+    .unwrap();
+    assert_eq!(attr(&failing, "state").as_deref(), Some("failing"));
+    assert_eq!(attr(&failing, "reason"), None);
+}
+
+#[test]
 fn daemon_version_becomes_a_resource_attribute_not_a_metric() {
     let batch = vec![host_health_envelope()];
     let request = build_metrics_request(&batch).unwrap();
@@ -634,6 +691,7 @@ fn unmeasured_optional_fields_produce_no_data_point() {
         captainless_singleton_jobs: Vec::new(),
         exported_kinds: Vec::new(),
         exporters: Vec::new(),
+        otlp_export: None,
         memory: None,
     };
     let batch = vec![envelope(

@@ -29,13 +29,19 @@ use std::process::Command;
 ///
 /// 0.19.0 is the first release whose installed tree carries every file in
 /// [`DAEMON_INVOKED_INSTALLED_FILES`]. No break has been declared since.
+///
+/// It must name a release tag. `ci-daily.yml` (`Compatibility Floor`) runs
+/// that release's installed files against today's daemon every day (#10868).
+/// If that fails, raise this to the oldest release that passes, or restore
+/// what the old files need (`defaults/docs/release-cadence.md`).
 pub const SUPPORTS_INSTALLED: &str = "0.19.0";
 
 /// The oldest daemon the installed files this release ships work with. The
 /// install-metadata writers record it as `requires_daemon`.
 ///
 /// It must be at least every hard `# requires-daemon: <sub> >= <version>`
-/// floor in the shipped shell (`defaults/`); the CI harness enforces that.
+/// floor in the shipped shell (`defaults/`); the CI harness and the unit test
+/// `no_shipped_hard_floor_is_above_requires_daemon` both enforce that.
 /// 0.19.772 is the highest such floor today (`gh-shim`, #10516).
 ///
 /// Keep this on one line in exactly this shape: the installer
@@ -187,7 +193,10 @@ pub enum Compat {
     Compatible,
     /// No usable claim recorded: `loom_version` or `requires_daemon` is
     /// absent or not a version. Every install before #10716 lands here. It
-    /// keeps dispatching as today, and its first resync writes the fields.
+    /// keeps dispatching as today. The first resync that changes a file
+    /// writes the fields; one whose files already match the payload writes
+    /// nothing, so such an install stays `ResyncOwed` and the workspace pass
+    /// treats its empty diff as W0 (#10718).
     ResyncOwed,
     /// The installed `loom_version` is below this daemon's
     /// `supports_installed`, or below the fleet floor.

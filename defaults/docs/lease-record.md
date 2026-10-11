@@ -202,6 +202,25 @@ the lease aged out) and sent stderr to `/dev/null`, hiding the one-line
 (`Renewing` = published and renewed; anything else = no fresh lease, so another
 host's orphan recovery may reclaim the claim after its grace period).
 
+**A declined publish is retried, not final (#10570).** The #10161 incident
+(2026-10-06) was not the pid chain: the attended claim at 12:24:24Z landed while
+a *released* fleet sweep's lease (last renewed 12:14:54Z, claim dropped
+12:19:28Z) was still inside the 15-minute TTL. Publish exited 4 ("a peer holds
+a fresh lease"), `lease ensure` stopped there, and no attended lease ever
+appeared; when the leftover aged out, another host's recovery correctly found
+only a stale lease and reclaimed at 12:35:51Z. Now an exit 4 or 2 spawns one
+detached **deferred publisher** per issue per checkout. It re-runs the same
+publish (same trusted format, same peer rules, so a live peer is never
+superseded) every 60 s, slowing to 300 s once the peer has outlived the TTL. It
+stops when a publish settles (then starts the normal renewer with the time left
+of the original cap), when the watched session dies, or at the cap. Every
+outcome is appended to `.loom/logs/lease-ensure/issue-<N>.log`. An attended
+lease's sweep id is stable per watched session
+(`sweep-insession-s<pid>-<start-time>`), so a second `lease ensure` from the
+same session re-attaches to its own lease. Without that, the session's first
+lease would read as a live peer and block the second call. An in-session
+sweep's `LOOM_SWEEP_RUN_ID` still wins.
+
 **Why the second writer exists.** `/loom:sweep`'s in-session path dispatches
 its Builder through the Task tool, one level deep, deliberately (the skill's
 own "CRITICAL: One level deep" rule). Those Builders are subagents of the
@@ -296,8 +315,24 @@ future reclamation decision's evidence, not the claim's own validity.
   `lease renewer check`: `closed`, a release or a newer owner ends the loop
   even while the interactive parent lives; an unreadable state skips that
   cycle's PATCH and keeps the loop. `release <issue>` ends that key's loop
-  explicitly (idempotent). A daemon predating the verb renews as before (`start` probes `lease renewer --help` once and then skips the state read, `check` and `claim`, #10348). A daemon-dispatched start (`LOOM_SWEEP_LEASE_RENEW_SOURCE=dispatch`, set by `run_lease_renewal_start`) also skips the state read and passes `--issue-state open`: its watched pid is the sweep child, which already bounds the loop. A
-  remote authenticated release marker is not defined.
+  explicitly (idempotent). A daemon predating the verb renews as before (`start` probes `lease renewer --help` once and then skips the state read, `check` and `claim`, #10348). A daemon-dispatched start (`LOOM_SWEEP_LEASE_RENEW_SOURCE=dispatch`, set by `run_lease_renewal_start`) also skips the state read and passes `--issue-state open`: its watched pid is the sweep child, which already bounds the loop.
+- **Release signal and identity (defined, not inferred).** The only release
+  signal is the host-local tombstone `lease renewer release` writes under
+  `~/.loom/lease-renew/` (owner-only state outside every worktree and outside
+  the forge): it is authenticated by that filesystem ownership, not by comment
+  text, so a forge comment, an open PR or a temporary label change can never
+  end a loop (see `comment-trust.md`: forge text is prose). It matches the
+  exact (repo, sweep, issue) key, plus the host when `--host` is given (the
+  sweep wave always passes it). A peer's key (other sweep, issue, repo or
+  host) is untouched, and a release that matches nothing leaves no tombstone,
+  so it cannot pre-stop a later start. The loop's next `check`, within one
+  interval, honours the tombstone even if the SIGTERM could not be delivered,
+  and an unverifiable issue state never overrides it. The other completion
+  signal, a `closed` issue, comes from the explicit state read; a failed or
+  malformed read or a 5xx/auth failure on any call is "unverified": the PATCH
+  is skipped, the loop lives, nothing is released. A release marker on the
+  forge is deliberately not defined: leases are per host, so no peer host needs
+  to see one.
 - **Budget.** Per path at the default 300 s (#10348): daemon-dispatched and
   verb-absent loops make two requests per cycle (one non-paginated `?since=`
   window, one PATCH), 24/h per held lease. In-session loops with the verb add
@@ -333,6 +368,11 @@ future reclamation decision's evidence, not the claim's own validity.
   created after that listing is still inside the window, so the own-yield
   guard sees every new `loom:lease-yield`. The window now spans about two
   intervals.
+  The remaining re-list reasons are the rare-miss cases (first cycle, a full
+  100-comment window, a deleted or no-longer-matching cached comment, a PATCH
+  404). Truncated data is never ignored: a full page always re-lists with
+  `--paginate`, and a failed window read is a failed cycle, not a miss, so it
+  neither re-lists nor PATCHes an unverified target.
 
 ## For Phase 2 (reclamation) and Phase 3 (fencing)
 

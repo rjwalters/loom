@@ -73,6 +73,7 @@ pub fn tick_summary(
         queue,
         plan,
         listing_failed: ready_queue::repo_names(&report.listing_failed, roots),
+        listing_incomplete: ready_queue::repo_names(&report.listing_incomplete, roots),
         at,
         max_concurrent,
         seen: report.seen,
@@ -183,8 +184,16 @@ pub fn publish_tick(
     summary.starred_at_cache = Some(super::operator_priority::starred_at_tally());
     crate::observability::ops::queue::record_queue(&summary);
     // #10212: the ranked candidates and what the tick did with each.
-    crate::observability::pick_decision::emit_work_finder(&summary, started_at, completed_at);
+    crate::observability::pick_decision::emit_work_finder(
+        &summary,
+        started_at,
+        completed_at,
+        report.workspace_draw.as_ref(),
+        roots,
+    );
     store_tick_summary(summary);
+    // #11161: `fleet.state` samples every tick, after the summary is stored.
+    crate::observability::fleet_state::tick_completed();
     crate::observability::ops::dispatch::record_tick(
         report,
         max_concurrent,

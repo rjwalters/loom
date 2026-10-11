@@ -1450,16 +1450,7 @@ mod tests {
         let lock = locks.join("issue-404");
         std::fs::create_dir(&lock).unwrap();
         let sweep_id = "sweep-issue-404-adopt";
-        let owner = LockOwner {
-            overflow: false,
-            pgid: None,
-            model: None,
-            effort: None,
-            issue: 404,
-            owner_pid: std::process::id(),
-            acquired_at: Utc::now().to_rfc3339(),
-            sweep_id: sweep_id.to_string(),
-        };
+        let owner = LockOwner::new(404, std::process::id(), sweep_id.to_string());
         std::fs::write(lock.join("owner.json"), serde_json::to_string_pretty(&owner).unwrap())
             .unwrap();
 

@@ -40,12 +40,13 @@ use super::ledger::{Ledger, PendingUnit, UnitDraft, UnitKey, COMPACT_THRESHOLD_B
 use super::logs::{self, LogTarget};
 use super::owners::{discover, resolve_kind, KindCache, Owner, OwnerStatus};
 use super::records::{
-    envelope_identity, job_envelopes_with_reason, run_envelopes, JobCreationBaselines, JobJson,
-    JobsPage, RepoJson, RunJson, RunsPage,
+    job_envelopes_with_reason, run_envelopes, JobCreationBaselines, JobJson, JobsPage, RepoJson,
+    RunJson, RunsPage,
 };
 use super::state::{self, CycleLock, CycleSummary, PollStatus};
 use super::story::{self, RepoIdentityFn, RepoStories, Stitch};
 use super::{journal_path, log_capture_gate, state_dir, LogCaptureGate, ResolvedCiTelemetry};
+use crate::telemetry::TelemetryEnvelope;
 
 pub mod targeted;
 
@@ -627,13 +628,13 @@ fn recover(ledger: &mut Ledger, journal: &Journal) -> io::Result<usize> {
     if pending.is_empty() {
         return Ok(0);
     }
-    let present = journal.identities()?;
-    let missing: Vec<_> = pending
+    // #11045: streamed, and bounded by the pending envelopes — never a
+    // whole-journal identity set.
+    let wanted: Vec<TelemetryEnvelope> = pending
         .iter()
-        .flat_map(|unit| unit.envelopes.iter())
-        .filter(|env| envelope_identity(env).is_none_or(|id| !present.contains(&id)))
-        .cloned()
+        .flat_map(|unit| unit.envelopes.iter().cloned())
         .collect();
+    let missing = journal.missing(&wanted)?;
     log::info!(
         "ci_telemetry: recovering {} committed-but-unconfirmed unit(s) ({} envelope(s) missing from the journal)",
         pending.len(),

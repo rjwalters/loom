@@ -740,6 +740,7 @@ mod tests {
             kind: SweepKind::Issue(42),
             runtime: None,
             runtime_source: None,
+            start: None,
             repo: None,
         };
         assert_eq!(ev.topic(), "sweep.global.dispatch");

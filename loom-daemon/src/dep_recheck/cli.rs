@@ -9,7 +9,8 @@
 //! - **stdout**: the same keys, in the same order, with the same quoting —
 //!   [`shell_quote`] is applied uniformly to every multi-value field
 //!   (`REFS`, `BLOCKERS`, `DEPS`, #8323) so a 2+-entry value still `eval`s as
-//!   one assignment;
+//!   one assignment, and to the two caller-supplied free-text pass-throughs
+//!   (`BLOCK_REASON`, `ORTHOGONAL`, #9041) so prose `eval`s as one word;
 //! - **exit codes**: `0` evaluated, `2` usage error, `3` missing dependency.
 //!
 //! `defaults/scripts/tests/test-dep-recheck-fingerprint.sh` drives all of it
@@ -18,9 +19,20 @@
 //!
 //! # `eval` safety
 //!
-//! Like `claim-staleness.sh`, the output is built only from a fixed enum, a hex
-//! hash, and pre-sorted plain-text lines — never raw forge text — so no comment
-//! or PR body can reach a caller's shell through `eval`.
+//! Most of the output is, like `claim-staleness.sh`'s, built only from a fixed
+//! enum, a hex hash, and pre-sorted plain-text lines. Two fields are not:
+//! `BLOCK_REASON` and `ORTHOGONAL` echo `--block-reason` / `--orthogonal`, which
+//! are **caller-supplied free text** — `curator.md` has the Curator build them
+//! from prose, so forge punctuation (a `;`, a `$(...)`, a newline) can ride in
+//! on a summarized comment. Nothing about their *source* makes them safe.
+//!
+//! What makes `eval` safe is therefore the **quoting**, not the provenance:
+//! every value that is not a fixed enum or a hex hash goes through
+//! [`shell_quote`], so each `KEY=VALUE` is exactly one line holding exactly one
+//! shell word. A value cannot run a command, and it cannot open a second line to
+//! forge a later key (#9041 — the two pass-throughs were emitted raw until then,
+//! and the "never raw forge text" claim that used to stand here was false for
+//! exactly those two lines).
 
 use super::{decide, extract, forge, named, premise, recheck};
 use std::path::Path;
@@ -65,7 +77,17 @@ fn die(msg: &str, code: i32) -> i32 {
 }
 
 /// Quote a value the way bash's `printf %q` does, for the fields whose values
-/// may contain whitespace or newlines and which callers `eval`.
+/// may contain whitespace, newlines or shell metacharacters and which callers
+/// `eval`.
+///
+/// Applied to `BLOCK_REASON` and `ORTHOGONAL` (#9041): the only fields whose
+/// bytes are caller-supplied free text, and so the only ones that can carry a
+/// `;`, a `$(...)`, a backtick or a quote at all. They were classified as
+/// single-value and left raw when #8323 quoted the lists, which made the
+/// documented `eval` word-split a multi-word reason (handing the caller its
+/// first word and running the rest as a command) and let a newline forge a
+/// later `KEY=` line. Quoting is applied at the print site only — the value
+/// handed to `recheck::compute`, and therefore `CONCLUSION_HASH`, is untouched.
 ///
 /// Applied to `REFS`, `BLOCKERS`, and `DEPS` alike (#8323). `BLOCKERS`/`DEPS`
 /// used to be emitted **unquoted** even though they are just as multi-line as
@@ -186,8 +208,10 @@ fn run_dep_recheck(cwd: &Path, opts: &Opts, stdin_text: Option<&str>) -> Result<
         println!("VERDICT={}", o.verdict);
         // Quoted: consumers eval these assignments and the list is multi-line.
         println!("BLOCKERS={}", shell_quote(&o.blockers));
-        println!("BLOCK_REASON={}", o.block_reason);
-        println!("ORTHOGONAL={}", o.orthogonal);
+        // Quoted: caller-supplied free text (#9041). Emission-only — `o` already
+        // carries the hash computed from the raw arguments.
+        println!("BLOCK_REASON={}", shell_quote(&o.block_reason));
+        println!("ORTHOGONAL={}", shell_quote(&o.orthogonal));
         println!("CONCLUSION_HASH={}", o.conclusion_hash);
     }
     Ok(0)

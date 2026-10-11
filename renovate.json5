@@ -4,17 +4,24 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
 
   // Extend recommended defaults, plus security-focused presets.
-  // No `:dependencyDashboard` — that preset opens a bot-owned issue with no
-  // `loom:` label, which Curator's unlabeled-issue intake would otherwise pick
-  // up and try to enrich as a normal issue.
   "extends": [
     "config:recommended",
     "security:openssf-scorecard"
   ],
 
+  // `config:recommended` extends `:dependencyDashboard` (= `true`), so the
+  // dashboard must be switched off explicitly — omitting the preset from
+  // `extends` above is NOT enough. The dashboard is a bot-owned issue with no
+  // `loom:` label (`labels` below applies to PRs only), which Curator's
+  // unlabeled-issue intake would otherwise pick up and try to enrich as a
+  // normal issue (#9418). `false` is the simpler guarantee than
+  // `dependencyDashboardLabels`: a non-`loom:` label does not exclude it from
+  // that intake query.
+  "dependencyDashboard": false,
+
   // Override Mend-hosted "silent" default (applied when app is installed on
-  // "All repositories").  "full" lets Renovate create branches, PRs, and the
-  // Dependency Dashboard issue.
+  // "All repositories").  "full" lets Renovate create branches and PRs (the
+  // Dependency Dashboard issue stays off — see `dependencyDashboard` above).
   "mode": "full",
 
   // --- Supply chain security ---
@@ -41,7 +48,11 @@
   // this, an unlabeled Renovate PR sits in the Judge's unlabeled-PR fallback
   // queue, which applies no labels and therefore can never clear it from that
   // queue (the #5455 livelock — see `.github/dependabot.yml`'s header for the
-  // Dependabot-side version of the same fix).
+  // Dependabot-side version of the same fix). `labels` is not mergeable: any
+  // `packageRules` / `vulnerabilityAlerts` / `lockFileMaintenance` entry that
+  // sets its own `labels` REPLACES this array, so it must repeat
+  // `loom:review-requested` (or use `addLabels`). CI enforces this via
+  // `loom-daemon check-renovate-labels` (#9418).
   "labels": ["dependencies", "loom:review-requested"],
 
   // --- Schedule ---

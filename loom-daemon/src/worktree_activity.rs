@@ -160,13 +160,72 @@ fn recent_age(path: &Path, now: SystemTime, window: Duration) -> Option<Duration
     mtime_age(path, now).filter(|age| *age < window)
 }
 
-/// Source 1: the worktree's git refs (`HEAD`, `index`, `logs/HEAD`).
+/// Source 1: the worktree's git refs (`HEAD`, `index`, `ORIG_HEAD` by mtime;
+/// `logs/HEAD` by its newest entry's own timestamp).
+///
+/// `logs/HEAD` is read by content, not mtime (#11071). `git reflog expire
+/// --all`, which every `git gc` and `gc --auto` runs, rewrites the `logs/HEAD`
+/// of **every** linked worktree of the repo whether or not it expired
+/// anything, so its mtime moves on every gc in any worktree. On loom-worker-1
+/// on 2026-10-09 all 84 worktrees' `logs/HEAD` carried the same mtime
+/// (05:14:41) while `issue-9243`'s newest entry was from 10-08 19:50. A busy
+/// host runs gc more often than the activity window, so every kept worktree
+/// read as live and the artifact reclaim skipped all of them for 31 hours.
+/// A commit appends an entry, so the entry's timestamp keeps that signal.
 fn git_ref_activity(worktree_path: &Path, now: SystemTime, window: Duration) -> Option<Duration> {
     let gitdir = resolve_gitdir(worktree_path)?;
-    ["HEAD", "index", "logs/HEAD", "ORIG_HEAD"]
+    let reflog = reflog_age(&gitdir.join("logs/HEAD"), now).filter(|age| *age < window);
+    ["HEAD", "index", "ORIG_HEAD"]
         .iter()
         .filter_map(|name| recent_age(&gitdir.join(name), now, window))
+        .chain(reflog)
         .min()
+}
+
+/// Age of a reflog's newest entry at `now`, from the timestamp git wrote into
+/// it. An unreadable or unparseable tail (a write in progress, a foreign
+/// format) falls back to the file's mtime, which can only read as *more*
+/// recent: the failure direction stays "treat as live".
+fn reflog_age(path: &Path, now: SystemTime) -> Option<Duration> {
+    match last_reflog_entry_time(path) {
+        Some(at) => Some(now.duration_since(at).unwrap_or(Duration::ZERO)),
+        None => mtime_age(path, now),
+    }
+}
+
+/// The timestamp of the last entry in the reflog at `path`, reading only its
+/// final few KiB.
+fn last_reflog_entry_time(path: &Path) -> Option<SystemTime> {
+    use std::io::{Read, Seek, SeekFrom};
+    const TAIL_BYTES: u64 = 8192;
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    file.seek(SeekFrom::Start(len.saturating_sub(TAIL_BYTES)))
+        .ok()?;
+    let mut buf = Vec::new();
+    file.take(TAIL_BYTES).read_to_end(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf);
+    let line = text.lines().rev().find(|l| !l.trim().is_empty())?;
+    parse_reflog_timestamp(line)
+}
+
+/// Parse a reflog line's timestamp: `<old> <new> <name> <<email>> <unix-secs>
+/// <+hhmm>\t<message>`. `None` unless the two fields before the tab are a
+/// number and a signed timezone offset.
+fn parse_reflog_timestamp(line: &str) -> Option<SystemTime> {
+    let header = line.split('\t').next()?;
+    let mut fields = header.rsplitn(3, ' ');
+    let tz = fields.next()?;
+    let secs = fields.next()?;
+    fields.next()?;
+    let offset_ok = tz.len() == 5
+        && (tz.starts_with('+') || tz.starts_with('-'))
+        && tz[1..].bytes().all(|b| b.is_ascii_digit());
+    if !offset_ok {
+        return None;
+    }
+    let secs: u64 = secs.parse().ok()?;
+    Some(SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
 }
 
 /// Source 2: build-artifact directories, depth 1 only.
@@ -699,6 +758,71 @@ mod tests {
             probe_worktree_activity(&wt, later(7200), window(180)),
             ActivityProbe::Recent { .. }
         ));
+    }
+
+    /// #11071 regression: `git gc`'s `reflog expire --all` rewrites every
+    /// linked worktree's `logs/HEAD` without adding an entry. A fresh mtime
+    /// over an old newest entry is not activity.
+    #[test]
+    fn a_gc_rewritten_reflog_with_an_old_newest_entry_is_not_activity() {
+        let tmp = make_worktree();
+        let wt = worktree_path(&tmp);
+        let now = later(7200);
+        let old = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .saturating_sub(10 * 3600);
+        let entry = |secs: u64| {
+            format!(
+                "{z} {z} A U Thor <a@example.com> {secs} +0000\tcommit: x\n",
+                z = "0".repeat(40)
+            )
+        };
+        let reflog = tmp.path().join("gitdir/logs/HEAD");
+        // Everything else is 2h old by `now`. logs/HEAD was rewritten a
+        // minute before `now` (as gc does), but its newest entry is 10h old.
+        let rewrite = |content: String| {
+            fs::write(&reflog, content).unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&reflog)
+                .unwrap()
+                .set_modified(now - Duration::from_secs(60))
+                .unwrap();
+        };
+        rewrite(entry(old));
+        assert_eq!(probe_worktree_activity(&wt, now, window(30)), ActivityProbe::Idle);
+
+        // A real commit appends an entry stamped a minute ago: that IS
+        // activity, with the same file mtime as above.
+        let fresh = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 60;
+        rewrite(entry(old) + &entry(fresh));
+        assert!(matches!(
+            probe_worktree_activity(&wt, now, window(30)),
+            ActivityProbe::Recent { age_secs } if age_secs < 120
+        ));
+    }
+
+    #[test]
+    fn an_unparseable_reflog_falls_back_to_its_mtime() {
+        // The fixture's `logs/HEAD` is "reflog\n": no timestamp, so its mtime
+        // (fresh) decides, which reads as live.
+        let tmp = make_worktree();
+        let gitdir = tmp.path().join("gitdir");
+        assert!(reflog_age(&gitdir.join("logs/HEAD"), SystemTime::now())
+            .is_some_and(|age| age < Duration::from_secs(60)));
+        assert_eq!(parse_reflog_timestamp("reflog"), None);
+        assert_eq!(parse_reflog_timestamp("a b c <e> 12x +0000\tm"), None);
+        assert_eq!(parse_reflog_timestamp("a b c <e> 12 0000\tm"), None);
+        assert_eq!(
+            parse_reflog_timestamp("a b A U Thor <e> 1700000000 -0700\tcommit: m"),
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000))
+        );
     }
 
     #[test]

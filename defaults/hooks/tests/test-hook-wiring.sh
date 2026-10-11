@@ -274,7 +274,8 @@ else
         [[ -n "$name" ]] || continue
         assert_contains "$name ($event): routes through hook-wiring.sh" "hook-wiring.sh" "$command"
         assert_contains "$name ($event): signals a broken install on stderr" "BROKEN GUARD INSTALL" "$command"
-        if [[ "$event" == "PreToolUse" ]]; then
+        # roll-pause.sh is the one fail-open PreToolUse entry; see (g) below.
+        if [[ "$event" == "PreToolUse" && "$name" != "roll-pause.sh" ]]; then
             assert_contains "$name: inline fallback denies rather than allowing" '\"permissionDecision\":\"deny\"' "$command"
         fi
     done <<< "$COMMANDS"
@@ -348,6 +349,29 @@ else
     assert_contains "wiring + no git: denies instead of silently allowing" '"permissionDecision":"deny"' "$(field "$R" 2)"
     R="$(run_wired_nogit "$PLAIN")"
     assert_eq "wiring + no git + non-Loom repo: still a silent allow" "0||" "$R"
+
+    # (g) roll-pause.sh is not a guard (#10830): it parks a daemon-dispatched
+    # agent's tool calls for a roll and is a no-op otherwise, so a missing or
+    # stale installed copy must ALLOW. This repo's PreToolUse entry for it is
+    # match-all; failing closed there would block every tool call in the
+    # checkout. Driven with the launcher present (rung 5) and absent (the
+    # inline fallback).
+    CMD="$(printf '%s\n' "$COMMANDS" | grep -m1 '^PreToolUse.*roll-pause\.sh' | cut -f2-)"
+    CMD="${CMD#bash -c }"
+    if [[ -z "$CMD" ]]; then
+        bad "settings.json wires roll-pause.sh under PreToolUse" "found none"
+    else
+        WS="$(new_workspace ws-pause-nohook)"
+        R="$(run_wired "$WS")"
+        assert_eq "roll-pause, hook missing: exits 0 and emits no deny" "0|" "$(field "$R" 1)|$(field "$R" 2)"
+        assert_contains "roll-pause, hook missing: still warns on stderr" "roll-pause.sh" "$(field "$R" 3)"
+        rm -f "$WS/.loom/hooks/hook-wiring.sh"
+        R="$(run_wired "$WS")"
+        assert_eq "roll-pause, hook and launcher missing: exits 0 and emits no deny" "0|" "$(field "$R" 1)|$(field "$R" 2)"
+        install_hook "$WS/.loom/hooks" roll-pause.sh
+        R="$(run_wired "$WS")"
+        assert_contains "roll-pause, hook installed: the hook runs" "RAN:roll-pause.sh" "$(field "$R" 2)"
+    fi
 fi
 
 # ---------------------------------------------------------------------------

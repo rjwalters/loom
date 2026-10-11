@@ -88,6 +88,12 @@ pub struct QueueSnapshotRow {
     /// number (`open_pr`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// Why a `workspace_halted` row is held (#11417): the closed
+    /// `work_finder::halt_cause` vocabulary, same tokens as the SigNoz
+    /// `loom.queue.halt_cause` attribute. Absent on other dispositions and
+    /// when the cause is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub halt_cause: Option<String>,
     /// The dispatch-plan fields (Issue #9288), flattened beside `rank`:
     /// `position`, `plan_state`, `keys`, `gate`, `in_slice`, `hot`,
     /// `owning_shard`, `repo_cap`. The `keys` names are the seven
@@ -121,6 +127,16 @@ pub struct QueueSnapshotRecord {
     /// Workspaces in `listing_failed` whose slug could not be resolved.
     #[serde(default)]
     pub listing_failed_unresolved: usize,
+    /// Repos whose ready listing came back partial on this tick (#11139: a
+    /// later page failed, the page cap, a mid-walk change). Some of their
+    /// rows are present, but not all: a missing row is not evidence the
+    /// issue left the queue. The snapshot is whole only when this,
+    /// `listing_failed` and both `*_unresolved` counters are empty/zero.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub listing_incomplete: Vec<QueueRepoRef>,
+    /// Workspaces in `listing_incomplete` whose slug could not be resolved.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub listing_incomplete_unresolved: usize,
     pub rows: Vec<QueueSnapshotRow>,
     /// Rows dropped because their repo slug could not be resolved.
     #[serde(default)]
@@ -155,16 +171,26 @@ pub struct QueueLandingRow {
 
 /// `detail` survives only for dispositions whose detail is structured: the
 /// park label, the open PR, a `labelled_blocked` row's allowlisted hold
-/// labels (#8957), and a `workspace_halted` row's closed-vocabulary hold
+/// labels (#8957), a `deferred_file_overlap` row's shared `## Affected Files`
+/// paths (#9781; the daemon formats `file overlap: <paths>`, never forge free
+/// text), and a `workspace_halted` row's closed-vocabulary hold
 /// cause (#9017 — `main_red`, `gate_pending`, `token_pool`, …, emitted by
-/// `work_finder::halt_cause`, never free-form text).
+/// `work_finder::halt_cause`, never free-form text), and an `already_landed`
+/// row's evidence (#11429: `forge_closed` or `journal_landed`).
 #[must_use]
 pub fn exportable_detail(disposition: QueueDisposition, detail: Option<&str>) -> Option<String> {
     match disposition {
         QueueDisposition::Parked
         | QueueDisposition::OpenPr
         | QueueDisposition::LabelledBlocked
-        | QueueDisposition::WorkspaceHalted => detail.map(str::to_string),
+        | QueueDisposition::DeferredFileOverlap
+        | QueueDisposition::WorkspaceHalted
+        | QueueDisposition::AlreadyLanded => detail.map(str::to_string),
         _ => None,
     }
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if signature
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }

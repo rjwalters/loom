@@ -159,6 +159,12 @@ pub fn sync_with_origin(repo_root: &Path, args: &Args, state: &mut SyncState) ->
     // forge-supplied `headRefName`, so this is the separator half of the
     // mitigation only: form kept uniform across every sink so a future reader
     // does not have to re-derive which argvs are exposed.
+    // Below the disk floor, skip the fetch like an unreachable origin: an
+    // aborted fetch on a full disk leaves a partial tmp_pack_* behind (#10995).
+    if let Some(reason) = crate::fetch_headroom::skip_reason(repo_root) {
+        out::warn(&format!("note: {reason} — proceeding with local HEAD as-is."));
+        return true;
+    }
     let fetch_ok = if util::have("timeout") {
         Command::new("timeout")
             .arg("5")

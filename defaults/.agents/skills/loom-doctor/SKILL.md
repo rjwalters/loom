@@ -236,17 +236,22 @@ handoff below) are **GraphQL-backed mutations**. GitHub's GraphQL quota
 (5000/hr, shared across every agent + tool) and its REST quota are
 **independent** — confirmed live during long sweeps (#4526, #4670, #4856):
 GraphQL can read 0 remaining while REST still has ~4000 left. A rejection
-whose text contains one of these five signatures (case-insensitive) is a
-rate limit, not a real failure, and has a REST equivalent — do **not** give
-up or wait idly; retry the same mutation over REST:
+whose text contains one of these five signatures (case-insensitive; `·` is a
+space, #11411) is a rate limit, not a real failure, and has a REST
+equivalent — do **not** give up or wait idly; retry the same mutation over REST:
 
 | Signature | Seen as |
 |---|---|
-| `api rate limit exceeded` | REST itself throttling (rare on the fallback path) |
-| `api rate limit already exceeded` | GraphQL: `GraphQL: API rate limit already exceeded for user ID …` |
-| `secondary rate limit` | either transport, burst throttling |
-| `abuse detection mechanism` | either transport, burst throttling |
-| `was submitted too quickly` | either transport, burst throttling |
+| `api rate limit·exceeded` | REST throttling (rare here) |
+| `api rate limit·already exceeded` | GraphQL, as `GraphQL: … for user ID …` |
+| `secondary rate limit` | burst throttling |
+| `abuse detection mechanism` | burst throttling |
+| `was submitted too quickly` | burst throttling |
+
+A "GitHub API rate limit … sleep until reset" reminder on a tool result is a
+text match on its output (#11411), not a quota reading: check
+`gh api rate_limit` and keep working. Read role files with a file-read tool,
+not `cat`.
 
 REST equivalents for the mutations you actually need mid-fix:
 
@@ -1127,7 +1132,7 @@ shellcheck scripts/*.sh # Shell scripts (if applicable)
 
 | File | Load when |
 |---|---|
-| [`cargo-target-isolation.md`](../loom-cargo-target-isolation/SKILL.md) | Before a local cargo result counts as "the fix works": a shared target dir may hold another worktree's binary (#8457). |
+| [`cargo-target-isolation.md`](../loom-cargo-target-isolation/SKILL.md) | Any cargo build: use exported `CARGO_TARGET_DIR` or `<worktree>/target`; never `/tmp`, `~`, `.loom/target-*` (#8370). |
 | [`ci-refusals-reference.md`](../loom-ci-refusals-reference/SKILL.md) | A CI read got 403/429, or a job needs a re-run. |
 
 ### Step 5: Verify Remote CI After Push
@@ -1257,7 +1262,7 @@ Read the full review, not just individual comments; check what the reviewer alre
 
 ### Make Focused Changes
 
-Address exactly what was requested — no new features or refactoring beyond the feedback (see "Scope Discipline"). Keep commits focused and well-described, and run tests after each change.
+Address exactly what was requested, nothing beyond it (see "Scope Discipline"); keep commits focused and run tests after each change.
 
 ### Fixing a Role Prompt or Dispatch Brief
 
@@ -1273,13 +1278,17 @@ Comment on the PR when pushing fixes ("Addressed: formatting, added tests for ed
 
 ### Quality Checks
 ```bash
-# Always run full CI before pushing
-pnpm check:ci   # your repo's check command — see buildGate.command in .loom/config.json
+# Full CI; Rust lint = each CI `cargo clippy` line verbatim, apart from tests; no clippy = unvalidated.
+# Production shell changed + CI runs shell-budget --check? After the final commit, before re-review:
+# `loom-daemon shell-budget --check --base <PR base, default origin/main>`; nonzero = this branch's
+# growth (never pre-existing): cut counted shell or move it to the daemon, rerun to exit 0.
+# Comments, follow-up issues or arbitrary trailers are not permission.
+pnpm check:ci   # repo check: buildGate.command in .loom/config.json
 
-# Check specific areas if review mentioned them
-pnpm test              # If review mentioned testing
-pnpm lint              # If review mentioned code style
-pnpm exec tsc --noEmit # If review mentioned types
+# If review mentioned tests / style / types:
+pnpm test
+pnpm lint
+pnpm exec tsc --noEmit
 ```
 
 ### Test Output: Truncate for Token Efficiency
@@ -1287,28 +1296,13 @@ pnpm exec tsc --noEmit # If review mentioned types
 When running tests during PR fixes, truncate verbose output to conserve tokens:
 
 ```bash
-# Failures + summary only (recommended)
+# Failures + summary only
 pnpm test 2>&1 | grep -E "(FAIL|PASS|Error|✓|✗|Summary|Tests:)" | head -100
-
-# Just the summary
-pnpm test 2>&1 | tail -30
-
-# Show only failures with context
-pnpm test 2>&1 | grep -A 5 -B 2 "FAIL\|Error\|✗"
 ```
 
-**Why truncate?**
-- Test output can exceed 10,000+ lines
-- Most of that is passing tests (not actionable)
-- Wastes tokens that could be used for actual fix work
-- Pollutes context for subsequent operations
+**Why truncate?** Output can exceed 10,000 lines of mostly passing, non-actionable tests that waste tokens and pollute context.
 
-**Report failures concisely:**
-```
-❌ 2 tests failing after fix:
-1. `state.test.ts:45` - still returns undefined (need null check)
-2. `worktree.test.ts:89` - timeout (async issue remains)
-```
+Report failures concisely: one `file:line` - cause line per failing test.
 
 ## Example Commands
 

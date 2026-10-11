@@ -82,9 +82,15 @@ later re-renders keep them. To change a value on a host, export it and re-run
 `loom-daemon-start.sh`. A plain `loom-daemon restart` keeps the old
 environment. See "Changing daemon environment variables" and "Env keys carried
 forward across a re-render" in `daemon-reference.md`. For a hand-run
-`/loom:champion`, export the value in that shell. These knobs are not yet keys
-of the `hyperparameters` config block, so the fleet store's machine tier
-(`fleet/defaults.json`) cannot carry them yet. That move is follow-on work.
+`/loom:champion`, export the value in that shell. The knobs are
+keys of the `champion` group of the `hyperparameters` config block
+(`prSlice`, `promotionSlice`, `tier2Cap`, `tier3Cap`, `tier3BacklogCap`;
+defaults 10, 3, 2, 1, 5), so the fleet store's machine tier
+(`fleet/defaults.json`) can carry them and they enter the run digest
+(`hyperparameters.md`). Precedence is env var > `LOOM_HYPERPARAMS` vector >
+config block > default. Follow-on work: the daemon does not yet export the
+resolved block values as `LOOM_CHAMPION_*` into role sessions, so Champion's
+shell snippets honour only the env vars today.
 
 ## 3. "Needs revision" goes to Curator, not to the operator
 

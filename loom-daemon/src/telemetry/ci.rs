@@ -52,8 +52,8 @@ pub const CI_LOG_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.ci.completed_at",
     // `ci.run` / `ci.job` (#10511): when this daemon *observed* the completed
     // run/job — its knowable-at instant, distinct from GitHub's own
-    // `completed_at`. A point-in-time reader filters on it
-    // (`eta::point_in_time`), never on the event time.
+    // `completed_at`. A point-in-time reader filters on it, never on the
+    // event time.
     "loom.ci.observed_at",
     "loom.ci.duration_ms",
     // `ci.run` (#9007 follow-up: `run_started_at − created_at`) AND `ci.job`
@@ -259,8 +259,8 @@ pub struct CiRunRecord {
     pub trigger_reason: Option<String>,
     /// When this daemon observed the record (#10511): the instant it became
     /// knowable to Loom, as opposed to GitHub's event time (`completed_at`).
-    /// Training and serving filter on it (`observed_at <= cutoff`, see
-    /// `eta::point_in_time`), so a run backfilled later can never leak into a
+    /// A point-in-time reader filters on it (`observed_at <= cutoff`), so a
+    /// run backfilled later can never leak into a
     /// cutoff it was not knowable at. `None` only on a pre-#10511 record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_at: Option<DateTime<Utc>>,
@@ -368,8 +368,8 @@ pub struct CiJobRecord {
     pub shard_kind: String,
     /// When this daemon observed the record (#10511): the instant it became
     /// knowable to Loom, as opposed to GitHub's event time (`completed_at`).
-    /// Training and serving filter on it (`observed_at <= cutoff`, see
-    /// `eta::point_in_time`), so a run backfilled later can never leak into a
+    /// A point-in-time reader filters on it (`observed_at <= cutoff`), so a
+    /// run backfilled later can never leak into a
     /// cutoff it was not knowable at. `None` only on a pre-#10511 record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_at: Option<DateTime<Utc>>,

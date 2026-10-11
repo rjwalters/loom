@@ -530,32 +530,6 @@ pub const DEFAULT_ROLES: &[RoleSpec] = &[
         default_interval_secs: 3600,
         interval_default: false,
     },
-    RoleSpec {
-        // The operator-agent persona (Issue #7947, Phase 3b of #4196).
-        //
-        // `interval_default: false` for a *stronger* reason than architect's.
-        // Architect is merely expensive to run everywhere; this role is an
-        // inbound control channel — it reads human prose out of a chat room and
-        // steers the daemon with it. A role like that must never arrive because
-        // a repo failed to pin `roles`, so it is excluded from the
-        // "unset `roles` ⇒ all defaults" fallback like architect, AND gated a
-        // second time on its own config resolving (see `role_is_config_gated`):
-        // naming it in `roles` is not enough, `safehouse.concierge` must also
-        // name at least one allowed sender. Two independent opt-ins, because
-        // one of them is a chat room.
-        //
-        // The 300s cadence is a *listening* cadence, not a work cadence: each
-        // tick is a short `concierge listen` window. Its cost bound is NOT
-        // carried in the prompt the way `architectMaxProposals` is — a daily
-        // turn budget spans sessions, so it lives in the ledger
-        // (`concierge::budget`) that `concierge budget --begin-turn` consults
-        // at the top of every session. See that module's doc for why a prompt
-        // cannot hold this particular number.
-        name: crate::concierge::CONCIERGE_ROLE,
-        prompt: "/loom:concierge",
-        default_interval_secs: 300,
-        interval_default: false,
-    },
 ];
 
 /// A stable, content-derived identifier for the running binary's
@@ -1010,6 +984,9 @@ pub struct ScriptRoleInvocationRunner {
     /// [`invoke`]: RoleInvocationRunner::invoke
     resolved_launch: Option<crate::role_tick_telemetry::ResolvedLaunch>,
     trace_context: Option<crate::observability::lifecycle::RoleTrace>,
+    /// Set by [`roll_resume`] when this runner relaunches a session a daemon
+    /// roll paused (#10832), instead of starting a fresh tick.
+    roll_resume: Option<roll_resume::RoleRollResume>,
 }
 
 impl ScriptRoleInvocationRunner {
@@ -1025,6 +1002,7 @@ impl ScriptRoleInvocationRunner {
             gh_bin: None,
             resolved_launch: None,
             trace_context: None,
+            roll_resume: None,
         }
     }
 
@@ -1089,6 +1067,8 @@ impl ScriptRoleInvocationRunner {
 }
 
 mod invocation;
+/// #10832: resuming a role run a daemon roll paused.
+pub(crate) mod roll_resume;
 
 /// The per-role log file every invocation — real or skipped — writes to:
 /// `<logs_dir>/role-<role>.log`.
@@ -2195,34 +2175,6 @@ pub fn log_role_runner_disabled(repo_root: &Path, config: &RoleRunnerConfig) {
     log::info!("{}", disabled_role_runner_log_line(repo_root, config));
 }
 
-/// Whether `spec` is gated off for `root` by its **own** config block, beyond
-/// the role runner's own `enabled`/`roles` knobs — `Some(reason)` ⇒ do not
-/// tick (issue #7947).
-///
-/// Exactly one role has such a gate today: `concierge`, which requires
-/// `safehouse.concierge` to resolve (present, `enabled` not false, and at least
-/// one usable Matrix ID in `allowedSenders`). Naming it in
-/// `autonomous.roleRunner.roles` is deliberately **not** sufficient — an
-/// inbound control channel wired to a chat room should take two independent,
-/// explicit opt-ins, not one.
-///
-/// Written as a general predicate rather than an inline `if spec.name ==
-/// "concierge"` so that the next role with a config prerequisite has an obvious
-/// place to declare it, and so the "which roles are config-gated" question has
-/// one unit-testable answer.
-#[must_use]
-pub fn role_is_config_gated(spec: &RoleSpec, root: &Path) -> Option<&'static str> {
-    if spec.name == crate::concierge::CONCIERGE_ROLE
-        && crate::concierge::resolve_concierge_config(root).is_none()
-    {
-        return Some(
-            "safehouse.concierge does not resolve for this workspace (absent, disabled, or an \
-             empty allowedSenders); run `loom-daemon concierge check` there",
-        );
-    }
-    None
-}
-
 /// Resolve the **per-invocation architect proposal cap** (#5656) with
 /// precedence **env ([`ARCHITECT_MAX_PROPOSALS_ENV`]) > config
 /// (`autonomous.roleRunner.architectMaxProposals`, read from each root's own
@@ -2661,7 +2613,9 @@ impl IdleTrigger {
 ///    switch, which only decides whether the loops start at all. When
 ///    `onIdle` roles are configured for `root` but the gate is off, this is
 ///    the silent-no-op the issue exists to fix — see
-///    [`warn_if_idle_configured_but_disabled`].
+///    [`warn_if_idle_configured_but_disabled`]. Then bail on the host shard,
+///    an archived repo, or a held workspace ([`crate::workspace_hold`],
+///    #10719).
 /// 4. Per configured on-idle role ([`resolve_on_idle_roles`]): skip if inside
 ///    the debounce window, or if an interval / idle run already holds the
 ///    in-progress guard; else record the fire and acquire the guard.
@@ -2718,6 +2672,15 @@ pub fn plan_idle_runs(
     }
     if roster::repo_is_archived(root, None) {
         log::debug!("role_runner: idle edge for {} suppressed — archived (#10562)", root.display());
+        return Vec::new();
+    }
+    // #10719: a held workspace starts no role. The hold stops new sweeps, the
+    // in-flight set drains, and that very drain is what raises this idle edge —
+    // so without this the hold would itself launch every `onIdle` role. The
+    // edge was already observed above, so the bookkeeping stays right.
+    // After the gates above, so it is logged (with the hold's reason) only
+    // for an edge that would otherwise have started a role.
+    if crate::workspace_hold::refuse_role_start(root, "idle edge") {
         return Vec::new();
     }
     // Concurrent role-agent ceiling (#6102), resolved from this root's own
@@ -3107,15 +3070,6 @@ fn decide_root_tick_detailed(
     // The root resolved enabled again — clear any stale disabled-warning so a
     // later disable re-warns (#4377).
     disabled_roots_warned.remove(root);
-    // Per-role config gate (#7947). A role whose own config block does not
-    // resolve never ticks, even when an explicit `roles` allowlist names it.
-    // Placed here — after the master switch, before sharding and the
-    // membership check — so a role that is structurally unable to do anything
-    // costs nothing further to decide about.
-    if let Some(reason) = role_is_config_gated(spec, root) {
-        log::debug!("role_runner: {} tick for {} skipped — {reason}", spec.name, root.display());
-        return concurrent_dispatch::RootTickDecision::Skip;
-    }
     // Host sharding (#6374): on a fleet, each workspace's role rotation must
     // run on exactly ONE host per interval — otherwise N dispatchers each
     // spawn the same role session over the same forge queue, which is both
@@ -3392,6 +3346,7 @@ pub fn spawn_multi_role_task(
         // Missing-root warn-once-per-period state (#4326), shared discipline
         // with `work_finder` via `filter_missing_roots`.
         let mut missing_roots_warned: HashSet<PathBuf> = HashSet::new();
+        let mut held_roots_logged: HashSet<PathBuf> = HashSet::new();
         let mut dispatcher = concurrent_dispatch::RoleDispatcher::new(
             spec,
             interval,
@@ -3458,6 +3413,8 @@ pub fn spawn_multi_role_task(
             // warn-and-skip, never auto-remove (`loom-daemon status` flags it,
             // `workspace remove` clears it).
             let roots = filter_missing_roots(roots, &mut missing_roots_warned);
+            // #10719: no role tick starts in a held workspace (W3/W4).
+            let roots = crate::workspace_hold::filter_held(roots, &mut held_roots_logged);
             let _report = dispatcher.dispatch_tick(roots, &in_progress);
         }
     })

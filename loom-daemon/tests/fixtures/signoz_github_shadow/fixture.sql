@@ -35,8 +35,13 @@
 --
 -- `loom.forge.calls` for bucket A in hour H: ok 150, error 20,
 -- not_modified 50, plus a free `rate_limit` probe (`resource=other`) of 7.
--- Expected query 3 band: shadow_low = round(1 - 170/190, 3) = 0.105,
--- shadow_high = round(1 - 150/190, 3) = 0.211.
+-- The agent slice (#10607) adds, for bucket A in hour H: a builder's
+-- passthroughs (`agent.gh.pr`, ok 15), a judge's served reads
+-- (`agent_gh_front`, ok 5 and not_modified 25). One daemon series carries
+-- `agent = '-'`, the others none (an older daemon); neither is agent spend.
+-- Expected query 3 band: shadow_low = round(1 - 190/190, 3) = 0,
+-- shadow_high = round(1 - 170/190, 3) = 0.105 -- without the agent rows it
+-- was 0.105 .. 0.211, so the band shrinks by agent_share = 20/190 = 0.105.
 
 CREATE DATABASE IF NOT EXISTS signoz_metrics;
 CREATE DATABASE IF NOT EXISTS signoz_traces;
@@ -106,10 +111,13 @@ INSERT INTO loom_fixture.series_seed VALUES
     ('github.ratelimit.reset', 32, 'Gauge', 'Unspecified', '{"account":"app-2","owner":"beta","resource":"graphql","role":"reader","installation":"22","host.id":"h1"}'),
     ('github.ratelimit.used',  41, 'Gauge', 'Unspecified', '{"account":"app-1","resource":"core","host.id":"h3"}'),
     ('github.ratelimit.reset', 42, 'Gauge', 'Unspecified', '{"account":"app-1","resource":"core","host.id":"h3"}'),
-    ('loom.forge.calls', 51, 'Sum', 'Delta', '{"account":"app-1","cred_owner":"acme","installation":"11","resource":"core","outcome":"ok","op":"issue.list","caller":"x","role":"writer","target_owner":"acme","host.id":"h1"}'),
+    ('loom.forge.calls', 51, 'Sum', 'Delta', '{"account":"app-1","cred_owner":"acme","installation":"11","resource":"core","outcome":"ok","op":"issue.list","caller":"x","role":"writer","target_owner":"acme","agent":"-","host.id":"h1"}'),
     ('loom.forge.calls', 52, 'Sum', 'Delta', '{"account":"app-1","cred_owner":"acme","installation":"11","resource":"core","outcome":"error","op":"issue.list","caller":"x","role":"writer","target_owner":"acme","host.id":"h1"}'),
     ('loom.forge.calls', 53, 'Sum', 'Delta', '{"account":"app-1","cred_owner":"acme","installation":"11","resource":"core","outcome":"not_modified","op":"issue.list","caller":"x","role":"writer","target_owner":"acme","host.id":"h1"}'),
-    ('loom.forge.calls', 54, 'Sum', 'Delta', '{"account":"app-1","cred_owner":"acme","installation":"11","resource":"other","outcome":"ok","op":"quota.rate-limit-reading","caller":"api.rate_limit","role":"writer","target_owner":"acme","host.id":"h1"}');
+    ('loom.forge.calls', 54, 'Sum', 'Delta', '{"account":"app-1","cred_owner":"acme","installation":"11","resource":"other","outcome":"ok","op":"quota.rate-limit-reading","caller":"api.rate_limit","role":"writer","target_owner":"acme","host.id":"h1"}'),
+    ('loom.forge.calls', 55, 'Sum', 'Delta', '{"account":"app-1","cred_owner":"acme","installation":"11","resource":"core","outcome":"ok","op":"unknown","caller":"agent.gh.pr","role":"agent-builder","target_owner":"acme","agent":"builder","host.id":"h1"}'),
+    ('loom.forge.calls', 56, 'Sum', 'Delta', '{"account":"app-1","cred_owner":"acme","installation":"11","resource":"core","outcome":"ok","op":"issue.view","caller":"agent_gh_front","role":"writer","target_owner":"acme","agent":"judge","host.id":"h2"}'),
+    ('loom.forge.calls', 57, 'Sum', 'Delta', '{"account":"app-1","cred_owner":"acme","installation":"11","resource":"core","outcome":"not_modified","op":"issue.view","caller":"agent_gh_front","role":"writer","target_owner":"acme","agent":"judge","host.id":"h2"}');
 
 -- Two hour-rows per series (the SigNoz trap the sub-select exists for).
 INSERT INTO signoz_metrics.time_series_v4
@@ -164,7 +172,8 @@ FROM loom_fixture.reading_seed AS r CROSS JOIN loom_fixture.anchor AS a;
 INSERT INTO signoz_metrics.samples_v4 (metric_name, fingerprint, unix_milli, value)
 SELECT 'loom.forge.calls', c.fp, a.base_ms + c.offset_s * 1000, c.v
 FROM (SELECT arrayJoin([(51, 600, 100.0), (51, 1200, 50.0), (52, 600, 20.0),
-                        (53, 600, 50.0), (54, 600, 7.0)]) AS t,
+                        (53, 600, 50.0), (54, 600, 7.0), (55, 600, 10.0),
+                        (55, 1200, 5.0), (56, 900, 5.0), (57, 900, 25.0)]) AS t,
              t.1 AS fp, t.2 AS offset_s, t.3 AS v) AS c
 CROSS JOIN loom_fixture.anchor AS a;
 
