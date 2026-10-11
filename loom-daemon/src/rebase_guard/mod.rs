@@ -27,12 +27,15 @@
 //!
 //! # The two findings
 //!
-//! - `EMPTIED`: `<new>`'s tree equals `<base>`'s, and `<base>..<old>` held a
-//!   non-merge commit with a non-empty diff that has **no patch-equivalent
-//!   commit in `<base>`**. That last clause is deliberate: a commit that was
-//!   dropped because the base already carries the identical patch lost
-//!   nothing, so it is clean. Refusing it would strand a branch whose only
-//!   possible rebase result is the same empty one.
+//! - `EMPTIED`: `<new>`'s tree equals `<base>`'s, although **merging `<base>`
+//!   into `<old>`** would conflict or produce a tree that differs from
+//!   `<base>`'s. The test is on content, not on patch history: a commit that
+//!   was dropped because the base still carries the identical change lost
+//!   nothing (the merge yields the base's tree), so it is clean, and refusing
+//!   it would strand a branch whose only possible rebase result is the same
+//!   empty one. A change that landed in the base and was then **reverted**
+//!   there is not in the base, whatever `git rebase` skipped as "already
+//!   applied", so it is `EMPTIED`.
 //! - `RESOLUTION_DISCARDED <merge-sha>`: a merge commit reachable from `<old>`
 //!   but from neither `<base>` nor `<new>` has a non-empty `--remerge-diff`
 //!   (a hand resolution, not a mechanical merge), and `<new>` does not carry
@@ -40,7 +43,11 @@
 //!   into `<old>`** would produce, restricted to the paths the resolution
 //!   touched, so a base that moved one of those paths cleanly is not mistaken
 //!   for a discard. A resolution path that conflicts in that merge counts as
-//!   discarded: the rebase necessarily re-resolved it without the merge.
+//!   discarded: the rebase necessarily re-resolved it without the merge. So
+//!   does a path the merge commit holds that `<new>` no longer has under that
+//!   name (the base, or a later branch commit, renamed it), unless `<new>`'s
+//!   whole tree is exactly that merge result: a comparison by path cannot
+//!   follow the rename, and what cannot be shown to be carried is not safe.
 //!
 //! # Exit-code contract (same shape as `forge check-claim`)
 //!
@@ -101,7 +108,8 @@ pub struct Args {
 pub enum Verdict {
     /// Nothing is discarded. The string says why, for the log.
     Clean(&'static str),
-    /// `<new>` equals `<base>`; `commit` is a payload commit that vanished.
+    /// `<new>` equals `<base>`; `commit` is a payload commit that vanished
+    /// (`<old>` itself when no single non-merge commit can be named).
     Emptied { commit: String },
     /// `merge` carried a hand resolution over `paths` that `<new>` lacks.
     ResolutionDiscarded { merge: String, paths: Vec<String> },
@@ -257,7 +265,19 @@ fn decide(
     let scratch = tempfile::tempdir().map_err(|e| format!("no scratch directory: {e}"))?;
     let mut env = caller;
     env.extend(quarantine(&plain, scratch.path())?);
-    let git = Git { repo, env };
+    // Pathspecs are relative to the directory git runs in, and every path this
+    // module hands back to git is relative to the top of the tree. Run from
+    // the top, or a call from a subdirectory compares nothing and answers
+    // "safe". A bare repository has no top level and no prefix either.
+    let top = plain
+        .ok(&["rev-parse", "--path-format=absolute", "--show-toplevel"])
+        .ok()
+        .map(|t| PathBuf::from(t.trim_end_matches('\n')))
+        .filter(|t| t.is_dir());
+    let git = Git {
+        repo: top.as_deref().unwrap_or(repo),
+        env,
+    };
 
     let base = git.commit("--base", base)?;
     let old = match git.commit("--old", old) {
@@ -293,23 +313,28 @@ fn decide(
     Ok(Verdict::Clean("no payload emptied and no hand resolution dropped"))
 }
 
-/// The #8298 predicate: `<new>` is tree-identical to `<base>` although
-/// `<old>` carried a payload the base does not already contain.
+/// The #8298 predicate, decided on content: `<new>` is tree-identical to
+/// `<base>` although merging `<base>` into `<old>` would not be.
+///
+/// Patch-equivalence (`rev-list --cherry-pick`) is deliberately not consulted:
+/// it says a patch once landed in the base, not that the base still holds it.
 fn emptied(git: &Git<'_>, base: &str, old: &str, new: &str) -> Result<Option<String>, String> {
-    if git.tree(new)? != git.tree(base)? {
+    let base_tree = git.tree(base)?;
+    if git.tree(new)? != base_tree {
         return Ok(None);
     }
-    // Right-side commits with no patch-equivalent on the left: what `<old>`
-    // has that `<base>` genuinely lacks.
-    let range = format!("{base}...{old}");
-    let unique = git.ok(&[
-        "rev-list",
-        "--no-merges",
-        "--cherry-pick",
-        "--right-only",
-        &range,
-    ])?;
-    for commit in unique.lines().map(str::trim).filter(|l| !l.is_empty()) {
+    // When the merge cannot be computed the reference is `<old>`'s own tree,
+    // so anything `<old>` holds that the base does not is reported: blocked,
+    // never "safe".
+    let (merged, conflicted) = merge_reference(git, old, base)?;
+    if conflicted.is_empty() && merged == base_tree {
+        return Ok(None);
+    }
+    // Name a payload commit for the explanation: the newest non-merge commit
+    // of the branch that changes anything.
+    let range = format!("{base}..{old}");
+    let ahead = git.ok(&["rev-list", "--no-merges", &range])?;
+    for commit in ahead.lines().map(str::trim).filter(|l| !l.is_empty()) {
         let parent = format!("{commit}^");
         // A root commit has no parent to diff against; it is payload.
         let has_parent = git
@@ -320,12 +345,12 @@ fn emptied(git: &Git<'_>, base: &str, old: &str, new: &str) -> Result<Option<Str
             return Ok(Some(commit.to_string()));
         }
     }
-    Ok(None)
+    Ok(Some(old.to_string()))
 }
 
 /// The tree merging `<base>` into `<old>` would produce, and the paths that
-/// merge conflicts on. `None` when the merge cannot be computed at all, in
-/// which case `<old>`'s own tree is the reference.
+/// merge conflicts on. When the merge cannot be computed at all, `<old>`'s own
+/// tree is the reference.
 fn merge_reference(git: &Git<'_>, old: &str, base: &str) -> Result<(String, Vec<String>), String> {
     let out = git.run(&[
         "merge-tree",
@@ -343,6 +368,25 @@ fn merge_reference(git: &Git<'_>, old: &str, base: &str) -> Result<(String, Vec<
         }
     }
     Ok((git.tree(old)?, Vec::new()))
+}
+
+/// Which of `paths` exist, under exactly that name, in `treeish`.
+fn present(git: &Git<'_>, treeish: &str, paths: &[String]) -> Result<Vec<String>, String> {
+    let mut found = Vec::new();
+    for chunk in paths.chunks(PATH_CHUNK) {
+        let mut args = vec![
+            "ls-tree",
+            "-r",
+            "--full-tree",
+            "--name-only",
+            "-z",
+            treeish,
+            "--",
+        ];
+        args.extend(chunk.iter().map(String::as_str));
+        found.extend(nul_list(&git.ok(&args)?));
+    }
+    Ok(found)
 }
 
 fn discarded_resolution(
@@ -410,6 +454,20 @@ fn discarded_resolution(
             args.extend(chunk.iter().map(String::as_str));
             for path in nul_list(&git.ok(&args)?) {
                 if !lost.contains(&path) {
+                    lost.push(path);
+                }
+            }
+        }
+        // A path the merge commit holds but `<new>` does not have under that
+        // name was renamed or removed on the way (by the base, or by a later
+        // branch commit), and the comparison above cannot see through that:
+        // when the reference lacks the name too, it reports nothing. Such a
+        // path is carried only if `<new>` is exactly the merge result.
+        let in_merge = present(git, merge, &touched)?;
+        let in_new = present(git, new, &touched)?;
+        if in_merge.iter().any(|p| !in_new.contains(p)) && git.tree(new)? != *tree {
+            for path in in_merge {
+                if !in_new.contains(&path) && !lost.contains(&path) {
                     lost.push(path);
                 }
             }

@@ -1278,7 +1278,7 @@ if [ "$MERGE_STATE" = "DIRTY" ]; then
 
 Automated rebase succeeded but was not pushed: the push failed, or `loom-daemon forge rebase-guard --base origin/main` found it would discard PR content (then merge `origin/main` in instead of rebasing).
 
-Please rebase your branch manually and push:
+After a failed push, rebase and push:
 ```bash
 git fetch origin
 git rebase origin/main

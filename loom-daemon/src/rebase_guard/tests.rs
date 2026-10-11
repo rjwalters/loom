@@ -274,6 +274,131 @@ fn a_resolution_path_the_base_conflicts_with_is_a_discard() {
     );
 }
 
+/// `fix.txt` on main; a feature branch that adds `b.txt` and then merges an
+/// unrelated main commit, hand-editing `fix.txt` to `coord=6` inside the merge
+/// commit. Leaves `feature` checked out and returns the merge.
+fn hand_resolved_fix_txt(r: &Path) -> String {
+    g(r, &["checkout", "-q", "-b", "feature"]);
+    write(r, "b.txt", "payload\n");
+    commit(r, "feature: payload");
+    g(r, &["checkout", "-q", "main"]);
+    write(r, "other.txt", "main moved\n");
+    commit(r, "main: unrelated");
+    g(r, &["checkout", "-q", "feature"]);
+    g(r, &["merge", "--no-commit", "--no-ff", "main"]);
+    write(r, "fix.txt", "coord=6\n");
+    commit(r, "Merge main: move fix off the colliding coordinate")
+}
+
+/// The base renames a file the hand resolution touched. Neither the merge
+/// result nor the rebased tree has the old name, so a comparison restricted
+/// to that name is empty; the rebase exits 0 and the resolution is gone.
+#[test]
+fn a_resolution_on_a_path_the_base_renamed_is_a_discard() {
+    let dir = repo_with(&[("fix.txt", "coord=5\n")]);
+    let r = dir.path();
+    let merge = hand_resolved_fix_txt(r);
+    g(r, &["checkout", "-q", "main"]);
+    g(r, &["mv", "fix.txt", "fixture.txt"]);
+    commit(r, "main: rename fix.txt");
+
+    g(r, &["checkout", "-q", "-b", "rebased", "feature"]);
+    g(r, &["rebase", "main"]); // exits 0
+    assert_eq!(std::fs::read_to_string(r.join("fixture.txt")).unwrap(), "coord=5\n");
+    assert!(!r.join("fix.txt").exists());
+
+    assert_eq!(
+        check(r, "main", "feature", "rebased"),
+        Verdict::ResolutionDiscarded {
+            merge,
+            paths: vec!["fix.txt".to_string()],
+        }
+    );
+
+    // Carried forward under the new name, the result is exactly what merging
+    // main in would have produced: nothing is lost.
+    write(r, "fixture.txt", "coord=6\n");
+    commit(r, "carry the merge's resolution forward");
+    assert_clean(&check(r, "main", "feature", "rebased"));
+}
+
+/// The same hole from the other side: a later commit on the branch renames
+/// the resolved file, and the rebase replays the rename over the unresolved
+/// content.
+#[test]
+fn a_resolution_on_a_path_the_branch_later_renamed_is_a_discard() {
+    let dir = repo_with(&[("fix.txt", "coord=5\n")]);
+    let r = dir.path();
+    let merge = hand_resolved_fix_txt(r);
+    g(r, &["mv", "fix.txt", "fixture.txt"]);
+    commit(r, "feature: rename fix.txt");
+    g(r, &["checkout", "-q", "main"]);
+    write(r, "more.txt", "main moved again\n");
+    commit(r, "main: unrelated, again");
+
+    g(r, &["checkout", "-q", "-b", "rebased", "feature"]);
+    g(r, &["rebase", "main"]);
+    assert_eq!(std::fs::read_to_string(r.join("fixture.txt")).unwrap(), "coord=5\n");
+
+    assert_eq!(
+        check(r, "main", "feature", "rebased"),
+        Verdict::ResolutionDiscarded {
+            merge,
+            paths: vec!["fix.txt".to_string()],
+        }
+    );
+}
+
+/// A resolution that settled a modify/delete conflict by deleting the file is
+/// carried by a rebase that also ends without it: an absent path is not, by
+/// itself, a discard.
+#[test]
+fn a_resolution_that_deletes_a_path_is_carried_by_its_absence() {
+    let dir = repo_with(&[("gone.txt", "v=0\n"), ("a.txt", "a\n")]);
+    let r = dir.path();
+    g(r, &["checkout", "-q", "-b", "feature"]);
+    g(r, &["rm", "-q", "gone.txt"]);
+    commit(r, "feature: delete gone.txt");
+    g(r, &["checkout", "-q", "main"]);
+    write(r, "gone.txt", "v=main\n");
+    commit(r, "main: modify gone.txt");
+    g(r, &["checkout", "-q", "feature"]);
+    assert!(!raw(r, &["merge", "main"]).0, "modify/delete must conflict");
+    g(r, &["rm", "-q", "gone.txt"]);
+    commit(r, "Merge main: keep the deletion");
+    assert_eq!(
+        g(r, &["show", "--remerge-diff", "--format=", "--name-only", "HEAD"]),
+        "gone.txt",
+        "the deletion is a hand resolution"
+    );
+
+    let tree = g(r, &["rev-parse", "feature^{tree}"]);
+    let flat = g(r, &["commit-tree", &tree, "-p", "main", "-m", "flattened"]);
+    assert_clean(&check(r, "main", "feature", &flat));
+}
+
+/// The verb is asked from wherever the caller stands. Paths are relative to
+/// the top of the tree, so a subdirectory must not turn a discard into "safe".
+#[test]
+fn a_discard_is_found_from_a_subdirectory() {
+    let dir = repo_with(&[("fix.txt", "coord=5\n")]);
+    let r = dir.path();
+    std::fs::create_dir(r.join("sub")).unwrap();
+    write(r, "sub/keep.txt", "k\n");
+    commit(r, "base: a subdirectory");
+    let merge = hand_resolved_fix_txt(r);
+    g(r, &["checkout", "-q", "-b", "rebased", "feature"]);
+    g(r, &["rebase", "main"]);
+
+    assert_eq!(
+        check(&r.join("sub"), "main", "feature", "rebased"),
+        Verdict::ResolutionDiscarded {
+            merge,
+            paths: vec!["fix.txt".to_string()],
+        }
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Fixture B: an emptied payload
 // ---------------------------------------------------------------------------
@@ -359,6 +484,53 @@ fn a_commit_dropped_because_the_base_already_has_it_is_clean() {
     assert_eq!(g(r, &["rev-parse", "rebased"]), g(r, &["rev-parse", "main"]));
 
     assert_clean(&check(r, "main", "feature", "rebased"));
+}
+
+/// The other half of that decision: it is the base's CONTENT that makes the
+/// drop harmless, not its history. The identical patch landed in the base and
+/// was then reverted there; `git rebase` still skips the branch commit as
+/// already applied, and the change is in neither the base nor the rebased
+/// branch. Merging instead would have kept it.
+#[test]
+fn a_commit_dropped_because_the_base_landed_then_reverted_it_is_emptied() {
+    let dir = repo_with(&[("a.txt", "a\n")]);
+    let r = dir.path();
+    g(r, &["checkout", "-q", "-b", "feature"]);
+    write(r, "b.txt", "payload\n");
+    let payload = commit(r, "feature: payload");
+    g(r, &["checkout", "-q", "main"]);
+    write(r, "c.txt", "main moved\n");
+    commit(r, "main: unrelated");
+    g(r, &["cherry-pick", &payload]);
+    g(r, &["revert", "--no-edit", "HEAD"]);
+    assert!(!r.join("b.txt").exists());
+
+    g(r, &["checkout", "-q", "-b", "rebased", "feature"]);
+    g(r, &["rebase", "main"]); // exits 0, skipping the "already applied" commit
+    assert_eq!(g(r, &["rev-parse", "rebased^{tree}"]), g(r, &["rev-parse", "main^{tree}"]));
+    assert_eq!(
+        g(
+            r,
+            &[
+                "rev-list",
+                "--no-merges",
+                "--cherry-pick",
+                "--right-only",
+                "main...feature"
+            ]
+        ),
+        "",
+        "patch history calls the commit already in the base"
+    );
+
+    let v = check(r, "main", "feature", "rebased");
+    assert_eq!(v, Verdict::Emptied { commit: payload });
+    let args = Args {
+        base: "main".into(),
+        old: "feature".into(),
+        new: "rebased".into(),
+    };
+    assert_eq!(render(&v, &args).0, 0, "blocked, not safe");
 }
 
 /// Commits ahead that change nothing are not a payload.
