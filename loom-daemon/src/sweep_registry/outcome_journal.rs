@@ -244,6 +244,9 @@ impl SweepRegistry {
             // every single-record region and every re-dispatch/re-exec that
             // re-announced the same tap (Issue #8659).
             tap_usage_all: tap_region.breakdown().to_vec(),
+            // Issue #11360: `worker run` phases, from their own logs — beside the
+            // parent's rows above, never folded into them.
+            phase_tap_usage: tap_region.phase_workers.clone(),
             duration_sec,
         };
         if let Err(e) = sweep_outcomes::append_outcome(&path, &record) {
@@ -316,11 +319,21 @@ impl SweepRegistry {
             .entries
             .get(sweep_id)
             .map_or_else(|| self.compute_log_path(issue), |i| i.log_path.clone());
+        // Issue #11360: out-of-process phases (`worker run`) write logs of their
+        // own, joined by the `sweep_id` they were stamped with. Read even when
+        // the sweep log itself is gone: those launches still spent on a tap.
+        let phase_workers =
+            crate::tap_usage::account_phase_logs_at(&self.config.workspace_root, issue, sweep_id);
         let Ok(contents) = std::fs::read_to_string(log_path) else {
-            return (None, crate::tap_usage::RegionAccounting::default());
+            let tap_region = crate::tap_usage::RegionAccounting {
+                phase_workers,
+                ..Default::default()
+            };
+            return (None, tap_region);
         };
         let anchor = format!("sweep_id={sweep_id}");
-        let tap_region = crate::tap_usage::account_region_by_tap(&contents, &anchor);
+        let mut tap_region = crate::tap_usage::account_region_by_tap(&contents, &anchor);
+        tap_region.phase_workers = phase_workers;
         let credential = tap_region
             .outcome()
             .map(|accounting| accounting.tap.credential.clone())
@@ -577,6 +590,19 @@ impl SweepRegistry {
                     .collect::<Vec<_>>()
                     .join(","),
             );
+        }
+        // Issue #11360: taps that `worker run` phases spent on, from their own
+        // logs. Flagged only (like `tap_region_keys`) so `config["tap"]` keeps
+        // naming the parent's launch; the counters are on `phase_tap_usage`.
+        if !tap_region.phase_workers.is_empty() {
+            let mut keys: Vec<String> = Vec::new();
+            for phase in &tap_region.phase_workers {
+                let key = format!("{}={}", phase.role, phase.accounting.key());
+                if !keys.contains(&key) {
+                    keys.push(key);
+                }
+            }
+            config.insert("tap_phase_keys".to_string(), keys.join(","));
         }
         // Issue #4809: attribute this sweep to the model-cost A/B experiment's
         // arm from its OWN dispatched model — the same inference the #3725

@@ -21,6 +21,10 @@ pub(crate) mod profiles;
 mod prompt;
 
 pub use profile_check::{cli as profile_cli, WorkerArgs as WorkerCommand};
+// #11360: the mixed-sweep accounting fixture builds its escalated-Doctor log
+// from the exact report `worker run --escalate-claude` prints.
+#[cfg(test)]
+pub(crate) use phase_run::escalation_report;
 
 use harness::Harness;
 use std::{
