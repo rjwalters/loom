@@ -34,6 +34,11 @@ use crate::observability::ops::liveness::{self, Fault};
 use crate::task_liveness::{self as task_liveness, AUTO_UPDATE};
 use crate::telemetry::kinds::auto_update_tick::TickDecisionKind;
 
+// #10720: a sibling file, declared here because `auto_update.rs` is at the
+// file-size ratchet's ceiling.
+#[path = "config_restart.rs"]
+pub(super) mod config_restart;
+
 /// How long one tick may run before it counts as an overrun: the update
 /// script's own timeout (a fetch or rebuild is killed at that point) plus five
 /// minutes for resolution and the drain trigger.
@@ -392,9 +397,15 @@ pub(super) fn guarded_tick<P: AutoUpdateProbe, T: RollTrigger>(
     // #10954: a loop that runs only for the fleet floor (autoUpdate off) does
     // nothing on a tick where the host has no fleet store.
     let idle = loop_mode::idle_reason(tuning.chase_enabled, state.floor.fleet_host());
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match idle {
-        Some(note) => idle_tick(state, status, note),
-        None => run_tick(state, status, probe, trigger, tuning.settle, tuning.defer_deadline),
+    // #10720: the restart-required config change fleet-sync found since boot.
+    // Acted on after the version decision, so a roll this tick absorbs it.
+    let config = floor.config_demand();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let summary = match idle {
+            Some(note) => idle_tick(state, status, note),
+            None => run_tick(state, status, probe, trigger, tuning.settle, tuning.defer_deadline),
+        };
+        config_restart::after_tick(state, status, trigger, config.as_ref(), summary)
     }));
     let summary = result.unwrap_or_else(|payload| {
         let note = format!(
@@ -470,6 +481,8 @@ pub(super) struct FloorFeed {
     wake: Arc<dyn Fn() -> &'static crate::fleet_sync::FloorWake + Send + Sync>,
     /// #10719: the highest daemon version a registered workspace needs.
     demand: Arc<dyn Fn() -> Option<floor_roll::repo_ahead::Demand> + Send + Sync>,
+    /// #10720: the restart-required config change standing since boot.
+    config: Arc<dyn Fn() -> Option<crate::fleet_sync::ConfigRestartDemand> + Send + Sync>,
 }
 
 impl FloorFeed {
@@ -479,6 +492,7 @@ impl FloorFeed {
             read: Arc::new(crate::fleet_sync::floor_knowledge),
             wake: Arc::new(crate::fleet_sync::floor_wake),
             demand: Arc::new(floor_roll::repo_ahead::Demand::live),
+            config: Arc::new(crate::fleet_sync::config_restart_demand),
         }
     }
 
@@ -492,6 +506,7 @@ impl FloorFeed {
             read: Arc::new(read),
             wake: Arc::new(move || wake),
             demand: Arc::new(|| None),
+            config: Arc::new(|| None),
         }
     }
 
@@ -500,6 +515,20 @@ impl FloorFeed {
     pub(super) fn with_demand(mut self, demand: floor_roll::repo_ahead::Demand) -> Self {
         self.demand = Arc::new(move || Some(demand.clone()));
         self
+    }
+
+    /// The same feed, with a fixed config-restart demand (#10720).
+    #[cfg(test)]
+    pub(super) fn with_config_demand(
+        mut self,
+        demand: crate::fleet_sync::ConfigRestartDemand,
+    ) -> Self {
+        self.config = Arc::new(move || Some(demand.clone()));
+        self
+    }
+
+    fn config_demand(&self) -> Option<crate::fleet_sync::ConfigRestartDemand> {
+        (self.config)()
     }
 
     fn knowledge(&self) -> crate::fleet_sync::FloorKnowledge {

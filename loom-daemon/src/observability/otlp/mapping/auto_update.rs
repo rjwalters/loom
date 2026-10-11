@@ -75,6 +75,7 @@ pub(super) fn log_parts(
         ("loom.auto_update.target_version", r.target_version.clone()),
         ("loom.auto_update.target_published_at", r.target_published_at.clone()),
         ("loom.auto_update.drain_target", r.drain.target.clone()),
+        ("loom.auto_update.target_source", r.target_source.clone()),
     ] {
         if let Some(value) = value {
             attributes.push(kv_string(key, value));
@@ -84,6 +85,7 @@ pub(super) fn log_parts(
         ("loom.auto_update.commits_behind", r.commits_behind.map(i64::from)),
         ("loom.auto_update.hours_behind", r.hours_behind.map(i64::from)),
         ("loom.auto_update.in_flight", r.in_flight.map(to_i64)),
+        ("loom.auto_update.config_restart_paths", r.config_restart_paths.map(to_i64)),
     ] {
         if let Some(value) = value {
             attributes.push(kv_int(key, value));

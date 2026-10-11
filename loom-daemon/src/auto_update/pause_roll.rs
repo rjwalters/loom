@@ -166,6 +166,20 @@ impl RollTarget {
             label: None,
         }
     }
+
+    /// #10720: a restart onto the binary already running, for a
+    /// restart-required fleet-config change. `from_version` equals
+    /// `to_version`; `artifact_sha256` is the running artifact's, when known.
+    /// It has no release-artifact label, so it is never superseded (#8514).
+    #[must_use]
+    pub fn config_restart(running_version: &str, artifact_sha256: Option<String>) -> Self {
+        Self {
+            source: TargetSource::ConfigRestart,
+            to_version: Some(running_version.to_string()),
+            to_artifact_sha256: artifact_sha256,
+            label: None,
+        }
+    }
 }
 
 /// The resolved `autonomous.autoUpdate.pauseRoll.*` knobs.

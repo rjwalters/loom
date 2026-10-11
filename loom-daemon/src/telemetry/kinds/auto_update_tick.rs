@@ -46,6 +46,8 @@ pub const AUTO_UPDATE_LOG_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.auto_update.revision",
     "loom.auto_update.tree_state",
     "loom.auto_update.provenance_complete",
+    "loom.auto_update.target_source",
+    "loom.auto_update.config_restart_paths",
 ];
 
 /// What one tick decided. A closed set, so dashboards can group on it.
@@ -68,6 +70,9 @@ pub enum TickDecisionKind {
     DrainWait,
     /// The tick panicked. The loop recorded it and keeps running.
     Panic,
+    /// #10720: a restart-required fleet-config change armed a pause-and-roll
+    /// onto the binary already running.
+    ConfigRestart,
 }
 
 impl TickDecisionKind {
@@ -82,6 +87,7 @@ impl TickDecisionKind {
             Self::Rebuild => "rebuild",
             Self::DrainWait => "drain_wait",
             Self::Panic => "panic",
+            Self::ConfigRestart => "config_restart",
         }
     }
 }
@@ -180,6 +186,15 @@ pub struct AutoUpdateTickRecord {
     /// Raises the record to ERROR when floor-driven, else WARN.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub roll_held: Option<RollHeld>,
+    /// #10720: `config_restart` when a restart-required fleet-config change
+    /// stood this tick (armed, folded into a version roll, or deferred; the
+    /// `reason` says which). Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_source: Option<String>,
+    /// #10720: how many restart-required config paths that change covers. A
+    /// count only: neither the paths' values nor the paths ride here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_restart_paths: Option<u64>,
     /// Consecutive retryable failures for the tracked target.
     pub consecutive_failures: u32,
     /// Wall time the tick took, milliseconds.

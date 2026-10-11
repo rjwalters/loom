@@ -23,6 +23,16 @@
 //! An entry not covered here defaults conservatively to
 //! [`Reloadability::RestartRequired`] — "unknown" must never be reported as
 //! "safe to skip the restart", only the reverse.
+//!
+//! # Why accuracy matters (#10720)
+//!
+//! This table used to only print a line. Since #10720 the daemon itself acts
+//! on it: a restart-required change a fleet-store host applied arms the
+//! unified pause-and-roll (`fleet_sync::config_restart`), which pauses every
+//! agent. So every block a fleet store carries has an explicit entry below,
+//! and an annotation key (any `_`-prefixed segment, which nothing reads) never
+//! restarts anything. An unlisted block still defaults to restart-required,
+//! so a new block is a deliberate choice ([`AUDITED_BLOCKS`]).
 
 use std::fmt;
 
@@ -108,13 +118,100 @@ const TABLE: &[(&str, Reloadability)] = &[
     // the timer task is spawned — including the very config this `render`
     // itself is driven by.
     ("fleet", Reloadability::RestartRequired),
+    // Re-read on every tick: each captain-gated singleton re-evaluates
+    // `config_resolver::fleet_captain` per tick (`fleet_singletons.rs`'s
+    // module contract), so a captain change needs no restart.
+    ("fleet.captain", Reloadability::Live),
+    // `read_auto_update_config` runs once at bring-up in `daemon_service.rs`
+    // (the self-update loop's spawn block) and the result is frozen into
+    // `TickTuning`.
+    ("autonomous.autoUpdate", Reloadability::RestartRequired),
+    // Except the pause-and-roll budgets: `PauseRollTuning::resolve` reads them
+    // fresh on every roll (`auto_update/pause_roll/supervise.rs`,
+    // `start_pause_roll`).
+    ("autonomous.autoUpdate.pauseRoll", Reloadability::Live),
+    // `worktree_reaper::read_worktree_reaper_config` runs once before the
+    // reaper loop is spawned (`daemon_service.rs`).
+    ("autonomous.worktreeReaper", Reloadability::RestartRequired),
+    // `ci_telemetry::spawn_task_on` resolves `enabled` / the interval once,
+    // before its loop is spawned (`ci_telemetry/mod.rs`, `spawn_task_with_bus`).
+    ("autonomous.ciTelemetry", Reloadability::RestartRequired),
+    // No daemon consumer since #11098 retired the ETA writers: only the CLI
+    // `telemetry-replay` reads the legacy `fleetRefresh.signoz` endpoint
+    // (`signoz_read::LEGACY_ENDPOINT_CONFIG_KEY`), fresh per invocation.
+    ("autonomous.eta", Reloadability::Live),
+    // `star_liveness::Settings::resolve` is called at the top of every pass of
+    // the star-liveness loop (`star_liveness/task.rs`, `spawn`).
+    ("autonomous.operatorPriority", Reloadability::Live),
+    // `observability::read_config` runs once in `spawn_observer_tasks`
+    // (`daemon_service/observer_tasks.rs`) before the exporter is spawned.
+    ("observability", Reloadability::RestartRequired),
+    // Read per admission / per spawn: `runtime_admission::config_runtime`,
+    // `worker_spawn::profiles::lookup`, `agent_relay`'s containment check and
+    // `spawn-worker.sh` each resolve the effective config at the moment a
+    // worker is launched.
+    ("runtimes", Reloadability::Live),
+    // `credential_preflight` resolves `forge.githubApp` once at bring-up,
+    // before the fleet store is even read (`fleet_sync`'s module doc).
+    ("forge", Reloadability::RestartRequired),
+    // `WorkspacePool::start_safehouse_narration` / `start_peer_coordination`
+    // resolve `safehouse::resolve_config` once when the pool comes up.
+    ("safehouse", Reloadability::RestartRequired),
+    // No daemon consumer: `codesign.identity` is read by `loom-daemon health`
+    // (`cli/health.rs`) and the provisioning scripts, each fresh per run.
+    ("codesign", Reloadability::Live),
+    // No consumer in this tree at all; nothing a restart would re-read.
+    ("ratification", Reloadability::Live),
 ];
 
-/// Classify one dotted config path. Unmatched paths default conservatively to
+/// The config blocks a fleet store carries that were audited for #10720. Each
+/// must have an explicit [`TABLE`] entry (pinned by a test), so adding a
+/// block to the store is a deliberate classification, never a silent default.
+pub const AUDITED_BLOCKS: &[&str] = &[
+    "autonomous.roleRunner",
+    "autonomous.workFinder",
+    "autonomous.hostBreaker",
+    "autonomous.rateLimitBreaker",
+    "autonomous.mainHealthGate",
+    "autonomous.transcriptIngest",
+    "autonomous.autoUpdate",
+    "autonomous.worktreeReaper",
+    "autonomous.ciTelemetry",
+    "autonomous.eta",
+    "autonomous.operatorPriority",
+    "observability",
+    "fleet",
+    "fleet.captain",
+    "runtimes",
+    "forge",
+    "safehouse",
+    "codesign",
+    "ratification",
+];
+
+/// Whether `path` names an annotation: any segment starting with `_`
+/// (`fleet._sync_note`, `autonomous.autoUpdate._settle_note`). Nothing reads
+/// one, so changing it never needs a restart.
+#[must_use]
+pub fn is_annotation(path: &str) -> bool {
+    path.split('.').any(|segment| segment.starts_with('_'))
+}
+
+/// Whether `prefix` has its own [`TABLE`] entry.
+#[must_use]
+pub fn has_entry(prefix: &str) -> bool {
+    TABLE.iter().any(|(p, _)| *p == prefix)
+}
+
+/// Classify one dotted config path. Annotation paths ([`is_annotation`]) are
+/// live; other unmatched paths default conservatively to
 /// [`Reloadability::RestartRequired`] — see the module doc's "mechanical
 /// test".
 #[must_use]
 pub fn classify(path: &str) -> Reloadability {
+    if is_annotation(path) {
+        return Reloadability::Live;
+    }
     TABLE
         .iter()
         .filter(|(prefix, _)| path == *prefix || path.starts_with(&format!("{prefix}.")))
@@ -198,6 +295,59 @@ mod tests {
             classify("autonomous.workFinder.maxConcurrentPerRepoLimitFoo"),
             Reloadability::RestartRequired
         );
+    }
+
+    /// #10720: an annotation segment at any depth is live, even under a
+    /// restart-required block.
+    #[test]
+    fn annotation_paths_are_live_at_any_depth() {
+        for path in [
+            "_note",
+            "fleet._sync_note",
+            "autonomous.autoUpdate._settle_note",
+            "autonomous.workFinder.saturationBrake._why",
+            "somethingBrandNew._comment.nested",
+        ] {
+            assert!(is_annotation(path), "{path}");
+            assert_eq!(classify(path), Reloadability::Live, "{path}");
+        }
+        // An underscore that does not start a segment is not an annotation.
+        assert!(!is_annotation("fleet.sync_note"));
+        assert_eq!(classify("fleet.sync_note"), Reloadability::RestartRequired);
+    }
+
+    /// #10720: every audited block has its own entry, so a block a fleet store
+    /// carries is never classified by the unknown default.
+    #[test]
+    fn every_audited_block_has_an_explicit_entry() {
+        for block in AUDITED_BLOCKS {
+            assert!(has_entry(block), "{block} has no explicit reload-table entry");
+        }
+    }
+
+    #[test]
+    fn audited_blocks_classify_as_their_call_sites_say() {
+        let cases = [
+            ("autonomous.autoUpdate.enabled", Reloadability::RestartRequired),
+            ("autonomous.autoUpdate.intervalSecs", Reloadability::RestartRequired),
+            ("autonomous.autoUpdate.pauseRoll.pauseBudgetSecs", Reloadability::Live),
+            ("autonomous.worktreeReaper.enabled", Reloadability::RestartRequired),
+            ("autonomous.ciTelemetry.enabled", Reloadability::RestartRequired),
+            ("autonomous.eta.enabled", Reloadability::Live),
+            ("autonomous.operatorPriority.escalate", Reloadability::Live),
+            ("observability.enabled", Reloadability::RestartRequired),
+            ("fleet.captain", Reloadability::Live),
+            ("fleet.captainArmTtlSecs", Reloadability::RestartRequired),
+            ("fleet.repo", Reloadability::RestartRequired),
+            ("runtimes.default", Reloadability::Live),
+            ("forge.githubApp.appId", Reloadability::RestartRequired),
+            ("safehouse.enabled", Reloadability::RestartRequired),
+            ("codesign.identity", Reloadability::Live),
+            ("ratification.anything", Reloadability::Live),
+        ];
+        for (path, want) in cases {
+            assert_eq!(classify(path), want, "{path}");
+        }
     }
 
     #[test]

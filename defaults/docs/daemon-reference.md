@@ -1701,7 +1701,10 @@ runs the same reader the verbs above use, twice over:
   on, in which case a timer pass renders and applies exactly as `render` /
   `roster --apply` would, and also clones a desired repo that is not cloned
   yet ([Roster clones](#roster-clones-11218)). `autoApply` is ignored (with a warning) on a repo that
-  sets `daemon.delegatedTo`.
+  sets `daemon.delegatedTo`. After each timer pass the tiers on disk are also
+  compared with what the process booted with; a restart-required change arms
+  a same-binary pause-and-roll on the next self-update tick when `autoApply` is
+  on (#10720, see [The fleet floor drives rolls](#the-fleet-floor-drives-rolls-no-roll-windows-10885)).
 
 Three properties are preserved deliberately:
 
@@ -6462,7 +6465,7 @@ knobs not yet audited here.
 | `safehouse.rooms.byRepo` | `LOOM_SAFEHOUSE_ROOMS_BY_REPO` (`repo=room,…`) | `{}` | Attention-class routing (#4225): per-repo **firehose** room ids keyed by workspace-root basename — `task`/`chat` narration. A repo absent from the map is created lazily as `fleet-<repo>`; a refused creation degrades that repo to the signal room with one `warn!`. The env form replaces the whole map |
 | `safehouse.claimReconcileIntervalSecs` | `LOOM_CLAIM_RECONCILE_INTERVAL_SECS` | `1800` when `safehouse.enabled`, else `600` | Periodic `loom:building`/PR-claim reconciliation cadence (#4431). With safehouse peer-claims carrying the fast in-flight signal (re-advertised each reaper tick), label reconciliation demotes to a slow healing sweep. Env wins on any host; floored at 60s |
 | *(host identity)* | `LOOM_HOST_ID` | `$HOSTNAME` → `hostname` → `unknown-host` | This host's identity string, used in collision log records (#4085) **and** peer-claim self-recognition (#4028); set it where the daemon runs without `$HOSTNAME` exported |
-| `autonomous.autoUpdate.enabled` | `LOOM_AUTO_UPDATE` | `false` | Autonomous self-update loop on/off (#4055) **on a host with no fleet store only**. **Opt-in** there (it rebuilds + restarts the daemon process). On a fleet host (`fleet.repo` set) it governs nothing: the loop runs whatever it says, for the fleet floor and for a workspace that needs a newer daemon, and never chases the newest release (#10954, see [The fleet floor drives rolls](#the-fleet-floor-drives-rolls-no-roll-windows-10885)). Exactly one loop per daemon, not a per-workspace fan-out. See [Autonomous self-update loop](#autonomous-self-update-loop-4055) below |
+| `autonomous.autoUpdate.enabled` | `LOOM_AUTO_UPDATE` | `false` | Autonomous self-update loop on/off (#4055) **on a host with no fleet store only**. **Opt-in** there (it rebuilds + restarts the daemon process). On a fleet host (`fleet.repo` set) it governs nothing: the loop runs whatever it says, for the fleet floor, for a workspace that needs a newer daemon and (on a `fleet.autoApply` host) for a restart-only config change (#10720), and never chases the newest release (#10954, see [The fleet floor drives rolls](#the-fleet-floor-drives-rolls-no-roll-windows-10885)). Exactly one loop per daemon, not a per-workspace fan-out. See [Autonomous self-update loop](#autonomous-self-update-loop-4055) below |
 | `autonomous.autoUpdate.intervalSecs` | `LOOM_AUTO_UPDATE_INTERVAL_SECS` | `900` | Cadence between staleness checks. Zero/invalid → default |
 | `autonomous.autoUpdate.settleSecs` | `LOOM_AUTO_UPDATE_SETTLE_SECS` | `600` | Settle window: wait this long after first observing a stale commit — resetting on every further commit — before rolling, so a burst of merges collapses into one roll. Zero/invalid → default. **Only on a host with no fleet store** (#10885): a fleet host rolls for its floor on the tick that sees it and never waits on settle |
 | `autonomous.transcriptIngest.enabled` | `LOOM_TRANSCRIPT_INGEST` | **`true`** | Periodic transcript token/cost ingestion into `~/.loom/activity.db` (#8059, flipped default-on by #8477). **Deliberately defaults ON against FLAGS-OFF**, like the `autonomous.eta.*` writers: it generates no work (a passive, ledgered, idempotent telemetry writer), while default-*off* silently destroyed data — Claude Code deletes transcripts after `cleanupPeriodDays` (default 30), so every host that never hand-set the env var lost its cost history permanently. Env `0`/`false`/`no`/`off` opts out; an unrecognized value falls through to config/default rather than silently disabling. **Restart required** — resolved once before the thread is spawned. See [`transcript-token-ingest.md`](transcript-token-ingest.md) |
@@ -6513,6 +6516,7 @@ says** (#10954): the loop is spawned on every host with a fleet store, and
 | set | below; no release resolved | No roll; the next tick asks again |
 | set | at or above | **No roll**, whatever newer release, re-published artifact or source HEAD exists, unless a registered workspace needs a newer daemon (the next row) |
 | any store, floor unknown included | a workspace's installed Loom needs a newer daemon (`W4`, #10719) | Pause-and-roll now, no settle, to the newest published release (binary and `.sha256` present) at or above its `requires_daemon`. `target_source = repo_ahead` (`floor` when the floor drives too). See [Dispatch holds](#dispatch-holds-10719) |
+| any store, `fleet.autoApply` on | a restart-required config key changed since this daemon booted (#10720) | Pause-and-roll now onto the **same binary** (no fetch): `from_version = to_version`, `target_source = config_restart`. Folded into a version roll armed or in progress instead. See the bullet below |
 
 - **A fleet host moves only when the floor moves.** It does not chase the
   newest release and does not rebuild itself from source as `main` advances.
@@ -6565,6 +6569,29 @@ says** (#10954): the loop is spawned on every host with a fleet store, and
   continues on the running version. A **terminal** fetch failure on a floor
   target is not final: it is retried every 6 h. Any other target keeps the
   old rule (no retry until a new release).
+- **A restart-only config change restarts the host on the next tick** (#10720).
+  Fleet-sync compares the machine and host-local tiers on disk, after each
+  timer pass, with what this process booted with, and classifies each changed
+  path with `fleet_store/reload.rs`. A restart-required path (or a tier file
+  that appeared, vanished or stopped parsing) is one standing demand covering
+  every change since boot; a change reverted before the tick clears it, and a
+  live or annotation (`_`-prefixed) key never raises one. The next self-update
+  tick arms it through `trigger_pause_roll` with `target_source =
+  config_restart` and the running version as the target: no fetch, no roll
+  window, debounce, jitter or minimum interval, and the pause, 5-minute rule,
+  budgets, supervisor check, operator-drain precedence and `EXIT_RESTART` are
+  #10831's. When a version roll is armed that tick or already in progress, the
+  demand rides on it. It is not a completed roll: `last_roll`, the
+  artifact-roll record, backoff and the convergence guard are untouched, and
+  the same binary reads `auto_update_state.json` back, so settle clocks and the
+  stall episode survive. The restarted process's snapshot equals the disk, so
+  it never loops. **`Mode::Write` hosts only** (`fleet.autoApply` on), and
+  **regardless of `autonomous.autoUpdate.enabled`** (the loop runs on every
+  fleet host, #10954); a check-mode host records it and arms nothing.
+  `loom-daemon status` shows `Pending restart:` with the paths until the pid
+  changes, and the `auto_update.tick` record carries `decision =
+  config_restart`, `target_source` and `config_restart_paths` (a count). Paths
+  only, never values, in every log line, marker and record.
 - **Every fleet host runs the loop, `autoUpdate.enabled` or not** (#10954).
   The mode is chosen once at startup, after the startup fleet-sync pass has
   classified the host: a store that is named but unusable is a fleet host

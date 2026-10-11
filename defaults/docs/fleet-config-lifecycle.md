@@ -131,8 +131,27 @@ between passes. A store commit with no host reporting it is exactly the
 "landed != effective" gap, made visible instead of inferred.
 
 The timer half is **detection, not convergence** by default: it reports drift
-and writes nothing unless `fleet.autoApply` is on. A change that must take
-effect without waiting for a restart still needs one.
+and writes nothing unless `fleet.autoApply` is on.
+
+**On a `fleet.autoApply` host the restart is now automatic (#10720).** After
+each timer pass, fleet-sync compares the two tiers on disk with what this
+daemon process **booted with**, and classifies every changed path with
+`reload.rs`. Any restart-required path (or a tier file that appeared,
+vanished or stopped parsing) becomes one standing demand; the self-update loop
+arms it on its next tick through the one roll path, `trigger_pause_roll`
+(source `config_restart`): pause every agent resumably, restart onto the
+**same binary**, resume. Every change since boot is one restart, however many
+store commits or writers (the timer's own write, a hand-run `fleet-config
+render`, a startup pass that overran its cap) produced it; a change reverted
+before the tick needs none; and the restarted process's own snapshot equals the
+disk, so it never loops. Live keys and annotation keys (any `_`-prefixed
+segment) never restart anything. `loom-daemon status` shows `Pending restart:`
+with the paths and "restarts itself on its next self-update tick" until the
+pid changes. Only paths are ever logged or recorded, never values.
+
+On a host **without** `fleet.autoApply` (check mode) the same demand is
+recorded and shown, and nothing is armed: a change that must take effect still
+needs a manual restart there.
 
 ## Applying the rule
 

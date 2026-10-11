@@ -46,6 +46,8 @@ pub struct TickSummary {
     /// #10880: the held-roll alert this tick raised (ERROR below the floor,
     /// WARN otherwise). Set on every tick the roll stays held.
     pub roll_held: Option<RollHeld>,
+    /// #10720: the restart-required config paths standing this tick (a count).
+    pub config_restart_paths: Option<usize>,
 }
 
 impl TickSummary {
@@ -73,6 +75,7 @@ impl TickSummary {
             floor_stall: None,
             floor_alerted: false,
             roll_held: None,
+            config_restart_paths: None,
         }
     }
 
@@ -126,6 +129,12 @@ pub fn record(
         drain: summary.drain.clone(),
         floor_stall: summary.floor_stall.clone(),
         roll_held: summary.roll_held.clone(),
+        target_source: summary.config_restart_paths.map(|_| {
+            super::pause_manifest::TargetSource::ConfigRestart
+                .as_str()
+                .to_string()
+        }),
+        config_restart_paths: summary.config_restart_paths.map(|n| n as u64),
         consecutive_failures,
         duration_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
         loom,

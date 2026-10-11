@@ -13,7 +13,9 @@
 //! the drift has already restarted, so the pending state is resolved and the
 //! marker is cleared as a side effect of printing status. This is the read
 //! side of #9597's "restart-required changes show up in `status` until
-//! actually applied" acceptance criterion.
+//! actually applied" acceptance criterion. Since #10720 the daemon's own
+//! fleet-sync pass records it too, and the line then says whether the daemon
+//! restarts itself (a `fleet.autoApply` host) and when.
 //!
 //! **Silent by default.** A host that has never rendered a restart-required
 //! change (or whose daemon has already restarted since) has no marker, so
@@ -36,12 +38,25 @@ pub fn print(current_daemon_pid: Option<u32>) {
 #[must_use]
 fn render_marker(marker: &PendingRestart, now: chrono::DateTime<chrono::Utc>) -> String {
     let age_mins = (now - marker.rendered_at).num_minutes().max(0);
-    format!(
-        "Pending restart: {} — rendered {age_mins}m ago (daemon pid {}); restart the daemon to \
-         apply",
-        marker.paths.join(", "),
-        marker.observed_pid
-    )
+    let paths = marker.paths.join(", ");
+    let pid = marker.observed_pid;
+    // #10720: the daemon recorded it itself, and says whether it restarts.
+    match marker.self_restart {
+        Some(true) => format!(
+            "Pending restart: {paths} — applied from the fleet store {age_mins}m ago (daemon pid \
+             {pid}); the daemon restarts itself (pause-and-roll, same version) on its next \
+             self-update tick (every autonomous.autoUpdate.intervalSecs, default 900s)"
+        ),
+        Some(false) => format!(
+            "Pending restart: {paths} — changed since the daemon started, seen {age_mins}m ago \
+             (daemon pid {pid}); fleet.autoApply is off on this host, so restart the daemon to \
+             apply"
+        ),
+        None => format!(
+            "Pending restart: {paths} — rendered {age_mins}m ago (daemon pid {pid}); restart the \
+             daemon to apply"
+        ),
+    }
 }
 
 /// [`pending_restart::reconcile`] against `current_daemon_pid`, then render —
@@ -77,10 +92,31 @@ mod tests {
             paths: vec!["autonomous.hostBreaker.enabled".to_string()],
             observed_pid: 4242,
             rendered_at: at(2026, 9, 30, 12, 0, 0),
+            self_restart: None,
         };
         let line = render_marker(&marker, at(2026, 9, 30, 12, 5, 0));
         assert!(line.starts_with("Pending restart: autonomous.hostBreaker.enabled"), "{line}");
         assert!(line.contains("5m ago"), "{line}");
         assert!(line.contains("pid 4242"), "{line}");
+        assert!(line.contains("restart the daemon to apply"), "{line}");
+    }
+
+    /// #10720: a daemon-recorded marker says whether the daemon restarts
+    /// itself, and when.
+    #[test]
+    fn a_daemon_recorded_marker_says_whether_and_when_it_restarts_itself() {
+        let mut marker = PendingRestart {
+            paths: vec!["autonomous.hostBreaker".to_string()],
+            observed_pid: 7,
+            rendered_at: at(2026, 9, 30, 12, 0, 0),
+            self_restart: Some(true),
+        };
+        let line = render_marker(&marker, at(2026, 9, 30, 12, 2, 0));
+        assert!(line.contains("restarts itself"), "{line}");
+        assert!(line.contains("next self-update tick"), "{line}");
+        marker.self_restart = Some(false);
+        let line = render_marker(&marker, at(2026, 9, 30, 12, 2, 0));
+        assert!(line.contains("fleet.autoApply is off"), "{line}");
+        assert!(line.contains("restart the daemon to apply"), "{line}");
     }
 }

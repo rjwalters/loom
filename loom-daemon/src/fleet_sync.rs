@@ -91,11 +91,13 @@ use crate::fleet_store::roster::{self, Change, Plan, Registered};
 use crate::fleet_store::{self as store, StoreLocation};
 
 pub mod checkout_ff;
+pub mod config_restart;
 mod floor_knowledge;
 pub mod offline_floor;
 pub mod roster_clone;
 pub mod workspace_resync;
 
+pub use config_restart::{config_restart_demand, ConfigRestartDemand};
 pub use floor_knowledge::{floor_knowledge, floor_wake, FloorKnowledge, FloorWake};
 
 /// Config key for the timer cadence.
@@ -1330,6 +1332,9 @@ pub async fn start(
     );
     workspace_resync::mark_boot();
     let state = startup_pass(&inputs, bus.as_deref()).await;
+    // #10720: what this process boots with; a later restart-required change
+    // against it arms a restart.
+    config_restart::snapshot_boot(&inputs.workspace);
     // Diverges on `stopped`: this host is not meant to be up at all.
     let hold_note = fleet_state::enforce_at_boot(&state, &inputs.host, &inputs.location.repo).await;
     Some(Started {
@@ -1434,6 +1439,8 @@ fn spawn_timer(
                         enforce(&mut status, e, bus.as_deref());
                     }
                     status.workspaces = workspace_resync::latest();
+                    // #10720: after the config half wrote, before the report.
+                    config_restart::after_pass(&inputs.workspace, mode);
                     publish(&status);
                     report(&status, bus.as_deref());
                     // #10718: last, so the floor is current and a hold this

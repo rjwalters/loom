@@ -31,6 +31,8 @@ fn record() -> AutoUpdateTickRecord {
         },
         floor_stall: None,
         roll_held: None,
+        target_source: Some("config_restart".to_string()),
+        config_restart_paths: Some(2),
         consecutive_failures: 0,
         duration_ms: 4200,
         loom: Provenance {
@@ -97,6 +99,8 @@ fn optional_fields_are_omitted_not_fabricated() {
     tick.target_published_at = None;
     tick.in_flight = None;
     tick.drain = DrainSnapshot::default();
+    tick.target_source = None;
+    tick.config_restart_paths = None;
     let envelope = TelemetryEnvelope::new("host", TelemetryRecord::AutoUpdateTick(tick));
     let log = log_record_for(&envelope).unwrap();
     for key in [
@@ -104,6 +108,8 @@ fn optional_fields_are_omitted_not_fabricated() {
         "loom.auto_update.target_version",
         "loom.auto_update.in_flight",
         "loom.auto_update.drain_target",
+        "loom.auto_update.target_source",
+        "loom.auto_update.config_restart_paths",
     ] {
         assert_eq!(attr(&log, key), None, "{key}");
     }
@@ -118,6 +124,7 @@ fn severity_tracks_whether_the_host_is_converging() {
         (TickDecisionKind::Fetch, Some("retryable"), SeverityNumber::Warn),
         (TickDecisionKind::Fetch, Some("success"), SeverityNumber::Info),
         (TickDecisionKind::Defer, None, SeverityNumber::Info),
+        (TickDecisionKind::ConfigRestart, None, SeverityNumber::Info),
     ];
     for (decision, outcome, expected) in cases {
         let mut tick = record();

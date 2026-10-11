@@ -50,6 +50,13 @@ pub struct PendingRestart {
     pub observed_pid: u32,
     /// When the render ran.
     pub rendered_at: DateTime<Utc>,
+    /// #10720: recorded by the daemon itself (fleet-sync's config-restart
+    /// demand), not by a hand-run `render`. `Some(true)`: this host applies
+    /// the store automatically and the daemon restarts itself on its next
+    /// self-update tick; `Some(false)`: `fleet.autoApply` is off, so nothing
+    /// is armed. Absent in a marker `render` wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_restart: Option<bool>,
 }
 
 /// Resolve `<loom_dir>` the same way [`crate::fleet_sync`] does: the parent
@@ -76,13 +83,33 @@ pub fn marker_path() -> Option<PathBuf> {
 /// this returns `Err` on a write failure so `render` can log it, never
 /// panics, and never fails the render itself.
 pub fn record(paths: Vec<String>, observed_pid: u32, rendered_at: DateTime<Utc>) -> Result<()> {
-    let Some(path) = marker_path() else {
-        return Ok(());
-    };
-    let marker = PendingRestart {
+    write(PendingRestart {
         paths,
         observed_pid,
         rendered_at,
+        self_restart: None,
+    })
+}
+
+/// [`record`] as the daemon's own fleet-sync pass calls it (#10720):
+/// `self_restart` says whether this daemon will restart itself for it.
+pub fn record_by_daemon(
+    paths: Vec<String>,
+    observed_pid: u32,
+    at: DateTime<Utc>,
+    self_restart: bool,
+) -> Result<()> {
+    write(PendingRestart {
+        paths,
+        observed_pid,
+        rendered_at: at,
+        self_restart: Some(self_restart),
+    })
+}
+
+fn write(marker: PendingRestart) -> Result<()> {
+    let Some(path) = marker_path() else {
+        return Ok(());
     };
     let mut body = serde_json::to_vec_pretty(&marker)?;
     body.push(b'\n');
@@ -162,6 +189,22 @@ mod tests {
             let marker = probe().unwrap();
             assert_eq!(marker.paths, vec!["autonomous.hostBreaker.enabled".to_string()]);
             assert_eq!(marker.observed_pid, 4242);
+        });
+    }
+
+    /// #10720: the daemon's own record says whether it restarts itself; a
+    /// `render`-written marker carries no such field.
+    #[test]
+    #[serial(loom_socket_path_env)]
+    fn a_daemon_record_carries_self_restart_and_a_render_record_does_not() {
+        with_loom_dir(|_| {
+            record_by_daemon(vec!["autonomous.hostBreaker".to_string()], 7, Utc::now(), true)
+                .unwrap();
+            assert_eq!(probe().unwrap().self_restart, Some(true));
+            record(vec!["fleet.autoApply".to_string()], 7, Utc::now()).unwrap();
+            assert_eq!(probe().unwrap().self_restart, None);
+            let raw = std::fs::read_to_string(marker_path().unwrap()).unwrap();
+            assert!(!raw.contains("selfRestart"), "{raw}");
         });
     }
 
