@@ -935,6 +935,21 @@ fn sweep_md_step_1b_publishes_an_in_session_lease_after_step_1a() {
     doc_lint_support::check_step_1b_lease_publish(&read_sweep_md());
 }
 
+/// #8881: Mode A/B pre-flight skips a `loom:epic` container — even a
+/// daemon-dispatched `--claim-owned` one — and releases the claim without
+/// restoring `loom:issue`. Reads `sweep-wave-lifecycle.md` ALONE: the
+/// concatenated skill already carries `loom:epic` in the `all` taxonomy, so an
+/// unscoped check would pass without the rule. Body (line-sliced, recipe
+/// executed): [`doc_lint_support::check_mode_ab_epic_preflight_skip`].
+#[test]
+fn sweep_md_mode_ab_preflight_skips_epics_without_requeueing_them() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join(SWEEP_SKILL_DIR_RELATIVE)
+        .join("sweep-wave-lifecycle.md");
+    let wave = fs::read_to_string(&path).expect("read sweep-wave-lifecycle.md");
+    doc_lint_support::check_mode_ab_epic_preflight_skip(&wave);
+}
+
 /// #6320's second point: `--no-daemon` names dispatch, not isolation. The
 /// flag's documentation must say so and must name the multi-host deregister
 /// workaround, or an operator keeps reading it as a guarantee that no daemon
