@@ -18,6 +18,7 @@ fn disk_cap() -> CapView {
         configured: 6,
         disk: Some(2),
         ram: Some(30),
+        seat_floor: None,
     }
 }
 
@@ -61,6 +62,7 @@ fn cap_view_names_the_binding_term() {
         configured: 6,
         disk: Some(9),
         ram: Some(3),
+        seat_floor: None,
     };
     assert_eq!(ram.limiter(), CapLimiter::Ram);
     let configured = CapView::from_terms(4, usize::MAX, 10);
@@ -68,6 +70,25 @@ fn cap_view_names_the_binding_term() {
     assert_eq!(configured.limiter(), CapLimiter::Configured);
     assert!(!configured.resource_limited());
     assert_eq!(configured.effective(), 4);
+    // #11284: the seat floor raises the configured term only. When it alone
+    // lifted the cap it is the binding term — a paid seat all taken, neither
+    // a shortage nor an operator setting — and it never reads as a resource
+    // limit, so no fleet capacity alert fires for it.
+    let seated = CapView::from_terms_with_seat_floor(2, 6, usize::MAX, 30);
+    assert_eq!(seated.effective(), 6);
+    assert_eq!(seated.limiter(), CapLimiter::SeatFloor);
+    assert!(!seated.resource_limited());
+    let floor_below_configured = CapView::from_terms_with_seat_floor(6, 2, usize::MAX, 30);
+    assert_eq!(floor_below_configured.effective(), 6);
+    assert_eq!(
+        floor_below_configured.limiter(),
+        CapLimiter::Configured,
+        "a floor under the configured cap never binds"
+    );
+    let disk_still_binds = CapView::from_terms_with_seat_floor(2, 6, 4, 30);
+    assert_eq!(disk_still_binds.effective(), 4);
+    assert_eq!(disk_still_binds.limiter(), CapLimiter::Disk);
+    assert!(disk_still_binds.resource_limited());
 }
 
 #[test]

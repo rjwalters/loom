@@ -33,6 +33,7 @@ pub(crate) fn sample_report() -> DaemonStatusReport {
         preflight_advisory_changed_at: None,
         configured_max: 5,
         dynamic_cap: 3,
+        zai_seats: None,
         main_health_gate_halted: false,
         main_health_gate_not_evaluated: false,
         main_health_gate_not_evaluated_reason: None,

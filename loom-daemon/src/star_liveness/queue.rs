@@ -103,6 +103,10 @@ pub fn advice(w: &CapacityWait) -> String {
         ("capacity", Some(crate::types::CapLimiter::Ram)) => {
             format!("Available RAM is the limit{below}: free memory or add capacity, {rerank}.")
         }
+        ("capacity", Some(crate::types::CapLimiter::SeatFloor)) => format!(
+            "Every free Z.ai seat is already taken (the cap was raised to them, #11284): the \
+             next seat frees as a launch ends, or add zai pool capacity, {rerank}."
+        ),
         ("capacity", _) => format!(
             "Every slot is taken by older work: raise `maxConcurrent`, add a host, {rerank}."
         ),

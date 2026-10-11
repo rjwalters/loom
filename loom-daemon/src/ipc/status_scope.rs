@@ -64,6 +64,9 @@ pub(super) struct MachineCaps {
     pub disk_headroom: usize,
     pub ram_headroom: usize,
     pub configured_max: usize,
+    /// The Z.ai free-seat floor observed for this build (#11284) — feeds
+    /// `dynamic_cap` and the report's `zai_seats`.
+    pub seat_floor: crate::work_finder::seat_floor::SeatFloor,
     pub logical_cpus: usize,
     pub loadavg_1m: Option<f64>,
     pub cpu_idle_fraction: Option<f64>,
@@ -147,10 +150,14 @@ pub(super) fn machine_caps(
         caps.ram_headroom = crate::ram_headroom::ram_headroom_limit();
         // `needs_host_headroom` implies `needs_work_finder_config`, so
         // `configured_max` is resolved here.
+        // Z.ai free seats (#11284) raise the configured term — the same
+        // raise the work finder's tick applies, so the report's `dynamic_cap`
+        // and the loop's admission cap can never disagree.
+        caps.seat_floor = crate::work_finder::seat_floor::SeatFloor::observe(workspace_root);
         caps.dynamic_cap = crate::work_finder::resolve_dynamic_max_concurrent(
             caps.disk_headroom,
             caps.ram_headroom,
-            caps.configured_max,
+            caps.seat_floor.raise(caps.configured_max),
         );
         // "Currently binding" vs "smallest ceiling" (#4031): the dynamic cap is
         // the minimum of several ceilings, but a ceiling only *binds* once

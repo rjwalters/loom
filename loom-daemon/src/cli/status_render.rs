@@ -22,6 +22,7 @@ mod operator_priority_line;
 mod otlp_export_line;
 mod peer_claims_line;
 mod pending_restart_line;
+mod seat_line;
 mod session_containers_line;
 mod task_liveness_line;
 mod telemetry_banner;
@@ -375,6 +376,10 @@ pub(crate) fn build_status_json_value_for(
             "loadavg_1m": report.loadavg_1m,
             "cpu_idle_fraction": report.cpu_idle_fraction,
             "configured_max": report.configured_max,
+            // Z.ai free seats (#11284): the floor that may be raising the
+            // configured term inside `effective`. `null` only from a
+            // pre-#11284 daemon binary; counts only, never account names.
+            "zai_seats": report.zai_seats,
             "effective": rc.effective_cap,
         },
         "capacity": {
@@ -1895,10 +1900,21 @@ pub(crate) fn print_status_human(
     // secondary line only when it disagrees.
     let dispatch_cap = report.dynamic_cap;
     println!("\nDynamic concurrency cap: {dispatch_cap}  (the number dispatch uses)");
-    println!(
-        "  = min(disk headroom {}, ram headroom {}, configured max {})",
-        report.disk_headroom, report.ram_headroom, report.configured_max
-    );
+    let seats = seat_line::render(report);
+    if seats.is_some() {
+        println!(
+            "  = min(disk headroom {}, ram headroom {}, max(configured max {}, zai free seats))",
+            report.disk_headroom, report.ram_headroom, report.configured_max
+        );
+    } else {
+        println!(
+            "  = min(disk headroom {}, ram headroom {}, configured max {})",
+            report.disk_headroom, report.ram_headroom, report.configured_max
+        );
+    }
+    if let Some(line) = seats {
+        println!("{line}");
+    }
     // Host CPU OBSERVATION (#3978 AC4; measured-idle signal #4031) — since
     // #4512 this is deliberately NOT a cap term: it is the evidence an operator
     // uses to decide whether this machine's `maxConcurrent` should go up (host

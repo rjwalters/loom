@@ -15,6 +15,9 @@ pub struct TickLine<'a> {
     pub disk: usize,
     pub ram: usize,
     pub configured_max: usize,
+    /// Free Z.ai seats (#11284) — the figure that may be raising
+    /// `configured_max` into this line's `ceiling=`.
+    pub seat_floor: usize,
     pub max_admissions_per_tick: usize,
     pub workspaces: usize,
     /// [`crate::disk_admission::note`]: the disk budget's figures.
@@ -49,7 +52,8 @@ pub fn render(report: &TickReport, t: &TickLine<'_>) -> String {
     format!(
         "work_finder: tick — cap {} (pool={}, healthy={} [fallback_root probe only], \
          min_workspace_healthy={} [minimum across every registered workspace's own resolved \
-         pool, #7527], disk={} [{}], ram={}, ceiling={}, ramp_cap={}); {} workspace(s), \
+         pool, #7527], disk={} [{}], ram={}, ceiling=max({}, zai_free_seats={}) [#11284], \
+         ramp_cap={}); {} workspace(s), \
          {} seen, {} dispatched, {} labeled-skip, {} in-flight-skip, \
          {} quarantine-skip, {} workspace-commands-missing-skip, \
          {} backoff-skip, {} pr-open-backoff, {} noop-cooldown-skip, \
@@ -70,6 +74,7 @@ pub fn render(report: &TickReport, t: &TickLine<'_>) -> String {
         t.disk_note,
         t.ram,
         t.configured_max,
+        t.seat_floor,
         t.max_admissions_per_tick,
         t.workspaces,
         report.seen,
@@ -124,6 +129,7 @@ mod tests {
             disk: 2,
             ram: 9,
             configured_max: 12,
+            seat_floor: 0,
             max_admissions_per_tick: 2,
             workspaces: 1,
             disk_note: note,

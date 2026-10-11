@@ -691,6 +691,11 @@ pub struct CapTerms {
     pub configured: usize,
     /// `min(disk headroom, ram headroom)`: how many sweeps the host can hold.
     pub headroom: usize,
+    /// The Z.ai free-seat floor (#11284): `0` when none. Raises only the
+    /// `configured` term (see [`Self::effective`]), never the resource
+    /// gates — and never the overflow slot's `occupancy <= configured`
+    /// bound, which stays keyed on the operator's own ceiling.
+    pub seat_floor: usize,
 }
 
 impl CapTerms {
@@ -700,6 +705,22 @@ impl CapTerms {
         Self {
             configured,
             headroom: disk_headroom.min(ram_headroom),
+            seat_floor: 0,
+        }
+    }
+
+    /// [`Self::new`] with the seat floor applied (#11284): the effective cap
+    /// becomes `min(max(configured, seat_floor), headroom)`.
+    #[must_use]
+    pub fn with_seat_floor(
+        configured: usize,
+        seat_floor: usize,
+        disk_headroom: usize,
+        ram_headroom: usize,
+    ) -> Self {
+        Self {
+            seat_floor,
+            ..Self::new(configured, disk_headroom, ram_headroom)
         }
     }
 
@@ -716,10 +737,31 @@ impl CapTerms {
         Self::new(configured, disk_headroom, ram_headroom)
     }
 
-    /// The effective cap every non-overflow admission is held to.
+    /// [`Self::with_seat_floor`] for a production tick: records the seated
+    /// terms (Issue #10214) the same way [`Self::observed`] records the bare
+    /// ones.
+    #[must_use]
+    pub fn observed_with_seat_floor(
+        configured: usize,
+        seat_floor: usize,
+        disk_headroom: usize,
+        ram_headroom: usize,
+    ) -> Self {
+        super::tick_summary::record_cap(crate::types::CapView::from_terms_with_seat_floor(
+            configured,
+            seat_floor,
+            disk_headroom,
+            ram_headroom,
+        ));
+        Self::with_seat_floor(configured, seat_floor, disk_headroom, ram_headroom)
+    }
+
+    /// The effective cap every non-overflow admission is held to. The seat
+    /// floor (#11284) raises the configured term only: disk and RAM stay
+    /// safety gates a free seat may not buy past.
     #[must_use]
     pub fn effective(&self) -> usize {
-        self.configured.min(self.headroom)
+        self.configured.max(self.seat_floor).min(self.headroom)
     }
 }
 
@@ -731,6 +773,7 @@ impl From<usize> for CapTerms {
         Self {
             configured,
             headroom: usize::MAX,
+            seat_floor: 0,
         }
     }
 }

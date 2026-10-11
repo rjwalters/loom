@@ -1259,7 +1259,50 @@ It is an operator pin: it wins over `rolePreference`/`preference` and
   (`opencode:zai-flash`), so `sweep-outcomes summary --group-by tap` groups
   it with the same taps chosen by preference.
 
-Seat-aware work-finder concurrency and free-seat status are a later slice.
+### Seat-aware work-finder concurrency and free-seat status (#11284)
+
+Flat-rate Z.ai seats idle when the operator ceiling
+(`autonomous.workFinder.maxConcurrent`) — sized for the metered pools a host
+also serves — is what binds, not the seats and not disk/RAM. The work finder
+therefore re-derives the ceiling every tick as:
+
+```text
+dynamic cap = min(disk headroom, ram headroom, max(configured_max, free zai seats))
+```
+
+- **What a free seat is.** For every **selectable** Z.ai-pool account
+  (provider namespace `zai`, `zai-coding-plan`, `zhipuai`,
+  `zhipuai-coding-plan`) that *declares* a concurrency cap
+  (`loom-daemon api-keys limit zai <name> --max-concurrent N`), a seat is
+  `N − live in-flight leases` — the same reservation store
+  (`api_keys_pool::inflight`) the spawn-time selection ladder enforces, so
+  admission and selection cannot disagree about what is free. Disabled,
+  malformed, bad-marked and unverifiable accounts are excluded; an account
+  at its cap contributes zero; an account with **no declared cap contributes
+  zero** (unbounded is not a number the floor may invent — declare
+  `--max-concurrent` to make an account count).
+- **Seats raise only the ceiling term.** Disk and RAM stay safety gates
+  (#5270): a free seat never buys a sweep the host cannot hold. Drain, the
+  host-distress breaker, the saturation brake, the per-repo cap
+  (`maxConcurrentPerRepo`) and every pre-dispatch hold are untouched, and the
+  #9244 overflow slot stays bounded by the operator's **raw** ceiling — a
+  star cannot overflow past seats.
+- **Races degrade, never over-commit.** A seat taken between the tick's
+  count and the phase's launch makes the GLM tap unavailable at selection,
+  and the preference walk falls through to the next tap (claude) exactly as
+  for any exhausted pool. The floor is also self-correcting across ticks:
+  launched sweeps hold leases, so free seats — and the floor — drop.
+- **Status.** `loom-daemon status` prints the observation under the dynamic
+  cap (`zai seats: 2 free of 6 across 2 selectable account(s), 4 held by
+  running launches`), names `max(configured max, zai free seats)` in the cap
+  formula, and `--json` carries it as `dynamic_cap.zai_seats` (counts only —
+  account names and credentials never enter the status wire). The per-tick
+  log line shows `zai_free_seats=` in the axis line, and a starred issue
+  waiting on a seated cap reads `at the free-seat cap (#11284)`, not
+  "configured cap full".
+- **Failure direction.** An unreadable pool contributes nothing and is named
+  in the log: a floor that cannot be computed is a floor of zero, i.e. the
+  configured cap, never a guess upward.
 
 ### The `runtimes` config block
 

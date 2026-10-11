@@ -1469,6 +1469,7 @@ pub fn build_daemon_status_for(
         disk_headroom,
         ram_headroom,
         configured_max,
+        seat_floor,
         logical_cpus,
         loadavg_1m,
         cpu_idle_fraction,
@@ -1498,6 +1499,12 @@ pub fn build_daemon_status_for(
         preflight_advisory_changed_at,
         configured_max,
         dynamic_cap,
+        zai_seats: Some(crate::types::ZaiSeats {
+            free: seat_floor.free,
+            accounts: seat_floor.accounts,
+            capacity: seat_floor.capacity,
+            reserved: seat_floor.reserved,
+        }),
         // Top-level halt preserves its pre-#3930 single-workspace meaning: the
         // daemon's own primary workspace. Per-repo halt is in `per_repo`.
         main_health_gate_halted: health_states.is_halted(fallback_root),
@@ -2049,6 +2056,10 @@ fn assess_dispatch_headroom(sr: &mut SweepRegistry, repo_root: &Path) -> Dispatc
 
     let wf_config = crate::work_finder::read_work_finder_config(repo_root);
     let configured_max = crate::work_finder::resolve_max_concurrent_with_config(&wf_config);
+    // Free Z.ai seats raise the ceiling term here too (#11284), so this
+    // advisory's `dynamic_cap` cannot understate the cap the work finder is
+    // actually admitting against.
+    let seat_floor = crate::work_finder::seat_floor::SeatFloor::observe(repo_root);
     let disk_headroom = crate::disk_headroom::disk_headroom_limit(repo_root);
     let ram_headroom = crate::ram_headroom::ram_headroom_limit();
     let token_pool_size = crate::tokens::token_pool_size(repo_root);
@@ -2058,7 +2069,7 @@ fn assess_dispatch_headroom(sr: &mut SweepRegistry, repo_root: &Path) -> Dispatc
     let dynamic_cap = crate::work_finder::resolve_dynamic_max_concurrent(
         disk_headroom,
         ram_headroom,
-        configured_max,
+        seat_floor.raise(configured_max),
     );
 
     DispatchHeadroom {

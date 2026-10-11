@@ -444,6 +444,7 @@ fn overflow_never_passes_disk_or_ram_headroom() {
     let terms = |configured, headroom| CapTerms {
         configured,
         headroom,
+        seat_floor: 0,
     };
     // (terms, occupancy, overflow expected)
     let cases = [
@@ -486,6 +487,60 @@ fn overflow_never_passes_disk_or_ram_headroom() {
     let mut dispatcher = full(0);
     let report = tick(&mut FakeSource::once(vec![starred(1, &[])]), &mut dispatcher, 0, false);
     assert_eq!(report.unwrap().dispatched, 0);
+}
+
+/// #11284: free Z.ai seats raise the configured term of the cap — unstarred
+/// work admits up to the seated cap — but they never license the overflow
+/// slot past the operator's raw ceiling, and they never buy past disk/RAM.
+#[test]
+fn free_seats_raise_admission_but_never_the_safety_gates() {
+    let terms = CapTerms::with_seat_floor(2, 5, usize::MAX, usize::MAX);
+    assert_eq!(terms.effective(), 5);
+    let lane = RedMainLane::default();
+    let mut dispatcher = full(0);
+    let report = tick_with_lanes(
+        &mut FakeSource::once(vec![issue(1), issue(2), issue(3)]),
+        &mut dispatcher,
+        (terms, usize::MAX),
+        false,
+        false,
+        lane,
+    )
+    .unwrap();
+    assert_eq!(report.dispatched, 3, "admits past the raw configured 2");
+
+    // Below the seated cap a star admits normally; at it, no overflow —
+    // `occupancy <= configured` stays keyed on the operator's own ceiling.
+    let mut dispatcher = full(2);
+    let report = tick_with_lanes(
+        &mut FakeSource::once(vec![starred(9, &[])]),
+        &mut dispatcher,
+        (terms, usize::MAX),
+        false,
+        false,
+        lane,
+    )
+    .unwrap();
+    assert_eq!(report.dispatched, 1);
+    let mut dispatcher = full(5);
+    let report = tick_with_lanes(
+        &mut FakeSource::once(vec![starred(9, &[])]),
+        &mut dispatcher,
+        (terms, usize::MAX),
+        false,
+        false,
+        lane,
+    )
+    .unwrap();
+    assert_eq!(report.dispatched, 0);
+    assert_eq!(
+        report.dispatched_overflow, 0,
+        "the seat floor is not an overflow-past-configured license"
+    );
+
+    // A seat cannot buy past disk/RAM headroom (#5270 safety gates).
+    assert_eq!(CapTerms::with_seat_floor(2, 5, 3, usize::MAX).effective(), 3);
+    assert_eq!(CapTerms::with_seat_floor(2, 5, usize::MAX, 4).effective(), 4);
 }
 
 // ---- Operator priority levels (#10307) -----------------------------------

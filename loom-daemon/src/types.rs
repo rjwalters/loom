@@ -1071,6 +1071,29 @@ fn default_sweep_runtime() -> String {
     "unknown".to_string()
 }
 
+/// The Z.ai free-seat observation on a `DaemonStatusReport` (#11284): what
+/// raised — or left alone — the configured term of [`DaemonStatusReport`'s]
+/// `dynamic_cap`. Counts only, no account names, no credentials: the status
+/// wire stays secret-free by construction.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ZaiSeats {
+    /// Selectable free seats: declared per-account concurrency minus live
+    /// in-flight reservations, summed over the selectable capped accounts of
+    /// the daemon's effective Z.ai API-key pool. The value the cap floor
+    /// uses; `0` leaves `configured_max` in force.
+    #[serde(default)]
+    pub free: usize,
+    /// Selectable accounts with a declared concurrency cap that were counted.
+    #[serde(default)]
+    pub accounts: usize,
+    /// Sum of those accounts' declared caps.
+    #[serde(default)]
+    pub capacity: usize,
+    /// Live in-flight reservations held against those caps.
+    #[serde(default)]
+    pub reserved: usize,
+}
+
 // ========================================================================
 // Autonomous Daemon Status Types (Issue #3891 — follow-up to #3813 Phase D)
 // ========================================================================
@@ -1235,12 +1258,23 @@ pub struct DaemonStatusReport {
     /// tunes for a host, empirically, from the observed idle fraction above.
     pub configured_max: usize,
     /// The effective dynamic concurrency cap —
-    /// `min(disk_headroom, ram_headroom, configured_max)`
+    /// `min(disk_headroom, ram_headroom, max(configured_max, zai free seats))`
     /// (`resolve_dynamic_max_concurrent`; the CPU term that sat in this `min`
     /// from #3978 was removed in #4512, and the token axis was removed
-    /// entirely in #5270 — see [`Self::ram_headroom`]). This is the
+    /// entirely in #5270 — see [`Self::ram_headroom`]; the Z.ai free-seat
+    /// floor raising the configured term landed in #11284 — see
+    /// [`Self::zai_seats`]). This is the
     /// total-occupancy ceiling the work finder recomputes every tick.
     pub dynamic_cap: usize,
+    /// The Z.ai free-seat observation behind this status build (#11284):
+    /// free selectable seats over the daemon's effective Z.ai API-key pool,
+    /// which raises `dynamic_cap`'s configured term when seats would
+    /// otherwise sit idle under backlog. `None` only from a pre-#11284
+    /// daemon binary; a host with no Z.ai pool reports `Some` with
+    /// `free == 0`. Carries pool counts only — account *names* and
+    /// credentials never enter the status wire.
+    #[serde(default)]
+    pub zai_seats: Option<ZaiSeats>,
     /// Whether autonomous dispatch is currently halted by the reactive
     /// main-health gate (#3812). `true` means a red `main` has paused new
     /// dispatch (in-flight sweeps keep running); `false` means dispatch is

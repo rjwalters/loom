@@ -221,6 +221,75 @@ fn grouping_by_tap_separates_the_metered_backstop_from_the_subscriptions() {
     assert_eq!(row(&format!("{UNKNOWN_GROUP}@{UNKNOWN_GROUP}")).sweeps, 1);
 }
 
+/// #11284 verification: the `--group-by tap` cut carries the three
+/// routing-evaluation metrics — first-pass Judge approval, Doctor engagement,
+/// merged PRs — per tap, and keeps missing evidence apart from zero on each.
+#[test]
+fn the_tap_cut_carries_first_pass_doctor_and_merged_with_missing_apart_from_zero() {
+    let tapped =
+        |sweep: &str, tap: &str, verdict: Option<&str>, doctored: bool, pr: Option<u32>| {
+            let mut r = record(sweep, "o/r", None, SweepResult::Success, 100);
+            r.config.insert("tap".into(), tap.into());
+            if let Some(verdict) = verdict {
+                r.judge_verdicts = Some(vec![crate::telemetry::JudgeVerdict {
+                    attempt: 1,
+                    verdict: verdict.to_string(),
+                }]);
+            }
+            if doctored {
+                r.phase_durations = vec![PhaseDuration::new("doctor", 120)];
+            }
+            r.pr_number = pr;
+            entry(r, day(10), "h1")
+        };
+    let records = vec![
+        tapped("s1", "opencode:zai-flash@api_keys:zai", Some("pass"), true, Some(7)),
+        tapped("s2", "opencode:zai-flash@api_keys:zai", Some("fail"), false, Some(8)),
+        // Never judged, never doctored, no PR: missing evidence, not zero.
+        tapped("s3", "claude@claude_tokens", None, false, None),
+    ];
+    let report = summarize(
+        &records,
+        &SpawnDeathIndex::default(),
+        opts(GroupBy::Tap),
+        &mut AllMerged,
+        vec!["/ws".into()],
+    );
+    let row = |g: &str| {
+        report
+            .rows
+            .iter()
+            .find(|r| r.group == g)
+            .unwrap_or_else(|| panic!("missing tap row {g}: {:?}", report.rows))
+    };
+    let zai = row("opencode:zai-flash@api_keys:zai");
+    assert_eq!(zai.first_pass_judged, 2);
+    assert!((zai.first_pass_approval_rate.unwrap() - 0.5).abs() < 1e-9);
+    assert!((zai.doctor_phase_rate - 0.5).abs() < 1e-9);
+    assert_eq!(zai.merged_prs, Some(2));
+    let claude = row("claude@claude_tokens");
+    assert_eq!(claude.first_pass_judged, 0);
+    assert_eq!(claude.first_pass_approval_rate, None, "missing, never 0.0");
+    assert_eq!(claude.doctor_phase_rate, 0.0);
+    assert_eq!(claude.merged_prs, Some(0));
+    // A merge join that cannot answer degrades the merged count to
+    // "unavailable" (`None`) rather than a fabricated zero — the same
+    // contract on the tap cut as everywhere else.
+    let report = summarize(
+        &records,
+        &SpawnDeathIndex::default(),
+        opts(GroupBy::Tap),
+        &mut ForgeDown,
+        vec!["/ws".into()],
+    );
+    let zai = report
+        .rows
+        .iter()
+        .find(|r| r.group == "opencode:zai-flash@api_keys:zai")
+        .unwrap();
+    assert_eq!(zai.merged_prs, None, "join down is unknown, not zero");
+}
+
 /// Issue #8634: one logical tap can straddle the profile-stamping boundary
 /// (#8556, landed in #8625) — its pre-stamp records reconstruct a
 /// BARE-RUNTIME key while its post-stamp records carry the profile half — so

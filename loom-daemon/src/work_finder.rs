@@ -2862,6 +2862,9 @@ pub fn spawn_multi_work_finder_task(
         // Healthy-account transition state (#4344) — see the single-workspace
         // loop above for the full rationale.
         let mut was_healthy_tokens: Option<usize> = None;
+        // Free-seat transition state (#11284) — same log-once-per-change
+        // discipline as `was_healthy_tokens` above.
+        let mut was_seat_floor: Option<usize> = None;
         // Eager reclaim trigger state (#7512, #11192) — see the
         // single-workspace loop above.
         let mut eager_trigger = crate::eager_reclaim::EagerTrigger::default();
@@ -2968,8 +2971,33 @@ pub fn spawn_multi_work_finder_task(
             // measured footprint); both come back re-ticked after a pass,
             // before this tick's cap is finalized. See the single-workspace
             // loop above and `EagerTrigger::tick_admission`.
+            // Fill the seats (#11284): free Z.ai seats raise the configured
+            // term of the cap — `min(disk, ram, max(configured_max, seats))`
+            // — so flat-rate seats left idle by a ceiling sized for metered
+            // pools run backlog instead. Observed from `fallback_root`, the
+            // same anchor every other machine-level knob resolves from, and
+            // logged once per change (mirroring `was_healthy_tokens` below).
+            let seat_floor = SeatFloor::observe(&fallback_root);
+            let configured_seated = seat_floor.raise(configured_max);
+            if was_seat_floor != Some(seat_floor.free) {
+                log::info!(
+                    "work_finder: zai free seats {} -> {} (accounts={}, capacity={}, \
+                     reserved={}{}), ceiling term configured_max={configured_max} -> \
+                     {configured_seated} — disk/ram and every dispatch hold still bind (#11284)",
+                    was_seat_floor.map_or(0, |s| s),
+                    seat_floor.free,
+                    seat_floor.accounts,
+                    seat_floor.capacity,
+                    seat_floor.reserved,
+                    seat_floor
+                        .note
+                        .as_ref()
+                        .map_or_else(String::new, |n| format!("; {n}"))
+                );
+                was_seat_floor = Some(seat_floor.free);
+            }
             let (disk, disk_budget) = eager_trigger
-                .tick_admission(&roots, &fallback_root, ram, configured_max)
+                .tick_admission(&roots, &fallback_root, ram, configured_seated)
                 .await;
             // Refresh the memoized CPU idle sample — **observational only**
             // since #4512 (see the single-workspace loop above). It feeds the
@@ -2978,7 +3006,7 @@ pub fn spawn_multi_work_finder_task(
             // `maxConcurrent`; it no longer gates admission.
             let _ = tokio::task::spawn_blocking(crate::cpu_headroom::refresh_cpu_util_cache).await;
             let idle = crate::cpu_headroom::cached_cpu_idle_fraction();
-            let max_concurrent = resolve_dynamic_max_concurrent(disk, ram, configured_max);
+            let max_concurrent = resolve_dynamic_max_concurrent(disk, ram, configured_seated);
 
             // `roots` was already resolved (registry reload + missing-root
             // filtering) by `refresh_local_workspace_state` above, before the
@@ -3217,7 +3245,8 @@ pub fn spawn_multi_work_finder_task(
             let axis_line = format!(
                 "work_finder: dynamic cap = {max_concurrent} (pool={pool_size}, \
                  healthy_tokens={token_limit} [informational only, not capacity-limiting \
-                 since #5270], disk={disk}, ram={ram}, configured_max={configured_max}, \
+                 since #5270], disk={disk}, ram={ram}, \
+                 max(configured_max={configured_max}, zai_free_seats={}) [#11284], \
                  max_admissions_per_tick={max_admissions_per_tick}, any_halted={any_halted}, \
                  per_repo_cap={max_concurrent_per_repo:?} (#9090), \
                  preflight_held={preflight_held_count}, \
@@ -3225,6 +3254,7 @@ pub fn spawn_multi_work_finder_task(
                  build_backoff_held={build_backoff_held} (#9410), \
                  observed_idle={}, workspaces={}, priorities={priorities:?}, \
                  shard_slice={in_slice_count}/{} preferred (#6243/#6374))",
+                seat_floor.free,
                 format_idle(idle),
                 pairs.len(),
                 preferred_slice.len()
@@ -3240,7 +3270,7 @@ pub fn spawn_multi_work_finder_task(
             let report = tick_multi_with_build_backoff(
                 &mut pairs,
                 &priorities,
-                CapTerms::observed(configured_max, disk, ram),
+                CapTerms::observed_with_seat_floor(configured_max, seat_floor.free, disk, ram),
                 &halted,
                 Some(&halt_causes),
                 max_admissions_per_tick,
@@ -3275,6 +3305,7 @@ pub fn spawn_multi_work_finder_task(
                 disk,
                 ram,
                 configured_max,
+                seat_floor: seat_floor.free,
                 max_admissions_per_tick,
                 workspaces: pairs.len(),
                 disk_note: &disk_note,
@@ -3492,6 +3523,9 @@ pub use configured_max::{ConfiguredMax, ConfiguredMaxReloader};
 /// file for the same file-size-ratchet reason as [`registry_refresh`].
 pub mod repo_cap;
 pub use repo_cap::{tick_multi_with_sharding, RepoCap};
+
+pub mod seat_floor;
+pub use seat_floor::SeatFloor;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]

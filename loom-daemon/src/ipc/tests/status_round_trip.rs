@@ -38,6 +38,7 @@ fn test_daemon_status_request_response_round_trip() {
         preflight_advisory_changed_at: None,
         configured_max: 5,
         dynamic_cap: 3,
+        zai_seats: None,
         main_health_gate_halted: true,
         main_health_gate_not_evaluated: false,
         main_health_gate_not_evaluated_reason: None,

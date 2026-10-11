@@ -204,6 +204,10 @@ pub enum CapLimiter {
     Disk,
     /// Available-RAM headroom.
     Ram,
+    /// The Z.ai free-seat floor (#11284): free seats raised the configured
+    /// term and every seat is now taken — the cap is doing exactly what the
+    /// seats pay for, neither a shortage nor an operator setting.
+    SeatFloor,
     /// A limiter this client does not know (forward compatibility).
     #[serde(other)]
     Unknown,
@@ -217,14 +221,17 @@ impl CapLimiter {
             Self::Configured => "configured",
             Self::Disk => "disk",
             Self::Ram => "ram",
+            Self::SeatFloor => "seat-floor",
             Self::Unknown => "unknown",
         }
     }
 }
 
 /// The terms of one tick's concurrency cap (Issue #10214): `min(configured,
-/// disk headroom, ram headroom)`. A headroom term is `None` when it was
-/// unmeasurable (the work finder then skips that clamp).
+/// disk headroom, ram headroom)`, with the Z.ai free-seat floor (#11284)
+/// raising the configured term to `max(configured, seat_floor)` first. A
+/// headroom term is `None` when it was unmeasurable (the work finder then
+/// skips that clamp).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapView {
     /// The configured `maxConcurrent`.
@@ -236,6 +243,10 @@ pub struct CapView {
     /// RAM headroom: how many sweeps available memory can hold.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ram: Option<usize>,
+    /// Free Z.ai seats observed this tick (#11284); `None` when the tick
+    /// carried no seat observation (a floor of zero is `Some(0)`, not this).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seat_floor: Option<usize>,
 }
 
 impl CapView {
@@ -248,27 +259,52 @@ impl CapView {
             configured,
             disk: known(disk),
             ram: known(ram),
+            seat_floor: None,
+        }
+    }
+
+    /// [`Self::from_terms`] with the seat floor applied (#11284).
+    #[must_use]
+    pub fn from_terms_with_seat_floor(
+        configured: usize,
+        seat_floor: usize,
+        disk: usize,
+        ram: usize,
+    ) -> Self {
+        Self {
+            seat_floor: Some(seat_floor),
+            ..Self::from_terms(configured, disk, ram)
         }
     }
 
     /// The effective cap.
     #[must_use]
     pub fn effective(&self) -> usize {
-        self.configured
+        self.seated()
             .min(self.disk.unwrap_or(usize::MAX))
             .min(self.ram.unwrap_or(usize::MAX))
     }
 
+    /// The configured term after the seat floor raised it (#11284).
+    #[must_use]
+    pub fn seated(&self) -> usize {
+        self.configured.max(self.seat_floor.unwrap_or(0))
+    }
+
     /// The term that binds. A headroom term binds only when it is strictly
-    /// below the configured cap; disk wins a disk / RAM tie.
+    /// below the seated cap; disk wins a disk / RAM tie. The seat floor
+    /// binds when it alone lifted the cap (free seats all taken).
     #[must_use]
     pub fn limiter(&self) -> CapLimiter {
         let disk = self.disk.unwrap_or(usize::MAX);
         let ram = self.ram.unwrap_or(usize::MAX);
-        if disk < self.configured && disk <= ram {
+        let seated = self.seated();
+        if disk < seated && disk <= ram {
             CapLimiter::Disk
-        } else if ram < self.configured {
+        } else if ram < seated {
             CapLimiter::Ram
+        } else if self.seat_floor.is_some_and(|floor| floor > self.configured) {
+            CapLimiter::SeatFloor
         } else {
             CapLimiter::Configured
         }
@@ -324,6 +360,7 @@ impl CapacityWait {
             ("capacity", Some(CapLimiter::Disk)) => "disk-limited",
             ("capacity", Some(CapLimiter::Ram)) => "ram-limited",
             ("capacity", Some(CapLimiter::Configured)) => "at the configured cap",
+            ("capacity", Some(CapLimiter::SeatFloor)) => "at the free-seat cap (#11284)",
             ("capacity", _) => "concurrency cap full",
             ("ramp", _) => "per-tick admission ramp",
             ("saturation", _) => "host saturated",
