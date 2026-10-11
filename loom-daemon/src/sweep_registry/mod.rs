@@ -118,6 +118,7 @@ mod decline_cooldown;
 mod dispatch;
 mod guards;
 mod heartbeat_broadcast;
+mod journal_shadow;
 mod lease_episode;
 mod locks;
 mod model;

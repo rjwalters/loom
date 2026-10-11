@@ -7,12 +7,19 @@
 //! anomalies found (corruption, gap/regression, unknown major, unreadable
 //! stream/segment/cursor), `2` nothing could be verified (missing,
 //! unreadable or empty root). There is no false green.
+//!
+//! `journal verify --concern execution` (#11346) instead rebuilds the J1
+//! execution projections and diffs them against the legacy stores they
+//! shadow, read-only: `0` no unexplained divergence, `1` unexplained
+//! divergence, `2` no readable execution journal. Its root defaults to the
+//! machine-level journal root (`LOOM_JOURNAL_DIR`, else `~/.loom/journal`).
 
 use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Args, Subcommand};
 
+use loom_daemon::journal::execution::{self, ConcernReport};
 use loom_daemon::journal::{verify, VerifyOptions, VerifyReport};
 
 /// `loom-daemon journal` arguments.
@@ -27,10 +34,15 @@ enum JournalCommand {
     /// Structurally verify a journal root: corrupt lines, `seq` gaps and
     /// regressions, unknown envelope majors, unreadable streams. Read-only.
     Verify {
-        /// The journal root. No production root exists yet, so it must be
-        /// given explicitly (or via `LOOM_JOURNAL_ROOT`).
+        /// The journal root (or `LOOM_JOURNAL_ROOT`). Required for a
+        /// structural check; with `--concern execution` it defaults to the
+        /// machine-level root (`LOOM_JOURNAL_DIR`, else `~/.loom/journal`).
         #[arg(long, value_name = "PATH", env = "LOOM_JOURNAL_ROOT")]
-        root: PathBuf,
+        root: Option<PathBuf>,
+        /// Concern verification: rebuild this concern's projections and diff
+        /// them against its legacy stores (read-only). Only `execution`.
+        #[arg(long, value_name = "CONCERN", value_parser = ["execution"])]
+        concern: Option<String>,
         /// Verify only this stream (repeatable). Default: every stream.
         #[arg(long = "stream", value_name = "NAME")]
         streams: Vec<String>,
@@ -44,9 +56,32 @@ pub(crate) fn dispatch(args: JournalArgs) -> Result<()> {
     let code = match args.command {
         JournalCommand::Verify {
             root,
+            concern: Some(_),
+            json,
+            ..
+        } => {
+            let get = |k: &str| std::env::var(k).ok();
+            let root = root.or_else(|| execution::default_root(&get, dirs::home_dir().as_deref()));
+            match root {
+                Some(root) => run_concern(&execution::verify_concern(&root), json)?,
+                None => {
+                    eprintln!("journal verify: no journal root (set --root or LOOM_JOURNAL_DIR)");
+                    2
+                }
+            }
+        }
+        JournalCommand::Verify {
+            root,
             streams,
             json,
-        } => run_verify(&verify(&root, &VerifyOptions { streams }), json)?,
+            concern: None,
+        } => match root {
+            Some(root) => run_verify(&verify(&root, &VerifyOptions { streams }), json)?,
+            None => {
+                eprintln!("journal verify: --root (or LOOM_JOURNAL_ROOT) is required");
+                2
+            }
+        },
     };
     if code != 0 {
         std::process::exit(code);
@@ -95,4 +130,55 @@ fn print_human(report: &VerifyReport) {
         }
     }
     println!("{}", if report.ok { "OK" } else { "NOT OK" });
+}
+
+fn run_concern(report: &ConcernReport, json: bool) -> Result<i32> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+    } else {
+        println!("journal {} (concern {})", report.root.display(), report.concern);
+        for error in &report.errors {
+            println!("  error: {error}");
+        }
+        println!(
+            "  {} records, corrupt {}, unknown-major {}{}, recorded divergences {}",
+            report.records,
+            report.corrupt_lines,
+            report.unknown_major,
+            if report.torn_tail { ", torn tail" } else { "" },
+            report.recorded_divergences
+        );
+        for s in &report.stores {
+            let explained: Vec<String> = s
+                .explained
+                .iter()
+                .map(|(k, n)| format!("{k} {n}"))
+                .collect();
+            println!(
+                "  {:4} {} {}: compared {}, matched {}, unexplained {}{}",
+                if s.unexplained == 0 { "ok" } else { "FAIL" },
+                s.store,
+                s.path,
+                s.compared,
+                s.matched,
+                s.unexplained,
+                if explained.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (explained: {})", explained.join(", "))
+                }
+            );
+        }
+        for d in &report.unexplained {
+            println!("  divergence {} {} [{}]: {}", d.store, d.path, d.item, d.fields.join(","));
+        }
+        println!("{}", if report.ok { "OK" } else { "NOT OK" });
+    }
+    Ok(if report.ok {
+        0
+    } else if report.errors.is_empty() {
+        1
+    } else {
+        2
+    })
 }
