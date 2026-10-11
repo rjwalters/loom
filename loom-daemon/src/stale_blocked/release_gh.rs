@@ -182,11 +182,13 @@ pub fn maybe_run(gh_bin: &Path, root: &Path) -> Option<Report> {
     if let Some(f) = report.failed.first() {
         let (n, slug) = (report.failed.len(), root.display().to_string());
         // #11437: a persistent refusal repeats every pass; warn once per
-        // workspace per hour and count the repeats that were swallowed.
-        if let Some(suppressed) = failure_warn_due(&slug, Instant::now()) {
+        // (workspace, reason) per hour and count the repeats swallowed. A
+        // new reason is a new key, so it warns at once (as `write_scope::gate`
+        // does) instead of hiding behind the previous reason's window.
+        if let Some(suppressed) = failure_warn_due(&slug, &f.why, Instant::now()) {
             log::warn!(
                 "stale_blocked_release: {slug} — {n} write(s) failed; #{}: {} \
-                 ({suppressed} identical warning(s) suppressed in the last hour)",
+                 ({suppressed} identical warning(s) suppressed since the last one)",
                 f.number,
                 f.why
             );
@@ -221,30 +223,40 @@ pub fn run_for_root(root: &Path, repo: Option<&str>, cfg: &Config) -> Report {
     report
 }
 
-/// Minimum seconds between two write-failure warnings for one workspace.
+/// Minimum seconds between two write-failure warnings for one workspace and
+/// one failure reason.
 pub const FAILURE_WARN_SECS: u64 = 3600;
 
-/// Per workspace: when it last warned, and repeats suppressed since.
-static FAILURE_WARNED: LazyLock<Mutex<HashMap<String, (Instant, u64)>>> =
+/// Per (workspace, failure reason): when it last warned, and identical
+/// repeats suppressed since.
+type FailureWarnings = HashMap<(String, String), (Instant, u64)>;
+
+static FAILURE_WARNED: LazyLock<Mutex<FailureWarnings>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// `Some(suppressed_since_last_warning)` when `slug` may warn at `now`
-/// (recording it); `None` (counting the suppression) otherwise.
-fn failure_warn_due(slug: &str, now: Instant) -> Option<u64> {
+/// `Some(suppressed_since_last_warning)` when `slug` may warn about `why` at
+/// `now` (recording it); `None` (counting the suppression) when the same
+/// workspace warned the same reason within [`FAILURE_WARN_SECS`]. A reason not
+/// warned within the window warns immediately, so the count only ever covers
+/// repeats of the reason it is printed with.
+fn failure_warn_due(slug: &str, why: &str, now: Instant) -> Option<u64> {
+    let window = Duration::from_secs(FAILURE_WARN_SECS);
     let mut map = FAILURE_WARNED
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match map.get_mut(slug) {
-        Some((prev, count)) if now.duration_since(*prev).as_secs() < FAILURE_WARN_SECS => {
+    let key = (slug.to_string(), why.to_string());
+    if let Some((prev, count)) = map.get_mut(&key) {
+        if now.saturating_duration_since(*prev) < window {
             *count += 1;
-            None
-        }
-        entry => {
-            let suppressed = entry.map_or(0, |(_, c)| *c);
-            map.insert(slug.to_string(), (now, 0));
-            Some(suppressed)
+            return None;
         }
     }
+    let suppressed = map.remove(&key).map_or(0, |(_, c)| c);
+    // Bound the map: drop keys whose window lapsed with nothing suppressed.
+    // A key holding an unreported count stays until its reason recurs.
+    map.retain(|_, (prev, c)| *c > 0 || now.saturating_duration_since(*prev) < window);
+    map.insert(key, (now, 0));
+    Some(suppressed)
 }
 
 /// Minimum seconds between two zero-row cross-checks of one repo.

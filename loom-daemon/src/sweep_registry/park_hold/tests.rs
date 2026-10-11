@@ -243,7 +243,8 @@ struct Script<'a> {
 }
 
 /// A registry with forge writes enabled, driven by a fake `gh` that logs every
-/// argv to `gh.log` and every `PATCH` payload to `payloads.log`.
+/// argv to `gh.log`, every `PATCH` payload to `payloads.log`, and each call's
+/// `GH_CONFIG_DIR` with its argv (`<dir>|<argv>`) to `gh-creds.log`.
 fn registry(ws: &Path, s: &Script) -> (SweepRegistry, PathBuf, PathBuf) {
     let log = ws.join("gh.log");
     let payloads = ws.join("payloads.log");
@@ -251,6 +252,7 @@ fn registry(ws: &Path, s: &Script) -> (SweepRegistry, PathBuf, PathBuf) {
     let script = format!(
         "#!/usr/bin/env bash\n\
          printf '%s\\n' \"$*\" >> \"{log}\"\n\
+         printf '%s|%s\\n' \"${{GH_CONFIG_DIR:-}}\" \"$*\" >> \"{creds}\"\n\
          if [[ \"$1\" == \"api\" && \"$2\" == \"-X\" && \"$3\" == \"PATCH\" ]]; then\n\
          cat \"$6\" >> \"{payloads}\"; printf '\\n' >> \"{payloads}\"\n\
          if [[ {patch} -ne 0 ]]; then printf 'HTTP 403: body write refused\\n' >&2; fi\n\
@@ -273,6 +275,7 @@ fn registry(ws: &Path, s: &Script) -> (SweepRegistry, PathBuf, PathBuf) {
          fi\n\
          exit 0\n",
         log = log.display(),
+        creds = ws.join("gh-creds.log").display(),
         payloads = payloads.display(),
         patch = s.patch_exit,
         sleep = s.view_sleep,
@@ -580,6 +583,23 @@ fn the_prless_hold_writes_on_a_cross_owner_root() {
         "no label edit on the cross-owner root: {calls:?}"
     );
     assert_eq!(patched_bodies(&payloads).len(), 1);
+    // Both writes carried the owner's credential, not the process's.
+    let creds = std::fs::read_to_string(root.join("gh-creds.log")).unwrap_or_default();
+    let owner = owner_dir.display().to_string();
+    for write in [
+        "api -X PATCH repos/",
+        "issue edit 121 --add-label loom:blocked",
+    ] {
+        let lines: Vec<&str> = creds.lines().filter(|l| l.contains(write)).collect();
+        assert!(!lines.is_empty(), "no `{write}` call logged: {creds}");
+        for line in lines {
+            assert_eq!(
+                line.split('|').next(),
+                Some(owner.as_str()),
+                "`{write}` not under the owner's GH_CONFIG_DIR: {line}"
+            );
+        }
+    }
     drop(fixture);
     clear_owner_root_registry();
 }
