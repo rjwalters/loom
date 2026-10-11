@@ -704,6 +704,10 @@ static STATE: Mutex<PassState> = Mutex::new(PassState {
         unread: BTreeMap::new(),
         settled: BTreeSet::new(),
         pending_ready: BTreeMap::new(),
+        curated: BTreeMap::new(),
+        curated_now: None,
+        pre_ready_done: BTreeSet::new(),
+        pre_ready_retry: BTreeSet::new(),
         view: None,
         at: None,
     },
@@ -714,6 +718,7 @@ static STATE: Mutex<PassState> = Mutex::new(PassState {
 async fn record_outcomes(
     sink: &FleetStateSink,
     input: &FleetInput,
+    curated: outcomes::Curated,
     view: &FleetView,
     now: DateTime<Utc>,
     workspace_pool: &crate::workspace_pool::WorkspacePool,
@@ -724,6 +729,7 @@ async fn record_outcomes(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .outcomes
         .clone();
+    memory.curated_now = Some(curated);
     let roots = sources::managed_roots(workspace_pool, slug_cache)
         .await
         .into_iter()
@@ -806,14 +812,14 @@ pub(super) async fn record(
     };
     let _pass = pass_lock().lock().await;
     let now = Utc::now();
-    let (input, mut reused) =
+    let (input, mut reused, curated) =
         sources::gather(workspace_root, workspace_pool, slug_cache, &sink.host_id, now).await;
     let state = STATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
     let view = build_view(&input, state.prev.as_ref(), now);
-    record_outcomes(sink, &input, &view, now, workspace_pool, slug_cache).await;
+    record_outcomes(sink, &input, curated, &view, now, workspace_pool, slug_cache).await;
     for repo in view.repos.keys().chain(&input.managed) {
         if !reused.visibility.contains_key(repo) {
             let visibility = super::collector::resolve_visibility(repo).await;

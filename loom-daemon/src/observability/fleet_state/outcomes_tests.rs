@@ -42,6 +42,8 @@ struct Forge {
     pull_failures: usize,
     /// Every history read fails.
     history_fails: bool,
+    /// History reads that fail before one is answered.
+    history_fail_reads: usize,
     /// The pass being run: a history shows only the events up to it.
     clock: Option<DateTime<Utc>>,
 }
@@ -80,6 +82,10 @@ impl ForgeReads for Forge {
         self.reads += 1;
         *self.history_reads.entry(number).or_default() += 1;
         if self.history_fails {
+            return None;
+        }
+        if self.history_fail_reads > 0 {
+            self.history_fail_reads -= 1;
             return None;
         }
         let clock = self.clock;
@@ -135,6 +141,17 @@ fn input(prs: &[(u32, &str, u32)], held: Vec<HeldSweep>) -> FleetInput {
 /// The records of passes over `inputs`, the first at `t0()` and each next
 /// `step` later.
 fn run(inputs: &[FleetInput], step: Duration, forge: &mut Forge) -> Vec<Vec<TelemetryRecord>> {
+    run_curated(inputs, &[], step, forge)
+}
+
+/// [`run`], with pass `i` also reading `curated[i]` (a missing entry is a
+/// pass whose curated listing was incomplete for every repo).
+fn run_curated(
+    inputs: &[FleetInput],
+    curated: &[Curated],
+    step: Duration,
+    forge: &mut Forge,
+) -> Vec<Vec<TelemetryRecord>> {
     let mut memory = Memory::default();
     let mut prev_view = None;
     let mut out = Vec::new();
@@ -149,6 +166,7 @@ fn run(inputs: &[FleetInput], step: Duration, forge: &mut Forge) -> Vec<Vec<Tele
             now,
         };
         forge.clock = Some(now);
+        memory.curated_now = Some(curated.get(i).cloned().unwrap_or_default());
         out.push(diff(&mut memory, &pass, forge, &provenance()));
         memory = remember(memory, &pass);
         prev_view = Some(view);
@@ -630,9 +648,9 @@ fn a_ready_row_of_an_unwhole_or_unmanaged_listing_is_not_an_exit() {
     unmanaged.managed.clear();
     for gone in [partial, unmanaged] {
         let out = run(&[ready(&[ISSUE], Vec::new()), gone], Duration::minutes(5), &mut forge);
-        assert!(out.iter().all(Vec::is_empty), "{out:?}");
+        // The first pass's ready row may give pre-ready exits; no ready exit.
+        assert!(out.iter().flatten().all(|r| !matches!(r, TelemetryRecord::StageOutcome(s) if s.stage == FleetStage::ReadyWait)), "{out:?}");
     }
-    assert_eq!(forge.reads, 0);
 }
 
 #[test]
@@ -998,3 +1016,6 @@ fn a_failed_events_page_is_a_failed_read() {
     );
     assert!(LabelHistory::read(|page| (page == 1).then(|| full.clone())).is_none());
 }
+
+#[path = "outcomes_pre_ready_tests.rs"]
+mod pre_ready_tests;
