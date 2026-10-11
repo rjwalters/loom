@@ -174,6 +174,7 @@ pub mod disk_footprint;
 pub mod disk_full_halt;
 pub mod disk_headroom;
 pub mod docker_image_clean;
+pub mod doctor_escalation;
 pub mod eager_reclaim;
 pub mod epic_state;
 pub mod epic_supervisor;

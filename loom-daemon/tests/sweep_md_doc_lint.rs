@@ -100,6 +100,7 @@ const SWEEP_SKILL_FILES: &[&str] = &[
     "sweep-dry-run.md",
     "sweep-mode-c-lifecycle.md",
     "sweep-wave-lifecycle.md",
+    "sweep-doctor-glm-escalation.md",
     "sweep-summary-output.md",
     "sweep-run-hygiene.md",
     "sweep-reference.md",
@@ -343,6 +344,39 @@ fn sweep_md_documents_refusal_fallback() {
 fn sweep_md_documents_rebase_pass_carve_out_and_budget() {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(SWEEP_SKILL_DIR_RELATIVE);
     doc_lint_support::check_rebase_pass_carve_out(&read_sweep_md(), &dir);
+}
+
+/// #11359: both orchestration entry paths (issue-side §6 and Mode C C1b) and the
+/// Execution Model hand off to the one GLM-Doctor escalation doc, which names the
+/// config key, the three checkpoint verbs and the cap-stays-authoritative rule.
+/// Routing behavior itself is tested in `doctor_escalation` / `sweep_checkpoint`.
+#[test]
+fn sweep_md_documents_glm_doctor_escalation_on_both_entry_paths() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(SWEEP_SKILL_DIR_RELATIVE);
+    let read = |n: &str| fs::read_to_string(dir.join(n)).unwrap();
+    for entry in [
+        "sweep-wave-lifecycle.md",
+        "sweep-mode-c-lifecycle.md",
+        "sweep-execution-model.md",
+    ] {
+        assert!(
+            read(entry).contains("sweep-doctor-glm-escalation.md"),
+            "{entry} must hand off to sweep-doctor-glm-escalation.md"
+        );
+    }
+    let doc = read("sweep-doctor-glm-escalation.md");
+    for needle in [
+        "sweep.glmDoctorRejectionsBeforeEscalation",
+        "doctor-attempt",
+        "doctor-rejection",
+        "doctor-route",
+        "--escalate-claude",
+        "route=cap-exhausted",
+        "never changes `sweep.max_doctor_cycles`",
+    ] {
+        assert!(doc.contains(needle), "missing {needle}");
+    }
+    assert!(read("sweep.md").contains("sweep-doctor-glm-escalation.md"));
 }
 
 /// #3702: the hard invariant that Judge model resolution can never resolve to

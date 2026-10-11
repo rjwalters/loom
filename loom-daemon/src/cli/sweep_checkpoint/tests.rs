@@ -197,3 +197,195 @@ fn begin_is_telemetry_only_and_never_touches_the_checkpoint() {
         assert_eq!(invoke(dir.path(), bad).unwrap_err().0, 1, "{bad:?}");
     }
 }
+
+// ---- #11359: GLM Doctor rejection state --------------------------------
+
+fn set_k(root: &Path, body: &str) {
+    std::fs::create_dir_all(root.join(".loom")).unwrap();
+    std::fs::write(root.join(".loom/config.json"), body).unwrap();
+}
+
+fn rejected(root: &Path) {
+    invoke(root, &["write", "42", "judge-rejected", "--pr-number", "43"]).unwrap();
+}
+
+fn doctor(root: &Path, head: &str, runtime: &str, profile: &str) -> String {
+    invoke(
+        root,
+        &[
+            "doctor-attempt",
+            "42",
+            "--pr",
+            "43",
+            "--head",
+            head,
+            "--runtime",
+            runtime,
+            "--profile",
+            profile,
+        ],
+    )
+    .unwrap()
+}
+
+fn reject(root: &Path, head: &str) -> String {
+    invoke(root, &["doctor-rejection", "42", "--pr", "43", "--head", head]).unwrap()
+}
+
+fn route(root: &Path, attempt: &str, cap: &str) -> String {
+    invoke(
+        root,
+        &[
+            "doctor-route",
+            "42",
+            "--pr",
+            "43",
+            "--attempt",
+            attempt,
+            "--cap",
+            cap,
+        ],
+    )
+    .unwrap()
+}
+
+#[test]
+fn default_k_two_escalates_on_the_second_glm_rejection_and_survives_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = dir.path();
+    rejected(r);
+    assert_eq!(route(r, "2", "3"), "route=preference\n");
+    doctor(r, "aaa1", "opencode", "glm-5.3");
+    assert!(reject(r, "aaa1").starts_with("counted count=1 k=2 escalated=false"));
+    // Restart at K-1: replaying the same verdict does not double count.
+    assert!(reject(r, "aaa1").starts_with("replay count=1"));
+    assert_eq!(route(r, "3", "3"), "route=preference\n");
+    // The multi-cycle re-rejection write must retain the state.
+    invoke(
+        r,
+        &[
+            "write",
+            "42",
+            "judge-rejected",
+            "--pr-number",
+            "43",
+            "--attempt",
+            "3",
+        ],
+    )
+    .unwrap();
+    doctor(r, "bbb2", "opencode", "glm-5.3");
+    assert!(reject(r, "bbb2").starts_with("counted count=2 k=2 escalated=true"));
+    // Restart at K: same next tap, no duplicate counting.
+    assert!(reject(r, "bbb2").starts_with("replay count=2"));
+    invoke(
+        r,
+        &[
+            "write",
+            "42",
+            "judge-rejected",
+            "--pr-number",
+            "43",
+            "--attempt",
+            "4",
+        ],
+    )
+    .unwrap();
+    assert!(route(r, "4", "3").starts_with("route=claude reason=2 Judge rejection(s)"));
+    // The cap stays authoritative.
+    assert_eq!(route(r, "4", "2"), "route=cap-exhausted\n");
+}
+
+#[test]
+fn k_one_and_larger_k_come_from_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = dir.path();
+    set_k(r, r#"{"sweep":{"glmDoctorRejectionsBeforeEscalation":1}}"#);
+    rejected(r);
+    doctor(r, "a1", "opencode", "glm-5.3");
+    assert!(reject(r, "a1").contains("escalated=true"));
+    set_k(r, r#"{"sweep":{"glmDoctorRejectionsBeforeEscalation":3}}"#);
+    let d2 = tempfile::tempdir().unwrap();
+    let r = d2.path();
+    set_k(r, r#"{"sweep":{"glmDoctorRejectionsBeforeEscalation":3}}"#);
+    rejected(r);
+    for (i, head) in ["a1", "a2", "a3"].iter().enumerate() {
+        doctor(r, head, "opencode", "glm-5.3");
+        let line = reject(r, head);
+        assert_eq!(line.contains("escalated=true"), i == 2, "{line}");
+    }
+}
+
+#[test]
+fn invalid_k_is_a_config_error_and_does_not_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = dir.path();
+    set_k(r, r#"{"sweep":{"glmDoctorRejectionsBeforeEscalation":0}}"#);
+    rejected(r);
+    doctor(r, "a1", "opencode", "glm-5.3");
+    let err = invoke(r, &["doctor-rejection", "42", "--pr", "43", "--head", "a1"]).unwrap_err();
+    assert_eq!(err.0, 78);
+    assert!(err.1.contains("sweep.glmDoctorRejectionsBeforeEscalation"));
+    let rec: Value = serde_json::from_str(&invoke(r, &["read", "42"]).unwrap()).unwrap();
+    assert_eq!(rec["doctor_escalation"]["rejections"], 0);
+}
+
+#[test]
+fn non_qualifying_failures_never_advance_the_counter() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = dir.path();
+    set_k(r, r#"{"sweep":{"glmDoctorRejectionsBeforeEscalation":1}}"#);
+    rejected(r);
+    // Initial Builder rejection, no Doctor yet.
+    assert!(reject(r, "b0").starts_with("not-counted"));
+    // Mixed: a Claude attempt's rejection, and a stale verdict for a GLM head.
+    doctor(r, "c1", "claude", "");
+    assert!(reject(r, "c1").contains("attempt-not-on-glm"));
+    doctor(r, "d1", "opencode", "glm-5.3");
+    assert!(reject(r, "5ca1e9").contains("stale-or-unrelated-head"));
+    // Launch failure / no seat / conflict-only maintenance record no attempt at all.
+    assert_eq!(route(r, "2", "1"), "route=preference\n");
+}
+
+#[test]
+fn legacy_checkpoint_means_zero_and_fresh_sweep_resets() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = dir.path();
+    set_k(r, r#"{"sweep":{"glmDoctorRejectionsBeforeEscalation":1}}"#);
+    rejected(r); // no doctor_escalation key: legacy
+    assert_eq!(route(r, "2", "1"), "route=preference\n");
+    doctor(r, "a1", "opencode", "glm-5.3");
+    reject(r, "a1");
+    assert!(route(r, "2", "1").starts_with("route=claude"));
+    // A new lineage (Builder completion) resets deliberately.
+    invoke(r, &["write", "42", "builder-done", "--pr-number", "43"]).unwrap();
+    assert_eq!(route(r, "2", "1"), "route=preference\n");
+    // Without a checkpoint the policy is inactive and routes by preference.
+    invoke(r, &["delete", "42"]).unwrap();
+    assert_eq!(route(r, "2", "1"), "route=preference\n");
+    assert!(doctor(r, "a1", "opencode", "glm-5.3").starts_with("inactive"));
+}
+
+#[test]
+fn restart_after_doctor_completion_before_review_keeps_attempt_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = dir.path();
+    rejected(r);
+    doctor(r, "a1", "opencode", "glm-5.3");
+    invoke(
+        r,
+        &[
+            "write",
+            "42",
+            "doctor-done",
+            "--pr-number",
+            "43",
+            "--attempt",
+            "2",
+            "--model",
+            "glm-5.3",
+        ],
+    )
+    .unwrap();
+    assert!(reject(r, "a1").starts_with("counted count=1"));
+}
