@@ -33,6 +33,8 @@ fn record() -> StageOutcomeRecord {
         observed_at: at + chrono::Duration::seconds(120),
         resolution_sec: Some(0),
         forge_transition_at: Some(at),
+        sweep_id: None,
+        fact_id_missing_reason: None,
         loom: provenance(),
     }
 }

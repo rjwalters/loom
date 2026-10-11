@@ -44,6 +44,7 @@ fn held(repo: &str, issue: u32, stage: FleetStage, overflow: bool) -> HeldSweep 
         pr: None,
         overflow,
         start: Default::default(),
+        sweep_id: None,
     }
 }
 
