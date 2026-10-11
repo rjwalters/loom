@@ -457,12 +457,46 @@ fn a_head_that_moves_during_the_write_is_not_a_verified_hand_back() {
 }
 
 #[test]
-fn a_head_move_with_no_changes_label_only_withdraws_the_add() {
+fn a_head_move_with_no_changes_label_keeps_the_queue_label() {
+    // `loom:ci-failure` is informational, not a lifecycle label: with the claim
+    // gone, the queue label is the only thing keeping the PR in a queue.
     let mut f = Fake::new(&[CLAIM, "loom:ci-failure"], PUSHED);
     f.head_after_add = Some(OTHER);
     let out = run(&mut f, PUSHED);
     assert_eq!(out, Outcome::HeadMoved(OTHER.into()));
-    assert_eq!(f.sorted(), names(&["loom:ci-failure"]));
+    assert_eq!(f.sorted(), names(&[QUEUE, "loom:ci-failure"]));
+}
+
+/// A claim-only hand-back (no rejection label) whose head moves: nothing
+/// replaces the queue label, so it must survive the stand-down.
+#[test]
+fn a_claim_only_head_move_keeps_the_queue_label() {
+    let mut f = Fake::new(&[CLAIM], PUSHED);
+    f.head_after_add = Some(OTHER);
+    let out = run(&mut f, PUSHED);
+    assert_eq!(out, Outcome::HeadMoved(OTHER.into()));
+    assert_eq!(f.sorted(), names(&[QUEUE]));
+}
+
+#[test]
+fn a_claim_only_head_move_with_a_stuck_claim_keeps_the_queue_label() {
+    let mut f = Fake::new(&[CLAIM], PUSHED);
+    f.head_after_add = Some(OTHER);
+    f.fail_remove = vec![CLAIM];
+    assert!(matches!(run(&mut f, PUSHED), Outcome::Failed(_)));
+    assert!(f.sorted().contains(&QUEUE.to_string()), "{:?}", f.sorted());
+}
+
+/// The queue label is withdrawn once a newer verdict already holds the PR, even
+/// on a claim-only hand-back.
+#[test]
+fn a_claim_only_head_move_with_a_newer_approval_withdraws_the_queue_label() {
+    let mut f = Fake::new(&[CLAIM], PUSHED);
+    f.head_after_add = Some(OTHER);
+    f.after_add = vec!["loom:pr"];
+    let out = run(&mut f, PUSHED);
+    assert_eq!(out, Outcome::HeadMoved(OTHER.into()));
+    assert_eq!(f.sorted(), names(&["loom:pr"]));
 }
 
 /// The old rejection was removed, then a newer head was pushed and approved:

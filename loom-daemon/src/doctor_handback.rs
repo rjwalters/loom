@@ -283,9 +283,12 @@ fn stand_down_head_moved(
     // A review claim is an overlay on the queue label: without a verdict the
     // claim alone cannot bring the PR back if that review stands down.
     let keep_queue = !newer_verdict && post.has("loom:reviewing");
-    // Add-before-remove: with no replacement label (restore failed), the queue
-    // label is all that is left, so keep it.
-    let withdrawn = keep_queue || (restored && forge.remove(QUEUE));
+    // Add-before-remove: the queue label goes only once a replacement lifecycle
+    // label is on the PR (a newer verdict/claim, or the restored CHANGES). A
+    // claim-only hand-back (`restore_changes == false`) with nothing newer has
+    // none, and the claim is already gone, so the queue label stays.
+    let has_replacement = newer_state || (restore_changes && restored);
+    let withdrawn = keep_queue || !has_replacement || forge.remove(QUEUE);
     if restored && withdrawn {
         Outcome::HeadMoved(post.head_sha.clone())
     } else {
