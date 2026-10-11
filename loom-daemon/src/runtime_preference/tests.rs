@@ -53,8 +53,15 @@ pub(super) struct ClearedRuntimeEnv {
     _profile_root_lock: crate::tokens_pool::profile_root_env::ProfileRootLock,
 }
 
-const ISOLATED_VARS: [&str; 10] = [
+const ISOLATED_VARS: [&str; 14] = [
     "LOOM_RUNTIME",
+    "LOOM_RUNTIME_DOCTOR",
+    // #11400: picks the profile whose `excludedRoles` admission checks.
+    "LOOM_MODEL_PROFILE",
+    // #10767: an exported key makes a pooled native tap ungated, so the
+    // api-key pool would stop being the wall these tests exercise.
+    "ZAI_API_KEY",
+    "ZHIPU_API_KEY",
     "LOOM_RUNTIME_BUILDER",
     "LOOM_RUNTIME_JUDGE",
     "LOOM_RUNTIME_CURATOR",
@@ -418,7 +425,7 @@ pub(super) fn fixture() -> tempfile::TempDir {
     dir
 }
 
-fn write_config(root: &Path, config: &serde_json::Value) {
+pub(super) fn write_config(root: &Path, config: &serde_json::Value) {
     fs::create_dir_all(root.join(".loom")).unwrap();
     fs::write(root.join(".loom/config.json"), config.to_string()).unwrap();
 }
@@ -426,7 +433,7 @@ fn write_config(root: &Path, config: &serde_json::Value) {
 /// Re-provision the Claude token pool with exactly `count` accounts. Zero is
 /// the "no pool at all" state the preflight reports as `NoTokenPool`; the
 /// directory is rebuilt each call so a later call genuinely *empties* it.
-fn provision_claude_pool(root: &Path, count: usize) {
+pub(super) fn provision_claude_pool(root: &Path, count: usize) {
     let dir = root.join(".loom/tokens");
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();

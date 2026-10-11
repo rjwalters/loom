@@ -160,7 +160,7 @@
     "roles": {
       "judge": "codex"
     },
-    "_comment": "preference follows the operator's runtime order: Claude -> Codex -> OpenCode (metered z.ai, backstop only) -> gemini (last). Codex is NOT dropped for Builder/Doctor by a per-role list: defaults/runtimes/codex.json declares worktreeIsolation 'partial' (#4495) and defaults/roles/builder.json / doctor.json require it, so the admission gate skips Codex for those two roles only (logged as codex:not-admitted(worktreeIsolation)) and lifts automatically once the capability is promoted. Judge (requires only loomControl) keeps its own rolePreference with Codex first, for review independence from the Builder's runtime.",
+    "_comment": "preference follows the operator's runtime order: Claude -> Codex -> OpenCode (z.ai GLM, zai-flash) -> gemini (last). Doctor is GLM-first (#11400): rolePreference.doctor puts opencode:zai-flash ahead of claude, so Doctor ticks run on a Z.ai seat while one is selectable in the zai api-keys pool and fall through to Claude when the pool is dry. Judge and Curator never run on GLM: the zai-flash model profile declares excludedRoles [judge, curator], enforced at admission for every source (a preference entry is skipped as opencode:not-admitted(excludedRole), a pin is refused), so rolePreference.judge is codex -> claude only. Codex is NOT dropped for Builder/Doctor by a per-role list: defaults/runtimes/codex.json declares worktreeIsolation 'partial' (#4495) and defaults/roles/builder.json / doctor.json require it, so the admission gate skips Codex for those two roles only (logged as codex:not-admitted(worktreeIsolation)) and lifts automatically once the capability is promoted. Judge (requires only loomControl) keeps Codex first, for review independence from the Builder's runtime.",
     "preference": [
       "claude",
       "codex",
@@ -171,13 +171,16 @@
       "gemini"
     ],
     "rolePreference": {
-      "judge": [
-        "codex",
-        "claude",
+      "doctor": [
         {
           "runtime": "opencode",
           "modelProfile": "zai-flash"
-        }
+        },
+        "claude"
+      ],
+      "judge": [
+        "codex",
+        "claude"
       ]
     }
   },

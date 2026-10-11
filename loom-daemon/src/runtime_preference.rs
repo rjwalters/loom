@@ -72,7 +72,10 @@
 //!   admitted onto is skipped, never forced. `defaults/runtimes/codex.json`
 //!   declares `worktreeIsolation: "partial"` and `builder.json`/`doctor.json`
 //!   require it, so for build work `["claude","codex","opencode"]` is
-//!   effectively `claude -> opencode`.
+//!   effectively `claude -> opencode`. The same holds for a model profile's
+//!   `excludedRoles` (#11400): a `{"runtime":"opencode","modelProfile":
+//!   "zai-flash"}` entry is skipped for Judge/Curator as
+//!   `not-admitted(excludedRole)`.
 //! - **The backstop ceiling bounds spend, it never gates on a human.** A
 //!   governed tap that is at its per-host ceiling (or that this work is not
 //!   eligible for) is skipped with a recorded reason exactly like an
@@ -679,9 +682,19 @@ fn admit_static(
     root: &Path,
     role: &str,
     explicit: Option<&str>,
+    model_profile: Option<&str>,
     preparer: &mut dyn ContainmentPreparer,
 ) -> Result<ResolvedRuntime, RuntimeRejection> {
-    match crate::runtime_admission::resolve_and_admit(root, role, explicit) {
+    // `model_profile` is a preference tap's own profile (#11400), so the
+    // profile's `excludedRoles` is judged against the profile the launch will
+    // pin, not the fallback default.
+    match crate::runtime_admission::resolve_and_admit_profiled(
+        root,
+        role,
+        explicit,
+        model_profile,
+        crate::runtime_admission::AdmissionContext::Host,
+    ) {
         Err(rejection) if rejection.containment_eligible() => {
             preparer.contain(role, explicit, rejection)
         }
@@ -715,7 +728,7 @@ pub fn resolve_runtime_contained(
         // never moves the launch to a different runtime (#8787).
         return Ok(Decision::Static {
             reason: StaticReason::OperatorPin(pin),
-            result: admit_static(root, role, explicit, preparer),
+            result: admit_static(root, role, explicit, None, preparer),
         });
     }
     let config = crate::config_resolver::resolve_effective_config(root);
@@ -729,7 +742,7 @@ pub fn resolve_runtime_contained(
     let Some((source, taps)) = listed else {
         return Ok(Decision::Static {
             reason: StaticReason::NoPreferenceConfigured,
-            result: admit_static(root, role, None, preparer),
+            result: admit_static(root, role, None, None, preparer),
         });
     };
     let backstop_ceiling = ceiling::configured(&config).map_err(|reason| RuntimeRejection {
@@ -751,18 +764,24 @@ pub fn resolve_runtime_contained(
     let resolution = resolve::resolve(
         &taps,
         |tap| {
-            admit_static(root, canonical, Some(&tap.runtime), *preparer.borrow_mut())
-                .map(|mut admitted| {
-                    // The walk chose among candidates; it is not the operator
-                    // pin `Explicit` denotes, even though each candidate was
-                    // offered to admission as an explicit runtime.
-                    admitted.source = RuntimeSource::Preference;
-                    admitted
-                })
-                .map_err(|rejection| SkipReason::NotAdmitted {
-                    unmet: rejection.unmet_capabilities.clone(),
-                    detail: rejection.reason.clone(),
-                })
+            admit_static(
+                root,
+                canonical,
+                Some(&tap.runtime),
+                tap.model_profile.as_deref(),
+                *preparer.borrow_mut(),
+            )
+            .map(|mut admitted| {
+                // The walk chose among candidates; it is not the operator
+                // pin `Explicit` denotes, even though each candidate was
+                // offered to admission as an explicit runtime.
+                admitted.source = RuntimeSource::Preference;
+                admitted
+            })
+            .map_err(|rejection| SkipReason::NotAdmitted {
+                unmet: rejection.unmet_capabilities.clone(),
+                detail: rejection.reason.clone(),
+            })
         },
         |tier, tap, admitted| {
             // A contained candidate that is about to be skipped must give its
@@ -818,6 +837,9 @@ pub fn resolve_runtime_contained(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod containment_tests;
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod excluded_role_tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod gateway_tests;

@@ -404,6 +404,28 @@ fn run_preflight(
                 .map_err(|e| LaunchError::config(e.diagnostic()))?;
         }
         let mut selection = profiles::select(&runtime, &options, &config)?;
+        // #11400: the profile actually selected (an explicit `--profile` may
+        // differ from the one admission judged) must not exclude this role.
+        if let Some(name) = selection.profile.as_deref() {
+            for role in role.as_deref().into_iter().chain(prompt_role) {
+                let Some(canonical) = crate::runtime_admission::canonical_role(role) else {
+                    continue;
+                };
+                // A native sweep runs every phase in this one session.
+                let phases: &[&str] = if canonical == "sweep-lifecycle" {
+                    &["builder", "curator", "judge", "doctor"]
+                } else {
+                    &[canonical]
+                };
+                for &checked in phases {
+                    if profiles::excluded_role(&runtime, Some(name), checked, &config).is_some() {
+                        return Err(LaunchError::config(format!(
+                            "model profile {name:?} excludes role {checked:?} (excludedRoles, #11400)"
+                        )));
+                    }
+                }
+            }
+        }
         trace_identity.insert("loom.provider".into(), selection.provider.clone());
         trace_identity.insert("loom.model".into(), selection.model.clone());
         if let Some(effort) = &selection.effort {
