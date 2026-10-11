@@ -410,6 +410,12 @@ owner = "daemon-sweep"
 removal_issue = 9799
 
 [[bypass]]
+path = "loom-daemon/src/sweep_registry/noop_cooldown/hold.rs"
+calls = 3
+owner = "daemon-sweep"
+removal_issue = 9799
+
+[[bypass]]
 path = "loom-daemon/src/sweep_registry/prless_retry/hold.rs"
 calls = 3
 owner = "daemon-sweep"

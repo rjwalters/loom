@@ -969,9 +969,10 @@ impl SweepRegistry {
         // has aged past the configured window before this tick's work. Cheap
         // early-return when nothing is quarantined.
         self.expire_quarantine();
-        // Retry any previously-failed quarantine label restores (Issue #4110).
-        // Cheap early-return when nothing is pending.
-        self.retry_pending_quarantine_releases();
+        // Retry any previously-failed quarantine label restores (Issue #4110)
+        // and release no-op holds whose inputs changed (Issue #10156). Cheap
+        // early-return when nothing is pending or held.
+        self.release_pending_holds();
         // SIGKILL-escalate any orphaned process group that survived a
         // crash-path SIGTERM (Issue #4980). Cheap early-return when nothing is
         // pending; never blocks (the grace is deadline-based, not slept).
