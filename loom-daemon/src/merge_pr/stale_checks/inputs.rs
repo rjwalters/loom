@@ -86,9 +86,9 @@
 //!
 //! # Gates implemented inside the daemon binary
 //!
-//! Four components (`Shell Budget Ratchet`, `.gitignore Convergence Check`,
-//! `Secret Scan`, `MCP Guard Wiring Contract`) run a `loom-daemon` subcommand
-//! rather than a script. Their `G` used to be `loom-daemon/**`, which nearly
+//! Five components (`Shell Budget Ratchet`, `.gitignore Convergence Check`,
+//! `Secret Scan`, `MCP Guard Wiring Contract`, `Fleet-Policy Shadow Guard`)
+//! run a `loom-daemon` subcommand rather than a script. Their `G` used to be `loom-daemon/**`, which nearly
 //! every base move and nearly every PR touches, so they read as stale almost
 //! always and the guard stopped distinguishing anything (PRs #9543/#9544,
 //! 2026-09-29: refused on `cli/forge_action.rs` vs `init/post_init.rs`).
@@ -590,6 +590,7 @@ pub const REQUIRED_CHECKS: &[RequiredCheck] = &[
             ".gitignore Convergence Check",
             "Secret Scan",
             "MCP Guard Wiring Contract",
+            "Fleet-Policy Shadow Guard",
         ],
         aggregates: &[],
     },
@@ -881,6 +882,39 @@ pub const SPECS: &[CheckSpec<'static>] = &[
         ],
         scanned: &[],
         coupled: &[".gitignore"],
+        removal_sensitive: false,
+    },
+    // `loom-daemon validate . --fleet-policy-only` (#11441): a fleet-policy key
+    // in a tracked repo tier is a finding unless the allow-list gives a reason,
+    // so a key added on one side and an allow entry removed on the other
+    // interact — the three files are coupled.
+    //
+    // Rust surface: `handle_validate_command` in `cli/misc_cmds.rs`, the
+    // `fleet_policy` module and what it reaches (`config_resolver`), and the
+    // dispatch chain. MUST grow if the checker starts using another module —
+    // `daemon_surface_tests.rs` fails until it does.
+    CheckSpec {
+        context: "Fleet-Policy Shadow Guard",
+        global: &[
+            "loom-daemon/src/cli/misc_cmds.rs",
+            "loom-daemon/src/fleet_policy.rs",
+            "loom-daemon/src/config_resolver.rs",
+            "loom-daemon/src/main.rs",
+            "loom-daemon/src/daemon_service.rs",
+            "Cargo.toml",
+            "Cargo.lock",
+            "rust-toolchain.toml",
+            ".cargo/config.toml",
+            "loom-daemon/Cargo.toml",
+            "loom-daemon/build.rs",
+            CI_WORKFLOW,
+        ],
+        scanned: &[],
+        coupled: &[
+            ".loom/config.json",
+            ".loom-project/project.json",
+            ".loom/fleet-policy-allow.json",
+        ],
         removal_sensitive: false,
     },
     // Scans the commits in `base..head` by revision (#9133), so like the

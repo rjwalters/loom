@@ -1383,8 +1383,8 @@ jobs:
         if: ${{ !cancelled() && needs.changes.outputs.daemon != 'false' }}
         run: ./target/debug/loom-daemon shell-budget --check
 
-      # component: Fleet-Policy Shadow Guard (#11441)
-      # A fleet-policy key (runtimes, autonomous, ...) committed in a tracked
+      # component: Fleet-Policy Shadow Guard
+      # (#11441) A fleet-policy key (runtimes, autonomous, ...) committed in a tracked
       # repo tier (.loom/config.json, .loom-project/project.json) silently
       # overrides fleet-gitops. Fails (exit 2) unless the key has an entry with
       # a reason in .loom/fleet-policy-allow.json. Classification lives in
