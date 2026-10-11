@@ -213,6 +213,7 @@ test-sweep-lease-renew.sh
 test-sweep-lease-renew-lifecycle.sh
 test-sweep-pr-mode.sh
 test-sweep-run-registry.sh
+test-sweep-wave-judge-done-staleness.sh
 test-sync-labels-check.sh
 test-token-cache-affinity.sh
 test-claude-wrapper-proxy-rotation.sh
