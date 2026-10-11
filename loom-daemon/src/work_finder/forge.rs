@@ -601,6 +601,12 @@ impl WorkDispatcher for RegistryDispatcher {
         self.dispatch_with(issue, complexity, false)
     }
 
+    /// One read of this workspace's ETag-cached open-PR listing, classified
+    /// for every candidate (#8865); see [`super::open_pr_prefilter::blocked_in`].
+    fn open_pr_blocked(&self, candidates: &[u32]) -> std::collections::HashMap<u32, u32> {
+        super::open_pr_prefilter::blocked_in(&self.registry, candidates)
+    }
+
     /// Whether a live sweep in this registry is the host's overflow sweep
     /// (#9244). The multi-workspace tick ORs this across every root.
     fn overflow_in_flight(&self) -> bool {

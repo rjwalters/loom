@@ -87,6 +87,29 @@ impl SweepRegistry {
         verdict
     }
 
+    /// Where the work finder's batched open-PR pre-filter (#8865) reads the
+    /// listing: this registry's `gh`, its workspace root, and the `owner/repo`
+    /// the 2.6 guard resolves ([`Self::resolve_owner_repo`], never `origin`'s)
+    /// — the same three inputs `probe_open_linked_pr_transports` hands leg 0,
+    /// so the pre-filter and the guard read one listing of one repo.
+    ///
+    /// `None` when the guards are off (`skip_label_flip`, mirroring 2.5/2.6) or
+    /// the repo cannot be resolved; the pre-filter then drops nothing. It makes
+    /// no forge call for a repo already resolved once (#9572), which lets the
+    /// caller take it under a short registry lock and read the listing after
+    /// releasing it.
+    pub(crate) fn open_pr_listing_target(&self) -> Option<(PathBuf, PathBuf, String)> {
+        if self.config.skip_label_flip {
+            return None;
+        }
+        let (owner, repo) = self.resolve_owner_repo()?;
+        Some((
+            self.resolved_gh(),
+            self.config.workspace_root.clone(),
+            format!("{owner}/{repo}"),
+        ))
+    }
+
     fn note_open_pr_refusal(&self, issue: u32, pr: u32, source: &'static str) {
         crate::forge_call_stats::counters::bump(source);
         let key = (self.config.workspace_root.clone(), issue, pr);

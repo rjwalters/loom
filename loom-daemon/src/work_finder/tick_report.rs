@@ -80,6 +80,12 @@ pub struct TickReport {
     /// with the parent sweep, so without this guard an issue whose approved PR is
     /// still open would be re-dispatched the moment its sweep exits.
     pub skipped_pr_open: usize,
+    /// The subset of [`skipped_pr_open`](Self::skipped_pr_open) the batched
+    /// open-PR pre-filter (#8865, [`super::open_pr_prefilter`]) skipped from
+    /// the open-PR listing, with no `dispatch()` attempt and so no
+    /// [`Admission`] and no dispatch backoff. The remainder are refusals
+    /// `dispatch()`'s own guard still made (the listing could not be read).
+    pub pr_open_prefiltered: usize,
     /// Issues skipped because a **peer host** advertised a live soft claim over
     /// the safehouse room (Issue #4028, Phase 1). Counted under its **own**
     /// distinct reason — never folded into [`collisions`](Self::collisions)

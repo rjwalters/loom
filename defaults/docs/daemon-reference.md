@@ -7774,6 +7774,23 @@ never wedge the daemon. It is GitHub-only (uses the `closedByPullRequestsReferen
 closes-graph, filtered to `state == "OPEN"`); a Gitea workspace fails open and
 keeps today's behavior.
 
+**Batched pre-filter (#8865).** The multi-workspace tick no longer pays a full
+`dispatch()` attempt per PR-blocked candidate. The first candidate of a
+workspace to reach the dispatch point triggers ONE read of that workspace's
+ETag-cached open-PR listing, classified for all of its candidates with the
+guard's own classifier (`work_finder/open_pr_prefilter.rs`). A candidate with a
+verified open linked PR is counted in `pr-open-skip` and reported `open_pr`
+without a dispatch attempt: no `work_finder: attempting issue` line, no
+`loom.dispatch.admission` span, no dispatch backoff, and so no `pr-open-backoff`
+ticks in between. Its skip line is logged when the block starts, not every tick.
+The pre-filter only removes candidates and fails open: with the listing
+unreadable every candidate goes to `dispatch()` and the step 2.6 guard above,
+which is unchanged and still the authority for every route. A tick in which
+nothing reaches the dispatch point (at capacity, saturated, halted) makes no
+read. An open-PR refusal that `dispatch()` still makes arms the #4485 ladder as
+before, but as its own streak, logged as a guard refusal rather than as
+`consecutive failed dispatch(es)`.
+
 **A large held-PR backlog can masquerade as work starvation here — a distinct
 mechanism from #5715.** Because the guard keys on openness only, a PR that
 Champion has put on a merge-risk hold (`loom:pr` + `loom:operator`) is still an
