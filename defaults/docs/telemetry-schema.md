@@ -2337,7 +2337,18 @@ two consecutive `fleet.state` views of the same host (held sweeps, review
 PRs, ready queue). A row whose stage changed gives one record (`next_stage`
 is the new stage). A row that left the view gives one record with no
 `next_stage`: `landed` when its PR merged, `cut_short` when it closed or is
-still open without review labels, `unknown` otherwise (a sweep that ended).
+still open without review labels. A row with no resolved PR (a sweep stage,
+`triage_wait`, `approval_wait`) reads its issue instead (#11398): `landed` at
+the issue's `closed_at` when its latest `closed` event carries a `commit_id`
+(a merge closed it), `abandoned` at `closed_at` when it was closed by hand as
+`not_planned` or `duplicate`, and `unknown` (no forge instant, so no
+`loom.fact_id`) when it is still open or closed by hand as `completed` / with
+no reason, which may have been a merge the forge did not link. A failed issue
+read emits nothing and is retried each pass; after
+`PENDING_ISSUE_MAX_PASSES` (12) failed retries it is one `unknown` stamped at
+the pass that first saw the row gone, with no `loom.fact_id`, and is never
+emitted again. A transferred or deleted issue answers 404 to that read, so
+it takes this path: no forge instant is knowable for it.
 A `ready_wait` row that left the view is not a record until a repo's ready
 listing is known whole (#11139), and a row of a repo no longer managed is not
 a record. **Every host that observes a transition emits it**; nothing is
@@ -2352,7 +2363,8 @@ nanoseconds). `forge_transition_at` is the forge's own instant: the new review
 label's `labeled` event (one paginated issue-events read per actual move,
 with no per-pass limit, every page of the history, and only when it falls
 inside the pass window), or the PR's
-`merged_at` / `closed_at`, or for a hold release (`merge_hold` →
+`merged_at` / `closed_at`, or (a row with no PR) the issue's `closed_at`
+(#11398), or for a hold release (`merge_hold` →
 `merge_wait`) the hold label's `unlabeled` event (#11401). Every part is the
 same on every host, whatever its polling time.
 
@@ -2404,7 +2416,7 @@ pass interval. `forge_transition_at` is new (additive).
 | `entered_at` | RFC3339? | present only when the entry has an exact source: a sweep's own checkpoint timestamp. Absent for a polled (review or ready) row, whose entry fell between two passes, and for a stage first seen mid-way |
 | `left_at` | RFC3339 | the event time: `forge_transition_at` when known, else the observing pass |
 | `dwell_sec` | integer? | `left_at − entered_at`, only when the stage completed with an exact entry; never a lower bound |
-| `exit` | string | `advance`, `pass` (`review_wait` → `merge_wait`), `rework` (into `doctor`), `hold`, `released`, `landed`, `cut_short` (PR closed unmerged, or ended without completing), `abandoned` (#11398: the issue closed without a merge while the item sat in the stage, `left_at` is the issue's `closed_at`, `dwell_sec` and `loom.fact_id` are set; a failed issue read is retried each pass and never emitted timeless, and an issue still open or never readable stays `unknown`), `unknown`. `judged` is no longer produced |
+| `exit` | string | `advance`, `pass` (`review_wait` → `merge_wait`), `rework` (into `doctor`), `hold`, `released`, `landed`, `cut_short` (PR closed unmerged, or ended without completing), `abandoned` (#11398: the issue was closed by hand as `not_planned` / `duplicate`, with no commit closing it, while the item sat in a stage with no resolved PR; `left_at` is the issue's `closed_at`, `dwell_sec` and `loom.fact_id` are set. A merge-closed issue is `landed`; an open, `completed`-by-hand, transferred/404 or never-readable issue is `unknown` — see the producer notes above), `unknown`. `judged` is no longer produced |
 | `next_stage` | string? | the stage entered next; absent when the item left the view |
 | `event` | string | the observing source: `fleet.state` |
 | `observed_at` | RFC3339 | when this daemon observed it (knowable-at) |

@@ -69,8 +69,8 @@ pub enum StageExit {
     /// Cut short: the PR closed unmerged, or the stage ended without
     /// completing. There is no dwell.
     CutShort,
-    /// The issue was closed without a merge while the item sat in the stage
-    /// (done elsewhere, rescoped, abandoned), or it left the fleet. Unlike
+    /// The issue was closed as `not_planned` / `duplicate`, with no commit
+    /// closing it, while the item sat in the stage. Unlike
     /// `CutShort` the stay completed at the forge's close instant, so it has
     /// a dwell (#11398).
     Abandoned,

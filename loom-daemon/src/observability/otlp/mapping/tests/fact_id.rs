@@ -335,7 +335,7 @@ fn two_hosts_running_the_producer_at_different_times_emit_one_fact() {
             None
         }
         fn issue(&mut self, _: &str, _: u32) -> Option<IssueFacts> {
-            Some(IssueFacts { closed_at: None })
+            Some(IssueFacts::Open)
         }
 
         fn label_history(&mut self, _: &str, _: u32) -> Option<LabelHistory> {
@@ -412,7 +412,7 @@ fn a_claimed_ready_issue_is_one_fact_across_hosts() {
             None
         }
         fn issue(&mut self, _: &str, _: u32) -> Option<IssueFacts> {
-            Some(IssueFacts { closed_at: None })
+            Some(IssueFacts::Open)
         }
 
         fn label_history(&mut self, _: &str, _: u32) -> Option<LabelHistory> {

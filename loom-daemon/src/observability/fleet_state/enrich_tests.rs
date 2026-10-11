@@ -44,7 +44,7 @@ impl ForgeReads for Forge {
         _: &str,
         _: u32,
     ) -> Option<crate::observability::fleet_state::outcomes::IssueFacts> {
-        Some(crate::observability::fleet_state::outcomes::IssueFacts { closed_at: None })
+        Some(crate::observability::fleet_state::outcomes::IssueFacts::Open)
     }
 
     fn label_history(&mut self, _: &str, n: u32) -> Option<LabelHistory> {

@@ -96,11 +96,60 @@ pub struct PullFacts {
     pub closed_at: Option<DateTime<Utc>>,
 }
 
-/// An issue's state from one `issues/{n}` read (#11398).
+/// An issue's state from its `issues/{n}` read and, once closed, its
+/// `issues/{n}/events` pages (#11398). Every instant is the issue's own
+/// forge `closed_at`, the same on every host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct IssueFacts {
-    /// When the issue was closed; `None` while it is open.
-    pub closed_at: Option<DateTime<Utc>>,
+pub enum IssueFacts {
+    /// Still open.
+    Open,
+    /// Its latest `closed` event carries a `commit_id`: a merge (or a pushed
+    /// commit) closed it, at `closed_at`.
+    Merged(DateTime<Utc>),
+    /// Closed by hand with `state_reason` `not_planned` or `duplicate`, so
+    /// known unmerged, at `closed_at`.
+    NotMerged(DateTime<Utc>),
+    /// Closed, but nothing says whether work landed: a hand close as
+    /// `completed` (or with no reason), or no `closed` event found.
+    ClosedUnresolved,
+}
+
+impl IssueFacts {
+    /// Classify a closed issue from its `state_reason` and its events pages.
+    #[must_use]
+    pub fn closed(
+        closed_at: DateTime<Utc>,
+        state_reason: Option<&str>,
+        events: &[serde_json::Value],
+    ) -> Self {
+        let last_close = events
+            .iter()
+            .flat_map(|page| page.as_array().into_iter().flatten())
+            .filter(|e| e["event"] == "closed")
+            .filter_map(|e| Some((parse_instant(e["created_at"].as_str())?, e)))
+            .max_by_key(|(at, _)| *at);
+        match last_close {
+            Some((_, e)) if e["commit_id"].as_str().is_some_and(|c| !c.is_empty()) => {
+                IssueFacts::Merged(closed_at)
+            }
+            Some(_) if matches!(state_reason, Some("not_planned" | "duplicate")) => {
+                IssueFacts::NotMerged(closed_at)
+            }
+            _ => IssueFacts::ClosedUnresolved,
+        }
+    }
+
+    /// The exit and forge instant a vanished row with no resolved PR takes:
+    /// `landed` at a merge close, `abandoned` at a known-unmerged close,
+    /// else `unknown` with no forge instant (so no fact id).
+    #[must_use]
+    pub fn exit(self) -> (StageExit, Option<DateTime<Utc>>) {
+        match self {
+            IssueFacts::Merged(at) => (StageExit::Landed, Some(at)),
+            IssueFacts::NotMerged(at) => (StageExit::Abandoned, Some(at)),
+            IssueFacts::Open | IssueFacts::ClosedUnresolved => (StageExit::Unknown, None),
+        }
+    }
 }
 
 /// A row that vanished with no resolved PR whose issue read failed, awaiting
@@ -816,10 +865,7 @@ pub fn diff(
                         // No PR said how: the issue's own close is the
                         // departure (#11398).
                         None => match diff.forge.issue(repo, issue) {
-                            Some(IssueFacts {
-                                closed_at: Some(at),
-                            }) => (StageExit::Abandoned, Some(at)),
-                            Some(IssueFacts { closed_at: None }) => (StageExit::Unknown, None),
+                            Some(facts) => facts.exit(),
                             None => {
                                 log::debug!(
                                     "fleet.state: issues/{issue} of {repo} unread; retrying next pass"
@@ -915,7 +961,7 @@ fn settle_pending_ready<F: ForgeReads>(
 
 /// Settle the vanished rows whose issue read failed (#11398): drop one whose
 /// row is back or whose repo is no longer managed, emit one whose issue now
-/// reads (`abandoned` at the close instant, or `unknown` while it is open),
+/// reads (see [`IssueFacts::exit`]),
 /// and emit one past [`PENDING_ISSUE_MAX_PASSES`] as `unknown` at the pass
 /// that first saw it gone, with no fact id. Returns those still waiting.
 fn settle_pending_issue<F: ForgeReads>(
@@ -935,10 +981,7 @@ fn settle_pending_issue<F: ForgeReads>(
             continue;
         }
         let (exit, forge_at) = match diff.forge.issue(&repo, issue) {
-            Some(IssueFacts {
-                closed_at: Some(at),
-            }) => (StageExit::Abandoned, Some(at)),
-            Some(IssueFacts { closed_at: None }) => (StageExit::Unknown, None),
+            Some(facts) => facts.exit(),
             None => {
                 let passes = waiting.passes + 1;
                 if passes < PENDING_ISSUE_MAX_PASSES {
@@ -1051,13 +1094,31 @@ impl ForgeReads for GhForgeReads {
     }
 
     fn issue(&mut self, repo: &str, number: u32) -> Option<IssueFacts> {
+        let root = self.root(repo)?.to_path_buf();
         let issue = crate::observability::ops::stage_dwell::gh_json(
-            self.root(repo)?,
+            &root,
             &format!("repos/{repo}/issues/{number}"),
         )?;
-        Some(IssueFacts {
-            closed_at: parse_instant(issue["closed_at"].as_str()),
-        })
+        let Some(closed_at) = parse_instant(issue["closed_at"].as_str()) else {
+            return Some(IssueFacts::Open);
+        };
+        // Whether a merge closed it is on the `closed` event's `commit_id`;
+        // a failed page is a failed read, retried next pass.
+        let mut pages = Vec::new();
+        for page in 1.. {
+            let events = crate::observability::ops::stage_dwell::gh_json(
+                &root,
+                &format!(
+                    "repos/{repo}/issues/{number}/events?per_page={EVENTS_PAGE_SIZE}&page={page}"
+                ),
+            )?;
+            let len = events.as_array()?.len();
+            pages.push(events);
+            if len < EVENTS_PAGE_SIZE {
+                break;
+            }
+        }
+        Some(IssueFacts::closed(closed_at, issue["state_reason"].as_str(), &pages))
     }
 
     fn label_history(&mut self, repo: &str, number: u32) -> Option<LabelHistory> {

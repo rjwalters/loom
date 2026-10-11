@@ -94,7 +94,7 @@ impl ForgeReads for Forge {
             self.issues
                 .get(&number)
                 .copied()
-                .unwrap_or(IssueFacts { closed_at: None }),
+                .unwrap_or(IssueFacts::Open),
         )
     }
 
@@ -1047,112 +1047,5 @@ mod pre_ready_tests;
 #[path = "outcomes_fact_id_tests.rs"]
 mod fact_id_tests;
 
-fn held_curator() -> HeldSweep {
-    HeldSweep {
-        repo: REPO.to_string(),
-        issue: 20,
-        stage: FleetStage::SweepCurator,
-        entered_at: t0() - Duration::minutes(2),
-        entered_at_lower_bound: false,
-        pr: None,
-        overflow: false,
-        start: Default::default(),
-    }
-}
-
-fn closed_at_7() -> (DateTime<Utc>, Forge) {
-    let at = t0() + Duration::minutes(7);
-    let mut forge = Forge::default();
-    forge.issues.insert(
-        20,
-        IssueFacts {
-            closed_at: Some(at),
-        },
-    );
-    (at, forge)
-}
-
-#[test]
-fn an_issue_closed_mid_sweep_is_one_abandoned_exit_at_the_close_time() {
-    let (closed, mut forge) = closed_at_7();
-    let out = run(
-        &[
-            input(&[], vec![held_curator()]),
-            input(&[], Vec::new()),
-            input(&[], Vec::new()),
-        ],
-        Duration::minutes(10),
-        &mut forge,
-    );
-    let r = stages(&out[1]);
-    assert_eq!(r.len(), 1, "{out:?}");
-    assert_eq!(r[0].stage, FleetStage::SweepCurator);
-    assert_eq!(r[0].exit, StageExit::Abandoned);
-    assert_eq!(r[0].next_stage, None);
-    assert_eq!(r[0].forge_transition_at, Some(closed));
-    assert_eq!(r[0].left_at, closed);
-    assert_eq!(r[0].dwell_sec, Some(9 * 60));
-    assert_eq!(r[0].resolution_sec, Some(0));
-    assert!(stages(&out[2]).is_empty(), "no second exit");
-}
-
-#[test]
-fn two_hosts_diffing_one_close_emit_the_same_forge_instant() {
-    let run_host = |step: i64| {
-        let (_, mut forge) = closed_at_7();
-        let out = run(
-            &[input(&[], vec![held_curator()]), input(&[], Vec::new())],
-            Duration::minutes(step),
-            &mut forge,
-        );
-        let r = stages(&out[1])[0].clone();
-        (r.exit, r.stage, r.next_stage, r.forge_transition_at)
-    };
-    assert_eq!(run_host(10), run_host(25));
-}
-
-#[test]
-fn an_unread_issue_emits_nothing_until_it_reads_then_once() {
-    let (closed, mut forge) = closed_at_7();
-    forge.issue_failures = 1;
-    let out = run(
-        &[
-            input(&[], vec![held_curator()]),
-            input(&[], Vec::new()),
-            input(&[], Vec::new()),
-            input(&[], Vec::new()),
-        ],
-        Duration::minutes(10),
-        &mut forge,
-    );
-    assert!(stages(&out[1]).is_empty(), "no timeless exit on a failed read");
-    let r = stages(&out[2]);
-    assert_eq!(r.len(), 1, "{out:?}");
-    assert_eq!((r[0].exit, r[0].forge_transition_at), (StageExit::Abandoned, Some(closed)));
-    assert!(stages(&out[3]).is_empty());
-}
-
-#[test]
-fn an_issue_that_never_reads_is_one_unknown_after_the_cap() {
-    let mut forge = Forge {
-        issue_failures: usize::MAX,
-        ..Forge::default()
-    };
-    let mut inputs = vec![input(&[], vec![held_curator()])];
-    inputs.extend((0..=PENDING_ISSUE_MAX_PASSES).map(|_| input(&[], Vec::new())));
-    let out = run(&inputs, Duration::minutes(5), &mut forge);
-    let all: Vec<_> = out.iter().flat_map(|o| stages(o)).collect();
-    assert_eq!(all.len(), 1, "{out:?}");
-    assert_eq!((all[0].exit, all[0].forge_transition_at), (StageExit::Unknown, None));
-}
-
-#[test]
-fn a_vanished_row_whose_issue_is_still_open_stays_unknown() {
-    let mut forge = Forge::default();
-    let out = run(
-        &[input(&[], vec![held_curator()]), input(&[], Vec::new())],
-        Duration::minutes(10),
-        &mut forge,
-    );
-    assert_eq!(stages(&out[1])[0].exit, StageExit::Unknown);
-}
+#[path = "outcomes_issue_close_tests.rs"]
+mod issue_close_tests;
