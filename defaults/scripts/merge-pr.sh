@@ -1333,9 +1333,9 @@ _reset_one_partial_issue() {
         # forge_gh_swap_label_rl_safe (#4856): falls back to REST (DELETE the old
         # label, POST the new one) when `gh issue edit`'s GraphQL mutation is
         # rate-limited, rather than silently dropping the label swap.
-        if forge_gh_swap_label_rl_safe "$REPO_NWO" "$issue_num" "loom:building" "loom:issue" 2>/dev/null; then
-          success "Issue #$issue_num: loom:building -> loom:issue (partial increment; issue remains open)"
-          local rn=(); [[ "$reopened" != "true" ]] || rn=(--reopened)
+        if forge_gh_swap_label_rl_safe "$REPO_NWO" "$issue_num" "loom:building" "${text:-loom:issue}" 2>/dev/null; then
+          success "Issue #$issue_num: loom:building -> ${text:-loom:issue} (partial increment; issue remains open)"
+          local rn=(); [[ "$reopened" != "true" ]] || rn=(--reopened); [[ -z "$text" ]] || rn+=(--held)  # held remainder (#9264)
           # forge_gh_comment_rl_safe (#4856): falls back to the REST comments
           # endpoint on a GraphQL rate-limit rejection.
           _mp_post_partial_comment partial-merged "$issue_num" "Could not post partial-increment comment on issue #$issue_num (label swap still applied)" ${rn[@]+"${rn[@]}"}
@@ -1388,7 +1388,7 @@ _mp_post_partial_comment() {
   local kind="$1" issue_num="$2" post_warn="$3"; shift 3
   local out rc=0 nl
   nl=$'\n'
-  out="$("${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr partial-comment --kind "$kind" --issue "$issue_num" --pr "$PR_NUMBER" "$@" 2>/dev/null)" || rc=$?
+  out="$("${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr partial-comment --kind "$kind" --issue "$issue_num" --pr "$PR_NUMBER" "$@" <<<"${issue_json-}" 2>/dev/null)" || rc=$?
   if [[ $rc -ne 0 || "$out" != "LOOM-MERGE-PR-COMMENT$nl"* ]]; then
     warning "The $kind audit comment for issue #$issue_num (#3667/#4569) was NOT posted — '${LOOM_DAEMON_BIN:-loom-daemon} merge-pr partial-comment' exited $rc without the LOOM-MERGE-PR-COMMENT sentinel (a loom-daemon predating #8191's slice has no such verb). Advisory only: the merge, the reopen and the label swap all already happened and are unaffected — only this explanatory note is missing, and an empty comment is never posted in its place. $(! declare -F _mp_daemon_roll_hint >/dev/null || _mp_daemon_roll_hint merge-pr "$(command -v "${LOOM_DAEMON_BIN:-loom-daemon}" 2>/dev/null || true)")"
     return 0
