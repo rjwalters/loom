@@ -1089,6 +1089,11 @@ enum Commands {
         /// Show verbose output including configured roles
         #[arg(long, short)]
         verbose: bool,
+
+        /// Run only the fleet-policy shadow check (#11441) and exit 2 on any
+        /// finding; skips role validation. Used by the CI guard.
+        #[arg(long)]
+        fleet_policy_only: bool,
     },
 
     /// Inspect the durable `sweep.outcome` telemetry journal (Issue #4704,
@@ -2369,7 +2374,8 @@ async fn handle_cli_command(command: Commands) -> Result<()> {
             format,
             strict,
             verbose,
-        } => handle_validate_command(&workspace, &format, strict, verbose),
+            fleet_policy_only,
+        } => handle_validate_command(&workspace, &format, strict, verbose, fleet_policy_only),
         Commands::SweepOutcomes(args) => cli::sweep_outcomes_cli::dispatch(args),
         Commands::FleetConfig(args) => cli::fleet_config::dispatch(args),
         Commands::Journal(args) => cli::journal_cli::dispatch(args),

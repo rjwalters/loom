@@ -229,6 +229,7 @@ Configuration lives in `.loom/config.json` (committed for team sharing): a
 - **Daemon configuration (Tier 2)** — the `autonomous` block, start/stop wrappers,
   self-update, epic supervisor: [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md)
   §Operability (precedence **env > config > default**; daemon defaults FLAGS-OFF).
+- **Fleet vs repo keys** — fleet policy lives in fleet-gitops only; a tracked repo tier must not shadow it (`validate --strict` in CI): [`fleet-config-lifecycle.md`](.loom/docs/fleet-config-lifecycle.md) §"Where each kind of key lives".
 - **Post-Builder quality gate (`buildGate`)** — [`.loom/docs/build-gate.md`](.loom/docs/build-gate.md).
 - **Runtime dispatch (`runtimes`)** — `spawn-worker.sh` selects the worker runtime
   (`LOOM_RUNTIME` env > `runtimes.default` > `"claude"`), execing `spawn-<runtime>.sh`:
