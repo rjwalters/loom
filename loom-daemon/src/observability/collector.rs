@@ -744,17 +744,20 @@ fn terminal_records(
     // and the classifier hands back the mandatory `failure_class` (a
     // synthesized `unclassified:*` label here, since nothing classified this
     // transition) together with the disposition.
-    let (disposition, failure_class) =
-        crate::telemetry::classify_disposition(&crate::telemetry::DispositionSignals {
-            result,
-            pr_number,
-            failure_class: None,
-            phase_durations: &[],
-            total_duration_sec,
-            judge_verdicts: None,
-            doctor_cycles: None,
-            issue_end_state: None,
-        });
+    // #11429: no Judge verdicts are read here, so a `landed` failure stays a
+    // `failure` (no proof it landed clean).
+    let signals = crate::telemetry::DispositionSignals {
+        result,
+        pr_number,
+        failure_class: None,
+        phase_durations: &[],
+        total_duration_sec,
+        judge_verdicts: None,
+        doctor_cycles: None,
+        issue_end_state: None,
+    };
+    let (disposition, failure_class) = crate::telemetry::classify_disposition(&signals);
+    let outcome_result = crate::telemetry::result_for_disposition(&signals, disposition);
     vec![
         TelemetryRecord::SweepCompleted(crate::telemetry::SweepCompletedRecord {
             repo: repo.clone(),
@@ -781,7 +784,7 @@ fn terminal_records(
             config: std::collections::BTreeMap::new(),
             phase_durations: Vec::<PhaseDuration>::new(),
             total_duration_sec,
-            result: crate::telemetry::result_for_disposition(result, disposition),
+            result: outcome_result,
             disposition,
             pr_number,
             // Token fields (and `tokens_status`) are filled by

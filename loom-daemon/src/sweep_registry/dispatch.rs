@@ -1914,11 +1914,6 @@ impl SweepRegistry {
         //     W9: a resume never consults the memo (`dispatch_open_pr_memo`,
         //     see `guards/refusal_memo.rs`), and the probe below is a
         //     conditional read whose verdict comes from the body it serves.
-        // #11429: a `landed` outcome on this host's journal refuses first, at no
-        //     forge cost; a crash resume of the issue's own sweep is exempt.
-        if resume_bypass_pr.is_none() {
-            self.refuse_recent_landing(issue_number, Utc::now())?;
-        }
         if !self.config.skip_label_flip {
             if let Some(memo) = self.dispatch_open_pr_memo(issue_number, resume_bypass_pr) {
                 self.record_open_pr_guard_backoff(issue_number);
@@ -1999,6 +1994,15 @@ impl SweepRegistry {
                      open-PR guard for its own PR #{pr} (#4256)"
                 );
             }
+        }
+
+        // #11429: a `landed` outcome on this host's journal refuses as
+        //     `already_landed`. It runs after 2.6, so an issue whose PR is
+        //     still open gets `OpenPrDispatchError` first, which the
+        //     review-stall watchdog converts to a PrSet dispatch (#7649). A
+        //     crash resume of the issue's own sweep is exempt.
+        if resume_bypass_pr.is_none() {
+            self.refuse_recent_landing(issue_number, Utc::now())?;
         }
 
         // 2.7 Park-label guard (Issue #4444). The work-finder's `SKIP_LABELS`

@@ -941,17 +941,18 @@ impl SweepRegistry {
         // disposition and its mandatory `failure_class` come back as one value
         // so the "env_failure/substantive_failure/unknown must say why"
         // invariant cannot be half-applied; see `telemetry::disposition`.
-        let (disposition, failure_class) =
-            telemetry::classify_disposition(&telemetry::DispositionSignals {
-                result,
-                pr_number,
-                failure_class: failure_class.as_deref(),
-                phase_durations: &phase_durations,
-                total_duration_sec: duration_sec,
-                judge_verdicts: judge_verdicts.as_deref(),
-                doctor_cycles,
-                issue_end_state,
-            });
+        let signals = telemetry::DispositionSignals {
+            result,
+            pr_number,
+            failure_class: failure_class.as_deref(),
+            phase_durations: &phase_durations,
+            total_duration_sec: duration_sec,
+            judge_verdicts: judge_verdicts.as_deref(),
+            doctor_cycles,
+            issue_end_state,
+        };
+        let (disposition, failure_class) = telemetry::classify_disposition(&signals);
+        let reported_result = telemetry::result_for_disposition(&signals, disposition);
         // Issue #10642: a synthesized `no-phase-signal` class says nothing on
         // its own, so attach what is known about how the run ended.
         let no_phase_cause = (failure_class.as_deref() == Some(telemetry::NO_PHASE_SIGNAL_CLASS))
@@ -973,7 +974,7 @@ impl SweepRegistry {
                 .map(ParkKind::failure_class),
         );
         let process_result = result;
-        let result = telemetry::result_for_disposition(result, disposition);
+        let result = reported_result;
 
         let outcome_record = telemetry::SweepOutcomeRecord {
             repo,

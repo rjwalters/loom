@@ -937,12 +937,14 @@ side, 16,898 `failure` records folded 5,326 sub-60 s spawn deaths together with
 235 genuine Judge rejections and 6,373 deaths nothing observed at all.
 
 `disposition` is that missing axis. It is **required on every record written
-since #9441**, low-cardinality, and **strictly additive**: `result` is emitted
-unchanged beside it, so every pre-#9441 consumer keeps working.
+since #9441** and low-cardinality. `result` is still emitted beside it. Since
+#11429 a `failure` is reported as `success` for `noop_already_done`, and for a
+`landed` sweep with no rejection or rework signal (see the `result` rules
+below); every other record keeps the process result.
 
 | value | meaning |
 |---|---|
-| `landed` | The sweep produced a PR for its issue. Its `result` is `success` unless it was `cancelled` (#11429). |
+| `landed` | The sweep produced a PR for its issue. A `failure` is reported as `success` only when the PR landed with no rejection or rework signal: the Judge approved it and never requested changes, and no classifier labelled a crash, death or exhausted Doctor loop (#11429). Otherwise `result` keeps the process result. |
 | `noop_already_done` | Nothing to do: the issue was already closed before dispatch, or the run exited clean and short having produced no PR, no phase and no work. Its `result` is `success` (#11429). |
 | `curator_closed` | The Curator closed the issue instead of building it (the "Issues Are Suggestions" path) — a correct outcome, not a failure. |
 | `curator_rescoped` | The Curator handed the issue back to `loom:triage` / `loom:curated` (and off `loom:issue` / `loom:building`) instead of building it. |
@@ -1627,6 +1629,7 @@ Each name fixes its OTLP kind. `loom.dispatch.decisions` is a monotonic
 `workspace_commands_missing`, `pr_open`, `peer_claim`, `backoff`,
 `pr_open_backoff`, `noop_cooldown`, `declined`, `prless_retry`,
 `already_landed` (#11429: the issue's work already landed),
+`already_closed` (#11429: the issue is closed as not planned),
 `recheck_interval`, `host_constraint`, `host_class` (#9034: a `loom:heavy`
 candidate refused on a `local-dev` host), `capacity`, `ramp_cap`, `saturation`,
 `build_backoff` (#9410: the build back-off held an unstarred issue build),
@@ -2088,7 +2091,7 @@ Each row:
 | `operator_priority_at` | RFC 3339, optional | when it was starred (the `labeled` timeline event), when known. Omitted for an unstarred issue, or a starred one ordered by its `created_at` fallback |
 | `created_at` | RFC 3339, optional | issue creation time (the age ordering key) |
 | `tier` | string, optional | the `tier:*` label, informational only |
-| `disposition` | string | `dispatched`, `in_flight`, `deferred_capacity`, `deferred_ramp_cap`, `deferred_saturation`, `deferred_build_backoff`, `deferred_out_of_slice`, `deferred_repo_cap`, `deferred_file_overlap`, `workspace_halted`, `workspace_commands_missing`, `host_constraint`, `host_class_refused`, `parked`, `hard_exclusion`, `recheck_interval`, `quarantined`, `dispatch_backoff`, `open_pr_backoff`, `noop_cooldown`, `declined`, `prless_retry`, `peer_claim`, `open_pr`, `dispatch_error`, `already_landed`, `labelled_blocked` (unknown values are forward-compatible) |
+| `disposition` | string | `dispatched`, `in_flight`, `deferred_capacity`, `deferred_ramp_cap`, `deferred_saturation`, `deferred_build_backoff`, `deferred_out_of_slice`, `deferred_repo_cap`, `deferred_file_overlap`, `workspace_halted`, `workspace_commands_missing`, `host_constraint`, `host_class_refused`, `parked`, `hard_exclusion`, `recheck_interval`, `quarantined`, `dispatch_backoff`, `open_pr_backoff`, `noop_cooldown`, `declined`, `prless_retry`, `peer_claim`, `open_pr`, `dispatch_error`, `already_landed`, `already_closed`, `labelled_blocked` (unknown values are forward-compatible) |
 | `state` | string | `running` / `ready` / `blocked`, derived by the daemon so clients never keep a copy of the mapping |
 | `reason` | string | human-readable reason, also daemon-derived |
 | `detail` | string, optional | only for `parked` (the park label), `open_pr` (`open PR #N`), `deferred_file_overlap` (`file overlap: <paths>`, the shared `## Affected Files` paths, #9781), `already_landed` (`forge_closed` or `journal_landed`, #11429) and `labelled_blocked` (the hold labels it also carries, from `loom:operator`, `loom:operator-only`, `loom:operator-mechanical`, `loom:needs-capability`). Free-form dispatch-error and comment text is never exported |
@@ -3128,12 +3131,17 @@ forge call):
 | Clean exit (code `0`) with no `merge-done`, not the #4366 no-progress shape | `success` |
 | Everything else — non-zero exit, unobservable exit status, the #4366 clean-exit-with-zero-progress shape, or a death that left a checkpoint behind | `failure` |
 
-A `failure` whose `disposition` is `landed` or `noop_already_done` is reported
-as `success` (Issue #11429): the work landed, or there was none to do, even
-though the process did not end clean. Both construction sites apply it (the
-reaper's journal and the collector's live path). `failure_class` keeps what the
-classifier saw, the paired `sweep.completed` keeps the process result, and the
-opt-in issue write-back still keys on the process result.
+A `failure` whose `disposition` is `noop_already_done` is reported as
+`success` (Issue #11429): there was no work to do. A `failure` whose
+`disposition` is `landed` is reported as `success` only when there is no
+rejection or rework signal: the Judge verdicts were read, every one is a
+`pass`, and no classifier labelled the transition (`failure_class` absent:
+no crash, death or exhausted Doctor loop). A Judge rejection, even one the
+Doctor fixed, keeps `failure`, so `landed` + `failure` still names the PRs
+that needed rework or did not make it. The collector's live path reads no
+Judge verdicts, so its `landed` failures stay `failure`. `failure_class` keeps
+what the classifier saw, the paired `sweep.completed` keeps the process
+result, and the opt-in issue write-back still keys on the process result.
 
 An *unobservable* exit status (a reconstructed entry reaped via `kill(pid, 0)`,
 which yields no code) is deliberately a `failure`, not a `success`: absence of

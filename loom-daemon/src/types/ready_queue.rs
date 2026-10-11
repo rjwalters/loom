@@ -89,6 +89,8 @@ pub enum QueueDisposition {
     /// Skipped: its work already landed. The issue is closed, or this host
     /// recorded a `landed` sweep for it moments ago (Issue #11429).
     AlreadyLanded,
+    /// Skipped: the issue is closed as not planned (Issue #11429).
+    AlreadyClosed,
     /// Blocked on the forge: the issue carries `loom:blocked` without
     /// `loom:issue`, so the work finder never lists it (Issue #8957). Only in
     /// `queue.snapshot`, added by the collector from its own cached forge
@@ -104,7 +106,7 @@ impl QueueDisposition {
     /// ([`Self::LabelledBlocked`] and [`Self::Unknown`] excluded). The queue-depth metrics (Issue #8852, phase 2) emit one
     /// point per entry every tick, zeros included, so an empty queue reads as
     /// `0` rather than as a missing series.
-    pub const ALL: [Self; 26] = [
+    pub const ALL: [Self; 27] = [
         Self::Dispatched,
         Self::InFlight,
         Self::DeferredCapacity,
@@ -131,6 +133,7 @@ impl QueueDisposition {
         Self::OpenPr,
         Self::DispatchError,
         Self::AlreadyLanded,
+        Self::AlreadyClosed,
     ];
 
     /// The snake_case wire name (identical to the serde form; pinned by a
@@ -164,6 +167,7 @@ impl QueueDisposition {
             Self::OpenPr => "open_pr",
             Self::DispatchError => "dispatch_error",
             Self::AlreadyLanded => "already_landed",
+            Self::AlreadyClosed => "already_closed",
             Self::LabelledBlocked => "labelled_blocked",
             Self::Unknown => "unknown",
         }
@@ -219,6 +223,7 @@ impl QueueDisposition {
             Self::OpenPr => "blocked: open linked PR",
             Self::DispatchError => "dispatch failed",
             Self::AlreadyLanded => "skipped: work already landed",
+            Self::AlreadyClosed => "skipped: issue closed as not planned",
             Self::LabelledBlocked => "blocked: labelled loom:blocked",
             Self::Unknown => "unknown",
         }
@@ -358,7 +363,7 @@ mod tests {
     #[test]
     fn build_backoff_disposition_round_trips_and_old_summaries_parse() {
         let d = QueueDisposition::DeferredBuildBackoff;
-        assert_eq!(QueueDisposition::ALL.len(), 26);
+        assert_eq!(QueueDisposition::ALL.len(), 27);
         assert!(QueueDisposition::ALL.contains(&d));
         let json = serde_json::to_value(d).unwrap();
         assert_eq!(json, serde_json::json!("deferred_build_backoff"));

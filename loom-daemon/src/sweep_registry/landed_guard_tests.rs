@@ -124,3 +124,22 @@ fn a_closed_issue_is_refused_as_already_landed() {
     assert!(err.downcast_ref::<AlreadyLandedDispatchError>().is_none(), "{err:#}");
     assert!(err.to_string().contains("pull request"), "{err:#}");
 }
+
+/// An issue closed as not planned did not land: the REST read reports it as
+/// `already_closed`.
+#[test]
+#[serial]
+fn a_not_planned_close_is_refused_as_already_closed() {
+    std::env::remove_var("LOOM_REPO");
+    let dir = tempdir().unwrap();
+    let probe = r#"{"state":"closed","state_reason":"not_planned","is_pr":false}"#;
+    let (mut registry, _) = closed_guard_registry(dir.path(), probe, 0);
+    let err = registry
+        .dispatch(&SweepKind::Issue(151), None, None, None, None)
+        .expect_err("a closed issue is refused");
+    let refusal = err
+        .downcast_ref::<AlreadyLandedDispatchError>()
+        .expect("typed refusal");
+    assert_eq!(refusal.evidence, LandedEvidence::ForgeClosedNotPlanned);
+    assert!(err.to_string().contains("already_closed"), "{err:#}");
+}

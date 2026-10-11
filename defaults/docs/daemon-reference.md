@@ -3392,7 +3392,8 @@ by `candidate_cmp`, with what the tick did with it:
   host-distress breaker; the row does not say which), `workspace_commands_missing`,
   `dispatch_error` (with the error text), `already_landed` (#11429: the issue
   is closed, or this host recorded a `landed` sweep for it in the last 30
-  minutes; detail `forge_closed` or `journal_landed`)
+  minutes; detail `forge_closed` or `journal_landed`), `already_closed`
+  (#11429: the issue is closed as not planned)
 
 Each disposition is recorded next to the `TickReport` counter it matches, so the
 rows and the counters agree. Issues dropped before the sort are still ranked by the same

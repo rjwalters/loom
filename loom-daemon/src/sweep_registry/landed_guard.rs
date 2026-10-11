@@ -6,14 +6,25 @@
 //! [`AlreadyLandedDispatchError`], which the work finder records as the
 //! `already_landed` queue disposition and `pick.decision` skip reason:
 //!
-//! - this host's outcome journal has a `landed` `sweep.outcome` for the issue
-//!   inside [`LANDED_REDISPATCH_WINDOW`] (no forge call); and
 //! - the 2.5 closed-issue read, which dispatch already makes, finds the issue
-//!   closed.
+//!   closed (an issue closed as *not planned* is reported `already_closed`
+//!   instead); and
+//! - this host's outcome journal has a `landed` `sweep.outcome` for the issue
+//!   inside [`LANDED_REDISPATCH_WINDOW`] (no forge call).
+//!
+//! The journal check runs after the 2.6 open-PR guard. An issue whose PR is
+//! still open therefore gets `OpenPrDispatchError`, as before #11429: the
+//! review-stall and mid-build watchdogs key on that error, and the
+//! review-stall watchdog converts it to a PrSet dispatch (#7649). A cancelled
+//! review-phase sweep journals `landed` just before that re-dispatch.
 //!
 //! A crash resume of the issue's own sweep (`resume_bypass_pr`) is not
 //! refused by the journal check: its own landed record is the reason to
 //! resume, and the 2.6 open-PR guard already decides that case.
+//!
+//! The journal is per host. Another host can still dispatch the issue inside
+//! the window while it is open and its PR is merged; the 2.5 read stops it
+//! once the issue closes.
 
 use super::*;
 use crate::telemetry::{SweepDisposition, TelemetryEnvelope, TelemetryRecord};
@@ -29,6 +40,9 @@ pub const ALREADY_LANDED_REASON: &str = "already_landed";
 pub enum LandedEvidence {
     /// The issue is closed on the forge.
     ForgeClosed,
+    /// The issue is closed on the forge as not planned: reported as
+    /// `already_closed`, not `already_landed`.
+    ForgeClosedNotPlanned,
     /// This host's outcome journal has a recent `landed` outcome.
     JournalLanded {
         sweep_id: String,
@@ -51,6 +65,7 @@ impl AlreadyLandedDispatchError {
     pub fn detail(&self) -> &'static str {
         match self.evidence {
             LandedEvidence::ForgeClosed => "forge_closed",
+            LandedEvidence::ForgeClosedNotPlanned => "forge_closed_not_planned",
             LandedEvidence::JournalLanded { .. } => "journal_landed",
         }
     }
@@ -64,6 +79,11 @@ impl std::fmt::Display for AlreadyLandedDispatchError {
                 f,
                 "refusing to dispatch issue #{issue} ({ALREADY_LANDED_REASON}): it is closed on \
                  the forge (#4088 closed-issue guard, #11429)"
+            ),
+            LandedEvidence::ForgeClosedNotPlanned => write!(
+                f,
+                "refusing to dispatch issue #{issue} (already_closed): it is closed as not \
+                 planned on the forge (#4088 closed-issue guard, #11429)"
             ),
             LandedEvidence::JournalLanded {
                 sweep_id,
@@ -150,22 +170,21 @@ impl SweepRegistry {
     /// Step 2.5: refuse a closed issue as `already_landed`, and a number that
     /// resolves to a pull request as before (#4088/#4504). Fails open.
     pub(super) fn refuse_closed_issue(&self, issue: u32) -> Result<()> {
-        match self.guard_issue_gate(issue) {
-            Some(IssueGate::Closed) => {
-                let refusal = AlreadyLandedDispatchError {
-                    issue,
-                    evidence: LandedEvidence::ForgeClosed,
-                };
-                log::info!("sweep_registry: {refusal}");
-                Err(refusal.into())
+        let evidence = match self.guard_issue_gate(issue) {
+            Some(IssueGate::Closed) => LandedEvidence::ForgeClosed,
+            Some(IssueGate::ClosedNotPlanned) => LandedEvidence::ForgeClosedNotPlanned,
+            Some(IssueGate::PullRequest) => {
+                return Err(anyhow!(
+                    "refusing to dispatch issue #{issue}: the number resolves to a pull request \
+                     rather than an open issue (#4088/#4504 closed-issue guard). A watchdog \
+                     re-dispatch must not re-claim a closed/merged issue or a PR number."
+                ))
             }
-            Some(IssueGate::PullRequest) => Err(anyhow!(
-                "refusing to dispatch issue #{issue}: the number resolves to a pull request \
-                 rather than an open issue (#4088/#4504 closed-issue guard). A watchdog \
-                 re-dispatch must not re-claim a closed/merged issue or a PR number."
-            )),
-            Some(IssueGate::Open) | None => Ok(()),
-        }
+            Some(IssueGate::Open) | None => return Ok(()),
+        };
+        let refusal = AlreadyLandedDispatchError { issue, evidence };
+        log::info!("sweep_registry: {refusal}");
+        Err(refusal.into())
     }
 }
 

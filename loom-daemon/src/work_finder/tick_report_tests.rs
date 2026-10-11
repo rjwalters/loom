@@ -389,3 +389,31 @@ fn a_pr_open_admission_in_a_locked_repo_carries_the_lockout_weight() {
         .attributes
         .contains_key("lockout.frozen_candidates_count"));
 }
+
+fn already_closed(issue: u32) -> anyhow::Error {
+    crate::sweep_registry::AlreadyLandedDispatchError {
+        issue,
+        evidence: crate::sweep_registry::LandedEvidence::ForgeClosedNotPlanned,
+    }
+    .into()
+}
+
+/// Issue #11429: a not-planned close is `already_closed`, not a landing.
+#[test]
+fn a_not_planned_close_is_recorded_as_already_closed() {
+    let mut multi = vec![(
+        Source(items(&[3080, 1130])),
+        Refusing {
+            refuse: already_closed,
+            ok: HashSet::from([1130]),
+        },
+    )];
+    let report = tick_multi(&mut multi, &[], 4, &[false]);
+    assert_eq!((report.skipped_already_closed, report.skipped_already_landed), (1, 0));
+    let row = report.queue.iter().find(|r| r.key.number == 3080).unwrap();
+    assert_eq!(row.disposition, Some(Qd::AlreadyClosed));
+    assert_eq!(reason(&report, "already_closed"), 1);
+    assert_partition(&report, 2);
+    let closed = report.admissions.iter().find(|a| a.issue == 3080).unwrap();
+    assert_eq!((closed.result, closed.reason), ("refused", "already_closed"));
+}

@@ -77,6 +77,8 @@ pub(crate) struct IssueView {
     pub(crate) closed_or_pr: Option<bool>,
     /// The number is a pull request, in any state.
     pub(crate) is_pr: bool,
+    /// The issue was closed as not planned (`state_reason`).
+    pub(crate) not_planned: bool,
     /// Label names, as [`SweepRegistry::current_labels_via_rest`] gives them.
     pub(crate) labels: Vec<String>,
 }
@@ -103,9 +105,14 @@ pub(crate) fn parse_issue_view(body: &str) -> Option<IssueView> {
         (false, Some("OPEN")) => Some(false),
         _ => None,
     };
+    let not_planned = v
+        .get("state_reason")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(is_not_planned);
     Some(IssueView {
         closed_or_pr,
         is_pr,
+        not_planned,
         labels,
     })
 }
@@ -116,7 +123,13 @@ pub(crate) fn parse_issue_view(body: &str) -> Option<IssueView> {
 pub(crate) enum IssueGate {
     Open,
     Closed,
+    /// Closed with `state_reason` `not_planned`: refused as `already_closed`.
+    ClosedNotPlanned,
     PullRequest,
+}
+
+fn is_not_planned(state_reason: &str) -> bool {
+    state_reason.trim().eq_ignore_ascii_case("not_planned")
 }
 
 impl IssueGate {
@@ -131,7 +144,15 @@ impl IssueGate {
             return Some(Self::PullRequest);
         }
         view.closed_or_pr
-            .map(|closed| if closed { Self::Closed } else { Self::Open })
+            .map(|closed| Self::closed_or_open(closed, view.not_planned))
+    }
+
+    fn closed_or_open(closed: bool, not_planned: bool) -> Self {
+        match (closed, not_planned) {
+            (false, _) => Self::Open,
+            (true, true) => Self::ClosedNotPlanned,
+            (true, false) => Self::Closed,
+        }
     }
 }
 
@@ -185,7 +206,7 @@ impl SweepRegistry {
             .arg("api")
             .arg(format!("repos/{owner}/{repo}/issues/{issue}"))
             .arg("--jq")
-            .arg("{state, is_pr: (.pull_request != null)}");
+            .arg("{state, state_reason, is_pr: (.pull_request != null)}");
         let output = self.run_counted(cmd).ok()??;
         if !output.status.success() {
             return None;
@@ -195,7 +216,11 @@ impl SweepRegistry {
         if parsed.get("is_pr")?.as_bool()? {
             return Some(IssueGate::PullRequest);
         }
-        match parsed
+        let not_planned = parsed
+            .get("state_reason")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(is_not_planned);
+        let closed = match parsed
             .get("state")?
             .as_str()?
             .trim()
@@ -204,10 +229,11 @@ impl SweepRegistry {
         {
             // REST reports a merged PR as `closed`; `MERGED` on an issue-shaped
             // node must still never fall through to the fail-open arm (#4504).
-            "CLOSED" | "MERGED" => Some(IssueGate::Closed),
-            "OPEN" => Some(IssueGate::Open),
-            _ => None,
-        }
+            "CLOSED" | "MERGED" => true,
+            "OPEN" => false,
+            _ => return None,
+        };
+        Some(IssueGate::closed_or_open(closed, not_planned))
     }
 
     /// Step 2.7 (and 2.71): `issue`'s labels. The writer-pinned conditional

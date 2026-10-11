@@ -93,11 +93,13 @@ pub enum PickSkipReason {
     NotSelected,
     /// The item's work already landed (Issue #11429).
     AlreadyLanded,
+    /// The issue is closed as not planned (Issue #11429).
+    AlreadyClosed,
 }
 
 impl PickSkipReason {
     /// Every reason, in declaration order (pinned by a test against the docs).
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::OverlapChain,
         Self::PrOpenSkip,
         Self::OperatorHold,
@@ -112,6 +114,7 @@ impl PickSkipReason {
         Self::TickSkipped,
         Self::NotSelected,
         Self::AlreadyLanded,
+        Self::AlreadyClosed,
     ];
 
     /// The snake_case wire name (identical to the serde form).
@@ -132,6 +135,7 @@ impl PickSkipReason {
             Self::TickSkipped => "tick_skipped",
             Self::NotSelected => "not_selected",
             Self::AlreadyLanded => "already_landed",
+            Self::AlreadyClosed => "already_closed",
         }
     }
 
@@ -166,6 +170,7 @@ impl PickSkipReason {
             Qd::OpenPrBackoff | Qd::OpenPr => Self::PrOpenSkip,
             Qd::DispatchError => Self::Error,
             Qd::AlreadyLanded => Self::AlreadyLanded,
+            Qd::AlreadyClosed => Self::AlreadyClosed,
         })
     }
 }

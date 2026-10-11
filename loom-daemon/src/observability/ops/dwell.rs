@@ -99,6 +99,7 @@ pub fn wait_class(disposition: QueueDisposition) -> Option<WaitClass> {
         | D::OpenPr
         | D::OpenPrBackoff
         | D::AlreadyLanded
+        | D::AlreadyClosed
         | D::RecheckInterval
         | D::LabelledBlocked
         | D::Unknown => None,
