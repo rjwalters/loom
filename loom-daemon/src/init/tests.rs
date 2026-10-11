@@ -2554,7 +2554,6 @@ fn test_template_invalid_skip_warns_and_leaves_consumer_untouched() {
     );
 }
 
-// ------------------------------------------------------------------
 #[test]
 fn test_describe_config_changes_unit() {
     let before = serde_json::json!({
