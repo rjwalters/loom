@@ -360,10 +360,167 @@ fn legacy_checkpoint_means_zero_and_fresh_sweep_resets() {
     // A new lineage (Builder completion) resets deliberately.
     invoke(r, &["write", "42", "builder-done", "--pr-number", "43"]).unwrap();
     assert_eq!(route(r, "2", "1"), "route=preference\n");
-    // Without a checkpoint the policy is inactive and routes by preference.
+    // Deleting the checkpoint drops its history too.
     invoke(r, &["delete", "42"]).unwrap();
     assert_eq!(route(r, "2", "1"), "route=preference\n");
-    assert!(doctor(r, "a1", "opencode", "glm-5.3").starts_with("inactive"));
+}
+
+fn pr_only(root: &Path, args: &[&str]) -> String {
+    let mut full = vec![args[0], "-", "--pr", "43"];
+    full.extend_from_slice(&args[1..]);
+    invoke(root, &full).unwrap()
+}
+
+#[test]
+fn direct_entry_without_a_checkpoint_keeps_the_first_completed_attempt() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = dir.path();
+    set_k(r, r#"{"sweep":{"glmDoctorRejectionsBeforeEscalation":1}}"#);
+    // Mode C C1b: already-rejected PR, issue 42 has no checkpoint file yet.
+    assert!(invoke(r, &["exists", "42"]).is_err());
+    assert!(doctor(r, "a1", "opencode", "glm-5.3").starts_with("recorded glm=true"));
+    // No phase was invented to hold the state.
+    assert!(invoke(r, &["exists", "42"]).is_err());
+    assert_eq!(invoke(r, &["phase", "42"]).unwrap(), "");
+    assert_eq!(invoke(r, &["list"]).unwrap(), "");
+    // doctor-done is written after the attempt; it adopts the state.
+    invoke(
+        r,
+        &[
+            "write",
+            "42",
+            "doctor-done",
+            "--pr-number",
+            "43",
+            "--attempt",
+            "2",
+        ],
+    )
+    .unwrap();
+    assert!(reject(r, "a1").contains("escalated=true"));
+    assert!(route(r, "3", "3").starts_with("route=claude"));
+    // Cap stays authoritative.
+    assert_eq!(route(r, "3", "1"), "route=cap-exhausted\n");
+}
+
+#[test]
+fn pr_only_scope_counts_and_latches_at_k_one_and_two_across_restarts() {
+    for (k, rounds) in [(1u32, 1usize), (2, 2)] {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        set_k(r, &format!(r#"{{"sweep":{{"glmDoctorRejectionsBeforeEscalation":{k}}}}}"#));
+        for i in 0..rounds {
+            let head = format!("c{i}");
+            assert_eq!(route_pr(r, 2 + i), "route=preference\n", "k={k} i={i}");
+            assert!(pr_only(
+                r,
+                &[
+                    "doctor-attempt",
+                    "--head",
+                    &head,
+                    "--runtime",
+                    "opencode",
+                    "--profile",
+                    "glm-5.3"
+                ]
+            )
+            .starts_with("recorded glm=true"));
+            let line = pr_only(r, &["doctor-rejection", "--head", &head]);
+            assert_eq!(line.contains("escalated=true"), i + 1 == rounds, "{line}");
+            // Resume: each call is a fresh process; replay does not double count.
+            assert!(pr_only(r, &["doctor-rejection", "--head", &head]).starts_with("replay"));
+        }
+        assert!(route_pr(r, 2 + rounds).starts_with("route=claude"), "k={k}");
+        assert_eq!(invoke(r, &["list"]).unwrap(), "");
+        // Another PR is unaffected; clearing drops the history.
+        let other = invoke(
+            r,
+            &[
+                "doctor-route",
+                "-",
+                "--pr",
+                "44",
+                "--attempt",
+                "9",
+                "--cap",
+                "99",
+            ],
+        )
+        .unwrap();
+        assert_eq!(other, "route=preference\n");
+        pr_only(r, &["doctor-clear"]);
+        assert_eq!(route_pr(r, 2 + rounds), "route=preference\n");
+    }
+}
+
+fn route_pr(root: &Path, attempt: usize) -> String {
+    pr_only(
+        root,
+        &[
+            "doctor-route",
+            "--attempt",
+            &attempt.to_string(),
+            "--cap",
+            "9",
+        ],
+    )
+}
+
+#[test]
+fn builder_done_reset_discards_stale_pr_scoped_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = dir.path();
+    set_k(r, r#"{"sweep":{"glmDoctorRejectionsBeforeEscalation":1}}"#);
+    doctor(r, "a1", "opencode", "glm-5.3");
+    reject(r, "a1");
+    assert!(route(r, "2", "9").starts_with("route=claude"));
+    invoke(r, &["write", "42", "builder-done", "--pr-number", "43"]).unwrap();
+    assert_eq!(route(r, "2", "9"), "route=preference\n");
+}
+
+#[test]
+fn completed_glm_rebase_pass_followed_by_rejection_does_not_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = dir.path();
+    set_k(r, r#"{"sweep":{"glmDoctorRejectionsBeforeEscalation":1}}"#);
+    rejected(r);
+    let out = invoke(
+        r,
+        &[
+            "doctor-attempt",
+            "42",
+            "--pr",
+            "43",
+            "--head",
+            "e1",
+            "--runtime",
+            "opencode",
+            "--profile",
+            "glm-5.3",
+            "--kind",
+            "rebase",
+        ],
+    )
+    .unwrap();
+    assert!(out.contains("kind=rebase"), "{out}");
+    assert!(reject(r, "e1").contains("not-counted rebase-pass"));
+    assert_eq!(route(r, "2", "9"), "route=preference\n");
+    assert!(invoke(
+        r,
+        &[
+            "doctor-attempt",
+            "42",
+            "--pr",
+            "43",
+            "--head",
+            "e2",
+            "--runtime",
+            "x",
+            "--kind",
+            "bogus"
+        ],
+    )
+    .is_err());
 }
 
 #[test]

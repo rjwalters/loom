@@ -112,17 +112,25 @@ fn execute(root: &Path, args: &[String], out: &mut impl Write) -> Result<()> {
             | "doctor-attempt"
             | "doctor-rejection"
             | "doctor-route"
+            | "doctor-clear"
     ) {
-        return Err(invalid("usage: sweep-checkpoint doctor-attempt ISSUE --pr N --head SHA --runtime RT [--profile P]; doctor-rejection ISSUE --pr N --head SHA; doctor-route ISSUE --pr N --attempt A --cap C; write ISSUE PHASE [--task-id ID] [--pr-number N] [--attempt N] [--model M]; begin ISSUE ROLE [--attempt N] [--model M]; read/phase/attempt/model/exists/delete ISSUE; jev ISSUE TIER CONFIDENCE; list"));
+        return Err(invalid("usage: sweep-checkpoint doctor-attempt ISSUE|- --pr N --head SHA --runtime RT [--profile P] [--kind fix|rebase]; doctor-rejection ISSUE|- --pr N --head SHA; doctor-route ISSUE|- --pr N --attempt A --cap C; doctor-clear ISSUE|- --pr N; write ISSUE PHASE [--task-id ID] [--pr-number N] [--attempt N] [--model M]; begin ISSUE ROLE [--attempt N] [--model M]; read/phase/attempt/model/exists/delete ISSUE; jev ISSUE TIER CONFIDENCE; list"));
     }
     let issue_text = args.get(1).ok_or_else(|| invalid("issue is required"))?;
+    if let Some(verb) = command.strip_prefix("doctor-") {
+        // `-` means no issue scope (Mode C PR with zero/multiple closing issues).
+        let issue_target = if issue_text == "-" {
+            None
+        } else {
+            number(issue_text)?;
+            Some(dir.join(format!("issue-{issue_text}.json")))
+        };
+        return escalation::run(root, &dir, issue_target.as_deref(), verb, &args[2..], out);
+    }
     let issue = number(issue_text)?;
     let target = dir.join(format!("issue-{issue_text}.json"));
     if command == "jev" {
         return patch_jev(&target, args.get(2), args.get(3));
-    }
-    if let Some(verb) = command.strip_prefix("doctor-") {
-        return escalation::run(root, &target, verb, &args[2..], out);
     }
     if command == "begin" {
         // Telemetry only (#9935): the checkpoint file, which drives resume,

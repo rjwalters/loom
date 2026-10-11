@@ -43,7 +43,7 @@ fn glm_is_judged_from_the_actual_launch_report() {
 }
 
 fn glm_attempt(s: &mut State, head: &str) {
-    record_doctor(s, 7, head, true);
+    record_doctor(s, 7, head, true, false);
 }
 
 #[test]
@@ -99,7 +99,7 @@ fn non_qualifying_rejections_do_not_advance() {
         Rejection::NotQualifying("no-completed-doctor-attempt")
     );
     // A Claude attempt's rejection never counts.
-    record_doctor(&mut s, 7, "c", false);
+    record_doctor(&mut s, 7, "c", false, false);
     assert_eq!(
         record_rejection(&mut s, 7, "c", 1),
         Rejection::NotQualifying("attempt-not-on-glm")
@@ -137,7 +137,7 @@ fn latch_survives_a_claude_attempt_and_stays_on_claude() {
     let mut s = State::default();
     glm_attempt(&mut s, "a");
     record_rejection(&mut s, 7, "a", 1);
-    record_doctor(&mut s, 7, "c", false);
+    record_doctor(&mut s, 7, "c", false, false);
     record_rejection(&mut s, 7, "c", 1);
     assert!(matches!(route(&s, 7, 4, 9), Route::Claude { .. }));
 }
@@ -148,7 +148,7 @@ fn another_prs_latch_does_not_apply_and_new_pr_resets() {
     glm_attempt(&mut s, "a");
     record_rejection(&mut s, 7, "a", 1);
     assert_eq!(route(&s, 8, 2, 9), Route::Preference);
-    record_doctor(&mut s, 8, "x", true);
+    record_doctor(&mut s, 8, "x", true, false);
     assert_eq!((s.pr, s.rejections, s.escalated), (8, 0, false));
 }
 
@@ -156,4 +156,21 @@ fn another_prs_latch_does_not_apply_and_new_pr_resets() {
 fn legacy_state_json_means_zero() {
     let s: State = serde_json::from_value(json!({})).unwrap();
     assert_eq!(s, State::default());
+}
+
+#[test]
+fn rebase_pass_rejection_never_counts() {
+    let mut s = State::default();
+    record_doctor(&mut s, 7, "r1", true, true);
+    assert_eq!(record_rejection(&mut s, 7, "r1", 1), Rejection::NotQualifying("rebase-pass"));
+    assert_eq!((s.rejections, s.escalated), (0, false));
+    // A later feedback fix on GLM counts again.
+    record_doctor(&mut s, 7, "f1", true, false);
+    assert!(matches!(
+        record_rejection(&mut s, 7, "f1", 1),
+        Rejection::Counted {
+            count: 1,
+            escalated: true
+        }
+    ));
 }

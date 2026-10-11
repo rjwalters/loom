@@ -59,6 +59,10 @@ pub struct State {
     /// Whether that attempt actually ran on GLM.
     #[serde(default)]
     pub last_doctor_glm: bool,
+    /// Whether that attempt was a conflict-only rebase pass rather than an
+    /// answer to Judge feedback. Absent (legacy) means feedback.
+    #[serde(default)]
+    pub last_doctor_rebase: bool,
     /// Qualifying rejections so far.
     #[serde(default)]
     pub rejections: u32,
@@ -72,8 +76,9 @@ pub struct State {
     pub reason: Option<String>,
 }
 
-/// A completed Doctor attempt produced `head` on the given runtime.
-pub fn record_doctor(state: &mut State, pr: u64, head: &str, glm: bool) {
+/// A completed Doctor attempt produced `head` on the given runtime. A
+/// conflict-only `rebase` pass is recorded but its rejection never counts.
+pub fn record_doctor(state: &mut State, pr: u64, head: &str, glm: bool, rebase: bool) {
     if state.pr != pr {
         *state = State {
             pr,
@@ -82,6 +87,7 @@ pub fn record_doctor(state: &mut State, pr: u64, head: &str, glm: bool) {
     }
     state.last_doctor_head = Some(head.to_owned());
     state.last_doctor_glm = glm;
+    state.last_doctor_rebase = rebase;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,6 +105,9 @@ pub fn record_rejection(state: &mut State, pr: u64, head: &str, k: u32) -> Rejec
     }
     if state.last_doctor_head.as_deref() != Some(head) {
         return Rejection::NotQualifying("stale-or-unrelated-head");
+    }
+    if state.last_doctor_rebase {
+        return Rejection::NotQualifying("rebase-pass");
     }
     if !state.last_doctor_glm {
         return Rejection::NotQualifying("attempt-not-on-glm");
