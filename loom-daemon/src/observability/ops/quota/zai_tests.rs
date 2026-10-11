@@ -205,3 +205,61 @@ async fn fetch_timeout_is_a_timeout_error() {
     assert_eq!(err, ZaiError::Timeout);
     server.abort();
 }
+
+// --- real, sanitized responses captured live (2026-10-11) ------------------
+//
+// Verbatim bodies from `GET /api/monitor/usage/quota/limit`, sanitized (no key,
+// no account id): a `max` seat at 5h 336/28000 and weekly 5515/140000, and the
+// rejection a bad key receives. They pin the production parser to the shape
+// the endpoint actually serves, not to a hand-written approximation of it.
+
+const REAL_SUCCESS: &str = include_str!("../../../../tests/fixtures/zai_quota/real-success.json");
+const REAL_AUTH_ERROR: &str =
+    include_str!("../../../../tests/fixtures/zai_quota/real-auth-error.json");
+
+#[test]
+fn real_success_response_parses_both_windows() {
+    let q = parse_quota(REAL_SUCCESS).unwrap();
+    let five = q.five_hour.unwrap();
+    let week = q.weekly.unwrap();
+    assert_eq!(five.fraction, Some(336.0 / 28000.0));
+    assert_eq!(five.resets_at, at(1_791_711_252_743));
+    assert_eq!(week.fraction, Some(5515.0 / 140_000.0));
+    assert_eq!(week.resets_at, at(1_791_746_700_984));
+
+    let row = account_state("turian-gmail", Some(&q), false, None);
+    assert_eq!(row.provider, "zai");
+    assert_eq!(row.usage_fraction, Some(336.0 / 28000.0));
+    assert_eq!(row.usage_fraction_weekly, Some(5515.0 / 140_000.0));
+    assert!(!row.exhausted);
+    assert_eq!(row.limit_window_reset_at, at(1_791_711_252_743));
+}
+
+#[test]
+fn real_auth_error_response_is_rejected_and_unknown() {
+    assert_eq!(parse_quota(REAL_AUTH_ERROR), Err(ZaiError::Rejected));
+    let mut cache = ZaiCache::default();
+    let t0 = Instant::now();
+    cache.store("seat", t0, parse_quota(REAL_AUTH_ERROR));
+    assert_eq!(cache.cached("seat", t0), Some(None), "unknown, never 0");
+    let row = account_state("seat", None, false, None);
+    assert_eq!(row.usage_fraction, None);
+    assert_eq!(row.usage_fraction_weekly, None);
+    assert!(!row.exhausted);
+}
+
+#[tokio::test]
+async fn real_responses_through_the_fetch_path() {
+    let (url, _server) = serve_once(Some(http("200 OK", REAL_SUCCESS))).await;
+    let q = fetch_from(&client(Duration::from_secs(5)), &url, "fake-zai-key-abc123")
+        .await
+        .unwrap();
+    assert_eq!(q.five_hour.unwrap().fraction, Some(336.0 / 28000.0));
+    assert_eq!(q.weekly.unwrap().fraction, Some(5515.0 / 140_000.0));
+
+    let (url, _server) = serve_once(Some(http("200 OK", REAL_AUTH_ERROR))).await;
+    let err = fetch_from(&client(Duration::from_secs(5)), &url, "fake-zai-key-abc123")
+        .await
+        .unwrap_err();
+    assert_eq!(err, ZaiError::Rejected);
+}
