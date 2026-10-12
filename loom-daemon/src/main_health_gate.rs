@@ -101,6 +101,10 @@ use owned_paths::{
     LOOM_OWNED_PREFIXES,
 };
 
+// `WorkspaceHealthStates::find` (#11565) lives in its own sibling module for
+// the same reason: this file is frozen by the file-size ratchet.
+mod workspace_find;
+
 /// Ceiling for a `git` invocation made by the main-health gate.
 ///
 /// Covers `git fetch`, which reaches the network — generous enough for a slow
@@ -690,27 +694,6 @@ impl WorkspaceHealthStates {
         map.entry(root.to_path_buf())
             .or_insert_with(|| Arc::new(MainHealthState::new()))
             .clone()
-    }
-
-    /// `root`'s [`MainHealthState`] if the gate has ever seen it, else `None`
-    /// (#11565). Tries the exact key first, then falls back to comparing
-    /// canonical paths, so a reader whose root differs from the gate loop's
-    /// only by a symlink, `..` or trailing slash (the registry stores
-    /// normalized roots, the workspace pool keys by the caller's literal
-    /// value) still finds the state. Never creates an entry.
-    #[must_use]
-    pub fn find(&self, root: &Path) -> Option<Arc<MainHealthState>> {
-        let map = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(s) = map.get(root) {
-            return Some(s.clone());
-        }
-        let wanted = std::fs::canonicalize(root).ok()?;
-        map.iter()
-            .find(|(k, _)| std::fs::canonicalize(k).is_ok_and(|c| c == wanted))
-            .map(|(_, s)| s.clone())
     }
 
     /// Whether `root`'s dispatch is currently halted. A never-seen root is
