@@ -302,9 +302,6 @@ pub struct WorkItem {
     /// last-dispatch clock. `None` (a synthetic item, or a listing without
     /// timestamps) simply disables the recheck-interval check for that item.
     pub updated_at: Option<String>,
-    /// Set by `star_liveness` (#11104) when this issue blocks a starred
-    /// issue. Dispatch never reads it (#11508).
-    pub operator_priority_inherited_from: Option<u32>,
     /// Who filed the issue, when the listing supplied it (#10118). Only a
     /// trusted author's red-main-fix marker admits an unpromoted row (#9548);
     /// `None` (a synthetic item) is never trusted. See [`main_red_fix`].
@@ -330,7 +327,6 @@ impl WorkItem {
             created_at,
             body: None,
             updated_at: None,
-            operator_priority_inherited_from: None,
             author: None,
             open_sub_issues: None,
         }

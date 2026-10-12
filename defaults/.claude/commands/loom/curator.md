@@ -1363,7 +1363,7 @@ If you discover dependencies during curation:
 This issue requires [dependency] to be implemented first.
 ```
 
-Only then park it with `park-record apply` (#10152): it writes the **body** park record, then adds `loom:blocked` — what `check-stale-blocked` (#8927), star-liveness, the unblock sweep and `merge-pr.sh` read; not comments. It refuses a closed blocker (#9102: your re-check below would unblock it). No open numbered blocker? Pass `--reason "<why>"`; never invent one.
+Only then park it with `park-record apply` (#10152): it writes the **body** park record, then adds `loom:blocked` — what `check-stale-blocked` (#8927), the unblock sweep and `merge-pr.sh` read; not comments. It refuses a closed blocker (#9102: your re-check below would unblock it). No open numbered blocker? Pass `--reason "<why>"`; never invent one.
 ```bash
 loom-daemon park-record apply --issue <number> --blocked-by <N> --by curator
 ```
