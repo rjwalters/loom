@@ -418,6 +418,70 @@ fn is_zero(n: &u8) -> bool {
     *n == 0
 }
 
+/// Why a PR under review cannot merge yet, as `fleet.state` reports it
+/// (Issue #11644). A single rollup of the row's own label-derived fields
+/// (`stage`, `hold_kind` / `holds`, `conflict`, `ci_fail`) — never a new forge
+/// read. Only ever set on a PR row (`review_wait` / `doctor` / `merge_wait` /
+/// `merge_hold`); absent on a `ready_wait` or sweep (`sweep.curator` /
+/// `sweep.builder`) row.
+///
+/// A closed, label-knowable set with a defined precedence (strongest first):
+/// `operator_hold`, then `sequenced`, `conflict`, `ci_red`,
+/// `changes_requested`, `approval_pending`, and finally `ready`. The emitter
+/// reads labels only, so it cannot tell `ci_pending` (needs
+/// `statusCheckRollup`) or `base_stale` (needs
+/// `mergeStateStatus`) without a per-PR GraphQL read; those are deliberately
+/// not represented here. For the same reason Champion's merge-risk hold
+/// (`loom:operator` + a comment marker the emitter does not read) collapses
+/// into `operator_hold` rather than a distinct reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeBlockedReason {
+    /// Approved (`loom:pr`) with no hold or flag: nothing blocks the merge.
+    Ready,
+    /// Under review (`review_wait`), not yet judged.
+    ApprovalPending,
+    /// Judge requested changes (`doctor` / `loom:changes-requested`).
+    ChangesRequested,
+    /// `loom:ci-failure` on the PR.
+    CiRed,
+    /// `loom:merge-conflict` on the PR.
+    Conflict,
+    /// `loom:sequenced`: approved, but ordered behind another PR.
+    Sequenced,
+    /// Any operator/`loom:blocked` hold (incl. Champion's marker-refined
+    /// `merge_risk` / `critical_file` / `ac_hold`, indistinguishable from
+    /// labels alone) on the PR.
+    OperatorHold,
+}
+
+impl MergeBlockedReason {
+    /// Every reason, strongest precedence last.
+    pub const ALL: [MergeBlockedReason; 7] = [
+        MergeBlockedReason::Ready,
+        MergeBlockedReason::ApprovalPending,
+        MergeBlockedReason::ChangesRequested,
+        MergeBlockedReason::CiRed,
+        MergeBlockedReason::Conflict,
+        MergeBlockedReason::Sequenced,
+        MergeBlockedReason::OperatorHold,
+    ];
+
+    /// The wire name.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MergeBlockedReason::Ready => "ready",
+            MergeBlockedReason::ApprovalPending => "approval_pending",
+            MergeBlockedReason::ChangesRequested => "changes_requested",
+            MergeBlockedReason::CiRed => "ci_red",
+            MergeBlockedReason::Conflict => "conflict",
+            MergeBlockedReason::Sequenced => "sequenced",
+            MergeBlockedReason::OperatorHold => "operator_hold",
+        }
+    }
+}
+
 /// One `(repo, issue)` as this host sees it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FleetStateRow {
@@ -510,6 +574,12 @@ pub struct FleetStateRow {
     /// `blocked`, `sequenced`, `other`. Absent = none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub holds: Vec<String>,
+    /// Why this PR row cannot merge yet (#11644), a rollup of the row's own
+    /// label-derived fields. Set only on a PR row (`review_wait` / `doctor` /
+    /// `merge_wait` / `merge_hold`); absent on `ready_wait` / sweep rows and
+    /// on an older emitter. No extra forge read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_blocked_reason: Option<MergeBlockedReason>,
     /// `ready_wait` only (#11564): the instant the time-boxed hold named by
     /// `eligible_reason` ends, as the work finder computed it on its last
     /// tick. Absent when no clock holds the item, when the hold has no clock
@@ -553,6 +623,7 @@ impl FleetStateRow {
             conflict: false,
             ci_fail: false,
             holds: Vec::new(),
+            merge_blocked_reason: None,
             eligible_at: None,
             eligible_reason: None,
         }
