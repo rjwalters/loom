@@ -83,7 +83,8 @@ else
     sed 's/^/    /' "$WOT/update.log" | tail -15
 fi
 TESTS_RUN=$((TESTS_RUN + 1))
-if "$INSTALLEDOT" --version 2>/dev/null | grep -q deadbee; then
+installed_ver="$("$INSTALLEDOT" --version 2>/dev/null)"
+if [[ "$installed_ver" == *deadbee* ]]; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "${GREEN}✓${NC} refused OTLP-less build did NOT replace the installed binary"
 else
