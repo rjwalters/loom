@@ -505,3 +505,258 @@ fn empty_credential_value_is_refused() {
     };
     assert!(finish_credential(output, "aws ssm get-parameter").is_err());
 }
+
+/// A sender that, like the live [`OtlpProbeSender`], reads the headers file
+/// only when the probe is sent — and snapshots what it found there.
+#[derive(Debug)]
+struct HeadersSnapshotSender {
+    path: std::path::PathBuf,
+    seen: std::sync::Mutex<Option<std::io::Result<String>>>,
+}
+
+impl ProbeSender for HeadersSnapshotSender {
+    async fn send_probe(&self, _envelope: &TelemetryEnvelope) -> Result<ProbeAck, JoinError> {
+        *self.seen.lock().unwrap() = Some(std::fs::read_to_string(&self.path));
+        Ok(ProbeAck::Accepted)
+    }
+}
+
+/// #11628 review (blocking): at send time the headers file exists and holds
+/// the token `join()` just fetched — on a clean host (no file before the run)
+/// and on a re-run over a previous run's stale token.
+#[tokio::test]
+#[serial]
+async fn headers_file_holds_the_fresh_token_at_send_time() {
+    let _guard = HostGuard::at("this-host");
+    for stale in [
+        None,
+        Some("Authorization: Bearer stale-token-from-last-run\n"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = plan_at(dir.path(), "this-host");
+        if let Some(stale) = stale {
+            std::fs::write(&plan.headers_path, stale).unwrap();
+        } else {
+            assert!(!plan.headers_path.exists());
+        }
+        let credential = FakeCredential {
+            recorder: Recorder::default(),
+            token: TOKEN.to_string(),
+        };
+        let sender = HeadersSnapshotSender {
+            path: plan.headers_path.clone(),
+            seen: std::sync::Mutex::new(None),
+        };
+        let mut reader = FakeReader::always(vec![ProbeRow {
+            host_id: Some("this-host".into()),
+            ingest_principal: Some("this-host".into()),
+        }]);
+        join(&plan, deps(&credential, &sender, &mut reader))
+            .await
+            .unwrap();
+        let seen = sender.seen.lock().unwrap().take().expect("probe was sent");
+        let text = seen.expect("the headers file exists at send time");
+        assert_eq!(text, format!("Authorization: Bearer {TOKEN}\n"), "stale={stale:?}");
+    }
+}
+
+/// #11628 review: only 401/403 are "credential refused"; every other status
+/// is reported as a server/transport failure, never as a bad token.
+#[test]
+fn only_401_and_403_are_credential_refusals() {
+    for status in [401, 403] {
+        let error = send_failure(Some(status), "ignored");
+        assert_eq!(error, JoinError::ProbeRejected { status });
+        assert!(error.to_string().contains("credential refused"));
+    }
+    for status in [400_u16, 404, 407, 413, 429, 500, 502, 503, 504] {
+        let error = send_failure(Some(status), "ignored");
+        let rendered = error.to_string();
+        assert!(matches!(error, JoinError::ProbeTransport(_)), "{status}: {error:?}");
+        assert!(rendered.contains(&format!("OTLP HTTP {status}")), "{rendered}");
+        assert!(rendered.contains("not a credential refusal"), "{rendered}");
+    }
+    assert_eq!(
+        send_failure(None, "OTLP request timed out"),
+        JoinError::ProbeTransport("OTLP request timed out".into())
+    );
+}
+
+/// A one-status loopback OTLP receiver recording each request's
+/// `Authorization` header, for driving the *live* [`OtlpProbeSender`].
+#[cfg(feature = "otlp")]
+struct AuthSink {
+    addr: std::net::SocketAddr,
+    auth: std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    shutdown: std::sync::Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(feature = "otlp")]
+impl AuthSink {
+    fn answering(status: u16) -> Self {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let auth = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let shutdown = std::sync::Arc::new(AtomicBool::new(false));
+        let (seen, stop) = (auth.clone(), shutdown.clone());
+        let handle = std::thread::spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                };
+                stream.set_nonblocking(false).ok();
+                stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let header_end = loop {
+                    let Ok(n) = stream.read(&mut chunk) else {
+                        break None;
+                    };
+                    if n == 0 {
+                        break None;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break Some(pos + 4);
+                    }
+                };
+                let Some(header_end) = header_end else {
+                    continue;
+                };
+                let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
+                let header = |name: &str| {
+                    head.lines().find_map(|line| {
+                        let (key, value) = line.split_once(':')?;
+                        key.trim()
+                            .eq_ignore_ascii_case(name)
+                            .then(|| value.trim().to_string())
+                    })
+                };
+                let length: usize = header("content-length")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                while buf.len() < header_end + length {
+                    match stream.read(&mut chunk) {
+                        Ok(n) if n > 0 => buf.extend_from_slice(&chunk[..n]),
+                        _ => break,
+                    }
+                }
+                // Record before answering, so a caller that saw the response
+                // also sees the request (#7256).
+                seen.lock().unwrap().push(header("authorization"));
+                let body = "{}";
+                let response = format!(
+                    "HTTP/1.1 {status} response\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        Self {
+            addr,
+            auth,
+            shutdown,
+            handle: Some(handle),
+        }
+    }
+
+    fn base_url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    fn auth_headers(&self) -> Vec<Option<String>> {
+        self.auth.lock().unwrap().clone()
+    }
+}
+
+#[cfg(feature = "otlp")]
+impl Drop for AuthSink {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// #11628 review (blocking), end to end through the production sender: the
+/// sender is built *before* `join()` (as `run()` does), yet the request on
+/// the wire carries the freshly fetched token — on a clean host with no
+/// headers file, and on a re-run whose file still holds a stale token.
+#[cfg(feature = "otlp")]
+#[tokio::test]
+#[serial]
+async fn live_sender_sends_the_fresh_token_on_clean_host_and_rerun() {
+    let _guard = HostGuard::at("this-host");
+    for stale in [
+        None,
+        Some("Authorization: Bearer stale-token-from-last-run\n"),
+    ] {
+        let sink = AuthSink::answering(200);
+        let dir = tempfile::tempdir().unwrap();
+        let mut plan = plan_at(dir.path(), "this-host");
+        plan.endpoint = sink.base_url();
+        if let Some(stale) = stale {
+            std::fs::write(&plan.headers_path, stale).unwrap();
+        }
+        // Constructed before the file exists / is refreshed — must not read it.
+        let sender = OtlpProbeSender::new(plan.endpoint.clone(), plan.headers_path.clone());
+        let credential = FakeCredential {
+            recorder: Recorder::default(),
+            token: TOKEN.to_string(),
+        };
+        let mut reader = FakeReader::always(vec![ProbeRow {
+            host_id: Some("this-host".into()),
+            ingest_principal: Some("this-host".into()),
+        }]);
+        join(&plan, deps(&credential, &sender, &mut reader))
+            .await
+            .unwrap_or_else(|e| panic!("stale={stale:?}: {e}"));
+        assert_eq!(sink.auth_headers(), vec![Some(format!("Bearer {TOKEN}"))], "stale={stale:?}");
+    }
+}
+
+/// #11628 review: through the live sender, 401/403 are `ProbeRejected`;
+/// 429 and 5xx are reported as server/transport failures.
+#[cfg(feature = "otlp")]
+#[tokio::test]
+#[serial]
+async fn live_sender_classifies_receiver_statuses() {
+    let _guard = HostGuard::at("this-host");
+    for (status, rejected) in [
+        (401, true),
+        (403, true),
+        (429, false),
+        (500, false),
+        (503, false),
+    ] {
+        let sink = AuthSink::answering(status);
+        let dir = tempfile::tempdir().unwrap();
+        let mut plan = plan_at(dir.path(), "this-host");
+        plan.endpoint = sink.base_url();
+        let sender = OtlpProbeSender::new(plan.endpoint.clone(), plan.headers_path.clone());
+        let credential = FakeCredential {
+            recorder: Recorder::default(),
+            token: TOKEN.to_string(),
+        };
+        let mut reader = FakeReader::always(vec![]);
+        let error = join(&plan, deps(&credential, &sender, &mut reader))
+            .await
+            .unwrap_err();
+        let rendered = error.to_string();
+        if rejected {
+            assert_eq!(error, JoinError::ProbeRejected { status });
+        } else {
+            assert!(matches!(error, JoinError::ProbeTransport(_)), "{status}: {error:?}");
+            assert!(!rendered.contains("credential refused"), "{rendered}");
+        }
+        assert!(rendered.contains(&status.to_string()), "{rendered}");
+        assert!(!rendered.contains(TOKEN), "token leaked: {rendered}");
+        assert_eq!(reader.calls.load(Ordering::SeqCst), 0, "no read-back after a failed send");
+    }
+}

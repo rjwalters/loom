@@ -103,9 +103,11 @@ pub enum JoinError {
     HeadersWrite(String),
     /// This binary was built without the `otlp` Cargo feature.
     NoOtlpFeature,
-    /// The receiver refused the probe's authorization, naming the status.
+    /// The receiver refused the probe's authorization — `401`/`403` only
+    /// (see [`send_failure`]), naming the status.
     ProbeRejected { status: u16 },
-    /// The probe could not be sent (transport failure).
+    /// The probe could not be sent: a transport failure, or a non-auth HTTP
+    /// status (429, 5xx, …) that says nothing about the credential.
     ProbeTransport(String),
     /// No row matching the probe appeared within the deadline.
     ProbeTimeout { seconds: u64 },
@@ -387,13 +389,80 @@ pub enum ProbeAck {
     Accepted,
 }
 
-/// Sends the probe record over the provisioned OTLP path. Deliberately not
-/// `Debug`: a live sender holds credential material (`OtlpExporter` is not
-/// `Debug` on purpose).
+/// Map one failed probe send to its terminal [`JoinError`]. Only `401`/`403`
+/// — the receiver refusing *this* authorization — are
+/// [`JoinError::ProbeRejected`] ("credential refused"). Any other HTTP status
+/// (429 throttling, 5xx, 4xx shape errors) is reported as what it is, a
+/// server/transport failure, so an outage is never blamed on a good token.
+/// `status` is the receiver's HTTP status when it answered at all; `detail`
+/// is the transport's own (token-free) wording for the no-status case.
+#[must_use]
+pub fn send_failure(status: Option<u16>, detail: &str) -> JoinError {
+    match status {
+        Some(status @ (401 | 403)) => JoinError::ProbeRejected { status },
+        Some(status) => JoinError::ProbeTransport(format!(
+            "OTLP HTTP {status} from the receiver (a server/transport failure, not a \
+             credential refusal — retry later or check the endpoint)"
+        )),
+        None => JoinError::ProbeTransport(detail.to_string()),
+    }
+}
+
+/// The live probe transport: the same `OtlpExporter` the daemon's exporter
+/// task uses. Construction does no I/O — the exporter (which loads the
+/// headers file) is built inside [`ProbeSender::send_probe`], and [`join`]
+/// only calls that after it has fetched the token and written the file. So a
+/// clean host (no file yet) can join, and a re-run never sends with a stale
+/// token left by a previous run (#11628 review). The ingest-key slot stays
+/// empty on purpose: the file's `Authorization` replaces the Bearer header,
+/// so no key exists anywhere in this command.
+#[cfg(feature = "otlp")]
+#[derive(Debug, Clone)]
+pub struct OtlpProbeSender {
+    endpoint: String,
+    headers_file: PathBuf,
+}
+
+#[cfg(feature = "otlp")]
+impl OtlpProbeSender {
+    /// A sender for `endpoint` that will read `headers_file` at send time.
+    #[must_use]
+    pub fn new(endpoint: impl Into<String>, headers_file: impl Into<PathBuf>) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            headers_file: headers_file.into(),
+        }
+    }
+}
+
+#[cfg(feature = "otlp")]
+impl ProbeSender for OtlpProbeSender {
+    async fn send_probe(&self, envelope: &TelemetryEnvelope) -> Result<ProbeAck, JoinError> {
+        use crate::observability::exporter::Exporter as _;
+        use crate::observability::otlp::{rejected_status, OtlpExporter};
+        let headers_file = self.headers_file.display().to_string();
+        let exporter = OtlpExporter::with_headers_file(
+            self.endpoint.clone(),
+            String::new(),
+            Some(&headers_file),
+        )
+        .map_err(|e| JoinError::HeadersWrite(format!("cannot load at send time: {e}")))?;
+        let outcome = exporter
+            .emit_batch_outcome(std::slice::from_ref(envelope))
+            .await;
+        match outcome.error {
+            Some(error) => Err(send_failure(rejected_status(&error), &error.to_string())),
+            None => Ok(ProbeAck::Accepted),
+        }
+    }
+}
+
+/// Sends the probe record over the provisioned OTLP path. Not `Debug` as a
+/// trait bound: a sender may hold credential material.
 pub trait ProbeSender {
-    /// Send one envelope. A credential refusal is
+    /// Send one envelope. A credential refusal (`401`/`403`) is
     /// [`JoinError::ProbeRejected`] (naming the status); any other send
-    /// failure is [`JoinError::ProbeTransport`].
+    /// failure is [`JoinError::ProbeTransport`] — see [`send_failure`].
     ///
     /// # Errors
     ///
@@ -554,7 +623,8 @@ pub async fn join<S: ProbeSender + Sync>(
     write_headers_file(&plan.headers_path, &token)?;
 
     // (d) One probe `host.export` record, sent over the OTLP path the file
-    // provisions.
+    // provisions. The sender reads the headers file only now, after (c)
+    // wrote the fresh token — never at construction (#11628 review).
     let record = HostExportRecord {
         captured_at: Utc::now(),
         host: plan.host.clone(),

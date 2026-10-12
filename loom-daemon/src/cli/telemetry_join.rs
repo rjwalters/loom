@@ -29,7 +29,7 @@ use loom_daemon::observability::endpoint_policy;
 use loom_daemon::signoz_read::{EndpointConfig, TelemetryReader};
 #[cfg(feature = "otlp")]
 use loom_daemon::telemetry_join::{
-    self, JoinDeps, JoinPlan, ReaderProbe, DEFAULT_HEADERS_PATH, PROBE_QUERY,
+    self, JoinDeps, JoinPlan, OtlpProbeSender, ReaderProbe, DEFAULT_HEADERS_PATH, PROBE_QUERY,
 };
 
 #[derive(clap::Args)]
@@ -141,8 +141,9 @@ impl JoinArgs {
         };
         let credential = telemetry_join::credential_source(&spec, self.age_identity.as_deref());
         let headers_path = self.headers_path()?;
-        let sender =
-            OtlpProbeSender::build(self.endpoint.clone(), headers_path.display().to_string())?;
+        // I/O-free: the exporter is built inside `send_probe`, after `join()`
+        // has written the fresh headers file (a clean host has none yet).
+        let sender = OtlpProbeSender::new(self.endpoint.clone(), headers_path.clone());
         let mut reader = self.reader()?;
         let plan = JoinPlan {
             host: self.host.clone(),
@@ -175,58 +176,6 @@ impl JoinArgs {
             })
         );
         Ok(())
-    }
-}
-
-/// The live probe transport: the same `OtlpExporter` the daemon's exporter
-/// task uses, built against the just-written headers file. The ingest key
-/// slot stays empty on purpose — the file's `Authorization` replaces the
-/// Bearer header, so no key exists anywhere in this command.
-#[cfg(feature = "otlp")]
-struct OtlpProbeSender {
-    exporter: loom_daemon::observability::otlp::OtlpExporter,
-}
-
-#[cfg(feature = "otlp")]
-impl std::fmt::Debug for OtlpProbeSender {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OtlpProbeSender").finish_non_exhaustive()
-    }
-}
-
-#[cfg(feature = "otlp")]
-impl OtlpProbeSender {
-    fn build(endpoint: String, headers_file: String) -> Result<Self> {
-        use loom_daemon::observability::otlp::OtlpExporter;
-        let exporter =
-            OtlpExporter::with_headers_file(endpoint, String::new(), Some(&headers_file))
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-        Ok(Self { exporter })
-    }
-}
-
-#[cfg(feature = "otlp")]
-impl loom_daemon::telemetry_join::ProbeSender for OtlpProbeSender {
-    async fn send_probe(
-        &self,
-        envelope: &loom_daemon::telemetry::TelemetryEnvelope,
-    ) -> std::result::Result<
-        loom_daemon::telemetry_join::ProbeAck,
-        loom_daemon::telemetry_join::JoinError,
-    > {
-        use loom_daemon::observability::exporter::Exporter;
-        use loom_daemon::telemetry_join::{JoinError, ProbeAck};
-        let outcome = self
-            .exporter
-            .emit_batch_outcome(std::slice::from_ref(envelope))
-            .await;
-        if let Some(error) = outcome.error {
-            if let Some(status) = loom_daemon::observability::otlp::rejected_status(&error) {
-                return Err(JoinError::ProbeRejected { status });
-            }
-            return Err(JoinError::ProbeTransport(error.to_string()));
-        }
-        Ok(ProbeAck::Accepted)
     }
 }
 

@@ -338,8 +338,10 @@ file; the `headers_file` parser must accept it), sends one `host.export` probe t
 `--endpoint` (default `https://otlp-cf.2amlogic.com`), and polls the
 telemetry-reader (`--reader-url`) until the row shows
 `host.id == harness.ingest.principal == <roster-id>` (`--timeout`, default 60 s).
-Failures exit non-zero with a distinct reason: credential fetch, `OTLP HTTP 401/403`,
-identity mismatch, probe never arrived, reader unavailable. The token is never
+Failures exit non-zero with a distinct reason: credential fetch, `OTLP HTTP 401/403`
+(credential refused), any other status such as 429/5xx (a server/transport failure,
+never blamed on the token), identity mismatch, probe never arrived, reader
+unavailable. The headers file is read only at send time, after it is written. The token is never
 printed. Needs the `otlp` feature. `--probe-sql` overrides the read-back query if
 the store keeps the principal elsewhere.
 
