@@ -306,7 +306,6 @@ mod tests {
             workspace_priority: 100,
             urgent: false,
             operator_priority: rank == 1,
-            operator_priority_at: None,
             main_red_fix: false,
             created_at: None,
             tier: None,

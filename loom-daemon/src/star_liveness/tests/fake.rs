@@ -451,7 +451,6 @@ pub fn tick_row(
         workspace_priority: 100,
         urgent: false,
         operator_priority: true,
-        operator_priority_at: None,
         main_red_fix: false,
         created_at: None,
         tier: None,

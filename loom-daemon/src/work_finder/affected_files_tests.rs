@@ -181,50 +181,127 @@ fn identical_paths_in_different_repos_do_not_defer() {
     assert_eq!(ws[1].1.dispatched, vec![2]);
 }
 
+/// #11508 (operator ruling): priority never exempts a candidate from the
+/// overlap gate. A `loom:very-important` candidate sharing `a.rs` with an
+/// in-flight sweep is deferred exactly like a plain one; the plain candidate
+/// behind it on a free surface is dispatched.
 #[test]
-fn starred_candidate_is_never_deferred_but_still_occupies() {
+fn a_very_important_candidate_is_deferred_by_the_overlap_gate_like_any_other() {
     let items = vec![
         item(9, Some(body(&["a.rs"])), Some("loom:building")),
         item(1, Some(body(&["b.rs"])), None),
-        item(2, Some(body(&["a.rs", "b.rs"])), Some("loom:operator-priority")),
+        item(2, Some(body(&["a.rs", "b.rs"])), Some("loom:very-important")),
     ];
     let mut disp = Disp::default();
     disp.in_flight.insert(9);
     let mut ws = [(Src(Some(items)), disp)];
     let report = run(&mut ws);
-    assert_eq!(ws[0].1.dispatched, vec![2], "the star ignores the occupied `a.rs`");
-    let (d, detail) = row(&report, 1).unwrap();
-    assert_eq!(d, Qd::DeferredFileOverlap, "the admitted star occupies `b.rs`");
-    let detail = detail.unwrap();
-    assert!(detail.contains("b.rs") && !detail.contains("a.rs"), "{detail}");
+    assert_eq!(ws[0].1.dispatched, vec![1]);
+    let (d, detail) = row(&report, 2).unwrap();
+    assert_eq!(d, Qd::DeferredFileOverlap, "very-important waits on the occupied `a.rs`");
+    assert!(detail.unwrap().contains("a.rs"));
 }
 
-fn cand(number: u32, operator_priority: bool, main_red_fix: bool) -> PriorityCandidate {
+fn cand(number: u32, level: crate::priority_pick::Level) -> PriorityCandidate {
     PriorityCandidate {
         workspace_idx: 0,
         workspace_priority: 0,
-        operator_level: u8::from(operator_priority),
-        operator_priority,
-        operator_priority_at: None,
-        main_red_fix,
         created_at: None,
         number,
-        level: crate::priority_pick::Level::default(),
+        level,
+        main_red_fix: false,
         complexity: None,
     }
 }
 
 #[test]
-fn red_main_fix_is_never_deferred_but_still_occupies() {
+fn the_gate_reports_overlap_for_every_level() {
+    use crate::priority_pick::Level;
     let mut gate = OverlapGate::default();
     gate.note(0, 9, Some(&body(&["a.rs"])), true);
     gate.note(0, 1, Some(&body(&["a.rs", "b.rs"])), false);
     gate.note(0, 2, Some(&body(&["b.rs"])), false);
-    let fix = cand(1, false, true);
-    assert!(gate.overlapping(&fix).is_empty(), "red-main fix bypasses the gate");
-    assert_eq!(gate.overlapping(&cand(1, false, false)), vec!["a.rs"], "control");
+    for level in [Level::Default, Level::Important, Level::VeryImportant] {
+        assert_eq!(gate.overlapping(&cand(1, level)), vec!["a.rs"], "{level:?}");
+    }
+    gate.occupy(&cand(1, Level::VeryImportant));
+    assert_eq!(gate.overlapping(&cand(2, Level::Default)), vec!["b.rs"]);
+}
+
+fn red_fix(n: u32, paths: &[&str]) -> WorkItem {
+    let body = format!("{}\n<!-- loom:main-red-fix -->\n", body(paths));
+    item(n, Some(body), None)
+}
+
+fn run_lane(workspaces: &mut [(Src, Disp)], halted: bool, lane: RedMainLane) -> TickReport {
+    tick_multi_with_repo_cap(
+        workspaces,
+        &[0],
+        10.into(),
+        &[halted],
+        None,
+        usize::MAX,
+        false,
+        None,
+        None,
+        &[lane],
+    )
+}
+
+/// #11508 (Judge): the red-main-fix lane (#9244) is not a priority, so it
+/// keeps its overlap bypass. On a verified-red `main` the in-flight work it
+/// shares `a.rs` with cannot merge, so deferring the fix would deadlock;
+/// a very-important candidate on the same surface is still deferred.
+#[test]
+fn a_verified_red_main_fix_bypasses_the_overlap_gate_but_very_important_does_not() {
+    let red = RedMainLane {
+        verified_red: true,
+        gate_disabled: false,
+        other_hold: false,
+    };
+    let items = vec![
+        item(9, Some(body(&["a.rs"])), Some("loom:building")),
+        red_fix(4, &["a.rs"]),
+    ];
+    let mut disp = Disp::default();
+    disp.in_flight.insert(9);
+    let mut ws = [(Src(Some(items)), disp)];
+    let report = run_lane(&mut ws, true, red);
+    assert_eq!(ws[0].1.dispatched, vec![4], "the verified fix is not held by `a.rs`");
+    let row4 = report.queue.iter().find(|r| r.key.number == 4).unwrap();
+    assert!(row4.key.main_red_fix);
+
+    // On a green `main` the marker grants nothing: the fix waits on `a.rs`.
+    let items = vec![
+        item(9, Some(body(&["a.rs"])), Some("loom:building")),
+        red_fix(4, &["a.rs"]),
+        item(2, Some(body(&["a.rs"])), Some("loom:very-important")),
+    ];
+    let mut disp = Disp::default();
+    disp.in_flight.insert(9);
+    let mut ws = [(Src(Some(items)), disp)];
+    let report = run_lane(&mut ws, false, RedMainLane::default());
+    assert!(ws[0].1.dispatched.is_empty());
+    assert_eq!(row(&report, 4).unwrap().0, Qd::DeferredFileOverlap);
+    assert_eq!(row(&report, 2).unwrap().0, Qd::DeferredFileOverlap);
+    assert!(report.queue.iter().all(|r| !r.key.main_red_fix));
+}
+
+#[test]
+fn a_red_main_fix_candidate_skips_the_gate_but_still_occupies() {
+    use crate::priority_pick::Level;
+    let mut gate = OverlapGate::default();
+    gate.note(0, 9, Some(&body(&["a.rs"])), true);
+    gate.note(0, 1, Some(&body(&["a.rs", "b.rs"])), false);
+    gate.note(0, 2, Some(&body(&["b.rs"])), false);
+    let fix = PriorityCandidate {
+        main_red_fix: true,
+        ..cand(1, Level::Default)
+    };
+    assert!(gate.overlapping(&fix).is_empty());
+    assert_eq!(gate.overlapping(&cand(1, Level::Default)), vec!["a.rs"]);
     gate.occupy(&fix);
-    assert_eq!(gate.overlapping(&cand(2, false, false)), vec!["b.rs"]);
+    assert_eq!(gate.overlapping(&cand(2, Level::VeryImportant)), vec!["b.rs"]);
 }
 
 #[test]

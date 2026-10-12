@@ -14,8 +14,8 @@
 //! inside it, is unchanged.
 
 use super::{
-    operator_priority, read_work_finder_config, resolve_extra_skip_labels_with_config,
-    WorkDispatcher, WorkItem, WorkSource,
+    read_work_finder_config, resolve_extra_skip_labels_with_config, WorkDispatcher, WorkItem,
+    WorkSource,
 };
 use crate::sweep_registry::SweepRegistry;
 use crate::types::{SweepKind, SweepState};
@@ -98,57 +98,13 @@ impl WorkSource for GhWorkSource {
         // fails the listing; any later shortfall keeps the rows read and
         // marks this repo's queue incomplete.
         self.complete = true;
-        let ready = self.list_label("loom:issue", true)?;
-        // Second ETag-cached listing (#9244 §4): starred issues outside
-        // `loom:issue` (triage, curated, or no workflow label at all). Its
-        // failure never costs the `loom:issue` rows: log, feed the rate-limit
-        // breaker, and carry on with what the first listing returned.
-        // #10307: one listing per level label (operator and inherited, every
-        // level): a level-2 issue need not carry the star itself.
-        let mut starred: Vec<WorkItem> = Vec::new();
-        // #11103: `loom:very-important` is listed the same way (the new top
-        // level wins the workspace draw even outside `loom:issue`); the legacy
-        // star listings go in slice 2.
-        let side_labels = crate::operator_levels::starred_labels(crate::operator_levels::table())
-            .into_iter()
-            .chain(std::iter::once(crate::priority_pick::VERY_IMPORTANT_LABEL));
-        for label in side_labels {
-            let rows = self.list_side_label(label, true);
-            let seen: HashSet<u32> = starred.iter().map(|i| i.number).collect();
-            starred.extend(rows.into_iter().filter(|i| !seen.contains(&i.number)));
-        }
-        let mut items = operator_priority::merge_starred(ready, starred);
-        let key = operator_priority::repo_key(self.cwd.as_deref(), self.repo.as_deref());
-        let mut timeline = operator_priority::GhTimelineStarredAt {
-            gh_bin: self.gh_bin.clone(),
-            cwd: self.cwd.clone(),
-            repo: self.repo.clone(),
-        };
-        // #9244 C: a loom-ui intent's `requested_at` answers first (the seam
-        // slice A left), then blockers of starred issues inherit the star.
-        let mut source = crate::star_liveness::intents::IntentStarredAt {
-            root: self.cwd.as_deref(),
-            inner: &mut timeline,
-        };
-        operator_priority::resolve_starred_at(&key, &mut items, &mut source);
-        // #10307: a blocker inheriting a level orders at its source's
-        // starred-at, which its body provenance marker carries (the listing
-        // already returned the body).
-        let table = crate::operator_levels::table();
-        for item in &mut items {
-            let item_key = (self.repo.clone().unwrap_or_default(), item.number);
-            if let Some(at) = crate::star_liveness::levels::inherited_requested_at(
-                table,
-                &item_key,
-                &item.labels,
-                item.body.as_deref(),
-            ) {
-                item.operator_priority_at = Some(at);
-            }
-        }
-        crate::star_liveness::inherit::apply(self.cwd.as_deref(), &mut items);
-        // #10118: marker-bearing fixes still in triage / curated. Merged after
-        // star inheritance so such a row never looks starred; the lane drops
+        let mut items = self.list_label("loom:issue", true)?;
+        // No priority side listing (#11508, operator ruling): priority changes
+        // order, never eligibility, so a `loom:important` /
+        // `loom:very-important` issue is dispatched only once it is
+        // `loom:issue`, like everything else. No starred-at or star
+        // inheritance is resolved here either.
+        // #10118: marker-bearing fixes still in triage / curated. The lane drops
         // them again unless this repo's `main` is red (`main_red_fix::evaluate`).
         // Only a trusted filer's marker counts (#9548); the policy is resolved
         // at most once per tick, and only if a marker-bearing row needs it.
@@ -175,7 +131,7 @@ impl WorkSource for GhWorkSource {
 }
 
 impl GhWorkSource {
-    /// A listing other than `loom:issue` (#9244 §4, #10118). Its failure
+    /// A listing other than `loom:issue` (the unpromoted red-main fixes, #10118). Its failure
     /// never costs the `loom:issue` rows: log, feed the rate-limit breaker,
     /// and carry on without it, but the repo's queue is then incomplete
     /// (#11139). `all_pages` as [`Self::list_label`].

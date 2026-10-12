@@ -128,7 +128,6 @@ pub fn build_record(
             workspace_priority: row.workspace_priority,
             urgent: false,
             operator_priority: row.operator_priority,
-            operator_priority_at: row.operator_priority_at.clone(),
             created_at: row.created_at.clone(),
             tier: row.tier.clone(),
             disposition: row.disposition,
