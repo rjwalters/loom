@@ -249,7 +249,7 @@ pub mod workspace_draw;
 use crate::types::QueueDisposition as Qd;
 pub use labels::{BUILDING_LABEL, OPERATOR_HOLD_LABEL, PARK_LABELS, SKIP_LABELS};
 pub use main_red_fix::RedMainLane;
-pub use operator_priority::{CapTerms, OverflowSlot, OPERATOR_PRIORITY_LABEL};
+pub use operator_priority::{CapTerms, OverflowSlot};
 pub use ordering::{candidate_cmp, PriorityCandidate};
 use tick_report::record_dispatch_outcome;
 pub use tick_report::{Admission, TickReport};
@@ -784,7 +784,7 @@ pub trait WorkDispatcher {
     fn dispatch(&mut self, issue: u32, complexity: Option<&str>) -> Result<bool>;
 
     /// [`dispatch`](Self::dispatch), additionally recording whether this is
-    /// the host's `loom:operator-priority` overflow sweep (#9244) on the sweep
+    /// the host's overflow sweep (#9244, inert since #11508) on the sweep
     /// record. Defaults to plain `dispatch` (the flag dropped), so a
     /// dispatcher that does not model overflow opts out with zero boilerplate.
     ///

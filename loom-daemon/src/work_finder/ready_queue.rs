@@ -25,8 +25,6 @@ use super::{candidate_cmp, PriorityCandidate, WorkItem};
 pub struct TickQueueRow {
     /// The ordering keys, exactly as dispatch uses them.
     pub key: PriorityCandidate,
-    /// The issue's `tier:*` label, if any (information only).
-    pub tier: Option<String>,
     /// What the tick did with it. `None` only while a candidate is waiting
     /// for pass 2; [`finish`] treats a still-`None` row as a capacity deferral.
     pub disposition: Option<QueueDisposition>,
@@ -57,10 +55,6 @@ pub struct TickQueueRow {
 /// issue.
 fn points_of(item: &WorkItem) -> Option<u32> {
     crate::story_points::classify_points_labels(&item.labels).value()
-}
-
-fn tier_of(item: &WorkItem) -> Option<String> {
-    item.labels.iter().find(|l| l.starts_with("tier:")).cloned()
 }
 
 /// The ordering keys for `item` in workspace `idx`. Every candidate key —
@@ -158,7 +152,6 @@ pub fn record_skip_held(
 ) {
     rows.push(TickQueueRow {
         key,
-        tier: tier_of(item),
         disposition: Some(disposition),
         detail,
         updated_at: item.updated_at.clone(),
@@ -177,7 +170,6 @@ pub fn record_candidate(rows: &mut Vec<TickQueueRow>, key: &PriorityCandidate, i
             complexity: None,
             ..key.clone()
         },
-        tier: tier_of(item),
         disposition: None,
         detail: None,
         updated_at: item.updated_at.clone(),
@@ -260,14 +252,12 @@ pub fn finish(rows: &[TickQueueRow], roots: &[PathBuf]) -> Vec<ReadyQueueRow> {
                 // Deprecated by #9244 (its label deleted in #11105): always
                 // false, kept only for wire compatibility.
                 urgent: false,
-                // Deprecated by #11508 (no star ordering key): always false,
-                // kept only for wire compatibility.
-                operator_priority: false,
+                // The level dispatch ordered it by (after the cap, #11509).
+                level: r.key.level,
                 // The verified red-main fix (#9244): a gate bypass since
                 // #11508, not an ordering key.
                 main_red_fix: r.key.main_red_fix,
                 created_at: r.key.created_at.clone(),
-                tier: r.tier.clone(),
                 story_points: r.story_points,
                 disposition,
                 detail: r.detail.clone(),

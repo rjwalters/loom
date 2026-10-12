@@ -23,11 +23,6 @@ use std::path::Path;
 
 use super::{WorkDispatcher, WorkItem, BUILDING_LABEL};
 
-/// The legacy operator-priority ("starred") label (#9244). Dispatch no
-/// longer reads it (#11508); kept for the non-dispatch readers #11510
-/// removes.
-pub const OPERATOR_PRIORITY_LABEL: &str = "loom:operator-priority";
-
 /// The in-progress Curator claim. A side-listed row carrying it is being
 /// curated right now, so it is left alone this tick.
 pub const CURATING_LABEL: &str = "loom:curating";

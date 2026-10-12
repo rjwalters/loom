@@ -305,8 +305,9 @@ async fn label_listings(roots: &[(PathBuf, String)], label: &'static str) -> Cur
     out
 }
 
-/// The effective operator priority level the planner ranked `row` on: its
-/// `operator_priority_level` comparator key, else the bare star.
+/// The priority level the planner ranked `row` on (0 default, 1
+/// `loom:important`, 2 `loom:very-important`): its `level` comparator key,
+/// else the row's own `level` (#11510).
 fn level(row: &ReadyQueueRow) -> u8 {
     row.plan
         .keys
@@ -314,7 +315,7 @@ fn level(row: &ReadyQueueRow) -> u8 {
         .find(|k| k.name == "level")
         .and_then(|k| k.value.as_u64())
         .and_then(|n| u8::try_from(n).ok())
-        .unwrap_or(u8::from(row.operator_priority))
+        .unwrap_or_else(|| row.level.rank())
 }
 
 /// The work finder's last tick: every row not running, with its rank and
@@ -374,8 +375,6 @@ fn ready_from_tick(
                 repo: slug(&row.repo)?,
                 issue: row.issue,
                 rank: small(row.rank),
-                star: row.operator_priority,
-                star_at: None,
                 level: level(row),
                 fleet_priority: row.workspace_priority,
                 created_at: parse_instant(row.created_at.as_deref()),

@@ -155,8 +155,8 @@ enum Commands {
     },
 
     /// Show the work finder's ready queue in its real dispatch order
-    /// (starred `loom:operator-priority` first, then red-main fixes, workspace
-    /// priority, oldest first — #9244) with what the last
+    /// (verified red-main fixes first, then priority level, oldest first —
+    /// #11103, #11547) with what the last
     /// tick did with each issue and why, plus a freshness line (Issue #8852).
     Queue {
         /// Emit machine-readable JSON instead of the human-readable table.

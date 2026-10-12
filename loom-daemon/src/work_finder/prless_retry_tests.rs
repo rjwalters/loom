@@ -217,18 +217,18 @@ fn tick_skips_an_issue_only_a_peer_host_armed() {
     assert_eq!(report.dispatched, 0, "nothing may be dispatched — and no spawn is attempted");
 }
 
-/// #10642 AC4: the operator's star (`loom:operator-priority`) is an ordering
-/// key, not a retry exemption. A starred issue inside its PR-less window is
-/// skipped exactly like an unstarred one — several of the `2AMLogic/2am`
-/// issues that looped on `no-phase-signal` deaths were starred.
+/// #10642 AC4: priority (`loom:very-important`, #11103) is an ordering key,
+/// not a retry exemption. A priority issue inside its PR-less window is
+/// skipped exactly like any other — several of the `2AMLogic/2am` issues
+/// that looped on `no-phase-signal` deaths were operator-prioritized.
 #[test]
-fn a_starred_issue_inside_its_prless_window_is_still_skipped() {
+fn a_priority_issue_inside_its_prless_window_is_still_skipped() {
     let mut source = OneShotSource(Some(vec![
         WorkItem::new(
             1,
             vec![
                 "loom:issue".to_string(),
-                OPERATOR_PRIORITY_LABEL.to_string(),
+                crate::priority_pick::VERY_IMPORTANT_LABEL.to_string(),
             ],
         ),
         WorkItem::new(2, vec!["loom:issue".to_string()]),
@@ -239,6 +239,6 @@ fn a_starred_issue_inside_its_prless_window_is_still_skipped() {
     };
     let report = tick(&mut source, &mut disp, 10, false).unwrap();
 
-    assert_eq!(report.skipped_prless_retry, 1, "the star does not exempt #1");
+    assert_eq!(report.skipped_prless_retry, 1, "priority does not exempt #1");
     assert_eq!(disp.dispatched, vec![2]);
 }

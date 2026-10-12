@@ -85,11 +85,10 @@ fn the_marker_leads_the_order_only_on_a_red_main() {
 }
 
 #[test]
-fn a_labelled_red_main_fix_outranks_a_starred_issue_without_overflow() {
-    // The legacy star carries no level (#11508); the very-important fix goes
-    // first and nothing goes over the cap of 1.
-    let starred = WorkItem::new(5, vec![OPERATOR_PRIORITY_LABEL.into()]);
-    let items = vec![very_important(fix(9)), starred];
+fn a_labelled_red_main_fix_outranks_an_important_issue_without_overflow() {
+    // The very-important fix goes first and nothing goes over the cap of 1.
+    let important = WorkItem::new(5, vec!["loom:important".into()]);
+    let items = vec![very_important(fix(9)), important];
     let mut multi = vec![(FakeSource::once(items), RecordingDispatcher::default())];
     tick_multi_with_repo_cap(
         &mut multi,
@@ -108,8 +107,8 @@ fn a_labelled_red_main_fix_outranks_a_starred_issue_without_overflow() {
 
 #[test]
 fn a_halted_red_repo_admits_its_fixes_and_nothing_else() {
-    let starred = WorkItem::new(5, vec![OPERATOR_PRIORITY_LABEL.into()]);
-    let items = || vec![issue(1), starred.clone(), fix(9)];
+    let important = WorkItem::new(5, vec!["loom:important".into()]);
+    let items = || vec![issue(1), important.clone(), fix(9)];
 
     let mut multi = vec![(FakeSource::once(items()), RecordingDispatcher::default())];
     let report = tick_multi_with_repo_cap(
@@ -132,7 +131,7 @@ fn a_halted_red_repo_admits_its_fixes_and_nothing_else() {
         .filter(|r| r.disposition == Qd::WorkspaceHalted)
         .map(|r| r.issue)
         .collect();
-    assert_eq!(halted, vec![1, 5], "the starred issue waits with the rest");
+    assert_eq!(halted, vec![5, 1], "the important issue waits with the rest (ranked first)");
     assert!(rows
         .iter()
         .any(|r| r.issue == 9 && r.disposition == Qd::Dispatched));
@@ -433,7 +432,7 @@ fn the_unpromoted_listing_keeps_only_unclaimed_marker_rows() {
     // A promoted fix is not "unpromoted": it is a candidate anyway. A
     // priority label does not promote it (#11508): it still needs a red main.
     assert!(!fix(1).is_unpromoted_red_fix());
-    for label in [OPERATOR_PRIORITY_LABEL, "loom:very-important"] {
+    for label in ["loom:important", "loom:very-important"] {
         let mut prioritised = unpromoted(2, "loom:triage");
         prioritised.labels.push(label.into());
         assert!(prioritised.is_unpromoted_red_fix(), "{label}");

@@ -10,8 +10,8 @@ fn vi(n: u32) -> WorkItem {
     WorkItem::new(n, vec!["loom:issue".into(), "loom:very-important".into()])
 }
 
-fn starred(n: u32) -> WorkItem {
-    WorkItem::new(n, vec![OPERATOR_PRIORITY_LABEL.to_string()])
+fn important(n: u32) -> WorkItem {
+    WorkItem::new(n, vec!["loom:important".to_string()])
 }
 
 fn fix(n: u32) -> WorkItem {
@@ -92,12 +92,12 @@ fn engaged_defers_every_plain_candidate_and_leaves_in_flight_alone() {
 // -- AC5 ----------------------------------------------------------------------
 
 /// #11508 (operator ruling): priority changes order, never admission. A
-/// `loom:very-important` candidate and a legacy star are deferred by the
-/// back-off exactly like a plain candidate.
+/// `loom:very-important` and a `loom:important` candidate are deferred by
+/// the back-off exactly like a plain candidate.
 #[test]
 fn a_very_important_candidate_is_held_by_the_backoff_like_any_other() {
     let mut multi = vec![(
-        FakeSource::once(vec![issue(1), vi(5), starred(6)]),
+        FakeSource::once(vec![issue(1), vi(5), important(6)]),
         RecordingDispatcher::default(),
     )];
     let report = run(&mut multi, 10, None, &[], &[true]);
@@ -115,13 +115,13 @@ fn a_very_important_candidate_is_held_by_the_backoff_like_any_other() {
 
 /// The red-main-fix lane (#9244) is not a level and keeps its bypass
 /// (#11508, Judge): while `main` is red nothing merges, so holding the fix
-/// would deadlock the debt the back-off waits on. The VI and the star in the
-/// same held repo still wait; on the red `main` the fix also leads the
+/// would deadlock the debt the back-off waits on. The VI and the important
+/// issue in the same held repo still wait; on the red `main` the fix also leads the
 /// published rank (#11547), which changes order only, not the back-off.
 #[test]
 fn a_verified_red_main_fix_bypasses_the_backoff_but_priority_does_not() {
     let mut multi = vec![(
-        FakeSource::once(vec![issue(1), vi(5), starred(6), fix(9)]),
+        FakeSource::once(vec![issue(1), vi(5), important(6), fix(9)]),
         RecordingDispatcher::default(),
     )];
     let report = run(&mut multi, 10, None, &[RED], &[true]);

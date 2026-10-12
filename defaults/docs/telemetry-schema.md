@@ -2106,9 +2106,8 @@ Each row:
 | `issue` | integer | issue number |
 | `workspace_priority` | integer | lower dispatches first |
 | `urgent` | bool | **deprecated (#9244): always `false`**. Its label was deleted (#11105); the field stays on the wire only for compatibility |
-| `operator_priority` | bool | **deprecated (#11508): always `false`**. The star is no longer an ordering key; the row's level is its `keys` entry `level`. Kept on the wire only for compatibility. (`operator_priority_at` was dropped in #11508; older daemons may still send it) |
+| `level` | string | the issue's priority level (#11510): `default`, `important` (`loom:important`) or `very-important` (`loom:very-important`), after the very-important cap (#11509); a `labelled_blocked` row reads its own labels. Absent (an older daemon) or unknown decodes to `default`. It replaces `operator_priority` (always `false` since #11508) and `tier`, which a current daemon no longer sends; older daemons may still send both (and `operator_priority_at`) |
 | `created_at` | RFC 3339, optional | issue creation time (the age ordering key) |
-| `tier` | string, optional | the `tier:*` label, informational only |
 | `disposition` | string | `dispatched`, `in_flight`, `deferred_capacity`, `deferred_ramp_cap`, `deferred_saturation`, `deferred_build_backoff`, `deferred_out_of_slice`, `deferred_repo_cap`, `deferred_file_overlap`, `workspace_halted`, `workspace_commands_missing`, `host_constraint`, `parked`, `hard_exclusion`, `recheck_interval`, `quarantined`, `dispatch_backoff`, `open_pr_backoff`, `noop_cooldown`, `declined`, `prless_retry`, `peer_claim`, `open_pr`, `dispatch_error`, `already_landed`, `already_closed`, `labelled_blocked` (unknown values are forward-compatible) |
 | `state` | string | `running` / `ready` / `blocked`, derived by the daemon so clients never keep a copy of the mapping |
 | `reason` | string | human-readable reason, also daemon-derived |
@@ -2181,9 +2180,9 @@ loom-ui derives landing state from labels and PRs.
 
 Redaction (phase 3, `loom-ui:src/queueState.ts`): the Worker redacts per
 row on `visibility`. On `/public/*` a private row keeps only `rank`,
-`visibility`, `urgent`, `operator_priority`, `disposition`, `state` and
-`reason` (plus the #9288 `position`, `plan_state` and `gate`); its `repo`,
-`issue`, `created_at`, `tier`, `detail`, `keys`, `repo_cap`, `owning_shard`,
+`visibility`, `urgent`, `level` (formerly `operator_priority`), `disposition`,
+`state` and `reason` (plus the #9288 `position`, `plan_state` and `gate`); its
+`repo`, `issue`, `created_at`, `detail`, `keys`, `repo_cap`, `owning_shard`,
 `in_slice` and `hot` are withheld, and a private `listing_failed` entry keeps
 only its `visibility`. A private `listing_incomplete` entry (#11139) needs the
 same treatment; a Worker that does not know the field must drop it rather
@@ -2643,9 +2642,8 @@ Each row:
 | `sweep_id` | string, optional | the id of this host's sweep that holds the item, the `loom.fact_id` key of the row's `eta.stage_outcome` when no forge instant dates the exit (#11401). Present exactly when `host` is. Additive on `fleet-state/v1` |
 | `model`, `effort`, `effort_source`, `model_source`, `runtime`, `attempt_index`, `trigger`, `previous_sweep_id`, `dispatch_origin` | optional | a row of a sweep this host runs (`sweep.curator`, `sweep.builder`, `review_wait`, `doctor`, `merge_wait`): the [dispatch facts](#sweepstarted) its `sweep.started` carried, with the same values (#11280). Absent for a sweep this daemon did not dispatch (adopted after a restart), and each one absent when unknown. Additive on `fleet-state/v1` |
 | `rank` | integer, optional | `ready_wait` only: this host's planner rank (1-based position in its dispatch order on the last work-finder tick). Per host: two hosts' ranks for one issue are two true answers |
-| `star` | bool, optional | starred at any level (absent = `false`). Every row since #11391: a PR row reads the PR's `loom:operator-priority` / level labels, and a row keeps the star an earlier row of the item carried (a `ready_wait` row is rebuilt from the tick, so an un-star shows there) |
-| `star_at` | RFC 3339, optional | `ready_wait` only: always absent since #11508 (the work finder no longer reads a starred-at) |
-| `level` | integer, optional | priority level (absent = `0`); on every row, like `star` (#11391). A `ready_wait` row reads the planner's `level` key since #11508 (1 `loom:important`, 2 `loom:very-important`); other rows still read the legacy level labels until #11510 |
+| `star`, `star_at` | — | **removed (#11510)**: the operator star is retired (#11103). A current daemon never sends them; an older one may (`star` = starred at any legacy level, `star_at` always absent since #11508). Read `level` instead |
+| `level` | integer, optional | priority level (absent = `0`): 1 `loom:important`, 2 `loom:very-important` (#11103). On every row (#11391): a `ready_wait` row reads the planner's `level` key, a PR row the PR's own priority label (`create-pr.sh` copies it from the closing issue), and a row keeps the level an earlier row of the item carried (a `ready_wait` row is rebuilt from the tick, so a lowered level shows there). The legacy operator-star labels are no longer read (#11510) |
 | `fleet_priority` | integer, optional | `ready_wait` only: the repo's fleet (workspace) priority tier; lower dispatches first |
 | `created_at` | RFC 3339, optional | `ready_wait` only: the issue's creation instant, the planner's age input (age = `as_of - created_at`; the instant is sent so an unchanged row stays unchanged) |
 | `main_red_fix` | bool, optional | `ready_wait` only: the row is a verified red-main fix (marker present and its repo's `main` verified red). A gate bypass (#11508) and, since #11547, the leading ordering key (true only while `main` is verified red) |

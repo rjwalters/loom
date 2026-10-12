@@ -150,7 +150,7 @@ impl FleetStage {
 pub enum FleetSlot {
     /// One of the host's `maxConcurrent` slots.
     Regular,
-    /// The host's single `loom:operator-priority` overflow slot (#9244).
+    /// The host's single overflow slot (#9244; inert since #11508).
     Overflow,
 }
 
@@ -459,16 +459,11 @@ pub struct FleetStateRow {
     /// the work finder's dispatch order on its last tick.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rank: Option<u32>,
-    /// Starred (`loom:operator-priority`, any level). On every row since
-    /// #11391: a PR row reads it from the PR's labels, any row keeps what an
-    /// earlier row of the item carried.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub star: bool,
-    /// `ready_wait` only: when it was starred, when known.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub star_at: Option<DateTime<Utc>>,
-    /// The effective operator priority level (0 absent). On every row, like
-    /// `star` (#11391).
+    /// The priority level (0 absent, 1 `loom:important`, 2
+    /// `loom:very-important`; #11103). On every row (#11391): a `ready_wait`
+    /// row reads the planner's `level` key, a PR row the PR's own labels,
+    /// and any row keeps the level an earlier row of the item carried. The
+    /// retired `star` / `star_at` fields are no longer sent (#11510).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub level: u8,
     /// `ready_wait` only: the repo's fleet priority (the workspace priority
@@ -546,8 +541,6 @@ impl FleetStateRow {
             start: SweepStartFacts::default(),
             sweep_id: None,
             rank: None,
-            star: false,
-            star_at: None,
             level: 0,
             fleet_priority: None,
             created_at: None,
