@@ -5,7 +5,7 @@
 use super::*;
 
 /// A synthetic value no status detail or log line may contain.
-#[cfg(all(feature = "otlp", unix))]
+#[cfg(unix)]
 const SECRET: &str = "fixture-secret-b81d44";
 
 fn with_headers(kind: &str, endpoint: Option<&str>, headers_file: &str) -> RawExporterEntry {
@@ -15,7 +15,7 @@ fn with_headers(kind: &str, endpoint: Option<&str>, headers_file: &str) -> RawEx
     }
 }
 
-#[cfg(all(feature = "otlp", unix))]
+#[cfg(unix)]
 fn write_headers_file(dir: &Path, contents: &str, mode: u32) -> String {
     let path = dir.join("otlp-headers");
     std::fs::write(&path, contents).unwrap();
@@ -101,7 +101,6 @@ fn entry_endpoint_applies_the_headers_file_policy_only_to_entries_that_have_one(
         Ok(shared.clone())
     );
 
-    #[cfg(feature = "otlp")]
     {
         let otlp = |endpoint: &str, headers_file: Option<&str>| ExporterEntry {
             headers_file: headers_file.map(str::to_string),
@@ -129,7 +128,6 @@ fn entry_endpoint_applies_the_headers_file_policy_only_to_entries_that_have_one(
     }
 }
 
-#[cfg(feature = "otlp")]
 #[test]
 #[serial]
 fn planned_otlp_exporters_pairs_each_endpoint_with_its_headers_file() {
@@ -185,7 +183,7 @@ async fn spawn_task_refuses_a_headers_file_on_a_non_otlp_entry() {
 /// A refused headers file — loose permissions, then a malformed line — turns
 /// the otlp sink `misconfigured` with a detail naming the file (and line),
 /// and neither the status nor any log line carries a header value.
-#[cfg(all(feature = "otlp", unix))]
+#[cfg(unix)]
 #[tokio::test]
 #[serial]
 async fn spawn_task_reports_a_refused_headers_file_without_its_contents() {
@@ -238,7 +236,7 @@ async fn spawn_task_reports_a_refused_headers_file_without_its_contents() {
 
 /// The happy path through `spawn_task`: an owner-only file on an otlp entry
 /// starts the sink like any other.
-#[cfg(all(feature = "otlp", unix))]
+#[cfg(unix)]
 #[tokio::test]
 #[serial]
 async fn spawn_task_starts_an_otlp_exporter_with_a_headers_file() {

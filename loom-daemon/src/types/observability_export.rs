@@ -318,8 +318,8 @@ pub enum ObservabilityExportState {
     /// `observability.enabled` is `true` but a required piece of config could
     /// not be resolved: no `endpoint`, no `ingestKeyFile`, or the configured
     /// `ingestKeyFile` could not be read (missing, unreadable, or empty after
-    /// trimming) — see #5337. Also covers `exporter = "otlp"` requested on a
-    /// build without the `otlp` Cargo feature. The exporter never started, so
+    /// trimming) — see #5337. Also covers a per-sink policy refusal (bad
+    /// endpoint, refused `headers_file`). The exporter never started, so
     /// there is no `started_at`, but this is a **config error an operator
     /// should fix**, not the same benign absence as [`Self::Disabled`].
     /// [`ObservabilityExportStatus::endpoint`] carries whatever *did* resolve

@@ -88,18 +88,13 @@ fn role_launch_carries_telemetry_env_with_its_traceparent_when_on() {
         get(&env, "OTEL_EXPORTER_OTLP_ENDPOINT"),
         Some(&Some("http://127.0.0.1:4318".into()))
     );
-    if cfg!(feature = "otlp") {
-        // Loom's own tracing is live, so the tick opened its root: the
-        // session's spans are parented by the SAME context Loom journals.
-        assert!(
-            matches!(get(&env, "TRACEPARENT"), Some(Some(_)))
-                && get(&env, "TRACEPARENT") == get(&env, "LOOM_TRACEPARENT"),
-            "telemetry env never ships without the tick's trace context: {env:?}"
-        );
-    } else {
-        // Tracing compiled out: no context, and no ambient one leaks in.
-        assert_eq!(get(&env, "TRACEPARENT"), Some(&None), "{env:?}");
-    }
+    // Loom's own tracing is live, so the tick opened its root: the
+    // session's spans are parented by the SAME context Loom journals.
+    assert!(
+        matches!(get(&env, "TRACEPARENT"), Some(Some(_)))
+            && get(&env, "TRACEPARENT") == get(&env, "LOOM_TRACEPARENT"),
+        "telemetry env never ships without the tick's trace context: {env:?}"
+    );
     let attrs = get(&env, RESOURCE_ATTRIBUTES_ENV)
         .cloned()
         .flatten()
