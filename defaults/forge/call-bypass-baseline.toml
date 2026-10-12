@@ -9,7 +9,7 @@
 # Eliminating these entries is the caller-migration issue's job, not this
 # ledger's — see `removal_epic` below and each entry's `removal_issue`.
 #
-# 80 file(s), 247 direct call site(s) at baseline.
+# 82 file(s), 252 direct call site(s) at baseline.
 
 removal_epic = 9769
 
@@ -236,6 +236,12 @@ owner = "daemon-cli"
 removal_issue = 9799
 
 [[bypass]]
+path = "loom-daemon/src/cli/role_tool_policy.rs"
+calls = 2
+owner = "daemon-cli"
+removal_issue = 9799
+
+[[bypass]]
 path = "loom-daemon/src/codex_sandbox_noop.rs"
 calls = 3
 owner = "daemon-other"
@@ -388,6 +394,12 @@ removal_issue = 9799
 [[bypass]]
 path = "loom-daemon/src/role_tool_policy.rs"
 calls = 5
+owner = "daemon-other"
+removal_issue = 9799
+
+[[bypass]]
+path = "loom-daemon/src/role_tool_policy/command_match.rs"
+calls = 3
 owner = "daemon-other"
 removal_issue = 9799
 
