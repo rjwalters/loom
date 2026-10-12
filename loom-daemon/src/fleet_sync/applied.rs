@@ -154,7 +154,7 @@ pub(crate) fn reset_for_tests() {
 mod tests {
     use super::*;
     use crate::fleet_sync::tests::{sample_status, with_clean_process_state};
-    use crate::fleet_sync::{applied_config_sha, clear_status, publish, TierReport};
+    use crate::fleet_sync::{clear_status, publish, TierReport};
     use serial_test::serial;
     use std::path::Path;
 

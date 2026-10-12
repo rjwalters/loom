@@ -90,7 +90,9 @@ use crate::fleet_store::render::{self, Drift};
 use crate::fleet_store::roster::{self, Change, Plan, Registered};
 use crate::fleet_store::{self as store, StoreLocation};
 
-// `applied` is `pub(crate)` so the OTLP resource tests reach its test seams (#11197).
+// `applied` is `pub(crate)` so the OTLP resource code and its tests reach
+// `applied_config_sha` / `AppliedSha` / `FLEET_CONFIG_SHA` and the test seams
+// via `fleet_sync::applied::…` directly, without a top-level re-export (#11197).
 pub(crate) mod applied;
 pub mod checkout_ff;
 mod floor_knowledge;
@@ -99,8 +101,6 @@ mod loom_ui;
 pub mod offline_floor;
 pub mod roster_clone;
 pub mod workspace_resync;
-
-pub use applied::{applied_config_sha, AppliedSha, FLEET_CONFIG_SHA};
 
 pub use floor_knowledge::{floor_knowledge, floor_wake, FloorKnowledge, FloorWake};
 

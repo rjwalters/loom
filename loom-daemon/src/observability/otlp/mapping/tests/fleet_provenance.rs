@@ -4,7 +4,7 @@
 //! export batch without a restart.
 
 use super::*;
-use crate::fleet_sync::{self, AppliedSha};
+use crate::fleet_sync::{self, applied::AppliedSha};
 use crate::telemetry::trace::{SpanName, SpanRecord, SpanStatus, TraceAttributes, TraceContext};
 use serial_test::serial;
 

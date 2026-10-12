@@ -40,7 +40,7 @@ pub fn start_record(supervisor: &str) -> TelemetryRecord {
             "revision": build.revision,
             "tree_state": build.tree_state,
             "supervisor": supervisor,
-            "config_sha": crate::fleet_sync::applied_config_sha().as_resource_value(),
+            "config_sha": crate::fleet_sync::applied::applied_config_sha().as_resource_value(),
             "pid": std::process::id(),
         }),
     })

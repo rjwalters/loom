@@ -12,7 +12,7 @@ use serial_test::serial;
 /// cell to the digit-free `unknown` sentinel first — serialized against the
 /// `fleet_sync` and mapping tests that mutate the same cell.
 fn pin_config_sha_unknown() {
-    crate::fleet_sync::applied::force_for_tests(crate::fleet_sync::AppliedSha::Unknown);
+    crate::fleet_sync::applied::force_for_tests(crate::fleet_sync::applied::AppliedSha::Unknown);
 }
 
 pub(in crate::observability::otlp::relay) fn bound() -> BoundIdentity {
@@ -98,7 +98,13 @@ fn decode_json(signal: Signal, value: &serde_json::Value) -> Payload {
 }
 
 #[test]
+#[serial(loom_socket_path_env)]
 fn identity_comes_from_the_daemon_whatever_the_sender_claimed() {
+    // `resource_for_host` reads the process-wide applied-SHA cell (and would
+    // seed it from whatever `LOOM_SOCKET_PATH` points at). Pin it and share the
+    // `loom_socket_path_env` key with the `fleet_sync::applied` tests so neither
+    // steps on the other's cell under a plain `cargo test` (#11197).
+    pin_config_sha_unknown();
     let mut payload = decode_json(Signal::Logs, &lying_logs());
     assert_eq!(bind_and_scrub(&mut payload, &bound()), 1);
     let Payload::Logs(request) = &payload else {

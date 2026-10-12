@@ -211,9 +211,12 @@ daemon rather than the moment the record was made (the same accepted behaviour
 as the `service.version` fallback). Which hosts are on which store commit:
 
 ```sql
-SELECT DISTINCT host_id, resources_string['loom.fleet.config_sha'] AS config_sha
-FROM signoz_logs.distributed_logs
+SELECT DISTINCT
+  resources_string['host.id']               AS host_id,
+  resources_string['loom.fleet.config_sha'] AS config_sha
+FROM signoz_logs.distributed_logs_v2
 WHERE resources_string['loom.fleet.config_sha'] != ''
+  AND timestamp >= toUnixTimestamp64Nano(now64() - INTERVAL 24 HOUR)
 ```
 
 A roster host stuck on `unknown`, or showing `none`, is the roll's laggard —

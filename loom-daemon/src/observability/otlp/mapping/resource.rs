@@ -37,7 +37,7 @@ use super::kv_string;
 ///   fleet host where no applied commit is established yet — e.g. during a
 ///   startup-pass timeout) or `none` (no fleet store). Never empty and never
 ///   omitted, so a backend `resources_string` read cannot confuse "missing"
-///   with "not known yet" — see [`fleet_sync::applied_config_sha`].
+///   with "not known yet" — see [`fleet_sync::applied::applied_config_sha`].
 ///
 /// Both describe the **exporting** daemon at export time: a record queued
 /// before a roll and exported after it carries the new SHA, the same accepted
@@ -59,8 +59,8 @@ pub(in crate::observability::otlp) fn resource_for_host(
         kv_string("service.version", version),
         kv_string(provenance::DAEMON_REVISION, provenance::daemon().revision),
         kv_string(
-            fleet_sync::FLEET_CONFIG_SHA,
-            fleet_sync::applied_config_sha().as_resource_value(),
+            fleet_sync::applied::FLEET_CONFIG_SHA,
+            fleet_sync::applied::applied_config_sha().as_resource_value(),
         ),
     ];
     Resource {
