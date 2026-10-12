@@ -1,0 +1,34 @@
+{
+  "alert": "Loom host export silent",
+  "alertType": "LOGS_BASED_ALERT",
+  "ruleType": "threshold_rule",
+  "version": "v4",
+  "evalWindow": "48h0m0s",
+  "frequency": "5m0s",
+  "condition": {
+    "compositeQuery": {
+      "queryType": "clickhouse_sql",
+      "panelType": "graph",
+      "chQueries": {
+        "A": {
+          "name": "A",
+          "query": "WITH\n  toInt64({{.start_timestamp_nano}}) AS start_ns,\n  toInt64({{.end_timestamp_nano}}) AS end_ns,\n  roster AS (\n    SELECT host, telemetry\n    FROM values('host String, telemetry String',\n        /* loom:roster:begin */\n        ('example-always', 'always'), ('example-when-awake', 'when_awake')\n        /* loom:roster:end */\n    )\n  ),\n  seen AS (\n    SELECT if(resources_string['host.name'] != '', resources_string['host.name'], resources_string['host.id']) AS host,\n           countIf(attributes_string['loom.kind'] = 'host.export') AS exports,\n           maxIf(timestamp, attributes_string['loom.kind'] = 'host.export') AS last_export_ns,\n           maxIf(timestamp, attributes_string['loom.kind'] NOT IN ('', 'host.export')) AS last_other_ns\n    FROM signoz_logs.distributed_logs_v2\n    WHERE timestamp >= {{.start_timestamp_nano}}\n      AND timestamp < {{.end_timestamp_nano}}\n    GROUP BY host\n  ),\n  judged AS (\n    SELECT r.host AS host,\n           if(r.telemetry = 'always', 900, 86400) AS threshold_seconds,\n           ifNull(s.exports, 0) AS n_exports,\n           toInt64(ifNull(s.last_export_ns, 0)) AS le_ns,\n           toInt64(ifNull(s.last_other_ns, 0)) AS lo_ns\n    FROM roster AS r\n    LEFT JOIN seen AS s ON r.host = s.host\n  )\nSELECT toDateTime(intDiv(end_ns, 1000000000)) AS ts,\n       host,\n       if(lo_ns > 0 AND intDiv(end_ns - lo_ns, 1000000000) <= threshold_seconds,\n          'exporter_silent', 'host_silent') AS state,\n       toFloat64(if(n_exports = 0, intDiv(end_ns - start_ns, 1000000000), intDiv(end_ns - le_ns, 1000000000))\n                 - threshold_seconds) AS value\nFROM judged\nORDER BY host",
+          "disabled": false
+        }
+      }
+    },
+    "selectedQueryName": "A",
+    "op": "1",
+    "matchType": "1",
+    "target": 0
+  },
+  "labels": {
+    "severity": "critical",
+    "loom_signal": "host_export_silent"
+  },
+  "annotations": {
+    "summary": "Loom host export silent",
+    "description": "Roster host {{$labels.host}} has sent no host.export log for {{$value}} s past its limit (900 s for telemetry: always, 86400 s for when_awake). The state label splits the cause: exporter_silent means the host still sends other Loom logs (the exporter or pipeline stopped, the host is up); host_silent means it sends nothing (the host or daemon is down, or it never exported over OTLP). The roster inside the query is rendered from fleet-gitops hosts.yml (services.loom-daemon.expected: running); the COMMITTED roster holds example-* placeholders so an unrendered import fires loudly rather than staying silently healthy. Re-render on every hosts.yml change. A host that never exported in the 48 h window counts as silent for the whole window. Issue #11198."
+  },
+  "disabled": false
+}
