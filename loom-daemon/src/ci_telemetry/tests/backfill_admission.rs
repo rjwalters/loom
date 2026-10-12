@@ -263,3 +263,30 @@ fn pressure_counters_separate_deferral_from_eviction_per_exporter() {
     assert_eq!(pressure.backfill_deferred_total, 2);
     assert_eq!(q.offer_backfill(all[2].clone()).unwrap(), Admission::Deferred);
 }
+
+#[test]
+fn pressure_reopen_preserves_all_reason_losses_but_resets_deferrals() {
+    use crate::observability::loss_ledger::REASON_RECEIVER_REJECTED;
+    let dir = TempDir::new().unwrap();
+    let all = seeded(dir.path());
+    let first = queue(dir.path(), "pressure.jsonl", 4);
+    for envelope in all.iter().take(5) {
+        first.push(envelope.clone());
+    }
+    first.record_losses(
+        &[(REASON_RECEIVER_REJECTED.to_string(), 7)]
+            .into_iter()
+            .collect(),
+    );
+    assert_eq!(first.offer_backfill(all[5].clone()).unwrap(), Admission::Deferred);
+    let before = first.pressure();
+    assert_eq!(before.dropped_total, 8); // one eviction and seven rejected signal items
+    assert_eq!(before.backfill_deferred_total, 1);
+    drop(first);
+    let reopened = queue(dir.path(), "pressure.jsonl", 4);
+    let after = reopened.pressure();
+    assert_eq!(after.dropped_total, before.dropped_total);
+    assert_eq!(after.backfill_deferred_total, 0);
+    assert_eq!(after.depth, before.depth);
+    assert_eq!(reopened.dropped_by_reason().get(REASON_RECEIVER_REJECTED), Some(&7));
+}

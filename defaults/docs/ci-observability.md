@@ -673,13 +673,15 @@ producers use:
 | Field | Meaning |
 |---|---|
 | `depth` / `capacity` / `backfill_limit` | Current occupancy and the two bounds. |
-| `dropped_total` | Envelopes evicted because an ordinary producer pushed into a full queue. This is real loss. |
+| `dropped_total` | Durable cumulative loss across all ledger reasons, including queue eviction, reopen capacity shrink and exporter-reported losses. Receiver rejection may count signal items rather than envelopes; see `host.export.dropped_by_reason`. |
 | `backfill_deferred_total` | Backfill offers refused at the limit. Not loss: the record is retried, so a record may be counted on every pass. |
 
-Both counters are cumulative for the daemon process and reset to 0 on
-restart; they are not persisted. A rising `backfill_deferred_total` with
+`dropped_total` is persisted in the queue loss ledger and survives restart.
+`backfill_deferred_total` is cumulative for the daemon process and resets to
+0 on restart; it is not persisted. A rising `backfill_deferred_total` with
 `dropped_total` flat means the replay is being paced correctly. A rising
-`dropped_total` means non-backfill producers are overflowing the queue.
+`dropped_total` means recorded loss increased; inspect
+`host.export.dropped_by_reason` to distinguish overflow from other reasons.
 
 ### Attribute allowlist
 

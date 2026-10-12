@@ -160,8 +160,8 @@ pub struct ObservabilityExportStatus {
 }
 
 /// Per-exporter queue pressure (#11115), the status-path companion of
-/// `DurableQueue`. Counters are **session-scoped**: they start at zero when
-/// the daemon process opens the queue and are never persisted.
+/// `DurableQueue`. Loss totals are durable across restart; backfill deferrals
+/// are session-scoped and reset when the daemon opens the queue.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ObservabilityQueuePressure {
     /// Envelopes currently queued (not yet acknowledged by the backend).
@@ -174,8 +174,9 @@ pub struct ObservabilityQueuePressure {
     /// admitted (always `<= capacity`).
     #[serde(default)]
     pub backfill_limit: u64,
-    /// Envelopes **evicted** (oldest-first) because an ordinary producer
-    /// pushed into a full queue. Real loss. Session-scoped.
+    /// Durable cumulative loss across every queue-ledger reason, surviving
+    /// restart. Includes eviction, reopen capacity shrink and exporter losses;
+    /// receiver rejection may count signal items rather than envelopes.
     #[serde(default)]
     pub dropped_total: u64,
     /// Bulk-backfill offers **refused** because the queue was at its backfill
