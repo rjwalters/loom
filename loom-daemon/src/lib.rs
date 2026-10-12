@@ -232,6 +232,7 @@ pub mod generated_artifact;
 pub mod gh_invocation;
 pub mod gh_repo_env;
 pub mod gh_state_probe;
+pub mod git_ff_identical;
 pub mod git_parser;
 pub mod git_tmp_reclaim;
 pub mod git_utils;

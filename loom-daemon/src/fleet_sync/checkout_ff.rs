@@ -26,9 +26,19 @@
 //! | 6 | nothing behind, nothing ahead | `current` (done) |
 //! | 7 | ahead only: unpushed local commits | `ahead` |
 //! | 8 | ahead and behind | `diverged` |
-//! | 9 | no staged or unstaged change to any tracked file | `dirty` |
+//! | 9 | no staged or unstaged change to any tracked file, unless every one is identical to origin (see below) | `dirty` |
 //! | 10 | `merge --ff-only` succeeds | `would-overwrite`, else `git-failure` |
 //! | | | `fast-forwarded` |
+//!
+//! Row 9 has one exception (#11553): when EVERY dirty tracked path already
+//! holds exactly its `origin/<default>` content, in the working tree and in
+//! the index (which may instead hold HEAD's content), the checkout is treated
+//! as clean ([`crate::git_ff_identical`], shared with the update script's
+//! own fast-forward, #11539). Those edits are discarded with `checkout HEAD
+//! --`, but only in row 10, immediately before the merge; a pass that does
+//! not merge discards nothing. One dirty path that differs from origin, or a
+//! staged blob that differs from both origin and HEAD, keeps the whole
+//! checkout `dirty`.
 //!
 //! With `fleet.autoApply` off, row 10 is not attempted and a clean checkout
 //! that is behind reports `behind`. The same holds, with `fleet.autoApply`
@@ -125,12 +135,16 @@
 //!
 //! # What it never does
 //!
-//! The only git write is the `merge --ff-only` of row 10 ([`git`]). A
+//! The git writes are both in row 10 ([`git`]): the `merge --ff-only`, and,
+//! immediately before it, a `checkout HEAD -- <paths>` of local edits that
+//! are byte-identical to `origin/<default>` (row 9's exception, #11553). That
+//! discard is the only thing this step can discard, and it loses nothing: the
+//! merge writes exactly that content to those paths anyway. Every other
 //! checkout that is not clean and strictly behind is left exactly as it is
 //! and reported. This is stricter than the main-health gate's own sync
 //! (`main_health_gate::prepare_workspace_to_origin_main`), which resets and
-//! may therefore ignore some dirt: this step discards nothing, so any tracked
-//! change is `dirty`. The gate's sync is unchanged; after a fast-forward its
+//! may therefore ignore some dirt: here any tracked change that differs from
+//! origin is `dirty`. The gate's sync is unchanged; after a fast-forward its
 //! reset is a no-op.
 //!
 //! # The Loom source checkout
@@ -819,14 +833,24 @@ fn attempt(env: &Env<'_>, root: &Path, net: &mut Net) -> Decided {
         }
     }
 
-    // 9. Clean: no staged or unstaged change to any tracked file.
-    match git::tracked_changes(root, local()) {
-        Ok(paths) if paths.is_empty() => {}
-        Ok(paths) => return found.end(S::Dirty, git::summarize(&paths)),
+    // 9. Clean: no staged or unstaged change to any tracked file, unless every
+    // one is already identical to origin (#11553). Nothing is discarded here:
+    // only in row 10, immediately before the merge.
+    let identical = match git::tracked_changes(root, local()) {
+        Ok(lines) if lines.is_empty() => Vec::new(),
+        Ok(lines) => match identical_to_origin(root, &branch, local) {
+            Some(paths) => paths,
+            None => return found.end(S::Dirty, git::summarize(&lines)),
+        },
         Err(e) => return found.end(S::GitFailure, e),
-    }
+    };
+    let note = if identical.is_empty() {
+        String::new()
+    } else {
+        format!(" (local edits identical to origin: {})", git::summarize(&identical))
+    };
     if !env.write {
-        return found.end(S::Behind, "fleet.autoApply is off; nothing written".to_string());
+        return found.end(S::Behind, format!("fleet.autoApply is off; nothing written{note}"));
     }
     // The gate may have started since rule 4. Ask again, right before the write.
     if (env.gate_in_flight)(root) {
@@ -834,10 +858,16 @@ fn attempt(env: &Env<'_>, root: &Path, net: &mut Net) -> Decided {
     }
     // And so may a pause. A paused host writes nothing, not even locally.
     if let Some(why) = (env.held)() {
-        return found.end(S::Behind, format!("the host is held ({why}); nothing written"));
+        return found.end(S::Behind, format!("the host is held ({why}); nothing written{note}"));
     }
 
-    // 10. The one write.
+    // 10. The write. Identical dirt is discarded only here, right before the
+    // merge, so no gate or hold can leave it discarded and unmerged.
+    if !identical.is_empty() {
+        if let Err(e) = git::discard_identical(root, &identical) {
+            return found.end(S::GitFailure, e);
+        }
+    }
     let old = found.head.clone().unwrap_or_else(|| "unknown".to_string());
     match git::fast_forward(root, &branch) {
         Ok(()) => {
@@ -845,13 +875,37 @@ fn attempt(env: &Env<'_>, root: &Path, net: &mut Net) -> Decided {
             let new = found.head.clone().unwrap_or_else(|| "unknown".to_string());
             found.behind = Some(0);
             found.installed_files_behind = false;
-            found.end(S::FastForwarded, format!("`{branch}` {old} -> {new} ({behind} commit(s))"))
+            let mut detail = format!("`{branch}` {old} -> {new} ({behind} commit(s))");
+            if !identical.is_empty() {
+                detail.push_str("; discarded local edits identical to origin: ");
+                detail.push_str(&git::summarize(&identical));
+            }
+            found.end(S::FastForwarded, detail)
         }
         Err(git::Refusal::WouldOverwrite(paths)) => {
             found.end(S::WouldOverwrite, format!("a local file is in the way: {paths}"))
         }
         Err(git::Refusal::Other(e)) => found.end(S::GitFailure, e),
     }
+}
+
+/// Row 9's exception (#11553): the dirty tracked paths when every one is
+/// identical to `origin/<branch>` ([`crate::git_ff_identical`]), else `None`.
+/// Every probe is bounded and runs against a scratch copy of the index (a
+/// `git diff` may refresh it), so a checkout that stays `dirty` is left
+/// byte-for-byte as it was. A probe that fails or times out answers `None`.
+fn identical_to_origin(
+    root: &Path,
+    branch: &str,
+    local: impl Fn() -> Duration,
+) -> Option<Vec<String>> {
+    let paths = git::tracked_paths(root, local()).ok()?;
+    let index = git::scratch_index(root, local()).ok()?;
+    crate::git_ff_identical::all_dirty_tracked_identical_to_origin(
+        &git::tracking(branch),
+        paths,
+        |args| git::quiet_ok(root, &index, args, local()),
+    )
 }
 
 #[cfg(test)]

@@ -1,12 +1,14 @@
 //! The git half of the checkout fast-forward (#10869): every command it runs
 //! in a registered workspace's main checkout.
 //!
-//! One command here writes to the checkout: [`fast_forward`], a
-//! `merge --ff-only` with hooks off. Everything else is a read, a
-//! `git ls-remote` that writes nothing, or a `fetch` that moves only the
-//! remote-tracking ref (not even `FETCH_HEAD`). Nothing here runs `reset`,
-//! `rebase`, `stash`, `checkout` or `clean`, makes a merge commit, or removes
-//! a lock file.
+//! Two commands here write to the checkout: [`fast_forward`], a
+//! `merge --ff-only` with hooks off, and [`discard_identical`], a
+//! `checkout HEAD -- <paths>` with hooks off that is only ever run on paths
+//! proven identical to `origin/<branch>`, immediately before the merge
+//! (#11553). Everything else is a read, a `git ls-remote` that writes
+//! nothing, or a `fetch` that moves only the remote-tracking ref (not even
+//! `FETCH_HEAD`). Nothing here runs `reset`, `rebase`, `stash` or `clean`,
+//! makes a merge commit, or removes a lock file.
 //!
 //! Two commands use the network: [`remote_head`] and [`fetch`]. Every ref
 //! operand that comes from the remote sits behind a standalone `--` (#9106,
@@ -46,13 +48,24 @@ pub(super) enum Refusal {
     Other(String),
 }
 
-fn tracking(branch: &str) -> String {
+pub(super) fn tracking(branch: &str) -> String {
     format!("refs/remotes/origin/{branch}")
 }
 
 /// Run `git` in `root` to an exit. `config` is `-c` pairs placed before the
 /// subcommand. `Err` when it could not be run or outlived `timeout`.
 fn run(root: &Path, config: &[&str], args: &[&str], timeout: Duration) -> Result<Output, String> {
+    run_with_index(root, config, args, timeout, None)
+}
+
+/// [`run`], with `GIT_INDEX_FILE` set to `index` when it is `Some`.
+fn run_with_index(
+    root: &Path,
+    config: &[&str],
+    args: &[&str],
+    timeout: Duration,
+    index: Option<&Path>,
+) -> Result<Output, String> {
     let mut cmd = Command::new("git");
     for pair in config {
         cmd.arg("-c").arg(pair);
@@ -68,6 +81,9 @@ fn run(root: &Path, config: &[&str], args: &[&str], timeout: Duration) -> Result
     // repository than `root`.
     for var in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"] {
         cmd.env_remove(var);
+    }
+    if let Some(index) = index {
+        cmd.env("GIT_INDEX_FILE", index);
     }
     crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
     match run_command(cmd, timeout) {
@@ -216,7 +232,97 @@ pub(super) fn tracked_changes(root: &Path, timeout: Duration) -> Result<Vec<Stri
     Ok(raw.lines().map(|l| l.trim().to_string()).collect())
 }
 
-/// The one write: fast-forward the checked-out branch to `origin/<branch>`.
+/// The tracked dirty paths, parsed from untrimmed porcelain by
+/// [`crate::git_ff_identical::tracked_paths_from_porcelain`] (the path
+/// column is fixed, so [`tracked_changes`]'s trimmed lines will not do).
+pub(super) fn tracked_paths(root: &Path, timeout: Duration) -> Result<Vec<String>, String> {
+    let args = [
+        "--no-optional-locks",
+        "status",
+        "--porcelain",
+        "--untracked-files=no",
+    ];
+    let out = run(root, &[], &args, timeout)?;
+    if !out.status.success() {
+        return Err(format!("git {} failed: {}", args.join(" "), stderr(&out)));
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    Ok(crate::git_ff_identical::tracked_paths_from_porcelain(raw.lines()))
+}
+
+/// A private copy of a checkout's index, for probes that would otherwise
+/// rewrite the real one. Removed on drop.
+pub(super) struct ScratchIndex {
+    _dir: tempfile::TempDir,
+    path: std::path::PathBuf,
+}
+
+/// Copy the checkout's index to a fresh temp dir. `git diff <commit> --
+/// <path>` refreshes the stat cache and writes the index back whenever it
+/// meets a file that is stat-dirty but identical, and `--no-optional-locks`
+/// does not stop it (git's `refresh_index_quietly`). A probe that runs
+/// against this copy leaves the operator's index and its lock alone.
+pub(super) fn scratch_index(root: &Path, timeout: Duration) -> Result<ScratchIndex, String> {
+    let at = ok(root, &["rev-parse", "--git-path", "index"], timeout)?;
+    let real = root.join(at);
+    let dir = tempfile::TempDir::new().map_err(|e| format!("scratch index: {e}"))?;
+    let path = dir.path().join("index");
+    let copy_err = |e: std::io::Error| format!("scratch index from {}: {e}", real.display());
+    std::fs::copy(&real, &path).map_err(copy_err)?;
+    // Keep the index file's own mtime: git's racy-entry check compares each
+    // entry's mtime with it, and a newer copy would make git trust a stale
+    // stat entry for a file edited in the same second the index was written.
+    let mtime = std::fs::metadata(&real)
+        .and_then(|m| m.modified())
+        .map_err(copy_err)?;
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .and_then(|f| f.set_modified(mtime))
+        .map_err(copy_err)?;
+    Ok(ScratchIndex { _dir: dir, path })
+}
+
+/// A bounded success probe against `index`: `true` only when `git <args>`
+/// ran and exited 0. A timeout or an error answers `false`, so a check built
+/// on it fails closed. `core.splitIndex=false`, so a refresh written to the
+/// copy never puts a shared-index file in the real git dir.
+pub(super) fn quiet_ok(
+    root: &Path,
+    index: &ScratchIndex,
+    args: &[&str],
+    timeout: Duration,
+) -> bool {
+    let config = ["core.splitIndex=false"];
+    run_with_index(root, &config, args, timeout, Some(&index.path))
+        .is_ok_and(|out| out.status.success())
+}
+
+/// The second write (#11553): `git checkout HEAD -- <paths>`, discarding
+/// local edits that are byte-identical to `origin/<branch>`. Only ever called
+/// with paths [`crate::git_ff_identical::all_dirty_tracked_identical_to_origin`]
+/// vouched for, and only immediately before [`fast_forward`].
+///
+/// Hooks are off (a path checkout still fires `post-checkout`), and so is
+/// `submodule.recurse`, as for [`fast_forward`]. Bounded like the merge, and
+/// for the same reason.
+pub(super) fn discard_identical(root: &Path, paths: &[String]) -> Result<(), String> {
+    let mut args = vec!["checkout", "HEAD", "--"];
+    args.extend(paths.iter().map(String::as_str));
+    let out = run(
+        root,
+        &["core.hooksPath=/dev/null", "submodule.recurse=false"],
+        &args,
+        MERGE_TIMEOUT,
+    )?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!("git checkout HEAD -- failed: {}", stderr(&out)))
+    }
+}
+
+/// The main write: fast-forward the checked-out branch to `origin/<branch>`.
 ///
 /// Hooks are off (a repo's `post-merge` must not run unattended inside the
 /// daemon), and so are the two config switches that would make a plain merge
