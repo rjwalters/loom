@@ -107,6 +107,7 @@ mod tests {
             tokens_status: None,
             tokens_status_reason: None,
             no_phase_cause: None,
+            phase_tap_usage: Vec::new(),
             issue,
             sweep_id: sweep_id.to_string(),
             model: None,
