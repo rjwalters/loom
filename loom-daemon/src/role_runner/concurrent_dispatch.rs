@@ -714,7 +714,7 @@ impl RoleDispatcher {
             }
         }
         // Stable: equal counts keep round-robin order.
-        observed.sort_by(|a, b| b.1.cmp(&a.1));
+        observed.sort_by_key(|o| std::cmp::Reverse(o.1));
         for (slot, (entry, _)) in slots.into_iter().zip(observed) {
             order[slot] = entry;
         }
