@@ -12,6 +12,13 @@
 //! symlink at any level, inside the worktree, owned by this user). It
 //! measures every artifact directory it finds, kept or not.
 //!
+//! Besides the fixed names, [`collect`] reclaims agent-chosen cargo target
+//! directories at any name (`.loom-target/`, `.loom/target-doctor-<N>/`,
+//! #11193): discovered by content ([`build_tree::discover_build_roots`]) and
+//! removed only once [`build_tree::prove_build_tree`] shows they hold nothing
+//! but cargo output and git tracks nothing under them. A symlinked, foreign,
+//! escaping, mixed-content or tracked root is kept with its reason.
+//!
 //! [`remove`] takes the candidates from any number of [`collect`] calls,
 //! largest first, and asks a stop condition before each one. The stop is
 //! judged **per volume** (filesystem, `st_dev`): once it fires for a
@@ -39,6 +46,8 @@ use std::time::{Duration, SystemTime};
 
 use chrono::Utc;
 
+use crate::generated_artifact::build_tree::{self, BuildRoot};
+
 use crate::target_orphan_reclaim::{
     current_euid, newest_mtime_and_size, owned_by_us, production_open_handles, vet_path_inside,
 };
@@ -58,7 +67,8 @@ pub struct ArtifactDir {
     pub num: u32,
     /// The worktree root.
     pub worktree: PathBuf,
-    /// Top-level directory name, e.g. `"target"`.
+    /// Worktree-relative directory path, e.g. `"target"` or (#11193) a
+    /// discovered `".loom/target-doctor-7"`.
     pub name: String,
     /// Bytes under it, not following symlinks (0 for a symlink).
     pub bytes: u64,
@@ -216,6 +226,54 @@ fn artifact_dirs(worktree: &Path) -> Vec<(String, PathBuf, std::fs::Metadata)> {
         .collect()
 }
 
+/// Content-discovered cargo build roots below `worktree` (#11193), minus
+/// those the fixed-name list already covers.
+fn discovered_roots(worktree: &Path) -> Vec<BuildRoot> {
+    build_tree::discover_build_roots(worktree)
+        .into_iter()
+        .filter(|root| {
+            !crate::worktree_ops::orphan_recovery::BUILD_ARTIFACT_PATTERNS
+                .iter()
+                .any(|p| p.trim_end_matches('/') == root.rel)
+        })
+        .collect()
+}
+
+/// Why a discovered build root must stay, or `None` when it may go: it must
+/// be a real directory (no symlink at any level) inside the worktree, owned
+/// by this user, proven to hold nothing but cargo output, and untracked.
+fn build_root_keep_reason(worktree: &Path, root: &BuildRoot, euid: u32) -> Option<String> {
+    if root.symlink {
+        return Some("symlinked cargo build root: never followed".to_string());
+    }
+    let path = worktree.join(&root.rel);
+    if let Err(why) = vet_path_inside(worktree, &path) {
+        return Some(format!("not reclaimed: {why}"));
+    }
+    let meta = match std::fs::symlink_metadata(&path) {
+        Ok(meta) => meta,
+        Err(e) => return Some(format!("cannot stat: {e}")),
+    };
+    if !owned_by_us(meta.uid(), euid) {
+        return Some(format!("owned by uid {}, not this daemon's", meta.uid()));
+    }
+    if let Err(why) = build_tree::prove_build_tree(&path) {
+        return Some(format!("not a proven cargo build tree: {why}"));
+    }
+    match build_tree::tracks_files_under(worktree, &root.rel) {
+        Some(false) => None,
+        Some(true) => Some("git tracks files under it: not build output".to_string()),
+        None => Some("git cannot list tracked files under it: not proven build output".to_string()),
+    }
+}
+
+fn root_bytes(worktree: &Path, root: &BuildRoot) -> u64 {
+    if root.symlink {
+        return 0;
+    }
+    newest_mtime_and_size(&worktree.join(&root.rel)).map_or(0, |(_, bytes)| bytes)
+}
+
 fn measured(meta: &std::fs::Metadata, path: &Path) -> u64 {
     if meta.file_type().is_symlink() {
         return 0;
@@ -267,6 +325,10 @@ pub fn collect(
                     .kept
                     .push((dir(&name, measured(&meta, &path)), reason.clone()));
             }
+            for root in discovered_roots(&worktree) {
+                let bytes = root_bytes(&worktree, &root);
+                report.kept.push((dir(&root.rel, bytes), reason.clone()));
+            }
             report.skipped.push((num, reason));
             continue;
         }
@@ -286,6 +348,13 @@ pub fn collect(
                 continue;
             }
             candidates.push(dir(&name, measured(&meta, &path)));
+        }
+        for root in discovered_roots(&worktree) {
+            let artifact = dir(&root.rel, root_bytes(&worktree, &root));
+            match build_root_keep_reason(&worktree, &root, euid) {
+                Some(why) => report.kept.push((artifact, why)),
+                None => candidates.push(artifact),
+            }
         }
     }
     candidates
@@ -578,3 +647,7 @@ pub fn reclaim_idle_targets(
 #[cfg(test)]
 #[path = "artifact_reclaim_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "build_root_tests.rs"]
+mod build_root_tests;
