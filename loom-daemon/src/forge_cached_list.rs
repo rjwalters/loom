@@ -492,6 +492,7 @@ mod tests {
             author: Some(s("octocat")),
             author_association: None,
             is_pull_request: is_pr,
+            open_sub_issues: None,
         }
     }
 

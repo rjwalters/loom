@@ -97,6 +97,7 @@ use super::*;
 
 mod fingerprint;
 mod hold;
+mod peer_expiry;
 
 pub(crate) use fingerprint::ParkKind;
 pub(crate) use hold::NoopCooldownTable;

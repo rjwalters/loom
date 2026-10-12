@@ -9,8 +9,10 @@
 //!
 //! **Facts only.** Every host emits its own view; nothing is elected, nothing
 //! is capped, and no rate or estimate is computed here. `dropped_total` is
-//! cumulative **per process lifetime**: it restarts at 0 when the daemon
-//! restarts, so a reader must treat a decrease as a counter reset.
+//! the durable loss-ledger sum (Issue #11527): it counts every loss reason —
+//! queue overflow, transport-level permanent rejection, partial rejection —
+//! and survives a daemon restart. A decrease is therefore no longer an
+//! expected counter reset; only a removed or reset ledger file produces one.
 //!
 //! **OTLP only.** The scalars ride as `loom.host_export.*` attributes
 //! ([`HOST_EXPORT_LOG_ATTRIBUTE_KEYS`], which the collector's log `keep_keys`
@@ -43,9 +45,19 @@ pub struct ExporterExport {
     pub name: String,
     /// Envelopes currently queued, waiting for a flush.
     pub queue_depth: u64,
-    /// Envelopes dropped (oldest first) for arriving at a full queue, summed
-    /// over this process's lifetime. Resets to 0 on a daemon restart.
+    /// Records lost over this exporter's lifetime, summed over every reason
+    /// in `dropped_by_reason`. **Durable** (Issue #11527): backed by the
+    /// on-disk loss ledger, so it survives a daemon restart instead of
+    /// resetting to 0. Counts are envelopes, except `receiver_rejected`
+    /// which the OTLP receiver reports in signal units.
     pub dropped_total: u64,
+    /// The by-reason breakdown behind `dropped_total` (Issue #11527):
+    /// `queue_overflow`, `capacity_shrink`, `status_<code>`,
+    /// `non_json_response`, `response_too_large`, `invalid_response`,
+    /// `receiver_rejected`, `trace_unmappable`. Absent (rather than empty)
+    /// when nothing has been lost, and on records from before #11527.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub dropped_by_reason: BTreeMap<String, u64>,
     /// When a batch was last acked by the backend. Absent when none has been
     /// acked this process: unknown, never a fabricated time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -69,13 +81,15 @@ pub struct HostExportRecord {
     pub fact_id_missing_total: u64,
 }
 
-/// One queue's depth and lifetime drop count, as the collector reads them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// One queue's depth and lifetime loss facts, as the collector reads them.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct QueueStats {
     /// Envelopes currently queued.
     pub depth: u64,
-    /// Lifetime drops.
+    /// Lifetime losses over every reason (durable loss-ledger sum).
     pub dropped_total: u64,
+    /// The by-reason breakdown behind `dropped_total` (Issue #11527).
+    pub dropped_by_reason: BTreeMap<String, u64>,
 }
 
 impl HostExportRecord {
@@ -93,12 +107,13 @@ impl HostExportRecord {
         let exporters = active
             .into_iter()
             .map(|name| {
-                let stats = queues.get(&name).copied().unwrap_or_default();
+                let stats = queues.get(&name).cloned().unwrap_or_default();
                 let last_flush_ok_at = statuses.get(&name).and_then(|s| s.last_success_at);
                 ExporterExport {
                     name,
                     queue_depth: stats.depth,
                     dropped_total: stats.dropped_total,
+                    dropped_by_reason: stats.dropped_by_reason,
                     last_flush_ok_at,
                 }
             })

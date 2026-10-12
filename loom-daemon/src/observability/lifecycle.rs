@@ -858,7 +858,7 @@ pub fn finish_execution(
         if !observed {
             attrs.insert("loom.timing_source".into(), "terminal_observed".into());
         }
-        let status = if !observed {
+        let status = if !observed || result == roll_interruption::RESULT {
             SpanStatus::Unset
         } else if result == "success" {
             SpanStatus::Ok
@@ -1004,25 +1004,9 @@ fn identity_gone(pid: u32, observed_at: Option<chrono::DateTime<Utc>>) -> bool {
     })
 }
 
+#[cfg(test)]
 fn recover_orphans(journal: &Journal) {
-    // A worker exit precedes authoritative reaping/verification. The live
-    // supervisor still owns that gap, even when every worker PID is gone.
-    let _ = journal.finish_abandoned(
-        |span| {
-            identity_gone(span.owner_pid, span.owner_observed_at)
-                && span
-                    .supervisor_pid
-                    .is_some_and(|pid| identity_gone(pid, span.supervisor_observed_at))
-        },
-        attributes(&[
-            ("loom.result", "process_lost"),
-            // #10640: what recovery knows — the child and its supervisor both
-            // exited before either recorded a close. Status stays unset.
-            (role_failure::FAILURE_CLASS, "supervisor-lost"),
-            ("loom.recovered", "true"),
-            ("loom.timing_source", "recovery_observed"),
-        ]),
-    );
+    roll_interruption::recover(journal, &mut roll_interruption::Records::at(None));
 }
 
 pub fn backfill(root: &Path, queue: &dyn super::queue::QueueSink) -> usize {
@@ -1033,13 +1017,14 @@ pub fn backfill(root: &Path, queue: &dyn super::queue::QueueSink) -> usize {
         return 0;
     };
     let mut count = 0;
+    let mut rolls = roll_interruption::Records::from_state_dir();
     for entry in entries.filter_map(Result::ok) {
         let path = entry.path();
         if path.extension().is_none_or(|e| e != "jsonl") {
             continue;
         }
         let journal = Journal::from_path(path);
-        recover_orphans(&journal);
+        roll_interruption::recover(&journal, &mut rolls);
         match journal.drain(|span| {
             let context = span.context.clone();
             let mut envelope = TelemetryEnvelope::new(
@@ -1189,10 +1174,12 @@ pub fn role_invocation(
     });
     let outcome = invoke();
     let noted = role_failure::take();
+    let resumed_from = roll_interruption::take_resumed_from();
     let Some(RoleSlot::Open(span)) = ROLE_CONTEXT.with(|slot| slot.borrow_mut().take()) else {
         return (outcome, None);
     };
-    let failure = role_failure::for_outcome(&outcome, noted);
+    let roll = roll_interruption::stopped(&span);
+    let failure = role_failure::for_outcome(&outcome, noted).filter(|_| roll.is_none());
     let trace = Some(RoleTrace {
         context: span.context().clone(),
         execution: execution.clone(),
@@ -1208,11 +1195,19 @@ pub fn role_invocation(
     if let Some(failure) = &failure {
         close.extend(failure.attributes());
     }
+    if let Some(from) = resumed_from {
+        close.insert(roll_interruption::RESUMED_FROM.into(), from);
+    }
+    let result = roll.map_or(result, |roll| {
+        roll.apply(&mut close);
+        roll_interruption::RESULT.to_owned()
+    });
     finish_execution(root, &execution, &result, close);
     (outcome, trace)
 }
 
 mod role_failure;
+pub mod roll_interruption;
 pub use role_failure::{
     note_role_failure, RoleFailure, EXIT_CODE, FAILURE_CLASS, ROLE_FAILURE_ATTRIBUTE_KEYS,
     UNCLASSIFIED,

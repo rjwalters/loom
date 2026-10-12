@@ -1145,3 +1145,23 @@ fn a_paged_walk_falls_short_with_its_rows_and_a_reason() {
         list_issues_cached_paged_as("t", &gh, Some(dir.path()), Some(&other), "x", "open").is_err()
     );
 }
+
+/// #11483: `sub_issues_summary` becomes the open-child count; an absent or
+/// malformed summary is `None` (fail open to the pre-#11483 behaviour).
+#[test]
+fn sub_issues_summary_parses_to_open_child_count() {
+    let body = r#"[
+        {"number": 1, "sub_issues_summary": {"total": 3, "completed": 1, "percent_completed": 33}},
+        {"number": 2, "sub_issues_summary": {"total": 3, "completed": 3, "percent_completed": 100}},
+        {"number": 3},
+        {"number": 4, "sub_issues_summary": null},
+        {"number": 5, "sub_issues_summary": {"total": "x", "completed": 1}},
+        {"number": 6, "sub_issues_summary": {"total": 1, "completed": 2}}
+    ]"#;
+    let open: Vec<Option<u32>> = parse_rest_issues(body)
+        .unwrap()
+        .iter()
+        .map(|r| r.open_sub_issues)
+        .collect();
+    assert_eq!(open, vec![Some(2), Some(0), None, None, None, None]);
+}
