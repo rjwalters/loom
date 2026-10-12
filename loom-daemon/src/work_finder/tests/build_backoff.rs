@@ -1,5 +1,6 @@
 //! The build back-off (#9410) in pass 2 of a multi-workspace tick: every
-//! candidate of a held repo waits whatever its priority (#11508), in-flight
+//! candidate of a held repo waits whatever its priority (#11508) except a
+//! verified red-main fix (#9244), in-flight
 //! sweeps are untouched, and `false` is the pre-#9410 tick exactly. Since
 //! #10624 the hold is per workspace: a held repo never defers a sibling.
 
@@ -91,17 +92,17 @@ fn engaged_defers_every_plain_candidate_and_leaves_in_flight_alone() {
 // -- AC5 ----------------------------------------------------------------------
 
 /// #11508 (operator ruling): priority changes order, never admission. A
-/// `loom:very-important` candidate, a legacy star and a verified red-main
-/// fix are all deferred by the back-off exactly like a plain candidate.
+/// `loom:very-important` candidate and a legacy star are deferred by the
+/// back-off exactly like a plain candidate.
 #[test]
 fn a_very_important_candidate_is_held_by_the_backoff_like_any_other() {
     let mut multi = vec![(
-        FakeSource::once(vec![issue(1), vi(5), starred(6), fix(9)]),
+        FakeSource::once(vec![issue(1), vi(5), starred(6)]),
         RecordingDispatcher::default(),
     )];
-    let report = run(&mut multi, 10, None, &[RED], &[true]);
+    let report = run(&mut multi, 10, None, &[], &[true]);
     assert!(multi[0].1.dispatched.is_empty());
-    assert_eq!((report.dispatched, report.deferred_build_backoff), (0, 4));
+    assert_eq!((report.dispatched, report.deferred_build_backoff), (0, 3));
     let rows = ready_queue::finish(&report.queue, &[]);
     let vi_row = rows.iter().find(|r| r.issue == 5).unwrap();
     assert_eq!(vi_row.disposition, Qd::DeferredBuildBackoff);
@@ -110,6 +111,38 @@ fn a_very_important_candidate_is_held_by_the_backoff_like_any_other() {
     let mut multi = vec![(FakeSource::once(vec![vi(5)]), RecordingDispatcher::default())];
     let report = run(&mut multi, 10, None, &[], &[false]);
     assert_eq!((report.dispatched, report.deferred_build_backoff), (1, 0));
+}
+
+/// The red-main-fix lane (#9244) is not a priority and keeps its bypass
+/// (#11508, Judge): while `main` is red nothing merges, so holding the fix
+/// would deadlock the debt the back-off waits on. The VI and the star in the
+/// same held repo still wait, and the fix gains no place in the order.
+#[test]
+fn a_verified_red_main_fix_bypasses_the_backoff_but_priority_does_not() {
+    let mut multi = vec![(
+        FakeSource::once(vec![issue(1), vi(5), starred(6), fix(9)]),
+        RecordingDispatcher::default(),
+    )];
+    let report = run(&mut multi, 10, None, &[RED], &[true]);
+    assert_eq!(multi[0].1.dispatched, vec![9]);
+    assert_eq!((report.dispatched, report.deferred_build_backoff), (1, 3));
+    let rows = ready_queue::finish(&report.queue, &[]);
+    let fix_row = rows.iter().find(|r| r.issue == 9).unwrap();
+    assert!(fix_row.main_red_fix, "the queue still names the verified fix");
+    assert!(rows
+        .iter()
+        .filter(|r| r.issue != 9)
+        .all(|r| !r.main_red_fix));
+    // Not an ordering key: the VI (level 2) still ranks ahead of the fix.
+    let rank = |n: u32| rows.iter().find(|r| r.issue == n).unwrap().rank;
+    assert!(rank(5) < rank(9));
+
+    // Without a verified-red main the marker is inert: the fix waits too.
+    let mut multi = vec![(FakeSource::once(vec![fix(9)]), RecordingDispatcher::default())];
+    let report = run(&mut multi, 10, None, &[], &[true]);
+    assert_eq!((report.dispatched, report.deferred_build_backoff), (0, 1));
+    let rows = ready_queue::finish(&report.queue, &[]);
+    assert!(!rows[0].main_red_fix);
 }
 
 #[test]

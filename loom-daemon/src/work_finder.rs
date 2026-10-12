@@ -1784,7 +1784,7 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
         // dropped from `ready` (and from `seen`) unless `main` is red.
         report.note_listing(idx, source.listing_complete());
         let lane = lanes.get(idx).copied().unwrap_or_default();
-        main_red_fix::evaluate(lane, &mut ready, dispatcher);
+        let red = main_red_fix::evaluate(lane, &mut ready, dispatcher);
         report.seen += ready.len();
         let workspace_priority = priorities
             .get(idx)
@@ -1800,7 +1800,7 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
         let repo_halted = halted.get(idx).copied().unwrap_or(false);
         if repo_halted && !lane.admits_fixes_while_halted() {
             // #9017: name WHICH hold tripped, not just that one did.
-            halt_cause::record_halted(q, &ready, idx, workspace_priority, halt_causes);
+            halt_cause::record_halted(q, &ready, idx, workspace_priority, red, halt_causes);
             continue;
         }
 
@@ -1812,7 +1812,7 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
         if commands_missing[idx] {
             report.skipped_workspace_commands_missing += ready.len();
             for item in &ready {
-                let key = ready_queue::key_of(idx, workspace_priority, item);
+                let key = ready_queue::key_of(idx, workspace_priority, item, red);
                 ready_queue::record_skip(q, key, item, Qd::WorkspaceCommandsMissing, None);
             }
             continue;
@@ -1823,7 +1823,7 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
 
         for item in ready {
             cap.note_surface(idx, &item, in_flight.contains(&item.number));
-            let key = ready_queue::key_of(idx, workspace_priority, &item);
+            let key = ready_queue::key_of(idx, workspace_priority, &item, red);
             // `held_until` (Issue #9311): `None` for every disposition but
             // the five time-boxed holds below, which pass their computed
             // expiry explicitly as the third argument.
@@ -1991,7 +1991,8 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
             continue;
         }
         // Build back-off (#9410), per repo since #10624: a WIP policy no
-        // priority bypasses (#11508).
+        // priority bypasses (#11508). A verified red-main fix does (#9244):
+        // it is what lets the repo merge again and drain the debt.
         if build_backoff::defers(build_backoff_held, &cand) {
             report.deferred_build_backoff += 1;
             ready_queue::resolve(q, &cand, Qd::DeferredBuildBackoff, None);

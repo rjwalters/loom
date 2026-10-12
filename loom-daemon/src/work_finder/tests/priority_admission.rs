@@ -2,7 +2,8 @@
 //! on #11103's rollout): `loom:important` / `loom:very-important` order the
 //! queue (level, oldest, number), but no priority overflows a cap, skips the
 //! repo-sharding slice, or makes an issue eligible. The legacy star
-//! (`loom:operator-priority`) carries no weight at all.
+//! (`loom:operator-priority`) carries no weight at all. The verified red-main
+//! fix (#9244) is not a priority and keeps its slice bypass.
 
 use super::*;
 
@@ -131,13 +132,68 @@ fn a_very_important_candidate_outside_this_hosts_slice_is_deferred() {
     assert_eq!(row.disposition, Qd::DeferredOutOfSlice);
 }
 
+/// The red-main-fix lane (#9244) is not a priority and keeps its slice
+/// bypass (#11508, Judge): another host's slice must not hold the fix that
+/// turns `main` green. It is kept in its draw position and does not make
+/// this host's slice non-empty. On a green `main` the marker grants nothing.
+#[test]
+fn a_verified_red_main_fix_outside_this_hosts_slice_is_not_deferred() {
+    let fix = |n: u32| {
+        WorkItem::new(n, vec!["loom:issue".into()])
+            .with_body(Some("Fixes red main.\n\n<!-- loom:main-red-fix -->\n".into()))
+    };
+    let red = RedMainLane {
+        verified_red: true,
+        gate_disabled: false,
+        other_hold: false,
+    };
+    let tick = |multi: &mut Vec<(FakeSource, RecordingDispatcher)>, lanes: &[RedMainLane]| {
+        let slice = [true, false];
+        tick_multi_with_repo_cap(
+            multi,
+            &[100, 100],
+            4.into(),
+            &[false, false],
+            None,
+            usize::MAX,
+            false,
+            Some(&slice),
+            None,
+            lanes,
+        )
+    };
+    // Repo 1 (out of slice) is verified red: its fix dispatches, its VI waits.
+    let mut multi = vec![
+        (FakeSource::once(vec![issue(1)]), full(0)),
+        (FakeSource::once(vec![vi(5), fix(9)]), RecordingDispatcher::default()),
+    ];
+    let report = tick(&mut multi, &[RedMainLane::default(), red]);
+    assert_eq!(multi[0].1.dispatched, vec![1]);
+    assert_eq!(multi[1].1.dispatched, vec![9]);
+    assert_eq!(report.deferred_out_of_slice, 1);
+    let rows = ready_queue::finish(&report.queue, &[]);
+    let disp = |n: u32| rows.iter().find(|r| r.issue == n).unwrap().disposition;
+    assert_eq!(disp(5), Qd::DeferredOutOfSlice);
+
+    // Repo 1 green: the marker is inert and the fix is deferred like the VI.
+    let mut multi = vec![
+        (FakeSource::once(vec![issue(1)]), full(0)),
+        (FakeSource::once(vec![vi(5), fix(9)]), RecordingDispatcher::default()),
+    ];
+    let report = tick(&mut multi, &[]);
+    assert_eq!(multi[0].1.dispatched, vec![1]);
+    assert!(multi[1].1.dispatched.is_empty());
+    assert_eq!(report.deferred_out_of_slice, 2);
+}
+
 #[test]
 fn the_published_row_keys_are_level_created_at_number() {
     let mut multi = vec![(FakeSource::once(vec![issue(1), vi(2)]), full(0))];
     let report = tick_multi(&mut multi, &[100], 10, &[false]);
     let rows = ready_queue::finish(&report.queue, &[]);
     assert_eq!(rows[0].issue, 2, "rank 1 is the very-important issue");
-    assert!(!rows[0].operator_priority && !rows[0].main_red_fix, "deprecated, always false");
+    assert!(!rows[0].operator_priority, "deprecated, always false");
+    assert!(!rows[0].main_red_fix, "no verified red-main fix here");
     assert_eq!(
         ready_queue::ordering_names(),
         vec!["level".to_string(), "created_at".into(), "number".into()]

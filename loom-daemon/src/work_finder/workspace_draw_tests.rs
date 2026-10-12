@@ -9,7 +9,7 @@ fn item(n: u32, created: Option<&str>, labels: &[&str]) -> WorkItem {
 }
 
 fn cand(idx: usize, n: u32, created: Option<&str>, labels: &[&str]) -> PriorityCandidate {
-    super::super::ready_queue::key_of(idx, 0, &item(n, created, labels))
+    super::super::ready_queue::key_of(idx, 0, &item(n, created, labels), false)
 }
 
 fn numbers(c: &[PriorityCandidate]) -> Vec<(usize, u32)> {
@@ -56,7 +56,7 @@ fn in_workspace_order_is_independent_of_listing_order() {
 /// carry no level (the bridge is gone).
 #[test]
 fn the_level_comes_only_from_the_two_priority_labels() {
-    let key = |i: &WorkItem| super::super::ready_queue::key_of(0, 0, i).level;
+    let key = |i: &WorkItem| super::super::ready_queue::key_of(0, 0, i, false).level;
     assert_eq!(key(&item(1, None, &["loom:operator-priority"])), Level::Default);
     assert_eq!(key(&item(2, None, &["loom:operator-high-priority"])), Level::Default);
     assert_eq!(key(&item(3, None, &["loom:high-priority-inherited"])), Level::Default);

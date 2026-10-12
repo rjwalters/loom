@@ -6,8 +6,11 @@
 //! other ready issue in that repo, whatever its priority, keeps the
 //! `WorkspaceHalted` disposition.
 //!
-//! It no longer sorts ahead (#11508 removed the red-main ordering key):
-//! whoever files a red-main fix labels it `loom:very-important`.
+//! It no longer sorts ahead (#11508 removed the red-main ordering key), but
+//! it is not a priority either: it keeps its bypass of the build back-off,
+//! the file-overlap gate and the repo-sharding slice
+//! ([`super::ordering::PriorityCandidate::main_red_fix`]), which a red `main`
+//! would otherwise deadlock.
 //!
 //! "Verified red" is [`WorkspaceHealthStates::is_halted`], never the
 //! work finder's per-root `halted` hold, which is also set while a gate run is
@@ -18,7 +21,7 @@
 //! stands in for it — one cached forge read per repo per tick, made only when
 //! the repo has a marker-bearing candidate.
 //!
-//! A marker on a green repo is inert: no halt bypass.
+//! A marker on a green repo is inert: no halt or gate bypass.
 //!
 //! # Unpromoted fixes (#10118)
 //!

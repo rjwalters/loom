@@ -329,10 +329,14 @@ pub struct RepoCapSnapshot {
 /// slice partition, then (when a per-repo cap is configured) the #9090 track
 /// affinity partition.
 ///
-/// No candidate is exempt (#11508): the slice defers an out-of-slice
+/// No priority is exempt (#11508): the slice defers an out-of-slice
 /// candidate whatever its priority, because priority changes order, never
 /// admission. (Before #11508 starred, red-main-fix and
-/// `loom:very-important` candidates were lifted ahead as "lanes".)
+/// `loom:very-important` candidates were lifted ahead as "lanes".) A verified
+/// red-main fix (#9244) is still never deferred by the slice, so another
+/// host's slice cannot hold the fix that turns `main` green; it keeps its
+/// draw position (it is not lifted ahead) and does not count toward "is my
+/// slice empty?".
 ///
 /// Both partitions are **stable**, so the workspace-draw order still decides
 /// order within each group. With
@@ -386,7 +390,9 @@ fn shape(
 /// `None` is a no-op. Otherwise the already-sorted list splits into in-slice /
 /// out-of-slice preserving each partition's relative order; out-of-slice
 /// candidates dispatch THIS TICK only when the slice was completely empty at
-/// the top of the tick (work-conservation, #6243's AC).
+/// the top of the tick (work-conservation, #6243's AC). A verified red-main
+/// fix (#9244) is kept in place whatever its slice, but only a candidate of an
+/// in-slice repo makes the slice non-empty.
 fn apply_slice(
     candidates: Vec<PriorityCandidate>,
     preferred_slice: Option<&[bool]>,
@@ -395,15 +401,16 @@ fn apply_slice(
     let Some(slice) = preferred_slice else {
         return candidates;
     };
-    let (in_slice, out_of_slice): (Vec<_>, Vec<_>) = candidates
-        .into_iter()
-        .partition(|c| slice.get(c.workspace_idx).copied().unwrap_or(true));
-    if in_slice.is_empty() {
+    let in_slice_repo = |c: &PriorityCandidate| slice.get(c.workspace_idx).copied().unwrap_or(true);
+    if !candidates.iter().any(in_slice_repo) {
         // This host's slice has zero eligible candidates this tick — fall back
         // to the full out-of-slice queue rather than starving while other
         // repos have ready work.
-        return out_of_slice;
+        return candidates;
     }
+    let (in_slice, out_of_slice): (Vec<_>, Vec<_>) = candidates
+        .into_iter()
+        .partition(|c| c.main_red_fix || in_slice_repo(c));
     report.deferred_out_of_slice += out_of_slice.len();
     for c in &out_of_slice {
         ready_queue::resolve(&mut report.queue, c, Qd::DeferredOutOfSlice, None);

@@ -243,8 +243,10 @@ pub struct ReadyQueueRow {
     /// field stays on the wire only for compatibility.
     #[serde(default)]
     pub operator_priority: bool,
-    /// Deprecated (#11508): always `false`. The red-main-fix ordering boost
-    /// is gone; the field stays on the wire only for compatibility.
+    /// Whether it is a verified red-main fix this tick: it carries
+    /// `<!-- loom:main-red-fix -->` and its repo's `main` is verified red
+    /// (#9244). Since #11508 it is not an ordering key; it only bypasses the
+    /// build back-off, the file-overlap gate and the repo-sharding slice.
     #[serde(default)]
     pub main_red_fix: bool,
     /// The issue's `createdAt`, when the listing supplied it.

@@ -3011,10 +3011,17 @@ follows the workspace draw, and the single-workspace tick uses the same three
 keys. #11508 removed the legacy keys: the star (`loom:operator-priority`), its
 levels and inherited levels, the starred-at time and its restart store
 (`starred-<sha16>.json`, no longer read or written; `LOOM_STARRED_AT_PERSIST` is
-ignored), the red-main-fix boost (whoever files a red-main fix labels it
-`loom:very-important`), and `workspace_priority` as a rank key (it weights the
-workspace draw instead). The ready-queue row fields `operator_priority` and
-`main_red_fix` are always `false`, kept for wire compatibility.
+ignored), the red-main-fix ordering boost, and `workspace_priority` as a rank
+key (it weights the workspace draw instead). The ready-queue row field
+`operator_priority` is always `false`, kept for wire compatibility;
+`main_red_fix` still marks a verified red-main fix.
+
+**The red-main-fix lane is not a priority.** A candidate carrying
+`<!-- loom:main-red-fix -->` whose repo's `main` is verified red keeps three
+gate bypasses, because while `main` is red nothing merges and holding the fix
+would deadlock: the build back-off, the file-overlap gate (it still occupies)
+and the repo-sharding slice (kept in its draw position). On a green `main`
+the marker grants nothing.
 
 **Priority changes order, never eligibility or admission** (operator ruling on
 #11508). There is no priority side listing: a `loom:important` /
@@ -4806,8 +4813,8 @@ issue whose linked PR is in flight a non-candidate (`open_pr`), so the tick's
 next dispatch goes to another repo, and re-engagement when the PR merges is
 automatic. It composes with [repo sharding (#6243)](dispatcher-repo-sharding.md)
 in a fixed order: the sharding slice partition runs first, affinity reorders
-within its result, and the cap gates admission last. Starred and red-main-fix
-candidates are exempt from both partitions (#9244).
+within its result, and the cap gates admission last. No priority is exempt
+(#11508); a verified red-main fix is never deferred by the slice (#9244).
 
 #### Same-repo file-overlap deferral (#9781)
 
@@ -4827,7 +4834,8 @@ after the capacity, ramp, RAM and per-repo-cap gates, so it is work-conserving
   section, "To be determined", or no paths ⇒ *unknown*: never deferred and
   never occupying — same rule as `/loom:sweep`'s overlap-aware waves.
 - **Scheduling signal only**: no label, hold, stacking edge or extra forge read.
-  Starred and red-main-fix candidates are never deferred but still occupy.
+  No priority is exempt (#11508); a verified red-main fix is never deferred
+  but still occupies.
 - **v1 limitation**: an in-flight issue absent from the `loom:issue` listing
   (the usual case once it flips to `loom:building`) is not seen, so the gate
   mainly separates same-tick admissions; the reactive Doctor rebase stays the
@@ -5392,9 +5400,10 @@ adds no PR dispatch path of its own.
 
   So `debt == high` does not engage and `high + 1` does; while engaged,
   `debt == low` holds and `low − 1` releases.
-- **No bypass** (#11508). Priority changes order, never admission: a
-  `loom:important` / `loom:very-important` issue, a legacy star and a red-main
-  fix are all held like any other candidate in an engaged repo.
+- **No priority bypass** (#11508). Priority changes order, never admission: a
+  `loom:important` / `loom:very-important` issue and a legacy star are held
+  like any other candidate in an engaged repo. A verified red-main fix
+  (#9244) bypasses it: it is what lets the repo merge and drain the debt.
 - **Explicit dispatch is unaffected** (`dispatch_sweep` over IPC does not go
   through the work-finder tick).
 - **Observability.** One `INFO` line per edge, naming the repo (or the host
@@ -6270,7 +6279,7 @@ knobs not yet audited here.
 | `autonomous.workFinder.saturationBrake.loadPerCoreHold` | `LOOM_ADMISSION_BRAKE_LOAD_PER_CORE` | `0.95` (`4.0` before #5270) | Load-per-core at/over which new admissions are held for that tick. `<= 0`/invalid → default. Since #5270 sits deliberately *below* the host breaker's `2.5` trip: the brake is now the primary "dumb mode" CPU gate and engages first (a single over-threshold reading), the breaker remains the slower sustained-distress trip. **Restart required** — same startup-resolved global as `enabled` above (#5963) |
 | `autonomous.workFinder.saturationBrake.starvationWarnSecs` | `LOOM_ADMISSION_BRAKE_STARVATION_WARN_SECS` | `300` | Seconds of continuous held+0-in-flight before the `WARN`-level `STARVING` log fires once per streak (#5715). `<= 0`/invalid → default. See [Starvation escape hatch](#starvation-escape-hatch-5715) |
 | `autonomous.workFinder.saturationBrake.starvationEscapeSecs` | `LOOM_ADMISSION_BRAKE_STARVATION_ESCAPE_SECS` | `900` | Seconds of continuous held+0-in-flight before the escape hatch yields one tick despite the raw load still being over threshold, logged at `ERROR` (#5715). `<= 0`/invalid → default |
-| `autonomous.workFinder.buildBackoff.enabled` | *(config only)* | `true` | Build back-off on review + merge debt (#9410), per repo (#10624). While a repo's is engaged, no new unstarred issue build is admitted in that repo; starred and red-main-fix issues bypass it. Reads the role runner's demand ledger, so it is inert with the role runner off. `false` → pre-#9410 admission. Non-bool → default. **Live**. See [Build back-off on review and merge debt](#build-back-off-on-review-and-merge-debt-9410) |
+| `autonomous.workFinder.buildBackoff.enabled` | *(config only)* | `true` | Build back-off on review + merge debt (#9410), per repo (#10624). While a repo's is engaged, no new issue build is admitted in that repo whatever its priority; only a verified red-main fix bypasses it. Reads the role runner's demand ledger, so it is inert with the role runner off. `false` → pre-#9410 admission. Non-bool → default. **Live**. See [Build back-off on review and merge debt](#build-back-off-on-review-and-merge-debt-9410) |
 | `autonomous.workFinder.buildBackoff.high` | *(config only)* | `40` | Engage a repo's back-off when **its own** `review + changes + merge` debt is **strictly above** this (#10624). Zero, negative or non-integer → default. **Live** |
 | `autonomous.workFinder.buildBackoff.low` | *(config only)* | `25` | Release a repo's back-off when its debt is **strictly below** this. Zero, negative or non-integer → default; `low >= high` rejects the pair (both fall back to `40`/`25`, one `WARN`). **Live** |
 | `autonomous.workFinder.buildBackoff.hostHigh` | *(config only)* | absent (off) | Optional host-wide ceiling (#10624): engage when the **host total** debt is strictly above this; while engaged, every repo's unstarred builds are held. Needs `hostLow` too. **Live** |

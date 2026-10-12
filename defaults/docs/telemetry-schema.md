@@ -2080,9 +2080,8 @@ namespace that must be a short `[a-z0-9_-]` token (anything else is
 The work finder's ranked ready queue as of its last tick (Issue #8852, phase
 2). The rows are the same ones `loom-daemon queue` and `status --json`'s
 `last_work_finder_tick.queue` show. They are ordered by the daemon's own
-dispatch comparator (#9244): starred (`loom:operator-priority`) first, starred
-issues by starred-at, then red-main fixes while their repo's `main` is verified
-red, then workspace priority, then oldest `createdAt`, then issue number.
+dispatch comparator (#11508): level (`loom:very-important`, then
+`loom:important`, then none), then oldest `createdAt`, then issue number.
 `tier:*` labels do not affect the order.
 Envelopes carry `schema_version: 11`. **Native-HTTPS only**: the OTLP
 exporter never receives it (the mirror of `metric.points`).
@@ -2687,7 +2686,7 @@ Each row:
 | `level` | integer, optional | priority level (absent = `0`); on every row, like `star` (#11391). A `ready_wait` row reads the planner's `level` key since #11508 (1 `loom:important`, 2 `loom:very-important`); other rows still read the legacy level labels until #11510 |
 | `fleet_priority` | integer, optional | `ready_wait` only: the repo's fleet (workspace) priority tier; lower dispatches first |
 | `created_at` | RFC 3339, optional | `ready_wait` only: the issue's creation instant, the planner's age input (age = `as_of - created_at`; the instant is sent so an unchanged row stays unchanged) |
-| `main_red_fix` | bool, optional | `ready_wait` only: always absent (`false`) since #11508, which removed the red-main-fix ordering boost |
+| `main_red_fix` | bool, optional | `ready_wait` only: the row is a verified red-main fix (marker present and its repo's `main` verified red). Since #11508 a gate bypass, not an ordering key |
 | `hold_kind` | string, optional | the item is under a hold now: one of `operator`, `operator_only`, `operator_decision`, `merge_risk`, `critical_file`, `ac_hold`, `blocked`, `other` (the long-standing snake_case hold names). Derived from the PR's labels; the emitter does not read Champion's comments, so it reports `operator` where Champion applied `merge_risk` / `critical_file` / `ac_hold` and leaves that split to the reader. Additive on `fleet-state/v1`; absent = not held (or an older emitter) |
 | `holds` | array of string, optional | every hold the PR's labels name now (#11391), strongest first: `operator_decision`, `operator_only`, `operator`, `blocked`, `sequenced`, `other`. `hold_kind` is the winning one; a row with two holds no longer loses one. Absent = none. Additive on `fleet-state/v1` |
 | `rework` | integer, optional | Judge rejections the item's PR has taken (#11391): each arrival of `loom:changes-requested` in the PR's label history, except a repeat with no `loom:review-requested` / `loom:pr` arrival between (a relabel inside one attempt). Counted once per PR from the history, then +1 each time the row enters `doctor`. It does not read comments, so a daemon base-conflict flag that `sweep.outcome` excludes can count here. Absent = `0` or not read. Additive on `fleet-state/v1` |

@@ -28,8 +28,11 @@
 //!   runner off, demand width disabled, every entry older than `staleSecs` —
 //!   never engages, and releases an engaged back-off. A partly observed one
 //!   sums what it has, which can only err toward not engaging.
-//! - **No bypass.** Priority changes order, never admission (#11508): a
-//!   `loom:important` / `loom:very-important` candidate is held like any other.
+//! - **No priority bypass.** Priority changes order, never admission
+//!   (#11508): a `loom:important` / `loom:very-important` candidate is held
+//!   like any other. The one bypass is a verified red-main fix (#9244): while
+//!   `main` is red nothing merges, so holding the fix would deadlock the very
+//!   debt the back-off is waiting on.
 //!
 //! Config: `autonomous.workFinder.buildBackoff.{enabled, high, low, hostHigh,
 //! hostLow}`, re-read every tick from the daemon's primary workspace. No env
@@ -581,12 +584,14 @@ pub fn any_held(held: &[bool], workspaces: usize) -> bool {
 }
 
 /// Whether pass 2 defers `cand`: its workspace is held (by its own repo's
-/// debt or the host ceiling). No priority bypasses it (#11508: priority
-/// changes order, never admission). `held` is parallel to the tick's
-/// workspaces; an index past its end is not held.
+/// debt or the host ceiling) and it is not a verified red-main fix. No
+/// priority bypasses it (#11508: priority changes order, never admission);
+/// the red-main fix does (#9244), because it is what drains the merge debt.
+/// `held` is parallel to the tick's workspaces; an index past its end is not
+/// held.
 #[must_use]
 pub fn defers(held: &[bool], cand: &PriorityCandidate) -> bool {
-    held.get(cand.workspace_idx) == Some(&true)
+    held.get(cand.workspace_idx) == Some(&true) && !cand.main_red_fix
 }
 
 /// This tick's build back-off deferrals per repo, most-deferred first (ties

@@ -57,9 +57,11 @@ no priority side listing), and no priority exempts a candidate from any gate
    `createdAt` first; issue number ascending.
 
 **Removed ordering keys** (gone from dispatch since #11508): the star, the
-starred-at time and its restart store, the red-main-fix key (whoever finds a
-red-main fix labels it `loom:very-important`), the inherited-level key, and
-the cross-workspace tier and round-robin interleave.
+starred-at time and its restart store, the red-main-fix key, the
+inherited-level key, and the cross-workspace tier and round-robin interleave.
+A verified red-main fix is not a priority: it gains no place in the order, but
+keeps its bypass of the build back-off, the file-overlap gate and the
+repo-sharding slice, which a red `main` would otherwise deadlock.
 
 ## Migration
 

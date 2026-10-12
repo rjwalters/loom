@@ -196,7 +196,7 @@ fn ready_requests(dir: &Path) -> usize {
 fn planner_order(items: &[WorkItem]) -> Vec<u32> {
     let mut keys: Vec<_> = items
         .iter()
-        .map(|i| super::super::ready_queue::key_of(0, 100, i))
+        .map(|i| super::super::ready_queue::key_of(0, 100, i, false))
         .collect();
     keys.sort_by(super::super::candidate_cmp);
     keys.iter().map(|k| k.number).collect()

@@ -493,8 +493,8 @@ fn work_finder_record_carries_the_workspace_draw() {
     use crate::work_finder::{ready_queue, WorkItem};
     let item = |n: u32| WorkItem::with_created_at(n, vec!["loom:issue".into()], None);
     let candidates = vec![
-        ready_queue::key_of(0, 0, &item(1)),
-        ready_queue::key_of(1, 100, &item(2)),
+        ready_queue::key_of(0, 0, &item(1), false),
+        ready_queue::key_of(1, 100, &item(2), false),
     ];
     let (order, log) = draw_order(candidates, &[0, 100], 99);
     let log = log.unwrap();

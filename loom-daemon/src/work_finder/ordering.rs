@@ -27,6 +27,13 @@ pub struct PriorityCandidate {
     /// The issue's priority level (#11103), from its `loom:important` /
     /// `loom:very-important` label only ([`Level::of`]).
     pub level: Level,
+    /// Whether the issue carries the `<!-- loom:main-red-fix -->` marker
+    /// **and** its repo's `main` is verified red this tick (#9244). It is
+    /// not a priority: it is neither a [`candidate_cmp`] key nor an input to
+    /// [`Self::level`]. It only lets the fix that turns `main` green past the
+    /// three gates that `main` being red would otherwise deadlock (#11508):
+    /// the build back-off, the file-overlap gate and the repo-sharding slice.
+    pub main_red_fix: bool,
     /// The issue's `<!-- loom:complexity=<tier> -->` stratum (#4827), carried
     /// from its work item so pass 2's `dispatch()` can stratify the
     /// model-cost A/B arm assignment without re-fetching the body. Not part of

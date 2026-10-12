@@ -68,14 +68,24 @@ fn tier_of(item: &WorkItem) -> Option<String> {
 /// level comes only from the item's own `loom:important` /
 /// `loom:very-important` label (#11508): no star, inheritance or red-main
 /// bridge.
+///
+/// `repo_red` is whether that repo's `main` is verified red this tick
+/// (#9244): [`PriorityCandidate::main_red_fix`] is set only then, so a marker
+/// on a green repo is inert. It is a gate bypass, never an ordering key.
 #[must_use]
-pub fn key_of(idx: usize, workspace_priority: u32, item: &WorkItem) -> PriorityCandidate {
+pub fn key_of(
+    idx: usize,
+    workspace_priority: u32,
+    item: &WorkItem,
+    repo_red: bool,
+) -> PriorityCandidate {
     PriorityCandidate {
         workspace_idx: idx,
         workspace_priority,
         created_at: item.created_at.clone(),
         number: item.number,
         level: crate::priority_pick::Level::of(&item.labels),
+        main_red_fix: repo_red && item.is_main_red_fix(),
         complexity: None,
     }
 }
@@ -83,10 +93,11 @@ pub fn key_of(idx: usize, workspace_priority: u32, item: &WorkItem) -> PriorityC
 /// Sort one workspace's ready items into the in-workspace order (#11103):
 /// level, oldest `createdAt`, issue number. The single-workspace tick's
 /// ordering; the multi-workspace tick applies the same order inside each
-/// drawn workspace.
+/// drawn workspace. A red-main fix is not an ordering key, so `repo_red` is
+/// irrelevant here and passed as `false`.
 pub fn sort_lanes(items: &mut [WorkItem]) {
     items.sort_by(|a, b| {
-        super::workspace_draw::in_workspace_cmp(&key_of(0, 0, a), &key_of(0, 0, b))
+        super::workspace_draw::in_workspace_cmp(&key_of(0, 0, a, false), &key_of(0, 0, b, false))
     });
 }
 
@@ -244,10 +255,12 @@ pub fn finish(rows: &[TickQueueRow], roots: &[PathBuf]) -> Vec<ReadyQueueRow> {
                 // Deprecated by #9244 (its label deleted in #11105): always
                 // false, kept only for wire compatibility.
                 urgent: false,
-                // Deprecated by #11508 (no star or red-main ordering key):
-                // always false, kept only for wire compatibility.
+                // Deprecated by #11508 (no star ordering key): always false,
+                // kept only for wire compatibility.
                 operator_priority: false,
-                main_red_fix: false,
+                // The verified red-main fix (#9244): a gate bypass since
+                // #11508, not an ordering key.
+                main_red_fix: r.key.main_red_fix,
                 created_at: r.key.created_at.clone(),
                 tier: r.tier.clone(),
                 story_points: r.story_points,
