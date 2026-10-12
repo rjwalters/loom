@@ -54,6 +54,7 @@ mod tests {
                 name: "otlp".to_string(),
                 queue_depth: 4,
                 dropped_total: 7,
+                dropped_by_reason: [("status_400".to_string(), 7)].into(),
                 last_flush_ok_at: Some(chrono::Utc::now()),
             }],
             fact_id_missing_total: 3,

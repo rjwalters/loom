@@ -257,6 +257,15 @@ impl Exporter for OtlpExporter {
                         .entry(signal.unit().to_string())
                         .or_default()
                         .dropped += (count - items) as u64;
+                    if items < count {
+                        // Unmappable trace envelopes are a permanent, counted
+                        // loss (Issue #11527) — the mapping will never send
+                        // them, and a later retry cannot change that.
+                        *outcome
+                            .lost
+                            .entry(super::loss_ledger::REASON_TRACE_UNMAPPABLE.to_string())
+                            .or_default() += (count - items) as u64;
+                    }
                     let Some(request) = request else {
                         outcome.acknowledged += count;
                         offset += count;
@@ -281,6 +290,21 @@ impl Exporter for OtlpExporter {
                 .entry(signal.unit().to_string())
                 .or_default()
                 .accumulate(&response.counts);
+            // Permanently lost groups get a durable, by-reason count (Issue
+            // #11527): envelope units for a refused/unreadable response,
+            // signal units for partial rejection (the receiver counts items
+            // and does not identify the envelopes that carried them).
+            if !response.retry && response.counts.dropped > 0 {
+                if let Some(reason) = &response.loss_reason {
+                    *outcome.lost.entry(reason.clone()).or_default() += count as u64;
+                }
+            }
+            if response.counts.rejected > 0 {
+                *outcome
+                    .lost
+                    .entry(super::loss_ledger::REASON_RECEIVER_REJECTED.to_string())
+                    .or_default() += response.counts.rejected;
+            }
             if response.error.is_some() {
                 outcome.error = response.error;
             }
