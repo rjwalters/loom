@@ -143,8 +143,7 @@ fn pick_decision_record_size_is_bounded() {
             c.repo = "some-organisation/some-repository".to_string();
             c.sort_key = Some(PickSortKey {
                 name: "pr_queue".to_string(),
-                value: "level=2,reason=operator-priority,origin=interactive,mode=workflow"
-                    .to_string(),
+                value: "level=2,reason=priority,origin=interactive,mode=workflow".to_string(),
             });
             let verdict = if n % 2 == 0 {
                 PickVerdict::Acted("changes_requested")

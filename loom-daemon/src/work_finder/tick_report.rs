@@ -234,7 +234,7 @@ pub struct TickReport {
     /// candidate, which is another repo's work.
     pub deferred_repo_cap: usize,
     /// The subset of [`dispatched`](Self::dispatched) admitted through the
-    /// `loom:operator-priority` overflow slot (#9244): a starred issue that
+    /// overflow slot (#9244, inert since #11508): an operator-starred issue that
     /// only the global and/or per-repo cap refused, dispatched as this host's
     /// single over-limit sweep. At most one per tick, and none while an
     /// earlier overflow sweep is still live. See
@@ -289,8 +289,8 @@ pub struct TickReport {
     /// The per-tick admission ramp cap (#4234) the tick ran under, or `None`
     /// when the caller did not record it.
     pub max_admissions_per_tick: Option<usize>,
-    /// Whether the host's single `loom:operator-priority` overflow slot
-    /// (#9244) was still unused when the tick finished, or `None` when the
+    /// Whether the host's single overflow slot (#9244, inert since #11508)
+    /// was still unused when the tick finished, or `None` when the
     /// tick did not record it (Issue #9288).
     pub overflow_free: Option<bool>,
     /// The tick's workspace draws (#11103): seed, and each draw's candidates,

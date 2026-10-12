@@ -1125,7 +1125,7 @@ and dropped).
 
 | Rule | From | Open / resolved |
 |---|---|---|
-| `fleet.<condition>` (`dispatch-halted`, `roles-persistent`, `capacity-limited`, `star-backlog`, `output-missing`) | `fleet_alert` | condition started (and each reminder) / cleared |
+| `fleet.<condition>` (`dispatch-halted`, `roles-persistent`, `capacity-limited`, `output-missing`; `star-backlog` retired by #11510) | `fleet_alert` | condition started (and each reminder) / cleared |
 | `daemon.down` (critical) | the watchdog, a separate process | recovery exhausted / any tick ending the outage |
 | `watchdog.peer-coord-degraded` (critical) | the watchdog | coordination degraded / green |
 | `safehouse.unreachable` (critical) | narration sink state | unreachable over 5 minutes / reconnected |

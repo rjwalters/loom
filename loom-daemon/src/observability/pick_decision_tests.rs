@@ -240,9 +240,9 @@ fn act(number: u32, action: &str) -> JournalEntry {
 
 #[test]
 fn the_serving_queue_order_wins_over_the_gate_listing_order() {
-    // pr-queue put the starred #3 first, then #1; #2 is not in the queue.
+    // pr-queue put the important #3 first, then #1; #2 is not in the queue.
     let obs = journal(vec![queue(vec![
-        qrow(3, "loom:review-requested", &["loom:operator-priority"], "level=1"),
+        qrow(3, "loom:review-requested", &["loom:important"], "level=1"),
         qrow(1, "loom:review-requested", &[], "level=0"),
     ])]);
     let r = role_record(tick("judge"), RoleTickResult::Success, obs, "o/r", &[]);
@@ -298,7 +298,7 @@ fn a_successful_multi_candidate_tick_records_the_pick_and_why_the_rest_were_skip
 
 #[test]
 fn a_refresh_ranks_the_latest_snapshot_not_a_first_seen_union() {
-    // #3 arrives starred and #1 is gone: neither served queue ranked 1,2,3.
+    // #3 arrives important and #1 is gone: neither served queue ranked 1,2,3.
     let obs = journal(vec![
         queue(vec![
             qrow(1, "loom:review-requested", &[], "level=0"),
@@ -306,7 +306,7 @@ fn a_refresh_ranks_the_latest_snapshot_not_a_first_seen_union() {
         ]),
         act(1, "claimed"),
         queue(vec![
-            qrow(3, "loom:review-requested", &["loom:operator-priority"], "level=1"),
+            qrow(3, "loom:review-requested", &["loom:important"], "level=1"),
             qrow(2, "loom:review-requested", &[], "level=0"),
         ]),
     ]);
@@ -354,7 +354,7 @@ fn curator_candidates_come_from_its_listings() {
     let obs = RoleObservation {
         journal: Some(Journal {
             entries: vec![
-                listing(vec![qrow(11, "loom:operator-priority", &[], "1")]),
+                listing(vec![qrow(11, "loom:important", &[], "1")]),
                 listing(vec![
                     qrow(12, "loom:issue", &[], "1"),
                     qrow(11, "loom:issue", &[], "2"),

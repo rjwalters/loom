@@ -27,8 +27,6 @@ fn ready_item(
         repo: repo.to_string(),
         issue,
         rank: issue,
-        star: false,
-        star_at: None,
         level: 0,
         fleet_priority: 100,
         created_at: None,

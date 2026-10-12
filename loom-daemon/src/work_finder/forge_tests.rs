@@ -4,7 +4,7 @@ use super::*;
 use std::os::unix::fs::PermissionsExt;
 
 const ISSUES: &str = r#"[
-  {"number":1,"labels":[{"name":"loom:issue"},{"name":"loom:operator-priority"}],"created_at":"2026-01-01T00:00:00Z"},
+  {"number":1,"labels":[{"name":"loom:issue"},{"name":"loom:important"}],"created_at":"2026-01-01T00:00:00Z"},
   {"number":2,"labels":[{"name":"loom:issue"}],"created_at":"2026-01-02T00:00:00Z"}
 ]"#;
 
@@ -12,13 +12,13 @@ const ISSUES: &str = r#"[
 /// row and a starred curated one. Neither may become a candidate.
 const PRIORITY: &str = r#"[
   {"number":11,"labels":[{"name":"loom:triage"},{"name":"loom:very-important"}]},
-  {"number":12,"labels":[{"name":"loom:curated"},{"name":"loom:operator-priority"}]}
+  {"number":12,"labels":[{"name":"loom:curated"},{"name":"loom:important"}]}
 ]"#;
 
 /// Pre-promotion rows (#10118): only marker-bearing, unclaimed ones filed by
 /// a trusted author (#9548) are kept. #10 is an outsider's marker.
 const TRIAGE: &str = r#"[
-  {"number":3,"labels":[{"name":"loom:triage"},{"name":"loom:operator-priority"}],"body":"<!-- loom:main-red-fix -->","user":{"login":"rjwalters"},"author_association":"OWNER"},
+  {"number":3,"labels":[{"name":"loom:triage"},{"name":"loom:important"}],"body":"<!-- loom:main-red-fix -->","user":{"login":"rjwalters"},"author_association":"OWNER"},
   {"number":6,"labels":[{"name":"loom:triage"}],"body":"Fix CI.\n<!-- loom:main-red-fix -->\n","user":{"login":"rjwalters"},"author_association":"OWNER"},
   {"number":7,"labels":[{"name":"loom:triage"}],"body":"No marker here.","user":{"login":"rjwalters"},"author_association":"OWNER"},
   {"number":8,"labels":[{"name":"loom:triage"},{"name":"loom:building"}],"body":"<!-- loom:main-red-fix -->","user":{"login":"rjwalters"},"author_association":"OWNER"},

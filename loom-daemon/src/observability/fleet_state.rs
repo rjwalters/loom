@@ -151,7 +151,7 @@ impl PrFacts {
             holds: hold_names(labels),
             conflict: has("loom:merge-conflict"),
             ci_fail: has("loom:ci-failure"),
-            level: crate::operator_levels::level(labels),
+            level: crate::priority_pick::Level::of(labels).rank(),
         }
     }
 
@@ -161,7 +161,6 @@ impl PrFacts {
         row.conflict = self.conflict;
         row.ci_fail = self.ci_fail;
         row.level = row.level.max(self.level);
-        row.star |= self.level >= 1;
     }
 }
 
@@ -218,8 +217,6 @@ pub struct ReadyItem {
     pub repo: String,
     pub issue: u32,
     pub rank: u32,
-    pub star: bool,
-    pub star_at: Option<DateTime<Utc>>,
     pub level: u8,
     pub fleet_priority: u32,
     pub created_at: Option<DateTime<Utc>>,
@@ -468,8 +465,6 @@ pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Ut
         for item in &ready.items {
             let row = FleetStateRow {
                 rank: Some(item.rank),
-                star: item.star,
-                star_at: item.star_at,
                 level: item.level,
                 fleet_priority: Some(item.fleet_priority),
                 created_at: item.created_at,
@@ -542,16 +537,12 @@ pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Ut
             }
         }
         // Facts a row carries from the item's earlier rows (#11391): the
-        // star and level an earlier (ready) row read, and the Judge
+        // level an earlier (ready) row read, and the Judge
         // rejections counted so far, one more when it just entered `doctor`.
         if let Some(was) = was {
-            // A ready row is rebuilt from the tick, so an un-star shows.
+            // A ready row is rebuilt from the tick, so a lowered level shows.
             if source != Source::Ready {
-                row.star |= was.star;
                 row.level = row.level.max(was.level);
-                if row.star_at.is_none() {
-                    row.star_at = was.star_at;
-                }
             }
             row.rework = row.rework.max(was.rework);
             if row.stage == FleetStage::Doctor && was.stage != FleetStage::Doctor {
