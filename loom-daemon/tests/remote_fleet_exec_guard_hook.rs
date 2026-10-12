@@ -156,3 +156,34 @@ fn a_daemon_without_the_verb_leaves_the_rule_inert() {
     );
     assert_eq!(d, "allow");
 }
+
+/// Judge cycle 1 on #11568: payloads built at run time fail closed, and
+/// `tailscale ssh` / `xargs` / `parallel` fan-out are transports too.
+#[test]
+fn runtime_built_payloads_and_fan_out_ask_through_the_hook() {
+    let f = Fixture::new();
+    for cmd in [
+        "ssh ubuntu@100.101.102.103 \"$(cat s.sh)\"",
+        "CMD='git reset --hard'; ssh ubuntu@100.101.102.103 \"$CMD\"",
+        "ssh ubuntu@100.101.102.103 bash -s <<< \"$(cat s.sh)\"",
+        "ssh ubuntu@100.101.102.103 bash -s <<EOS\n$(cat s.sh)\nEOS",
+        "printf '%s\\n' \"$CMD\" | ssh ubuntu@100.101.102.103 bash",
+        "tailscale ssh ubuntu@loom-worker-2 'git reset --hard'",
+        "tailscale ssh ubuntu@loom-worker-1 'bash -s' < s.sh",
+        "echo ubuntu@100.101.102.103 | xargs -I{} ssh {} 'git reset --hard'",
+        "parallel ssh {} 'git reset --hard' ::: ubuntu@100.101.102.103",
+    ] {
+        let (d, reason, _) = f.run(cmd, &[]);
+        assert_eq!(d, "ask", "{cmd}: {reason}");
+        assert!(reason.starts_with("ASK [remote-fleet-exec]"), "{cmd}: {reason}");
+    }
+    for cmd in [
+        "ssh ubuntu@100.101.102.103 \"ls $DIR\"",
+        "tailscale ssh ubuntu@loom-worker-2 uptime",
+        "echo ubuntu@100.101.102.103 | xargs -I{} ssh {} uptime",
+        "tailscale status",
+    ] {
+        let (d, reason, _) = f.run(cmd, &[]);
+        assert_eq!(d, "allow", "{cmd}: {reason}");
+    }
+}

@@ -7,13 +7,14 @@
 //! against three fleet workers. No guard fired — the local guards see neither
 //! the remote target nor the script's contents.
 //!
-//! This verb finds every `ssh` / `scp` / `rsync` / `aws ssm send-command|
-//! start-session` invocation in a command (through `bash -c`, `eval`,
-//! wrappers, `$( … )` and heredocs fed to a local shell), works out what it
+//! This verb finds every `ssh` / `tailscale ssh` / `scp` / `rsync` / `aws ssm
+//! send-command|start-session` invocation in a command (through `bash -c`,
+//! `eval`, wrappers, `xargs` / `parallel` fan-out, `$( … )` and heredocs fed
+//! to a local shell), works out what it
 //! would run or change remotely — the inline remote command, and for a remote
 //! shell reading stdin, the `< file`, heredoc, here-string or `cat file |`
 //! script it is fed — and answers ASK when that payload is not read-only (or
-//! cannot be resolved) **and** the target is a fleet host (see [`roster`]).
+//! cannot be resolved, including one built at run time — see [`dynamic`]) **and** the target is a fleet host (see [`roster`]).
 //! A push of files onto a fleet host (`scp`/`rsync` with a remote
 //! destination) is an outward change and asks too.
 //!
@@ -21,6 +22,7 @@
 //! `ask` decision), never a model judgment. Exit 0 allows. A daemon too old to
 //! have the verb exits 2, which the hook treats as allow.
 
+pub mod dynamic;
 pub mod lex;
 pub mod roster;
 
@@ -33,8 +35,6 @@ use serde_json::Value;
 use lex::{Pipeline, Simple, Stdin, Word};
 use roster::Roster;
 
-/// The decision-log tag and finding code.
-pub const TAG: &str = "loom:remote-fleet-exec";
 /// The first bytes of every ask; the hook asks only on this prefix.
 pub const ASK_PREFIX: &str = "ASK [remote-fleet-exec]";
 /// The category toggle (`guards.remoteFleetExec`, default on).
@@ -251,6 +251,17 @@ fn is_stdin_shell(words: &[Word]) -> bool {
     true
 }
 
+/// The script word of `sh -c SCRIPT` (any short-option cluster holding `c`).
+fn shell_c_script(rest: &[Word]) -> Option<&Word> {
+    let pos = rest.iter().position(|a| {
+        a.text.len() > 1
+            && a.text.starts_with('-')
+            && !a.text.starts_with("--")
+            && a.text[1..].contains('c')
+    })?;
+    rest.get(pos + 1)
+}
+
 /// Does any simple command in `text` read a shell script from stdin?
 fn text_runs_stdin_shell(text: &str) -> bool {
     lex::pipelines(text)
@@ -292,45 +303,66 @@ impl Scan<'_> {
                     self.text(&inner, depth + 1);
                 }
             }
-            let Some(ci) = command_index(&stage.words) else {
-                continue;
-            };
-            let word = base(&stage.words[ci].text);
-            let rest = &stage.words[ci + 1..];
             let producer = i.checked_sub(1).and_then(|j| p.get(j));
-            match word {
-                "eval" => {
-                    let joined: Vec<&str> = rest.iter().map(|w| w.text.as_str()).collect();
-                    self.text(&joined.join(" "), depth + 1);
-                }
-                w if SHELLS.contains(&w) => {
-                    if let Some(pos) = rest.iter().position(|a| {
-                        a.text.len() > 1
-                            && a.text.starts_with('-')
-                            && !a.text.starts_with("--")
-                            && a.text[1..].contains('c')
-                    }) {
-                        if let Some(script) = rest.get(pos + 1) {
-                            self.text(&script.text, depth + 1);
-                        }
-                    } else if is_stdin_shell(&stage.words) {
-                        match &stage.stdin {
-                            Some(Stdin::Heredoc(body)) => self.text(body, depth + 1),
-                            Some(Stdin::HereString(w)) => self.text(&w.text, depth + 1),
-                            _ => {}
-                        }
+            self.simple(stage, producer, depth);
+        }
+    }
+
+    fn simple(&mut self, stage: &Simple, producer: Option<&Simple>, depth: usize) {
+        if depth > MAX_DEPTH {
+            return;
+        }
+        let Some(ci) = command_index(&stage.words) else {
+            return;
+        };
+        let word = base(&stage.words[ci].text);
+        let rest = &stage.words[ci + 1..];
+        match word {
+            "eval" => {
+                let joined: Vec<&str> = rest.iter().map(|w| w.text.as_str()).collect();
+                self.text(&joined.join(" "), depth + 1);
+            }
+            w if SHELLS.contains(&w) => {
+                if let Some(script) = shell_c_script(rest) {
+                    self.text(&script.text, depth + 1);
+                } else if is_stdin_shell(&stage.words) {
+                    match &stage.stdin {
+                        Some(Stdin::Heredoc { body, .. }) => self.text(body, depth + 1),
+                        Some(Stdin::HereString(w)) => self.text(&w.text, depth + 1),
+                        _ => {}
                     }
                 }
-                "ssh" => self.ssh(rest, stage, producer),
-                "scp" => self.copy(
-                    "scp",
-                    rest,
-                    &["-c", "-F", "-i", "-J", "-l", "-o", "-P", "-S", "-D", "-X"],
-                ),
-                "rsync" => self.copy("rsync", rest, RSYNC_ARG_FLAGS),
-                "aws" => self.aws(rest),
-                _ => {}
             }
+            "ssh" => self.ssh("ssh", rest, stage, producer),
+            "tailscale" => {
+                // `tailscale [--socket=…] ssh [ssh options] dest cmd` —
+                // Tailscale's own ssh, the native one on a tailnet fleet.
+                let sub = rest.iter().position(|w| !w.text.starts_with('-'));
+                if let Some(sub) = sub.filter(|&k| rest[k].text == "ssh") {
+                    self.ssh("tailscale ssh", &rest[sub + 1..], stage, producer);
+                }
+            }
+            "xargs" | "parallel" => {
+                // Fan-out: the per-input command, its placeholders made
+                // dynamic (hosts or commands read from stdin). Its stdin
+                // is the input list, not a script — unless `xargs -a`.
+                if let Some(fan) = dynamic::fan_out(word, rest) {
+                    let stdin = stage.stdin.clone().filter(|_| fan.passes_stdin);
+                    let inner = Simple {
+                        words: fan.words,
+                        stdin,
+                    };
+                    self.simple(&inner, None, depth + 1);
+                }
+            }
+            "scp" => self.copy(
+                "scp",
+                rest,
+                &["-c", "-F", "-i", "-J", "-l", "-o", "-P", "-S", "-D", "-X"],
+            ),
+            "rsync" => self.copy("rsync", rest, RSYNC_ARG_FLAGS),
+            "aws" => self.aws(rest),
+            _ => {}
         }
     }
 
@@ -342,7 +374,13 @@ impl Scan<'_> {
         });
     }
 
-    fn ssh(&mut self, args: &[Word], stage: &Simple, producer: Option<&Simple>) {
+    fn ssh(
+        &mut self,
+        transport: &'static str,
+        args: &[Word],
+        stage: &Simple,
+        producer: Option<&Simple>,
+    ) {
         const TAKES: &str = "BbcDEeFIiJLlmOoPpQRSWw";
         let mut i = 0;
         while let Some(a) = args.get(i) {
@@ -368,28 +406,51 @@ impl Scan<'_> {
             return;
         };
         let target = host_target(dest, true);
-        let remote: Vec<&str> = args[i + 1..].iter().map(|w| w.text.as_str()).collect();
+        let local: Vec<&Word> = args[i + 1..].iter().collect();
+        let remote: Vec<&str> = local.iter().map(|w| w.text.as_str()).collect();
         let remote = remote.join(" ");
         if let Some(pattern) = destructive_pattern(&remote) {
             let source = "the inline remote command".to_string();
-            self.push("ssh", target, Payload::Destructive { pattern, source });
+            self.push(transport, target, Payload::Destructive { pattern, source });
             return;
         }
         if remote.trim().is_empty() || text_runs_stdin_shell(&remote) {
             if let Some(payload) = self.stdin_payload(stage, producer) {
-                self.push("ssh", target, payload);
+                self.push(transport, target, payload);
+                return;
             }
+        }
+        if let Some(why) = dynamic::undeterminable(&remote, &local) {
+            let src = format!("the inline remote command ({why})");
+            self.push(transport, target, Payload::Unresolvable(src));
+        }
+    }
+
+    /// A redirected stdin as a script: a file is read, a heredoc / here-string
+    /// is checked as text, and a body built at run time is undeterminable.
+    fn stdin_script(&self, stdin: &Stdin) -> Option<Payload> {
+        match stdin {
+            Stdin::File(w) => self.file_payload(w),
+            Stdin::Heredoc { body, expands } => {
+                let local = Word {
+                    text: body.clone(),
+                    dynamic: *expands,
+                };
+                if *expands {
+                    script_payload(body, &[&local], "the heredoc script")
+                } else {
+                    text_payload(body, "the heredoc script")
+                }
+            }
+            Stdin::HereString(w) => script_payload(&w.text, &[w], "the here-string script"),
         }
     }
 
     /// Classify the script a remote shell would read from stdin. `None` when
     /// it is read-only (or there is no stdin to speak of).
     fn stdin_payload(&self, stage: &Simple, producer: Option<&Simple>) -> Option<Payload> {
-        match &stage.stdin {
-            Some(Stdin::File(w)) => return self.file_payload(w),
-            Some(Stdin::Heredoc(body)) => return text_payload(body, "the heredoc script"),
-            Some(Stdin::HereString(w)) => return text_payload(&w.text, "the here-string script"),
-            None => {}
+        if let Some(stdin) = &stage.stdin {
+            return self.stdin_script(stdin);
         }
         let p = producer?;
         let ci = command_index(&p.words)?;
@@ -402,19 +463,25 @@ impl Scan<'_> {
                     .collect();
                 if files.is_empty() || files.iter().any(|w| w.text == "-") {
                     return match &p.stdin {
-                        Some(Stdin::Heredoc(body)) => text_payload(body, "the heredoc script"),
-                        Some(Stdin::File(w)) => self.file_payload(w),
-                        Some(Stdin::HereString(w)) => {
-                            text_payload(&w.text, "the here-string script")
-                        }
+                        Some(stdin) => self.stdin_script(stdin),
                         None => Some(Payload::Unresolvable("stdin of `cat`".into())),
                     };
                 }
                 files.into_iter().find_map(|w| self.file_payload(w))
             }
-            "echo" | "printf" => {
+            name @ ("echo" | "printf") => {
                 let joined: Vec<&str> = args.iter().map(|w| w.text.as_str()).collect();
-                text_payload(&joined.join(" "), "the piped-in script")
+                let source = "the piped-in script";
+                let local: Vec<&Word> = args.iter().collect();
+                script_payload(&joined.join(" "), &local, source).or_else(|| {
+                    // `printf FMT "$CMD"`: each argument lands in the format
+                    // on its own, so check each expanded one on its own too.
+                    let skip = usize::from(name == "printf");
+                    args.iter()
+                        .skip(skip)
+                        .filter(|w| w.dynamic)
+                        .find_map(|w| script_payload(&w.text, &[w], source))
+                })
             }
             other => Some(Payload::Unresolvable(format!("the output of `{other}`"))),
         }
@@ -588,6 +655,14 @@ fn text_payload(text: &str, source: &str) -> Option<Payload> {
     destructive_pattern(text).map(|pattern| Payload::Destructive {
         pattern,
         source: source.to_string(),
+    })
+}
+
+/// [`text_payload`], then: a script built at run time is undeterminable.
+fn script_payload(text: &str, local: &[&Word], source: &str) -> Option<Payload> {
+    text_payload(text, source).or_else(|| {
+        dynamic::undeterminable(text, local)
+            .map(|why| Payload::Unresolvable(format!("{source} ({why})")))
     })
 }
 

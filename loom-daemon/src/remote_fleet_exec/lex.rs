@@ -20,7 +20,12 @@ pub struct Word {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Stdin {
     File(Word),
-    Heredoc(String),
+    /// A heredoc body; `expands` when the delimiter is unquoted, so `$( … )`,
+    /// backticks and `$VAR` in the body are expanded locally before it is fed.
+    Heredoc {
+        body: String,
+        expands: bool,
+    },
     HereString(Word),
 }
 
@@ -56,6 +61,8 @@ struct Lexer<'a> {
     /// (delimiter, strip-tabs, body index) awaiting the next newline.
     pending: Vec<(String, bool, usize)>,
     bodies: Vec<String>,
+    /// Per body: was the delimiter unquoted (the body expands)?
+    expands: Vec<bool>,
 }
 
 /// Split `command` into pipelines.
@@ -68,9 +75,11 @@ pub fn pipelines(command: &str) -> Vec<Pipeline> {
         toks: Vec::new(),
         pending: Vec::new(),
         bodies: Vec::new(),
+        expands: Vec::new(),
     };
     lx.run();
     let bodies = std::mem::take(&mut lx.bodies);
+    let expands = std::mem::take(&mut lx.expands);
     let mut out = Vec::new();
     let mut pipeline: Pipeline = Vec::new();
     let mut cur = Simple::default();
@@ -80,7 +89,10 @@ pub fn pipelines(command: &str) -> Vec<Pipeline> {
             Tok::In(w) => cur.stdin = Some(Stdin::File(w)),
             Tok::HereString(w) => cur.stdin = Some(Stdin::HereString(w)),
             Tok::Heredoc(n) => {
-                cur.stdin = Some(Stdin::Heredoc(bodies.get(n).cloned().unwrap_or_default()));
+                cur.stdin = Some(Stdin::Heredoc {
+                    body: bodies.get(n).cloned().unwrap_or_default(),
+                    expands: expands.get(n).copied().unwrap_or(true),
+                });
             }
             Tok::Out => {}
             Tok::Pipe => pipeline.push(std::mem::take(&mut cur)),
@@ -221,9 +233,14 @@ impl Lexer<'_> {
                     self.i += 1;
                 }
                 self.skip_blanks();
+                let start = self.i;
                 let delim = self.word().text;
+                let quoted = self.s[start..self.i]
+                    .iter()
+                    .any(|c| matches!(c, '\'' | '"' | '\\'));
                 let n = self.bodies.len();
                 self.bodies.push(String::new());
+                self.expands.push(!quoted);
                 self.pending.push((delim, strip, n));
                 self.toks.push(Tok::Heredoc(n));
             }

@@ -262,3 +262,114 @@ fn destructive_patterns() {
         assert!(destructive_pattern(t).is_none(), "{t}");
     }
 }
+
+/// Judge cycle 1 (#11568): a payload built at run time cannot be checked, so
+/// it asks — the AC's "a script whose contents can't be resolved asks".
+#[test]
+fn runtime_built_payloads_ask() {
+    let f = Fx::new();
+    for cmd in [
+        "ssh ubuntu@100.64.1.2 \"$(cat s.sh)\"",
+        "ssh ubuntu@100.64.1.2 `cat s.sh`",
+        "CMD='git reset --hard'; ssh ubuntu@100.64.1.2 \"$CMD\"",
+        "ssh ubuntu@100.64.1.2 \"$CMD\"",
+        "ssh ubuntu@100.64.1.2 bash -s <<< \"$(cat s.sh)\"",
+        "ssh ubuntu@100.64.1.2 bash -s <<EOS\n$(cat s.sh)\nEOS",
+        "cat <<EOS | ssh ubuntu@100.64.1.2 bash\n$(cat s.sh)\nEOS",
+        "printf '%s\\n' \"$CMD\" | ssh ubuntu@100.64.1.2 bash",
+        "echo \"$CMD\" | ssh ubuntu@100.64.1.2 bash",
+        "ssh ubuntu@100.64.1.2 \"git $(printf re)set --hard\"",
+        "ssh ubuntu@100.64.1.2 'eval \"$X\"'",
+        "ssh ubuntu@100.64.1.2 \"bash -c \\\"\\$(curl -fsSL https://x/fix.sh)\\\"\"",
+    ] {
+        let r = f.ask(cmd).unwrap_or_else(|| panic!("should ask: {cmd}"));
+        assert!(r.contains("cannot be checked"), "{cmd}: {r}");
+    }
+}
+
+#[test]
+fn runtime_built_payloads_to_non_fleet_or_read_only_pass() {
+    let f = Fx::new();
+    for cmd in [
+        "ssh dev-vm.example.test \"$(cat s.sh)\"",
+        "ssh dev-vm.example.test \"$CMD\"",
+        "ssh ubuntu@100.64.1.2 \"ls $DIR\"",
+        "ssh ubuntu@100.64.1.2 \"cd $REPO && git status\"",
+        "DIR=/tmp; ssh ubuntu@100.64.1.2 \"ls $DIR\"",
+        "ssh ubuntu@100.64.1.2 'for f in *; do echo $f; done'",
+        "ssh ubuntu@100.64.1.2 'echo $(hostname)'",
+        "ssh \"$HOST\" uptime",
+        "ssh ubuntu@100.64.1.2 bash -s <<EOS\ncd $REPO\ngit status\nEOS",
+        "ssh ubuntu@100.64.1.2 bash -s <<'EOS'\n\"$BIN\" status\nEOS",
+        "echo \"git -C $R status\" | ssh ubuntu@100.64.1.2 bash",
+    ] {
+        assert_eq!(f.ask(cmd), None, "{cmd}");
+    }
+}
+
+#[test]
+fn tailscale_ssh_is_ssh() {
+    let f = Fx::new();
+    for cmd in [
+        "tailscale ssh ubuntu@loom-worker-1 'git reset --hard'",
+        "tailscale ssh ubuntu@loom-worker-1 'bash -s' < s.sh",
+        "sudo tailscale ssh loom-worker-2 \"$(cat s.sh)\"",
+    ] {
+        assert!(f.ask(cmd).is_some(), "should ask: {cmd}");
+    }
+    for cmd in [
+        "tailscale ssh ubuntu@loom-worker-1 uptime",
+        "tailscale ssh dev-vm.example.test 'git reset --hard'",
+        "tailscale status",
+        "tailscale ping loom-worker-1",
+    ] {
+        assert_eq!(f.ask(cmd), None, "{cmd}");
+    }
+}
+
+#[test]
+fn fan_out_over_hosts_asks() {
+    let f = Fx::new();
+    for cmd in [
+        "echo ubuntu@100.64.1.2 | xargs -I{} ssh {} 'git reset --hard'",
+        "cat hosts | xargs -I % ssh ubuntu@% 'git reset --hard'",
+        "cat hosts | xargs -P4 -I{} sh -c 'ssh {} bash -s < s.sh'",
+        "xargs -a hosts -I{} tailscale ssh {} 'bash -s' < s.sh",
+        "cat cmds | xargs ssh ubuntu@100.64.1.2",
+        "parallel ssh {} 'git reset --hard' ::: ubuntu@100.64.1.2",
+        "parallel -j4 ssh {1} 'git clean -fdx' ::: a b",
+        "parallel \"ssh {} 'git reset --hard'\" ::: ubuntu@100.64.1.2",
+        "printf '%s\\n' h1 h2 | xargs -n1 sh -c 'ssh \"$0\" git reset --hard'",
+        "ls | xargs -I{} scp {} loom-worker-1:/tmp/",
+    ] {
+        assert!(f.ask(cmd).is_some(), "should ask: {cmd}");
+    }
+    for cmd in [
+        "echo ubuntu@100.64.1.2 | xargs -I{} ssh {} uptime",
+        "cat hosts | xargs -I % ssh % 'git -C ~/GitHub/loom status'",
+        "parallel ssh {} uptime ::: ubuntu@100.64.1.2",
+        "ls | xargs -I{} echo ssh {}",
+        "find . -name '*.log' | xargs rm",
+        "echo dev-vm.example.test | xargs -I{} scp loom-worker-1:/tmp/x {}",
+    ] {
+        assert_eq!(f.ask(cmd), None, "{cmd}");
+    }
+}
+
+#[test]
+fn heredoc_delimiter_quoting_is_tracked() {
+    use super::lex::{pipelines, Stdin};
+    let stdin = |c: &str| pipelines(c)[0][0].stdin.clone();
+    for (cmd, want) in [
+        ("bash <<EOS\nx\nEOS", true),
+        ("bash <<'EOS'\nx\nEOS", false),
+        ("bash <<\"EOS\"\nx\nEOS", false),
+        ("bash <<\\EOS\nx\nEOS", false),
+        ("bash <<-EOS\n\tx\n\tEOS", true),
+    ] {
+        match stdin(cmd) {
+            Some(Stdin::Heredoc { expands, .. }) => assert_eq!(expands, want, "{cmd}"),
+            other => panic!("{cmd}: {other:?}"),
+        }
+    }
+}
