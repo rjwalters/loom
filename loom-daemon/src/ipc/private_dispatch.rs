@@ -14,6 +14,7 @@ pub(super) async fn dispatch_sweep_nonblocking(
     force: bool,
     runtime: Option<String>,
     model_profile: Option<String>,
+    origin: crate::sweep_registry::DispatchOrigin,
 ) -> Response {
     // Host-distress circuit breaker (#4235) — unchanged from the previous
     // synchronous arm; a pure, lock-free global snapshot read.
@@ -153,6 +154,7 @@ pub(super) async fn dispatch_sweep_nonblocking(
             depends_on,
             None,
             prepared_launch,
+            origin,
         )
     };
 

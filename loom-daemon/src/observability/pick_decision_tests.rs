@@ -526,3 +526,31 @@ fn work_finder_record_carries_the_workspace_draw() {
         .get("workspace_draw")
         .is_none());
 }
+
+/// #11509: the work finder's record carries the tick's `loom:very-important`
+/// flood-cap demotions, named by repo; a tick with none omits the field.
+#[test]
+fn work_finder_record_carries_the_very_important_demotions() {
+    use crate::work_finder::vi_cap::ViDemotion;
+    let demoted = [ViDemotion {
+        workspace_idx: 1,
+        number: 30,
+        holder: 20,
+    }];
+    let names = ["o/tool", "o/product"];
+    let records = vi_demotion_records(&demoted, |idx| names[idx].to_string());
+    let r = work_finder_record(&summary(Vec::new()), "h", at(), at(), resolve)
+        .with_very_important_demoted(records);
+    let json = serde_json::to_value(&r).unwrap();
+    assert_eq!(
+        json["very_important_demoted"],
+        serde_json::json!([{"repo": "o/product", "number": 30, "holder": 20}])
+    );
+    let back: PickDecisionRecord = serde_json::from_value(json).unwrap();
+    assert_eq!(back, r);
+    let plain = work_finder_record(&summary(Vec::new()), "h", at(), at(), resolve);
+    assert!(serde_json::to_value(&plain)
+        .unwrap()
+        .get("very_important_demoted")
+        .is_none());
+}

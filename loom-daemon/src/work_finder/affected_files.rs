@@ -15,7 +15,9 @@
 //!   plus `loom:building` / in-flight items the existing listing already
 //!   carries a body for. Nothing is fetched: an in-flight issue absent from
 //!   the listing is NOT covered (v1); the reactive Doctor rebase backstops it.
-//! * Starred and red-main-fix candidates are never deferred, but still occupy.
+//! * No priority exempts a candidate (#11508): priority changes order only.
+//!   A verified red-main fix (#9244) is never deferred, but still occupies:
+//!   the in-flight work it would wait behind cannot merge while `main` is red.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -133,10 +135,11 @@ impl OverlapGate {
     }
 
     /// The paths `cand` shares with its repo's occupied surface; empty when
-    /// its surface is unknown, it is a lane candidate, or nothing intersects.
+    /// its surface is unknown, it is a verified red-main fix (#9244), or
+    /// nothing intersects. No priority exempts a candidate (#11508).
     #[must_use]
     pub fn overlapping(&self, cand: &PriorityCandidate) -> Vec<String> {
-        if cand.operator_priority || cand.main_red_fix {
+        if cand.main_red_fix {
             return Vec::new();
         }
         match (

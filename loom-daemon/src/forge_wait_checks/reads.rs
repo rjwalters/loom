@@ -248,6 +248,17 @@ impl GhReads {
         Ok(v)
     }
 
+    /// `GET repos/{o}/{r}/commits/{sha}/check-suites?app_id=…` — the
+    /// GitHub Actions check suites for `sha` (#11389, `forge_wait_checks::no_run`).
+    pub fn actions_suites(&mut self, sha: &str, app_id: u64) -> Result<Value, ReadError> {
+        let url = format!(
+            "repos/{}/commits/{sha}/check-suites?app_id={app_id}&per_page={PER_PAGE}",
+            self.nwo()
+        );
+        let body = self.get_checks_entry(&url, ops::CI_CHECK_RUNS_FOR_SHA)?;
+        parse(&body, "check-suites")
+    }
+
     /// `GET repos/{o}/{r}` → `default_branch` (SHA mode with no `--base`).
     pub fn default_branch(&mut self) -> Result<String, ReadError> {
         let url = format!("repos/{}", self.nwo());

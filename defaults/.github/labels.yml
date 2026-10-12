@@ -250,7 +250,9 @@
 # Applied by: Champion (merge-risk and critical-file holds), and by
 # merge-pr.sh's #8508 escalation when the #8248 required-check freshness guard
 # blocks a merge that its own automated re-date remedy could not unblock
-# (defaults/docs/merge-pr-exit-code-exceptions.md). Removed by a human.
+# (defaults/docs/merge-pr-exit-code-exceptions.md), and by merge-pr.sh's
+# partial-increment reset (#9264) when the issue body carries a
+# `loom:remainder-hold` marker. Removed by a human.
 - name: loom:operator
   description: "Engine stops work on this item; human is the only transition out. Sweep/shepherd do not skip it."
   color: "EA580C"  # orange-600 - operator-action signal, one shade darker than operator-only
@@ -283,12 +285,13 @@
   color: "CA8A04"  # yellow-600 - the middle priority level
 
 # loom:very-important (#11103) is the top priority level. A workspace holding
-# dispatchable very-important work wins the workspace draw; a flood cap is
-# follow-up #11278, not enforced yet (see priority-model.md). NOT a hold,
+# dispatchable very-important work wins the workspace draw. Capped at one per
+# workspace (#11509): only the oldest open one counts, the rest rank as
+# loom:important, enforced at dispatch (see priority-model.md). NOT a hold,
 # never inherited by the daemon. Applied by / removed by: the operator, Guide
 # and Champion alike.
 - name: loom:very-important
-  description: "Priority level 3 of 3: wins the workspace draw (not a hold; cap lands in #11278). Anyone may set."
+  description: "Priority level 3 of 3: wins the workspace draw. Capped at 1 per workspace; extras rank important."
   color: "B45309"  # amber-700 - one shade above important
 
 # loom:operator-high-priority (#10307) is operator priority LEVEL 2, the

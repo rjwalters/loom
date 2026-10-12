@@ -27,7 +27,6 @@ fn star(rank: usize, issue: u32) -> ReadyQueueRow {
         workspace_priority: 100,
         urgent: false,
         operator_priority: true,
-        operator_priority_at: Some(format!("2026-10-0{}T00:00:00Z", 1 + rank.min(3))),
         main_red_fix: false,
         created_at: None,
         tier: None,

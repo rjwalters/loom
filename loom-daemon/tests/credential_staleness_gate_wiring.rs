@@ -25,6 +25,10 @@ use loom_daemon::main_health_gate::{CredentialFreshness, GlobalCredentialFreshne
 /// into several `#[test]`s would make them race each other inside this binary.
 #[test]
 fn refresh_loop_failures_are_visible_to_the_main_health_gate() {
+    // #11295: success resolves `forge.credential-missing` in a ledger; keep
+    // it in a temp dir, never the operator's ~/.loom/loom-ui-alerts.
+    let ledgers = tempfile::tempdir().unwrap();
+    std::env::set_var(loom_daemon::loom_ui_alerts::ledger::DIR_ENV, ledgers.path());
     let gate_view = GlobalCredentialFreshness;
 
     assert!(!forge_credential_stale(), "a fresh process has no failing credential source");

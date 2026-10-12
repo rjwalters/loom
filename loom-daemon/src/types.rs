@@ -208,6 +208,18 @@ pub enum Request {
         /// `runtime`; absent preserves the runtime's own default resolution.
         #[serde(default)]
         model_profile: Option<String>,
+        /// Who is asking (Issue #11444), recorded on the sweep's start facts
+        /// and exported as `loom.dispatch_origin`. `loom-daemon dispatch`,
+        /// the `dispatch_sweep` MCP tool and Safehouse ChatOps send
+        /// `operator`. Absent on the wire (a legacy client, or any IPC
+        /// client that does not say) records `unknown` — never assumed
+        /// `operator`, since automated tools share this request too.
+        ///
+        /// Client-supplied and trusted as-is: this is telemetry (which
+        /// `trigger` the sweep reports), not authorization. Nothing decides
+        /// whether to dispatch from it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dispatch_origin: Option<crate::telemetry::DispatchOrigin>,
     },
     /// List tracked sweeps, optionally filtered by state.
     ListSweeps {

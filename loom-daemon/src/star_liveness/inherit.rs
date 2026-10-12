@@ -80,7 +80,6 @@ pub fn apply_list(items: &mut Vec<WorkItem>, list: &[Inherited]) {
             let own_star = crate::operator_levels::is_starred(&item.labels);
             if !own_star {
                 item.operator_priority_inherited_from = Some(inh.from);
-                item.operator_priority_at.clone_from(&inh.starred_at);
             }
             continue;
         }
@@ -90,7 +89,6 @@ pub fn apply_list(items: &mut Vec<WorkItem>, list: &[Inherited]) {
         );
         if let Some(mut item) = added.pop() {
             item.operator_priority_inherited_from = Some(inh.from);
-            item.operator_priority_at.clone_from(&inh.starred_at);
             items.push(item);
         }
     }
@@ -154,7 +152,6 @@ pub fn current_levels(root: &Path) -> Vec<WorkItem> {
 pub fn apply_levels(items: &mut Vec<WorkItem>, list: &[WorkItem]) {
     for inh in list {
         if let Some(item) = items.iter_mut().find(|i| i.number == inh.number) {
-            let before = item.operator_level();
             for l in &inh.labels {
                 if crate::operator_levels::by_inherited_label(crate::operator_levels::table(), l)
                     .is_some()
@@ -162,10 +159,6 @@ pub fn apply_levels(items: &mut Vec<WorkItem>, list: &[WorkItem]) {
                 {
                     item.labels.push(l.clone());
                 }
-            }
-            if item.operator_level() > before {
-                item.operator_priority_at
-                    .clone_from(&inh.operator_priority_at);
             }
             continue;
         }

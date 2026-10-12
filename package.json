@@ -1,12 +1,12 @@
 {
   "name": "loom",
-  "version": "0.19.1074",
+  "version": "0.19.1091",
   "description": "AI-powered development orchestration: a CLI + daemon that coordinates AI development workers using git worktrees and a forge (GitHub or Gitea) as the coordination layer.",
   "type": "module",
   "engines": {
     "node": ">=24"
   },
-  "packageManager": "pnpm@11.27.1",
+  "packageManager": "pnpm@11.28.0",
   "scripts": {
     "daemon:dev": "./scripts/dev-daemon.sh",
     "daemon:headless": "./scripts/daemon-headless.sh",

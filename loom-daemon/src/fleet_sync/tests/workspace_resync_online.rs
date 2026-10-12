@@ -167,3 +167,56 @@ fn a_low_disk_resync_pass_is_followed_by_a_step_that_fetches_nothing() {
         host.advance(INTERVAL);
     }
 }
+
+/// #11295: the forge's head query sees the repo, but git's credential is
+/// refused on W2's fetch. Every pass goes on to W2, so the refusal count must
+/// keep climbing (the backoff doubling) and `repo-access` must fire on the
+/// third, never be reset by the forge's answer.
+#[test]
+fn a_refusal_on_the_resync_fetch_keeps_counting_and_alerts() {
+    let fx = Fixture::new(STALE);
+    let host = Host::new(&fx, "host-a");
+    // Only git's own channel is refused: upload-pack says so and exits.
+    git(
+        &host.root,
+        &[
+            "config",
+            "remote.origin.uploadpack",
+            "echo 'ERROR: Repository not found.' >&2; false",
+        ],
+    );
+    let mut alerts = Vec::new();
+    for n in 1..=ALERT_AFTER {
+        let pass = host.pass();
+        let failures = host.memory.borrow().backoff[&host.root].failures;
+        assert_eq!(failures, n, "{pass:?}");
+        assert_eq!(host.memory.borrow().backoff[&host.root].kind, FailureKind::Refused);
+        alerts.extend(pass.alerts.iter().map(|a| a.kind));
+        host.advance(BACKOFF_CAP + Duration::from_secs(1));
+    }
+    assert_eq!(alerts, vec!["repo-access"], "on the third refusal");
+}
+
+/// #11295: a repo whose earlier read was refused, read again (the forge
+/// answers) and needing no resync (repo-ahead, so not W0 either): the refusal
+/// run is over, and with it the `repo-access` incident.
+#[test]
+fn a_refused_repo_that_reads_again_and_needs_nothing_ends_its_run() {
+    let fx = Fixture::new(Seed {
+        version: "0.19.900",
+        requires: Some("0.19.772"),
+        ..STALE
+    });
+    let host = Host::new(&fx, "host-a");
+    let first = host.pass();
+    assert_eq!(only(&first).state, WState::RepoAhead, "{first:?}");
+    let past = host.now.get() - ChronoDuration::seconds(1);
+    {
+        let mut memory = host.memory.borrow_mut();
+        let _ = memory.fail(only(&first), FailureKind::Refused, "403", INTERVAL, past);
+        memory.backoff.get_mut(&host.root).unwrap().next_attempt = past;
+    }
+    let pass = host.pass();
+    assert_eq!(only(&pass).state, WState::RepoAhead, "{pass:?}");
+    assert!(host.memory.borrow().backoff.is_empty(), "the run is over");
+}

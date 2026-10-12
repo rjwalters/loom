@@ -104,6 +104,9 @@ pub fn command_to_request(command: &Command) -> Option<Request> {
             force: false,
             runtime: None,
             model_profile: None,
+            // #11444: a human typed `dispatch N` in chat, so this is an
+            // operator action, not a separate `chatops` origin.
+            dispatch_origin: Some(crate::telemetry::DispatchOrigin::Operator),
         }),
         Command::Cancel { sweep } => Some(Request::CancelSweep {
             sweep_id: sweep.clone(),
