@@ -63,7 +63,9 @@ fn host_name_is_the_host_id_on_logs_metrics_and_traces() {
                 "service.instance.id",
                 "host.id",
                 "host.name",
-                "service.version"
+                "service.version",
+                "loom.daemon.revision",
+                "loom.fleet.config_sha"
             ],
             "{signal}: resource key set"
         );

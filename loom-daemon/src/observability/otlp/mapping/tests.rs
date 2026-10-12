@@ -9,6 +9,7 @@ use opentelemetry_proto::tonic::resource::v1::Resource;
 use super::*;
 
 mod fact_id;
+mod fleet_provenance;
 mod host_name;
 mod loom_kind;
 mod record_id;
@@ -607,6 +608,7 @@ fn otlp_export_state_rides_a_state_labelled_gauge() {
     let exempt = gauge_for(Some(OtlpExportHealth {
         state: OtlpExportState::Exempt,
         detail: Some("air-gapped lab".into()),
+        since: None,
     }))
     .unwrap();
     assert_eq!(attr(&exempt, "state").as_deref(), Some("exempt"));
@@ -615,6 +617,7 @@ fn otlp_export_state_rides_a_state_labelled_gauge() {
     let failing = gauge_for(Some(OtlpExportHealth {
         state: OtlpExportState::Failing,
         detail: Some("no ack for 20m".into()),
+        since: None,
     }))
     .unwrap();
     assert_eq!(attr(&failing, "state").as_deref(), Some("failing"));

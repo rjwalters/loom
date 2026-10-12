@@ -259,6 +259,12 @@
 //! it: it answers "did THIS merge close the issue?" for Champion Step 4's
 //! negated-reference reopen (#8942), which used to undo any close it found.
 
+//! [`pr_state`] is the gate that opens the whole flow once the PR is fetched
+//! (#8191 slice): already merged (exit 0) versus closed unmerged (refuse)
+//! versus carry on. Merged wins over closed, since a merged PR also reads
+//! `state: closed`. The shell acts on a positively received verdict; a lost
+//! one falls back to the retired shell predicate (as `revalidate-head` does).
+
 pub mod chain_lock;
 pub mod check_runs_rollup;
 pub mod check_runs_streak;
@@ -280,6 +286,7 @@ pub mod partial_comment;
 pub mod partial_conflict;
 pub mod partial_reset;
 pub mod poll_wait;
+pub mod pr_state;
 pub mod reconcile;
 pub mod redate;
 pub mod refs;

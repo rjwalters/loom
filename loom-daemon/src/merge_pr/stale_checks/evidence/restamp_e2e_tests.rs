@@ -226,7 +226,7 @@ fn a_bump_without_its_version_file_discounts_nothing() {
     assert!(!stale_contexts(&moved, &shell_pr()).is_empty());
 }
 
-// --- RESTAMP_PATHS mirrors `scripts/version.sh list` -------------------------
+// --- The restamp candidates cover `scripts/version.sh list` (#11330: derived) --
 
 #[test]
 fn every_path_version_sh_lists_is_a_restamp_candidate() {
@@ -246,8 +246,8 @@ fn every_path_version_sh_lists_is_a_restamp_candidate() {
     assert!(listed.len() >= 5, "suspiciously short list: {listed:?}");
     for path in &listed {
         assert!(
-            RESTAMP_PATHS.contains(&path.as_str()),
-            "`scripts/version.sh list` names `{path}` but RESTAMP_PATHS does not: a release \
+            super::super::bump_tail::version_set().contains(path),
+            "`scripts/version.sh list` names `{path}` but version_set() does not: a release \
              bump to it would never be discounted and every merge would stale open PRs"
         );
     }

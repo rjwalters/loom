@@ -4,6 +4,16 @@ use super::*;
 use crate::observability::agent_relay::{Harness, SessionIdentity, SessionKind};
 use prost::Message;
 use serde_json::json;
+use serial_test::serial;
+
+/// #11197: the bound resource always carries `loom.fleet.config_sha`, and a
+/// 40-hex SHA can contain `SECRET_NUMBER`'s digit run. Tests that blanket-
+/// scan the exported request for that fixture pin the process-wide applied
+/// cell to the digit-free `unknown` sentinel first — serialized against the
+/// `fleet_sync` and mapping tests that mutate the same cell.
+fn pin_config_sha_unknown() {
+    crate::fleet_sync::applied::force_for_tests(crate::fleet_sync::applied::AppliedSha::Unknown);
+}
 
 pub(in crate::observability::otlp::relay) fn bound() -> BoundIdentity {
     BoundIdentity {
@@ -63,6 +73,8 @@ fn lying_logs() -> serde_json::Value {
         {"key": "loom.sweep_id", "value": {"stringValue": "forged-sweep"}},
         {"key": "loom.session.launch", "value": {"stringValue": "forged-launch"}},
         {"key": "loom.relay.redaction", "value": {"stringValue": "none"}},
+        {"key": "loom.fleet.config_sha", "value": {"stringValue": "forged-fedcba"}},
+        {"key": "loom.daemon.revision", "value": {"stringValue": "forged-revision"}},
         {"key": "service.version", "value": {"stringValue": "9.9.9-fixture"}},
         {"key": "os.type", "value": {"stringValue": "fixture-os"}}
     ]);
@@ -86,7 +98,13 @@ fn decode_json(signal: Signal, value: &serde_json::Value) -> Payload {
 }
 
 #[test]
+#[serial(loom_socket_path_env)]
 fn identity_comes_from_the_daemon_whatever_the_sender_claimed() {
+    // `resource_for_host` reads the process-wide applied-SHA cell (and would
+    // seed it from whatever `LOOM_SOCKET_PATH` points at). Pin it and share the
+    // `loom_socket_path_env` key with the `fleet_sync::applied` tests so neither
+    // steps on the other's cell under a plain `cargo test` (#11197).
+    pin_config_sha_unknown();
     let mut payload = decode_json(Signal::Logs, &lying_logs());
     assert_eq!(bind_and_scrub(&mut payload, &bound()), 1);
     let Payload::Logs(request) = &payload else {
@@ -108,6 +126,19 @@ fn identity_comes_from_the_daemon_whatever_the_sender_claimed() {
     assert_eq!(one(&pairs, "loom.session.launch"), "daemon");
     assert_eq!(one(&pairs, REDACTION_ATTRIBUTE), redact::POLICY);
     assert_eq!(one(&pairs, "loom.daemon.version"), env!("CARGO_PKG_VERSION"));
+    // Fleet provenance (#11197) rides `resource_for_host`, so the relay
+    // carries it too — with the daemon's value: a sender-supplied
+    // `loom.fleet.config_sha` / `loom.daemon.revision` is scrubbed as a
+    // daemon-owned `loom.*` key, never overriding or duplicating it.
+    let config_sha = one(&pairs, "loom.fleet.config_sha");
+    assert!(
+        config_sha == "unknown" || config_sha == "none" || config_sha.len() == 40,
+        "config_sha must be the daemon's SHA or sentinel, got {config_sha:?}"
+    );
+    assert_eq!(
+        one(&pairs, "loom.daemon.revision"),
+        crate::telemetry::trace::provenance::daemon().revision
+    );
     // A sweep has no single role, and the sender does not get to supply one.
     assert!(!pairs
         .iter()
@@ -504,7 +535,9 @@ const HOSTILE: &[&str] = &[
 ];
 
 #[test]
+#[serial(loom_socket_path_env)]
 fn keys_schema_urls_and_numbers_are_scrubbed_on_logs_in_both_encodings() {
+    pin_config_sha_unknown();
     let attributes = hostile_attributes();
     let logs = json!({"resourceLogs": [{
         "resource": {"attributes": attributes},
@@ -553,7 +586,9 @@ fn keys_schema_urls_and_numbers_are_scrubbed_on_logs_in_both_encodings() {
 }
 
 #[test]
+#[serial(loom_socket_path_env)]
 fn keys_schema_urls_and_numbers_are_scrubbed_on_spans_and_metrics_in_both_encodings() {
+    pin_config_sha_unknown();
     let attributes = hostile_attributes();
     let traces = json!({"resourceSpans": [{
         "resource": {"attributes": attributes},
@@ -606,7 +641,9 @@ fn the_daemon_owned_filter_ignores_case() {
 }
 
 #[test]
+#[serial(loom_socket_path_env)]
 fn ids_of_the_wrong_length_are_cleared_and_valid_ones_kept() {
+    pin_config_sha_unknown();
     let mut payload = Payload::Traces(ExportTraceServiceRequest {
         resource_spans: vec![opentelemetry_proto::tonic::trace::v1::ResourceSpans {
             scope_spans: vec![opentelemetry_proto::tonic::trace::v1::ScopeSpans {
