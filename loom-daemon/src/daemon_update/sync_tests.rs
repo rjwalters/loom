@@ -104,7 +104,7 @@ impl Fixture {
         git(&self.seed, &["add", "-A"]);
         git(&self.seed, &["commit", "--quiet", "-m", "upstream change"]);
         git(&self.seed, &["push", "--quiet", "origin", &format!("HEAD:{BRANCH}")]);
-        git(&self.host, &["fetch", "--quiet", "origin", BRANCH]);
+        git(&self.host, &["fetch", "--quiet", "--", "origin", BRANCH]);
     }
 
     fn head(&self) -> String {
@@ -206,6 +206,28 @@ fn ff_abort_identical_mix_of_identical_and_differing_hard_aborts() {
     assert_eq!(fx.head(), before);
     assert_eq!(read(&fx.host.join(ACCOUNTS)), NEW_ACCOUNTS);
     assert_eq!(read(&fx.host.join("README.md")), "mine\n");
+}
+
+#[test]
+fn ff_abort_identical_staged_copy_of_origin_resolves_and_fast_forwards() {
+    let fx = Fixture::new();
+    fx.push(&[(ACCOUNTS, NEW_ACCOUNTS), ("README.md", "two\n")]);
+    // README.md: index == origin and working tree == origin, so its staged
+    // content is recoverable from origin and the relaxation applies. git's
+    // own ff accepts an index entry already equal to the target, so an
+    // unstaged identical ACCOUNTS is what makes the ff refuse here.
+    write(&fx.host.join("README.md"), "two\n");
+    git(&fx.host, &["add", "README.md"]);
+    write(&fx.host.join(ACCOUNTS), NEW_ACCOUNTS);
+    fx.assert_ff_refuses();
+
+    let (ok, state) = fx.classify(true);
+    assert!(ok);
+    assert!(state.ff_synced);
+    assert_eq!(fx.head(), fx.origin_tip());
+    assert_eq!(fx.status(), "");
+    assert_eq!(read(&fx.host.join(ACCOUNTS)), NEW_ACCOUNTS);
+    assert_eq!(read(&fx.host.join("README.md")), "two\n");
 }
 
 #[test]
