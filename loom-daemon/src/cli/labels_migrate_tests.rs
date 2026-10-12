@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 const STAR: &str = "loom:operator-priority";
 const IMPORTANT: &str = "loom:important";
 const TIER: &str = "tier:maintenance";
-const UNOWNED: &str = "priority:high";
+const UNOWNED: &str = "consumer:legacy-prio";
 
 #[derive(Default)]
 struct Fake {
@@ -198,7 +198,7 @@ fn a_dry_run_makes_no_forge_writes() {
     assert!(out.starts_with("MODE dry-run"), "{out}");
     assert!(out.contains("RELABEL #1 loom:operator-priority -> loom:important\n"), "{out}");
     assert!(out.contains("RELABEL #2 tier:maintenance -> none\n"), "{out}");
-    assert!(out.contains("ADD-ONLY #3 priority:high +loom:important\n"), "{out}");
+    assert!(out.contains("ADD-ONLY #3 consumer:legacy-prio +loom:important\n"), "{out}");
     assert!(out.contains("DELETE loom:operator-priority\n"), "{out}");
     assert_eq!(f.labels_of(1), BTreeSet::from([STAR.to_string()]));
 }
@@ -305,13 +305,35 @@ fn an_unowned_label_is_add_only_in_every_mode() {
             "apply={apply}: {:?}",
             f.writes()
         );
-        assert!(text(&r).contains("UNOWNED priority:high"), "{}", text(&r));
+        assert!(text(&r).contains("UNOWNED consumer:legacy-prio"), "{}", text(&r));
         if apply {
             assert_eq!(f.writes(), vec![format!("add #3 {IMPORTANT}")]);
             assert!(f.labels_of(3).contains(UNOWNED));
             assert_eq!(r.exit, 0);
         }
     }
+}
+
+#[test]
+fn priority_high_is_owned_so_it_is_relabelled_then_deleted() {
+    let reg = loom_daemon::label_registry::Registry::embedded();
+    let entry = reg
+        .retired
+        .iter()
+        .find(|r| r.name == "priority:high")
+        .expect("priority:high is retired")
+        .clone();
+    let f = Fake::new(&["priority:high", IMPORTANT]).item(3, &["priority:high"]);
+    let r = run(&f, "o/r", &[entry], true);
+    assert_eq!(
+        f.writes(),
+        vec![
+            format!("add #3 {IMPORTANT}"),
+            "remove #3 priority:high".to_string(),
+            "delete priority:high".to_string(),
+        ]
+    );
+    assert_eq!(r.exit, 0);
 }
 
 #[test]
@@ -470,7 +492,10 @@ fn the_embedded_registry_carries_the_retired_map() {
     // The embedded map is what a consumer repo (no labels.json) migrates by.
     let reg = loom_daemon::label_registry::Registry::embedded();
     assert!(reg.retired.iter().any(|r| r.name == STAR && r.owned));
-    assert!(reg.retired.iter().any(|r| r.name == UNOWNED && !r.owned));
+    assert!(reg
+        .retired
+        .iter()
+        .any(|r| r.name == "priority:high" && r.owned));
 }
 
 #[test]
