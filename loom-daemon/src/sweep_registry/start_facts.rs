@@ -88,6 +88,10 @@ impl SweepRegistry {
             }
             _ => None,
         };
+        let curator_issue = match (&kind, &start) {
+            (SweepKind::Issue(issue), Some(_)) => Some(*issue),
+            _ => None,
+        };
         self.emit_event(Event::SweepGlobalDispatch {
             sweep_id: sweep_id.clone(),
             kind,
@@ -98,6 +102,10 @@ impl SweepRegistry {
             story_points,
             start,
         });
+        // #11641: an issue sweep's Curator phase begins at dispatch.
+        if let Some(issue) = curator_issue {
+            self.emit_work_started(sweep_id, issue, None, None, None, 1);
+        }
     }
 }
 

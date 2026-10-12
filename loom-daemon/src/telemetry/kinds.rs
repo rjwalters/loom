@@ -191,6 +191,9 @@ pub mod issue_estimate;
 /// `token_ranking.refresh` (#10744) — one token-ranking refresh round.
 pub mod token_ranking_refresh;
 
+/// `stage.work_started` (#11641) — a role agent began working an item in a stage.
+pub mod work_started;
+
 /// The export-coverage pair `(exporters, exported_kinds)` for `host.health`
 /// (Issue #10196), derived from the per-exporter status map
 /// (`crate::observability::global_export_statuses()`, keyed by
@@ -453,6 +456,11 @@ macro_rules! telemetry_kind_table {
 
             /// One curation completion's blind difficulty estimate (#11608).
             IssueEstimate = "issue.estimate" => $crate::telemetry::kinds::issue_estimate::IssueEstimateRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// A role agent began working an item in a stage (#11641): the
+            /// work-start that splits a stay into queue wait and work time.
+            WorkStarted = "stage.work_started" => $crate::telemetry::kinds::work_started::WorkStartedRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             // APPEND NEW KINDS ABOVE THIS LINE (one row; `gate:` stays

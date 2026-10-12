@@ -17,6 +17,7 @@ mod pass;
 mod pick_decision;
 mod session_output;
 mod token_ranking;
+mod work_started;
 
 // The shared host `Resource` constructor; traces and the relay re-import it
 // from here, exactly as when it lived inline.
@@ -616,6 +617,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         }
         TelemetryRecord::SessionOutput(_)
         | TelemetryRecord::IssueEstimate(_)
+        | TelemetryRecord::WorkStarted(_)
         | TelemetryRecord::PrResolved(_)
         | TelemetryRecord::StageOutcome(_) => {
             // Issue #9764: the body is the producer-redacted readable text,
@@ -628,7 +630,8 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             let r = &envelope.record;
             let parts = session_output::log_parts(r)
                 .or_else(|| outcome_facts::log_parts(r, &envelope.host_id))
-                .or_else(|| issue_estimate::log_parts(r))?;
+                .or_else(|| issue_estimate::log_parts(r))
+                .or_else(|| work_started::log_parts(r))?;
             time_unix_nano = parts.source_at;
             observed_time_unix_nano = parts.observed_at;
             body_override = Some(parts.body);
