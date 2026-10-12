@@ -457,6 +457,34 @@ fn removals_and_census_only_repos_survive_a_split() {
     }
 }
 
+/// `standing_auth_ids` is additive: an older emitter's champion object
+/// without the field decodes to an empty list, not an error.
+#[test]
+fn standing_auth_ids_decode_additively_from_older_emitters() {
+    let back: ChampionState = serde_json::from_value(serde_json::json!({
+        "prompt_source": "/loom:champion",
+        "interval_enabled": true,
+        "cadence_secs": 600,
+        "cadence_source": "built_in"
+    }))
+    .unwrap();
+    assert!(back.standing_auth_ids.is_empty());
+    let wire = serde_json::to_value(ChampionState {
+        approval: None,
+        merge: None,
+        standing_auth_ids: vec!["guard-hooks".to_string()],
+        prompt_source: "/loom:champion".into(),
+        prompt_hash: None,
+        interval_enabled: true,
+        cadence_secs: 600,
+        cadence_source: "built_in".into(),
+        last_attempt_at: None,
+        last_attempt_ok: None,
+    })
+    .unwrap();
+    assert_eq!(wire["standing_auth_ids"], serde_json::json!(["guard-hooks"]));
+}
+
 /// `ready_replace` is sent only when set, a missing one (an older emitter)
 /// decodes to plain diffing, and a repo split across chunks repeats it in
 /// every chunk so a reader can apply the replace rule to the whole record.
@@ -536,6 +564,7 @@ fn champion_metadata_survives_all_repo_chunks() {
     let metadata = ChampionState {
         approval: None,
         merge: None,
+        standing_auth_ids: Vec::new(),
         prompt_source: "/loom:champion".into(),
         prompt_hash: Some("a".repeat(64)),
         interval_enabled: true,

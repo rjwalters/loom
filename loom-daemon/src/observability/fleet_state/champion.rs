@@ -29,6 +29,7 @@ fn champion_with_ticks(
                 crate::telemetry::kinds::fleet_state::ChampionState {
                     approval: None,
                     merge: None,
+                    standing_auth_ids: standing_auth_ids(root),
                     prompt_source: spec.prompt.to_string(),
                     prompt_hash: prompt_hash(root),
                     interval_enabled: role_runner::resolve_enabled(&config)
@@ -48,6 +49,59 @@ fn champion_with_ticks(
             ))
         })
         .collect()
+}
+
+/// Valid `champion.standingAuthorizations` class ids, read from the same
+/// `.loom/config.json` the installed prompt's script reads, mirroring its
+/// fail-safe entry validation: no id, no usable `filePatterns` list, or any
+/// condition outside the closed vocabulary authorizes nothing.
+fn standing_auth_ids(root: &std::path::Path) -> Vec<String> {
+    use serde_json::Value;
+    let Ok(bytes) = std::fs::read(root.join(".loom/config.json")) else {
+        return Vec::new();
+    };
+    let Ok(config) = serde_json::from_slice::<Value>(&bytes) else {
+        return Vec::new();
+    };
+    let Some(classes) = config
+        .get("champion")
+        .and_then(|champion| champion.get("standingAuthorizations"))
+        .and_then(|value| value.as_array())
+    else {
+        return Vec::new();
+    };
+    let mut ids: Vec<String> = classes
+        .iter()
+        .filter(|entry| {
+            let id_ok = entry
+                .get("id")
+                .and_then(|value| value.as_str())
+                .is_some_and(|id| !id.is_empty());
+            let patterns_ok = entry
+                .get("filePatterns")
+                .and_then(|value| value.as_array())
+                .is_some_and(|patterns| {
+                    patterns
+                        .iter()
+                        .any(|pattern| pattern.as_str().is_some_and(|s| !s.is_empty()))
+                });
+            let conditions_ok = entry
+                .get("conditions")
+                .and_then(|value| value.as_array())
+                .is_some_and(|conditions| {
+                    !conditions.is_empty()
+                        && conditions.iter().all(|condition| {
+                            matches!(condition.as_str(), Some("judgeApproval") | Some("greenCi"))
+                        })
+                });
+            id_ok && patterns_ok && conditions_ok
+        })
+        .filter_map(|entry| entry.get("id").and_then(|value| value.as_str()))
+        .map(str::to_string)
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
 }
 
 fn prompt_hash(root: &std::path::Path) -> Option<String> {
@@ -142,5 +196,68 @@ mod tests {
         );
         assert!(actual["acme/repo"].interval_enabled);
         assert_eq!(actual["acme/repo"].last_attempt_at, None);
+    }
+    #[test]
+    fn standing_authorizations_pin_fast_path_repos_against_judgment_repos() {
+        let auto = tempfile::tempdir().expect("auto root");
+        std::fs::create_dir_all(auto.path().join(".loom")).expect("config directory");
+        std::fs::write(
+            auto.path().join(".loom/config.json"),
+            r#"{"champion":{"standingAuthorizations":[
+                {"id":"docs-only","filePatterns":["README.md"],"conditions":["judgeApproval"]},
+                {"id":"guard-hooks","filePatterns":[".loom/hooks/guard-*.sh"],"conditions":["judgeApproval","greenCi"]}
+            ]}}"#,
+        )
+        .expect("config");
+        let judgment = tempfile::tempdir().expect("judgment root");
+        std::fs::create_dir_all(judgment.path().join(".loom")).expect("config directory");
+        std::fs::write(judgment.path().join(".loom/config.json"), "{}").expect("config");
+        let roots = vec![
+            (auto.path().to_path_buf(), "acme/auto".into()),
+            (judgment.path().to_path_buf(), "acme/judgment".into()),
+        ];
+        let state = champion_with_ticks(&roots, &[]);
+        assert_eq!(
+            state["acme/auto"].standing_auth_ids,
+            vec!["docs-only".to_string(), "guard-hooks".to_string()]
+        );
+        assert!(state["acme/judgment"].standing_auth_ids.is_empty());
+    }
+    #[test]
+    fn malformed_standing_authorization_entries_authorize_nothing() {
+        let root = tempfile::tempdir().expect("root");
+        std::fs::create_dir_all(root.path().join(".loom")).expect("config directory");
+        std::fs::write(
+            root.path().join(".loom/config.json"),
+            r#"{"champion":{"standingAuthorizations":[
+                {"filePatterns":["a.sh"],"conditions":["judgeApproval"]},
+                {"id":"no-patterns","conditions":["judgeApproval"]},
+                {"id":"empty-patterns","filePatterns":[],"conditions":["judgeApproval"]},
+                {"id":"blank-patterns","filePatterns":["",""],"conditions":["judgeApproval"]},
+                {"id":"patterns-not-array","filePatterns":"a.sh","conditions":["judgeApproval"]},
+                {"id":"no-conditions","filePatterns":["a.sh"]},
+                {"id":"empty-conditions","filePatterns":["a.sh"],"conditions":[]},
+                {"id":"unknown-condition","filePatterns":["a.sh"],"conditions":["judgeApproval","reviewedByTwoHumans"]},
+                {"id":"valid","filePatterns":["a.sh"],"conditions":["greenCi"]}
+            ]}}"#,
+        )
+        .expect("config");
+        let roots = vec![(root.path().to_path_buf(), "acme/repo".into())];
+        let state = champion_with_ticks(&roots, &[]);
+        assert_eq!(state["acme/repo"].standing_auth_ids, vec!["valid".to_string()]);
+    }
+    #[test]
+    fn missing_or_unreadable_config_declares_no_standing_authorization() {
+        let missing = tempfile::tempdir().expect("missing");
+        let broken = tempfile::tempdir().expect("broken");
+        std::fs::create_dir_all(broken.path().join(".loom")).expect("config directory");
+        std::fs::write(broken.path().join(".loom/config.json"), "{not json").expect("config");
+        let roots = vec![
+            (missing.path().to_path_buf(), "acme/missing".into()),
+            (broken.path().to_path_buf(), "acme/broken".into()),
+        ];
+        let state = champion_with_ticks(&roots, &[]);
+        assert!(state["acme/missing"].standing_auth_ids.is_empty());
+        assert!(state["acme/broken"].standing_auth_ids.is_empty());
     }
 }

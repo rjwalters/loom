@@ -662,6 +662,15 @@ pub struct ChampionState {
     pub approval: Option<String>,
     /// Conditional merge authority is prompt-defined; absent means unknown.
     pub merge: Option<String>,
+    /// `champion.standingAuthorizations` ids (#6850) that pass the same
+    /// fail-safe read the installed prompt's script performs: an entry
+    /// without an id, without a usable `filePatterns` list, or with any
+    /// condition outside the closed vocabulary authorizes nothing and is
+    /// skipped. Empty means no valid class — every PR goes through the
+    /// prompt's own judgment — never "unknown"; only a missing `champion`
+    /// object means an older emitter.
+    #[serde(default)]
+    pub standing_auth_ids: Vec<String>,
     /// Command actually selected by the role runner.
     pub prompt_source: String,
     /// SHA-256 of the installed Champion command and its two policy companions.

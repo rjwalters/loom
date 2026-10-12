@@ -2699,6 +2699,21 @@ successful runs. Both are null when unobserved or after process restart.
 Metadata changes trigger deltas without row changes; chunking retains metadata
 and OTLP carries it in the existing serialized repo attribute/body.
 
+`standing_auth_ids` is the one merge-policy fact read from configuration:
+the ids of the repo's `champion.standingAuthorizations` entries (#6850) that
+pass the same fail-safe read the installed `champion-pr-merge.md` script
+performs — an entry without an id, without a usable `filePatterns` list, or
+with any condition outside the closed vocabulary (`judgeApproval`, `greenCi`)
+authorizes nothing and is skipped. A repo with ids widens auto-merge for PRs
+whose every changed file matches a declared class (given the class's
+conditions, re-verified per pass); a repo without ids auto-merges nothing
+extra — every PR goes through the prompt's own judgment. Empty means no valid
+class, never "unknown"; only a missing `champion` object means an older
+emitter. This reports configuration, not behavior: the prompt-defined
+four-axis judgment itself remains unobservable, and `approval` / `merge`
+stay null. Changing or removing the key is a metadata change and rides the
+next delta.
+
 ### Repo halts and eligible-at
 
 Facts for an ETA reader (#11564): a wait in a halted repo, or behind a

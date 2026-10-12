@@ -1091,6 +1091,7 @@ fn champion_metadata_alone_triggers_delta_and_old_payload_remains_unknown() {
     let state = ChampionState {
         approval: None,
         merge: None,
+        standing_auth_ids: Vec::new(),
         prompt_source: "/loom:champion".into(),
         prompt_hash: None,
         interval_enabled: false,
