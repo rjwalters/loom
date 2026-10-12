@@ -512,7 +512,7 @@ stands. The two kinds of 7 are handled differently:
 
 | `step`'s first stdout line | Meaning | Champion's handling |
 |---|---|---|
-| `LOOM-MERGE-QUEUE-QUEUED` / `-DROPPED` / `-HANDED-OFF` / `-MERGED` | The queue protocol is working | Silent, exactly like 3-6: the result is logged and the PR is re-queued |
+| `LOOM-MERGE-QUEUE-QUEUED` / `-DROPPED` / `-HANDED-OFF` / `-MERGED` | The queue protocol is working | Silent, like `merge-pr.sh`'s 3-7: the result is logged and the PR is re-queued |
 | anything else: `-UNDETERMINED`, `-REFUSED`, `-DIRECT` with rc≠0, empty output, an invalid `champion.mergeMode`, an old binary that cannot prove direct mode, `command not found` | **A stall.** In a direct-mode repo this stops *every* merge on the host | Logs `CHAMPION-MERGE-QUEUE-STALL pr=N: <stdout lines> <stderr first line> (rc=R)` and posts one PR notice per head (`<!-- champion:merge-queue-stall pr=N sha=HEAD -->`, the same dedup shape as `champion:merge-outcome-unknown`). Then re-queues; not an error |
 
 `step`'s stderr is captured, never discarded, so the cause is named. Before
@@ -587,7 +587,7 @@ Bash tool call whose timeout caps at 600s, and `LOOM_AUTO_MERGE_TIMEOUT`
 approaches that budget the tool wins the race, the script is killed mid-wait,
 and the exit-5 branch above never runs.
 
-What that leaves on the forge is worse than any of exits 3/4/5/6: Step 2 has
+What that leaves on the forge is worse than any of exits 3-7: Step 2 has
 already posted "Proceeding with merge…", and then there is nothing. No merge,
 no failure, no label change, no comment — indistinguishable from a dead host.
 That is the 2026-09-26 incident on a private fleet repo: a "Proceeding with
@@ -678,14 +678,14 @@ this section exists to settle:
   action is required — the PR is still Judge-approved and a later pass retries
   it. Posting the failure wording would manufacture an incident out of a
   timeout and park a mergeable PR on a human.
-- **It is also not covered by the exits-3/4/5/6 silence rule.** Those runs stay
+- **It is also not covered by the exits-3-7 silence rule.** Those runs stay
   silent on the forge because they *reported themselves*: the caller knows the
   outcome, records it, and re-queues; commenting on a self-resolving race
   would be noise (see exit 3 above). A killed call reports nothing, so silence
   there is not "an ordinary operational event went unremarked" but "Champion
   announced a merge and vanished." **The silence rule is conditioned on having
   an outcome to be silent about**, and must never be generalised to cover its
-  absence — nor may the notice ever be extended to fire on exits 3/4/5/6, which
+  absence — nor may the notice ever be extended to fire on exits 3-7, which
   stay exactly as silent as they are today.
 
 The notice is therefore worded as a *state report*, not a verdict: what

@@ -660,7 +660,7 @@ This is the terminal state. The checkpoint must go, so a later `/loom:sweep` of 
 
 **Approved but conflicting (#9265).** If `merge-pr.sh` refuses an approved `#X` for merge conflicts and `gh pr view X --json mergeable` confirms `CONFLICTING` (`main` moved outside this wave), do not consult the Doctor-cycle cap: take the `DIRTY` route above — rebase pass → re-Judge → merge.
 
-**Exits 3-7 are re-queues, not failures** (nothing merged; 7 = `LOOM-SEQUENCED-HOLD`, a predecessor has not landed; table: "exit codes" above): keep the checkpoint, log "not merged this pass", no diagnosis.
+**Exits 3-7 are re-queues, not failures** (nothing merged; 7 = `LOOM-SEQUENCED-HOLD`; table: "exit codes" above): keep the checkpoint, log "not merged this pass", no diagnosis. After 3/4 (head moved) step 5's `judge-done` guard re-Judges.
 
 If `merge-pr.sh` fails otherwise (e.g. a required check failed), do **not** delete the checkpoint — leave it at `judge-done` so the next sweep retries the merge from a clean state. **Before logging why it failed, classify the failure text through "Forge write failure diagnosis (#6425)"** (Mode B, above) — a forge 5xx/outage signature or an unconfirmed permission-scope 403 must be logged as forge-transient / "will retry", never as a "needs operator attention" credential diagnosis without the positive-evidence check.
 
