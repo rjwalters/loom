@@ -66,6 +66,7 @@ fn record() -> FleetStateRecord {
         }),
         capacity: None,
         repos: vec![FleetStateRepo {
+            champion: None,
             repo: "rjwalters/loom".to_string(),
             visibility: RepoVisibility::Public,
             main_ci: None,
@@ -89,6 +90,7 @@ fn anchor_with(n: u32) -> FleetStateRecord {
         .iter()
         .enumerate()
         .map(|(i, repo)| FleetStateRepo {
+            champion: None,
             repo: (*repo).to_string(),
             visibility: RepoVisibility::Private,
             main_ci: None,
@@ -346,6 +348,7 @@ fn removals_and_census_only_repos_survive_a_split() {
     r.anchor = false;
     r.repos = vec![
         FleetStateRepo {
+            champion: None,
             repo: "acme/a".to_string(),
             visibility: RepoVisibility::Private,
             main_ci: None,
@@ -357,6 +360,7 @@ fn removals_and_census_only_repos_survive_a_split() {
             removed: (1000..1400).collect(),
         },
         FleetStateRepo {
+            champion: None,
             repo: "acme/b".to_string(),
             visibility: RepoVisibility::Private,
             main_ci: None,
@@ -398,6 +402,7 @@ fn ready_replace_is_additive_and_rides_every_chunk() {
     assert!(!back.ready_replace);
 
     r.repos = vec![FleetStateRepo {
+        champion: None,
         repo: "acme/a".to_string(),
         visibility: RepoVisibility::Private,
         main_ci: None,
@@ -447,4 +452,32 @@ fn collector_keeps_every_fleet_state_log_attribute() {
         assert!(log_keep.contains(&format!("\"{key}\"")), "collector drops {key}");
     }
     assert!(!log_keep.contains("loom.fleet.rows_truncated"), "no cap, no truncation key");
+}
+
+#[test]
+fn champion_metadata_survives_all_repo_chunks() {
+    let mut r = anchor_with(100);
+    let metadata = ChampionState {
+        approval: None,
+        merge: None,
+        prompt_source: "/loom:champion".into(),
+        prompt_hash: Some("a".repeat(64)),
+        interval_enabled: true,
+        cadence_secs: 123,
+        cadence_source: "effective_config".into(),
+        last_attempt_at: Some(r.as_of),
+        last_attempt_ok: Some(true),
+    };
+    for repo in &mut r.repos {
+        repo.champion = Some(metadata.clone());
+    }
+    let chunks = split_into_chunks(r, 2_000);
+    assert!(chunks.len() > 1);
+    for chunk in chunks {
+        let decoded: FleetStateRecord =
+            serde_json::from_slice(&serde_json::to_vec(&chunk).unwrap()).unwrap();
+        for repo in decoded.repos {
+            assert_eq!(repo.champion, Some(metadata.clone()));
+        }
+    }
 }

@@ -574,9 +574,33 @@ pub struct FleetPrCensus {
     pub by_stage: BTreeMap<String, u32>,
 }
 
+/// Observed Champion dispatch metadata, independent of approval authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChampionState {
+    /// Policy cannot be inferred from scheduling: absent means unknown.
+    pub approval: Option<String>,
+    /// Conditional merge authority is prompt-defined; absent means unknown.
+    pub merge: Option<String>,
+    /// Command actually selected by the role runner.
+    pub prompt_source: String,
+    /// SHA-256 of the installed Champion command and its two policy companions.
+    pub prompt_hash: Option<String>,
+    /// Whether the interval runner currently selects Champion.
+    pub interval_enabled: bool,
+    pub cadence_secs: u64,
+    pub cadence_source: String,
+    /// Most recent recorded attempt, including failures and pre-spawn skips.
+    pub last_attempt_at: Option<DateTime<Utc>>,
+    /// Runner outcome for that attempt; never a claim that issues were evaluated.
+    pub last_attempt_ok: Option<bool>,
+}
+
 /// One repo's part of a record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FleetStateRepo {
+    /// Unknown on older emitters. Scheduling never implies human approval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub champion: Option<ChampionState>,
     /// Forge `owner/repo`, lowercased.
     pub repo: String,
     #[serde(default)]

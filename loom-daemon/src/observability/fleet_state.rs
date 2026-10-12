@@ -51,6 +51,8 @@
 //! ETA is enabled does not matter. An anchor with zero rows is still sent,
 //! because it truthfully says "nothing here".
 
+mod champion;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -247,6 +249,8 @@ pub struct ReadyQueue {
 /// Everything one pass read.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FleetInput {
+    /// Per-root Champion dispatch observations.
+    pub champion: BTreeMap<String, crate::telemetry::kinds::fleet_state::ChampionState>,
     /// This host's id.
     pub host_id: String,
     /// Every managed repo's lowercased slug.
@@ -266,6 +270,8 @@ pub struct FleetInput {
 /// One repo's full state at one pass.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RepoView {
+    /// Champion dispatch metadata.
+    pub champion: Option<crate::telemetry::kinds::fleet_state::ChampionState>,
     /// The census, when the repo was completely listed this pass.
     pub census: Option<FleetPrCensus>,
     /// Rows by issue.
@@ -582,6 +588,9 @@ pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Ut
     for (repo, repo_census) in census {
         repos.entry(repo).or_default().census = Some(repo_census);
     }
+    for (repo, champion) in &input.champion {
+        repos.entry(repo.clone()).or_default().champion = Some(champion.clone());
+    }
     for (repo, main_ci) in &input.main_ci {
         repos.entry(repo.clone()).or_default().main_ci = Some(*main_ci);
     }
@@ -613,6 +622,7 @@ fn repo_entry(view: &FleetView, repo: &str, census: Option<FleetPrCensus>) -> Fl
     let halt = view.repos.get(repo).and_then(|r| r.halt.clone());
     let ready_complete = view.ready_complete(repo);
     FleetStateRepo {
+        champion: view.repos.get(repo).and_then(|r| r.champion.clone()),
         repo: repo.to_string(),
         // Tagged by the caller once the record is known to be sent; private
         // until then is the safe default.
@@ -713,6 +723,7 @@ pub fn decide(
             && removed.is_empty()
             && !ready_changed
             && now_state.census == was.census
+            && now_state.champion == was.champion
             && now_state.main_ci == was.main_ci
             && now_state.halt == was.halt
             && view.ready_complete(repo) == last.view.ready_complete(repo)
