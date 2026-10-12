@@ -82,16 +82,17 @@ WITH canonical(position, name, type) AS (
         (26, 'attempt_index',             'INTEGER'),
         (27, 'previous_sweep_id',         'TEXT'),
         (28, 'trigger',                   'TEXT'),
-        (29, 'rework_substantive',        'INTEGER'),
-        (30, 'rework_environmental',      'INTEGER'),
-        (31, 'rework_substantive_sec',    'INTEGER'),
-        (32, 'rework_environmental_sec',  'INTEGER'),
-        (33, 'rework_substantive_open',   'INTEGER'),
-        (34, 'rework_environmental_open', 'INTEGER'),
-        (35, 'pr_number',                 'INTEGER'),
-        (36, 'pr_numbers',                'TEXT'),
-        (37, 'suspect',                   'INTEGER'),
-        (38, 'schema_version',            'INTEGER')
+        (29, 'dispatch_origin',           'TEXT'),
+        (30, 'rework_substantive',        'INTEGER'),
+        (31, 'rework_environmental',      'INTEGER'),
+        (32, 'rework_substantive_sec',    'INTEGER'),
+        (33, 'rework_environmental_sec',  'INTEGER'),
+        (34, 'rework_substantive_open',   'INTEGER'),
+        (35, 'rework_environmental_open', 'INTEGER'),
+        (36, 'pr_number',                 'INTEGER'),
+        (37, 'pr_numbers',                'TEXT'),
+        (38, 'suspect',                   'INTEGER'),
+        (39, 'schema_version',            'INTEGER')
 )
 SELECT 'ALTER TABLE sweep_facts ADD COLUMN ' || c.name || ' ' || c.type || char(59)
            AS ddl

@@ -559,6 +559,39 @@ fn the_forecast_column_is_a_fact_column_on_every_side_of_the_seam() {
 }
 
 #[test]
+fn the_dispatch_origin_column_is_a_fact_column_on_every_side_of_the_seam() {
+    // `dispatch_origin` (#11444) is the #9444 lineage sibling of `trigger` /
+    // `attempt_index` / `previous_sweep_id`: who asked for the sweep (operator
+    // vs. an automated driver), the ETA driver signal (#11479). The generic
+    // parity tests above already compare the DDL, the INSERT list and both
+    // extraction views against each other — this names the column so its
+    // removal from all of them at once is still loud, and pins that the rollup
+    // actually reads it out of the payload (declaring it without reading it
+    // would leave the column NULL forever).
+    assert!(
+        fact_table_columns().contains(&"dispatch_origin".to_owned()),
+        "sweep_facts no longer declares dispatch_origin; a sweep-facts query cannot split \
+         operator re-dispatches from automated ones without it (#11444/#11479)"
+    );
+    assert!(
+        ROLLUP.contains("json_extract(r.payload, '$.dispatch_origin')"),
+        "the rollup no longer reads dispatch_origin out of the sweep.outcome payload, so the \
+         column it declares would stay NULL forever (#11444/#11479)"
+    );
+    for (backend, sql) in [
+        ("ClickStack", CLICKSTACK_EXTRACT),
+        ("SigNoz", SIGNOZ_EXTRACT),
+    ] {
+        assert!(
+            sql.contains("loom.dispatch_origin"),
+            "the {backend} extraction view no longer reads the `loom.dispatch_origin` OTLP \
+             attribute (telemetry-schema.md §dispatch_origin), so that backend's facts and \
+             D1's are no longer the same fact (#11444/#11479)"
+        );
+    }
+}
+
+#[test]
 fn the_throughput_question_counts_only_landings() {
     // A failed, cancelled or no-op sweep lands nothing, so it may contribute to
     // neither the points sum nor the landings count (#9433's acceptance
