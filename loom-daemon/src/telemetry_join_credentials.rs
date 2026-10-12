@@ -304,10 +304,10 @@ pub fn parse_credential_spec(spec: &str) -> Result<CredentialSpec, JoinError> {
             path: PathBuf::from(path),
         });
     }
-    Err(JoinError::Credential(format!(
+    Err(JoinError::Credential(
         "unknown credential source; use ssm-access://<prefix>, headers-file:<path>, ssm://<parameter>, age-file:<path> or \
-         file:<path>"
-    )))
+         file:<path>".into()
+    ))
 }
 
 /// Build the live source for a parsed spec.

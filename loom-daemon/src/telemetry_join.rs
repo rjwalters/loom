@@ -78,8 +78,6 @@ pub const PROBE_QUERY: &str = "SELECT resources_string['host.id'] AS host_id, \
        AND body LIKE {probe:String} \
      LIMIT 5";
 
-/// Bounded runtime for the `aws`/`age` credential subprocesses.
-
 /// Why the join failed. Every variant is a distinct, printable reason; none
 /// ever carries credential material.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -585,10 +585,13 @@ fn only_401_and_403_are_credential_refusals() {
 
 /// A one-status loopback OTLP receiver recording each request's
 /// `Authorization` header, for driving the *live* [`OtlpProbeSender`].
+type AccessHeaders = (Option<String>, Option<String>);
+type RecordedAccess = std::sync::Arc<std::sync::Mutex<Vec<AccessHeaders>>>;
+
 struct AuthSink {
     addr: std::net::SocketAddr,
     auth: std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>,
-    access: std::sync::Arc<std::sync::Mutex<Vec<(Option<String>, Option<String>)>>>,
+    access: RecordedAccess,
     shutdown: std::sync::Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
