@@ -369,21 +369,34 @@ list with a single bare kind — drops it along with any per-entry `endpoint`.
 it.
 
 **Provisioning and proving a host: `loom-daemon telemetry-join --host <roster-id>`
-(#11528).** Resolves this host's id (`fleet.hostId` / `$LOOM_HOST_ID`) and exits
-non-zero *before any fetch, write or send* if it differs from `--host`. It then
-fetches the per-host Access token (`--credential-source ssm://<param>`, default
-`ssm:///2am/cloudflare/otlp-host/<host>`; or `age-file:<path>` / `file:<path>`),
-writes `~/.config/loom/otlp-headers` mode 0600 (atomically replacing any looser
-file; the `headers_file` parser must accept it), sends one `host.export` probe to
-`--endpoint` (default: the compiled-in `DEFAULT_ENDPOINT`), and polls the
-telemetry-reader (`--reader-url`) until the row shows
-`host.id == harness.ingest.principal == <roster-id>` (`--timeout`, default 60 s).
-Failures exit non-zero with a distinct reason: credential fetch, `OTLP HTTP 401/403`
-(credential refused), any other status such as 429/5xx (a server/transport failure,
-never blamed on the token), identity mismatch, probe never arrived, reader
-unavailable. The headers file is read only at send time, after it is written. The token is never
-printed. Needs the `otlp` feature. `--probe-sql` overrides the read-back query if
-the store keeps the principal elsewhere.
+(#11528).** Resolves this host's identity first and refuses a mismatched
+`--host` before credential fetch, write or send. The default source is
+`ssm-access:///2am/cloudflare/otlp-host/<host>`: fetch the existing
+`client_id`/`client_secret` pair and write `CF-Access-Client-Id` and
+`CF-Access-Client-Secret`. It neither mints a token nor changes Access policy.
+`headers-file:<path>` accepts an existing owner-only header file, including
+using the already provisioned destination as the source. Explicit legacy
+`ssm://<parameter>`, `file:<path>` and `age-file:<path>` sources still mean a
+scalar bearer token. Plaintext sources must be owner-only regular files;
+credential paths must stay outside every repository/worktree.
+
+The destination (`--headers-path`, default `~/.config/loom/otlp-headers`) is
+written atomically at 0600. Fresh content is parsed before replacement;
+malformed headers, partial Access pairs and nonregular/symlink destinations
+are refused without truncating existing credentials. Values never appear in
+errors or Debug. Only after provisioning does the live sender load the file,
+with no ambient or empty ingest-key Bearer header. OTLP is always compiled in.
+
+The command sends one `host.export` probe to the compiled-in `DEFAULT_ENDPOINT`
+(or `--endpoint`) and polls the reader (`--reader-url`) for
+`host.id == harness.ingest.principal == <roster-id>` within `--timeout`
+(default 60 s). The principal is a **resource** attribute stamped by ingress;
+`--probe-sql` can override the query for another schema. Credential fetch,
+401/403 refusal, other transport/status failures, identity mismatch, missing
+probe and reader outage remain distinct errors. CI uses fake credentials and
+loopback receivers; actual host provisioning/probe and the 2am onboarding-doc
+acceptance remain separate, explicitly unverified work under #11528.
+
 
 See [OTLP transport and artifact verification](otlp-transport.md) for response
 classification, per-signal counters, retry/drop policy and the real Collector

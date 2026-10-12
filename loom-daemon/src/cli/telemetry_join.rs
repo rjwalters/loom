@@ -12,22 +12,14 @@
 //! network reach to SigNoz, so CI covers the engine only through fakes
 //! (`telemetry_join_tests.rs`); a real run is recorded manually on the PR.
 
-#[cfg(feature = "otlp")]
 use std::path::Path;
 use std::path::PathBuf;
-#[cfg(feature = "otlp")]
 use std::time::Duration;
 
-#[cfg(not(feature = "otlp"))]
-use anyhow::Result;
-#[cfg(feature = "otlp")]
 use anyhow::{bail, Result};
 
-#[cfg(feature = "otlp")]
 use loom_daemon::observability::endpoint_policy;
-#[cfg(feature = "otlp")]
 use loom_daemon::signoz_read::{EndpointConfig, TelemetryReader};
-#[cfg(feature = "otlp")]
 use loom_daemon::telemetry_join::{
     self, JoinDeps, JoinPlan, OtlpProbeSender, ReaderProbe, DEFAULT_HEADERS_PATH, PROBE_QUERY,
 };
@@ -47,7 +39,8 @@ pub(crate) struct JoinArgs {
 
     /// Credential source: `ssm://<parameter>` (AWS CLI, decrypted),
     /// `age-file:<path>` (`age -d`), or `file:<path>` (already-decrypted
-    /// plaintext). Default: `ssm:///2am/cloudflare/otlp-host/<host>`.
+    /// plaintext). Default: `ssm-access:///2am/cloudflare/otlp-host/<host>` (id/secret pair).
+    /// `headers-file:<path>` preserves an existing owner-only header file.
     #[arg(long, value_name = "SPEC")]
     credential_source: Option<String>,
 
@@ -79,7 +72,6 @@ pub(crate) struct JoinArgs {
 
 impl JoinArgs {
     /// Resolve the headers file's default against the home directory.
-    #[cfg(feature = "otlp")]
     fn headers_path(&self) -> Result<PathBuf> {
         if let Some(path) = &self.headers_path {
             return Ok(path.clone());
@@ -91,7 +83,6 @@ impl JoinArgs {
 
     /// Resolve the reader transport from `--reader-url`, then
     /// `TELEMETRY_READER_URL`, then `telemetry.signoz.endpoint`.
-    #[cfg(feature = "otlp")]
     fn reader(&self) -> Result<ReaderProbe> {
         let url = match &self.reader_url {
             Some(url) => Some(url.clone()),
@@ -115,15 +106,6 @@ impl JoinArgs {
         })
     }
 
-    /// The whole command lives behind the `otlp` feature, exactly like
-    /// `telemetry-export`: a plain build fails with the family's standard
-    /// message instead of reaching for a transport it does not have.
-    #[cfg(not(feature = "otlp"))]
-    pub(crate) async fn run(self) -> Result<()> {
-        anyhow::bail!("this binary was built without the otlp feature")
-    }
-
-    #[cfg(feature = "otlp")]
     pub(crate) async fn run(self) -> Result<()> {
         // Endpoint policy first: never send headers to a placeholder.
         if let Some(host) = endpoint_policy::reserved_placeholder_host(&self.endpoint) {

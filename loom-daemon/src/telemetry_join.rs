@@ -58,7 +58,7 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 60;
 /// How long to wait between read-back polls.
 pub const PROBE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Attribute key the ingest edge stamps with the authenticated principal
+/// Resource attribute key the ingest edge stamps with the authenticated principal
 /// (#11528 scope note: the store-side location is not defined in this
 /// repository; override the whole query with `--probe-sql` when the schema
 /// differs).
@@ -71,7 +71,7 @@ pub const INGEST_PRINCIPAL_ATTR: &str = "harness.ingest.principal";
 /// expressed. Schema conventions follow
 /// `defaults/observability/signoz/host-export-queries.sql`.
 pub const PROBE_QUERY: &str = "SELECT resources_string['host.id'] AS host_id, \
-     attributes_string['harness.ingest.principal'] AS ingest_principal \
+     resources_string['harness.ingest.principal'] AS ingest_principal \
      FROM signoz_logs.distributed_logs_v2 \
      WHERE attributes_string['loom.kind'] = 'host.export' \
        AND resources_string['host.id'] = {host:String} \
@@ -79,7 +79,6 @@ pub const PROBE_QUERY: &str = "SELECT resources_string['host.id'] AS host_id, \
      LIMIT 5";
 
 /// Bounded runtime for the `aws`/`age` credential subprocesses.
-const CREDENTIAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Why the join failed. Every variant is a distinct, printable reason; none
 /// ever carries credential material.
@@ -101,8 +100,6 @@ pub enum JoinError {
     /// The headers file could not be written, or does not round-trip through
     /// the exporter's parser.
     HeadersWrite(String),
-    /// This binary was built without the `otlp` Cargo feature.
-    NoOtlpFeature,
     /// The receiver refused the probe's authorization — `401`/`403` only
     /// (see [`send_failure`]), naming the status.
     ProbeRejected { status: u16 },
@@ -143,7 +140,6 @@ impl fmt::Display for JoinError {
             Self::BadEndpoint(detail) => write!(f, "invalid --endpoint: {detail}"),
             Self::Credential(detail) => write!(f, "credential fetch failed: {detail}"),
             Self::HeadersWrite(detail) => write!(f, "headers file not provisioned: {detail}"),
-            Self::NoOtlpFeature => write!(f, "this binary was built without the otlp feature"),
             Self::ProbeRejected { status } => write!(
                 f,
                 "probe rejected: OTLP HTTP {status} (credential refused — check the \
@@ -168,219 +164,9 @@ impl fmt::Display for JoinError {
 
 impl std::error::Error for JoinError {}
 
-/// A credential is fetchable from its declared store.
-pub trait CredentialSource: fmt::Debug {
-    /// The bearer token for this host's OTLP endpoint. Never logged.
-    ///
-    /// # Errors
-    ///
-    /// [`JoinError::Credential`] when the store cannot be reached or the
-    /// value is empty.
-    fn token(&self) -> Result<String, JoinError>;
-}
-
-/// `ssm://<parameter>`: shell out to the AWS CLI (`aws ssm get-parameter
-/// --with-decryption`). No SDK dependency exists in this workspace, and the
-/// token never appears in a command line — only the parameter *name* does.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SsmSource {
-    /// The SSM parameter's full name.
-    pub parameter: String,
-}
-
-impl CredentialSource for SsmSource {
-    fn token(&self) -> Result<String, JoinError> {
-        let mut cmd = std::process::Command::new("aws");
-        cmd.args([
-            "ssm",
-            "get-parameter",
-            "--name",
-            &self.parameter,
-            "--with-decryption",
-            "--query",
-            "Parameter.Value",
-            "--output",
-            "text",
-        ]);
-        let output =
-            run_credential_command(cmd, &format!("aws ssm get-parameter {}", self.parameter))?;
-        finish_credential(output, "aws ssm get-parameter")
-    }
-}
-
-/// One completed credential subprocess: stdout / first stderr line, and
-/// whether it exited zero. A deadline hit is a failure naming the tool.
-struct CommandOutput {
-    ok: bool,
-    stdout: String,
-    stderr_head: String,
-}
-
-/// Run a credential fetch under [`CREDENTIAL_COMMAND_TIMEOUT`], mapping every
-/// failure (spawn, collect, deadline) to [`JoinError::Credential`].
-fn run_credential_command(
-    cmd: std::process::Command,
-    tool: &str,
-) -> Result<CommandOutput, JoinError> {
-    match crate::proc_exec::run_bounded(cmd, CREDENTIAL_COMMAND_TIMEOUT) {
-        Ok(crate::proc_exec::Completion::Exited(output)) => Ok(CommandOutput {
-            ok: output.status.success(),
-            stdout: String::from_utf8_lossy(&output.stdout).trim().to_string(),
-            stderr_head: String::from_utf8_lossy(&output.stderr)
-                .lines()
-                .next()
-                .unwrap_or_default()
-                .chars()
-                .take(200)
-                .collect(),
-        }),
-        Ok(crate::proc_exec::Completion::TimedOut { .. }) => {
-            Err(JoinError::Credential(format!("{tool} timed out")))
-        }
-        Err(e) => Err(JoinError::Credential(format!("{tool}: {e}"))),
-    }
-}
-
-/// Shared tail of a credential fetch: non-empty stdout on exit zero, a
-/// reason that names the tool and its first stderr line — never the value.
-fn finish_credential(output: CommandOutput, tool: &str) -> Result<String, JoinError> {
-    if !output.ok {
-        return Err(JoinError::Credential(format!("{tool} failed: {}", output.stderr_head)));
-    }
-    let token = output.stdout;
-    if token.is_empty() {
-        return Err(JoinError::Credential(format!("{tool} returned an empty value")));
-    }
-    Ok(token)
-}
-
-/// `age-file:<path>`: decrypt with `age -d` (optionally `-i <identity>`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AgeFileSource {
-    /// The encrypted file's path.
-    pub path: PathBuf,
-    /// Identity file passed as `-i`, when the passphrase is held in one.
-    pub identity: Option<PathBuf>,
-}
-
-impl CredentialSource for AgeFileSource {
-    fn token(&self) -> Result<String, JoinError> {
-        let mut cmd = std::process::Command::new("age");
-        cmd.arg("--decrypt");
-        if let Some(identity) = &self.identity {
-            cmd.args(["-i", &identity.display().to_string()]);
-        }
-        cmd.arg(&self.path);
-        let output = run_credential_command(cmd, &format!("age -d {}", self.path.display()))?;
-        finish_credential(output, "age -d")
-    }
-}
-
-/// `file:<path>`: an already-decrypted plaintext file (e.g. a
-/// chezmoi-rendered secret), read directly.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FileSource {
-    /// The file's path.
-    pub path: PathBuf,
-}
-
-impl CredentialSource for FileSource {
-    fn token(&self) -> Result<String, JoinError> {
-        let token = std::fs::read_to_string(&self.path)
-            .map_err(|e| JoinError::Credential(format!("read {}: {e}", self.path.display())))?
-            .trim()
-            .to_string();
-        if token.is_empty() {
-            return Err(JoinError::Credential(format!("{} is empty", self.path.display())));
-        }
-        Ok(token)
-    }
-}
-
-/// A parsed `--credential-source` value.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CredentialSpec {
-    /// `ssm://<parameter>`.
-    Ssm { parameter: String },
-    /// `age-file:<path>`.
-    AgeFile { path: PathBuf },
-    /// `file:<path>`.
-    File { path: PathBuf },
-}
-
-/// The default spec for `host`: `ssm://{DEFAULT_SSM_PARAM}/{host}`.
-#[must_use]
-pub fn default_credential_spec(host: &str) -> String {
-    format!("ssm://{DEFAULT_SSM_PARAM}/{host}")
-}
-
-/// Parse a `--credential-source` value.
-///
-/// # Errors
-///
-/// [`JoinError::Credential`] naming the accepted forms when the spec does not
-/// match one.
-pub fn parse_credential_spec(spec: &str) -> Result<CredentialSpec, JoinError> {
-    if let Some(parameter) = spec.strip_prefix("ssm://") {
-        let parameter = parameter.trim();
-        if parameter.is_empty() {
-            return Err(JoinError::Credential(
-                "ssm:// needs a parameter name (ssm:///path/to/parameter)".to_string(),
-            ));
-        }
-        return Ok(CredentialSpec::Ssm {
-            parameter: parameter.to_string(),
-        });
-    }
-    if let Some(path) = spec.strip_prefix("age-file:") {
-        let path = path.trim();
-        if path.is_empty() {
-            return Err(JoinError::Credential(
-                "age-file: needs a path (age-file:/path/to/encrypted)".to_string(),
-            ));
-        }
-        return Ok(CredentialSpec::AgeFile {
-            path: PathBuf::from(path),
-        });
-    }
-    if let Some(path) = spec.strip_prefix("file:") {
-        let path = path.trim();
-        if path.is_empty() {
-            return Err(JoinError::Credential(
-                "file: needs a path (file:/path/to/plaintext)".to_string(),
-            ));
-        }
-        return Ok(CredentialSpec::File {
-            path: PathBuf::from(path),
-        });
-    }
-    Err(JoinError::Credential(format!(
-        "unknown credential source {spec:?}; use ssm://<parameter>, age-file:<path> or \
-         file:<path>"
-    )))
-}
-
-/// Build the live source for a parsed spec.
-///
-/// # Errors
-///
-/// [`JoinError::NoOtlpFeature`] is never raised here; a bad spec is
-/// [`JoinError::Credential`].
-pub fn credential_source<'a>(
-    spec: &'a CredentialSpec,
-    age_identity: Option<&'a Path>,
-) -> Box<dyn CredentialSource + 'a> {
-    match spec {
-        CredentialSpec::Ssm { parameter } => Box::new(SsmSource {
-            parameter: parameter.clone(),
-        }),
-        CredentialSpec::AgeFile { path } => Box::new(AgeFileSource {
-            path: path.clone(),
-            identity: age_identity.map(Path::to_path_buf),
-        }),
-        CredentialSpec::File { path } => Box::new(FileSource { path: path.clone() }),
-    }
-}
+#[path = "telemetry_join_credentials.rs"]
+mod credentials;
+pub use credentials::*;
 
 /// What one probe send decided.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -416,14 +202,12 @@ pub fn send_failure(status: Option<u16>, detail: &str) -> JoinError {
 /// token left by a previous run (#11628 review). The ingest-key slot stays
 /// empty on purpose: the file's `Authorization` replaces the Bearer header,
 /// so no key exists anywhere in this command.
-#[cfg(feature = "otlp")]
 #[derive(Debug, Clone)]
 pub struct OtlpProbeSender {
     endpoint: String,
     headers_file: PathBuf,
 }
 
-#[cfg(feature = "otlp")]
 impl OtlpProbeSender {
     /// A sender for `endpoint` that will read `headers_file` at send time.
     #[must_use]
@@ -435,18 +219,14 @@ impl OtlpProbeSender {
     }
 }
 
-#[cfg(feature = "otlp")]
 impl ProbeSender for OtlpProbeSender {
     async fn send_probe(&self, envelope: &TelemetryEnvelope) -> Result<ProbeAck, JoinError> {
         use crate::observability::exporter::Exporter as _;
         use crate::observability::otlp::{rejected_status, OtlpExporter};
         let headers_file = self.headers_file.display().to_string();
-        let exporter = OtlpExporter::with_headers_file(
-            self.endpoint.clone(),
-            String::new(),
-            Some(&headers_file),
-        )
-        .map_err(|e| JoinError::HeadersWrite(format!("cannot load at send time: {e}")))?;
+        let exporter =
+            OtlpExporter::with_headers_file(self.endpoint.clone(), None, Some(&headers_file))
+                .map_err(|e| JoinError::HeadersWrite(format!("cannot load at send time: {e}")))?;
         let outcome = exporter
             .emit_batch_outcome(std::slice::from_ref(envelope))
             .await;
@@ -615,12 +395,14 @@ pub async fn join<S: ProbeSender + Sync>(
         });
     }
 
-    // (b) The token, from the host's declared store.
-    let token = deps.credential.token()?;
+    ensure_external_path(&plan.headers_path)?;
+
+    // (b) Credential material, from the host's declared store.
+    let credential = deps.credential.credential()?;
 
     // (c) The owner-only headers file, verified through the exporter's own
     // parser before anything is sent.
-    write_headers_file(&plan.headers_path, &token)?;
+    write_credential_headers(&plan.headers_path, &credential.headers()?)?;
 
     // (d) One probe `host.export` record, sent over the OTLP path the file
     // provisions. The sender reads the headers file only now, after (c)
@@ -704,16 +486,46 @@ fn probe_needle(envelope: &TelemetryEnvelope) -> Result<String, JoinError> {
     Ok(format!("%{captured}%"))
 }
 
+/// Credentials may not be provisioned inside any repository/worktree, including
+/// through a symlinked parent. Check before creating missing directories.
+fn ensure_external_path(path: &Path) -> Result<(), JoinError> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|_| JoinError::HeadersWrite("cannot resolve credential path".into()))?
+            .join(path)
+    };
+    let existing = absolute
+        .ancestors()
+        .find(|p| p.exists())
+        .ok_or_else(|| JoinError::HeadersWrite("cannot resolve credential parent".into()))?;
+    let resolved = existing
+        .canonicalize()
+        .map_err(|_| JoinError::HeadersWrite("cannot resolve credential parent".into()))?;
+    if resolved.ancestors().any(|p| p.join(".git").exists()) {
+        return Err(JoinError::HeadersWrite(
+            "credential path must be outside every repository/worktree".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Write the headers file atomically with mode 0600 and prove the exporter's
 /// parser accepts it. A pre-existing looser-mode file is replaced, never
 /// trusted or mutated in place: the new inode carries 0600 from creation.
 pub fn write_headers_file(path: &Path, token: &str) -> Result<(), JoinError> {
+    write_credential_headers(path, &Credential::Bearer(token.to_owned()).headers()?)
+}
+
+fn write_credential_headers(path: &Path, text: &str) -> Result<(), JoinError> {
+    ensure_external_path(path)?;
     let refuse = |detail: String| JoinError::HeadersWrite(detail);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| refuse(format!("cannot create {}: {e}", parent.display())))?;
     }
-    let text = format!("Authorization: Bearer {token}\n");
+
     let mut temp = tempfile::Builder::new()
         .prefix(".telemetry-join")
         .rand_bytes(8)
@@ -725,13 +537,31 @@ pub fn write_headers_file(path: &Path, token: &str) -> Result<(), JoinError> {
         .map_err(|e| refuse(format!("cannot write the headers file: {e}")))?;
     // NamedTempFile is already owner-only (0600 on unix); persist() renames
     // atomically, replacing whatever was at the path.
+    // Validate before replacement: an invalid credential must leave the old
+    // file intact. The parser's errors never contain header values.
+    let parsed = crate::observability::request_headers::RequestHeaders::load(temp.path())
+        .map_err(|e| refuse(e.to_string()))?;
+    let names: Vec<_> = parsed.names().collect();
+    if names.contains(&"cf-access-client-id") != names.contains(&"cf-access-client-secret") {
+        return Err(refuse("Access credentials require both client id and client secret".into()));
+    }
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            // SAFETY: geteuid only reads the caller's effective user id.
+            if meta.uid() != unsafe { libc::geteuid() } {
+                return Err(refuse("destination must belong to the invoking user".into()));
+            }
+        }
+        if !meta.is_file() {
+            return Err(refuse(
+                "destination must be a regular file, not a symlink or directory".into(),
+            ));
+        }
+    }
     temp.persist(path)
         .map_err(|e| refuse(format!("cannot install the headers file: {e}")))?;
-    let headers = crate::observability::request_headers::RequestHeaders::load(path)
-        .map_err(|e| refuse(e.to_string()))?;
-    if !headers.sets_authorization() {
-        return Err(refuse("the written file does not carry an Authorization header".to_string()));
-    }
     Ok(())
 }
 

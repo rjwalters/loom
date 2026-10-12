@@ -67,9 +67,9 @@ struct FakeCredential {
 }
 
 impl CredentialSource for FakeCredential {
-    fn token(&self) -> Result<String, JoinError> {
+    fn credential(&self) -> Result<Credential, JoinError> {
         self.recorder.called.store(true, Ordering::SeqCst);
-        Ok(self.token.clone())
+        Ok(Credential::Bearer(self.token.clone()))
     }
 }
 
@@ -77,7 +77,7 @@ impl CredentialSource for FakeCredential {
 struct FailingCredential(Recorder);
 
 impl CredentialSource for FailingCredential {
-    fn token(&self) -> Result<String, JoinError> {
+    fn credential(&self) -> Result<Credential, JoinError> {
         self.0.called.store(true, Ordering::SeqCst);
         Err(JoinError::Credential("store down".into()))
     }
@@ -471,11 +471,13 @@ fn credential_specs_parse() {
     for bad in ["", "ssh://host", "ssm://", "age-file:", "file:", "token"] {
         assert!(parse_credential_spec(bad).is_err(), "{bad:?} must not parse");
     }
-    assert_eq!(default_credential_spec("robb-pro"), "ssm:///2am/cloudflare/otlp-host/robb-pro");
+    assert_eq!(
+        default_credential_spec("robb-pro"),
+        "ssm-access:///2am/cloudflare/otlp-host/robb-pro"
+    );
 }
 
 /// The `rejected_status` helper reads the transport's own failure wording.
-#[cfg(feature = "otlp")]
 #[test]
 fn rejected_status_reads_transport_wording() {
     use crate::observability::exporter::ExportError;
@@ -498,12 +500,11 @@ fn rejected_status_reads_transport_wording() {
 /// An empty credential value is a failure, not a silent empty header.
 #[test]
 fn empty_credential_value_is_refused() {
-    let output = CommandOutput {
+    let output = super::credentials::CommandOutput {
         ok: true,
         stdout: String::new(),
-        stderr_head: String::new(),
     };
-    assert!(finish_credential(output, "aws ssm get-parameter").is_err());
+    assert!(super::credentials::finish_credential(output, "aws ssm get-parameter").is_err());
 }
 
 /// A sender that, like the live [`OtlpProbeSender`], reads the headers file
@@ -584,15 +585,14 @@ fn only_401_and_403_are_credential_refusals() {
 
 /// A one-status loopback OTLP receiver recording each request's
 /// `Authorization` header, for driving the *live* [`OtlpProbeSender`].
-#[cfg(feature = "otlp")]
 struct AuthSink {
     addr: std::net::SocketAddr,
     auth: std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    access: std::sync::Arc<std::sync::Mutex<Vec<(Option<String>, Option<String>)>>>,
     shutdown: std::sync::Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
-#[cfg(feature = "otlp")]
 impl AuthSink {
     fn answering(status: u16) -> Self {
         use std::io::{Read, Write};
@@ -600,6 +600,8 @@ impl AuthSink {
         listener.set_nonblocking(true).unwrap();
         let addr = listener.local_addr().unwrap();
         let auth = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let access = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let access_seen = access.clone();
         let shutdown = std::sync::Arc::new(AtomicBool::new(false));
         let (seen, stop) = (auth.clone(), shutdown.clone());
         let handle = std::thread::spawn(move || {
@@ -648,6 +650,10 @@ impl AuthSink {
                 // Record before answering, so a caller that saw the response
                 // also sees the request (#7256).
                 seen.lock().unwrap().push(header("authorization"));
+                access_seen
+                    .lock()
+                    .unwrap()
+                    .push((header("cf-access-client-id"), header("cf-access-client-secret")));
                 let body = "{}";
                 let response = format!(
                     "HTTP/1.1 {status} response\r\nContent-Type: application/json\r\n\
@@ -660,6 +666,7 @@ impl AuthSink {
         Self {
             addr,
             auth,
+            access,
             shutdown,
             handle: Some(handle),
         }
@@ -674,7 +681,6 @@ impl AuthSink {
     }
 }
 
-#[cfg(feature = "otlp")]
 impl Drop for AuthSink {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::SeqCst);
@@ -688,7 +694,6 @@ impl Drop for AuthSink {
 /// sender is built *before* `join()` (as `run()` does), yet the request on
 /// the wire carries the freshly fetched token — on a clean host with no
 /// headers file, and on a re-run whose file still holds a stale token.
-#[cfg(feature = "otlp")]
 #[tokio::test]
 #[serial]
 async fn live_sender_sends_the_fresh_token_on_clean_host_and_rerun() {
@@ -723,7 +728,6 @@ async fn live_sender_sends_the_fresh_token_on_clean_host_and_rerun() {
 
 /// #11628 review: through the live sender, 401/403 are `ProbeRejected`;
 /// 429 and 5xx are reported as server/transport failures.
-#[cfg(feature = "otlp")]
 #[tokio::test]
 #[serial]
 async fn live_sender_classifies_receiver_statuses() {
@@ -760,3 +764,6 @@ async fn live_sender_classifies_receiver_statuses() {
         assert_eq!(reader.calls.load(Ordering::SeqCst), 0, "no read-back after a failed send");
     }
 }
+
+#[path = "telemetry_join_contract_tests.rs"]
+mod contract;
