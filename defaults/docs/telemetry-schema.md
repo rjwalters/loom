@@ -2610,7 +2610,7 @@ its absence from the tick.
 anchor is at least 300 s old (`ANCHOR_INTERVAL_SECS`) or the planner stamps
 changed (a regime boundary). A lost delta therefore leaves a reader's
 reconstruction wrong for at most about 5 minutes. Between anchors a pass sends a **delta** (`anchor: false`) only if
-rows, a census, a repo's `ready_complete` or the plan slots changed. A delta holds the added or changed
+rows, a census, a repo's `ready_complete`, `main_ci` or `halt`, or the plan slots changed. A delta holds the added or changed
 rows, the issues that left (`removed`), and the **full** census of each repo it
 names. **Ready replacement:** a repo with `ready_complete: false` is sent with `ready_replace: true`. Its `ready_wait` rows are not
 diffed: every record that names it carries the repo's **entire** observed
@@ -2628,7 +2628,7 @@ would exceed ~1 MB (`CHUNK_BYTES`, a quarter of the ~4 MB OTLP/gRPC message
 limit) is split into several log records that share `as_of` and every header
 field, numbered `chunk_index` `0..chunk_count`; rows and `removed` entries are
 packed in order, and a repo that spans chunks repeats its `repo`,
-`visibility`, `census`, `ready_complete` and `ready_replace` in each. A ~3000-row queue (~100-180 bytes a row) is
+`visibility`, `main_ci`, `halt`, `census`, `ready_complete` and `ready_replace` in each. A ~3000-row queue (~100-180 bytes a row) is
 one record with `chunk_count: 1`. A reader uses a record only once it holds
 all `chunk_count` chunks of that `(host, as_of)`.
 
@@ -2648,7 +2648,7 @@ all `chunk_count` chunks of that `(host, as_of)`.
 | `census_at` | RFC 3339, optional | when the review listings were read |
 | `slots` | object, optional | `{max_concurrent, occupancy?}` from the last work-finder dispatch plan |
 | `capacity` | object, optional | host capacity beside `slots` (never repeating `max_concurrent` / `occupancy`); additive on `fleet-state/v1`, absent from older emitters. All discrete: `live_workers` (sweeps this host runs), `accounts_usable` (ranking accounts with status `available`) / `accounts_exhausted` (ranking accounts with status `exhausted` only; `blocked`, `rate_limited` and unknown statuses count in neither), both absent when the ranking is unreadable or lists no account, `host_breaker` / `rate_limit_breaker` (`closed` / `open` / `cooldown`, absent when none is enabled), `admission_brake_held` (bool, absent when none is enabled). No utilisation fraction is carried, so a quiet host stays quiet: a change in any field above is a delta, drift is not |
-| `repos[]` | array | per repo, ordered by slug. An anchor lists every repo with rows or a census; a delta lists only repos that changed |
+| `repos[]` | array | per repo, ordered by slug. An anchor lists every repo with rows, a census, a `main_ci` or a `halt`; a delta lists only repos that changed |
 
 A change in `planner_version`, `planner_config_hash` or `fleet_config_hash`
 marks a regime boundary; the emitter starts a fresh anchor there, so a reader
@@ -2662,6 +2662,7 @@ Each `repos[]` entry:
 | `visibility` | `public` / `private` | missing or unknown decodes to `private` |
 | `census` | object, optional | `{open, by_stage?}`: distinct open PRs under a Loom review label, with `by_stage` keys `review_wait` / `doctor` / `merge_wait` / `merge_hold` / `held` (labels that name no single stage). **Absent means unknown** (listing incomplete or not read), never zero. Open PRs with no review label are not counted |
 | `main_ci` | `green` / `red` / `unknown`, optional | this repo's `main` CI status from the host's main-health gate: `red` = a verified-red run halted dispatch, `green` = the gate completed a green run for this repo, `unknown` = the gate holds no verdict for it: the gate is not enabled for the repo (`autonomous.mainHealthGate.enabled` is off by default, or the repo has no usable `buildGate` block), it has not completed a run since the daemon started, or its last tick could not evaluate. `unknown` is therefore not a statement about CI; a host that does not run the gate reports `unknown` for every repo (#11565). Per repo, never per host. Additive on `fleet-state/v1`; absent from older emitters. A change is a delta naming the repo |
+| `halt` | object, optional | this host's work finder holds the **whole repo** (#11564): `{reason, since, since_lower_bound?}`, present **exactly** when its last tick held the repo, whether or not the repo has ready rows. See [Repo halts and eligible-at](#repo-halts-and-eligible-at). Additive on `fleet-state/v1`; absent from older emitters and on every repo before the host's first work-finder tick |
 | `ready_complete` | bool | `true` when the work finder's last tick walked this repo's ready listing to its last page (#11139), so its `ready_wait` rows are the whole queue. `false` when the walk fell short (a later page failed, the page cap, a mid-walk change), and on emitters before #11139, which listed one page per label. A reader must not treat a `false` repo's `ready_wait` rows as its whole queue. Always sent; missing (an older emitter) decodes to `false` |
 | `ready_replace` | bool, optional | `true` exactly when `ready_complete` is `false`: `rows` carries the repo's **entire** observed `ready_wait` set, and a reader replaces the repo's `ready_wait` rows with it (drop them all, then apply `removed` and `rows`). Removals of `ready_wait` rows are never sent in `removed` for such a repo, and a reader never infers one from absence otherwise. Absent (`false`, or an older emitter): plain diffing |
 | `rows[]` | array, optional | anchor: every row; delta: added or changed rows. Ordered by issue |
@@ -2695,6 +2696,43 @@ Each row:
 | `held_since` | RFC 3339, optional | when the current hold began. Present exactly when `hold_kind` is |
 | `held_since_lower_bound` | bool, optional | present (`true`) when `held_since` is the first pass that saw the hold, not an observed transition |
 | `hold_released_at` | RFC 3339, optional | the hold cleared: the pass that first saw it clear. The clearing delta carries it with `hold_kind` / `held_since` absent, and it is kept while the row is otherwise unchanged. A held item that merges or closes gets none: its removal is the end |
+| `eligible_reason` | string, optional | `ready_wait` only (#11564): the clock the work finder held the item back on at its last tick, one of `recheck_interval`, `dispatch_backoff`, `open_pr_backoff`, `noop_cooldown`, `declined`, `prless_retry`, `build_backoff`. Present on every such row, dated or not. Absent = no clock holds it. Additive on `fleet-state/v1` |
+| `eligible_at` | RFC 3339, optional | `ready_wait` only (#11564): when that clock ends, the absolute expiry the work finder computed (the same instant as `queue.snapshot` `rows[].held_until`). Absent for `build_backoff` (no clock) and when this host cannot date the window. Additive on `fleet-state/v1` |
+
+#### Repo halts and eligible-at
+
+Facts for an ETA reader (#11564): a wait in a halted repo, or behind a
+backoff, cannot be modelled without **that** it is held, **why** and **since
+when**, and per item **when** a time-boxed hold ends. The daemon emits the
+facts; it computes no estimate.
+
+**`repos[].halt`.** The work finder folds every per-repo hold into one cause
+per repo each tick (`work_finder::halt_cause`, #9017), and `fleet.state`
+reports it per repo instead of only on `queue.snapshot`'s capped rows.
+
+| Field | Type | Notes |
+|---|---|---|
+| `reason` | string | closed enum: the `HaltCause` tokens `main_red`, `gate_pending`, `token_pool`, `preflight_advisory`, `drain`, `breaker`, `write_scope`, `ci_billing`, `install_incompatible`, `daemon_too_old`, `maintain_only`, `disk_reservation`, plus `unknown` for a hold no cause names (never omitted). A reader decodes a token it does not know as `unknown` |
+| `since` | RFC 3339 | the first work-finder tick at which this daemon process saw the repo held **with this `reason`**. A reason change restarts it; a tick that sees the repo not held ends the halt |
+| `since_lower_bound` | bool, optional | present (`true`) when the hold was already in force on this process's first tick, so it may predate the process and `since` is only a lower bound. Mirrors `held_since_lower_bound` |
+
+**Delta rule.** A halt starting, changing `reason` (or `since`) or clearing is a
+delta naming the repo. Every record that names a repo carries its current
+`halt`, so a named repo **without** `halt` is not held as of `as_of`; a
+cleared halt is that absence. An unchanged halt sends nothing between anchors.
+
+**`rows[].eligible_reason` / `eligible_at`.** Taken from the work finder's
+last tick row of the item: its disposition names the clock, and the
+disposition's `held_until` (#9311) is the end. A dispatch-backoff or no-op
+cooldown window a **peer** host armed (fleet-wide since #7477) is dated from
+the remaining time its broadcast carried. The build back-off releases when the
+repo's review + merge debt drains, not at a time, so its rows carry
+`eligible_reason: build_backoff` and no `eligible_at`. An item whose dispatch
+failed during the tick itself gets its window's end on the next tick.
+
+**No caps.** Both are carried on every halted repo and every held
+`ready_wait` row the tick saw (all of them, not `queue.snapshot`'s 200), and a
+large record is chunked, never truncated.
 
 Log attributes besides `loom.kind` and `loom.record_id`
 (`FLEET_STATE_LOG_ATTRIBUTE_KEYS`, kept by the collector's `transform/privacy`

@@ -3129,7 +3129,8 @@ pub fn spawn_multi_work_finder_task(
                 breaker_suppressed,
             );
             // #11191: a repo whose disk charge does not fit is held, named.
-            let halt_causes = halt_cause::with_disk_holds(halt_causes, disk_budget.as_ref());
+            // #11564: the result is recorded with its start for `fleet.state`.
+            let halt_causes = halt_cause::publish(halt_causes, disk_budget.as_ref(), &roots);
             let disk_note = crate::disk_admission::note(disk_budget.as_ref());
             let halted: Vec<bool> = halt_causes.iter().map(Option::is_some).collect();
             let preflight_held_count = preflight_held.iter().filter(|&&h| h).count();

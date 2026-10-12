@@ -18,7 +18,10 @@ use super::{
     held_stage, FleetInput, HeldSweep, ListedPr, ReadyItem, ReadyQueue, RepoListing, REVIEW_LABELS,
 };
 use crate::sweep_registry::SweepRegistry;
-use crate::telemetry::kinds::fleet_state::{FleetCapacity, FleetSlots, MainCi, PlannerStamps};
+use crate::telemetry::kinds::fleet_state::{
+    FleetCapacity, FleetEligibleReason, FleetHaltReason, FleetRepoHalt, FleetSlots, MainCi,
+    PlannerStamps,
+};
 use crate::telemetry::RepoVisibility;
 use crate::types::{ReadyQueueRow, SweepKind, WorkFinderTickSummary};
 use crate::workspace_pool::WorkspacePool;
@@ -323,7 +326,30 @@ async fn ready_queue(
     let summary = crate::work_finder::last_tick_summary()?;
     let refs = crate::observability::queue_snapshot::resolve_repos(&summary, slug_cache).await;
     let slug = |root: &str| refs.get(root).map(|r| r.repo.to_ascii_lowercase());
-    Some(ready_from_tick(&summary, slug, managed))
+    let mut ready = ready_from_tick(&summary, slug, managed);
+    ready.halts = halts_by_slug(&crate::work_finder::halt_cause::since::current(), slug);
+    Some(ready)
+}
+
+/// The work finder's held roots (#11564) by lowercased slug, each as its
+/// `fleet.state` fact. Every held root is kept (no cap); a root `slug` cannot
+/// name is left out, as its ready rows are. Pure.
+pub(super) fn halts_by_slug(
+    halts: &Option<Vec<crate::work_finder::halt_cause::since::RootHalt>>,
+    slug: impl Fn(&str) -> Option<String>,
+) -> BTreeMap<String, FleetRepoHalt> {
+    let mut out = BTreeMap::new();
+    for halt in halts.iter().flatten() {
+        let Some(repo) = slug(&halt.root.to_string_lossy()) else {
+            continue;
+        };
+        out.entry(repo).or_insert_with(|| FleetRepoHalt {
+            reason: FleetHaltReason::from_cause(halt.cause),
+            since: halt.since,
+            since_lower_bound: halt.since_lower_bound,
+        });
+    }
+    out
 }
 
 /// [`ready_queue`] over one tick, with `slug` resolving a root. Pure.
@@ -354,6 +380,11 @@ fn ready_from_tick(
                 fleet_priority: row.workspace_priority,
                 created_at: parse_instant(row.created_at.as_deref()),
                 main_red_fix: row.main_red_fix,
+                eligible_reason: FleetEligibleReason::from_disposition(row.disposition),
+                // Only a clocked hold's own expiry: never a stray one.
+                eligible_at: FleetEligibleReason::from_disposition(row.disposition)
+                    .filter(|reason| reason.has_clock())
+                    .and(row.plan.held_until),
             })
         })
         .collect();
@@ -381,6 +412,7 @@ fn ready_from_tick(
         listed,
         complete,
         slots,
+        halts: BTreeMap::new(),
     }
 }
 
@@ -598,10 +630,13 @@ pub(super) fn reused_input(host_id: &str, reused: &Reused) -> FleetInput {
     }
 }
 
-/// The ready queue of `summary`, its roots named by the collector's slugs.
-/// Pure.
+/// The ready queue of `summary`, its roots named by the collector's slugs,
+/// with the work finder's current repo halts (#11564).
 pub(super) fn ready_input(summary: &WorkFinderTickSummary, reused: &Reused) -> ReadyQueue {
-    ready_from_tick(summary, |root| reused.slug(root), &reused.managed)
+    let mut ready = ready_from_tick(summary, |root| reused.slug(root), &reused.managed);
+    let halts = crate::work_finder::halt_cause::since::current();
+    ready.halts = halts_by_slug(&halts, |root| reused.slug(root));
+    ready
 }
 
 /// The seconds between passes: the work finder's tick interval once it has
