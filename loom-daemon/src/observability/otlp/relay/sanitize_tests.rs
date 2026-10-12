@@ -12,7 +12,7 @@ use serial_test::serial;
 /// cell to the digit-free `unknown` sentinel first — serialized against the
 /// `fleet_sync` and mapping tests that mutate the same cell.
 fn pin_config_sha_unknown() {
-    crate::fleet_sync::force_for_tests(crate::fleet_sync::AppliedSha::Unknown);
+    crate::fleet_sync::applied::force_for_tests(crate::fleet_sync::AppliedSha::Unknown);
 }
 
 pub(in crate::observability::otlp::relay) fn bound() -> BoundIdentity {

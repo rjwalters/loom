@@ -16,9 +16,9 @@ fn with_clean_cell<T>(f: impl FnOnce() -> T) -> T {
     let dir = tempfile::tempdir().expect("dir");
     let prior = std::env::var("LOOM_SOCKET_PATH").ok();
     std::env::set_var("LOOM_SOCKET_PATH", dir.path().join("loom-daemon.sock"));
-    fleet_sync::reset_for_tests();
+    fleet_sync::applied::reset_for_tests();
     let out = f();
-    fleet_sync::reset_for_tests();
+    fleet_sync::applied::reset_for_tests();
     match prior {
         Some(value) => std::env::set_var("LOOM_SOCKET_PATH", value),
         None => std::env::remove_var("LOOM_SOCKET_PATH"),
@@ -87,7 +87,7 @@ fn get<'a>(pairs: &'a [(String, String)], key: &str) -> Option<&'a str> {
 #[serial(loom_socket_path_env)]
 fn fleet_provenance_is_on_the_resource_of_every_signal() {
     with_clean_cell(|| {
-        fleet_sync::force_for_tests(AppliedSha::Sha(
+        fleet_sync::applied::force_for_tests(AppliedSha::Sha(
             "0123456789abcdef0123456789abcdef01234567".to_string(),
         ));
         for (signal, pairs) in per_signal_pairs(&batch()) {
@@ -113,11 +113,11 @@ fn fleet_provenance_is_on_the_resource_of_every_signal() {
 #[serial(loom_socket_path_env)]
 fn config_sha_sentinels_are_unknown_and_none_never_absent_or_empty() {
     with_clean_cell(|| {
-        fleet_sync::force_for_tests(AppliedSha::Unknown);
+        fleet_sync::applied::force_for_tests(AppliedSha::Unknown);
         for (signal, pairs) in per_signal_pairs(&batch()) {
             assert_eq!(get(&pairs, "loom.fleet.config_sha"), Some("unknown"), "{signal}");
         }
-        fleet_sync::force_for_tests(AppliedSha::NoStore);
+        fleet_sync::applied::force_for_tests(AppliedSha::NoStore);
         for (signal, pairs) in per_signal_pairs(&batch()) {
             assert_eq!(get(&pairs, "loom.fleet.config_sha"), Some("none"), "{signal}");
         }
@@ -132,7 +132,7 @@ fn config_sha_sentinels_are_unknown_and_none_never_absent_or_empty() {
 #[serial(loom_socket_path_env)]
 fn the_next_request_carries_a_sha_that_changed_in_process() {
     with_clean_cell(|| {
-        fleet_sync::force_for_tests(AppliedSha::Sha(
+        fleet_sync::applied::force_for_tests(AppliedSha::Sha(
             "0123456789abcdef0123456789abcdef01234567".to_string(),
         ));
         let first = per_signal_pairs(&batch());
@@ -143,7 +143,7 @@ fn the_next_request_carries_a_sha_that_changed_in_process() {
                 "{signal}: before the simulated timer pass"
             );
         }
-        fleet_sync::force_for_tests(AppliedSha::Sha(
+        fleet_sync::applied::force_for_tests(AppliedSha::Sha(
             "fedcba9876543210fedcba9876543210fedcba98".to_string(),
         ));
         for (signal, pairs) in per_signal_pairs(&batch()) {

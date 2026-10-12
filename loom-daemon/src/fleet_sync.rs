@@ -90,7 +90,8 @@ use crate::fleet_store::render::{self, Drift};
 use crate::fleet_store::roster::{self, Change, Plan, Registered};
 use crate::fleet_store::{self as store, StoreLocation};
 
-mod applied;
+// `applied` is `pub(crate)` so the OTLP resource tests reach its test seams (#11197).
+pub(crate) mod applied;
 pub mod checkout_ff;
 mod floor_knowledge;
 mod loom_ui;
@@ -99,10 +100,6 @@ pub mod roster_clone;
 pub mod workspace_resync;
 
 pub use applied::{applied_config_sha, AppliedSha, FLEET_CONFIG_SHA};
-
-// Test seams for the applied-SHA cell, used by the OTLP resource tests (#11197).
-#[cfg(all(test, feature = "otlp"))]
-pub(crate) use applied::{force_for_tests, reset_for_tests};
 
 pub use floor_knowledge::{floor_knowledge, floor_wake, FloorKnowledge, FloorWake};
 
