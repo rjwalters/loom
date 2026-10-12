@@ -2423,6 +2423,47 @@ Reporting:
   memory behind this is per process: a restarted daemon reports each standing
   skip state once more.
 
+#### Self-heal of a Loom-only blockage (#11425)
+
+A checkout that stops at `mid-operation`, `ahead`, `diverged` or `dirty` is
+usually someone's work, and stays untouched. On fleet workers it is often only
+Loom's own stale install: `chore: resync installed Loom surfaces` commits whose
+push a ruleset refused, modified installed files, or a rebase the resync script
+abandoned. Before the rules run, the step repairs a checkout when **every**
+blocker is Loom-owned:
+
+- **What counts as Loom-owned.** The `installed_files` of
+  `.loom/install-metadata.json` at HEAD, at the branch tip and at
+  `origin/<default>`, plus the metadata file. Missing or unparseable metadata
+  on any side means nothing is repaired. Every local commit (and every commit
+  of an in-progress rebase, merge or cherry-pick) may change only those paths,
+  and so may every dirty tracked path. Dirt counts only on a checkout that is
+  behind. Untracked files are never touched; one where `origin` writes a file
+  stops the repair.
+- **Operations and locks.** A rebase of the default branch, a merge or a
+  cherry-pick is repaired only when its state is 30 minutes old and no `git`
+  process has its working directory in the repo. An `index.lock` is removed
+  only when empty, 30 minutes old and no `git` process is live there.
+- **Repair, in order.** `refs/loom/rescue/<UTC ts>` at HEAD (and `<ts>-branch`
+  at the branch tip when an operation moved HEAD); the lock; `stash push` of
+  the dirty paths as `loom-rescue-<ts>` (not during an operation, whose abort
+  discards them); `<op> --abort`; `reset --hard origin/<default>`. A failure
+  stops the repair, before the reset, and the ordinary rules report the
+  checkout as before.
+- **Write gates.** Nothing is written while `fleet.autoApply` is off, the host
+  is held, a main-health gate run or the self-update is in that checkout.
+- **Rescue refs** older than 14 days are pruned
+  (`LOOM_RESCUE_REF_RETAIN_DAYS`).
+- **Escalation.** A hold in one of those four states (or `would-overwrite`)
+  that stays for 120 minutes (`LOOM_CHECKOUT_ESCALATE_AFTER_MINUTES`) produces
+  one `escalated` event and an `error` log line, naming the repo, the state and
+  the command to run, until the hold clears. Memory is per process, so a
+  restart asks once more.
+- **Telemetry.** Each step is an event on `fleet_sync.checkout` with kind
+  `rescue-ref`, `lock-removed`, `stash`, `abort`, `repaired`, `repair-failed`,
+  `rescue-pruned` or `escalated`, and a log line naming the repo path. Carrying
+  these to SigNoz is #11386.
+
 ## Fleet model A/B — `sweep-experiment plan` (#8055 phase 1)
 
 `loom-daemon sweep-experiment` already randomizes **per issue**, by parity

@@ -1,6 +1,9 @@
 //! OTLP mapping for `pick.decision` (#10212).
 //!
-//! One log record per tick. The **body** is the record's JSON, so ClickHouse
+//! One log record per chunk: a tick whose JSON exceeds `CHUNK_BYTES` is
+//! split into bounded chunks, each exported as its own log record (see
+//! `telemetry-kind-pick-decision.md`). The **body** is the chunk's JSON, so
+//! ClickHouse
 //! can `JSONExtract` the ranked candidate list (see `telemetry-schema.md` for
 //! the rank query). The one attribute here is `loom.role`; `log_record_for`
 //! adds `loom.kind` (`pick.decision`, the key the SigNoz queries filter on,
@@ -30,25 +33,30 @@ pub(super) fn log_parts(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::super::log_record_for;
+    use super::super::{any_value, log_record_for};
     use crate::telemetry::kinds::pick_decision::{
-        PickCandidate, PickDecisionRecord, PickTick, PickVerdict,
+        split_into_chunks, PickCandidate, PickDecisionRecord, PickDraw, PickDrawCandidate,
+        PickTick, PickVerdict, PickWorkspaceDraw,
     };
     use crate::telemetry::{TelemetryEnvelope, TelemetryRecord};
     use chrono::Utc;
 
+    fn tick() -> PickTick {
+        let now = Utc::now();
+        PickTick {
+            role: "judge".into(),
+            host: "h".into(),
+            tick_id: "t".into(),
+            started_at: now,
+            ended_at: now,
+            outcome: "success".into(),
+        }
+    }
+
     #[test]
     fn maps_to_a_log_whose_body_is_the_record_json() {
-        let now = Utc::now();
         let record = PickDecisionRecord::build(
-            PickTick {
-                role: "judge".into(),
-                host: "h".into(),
-                tick_id: "t".into(),
-                started_at: now,
-                ended_at: now,
-                outcome: "success".into(),
-            },
+            tick(),
             vec![(
                 PickCandidate {
                     rank: 1,
@@ -72,5 +80,45 @@ mod tests {
             .find(|a| a.key == "loom.kind")
             .expect("loom.kind");
         assert!(format!("{:?}", kind.value).contains("pick.decision"), "{kind:?}");
+    }
+
+    /// #11567: a chunk's body carries `chunk_index` / `chunk_count` and the
+    /// tick header, so ClickHouse can reassemble and filter per tick.
+    #[test]
+    fn a_chunked_record_keeps_the_chunk_fields_and_tick_id_in_its_body() {
+        let draws = (0u32..200)
+            .map(|d| PickDraw {
+                pool: "all".into(),
+                candidates: vec![PickDrawCandidate {
+                    repo: format!("o/w{d}"),
+                    weight: u64::from(10 + d),
+                }],
+                total_weight: u64::from(10 + d),
+                roll: u64::from(d),
+                picked: format!("o/w{d}"),
+                number: d,
+            })
+            .collect();
+        let record = PickDecisionRecord::build(tick(), Vec::new()).with_workspace_draw(Some(
+            PickWorkspaceDraw {
+                seed: "42".into(),
+                draws_total: 200,
+                draws,
+            },
+        ));
+        for chunk in split_into_chunks(record, 2_000) {
+            let envelope = TelemetryEnvelope::new("h", TelemetryRecord::PickDecision(chunk));
+            let log = log_record_for(&envelope).expect("pick.decision exports as a log");
+            let Some(any_value::Value::StringValue(json)) =
+                log.body.as_ref().and_then(|b| b.value.as_ref())
+            else {
+                panic!("pick.decision body is a string: {:?}", log.body);
+            };
+            let body: serde_json::Value = serde_json::from_str(json).expect("json body");
+            assert!(body["chunk_index"].is_u64(), "{body}");
+            assert_eq!(body["tick_id"], "t");
+            assert_eq!(body["workspace_draw"]["seed"], "42");
+            assert_eq!(body["workspace_draw"]["draws_total"], 200);
+        }
     }
 }

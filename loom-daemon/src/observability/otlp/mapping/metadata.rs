@@ -5,7 +5,7 @@ use super::{
     RepoVisibility,
 };
 use crate::script_helpers::sweep_experiment::ModelUsageTotals;
-use crate::telemetry::{PhaseDuration, SweepOutcomeRecord, SweepStartFacts};
+use crate::telemetry::{PhaseDuration, PhaseTapUsageRow, SweepOutcomeRecord, SweepStartFacts};
 pub(super) fn visibility_str(visibility: RepoVisibility) -> &'static str {
     match visibility {
         RepoVisibility::Public => "public",
@@ -144,6 +144,68 @@ pub(super) fn phase_durations(entries: &[PhaseDuration]) -> Option<KeyValue> {
                     if let Some(value) = value.and_then(|v| i64::try_from(v).ok()) {
                         values.push(kv_int(key, value));
                     }
+                }
+                row(values)
+            })
+            .collect(),
+    ))
+}
+
+/// `loom.phase_tap_usage` (Issue #11488): one kvlist per `(role, tap, model)`
+/// for out-of-process phases. An unreported counter is an absent key, never `0`.
+pub(super) fn phase_tap_usage(rows: &[PhaseTapUsageRow]) -> Option<KeyValue> {
+    if rows.is_empty() {
+        return None;
+    }
+    let valid = |r: &PhaseTapUsageRow| {
+        [
+            Some(&r.role),
+            Some(&r.tap),
+            Some(&r.runtime),
+            r.model_profile.as_ref(),
+            r.model.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .all(|v| text(v))
+    };
+    if rows.len() > MAX_GROUPS || !rows.iter().all(valid) {
+        log::warn!("observability: invalid or oversized phase tap usage omitted");
+        return None;
+    }
+    Some(array(
+        "loom.phase_tap_usage",
+        rows.iter()
+            .map(|r| {
+                let mut values = vec![
+                    kv_string("role", r.role.clone()),
+                    kv_string("tap", r.tap.clone()),
+                    kv_string("runtime", r.runtime.clone()),
+                ];
+                for (key, value) in [("model_profile", &r.model_profile), ("model", &r.model)] {
+                    if let Some(value) = value {
+                        values.push(kv_string(key, value.clone()));
+                    }
+                }
+                for (key, value) in [
+                    ("input", r.input),
+                    ("output", r.output),
+                    ("reasoning", r.reasoning),
+                    ("cache_read", r.cache_read),
+                    ("cache_write", r.cache_write),
+                    ("usage_events", r.usage_events),
+                ] {
+                    if let Some(value) = value.and_then(|v| i64::try_from(v).ok()) {
+                        values.push(kv_int(key, value));
+                    }
+                }
+                if let Some(cost) = r.cost_estimate.filter(|c| c.is_finite()) {
+                    values.push(kv(
+                        "cost_estimate",
+                        AnyValue {
+                            value: Some(any_value::Value::DoubleValue(cost)),
+                        },
+                    ));
                 }
                 row(values)
             })

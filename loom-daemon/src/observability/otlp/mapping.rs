@@ -8,6 +8,7 @@ mod ci;
 mod fact_id;
 mod fleet_state;
 mod host_export;
+mod host_resource;
 mod metadata;
 mod ops;
 mod outcome_facts;
@@ -16,6 +17,9 @@ mod pick_decision;
 mod session_output;
 mod token_ranking;
 
+// The shared host `Resource` constructor; traces and the relay re-import it
+// from here, exactly as when it lived inline.
+pub(super) use host_resource::resource_for_host;
 use metadata::visibility_str;
 
 use std::collections::BTreeMap;
@@ -31,7 +35,6 @@ use opentelemetry_proto::tonic::metrics::v1::{
     metric, number_data_point, AggregationTemporality, Gauge, Histogram, HistogramDataPoint,
     Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics,
 };
-use opentelemetry_proto::tonic::resource::v1::Resource;
 
 use crate::telemetry::{
     AnomalyFlag, RepoVisibility, RoleTickResult, SweepResult, TelemetryEnvelope, TelemetryKindOtlp,
@@ -146,34 +149,8 @@ fn severity_text(severity: SeverityNumber) -> &'static str {
     }
 }
 
-/// A `Resource` describing the emitting daemon host. `service.version` is
-/// always present: a record-supplied `daemon_version` (from a `host.health`
-/// record, threaded in by [`build_metrics_request`]) wins; otherwise — traces,
-/// logs, and metrics batches without `host.health` — it falls back to the
-/// exporting build's own `CARGO_PKG_VERSION` (Issue #9028).
-///
-/// `host.name` (Issue #10977) has one source: the envelope's `host_id`, the
-/// same string as `host.id` and `service.instance.id`. For a daemon that is
-/// [`host_identity()`](crate::sweep_registry::host_identity) — fleet-gitops
-/// `fleet.hostId`, else `$LOOM_HOST_ID`, else the persisted `~/.loom/host-id`
-/// (#11530; never the OS hostname). It is set here, on every signal,
-/// so a receiver reached without a collector still gets a readable host axis.
-pub(super) fn resource_for_host(host_id: &str, daemon_version: Option<&str>) -> Resource {
-    let version = daemon_version
-        .filter(|v| !v.is_empty())
-        .unwrap_or(env!("CARGO_PKG_VERSION"));
-    let attributes = vec![
-        kv_string("service.name", "loom-daemon"),
-        kv_string("service.instance.id", host_id),
-        kv_string("host.id", host_id),
-        kv_string("host.name", host_id),
-        kv_string("service.version", version),
-    ];
-    Resource {
-        attributes,
-        ..Default::default()
-    }
-}
+// `resource_for_host` — the shared host `Resource` — lives in the
+// `host_resource` sibling module, with the traces builder and the relay.
 
 // ============================================================================
 // Logs — the four sweep-lifecycle record kinds
@@ -342,6 +319,9 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             attributes.extend(metadata::outcome(r));
             if let Some(phases) = metadata::phase_durations(&r.phase_durations) {
                 attributes.push(phases);
+            }
+            if let Some(usage) = metadata::phase_tap_usage(&r.phase_tap_usage) {
+                attributes.push(usage);
             }
             (
                 "sweep.outcome",

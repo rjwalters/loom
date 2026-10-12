@@ -1,5 +1,7 @@
 //! Issue #10977: the OTLP resource carries `host.name` on every signal.
 
+use opentelemetry_proto::tonic::resource::v1::Resource;
+
 use super::*;
 use crate::telemetry::trace::{SpanName, SpanRecord, SpanStatus, TraceAttributes, TraceContext};
 
