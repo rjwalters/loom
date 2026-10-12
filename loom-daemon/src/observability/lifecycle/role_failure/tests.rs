@@ -127,7 +127,6 @@ fn gateway_collector_keeps_every_role_failure_attribute() {
     }
 }
 
-#[cfg(feature = "otlp")]
 mod role_invocation_close {
     use super::super::super::{
         role_child_exited, role_child_spawned, role_command, role_invocation, RoleTrace,

@@ -15,7 +15,6 @@
 //! durably queued for export — not against the synthetic
 //! `loom_daemon::telemetry::fixture` generator, which hand-builds span records
 //! and so could not demonstrate what a sweep itself records.
-#![cfg(feature = "otlp")]
 #![allow(clippy::unwrap_used)]
 use loom_daemon::{
     observability::{lifecycle, queue::DurableQueue},

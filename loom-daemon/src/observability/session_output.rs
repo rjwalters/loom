@@ -722,9 +722,8 @@ fn advance_run(run: &mut Run, projects_dir: &Path, now: DateTime<Utc>) -> Vec<Se
 #[path = "session_output/tests.rs"]
 mod tests;
 
-/// Live end-to-end verification, `#[ignore]`d — needs a reachable collector
-/// AND the `otlp` feature (the real exporter lives behind it). See the module
-/// docs for the invocation.
-#[cfg(all(test, feature = "otlp"))]
+/// Live end-to-end verification, `#[ignore]`d — needs a reachable collector.
+/// See the module docs for the invocation.
+#[cfg(test)]
 #[path = "session_output/e2e_tests.rs"]
 mod e2e;

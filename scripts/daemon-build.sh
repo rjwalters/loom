@@ -21,6 +21,14 @@
 # failure is never confused with a missing binary after a successful build:
 #   - cargo build itself fails            -> exit 1, "Failed to build loom-daemon"
 #   - build succeeds but binary is absent -> exit 3, a distinct "binary not found" message
+#   - the built binary cannot export OTLP -> exit 4, a distinct "cannot export OTLP" message
+#
+# The exit-4 probe (#10700): after the build, the fresh binary is asked
+# `telemetry-capabilities --require-otlp`. The OTLP exporter is compiled
+# unconditionally, so this always passes for this source — it exists so that
+# no build path can ever again install a daemon that silently drops a
+# configured `otlp` sink (the incident #10700 records). The probe's JSON goes
+# to stderr so stdout stays the single target-dir line.
 
 set -euo pipefail
 
@@ -41,6 +49,11 @@ if [[ ! -x "$DAEMON_BIN" ]]; then
   echo "Error: loom-daemon build succeeded, but no binary was found at $DAEMON_BIN" >&2
   echo "       (Cargo target dir resolved to: $TARGET_DIR — check build.target-dir / CARGO_TARGET_DIR)" >&2
   exit 3
+fi
+
+if ! "$DAEMON_BIN" telemetry-capabilities --require-otlp >&2; then
+  echo "Error: the built loom-daemon at $DAEMON_BIN cannot export OTLP ('telemetry-capabilities --require-otlp' failed) — refusing to hand it to an installer (#10700)" >&2
+  exit 4
 fi
 
 # Copy to architecture-specific name (matches release artifact naming)

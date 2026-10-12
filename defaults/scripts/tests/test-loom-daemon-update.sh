@@ -244,6 +244,11 @@ fi
 # Same catch-all as write_fake_daemon (#4799): an unrecognized NON-FLAG
 # subcommand must never fall into the foreground daemon loop and wedge its
 # caller. Flags still reach the daemon body.
+if [[ "\${1:-}" == "telemetry-capabilities" ]]; then
+    # Answers the post-build OTLP probe (#10700) like a real daemon.
+    echo '{"otlp":true}'
+    exit 0
+fi
 if [[ -n "\${1:-}" && "\${1:-}" != -* ]]; then
     echo "fake loom-daemon: unsupported subcommand: \$*" >&2
     exit 1
@@ -284,6 +289,11 @@ if [[ -n '${status_json}' && "\${1:-}" == "status" ]]; then
 fi
 if [[ "\${1:-}" == "calibrate" ]]; then
     exit 1
+fi
+if [[ "\${1:-}" == "telemetry-capabilities" ]]; then
+    # Answers the post-build OTLP probe (#10700) like a real daemon.
+    echo '{"otlp":true}'
+    exit 0
 fi
 if [[ -n "\${1:-}" && "\${1:-}" != -* ]]; then
     echo "fake loom-daemon: unsupported subcommand: \$*" >&2
@@ -4633,6 +4643,44 @@ else
     TESTS_FAILED=$((TESTS_FAILED + 1))
     echo -e "${RED}✗${NC} no launchctl invocation named a com.rjwalters.* label"
     echo "  launchctl invocations: $(cat "$SANDBOX_LOG_DIR/launchctl-invocations.log" 2>/dev/null)"
+fi
+
+# ============================================================
+# 43b. OTLP post-build probe refusal (#10700): when the freshly-built binary's
+#      `telemetry-capabilities --require-otlp` exits 1, the update refuses
+#      (MissingOtlp) and leaves the installed binary untouched. Every happy-path
+#      scenario above proves the probe passes for a capable daemon (the fixture
+#      fakes answer it); this row proves it is load-bearing.
+# ============================================================
+WOT="$BASE_WORKDIR/wotlp"
+new_fixture "$WOT"
+HEADOT="$(cd "$WOT" && git rev-parse --short HEAD)"
+INSTALLEDOT="$WOT/installed/loom-daemon"
+mkdir -p "$WOT/installed"
+write_fake_daemon "$INSTALLEDOT" "deadbee" "$WOT/old-marker"
+NEW_FAKEOT="$WOT/new-fake-daemon"
+write_fake_daemon "$NEW_FAKEOT" "$HEADOT" "$WOT/new-marker"
+( cd "$WOT" && PATH="$TEST_PATH" LOOM_PID_FILE='' LOOM_DAEMON_BIN="$INSTALLEDOT" NEW_FAKE_BIN_SRC="$NEW_FAKEOT" \
+    FAKE_DAEMON_OTLP_PROBE_EXIT=1 \
+    env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
+    bash "$UPDATE_SCRIPT" >"$WOT/update.log" 2>&1 )
+otlp_rc=$?
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ "$otlp_rc" -ne 0 ]] && grep -q 'OTLP probe FAILED' "$WOT/update.log"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} update refuses when the built binary lacks OTLP (probe exit 1, #10700)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} update refuses when the built binary lacks OTLP (rc=$otlp_rc)"
+    sed 's/^/    /' "$WOT/update.log" | tail -15
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if "$INSTALLEDOT" --version 2>/dev/null | grep -q deadbee; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} refused OTLP-less build did NOT replace the installed binary"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} refused OTLP-less build replaced the installed binary"
 fi
 
 # ============================================================

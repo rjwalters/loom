@@ -160,7 +160,6 @@ fn caller_running(command: &str) -> Caller {
 }
 
 /// A caller closure for `start_with`, for a call running `command`.
-#[cfg(feature = "otlp")]
 fn running(command: &str) -> impl FnOnce() -> Result<Caller, String> {
     let caller = caller_running(command);
     move || Ok(caller)
@@ -293,26 +292,6 @@ fn outside_a_loom_checkout_starting_is_a_no_op() {
     assert!(matches!(outcome, Outcome::NotConfigured(_)), "{outcome:?}");
 }
 
-/// A binary built without the `otlp` feature has no exporter for an
-/// OTLP-only kind, so even a fully configured claim starts nothing.
-#[cfg(not(feature = "otlp"))]
-#[test]
-fn a_build_without_otlp_never_starts_a_tailer() {
-    let scratch = Scratch::new("no-otlp-build");
-    let root = checkout(&scratch, Some(&live_config(&scratch)));
-    let outcome =
-        start_with(&request(&root), &attended_env(), Some(&scratch.0), never_read, |_| {
-            panic!("no exporter, no tailer")
-        });
-    match outcome {
-        Outcome::NotConfigured(reason) => assert!(reason.contains("OTLP"), "{reason}"),
-        other => panic!("expected NotConfigured, got {other:?}"),
-    }
-}
-
-// The tests below need a configuration this binary can export under, which
-// takes the `otlp` feature.
-#[cfg(feature = "otlp")]
 #[test]
 fn without_a_session_id_nothing_is_guessed() {
     let scratch = Scratch::new("no-session");
@@ -427,7 +406,6 @@ fn an_explicit_transcript_path_is_described_without_locating() {
 // The detached tailer
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "otlp")]
 #[test]
 fn a_configured_attended_claim_detaches_one_tailer_for_its_own_transcript() {
     let scratch = Scratch::new("spawn");
@@ -810,7 +788,6 @@ async fn a_restarted_tailer_for_the_same_claim_reproduces_its_status_ids() {
 
 /// The whole detached-tailer path against a collector that is not there: it
 /// must finish promptly and quietly, not hang on export.
-#[cfg(feature = "otlp")]
 #[tokio::test]
 #[serial_test::serial]
 async fn an_unreachable_collector_never_holds_the_tailer_up() {

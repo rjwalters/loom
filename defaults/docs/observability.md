@@ -238,8 +238,8 @@ Back-compat and upgrade rules:
 - Entries dedupe by kind (first wins; queues and status are keyed by kind
   name, so `"https"` can appear once). An unrecognized kind is logged and
   skipped, never a hard error.
-- A policy failure on one entry (bad endpoint, placeholder host, missing
-  `otlp` Cargo feature in this build) degrades **that entry** to its own
+- A policy failure on one entry (bad endpoint, placeholder host, refused
+  `headers_file`) degrades **that entry** to its own
   `misconfigured` status while the other exporters run; only when *no*
   exporter survives — or the shared ingest key is unusable — is export off
   entirely.
@@ -493,7 +493,7 @@ condition is a first-class health check with four states, shown on the
 
 | State | Meaning |
 |---|---|
-| `no_exporter` | The resolved `observability.exporters` has no usable `otlp` entry (or observability is off), or the binary was built without the `otlp` feature (#10700). |
+| `no_exporter` | The resolved `observability.exporters` has no usable `otlp` entry (or observability is off). Every build compiles the OTLP exporter in (#10700), so a binary can no longer lack it. |
 | `failing` | An `otlp` exporter is configured, but no batch was acked within the window, or the OTLP queue's `dropped_total` grew within the window. |
 | `ok` | The last successful export is recent (a fresh exporter gets the window as startup grace). |
 | `exempt` | The host opted out; the reason is shown. |
@@ -965,7 +965,6 @@ could read. A machine with no daemon running has no receiver at all.
 
 The same switch is read again at each launch against the launched session's
 own workspace, so one repository of a multi-workspace daemon can opt out.
-Requires a daemon built with the `otlp` Cargo feature (release builds are).
 
 **What a wired session is given.** `CLAUDE_CODE_ENABLE_TELEMETRY=1`,
 `CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1`, `OTEL_{METRICS,LOGS,TRACES}_EXPORTER=otlp`,

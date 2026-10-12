@@ -7,9 +7,10 @@
 //! `observability.exporters` entry (`observability::resolve_exporters`) —
 //! [`super::exporter::HttpsExporter`] stays the default (`"https"`).
 //!
-//! Gated behind the `otlp` Cargo feature (see `loom-daemon/Cargo.toml`): a
-//! default build never compiles `opentelemetry_proto` in, so choosing this
-//! sink costs nothing for operators who stick with the HTTPS exporter.
+//! Compiled into every build (#10700): `opentelemetry_proto` is a
+//! non-optional dependency, so no build path can produce a daemon that
+//! silently cannot honour a configured `otlp` sink. The `otlp` Cargo feature
+//! survives only as a no-op alias (see `loom-daemon/Cargo.toml`).
 //!
 //! # Transport, not the OTel SDK
 //!
