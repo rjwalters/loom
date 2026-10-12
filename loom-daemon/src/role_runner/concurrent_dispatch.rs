@@ -686,6 +686,9 @@ impl RoleDispatcher {
         let start = self.rotation_start(&roots);
         let mut order: VecDeque<(usize, PathBuf)> = roots.into_iter().enumerate().collect();
         order.rotate_left(start);
+        if self.spec.name == "curator" {
+            self.order_by_untriaged(&mut order);
+        }
         // A new tick replaces whatever the previous one left undecided.
         self.resume_requested = false;
         let report = self.walk(order, in_progress);
@@ -693,6 +696,28 @@ impl RoleDispatcher {
             log::warn!("{}", refusal_summary_line(self.spec.name, refusal, report.deferred));
         }
         report
+    }
+
+    /// Curator demand axis (#9000): among roots with a last-known untriaged
+    /// count, visit the largest backlog first. The observed roots are
+    /// re-sorted within the slots they already occupy, so unobserved roots keep
+    /// their round-robin position and a failing listing never starves a root.
+    /// Counts exist only when `eventTriggers` is on, so otherwise this is a
+    /// no-op.
+    fn order_by_untriaged(&self, order: &mut VecDeque<(usize, PathBuf)>) {
+        let mut slots: Vec<usize> = Vec::new();
+        let mut observed: Vec<((usize, PathBuf), usize)> = Vec::new();
+        for (slot, entry) in order.iter().enumerate() {
+            if let Some(n) = self.trigger_ledger.last_untriaged(&entry.1) {
+                slots.push(slot);
+                observed.push((entry.clone(), n));
+            }
+        }
+        // Stable: equal counts keep round-robin order.
+        observed.sort_by(|a, b| b.1.cmp(&a.1));
+        for (slot, (entry, _)) in slots.into_iter().zip(observed) {
+            order[slot] = entry;
+        }
     }
 
     /// Resume this tick's deferred roots after a run returned
