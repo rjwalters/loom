@@ -83,7 +83,7 @@ fn every_prompt_call_site_warns_when_the_guard_gives_no_answer() {
     ] {
         let text = shipped(rel);
         let calls = text
-            .matches("loom-daemon forge rebase-guard --base origin/main; RG=$?")
+            .matches("RG=0; loom-daemon forge rebase-guard --base origin/main || RG=$?")
             .count();
         let warnings = text
             .matches("WARNING: rebase-guard gave no answer (rc=$RG)")

@@ -1238,7 +1238,7 @@ if [ "$MERGE_STATE" = "DIRTY" ]; then
     fi
     # Discard guard (#9282): rc 0 = BLOCKED.
     if [ "$GATE_OK" = true ]; then
-        loom-daemon forge rebase-guard --base origin/main; RG=$?
+        RG=0; loom-daemon forge rebase-guard --base origin/main || RG=$?
         [ "$RG" = 0 ] && GATE_OK=false
         [ "$RG" -le 1 ] || echo "WARNING: rebase-guard gave no answer (rc=$RG) - pushing UNCHECKED (#9282)" >&2
     fi
@@ -1289,7 +1289,7 @@ if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-che
   echo "Version-bearing files out of sync after update (see BLOCKER:/Fix: above) - aborting push"
   exit 1
 fi
-loom-daemon forge rebase-guard --base origin/main; RG=$?
+RG=0; loom-daemon forge rebase-guard --base origin/main || RG=$?
 [ "$RG" = 0 ] && exit 1
 [ "$RG" = 1 ] || echo "WARNING: rebase-guard gave no answer (rc=$RG) - pushing UNCHECKED (#9282)" >&2
 
@@ -1322,7 +1322,7 @@ if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-che
   echo "Version-bearing files out of sync after update (see BLOCKER:/Fix: above) - aborting push"
   exit 1
 fi
-loom-daemon forge rebase-guard --base origin/main; RG=$?
+RG=0; loom-daemon forge rebase-guard --base origin/main || RG=$?
 [ "$RG" = 0 ] && exit 1
 [ "$RG" = 1 ] || echo "WARNING: rebase-guard gave no answer (rc=$RG) - pushing UNCHECKED (#9282)" >&2
 
