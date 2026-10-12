@@ -2583,7 +2583,7 @@ its absence from the tick.
 anchor is at least 300 s old (`ANCHOR_INTERVAL_SECS`) or the planner stamps
 changed (a regime boundary). A lost delta therefore leaves a reader's
 reconstruction wrong for at most about 5 minutes. Between anchors a pass sends a **delta** (`anchor: false`) only if
-rows, a census, a repo's `ready_complete`, `main_ci`, `halt` or dispatch limits (`in_flight`, `cap`, `deferred_repo_cap`), or the plan slots changed. A delta holds the added or changed
+rows, a census, a repo's `ready_complete`, `main_ci`, `halt`, dispatch limits (`in_flight`, `cap`, `deferred_repo_cap`), queue flow (`queue_depth`, `queue_flow`), or the plan slots changed. A delta holds the added or changed
 rows, the issues that left (`removed`), and the **full** census of each repo it
 names. **Ready replacement:** a repo with `ready_complete: false` is sent with `ready_replace: true`. Its `ready_wait` rows are not
 diffed: every record that names it carries the repo's **entire** observed
@@ -2601,7 +2601,7 @@ would exceed ~1 MB (`CHUNK_BYTES`, a quarter of the ~4 MB OTLP/gRPC message
 limit) is split into several log records that share `as_of` and every header
 field, numbered `chunk_index` `0..chunk_count`; rows and `removed` entries are
 packed in order, and a repo that spans chunks repeats its `repo`,
-`visibility`, `main_ci`, `halt`, `in_flight`, `cap`, `deferred_repo_cap`, `census`, `ready_complete` and `ready_replace` in each. A ~3000-row queue (~100-180 bytes a row) is
+`visibility`, `main_ci`, `halt`, `in_flight`, `cap`, `deferred_repo_cap`, `queue_depth`, `queue_flow`, `census`, `ready_complete` and `ready_replace` in each. A ~3000-row queue (~100-180 bytes a row) is
 one record with `chunk_count: 1`. A reader uses a record only once it holds
 all `chunk_count` chunks of that `(host, as_of)`.
 
@@ -2637,6 +2637,8 @@ Each `repos[]` entry:
 | `main_ci` | `green` / `red` / `unknown`, optional | this repo's `main` CI status from the host's main-health gate: `red` = a verified-red run halted dispatch, `green` = the gate completed a green run for this repo, `unknown` = the gate holds no verdict for it: the gate is not enabled for the repo (`autonomous.mainHealthGate.enabled` is off by default, or the repo has no usable `buildGate` block), it has not completed a run since the daemon started, or its last tick could not evaluate. `unknown` is therefore not a statement about CI; a host that does not run the gate reports `unknown` for every repo (#11565). Per repo, never per host. Additive on `fleet-state/v1`; absent from older emitters. A change is a delta naming the repo |
 | `halt` | object, optional | this host's work finder holds the **whole repo** (#11564): `{reason, since, since_lower_bound?}`, present **exactly** when its last tick held the repo, whether or not the repo has ready rows. See [Repo halts and eligible-at](#repo-halts-and-eligible-at). Additive on `fleet-state/v1`; absent from older emitters and on every repo before the host's first work-finder tick |
 | `in_flight`, `cap`, `deferred_repo_cap` | integer, integer or `null`, integer; optional | this host's per-repo dispatch limits from the work finder's last tick (#11606); see [Repo dispatch limits](#repo-dispatch-limits). All three are present together or all absent. Additive on `fleet-state/v1`; absent from older emitters and for a repo the tick did not cover |
+| `queue_depth` | integer, optional | `ready_wait` items of this repo waiting in the dispatch queue now — the depth of the queue the work finder read this tick, the same source `ready_wait` rows come from (#11645); see [Repo queue flow](#repo-queue-flow). Set only when the repo's ready listing was read whole this tick (`ready_complete: true`); **absent = unknown** (partial/failed listing, no tick, older emitter), never zero. Additive on `fleet-state/v1` |
+| `queue_flow` | object, optional | this repo's `ready_wait` arrival/drain flow over a trailing window (#11645): `{arrivals, drains, window_secs, since}`; see [Repo queue flow](#repo-queue-flow). Present once this host has observed the repo's ready queue; **absent = unknown**, never zero. Additive on `fleet-state/v1` |
 | `ready_complete` | bool | `true` when the work finder's last tick walked this repo's ready listing to its last page (#11139), so its `ready_wait` rows are the whole queue. `false` when the walk fell short (a later page failed, the page cap, a mid-walk change), and on emitters before #11139, which listed one page per label. A reader must not treat a `false` repo's `ready_wait` rows as its whole queue. Always sent; missing (an older emitter) decodes to `false` |
 | `ready_replace` | bool, optional | `true` exactly when `ready_complete` is `false`: `rows` carries the repo's **entire** observed `ready_wait` set, and a reader replaces the repo's `ready_wait` rows with it (drop them all, then apply `removed` and `rows`). Removals of `ready_wait` rows are never sent in `removed` for such a repo, and a reader never infers one from absence otherwise. Absent (`false`, or an older emitter): plain diffing |
 | `rows[]` | array, optional | anchor: every row; delta: added or changed rows. Ordered by issue |
@@ -2761,6 +2763,48 @@ into each repo.
 
 **No caps.** Every repo of the tick has an entry: `repos[]` is never capped or
 truncated, and a large record is chunked.
+
+#### Repo queue flow
+
+Facts for an ETA reader (#11645): the `ready_wait` long tail (20 h+ waits) is
+not irreducible — it tracks repo-local congestion. On the 2026-10-12 dump, a
+repo's **queue depth** had Spearman +0.22 to log-dwell (fast quartile 8
+waiting, slow quartile 51), and a Little's-Law repo wait of
+`queue_depth / drain_rate` tracked it too. So a reader can model `ready_wait`
+as a queue (position / service rate) instead of a per-item curve. This host
+emits the three facts the model needs; it computes no estimate (the
+`expected_wait = queue_depth / max(drain_rate, eps)` division is left to the
+reader).
+
+The source is the **same** queue the work finder reads — each repo's complete
+`ready_wait` listing on the tick. Depth is that listing's size; flow is the
+diff of successive complete listings, kept over a trailing window
+(`QUEUE_FLOW_WINDOW_SECS`, 6 h). A repo is counted only on a tick that read its
+listing whole (`ready_complete: true`): a partial listing would read its
+missing rows as drains. The first sight of a repo seeds the baseline with no
+counts (its queue predates the watch).
+
+| Field | Meaning |
+|---|---|
+| `queue_depth` | `ready_wait` items of the repo waiting now — the size of the complete ready listing the tick read. `0` is a measured empty queue; **absent is unknown** (the listing was partial or failed this tick, no tick yet, or an older emitter), never carried over from an earlier tick |
+| `queue_flow.arrivals` | issues that **entered** the repo's `ready_wait` queue within the window — the **arrival_rate** numerator. Divide by the effective window for a rate |
+| `queue_flow.drains` | issues that **left** the repo's `ready_wait` queue within the window (dispatched, closed, relabelled — gone from the queue the work finder reads) — the **drain_rate** numerator. `wait ≈ queue_depth / (drains / effective window)` |
+| `queue_flow.window_secs` | the nominal trailing window in seconds (the rate denominator, `21600` for 6 h) |
+| `queue_flow.since` | when this host began observing the repo's queue, as an instant. The **effective** window is `min(as_of - since, window_secs)`: counts before `since` are unknown, so a reader divides by the effective window and a daemon younger than the window is not read as a low rate |
+
+**Why counts, not a rate.** The facts are discrete counts over a fixed window,
+not a continuous `entries/second`. A float rate would drift every pass and make
+every repo a delta every pass (the reason the host `capacity` block carries no
+utilisation fraction); `since` is likewise an instant, not an elapsed span, so
+an idle repo's row stays unchanged between passes.
+
+**Null versus unknown.** An absent `queue_depth` or `queue_flow` means this
+host has not observed the repo's complete queue (no whole-listing tick yet, an
+older emitter), never `0`.
+
+**Delta rule.** A change in `queue_depth` or `queue_flow` is a delta naming the
+repo, even when no row changed. Every record that names a repo carries its
+current flow, and a repo split across chunks repeats it.
 
 Log attributes besides `loom.kind` and `loom.record_id`
 (`FLEET_STATE_LOG_ATTRIBUTE_KEYS`, kept by the collector's `transform/privacy`

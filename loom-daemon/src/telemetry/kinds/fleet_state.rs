@@ -605,6 +605,37 @@ pub struct ChampionState {
     pub last_attempt_ok: Option<bool>,
 }
 
+/// One repo's `ready_wait` queue flow over a trailing window (#11645): how
+/// many issues entered and left the repo's dispatch queue within the window,
+/// so a reader can compute an arrival/drain **rate** (count / effective
+/// window) and predict backlog via Little's Law
+/// (wait ≈ `queue_depth` / drain_rate).
+///
+/// The counts are discrete, not a continuous rate: an idle repo's facts do
+/// not change between passes, so its `fleet.state` row stays unchanged — a
+/// float rate would make every pass a delta (cf. [`FleetCapacity`]). The
+/// window start is sent as an instant, not an elapsed span, for the same
+/// reason (as [`FleetStateRow::created_at`] is). A reader divides each count
+/// by the **effective** window `min(as_of - since, window_secs)`, so a daemon
+/// younger than the window is not read as a low rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetQueueFlow {
+    /// Issues that **entered** the repo's `ready_wait` queue within the
+    /// window — the `arrival_rate` numerator.
+    pub arrivals: u32,
+    /// Issues that **left** the repo's `ready_wait` queue within the window
+    /// (dispatched, closed, relabelled — gone from the queue the work finder
+    /// reads) — the `drain_rate` numerator.
+    pub drains: u32,
+    /// The nominal trailing window in seconds (the rate denominator, e.g.
+    /// 21600 for 6 h).
+    pub window_secs: u64,
+    /// When this host began observing the repo's queue. The effective window
+    /// is `min(as_of - since, window_secs)`; the counts before `since` are
+    /// unknown, never zero, so a reader divides by the effective window.
+    pub since: DateTime<Utc>,
+}
+
 /// One repo's part of a record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FleetStateRepo {
@@ -647,6 +678,21 @@ pub struct FleetStateRepo {
     /// `in_flight` is. Additive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deferred_repo_cap: Option<u32>,
+    /// `ready_wait` only (#11645): issues of this repo waiting in the dispatch
+    /// queue right now — the depth of the queue the work finder read this
+    /// tick, the same source `ready_wait` rows come from. The single strongest
+    /// ETA signal for the `ready_wait` long tail (repo congestion has Spearman
+    /// +0.22 to dwell). Set only when the repo's ready listing was read whole
+    /// this tick (`ready_complete`); absent = unknown (partial/failed listing,
+    /// no tick, or an older emitter), never zero. Additive on `fleet-state/v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_depth: Option<u32>,
+    /// `ready_wait` only (#11645): this repo's queue flow (entries/exits) over
+    /// a trailing window, the `arrival_rate`/`drain_rate` facts for Little's
+    /// Law. Present once this host has observed the repo's ready queue;
+    /// absent = unknown, never zero. Additive on `fleet-state/v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_flow: Option<FleetQueueFlow>,
     /// The census. Absent means unknown at `as_of`, because the repo's
     /// listings were incomplete or not read. It never means zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
