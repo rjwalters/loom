@@ -326,6 +326,8 @@ fn host_health_otlp_export_is_omitted_when_unreported_and_round_trips() {
     let health = OtlpExportHealth {
         state: OtlpExportState::NoExporter,
         detail: Some("no usable `otlp` entry".to_string()),
+        // #11557: the attention interval start survives the round trip.
+        since: Some(ts()),
     };
     let record = sample_record_for_otlp_export(Some(health));
     value = serde_json::to_value(&record).unwrap();
