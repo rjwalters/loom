@@ -100,9 +100,7 @@ pub mod workspace_resync;
 
 pub use applied::{applied_config_sha, AppliedSha, FLEET_CONFIG_SHA};
 
-/// Cross-module test seams for the process-wide applied-SHA cell: the OTLP
-/// resource tests (`otlp/mapping/tests/fleet_provenance.rs`) force and reset
-/// the cell without touching `fleet_sync`'s own subtree (#11197).
+// Test seams for the applied-SHA cell, used by the OTLP resource tests (#11197).
 #[cfg(all(test, feature = "otlp"))]
 pub(crate) use applied::{force_for_tests, reset_for_tests};
 
@@ -831,7 +829,6 @@ pub fn clear_status() {
     if let Ok(mut guard) = cell().lock() {
         *guard = None;
     }
-    // No store ⇒ no applied commit: the OTLP resource reports `none` (#11197).
     applied::clear();
     let Some(path) = status_path() else {
         return;
