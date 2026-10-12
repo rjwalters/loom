@@ -1248,7 +1248,7 @@ behavior with no inferred mechanism attached.]
 Ask yourself: "Is the original issue already clear and actionable?"
 
 - **YES** → Add enhancement as **comment** (supplementary info)
-- **NO** → **Amend description** (create comprehensive spec, preserving original)
+- **NO** → **Amend description** (complete the spec, preserving original)
 
 ## Checking Dependencies
 
