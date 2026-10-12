@@ -198,6 +198,10 @@ pub(super) fn run_role_with_timeout(
 
     let mut cmd = Command::new(script);
     cmd.env(crate::provenance::origin::ENV, "autonomous");
+    if role == "curator" {
+        cmd.env("LOOM_CURATION_MODEL", model)
+            .env("LOOM_CURATION_RUNTIME", admission.map(|a| a.runtime.as_str()).unwrap_or(""));
+    }
     // #10832: a roll resume passes no prompt of its own (see
     // `sweep_registry::spawn_process`'s identical branch).
     match resume.map(|r| r.launch.runtime.as_str()) {

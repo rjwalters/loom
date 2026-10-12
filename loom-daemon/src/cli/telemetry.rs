@@ -30,6 +30,8 @@ use loom_daemon::script_helpers;
 
 #[path = "live_output_attend.rs"]
 mod live_output_attend;
+#[path = "curation_complete.rs"]
+mod curation_complete;
 #[path = "record_rework.rs"]
 mod record_rework;
 #[path = "telemetry_export.rs"]
@@ -47,6 +49,8 @@ mod usage_record;
 
 #[derive(clap::Subcommand)]
 pub(crate) enum TelemetryCommand {
+    /// Journal one Curator completion before applying curated labels.
+    CurationComplete(curation_complete::CurationCompleteArgs),
     /// Plan or explicitly execute two bounded Pi/OpenCode GLM smoke runs.
     TelemetryLiveCanary(telemetry_live::LiveArgs),
     /// Write deterministic synthetic telemetry and an independent-query manifest.
@@ -185,6 +189,7 @@ impl TelemetryCommand {
     /// it exits with the process code `check-usage.sh` branches on.
     pub(crate) async fn run(self) -> Result<()> {
         match self {
+            TelemetryCommand::CurationComplete(args) => args.run(),
             TelemetryCommand::TelemetryLiveCanary(args) => args.run(),
             TelemetryCommand::TelemetryFixture(args) => args.run(),
             TelemetryCommand::TelemetryOverhead(args) => args.run(),

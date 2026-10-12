@@ -186,6 +186,7 @@ pub mod session_output;
 pub mod fleet_state;
 /// `token_ranking.refresh` (#10744) — one token-ranking refresh round.
 pub mod token_ranking_refresh;
+pub mod issue_estimate;
 
 /// The export-coverage pair `(exporters, exported_kinds)` for `host.health`
 /// (Issue #10196), derived from the per-exporter status map
@@ -438,6 +439,10 @@ macro_rules! telemetry_kind_table {
             /// Loom (Issue #11566): the reflog entry, from/to sha and the commits
             /// it made unreachable. OTLP-only. See [`checkout_external_change`].
             CheckoutExternalChange = "checkout.external_change" => $crate::telemetry::kinds::checkout_external_change::CheckoutExternalChangeRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// One curation completion's blind difficulty estimate (#11608).
+            IssueEstimate = "issue.estimate" => $crate::telemetry::kinds::issue_estimate::IssueEstimateRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             // APPEND NEW KINDS ABOVE THIS LINE (one row; `gate:` stays
