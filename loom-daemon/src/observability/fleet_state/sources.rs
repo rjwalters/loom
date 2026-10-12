@@ -13,6 +13,7 @@ use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
 
+use super::champion::champion_by_slug;
 use super::outcomes::Curated;
 use super::{
     held_stage, FleetInput, HeldSweep, ListedPr, ReadyItem, ReadyQueue, RepoListing, REVIEW_LABELS,
@@ -571,7 +572,9 @@ pub(super) async fn gather(
             .collect(),
         visibility: BTreeMap::new(),
     };
+    let champion = champion_by_slug(&reused.roots);
     let input = FleetInput {
+        champion,
         capacity,
         main_ci,
         host_id: host_id.to_string(),
@@ -594,6 +597,7 @@ pub(super) fn tick_input(
     reused: &Reused,
 ) -> FleetInput {
     FleetInput {
+        champion: champion_by_slug(&reused.roots),
         capacity: Some(capacity(
             workspace_root,
             live_sweep_count(&workspace_pool.provisioned_registries()),
@@ -626,6 +630,7 @@ pub(super) fn reused_input(host_id: &str, reused: &Reused) -> FleetInput {
         listed_at: reused.listed_at,
         ready: None,
         capacity: None,
+        champion: BTreeMap::new(),
         main_ci: BTreeMap::new(),
     }
 }

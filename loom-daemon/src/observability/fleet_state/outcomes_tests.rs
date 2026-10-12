@@ -137,6 +137,7 @@ impl QueueSink for CapturingQueue {
 
 fn input(prs: &[(u32, &str, u32)], held: Vec<HeldSweep>) -> FleetInput {
     FleetInput {
+        champion: BTreeMap::new(),
         host_id: "host-a".to_string(),
         managed: [REPO.to_string()].into(),
         held,
