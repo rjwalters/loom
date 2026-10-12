@@ -127,3 +127,35 @@ fn access_default_and_legacy_scalar_specs_remain_distinct() {
         assert!(parse_credential_spec(bad).is_err());
     }
 }
+
+#[test]
+fn missing_parent_traversal_cannot_create_a_repository_secret() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let outside = sandbox.path().join("outside");
+    let repo = sandbox.path().join("repo");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::create_dir(&repo).unwrap();
+    std::fs::create_dir(repo.join(".git")).unwrap();
+    let route = outside.join("missing/../../repo/new-secret");
+    assert!(write_credential_headers(&route, PAIR).is_err());
+    assert!(!outside.join("missing").exists(), "refused before mkdir");
+    assert!(!repo.join("new-secret").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn new_parents_are_private_and_shared_parent_is_not_changed() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("new/nested/headers");
+    write_credential_headers(&path, PAIR).unwrap();
+    for parent in [dir.path().join("new"), dir.path().join("new/nested")] {
+        assert_eq!(std::fs::metadata(parent).unwrap().permissions().mode() & 0o777, 0o700);
+    }
+    let shared = dir.path().join("shared");
+    std::fs::create_dir(&shared).unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(write_credential_headers(&shared.join("headers"), PAIR).is_err());
+    assert!(!shared.join("headers").exists());
+    assert_eq!(std::fs::metadata(&shared).unwrap().permissions().mode() & 0o777, 0o755);
+}

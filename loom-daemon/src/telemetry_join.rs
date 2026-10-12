@@ -489,6 +489,14 @@ fn probe_needle(envelope: &TelemetryEnvelope) -> Result<String, JoinError> {
 /// Credentials may not be provisioned inside any repository/worktree, including
 /// through a symlinked parent. Check before creating missing directories.
 fn ensure_external_path(path: &Path) -> Result<(), JoinError> {
+    if path
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
+        return Err(JoinError::HeadersWrite(
+            "credential paths may not contain parent-directory traversal".into(),
+        ));
+    }
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -521,15 +529,37 @@ pub fn write_headers_file(path: &Path, token: &str) -> Result<(), JoinError> {
 fn write_credential_headers(path: &Path, text: &str) -> Result<(), JoinError> {
     ensure_external_path(path)?;
     let refuse = |detail: String| JoinError::HeadersWrite(detail);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| refuse(format!("cannot create {}: {e}", parent.display())))?;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder
+        .create(parent)
+        .map_err(|e| refuse(format!("cannot create credential parent: {e}")))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let meta = std::fs::metadata(parent)
+            .map_err(|_| refuse("cannot stat credential parent".into()))?;
+        // SAFETY: geteuid only reads the caller's effective user id.
+        if meta.uid() != unsafe { libc::geteuid() } || meta.permissions().mode() & 0o077 != 0 {
+            return Err(refuse(
+                "credential parent must belong to the invoking user and be private (0700)".into(),
+            ));
+        }
     }
 
     let mut temp = tempfile::Builder::new()
         .prefix(".telemetry-join")
         .rand_bytes(8)
-        .tempfile_in(path.parent().unwrap_or(Path::new(".")))
+        .tempfile_in(parent)
         .map_err(|e| refuse(format!("cannot create a temporary file: {e}")))?;
     use std::io::Write as _;
     temp.write_all(text.as_bytes())

@@ -378,7 +378,10 @@ it.
 using the already provisioned destination as the source. Explicit legacy
 `ssm://<parameter>`, `file:<path>` and `age-file:<path>` sources still mean a
 scalar bearer token. Plaintext sources must be owner-only regular files;
-credential paths must stay outside every repository/worktree.
+credential paths must stay outside every repository/worktree and contain no
+parent-directory traversal. New credential directories are 0700; existing
+destination parents must be private and owned by the invoking user (the
+command refuses a shared parent rather than chmodding it).
 
 The destination (`--headers-path`, default `~/.config/loom/otlp-headers`) is
 written atomically at 0600. Fresh content is parsed before replacement;
