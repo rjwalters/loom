@@ -2503,7 +2503,7 @@ pass interval. `forge_transition_at` is new (additive).
 ### `pick.decision`
 
 One OTLP-only log record per role tick and per work-finder tick (Issue #10212):
-the ranked candidate list (capped at 50, with `candidates_total`), the items
+the ranked candidate list (every candidate, chunked by `chunk_index`/`chunk_count` when large, with `candidates_total`), the items
 acted on, and a closed-set reason code per skipped candidate. Role ticks record
 the queue the agent actually consumed (`pr-queue`, or Curator's listings) and
 the writes it issued, via a per-tick pick journal (#10432); `candidate_source`
