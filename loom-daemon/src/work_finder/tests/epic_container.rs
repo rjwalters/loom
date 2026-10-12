@@ -139,9 +139,9 @@ fn the_mechanical_capability_lane_cannot_dispatch_an_epic() {
 }
 
 #[test]
-fn a_starred_epic_is_still_dropped_from_the_side_listing() {
-    let starred_epic = WorkItem::new(20, vec![OPERATOR_PRIORITY_LABEL.to_string(), EPIC.into()]);
-    assert!(excluded_from_side_listing(&starred_epic));
+fn a_priority_epic_is_still_dropped_from_the_side_listing() {
+    let important_epic = WorkItem::new(20, vec!["loom:very-important".to_string(), EPIC.into()]);
+    assert!(excluded_from_side_listing(&important_epic));
 }
 
 #[test]

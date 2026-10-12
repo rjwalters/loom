@@ -57,16 +57,18 @@ no journal is created, when no OTLP exporter runs.
   with a reason mapped from its `QueueDisposition`.
 - **Judge, Doctor, Champion** (`candidate_source = serving_queue`). The rows of
   the **latest** `loom-daemon pr-queue --role <role>` call the agent made during
-  the tick, in `pr_planning::ordered_queue` order (operator priority level,
+  the tick, in `pr_planning::ordered_queue` order (priority level,
   interactive preference, fallback admission and each role's tie-breaks
   applied), so a fallback-only Judge queue is recorded even though the gate
   listing was empty. Earlier snapshots are not merged in: a refresh that
-  adds a starred item or drops one is ranked as the queue the role last served,
+  adds a priority item or drops one is ranked as the queue the role last served,
   and an item acted on from an earlier snapshot stays in `acted` (actions are
   recorded independently of the ranking). `stage` is the row's workflow
   label (`loom:review-requested`, `loom:changes-requested`, `loom:pr`) or
   `fallback`; `sort_key` is `pr_queue`, valued
-  `level=<operatorPriorityLevel>,reason=<priorityReason>,origin=<origin>,mode=<mode>`.
+  `level=<priorityLevel>,reason=<priorityReason>,origin=<origin>,mode=<mode>`
+  (`priorityLevel` 0 default, 1 `loom:important`, 2 `loom:very-important`;
+  named `operatorPriorityLevel`, over the retired star levels, before #11510).
 - **Curator** and any role that reads its queue with `gh issue|pr list`
   (`candidate_source = listing`). The rows the agent `gh` front served, in the
   order the agent read its listings (Curator's priority queries run in priority

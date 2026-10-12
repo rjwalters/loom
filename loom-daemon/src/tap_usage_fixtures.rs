@@ -38,6 +38,12 @@ pub(crate) const CODEX_KEY: &str = "codex@env";
 /// A `# LOOM_LAUNCH` record for the OpenCode/zai-flash phase tap, with the full
 /// field set `worker_spawn::run` writes.
 pub(crate) fn glm_launch() -> String {
+    glm_launch_with_model("glm-fixture-flash")
+}
+
+/// [`glm_launch`] naming a different model — the relaunch shape the model-in
+/// the-fold-identity test needs (Judge feedback on #11501).
+pub(crate) fn glm_launch_with_model(model: &str) -> String {
     format!(
         "# LOOM_LAUNCH {}",
         serde_json::json!({
@@ -45,7 +51,7 @@ pub(crate) fn glm_launch() -> String {
             "runtime": "opencode",
             "tap": "opencode:zai-flash",
             "provider": "zai-coding-plan",
-            "model": "glm-fixture-flash",
+            "model": model,
             "profile": "zai-flash",
             "effort": serde_json::Value::Null,
             "credentialSource": "pool",

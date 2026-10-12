@@ -150,7 +150,7 @@ impl FleetStage {
 pub enum FleetSlot {
     /// One of the host's `maxConcurrent` slots.
     Regular,
-    /// The host's single `loom:operator-priority` overflow slot (#9244).
+    /// The host's single overflow slot (#9244; inert since #11508).
     Overflow,
 }
 
@@ -459,16 +459,11 @@ pub struct FleetStateRow {
     /// the work finder's dispatch order on its last tick.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rank: Option<u32>,
-    /// Starred (`loom:operator-priority`, any level). On every row since
-    /// #11391: a PR row reads it from the PR's labels, any row keeps what an
-    /// earlier row of the item carried.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub star: bool,
-    /// `ready_wait` only: when it was starred, when known.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub star_at: Option<DateTime<Utc>>,
-    /// The effective operator priority level (0 absent). On every row, like
-    /// `star` (#11391).
+    /// The priority level (0 absent, 1 `loom:important`, 2
+    /// `loom:very-important`; #11103). On every row (#11391): a `ready_wait`
+    /// row reads the planner's `level` key, a PR row the PR's own labels,
+    /// and any row keeps the level an earlier row of the item carried. The
+    /// retired `star` / `star_at` fields are no longer sent (#11510).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub level: u8,
     /// `ready_wait` only: the repo's fleet priority (the workspace priority
@@ -546,8 +541,6 @@ impl FleetStateRow {
             start: SweepStartFacts::default(),
             sweep_id: None,
             rank: None,
-            star: false,
-            star_at: None,
             level: 0,
             fleet_priority: None,
             created_at: None,
@@ -581,9 +574,74 @@ pub struct FleetPrCensus {
     pub by_stage: BTreeMap<String, u32>,
 }
 
+/// Decode a present field, `null` included, as `Some(..)`; an absent field
+/// stays `None` through `#[serde(default)]` (#11606: uncapped vs unknown).
+fn observed_option<'de, D, T>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(de).map(Some)
+}
+
+/// Observed Champion dispatch metadata, independent of approval authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChampionState {
+    /// Policy cannot be inferred from scheduling: absent means unknown.
+    pub approval: Option<String>,
+    /// Conditional merge authority is prompt-defined; absent means unknown.
+    pub merge: Option<String>,
+    /// Command actually selected by the role runner.
+    pub prompt_source: String,
+    /// SHA-256 of the installed Champion command and its two policy companions.
+    pub prompt_hash: Option<String>,
+    /// Whether the interval runner currently selects Champion.
+    pub interval_enabled: bool,
+    pub cadence_secs: u64,
+    pub cadence_source: String,
+    /// Most recent recorded attempt, including failures and pre-spawn skips.
+    pub last_attempt_at: Option<DateTime<Utc>>,
+    /// Runner outcome for that attempt; never a claim that issues were evaluated.
+    pub last_attempt_ok: Option<bool>,
+}
+
+/// One repo's `ready_wait` queue flow over a trailing window (#11645): how
+/// many issues entered and left the repo's dispatch queue within the window,
+/// so a reader can compute an arrival/drain **rate** (count / effective
+/// window) and predict backlog via Little's Law
+/// (wait ≈ `queue_depth` / drain_rate).
+///
+/// The counts are discrete, not a continuous rate: an idle repo's facts do
+/// not change between passes, so its `fleet.state` row stays unchanged — a
+/// float rate would make every pass a delta (cf. [`FleetCapacity`]). The
+/// window start is sent as an instant, not an elapsed span, for the same
+/// reason (as [`FleetStateRow::created_at`] is). A reader divides each count
+/// by the **effective** window `min(as_of - since, window_secs)`, so a daemon
+/// younger than the window is not read as a low rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetQueueFlow {
+    /// Issues that **entered** the repo's `ready_wait` queue within the
+    /// window — the `arrival_rate` numerator.
+    pub arrivals: u32,
+    /// Issues that **left** the repo's `ready_wait` queue within the window
+    /// (dispatched, closed, relabelled — gone from the queue the work finder
+    /// reads) — the `drain_rate` numerator.
+    pub drains: u32,
+    /// The nominal trailing window in seconds (the rate denominator, e.g.
+    /// 21600 for 6 h).
+    pub window_secs: u64,
+    /// When this host began observing the repo's queue. The effective window
+    /// is `min(as_of - since, window_secs)`; the counts before `since` are
+    /// unknown, never zero, so a reader divides by the effective window.
+    pub since: DateTime<Utc>,
+}
+
 /// One repo's part of a record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FleetStateRepo {
+    /// Unknown on older emitters. Scheduling never implies human approval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub champion: Option<ChampionState>,
     /// Forge `owner/repo`, lowercased.
     pub repo: String,
     #[serde(default)]
@@ -600,6 +658,41 @@ pub struct FleetStateRepo {
     /// `fleet-state/v1`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub halt: Option<FleetRepoHalt>,
+    /// Sweeps this host's work finder counts against the repo's dispatch cap
+    /// when its last tick finished (#11606): host-local, the dispatcher's
+    /// own occupancy count plus that tick's admissions. Absent means unknown
+    /// (no tick, or an older emitter), never zero. Additive on `fleet-state/v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_flight: Option<u32>,
+    /// The repo's resolved `maxConcurrentPerRepo` on that tick (#11606).
+    /// Three states: absent = unknown, `null` = uncapped (observed), a number
+    /// = the cap. Present exactly when `in_flight` is. Additive.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "observed_option"
+    )]
+    pub cap: Option<Option<u32>>,
+    /// Ready candidates of the repo that tick deferred for the cap (#11606).
+    /// `0` is a measured result; absent means unknown. Present exactly when
+    /// `in_flight` is. Additive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred_repo_cap: Option<u32>,
+    /// `ready_wait` only (#11645): issues of this repo waiting in the dispatch
+    /// queue right now — the depth of the queue the work finder read this
+    /// tick, the same source `ready_wait` rows come from. The single strongest
+    /// ETA signal for the `ready_wait` long tail (repo congestion has Spearman
+    /// +0.22 to dwell). Set only when the repo's ready listing was read whole
+    /// this tick (`ready_complete`); absent = unknown (partial/failed listing,
+    /// no tick, or an older emitter), never zero. Additive on `fleet-state/v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_depth: Option<u32>,
+    /// `ready_wait` only (#11645): this repo's queue flow (entries/exits) over
+    /// a trailing window, the `arrival_rate`/`drain_rate` facts for Little's
+    /// Law. Present once this host has observed the repo's ready queue;
+    /// absent = unknown, never zero. Additive on `fleet-state/v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_flow: Option<FleetQueueFlow>,
     /// The census. Absent means unknown at `as_of`, because the repo's
     /// listings were incomplete or not read. It never means zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]

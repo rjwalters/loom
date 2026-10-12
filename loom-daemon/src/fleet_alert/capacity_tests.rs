@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use chrono::{Duration as Cd, TimeZone, Utc};
 
-use super::capacity::{KEY_CAPACITY_LIMITED, KEY_STAR_BACKLOG};
+use super::capacity::KEY_CAPACITY_LIMITED;
 use super::state::{AlertState, Kind, Transition};
 use super::task::{run_tick, AlertSink, TickContext};
 use super::{classify, TokenCause};
@@ -18,7 +18,7 @@ use crate::types::{
 
 const WINDOW: Duration = Duration::from_secs(30 * 60);
 
-fn star(rank: usize, issue: u32) -> ReadyQueueRow {
+fn waiting(rank: usize, issue: u32) -> ReadyQueueRow {
     let d = QueueDisposition::DeferredCapacity;
     ReadyQueueRow {
         rank,
@@ -26,10 +26,9 @@ fn star(rank: usize, issue: u32) -> ReadyQueueRow {
         issue,
         workspace_priority: 100,
         urgent: false,
-        operator_priority: true,
+        level: crate::priority_pick::Level::Important,
         main_red_fix: false,
         created_at: None,
-        tier: None,
         story_points: None,
         disposition: d,
         detail: None,
@@ -39,8 +38,8 @@ fn star(rank: usize, issue: u32) -> ReadyQueueRow {
     }
 }
 
-/// Healthy tokens, a tick under `cap`, with `stars` starred issues waiting.
-fn status(cap: CapView, stars: u32) -> DaemonStatusReport {
+/// Healthy tokens, a tick under `cap`, with `ready` issues waiting.
+fn status(cap: CapView, ready: u32) -> DaemonStatusReport {
     DaemonStatusReport {
         capacity: CapacityReport {
             ranking_present: true,
@@ -52,7 +51,9 @@ fn status(cap: CapView, stars: u32) -> DaemonStatusReport {
         last_work_finder_tick: Some(WorkFinderTickSummary {
             max_concurrent: cap.effective(),
             cap: Some(cap),
-            queue: (0..stars).map(|i| star(i as usize + 1, 400 + i)).collect(),
+            queue: (0..ready)
+                .map(|i| waiting(i as usize + 1, 400 + i))
+                .collect(),
             ..Default::default()
         }),
         ..Default::default()
@@ -84,24 +85,19 @@ fn t0() -> chrono::DateTime<Utc> {
 }
 
 #[test]
-fn a_disk_limited_cap_and_a_starred_backlog_each_name_the_numbers() {
+fn a_disk_limited_cap_names_the_numbers_and_a_priority_backlog_is_no_ask() {
+    // #11510: a large priority backlog is not an ask of its own any more (the
+    // retired `star-backlog`); the capacity ask names the ready count.
     let c = classify(&status(disk_limited(), 106), t0(), WINDOW, TokenCause::Exhausted);
     let keys: Vec<_> = c.iter().map(|c| c.key.as_str()).collect();
-    assert_eq!(keys, vec![KEY_CAPACITY_LIMITED, KEY_STAR_BACKLOG]);
+    assert_eq!(keys, vec![KEY_CAPACITY_LIMITED]);
     let cap = &c[0];
     assert!(cap.headline.contains("Disk headroom"), "{}", cap.headline);
     assert!(cap
         .headline
         .contains("capping concurrency at 2, below the configured 6"));
-    assert!(cap.headline.contains("106 starred issue(s) are waiting"));
+    assert!(cap.headline.contains("106 ready issue(s) are waiting"));
     assert!(cap.fix.contains("Free disk"));
-    let backlog = &c[1];
-    assert!(backlog
-        .headline
-        .contains("106 starred issues are waiting for 2 slot(s)"));
-    assert!(backlog.headline.contains("position 107"), "{}", backlog.headline);
-    assert!(backlog.headline.contains("#400 in /w/loom-ui"), "{}", backlog.headline);
-    assert!(backlog.fix.contains("Unstar or re-rank"));
 }
 
 #[test]
@@ -112,10 +108,10 @@ fn a_configured_cap_with_a_short_queue_asks_nothing() {
         ram: None,
     };
     assert!(classify(&status(configured, 12), t0(), WINDOW, TokenCause::Exhausted).is_empty());
-    // A disk-limited cap is an ask even with nothing starred.
+    // A disk-limited cap is an ask even with nothing waiting.
     let c = classify(&status(disk_limited(), 0), t0(), WINDOW, TokenCause::Exhausted);
     assert_eq!(c.iter().map(|c| c.key.as_str()).collect::<Vec<_>>(), vec![KEY_CAPACITY_LIMITED]);
-    assert!(!c[0].headline.contains("starred"));
+    assert!(!c[0].headline.contains("waiting"));
 }
 
 #[test]
@@ -124,7 +120,7 @@ fn each_ask_reaches_the_sink_exactly_once() {
     let sinks: Vec<Box<dyn AlertSink>> = vec![Box::new(Recorder(sent.clone()))];
     let mut st = AlertState::new(3, Duration::from_secs(6 * 3600));
     // Three hours at 1-minute ticks while the backlog shifts between 100 and
-    // 110 stars: the headline moves, the asks do not repeat.
+    // 110 issues: the headline moves, the ask does not repeat.
     for m in 0..180 {
         let s = status(disk_limited(), 100 + (m % 11));
         run_tick(
@@ -141,14 +137,8 @@ fn each_ask_reaches_the_sink_exactly_once() {
         );
     }
     let delivered = sent.lock().unwrap().clone();
-    assert_eq!(
-        delivered,
-        vec![
-            (Kind::Started, KEY_CAPACITY_LIMITED.to_string()),
-            (Kind::Started, KEY_STAR_BACKLOG.to_string()),
-        ]
-    );
-    // Freeing disk clears the capacity ask (and, with 6 slots, the backlog).
+    assert_eq!(delivered, vec![(Kind::Started, KEY_CAPACITY_LIMITED.to_string())]);
+    // Freeing disk clears the capacity ask.
     let freed = CapView {
         disk: Some(20),
         ..disk_limited()
@@ -168,6 +158,6 @@ fn each_ask_reaches_the_sink_exactly_once() {
             t0() + Cd::minutes(m),
         ));
     }
-    assert_eq!(cleared.len(), 2);
+    assert_eq!(cleared.len(), 1);
     assert!(cleared.iter().all(|t| t.kind == Kind::Cleared));
 }

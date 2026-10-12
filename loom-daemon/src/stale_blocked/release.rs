@@ -75,8 +75,8 @@ pub const REPARK_MARKER_PREFIX: &str = "<!-- loom:stale-blocked-repark:";
 pub const PERMANENT_BLOCK_MARKER: &str = "<!-- loom:permanent-block";
 
 /// Labels that mean a human decision is pending on the artifact itself.
-/// `loom:operator-priority` (the star) is deliberately absent: it is not a
-/// hold.
+/// The priority labels (`loom:important` / `loom:very-important`) are
+/// deliberately absent: they are not holds.
 pub const OPERATOR_HOLD_LABELS: [&str; 5] = [
     "loom:operator",
     "loom:operator-only",

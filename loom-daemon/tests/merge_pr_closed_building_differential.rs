@@ -43,7 +43,7 @@ use loom_daemon::merge_pr::partial_reset::IssueView;
 /// `gh api repos/<nwo>/issues/<n>` response bodies.
 const CORPUS: &[&str] = &[
     // --- 0-6: the shapes GitHub actually returns ---
-    r#"{"number":123,"state":"closed","labels":[{"name":"loom:building"},{"name":"tier:goal-advancing"}]}"#,
+    r#"{"number":123,"state":"closed","labels":[{"name":"loom:building"},{"name":"enhancement"}]}"#,
     r#"{"state":"closed","labels":[{"name":"loom:building"}]}"#,
     r#"{"state":"open","labels":[{"name":"loom:building"}]}"#,
     r#"{"state":"closed","labels":[{"name":"loom:issue"}]}"#,

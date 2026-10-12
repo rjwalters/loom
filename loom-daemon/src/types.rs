@@ -1059,7 +1059,7 @@ pub struct SweepInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
     /// Whether this sweep was admitted through the host's
-    /// `loom:operator-priority` overflow slot (#9244): a starred issue
+    /// overflow slot (#9244, inert since #11508): an operator-starred issue
     /// dispatched over the global and/or per-repo concurrency cap as this
     /// host's single over-limit sweep. `#[serde(default)]` keeps older wire
     /// data and clients compatible (absent parses as `false`).
@@ -1921,11 +1921,14 @@ pub struct DeepCleanRepoStatus {
 mod observability_export;
 pub use observability_export::{
     ObservabilityExportScope, ObservabilityExportState, ObservabilityExportStatus,
-    ObservabilityHostIdMismatch, NEVER_EXPORTED_GRACE_FLOOR_SECS,
+    ObservabilityHostIdMismatch, ObservabilityQueuePressure, NEVER_EXPORTED_GRACE_FLOOR_SECS,
 };
 
 mod forge_events;
-pub use forge_events::{ForgeEventsState, ForgeEventsStatus, ForgeEventsWakeStatus};
+pub use forge_events::{
+    ForgeEventsState, ForgeEventsStatus, ForgeEventsWakeStatus, PollGatingStatus,
+    PollGatingWorkspace,
+};
 
 mod ready_queue;
 pub use ready_queue::{QueueDisposition, ReadyQueueRow};
@@ -1937,7 +1940,9 @@ pub use dispatch_plan::{
 mod fleet_plan;
 pub use fleet_plan::{FleetPlan, FleetPlanItem, FleetPlanObservation, HostPlan, HostPlanRow};
 pub(crate) mod work_finder_tick;
-pub use work_finder_tick::{CapLimiter, CapView, CapacityWait, WorkFinderTickSummary};
+pub use work_finder_tick::{
+    CapLimiter, CapView, CapacityWait, RepoLimitView, WorkFinderTickSummary,
+};
 
 /// One role-runner tick outcome for one `(root, role)` pair (Issue #4761).
 ///

@@ -13,9 +13,11 @@ use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
 
+use super::champion::champion_by_slug;
 use super::outcomes::Curated;
 use super::{
-    held_stage, FleetInput, HeldSweep, ListedPr, ReadyItem, ReadyQueue, RepoListing, REVIEW_LABELS,
+    held_stage, FleetInput, HeldSweep, ListedPr, ReadyItem, ReadyQueue, RepoLimits, RepoListing,
+    REVIEW_LABELS,
 };
 use crate::sweep_registry::SweepRegistry;
 use crate::telemetry::kinds::fleet_state::{
@@ -23,7 +25,7 @@ use crate::telemetry::kinds::fleet_state::{
     PlannerStamps,
 };
 use crate::telemetry::RepoVisibility;
-use crate::types::{ReadyQueueRow, SweepKind, WorkFinderTickSummary};
+use crate::types::{ReadyQueueRow, RepoLimitView, SweepKind, WorkFinderTickSummary};
 use crate::workspace_pool::WorkspacePool;
 use crate::worktree_ops::gh::{linkage_refs, LinkageKind};
 
@@ -305,8 +307,9 @@ async fn label_listings(roots: &[(PathBuf, String)], label: &'static str) -> Cur
     out
 }
 
-/// The effective operator priority level the planner ranked `row` on: its
-/// `operator_priority_level` comparator key, else the bare star.
+/// The priority level the planner ranked `row` on (0 default, 1
+/// `loom:important`, 2 `loom:very-important`): its `level` comparator key,
+/// else the row's own `level` (#11510).
 fn level(row: &ReadyQueueRow) -> u8 {
     row.plan
         .keys
@@ -314,7 +317,7 @@ fn level(row: &ReadyQueueRow) -> u8 {
         .find(|k| k.name == "level")
         .and_then(|k| k.value.as_u64())
         .and_then(|n| u8::try_from(n).ok())
-        .unwrap_or(u8::from(row.operator_priority))
+        .unwrap_or_else(|| row.level.rank())
 }
 
 /// The work finder's last tick: every row not running, with its rank and
@@ -374,8 +377,6 @@ fn ready_from_tick(
                 repo: slug(&row.repo)?,
                 issue: row.issue,
                 rank: small(row.rank),
-                star: row.operator_priority,
-                star_at: None,
                 level: level(row),
                 fleet_priority: row.workspace_priority,
                 created_at: parse_instant(row.created_at.as_deref()),
@@ -413,7 +414,29 @@ fn ready_from_tick(
         complete,
         slots,
         halts: BTreeMap::new(),
+        limits: limits_by_slug(&summary.repo_limits, slug),
     }
+}
+
+/// The tick's per-repo dispatch limits (#11606) by lowercased slug. Every
+/// entry is kept (no cap); a root `slug` cannot name is left out, as its
+/// ready rows are. Pure.
+pub(super) fn limits_by_slug(
+    limits: &[RepoLimitView],
+    slug: impl Fn(&str) -> Option<String>,
+) -> BTreeMap<String, RepoLimits> {
+    let mut out = BTreeMap::new();
+    for limit in limits {
+        let Some(repo) = slug(&limit.repo) else {
+            continue;
+        };
+        out.entry(repo).or_insert_with(|| RepoLimits {
+            in_flight: small(limit.in_flight),
+            cap: limit.cap.map(small),
+            deferred_repo_cap: small(limit.deferred_repo_cap),
+        });
+    }
+    out
 }
 
 /// Available and exhausted token accounts in the rotation ranking at
@@ -571,7 +594,9 @@ pub(super) async fn gather(
             .collect(),
         visibility: BTreeMap::new(),
     };
+    let champion = champion_by_slug(&reused.roots);
     let input = FleetInput {
+        champion,
         capacity,
         main_ci,
         host_id: host_id.to_string(),
@@ -594,6 +619,7 @@ pub(super) fn tick_input(
     reused: &Reused,
 ) -> FleetInput {
     FleetInput {
+        champion: champion_by_slug(&reused.roots),
         capacity: Some(capacity(
             workspace_root,
             live_sweep_count(&workspace_pool.provisioned_registries()),
@@ -626,6 +652,7 @@ pub(super) fn reused_input(host_id: &str, reused: &Reused) -> FleetInput {
         listed_at: reused.listed_at,
         ready: None,
         capacity: None,
+        champion: BTreeMap::new(),
         main_ci: BTreeMap::new(),
     }
 }

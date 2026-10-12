@@ -412,6 +412,21 @@ pub(crate) fn fetch_check_runs(
     project_check_runs(&rollup, head_sha)
 }
 
+/// The workflow runs on `head_sha` (one page), through the same paced,
+/// conditional read as [`fetch_check_runs`] — for `merge-pr
+/// check-runs-rollup`'s superseded-twin drop (#11097).
+///
+/// # Errors
+///
+/// When the read fails; the caller then drops nothing.
+pub fn fetch_workflow_runs(
+    gh: &str,
+    nwo: &str,
+    head_sha: &str,
+) -> Result<serde_json::Value, String> {
+    conditional(gh, nwo, default_store().as_deref(), |r| r.workflow_runs(head_sha))
+}
+
 /// The guard's [`CheckRun`]s from a `{total_count, check_runs}` rollup.
 fn project_check_runs(rollup: &serde_json::Value, head_sha: &str) -> Result<Vec<CheckRun>, String> {
     let rows = rollup
@@ -831,6 +846,24 @@ fn fetch_declaration(gh: &str, nwo: &str, tip_sha: &str) -> Result<String, Strin
             "Accept: application/vnd.github.raw",
             &format!("repos/{nwo}/contents/{DECLARATION_PATH}?ref={tip_sha}"),
         ],
+    )
+}
+
+/// The base tip with trailing post-merge version bumps discounted (#11330),
+/// or `None` when the tip is not a bump or any read failed. Read lazily — only
+/// for a verdict that is already stale — one `commits/{sha}` per commit.
+/// The bump identity is a fleet App bot ([`crate::forge_identity::FleetLogins`]
+/// for the repo at `root`): the workflow commits as the fleet App.
+pub fn bump_tail(nwo: &str, tip_sha: &str, root: &Path) -> Option<super::bump_tail::BumpTail> {
+    let gh = gh_bin();
+    let fleet = crate::forge_identity::FleetLogins::for_root(root);
+    super::bump_tail::walk(
+        tip_sha,
+        &mut |sha| {
+            gh_api(&gh, nwo, &[&format!("repos/{nwo}/commits/{sha}")])
+                .and_then(|body| super::bump_tail::commit_from_json(&body))
+        },
+        &|login| fleet.contains(login),
     )
 }
 

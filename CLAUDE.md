@@ -96,8 +96,8 @@ label documents its own `Applied by:` owner). State transitions:
   `loom:epic-phase` issues.
 
 `loom:operator` means "a human is needed" (engine stops, re-evaluable, unlike
-`loom:operator-only`; set by Champion's merge-risk hold). `loom:operator-priority`
-is the operator's star (not a hold); every stage takes it first. Your
+`loom:operator-only`; set by Champion's merge-risk hold). `loom:very-important` /
+`loom:important` reorder (not holds, not approval); every stage takes them first. Your
 queue: the pinned hold digest (#6877) and label queries in
 [`.loom/docs/label-state-machine.md`](.loom/docs/label-state-machine.md).
 

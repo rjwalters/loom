@@ -583,7 +583,7 @@ mod tests {
                 "--cached",
                 "--label",
                 "loom:issue",
-                "--label=tier:goal-supporting",
+                "--label=enhancement",
                 "--search",
                 "-label:loom:building",
                 "--state=open",
@@ -592,7 +592,7 @@ mod tests {
             ]),
         )
         .unwrap();
-        assert_eq!(q.positive_labels, vec!["loom:issue", "tier:goal-supporting"]);
+        assert_eq!(q.positive_labels, vec!["loom:issue", "enhancement"]);
         assert_eq!(q.negative_labels, vec!["loom:building"]);
         assert_eq!(q.state, "open");
         assert_eq!(q.json_fields, vec!["number", "labels"]);

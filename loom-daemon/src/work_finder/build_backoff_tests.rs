@@ -521,7 +521,6 @@ fn deferrals_are_broken_down_per_repo() {
             number: n,
             ..PriorityCandidate::default()
         },
-        tier: None,
         disposition: Some(d),
         detail: None,
         updated_at: None,

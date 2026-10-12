@@ -28,13 +28,11 @@ fn listed_row() -> FleetStateRow {
 }
 
 /// A realistic `ready_wait` row: rank and every ranking input, worst case
-/// (starred, dated, level 2).
+/// (dated, level 2).
 fn ready_row(issue: u32, rank: u32) -> FleetStateRow {
     FleetStateRow {
         entered_at_lower_bound: true,
         rank: Some(rank),
-        star: true,
-        star_at: Some(at(9, 30)),
         level: 2,
         fleet_priority: Some(100),
         created_at: Some(at(8, 0) - Duration::days(30)),
@@ -68,10 +66,16 @@ fn record() -> FleetStateRecord {
         }),
         capacity: None,
         repos: vec![FleetStateRepo {
+            champion: None,
             repo: "rjwalters/loom".to_string(),
             visibility: RepoVisibility::Public,
             main_ci: None,
             halt: None,
+            in_flight: None,
+            cap: None,
+            deferred_repo_cap: None,
+            queue_depth: None,
+            queue_flow: None,
             ready_complete: true,
             ready_replace: false,
             census: Some(FleetPrCensus {
@@ -91,10 +95,16 @@ fn anchor_with(n: u32) -> FleetStateRecord {
         .iter()
         .enumerate()
         .map(|(i, repo)| FleetStateRepo {
+            champion: None,
             repo: (*repo).to_string(),
             visibility: RepoVisibility::Private,
             main_ci: None,
             halt: None,
+            in_flight: None,
+            cap: None,
+            deferred_repo_cap: None,
+            queue_depth: None,
+            queue_flow: None,
             ready_complete: true,
             ready_replace: false,
             census: Some(FleetPrCensus::default()),
@@ -217,7 +227,8 @@ fn a_listed_row_omits_host_and_slot_and_flags_a_lower_bound_entry() {
 }
 
 /// A `ready_wait` row carries this host's planner rank and the planner's
-/// inputs: star, starred-at, level, fleet priority and the age instant.
+/// inputs: level, fleet priority and the age instant (no retired `star` /
+/// `star_at`, #11510).
 #[test]
 fn a_ready_row_carries_rank_and_the_planner_inputs() {
     let wire = serde_json::to_value(ready_row(7, 3)).unwrap();
@@ -231,9 +242,7 @@ fn a_ready_row_carries_rank_and_the_planner_inputs() {
             "issue",
             "level",
             "rank",
-            "stage",
-            "star",
-            "star_at"
+            "stage"
         ]
     );
     assert_eq!(wire["stage"], "ready_wait");
@@ -349,10 +358,16 @@ fn removals_and_census_only_repos_survive_a_split() {
     r.anchor = false;
     r.repos = vec![
         FleetStateRepo {
+            champion: None,
             repo: "acme/a".to_string(),
             visibility: RepoVisibility::Private,
             main_ci: None,
             halt: None,
+            in_flight: None,
+            cap: None,
+            deferred_repo_cap: None,
+            queue_depth: None,
+            queue_flow: None,
             ready_complete: true,
             ready_replace: false,
             census: None,
@@ -360,10 +375,16 @@ fn removals_and_census_only_repos_survive_a_split() {
             removed: (1000..1400).collect(),
         },
         FleetStateRepo {
+            champion: None,
             repo: "acme/b".to_string(),
             visibility: RepoVisibility::Private,
             main_ci: None,
             halt: None,
+            in_flight: None,
+            cap: None,
+            deferred_repo_cap: None,
+            queue_depth: None,
+            queue_flow: None,
             ready_complete: true,
             ready_replace: false,
             census: Some(FleetPrCensus::default()),
@@ -401,10 +422,16 @@ fn ready_replace_is_additive_and_rides_every_chunk() {
     assert!(!back.ready_replace);
 
     r.repos = vec![FleetStateRepo {
+        champion: None,
         repo: "acme/a".to_string(),
         visibility: RepoVisibility::Private,
         main_ci: None,
         halt: None,
+        in_flight: None,
+        cap: None,
+        deferred_repo_cap: None,
+        queue_depth: None,
+        queue_flow: None,
         ready_complete: false,
         ready_replace: true,
         census: None,
@@ -450,4 +477,32 @@ fn collector_keeps_every_fleet_state_log_attribute() {
         assert!(log_keep.contains(&format!("\"{key}\"")), "collector drops {key}");
     }
     assert!(!log_keep.contains("loom.fleet.rows_truncated"), "no cap, no truncation key");
+}
+
+#[test]
+fn champion_metadata_survives_all_repo_chunks() {
+    let mut r = anchor_with(100);
+    let metadata = ChampionState {
+        approval: None,
+        merge: None,
+        prompt_source: "/loom:champion".into(),
+        prompt_hash: Some("a".repeat(64)),
+        interval_enabled: true,
+        cadence_secs: 123,
+        cadence_source: "effective_config".into(),
+        last_attempt_at: Some(r.as_of),
+        last_attempt_ok: Some(true),
+    };
+    for repo in &mut r.repos {
+        repo.champion = Some(metadata.clone());
+    }
+    let chunks = split_into_chunks(r, 2_000);
+    assert!(chunks.len() > 1);
+    for chunk in chunks {
+        let decoded: FleetStateRecord =
+            serde_json::from_slice(&serde_json::to_vec(&chunk).unwrap()).unwrap();
+        for repo in decoded.repos {
+            assert_eq!(repo.champion, Some(metadata.clone()));
+        }
+    }
 }

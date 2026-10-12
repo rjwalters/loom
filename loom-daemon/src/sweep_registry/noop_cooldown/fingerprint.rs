@@ -85,9 +85,10 @@ pub(super) struct IssueSnapshot {
 
 impl IssueSnapshot {
     /// Canonical fingerprint. Equal strings mean "the sweep's inputs are
-    /// unchanged". `loom:operator-priority` is deliberately part of the label
-    /// set (an operator starring or unstarring is a human signal) but its mere
-    /// presence never exempts the issue from the hold.
+    /// unchanged". A priority label (`loom:important` /
+    /// `loom:very-important`) is deliberately part of the label set (raising
+    /// or lowering priority is a human signal) but its mere presence never
+    /// exempts the issue from the hold.
     pub(super) fn fingerprint(&self) -> String {
         self.fingerprint_ignoring(&[])
     }
@@ -172,7 +173,7 @@ mod tests {
 
     fn base() -> IssueSnapshot {
         IssueSnapshot {
-            labels: vec!["loom:issue".into(), "loom:operator-priority".into()],
+            labels: vec!["loom:issue".into(), "loom:important".into()],
             open: true,
             comments: vec!["1:2026-10-01T00:00:00Z".into()],
             linked_pr: "none".into(),
@@ -184,7 +185,7 @@ mod tests {
     fn daemon_label_churn_does_not_change_the_fingerprint() {
         let a = base();
         let mut b = base();
-        b.labels = vec!["loom:building".into(), "loom:operator-priority".into()];
+        b.labels = vec!["loom:building".into(), "loom:important".into()];
         assert_eq!(a.fingerprint(), b.fingerprint());
         b.labels.push("loom:curating".into());
         assert_eq!(a.fingerprint(), b.fingerprint());
@@ -224,7 +225,7 @@ mod tests {
     fn ignoring_the_park_labels_matches_the_pre_park_fingerprint() {
         let before = base().fingerprint();
         let mut parked = base();
-        parked.labels = vec!["loom:operator-priority".into(), "loom:blocked".into()];
+        parked.labels = vec!["loom:important".into(), "loom:blocked".into()];
         assert_ne!(before, parked.fingerprint());
         assert_eq!(before, parked.fingerprint_ignoring(&["loom:blocked"]));
     }
@@ -245,11 +246,11 @@ mod tests {
     }
 
     #[test]
-    fn park_labels_never_touch_the_claim_or_the_star() {
+    fn park_labels_never_touch_the_claim_or_the_priority() {
         for kind in [ParkKind::Blocked, ParkKind::HumanGate] {
             for l in kind.labels() {
                 assert_ne!(*l, "loom:building");
-                assert_ne!(*l, "loom:operator-priority");
+                assert_ne!(*l, "loom:important");
             }
         }
     }

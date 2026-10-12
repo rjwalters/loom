@@ -91,9 +91,9 @@ fn label_derived_skip_reasons() {
     );
     assert_eq!(skip_reason_for_labels(&l(&["loom:treating"])), Some(PickSkipReason::InFlight));
     assert_eq!(
-        skip_reason_for_labels(&l(&["loom:operator-priority"])),
+        skip_reason_for_labels(&l(&["loom:very-important"])),
         None,
-        "a star is no hold"
+        "a priority level is no hold"
     );
 }
 
@@ -101,9 +101,9 @@ fn label_derived_skip_reasons() {
 fn pr_queue_rows_keep_order_stage_and_sort_key() {
     let rows = serde_json::json!([
         {"number": 9, "labels": [{"name": "loom:pr"}], "mode": "workflow",
-         "origin": "interactive", "priorityReason": "operator-priority", "operatorPriorityLevel": 1},
+         "origin": "interactive", "priorityReason": "priority", "priorityLevel": 1},
         {"number": 4, "labels": [], "mode": "fallback",
-         "origin": "interactive", "priorityReason": "interactive", "operatorPriorityLevel": 0},
+         "origin": "interactive", "priorityReason": "interactive", "priorityLevel": 0},
     ]);
     let out = pr_queue_rows(rows.as_array().unwrap());
     assert_eq!(out.iter().map(|r| r.number).collect::<Vec<_>>(), vec![9, 4]);
@@ -111,7 +111,7 @@ fn pr_queue_rows_keep_order_stage_and_sort_key() {
     assert_eq!(out[1].stage, "fallback");
     assert_eq!(
         out[0].sort_key.as_ref().unwrap().value,
-        "level=1,reason=operator-priority,origin=interactive,mode=workflow"
+        "level=1,reason=priority,origin=interactive,mode=workflow"
     );
 }
 

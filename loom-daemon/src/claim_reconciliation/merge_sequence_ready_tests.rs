@@ -7,7 +7,7 @@ use chrono::Utc;
 
 use super::super::{hold_action, plan_repo_with, release_comment_body, SEQUENCE_LABEL};
 use super::*;
-use crate::work_finder::operator_priority::OPERATOR_PRIORITY_LABEL;
+use crate::priority_pick::IMPORTANT_LABEL;
 
 fn sha(n: u32) -> String {
     format!("{n:040x}")
@@ -331,17 +331,18 @@ fn reservations_and_every_other_decision_are_left_alone() {
 // --- Ordering inside a tier -------------------------------------------------
 
 #[test]
-fn stars_first_and_oldest_first_within_each_readiness_tier() {
+fn higher_level_first_and_oldest_first_within_each_readiness_tier() {
     let prs = [
         pr(1, "2026-10-01T00:00:00Z", &[]),
-        pr(2, "2026-10-01T01:00:00Z", &[OPERATOR_PRIORITY_LABEL]),
+        pr(2, "2026-10-01T01:00:00Z", &[IMPORTANT_LABEL]),
         pr(3, "2026-10-01T02:00:00Z", &[APPROVED_LABEL]),
-        pr(4, "2026-10-01T03:00:00Z", &[APPROVED_LABEL, OPERATOR_PRIORITY_LABEL]),
+        pr(4, "2026-10-01T03:00:00Z", &[APPROVED_LABEL, IMPORTANT_LABEL]),
         pr(5, "2026-10-01T04:00:00Z", &[APPROVED_LABEL]),
         pr(6, "2026-10-01T05:00:00Z", &[]),
     ];
-    // Ready tier: star #4, then #3, #5 by age. Then the rest: star #2, then
-    // #1, #6 by age. A star never lifts a non-ready PR over ready work.
+    // Ready tier: important #4, then #3, #5 by age. Then the rest: important
+    // #2, then #1, #6 by age. A level never lifts a non-ready PR over ready
+    // work.
     assert_eq!(order(&prs), vec![4, 3, 5, 2, 1, 6]);
 }
 

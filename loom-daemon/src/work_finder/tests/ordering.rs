@@ -76,14 +76,14 @@ fn very_important_in_a_priority_100_repo_beats_a_priority_0_repo() {
 
 #[test]
 fn two_important_issues_order_by_age() {
-    // Two issues at the same level order oldest `createdAt` first; a legacy
-    // star on the newest changes nothing (#11508).
+    // Issues at the same level order oldest `createdAt` first; an older
+    // issue with no level still goes after them.
     let mut multi = vec![(
         FakeSource::once(vec![
             labelled_at(2, "loom:important", "2026-01-01T00:00:00Z"),
             labelled_at(1, "loom:important", "2020-01-01T00:00:00Z"),
             labelled_at(3, "loom:important", "2019-08-01T00:00:00Z"),
-            labelled_at(4, OPERATOR_PRIORITY_LABEL, "2010-01-01T00:00:00Z"),
+            issue_at(4, "2010-01-01T00:00:00Z"),
         ]),
         RecordingDispatcher::default(),
     )];
@@ -126,12 +126,12 @@ fn test_tick_multi_missing_priority_entry_defaults() {
 fn single_workspace_tick_moves_important_first_then_oldest_first() {
     // #11103: the single-workspace tick uses the in-workspace order — level,
     // oldest `createdAt`, number — not the listing order (newest-first
-    // here). The legacy star (#8) is a plain issue since #11508.
+    // here).
     let mut source = FakeSource::once(vec![
         issue_at(3, "2026-03-01T00:00:00Z"),
         issue_at(1, "2026-01-01T00:00:00Z"),
         labelled_at(9, "loom:important", "2026-09-01T00:00:00Z"),
-        labelled_at(8, OPERATOR_PRIORITY_LABEL, "2026-08-01T00:00:00Z"),
+        issue_at(8, "2026-08-01T00:00:00Z"),
         issue_at(2, "2026-02-01T00:00:00Z"),
     ]);
     let mut dispatcher = RecordingDispatcher::default();

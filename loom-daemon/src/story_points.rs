@@ -172,7 +172,7 @@ mod tests {
         for labels in [
             vec![],
             vec!["loom:building"],
-            vec!["loom:curated", "loom:issue", "tier:goal-advancing"],
+            vec!["loom:curated", "loom:issue", "enhancement"],
             // Near-misses: neither is a member of the `points:` family.
             vec!["loom:points=3"],
             vec!["story-points:3"],
@@ -194,7 +194,7 @@ mod tests {
             ("points:8", 8),
             ("points:13", 13),
         ] {
-            let labels = vec!["loom:curated", label, "tier:goal-advancing"];
+            let labels = vec!["loom:curated", label, "enhancement"];
             assert_eq!(classify_points_labels(&labels), PointsLabels::One(expected), "{label}");
             assert_eq!(resolve_story_points(9432, &owned(&labels)), Some(expected), "{label}");
         }

@@ -295,7 +295,7 @@ was removed by #11104; today it is published by the
 clears). Consumer: the Safehouse narration sink, which renders it as a
 `handoff` envelope into the signal room. Room routing, the
 `safehouse.operatorMention` ping and the rendered line are documented in
-[`safehouse.md` → Operator-priority escalations](safehouse.md#operator-priority-escalations-9321).
+[`safehouse.md` → Operator escalations](safehouse.md#operator-escalations-9321).
 
 **`Generic`-topic rule.** A `Generic` topic is allowed only while it (a) is
 listed in this inventory, (b) carries a `source` field naming its producing
@@ -3076,9 +3076,10 @@ starved. A repo whose next candidate is a verified red-main fix wins the draw
 outright; failing that, a repo with `loom:very-important` work next does.
 Cross-repo dependency awareness stays a role judgment (label the blocker).
 
-**`tier:*` labels do not affect dispatch order.** `tier:goal-advancing` and its
-siblings are triage metadata; no daemon code reads them. Only the four keys
-below order the queue.
+**Retired labels do not affect dispatch order.** The tier labels and the
+operator star are retired (#11103; mapping in
+[`priority-model.md`](priority-model.md)); no daemon code reads them. Only the
+four keys below order the queue.
 
 ### Dispatch order and the red-main-fix lane (#11103, #11508, #11547)
 
@@ -3098,14 +3099,15 @@ follows the workspace draw, and the single-workspace tick uses the same four
 keys (passed the repo's real verified-red state). The workspace draw's pool is
 three-tier: workspaces whose next candidate is a verified red-main fix if any
 (`pool: "red-main-fix"`), else those with very-important work
-(`"very-important"`), else all (`"all"`). #11508 removed the legacy keys: the star (`loom:operator-priority`), its
+(`"very-important"`), else all (`"all"`). #11508 removed the legacy keys: the star, its
 levels and inherited levels, the starred-at time and its restart store
 (`starred-<sha16>.json`, no longer read or written; `LOOM_STARRED_AT_PERSIST` is
 ignored), and `workspace_priority` as a rank key (it weights the workspace
 draw instead); #11547 restored the red-main-fix key above, live only while
-`main` is verified red. The ready-queue row field
-`operator_priority` is always `false`, kept for wire compatibility;
-`main_red_fix` still marks a verified red-main fix.
+`main` is verified red. Each ready-queue row reports its
+`level` (`default` / `important` / `very-important`, after the cap; #11510,
+replacing the always-`false` `operator_priority` and the informational
+`tier`); `main_red_fix` still marks a verified red-main fix.
 
 **The red-main-fix lane reorders; it is not a level.** A candidate carrying
 `<!-- loom:main-red-fix -->` whose repo's `main` is verified red leads the
@@ -3126,13 +3128,12 @@ only reports whether an overflow sweep an older daemon started is still live
 (its `overflow: true` sweep record and claim-lock stamp are still honoured on
 adoption).
 
-`loom:operator-priority` is **not** `loom:operator` and is not a hold. Code that
-treats a `loom:operator-` prefix match as a hold must exclude it by name (see
-`pr_latency::hold_labels`).
+Neither priority label is a hold (`pr_latency::hold_labels` reads an explicit
+set, never a prefix match).
 
 **Main-health halt admits only fixes.** A repo halted because its `main` is
 verified red still admits its `<!-- loom:main-red-fix -->` candidates, and only
-those; every other ready issue in it, starred or not, keeps `workspace_halted`.
+those; every other ready issue in it, priority or not, keeps `workspace_halted`.
 `report.halted` is unchanged. A hold that is not a verified-red `main` (a gate
 run in flight, a drain, the host-distress breaker, a pre-flight or token-pool
 hold) admits nothing, fixes included. With the main-health gate disabled for a
@@ -3153,8 +3154,7 @@ costs only its own rows. These rows are candidates **only while the repo is
 red** (verified red, or the CI fallback above); on a green repo they are dropped
 before counting, so the marker stays inert there. When red they sort first
 (key 3), are admitted through the main-health halt, and go through every normal
-skip filter; the dispatched sweep starts from Curator, as for a starred
-unpromoted issue. Curator does not promote them. An issue with no workflow label
+skip filter; the dispatched sweep starts from Curator. Curator does not promote them. An issue with no workflow label
 is not listed this way, which is why Doctor files fixes with `loom:triage`.
 
 If a marker-bearing candidate stays unclaimed on a red `main` for longer than
@@ -3177,8 +3177,12 @@ conditions, each keyed and alerted independently:
 | `tokens-zero-healthy` | zero healthy token accounts | `auth_401` (blocked by an auth-class `.bad_tokens` entry such as `auth-dead: 401`, or with no `.bad_tokens` history; never self-heals): re-auth / `tokens import-from-monitor` / `tokens unblock`; exhausted: wait or add accounts; empty pool: `tokens bootstrap` |
 | `dispatch-halted` | main-health gate halted, or the last tick halted while tokens are still available | read `health`'s dispatch section |
 | `roles-persistent` | one or more roles with PERSISTENT tick failures | a launch refused for a missing guarded-canary receipt (exit 78) is named as a runtime/version mismatch (`runtimes.default`, opencode version) |
-| `capacity-limited` | disk or RAM headroom holds the effective cap below the configured `maxConcurrent` (#10214; even with nothing starred) | which term, the effective vs. configured cap, how many starred issues wait; free disk / RAM or add capacity |
-| `star-backlog` | more than 3x the effective cap of starred issues waiting on this host (#10214) | the count, the oldest star and a new star's FIFO position; unstar or re-rank, or add capacity |
+| `capacity-limited` | disk or RAM headroom holds the effective cap below the configured `maxConcurrent` (#10214; even with nothing waiting) | which term, the effective vs. configured cap, how many ready issues wait; free disk / RAM or add capacity |
+
+The `star-backlog` ask (#10214) was retired with the operator star (#11510):
+priority only orders the queue, and `loom:very-important` is capped at one
+per workspace. An older daemon's open `star-backlog` alert clears on the next
+debounced good ticks.
 
 An unreachable status changes nothing (unknown is not healthy). A condition must
 hold `debounceTicks` consecutive ticks before one `Started` alert; one `Cleared`
@@ -3225,8 +3229,8 @@ one warning naming the keys and otherwise ignores them. The
 Each multi-workspace tick records one row per ready `loom:issue` it listed, ranked
 by `candidate_cmp`, with what the tick did with it:
 
-- **running**: `dispatched` (detail `overflow` for the host's over-limit
-  starred sweep, #9244), `in_flight`
+- **running**: `dispatched` (detail `overflow` only from an older daemon's
+  over-limit sweep, #9244; the slot is inert since #11508), `in_flight`
 - **ready** (waiting on a limit): `deferred_capacity`, `deferred_ramp_cap`,
   `deferred_saturation`, `deferred_build_backoff` (#9410), `deferred_out_of_slice`,
   `deferred_repo_cap`
@@ -13095,7 +13099,11 @@ with the floor and the installed version:
 
 On a warning a run with a terminal on stdin asks `Continue? [y/N]`, and only a
 typed `y` continues. A run without one **refuses** with exit 1 and names the
-override, and never reads stdin. `--yes` or `LOOM_DAEMON_UPDATE_YES=1`
+override, and never reads stdin. A manual run is checked **before** the source
+checkout is fetched or fast-forwarded (#11064), so "Nothing was changed" is
+literal. A source build's target is then the checkout's current `VERSION`; if
+the fast-forward moves it off the floor, the post-sync check refuses with "the
+installed daemon was not changed, but the source checkout was fast-forwarded". `--yes` or `LOOM_DAEMON_UPDATE_YES=1`
 continues without asking. `--dry-run` prints the warning and never asks.
 `--check` and `--resolve-json` are unchanged.
 
@@ -13129,7 +13137,10 @@ Continue? [y/N]
   `--fetch --tag`) to bring a lagging host up to the fleet, for example a
   fleet-paused host held by an operator stop. A host already at or above the
   floor installs nothing (exit 0); it never moves a host down. A host with no
-  fleet store, or whose floor is unknown, is refused (exit 1).
+  fleet store, or whose floor is unknown, is refused (exit 1). So is a host
+  whose installed daemon exists but reports no readable `--version` (#11064):
+  it may be above the floor. A host with no installed daemon installs the
+  floor (bootstrap). Both are decided before any fetch or checkout sync.
 
 **One-shot drain roll (Issue #5138).** Before this, a drained roll needed the
 documented two-step dance — `loom-daemon-update.sh --no-restart` followed by a
@@ -13899,8 +13910,12 @@ overrides the built-in default (`false` / *(none)* / `$HOME/.loom/observability/
 contents never appear in a log line or error message (only the *path* does),
 and requests authenticate via an `Authorization: Bearer <key>` header.
 `loom-daemon` refuses to export (logs a `WARN` and skips both background
-tasks) when enabled without a resolvable `endpoint` or a readable, non-empty
-`ingestKeyFile` — treated the same as "not configured", not a startup
+tasks) when enabled without a resolvable `endpoint` — or, since #11555, when
+no exporter at all can start: a missing or unreadable `ingestKeyFile`
+degrades only the entries that need the key (every `https` entry, an `otlp`
+entry without `headers_file`) to their own `misconfigured` status, while an
+`otlp` entry carrying a `headers_file` starts with no ingest key at all —
+treated the same as "not configured", not a startup
 failure.
 
 `ingestKeyFile` is deliberately **excluded** from the example above and must
