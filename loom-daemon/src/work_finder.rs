@@ -243,6 +243,7 @@ mod recheck_interval;
 mod tick_line;
 mod tick_report;
 mod tick_summary;
+mod tracking_parent;
 pub mod vi_cap;
 pub mod workspace_draw;
 use crate::types::QueueDisposition as Qd;
@@ -301,13 +302,12 @@ pub struct WorkItem {
     /// last-dispatch clock. `None` (a synthetic item, or a listing without
     /// timestamps) simply disables the recheck-interval check for that item.
     pub updated_at: Option<String>,
-    /// Set by `star_liveness` (#11104) when this issue blocks a starred
-    /// issue. Dispatch never reads it (#11508).
-    pub operator_priority_inherited_from: Option<u32>,
     /// Who filed the issue, when the listing supplied it (#10118). Only a
     /// trusted author's red-main-fix marker admits an unpromoted row (#9548);
     /// `None` (a synthetic item) is never trusted. See [`main_red_fix`].
     pub author: Option<crate::comment_trust::Author>,
+    /// Open native sub-issues (#11483); see [`tracking_parent`].
+    pub open_sub_issues: Option<u32>,
 }
 
 impl WorkItem {
@@ -327,8 +327,8 @@ impl WorkItem {
             created_at,
             body: None,
             updated_at: None,
-            operator_priority_inherited_from: None,
             author: None,
+            open_sub_issues: None,
         }
     }
 
@@ -1159,6 +1159,11 @@ pub fn tick_with_lanes(
             log_capability_gap(&item, &held_capabilities);
             continue;
         }
+        if let Some(open) = item.open_sub_issues_blocking() {
+            report.skipped_labeled += 1;
+            log::info!("{}", tracking_parent::skip_line(item.number, open));
+            continue;
+        }
         // 1a. Hard-exclusion labels (#7528): the same rule the Curator and
         //     Builder role prompts enforce (`external` today — see
         //     `crate::hard_exclusion`), applied HERE so the issue never costs
@@ -1876,6 +1881,12 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
                 report.skipped_labeled += 1;
                 skip(Qd::Parked, ready_queue::park_label(&item, &extra_skip_label_sets[idx]), None);
                 log_capability_gap(&item, &held_capability_sets[idx]);
+                continue;
+            }
+            if let Some(open) = item.open_sub_issues_blocking() {
+                report.skipped_labeled += 1;
+                skip(Qd::Parked, Some(tracking_parent::skip_detail(open)), None);
+                log::info!("{}", tracking_parent::skip_line(item.number, open));
                 continue;
             }
             // Hard-exclusion labels (#7528) — mirrors

@@ -9,8 +9,14 @@
 //! delivered by the fleet-alert state machine and sinks (the event bus).
 
 use super::Condition;
-use crate::star_liveness::queue::waiting_star;
-use crate::types::{CapLimiter, WorkFinderTickSummary};
+use crate::types::{CapLimiter, ReadyQueueRow, WorkFinderTickSummary};
+
+/// Whether `r` is a starred issue waiting on a capacity-style gate. (Moved
+/// here from the removed star-liveness subsystem, #11104; the starred-row
+/// reader itself is #11510's to retire.)
+fn waiting_star(r: &ReadyQueueRow) -> bool {
+    r.operator_priority && r.disposition.state() == "ready"
+}
 
 /// Condition key: disk or RAM headroom holds the cap below `maxConcurrent`.
 pub const KEY_CAPACITY_LIMITED: &str = "capacity-limited";
