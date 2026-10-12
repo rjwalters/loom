@@ -25,9 +25,6 @@ use serde_json::{json, Value};
 use super::{run_gh, run_git};
 use crate::cmd_out::{run_command, CmdOutcome, Query, Unavailable, DEFAULT_TIMEOUT};
 
-mod gh_fallback;
-use gh_fallback::create_via_gh;
-
 /// Typed shapes for the `gh --json` queries this module makes (#7810 PR 2).
 ///
 /// These replace `--jq` filters that ran a second interpreter inside the `gh`
@@ -348,7 +345,7 @@ fn log_recovery_event(
     let mut events: Vec<Value> = super::read_json_file(&recovery_file)
         .and_then(|v| v.as_array().cloned())
         .unwrap_or_default();
-    events.push(event);
+    events.push(event.clone());
     if events.len() > MAX_RECOVERY_EVENTS {
         events.drain(..events.len() - MAX_RECOVERY_EVENTS);
     }
@@ -357,6 +354,8 @@ fn log_recovery_event(
             "Failed to write recovery event to {}",
             recovery_file.display()
         ));
+    } else {
+        crate::journal::execution::recovery_event(repo_root, issue, &recovery_file, &event);
     }
 }
 
@@ -1206,12 +1205,9 @@ fn create_recovery_pr(
             return spawned;
         }
     }
-    create_via_gh(
-        &args,
-        !stars.is_empty(),
-        |argv| run_gh(argv, repo_root, false),
-        |url| crate::forge_priority_labels::audit_created_pr(repo_root, body, url),
-    )
+    // The bare fallback. It used to post an inherited-star audit comment for
+    // the star-liveness removal rule (#10518); that rule is gone (#11104).
+    run_gh(&[&["pr", "create"][..], &args].concat(), repo_root, false)
 }
 
 /// Extract the file path from a `git status --porcelain` line.

@@ -26,6 +26,7 @@ mod gh_exec;
 /// Conditional 2.5/2.7 issue reads (W9), a child module because this file is
 /// frozen by `scripts/file-size-baseline.txt`.
 pub(crate) mod issue_snapshot;
+pub(crate) use issue_snapshot::IssueGate;
 mod rate_limit_report;
 #[cfg(test)]
 mod rate_limit_report_tests;
@@ -491,45 +492,7 @@ impl SweepRegistry {
     /// merged PR as `state: "closed"`, but an Issue-shaped node reporting `MERGED`
     /// must never fall through to the fail-open arm again.
     pub(crate) fn issue_is_closed_or_pr(&self, issue: u32) -> Option<bool> {
-        // `gh api` cannot infer the repo from the working directory; this helper
-        // prefers the process-global LOOM_REPO override and falls back to
-        // `gh repo view` in the workspace root, so the override keeps working
-        // exactly as it did with `gh issue view --repo`. Returns `None` (fail
-        // open) when the repo cannot be resolved.
-        let (owner, repo) = self.resolve_owner_repo()?;
-        let gh = self.resolved_gh();
-        let mut cmd = self.gh_inv("guard.issue_state", AccessIntent::Read, &gh);
-        cmd = cmd
-            .arg("api")
-            .arg(format!("repos/{owner}/{repo}/issues/{issue}"))
-            .arg("--jq")
-            .arg("{state, is_pr: (.pull_request != null)}");
-        // Resolve against this registry's own workspace, matching the label-flip
-        // helpers and the other dispatch-path probes (#3937).
-        let output = self.run_counted(cmd).ok()??;
-        if !output.status.success() {
-            return None;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).ok()?;
-        // A PR is terminal for dispatch purposes in EVERY state — an open PR is
-        // still not an issue anyone can build.
-        if parsed.get("is_pr")?.as_bool()? {
-            return Some(true);
-        }
-        match parsed
-            .get("state")?
-            .as_str()?
-            .trim()
-            .to_ascii_uppercase()
-            .as_str()
-        {
-            "CLOSED" | "MERGED" => Some(true),
-            "OPEN" => Some(false),
-            // Reserved for genuine lookup failures only: an unrecognized state
-            // string is an unparseable answer, not a verdict.
-            _ => None,
-        }
+        self.issue_gate_via_rest(issue).map(IssueGate::closed_or_pr)
     }
 
     /// Best-effort probe for an **open** pull request linked to `issue` via
@@ -1300,7 +1263,7 @@ impl SweepRegistry {
     }
 
     /// Whether the lease publishers below should publish this host's RAW
-    /// [`host_identity()`] value rather than [`opaque_host_id`] (Issue
+    /// [`lease_host_identity()`] value rather than [`opaque_host_id`] (Issue
     /// #6322). Reads [`LEASE_PUBLISH_HOSTNAME_ENV`] only — there is
     /// deliberately no per-repo config key for this: a shell counterpart
     /// (`defaults/scripts/sweep-lease-fence.sh`) must derive the exact same
@@ -1316,7 +1279,7 @@ impl SweepRegistry {
 
     /// The host identity to PUBLISH in a `loom:lease`/`loom:lease-yield`
     /// forge comment (Issue #6322) — [`opaque_host_id`] of
-    /// [`host_identity()`] by default, or the raw value when
+    /// [`lease_host_identity()`] by default, or the raw value when
     /// [`lease_publish_raw_hostname`](Self::lease_publish_raw_hostname) opts
     /// in via [`LEASE_PUBLISH_HOSTNAME_ENV`].
     ///
@@ -1325,7 +1288,7 @@ impl SweepRegistry {
     /// [`post_lease_yield_comment`](Self::post_lease_yield_comment)) AND the
     /// one reconciliation reader that must recognize "this dispatcher's own
     /// comment" ([`resolve_lease_order`](Self::resolve_lease_order)) call
-    /// this method rather than `host_identity()` directly — centralizing the
+    /// this method rather than `lease_host_identity()` directly — centralizing the
     /// transform here means a future publisher can never forget it, and
     /// `resolve_lease_order`'s own-claim recognition can never drift out of
     /// sync with what was actually published.
@@ -1335,7 +1298,7 @@ impl SweepRegistry {
     /// pointer back to the raw hostname — see `defaults/docs/lease-record.md`
     /// for the full resolution recipe.
     pub(crate) fn published_host_id(&self) -> String {
-        let host = host_identity();
+        let host = lease_host_identity();
         if self.lease_publish_raw_hostname() {
             return host;
         }
@@ -1700,8 +1663,8 @@ impl SweepRegistry {
         episode_start: DateTime<Utc>,
     ) -> LeaseOrderDecision {
         // Must match exactly what `write_lease_comment` PUBLISHED for this
-        // host (Issue #6322) — comparing against raw `host_identity()` here
-        // while the publisher writes `opaque_host_id(host_identity())` would
+        // host (Issue #6322) — comparing against raw `lease_host_identity()` here
+        // while the publisher writes `opaque_host_id(lease_host_identity())` would
         // silently break "recognize my own claim" for every dispatch once
         // publishing goes opaque.
         let host = self.published_host_id();
@@ -2882,7 +2845,7 @@ exit 0
         // Issue #6322: the marker's `host=` must be the opaque published id,
         // never the raw hostname (unless this test process happened to opt
         // into raw publishing, which it did not).
-        let raw_host = host_identity();
+        let raw_host = lease_host_identity();
         if raw_host != published {
             assert!(
                 !gh_calls.contains(&format!(
@@ -2969,14 +2932,14 @@ exit 0
     }
 
     /// Default (env unset): `published_host_id` returns the opaque form, not
-    /// the raw `host_identity()` value.
+    /// the raw `lease_host_identity()` value.
     #[test]
     #[serial]
     fn published_host_id_defaults_to_opaque() {
         std::env::remove_var(LEASE_PUBLISH_HOSTNAME_ENV);
         let dir = tempdir().unwrap();
         let registry = SweepRegistry::new(SweepRegistryConfig::new(dir.path().to_path_buf()));
-        let raw = host_identity();
+        let raw = lease_host_identity();
         assert_eq!(
             registry.published_host_id(),
             opaque_host_id(&raw),
@@ -2995,7 +2958,7 @@ exit 0
         let registry = SweepRegistry::new(SweepRegistryConfig::new(dir.path().to_path_buf()));
         assert_eq!(
             registry.published_host_id(),
-            host_identity(),
+            lease_host_identity(),
             "LOOM_LEASE_PUBLISH_HOSTNAME=1 must restore raw hostname publishing"
         );
     }
@@ -3010,7 +2973,7 @@ exit 0
         let registry = SweepRegistry::new(SweepRegistryConfig::new(dir.path().to_path_buf()));
         assert_eq!(
             registry.published_host_id(),
-            opaque_host_id(&host_identity()),
+            opaque_host_id(&lease_host_identity()),
             "an unrecognized/falsy value must not opt into raw publishing"
         );
     }
@@ -3037,7 +3000,7 @@ exit 0
             gh_calls.contains(&format!(
                 "{prefix}{host} sweep=sweep-test-6322 -->",
                 prefix = LEASE_MARKER_PREFIX,
-                host = host_identity(),
+                host = lease_host_identity(),
             )),
             "the opt-in must restore the raw hostname in the actual posted marker; got: \
              {gh_calls:?}"

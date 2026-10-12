@@ -9,9 +9,10 @@ use chrono::{DateTime, Utc};
 
 use super::ready_queue;
 use crate::sweep_registry::{
-    ClaimLockDispatchError, CollisionDispatchError, DispatchBackoffError, LeaseOrderDispatchError,
-    LiveClaimDispatchError, OpenPrDispatchError, ParkedIssueDispatchError,
-    TokenSelectionDispatchError, WorkspaceCommandsMissingDispatchError,
+    AlreadyLandedDispatchError, ClaimLockDispatchError, CollisionDispatchError,
+    DispatchBackoffError, LandedEvidence, LeaseOrderDispatchError, LiveClaimDispatchError,
+    OpenPrDispatchError, ParkedIssueDispatchError, TokenSelectionDispatchError,
+    WorkspaceCommandsMissingDispatchError,
 };
 use crate::types::QueueDisposition as Qd;
 
@@ -80,6 +81,17 @@ pub struct TickReport {
     /// with the parent sweep, so without this guard an issue whose approved PR is
     /// still open would be re-dispatched the moment its sweep exits.
     pub skipped_pr_open: usize,
+    /// The subset of [`skipped_pr_open`](Self::skipped_pr_open) the batched
+    /// open-PR pre-filter (#8865, [`super::open_pr_prefilter`]) skipped from
+    /// the open-PR listing, with no `dispatch()` attempt and so no
+    /// [`Admission`] and no dispatch backoff. The remainder are refusals
+    /// `dispatch()`'s own guard still made (the listing could not be read).
+    ///
+    /// In-process only: it is not on the tick line and not exported in
+    /// `loom.dispatch.decisions`. Tests read it to tell the two paths apart;
+    /// an operator tells them apart by the admission span, which only an
+    /// in-dispatch refusal has.
+    pub pr_open_prefiltered: usize,
     /// Issues skipped because a **peer host** advertised a live soft claim over
     /// the safehouse room (Issue #4028, Phase 1). Counted under its **own**
     /// distinct reason — never folded into [`collisions`](Self::collisions)
@@ -143,6 +155,10 @@ pub struct TickReport {
     /// apparently-healthy sweep that produced nothing** and would otherwise be
     /// re-offered on the very next tick.
     pub skipped_prless_retry: usize,
+    /// Issues refused because their work already landed (Issue #11429).
+    pub skipped_already_landed: usize,
+    /// Issues refused because they are closed as not planned (Issue #11429).
+    pub skipped_already_closed: usize,
     /// Issues skipped because they self-declared a `<!-- loom:recheck-interval=
     /// <value> -->` marker (Issue #6685) and their own `updatedAt` is still
     /// within that interval — see [`WorkItem::is_within_recheck_interval`](super::WorkItem::is_within_recheck_interval).
@@ -160,13 +176,6 @@ pub struct TickReport {
     /// flip, no comment, no cooldown/backoff record — this candidate is not
     /// actionable on this host at all, so it is never even attempted.
     pub skipped_host_constraint: usize,
-    /// Issues skipped because they carry `loom:heavy` and this host is
-    /// classified `local-dev` (Issue #9034), with no override set — see
-    /// [`crate::work_finder::host_class`]. Checked immediately after
-    /// [`skipped_host_constraint`](Self::skipped_host_constraint), and carries
-    /// the same zero-side-effect contract: no claim flip, no comment, no
-    /// cooldown/backoff record.
-    pub skipped_host_class: usize,
     /// Dispatch attempts that returned an error (logged, non-fatal).
     pub errors: usize,
     /// Cumulative cross-host dispatch collisions observed (Issue #4085, Phase 0
@@ -288,6 +297,9 @@ pub struct TickReport {
     /// weights, roll and pick, in order. `None` when nothing was drawn (an
     /// idle tick, and the single-workspace tick).
     pub workspace_draw: Option<super::workspace_draw::DrawLog>,
+    /// The `loom:very-important` issues the flood cap ranked as important
+    /// this tick (#11509), in listing order; exported in `pick.decision`.
+    pub vi_demotions: Vec<super::vi_cap::ViDemotion>,
 }
 
 impl TickReport {
@@ -469,6 +481,17 @@ fn classify(report: &mut TickReport, issue: u32, outcome: &Result<bool>) -> Outc
             parked.label
         );
         Outcome::new(Qd::Parked, Some(parked.label.to_string()), "refused", "labeled")
+    } else if let Some(landed) = e.downcast_ref::<AlreadyLandedDispatchError>() {
+        // #11429: the issue is closed, or this host just landed it.
+        log::info!("work_finder: skipping issue #{issue} — {e}");
+        if landed.evidence == LandedEvidence::ForgeClosedNotPlanned {
+            report.skipped_already_closed += 1;
+            Outcome::new(Qd::AlreadyClosed, None, "refused", "already_closed")
+        } else {
+            report.skipped_already_landed += 1;
+            let detail = Some(landed.detail().to_string());
+            Outcome::new(Qd::AlreadyLanded, detail, "refused", "already_landed")
+        }
     } else if e.downcast_ref::<DispatchBackoffError>().is_some() {
         // Dispatch backoff (#4485), possibly armed mid-tick by a reap.
         report.skipped_backoff += 1;

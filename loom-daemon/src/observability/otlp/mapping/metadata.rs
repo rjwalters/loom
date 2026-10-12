@@ -2,9 +2,17 @@
 //! token-price estimates, or provider billing guesses enter this mapping.
 use super::{
     any_string, any_value, kv, kv_int, kv_string, AnyValue, ArrayValue, KeyValue, KeyValueList,
+    RepoVisibility,
 };
 use crate::script_helpers::sweep_experiment::ModelUsageTotals;
 use crate::telemetry::{PhaseDuration, SweepOutcomeRecord, SweepStartFacts};
+pub(super) fn visibility_str(visibility: RepoVisibility) -> &'static str {
+    match visibility {
+        RepoVisibility::Public => "public",
+        RepoVisibility::Private => "private",
+    }
+}
+
 const MAX_GROUPS: usize = 64;
 const MAX_STRING_BYTES: usize = 256;
 
@@ -46,6 +54,7 @@ pub(super) fn start_facts(facts: &SweepStartFacts) -> Vec<KeyValue> {
     for (key, value) in [
         ("loom.trigger", &facts.trigger),
         ("loom.previous_sweep_id", &facts.previous_sweep_id),
+        ("loom.dispatch_origin", &facts.dispatch_origin),
     ] {
         if let Some(value) = value.as_ref().filter(|v| text(v)) {
             attrs.push(kv_string(key, value.clone()));
@@ -291,6 +300,10 @@ pub(super) fn outcome(record: &SweepOutcomeRecord) -> Vec<KeyValue> {
     }
     if let Some(value) = record.trigger.as_ref().filter(|v| text(v)) {
         attrs.push(kv_string("loom.trigger", value.clone()));
+    }
+    // Issue #11444: who asked for this sweep, equal to `sweep.started`'s.
+    if let Some(value) = record.dispatch_origin.as_ref().filter(|v| text(v)) {
+        attrs.push(kv_string("loom.dispatch_origin", value.clone()));
     }
     if let Some(numbers) = &record.pr_numbers {
         if !numbers.is_empty() && numbers.len() <= MAX_GROUPS {

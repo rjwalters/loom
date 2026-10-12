@@ -202,6 +202,7 @@ fn every_unverified_private_shape_is_refused_for_a_mutable_role() {
         None,
         None,
         None,
+        loom_daemon::sweep_registry::DispatchOrigin::Unknown,
     )
     .unwrap_err();
     assert!(rejected.to_string().contains("hook trust"), "{rejected}");

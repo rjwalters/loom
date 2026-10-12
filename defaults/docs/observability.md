@@ -19,6 +19,7 @@
 - [3b-2. Every daemon must export OTLP: `otlp_export` (Issue #11353)](#3b-2-every-daemon-must-export-otlp-otlp_export-issue-11353)
 - [3c. Operational signals from daemon loops (Issue #8860)](#3c-operational-signals-from-daemon-loops-issue-8860)
 - [3d. Agent telemetry relay (Issue #10964)](#3d-agent-telemetry-relay-issue-10964)
+- [3e. Alerts on loom-ui's Alerts page (Issue #11295)](#3e-alerts-on-loom-uis-alerts-page-issue-11295)
 - [4. The backend: deploy your own Cloudflare Worker](#4-the-backend-deploy-your-own-cloudflare-worker)
 - [5. Authenticated vs. public: two views, one redaction policy](#5-authenticated-vs-public-two-views-one-redaction-policy)
 - [5b. Doc-maintenance throughput (Guide, local-only, issue #6136)](#5b-doc-maintenance-throughput-guide-local-only-issue-6136)
@@ -572,8 +573,10 @@ alert. The rule's shape has not yet been tested against a live SigNoz. Standing 
 `defaults/observability/signoz/queue-dwell.sql`.
 
 **Fleet singleton outputs (#10916).** The in-daemon `fleet_alert` path
-(#10924) judges the registered one-host fleet outputs (`ci.run` and the
-captain gauges) against `fleet_outputs::SINGLETON_OUTPUTS`. The SigNoz
+(#10924) judges the registered one-host fleet outputs (`ci.run`, the captain
+gauges, and the intake-reconcile completed-pass heartbeat
+`.loom/state/intake-reconcile/last-pass.json`) against
+`fleet_outputs::SINGLETON_OUTPUTS`. The SigNoz
 cross-host alert that watched the ETA singletons was removed with the ETA
 subsystem (#11098).
 
@@ -620,7 +623,7 @@ merge-chain head that `main` keeps moving under. Details are in
 **Per-issue dispatch disposition (#9222).** `loom.dispatch.admission` only
 covers candidates that reached a `dispatch()` attempt — a candidate filtered
 out earlier (`workspace_halted`, `parked`, `deferred_saturation`,
-`host_class_refused`, a backoff, a cooldown, …) had no per-issue SigNoz record
+`host_constraint`, a backoff, a cooldown, …) had no per-issue SigNoz record
 at all before this. Every ready-queue row now gets a `loom.dispatch.disposition`
 span on a disposition transition (including first sight), on a periodic
 refresh (`LOOM_DISPATCH_DISPOSITION_REFRESH_SECS`, default 600s = 10 min), or
@@ -723,11 +726,16 @@ without an exporter, `loom-daemon forge calls --by bucket` shows the same
 picture from the local forge-call sink. Each `invoke github` span carries the
 same facts per call (#10343): `github.http.{status,not_modified,requests,source}`
 (`unknown` when `gh` gave no HTTP evidence — never guessed),
-`github.billing` (`ok`|`not_modified`|`rate_limited`|`error`|`not_sent`) and
+`github.billing` (`ok`|`not_modified`|`rate_limited`|`secondary_limited`|`error`|`not_sent`) and
 the bucket join keys `github.{resource,account,cred_owner,role}`. Since
 #10752 a span also carries `github.repo`, a write carries `github.number`, and
 a call made by a daemon pass inside its caller scope carries `github.caller`
-(the `loom:blocked` release pass: `stale_blocked_release`). That pass also
+(the `loom:blocked` release pass: `stale_blocked_release`). Since #11407
+every span also names the endpoint: `github.route` (a template such as
+`/repos/{owner}/{repo}/pulls/{n}`, from the same finite table as gh-shim's
+`github.api.route`), `http.request.method`, and `github.command` (`pr view`
+for an agent front read), so `api.rest` and `agent_gh_front` spend can be
+ranked by route. That pass also
 emits a `pass.summary` log per pass and a `pass.verdict` per artifact; see
 [`telemetry-schema.md`](telemetry-schema.md) and
 `defaults/observability/signoz/pass-queries.sql`.
@@ -1102,6 +1110,56 @@ in view:
 A session that outlives the daemon that launched it (a sweep adopted after a
 restart) keeps a stale address and exports nothing until it is relaunched —
 unless something else now holds that address, as above.
+
+## 3e. Alerts on loom-ui's Alerts page (Issue #11295)
+
+loom-ui is the alert hub for every repo. With the native ingest export
+configured (section 1), the daemon also posts its alerts to
+`POST {loom-ui}/api/alerts/external` (2AMLogic/loom-ui
+`docs/alerts/external.md`) — same ingest key, same host id as `source`, URL
+derived from `observability.endpoint` by replacing its `/ingest` path. No
+ingest config means the output is off. `LOOM_LOOM_UI_ALERTS=0` turns it off
+on a host that exports telemetry; `LOOM_LOOM_UI_ALERTS_URL` overrides the URL.
+The host id must be in loom-ui's `ALERTS_EXTERNAL_HOSTS` (else 403, logged
+and dropped).
+
+| Rule | From | Open / resolved |
+|---|---|---|
+| `fleet.<condition>` (`dispatch-halted`, `roles-persistent`, `capacity-limited`, `star-backlog`, `output-missing`) | `fleet_alert` | condition started (and each reminder) / cleared |
+| `daemon.down` (critical) | the watchdog, a separate process | recovery exhausted / any tick ending the outage |
+| `watchdog.peer-coord-degraded` (critical) | the watchdog | coordination degraded / green |
+| `safehouse.unreachable` (critical) | narration sink state | unreachable over 5 minutes / reconnected |
+| `fleet.floor-unsatisfiable` | `auto_update` | the floor ERROR line / floor met |
+| `fleet.floor-malformed` | fleet-sync pass | `loom_min_version` malformed / a valid (or no) floor |
+| `fleet.sync-error` | fleet-sync pass | 3 erroring passes in a row / a clean pass |
+| `daemon.task-dead` (key = task) | `task_liveness`, sampled each minute | loop past its staleness window / beating again or gone |
+| `forge.credential-missing` (critical) | startup credential preflight | no usable GitHub credential / a good start or github-app refresh |
+| `resync.<kind>` (`failure`, `repo-access`, `branch-protection`: key = repo; `network`, `head-query`, `pass-stuck`: key `workspaces`) | workspace resync | its alert threshold (3 in a row) / the repo or host healthy again |
+| `forge.ratelimit-breaker` | rate-limit breaker, sampled each minute | polling held off over 15 minutes / released |
+| `version.pause-failed` (key = version) | pause roll (H7 `pause-failed`) | the failed pause / a start on another version |
+| `version.config-rejected` | pause roll | `pauseRoll.*` tuning rejected / accepted (each roll and each start) |
+| `llm-monitor.stale` | llm-monitor `ranking.json` | older than 30 minutes (or unreadable) on two reads 5 minutes apart / fresh (no file: nothing) |
+| `install.<invariant>` (key = workspace root) | `install_self_check`, when enabled | violation standing after the tick / gone, or the check off |
+
+`tokens-zero-healthy` is not sent: loom-ui derives `provider-pool-exhausted`
+from the daemon's pool gauge itself. Delivery is a bounded FIFO drained by one
+task (open always before resolved): a 2xx is done, any other 4xx except 429 is
+dropped and logged, 429 / 5xx / network errors back off (5 s doubling to
+15 min, at most 20 tries). The watchdog posts synchronously (10 s bound) and
+keeps a `<sentinel>.loom-ui` record so an unanswered post retries next tick.
+
+Level-triggered sources keep the incidents they hold open in
+`~/.loom/loom-ui-alerts/<scope>.json`, so a restarted daemon resolves one
+the previous process opened once it finds the condition gone, and keeps one
+open while its failure count (process memory) builds up again; a daemon
+that finds the output off removes those files. The single-key
+watches (safehouse, breaker, llm-monitor) send one `resolved` on their first
+healthy sample instead. Alerts raised before the output starts (credential
+preflight, the fleet-sync startup pass) wait in the outbox. llm-monitor's
+quota step-change alert is not in `ranking.json` yet, so it is not sent.
+
+`fleet_alert` only runs when `autonomous.fleetAlert.enabled` is on (off by
+default here); the fleet defaults (fleet-gitops) are where to enable it.
 
 ## 4. The backend: deploy your own Cloudflare Worker
 

@@ -427,10 +427,10 @@ pub fn parse_query(entity: &str, args: &[String]) -> Option<CachedQuery> {
                 for tok in raw.split_whitespace() {
                     if let Some(v) = tok.strip_prefix("-label:") {
                         negative_labels.push(v.to_string());
-                    } else if let Some(v) = tok.strip_prefix("label:") {
-                        positive_labels.push(v.to_string());
                     } else {
-                        return None; // unsupported search term → decline
+                        // unsupported search term → decline
+                        let v = tok.strip_prefix("label:")?;
+                        positive_labels.push(v.to_string());
                     }
                 }
             }
@@ -492,6 +492,7 @@ mod tests {
             author: Some(s("octocat")),
             author_association: None,
             is_pull_request: is_pr,
+            open_sub_issues: None,
         }
     }
 

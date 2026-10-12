@@ -69,14 +69,15 @@ pub mod queue_snapshot;
 pub mod repo_identity;
 mod start_facts;
 pub use start_facts::{
-    effort_source, model_source, SweepStartFacts, SWEEP_START_FACT_LOG_ATTRIBUTE_KEYS,
+    effort_source, model_source, DispatchOrigin, SweepStartFacts,
+    SWEEP_START_FACT_LOG_ATTRIBUTE_KEYS,
 };
 pub mod trace;
 pub mod visibility;
 pub use ci::{CiDurationRecord, CiJobLogRecord, CiJobRecord, CiRunRecord};
 pub use disposition::{
-    classify_disposition, DispositionSignals, IssueEndState, SweepDisposition,
-    NO_PHASE_SIGNAL_CLASS,
+    apply_noop_loop_class, classify_disposition, result_for_disposition, DispositionSignals,
+    IssueEndState, SweepDisposition, NO_PHASE_SIGNAL_CLASS, SPAWN_DEATH_CLASS,
 };
 pub use envelope::TelemetryEnvelope;
 pub use kinds::{
@@ -367,7 +368,14 @@ pub mod trigger {
     pub const STALE_BASE_REJUDGE: &str = "stale_base_rejudge";
     /// Dispatched to fix a CI failure.
     pub const CI_FAILURE_FIX: &str = "ci_failure_fix";
-    /// A human or external tool asked for this sweep.
+    /// Re-dispatch after the previous attempt succeeded: it landed, found the
+    /// work already done, or the Curator closed or rescoped the issue (Issue
+    /// #11429). Inferred from the journal; says nothing about who dispatched.
+    pub const REDISPATCH_AFTER_SUCCESS: &str = "redispatch_after_success";
+    /// An operator re-dispatched an issue that already had an attempt on this
+    /// host. Set only from the recorded `dispatch_origin=operator` (Issue
+    /// #11444, `DispatchOrigin::apply_to_trigger`); the journal inference
+    /// never sets it.
     pub const OPERATOR_REDISPATCH: &str = "operator_redispatch";
     /// The dispatch reason was not observable. Counted, never silently merged.
     pub const UNKNOWN: &str = "unknown";
@@ -959,6 +967,13 @@ pub struct SweepOutcomeRecord {
     /// `unknown` is counted, never silently merged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trigger: Option<String>,
+    /// Who asked for this sweep (Issue #11444) — a [`DispatchOrigin`] wire
+    /// value, copied from the sweep's start facts so `sweep.outcome` agrees
+    /// with `sweep.started`. Absent on journal lines that predate it and on
+    /// sweeps this daemon did not dispatch (adopted, PR-set); never
+    /// fabricated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_origin: Option<String>,
     /// In-sweep rework events (Issue #9444) observed by the paths that
     /// performed them, in event order. Absent (never `[]`) when none were
     /// observed for this sweep.

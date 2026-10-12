@@ -34,6 +34,11 @@ fn provenance() -> Provenance {
 #[derive(Default)]
 struct Forge {
     pulls: BTreeMap<u32, PullFacts>,
+    /// Issues not listed read as open.
+    issues: BTreeMap<u32, IssueFacts>,
+    /// Issue reads that fail before one is answered.
+    issue_failures: usize,
+    issue_reads: usize,
     histories: BTreeMap<u32, LabelHistory>,
     reads: usize,
     /// History reads per number.
@@ -64,7 +69,7 @@ impl Forge {
     }
 
     fn pull_reads(&self) -> usize {
-        self.reads - self.history_reads.values().sum::<usize>()
+        self.reads - self.issue_reads - self.history_reads.values().sum::<usize>()
     }
 }
 
@@ -76,6 +81,21 @@ impl ForgeReads for Forge {
             return None;
         }
         self.pulls.get(&number).copied()
+    }
+
+    fn issue(&mut self, _repo: &str, number: u32) -> Option<IssueFacts> {
+        self.reads += 1;
+        self.issue_reads += 1;
+        if self.issue_failures > 0 {
+            self.issue_failures -= 1;
+            return None;
+        }
+        Some(
+            self.issues
+                .get(&number)
+                .copied()
+                .unwrap_or(IssueFacts::Open),
+        )
     }
 
     fn label_history(&mut self, _repo: &str, number: u32) -> Option<LabelHistory> {
@@ -286,6 +306,7 @@ fn held_merge_wait() -> HeldSweep {
         pr: Some(21),
         overflow: false,
         start: Default::default(),
+        sweep_id: None,
     }
 }
 
@@ -347,10 +368,13 @@ fn a_ready_row_surviving_the_review_departure_gives_landed_not_advance() {
                 fleet_priority: 0,
                 created_at: None,
                 main_red_fix: false,
+                eligible_reason: None,
+                eligible_at: None,
             }],
             listed: [REPO.to_string()].into(),
             complete: BTreeSet::new(),
             slots: None,
+            halts: Default::default(),
         });
         with_ready
     };
@@ -492,11 +516,14 @@ fn ready(issues: &[u32], held: Vec<HeldSweep>) -> FleetInput {
                 fleet_priority: 0,
                 created_at: None,
                 main_red_fix: false,
+                eligible_reason: None,
+                eligible_at: None,
             })
             .collect(),
         listed: [REPO.to_string()].into(),
         complete: [REPO.to_string()].into(),
         slots: None,
+        halts: Default::default(),
     });
     with_ready
 }
@@ -514,6 +541,7 @@ fn claimed() -> FleetInput {
             pr: None,
             overflow: false,
             start: Default::default(),
+            sweep_id: None,
         }],
     )
 }
@@ -605,23 +633,6 @@ fn a_ready_exit_waits_for_its_forge_departure() {
 }
 
 #[test]
-fn a_closed_ready_issue_is_cut_short_at_the_close() {
-    let at = t0() + Duration::minutes(3);
-    let mut forge = ready_forge();
-    forge.event(ISSUE, at, HistoryEvent::Closed);
-    let out = run(
-        &[ready(&[ISSUE], Vec::new()), ready(&[], Vec::new())],
-        Duration::minutes(5),
-        &mut forge,
-    );
-    let r = stages(&out[1])[0];
-    assert_eq!((r.exit, r.next_stage), (StageExit::CutShort, None));
-    assert_eq!(r.forge_transition_at, Some(at));
-    assert_eq!(r.dwell_sec, None);
-    assert_eq!(r.entered_at, Some(t0() - Duration::minutes(30)));
-}
-
-#[test]
 fn a_ready_exit_the_forge_never_shows_is_one_unknown_after_the_cap() {
     let mut forge = ready_forge();
     let mut inputs = vec![ready(&[ISSUE], Vec::new())];
@@ -633,9 +644,10 @@ fn a_ready_exit_the_forge_never_shows_is_one_unknown_after_the_cap() {
     }
     let r = stages(&out[cap + 1])[0];
     assert_eq!((r.exit, r.next_stage), (StageExit::Unknown, None));
-    assert_eq!(r.forge_transition_at, None, "no fact id");
+    assert_eq!(r.forge_transition_at, None, "no forge exit instant");
     assert_eq!(r.left_at, t0() + Duration::minutes(5), "the pass that saw it gone");
     assert_eq!(r.entered_at, Some(t0() - Duration::minutes(30)));
+    assert!(r.has_fact_key(), "keyed on the forge-dated entry (#11401)");
 }
 
 #[test]
@@ -763,6 +775,7 @@ fn a_held_sweep_advancing_is_a_stage_outcome_without_a_forge_instant() {
         pr: None,
         overflow: false,
         start: Default::default(),
+        sweep_id: None,
     };
     let mut forge = Forge::default();
     let out = run(
@@ -1019,3 +1032,12 @@ fn a_failed_events_page_is_a_failed_read() {
 
 #[path = "outcomes_pre_ready_tests.rs"]
 mod pre_ready_tests;
+
+#[path = "outcomes_fact_id_tests.rs"]
+mod fact_id_tests;
+
+#[path = "outcomes_issue_close_tests.rs"]
+mod issue_close_tests;
+
+#[path = "outcomes_close_tests.rs"]
+mod close_tests;

@@ -78,13 +78,24 @@ impl SweepRegistry {
     /// manufacture quarantine pressure. `open_pr_probe` is `None` when the
     /// caller did not run the probe at all (`skip_label_flip`, or a non-zero
     /// exit), which likewise yields `false`.
+    ///
+    /// # Self-reported no-op (#11438)
+    ///
+    /// A dispatch that self-reported a no-op release
+    /// ([`noop_release_covers_dispatch`](Self::noop_release_covers_dispatch),
+    /// #8912) reached a deliberate conclusion — "no build work here" — so it
+    /// is never "no progress". Checked first: it is a free in-memory read, and
+    /// without it the clean exit was journaled `result=failure`, which the
+    /// disposition classifier then turned into `env_failure` +
+    /// `unclassified:spawn-death` and a `retry_after_env_failure` re-dispatch.
     pub(crate) fn is_no_progress(
         &self,
         issue: u32,
         sweep_id: &str,
         open_pr_probe: Option<OpenPrProbe>,
     ) -> bool {
-        !self.observed_lifecycle_progress(sweep_id)
+        !self.noop_release_covers_dispatch(issue, sweep_id)
+            && !self.observed_lifecycle_progress(sweep_id)
             && open_pr_probe == Some(OpenPrProbe::NoneOpen)
             && self.issue_is_closed_or_pr(issue) == Some(false)
     }

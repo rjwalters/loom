@@ -56,8 +56,10 @@ pub const TRIGGER_CALLER: &str = "role_event_trigger";
 pub const UNTRIAGED_AXIS: &str = "untriaged";
 
 /// Labels that mean Curator has queued work: new issues and Champion's
-/// revision requests (#10753), which never carry `loom:triage`.
-pub const CURATOR_WORK_LABELS: [&str; 2] = ["loom:triage", "loom:needs-revision"];
+/// revision requests (#10753) and the undocumented-`loom:blocked` hand-off
+/// queue (#10558), neither of which carries `loom:triage`.
+pub const CURATOR_WORK_LABELS: [&str; 3] =
+    ["loom:triage", "loom:needs-revision", "loom:blocked-unnamed"];
 
 /// The resolved `autonomous.roleRunner.eventTriggers` block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -442,7 +444,8 @@ fn observe_untriaged(root: &Path) -> Observation {
     let gh = concurrent_dispatch::gate_gh_bin();
     let mut total = 0;
     // Champion's NEEDS REVISION requests (`loom:needs-revision`, #10753) are
-    // Curator work that never carries `loom:triage`, so they count too.
+    // Curator work that never carries `loom:triage`, so they count too, as does
+    // the `loom:blocked-unnamed` queue (#10558).
     for label in CURATOR_WORK_LABELS {
         match crate::forge_listing::list_issues_cached_as(
             TRIGGER_CALLER,

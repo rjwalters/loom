@@ -1,6 +1,6 @@
 //! `pick.decision` emission (Issue #10212): per role tick and per work-finder
 //! tick, the ranked candidates, what was acted on, and why the rest were
-//! skipped. The payload and its caps live in
+//! skipped. The payload and its chunk split live in
 //! [`crate::telemetry::kinds::pick_decision`].
 //!
 //! **No forge calls are added.** The work-finder side reads the
@@ -33,11 +33,13 @@ use super::pick_journal::{
 use crate::forge_listing::RestIssue;
 use crate::role_runner::RoleTickOutcome;
 use crate::telemetry::kinds::pick_decision::{
-    source, PickAction, PickCandidate, PickDecisionRecord, PickDraw, PickDrawCandidate,
-    PickSkipReason, PickSortKey, PickTick, PickVerdict, PickWorkspaceDraw, WORK_FINDER_ROLE,
+    source, split_into_chunks, PickAction, PickCandidate, PickDecisionRecord, PickDraw,
+    PickDrawCandidate, PickSkipReason, PickSortKey, PickTick, PickVerdict, PickViDemotion,
+    PickWorkspaceDraw, CHUNK_BYTES, WORK_FINDER_ROLE,
 };
 use crate::telemetry::{RoleTickResult, TelemetryRecord};
 use crate::types::{QueueDisposition, WorkFinderTickSummary};
+use crate::work_finder::vi_cap::ViDemotion;
 use crate::work_finder::workspace_draw::{self, DrawLog};
 
 /// `repo` value when no forge slug is known. Never a local path (#9442).
@@ -111,7 +113,11 @@ fn repo_label(root: &Path) -> String {
 
 fn emit(record: PickDecisionRecord) {
     if let Some(sink) = super::ops::global_ops_sink() {
-        sink.emit_record(TelemetryRecord::PickDecision(record));
+        // A record over the byte budget is split, never truncated (#11567):
+        // the chunks share `tick_id` and their union is the original.
+        for chunk in split_into_chunks(record, CHUNK_BYTES) {
+            sink.emit_record(TelemetryRecord::PickDecision(chunk));
+        }
     }
 }
 
@@ -227,6 +233,23 @@ pub fn workspace_draw_record(
     }
 }
 
+/// The tick's flood-cap demotions (#11509) as `pick.decision` carries them.
+/// `resolve` maps a workspace index to the `repo` the record names.
+#[must_use]
+pub fn vi_demotion_records(
+    demoted: &[ViDemotion],
+    resolve: impl Fn(usize) -> String,
+) -> Vec<PickViDemotion> {
+    demoted
+        .iter()
+        .map(|d| PickViDemotion {
+            repo: resolve(d.workspace_idx),
+            number: d.number,
+            holder: d.holder,
+        })
+        .collect()
+}
+
 fn resolve_repo(repo: &str) -> String {
     let path = Path::new(repo);
     if path.is_absolute() {
@@ -239,25 +262,25 @@ fn resolve_repo(repo: &str) -> String {
 /// Emit the work finder's decision for a completed tick (a no-op with no OTLP
 /// exporter). Called from the shared end-of-tick seam, so empty ticks count.
 /// `draw` is the tick's workspace-draw log (#11103) and `roots[i]` workspace
-/// `i`'s repo root, which names the draw's workspaces.
+/// `i`'s repo root, which names the draw's workspaces. `demoted` is the
+/// tick's `loom:very-important` flood-cap demotions (#11509).
 pub fn emit_work_finder(
     summary: &WorkFinderTickSummary,
     started_at: DateTime<Utc>,
     ended_at: DateTime<Utc>,
-    draw: Option<&DrawLog>,
+    (draw, demoted): (Option<&DrawLog>, &[ViDemotion]),
     roots: &[std::path::PathBuf],
 ) {
     if !exporting() {
         return;
     }
-    let draw = draw.map(|log| {
-        workspace_draw_record(log, |idx| {
-            roots.get(idx).map_or_else(
-                || REPO_UNRESOLVED.to_string(),
-                |r| resolve_repo(&r.display().to_string()),
-            )
-        })
-    });
+    let name = |idx: usize| {
+        roots
+            .get(idx)
+            .map_or_else(|| REPO_UNRESOLVED.to_string(), |r| resolve_repo(&r.display().to_string()))
+    };
+    let draw = draw.map(|log| workspace_draw_record(log, name));
+    let demoted = vi_demotion_records(demoted, name);
     emit(
         work_finder_record(
             summary,
@@ -266,7 +289,8 @@ pub fn emit_work_finder(
             ended_at,
             resolve_repo,
         )
-        .with_workspace_draw(draw),
+        .with_workspace_draw(draw)
+        .with_very_important_demoted(demoted),
     )
 }
 

@@ -57,7 +57,8 @@ const QUESTION_IDS: &[&str] = &["IE1", "IE2", "IE3", "IE4", "IE5"];
 /// absence from its `CASE` list is not drift. Pinned here so that *adding* a
 /// variant to this list is a visible, reviewable diff rather than a silent
 /// widening of the unattributed bucket.
-const UNBUCKETED_TRIGGERS: &[&str] = &["operator_redispatch", "unknown"];
+const UNBUCKETED_TRIGGERS: &[&str] =
+    &["redispatch_after_success", "operator_redispatch", "unknown"];
 
 /// The payload fields the query reads off a `sweep.outcome` record, and the
 /// fields it reads off a `rework_events[]` entry. Checked against the serde

@@ -13,8 +13,9 @@
 //! `BLOCKING` and queue_blocked `HOLD_LABELS` are derived too; `tests.rs` pins each to its previous literal. dep_classify's
 //! operator-only labels are single named consts, kept in lockstep by a test.
 //!
-//! Final slice (AC 6): `propagate` holds #10012's propagation rule table;
-//! `star_liveness::propagation_rules::RULES` is derived from it.
+//! Final slice (AC 6): `propagate` holds #10012's propagation rule table. Its
+//! only consumer, the star-liveness propagation pass, was removed by #11104,
+//! so the table is inert until the label cleanup retires it.
 //!
 //! Fields documented as inert (`stale_after_minutes`, `lifecycle`) have no
 //! consumer yet.
@@ -76,7 +77,6 @@ pub const KINDS: &[&str] = &[
     "structural",
     "tier",
     "size",
-    "resource",
     "external",
 ];
 

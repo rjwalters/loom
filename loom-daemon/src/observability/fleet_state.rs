@@ -34,6 +34,11 @@
 //! When one `(repo, issue)` is seen by several sources, the held row wins,
 //! then the PR row, then the ready row.
 //!
+//! The same tick also gives the ETA facts (#11564): each `ready_wait` row's
+//! `eligible_reason` / `eligible_at` (the clock holding it back and its end)
+//! and each held repo's `halt` (`work_finder::halt_cause::since`). Neither is
+//! capped.
+//!
 //! The same two consecutive views also give the outcome facts
 //! `eta.stage_outcome` and `pr.resolved` ([`outcomes`], #11126).
 //!
@@ -55,9 +60,9 @@ use serde_json::Value;
 
 use super::queue::{DurableQueue, FanoutQueue, QueueSink};
 use crate::telemetry::kinds::fleet_state::{
-    split_into_chunks, FleetCapacity, FleetHoldKind, FleetPrCensus, FleetSlot, FleetSlots,
-    FleetStage, FleetStateRecord, FleetStateRepo, FleetStateRow, MainCi, PlannerStamps,
-    ANCHOR_INTERVAL_SECS, CHUNK_BYTES, FLEET_STATE_SCHEMA,
+    split_into_chunks, FleetCapacity, FleetEligibleReason, FleetHoldKind, FleetPrCensus,
+    FleetRepoHalt, FleetSlot, FleetSlots, FleetStage, FleetStateRecord, FleetStateRepo,
+    FleetStateRow, MainCi, PlannerStamps, ANCHOR_INTERVAL_SECS, CHUNK_BYTES, FLEET_STATE_SCHEMA,
 };
 use crate::telemetry::{RepoVisibility, SweepStartFacts, TelemetryEnvelope, TelemetryRecord};
 
@@ -185,6 +190,8 @@ pub struct HeldSweep {
     pub overflow: bool,
     /// The sweep's dispatch-time facts (#11280), when this daemon has them.
     pub start: SweepStartFacts,
+    /// The sweep's id (#11401), keying its stages' `loom.fact_id`.
+    pub sweep_id: Option<String>,
 }
 
 /// One open item from a repo's review listings.
@@ -217,6 +224,10 @@ pub struct ReadyItem {
     pub fleet_priority: u32,
     pub created_at: Option<DateTime<Utc>>,
     pub main_red_fix: bool,
+    /// The clock holding it back this tick, when one does (#11564).
+    pub eligible_reason: Option<FleetEligibleReason>,
+    /// When that clock ends, when the work finder knows (#11564).
+    pub eligible_at: Option<DateTime<Utc>>,
 }
 
 /// The work finder's last tick, as `fleet.state` reads it.
@@ -231,6 +242,9 @@ pub struct ReadyQueue {
     /// `ready_complete`, #11139). A subset of `listed`.
     pub complete: BTreeSet<String>,
     pub slots: Option<FleetSlots>,
+    /// The repos the tick held, by lowercased slug (#11564). Every held repo
+    /// is here, whether or not it has ready rows.
+    pub halts: BTreeMap<String, FleetRepoHalt>,
 }
 
 /// Everything one pass read.
@@ -263,6 +277,8 @@ pub struct RepoView {
     pub sources: BTreeMap<u32, Source>,
     /// `main` CI status, when the host read it.
     pub main_ci: Option<MainCi>,
+    /// The work finder's hold on the repo, when it holds it (#11564).
+    pub halt: Option<FleetRepoHalt>,
 }
 
 /// The full state at one pass, before visibility tagging.
@@ -393,6 +409,7 @@ pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Ut
                 FleetSlot::Regular
             }),
             start: sweep.start.clone(),
+            sweep_id: sweep.sweep_id.clone(),
             ..FleetStateRow::new(sweep.issue, sweep.stage, sweep.entered_at)
         };
         offer(&mut candidates, &sweep.repo, Source::Held, row);
@@ -457,6 +474,8 @@ pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Ut
                 fleet_priority: Some(item.fleet_priority),
                 created_at: item.created_at,
                 main_red_fix: item.main_red_fix,
+                eligible_reason: item.eligible_reason,
+                eligible_at: item.eligible_at,
                 ..FleetStateRow::new(item.issue, FleetStage::ReadyWait, now)
             };
             offer(&mut candidates, &item.repo, Source::Ready, row);
@@ -575,6 +594,10 @@ pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Ut
     for (repo, main_ci) in &input.main_ci {
         repos.entry(repo.clone()).or_default().main_ci = Some(*main_ci);
     }
+    // Every held repo, rows or not (#11564): a halt is never capped.
+    for (repo, halt) in input.ready.iter().flat_map(|ready| &ready.halts) {
+        repos.entry(repo.clone()).or_default().halt = Some(halt.clone());
+    }
     FleetView {
         census_at: input.listed_at.filter(|_| !input.listings.is_empty()),
         slots: input.ready.as_ref().and_then(|r| r.slots),
@@ -596,6 +619,7 @@ pub fn needs_anchor(last: Option<&Emitted>, stamps: &PlannerStamps, now: DateTim
 
 fn repo_entry(view: &FleetView, repo: &str, census: Option<FleetPrCensus>) -> FleetStateRepo {
     let main_ci = view.repos.get(repo).and_then(|r| r.main_ci);
+    let halt = view.repos.get(repo).and_then(|r| r.halt.clone());
     let ready_complete = view.ready_complete(repo);
     FleetStateRepo {
         repo: repo.to_string(),
@@ -603,6 +627,7 @@ fn repo_entry(view: &FleetView, repo: &str, census: Option<FleetPrCensus>) -> Fl
         // until then is the safe default.
         visibility: RepoVisibility::Private,
         main_ci,
+        halt,
         census,
         ready_complete,
         ready_replace: !ready_complete,
@@ -698,6 +723,7 @@ pub fn decide(
             && !ready_changed
             && now_state.census == was.census
             && now_state.main_ci == was.main_ci
+            && now_state.halt == was.halt
             && view.ready_complete(repo) == last.view.ready_complete(repo)
         {
             continue;
@@ -797,8 +823,14 @@ static STATE: Mutex<PassState> = Mutex::new(PassState {
         unread: BTreeMap::new(),
         settled: BTreeSet::new(),
         pending_ready: BTreeMap::new(),
+        pending_issue: BTreeMap::new(),
         curated: BTreeMap::new(),
         curated_now: None,
+        triage: BTreeMap::new(),
+        triage_now: None,
+        pre_ready_gone: BTreeMap::new(),
+        managed: BTreeSet::new(),
+        absent: BTreeMap::new(),
         pre_ready_done: BTreeSet::new(),
         pre_ready_retry: BTreeSet::new(),
         warm: BTreeMap::new(),
@@ -814,7 +846,7 @@ static STATE: Mutex<PassState> = Mutex::new(PassState {
 async fn record_outcomes(
     sink: &FleetStateSink,
     input: &FleetInput,
-    curated: outcomes::Curated,
+    (curated, triage): (outcomes::Curated, outcomes::Curated),
     view: FleetView,
     now: DateTime<Utc>,
     workspace_pool: &crate::workspace_pool::WorkspacePool,
@@ -827,6 +859,7 @@ async fn record_outcomes(
         (state.outcomes.clone(), state.enrich.clone())
     };
     memory.curated_now = Some(curated);
+    memory.triage_now = Some(triage);
     let roots = sources::managed_roots(workspace_pool, slug_cache)
         .await
         .into_iter()
@@ -919,14 +952,16 @@ pub(super) async fn record(
     };
     let _pass = pass_lock().lock().await;
     let now = Utc::now();
-    let (input, mut reused, curated) =
+    let (input, mut reused, curated, triage) =
         sources::gather(workspace_root, workspace_pool, slug_cache, &sink.host_id, now).await;
     let state = STATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
     let view = build_view(&input, state.prev.as_ref(), now);
-    let view = record_outcomes(sink, &input, curated, view, now, workspace_pool, slug_cache).await;
+    let view =
+        record_outcomes(sink, &input, (curated, triage), view, now, workspace_pool, slug_cache)
+            .await;
     for repo in view.repos.keys().chain(&input.managed) {
         if !reused.visibility.contains_key(repo) {
             let visibility = super::collector::resolve_visibility(repo).await;
@@ -1019,3 +1054,8 @@ fn send(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[path = "fleet_state_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[path = "fleet_state/facts_tests.rs"]
+mod facts_tests;

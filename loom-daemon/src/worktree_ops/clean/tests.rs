@@ -986,7 +986,7 @@ fn classify_and_cleanup_pr_worktree_treat_a_detached_head_the_same_as_a_named_br
         is_managed: &|p: &Path| is_loom_managed(p),
         pr_status: &pr_status,
         branch_reachable_from_remotes: &|_: &Path| true,
-        uncommitted: &check_uncommitted_or_untracked_changes,
+        uncommitted: &check_uncommitted_or_unproven_untracked_changes,
         now: chrono::Utc::now(),
     };
     let decision = classify_pr_worktree(&wt_path, 888, &opts, &probes);
@@ -2152,7 +2152,7 @@ fn quarantine_dirty_worktree_stashes_uncommitted_and_untracked_changes() {
     assert!(!sha.trim().is_empty());
 
     // The working tree is clean again — the dirt moved into the stash.
-    assert!(!check_uncommitted_or_untracked_changes(dir.path()));
+    assert!(!check_uncommitted_or_unproven_untracked_changes(dir.path()));
     assert_eq!(std::fs::read_to_string(dir.path().join("tracked.txt")).unwrap(), "v1");
     assert!(!dir.path().join("untracked.txt").exists());
 

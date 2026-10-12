@@ -393,6 +393,7 @@ fn gate_stash_keeps_only_open_prs_and_drains_per_root() {
         author: None,
         author_association: None,
         is_pull_request: is_pr,
+        open_sub_issues: None,
     };
     let root = Path::new("/stash-test/a");
     record_gate_listing(
@@ -424,8 +425,9 @@ fn emit_record_routes_through_the_ops_sink_as_a_pick_decision() {
 }
 
 #[test]
-fn a_queue_past_the_row_cap_keeps_its_uncapped_total() {
-    // The journal kept 200 of 250 rows; the record lists 50 and says 250.
+fn a_queue_past_the_journal_row_cap_lists_every_kept_row() {
+    // The journal kept 200 of 250 rows; the record lists all 200 and says 250.
+    // The journal's own 200-row cap is upstream of the record and unchanged.
     let rows: Vec<JournalRow> = (1..=200)
         .map(|n| qrow(n, "loom:review-requested", &[], "k"))
         .collect();
@@ -437,8 +439,9 @@ fn a_queue_past_the_row_cap_keeps_its_uncapped_total() {
         rows,
     }]);
     let r = role_record(tick("judge"), RoleTickResult::Success, obs, "o/r", &[]);
-    assert_eq!(r.candidates.len(), 50);
+    assert_eq!(r.candidates.len(), 200);
     assert_eq!(r.candidates_total, 250);
+    assert_eq!(r.skipped.len(), 200, "every kept row's decision is carried");
 }
 
 #[test]
@@ -524,5 +527,33 @@ fn work_finder_record_carries_the_workspace_draw() {
     assert!(serde_json::to_value(&plain)
         .unwrap()
         .get("workspace_draw")
+        .is_none());
+}
+
+/// #11509: the work finder's record carries the tick's `loom:very-important`
+/// flood-cap demotions, named by repo; a tick with none omits the field.
+#[test]
+fn work_finder_record_carries_the_very_important_demotions() {
+    use crate::work_finder::vi_cap::ViDemotion;
+    let demoted = [ViDemotion {
+        workspace_idx: 1,
+        number: 30,
+        holder: 20,
+    }];
+    let names = ["o/tool", "o/product"];
+    let records = vi_demotion_records(&demoted, |idx| names[idx].to_string());
+    let r = work_finder_record(&summary(Vec::new()), "h", at(), at(), resolve)
+        .with_very_important_demoted(records);
+    let json = serde_json::to_value(&r).unwrap();
+    assert_eq!(
+        json["very_important_demoted"],
+        serde_json::json!([{"repo": "o/product", "number": 30, "holder": 20}])
+    );
+    let back: PickDecisionRecord = serde_json::from_value(json).unwrap();
+    assert_eq!(back, r);
+    let plain = work_finder_record(&summary(Vec::new()), "h", at(), at(), resolve);
+    assert!(serde_json::to_value(&plain)
+        .unwrap()
+        .get("very_important_demoted")
         .is_none());
 }

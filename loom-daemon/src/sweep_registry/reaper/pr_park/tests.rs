@@ -256,7 +256,41 @@ async fn reaper_still_resumes_a_crash_when_the_linked_pr_is_not_blocked() {
         Some(1),
         "a genuine crash resume still consumes one attempt from the runway"
     );
+    // #11444: the resume records the reaper as its origin.
+    let resumed = running_issue_sweep_id(&reg, 8669).unwrap();
+    assert_eq!(
+        reg.start_facts_snapshot()[&resumed]
+            .dispatch_origin
+            .as_deref(),
+        Some("reaper_retry")
+    );
     std::env::remove_var("LOOM_REPO");
+}
+
+/// #11444: the production reaper path (`reap_once_releasing_poll_lock`,
+/// which defers the resume's poll) records `reaper_retry` too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn the_deferred_reaper_resume_records_its_origin() {
+    let tmp = tempdir().unwrap();
+    let ws = tmp.path();
+    std::env::set_var("LOOM_REPO", "rjwalters/loom");
+    let (mut reg, _gh_log) = pr_park_registry(ws, 8684, "loom:review-requested", "");
+    write_checkpoint(&reg, 8670, "doctor-done");
+    insert_dead_running_entry(&mut reg, 8670, "sweep-issue-8670-crashed");
+    let reg = Arc::new(std::sync::Mutex::new(reg));
+
+    assert!(reap_once_releasing_poll_lock(&reg) >= 1);
+    std::env::remove_var("LOOM_REPO");
+
+    let reg = reg.lock().unwrap();
+    let resumed = running_issue_sweep_id(&reg, 8670).expect("the crash was resumed");
+    assert_eq!(
+        reg.start_facts_snapshot()[&resumed]
+            .dispatch_origin
+            .as_deref(),
+        Some("reaper_retry")
+    );
 }
 
 /// Variable isolation for the pair above: the PR's park label alone decides.

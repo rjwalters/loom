@@ -9,8 +9,14 @@
 //! delivered by the fleet-alert state machine and sinks (the event bus).
 
 use super::Condition;
-use crate::star_liveness::queue::waiting_star;
-use crate::types::{CapLimiter, WorkFinderTickSummary};
+use crate::types::{CapLimiter, ReadyQueueRow, WorkFinderTickSummary};
+
+/// Whether `r` is a starred issue waiting on a capacity-style gate. (Moved
+/// here from the removed star-liveness subsystem, #11104; the starred-row
+/// reader itself is #11510's to retire.)
+fn waiting_star(r: &ReadyQueueRow) -> bool {
+    r.operator_priority && r.disposition.state() == "ready"
+}
 
 /// Condition key: disk or RAM headroom holds the cap below `maxConcurrent`.
 pub const KEY_CAPACITY_LIMITED: &str = "capacity-limited";
@@ -58,13 +64,9 @@ pub fn conditions(tick: &WorkFinderTickSummary) -> Vec<Condition> {
     }
 
     if waiting > STAR_BACKLOG_FACTOR.saturating_mul(effective.max(1)) {
-        let oldest = stars.first().map_or_else(String::new, |r| {
-            let at = r
-                .operator_priority_at
-                .as_deref()
-                .map_or_else(String::new, |t| format!(", starred {t}"));
-            format!(" The oldest is #{} in {}{at}.", r.issue, r.repo)
-        });
+        let oldest = stars
+            .first()
+            .map_or_else(String::new, |r| format!(" The oldest is #{} in {}.", r.issue, r.repo));
         let rounds = waiting.div_ceil(effective.max(1));
         out.push(Condition {
             key: KEY_STAR_BACKLOG.to_string(),

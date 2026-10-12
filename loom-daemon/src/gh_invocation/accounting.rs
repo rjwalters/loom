@@ -273,10 +273,13 @@ pub(super) fn record(
         // become the host's `other` budget reading (a zero there would read
         // as a host-wide `rate_limit_quota` stall). `parse_probe` books the
         // probe's readings into the bucket book on its own path.
-        (pool, classified, Some(&resp.ratelimit).filter(|_| !probe))
+        (pool, classified, (!probe).then_some(&resp.ratelimit))
     } else {
         let classified = match outcome {
             InvokeOutcome::Ok => Outcome::Ok,
+            InvokeOutcome::ExitNonzero if forge_call_stats::is_secondary_limit(None, stderr) => {
+                Outcome::SecondaryLimited
+            }
             InvokeOutcome::ExitNonzero
                 if crate::rate_limit_breaker::indicates_rate_limit(stderr) =>
             {
@@ -426,6 +429,7 @@ fn record_metric(
             Outcome::Ok => CallOutcome::Ok,
             Outcome::NotModified => CallOutcome::NotModified,
             Outcome::RateLimited => CallOutcome::RateLimited,
+            Outcome::SecondaryLimited => CallOutcome::SecondaryLimited,
             Outcome::Error => CallOutcome::Error,
             Outcome::Shed => CallOutcome::Shed,
         },

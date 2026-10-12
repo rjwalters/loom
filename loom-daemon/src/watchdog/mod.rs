@@ -63,6 +63,7 @@ pub mod heartbeat;
 pub mod liveness;
 pub mod load_avg;
 pub mod locate;
+pub mod loom_ui;
 pub mod marker;
 pub mod peer_coord;
 pub mod probe;
@@ -669,6 +670,9 @@ fn escalation_note(
     reason: &str,
     recovery_detail: Option<&str>,
 ) -> String {
+    // #11295: loom-ui records the outage whether or not an issue is filed.
+    let detail = format!("{reason}. Observed: {}. Log: {}", snap.detail, paths.log.display());
+    loom_ui::daemon_down(&state.escalation_sentinel, &escalate::hostname(), &detail);
     match escalate::decide(&state.escalation_sentinel) {
         escalate::Decision::AlreadyEscalated => format!(
             " This outage has ALREADY been escalated out-of-band (sentinel {}).",
@@ -1108,6 +1112,9 @@ fn peer_coordination(
         return;
     };
 
+    let degraded = health.verdict == peer_coord::Verdict::Degraded;
+    let host = escalate::hostname();
+    loom_ui::peer_coord(&state.peer_coord_sentinel, degraded, &host, &health.summary); // #11295
     match health.verdict {
         peer_coord::Verdict::Degraded => {
             let note = if state.peer_coord_sentinel.exists() {

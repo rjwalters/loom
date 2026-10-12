@@ -13,8 +13,9 @@ fn facts() -> SweepStartFacts {
         model_source: Some("explicit".to_string()),
         runtime: Some("codex".to_string()),
         attempt_index: Some(2),
-        trigger: Some("retry_after_env_failure".to_string()),
+        trigger: Some("operator_redispatch".to_string()),
         previous_sweep_id: Some("sweep-issue-4858-prior".to_string()),
+        dispatch_origin: Some("operator".to_string()),
     }
 }
 
@@ -64,6 +65,8 @@ fn sweep_started_exports_its_facts_as_the_native_record_and_the_outcome_do() {
     outcome.attempt_index = facts.attempt_index;
     outcome.trigger = facts.trigger;
     outcome.previous_sweep_id = facts.previous_sweep_id;
+    // #11444: the outcome carries the start's origin, so the two agree.
+    outcome.dispatch_origin = facts.dispatch_origin;
     let outcome = attributes(&envelope("host-a", TelemetryRecord::SweepOutcome(outcome)));
     for key in SWEEP_START_FACT_LOG_ATTRIBUTE_KEYS
         .iter()

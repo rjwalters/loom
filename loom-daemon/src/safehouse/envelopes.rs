@@ -200,8 +200,8 @@ pub fn event_to_envelope(event: &Event) -> Option<Envelope> {
 }
 
 /// Render an `operator_priority.escalation` event as a room message (#9321):
-/// the Matrix half of a starred issue's operator ask, whose forge-comment half
-/// [`crate::star_liveness::escalate`] already posted.
+/// an operator ask (today: a `fleet_alert` host condition, #10164; the
+/// star-liveness publisher was removed by #11104).
 ///
 /// `operator_mention` is `safehouse.operatorMention` — prepended to the
 /// escalation line so the room notifies a human. It is deliberately **not**
@@ -225,10 +225,8 @@ pub fn event_to_envelope(event: &Event) -> Option<Envelope> {
 /// body, and the structured facts stay on the bus event for any other consumer.
 ///
 /// **Dedupe is upstream, not here.** This function is a pure relay: fed the
-/// same event twice it renders two envelopes. The once-per-cause property comes
-/// from the publisher, which only emits on the pass that actually posts the
-/// forge comment carrying that key's marker — see
-/// [`crate::star_liveness::escalate`]'s module docs.
+/// same event twice it renders two envelopes. The once-per-cause property is
+/// the publisher's (the fleet-alert state machine).
 #[must_use]
 pub fn operator_priority_envelope(
     event: &Event,
@@ -321,7 +319,7 @@ mod tests {
         SafehouseConfig,
     };
 
-    /// One escalation event, as `star_liveness` publishes it.
+    /// One escalation event, in the shape the bus carries.
     fn escalation_event(resolved: bool) -> Event {
         Event::OperatorPriorityEscalation {
             slug: "rjwalters/loom".to_owned(),
@@ -459,22 +457,12 @@ mod tests {
         .is_none());
     }
 
-    /// End-to-end over the fake `safehoused` peer (#9321): the **real**
-    /// star-liveness pass publishes, the **real** sink relays, and the stub
-    /// server counts the Matrix sends.
-    ///
-    /// This is the composition the acceptance criteria are about — one post per
-    /// `<kind>:<specifics>` dedupe key fleet-wide, none for an unstarred issue, no
-    /// repeat across ticks/hosts/restarts, and one recovery post when the ask
-    /// clears. The dedupe itself is asserted on the publisher side
-    /// (`star_liveness::tests::notice_tests`); what this proves is that the two
-    /// halves actually compose over the wire, with nothing in the sink
-    /// duplicating or swallowing an ask.
+    /// End-to-end over the fake `safehoused` peer (#9321): an ask and its
+    /// recovery published on the bus reach the room as exactly two sends, the
+    /// ask pinging the operator and the recovery not.
     #[tokio::test]
     #[serial]
-    async fn run_sink_relays_one_escalation_and_one_recovery_for_a_starred_issue() {
-        use crate::star_liveness::tests::fake::{issue, pr, repo_input, t, Host, World, STAR};
-
+    async fn run_sink_relays_one_escalation_and_one_recovery() {
         let dir = tempfile::tempdir().unwrap();
         let _safehouse_test_paths = SafehouseTestPaths::set(dir.path());
         let socket = dir.path().join("safehoused.sock");
@@ -500,47 +488,8 @@ mod tests {
             None,
         ));
 
-        // A starred issue whose approved PR is held by Champion's merge-risk
-        // hold, plus an unstarred issue in exactly the same state.
-        let world = World::default();
-        world.add("o/r", issue(1, &[STAR, "loom:building"]));
-        world.add("o/r", pr(2, 1, &["loom:pr", "loom:operator"]));
-        world.add("o/r", issue(3, &["loom:building"]));
-        world.add("o/r", pr(4, 3, &["loom:pr", "loom:operator"]));
-        let repos = vec![repo_input("o/r")];
-
-        let mut host = Host::new("host-a");
-        // Three ticks with the hold in place.
-        for minute in [0, 2, 4] {
-            host.pass(&world, &repos, Vec::new(), t(10, minute));
-        }
-        // A peer host, and a restarted daemon (a fresh ledger against the same
-        // forge): both find the marker the first pass posted.
-        let mut peer = Host::new("host-b");
-        peer.pass(&world, &repos, Vec::new(), t(10, 5));
-        let mut restarted = Host::new("host-a");
-        restarted.pass(&world, &repos, Vec::new(), t(10, 6));
-        // Champion's hold comes off: the instance that announced the ask — the
-        // only one that knows it announced — narrates the recovery.
-        world.repo("o/r").items.get_mut(&2).unwrap().labels = vec!["loom:pr".into()];
-        host.pass(&world, &repos, Vec::new(), t(10, 8));
-
-        assert!(peer.notices.is_empty(), "no repeat on a second host");
-        assert!(restarted.notices.is_empty(), "no repeat across a restart");
-        assert_eq!(
-            host.notices.len(),
-            2,
-            "one escalation + one recovery for the starred issue, nothing for #3: {:?}",
-            host.notices
-        );
-        for event in host
-            .events()
-            .into_iter()
-            .chain(peer.events())
-            .chain(restarted.events())
-        {
-            bus.publish(event).unwrap();
-        }
+        bus.publish(escalation_event(false)).unwrap();
+        bus.publish(escalation_event(true)).unwrap();
 
         let received = tokio::time::timeout(Duration::from_secs(2), server)
             .await
@@ -552,13 +501,12 @@ mod tests {
         assert_eq!(received.len(), 2);
         let ask = received[0]["body"].as_str().unwrap();
         assert!(ask.starts_with("@operator:example.org: "), "got {ask:?}");
-        assert!(ask.contains("r#1 · OPERATOR NEEDED · merge-risk-hold"), "got {ask:?}");
-        assert!(ask.contains("https://github.com/o/r/issues/1"), "got {ask:?}");
-        assert!(!ask.contains("#3"), "the unstarred issue is never narrated: {ask:?}");
+        assert!(ask.contains("loom#9268 · OPERATOR NEEDED · merge-refused"), "got {ask:?}");
+        assert!(ask.contains("https://github.com/rjwalters/loom/issues/9268"), "got {ask:?}");
         assert_eq!(received[0]["type"], json!("handoff"));
 
         let done = received[1]["body"].as_str().unwrap();
-        assert!(done.contains("r#1 · operator ask resolved ✓"), "got {done:?}");
+        assert!(done.contains("loom#9268 · operator ask resolved ✓"), "got {done:?}");
         assert!(!done.contains("@operator:example.org"), "a recovery does not re-ping: {done:?}");
     }
 }

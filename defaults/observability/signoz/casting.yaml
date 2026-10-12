@@ -9,17 +9,19 @@ spec:
     mode: docker
   signoz:
     spec:
-      version: v0.142.1
-      image: signoz/signoz:v0.142.1@sha256:49501b04d77a1e8328d31519c977dd4503b724c74425764a3ab83768db3ee8ff
+      version: v0.143.0
+      image: signoz/signoz:v0.143.0@sha256:7da6b9c07db100cfcf7949966211b16543e3d6828df31f0f7a24110d734a811c
       env:
         SIGNOZ_ANALYTICS_ENABLED: "false"
         SIGNOZ_TOKENIZER_JWT_SECRET: "${SIGNOZ_TOKENIZER_JWT_SECRET:?set a private random session-signing secret}"
+        # v0.143.0 made opaque sessions the default; keep JWT sessions.
+        SIGNOZ_TOKENIZER_PROVIDER: jwt
         # SigNoz escapes literal underscores in configuration keys with "__".
         SIGNOZ_PROMETHEUS_ACTIVE__QUERY__TRACKER_PATH: /tmp/signoz-active-queries
   ingester:
     spec:
-      version: v0.144.10
-      image: signoz/signoz-otel-collector:v0.144.10@sha256:34ecb436b687cc23bef5f706904cdf005998ca4ebe543653a634055a9fe204f6
+      version: v0.144.12
+      image: signoz/signoz-otel-collector:v0.144.12@sha256:deb566a7a3c0ba544ee58ccc92ee1f0e6da827bc40383e52f3c824705e100a3d
       config:
         data:
           opamp.yaml: |
