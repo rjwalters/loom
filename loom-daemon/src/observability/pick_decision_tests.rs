@@ -425,8 +425,9 @@ fn emit_record_routes_through_the_ops_sink_as_a_pick_decision() {
 }
 
 #[test]
-fn a_queue_past_the_row_cap_keeps_its_uncapped_total() {
-    // The journal kept 200 of 250 rows; the record lists 50 and says 250.
+fn a_queue_past_the_journal_row_cap_lists_every_kept_row() {
+    // The journal kept 200 of 250 rows; the record lists all 200 and says 250.
+    // The journal's own 200-row cap is upstream of the record and unchanged.
     let rows: Vec<JournalRow> = (1..=200)
         .map(|n| qrow(n, "loom:review-requested", &[], "k"))
         .collect();
@@ -438,8 +439,9 @@ fn a_queue_past_the_row_cap_keeps_its_uncapped_total() {
         rows,
     }]);
     let r = role_record(tick("judge"), RoleTickResult::Success, obs, "o/r", &[]);
-    assert_eq!(r.candidates.len(), 50);
+    assert_eq!(r.candidates.len(), 200);
     assert_eq!(r.candidates_total, 250);
+    assert_eq!(r.skipped.len(), 200, "every kept row's decision is carried");
 }
 
 #[test]
