@@ -184,9 +184,9 @@ pub mod session_output;
 
 /// `fleet.state` (#10196) — in-flight items and open-PR census over OTLP.
 pub mod fleet_state;
+pub mod issue_estimate;
 /// `token_ranking.refresh` (#10744) — one token-ranking refresh round.
 pub mod token_ranking_refresh;
-pub mod issue_estimate;
 
 /// The export-coverage pair `(exporters, exported_kinds)` for `host.health`
 /// (Issue #10196), derived from the per-exporter status map

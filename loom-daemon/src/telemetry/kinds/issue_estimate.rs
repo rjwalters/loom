@@ -44,23 +44,32 @@ pub fn parse(body: &str) -> anyhow::Result<Option<Estimate>> {
             }
             continue;
         }
-        if fence.is_some() || line.starts_with("    ") || line.starts_with('\t')
-            || !text.starts_with("<!-- loom:estimate") {
+        if fence.is_some()
+            || line.starts_with("    ")
+            || line.starts_with('\t')
+            || !text.starts_with("<!-- loom:estimate")
+        {
             continue;
         }
         anyhow::ensure!(result.is_none(), "duplicate concrete estimate marker");
-        let fields = text.strip_prefix("<!-- loom:estimate ")
+        let fields = text
+            .strip_prefix("<!-- loom:estimate ")
             .and_then(|s| s.strip_suffix(" -->"))
             .ok_or_else(|| anyhow::anyhow!("malformed estimate marker"))?;
         let mut values = std::collections::BTreeMap::new();
         for field in fields.split_whitespace() {
-            let (key, value) = field.split_once('=')
+            let (key, value) = field
+                .split_once('=')
                 .ok_or_else(|| anyhow::anyhow!("malformed estimate field"))?;
             anyhow::ensure!(values.insert(key, value).is_none(), "duplicate estimate field");
         }
         anyhow::ensure!(values.len() == 4, "estimate requires four fields");
-        let get = |key| values.get(key).copied()
-            .ok_or_else(|| anyhow::anyhow!("missing estimate field: {key}"));
+        let get = |key| {
+            values
+                .get(key)
+                .copied()
+                .ok_or_else(|| anyhow::anyhow!("missing estimate field: {key}"))
+        };
         let estimate = Estimate {
             difficulty: get("difficulty")?.parse()?,
             lines: get("lines")?.parse()?,
@@ -68,8 +77,10 @@ pub fn parse(body: &str) -> anyhow::Result<Option<Estimate>> {
             doctor_risk: get("doctor_risk")?.parse()?,
         };
         anyhow::ensure!((1..=5).contains(&estimate.difficulty), "difficulty outside 1..5");
-        anyhow::ensure!(estimate.doctor_risk.is_finite()
-            && (0.0..=1.0).contains(&estimate.doctor_risk), "risk outside 0..1");
+        anyhow::ensure!(
+            estimate.doctor_risk.is_finite() && (0.0..=1.0).contains(&estimate.doctor_risk),
+            "risk outside 0..1"
+        );
         result = Some(estimate);
     }
     Ok(result)
@@ -84,17 +95,26 @@ mod tests {
     #[test]
     fn concrete_only_and_historical_absence() {
         assert_eq!(parse("historical issue").unwrap(), None);
-        assert_eq!(parse(&format!("`{MARKER}`\n```html\n{MARKER}\n```\n    {MARKER}")).unwrap(), None);
+        assert_eq!(
+            parse(&format!("`{MARKER}`\n```html\n{MARKER}\n```\n    {MARKER}")).unwrap(),
+            None
+        );
         assert_eq!(parse(MARKER).unwrap().unwrap().lines, 400);
         assert!(parse(&format!("{MARKER}\n{MARKER}")).is_err());
     }
 
     #[test]
     fn invalid_values_are_rejected() {
-        for (before, after) in [("difficulty=3", "difficulty=0"), ("difficulty=3", "difficulty=6"),
-            ("lines=400", "lines=-1"), ("files=4", "files=1.5"),
-            ("doctor_risk=0.2", "doctor_risk=NaN"), ("doctor_risk=0.2", "doctor_risk=inf"),
-            ("doctor_risk=0.2", "doctor_risk=-0.1"), ("doctor_risk=0.2", "doctor_risk=1.1")] {
+        for (before, after) in [
+            ("difficulty=3", "difficulty=0"),
+            ("difficulty=3", "difficulty=6"),
+            ("lines=400", "lines=-1"),
+            ("files=4", "files=1.5"),
+            ("doctor_risk=0.2", "doctor_risk=NaN"),
+            ("doctor_risk=0.2", "doctor_risk=inf"),
+            ("doctor_risk=0.2", "doctor_risk=-0.1"),
+            ("doctor_risk=0.2", "doctor_risk=1.1"),
+        ] {
             assert!(parse(&MARKER.replace(before, after)).is_err(), "{after}");
         }
     }

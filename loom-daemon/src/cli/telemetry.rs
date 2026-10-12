@@ -28,10 +28,10 @@ use anyhow::Result;
 
 use loom_daemon::script_helpers;
 
-#[path = "live_output_attend.rs"]
-mod live_output_attend;
 #[path = "curation_complete.rs"]
 mod curation_complete;
+#[path = "live_output_attend.rs"]
+mod live_output_attend;
 #[path = "record_rework.rs"]
 mod record_rework;
 #[path = "telemetry_export.rs"]
