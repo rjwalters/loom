@@ -188,7 +188,7 @@ fn the_clean_sentinel_matches_the_string_merge_pr_sh_checks_for() {
 fn a_sequencing_hold_alone_is_the_retryable_kind() {
     // #11330: the ordering hold is re-queued (exit 7), never a failure.
     assert!(sequenced_hold_only("loom:pr\nloom:sequenced"));
-    assert!(sequenced_hold_only("loom:sequenced\nloom:operator-priority\nloom:pr"));
+    assert!(sequenced_hold_only("loom:sequenced\nloom:important\nloom:pr"));
     // Nothing to hold without an approval, and nothing sequenced to hold on.
     assert!(!sequenced_hold_only("loom:sequenced"));
     assert!(!sequenced_hold_only("loom:pr"));
