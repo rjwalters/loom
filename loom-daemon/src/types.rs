@@ -1937,7 +1937,9 @@ pub use dispatch_plan::{
 mod fleet_plan;
 pub use fleet_plan::{FleetPlan, FleetPlanItem, FleetPlanObservation, HostPlan, HostPlanRow};
 pub(crate) mod work_finder_tick;
-pub use work_finder_tick::{CapLimiter, CapView, CapacityWait, WorkFinderTickSummary};
+pub use work_finder_tick::{
+    CapLimiter, CapView, CapacityWait, RepoLimitView, WorkFinderTickSummary,
+};
 
 /// One role-runner tick outcome for one `(root, role)` pair (Issue #4761).
 ///

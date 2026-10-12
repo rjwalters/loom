@@ -2570,7 +2570,7 @@ its absence from the tick.
 anchor is at least 300 s old (`ANCHOR_INTERVAL_SECS`) or the planner stamps
 changed (a regime boundary). A lost delta therefore leaves a reader's
 reconstruction wrong for at most about 5 minutes. Between anchors a pass sends a **delta** (`anchor: false`) only if
-rows, a census, a repo's `ready_complete`, `main_ci` or `halt`, or the plan slots changed. A delta holds the added or changed
+rows, a census, a repo's `ready_complete`, `main_ci`, `halt` or dispatch limits (`in_flight`, `cap`, `deferred_repo_cap`), or the plan slots changed. A delta holds the added or changed
 rows, the issues that left (`removed`), and the **full** census of each repo it
 names. **Ready replacement:** a repo with `ready_complete: false` is sent with `ready_replace: true`. Its `ready_wait` rows are not
 diffed: every record that names it carries the repo's **entire** observed
@@ -2588,7 +2588,7 @@ would exceed ~1 MB (`CHUNK_BYTES`, a quarter of the ~4 MB OTLP/gRPC message
 limit) is split into several log records that share `as_of` and every header
 field, numbered `chunk_index` `0..chunk_count`; rows and `removed` entries are
 packed in order, and a repo that spans chunks repeats its `repo`,
-`visibility`, `main_ci`, `halt`, `census`, `ready_complete` and `ready_replace` in each. A ~3000-row queue (~100-180 bytes a row) is
+`visibility`, `main_ci`, `halt`, `in_flight`, `cap`, `deferred_repo_cap`, `census`, `ready_complete` and `ready_replace` in each. A ~3000-row queue (~100-180 bytes a row) is
 one record with `chunk_count: 1`. A reader uses a record only once it holds
 all `chunk_count` chunks of that `(host, as_of)`.
 
@@ -2623,6 +2623,7 @@ Each `repos[]` entry:
 | `census` | object, optional | `{open, by_stage?}`: distinct open PRs under a Loom review label, with `by_stage` keys `review_wait` / `doctor` / `merge_wait` / `merge_hold` / `held` (labels that name no single stage). **Absent means unknown** (listing incomplete or not read), never zero. Open PRs with no review label are not counted |
 | `main_ci` | `green` / `red` / `unknown`, optional | this repo's `main` CI status from the host's main-health gate: `red` = a verified-red run halted dispatch, `green` = the gate completed a green run for this repo, `unknown` = the gate holds no verdict for it: the gate is not enabled for the repo (`autonomous.mainHealthGate.enabled` is off by default, or the repo has no usable `buildGate` block), it has not completed a run since the daemon started, or its last tick could not evaluate. `unknown` is therefore not a statement about CI; a host that does not run the gate reports `unknown` for every repo (#11565). Per repo, never per host. Additive on `fleet-state/v1`; absent from older emitters. A change is a delta naming the repo |
 | `halt` | object, optional | this host's work finder holds the **whole repo** (#11564): `{reason, since, since_lower_bound?}`, present **exactly** when its last tick held the repo, whether or not the repo has ready rows. See [Repo halts and eligible-at](#repo-halts-and-eligible-at). Additive on `fleet-state/v1`; absent from older emitters and on every repo before the host's first work-finder tick |
+| `in_flight`, `cap`, `deferred_repo_cap` | integer, integer or `null`, integer; optional | this host's per-repo dispatch limits from the work finder's last tick (#11606); see [Repo dispatch limits](#repo-dispatch-limits). All three are present together or all absent. Additive on `fleet-state/v1`; absent from older emitters and for a repo the tick did not cover |
 | `ready_complete` | bool | `true` when the work finder's last tick walked this repo's ready listing to its last page (#11139), so its `ready_wait` rows are the whole queue. `false` when the walk fell short (a later page failed, the page cap, a mid-walk change), and on emitters before #11139, which listed one page per label. A reader must not treat a `false` repo's `ready_wait` rows as its whole queue. Always sent; missing (an older emitter) decodes to `false` |
 | `ready_replace` | bool, optional | `true` exactly when `ready_complete` is `false`: `rows` carries the repo's **entire** observed `ready_wait` set, and a reader replaces the repo's `ready_wait` rows with it (drop them all, then apply `removed` and `rows`). Removals of `ready_wait` rows are never sent in `removed` for such a repo, and a reader never infers one from absence otherwise. Absent (`false`, or an older emitter): plain diffing |
 | `rows[]` | array, optional | anchor: every row; delta: added or changed rows. Ordered by issue |
@@ -2692,6 +2693,40 @@ failed during the tick itself gets its window's end on the next tick.
 **No caps.** Both are carried on every halted repo and every held
 `ready_wait` row the tick saw (all of them, not `queue.snapshot`'s 200), and a
 large record is chunked, never truncated.
+
+#### Repo dispatch limits
+
+Facts for an ETA reader (#11606): starred work waits longest in the repos
+the work finder defers for `maxConcurrentPerRepo`, so a reader needs each
+repo's occupancy, its cap and how many of its candidates the tick deferred.
+They are the work finder's own values from its last tick (`RepoCap`, the
+state pass 2 gated on, and the tick's `deferred_repo_cap` rows), read from the
+published tick summary: no forge call and no second config read. The daemon
+emits the facts; it computes no estimate.
+
+| Field | Meaning |
+|---|---|
+| `in_flight` | **Host-local.** The repo's `WorkDispatcher::occupancy` count when the tick finished: the same per-repo number the cap compares against (registry sweeps for the repo, including PR-set sweeps, minus a sweep whose startup was never proven), plus the sweeps that tick admitted. A sweep another host runs is not counted. It is not derived from `ready_wait` rows or the review census. It is the whole count; no phase split is sent (the `sweep.*` rows give the phase of each held issue) |
+| `cap` | The resolved `autonomous.workFinder.maxConcurrentPerRepo` the tick ran under (env over config). Three states: a number = capped; `null` = **uncapped, observed**; field absent = **unknown**. It is a fleet-wide setting resolved per tick, so every repo of one tick shows the same value; it changes when the operator changes the setting. The per-repo RAM and disk budgets are not part of it: a candidate those hold back is counted as `deferred_capacity` (host capacity), not here |
+| `deferred_repo_cap` | Candidates of this repo that tick deferred because the repo was at its `cap` (the repo's `deferred_repo_cap` rows). `0` is a measured result; absent is unknown. It is never carried over from an earlier tick |
+
+**Null versus unknown.** A reader must not read an absent `in_flight`, `cap` or
+`deferred_repo_cap` as `0` or as "uncapped": absence means this host's last
+tick did not cover the repo (no tick yet, a single-workspace tick, an older
+emitter, or a root that does not resolve to a slug). Only `cap: null` says
+the repo was uncapped.
+
+**Delta rule.** A change in any of the three is a delta naming the repo, even
+when no row changed (a slot-only change has an empty `rows`). Every record that
+names a repo carries its current limits, a repo split across chunks repeats
+them, and an anchor lists every repo the tick covered, rows or not.
+
+**Role capacities** (Judge, Doctor) are host-wide limits of the role runner,
+not per-repo, so they stay on the host `capacity` block and are never copied
+into each repo.
+
+**No caps.** Every repo of the tick has an entry: `repos[]` is never capped or
+truncated, and a large record is chunked.
 
 Log attributes besides `loom.kind` and `loom.record_id`
 (`FLEET_STATE_LOG_ATTRIBUTE_KEYS`, kept by the collector's `transform/privacy`

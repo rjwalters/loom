@@ -153,6 +153,7 @@ fn out_of_slice_rows_follow_the_plan_with_shaping_inputs() {
         repo_cap: Some(RepoCapSnapshot {
             cap: Some(2),
             occupancy: vec![0, 1],
+            occupancy_end: Vec::new(),
         }),
         max_admissions_per_tick: Some(1),
         ..TickReport::default()

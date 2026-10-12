@@ -2063,6 +2063,7 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
 
     report.halted = any_halted;
     report.occupancy = Some(occupancy);
+    cap.finish(&mut report); // #11606
     report.overflow_free = Some(overflow.is_free());
     // Sum the cumulative cross-host collision totals across every workspace's
     // dispatcher (#4085), read after pass 2 so this tick's collisions count.
