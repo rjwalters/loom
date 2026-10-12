@@ -23,10 +23,24 @@
 //! A path that matches nothing must never be vouched for (`git diff --quiet
 //! <ref> -- <nothing>` exits 0), so each path must first exist in `HEAD`,
 //! which is also exactly what the `checkout HEAD --` discard needs.
+//!
+//! # The filesystem is checked too, without following symlinks
+//!
+//! Git's tracked diff cannot see what is on disk where a tracked path used to
+//! be. A tracked file deleted locally and upstream, with a directory of
+//! untracked or ignored files now in its place, diffs as "deleted" and so
+//! looks identical to origin; `checkout HEAD -- <path>` would then remove that
+//! whole directory. Likewise an untracked file sitting on a path that was
+//! `git rm --cached` is invisible to `git diff <ref>`, and the discard would
+//! overwrite it. So [`worktree_entry_is_restorable`] (an `lstat` walk) and an
+//! index-entry probe fail closed on anything but an absent path or a tracked
+//! regular file or symlink under real directories.
 
 /// The global option that makes every pathspec literal. Goes before the
 /// subcommand.
 pub const LITERAL_PATHSPECS: &str = "--literal-pathspecs";
+
+use std::path::{Component, Path};
 
 /// `git <STATUS_ARGS>`: the tracked changes, NUL-separated and unquoted, for
 /// [`tracked_paths_from_porcelain_z`]. Takes no optional lock.
@@ -120,8 +134,15 @@ pub fn discard_args(paths: &[String]) -> Vec<&str> {
 ///    work that `checkout HEAD --` would discard, so it is not vouched for.
 /// 4. **Literal pathspecs, conjunctive, plain `--quiet`, no rename
 ///    detection.** One mismatch answers `None`; a mode-only difference
-///    counts as non-identical.
+///    (including file <-> symlink) counts as non-identical.
+/// 5. **The filesystem (#11558 P1).** `worktree` is the checkout's root. On
+///    disk each path must be absent ([`worktree_entry_is_restorable`]), or a
+///    regular file or symlink that is in the index, so the tree diff in (3)
+///    actually saw it. A directory, any other type, a symlinked or
+///    non-directory parent: not identical. `HEAD`'s entry must be a blob
+///    (file or symlink), never a tree or gitlink.
 pub fn all_dirty_tracked_identical_to_origin(
+    worktree: &Path,
     origin_ref: &str,
     paths: Vec<String>,
     mut git_ok: impl FnMut(&[&str]) -> bool,
@@ -134,13 +155,70 @@ pub fn all_dirty_tracked_identical_to_origin(
     }
     let lit = LITERAL_PATHSPECS;
     let identical = paths.iter().all(|p| {
-        !p.is_empty()
-            && git_ok(&["cat-file", "-e", &format!("HEAD:{p}")])
+        let Some(on_disk) = worktree_entry_is_restorable(worktree, p) else {
+            return false;
+        };
+        // `cat-file blob` fails for a tree or a gitlink; `:0:<p>` is an exact
+        // index lookup (revision syntax, never a pathspec).
+        git_ok(&["cat-file", "blob", &format!("HEAD:{p}")])
+            && (on_disk == OnDisk::Absent || git_ok(&["cat-file", "-e", &format!(":0:{p}")]))
             && git_ok(&[lit, "diff", "--quiet", origin_ref, "--", p])
             && (git_ok(&[lit, "diff", "--cached", "--quiet", origin_ref, "--", p])
                 || git_ok(&[lit, "diff", "--cached", "--quiet", "HEAD", "--", p]))
     });
     identical.then_some(paths)
+}
+
+/// What [`worktree_entry_is_restorable`] found at a path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnDisk {
+    /// Nothing there (a deletion): the discard creates, never removes.
+    Absent,
+    /// A regular file or a symlink (the link itself, never its target).
+    FileOrSymlink,
+}
+
+/// `lstat` walk of `rel` under `worktree`, never following a symlink:
+/// `Some(kind)` only when `checkout HEAD -- <rel>` can touch nothing but the
+/// one entry git's diff already compared.
+///
+/// Every existing parent component must be a real directory (not a symlink,
+/// not a file); the first absent component makes the whole path absent. The
+/// final component must be absent, a regular file or a symlink. A directory
+/// (the #11558 P1: untracked or ignored files where a deleted file was), any
+/// other type, an unreadable entry, or a path that is not a plain relative
+/// one (`..`, `.`, absolute, empty) answers `None`.
+///
+/// A symlink, dangling or not, is accepted here: the discard replaces the
+/// link itself, and its target text is what the tree diff compared.
+pub fn worktree_entry_is_restorable(worktree: &Path, rel: &str) -> Option<OnDisk> {
+    let comps: Vec<Component> = Path::new(rel).components().collect();
+    if rel.is_empty() || rel.ends_with('/') || comps.is_empty() {
+        return None;
+    }
+    let mut cur = worktree.to_path_buf();
+    for (i, comp) in comps.iter().enumerate() {
+        let Component::Normal(name) = comp else {
+            return None;
+        };
+        cur.push(name);
+        let meta = match std::fs::symlink_metadata(&cur) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(OnDisk::Absent),
+            Err(_) => return None,
+        };
+        let ft = meta.file_type();
+        if i + 1 < comps.len() {
+            if !ft.is_dir() {
+                return None;
+            }
+        } else if ft.is_file() || ft.is_symlink() {
+            return Some(OnDisk::FileOrSymlink);
+        } else {
+            return None;
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -183,10 +261,15 @@ mod tests {
     #[test]
     fn no_dirty_paths_is_never_identical() {
         let mut calls = 0;
-        let got = all_dirty_tracked_identical_to_origin("origin/main", Vec::new(), |_| {
-            calls += 1;
-            true
-        });
+        let got = all_dirty_tracked_identical_to_origin(
+            Path::new("/nonexistent-11558"),
+            "origin/main",
+            Vec::new(),
+            |_| {
+                calls += 1;
+                true
+            },
+        );
         assert_eq!(got, None);
         assert_eq!(calls, 0);
     }
@@ -194,17 +277,30 @@ mod tests {
     #[test]
     fn a_failing_runner_fails_closed() {
         let paths = vec!["a".to_string()];
-        assert_eq!(all_dirty_tracked_identical_to_origin("origin/main", paths, |_| false), None);
+        assert_eq!(
+            all_dirty_tracked_identical_to_origin(
+                Path::new("/nonexistent-11558"),
+                "origin/main",
+                paths,
+                |_| { false }
+            ),
+            None
+        );
     }
 
     #[test]
     fn every_path_probe_is_literal() {
         let paths = vec!["a[1].txt".to_string()];
         let mut seen = Vec::new();
-        all_dirty_tracked_identical_to_origin("origin/main", paths, |a| {
-            seen.push(a.iter().map(|s| s.to_string()).collect::<Vec<_>>());
-            true
-        });
+        all_dirty_tracked_identical_to_origin(
+            Path::new("/nonexistent-11558"),
+            "origin/main",
+            paths,
+            |a| {
+                seen.push(a.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+                true
+            },
+        );
         for argv in seen.iter().filter(|a| a.contains(&"a[1].txt".to_string())) {
             assert_eq!(argv[0], LITERAL_PATHSPECS, "{argv:?}");
         }
@@ -215,9 +311,12 @@ mod tests {
     fn index_may_match_head_instead_of_origin() {
         let paths = vec!["a".to_string()];
         // Everything succeeds except the index-vs-origin probe.
-        let got = all_dirty_tracked_identical_to_origin("origin/main", paths, |a| {
-            !(a.contains(&"--cached") && a.contains(&"origin/main"))
-        });
+        let got = all_dirty_tracked_identical_to_origin(
+            Path::new("/nonexistent-11558"),
+            "origin/main",
+            paths,
+            |a| !(a.contains(&"--cached") && a.contains(&"origin/main")),
+        );
         assert_eq!(got, Some(vec!["a".to_string()]));
     }
 
@@ -265,7 +364,7 @@ mod tests {
     }
 
     fn check(d: &Path, paths: Vec<String>) -> Option<Vec<String>> {
-        all_dirty_tracked_identical_to_origin("refs/remotes/origin/main", paths, |a| {
+        all_dirty_tracked_identical_to_origin(d, "refs/remotes/origin/main", paths, |a| {
             git_out(d, a).status.success()
         })
     }
@@ -322,5 +421,42 @@ mod tests {
         let paths = dirty(d);
         assert_eq!(paths, vec!["moved.txt".to_string(), "r.txt".to_string()]);
         assert_eq!(check(d, paths), None, "moved.txt is not in HEAD");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_ff_identical_worktree_entry_lstat_walk_fails_closed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let d = tmp.path();
+        fs::create_dir_all(d.join("dir/sub")).unwrap();
+        fs::write(d.join("file"), "x").unwrap();
+        fs::write(d.join("dir/f"), "x").unwrap();
+        std::os::unix::fs::symlink("dir", d.join("link")).unwrap();
+        std::os::unix::fs::symlink("nowhere", d.join("dangling")).unwrap();
+        let at = |p: &str| worktree_entry_is_restorable(d, p);
+
+        assert_eq!(at("gone"), Some(OnDisk::Absent));
+        assert_eq!(at("gone/deeper"), Some(OnDisk::Absent));
+        assert_eq!(at("file"), Some(OnDisk::FileOrSymlink));
+        assert_eq!(at("dir/f"), Some(OnDisk::FileOrSymlink));
+        assert_eq!(at("dangling"), Some(OnDisk::FileOrSymlink), "the link itself");
+        assert_eq!(at("dir"), None, "a directory");
+        assert_eq!(at("dir/sub"), None);
+        assert_eq!(at("link/f"), None, "a symlinked parent is never followed");
+        assert_eq!(at("file/x"), None, "a non-directory parent");
+        for bad in ["", "../x", "./file", "/etc/passwd", "dir/../file", "file/"] {
+            assert_eq!(at(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn git_ff_identical_deleted_path_now_a_directory_is_not_vouched_for() {
+        let tmp = repo(&["victim"]);
+        let d = tmp.path();
+        fs::remove_file(d.join("victim")).unwrap();
+        fs::create_dir(d.join("victim")).unwrap();
+        fs::write(d.join("victim/local-only.txt"), "precious\n").unwrap();
+        assert_eq!(check(d, vec!["victim".to_string()]), None);
+        assert!(d.join("victim/local-only.txt").exists());
     }
 }

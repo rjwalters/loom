@@ -905,6 +905,7 @@ fn identical_to_origin(
     let paths = git::tracked_paths(root, local()).ok()?;
     let index = git::scratch_index(root, local()).ok()?;
     crate::git_ff_identical::all_dirty_tracked_identical_to_origin(
+        root,
         &git::tracking(branch),
         paths,
         |args| git::quiet_ok(root, &index, args, local()),

@@ -570,6 +570,7 @@ fn all_dirty_tracked_managed(repo_root: &Path) -> Option<Vec<String>> {
 /// implementation lives in [`git_ff_identical`] (#11553).
 fn dirty_tracked_identical_to_origin(repo_root: &Path, branch: &str) -> Option<Vec<String>> {
     git_ff_identical::all_dirty_tracked_identical_to_origin(
+        repo_root,
         &format!("origin/{branch}"),
         dirty_tracked_paths(repo_root),
         |args| util::git_ok(repo_root, args),

@@ -197,3 +197,79 @@ fn identical_dirt_rename_stays_dirty() {
     assert_eq!(read(&fx, "moved.md"), "one\n");
     assert!(!fx.host.join("README.md").exists());
 }
+
+// ── The filesystem behind a vouched-for path (#11558 P1) ────────────────
+
+/// Someone else deletes `path` upstream.
+fn delete_upstream(fx: &Fixture, path: &str) -> String {
+    git(&fx.seed, &["pull", "--quiet", "--ff-only", "origin", fx.branch]);
+    git(&fx.seed, &["rm", "--quiet", "--", path]);
+    git(&fx.seed, &["commit", "--quiet", "-m", &format!("delete {path}")]);
+    git(&fx.seed, &["push", "--quiet", "origin", &format!("HEAD:{}", fx.branch)]);
+    fx.origin_tip()
+}
+
+#[test]
+fn identical_dirt_deleted_path_now_a_directory_stays_dirty() {
+    // Upstream deletes `victim`; locally `victim` is now a directory of
+    // untracked and ignored files. Git's diff calls it "deleted" (identical
+    // to origin), but `checkout HEAD -- victim` would remove the directory.
+    let fx = Fixture::new();
+    in_head(&fx, &["victim"]);
+    delete_upstream(&fx, "victim");
+    fs::remove_file(fx.host.join("victim")).unwrap();
+    write(&fx.host.join("victim/local-only.txt"), "precious\n");
+    write(&fx.host.join("victim/build.log"), "ignored\n");
+    write(&fx.host.join(".git/info/exclude"), "*.log\n");
+    let index = git(&fx.host, &["ls-files", "-s"]);
+
+    // `assert_skipped` also pins HEAD, the index bytes and every file.
+    assert_skipped(&fx, &Knobs::default(), CheckoutState::Dirty);
+    assert_eq!(read(&fx, "victim/local-only.txt"), "precious\n");
+    assert_eq!(read(&fx, "victim/build.log"), "ignored\n");
+    assert_eq!(git(&fx.host, &["ls-files", "-s"]), index);
+}
+
+#[test]
+fn identical_dirt_untracked_file_on_an_unstaged_deletion_stays_dirty() {
+    // `git rm --cached victim` + a new untracked `victim`: invisible to
+    // `git diff <ref>`, and the discard would overwrite it.
+    let fx = Fixture::new();
+    in_head(&fx, &["victim"]);
+    delete_upstream(&fx, "victim");
+    git(&fx.host, &["rm", "--quiet", "--cached", "--", "victim"]);
+    write(&fx.host.join("victim"), "precious\n");
+
+    assert_skipped(&fx, &Knobs::default(), CheckoutState::Dirty);
+    assert_eq!(read(&fx, "victim"), "precious\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn identical_dirt_file_to_symlink_type_change_stays_dirty() {
+    let fx = Fixture::new();
+    fx.push("README.md", "two\n");
+    write(&fx.host.join("elsewhere.txt"), "two\n");
+    fs::remove_file(fx.host.join("README.md")).unwrap();
+    std::os::unix::fs::symlink("elsewhere.txt", fx.host.join("README.md")).unwrap();
+
+    assert_skipped(&fx, &Knobs::default(), CheckoutState::Dirty);
+    let meta = fs::symlink_metadata(fx.host.join("README.md")).unwrap();
+    assert!(meta.file_type().is_symlink(), "the symlink is left alone");
+}
+
+#[test]
+fn identical_dirt_plain_deletion_is_fast_forwarded() {
+    // The path is truly absent locally and upstream deletes it too.
+    let fx = Fixture::new();
+    in_head(&fx, &["victim"]);
+    let tip = delete_upstream(&fx, "victim");
+    fs::remove_file(fx.host.join("victim")).unwrap();
+
+    let found = pass(&fx, &Knobs::default());
+
+    assert_eq!(only(&found).state, CheckoutState::FastForwarded, "{found:?}");
+    assert_eq!(fx.head(), tip);
+    assert_eq!(git(&fx.host, &["status", "--porcelain"]), "");
+    assert!(!fx.host.join("victim").exists());
+}

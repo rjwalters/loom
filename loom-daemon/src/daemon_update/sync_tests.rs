@@ -363,3 +363,96 @@ fn ff_abort_identical_rename_hard_aborts() {
     assert_eq!(fx.head(), before);
     assert_eq!(read(&fx.host.join("moved.md")), "one\n");
 }
+
+// ── The filesystem behind a vouched-for path (#11558 P1) ────────────────
+
+impl Fixture {
+    /// Someone else deletes `path` upstream and lands `extra`; the host
+    /// fetches. The host holds `path` in HEAD.
+    fn delete_upstream(&self, path: &str) {
+        git(&self.seed, &["rm", "--quiet", "--", path]);
+        write(&self.seed.join(ACCOUNTS), NEW_ACCOUNTS);
+        git(&self.seed, &["add", "-A"]);
+        git(&self.seed, &["commit", "--quiet", "-m", &format!("delete {path}")]);
+        git(&self.seed, &["push", "--quiet", "origin", &format!("HEAD:{BRANCH}")]);
+        git(&self.host, &["fetch", "--quiet", "--", "origin", BRANCH]);
+        // An identical unstaged ACCOUNTS is what makes the real ff refuse.
+        write(&self.host.join(ACCOUNTS), NEW_ACCOUNTS);
+    }
+}
+
+#[test]
+fn ff_abort_identical_deleted_path_now_a_directory_hard_aborts() {
+    let fx = Fixture::new();
+    fx.in_head(&["victim"]);
+    fx.delete_upstream("victim");
+    fs::remove_file(fx.host.join("victim")).unwrap();
+    write(&fx.host.join("victim/local-only.txt"), "precious\n");
+    write(&fx.host.join("victim/build.log"), "ignored\n");
+    write(&fx.host.join(".git/info/exclude"), "*.log\n");
+    fx.assert_ff_refuses();
+    let before = fx.head();
+    let index = git(&fx.host, &["ls-files", "-s"]);
+
+    assert_eq!(all_dirty_tracked_identical_to_origin(&fx.host, BRANCH), None);
+    let (ok, state) = fx.classify(true);
+    assert!(!ok);
+    assert!(!state.ff_synced);
+    assert_eq!(fx.head(), before);
+    assert_eq!(git(&fx.host, &["ls-files", "-s"]), index);
+    assert_eq!(read(&fx.host.join("victim/local-only.txt")), "precious\n");
+    assert_eq!(read(&fx.host.join("victim/build.log")), "ignored\n");
+}
+
+#[test]
+fn ff_abort_identical_untracked_file_on_an_unstaged_deletion_hard_aborts() {
+    let fx = Fixture::new();
+    fx.in_head(&["victim"]);
+    fx.delete_upstream("victim");
+    git(&fx.host, &["rm", "--quiet", "--cached", "--", "victim"]);
+    write(&fx.host.join("victim"), "precious\n");
+    fx.assert_ff_refuses();
+    let before = fx.head();
+
+    assert_eq!(all_dirty_tracked_identical_to_origin(&fx.host, BRANCH), None);
+    let (ok, _) = fx.classify(true);
+    assert!(!ok);
+    assert_eq!(fx.head(), before);
+    assert_eq!(read(&fx.host.join("victim")), "precious\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn ff_abort_identical_file_to_symlink_type_change_hard_aborts() {
+    let fx = Fixture::new();
+    fx.push(&[(ACCOUNTS, NEW_ACCOUNTS), ("README.md", "two\n")]);
+    write(&fx.host.join(ACCOUNTS), NEW_ACCOUNTS);
+    write(&fx.host.join("elsewhere.txt"), "two\n");
+    fs::remove_file(fx.host.join("README.md")).unwrap();
+    std::os::unix::fs::symlink("elsewhere.txt", fx.host.join("README.md")).unwrap();
+    fx.assert_ff_refuses();
+    let before = fx.head();
+
+    assert_eq!(all_dirty_tracked_identical_to_origin(&fx.host, BRANCH), None);
+    let (ok, _) = fx.classify(true);
+    assert!(!ok);
+    assert_eq!(fx.head(), before);
+    let meta = fs::symlink_metadata(fx.host.join("README.md")).unwrap();
+    assert!(meta.file_type().is_symlink(), "the symlink is left alone");
+}
+
+#[test]
+fn ff_abort_identical_plain_deletion_resolves() {
+    let fx = Fixture::new();
+    fx.in_head(&["victim"]);
+    fx.delete_upstream("victim");
+    fs::remove_file(fx.host.join("victim")).unwrap();
+    fx.assert_ff_refuses();
+
+    let (ok, state) = fx.classify(true);
+    assert!(ok);
+    assert!(state.ff_synced);
+    assert_eq!(fx.head(), fx.origin_tip());
+    assert_eq!(fx.status(), "");
+    assert!(!fx.host.join("victim").exists());
+}
