@@ -394,9 +394,12 @@ deletes it outright, with `ComplexityTier` (`ceiling.rs`), `COMPLEXITY_TIERS`
 (`model_tiers.rs`) and `extract_complexity_marker`/`normalize_complexity`
 (`sweep_experiment.rs`). No `minPoints` replaces it: a points-keyed
 eligibility filter would contradict §5e. The back-compat behaviour is the
-existing one: `ceiling.rs` rejects unknown keys, so a stale config fails
-validation loudly, naming the key, rather than silently widening metered-tap
-admission.
+existing one, kept fail-closed: `ceiling.rs` rejects unknown keys. The check
+runs at dispatch time (`runtime_preference.rs`, via `ceiling::configured`),
+not at daemon start. A stale `minComplexity` therefore does not stop the
+daemon, but it rejects every dispatch on a host with a runtime preference list,
+naming the key. The remedy is deleting the key. No host sets it today, and a
+silently lapsed spend limit is worse than a loud rejection.
 
 ## 7. Phased plan
 
@@ -407,11 +410,11 @@ first; P2 and P3 each depend on it.
 |---|---|---|
 | **P1** Points gate (#11663) | Harden `points_marker.rs` (§5a). Resolve the marker from the body and trusted comments through `comment_trust` (§5b). `curation-complete` validates, projects `points:N`, applies `loom:curated` and journals `points` in `issue.estimate`. Fold `forge_pr_congestion::points_from_labels` into `story_points`. | Rejects `3`, `loom:complexity=3`, `loom:points=x`, `points=21` and conflicting duplicates. Accepts a valid marker in a trusted comment; ignores an untrusted commenter's. Body-vs-comment precedence. Quoted and fenced syntax. Projection replaces a stale `points:*` label. No label or journal entry on failure. |
 | **P2** Curator switch and gate deletion (#11664) | `curator.md`, `curator-estimate.md` and their skill mirrors emit `<!-- loom:points=N -->` and drop the tier section. Un-pause `story-points.md`. Drop `difficulty` from `loom:estimate` (prompt and parser). Update `label-state-machine.md` and the `points:*` label descriptions. **Delete** `require-complexity-marker.sh`, its test, and its allowlist, CI and baseline entries. | A missing `difficulty` is accepted. Prompt-budget and markdown-token-budget gates. Codex mirror sync. Shell budget shrinks. |
-| **P3** Delete the tier consumers (#11665) | Delete `resolve-tier-model.sh`, tier 2.5, `tierModels`/`optimization`, the `--tier` flag, `minComplexity`/`ComplexityTier`, Jev (`jev_tier.rs`, its hook and subcommand), `complexity_signal.rs`'s body fetch and `sweep.outcome.complexity`, and the experiment stratum (§6.4). Observe records carry `story_points` (§6.3). The work-finder carrier and write-back read the label. Update the docs in §3.2–§3.4 and `sweep_md_doc_lint.rs`, re-anchor the dead cross-references (§3.1), and fix the dangling "Points estimate marker" reference in `daemon-reference.md`. Split into a Rust change and a docs change only if the diff is too large to review. | Builder resolution is byte-identical without tier config. A stale `minComplexity` fails validation. Arm parity test on the issue-only hash. Observe record carries `story_points`. No Jev call path remains. The inventory grep in §3 matches only historical docs and existing markers. |
+| **P3** Delete the tier consumers (#11665) | Delete `resolve-tier-model.sh`, tier 2.5, `tierModels`/`optimization`, the `--tier` flag, `minComplexity`/`ComplexityTier`, Jev (`jev_tier.rs`, its hook and subcommand), `complexity_signal.rs`'s body fetch and `sweep.outcome.complexity`, and the experiment stratum (§6.4). Observe records carry `story_points` (§6.3). The work-finder carrier and write-back read the label. Update the docs in §3.2–§3.4 and `sweep_md_doc_lint.rs`, re-anchor the dead cross-references (§3.1), and fix the dangling "Points estimate marker" reference in `daemon-reference.md`. Split into a Rust change and a docs change only if the diff is too large to review. | Builder resolution is byte-identical without tier config. A stale `minComplexity` rejects dispatch, naming the key. Arm parity test on the issue-only hash. Observe record carries `story_points`. No Jev call path remains. The inventory grep in §3 matches only historical docs and existing markers. |
 
 **Child issues.** #11663 (P1), #11664 (P2) and #11665 (P3) are kept and
-rescoped to the rows above. #11666, #11667 and #11668 fold into #11665.
-#11669 (restart calibration) closes in favour of #9434, which already owns
+rescoped to the rows above. #11666, #11667 and #11668 are closed, absorbed into #11665.
+#11669 (restart calibration) is closed in favour of #9434, which already owns
 calibration, with #9466 owning the LSI KPI.
 
 ## 8. Out of scope
