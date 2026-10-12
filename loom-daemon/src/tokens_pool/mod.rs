@@ -82,6 +82,7 @@ pub mod monitor_classes;
 pub mod monitor_db;
 pub mod monitor_dir;
 pub mod monitor_ranking_json;
+pub mod monitor_stale;
 pub mod operator_interrupt;
 pub mod paths;
 pub mod private_workspace;
