@@ -40,7 +40,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use crate::types::{ForgeEventsState, PollGatingStatus, PollGatingWorkspace};
+use crate::types::{PollGatingStatus, PollGatingWorkspace};
 
 use super::keys::repo_is_path_safe;
 
@@ -439,7 +439,7 @@ pub fn forget_held(root: Option<&std::path::Path>) {
 
 /// Run `list` (one workspace's discovery listing) under the gate.
 ///
-/// Gate off (the default), feed not `healthy`, or repo unresolvable: `list`
+/// Gate off (the default), feed not live (`healthy` and recently polled), or repo unresolvable: `list`
 /// runs, exactly as before. Otherwise a workspace with no event since its last
 /// poll and inside its hard cap returns its held listing without a forge call.
 ///
@@ -455,7 +455,7 @@ pub fn gated_list<E>(
     if !lock().enabled() {
         return list();
     }
-    let healthy = super::global_state() == ForgeEventsState::Healthy;
+    let healthy = super::global_feed_live();
     let key = workspace_key(root);
     let known_repo = lock().workspaces.get(&key).map(|ws| ws.repo.clone());
     let repo = repo_override
@@ -499,7 +499,7 @@ pub fn snapshot() -> Option<PollGatingStatus> {
     if !gate.enabled() {
         return None;
     }
-    let healthy = super::global_state() == ForgeEventsState::Healthy;
+    let healthy = super::global_feed_live();
     Some(gate.snapshot(healthy, Instant::now()))
 }
 

@@ -58,9 +58,9 @@ fn render_poll_gating(s: &ForgeEventsStatus) -> Vec<String> {
         return Vec::new();
     };
     let state = if g.gating_active {
-        "ACTIVE (feed healthy)"
+        "ACTIVE (feed live)"
     } else {
-        "inactive (feed not healthy: every workspace on base cadence)"
+        "inactive (feed not live: not healthy, or no recent poll; every workspace on base cadence)"
     };
     let lossy = g.lossy_rate().map_or_else(
         || "n/a (no hard-cap re-poll yet)".to_string(),
@@ -353,7 +353,7 @@ mod tests {
             .expect("gating line");
         assert_eq!(
             line,
-            "Forge poll gating: ACTIVE (feed healthy) — hard cap 600s, 7 poll(s) skipped, 2 event re-poll(s), 4 hard-cap re-poll(s), lossy-feed rate 25.0% (1/4)"
+            "Forge poll gating: ACTIVE (feed live) — hard cap 600s, 7 poll(s) skipped, 2 event re-poll(s), 4 hard-cap re-poll(s), lossy-feed rate 25.0% (1/4)"
         );
         assert!(out.contains("/ws/a (o/a): gated"), "{out}");
     }

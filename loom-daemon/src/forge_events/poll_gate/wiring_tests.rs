@@ -8,9 +8,10 @@ use serial_test::serial;
 
 use super::*;
 use crate::forge_events::{
-    global_state, register_global_status, EventBus, FeedClient, FeedErrorClass, FeedPage,
-    FeedPaths, FeedStatus, ResolvedFeed, DEFAULT_POLL_INTERVAL_SECS,
+    global_feed_live, global_state, register_global_status, EventBus, FeedClient, FeedErrorClass,
+    FeedPage, FeedPaths, FeedStatus, ResolvedFeed, DEFAULT_POLL_INTERVAL_SECS,
 };
+use crate::types::ForgeEventsState;
 use crate::work_finder::WorkItem;
 
 const REPO: &str = "o/a";
@@ -119,6 +120,25 @@ fn gated_list_follows_the_feed_state_events_and_clamped_pages() {
         });
         assert!(polled);
     }
+
+    // A dead feed task leaves the recorded state `healthy`: the gate must not
+    // trust it. A stale `last_poll_at` restores the base cadence on the very
+    // next read, and the status block says gating is inactive.
+    assert_eq!(global_state(), ForgeEventsState::Healthy);
+    assert!(global_feed_live());
+    assert!(!read(&[7]).1, "live and quiet: the hold is served");
+    assert!(snapshot().expect("snapshot").gating_active);
+    status.lock().last_poll_at = Some(chrono::Utc::now() - chrono::Duration::hours(1));
+    assert_eq!(global_state(), ForgeEventsState::Healthy, "recorded state is stuck");
+    assert!(!global_feed_live());
+    assert!(read(&[7]).1, "stale feed: every read polls at the base cadence");
+    assert!(read(&[7]).1, "and keeps polling");
+    let stale = snapshot().expect("snapshot");
+    assert!(!stale.gating_active, "status reports the gate inactive");
+    assert!(stale.workspaces.iter().all(|w| !w.gated));
+    // A fresh poll revives it.
+    status.record_success(0, 7);
+    assert!(global_feed_live());
 
     // #11139: the work finder forgets a hold whose listing fell short of the
     // whole queue; the next read polls instead of serving the partial rows.

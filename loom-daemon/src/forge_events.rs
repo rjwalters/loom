@@ -71,7 +71,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 use crate::event_bus::EventBus;
@@ -704,13 +704,35 @@ pub fn global_status() -> ForgeEventsStatus {
     status
 }
 
-/// The feed's current state without allocating a full snapshot (the poll gate
-/// reads it on every discovery read). Unregistered ⇒ `Disabled`.
+/// The feed's current state (a clone of the status record under its lock).
+/// Unregistered ⇒ `Disabled`. Reports the *recorded* state only: a dead feed
+/// task leaves it stuck at `healthy`, so a gate decision must use
+/// [`global_feed_live`] instead.
 #[must_use]
 pub fn global_state() -> ForgeEventsState {
     GLOBAL_STATUS
         .get()
         .map_or(ForgeEventsState::Disabled, |status| status.snapshot().state)
+}
+
+/// Is the feed `healthy` **and** has it polled recently? The poll gate's one
+/// health check (decision and status output alike), delegating to the
+/// repo's liveness predicate [`feed_is_live`](crate::ci_telemetry::feed::feed_is_live)
+/// so a dead or hung feed task cannot keep every workspace gated at the hard
+/// cap while `status` claims gating is active. Reads the status cell
+/// directly (never [`global_status`], which takes the gate lock). Unregistered
+/// ⇒ `false`.
+#[must_use]
+pub fn global_feed_live() -> bool {
+    global_feed_live_at(Utc::now())
+}
+
+/// [`global_feed_live`] at an explicit instant.
+#[must_use]
+pub fn global_feed_live_at(now: DateTime<Utc>) -> bool {
+    GLOBAL_STATUS
+        .get()
+        .is_some_and(|status| crate::ci_telemetry::feed::feed_is_live(&status.snapshot(), now))
 }
 
 // ============================================================================
