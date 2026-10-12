@@ -399,7 +399,8 @@ fn poll(
             head.sha
         }
     };
-    let runs = reads.check_runs(&sha)?;
+    let mut runs = reads.check_runs(&sha)?;
+    drop_superseded_twins(reads, &sha, &mut runs);
     let status = legacy_statuses(reads, &sha, st)?;
     let rollup = verdict::fold(&runs, &status).map_err(ReadError::Fatal)?;
 
@@ -536,6 +537,29 @@ fn resolve_required(reads: &mut GhReads, st: &mut State) -> Result<Option<Vec<St
 /// What the degraded verdict cannot see is a failing **non-required**
 /// legacy status; the note says that too. Every other refusal (a rate
 /// limit, a bad credential) is returned unchanged.
+/// Drop the check-runs of a superseded twin workflow run on `sha` (#11097,
+/// [`crate::merge_pr::superseded_runs`]). Read only when the rollup could
+/// hold twin residue; a failed read or a doubtful payload drops nothing, so
+/// the poll classifies exactly as it did before. Silent: nothing may reach
+/// stderr before the sentinel.
+fn drop_superseded_twins(reads: &mut GhReads, sha: &str, runs: &mut serde_json::Value) {
+    use crate::merge_pr::superseded_runs as twins;
+    let suspect = runs
+        .get("check_runs")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|rows| twins::needs_runs(rows));
+    if !suspect {
+        return;
+    }
+    if let Ok(superseded) = reads
+        .workflow_runs(sha)
+        .map_err(|e| e.reason().to_string())
+        .and_then(|p| twins::superseded_suites(&p, sha))
+    {
+        twins::drop_superseded(runs, &superseded);
+    }
+}
+
 fn legacy_statuses(
     reads: &mut GhReads,
     sha: &str,
