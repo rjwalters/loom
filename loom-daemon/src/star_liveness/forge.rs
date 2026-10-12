@@ -6,9 +6,15 @@
 //! conditional GET through the shared ETag store ([`crate::forge_etag_store`]):
 //! an unchanged answer is a free `304`, and the request runs under the repo's
 //! reader App installation credential (writer fallback) exactly like the work
-//! finder's own reads (#9949). Writes (and the one-off `GET /user`) go through
-//! the single [`GhStarForge::api`] helper under the per-owner App credential
+//! finder's own reads (#9949). Writes go through the single
+//! [`GhStarForge::api`] helper under the per-owner App credential
 //! (`credential_preflight`). Every call honors the rate-limit breaker.
+//!
+//! The daemon's own login ([`StarForge::self_login`]) is never asked of the
+//! forge under an App installation token: `GET /user` always answers such a
+//! token `403`, so the configured App's `<slug>[bot]` is the identity there
+//! ([`CredentialKind`], #11507). Only a user token (a PAT, `gh auth login`)
+//! makes the one-off `GET /user`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -98,6 +104,58 @@ impl LoginLookup {
     }
 }
 
+/// The kind of credential a root's forge calls run under, as far as naming
+/// the daemon's own login is concerned (#11507).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialKind {
+    /// A GitHub App installation token: a Loom-minted credential directory
+    /// (reader or writer), or an env token with the installation prefix.
+    /// `GET /user` can never answer it.
+    AppInstallation,
+    /// Anything else (a PAT, an operator's `gh auth login`): `GET /user`
+    /// names it.
+    User,
+}
+
+/// GitHub's documented prefix for an App installation access token.
+const INSTALLATION_TOKEN_PREFIX: &str = "ghs_";
+
+/// The credential kind of a call booked as `cred` ([`crate::gh_invocation::
+/// accounting::cred_of`]); `env_token` is the env token reaching the child
+/// when `cred` is an env credential. Only the token's prefix is inspected:
+/// it is never logged, kept, or compared beyond that.
+#[must_use]
+pub fn credential_kind(
+    cred: &crate::gh_invocation::accounting::CredAttr,
+    env_token: Option<&str>,
+) -> CredentialKind {
+    match cred.kind {
+        "reader" | "writer" => CredentialKind::AppInstallation,
+        "env" if env_token.is_some_and(|t| t.trim().starts_with(INSTALLATION_TOKEN_PREFIX)) => {
+            CredentialKind::AppInstallation
+        }
+        _ => CredentialKind::User,
+    }
+}
+
+/// The daemon's own login for a credential of `kind`: under an App
+/// installation token the configured App's `<app>[bot]` (or none), with no
+/// forge call; under a user token `lookup`'s answer, `fetch`ing only as
+/// [`LoginLookup::get`] allows, the `<app>[bot]` fallback after a failure.
+pub fn resolve_self_login(
+    kind: CredentialKind,
+    app: Option<&str>,
+    lookup: &mut LoginLookup,
+    now: Instant,
+    fetch: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    let bot = || app.map(|a| format!("{a}[bot]"));
+    match kind {
+        CredentialKind::AppInstallation => bot(),
+        CredentialKind::User => lookup.get(now, fetch).or_else(bot),
+    }
+}
+
 /// What the liveness pass and the intent applier need from one repo.
 pub trait StarForge {
     /// Open issues **and PRs** carrying `label`.
@@ -136,8 +194,9 @@ pub trait StarForge {
     /// The read failed.
     fn star_events(&mut self, number: u32) -> Result<Vec<super::inherited_star::StarEvent>>;
 
-    /// This daemon's own forge login, when the forge can name it (an App
-    /// installation token cannot). Used only to trust its own markers.
+    /// This daemon's own forge login: a user token's `GET /user` answer, or
+    /// `<app>[bot]` under an App installation token (which `GET /user`
+    /// cannot name, #11507). Used only to trust its own markers.
     fn self_login(&mut self) -> Option<String> {
         None
     }
@@ -211,6 +270,37 @@ impl GhStarForge {
             return Err(anyhow!("gh api {context} failed: {stderr}"));
         }
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    /// The kind of credential [`Self::api`] runs under for this root: the
+    /// same booking (`cred_of`) its `star.api` spans carry. Local only.
+    fn credential_kind(&self) -> CredentialKind {
+        let inv = crate::claim_reconciliation::gh_call::read("star.api", &self.gh_bin, &self.root);
+        let cred = crate::gh_invocation::accounting::cred_of(&inv);
+        let env_token = (cred.kind == "env")
+            .then(|| {
+                ["GH_TOKEN", "GITHUB_TOKEN"]
+                    .iter()
+                    .find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
+            })
+            .flatten();
+        credential_kind(&cred, env_token.as_deref())
+    }
+
+    /// [`StarForge::self_login`] for a credential of `kind`, through the
+    /// process-wide per-root [`LoginLookup`]: an App installation token never
+    /// reaches `GET /user` (#11507); a user token's success is kept for the
+    /// process.
+    fn login_for(&self, kind: CredentialKind, app: Option<&str>) -> Option<String> {
+        static CACHE: OnceLock<Mutex<HashMap<PathBuf, LoginLookup>>> = OnceLock::new();
+        let mut cache = CACHE
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let lookup = cache.entry(self.root.clone()).or_default();
+        resolve_self_login(kind, app, lookup, Instant::now(), || {
+            self.api(&["user", "--jq", ".login"], "user").ok()
+        })
     }
 
     fn issue_path(&self, number: u32) -> String {
@@ -401,19 +491,10 @@ impl StarForge for GhStarForge {
     }
 
     fn self_login(&mut self) -> Option<String> {
-        static CACHE: OnceLock<Mutex<HashMap<PathBuf, LoginLookup>>> = OnceLock::new();
         // Registers the configured fleet App with `trust` for this process.
         let app = super::trust::configured_app_slug(&self.root);
-        let mut cache = CACHE
-            .get_or_init(|| Mutex::new(HashMap::new()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let lookup = cache.entry(self.root.clone()).or_default();
-        // An App installation token cannot name itself (`GET /user` is a
-        // 403): the configured App slug is then this daemon's identity.
-        lookup
-            .get(Instant::now(), || self.api(&["user", "--jq", ".login"], "user").ok())
-            .or_else(|| app.map(|a| format!("{a}[bot]")))
+        let kind = self.credential_kind();
+        self.login_for(kind, app.as_deref())
     }
 
     fn add_label(&mut self, number: u32, label: &str) -> Result<()> {
@@ -562,6 +643,132 @@ mod tests {
             .unwrap()
             .contains("search/issues?q=%22some%20phrase%22"));
         assert!(log.lines().nth(1).unwrap().contains("If-None-Match"));
+    }
+
+    fn cred(kind: &'static str) -> crate::gh_invocation::accounting::CredAttr {
+        crate::gh_invocation::accounting::CredAttr {
+            account: "app-1".to_string(),
+            owner: Some("o".to_string()),
+            kind,
+            installation: None,
+        }
+    }
+
+    #[test]
+    fn credential_kind_is_app_for_minted_dirs_and_installation_env_tokens() {
+        assert_eq!(credential_kind(&cred("writer"), None), CredentialKind::AppInstallation);
+        assert_eq!(credential_kind(&cred("reader"), None), CredentialKind::AppInstallation);
+        assert_eq!(credential_kind(&cred("env"), Some("ghs_x")), CredentialKind::AppInstallation);
+        assert_eq!(credential_kind(&cred("env"), Some("ghp_x")), CredentialKind::User);
+        assert_eq!(credential_kind(&cred("env"), Some("github_pat_x")), CredentialKind::User);
+        assert_eq!(credential_kind(&cred("env"), None), CredentialKind::User);
+        assert_eq!(credential_kind(&cred("ambient"), None), CredentialKind::User);
+        // A configured slug says nothing about the token: an ambient PAT on a
+        // host with `forge.githubApp.slug` set is still a user token.
+        let primary = crate::gh_invocation::accounting::cred_of_with(
+            Some(Path::new("/w/.loom/gh-config")),
+            false,
+        );
+        assert_eq!(credential_kind(&primary, None), CredentialKind::AppInstallation);
+        let by_owner = crate::gh_invocation::accounting::cred_of_with(
+            Some(Path::new("/w/.loom/gh-config-by-owner/acme/42")),
+            false,
+        );
+        assert_eq!(credential_kind(&by_owner, None), CredentialKind::AppInstallation);
+        let own_login = crate::gh_invocation::accounting::cred_of_with(
+            Some(Path::new("/home/u/.config/gh")),
+            false,
+        );
+        assert_eq!(credential_kind(&own_login, None), CredentialKind::User);
+    }
+
+    #[test]
+    fn an_app_credential_never_fetches_and_answers_its_bot_login() {
+        let mut l = LoginLookup::default();
+        let t0 = Instant::now();
+        let mut calls = 0;
+        for i in 0..5 {
+            let got = resolve_self_login(
+                CredentialKind::AppInstallation,
+                Some("loom-fleet-dispatch"),
+                &mut l,
+                t0 + LOGIN_RETRY_MAX * i,
+                || {
+                    calls += 1;
+                    None
+                },
+            );
+            assert_eq!(got.as_deref(), Some("loom-fleet-dispatch[bot]"));
+        }
+        let none = resolve_self_login(CredentialKind::AppInstallation, None, &mut l, t0, || {
+            calls += 1;
+            Some("x".into())
+        });
+        assert_eq!(none, None, "no configured App: no identity, still no call");
+        assert_eq!(calls, 0);
+    }
+
+    #[test]
+    fn a_user_credential_fetches_once_and_keeps_the_answer() {
+        let mut l = LoginLookup::default();
+        let t0 = Instant::now();
+        let mut calls = 0;
+        for _ in 0..3 {
+            let got = resolve_self_login(CredentialKind::User, Some("acme"), &mut l, t0, || {
+                calls += 1;
+                Some("robb-bot".into())
+            });
+            assert_eq!(got.as_deref(), Some("robb-bot"));
+        }
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn own_markers_are_trusted_under_the_app_credential_as_an_app_only() {
+        let me = resolve_self_login(
+            CredentialKind::AppInstallation,
+            Some("kappa-dispatch"),
+            &mut LoginLookup::default(),
+            Instant::now(),
+            || None,
+        );
+        let me = me.as_deref();
+        assert!(super::super::trust::trusted_author(
+            Some("kappa-dispatch[bot]"),
+            Some("NONE"),
+            me
+        ));
+        assert!(!super::super::trust::trusted_author(Some("kappa-dispatch"), Some("NONE"), me));
+        // Under a user token, the user is the daemon and its App namesake is not.
+        let me = resolve_self_login(
+            CredentialKind::User,
+            Some("kappa-dispatch"),
+            &mut LoginLookup::default(),
+            Instant::now(),
+            || Some("kappa-user".into()),
+        );
+        let me = me.as_deref();
+        assert!(super::super::trust::trusted_author(Some("kappa-user"), Some("NONE"), me));
+        assert!(!super::super::trust::trusted_author(Some("kappa-user[bot]"), Some("NONE"), me));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh_forge_login_makes_no_user_call_under_an_app_and_one_under_a_user_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let f = forge_with(dir.path(), cache.path(), "robb-bot", "o/star-login");
+        for _ in 0..3 {
+            let got = f.login_for(CredentialKind::AppInstallation, Some("loom-fleet-dispatch"));
+            assert_eq!(got.as_deref(), Some("loom-fleet-dispatch[bot]"));
+        }
+        let log = dir.path().join("calls.log");
+        assert!(!log.exists(), "an App credential makes no forge call");
+        for _ in 0..3 {
+            assert!(f.login_for(CredentialKind::User, None).is_some());
+        }
+        let log = std::fs::read_to_string(log).unwrap();
+        assert_eq!(log.lines().filter(|l| l.contains("user")).count(), 1, "{log}");
     }
 
     #[test]
