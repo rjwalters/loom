@@ -38,6 +38,14 @@ Options:
                          gate (checks run on base + PR head, #10026). Warns and
                          records an audit PR comment. Operator asserts
                          responsibility.
+  --allow-red-required <context>
+                         Repeatable. Merge over a red REQUIRED status-check
+                         context, for exactly the named context(s). Otherwise
+                         a plain (non --auto) merge refuses (exit 1) on any red
+                         required context and holds (exit 5) on a missing or
+                         pending one, even with a token that could bypass
+                         branch protection (#10688). Warns and, on a real
+                         merge, records an audit PR comment.
   --allow-unapproved     Bypass the pre-merge loom:pr review-signal guard.
                          By default the script refuses to merge (exit 1) a
                          PR whose current head does not carry the loom:pr

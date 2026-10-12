@@ -912,7 +912,9 @@
         "# Applied by: Champion (merge-risk and critical-file holds), and by",
         "# merge-pr.sh's #8508 escalation when the #8248 required-check freshness guard",
         "# blocks a merge that its own automated re-date remedy could not unblock",
-        "# (defaults/docs/merge-pr-exit-code-exceptions.md). Removed by a human."
+        "# (defaults/docs/merge-pr-exit-code-exceptions.md), and by merge-pr.sh's",
+        "# partial-increment reset (#9264) when the issue body carries a",
+        "# `loom:remainder-hold` marker. Removed by a human."
       ]
     },
     {

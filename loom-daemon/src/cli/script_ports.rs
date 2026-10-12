@@ -375,6 +375,28 @@ pub(crate) enum ScriptPortCommand {
     /// refused with nothing mutated, 2 the rebase itself failed.
     ReconcileStack(super::reconcile_stack::ReconcileStackArgs),
 
+    /// Build a PINNED `--force-with-lease=<branch>:<oid>` push argument, or
+    /// refuse (#9487). Backs the lease capture in `reconcile-stack.sh` and
+    /// `rebase-stacked-children.sh`. A bare `--force-with-lease` compares
+    /// against `refs/remotes/<remote>/<branch>`, a ref shared by every linked
+    /// worktree of a Loom clone that a sibling's fetch can advance — so the
+    /// lease is satisfied by construction and the push silently deletes the
+    /// sibling's commit (the live PR #9483 incident). Exit 0 + the argument
+    /// on stdout, 3 the remote could not be queried, 4 the remote holds
+    /// commits this checkout never incorporated. There is no bare-flag
+    /// fallback by design: see `cli/push_lease.rs`.
+    #[command(subcommand)]
+    PushLease(super::push_lease::PushLeaseCommand),
+
+    /// May this repository's PR branches be rebased (#10771)? `strategy`
+    /// prints `merge` or `rebase` for the roles and stack scripts that bring a
+    /// PR branch up to date. `merge` (the answer whenever the forge does not
+    /// positively allow rebase merges, or anything is unknown) means merge the
+    /// default branch in and push without force — a rebase in a merge-only
+    /// repo deletes other agents' merge commits and orphans reviewed heads.
+    #[command(subcommand)]
+    BranchUpdate(super::branch_update::BranchUpdateCommand),
+
     /// Generate `.agents/skills/loom-<name>/SKILL.md` from every
     /// `defaults/roles/<name>.md` role prompt (#8673) — the cross-vendor
     /// skill-discovery surface Codex, Kimi Code, Mistral Vibe, and Grok read
@@ -653,6 +675,8 @@ impl ScriptPortCommand {
             ScriptPortCommand::PremiseCheck(args) => args.run(),
             ScriptPortCommand::OperatorDecision(cmd) => cmd.run(),
             ScriptPortCommand::ReconcileStack(args) => args.run(),
+            ScriptPortCommand::PushLease(cmd) => cmd.run(),
+            ScriptPortCommand::BranchUpdate(cmd) => cmd.run(),
             ScriptPortCommand::GenerateAgentSkills(args) => args.run(),
             ScriptPortCommand::GitBlobLines(args) => args.run(),
             ScriptPortCommand::AffectedFiles(cmd) => cmd.run(),
@@ -711,6 +735,12 @@ pub(crate) enum MergePrCommand {
     /// success, 0+UNVERIFIED = no definite verdict (caller warns), 1 = refuse,
     /// 2 = forge unreachable (caller warns).
     CiResult(super::merge_pr_ci_result::CiResultArgs),
+
+    /// Refuse a plain (non-`--auto`) merge whose head has a required context
+    /// that concluded red (#10688); hold (exit 3) on a missing/pending one.
+    /// `--allow-red-required <ctx>` overrides named contexts with an audit
+    /// comment. Exit 0 = clean/bypassed, 1 = refuse, 2 = forge unreadable.
+    RequiredChecks(super::merge_pr_required_checks::RequiredChecksArgs),
 
     /// The stale-cached-mergeable recheck decision (#6104): once REST
     /// `.mergeable` has read `false`, classify the backoff re-reads plus the
@@ -1071,6 +1101,7 @@ impl MergePrCommand {
             MergePrCommand::TreeChecks(args) => args.run(),
             MergePrCommand::ChainLock(args) => args.run(),
             MergePrCommand::CiResult(args) => args.run(),
+            MergePrCommand::RequiredChecks(args) => args.run(),
             MergePrCommand::HeadSyncRetry(args) => args.run(),
             MergePrCommand::RedateChecks(args) => args.run(),
             MergePrCommand::RedateReport(args) => args.run(),

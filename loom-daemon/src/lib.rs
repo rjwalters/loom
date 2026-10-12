@@ -140,6 +140,7 @@ pub mod agent_skills;
 pub mod api_keys_pool;
 pub mod auto_update;
 pub mod autonomy_marker;
+pub mod branch_update;
 pub mod build_slot;
 pub mod calibrate;
 pub mod capability;
