@@ -20,8 +20,10 @@
 //!
 //! # Anchors, deltas and chunks
 //!
-//! The emitter (`observability::fleet_state`) runs on the collector's 5-minute
-//! snapshot pass. It sends a **full anchor** (`anchor: true`, every row) on its
+//! The emitter (`observability::fleet_state`) runs after every work-finder
+//! tick (default 60 s, `autonomous.workFinder.intervalSecs`) and on the
+//! collector's 5-minute snapshot pass; `tick_interval_secs` names the
+//! cadence. It sends a **full anchor** (`anchor: true`, every row) on its
 //! first pass, whenever the planner stamps change, and at least every
 //! [`ANCHOR_INTERVAL_SECS`]. Between anchors it sends a **delta**
 //! (`anchor: false`) only when something changed: the changed or added rows,
@@ -54,15 +56,15 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::telemetry::RepoVisibility;
+use crate::telemetry::{RepoVisibility, SweepStartFacts};
 
 /// Schema tag carried in every record.
 pub const FLEET_STATE_SCHEMA: &str = "fleet-state/v1";
 
 /// The longest gap between two full anchors, in seconds. A reader never has
-/// to look back further than this, plus one snapshot interval, to find a
-/// reconstruction base.
-pub const ANCHOR_INTERVAL_SECS: i64 = 3600;
+/// to look back further than this, plus one pass interval, to find a
+/// reconstruction base, so a lost delta is wrong for at most this long.
+pub const ANCHOR_INTERVAL_SECS: i64 = 300;
 
 /// The most bytes of JSON one record carries before it is split into chunks
 /// (~1 MB, a quarter of the ~4 MB OTLP/gRPC message limit). A row is ~100-180
@@ -111,6 +113,15 @@ pub enum FleetStage {
     /// Approved, held for a human by an operator hold label.
     #[serde(rename = "merge_hold")]
     MergeHold,
+    /// Pre-ready: from the issue's creation (or latest reopen) until
+    /// `loom:curated`, or `loom:issue` for a one-step promotion (#11368).
+    /// Only ever an `eta.stage_outcome` stage; never a `fleet.state` row.
+    #[serde(rename = "triage_wait")]
+    TriageWait,
+    /// Pre-ready: from `loom:curated` until `loom:issue` (#11368). Only ever
+    /// an `eta.stage_outcome` stage; never a `fleet.state` row.
+    #[serde(rename = "approval_wait")]
+    ApprovalWait,
 }
 
 impl FleetStage {
@@ -125,6 +136,8 @@ impl FleetStage {
             FleetStage::Doctor => "doctor",
             FleetStage::MergeWait => "merge_wait",
             FleetStage::MergeHold => "merge_hold",
+            FleetStage::TriageWait => "triage_wait",
+            FleetStage::ApprovalWait => "approval_wait",
         }
     }
 }
@@ -137,6 +150,74 @@ pub enum FleetSlot {
     Regular,
     /// The host's single `loom:operator-priority` overflow slot (#9244).
     Overflow,
+}
+
+/// Why a held item is held, as `fleet.state` reports it. Neutral (not tied to
+/// the ETA subsystem); the wire strings are the long-standing snake_case hold
+/// names, so a reader can join them with historical hold data. All eight
+/// values are carried even when this host's emitter can only tell some of
+/// them from labels (the marker-refined `merge_risk` / `critical_file` /
+/// `ac_hold` split is left to the reader).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetHoldKind {
+    /// `loom:operator`.
+    Operator,
+    /// `loom:operator-only` (or `-mechanical`).
+    OperatorOnly,
+    /// `loom:operator-decision`.
+    OperatorDecision,
+    /// Champion's merge-risk hold.
+    MergeRisk,
+    /// Champion's critical-file hold.
+    CriticalFile,
+    /// Champion's acceptance-criteria hold.
+    AcHold,
+    /// `loom:blocked` alone.
+    Blocked,
+    /// A hold label none of the above names.
+    Other,
+}
+
+impl FleetHoldKind {
+    /// Every kind.
+    pub const ALL: [FleetHoldKind; 8] = [
+        FleetHoldKind::Operator,
+        FleetHoldKind::OperatorOnly,
+        FleetHoldKind::OperatorDecision,
+        FleetHoldKind::MergeRisk,
+        FleetHoldKind::CriticalFile,
+        FleetHoldKind::AcHold,
+        FleetHoldKind::Blocked,
+        FleetHoldKind::Other,
+    ];
+
+    /// The wire name.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FleetHoldKind::Operator => "operator",
+            FleetHoldKind::OperatorOnly => "operator_only",
+            FleetHoldKind::OperatorDecision => "operator_decision",
+            FleetHoldKind::MergeRisk => "merge_risk",
+            FleetHoldKind::CriticalFile => "critical_file",
+            FleetHoldKind::AcHold => "ac_hold",
+            FleetHoldKind::Blocked => "blocked",
+            FleetHoldKind::Other => "other",
+        }
+    }
+}
+
+/// A repo's `main` CI status as this host's main-health gate last saw it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MainCi {
+    /// The gate evaluated `main` and it is green.
+    Green,
+    /// The gate verified `main` red (dispatch halted).
+    Red,
+    /// The gate has not evaluated `main`, or could not.
+    Unknown,
 }
 
 fn is_zero(n: &u8) -> bool {
@@ -167,17 +248,33 @@ pub struct FleetStateRow {
     /// The dispatch slot the sweep holds. Present exactly when `host` is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slot: Option<FleetSlot>,
+    /// A sweep row only: its model, effort, runtime and attempt lineage, the
+    /// values its `sweep.started` carried (#11280). Flattened, so the keys
+    /// sit beside `host` / `slot` under `sweep.outcome`'s names. Absent for a
+    /// sweep this daemon did not dispatch (adopted after a restart). Additive
+    /// on `fleet-state/v1`.
+    #[serde(flatten)]
+    pub start: SweepStartFacts,
+    /// A sweep row only: the id of this host's sweep that holds the item
+    /// (#11401), the `loom.fact_id` key of the row's `eta.stage_outcome` when
+    /// no forge instant dates the exit. Present exactly when `host` is.
+    /// Additive on `fleet-state/v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sweep_id: Option<String>,
     /// `ready_wait` only: this host's planner rank, the 1-based position in
     /// the work finder's dispatch order on its last tick.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rank: Option<u32>,
-    /// `ready_wait` only: starred (`loom:operator-priority`, any level).
+    /// Starred (`loom:operator-priority`, any level). On every row since
+    /// #11391: a PR row reads it from the PR's labels, any row keeps what an
+    /// earlier row of the item carried.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub star: bool,
     /// `ready_wait` only: when it was starred, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub star_at: Option<DateTime<Utc>>,
-    /// `ready_wait` only: the effective operator priority level (0 absent).
+    /// The effective operator priority level (0 absent). On every row, like
+    /// `star` (#11391).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub level: u8,
     /// `ready_wait` only: the repo's fleet priority (the workspace priority
@@ -192,6 +289,42 @@ pub struct FleetStateRow {
     /// `ready_wait` only: a red-main fix the planner boosted this tick.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub main_red_fix: bool,
+    /// The item is under a hold (operator or `loom:blocked`) now. Absent when
+    /// it is not. Additive on `fleet-state/v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_kind: Option<FleetHoldKind>,
+    /// When the current hold began. Present exactly when `hold_kind` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_since: Option<DateTime<Utc>>,
+    /// `held_since` is a lower bound (first seen held), not an observed
+    /// transition. Absent when exact.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub held_since_lower_bound: bool,
+    /// The hold was released; the instant this host first saw it clear. Set
+    /// on the row that clears the hold, with `hold_kind` and `held_since`
+    /// absent, and kept while the row is otherwise unchanged. A row that
+    /// leaves while held gets none: its removal is the end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_released_at: Option<DateTime<Utc>>,
+    /// Judge rejections the item's PR has taken (#11391). Absent = none or
+    /// not read.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub rework: u32,
+    /// The PR carries `loom:merge-conflict` (#11391). Absent = `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub conflict: bool,
+    /// The PR carries `loom:ci-failure` (#11391). Absent = `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ci_fail: bool,
+    /// Every hold the PR's labels name now (#11391), beside `hold_kind`
+    /// (the one that wins): `operator_decision`, `operator_only`, `operator`,
+    /// `blocked`, `sequenced`, `other`. Absent = none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub holds: Vec<String>,
+}
+
+fn is_zero_u32(n: &u32) -> bool {
+    *n == 0
 }
 
 impl FleetStateRow {
@@ -206,6 +339,8 @@ impl FleetStateRow {
             pr: None,
             host: None,
             slot: None,
+            start: SweepStartFacts::default(),
+            sweep_id: None,
             rank: None,
             star: false,
             star_at: None,
@@ -213,6 +348,14 @@ impl FleetStateRow {
             fleet_priority: None,
             created_at: None,
             main_red_fix: false,
+            hold_kind: None,
+            held_since: None,
+            held_since_lower_bound: false,
+            hold_released_at: None,
+            rework: 0,
+            conflict: false,
+            ci_fail: false,
+            holds: Vec::new(),
         }
     }
 }
@@ -239,15 +382,18 @@ pub struct FleetStateRepo {
     pub repo: String,
     #[serde(default)]
     pub visibility: RepoVisibility,
+    /// This repo's `main` CI status from the main-health gate. Absent when
+    /// the host did not read it (an older emitter). Additive on `fleet-state/v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub main_ci: Option<MainCi>,
     /// The census. Absent means unknown at `as_of`, because the repo's
     /// listings were incomplete or not read. It never means zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub census: Option<FleetPrCensus>,
-    /// The work finder's last tick is known to have listed this repo's whole
-    /// ready queue. Always `false` until #11139 lets the work finder prove a
-    /// listing whole: a reader must not treat a `false` repo's `ready_wait`
-    /// rows as its whole queue. Always sent; missing (an older emitter)
-    /// decodes to `false`.
+    /// The work finder's last tick walked this repo's ready listing to its
+    /// last page (#11139), so its `ready_wait` rows are the whole queue. A
+    /// reader must not treat a `false` repo's `ready_wait` rows as its whole
+    /// queue. Always sent; missing (an older emitter) decodes to `false`.
     #[serde(default)]
     pub ready_complete: bool,
     /// `rows` carries this repo's **entire** `ready_wait` set, not a diff:
@@ -276,6 +422,34 @@ pub struct FleetSlots {
     /// Occupied slots when the tick finished, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub occupancy: Option<u32>,
+}
+
+/// Host-level capacity beside [`FleetSlots`] (which it never repeats). Every
+/// field is a discrete fact: a continuous utilisation fraction would turn
+/// every pass into a delta, so none is carried.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetCapacity {
+    /// Sweeps this host runs now.
+    #[serde(default)]
+    pub live_workers: u32,
+    /// Token accounts the rotation ranking calls healthy. Absent when the
+    /// ranking is unreadable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accounts_usable: Option<u32>,
+    /// Token accounts the ranking calls exhausted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accounts_exhausted: Option<u32>,
+    /// Host-load breaker phase (`closed`, `open`, `cooldown`). Absent when
+    /// none is registered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_breaker: Option<String>,
+    /// Forge rate-limit breaker phase. Absent when none is registered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_breaker: Option<String>,
+    /// The admission brake is holding new dispatch. Absent when none is
+    /// registered or it is disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_brake_held: Option<bool>,
 }
 
 /// The planner regime a record was observed under.
@@ -322,12 +496,20 @@ pub struct FleetStateRecord {
     /// The planner regime stamps.
     #[serde(flatten)]
     pub stamps: PlannerStamps,
+    /// The seconds between the emitter's passes, the sampling resolution: the
+    /// work finder's tick interval, or 300 when it has not ticked. Absent
+    /// from an older emitter, which sampled every 300 s.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tick_interval_secs: Option<u64>,
     /// When the review listings were read. Absent when none completed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub census_at: Option<DateTime<Utc>>,
     /// Slot use from the last dispatch plan, when there is one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slots: Option<FleetSlots>,
+    /// Host capacity beside `slots`, when read. Additive on `fleet-state/v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity: Option<FleetCapacity>,
     /// On an anchor, every repo with rows or a census. On a delta, only the
     /// repos that changed. Ordered by repo. A chunk carries a slice of them;
     /// one repo's rows may span chunks.

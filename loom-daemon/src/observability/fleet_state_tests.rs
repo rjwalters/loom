@@ -7,14 +7,15 @@ use std::sync::{Arc, Mutex as StdMutex};
 use chrono::{DateTime, Duration, TimeZone, Utc};
 
 use super::{
-    build_view, decide, held_stage, needs_anchor, planner_config_hash, pr_stage, Emitted,
-    FleetInput, FleetStateSink, FleetView, HeldSweep, ListedPr, ReadyItem, ReadyQueue, RepoListing,
-    Source,
+    build_view, decide, held_stage, hold_kind, needs_anchor, planner_config_hash, pr_stage,
+    Emitted, FleetInput, FleetStateSink, FleetView, HeldSweep, ListedPr, ReadyItem, ReadyQueue,
+    RepoListing, Source,
 };
 use crate::observability::queue::QueueSink;
 use crate::telemetry::kinds::fleet_state::{
-    split_into_chunks, FleetSlot, FleetSlots, FleetStage, FleetStateRecord, FleetStateRepo,
-    FleetStateRow, PlannerStamps, ANCHOR_INTERVAL_SECS, CHUNK_BYTES,
+    split_into_chunks, FleetCapacity, FleetHoldKind, FleetSlot, FleetSlots, FleetStage,
+    FleetStateRecord, FleetStateRepo, FleetStateRow, MainCi, PlannerStamps, ANCHOR_INTERVAL_SECS,
+    CHUNK_BYTES,
 };
 use crate::telemetry::{TelemetryEnvelope, TelemetryRecord};
 
@@ -42,6 +43,8 @@ fn held(repo: &str, issue: u32, stage: FleetStage, overflow: bool) -> HeldSweep 
         entered_at_lower_bound: false,
         pr: None,
         overflow,
+        start: Default::default(),
+        sweep_id: None,
     }
 }
 
@@ -83,14 +86,15 @@ fn input() -> FleetInput {
         ready: Some(ReadyQueue {
             items: vec![ready(OTHER, 5, 1), ready(OTHER, 6, 2)],
             listed: [REPO, OTHER].iter().map(|s| (*s).to_string()).collect(),
-            // Forced whole so the diffing path stays covered; the work
-            // finder never reports this until #11139.
+            // Both whole, so the diffing path is covered.
             complete: [REPO, OTHER].iter().map(|s| (*s).to_string()).collect(),
             slots: Some(FleetSlots {
                 max_concurrent: 4,
                 occupancy: Some(1),
             }),
         }),
+        capacity: None,
+        main_ci: BTreeMap::new(),
     }
 }
 
@@ -188,7 +192,7 @@ fn first_sight_is_a_lower_bound_and_a_later_arrival_is_exact() {
     // The host-held row's entry comes from the checkpoint, not first sight.
     assert!(!first.repos[REPO].rows[&10].entered_at_lower_bound);
 
-    let later = t0() + Duration::minutes(5);
+    let later = t0() + Duration::minutes(1);
     let mut inp = input();
     inp.ready.as_mut().unwrap().items.push(ready(OTHER, 7, 3));
     let second = build_view(&inp, Some(&first), later);
@@ -204,7 +208,7 @@ fn first_sight_is_a_lower_bound_and_a_later_arrival_is_exact() {
 #[test]
 fn a_stage_change_is_a_new_entry_and_a_handoff_keeps_it() {
     let first = build_view(&input(), None, t0());
-    let later = t0() + Duration::minutes(5);
+    let later = t0() + Duration::minutes(1);
     // #20's PR is approved: a new stage, observed this pass.
     let mut inp = input();
     inp.listings[0].prs[0] = pr(21, "loom:pr", Some(20));
@@ -240,14 +244,14 @@ fn a_failed_listing_carries_the_last_rows_and_drops_the_census() {
     inp.ready.as_mut().unwrap().listed.remove(OTHER);
     inp.ready.as_mut().unwrap().complete.remove(OTHER);
     inp.ready.as_mut().unwrap().items.clear();
-    let second = build_view(&inp, Some(&first), t0() + Duration::minutes(5));
+    let second = build_view(&inp, Some(&first), t0() + Duration::minutes(1));
     assert_eq!(second.repos[REPO].rows[&20], first.repos[REPO].rows[&20]);
     assert_eq!(second.repos[REPO].census, None, "unknown, not zero");
     assert_eq!(second.repos[OTHER].rows[&5], first.repos[OTHER].rows[&5]);
     assert_eq!(second.census_at, None);
     // A repo no longer managed is not carried.
     inp.managed.remove(OTHER);
-    let third = build_view(&inp, Some(&first), t0() + Duration::minutes(5));
+    let third = build_view(&inp, Some(&first), t0() + Duration::minutes(1));
     assert!(!third.repos.contains_key(OTHER));
 }
 
@@ -321,7 +325,7 @@ fn an_unchanged_pass_sends_nothing() {
     // `census_at` moves every pass; that alone is not a change.
     let mut next = view;
     next.census_at = Some(t0() + Duration::minutes(4));
-    assert_eq!(decide(&next, &stamps(), Some(&last), t0() + Duration::minutes(5)), None);
+    assert_eq!(decide(&next, &stamps(), Some(&last), t0() + Duration::minutes(1)), None);
 }
 
 #[test]
@@ -331,7 +335,7 @@ fn a_delta_carries_changed_rows_removals_and_the_full_census() {
     let mut inp = input();
     inp.held.clear();
     inp.ready.as_mut().unwrap().items.retain(|i| i.issue != 6);
-    let later = t0() + Duration::minutes(5);
+    let later = t0() + Duration::minutes(1);
     let second = build_view(&inp, Some(&first), later);
     let record = decide(&second, &stamps(), Some(&last), later).unwrap();
     assert!(!record.anchor);
@@ -352,7 +356,7 @@ fn a_rank_shift_is_a_change() {
     let mut inp = input();
     inp.ready.as_mut().unwrap().items[1].rank = 1;
     inp.ready.as_mut().unwrap().items[0].rank = 2;
-    let later = t0() + Duration::minutes(5);
+    let later = t0() + Duration::minutes(1);
     let record =
         decide(&build_view(&inp, Some(&first), later), &stamps(), Some(&last), later).unwrap();
     assert_eq!(record.row_count(), 2);
@@ -367,12 +371,12 @@ fn a_slot_change_alone_sends_a_delta_with_no_repos() {
         max_concurrent: 4,
         occupancy: Some(2),
     });
-    let record = decide(&next, &stamps(), Some(&last), t0() + Duration::minutes(5)).unwrap();
+    let record = decide(&next, &stamps(), Some(&last), t0() + Duration::minutes(1)).unwrap();
     assert!(!record.anchor && record.repos.is_empty());
 }
 
 #[test]
-fn the_anchor_repeats_hourly_and_on_a_regime_change() {
+fn the_anchor_repeats_every_five_minutes_and_on_a_regime_change() {
     let view = build_view(&input(), None, t0());
     let last = emitted(view.clone(), t0(), t0());
     let at = |s: i64| t0() + Duration::seconds(s);
@@ -470,7 +474,7 @@ fn observed_sources_are_recorded_per_repo() {
 }
 
 /// `ready_complete` is `true` only for a repo whose ready listing is known
-/// whole (forced here; never so before #11139). A repo read but not known
+/// whole (#11139). A repo read but not known
 /// whole is `false` and `ready_replace`; a flip alone is a change, and the
 /// delta carries the repo's whole ready set.
 #[test]
@@ -483,7 +487,7 @@ fn ready_complete_marks_whether_the_ready_listing_was_whole() {
 
     let mut inp = input();
     inp.ready.as_mut().unwrap().complete.remove(OTHER);
-    let later = t0() + Duration::minutes(5);
+    let later = t0() + Duration::minutes(1);
     let second = build_view(&inp, Some(&view), later);
     assert!(!second.ready_complete(OTHER));
     let last = emitted(view, t0(), t0());
@@ -520,7 +524,7 @@ fn an_incomplete_read_never_removes_what_it_could_not_see() {
     ready.listed.remove(OTHER);
     ready.complete.remove(OTHER);
     ready.items.retain(|i| i.issue != 6);
-    let later = t0() + Duration::minutes(5);
+    let later = t0() + Duration::minutes(1);
     let second = build_view(&inp, Some(&first), later);
     let record = decide(&second, &stamps(), Some(&last), later).unwrap();
     assert_eq!(record.removed_count(), 0, "{record:?}");
@@ -621,7 +625,7 @@ fn drive(passes: &[FleetInput]) -> Vec<(Option<FleetStateRecord>, Replayed)> {
     let mut state = Replayed::new();
     let mut out = Vec::new();
     for (i, inp) in passes.iter().enumerate() {
-        let now = t0() + Duration::minutes(5 * i64::try_from(i).unwrap());
+        let now = t0() + Duration::minutes(i64::try_from(i).unwrap());
         let view = build_view(inp, prev.as_ref(), now);
         let record = decide(&view, &stamps(), last.as_ref(), now);
         if let Some(record) = &record {
@@ -714,4 +718,362 @@ fn no_ready_row_outlives_its_absence_from_the_observed_set() {
             .get(OTHER)
             .is_some_and(|rows| rows.contains_key(&7)));
     }
+}
+
+fn labels(list: &[&str]) -> Vec<String> {
+    list.iter().map(|l| (*l).to_string()).collect()
+}
+
+/// An input whose only PR (21, issue 20) carries `pr_labels`.
+fn with_pr_labels(pr_labels: &[&str]) -> FleetInput {
+    let mut i = input();
+    i.held.clear();
+    i.listings[0].prs = vec![ListedPr {
+        number: 21,
+        labels: labels(pr_labels),
+        issue: Some(20),
+    }];
+    i
+}
+
+#[test]
+fn hold_kind_wire_strings_are_pinned() {
+    let wire: Vec<&str> = FleetHoldKind::ALL.iter().map(|k| k.as_str()).collect();
+    assert_eq!(
+        wire,
+        [
+            "operator",
+            "operator_only",
+            "operator_decision",
+            "merge_risk",
+            "critical_file",
+            "ac_hold",
+            "blocked",
+            "other"
+        ]
+    );
+    for kind in FleetHoldKind::ALL {
+        assert_eq!(serde_json::to_value(kind).unwrap(), kind.as_str());
+    }
+}
+
+#[test]
+fn hold_kind_comes_from_the_labels() {
+    assert_eq!(hold_kind(&labels(&["loom:pr"])), None);
+    assert_eq!(hold_kind(&labels(&["loom:pr", "loom:operator"])), Some(FleetHoldKind::Operator));
+    assert_eq!(
+        hold_kind(&labels(&["loom:operator", "loom:operator-only"])),
+        Some(FleetHoldKind::OperatorOnly)
+    );
+    assert_eq!(
+        hold_kind(&labels(&["loom:operator-decision", "loom:operator"])),
+        Some(FleetHoldKind::OperatorDecision)
+    );
+    assert_eq!(hold_kind(&labels(&["loom:blocked"])), Some(FleetHoldKind::Blocked));
+}
+
+#[test]
+fn hold_appears_then_releases_across_two_deltas() {
+    let stamps = stamps();
+    let t1 = t0() + Duration::minutes(1);
+    let t2 = t0() + Duration::minutes(2);
+    let t3 = t0() + Duration::minutes(3);
+    let v0 = build_view(&with_pr_labels(&["loom:pr"]), None, t0());
+    let anchor = decide(&v0, &stamps, None, t0()).unwrap();
+    assert!(anchor.anchor);
+    let e0 = emitted(v0.clone(), t0(), t0());
+
+    // The hold appears.
+    let v1 = build_view(&with_pr_labels(&["loom:pr", "loom:operator"]), Some(&v0), t1);
+    let d1 = decide(&v1, &stamps, Some(&e0), t1).unwrap();
+    let row = &entry(&d1, REPO).rows[0];
+    assert_eq!(row.hold_kind, Some(FleetHoldKind::Operator));
+    assert_eq!(row.held_since, Some(t1));
+    assert!(!row.held_since_lower_bound);
+    assert_eq!(row.hold_released_at, None);
+    let e1 = emitted(v1.clone(), t1, t0());
+
+    // Still held: no change, no delta (and the start is kept).
+    let v2 = build_view(&with_pr_labels(&["loom:pr", "loom:operator"]), Some(&v1), t2);
+    assert_eq!(v2.repos[REPO].rows[&20].held_since, Some(t1));
+    assert!(decide(&v2, &stamps, Some(&e1), t2).is_none_or(|d| d.repos.is_empty()));
+
+    // It clears: the clearing delta says when, and the hold fields are gone.
+    let v3 = build_view(&with_pr_labels(&["loom:pr"]), Some(&v2), t3);
+    let d3 = decide(&v3, &stamps, Some(&emitted(v2, t2, t0())), t3).unwrap();
+    let row = &entry(&d3, REPO).rows[0];
+    assert_eq!(row.hold_kind, None);
+    assert_eq!(row.held_since, None);
+    assert_eq!(row.hold_released_at, Some(t3));
+    // The stamp is kept, so the next pass is quiet.
+    let v4 = build_view(&with_pr_labels(&["loom:pr"]), Some(&v3), t3 + Duration::minutes(1));
+    assert_eq!(v4.repos[REPO].rows[&20].hold_released_at, Some(t3));
+    let e3 = emitted(v3, t3, t0());
+    assert!(decide(&v4, &stamps, Some(&e3), t3 + Duration::minutes(1)).is_none());
+}
+
+#[test]
+fn a_hold_first_seen_without_a_prior_listing_is_a_lower_bound() {
+    let v = build_view(&with_pr_labels(&["loom:pr", "loom:blocked"]), None, t0());
+    let row = &v.repos[REPO].rows[&20];
+    assert_eq!(row.hold_kind, Some(FleetHoldKind::Blocked));
+    assert!(row.held_since_lower_bound);
+}
+
+fn capacity(live: u32) -> FleetCapacity {
+    FleetCapacity {
+        live_workers: live,
+        accounts_usable: Some(3),
+        accounts_exhausted: Some(1),
+        host_breaker: Some("closed".to_string()),
+        rate_limit_breaker: Some("closed".to_string()),
+        admission_brake_held: Some(false),
+    }
+}
+
+#[test]
+fn capacity_change_produces_delta() {
+    let stamps = stamps();
+    let t1 = t0() + Duration::minutes(1);
+    let mut i = input();
+    i.capacity = Some(capacity(2));
+    let v0 = build_view(&i, None, t0());
+    let e0 = emitted(v0.clone(), t0(), t0());
+    assert!(decide(&v0, &stamps, None, t0()).unwrap().capacity == Some(capacity(2)));
+
+    // Otherwise unchanged, capacity unchanged: nothing to send.
+    let v1 = build_view(&i, Some(&v0), t1);
+    assert!(decide(&v1, &stamps, Some(&e0), t1).is_none());
+
+    // Only `live_workers` changed: a delta carrying the capacity.
+    i.capacity = Some(capacity(3));
+    let v2 = build_view(&i, Some(&v0), t1);
+    let delta = decide(&v2, &stamps, Some(&e0), t1).unwrap();
+    assert!(!delta.anchor);
+    assert!(delta.repos.is_empty());
+    assert_eq!(delta.capacity, Some(capacity(3)));
+}
+
+#[test]
+fn main_ci_rides_each_repo_entry_and_a_change_is_a_delta() {
+    let stamps = stamps();
+    let t1 = t0() + Duration::minutes(1);
+    let mut i = input();
+    i.main_ci.insert(REPO.to_string(), MainCi::Green);
+    let v0 = build_view(&i, None, t0());
+    let anchor = decide(&v0, &stamps, None, t0()).unwrap();
+    assert_eq!(entry(&anchor, REPO).main_ci, Some(MainCi::Green));
+    assert_eq!(entry(&anchor, OTHER).main_ci, None);
+    let e0 = emitted(v0.clone(), t0(), t0());
+    i.main_ci.insert(REPO.to_string(), MainCi::Red);
+    let v1 = build_view(&i, Some(&v0), t1);
+    let delta = decide(&v1, &stamps, Some(&e0), t1).unwrap();
+    assert_eq!(delta.repos.len(), 1);
+    assert_eq!(delta.repos[0].main_ci, Some(MainCi::Red));
+}
+
+#[test]
+fn fleet_state_v1_old_record_decodes() {
+    let old = serde_json::json!({
+        "schema": "fleet-state/v1",
+        "as_of": "2026-10-04T12:00:00Z",
+        "anchor": true,
+        "anchor_as_of": "2026-10-04T12:00:00Z",
+        "repos": [{"repo": "a/b", "rows": [{
+            "issue": 1, "stage": "review_wait", "entered_at": "2026-10-04T11:00:00Z"
+        }]}]
+    });
+    let record: FleetStateRecord = serde_json::from_value(old).unwrap();
+    assert_eq!(record.capacity, None);
+    assert_eq!(record.repos[0].main_ci, None);
+    let row = &record.repos[0].rows[0];
+    assert_eq!((row.hold_kind, row.held_since, row.hold_released_at), (None, None, None));
+    // And the new fields stay off the wire when unset.
+    let text = serde_json::to_string(&record).unwrap();
+    assert!(!text.contains("hold_") && !text.contains("capacity") && !text.contains("main_ci"));
+}
+
+/// A live sweep on issue 20 (stage `sweep.builder`, regular slot) beside the
+/// PR 21 that closes it, carrying `pr_labels`.
+fn sweep_with_pr_labels(pr_labels: &[&str]) -> FleetInput {
+    let mut i = with_pr_labels(pr_labels);
+    i.held = vec![held(REPO, 20, FleetStage::SweepBuilder, false)];
+    i
+}
+
+#[test]
+fn sweep_owned_row_takes_hold_from_its_pr_and_releases() {
+    let t1 = t0() + Duration::minutes(1);
+    let t2 = t0() + Duration::minutes(2);
+    let t3 = t0() + Duration::minutes(3);
+    let t4 = t0() + Duration::minutes(4);
+    let v0 = build_view(&sweep_with_pr_labels(&["loom:pr"]), None, t0());
+    assert_eq!(v0.repos[REPO].sources[&20], Source::Held);
+
+    // The hold appears on the sweep's winning row; provenance is kept.
+    let v1 = build_view(&sweep_with_pr_labels(&["loom:pr", "loom:operator"]), Some(&v0), t1);
+    let row = &v1.repos[REPO].rows[&20];
+    assert_eq!(v1.repos[REPO].sources[&20], Source::Held);
+    assert_eq!(row.stage, FleetStage::SweepBuilder);
+    assert_eq!(row.host.as_deref(), Some("robb-studio"));
+    assert_eq!(row.slot, Some(FleetSlot::Regular));
+    assert_eq!(row.hold_kind, Some(FleetHoldKind::Operator));
+    assert_eq!(row.held_since, Some(t1));
+    assert!(!row.held_since_lower_bound);
+
+    // A failed listing leaves the hold unknown: it carries, nothing clears.
+    let mut failed = sweep_with_pr_labels(&[]);
+    failed.listings.clear();
+    let v2 = build_view(&failed, Some(&v1), t2);
+    let row = &v2.repos[REPO].rows[&20];
+    assert_eq!(row.hold_kind, Some(FleetHoldKind::Operator));
+    assert_eq!(row.held_since, Some(t1));
+    assert_eq!(row.hold_released_at, None);
+
+    // The listing returns and the hold is gone: cleared, stamped once.
+    let v3 = build_view(&sweep_with_pr_labels(&["loom:pr"]), Some(&v2), t3);
+    let row = &v3.repos[REPO].rows[&20];
+    assert_eq!((row.hold_kind, row.held_since), (None, None));
+    assert_eq!(row.hold_released_at, Some(t3));
+    assert_eq!(row.stage, FleetStage::SweepBuilder);
+
+    // The stamp persists while nothing changes.
+    let v4 = build_view(&sweep_with_pr_labels(&["loom:pr"]), Some(&v3), t4);
+    assert_eq!(v4.repos[REPO].rows[&20].hold_released_at, Some(t3));
+}
+
+/// One tick's queue under `/src/anvil`: `(issue, rank)` rows.
+fn tick(rows: &[(u32, u32)]) -> crate::types::WorkFinderTickSummary {
+    let queue = rows
+        .iter()
+        .map(|&(issue, rank)| {
+            serde_json::from_value(serde_json::json!({
+                "rank": rank, "repo": "/src/anvil", "issue": issue,
+                "workspace_priority": 100, "urgent": false, "disposition": "queued"
+            }))
+            .unwrap()
+        })
+        .collect();
+    crate::types::WorkFinderTickSummary {
+        plan: Some(crate::types::DispatchPlanContext::default()),
+        queue,
+        ..Default::default()
+    }
+}
+
+/// #11161: the slug cache also holds roots that are not managed, or that
+/// spell a managed repo's path differently. A tick pass reads `main_ci` from
+/// the managed roots alone, so it matches the collector's and never flaps.
+#[test]
+fn tick_main_ci_covers_only_the_managed_roots() {
+    let reused = super::sources::Reused {
+        managed: [OTHER.to_string()].into(),
+        roots: vec![(std::path::PathBuf::from("/src/anvil"), OTHER.to_string())],
+        slugs: [
+            ("/src/anvil".to_string(), OTHER.to_string()),
+            ("/src/anvil/".to_string(), OTHER.to_string()),
+            ("/src/retired".to_string(), "acme/retired".to_string()),
+        ]
+        .into(),
+        ..Default::default()
+    };
+    let keys: Vec<_> = super::sources::tick_main_ci(&reused).into_keys().collect();
+    assert_eq!(keys, vec![OTHER.to_string()]);
+}
+
+/// #11161: a pass runs after every work-finder tick, so three ticks inside
+/// one 5-minute window that each move a rank send three records, each a
+/// delta on the one before. A tick that changes nothing sends nothing. The
+/// tick passes reuse the collector pass's listings, so they cost no forge
+/// read.
+#[test]
+fn three_ticks_in_one_five_minute_window_that_change_a_rank_send_three_records() {
+    let reused = super::sources::Reused {
+        managed: [OTHER.to_string()].into(),
+        listings: vec![RepoListing {
+            repo: OTHER.to_string(),
+            prs: vec![pr(41, "loom:review-requested", Some(40))],
+        }],
+        listed_at: Some(t0()),
+        slugs: [("/src/anvil".to_string(), OTHER.to_string())].into(),
+        roots: Vec::new(),
+        visibility: BTreeMap::new(),
+    };
+    let pass_at = |rows: &[(u32, u32)]| FleetInput {
+        ready: Some(super::sources::ready_input(&tick(rows), &reused)),
+        ..super::sources::reused_input("robb-studio", &reused)
+    };
+    let view = build_view(&pass_at(&[(5, 1), (6, 2)]), None, t0());
+    let anchor = decide(&view, &stamps(), None, t0()).unwrap();
+    assert!(anchor.anchor);
+    let mut prev = view.clone();
+    let mut last = emitted(view, t0(), t0());
+
+    let ticks: [&[(u32, u32)]; 4] = [
+        &[(6, 1), (5, 2)],
+        &[(5, 1), (6, 2)],
+        &[(6, 1), (5, 2)],
+        &[(6, 1), (5, 2)],
+    ];
+    let mut records = Vec::new();
+    for (i, rows) in ticks.iter().enumerate() {
+        let now = t0() + Duration::seconds(60 * (i64::try_from(i).unwrap() + 1));
+        let view = build_view(&pass_at(rows), Some(&prev), now);
+        if let Some(record) = decide(&view, &stamps(), Some(&last), now) {
+            assert!(!record.anchor, "tick {i}");
+            assert_eq!(record.prev_as_of, Some(last.as_of), "tick {i}");
+            let ranks: Vec<(u32, Option<u32>)> = entry(&record, OTHER)
+                .rows
+                .iter()
+                .filter(|r| r.stage == FleetStage::ReadyWait)
+                .map(|r| (r.issue, r.rank))
+                .collect();
+            let want: Vec<(u32, Option<u32>)> = {
+                let mut w: Vec<_> = rows.iter().map(|&(i, r)| (i, Some(r))).collect();
+                w.sort_unstable();
+                w
+            };
+            assert_eq!(ranks, want, "tick {i}");
+            last = emitted(view.clone(), now, last.anchor_as_of);
+            records.push(record);
+        }
+        prev = view;
+    }
+    assert_eq!(records.len(), 3, "the unchanged fourth tick sends nothing");
+    assert!(records
+        .iter()
+        .all(|r| r.as_of - t0() < Duration::seconds(ANCHOR_INTERVAL_SECS)));
+    // The reused listing is not a change: no record names the PR row again.
+    assert!(records
+        .iter()
+        .flat_map(|r| &r.repos)
+        .flat_map(|r| &r.rows)
+        .all(|row| row.stage == FleetStage::ReadyWait));
+}
+
+/// #11161: the anchor interval is 5 minutes. With nothing changed, a pass
+/// 299 s after the last anchor sends nothing and a pass at 300 s sends a
+/// full anchor.
+#[test]
+fn an_anchor_goes_out_once_the_last_is_300_s_old() {
+    assert_eq!(ANCHOR_INTERVAL_SECS, 300);
+    let view = build_view(&input(), None, t0());
+    let at = |s: i64| t0() + Duration::seconds(s);
+    let last = emitted(view.clone(), at(240), t0());
+    assert_eq!(decide(&view, &stamps(), Some(&last), at(299)), None);
+    let record = decide(&view, &stamps(), Some(&last), at(300)).unwrap();
+    assert!(record.anchor);
+    assert_eq!((record.anchor_as_of, record.prev_as_of), (at(300), None));
+    let first = decide(&view, &stamps(), None, t0()).unwrap();
+    assert_eq!(record.row_count(), first.row_count());
+}
+
+/// A finished tick wakes the tick pass, and a tick that finishes while no
+/// pass waits is not lost.
+#[tokio::test]
+async fn a_finished_tick_wakes_the_tick_pass() {
+    super::tick_completed();
+    tokio::time::timeout(std::time::Duration::from_secs(1), super::ticked().notified())
+        .await
+        .expect("the tick left a wake-up");
 }

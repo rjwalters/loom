@@ -208,6 +208,34 @@ fn write_fake_gh(path: &Path, gh_log: &Path) {
     }
 }
 
+/// #9518: a host whose identity fell through to `UNKNOWN_HOST` receives its own
+/// echoed ads. They must not inflate the tally: counts stay 1, 2, 3 and the
+/// hold trips on the third local release, not the second.
+#[test]
+#[serial]
+fn echoed_unresolved_identity_ads_do_not_double_count() {
+    let mut fleet = Fleet::new(1, false);
+    fleet.hosts[0].view = Arc::new(Mutex::new(PeerClaimView::new(
+        crate::sweep_registry::UNKNOWN_HOST.to_string(),
+        Duration::from_secs(120),
+    )));
+    let view = Arc::clone(&fleet.hosts[0].view);
+    fleet.hosts[0].reg.set_peer_claims(view);
+    assert_eq!(fleet.hosts[0].reg.prless_retry_config().threshold, 3);
+
+    for expected in 1..=3u32 {
+        fleet.hosts[0].reg.record_prless_release(8812, "no PR");
+        assert_eq!(fleet.hosts[0].reg.prless_fleet_release_count(8812), expected);
+        // Echo the host's own ad back at it under the unresolved identity.
+        while let Ok(mut ad) = fleet.hosts[0].rx.try_recv() {
+            ad.host = crate::sweep_registry::UNKNOWN_HOST.to_string();
+            let mut v = fleet.hosts[0].view.lock().unwrap();
+            observe_brake_ad(&mut v, &ad, Instant::now());
+        }
+        assert_eq!(fleet.hosts[0].reg.prless_retry_held(8812), expected >= 3);
+    }
+}
+
 // ======================================================================
 // The headline regression: the threshold is fleet-wide, not per-host
 // ======================================================================

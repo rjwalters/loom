@@ -9,6 +9,7 @@
 //!
 //! Lives outside the ETA modules so it survives the ETA removal (#11098).
 
+use crate::telemetry::kinds::stage_outcome::EnteredAtSource;
 use crate::telemetry::trace::{derived_hex, instant};
 use crate::telemetry::TelemetryRecord;
 
@@ -20,24 +21,59 @@ pub(super) fn derive(kind: &str, key: &[&str]) -> String {
 }
 
 /// The fact id of an outcome record, or `None` for a kind that is not an
-/// outcome fact.
+/// outcome fact or a record with nothing stable to key on. No key part is a
+/// host or an emission time.
 ///
-/// - `pr.resolved`: `(repo, pr_number, state)`
-/// - `eta.stage_outcome`: `(repo, issue, stage, left_at)`
+/// - `pr.resolved`: `(repo, pr_number, state, closed_at)`
+/// - `eta.stage_outcome`, first match (#11401):
+///   1. `(repo, issue, stage, next_stage, forge_transition_at)`: the forge's
+///      instant for the move, identical on every host. Unchanged since
+///      #11125, so no existing fact is re-keyed.
+///   2. `(repo, issue, stage, next_stage, "sweep", sweep_id, entered_at)`:
+///      a stage this host's sweep held. Only that host emits it; `entered_at`
+///      (when the sweep's checkpoint dates it) tells a re-entry within one
+///      sweep (`doctor` → `review_wait` → `doctor`) apart.
+///   3. `(repo, issue, stage, next_stage, "entry", entered_at)`: a
+///      forge-dated entry, when the exit's own forge read failed or no forge
+///      event dates it.
+///
+///   `next_stage` is empty when the item left the listings. With none of
+///   these the record carries `loom.fact_id_missing_reason` instead
+///   ([`StageOutcomeRecord::missing_fact_id_reason`]).
+///
+/// [`StageOutcomeRecord::missing_fact_id_reason`]: crate::telemetry::kinds::stage_outcome::StageOutcomeRecord::missing_fact_id_reason
 pub(super) fn of(record: &TelemetryRecord) -> Option<String> {
     match record {
-        TelemetryRecord::PrResolved(r) => {
-            Some(derive("pr.resolved", &[&r.repo, &r.pr_number.to_string(), r.state.as_str()]))
-        }
-        TelemetryRecord::EtaStageOutcome(r) => Some(derive(
-            "eta.stage_outcome",
+        TelemetryRecord::PrResolved(r) => Some(derive(
+            "pr.resolved",
             &[
                 &r.repo,
-                &r.issue.to_string(),
-                r.stage.as_str(),
-                &instant(r.left_at),
+                &r.pr_number.to_string(),
+                r.state.as_str(),
+                &instant(r.closed_at?),
             ],
         )),
+        TelemetryRecord::StageOutcome(r) => {
+            let issue = r.issue.to_string();
+            let next = r.next_stage.map_or("", |s| s.as_str());
+            let head = [r.repo.as_str(), issue.as_str(), r.stage.as_str(), next];
+            let with = |tail: &[&str]| {
+                let mut key = head.to_vec();
+                key.extend_from_slice(tail);
+                derive("eta.stage_outcome", &key)
+            };
+            if let Some(at) = r.forge_transition_at {
+                return Some(with(&[&instant(at)]));
+            }
+            if let Some(sweep) = r.sweep_id.as_deref().filter(|id| !id.is_empty()) {
+                let checkpoint = r
+                    .entered_at
+                    .filter(|_| r.entered_at_source == Some(EnteredAtSource::Checkpoint));
+                return Some(with(&["sweep", sweep, &checkpoint.map(instant).unwrap_or_default()]));
+            }
+            r.forge_entered_at()
+                .map(|entered| with(&["entry", &instant(entered)]))
+        }
         _ => None,
     }
 }

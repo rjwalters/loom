@@ -126,7 +126,6 @@ test-guide-work-plan-operator-only-exclude.sh
 test-guide-work-plan-ready-open-pr-exclude.sh
 test-hard-exclusion-labels.sh
 test-host-sleep-config.sh
-test-inbox-mail.sh
 test-install-active-session.sh
 test-install-agents-md-reapply.sh
 test-install-full-reinstall-no-target-mutation.sh
@@ -160,6 +159,7 @@ test-merge-pr-rate-limit-fallback.sh
 test-merge-pr-stacked-child-branch-delete.sh
 test-merge-pr-tree-checks.sh
 test-merge-pr-ci-result.sh
+test-merge-pr-required-checks.sh
 test-nextest-daemon-guard.sh
 test-operator-only-subkind.sh
 test-post-verdict.sh
@@ -187,6 +187,7 @@ test-resync-installed-stamp.sh
 test-resync-installed-output-staging.sh
 test-resync-installed.sh
 test-resync-installed-egress-doctor.sh
+test-resync-installed-payload-fallback.sh
 test-review-feedback-reconciliation.sh
 test-run-ci-suites-daemon-guard.sh
 test-run-ci-suites-failure-excerpt.sh
@@ -213,6 +214,7 @@ test-sweep-lease-renew.sh
 test-sweep-lease-renew-lifecycle.sh
 test-sweep-pr-mode.sh
 test-sweep-run-registry.sh
+test-sweep-wave-judge-done-staleness.sh
 test-sync-labels-check.sh
 test-token-cache-affinity.sh
 test-claude-wrapper-proxy-rotation.sh

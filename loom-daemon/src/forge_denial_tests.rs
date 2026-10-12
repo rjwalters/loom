@@ -124,3 +124,23 @@ fn describe_names_class_permission_and_message_on_one_line() {
     );
     assert_eq!(body_message("not json"), None);
 }
+
+/// #11418: GitHub's secondary-limit rule. `retry-after` wins; the primary
+/// reset counts only when the primary window is spent; else a minute.
+#[test]
+fn retry_at_uses_the_reset_only_when_the_primary_window_is_spent() {
+    let now = 1_000_000;
+    let reset = |remaining| RateLimitHeaders {
+        reset_epoch: Some(now + 3000),
+        ..headers(remaining, None)
+    };
+    assert_eq!(retry_at(&reset(Some(2000)), now), now + 60);
+    assert_eq!(retry_at(&reset(None), now), now + 60);
+    assert_eq!(retry_at(&reset(Some(0)), now), now + 3000);
+    let with_retry_after = RateLimitHeaders {
+        reset_epoch: Some(now + 3000),
+        ..headers(Some(0), Some(30))
+    };
+    assert_eq!(retry_at(&with_retry_after, now), now + 30);
+    assert_eq!(retry_at(&headers(None, Some(86_400)), now), now + 3600);
+}

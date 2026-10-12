@@ -31,6 +31,7 @@ use crate::telemetry::queue_snapshot::{
 };
 use crate::telemetry::{QueueSnapshotRecord, TelemetryEnvelope, TelemetryRecord};
 use crate::types::WorkFinderTickSummary;
+use crate::work_finder::halt_cause::HaltCause;
 
 /// Offers `queue.snapshot` envelopes, stamped with this daemon's host id, to
 /// the native exporters' queues.
@@ -116,6 +117,9 @@ pub fn build_record(
             rows_truncated += 1;
             continue;
         }
+        let cause = (row.disposition == crate::types::QueueDisposition::WorkspaceHalted)
+            .then(|| row.detail.as_deref().and_then(HaltCause::from_wire))
+            .flatten();
         rows.push(QueueSnapshotRow {
             rank: row.rank,
             repo: repo.repo.clone(),
@@ -124,18 +128,26 @@ pub fn build_record(
             workspace_priority: row.workspace_priority,
             urgent: false,
             operator_priority: row.operator_priority,
-            operator_priority_at: row.operator_priority_at.clone(),
             created_at: row.created_at.clone(),
             tier: row.tier.clone(),
             disposition: row.disposition,
             state: row.disposition.state().to_string(),
-            reason: row.disposition.reason().to_string(),
+            reason: cause
+                .map_or_else(|| row.disposition.reason().to_string(), HaltCause::halted_reason),
+            halt_cause: cause.map(|c| c.as_str().to_string()),
             detail: exportable_detail(row.disposition, row.detail.as_deref()),
             plan: row.plan.clone(),
         });
     }
     let listing_failed: Vec<QueueRepoRef> = summary
         .listing_failed
+        .iter()
+        .filter_map(|root| repos.get(root).cloned())
+        .collect();
+    // #11139: a partial listing is reported too, so the snapshot never
+    // passes for the whole queue when a repo's rows are only part of it.
+    let listing_incomplete: Vec<QueueRepoRef> = summary
+        .listing_incomplete
         .iter()
         .filter_map(|root| repos.get(root).cloned())
         .collect();
@@ -146,6 +158,8 @@ pub fn build_record(
         counts,
         listing_failed_unresolved: summary.listing_failed.len() - listing_failed.len(),
         listing_failed,
+        listing_incomplete_unresolved: summary.listing_incomplete.len() - listing_incomplete.len(),
+        listing_incomplete,
         rows,
         unresolved_rows,
         rows_truncated,
@@ -195,7 +209,7 @@ pub(super) async fn resolve_repos(
         .queue
         .iter()
         .map(|r| r.repo.as_str())
-        .chain(summary.listing_failed.iter().map(String::as_str))
+        .chain(summary.listing_not_whole().map(String::as_str))
         .collect();
     super::repo_ref::resolve_repo_refs(roots, slug_cache).await
 }

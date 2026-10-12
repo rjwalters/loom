@@ -67,12 +67,17 @@ pub mod ops;
 pub mod provenance;
 pub mod queue_snapshot;
 pub mod repo_identity;
+mod start_facts;
+pub use start_facts::{
+    effort_source, model_source, DispatchOrigin, SweepStartFacts,
+    SWEEP_START_FACT_LOG_ATTRIBUTE_KEYS,
+};
 pub mod trace;
 pub mod visibility;
 pub use ci::{CiDurationRecord, CiJobLogRecord, CiJobRecord, CiRunRecord};
 pub use disposition::{
-    classify_disposition, DispositionSignals, IssueEndState, SweepDisposition,
-    NO_PHASE_SIGNAL_CLASS,
+    apply_noop_loop_class, classify_disposition, result_for_disposition, DispositionSignals,
+    IssueEndState, SweepDisposition, NO_PHASE_SIGNAL_CLASS, SPAWN_DEATH_CLASS,
 };
 pub use envelope::TelemetryEnvelope;
 pub use kinds::{
@@ -363,7 +368,14 @@ pub mod trigger {
     pub const STALE_BASE_REJUDGE: &str = "stale_base_rejudge";
     /// Dispatched to fix a CI failure.
     pub const CI_FAILURE_FIX: &str = "ci_failure_fix";
-    /// A human or external tool asked for this sweep.
+    /// Re-dispatch after the previous attempt succeeded: it landed, found the
+    /// work already done, or the Curator closed or rescoped the issue (Issue
+    /// #11429). Inferred from the journal; says nothing about who dispatched.
+    pub const REDISPATCH_AFTER_SUCCESS: &str = "redispatch_after_success";
+    /// An operator re-dispatched an issue that already had an attempt on this
+    /// host. Set only from the recorded `dispatch_origin=operator` (Issue
+    /// #11444, `DispatchOrigin::apply_to_trigger`); the journal inference
+    /// never sets it.
     pub const OPERATOR_REDISPATCH: &str = "operator_redispatch";
     /// The dispatch reason was not observable. Counted, never silently merged.
     pub const UNKNOWN: &str = "unknown";
@@ -535,19 +547,11 @@ pub struct SweepStartedRecord {
     pub sweep_id: String,
     /// When the sweep started.
     pub started_at: DateTime<Utc>,
-    /// Selected Claude model, when one was chosen (mirrors `SweepInfo::model`'s
-    /// empty-means-unset contract).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    /// Selected reasoning-effort level, when one was chosen.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub effort: Option<String>,
-    /// Runtime adapter the sweep was dispatched on (`claude`, `codex`, …),
-    /// when the dispatch event carried one — the same value
-    /// `SweepInfo::runtime` records. Absent for a legacy dispatch that did
-    /// not name its runtime; never fabricated as `"claude"`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub runtime: Option<String>,
+    /// Model, effort, runtime and attempt lineage as the dispatch knew them
+    /// (#11280), flattened so the existing `model` / `effort` / `runtime`
+    /// keys keep their wire names.
+    #[serde(flatten)]
+    pub facts: SweepStartFacts,
     /// The Curator's story-point size estimate for this sweep's issue (Issue
     /// #9432, epic #9429) — the numeric value of its single `points:*` label,
     /// carried on the `sweep.global.dispatch` event from the label read the
@@ -963,6 +967,13 @@ pub struct SweepOutcomeRecord {
     /// `unknown` is counted, never silently merged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trigger: Option<String>,
+    /// Who asked for this sweep (Issue #11444) — a [`DispatchOrigin`] wire
+    /// value, copied from the sweep's start facts so `sweep.outcome` agrees
+    /// with `sweep.started`. Absent on journal lines that predate it and on
+    /// sweeps this daemon did not dispatch (adopted, PR-set); never
+    /// fabricated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_origin: Option<String>,
     /// In-sweep rework events (Issue #9444) observed by the paths that
     /// performed them, in event order. Absent (never `[]`) when none were
     /// observed for this sweep.
@@ -1656,6 +1667,11 @@ pub struct HostHealthRecord {
     /// empty-is-unknown and `#[serde(default)]` contract as `exported_kinds`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exporters: Vec<String>,
+    /// Whether this daemon exports OTLP (Issue #11353):
+    /// `no_exporter` / `failing` / `ok` / `exempt` (+ detail). `None` means
+    /// "not reported" (a pre-#11353 daemon), never "ok".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub otlp_export: Option<crate::observability::otlp_health::OtlpExportHealth>,
     /// This host's memory/pressure readings at the sampling moment — the
     /// "deferred vs killed vs timed out" slice (RAM, compressed memory,
     /// swap and its rates, PSI class, kernel OOM counter) — see

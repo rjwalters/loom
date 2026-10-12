@@ -1,6 +1,7 @@
 //! Native runtime dispatch behind the existing spawn-worker.sh invocation contract.
 //! Unix exec keeps PID, signal semantics and streaming intact; the daemon remains
 //! responsible for deadlines/process-group teardown. Models are profiles, not adapters.
+pub mod cargo_debuginfo;
 pub mod containment;
 // `pub(crate)` rather than private since #8436: `runtime_preference::
 // availability` mirrors `credential::resolve`'s ladder to decide whether a
@@ -14,11 +15,16 @@ pub mod launch_outcome;
 // `pub(crate)` so the daemon's dispatch surfaces can call `guard_dispatch`.
 pub(crate) mod llm_gateway;
 mod opencode_version;
+mod phase_run;
 mod profile_check;
 pub(crate) mod profiles;
 mod prompt;
 
 pub use profile_check::{cli as profile_cli, WorkerArgs as WorkerCommand};
+// #11360: the mixed-sweep accounting fixture builds its escalated-Doctor log
+// from the exact report `worker run --escalate-claude` prints.
+#[cfg(test)]
+pub(crate) use phase_run::escalation_report;
 
 use harness::Harness;
 use std::{
@@ -307,6 +313,34 @@ fn native_llm_billing(
     )
 }
 
+/// The runtime this launch runs on, and where that choice came from: the
+/// role binding (`LOOM_ROLE` → `runtime_admission::resolve_binding`), then
+/// `LOOM_RUNTIME`, then `runtimes.default`, then the built-in `claude`. The
+/// single source of truth for the launch's runtime — downstream attribution
+/// (e.g. the egress proxy's observe tags, #11300) takes this value rather than
+/// rereading the environment.
+pub(crate) fn resolve_launch_runtime(
+    root: &Path,
+    config: &serde_json::Value,
+) -> Result<(String, String), LaunchError> {
+    if let Some(role) = nonempty_env("LOOM_ROLE") {
+        let (runtime, source) = crate::runtime_admission::resolve_binding(root, &role, None)
+            .map_err(|e| LaunchError::config(e.diagnostic()))?;
+        return Ok((runtime, source.to_string()));
+    }
+    if let Some(runtime) = nonempty_env("LOOM_RUNTIME") {
+        return Ok((runtime, "env (LOOM_RUNTIME)".to_string()));
+    }
+    if let Some(runtime) = config
+        .pointer("/runtimes/default")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+    {
+        return Ok((runtime.into(), "config (runtimes.default)".to_string()));
+    }
+    Ok(("claude".into(), "default".to_string()))
+}
+
 fn run_preflight(
     args: WorkerArgs,
     root: &Path,
@@ -316,21 +350,7 @@ fn run_preflight(
 ) -> Result<(), LaunchError> {
     let mut trace_identity = crate::telemetry::trace::TraceAttributes::new();
     let config = crate::config_resolver::resolve_effective_config(root);
-    let (runtime, source) = if let Some(role) = nonempty_env("LOOM_ROLE") {
-        let (runtime, source) = crate::runtime_admission::resolve_binding(root, &role, None)
-            .map_err(|e| LaunchError::config(e.diagnostic()))?;
-        (runtime, source.to_string())
-    } else if let Some(runtime) = nonempty_env("LOOM_RUNTIME") {
-        (runtime, "env (LOOM_RUNTIME)".to_string())
-    } else if let Some(runtime) = config
-        .pointer("/runtimes/default")
-        .and_then(serde_json::Value::as_str)
-        .filter(|s| !s.trim().is_empty())
-    {
-        (runtime.into(), "config (runtimes.default)".to_string())
-    } else {
-        ("claude".into(), "default".to_string())
-    };
+    let (runtime, source) = resolve_launch_runtime(root, &config)?;
     if runtime.is_empty()
         || !runtime
             .bytes()
@@ -384,11 +404,46 @@ fn run_preflight(
             .as_deref()
             .and_then(prompt::role_invocation)
             .map(|(r, _)| r);
+        // #11400: judge exclusion against the profile this launch will select —
+        // an explicit `--profile` — not the env/default profile it overrides.
+        let launch_profile = options
+            .profile
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty());
         for role in role.as_deref().into_iter().chain(prompt_role) {
-            crate::runtime_admission::resolve_and_admit(root, role, Some(&runtime))
-                .map_err(|e| LaunchError::config(e.diagnostic()))?;
+            crate::runtime_admission::resolve_and_admit_profiled(
+                root,
+                role,
+                Some(&runtime),
+                launch_profile,
+                crate::runtime_admission::AdmissionContext::Host,
+            )
+            .map_err(|e| LaunchError::config(e.diagnostic()))?;
         }
         let mut selection = profiles::select(&runtime, &options, &config)?;
+        // #11400: the profile actually selected (an explicit `--profile` may
+        // differ from the one admission judged) must not exclude this role.
+        if let Some(name) = selection.profile.as_deref() {
+            for role in role.as_deref().into_iter().chain(prompt_role) {
+                let Some(canonical) = crate::runtime_admission::canonical_role(role) else {
+                    continue;
+                };
+                // A native sweep runs every phase in this one session.
+                let phases: &[&str] = if canonical == "sweep-lifecycle" {
+                    &["builder", "curator", "judge", "doctor"]
+                } else {
+                    &[canonical]
+                };
+                for &checked in phases {
+                    if profiles::excluded_role(&runtime, Some(name), checked, &config).is_some() {
+                        return Err(LaunchError::config(format!(
+                            "model profile {name:?} excludes role {checked:?} (excludedRoles, #11400)"
+                        )));
+                    }
+                }
+            }
+        }
         trace_identity.insert("loom.provider".into(), selection.provider.clone());
         trace_identity.insert("loom.model".into(), selection.model.clone());
         if let Some(effort) = &selection.effort {
@@ -439,7 +494,7 @@ fn run_preflight(
             // proxy. `prepare` fails closed — it never silently reverts to
             // forwarding the real value — and returns `None` only when the
             // feature is off or the profile opts out.
-            let prepared = egress_proxy::prepare(root, &selection, &config)?;
+            let prepared = egress_proxy::prepare(root, &selection, &config, &runtime)?;
             if worker_egress.as_ref().is_some_and(|e| e.required)
                 && !containment::image_has_python3(&profile.image)
             {
@@ -524,7 +579,12 @@ fn run_preflight(
             Some(profile) => crate::runtime_preference::Tap::with_profile(&runtime, profile),
             None => crate::runtime_preference::Tap::runtime(&runtime),
         };
-        writeln!(log, "# LOOM_LAUNCH {}", serde_json::json!({"schema":1,"runtime":runtime,"tap":tap.to_string(),"provider":selection.provider,"model":selection.model,"profile":selection.profile,"effort":selection.effort,"credentialSource":credential.source.as_str(),"credentialProvider":credential.provider,"credentialAccount":credential.account,"usage":"native-json-events","billing":"not-measured","llmBilling":llm_billing.billing,"llmCredentialKind":llm_billing.credential_kind,"prompt_bytes":expanded.as_deref().map(str::len)})).map_err(|e| LaunchError::config(e.to_string()))?;
+        let launch = serde_json::json!({"schema":1,"runtime":runtime,"tap":tap.to_string(),"provider":selection.provider,"model":selection.model,"profile":selection.profile,"effort":selection.effort,"credentialSource":credential.source.as_str(),"credentialProvider":credential.provider,"credentialAccount":credential.account,"usage":"native-json-events","billing":"not-measured","llmBilling":llm_billing.billing,"llmCredentialKind":llm_billing.credential_kind,"prompt_bytes":expanded.as_deref().map(str::len)}).to_string();
+        writeln!(log, "# LOOM_LAUNCH {launch}").map_err(|e| LaunchError::config(e.to_string()))?;
+        // J1 shadow (#11346): attribution only, after the legacy line is written.
+        if let Some(log_path) = options.log.as_deref() {
+            crate::journal::execution::launch_recorded(root, log_path, &launch);
+        }
         if let Some(route) = &gateway {
             writeln!(log, "{}", route.marker(&runtime))
                 .map_err(|e| LaunchError::config(e.to_string()))?;
@@ -651,6 +711,17 @@ fn run_preflight(
     // Docker boundaries that bypass it (spawn-claude.sh's containment,
     // spawn-codex.sh's session-exec) export it explicitly on their own.
     command.env("CARGO_INCREMENTAL", "0");
+    // #11190: cap dev/test debuginfo (default `line-tables-only`) beside it,
+    // without overriding an ambient CARGO_PROFILE_*_DEBUG, the repo's own
+    // `[profile.*] debug`, or a `cargo.debuginfo: "full"` opt-out. Native
+    // containment forwards both names so the in-container seam sees a host
+    // value as ambient; spawn-claude.sh's containment forwards the values
+    // chosen here, since its re-exec never re-enters this seam.
+    let debuginfo = cargo_debuginfo::decide(&cargo_debuginfo::inputs_for(root));
+    // A variable set but EMPTY is unset rather than inherited: cargo fails
+    // the build on an empty value instead of reading it as unset.
+    cargo_debuginfo::apply(&mut command, &debuginfo, |k| std::env::var_os(k));
+    let _ = writeln!(log, "{}", debuginfo.marker);
     // The other half of #8453, on the same seam and for the same reason
     // (#8458): when the repo opts in (`cargo.perWorktreeTargetDir`), a spawn
     // that OWNS a sweep's claim runs under that issue worktree's own

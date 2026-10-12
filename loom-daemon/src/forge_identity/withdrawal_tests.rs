@@ -579,6 +579,7 @@ fn fetch_conditional_failures_carry_their_reset_into_the_withdrawal() {
             etag: None,
             body: String::new(),
             ratelimit: h,
+            next_page: false,
         }),
         "gh: API rate limit exceeded for installation ID 1. (HTTP 403)".into(),
     );

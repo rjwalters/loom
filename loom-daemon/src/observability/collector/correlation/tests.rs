@@ -14,6 +14,7 @@ fn dispatch(issue: u32, sweep: &str) -> Event {
         kind: SweepKind::Issue(issue),
         runtime: None,
         runtime_source: None,
+        start: None,
         repo: None,
     }
 }

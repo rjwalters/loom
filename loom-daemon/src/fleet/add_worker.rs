@@ -1449,16 +1449,30 @@ cd "$WORKSPACE_ROOT" || {{ echo "verify: workspace root $WORKSPACE_ROOT not foun
 # be finishing startup right after daemon-unit's `systemctl --user enable
 # --now` (re)started it -- retry with a bounded ~30s wait instead of failing
 # on the very first race (#5334).
+# `loom-daemon status` exits 5 (EXIT_AUTONOMY_MISMATCH, #5409) when the daemon
+# is up and healthy but its work finder is off while the autonomy-desired
+# marker is present. That is a reachable daemon with an autonomy
+# configuration state, not "not ready" (#9064): accept 0 and 5, retry
+# anything else within the bound. The exit code is captured via `|| rc=$?`
+# so `set -e` does not abort the script on a nonzero status.
 STATUS_OK=0
+STATUS_RC=0
 for _attempt in $(seq 1 15); do
-  if loom-daemon status >/dev/null 2>&1; then
+  STATUS_RC=0
+  loom-daemon status >/dev/null 2>&1 || STATUS_RC=$?
+  if [ "$STATUS_RC" = "0" ]; then
     STATUS_OK=1
+    break
+  fi
+  if [ "$STATUS_RC" = "5" ]; then
+    STATUS_OK=1
+    echo "warning: loom-daemon status exited 5 (autonomy mismatch: work finder is off on this worker); daemon is reachable, so verification continues. Autonomy settings are left unchanged -- use explicit dispatch or enable the work finder deliberately." >&2
     break
   fi
   sleep 2
 done
 if [ "$STATUS_OK" != "1" ]; then
-  echo "loom-daemon status did not become ready within ~30s" >&2
+  echo "loom-daemon status did not become ready within ~30s (last status exit code: $STATUS_RC)" >&2
   exit 1
 fi
 # Token ranking is present + fresh (bootstrap + check ran).
@@ -1693,3 +1707,8 @@ mod feed_egress_tests;
 // reason.
 #[cfg(test)]
 mod invoker_tests;
+
+// #9064: verify-script `status` exit-code handling, same reason.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod verify_status_tests;

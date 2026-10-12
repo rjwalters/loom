@@ -93,3 +93,26 @@ fn terminal_records_omit_an_unresolvable_repo_and_stamp_repo_unresolved() {
     );
     assert!(outcome.repo_unresolved);
 }
+
+/// Issue #11429: the live path reads no Judge verdicts, so a failed exit that
+/// produced a PR is `landed` but stays a `failure`.
+#[test]
+fn a_landed_failure_without_judge_signals_stays_failure() {
+    let records = terminal_records(
+        "rjwalters/loom",
+        RepoVisibility::Private,
+        149,
+        "sweep-issue-149-1".to_string(),
+        SweepResult::Failure,
+        900,
+        Some(150),
+    );
+    let [TelemetryRecord::SweepCompleted(completed), TelemetryRecord::SweepOutcome(outcome)] =
+        records.as_slice()
+    else {
+        panic!("expected sweep.completed + sweep.outcome, got {records:?}");
+    };
+    assert_eq!(completed.result, SweepResult::Failure);
+    assert_eq!(outcome.disposition, crate::telemetry::SweepDisposition::Landed);
+    assert_eq!(outcome.result, SweepResult::Failure);
+}

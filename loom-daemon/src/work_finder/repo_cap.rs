@@ -105,24 +105,48 @@ pub fn resolve(config: &WorkFinderConfig) -> Option<usize> {
 /// in production since #11094, the per-repo RAM budget
 /// ([`crate::ram_headroom::RamBudget`]). `Option<usize>` converts to a
 /// RAM-less value, so every pre-#11094 caller is unchanged.
+/// Since #11191 it also carries the per-repo disk budget
+/// ([`crate::disk_admission::DiskBudget`]).
 #[derive(Debug, Clone, Default)]
 pub struct RepoLimits {
     pub per_repo: Option<usize>,
     pub ram: Option<crate::ram_headroom::RamBudget>,
+    pub disk: Option<crate::disk_admission::DiskBudget>,
 }
 
 impl From<Option<usize>> for RepoLimits {
     fn from(per_repo: Option<usize>) -> Self {
         Self {
             per_repo,
-            ram: None,
+            ..Self::default()
         }
     }
 }
 
 impl From<(Option<usize>, Option<crate::ram_headroom::RamBudget>)> for RepoLimits {
     fn from((per_repo, ram): (Option<usize>, Option<crate::ram_headroom::RamBudget>)) -> Self {
-        Self { per_repo, ram }
+        Self {
+            per_repo,
+            ram,
+            disk: None,
+        }
+    }
+}
+
+/// The production tick's limits (#11191): per-repo cap, RAM and disk budgets.
+type TickLimits = (
+    Option<usize>,
+    Option<crate::ram_headroom::RamBudget>,
+    Option<crate::disk_admission::DiskBudget>,
+);
+
+impl From<TickLimits> for RepoLimits {
+    fn from((per_repo, ram, disk): TickLimits) -> Self {
+        Self {
+            per_repo,
+            ram,
+            disk,
+        }
     }
 }
 
@@ -142,6 +166,10 @@ pub struct RepoCap {
     hot: Vec<bool>,
     /// The tick's per-repo RAM budget (#11094); `None` ⇒ no RAM gate here.
     ram: Option<crate::ram_headroom::RamBudget>,
+    /// The tick's per-repo disk budget (#11191); `None` ⇒ no disk gate here.
+    disk: Option<crate::disk_admission::DiskBudget>,
+    /// The same-tick affected-files overlap gate (#9781).
+    overlap: super::affected_files::OverlapGate,
 }
 
 impl RepoCap {
@@ -163,6 +191,8 @@ impl RepoCap {
             hot: occupancy.iter().map(|&o| o > 0).collect(),
             occupancy,
             ram: limits.ram,
+            disk: limits.disk,
+            overlap: super::affected_files::OverlapGate::default(),
         }
     }
 
@@ -213,18 +243,11 @@ impl RepoCap {
     }
 
     /// Pass 2's per-repo gate (#11094): defer `cand` when its OWN repo's RAM
-    /// charge no longer fits the tick's remaining RAM budget — checked even
-    /// for an `over` (overflow-slot) candidate, since a star cannot buy
-    /// memory — and otherwise, unless `over`, when its repo is at its #9090
-    /// cap ([`Self::defer`]). A RAM deferral counts as `deferred_capacity`
+    /// charge no longer fits the tick's remaining RAM budget, and otherwise
+    /// when its repo is at its #9090 cap ([`Self::defer`]). A RAM deferral counts as `deferred_capacity`
     /// with a `ram:` detail naming the repo and its charge. Work-conserving:
     /// the next candidate, in a lighter repo, may still fit.
-    pub fn defer_admission(
-        &self,
-        cand: &PriorityCandidate,
-        over: bool,
-        report: &mut TickReport,
-    ) -> bool {
+    pub fn defer_admission(&self, cand: &PriorityCandidate, report: &mut TickReport) -> bool {
         if let Some(ram) = self.ram.as_ref().filter(|r| !r.fits(cand.workspace_idx)) {
             let detail = ram.deferral_detail(cand.workspace_idx);
             log::debug!("work_finder: deferring issue #{} — {detail}", cand.number);
@@ -232,7 +255,41 @@ impl RepoCap {
             ready_queue::resolve(&mut report.queue, cand, Qd::DeferredCapacity, Some(detail));
             return true;
         }
-        !over && self.defer(cand, report)
+        // #11191: the same for the repo's disk charge.
+        if let Some(disk) = self.disk.as_ref().filter(|d| !d.fits(cand.workspace_idx)) {
+            let detail = disk.deferral_detail(cand.workspace_idx);
+            log::debug!("work_finder: deferring issue #{} — {detail}", cand.number);
+            report.deferred_capacity += 1;
+            ready_queue::resolve(&mut report.queue, cand, Qd::DeferredCapacity, Some(detail));
+            return true;
+        }
+        if self.defer(cand, report) {
+            return true;
+        }
+        let shared = self.overlap.overlapping(cand);
+        if shared.is_empty() {
+            return false;
+        }
+        // #9781: scheduling signal only — no label, hold, or stacking edge.
+        let detail = ready_queue::short_detail(&format!("file overlap: {}", shared.join(", ")));
+        ready_queue::resolve(&mut report.queue, cand, Qd::DeferredFileOverlap, Some(detail));
+        true
+    }
+
+    /// Record a listed item's `## Affected Files` surface (#9781); `in_flight`
+    /// marks an item this dispatcher already holds, and a listed
+    /// `loom:building` item occupies its surface regardless. Reads only the
+    /// listing's own body and labels.
+    pub fn note_surface(&mut self, idx: usize, item: &super::WorkItem, in_flight: bool) {
+        let occupying = in_flight || item.labels.iter().any(|l| l == super::BUILDING_LABEL);
+        self.overlap
+            .note(idx, item.number, item.body.as_deref(), occupying);
+    }
+
+    /// [`Self::admit`] for a whole candidate: also occupies its surface.
+    pub fn admit_candidate(&mut self, cand: &PriorityCandidate) {
+        self.overlap.occupy(cand);
+        self.admit(cand.workspace_idx);
     }
 
     /// The cap and the per-workspace occupancy as they stand now — at the
@@ -254,6 +311,9 @@ impl RepoCap {
         if let Some(ram) = self.ram.as_mut() {
             ram.debit(idx);
         }
+        if let Some(disk) = self.disk.as_mut() {
+            disk.debit(idx);
+        }
     }
 }
 
@@ -269,17 +329,17 @@ pub struct RepoCapSnapshot {
 /// slice partition, then (when a per-repo cap is configured) the #9090 track
 /// affinity partition.
 ///
-/// **Lane candidates are exempt** (#9244): a starred or red-main-fix candidate
-/// stays at the head of the list, in its [`candidate_cmp`](super::candidate_cmp)
-/// order, and both partitions apply only to the ordinary tail behind it.
-/// Affinity would otherwise float every hot-repo candidate ahead of a starred
-/// issue in a cold repo, and the slice would defer a starred issue whose repo
-/// another host prefers; either breaks "starred first, fleet-wide". A lane
-/// candidate's repo still counts toward the slice's "is my slice empty?"
-/// question, so the #6243 fallback behaves as before.
+/// No priority is exempt (#11508): the slice defers an out-of-slice
+/// candidate whatever its priority, because priority changes order, never
+/// admission. (Before #11508 starred, red-main-fix and
+/// `loom:very-important` candidates were lifted ahead as "lanes".) A verified
+/// red-main fix (#9244) is still never deferred by the slice, so another
+/// host's slice cannot hold the fix that turns `main` green; it keeps its
+/// draw position (it is not lifted ahead) and does not count toward "is my
+/// slice empty?".
 ///
-/// Both partitions are **stable**, so `candidate_cmp` still decides order
-/// within each group and the comparator itself is untouched. With
+/// Both partitions are **stable**, so the workspace-draw order still decides
+/// order within each group. With
 /// `preferred_slice: None` and a disabled `cap` this returns `candidates`
 /// unchanged.
 ///
@@ -306,18 +366,10 @@ fn shape(
     cap: &RepoCap,
     report: &mut TickReport,
 ) -> Vec<PriorityCandidate> {
-    // `candidates` is sorted by `candidate_cmp`, whose first keys are the
-    // lanes, so this partition keeps the head exactly as sorted.
-    let (lanes, rest): (Vec<_>, Vec<_>) = candidates
-        .into_iter()
-        .partition(|c| c.operator_priority || c.main_red_fix);
-    let in_slice = |c: &PriorityCandidate| {
-        preferred_slice.is_none_or(|s| s.get(c.workspace_idx).copied().unwrap_or(true))
-    };
-    let lane_in_slice = lanes.iter().any(in_slice);
-    let sliced = apply_slice(rest, preferred_slice, lane_in_slice, report);
+    // `candidates` is in workspace-draw order (#11103).
+    let sliced = apply_slice(candidates, preferred_slice, report);
     if !cap.enabled() {
-        return lanes.into_iter().chain(sliced).collect();
+        return sliced;
     }
     // Track affinity (#9090): float repos that already have a live sweep ahead
     // of cold ones. `Iterator::partition` preserves relative order within both
@@ -328,7 +380,7 @@ fn shape(
     let (hot, cold): (Vec<_>, Vec<_>) = sliced
         .into_iter()
         .partition(|c| cap.is_hot(c.workspace_idx));
-    lanes.into_iter().chain(hot).chain(cold).collect()
+    hot.into_iter().chain(cold).collect()
 }
 
 /// The #6243 repo-sharding slice partition, moved here verbatim from
@@ -338,27 +390,27 @@ fn shape(
 /// `None` is a no-op. Otherwise the already-sorted list splits into in-slice /
 /// out-of-slice preserving each partition's relative order; out-of-slice
 /// candidates dispatch THIS TICK only when the slice was completely empty at
-/// the top of the tick (work-conservation, #6243's AC). `lane_in_slice` says
-/// an exempt lane candidate (see [`shape_queue`]) sits in the slice, so the
-/// slice is not empty.
+/// the top of the tick (work-conservation, #6243's AC). A verified red-main
+/// fix (#9244) is kept in place whatever its slice, but only a candidate of an
+/// in-slice repo makes the slice non-empty.
 fn apply_slice(
     candidates: Vec<PriorityCandidate>,
     preferred_slice: Option<&[bool]>,
-    lane_in_slice: bool,
     report: &mut TickReport,
 ) -> Vec<PriorityCandidate> {
     let Some(slice) = preferred_slice else {
         return candidates;
     };
-    let (in_slice, out_of_slice): (Vec<_>, Vec<_>) = candidates
-        .into_iter()
-        .partition(|c| slice.get(c.workspace_idx).copied().unwrap_or(true));
-    if in_slice.is_empty() && !lane_in_slice {
+    let in_slice_repo = |c: &PriorityCandidate| slice.get(c.workspace_idx).copied().unwrap_or(true);
+    if !candidates.iter().any(in_slice_repo) {
         // This host's slice has zero eligible candidates this tick — fall back
         // to the full out-of-slice queue rather than starving while other
         // repos have ready work.
-        return out_of_slice;
+        return candidates;
     }
+    let (in_slice, out_of_slice): (Vec<_>, Vec<_>) = candidates
+        .into_iter()
+        .partition(|c| c.main_red_fix || in_slice_repo(c));
     report.deferred_out_of_slice += out_of_slice.len();
     for c in &out_of_slice {
         ready_queue::resolve(&mut report.queue, c, Qd::DeferredOutOfSlice, None);

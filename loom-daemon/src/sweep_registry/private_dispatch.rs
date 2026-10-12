@@ -125,6 +125,7 @@ impl SweepRegistry {
         model: Option<&str>,
         effort: Option<&str>,
         depends_on: Option<u32>,
+        origin: DispatchOrigin,
     ) -> Result<DispatchOutcome> {
         dispatch_model_releasing_poll_lock(
             registry,
@@ -133,12 +134,14 @@ impl SweepRegistry {
             DispatchModel::Request(model),
             effort,
             depends_on,
+            origin,
         )
     }
 
     /// Compatibility entry for lock-held watchdog/reaper paths. A private
     /// recovery must be requested through unlocked dispatch; never block the
     /// daemon's status mutex with Docker or silently route it to another pool.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn begin_issue_dispatch_with_model(
         &mut self,
         kind: &SweepKind,
@@ -147,6 +150,7 @@ impl SweepRegistry {
         effort: Option<&str>,
         depends_on: Option<u32>,
         resume_bypass_pr: Option<u32>,
+        origin: DispatchOrigin,
     ) -> Result<BeginIssueDispatch> {
         let existing = idempotency_key
             .as_deref()
@@ -176,6 +180,7 @@ impl SweepRegistry {
             depends_on,
             resume_bypass_pr,
             None,
+            origin,
         )
     }
 }
@@ -230,6 +235,7 @@ mod tests {
                 None,
                 None,
                 None,
+                DispatchOrigin::Unknown,
             )
             .unwrap();
         match result {

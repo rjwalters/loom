@@ -22,6 +22,7 @@ fn review_stub(dir: &Path) -> PathBuf {
             r#"#!/bin/sh
 d={dir}
 echo "$*" >> "$d/calls.log"
+n=1
 case "$*" in
   *'&page='*)
     n=$(echo "$*" | sed 's/.*&page=\([0-9]*\).*/\1/')
@@ -32,7 +33,9 @@ case "$*" in
   *'labels=loom:review-requested&'*) f=rr1.json ;;
   *) f=empty.json ;;
 esac
-printf 'HTTP/2.0 200 OK\r\n\r\n'
+printf 'HTTP/2.0 200 OK\r\n'
+[ "$(grep -o '"number"' "$d/$f" | wc -l)" -ge 100 ] && [ ! -f "$d/last$n" ] && printf 'Link: <https://api.github.com/next>; rel="next"\r\n'
+printf '\r\n'
 cat "$d/$f"
 "#,
             dir = dir.display()
@@ -108,6 +111,65 @@ fn an_unfinished_review_walk_is_an_error_not_the_first_page() {
     assert!(format!("{err:#}").contains("HTTP 502"), "{err:#}");
 }
 
+/// A stub serving `loom:curated` issues: `cu1.json` on page 1, `cu2.json` on
+/// `&page=2`, anything else empty; `fail<N>` fails page N.
+fn curated_stub(dir: &Path) -> PathBuf {
+    let path = review_stub(dir);
+    let script = std::fs::read_to_string(&path)
+        .unwrap()
+        .replace("labels=loom:review-requested&'*'&page=2'", "labels=loom:curated&'*'&page=2'")
+        .replace("labels=loom:review-requested&'", "labels=loom:curated&'")
+        .replace("f=rr2.json", "f=cu2.json")
+        .replace("f=rr1.json", "f=cu1.json");
+    std::fs::write(&path, script).unwrap();
+    path
+}
+
+fn issue_page(numbers: std::ops::Range<u32>) -> String {
+    let rows: Vec<String> = numbers
+        .map(|n| {
+            format!(
+                r#"{{"number": {n}, "state": "open", "created_at": "2026-10-01T00:00:{:02}Z",
+                    "labels": [{{"name": "loom:curated"}}]}}"#,
+                n % 60
+            )
+        })
+        .collect();
+    format!("[{}]\n", rows.join(","))
+}
+
+/// The curated listing walks past page 1 and carries each creation instant;
+/// a pull request under the label is not an issue.
+#[test]
+fn the_curated_listing_is_paginated_and_dated() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = format!("test-owner/fleet-curated-{}", std::process::id());
+    std::fs::write(dir.path().join("cu1.json"), issue_page(1..101)).unwrap();
+    std::fs::write(dir.path().join("cu2.json"), issue_page(101..131)).unwrap();
+    let gh = curated_stub(dir.path());
+
+    let listing = super::curated_listing_with(&gh, dir.path(), Some(&repo)).unwrap();
+    assert_eq!(listing.keys().copied().collect::<Vec<_>>(), (1..131).collect::<Vec<_>>());
+    assert_eq!(listing[&7].unwrap().to_rfc3339(), "2026-10-01T00:00:07+00:00");
+    let calls = std::fs::read_to_string(dir.path().join("calls.log")).unwrap();
+    assert!(calls.contains("&page=2"), "{calls}");
+}
+
+/// A walk that cannot finish is an error: the repo has no curated listing
+/// this pass rather than the first page only.
+#[test]
+fn an_unfinished_curated_walk_is_an_error_not_the_first_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = format!("test-owner/fleet-curated-fail-{}", std::process::id());
+    std::fs::write(dir.path().join("cu1.json"), issue_page(1..101)).unwrap();
+    std::fs::write(dir.path().join("cu2.json"), issue_page(101..131)).unwrap();
+    std::fs::write(dir.path().join("fail2"), "").unwrap();
+    let gh = curated_stub(dir.path());
+
+    let err = super::curated_listing_with(&gh, dir.path(), Some(&repo)).unwrap_err();
+    assert!(format!("{err:#}").contains("HTTP 502"), "{err:#}");
+}
+
 fn row(repo: &str, issue: u32) -> ReadyQueueRow {
     serde_json::from_value(serde_json::json!({
         "rank": issue, "repo": repo, "issue": issue, "workspace_priority": 100,
@@ -116,34 +178,43 @@ fn row(repo: &str, issue: u32) -> ReadyQueueRow {
     .unwrap()
 }
 
-/// (c) No repo is ever `ready_complete`, whatever the tick's row count: the
-/// work finder cannot prove a listing whole before #11139 (a full raw page of
-/// PRs and issues can leave 40 ready rows and an unseen issue on page 2).
-/// Every read repo is `listed`, a failed one is not, and the wire marks every
-/// repo `ready_replace`; an issue absent from the tick is replaced away,
-/// never sent in `removed[]`.
+/// (c) A repo is `ready_complete` exactly when the tick walked its ready
+/// listing to the last page (#11139), whatever its row count. A failed repo is
+/// not `listed`; a partial one is listed but not complete, so the wire marks
+/// it `ready_replace` and an issue absent from the tick is replaced away,
+/// never sent in `removed[]`. A complete repo is diffed: an issue that left
+/// is sent in `removed[]`.
 #[test]
-fn no_repo_is_ever_ready_complete() {
-    let managed: BTreeSet<String> = ["acme/full", "acme/short", "acme/failed", "acme/idle"]
-        .iter()
-        .map(|s| (*s).to_string())
-        .collect();
+fn only_a_whole_listing_is_ready_complete() {
+    let managed: BTreeSet<String> = [
+        "acme/full",
+        "acme/short",
+        "acme/failed",
+        "acme/idle",
+        "acme/partial",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect();
     let per_page = u32::try_from(crate::forge_listing::PER_PAGE).unwrap();
     let mut summary = WorkFinderTickSummary {
         plan: Some(DispatchPlanContext::default()),
         listing_failed: vec!["/src/failed".to_string()],
+        listing_incomplete: vec!["/src/partial".to_string()],
         ..WorkFinderTickSummary::default()
     };
     summary.queue = (1..=per_page).map(|n| row("/src/full", n)).collect();
     summary.queue.extend((1..=40).map(|n| row("/src/short", n)));
+    summary
+        .queue
+        .extend((1..=per_page).map(|n| row("/src/partial", n)));
     let slug = |root: &str| root.strip_prefix("/src/").map(|r| format!("acme/{r}"));
 
     let ready = super::ready_from_tick(&summary, slug, &managed);
-    assert!(ready.complete.is_empty(), "{:?}", ready.complete);
-    let listed: Vec<&str> = ready.listed.iter().map(String::as_str).collect();
-    assert_eq!(listed, ["acme/full", "acme/idle", "acme/short"]);
+    let names = |set: &BTreeSet<String>| set.iter().cloned().collect::<Vec<_>>();
+    assert_eq!(names(&ready.listed), ["acme/full", "acme/idle", "acme/partial", "acme/short"]);
+    assert_eq!(names(&ready.complete), ["acme/full", "acme/idle", "acme/short"]);
 
-    // On the wire: every repo `ready_complete: false`, `ready_replace: true`.
     let input = |ready| FleetInput {
         managed: managed.clone(),
         ready: Some(ready),
@@ -151,21 +222,24 @@ fn no_repo_is_ever_ready_complete() {
     };
     let now = Utc::now();
     let mut first = input(ready.clone());
-    first.ready.as_mut().unwrap().items.push(ReadyItem {
-        issue: 999,
-        ..ready.items[crate::forge_listing::PER_PAGE].clone()
-    });
+    for repo in ["acme/short", "acme/partial"] {
+        let template = ready.items.iter().find(|i| i.repo == repo).unwrap().clone();
+        first.ready.as_mut().unwrap().items.push(ReadyItem {
+            issue: 999,
+            ..template
+        });
+    }
     let view = build_view(&first, None, now);
     let anchor = decide(&view, &PlannerStamps::default(), None, now).unwrap();
-    assert!(!anchor.repos.is_empty());
-    assert!(anchor
-        .repos
-        .iter()
-        .all(|r| !r.ready_complete && r.ready_replace));
+    for repo in &anchor.repos {
+        let whole = repo.repo != "acme/partial";
+        assert_eq!(repo.ready_complete, whole, "{}", repo.repo);
+        assert_eq!(repo.ready_replace, !whole, "{}", repo.repo);
+    }
+    assert!(anchor.repos.iter().any(|r| r.repo == "acme/partial"));
 
-    // #999 (seen before, absent now, maybe beyond page 1): the short repo
-    // stays incomplete, and #999 is replaced away rather than `removed`.
-    let later = now + chrono::Duration::minutes(5);
+    // #999 left both queues: the whole repo says so, the partial one cannot.
+    let later = now + chrono::Duration::minutes(1);
     let second = build_view(&input(ready), Some(&view), later);
     let last = Emitted {
         view,
@@ -175,8 +249,103 @@ fn no_repo_is_ever_ready_complete() {
     };
     let delta = decide(&second, &PlannerStamps::default(), Some(&last), later).unwrap();
     let short = delta.repos.iter().find(|r| r.repo == "acme/short").unwrap();
-    assert!(!short.ready_complete && short.ready_replace);
-    assert!(short.removed.is_empty());
-    assert_eq!(short.rows.len(), 40);
-    assert!(!second.repos["acme/short"].rows.contains_key(&999));
+    assert!(short.ready_complete && !short.ready_replace);
+    assert_eq!(short.removed, [999]);
+    let partial = delta
+        .repos
+        .iter()
+        .find(|r| r.repo == "acme/partial")
+        .unwrap();
+    assert!(!partial.ready_complete && partial.ready_replace);
+    assert!(partial.removed.is_empty());
+    assert_eq!(partial.rows.len(), crate::forge_listing::PER_PAGE);
+    assert!(!second.repos["acme/partial"].rows.contains_key(&999));
+}
+
+#[test]
+fn account_counts_separate_exhausted_from_other_unavailable() {
+    use super::parse_account_counts;
+    let ranking =
+        "a|available|0.1\nb|exhausted|0.99\nc|blocked|0.0\nd|rate_limited|0.5\ne|mystery|0.0\n";
+    assert_eq!(parse_account_counts(ranking), Some((1, 1)));
+    // Blocked, rate-limited and unknown accounts are not exhausted.
+    assert_eq!(
+        parse_account_counts("c|blocked|0.0\nd|rate_limited|0.5\ne|mystery|0.0\n"),
+        Some((0, 0))
+    );
+    assert_eq!(parse_account_counts("b|exhausted|0.99\n"), Some((0, 1)));
+    assert_eq!(parse_account_counts("# only a comment\n"), None);
+}
+
+#[test]
+fn live_workers_counts_every_nonterminal_sweep_regardless_of_kind_or_slug() {
+    use crate::sweep_registry::{SweepRegistry, SweepRegistryConfig};
+    use crate::types::{SweepKind, SweepState};
+
+    // Plain temp dirs: not git checkouts, so no repo slug can resolve.
+    let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let reg_a = SweepRegistry::shared(SweepRegistryConfig::new(a.path().to_path_buf()));
+    let reg_b = SweepRegistry::shared(SweepRegistryConfig::new(b.path().to_path_buf()));
+    {
+        let mut r = reg_a.lock().unwrap();
+        r.seed_entry_for_test(SweepKind::Issue(1), SweepState::Running);
+        r.seed_entry_for_test(
+            SweepKind::Issue(2),
+            SweepState::Exited {
+                code: Some(0),
+                at: Utc::now(),
+            },
+        );
+    }
+    reg_b
+        .lock()
+        .unwrap()
+        .seed_entry_for_test(SweepKind::PrSet(vec![10, 20]), SweepState::Running);
+
+    assert_eq!(super::live_sweep_count(&[reg_a, reg_b]), 2);
+    assert_eq!(super::live_sweep_count(&[]), 0);
+}
+
+/// Issue #11280: an anchor taken mid-sweep carries the sweep's model, effort,
+/// model source and attempt lineage on its running row, beside `host`/`slot`.
+#[test]
+#[serial_test::serial]
+fn an_anchor_taken_mid_sweep_carries_its_start_facts_on_the_running_row() {
+    use crate::telemetry::kinds::fleet_state::FleetStage;
+    use crate::types::SweepKind;
+    use std::sync::{Arc, Mutex};
+
+    std::env::set_var("LOOM_REPO", "rjwalters/loom");
+    let dir = tempfile::tempdir().unwrap();
+    let (mut registry, _rec) = crate::sweep_registry::test_support::fixture_registry(dir.path());
+    let dispatched =
+        registry.dispatch(&SweepKind::Issue(11280), None, Some("opus"), Some("high"), None);
+    std::env::remove_var("LOOM_REPO");
+    dispatched.unwrap();
+
+    let held = super::held_sweeps(&[Arc::new(Mutex::new(registry))], |_| {
+        Some("rjwalters/loom".to_string())
+    });
+    let input = FleetInput {
+        host_id: "host-a".to_string(),
+        held,
+        ..Default::default()
+    };
+    let now = Utc::now();
+    let anchor =
+        decide(&build_view(&input, None, now), &PlannerStamps::default(), None, now).unwrap();
+    assert!(anchor.anchor);
+    let row = serde_json::to_value(&anchor.repos[0].rows[0]).unwrap();
+    assert_eq!(row["stage"], FleetStage::SweepCurator.as_str());
+    assert_eq!(row["host"], "host-a");
+    assert_eq!(row["slot"], "regular");
+    assert_eq!(row["model"], "claude-opus-5-5");
+    assert_eq!(row["effort_source"], "explicit");
+    assert_eq!(row["effort"], "high");
+    assert_eq!(row["model_source"], "explicit");
+    assert_eq!(row["attempt_index"], 1);
+    assert_eq!(row["trigger"], "first");
+    assert!(row.get("previous_sweep_id").is_none());
+    // #11444: the test-only `dispatch` names no origin.
+    assert_eq!(row["dispatch_origin"], "unknown");
 }

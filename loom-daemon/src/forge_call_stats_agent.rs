@@ -60,7 +60,6 @@ pub const ROLES: &[&str] = &[
     "guide",
     "driver",
     "auditor",
-    "concierge",
     "loom",
 ];
 

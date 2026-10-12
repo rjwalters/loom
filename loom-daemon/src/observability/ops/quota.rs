@@ -37,8 +37,24 @@
 //!   sample, credited when the pool read exhausted at that previous sample
 //!   (sample-and-hold). Summed over a day, this is the downtime.
 //!
-//! Only per-provider aggregates: no account label, which keeps cardinality
-//! fixed. Per-account state is already `loom.tokens.exhausted`.
+//! Those four stay per-provider aggregates with no account label. Per-account
+//! state (Issue #11286) is its own family, so no existing query changes shape:
+//!
+//! - `loom.pool.account_state{provider,account,state=usable|exhausted}`: one
+//!   0/1 gauge per account and state, every sample — a fixed two series per
+//!   registered account.
+//! - `loom.pool.plan_token_limit{provider,account}` and
+//!   `loom.pool.plan_window_seconds{provider,account}`: the plan allowance and
+//!   window an operator declared for an API-key seat (`api-keys limit
+//!   --plan-token-limit / --exhaustion-window`). Emitted only where declared —
+//!   never a zero-filled denominator. They are the raw facts a Z.ai
+//!   utilization figure needs (`loom.llm.tokens.*{provider=zai}` over the
+//!   window, divided by the summed limits); the dashboard does that division,
+//!   the daemon does not.
+//!
+//! Account names are the non-secret pool names operators chose
+//! (`.loom/api-keys/<provider>/<name>.env`, `.ranking` names), the same
+//! identity `github.ratelimit.*` already labels with.
 
 pub mod burn;
 pub mod claude;
@@ -46,6 +62,7 @@ pub mod codex;
 pub mod kimi;
 pub mod opencode;
 pub mod tail;
+pub mod zai;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -65,16 +82,30 @@ pub struct PoolAccount {
     pub account: String,
     pub usable: bool,
     pub exhausted: bool,
+    /// Declared plan token allowance per window (API-key pool only, #11286).
+    pub plan_token_limit: Option<u64>,
+    /// Declared plan window in seconds (API-key pool only, #11286).
+    pub plan_window_secs: Option<u64>,
+}
+
+impl PoolAccount {
+    /// An account with no declared plan facts.
+    #[must_use]
+    pub fn new(provider: &str, account: &str, usable: bool, exhausted: bool) -> Self {
+        PoolAccount {
+            provider: provider.to_string(),
+            account: account.to_string(),
+            usable,
+            exhausted,
+            plan_token_limit: None,
+            plan_window_secs: None,
+        }
+    }
 }
 
 impl From<&TokenAccountState> for PoolAccount {
     fn from(state: &TokenAccountState) -> Self {
-        PoolAccount {
-            provider: state.provider.clone(),
-            account: state.account.clone(),
-            usable: !state.exhausted,
-            exhausted: state.exhausted,
-        }
+        PoolAccount::new(&state.provider, &state.account, !state.exhausted, state.exhausted)
     }
 }
 
@@ -90,6 +121,8 @@ fn api_key_accounts_in(roots: &[PathBuf]) -> Option<Vec<PoolAccount>> {
             .map(|account| PoolAccount {
                 usable: matches!(account.ineligible, None | Some(Ineligible::AtCapacity)),
                 exhausted: account.ineligible == Some(Ineligible::Exhausted),
+                plan_token_limit: account.plan_token_limit,
+                plan_window_secs: account.exhaustion_window_secs,
                 provider: account.provider,
                 account: account.name,
             })
@@ -129,6 +162,7 @@ impl QuotaState {
         accounts: &[PoolAccount],
         now: DateTime<Utc>,
     ) -> Vec<MetricPoint> {
+        let mut points = account_points(accounts);
         let mut by_provider: BTreeMap<&str, (i64, BTreeSet<String>)> = BTreeMap::new();
         for account in accounts {
             let entry = by_provider.entry(account.provider.as_str()).or_default();
@@ -142,7 +176,6 @@ impl QuotaState {
         let elapsed = self
             .last_pool_sample
             .map(|last| (now - last).num_seconds().max(0));
-        let mut points = Vec::new();
         let mut exhausted_now = BTreeMap::new();
         let mut pools_exhausted = BTreeSet::new();
         for (provider, (usable, exhausted)) in by_provider {
@@ -196,6 +229,43 @@ impl QuotaState {
     }
 }
 
+/// Per-account gauges (Issue #11286): `loom.pool.account_state` for every
+/// account and state, plus the declared plan facts where present. The same
+/// account seen twice (a name in two pools of one provider) is emitted once.
+fn account_points(accounts: &[PoolAccount]) -> Vec<MetricPoint> {
+    let mut seen = BTreeSet::new();
+    let mut points = Vec::new();
+    for account in accounts {
+        if !seen.insert((account.provider.as_str(), account.account.as_str())) {
+            continue;
+        }
+        let labelled = |point: MetricPoint| {
+            point
+                .label("provider", account.provider.as_str())
+                .label("account", account.account.as_str())
+        };
+        for (state, on) in [("usable", account.usable), ("exhausted", account.exhausted)] {
+            points.push(
+                labelled(MetricPoint::int(MetricName::PoolAccountState, i64::from(on)))
+                    .label("state", state),
+            );
+        }
+        if let Some(limit) = account.plan_token_limit {
+            points.push(labelled(MetricPoint::int(
+                MetricName::PoolPlanTokenLimit,
+                i64::try_from(limit).unwrap_or(i64::MAX),
+            )));
+        }
+        if let Some(window) = account.plan_window_secs {
+            points.push(labelled(MetricPoint::int(
+                MetricName::PoolPlanWindowSeconds,
+                i64::try_from(window).unwrap_or(i64::MAX),
+            )));
+        }
+    }
+    points
+}
+
 static STATE: Mutex<Option<QuotaState>> = Mutex::new(None);
 static BURN: Mutex<Option<Burn>> = Mutex::new(None);
 
@@ -206,12 +276,34 @@ struct Sample {
     pool_start: Option<DateTime<Utc>>,
 }
 
+/// Fold the api-key pool into the `tokens.snapshot` accounts. A seat the
+/// snapshot already carries (Z.ai, #11396) is not counted a second time in the
+/// per-provider aggregates: it picks up the declared plan facts the snapshot
+/// row has no field for, and the pool's eligibility restriction (a seat the
+/// pool cannot vouch for is never usable, however the quota reads).
+fn merge_pool(accounts: &mut Vec<PoolAccount>, pool: Vec<PoolAccount>) {
+    for pooled in pool {
+        match accounts
+            .iter_mut()
+            .find(|a| a.provider == pooled.provider && a.account == pooled.account)
+        {
+            Some(known) => {
+                known.usable &= pooled.usable;
+                known.exhausted |= pooled.exhausted;
+                known.plan_token_limit = pooled.plan_token_limit;
+                known.plan_window_secs = pooled.plan_window_secs;
+            }
+            None => accounts.push(pooled),
+        }
+    }
+}
+
 fn sample(workspace_root: &Path, mut accounts: Vec<PoolAccount>, now: DateTime<Utc>) -> Sample {
     let api_keys = api_key_accounts_in(&crate::api_keys_pool::paths::pool_roots(workspace_root));
     let (pool, pool_start) = {
         let mut guard = STATE.lock().unwrap_or_else(PoisonError::into_inner);
         let state = guard.get_or_insert_with(QuotaState::default);
-        accounts.extend(state.api_key_pool(api_keys));
+        merge_pool(&mut accounts, state.api_key_pool(api_keys));
         let pool_start = state.last_pool_sample;
         (state.pool_points(&accounts, now), pool_start)
     };

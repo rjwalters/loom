@@ -15,6 +15,7 @@ fn envelope() -> TelemetryEnvelope {
             captured_at: Utc::now(),
             host: "host-a".to_string(),
             exporters: vec![],
+            fact_id_missing_total: 0,
         }),
     )
 }
@@ -66,6 +67,7 @@ fn record_round_trips_and_omits_unknown_flush_time() {
             dropped_total: 0,
             last_flush_ok_at: None,
         }],
+        fact_id_missing_total: 0,
     };
     let wrapped = TelemetryRecord::HostExport(record.clone());
     let json = serde_json::to_string(&wrapped).unwrap();
@@ -79,4 +81,21 @@ fn record_round_trips_and_omits_unknown_flush_time() {
 fn inactive_exporters_are_omitted() {
     let record = HostExportRecord::build("h", Utc::now(), &BTreeMap::new(), &BTreeMap::new());
     assert!(record.exporters.is_empty());
+}
+
+/// #11401: `host.export` reports the exits emitted without a fact id.
+#[test]
+fn build_reports_the_exits_emitted_without_a_fact_id() {
+    let before = super::super::stage_outcome::fact_id_missing_total();
+    super::super::stage_outcome::note_fact_id_missing();
+    let record = HostExportRecord::build("h", Utc::now(), &BTreeMap::new(), &BTreeMap::new());
+    // Process-wide and cumulative; parallel tests may add more.
+    assert!(record.fact_id_missing_total > before, "{record:?}");
+}
+
+#[test]
+fn a_body_from_before_the_fact_id_count_still_parses() {
+    let old = r#"{"captured_at":"2026-10-08T12:00:00Z","host":"h","exporters":[]}"#;
+    let record: HostExportRecord = serde_json::from_str(old).unwrap();
+    assert_eq!(record.fact_id_missing_total, 0);
 }

@@ -235,6 +235,7 @@ fn a_subscription_or_login_store_profile_refuses_instead_of_routing() {
         upstream: "https://api.example.com".into(),
         header: crate::worker_spawn::egress_proxy::HeaderStyle::AuthorizationBearer,
         base_url_env: vec![],
+        observe: false,
     });
     assert!(plan_of("opencode", &proxied, &env).is_err());
 }

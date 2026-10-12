@@ -73,6 +73,7 @@ The predicate lives once, in `loom-daemon/src/comment_trust.rs`:
   | Lease probes (claim reconciliation, orphan recovery, dispatch tie-break, mid-build watchdog) | `loom:lease` | Not a lease: it can neither hold a claim, win the tie-break, nor fence a cleanup. |
   | Claim reconciliation | `loom:claim-activity` / `loom:standdown` | Not claimant activity: it cannot keep a dead claim alive. |
   | Review-conflict pass | `loom:base-conflict flagged` | Not "ours", so a Judge's verdict is never undone. |
+  | Outcome telemetry (`label_timeline`) | `loom:base-conflict flagged` | Not a flag: the rejection still counts. |
   | Quarantine reconciliation | `Auto-quarantined by loom-daemon (#3939)` | Not the daemon's quarantine; the marker must also *start* the comment. |
   | Dependency classification | `champion:proposal-escalated` / `dep-cycle` / `proposal-unescalated` | Absent. |
   | `premise-check` | `loom:premise-check … verdict=` | Absent (comments; a body counts only when its author is trusted). |
@@ -219,9 +220,9 @@ Anything unverifiable is a refusal. Reads are never gated.
   `write_scope::tests::daemon_write_paths_are_scoped` fails when a new daemon
   file writes to the forge without being reviewed into its list. One
   autonomous write sits outside the rule above, scoped narrower by that test:
-  the declared captain's ETA fit publication (#10395) goes to the configured
+  the declared captain's gauge heartbeat (#10395) goes to the configured
   fleet store (`fleet.repo`, never gh's resolution) under its writer App, and
-  only to the dedicated `fleet.etaFitRef` branch, never the reviewed one.
+  only to the dedicated `fleet.captainGauges.ref` branch, never the reviewed one.
 - **Shell:** `loom-daemon forge may-write [--repo OWNER/REPO]` prints the
   repository to name on the write (exit 0) or the reason (exit 1).
   `loom_write_repo` in `lib/forge-helpers.sh` wraps it. Every script that

@@ -124,6 +124,40 @@ This issue is now available for the next increment (a subsequent `/loom:sweep` w
     )
 }
 
+/// The held variant of [`partial_merged_comment`] (#9264): the issue body
+/// declared a `loom:remainder-hold`, so the swap applied `loom:operator`
+/// rather than `loom:issue`. `reason` is `""` when the marker states none.
+#[must_use]
+pub fn partial_merged_held_comment(
+    pr_number: &str,
+    reopened: bool,
+    reason: &str,
+    timestamp: &str,
+) -> String {
+    let reopen_note = if reopened {
+        format!(
+            "\n- **Reopened** this issue (GitHub had auto-closed it from a stray closing keyword in PR #{pr_number}'s body or one of its commit messages — see #4569)"
+        )
+    } else {
+        String::new()
+    };
+    let why = crate::merge_pr::partial_reset::reason_text(reason);
+    format!(
+        "## Partial Increment Merged (remainder held)
+
+PR #{pr_number} merged with a non-closing `Part of` / `Contributes to` reference, so this issue remains **open**, but its issue body declares the remainder needs an operator (`loom:remainder-hold`, {why}).
+
+**Action taken**:{reopen_note}
+- Removed `loom:building` label
+- Added `loom:operator` label (not `loom:issue`): the daemon will not dispatch a builder at this scope
+
+**To release**: a human removes `loom:operator` and the `loom:remainder-hold` marker from the issue body, then re-applies `loom:issue` once the remainder is buildable.
+
+---
+*Reset by merge-pr.sh (#3667, #9264) at {timestamp}*"
+    )
+}
+
 /// The `## Premature Auto-Close Reverted` body (#4569), byte-frozen from the
 /// retired shell.
 ///

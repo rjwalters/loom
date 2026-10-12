@@ -164,9 +164,7 @@ fn sweep_started_envelope() -> TelemetryEnvelope {
             issue: 4858,
             sweep_id: "sweep-issue-4858-0".to_string(),
             started_at: chrono::Utc::now(),
-            model: None,
-            effort: None,
-            runtime: None,
+            facts: Default::default(),
         }),
     )
 }
@@ -197,6 +195,7 @@ fn host_health_envelope() -> TelemetryEnvelope {
             captainless_singleton_jobs: Vec::new(),
             exported_kinds: Vec::new(),
             exporters: Vec::new(),
+            otlp_export: None,
             memory: None,
         }),
     )

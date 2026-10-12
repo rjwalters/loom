@@ -38,6 +38,24 @@ pub(crate) fn issue_state_output(repo_root: &Path, issue: u64) -> Option<Output>
     .run())
 }
 
+/// [`issue_state_output`] with an explicit `owner/repo` target, so the facade
+/// selects the per-owner credential registered in the calling (daemon)
+/// process (#8876). A malformed slug yields `None`, never an untargeted read.
+pub(crate) fn issue_state_output_for_repo(
+    repo_root: &Path,
+    slug: &str,
+    issue: u64,
+) -> Option<Output> {
+    let target = GhTarget::repo(slug).ok()?;
+    let issue = issue.to_string();
+    ran(
+        GhInvocation::new(Operation::new("issue.view"), AccessIntent::Read, target, PROBE_TIMEOUT)
+            .args(["issue", "view", &issue, "--json", "state", "-q", ".state"])
+            .current_dir(repo_root)
+            .run(),
+    )
+}
+
 /// `gh pr view <pr> --repo <repo> --json mergedAt`.
 pub(crate) fn pr_merged_at_output(repo: &str, pr: u32) -> Option<Output> {
     let pr = pr.to_string();

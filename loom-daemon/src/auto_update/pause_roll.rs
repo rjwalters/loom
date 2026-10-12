@@ -101,6 +101,7 @@ use crate::sweep_registry::roll_requeue::RollRequeueNotice;
 
 pub(crate) mod host;
 pub(crate) mod ledger;
+pub mod loom_ui;
 mod refusal;
 mod stops;
 mod supervise;
@@ -743,6 +744,7 @@ pub(crate) fn run_h4_with(
             plan.from_version
         );
         log::error!("pause_roll: {note}");
+        loom_ui::pause_failed(&plan.from_version, &note); // #11295
         run.host.emit(
             "daemon.roll.pause_failed",
             serde_json::json!({ "manifest_id": manifest_id, "error": e.to_string(), "items": items }),
@@ -927,7 +929,7 @@ pub(crate) fn run_h4_with(
         let id = w.item.id.clone();
         run.event(Some(&id), "budget_missed", Some(detail));
     }
-    run.finish_stops(&mut pool, stop_bound);
+    let forced_stops = run.finish_stops(&mut pool, stop_bound);
     drop(pool);
     let stop_elapsed = stop_started.elapsed();
     let stop_secs = stop_elapsed.as_secs();
@@ -1061,6 +1063,7 @@ pub(crate) fn run_h4_with(
             "settle_secs": settle_secs,
             "stop_secs": stop_secs,
             "stop_ms": stop_ms,
+            "forced_stops": forced_stops,
             "total_secs": started.elapsed().as_secs(),
         }),
     );

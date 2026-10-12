@@ -1,5 +1,6 @@
 //! Per-workspace dispatch holds for workspace states W3 and W4, and the
-//! `repo_ahead_target` roll demand (#10719, tracker #10698 decision D1).
+//! `repo_ahead_target` roll demand (#10719, tracker #10698 decision D1); and
+//! the operator's `maintain-only` hold (#11186, [`maintain_only`]).
 //!
 //! Dispatch runs each repo's own installed files: agent worktrees start from
 //! the default branch, and the spawn script comes from the host's checkout.
@@ -15,6 +16,10 @@
 //! | Role runner, interval ticks | [`filter_held`] |
 //! | Role runner, idle-edge (`onIdle`) runs | [`refuse_role_start`] |
 //! | Epic supervisor: its whole tick, and its singleton roles (Architect, Champion) | the tick skips a held root; [`guard`] again in its `dispatch_role` |
+//!
+//! Every path asks [`hold_for`], which reports the `maintain-only` hold
+//! first and then a W3/W4 one, so a maintain-only workspace is refused on
+//! each of them exactly like a W3/W4 one.
 //!
 //! Not refused, on purpose: the pause-and-roll resume of sweeps and role runs
 //! (work that was already in flight when the host rolled), the resync itself,
@@ -133,6 +138,11 @@ pub enum HoldKind {
     /// W4: the installed files need a newer daemon than this one, or record a
     /// version that cannot be ordered against it.
     DaemonTooOld,
+    /// The registry marks the workspace maintain-only (#11186): the fleet
+    /// store's `fleet: maintain`, or `loom-daemon workspace hold`. Permanent
+    /// while the mark stands; never judged by a pass, never a roll demand,
+    /// never a "stuck" alert ([`maintain_only`]).
+    MaintainOnly,
 }
 
 impl HoldKind {
@@ -142,6 +152,7 @@ impl HoldKind {
         match self {
             Self::InstallIncompatible => "install-incompatible",
             Self::DaemonTooOld => "daemon-too-old",
+            Self::MaintainOnly => "maintain-only",
         }
     }
 
@@ -151,6 +162,7 @@ impl HoldKind {
         match self {
             Self::InstallIncompatible => HaltCause::InstallIncompatible,
             Self::DaemonTooOld => HaltCause::DaemonTooOld,
+            Self::MaintainOnly => HaltCause::MaintainOnly,
         }
     }
 }
@@ -163,6 +175,8 @@ pub enum HeldCopy {
     DefaultBranch,
     /// The host's checkout: where the spawn script and role runs come from.
     Checkout,
+    /// Neither: the `maintain-only` hold is the registry entry's mark.
+    Registry,
 }
 
 impl HeldCopy {
@@ -172,6 +186,7 @@ impl HeldCopy {
         match self {
             Self::DefaultBranch => "default-branch",
             Self::Checkout => "checkout",
+            Self::Registry => "registry",
         }
     }
 }
@@ -202,6 +217,16 @@ impl WorkspaceHold {
         let age = now.signed_duration_since(self.verdict_at);
         let fresh = chrono::Duration::from_std(fresh).ok()?;
         (age > fresh).then(|| format!("hold verdict is {} minutes old", age.num_minutes()))
+    }
+
+    /// `maintain-only`, or `<kind>, <copy> copy`: what a refusal's log line
+    /// names.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match self.kind {
+            HoldKind::MaintainOnly => self.kind.as_str().to_string(),
+            kind => format!("{}, {} copy", kind.as_str(), self.copy.as_str()),
+        }
     }
 
     /// `held: <kind> (<copy>) since <time>`, for a status line.
@@ -799,10 +824,33 @@ fn demand_cell() -> &'static Mutex<Option<RepoAheadDemand>> {
     DEMAND.get_or_init(|| Mutex::new(None))
 }
 
-/// The hold standing on `root`, if any. Cheap: no hold anywhere costs one
-/// read lock and no syscall.
+/// The hold that refuses new dispatch into `root`, if any: the
+/// `maintain-only` hold when the registry marks it (#11186), else a W3/W4
+/// hold ([`resync_hold_for`]). Every dispatch path asks this. Cheap: one
+/// `stat` of the registry file and one read lock.
 #[must_use]
 pub fn hold_for(root: &Path) -> Option<WorkspaceHold> {
+    if let Some(mark) = maintain_only::maintain_only_for(root) {
+        return Some(WorkspaceHold {
+            kind: HoldKind::MaintainOnly,
+            copy: HeldCopy::Registry,
+            since: mark.since,
+            detail: format!(
+                "set by the {} at {}",
+                mark.by.label(),
+                mark.since.format("%Y-%m-%dT%H:%M:%SZ")
+            ),
+            verdict_at: mark.since,
+        });
+    }
+    resync_hold_for(root)
+}
+
+/// The W3/W4 hold the workspace pass judged on `root`, if any, whatever the
+/// registry says: what the `Fleet store:` status block shows. Cheap: no hold
+/// anywhere costs one read lock and no syscall.
+#[must_use]
+pub fn resync_hold_for(root: &Path) -> Option<WorkspaceHold> {
     let holds = published()
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -987,6 +1035,11 @@ impl std::fmt::Display for WorkspaceHeldDispatchError {
                 "it clears when the workspace's installed Loom is resynced"
             }
             HoldKind::DaemonTooOld => "it clears when this host has rolled to a newer daemon",
+            HoldKind::MaintainOnly => {
+                "the daemon keeps its Loom install current and never dispatches into it; it \
+                 clears with `fleet: true` in the fleet store, or `loom-daemon workspace \
+                 release <root>` on a host no store drives"
+            }
         };
         write!(
             f,
@@ -1039,11 +1092,10 @@ pub fn filter_held(
         };
         if !logged.contains(&root) {
             log::warn!(
-                "role_runner: workspace {} is held ({}, {} copy): {}; no role tick starts there \
-                 until it clears (running roles are not touched)",
+                "role_runner: workspace {} is held ({}): {}; no role tick starts there until it \
+                 clears (running roles are not touched)",
                 root.display(),
-                hold.kind.as_str(),
-                hold.copy.as_str(),
+                hold.describe(),
                 hold.detail
             );
         }
@@ -1067,10 +1119,9 @@ pub fn refuse_role_start(root: &Path, what: &str) -> bool {
         return false;
     };
     log::info!(
-        "role_runner: {what} for {} suppressed: the workspace is held ({}, {} copy): {} (#10719)",
+        "role_runner: {what} for {} suppressed: the workspace is held ({}): {} (#10719)",
         root.display(),
-        hold.kind.as_str(),
-        hold.copy.as_str(),
+        hold.describe(),
         hold.detail
     );
     true
@@ -1088,6 +1139,10 @@ pub(crate) fn set_for_test(root: &Path, hold: Option<WorkspaceHold>) {
         None => holds.remove(&normalize(root)),
     };
 }
+
+pub mod maintain_only;
+#[cfg(test)]
+pub(crate) use maintain_only::set_maintain_only_for_test;
 
 #[cfg(test)]
 mod tests;

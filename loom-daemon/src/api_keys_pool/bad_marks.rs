@@ -286,7 +286,8 @@ pub fn mark_bad_for_class(
     cooldown_secs: Option<u64>,
     model_class: Option<&str>,
 ) -> Result<BadMark, String> {
-    match write_mark(root, provider, name, reason, cooldown_secs, model_class, false)? {
+    let horizon = Horizon::Cooldown(cooldown_secs);
+    match write_mark(root, provider, name, reason, horizon, model_class, false)? {
         MarkWrite::Written(mark) | MarkWrite::AlreadyCovered(mark) => Ok(mark),
     }
 }
@@ -322,7 +323,38 @@ pub fn escalate_bad_for_class(
     cooldown_secs: Option<u64>,
     model_class: Option<&str>,
 ) -> Result<MarkWrite, String> {
-    write_mark(root, provider, name, reason, cooldown_secs, model_class, true)
+    let horizon = Horizon::Cooldown(cooldown_secs);
+    write_mark(root, provider, name, reason, horizon, model_class, true)
+}
+
+/// [`escalate_bad_for_class`] with an **absolute** reset instant (#11286).
+///
+/// For a caller that already resolved *when* the evidence it holds ends —
+/// the launch-log ingest anchors a relative horizon (configured window,
+/// default cooldown, provider `retry-after`) on the instant the evidence was
+/// first seen, so re-reading the same evidence later (the in-run watcher,
+/// then the exit-time pass) asks for the same deadline instead of pushing it
+/// out by however long the run took to exit. A deadline at or before `now`
+/// is refused: replaying lapsed evidence must not create a fresh hold.
+pub fn escalate_bad_until_for_class(
+    root: &Path,
+    provider: &str,
+    name: &str,
+    reason: &str,
+    resets_at: u64,
+    model_class: Option<&str>,
+) -> Result<MarkWrite, String> {
+    let horizon = Horizon::Until(resets_at);
+    write_mark(root, provider, name, reason, horizon, model_class, true)
+}
+
+/// How long a [`write_mark`] holds the seat.
+#[derive(Clone, Copy)]
+enum Horizon {
+    /// Seconds from the write's `now` (`None`: until an explicit unmark).
+    Cooldown(Option<u64>),
+    /// An absolute Unix-seconds reset instant.
+    Until(u64),
 }
 
 fn write_mark(
@@ -330,13 +362,13 @@ fn write_mark(
     provider: &str,
     name: &str,
     reason: &str,
-    cooldown_secs: Option<u64>,
+    horizon: Horizon,
     model_class: Option<&str>,
     never_shorten: bool,
 ) -> Result<MarkWrite, String> {
     validate_provider(provider)?;
     validate_account(name)?;
-    if cooldown_secs == Some(0) {
+    if matches!(horizon, Horizon::Cooldown(Some(0))) {
         return Err(
             "cooldown_secs must be > 0 (use `api-keys unblock` to clear a mark immediately)"
                 .to_string(),
@@ -366,11 +398,19 @@ fn write_mark(
     let _lock = MkdirLock::acquire(&lock_path(root, provider))
         .map_err(|e| format!("cannot lock bad-marks file: {e}"))?;
     let now = epoch_now();
+    let wanted = match horizon {
+        Horizon::Cooldown(cooldown_secs) => cooldown_secs.map(|secs| now + secs),
+        Horizon::Until(at) if at > now => Some(at),
+        Horizon::Until(at) => {
+            return Err(format!(
+                "reset instant {at} is not after now ({now}); the evidence's hold has lapsed"
+            ));
+        }
+    };
     // `?`: refuse to rewrite an unusable file from an empty read, which would
     // permanently drop every other account's mark.
     let mut marks = read_marks(root, provider)?;
     if never_shorten {
-        let wanted = cooldown_secs.map(|secs| now + secs);
         let covering = marks
             .iter()
             .filter(|m| {
@@ -398,7 +438,7 @@ fn write_mark(
         name: name.to_string(),
         reason: reason.replace(['\n', '\r'], " "),
         marked_at: now,
-        resets_at: cooldown_secs.map(|secs| now + secs),
+        resets_at: wanted,
         model_class,
     };
     marks.push(mark.clone());

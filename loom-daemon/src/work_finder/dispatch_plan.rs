@@ -91,6 +91,7 @@ pub fn gate_of(disposition: Qd) -> Option<PlanGate> {
         Qd::DeferredBuildBackoff => Some(PlanGate::BuildBackoff),
         Qd::DeferredRepoCap => Some(PlanGate::RepoCap),
         Qd::DeferredOutOfSlice => Some(PlanGate::OutOfSlice),
+        Qd::DeferredFileOverlap => Some(PlanGate::FileOverlap),
         _ => None,
     }
 }
@@ -140,7 +141,7 @@ pub fn annotate(
         shard: inputs.shard,
         scope: PLAN_SCOPE.iter().map(|s| (*s).to_string()).collect(),
         ordering: ready_queue::ordering_names(),
-        complete: report.listing_failed.is_empty(),
+        complete: report.listing_not_whole().is_empty(),
     }
 }
 

@@ -183,16 +183,34 @@ impl Run<'_> {
     /// Wait for the teardowns still running, until `bound`. A tree whose
     /// teardown has not returned by then has its process group killed and is
     /// recorded stopped.
-    pub(super) fn finish_stops(&mut self, pool: &mut StopPool, bound: Instant) {
+    ///
+    /// Returns how many trees were force-stopped (#11083).
+    ///
+    /// A teardown that finishes just as the bound passes is recorded as a
+    /// normal stop (with its `teardown_ms`), not a forced one: the pool is
+    /// drained once more after the wait, before anything is abandoned.
+    ///
+    /// A forced tree keeps its disposition. A parked item killed here stays
+    /// resumable, whereas the ledger's deadline path requeues it. The two
+    /// differ on purpose: here the item reached its safe point and the
+    /// session is intact on disk, so only the process group is cut short;
+    /// the ledger path fires with no such guarantee. H5 reaps leftovers
+    /// before it resumes either way. Only the process group is signalled: a
+    /// queued teardown that never started gets no SIGTERM and its scope is
+    /// not stopped, so `setsid` children survive until H5 (design doc, §5).
+    pub(super) fn finish_stops(&mut self, pool: &mut StopPool, bound: Instant) -> usize {
         while pool.has_pending() {
             match pool.next_until(bound) {
                 Some((idx, report)) => self.record_stop(idx, &report),
                 None => break,
             }
         }
-        for idx in pool.abandon() {
+        self.collect_stops(pool);
+        let abandoned = pool.abandon();
+        for &idx in &abandoned {
             self.force_stop(idx, bound);
         }
+        abandoned.len()
     }
 
     /// What a finished teardown records.

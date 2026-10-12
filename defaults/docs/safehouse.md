@@ -55,7 +55,7 @@ below.
 ## The degradation contract (read this first)
 
 Safehouse is a **best-effort side-channel with no hard dependency** — it mirrors
-the claude-monitor optional-integration pattern. **Loom never blocks a sweep on
+the llm-monitor (formerly claude-monitor) optional-integration pattern. **Loom never blocks a sweep on
 safehouse.** Concretely:
 
 - `safehouse.enabled` false/absent ⇒ **byte-for-byte no-op**: the daemon does
@@ -1843,6 +1843,18 @@ One more `ClaimKind` on the same envelope closes it:
   forever. A missing/zero `consecutive` (a pre-#9292 peer) contributes `0`; a
   missing/zero `remaining_secs` reads as an already-elapsed window whose release
   still counts for the streak hour.
+- **Unresolved senders add a window, never a count (#9518).** Every other lane
+  keeps the #5063 carve-out: an `UNKNOWN_HOST` ad is treated as a peer, never as
+  self, because its worst case is a harmless extra backoff. That argument is
+  *window-specific*. This lane sums counts, and an unresolved sender cannot prove
+  its count is disjoint from ours; when the receiver is also `UNKNOWN_HOST` it is
+  very likely our own echoed ad, which would double the tally and trip the hold
+  at about half the threshold. So `observe_prless_release_at` keeps the
+  conservative backoff window for an `UNKNOWN_HOST` ad but stores `0` as its
+  contribution to the peer tally, whatever the receiver's identity. Unidentified
+  senders therefore degrade counting to the exact local count plus any
+  identifiable peers (two unresolved hosts do not count each other). Known self
+  ads are still excluded and known peers still sum.
 - **Degrades to the pre-#9292 tally, loudly.** No publisher/view attached, a
   dropped ad, a pre-#9292 peer, or a poisoned view all reduce the peer term to
   what could be read, leaving this host's own exact count behind. Precondition 1
@@ -2283,7 +2295,7 @@ accepts-nobody config that still reports as enabled.
 **Two independent opt-ins, because one of them is a chat room.** The
 `concierge` role is excluded from the role runner's "unset `roles` ⇒ all
 defaults" fallback (like `architect`), **and** gated a second time on this block
-resolving (`role_runner::role_is_config_gated`). Naming it in
+resolving (a role-runner config gate, removed in #11112). Naming it in
 `autonomous.roleRunner.roles` is not sufficient. An install without safehouse,
 or with safehouse but without this block, is byte-for-byte unaffected: no role
 tick, no budget file, no socket, no listener.
@@ -2378,9 +2390,7 @@ and gets exactly today's read-only narrator.
 
 ### Implementation (phase 3b)
 
-- `defaults/.claude/commands/loom/concierge.md` — the role prompt (symlinked as
-  `defaults/roles/concierge.md`), with `defaults/roles/concierge.json` for
-  cadence metadata.
+- The concierge role prompt and its cadence metadata (removed in #11112).
 - `loom-daemon/src/concierge.rs` — config resolution, the sender allowlist.
 - `loom-daemon/src/concierge/intent.rs` — `RoomMessage`, the injection scan, the
   five-variant `Verb`, and the conservative prose → `Proposal` map.
@@ -2393,7 +2403,8 @@ and gets exactly today's read-only narrator.
 - `loom-daemon/src/concierge/budget.rs` — the per-tick + per-day ledger.
 - `loom-daemon/src/cli/concierge.rs` — the six subcommands above.
 - `loom-daemon/src/role_runner.rs` — the `concierge` `RoleSpec` (300s listening
-  cadence, `interval_default: false`) and `role_is_config_gated`.
+  cadence, `interval_default: false`) and its config gate (both removed in
+  #11112).
 
 > Out of scope here, as in 3a: any widening of the daemon's typed enum. Phase 4
 > (interface parity, digests, watch-results posted into the room) landed as
@@ -2457,7 +2468,7 @@ digest's suppression makes a listening cadence safe for a summary cadence.
 
 ### What the persona may and may not do with them
 
-The concierge prompt (`.loom/roles/concierge.md`) carries the one-line rule —
+The concierge prompt (removed in #11112) carried the one-line rule —
 "you run them, you never author, re-render, or continue them". The reasoning
 behind each clause lives here, so the always-loaded prompt does not pay for it:
 

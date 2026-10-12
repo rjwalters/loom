@@ -298,6 +298,15 @@ pub struct OutcomeRecord {
     /// any line that fails to deserialize.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tap_usage_all: Vec<crate::tap_usage::TapAccounting>,
+    /// Out-of-process phase launches (`worker run --role builder|doctor`,
+    /// Issue #11360) that named this sweep, one row per `(role, tap)`, read from
+    /// their own phase logs. Never folded into [`Self::tap_usage`] /
+    /// [`Self::tap_usage_all`], which stay the parent orchestrator's own region:
+    /// the sweep's whole per-tap spend is the fold of both
+    /// ([`crate::tap_usage::RegionAccounting::sweep_totals_by_tap`]). Empty, and
+    /// absent from the line, when no phase ran out of process.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub phase_tap_usage: Vec<crate::tap_usage::PhaseTapAccounting>,
     /// Elapsed wall-clock seconds from dispatch to this terminal outcome.
     pub duration_sec: i64,
 }
@@ -340,6 +349,8 @@ pub fn append_outcome(path: &Path, record: &OutcomeRecord) -> Result<()> {
         .with_context(|| format!("opening outcomes journal {}", path.display()))?;
     writeln!(file, "{line}")
         .with_context(|| format!("appending to outcomes journal {}", path.display()))?;
+    // J1 shadow (#11346): after the legacy append, never instead of it.
+    crate::journal::execution::outcome_appended(path, record);
     Ok(())
 }
 
@@ -530,6 +541,29 @@ pub fn read_all_outcome_telemetry(path: &Path) -> Vec<telemetry::TelemetryEnvelo
         .lines()
         .filter_map(|line| serde_json::from_str(line).ok())
         .collect()
+}
+
+/// Like [`read_all_sweep_outcomes`], but `None` when the journal exists and
+/// could not be read (a directory at the path, invalid UTF-8, permissions). A
+/// missing file is a genuinely new journal and yields `Some(vec![])`, so a
+/// caller that must not fabricate "first attempt" from an unreadable journal
+/// (Issue #11280) can tell the two apart.
+#[must_use]
+pub fn try_read_all_sweep_outcomes(path: &Path) -> Option<Vec<telemetry::SweepOutcomeRecord>> {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => Some(
+            contents
+                .lines()
+                .filter_map(|line| serde_json::from_str::<telemetry::TelemetryEnvelope>(line).ok())
+                .filter_map(|envelope| match envelope.record {
+                    telemetry::TelemetryRecord::SweepOutcome(record) => Some(record),
+                    _ => None,
+                })
+                .collect(),
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(Vec::new()),
+        Err(_) => None,
+    }
 }
 
 /// Read every [`crate::telemetry::SweepOutcomeRecord`] from `path` (unwrapping
@@ -727,6 +761,7 @@ mod tests {
             jev_confidence: None,
             tap_usage: None,
             tap_usage_all: Vec::new(),
+            phase_tap_usage: Vec::new(),
             duration_sec: 1,
         }
     }
@@ -966,6 +1001,7 @@ mod tests {
                 attempt_index: None,
                 previous_sweep_id: None,
                 trigger: None,
+                dispatch_origin: None,
                 rework_events: None,
                 pr_numbers: None,
                 hw_lines_added: None,

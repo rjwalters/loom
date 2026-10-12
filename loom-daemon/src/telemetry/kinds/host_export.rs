@@ -4,7 +4,8 @@
 //! Export coverage used to reach SigNoz only as gauges. This record carries the
 //! facts a fast-refit window needs to see its own holes: which exporters are
 //! active, how deep each exporter's queue is, a cumulative `dropped_total` per
-//! exporter, and when each last flushed successfully.
+//! exporter, and when each last flushed successfully. It also counts the
+//! `eta.stage_outcome` exits emitted without a `loom.fact_id` (#11401).
 //!
 //! **Facts only.** Every host emits its own view; nothing is elected, nothing
 //! is capped, and no rate or estimate is computed here. `dropped_total` is
@@ -29,6 +30,10 @@ pub const HOST_EXPORT_LOG_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.host_export.queue_depth",
     "loom.host_export.dropped_total",
     "loom.host_export.last_flush_ok_at",
+    "loom.host_export.fact_id_missing_total",
+    // #11530: `opaque_host_id(host)`, the `host-XXXXXXXX` form `loom:lease`
+    // comments publish, derived in the OTLP mapping (no wire field).
+    "host.lease_id",
 ];
 
 /// One exporter's queue and flush facts.
@@ -56,6 +61,12 @@ pub struct HostExportRecord {
     pub host: String,
     /// One entry per active exporter, sorted by name.
     pub exporters: Vec<ExporterExport>,
+    /// `eta.stage_outcome` exits this process emitted without a
+    /// `loom.fact_id` (#11401): each carried `loom.fact_id_missing_reason`.
+    /// Cumulative per process lifetime, like `dropped_total`. Absent on
+    /// records from before #11401.
+    #[serde(default)]
+    pub fact_id_missing_total: u64,
 }
 
 /// One queue's depth and lifetime drop count, as the collector reads them.
@@ -96,6 +107,7 @@ impl HostExportRecord {
             captured_at: now,
             host: host.to_string(),
             exporters,
+            fact_id_missing_total: super::stage_outcome::fact_id_missing_total(),
         }
     }
 

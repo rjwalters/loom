@@ -678,6 +678,7 @@ mod tests {
                     root: normalize_path(r),
                     priority: 100,
                     config_overrides: None,
+                    maintain_only: None,
                 })
                 .collect(),
         }

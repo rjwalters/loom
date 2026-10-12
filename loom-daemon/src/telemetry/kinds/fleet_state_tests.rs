@@ -60,14 +60,17 @@ fn record() -> FleetStateRecord {
         chunk_index: 0,
         chunk_count: 1,
         stamps: stamps(),
+        tick_interval_secs: Some(60),
         census_at: Some(at(12, 4)),
         slots: Some(FleetSlots {
             max_concurrent: 4,
             occupancy: Some(1),
         }),
+        capacity: None,
         repos: vec![FleetStateRepo {
             repo: "rjwalters/loom".to_string(),
             visibility: RepoVisibility::Public,
+            main_ci: None,
             ready_complete: true,
             ready_replace: false,
             census: Some(FleetPrCensus {
@@ -89,6 +92,7 @@ fn anchor_with(n: u32) -> FleetStateRecord {
         .map(|(i, repo)| FleetStateRepo {
             repo: (*repo).to_string(),
             visibility: RepoVisibility::Private,
+            main_ci: None,
             ready_complete: true,
             ready_replace: false,
             census: Some(FleetPrCensus::default()),
@@ -155,10 +159,12 @@ fn the_header_carries_chunks_and_stamps_and_no_truncation_field() {
             "planner_version",
             "repos",
             "schema",
-            "slots"
+            "slots",
+            "tick_interval_secs"
         ]
     );
     assert_eq!(wire["chunk_count"], 1);
+    assert_eq!(wire["tick_interval_secs"], 60);
     // A host with no fleet store omits the fleet stamp.
     let mut r = record();
     r.stamps.fleet_config_hash = None;
@@ -166,6 +172,17 @@ fn the_header_carries_chunks_and_stamps_and_no_truncation_field() {
         .unwrap()
         .get("fleet_config_hash")
         .is_none());
+}
+
+/// `tick_interval_secs` is additive (#11161): a record from an emitter that
+/// predates it decodes, with no cadence.
+#[test]
+fn a_record_without_tick_interval_secs_still_decodes() {
+    let mut wire = serde_json::to_value(record()).unwrap();
+    wire.as_object_mut().unwrap().remove("tick_interval_secs");
+    let back: FleetStateRecord = serde_json::from_value(wire).unwrap();
+    assert_eq!(back.tick_interval_secs, None);
+    assert_eq!(back.repos, record().repos);
 }
 
 /// The per-item facts: stage, entered-at, PR, host and slot. Pinned,
@@ -234,6 +251,8 @@ fn stage_wire_names_are_the_contract_names() {
         (FleetStage::Doctor, "doctor"),
         (FleetStage::MergeWait, "merge_wait"),
         (FleetStage::MergeHold, "merge_hold"),
+        (FleetStage::TriageWait, "triage_wait"),
+        (FleetStage::ApprovalWait, "approval_wait"),
     ] {
         assert_eq!(stage.as_str(), name);
         assert_eq!(serde_json::to_value(stage).unwrap(), name);
@@ -330,6 +349,7 @@ fn removals_and_census_only_repos_survive_a_split() {
         FleetStateRepo {
             repo: "acme/a".to_string(),
             visibility: RepoVisibility::Private,
+            main_ci: None,
             ready_complete: true,
             ready_replace: false,
             census: None,
@@ -339,6 +359,7 @@ fn removals_and_census_only_repos_survive_a_split() {
         FleetStateRepo {
             repo: "acme/b".to_string(),
             visibility: RepoVisibility::Private,
+            main_ci: None,
             ready_complete: true,
             ready_replace: false,
             census: Some(FleetPrCensus::default()),
@@ -378,6 +399,7 @@ fn ready_replace_is_additive_and_rides_every_chunk() {
     r.repos = vec![FleetStateRepo {
         repo: "acme/a".to_string(),
         visibility: RepoVisibility::Private,
+        main_ci: None,
         ready_complete: false,
         ready_replace: true,
         census: None,
@@ -413,7 +435,7 @@ fn collector_keeps_every_fleet_state_log_attribute() {
         .find(|l| {
             l.contains("keep_keys(attributes, [")
                 && l.contains("loom.ci.chunk_index")
-                && l.contains("loom.eta.estimate_id")
+                && l.contains("loom.eta.pr.state")
         })
         .expect("the transform/privacy log keep_keys line");
     for key in FLEET_STATE_LOG_ATTRIBUTE_KEYS

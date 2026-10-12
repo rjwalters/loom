@@ -241,6 +241,7 @@ fn every_metric_name_serializes_to_its_as_str() {
         MetricName::HostWorktreeVolumeTotalBytes,
         MetricName::QueueIssues,
         MetricName::QueueListingFailedRepos,
+        MetricName::QueueListingIncompleteRepos,
         MetricName::LlmTokensInput,
         MetricName::LlmTokensOutput,
         MetricName::LlmTokensCacheRead,
@@ -250,6 +251,9 @@ fn every_metric_name_serializes_to_its_as_str() {
         MetricName::PoolExhausted,
         MetricName::PoolExhaustions,
         MetricName::PoolExhaustedSeconds,
+        MetricName::PoolAccountState,
+        MetricName::PoolPlanTokenLimit,
+        MetricName::PoolPlanWindowSeconds,
         MetricName::PoolAccountMarks,
         MetricName::DispatchSlotTurnaround,
         MetricName::DispatchSlotTurnaroundSamples,
@@ -274,26 +278,16 @@ fn every_metric_name_serializes_to_its_as_str() {
         MetricName::GithubRateLimitBreakerSkips,
         MetricName::ForgeCalls,
         MetricName::ForgeFacadeEvents,
-        MetricName::EtaHealthItems,
-        MetricName::EtaHealthFitLoaded,
-        MetricName::EtaHealthFitAgeSeconds,
-        MetricName::EtaHealthFitCheckAgeSeconds,
-        MetricName::EtaHealthSnapshotAgeSeconds,
-        MetricName::EtaHealthRefreshGate,
-        MetricName::EtaHealthRefreshLastCycleAgeSeconds,
-        MetricName::EtaHealthRefreshRepos,
-        MetricName::EtaHealthSnapshotRows,
-        MetricName::EtaHealthSnapshotAlternatesRows,
-        MetricName::EtaHealthSnapshotRowsTruncated,
-        MetricName::EtaHealthSnapshotAlternatesTruncated,
-        MetricName::EtaHealthSnapshotBytes,
-        MetricName::EtaHealthPendingOverCap,
         MetricName::CodexSessionState,
         MetricName::CodexSessionRecord,
         MetricName::CodexSessionMountDrift,
         MetricName::CaptainGaugeAgeSeconds,
         MetricName::CaptainGaugeFallback,
         MetricName::AgentScopePeakMemoryBytes,
+        MetricName::EgressRequests,
+        MetricName::EgressTokens,
+        MetricName::EgressLatency,
+        MetricName::EgressTtft,
     ] {
         assert_eq!(serde_json::to_value(name).unwrap(), name.as_str());
     }
@@ -403,7 +397,7 @@ fn tick_points_emit_only_nonzero_reasons_plus_gauges() {
         seen: 6,
         dispatched: 2,
         skipped_peer_claim: 1,
-        skipped_host_class: 1,
+        skipped_host_constraint: 1,
         deferred_capacity: 2,
         ..TickReport::default()
     };
@@ -418,7 +412,7 @@ fn tick_points_emit_only_nonzero_reasons_plus_gauges() {
         [
             ("capacity".to_string(), MetricValue::Int(2)),
             ("dispatched".to_string(), MetricValue::Int(2)),
-            ("host_class".to_string(), MetricValue::Int(1)),
+            ("host_constraint".to_string(), MetricValue::Int(1)),
             ("peer_claim".to_string(), MetricValue::Int(1)),
         ]
         .into_iter()
@@ -570,7 +564,6 @@ fn queue_summary(
                 workspace_priority: 100,
                 urgent: false,
                 operator_priority: false,
-                operator_priority_at: None,
                 main_red_fix: false,
                 created_at: None,
                 tier: None,
@@ -596,8 +589,9 @@ fn queue_points_emit_every_disposition_with_zeros_and_no_issue_label() {
         Qd::OpenPr,
     ]);
     summary.listing_failed = vec!["/r2".into()];
+    summary.listing_incomplete = vec!["/r3".into(), "/r4".into()];
     let points = super::queue::queue_points(&summary);
-    assert_eq!(points.len(), Qd::ALL.len() + 1);
+    assert_eq!(points.len(), Qd::ALL.len() + 2);
     let value = |reason: &str| {
         points
             .iter()
@@ -621,6 +615,11 @@ fn queue_points_emit_every_disposition_with_zeros_and_no_issue_label() {
         .find(|p| p.name == MetricName::QueueListingFailedRepos)
         .unwrap();
     assert_eq!(failed.value, MetricValue::Int(1));
+    let partial = points
+        .iter()
+        .find(|p| p.name == MetricName::QueueListingIncompleteRepos)
+        .unwrap();
+    assert_eq!(partial.value, MetricValue::Int(2));
     for point in &points {
         // Every label survives the export policy unchanged: only allowlisted,
         // bounded keys (state, reason), never an issue number or repo.

@@ -575,7 +575,7 @@ fn plan_order_is_the_dispatch_order_under_slice_and_cap() {
 }
 
 /// A tick without a slice or cap still records its (unshaped) order, which
-/// is then just the comparator order.
+/// is then just the workspace-draw order (#11103).
 #[test]
 fn plan_order_without_shaping_is_the_sorted_order() {
     let mut workspaces = [
@@ -583,7 +583,21 @@ fn plan_order_without_shaping_is_the_sorted_order() {
         (OneShotSource::of(&[1]), CapDispatcher::default()),
     ];
     let report = tick_capped(&mut workspaces, &[5, 0], 10, None);
-    assert_eq!(report.plan_order, vec![(1, 1), (0, 3), (0, 4)]);
+    let drawn: Vec<(usize, u32)> = report
+        .workspace_draw
+        .as_ref()
+        .unwrap()
+        .steps
+        .iter()
+        .map(|s| (s.workspace_idx, s.issue))
+        .collect();
+    assert_eq!(report.plan_order, drawn);
+    let ws0: Vec<u32> = drawn
+        .iter()
+        .filter(|(w, _)| *w == 0)
+        .map(|(_, n)| *n)
+        .collect();
+    assert_eq!(ws0, vec![3, 4], "in-workspace order kept");
     assert_eq!(report.in_slice, None);
     assert_eq!(report.max_admissions_per_tick, Some(usize::MAX));
 }

@@ -155,6 +155,26 @@ pub fn verdict(prs: &[Pr]) -> &'static str {
 ///
 /// An all-whitespace value canonicalizes to the empty string, so it hashes
 /// identically to passing nothing at all — which is what it means.
+///
+/// **Persisted contract and its one transition (#9308).** `CONCLUSION_HASH`
+/// lives in posted `curator:dep-recheck` markers, so this canonicalization is
+/// part of a cross-release contract pinned by exact golden vectors in
+/// `recheck/tests.rs`. It changed once: #8320 (`4daa840bf`, 2026-09-18, first
+/// tagged v0.19.187) introduced it, so every build before that (the shell
+/// original and the v0.19.104–v0.19.186 Rust port) hashed the reason verbatim.
+/// Any nonempty reason or orthogonal identity that is not already lowercase
+/// and single-spaced hashes differently on the two sides. A marker written
+/// before the change re-posts once after it. Two hosts on either side of it
+/// alternate on every pass. #9308's reported pair
+/// (`41df30ee18089360` → `e8876061202241c6`) is exactly that pre/post pair.
+/// The historical binaries behind the reported repeated oscillation were not
+/// recovered, so a mixed-version fleet is the likely explanation but it is
+/// unverified. For inputs with linked PRs the overall hash also moved, separately,
+/// at #8253 (`cb6be106f`, first tagged v0.19.197: MERGED/CLOSED blockers bucketed
+/// `n/a`) and #7364 (label component narrowed); #64's pair was never decomposed,
+/// so those are not ruled out. No other version-dependent input exists: no map
+/// iteration, no locale, no version string. One caveat: `to_lowercase`/`split_whitespace`
+/// follow the toolchain's Unicode tables, which are stable for ASCII.
 fn canonical_hash_input(s: &str) -> String {
     // `split_whitespace` trims and collapses in one pass, over Unicode
     // whitespace rather than just ASCII.

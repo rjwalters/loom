@@ -20,7 +20,6 @@ fn row(rank: usize, repo: &str, issue: u32, d: Qd, detail: Option<&str>) -> Read
         workspace_priority: 100,
         urgent: false,
         operator_priority: false,
-        operator_priority_at: None,
         main_red_fix: false,
         created_at: Some("2026-09-01T00:00:00Z".into()),
         tier: Some("tier:goal-advancing".into()),
@@ -134,6 +133,29 @@ fn listing_failures_name_resolved_repos_and_count_the_rest() {
 }
 
 #[test]
+fn a_partial_listing_is_reported_not_passed_off_as_whole() {
+    // #11139: the partial repo's rows ARE exported, and the repo is named in
+    // `listing_incomplete` so a consumer does not read missing rows as gone.
+    let mut s = summary(vec![row(1, ROOT, 100, Qd::DeferredCapacity, None)]);
+    s.listing_incomplete = vec![ROOT.to_string(), "workspace #3".to_string()];
+    let record = build_record(&s, &repos());
+    assert!(record.listing_failed.is_empty());
+    assert_eq!(record.listing_incomplete.len(), 1);
+    assert_eq!(record.listing_incomplete[0].repo, "acme/secret");
+    assert_eq!(record.listing_incomplete_unresolved, 1);
+    assert_eq!(record.rows.len(), 1);
+    let json = serde_json::to_value(&record).unwrap();
+    assert_eq!(json["listing_incomplete"][0]["repo"], "acme/secret");
+    assert_eq!(json["listing_incomplete_unresolved"], 1);
+
+    // A whole tick omits both fields on the wire (older readers unchanged).
+    let whole = build_record(&summary(Vec::new()), &repos());
+    let json = serde_json::to_value(&whole).unwrap();
+    assert!(json.get("listing_incomplete").is_none());
+    assert!(json.get("listing_incomplete_unresolved").is_none());
+}
+
+#[test]
 fn only_a_newer_tick_is_emitted() {
     let t = Utc.timestamp_opt(1_790_000_000, 0).unwrap();
     assert!(is_new_tick(t, None));
@@ -167,19 +189,18 @@ fn a_row_without_visibility_decodes_private() {
 
 #[test]
 fn rows_carry_operator_priority_and_urgent_is_always_false() {
-    // #9244: starred rows ship `operator_priority` / `operator_priority_at`;
-    // `urgent` stays on the wire for one release but is always false, even if
-    // a (stale) summary row still claims it.
+    // #9244: `operator_priority` is copied from the row (always false since
+    // #11508, which also dropped `operator_priority_at`); `urgent` stays on
+    // the wire but is always false, even if a (stale) summary row claims it.
     let mut starred = row(1, PUBLIC_ROOT, 10, Qd::Dispatched, None);
     starred.urgent = true;
     starred.operator_priority = true;
-    starred.operator_priority_at = Some("2026-09-27T08:00:00Z".into());
     let plain = row(2, PUBLIC_ROOT, 11, Qd::DeferredCapacity, None);
     let record = build_record(&summary(vec![starred, plain]), &repos());
     let wire = serde_json::to_value(&record.rows).unwrap();
     assert_eq!(wire[0]["urgent"], false);
     assert_eq!(wire[0]["operator_priority"], true);
-    assert_eq!(wire[0]["operator_priority_at"], "2026-09-27T08:00:00Z");
+    assert!(wire[0].get("operator_priority_at").is_none(), "{wire}");
     assert_eq!(wire[1]["operator_priority"], false);
     assert!(wire[1].get("operator_priority_at").is_none(), "{wire}");
     // An older daemon's row (no new fields) still decodes.
@@ -254,4 +275,47 @@ fn a_row_without_plan_fields_decodes_with_defaults() {
     }))
     .unwrap();
     assert_eq!(row.plan, crate::types::RowPlan::default());
+}
+
+#[test]
+fn deferred_file_overlap_row_exports_its_shared_paths_in_the_serialized_snapshot() {
+    let s = summary(vec![
+        row(
+            1,
+            PUBLIC_ROOT,
+            10,
+            Qd::DeferredFileOverlap,
+            Some("file overlap: x/b.rs, Dockerfile"),
+        ),
+        row(2, PUBLIC_ROOT, 11, Qd::DispatchError, Some("boom: secret stderr")),
+    ]);
+    let record = build_record(&s, &repos());
+    let json = serde_json::to_value(&record).unwrap();
+    let rows = json["rows"].as_array().unwrap();
+    assert_eq!(rows[0]["detail"], "file overlap: x/b.rs, Dockerfile");
+    assert!(rows[1].get("detail").is_none_or(serde_json::Value::is_null), "{}", rows[1]);
+    assert!(
+        !json.to_string().contains("secret stderr"),
+        "dispatch-error text stays excluded"
+    );
+}
+
+#[test]
+fn workspace_halted_rows_carry_halt_cause_and_name_it_in_reason() {
+    let s = summary(vec![
+        row(1, PUBLIC_ROOT, 10, Qd::WorkspaceHalted, Some("main_red")),
+        row(2, PUBLIC_ROOT, 11, Qd::WorkspaceHalted, None),
+        row(3, PUBLIC_ROOT, 12, Qd::WorkspaceHalted, Some("free text")),
+        row(4, PUBLIC_ROOT, 13, Qd::DeferredCapacity, Some("main_red")),
+    ]);
+    let rows = build_record(&s, &repos()).rows;
+    assert_eq!(rows[0].halt_cause.as_deref(), Some("main_red"));
+    assert_eq!(rows[0].reason, "blocked: repo dispatch held — main red");
+    for r in &rows[1..3] {
+        assert_eq!(r.halt_cause, None);
+        assert_eq!(r.reason, Qd::WorkspaceHalted.reason());
+    }
+    assert_eq!(rows[3].halt_cause, None);
+    let json = serde_json::to_value(&rows[1]).unwrap();
+    assert!(json.get("halt_cause").is_none());
 }

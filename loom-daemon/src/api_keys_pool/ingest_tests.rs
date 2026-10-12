@@ -637,3 +637,60 @@ fn a_kimi_failure_never_touches_the_claude_or_codex_pools() {
     .unwrap()
     .is_none());
 }
+
+/// #11286 acceptance 2: a seat that hit its weekly cap is not selected again
+/// before its configured reset — the 6 h default no longer returns it early.
+#[test]
+fn a_weekly_capped_seat_stays_out_until_its_configured_window() {
+    let clock = bad_marks::test_clock::pin(T0);
+    let tmp = workspace(&["alpha"]);
+    super::super::limits::set_exhaustion_window(
+        &pool_root(tmp.path()),
+        PROVIDER,
+        "alpha",
+        Some(7 * 86_400),
+    )
+    .unwrap();
+    let contents = log("pool", Some("alpha"), "glm-5.3-flash", "Error: insufficient balance");
+    let feedback = ingest_launch_log(tmp.path(), &contents, ANCHOR, Some(1)).unwrap();
+    let mark = feedback.mark.expect("marked");
+    assert_eq!(mark.resets_at, Some(T0 + 7 * 86_400));
+    assert!(feedback.detail.contains("configured plan window"), "{}", feedback.detail);
+    clock.set(T0 + 6 * 3600 + 1);
+    assert!(
+        active(tmp.path(), "alpha", Some("glm-5.3-flash")).is_some(),
+        "still held after 6h"
+    );
+    clock.set(T0 + 7 * 86_400 + 1);
+    assert!(
+        active(tmp.path(), "alpha", Some("glm-5.3-flash")).is_none(),
+        "free after the window"
+    );
+}
+
+/// #11286: a reset instant the provider printed beats both the configured
+/// window and the default. The provider line is SYNTHETIC / UNVERIFIED (no
+/// real Z.ai exhausted output has been captured).
+#[test]
+fn a_provider_reported_reset_sets_the_horizon_and_the_agents_quote_never_does() {
+    let _clock = bad_marks::test_clock::pin(T0);
+    let tmp = workspace(&["alpha"]);
+    super::super::limits::set_exhaustion_window(
+        &pool_root(tmp.path()),
+        PROVIDER,
+        "alpha",
+        Some(7 * 86_400),
+    )
+    .unwrap();
+    let reset = T0 + 5 * 3600;
+    let output = format!(
+        "{{\"type\":\"text\",\"text\":\"it said reset_at {}\"}}\n\
+         {{\"error\":{{\"message\":\"insufficient balance\",\"reset_at\":{reset}}}}}",
+        T0 + 86_400
+    );
+    let contents = log("pool", Some("alpha"), "glm-5.3-flash", &output);
+    let feedback = ingest_launch_log(tmp.path(), &contents, ANCHOR, Some(1)).unwrap();
+    let mark = feedback.mark.expect("marked");
+    assert_eq!(mark.resets_at, Some(reset));
+    assert!(mark.reason.contains("provider-reported reset"), "{}", mark.reason);
+}

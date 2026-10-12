@@ -60,8 +60,29 @@
 //! thread: nothing either half does — resolving the binary aside, which is one
 //! env read — can block the caller. The only work left on the caller's thread
 //! is `std::thread::Builder::spawn` itself. Each detached thread stays bounded
-//! exactly as before ([`output_with_timeout`] kills a child that overruns, and
-//! there are no retries), so moving the discovery cannot leak a helper process.
+//! exactly as before ([`docker_output`] kills a child that overruns, and there
+//! are no retries), so moving the discovery cannot leak a helper process.
+//!
+//! # A docker child never outlives its parent (#11449)
+//!
+//! The per-call bound above holds only while the detached thread is alive to
+//! enforce it. When the whole process exits first — a daemon shutdown or roll
+//! mid-teardown, or (the main source) a unit-test binary that finishes in
+//! milliseconds — the thread dies without killing its child, and a `docker ps`
+//! wedged on an unresponsive dockerd was re-parented to pid 1 and stayed
+//! forever: 3,641 of them on one host, until `fork` hit the per-user process
+//! limit. Three layers close it:
+//!
+//! 1. Every docker child runs through [`docker_output`] (the shared
+//!    [`run_bounded`](crate::proc_exec::run_bounded) executor): its own process
+//!    group, killed **as a group** on timeout, so a wrapper's descendants go
+//!    too.
+//! 2. On Linux each child is spawned with `PR_SET_PDEATHSIG(SIGKILL)`, so the
+//!    kernel kills it the moment the spawning thread — and therefore the
+//!    process — goes away. macOS has no equivalent; there layers 1 and 3 bound
+//!    it.
+//! 3. Under `cfg(test)` [`docker_program`] never resolves to the real `docker`
+//!    (see [`TEST_DOCKER_DISABLED`]); tests inject a stub explicitly.
 //!
 //! # Fail-safe contract (#8435 AC3)
 //!
@@ -72,9 +93,10 @@
 //! exited, a host with no docker at all) is a debug-level no-op that neither
 //! fails nor logs an error.
 
-use super::{output_with_timeout, reap_gh_timeout, REAP_GH_TIMEOUT};
+use super::{reap_gh_timeout, REAP_GH_TIMEOUT};
+use crate::proc_exec::{run_bounded, Completion, ExecError};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
 use std::time::Duration;
 
 /// Env var overriding the docker CLI binary the cancellation path invokes
@@ -116,14 +138,35 @@ pub(crate) struct IssueContainer {
     pub(crate) containment: Option<String>,
 }
 
+/// The docker program a `cfg(test)` build resolves when no test injected one
+/// via [`DOCKER_BIN_ENV`] (#11449): a path that does not exist, so the spawn
+/// fails at once and the teardown is the ordinary debug-level "no docker"
+/// no-op. Registry tests that dispatch and then cancel issue sweeps reach
+/// [`begin_container_stop`] through `begin_cancel`; before this they ran the
+/// host's real `docker ps`, and against a wedged dockerd every such run leaked
+/// a probe that outlived the test binary.
+#[cfg(test)]
+pub(crate) const TEST_DOCKER_DISABLED: &str = "/nonexistent/loom-test-docker-disabled-11449";
+
 /// Resolve the docker CLI binary: [`DOCKER_BIN_ENV`] override, else `docker`
-/// from `PATH`.
+/// from `PATH` — except in a `cfg(test)` build, where the fallback is
+/// [`TEST_DOCKER_DISABLED`] so no unit test can reach the real CLI (#11449).
 pub(crate) fn docker_program() -> PathBuf {
     std::env::var(DOCKER_BIN_ENV)
         .ok()
         .map(|v| PathBuf::from(v.trim().to_string()))
         .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| PathBuf::from("docker"))
+        .unwrap_or_else(default_docker_program)
+}
+
+#[cfg(not(test))]
+fn default_docker_program() -> PathBuf {
+    PathBuf::from("docker")
+}
+
+#[cfg(test)]
+fn default_docker_program() -> PathBuf {
+    PathBuf::from(TEST_DOCKER_DISABLED)
 }
 
 /// argv (after the program) identifying a cancelled issue's container(s):
@@ -163,10 +206,64 @@ pub(crate) fn kill_args(containers: &[IssueContainer]) -> Vec<String> {
     args
 }
 
+/// Build a docker CLI invocation. stdin is closed (no docker verb used here
+/// reads it), and on Linux the child is armed to die with its parent (#11449).
 fn command_with(program: &Path, args: Vec<String>) -> Command {
     let mut cmd = Command::new(program);
-    cmd.args(args);
+    cmd.args(args).stdin(Stdio::null());
+    die_with_parent(&mut cmd);
     cmd
+}
+
+/// Arm `PR_SET_PDEATHSIG(SIGKILL)` on the child (#11449), so the kernel kills
+/// it when the thread that spawned it exits — which, for the detached teardown
+/// thread that spawns and then waits on it, happens only when the process
+/// itself goes away. That is exactly the orphaning case: the bounded wait in
+/// [`docker_output`] can no longer run, and without this the child would be
+/// re-parented to pid 1 and live on.
+#[cfg(target_os = "linux")]
+fn die_with_parent(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // Captured BEFORE the fork: if the parent dies between `fork` and `prctl`,
+    // the signal is never delivered, so the child re-checks its parent.
+    let parent = std::process::id();
+    // SAFETY: the closure runs between fork and exec and calls only `prctl`
+    // and `getppid`, both async-signal-safe; it allocates nothing (the error
+    // value is a raw OS error, not a boxed message).
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::getppid() as u32 != parent {
+                return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+            }
+            Ok(())
+        });
+    }
+}
+
+/// No parent-death signal outside Linux; process-group termination and the
+/// `cfg(test)` docker fence bound the leak there (see the module docs).
+#[cfg(not(target_os = "linux"))]
+fn die_with_parent(_cmd: &mut Command) {}
+
+/// Run a docker CLI invocation under `timeout` (#11449).
+///
+/// Same contract the module's callers relied on from the reaper's
+/// `output_with_timeout`: `Ok(Some(output))` when it completed, `Ok(None)` when
+/// it was killed for overrunning (the explicit "could not determine" answer —
+/// every caller here fails safe on it), `Err` when it could not run or its
+/// result could not be collected. Unlike that helper it runs on
+/// [`run_bounded`]: the child leads its own process group and a timeout kills
+/// the **group**, so a wrapper script's descendants cannot survive the
+/// deadline either.
+pub(crate) fn docker_output(cmd: Command, timeout: Duration) -> std::io::Result<Option<Output>> {
+    match run_bounded(cmd, timeout) {
+        Ok(Completion::Exited(out)) => Ok(Some(out)),
+        Ok(Completion::TimedOut { .. }) => Ok(None),
+        Err(ExecError::Spawn(e) | ExecError::Collect(e)) => Err(e),
+    }
 }
 
 /// Parse one `docker ps --format` output line into an [`IssueContainer`].
@@ -193,8 +290,19 @@ pub(crate) fn parse_ps_line(line: &str) -> Option<IssueContainer> {
 /// reaper call budget the `gh` probes use. Fail-safe: any failure yields an
 /// empty list (with a log line at the appropriate level), never an error.
 pub(crate) fn list_issue_containers(program: &Path, issue: u32) -> Vec<IssueContainer> {
+    list_issue_containers_within(program, issue, reap_gh_timeout())
+}
+
+/// [`list_issue_containers`] with an explicit probe budget — the seam the
+/// hung-docker test (#11449) uses to stay fast without touching the
+/// process-global [`REAP_GH_TIMEOUT_ENV`](super::REAP_GH_TIMEOUT_ENV).
+pub(crate) fn list_issue_containers_within(
+    program: &Path,
+    issue: u32,
+    timeout: Duration,
+) -> Vec<IssueContainer> {
     let cmd = command_with(program, ps_args(issue));
-    match output_with_timeout(cmd, reap_gh_timeout()) {
+    match docker_output(cmd, timeout) {
         Ok(Some(out)) if out.status.success() => String::from_utf8_lossy(&out.stdout)
             .lines()
             .filter_map(parse_ps_line)
@@ -314,7 +422,7 @@ pub(crate) fn begin_container_stop_with(
         // `--rm`'s daemon-side removal) covers the rest.
         let bound = grace + REAP_GH_TIMEOUT;
         let cmd = command_with(&program, stop_args(grace, &containers));
-        match output_with_timeout(cmd, bound) {
+        match docker_output(cmd, bound) {
             Ok(Some(out)) if out.status.success() => {
                 log::info!(
                     "cancel_sweep: docker stop for issue #{issue} completed ({}) (#8435)",
@@ -396,7 +504,7 @@ pub(crate) fn finish_container_stop_with(
             describe(&containers)
         );
         let cmd = command_with(&program, kill_args(&containers));
-        match output_with_timeout(cmd, reap_gh_timeout()) {
+        match docker_output(cmd, reap_gh_timeout()) {
             Ok(Some(out)) if out.status.success() => {
                 log::info!(
                     "cancel_sweep: docker kill for issue #{issue} completed ({}) (#8435)",
@@ -434,6 +542,12 @@ pub(crate) fn finish_container_stop_with(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic, clippy::expect_used)]
 mod cancel_latency_tests;
+
+// #11449: the no-orphan contract (hung probe killed with its descendants, a
+// probe dies with its parent process, no test reaches the real docker).
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic, clippy::expect_used)]
+mod orphan_tests;
 
 #[cfg(test)]
 mod tests {

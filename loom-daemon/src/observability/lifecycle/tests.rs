@@ -876,3 +876,81 @@ fn begun_attempts_are_matched_per_issue_and_superseded_on_redispatch() {
     assert_eq!(synthetic.attributes[ATTEMPT_WORKED], "false");
     assert!(checkpoint_begin_observation(&journal, &root, None, 1, "sweep", None, None).is_none());
 }
+
+/// #9510: the value `insert_nonempty_bounded` would stamp for `value`.
+fn bounded_value(value: &str) -> Option<String> {
+    let mut attrs = TraceAttributes::new();
+    insert_nonempty_bounded(&mut attrs, "loom.model", value);
+    attrs.remove("loom.model")
+}
+
+#[test]
+fn insert_nonempty_bounded_cuts_to_256_bytes_on_a_char_boundary() {
+    // ASCII: bytes == chars, so the cut is unchanged from the char-counting era.
+    assert_eq!(bounded_value(&"a".repeat(300)), Some("a".repeat(256)));
+    assert_eq!(bounded_value(&"a".repeat(256)), Some("a".repeat(256)));
+    assert_eq!(bounded_value("opus"), Some("opus".to_owned()));
+    // 256 three-byte chars (768 bytes): the largest whole-char prefix is 85
+    // chars / 255 bytes — not the 256 chars the old `chars().take(256)` kept.
+    let euro = "\u{20AC}";
+    assert_eq!(bounded_value(&euro.repeat(256)), Some(euro.repeat(85)));
+    assert_eq!(bounded_value(&euro.repeat(100)).map(|v| v.len()), Some(255));
+    // The 256-byte mark lands exactly on a boundary: 1 + 3 * 85 = 256.
+    let on_boundary = bounded_value(&format!("a{}", euro.repeat(100))).unwrap();
+    assert_eq!((on_boundary.len(), on_boundary.chars().count()), (256, 86));
+    // ...and mid-code-point for every other offset; four-byte chars too.
+    for value in [format!("ab{}", euro.repeat(100)), "\u{1F9F5}".repeat(100)] {
+        let kept = bounded_value(&value).unwrap();
+        assert!(kept.len() <= 256 && kept.len() > 252, "{} bytes", kept.len());
+        assert!(value.starts_with(&kept), "must be a whole-char prefix");
+    }
+    // Nothing safe remains: the key stays absent.
+    for blank in ["", "   ", "\t\n"] {
+        assert_eq!(bounded_value(blank), None, "{blank:?}");
+    }
+}
+
+#[test]
+fn long_multibyte_admission_values_survive_the_export_allowlist() {
+    // #9510: 256 multi-byte chars passed the old char bound, then failed
+    // `bounded_attributes`' byte bound — so the whole attribute was dropped.
+    use crate::role_runner::RoleTickOutcome;
+    let mismatch =
+        RoleTickOutcome::ModelRuntimeMismatch(crate::role_runner::ModelRuntimeMismatch {
+            role: "doctor".into(),
+            runtime: "codex".into(),
+            model: "\u{20AC}".repeat(256),
+            model_source: "default".into(),
+            reason: "family conflict".into(),
+        });
+    let rejected = RoleTickOutcome::RuntimeRejected(crate::runtime_admission::RuntimeRejection {
+        role: "doctor".into(),
+        runtime: "codex".into(),
+        source: crate::runtime_admission::RuntimeSource::RoleConfig,
+        unmet_capabilities: vec!["isolation-\u{9694}\u{79BB}".to_owned(); 40],
+        reason: "unmet".into(),
+    });
+    for (outcome, key) in [
+        (mismatch, "loom.model"),
+        (rejected, "loom.admission.unmet_capabilities"),
+    ] {
+        // Through the journal, whose records pass `SpanRecord::bounded` — the
+        // only (crate-private) caller path into `bounded_attributes`.
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::for_context(&dir.path().join("root.json"));
+        let root = TraceContext::root(true);
+        let start = attributes(&[("loom.role", "doctor")]);
+        let active = journal
+            .start(root.child(), Some(&root), SpanName::RoleAttempt, Utc::now(), start)
+            .unwrap();
+        journal
+            .finish(&active, Utc::now(), SpanStatus::Error, admission_attributes(&outcome))
+            .unwrap();
+        let exported = &drained_spans(&journal)[0].attributes;
+        let value = exported
+            .get(key)
+            .unwrap_or_else(|| panic!("{key} dropped at export"));
+        assert!(!value.is_empty() && value.len() <= 256, "{key}: {} bytes", value.len());
+        assert_eq!(exported["loom.runtime"], "codex");
+    }
+}

@@ -79,6 +79,7 @@ pub fn daemon_bin() -> PathBuf {
 #[allow(dead_code)]
 pub fn isolate_daemon_state(cmd: &mut Command, fixture: &Path) {
     deny_real_gh(cmd);
+    deny_real_docker(cmd);
     cmd.current_dir(fixture)
         // #11111: a sweep's environment carries the production daemon's
         // `LOOM_DAEMON_SUPERVISOR=systemd`. A test daemon must never believe
@@ -113,6 +114,42 @@ pub fn isolate_daemon_state(cmd: &mut Command, fixture: &Path) {
             "LOOM_SESSION_FALLBACK_ROOT_FILE",
             fixture.join("session-reconcile-fallback-root.json"),
         );
+    isolate_build_slot(cmd, fixture);
+    assert_build_slot_isolated(cmd, fixture);
+}
+
+/// Points the build-slot dir inside `fixture` and drops any inherited
+/// held-marker (#11024).
+///
+/// The worktree reaper's `deep_clean::run_for` takes the real machine-wide
+/// build slot when the host is below the disk floor. Point the slot dir inside
+/// the fixture so a test daemon never contends for (or leaves state in) the
+/// host's `~/.loom/locks`. Split out of `isolate_daemon_state` for spawn paths
+/// that build their own environment — e.g. the watchdog command whose stub
+/// relaunches a real daemon — and so cannot take the full isolation helper.
+#[allow(dead_code)]
+pub fn isolate_build_slot(cmd: &mut Command, fixture: &Path) {
+    cmd.env("LOOM_BUILD_SLOT_DIR", fixture.join("build-slots"))
+        .env_remove("LOOM_BUILD_SLOT_HELD");
+}
+
+/// Fails (panics) unless `cmd` will spawn a daemon whose build-slot dir
+/// resolves inside `fixture` rather than the host's (#11024).
+#[allow(dead_code)]
+pub fn assert_build_slot_isolated(cmd: &Command, fixture: &Path) {
+    let dir = cmd
+        .get_envs()
+        .find(|(k, _)| *k == "LOOM_BUILD_SLOT_DIR")
+        .and_then(|(_, v)| v)
+        .map(PathBuf::from);
+    match dir {
+        Some(d) if d.starts_with(fixture) => {}
+        other => panic!(
+            "spawned test daemon would resolve the host build-slot dir \
+             (LOOM_BUILD_SLOT_DIR = {other:?}, expected under {})",
+            fixture.display()
+        ),
+    }
 }
 
 /// Process-wide loud-failing `gh` stub (#10088): prints its args to stderr,
@@ -146,6 +183,20 @@ pub fn deny_real_gh(cmd: &mut Command) {
     cmd.env("LOOM_GH_NO_POLICY_LAUNCHER", "1");
     if std::env::var_os("LOOM_GH_BIN").is_none() {
         cmd.env("LOOM_GH_BIN", gh_stub_path());
+    }
+}
+
+/// Point a spawned daemon's `LOOM_DOCKER_BIN` at a path that does not exist
+/// (#11449), so a sweep cancel's container teardown fails its spawn at once
+/// (the debug-level "no docker" no-op) instead of running the host's real
+/// `docker ps` — which, against a wedged Docker backend, hangs and outlives
+/// the test. The real binary is not `cfg(test)`, so the lib's own test-only
+/// fence does not apply to it. A caller-set value in the parent environment
+/// (an explicit stub) wins.
+#[allow(dead_code)]
+pub fn deny_real_docker(cmd: &mut Command) {
+    if std::env::var_os("LOOM_DOCKER_BIN").is_none() {
+        cmd.env("LOOM_DOCKER_BIN", "/nonexistent/loom-test-docker-disabled-11449");
     }
 }
 

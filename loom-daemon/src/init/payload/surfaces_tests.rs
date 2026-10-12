@@ -326,7 +326,7 @@ fn gitignore_block_is_merged_never_recorded_and_never_created() {
     let stale = format!(
         "node_modules/\n{}.loom/only-old-pattern\n{}\n# after\ndist/\n",
         &current[begin..end],
-        &current[end..].trim_end()
+        current[end..].trim_end()
     );
     write(&ws.join(".gitignore"), &stale);
 

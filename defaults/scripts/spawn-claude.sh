@@ -867,6 +867,21 @@ if [[ "$CONTAINMENT_ENABLED" == "1" ]]; then
     # `CARGO_INCREMENTAL=1 cargo …` outranks the ambient value for that
     # invocation only.
     _containment_env+=(-e "CARGO_INCREMENTAL=0")
+    # The debuginfo cap (#11190) rides the same boundary, but by NAME (`-e
+    # VAR`, no value) and only when set: the daemon-side seam already chose
+    # the value — or kept an operator's own — before it spawned this script,
+    # and this re-exec runs spawn-claude.sh, not spawn-worker.sh, so nothing
+    # inside the container re-runs that seam. Without this the worker log
+    # records the cap while the in-container cargo builds full DWARF. The two
+    # names are forwarded by the env-passthrough `case` below (by name, when
+    # present in `env`). "Present" is not "set to something", though: the
+    # passthrough forwards a set-but-EMPTY variable too, and cargo hard-fails
+    # on an empty one (`invalid value: string ""`) instead of reading it as
+    # unset, so the loop's input drops those two empties and the container
+    # sees them as unset. (`grep -v` exiting 1 on no output cannot abort this
+    # script: a process substitution's status is never the shell's.) `-a` is
+    # load-bearing (#11237): GNU grep in a UTF-8 locale otherwise suppresses a
+    # line holding a non-UTF-8 byte, silently un-forwarding that variable.
 
     # --- Env passthrough ---
     # Every LOOM_*/CLAUDE_*/SAFEHOUSE*/CODEX_* var (GH_TOKEN/GITHUB_TOKEN
@@ -889,11 +904,11 @@ if [[ "$CONTAINMENT_ENABLED" == "1" ]]; then
     # same host's bare-metal dispatch worked.
     while IFS='=' read -r _containment_var _; do
         case "$_containment_var" in
-            LOOM_* | CLAUDE_* | SAFEHOUSE* | CODEX_* | TRACEPARENT | OTEL_*)
+            LOOM_* | CLAUDE_* | SAFEHOUSE* | CODEX_* | TRACEPARENT | OTEL_* | CARGO_PROFILE_DEV_DEBUG | CARGO_PROFILE_TEST_DEBUG)
                 _containment_env+=(-e "$_containment_var")
                 ;;
         esac
-    done < <(env)
+    done < <(env | grep -av '^CARGO_PROFILE_[A-Z]*_DEBUG=$')
     _containment_env+=(-e "LOOM_SPAWN_CONTAINERIZED=1" -e "LOOM_WORKSPACE=${WORKSPACE}" -e "HOME=${HOME:-/home/loom}")
 
     # --- Resource-limit docker flags + observability labels (issue #7430) ---
@@ -1410,6 +1425,23 @@ if [[ "$_CONTAINMENT_CRED_PROXY" != "1" && -f "$_mcp_config_lib" ]]; then
             fi
         fi
     fi
+fi
+
+# --- Per-role tool restriction at spawn (#8256) ---
+# Defense in depth for the guard hooks: the role JSON's
+# toolPolicy.allowedCapabilities (plus any forge-egress policy) become
+# --disallowedTools specs, computed by `loom-daemon role-tool-policy
+# deny-specs`. Bypassable on its own (`bash -c 'ssh …'`), which is why the hooks
+# are the backstop. Appended last so no positional follows the variadic flag,
+# and additive to any --disallowedTools the caller passed. No binary or no
+# specs => byte-for-byte no-op; never fails the spawn.
+# requires-daemon: role-tool-policy optional   #8256 — `deny-specs` (since #8322); no binary or no answer injects nothing, and the guard hooks still enforce the role's declaration.
+_rtp_bin="$(loom_locate_daemon_bin "$WORKSPACE" 2>/dev/null || true)"
+_rtp_specs=()
+while IFS= read -r _rtp_spec; do [[ -z "$_rtp_spec" ]] || _rtp_specs+=("$_rtp_spec"); done < <([[ -z "$_rtp_bin" ]] || "$_rtp_bin" role-tool-policy deny-specs --workspace "$WORKSPACE" --roles-dir "$_script_dir/../roles" 2>/dev/null || true)
+if [[ ${#_rtp_specs[@]} -gt 0 ]]; then
+    PASSTHROUGH_ARGS+=(--disallowedTools "${_rtp_specs[@]}")
+    log_info "spawn-claude: per-role tool restriction (#8256): role=${LOOM_ROLE:-unset} gets ${#_rtp_specs[@]} --disallowedTools specs"
 fi
 
 # --- Dispatch ---

@@ -122,6 +122,28 @@ fn crlf_boundary_wins_over_later_lf_pair_in_body() {
     assert_eq!(parse_rest_issues(&r.body).unwrap()[0].number, 1);
 }
 
+/// `next_page` is set only by a `Link` header naming `rel="next"`; a last
+/// page's `Link` names `prev`/`first` only.
+#[test]
+fn a_link_header_with_rel_next_marks_a_next_page() {
+    let page = |link: &str| format!("HTTP/2.0 200 OK\r\n{link}\r\n\r\n[]");
+    let next = page(
+        "Link: <https://api.github.com/repositories/1/issues?page=2>; rel=\"next\", \
+         <https://api.github.com/repositories/1/issues?page=3>; rel=\"last\"",
+    );
+    assert!(parse_http_response(&next).unwrap().next_page);
+    let last = page(
+        "link: <https://api.github.com/repositories/1/issues?page=2>; rel=\"prev\", \
+         <https://api.github.com/repositories/1/issues?page=1>; rel=\"first\"",
+    );
+    assert!(!parse_http_response(&last).unwrap().next_page);
+    assert!(
+        !parse_http_response("HTTP/2.0 200 OK\r\n\r\n[]")
+            .unwrap()
+            .next_page
+    );
+}
+
 #[test]
 fn rejects_non_http_output() {
     assert!(parse_http_response("gh: command not found").is_none());
@@ -864,7 +886,9 @@ case "$*" in
     n=$(echo "$*" | sed 's/.*&page=\([0-9]*\).*/\1/')
     if [ -f "$d/fail$n" ]; then echo 'gh: Server Error (HTTP 502)' 1>&2; exit 1; fi
     if [ "$n" = 2 ] && [ -f "$d/shift" ]; then cp "$d/p1b.json" "$d/p1.json"; echo p1b > "$d/etag1"; fi
-    printf 'HTTP/2.0 200 OK\r\nEtag: W/"pn"\r\n\r\n'
+    printf 'HTTP/2.0 200 OK\r\nEtag: W/"pn"\r\n'
+    [ "$(grep -o '"number"' "$d/pages.json" | wc -l)" -ge 100 ] && [ ! -f "$d/last$n" ] && printf 'Link: <https://api.github.com/next>; rel="next"\r\n'
+    printf '\r\n'
     cat "$d/pages.json" ;;
   *)
     e=p1; [ -f "$d/etag1" ] && e=$(cat "$d/etag1")
@@ -874,7 +898,9 @@ case "$*" in
         echo 'gh: Not Modified (HTTP 304)' 1>&2
         exit 1 ;;
     esac
-    printf 'HTTP/2.0 200 OK\r\nEtag: W/"%s"\r\n\r\n' "$e"
+    printf 'HTTP/2.0 200 OK\r\nEtag: W/"%s"\r\n' "$e"
+    [ "$(grep -o '"number"' "$d/p1.json" | wc -l)" -ge 100 ] && [ ! -f "$d/last1" ] && printf 'Link: <https://api.github.com/next>; rel="next"\r\n'
+    printf '\r\n'
     cat "$d/p1.json" ;;
 esac
 "#,
@@ -1016,4 +1042,106 @@ fn a_single_page_walk_makes_no_extra_request() {
         list_issues_cached_all_as("t", &gh, Some(dir.path()), Some(&repo), "x", "open").unwrap();
     assert_eq!(all.len(), 3);
     assert_eq!(calls(dir.path()).len(), 1);
+}
+
+// ===== list_issues_cached_paged_as (#11139) =====
+
+/// The partial walk: a mid-walk change hands back the fresher rows, each item
+/// once, marked incomplete, where the all-or-nothing walk errors.
+#[test]
+fn a_paged_walk_that_moves_mid_walk_returns_the_fresher_rows_marked_incomplete() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = format!("test-owner/paged-partial-shift-{}", std::process::id());
+    std::fs::write(dir.path().join("p1.json"), page_json(1..101)).unwrap();
+    std::fs::write(dir.path().join("p1b.json"), page_json(2..102)).unwrap();
+    std::fs::write(dir.path().join("pages.json"), page_json(101..106)).unwrap();
+    std::fs::write(dir.path().join("shift"), "").unwrap();
+    let gh = paging_stub(dir.path());
+    let walk = list_issues_cached_paged_as("t", &gh, Some(dir.path()), Some(&repo), "x", "open")
+        .expect("page 1 was read");
+    assert!(!walk.complete());
+    let reason = format!("{:#}", walk.incomplete.as_ref().unwrap());
+    assert!(reason.contains("changed mid-walk"), "{reason}");
+    let numbers: Vec<u32> = walk.rows.iter().map(|i| i.number).collect();
+    assert_eq!(numbers, (2..106).collect::<Vec<_>>(), "#1 left; #101 listed once");
+}
+
+/// 101 items (page 1 links a next page), and #1 leaves between the page 1
+/// and page 2 reads, so #101
+/// moves up and page 2 comes back empty. The walk must not return the old
+/// page 1 as complete: the re-read of page 1 sees #101 and marks the change.
+#[test]
+fn an_empty_page_2_after_a_shift_is_not_a_complete_page_1() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = format!("test-owner/paged-empty-p2-{}", std::process::id());
+    std::fs::write(dir.path().join("p1.json"), page_json(1..101)).unwrap();
+    std::fs::write(dir.path().join("p1b.json"), page_json(2..102)).unwrap();
+    std::fs::write(dir.path().join("pages.json"), "[]\n").unwrap();
+    std::fs::write(dir.path().join("shift"), "").unwrap();
+    let gh = paging_stub(dir.path());
+    let walk = list_issues_cached_paged_as("t", &gh, Some(dir.path()), Some(&repo), "x", "open")
+        .expect("page 1 was read");
+    assert!(!walk.complete());
+    assert!(walk.rows.iter().any(|i| i.number == 101), "#101 is listed");
+}
+
+/// A full page 1 whose `Link` names no next page is one request. Served again
+/// from a `304`, which carries no `Link`, the same full page is read on:
+/// page 2 (empty here) and then the re-read of page 1.
+#[test]
+fn a_full_page_without_a_next_link_ends_the_walk_unless_it_came_from_a_304() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = format!("test-owner/paged-link-{}", std::process::id());
+    std::fs::write(dir.path().join("p1.json"), page_json(1..101)).unwrap();
+    std::fs::write(dir.path().join("pages.json"), "[]\n").unwrap();
+    std::fs::write(dir.path().join("last1"), "").unwrap();
+    let gh = paging_stub(dir.path());
+    let walk = || list_issues_cached_paged_as("t", &gh, Some(dir.path()), Some(&repo), "x", "open");
+
+    let first = walk().unwrap();
+    assert!(first.complete());
+    assert_eq!(first.rows.len(), 100);
+    assert_eq!(calls(dir.path()).len(), 1);
+
+    let cached = walk().unwrap();
+    assert!(cached.complete());
+    assert_eq!(cached.rows.len(), 100);
+    assert_eq!(calls(dir.path()).len(), 4);
+}
+
+/// The partial walk: a later page failing or the page cap keeps what was
+/// read, marked incomplete; page 1 failing is still an error; a whole walk
+/// is complete and costs what [`list_issues_cached_all_as`]'s does.
+#[test]
+fn a_paged_walk_falls_short_with_its_rows_and_a_reason() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = format!("test-owner/paged-partial-{}", std::process::id());
+    std::fs::write(dir.path().join("p1.json"), page_json(1..101)).unwrap();
+    std::fs::write(dir.path().join("pages.json"), page_json(101..201)).unwrap();
+    let gh = paging_stub(dir.path());
+    let walk = || list_issues_cached_paged_as("t", &gh, Some(dir.path()), Some(&repo), "x", "open");
+
+    std::fs::write(dir.path().join("fail3"), "").unwrap();
+    let partial = walk().unwrap();
+    assert_eq!(partial.rows.len(), 200);
+    assert!(format!("{:#}", partial.incomplete.unwrap()).contains("HTTP 502"));
+
+    std::fs::remove_file(dir.path().join("fail3")).unwrap();
+    let capped = walk().unwrap();
+    // Pages 2..=MAX_PAGES all serve the same rows: each item listed once.
+    assert_eq!(capped.rows.len(), 200);
+    assert!(format!("{:#}", capped.incomplete.unwrap()).contains("incomplete"));
+
+    std::fs::write(dir.path().join("pages.json"), page_json(101..106)).unwrap();
+    let before = calls(dir.path()).len();
+    let whole = walk().unwrap();
+    assert!(whole.complete());
+    assert_eq!(whole.rows.len(), 105);
+    assert_eq!(calls(dir.path()).len() - before, 3, "page 1, page 2, page 1 again");
+
+    let other = format!("{repo}-p1-fails");
+    std::fs::write(dir.path().join("p1.json"), "not json").unwrap();
+    assert!(
+        list_issues_cached_paged_as("t", &gh, Some(dir.path()), Some(&other), "x", "open").is_err()
+    );
 }

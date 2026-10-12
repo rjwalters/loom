@@ -567,3 +567,86 @@ mod fetch_headroom_tests {
         assert!(!format!("{err:#}").contains("skipped git fetch"), "{err:#}");
     }
 }
+
+/// Binds [`resync_message`] to the consumer-side reader of its subject (#8920).
+///
+/// `defaults/scripts/resync-installed.sh`'s local-fix guard decides, from a
+/// file's last-touching commit SUBJECT, whether Loom's own tooling wrote it. It
+/// did not know the subject this module writes, so every file a daemon resync
+/// touched read as a hand edit and its next upstream line removal was blocked.
+/// Shell cannot `source` Rust, so each side keeps its literal and the agreement
+/// is what gets checked: the regexes are read out of the script itself.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod resync_subject_parity_tests {
+    use super::resync_message;
+    use regex::Regex;
+
+    const RESYNC_INSTALLED: &str = include_str!("../../../../defaults/scripts/resync-installed.sh");
+
+    /// The single-quoted value of the script's top-level `<name>='...'`.
+    fn script_regex(name: &str) -> Regex {
+        let prefix = format!("{name}='");
+        let mut found = RESYNC_INSTALLED
+            .lines()
+            .filter_map(|l| l.strip_prefix(prefix.as_str()));
+        let value = found
+            .next()
+            .unwrap_or_else(|| panic!("{name}='...' must be assigned"));
+        assert!(found.next().is_none(), "{name} must be assigned exactly once");
+        let literal = value
+            .strip_suffix('\'')
+            .unwrap_or_else(|| panic!("{name} must be one line"));
+        Regex::new(literal).unwrap_or_else(|e| panic!("{name} must parse as a regex: {e}"))
+    }
+
+    fn subject(version: &str) -> String {
+        let message = resync_message("host-a", version);
+        message.lines().next().unwrap().to_string()
+    }
+
+    #[test]
+    fn the_subject_the_daemon_writes_is_routine_lineage_to_the_script() {
+        let routine = script_regex("RESYNC_COMMIT_SUBJECT_RE");
+        for version in ["0.19.1021", "1.0.0", "10.200.3000"] {
+            let subject = subject(version);
+            assert!(routine.is_match(&subject), "{subject:?} must match the script's regex");
+            // A squash merge appends the PR number.
+            let squashed = format!("{subject} (#123)");
+            assert!(routine.is_match(&squashed), "{squashed:?} must match too");
+        }
+    }
+
+    #[test]
+    fn only_the_exact_subject_shape_is_routine() {
+        let routine = script_regex("RESYNC_COMMIT_SUBJECT_RE");
+        let prefix = script_regex("ROUTINE_SUBJECT_PREFIX_RE");
+        let subject = subject("0.19.1021");
+        // A human extending the subject carried more than routine output
+        // (#8098): not routine, and recognised as an extension so the
+        // install-baseline rung (#9178) withholds its amnesty as well.
+        for extended in [
+            format!("{subject} and also revert the guard fix"),
+            format!("{subject} (#123) plus a hotfix"),
+            format!("{subject}-hotfix"),
+            format!("{subject}.1"),
+            "chore(loom): resync installed Loom to v1 and also revert the guard fix".to_string(),
+            "chore(loom): resync installed Loom to vendor my guard fix".to_string(),
+        ] {
+            assert!(!routine.is_match(&extended), "{extended:?} must NOT be routine");
+            assert!(prefix.is_match(&extended), "{extended:?} must read as an extension");
+        }
+        // Look-alikes that do not even start like the subject.
+        for other in [
+            format!("fixup! {subject}"),
+            format!("Revert \"{subject}\""),
+            format!(" {subject}"),
+            "chore(loom): resync installed loom to v0.19.1021".to_string(),
+            "chore(loom): resync installed Loom to 0.19.1021".to_string(),
+            "chore: resync installed Loom to v0.19.1021".to_string(),
+        ] {
+            assert!(!routine.is_match(&other), "{other:?} must NOT be routine");
+        }
+        assert!(prefix.is_match(&subject), "the real subject carries the routine prefix");
+    }
+}
