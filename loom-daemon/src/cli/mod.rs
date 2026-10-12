@@ -70,6 +70,7 @@ pub(crate) mod install_compat_cli;
 pub(crate) mod journal_cli;
 mod label_duplicates;
 pub(crate) mod labels_cmd;
+mod labels_migrate;
 mod labels_undeclared;
 pub(crate) mod lease_co_occupancy;
 pub(crate) mod lease_ensure;

@@ -535,6 +535,7 @@ fn daemon_write_paths_are_scoped() {
             NotAWrite("parses an agent's own gh argv for the claim it took (#10832), runs none"),
         ),
         ("operator_decision/cli.rs", Gated),
+        ("cli/labels_migrate.rs", Gated),
         ("cli/labels_undeclared.rs", Gated),
         ("cli/pr_lease.rs", Gated),
         (

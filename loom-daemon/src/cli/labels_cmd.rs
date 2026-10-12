@@ -3,8 +3,8 @@
 //! frozen by the file-size ratchet.
 //!
 //! Exit codes: 0 ok; 1 unknown label (`get`) or drift (`check`); 2 unknown
-//! property/kind/field or unreadable registry. `undeclared` has its own
-//! (see [`super::labels_undeclared`]).
+//! property/kind/field or unreadable registry. `undeclared` and `migrate`
+//! have their own (see [`super::labels_undeclared`], [`super::labels_migrate`]).
 
 use std::path::{Path, PathBuf};
 
@@ -64,6 +64,26 @@ pub(crate) enum LabelsCommand {
         /// Delete the unused ones (default: report only).
         #[arg(long)]
         prune: bool,
+    },
+    /// Move OPEN issues/PRs off the registry's retired labels onto their
+    /// replacements, then delete each owned retired label nothing open still
+    /// carries (#11511). Dry run unless `--apply`. Never creates a label;
+    /// `owned: false` entries are add-only. Exit 0 nothing left to do, 3
+    /// something remains, 4 labels unreadable or rate limited, 2 bad
+    /// arguments or `--apply` refused by write scope.
+    Migrate {
+        /// The GitHub repo, `OWNER/NAME` (default: this checkout's origin).
+        #[arg(long, conflicts_with = "all_workspaces")]
+        repo: Option<String>,
+        /// Every repo in this host's workspace registry, deduplicated.
+        #[arg(long)]
+        all_workspaces: bool,
+        /// Make the forge writes (default: dry run, reads only).
+        #[arg(long)]
+        apply: bool,
+        /// Print the report as JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -170,6 +190,21 @@ fn run(cmd: LabelsCommand) -> Result<i32> {
             labels_file,
             prune,
         } => Ok(super::labels_undeclared::dispatch(&repo, &labels_file, prune)),
+        LabelsCommand::Migrate {
+            repo,
+            all_workspaces,
+            apply,
+            json,
+        } => {
+            use super::labels_migrate::{dispatch, Scope};
+            let root = root_of(None);
+            let scope = match (repo, all_workspaces) {
+                (Some(r), _) => Scope::Repo(r),
+                (None, true) => Scope::AllWorkspaces,
+                (None, false) => Scope::Here(root.clone()),
+            };
+            Ok(dispatch(&load(&root)?.retired, scope, apply, json))
+        }
         LabelsCommand::Check { root } => {
             let root = root_of(root);
             let block = generate::loom_block(&load(&root)?);
