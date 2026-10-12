@@ -90,10 +90,11 @@ use crate::fleet_store::render::{self, Drift};
 use crate::fleet_store::roster::{self, Change, Plan, Registered};
 use crate::fleet_store::{self as store, StoreLocation};
 
-// `applied` is `pub(crate)` so the OTLP resource code and its tests reach
-// `applied_config_sha` / `AppliedSha` / `FLEET_CONFIG_SHA` and the test seams
-// via `fleet_sync::applied::…` directly, without a top-level re-export (#11197).
-pub(crate) mod applied;
+// `applied` is `pub` so the OTLP resource code and its tests reach
+// `applied_config_sha` / `AppliedSha` / `FLEET_CONFIG_SHA` via
+// `fleet_sync::applied::…` directly, without a top-level re-export, and so
+// the otlp-only consumers do not leave them dead in a non-otlp build (#11197).
+pub mod applied;
 pub mod checkout_ff;
 mod floor_knowledge;
 pub mod git_spawn_log;
