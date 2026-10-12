@@ -345,6 +345,8 @@ fn host_only(resource: &Resource) -> Resource {
             "service.name"
                 | "service.instance.id"
                 | "loom.daemon.version"
+                | "loom.daemon.revision"
+                | "loom.fleet.config_sha"
                 | "loom.runtime"
                 | "loom.relay.redaction"
                 | "loom.session.launch"

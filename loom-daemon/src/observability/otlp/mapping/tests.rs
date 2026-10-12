@@ -9,6 +9,7 @@ use opentelemetry_proto::tonic::resource::v1::Resource;
 use super::*;
 
 mod fact_id;
+mod fleet_provenance;
 mod host_name;
 mod loom_kind;
 mod record_id;
