@@ -37,9 +37,12 @@ exporter's queue keeps a loss ledger (`observability-queue[.<name>].loss.json`
 next to its queue file) mapping a reason to a cumulative count:
 `status_<code>` (any other non-200 status), `non_json_response`,
 `response_too_large`, `invalid_response`, `receiver_rejected` (partial
-rejection, in **signal units** — items, not envelopes), `trace_unmappable`,
-`queue_overflow` (capacity eviction) and `capacity_shrink` (front-trim on
-reopen). The ledger survives daemon restarts; its sum is `host.export`'s
+rejection, in **signal units** — items, not envelopes), `trace_unmappable`
+(trace envelopes the mapping never sends — unsampled or invalid spans;
+counted when the batch's fate is decided — acknowledged or permanently
+dropped — never per retry), `queue_overflow` (capacity eviction) and
+`capacity_shrink` (front-trim on reopen). Each lost envelope is counted under
+exactly one reason. The ledger survives daemon restarts; its sum is `host.export`'s
 `dropped_total` and its map is `dropped_by_reason` (see
 [telemetry-schema.md](telemetry-schema.md) § `host.export`). Each flush with
 losses logs one WARNING naming the reasons and counts. A held batch (401/403,
