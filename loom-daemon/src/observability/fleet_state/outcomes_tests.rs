@@ -154,6 +154,7 @@ fn input(prs: &[(u32, &str, u32)], held: Vec<HeldSweep>) -> FleetInput {
         }],
         listed_at: Some(t0()),
         ready: None,
+        slots: None,
         capacity: None,
         main_ci: BTreeMap::new(),
     }
