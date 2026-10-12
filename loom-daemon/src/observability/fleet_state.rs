@@ -64,8 +64,8 @@ use super::queue::{DurableQueue, FanoutQueue, QueueSink};
 use crate::telemetry::kinds::fleet_state::{
     split_into_chunks, FleetCapacity, FleetEligibleReason, FleetHoldKind, FleetPrCensus,
     FleetQueueFlow, FleetRepoHalt, FleetSlot, FleetSlots, FleetStage, FleetStateRecord,
-    FleetStateRepo, FleetStateRow, MainCi, PlannerStamps, ANCHOR_INTERVAL_SECS, CHUNK_BYTES,
-    FLEET_STATE_SCHEMA,
+    FleetStateRepo, FleetStateRow, MainCi, MergeBlockedReason, PlannerStamps, ANCHOR_INTERVAL_SECS,
+    CHUNK_BYTES, FLEET_STATE_SCHEMA,
 };
 use crate::telemetry::{RepoVisibility, SweepStartFacts, TelemetryEnvelope, TelemetryRecord};
 
@@ -137,6 +137,55 @@ pub fn hold_names(labels: &[String]) -> Vec<String> {
         holds.push("other".to_string());
     }
     holds
+}
+
+/// Why a PR row cannot merge yet (#11644), rolled up from the row's own
+/// label-derived fields: its `stage`, whether any hold holds it
+/// (`hold_kind`), whether it is `sequenced` (`holds`), and its
+/// `loom:merge-conflict` / `loom:ci-failure` flags. No forge read — every
+/// input is already on the row from the same review-label census
+/// Champion/Judge read.
+///
+/// Returns `None` for any non-PR stage (`ready_wait`, `sweep.curator`,
+/// `sweep.builder`). For a PR stage (`review_wait`, `doctor`, `merge_wait`,
+/// `merge_hold`) it always returns a reason, in descending precedence:
+/// `operator_hold` > `sequenced` > `conflict` > `ci_red` > `changes_requested`
+/// > `approval_pending` > `ready`. Pure.
+#[must_use]
+pub fn merge_blocked_reason(
+    stage: FleetStage,
+    hold_kind: Option<FleetHoldKind>,
+    holds: &[String],
+    conflict: bool,
+    ci_fail: bool,
+) -> Option<MergeBlockedReason> {
+    match stage {
+        FleetStage::ReviewWait
+        | FleetStage::Doctor
+        | FleetStage::MergeWait
+        | FleetStage::MergeHold => {}
+        _ => return None,
+    }
+    // `hold_kind` already collapses every operator/`loom:blocked` hold (and
+    // Champion's marker-refined holds, unreadable from labels) into one value.
+    let reason = if hold_kind.is_some() {
+        MergeBlockedReason::OperatorHold
+    } else if holds.iter().any(|h| h == "sequenced") {
+        MergeBlockedReason::Sequenced
+    } else if conflict {
+        MergeBlockedReason::Conflict
+    } else if ci_fail {
+        MergeBlockedReason::CiRed
+    } else if stage == FleetStage::Doctor {
+        MergeBlockedReason::ChangesRequested
+    } else if stage == FleetStage::ReviewWait {
+        MergeBlockedReason::ApprovalPending
+    } else {
+        // `merge_wait` with no hold or flag. (`merge_hold` always carries a
+        // merge-hold label, so `hold_kind` is set and this arm is unreached.)
+        MergeBlockedReason::Ready
+    };
+    Some(reason)
 }
 
 /// What one listed PR's labels say about the row of the issue it links.
@@ -607,6 +656,16 @@ pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Ut
             (None, Some(was)) => row.hold_released_at = was.hold_released_at,
             (None, None) => {}
         }
+        // Roll the row's own label-derived facts up into the merge-readiness
+        // reason (#11644). Computed last, so it reflects the final stage, hold
+        // and flags, whatever source set them.
+        row.merge_blocked_reason = merge_blocked_reason(
+            row.stage,
+            row.hold_kind,
+            &row.holds,
+            row.conflict,
+            row.ci_fail,
+        );
         let state = repos.entry(repo).or_default();
         state.rows.insert(issue, row);
         state.sources.insert(issue, source);
@@ -1144,6 +1203,11 @@ fn send(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[path = "fleet_state_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[path = "fleet_state_merge_blocked_tests.rs"]
+mod merge_blocked_tests;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]

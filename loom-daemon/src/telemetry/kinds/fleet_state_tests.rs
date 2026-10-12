@@ -270,6 +270,42 @@ fn stage_wire_names_are_the_contract_names() {
     }
 }
 
+/// The merge-blocked-reason enum pins its label-knowable wire strings, in
+/// descending precedence (#11644).
+#[test]
+fn merge_blocked_reason_wire_names_are_pinned() {
+    let wire: Vec<&str> = MergeBlockedReason::ALL.iter().map(|r| r.as_str()).collect();
+    assert_eq!(
+        wire,
+        [
+            "ready",
+            "approval_pending",
+            "changes_requested",
+            "ci_red",
+            "conflict",
+            "sequenced",
+            "operator_hold"
+        ]
+    );
+    for reason in MergeBlockedReason::ALL {
+        assert_eq!(serde_json::to_value(reason).unwrap(), reason.as_str());
+    }
+}
+
+/// `merge_blocked_reason` is omitted on the wire when absent (a non-PR row or
+/// an older emitter), and carried as its snake_case string when set.
+#[test]
+fn merge_blocked_reason_is_omitted_when_absent() {
+    // A ready/sweep-style row built via `new` carries no reason: absent key.
+    let wire = serde_json::to_value(ready_row(7, 3)).unwrap();
+    assert!(wire.get("merge_blocked_reason").is_none());
+
+    let mut row = listed_row();
+    row.merge_blocked_reason = Some(MergeBlockedReason::OperatorHold);
+    let wire = serde_json::to_value(&row).unwrap();
+    assert_eq!(wire["merge_blocked_reason"], "operator_hold");
+}
+
 /// An absent census decodes as unknown, never as zero, and a missing
 /// visibility decodes as private.
 #[test]
