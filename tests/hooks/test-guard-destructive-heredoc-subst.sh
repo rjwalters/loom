@@ -284,6 +284,47 @@ for t9870 in /dev/stdout /dev/fd/1 /proc/self/fd/1 /DEV/stdout ../../dev/stdout 
         "$(hd9870 "cat > $t9870 <<'EOF'" "never run $P9870_REPO" "EOF")"
 done
 
+# --- DENY: the target token is literal, but the path on disk is no inert file
+# #9870 review: `cat > P` does not create P -- it OPENS whatever P already is.
+# A pre-staged FIFO (or a symlink resolving to one) makes the heredoc body the
+# reader's INPUT, so the masker must prove the sink before hiding anything
+# from the floor. Fixtures live in a throwaway dir; absolute paths, so the
+# assertions do not depend on the fixture repo's contents. The deny helper
+# pins the catastrophic 'dangerous pattern' reason, i.e. the masking was
+# skipped and the FLOOR denied -- not some other tier.
+S9870_DIR=$(mktemp -d 2>/dev/null || mktemp -d -t loom-9870-sink)
+mkfifo "$S9870_DIR/pipe"
+mkdir "$S9870_DIR/realdir"
+ln -s "$S9870_DIR/pipe" "$S9870_DIR/link-to-pipe"
+ln -s "$S9870_DIR/gone" "$S9870_DIR/dangling"
+ln -s "$S9870_DIR/realdir" "$S9870_DIR/link-to-dir"
+printf 'plain\n' > "$S9870_DIR/plain.md"
+deny9870 "catastrophic (#9870 review): a target that is an EXISTING FIFO still denies (the body would feed its reader)" \
+    "$(hd9870 "cat > $S9870_DIR/pipe <<'EOF'" "never run $P9870_REPO" "EOF")"
+deny9870 "catastrophic (#9870 review): a target that is a SYMLINK TO A FIFO still denies" \
+    "$(hd9870 "cat > $S9870_DIR/link-to-pipe <<'EOF'" "never run $P9870_REPO" "EOF")"
+deny9870 "catastrophic (#9870 review): a target that is a DANGLING SYMLINK still denies (fail closed)" \
+    "$(hd9870 "cat > $S9870_DIR/dangling <<'EOF'" "never run $P9870_REPO" "EOF")"
+deny9870 "catastrophic (#9870 review): a target that is a SYMLINK TO A DIRECTORY still denies" \
+    "$(hd9870 "cat > $S9870_DIR/link-to-dir <<'EOF'" "never run $P9870_REPO" "EOF")"
+deny9870 "catastrophic (#9870 review): a target that is an EXISTING DIRECTORY still denies" \
+    "$(hd9870 "cat > $S9870_DIR/realdir <<'EOF'" "never run $P9870_REPO" "EOF")"
+assert_allow "catastrophic (#9870 review): a target that is an EXISTING REGULAR FILE still allows" \
+    "$(hd9870 "cat > $S9870_DIR/plain.md <<'EOF'" "never run $P9870_REPO" "EOF")"
+assert_allow "catastrophic (#9870 review): a target that does not exist yet still allows (fresh regular file)" \
+    "$(hd9870 "cat > $S9870_DIR/new.md <<'EOF'" "never run $P9870_REPO" "EOF")"
+
+# Relative targets resolve against the SESSION cwd from the hook input, not
+# the guard process's own cwd: the same proof must fire through it.
+mkfifo "$TEST_REPO/pwn9870.fifo"
+printf 'note\n' > "$TEST_REPO/notes9870.md"
+deny9870 "catastrophic (#9870 review): a RELATIVE target that is a FIFO in the session cwd still denies" \
+    "$(hd9870 "cat > pwn9870.fifo <<'EOF'" "never run $P9870_REPO" "EOF")"
+assert_allow "catastrophic (#9870 review): a RELATIVE target that is a regular file in the session cwd still allows" \
+    "$(hd9870 "cat > notes9870.md <<'EOF'" "never run $P9870_REPO" "EOF")"
+rm -rf "$S9870_DIR" "$TEST_REPO/pwn9870.fifo" "$TEST_REPO/notes9870.md"
+
+
 # --- DENY: anything else in the command (write-then-execute and friends) ----
 W9870=$(hd9870 "cat > x.sh <<'EOF'" "$P9870_REPO" "EOF")
 for run9870 in 'bash x.sh' 'sh ./x.sh' '. x.sh' 'source x.sh' 'chmod +x x.sh && ./x.sh' \

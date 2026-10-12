@@ -6216,6 +6216,60 @@ mask_catastrophic_comment_lines() {
     }'
 }
 
+# Extract every `>`/`>>` redirect target that could be the sink of a
+# `cat > file <<'EOF'` block, from lines that at least START like one
+# (`cat …` containing `<<`). Deliberately LOOSE: anything this over-collects
+# only makes the proof below stricter -- a path that gets checked without
+# being a real sink skips masking, it never enables it. Output: one target
+# token per line, drawn from the masker's own TGT charset, so a token can
+# contain neither blanks nor newlines.
+heredoc_filesink_candidate_targets() {
+    printf '%s\n' "$1" | awk '
+    {
+        line = $0
+        if (line !~ /^[ \t]*cat[ \t]/ || line !~ /<</) next
+        while (match(line, />[ \t]*[A-Za-z0-9_./+@%,:-]+/)) {
+            t = substr(line, RSTART, RLENGTH)
+            sub(/^>[ \t]*/, "", t)
+            print t
+            line = substr(line, RSTART + RLENGTH)
+        }
+    }'
+}
+
+# The filesystem half of the sink proof (#9870 review): see condition (5) of
+# mask_catastrophic_filesink_heredocs()'s header above. Returns 0 only when
+# EVERY candidate target's final component -- resolved against the session
+# cwd from the hook input when the target is relative -- is not a symlink
+# and is either absent or a plain regular file.
+heredoc_filesink_targets_are_inert() {
+    local t p
+    while IFS= read -r t; do
+        [ -n "$t" ] || continue
+        case "$t" in
+            /*) p=$t ;;
+            *)
+                # A relative target opens against the session cwd (the hook
+                # input's `cwd`), not against this hook process's own cwd.
+                # No CWD in the input -> the open's directory is unknown ->
+                # fail closed.
+                if [[ -z "$CWD" ]]; then return 1; fi
+                p="$CWD/$t" ;;
+        esac
+        # A symlink is denied whatever it points at (regular file included):
+        # resolution adds nothing but doubt, and a dangling link, a
+        # link-to-FIFO and a link to somewhere off-tree all fail the same
+        # way. Anything that exists but is not a regular file -- FIFO,
+        # socket, device, directory -- is likewise no inert sink.
+        if [ -L "$p" ] || { [ -e "$p" ] && [ ! -f "$p" ]; }; then
+            return 1
+        fi
+    done <<EOF
+$(heredoc_filesink_candidate_targets "$1")
+EOF
+    return 0
+}
+
 # Mask the bodies of direct file-write heredocs (`cat > file <<'EOF' ... EOF`)
 # for the catastrophic scan ONLY (#9870). Without this, a fixture, a doc or a
 # note written with a QUOTED-delimiter heredoc hard-denies whenever its body
@@ -6247,11 +6301,30 @@ mask_catastrophic_comment_lines() {
 #   3. TARGET IS A LITERAL PATH drawn from [A-Za-z0-9_./+@%,:-] only: no `$`,
 #      backtick, quote, glob, brace, `~`, `=`, `&`, space. It must not have a
 #      `dev`, `proc` or `..` path component (case-insensitively), so it cannot
-#      name /dev/stdout, /dev/fd/N, /dev/tcp/..., /proc/self/fd/N.
+#      name /dev/stdout, /dev/fd/N, /dev/tcp/..., /proc/self/fd/N -- and it
+#      must also pass the ON-DISK proof in (5) below.
 #   4. THE BLOCK IS CLOSED by a line that is exactly DELIM, using the real
 #      shell rule (leading TABS stripped only for `<<-`). Terminating earlier
 #      or later than the shell does would misclassify live lines, so there is
 #      no best-effort matching here.
+#   5. THE TARGET PROVES INERT ON DISK (#9870 review). A literal token is a
+#      claim about TEXT, not about the filesystem: `cat > P` does not create
+#      P -- it OPENS whatever P already is. If an earlier command or an
+#      unrelated process left a FIFO at P, the body becomes that FIFO's
+#      reader's input (`bash </tmp/f`, `xargs -a /tmp/f`, a logger), and a
+#      symlink resolves to whichever object really sits at the end -- the
+#      body executes even though the command reads as a plain file write.
+#      heredoc_filesink_targets_are_inert() therefore stats every candidate
+#      target (resolved against the session cwd from the hook input when
+#      relative): the final component must NOT be a symlink, and must be
+#      either ABSENT (a fresh open creates a regular file or fails outright)
+#      or a plain REGULAR FILE (writing truncates bytes; it feeds nobody).
+#      FIFO, socket, device, directory, symlink and dangling link all leave
+#      the buffer unchanged, keeping the whole command visible to the
+#      catastrophic floor. Residual TOCTOU -- an object swapped in between
+#      this stat and the command's own open(2) -- requires a hostile local
+#      process already racing the guard and is accepted; it is unreachable
+#      without one.
 #
 # WHY WHOLE-COMMAND, and not "this one block looks fine" (which is what the
 # curated plan on #9870 proposed, with a "target basename appears nowhere
@@ -6275,6 +6348,14 @@ mask_catastrophic_comment_lines() {
 # first one visible too. Line count and every non-body line are preserved, so
 # the two copies derived from COMMAND_NO_LITERAL_TEXT are unaffected.
 mask_catastrophic_filesink_heredocs() {
+    # On-disk sink proof FIRST (#9870 review): the text pass below can only
+    # reason about tokens. If any candidate target is (or may resolve to)
+    # something other than an absent path or a plain regular file, return the
+    # buffer unchanged so the catastrophic floor stays armed.
+    if ! heredoc_filesink_targets_are_inert "$1"; then
+        printf '%s' "$1"
+        return
+    fi
     printf '%s' "$1" | awk '
     BEGIN {
         SQ = sprintf("%c", 39)
