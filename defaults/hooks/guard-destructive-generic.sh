@@ -6225,10 +6225,13 @@ mask_catastrophic_comment_lines() {
 # contain neither blanks nor newlines.
 heredoc_filesink_candidate_targets() {
     printf '%s\n' "$1" | awk '
+    BEGIN { PAT = ">[ \t]*[A-Za-z0-9_./+@%,:-]+" }
     {
         line = $0
         if (line !~ /^[ \t]*cat[ \t]/ || line !~ /<</) next
-        while (match(line, />[ \t]*[A-Za-z0-9_./+@%,:-]+/)) {
+        # Dynamic STRING regex (not a /.../ literal): an unescaped "/" inside
+        # a bracket expression ends the literal early on BWK awk (macOS).
+        while (match(line, PAT)) {
             t = substr(line, RSTART, RLENGTH)
             sub(/^>[ \t]*/, "", t)
             print t
@@ -6243,7 +6246,11 @@ heredoc_filesink_candidate_targets() {
 # cwd from the hook input when the target is relative -- is not a symlink
 # and is either absent or a plain regular file.
 heredoc_filesink_targets_are_inert() {
-    local t p
+    local t p targets
+    # Capture the extractor's output AND status first: a failed extraction
+    # (awk dialect parse error, ...) must fail CLOSED, never read as "no
+    # candidates -> inert". (Judge review, macOS BWK awk.)
+    targets=$(heredoc_filesink_candidate_targets "$1" 2>/dev/null) || return 1
     while IFS= read -r t; do
         [ -n "$t" ] || continue
         case "$t" in
@@ -6265,7 +6272,7 @@ heredoc_filesink_targets_are_inert() {
             return 1
         fi
     done <<EOF
-$(heredoc_filesink_candidate_targets "$1")
+$targets
 EOF
     return 0
 }

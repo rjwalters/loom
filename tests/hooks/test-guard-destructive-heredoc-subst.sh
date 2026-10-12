@@ -364,6 +364,32 @@ done
 deny9870 "catastrophic (#9870): gh issue comment --body-file - <<'EOF' still denies (out of scope)" \
     "$(hd9870 "gh issue comment 1 --body-file - <<'EOF'" "never run $P9870_REPO" "EOF")"
 
+# --- awk-dialect regression (#9870 review): the on-disk sink proof must run on
+# every awk the fleet has (BWK on macOS, mawk, gawk) and FAIL CLOSED if its
+# extractor errors. The extractor once held an unescaped "/" inside a /regex/
+# bracket expression, which BWK awk rejects (rc 2, no output) -> zero candidates
+# -> "inert" -> FIFO/symlink sinks silently allowed on macOS.
+EXTRACT9870=$(sed -n '/^heredoc_filesink_candidate_targets() {/,/^}/p;/^heredoc_filesink_targets_are_inert() {/,/^}/p' "$GUARD")
+run9870_fn() { # <PATH-prefix> <command-text> -> prints "rc=<n> out=<...>" from a subshell
+    ( PATH="$1:$PATH"; CWD=/tmp; eval "$EXTRACT9870"; heredoc_filesink_targets_are_inert "$2" >/dev/null 2>&1; echo "rc=$?" )
+}
+CAND9870=$(PATH="$PATH"; eval "$EXTRACT9870"; heredoc_filesink_candidate_targets "$(hd9870 "cat > /tmp/loom-fifo-9870 <<'EOF'" body EOF)" 2>&1)
+TOTAL=$((TOTAL + 1))
+if [[ "$CAND9870" == "/tmp/loom-fifo-9870" ]]; then
+    PASS=$((PASS + 1)); echo -e "  ${GREEN}PASS${NC}: sink extractor prints the target on this host's awk (#9870 review)"
+else
+    FAIL=$((FAIL + 1)); echo -e "  ${RED}FAIL${NC}: sink extractor prints the target on this host's awk (#9870 review)"; echo "  Got: $CAND9870"
+fi
+BADAWK9870=$(mktemp -d); printf '#!/bin/sh\nexit 2\n' >"$BADAWK9870/awk"; chmod +x "$BADAWK9870/awk"
+GOT9870=$(run9870_fn "$BADAWK9870" "$(hd9870 "cat > /tmp/loom-absent-9870 <<'EOF'" body EOF)")
+rm -rf "$BADAWK9870"
+TOTAL=$((TOTAL + 1))
+if [[ "$GOT9870" == "rc=1" ]]; then
+    PASS=$((PASS + 1)); echo -e "  ${GREEN}PASS${NC}: a failing awk extractor makes the sink proof fail closed (#9870 review)"
+else
+    FAIL=$((FAIL + 1)); echo -e "  ${RED}FAIL${NC}: a failing awk extractor makes the sink proof fail closed (#9870 review)"; echo "  Got: $GOT9870"
+fi
+
 echo ""
 
 # =========================================================================

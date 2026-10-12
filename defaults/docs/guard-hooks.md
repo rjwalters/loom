@@ -2261,6 +2261,19 @@ etc. flags `mask_flag_cat_heredocs()` already recognized — and not extended to
 variable-assignment capture, which needs its own re-parse read check (#7970) that
 a flag value never does.
 
+**Eighth refinement pass (#9870), CATASTROPHIC TIER, DIRECT FILE-WRITE HEREDOCS:** a
+fixture, doc or note written with `cat > file <<'EOF' … EOF` hard-denied whenever its
+body merely mentioned a catastrophic-tier phrase. `mask_catastrophic_filesink_heredocs()`
+now masks such bodies, but only for a WHOLE-COMMAND allowlist: every line must be a
+quoted-delimiter `cat > file` / `cat >> file` block (or its body, terminator or a blank
+line), with no other command anywhere. The target is also proven inert on disk
+(`heredoc_filesink_targets_are_inert()`): a symlink, FIFO, socket, device or directory
+sink, or a relative target with no hook-input `cwd`, is never masked. The proof fails
+CLOSED -- a failed target extraction (e.g. an awk-dialect parse error) counts as "not
+inert". The extractor uses a dynamic string regex because an unescaped `/` in a
+`/…[…/…]…/` literal is a parse error on BWK awk (macOS); the suite pins this with a
+host-awk extractor row and a failing-awk fail-closed row.
+
 ### When a Legitimate Operation Is Pattern-Blocked
 
 When a guard blocks (or asks about) an operation you believe is legitimate, the sanctioned recourse depends on the session:
