@@ -51,7 +51,6 @@ pub const REASON_NON_JSON_RESPONSE: &str = "non_json_response";
 pub const REASON_RESPONSE_TOO_LARGE: &str = "response_too_large";
 
 /// Loss reason: an OTLP HTTP 200 body that could not be parsed as a valid
-/// Loss reason: an OTLP HTTP 200 body that could not be parsed as a valid
 /// Export response. Envelope units.
 pub const REASON_INVALID_RESPONSE: &str = "invalid_response";
 
