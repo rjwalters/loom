@@ -28,9 +28,14 @@
 //! - it has exactly one parent;
 //! - every changed path is in [`version_set`] — `scripts/version.sh list`'s
 //!   set, read from that script at build time, plus each manifest's lockfile;
-//! - `VERSION` strictly increases and every changed line of every other file
-//!   carries the old/new version ([`super::evidence::strip_validated_restamps`]
-//!   discounts the whole commit);
+//! - `VERSION` strictly increases and every other file changes ONLY by that
+//!   old → new swap in the release-owned version field: each changed line is
+//!   the removed line with just the version value replaced, in a `"version"`
+//!   (JSON, below the package's own `"name"`), `version =` (`Cargo.toml`
+//!   `[workspace.package]`/`[package]`) or `"loom_version"` field
+//!   ([`is_version_only_edit`]). A substring match is not enough: it would let
+//!   a changed build command or a dependency that merely mentions the same
+//!   versions ride through as a "bump";
 //! - its `Cargo.lock` lines are workspace crates' own `version =` lines
 //!   ([`cargo_lock_is_workspace_only`]): a registry or git package (one with a
 //!   `source =` line) moving is a dependency change, never a bump.
@@ -38,7 +43,7 @@
 //! Any read failure, a walk longer than [`MAX_WALK`], or a tip that is not a
 //! bump yields `None` — the guard's verdict is exactly what it was before.
 
-use super::evidence::{strip_validated_restamps, ChangedFile};
+use super::evidence::{version_pair, ChangedFile};
 use chrono::{DateTime, Utc};
 use std::sync::LazyLock;
 
@@ -154,11 +159,92 @@ pub fn is_version_bump(c: &BaseCommit, is_bump_identity: &dyn Fn(&str) -> bool) 
         && !c.files.is_empty()
         && c.files.iter().all(|f| set.contains(&f.path))
         && c.files.iter().any(|f| f.path == "VERSION")
-        && strip_validated_restamps(&c.files).is_empty()
+        && version_pair(&c.files)
+            .is_some_and(|(old, new)| c.files.iter().all(|f| is_version_only_edit(f, &old, &new)))
         && c.files
             .iter()
             .filter(|f| f.path == "Cargo.lock")
             .all(|f| f.patch.as_deref().is_some_and(cargo_lock_is_workspace_only))
+}
+
+/// One single-line in-place edit of a patch: the context line directly above
+/// it (`None` at a hunk's first line), the removed line and the added line.
+struct LineEdit {
+    above: Option<String>,
+    removed: String,
+    added: String,
+}
+
+/// The patch as single-line edits, or `None` when any change is not exactly
+/// one removed line replaced by one added line (an insertion, a deletion or a
+/// multi-line change is never a version swap).
+fn single_line_edits(patch: &str) -> Option<Vec<LineEdit>> {
+    let mut edits = Vec::new();
+    let mut above: Option<String> = None;
+    let mut lines = patch.lines().peekable();
+    while let Some(line) = lines.next() {
+        if line.starts_with("@@") {
+            above = None;
+        } else if line.starts_with('\\') {
+            continue;
+        } else if let Some(removed) = line.strip_prefix('-') {
+            let added = lines.next()?.strip_prefix('+')?;
+            if matches!(lines.peek(), Some(n) if n.starts_with('-') || n.starts_with('+')) {
+                return None;
+            }
+            edits.push(LineEdit {
+                above: above.take(),
+                removed: removed.to_string(),
+                added: added.to_string(),
+            });
+        } else if line.starts_with('+') {
+            return None;
+        } else {
+            above = Some(line.strip_prefix(' ').unwrap_or(line).to_string());
+        }
+    }
+    (!edits.is_empty()).then_some(edits)
+}
+
+/// Does this file change ONLY by the release-owned version value moving
+/// `old` → `new`? Every changed line must be the removed line with nothing but
+/// that value replaced (indentation and trailing comma included), and sit in
+/// the field the release bump owns for that file — never a build command, a
+/// dependency or any other value that happens to carry the same version.
+/// `Cargo.lock` is additionally gated by [`cargo_lock_is_workspace_only`].
+fn is_version_only_edit(f: &ChangedFile, old: &str, new: &str) -> bool {
+    if f.status != "modified" {
+        return false;
+    }
+    let Some(edits) = f.patch.as_deref().and_then(single_line_edits) else {
+        return false;
+    };
+    edits.iter().all(|e| {
+        let body = |l: &str| l.trim_start().to_string();
+        let indent = |l: &str| l[..l.len() - l.trim_start().len()].to_string();
+        let swap = |key: &str, v: &str, tail: &str| format!("{key}{v}\"{tail}");
+        let field_ok = |key: &str, tails: &[&str]| {
+            indent(&e.removed) == indent(&e.added)
+                && tails.iter().any(|t| {
+                    body(&e.removed) == swap(key, old, t) && body(&e.added) == swap(key, new, t)
+                })
+        };
+        let above = e.above.as_deref().map(str::trim);
+        match f.path.as_str() {
+            "VERSION" => e.removed.trim() == old && e.added.trim() == new,
+            ".loom/install-metadata.json" => field_ok("\"loom_version\": \"", &[",", ""]),
+            "Cargo.lock" => field_ok("version = \"", &[""]),
+            "Cargo.toml" => {
+                field_ok("version = \"", &[""])
+                    && matches!(above, Some("[workspace.package]" | "[package]"))
+            }
+            path if path.ends_with("package.json") || path.ends_with("package-lock.json") => {
+                field_ok("\"version\": \"", &[",", ""])
+                    && above.is_some_and(|a| a.starts_with("\"name\": \""))
+            }
+            _ => false,
+        }
+    })
 }
 
 /// Every changed line of a `Cargo.lock` patch is the `version =` line of a

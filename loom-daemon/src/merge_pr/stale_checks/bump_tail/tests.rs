@@ -31,6 +31,8 @@ fn file(path: &str, patch: &str) -> ChangedFile {
 
 const CARGO_LOCK_PATCH: &str = "@@ -1257,7 +1257,7 @@\n \n [[package]]\n name = \"loom-api\"\n-version = \"0.19.1079\"\n+version = \"0.19.1080\"\n dependencies = [\n  \"anyhow\",\n@@ -1275,7 +1275,7 @@\n \n [[package]]\n name = \"loom-daemon\"\n-version = \"0.19.1079\"\n+version = \"0.19.1080\"\n dependencies = [\n  \"anyhow\",";
 
+const PKG_BUMP: &str = "@@ -1,6 +1,6 @@\n {\n   \"name\": \"loom\",\n-  \"version\": \"0.19.1079\",\n+  \"version\": \"0.19.1080\",\n   \"description\": \"x\",";
+
 fn bump_files() -> Vec<ChangedFile> {
     vec![
         file(
@@ -38,7 +40,10 @@ fn bump_files() -> Vec<ChangedFile> {
             "@@ -1 +1 @@\n-  \"loom_version\": \"0.19.1079\",\n+  \"loom_version\": \"0.19.1080\",",
         ),
         file("Cargo.lock", CARGO_LOCK_PATCH),
-        file("Cargo.toml", "@@ -1 +1 @@\n-version = \"0.19.1079\"\n+version = \"0.19.1080\""),
+        file(
+            "Cargo.toml",
+            "@@ -8,7 +8,7 @@ resolver = \"2\"\n [workspace.package]\n-version = \"0.19.1079\"\n+version = \"0.19.1080\"\n # comment",
+        ),
         file("VERSION", "@@ -1 +1 @@\n-0.19.1079\n+0.19.1080"),
         file(
             "mcp-loom/package-lock.json",
@@ -46,9 +51,9 @@ fn bump_files() -> Vec<ChangedFile> {
         ),
         file(
             "mcp-loom/package.json",
-            "@@ -1 +1 @@\n-  \"version\": \"0.19.1079\",\n+  \"version\": \"0.19.1080\",",
+            PKG_BUMP,
         ),
-        file("package.json", "@@ -1 +1 @@\n-  \"version\": \"0.19.1079\",\n+  \"version\": \"0.19.1080\","),
+        file("package.json", PKG_BUMP),
     ]
 }
 
@@ -274,4 +279,66 @@ fn commit_json_projects_the_fields_the_rule_reads() {
     assert_eq!(c.committed_at, Some(at(BUMP_AT)));
     assert_eq!(c.files.len(), 1);
     assert!(commit_from_json("{\"sha\": \"x\"}").is_err(), "no files array is an unknown");
+}
+
+// --- The bump must change ONLY the release-owned version values (#11538) -----
+
+/// `bump_files()` with the file at `path` replaced by `patch`.
+fn bump_with(path: &str, patch: &str) -> BaseCommit {
+    let mut files = bump_files();
+    let i = files
+        .iter()
+        .position(|f| f.path == path)
+        .expect("fixture file");
+    files[i] = file(path, patch);
+    bump_commit(files)
+}
+
+#[test]
+fn a_changed_build_command_carrying_the_versions_is_not_a_bump() {
+    let patch = "@@ -1,6 +1,6 @@\n {\n   \"name\": \"loom\",\n-  \"build\": \"node build.js --version 0.19.1079\",\n+  \"build\": \"node different-build.js --version 0.19.1080\",";
+    assert!(!is_version_bump(&bump_with("package.json", patch), &fleet));
+    assert_eq!(tail_over(bump_with("package.json", patch)), None);
+}
+
+#[test]
+fn a_dependency_edit_in_a_json_manifest_or_lockfile_is_not_a_bump() {
+    // A dependency named like the field, and a lockfile entry's own version.
+    let manifest = "@@ -5,6 +5,6 @@\n   \"dependencies\": {\n-    \"version\": \"0.19.1079\",\n+    \"version\": \"0.19.1080\",";
+    assert!(!is_version_bump(&bump_with("package.json", manifest), &fleet));
+    let dep_value = "@@ -5,6 +5,6 @@\n   \"name\": \"loom\",\n-  \"left-pad\": \"0.19.1079\",\n+  \"left-pad\": \"0.19.1080\",";
+    assert!(!is_version_bump(&bump_with("package.json", dep_value), &fleet));
+    let lock = "@@ -20,7 +20,7 @@\n     \"node_modules/left-pad\": {\n-      \"version\": \"0.19.1079\",\n+      \"version\": \"0.19.1080\",";
+    assert!(!is_version_bump(&bump_with("mcp-loom/package-lock.json", lock), &fleet));
+}
+
+#[test]
+fn only_the_version_value_may_differ_between_the_removed_and_added_line() {
+    // Same field, extra content, indentation, or an added/removed line.
+    for patch in [
+        "@@ -1,4 +1,4 @@\n {\n   \"name\": \"loom\",\n-  \"version\": \"0.19.1079\",\n+  \"version\": \"0.19.1080\", \"x\": 1,",
+        "@@ -1,4 +1,4 @@\n {\n   \"name\": \"loom\",\n-  \"version\": \"0.19.1079\",\n+    \"version\": \"0.19.1080\",",
+        "@@ -1,4 +1,5 @@\n {\n   \"name\": \"loom\",\n-  \"version\": \"0.19.1079\",\n+  \"version\": \"0.19.1080\",\n+  \"private\": false,",
+        "@@ -1,4 +1,3 @@\n {\n   \"name\": \"loom\",\n-  \"version\": \"0.19.1079\",",
+        // No context above: the field's owner is unknown.
+        "@@ -1 +1 @@\n-  \"version\": \"0.19.1079\",\n+  \"version\": \"0.19.1080\",",
+    ] {
+        assert!(!is_version_bump(&bump_with("package.json", patch), &fleet), "{patch}");
+    }
+}
+
+#[test]
+fn a_cargo_toml_edit_outside_the_package_version_is_not_a_bump() {
+    let dep = "@@ -20,7 +20,7 @@\n [workspace.dependencies]\n-version = \"0.19.1079\"\n+version = \"0.19.1080\"";
+    assert!(!is_version_bump(&bump_with("Cargo.toml", dep), &fleet));
+    let other = "@@ -8,7 +8,7 @@\n [workspace.package]\n-edition = \"2021\"\n+edition = \"2024\"";
+    assert!(!is_version_bump(&bump_with("Cargo.toml", other), &fleet));
+}
+
+#[test]
+fn a_foreign_field_in_install_metadata_or_cargo_lock_is_not_a_bump() {
+    let meta = "@@ -1,4 +1,4 @@\n {\n-  \"loom_commit\": \"0.19.1079\",\n+  \"loom_commit\": \"0.19.1080\",";
+    assert!(!is_version_bump(&bump_with(".loom/install-metadata.json", meta), &fleet));
+    let lock = "@@ -1,7 +1,7 @@\n [[package]]\n name = \"loom-api\"\n-version = \"0.19.1079\"\n+version = \"0.19.1080-rc\"\n dependencies = [";
+    assert!(!is_version_bump(&bump_with("Cargo.lock", lock), &fleet));
 }

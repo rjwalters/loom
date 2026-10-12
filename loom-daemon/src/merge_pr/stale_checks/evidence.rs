@@ -228,7 +228,7 @@ fn is_discountable(f: &ChangedFile, pair: Option<&(String, String)>) -> bool {
 
 /// `(VERSION@B, VERSION@tip)` when the diff carries a single, strictly
 /// increasing `VERSION` edit; `None` otherwise (which disables all discounting).
-fn version_pair(files: &[ChangedFile]) -> Option<(String, String)> {
+pub(super) fn version_pair(files: &[ChangedFile]) -> Option<(String, String)> {
     let v = files.iter().find(|f| f.path == "VERSION")?;
     if v.status != "modified" {
         return None;
