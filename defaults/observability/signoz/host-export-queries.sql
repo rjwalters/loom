@@ -133,13 +133,19 @@ ORDER BY host;
 --    the JSON body. `dropped_by_reason` holds the durable loss-ledger
 --    breakdown (`queue_overflow`, `capacity_shrink`, `status_<code>`,
 --    `non_json_response`, `response_too_large`, `invalid_response`,
---    `receiver_rejected`, `trace_unmappable`). A reason with no entry means
---    nothing was lost for it; samples from before #11527 carry no breakdown,
---    so any drop growth without a reason row is reported as reason
---    `unattributed`. Facts only, read-only: `first_dropped`/`last_dropped` are
---    the cumulative counter at the first/last in-window sample and
---    `delta` is `last - first` (negative or zero reads as no loss in the
---    window; a ledger reset shows as a negative delta, never a recovery).
+--    `receiver_rejected`, `trace_unmappable`). The map omits zero counts, so
+--    no entry for a reason means 0 at that sample. Facts only, read-only:
+--    `first_dropped`/`last_dropped` are the cumulative counter at the
+--    exporter's first/last in-window sample and `delta` is `last - first`
+--    (negative or zero reads as no loss in the window; a ledger reset shows
+--    as a negative delta, never a recovery). `reason_delta` is the reason's
+--    count at the exporter's last sample carrying it minus its count at the
+--    exporter's first in-window sample, where a reason first seen after that
+--    sample starts from 0 (absent -> N counts N). Any part of `delta` the
+--    reasons do not explain (samples from before #11527 carry no
+--    breakdown) is reported as one extra row, reason `unattributed`.
+--    Drops before the first in-window sample are not counted (no pre-window
+--    baseline, unlike query 1).
 --    Also reports `max_queue_depth` and the daemon versions seen, so a loss
 --    can be tied to the running build rather than to a merged fix.
 --    Durable ledger counts only: session-only admission deferrals are not
@@ -162,6 +168,7 @@ WITH samples AS (
 ),
 per_reason AS (
     SELECT host, exporter, tupleElement(r, 1) AS reason,
+           min(timestamp) AS r_first_ts,
            argMin(tupleElement(r, 2), timestamp) AS first_n,
            argMax(tupleElement(r, 2), timestamp) AS last_n
     FROM samples
@@ -170,6 +177,7 @@ per_reason AS (
 ),
 per_exporter AS (
     SELECT host, exporter,
+           min(timestamp) AS e_first_ts,
            argMin(dropped_total, timestamp) AS first_dropped,
            argMax(dropped_total, timestamp) AS last_dropped,
            max(queue_depth) AS max_queue_depth,
@@ -177,6 +185,27 @@ per_exporter AS (
            count() AS samples
     FROM samples
     GROUP BY host, exporter
+),
+-- A reason absent at the exporter's first in-window sample had 0 there.
+reason_deltas AS (
+    SELECT r.host AS host, r.exporter AS exporter, r.reason AS reason,
+           toInt64(r.last_n) - toInt64(if(r.r_first_ts > e.e_first_ts, 0, r.first_n)) AS reason_delta
+    FROM per_reason AS r
+    INNER JOIN per_exporter AS e ON r.host = e.host AND r.exporter = e.exporter
+),
+attributed AS (
+    SELECT host, exporter, sum(reason_delta) AS attributed_delta
+    FROM reason_deltas
+    GROUP BY host, exporter
+),
+reason_rows AS (
+    SELECT host, exporter, reason, reason_delta FROM reason_deltas
+    UNION ALL
+    SELECT e.host AS host, e.exporter AS exporter, 'unattributed' AS reason,
+           toInt64(e.last_dropped) - toInt64(e.first_dropped) - toInt64(a.attributed_delta) AS reason_delta
+    FROM per_exporter AS e
+    LEFT JOIN attributed AS a ON e.host = a.host AND e.exporter = a.exporter
+    WHERE reason_delta > 0
 )
 SELECT e.host AS host,
        e.exporter AS exporter,
@@ -186,9 +215,9 @@ SELECT e.host AS host,
        e.last_dropped AS last_dropped,
        toInt64(e.last_dropped) - toInt64(e.first_dropped) AS delta,
        e.max_queue_depth AS max_queue_depth,
-       if(r.reason = '', 'unattributed', r.reason) AS reason,
-       toInt64(r.last_n) - toInt64(r.first_n) AS reason_delta
+       r.reason AS reason,
+       r.reason_delta AS reason_delta
 FROM per_exporter AS e
-LEFT JOIN per_reason AS r ON e.host = r.host AND e.exporter = r.exporter
+LEFT JOIN reason_rows AS r ON e.host = r.host AND e.exporter = r.exporter
 WHERE delta > 0
 ORDER BY delta DESC, host, exporter, reason_delta DESC;

@@ -370,7 +370,10 @@ hit: for each host and exporter (`https`, `otlp`) whose cumulative
 `dropped_total` grew in the last 2 h it lists the by-reason ledger deltas
 (`queue_overflow`, `status_<code>`, ...), peak queue depth and the daemon
 versions seen, so a loss is tied to the running build and not to a merged fix.
-It reads only durable loss-ledger counts; session-only admission deferrals are
+`dropped_by_reason` omits zero counts, so a missing reason means 0 at that
+sample: a reason that first appears mid-window (absent -> N) counts its full
+N. Growth the reasons do not explain (e.g. pre-#11527 samples) shows as one
+`unattributed` row. It reads only durable loss-ledger counts; session-only admission deferrals are
 not `host.export` drops. It is not yet replayed in CI (the first live run is
 its check). Whether lost records are recoverable from the authoritative
 journals (bounded replay, `replay-queries.sql`) is a separate, per-incident
