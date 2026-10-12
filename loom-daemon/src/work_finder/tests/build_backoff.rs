@@ -113,10 +113,11 @@ fn a_very_important_candidate_is_held_by_the_backoff_like_any_other() {
     assert_eq!((report.dispatched, report.deferred_build_backoff), (1, 0));
 }
 
-/// The red-main-fix lane (#9244) is not a priority and keeps its bypass
+/// The red-main-fix lane (#9244) is not a level and keeps its bypass
 /// (#11508, Judge): while `main` is red nothing merges, so holding the fix
 /// would deadlock the debt the back-off waits on. The VI and the star in the
-/// same held repo still wait, and the fix gains no place in the order.
+/// same held repo still wait; on the red `main` the fix also leads the
+/// published rank (#11547), which changes order only, not the back-off.
 #[test]
 fn a_verified_red_main_fix_bypasses_the_backoff_but_priority_does_not() {
     let mut multi = vec![(
