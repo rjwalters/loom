@@ -126,3 +126,69 @@ SELECT host,
 FROM judged
 WHERE silent_seconds > threshold_seconds
 ORDER BY host;
+
+-- 4. Per-exporter, per-reason loss in the last 2 h (Issue #11639): which
+--    exporter (`https` vs `otlp`) on which host lost records, and why.
+--    Query 1 stops at the host-level sum; this reads the `exporters` array in
+--    the JSON body. `dropped_by_reason` holds the durable loss-ledger
+--    breakdown (`queue_overflow`, `capacity_shrink`, `status_<code>`,
+--    `non_json_response`, `response_too_large`, `invalid_response`,
+--    `receiver_rejected`, `trace_unmappable`). A reason with no entry means
+--    nothing was lost for it; samples from before #11527 carry no breakdown,
+--    so any drop growth without a reason row is reported as reason
+--    `unattributed`. Facts only, read-only: `first_dropped`/`last_dropped` are
+--    the cumulative counter at the first/last in-window sample and
+--    `delta` is `last - first` (negative or zero reads as no loss in the
+--    window; a ledger reset shows as a negative delta, never a recovery).
+--    Also reports `max_queue_depth` and the daemon versions seen, so a loss
+--    can be tied to the running build rather than to a merged fix.
+--    Durable ledger counts only: session-only admission deferrals are not
+--    `host.export` drops and never appear here.
+--    STATUS: written against the body shape in
+--    telemetry/kinds/host_export.rs; not yet replayed by
+--    signoz_host_export_queries.rs, so treat the first live run as its check.
+WITH samples AS (
+    SELECT if(resources_string['host.name'] != '', resources_string['host.name'], resources_string['host.id']) AS host,
+           resources_string['service.version'] AS version,
+           timestamp,
+           JSONExtractString(e, 'name') AS exporter,
+           JSONExtractUInt(e, 'dropped_total') AS dropped_total,
+           JSONExtractUInt(e, 'queue_depth') AS queue_depth,
+           JSONExtractKeysAndValues(e, 'dropped_by_reason', 'UInt64') AS by_reason
+    FROM signoz_logs.distributed_logs_v2
+    ARRAY JOIN JSONExtractArrayRaw(body, 'exporters') AS e
+    WHERE attributes_string['loom.kind'] = 'host.export'
+      AND timestamp >= toUnixTimestamp64Nano(now64(9) - INTERVAL 2 HOUR)
+),
+per_reason AS (
+    SELECT host, exporter, tupleElement(r, 1) AS reason,
+           argMin(tupleElement(r, 2), timestamp) AS first_n,
+           argMax(tupleElement(r, 2), timestamp) AS last_n
+    FROM samples
+    ARRAY JOIN by_reason AS r
+    GROUP BY host, exporter, reason
+),
+per_exporter AS (
+    SELECT host, exporter,
+           argMin(dropped_total, timestamp) AS first_dropped,
+           argMax(dropped_total, timestamp) AS last_dropped,
+           max(queue_depth) AS max_queue_depth,
+           groupUniqArray(version) AS versions,
+           count() AS samples
+    FROM samples
+    GROUP BY host, exporter
+)
+SELECT e.host AS host,
+       e.exporter AS exporter,
+       e.versions AS versions,
+       e.samples AS samples,
+       e.first_dropped AS first_dropped,
+       e.last_dropped AS last_dropped,
+       toInt64(e.last_dropped) - toInt64(e.first_dropped) AS delta,
+       e.max_queue_depth AS max_queue_depth,
+       if(r.reason = '', 'unattributed', r.reason) AS reason,
+       toInt64(r.last_n) - toInt64(r.first_n) AS reason_delta
+FROM per_exporter AS e
+LEFT JOIN per_reason AS r ON e.host = r.host AND e.exporter = r.exporter
+WHERE delta > 0
+ORDER BY delta DESC, host, exporter, reason_delta DESC;

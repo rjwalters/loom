@@ -365,6 +365,17 @@ with no earlier sample has an unknown baseline and its first value counts as
 (`signoz_host_export_queries.rs`, fixtures for increment, no-increase, reset
 and no-baseline).
 
+Query 4 (#11639) is the per-exporter, per-reason drill-down for a query 1
+hit: for each host and exporter (`https`, `otlp`) whose cumulative
+`dropped_total` grew in the last 2 h it lists the by-reason ledger deltas
+(`queue_overflow`, `status_<code>`, ...), peak queue depth and the daemon
+versions seen, so a loss is tied to the running build and not to a merged fix.
+It reads only durable loss-ledger counts; session-only admission deferrals are
+not `host.export` drops. It is not yet replayed in CI (the first live run is
+its check). Whether lost records are recoverable from the authoritative
+journals (bounded replay, `replay-queries.sql`) is a separate, per-incident
+check, and gaps stay recorded as gaps, never synthesized.
+
 Query 3 (#11198) finds roster hosts silent by absence, which queries 1-2
 cannot (they anchor on logs a host sent). The roster sits between
 `/* loom:roster:begin */` and `/* loom:roster:end */`: one `(host, telemetry)`
