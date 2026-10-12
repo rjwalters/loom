@@ -362,7 +362,7 @@ fetches the per-host Access token (`--credential-source ssm://<param>`, default
 `ssm:///2am/cloudflare/otlp-host/<host>`; or `age-file:<path>` / `file:<path>`),
 writes `~/.config/loom/otlp-headers` mode 0600 (atomically replacing any looser
 file; the `headers_file` parser must accept it), sends one `host.export` probe to
-`--endpoint` (default `https://otlp-cf.2amlogic.com`), and polls the
+`--endpoint` (default: the compiled-in `DEFAULT_ENDPOINT`), and polls the
 telemetry-reader (`--reader-url`) until the row shows
 `host.id == harness.ingest.principal == <roster-id>` (`--timeout`, default 60 s).
 Failures exit non-zero with a distinct reason: credential fetch, `OTLP HTTP 401/403`
