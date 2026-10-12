@@ -3,8 +3,8 @@
 This is the design doc for #11659. It covers how Loom sizes an issue at
 curation time and what reads that size. It lists every reader and writer of
 the three current sizing signals, maps each consumer onto story points, answers
-the five questions the operator ruling left open, and sets out a phased plan.
-Each phase is filed as its own child issue.
+the five questions the operator ruling left open, and sets out a three-phase
+plan. Each phase is its own child issue.
 
 **Status: proposal for operator sign-off.** This doc changes documentation
 only. It changes no code, prompt, label or config, and it does not restart
@@ -60,10 +60,16 @@ What we found:
 
 - **The tier routes nothing.** The `sweep` block is absent from
   `.loom/config.json` and `defaults/config.json` (checked at `1a2356921`).
-  It is also absent from robb-studio's `.loom-local/local.json` overlay, and
-  no fleet-gitops checkout file names `tierModels`, `optimization`,
-  `modelExperiment` or `minComplexity` (checked at `e1fd8f8`, 2026-10-10). So
-  every Builder runs on its role default.
+  Neither robb-studio's `.loom-local/local.json` overlay, its tier-1 host
+  defaults, nor any fleet-gitops checkout file sets `tierModels`,
+  `optimization` or `minComplexity` (fleet-gitops checked at `e1fd8f8`,
+  2026-10-10). So every Builder runs on its role default.
+- **The model-cost experiment records, but assigns no arm.**
+  `sweep.modelExperiment` is `"observe"` fleet-wide, set in the host defaults
+  file `~/.local/share/loom/config/defaults.json` (operator decision #11450,
+  2026-10-11). Observe mode appends one stats record per phase, carrying the
+  normalized tier as `complexity`. It assigns no arm. `experiment` mode is
+  configured nowhere.
 - **The tier still costs a forge call.** At every Builder dispatch,
   `resolve-tier-model.sh` fetches the issue body by GraphQL, falling back to
   REST, and then exits 3 because no map is configured.
@@ -170,12 +176,12 @@ A test file takes its subject's status.
 
 | File | Role | Status |
 |---|---|---|
-| `loom-daemon/src/script_helpers/sweep_experiment.rs` | `sweep.modelExperiment` mode; `extract_complexity_marker`; `normalize_complexity` (anything but `complex` folds to `routine`); `assign_arm` | inert-unless-configured (`off` by default; `observe` was used historically on robb-studio) |
+| `loom-daemon/src/script_helpers/sweep_experiment.rs` | `sweep.modelExperiment` mode; `extract_complexity_marker`; `normalize_complexity` (anything but `complex` folds to `routine`); `assign_arm` | live (`observe` via the host defaults, #11450; `assign_arm` runs only in `experiment` mode, configured nowhere) |
 | `loom-daemon/src/script_helpers/sweep_experiment_arms.rs` | `sweep.modelExperimentArms` and `…BudgetFraction`; `unit_hash(domain, issue, stratum)` | inert-unless-configured |
 | `loom-daemon/src/sweep_registry/model.rs` | `fetch_issue_complexity`, which fetches lazily and only in `experiment` mode; daemon arm assignment | inert-unless-configured |
-| `defaults/scripts/sweep-experiment.sh` | `resolve-mode`, `assign-arm --complexity`, and `record --complexity` | inert-unless-configured |
-| `defaults/scripts/tests/test-sweep-experiment.sh` | Its test | inert-unless-configured |
-| `defaults/docs/model-cost-experiment.md` | Experiment design (#3725, #9122) | inert-unless-configured |
+| `defaults/scripts/sweep-experiment.sh` | `resolve-mode`, `assign-arm --complexity`, and `record --complexity` | live (`record` in `observe`; `assign-arm` inert) |
+| `defaults/scripts/tests/test-sweep-experiment.sh` | Its test | live |
+| `defaults/docs/model-cost-experiment.md` | Experiment design (#3725, #9122) | live (observe recording) |
 | `docs/model-selection-retune.md` | Cheap-first retune (#3718) | inert-unless-configured |
 | `defaults/scripts/experiments/README.md` | Cites `sweep.modelExperiment` as flag precedent | dead |
 | `defaults/scripts/experiments/judge-fanout-experiment.sh` | Same | dead |
@@ -224,26 +230,25 @@ journals), `loom-daemon/src/sweep_registry/dispatch.rs` (step 2.71, live;
 `story_points` read from dispatch labels), `loom-daemon/src/work_finder/ready_queue.rs`
 (live; `points_of`), `loom-daemon/src/comment_trust.rs` (live; the trust
 predicate), `defaults/docs/story-points.md` (the paused rubric),
-`defaults/observability/story-points-calibration-queries.sql` and
-`defaults/observability/story-points-calibration-questions.md` (#9434),
 and `defaults/docs/runtime-model-trials.md` (a `minComplexity` example).
 
 ## 4. Consumer map under the ruling
 
 | Consumer | Reads today | Under the ruling | Phase |
 |---|---|---|---|
-| Builder model routing (tier 2.5: `resolve-tier-model.sh`, `sweep.tierModels`, `sweep.optimization`, `model_tiers.rs`) | Tier from the body | **Retired.** Routing uses tiers 1–3 plus the escalation ladder. Points do not route (§5e). | P3 |
-| Experiment-mode tier-2.5 suppression (`sweep-execution-model.md`) | Tier 2.5 existence | **Retired** with tier 2.5. The forced arm stays above the tier-3 role default. | P3 |
-| Model-cost experiment stratification (`assign_arm`, `ExperimentArms::assign`, `in_experiment`) | Binary stratum: `complex` vs. everything else | **Points band** (`small` 1–2, `medium` 3–5, `large` 8–13, `unsized`) on versioned hash domains (§6.4) | P4 |
-| Backstop ceiling `minComplexity` (#8555) | Tier; unmarked counts as `routine` | **`minPoints`** (one of `POINTS_VALUES`); unsized counts as 3. `minComplexity` is translated with a warning for one release (§6.5). | P3 |
-| Work-finder carrier (`WorkItem::complexity`, `PriorityCandidate.complexity`) | Tier from the listing body | **`story_points`** from the listing's labels, already read by `ready_queue::points_of`. The tier body extraction is removed. | P3 |
-| `sweep.outcome.complexity` | Tier from a body fetch | **Deprecated.** Nullable and kept in the schema; no longer filled after P5. `story_points` (label) already exists on `sweep.started` and `sweep.outcome`. | P5 |
-| Sweep-outcome write-back (`writeback.rs`, `points_signal.rs`) | Tier and body points marker | Points from the label projection | P5 |
-| Jev shadow classifier (#8543) | Asks the same three-way tier question; its only trigger is `resolve-tier-model.sh` | **Retired** with its trigger. A points shadow could be proposed again with evidence. | P5 |
-| Calibration (#9434) | `points:*` labels (paused) | The journaled `issue.estimate` fact, extended with `points` and the Curator's model and runtime, joined against landed size | P5, P7 |
-| Throughput KPI (LSI, #9466) | Not live | Landed-size index per `RESULTS.md`. Points are ordinal, so the KPI never sums them; it counts per class and reports the LSI. | P7 |
+| Builder model routing (tier 2.5: `resolve-tier-model.sh`, `sweep.tierModels`, `sweep.optimization`, `model_tiers.rs`) | Tier from the body | **Deleted.** Routing uses tiers 1–3 plus the escalation ladder. Points do not route (§5e). | P3 |
+| Experiment-mode tier-2.5 suppression (`sweep-execution-model.md`) | Tier 2.5 existence | **Deleted** with tier 2.5. The forced arm stays above the tier-3 role default. | P3 |
+| Experiment arm assignment (`assign_arm`, `ExperimentArms::assign`, `in_experiment`) | Binary stratum: `complex` vs. everything else | **No stratum.** The hash takes the issue number only (§6.4). | P3 |
+| Observe-mode stats record (`sweep-experiment.sh record --complexity`) | Normalized tier | **Kept** (live, #11450). Records `story_points` from the issue's label instead, empty when unsized. | P3 |
+| Backstop ceiling `minComplexity` (#8555) | Tier; unmarked counts as `routine` | **Deleted, no replacement** (§6.5). | P3 |
+| Work-finder carrier (`WorkItem::complexity`, `PriorityCandidate.complexity`) | Tier from the listing body | **`story_points`** from the listing's labels, already read by `ready_queue::points_of`. | P3 |
+| `sweep.outcome.complexity` and `complexity_signal.rs`'s body fetch | Tier from a body fetch | **Deleted.** `story_points` (label) already exists on `sweep.started` and `sweep.outcome`. | P3 |
+| Sweep-outcome write-back (`writeback.rs`, `points_signal.rs`) | Tier and body points marker | Points from the label | P3 |
+| Jev shadow classifier (#8543) | Asks the same three-way tier question; its only trigger is `resolve-tier-model.sh` | **Deleted** with its trigger | P3 |
+| `issue.estimate` fact | `difficulty`, `lines`, `files`, `doctor_risk` | Journals the resolved `points` (P1); drops `difficulty` (P2) | P1, P2 |
 | PR congestion (`forge_pr_congestion.rs`) | Its own label parser | `story_points::classify_points_labels` (the duplicate parser is removed) | P1 |
-| Disposition exporter / dispatch telemetry (`ready_queue.rs`, `dispatch.rs` step 2.71) | `points:*` label | Unchanged: it already reads the projection | none |
+| Disposition exporter / dispatch telemetry (`ready_queue.rs`, `dispatch.rs` step 2.71) | `points:*` label | Unchanged | none |
+| Calibration (#9434) and the LSI throughput KPI (#9466) | `points:*` labels | Out of this plan. Those issues own it; they read the label and the `issue.estimate` points. | — |
 
 ## 5. Open questions
 
@@ -251,9 +256,9 @@ and `defaults/docs/runtime-model-trials.md` (a `minComplexity` example).
 
 | Rank | Option | Verdict |
 |---|---|---|
-| **1 (recommended)** | **Both.** The marker is the authored source of truth: written by the Curator in the body or a comment, and parsed by `points_marker.rs`. The `points:N` label is a **projection** that only the gate writes (§5d). Consumers read the label. | Consumers keep zero-cost reads: every listing and dispatch read already carries labels (`story_points.rs`), and `gh issue list --label points:3` still filters server-side (#9431's reason for choosing labels). The marker carries provenance and is validated **before** the label lands. Trust is settled once, at write time, by the gate. Only insiders can apply labels, so label readers need no trust check. |
-| 2 | Label only (#9431 as shipped) | Rejected. The ruling requires a marker that can be parsed from comments. A bare label has no record of who assigned it or which model and rubric did. The gate would have nothing to validate before the value lands. |
-| 3 | Marker only | Rejected. Every consumer would need a body plus comments fetch. The work-finder listing carries bodies but not comments, so this adds one comments call per candidate per tick. It also loses server-side filtering. |
+| **1 (recommended)** | **Both.** The marker is the authored source of truth: written by the Curator in the body or a comment, and parsed by `points_marker.rs`. The `points:N` label is a **projection** that only the gate writes (§5d). Consumers read the label. | Consumers keep zero-cost reads: every listing and dispatch read already carries labels (`story_points.rs`), and `gh issue list --label points:3` still filters server-side (#9431's reason for choosing labels). The marker is validated **before** the label lands, so trust is settled once, at write time. Only insiders can apply labels, so label readers need no trust check. |
+| 2 | Label only (#9431 as shipped) | Rejected. The ruling requires a marker that can be parsed from comments, and the gate would have nothing to validate before the value lands. |
+| 3 | Marker only | Rejected. Every consumer would need a body plus comments fetch (the work-finder listing carries no comments), and server-side filtering is lost. |
 
 **Single parsers, one vocabulary.** Markers go through `points_marker.rs` and
 labels through `story_points.rs`. Both already share `POINTS_VALUES`.
@@ -261,9 +266,9 @@ labels through `story_points.rs`. Both already share `POINTS_VALUES`.
 `story_points::classify_points_labels`. We do not add a new parser.
 `points_marker.rs` is hardened in place to the discipline of
 `issue_estimate::parse`: a marker counts only on a standalone line outside
-fenced or indented code, a malformed `loom:points=` value is detected and
-rejected instead of being silently skipped, and conflicting duplicates in one
-source are rejected. The #4840 anchoring guarantee is kept.
+fenced or indented code, a malformed `loom:points=` value is rejected instead
+of being silently skipped, and conflicting duplicates in one source are
+rejected. The #4840 anchoring guarantee is kept.
 
 **Labels.** No new labels. The six existing `points:*` labels are reused.
 Their descriptions lose "(paused)", and their owner becomes "Curator, via
@@ -277,9 +282,9 @@ content, not control.**
 
 | Rank | Option | Verdict |
 |---|---|---|
-| **1 (recommended)** | Filter with `comment_trust` (insider `author_association`, fleet Apps, the daemon identity, `forge.trustedCommenters`, the fleet admin roster). The **latest trusted comment** that has a points marker wins. The **body** counts only when the issue's author is trusted, which is the `premise-check` precedent. | Uses the one existing predicate. Comments have per-comment authorship and timestamps; the body has only one author field. That field is the filer, even after a Curator edit, so on public repos a trusted comment is the *more* reliable source. |
-| 2 | Accept only markers whose author is the Curator's identity | Rejected. The Curator runs under several identities (attended `gh` user, fleet App, Codex). An operator's correction would not count. Pinning one identity breaks attended curation. |
-| 3 | Body first; ignore comments unless the body has no marker | Rejected. A stale body marker from a pre-pause curation would beat a fresh re-curation comment. And for outsider-filed issues, the body is the untrusted source. |
+| **1 (recommended)** | Filter with `comment_trust` (insider `author_association`, fleet Apps, the daemon identity, `forge.trustedCommenters`, the fleet admin roster). The **latest trusted comment** that has a points marker wins. The **body** counts only when the issue's author is trusted, which is the `premise-check` precedent. | Uses the one existing predicate. Comments have per-comment authorship; the body's only author field is the filer, even after a Curator edit, so on public repos a trusted comment is the *more* reliable source. |
+| 2 | Accept only markers whose author is the Curator's identity | Rejected. The Curator runs under several identities (attended `gh` user, fleet App, Codex), and an operator's correction would not count. |
+| 3 | Body first; ignore comments unless the body has no marker | Rejected. A stale body marker would beat a fresh re-curation comment, and for outsider-filed issues the body is the untrusted source. |
 
 **Precedence and edge cases** (P1 tests each one):
 
@@ -288,8 +293,7 @@ content, not control.**
 - **Several comment markers:** the newest trusted comment by `created_at`
   wins. Inside one comment, two different values are rejected as conflicting.
 - **The winning source is malformed or out of vocabulary:** reject (fail
-  closed). Never fall back to an older valid marker, because the newest intent
-  is what the gate checks.
+  closed). Never fall back to an older valid marker.
 - **The winning source carries a `loom:complexity=` marker:** reject, naming
   the retired tier and the points syntax. This is exactly the repo#623 case.
   Tier markers in older comments or bodies are ignored.
@@ -297,8 +301,7 @@ content, not control.**
   fences or indented code): not a marker, because of the standalone-line and
   fence rules plus the digit-only capture.
 - **Closed issue with only a `points:*` label:** consumers read the label
-  as-is. Calibration counts it as *label-only, no journaled provenance* and
-  leaves it out of fits by default (§6.2).
+  as-is.
 
 ### 5c. Overlap with `loom:estimate`
 
@@ -308,41 +311,40 @@ only signal" is false.
 
 | Rank | Option | Verdict |
 |---|---|---|
-| **1 (recommended)** | **Keep `loom:estimate` as an observational forecast, drop `difficulty`, and journal `points` in the same `issue.estimate` fact.** `lines`, `files` and `doctor_risk` stay as calibration covariates. The docs and `curator-estimate.md` state that **no consumer may route, gate or order on them**. | Points become the only *decision-bearing* size. The live completion path (`curation-complete`, the journal, the OTLP export) is reused rather than duplicated. Calibration gets points with the Curator's model and runtime in one fact. Dropping `difficulty` removes the only scale that competes with points. |
-| 2 | Retire `loom:estimate` entirely | Rejected for now. It is live and required, and its `lines`/`files` forecasts are the only pre-registered estimate-vs-actual covariates. Retiring it is a separate decision with its own evidence. |
-| 3 | Fold points into the estimate marker (`loom:estimate points=5 lines=…`) | Rejected. It would create a second points parser beside `points_marker.rs`, which breaks the one-source-of-truth rule, and it would make points body-only again. |
-| 4 | Derive points from `lines`/`difficulty` | Rejected. The ruling has the Curator *produce* points. `RESULTS.md` measured the rubric directly (ρ≈0.82), and a derived value would be a guess nobody assigned. |
+| **1 (recommended)** | **Keep `loom:estimate` as an observational forecast, drop `difficulty`, and journal `points` in the same `issue.estimate` fact.** `lines`, `files` and `doctor_risk` stay. The docs and `curator-estimate.md` state that **no consumer may route, gate or order on them**. | Points become the only *decision-bearing* size. The live completion path (`curation-complete`, the journal, the OTLP export) is reused, not duplicated. Dropping `difficulty` removes the only scale that competes with points. |
+| 2 | Retire `loom:estimate` entirely | Rejected for now. It is live and required, and its `lines`/`files` forecasts are the only pre-registered estimate-vs-actual covariates. |
+| 3 | Fold points into the estimate marker (`loom:estimate points=5 lines=…`) | Rejected. A second points parser beside `points_marker.rs`, and points would be body-only again. |
+| 4 | Derive points from `lines`/`difficulty` | Rejected. The ruling has the Curator *produce* points, and `RESULTS.md` measured the rubric directly (ρ≈0.82). |
 
 ### 5d. Where the gate is enforced
 
 | Rank | Option | Verdict |
 |---|---|---|
-| **1 (recommended)** | **Inside `loom-daemon curation-complete`, which also applies the labels.** It already fetches the issue and validates before completion. It gains: a comments fetch, points resolution (§5b), validation, then projection of `points:N` (removing any other `points:*`) and application of `loom:curated`. Nothing is journaled or labeled on failure. A `--check` dry-run gives the Curator the same verdict before completion. | The label transition is *done by* the gate, so a skipped or ignored check can no longer produce `loom:curated`. That closes the repo#623 failure mode structurally. It is daemon-native (`.loom/docs/shell-language-policy.md`). `CheckPointsMarker`'s message text is reused as the error output. |
-| 2 | A standalone `loom-daemon` subcommand (revive `CheckPointsMarker` with its own fetch) | Rejected as the enforcement point. It is still a self-run check: one more command to forget, which is the original failure. It survives only as the `--check` dry-run of option 1. |
-| 3 | A check at the label transition (a `labeled` Action, or a daemon pass on `loom:curated`) | Rejected as primary. It is reactive (the label is already applied and may race Champion), and Actions are off by default. **Kept as a repair backstop:** a daemon pass finds post-cutover `loom:curated` issues with no valid single `points:*` label and sends them back to curation. This fits repair-over-gate, and it is P1's optional slice. |
+| **1 (recommended)** | **Inside `loom-daemon curation-complete`, which also applies the labels.** It already fetches the issue and validates before completion. It gains a comments fetch, points resolution (§5b) and validation, then projects `points:N` (removing any other `points:*`) and applies `loom:curated`. Nothing is journaled or labeled on failure. | The label transition is *done by* the gate, so a skipped or ignored check can no longer produce `loom:curated`. That closes the repo#623 failure mode structurally. It is daemon-native (`.loom/docs/shell-language-policy.md`). `CheckPointsMarker`'s message text is reused as the error output. |
+| 2 | A standalone `loom-daemon` subcommand (revive `CheckPointsMarker` with its own fetch) | Rejected. It is still a self-run check: one more command to forget, which is the original failure. |
+| 3 | A check at the label transition (a `labeled` Action, or a daemon repair pass on `loom:curated`) | Rejected. It is reactive (the label is already applied and may race Champion), Actions are off by default, and option 1 already makes the bad transition impossible. |
 
-`require-complexity-marker.sh` becomes a deprecation shim for one release. It
-is a `contract` script that older consumer prompts still call. The shim prints
-a notice and runs `loom-daemon curation-complete --check`. After that release
-it is removed, along with its allowlist, CI and baseline entries.
+`require-complexity-marker.sh` is deleted, with its test and its allowlist, CI
+and baseline entries, in the same change that switches the Curator prompts
+(P2). Prompts and scripts ship together through resync, so no shim is needed.
 
 ### 5e. Model routing
 
 | Rank | Option | Verdict |
 |---|---|---|
-| **1 (recommended)** | **Points do not drive model choice.** Tier 2.5, `sweep.tierModels` and `sweep.optimization` are retired, and the Builder falls back to tiers 1–3 (operator param, `roleConfig.model`, role default) plus the Judge-rejection escalation ladder. | No config uses tier routing today (§2), so the dispatch result is byte-identical. Size is not cost-of-being-wrong, which was the question the tier answered: a tiny security fix is small but risky. Points are ordinal. And #3718's cheap-first retune has no evidence that a smaller model succeeds on low-point work. Retiring also removes one GraphQL body fetch per Builder dispatch. |
-| 2 | A points-band model map (e.g. `sweep.pointsModels`) | Rejected for now. It recreates an unconfigured surface with no evidence behind it. It can be proposed again once P4's stratified experiment produces arm outcomes per band. |
-| 3 | Map points onto legacy tiers (1–2 → `mechanical`, 3–5 → `routine`, 8–13 → `complex`) and keep `tierModels` | Rejected. It keeps a dead config surface alive and mixes up size and risk under the old names. |
+| **1 (recommended)** | **Points do not drive model choice.** Tier 2.5, `sweep.tierModels` and `sweep.optimization` are deleted, and the Builder falls back to tiers 1–3 (operator param, `roleConfig.model`, role default) plus the Judge-rejection escalation ladder. | No config uses tier routing today (§2), so the dispatch result is byte-identical. Size is not cost-of-being-wrong, which was the question the tier answered: a tiny security fix is small but risky. And #3718's cheap-first retune has no evidence that a smaller model succeeds on low-point work. Deleting also removes one GraphQL body fetch per Builder dispatch. |
+| 2 | A points-band model map (e.g. `sweep.pointsModels`) | Rejected. It recreates an unconfigured surface with no evidence behind it. It can be proposed again once observe records grouped by `story_points` show a difference. |
+| 3 | Map points onto legacy tiers and keep `tierModels` | Rejected. It keeps a dead config surface alive and mixes up size and risk under the old names. |
 
 ## 6. Migration and back-compat
 
 Counts are from GitHub search on 2026-10-12 (body and comments, so upper
-bounds), re-run for this doc:
+bounds):
 
 | Population | Count |
 |---|---|
 | Open issues matching `"loom:complexity"` | 114 |
-| … of which in `loom:issue`/`loom:curated`/`loom:building` (98 in those states) | 73 |
+| … of which in `loom:issue`/`loom:curated`/`loom:building` | 73 |
 | Open issues with a `points:*` label | 54 |
 | Open issues matching `"loom:points"` | 11 |
 | `.loom/stats/sweep-model-stats.jsonl` records on robb-studio | 33, all `observe`, all `arm: null` (2026-07-31 to 2026-10-03) |
@@ -350,100 +352,81 @@ bounds), re-run for this doc:
 ### 6.1 Tier markers on open issues
 
 **Leave them in place. Never convert them.** A tier measures cost of being
-wrong, not size. Mapping it onto points would publish numbers no Curator
-assigned, which breaks the "never a guess" rule in `story_points.rs`. Once
-P3–P5 land, nothing reads them, so the stale HTML comments are inert. We do not
-mass-edit 114 bodies: that would spam notifications and risk clobbering a
-concurrent Curator's body write. In-flight issues without points run unsized,
-because routing does not depend on points (§5e), and they get points at their
-next curation. The gate rejects a tier marker only in the source it is
+wrong, not size, so mapping it onto points would publish numbers no Curator
+assigned (the "never a guess" rule in `story_points.rs`). After P3 nothing
+reads them. We do not mass-edit 114 bodies: that spams notifications and can
+clobber a concurrent Curator's body write. In-flight issues without points run
+unsized, because routing does not depend on points (§5e), and get points at
+their next curation. The gate rejects a tier marker only in the source it is
 validating (§5b).
 
 ### 6.2 Existing `points:*` labels and `loom:points` markers
 
-**Keep them.** They were assigned under the rubric before the pause. Consumers
-read them as before. They have no journaled `issue.estimate` provenance, so
-calibration (P7) tags them `pre-restart` and leaves them out of fits by
-default. The 11 body markers are valid syntax for the hardened parser. Where
-the body author is trusted they still count, until a re-curation comment
-replaces them.
+**Keep them.** They were assigned under the rubric before the pause, and
+consumers read them as before. The 11 body markers are valid syntax for the
+hardened parser. Where the body author is trusted they still count, until a
+re-curation comment replaces them.
 
 ### 6.3 `sweep.outcome` records and the stats store
 
-- `sweep.outcome.complexity` stays in the schema as nullable and deprecated.
-  It is not filled after P5. Historical records are not rewritten.
-  `telemetry-schema.md` records the cutover Loom version so queries can split
-  on it. Queries group by `story_points` going forward.
-- Stats-store records (`sweep-experiment.sh record`) gain `stratum` and
-  `stratum_version: 2`. Records without `stratum_version` read as version 1
-  (tier stratum). The harvest and `agent-metrics.sh --model-experiment`
-  accept both.
+- `sweep.outcome.complexity` is deleted from the schema in P3. Historical
+  records are not rewritten. `telemetry-schema.md` records the cutover Loom
+  version once, so queries can split on it. Queries group by `story_points`.
+- Observe-mode stats records are live (#11450), so recording keeps working:
+  new records carry `story_points` in place of `complexity`. Old records keep
+  their `complexity` field. There is no version field; a reader treats a
+  missing field as absent.
 
-### 6.4 Experiment arm rehashing
+### 6.4 Experiment arm assignment
 
-Today both hashes take `(issue, normalize_complexity(tier))`, where the
-stratum is binary. Rehashing on a points band changes arm assignment, and an
-in-flight `experiment`-mode sweep would switch arms when it resumes.
-
-**Cut over by version. Do not rehash silently.**
-
-1. Use new domain separators (`…/v2`) keyed on the points band (`small`,
-   `medium`, `large`, `unsized`). `unsized` is its own stratum and is not folded
-   into `medium`.
-2. **An arm recorded in the checkpoint wins on resume.** The hash applies only
-   to a sweep that has never been assigned one. This removes the in-flight
-   flip whatever the cutover timing.
-3. Keep the built-in A/B parity split for the absent-config case, with the band
-   replacing the tier bit, and update the parity test to the new definition.
-
-This is acceptable. `experiment` is canary-only, no verified config enables
-it, and the only local stats store holds no assigned arm.
+Both arm hashes take `(issue, normalize_complexity(tier))`. Dropping the tier
+bit changes which arm an issue would get. That is safe with no transition
+step: `experiment` mode is configured nowhere, and `observe` (the live mode)
+assigns no arm; all 33 local records have `arm: null`. So there is no
+in-flight arm to protect. P3 hashes on the issue number only, keeps the
+built-in A/B parity split for the absent-config case, and updates the parity
+test.
 
 ### 6.5 `minComplexity` and the `ComplexityTier` vocabulary
 
-`runtimes.backstopCeiling.minComplexity` (#8555) is strictly validated:
-`ceiling.rs` rejects keys outside `KNOWN_KEYS` and any value outside the tier
-vocabulary. Dropping the key outright would turn a stale config into a hard
-error.
-
-1. **Deprecation release:** accept `minComplexity` with a warning naming
-   `minPoints`, and translate it (`mechanical` → no filter, `routine` →
-   `minPoints: 3`, `complex` → `minPoints: 8`). That keeps the operator's
-   restriction instead of quietly widening metered-tap admission. `minPoints`
-   is validated against `POINTS_VALUES`.
-2. **Removal release:** `minComplexity` moves to a retired-key list that fails
-   validation with a message naming `minPoints`.
-3. After P3–P5, delete `COMPLEXITY_TIERS` (`model_tiers.rs`), `ComplexityTier`
-   (`ceiling.rs`), and `extract_complexity_marker`/`normalize_complexity`
-   (`sweep_experiment.rs`).
+`runtimes.backstopCeiling.minComplexity` (#8555) is set nowhere (§2). P3
+deletes it outright, with `ComplexityTier` (`ceiling.rs`), `COMPLEXITY_TIERS`
+(`model_tiers.rs`) and `extract_complexity_marker`/`normalize_complexity`
+(`sweep_experiment.rs`). No `minPoints` replaces it: a points-keyed
+eligibility filter would contradict §5e. The back-compat behaviour is the
+existing one: `ceiling.rs` rejects unknown keys, so a stale config fails
+validation loudly, naming the key, rather than silently widening metered-tap
+admission.
 
 ## 7. Phased plan
 
-Each phase is one child issue of #11659, with its own tests. Dependencies:
-P1 → P2. P1 → P3, P4 and P5. P2 + P5 → P7. P6 comes last.
+Three phases, each one child issue of #11659 with its own tests. P1 comes
+first; P2 and P3 each depend on it.
 
 | Phase | Scope | Key tests |
 |---|---|---|
-| **P1** Points resolver and gate in `curation-complete` | Harden `points_marker.rs` (§5a). Add comment-source resolution through `comment_trust` with the §5b precedence rule. `curation-complete` validates, projects `points:N` and applies `loom:curated`; it also gets a `--check` dry-run. Fold `forge_pr_congestion::points_from_labels` into `story_points`. Optional: the repair backstop pass. | Rejects `3`, `loom:complexity=3`, `loom:points=x`, `points=21` and conflicting duplicates. Accepts a valid marker in a trusted comment. Ignores an untrusted commenter's marker. Body-vs-comment precedence. Quoted and fenced syntax. Projection replaces a stale `points:*` label. No label or journal entry on failure. |
-| **P2** Curator prompt and gate shim | `curator.md`, `defaults/.agents/skills/loom-curator/SKILL.md`, `curator-estimate.md` and its skill mirror: emit `<!-- loom:points=N -->` and drop the tier section. `story-points.md` is un-paused. Update `label-state-machine.md` and the `points:*` label descriptions. `require-complexity-marker.sh` becomes the shim (§5d). Update the allowlist, CI wiring and bypass baseline. | Shim test (exit codes, notice). Prompt-budget and markdown-token-budget gates. Codex mirror sync. |
-| **P3** Retire tier 2.5 and move ceiling/work finder to points | Remove tier 2.5 from `sweep-execution-model.md`. `resolve-tier-model.sh` becomes an exit-3 shim, then is removed. Remove the `tierModels`/`optimization` paths in `model_tiers.rs` and the `--tier` flag. Update `model-selection.md`, `configuring-resources.md`, `runtime-adapters.md` and `sweep_md_doc_lint.rs`. Replace `minComplexity` with `minPoints` (§6.5). The work-finder carrier uses `story_points`. | Builder resolution is byte-identical without tier config. `minComplexity` translation plus warning. `minPoints` validation. The carrier reads labels with no body parse. |
-| **P4** Experiment stratification v2 | Points-band stratum and versioned hash domains. A checkpoint-recorded arm wins on resume. `stratum_version` in stats records. `fetch_issue_complexity` becomes a label read. Update `sweep-experiment.sh`, `model-cost-experiment.md` and `model-selection-retune.md`. | Weighted frequencies converge within each band. Resume keeps the recorded arm across the cutover. v1 and v2 records both harvest. |
-| **P5** Telemetry, write-back, estimate and Jev | `sweep.outcome.complexity` is deprecated (§6.3). Retire the marker read in `complexity_signal.rs`. Write-back reads the label. `issue.estimate` gains `points` and drops `difficulty` (§5c), with the OTLP mapping and `telemetry-schema.md` updated. Retire `jev_tier.rs`, its `daemon_service.rs` hook and its subcommand. | Schema round-trip with old and new records. A missing `difficulty` is accepted. No Jev call path remains. |
-| **P6** Legacy cleanup | Re-anchor the dead cross-references (§3.1) to `loom:points`/`loom:capability`. Fix the dangling "Points estimate marker" reference in `daemon-reference.md`. Delete the tier vocabulary (§6.5 step 3) and the shims after their deprecation release. Leave existing markers and labels in place (§6.1, §6.2). | The inventory grep in §3 matches only historical docs. Shell budget shrinks. |
-| **P7** Restart calibration (#9434) | Calibration and LSI KPI queries read journaled `issue.estimate` points with provenance, joined against landed size. Pre-restart label-only points are excluded by default. Update `story-points-calibration-queries.sql` and its questions doc. | Query fixtures. Label-only rows excluded. KPI never sums points. |
+| **P1** Points gate (#11663) | Harden `points_marker.rs` (§5a). Resolve the marker from the body and trusted comments through `comment_trust` (§5b). `curation-complete` validates, projects `points:N`, applies `loom:curated` and journals `points` in `issue.estimate`. Fold `forge_pr_congestion::points_from_labels` into `story_points`. | Rejects `3`, `loom:complexity=3`, `loom:points=x`, `points=21` and conflicting duplicates. Accepts a valid marker in a trusted comment; ignores an untrusted commenter's. Body-vs-comment precedence. Quoted and fenced syntax. Projection replaces a stale `points:*` label. No label or journal entry on failure. |
+| **P2** Curator switch and gate deletion (#11664) | `curator.md`, `curator-estimate.md` and their skill mirrors emit `<!-- loom:points=N -->` and drop the tier section. Un-pause `story-points.md`. Drop `difficulty` from `loom:estimate` (prompt and parser). Update `label-state-machine.md` and the `points:*` label descriptions. **Delete** `require-complexity-marker.sh`, its test, and its allowlist, CI and baseline entries. | A missing `difficulty` is accepted. Prompt-budget and markdown-token-budget gates. Codex mirror sync. Shell budget shrinks. |
+| **P3** Delete the tier consumers (#11665) | Delete `resolve-tier-model.sh`, tier 2.5, `tierModels`/`optimization`, the `--tier` flag, `minComplexity`/`ComplexityTier`, Jev (`jev_tier.rs`, its hook and subcommand), `complexity_signal.rs`'s body fetch and `sweep.outcome.complexity`, and the experiment stratum (§6.4). Observe records carry `story_points` (§6.3). The work-finder carrier and write-back read the label. Update the docs in §3.2–§3.4 and `sweep_md_doc_lint.rs`, re-anchor the dead cross-references (§3.1), and fix the dangling "Points estimate marker" reference in `daemon-reference.md`. Split into a Rust change and a docs change only if the diff is too large to review. | Builder resolution is byte-identical without tier config. A stale `minComplexity` fails validation. Arm parity test on the issue-only hash. Observe record carries `story_points`. No Jev call path remains. The inventory grep in §3 matches only historical docs and existing markers. |
+
+**Child issues.** #11663 (P1), #11664 (P2) and #11665 (P3) are kept and
+rescoped to the rows above. #11666, #11667 and #11668 fold into #11665.
+#11669 (restart calibration) closes in favour of #9434, which already owns
+calibration, with #9466 owning the LSI KPI.
 
 ## 8. Out of scope
 
 - Any code, prompt, label or config change. Those are the child issues.
 - Reopening the ruling, including whether to keep the tier as a second axis.
-- A points-driven model router (§5e, option 2), until P4 produces evidence.
+- Calibration and the throughput KPI (#9434, #9466).
+- A points-driven model router (§5e, option 2).
 - Retiring `loom:estimate` entirely (§5c, option 2).
 
 ## 9. Sources
 
-- Ruling: [#11659 comment](https://github.com/rjwalters/loom/issues/11659#issuecomment-6131613162). Incident: rjwalters/repo#623.
+- Ruling: [#11659 comment](https://github.com/rjwalters/loom/issues/11659#issuecomment-6131613162). Incident: rjwalters/repo#623. Simplicity standard: #11662.
 - Tier: #3702 (two strata), #4238/#4278 (`mechanical`, `tierModels`, `optimization`), #4448 (closed vocabulary), #4827 (work-finder stratum), #4840 (marker anchoring).
-- Experiments: #3718 (cheap-first retune), #3725 (model-cost A/B), #3731 (canary confirmation), #9122 (N arms, budget fraction).
+- Experiments: #3718 (cheap-first retune), #3725 (model-cost A/B), #3731 (canary confirmation), #9122 (N arms, budget fraction), #11450 (`observe` fleet-wide).
 - Jev shadow: #8543. Backstop ceiling: #8555.
 - Story points: #9429 (epic), #9056 (marker and gate), #9431/#9432 (labels), #9434 (calibration), #9446, #9466 (LSI), #9674 (ready-queue points), #9867 (pause bypass; related).
 - Trust: #9548, `defaults/docs/comment-trust.md`. Language policy: `.loom/docs/shell-language-policy.md`, #7810.
