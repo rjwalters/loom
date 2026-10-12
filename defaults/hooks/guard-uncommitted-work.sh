@@ -62,6 +62,14 @@ _canary_effective_true() { local f t=""; for f in "${LOOM_CONFIG_DEFAULTS_FILE-$
 # Opted in but unable to record: a non-blocking coverage notice (never a block).
 _canary_gap() { printf '{"continue":true,"systemMessage":"uncommitted-work canary: wrapper failure (%s) NOT recorded (%s) - coverage gap; the stop was allowed."}\n' "$1" "$2"; }
 
+# Portable `realpath -m` (BSD/macOS realpath has no -m): follow symlinks (even dangling), resolve the
+# deepest existing ancestor physically, and refuse any ".." in the not-yet-existing tail.
+_canon() { local p="$1" t="" n=0 rest=""; while [[ -L "$p" && $((n++)) -lt 20 ]]; do t="$(readlink "$p")"; [[ "$t" == /* ]] && p="$t" || p="${p%/*}/$t"; done
+    while [[ ! -e "$p" && "$p" == /?* ]]; do rest="/${p##*/}$rest"; p="${p%/*}"; done
+    [[ "$rest" != *"/.."* ]] || return 1
+    [[ -d "$p" ]] || { rest="/${p##*/}$rest"; p="${p%/*}"; }
+    p="$(cd -P "${p:-/}" 2>/dev/null && pwd)" || return 1; printf '%s\n' "${p%/}$rest"; }
+
 # $1 = failure class. Records only for a workspace whose EFFECTIVE canary key is
 # true (see _canary_effective_true), never grows the log past its 1 MiB bound (the daemon
 # owns rotation), and drops (fail open, with a coverage notice) a LOG override lying inside any Git checkout.
@@ -69,7 +77,7 @@ _record_wrapper_failure() {
     _canary_effective_true || return 0
     local ov="${LOOM_UNCOMMITTED_WORK_CANARY_LOG:-}" d event="" ws log
     [[ -z "$ov" || "$ov" == /* ]] || { _canary_gap "$1" "relative log override"; return 0; }
-    log="$(realpath -m "${ov:-${HOME:-}/.loom/logs/uncommitted-work-canary.jsonl}" 2>/dev/null)" && [[ "$log" == /* ]] || { _canary_gap "$1" "log path unresolved"; return 0; }  # symlinks/".." resolved first
+    log="$(_canon "${ov:-${HOME:-}/.loom/logs/uncommitted-work-canary.jsonl}")" && [[ "$log" == /* ]] || { _canary_gap "$1" "log path unresolved"; return 0; }  # symlinks/".." resolved first
     d="$log"; while [[ "$d" == /?* ]]; do d="${d%/*}"; [[ -e "${d:-/}/.git" ]] && { _canary_gap "$1" "log inside a Git checkout"; return 0; }; done
     mkdir -p "$(dirname "$log")" 2>/dev/null && [[ ! -d "$log" ]] || { _canary_gap "$1" "log not writable"; return 0; }
     [[ "$(wc -c 2>/dev/null <"$log")" -lt 1048576 ]] || { _canary_gap "$1" "log full"; return 0; }  # missing log -> "" -> 0
