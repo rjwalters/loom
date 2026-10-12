@@ -136,7 +136,7 @@ pub(crate) fn clear() {
 /// Test seam for the sibling `applied` module's tests and the OTLP resource
 /// tests: force or empty the process-wide cell (#11197). Never call outside
 /// `#[cfg(test)]` code — the honest writers are [`record_pass`] and [`clear`].
-#[cfg(test)]
+#[cfg(all(test, feature = "otlp"))]
 pub(crate) fn force_for_tests(sha: AppliedSha) {
     *cell()
         .lock()
