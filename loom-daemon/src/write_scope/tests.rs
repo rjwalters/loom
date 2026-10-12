@@ -536,6 +536,7 @@ fn daemon_write_paths_are_scoped() {
         ),
         ("operator_decision/cli.rs", Gated),
         ("cli/labels_migrate.rs", Gated),
+        ("cli/curation_complete.rs", Gated),
         ("cli/labels_undeclared.rs", Gated),
         ("cli/pr_lease.rs", Gated),
         (

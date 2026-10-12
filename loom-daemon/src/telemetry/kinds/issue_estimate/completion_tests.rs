@@ -26,7 +26,7 @@ impl QueueSink for Queue {
 #[test]
 fn attended_and_daemon_completion_export_once_and_retry_preserves_fact() {
     let dir = tempfile::tempdir().unwrap();
-    let body = "<!-- loom:estimate difficulty=1 lines=7 files=1 doctor_risk=0.3 -->";
+    let body = "<!-- loom:estimate lines=7 files=1 doctor_risk=0.3 -->";
     let queue = Queue::default();
     queue.fail.store(true, Ordering::Relaxed);
     for (index, runtime) in ["codex", "claude"].into_iter().enumerate() {
@@ -39,6 +39,7 @@ fn attended_and_daemon_completion_export_once_and_retry_preserves_fact() {
             id: &id,
             host_id: "authoritative-host",
             at: Utc::now() + chrono::Duration::seconds(index as i64),
+            points: Some(5),
         };
         let envelope = record(dir.path(), body, &request).unwrap().unwrap();
         assert_eq!(existing(dir.path(), &request).unwrap().unwrap(), envelope);
@@ -49,7 +50,7 @@ fn attended_and_daemon_completion_export_once_and_retry_preserves_fact() {
         assert_eq!(r.repo, "o/r");
         assert_eq!(r.model.as_deref(), Some("curator-model"));
         assert_eq!(r.runtime.as_deref(), Some(runtime));
-        assert_eq!(r.estimate.difficulty, 1);
+        assert_eq!(r.points, Some(5));
         assert_eq!(r.estimate.lines, 7);
         assert_eq!(r.estimate.files, 1);
         assert_eq!(r.estimate.doctor_risk, 0.3);
@@ -76,14 +77,12 @@ fn unknown_provenance_is_absent_and_never_inferred() {
         id: &id,
         host_id: "h",
         at: Utc::now(),
+        points: None,
     };
-    let saved = record(
-        dir.path(),
-        "<!-- loom:estimate difficulty=1 lines=7 files=1 doctor_risk=0 -->",
-        &request,
-    )
-    .unwrap()
-    .unwrap();
+    let saved =
+        record(dir.path(), "<!-- loom:estimate lines=7 files=1 doctor_risk=0 -->", &request)
+            .unwrap()
+            .unwrap();
     let TelemetryRecord::IssueEstimate(r) = saved.record else {
         panic!("wrong kind")
     };

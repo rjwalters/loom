@@ -68,7 +68,13 @@ fn validation_rejects_bad_retired_entries() {
     assert!(mutate(&|v| v["retired"][1]["name"] = v["retired"][0]["name"].clone()).is_err());
     // replaced_by naming an unknown label, and a paused (non-active) one.
     assert!(mutate(&|v| v["retired"][0]["replaced_by"] = "loom:nope".into()).is_err());
-    assert!(mutate(&|v| v["retired"][0]["replaced_by"] = "points:1".into()).is_err());
+    assert!(mutate(&|v| {
+        let labels = v["labels"].as_array_mut().unwrap();
+        let paused = labels.iter_mut().find(|l| l["name"] == "points:1").unwrap();
+        paused["lifecycle"] = "paused".into();
+        v["retired"][0]["replaced_by"] = "points:1".into();
+    })
+    .is_err());
     // A retired entry must name its retiring issue, and has a fixed shape.
     assert!(mutate(&|v| v["retired"][0]["retired_in"] = "".into()).is_err());
     assert!(mutate(&|v| v["retired"][0]["extra"] = true.into()).is_err());
