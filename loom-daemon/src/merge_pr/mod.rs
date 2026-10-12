@@ -75,6 +75,10 @@
 //! nothing pending". It answers only inside the forge contract and refuses
 //! the rest, which the shell treats as still pending.
 //!
+//! [`superseded_runs`] narrows that READ (#11097): when one push fired two
+//! runs of the same workflow on one head, the superseded twin's check-runs
+//! are dropped before classification, so its residue cannot fail a green tree.
+//!
 //! [`check_runs_streak`] is the OTHER classification the same poll loop makes
 //! on a FAILED fetch attempt (#6389, an #8191 slice): whether a confirmed
 //! HTTP 404 — both the attempt and its retry-once agreeing — has now repeated
@@ -287,6 +291,7 @@ pub mod revalidate_head;
 pub mod sequence;
 pub mod stacked_children;
 pub mod stale_checks;
+pub mod superseded_runs;
 pub mod tree_checks;
 pub mod usage;
 pub mod version_policy;

@@ -121,10 +121,10 @@ pub const EPIC_LABEL: &str = "loom:epic";
 ///
 /// It always accompanies `loom:operator-only`, so on a `loom:issue` row it was
 /// already skipped through that base label. #9244 made it a skip label in its
-/// own right: a starred (`loom:operator-priority`) issue now reaches the
-/// candidate list from outside `loom:issue`, and starring an item that is
-/// waiting on an owner's decision must never dispatch a sweep onto it, even
-/// if the base label was dropped. Not a park ([`PARK_LABELS`]): the base
+/// own right: an operator-starred issue then reached the candidate list from
+/// outside `loom:issue` (no longer, #11508), and an item waiting on an
+/// owner's decision must never get a sweep dispatched onto it, even if the
+/// base label was dropped. Not a park ([`PARK_LABELS`]): the base
 /// label already is one wherever it matters.
 ///
 /// Membership in [`SKIP_LABELS`] now comes from the registry's `skip`

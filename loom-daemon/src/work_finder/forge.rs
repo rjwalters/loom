@@ -14,8 +14,8 @@
 //! inside it, is unchanged.
 
 use super::{
-    operator_priority, read_work_finder_config, resolve_extra_skip_labels_with_config,
-    WorkDispatcher, WorkItem, WorkSource,
+    read_work_finder_config, resolve_extra_skip_labels_with_config, WorkDispatcher, WorkItem,
+    WorkSource,
 };
 use crate::sweep_registry::SweepRegistry;
 use crate::types::{SweepKind, SweepState};
@@ -98,57 +98,13 @@ impl WorkSource for GhWorkSource {
         // fails the listing; any later shortfall keeps the rows read and
         // marks this repo's queue incomplete.
         self.complete = true;
-        let ready = self.list_label("loom:issue", true)?;
-        // Second ETag-cached listing (#9244 §4): starred issues outside
-        // `loom:issue` (triage, curated, or no workflow label at all). Its
-        // failure never costs the `loom:issue` rows: log, feed the rate-limit
-        // breaker, and carry on with what the first listing returned.
-        // #10307: one listing per level label (operator and inherited, every
-        // level): a level-2 issue need not carry the star itself.
-        let mut starred: Vec<WorkItem> = Vec::new();
-        // #11103: `loom:very-important` is listed the same way (the new top
-        // level wins the workspace draw even outside `loom:issue`); the legacy
-        // star listings go in slice 2.
-        let side_labels = crate::operator_levels::starred_labels(crate::operator_levels::table())
-            .into_iter()
-            .chain(std::iter::once(crate::priority_pick::VERY_IMPORTANT_LABEL));
-        for label in side_labels {
-            let rows = self.list_side_label(label, true);
-            let seen: HashSet<u32> = starred.iter().map(|i| i.number).collect();
-            starred.extend(rows.into_iter().filter(|i| !seen.contains(&i.number)));
-        }
-        let mut items = operator_priority::merge_starred(ready, starred);
-        let key = operator_priority::repo_key(self.cwd.as_deref(), self.repo.as_deref());
-        let mut timeline = operator_priority::GhTimelineStarredAt {
-            gh_bin: self.gh_bin.clone(),
-            cwd: self.cwd.clone(),
-            repo: self.repo.clone(),
-        };
-        // #9244 C: a loom-ui intent's `requested_at` answers first (the seam
-        // slice A left), then blockers of starred issues inherit the star.
-        let mut source = crate::star_liveness::intents::IntentStarredAt {
-            root: self.cwd.as_deref(),
-            inner: &mut timeline,
-        };
-        operator_priority::resolve_starred_at(&key, &mut items, &mut source);
-        // #10307: a blocker inheriting a level orders at its source's
-        // starred-at, which its body provenance marker carries (the listing
-        // already returned the body).
-        let table = crate::operator_levels::table();
-        for item in &mut items {
-            let item_key = (self.repo.clone().unwrap_or_default(), item.number);
-            if let Some(at) = crate::star_liveness::levels::inherited_requested_at(
-                table,
-                &item_key,
-                &item.labels,
-                item.body.as_deref(),
-            ) {
-                item.operator_priority_at = Some(at);
-            }
-        }
-        crate::star_liveness::inherit::apply(self.cwd.as_deref(), &mut items);
-        // #10118: marker-bearing fixes still in triage / curated. Merged after
-        // star inheritance so such a row never looks starred; the lane drops
+        let mut items = self.list_label("loom:issue", true)?;
+        // No priority side listing (#11508, operator ruling): priority changes
+        // order, never eligibility, so a `loom:important` /
+        // `loom:very-important` issue is dispatched only once it is
+        // `loom:issue`, like everything else. No starred-at or star
+        // inheritance is resolved here either.
+        // #10118: marker-bearing fixes still in triage / curated. The lane drops
         // them again unless this repo's `main` is red (`main_red_fix::evaluate`).
         // Only a trusted filer's marker counts (#9548); the policy is resolved
         // at most once per tick, and only if a marker-bearing row needs it.
@@ -172,10 +128,55 @@ impl WorkSource for GhWorkSource {
     fn listing_complete(&self) -> bool {
         self.complete
     }
+
+    /// The open `loom:very-important` issues, any state (#11509): one more
+    /// ETag-cached listing, read only on a tick whose ready listing holds a
+    /// very-important issue (a 304 costs no rate limit). A failure is logged
+    /// and returns `None` (an incomplete walk returns the rows read, which
+    /// the cap unions with the ready listing); it never marks the ready queue incomplete, because
+    /// the ready rows themselves were read whole.
+    fn list_open_very_important(&mut self) -> Option<Vec<WorkItem>> {
+        let (gh, cwd, repo) = (&self.gh_bin, self.cwd.as_deref(), self.repo.as_deref());
+        let label = crate::priority_pick::VERY_IMPORTANT_LABEL;
+        match crate::forge_listing::list_issues_cached_paged_as(
+            "work_finder",
+            gh,
+            cwd,
+            repo,
+            label,
+            "open",
+        ) {
+            Ok(listing) => {
+                if let Some(e) = &listing.incomplete {
+                    log::warn!(
+                        "work_finder: the {label} listing is incomplete ({e:#}); the flood cap \
+                         counts the {} rows read plus the ready listing",
+                        listing.rows.len()
+                    );
+                }
+                Some(
+                    listing
+                        .rows
+                        .into_iter()
+                        .filter(|r| !r.is_pull_request)
+                        .map(|r| WorkItem::with_created_at(r.number, r.labels, r.created_at))
+                        .collect(),
+                )
+            }
+            Err(e) => {
+                log::warn!(
+                    "work_finder: listing {label} issues failed ({e}); the flood cap counts the \
+                     ready listing only this tick"
+                );
+                crate::rate_limit_breaker::global_observe_failure(&e.to_string(), "work_finder");
+                None
+            }
+        }
+    }
 }
 
 impl GhWorkSource {
-    /// A listing other than `loom:issue` (#9244 §4, #10118). Its failure
+    /// A listing other than `loom:issue` (the unpromoted red-main fixes, #10118). Its failure
     /// never costs the `loom:issue` rows: log, feed the rate-limit breaker,
     /// and carry on without it, but the repo's queue is then incomplete
     /// (#11139). `all_pages` as [`Self::list_label`].
@@ -242,6 +243,7 @@ impl GhWorkSource {
                 WorkItem::with_created_at(r.number, r.labels, r.created_at)
                     .with_body(r.body)
                     .with_updated_at(r.updated_at)
+                    .with_open_sub_issues(r.open_sub_issues)
                     .with_author(r.author.as_deref().map(|login| {
                         crate::comment_trust::Author::new(
                             Some(login),
@@ -330,17 +332,24 @@ impl WorkDispatcher for RegistryDispatcher {
         }
     }
 
-    /// [`WorkDispatcher::dispatch_backoff_expiry`] (Issue #9311): this host's
-    /// own local window only, mirroring [`Self::pr_open_backed_off`]'s scope
-    /// rather than [`Self::backed_off`]'s fleet union — a peer-armed window's
-    /// expiry is not available here.
+    /// [`WorkDispatcher::dispatch_backoff_expiry`] (Issue #9311): every
+    /// window [`Self::backed_off`] skips on: the later of this host's own end
+    /// and a peer-armed window's broadcast end (#11564).
     fn dispatch_backoff_expiry(&self) -> HashMap<u32, chrono::DateTime<chrono::Utc>> {
         match self.registry.lock() {
             Ok(reg) => {
                 let now = chrono::Utc::now();
                 reg.dispatch_backoff_issues(now)
                     .into_iter()
-                    .filter_map(|issue| reg.dispatch_backoff_until(issue, now).map(|u| (issue, u)))
+                    .filter_map(|issue| {
+                        // The skip lasts until the later of the two windows.
+                        let local = reg.dispatch_backoff_until(issue, now);
+                        let until = local
+                            .into_iter()
+                            .chain(reg.peer_dispatch_backoff_until(issue, now))
+                            .max();
+                        until.map(|u| (issue, u))
+                    })
                     .collect()
             }
             Err(poisoned) => {
@@ -377,16 +386,24 @@ impl WorkDispatcher for RegistryDispatcher {
         }
     }
 
-    /// [`WorkDispatcher::noop_cooldown_expiry`] (Issue #9311): this host's own
-    /// local window only — a peer-armed window's expiry is not available
-    /// here, mirroring [`Self::dispatch_backoff_expiry`]'s scope.
+    /// [`WorkDispatcher::noop_cooldown_expiry`] (Issue #9311): like
+    /// [`Self::dispatch_backoff_expiry`], the later of the local and the
+    /// peer-armed window's end (#11564).
     fn noop_cooldown_expiry(&self) -> HashMap<u32, chrono::DateTime<chrono::Utc>> {
         match self.registry.lock() {
             Ok(reg) => {
                 let now = chrono::Utc::now();
                 reg.noop_cooldown_issues(now)
                     .into_iter()
-                    .filter_map(|issue| reg.noop_cooldown_until(issue, now).map(|u| (issue, u)))
+                    .filter_map(|issue| {
+                        // The skip lasts until the later of the two windows.
+                        let local = reg.noop_cooldown_until(issue, now);
+                        let until = local
+                            .into_iter()
+                            .chain(reg.peer_noop_cooldown_until(issue, now))
+                            .max();
+                        until.map(|u| (issue, u))
+                    })
                     .collect()
             }
             Err(poisoned) => {

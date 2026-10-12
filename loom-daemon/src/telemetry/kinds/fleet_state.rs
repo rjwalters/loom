@@ -57,6 +57,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::telemetry::{RepoVisibility, SweepStartFacts};
+use crate::types::QueueDisposition;
+use crate::work_finder::halt_cause::HaltCause;
 
 /// Schema tag carried in every record.
 pub const FLEET_STATE_SCHEMA: &str = "fleet-state/v1";
@@ -148,7 +150,7 @@ impl FleetStage {
 pub enum FleetSlot {
     /// One of the host's `maxConcurrent` slots.
     Regular,
-    /// The host's single `loom:operator-priority` overflow slot (#9244).
+    /// The host's single overflow slot (#9244; inert since #11508).
     Overflow,
 }
 
@@ -220,6 +222,198 @@ pub enum MainCi {
     Unknown,
 }
 
+/// Why this host's work finder holds a whole repo (Issue #11564): the
+/// `work_finder::halt_cause::HaltCause` tokens, plus `unknown` for a hold no
+/// cause names. A closed enum, so no other value can be exported; built only
+/// through [`Self::from_cause`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetHaltReason {
+    MainRed,
+    GatePending,
+    TokenPool,
+    PreflightAdvisory,
+    Drain,
+    Breaker,
+    WriteScope,
+    CiBilling,
+    InstallIncompatible,
+    DaemonTooOld,
+    MaintainOnly,
+    DiskReservation,
+    /// A hold with no named cause. A reader also decodes any value it does
+    /// not know (from a newer emitter) as this.
+    #[serde(other)]
+    Unknown,
+}
+
+impl FleetHaltReason {
+    /// Every reason, in wire order.
+    pub const ALL: [FleetHaltReason; 13] = [
+        FleetHaltReason::MainRed,
+        FleetHaltReason::GatePending,
+        FleetHaltReason::TokenPool,
+        FleetHaltReason::PreflightAdvisory,
+        FleetHaltReason::Drain,
+        FleetHaltReason::Breaker,
+        FleetHaltReason::WriteScope,
+        FleetHaltReason::CiBilling,
+        FleetHaltReason::InstallIncompatible,
+        FleetHaltReason::DaemonTooOld,
+        FleetHaltReason::MaintainOnly,
+        FleetHaltReason::DiskReservation,
+        FleetHaltReason::Unknown,
+    ];
+
+    /// The reason for a hold with `cause`; `None` is [`Self::Unknown`].
+    /// Exhaustive, so a new `HaltCause` cannot reach the wire unmapped.
+    #[must_use]
+    pub fn from_cause(cause: Option<HaltCause>) -> Self {
+        match cause {
+            Some(HaltCause::MainRed) => Self::MainRed,
+            Some(HaltCause::GatePending) => Self::GatePending,
+            Some(HaltCause::TokenPool) => Self::TokenPool,
+            Some(HaltCause::PreflightAdvisory) => Self::PreflightAdvisory,
+            Some(HaltCause::Drain) => Self::Drain,
+            Some(HaltCause::Breaker) => Self::Breaker,
+            Some(HaltCause::WriteScope) => Self::WriteScope,
+            Some(HaltCause::CiBilling) => Self::CiBilling,
+            Some(HaltCause::InstallIncompatible) => Self::InstallIncompatible,
+            Some(HaltCause::DaemonTooOld) => Self::DaemonTooOld,
+            Some(HaltCause::MaintainOnly) => Self::MaintainOnly,
+            Some(HaltCause::DiskReservation) => Self::DiskReservation,
+            None => Self::Unknown,
+        }
+    }
+
+    /// The wire name: the `HaltCause::as_str` token, or `unknown`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MainRed => "main_red",
+            Self::GatePending => "gate_pending",
+            Self::TokenPool => "token_pool",
+            Self::PreflightAdvisory => "preflight_advisory",
+            Self::Drain => "drain",
+            Self::Breaker => "breaker",
+            Self::WriteScope => "write_scope",
+            Self::CiBilling => "ci_billing",
+            Self::InstallIncompatible => "install_incompatible",
+            Self::DaemonTooOld => "daemon_too_old",
+            Self::MaintainOnly => "maintain_only",
+            Self::DiskReservation => "disk_reservation",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// A repo this host's work finder holds (Issue #11564).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetRepoHalt {
+    /// Why.
+    pub reason: FleetHaltReason,
+    /// The first work-finder tick at which this process saw the repo held
+    /// with this `reason`. A reason change restarts it.
+    pub since: DateTime<Utc>,
+    /// The hold was already in force on this process's first tick, so
+    /// `since` is a lower bound. Absent when exact.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub since_lower_bound: bool,
+}
+
+/// Which clock holds a ready item back (Issue #11564): the time-boxed
+/// dispositions of the work finder's tick, plus the build back-off. A closed
+/// enum, built only through [`Self::from_disposition`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetEligibleReason {
+    /// The issue's own `loom:recheck-interval` marker.
+    RecheckInterval,
+    /// A dispatch-backoff window after a failed dispatch.
+    DispatchBackoff,
+    /// A backoff window armed by the open-PR guard.
+    OpenPrBackoff,
+    /// A no-op release cooldown.
+    NoopCooldown,
+    /// A hard-exclusion decline cooldown.
+    Declined,
+    /// The PR-less retry window.
+    PrlessRetry,
+    /// The repo's build back-off (review + merge debt). It has no clock: it
+    /// releases when the debt drains, so its rows carry no `eligible_at`.
+    BuildBackoff,
+}
+
+impl FleetEligibleReason {
+    /// Every reason, in wire order.
+    pub const ALL: [FleetEligibleReason; 7] = [
+        FleetEligibleReason::RecheckInterval,
+        FleetEligibleReason::DispatchBackoff,
+        FleetEligibleReason::OpenPrBackoff,
+        FleetEligibleReason::NoopCooldown,
+        FleetEligibleReason::Declined,
+        FleetEligibleReason::PrlessRetry,
+        FleetEligibleReason::BuildBackoff,
+    ];
+
+    /// The clock behind `disposition`, or `None` for one no clock holds.
+    /// Exhaustive, so a new disposition must be placed deliberately.
+    #[must_use]
+    pub fn from_disposition(disposition: QueueDisposition) -> Option<Self> {
+        use QueueDisposition as Qd;
+        match disposition {
+            Qd::RecheckInterval => Some(Self::RecheckInterval),
+            Qd::DispatchBackoff => Some(Self::DispatchBackoff),
+            Qd::OpenPrBackoff => Some(Self::OpenPrBackoff),
+            Qd::NoopCooldown => Some(Self::NoopCooldown),
+            Qd::Declined => Some(Self::Declined),
+            Qd::PrlessRetry => Some(Self::PrlessRetry),
+            Qd::DeferredBuildBackoff => Some(Self::BuildBackoff),
+            Qd::Dispatched
+            | Qd::InFlight
+            | Qd::DeferredCapacity
+            | Qd::DeferredRampCap
+            | Qd::DeferredSaturation
+            | Qd::DeferredOutOfSlice
+            | Qd::DeferredRepoCap
+            | Qd::DeferredFileOverlap
+            | Qd::WorkspaceHalted
+            | Qd::WorkspaceCommandsMissing
+            | Qd::HostConstraint
+            | Qd::Parked
+            | Qd::HardExclusion
+            | Qd::Quarantined
+            | Qd::PeerClaim
+            | Qd::OpenPr
+            | Qd::DispatchError
+            | Qd::AlreadyLanded
+            | Qd::AlreadyClosed
+            | Qd::LabelledBlocked
+            | Qd::Unknown => None,
+        }
+    }
+
+    /// The wire name.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RecheckInterval => "recheck_interval",
+            Self::DispatchBackoff => "dispatch_backoff",
+            Self::OpenPrBackoff => "open_pr_backoff",
+            Self::NoopCooldown => "noop_cooldown",
+            Self::Declined => "declined",
+            Self::PrlessRetry => "prless_retry",
+            Self::BuildBackoff => "build_backoff",
+        }
+    }
+
+    /// Whether this hold has an absolute expiry the work finder computes.
+    #[must_use]
+    pub fn has_clock(self) -> bool {
+        self != Self::BuildBackoff
+    }
+}
+
 fn is_zero(n: &u8) -> bool {
     *n == 0
 }
@@ -265,16 +459,11 @@ pub struct FleetStateRow {
     /// the work finder's dispatch order on its last tick.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rank: Option<u32>,
-    /// Starred (`loom:operator-priority`, any level). On every row since
-    /// #11391: a PR row reads it from the PR's labels, any row keeps what an
-    /// earlier row of the item carried.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub star: bool,
-    /// `ready_wait` only: when it was starred, when known.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub star_at: Option<DateTime<Utc>>,
-    /// The effective operator priority level (0 absent). On every row, like
-    /// `star` (#11391).
+    /// The priority level (0 absent, 1 `loom:important`, 2
+    /// `loom:very-important`; #11103). On every row (#11391): a `ready_wait`
+    /// row reads the planner's `level` key, a PR row the PR's own labels,
+    /// and any row keeps the level an earlier row of the item carried. The
+    /// retired `star` / `star_at` fields are no longer sent (#11510).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub level: u8,
     /// `ready_wait` only: the repo's fleet priority (the workspace priority
@@ -321,6 +510,16 @@ pub struct FleetStateRow {
     /// `blocked`, `sequenced`, `other`. Absent = none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub holds: Vec<String>,
+    /// `ready_wait` only (#11564): the instant the time-boxed hold named by
+    /// `eligible_reason` ends, as the work finder computed it on its last
+    /// tick. Absent when no clock holds the item, when the hold has no clock
+    /// (`build_backoff`), or when this host does not know the expiry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eligible_at: Option<DateTime<Utc>>,
+    /// `ready_wait` only (#11564): which clock holds the item back. Present
+    /// on every row the work finder held under one, `eligible_at` or not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eligible_reason: Option<FleetEligibleReason>,
 }
 
 fn is_zero_u32(n: &u32) -> bool {
@@ -342,8 +541,6 @@ impl FleetStateRow {
             start: SweepStartFacts::default(),
             sweep_id: None,
             rank: None,
-            star: false,
-            star_at: None,
             level: 0,
             fleet_priority: None,
             created_at: None,
@@ -356,6 +553,8 @@ impl FleetStateRow {
             conflict: false,
             ci_fail: false,
             holds: Vec::new(),
+            eligible_at: None,
+            eligible_reason: None,
         }
     }
 }
@@ -386,6 +585,14 @@ pub struct FleetStateRepo {
     /// the host did not read it (an older emitter). Additive on `fleet-state/v1`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub main_ci: Option<MainCi>,
+    /// This host's work finder holds the whole repo (#11564): present exactly
+    /// when it does, as of its last tick. Every record that names the repo
+    /// carries it, and a halt starting, changing reason or clearing names the
+    /// repo in a delta, so absence on a named repo means "not held". Absent
+    /// on every repo before the work finder's first tick. Additive on
+    /// `fleet-state/v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub halt: Option<FleetRepoHalt>,
     /// The census. Absent means unknown at `as_of`, because the repo's
     /// listings were incomplete or not read. It never means zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -540,8 +747,8 @@ fn json_len<T: Serialize>(value: &T) -> usize {
 /// Every chunk shares the header (`as_of`, `anchor`, stamps, `slots`, ...);
 /// the repos' rows and `removed` entries are packed in order, so the union of
 /// the chunks is exactly `record`: nothing is dropped. A repo whose entries
-/// span chunks repeats its `repo`, `visibility`, `census`, `ready_complete`
-/// and `ready_replace` in each. Pure.
+/// span chunks repeats its `repo`, `visibility`, `main_ci`, `halt`, `census`,
+/// `ready_complete` and `ready_replace` in each. Pure.
 #[must_use]
 pub fn split_into_chunks(mut record: FleetStateRecord, max_bytes: usize) -> Vec<FleetStateRecord> {
     record.chunk_index = 0;
@@ -621,3 +828,8 @@ pub fn split_into_chunks(mut record: FleetStateRecord, max_bytes: usize) -> Vec<
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[path = "fleet_state_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[path = "fleet_state_facts_tests.rs"]
+mod facts_tests;

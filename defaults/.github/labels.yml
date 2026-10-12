@@ -167,6 +167,14 @@
   description: "Implementation blocked, needs help or clarification"
   color: "EF4444"  # red-500
 
+# loom:blocked-unnamed (#10558): a queue marker, NOT a park label. It coexists
+# with loom:blocked. Applied by the daemon tick to an open loom:blocked issue
+# that names no blocker and states no reason; removed by Curator after it names
+# the blocker, records a reason, or releases the block.
+- name: loom:blocked-unnamed
+  description: "loom:blocked names no blocker: queued for Curator to name it or release it"
+  color: "F87171"  # red-400
+
 - name: loom:abort
   description: "Signal to abort the sweep for this issue (returns to loom:issue)"
   color: "F97316"  # orange-500 - warning/signal color
@@ -285,12 +293,13 @@
   color: "CA8A04"  # yellow-600 - the middle priority level
 
 # loom:very-important (#11103) is the top priority level. A workspace holding
-# dispatchable very-important work wins the workspace draw; a flood cap is
-# follow-up #11278, not enforced yet (see priority-model.md). NOT a hold,
+# dispatchable very-important work wins the workspace draw. Capped at one per
+# workspace (#11509): only the oldest open one counts, the rest rank as
+# loom:important, enforced at dispatch (see priority-model.md). NOT a hold,
 # never inherited by the daemon. Applied by / removed by: the operator, Guide
 # and Champion alike.
 - name: loom:very-important
-  description: "Priority level 3 of 3: wins the workspace draw (not a hold; cap lands in #11278). Anyone may set."
+  description: "Priority level 3 of 3: wins the workspace draw. Capped at 1 per workspace; extras rank important."
   color: "B45309"  # amber-700 - one shade above important
 
 # loom:operator-high-priority (#10307) is operator priority LEVEL 2, the

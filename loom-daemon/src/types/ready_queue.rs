@@ -4,11 +4,10 @@
 //! backoff-skip, 2 deferred-capacity"); these rows say *which* issue got
 //! *which* outcome, in the order the work finder actually ranks them. The
 //! order is the daemon's own dispatch comparator,
-//! `crate::work_finder::candidate_cmp` (#9244): `loom:operator-priority`
-//! (starred) first, starred issues by starred-at, then red-main fixes (only
-//! while that repo's `main` is verified red), then workspace priority, then
-//! oldest `createdAt`, then issue number. `tier:*` labels do not affect
-//! dispatch order.
+//! `crate::work_finder::candidate_cmp` (#11103, #11547): verified red-main
+//! fixes first (only while that repo's `main` is verified red), then
+//! priority level (`loom:very-important`, `loom:important`, none), then
+//! oldest `createdAt`, then issue number.
 
 use serde::{Deserialize, Serialize};
 
@@ -33,8 +32,8 @@ pub enum QueueDisposition {
     /// Waiting: the saturation admission brake held new admissions.
     DeferredSaturation,
     /// Waiting: the build back-off (#9410) held new issue builds because the
-    /// host's review + merge debt is high. Starred and red-main-fix issues
-    /// bypass it, so this row is always an unstarred issue.
+    /// host's review + merge debt is high. A verified red-main fix bypasses
+    /// it, so this row is never one.
     DeferredBuildBackoff,
     /// Waiting: outside this host's preferred repo slice while the slice still
     /// had work (repo sharding, #6243).
@@ -238,24 +237,21 @@ pub struct ReadyQueueRow {
     /// Deprecated (#9244): always `false`. Its label was deleted in #11105;
     /// the field stays on the wire only for compatibility.
     pub urgent: bool,
-    /// Whether the issue is starred (`loom:operator-priority`, #9244).
+    /// The issue's priority level (#11103, #11510): `default`, `important`
+    /// or `very-important`, from its own `loom:important` /
+    /// `loom:very-important` label after the very-important cap (#11509).
+    /// Absent (an older daemon) reads as `default`.
     #[serde(default)]
-    pub operator_priority: bool,
-    /// When it was starred, when known (#9244). Absent for an unstarred
-    /// issue, or a starred one ordered by its `createdAt` fallback.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub operator_priority_at: Option<String>,
-    /// Whether it is a red-main fix boosted this tick: it carries
-    /// `<!-- loom:main-red-fix -->` and its repo's `main` is verified red.
+    pub level: crate::priority_pick::Level,
+    /// Whether it is a verified red-main fix this tick: it carries
+    /// `<!-- loom:main-red-fix -->` and its repo's `main` is verified red
+    /// (#9244). Since #11508 it is not an ordering key; it only bypasses the
+    /// build back-off, the file-overlap gate and the repo-sharding slice.
     #[serde(default)]
     pub main_red_fix: bool,
     /// The issue's `createdAt`, when the listing supplied it.
     #[serde(default)]
     pub created_at: Option<String>,
-    /// The issue's `tier:*` label, if any. Informational only: the work
-    /// finder does not order by it.
-    #[serde(default)]
-    pub tier: Option<String>,
     /// The issue's resolved story-point size (#9432, from its single
     /// `points:*` label), when the listing supplied a legal one (Issue
     /// #9674). `None` for an unsized issue, a stacked/out-of-vocabulary

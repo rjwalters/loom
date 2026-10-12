@@ -27,8 +27,9 @@
 //! [`NoopCooldownConfig::hold_threshold`] the issue is parked with a forge
 //! label — `loom:blocked` for dependencies, `loom:operator-only` +
 //! `loom:operator-decision` for a human gate or when the kind is unclear — and
-//! one marked comment says why and what unparks it. `loom:operator-priority`
-//! never exempts an issue and is never touched; the park labels are already in
+//! one marked comment says why and what unparks it. A priority label
+//! (`loom:important` / `loom:very-important`) never exempts an issue and is
+//! never touched; the park labels are already in
 //! [`crate::work_finder::SKIP_LABELS`], which every candidate path applies.
 //!
 //! The label write is the deliverable, the comment is commentary (the #9239
@@ -464,8 +465,8 @@ impl SweepRegistry {
             .map_err(|(_, detail)| detail)
     }
 
-    /// Park `issue` and say why. Never touches `loom:building` or
-    /// `loom:operator-priority`.
+    /// Park `issue` and say why. Never touches `loom:building` or a priority
+    /// label.
     fn apply_noop_hold(
         &self,
         issue: u32,
@@ -526,8 +527,8 @@ impl SweepRegistry {
              **Held after {count} consecutive no-op sweeps.** Each of the last {count} sweeps \
              concluded there was nothing to do, and nothing this issue depends on changed in \
              between — {needs}. It now carries {} instead of being offered again \
-             (Issue #10156). A `loom:operator-priority` star does not exempt an issue from this \
-             hold and has been left in place.\n\n{why}Fingerprint compared: `{announced}`\n\n\
+             (Issue #10156). A priority label (`loom:important` / `loom:very-important`) does \
+             not exempt an issue from this hold and has been left in place.\n\n{why}Fingerprint compared: `{announced}`\n\n\
              **What unparks it**: {unparks}. Any new comment, label change, linked-PR change or \
              dependency state change also restarts the count from zero.",
             labels.join(" + "),

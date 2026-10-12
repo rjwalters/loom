@@ -6,8 +6,8 @@
 //! [`super::render`] made the park record *easy* to write, but nothing made it
 //! *necessary*: every role still applied the label with a bare
 //! `gh issue edit N --add-label "loom:blocked"` and named the blocker in a
-//! comment. `star_liveness`, `check-stale-blocked` and Guide's unblock sweep all
-//! read the **body**, so those parks read as `blocked-unnamed`, were escalated to
+//! comment. The (since removed, #11104) star-liveness pass,
+//! `check-stale-blocked` and Guide's unblock sweep all read the **body**, so those parks read as `blocked-unnamed`, were escalated to
 //! the operator, and were never released automatically (#10129, #10125, #10120,
 //! 2AMLogic/2am#2062 … on 2026-10-03/04).
 //!

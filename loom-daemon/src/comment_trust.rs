@@ -42,8 +42,7 @@
 //! (`gh api repos/{owner}/{repo}/issues/<n>/comments --paginate`), whose
 //! `user.login` carries the `[bot]` suffix.
 //!
-//! `star_liveness::trust` delegates its decision to [`trusted_by`], and the
-//! shell reaches the same predicate through `loom-daemon forge
+//! The shell reaches the same predicate through `loom-daemon forge
 //! trusted-comments`.
 
 use std::path::Path;

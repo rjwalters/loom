@@ -1,5 +1,4 @@
 //! Owned Rust launch/tool contracts. Real provider canaries are separate evidence.
-#![cfg(feature = "otlp")]
 use loom_daemon::{
     observability::{lifecycle, queue::DurableQueue},
     telemetry::{

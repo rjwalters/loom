@@ -136,7 +136,8 @@ sessions only.
 
 ## Canary and rollback
 
-First check that your `loom-daemon` was built with the `otlp` feature. Set these
+First check that your `loom-daemon` can export OTLP (`loom-daemon
+telemetry-capabilities --require-otlp`; every build since #10700 can). Set these
 values in `.loom-local/local.json` or the equivalent `LOOM_OBSERVABILITY_*`
 environment variables for the intended canary daemon:
 

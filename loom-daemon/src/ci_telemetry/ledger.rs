@@ -30,13 +30,22 @@
 //! back to the last complete line, and the partial entry is never counted —
 //! the unit it would have committed was therefore never emitted either (emit
 //! strictly follows commit), and the next poll simply commits it again.
+//!
+//! **Bounded working set (#11159).** The ledger is opened on every poll
+//! cycle, so its in-memory size must follow the working set, not all history.
+//! Opening *streams* the file line by line ([`scan_lines`]) — the whole file
+//! is never materialised — and a key line whose `committed_at` lies more than
+//! [`SEEN_RETENTION_DAYS`] before its repo's watermark is **expired**: it is
+//! read past and never enters the seen set (see [`Ledger::open`] for why no
+//! consumer can ask for such a key again). Keys are held compactly, with the
+//! repo name interned once per repo rather than once per key.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::logs::LogTarget;
@@ -106,6 +115,49 @@ fn is_false(value: &bool) -> bool {
 /// pending) — confirmed units drop their envelope payloads.
 pub const COMPACT_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
 
+/// How far behind its repo's watermark a key's `committed_at` may fall before
+/// [`Ledger::open`] expires it (#11159).
+///
+/// The bound has to outlast every path that can still ask about a key:
+///
+/// - the repo sweep lists runs `created >= runs_floor`, the older of the
+///   watermark and `now - rescan window` ([`super::poll::runs_floor`]); a
+///   watermark is a GitHub `created_at`, never ahead of now, so a key
+///   committed (hence created) before `watermark - RETENTION` is below both;
+/// - the feed-driven single-run path ([`super::poll::targeted`]) records any
+///   run GitHub reports as completed, and a run can be re-run — re-listing
+///   its earlier attempts' jobs under `filter=all` — for up to 30 days after
+///   it was created; a workflow run can last at most 35 days;
+/// - the initial lookback and the rescan window (both far shorter, asserted
+///   below).
+///
+/// 45 days clears all of them with a margin for host clock skew. Expiry is
+/// relative to the *watermark*, not to the wall clock, so a daemon that was
+/// stopped for months does not expire the keys its first sweep will re-list
+/// (the floor is then the old watermark).
+pub const SEEN_RETENTION_DAYS: i64 = 45;
+
+const _: () = assert!(SEEN_RETENTION_DAYS * 24 > super::RESCAN_WINDOW_HOURS);
+const _: () = assert!(SEEN_RETENTION_DAYS * 24 > super::INITIAL_LOOKBACK_HOURS);
+const _: () = assert!(SEEN_RETENTION_DAYS > 35, "must outlast GitHub's re-run and run limits");
+
+/// The in-memory stamp of a key with no `committed_at` (a line written before
+/// #11159, or by an older daemon). It is never expired; the next compaction
+/// stamps it with the compaction time, which is a safe upper bound on when
+/// its run was created.
+const UNSTAMPED: i64 = i64::MIN;
+
+/// The in-memory form of a [`UnitKey`]: the repo is an index into
+/// [`Ledger::repos`], so a key carries no heap allocation of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct SeenKey {
+    repo: u32,
+    attempt: u32,
+    run_id: u64,
+    job_id: Option<u64>,
+    logs: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum LedgerLine {
@@ -121,6 +173,11 @@ enum LedgerLine {
         /// record-unit meaning, so an existing ledger loads unchanged.
         #[serde(default, skip_serializing_if = "is_false")]
         logs: bool,
+        /// #11159: the wall-clock time this unit was committed — always at or
+        /// after its run's `created_at`. Optional on read (pre-#11159 lines
+        /// have none), and an older daemon ignores it as an unknown field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        committed_at: Option<DateTime<Utc>>,
         envelopes: Vec<TelemetryEnvelope>,
     },
     Seen {
@@ -133,6 +190,10 @@ enum LedgerLine {
         attempt: u32,
         #[serde(default, skip_serializing_if = "is_false")]
         logs: bool,
+        /// #11159: as on `unit`; a compaction carries it over, and stamps a
+        /// key that had none with the compaction time.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        committed_at: Option<DateTime<Utc>>,
     },
     Watermark {
         repo: String,
@@ -293,30 +354,6 @@ fn skip_past_newline(reader: &mut impl BufRead) -> io::Result<Option<u64>> {
     }
 }
 
-/// Read `path` as complete lines, truncating a torn trailing fragment in
-/// place ([`repair_torn_tail`]). Returns the complete non-blank lines and
-/// whether a repair happened. Same lock rule as [`repair_torn_tail`];
-/// readers use [`read_complete_lines`]. For the ledger, which needs every
-/// line — the journal never loads its lines (#11045).
-pub fn read_repaired_lines(path: &Path) -> io::Result<(Vec<String>, bool)> {
-    let repaired = repair_torn_tail(path)?;
-    Ok((read_complete_lines(path)?, repaired))
-}
-
-/// Read-only counterpart of [`read_repaired_lines`]: the complete non-blank
-/// lines of `path`, ignoring (never touching) any trailing fragment.
-pub fn read_complete_lines(path: &Path) -> io::Result<Vec<String>> {
-    let mut lines = Vec::new();
-    scan_lines(path, 0, u64::MAX, |line| {
-        let text = String::from_utf8_lossy(line);
-        if !text.trim().is_empty() {
-            lines.push(text.trim_end_matches('\r').to_string());
-        }
-        true
-    })?;
-    Ok(lines)
-}
-
 /// Append `bytes` (one or more complete lines) to `path` and fsync it —
 /// plus the parent directory when the file is new, so the directory entry
 /// is durable too.
@@ -354,7 +391,12 @@ pub struct LogCounts {
 #[derive(Debug)]
 pub struct Ledger {
     path: PathBuf,
-    seen: HashSet<UnitKey>,
+    /// Committed keys → their `committed_at` (unix seconds, or
+    /// [`UNSTAMPED`]). Expired keys are never inserted (#11159).
+    seen: HashMap<SeenKey, i64>,
+    /// Interned repo names; [`SeenKey::repo`] indexes this.
+    repos: Vec<String>,
+    repo_index: HashMap<String, u32>,
     watermarks: BTreeMap<String, DateTime<Utc>>,
     next_seq: u64,
     emitted_through: u64,
@@ -373,34 +415,67 @@ pub struct Ledger {
     /// that stays above the threshold afterwards must not be rewritten
     /// again until it has really grown.
     compacted_size: u64,
+    /// Key lines read past as expired by this open.
+    expired: usize,
 }
 
 impl Ledger {
     /// Load the ledger at `path` **as its writer** (under the cycle lock),
     /// repairing a torn tail. A missing file is an empty ledger; an
     /// unparseable complete line is skipped with a warning.
+    ///
+    /// The file is streamed, never held whole, and expired keys are dropped
+    /// as they are read (#11159). A `unit`/`seen` key of repo R is
+    /// **expired** when it carries a `committed_at` and that is more than
+    /// [`SEEN_RETENTION_DAYS`] before R's watermark *as read so far*.
+    /// Nothing can ask about such a key again:
+    ///
+    /// - run listing, per-run and per-job dedupe, and the artifact-span gate
+    ///   all key on runs the sweep lists (`created >= runs_floor`, the older
+    ///   of the watermark and the rescan window) or the feed path records
+    ///   (re-runnable for 30 days) — see [`SEEN_RETENTION_DAYS`];
+    /// - a job-log key is the "logs done" marker for its `log_wanted` line.
+    ///   That line is always written *before* the log unit (a log is only
+    ///   captured once wanted, and a captured job is never wanted again), so
+    ///   when the marker expires its wanted line is already loaded and is
+    ///   dropped with it — exactly what compaction does for captured jobs;
+    /// - a committed-but-unconfirmed unit is pending whatever its age, and
+    ///   its key is restored once the file is read.
+    ///
+    /// Using the watermark seen *so far* errs towards keeping: watermarks
+    /// only advance, so an earlier value can only expire less. Compaction
+    /// writes the watermarks first so the compacted form expires fully.
+    /// A key with no `committed_at` (pre-#11159) is never expired here; the
+    /// next compaction stamps it, so it ages out
+    /// [`SEEN_RETENTION_DAYS`] after that.
+    ///
+    /// [`unit_count`](Self::unit_count) and the log `done` counts therefore
+    /// report the **retained** keys, not all history.
     pub fn open(path: PathBuf) -> io::Result<Self> {
-        let (lines, repaired) = read_repaired_lines(&path)?;
-        let mut ledger = Self::from_lines(path, lines, repaired);
-        // A loaded file with no `unit` lines is already compact: skip the
-        // redundant rewrite a fresh process would otherwise do (#11160).
-        if !ledger.has_uncompacted_units {
+        let repaired = repair_torn_tail(&path)?;
+        let mut ledger = Self::load(path, repaired)?;
+        // A loaded file with no `unit` lines and no expired key lines is
+        // already compact: skip the redundant rewrite a fresh process would
+        // otherwise do (#11160).
+        if !ledger.has_uncompacted_units && ledger.expired == 0 {
             ledger.compacted_size = std::fs::metadata(&ledger.path).map_or(0, |m| m.len());
         }
         Ok(ledger)
     }
 
     /// Load the ledger read-only (for `status`): never repairs, so it is
-    /// safe beside a running cycle.
+    /// safe beside a running cycle. Same streaming and expiry as
+    /// [`open`](Self::open).
     pub fn open_read_only(path: PathBuf) -> io::Result<Self> {
-        let lines = read_complete_lines(&path)?;
-        Ok(Self::from_lines(path, lines, false))
+        Self::load(path, false)
     }
 
-    fn from_lines(path: PathBuf, lines: Vec<String>, repaired: bool) -> Self {
+    fn load(path: PathBuf, repaired: bool) -> io::Result<Self> {
         let mut ledger = Ledger {
             path,
-            seen: HashSet::new(),
+            seen: HashMap::new(),
+            repos: Vec::new(),
+            repo_index: HashMap::new(),
             watermarks: BTreeMap::new(),
             next_seq: 1,
             emitted_through: 0,
@@ -410,86 +485,184 @@ impl Ledger {
             log_failures: BTreeMap::new(),
             has_uncompacted_units: false,
             compacted_size: 0,
+            expired: 0,
         };
+        // Units read so far that no `emitted` line read so far covers. An
+        // `emitted` line prunes it, so it stays bounded by what is pending
+        // between confirmations, not by every unit line in the file.
         let mut units: Vec<PendingUnit> = Vec::new();
-        for line in lines {
-            match serde_json::from_str::<LedgerLine>(&line) {
-                Ok(LedgerLine::Unit {
-                    seq,
+        let path = ledger.path.clone();
+        scan_lines(&path, 0, u64::MAX, |line| {
+            let text = String::from_utf8_lossy(line);
+            let text = text.trim_end_matches('\r');
+            if !text.trim().is_empty() {
+                ledger.load_line(text, &mut units);
+            }
+            true
+        })?;
+        let through = ledger.emitted_through;
+        units.retain(|u| u.seq > through);
+        for unit in &units {
+            // A pending unit replays whatever its age, so its key must stay
+            // seen. Unstamped is the conservative choice: never expired.
+            let key = ledger.intern_key(&unit.key);
+            ledger.seen.entry(key).or_insert(UNSTAMPED);
+        }
+        ledger.pending = units;
+        if ledger.expired > 0 {
+            log::debug!(
+                "ci_telemetry: {} expired ledger key line(s) not loaded from {} (#11159)",
+                ledger.expired,
+                ledger.path.display()
+            );
+        }
+        Ok(ledger)
+    }
+
+    /// Fold one ledger line into the loaded state.
+    fn load_line(&mut self, text: &str, units: &mut Vec<PendingUnit>) {
+        match serde_json::from_str::<LedgerLine>(text) {
+            Ok(LedgerLine::Unit {
+                seq,
+                repo,
+                run_id,
+                job_id,
+                attempt,
+                logs,
+                committed_at,
+                envelopes,
+            }) => {
+                self.next_seq = self.next_seq.max(seq + 1);
+                let key = UnitKey {
                     repo,
                     run_id,
                     job_id,
                     attempt,
                     logs,
-                    envelopes,
-                }) => {
-                    ledger.has_uncompacted_units = true;
-                    let key = UnitKey {
-                        repo,
-                        run_id,
-                        job_id,
-                        attempt,
-                        logs,
-                    };
-                    ledger.seen.insert(key.clone());
-                    ledger.next_seq = ledger.next_seq.max(seq + 1);
+                };
+                self.has_uncompacted_units = true;
+                self.load_key(&key, committed_at);
+                if seq > self.emitted_through {
                     units.push(PendingUnit {
                         seq,
                         key,
                         envelopes,
                     });
                 }
-                Ok(LedgerLine::Seen {
-                    seq,
+            }
+            Ok(LedgerLine::Seen {
+                seq,
+                repo,
+                run_id,
+                job_id,
+                attempt,
+                logs,
+                committed_at,
+            }) => {
+                self.next_seq = self.next_seq.max(seq + 1);
+                let key = UnitKey {
                     repo,
                     run_id,
                     job_id,
                     attempt,
                     logs,
-                }) => {
-                    ledger.seen.insert(UnitKey {
-                        repo,
-                        run_id,
-                        job_id,
-                        attempt,
-                        logs,
-                    });
-                    ledger.next_seq = ledger.next_seq.max(seq + 1);
+                };
+                self.load_key(&key, committed_at);
+            }
+            Ok(LedgerLine::Watermark { repo, created_at }) => {
+                self.watermarks.insert(repo, created_at);
+            }
+            Ok(LedgerLine::Emitted { through_seq }) => {
+                if through_seq > self.emitted_through {
+                    self.emitted_through = through_seq;
+                    units.retain(|u| u.seq > through_seq);
                 }
-                Ok(LedgerLine::Watermark { repo, created_at }) => {
-                    ledger.watermarks.insert(repo, created_at);
+            }
+            Ok(LedgerLine::LogWanted { target }) => {
+                self.log_wanted
+                    .insert((target.repo.clone(), target.job_id), target);
+            }
+            Ok(LedgerLine::LogFailure {
+                repo,
+                job_id,
+                attempts,
+                error,
+            }) => {
+                let entry = self
+                    .log_failures
+                    .entry((repo, job_id))
+                    .or_insert((0, String::new()));
+                if attempts >= entry.0 {
+                    *entry = (attempts, error);
                 }
-                Ok(LedgerLine::Emitted { through_seq }) => {
-                    ledger.emitted_through = ledger.emitted_through.max(through_seq);
-                }
-                Ok(LedgerLine::LogWanted { target }) => {
-                    ledger
-                        .log_wanted
-                        .insert((target.repo.clone(), target.job_id), target);
-                }
-                Ok(LedgerLine::LogFailure {
-                    repo,
-                    job_id,
-                    attempts,
-                    error,
-                }) => {
-                    let entry = ledger
-                        .log_failures
-                        .entry((repo, job_id))
-                        .or_insert((0, String::new()));
-                    if attempts >= entry.0 {
-                        *entry = (attempts, error);
+            }
+            Err(error) => log::warn!(
+                "ci_telemetry: skipping unparseable ledger line in {}: {error}",
+                self.path.display()
+            ),
+        }
+    }
+
+    /// Insert `key` as seen unless it is expired (see [`open`](Self::open)).
+    fn load_key(&mut self, key: &UnitKey, committed_at: Option<DateTime<Utc>>) {
+        let stamp = committed_at.map_or(UNSTAMPED, |at| at.timestamp());
+        if let Some(at) = committed_at {
+            let expired = self
+                .watermarks
+                .get(&key.repo)
+                .is_some_and(|watermark| at < *watermark - Duration::days(SEEN_RETENTION_DAYS));
+            if expired {
+                self.expired += 1;
+                if key.logs {
+                    // Captured: its wanted line, already read, is done too.
+                    if let Some(job_id) = key.job_id {
+                        self.log_wanted.remove(&(key.repo.clone(), job_id));
                     }
                 }
-                Err(error) => log::warn!(
-                    "ci_telemetry: skipping unparseable ledger line in {}: {error}",
-                    ledger.path.display()
-                ),
+                return;
             }
         }
-        let through = ledger.emitted_through;
-        ledger.pending = units.into_iter().filter(|u| u.seq > through).collect();
-        ledger
+        let interned = self.intern_key(key);
+        let entry = self.seen.entry(interned).or_insert(stamp);
+        // A key seen twice (a `unit` and later its compacted `seen`) keeps
+        // the later stamp — later is the safe direction.
+        *entry = (*entry).max(stamp);
+    }
+
+    fn intern_key(&mut self, key: &UnitKey) -> SeenKey {
+        let repo = match self.repo_index.get(key.repo.as_str()) {
+            Some(index) => *index,
+            None => {
+                let index = u32::try_from(self.repos.len()).unwrap_or(u32::MAX);
+                self.repos.push(key.repo.clone());
+                self.repo_index.insert(key.repo.clone(), index);
+                index
+            }
+        };
+        SeenKey {
+            repo,
+            attempt: key.attempt,
+            run_id: key.run_id,
+            job_id: key.job_id,
+            logs: key.logs,
+        }
+    }
+
+    /// `key`'s compact form, if its repo has any key at all.
+    fn lookup(&self, key: &UnitKey) -> Option<SeenKey> {
+        self.repo_index.get(key.repo.as_str()).map(|repo| SeenKey {
+            repo: *repo,
+            attempt: key.attempt,
+            run_id: key.run_id,
+            job_id: key.job_id,
+            logs: key.logs,
+        })
+    }
+
+    /// Key lines this open read past as expired (#11159).
+    #[must_use]
+    pub fn expired_on_open(&self) -> usize {
+        self.expired
     }
 
     #[must_use]
@@ -503,12 +676,27 @@ impl Ledger {
         self.repaired
     }
 
+    /// Whether a run created at `created_at` is older than `repo`'s retention
+    /// boundary (watermark − [`SEEN_RETENTION_DAYS`]). Such a run's keys may
+    /// have been dropped by [`open`](Self::open), so [`is_seen`](Self::is_seen)
+    /// can no longer vouch for it and a consumer fed an arbitrary run key (the
+    /// feed-driven path) must refuse it rather than record it again (#11159).
+    /// `false` when the repo has no watermark (nothing is ever expired there).
     #[must_use]
-    pub fn is_seen(&self, key: &UnitKey) -> bool {
-        self.seen.contains(key)
+    pub fn run_is_past_retention(&self, repo: &str, created_at: DateTime<Utc>) -> bool {
+        self.watermarks
+            .get(repo)
+            .is_some_and(|watermark| created_at < *watermark - Duration::days(SEEN_RETENTION_DAYS))
     }
 
-    /// Number of committed units (runs + jobs).
+    #[must_use]
+    pub fn is_seen(&self, key: &UnitKey) -> bool {
+        self.lookup(key)
+            .is_some_and(|key| self.seen.contains_key(&key))
+    }
+
+    /// Number of committed units (runs + jobs) currently retained — expired
+    /// keys (#11159) are not counted.
     #[must_use]
     pub fn unit_count(&self) -> usize {
         self.seen.len()
@@ -537,8 +725,15 @@ impl Ledger {
         let mut committed = Vec::new();
         let mut buffer = String::new();
         let mut seq = self.next_seq;
+        // Second precision is all expiry needs, and keeps the in-memory and
+        // on-disk stamps identical.
+        let now = Utc::now();
+        let now = Utc
+            .timestamp_opt(now.timestamp(), 0)
+            .single()
+            .unwrap_or(now);
         for unit in units {
-            if self.seen.contains(&unit.key) {
+            if self.is_seen(&unit.key) {
                 continue;
             }
             let line = LedgerLine::Unit {
@@ -548,6 +743,7 @@ impl Ledger {
                 job_id: unit.key.job_id,
                 attempt: unit.key.attempt,
                 logs: unit.key.logs,
+                committed_at: Some(now),
                 envelopes: unit.envelopes.clone(),
             };
             buffer.push_str(&serde_json::to_string(&line).map_err(io::Error::other)?);
@@ -566,7 +762,8 @@ impl Ledger {
         self.next_seq = seq;
         self.has_uncompacted_units = true;
         for unit in &committed {
-            self.seen.insert(unit.key.clone());
+            let key = self.intern_key(&unit.key);
+            self.seen.insert(key, now.timestamp());
         }
         self.pending.extend(committed.iter().cloned());
         Ok(committed)
@@ -654,7 +851,7 @@ impl Ledger {
     #[must_use]
     pub fn log_counts(&self) -> LogCounts {
         let mut counts = LogCounts {
-            done: self.seen.iter().filter(|key| key.logs).count(),
+            done: self.seen.keys().filter(|key| key.logs).count(),
             ..LogCounts::default()
         };
         for target in self.log_wanted.values() {
@@ -683,8 +880,11 @@ impl Ledger {
     #[must_use]
     pub fn log_counts_by_repo(&self) -> BTreeMap<String, LogCounts> {
         let mut by_repo: BTreeMap<String, LogCounts> = BTreeMap::new();
-        for key in self.seen.iter().filter(|key| key.logs) {
-            by_repo.entry(key.repo.clone()).or_default().done += 1;
+        for key in self.seen.keys().filter(|key| key.logs) {
+            by_repo
+                .entry(self.repos[key.repo as usize].clone())
+                .or_default()
+                .done += 1;
         }
         for target in self.log_wanted.values() {
             if self.is_seen(&UnitKey::job_logs(
@@ -756,10 +956,16 @@ impl Ledger {
     /// ledger, never a mix.
     ///
     /// A no-op (`Ok(false)`) unless a rewrite could actually shrink the
-    /// file (#11160): compaction keeps every `seen` key, so a compacted
-    /// ledger can itself exceed `threshold`; it is rewritten again only
+    /// file (#11160): compaction keeps every retained `seen` key, so a
+    /// compacted ledger can itself exceed `threshold`; it is rewritten again only
     /// when `unit` lines were committed since, or the file has grown past
     /// twice its last compacted size.
+    ///
+    /// #11159: only the retained (unexpired) keys are written, each with its
+    /// `committed_at`; a key that had none is stamped with the compaction
+    /// time (a safe upper bound on its run's creation), so it can expire
+    /// later. Watermarks are written **first**, so the next open expires
+    /// against them from the first key line on.
     pub fn compact_if_large(&mut self, threshold: u64) -> io::Result<bool> {
         let size = std::fs::metadata(&self.path).map_or(0, |m| m.len());
         if size <= threshold || !self.pending.is_empty() {
@@ -770,21 +976,46 @@ impl Ledger {
             return Ok(false);
         }
         let mut buffer = String::new();
-        let mut keys: Vec<&UnitKey> = self.seen.iter().collect();
-        keys.sort();
-        let seq = self.next_seq.saturating_sub(1);
-        for key in keys {
-            let line = LedgerLine::Seen {
-                seq,
-                repo: key.repo.clone(),
-                run_id: key.run_id,
-                job_id: key.job_id,
-                attempt: key.attempt,
-                logs: key.logs,
+        for (repo, created_at) in &self.watermarks {
+            let line = LedgerLine::Watermark {
+                repo: repo.clone(),
+                created_at: *created_at,
             };
             buffer.push_str(&serde_json::to_string(&line).map_err(io::Error::other)?);
             buffer.push('\n');
         }
+        let now = Utc::now().timestamp();
+        let mut keys: Vec<(&str, SeenKey, i64)> = self
+            .seen
+            .iter()
+            .map(|(key, stamp)| (self.repos[key.repo as usize].as_str(), *key, *stamp))
+            .collect();
+        // The `UnitKey` order: repo name, run, job, attempt, logs.
+        keys.sort_by(|a, b| {
+            (a.0, a.1.run_id, a.1.job_id, a.1.attempt, a.1.logs).cmp(&(
+                b.0,
+                b.1.run_id,
+                b.1.job_id,
+                b.1.attempt,
+                b.1.logs,
+            ))
+        });
+        let seq = self.next_seq.saturating_sub(1);
+        for (repo, key, stamp) in &keys {
+            let stamp = if *stamp == UNSTAMPED { now } else { *stamp };
+            let line = LedgerLine::Seen {
+                seq,
+                repo: (*repo).to_string(),
+                run_id: key.run_id,
+                job_id: key.job_id,
+                attempt: key.attempt,
+                logs: key.logs,
+                committed_at: Utc.timestamp_opt(stamp, 0).single(),
+            };
+            buffer.push_str(&serde_json::to_string(&line).map_err(io::Error::other)?);
+            buffer.push('\n');
+        }
+        drop(keys);
         // #8825: a job whose log capture is still outstanding (pending, or
         // given up on) must survive compaction — dropping a `log_wanted`
         // would silently abandon the capture, and dropping a `log_failure`
@@ -818,14 +1049,6 @@ impl Ledger {
                 buffer.push('\n');
             }
         }
-        for (repo, created_at) in &self.watermarks {
-            let line = LedgerLine::Watermark {
-                repo: repo.clone(),
-                created_at: *created_at,
-            };
-            buffer.push_str(&serde_json::to_string(&line).map_err(io::Error::other)?);
-            buffer.push('\n');
-        }
         let emitted = LedgerLine::Emitted {
             through_seq: self.emitted_through.max(seq),
         };
@@ -845,6 +1068,12 @@ impl Ledger {
         }
         self.has_uncompacted_units = false;
         self.compacted_size = std::fs::metadata(&self.path).map_or(0, |m| m.len());
+        // The file now carries the compaction-time stamps; match it.
+        for stamp in self.seen.values_mut() {
+            if *stamp == UNSTAMPED {
+                *stamp = now;
+            }
+        }
         Ok(true)
     }
 }

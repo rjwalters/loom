@@ -60,13 +60,12 @@ pub enum Job {
     QuarantineReconciliation,
     CiTelemetry,
     OutcomeJournal,
-    StarLiveness,
     Other,
 }
 
 impl Job {
     /// Every value, in label order.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 8] = [
         Self::WorkFinder,
         Self::ClaimReconciliation,
         Self::RoleRunner,
@@ -74,7 +73,6 @@ impl Job {
         Self::QuarantineReconciliation,
         Self::CiTelemetry,
         Self::OutcomeJournal,
-        Self::StarLiveness,
         Self::Other,
     ];
 
@@ -88,7 +86,6 @@ impl Job {
             Self::QuarantineReconciliation => "quarantine_reconciliation",
             Self::CiTelemetry => "ci_telemetry",
             Self::OutcomeJournal => "outcome_journal",
-            Self::StarLiveness => "star_liveness",
             Self::Other => "other",
         }
     }
@@ -113,8 +110,6 @@ impl Job {
             Self::CiTelemetry
         } else if prefixed("sweep_outcome") || prefixed("outcome_journal") {
             Self::OutcomeJournal
-        } else if prefixed("star_liveness") {
-            Self::StarLiveness
         } else {
             Self::Other
         }

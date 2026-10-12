@@ -529,6 +529,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // #9872: name the rate-limit pool the credential spends (WARN on a
     // personal one: shared with every PAT/OAuth/`gh` login of that user).
     let credential_preflight = credential_preflight::attach_pool(github_app_preflight.report);
+    credential_preflight::loom_ui::startup(&credential_preflight); // #11295
 
     // Per-owner managed-repo credentials (#5401). The GitHub App mechanism
     // above mints exactly ONE installation token, keyed on this daemon's
@@ -1558,16 +1559,13 @@ pub(crate) async fn run_daemon() -> Result<()> {
         log::debug!("work_finder: disabled (set LOOM_WORK_FINDER=1 to enable)");
         None
     };
-    // Starred-issue liveness + loom-ui star intents (#9244 C), alongside dispatch.
-    // The bus handle (#9321) carries each new escalation / recovery onto
-    // `operator_priority.escalation` so the Safehouse sink relays it into the
-    // team's Matrix room rather than leaving the ask as a forge comment only.
     // #11295: loom-ui's Alerts page, before its producers below start.
-    let _loom_ui_alerts = loom_daemon::loom_ui_alerts::start(&sweep_workspace);
-    let _star_liveness = _work_finder_handle.is_some().then(|| {
-        loom_daemon::star_liveness::task::spawn(sweep_workspace.clone(), Some(event_bus.clone()))
-    });
-
+    // Started before the watches below; alerts raised earlier wait in its outbox.
+    if loom_daemon::loom_ui_alerts::start(&sweep_workspace).is_some() {
+        loom_daemon::loom_ui_alerts::watches::spawn_all(&sweep_workspace);
+    }
+    // #11104: star-liveness is gone; its `autonomous.operatorPriority` keys warn once.
+    work_finder::operator_priority::warn_retired_config(&sweep_workspace);
     let _fleet_alert = loom_daemon::fleet_alert::task::spawn(
         sweep_workspace.clone(),
         socket_path.clone(),

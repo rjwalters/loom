@@ -115,8 +115,8 @@ pub mod exporter;
 pub mod fleet_state;
 pub mod lifecycle;
 pub mod llm_billing;
+pub mod loss_ledger;
 pub mod ops;
-#[cfg(feature = "otlp")]
 pub mod otlp;
 pub mod otlp_health;
 pub mod outcome;
@@ -248,9 +248,8 @@ pub enum ExporterKind {
     /// default, for backward compatibility with every deployment predating
     /// this issue.
     Https,
-    /// OTLP/HTTP+JSON push (`otlp::OtlpExporter`, only compiled in behind the
-    /// `otlp` Cargo feature) — an escape hatch for an existing OpenTelemetry
-    /// stack.
+    /// OTLP/HTTP+JSON push (`otlp::OtlpExporter`, compiled into every build
+    /// since #10700) — an escape hatch for an existing OpenTelemetry stack.
     Otlp,
 }
 
@@ -733,6 +732,7 @@ pub fn global_export_queue_stats(
                         crate::telemetry::kinds::host_export::QueueStats {
                             depth: u64::try_from(queue.len()).unwrap_or(u64::MAX),
                             dropped_total: queue.dropped_total(),
+                            dropped_by_reason: queue.dropped_by_reason(),
                         },
                     )
                 })
@@ -942,15 +942,6 @@ fn entry_endpoint(
         );
         return Err((Some(endpoint), detail));
     }
-    #[cfg(not(feature = "otlp"))]
-    if entry.kind == ExporterKind::Otlp {
-        return Err((
-            Some(endpoint),
-            "exporter=otlp requested but this daemon build was not compiled \
-                 with the `otlp` Cargo feature"
-                .to_string(),
-        ));
-    }
     // `headers_file` (Issue #10961): refused here, before the ingest key or
     // the headers file itself is read. A no-op for an entry without one.
     if let Err(detail) = request_headers::entry_policy(
@@ -1144,7 +1135,6 @@ pub fn spawn_task(
     // The non-OTLP subset, for the `queue.snapshot` sink (Issue #8852).
     let mut native_queues: Vec<Arc<DurableQueue>> = Vec::new();
     // The OTLP sinks whose senders started, for the agent relay (#10964).
-    #[cfg(feature = "otlp")]
     let mut relay_sinks: Vec<otlp::relay::Sink> = Vec::new();
     for (index, (entry, endpoint)) in planned.iter().enumerate() {
         let name = entry.kind.name();
@@ -1167,18 +1157,12 @@ pub fn spawn_task(
                 // already handle.
                 let host_id_status = Arc::new(HostIdStatus::default());
                 register_global_host_id_status(host_id_status.clone());
-                // loom-ui star intents (#9244 C) ride the same native ack, so
-                // the queue is registered here too and nowhere else (the OTLP
-                // arm below has no ack to read them from).
-                let intents = crate::star_liveness::intents::register_global_queue();
                 match HttpsExporter::new(
                     endpoint.clone(),
                     ingest_key.clone(),
                     host_id.clone(),
                     host_id_status,
-                )
-                .map(|e| e.with_intent_queue(intents))
-                {
+                ) {
                     Ok(exporter) => sender::spawn_task(
                         queue.clone(),
                         exporter,
@@ -1224,7 +1208,6 @@ pub fn spawn_task(
                 // from "checked, and they agree". Better to leave the surface
                 // honestly absent until an OTLP-side identity signal exists to
                 // check against.
-                #[cfg(feature = "otlp")]
                 {
                     // `headers_file` (#10961) is read here, at construction —
                     // a refused file lands in the `Err` arm below as this
@@ -1256,18 +1239,10 @@ pub fn spawn_task(
                         }
                     }
                 }
-                // Unreachable without the feature: the policy pass above
-                // already rejected `Otlp` entries on non-`otlp` builds.
-                #[cfg(not(feature = "otlp"))]
-                {
-                    let _ = (endpoint, ingest_key, batch_size, flush_interval);
-                    unreachable!("otlp entry rejected in the policy pass without the feature")
-                }
             }
         };
         statuses.insert(name.to_string(), export_status);
         if entry.kind == ExporterKind::Otlp {
-            #[cfg(feature = "otlp")]
             relay_sinks.push(otlp::relay::Sink {
                 endpoint: endpoint.clone(),
                 headers_file: entry.headers_file.clone(),
@@ -1309,7 +1284,6 @@ pub fn spawn_task(
     let mut ops_handles = Vec::new();
     // The agent telemetry relay (#10964): opt-in, and only over OTLP sinks
     // that just started — it cannot add or start an exporter either.
-    #[cfg(feature = "otlp")]
     ops_handles.extend(otlp::relay::start(&workspace_root, &host_id, &ingest_key, &relay_sinks));
     // `fleet.state` (#10196): the replay contract's state record, OTLP-only,
     // built after every work-finder tick (#11161) and on the collector's

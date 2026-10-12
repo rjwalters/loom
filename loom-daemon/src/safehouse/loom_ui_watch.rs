@@ -27,45 +27,8 @@ pub const SAMPLE: Duration = Duration::from_secs(30);
 /// The rule.
 pub const RULE: &str = "safehouse.unreachable";
 
-/// Debounce over state samples. Pure, injected clock.
-#[derive(Debug)]
-pub struct Tracker {
-    bad_since: Option<Instant>,
-    /// This process opened the incident.
-    open: bool,
-    /// A previous process may have left it open: resolve on the first healthy
-    /// sample.
-    startup_resolve_owed: bool,
-}
-
-impl Default for Tracker {
-    fn default() -> Self {
-        Self {
-            bad_since: None,
-            open: false,
-            startup_resolve_owed: true,
-        }
-    }
-}
-
-impl Tracker {
-    /// Feed one sample; returns the transition to post, if any.
-    pub fn observe(&mut self, healthy: bool, now: Instant, sustain: Duration) -> Option<State> {
-        if healthy {
-            self.bad_since = None;
-            let owed =
-                std::mem::take(&mut self.open) | std::mem::take(&mut self.startup_resolve_owed);
-            return owed.then_some(State::Resolved);
-        }
-        let since = *self.bad_since.get_or_insert(now);
-        if !self.open && now.duration_since(since) >= sustain {
-            self.open = true;
-            self.startup_resolve_owed = false;
-            return Some(State::Open);
-        }
-        None
-    }
-}
+/// The debounce, shared with the other single-key loom-ui watches.
+pub use crate::loom_ui_alerts::sustain::Tracker;
 
 /// The alert for `state`, describing `sample`.
 #[must_use]

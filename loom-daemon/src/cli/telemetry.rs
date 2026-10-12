@@ -190,15 +190,13 @@ impl TelemetryCommand {
             TelemetryCommand::TelemetryOverhead(args) => args.run(),
             TelemetryCommand::TelemetryExport(args) => args.run().await,
             TelemetryCommand::TelemetryReplay(args) => args.run(),
-            TelemetryCommand::TelemetryCapabilities { require_otlp } => {
-                println!(
-                    "{}",
-                    serde_json::json!({"otlp": cfg!(feature = "otlp"), "otlp_protocol": "http/json"})
-                );
-                anyhow::ensure!(
-                    !require_otlp || cfg!(feature = "otlp"),
-                    "this binary was built without the otlp feature"
-                );
+            // The OTLP exporter is compiled unconditionally (#10700), so
+            // `otlp` is always `true` and `--require-otlp` always passes. The
+            // flag stays so build/roll probes (`daemon-build.sh`,
+            // `daemon_update::rebuild`) keep one stable contract: exit 0 =
+            // this binary exports OTLP.
+            TelemetryCommand::TelemetryCapabilities { require_otlp: _ } => {
+                println!("{}", serde_json::json!({"otlp": true, "otlp_protocol": "http/json"}));
                 Ok(())
             }
 

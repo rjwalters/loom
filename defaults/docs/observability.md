@@ -238,8 +238,8 @@ Back-compat and upgrade rules:
 - Entries dedupe by kind (first wins; queues and status are keyed by kind
   name, so `"https"` can appear once). An unrecognized kind is logged and
   skipped, never a hard error.
-- A policy failure on one entry (bad endpoint, placeholder host, missing
-  `otlp` Cargo feature in this build) degrades **that entry** to its own
+- A policy failure on one entry (bad endpoint, placeholder host, refused
+  `headers_file`) degrades **that entry** to its own
   `misconfigured` status while the other exporters run; only when *no*
   exporter survives — or the shared ingest key is unusable — is export off
   entirely.
@@ -493,7 +493,7 @@ condition is a first-class health check with four states, shown on the
 
 | State | Meaning |
 |---|---|
-| `no_exporter` | The resolved `observability.exporters` has no usable `otlp` entry (or observability is off), or the binary was built without the `otlp` feature (#10700). |
+| `no_exporter` | The resolved `observability.exporters` has no usable `otlp` entry (or observability is off). Every build compiles the OTLP exporter in (#10700), so a binary can no longer lack it. |
 | `failing` | An `otlp` exporter is configured, but no batch was acked within the window, or the OTLP queue's `dropped_total` grew within the window. |
 | `ok` | The last successful export is recent (a fresh exporter gets the window as startup grace). |
 | `exempt` | The host opted out; the reason is shown. |
@@ -573,8 +573,10 @@ alert. The rule's shape has not yet been tested against a live SigNoz. Standing 
 `defaults/observability/signoz/queue-dwell.sql`.
 
 **Fleet singleton outputs (#10916).** The in-daemon `fleet_alert` path
-(#10924) judges the registered one-host fleet outputs (`ci.run` and the
-captain gauges) against `fleet_outputs::SINGLETON_OUTPUTS`. The SigNoz
+(#10924) judges the registered one-host fleet outputs (`ci.run`, the captain
+gauges, and the intake-reconcile completed-pass heartbeat
+`.loom/state/intake-reconcile/last-pass.json`) against
+`fleet_outputs::SINGLETON_OUTPUTS`. The SigNoz
 cross-host alert that watched the ETA singletons was removed with the ETA
 subsystem (#11098).
 
@@ -965,7 +967,6 @@ could read. A machine with no daemon running has no receiver at all.
 
 The same switch is read again at each launch against the launched session's
 own workspace, so one repository of a multi-workspace daemon can opt out.
-Requires a daemon built with the `otlp` Cargo feature (release builds are).
 
 **What a wired session is given.** `CLAUDE_CODE_ENABLE_TELEMETRY=1`,
 `CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1`, `OTEL_{METRICS,LOGS,TRACES}_EXPORTER=otlp`,
@@ -1123,12 +1124,21 @@ and dropped).
 
 | Rule | From | Open / resolved |
 |---|---|---|
-| `fleet.<condition>` (`dispatch-halted`, `roles-persistent`, `capacity-limited`, `star-backlog`, `output-missing`) | `fleet_alert` | condition started (and each reminder) / cleared |
-| `star.<ask kind>` (link = the issue) | `star_liveness` escalations | escalation posted / ask cleared |
+| `fleet.<condition>` (`dispatch-halted`, `roles-persistent`, `capacity-limited`, `output-missing`; `star-backlog` retired by #11510) | `fleet_alert` | condition started (and each reminder) / cleared |
 | `daemon.down` (critical) | the watchdog, a separate process | recovery exhausted / any tick ending the outage |
 | `watchdog.peer-coord-degraded` (critical) | the watchdog | coordination degraded / green |
 | `safehouse.unreachable` (critical) | narration sink state | unreachable over 5 minutes / reconnected |
 | `fleet.floor-unsatisfiable` | `auto_update` | the floor ERROR line / floor met |
+| `fleet.floor-malformed` | fleet-sync pass | `loom_min_version` malformed / a valid (or no) floor |
+| `fleet.sync-error` | fleet-sync pass | 3 erroring passes in a row / a clean pass |
+| `daemon.task-dead` (key = task) | `task_liveness`, sampled each minute | loop past its staleness window / beating again or gone |
+| `forge.credential-missing` (critical) | startup credential preflight | no usable GitHub credential / a good start or github-app refresh |
+| `resync.<kind>` (`failure`, `repo-access`, `branch-protection`: key = repo; `network`, `head-query`, `pass-stuck`: key `workspaces`) | workspace resync | its alert threshold (3 in a row) / the repo or host healthy again |
+| `forge.ratelimit-breaker` | rate-limit breaker, sampled each minute | polling held off over 15 minutes / released |
+| `version.pause-failed` (key = version) | pause roll (H7 `pause-failed`) | the failed pause / a start on another version |
+| `version.config-rejected` | pause roll | `pauseRoll.*` tuning rejected / accepted (each roll and each start) |
+| `llm-monitor.stale` | llm-monitor `ranking.json` | older than 30 minutes (or unreadable) on two reads 5 minutes apart / fresh (no file: nothing) |
+| `install.<invariant>` (key = workspace root) | `install_self_check`, when enabled | violation standing after the tick / gone, or the check off |
 
 `tokens-zero-healthy` is not sent: loom-ui derives `provider-pool-exhausted`
 from the daemon's pool gauge itself. Delivery is a bounded FIFO drained by one
@@ -1136,6 +1146,16 @@ task (open always before resolved): a 2xx is done, any other 4xx except 429 is
 dropped and logged, 429 / 5xx / network errors back off (5 s doubling to
 15 min, at most 20 tries). The watchdog posts synchronously (10 s bound) and
 keeps a `<sentinel>.loom-ui` record so an unanswered post retries next tick.
+
+Level-triggered sources keep the incidents they hold open in
+`~/.loom/loom-ui-alerts/<scope>.json`, so a restarted daemon resolves one
+the previous process opened once it finds the condition gone, and keeps one
+open while its failure count (process memory) builds up again; a daemon
+that finds the output off removes those files. The single-key
+watches (safehouse, breaker, llm-monitor) send one `resolved` on their first
+healthy sample instead. Alerts raised before the output starts (credential
+preflight, the fleet-sync startup pass) wait in the outbox. llm-monitor's
+quota step-change alert is not in `ranking.json` yet, so it is not sent.
 
 `fleet_alert` only runs when `autonomous.fleetAlert.enabled` is on (off by
 default here); the fleet defaults (fleet-gitops) are where to enable it.

@@ -160,6 +160,11 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.egress.ttft_ms",
     "loom.egress.error_code",
     "loom.egress.stream",
+    // `guard.cargo_target_dir.denied` spans (#11582): the forbidden root by
+    // name (`/tmp`, `$TMPDIR`, `~/.cache`, `~`, `.loom/target-*`) and where the
+    // value came from. Never the path or the command.
+    "loom.guard.root",
+    "loom.guard.source",
 ];
 
 /// Longest label value kept, in bytes.

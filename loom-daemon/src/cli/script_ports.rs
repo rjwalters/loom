@@ -375,6 +375,28 @@ pub(crate) enum ScriptPortCommand {
     /// refused with nothing mutated, 2 the rebase itself failed.
     ReconcileStack(super::reconcile_stack::ReconcileStackArgs),
 
+    /// Build a PINNED `--force-with-lease=<branch>:<oid>` push argument, or
+    /// refuse (#9487). Backs the lease capture in `reconcile-stack.sh` and
+    /// `rebase-stacked-children.sh`. A bare `--force-with-lease` compares
+    /// against `refs/remotes/<remote>/<branch>`, a ref shared by every linked
+    /// worktree of a Loom clone that a sibling's fetch can advance — so the
+    /// lease is satisfied by construction and the push silently deletes the
+    /// sibling's commit (the live PR #9483 incident). Exit 0 + the argument
+    /// on stdout, 3 the remote could not be queried, 4 the remote holds
+    /// commits this checkout never incorporated. There is no bare-flag
+    /// fallback by design: see `cli/push_lease.rs`.
+    #[command(subcommand)]
+    PushLease(super::push_lease::PushLeaseCommand),
+
+    /// May this repository's PR branches be rebased (#10771)? `strategy`
+    /// prints `merge` or `rebase` for the roles and stack scripts that bring a
+    /// PR branch up to date. `merge` (the answer whenever the forge does not
+    /// positively allow rebase merges, or anything is unknown) means merge the
+    /// default branch in and push without force — a rebase in a merge-only
+    /// repo deletes other agents' merge commits and orphans reviewed heads.
+    #[command(subcommand)]
+    BranchUpdate(super::branch_update::BranchUpdateCommand),
+
     /// Generate `.agents/skills/loom-<name>/SKILL.md` from every
     /// `defaults/roles/<name>.md` role prompt (#8673) — the cross-vendor
     /// skill-discovery surface Codex, Kimi Code, Mistral Vibe, and Grok read
@@ -465,6 +487,15 @@ pub(crate) enum ScriptPortCommand {
     /// shell-language policy and the #7810 shell-budget gate both send here.
     CheckGuardWiring(super::check_guard_wiring::CheckGuardWiringArgs),
 
+    /// CI gate (#8858): the private-control `POLICY` map in `bundle.rs` may only
+    /// change semantically together with a strictly greater `CONTROL_VERSION`,
+    /// measured against the merge base of `--base` and `--head` straight from
+    /// git objects (no network). Exit 1 on a violation or any missing ref /
+    /// malformed / duplicate / ambiguous declaration. New logic, not a shell port.
+    CheckPrivateControlVersion(
+        super::check_private_control_version::CheckPrivateControlVersionArgs,
+    ),
+
     /// The Renovate-side routing contract (#9418): every `labels` array in the
     /// repo's Renovate config (top-level, `packageRules`, `vulnerabilityAlerts`,
     /// `lockFileMaintenance`, …) contains `loom:review-requested`. Exit 1 on
@@ -505,6 +536,13 @@ pub(crate) enum ScriptPortCommand {
     /// new points check moved here, to keep the #7810 `shell-budget` gate a
     /// non-event for this addition.
     CheckPointsMarker(super::points_marker_check::CheckPointsMarkerArgs),
+
+    /// Per-agent-scope `MemoryMax` (MiB) sized from the repo's observed
+    /// `memory.peak` history (#11094), for `spawn-claude.sh`'s systemd
+    /// scope. Exit 0 = apply the MiB on stdout, 1 = no limit (an answer, not
+    /// an error), 3 = `--probe` found systemd rejects it. New logic behind a
+    /// `contract` script's name, so it lives here, not in the script.
+    RamScopeLimit(super::ram_scope_limit::RamScopeLimitArgs),
 
     /// Refuse content carrying a credential shape — a Claude OAuth/API key,
     /// GitHub/Tailscale/Slack token, AWS key id, private key — whatever its
@@ -596,6 +634,11 @@ pub(crate) enum ScriptPortCommand {
     /// `shell-budget`.
     #[command(subcommand)]
     MergeGroupCi(super::merge_group_ci_cmd::MergeGroupCiCommand),
+
+    /// Print this host's identity (#11530): `fleet.hostId` > `LOOM_HOST_ID` >
+    /// the persisted `~/.loom/host-id`, never the hostname. One line on
+    /// stdout, exit 0; exits non-zero (nothing on stdout) on `unknown-host`.
+    HostId(super::host_id_cmd::HostIdArgs),
 }
 
 impl ScriptPortCommand {
@@ -653,6 +696,8 @@ impl ScriptPortCommand {
             ScriptPortCommand::PremiseCheck(args) => args.run(),
             ScriptPortCommand::OperatorDecision(cmd) => cmd.run(),
             ScriptPortCommand::ReconcileStack(args) => args.run(),
+            ScriptPortCommand::PushLease(cmd) => cmd.run(),
+            ScriptPortCommand::BranchUpdate(cmd) => cmd.run(),
             ScriptPortCommand::GenerateAgentSkills(args) => args.run(),
             ScriptPortCommand::GitBlobLines(args) => args.run(),
             ScriptPortCommand::AffectedFiles(cmd) => cmd.run(),
@@ -662,11 +707,13 @@ impl ScriptPortCommand {
             ScriptPortCommand::CheckStaleBlocked(args) => args.run(),
             ScriptPortCommand::GuardMcpTools(args) => args.run(),
             ScriptPortCommand::CheckGuardWiring(args) => args.run(),
+            ScriptPortCommand::CheckPrivateControlVersion(args) => args.run(),
             ScriptPortCommand::CheckRenovateLabels(args) => args.run(),
             ScriptPortCommand::Guards(cmd) => cmd.run(),
             ScriptPortCommand::PrLatency(args) => args.run(),
             ScriptPortCommand::ParkRecord(cmd) => cmd.run(),
             ScriptPortCommand::CheckPointsMarker(args) => args.run(),
+            ScriptPortCommand::RamScopeLimit(args) => args.run(),
             ScriptPortCommand::SecretScan(args) => args.run(),
             ScriptPortCommand::NotifyClearedBlockers(args) => args.run(),
             ScriptPortCommand::ReleaseStaleBlocked(args) => args.run(),
@@ -676,6 +723,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::ForgeProbe(args) => args.run(),
             ScriptPortCommand::ResyncPin(cmd) => cmd.run(),
             ScriptPortCommand::ResyncPayload(args) => args.run(),
+            ScriptPortCommand::HostId(args) => args.run(),
         }
     }
 }

@@ -574,7 +574,7 @@ pub fn check_uncommitted_changes(worktree_path: &Path) -> bool {
 
 /// Untracked files Loom writes into a managed worktree itself. These are
 /// bookkeeping, not user work, so they must never make a worktree look dirty
-/// to [`has_untracked_files`] — most repos gitignore them (the `loom-managed`
+/// to [`check_uncommitted_or_unproven_untracked_changes`] — most repos gitignore them (the `loom-managed`
 /// block in `.gitignore`), but a repo that predates or has edited that block
 /// would otherwise see every managed worktree as permanently unreclaimable.
 ///
@@ -627,54 +627,31 @@ pub fn is_loom_own_untracked_path(path: &str) -> bool {
     LOOM_OWN_UNTRACKED_FILES.contains(&name)
 }
 
-/// True if `worktree_path` contains untracked, non-gitignored files that are
-/// not Loom's own sentinels (issue #5939).
+/// The `pr-<N>` reaper's `uncommitted` probe: tracked changes, or untracked
+/// non-ignored files that are neither Loom's own sentinels nor inside a
+/// proven Cargo build tree
+/// ([`crate::generated_artifact::build_tree::has_untracked_user_work`]).
 ///
 /// [`check_uncommitted_changes`] deliberately only asks `git diff` /
 /// `git diff --cached`, which are both blind to untracked files — and
-/// `git worktree remove --force` deletes those. For an `issue-<N>` worktree
-/// that gap is bounded by the closed-issue gate; for a `pr-<N>` worktree,
-/// whose branch and contents come from outside Loom, it is not, so the PR path
-/// layers this on top (see [`super::clean::classify_pr_worktree`]).
+/// `git worktree remove --force` deletes those (#5939). For an `issue-<N>`
+/// worktree that gap is bounded by the closed-issue gate; for a `pr-<N>`
+/// worktree, whose branch and contents come from outside Loom, it is not, so
+/// the PR path layers this on top (see [`super::clean::classify_pr_worktree`]).
+/// Kept separate from [`check_uncommitted_changes`] on purpose: the
+/// `issue-<N>` gate chain shipped with the narrower definition.
 ///
-/// A `git` failure (including "not a git worktree at all", the #5177 orphaned
-/// directory case the removal path exists to clean up) reports `false` — the
-/// same fail-toward-proceed convention as [`check_uncommitted_changes`], and
-/// the reason the sentinel/containment gates still bound that path.
+/// #11193 narrowed the untracked half in exactly one way: an agent-chosen
+/// `CARGO_TARGET_DIR` (`.loom-target/`, `.loom/target-doctor-<N>/`, ...)
+/// whose whole content is proven cargo output no longer counts as user work.
+/// A marker beside anything else — a `.rs`, a symlink, an unrecognised file —
+/// still does, and every other removal gate is untouched. A `git` failure
+/// (including the #5177 orphaned-directory case) reports `false`, the same
+/// fail-toward-proceed convention as [`check_uncommitted_changes`].
 #[must_use]
-pub fn has_untracked_files(worktree_path: &Path) -> bool {
-    if !worktree_path.is_dir() {
-        return false;
-    }
-    let Ok(out) = Command::new("git")
-        .arg("-C")
-        .arg(worktree_path)
-        .args(["ls-files", "--others", "--exclude-standard"])
-        .output()
-    else {
-        return false;
-    };
-    if !out.status.success() {
-        return false;
-    }
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .any(|l| !is_loom_own_untracked_path(l))
-}
-
-/// [`check_uncommitted_changes`] widened to also catch untracked files
-/// ([`has_untracked_files`]) — the `uncommitted` probe the `pr-<N>` path wires
-/// in (issue #5939).
-///
-/// Kept as a separate function rather than folded into
-/// [`check_uncommitted_changes`] on purpose: the `issue-<N>` gate chain was
-/// reviewed and shipped with the narrower definition, and widening it there is
-/// a behavior change to a path this work does not touch.
-#[must_use]
-pub fn check_uncommitted_or_untracked_changes(worktree_path: &Path) -> bool {
-    check_uncommitted_changes(worktree_path) || has_untracked_files(worktree_path)
+pub fn check_uncommitted_or_unproven_untracked_changes(worktree_path: &Path) -> bool {
+    check_uncommitted_changes(worktree_path)
+        || crate::generated_artifact::build_tree::has_untracked_user_work(worktree_path)
 }
 
 /// Parsed `.loom-in-use` marker contents (best-effort; unknown/missing
@@ -753,16 +730,17 @@ mod tests {
             std::fs::write(dir.path().join(m), "").expect("write marker");
         }
         assert!(
-            !has_untracked_files(dir.path()),
+            !has_untracked_user_work(dir.path()),
             "every LOOM_OWN_UNTRACKED_FILES entry must be treated as bookkeeping"
         );
 
         // And real user work is still caught.
         std::fs::write(dir.path().join("work.txt"), "mine\n").expect("write");
-        assert!(has_untracked_files(dir.path()), "a real untracked file is dirt");
+        assert!(has_untracked_user_work(dir.path()), "a real untracked file is dirt");
     }
 
     use super::*;
+    use crate::generated_artifact::build_tree::has_untracked_user_work;
     use tempfile::tempdir;
 
     #[test]
@@ -1449,8 +1427,8 @@ mod tests {
     fn a_clean_worktree_has_no_untracked_files() {
         let dir = tempdir().unwrap();
         init_repo_with_commit(dir.path());
-        assert!(!has_untracked_files(dir.path()));
-        assert!(!check_uncommitted_or_untracked_changes(dir.path()));
+        assert!(!has_untracked_user_work(dir.path()));
+        assert!(!check_uncommitted_or_unproven_untracked_changes(dir.path()));
     }
 
     #[test]
@@ -1458,10 +1436,10 @@ mod tests {
         let dir = tempdir().unwrap();
         init_repo_with_commit(dir.path());
         std::fs::write(dir.path().join("scratch-notes.md"), "unsaved").unwrap();
-        assert!(has_untracked_files(dir.path()));
+        assert!(has_untracked_user_work(dir.path()));
         // The narrower legacy probe cannot see it — the exact gap this closes.
         assert!(!check_uncommitted_changes(dir.path()));
-        assert!(check_uncommitted_or_untracked_changes(dir.path()));
+        assert!(check_uncommitted_or_unproven_untracked_changes(dir.path()));
     }
 
     #[test]
@@ -1471,7 +1449,7 @@ mod tests {
         std::fs::write(dir.path().join(".loom-managed"), "").unwrap();
         std::fs::write(dir.path().join(".loom-in-use"), "{}").unwrap();
         assert!(
-            !has_untracked_files(dir.path()),
+            !has_untracked_user_work(dir.path()),
             "every managed worktree carries these; counting them would make the pr-<N> \
              reaper a permanent no-op in a repo without the loom .gitignore block"
         );
@@ -1499,7 +1477,7 @@ mod tests {
             .status()
             .unwrap()
             .success());
-        assert!(!has_untracked_files(dir.path()));
+        assert!(!has_untracked_user_work(dir.path()));
     }
 
     #[test]
@@ -1507,7 +1485,7 @@ mod tests {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("loose.txt"), "x").unwrap();
         assert!(
-            !has_untracked_files(dir.path()),
+            !has_untracked_user_work(dir.path()),
             "the #5177 orphaned-directory path must stay reclaimable"
         );
     }

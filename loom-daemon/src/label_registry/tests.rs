@@ -54,46 +54,34 @@ fn validation_rejects_bad_registries() {
     assert!(mutate(&park_only).is_err());
 }
 
+/// #11510: the labels the daemon no longer reads stay in the registry until
+/// their forge migration (#11511 / #11513), marked `retired`; no other label
+/// is.
 #[test]
-fn validation_rejects_bad_propagate() {
-    let good: serde_json::Value = serde_json::from_str(REGISTRY_JSON).unwrap();
-    let idx = |name: &str| reg().labels.iter().position(|l| l.name == name).unwrap();
-    let (ext, tier) = (idx("external"), idx("tier:maintenance"));
-    let mutate = |i: usize, key: &str, val: serde_json::Value| {
-        let mut v = good.clone();
-        v["labels"][i]["propagate"][key] = val;
-        Registry::parse(&v.to_string())
-    };
-    assert!(mutate(ext, "direction", "child-to-parent".into()).is_err());
-    assert!(mutate(ext, "add", "sometimes".into()).is_err());
-    assert!(mutate(ext, "bogus", true.into()).is_err());
-    // A rank gap, and two rules sharing a rank.
-    assert!(mutate(ext, "rank", 9.into()).is_err());
-    assert!(mutate(ext, "rank", 1.into()).is_err());
-    // A family default without a family; a family that is not the prefix.
-    assert!(mutate(tier, "family", serde_json::Value::Null).is_err());
-    assert!(mutate(ext, "family", "tier:".into()).is_err());
-    // Family members must agree.
-    assert!(mutate(tier, "to_prs", true.into()).is_err());
-}
-
-#[test]
-fn propagate_holds_the_10012_table() {
-    let named: Vec<(&str, u32)> = reg()
+fn the_retired_priority_and_tier_labels_are_marked_retired() {
+    let retired: Vec<&str> = reg()
         .labels
         .iter()
-        .filter_map(|l| l.propagate.as_ref().map(|p| (l.name.as_str(), p.rank)))
+        .filter(|l| l.lifecycle == "retired")
+        .map(|l| l.name.as_str())
         .collect();
     assert_eq!(
-        named,
+        retired,
         vec![
-            ("loom:operator-priority", 1),
-            ("tier:goal-advancing", 3),
-            ("tier:goal-supporting", 3),
-            ("tier:maintenance", 3),
-            ("external", 2),
+            "loom:operator-priority",
+            "loom:operator-high-priority",
+            "loom:high-priority-inherited",
+            "tier:goal-advancing",
+            "tier:goal-supporting",
+            "tier:maintenance",
         ]
     );
+    for name in [
+        crate::priority_pick::IMPORTANT_LABEL,
+        crate::priority_pick::VERY_IMPORTANT_LABEL,
+    ] {
+        assert_eq!(reg().get(name).unwrap().lifecycle, "active", "{name}");
+    }
 }
 
 #[test]

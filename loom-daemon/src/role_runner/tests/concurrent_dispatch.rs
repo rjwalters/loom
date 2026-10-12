@@ -912,3 +912,42 @@ fn fairness_a_real_run_does_not_resume_and_a_new_tick_replaces_pending() {
     assert_eq!(d.dispatch_tick(roots, &in_progress).spawned, vec![b.path().to_path_buf()]);
     let _ = join_one(&rt, &mut d);
 }
+
+// -- curator untriaged-count ordering (#9000) -------------------------------
+
+fn curator_order(ledger: &'static triggers::TriggerLedger, paths: &[PathBuf]) -> Vec<PathBuf> {
+    let factory: RunnerFactory = Arc::new(|_| {
+        Box::new(FixedRunner(RoleTickOutcome::Success, Arc::new(AtomicUsize::new(0))))
+    });
+    let d = dispatcher("curator", factory, admit_only("curator"))
+        .with_triggers(triggers::no_trigger_probe(), ledger);
+    let mut order: VecDeque<(usize, PathBuf)> = paths.iter().cloned().enumerate().collect();
+    d.order_by_untriaged(&mut order);
+    order.into_iter().map(|(_, p)| p).collect()
+}
+
+#[test]
+fn curator_visits_the_largest_untriaged_backlog_first() {
+    let ledger: &'static triggers::TriggerLedger =
+        Box::leak(Box::new(triggers::TriggerLedger::default()));
+    let (a, b, c) = (PathBuf::from("/a"), PathBuf::from("/b"), PathBuf::from("/c"));
+    let paths = vec![b.clone(), a.clone(), c.clone()];
+    // Nothing observed: round-robin order is untouched.
+    assert_eq!(curator_order(ledger, &paths), paths);
+    ledger.record_untriaged(&a, 40);
+    ledger.record_untriaged(&b, 0);
+    // `c` is unobserved and keeps its slot; A (40) outranks B (0).
+    assert_eq!(curator_order(ledger, &paths), vec![a, b, c]);
+}
+
+#[test]
+fn curator_keeps_round_robin_for_unobserved_roots() {
+    let ledger: &'static triggers::TriggerLedger =
+        Box::leak(Box::new(triggers::TriggerLedger::default()));
+    let (a, b) = (PathBuf::from("/a"), PathBuf::from("/b"));
+    let paths = vec![a.clone(), b.clone()];
+    // Only B is observed: unobserved A keeps its round-robin slot ahead of
+    // B's backlog rather than being pushed behind it.
+    ledger.record_untriaged(&b, 40);
+    assert_eq!(curator_order(ledger, &paths), vec![a, b]);
+}

@@ -101,9 +101,9 @@ mod tests {
 
     #[test]
     fn a_reminder_re_posts_open() {
-        let a = to_alert(&t(Kind::Reminder, "star-backlog", false)).unwrap();
+        let a = to_alert(&t(Kind::Reminder, "capacity-limited", false)).unwrap();
         assert_eq!(a.state, State::Open);
-        assert_eq!(a.rule, "fleet.star-backlog");
+        assert_eq!(a.rule, "fleet.capacity-limited");
     }
 
     #[test]

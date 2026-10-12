@@ -35,7 +35,6 @@
 //! The day a Loom span becomes CLIENT-kind, or a second `service.name` appears,
 //! the documented answer stops being true — and these tests fail in ordinary CI
 //! instead of the `evidence.md` row quietly going stale.
-#![cfg(feature = "otlp")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::BTreeSet;

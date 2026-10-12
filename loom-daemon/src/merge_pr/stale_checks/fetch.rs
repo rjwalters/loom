@@ -412,6 +412,21 @@ pub(crate) fn fetch_check_runs(
     project_check_runs(&rollup, head_sha)
 }
 
+/// The workflow runs on `head_sha` (one page), through the same paced,
+/// conditional read as [`fetch_check_runs`] — for `merge-pr
+/// check-runs-rollup`'s superseded-twin drop (#11097).
+///
+/// # Errors
+///
+/// When the read fails; the caller then drops nothing.
+pub fn fetch_workflow_runs(
+    gh: &str,
+    nwo: &str,
+    head_sha: &str,
+) -> Result<serde_json::Value, String> {
+    conditional(gh, nwo, default_store().as_deref(), |r| r.workflow_runs(head_sha))
+}
+
 /// The guard's [`CheckRun`]s from a `{total_count, check_runs}` rollup.
 fn project_check_runs(rollup: &serde_json::Value, head_sha: &str) -> Result<Vec<CheckRun>, String> {
     let rows = rollup
