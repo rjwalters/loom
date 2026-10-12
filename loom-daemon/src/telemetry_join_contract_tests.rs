@@ -159,3 +159,18 @@ fn new_parents_are_private_and_shared_parent_is_not_changed() {
     assert!(!shared.join("headers").exists());
     assert_eq!(std::fs::metadata(&shared).unwrap().permissions().mode() & 0o777, 0o755);
 }
+
+#[test]
+fn age_identity_inside_repository_is_refused_before_subprocess() {
+    let external = tempfile::tempdir().unwrap();
+    let repository = tempfile::tempdir().unwrap();
+    std::fs::create_dir(repository.path().join(".git")).unwrap();
+    let identity = repository.path().join("FAKE-age-identity");
+    let source = AgeFileSource {
+        path: external.path().join("FAKE-encrypted-credential"),
+        identity: Some(identity),
+    };
+    let error = source.credential().unwrap_err();
+    assert!(matches!(error, JoinError::Credential(_)));
+    assert!(error.to_string().contains("repository"));
+}

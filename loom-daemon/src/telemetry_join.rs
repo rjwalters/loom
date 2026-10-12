@@ -197,11 +197,10 @@ pub fn send_failure(status: Option<u16>, detail: &str) -> JoinError {
 /// The live probe transport: the same `OtlpExporter` the daemon's exporter
 /// task uses. Construction does no I/O — the exporter (which loads the
 /// headers file) is built inside [`ProbeSender::send_probe`], and [`join`]
-/// only calls that after it has fetched the token and written the file. So a
-/// clean host (no file yet) can join, and a re-run never sends with a stale
-/// token left by a previous run (#11628 review). The ingest-key slot stays
-/// empty on purpose: the file's `Authorization` replaces the Bearer header,
-/// so no key exists anywhere in this command.
+/// only calls that after it has fetched the credential and written the file.
+/// A clean host can join, and a re-run uses the newly validated file. The
+/// ingest-key slot is `None`: authentication comes exclusively from the file
+/// (Access headers by default, or explicit legacy Bearer authorization).
 #[derive(Debug, Clone)]
 pub struct OtlpProbeSender {
     endpoint: String,

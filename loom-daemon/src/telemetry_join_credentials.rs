@@ -194,6 +194,7 @@ impl CredentialSource for AgeFileSource {
         let mut cmd = std::process::Command::new("age");
         cmd.arg("--decrypt");
         if let Some(identity) = &self.identity {
+            super::ensure_external_path(identity)?;
             cmd.args(["-i", &identity.display().to_string()]);
         }
         cmd.arg(&self.path);
@@ -242,7 +243,7 @@ pub enum CredentialSpec {
     File { path: PathBuf },
 }
 
-/// The default spec for `host`: `ssm://{DEFAULT_SSM_PARAM}/{host}`.
+/// The default Access-pair spec for `host`: `ssm-access://{DEFAULT_SSM_PARAM}/{host}`.
 #[must_use]
 pub fn default_credential_spec(host: &str) -> String {
     format!("ssm-access://{DEFAULT_SSM_PARAM}/{host}")
