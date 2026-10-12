@@ -723,6 +723,68 @@ async fn spawn_task_fully_configured_spawns_three_tasks() {
     }
 }
 
+/// Issue #11197: `spawn_task` enqueues exactly one `daemon.start` record per
+/// call — the offer persists synchronously (`DurableQueue::push`), so the
+/// queue file already holds it when `spawn_task` returns, and the sender
+/// (flush_interval 1 h) has not drained it.
+#[tokio::test]
+#[serial]
+async fn spawn_task_offers_exactly_one_daemon_start_record() {
+    clear_env();
+    let bus = EventBus::new();
+    let dir = tempdir().unwrap();
+    let key_path = dir.path().join("ingest.key");
+    std::fs::write(&key_path, "s3cr3t\n").unwrap();
+    let config = ObservabilityConfig {
+        enabled: Some(true),
+        endpoint: Some(SAFE_TEST_ENDPOINT.to_string()),
+        ingest_key_file: Some(key_path.to_string_lossy().to_string()),
+        flush_interval_secs: Some(3600), // avoid a real network attempt during the test
+        ..Default::default()
+    };
+    let handles =
+        spawn_task(&config, dir.path().to_path_buf(), &bus, Instant::now(), test_workspace_pool());
+    assert!(handles.is_some(), "fully configured ⇒ export is on");
+    let queue = std::fs::read_to_string(
+        dir.path()
+            .join(".loom")
+            .join("logs")
+            .join("observability-queue.jsonl"),
+    )
+    .expect("the daemon.start offer persists to the sole exporter's queue file");
+    assert_eq!(
+        queue.matches("daemon.start").count(),
+        1,
+        "exactly one daemon.start per spawn_task call — queue: {queue}"
+    );
+    for handle in handles.unwrap() {
+        handle.abort();
+    }
+}
+
+/// Issue #11197: telemetry disabled ⇒ no `daemon.start` — the `enabled:
+/// false` path returns before any queue exists, so the queue file is never
+/// even created.
+#[tokio::test]
+#[serial]
+async fn spawn_task_disabled_emits_no_daemon_start() {
+    clear_env();
+    let bus = EventBus::new();
+    let dir = tempdir().unwrap();
+    let config = ObservabilityConfig::default();
+    let handles =
+        spawn_task(&config, dir.path().to_path_buf(), &bus, Instant::now(), test_workspace_pool());
+    assert!(handles.is_none());
+    assert!(
+        !dir.path()
+            .join(".loom")
+            .join("logs")
+            .join("observability-queue.jsonl")
+            .exists(),
+        "no exporter came up, so no queue file — and no daemon.start in it"
+    );
+}
+
 #[cfg(feature = "otlp")]
 #[tokio::test]
 #[serial]

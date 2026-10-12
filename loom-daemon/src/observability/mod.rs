@@ -110,6 +110,7 @@ pub mod claude_code_telemetry;
 pub mod collector;
 pub mod cycle_guard;
 pub mod daemon_event;
+pub mod daemon_lifecycle;
 pub mod endpoint_policy;
 pub mod exporter;
 pub mod fleet_state;
@@ -1341,6 +1342,12 @@ pub fn spawn_task(
     if let Some(sink) = queue_snapshot::sink_for_native_queues(native_queues, &host_id) {
         queue_snapshot::register_global_sink(sink);
     }
+    // `daemon.start` (#11197): exactly one lifecycle record per process,
+    // offered once the exporters are up — every disabled/under-configured
+    // path above returned before a queue existed, so telemetry-off emits
+    // nothing. Rides the fan-out like any other producer; see
+    // `daemon_lifecycle`'s module doc for the naming contract with #10065.
+    daemon_lifecycle::emit_start(fanout.as_ref(), &host_id);
     // `daemon.event` collection (Issue #8760, G4): a second, independent bus
     // subscription alongside `collector::spawn_task` below — see
     // `daemon_event`'s module doc for why it is a separate subscriber rather
