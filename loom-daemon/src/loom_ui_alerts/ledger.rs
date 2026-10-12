@@ -23,6 +23,8 @@ use super::{Alert, Severity, State};
 
 /// Directory under `<loom_dir>` the ledgers live in.
 pub const DIR: &str = "loom-ui-alerts";
+/// Overrides the whole ledger directory (tests that run the production paths).
+pub const DIR_ENV: &str = "LOOM_LOOM_UI_ALERTS_LEDGER_DIR";
 
 /// One open incident, as persisted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,10 +64,34 @@ fn loom_dir() -> Option<PathBuf> {
 /// tests: those drive [`Ledger::at`] with their own path.
 #[must_use]
 pub fn path_for(scope: &str) -> Option<PathBuf> {
+    let file = format!("{scope}.json");
+    if let Some(dir) = std::env::var_os(DIR_ENV).filter(|d| !d.is_empty()) {
+        return Some(PathBuf::from(dir).join(file));
+    }
     if cfg!(test) {
         return None;
     }
-    loom_dir().map(|d| d.join(DIR).join(format!("{scope}.json")))
+    ledger_dir().map(|d| d.join(file))
+}
+
+fn ledger_dir() -> Option<PathBuf> {
+    loom_dir().map(|d| d.join(DIR))
+}
+
+/// The output is off: nothing recorded can be delivered, so forget it all.
+/// A ledger file written before [`super::start`] decided (the credential
+/// preflight, the fleet-sync startup pass) would otherwise record an `open`
+/// loom-ui never got, and a later process with the output on would never post
+/// it. Turning the output off thus also forgets what an earlier process had
+/// open; loom-ui keeps those until they are resolved there.
+pub fn forget_all() {
+    let dir = std::env::var_os(DIR_ENV)
+        .filter(|d| !d.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| (!cfg!(test)).then(ledger_dir).flatten());
+    if let Some(dir) = dir {
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 impl Ledger {
@@ -304,6 +330,8 @@ mod tests {
 
     #[test]
     fn production_paths_are_never_real_files_in_tests() {
-        assert_eq!(path_for("x"), None);
+        if std::env::var_os(DIR_ENV).is_none() {
+            assert_eq!(path_for("x"), None);
+        }
     }
 }

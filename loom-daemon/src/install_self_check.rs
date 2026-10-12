@@ -1300,8 +1300,9 @@ pub fn spawn_multi_install_self_check_task(
                         &RepairContext::default(),
                         &reporter,
                     );
-                    // A repair may have fixed it: what stands is a re-check.
-                    let report = if repair_mode {
+                    // A repair may have fixed a violation: what stands is a
+                    // re-check, run only when there was one to repair.
+                    let report = if repair_mode && !report.is_all_ok() {
                         run_checks(&root_for_task, check_opts)
                     } else {
                         report

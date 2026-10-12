@@ -739,15 +739,12 @@ fn classify(
     let answered = matches!(asked, Asked::Forge { .. } | Asked::Remote(Ok(_)));
     match classify_head(env, root, gate, memory, scan, asked, &mut report) {
         Ok(found) => {
-            // #11295: a repo the forge refused that now answers is no longer
-            // refused; its `repo-access` run (and incident) ends here.
-            if answered
-                && memory
-                    .backoff
-                    .get(root)
-                    .is_some_and(|b| b.kind == FailureKind::Refused)
-            {
-                memory.backoff.remove(root);
+            // #11295: a repo the forge refused that answers again and needs
+            // no resync is no longer refused, so its `repo-access` run ends.
+            // One that goes on to W2 is judged by W2's own fetch: git may
+            // still be refused where the forge's query is not.
+            if answered && found.is_none() {
+                memory.clear_refused(root);
             }
             (report, found.map(|(branch, commit)| (nwo, branch, commit)))
         }

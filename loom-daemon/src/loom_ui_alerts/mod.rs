@@ -532,6 +532,7 @@ pub fn start(root: &Path) -> Option<tokio::task::JoinHandle<()>> {
     let off = |why: String| {
         log::info!("loom_ui_alerts: off — {why}");
         STATE.store(OFF, Ordering::Release);
+        ledger::forget_all();
         global()
             .outbox
             .lock()

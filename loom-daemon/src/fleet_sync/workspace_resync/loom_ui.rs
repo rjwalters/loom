@@ -4,22 +4,27 @@
 //! | Rule | Key | Open while | Resolved by |
 //! |---|---|---|---|
 //! | `resync.failure` | the repo | [`ALERT_AFTER`] or more failures in a row | a resync, or the repo reaching W0 |
-//! | `resync.repo-access` | the repo | [`ALERT_AFTER`] or more refusals in a row | the forge answering for it again |
+//! | `resync.repo-access` | the repo | [`ALERT_AFTER`] or more refusals in a row | the repo read again (and needing no resync), or a resync |
 //! | `resync.branch-protection` | the repo | a protection rule refused the push | a later resync, or W0 |
 //! | `resync.network` | `workspaces` | the outage alert stands | every remote answering again |
 //! | `resync.head-query` | `workspaces` | the head-query alert stands | a pass whose query works |
 //! | `resync.pass-stuck` | `workspaces` | a pass has run for [`super::STUCK_AFTER_TICKS`] ticks | the next pass that finishes |
 //!
 //! Read from the pass memory after every finished pass (level, not edge), and
-//! kept in a [`Ledger`], so a restarted daemon resolves what the previous one
-//! left open once its first pass finds the repo healthy or unregistered.
+//! kept in a [`Ledger`]. The failure counts are process memory, so a restarted
+//! daemon starts each one again from zero: an incident the ledger holds stays
+//! open while its condition is still counting (any failure of that kind on
+//! the repo, a failing pass of the host-level kind) or the repo could not be
+//! classified this pass, and resolves only on a pass that shows it healthy, or
+//! once the repo is unregistered. So a roll never resolves and re-opens a
+//! standing incident.
 //! `resync-loop` is not sent: it is a one-off refusal per version, reported on
 //! the event bus, with no recovery edge to resolve it by.
 
 use std::sync::{Mutex, OnceLock};
 
 use super::memory::FailureKind;
-use super::{Memory, WorkspacePass, ALERT_AFTER};
+use super::{Memory, WState, WorkspacePass, ALERT_AFTER};
 use crate::loom_ui_alerts::ledger::Ledger;
 use crate::loom_ui_alerts::{Alert, Severity, State};
 
@@ -36,24 +41,47 @@ fn alert(kind: &str, key: &str, title: String, detail: String) -> Alert {
         .with_detail(detail)
 }
 
-/// What stands after `pass`, read from `memory`.
+/// What stands after `pass`, read from `memory`. `held` says whether the
+/// ledger has `(rule, key)` open already: such an incident needs only a
+/// failure still counting, not the alert threshold.
 #[must_use]
-pub(super) fn alerts(memory: &Memory, pass: &WorkspacePass) -> Vec<Alert> {
+pub(super) fn alerts(
+    memory: &Memory,
+    pass: &WorkspacePass,
+    held: &dyn Fn(&str, &str) -> bool,
+) -> Vec<Alert> {
     let mut out = Vec::new();
     for report in &pass.workspaces {
-        let Some(b) = memory.backoff.get(&report.root) else {
-            continue;
-        };
-        let kind = match b.kind {
-            FailureKind::Protected => "branch-protection",
-            FailureKind::Refused if b.failures >= ALERT_AFTER => "repo-access",
-            FailureKind::Other if b.failures >= ALERT_AFTER => "failure",
-            _ => continue,
-        };
         let key = report
             .repo
             .clone()
             .unwrap_or_else(|| report.root.display().to_string());
+        let Some(b) = memory.backoff.get(&report.root) else {
+            if report.state == WState::Unknown {
+                // Not classified this pass: no evidence either way.
+                for kind in ["failure", "repo-access", "branch-protection"] {
+                    if held(&format!("resync.{kind}"), &key) {
+                        out.push(alert(
+                            kind,
+                            &key,
+                            format!("Loom resync of {key} is failing ({kind})"),
+                            "Not checked again yet.".to_string(),
+                        ));
+                    }
+                }
+            }
+            continue;
+        };
+        let kind = match b.kind {
+            FailureKind::Protected => "branch-protection",
+            FailureKind::Refused => "repo-access",
+            FailureKind::Other => "failure",
+            FailureKind::Unreachable => continue,
+        };
+        let protected = b.kind == FailureKind::Protected;
+        if !(protected || b.failures >= ALERT_AFTER || held(&format!("resync.{kind}"), &key)) {
+            continue;
+        }
         out.push(alert(
             kind,
             &key,
@@ -66,8 +94,8 @@ pub(super) fn alerts(memory: &Memory, pass: &WorkspacePass) -> Vec<Alert> {
             ),
         ));
     }
-    let (network, head_query) = memory.host_alerts_standing();
-    if network {
+    let ((network, outage), (head_query, query_failing)) = memory.host_conditions();
+    if network || (outage && held("resync.network", HOST_KEY)) {
         out.push(alert(
             "network",
             HOST_KEY,
@@ -76,7 +104,7 @@ pub(super) fn alerts(memory: &Memory, pass: &WorkspacePass) -> Vec<Alert> {
                 .to_string(),
         ));
     }
-    if head_query {
+    if head_query || (query_failing && held("resync.head-query", HOST_KEY)) {
         out.push(alert(
             "head-query",
             HOST_KEY,
@@ -87,13 +115,21 @@ pub(super) fn alerts(memory: &Memory, pass: &WorkspacePass) -> Vec<Alert> {
     out
 }
 
+/// Fold `pass` into `ledger`.
+pub(super) fn fold(ledger: &mut Ledger, memory: &Memory, pass: &WorkspacePass) {
+    let current = alerts(memory, pass, &|rule, key| ledger.is_open(rule, key));
+    ledger.reconcile(current);
+}
+
 /// Fold a finished pass in. A pass finished, so none is stuck.
 pub(super) fn after_pass(memory: &Memory, pass: &WorkspacePass) {
-    let current = alerts(memory, pass);
-    ledger()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .reconcile(current);
+    fold(
+        &mut ledger()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        memory,
+        pass,
+    );
 }
 
 /// A pass has not ended for `ticks` ticks.
@@ -113,7 +149,7 @@ pub(super) fn stuck(ticks: u32, detail: &str) {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::super::memory::Backoff;
-    use super::super::{report_for, WState};
+    use super::super::report_for;
     use super::*;
     use std::path::PathBuf;
 
@@ -140,7 +176,7 @@ mod tests {
     }
 
     fn rules(memory: &Memory, pass: &WorkspacePass) -> Vec<(String, String)> {
-        alerts(memory, pass)
+        alerts(memory, pass, &|_, _| false)
             .into_iter()
             .map(|a| (a.rule, a.key))
             .collect()
@@ -193,9 +229,67 @@ mod tests {
         let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
         let sink = seen.clone();
         let mut l = Ledger::at(None, move |a: Alert| sink.lock().unwrap().push(a.state));
-        l.reconcile(alerts(&memory, &pass));
+        fold(&mut l, &memory, &pass);
+        // Unclassified this pass (state unknown): no evidence, still open.
         memory.backoff.clear();
-        l.reconcile(alerts(&memory, &pass));
+        fold(&mut l, &memory, &pass);
+        assert_eq!(*seen.lock().unwrap(), [State::Open]);
+        // Classified healthy: resolved.
+        let mut healthy = pass.clone();
+        healthy.workspaces[0].state = WState::W0;
+        fold(&mut l, &memory, &healthy);
         assert_eq!(*seen.lock().unwrap(), [State::Open, State::Resolved]);
+    }
+
+    /// The counts are process memory: after a restart a repo still refused,
+    /// and an outage still going, count from one again. What the previous
+    /// process opened must stay open through that, not resolve and re-open.
+    #[test]
+    fn incidents_inherited_from_a_restart_stay_open_while_still_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workspace_resync.json");
+        let pass = pass_with("/w/a", Some("o/a"));
+        let now = chrono::Utc::now();
+        {
+            let mut memory = Memory::default();
+            memory
+                .backoff
+                .insert("/w/a".into(), backoff(FailureKind::Refused, ALERT_AFTER));
+            for _ in 0..ALERT_AFTER {
+                memory.note_network(1, 1, Some("timeout"), std::time::Duration::from_secs(60), now);
+            }
+            let mut l = Ledger::at(Some(path.clone()), |_| {});
+            fold(&mut l, &memory, &pass);
+            assert_eq!(l.open_incidents().len(), 2, "{l:?}");
+        }
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let mut l = Ledger::at(Some(path), move |a: Alert| {
+            sink.lock().unwrap().push((a.rule, a.state));
+        });
+        // The new process: one refusal, one failing pass so far.
+        let mut memory = Memory::default();
+        memory
+            .backoff
+            .insert("/w/a".into(), backoff(FailureKind::Refused, 1));
+        memory.note_network(1, 1, Some("timeout"), std::time::Duration::from_secs(60), now);
+        fold(&mut l, &memory, &pass);
+        assert!(seen.lock().unwrap().is_empty(), "nothing flaps");
+        // Recovery: the repo reads again and every remote answers.
+        memory.backoff.clear();
+        memory.down.clear();
+        memory.note_network(2, 0, None, std::time::Duration::from_secs(60), now);
+        let mut healthy = pass.clone();
+        healthy.workspaces[0].state = WState::W0;
+        fold(&mut l, &memory, &healthy);
+        let mut got = seen.lock().unwrap().clone();
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            got,
+            [
+                ("resync.network".to_string(), State::Resolved),
+                ("resync.repo-access".to_string(), State::Resolved)
+            ]
+        );
     }
 }

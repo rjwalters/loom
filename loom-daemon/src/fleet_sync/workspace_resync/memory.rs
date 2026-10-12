@@ -281,10 +281,25 @@ impl Memory {
             .collect()
     }
 
-    /// The host-level conditions alerted and still standing (#11295): the
-    /// network outage and the failing head query.
-    pub(super) fn host_alerts_standing(&self) -> (bool, bool) {
-        (self.outage.alerted, self.head_query.1)
+    /// The host-level conditions (#11295), as `(alerted, building)` for the
+    /// network outage and then the failing head query: `alerted` once its
+    /// alert was raised, `building` while any failing pass is counted.
+    pub(super) fn host_conditions(&self) -> ((bool, bool), (bool, bool)) {
+        (
+            (self.outage.alerted, self.outage.streak > 0),
+            (self.head_query.1, self.head_query.0 > 0),
+        )
+    }
+
+    /// End a `Refused` backoff on `root`: git or the forge read it again.
+    pub(super) fn clear_refused(&mut self, root: &Path) {
+        if self
+            .backoff
+            .get(root)
+            .is_some_and(|b| b.kind == FailureKind::Refused)
+        {
+            self.backoff.remove(root);
+        }
     }
 
     /// Is the host staying off the network after an outage?

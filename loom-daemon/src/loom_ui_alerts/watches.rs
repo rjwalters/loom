@@ -6,7 +6,8 @@
 //!   off for over [`BREAKER_SUSTAIN`] (sampled every minute, so a release and
 //!   immediate re-trip between two samples is one episode);
 //! - `llm-monitor.stale`: llm-monitor's `ranking.json` is older than
-//!   [`crate::tokens_pool::monitor_stale::STALE_AFTER_SECS`];
+//!   [`crate::tokens_pool::monitor_stale::STALE_AFTER_SECS`] (or unreadable)
+//!   on two reads in a row;
 //! - the start-time checks of `version.pause-failed` /
 //!   `version.config-rejected` ([`crate::auto_update::pause_roll::loom_ui`]);
 //! - resolving `install.*` left open by an earlier process when the install
@@ -21,6 +22,8 @@ use super::{Alert, Severity, State};
 pub const BREAKER_SUSTAIN: Duration = Duration::from_secs(15 * 60);
 /// Rule for a long breaker cooldown.
 pub const RULE_BREAKER: &str = "forge.ratelimit-breaker";
+/// How often `ranking.json` is read.
+pub const LLM_MONITOR_SAMPLE: Duration = Duration::from_secs(5 * 60);
 /// Rule for a stale `ranking.json`.
 pub const RULE_LLM_MONITOR_STALE: &str = "llm-monitor.stale";
 
@@ -84,8 +87,9 @@ pub fn spawn_all(root: &Path) {
         breaker_alert,
     );
     super::sustain::spawn_watch(
-        Duration::from_secs(5 * 60),
-        Duration::ZERO,
+        LLM_MONITOR_SAMPLE,
+        // Two bad reads in a row: one torn read mid-rewrite is not an alert.
+        LLM_MONITOR_SAMPLE,
         || {
             crate::tokens_pool::monitor_stale::check(
                 &crate::tokens_pool::monitor_dir::claude_monitor_dir(),
