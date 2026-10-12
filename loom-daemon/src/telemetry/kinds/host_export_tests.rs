@@ -42,6 +42,7 @@ fn forced_overflow_increments_dropped_total_and_appears_in_the_record() {
         QueueStats {
             depth: queue.len() as u64,
             dropped_total: queue.dropped_total(),
+            dropped_by_reason: queue.dropped_by_reason(),
         },
     )]);
     let record = HostExportRecord::build("host-a", Utc::now(), &statuses, &stats);
@@ -49,6 +50,11 @@ fn forced_overflow_increments_dropped_total_and_appears_in_the_record() {
     assert_eq!(record.exporters[0].name, "otlp");
     assert_eq!(record.exporters[0].queue_depth, 2);
     assert_eq!(record.exporters[0].dropped_total, 3);
+    assert_eq!(
+        record.exporters[0].dropped_by_reason,
+        BTreeMap::from([("queue_overflow".to_string(), 3)]),
+        "dropped_total = the sum over dropped_by_reason"
+    );
     assert!(record.exporters[0].last_flush_ok_at.is_some());
 
     // A further overflow increments again, cumulatively.
@@ -65,6 +71,7 @@ fn record_round_trips_and_omits_unknown_flush_time() {
             name: "https".to_string(),
             queue_depth: 1,
             dropped_total: 0,
+            dropped_by_reason: BTreeMap::new(),
             last_flush_ok_at: None,
         }],
         fact_id_missing_total: 0,
@@ -73,8 +80,43 @@ fn record_round_trips_and_omits_unknown_flush_time() {
     let json = serde_json::to_string(&wrapped).unwrap();
     assert!(json.contains(r#""kind":"host.export""#), "{json}");
     assert!(!json.contains("last_flush_ok_at"), "{json}");
+    assert!(!json.contains("dropped_by_reason"), "{json}");
     let decoded: TelemetryRecord = serde_json::from_str(&json).unwrap();
     assert_eq!(decoded, wrapped);
+}
+
+#[test]
+fn build_carries_dropped_by_reason_and_the_body_round_trips() {
+    let record = HostExportRecord {
+        captured_at: Utc::now(),
+        host: "h".to_string(),
+        exporters: vec![ExporterExport {
+            name: "otlp".to_string(),
+            queue_depth: 4,
+            dropped_total: 6,
+            dropped_by_reason: BTreeMap::from([
+                ("status_400".to_string(), 2),
+                ("queue_overflow".to_string(), 4),
+            ]),
+            last_flush_ok_at: None,
+        }],
+        fact_id_missing_total: 0,
+    };
+    let json = serde_json::to_string(&record).unwrap();
+    assert!(
+        json.contains(r#""dropped_by_reason":{"queue_overflow":4,"status_400":2}"#),
+        "{json}"
+    );
+    let decoded: HostExportRecord = serde_json::from_str(&json).unwrap();
+    assert_eq!(decoded, record);
+}
+
+#[test]
+fn a_body_from_before_the_by_reason_map_still_parses() {
+    let old = r#"{"captured_at":"2026-10-08T12:00:00Z","host":"h","exporters":[{"name":"https","queue_depth":1,"dropped_total":2}]}"#;
+    let record: HostExportRecord = serde_json::from_str(old).unwrap();
+    assert_eq!(record.exporters[0].dropped_total, 2);
+    assert!(record.exporters[0].dropped_by_reason.is_empty());
 }
 
 #[test]

@@ -2,10 +2,14 @@
 -- R2 of #10196), from the `host.export` log the daemon emits once per
 -- `host.health` interval. Facts only: the daemon computes no rate.
 --
--- `loom.host_export.dropped_total` is cumulative per daemon process, so it
--- restarts at 0 when a daemon restarts. A window's drops are therefore summed
--- as positive steps between consecutive samples; a decrease is a counter reset
--- and contributes the post-reset value, never a negative delta.
+-- `loom.host_export.dropped_total` is a durable per-exporter sum over loss
+-- reasons (Issue #11527): the daemon backs it with an on-disk loss ledger
+-- (observability-queue[.<name>].loss.json), so it survives daemon restarts
+-- instead of resetting to 0. A decrease is therefore no longer an expected
+-- counter reset — only a removed or reset ledger file produces one — but the
+-- query keeps the reset-defensive read below (a decrease contributes the
+-- post-reset value, never a negative delta), which stays correct for either
+-- shape.
 --
 -- STATUS: queries 1-3 are executed verbatim against the pinned ClickHouse by
 -- loom-daemon/tests/signoz_host_export_queries.rs (CI runs it with --ignored).

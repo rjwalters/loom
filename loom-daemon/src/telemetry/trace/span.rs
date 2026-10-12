@@ -94,6 +94,11 @@ pub enum SpanName {
     /// own root trace, counts and classified codes only, never a body.
     #[serde(rename = "loom.egress.request")]
     EgressRequest,
+    /// One `loom:cargo-target-dir` guard deny (Issue #11582): an instant
+    /// span naming the role, the forbidden root and where the value came
+    /// from — never the command or the path.
+    #[serde(rename = "guard.cargo_target_dir.denied")]
+    GuardCargoTargetDirDenied,
 }
 
 impl SpanName {
@@ -122,6 +127,7 @@ impl SpanName {
             Self::ForgeReaderSpill => "forge.reader.spill",
             Self::ForgeReadShed => "forge.read.shed",
             Self::EgressRequest => "loom.egress.request",
+            Self::GuardCargoTargetDirDenied => "guard.cargo_target_dir.denied",
         }
     }
 }

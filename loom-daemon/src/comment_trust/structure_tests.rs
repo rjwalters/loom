@@ -29,6 +29,7 @@ const MARKERS: &[&str] = &[
     "ROSTER_MARKER_PREFIX",
     "loom:stale-check-redate",
     "loom:premise-check",
+    "loom:unnamed-block-review",
     "closedByPullRequestsReferences",
 ];
 
@@ -37,6 +38,10 @@ const MARKER_FILES: &[(&str, &str)] = &[
     (
         "claim_reconciliation.rs",
         "lease, claim-activity, stand-down readers (FETCH_SITES)",
+    ),
+    (
+        "claim_reconciliation/liveness.rs",
+        "claim-activity + Judge-progress reader (FETCH_SITES, #10235)",
     ),
     (
         "claim_reconciliation/review_conflict.rs",
@@ -73,6 +78,12 @@ const MARKER_FILES: &[(&str, &str)] = &[
         "#10556 hold/idempotency reader: comments from ReleaseForge, trusted via policy.trusts_json",
     ),
     (
+        "stale_blocked/unnamed.rs",
+        "#10558 queue veto: legacy PR-less/quarantine and Curator review markers from \
+         ReleaseForge comments, trusted via policy.trusts_json (permanent-block veto reads any \
+         comment: fail-safe)",
+    ),
+    (
         "sweep_registry/guards.rs",
         "writer; reader in read_lease_comments (FETCH_SITES)",
     ),
@@ -94,9 +105,19 @@ const FETCH_SITES: &[(&str, &str, &str)] = &[
         "TrustPolicy::for_root(root).trusted_records(",
     ),
     (
-        "claim_reconciliation.rs",
-        "fetch_most_recent_claim_activity_at",
+        "claim_reconciliation/liveness.rs",
+        "fetch_trusted_comments_since",
         "TrustPolicy::for_root(root).trusted_records(",
+    ),
+    (
+        "claim_reconciliation/liveness.rs",
+        "fetch_most_recent_claim_activity_at",
+        "fetch_trusted_comments_since(",
+    ),
+    (
+        "claim_reconciliation/liveness.rs",
+        "fetch_most_recent_judge_activity_at",
+        "fetch_trusted_comments_since(",
     ),
     (
         "claim_reconciliation.rs",

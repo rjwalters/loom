@@ -78,6 +78,8 @@ fn command(root: &Path, config: &[&str], args: &[&str]) -> Command {
         .args(args)
         .stdin(Stdio::null())
         .env("GIT_TERMINAL_PROMPT", "0")
+        // Loom's own ref moves are not external changes (#11566).
+        .env("GIT_REFLOG_ACTION", super::external_change::tag("ff"))
         // Refusals are read from stderr below, so the wording must be git's own.
         .env("LC_ALL", "C");
     // An inherited repository override would aim every command at some other

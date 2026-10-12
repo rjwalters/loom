@@ -233,6 +233,13 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     // out of quarantine stashes.
     ".loom/target*/",
     ".cargo-target*/",
+    // Agent-chosen CARGO_TARGET_DIR names outside `.loom/` (#11193): left
+    // unignored, one pins a merged `pr-<N>` worktree as dirty. `/target-*/`
+    // is root-anchored so a nested `src/target-x/` source dir is never
+    // ignored. Preventive only: the reaper deletes by content proof, never
+    // because a path is ignored.
+    ".loom-target/",
+    "/target-*/",
     // `.loom/state/` is daemon-written, per-host runtime state, ignored
     // WHOLESALE (#9592). It used to be ignored one subsystem at a time
     // (`ci-telemetry/` #8824, `fleet-captain/` #8901, `eta/` #9544), and each
@@ -1077,6 +1084,47 @@ mod tests {
         );
     }
 
+    /// #11193: agent-chosen cargo target dirs converge into the managed block
+    /// (a user's own rules outside it survive), while `target-*/` stays
+    /// root-anchored so a nested source directory of that shape is not hidden.
+    #[test]
+    fn agent_cargo_target_dirs_are_ignored_and_user_rules_survive() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .expect("run git")
+        };
+        assert!(git(&["init", "-q"]).status.success(), "git init failed");
+        fs::write(root.join(".gitignore"), "my-own-rule/\n").unwrap();
+        update_gitignore(root).unwrap();
+        let ignored = |path: &str| {
+            git(&["check-ignore", "-q", "--no-index", path])
+                .status
+                .success()
+        };
+        for path in [
+            ".loom-target/debug/x",
+            ".loom/target-doctor-10644-pr/debug/x",
+            ".loom/target/debug/x",
+            "target-doctor-10725/debug/x",
+            "target-wt/debug/x",
+            ".cargo-target-doctor-7/debug/x",
+            "my-own-rule/kept",
+        ] {
+            assert!(ignored(path), "{path} must be ignored");
+        }
+        for path in ["src/target-notes/a.rs", "target-notes.md", "src/main.rs"] {
+            assert!(!ignored(path), "{path} must stay visible");
+        }
+    }
+
     #[test]
     fn appends_missing_patterns_to_existing_gitignore() {
         let tmp = TempDir::new().unwrap();
@@ -1196,6 +1244,9 @@ mod tests {
             ".loom/targets/",
             ".loom/target*/",
             ".cargo-target*/",
+            // #11193: agent-chosen cargo target dirs outside `.loom/`.
+            ".loom-target/",
+            "/target-*/",
             ".loom/usage-cache.json",
             ".loom/claude-config/",
             ".loom/native-tools/",

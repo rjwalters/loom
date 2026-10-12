@@ -199,6 +199,10 @@ fn verdict_sha_readers_go_through_the_trust_filter() {
         // Reads: `fetch_comment_bodies` returns trusted bodies only.
         ("claim_reconciliation.rs", "reader via forge::fetch_comment_bodies"),
         (
+            "claim_reconciliation/liveness.rs",
+            "reader via TrustPolicy::trusted_records (#10235)",
+        ),
+        (
             "claim_reconciliation/review_conflict.rs",
             "reader via forge::fetch_comment_bodies",
         ),
@@ -224,6 +228,8 @@ fn verdict_sha_readers_go_through_the_trust_filter() {
         ("claim_reconciliation/verdict_dedup_tests.rs", "test"),
         ("claim_reconciliation/auto_merge_disarm.rs", "test fixture"),
         ("claim_reconciliation/trusted_comments_tests.rs", "test"),
+        // #10235: in-memory `PrComment` fixtures for the liveness predicate; no forge read.
+        ("claim_reconciliation/liveness_tests.rs", "test fixture"),
         ("claim_reconciliation/read_cache_tests.rs", "test"),
         ("claim_reconciliation/read_cache_passes_tests.rs", "test"),
         ("claim_reconciliation/open_pr_listing_tests.rs", "test"),
