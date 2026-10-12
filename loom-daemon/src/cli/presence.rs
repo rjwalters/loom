@@ -304,6 +304,48 @@ pub(crate) fn on_lease_published(workspace: &str, issue: u64, sweep_id: &str) {
     }
 }
 
+/// Called where an in-session sweep ends: the checkpoint delete after a merge
+/// (`success`, with the checkpoint's PR), `lease renewer release` while the
+/// sweep is still driven (`failure`), and the renewal loop's issue-closed stop
+/// (`success`). Opt-in like [`on_lease_published`] and fail-open: journals
+/// `sweep.outcome` only for a lease this host recorded with `sweep.started`,
+/// so whichever signal comes first wins and the rest are no-ops.
+pub(crate) fn on_sweep_finished(
+    workspace: &str,
+    issue: u64,
+    result: SweepResult,
+    pr_number: Option<u32>,
+) {
+    let enabled = std::env::var(ENABLE_ENV).ok().as_deref() == Some("1");
+    finish_if(enabled, workspace, issue, result, pr_number);
+}
+
+/// [`on_sweep_finished`] with the opt-in read already made (testable seam).
+fn finish_if(
+    enabled: bool,
+    workspace: &str,
+    issue: u64,
+    result: SweepResult,
+    pr_number: Option<u32>,
+) {
+    if !enabled {
+        return;
+    }
+    let Ok(number) = u32::try_from(issue) else {
+        return;
+    };
+    let common = CommonArgs {
+        workspace: workspace.to_string(),
+        session_id: None,
+        operator: None,
+    };
+    let result =
+        ctx(&common, None).and_then(|ctx| beat::finish_driven(&ctx, number, result, pr_number));
+    if let Err(e) = result {
+        report_failure(workspace, &format!("sweep.outcome not journaled: {e:#}"));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,5 +363,68 @@ mod tests {
         let (count, last) = journal::error_summary(&journal::default_journal_path(&root));
         assert_eq!(count, 1);
         assert!(last.unwrap().contains("No space left on device"));
+    }
+
+    fn workspace_with_driven_lease(issue: u32) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".loom")).unwrap();
+        let root = loom_daemon::repo_root::resolve_repo_root(dir.path().to_str().unwrap()).unwrap();
+        let ctx = Ctx {
+            journal: journal::default_journal_path(&root),
+            root: root.clone(),
+            session_id: "sess-1".into(),
+            host: "host-a".into(),
+            operator: None,
+            now: Utc::now(),
+        };
+        beat::sweep_started(&ctx, "rjwalters/loom", "issue", issue, "sweep-issue-5-1").unwrap();
+        (dir, root)
+    }
+
+    fn outcomes(root: &Path) -> Vec<loom_daemon::telemetry::SweepOutcomeRecord> {
+        journal::read_pending(&journal::default_journal_path(root))
+            .into_iter()
+            .filter_map(|e| match e.record {
+                loom_daemon::telemetry::TelemetryRecord::SweepOutcome(o) => Some(o),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// #11563: the automatic end-of-sweep outcome carries the operator origin
+    /// and the lease id when opted in, and is absent when not.
+    #[test]
+    fn a_sweep_end_journals_the_outcome_only_when_opted_in() {
+        let (dir, root) = workspace_with_driven_lease(5);
+        let ws = dir.path().to_str().unwrap();
+        finish_if(false, ws, 5, SweepResult::Success, Some(8));
+        assert!(outcomes(&root).is_empty(), "opt-in unset must journal nothing");
+        assert_eq!(beat::load_state(&root, "sess-1").driving.len(), 1);
+
+        finish_if(true, ws, 5, SweepResult::Success, Some(8));
+        let got = outcomes(&root);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].sweep_id, "sweep-issue-5-1");
+        assert_eq!(got[0].dispatch_origin.as_deref(), Some("operator"));
+        assert_eq!(got[0].pr_number, Some(8));
+    }
+
+    /// A failed emit never reaches the caller (the checkpoint delete or the
+    /// lease release): it returns normally and leaves a breadcrumb.
+    #[test]
+    fn a_failed_sweep_end_emit_never_fails_the_caller() {
+        let (dir, root) = workspace_with_driven_lease(5);
+        let ws = dir.path().to_str().unwrap();
+        let journal_path = journal::default_journal_path(&root);
+        std::fs::remove_file(&journal_path).unwrap();
+        std::fs::create_dir_all(&journal_path).unwrap(); // appends now fail
+        finish_if(true, ws, 5, SweepResult::Failure, None);
+        let (count, last) = journal::error_summary(&journal_path);
+        assert_eq!(count, 1);
+        assert!(last.unwrap().contains("sweep.outcome not journaled"));
+        // Outside any repository: nothing to write to, still no panic.
+        let outside = tempfile::tempdir().unwrap();
+        finish_if(true, outside.path().to_str().unwrap(), 5, SweepResult::Success, None);
     }
 }

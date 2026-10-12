@@ -318,3 +318,80 @@ fn a_failed_write_leaves_a_durable_breadcrumb() {
     assert_eq!(count, 2);
     assert!(last.unwrap().ends_with("\tlater failure"));
 }
+
+/// Acceptance 2, automatic end: the sweep's own end signal (no explicit
+/// `sweep-outcome` call) journals `sweep.outcome` with the lease id, under the
+/// session that started it, exactly once however many end signals follow.
+#[test]
+fn the_end_of_a_driven_sweep_journals_its_outcome_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = ctx(dir.path(), t0());
+    beat::sweep_started(&c, "rjwalters/loom", "issue", 42, "sweep-issue-42-9").unwrap();
+    // The end signal arrives from a process that knows no session id.
+    let end = Ctx {
+        session_id: beat::UNKNOWN_SESSION.to_string(),
+        now: t0() + Duration::seconds(120),
+        ..c.clone()
+    };
+    let done = beat::finish_driven(&end, 42, SweepResult::Success, Some(77)).unwrap();
+    assert_eq!(done, vec!["sweep-issue-42-9".to_string()]);
+    // The release that follows the merge finds nothing left to finish.
+    assert!(beat::finish_driven(&end, 42, SweepResult::Failure, None)
+        .unwrap()
+        .is_empty());
+
+    let records = read(&c);
+    assert_eq!(records.len(), 2, "one start, one outcome");
+    let TelemetryRecord::SweepOutcome(o) = &records[1].record else {
+        panic!("not an outcome")
+    };
+    assert_eq!(o.sweep_id, "sweep-issue-42-9");
+    assert_eq!(o.dispatch_origin.as_deref(), Some("operator"));
+    assert_eq!(o.result, SweepResult::Success);
+    assert_eq!(o.pr_number, Some(77));
+    assert_eq!(o.repo.as_deref(), Some("rjwalters/loom"));
+    assert_eq!(o.total_duration_sec, 120);
+    assert!(beat::load_state(dir.path(), "sess-1").driving.is_empty());
+}
+
+/// A sweep this host never recorded as started (a daemon-dispatched one, or a
+/// different issue) gets no outcome from an end signal.
+#[test]
+fn an_end_signal_for_an_undriven_issue_journals_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = ctx(dir.path(), t0());
+    assert!(beat::finish_driven(&c, 42, SweepResult::Success, None)
+        .unwrap()
+        .is_empty());
+    beat::sweep_started(&c, "rjwalters/loom", "issue", 41, "sweep-issue-41-1").unwrap();
+    beat::sweep_started(&c, "rjwalters/loom", "pr", 42, "sweep-pr-42-1").unwrap();
+    assert!(beat::finish_driven(&c, 42, SweepResult::Success, None)
+        .unwrap()
+        .is_empty());
+    assert_eq!(read(&c).len(), 2, "only the two starts");
+    assert_eq!(beat::load_state(dir.path(), "sess-1").driving.len(), 2);
+}
+
+/// A lease filed under `unknown` and the same lease under a named session
+/// are one sweep: one outcome, and both copies stop being driven.
+#[test]
+fn an_end_signal_finishes_a_lease_held_under_two_sessions_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let named = ctx(dir.path(), t0());
+    let anon = Ctx {
+        session_id: beat::UNKNOWN_SESSION.to_string(),
+        ..named.clone()
+    };
+    beat::sweep_started(&anon, "rjwalters/loom", "issue", 9, "sweep-issue-9-1").unwrap();
+    beat::sweep_started(&named, "rjwalters/loom", "issue", 9, "sweep-issue-9-1").unwrap();
+    let done = beat::finish_driven(&anon, 9, SweepResult::Failure, None).unwrap();
+    assert_eq!(done.len(), 1);
+    let outcomes = read(&named)
+        .into_iter()
+        .filter(|e| matches!(e.record, TelemetryRecord::SweepOutcome(_)))
+        .count();
+    assert_eq!(outcomes, 1);
+    for session in ["sess-1", beat::UNKNOWN_SESSION] {
+        assert!(beat::load_state(dir.path(), session).driving.is_empty(), "{session}");
+    }
+}

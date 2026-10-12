@@ -3200,7 +3200,15 @@ only when the operator provisions with `LOOM_OPERATOR_PRESENCE=1`
 journal `sweep.started` / `sweep.outcome` with `loom.dispatch_origin=operator`
 and the `sweep_id` that appears in the in-session lease comment. With
 `LOOM_OPERATOR_PRESENCE=1`, `lease ensure` calls `sweep-start` itself once the
-lease is publishing; `sweep-outcome` is an explicit call at the sweep's end.
+lease is publishing, and the sweep's own end emits `sweep.outcome` with no
+extra step: `sweep-checkpoint.sh delete` (the merge's terminal step, or an
+issue found closed) reports `success` with the checkpoint's PR; the renewal
+loop stopping on a closed issue reports `success`; `sweep-lease-renew.sh
+release` while the sweep is still driven reports `failure` (it ended without
+landing). Only a lease this host journaled `sweep.started` for is finished,
+once: the first end signal wins and later ones are no-ops, so a
+daemon-dispatched sweep never gets one. `sweep-outcome` stays available as an
+explicit call.
 
 **Transport and journal.** Until the transport of #11525 exists, every fact is
 appended to `.loom/logs/operator-presence.jsonl` (override
