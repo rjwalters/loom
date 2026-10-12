@@ -61,7 +61,6 @@ pub enum StatusSection {
     Capacity,
     MainHealthGate,
     WorkFinder,
-    OperatorPriorityLanding,
     RoleRunner,
     CredentialPreflight,
     Drain,
@@ -147,9 +146,6 @@ impl StatusSection {
             S::Capacity => ("capacity", &["capacity"]),
             S::MainHealthGate => ("main_health_gate", &["main_health_gate"]),
             S::WorkFinder => ("work_finder", &["work_finder"]),
-            S::OperatorPriorityLanding => {
-                ("operator_priority_landing", &["operator_priority_landing"])
-            }
             S::RoleRunner => {
                 ("role_runner", &["role_runner_host_env_override", "role_runner_shard"])
             }

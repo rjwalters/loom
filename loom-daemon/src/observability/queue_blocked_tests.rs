@@ -203,8 +203,8 @@ fn loom_repo_does_not_redirect_the_captains_listing() {
         &gh,
         checkout.path(),
         Some("acme/app"),
-        "loom:operator-priority",
-        "star_liveness",
+        "loom:blocked",
+        "queue_blocked",
     );
     std::env::remove_var("LOOM_REPO");
     result.unwrap();
