@@ -18,8 +18,9 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 
+use crate::fleet_sync::git_spawn_log::{memory_config_for, run_logged};
 use crate::install_compat::INSTALL_METADATA_PATH;
-use crate::proc_exec::{run_bounded, Completion};
+use crate::proc_exec::Completion;
 
 /// Local plumbing: no network, small output.
 const QUICK: Duration = Duration::from_secs(20);
@@ -128,18 +129,28 @@ pub(super) enum Push {
     Protected(String),
 }
 
-/// Run `git` in `dir` to an exit. `root` is the registered workspace, which
-/// decides the forge credential the child gets (the same one a sweep child in
-/// that repo gets). `Err` only for a spawn failure or a timeout.
-fn run(dir: &Path, root: &Path, args: &[&str], timeout: Duration) -> Result<Output> {
+/// The `git` command [`run`] spawns, before credentials: `fetch` carries the
+/// memory bound (#11059).
+fn command(dir: &Path, args: &[&str]) -> Command {
     let mut cmd = Command::new("git");
+    for pair in memory_config_for(args.first().copied().unwrap_or_default()) {
+        cmd.arg("-c").arg(pair);
+    }
     cmd.arg("-C")
         .arg(dir)
         .args(args)
         .stdin(Stdio::null())
         .env("GIT_TERMINAL_PROMPT", "0");
+    cmd
+}
+
+/// Run `git` in `dir` to an exit. `root` is the registered workspace, which
+/// decides the forge credential the child gets (the same one a sweep child in
+/// that repo gets). `Err` only for a spawn failure or a timeout.
+fn run(dir: &Path, root: &Path, args: &[&str], timeout: Duration) -> Result<Output> {
+    let mut cmd = command(dir, args);
     crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-    match run_bounded(cmd, timeout) {
+    match run_logged("workspace_resync", root, cmd, timeout) {
         Ok(Completion::Exited(out)) => Ok(out),
         Ok(Completion::TimedOut { .. }) => {
             bail!("git {} timed out after {}s", args.join(" "), timeout.as_secs())
@@ -648,5 +659,27 @@ mod resync_subject_parity_tests {
             assert!(!routine.is_match(&other), "{other:?} must NOT be routine");
         }
         assert!(prefix.is_match(&subject), "the real subject carries the routine prefix");
+    }
+}
+
+#[cfg(test)]
+mod memory_bound_tests {
+    use super::*;
+    use crate::fleet_sync::git_spawn_log::MEMORY_BOUND_CONFIG;
+
+    fn argv(cmd: &Command) -> Vec<String> {
+        crate::fleet_sync::git_spawn_log::argv_of(cmd)
+    }
+
+    #[test]
+    fn fetch_carries_the_memory_bound_and_reads_do_not() {
+        let fetch = argv(&command(Path::new("/r"), &["fetch", "origin"]));
+        for pair in MEMORY_BOUND_CONFIG {
+            let at = fetch.iter().position(|a| a == pair).expect(pair);
+            assert_eq!(fetch[at - 1], "-c");
+            assert!(at < fetch.iter().position(|a| a == "fetch").unwrap());
+        }
+        let read = argv(&command(Path::new("/r"), &["rev-parse", "HEAD"]));
+        assert!(!read.iter().any(|a| a.starts_with("pack.")));
     }
 }

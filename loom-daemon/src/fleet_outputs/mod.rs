@@ -156,15 +156,29 @@ pub const SINGLETON_OUTPUTS: &[SingletonOutput] = &[
         "captain-gauges/v1:queue-blocked",
         &[gauges::ENABLED_KEY, gauges::QUEUE_BLOCKED_KEY],
     ),
+    // Intake reconcile (#10924): the captain's pass over the registered repos
+    // runs on the built-in default cadence (300 s) whether or not anything
+    // was labelled — the LOOM_INTAKE_RECONCILE_INTERVAL_SECS override does
+    // not move this row's deadline — so its durable output is the
+    // completed-pass heartbeat (`PassHeartbeat`, on the captain). A pass that
+    // is stopped early by the breaker, or shed or failed a listing, keeps the
+    // previous stamp: only a completed scan counts as output. Critical, not
+    // Warning: the pass runs on a fixed cadence, quiet or not, so absence is
+    // never a legal quiet spell.
+    job(
+        crate::intake_reconcile::singleton::SINGLETON_JOB_NAME,
+        crate::intake_reconcile::singleton::PASS_HEARTBEAT_KIND,
+        Scope::FleetWide,
+        Duration::from_secs(crate::intake_reconcile::DEFAULT_INTERVAL_SECS),
+        &[crate::intake_reconcile::singleton::SINGLETON_KEY],
+    ),
 ];
 
-/// Singleton job names deliberately absent from [`SINGLETON_OUTPUTS`], each with
-/// a reason.
-pub const EXEMPT: &[(&str, &str)] = &[(
-    crate::intake_reconcile::singleton::SINGLETON_JOB_NAME,
-    "emits no record kind yet: its output is forge labels, and a pass that finds nothing to \
-         label is healthy; needs a pass heartbeat before it can be watched (#10916 follow-up)",
-)];
+/// Singleton job names deliberately absent from [`SINGLETON_OUTPUTS`], each
+/// with a reason. Empty since #10924 registered `intake-reconcile` with a
+/// completed-pass heartbeat: every named singleton job now owes a record
+/// kind. Add a row here only with a reason a future reader can re-check.
+pub const EXEMPT: &[(&str, &str)] = &[];
 
 /// Read access to when outputs were last observed (fleet store / local queue
 /// in production, a fake in tests).

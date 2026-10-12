@@ -39,6 +39,10 @@ const MARKER_FILES: &[(&str, &str)] = &[
         "lease, claim-activity, stand-down readers (FETCH_SITES)",
     ),
     (
+        "claim_reconciliation/liveness.rs",
+        "claim-activity + Judge-progress reader (FETCH_SITES, #10235)",
+    ),
+    (
         "claim_reconciliation/review_conflict.rs",
         "writer; reader via fetch_comment_bodies",
     ),
@@ -94,9 +98,19 @@ const FETCH_SITES: &[(&str, &str, &str)] = &[
         "TrustPolicy::for_root(root).trusted_records(",
     ),
     (
-        "claim_reconciliation.rs",
-        "fetch_most_recent_claim_activity_at",
+        "claim_reconciliation/liveness.rs",
+        "fetch_trusted_comments_since",
         "TrustPolicy::for_root(root).trusted_records(",
+    ),
+    (
+        "claim_reconciliation/liveness.rs",
+        "fetch_most_recent_claim_activity_at",
+        "fetch_trusted_comments_since(",
+    ),
+    (
+        "claim_reconciliation/liveness.rs",
+        "fetch_most_recent_judge_activity_at",
+        "fetch_trusted_comments_since(",
     ),
     (
         "claim_reconciliation.rs",

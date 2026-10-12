@@ -7565,6 +7565,7 @@ let one of them be read as the sentinel:
 | `LOOM-CHECKS-TIMEOUT <sha> <pending>` | 2 | the deadline passed with checks pending — including zero rows while required contexts exist (never `NONE`) |
 | `LOOM-CHECKS-ERROR <reason>` | 3 | unreadable or truncated rollup, a classified refusal (see below) or 404, repeated read failures, a required-context lookup still failing after 3 attempts when the wait would otherwise settle (`required-lookup-failed: …`), or Gitea |
 | `LOOM-CHECKS-HEAD-MOVED <old> <new>` | 4 | PR mode: the head changed mid-wait, so no verdict for `<old>` applies to `<new>` |
+| `LOOM-CHECKS-NO-RUN <sha>` | 5 | #11389: after a grace period (`LOOM_WAIT_CHECKS_NO_RUN_GRACE`, default 120s), with nothing observed still running, the head has zero `github-actions` check suites — no workflow run exists, usually because of a skip-CI marker in the head commit message (stderr hint). A queued Actions suite is a run: the wait continues. A failed suite lookup falls back to `TIMEOUT` |
 
 `--timeout 0` is one snapshot poll. Default mode settles on every observed check,
 and before `GREEN` also waits for a required context that has not registered yet
@@ -8364,9 +8365,9 @@ pass, on the captain.
 > line against the fleet's repo list.
 >
 > **A dead captain means no intake anywhere.** Unlabelled issues wait until it
-> is back. Today the only signal is `intake-reconcile` missing from the
-> captain's `host.health.armed_singleton_jobs`; there is no per-repo
-> heartbeat or age gauge yet.
+> is back. The signals are `intake-reconcile` missing from the captain's
+> `host.health.armed_singleton_jobs` and the completed-pass heartbeat (below)
+> going stale in the singleton-output watchdog.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -8421,6 +8422,42 @@ captain that dispatches nothing still runs it:
 - **Rate-limit breaker**: no pass while it is open, and the pass stops between
   repos if it opens. A failed or shed listing is not reported to it.
 
+**The completed-pass heartbeat (#10924).** A healthy pass that labels nothing
+emits no forge output, so a watcher could not tell a quiet fleet from a
+stopped reconciler. After every pass the captain folds the outcome into
+`<root>/.loom/state/intake-reconcile/last-pass.json` on the captain
+(`intake_reconcile::singleton::PassHeartbeat`): the record carries the pass's
+counts and outcome, and `last_completed_at` — the timestamp the watchdog ages —
+advances **only** when the pass completed its intended scan (every registered
+repo walked, every listing read). A pass that was stopped early by the
+rate-limit breaker, or shed or failed a listing, is recorded but keeps the
+previous stamp, so it can never masquerade as successful output. Label
+outcomes (a denied write scope, races, reverts, cap leftovers) do not block
+the stamp: the pass retries them next pass by design. A captain with no
+registered repos returns before any scan, so its stamp ages the same way: an
+empty roster surfaces as stale, not as a quiet healthy fleet.
+
+The heartbeat is the `fleet_outputs::SINGLETON_OUTPUTS` row for job
+`intake-reconcile` (record kind `intake-reconcile.pass`, gated on
+`fleet.intakeReconcile.singleton`): a stamp older than twice the *default*
+pass cadence — the row is built from the built-in 300 s constant, so its
+deadline is fixed at 600 s; overriding `LOOM_INTAKE_RECONCILE_INTERVAL_SECS`
+does not move it, and an interval above 600 s would trip the row on every
+quiet gap once the source is wired — or no stamp at all, is a Critical
+`output-missing:` condition once the in-daemon `fleet_alert` output source is
+wired (follow-up slice). The file is local to
+the captain, like the other on-host health records; the cross-host detector
+for a captain that is down entirely is `intake-reconcile` missing from its
+`host.health.armed_singleton_jobs`.
+
+**Rollout signal.** After deploying, confirm on the captain that
+`last_completed_at` in the heartbeat file advances on every pass even when
+nothing was labelled:
+
+```bash
+cat .loom/state/intake-reconcile/last-pass.json   # last_completed_at is fresh
+```
+
 In the forge-call ledger the pass is `intake.list_open`, `intake.recheck`,
 `intake.add_triage` and `intake.remove_triage`; with the singleton on, only
 the captain books them.
@@ -8443,9 +8480,10 @@ label: the write is idempotent and each is preceded by a re-read.
    host that does not see the key runs intake per host as soon as its own
    variable is removed.
 4. Confirm: the captain lists `intake-reconcile` in
-   `host.health.armed_singleton_jobs`, logs the covered slugs you expect, and
+   `host.health.armed_singleton_jobs`, logs the covered slugs you expect,
    is the only host whose `loom-daemon forge calls --by caller` books
-   `intake.*` rows.
+   `intake.*` rows, and its `.loom/state/intake-reconcile/last-pass.json`
+   shows a fresh `last_completed_at` on every pass (#10924).
 5. Remove `LOOM_INTAKE_RECONCILE=0` from the other hosts. They stay off because
    the key, not the environment, now stands them down. A host still on an older
    daemon must keep the variable until it is upgraded.
