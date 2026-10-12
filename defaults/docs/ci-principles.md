@@ -238,6 +238,20 @@ to ignore red. So the `report` job is part of the mechanism, not a nicety:
   the label set is intentional and `.github/labels.yml` is authoritative.
   Identity lives in the title, which is why the lookup ignores labels and the
   issue body asks that the title be left unchanged.
+- **The same decisions are recorded on loom-ui**, the fleet's alert hub
+  (2AMLogic/loom-ui#3319). After the issue step, the `report` job posts
+  `open` for each job whose issue it opened or updated and `resolved` for
+  each green job, as incident `ext:rjwalters.loom:ci-daily:<job slug>`, with
+  the job's Actions OIDC token (no secret). It is best-effort
+  (`continue-on-error`, warnings only) and posts only from `main`; it never
+  changes an issue, and a loom-ui outage never turns the report red.
+- **The same decisions are recorded on loom-ui**, the fleet's alert hub
+  (2AMLogic/loom-ui#3319). After the issue step, the `report` job posts
+  `open` for each job whose issue it opened or updated and `resolved` for
+  each green job, as incident `ext:rjwalters.loom:ci-daily:<job slug>`, with
+  the job's Actions OIDC token (no secret). It is best-effort
+  (`continue-on-error`, warnings only) and posts only from `main`; it never
+  changes an issue, and a loom-ui outage never turns the report red.
 
 SigNoz needs nothing workflow-side: `loom-daemon ci-telemetry` captures every
 run of every workflow of the configured owners by auto-discovery, so the daily
