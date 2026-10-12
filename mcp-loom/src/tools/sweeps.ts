@@ -163,8 +163,8 @@ export interface SweepInfo {
   repo?: string;
   /**
    * True when the work finder admitted this sweep through the host's
-   * `loom:operator-priority` overflow slot (#9244): a starred issue run as the
-   * host's single sweep over the concurrency cap. Absent means false.
+   * overflow slot (#9244): a starred issue run as the host's single sweep
+   * over the concurrency cap. Inert since #11508; absent means false.
    */
   overflow?: boolean;
 }

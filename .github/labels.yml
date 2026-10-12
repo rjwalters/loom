@@ -265,31 +265,13 @@
   description: "Engine stops work on this item; human is the only transition out. Sweep/shepherd do not skip it."
   color: "EA580C"  # orange-600 - operator-action signal, one shade darker than operator-only
 
-# loom:operator-priority (#9244) is the operator's "star": land this ASAP,
-# ahead of all other work, fleet-wide. It is NOT loom:operator (the hold
-# above) and it is NOT a hold of any kind -- nothing may treat a
-# `loom:operator` / `loom:operator-` prefix match as a hold without excluding
-# this label by name (see loom-daemon pr_latency::hold_labels). The daemon's
-# work finder sorts starred issues first (by when they were starred), lists
-# them even outside loom:issue (triage, curated, or unlabelled; the sweep then
-# starts from Curator), and may run one starred sweep over the concurrency
-# cap. Skip/park labels still win: a starred issue carrying loom:blocked,
-# loom:operator-only, loom:operator-decision or loom:operator is never
-# dispatched. Applied by: humans (directly or via the loom-ui star), and, for the
-# children of a starred parent, inherited (#10012: `create-issue.sh --parent`
-# stars a new child; the audit comment names `inherited_from=#P`). Removed by:
-# humans; a star propagation applied goes with the parent's star.
-- name: loom:operator-priority
-  description: "Land ASAP, not a hold. Applied by: humans/loom-ui; inherited by a starred parent's children"
-  color: "CA8A04"  # yellow-600 - matches loom-ui's star
-
 # loom:important (#11103) is the middle of Loom's three priority levels (none /
 # important / very important). Within a workspace the queue order is level,
 # then oldest createdAt, then issue number. NOT a hold, never inherited by the
 # daemon: whoever sets the priority labels a blocker too. Applied by / removed
 # by: the operator, Guide and Champion alike.
 - name: loom:important
-  description: "Priority level 2 of 3: dispatched before unlabeled work (not a hold). Anyone may set."
+  description: "Priority 2 of 3: taken before unlabeled work, not a hold. Applied by: operator, Guide, Champion."
   color: "CA8A04"  # yellow-600 - the middle priority level
 
 # loom:very-important (#11103) is the top priority level. A workspace holding
@@ -302,32 +284,6 @@
   description: "Priority level 3 of 3: wins the workspace draw. Capped at 1 per workspace; extras rank important."
   color: "B45309"  # amber-700 - one shade above important
 
-# loom:operator-high-priority (#10307) is operator priority LEVEL 2, the
-# double star: above loom:operator-priority, which it nests over (level >= 2
-# counts as starred everywhere; a level-2 item need not also carry the star).
-# Every starred-first pass drains by effective level, highest first. Capped:
-# at most 5 open issues fleet-wide by default (loom-ui enforces the cap at
-# click time; the daemon reports an over-cap level in the star-liveness
-# digest and never refuses a human's label). Its open blockers inherit the
-# level as loom:high-priority-inherited. Like the star it is NOT a hold:
-# every loom:operator- prefix match must exclude it by name. Applied by:
-# humans (directly or via the loom-ui double star). Removed by: humans.
-- name: loom:operator-high-priority
-  description: "Level 2, above the star (capped, not a hold). Applied by: humans, directly or via loom-ui."
-  color: "B45309"  # amber-700 - one shade above the star
-
-# loom:high-priority-inherited (#10307) is DERIVED, never a human's or a
-# role's: the daemon's star-liveness pass writes it on every open issue that
-# blocks a loom:operator-high-priority issue, directly or transitively (across
-# managed repos), with a body provenance marker naming the source, and removes it
-# once no level-2 source reaches the issue. Every reader treats it exactly
-# like level 2. It never counts toward the level-2 cap and is never accepted
-# from a loom-ui intent. Applied by / removed by: the loom-daemon
-# star-liveness pass only.
-- name: loom:high-priority-inherited
-  description: "Blocks a level-2 issue, so treated as level 2. Applied by: loom-daemon star-liveness only."
-  color: "D97706"  # amber-600 - the double star's shade, lighter
-
 # Epic Labels
 - name: loom:epic
   description: "Multi-phase epic proposal (decomposes into implementation issues)"
@@ -336,19 +292,6 @@
 - name: loom:epic-phase
   description: "Issue is part of an epic phase (references parent epic)"
   color: "8B5CF6"  # violet-500 - lighter variant for child issues
-
-# Tier Labels (Goal Alignment)
-- name: tier:goal-advancing
-  description: "Directly implements a milestone deliverable or unblocks goal work"
-  color: "0E8A16"  # green - highest priority
-
-- name: tier:goal-supporting
-  description: "Infrastructure, testing, or docs for milestone features"
-  color: "FBCA04"  # yellow - medium priority
-
-- name: tier:maintenance
-  description: "Cleanup, refactoring, or improvements not tied to current goals"
-  color: "D4C5F9"  # purple - lower priority
 
 # Story-Point Size Labels (#9431, epic #9429): estimation is paused.
 # Retained for historical data; Curators do not assign or refresh these labels.
