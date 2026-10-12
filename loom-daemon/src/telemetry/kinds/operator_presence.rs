@@ -11,16 +11,27 @@
 //! `session_id` and `hook_event_name` out of the hook payload. A prompt cannot
 //! reach the wire because there is nowhere to put it.
 //!
-//! **Not exported yet** (`otlp: NotExported`, `native: true`: the registry
-//! requires every kind to name a carrier, as for `queue.snapshot`). Until the
-//! transport of #11525 exists the records sit in a local durable journal
-//! (`crate::presence`); nothing drops one. When that transport lands, the
-//! registry row flips to `otlp: Logs` and a `mapping/operator_presence.rs`
-//! sibling maps the scalars (the `loom.presence.*` attribute names are
-//! reserved for it).
+//! **Exported over OTLP** (`otlp: Logs`, `native: false`) now that #11525
+//! settled the transport — "the same path as every other fact". The scalars
+//! ride as the [`OPERATOR_PRESENCE_LOG_ATTRIBUTE_KEYS`] `loom.presence.*`
+//! attributes (which the collector's log `keep_keys` must list; contract-tested)
+//! and the body is the record's JSON, which carries the `driving[]` entries. The
+//! local durable journal (`crate::presence`) stays as the buffer the exporter
+//! drains; nothing drops one.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
+/// Every log attribute key `operator.presence` exports. `host` is not here: it
+/// rides on the OTLP Resource as `host.id`, like every other kind. No prompt or
+/// transcript content can appear — the record has no such field.
+pub const OPERATOR_PRESENCE_LOG_ATTRIBUTE_KEYS: &[&str] = &[
+    "loom.presence.session_id",
+    "loom.presence.operator",
+    "loom.presence.last_input_at",
+    "loom.presence.last_activity_at",
+    "loom.presence.driving_count",
+];
 
 /// One issue or PR the session holds an in-session lease on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
