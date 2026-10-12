@@ -27,6 +27,40 @@ impl SweepRegistry {
         runtime_admission: Option<&crate::runtime_admission::ResolvedRuntime>,
         selection: Option<&crate::tokens_pool::private_workspace::dispatch::Selection>,
     ) -> Result<(Child, String)> {
+        self.spawn_child_process_for(
+            kind,
+            log_path,
+            sweep_id,
+            model,
+            effort,
+            depends_on,
+            runtime_admission,
+            selection,
+            None,
+        )
+    }
+
+    /// [`Self::spawn_child_process`], or — with `resume` — the relaunch of a
+    /// session a daemon roll paused (H5, #10832). A resume differs in exactly
+    /// two things: the child gets no `/loom:sweep` prompt (the saved session
+    /// already holds the task; the resume prompt rides in its environment, see
+    /// [`super::resume_handle::DispatchSession::apply_env`]), and its
+    /// pause-and-roll identity carries the session id and lineage instead of a
+    /// freshly pinned id. Everything else (log, model, credentials, runtime
+    /// pin, process group, provenance) is the ordinary dispatch.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub(crate) fn spawn_child_process_for(
+        &self,
+        kind: &SweepKind,
+        log_path: &Path,
+        sweep_id: &str,
+        model: Option<&str>,
+        effort: Option<&str>,
+        depends_on: Option<u32>,
+        runtime_admission: Option<&crate::runtime_admission::ResolvedRuntime>,
+        selection: Option<&crate::tokens_pool::private_workspace::dispatch::Selection>,
+        resume: Option<&super::resume_handle::RollResumeLaunch>,
+    ) -> Result<(Child, String)> {
         let spawn_bin = self.config.resolve_spawn_bin()?;
 
         // Ensure log dir exists.
@@ -103,7 +137,19 @@ impl SweepRegistry {
         };
         let mut cmd = Command::new(&spawn_bin);
         cmd.env(crate::provenance::origin::ENV, "autonomous");
-        cmd.arg("-p").arg(&prompt);
+        match resume {
+            None => {
+                cmd.arg("-p").arg(&prompt);
+            }
+            // #10832: a resume passes no prompt of its own. Claude still needs
+            // print mode (`claude -p --resume <id> <prompt>`, appended by
+            // `spawn-claude.sh`); `spawn-codex.sh` takes a value after `-p`,
+            // so a Codex resume passes none (`codex exec resume <id> <prompt>`).
+            Some(launch) if launch.runtime == "codex" => {}
+            Some(_) => {
+                cmd.arg("-p");
+            }
+        }
         // Model selection (issue #3477, Phase 1): the dispatch-param tier of
         // the precedence chain. Appended as an explicit `--model` arg (which
         // beats any ambient LOOM_MODEL env inside spawn-claude.sh). Empty
@@ -190,6 +236,19 @@ impl SweepRegistry {
         crate::observability::claude_code_telemetry::prepare_child(
             &mut cmd,
             &self.config.workspace_root,
+        );
+        // #10964: opt-in, default-off — point the session's own OTLP export
+        // at this daemon's loopback relay. After the block above (which
+        // clears the endpoint it owns) and a no-op unless a receiver runs.
+        crate::observability::agent_relay::prepare_sweep_child(
+            &mut cmd,
+            &self.config.workspace_root,
+            runtime_admission.map(|a| a.runtime.as_str()),
+            match kind {
+                SweepKind::Issue(issue) => Some(*issue),
+                SweepKind::PrSet(_) => None,
+            },
+            sweep_id,
         );
         // #9027: stamp the sweep's commits with the D33 provenance trailers
         // (a git-env hooksPath override that chains to the repo's own hooks).
@@ -328,6 +387,28 @@ impl SweepRegistry {
         if let Some(selection) = selection {
             selection.apply(&mut cmd);
         }
+        // #10830: name this agent for pause-and-roll (item id, pause dir,
+        // pinned Claude session id, scope unit). Inert until a roll asks.
+        let session = match resume {
+            None => super::resume_handle::DispatchSession::new(
+                sweep_id,
+                &self.config.workspace_root,
+                runtime_admission.map(|a| a.runtime.as_str()),
+            ),
+            Some(launch) => Some(
+                super::resume_handle::DispatchSession::resumed(
+                    sweep_id,
+                    &self.config.workspace_root,
+                    launch,
+                )
+                .ok_or_else(|| {
+                    anyhow!("cannot resume: `{}` is not a session id", launch.session_id)
+                })?,
+            ),
+        };
+        if let Some(session) = &session {
+            session.apply_env(&mut cmd);
+        }
         let child = crate::observability::lifecycle::spawn_child(
             &mut cmd,
             &self.config.workspace_root,
@@ -349,6 +430,9 @@ impl SweepRegistry {
         // per-issue log is never mistaken for the current selection.
         if let Some(selection) = selection {
             selection.spawned();
+        }
+        if let (Some(session), SweepKind::Issue(issue)) = (&session, kind) {
+            self.stamp_resume_handle_in_lock(*issue, session, model, effort);
         }
         let header_anchor = format!("sweep_id={sweep_id}");
         Ok((child, header_anchor))

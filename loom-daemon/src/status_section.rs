@@ -138,6 +138,7 @@ impl StatusSection {
                     "observability_host_id_mismatch",
                     "observability_export",
                     "observability_exports",
+                    "otlp_export",
                 ],
             ),
             S::ForgeEvents => ("forge_events", &["forge_events"]),
@@ -243,6 +244,13 @@ impl SectionSet {
     #[must_use]
     pub fn is_all(&self) -> bool {
         self.only.is_none()
+    }
+
+    /// Whether this names no section at all — a selection that would build
+    /// nothing. The CLI never sends one; the daemon rejects it (#10861).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.only.as_ref().is_some_and(BTreeSet::is_empty)
     }
 
     /// Whether `section` is served.

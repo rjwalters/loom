@@ -115,8 +115,8 @@ ORDER BY outcomes DESC;
 -- SF5. How many attempts does an issue take, and why: attempts split by
 -- dispatch trigger into first / substantive / environmental / unclassified
 -- (#9444's one committed query; "unclassified" is counted, never merged —
--- it is `operator_redispatch`, `unknown`, or a pre-#9444 record with no
--- trigger). The rework columns fold the in-sweep `rework_events`
+-- it is `redispatch_after_success`, `operator_redispatch`, `unknown`, or a
+-- pre-#9444 record with no trigger). The rework columns fold the in-sweep `rework_events`
 -- classifications in via `issue_effort`, over issues that LANDED in the
 -- window (their sums cover the issue's whole history). (Not answerable from
 -- this store, and therefore not an SF question: whether a closed issue later

@@ -39,9 +39,12 @@ fn sweep_started() -> TelemetryRecord {
         issue: 4703,
         sweep_id: "sweep-issue-4703-0".to_string(),
         started_at: ts(),
-        model: Some("opus".to_string()),
-        effort: Some("high".to_string()),
-        runtime: Some("claude".to_string()),
+        facts: crate::telemetry::SweepStartFacts {
+            model: Some("opus".to_string()),
+            effort: Some("high".to_string()),
+            runtime: Some("claude".to_string()),
+            ..Default::default()
+        },
     })
 }
 
@@ -130,6 +133,7 @@ pub(super) fn sweep_outcome() -> TelemetryRecord {
         attempt_index: None,
         previous_sweep_id: None,
         trigger: None,
+        dispatch_origin: None,
         rework_events: None,
         pr_numbers: None,
         hw_lines_added: None,
@@ -190,6 +194,7 @@ fn host_health() -> TelemetryRecord {
         captainless_singleton_jobs: Vec::new(),
         exported_kinds: Vec::new(),
         exporters: Vec::new(),
+        otlp_export: None,
         memory: None,
     })
 }
@@ -286,6 +291,7 @@ fn sweep_outcome_omits_work_output_fields_when_unavailable() {
         attempt_index: None,
         previous_sweep_id: None,
         trigger: None,
+        dispatch_origin: None,
         rework_events: None,
         pr_numbers: None,
         hw_lines_added: None,
@@ -422,6 +428,7 @@ fn sweep_outcome_round_trips_the_completeness_fields() {
         attempt_index: None,
         previous_sweep_id: None,
         trigger: None,
+        dispatch_origin: None,
         rework_events: None,
         pr_numbers: None,
         hw_lines_added: None,
@@ -487,6 +494,7 @@ fn sweep_outcome_distinguishes_an_omitted_doctor_cycles_from_zero() {
         attempt_index: None,
         previous_sweep_id: None,
         trigger: None,
+        dispatch_origin: None,
         rework_events: None,
         pr_numbers: None,
         hw_lines_added: None,
@@ -1130,6 +1138,7 @@ fn sweep_outcome_repo_is_a_slug_or_absent_and_repo_unresolved_marks_the_gap() {
         attempt_index: None,
         previous_sweep_id: None,
         trigger: None,
+        dispatch_origin: None,
         rework_events: None,
         pr_numbers: None,
         hw_lines_added: None,

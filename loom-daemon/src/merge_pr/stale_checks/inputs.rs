@@ -86,9 +86,9 @@
 //!
 //! # Gates implemented inside the daemon binary
 //!
-//! Four components (`Shell Budget Ratchet`, `.gitignore Convergence Check`,
-//! `Secret Scan`, `MCP Guard Wiring Contract`) run a `loom-daemon` subcommand
-//! rather than a script. Their `G` used to be `loom-daemon/**`, which nearly
+//! Five components (`Shell Budget Ratchet`, `.gitignore Convergence Check`,
+//! `Secret Scan`, `MCP Guard Wiring Contract`, `Fleet-Policy Shadow Guard`)
+//! run a `loom-daemon` subcommand rather than a script. Their `G` used to be `loom-daemon/**`, which nearly
 //! every base move and nearly every PR touches, so they read as stale almost
 //! always and the guard stopped distinguishing anything (PRs #9543/#9544,
 //! 2026-09-29: refused on `cli/forge_action.rs` vs `init/post_init.rs`).
@@ -590,6 +590,7 @@ pub const REQUIRED_CHECKS: &[RequiredCheck] = &[
             ".gitignore Convergence Check",
             "Secret Scan",
             "MCP Guard Wiring Contract",
+            "Fleet-Policy Shadow Guard",
         ],
         aggregates: &[],
     },
@@ -683,6 +684,11 @@ pub const SPECS: &[CheckSpec<'static>] = &[
             "scripts/test-release-decision.sh",
             "scripts/release-decision.sh",
             ".github/workflows/release.yml",
+            // The image-input tests ride here too (#10825); they drive the
+            // detection script, which reads .dockerignore, and parse ci.yml.
+            "scripts/test-ci-image-inputs.sh",
+            "scripts/ci-image-inputs.sh",
+            ".dockerignore",
             CI_WORKFLOW,
         ],
         scanned: SHELL,
@@ -846,10 +852,12 @@ pub const SPECS: &[CheckSpec<'static>] = &[
     // Rust surface: `update-gitignore`'s handler in `cli/misc_cmds.rs` calls
     // `loom_daemon::init::update_gitignore` (`init/post_init.rs`, which owns
     // EPHEMERAL_PATTERNS). The whole `init` module tree is listed, plus the
-    // modules its production code reaches (`agent_skills`, `install_compat`,
-    // `proc_exec`, `self_update`), and the dispatch chain. MUST grow if the checker
-    // starts using another module — `daemon_surface_tests.rs` fails until it
-    // does. The script also runs `scripts/cargo-target-dir.sh`.
+    // modules its production code reaches (`agent_skills`, `fleet_policy`,
+    // `config_resolver`, `install_compat`, `proc_exec`, `release_provenance`,
+    // `self_update`), and the dispatch chain.
+    // MUST grow if the checker starts using another module —
+    // `daemon_surface_tests.rs` fails until it does. The script also runs
+    // `scripts/cargo-target-dir.sh`.
     CheckSpec {
         context: ".gitignore Convergence Check",
         global: &[
@@ -858,9 +866,12 @@ pub const SPECS: &[CheckSpec<'static>] = &[
             "loom-daemon/src/cli/misc_cmds.rs",
             "loom-daemon/src/init/**",
             "loom-daemon/src/agent_skills.rs",
+            "loom-daemon/src/fleet_policy.rs",
+            "loom-daemon/src/config_resolver.rs",
             "loom-daemon/src/install_compat.rs",
             "loom-daemon/src/install_compat/**",
             "loom-daemon/src/proc_exec.rs",
+            "loom-daemon/src/release_provenance.rs",
             "loom-daemon/src/self_update.rs",
             "loom-daemon/src/main.rs",
             "loom-daemon/src/daemon_service.rs",
@@ -874,6 +885,39 @@ pub const SPECS: &[CheckSpec<'static>] = &[
         ],
         scanned: &[],
         coupled: &[".gitignore"],
+        removal_sensitive: false,
+    },
+    // `loom-daemon validate . --fleet-policy-only` (#11441): a fleet-policy key
+    // in a tracked repo tier is a finding unless the allow-list gives a reason,
+    // so a key added on one side and an allow entry removed on the other
+    // interact — the three files are coupled.
+    //
+    // Rust surface: `handle_validate_command` in `cli/misc_cmds.rs`, the
+    // `fleet_policy` module and what it reaches (`config_resolver`), and the
+    // dispatch chain. MUST grow if the checker starts using another module —
+    // `daemon_surface_tests.rs` fails until it does.
+    CheckSpec {
+        context: "Fleet-Policy Shadow Guard",
+        global: &[
+            "loom-daemon/src/cli/misc_cmds.rs",
+            "loom-daemon/src/fleet_policy.rs",
+            "loom-daemon/src/config_resolver.rs",
+            "loom-daemon/src/main.rs",
+            "loom-daemon/src/daemon_service.rs",
+            "Cargo.toml",
+            "Cargo.lock",
+            "rust-toolchain.toml",
+            ".cargo/config.toml",
+            "loom-daemon/Cargo.toml",
+            "loom-daemon/build.rs",
+            CI_WORKFLOW,
+        ],
+        scanned: &[],
+        coupled: &[
+            ".loom/config.json",
+            ".loom-project/project.json",
+            ".loom/fleet-policy-allow.json",
+        ],
         removal_sensitive: false,
     },
     // Scans the commits in `base..head` by revision (#9133), so like the

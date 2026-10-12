@@ -194,6 +194,7 @@ mod tests {
         let mut status = sample_report();
         status.per_repo = vec![RepoStatus {
             root: PathBuf::from("/repo/a"),
+            maintain_only: None,
             role_runner_enabled: true,
             role_runner_roles: vec!["judge".to_string()],
             ..sample_repo_status()
@@ -228,6 +229,7 @@ mod tests {
     fn sample_repo_status() -> RepoStatus {
         RepoStatus {
             root: PathBuf::new(),
+            maintain_only: None,
             priority: 0,
             in_flight_count: 0,
             health_gate_halted: false,

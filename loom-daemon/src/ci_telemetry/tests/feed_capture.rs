@@ -13,7 +13,7 @@ use tokio::time::Instant;
 
 use super::*;
 use crate::ci_telemetry::feed::{
-    feed_is_live, resolve_floor_interval_secs, spawn_bridge, Action, Driver,
+    feed_is_live, resolve_floor_interval_secs_with_env, spawn_bridge, Action, Driver,
     DEFAULT_FEED_FLOOR_INTERVAL_SECS, FEED_FLOOR_INTERVAL_SECS_ENV, MAX_FEED_FLOOR_INTERVAL_SECS,
 };
 use crate::ci_telemetry::poll::targeted::record_runs;
@@ -321,15 +321,17 @@ fn the_feed_counts_as_live_only_while_healthy_and_fresh() {
 #[serial_test::serial]
 fn the_floor_interval_resolves_and_is_clamped_inside_the_rescan_window() {
     let dir = TempDir::new().unwrap();
-    std::env::remove_var(FEED_FLOOR_INTERVAL_SECS_ENV);
-    assert_eq!(resolve_floor_interval_secs(dir.path(), 120), DEFAULT_FEED_FLOOR_INTERVAL_SECS);
-    std::env::set_var(FEED_FLOOR_INTERVAL_SECS_ENV, "1800");
-    assert_eq!(resolve_floor_interval_secs(dir.path(), 120), 1800);
-    std::env::set_var(FEED_FLOOR_INTERVAL_SECS_ENV, "30");
-    assert_eq!(resolve_floor_interval_secs(dir.path(), 120), 120, "never faster than base");
-    std::env::set_var(FEED_FLOOR_INTERVAL_SECS_ENV, "999999");
-    assert_eq!(resolve_floor_interval_secs(dir.path(), 120), MAX_FEED_FLOOR_INTERVAL_SECS);
-    std::env::remove_var(FEED_FLOOR_INTERVAL_SECS_ENV);
+    let floor = |value: Option<&str>| {
+        let pairs: Vec<(&str, &str)> = value
+            .map(|v| (FEED_FLOOR_INTERVAL_SECS_ENV, v))
+            .into_iter()
+            .collect();
+        resolve_floor_interval_secs_with_env(dir.path(), 120, &super::fixed_env(&pairs))
+    };
+    assert_eq!(floor(None), DEFAULT_FEED_FLOOR_INTERVAL_SECS);
+    assert_eq!(floor(Some("1800")), 1800);
+    assert_eq!(floor(Some("30")), 120, "never faster than base");
+    assert_eq!(floor(Some("999999")), MAX_FEED_FLOOR_INTERVAL_SECS);
 }
 
 #[test]

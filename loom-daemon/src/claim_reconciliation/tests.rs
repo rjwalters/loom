@@ -3335,12 +3335,10 @@ fn verdict_hold_labels_cover_every_parking_label() {
 
 #[test]
 fn decide_anchor_stamps_the_current_head_for_a_confirmed_unmarked_verdict() {
-    // The observed production case: an approving verdict with no marker.
+    // #9258: an unmarked APPROVAL is re-queued, never anchored to this head.
     assert_eq!(
         decide_anchor(&verdict_pr(VerdictKind::Approved, Some(SHA_B), None)),
-        AnchorAction::Anchor {
-            head_sha: SHA_B.to_string()
-        }
+        AnchorAction::RequeueApproval
     );
     assert_eq!(
         decide_anchor(&verdict_pr(VerdictKind::ChangesRequested, Some(SHA_A), None)),
@@ -3355,7 +3353,7 @@ fn decide_anchor_treats_an_empty_marker_as_unmarked() {
     // decide_verdict folds `Some("")` into Unverifiable; the anchoring
     // pass must agree, or an empty marker would be permanently stuck.
     assert_eq!(
-        decide_anchor(&verdict_pr(VerdictKind::Approved, Some(SHA_B), Some(""))),
+        decide_anchor(&verdict_pr(VerdictKind::ChangesRequested, Some(SHA_B), Some(""))),
         AnchorAction::Anchor {
             head_sha: SHA_B.to_string()
         }
@@ -3400,11 +3398,11 @@ fn decide_anchor_skips_when_the_comment_scan_failed() {
 #[test]
 fn decide_anchor_skips_without_a_resolvable_head_sha() {
     assert_eq!(
-        decide_anchor(&verdict_pr(VerdictKind::Approved, None, None)),
+        decide_anchor(&verdict_pr(VerdictKind::ChangesRequested, None, None)),
         AnchorAction::Skip(AnchorSkipReason::NoHeadSha)
     );
     assert_eq!(
-        decide_anchor(&verdict_pr(VerdictKind::Approved, Some(""), None)),
+        decide_anchor(&verdict_pr(VerdictKind::ChangesRequested, Some(""), None)),
         AnchorAction::Skip(AnchorSkipReason::NoHeadSha)
     );
 }

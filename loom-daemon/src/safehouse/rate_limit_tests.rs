@@ -308,6 +308,7 @@ async fn events_still_flow_untitled_while_cooling() {
         kind: SweepKind::Issue(8997),
         runtime: None,
         runtime_source: None,
+        start: None,
         repo: Some(ws.to_string_lossy().into_owned()),
     })
     .unwrap();

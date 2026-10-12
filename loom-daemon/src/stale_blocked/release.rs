@@ -76,13 +76,12 @@ pub const PERMANENT_BLOCK_MARKER: &str = "<!-- loom:permanent-block";
 /// Labels that mean a human decision is pending on the artifact itself.
 /// `loom:operator-priority` (the star) is deliberately absent: it is not a
 /// hold.
-pub const OPERATOR_HOLD_LABELS: [&str; 6] = [
+pub const OPERATOR_HOLD_LABELS: [&str; 5] = [
     "loom:operator",
     "loom:operator-only",
     "loom:operator-blocked",
     "loom:operator-mechanical",
     "loom:operator-decision",
-    "loom:operator-objective",
 ];
 
 const ISSUE_LABEL: &str = "loom:issue";

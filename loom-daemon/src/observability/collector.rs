@@ -78,6 +78,8 @@ use crate::workspace_pool::WorkspacePool;
 use super::queue::QueueSink;
 mod correlation;
 mod identity;
+mod zai_accounts;
+use zai_accounts::sample_zai_accounts;
 pub(crate) type DispatchKey = (String, u32);
 
 /// Timeout on the `gh repo view` slug lookup — generous but bounded so a
@@ -617,9 +619,13 @@ pub(crate) fn map_event_to_records(
             sweep_id,
             runtime,
             story_points,
+            start,
             ..
         } => {
             let started_at = Utc::now();
+            let mut facts = start.as_deref().cloned().unwrap_or_default();
+            // The event's own `runtime` field stays the authority for it.
+            facts.runtime.clone_from(runtime);
             dispatches.insert(
                 (repo.to_owned(), issue),
                 DispatchState {
@@ -639,12 +645,10 @@ pub(crate) fn map_event_to_records(
                 issue,
                 sweep_id: sweep_id.clone(),
                 started_at,
-                model: None,
-                effort: None,
-                // The dispatch event already names the admitted runtime
-                // adapter; carrying it here is what lets the dashboard say
-                // *which agent* is working each in-flight sweep.
-                runtime: runtime.clone(),
+                // #11280: model, effort, runtime and attempt lineage as the
+                // dispatch knew them, so the in-flight record carries the
+                // same facts `sweep.outcome` later reports.
+                facts,
             })]
         }
         Event::SweepGlobalDispatch { .. } => Vec::new(),
@@ -740,17 +744,23 @@ fn terminal_records(
     // and the classifier hands back the mandatory `failure_class` (a
     // synthesized `unclassified:*` label here, since nothing classified this
     // transition) together with the disposition.
-    let (disposition, failure_class) =
-        crate::telemetry::classify_disposition(&crate::telemetry::DispositionSignals {
-            result,
-            pr_number,
-            failure_class: None,
-            phase_durations: &[],
-            total_duration_sec,
-            judge_verdicts: None,
-            doctor_cycles: None,
-            issue_end_state: None,
-        });
+    // #11429: no Judge verdicts are read here, so a `landed` failure stays a
+    // `failure` (no proof it landed clean).
+    let signals = crate::telemetry::DispositionSignals {
+        result,
+        pr_number,
+        failure_class: None,
+        phase_durations: &[],
+        total_duration_sec,
+        judge_verdicts: None,
+        doctor_cycles: None,
+        issue_end_state: None,
+        // `result` already encodes the only exit fact this path has
+        // (`Success` ⇔ exit 0), so a `Failure` here is never a clean exit.
+        exit_code: None,
+    };
+    let (disposition, failure_class) = crate::telemetry::classify_disposition(&signals);
+    let outcome_result = crate::telemetry::result_for_disposition(&signals, disposition);
     vec![
         TelemetryRecord::SweepCompleted(crate::telemetry::SweepCompletedRecord {
             repo: repo.clone(),
@@ -777,7 +787,7 @@ fn terminal_records(
             config: std::collections::BTreeMap::new(),
             phase_durations: Vec::<PhaseDuration>::new(),
             total_duration_sec,
-            result,
+            result: outcome_result,
             disposition,
             pr_number,
             // Token fields (and `tokens_status`) are filled by
@@ -823,6 +833,7 @@ fn terminal_records(
             attempt_index: None,
             previous_sweep_id: None,
             trigger: None,
+            dispatch_origin: None,
             rework_events: None,
             pr_numbers: None,
             hw_lines_added: None,
@@ -938,6 +949,12 @@ async fn sample_snapshots(
     token_record
         .accounts
         .extend(sample_registry_provider_accounts(workspace_root));
+    // The Z.ai api-keys seats (#11396): per-seat 5h/weekly burn from the
+    // read-only quota endpoint, cached between ticks; unknown, never 0, on any
+    // failure. Skipped entirely (no client, no request) with no zai seats.
+    token_record
+        .accounts
+        .extend(sample_zai_accounts(workspace_root).await);
     // Token burn + per-provider pool state (Issue #8857), through the
     // OTLP-only ops sink — a no-op (no reads at all) without an OTLP exporter.
     super::ops::quota::record(workspace_root, &token_record.accounts).await;
@@ -958,6 +975,17 @@ async fn sample_snapshots(
     )
     .await;
     queue.offer(TelemetryEnvelope::new(host_id, TelemetryRecord::HostHealth(health_record)));
+    // This host's export view (Issue #11124): per-exporter queue depth,
+    // cumulative drops and last flush. Facts only; every host emits its own.
+    queue.offer(TelemetryEnvelope::new(
+        host_id,
+        TelemetryRecord::HostExport(crate::telemetry::kinds::host_export::HostExportRecord::build(
+            host_id,
+            Utc::now(),
+            &super::global_export_statuses(),
+            &super::global_export_queue_stats(),
+        )),
+    ));
     // Memory/swap/worktree-volume gauges (Issue #8860), same cadence, through
     // the OTLP-only ops sink — a no-op when no OTLP exporter is running.
     super::ops::host::record(worktree_volume).await;
@@ -976,24 +1004,16 @@ async fn sample_snapshots(
     // without the ops sink, and without a new work-finder tick since the last
     // export pass.
     super::ops::disposition::record(slug_cache).await;
-    // ETA (Issue #9289): review listings, outcome checks and re-estimates,
-    // after `stage_dwell` so the ETag-cached listings are warm.
-    super::eta::record(workspace_root, workspace_pool, slug_cache).await;
-    // #10414: the ETA pass finished; a no-op unless ETA registered it.
-    crate::task_liveness::beat_if_registered(crate::task_liveness::ETA_PASS);
-    // This host's live estimate set (Issue #9329) — native HTTPS only, and
-    // only when the set changed. After `eta::record` so it carries this
-    // pass's estimates rather than the previous pass's.
-    super::eta_snapshot::record().await;
-    // ETA pipeline health gauges (Issue #10391), OTLP-only: local state and
-    // file reads, no forge call; a no-op without the ops sink. After the
-    // snapshot so it reports this pass's built snapshot.
-    super::ops::eta_health::record(workspace_root).await;
     // Per-account Codex session-container state (Issue #10455): export the
     // gauge from the always-on watch's newest observations. No docker call
     // here (the watch owns the bounded snapshot), so a wedged Docker cannot
     // stall this pass; the WARN lives in the watch and runs without telemetry.
     super::ops::codex_session::record();
+    // This host's view of its held sweeps, review PRs and ready queue over
+    // OTLP (Issue #10196), independent of ETA. 5-minute anchor, deltas only
+    // on change; its review listings are ETag-cached (warm after stage_dwell)
+    // and reused by the pass after each work-finder tick (#11161).
+    super::fleet_state::record(workspace_root, workspace_pool, slug_cache).await;
 }
 
 /// Parse a `.ranking` row's binding-window reset text into the typed instant
@@ -1216,6 +1236,9 @@ async fn sample_host_health(
         captainless_singleton_jobs: crate::fleet_captain::captainless_singleton_job_names(),
         exported_kinds,
         exporters,
+        otlp_export: Some(crate::observability::otlp_health::check_global(
+            &crate::observability::read_config(workspace_root),
+        )),
         // Memory/pressure slice ("deferred vs killed vs timed out"): the
         // whole object is omitted when nothing was measured — never a flat
         // zero — the same absence contract `protection`/`admission_brake`

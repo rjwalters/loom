@@ -3,11 +3,11 @@ use opentelemetry_proto::tonic::common::v1::any_value::Value;
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, SeverityNumber};
 
 use super::super::log_record_for;
-use crate::eta::Provenance;
 use crate::telemetry::kinds::token_ranking_refresh::{
     AccountOutcome, CredentialKind, RankingSource, RoundOutcome, TokenRankingAccount,
     TokenRankingRefreshRecord, TOKEN_RANKING_LOG_ATTRIBUTE_KEYS,
 };
+use crate::telemetry::provenance::Provenance;
 use crate::telemetry::{TelemetryEnvelope, TelemetryRecord};
 
 fn account(
@@ -197,7 +197,7 @@ fn collector_keeps_every_token_ranking_log_attribute() {
         .find(|l| {
             l.contains("keep_keys(attributes, [")
                 && l.contains("loom.ci.chunk_index")
-                && l.contains("loom.eta.estimate_id")
+                && l.contains("loom.eta.pr.state")
         })
         .expect("the transform/privacy log keep_keys line");
     for key in TOKEN_RANKING_LOG_ATTRIBUTE_KEYS {

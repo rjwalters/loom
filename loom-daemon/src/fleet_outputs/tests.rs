@@ -5,6 +5,8 @@ use chrono::TimeZone;
 struct Fake {
     fleet: BTreeMap<&'static str, DateTime<Utc>>,
     repos: BTreeMap<&'static str, BTreeMap<String, DateTime<Utc>>>,
+    expected: BTreeMap<&'static str, Vec<String>>,
+    disabled: BTreeSet<&'static str>,
 }
 impl OutputSource for Fake {
     fn last_seen(&self, k: &str) -> Option<DateTime<Utc>> {
@@ -12,6 +14,12 @@ impl OutputSource for Fake {
     }
     fn last_seen_per_repo(&self, k: &str) -> BTreeMap<String, DateTime<Utc>> {
         self.repos.get(k).cloned().unwrap_or_default()
+    }
+    fn expected_repos(&self, k: &str) -> Option<Vec<String>> {
+        self.expected.get(k).cloned()
+    }
+    fn disabled(&self) -> BTreeSet<&'static str> {
+        self.disabled.clone()
     }
 }
 
@@ -24,8 +32,8 @@ fn ago(m: i64) -> DateTime<Utc> {
 fn roster(n: usize) -> Vec<String> {
     (0..n).map(|i| format!("org/repo{i}")).collect()
 }
-const FLEET: SingletonOutput = job("j", "k", Scope::FleetWide, mins(30));
-const PER_REPO: SingletonOutput = job("j", "e", Scope::PerRepo, mins(30));
+const FLEET: SingletonOutput = job("j", "k", Scope::FleetWide, mins(30), &[]);
+const PER_REPO: SingletonOutput = job("j", "e", Scope::PerRepo, mins(30), &[]);
 
 fn row_for(kind: &str) -> SingletonOutput {
     *SINGLETON_OUTPUTS
@@ -42,7 +50,7 @@ fn whole_fleet_at(at: DateTime<Utc>, r: &[String]) -> Fake {
             Scope::FleetWide => {
                 f.fleet.insert(o.record_kind, at);
             }
-            Scope::PerRepo => {
+            Scope::PerRepo | Scope::PerActiveRepo => {
                 f.repos
                     .insert(o.record_kind, r.iter().map(|n| (n.clone(), at)).collect());
             }
@@ -116,64 +124,82 @@ fn healthy_fleet_has_no_conditions() {
     assert!(evaluate(SINGLETON_OUTPUTS, &whole_fleet_at(ago(1), &r), &r, now()).is_empty());
 }
 
-/// 10-07: `eta.estimate` stopped for 28 of 30 repos for ~31h while the ETA
-/// authority stayed "armed". The watchdog must fire by 2x cadence after the
-/// stop and keep firing for the whole outage.
-#[test]
-fn replays_the_10_07_incident_within_twice_cadence() {
-    let row = row_for("eta.estimate");
-    assert_eq!(row.gate, Gate::EtaAuthority);
-    let r = roster(30);
-    let stop = now();
-    let mut f = Fake::default();
-    // Every repo emitted last at `stop`.
-    f.repos
-        .insert("eta.estimate", r.iter().map(|n| (n.clone(), stop)).collect());
-    let deadline = chrono::Duration::from_std(row.cadence * 2).unwrap();
-    let step = chrono::Duration::minutes(1);
-    // Quiet up to the deadline.
-    assert!(evaluate(&[row], &f, &r, stop + deadline).is_empty());
-    // The two surviving repos keep emitting; the 28 never do again.
-    let mut fired_at = None;
-    let mut t = stop;
-    while t <= stop + chrono::Duration::hours(31) {
-        let survivors = f.repos.get_mut("eta.estimate").unwrap();
-        for n in r.iter().take(2) {
-            survivors.insert(n.clone(), t);
-        }
-        let c = evaluate(&[row], &f, &r, t);
-        if fired_at.is_none() && !c.is_empty() {
-            assert!(c[0].headline.contains("2 of 30"), "{}", c[0].headline);
-            assert_eq!(c[0].key, "output-missing:eta-authority:eta.estimate");
-            fired_at = Some(t);
-        }
-        if fired_at.is_some() {
-            assert_eq!(c.len(), 1, "stopped firing at {t}");
-        }
-        t += step;
-    }
-    assert_eq!(fired_at, Some(stop + deadline + step));
-}
-
-#[test]
-fn job_moved_to_non_producing_host_fires_without_host_input() {
-    // eta-fleet-refresh was re-armed on a new host that never refreshes: the
-    // captain gate reads healthy, but the output stops. The evaluator has no
-    // host parameter: the output's age alone fires it.
-    let row = row_for("eta.fleet_refresh");
-    let r = roster(30);
-    let moved =
-        now() - chrono::Duration::from_std(row.cadence * 2).unwrap() - chrono::Duration::minutes(1);
-    let f = whole_fleet_at(moved, &r);
-    let c = evaluate(&[row], &f, &r, now());
-    assert_eq!(c.len(), 1);
-    assert_eq!(c[0].job, crate::observability::eta_fleet_refresh::SINGLETON_JOB_NAME);
-    assert!(c[0].headline.contains("0 of 30"));
-}
-
 #[test]
 fn future_timestamp_is_not_stale() {
     let mut f = Fake::default();
     f.fleet.insert("k", now() + chrono::Duration::minutes(1));
     assert!(evaluate(&[FLEET], &f, &[], now()).is_empty());
+}
+
+#[test]
+fn far_future_timestamp_does_not_mask_an_outage() {
+    let mut f = Fake::default();
+    f.fleet.insert("k", now() + chrono::Duration::days(1));
+    assert_eq!(evaluate(&[FLEET], &f, &[], now()).len(), 1);
+}
+
+/// Finding 2: gauges are judged against `maxAgeSecs` (1800s), not 2x the
+/// 600s publish cadence.
+#[test]
+fn captain_gauges_tolerate_one_missed_publish() {
+    for kind in [
+        "captain-gauges/v1:stage-dwell",
+        "captain-gauges/v1:star-facts",
+        "captain-gauges/v1:queue-blocked",
+    ] {
+        let row = row_for(kind);
+        assert_eq!(row.deadline(), Duration::from_secs(1800));
+        let mut f = Fake::default();
+        f.fleet
+            .insert(kind, now() - chrono::Duration::seconds(1500));
+        assert!(evaluate(&[row], &f, &[], now()).is_empty(), "{kind}");
+        f.fleet
+            .insert(kind, now() - chrono::Duration::seconds(1801));
+        assert_eq!(evaluate(&[row], &f, &[], now()).len(), 1, "{kind}");
+    }
+}
+
+fn kinds(c: &[Condition]) -> Vec<&'static str> {
+    c.iter().map(|c| c.record_kind).collect()
+}
+
+/// Every captain-gauges deadline is at least the bound the dispatchers use
+/// for that job.
+#[test]
+fn captain_gauge_deadlines_cover_the_heartbeat_contract() {
+    for (job, bound) in [
+        (STAGE_DWELL_JOB, gauges::DEFAULT_MAX_AGE_SECS),
+        (QUEUE_BLOCKED_JOB, gauges::DEFAULT_MAX_AGE_SECS),
+        (STAR_FACTS_JOB, gauges::DEFAULT_STAR_FACTS_MAX_AGE_SECS),
+    ] {
+        let row = SINGLETON_OUTPUTS.iter().find(|o| o.job == job).unwrap();
+        assert!(row.deadline().as_secs() >= bound.unsigned_abs(), "{job}");
+    }
+}
+
+/// Opt-in jobs: a fleet with them off is not owed their output; the rest of
+/// the registry is still judged, and a source that never read the config
+/// (empty `disabled`) stays loud.
+#[test]
+fn disabled_opt_in_jobs_do_not_fire() {
+    let r = roster(30);
+    let mut f = whole_fleet_at(ago(1), &r);
+    for o in SINGLETON_OUTPUTS {
+        if o.record_kind.starts_with("captain-gauges/v1:") || o.record_kind == "ci.run" {
+            f.fleet.remove(o.record_kind);
+        }
+    }
+    assert_eq!(evaluate(SINGLETON_OUTPUTS, &f, &r, now()).len(), 4);
+    f.disabled = BTreeSet::from([gauges::ENABLED_KEY, CI_TELEMETRY_KEY]);
+    assert!(evaluate(SINGLETON_OUTPUTS, &f, &r, now()).is_empty());
+    // Only the sub-switches off: stage-dwell is still owed.
+    f.disabled = BTreeSet::from([
+        gauges::STAR_FACTS_KEY,
+        gauges::QUEUE_BLOCKED_KEY,
+        CI_TELEMETRY_KEY,
+    ]);
+    assert_eq!(
+        kinds(&evaluate(SINGLETON_OUTPUTS, &f, &r, now())),
+        ["captain-gauges/v1:stage-dwell"]
+    );
 }

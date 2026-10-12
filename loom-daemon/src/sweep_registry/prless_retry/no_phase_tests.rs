@@ -157,7 +157,13 @@ fn a_clear_is_not_undone_by_the_durable_floor() {
     phaseless_death(&mut reg, 10_642, 1);
     assert_eq!(reg.prless_release_count(10_642), 2);
 
-    reg.note_prless_terminal_outcome(10_642, "sweep-other", Some(OpenPrProbe::Open(1)), "n/a");
+    reg.note_prless_terminal_outcome(
+        10_642,
+        "sweep-other",
+        Some(OpenPrProbe::Open(1)),
+        "n/a",
+        None,
+    );
     assert_eq!(reg.prless_release_count(10_642), 0);
 
     phaseless_death(&mut reg, 10_642, 2);
@@ -181,7 +187,13 @@ fn a_clear_survives_a_daemon_restart() {
         let (mut reg, _) = fixture_registry(dir.path());
         phaseless_death(&mut reg, 10_642, 0);
         phaseless_death(&mut reg, 10_642, 1);
-        reg.note_prless_terminal_outcome(10_642, "sweep-other", Some(OpenPrProbe::Open(1)), "n/a");
+        reg.note_prless_terminal_outcome(
+            10_642,
+            "sweep-other",
+            Some(OpenPrProbe::Open(1)),
+            "n/a",
+            None,
+        );
         assert_eq!(reg.prless_release_count(10_642), 0);
     }
     let (mut reg, _) = fixture_registry(dir.path());

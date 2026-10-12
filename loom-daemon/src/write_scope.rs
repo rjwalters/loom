@@ -40,6 +40,8 @@
 //!   (claim and quarantine reconciliation, star liveness, sweep dispatch, and
 //!   every scheduled role tick), which is also where the refusal is logged,
 //!   once per change of reason.
+//! - [`repo_writable`] before the workspace resync (#10718) takes a repo's
+//!   claim: its target is the workspace's `origin`, named explicitly.
 //! - `loom-daemon forge may-write` for shell, wrapped by `loom_write_repo` in
 //!   `defaults/scripts/lib/forge-helpers.sh`; the `forge issue|pr` write
 //!   passthroughs and the auto-merge verbs vet with it before they run.
@@ -49,7 +51,7 @@
 //!
 //! # The one autonomous write outside this rule
 //!
-//! The captain's ETA fit publication (`eta::fit::publish`, #10395) writes to
+//! The captain's gauge heartbeat (`captain_gauges::store`, #10395) writes to
 //! the configured fleet store (`fleet.repo`), which is not a managed workspace
 //! repo and is written under the store's writer App, not `root`'s credential,
 //! so this rule cannot vet it. Its `FleetStore` entry in

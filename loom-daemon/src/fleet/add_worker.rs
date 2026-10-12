@@ -708,10 +708,10 @@ pub fn build_plan_with_policy(
         render_workspace_register(&config.repos, config.priority),
     ));
 
-    // 8. Start the daemon under a systemd --user unit (Restart=on-success, linger).
+    // 8. Start the daemon under a systemd --user unit (Restart=always, linger).
     plan.push_step(Step::new(
         "daemon-unit",
-        "install + enable the loom-daemon systemd --user unit (linger, Restart=on-success, LOOM_DAEMON_SUPERVISOR=systemd)",
+        "install + enable the loom-daemon systemd --user unit (linger, Restart=always + RestartPreventExitStatus, OOMPolicy=continue, LOOM_DAEMON_SUPERVISOR=systemd)",
         Some("systemctl --user is-enabled loom-daemon.service >/dev/null 2>&1".to_string()),
         render_daemon_unit(&primary_rel),
     ));
@@ -1075,6 +1075,8 @@ mkdir -p "$HOME/.local/bin"
 # never a hard failure on that account. --no-restart is safe here: the
 # loom-daemon systemd unit has not been installed yet (a later step), so there
 # is never a running daemon for this invocation to try to restart.
+# #11044: this is unattended, so the fleet floor confirmation must not stop it.
+export LOOM_DAEMON_UPDATE_INVOKER=add-worker
 UPDATE_SCRIPT="$LOOM_SRC/defaults/scripts/cli/loom-daemon-update.sh"
 if ! "$UPDATE_SCRIPT" --no-restart; then
   # A missing Rust toolchain is the ONLY failure this can repair: install
@@ -1253,18 +1255,14 @@ fn render_daemon_unit(primary_rel: &str) -> String {
     // WorkingDirectory pinned to a workspace clone is the #4292 token-pool cwd
     // workaround — REMOVE once #4292 lands (token pool no longer cwd-coupled).
     //
-    // Restart=on-success + Environment=LOOM_DAEMON_SUPERVISOR=systemd mirror the
-    // canonical systemd --user unit rendered by `render_systemd_unit()` in
-    // `loom-daemon-start.sh` (#4268) — the same supervised-restart contract
-    // documented in `ipc.rs` (`detect_supervisor` / `EXIT_RESTART` /
-    // `EXIT_SIGINT` / `EXIT_SHUTDOWN`, #4054). `LOOM_DAEMON_SUPERVISOR=systemd`
-    // lets the daemon prove it is supervised before `restart --drain` exits it
-    // (#4640); `Restart=on-success` relaunches ONLY on the clean `EXIT_RESTART`
-    // (exit 0) the restart primitive uses, and leaves the daemon down on
-    // `EXIT_SIGINT` (130) / `EXIT_SHUTDOWN` (143) / a crash — deliberately NOT
-    // `Restart=on-failure`, which would do the opposite (never relaunch a
-    // requested restart, but crash-loop-relaunch is watchdog territory the
-    // fleet unit does not attempt).
+    // The supervision directives (Restart=always + RestartPreventExitStatus=,
+    // RestartSec=, KillMode=mixed, TimeoutStopSec=20, OOMPolicy=continue,
+    // SuccessExitStatus=) and the [Unit] start-rate limit come from the
+    // canonical renderer (`daemon_start::render`, #11058) instead of a second
+    // hand-kept copy -- this template drifted from it twice before (#5119 found
+    // it without KillMode=mixed; it never got #6129's exit statuses).
+    // `Environment=LOOM_DAEMON_SUPERVISOR=systemd` lets the daemon prove it is
+    // supervised before `restart --drain` exits it (#4640).
     //
     // Environment=PATH= below is rendered from the SAME canonical set
     // (path_bootstrap::canonical_path_systemd(), #4831) as
@@ -1275,6 +1273,8 @@ fn render_daemon_unit(primary_rel: &str) -> String {
     // renderer and this same function's own `export PATH=` line above it.
     let export_line = path_bootstrap::canonical_path_export_line();
     let systemd_path = path_bootstrap::canonical_path_systemd();
+    let start_limit = crate::daemon_start::render::SYSTEMD_START_LIMIT;
+    let supervision = crate::daemon_start::render::systemd_supervision_block();
     format!(
         r#"set -e
 {export_line}mkdir -p "$HOME/.config/systemd/user"
@@ -1283,7 +1283,7 @@ cat > "$HOME/.config/systemd/user/loom-daemon.service" <<'UNIT'
 Description=Loom daemon (fleet worker)
 After=network-online.target
 Wants=network-online.target
-
+{start_limit}
 [Service]
 Type=simple
 # WORKAROUND(#4292): the token pool resolves via the daemon's cwd, so pin the
@@ -1292,23 +1292,10 @@ Type=simple
 # lands.
 WorkingDirectory=%h/{primary_rel}
 ExecStart=%h/.local/bin/loom-daemon
-# Restart=on-success == the launchd KeepAlive:{{SuccessfulExit:true}} analog
-# (#4054, mirrored from loom-daemon-start.sh's render_systemd_unit): only the
-# clean EXIT_RESTART (0) relaunches; EXIT_SIGINT (130) / EXIT_SHUTDOWN (143) /
-# a crash all exit non-zero and stay down.
-Restart=on-success
-# KillMode=mixed (#4862) + TimeoutStopSec=20 (#4950): mirrored from the same
-# canonical renderer. Without KillMode=mixed, a clean exit(0) with lingering
-# sweep/role-run children in the cgroup is reclassified Result=timeout (the
-# control-group default SIGKILLs the cgroup only after the FULL TimeoutStopSec),
-# and Restart=on-success does NOT match Result=timeout -- so the relaunch never
-# fires and the worker sits dead. TimeoutStopSec=20 bounds that stop transition
-# well under systemd's 90s default as a fast-failure backstop. Both were missing
-# here until #5119, leaving every fleet worker on the exact unit shape that
-# caused the 2026-08-03 loom-worker-1 outage.
-KillMode=mixed
-TimeoutStopSec=20
-Environment=PATH={systemd_path}
+# The supervision block below is rendered by the canonical
+# daemon_start::render::systemd_supervision_block() (#11058), so the fleet unit
+# and the loom-daemon-start unit carry one exit-code contract, not two copies.
+{supervision}Environment=PATH={systemd_path}
 # Lets detect_supervisor() (ipc.rs) prove this daemon is supervised so
 # `restart --drain` will actually exit for a relaunch instead of refusing.
 Environment=LOOM_DAEMON_SUPERVISOR=systemd
@@ -1364,7 +1351,7 @@ fn render_daemon_watchdog(primary_rel: &str) -> String {
 fn render_idle_shutdown(minutes: u32) -> String {
     // Stage 2 of power-off: autonomous.idleExit is stage 1. Before #5565 this
     // guard also vetoed on bare `pgrep -f loom-daemon` process presence — but
-    // under the fleet's OWN `systemd --user … Restart=on-success` supervision
+    // under the fleet's OWN `systemd --user … Restart=always` supervision
     // (`daemon-unit`'s step, same plan), the daemon is essentially always
     // running (a stage-1 self-exit gets immediately respawned), so that veto
     // could never observe an absent daemon and `--idle-shutdown-minutes` was
@@ -1462,16 +1449,30 @@ cd "$WORKSPACE_ROOT" || {{ echo "verify: workspace root $WORKSPACE_ROOT not foun
 # be finishing startup right after daemon-unit's `systemctl --user enable
 # --now` (re)started it -- retry with a bounded ~30s wait instead of failing
 # on the very first race (#5334).
+# `loom-daemon status` exits 5 (EXIT_AUTONOMY_MISMATCH, #5409) when the daemon
+# is up and healthy but its work finder is off while the autonomy-desired
+# marker is present. That is a reachable daemon with an autonomy
+# configuration state, not "not ready" (#9064): accept 0 and 5, retry
+# anything else within the bound. The exit code is captured via `|| rc=$?`
+# so `set -e` does not abort the script on a nonzero status.
 STATUS_OK=0
+STATUS_RC=0
 for _attempt in $(seq 1 15); do
-  if loom-daemon status >/dev/null 2>&1; then
+  STATUS_RC=0
+  loom-daemon status >/dev/null 2>&1 || STATUS_RC=$?
+  if [ "$STATUS_RC" = "0" ]; then
     STATUS_OK=1
+    break
+  fi
+  if [ "$STATUS_RC" = "5" ]; then
+    STATUS_OK=1
+    echo "warning: loom-daemon status exited 5 (autonomy mismatch: work finder is off on this worker); daemon is reachable, so verification continues. Autonomy settings are left unchanged -- use explicit dispatch or enable the work finder deliberately." >&2
     break
   fi
   sleep 2
 done
 if [ "$STATUS_OK" != "1" ]; then
-  echo "loom-daemon status did not become ready within ~30s" >&2
+  echo "loom-daemon status did not become ready within ~30s (last status exit code: $STATUS_RC)" >&2
   exit 1
 fi
 # Token ranking is present + fresh (bootstrap + check ran).
@@ -1701,3 +1702,13 @@ mod tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod feed_egress_tests;
+
+// #11044: the update-script invoker marker, in its own sibling for the same
+// reason.
+#[cfg(test)]
+mod invoker_tests;
+
+// #9064: verify-script `status` exit-code handling, same reason.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod verify_status_tests;

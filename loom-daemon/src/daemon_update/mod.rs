@@ -41,6 +41,7 @@
 pub mod args;
 pub mod artifact;
 pub mod entry_points;
+pub mod floor_guard;
 pub mod notice;
 pub mod out;
 pub mod paths;
@@ -129,7 +130,7 @@ pub fn argv0_basename() -> String {
 pub fn run(argv: &[String], argv0: &str) -> ! {
     let _ = ARGV0.set(argv0.to_string());
 
-    let a = Args::parse(argv);
+    let mut a = Args::parse(argv);
     // #10179: no rebuild / provision / restart / relaunch on a disabled host.
     crate::host_optout::refuse_if_disabled_exit("daemon-update");
 
@@ -143,6 +144,11 @@ pub fn run(argv: &[String], argv0: &str) -> ! {
     }
 
     let repo_root = resolve_repo_root(&a);
+    // #11044: `--to-floor` becomes `--fetch --tag v<floor>` before anything
+    // resolves a release.
+    if a.to_floor {
+        floor_guard::apply_to_floor(&mut a, &repo_root.repo_root);
+    }
     let state = Stage::build(&a, repo_root);
     stage_two(&a, state)
 }
@@ -411,6 +417,19 @@ impl Stage {
             update_needed = true;
         }
 
+        // #11044: `--to-floor` never moves a host down, and a host already at
+        // the floor has nothing to fetch.
+        if a.to_floor {
+            if let Some(met) = floor_guard::to_floor_met(
+                a.tag.as_deref().unwrap_or_default(),
+                &installed_version,
+                a.force,
+            ) {
+                out::ok(&met);
+                exit(0);
+            }
+        }
+
         // ---- artifact-fetch resolution (Epic #4990 Phase 3, #5020) ----
         // Read-only resolution (no downloads yet). When a newer release
         // resolves for this host's platform it takes precedence over the
@@ -616,6 +635,7 @@ fn resolve_json_and_exit(a: &Args, repo_root: &Path, installed_bin: Option<&Path
             || std::env::var("LOOM_DAEMON_UPDATE_FETCH")
                 .map(|v| matches!(v.trim(), "0" | "false" | "no" | "off"))
                 .unwrap_or(false),
+        min_version: None,
     };
     let resolution = resolve(&inputs);
     // Exactly one line on stdout, and nothing else ever written there.
@@ -718,6 +738,27 @@ fn stage_two(a: &Args, s: Stage) -> ! {
         out::err("Refusing to silently fall back to a source build; re-run without --fetch to allow that, or resolve the cause above.");
         exit(1);
     }
+
+    // ---- fleet floor check (#11044) ----
+    // Before anything is fetched, built or provisioned: on a fleet host, a
+    // version that is not what the floor implies needs confirmation. Silent
+    // on a host with no fleet store. `--check` and `--resolve-json` exited
+    // above and never reach it.
+    let (target_version, target_how) = if s.artifact_mode {
+        (s.artifact_version.as_str(), format!("release {}", s.artifact_tag))
+    } else {
+        (s.source_version.as_str(), format!("a source build of {}", s.source_commit))
+    };
+    floor_guard::enforce(
+        &s.roots.repo_root,
+        floor_guard::Target {
+            version: target_version,
+            how: &target_how,
+        },
+        &s.installed_version,
+        a.dry_run,
+        a.yes,
+    );
 
     // ---- resolve the restart plan up front (read-only; safe for --dry-run) ----
     // The flags below are only consulted for the pid-file/nohup restart path —
@@ -835,8 +876,8 @@ fn stage_two(a: &Args, s: Stage) -> ! {
         run_verifiers(Some(&dest));
     } else if let Some(script) = provision_script.as_ref() {
         // The machine-level destination is the one that IS this binary on a
-        // normal fleet host — see `selfrepl` for why the write below is an
-        // unlink-and-create and why every check after it re-execs the path.
+        // normal fleet host — see `selfrepl` for why the write below is a
+        // rename (#10983) and why every check after it re-execs the path.
         selfrepl::announce_if_self(&provision_target);
         match provision::provision_machine_daemon(script, &new_bin, &s.roots.repo_root) {
             provision::ProvisionOutcome::Provisioned(dest) => {

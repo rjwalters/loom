@@ -46,6 +46,7 @@
 //! | [`advisories`] | `print_safehouse_status`, `print_calibrate_hint`, the host-sleep check |
 //! | [`launch`] | the launchd / systemd / nohup start paths |
 //! | [`platform`] | the label/domain/unit resolvers the lifecycle scripts share |
+//! | [`supervision_dropin`] | none: the daemon's startup systemd drop-in (#11111) |
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -61,6 +62,7 @@ pub mod out;
 pub mod paths;
 pub mod platform;
 pub mod render;
+pub mod supervision_dropin;
 pub mod unescape;
 pub mod watchdog_job;
 

@@ -576,6 +576,14 @@ impl SharedHostBreaker {
         }
     }
 
+    /// Register the disk-full dispatch halt (#10973) for `root`'s worktree
+    /// volume (env-resolved config); sampled from every [`Self::observe`].
+    #[must_use]
+    pub fn with_disk_guard(self, root: &std::path::Path) -> Self {
+        crate::disk_full_halt::register_from_env(root);
+        self
+    }
+
     #[must_use]
     pub fn config(&self) -> HostBreakerConfig {
         self.config
@@ -584,6 +592,9 @@ impl SharedHostBreaker {
     /// Fold one load-per-core sample into the breaker, returning any phase
     /// transition (the caller emits the log line + event on `Some`).
     pub fn observe(&self, load_per_core: Option<f64>, now: DateTime<Utc>) -> Option<Transition> {
+        // Disk-full self-protection (#10973) rides the same per-tick sample; a
+        // no-op unless the daemon registered a guard.
+        crate::disk_full_halt::global_sample();
         let mut guard = self.inner.lock().expect("host breaker mutex poisoned");
         let result = step(&guard, &self.config, load_per_core, now);
         *guard = result.next;
@@ -593,6 +604,9 @@ impl SharedHostBreaker {
     /// Whether the breaker is currently suppressing new dispatch.
     #[must_use]
     pub fn is_suppressed(&self) -> bool {
+        if crate::disk_full_halt::global_halt_reason().is_some() {
+            return true;
+        }
         if !self.config.enabled {
             return false;
         }
@@ -604,12 +618,20 @@ impl SharedHostBreaker {
     #[must_use]
     pub fn snapshot(&self) -> BreakerSnapshot {
         let guard = self.inner.lock().expect("host breaker mutex poisoned");
-        let suppressed = self.config.enabled && guard.phase.suppresses_dispatch();
+        let load_suppressed = self.config.enabled && guard.phase.suppresses_dispatch();
+        // A disk-full halt (#10973) surfaces as an Open breaker with a
+        // `disk_full: ...` reason unless the load breaker already holds.
+        let disk_reason = crate::disk_full_halt::global_halt_reason().filter(|_| !load_suppressed);
+        let suppressed = load_suppressed || disk_reason.is_some();
         BreakerSnapshot {
-            enabled: self.config.enabled,
-            phase: guard.phase,
+            enabled: self.config.enabled || disk_reason.is_some(),
+            phase: if disk_reason.is_some() {
+                BreakerPhase::Open
+            } else {
+                guard.phase
+            },
             suppressed,
-            reason: guard.reason.clone(),
+            reason: disk_reason.or_else(|| guard.reason.clone()),
             tripped_at: guard.tripped_at,
             releases_at: guard.releases_at,
             last_load_per_core: guard.last_load_per_core,

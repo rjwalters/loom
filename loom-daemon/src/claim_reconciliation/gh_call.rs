@@ -82,6 +82,7 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "quarantine.issue_timeline"
         | "guard.open_pr_timeline"
         | "outcome.label_timeline"
+        | "restore.label_timeline"
         | "sequence.label_timeline" => ops::TIMELINE_READ,
         "guard.open_pr_graphql" => ops::PR_CLOSING_ISSUE_REFERENCES,
         "claim.lease_comments"
@@ -104,6 +105,7 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "intake.add_triage"
         | "intake.remove_triage"
         | "verdict.clear_labels"
+        | "verdict.requeue_unanchored"
         | "sequence.pr_edit"
         | "review_conflict.pr_edit"
         | "guard.flip_building"
@@ -115,6 +117,7 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         "verdict.anchor_comment"
         | "verdict.reanchor_comment"
         | "verdict.stale_comment"
+        | "verdict.requeue_unanchored_comment"
         | "sequence.pr_comment"
         | "review_conflict.pr_comment"
         | "guard.lease_comment"

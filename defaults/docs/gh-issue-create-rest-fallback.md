@@ -129,14 +129,14 @@ outage alert — so those three call sites file with `--force`.
 
 ## The five-signature table
 
-A rejection whose text contains one of these (case-insensitive) is a rate
-limit, not a real failure — retry the same creation over REST instead of
-giving up:
+A rejection whose text contains one of these (case-insensitive; `·` is a
+space, #11411) is a rate limit, not a real failure — retry the same creation
+over REST instead of giving up:
 
 | Signature | Seen as |
 |---|---|
-| `api rate limit exceeded` | REST itself throttling (rare on the fallback path) |
-| `api rate limit already exceeded` | GraphQL: `GraphQL: API rate limit already exceeded for user ID …` |
+| `api rate limit·exceeded` | REST itself throttling (rare on the fallback path) |
+| `api rate limit·already exceeded` | GraphQL, as `GraphQL: … for user ID …` |
 | `secondary rate limit` | either transport, burst throttling |
 | `abuse detection mechanism` | either transport, burst throttling |
 | `was submitted too quickly` | either transport, burst throttling |
@@ -182,8 +182,14 @@ url=$(forge_gh_create_issue_rl_safe "" "$TITLE" "$BODY" "loom:triage" "bug")
 
 It tries `gh issue create` first, falls back to the REST POST above on a
 rate-limit rejection (applying labels atomically either way), prints the
-created issue's URL on success, and propagates any non-rate-limit failure
-without attempting the REST call. GitHub-only, like the sibling `*_rl_safe`
+created issue's URL on success, and propagates any other failure without
+attempting the REST call. One exception (#9714): a GraphQL **server error**
+(`Something went wrong while executing your query`, HTTP 502/503/504) also
+falls back, but because that mutation may already have committed, it first
+reads the non-search `repos/{nwo}/issues?since=<t0>` listing. An exact-title
+issue found there is adopted with no POST, and an unreadable listing means no
+POST plus a "MAY exist" error. Empty or invalid output keeps the #8289
+"MAY exist" refusal. GitHub-only, like the sibling `*_rl_safe`
 helpers — gate calls on `FORGE_TYPE == github` the same way callers already
 gate `forge_gh_comment_rl_safe` et al.
 

@@ -1,0 +1,34 @@
+{
+  "alert": "Loom work finder stale",
+  "alertType": "METRIC_BASED_ALERT",
+  "ruleType": "threshold_rule",
+  "version": "v4",
+  "evalWindow": "24h0m0s",
+  "frequency": "5m0s",
+  "condition": {
+    "compositeQuery": {
+      "queryType": "clickhouse_sql",
+      "panelType": "graph",
+      "chQueries": {
+        "A": {
+          "name": "A",
+          "query": "WITH\n  toInt64({{.end_timestamp_ms}}) AS end_ms,\n  series AS (\n    SELECT fingerprint,\n           any(if(JSONExtractString(labels, 'host.name') != '', JSONExtractString(labels, 'host.name'), JSONExtractString(labels, 'host.id'))) AS host\n    FROM signoz_metrics.time_series_v4\n    WHERE metric_name IN ('loom.queue.issues', 'loom.host.uptime_seconds')\n    GROUP BY fingerprint\n  ),\n  pts AS (\n    SELECT series.host AS host, s.metric_name AS metric, s.unix_milli AS ms\n    FROM signoz_metrics.samples_v4 AS s\n    INNER JOIN series USING (fingerprint)\n    WHERE s.metric_name IN ('loom.queue.issues', 'loom.host.uptime_seconds')\n      AND s.unix_milli >= {{.start_timestamp_ms}}\n      AND s.unix_milli < {{.end_timestamp_ms}}\n  ),\n  per_host AS (\n    SELECT host,\n           arraySort(groupUniqArrayIf(ms, metric = 'loom.queue.issues')) AS ticks,\n           maxIf(ms, metric = 'loom.host.uptime_seconds') AS last_health_ms\n    FROM pts\n    WHERE host != ''\n    GROUP BY host\n  )\nSELECT toDateTime(intDiv(end_ms, 1000)) AS ts,\n       host,\n       toFloat64(intDiv(end_ms - arrayMax(ticks), 1000)\n                 - greatest(300, 2 * intDiv(if(length(ticks) >= 3,\n                                               toInt64(arrayReduce('quantileExact(0.5)', arrayPopFront(arrayDifference(ticks)))),\n                                               60000), 1000))) AS value\nFROM per_host\nWHERE length(ticks) > 0\n  AND last_health_ms >= end_ms - 600000\nORDER BY host",
+          "disabled": false
+        }
+      }
+    },
+    "selectedQueryName": "A",
+    "op": "1",
+    "matchType": "1",
+    "target": 0
+  },
+  "labels": {
+    "severity": "critical",
+    "loom_signal": "work_finder_stale"
+  },
+  "annotations": {
+    "summary": "Loom work finder stale",
+    "description": "Host {{$labels.host}} is still exporting host.health (loom.host.uptime_seconds within 10 min) but its work finder has not ticked for {{$value}} s past its deadline. The deadline is 2x the host's own tick interval, learned as the median gap between its loom.queue.issues samples in the 24 h window (60 s if fewer than 3 ticks), floored at 300 s. A host whose work finder never ticked in the window (disabled) is not judged, nor is a host that stopped heartbeating (that is a dead host, not a stalled finder). A stalled finder on the ETA authority leaves every Ready ETA stale_inputs (see Loom Ready-stage ETAs stale or unanswered). Common cause: a full worktree disk (Loom host worktree disk critical, host.health halt_reason disk_full). Run `loom-daemon health` on the host; see troubleshooting.md 'Worker disk full'. Issue #10973 (2026-10-08: loom-worker-1's finder stopped at 14:04Z while it kept heartbeating; nothing alerted)."
+  },
+  "disabled": false
+}

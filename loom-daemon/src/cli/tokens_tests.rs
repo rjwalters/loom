@@ -120,6 +120,7 @@ mod resolve_tokens_pool_dir_for_cli_tests {
                     root: normalize_path(r),
                     priority: 100,
                     config_overrides: None,
+                    maintain_only: None,
                 })
                 .collect(),
         };

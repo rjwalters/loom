@@ -2,16 +2,23 @@
 //!
 //! Before this module every clock and counter in [`AutoUpdateState`] lived in
 //! memory, so any restart (an operator unsticking a host, a crash, or the roll's
-//! own restart) reset three things that are meant to accumulate:
+//! own restart) reset things that are meant to accumulate:
 //!
 //! - **The settle ceiling** (#10418). `first_stale_since` bounds how long a
 //!   steady release stream can defer a roll, at `6 × settleSecs`. On the AWS
 //!   workers that is 24 h, and every restart started it again.
-//! - **Roll-window consumption** (#10188 item 2). A restart inside an open window
-//!   forgot the window was already used and could arm a second roll in it.
-//! - **The stall detector** (#8998/#9010). A restart dropped a standing
-//!   unsatisfiable declaration, so the next tick paused dispatch for another
-//!   budget the detector had already counted as hopeless.
+//!
+//! (It also persisted which roll window had been used, #10188 item 2. #10885
+//! removed roll windows, and with them the `window` field: an older file's
+//! `window` key is ignored on load and dropped on the next write. The schema
+//! version is unchanged, so a rollback onto a binary that still has windows
+//! reads this binary's file, finds no `window`, and keeps the settle clocks.)
+//!
+//! (It also persisted the #8998/#9010 stall detector's state. #10831 removed
+//! that detector with the wait-for-zero roll it guarded, and with it the
+//! `stall` field: an older file's `stall` key is ignored on load. Pause-and-roll
+//! needs no stall state across its own restart: a roll no longer waits on
+//! anything a restart could forget.)
 //!
 //! # Format and location
 //!
@@ -24,7 +31,8 @@
 //!
 //! # Failure handling
 //!
-//! Written atomically: a temp file in the same directory, `fsync`, `rename`. A
+//! Written atomically: a temp file in the same directory, `fsync`, `rename`,
+//! then a best-effort `fsync` of the directory (#10880). A
 //! crash mid-write leaves either the old file or the new one, never half of one.
 //! Loading never fails: a missing, unreadable, corrupt or other-version file is
 //! a [`LoadOutcome`] that yields empty state (today's behaviour) and one log
@@ -32,19 +40,48 @@
 //!
 //! # What a restart keeps
 //!
-//! The roll-window consumption is always restored (when the schedule is
-//! unchanged): the restart that completes a roll is exactly the one that must
-//! not re-arm in the same window.
+//! The unsatisfiable-floor alert record (#10866) is always handed back. It
+//! is valid for its floor and running version, not for a build commit, and
+//! [`FloorState::set_basis`](super::floor_roll::FloorState::set_basis) keeps it
+//! on the first tick only if both still match.
 //!
-//! The settle clocks and the stall episode are restored only when the binary
-//! that saved them is the one running now. A different binary means a roll
-//! completed (or an operator installed one), which ends the stale streak, as a
-//! successful roll always has, and proves the drain was satisfiable, which is
-//! what clears a stall episode. Restoring them there would make the next release
-//! roll at once on a ceiling that belongs to the previous one.
+//! The settle clocks are restored only when the binary that saved them is the
+//! one running now. A different binary means a roll completed (or an operator
+//! installed one), which ends the stale streak, as a successful roll always
+//! has. Restoring them there would make the next release roll at once on a
+//! ceiling that belongs to the previous one.
+//!
+//! The roll-attempt record (#10880, [`super::roll_attempt`]) is also always
+//! handed back, whatever binary saved it: the binary a failed roll leaves
+//! running is the one that must judge it. It is written before a roll is
+//! armed, not only at the end of a tick.
+//!
+//! # Wall-clock times on load
+//!
+//! Every restored wall-clock time is bounded by `now`: a settle clock in the
+//! future restores as `now`, a roll attempt's arm times are clamped to `now`
+//! and its retry time to `now + 6 h`. (#10880 item 3 asked the same of the
+//! drain-stall timestamps; #10831 removed that state, so it applies to these.)
+//!
+//! `saved_at` is **not** used to subtract the downtime from restored ages
+//! (#10880 item 6, declined). Restored ages deliberately include downtime: a
+//! release that has been out for two days has been quiet for two days, and
+//! since #10885 the settle clocks only matter on a host with no fleet store.
+//! The load line reports the file's age, and a `saved_at` in the future is one
+//! WARN; the per-field clamps already bound its effect.
+//!
+//! # Durability
+//!
+//! After the rename the directory itself is synced (Unix only, best-effort:
+//! a failure is logged at debug and does not fail the write), so a power loss
+//! does not undo the rename. Persisting runs under its own `catch_unwind`, so
+//! a panic there is a counted fault, never the end of the loop.
 
-use super::stall_state::StallState;
+use super::floor_roll::alert::FloorStallState;
+use super::roll_attempt::RollAttempt;
 use super::{AutoUpdateState, RebuildOutcome};
+use crate::observability::ops::liveness::{self, Fault};
+use crate::task_liveness::AUTO_UPDATE;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::io::Write as _;
@@ -71,12 +108,21 @@ pub struct PersistedState {
     /// The settle-window clocks.
     #[serde(default)]
     pub settle: SettleClocks,
-    /// Roll-window consumption, `None` when windowing was off.
-    #[serde(default)]
-    pub window: Option<WindowConsumption>,
-    /// The unsatisfiable-roll detector's state.
-    #[serde(default)]
-    pub stall: StallState,
+    /// #10866: the last unsatisfiable-floor alert, absent when no such stall
+    /// stands. It outlives a binary change. An older binary ignores the key,
+    /// and a file without it loads as `None`, so the schema version is
+    /// unchanged. (The drain detector's `stall` key was removed by #10831 and
+    /// the roll window's `window` key by #10885; a file that still carries
+    /// either loads, and the key is ignored.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub floor_stall: Option<FloorStallState>,
+    /// #10880: the last version roll this host armed (see
+    /// [`super::roll_attempt`]). Written before the arm and restored whatever
+    /// binary saved it. Absent in older files, and ignored (then dropped on
+    /// the next write) by a binary older than #10880; the schema version is
+    /// unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roll_attempt: Option<RollAttempt>,
 }
 
 /// The settle gate's clocks, as wall-clock times.
@@ -94,22 +140,6 @@ pub struct SettleClocks {
     /// When gate 4 first deferred in the current busy run (#4929).
     #[serde(default)]
     pub deferred_since: Option<DateTime<Utc>>,
-}
-
-/// Which roll windows have been used. Indices are relative to the schedule
-/// (`period_secs`, `offset_secs`) recorded with them.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WindowConsumption {
-    /// The window period in force when saved.
-    pub period_secs: u64,
-    /// The per-host offset in force when saved.
-    pub offset_secs: u64,
-    /// Index of the latest window a roll was armed in.
-    #[serde(default)]
-    pub consumed: Option<i64>,
-    /// Index of the window whose drain timed out and was abandoned.
-    #[serde(default)]
-    pub timed_out: Option<i64>,
 }
 
 /// What loading the state file found. Every outcome but [`Self::Loaded`] means
@@ -188,7 +218,44 @@ pub fn store(path: &Path, state: &PersistedState) -> std::io::Result<()> {
     tmp.write_all(&body)?;
     tmp.as_file().sync_all()?;
     tmp.persist(path).map_err(|e| e.error)?;
+    // #10880 item 5: make the rename itself durable. Best-effort.
+    report_dir_sync(dir, sync_dir(dir));
     Ok(())
+}
+
+/// `fsync` the directory, so a rename into it survives a power loss.
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
+}
+
+/// Not supported off Unix (a directory cannot be opened to sync it there).
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> std::io::Result<()> {
+    Err(std::io::ErrorKind::Unsupported.into())
+}
+
+/// A failed directory sync costs only durability: logged at debug, never an
+/// error of the write.
+fn report_dir_sync(dir: &Path, result: std::io::Result<()>) {
+    if let Err(e) = result {
+        log::debug!("auto_update: could not sync {} after the rename: {e}", dir.display());
+    }
+}
+
+/// #10880 item 6: the load line's note on `saved_at`. `Err` (a WARN) when it
+/// is in the future; the per-field clamps already bound the effect, so the
+/// file still loads.
+fn saved_age(saved_at: DateTime<Utc>, now_utc: DateTime<Utc>) -> Result<String, String> {
+    let age = now_utc - saved_at;
+    if age < chrono::Duration::zero() {
+        return Err(format!(
+            "it was saved at {saved_at}, {}s in the future (the clock stepped back, or ran ahead \
+             when it was written); restored times are clamped to now",
+            -age.num_seconds()
+        ));
+    }
+    Ok(format!("saved {}s ago", age.num_seconds()))
 }
 
 /// Where persistence writes, held by [`AutoUpdateState`]. The default is
@@ -196,6 +263,9 @@ pub fn store(path: &Path, state: &PersistedState) -> std::io::Result<()> {
 #[derive(Debug, Default)]
 pub struct Persistence {
     path: Option<PathBuf>,
+    /// Test hook (#10880 item 4): the next persist panics.
+    #[cfg(test)]
+    pub(super) panic_on_store: bool,
 }
 
 /// `now - age`, or the earliest `Instant` this platform can represent when the
@@ -252,8 +322,8 @@ impl AutoUpdateState {
                 first_stale_since: wall(self.first_stale_since),
                 deferred_since: wall(self.deferred_since),
             },
-            window: self.window.consumption(),
-            stall: self.roll_stall.stall_state(),
+            floor_stall: self.floor.stall_state(),
+            roll_attempt: self.attempt.record().cloned(),
         }
     }
 
@@ -266,17 +336,30 @@ impl AutoUpdateState {
         now_utc: DateTime<Utc>,
         binary: &str,
     ) -> String {
-        let window = match &saved.window {
-            Some(consumption) if self.window.restore_consumption(consumption) => {
-                "window consumption"
-            }
-            Some(_) => "no window consumption (the schedule changed or windowing is off)",
-            None => "no window consumption (none saved)",
+        // #10866: before the binary check. A floor stall depends on the floor
+        // and the running version, which `set_basis` compares on the first tick.
+        let floor = match &saved.floor_stall {
+            Some(stall) => format!(
+                "; unsatisfiable-floor alert for floor {} on {} (last logged {}), kept if the \
+                 first tick finds the same floor and running version",
+                stall.floor,
+                stall.running,
+                stall.last_alerted_at.format("%Y-%m-%dT%H:%M:%SZ")
+            ),
+            None => String::new(),
         };
+        self.floor.restore_stall_state(saved.floor_stall);
+        // #10880: also before the binary check. The binary that comes back
+        // after a roll that did not take is exactly the case it is for.
+        let running = binary.split('+').next().unwrap_or(binary);
+        let attempt = self
+            .attempt
+            .restore(saved.roll_attempt, now, now_utc, running);
+        let floor = format!("{floor}{attempt}");
         if saved.binary != binary {
             return format!(
-                "restored {window}; settle clocks and stall state DROPPED because the binary \
-                 changed ({} -> {binary}), i.e. a roll completed since they were saved",
+                "settle clocks DROPPED because the binary changed ({} -> {binary}), i.e. a roll \
+                 completed since they were saved{floor}",
                 saved.binary
             );
         }
@@ -291,11 +374,9 @@ impl AutoUpdateState {
         self.stale_since = instant(stale_since);
         self.first_stale_since = instant(first_stale_since);
         self.deferred_since = instant(deferred_since);
-        let stall = stall_kind(&saved.stall);
-        self.roll_stall.restore_stall_state(saved.stall);
         let since = first_stale_since
             .map_or_else(|| "none".to_string(), |at| at.format("%Y-%m-%dT%H:%M:%SZ").to_string());
-        format!("restored settle clocks (streak since {since}), {window}, stall state {stall}")
+        format!("restored settle clocks (streak since {since}){floor}")
     }
 
     /// Enable persistence at `path` and restore whatever it holds. Logs exactly
@@ -308,55 +389,60 @@ impl AutoUpdateState {
         let shown = path.display().to_string();
         match load(&path) {
             LoadOutcome::Loaded(saved) => {
-                let restored = self.apply_persisted_state(
-                    *saved,
-                    Instant::now(),
-                    Utc::now(),
-                    &running_binary(),
-                );
-                log::info!("auto_update: loaded {shown}: {restored}");
+                let now_utc = Utc::now();
+                let age = saved_age(saved.saved_at, now_utc).unwrap_or_else(|warning| {
+                    log::warn!("auto_update: saved update state at {shown}: {warning}");
+                    "saved in the future".to_string()
+                });
+                let restored =
+                    self.apply_persisted_state(*saved, Instant::now(), now_utc, &running_binary());
+                log::info!("auto_update: loaded {shown} ({age}): {restored}");
             }
             LoadOutcome::Missing => {
                 log::info!("auto_update: no saved update state at {shown}; starting empty");
             }
             LoadOutcome::Corrupt(why) => log::warn!(
                 "auto_update: saved update state at {shown} is corrupt ({why}); starting empty — \
-                 the settle ceiling, window consumption and stall state restart from now"
+                 the settle ceiling restarts from now"
             ),
             LoadOutcome::UnknownVersion(version) => log::warn!(
                 "auto_update: saved update state at {shown} has schema_version {version}, this \
                  binary reads {SCHEMA_VERSION}; starting empty"
             ),
         }
-        self.persist = Persistence { path: Some(path) };
+        self.persist.path = Some(path);
     }
 
-    /// Called just before the tick arms a drain: record the roll window it
-    /// consumes and persist, ahead of the restart the roll may perform at once.
-    /// Pass the result to [`Self::end_roll_arm`].
-    #[must_use]
-    pub(super) fn begin_roll_arm(&mut self, outcome: &RebuildOutcome) -> Option<Option<i64>> {
-        if !matches!(outcome, RebuildOutcome::Success) {
-            return None; // nothing is armed after a failed roll
-        }
-        let prior = self.window.mark_armed();
-        if prior.is_some() {
+    /// Called just before the tick arms a roll: write the state ahead of the
+    /// restart the roll may perform at once, which the end-of-tick save would
+    /// not survive. Nothing is armed after a failed install, so nothing is
+    /// written for one.
+    pub(super) fn persist_before_arm(&self, outcome: &RebuildOutcome) {
+        if matches!(outcome, RebuildOutcome::Success) {
             self.persist_state();
-        }
-        prior
-    }
-
-    /// Called after the arm attempt: a drain that was not armed gives the
-    /// window back. The end-of-tick save then records the corrected state.
-    pub(super) fn end_roll_arm(&mut self, prior: Option<Option<i64>>, armed: bool) {
-        if let (false, Some(prior)) = (armed, prior) {
-            self.window.unmark_armed(prior);
         }
     }
 
     /// Write the current state. Best-effort: a failure is logged, and the
     /// in-memory state is unaffected.
+    ///
+    /// #10880 item 4: under its own `catch_unwind`, for both callers (the end
+    /// of `guarded_tick` and the pre-arm write). A panic is logged at ERROR and
+    /// counted as a `panic` fault of the auto-update task; the loop continues.
     pub(super) fn persist_state(&self) {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.store_now()));
+        if let Err(payload) = result {
+            log::error!(
+                "auto_update: persisting the update state panicked ({}); the loop keeps running",
+                super::runner::panic_message(payload.as_ref())
+            );
+            liveness::fault(AUTO_UPDATE, Fault::Panic);
+        }
+    }
+
+    fn store_now(&self) {
+        #[cfg(test)]
+        assert!(!self.persist.panic_on_store, "test hook: persist panics");
         let Some(path) = self.persist.path.as_deref() else {
             return;
         };
@@ -364,19 +450,10 @@ impl AutoUpdateState {
         if let Err(e) = store(path, &state) {
             log::warn!(
                 "auto_update: could not persist update state to {}: {e} (a restart now resets \
-                 the settle ceiling, window consumption and stall state)",
+                 the settle ceiling)",
                 path.display()
             );
         }
-    }
-}
-
-/// The variant name, for the restore log line.
-fn stall_kind(stall: &StallState) -> &'static str {
-    match stall {
-        StallState::None { .. } => "none",
-        StallState::DrainDeadlines { .. } => "drain_deadlines",
-        StallState::Unsatisfiable { .. } => "unsatisfiable",
     }
 }
 

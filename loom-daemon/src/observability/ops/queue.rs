@@ -5,7 +5,9 @@
 //! per known disposition. Each gauge is labelled `state` (`running`, `ready`
 //! or `blocked`) and `reason` (the disposition's wire name). A second gauge,
 //! `loom.queue.listing_failed_repos`, counts the repos whose ready listing
-//! failed, which means the counts are incomplete rather than low.
+//! failed, which means the counts are incomplete rather than low. A third,
+//! `loom.queue.listing_incomplete_repos` (#11139), counts the repos whose
+//! listing came back partial: their rows are counted, but not all of them.
 //!
 //! Every disposition is emitted every tick, **zeros included**, so an empty
 //! queue reads as `0` and not as a missing series. A missing series then
@@ -22,7 +24,8 @@ fn int(value: usize) -> i64 {
 }
 
 /// The tick's queue gauges: one `loom.queue.issues{state,reason}` point per
-/// entry of [`QueueDisposition::ALL`], plus `loom.queue.listing_failed_repos`.
+/// entry of [`QueueDisposition::ALL`], plus `loom.queue.listing_failed_repos`
+/// and `loom.queue.listing_incomplete_repos`.
 #[must_use]
 pub fn queue_points(summary: &WorkFinderTickSummary) -> Vec<MetricPoint> {
     let mut points: Vec<MetricPoint> = QueueDisposition::ALL
@@ -37,6 +40,11 @@ pub fn queue_points(summary: &WorkFinderTickSummary) -> Vec<MetricPoint> {
     points.push(MetricPoint::int(
         MetricName::QueueListingFailedRepos,
         int(summary.listing_failed.len()),
+    ));
+    // #11139: a partial listing is not a whole one either.
+    points.push(MetricPoint::int(
+        MetricName::QueueListingIncompleteRepos,
+        int(summary.listing_incomplete.len()),
     ));
     points
 }

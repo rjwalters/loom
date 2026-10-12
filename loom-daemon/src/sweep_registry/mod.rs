@@ -110,6 +110,8 @@ pub mod containment_signal;
 // `is_pid_alive` reaches every consumer (the reaper, the orphan reaper, and
 // #9464's claim-label heal) without a re-export line in this ratcheted file.
 pub(crate) mod crash_signals;
+/// Who asked for a dispatch (#11444); every dispatch-core entry takes one.
+pub use crate::telemetry::DispatchOrigin;
 // `generate_sweep_id` lives with the `SweepKind` it names (model.rs) — moved out
 // of this ratcheted file; re-exported for the existing callers.
 pub use model::generate_sweep_id;
@@ -118,24 +120,34 @@ mod decline_cooldown;
 mod dispatch;
 mod guards;
 mod heartbeat_broadcast;
+mod journal_shadow;
+mod landed_guard;
 mod lease_episode;
 mod locks;
 mod model;
 mod noop_cooldown;
 mod outcome_journal;
 mod overflow;
+mod resolved_facts;
 // `pub`: the daemon-hold record contract (`is_daemon_hold`, #10161) is read
 // by the stale-blocked readers (#10556, #10558).
 pub mod park_hold;
 mod pool_hold_broadcast;
+mod prepared_dispatch;
+pub use prepared_dispatch::PreparedIssueDispatch;
 pub(crate) mod private_dispatch;
 mod prless_retry;
 mod quarantine;
 mod quarantine_escalation;
 pub(crate) mod reaper;
 mod restore_to_ready;
+pub(crate) mod resume_handle;
+pub(crate) mod roll_gate;
+pub(crate) mod roll_requeue;
+pub(crate) mod roll_resume;
 mod spawn_process;
 mod stacking;
+mod start_facts;
 #[cfg(test)]
 #[allow(unused_imports)]
 pub(crate) mod test_support;
@@ -147,6 +159,8 @@ mod watchdog;
 // Several submodules (e.g. `stacking`) only contribute inherent
 // `impl SweepRegistry` methods with nothing free-standing to import, so the
 // glob below is a no-op for them -- harmless, silenced explicitly.
+/// #10719: the typed refusal for a held workspace, beside the other dispatch errors.
+pub use crate::workspace_hold::WorkspaceHeldDispatchError;
 #[allow(unused_imports)]
 pub use crash_signals::*;
 #[allow(unused_imports)]
@@ -155,6 +169,8 @@ pub use decline_cooldown::*;
 pub use dispatch::*;
 #[allow(unused_imports)]
 pub use guards::*;
+#[allow(unused_imports)]
+pub use landed_guard::*;
 #[allow(unused_imports)]
 pub use locks::*;
 #[allow(unused_imports)]
@@ -171,6 +187,8 @@ pub use quarantine::*;
 pub use quarantine_escalation::*;
 #[allow(unused_imports)]
 pub use reaper::*;
+#[allow(unused_imports)]
+pub use resolved_facts::*;
 #[allow(unused_imports)]
 pub use stacking::*;
 #[allow(unused_imports)]
@@ -647,7 +665,7 @@ pub struct SweepRegistry {
     /// outcome classification, so it never overlaps or interferes with
     /// [`quarantined`](Self::quarantined) or
     /// [`dispatch_backoff`](Self::dispatch_backoff) above.
-    noop_cooldown: HashMap<u32, NoopCooldownState>,
+    noop_cooldown: NoopCooldownTable,
     /// Hard-exclusion decline cooldown parameters (Issue #7528). Set at
     /// provision time from the resolved env > config > default value,
     /// mirroring [`noop_cooldown_config`](Self::noop_cooldown_config).
@@ -766,6 +784,9 @@ pub struct SweepRegistry {
     /// Pruned alongside `phase_history` at the same terminal-entry GC site,
     /// for the same "unbounded across many dispatches" reason.
     sampled_loc: HashMap<SweepId, (i64, i64)>,
+    /// What each dispatch knew about the sweep it started (#11280): read by
+    /// `fleet.state` for the sweep's running row. Pruned with `phase_history`.
+    start_facts: HashMap<SweepId, telemetry::SweepStartFacts>,
     /// Orphaned process groups awaiting SIGKILL escalation (Issue #4980).
     ///
     /// Written by [`reap_orphaned_group`](Self::reap_orphaned_group) when a
@@ -845,6 +866,8 @@ pub struct SweepRegistry {
     /// tie-break, spawn failure) never wedges the key against a later,
     /// legitimate same-key dispatch.
     inflight_idempotency: HashMap<String, SweepId>,
+    /// #10974: the dispatch gate a daemon roll closes (`roll_gate`).
+    roll_gate: roll_gate::RollGate,
 }
 
 /// Resolve this host's identity string for collision records (Issue #4085) and
@@ -1031,47 +1054,6 @@ pub enum BeginIssueDispatch {
     Spawned(Box<PreparedIssueDispatch>),
 }
 
-/// Everything [`finish_issue_dispatch`](SweepRegistry::finish_issue_dispatch)
-/// needs to record a dispatch after the caller has polled the spawned child
-/// OUTSIDE the registry mutex (Issue #6592). Produced by
-/// [`begin_issue_dispatch`](SweepRegistry::begin_issue_dispatch).
-pub struct PreparedIssueDispatch {
-    /// The live child handle. `poll_and_classify_spawned_child` takes this
-    /// by `&mut` to poll its log/exit status; `finish_issue_dispatch` then
-    /// takes ownership to record it in `self.children`.
-    pub(crate) child: Child,
-    /// `sweep_id=<id>` — anchors the log scan to this dispatch's own header
-    /// line (see `spawn_child_process`'s doc comment).
-    pub(crate) header_anchor: String,
-    pub(crate) log_path: PathBuf,
-    pub(crate) issue_number: u32,
-    pub(crate) sweep_id: SweepId,
-    pub(crate) kind: SweepKind,
-    pub(crate) idempotency_key: Option<String>,
-    /// Already normalized: empty strings collapsed to `None`, matching the
-    /// spawn-side rule that `--model ""` / `--effort ""` are never emitted.
-    pub(crate) model: Option<String>,
-    pub(crate) effort: Option<String>,
-    pub(crate) depends_on: Option<u32>,
-    /// What this dispatch resolved onto, and the metered backstop slot that
-    /// choosing it took (#8555). Carried here — rather than parked in shared
-    /// state keyed on the resolving thread — because this box is precisely the
-    /// value that crosses the resolve→spawn seam on EVERY dispatch path,
-    /// including the two that do not stay on one thread: `ipc.rs`'s
-    /// `spawn_blocking(...).await` between begin and finish, and the reaper's
-    /// batch of pending resumes prepared in one pass and finished in another.
-    /// Dropping this box releases the slot, so an abandoned dispatch cannot
-    /// leak one. See `runtime_preference::handoff`.
-    pub(crate) admission: crate::runtime_preference::DispatchAdmission,
-    /// The issue's story-point size (#9432), resolved at guard-chain step 2.71
-    /// from the label set the #4444 park guard already fetched, and carried
-    /// across the begin→poll→finish seam so `finish_issue_dispatch` can stamp
-    /// it on the `sweep.global.dispatch` event without re-reading the forge.
-    /// `None` for an unsized issue, a defective points label set, or a skipped
-    /// label read — never `0`.
-    pub(crate) story_points: Option<u32>,
-}
-
 /// Result of the lock-scoped [`begin_cancel`](SweepRegistry::begin_cancel)
 /// step of a split cancel (Issue #3807).
 ///
@@ -1170,7 +1152,7 @@ impl SweepRegistry {
             dispatch_backoff_config: DispatchBackoffConfig::default(),
             dispatch_backoff: HashMap::new(),
             noop_cooldown_config: NoopCooldownConfig::default(),
-            noop_cooldown: HashMap::new(),
+            noop_cooldown: NoopCooldownTable::default(),
             decline_cooldown_config: DeclineCooldownConfig::default(),
             decline_cooldown: HashMap::new(),
             prless_retry_config: PrlessRetryConfig::default(),
@@ -1181,10 +1163,12 @@ impl SweepRegistry {
             flap_warned_at: HashMap::new(),
             phase_history: HashMap::new(),
             sampled_loc: HashMap::new(),
+            start_facts: HashMap::new(),
             pending_group_reaps: HashMap::new(),
             activity_window: None,
             owner_repo_cache: Mutex::new(None),
             inflight_idempotency: HashMap::new(),
+            roll_gate: roll_gate::RollGate::default(),
         }
     }
 
@@ -1509,6 +1493,7 @@ impl SweepRegistry {
             entries: self.entries.clone(),
             children: self.children.keys().cloned().collect(),
             checkpoint_dir: self.config.checkpoint_dir(),
+            workspace_root: self.config.workspace_root.clone(),
             locks_dir: self.config.locks_dir(),
             quarantined_issues_sorted,
         }
@@ -1622,6 +1607,7 @@ pub struct RegistrySnapshot {
     /// `!self.children.contains_key` eligibility gate.
     children: HashSet<SweepId>,
     checkpoint_dir: PathBuf,
+    workspace_root: PathBuf,
     locks_dir: PathBuf,
     quarantined_issues_sorted: Vec<u32>,
 }
@@ -1659,6 +1645,7 @@ impl RegistrySnapshot {
         scan_stale_sweep_findings(
             self.entries.iter(),
             &|id| self.children.contains(id),
+            &self.workspace_root,
             min_age,
             log_silence_timeout,
         )

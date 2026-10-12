@@ -345,7 +345,7 @@ fn keyless_regexp_does_not_leak_rejected_workflow() {
             ..EvidenceFacts::default()
         },
         "host-a".to_string(),
-        crate::eta::Provenance::current(),
+        crate::telemetry::provenance::Provenance::current(),
         chrono::Utc::now(),
     );
     assert!(r.identity_regexp.is_some());
@@ -378,7 +378,7 @@ fn sanitize_drops_path_and_token_shaped_public_text() {
         &policy,
         &EvidenceFacts::default(),
         "host-a".to_string(),
-        crate::eta::Provenance::current(),
+        crate::telemetry::provenance::Provenance::current(),
         chrono::Utc::now(),
     );
     assert!(r.configured_workflow.is_none());
@@ -410,7 +410,7 @@ fn identity_and_issuer_reject_credential_urls_and_local_paths() {
                 ..EvidenceFacts::default()
             },
             "host-a".to_string(),
-            crate::eta::Provenance::current(),
+            crate::telemetry::provenance::Provenance::current(),
             chrono::Utc::now(),
         )
     };
@@ -444,7 +444,7 @@ fn sample(tag: &str) -> SignatureEvidence {
         &SignaturePolicy::default(),
         &EvidenceFacts::default(),
         "host-a".to_string(),
-        crate::eta::Provenance::current(),
+        crate::telemetry::provenance::Provenance::current(),
         chrono::Utc::now(),
     )
 }

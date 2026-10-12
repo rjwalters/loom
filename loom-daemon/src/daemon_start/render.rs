@@ -83,9 +83,7 @@ pub fn launchd_plist(
     s.push_str(&expand_printf_b(&env_entries));
     s.push_str("    </dict>\n");
     s.push_str("    <key>RunAtLoad</key>\n    <true/>\n");
-    s.push_str(
-        "    <key>KeepAlive</key>\n    <dict>\n        <key>SuccessfulExit</key>\n        <true/>\n    </dict>\n",
-    );
+    s.push_str(LAUNCHD_KEEP_ALIVE);
     s.push_str("    <key>ProcessType</key>\n    <string>Background</string>\n");
     s.push_str(&format!(
         "    <key>StandardOutPath</key>\n    <string>{}</string>\n",
@@ -99,12 +97,114 @@ pub fn launchd_plist(
     s
 }
 
+/// The daemon plist's `KeepAlive` dict: the launchd half of the exit-code
+/// contract (#4054, #11058).
+///
+/// launchd ORs the conditions. `SuccessfulExit` relaunches the clean
+/// `EXIT_RESTART` (0). `Crashed` (#11058) relaunches a death by a crash signal
+/// (`SIGSEGV`, `SIGBUS`, `SIGILL`, `SIGABRT`, `SIGFPE`, `SIGSYS`, `SIGTRAP`).
+/// Every stay-down exit (1, 79, 130, 143) is a non-zero `exit()`, which is
+/// neither, so `restart --drain --then-exit`, an operator stop and a
+/// fleet-stopped refusal still stay down.
+///
+/// launchd cannot express systemd's "relaunch on everything but these codes":
+/// it does not count `SIGKILL` (jetsam, `kill -9`) as a crash, and a panic is a
+/// plain `exit(101)`. Those two still leave the job down, and the autonomy-loss
+/// watchdog's bounded recovery (#5391, #6388) is what revives them. Making
+/// `KeepAlive` unconditional would close them, but it would also relaunch every
+/// deliberate stop. macOS has no counterpart to the cgroup `OOMPolicy` gap: a
+/// killed child never takes its parent's job down.
+pub const LAUNCHD_KEEP_ALIVE: &str = "    <key>KeepAlive</key>\n    <dict>\n        \
+     <key>SuccessfulExit</key>\n        <true/>\n        \
+     <key>Crashed</key>\n        <true/>\n    </dict>\n";
+
+/// The `[Unit]` start-rate limit that bounds `Restart=always` (#11058).
+///
+/// Five starts per ten minutes, counting supervised relaunches. Past that the
+/// unit lands `failed (Result: start-limit-hit)` and the autonomy-loss watchdog's
+/// bounded recovery takes over, so a daemon that dies on every boot cannot spin
+/// forever. Shared with the fleet add-worker unit.
+pub const SYSTEMD_START_LIMIT: &str = "StartLimitIntervalSec=600\nStartLimitBurst=5\n";
+
+/// The exit statuses after which the daemon must STAY DOWN under
+/// `Restart=always` (#11058), rendered as `RestartPreventExitStatus=`.
+///
+/// Built from the daemon's own exit-code constants so the unit and the code
+/// cannot drift: [`crate::ipc::EXIT_STARTUP_FAILURE`] (1, a startup refusal such
+/// as the singleton guard), [`crate::fleet_state::EXIT_FLEET_STOPPED`] (79, the
+/// fleet run state says `stopped`), [`crate::ipc::EXIT_SIGINT`] (130) and
+/// [`crate::ipc::EXIT_SHUTDOWN`] (143, which is also `EXIT_SIGTERM` and the
+/// `restart --drain --then-exit` code from `drain_exit_code(true)`). `SIGTERM` /
+/// `SIGINT` cover a signal death before the daemon's handler is installed.
+/// [`crate::ipc::EXIT_RESTART`] (0) is deliberately absent: it is the supervised
+/// relaunch.
+#[must_use]
+pub fn systemd_restart_prevent_exit_status() -> String {
+    let mut codes = vec![
+        crate::ipc::EXIT_STARTUP_FAILURE,
+        crate::fleet_state::EXIT_FLEET_STOPPED,
+        crate::ipc::EXIT_SIGINT,
+        crate::ipc::EXIT_SHUTDOWN,
+        crate::ipc::EXIT_SIGTERM,
+    ];
+    codes.sort_unstable();
+    codes.dedup();
+    let mut s = codes
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(" ");
+    s.push_str(" SIGTERM SIGINT");
+    s
+}
+
+/// The `[Service]` supervision block shared by the canonical unit and the fleet
+/// add-worker unit: the exit-code contract as a comment, then the directives.
+///
+/// Each directive has an incident behind it. `KillMode=mixed` (#4862) and
+/// `TimeoutStopSec=20` (#4950) keep a clean exit from being reclassified
+/// `Result=timeout`. `SuccessExitStatus=143 130` (#6129) lands an operator stop
+/// in `inactive`, not `failed`. `Restart=always` + `RestartPreventExitStatus=`
+/// (#11058) replaced `Restart=on-success`, which left a daemon killed by
+/// anything but a clean exit down until someone restarted it by hand.
+/// `OOMPolicy=continue` (#11058) stops the OOM kill of ONE child (a `git`, a
+/// sweep) from stopping the whole unit, which is the systemd default
+/// (`OOMPolicy=stop`).
+#[must_use]
+pub fn systemd_supervision_block() -> String {
+    format!(
+        "# Exit-code contract (#4054, #6129, #11058). Restart=always relaunches after\n\
+         # every exit EXCEPT the stay-down codes in RestartPreventExitStatus, and\n\
+         # never after `systemctl --user stop`/`disable --now` (operator stop).\n\
+         #   0    EXIT_RESTART          supervised restart / idle exit   -> relaunch\n\
+         #   1    EXIT_STARTUP_FAILURE  startup refusal (singleton etc.) -> stay down\n\
+         #   79   EXIT_FLEET_STOPPED    fleet run state is `stopped`     -> stay down\n\
+         #   130  EXIT_SIGINT           Ctrl-C                           -> stay down\n\
+         #   143  EXIT_SIGTERM / EXIT_SHUTDOWN: SIGTERM, IPC Shutdown,\n\
+         #        restart --drain --then-exit                            -> stay down\n\
+         #   SIGTERM/SIGINT death before the handler is installed      -> stay down\n\
+         #   anything else: SIGKILL (kernel OOM kill), SIGSEGV/SIGABRT,\n\
+         #   a panic (101), a stop timeout                             -> relaunch\n\
+         # RestartSec=5 plus [Unit] StartLimitBurst=5 per StartLimitIntervalSec=600\n\
+         # bound a crash loop; past that the unit is failed and the autonomy-loss\n\
+         # watchdog takes over. OOMPolicy=continue: an OOM-killed child no longer\n\
+         # stops the whole unit (the systemd default, OOMPolicy=stop, did).\n\
+         Restart=always\n\
+         RestartSec=5\n\
+         KillMode=mixed\n\
+         TimeoutStopSec=20\n\
+         OOMPolicy=continue\n\
+         SuccessExitStatus=143 130\n\
+         RestartPreventExitStatus={}\n",
+        systemd_restart_prevent_exit_status()
+    )
+}
+
 /// `render_systemd_unit <daemon_bin> <workdir> <log_path>` — the Linux mirror.
 ///
-/// `Restart=on-success` + `KillMode=mixed` + `TimeoutStopSec=20` +
-/// `SuccessExitStatus=143 130` / `RestartPreventExitStatus=143 130` are each
-/// load-bearing and each has an incident behind it; the shell's comments at
-/// their printf sites carry the full rationale and are not repeated here.
+/// The supervision directives come from [`systemd_supervision_block`] and
+/// [`SYSTEMD_START_LIMIT`], which carry the exit-code contract and the incident
+/// behind each line.
 #[must_use]
 pub fn systemd_unit(
     bin: &str,
@@ -137,16 +237,13 @@ pub fn systemd_unit(
     s.push_str("Description=Loom autonomous daemon (loom-daemon)\n");
     s.push_str("After=network-online.target\n");
     s.push_str("Wants=network-online.target\n");
+    s.push_str(SYSTEMD_START_LIMIT);
     s.push('\n');
     s.push_str("[Service]\n");
     s.push_str("Type=simple\n");
     s.push_str(&format!("WorkingDirectory={workdir}\n"));
     s.push_str(&format!("ExecStart={bin}\n"));
-    s.push_str("Restart=on-success\n");
-    s.push_str("KillMode=mixed\n");
-    s.push_str("TimeoutStopSec=20\n");
-    s.push_str("SuccessExitStatus=143 130\n");
-    s.push_str("RestartPreventExitStatus=143 130\n");
+    s.push_str(&systemd_supervision_block());
     s.push_str(&expand_printf_b(&env_lines));
     s.push_str(&format!("StandardOutput=append:{log_path}\n"));
     s.push_str(&format!("StandardError=append:{log_path}\n"));
@@ -655,6 +752,106 @@ mod tests {
         }
         assert!(p.contains("LOOM_WORK_FINDER"));
         assert!(u.contains("Environment=LOOM_WORK_FINDER=1"));
+    }
+
+    /// The one value of `key=` in `text`, panicking unless there is exactly one.
+    fn sole_value<'a>(text: &'a str, key: &str) -> &'a str {
+        let prefix = format!("{key}=");
+        let hits: Vec<&str> = text
+            .lines()
+            .filter_map(|l| l.strip_prefix(prefix.as_str()))
+            .collect();
+        assert_eq!(hits.len(), 1, "expected exactly one {key}= line in:\n{text}");
+        hits[0]
+    }
+
+    /// How a main-process exit ends, as systemd records it.
+    enum Exit {
+        Code(i32),
+        Signal(&'static str),
+    }
+
+    /// systemd's relaunch decision for a main-process exit, read off the
+    /// RENDERED unit text rather than off the constants, so a unit that drifts
+    /// from the code fails here. Models `Restart=always` + `RestartPreventExitStatus=`
+    /// only; any other `Restart=` value makes the model refuse.
+    fn systemd_relaunches(unit: &str, exit: &Exit) -> bool {
+        assert_eq!(sole_value(unit, "Restart"), "always", "the model covers Restart=always only");
+        let prevent: Vec<&str> = sole_value(unit, "RestartPreventExitStatus")
+            .split_whitespace()
+            .collect();
+        let token = match exit {
+            Exit::Code(c) => c.to_string(),
+            Exit::Signal(s) => (*s).to_string(),
+        };
+        !prevent.contains(&token.as_str())
+    }
+
+    fn unit() -> String {
+        systemd_unit("/b", "/w", "/l", "/p", "/h", &[])
+    }
+
+    #[test]
+    fn the_unit_survives_a_child_oom_kill_and_relaunches_after_a_failure() {
+        // #11058: a git child OOM-killed in the daemon's cgroup stopped the unit
+        // (systemd's default OOMPolicy=stop), the daemon exited 143, and
+        // Restart=on-success left the host with no daemon for 40 minutes.
+        let u = unit();
+        assert_eq!(sole_value(&u, "OOMPolicy"), "continue");
+        assert_eq!(sole_value(&u, "Restart"), "always");
+        assert_eq!(sole_value(&u, "RestartSec"), "5");
+        assert_eq!(sole_value(&u, "RestartPreventExitStatus"), "1 79 130 143 SIGTERM SIGINT");
+        assert_eq!(sole_value(&u, "SuccessExitStatus"), "143 130");
+        assert_eq!(sole_value(&u, "KillMode"), "mixed");
+        assert_eq!(sole_value(&u, "TimeoutStopSec"), "20");
+        assert!(!u.contains("Restart=on-success"));
+        // StartLimit* are [Unit] settings; systemd ignores them under [Service].
+        let unit_section = u.split("[Service]").next().expect("has [Unit]");
+        assert_eq!(sole_value(unit_section, "StartLimitIntervalSec"), "600");
+        assert_eq!(sole_value(unit_section, "StartLimitBurst"), "5");
+    }
+
+    #[test]
+    fn the_rendered_unit_keeps_every_stay_down_exit_down() {
+        let u = unit();
+        let stay_down = [
+            ("restart --drain --then-exit", crate::ipc::drain_exit_code(true)),
+            ("fleet run state stopped", crate::fleet_state::EXIT_FLEET_STOPPED),
+            ("startup refusal", crate::ipc::EXIT_STARTUP_FAILURE),
+            ("SIGTERM handler", crate::ipc::EXIT_SIGTERM),
+            ("IPC Shutdown", crate::ipc::EXIT_SHUTDOWN),
+            ("Ctrl-C", crate::ipc::EXIT_SIGINT),
+        ];
+        for (why, code) in stay_down {
+            assert!(!systemd_relaunches(&u, &Exit::Code(code)), "{why} (exit {code}) relaunched");
+        }
+        for sig in ["SIGTERM", "SIGINT"] {
+            assert!(!systemd_relaunches(&u, &Exit::Signal(sig)), "death by {sig} relaunched");
+        }
+    }
+
+    #[test]
+    fn the_rendered_unit_relaunches_a_restart_and_every_involuntary_death() {
+        let u = unit();
+        assert!(systemd_relaunches(&u, &Exit::Code(crate::ipc::EXIT_RESTART)));
+        assert!(systemd_relaunches(&u, &Exit::Code(crate::ipc::drain_exit_code(false))));
+        // The kernel OOM killer, a segfault, an abort, and an unwinding panic.
+        for sig in ["SIGKILL", "SIGSEGV", "SIGABRT"] {
+            assert!(systemd_relaunches(&u, &Exit::Signal(sig)), "death by {sig} stayed down");
+        }
+        assert!(systemd_relaunches(&u, &Exit::Code(101)), "a panic stayed down");
+    }
+
+    #[test]
+    fn the_plist_relaunches_a_clean_exit_and_a_crash_only() {
+        let p = launchd_plist("l", "/b", "/w", "/lg", "/p", "/h", &[]);
+        assert!(p.contains(LAUNCHD_KEEP_ALIVE));
+        assert!(p.contains("<key>SuccessfulExit</key>\n        <true/>"));
+        assert!(p.contains("<key>Crashed</key>\n        <true/>"));
+        // An unconditional KeepAlive would relaunch every stay-down exit,
+        // including `restart --drain --then-exit` (#4521).
+        assert!(!p.contains("<key>KeepAlive</key>\n    <true/>"));
+        assert_eq!(p.matches("<key>KeepAlive</key>").count(), 1);
     }
 
     #[test]

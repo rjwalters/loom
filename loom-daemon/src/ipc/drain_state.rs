@@ -1,14 +1,20 @@
 //! The daemon-global drain state machine (Issue #4090, extended by #4521,
-//! #6007, #8514, #8652 and #9588).
+//! #8514, #8652, #9588 and #10831).
 //!
 //! Moved out of `ipc.rs` unchanged apart from #9588's additions (drain origin,
 //! the operator timed-out hold, the startup operator-stop hold, and the
 //! durable operator-stop record) because that file is over
 //! `.loom/docs/file-size-policy.md`'s threshold and frozen. Re-exported from
 //! `crate::ipc` verbatim, so every existing caller is unchanged.
+//!
+//! #10831 removed #6007's retained-roll bookkeeping (a refused roll deadline
+//! re-armed on a widening window, then abandoned): every automatic roll is now
+//! a [`DrainOrigin::PauseRoll`] drain whose supervisor pauses the in-flight
+//! agents and restarts, so nothing waits for the in-flight count to reach
+//! zero. The pause's own state transitions live in the `pause` child module.
 
 use super::drain_ledger;
-use super::drain_roll::{drain_pending_budget, drain_refusal_decision, RefusalDecision};
+use super::drain_status::PauseRollStatus;
 use chrono::Utc;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -46,26 +52,28 @@ pub struct DrainState {
     stop_marker: Option<PathBuf>,
 }
 
-/// Who started a drain (Issue #9588) — it decides what a deadline without
-/// `--force-after-timeout` does.
+/// Who started a drain (Issue #9588) — it decides how the drain completes.
 ///
 /// - [`Self::Operator`] (every IPC `DrainAndRestartDaemon`: `restart --drain`,
 ///   `loom-daemon-update.sh --drain`, `fleet drain`): the operator asked for
-///   dispatch to stop, so a timeout keeps it **paused** and never resumes it on
-///   its own — only `--abort-drain` or a completed drain ends the pause.
-/// - [`Self::AutoUpdate`] (the self-update roll): keeps #6007's pending-roll
-///   re-arm and budget, then abandons the roll and resumes dispatch. This one
-///   is deliberately different: a version roll nobody asked for must never
-///   starve a host of work indefinitely.
+///   dispatch to stop. The drain completes when in-flight reaches zero; a
+///   timeout keeps dispatch **paused** and never resumes it on its own — only
+///   `--abort-drain` or a completed drain ends the pause.
+/// - [`Self::PauseRoll`] (#10831, every automatic roll: floor, repo-ahead,
+///   restart-only config, autoUpdate): the drain completes when every
+///   in-flight agent is stopped at a safe point or requeued and the pause
+///   manifest is written (`crate::auto_update::pause_roll`, design
+///   `docs/design/daemon-roll-pause-resume.md` §7). It never waits for the
+///   in-flight count to reach zero, and its deadline is the pause budget.
 ///
-/// One-way: an operator request against an in-progress auto-update drain
-/// promotes it to `Operator`; the reverse never happens.
+/// One-way: an operator request against a pause roll that has not stopped
+/// anything yet promotes it to `Operator`; the reverse never happens.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum DrainOrigin {
     #[default]
     Operator,
-    AutoUpdate,
+    PauseRoll,
 }
 
 impl DrainOrigin {
@@ -74,7 +82,7 @@ impl DrainOrigin {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Operator => "operator",
-            Self::AutoUpdate => "auto-update",
+            Self::PauseRoll => "pause-roll",
         }
     }
 }
@@ -96,22 +104,8 @@ pub struct DrainDescriptor {
     /// drain`'s teardown use case). See [`Request::DrainAndRestartDaemon`]'s
     /// `then_exit` field.
     pub then_exit: bool,
-    /// When this drain started — the anchor for the pending-roll budget
-    /// (Issue #6007).
+    /// When this drain started — the anchor for `paused_secs` in status.
     pub started_at: Option<chrono::DateTime<Utc>>,
-    /// The drain timeout this drain was *requested* with. Retained (rather than
-    /// only being folded into `deadline`) so a pending roll can size its retry
-    /// windows and its total budget from the operator's own number (#6007).
-    pub base_timeout: Duration,
-    /// How many deadline refusals this drain has already survived (#6007). `0`
-    /// for a drain that has not yet reached its first deadline.
-    pub refusals: u32,
-    /// `true` while the roll intent is **retained** across a deadline refusal:
-    /// new dispatch stays paused and the restart re-arms itself the moment
-    /// in-flight next reaches zero (Issue #6007). This is the state that keeps a
-    /// busy host converging on a new binary without an operator re-issuing
-    /// `restart --drain` with a bigger `--timeout`.
-    pub roll_pending: bool,
     /// The artifact identity this roll was triggered for (Issue #8514), set by
     /// the auto-updater immediately after its trigger is accepted (see
     /// [`DrainState::set_roll_target`]). `None` for any drain the auto-updater
@@ -133,6 +127,10 @@ pub struct DrainDescriptor {
     /// operator-stop record existed (#9588) — no drain supervisor is running,
     /// so a later drain request replaces the hold instead of acking it.
     pub startup_hold: bool,
+    /// The H4 pause's progress while a [`DrainOrigin::PauseRoll`] drain runs
+    /// (#10831); `None` for every other drain. `stopped` is the commit point
+    /// the operator-interplay rules key on (see the `pause` child module).
+    pub pause: Option<PauseRollStatus>,
     /// `true` when the hold was placed because the fleet store's
     /// `fleet/state.yml` says this host is **`paused`** (#9598) rather than
     /// because of a local operator stop.
@@ -144,6 +142,11 @@ pub struct DrainDescriptor {
     /// never touching a #9588 operator-stop hold — a local `restart --drain
     /// --then-exit` is a different operator action and wins locally.
     pub fleet_hold: bool,
+    /// `true` while dispatch is held because this daemon started with a live
+    /// pause manifest (#10832): H5 is verifying the new binary and resuming the
+    /// paused agents. No supervisor is behind it, so a real drain request
+    /// replaces it; the `resume` child module places and releases it.
+    pub resume_hold: bool,
 }
 
 /// Outcome of [`DrainState::begin`].
@@ -169,42 +172,12 @@ pub enum DrainBegin {
         /// stay-down (the one-way `then_exit` transition — see
         /// [`DrainState::begin`]).
         escalated: bool,
-        /// `true` when this request escalated a **pending roll** to
-        /// `--force-after-timeout` and pulled its re-armed deadline in to now
-        /// (Issue #6007 — see [`DrainState::begin`]). Only ever `true` while
-        /// `roll_pending`, so #4521's "the active drain's deadline/force flag
-        /// stay pinned" invariant is untouched for a first-attempt drain.
+        /// `true` when this request escalated the active drain to
+        /// `--force-after-timeout` (one-way, #9588 — see [`DrainState::begin`]).
         force_escalated: bool,
-        /// `true` when this operator request promoted an in-progress
-        /// auto-update drain to [`DrainOrigin::Operator`] (#9588).
+        /// `true` when this operator request promoted a pause roll that had not
+        /// stopped anything yet to [`DrainOrigin::Operator`] (#9588, #10831).
         origin_promoted: bool,
-    },
-}
-
-/// The outcome [`DrainState::refuse_roll_deadline`] applied (Issue #6007).
-#[derive(Debug, PartialEq, Eq)]
-pub enum RollRefusal {
-    /// The roll survived the refusal: dispatch is still paused, the deadline was
-    /// re-armed `window` out, and the supervisor keeps polling.
-    Deferred {
-        /// 1-based retry counter (`1` for the first refusal).
-        attempt: u32,
-        /// The re-armed window.
-        window: Duration,
-        /// Time since the drain began.
-        elapsed: Duration,
-        /// Total paused-dispatch budget for this roll.
-        budget: Duration,
-    },
-    /// The budget is spent: the flag was cleared, the generation bumped, and the
-    /// roll intent discarded.
-    Abandoned {
-        /// How many times the roll was re-armed before giving up.
-        attempts: u32,
-        /// Time since the drain began.
-        elapsed: Duration,
-        /// Total paused-dispatch budget that was available.
-        budget: Duration,
     },
 }
 
@@ -288,6 +261,17 @@ impl DrainState {
     /// operator's, not the store's.
     pub fn hold_for_fleet_state(&self, note: String) -> bool {
         let mut inner = self.inner.lock().expect("Drain mutex poisoned");
+        // #10832: an H5 resume hold ends by itself, and the store's `paused`
+        // must outlive it. The fleet hold takes the pause over in place, so
+        // dispatch is never open between H5 finishing and the next sync pass.
+        if inner.active && inner.resume_hold {
+            inner.resume_hold = false;
+            inner.startup_hold = true;
+            inner.fleet_hold = true;
+            inner.origin = DrainOrigin::Operator;
+            inner.note = Some(note);
+            return true;
+        }
         if inner.active {
             return false;
         }
@@ -499,10 +483,18 @@ impl DrainState {
     /// or an operator drain held after a timeout) forces on the next tick, and a
     /// first-attempt drain forces at `min(existing deadline, now + timeout)`.
     ///
-    /// **Origin (#9588).** An [`DrainOrigin::Operator`] request promotes an
-    /// in-progress auto-update drain to `Operator` — from then on a timeout
-    /// holds dispatch paused instead of abandoning the roll, and the
-    /// auto-updater can no longer supersede it. The reverse never happens.
+    /// **Origin (#9588, #10831).** An [`DrainOrigin::Operator`] request
+    /// promotes an in-progress [`DrainOrigin::PauseRoll`] drain to `Operator`
+    /// **only while the pause has stopped nothing** (rule 1 of #10831's
+    /// operator interplay): the target label is cleared, the operator's
+    /// timeout and force flag become the drain's, and the pause supervisor
+    /// stands down at its next step boundary (withdraws its pause requests,
+    /// deletes the manifest, stops nothing) and supervises the operator drain
+    /// instead. Once the pause has stopped an agent (rule 2) a relaunch request
+    /// is acked as `AlreadyDraining` with no promotion and the roll completes;
+    /// a then-exit request still escalates the terminal action (rule 3), so the
+    /// daemon stops without relaunch once the manifest says `phase = paused`.
+    /// The reverse (operator → pause roll) never happens.
     ///
     /// Equivalent to [`Self::begin_as`] with [`DrainOrigin::Operator`].
     pub fn begin(
@@ -527,26 +519,32 @@ impl DrainState {
         let mut inner = self.inner.lock().expect("Drain mutex poisoned");
         // A startup hold (#9588) has no supervisor behind it, so a drain request
         // replaces it with a real, supervised drain rather than acking it.
-        if inner.active && !inner.startup_hold {
+        if inner.active && !inner.startup_hold && !inner.resume_hold {
             let escalated = then_exit && !inner.then_exit;
             let force_escalated = force_after_timeout && !inner.force_after_timeout;
-            let origin_promoted =
-                origin == DrainOrigin::Operator && inner.origin == DrainOrigin::AutoUpdate;
+            let origin_promoted = origin == DrainOrigin::Operator
+                && inner.origin == DrainOrigin::PauseRoll
+                && !inner.pause.as_ref().is_some_and(|p| p.stopped);
             if escalated {
                 inner.then_exit = true;
             }
             if origin_promoted {
                 inner.origin = DrainOrigin::Operator;
-                // No longer a supersedable auto-update roll (#8514).
+                // No longer a supersedable roll (#8514), and no longer a pause:
+                // the pause supervisor stands down at its next step boundary.
                 inner.roll_target = None;
+                inner.pause = None;
+                // The pause roll's deadline was its pause budget; an operator
+                // drain runs on the operator's own timeout from here.
+                inner.deadline = Some(Utc::now() + requested);
             }
             if force_escalated {
                 inner.force_after_timeout = true;
                 let now = Utc::now();
                 inner.deadline = Some(match inner.deadline {
-                    Some(d) if !inner.roll_pending && !inner.timed_out => d.min(now + requested),
-                    // Already past its deadline (pending roll / timed-out hold):
-                    // act on the next supervisor tick.
+                    Some(d) if !inner.timed_out => d.min(now + requested),
+                    // Already past its deadline (timed-out hold): act on the
+                    // next supervisor tick.
                     _ => now,
                 });
             }
@@ -565,8 +563,8 @@ impl DrainState {
             }
             if origin_promoted {
                 parts.push(
-                    "promoted from an auto-update roll to an operator drain — a timeout now keeps \
-                     dispatch paused instead of resuming it",
+                    "promoted from a pause roll (nothing stopped yet) to an operator drain — it \
+                     now waits for in-flight work to finish, and a timeout keeps dispatch paused",
                 );
             }
             if !parts.is_empty() {
@@ -591,15 +589,12 @@ impl DrainState {
         inner.force_after_timeout = force_after_timeout;
         inner.then_exit = then_exit;
         inner.note = None;
-        // #6007 pending-roll bookkeeping — a fresh drain always starts with a
-        // clean retry history.
         let started_at = Utc::now();
         inner.started_at = Some(started_at);
-        inner.base_timeout = timeout;
-        inner.refusals = 0;
-        inner.roll_pending = false;
         // #8514: a fresh drain has no target until whoever armed it records one.
         inner.roll_target = None;
+        // #10831: a pause roll's progress is installed by `begin_pause_roll`.
+        inner.pause = None;
         // #9588: origin + the timed-out / startup holds.
         inner.origin = if was_held {
             DrainOrigin::Operator
@@ -608,9 +603,10 @@ impl DrainState {
         };
         inner.timed_out = false;
         inner.startup_hold = false;
-        // #9598: a real, supervised drain replaces a fleet-state hold — the
-        // operator's terminal action (relaunch / stay down) now owns the pause,
-        // so the store must not be able to release it out from under them.
+        inner.resume_hold = false; // #10832: H5 sees the hold gone and stops relaunching
+                                   // #9598: a real, supervised drain replaces a fleet-state hold — the
+                                   // operator's terminal action (relaunch / stay down) now owns the pause,
+                                   // so the store must not be able to release it out from under them.
         inner.fleet_hold = false;
         // Set the flag while holding the descriptor lock so status can never
         // observe `flag=true` with `active=false`.
@@ -628,34 +624,57 @@ impl DrainState {
 
     /// Abort an in-progress drain: clear the flag, bump the generation (so the
     /// running supervisor stops without exiting), and record a note. Returns
-    /// `true` when a drain was actually in progress.
+    /// `true` when a drain was actually aborted — see [`Self::abort_checked`]
+    /// for the outcome that tells "nothing to abort" from "refused".
     ///
     /// #9588: the operator abort also clears the operator-stop record (restoring
     /// the moved-aside `autonomy-desired` marker) — even when no drain is active,
     /// so a stale record can always be cleared from a running daemon.
     pub fn abort(&self) -> bool {
+        matches!(self.abort_checked(), AbortOutcome::Aborted)
+    }
+
+    /// [`Self::abort`] with its outcome (#10831): an operator `--abort-drain` is
+    /// **refused** for a pause roll that has already stopped an agent's process
+    /// tree (design §7 failure edges: honoured before H4 step 4, or in step 5
+    /// while nothing is stopped yet). Aborting then would leave stopped work
+    /// behind with no restart to pick it up, so the roll completes instead.
+    pub fn abort_checked(&self) -> AbortOutcome {
         let mut inner = self.inner.lock().expect("Drain mutex poisoned");
         if !inner.active {
             drop(inner);
             self.clear_operator_stop();
-            return false;
+            return AbortOutcome::NotActive;
+        }
+        if inner.resume_hold {
+            return AbortOutcome::Refused(resume::ABORT_REFUSED.to_string());
+        }
+        if inner.origin == DrainOrigin::PauseRoll {
+            if let Some(p) = inner.pause.as_ref().filter(|p| p.stopped) {
+                return AbortOutcome::Refused(format!(
+                    "refusing --abort-drain: the pause-and-roll pause is at H4 step {} and has \
+                     already stopped agent process trees, so aborting would strand stopped work \
+                     with no restart to pick it up (#10831, design §7). The roll completes: the \
+                     daemon writes the pause manifest and restarts onto the new binary, which \
+                     resumes or requeues every recorded agent.",
+                    p.step
+                ));
+            }
         }
         self.flag.store(false, Ordering::Relaxed);
         self.generation.fetch_add(1, Ordering::Relaxed);
         inner.active = false;
         inner.deadline = None;
-        // #6007: an abort is also the operator's way OUT of a retained (pending)
-        // roll, so say so — otherwise "dispatch resumed" reads identically for
-        // two quite different states.
-        inner.note = Some(if inner.roll_pending {
-            "drain aborted by operator — the pending roll was cancelled and dispatch resumed; \
-             this host stays on its current binary until a new roll is triggered"
+        inner.note = Some(if inner.pause.is_some() {
+            "drain aborted by operator — the pause roll was cancelled before it stopped any \
+             agent (its pause requests are withdrawn) and dispatch resumed; this host stays on \
+             its current binary until a new roll is triggered"
                 .to_string()
         } else {
             "drain aborted by operator — dispatch resumed".to_string()
         });
-        inner.roll_pending = false;
         inner.roll_target = None;
+        inner.pause = None;
         let was_held = inner.startup_hold;
         let was_fleet = inner.fleet_hold;
         inner.timed_out = false;
@@ -679,28 +698,34 @@ impl DrainState {
         self.ledger_after(inner, Utc::now(), false);
         // #9588: an operator abort undoes the stop intent as well.
         self.clear_operator_stop();
-        true
+        AbortOutcome::Aborted
     }
 
-    /// The auto-updater's own way out of a roll it armed (#8514 supersede,
-    /// #8998 unsatisfiable): [`Self::abort`], but **only** for an
-    /// [`DrainOrigin::AutoUpdate`] drain (#9588). An operator drain — including
-    /// an auto-update roll an operator request promoted — is never ended by the
-    /// auto-updater, and the operator-stop record is never touched here.
-    /// Returns `true` when a drain was aborted.
-    pub fn abort_auto_update_roll(&self) -> bool {
+    /// The auto-updater's own way out of a roll it armed (#8514 supersede):
+    /// [`Self::abort`], but **only** for a [`DrainOrigin::PauseRoll`] drain that
+    /// is not a then-exit and has not stopped anything yet (#10831: supersede
+    /// works until the pause commits). An operator drain — including a pause
+    /// roll an operator request promoted — is never ended by the auto-updater,
+    /// and the operator-stop record is never touched here. Returns `true` when
+    /// a drain was aborted.
+    pub fn abort_pause_roll(&self) -> bool {
         let mut inner = self.inner.lock().expect("Drain mutex poisoned");
-        if !inner.active || inner.origin != DrainOrigin::AutoUpdate || inner.then_exit {
+        // (#10832: an H5 resume hold is not a roll the updater armed.)
+        if !inner.active
+            || inner.resume_hold
+            || inner.origin != DrainOrigin::PauseRoll
+            || inner.then_exit
+            || inner.pause.as_ref().is_some_and(|p| p.stopped)
+        {
             return false;
         }
         self.flag.store(false, Ordering::Relaxed);
         self.generation.fetch_add(1, Ordering::Relaxed);
         inner.active = false;
         inner.deadline = None;
-        inner.roll_pending = false;
         inner.roll_target = None;
-        inner.note =
-            Some("auto-update roll ended by the auto-updater — dispatch resumed".to_string());
+        inner.pause = None;
+        inner.note = Some("pause roll ended by the auto-updater — dispatch resumed".to_string());
         self.ledger_after(inner, Utc::now(), false);
         true
     }
@@ -715,22 +740,23 @@ impl DrainState {
     /// teardown is never superseded by a newer binary.
     pub fn set_roll_target(&self, target: Option<String>) {
         let mut inner = self.inner.lock().expect("Drain mutex poisoned");
-        if inner.active && !inner.then_exit && inner.origin == DrainOrigin::AutoUpdate {
+        if inner.active && !inner.then_exit && inner.origin == DrainOrigin::PauseRoll {
             inner.roll_target = target;
         }
     }
 
-    /// The supervisor's fail-safe timeout path: clear the flag, bump the
-    /// generation, and record the refusal note so status explains why the
-    /// daemon stayed up.
+    /// End the drain without exiting: clear the flag, bump the generation, and
+    /// record `note` so status explains why the daemon stayed up. Since #10831
+    /// this is a pause roll's H7 `pause-failed` path (the manifest could not be
+    /// written, so nothing was signalled and dispatch resumes).
     pub(crate) fn resolve_timeout(&self, note: String) {
         let mut inner = self.inner.lock().expect("Drain mutex poisoned");
         self.flag.store(false, Ordering::Relaxed);
         self.generation.fetch_add(1, Ordering::Relaxed);
         inner.active = false;
         inner.deadline = None;
-        inner.roll_pending = false;
         inner.roll_target = None;
+        inner.pause = None;
         inner.note = Some(note);
         self.ledger_after(inner, Utc::now(), false);
     }
@@ -749,75 +775,22 @@ impl DrainState {
     }
 
     /// Record a note on the active/last drain without touching any other state
-    /// (Issue #6007) — the supervisor renders its note *after*
-    /// [`Self::refuse_roll_deadline`] has decided what to do, since the wording
-    /// depends on the decision.
+    /// (Issue #6007).
     pub fn set_note(&self, note: String) {
         let mut inner = self.inner.lock().expect("Drain mutex poisoned");
         inner.note = Some(note);
     }
+}
 
-    /// The Issue #6007 fail-safe deadline path for a **relaunch (roll)** drain:
-    /// retain the roll instead of discarding it.
-    ///
-    /// This is the fix for the drain/work-finder livelock. Before #6007 the
-    /// deadline called [`Self::resolve_timeout`], which cleared the pause flag —
-    /// handing the admission window straight back to the work finder, which
-    /// admitted more sweeps, which made the *next* drain strictly harder to
-    /// satisfy. On a host that is actually working, in-flight never reached zero
-    /// and a drain-based roll never landed.
-    ///
-    /// Now the intent survives: the pause flag stays set, the deadline is
-    /// re-armed on a widened window, the generation is **not** bumped (so the
-    /// same supervisor keeps polling and completes the restart the instant
-    /// in-flight reaches zero), and only once the total paused-dispatch budget is
-    /// spent does the roll give up — resuming dispatch exactly as before, so a
-    /// genuinely wedged sweep can never starve the host of work forever.
-    ///
-    /// `now` is injected so the whole widen-then-give-up sequence is testable
-    /// without sleeping.
-    pub fn refuse_roll_deadline(&self, now: chrono::DateTime<Utc>) -> RollRefusal {
-        let mut inner = self.inner.lock().expect("Drain mutex poisoned");
-        let base = inner.base_timeout;
-        let started = inner.started_at.unwrap_or(now);
-        let elapsed = (now - started).to_std().unwrap_or_default();
-        let budget = drain_pending_budget(base);
-        match drain_refusal_decision(base, inner.refusals, elapsed) {
-            RefusalDecision::Defer { window } => {
-                inner.refusals = inner.refusals.saturating_add(1);
-                inner.roll_pending = true;
-                inner.deadline = Some(
-                    now + chrono::Duration::from_std(window)
-                        .unwrap_or_else(|_| chrono::Duration::seconds(0)),
-                );
-                // Deliberately NOT touched: `self.flag` (dispatch stays paused —
-                // the whole point) and `self.generation` (the live supervisor
-                // must keep supervising, and an operator `abort` must still be
-                // able to supersede it).
-                RollRefusal::Deferred {
-                    attempt: inner.refusals,
-                    window,
-                    elapsed,
-                    budget,
-                }
-            }
-            RefusalDecision::Abandon => {
-                let attempts = inner.refusals;
-                self.flag.store(false, Ordering::Relaxed);
-                self.generation.fetch_add(1, Ordering::Relaxed);
-                inner.active = false;
-                inner.deadline = None;
-                inner.roll_pending = false;
-                inner.roll_target = None;
-                self.ledger_after(inner, now, false);
-                RollRefusal::Abandoned {
-                    attempts,
-                    elapsed,
-                    budget,
-                }
-            }
-        }
-    }
+/// What [`DrainState::abort_checked`] did (#10831).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AbortOutcome {
+    /// The drain was aborted and dispatch resumed.
+    Aborted,
+    /// No drain was active (a stale operator-stop record was still cleared).
+    NotActive,
+    /// Refused, with the operator-facing reason.
+    Refused(String),
 }
 
 /// The three terminal/continue decisions a drain-supervisor poll can reach
@@ -831,12 +804,9 @@ pub enum DrainTick {
     /// Zero in-flight — restart now (exit `EXIT_RESTART`).
     Complete,
     /// Deadline passed with sweeps still in flight and no force — refuse the
-    /// restart and stay up. What happens to *dispatch* then depends on the
-    /// drain's terminal action (Issue #6007): a **relaunch (roll)** drain retains
-    /// its intent and keeps dispatch paused
-    /// ([`DrainState::refuse_roll_deadline`]), while a **then-exit (teardown)**
-    /// drain keeps the historical behavior and resumes dispatch immediately
-    /// ([`DrainState::resolve_timeout`]).
+    /// restart and stay up. Only an operator drain reaches this (a pause roll
+    /// is not supervised by this poll), and it holds dispatch paused
+    /// ([`DrainState::hold_after_timeout`], #9588).
     TimedOutRefuse,
     /// Deadline passed with sweeps still in flight and `--force-after-timeout` —
     /// cancel the stragglers, then restart.
@@ -860,6 +830,14 @@ pub fn evaluate_drain_tick(in_flight: usize, past_deadline: bool, force: bool) -
         DrainTick::Continue
     }
 }
+
+/// #10831: the pause roll's step/commit transitions.
+#[path = "drain_pause.rs"]
+mod pause;
+#[path = "drain_resume.rs"]
+mod resume;
+pub use pause::PauseOwnership;
+pub use resume::ResumeHold;
 
 #[cfg(test)]
 #[path = "drain_state_tests.rs"]

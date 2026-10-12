@@ -5,6 +5,7 @@ use crate::event_bus::EventBus;
 use crate::forge_parser::parse_forge_events;
 use crate::git_parser;
 use crate::git_utils;
+use crate::issue_state_read;
 use crate::main_health_gate::WorkspaceHealthStates;
 use crate::role_validation;
 use crate::sweep_registry::{
@@ -92,8 +93,8 @@ pub const EXIT_STARTUP_FAILURE: i32 = 1;
 /// launchd plist's `EnvironmentVariables`, so it survives a relaunch. Likewise
 /// returns `Some("systemd")` when `LOOM_DAEMON_SUPERVISOR=systemd`
 /// (case-insensitive) is present — a value the systemd unit's `Environment=`
-/// bakes in, relying on `Restart=on-success` to relaunch the daemon after the
-/// clean `EXIT_RESTART` exit. Any other or absent value ⇒ `None` (the daemon is
+/// bakes in, relying on `Restart=always` (#11058) to relaunch the daemon after
+/// the clean `EXIT_RESTART` exit. Any other or absent value ⇒ `None` (the daemon is
 /// unsupervised: nohup / Linux without a recognized supervisor / `--foreground`),
 /// and the restart primitive must refuse to end the process because nothing
 /// would bring it back.
@@ -222,9 +223,11 @@ pub fn build_restart_decision(in_flight: usize) -> (Response, bool) {
                     a systemd --user service (e.g. a fleet worker provisioned before #4640), \
                     retrofit it instead of restarting manually: mkdir -p \
                     ~/.config/systemd/user/loom-daemon.service.d && printf \
-                    '[Service]\\nEnvironment=LOOM_DAEMON_SUPERVISOR=systemd\\nRestart=on-success\\n' \
+                    '[Service]\\nEnvironment=LOOM_DAEMON_SUPERVISOR=systemd\\n' \
                     > ~/.config/systemd/user/loom-daemon.service.d/supervisor.conf && \
-                    systemctl --user daemon-reload."
+                    systemctl --user daemon-reload. Once supervised, the daemon writes \
+                    its own Restart= supervision drop-in (zz-loom-supervision.conf, #11111) at \
+                    startup."
                     .to_string(),
             },
             false,
@@ -248,30 +251,20 @@ pub const DRAIN_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// #8652's persisted per-UTC-day paused-dispatch ledger — write-side only.
 pub mod drain_ledger;
-/// The pending-roll policy (#6007) and its live status projection (#8514) —
-/// extracted to a sibling module because this file is over
-/// `.loom/docs/file-size-policy.md`'s threshold and frozen, and because the
-/// projection belongs next to the policy whose state it renders. Re-exported
-/// verbatim so every existing `crate::ipc::…` caller is unchanged.
-pub mod drain_roll;
+/// The live drain/pause-roll status projection (#8514, #10831).
+pub mod drain_status;
+pub use drain_status::{DrainRollStatus, PauseRollStatus, MAX_DRAIN_PENDING_BUDGET_SECS};
 
-pub use drain_roll::{
-    drain_pending_budget, drain_refusal_decision, drain_refusal_path, drain_timeout_action,
-    DrainRollStatus, RefusalDecision, RefusalPath, TimeoutAction, DRAIN_PENDING_BUDGET_MULTIPLIER,
-    MAX_DRAIN_PENDING_BUDGET_SECS, MAX_DRAIN_RETRY_WINDOW_SECS, MIN_DRAIN_RETRY_WINDOW_SECS,
-};
-
-/// The drain state machine (#4090 … #9588) — see the module doc.
+/// The drain state machine (#4090 … #10831) — see the module doc.
 pub mod drain_state;
 pub use drain_state::{
-    evaluate_drain_tick, DrainBegin, DrainDescriptor, DrainOrigin, DrainState, DrainTick,
-    RollRefusal,
+    evaluate_drain_tick, AbortOutcome, DrainBegin, DrainDescriptor, DrainOrigin, DrainState,
+    DrainTick, PauseOwnership, ResumeHold,
 };
 /// `DrainAndRestartDaemon` handling and the drain supervisor — see the module doc.
 pub mod drain_supervisor;
 pub use drain_supervisor::{
-    drain_complete_log_line, drain_exit_code, drain_roll_abandoned_note, drain_roll_pending_note,
-    drain_timeout_hold_note, drain_timeout_refuse_note, handle_drain_request,
+    drain_complete_log_line, drain_exit_code, drain_timeout_hold_note, handle_drain_request,
     list_in_flight_sweeps,
 };
 
@@ -437,6 +430,9 @@ pub struct IpcServer {
     /// flag is OR'd into the dispatch producers' halt checks; the IPC handler
     /// sets/aborts it and the `DaemonStatus` snapshot renders it.
     drain_state: Arc<DrainState>,
+    /// The `DaemonStatus` builds in flight (#10861): concurrent requests for
+    /// the same section set share one build. See `status_off_runtime`.
+    status_flights: Arc<status_off_runtime::StatusFlights>,
 }
 
 impl IpcServer {
@@ -464,6 +460,7 @@ impl IpcServer {
             fallback_root,
             credential_preflight: Arc::new(credential_preflight),
             drain_state,
+            status_flights: Arc::default(),
         }
     }
 
@@ -541,6 +538,7 @@ impl IpcServer {
                     let fallback = self.fallback_root.clone();
                     let credential_preflight = self.credential_preflight.clone();
                     let drain = self.drain_state.clone();
+                    let flights = self.status_flights.clone();
                     tokio::spawn(async move {
                         if let Err(e) = handle_client(
                             stream,
@@ -553,6 +551,7 @@ impl IpcServer {
                             fallback,
                             credential_preflight,
                             drain,
+                            flights,
                         )
                         .await
                         {
@@ -580,6 +579,7 @@ async fn handle_client(
     fallback_root: PathBuf,
     credential_preflight: Arc<CredentialPreflightReport>,
     drain_state: Arc<DrainState>,
+    status_flights: Arc<status_off_runtime::StatusFlights>,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -648,11 +648,13 @@ async fn handle_client(
         // `health_states` halt flags, which the dispatcher does not receive.
         // The build is `O(roots)` and can take minutes on a busy host, so it
         // runs on the blocking pool, never inline on a tokio worker (#10765),
-        // and a panic in it still yields an error frame (#4279). See
-        // `status_off_runtime`. `DaemonStatusSections` (#10787) is the same
-        // build scoped to the requested sections — see `status_scope`.
+        // concurrent requests share one build (#10861), and a panic in it
+        // still yields an error frame (#4279). See `status_off_runtime`.
+        // `DaemonStatusSections` (#10787) is the same build scoped to the
+        // requested sections — see `status_scope`.
         if let Some(sections) = status_scope::requested_sections(&request) {
             let response = status_off_runtime::serve(
+                &status_flights,
                 &workspace_pool,
                 &health_states,
                 &fallback_root,
@@ -707,6 +709,9 @@ async fn handle_client(
             depends_on,
             workspace_root,
             force,
+            runtime,
+            model_profile,
+            dispatch_origin,
         } = request
         {
             let response = dispatch_sweep_nonblocking(
@@ -720,10 +725,30 @@ async fn handle_client(
                 depends_on,
                 workspace_root,
                 force,
+                runtime,
+                model_profile,
+                // #11444: absent on the wire records `unknown`, never `operator`.
+                crate::sweep_registry::DispatchOrigin::from_request(dispatch_origin),
             )
             .await;
             let response_json = serde_json::to_string(&response)?;
             writer.write_all(response_json.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+            continue;
+        }
+
+        // ReadIssueState (#8876): a blocking `gh` read, kept off the runtime.
+        if let Request::ReadIssueState {
+            workspace_root,
+            repo,
+            issue,
+        } = request
+        {
+            let reply =
+                issue_state_read::daemon::handle_blocking(workspace_root, repo, issue).await;
+            writer
+                .write_all(serde_json::to_string(&Response::IssueState(reply))?.as_bytes())
+                .await?;
             writer.write_all(b"\n").await?;
             continue;
         }
@@ -758,19 +783,21 @@ async fn handle_client(
         }
 
         if let Request::AbortDrain = request {
-            let was_draining = drain_state.abort();
+            let outcome = drain_state.abort_checked();
+            let was_draining = outcome == AbortOutcome::Aborted;
             let _ = event_bus.publish_generic(
                 "daemon.drain.aborted",
                 serde_json::json!({ "was_draining": was_draining }),
             );
-            let message = if was_draining {
-                "drain aborted — dispatch resumed; no restart will fire (even if in-flight \
-                 later reaches zero). Any operator-stop record was cleared (#9588)."
-                    .to_string()
-            } else {
-                "no drain in progress — nothing to abort (no-op; any stale operator-stop record \
-                 was cleared, #9588)."
-                    .to_string()
+            let message = match outcome {
+                AbortOutcome::Aborted => "drain aborted — dispatch resumed; no restart will fire \
+                     (even if in-flight later reaches zero). Any operator-stop record was cleared \
+                     (#9588)."
+                    .to_string(),
+                AbortOutcome::NotActive => "no drain in progress — nothing to abort (no-op; any \
+                     stale operator-stop record was cleared, #9588)."
+                    .to_string(),
+                AbortOutcome::Refused(why) => why, // #10831: a committed pause roll
             };
             let response = Response::DaemonDrain {
                 accepted: was_draining,
@@ -1360,6 +1387,7 @@ pub fn build_daemon_status_for(
         phase_sweep_command_check += phase_start.elapsed();
         per_repo.push(crate::types::RepoStatus {
             root: root.clone(),
+            maintain_only: workspace_registry.maintain_only_of(root),
             priority: workspace_registry.priority_of(root),
             in_flight_count,
             health_gate_halted: health_states.is_halted(root),
@@ -1509,6 +1537,7 @@ pub fn build_daemon_status_for(
         drain_note: None,
         drain_roll: None,
         drain_paused_by_day: BTreeMap::new(),
+        pause_resume: crate::auto_update::pause_resume::status(), // #10832
         // Autonomous self-update loop status (#4055) — read from the
         // process-global snapshot the loop publishes each tick. The loop is
         // process-global (exactly one per daemon, never a per-workspace
@@ -1516,6 +1545,7 @@ pub fn build_daemon_status_for(
         // thread; an unset global (loop never spawned) reads as the default
         // "disabled, never checked" snapshot.
         auto_update_enabled: au.enabled,
+        auto_update_mode: crate::auto_update::loop_mode::current().map(|m| m.describe().into()),
         auto_update_last_check: au.last_check,
         auto_update_last_roll: au.last_roll,
         auto_update_consecutive_failures: au.consecutive_failures,
@@ -1526,7 +1556,6 @@ pub fn build_daemon_status_for(
         auto_update_artifact_published_at: au.artifact_published_at,
         auto_update_stale_repo_ticks: au.stale_repo_ticks,
         auto_update_stale_repo: au.stale_repo,
-        auto_update_roll_window: au.roll_window,
         // Long-running task liveness (#10414): every registered loop's
         // last beat and whether it is inside its staleness window.
         task_liveness: crate::task_liveness::snapshot(),
@@ -1572,6 +1601,11 @@ pub fn build_daemon_status_for(
         // a daemon with observability off — the singular field above already
         // distinguishes that state.
         observability_exports: crate::observability::global_export_statuses(),
+        // OTLP-export health (#11353): evaluated from config + live exporter
+        // status, so a daemon with no exporter at all still answers.
+        otlp_export: Some(crate::observability::otlp_health::check_global(
+            &crate::observability::read_config(workspace_root),
+        )),
         // Forge event-feed consumer (ADR-0021, #8765) — same process-global
         // snapshot pattern. Always `Some` from a daemon of this vintage: a
         // consumer that never started reports `disabled`, so "is my cursor
@@ -2817,6 +2851,9 @@ fn handle_request(
             depends_on,
             workspace_root,
             force,
+            runtime,
+            model_profile,
+            dispatch_origin,
         } => {
             // Host-distress circuit breaker (#4235): a *tripped* breaker
             // represents SUSTAINED, already-observed host distress across
@@ -2902,6 +2939,19 @@ fn handle_request(
             // daemon-dispatched child is pinned to an explicit model.
             let repo_root = sr.config().workspace_root.clone();
 
+            // Per-dispatch runtime/modelProfile (#11284): validate (refusing an
+            // unavailable or unadmitted tap, no silent fallback) with no side
+            // effects; the record is saved only after the dispatch is accepted.
+            let tap_plan = match crate::dispatch_tap::validate_request(
+                &repo_root,
+                &kind,
+                runtime.as_deref(),
+                model_profile.as_deref(),
+            ) {
+                Ok(plan) => plan,
+                Err(response) => return *response,
+            };
+
             // Headroom advisory (#4234, Gap 1 of #4231's decomposition): consult
             // the same dynamic concurrency cap the autonomous work finder
             // applies to its own dispatches, and advise — never gate — an
@@ -2936,13 +2986,23 @@ fn handle_request(
                 crate::sweep_registry::DispatchModel::Request(model.as_deref()),
                 effort.as_deref(),
                 depends_on,
+                crate::sweep_registry::DispatchOrigin::from_request(dispatch_origin),
             ) {
-                Ok(outcome) => Response::SweepDispatched {
-                    sweep_id: outcome.sweep_id,
-                    pid: outcome.pid,
-                    token_name: outcome.token_name,
-                    log_path: outcome.log_path,
-                },
+                Ok(outcome) => {
+                    // Accepted and spawned. An idempotency hit is the
+                    // in-flight sweep itself: leave its record alone.
+                    if outcome.was_new {
+                        if let Err(response) = tap_plan.commit(&repo_root) {
+                            return *response;
+                        }
+                    }
+                    Response::SweepDispatched {
+                        sweep_id: outcome.sweep_id,
+                        pid: outcome.pid,
+                        token_name: outcome.token_name,
+                        log_path: outcome.log_path,
+                    }
+                }
                 Err(e) => match e.downcast::<crate::runtime_admission::RuntimeRejection>() {
                     Ok(rejection) => Response::RuntimeRejected(rejection),
                     Err(e) => {
@@ -3338,6 +3398,9 @@ fn handle_request(
                 .count();
             build_restart_decision(in_flight).0
         }
+        Request::ReadIssueState { .. } => Response::Error {
+            message: "internal: ReadIssueState is handled by handle_client".to_string(),
+        },
         Request::DrainAndRestartDaemon { .. } | Request::AbortDrain => {
             // Structurally unreachable: `handle_client` intercepts both drain
             // requests (#4090) before dispatching here, because a drain must ack

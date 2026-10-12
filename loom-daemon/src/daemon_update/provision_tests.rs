@@ -1,4 +1,5 @@
 //! Tests for [`super::install_to`]: the write-then-rename install (#10708).
+//! What it keeps and records (#10983) is tested in `provision/txn_tests.rs`.
 //!
 //! Every test works in its own tempdir; none touches a real daemon
 //! destination.
@@ -22,6 +23,27 @@ fn entries(dir: &Path) -> Vec<String> {
         .collect();
     names.sort();
     names
+}
+
+/// What an install over an existing binary leaves beside it (#10983): the
+/// binary, its record, and the binary it replaced. Nothing else, so a stray
+/// temp file still shows up by name.
+#[cfg(unix)]
+fn upgraded() -> Vec<String> {
+    vec![
+        "loom-daemon".to_string(),
+        "loom-daemon.install-state.json".to_string(),
+        "loom-daemon.previous".to_string(),
+    ]
+}
+
+/// The same for a first-ever install: there is nothing to keep.
+#[cfg(unix)]
+fn first_install() -> Vec<String> {
+    vec![
+        "loom-daemon".to_string(),
+        "loom-daemon.install-state.json".to_string(),
+    ]
 }
 
 #[cfg(unix)]
@@ -64,7 +86,8 @@ fn installs_over_an_existing_file_with_mode_755_and_no_residue() {
 
     assert_eq!(std::fs::read(&dest).unwrap(), b"new binary, longer than the old one");
     assert_eq!(mode(&dest), 0o755);
-    assert_eq!(entries(dir.path()), vec!["loom-daemon".to_string()]);
+    assert_eq!(entries(dir.path()), upgraded());
+    assert_eq!(std::fs::read(dir.path().join("loom-daemon.previous")).unwrap(), b"old binary");
     // The source is copied, not moved.
     assert_eq!(std::fs::read(&fresh).unwrap(), b"new binary, longer than the old one");
 }
@@ -82,7 +105,7 @@ fn installs_when_the_destination_does_not_exist_yet() {
 
     assert_eq!(std::fs::read(&dest).unwrap(), b"first install");
     assert_eq!(mode(&dest), 0o755);
-    assert_eq!(entries(dir.path()), vec!["loom-daemon".to_string()]);
+    assert_eq!(entries(dir.path()), first_install());
 }
 
 /// The destination is replaced by a NEW inode (rename of the staged file),
@@ -157,9 +180,10 @@ fn a_read_only_directory_fails_without_touching_dest() {
     assert_eq!(entries(dir.path()), vec!["loom-daemon".to_string()]);
 }
 
-/// The temp file is written in full and then the rename fails (here: `dest`
-/// is a non-empty directory). The temp file must be removed and `dest` left
-/// exactly as it was.
+/// The temp file is written in full and then the install cannot finish
+/// (here: `dest` is a non-empty directory, which can be neither kept as a
+/// previous binary nor renamed over). The temp file must be removed and
+/// `dest` left exactly as it was.
 #[cfg(unix)]
 #[test]
 fn a_failed_rename_removes_the_temp_file() {
@@ -254,7 +278,7 @@ fn replaces_a_currently_executing_binary() {
     assert!(still_running, "the running process must survive the replacement");
     assert_eq!(std::fs::read(&dest).unwrap(), b"#!/bin/sh\necho new\n");
     assert_eq!(mode(&dest), 0o755);
-    assert_eq!(entries(dir.path()), vec!["loom-daemon".to_string()]);
+    assert_eq!(entries(dir.path()), upgraded());
 }
 
 /// Concurrent installs onto the same destination each stage their own
@@ -287,7 +311,13 @@ fn concurrent_installs_never_share_a_temp_file() {
 
     let got = std::fs::read(&dest).unwrap();
     assert!(got == body_a || got == body_b, "dest is a mix of two installs");
-    assert_eq!(entries(dir.path()), vec!["loom-daemon".to_string()]);
+    // Which install ran last decides whether a previous binary was kept; what
+    // must never survive is a staging file.
+    let residue: Vec<String> = entries(dir.path())
+        .into_iter()
+        .filter(|n| n.starts_with('.'))
+        .collect();
+    assert_eq!(residue, Vec::<String>::new());
 }
 
 /// A bare relative destination (no directory component) stages its temp
@@ -350,7 +380,7 @@ fn a_stale_owned_staging_file_is_swept_by_the_next_install() {
 
     assert!(install_to(&fresh, &dest));
 
-    assert_eq!(entries(dir.path()), vec!["loom-daemon".to_string()]);
+    assert_eq!(entries(dir.path()), first_install());
 }
 
 /// Age a symlink itself (not its target), so only the file-type check can
@@ -429,6 +459,7 @@ fn the_sweep_leaves_everything_that_does_not_qualify() {
             ".loom-daemon.loom-install.1.2.3.4".to_string(),
             ".other.loom-install.1.1.1".to_string(),
             "loom-daemon".to_string(),
+            "loom-daemon.install-state.json".to_string(),
         ]
         .into_iter()
         .collect::<std::collections::BTreeSet<_>>()
@@ -478,4 +509,32 @@ fn staging_names_are_matched_on_raw_bytes() {
     assert!(is_staging_name(b".x\xff.loom-install.1.2.3", b"x\xff"));
     assert!(!is_staging_name(b".x\xfe.loom-install.1.2.3", b"x\xff"));
     assert!(!is_staging_name(b".x\xff.loom-install.1.2.3", b"x\xfe"));
+}
+
+/// The machine-level path tells the script which `loom-daemon` performs its
+/// `install-binary` calls: this running binary, which is known to execute on
+/// this host (#10983). An operator's own pin is left alone.
+#[test]
+fn the_provision_command_names_the_running_binary_as_the_install_helper() {
+    let cmd = super::provision_command(
+        Path::new("/x/provision-daemon.sh"),
+        Path::new("/x/new"),
+        Path::new("/x/repo"),
+        Path::new("/x/sink"),
+    );
+    let set = cmd
+        .get_envs()
+        .find(|(k, _)| *k == std::ffi::OsStr::new(super::INSTALL_HELPER_ENV))
+        .and_then(|(_, v)| v.map(std::path::PathBuf::from));
+    if std::env::var_os(super::INSTALL_HELPER_ENV).is_some() {
+        assert_eq!(set, None, "an ambient pin must not be overridden");
+    } else {
+        assert_eq!(set, super::selfrepl::running_binary());
+        assert!(set.is_some(), "a test binary always knows its own path");
+    }
+    let args: Vec<_> = cmd.get_args().collect();
+    assert_eq!(args.len(), 7);
+    assert_eq!(args[0], "-c");
+    assert_eq!(args[3], "/x/provision-daemon.sh");
+    assert_eq!(args[6], "/x/sink");
 }

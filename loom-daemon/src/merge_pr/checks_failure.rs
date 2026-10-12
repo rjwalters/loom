@@ -76,5 +76,8 @@ pub fn classify(failing: &[String], required: &[String], pending: bool) -> Verdi
     }
 }
 
+/// The same question for the synchronous merge path (#10688).
+pub mod required;
+
 #[cfg(test)]
 mod tests;

@@ -131,10 +131,6 @@ pub(crate) async fn run_daemon() -> Result<()> {
             // `jev-merge-risk` (issue #8543), so it needs the async runtime
             // for the same reason.
             Commands::JevTier { issue } => loom_daemon::jev_tier::run(issue).await,
-            // `concierge` connects to safehoused over its Unix socket to read
-            // the room and to relay a vetted command (Issue #7947), so it needs
-            // the async runtime for the same reason `quarantine` does.
-            Commands::Concierge(args) => args.action.run().await,
             // `hyperparams` prints the resolved hyperparameter vector
             // (Issue #9683) — pure config resolution, no live daemon, so it
             // needs neither the socket nor the async runtime.
@@ -162,7 +158,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
                 depends_on,
                 force,
                 ignore_host_constraint,
-                allow_local,
+                tap,
             } => {
                 handle_dispatch_command(
                     issue,
@@ -172,7 +168,8 @@ pub(crate) async fn run_daemon() -> Result<()> {
                     depends_on,
                     force,
                     ignore_host_constraint,
-                    allow_local,
+                    tap.runtime,
+                    tap.model_profile,
                 )
                 .await
             }
@@ -407,6 +404,9 @@ pub(crate) async fn run_daemon() -> Result<()> {
     let event_bus = Arc::new(EventBus::new());
     log::info!("event_bus: started in-memory pub/sub (capacity={})", event_bus.capacity());
 
+    // #10832: a live pause manifest must hold restart recovery off its paused
+    // agents BEFORE the first registry is reconstructed (design §7 H5).
+    let h5 = auto_update::pause_resume::arm_at_startup();
     let mut sweep = SweepRegistry::with_event_bus(sweep_config, event_bus.clone());
     match sweep.reconstruct() {
         Ok(0) => log::debug!("sweep_registry: no sweeps to reconstruct"),
@@ -416,6 +416,8 @@ pub(crate) async fn run_daemon() -> Result<()> {
         ),
         Err(e) => log::warn!("sweep_registry: reconstruction failed: {e}"),
     }
+    // #11346: J1 concern verification (logged, off-thread; no-op when disabled).
+    loom_daemon::journal::execution::log_startup_verification();
 
     // #6171: record the daemon's own primary workspace root once, before any
     // forge call that could trigger a forced per-owner credential refresh
@@ -527,6 +529,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // #9872: name the rate-limit pool the credential spends (WARN on a
     // personal one: shared with every PAT/OAuth/`gh` login of that user).
     let credential_preflight = credential_preflight::attach_pool(github_app_preflight.report);
+    credential_preflight::loom_ui::startup(&credential_preflight); // #11295
 
     // Per-owner managed-repo credentials (#5401). The GitHub App mechanism
     // above mints exactly ONE installation token, keyed on this daemon's
@@ -1328,7 +1331,10 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // that repo's dispatch — never the siblings'. With an empty registry (the
     // common single-workspace case) exactly one root is keyed, reducing to the
     // pre-#3930 single-flag behavior byte-for-byte.
-    let workspace_health_states = Arc::new(main_health_gate::WorkspaceHealthStates::new());
+    // #10869: made through `checkout_ff`, which registers them so the timer's
+    // checkout fast-forward asks whether a gate run is building in a checkout
+    // before it moves it.
+    let workspace_health_states = loom_daemon::fleet_sync::checkout_ff::health_states();
 
     // Shared drain-and-restart state (Issue #4090). Constructed here — before the
     // epic supervisor, work-finder, and role runner — so its flag can be threaded
@@ -1361,6 +1367,9 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // `0` rather than "unknown" — and so it is registered exactly once, at the
     // single construction site, rather than from whichever loop happens to spawn.
     role_runner::register_global_in_progress(role_in_progress.clone());
+    // #10832: hold dispatch and run H5 (health probation, then resume the
+    // paused agents) before any dispatch producer below is spawned.
+    h5.spawn(&drain_state, &workspace_pool, &sweep_workspace, &event_bus, &role_in_progress);
 
     // Epic supervisor loop (Issue #3872 — Phase 4 of epic #3842). Opt-in via
     // `LOOM_EPIC_SUPERVISOR`. The loop drives every open `loom:epic` issue
@@ -1479,9 +1488,10 @@ pub(crate) async fn run_daemon() -> Result<()> {
         // sole sampler — a daemon with no work-finder never trips it (and its
         // dispatch_sweep sees a Closed/absent breaker: zero behavior change).
         let host_breaker_config = host_breaker::resolve_config_for(&sweep_workspace);
-        host_breaker::register_global(std::sync::Arc::new(host_breaker::SharedHostBreaker::new(
-            host_breaker_config,
-        )));
+        host_breaker::register_global(std::sync::Arc::new(
+            host_breaker::SharedHostBreaker::new(host_breaker_config)
+                .with_disk_guard(&sweep_workspace),
+        ));
         log::info!(
             "host_breaker: enabled={} (load_per_core_trip={:.2}, sustain_ticks={}, cooldown_secs={})",
             host_breaker_config.enabled,
@@ -1553,6 +1563,11 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // The bus handle (#9321) carries each new escalation / recovery onto
     // `operator_priority.escalation` so the Safehouse sink relays it into the
     // team's Matrix room rather than leaving the ask as a forge comment only.
+    // #11295: loom-ui's Alerts page, before its producers below start.
+    // Started before the watches below; alerts raised earlier wait in its outbox.
+    if loom_daemon::loom_ui_alerts::start(&sweep_workspace).is_some() {
+        loom_daemon::loom_ui_alerts::watches::spawn_all(&sweep_workspace);
+    }
     let _star_liveness = _work_finder_handle.is_some().then(|| {
         loom_daemon::star_liveness::task::spawn(sweep_workspace.clone(), Some(event_bus.clone()))
     });
@@ -1818,6 +1833,21 @@ pub(crate) async fn run_daemon() -> Result<()> {
         heartbeat_interval.as_secs(),
     ));
 
+    // Startup supervision drop-in (#11111): a floor roll relaunches onto a new
+    // binary without re-rendering the unit, so write #11058's supervision
+    // settings as a drop-in and `daemon-reload`; systemd applies them at this
+    // daemon's next exit. systemd on Linux only; failures log at WARN. On its
+    // own thread so a wedged user manager cannot delay startup.
+    if let Err(e) = std::thread::Builder::new()
+        .name("supervision-dropin".to_string())
+        .spawn(loom_daemon::daemon_start::supervision_dropin::ensure_on_startup)
+    {
+        log::warn!(
+            "supervision drop-in: could not spawn its startup thread ({e}); the unit keeps \
+             its current supervision settings until the next startup"
+        );
+    }
+
     // Watchdog-provisioning-guard loop (Issue #5405): #5343's
     // heal_watchdog_provisioning_gap() only fires as a side effect of
     // RE-RUNNING loom-daemon-start.sh — a host that was provisioned before
@@ -2012,12 +2042,13 @@ pub(crate) async fn run_daemon() -> Result<()> {
         None
     };
 
-    // Autonomous self-update loop (Issue #4055 — Phase 3 of #4017). Opt-in via
-    // `LOOM_AUTO_UPDATE` / `autonomous.autoUpdate.enabled`. When the daemon's own
+    // Autonomous self-update loop (Issue #4055 — Phase 3 of #4017). Without a fleet
+    // store, opt-in via `LOOM_AUTO_UPDATE` / `autonomous.autoUpdate.enabled`. When the daemon's own
     // source checkout advances past the commit this binary was built from, the
     // loop rebuilds + provisions (reusing `loom-daemon-update.sh --no-restart`)
-    // and rolls onto the fresh binary via #4090's drain path — in-flight sweeps
-    // finish first and survive in the registry. Gated on a clean tree, a settle
+    // and rolls onto the fresh binary via pause-and-roll (#10831) — every
+    // in-flight agent is paused at a safe point or requeued, then the daemon
+    // restarts. Gated on a clean tree, a settle
     // window, zero in-flight sweeps (`ipc::count_in_flight_sweeps`), and exponential
     // backoff with a terminal give-up state, all surfaced in `loom-daemon status`.
     //
@@ -2025,31 +2056,10 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // whole daemon (its subject is the daemon process itself — one binary, one
     // source checkout, one restart), NOT a `spawn_multi_*` per-workspace fan-out.
     // Config is read from the daemon's default workspace, like the sibling readers.
-    // Default OFF (side effects on the running process). Cloned handles here because
-    // `event_bus` is moved into `IpcServer::new` below.
-    let auto_update_config = auto_update::read_auto_update_config(&sweep_workspace);
-    let _auto_update_handle = if auto_update::resolve_enabled(&auto_update_config) {
-        let tuning = auto_update::TickTuning::resolve(&auto_update_config);
-        log::info!("auto_update: enabled ({})", tuning.describe());
-        let probe = auto_update::ScriptAutoUpdateProbe::new(
-            workspace_pool.clone(),
-            sweep_workspace.clone(),
-        );
-        let trigger = auto_update::IpcDrainTrigger::new(
-            drain_state.clone(),
-            workspace_pool.clone(),
-            sweep_workspace.clone(),
-            event_bus.clone(),
-            tokio::runtime::Handle::current(),
-        );
-        let status = std::sync::Arc::new(auto_update::AutoUpdateStatus::new(true));
-        Some(auto_update::spawn_auto_update_task(probe, trigger, status, tuning))
-    } else {
-        log::debug!(
-            "auto_update: disabled (set LOOM_AUTO_UPDATE=1 or autonomous.autoUpdate.enabled=true to opt in)"
-        );
-        None
-    };
+    // #10954: spawned on every fleet host (fleet_sync::start ran above), and on a
+    // host with no fleet store only when autoUpdate is enabled — see `loop_mode`.
+    let _auto_update_handle =
+        auto_update::loop_mode::start(&sweep_workspace, &workspace_pool, &drain_state, &event_bus);
 
     // Independent, opt-in idle exit (#4467). The daemon only exits; the host
     // guard retains sole authority to power off.

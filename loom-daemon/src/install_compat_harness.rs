@@ -24,7 +24,12 @@
 //!   release's copy of `install_compat.rs`; a release predating #10716
 //!   declares none.
 //!
-//! "Exists" for a subcommand means `<daemon> <sub> --help` exits 0. The
+//! A subcommand is probed with `<daemon> <sub> --help`, and the answer is one
+//! of three ([`Probed`], #10868): missing when clap refuses it as
+//! unrecognized, broken when the binary cannot be run, is killed by a signal
+//! or panics, and present otherwise. Broken is a violation of its own: a
+//! crash proves nothing about the subcommand, so it is neither counted as
+//! present nor listed as a per-file gap. The
 //! `(file, subcommand)` pairs come from `check-daemon-subcommand-versions.sh
 //! --list`, the same detector the subcommand ratchet uses, so there is one
 //! definition of "this script calls the daemon". A pair the file marks
@@ -43,7 +48,8 @@ use crate::release_resolve::resolve::asset_names;
 use anyhow::{anyhow, Context, Result};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
+use std::time::Duration;
 
 /// Where the release's own copy of this module lives, for reading an old
 /// daemon's invoked-file list out of git.
@@ -101,6 +107,14 @@ pub enum OldDaemon {
 /// exhausts this fails rather than guessing.
 pub const MAX_RELEASE_LOOKUPS: usize = 5;
 
+/// How many times `--fetch-old-daemon` tries to download a release's binary
+/// and checksum before failing (#10868). The asset listing already said both
+/// are there, so a failure is a transfer blip or an upload still in flight.
+pub const DOWNLOAD_ATTEMPTS: u32 = 3;
+
+/// The pause between two download attempts.
+const DOWNLOAD_RETRY_PAUSE: Duration = Duration::from_secs(5);
+
 /// Which published release direction B runs against.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OldRelease {
@@ -139,13 +153,17 @@ pub fn tags_at_or_above(tags: &str, req: Version) -> Vec<(Version, String)> {
 /// step red by design, because this is a proof step and must not pass
 /// without having proven anything.
 ///
+/// The second value is every tag that was skipped on the way, oldest first,
+/// so the report can name the release that is still uploading (#10868).
+///
 /// # Errors
 /// An unanswerable lookup, or [`MAX_RELEASE_LOOKUPS`] candidates without the
 /// asset.
 pub fn pick_oldest_published(
     candidates: &[(Version, String)],
     mut has_asset: impl FnMut(&str) -> Option<bool>,
-) -> Result<OldRelease> {
+) -> Result<(OldRelease, Vec<String>)> {
+    let mut skipped = Vec::new();
     for (i, (v, tag)) in candidates.iter().enumerate() {
         anyhow::ensure!(
             i < MAX_RELEASE_LOOKUPS,
@@ -154,12 +172,26 @@ pub fn pick_oldest_published(
             candidates[0].0
         );
         match has_asset(tag) {
-            Some(true) => return Ok(OldRelease::Published(*v, tag.clone())),
-            Some(false) => {}
+            Some(true) => return Ok((OldRelease::Published(*v, tag.clone()), skipped)),
+            Some(false) => skipped.push(tag.clone()),
             None => anyhow::bail!("could not list the assets of release {tag}"),
         }
     }
-    Ok(OldRelease::Unpublished)
+    Ok((OldRelease::Unpublished, skipped))
+}
+
+/// How the report names the releases [`pick_oldest_published`] skipped.
+/// `None` when it skipped none.
+#[must_use]
+pub fn skipped_releases_text(skipped: &[String]) -> Option<String> {
+    match skipped {
+        [] => None,
+        [one] => Some(format!("release {one} is tagged but its assets are not uploaded yet")),
+        many => Some(format!(
+            "releases {} are tagged but their assets are not uploaded yet",
+            many.join(", ")
+        )),
+    }
 }
 
 /// The outcome of one run.
@@ -216,20 +248,38 @@ fn check_claims(
             ));
         }
     }
+    report
+        .violations
+        .extend(floors_above_claim(tree, scripts, opts.requires_daemon));
+}
+
+/// One entry per hard `# requires-daemon: <sub> >= <version>` floor in
+/// `scripts` (from [`installed_shell_files`] over `tree`) that is above
+/// `requires_daemon`. Empty means the claim covers every shipped floor.
+///
+/// Shared by the CI harness and by the unit test in `install_compat/tests.rs`
+/// (#10868), so both read the same files the same way.
+#[must_use]
+pub fn floors_above_claim(
+    tree: &Path,
+    scripts: &[PathBuf],
+    requires_daemon: Version,
+) -> Vec<String> {
+    let mut over = Vec::new();
     for file in scripts {
         let Ok(text) = std::fs::read_to_string(file) else {
             continue;
         };
         for (sub, floor) in hard_floors(&text) {
-            if floor > opts.requires_daemon {
-                report.violations.push(format!(
-                    "{} declares `requires-daemon: {sub} >= {floor}`, above REQUIRES_DAEMON {}",
+            if floor > requires_daemon {
+                over.push(format!(
+                    "{} declares `requires-daemon: {sub} >= {floor}`, above REQUIRES_DAEMON {requires_daemon}",
                     display(file, tree),
-                    opts.requires_daemon
                 ));
             }
         }
     }
+    over
 }
 
 fn direction_a(
@@ -258,14 +308,10 @@ fn direction_a(
     let prev_tree = scratch.path().join("defaults");
     let scripts = installed_shell_files(&prev_tree)?;
     let label = format!("A ({prev_ref} installed files vs new daemon)");
-    let missing = probe.missing_subcommands(&opts.repo_root, &opts.new_daemon, &scripts)?;
-    record_missing(&label, &missing, &prev_tree, report);
+    let gaps = probe.missing_subcommands(&opts.repo_root, &opts.new_daemon, &scripts)?;
+    record_gaps(&label, &gaps, &prev_tree, report);
     record_absent_files(&label, &opts.invoked_files, &prev_tree, report);
-    report.notes.push(format!(
-        "{label}: {} shell files, {} subcommand gaps",
-        scripts.len(),
-        missing.len()
-    ));
+    report.notes.push(gaps.summary(&label, scripts.len()));
     Ok(())
 }
 
@@ -278,6 +324,7 @@ fn direction_b(
 ) -> Result<()> {
     let req = opts.requires_daemon;
     let candidates = tags_at_or_above(&release_tags(&opts.repo_root)?, req);
+    let mut skipped = Vec::new();
     // Keeps a fetched binary alive until the probes below have run.
     let scratch = tempfile::Builder::new()
         .prefix("install-compat-old-")
@@ -292,10 +339,11 @@ fn direction_b(
         },
         OldDaemon::Fetch { repo, asset } => {
             let sha = format!("{asset}.sha256");
-            let picked = pick_oldest_published(&candidates, |tag| {
+            let (picked, passed_over) = pick_oldest_published(&candidates, |tag| {
                 asset_names(&opts.repo_root, repo, Some(tag))
                     .map(|names| names.contains(asset) && names.contains(&sha))
             })?;
+            skipped = passed_over;
             match picked {
                 OldRelease::Published(v, tag) => {
                     let bin = download_release_binary(
@@ -335,24 +383,33 @@ fn direction_b(
                 "B (new installed files vs daemon {v}, the oldest published release at or above {req})"
             )
         };
+        if let Some(why) = skipped_releases_text(&skipped) {
+            report.notes.push(format!("{label}: skipped, {why}"));
+        }
         let invoked = old_invoked_files(&opts.repo_root, v, report)?;
         (label, bin, invoked)
     } else {
         let label = format!("B (new installed files vs daemon {req})");
-        report.notes.push(format!(
-            "{label}: no release at or above {req} is published yet, so the new daemon stands in for it"
-        ));
+        report.notes.push(stand_in_note(&label, req, &skipped));
         (label, opts.new_daemon.clone(), opts.invoked_files.clone())
     };
-    let missing = probe.missing_subcommands(&opts.repo_root, &daemon, scripts)?;
-    record_missing(&label, &missing, new_tree, report);
+    let gaps = probe.missing_subcommands(&opts.repo_root, &daemon, scripts)?;
+    record_gaps(&label, &gaps, new_tree, report);
     record_absent_files(&label, &invoked, new_tree, report);
-    report.notes.push(format!(
-        "{label}: {} shell files, {} subcommand gaps",
-        scripts.len(),
-        missing.len()
-    ));
+    report.notes.push(gaps.summary(&label, scripts.len()));
     Ok(())
+}
+
+/// The note for direction B running against the new daemon because no
+/// release at or above `req` carries the asset. It names the releases that
+/// are tagged but still uploading, so a release in flight reads as that and
+/// not as "nothing was ever released" (#10868).
+#[must_use]
+pub fn stand_in_note(label: &str, req: Version, skipped: &[String]) -> String {
+    let why = skipped_releases_text(skipped).map_or_else(String::new, |t| format!(" ({t})"));
+    format!(
+        "{label}: no release at or above {req} is published yet{why}, so the new daemon stands in for it"
+    )
 }
 
 /// Check a caller-supplied old daemon: it must report a version at or above
@@ -383,8 +440,34 @@ fn given_daemon(
     Ok(v)
 }
 
-/// Download `asset` and `<asset>.sha256` from release `tag` into `dest`,
-/// verify the checksum, and make the binary executable.
+/// Run `attempt` (one download of `asset` from release `tag`) until it
+/// succeeds, at most [`DOWNLOAD_ATTEMPTS`] times, `pause` apart.
+///
+/// # Errors
+/// Every attempt failed. The message names the tag and the asset.
+pub fn download_with_retry(
+    tag: &str,
+    asset: &str,
+    pause: Duration,
+    mut attempt: impl FnMut() -> bool,
+) -> Result<()> {
+    for n in 1..=DOWNLOAD_ATTEMPTS {
+        if attempt() {
+            return Ok(());
+        }
+        if n < DOWNLOAD_ATTEMPTS {
+            std::thread::sleep(pause);
+        }
+    }
+    anyhow::bail!(
+        "downloading {asset} from release {tag} failed {DOWNLOAD_ATTEMPTS} times; the release \
+         lists the asset, so it may still be uploading: rerun, or pass --old-daemon"
+    )
+}
+
+/// Download `asset` and `<asset>.sha256` from release `tag` into `dest`
+/// (retried, [`download_with_retry`]), verify the checksum, and make the
+/// binary executable. A checksum mismatch is not retried.
 fn download_release_binary(
     repo_root: &Path,
     repo: &str,
@@ -393,10 +476,9 @@ fn download_release_binary(
     dest: &Path,
 ) -> Result<PathBuf> {
     let sha = format!("{asset}.sha256");
-    anyhow::ensure!(
-        fetch::download(repo_root, repo, tag, &[asset, &sha], dest),
-        "gh release download {tag} {asset} failed"
-    );
+    download_with_retry(tag, asset, DOWNLOAD_RETRY_PAUSE, || {
+        fetch::download(repo_root, repo, tag, &[asset, &sha], dest)
+    })?;
     let bin = dest.join(asset);
     anyhow::ensure!(
         checksum::verify(&bin, &dest.join(&sha)),
@@ -437,18 +519,16 @@ fn old_invoked_files(
     }
 }
 
-fn record_missing(
-    label: &str,
-    missing: &BTreeMap<String, Vec<PathBuf>>,
-    tree: &Path,
-    report: &mut Report,
-) {
-    for (sub, files) in missing {
+fn record_gaps(label: &str, gaps: &Gaps, tree: &Path, report: &mut Report) {
+    for (sub, files) in &gaps.missing {
         let users: Vec<String> = files.iter().map(|f| display(f, tree)).collect();
         report.violations.push(format!(
             "{label}: daemon has no `{sub}` subcommand, called by {}",
             users.join(", ")
         ));
+    }
+    for broken in &gaps.broken {
+        report.violations.push(format!("{label}: {broken}"));
     }
 }
 
@@ -465,48 +545,146 @@ fn record_absent_files(label: &str, invoked: &[String], tree: &Path, report: &mu
     }
 }
 
+/// What `<daemon> <sub> --help` says about one subcommand (#10868).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Probed {
+    /// The daemon has it.
+    Present,
+    /// Clap refused it as unrecognized: a compatibility gap.
+    Missing,
+    /// The probe proved nothing, and this is how it failed. Never "present".
+    Broken(String),
+}
+
+/// The exit code of a Rust process that panicked.
+const PANIC_EXIT: i32 = 101;
+
+/// Read one `<daemon> <sub> --help` outcome.
+///
+/// | Outcome | Result |
+/// |---|---|
+/// | stderr has clap's unrecognized-subcommand text | [`Probed::Missing`] |
+/// | not spawned, killed by a signal, or exit 101 with `panicked at` on stderr | [`Probed::Broken`] |
+/// | anything else | [`Probed::Present`] |
+///
+/// Exit 0 is not required for "present": a few subcommands (`gh-shim`) are
+/// dispatched before clap and answer `--help` with their own usage and exit 2.
+#[must_use]
+pub fn classify_probe(outcome: &std::io::Result<Output>) -> Probed {
+    let out = match outcome {
+        Ok(out) => out,
+        Err(e) => return Probed::Broken(format!("could not be executed ({e})")),
+    };
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if subcommand_unrecognized(&stderr) {
+        return Probed::Missing;
+    }
+    match out.status.code() {
+        // No exit code: the process did not exit, a signal ended it.
+        None => Probed::Broken(format!("was killed ({})", out.status)),
+        Some(PANIC_EXIT) if stderr.contains("panicked at") => {
+            Probed::Broken(format!("panicked ({})", out.status))
+        }
+        Some(_) => Probed::Present,
+    }
+}
+
+/// What one set of scripts found wrong with one daemon.
+#[derive(Debug, Default)]
+struct Gaps {
+    /// Subcommands the daemon lacks, each with the files that call it.
+    missing: BTreeMap<String, Vec<PathBuf>>,
+    /// Probes that proved nothing, as violation text. Each is listed once per
+    /// run, under the first direction that hit it.
+    broken: Vec<String>,
+}
+
+impl Gaps {
+    fn summary(&self, label: &str, scripts: usize) -> String {
+        let line =
+            format!("{label}: {scripts} shell files, {} subcommand gaps", self.missing.len());
+        if self.broken.is_empty() {
+            line
+        } else {
+            format!("{line}, {} broken probes", self.broken.len())
+        }
+    }
+}
+
 /// `<daemon> <sub> --help` results, cached per binary and subcommand.
 #[derive(Default)]
 struct Probe {
-    seen: HashMap<(PathBuf, String), bool>,
+    seen: HashMap<(PathBuf, String), Probed>,
+    /// Binaries that could not be spawned at all, with why. Never run again:
+    /// the answer is the same for every subcommand.
+    unusable: HashMap<PathBuf, String>,
+    /// Broken-probe violations already handed out this run.
+    reported: BTreeSet<String>,
 }
 
 impl Probe {
-    /// A subcommand exists unless clap refuses it as unrecognized. Exit 0 is
-    /// not required: a few subcommands (`gh-shim`) are dispatched before clap
-    /// and answer `--help` with their own usage and exit 2.
-    fn has(&mut self, daemon: &Path, sub: &str) -> bool {
-        *self
-            .seen
-            .entry((daemon.to_path_buf(), sub.to_string()))
-            .or_insert_with(|| {
-                let Ok(out) = Command::new(daemon)
-                    .args([sub, "--help"])
-                    .stdin(Stdio::null())
-                    .output()
-                else {
-                    return false;
-                };
-                out.status.success()
-                    || !subcommand_unrecognized(&String::from_utf8_lossy(&out.stderr))
-            })
+    fn probe(&mut self, daemon: &Path, sub: &str) -> Probed {
+        if let Some(why) = self.unusable.get(daemon) {
+            return Probed::Broken(why.clone());
+        }
+        let key = (daemon.to_path_buf(), sub.to_string());
+        if let Some(known) = self.seen.get(&key) {
+            return known.clone();
+        }
+        let outcome = Command::new(daemon)
+            .args([sub, "--help"])
+            .stdin(Stdio::null())
+            .output();
+        let result = classify_probe(&outcome);
+        match (&outcome, &result) {
+            (Err(_), Probed::Broken(why)) => {
+                self.unusable.insert(key.0, why.clone());
+            }
+            _ => {
+                self.seen.insert(key, result.clone());
+            }
+        }
+        result
     }
 
-    /// Hard subcommand dependencies of `scripts` that `daemon` lacks, each
-    /// with the files that call it.
+    /// Sort `pairs` (hard `(file, subcommand)` dependencies) by what `daemon`
+    /// answers for each subcommand.
+    fn gaps(&mut self, daemon: &Path, pairs: BTreeSet<(PathBuf, String)>) -> Gaps {
+        let mut gaps = Gaps::default();
+        for (file, sub) in pairs {
+            match self.probe(daemon, &sub) {
+                Probed::Present => {}
+                Probed::Missing => gaps.missing.entry(sub).or_default().push(file),
+                Probed::Broken(why) => {
+                    let text = if self.unusable.contains_key(daemon) {
+                        format!(
+                            "daemon {} {why}, so no subcommand could be probed",
+                            daemon.display()
+                        )
+                    } else {
+                        format!(
+                            "`{} {sub} --help` {why}; a crash does not show that `{sub}` exists",
+                            daemon.display()
+                        )
+                    };
+                    if self.reported.insert(text.clone()) {
+                        gaps.broken.push(text);
+                    }
+                }
+            }
+        }
+        gaps
+    }
+
+    /// What `daemon` lacks, or could not answer, of the hard subcommand
+    /// dependencies of `scripts`.
     fn missing_subcommands(
         &mut self,
         repo_root: &Path,
         daemon: &Path,
         scripts: &[PathBuf],
-    ) -> Result<BTreeMap<String, Vec<PathBuf>>> {
-        let mut missing: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
-        for (file, sub) in hard_pairs(repo_root, scripts)? {
-            if !self.has(daemon, &sub) {
-                missing.entry(sub).or_default().push(file);
-            }
-        }
-        Ok(missing)
+    ) -> Result<Gaps> {
+        Ok(self.gaps(daemon, hard_pairs(repo_root, scripts)?))
     }
 }
 
@@ -617,7 +795,10 @@ pub fn invoked_files_from_source(src: &str) -> Option<Vec<String>> {
 
 /// Installed shell under `tree` (a `defaults/` directory), test suites
 /// excluded, sorted. Symlinks are not followed.
-fn installed_shell_files(tree: &Path) -> Result<Vec<PathBuf>> {
+///
+/// # Errors
+/// A directory under `tree` could not be read.
+pub fn installed_shell_files(tree: &Path) -> Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     let mut stack = vec![tree.to_path_buf()];
     while let Some(dir) = stack.pop() {

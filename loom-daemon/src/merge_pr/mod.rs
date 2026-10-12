@@ -250,6 +250,10 @@
 //! open PR based on that branch (unrecoverably), so each open child is
 //! retargeted onto the parent's base first, and the branch is kept whenever
 //! that cannot be confirmed.
+//!
+//! [`closed_by_merge`] is not a port either, and `merge-pr.sh` does not call
+//! it: it answers "did THIS merge close the issue?" for Champion Step 4's
+//! negated-reference reopen (#8942), which used to undo any close it found.
 
 //! [`pr_state`] is the gate that opens the whole flow once the PR is fetched
 //! (#8191 slice): already merged (exit 0) versus closed unmerged (refuse)
@@ -264,6 +268,7 @@ pub mod checks_failure;
 pub mod ci_result;
 pub mod cleanup_paths;
 pub mod closed_building;
+pub mod closed_by_merge;
 pub mod consolidate;
 pub mod dirty_guard;
 pub mod discovered_worktree;

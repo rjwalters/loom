@@ -244,6 +244,9 @@ impl SweepRegistry {
             // every single-record region and every re-dispatch/re-exec that
             // re-announced the same tap (Issue #8659).
             tap_usage_all: tap_region.breakdown().to_vec(),
+            // Issue #11360: `worker run` phases, from their own logs — beside the
+            // parent's rows above, never folded into them.
+            phase_tap_usage: tap_region.phase_workers.clone(),
             duration_sec,
         };
         if let Err(e) = sweep_outcomes::append_outcome(&path, &record) {
@@ -316,11 +319,21 @@ impl SweepRegistry {
             .entries
             .get(sweep_id)
             .map_or_else(|| self.compute_log_path(issue), |i| i.log_path.clone());
+        // Issue #11360: out-of-process phases (`worker run`) write logs of their
+        // own, joined by the `sweep_id` they were stamped with. Read even when
+        // the sweep log itself is gone: those launches still spent on a tap.
+        let phase_workers =
+            crate::tap_usage::account_phase_logs_at(&self.config.workspace_root, issue, sweep_id);
         let Ok(contents) = std::fs::read_to_string(log_path) else {
-            return (None, crate::tap_usage::RegionAccounting::default());
+            let tap_region = crate::tap_usage::RegionAccounting {
+                phase_workers,
+                ..Default::default()
+            };
+            return (None, tap_region);
         };
         let anchor = format!("sweep_id={sweep_id}");
-        let tap_region = crate::tap_usage::account_region_by_tap(&contents, &anchor);
+        let mut tap_region = crate::tap_usage::account_region_by_tap(&contents, &anchor);
+        tap_region.phase_workers = phase_workers;
         let credential = tap_region
             .outcome()
             .map(|accounting| accounting.tap.credential.clone())
@@ -465,9 +478,17 @@ impl SweepRegistry {
         exit_code: Option<i32>,
     ) {
         let info = self.entries.get(sweep_id);
-        let model = info.and_then(|i| i.model.clone());
-        let effort = info.and_then(|i| i.effort.clone());
         let runtime = info.map(|i| i.runtime.clone());
+        // Issue #11370: the resolved facts `sweep.started` reported, not the
+        // literal launch arguments: a full model id (absent, with
+        // `model_source=unknown`, when none can be named) and the effort that
+        // applied with where it came from. Only an entry we hold has either.
+        let model = info
+            .and_then(|i| i.model.as_deref())
+            .and_then(normalize_model_id);
+        let resolved_effort = info
+            .and_then(|i| resolve_effort_from_env(i.effort.as_deref(), Some(i.runtime.as_str())));
+        let effort = resolved_effort.as_ref().map(|r| r.0.clone());
         // Issue #8056: survives both a missing entry and an entry whose
         // dispatch-time account capture timed out — see `resolve_token_account`.
         let token_name = self.resolve_token_account(sweep_id, issue);
@@ -486,6 +507,15 @@ impl SweepRegistry {
             config.insert("runtime".to_string(), runtime);
         }
         config.insert("token_account".to_string(), token_name);
+        if let Some((_, source)) = &resolved_effort {
+            config.insert("effort_source".to_string(), (*source).to_string());
+        }
+        if info.is_some() && model.is_none() {
+            config.insert(
+                "model_source".to_string(),
+                crate::telemetry::model_source::UNKNOWN.to_string(),
+            );
+        }
         // Issue #8447: the API-key pool's attribution beside the OAuth pool's,
         // in the same free-form map (additive per #4703 — no schema bump).
         // Names only, never key material. Keys are omitted rather than set to
@@ -560,6 +590,19 @@ impl SweepRegistry {
                     .collect::<Vec<_>>()
                     .join(","),
             );
+        }
+        // Issue #11360: taps that `worker run` phases spent on, from their own
+        // logs. Flagged only (like `tap_region_keys`) so `config["tap"]` keeps
+        // naming the parent's launch; the counters are on `phase_tap_usage`.
+        if !tap_region.phase_workers.is_empty() {
+            let mut keys: Vec<String> = Vec::new();
+            for phase in &tap_region.phase_workers {
+                let key = format!("{}={}", phase.role, phase.accounting.key());
+                if !keys.contains(&key) {
+                    keys.push(key);
+                }
+            }
+            config.insert("tap_phase_keys".to_string(), keys.join(","));
         }
         // Issue #4809: attribute this sweep to the model-cost A/B experiment's
         // arm from its OWN dispatched model — the same inference the #3725
@@ -748,15 +791,35 @@ impl SweepRegistry {
         // durable outcome journal — no forge calls, no new state. Absent
         // (never fabricated) when the journal could not be read or the repo
         // slug never resolved (the journal matches on it).
-        let lineage = repo.as_deref().and_then(|repo_slug| {
-            let journal_path = self.config.resolve_outcome_telemetry_path();
-            let prior = sweep_outcomes::read_all_sweep_outcomes(&journal_path);
-            lineage::derive_lineage(&prior, repo_slug, issue, sweep_id)
-        });
-        let (attempt_index, previous_sweep_id, trigger) = lineage
-            .map_or((None, None, None), |(index, previous, trigger)| {
-                (Some(index), previous, Some(trigger.to_string()))
-            });
+        //
+        // Issue #11280: a sweep dispatched by this daemon already published
+        // its lineage on `sweep.started` / `fleet.state`; reuse that captured
+        // value (including "unknown") so the start and outcome rows cannot
+        // disagree when the journal rotated or became unreadable in between.
+        // Only a sweep with no captured facts (adopted, PR-set) derives it
+        // here.
+        //
+        // Issue #11444: the dispatch origin rides the same captured facts, so
+        // `sweep.outcome`'s origin (and the `operator_redispatch` trigger it
+        // implies) equals `sweep.started`'s. A sweep with no captured facts
+        // has no observable origin: absent, never guessed.
+        let dispatch_origin = self
+            .start_facts
+            .get(sweep_id)
+            .and_then(|facts| facts.dispatch_origin.clone());
+        let (attempt_index, previous_sweep_id, trigger) =
+            if let Some(facts) = self.start_facts.get(sweep_id) {
+                (facts.attempt_index, facts.previous_sweep_id.clone(), facts.trigger.clone())
+            } else {
+                let lineage = repo.as_deref().and_then(|repo_slug| {
+                    let journal_path = self.config.resolve_outcome_telemetry_path();
+                    let prior = sweep_outcomes::read_all_sweep_outcomes(&journal_path);
+                    lineage::derive_lineage(&prior, repo_slug, issue, sweep_id)
+                });
+                lineage.map_or((None, None, None), |(index, previous, trigger)| {
+                    (Some(index), previous, Some(trigger.to_string()))
+                })
+            };
 
         // In-sweep rework events (Issue #9444), two sources, markers first:
         // (a) events the performing paths explicitly marked in the
@@ -913,17 +976,19 @@ impl SweepRegistry {
         // disposition and its mandatory `failure_class` come back as one value
         // so the "env_failure/substantive_failure/unknown must say why"
         // invariant cannot be half-applied; see `telemetry::disposition`.
-        let (disposition, failure_class) =
-            telemetry::classify_disposition(&telemetry::DispositionSignals {
-                result,
-                pr_number,
-                failure_class: failure_class.as_deref(),
-                phase_durations: &phase_durations,
-                total_duration_sec: duration_sec,
-                judge_verdicts: judge_verdicts.as_deref(),
-                doctor_cycles,
-                issue_end_state,
-            });
+        let signals = telemetry::DispositionSignals {
+            result,
+            pr_number,
+            failure_class: failure_class.as_deref(),
+            phase_durations: &phase_durations,
+            total_duration_sec: duration_sec,
+            judge_verdicts: judge_verdicts.as_deref(),
+            doctor_cycles,
+            issue_end_state,
+            exit_code,
+        };
+        let (disposition, failure_class) = telemetry::classify_disposition(&signals);
+        let reported_result = telemetry::result_for_disposition(&signals, disposition);
         // Issue #10642: a synthesized `no-phase-signal` class says nothing on
         // its own, so attach what is known about how the run ended.
         let no_phase_cause = (failure_class.as_deref() == Some(telemetry::NO_PHASE_SIGNAL_CLASS))
@@ -935,6 +1000,19 @@ impl SweepRegistry {
                     phase_durations.last().map(|p| p.phase.as_str()),
                 )
             });
+
+        // Issue #10156: an `after-curator` stop that is part of a no-op loop is
+        // its own outcome class instead of `unclassified` — and so (#11438) is
+        // the clean-exit `no-phase-signal`/`spawn-death` form of the same loop.
+        let failure_class = telemetry::apply_noop_loop_class(
+            disposition,
+            failure_class,
+            self.noop_loop_kind(issue, sweep_id)
+                .map(ParkKind::failure_class),
+            exit_code == Some(0),
+        );
+        let process_result = result;
+        let result = reported_result;
 
         let outcome_record = telemetry::SweepOutcomeRecord {
             repo,
@@ -971,6 +1049,7 @@ impl SweepRegistry {
             attempt_index,
             previous_sweep_id,
             trigger,
+            dispatch_origin,
             rework_events,
             pr_numbers,
             hw_lines_added: landing_size.as_ref().map(|size| size.hw_lines_added),
@@ -1003,7 +1082,7 @@ impl SweepRegistry {
         // window, lose) the `sweep.outcome` record. See `writeback`'s module
         // doc for the full fail-open contract.
         let writeback_record =
-            (result == telemetry::SweepResult::Success).then(|| outcome_record.clone());
+            (process_result == telemetry::SweepResult::Success).then(|| outcome_record.clone());
         let result_name = serde_json::to_value(result)
             .ok()
             .and_then(|v| v.as_str().map(str::to_owned))
@@ -1047,10 +1126,15 @@ impl SweepRegistry {
         if let Some(trigger) = outcome_record.trigger.as_deref() {
             metadata.insert("loom.trigger".into(), trigger.to_string());
         }
+        if let Some(origin) = outcome_record.dispatch_origin.as_deref() {
+            metadata.insert("loom.dispatch_origin".into(), origin.to_string());
+        }
         for (key, value) in [
             ("loom.failure_class", outcome_record.failure_class.as_ref()),
             ("loom.configured_model", outcome_record.model.as_ref()),
             ("loom.effort", outcome_record.effort.as_ref()),
+            ("loom.effort_source", outcome_record.config.get("effort_source")),
+            ("loom.model_source", outcome_record.config.get("model_source")),
             ("loom.runtime", outcome_record.config.get("runtime")),
             ("loom.provider", outcome_record.config.get("provider")),
         ] {
@@ -1307,6 +1391,15 @@ impl SweepRegistry {
             return None;
         }
         crate::git_utils::diff_stat_against_mainline(&wt)
+    }
+
+    /// Whether every phase sampled for `sweep_id` is the Curator's (Issue
+    /// #10156): `Some(true)` for a non-empty history that never got past
+    /// curation, `Some(false)` once any later phase was seen, `None` when
+    /// nothing was sampled. Free (no forge call).
+    pub(crate) fn sampled_only_curator(&self, sweep_id: &str) -> Option<bool> {
+        let history = self.phase_history.get(sweep_id).filter(|h| !h.is_empty())?;
+        Some(history.iter().all(|o| phase_label(&o.phase) == "curator"))
     }
 
     /// Whether this sweep was ever observed completing the Merge phase (Issue

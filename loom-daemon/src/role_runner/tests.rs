@@ -1228,10 +1228,6 @@ fn test_builtin_intervals_are_per_role_not_uniform() {
             ("hermit", 600),
             ("guide", 900),
             ("architect", 3600),
-            // #7947: a *listening* cadence, not a work cadence — each tick is
-            // a short `concierge listen` window, so it sits below the 5–15 min
-            // band's intent without violating it.
-            ("concierge", 300),
         ],
         "built-in per-role intervals drifted — update defaults/docs/daemon-reference.md's \
              role-runner table in the same change (#6204)"
@@ -1771,16 +1767,17 @@ fn test_default_roles_includes_architect_as_idle_only() {
         "#5656: architect must be idle-addressable ONLY — an interval-default architect \
              floods every unpinned repo's backlog with speculative proposals"
     );
-    // Two shipped roles are excluded from the "unset `roles` ⇒ all defaults"
-    // fallback: architect (#5656, floods the backlog) and concierge (#7947, an
-    // inbound control channel wired to a chat room). Every other role is an
-    // interval default. `concierge_gate.rs` pins WHICH two, by name.
+    // Exactly one shipped role is excluded from the "unset `roles` ⇒ all
+    // defaults" fallback: architect (#5656, floods the backlog). Every other
+    // role is an interval default.
+    let carve_outs: Vec<&str> = DEFAULT_ROLES
+        .iter()
+        .filter(|s| !s.is_interval_default())
+        .map(|s| s.name)
+        .collect();
     assert_eq!(
-        DEFAULT_ROLES
-            .iter()
-            .filter(|s| !s.is_interval_default())
-            .count(),
-        2,
+        carve_outs,
+        vec!["architect"],
         "a new non-interval-default role needs its own docs/table update \
          (see daemon-reference.md)"
     );
@@ -2814,6 +2811,39 @@ fn test_plan_idle_runs_fires_on_edge_when_enabled() {
     // Go busy: no edge.
     assert!(plan_idle_runs(&mut t, &set, root, &cfg, false, false, now).is_empty());
     // Busy → idle edge: champion fires (and its guard is now held).
+    let plan = plan_idle_runs(&mut t, &set, root, &cfg, true, false, now);
+    assert_eq!(plan.iter().map(|(s, _)| s.name).collect::<Vec<_>>(), vec!["champion"]);
+}
+
+#[test]
+#[serial]
+fn test_plan_idle_runs_held_workspace_suppresses() {
+    use crate::workspace_hold::{set_for_test, HeldCopy, HoldKind, WorkspaceHold};
+    std::env::remove_var(ROLE_RUNNER_ENABLE_ENV);
+    let mut t = IdleTrigger::new();
+    let set = new_in_progress_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let cfg = on_idle_config(Some(true), vec!["champion"]);
+    let now = Instant::now();
+    set_for_test(
+        root,
+        Some(WorkspaceHold {
+            kind: HoldKind::DaemonTooOld,
+            copy: HeldCopy::Checkout,
+            since: chrono::Utc::now(),
+            detail: "test".to_string(),
+            verdict_at: chrono::Utc::now(),
+        }),
+    );
+    // Busy, then the drain's idle edge: the hold must not launch the role.
+    assert!(plan_idle_runs(&mut t, &set, root, &cfg, false, false, now).is_empty());
+    assert!(plan_idle_runs(&mut t, &set, root, &cfg, true, false, now).is_empty());
+    // The edge was consumed, so lifting the hold does not replay it ...
+    set_for_test(root, None);
+    assert!(plan_idle_runs(&mut t, &set, root, &cfg, true, false, now).is_empty());
+    // ... but the next real busy -> idle edge fires again.
+    assert!(plan_idle_runs(&mut t, &set, root, &cfg, false, false, now).is_empty());
     let plan = plan_idle_runs(&mut t, &set, root, &cfg, true, false, now);
     assert_eq!(plan.iter().map(|(s, _)| s.name).collect::<Vec<_>>(), vec!["champion"]);
 }
@@ -4243,13 +4273,14 @@ fn tick_admitted(root: &Path) -> bool {
 }
 
 mod archived_gate;
-mod concierge_gate;
 mod invoke;
 mod llm_gateway;
 mod model_resolution;
 mod pipeline_idle_gate;
 mod prompt_cache_prefix;
 mod roster_fence;
+mod run_target_dir;
 mod shard_dispatch;
 mod tick_ring;
 mod triggers;
+mod workspace_hold;

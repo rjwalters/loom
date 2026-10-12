@@ -314,3 +314,46 @@ fn the_registry_row_agrees_with_the_record_it_describes() {
         );
     }
 }
+
+/// The Stage 1 exported-facts contract (`defaults/docs/telemetry-schema.md`,
+/// #11098): every record external consumers rely on stays registered with its
+/// signal shape, and the retired ETA-only wire tags stay retired (never
+/// reused) after the ETA subsystem was deleted.
+#[test]
+fn exported_facts_contract_kinds_are_registered_and_retired_tags_stay_gone() {
+    let kind = |tag: &str| TELEMETRY_KINDS.iter().find(|k| k.kind == tag);
+    // (tag, exports over OTLP, accepted by the native HTTPS backend)
+    for (tag, otlp, native) in [
+        ("sweep.outcome", true, true),
+        ("sweep.started", true, true),
+        ("sweep.phase", true, true),
+        ("sweep.completed", true, true),
+        ("sweep.identity", true, true),
+        ("pick.decision", true, false),
+        ("queue.snapshot", false, true),
+        ("fleet.state", true, false),
+        ("host.health", true, true),
+        ("host.export", true, false),
+        ("pr.resolved", true, false),
+        ("eta.stage_outcome", true, false),
+    ] {
+        let meta = kind(tag).unwrap_or_else(|| panic!("contract kind `{tag}` is not registered"));
+        assert_eq!(
+            meta.otlp != TelemetryKindOtlp::NotExported,
+            otlp,
+            "`{tag}`: OTLP export changed"
+        );
+        assert_eq!(meta.native_ingest, native, "`{tag}`: native ingest changed");
+    }
+    for tag in [
+        "eta.estimate",
+        "eta.outcome",
+        "eta.snapshot",
+        "eta.fit",
+        "eta.fleet_refresh",
+        "eta.backtest.fold",
+        "eta.backtest.summary",
+    ] {
+        assert!(kind(tag).is_none(), "retired wire tag `{tag}` was re-registered");
+    }
+}
