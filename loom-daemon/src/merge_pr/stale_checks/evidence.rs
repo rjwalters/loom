@@ -390,3 +390,6 @@ fn json_field_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod restamp_e2e_tests;

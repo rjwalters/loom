@@ -541,6 +541,12 @@ fn test_invoke_omits_effort_entirely_when_nothing_is_configured() {
 
 #[serial]
 fn test_invoke_omits_effort_entirely_when_nothing_is_configured_body() {
+    // #9360: "nothing configured anywhere" includes the environment. An ambient
+    // native pin (`LOOM_RUNTIME=opencode` on a dispatch worker's agent session)
+    // puts `resolve_dispatch_model` on its no-default native branch, so the
+    // `--model` pin asserted below disappears and the test fails for a reason
+    // that has nothing to do with `--effort`.
+    let _runtime_env = ClearedLoomRuntimeEnv::new();
     std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
 
     let tmp = tempfile::tempdir().unwrap();

@@ -88,6 +88,9 @@ pub enum HealOutcome {
     /// re-armed: healing it would let the watchdog revive a daemon an operator
     /// deliberately stopped.
     OperatorStopped(PathBuf),
+    /// The host opted out (#10179, [`crate::host_optout`]): never re-armed,
+    /// whatever the supervisor says.
+    HostDisabled,
 }
 
 /// The fields a healing marker records — the exact set
@@ -240,6 +243,11 @@ pub fn heal_marker(
     if supervisor.is_none() {
         return HealOutcome::UnsupervisedSkip;
     }
+    if crate::host_optout::check_at(&crate::host_optout::disabled_path(marker_path), "heal")
+        .is_err()
+    {
+        return HealOutcome::HostDisabled;
+    }
     if crate::operator_stop::is_recorded(marker_path) {
         return HealOutcome::OperatorStopped(crate::operator_stop::record_path(marker_path));
     }
@@ -264,6 +272,9 @@ pub fn heal_marker(
 /// `LOOM_SOCKET_PATH` and no home directory); otherwise the [`HealOutcome`].
 #[must_use]
 pub fn heal_on_startup(heartbeat_interval_secs: u64) -> Option<HealOutcome> {
+    // #10179: the daemon-startup choke point (supervised relaunch, reboot of an
+    // enabled unit, kickstart) — a host that opted out never comes up.
+    crate::host_optout::refuse_if_disabled_exit("loom-daemon startup");
     let supervisor = crate::ipc::detect_supervisor();
     // Short-circuit before touching the filesystem: an unsupervised run must not
     // even resolve/create the loom dir for the sake of a marker it won't write.
@@ -332,6 +343,10 @@ pub fn log_heal_outcome(outcome: Option<HealOutcome>) {
              record at {} (#9588), so the watchdog must not revive this daemon. Dispatch is held; \
              `loom-daemon restart --abort-drain` releases it and restores the marker.",
             record.display()
+        ),
+        Some(HealOutcome::HostDisabled) => log::warn!(
+            "autonomy_marker: NOT healing the autonomy-desired marker - the host is disabled by \
+             operator (#10179)."
         ),
         None => log::warn!(
             "autonomy_marker: could not resolve a loom dir (no LOOM_SOCKET_PATH / home) — \

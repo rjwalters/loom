@@ -1043,6 +1043,13 @@ impl SweepRegistry {
         if self.config.skip_label_flip {
             return;
         }
+        // Body park record first (#10161); a timeout stops here (park_hold.rs).
+        if self
+            .record_daemon_hold(issue, park_hold::QUARANTINE_HOLD_REASON)
+            .is_err()
+        {
+            return;
+        }
         // Counted as `quarantine.*` (#10089); the facade scopes each call to
         // the registry's workspace (#5401 GH_CONFIG_DIR). Bounded (Issue
         // #3973): quarantine runs from `reap_once`, on the `ListSweeps` /
@@ -2458,8 +2465,9 @@ exit 0
         );
     }
 
-    /// Issue #5431: `apply_quarantine_label`'s two forge mutations (the
-    /// `loom:blocked`/`loom:issue` edit and the explanatory comment) must
+    /// Issue #5431: `apply_quarantine_label`'s forge calls (the
+    /// `loom:blocked`/`loom:issue` edit, the explanatory comment, and the
+    /// #10161 park-record read/write) must
     /// thread a registered cross-owner workspace's installation-token
     /// `GH_CONFIG_DIR` through to the real `gh` children, mirroring
     /// `guards::classify_preflip_labels_applies_registered_gh_config_dir`.
@@ -2486,14 +2494,19 @@ exit 0
         registry.apply_quarantine_label(9501, 3);
 
         let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
-        let occurrences = gh_calls
-            .matches(&format!("GH_CONFIG_DIR={}", owner_dir.display()))
-            .count();
-        assert_eq!(
-            occurrences, 2,
-            "expected BOTH the label edit and the comment to carry the registered \
-             GH_CONFIG_DIR; got: {gh_calls:?}"
+        // Every child carries it: the label edit, the comment, and (#10161) the
+        // park-record calls that now precede them.
+        let expected = format!("GH_CONFIG_DIR={}", owner_dir.display());
+        let dirs: Vec<&str> = gh_calls
+            .lines()
+            .filter(|l| l.starts_with("GH_CONFIG_DIR="))
+            .collect();
+        assert!(
+            dirs.len() >= 2 && dirs.iter().all(|l| *l == expected),
+            "expected every gh child to carry the registered GH_CONFIG_DIR; got: {gh_calls:?}"
         );
+        assert!(gh_calls.contains("issue edit 9501 --add-label loom:blocked"), "{gh_calls:?}");
+        assert!(gh_calls.contains("issue comment 9501 --body"), "{gh_calls:?}");
 
         crate::credential_preflight::clear_owner_root_registry();
     }

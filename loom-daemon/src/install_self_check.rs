@@ -29,6 +29,7 @@
 //! | [`Invariant::RuntimesPresent`]  | #4 `.loom/runtimes/` absent in 7 clones (#5002) | yes — converge from `defaults/runtimes/` |
 //! | [`Invariant::TokenRankingFresh`]| #5 stale `.ranking` → wrong concurrency cap     | yes — re-probe via `tokens check --ranking` |
 //! | [`Invariant::ForgeEgressAligned`]| #9984 `gh` would not reach the mandated API origin | no — files/refreshes an issue naming the finding codes; closes it once aligned |
+//! | [`Invariant::GhFrontWired`]| #10516 interactive sessions do not reach the agent `gh` front | no — `loom update` re-provisions the SessionStart hook |
 //!
 //! The remaining six conditions (binary freshness, sidecar reachability,
 //! telemetry identity, sweep liveness, pid file, stale repo-local `.mcp.json`)
@@ -68,9 +69,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
 use crate::workspace_registry::WorkspaceRegistry;
 
 mod forge_egress_invariant;
+pub mod gh_front_invariant;
+pub mod loom_ui;
 
 // ============================================================================
 // Constants (env overrides + built-in defaults)
@@ -144,6 +148,11 @@ pub enum Invariant {
     /// auto-repairable: the issue names the finding codes and closes itself
     /// once the routing verdict is aligned again.
     ForgeEgressAligned,
+    /// #10516: interactive sessions (and their Task subagents) reach the
+    /// agent `gh` front — the SessionStart `gh-front-env.sh` hook is wired and
+    /// its prefix resolves `gh` to the front (or the managed launcher). Not
+    /// auto-repairable: see [`gh_front_invariant`].
+    GhFrontWired,
 }
 
 impl Invariant {
@@ -154,6 +163,7 @@ impl Invariant {
         Self::RuntimesPresent,
         Self::TokenRankingFresh,
         Self::ForgeEgressAligned,
+        Self::GhFrontWired,
     ];
 
     /// Stable machine identifier — used in the issue-dedup marker and logs.
@@ -165,6 +175,7 @@ impl Invariant {
             Self::RuntimesPresent => "runtimes-present",
             Self::TokenRankingFresh => "token-ranking-fresh",
             Self::ForgeEgressAligned => "forge-egress-aligned",
+            Self::GhFrontWired => "gh-front-wired",
         }
     }
 
@@ -176,6 +187,7 @@ impl Invariant {
             Self::RuntimesPresent => ".loom/runtimes/ is missing configured runtimes",
             Self::TokenRankingFresh => "token-pool .ranking is stale or missing",
             Self::ForgeEgressAligned => "forge egress routing is not aligned with policy",
+            Self::GhFrontWired => "interactive sessions do not reach the agent gh front",
         }
     }
 
@@ -188,7 +200,7 @@ impl Invariant {
     pub fn auto_repairable(self) -> bool {
         match self {
             Self::McpBundleHealth | Self::RuntimesPresent | Self::TokenRankingFresh => true,
-            Self::ForgeEgressAligned => false,
+            Self::ForgeEgressAligned | Self::GhFrontWired => false,
         }
     }
 
@@ -317,6 +329,7 @@ pub fn check(invariant: Invariant, repo_root: &Path, opts: &CheckOptions) -> Inv
             Some(sources) => forge_egress_invariant::check_with(sources, repo_root),
             None => forge_egress_invariant::check(repo_root),
         },
+        Invariant::GhFrontWired => gh_front_invariant::check(repo_root),
     }
 }
 
@@ -536,7 +549,7 @@ pub fn repair(invariant: Invariant, repo_root: &Path, ctx: &RepairContext) -> Re
         Invariant::RuntimesPresent => repair_runtimes(repo_root),
         Invariant::TokenRankingFresh => repair_token_ranking(repo_root, ctx),
         Invariant::McpBundleHealth => repair_mcp_bundle(repo_root, ctx),
-        Invariant::ForgeEgressAligned => unreachable_repair(),
+        Invariant::ForgeEgressAligned | Invariant::GhFrontWired => unreachable_repair(),
     }
 }
 
@@ -933,20 +946,26 @@ impl GhIssueFiler {
     }
 }
 
+/// A self-check `gh` call through the facade (#10089): counted in
+/// `forge_call_stats`, bounded, and run under `root`'s owner credential.
+fn gh_self_check(op: &'static str, intent: AccessIntent, root: &Path) -> GhInvocation {
+    let timeout = Duration::from_secs(60);
+    GhInvocation::new(Operation::new(op), intent, GhTarget::None, timeout).current_dir(root)
+}
+
 impl ViolationReporter for GhIssueFiler {
     fn has_open_issue(&self, marker: &str) -> Result<bool, String> {
         // `gh issue list --search "<marker>" --state open` — GitHub full-text
         // search matches the hidden HTML comment in the body.
-        let mut cmd = Command::new(crate::gh_invocation::gh_bin());
-        cmd.args([
-            "issue", "list", "--state", "open", "--search", marker, "--json", "number",
-        ])
-        .current_dir(&self.repo_root);
-        // #5431: select the owner-correct credential for a cross-owner repo_root.
-        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, &self.repo_root);
-        let output = cmd
-            .output()
-            .map_err(|e| format!("could not spawn gh: {e}"))?;
+        // #10089: through the facade, which also selects the owner-correct
+        // credential for a cross-owner repo_root (#5431).
+        let output = gh_self_check("self_check.issue_search", AccessIntent::Read, &self.repo_root)
+            .args([
+                "issue", "list", "--state", "open", "--search", marker, "--json", "number",
+            ])
+            .run()
+            .into_result()
+            .map_err(|e| format!("could not run gh: {e}"))?;
         if !output.status.success() {
             return Err(format!(
                 "gh issue list exited with {}: {}",
@@ -968,32 +987,22 @@ impl ViolationReporter for GhIssueFiler {
             .join(".loom")
             .join("scripts")
             .join("create-issue.sh");
-        let mut cmd = if script.is_file() {
-            let mut c = Command::new(&script);
-            c.args(["--title", title, "--body", body, "--label", "loom:triage"])
-                .current_dir(&self.repo_root);
-            c
+        let fields = ["--title", title, "--body", body, "--label", "loom:triage"];
+        let output = if script.is_file() {
+            let mut cmd = Command::new(&script);
+            cmd.args(fields).current_dir(&self.repo_root);
+            // #5431: the owner-correct credential, inherited by the script's `gh`.
+            crate::credential_preflight::apply_gh_config_for_root(&mut cmd, &self.repo_root);
+            cmd.output().map_err(|e| e.to_string())
         } else {
-            let mut c = Command::new(crate::gh_invocation::gh_bin());
-            c.args([
-                "issue",
-                "create",
-                "--title",
-                title,
-                "--body",
-                body,
-                "--label",
-                "loom:triage",
-            ])
-            .current_dir(&self.repo_root);
-            c
-        };
-        // #5431: select the owner-correct credential for a cross-owner repo_root.
-        // For `create-issue.sh` this is inherited by the `gh` it shells to.
-        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, &self.repo_root);
-        let output = cmd
-            .output()
-            .map_err(|e| format!("could not spawn issue-create: {e}"))?;
+            gh_self_check("self_check.issue_create", AccessIntent::Write, &self.repo_root)
+                .args(["issue", "create"])
+                .args(fields)
+                .run()
+                .into_result()
+                .map_err(|e| e.to_string())
+        }
+        .map_err(|e| format!("could not spawn issue-create: {e}"))?;
         if !output.status.success() {
             return Err(format!(
                 "issue-create exited with {}: {}",
@@ -1251,8 +1260,11 @@ pub fn spawn_multi_install_self_check_task(
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // #11295: the violations standing after each tick, on loom-ui.
+        let mut ledger = crate::loom_ui_alerts::ledger::Ledger::load(loom_ui::SCOPE);
         loop {
             ticker.tick().await;
+            let (mut standing, mut unknown) = (Vec::new(), BTreeSet::new());
 
             let roots = WorkspaceRegistry::load_default()
                 .unwrap_or_else(|e| {
@@ -1281,22 +1293,37 @@ pub fn spawn_multi_install_self_check_task(
                 let root_for_task = root.clone();
                 let joined = tokio::task::spawn_blocking(move || {
                     let reporter = GhIssueFiler::new(root_for_task.clone());
-                    run_pass(
+                    let report = run_pass(
                         &root_for_task,
                         repair_mode,
-                        check_opts,
+                        check_opts.clone(),
                         &RepairContext::default(),
                         &reporter,
                     );
+                    // A repair may have fixed a violation: what stands is a
+                    // re-check, run only when there was one to repair.
+                    let report = if repair_mode && !report.is_all_ok() {
+                        run_checks(&root_for_task, check_opts)
+                    } else {
+                        report
+                    };
+                    loom_ui::alerts(&root_for_task, &report)
                 })
                 .await;
-                if let Err(e) = joined {
-                    log::error!(
-                        "install_self_check: pass for {} panicked ({e}); continuing to the next repo",
-                        root.display()
-                    );
+                match joined {
+                    Ok(found) => standing.extend(found),
+                    Err(e) => {
+                        log::error!(
+                            "install_self_check: pass for {} panicked ({e}); continuing to the \
+                             next repo",
+                            root.display()
+                        );
+                        unknown.insert(root.display().to_string());
+                    }
                 }
             }
+            // A root whose pass panicked keeps what it had open.
+            ledger.reconcile_where(standing, |_, key| !unknown.contains(key));
         }
     })
 }

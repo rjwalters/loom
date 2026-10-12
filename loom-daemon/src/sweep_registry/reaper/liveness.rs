@@ -22,9 +22,10 @@ impl SweepRegistry {
     /// leaves the pre-#7935 verdict untouched.
     ///
     /// Returns `(is_dead, exit_code)`. On a handle-observed exit the handle is
-    /// removed from `self.children`; `exit_code` is `None` when the child was
-    /// terminated by a signal (no clean code) or when liveness came from the
-    /// fallback probe.
+    /// removed from `self.children`; `exit_code` is `None` only when liveness
+    /// came from the fallback probe. A leader killed by signal N reports the
+    /// shell convention `128 + N` (#11076: SIGKILL → 137, SIGTERM → 143), so a
+    /// signal death is distinguishable from "no exit status observed".
     pub(crate) fn poll_liveness(&mut self, sweep_id: &str, pid: u32) -> (bool, Option<i32>) {
         let started_at = self.entries.get(sweep_id).map(|info| info.started_at);
         if let Some(child) = self.children.get_mut(sweep_id) {
@@ -41,7 +42,7 @@ impl SweepRegistry {
                             "signal"
                         },
                     );
-                    let code = status.code();
+                    let code = exit_code_of(status);
                     self.children.remove(sweep_id);
                     (true, code)
                 }
@@ -70,5 +71,40 @@ impl SweepRegistry {
             // just been SIGKILL'd, so `wait()` returns promptly.
             child.wait().ok()
         })
+    }
+}
+
+/// Issue #11076: the exit code of a reaped child, mapping a signal death to
+/// the shell convention `128 + signal` instead of `ExitStatus::code()`'s
+/// `None` — which the reaper otherwise reads as "no exit status observed".
+pub(crate) fn exit_code_of(status: std::process::ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+    status
+        .code()
+        .or_else(|| status.signal().map(|sig| 128 + sig))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::exit_code_of;
+    use std::process::Command;
+
+    /// #11076: a SIGKILLed / SIGTERMed child must surface as 137 / 143 — the
+    /// codes `prless_retry::external_kill_exemption` keys on — not `None`.
+    #[test]
+    fn a_signal_killed_child_reports_128_plus_the_signal() {
+        for (sig, want) in [("KILL", 137), ("TERM", 143)] {
+            let status = Command::new("sh")
+                .args(["-c", &format!("kill -{sig} $$")])
+                .status()
+                .expect("spawn sh");
+            assert_eq!(status.code(), None, "the raw status carries no code");
+            assert_eq!(exit_code_of(status), Some(want), "SIG{sig}");
+        }
+        let status = Command::new("sh")
+            .args(["-c", "exit 3"])
+            .status()
+            .expect("spawn sh");
+        assert_eq!(exit_code_of(status), Some(3), "an ordinary exit is unchanged");
     }
 }

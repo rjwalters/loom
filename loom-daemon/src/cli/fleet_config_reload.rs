@@ -127,7 +127,7 @@ fn matching_repo<'a>(
     })
 }
 
-fn fetch_status() -> Option<DaemonStatusReport> {
+pub(crate) fn fetch_status() -> Option<DaemonStatusReport> {
     let socket_path = resolve_socket_path().ok()?;
     match block_on_query(&socket_path)? {
         Response::DaemonStatus(report) => Some(*report),
@@ -194,6 +194,7 @@ mod tests {
         let mut status = sample_report();
         status.per_repo = vec![RepoStatus {
             root: PathBuf::from("/repo/a"),
+            maintain_only: None,
             role_runner_enabled: true,
             role_runner_roles: vec!["judge".to_string()],
             ..sample_repo_status()
@@ -228,6 +229,7 @@ mod tests {
     fn sample_repo_status() -> RepoStatus {
         RepoStatus {
             root: PathBuf::new(),
+            maintain_only: None,
             priority: 0,
             in_flight_count: 0,
             health_gate_halted: false,

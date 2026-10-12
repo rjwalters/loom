@@ -7,6 +7,7 @@ use super::super::{
     hold_action, plan_group, plan_repo_with, EdgeReason, SequenceGroup, SEQUENCE_LABEL,
 };
 use super::*;
+use crate::work_finder::OPERATOR_PRIORITY_LABEL;
 
 const NOW: &str = "2026-10-03T12:00:00Z";
 const BOUND: f64 = 12.0;
@@ -60,9 +61,9 @@ fn transitive_only_members_get_no_edge() {
     // A–B share x.rs, B–C share y.rs, A and C share nothing. One component,
     // but C waits only for B, and nothing links A and C directly.
     let prs = [
-        fresh(1, "2026-10-01T00:00:00Z", &[]),
-        fresh(2, "2026-10-01T01:00:00Z", &[]),
-        fresh(3, "2026-10-01T02:00:00Z", &[]),
+        fresh(1, "2026-10-01T00:00:00Z", &[APPROVED_LABEL]),
+        fresh(2, "2026-10-01T01:00:00Z", &[APPROVED_LABEL]),
+        fresh(3, "2026-10-01T02:00:00Z", &[APPROVED_LABEL]),
     ];
     let f = files(&[(1, &["x.rs"]), (2, &["x.rs", "y.rs"]), (3, &["y.rs"])]);
     let groups = plan_repo_with(&prs, &f, &NONE, &BTreeSet::new());
@@ -77,9 +78,9 @@ fn disjoint_members_of_one_component_are_never_ordered_against_each_other() {
     // share none. #56 must wait for the hub, not for #53, and no
     // `SharedFiles` edge may join two PRs with disjoint file sets.
     let prs = [
-        fresh(10, "2026-10-01T00:00:00Z", &[]),
-        fresh(53, "2026-10-02T00:00:00Z", &[]),
-        fresh(56, "2026-10-02T01:00:00Z", &[]),
+        fresh(10, "2026-10-01T00:00:00Z", &[APPROVED_LABEL]),
+        fresh(53, "2026-10-02T00:00:00Z", &[APPROVED_LABEL]),
+        fresh(56, "2026-10-02T01:00:00Z", &[APPROVED_LABEL]),
     ];
     let f = files(&[
         (
@@ -180,9 +181,10 @@ fn a_ready_group_with_no_stalled_head_is_unchanged() {
 
 #[test]
 fn a_starred_pr_is_ordered_ahead_of_an_unstarred_predecessor() {
-    let old = fresh(1, "2026-10-01T00:00:00Z", &[]);
-    let mid = fresh(2, "2026-10-01T01:00:00Z", &[]);
-    let star = fresh(3, "2026-10-01T02:00:00Z", &[OPERATOR_PRIORITY_LABEL]);
+    // All approved: one readiness tier (#10371), so only the star reorders.
+    let old = fresh(1, "2026-10-01T00:00:00Z", &[APPROVED_LABEL]);
+    let mid = fresh(2, "2026-10-01T01:00:00Z", &[APPROVED_LABEL]);
+    let star = fresh(3, "2026-10-01T02:00:00Z", &[APPROVED_LABEL, OPERATOR_PRIORITY_LABEL]);
     let f = files(&[(1, &["s"]), (2, &["s"]), (3, &["s"])]);
     let prs = [old.clone(), mid.clone(), star.clone()];
     let g = &plan_repo_with(&prs, &f, &NONE, &BTreeSet::new())[0];
@@ -193,7 +195,7 @@ fn a_starred_pr_is_ordered_ahead_of_an_unstarred_predecessor() {
     let plain = [
         old.clone(),
         mid.clone(),
-        fresh(3, "2026-10-01T02:00:00Z", &[]),
+        fresh(3, "2026-10-01T02:00:00Z", &[APPROVED_LABEL]),
     ];
     assert_eq!(plan_repo_with(&plain, &f, &NONE, &BTreeSet::new())[0].order, vec![1, 2, 3]);
 
@@ -205,10 +207,10 @@ fn a_starred_pr_is_ordered_ahead_of_an_unstarred_predecessor() {
 
 #[test]
 fn a_stacked_base_beats_the_star() {
-    let base = fresh(1, "2026-10-01T00:00:00Z", &[]);
-    let mut stacked = fresh(2, "2026-10-01T01:00:00Z", &[OPERATOR_PRIORITY_LABEL]);
+    let base = fresh(1, "2026-10-01T00:00:00Z", &[APPROVED_LABEL]);
+    let mut stacked = fresh(2, "2026-10-01T01:00:00Z", &[APPROVED_LABEL, OPERATOR_PRIORITY_LABEL]);
     stacked.base_ref = base.head_ref.clone();
-    let other = fresh(3, "2026-10-01T02:00:00Z", &[]);
+    let other = fresh(3, "2026-10-01T02:00:00Z", &[APPROVED_LABEL]);
     let f = files(&[(1, &["s"]), (2, &["s"]), (3, &["s"])]);
     let g = &plan_repo_with(&[base, stacked, other], &f, &NONE, &BTreeSet::new())[0];
     assert_eq!(g.order, vec![1, 2, 3]);
@@ -331,7 +333,9 @@ fn a_stalled_no_verdict_member_is_planned_last_so_released_work_lands_first() {
     assert_eq!(stalled, BTreeSet::from([7]));
     let g = &plan_repo_with(&prs, &f, &NONE, &stalled)[0];
     assert_eq!(g.order, vec![8, 9, 7]);
-    assert_eq!(edges(g), vec![(9, 8), (7, 9)]);
+    // #10371: #7 would wait for the nearest earlier member, #9, which has no
+    // verdict — no hold is written behind a non-ready predecessor.
+    assert_eq!(edges(g), vec![(9, 8)]);
 }
 
 #[test]
@@ -404,4 +408,86 @@ fn the_second_tick_posts_nothing() {
     assert_eq!(calls.matches("pr comment").count(), 1, "{calls}");
     // A held PR label alone never counts as an escalation.
     assert!(!already_escalated(&[SEQUENCE_LABEL.to_string()], chain));
+}
+
+/// A fake `gh` for the #10089 dedupe test: `api` reads answer from the
+/// `marker` / `fail` flag files; every call is logged as `"$1 $2"`.
+#[cfg(unix)]
+fn flagged_gh(dir: &std::path::Path, marker: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let log = dir.join("flagged.log");
+    let bin = dir.join("fake-gh-flagged.sh");
+    let script = format!(
+        "#!/usr/bin/env bash\nprintf '%s\\n' \"$1 $2\" >> \"{log}\"\n\
+         if [ \"$1\" = api ]; then\n  [ -f \"{d}/fail\" ] && exit 1\n  \
+         if [ -f \"{d}/marker\" ]; then\n    \
+         echo '[{{\"body\":\"{marker}\",\"author_association\":\"OWNER\",\"user\":{{\"login\":\"op\",\"type\":\"User\"}}}}]'\n  \
+         else echo '[]'; fi\nfi\n",
+        log = log.display(),
+        d = dir.display(),
+    );
+    std::fs::write(&bin, script).unwrap();
+    let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&bin, perms).unwrap();
+    (bin, log)
+}
+
+/// #10089: with the read cache on, "not yet escalated" is never cached (a
+/// lagging listing must not suppress the first post), a failed read neither
+/// posts nor caches, and a found marker stops further comment reads.
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn escalation_dedupe_never_suppresses_the_first_post_and_never_reposts() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    std::fs::create_dir_all(&root).unwrap();
+    let head = pr(5, "2026-09-30T00:00:00Z", "2026-10-01T00:00:00Z", &["loom:operator"]);
+    let mut ledger = StallLedger::default();
+    ledger.record(&head, &StallCause::HumanHold("loom:operator".into()), 36.0, 11, false);
+    let chain = &ledger.chains[0];
+    let (gh, log) = flagged_gh(dir.path(), &escalation_marker(&chain.key()));
+    let count = |needle: &str| {
+        std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.contains(needle))
+            .count()
+    };
+    let flag = |name: &str, on: bool| {
+        let p = dir.path().join(name);
+        if on {
+            std::fs::write(p, "").unwrap();
+        } else {
+            let _ = std::fs::remove_file(p);
+        }
+    };
+
+    crate::claim_reconciliation::read_cache::set_test_enabled(true);
+
+    // (a) No marker: every call re-reads the comments and posts.
+    for n in 1..=2 {
+        assert!(escalate(&gh, &root, chain, BOUND).unwrap(), "call {n} posts");
+        assert_eq!(count("api"), n, "call {n} re-reads comments");
+        assert_eq!(count("pr comment"), n);
+    }
+
+    // (c) A failed read: Err, no post, nothing cached.
+    flag("fail", true);
+    assert!(escalate(&gh, &root, chain, BOUND).is_err());
+    assert_eq!((count("api"), count("pr comment")), (3, 2), "failed read never posts");
+    flag("fail", false);
+    assert!(escalate(&gh, &root, chain, BOUND).unwrap(), "the failure cached nothing");
+    assert_eq!((count("api"), count("pr comment")), (4, 3));
+
+    // (b) Marker present: one read, then none; never a post.
+    flag("marker", true);
+    for _ in 0..4 {
+        assert!(!escalate(&gh, &root, chain, BOUND).unwrap(), "already escalated");
+    }
+    assert_eq!(count("api"), 5, "one read, then served from cache");
+    assert_eq!(count("pr comment"), 3, "no post once the marker is found");
+
+    crate::claim_reconciliation::read_cache::set_test_enabled(false);
 }

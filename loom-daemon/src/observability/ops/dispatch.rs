@@ -29,7 +29,7 @@ use crate::work_finder::{Admission, TickReport};
 /// `claim_collision`, `claim_lock_held`), so their parents are reported net of
 /// them: every candidate lands in exactly one reason.
 #[must_use]
-pub fn decision_counts(report: &TickReport) -> [(&'static str, usize); 26] {
+pub fn decision_counts(report: &TickReport) -> [(&'static str, usize); 27] {
     let classified_errors =
         report.refused_token_selection + report.refused_claim_collision + report.refused_claim_lock;
     [
@@ -50,9 +50,10 @@ pub fn decision_counts(report: &TickReport) -> [(&'static str, usize); 26] {
         ("noop_cooldown", report.skipped_noop_cooldown),
         ("declined", report.skipped_declined),
         ("prless_retry", report.skipped_prless_retry),
+        ("already_landed", report.skipped_already_landed),
+        ("already_closed", report.skipped_already_closed),
         ("recheck_interval", report.skipped_recheck_interval),
         ("host_constraint", report.skipped_host_constraint),
-        ("host_class", report.skipped_host_class),
         ("capacity", report.deferred_capacity),
         ("ramp_cap", report.deferred_ramp_cap),
         ("saturation", report.deferred_saturation),
@@ -76,8 +77,8 @@ pub fn decision_counts(report: &TickReport) -> [(&'static str, usize); 26] {
 /// | `halted_main_red` | a main-health gate held a workspace |
 /// | `halted_ci_billing` | as above, but an owner's Actions jobs are billing-blocked (#10113) |
 /// | `saturation_held` | the saturation admission brake was engaged |
-/// | `build_backoff_held` | the build back-off (#9410) was engaged |
 /// | `error` | a dispatch or listing failed and nothing started |
+/// | `build_backoff_held` | the build back-off (#9410) deferred at least one candidate |
 /// | `no_eligible_work` | no ready candidates at all |
 /// | `capacity_full` | candidates deferred by the concurrency or ramp cap |
 /// | `all_skipped` | every candidate was skipped for a per-issue reason |
@@ -97,10 +98,14 @@ pub fn tick_result_with(report: &TickReport, billing_blocked: bool) -> &'static 
         "halted_main_red"
     } else if report.saturation_held {
         "saturation_held"
-    } else if report.build_backoff_held {
-        "build_backoff_held"
     } else if report.errors > 0 {
         "error"
+    } else if report.deferred_build_backoff > 0 {
+        // Keyed on an actual deferral, not on `build_backoff_held` (#10624):
+        // since the hold is per repo, one repo can stay engaged for days, and
+        // "any repo held" would mask every idle, capacity-full or failed tick
+        // as a back-off hold.
+        "build_backoff_held"
     } else if report.seen == 0 {
         "no_eligible_work"
     } else if report.deferred_capacity + report.deferred_ramp_cap > 0 {
@@ -371,8 +376,9 @@ pub fn record_tick(
     // failed-repo discipline (unresolvable roots are dropped, the same
     // accepted edge case its own `failed_slugs` documents).
     let repo_refs = resolved_repo_refs(&report.admissions, &report.queue, roots);
+    // #11139: a partial listing is no evidence of a cleared lock either.
     let failed: Vec<String> = report
-        .listing_failed
+        .listing_not_whole()
         .iter()
         .filter_map(|idx| repo_refs.get(idx).map(|r| r.repo.clone()))
         .collect();

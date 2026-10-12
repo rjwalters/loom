@@ -79,7 +79,8 @@ pub fn wait_class(disposition: QueueDisposition) -> Option<WaitClass> {
         | D::DeferredSaturation
         | D::DeferredBuildBackoff
         | D::DeferredOutOfSlice
-        | D::DeferredRepoCap => Some(WaitClass::Ready),
+        | D::DeferredRepoCap
+        | D::DeferredFileOverlap => Some(WaitClass::Ready),
         D::WorkspaceHalted
         | D::WorkspaceCommandsMissing
         | D::Quarantined
@@ -93,10 +94,11 @@ pub fn wait_class(disposition: QueueDisposition) -> Option<WaitClass> {
         | D::HardExclusion
         | D::Declined
         | D::HostConstraint
-        | D::HostClassRefused
         | D::PeerClaim
         | D::OpenPr
         | D::OpenPrBackoff
+        | D::AlreadyLanded
+        | D::AlreadyClosed
         | D::RecheckInterval
         | D::LabelledBlocked
         | D::Unknown => None,
@@ -286,7 +288,8 @@ pub fn record_tick(report: &TickReport, roots: &[PathBuf], started_at: DateTime<
         return;
     }
     let rows = rows_from_report(report, roots);
-    let incomplete = ready_queue::repo_names(&report.listing_failed, roots);
+    // #11139: a partial listing's missing rows did not leave the queue either.
+    let incomplete = ready_queue::repo_names(&report.listing_not_whole(), roots);
     let observation = TRACKER
         .get_or_init(|| Mutex::new(DwellTracker::default()))
         .lock()

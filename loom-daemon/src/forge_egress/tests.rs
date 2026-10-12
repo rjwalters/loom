@@ -30,6 +30,7 @@ fn aligned() -> Observed {
             version: Some((2, 102, 0)),
             raw: "gh version 2.102.0 (2026-09-30)".into(),
         },
+        path_gh: Some(PathBuf::from("/usr/local/bin/gh")),
         launcher_exists: true,
         profiles: vec![Profile {
             path: PathBuf::from("/home/u/.config/gh"),
@@ -42,15 +43,36 @@ fn aligned() -> Observed {
 }
 
 #[test]
-fn unconfigured_is_exit_zero_with_the_documented_json() {
+fn unconfigured_is_exit_zero_with_a_visible_notice() {
     let r = run_with(&PolicySources::default(), Path::new("/nonexistent"), Mode::Doctor);
     assert!(!r.is_configured());
     let j = r.to_json();
     assert_eq!(j["policy"]["origin"], "unconfigured");
     assert_eq!(j["exit_code"], 0);
+    assert_eq!(r.routing_codes(), ["policy.unconfigured"]);
+    assert_eq!(j["routing"]["findings"][0]["code"], "policy.unconfigured");
+    assert_eq!(j["routing"]["findings"][0]["severity"], "notice");
     for s in ["routing", "git", "runtime", "telemetry"] {
         assert_eq!(j[s]["exit_code"], 0, "{s}");
     }
+    assert_eq!(admission_for(&r), Admission::Unconfigured);
+}
+
+#[test]
+fn unconfigured_on_a_managed_host_is_exit_two() {
+    let sources = PolicySources {
+        managed: true,
+        ..PolicySources::default()
+    };
+    let r = run_with(&sources, Path::new("/nonexistent"), Mode::Doctor);
+    assert!(!r.is_configured());
+    assert_eq!(r.exit_code(), 2);
+    let j = r.to_json();
+    assert_eq!(j["exit_code"], 2);
+    assert_eq!(j["policy"]["origin"], "unconfigured");
+    assert_eq!(j["routing"]["findings"][0]["code"], "policy.unconfigured");
+    assert_eq!(j["routing"]["findings"][0]["severity"], "incomplete");
+    // The daemon gate still admits: an unconfigured host is never refused.
     assert_eq!(admission_for(&r), Admission::Unconfigured);
 }
 
@@ -174,4 +196,109 @@ fn repo_origin_policies_never_run_the_canary() {
     let r = run_with(&sources, dir.path(), Mode::Doctor);
     assert!(!marker.exists(), "a repo-local policy made the validator run a command");
     assert!(report::codes(&r.runtime).contains(&"runtime.unverifiable"));
+}
+
+// ---- #9986: no GitHub credential on `required` hosts ----
+
+fn with_api(mode: &str) -> PolicyDoc {
+    let mut p = example();
+    p["enforcement"]["api"] = mode.into();
+    doc(p)
+}
+
+#[test]
+fn token_in_an_enumerated_profile_is_a_finding_only_under_required() {
+    let mut obs = aligned();
+    obs.token_profiles = vec![PathBuf::from("/w/.loom/gh-config")];
+    let required = evaluate(&with_api("required"), &obs, Mode::Assert);
+    assert!(required
+        .routing_codes()
+        .contains(&"apiconfig.github-token-present".to_string()));
+    let observe = evaluate(&with_api("observe"), &obs, Mode::Assert);
+    assert!(!observe
+        .routing_codes()
+        .contains(&"apiconfig.github-token-present".to_string()));
+}
+
+#[test]
+fn gh_git_credential_helper_is_a_git_finding_only_under_required() {
+    let mut obs = aligned();
+    obs.git_helper_is_gh = true;
+    let required = evaluate(&with_api("required"), &obs, Mode::Doctor);
+    assert!(required
+        .git
+        .iter()
+        .any(|f| f.code == "git.credential-from-api-profile"));
+    let observe = evaluate(&with_api("observe"), &obs, Mode::Doctor);
+    assert!(!observe
+        .git
+        .iter()
+        .any(|f| f.code == "git.credential-from-api-profile"));
+    // The routing verdict (process exit code) is not affected by the git finding.
+    assert!(!required
+        .routing_codes()
+        .contains(&"git.credential-from-api-profile".to_string()));
+    obs.git_helper_is_gh = false;
+    assert!(evaluate(&with_api("required"), &obs, Mode::Doctor)
+        .git
+        .iter()
+        .all(|f| f.code != "git.credential-from-api-profile"));
+}
+
+#[test]
+fn hosts_token_detection_reads_verdict_only() {
+    use super::probe::hosts_text_has_token;
+    assert!(hosts_text_has_token("github.com:\n    oauth_token: ghs_x\n"));
+    assert!(!hosts_text_has_token("github.com:\n    git_protocol: https\n"));
+    assert!(!hosts_text_has_token("github.com:\n    oauth_token: \"\"\n"));
+}
+
+/// #9995: the version floor reads the exec target; launcher-not-first reads
+/// PATH's `gh`, even when the exec target is the launcher itself.
+#[test]
+fn launcher_not_first_and_the_floor_measure_different_gh() {
+    let launcher = PathBuf::from("/usr/local/bin/gh"); // example launcherPath
+    let mut obs = aligned();
+    obs.gh.path = Some(launcher.clone());
+    obs.path_gh = Some(PathBuf::from("/opt/unmanaged/bin/gh"));
+    let r = evaluate(&doc(example()), &obs, Mode::Doctor);
+    assert_eq!(r.routing_codes(), vec!["toolchain.launcher-not-first".to_string()]);
+    assert_eq!(
+        r.to_json()["observed"]["pathGhPath"],
+        "/opt/unmanaged/bin/gh",
+        "the report shows both"
+    );
+
+    // PATH is right but the exec target is below the floor: only the floor.
+    let mut obs = aligned();
+    obs.path_gh = Some(launcher);
+    obs.gh.version = Some((2, 97, 0));
+    let r = evaluate(&doc(example()), &obs, Mode::Doctor);
+    assert_eq!(r.routing_codes(), vec!["toolchain.below-api-host-floor".to_string()]);
+}
+
+/// #9995 review: an exec target that is neither the existing launcher nor
+/// PATH's `gh` (`LOOM_GH_BIN` with the policy rung declined) is a routing
+/// finding, even though PATH is correct and the version clears the floor.
+#[test]
+fn exec_target_off_the_launcher_and_off_path_is_policy_launcher_declined() {
+    let code = "toolchain.policy-launcher-declined".to_string();
+    let mut obs = aligned();
+    obs.gh.path = Some(PathBuf::from("/opt/unmanaged/bin/gh"));
+    obs.gh_source = Some("env_override");
+    let r = evaluate(&doc(example()), &obs, Mode::Assert);
+    assert_eq!(r.routing_codes(), vec![code.clone()]);
+    assert!(super::checks::LOOM_ONLY_CODES.contains(&code.as_str()));
+
+    // Exec target == PATH's gh: launcher-not-first alone covers it.
+    obs.path_gh = obs.gh.path.clone();
+    let r = evaluate(&doc(example()), &obs, Mode::Assert);
+    assert_eq!(r.routing_codes(), vec!["toolchain.launcher-not-first".to_string()]);
+
+    // Launcher absent on this host: the rung could not have won; no finding.
+    let mut obs = aligned();
+    obs.gh.path = Some(PathBuf::from("/opt/unmanaged/bin/gh"));
+    obs.launcher_exists = false;
+    let r = evaluate(&doc(example()), &obs, Mode::Assert);
+    assert!(!r.routing_codes().contains(&code), "{:?}", r.routing_codes());
 }

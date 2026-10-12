@@ -28,10 +28,44 @@
 //! The state probe is [`SweepRegistry::fetch_issue_signals`]'s `closed` field — one
 //! REST `gh api` read on the independent pool, breaker-gated, the same cost
 //! shape as the complexity read this terminal path already pays.
+//!
+//! Issue #10955 adds one more carve-out of the same shape: an issue that did
+//! not carry `loom:issue` when it was claimed does not gain it on release.
+//! See [`prior_label`].
 
 use super::*;
 
+mod prior_label;
+
 impl SweepRegistry {
+    /// The reaper's claim release for the reaped dispatch `sweep_id` (Issue
+    /// #11438): [`restore_label_to_ready`](Self::restore_label_to_ready),
+    /// except when that very dispatch self-reported a no-op release
+    /// ([`noop_release_covers_dispatch`](Self::noop_release_covers_dispatch),
+    /// #8912). Such a sweep removed `loom:building` and deliberately left
+    /// `loom:issue` off to stop a claim/release loop; re-adding it ~25 s later
+    /// re-armed the very loop (loom-ui#3508, #2727). So only the stale
+    /// `loom:building` claim is removed — never a queue label re-added.
+    pub(crate) fn restore_label_after_reap(&self, issue: u32, sweep_id: &str) -> Result<()> {
+        if !self.noop_release_covers_dispatch(issue, sweep_id) {
+            return self.restore_label_to_ready(issue);
+        }
+        log::info!(
+            "sweep_registry: sweep {sweep_id} self-reported a no-op release for #{issue} — \
+             removing the stale `loom:building` claim only, NOT re-adding `loom:issue` (#11438)"
+        );
+        self.run_claim_release_edit(
+            issue,
+            vec![
+                "issue".to_string(),
+                "edit".to_string(),
+                issue.to_string(),
+                "--remove-label".to_string(),
+                "loom:building".to_string(),
+            ],
+        )
+    }
+
     /// [`restore_label_to_ready`](Self::restore_label_to_ready) with the
     /// Issue #9463 closed-state carve-out applied. The label-mutation body
     /// lives here (a sibling module) so the size-ratcheted `guards.rs` only
@@ -58,6 +92,11 @@ impl SweepRegistry {
             // contract: `None` falls back to the unconditional restore.
             self.fetch_issue_signals(issue).closed
         };
+        // Issue #10955: last of all, and only when the re-add would otherwise
+        // happen — did the claim take `loom:issue` away in the first place?
+        // Only a positive "no" skips the re-add (see `prior_label`).
+        let never_ready = !(parked || is_pr || closed == Some(true))
+            && self.claim_took_ready_label(issue) == Some(false);
         let mut args = vec![
             "issue".to_string(),
             "edit".to_string(),
@@ -91,23 +130,42 @@ impl SweepRegistry {
                  `loom:building` claim only, NOT re-adding the `loom:issue` queue label \
                  to a closed issue."
             );
+        } else if never_ready {
+            log::info!(
+                "sweep_registry: restore_label_to_ready for #{issue} found the issue did \
+                 not carry `loom:issue` when it was claimed — removing the stale \
+                 `loom:building` claim only, NOT adding a queue label it never had (#10955)"
+            );
         } else {
             args.extend(["--add-label".to_string(), "loom:issue".to_string()]);
         }
+        self.run_claim_release_edit(issue, args)
+    }
+
+    /// Run one claim-release `gh issue edit` (`args`) for `issue`, bounded.
+    fn run_claim_release_edit(&self, issue: u32, mut args: Vec<String>) -> Result<()> {
         // Scoped to the registry's workspace (#3937; LOOM_REPO still overrides)
         // and counted as `restore.label` (#10089). Best-effort during reap, but
         // bounded so a wedged `gh` on the `ListSweeps` / `GetSweepStatus` read
         // path cannot block the registry read indefinitely (Issue #3973).
         args.extend(crate::claim_reconciliation::gh_call::loom_repo_flag());
         let timeout = reap_gh_timeout();
-        if self.gh_write("restore.label", &args)?.is_none() {
-            log::warn!(
-                "sweep_registry: restore_label_to_ready gh for #{issue} exceeded {}s \
-                 and was killed (#3973)",
-                timeout.as_secs()
-            );
+        match self.gh_write("restore.label", &args)? {
+            None => {
+                log::warn!(
+                    "sweep_registry: restore_label_to_ready gh for #{issue} exceeded {}s \
+                     and was killed (#3973)",
+                    timeout.as_secs()
+                );
+                anyhow::bail!("label restore for #{issue} timed out after {}s", timeout.as_secs());
+            }
+            Some(out) if !out.status.success() => anyhow::bail!(
+                "label restore for #{issue} failed ({}): {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+            Some(_) => Ok(()),
         }
-        Ok(())
     }
 }
 
@@ -214,6 +272,69 @@ exit 0
         assert!(
             calls.contains("--add-label loom:issue"),
             "fail-open: an unverifiable state still restores the queue label: {calls}"
+        );
+    }
+
+    /// Issue #11438: when the reaped dispatch itself self-reported a no-op
+    /// release (#8912's dispatch-scoped record), the release removes only the
+    /// stale `loom:building` claim. Re-adding `loom:issue` ~25 s later re-armed
+    /// the claim/release loop (loom-ui#3508: claim released 09:07:29Z,
+    /// `loom:issue` restored 09:07:55Z, re-claimed 09:10:00Z).
+    #[test]
+    #[serial_test::serial]
+    fn a_self_reported_noop_releases_only_the_stale_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let (fake_gh, gh_log) = fake_gh(dir.path(), "open");
+        let mut registry = registry_with(&fake_gh, dir.path());
+
+        let sweep_id = crate::sweep_registry::test_support::insert_clean_exit_running(
+            &mut registry,
+            114_380,
+            0,
+        );
+        registry.record_noop_release(114_380, Some("no build work".into()));
+        assert!(registry.noop_release_covers_dispatch(114_380, &sweep_id));
+
+        registry
+            .restore_label_after_reap(114_380, &sweep_id)
+            .unwrap();
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap();
+        assert!(
+            calls.contains("issue edit 114380 --remove-label loom:building"),
+            "the stale claim is still removed: {calls}"
+        );
+        assert!(
+            !calls.contains("--add-label loom:issue"),
+            "a self-reported no-op deliberately left `loom:issue` off — re-adding it \
+             re-arms the loop (#11438): {calls}"
+        );
+    }
+
+    /// The guard on the fix: without a self-report the crash-recovery restore
+    /// is byte-identical to `restore_label_to_ready`.
+    #[test]
+    #[serial_test::serial]
+    fn a_plain_reap_restore_is_unchanged_without_a_noop_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let (fake_gh, gh_log) = fake_gh(dir.path(), "open");
+        let mut registry = registry_with(&fake_gh, dir.path());
+
+        let sweep_id = crate::sweep_registry::test_support::insert_clean_exit_running(
+            &mut registry,
+            114_381,
+            0,
+        );
+        assert!(!registry.noop_release_covers_dispatch(114_381, &sweep_id));
+
+        registry
+            .restore_label_after_reap(114_381, &sweep_id)
+            .unwrap();
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap();
+        assert!(
+            calls.contains("issue edit 114381 --remove-label loom:building --add-label loom:issue"),
+            "an ordinary crash-recovery restore still re-queues the issue: {calls}"
         );
     }
 }

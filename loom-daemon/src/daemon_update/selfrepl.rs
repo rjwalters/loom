@@ -17,10 +17,16 @@
 //! unnamed, until the last mapping goes away, and every future `exec` of the
 //! path gets the new file.
 //!
-//! `install(1)` does exactly that (GNU unlinks the destination before opening;
-//! BSD writes a temp file and `rename`s it), which is why
-//! [`super::provision::install_to`] tries it FIRST and why neither it nor
-//! anything else here ever reaches for `File::create` on the destination. On
+//! [`super::provision::install_to`] goes one step further than unlinking:
+//! it writes the new file in full beside the destination and `rename`s it
+//! over the path (#10708), so the path is never absent or partial either.
+//! The machine-level path (`provision_machine_daemon`, the shell) does the
+//! same since #10983: it no longer runs `install`/`cp` onto the destination
+//! but calls [`super::provision::stage`] and [`super::provision::publish`]
+//! through `loom-daemon install-binary`. Both paths also keep the binary
+//! they replace as `<dest>.previous` (see [`super::provision::txn`]); the
+//! process running this update keeps executing its old inode either way.
+//! Nothing here ever reaches for `File::create` on the destination. On
 //! Linux, `open(O_WRONLY)` on a running executable fails with `ETXTBSY`
 //! anyway; on macOS it does not, so "the kernel would have stopped us" is not
 //! a defence. [`replacement_allocates_a_new_inode`] pins the property.
@@ -116,7 +122,7 @@ pub fn announce_if_self(dest: &Path) {
         return;
     }
     out::warn(&format!(
-        "Self-replacement: {} is the binary running this update. It is replaced by unlink-and-create (never an in-place truncate), so this process keeps running from its old, now-unnamed inode; every identity check below re-execs the PATH, not this process (#8017/#8088).",
+        "Self-replacement: {} is the binary running this update. It is replaced by a new file at that path (rename or unlink-and-create, never an in-place truncate), so this process keeps running from its old, now-unnamed inode; every identity check below re-execs the PATH, not this process (#8017/#8088).",
         dest.display()
     ));
 }
@@ -159,11 +165,12 @@ mod tests {
     ///
     /// The destination is held OPEN across the replacement, the same way
     /// [`the_version_read_follows_the_path_not_the_replaced_inode`] does.
-    /// Without that, `install(1)`'s unlink-then-create can hand the brand new
-    /// file back the exact inode NUMBER it just freed — nothing else was
+    /// Without that, an unlink-then-create replacement (the pre-#10708
+    /// `install(1)` path) can hand the brand new file back the exact inode
+    /// NUMBER it just freed — nothing else was
     /// competing for inodes in an otherwise-idle temp dir — which made this
     /// assertion fail on ext4 CI runners even though the destination was
-    /// correctly replaced by unlink-and-create, not by truncate. Holding an
+    /// correctly replaced by a new file, not by truncate. Holding an
     /// open handle keeps the old inode allocated (as a real running process
     /// would), which is both what the assertion is actually about and what
     /// stops the number from being recycled out from under the comparison.

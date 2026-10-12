@@ -1,6 +1,7 @@
 //! Per-issue claim-lock lifecycle (`.loom/locks/issue-<N>/owner.json`) and
 //! startup reconstruction of registry state from disk.
 
+use super::journal_shadow::LockNs;
 use super::*;
 
 /// Typed, matchable error returned by [`SweepRegistry::dispatch`] when the
@@ -154,7 +155,7 @@ impl LockReleaseOutcome {
 /// `live_sweep_lock_owner_pid()` all treat an unparseable owner as "no owner",
 /// which drops a *live* sweep's lock. The absent-pgid case degrades to
 /// single-PID signalling with a log line instead.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct LockOwner {
     pub(crate) issue: u32,
     pub(crate) owner_pid: u32,
@@ -203,6 +204,21 @@ pub(crate) struct LockOwner {
     /// is the honest value for both.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) overflow: bool,
+    /// Pause-and-roll identity (Issue #10830), stamped at spawn by
+    /// [`resume_handle::DispatchSession::stamp`](super::resume_handle::DispatchSession::stamp):
+    /// the item id that arms the pause hook, the systemd scope unit (the H4
+    /// teardown unit, Linux only), the session's FIRST start (the 5-minute
+    /// rule's clock, carried across roll resumes), and the resume handle.
+    /// Same `Option` + `#[serde(default)]` contract as `pgid`/`model`: an
+    /// `owner.json` from an older binary has none of them and still parses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) scope_unit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) agent_started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) resume_handle: Option<super::resume_handle::ResumeHandle>,
 }
 
 impl LockOwner {
@@ -227,6 +243,10 @@ impl LockOwner {
             model: None,
             effort: None,
             overflow: false,
+            item_id: None,
+            scope_unit: None,
+            agent_started_at: None,
+            resume_handle: None,
         }
     }
 }
@@ -348,6 +368,7 @@ impl SweepRegistry {
                     serde_json::to_string_pretty(&owner).context("serialize lock owner")?;
                 std::fs::write(lock.join("owner.json"), owner_json)
                     .context("write lock owner.json")?;
+                self.shadow_owner_acquired(LockNs::Issue, issue, &owner, true);
                 Ok(())
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -403,6 +424,7 @@ impl SweepRegistry {
             .with_context(|| format!("read lock owner {}", owner_path.display()))?;
         let mut owner: LockOwner =
             serde_json::from_str(&existing).context("parse lock owner.json")?;
+        let before = serde_json::from_str(&existing).unwrap_or_default();
         owner.owner_pid = child_pid;
         if pgid.is_some() {
             owner.pgid = pgid;
@@ -416,6 +438,7 @@ impl SweepRegistry {
         let owner_json = serde_json::to_string_pretty(&owner).context("serialize lock owner")?;
         std::fs::write(&owner_path, owner_json)
             .with_context(|| format!("write lock owner {}", owner_path.display()))?;
+        self.shadow_owner_updated(LockNs::Issue, issue, &before, &owner);
         Ok(())
     }
 
@@ -440,10 +463,12 @@ impl SweepRegistry {
         if owner.overflow {
             return Ok(());
         }
+        let before = serde_json::from_str(&existing).unwrap_or_default();
         owner.overflow = true;
         let owner_json = serde_json::to_string_pretty(&owner).context("serialize lock owner")?;
         std::fs::write(&owner_path, owner_json)
             .with_context(|| format!("write lock owner {}", owner_path.display()))?;
+        self.shadow_owner_updated(LockNs::Issue, issue, &before, &owner);
         Ok(())
     }
 
@@ -490,6 +515,7 @@ impl SweepRegistry {
                     serde_json::to_string_pretty(&owner).context("serialize PR lock owner")?;
                 std::fs::write(lock.join("owner.json"), owner_json)
                     .context("write PR lock owner.json")?;
+                self.shadow_owner_acquired(LockNs::Pr, pr, &owner, true);
                 Ok(())
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(anyhow!(
@@ -516,6 +542,7 @@ impl SweepRegistry {
             .with_context(|| format!("read PR lock owner {}", owner_path.display()))?;
         let mut owner: LockOwner =
             serde_json::from_str(&existing).context("parse PR lock owner.json")?;
+        let before = serde_json::from_str(&existing).unwrap_or_default();
         owner.owner_pid = child_pid;
         if pgid.is_some() {
             owner.pgid = pgid;
@@ -523,6 +550,7 @@ impl SweepRegistry {
         let owner_json = serde_json::to_string_pretty(&owner).context("serialize PR lock owner")?;
         std::fs::write(&owner_path, owner_json)
             .with_context(|| format!("write PR lock owner {}", owner_path.display()))?;
+        self.shadow_owner_updated(LockNs::Pr, pr, &before, &owner);
         Ok(())
     }
 
@@ -567,8 +595,11 @@ impl SweepRegistry {
         if owned_by_other {
             return LockReleaseOutcome::Superseded;
         }
-        if let Err(e) = std::fs::remove_dir_all(&lock) {
-            log::warn!("release_pr_lock: failed to remove lock dir {}: {e}", lock.display());
+        match std::fs::remove_dir_all(&lock) {
+            Ok(()) => self.shadow_owner_released(LockNs::Pr, pr, Some(sweep_id)),
+            Err(e) => {
+                log::warn!("release_pr_lock: failed to remove lock dir {}: {e}", lock.display());
+            }
         }
         LockReleaseOutcome::Released
     }
@@ -585,6 +616,7 @@ impl SweepRegistry {
         if lock.exists() {
             std::fs::remove_dir_all(&lock)
                 .with_context(|| format!("failed to remove lock dir {}", lock.display()))?;
+            self.shadow_owner_released(LockNs::Issue, issue, None);
         }
         Ok(())
     }
@@ -632,8 +664,9 @@ impl SweepRegistry {
             );
             return LockReleaseOutcome::HolderAlive;
         }
-        if let Err(e) = std::fs::remove_dir_all(&lock) {
-            log::warn!("release_lock: failed to remove lock dir {}: {e}", lock.display());
+        match std::fs::remove_dir_all(&lock) {
+            Ok(()) => self.shadow_owner_released(LockNs::Issue, issue, Some(sweep_id)),
+            Err(e) => log::warn!("release_lock: failed to remove lock dir {}: {e}", lock.display()),
         }
         LockReleaseOutcome::Released
     }
@@ -772,7 +805,10 @@ impl SweepRegistry {
                 std::fs::write(lock.join("owner.json"), json).context("write lock owner.json")
             });
         match takeover {
-            Ok(()) => Some(watchdog_sweep_id),
+            Ok(()) => {
+                self.shadow_owner_acquired(LockNs::Issue, issue, &owner, false);
+                Some(watchdog_sweep_id)
+            }
             Err(e) => {
                 log::warn!(
                     "midbuild-watchdog: could not take over issue #{issue}'s stale claim lock at \
@@ -861,8 +897,18 @@ impl SweepRegistry {
     /// are skipped, so the daemon no longer ingests phantom entries for sweeps
     /// it does not own. Genuine daemon-crash recovery is preserved because the
     /// lock survives a daemon crash (it is only removed on clean release).
-    #[allow(clippy::too_many_lines)]
     pub fn reconstruct(&mut self) -> Result<usize> {
+        self.reconstruct_issues(None)
+    }
+
+    /// [`Self::reconstruct`], restricted to `only` when it is given (#10832).
+    /// H5 uses it to hand a paused sweep it could not finish back to ordinary
+    /// crash recovery: the item was skipped at startup because a pause
+    /// manifest held it, and this runs the same recovery for just that issue
+    /// once the hold is gone, without re-adopting every other live sweep.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn reconstruct_issues(&mut self, only: Option<&HashSet<u32>>) -> Result<usize> {
+        let skipped = |issue: u32| only.is_some_and(|set| !set.contains(&issue));
         let locks_dir = self.config.locks_dir();
         let mut admitted = 0usize;
         // Issues that had a daemon-owned lock whose owner PID is now dead.
@@ -894,16 +940,37 @@ impl SweepRegistry {
                 let Ok(issue): Result<u32, _> = issue_str.parse() else {
                     continue;
                 };
+                if skipped(issue) {
+                    continue;
+                }
                 let owner_path = path.join("owner.json");
                 let owner: Option<LockOwner> = std::fs::read_to_string(&owner_path)
                     .ok()
                     .and_then(|s| serde_json::from_str(&s).ok());
                 let Some(owner) = owner else {
                     // No owner.json — treat as stale, remove.
-                    let _ = std::fs::remove_dir_all(&path);
+                    if std::fs::remove_dir_all(&path).is_ok() {
+                        self.shadow_owner_released(LockNs::Issue, issue, None);
+                    }
                     continue;
                 };
-                if !pid_identity::owner_pid_alive_since(owner.owner_pid, &owner.acquired_at) {
+                let alive =
+                    pid_identity::owner_pid_alive_since(owner.owner_pid, &owner.acquired_at);
+                // #10832: a roll's H4 pause stopped this agent on purpose and
+                // left its lock for H5, which resumes the saved session or
+                // requeues it. Crash recovery must not get there first: keep
+                // the lock, reap nothing, and synthesize no `Crashed` entry.
+                if !alive
+                    && crate::roll_pause::suppress::held_issue(&self.config.workspace_root, issue)
+                        .is_some()
+                {
+                    log::info!(
+                        "reconstruct: issue #{issue} was paused for a daemon roll; leaving its \
+                         lock for the resume (#10832)"
+                    );
+                    continue;
+                }
+                if !alive {
                     // Stale lock: the daemon-dispatched child's PID (recorded
                     // by `record_child_pid_in_lock`, #3808) is dead. This lock
                     // is the daemon's own crash-surviving evidence that it
@@ -936,7 +1003,9 @@ impl SweepRegistry {
                         self.reap_orphaned_group(&owner.sweep_id, Some(issue), pgid);
                     }
                     daemon_owned_dead.insert(issue);
-                    let _ = std::fs::remove_dir_all(&path);
+                    if std::fs::remove_dir_all(&path).is_ok() {
+                        self.shadow_owner_released(LockNs::Issue, issue, Some(&owner.sweep_id));
+                    }
                     continue;
                 }
                 let log_path = self.compute_log_path(issue);
@@ -1045,6 +1114,9 @@ impl SweepRegistry {
                 let Ok(issue): Result<u32, _> = issue_str.parse() else {
                     continue;
                 };
+                if skipped(issue) {
+                    continue;
+                }
                 // Skip if we already have a Running entry for this issue.
                 let already_running = self.entries.values().any(|info| {
                     matches!(info.state, SweepState::Running | SweepState::Pending)

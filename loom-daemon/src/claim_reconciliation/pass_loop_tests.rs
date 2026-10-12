@@ -194,9 +194,12 @@ fn a_root_outside_the_write_scope_is_skipped_without_a_forge_call() {
     );
 }
 
-/// #4429 follow-up: in the steady state (nothing to write) the review-conflict
-/// and merge-sequence passes share ONE open-PR listing per root — the two
-/// per-label conflict listings and the sequence pass's own listing are gone.
+/// #4429 follow-up + #10349: in the steady state (nothing to write) the
+/// review-conflict and merge-sequence passes share ONE open-PR listing per
+/// root, and every PR-side listing is the REST one — no GraphQL `gh pr list`
+/// at all. The claim and verdict passes list once per label they reconcile
+/// (2 + 2), the conflict pass once, the sequence pass not at all: 5
+/// conditional GETs, each a free `304` on an unchanged workspace.
 #[test]
 #[serial_test::serial]
 fn conflict_and_sequence_passes_share_one_open_pr_listing() {
@@ -204,49 +207,17 @@ fn conflict_and_sequence_passes_share_one_open_pr_listing() {
     let root = dir.path().join("repo-a");
     std::fs::create_dir_all(&root).unwrap();
     let gh_log = dir.path().join("gh-invocations.log");
-    // Like `write_fake_gh_logging_cwd`, but `gh pr list` answers a real
-    // (empty) JSON array, as the forge does for a workspace with no open PRs.
-    let logging_gh = dir.path().join("fake-gh-open-prs.sh");
-    std::fs::write(
-        &logging_gh,
-        format!(
-            r#"#!/usr/bin/env bash
-printf '%s %s\n' "$(pwd)" "$*" >> "{log}"
-if [ "$1" = "api" ]; then
-  printf 'HTTP/2.0 200 OK\r\n\r\n'
-  echo '[]'
-  exit 0
-fi
-if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
-  echo '[]'
-fi
-exit 0
-"#,
-            log = gh_log.display(),
-        ),
-    )
-    .unwrap();
-    #[cfg(unix)]
-    {
-        let mut perms = std::fs::metadata(&logging_gh).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&logging_gh, perms).unwrap();
-    }
+    let logging_gh = write_fake_gh_logging_cwd(dir.path(), &gh_log);
     let ws = WritableRoot::register_with_gh(&root, &logging_gh);
 
     let stats =
         run_reconciliation_pass_over_roots(std::slice::from_ref(&root), &ws.gh, false, || false);
     assert_eq!(stats.roots_processed, 1);
     let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
-    let unfiltered: Vec<&str> = gh_calls
+    let listings = gh_calls
         .lines()
-        .filter(|l| l.contains("pr list --state open --limit") && !l.contains("--label"))
-        .collect();
-    assert_eq!(unfiltered.len(), 1, "one shared open-PR listing per root: {gh_calls}");
-    for label in ["loom:review-requested", "loom:merge-conflict"] {
-        assert!(
-            !gh_calls.contains(&format!("pr list --state open --label {label}")),
-            "no per-label conflict listing for {label}: {gh_calls}"
-        );
-    }
+        .filter(|l| l.contains("api --include") && l.contains("pulls?state=open"))
+        .count();
+    assert_eq!(listings, 5, "2 claim + 2 verdict + 1 shared conflict/sequence: {gh_calls}");
+    assert!(!gh_calls.contains("pr list"), "no GraphQL pr list: {gh_calls}");
 }

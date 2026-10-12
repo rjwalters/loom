@@ -46,24 +46,29 @@ fn the_gateway_admits_loom_kind_on_logs_and_spans() {
 
 #[test]
 fn the_mapping_stamps_loom_kind_on_every_log_record() {
-    // One stamp, applied before the per-kind match: every arm's attribute
-    // vector opens with the kind attribute, so a new kind cannot forget it.
-    // Seven log-mapping arms carry it; the eighth `vec![` is the metric
-    // gauge path (tokens.snapshot's per-account datapoint attributes — not
-    // a log record, `loom.kind` is not its discriminator).
-    let stamps = MAPPING.matches("kind_attribute.clone()").count();
-    assert_eq!(
-        stamps, 7,
-        "the OTLP log mapping must stamp loom.kind on every log-record \
-         attribute vector (expected 7: sweep.started/identity/completed/\
-         outcome, role_tick.outcome, session.summary, session.analysis) — \
-         a kind whose attributes miss the stamp is unqueryable by kind at \
-         the backend (#9881)"
+    // One stamp, applied AFTER the per-kind match, so no arm can forget it.
+    // The per-arm form (#9881) did exactly that: the `eta.*`, `ci.*`,
+    // `sweep.phase`, `daemon.event`, `pr.resolved`, `session.output`,
+    // `auto_update.tick` and `token_ranking.refresh` arms never pushed it, so
+    // `loom.kind LIKE 'eta%'` read as "no ETAs ever" (#10899). The behavioural
+    // contract — every `otlp: Logs` registry kind maps to exactly one
+    // `loom.kind` equal to its tag — is `mapping/tests/loom_kind.rs`; this
+    // pins the shape that makes it hold for kinds added later.
+    assert!(
+        MAPPING.contains(
+            r#"attributes.insert(0, kv_string("loom.kind", envelope.record.kind().to_string()));"#
+        ),
+        "loom.kind must be stamped once, centrally, from the record's own kind \
+         tag, never a per-arm literal that can drift from telemetry/kinds.rs \
+         (#9881, #10899)"
     );
     assert!(
-        MAPPING.contains(r#"kv_string("loom.kind", envelope.record.kind().to_string())"#),
-        "loom.kind must be stamped from the record's own kind tag, never a \
-         per-arm literal that can drift from telemetry/kinds.rs (#9881)"
+        MAPPING.contains(r#"attributes.retain(|kv| kv.key != "loom.kind");"#),
+        "an arm-pushed loom.kind must be replaced, not duplicated (#10899)"
+    );
+    assert!(
+        !MAPPING.contains("kind_attribute"),
+        "the per-arm stamp is gone; a new arm must not reintroduce it (#10899)"
     );
 }
 

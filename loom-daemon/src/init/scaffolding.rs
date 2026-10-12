@@ -13,9 +13,7 @@ use super::file_ops::{
     force_merge_dir_with_report_filtered, merge_dir_with_report,
 };
 use super::git::extract_repo_info;
-use super::templates::{
-    assert_no_placeholders, localize_dotloom_doc_links, substitute_template_variables, LoomMetadata,
-};
+use super::templates::{assert_no_placeholders, render_dotloom_guide, LoomMetadata};
 use super::InitReport;
 
 /// Name of the skip-list file under `defaults/` that lists Loom-internal
@@ -1004,14 +1002,22 @@ pub fn setup_repository_scaffolding(
             .map_err(|e| format!("Failed to read CLAUDE.md template: {e}"))?;
 
         // Substitute template variables in Loom content
-        let loom_substituted = substitute_template_variables(
+        // --- Step 1: Write full guide to .loom/CLAUDE.md ---
+        // The template is authored with repo-root-relative link targets, but
+        // this copy is written one directory level deeper, at
+        // `.loom/CLAUDE.md` itself, so every such target needs re-basing
+        // (issue #5975) — see `localize_dotloom_doc_links` for the two
+        // shapes it rewrites. Only this destination needs the rewrite; the
+        // short pointer written to root CLAUDE.md below carries no such
+        // links. `render_dotloom_guide` does both, and is the rendering the
+        // daemon resync repeats (#10895).
+        let loom_claude_md_localized = render_dotloom_guide(
             &loom_content,
             repo_owner.as_deref(),
             repo_name.as_deref(),
             &loom_metadata,
         );
 
-        // --- Step 1: Write full guide to .loom/CLAUDE.md ---
         let loom_dir = workspace_path.join(".loom");
         // .loom/ should already exist (created earlier in initialize_workspace),
         // but create it if it doesn't to be safe.
@@ -1019,14 +1025,6 @@ pub fn setup_repository_scaffolding(
             fs::create_dir_all(&loom_dir)
                 .map_err(|e| format!("Failed to create .loom directory: {e}"))?;
         }
-        // The template is authored with repo-root-relative link targets, but
-        // this copy is written one directory level deeper, at
-        // `.loom/CLAUDE.md` itself, so every such target needs re-basing
-        // (issue #5975) — see `localize_dotloom_doc_links` for the two
-        // shapes it rewrites. Only this destination needs the rewrite; the
-        // short pointer written to root CLAUDE.md below carries no such
-        // links.
-        let loom_claude_md_localized = localize_dotloom_doc_links(&loom_substituted);
         let loom_claude_md_dst = loom_dir.join("CLAUDE.md");
         let loom_claude_md_existed = loom_claude_md_dst.exists();
         fs::write(&loom_claude_md_dst, &loom_claude_md_localized)
@@ -1196,7 +1194,12 @@ pub fn setup_repository_scaffolding(
         let agents_content = fs::read_to_string(&agents_md_src)
             .map_err(|e| format!("Failed to read AGENTS.md template: {e}"))?;
 
-        let agents_substituted = substitute_template_variables(
+        // Same rendering as .loom/CLAUDE.md above (issue #5975): the link
+        // re-basing is a no-op today since defaults/.loom/AGENTS.md has no
+        // `.loom/docs/...` link targets, but it keeps the two templates'
+        // write paths structurally consistent rather than relying on that
+        // staying true by convention.
+        let loom_agents_md_localized = render_dotloom_guide(
             &agents_content,
             repo_owner.as_deref(),
             repo_name.as_deref(),
@@ -1209,11 +1212,6 @@ pub fn setup_repository_scaffolding(
             fs::create_dir_all(&loom_dir)
                 .map_err(|e| format!("Failed to create .loom directory: {e}"))?;
         }
-        // Same rewrite as .loom/CLAUDE.md above (issue #5975) — a no-op today
-        // since defaults/.loom/AGENTS.md has no `.loom/docs/...` link
-        // targets, but keeps the two templates' write paths structurally
-        // consistent rather than relying on that staying true by convention.
-        let loom_agents_md_localized = localize_dotloom_doc_links(&agents_substituted);
         let loom_agents_md_dst = loom_dir.join("AGENTS.md");
         let loom_agents_md_existed = loom_agents_md_dst.exists();
         fs::write(&loom_agents_md_dst, &loom_agents_md_localized)
@@ -1503,10 +1501,23 @@ pub fn setup_repository_scaffolding(
 /// a false bug report (#3665). `.claude/agents` and `.claude/commands/loom`
 /// both resolved this with a symlink into `defaults/`; this is the fourth
 /// surface in that family and gets the same treatment.
-fn install_agent_skills(
+pub(super) fn install_agent_skills(
     defaults_path: &Path,
     workspace_path: &Path,
     report: &mut InitReport,
+) -> Result<(), String> {
+    install_agent_skills_where(defaults_path, workspace_path, report, &mut |_, _| true)
+}
+
+/// [`install_agent_skills`], for only the skills `usable` accepts. It is
+/// given each destination and its repo-relative name before anything is read
+/// or written there; a skill it rejects is not touched at all. The daemon
+/// resync uses it to step over a destination it cannot write (#10895).
+pub(super) fn install_agent_skills_where(
+    defaults_path: &Path,
+    workspace_path: &Path,
+    report: &mut InitReport,
+    usable: &mut dyn FnMut(&Path, &str) -> bool,
 ) -> Result<(), String> {
     // Dogfood detection: `defaults/` sits directly under the target, i.e. this
     // install is writing into the Loom source repo itself. Deliberately a
@@ -1532,8 +1543,15 @@ fn install_agent_skills(
         };
         let dst = workspace_path.join(".agents").join("skills").join(rel);
         let report_name = format!(".agents/skills/{}", rel.display());
+        if !usable(&dst, &report_name) {
+            continue;
+        }
 
-        let existing = fs::read_to_string(&dst).ok();
+        // Read as bytes: a destination that exists but is not UTF-8 is a file
+        // without the marker (the consumer's), not an absent one (#10895).
+        let existing = fs::read(&dst)
+            .ok()
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
         match existing {
             None => {
                 if let Some(parent) = dst.parent() {

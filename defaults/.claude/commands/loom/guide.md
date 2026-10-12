@@ -557,21 +557,17 @@ For each `loom:blocked` issue, check if all dependencies have resolved:
 
 ```bash
 # Get all blocked issues
-"$GH_READ" issue list --label "loom:blocked" --state open --json number,title,body
+# --limit: gh defaults to 30 (#10553)
+"$GH_READ" issue list --label "loom:blocked" --state open --limit 1000 --json number,title,body
 
 # For each issue:
-# 1. Parse dependency references from body
-# 2. Check if all referenced issues are closed
-# 3. If all resolved, unblock the issue
+# Parse body dependencies; unblock when all are closed
 ```
 
-**A dependency stated only in a comment cannot be read here (#8925's other
-defect)** — this routine reads the BODY only. A role applying `loom:blocked`
-must record the blocker in the body as a **park record**
-(`loom-daemon park-record render`; grammar: `.loom/docs/park-record.md`),
-not as prose in a comment — its rendered `Blocked by: #N`
-line already matches `parse_dependencies` below, so no parser change is
-needed once a role writes one.
+**A dependency stated only in a comment cannot be read here (#8925)** — this
+routine reads the BODY only. Record the blocker as a **park record**
+(`loom-daemon park-record render`; `.loom/docs/park-record.md`); its
+`Blocked by: #N` / `OWNER/REPO#N` line already matches `parse_dependencies`.
 
 ### Dependency Parsing
 
@@ -590,21 +586,20 @@ matched line is captured, not just the first (#4508):
 ```bash
 parse_dependencies() {
   local body="$1"
-  # Two-stage parse (#4508): stage 1 selects whole lines declaring a dependency
-  # (forms above; checkbox is UNCHECKED-only, #7973); stage 2 extracts every #N.
+  # Two-stage parse (#4508): select dependency lines (checkbox UNCHECKED-only,
+  # #7973), then extract every N / OWNER/REPO#N.
   echo "$body" \
-    | grep -E '(Blocked by|Depends on|Requires|\- \[ \])[*_:[:space:]]*#[0-9]+' \
-    | grep -oE '#[0-9]+' | tr -d '#' | sort -u
+    | grep -E '(Blocked by|Depends on|Requires|\- \[ \])[*_:[:space:]]*([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#[0-9]+' \
+    | grep -oE '([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#[0-9]+' | sed 's/^#//' | sort -u
 }
 ```
 
 ### Approval Archaeology (restore vs. don't grant)
 
-Before unblocking, determine whether the issue was **already approved** before it
-was blocked. Only issues that previously carried `loom:issue` may have it restored
-(see the Label Gate Policy exception above). Read the issue's label event history —
-if `loom:issue` was ever applied, restoring it is legitimate; otherwise the issue
-was blocked pre-approval and must **not** be promoted into the Builder queue.
+Only issues that previously carried `loom:issue` may have it restored (see the
+Label Gate Policy exception above). Read the label event history; if never
+applied, the issue was blocked pre-approval and must **not** be promoted into
+the Builder queue.
 
 ```bash
 was_previously_approved() {
@@ -622,11 +617,8 @@ through the lifecycle after it was written — e.g. `loom:blocked` gets
 re-applied later for a completely different, *current* reason (an
 implementation PR hitting the Doctor-cycle cap, a fresh block comment) while
 the original body dependency has long since closed. Trusting only the body
-dependency caused a live flip-flop loop on #4492: three separate Curator
-passes each stripped `loom:blocked` citing "dependency #4491 resolved" —
-true, but not the reason the label was applied — while implementation PR
-#4519 sat open with `loom:changes-requested`, forcing Champion to keep
-manually re-blocking with the real, current reason each time.
+dependency caused a live flip-flop loop on #4492 (Curator repeatedly stripped
+`loom:blocked` while PR #4519 sat open with `loom:changes-requested`).
 
 **#7267 extension**: the original check above only looked at the linked PR's
 *labels*. It missed a linked PR's *merge state* — `mergeable ==
@@ -644,11 +636,9 @@ against its own implementing PR #7246 (`loom:pr`+`loom:operator`,
 The function below folds in both signals so the two checks cannot diverge on
 the case that actually occurred; `loom:operator` is intentionally checked
 **unconditionally** here (not only when the merge state is also bad) even
-though `curator.md`'s own check treats a bare `loom:operator` label as
-insufficient *for its own, lower-stakes action* (marking `loom:curated`,
-resolved by #6939/#6317) — Guide's action (restoring `loom:issue`, which
-re-queues the issue for a brand-new Builder) is higher-stakes, so this check
-is deliberately a superset of Curator's.
+though `curator.md` treats a bare `loom:operator` as insufficient for its
+lower-stakes action (#6939/#6317) — restoring `loom:issue` re-queues a
+brand-new Builder, so this check is deliberately a superset of Curator's.
 
 **Before unblocking on a resolved body dependency, always run this check
 first.** It is the primary, mechanical gate — not a heuristic — and it
@@ -713,7 +703,14 @@ a later pass to sort out.
 
 ```bash
 check_and_unblock() {
-  "$GH_READ" issue list --label "loom:blocked" --state open --json number,body,title | jq -c '.[]' | while read -r issue; do
+  # --limit: gh defaults to 30 (#10553)
+  local blocked_limit=1000 blocked_json blocked_count
+  blocked_json=$("$GH_READ" issue list --label "loom:blocked" --state open --limit "$blocked_limit" --json number,body,title)
+  blocked_count=$(printf '%s\n' "$blocked_json" | jq 'length')
+  if [ "$blocked_count" -ge "$blocked_limit" ]; then
+    echo "WARNING: loom:blocked listing hit --limit $blocked_limit; truncated" >&2
+  fi
+  printf '%s\n' "$blocked_json" | jq -c '.[]' | while read -r issue; do
     local number=$(printf '%s\n' "$issue" | jq -r '.number')
     local body=$(printf '%s\n' "$issue" | jq -r '.body')
     local title=$(printf '%s\n' "$issue" | jq -r '.title')
@@ -721,7 +718,7 @@ check_and_unblock() {
     local deps=$(parse_dependencies "$body")
 
     if [ -z "$deps" ]; then
-      # No parseable dependencies - skip (may need manual review)
+      # No parseable dependencies - skip
       continue
     fi
 
@@ -729,12 +726,13 @@ check_and_unblock() {
     local resolved_deps=""
 
     for dep in $deps; do
-      local state=$(gh issue view "$dep" --json state --jq '.state' 2>/dev/null || echo "UNKNOWN")
-      if [ "$state" != "CLOSED" ]; then
+      local dn="${dep##*#}" dr=""; [[ "$dep" == */* ]] && dr="${dep%#*}"  # OWNER/REPO#N: own repo (#10443)
+      local state=$(gh issue view "$dn" ${dr:+--repo "$dr"} --json state --jq '.state' 2>/dev/null || echo "UNKNOWN")
+      if [ "$state" != "CLOSED" ] && [ "$state" != "MERGED" ]; then
         all_resolved=false
         break
       fi
-      resolved_deps="$resolved_deps #$dep"
+      resolved_deps="$resolved_deps $dr#$dn"
     done
 
     if [ "$all_resolved" = true ]; then
@@ -762,9 +760,8 @@ check_and_unblock() {
     fi
   done
 
-  # Pull requests (#8925): a parked PR is a SEPARATE enumeration, not a filter
-  # on the loop above — see "Problem: Stuck Blocked Issues" for why
-  # `gh issue list` can never surface one.
+  # Pull requests (#8925): a SEPARATE enumeration (`gh issue list` never
+  # surfaces a PR) — see "Problem: Stuck Blocked Issues".
   check_and_unblock_prs
 }
 ```

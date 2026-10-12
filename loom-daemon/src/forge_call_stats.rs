@@ -63,7 +63,6 @@
 //!    establish exhaustiveness on their own.
 
 use std::collections::BTreeMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -72,10 +71,21 @@ use serde::{Deserialize, Serialize};
 
 use crate::forge_listing::HttpResponse;
 
+#[path = "forge_call_stats_agent.rs"]
+pub mod agent;
+#[path = "forge_call_stats_buckets.rs"]
+pub mod buckets;
+#[path = "forge_call_stats_counters.rs"]
+pub mod counters;
+#[path = "forge_call_stats_ingest.rs"]
+pub mod ingest;
 #[path = "forge_call_stats_ops.rs"]
 pub mod ops;
+#[path = "forge_call_stats_sink.rs"]
+mod sink;
 use crate::types::{ForgeBudgetReading, ForgeCallCounts, ForgeCallsStatus, ForgeOperationCounts};
 pub use ops::ForgeOp;
+use sink::{append, read_since};
 
 /// The rolling window `status` reports (the last hour).
 pub const WINDOW_SECS: i64 = 3600;
@@ -90,10 +100,17 @@ pub enum Outcome {
     Ok,
     /// `304 Not Modified` — a free ETag hit.
     NotModified,
-    /// Rate-limited (classified like the breaker does).
+    /// Rate-limited (classified like the breaker does): the primary pool.
     RateLimited,
+    /// A secondary (burst / concurrency) limit, per
+    /// [`crate::forge_denial::Denial::SecondaryRateLimit`] (#11418). Kept
+    /// apart from [`Outcome::RateLimited`]: it says nothing about the pool.
+    SecondaryLimited,
     /// Any other failure.
     Error,
+    /// Not sent (W4-C): a Hygiene / Observability read deferred because
+    /// every reader for its bucket was withdrawn. Charges nothing.
+    Shed,
 }
 
 /// The rate-limit pool a call spends.
@@ -257,6 +274,16 @@ pub struct CallIdentity {
     pub origin: Option<String>,
     /// `owner/repo` slug.
     pub repo: Option<String>,
+    /// Which identity served the call (#9872): `reader`, `writer` or
+    /// `writer-fallback` — the rate-limit pool it spent. Set by the
+    /// `GhInvocation` facade; `None` for a caller recording outside it.
+    pub role: Option<String>,
+    /// The rate-limit bucket a *reader* call spent (#10232): the reader
+    /// App's id plus the owner whose installation it ran under — public,
+    /// non-secret labels. Two readers share the `reader` role but not a
+    /// budget, so budget readings are kept per bucket. `None` for the
+    /// writer and for a caller that does not know its reader.
+    pub bucket: Option<String>,
 }
 
 impl CallIdentity {
@@ -291,6 +318,18 @@ impl CallIdentity {
     #[must_use]
     pub fn with_repo(mut self, repo: &str) -> Self {
         self.repo = sanitize(repo);
+        self
+    }
+
+    #[must_use]
+    pub fn with_role(mut self, role: &str) -> Self {
+        self.role = sanitize(role);
+        self
+    }
+
+    #[must_use]
+    pub fn with_bucket(mut self, bucket: &str) -> Self {
+        self.bucket = sanitize(bucket);
         self
     }
 
@@ -332,6 +371,10 @@ pub struct RateLimitHeaders {
     /// vs external consumption.
     pub used: Option<u64>,
     pub reset_epoch: Option<i64>,
+    /// The pool's size this window (`x-ratelimit-limit`).
+    pub limit: Option<u64>,
+    /// `retry-after` seconds, sent with a secondary rate limit (W4-A).
+    pub retry_after_secs: Option<u64>,
 }
 
 impl RateLimitHeaders {
@@ -343,6 +386,8 @@ impl RateLimitHeaders {
             "x-ratelimit-remaining" => self.remaining = value.parse().ok(),
             "x-ratelimit-used" => self.used = value.parse().ok(),
             "x-ratelimit-reset" => self.reset_epoch = value.parse().ok(),
+            "x-ratelimit-limit" => self.limit = value.parse().ok(),
+            "retry-after" => self.retry_after_secs = value.parse().ok(),
             _ => {}
         }
     }
@@ -360,12 +405,26 @@ pub fn classify(response: Option<&HttpResponse>, exit_ok: bool, stderr: &str) ->
     let outcome = match status {
         Some(304) => Outcome::NotModified,
         Some(200..=299) if exit_ok => Outcome::Ok,
+        _ if is_secondary_limit(response, stderr) => Outcome::SecondaryLimited,
         _ if crate::rate_limit_breaker::indicates_rate_limit(stderr) => Outcome::RateLimited,
         Some(429) => Outcome::RateLimited,
         Some(403) if exhausted => Outcome::RateLimited,
         _ => Outcome::Error,
     };
     (pool, outcome)
+}
+
+/// Is this refusal a secondary limit? The same test as
+/// [`crate::forge_denial::classify`], so the ledger and a caller's denial
+/// handling cannot disagree.
+#[must_use]
+pub fn is_secondary_limit(response: Option<&HttpResponse>, stderr: &str) -> bool {
+    let text = match response {
+        Some(r) => format!("{}\n{stderr}", r.body),
+        None => stderr.to_string(),
+    };
+    crate::forge_denial::classify(response.map(|r| r.status), &text, response.map(|r| &r.ratelimit))
+        == Some(crate::forge_denial::Denial::SecondaryRateLimit)
 }
 
 /// Record one `gh api --include` call by `caller` (see [`classify`]) with the
@@ -404,6 +463,20 @@ pub fn record_with_identity(
     outcome: Outcome,
     headers: Option<&RateLimitHeaders>,
 ) {
+    record_attributed(caller, identity, pool, outcome, headers, &CallAttribution::default());
+}
+
+/// [`record_with_identity`] plus the W1 bucket attribution the `gh` facade
+/// knows ([`CallAttribution`]): which credential, which billed bucket, how
+/// many pages. Same guarantees: never blocks or fails the caller.
+pub fn record_attributed(
+    caller: &'static str,
+    identity: &CallIdentity,
+    pool: Pool,
+    outcome: Outcome,
+    headers: Option<&RateLimitHeaders>,
+    attribution: &CallAttribution,
+) {
     let line = SinkLine {
         t: Utc::now().timestamp(),
         c: caller.to_string(),
@@ -421,6 +494,10 @@ pub fn record_with_identity(
         pv: identity.provider.clone(),
         og: identity.origin.clone(),
         rp: identity.repo.clone(),
+        ir: identity.role.clone(),
+        ib: identity.bucket.clone(),
+        at: attribution.clone(),
+        ag: agent::stamp(caller),
     };
     if let Ok(mut state) = process_state().lock() {
         state.add(&line);
@@ -463,6 +540,65 @@ struct SinkLine {
     /// `owner/repo` slug.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     rp: Option<String>,
+    /// Identity role (#9872); absent on pre-#9872 lines and non-facade calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ir: Option<String>,
+    /// Reader rate-limit bucket (#10232); absent for the writer (whose
+    /// bucket is derived from its owner, #10334) and on older lines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ib: Option<String>,
+    /// The W1 bucket attribution, flattened into the same short-key line.
+    /// Every key is optional, so a pre-W1 line parses with all of them
+    /// absent and a pre-W1 reader ignores them.
+    #[serde(flatten, default)]
+    at: CallAttribution,
+    /// The agent `gh` front's `ag`/`vi` stamp (#10607); absent on daemon rows.
+    #[serde(flatten, default)]
+    ag: agent::AgentStamp,
+}
+
+/// Which credential and which billed bucket one row spent (W1). Recorded by
+/// the `gh` facade; every field is a short token — never a path, a token or
+/// a header body — and absent rather than guessed when unknown.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallAttribution {
+    /// Where the row's `rp` came from: `site`, `target`, `loom_repo`,
+    /// `remote` (the working directory's `origin`) or `none`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ro: Option<String>,
+    /// The credential's account label: `app-<id>`, `app-unknown`,
+    /// `env-token` or `ambient`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca: Option<String>,
+    /// The owner the credential is an installation for (lowercased).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub co: Option<String>,
+    /// The App installation the credential was minted under (#10571), from
+    /// its directory's `identity.json` sidecar.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ci: Option<String>,
+    /// Credential kind: `reader`, `writer`, `env` or `ambient`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tk: Option<String>,
+    /// The billed resource: `x-ratelimit-resource` when headers were seen,
+    /// else the pool the argv implies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rr: Option<String>,
+    /// Requests the row stands for when more than one is known
+    /// (`--paginate --include` status blocks, `run download`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pg: Option<u32>,
+    /// `--paginate` without `--include`: the page count is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pu: Option<bool>,
+    /// The `origin`-derived repo disagrees with the repo `gh` itself would
+    /// resolve from the same checkout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rd: Option<bool>,
+    /// A request GitHub does not charge (the `gh api rate_limit` probe): it
+    /// is still a row — a request was sent — but never a charged one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fr: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -470,7 +606,9 @@ struct Counts {
     ok: u64,
     not_modified: u64,
     rate_limited: u64,
+    secondary_limited: u64,
     error: u64,
+    shed: u64,
 }
 
 /// Add one outcome to a counter bucket.
@@ -479,7 +617,9 @@ fn bump(c: &mut Counts, outcome: Outcome) {
         Outcome::Ok => c.ok += 1,
         Outcome::NotModified => c.not_modified += 1,
         Outcome::RateLimited => c.rate_limited += 1,
+        Outcome::SecondaryLimited => c.secondary_limited += 1,
         Outcome::Error => c.error += 1,
+        Outcome::Shed => c.shed += 1,
     }
 }
 
@@ -506,13 +646,38 @@ struct Aggregate {
     started_at: i64,
     counts: BTreeMap<(String, Pool), Counts>,
     identities: BTreeMap<IdentityKey, Counts>,
+    /// Counts per identity role (#9872); a line without one is `unknown`.
+    roles: BTreeMap<String, Counts>,
     latest: BTreeMap<Pool, Reading>,
+    /// The newest reading per `(pool, identity bucket)` (#10232, #10334):
+    /// `latest` above collapses every identity, but each reader App
+    /// installation and each owner's writer own separate budgets (two
+    /// readers, or two owners' writers, share a role, so the role is not a
+    /// key). Only lines that name a bucket, or ran as an owner's writer, land
+    /// here.
+    latest_by_bucket: BTreeMap<(Pool, String), Reading>,
+}
+
+/// The owner whose writer a writer-role `line` spent (#10334): the owner its
+/// credential is installed for (`co`, booked by the `gh` facade), else the
+/// owner of the repo it served (`rp`) — the owner the serving writer is
+/// selected by. `None` when the line names neither.
+fn writer_owner(line: &SinkLine) -> Option<String> {
+    line.at.co.clone().or_else(|| {
+        line.rp
+            .as_deref()
+            .map(crate::credential_preflight::owner_of_nwo)
+            .filter(|o| !o.is_empty())
+            .map(str::to_string)
+    })
 }
 
 impl Aggregate {
     fn add(&mut self, line: &SinkLine) {
         let c = self.counts.entry((line.c.clone(), line.p)).or_default();
         bump(c, line.o);
+        let role = line.ir.as_deref().unwrap_or(UNKNOWN_OPERATION);
+        bump(self.roles.entry(role.to_string()).or_default(), line.o);
         if let Some(operation) = line.op.clone() {
             let key: IdentityKey = (operation, line.pv.clone(), line.og.clone(), line.rp.clone());
             let i = self.identities.entry(key).or_default();
@@ -534,6 +699,34 @@ impl Aggregate {
                     observed_at: line.t,
                 };
                 self.latest.insert(line.p, reading);
+            }
+            // A reader names its bucket; a writer (or writer-fallback) line
+            // lands under its own owner's writer label (#10334): the owner the
+            // credential is installed for, else the owner of the repo it
+            // served. So neither a healthy reader nor another owner's healthy
+            // writer can stand in for an exhausted writer; a writer line with
+            // no owner at all lands in no bucket.
+            let bucket = line.ib.clone().or_else(|| {
+                matches!(line.ir.as_deref(), Some("writer" | "writer-fallback"))
+                    .then(|| writer_owner(line))
+                    .flatten()
+                    .and_then(|owner| crate::forge_identity::writer_bucket(&owner))
+            });
+            if let Some(bucket) = bucket {
+                let key = (line.p, bucket);
+                if self
+                    .latest_by_bucket
+                    .get(&key)
+                    .is_none_or(|r| r.observed_at <= line.t)
+                {
+                    let reading = Reading {
+                        remaining,
+                        used: line.usd,
+                        reset_epoch: line.rst,
+                        observed_at: line.t,
+                    };
+                    self.latest_by_bucket.insert(key, reading);
+                }
             }
         }
     }
@@ -557,7 +750,25 @@ impl Aggregate {
                 ok: c.ok,
                 not_modified: c.not_modified,
                 rate_limited: c.rate_limited,
+                secondary_limited: c.secondary_limited,
                 error: c.error,
+                shed: c.shed,
+            })
+            .collect()
+    }
+
+    /// The #9872 per-identity-role rows.
+    fn role_rows(&self) -> Vec<crate::types::ForgeIdentityRoleCounts> {
+        self.roles
+            .iter()
+            .map(|(role, c)| crate::types::ForgeIdentityRoleCounts {
+                role: role.clone(),
+                ok: c.ok,
+                not_modified: c.not_modified,
+                rate_limited: c.rate_limited,
+                secondary_limited: c.secondary_limited,
+                error: c.error,
+                shed: c.shed,
             })
             .collect()
     }
@@ -574,7 +785,9 @@ impl Aggregate {
                 ok: c.ok,
                 not_modified: c.not_modified,
                 rate_limited: c.rate_limited,
+                secondary_limited: c.secondary_limited,
                 error: c.error,
+                shed: c.shed,
             })
             .collect()
     }
@@ -638,54 +851,11 @@ pub(crate) fn set_test_sink_dir(dir: Option<PathBuf>) {
     TEST_SINK_DIR.with(|d| *d.borrow_mut() = dir);
 }
 
-fn sink_file(dir: &Path, hour: i64) -> PathBuf {
-    dir.join(format!("calls-{hour}.jsonl"))
-}
-
-fn append(dir: &Path, line: &SinkLine) -> std::io::Result<()> {
-    // Same owner-only rules as the ETag store: a 0700 dir we own, 0600 files.
-    if !crate::forge_etag_store::private_dir(dir, true) {
-        return Err(std::io::Error::other("untrusted sink dir"));
-    }
-    let mut buf = serde_json::to_vec(line)?;
-    buf.push(b'\n');
-    let hour = line.t.div_euclid(3600);
-    let path = sink_file(dir, hour);
-    let mut create = std::fs::OpenOptions::new();
-    create.append(true).create_new(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut create, 0o600);
-    let (mut file, fresh) = match create.open(&path) {
-        Ok(f) => (f, true),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            (std::fs::OpenOptions::new().append(true).open(&path)?, false)
-        }
-        Err(e) => return Err(e),
-    };
-    // One write of one short line: atomic under O_APPEND.
-    file.write_all(&buf)?;
-    if fresh {
-        prune(dir, hour);
-    }
-    Ok(())
-}
-
-/// Remove sink files more than [`RETAIN_HOURS`] older than `current_hour`.
-fn prune(dir: &Path, current_hour: i64) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let hour = name
-            .to_str()
-            .and_then(|n| n.strip_prefix("calls-"))
-            .and_then(|n| n.strip_suffix(".jsonl"))
-            .and_then(|n| n.parse::<i64>().ok());
-        if hour.is_some_and(|h| h < current_hour - RETAIN_HOURS) {
-            let _ = std::fs::remove_file(entry.path());
-        }
-    }
+/// This host's sink directory (`None` when disabled), for readers outside
+/// this module: the `forge calls` CLI and the bucket book's snapshot.
+#[must_use]
+pub fn host_sink_dir() -> Option<PathBuf> {
+    sink_dir()
 }
 
 /// Aggregate the sink's last [`WINDOW_SECS`] as of `now` (missing hour files
@@ -693,17 +863,6 @@ fn prune(dir: &Path, current_hour: i64) {
 fn read_window(dir: &Path, now: i64) -> Aggregate {
     let since = now - WINDOW_SECS;
     aggregate_lines(read_since(dir, since, now).lines(), since)
-}
-
-/// The raw sink text of every hour file covering `since..=now`.
-fn read_since(dir: &Path, since: i64, now: i64) -> String {
-    let mut raw = String::new();
-    for hour in since.div_euclid(3600)..=now.div_euclid(3600) {
-        if let Ok(text) = std::fs::read_to_string(sink_file(dir, hour)) {
-            raw.push_str(&text);
-        }
-    }
-    raw
 }
 
 /// One operation ID as the sink observed it (Issue #9831).
@@ -843,12 +1002,112 @@ pub fn status_report(
     ForgeCallsStatus {
         window_secs: WINDOW_SECS.unsigned_abs(),
         operations: window.as_ref().map(Aggregate::identity_rows),
+        identity_roles: window.as_ref().map(Aggregate::role_rows),
+        buckets: sink_dir().map(|d| buckets::status_rows(&d, now_ts)),
+        reader_withdrawals: reader_withdrawal_rows(now),
+        read_spills: read_spill_rows(now),
         host_window: window.map(|w| w.rows()),
         since_start,
         since,
         budget: budget.into_values().collect(),
         own_window,
     }
+}
+
+/// This process's live scoped reader withdrawals (W4-A), for `status`.
+fn reader_withdrawal_rows(now: DateTime<Utc>) -> Vec<crate::types::ReaderWithdrawalStatus> {
+    crate::forge_read_pool::live_scoped_withdrawals(now.into())
+        .into_iter()
+        .map(|(app, owner, scope, until)| crate::types::ReaderWithdrawalStatus {
+            account: crate::observability::ops::ratelimit::app_account_label(&app),
+            owner,
+            resource: scope.as_str().to_string(),
+            until: until.into(),
+        })
+        .collect()
+}
+
+/// This process's engaged read-pool spill latches (W4-B), for `status`.
+fn read_spill_rows(now: DateTime<Utc>) -> Vec<crate::types::ReadSpillStatus> {
+    crate::forge_identity::route::live_latches(now.into())
+        .into_iter()
+        .map(|(owner_repo, resource, app, latch)| crate::types::ReadSpillStatus {
+            owner_repo,
+            resource: resource.as_str().to_string(),
+            from: crate::observability::ops::ratelimit::app_account_label(&app),
+            mode: latch.mode.as_str().to_string(),
+            until: latch.release_at.into(),
+        })
+        .collect()
+}
+
+/// The rate-limit pools this process last read at **zero remaining** and
+/// that have not reset yet at `now`, each with its reset instant when the
+/// header carried one (#10210, the ETA's `rate_limit_quota` stall).
+///
+/// Read-only and in-process: the newest free `x-ratelimit-*` reading per pool
+/// this daemon already absorbed — no file read, no forge call. A reading
+/// older than [`WINDOW_SECS`] with no reset is too stale to call a stall.
+#[must_use]
+pub fn exhausted_pools(now: DateTime<Utc>) -> Vec<(Pool, Option<DateTime<Utc>>)> {
+    match process_state().lock() {
+        Ok(state) => exhausted_in(&state.latest, now.timestamp()),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// [`exhausted_pools`] over an explicit reading map. Pure.
+fn exhausted_in(latest: &BTreeMap<Pool, Reading>, now: i64) -> Vec<(Pool, Option<DateTime<Utc>>)> {
+    latest
+        .iter()
+        .filter(|(_, r)| r.remaining == 0)
+        .filter(|(_, r)| match r.reset_epoch {
+            Some(reset) => reset > now,
+            None => now - r.observed_at <= WINDOW_SECS,
+        })
+        .map(|(pool, r)| (*pool, r.reset_epoch.and_then(epoch)))
+        .collect()
+}
+
+/// The newest header budget reading of each pool, per **reader rate-limit
+/// identity bucket** (#10232, #10334), keyed by the public bucket label
+/// ([`crate::forge_identity::reader_bucket`], or
+/// [`crate::forge_identity::writer_bucket`] — `writer@<owner>` — for an
+/// owner's writer and its fallback). Unlike [`status_report`]'s `budget` this
+/// never mixes identities: two readers of the same role, or two owners'
+/// writers, are separate buckets, and an unattributed call is not returned at
+/// all. Never a credential.
+#[must_use]
+pub fn bucket_readings(now: DateTime<Utc>) -> BTreeMap<String, Vec<ForgeBudgetReading>> {
+    let window = sink_dir().map(|d| read_window(&d, now.timestamp()));
+    let process = process_state()
+        .lock()
+        .map(|s| s.latest_by_bucket.clone())
+        .unwrap_or_default();
+    let mut latest = process;
+    for (key, r) in window.iter().flat_map(|w| w.latest_by_bucket.iter()) {
+        if latest
+            .get(key)
+            .is_none_or(|l| l.observed_at < r.observed_at)
+        {
+            latest.insert(key.clone(), *r);
+        }
+    }
+    let mut out: BTreeMap<String, Vec<ForgeBudgetReading>> = BTreeMap::new();
+    for ((pool, bucket), r) in latest {
+        let Some(observed_at) = epoch(r.observed_at) else {
+            continue;
+        };
+        out.entry(bucket).or_default().push(ForgeBudgetReading {
+            pool: pool.as_str().to_string(),
+            remaining: r.remaining,
+            used: r.used,
+            reset_at: r.reset_epoch.and_then(epoch),
+            observed_at,
+            source: "headers".to_string(),
+        });
+    }
+    out
 }
 
 /// This host's budget-costing forge calls per pool over the last window —

@@ -109,12 +109,11 @@ about a specific head SHA, not about the PR as an object.
 (`judge.md` → "Verdict SHA Marker"). `champion-pr-merge.md`'s Verdict-State
 Janitor Part 2 runs `./.loom/scripts/verdict-staleness-guard.sh <PR> --clear`
 on every `loom:pr` candidate **before** the 6 safety criteria:
-- If the marker's SHA still matches the current head (`FRESH`, exit `0`) or no
-  marker exists at all — the verdict predates this convention, or the Judge
-  dropped the marker (`UNVERIFIABLE`, exit `11`, fails safe) → proceed to the
-  safety criteria as before, unless the reason says the markers *could not
-  be authenticated* (#9548): then do NOT merge. Since #6319 Judge's sweep
-  (`--anchor`) and the daemon anchor unmarked verdicts, so exit `11` is rare.
+- If the marker's SHA still matches the current head (`FRESH`, exit `0`) →
+  proceed to the safety criteria. An approval with no trusted marker is
+  `STALE` (exit `12`, re-queued, never anchored: `post-verdict.sh` always
+  marks, so it bypassed the mechanism, #9258); `UNVERIFIABLE` (exit `11`) on
+  a `loom:pr` means markers could not be authenticated (#9548): do NOT merge.
 - If the head has moved since the verdict was rendered (`STALE`, exit `12`)
   → the guard has already cleared `loom:pr` and re-queued the PR as
   `loom:review-requested` with an auditable old→new-SHA comment. **Do not
@@ -309,7 +308,7 @@ gh issue edit <number> --add-label "loom:evaluating"
 
 ### Edge Case 5d: Capacity-Deferral Comments Re-Posted Every Pass for an Unchanged Backlog (#6729)
 
-**Scenario**: A proposal passes all 8 promotion criteria, but `champion-issue-promo.md`'s "Rate Limiting by Tier" caps the promotion (Tier 3: only 1 per iteration and only if fewer than 5 Tier 3 issues are already in the backlog; Tier 2: up to 2 per iteration). This is a **capacity deferral, not a rejection** — no revision is needed, so Edge Case 5c's `VERDICT_MARKER` is never written for it (capacity deferral is explicitly Step 3, not Step 4). Without a guard, every subsequent Champion pass re-derives the same "criteria pass, tier cap still blocks it" conclusion and posts an equivalent "Tier N backlog cap reached — deferring promotion" comment again — observed live as 10 near-identical comments on #6628 over ~22 hours, and 2-3 more on each of #6647/#6649, all citing the SAME five occupant `tier:maintenance` issues.
+**Scenario**: A proposal passes all 8 promotion criteria, but `champion-issue-promo.md`'s "Rate Limiting by Tier" caps the promotion (the per-pass Tier 2/3 caps, or the Tier 3 backlog cap; env vars, defaults 2/1/5, #10753). This is a **capacity deferral, not a rejection** — no revision is needed, so Edge Case 5c's `VERDICT_MARKER` is never written for it (capacity deferral is explicitly Step 3, not Step 4). Without a guard, every subsequent Champion pass re-derives the same "criteria pass, tier cap still blocks it" conclusion and posts an equivalent "Tier N backlog cap reached — deferring promotion" comment again — observed live as 10 near-identical comments on #6628 over ~22 hours, and 2-3 more on each of #6647/#6649, all citing the SAME five occupant `tier:maintenance` issues.
 
 **Handling**: `champion-issue-promo.md`'s "Step 3c: Capacity Deferral" mirrors Edge Case 5c's own mechanism, keyed to a **different** anchor because a capacity deferral has no verdict comment to PATCH a marker onto: the **tier and occupant set** that explains the deferral (`classify-capacity-defer.sh`, sourceable pure helpers `normalize_occupants` / `capacity_fingerprint`). The occupant set (`$OCCUPANTS`/`$tier3_occupants`) is the same one the "Backlog Balance Check" computes and already excludes `loom:operator-only`/`loom:blocked` issues (#7613) — those cannot self-clear, so including them here would pin the fingerprint on a backlog that never actually changes.
 
@@ -677,9 +676,8 @@ EXISTING=$(gh issue list --search "Follow-on from PR #$PR_NUMBER" --limit 500)
 - Check for webhook delays in GitHub's processing
 
 **Issue not auto-closing after merge**
-- Verify PR body uses correct format: "Closes #123" (not "closes issue #123")
-- Check if issue is in the same repository
-- Manual close may be needed for cross-repo references
+- Verify PR body format: "Closes #123" (not "closes issue #123")
+- Cross-repo references may need a manual close
 
 **Blocked issues not unblocking**
 - Verify dependency format: "Blocked by #123" or "Depends on #123" — markdown
@@ -689,15 +687,15 @@ EXISTING=$(gh issue list --search "Follow-on from PR #$PR_NUMBER" --limit 500)
 - Manual unblock may be needed for complex dependency patterns
 
 **Worktree checkout errors**
-- These are expected when running from a worktree
-- Champion verifies merge via API, not exit code
-- No action needed - merge still succeeds
+- Expected from a worktree; Champion verifies the merge via API, not exit
+  code — no action needed, the merge still succeeds
 
 ### Debugging Commands
 
 ```bash
-# Check PR merge status
-gh pr view <number> --json state,mergeable,statusCheckRollup
+# PR merge + CI status
+gh pr view <number> --json state,mergeable
+loom-daemon forge wait-checks <number> --timeout 20
 
 # View linked issues (uses GitHub's authoritative parser; `Updates #N` is excluded)
 gh pr view <number> --json closingIssuesReferences --jq '.closingIssuesReferences[].number'

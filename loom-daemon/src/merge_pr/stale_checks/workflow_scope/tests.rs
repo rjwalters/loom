@@ -122,13 +122,43 @@ fn every_needs_names_a_job_this_workflow_defines() {
 // --- The narrowing this issue exists for -------------------------------------
 
 #[test]
-fn a_base_move_editing_an_unrequired_job_affects_no_component() {
-    // THE #9065 FINDING. `backend-tests` is not a required context and no
-    // required job needs it, so editing its block cannot change what any
-    // required gate would say — yet before this narrowing it made every open
-    // PR that touched anything stale, because `ci.yml` was one path in `G`.
+fn a_base_move_editing_a_job_only_the_aggregate_needs_affects_only_ci_result() {
+    // THE #9065 FINDING, as amended by #10444. `backend-tests` is in no
+    // granular required job's closure, so editing its block cannot change
+    // what any of THOSE gates would say — before #9065 it made every open PR
+    // that touched anything stale, because `ci.yml` was one path in `G`. The
+    // `CI Result` aggregate does need it, so it (and only it) is affected.
     let line = line_of("  backend-tests:") + 3;
-    assert!(affected(&add_at(line)).is_empty());
+    assert_eq!(
+        affected(&add_at(line)),
+        ["CI Result".to_string()]
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+    );
+}
+
+#[test]
+fn the_aggregate_does_not_re_own_the_jobs_it_folds_in() {
+    // An edit inside `structural-checks` is attributed to that job's
+    // components, which `specs_for("CI Result")` already judges — so it must
+    // NOT also land on `CI Result`'s own, much broader, component (#10444).
+    let wf = workflow();
+    let job = wf.job_named("Structural Checks").expect("job");
+    let target = job
+        .components
+        .iter()
+        .find(|c| c.name == "Dangling Link Check")
+        .expect("marker");
+    let hit = affected(&add_at(target.start + 2));
+    assert!(!hit.contains("CI Result"), "{hit:?}");
+    // …while an edit to the aggregate's own block is its own component's.
+    let own = line_of("  ci-result:") + 3;
+    assert_eq!(
+        affected(&add_at(own)),
+        ["CI Result".to_string()]
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+    );
 }
 
 #[test]
@@ -184,7 +214,9 @@ fn a_base_move_in_a_needed_job_affects_the_components_that_need_it() {
         .components
         .iter()
         .map(|c| (*c).to_string())
+        .chain(std::iter::once("CI Result".to_string()))
         .collect();
+    // `CI Result` needs `build-daemon` directly too (#10444).
     assert_eq!(hit, daemon, "the shared daemon binary is an input to the gates that run it");
 }
 
@@ -442,8 +474,9 @@ fn the_pr_side_is_attributed_by_the_same_machinery_as_the_base_side() {
     let unrelated = add_at(line_of("  backend-tests:") + 3);
     assert_eq!(
         scope_for_files(&wf, &[ci_file("modified", Some(&unrelated))]),
-        CiScope::Scoped(BTreeSet::new()),
-        "a PR editing only an unrequired job's block is a global input for nobody"
+        CiScope::Scoped(["CI Result".to_string()].into_iter().collect()),
+        "a PR editing only a job no granular context runs is a global input for the \
+         CI Result aggregate alone (#10444)"
     );
 
     let own_block = wf

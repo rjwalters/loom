@@ -67,6 +67,25 @@ per-file. Every entry is safe to **over**-populate: listing a path too broadly
 only makes the guard refuse more often. Listing too little lets a stale green
 through, so when in doubt, put a file in `global`.
 
+## Machine restamps are not base moves
+
+Before the predicate runs, two kinds of machine-written commit are removed from
+`D`, one file at a time:
+
+- the post-merge version bump: every path `scripts/version.sh list` names,
+  plus `Cargo.lock` and `mcp-loom/package-lock.json`;
+- the `chore: resync installed Loom surfaces` stamp in
+  `.loom/install-metadata.json`.
+
+A base move made only of these stales nothing, whatever your PR touches. A
+file is removed only when `VERSION` strictly increased and every changed line
+is a version-value line, or, for the resync stamp, a resync field of the right
+shape. If a bump also edits a real dependency line, lowers `VERSION`, or arrives
+without its patch, it stays in `D` and is judged normally. The end-to-end tests
+in `stale_checks/evidence/restamp_e2e_tests.rs` (#10163) replay real bump and
+resync commits from `main` through every required context. They also fail if
+`scripts/version.sh list` ever names a file the discount does not know about.
+
 ## Fail-closed rules
 
 - **No file, or a context not listed:** that context keeps today's "stale on
@@ -97,3 +116,28 @@ Paste a real PR's inputs to see the verdict before you commit the file.
 Related: re-verifying deterministic ratchets on the merged tree instead of
 demanding a new CI run is tracked in #9571. That handles real staleness; this
 file removes false staleness.
+
+## What the guard costs GitHub (#11418)
+
+The guard's live reads are cheap to repeat and cannot burst:
+
+- The base tip, the rulesets lookup and the check-runs rollup are conditional
+  reads through the shared ETag store. An unchanged answer is a free `304`.
+  The check-runs read uses the entry `forge wait-checks` keeps for the same
+  SHA. The classic branch-protection lookup is GraphQL, which has no ETag, so
+  it is sent every time.
+- The base a finished job tested, and a `compare` between two SHAs, are kept
+  once read. A repeated run does not download the job logs again.
+- Requests are spaced 200 ms apart, including later pages of a check-runs
+  read (`LOOM_STALE_CHECKS_MIN_GAP_MS` overrides; `0` turns the spacing off).
+- When GitHub answers with a secondary rate limit, the guard sends nothing more
+  on that credential until `retry-after`. Without `retry-after` it waits for
+  `x-ratelimit-reset` only when `x-ratelimit-remaining` is `0`, otherwise one
+  minute. A hold never lasts more than an hour, even if the stored value says
+  otherwise. The hold is per forge host, credential and repo owner, and is
+  shared by every process on the host (one file per scope; writing a hold
+  removes expired ones). So the next merge pass on the same
+  credential fails closed at once instead of retrying. Another token or owner
+  is not held.
+  The ledger records these answers as `secondary_limited`, apart from primary
+  `rate_limited` (`loom-daemon forge calls`, column `2ND-LIM`).

@@ -162,6 +162,9 @@ fn gh(
         GhCompletion::Captured(Completion::Exited(out)) => out,
         GhCompletion::Captured(_) => return Err(format!("gh {operation} timed out")),
         GhCompletion::Passthrough(_) => return Err("unexpected passthrough".to_string()),
+        GhCompletion::Shed { .. } => {
+            return Err(format!("gh {operation} was deferred (loom-shed)"))
+        }
     };
     if !out.status.success() {
         return Err(format!(

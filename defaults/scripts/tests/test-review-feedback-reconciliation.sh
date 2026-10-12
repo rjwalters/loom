@@ -242,12 +242,25 @@ export PATH="$STUB_DIR:$PATH"
 # is the reconciliation semantics over the GH ladder, so pin the SELF daemon
 # to a mock that refuses (127 = unavailable, never a scope verdict) — the gh
 # stub above stays the path under test, deterministically.
+# #10581's verdict gate / label verbs answer "proceed" / "ok": their logic is
+# not this suite's subject (test-post-verdict*.sh, loom_daemon::verdict_gate).
 cat > "$STUB_DIR/loom-daemon" <<'MOCK'
 #!/usr/bin/env bash
+# #10485: approvals also pass the exact-head CI gate; this suite is about review
+# reconciliation, so the reader reports the reviewed head green.
+if [[ "${1:-} ${2:-}" == "forge wait-checks" ]]; then
+  echo "LOOM-CHECKS-GREEN ${LOOM_TEST_HEAD_SHA:?}"
+  exit 0
+fi
+[[ "${1:-} ${2:-}" == "forge verdict-gate" ]] && { echo "LOOM-VERDICT-GATE PROCEED ok"; exit 0; }
+[[ "${1:-} ${2:-}" == "forge verdict-labels" ]] && { echo "LOOM-VERDICT-LABELS OK"; exit 0; }
+[[ "${1:-} ${2:-}" == "forge verdict-lock" ]] && exit 0
+[[ "${1:-} ${2:-}" == "forge verdict-reconcile" ]] && { echo "LOOM-VERDICT-RECONCILE STABLE"; exit 0; }
 echo "mock loom-daemon: forge comment not under test here" >&2
 exit 127
 MOCK
 chmod +x "$STUB_DIR/loom-daemon"
+export LOOM_TEST_HEAD_SHA="$HEAD_SHA"
 export LOOM_DAEMON_SELF_BIN="$STUB_DIR/loom-daemon"
 # #9548: post-verdict.sh vets its write target through the write scope before it
 # writes. It runs from a checkout registered as owner/repo (origin, .loom/, push

@@ -54,6 +54,12 @@
 //! contract), never "skip". (4)–(6) are different: a failure there is recorded
 //! as a per-context FALLBACK to the #8248 time rule, announced on stderr, so an
 //! install without `Actions: read` is no worse off than before #8919.
+//!
+//! Cost (#11418): (1), the rulesets half of (2) and (3) are conditional reads
+//! through the shared ETag store, (3) on the very entry `forge wait-checks`
+//! keeps; a tested base and a compare answer are kept once read ([`memo`]);
+//! every request is spaced, and a secondary-limit answer holds every later
+//! request on that credential until it clears ([`budget`]).
 
 use super::evidence::{
     compare_usable, parse_tested_base, strip_validated_restamps, to_file_set, ChangedFile,
@@ -65,14 +71,72 @@ use super::CheckRun;
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 
+use crate::forge_call_stats::{ops, ForgeOp};
+use crate::forge_wait_checks::reads::{GhReads, ReadError};
 use crate::gh_invocation::gh_bin;
+use std::path::{Path, PathBuf};
+
+mod budget;
+mod memo;
+
+/// The facade operation and ledger caller of every read here.
+pub const CALLER: &str = "merge_guard.stale_checks";
+
+/// The rulesets read has no inventoried operation of its own.
+const RULES_OP: ForgeOp = ForgeOp::uninventoried("branch rules read by the freshness guard");
+
+/// Where conditional entries and memos live: the shared ETag store (none in
+/// a test build that did not opt in).
+fn default_store() -> Option<PathBuf> {
+    crate::forge_etag_store::daemon_store_dir()
+}
+
+/// One conditional REST read through [`GhReads`] (#11418): `If-None-Match`
+/// when `store` holds an entry, so an unchanged answer is a free `304`. Paced
+/// and held like [`gh_api`].
+fn conditional<T>(
+    gh: &str,
+    nwo: &str,
+    store: Option<&Path>,
+    read: impl FnOnce(&mut GhReads) -> Result<T, ReadError>,
+) -> Result<T, String> {
+    let scope = budget::scope(nwo);
+    budget::before_request(&scope)?;
+    let reads = GhReads::new(
+        PathBuf::from(gh),
+        None,
+        store.map_or_else(PathBuf::new, Path::to_path_buf),
+        Some(nwo),
+    )?
+    .with_caller(CALLER)
+    .with_page_pacing(budget::pace);
+    let mut reads = if store.is_some() {
+        reads
+    } else {
+        reads.ephemeral()
+    };
+    let out = read(&mut reads);
+    match (&out, reads.secondary_retry_at()) {
+        (_, Some(at)) => budget::note_secondary(&scope, Some(at)),
+        (Err(e), None) if crate::forge_call_stats::is_secondary_limit(None, e.reason()) => {
+            budget::note_secondary(&scope, None);
+        }
+        _ => {}
+    }
+    out.map_err(|e| e.reason().to_string())
+}
 
 /// Run `gh api …` with the given args, returning stdout on success. `gh` is
 /// the binary — a plain argument so a caller's tests can inject a stub without
 /// a process-global `LOOM_GH_BIN` (which races across parallel test threads).
-fn gh_api(gh: &str, args: &[&str]) -> Result<String, String> {
+///
+/// Paced, and refused without a request while a secondary-limit hold is in
+/// force ([`budget`], #11418).
+fn gh_api(gh: &str, nwo: &str, args: &[&str]) -> Result<String, String> {
+    let scope = budget::scope(nwo);
+    budget::before_request(&scope)?;
     let out = crate::gh_invocation::GhInvocation::new(
-        crate::gh_invocation::Operation::new("merge_guard.stale_checks"),
+        crate::gh_invocation::Operation::new(CALLER),
         crate::gh_invocation::AccessIntent::Read,
         crate::gh_invocation::GhTarget::None,
         std::time::Duration::from_secs(60),
@@ -89,6 +153,9 @@ fn gh_api(gh: &str, args: &[&str]) -> Result<String, String> {
     };
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
+        if crate::forge_call_stats::is_secondary_limit(None, &stderr) {
+            budget::note_secondary(&scope, None);
+        }
         let trimmed = stderr.trim();
         let hint = if trimmed.is_empty() {
             format!("exit {}", out.status)
@@ -183,22 +250,26 @@ fn split_nwo(nwo: &str) -> Result<(&str, &str), String> {
 }
 
 /// Resolve the base branch's current tip: its SHA and commit time.
-fn fetch_base_tip(gh: &str, nwo: &str, base_ref: &str) -> Result<(String, DateTime<Utc>), String> {
-    let out = gh_api(
-        gh,
-        &[
-            &format!("repos/{nwo}/commits/{base_ref}"),
-            "--jq",
-            "[.sha, .commit.committer.date] | @tsv",
-        ],
-    )?;
-    let mut cols = out.split('\t');
-    let sha = cols.next().unwrap_or("").trim().to_string();
-    let date = cols.next().unwrap_or("").trim().to_string();
+fn fetch_base_tip(
+    gh: &str,
+    nwo: &str,
+    base_ref: &str,
+    store: Option<&Path>,
+) -> Result<(String, DateTime<Utc>), String> {
+    let url = format!("repos/{nwo}/commits/{base_ref}");
+    let body = conditional(gh, nwo, store, |r| r.read(&url, ops::GIT_DEFAULT_BRANCH_HEADS))?;
+    let v: serde_json::Value = serde_json::from_str(body.trim())
+        .map_err(|e| format!("base branch '{base_ref}' commit was not JSON: {e}"))?;
+    let sha = v.get("sha").and_then(|s| s.as_str()).unwrap_or("").trim();
+    let date = v
+        .pointer("/commit/committer/date")
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .trim();
     if sha.is_empty() || date.is_empty() {
         return Err(format!("base branch '{base_ref}' resolved to an empty SHA or committer date"));
     }
-    Ok((sha, parse_iso("base tip commit time", &date)?))
+    Ok((sha.to_string(), parse_iso("base tip commit time", date)?))
 }
 
 /// [`fetch_required`] on its own, for a caller that needs ONLY the base
@@ -212,7 +283,7 @@ fn fetch_base_tip(gh: &str, nwo: &str, base_ref: &str) -> Result<(String, DateTi
 /// means "could not find out", a distinction both callers fail closed on in
 /// their own way.
 pub fn required_contexts(nwo: &str, base_ref: &str) -> Result<(Vec<String>, Vec<String>), String> {
-    fetch_required(&gh_bin(), nwo, base_ref)
+    fetch_required(&gh_bin(), nwo, base_ref, default_store().as_deref())
 }
 
 /// [`required_contexts`], parameterized on the `gh` binary (see [`gh_api`]).
@@ -221,7 +292,34 @@ pub fn required_contexts_with(
     nwo: &str,
     base_ref: &str,
 ) -> Result<(Vec<String>, Vec<String>), String> {
-    fetch_required(gh, nwo, base_ref)
+    fetch_required(gh, nwo, base_ref, default_store().as_deref())
+}
+
+/// [`required_contexts_with`], keeping the rulesets entry in `store` (the
+/// caller's ETag store; `None` = unconditional).
+pub fn required_contexts_in(
+    gh: &str,
+    nwo: &str,
+    base_ref: &str,
+    store: Option<&Path>,
+) -> Result<(Vec<String>, Vec<String>), String> {
+    fetch_required(gh, nwo, base_ref, store)
+}
+
+/// The contexts a `rules/branches/{ref}` answer requires, in rule order.
+fn ruleset_contexts(body: &str) -> Result<Vec<String>, String> {
+    let v: serde_json::Value = serde_json::from_str(body.trim())
+        .map_err(|e| format!("rulesets response was not JSON: {e}"))?;
+    let rules = v.as_array().ok_or("rulesets response was not an array")?;
+    Ok(rules
+        .iter()
+        .filter(|r| r.get("type").and_then(|t| t.as_str()) == Some("required_status_checks"))
+        .filter_map(|r| r.pointer("/parameters/required_status_checks"))
+        .filter_map(|c| c.as_array())
+        .flatten()
+        .filter_map(|c| c.get("context").and_then(|s| s.as_str()))
+        .map(String::from)
+        .collect())
 }
 
 /// Required status check contexts, unioned across rulesets and classic branch
@@ -231,20 +329,23 @@ pub fn required_contexts_with(
 /// The plan gate is evaluated PER SOURCE rather than "only when both are
 /// gated": a gated source provably holds no rules of its own, and a source
 /// that answered normally is still authoritative for what it does hold.
+///
+/// The rulesets read is conditional (#11418); the classic read is GraphQL,
+/// which has no ETag, so it is sent every time.
 fn fetch_required(
     gh: &str,
     nwo: &str,
     base_ref: &str,
+    store: Option<&Path>,
 ) -> Result<(Vec<String>, Vec<String>), String> {
     let (owner, repo) = split_nwo(nwo)?;
     let mut notices: Vec<String> = Vec::new();
 
-    let ruleset = match gh_api(gh, &[
-        &format!("repos/{nwo}/rules/branches/{base_ref}"),
-        "--jq",
-        ".[]? | select(.type == \"required_status_checks\") | .parameters.required_status_checks[]?.context",
-    ]) {
-        Ok(out) => out,
+    let url = format!("repos/{nwo}/rules/branches/{base_ref}");
+    let ruleset = match conditional(gh, nwo, store, |r| r.read(&url, RULES_OP))
+        .and_then(|body| ruleset_contexts(&body))
+    {
+        Ok(contexts) => contexts.join("\n"),
         Err(e) if is_plan_gated(&e) => {
             notices.push(plan_gated_notice("ruleset", base_ref, &e));
             String::new()
@@ -255,6 +356,7 @@ fn fetch_required(
     let query = "query($owner: String!, $name: String!, $ref: String!) { repository(owner: $owner, name: $name) { ref(qualifiedName: $ref) { branchProtectionRule { requiredStatusCheckContexts } } } }";
     let classic = match gh_api(
         gh,
+        nwo,
         &[
             "graphql",
             &format!("-fquery={query}"),
@@ -294,54 +396,32 @@ fn fetch_required(
 /// The check-runs rollup for the PR head, projected to the guard's fields —
 /// fully paginated, and failing closed on a short read (#8987).
 ///
-/// This mirrors `forge_get_check_runs`' GitHub branch (#8895) rather than
-/// inventing its own contract, because the two answer the same question about
-/// the same endpoint. Both halves matter:
-///
-/// - **`per_page=100` + `--paginate`**: `per_page` alone only moves the cap, so
-///   a repo whose head grows past 100 check-runs would hand the freshness guard
-///   a silent subset. `--paginate` follows the Link header instead.
-/// - **keep `total_count`**: the projection used to drop it, leaving nothing to
-///   compare the row count against. With it, a read short of the forge's own
-///   count is an `Err` — which every caller turns into "refuse the merge" — and
-///   never a partial `Vec<CheckRun>` the guard would evaluate as if complete.
-///
-/// `--jq` runs once per page, so a multi-page read arrives as a stream of
-/// concatenated per-page objects that must be folded here. `total_count` repeats
-/// identically on every page; `max` is the conservative pick for the comparison.
-fn fetch_check_runs(gh: &str, nwo: &str, head_sha: &str) -> Result<Vec<CheckRun>, String> {
-    let out = gh_api(gh, &[
-        &format!("repos/{nwo}/commits/{head_sha}/check-runs?per_page=100"),
-        "--paginate",
-        "--jq",
-        "{total_count: (.total_count // 0), check_runs: [(.check_runs // [])[] | {name: .name, status: .status, conclusion: .conclusion, started_at: .started_at, app: .app.slug, details_url: .details_url, id: .id}]}",
-    ])?;
+/// Read through [`GhReads::check_runs`] (#11418), the same conditional read
+/// and the same ETag entry `forge wait-checks` uses for this SHA, so a guard
+/// run after a wait is a free `304`. That read folds every page and returns
+/// [`ReadError::Fatal`] when it holds fewer rows than the forge's own
+/// `total_count`: a subset is never evaluated as if complete.
+pub(crate) fn fetch_check_runs(
+    gh: &str,
+    nwo: &str,
+    head_sha: &str,
+) -> Result<Vec<CheckRun>, String> {
+    let store = default_store();
+    let rollup = conditional(gh, nwo, store.as_deref(), |r| r.check_runs(head_sha))
+        .map_err(|e| format!("check-runs read for {head_sha} failed: {e}"))?;
+    project_check_runs(&rollup, head_sha)
+}
 
-    let mut total: u64 = 0;
-    let mut rows: Vec<serde_json::Value> = Vec::new();
-    let mut pages = 0usize;
-    for page in serde_json::Deserializer::from_str(&out).into_iter::<serde_json::Value>() {
-        let page = page.map_err(|e| format!("check-runs response was not JSON: {e}"))?;
-        pages += 1;
-        total = total.max(
-            page.get("total_count")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0),
-        );
-        let page_rows = page
-            .get("check_runs")
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| "check-runs page had no check_runs array".to_string())?;
-        rows.extend(page_rows.iter().cloned());
-    }
-    // A `gh` that exited 0 having printed nothing is a degraded read, not an
-    // authoritative "this commit has no checks" — same treatment the shell
-    // helper gives it, for the same reason.
-    if pages == 0 {
-        return Err(format!(
-            "check-runs read for {head_sha} returned no pages (gh exited 0 with empty output)"
-        ));
-    }
+/// The guard's [`CheckRun`]s from a `{total_count, check_runs}` rollup.
+fn project_check_runs(rollup: &serde_json::Value, head_sha: &str) -> Result<Vec<CheckRun>, String> {
+    let rows = rollup
+        .get("check_runs")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| format!("check-runs read for {head_sha} had no check_runs array"))?;
+    let total = rollup
+        .get("total_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
     if (rows.len() as u64) < total {
         return Err(format!(
             "check-runs read for {head_sha} was SHORT: got {} of {total} check-runs; \
@@ -349,37 +429,22 @@ failing closed rather than evaluating the freshness guard on a subset (#8987)",
             rows.len()
         ));
     }
-
     rows.iter()
         .map(|v| {
-            let started_at = match v.get("started_at").and_then(|s| s.as_str()) {
+            let str_of = |k: &str| v.get(k).and_then(|s| s.as_str());
+            let started_at = match str_of("started_at") {
                 Some(s) if !s.is_empty() => Some(parse_iso("check run started_at", s)?),
                 _ => None,
             };
+            let app = v.pointer("/app/slug").and_then(|s| s.as_str());
+            let details_url = str_of("details_url");
             Ok(CheckRun {
-                name: v
-                    .get("name")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-                status: v
-                    .get("status")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-                conclusion: v
-                    .get("conclusion")
-                    .and_then(|s| s.as_str())
-                    .map(String::from),
+                name: str_of("name").unwrap_or_default().to_string(),
+                status: str_of("status").unwrap_or_default().to_string(),
+                conclusion: str_of("conclusion").map(String::from),
                 started_at,
-                actions_run_id: actions_run_id(
-                    v.get("app").and_then(|s| s.as_str()),
-                    v.get("details_url").and_then(|s| s.as_str()),
-                ),
-                actions_job_id: actions_job_id(
-                    v.get("app").and_then(|s| s.as_str()),
-                    v.get("details_url").and_then(|s| s.as_str()),
-                ),
+                actions_run_id: actions_run_id(app, details_url),
+                actions_job_id: actions_job_id(app, details_url),
             })
         })
         .collect()
@@ -423,9 +488,9 @@ pub fn actions_job_id(app_slug: Option<&str>, details_url: Option<&str>) -> Opti
 /// (#9057). A `gh` predating the flag rejects it, so retry without it.
 fn fetch_job_log(gh: &str, nwo: &str, job_id: u64) -> Result<String, String> {
     let path = format!("repos/{nwo}/actions/jobs/{job_id}/logs");
-    match gh_api(gh, &[&path, "--allow-escape-sequences"]) {
+    match gh_api(gh, nwo, &[&path, "--allow-escape-sequences"]) {
         Err(e) if crate::ci_telemetry::api::mentions_unknown_escape_flag(&e) => {
-            gh_api(gh, &[&path])
+            gh_api(gh, nwo, &[&path])
         }
         other => other,
     }
@@ -435,6 +500,7 @@ fn fetch_job_log(gh: &str, nwo: &str, job_id: u64) -> Result<String, String> {
 fn fetch_pr_files(gh: &str, nwo: &str, pr: &str) -> Result<Vec<ChangedFile>, String> {
     let out = gh_api(
         gh,
+        nwo,
         &[
             &format!("repos/{nwo}/pulls/{pr}/files"),
             "--paginate",
@@ -471,6 +537,7 @@ fn fetch_compare(
 ) -> Result<(String, Vec<ChangedFile>), String> {
     let out = gh_api(
         gh,
+        nwo,
         &[
             &format!("repos/{nwo}/compare/{base}...{head}"),
             "--jq",
@@ -522,6 +589,7 @@ fn fetch_compare(
 fn fetch_pr_ci_file(gh: &str, nwo: &str, pr: &str) -> Result<Option<ChangedFile>, String> {
     let out = gh_api(
         gh,
+        nwo,
         &[
             &format!("repos/{nwo}/pulls/{pr}/files"),
             "--paginate",
@@ -575,6 +643,7 @@ fn pr_ci_scope(gh: &str, nwo: &str, pr: &str, head_sha: &str, pr_files: &[Change
 fn fetch_workflow(gh: &str, nwo: &str, sha: &str) -> Result<String, String> {
     gh_api(
         gh,
+        nwo,
         &[
             "-H",
             "Accept: application/vnd.github.raw",
@@ -670,11 +739,7 @@ workflow log"
         };
         let base = bases
             .entry(job_id)
-            .or_insert_with(|| {
-                fetch_job_log(gh, nwo, job_id)
-                    .map_err(|e| format!("its job log could not be read ({e})"))
-                    .and_then(|log| parse_tested_base(&log, head_sha))
-            })
+            .or_insert_with(|| tested_base(gh, nwo, job_id, head_sha))
             .clone();
         let base = match base {
             Ok(b) => b,
@@ -687,7 +752,7 @@ workflow log"
             // Not `or_insert_with`: the ci.yml attribution needs a mutable
             // borrow of the memoised workflow, which a closure cannot hold at
             // the same time as the entry it is filling.
-            let computed = match fetch_compare(gh, nwo, &base, tip_sha) {
+            let computed = match compare_memoised(gh, nwo, &base, tip_sha) {
                 Err(e) => Err(format!("the base-move compare from {base} failed ({e})")),
                 Ok((status, files)) => compare_usable(&status, files.len()).map(|()| {
                     let ci = ci_scope_for(gh, nwo, tip_sha, &files, &mut workflow);
@@ -727,11 +792,40 @@ workflow log"
     (Some(ev), notices)
 }
 
+/// The base job `job_id` tested for `head_sha`: from [`memo`] when an earlier
+/// run read it (a finished job's log never changes), else from its log.
+fn tested_base(gh: &str, nwo: &str, job_id: u64, head_sha: &str) -> Result<String, String> {
+    if let Some(base) = memo::tested_base(nwo, job_id, head_sha) {
+        return Ok(base);
+    }
+    let base = fetch_job_log(gh, nwo, job_id)
+        .map_err(|e| format!("its job log could not be read ({e})"))
+        .and_then(|log| parse_tested_base(&log, head_sha))?;
+    memo::keep_tested_base(nwo, job_id, head_sha, &base);
+    Ok(base)
+}
+
+/// [`fetch_compare`], kept in [`memo`]: both ends are commit SHAs.
+fn compare_memoised(
+    gh: &str,
+    nwo: &str,
+    base: &str,
+    tip: &str,
+) -> Result<(String, Vec<ChangedFile>), String> {
+    if let Some(hit) = memo::compare(nwo, base, tip) {
+        return Ok(hit);
+    }
+    let (status, files) = fetch_compare(gh, nwo, base, tip)?;
+    memo::keep_compare(nwo, base, tip, &status, &files);
+    Ok((status, files))
+}
+
 /// The base tip's [`DECLARATION_PATH`] — the BASE tip, never the PR head, so a
 /// PR cannot narrow its own freshness check (#9589).
 fn fetch_declaration(gh: &str, nwo: &str, tip_sha: &str) -> Result<String, String> {
     gh_api(
         gh,
+        nwo,
         &[
             "-H",
             "Accept: application/vnd.github.raw",
@@ -758,8 +852,9 @@ pub fn live_inputs_with(
     base_ref: &str,
     head_sha: &str,
 ) -> Result<LiveInputs, String> {
-    let (tip_sha, base_tip) = fetch_base_tip(gh, nwo, base_ref)?;
-    let (required, mut notices) = fetch_required(gh, nwo, base_ref)?;
+    let store = default_store();
+    let (tip_sha, base_tip) = fetch_base_tip(gh, nwo, base_ref, store.as_deref())?;
+    let (required, mut notices) = fetch_required(gh, nwo, base_ref, store.as_deref())?;
     let runs = fetch_check_runs(gh, nwo, head_sha)?;
     let (scoped, scoped_notices) =
         scoped_evidence(gh, nwo, pr, head_sha, &tip_sha, &required, &runs);
@@ -776,3 +871,6 @@ pub fn live_inputs_with(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod conditional_tests;

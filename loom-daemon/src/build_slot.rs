@@ -173,21 +173,28 @@ pub fn is_held_here() -> bool {
 /// The machine-wide slot directory: [`BUILD_SLOT_DIR_ENV`] when set, else
 /// `~/.loom/locks/build-slot`. `None` when neither is resolvable (no home
 /// directory) — the caller degrades open.
+///
+/// In test builds this panics if the answer is the host's real slot directory
+/// (#11014): see [`test_support`].
 #[must_use]
 pub fn slot_dir() -> Option<PathBuf> {
-    if let Ok(dir) = std::env::var(BUILD_SLOT_DIR_ENV) {
-        let trimmed = dir.trim();
-        if !trimmed.is_empty() {
-            return Some(PathBuf::from(trimmed));
-        }
-    }
-    Some(
-        dirs::home_dir()?
-            .join(".loom")
-            .join("locks")
-            .join("build-slot"),
-    )
+    let dir = resolve_slot_dir(std::env::var(BUILD_SLOT_DIR_ENV).ok().as_deref(), dirs::home_dir());
+    #[cfg(test)]
+    test_support::forbid_host_slot_dir(dir.as_deref());
+    dir
 }
+
+/// [`slot_dir`] with both inputs injected: the override value and the home
+/// directory. A blank override is ignored.
+fn resolve_slot_dir(override_dir: Option<&str>, home: Option<PathBuf>) -> Option<PathBuf> {
+    if let Some(trimmed) = override_dir.map(str::trim).filter(|d| !d.is_empty()) {
+        return Some(PathBuf::from(trimmed));
+    }
+    Some(home?.join(".loom").join("locks").join("build-slot"))
+}
+
+#[cfg(test)]
+pub(crate) mod test_support;
 
 // ============================================================================
 // The lease
@@ -451,6 +458,7 @@ pub fn slot_path(dir: &Path, i: usize) -> PathBuf {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use super::test_support::BuildSlotEnvGuard;
     use super::*;
     use serial_test::serial;
 
@@ -620,9 +628,7 @@ mod tests {
     #[test]
     #[serial]
     fn nested_acquire_is_a_reentrant_no_op() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("build-slot");
-        std::env::set_var(BUILD_SLOT_DIR_ENV, &dir);
+        let env = BuildSlotEnvGuard::isolated();
         std::env::set_var(BUILD_SLOT_HELD_ENV, "1");
         let lease = acquire("nested-gate");
         assert_eq!(lease.kind(), &LeaseKind::Reentrant);
@@ -631,14 +637,16 @@ mod tests {
             lease.covers_children(),
             "an ancestor already holds a slot, so children stay covered"
         );
-        assert!(!slot_path(&dir, 0).exists(), "a re-entrant acquire must not take a second slot");
-        std::env::remove_var(BUILD_SLOT_HELD_ENV);
-        std::env::remove_var(BUILD_SLOT_DIR_ENV);
+        assert!(
+            !slot_path(env.dir(), 0).exists(),
+            "a re-entrant acquire must not take a second slot"
+        );
     }
 
     #[test]
     #[serial]
     fn is_held_here_parses_truthy_values_only() {
+        let _env = BuildSlotEnvGuard::isolated();
         for truthy in ["1", "true", "YES", "on"] {
             std::env::set_var(BUILD_SLOT_HELD_ENV, truthy);
             assert!(is_held_here(), "{truthy} must be truthy");
@@ -658,9 +666,8 @@ mod tests {
     #[test]
     #[serial]
     fn resolves_knobs_from_env_with_defaults() {
-        std::env::remove_var(BUILD_SLOTS_ENV);
-        std::env::remove_var(BUILD_SLOT_WAIT_SECS_ENV);
-        std::env::remove_var(BUILD_SLOT_STALE_SECS_ENV);
+        // The guard clears every knob and restores the prior values on drop.
+        let _env = BuildSlotEnvGuard::isolated();
         assert_eq!(resolve_slots(), DEFAULT_BUILD_SLOTS);
         assert_eq!(resolve_wait(), Duration::from_secs(DEFAULT_BUILD_SLOT_WAIT_SECS));
         assert_eq!(resolve_stale(), Duration::from_secs(DEFAULT_STALE_SLOT_SECS));
@@ -684,27 +691,78 @@ mod tests {
         std::env::set_var(BUILD_SLOT_WAIT_SECS_ENV, "soon");
         assert_eq!(resolve_slots(), DEFAULT_BUILD_SLOTS);
         assert_eq!(resolve_wait(), Duration::from_secs(DEFAULT_BUILD_SLOT_WAIT_SECS));
+    }
 
-        std::env::remove_var(BUILD_SLOTS_ENV);
-        std::env::remove_var(BUILD_SLOT_WAIT_SECS_ENV);
-        std::env::remove_var(BUILD_SLOT_STALE_SECS_ENV);
+    #[test]
+    fn slot_dir_honors_the_override_and_falls_back_to_home() {
+        // The pure resolver, so the fallback is checked without ever pointing
+        // this process at a real home directory.
+        let home = || Some(PathBuf::from("/h"));
+        assert_eq!(
+            resolve_slot_dir(Some(" /tmp/loom-slots-test "), home()),
+            Some(PathBuf::from("/tmp/loom-slots-test"))
+        );
+        // An absent or blank override falls through to the home directory.
+        for blank in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                resolve_slot_dir(blank, home()),
+                Some(PathBuf::from("/h/.loom/locks/build-slot"))
+            );
+        }
+        assert_eq!(resolve_slot_dir(None, None), None, "no home: the caller degrades open");
     }
 
     #[test]
     #[serial]
-    fn slot_dir_honors_the_env_override_and_falls_back_to_home() {
-        std::env::set_var(BUILD_SLOT_DIR_ENV, "/tmp/loom-slots-test");
-        assert_eq!(slot_dir(), Some(PathBuf::from("/tmp/loom-slots-test")));
-        // An empty/whitespace override is ignored (falls through to `$HOME`).
-        std::env::set_var(BUILD_SLOT_DIR_ENV, "   ");
-        if let Some(p) = slot_dir() {
-            assert!(
-                p.ends_with(PathBuf::from(".loom").join("locks").join("build-slot")),
-                "unexpected fallback path: {}",
-                p.display()
-            );
+    fn slot_dir_reads_the_env_override() {
+        let env = BuildSlotEnvGuard::isolated();
+        assert_eq!(slot_dir().as_deref(), Some(env.dir()));
+    }
+
+    // ------------------------------------------------------------------
+    // test isolation (#11014)
+    // ------------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn a_test_that_resolves_the_host_slot_dir_fails_loudly() {
+        // THE regression guard. Without an override `slot_dir()` answers
+        // `$HOME/.loom/locks/build-slot`, the host's real slot — a test must
+        // never get that far. Nothing is created: the guard fires at
+        // resolution, before any `mkdir`.
+        let _env = BuildSlotEnvGuard::isolated();
+        if dirs::home_dir().is_none() {
+            return; // no home to fall back to, so nothing to forbid
         }
         std::env::remove_var(BUILD_SLOT_DIR_ENV);
+        assert!(std::panic::catch_unwind(slot_dir).is_err(), "slot_dir() must panic");
+        assert!(
+            std::panic::catch_unwind(|| acquire("unguarded-test")).is_err(),
+            "acquire() must panic rather than take the host's slot"
+        );
+        // An explicit override naming the host directory is caught too.
+        let host = resolve_slot_dir(None, dirs::home_dir()).unwrap();
+        std::env::set_var(BUILD_SLOT_DIR_ENV, &host);
+        assert!(std::panic::catch_unwind(slot_dir).is_err());
+        // Disabling slots never resolves a directory at all.
+        std::env::remove_var(BUILD_SLOT_DIR_ENV);
+        std::env::set_var(BUILD_SLOTS_ENV, "0");
+        assert_eq!(acquire("slots-disabled").kind().as_str(), "degraded-open");
+    }
+
+    #[test]
+    #[serial]
+    fn the_env_guard_restores_prior_values_instead_of_unsetting_them() {
+        let outer = BuildSlotEnvGuard::isolated();
+        std::env::set_var(BUILD_SLOTS_ENV, "3");
+        {
+            let inner = BuildSlotEnvGuard::disabled();
+            assert_ne!(inner.dir(), outer.dir(), "each guard gets its own directory");
+            assert_eq!(slot_dir().as_deref(), Some(inner.dir()));
+            assert_eq!(resolve_slots(), 0);
+        }
+        assert_eq!(slot_dir().as_deref(), Some(outer.dir()), "the prior override is back");
+        assert_eq!(resolve_slots(), 3, "the prior slot count is back");
     }
 
     // ------------------------------------------------------------------

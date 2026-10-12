@@ -148,6 +148,23 @@ fn issue_execution_joins_the_story_trace_and_still_retires() {
     assert_ne!(sweeps[0].context.span_id, sweeps[1].context.span_id);
 }
 
+/// #10637: a story sweep's `loom.repo` is GitHub's spelling of the repo (the
+/// one `loom.dispatch.*` carries), not the origin's, and never lowercased.
+#[test]
+fn story_sweep_names_its_repo_as_github_spells_it() {
+    let dir = root();
+    let root = dir.path();
+    git_repo_with_origin(root, "git@github.com:twoam-fixture/story-case.git");
+    loom_daemon::telemetry::repo_identity::seed(
+        "twoam-fixture/story-case",
+        loom_daemon::telemetry::repo_identity::parse("4242 TwoAM-Fixture/Story-Case"),
+    );
+    let sweeps = issue_sweeps(root, &["case-attempt-1"], 10637);
+    assert_eq!(sweeps.len(), 1);
+    assert_eq!(sweeps[0].attributes["loom.repo"], "TwoAM-Fixture/Story-Case");
+    assert_eq!(sweeps[0].attributes["loom.story"], "TwoAM-Fixture/Story-Case#10637");
+}
+
 #[test]
 fn unresolvable_repo_id_makes_the_execution_its_own_root() {
     let dir = root();
@@ -390,7 +407,12 @@ fn identical_issue_numbers_in_distinct_roots_keep_distinct_trace_ids_after_reloa
 fn actual_checkpoint_cli_preserves_rapid_judge_doctor_repair_waterfall() {
     let dir = root();
     let root = dir.path();
-    let sweep = lifecycle::begin(root, "repair", SpanName::Sweep, Default::default()).unwrap();
+    // The scope `prepare_execution` stamps on a sweep root (#10637).
+    let scope = lifecycle::attributes(&[
+        ("loom.repo", "TwoAM-Fixture/Repair"),
+        ("loom.sweep_id", "repair"),
+    ]);
+    let sweep = lifecycle::begin(root, "repair", SpanName::Sweep, scope.clone()).unwrap();
     for (phase, attempt) in [
         ("builder-done", "1"),
         ("judge-rejected", "1"),
@@ -426,4 +448,10 @@ fn actual_checkpoint_cli_preserves_rapid_judge_doctor_repair_waterfall() {
     assert_ne!(judges[0].context.span_id, judges[1].context.span_id);
     assert!(judges.iter().all(|s| s.started_at == s.ended_at
         && s.attributes["loom.timing_source"] == "checkpoint_write_observed"));
+    // #10637: every checkpoint span names its execution's repo and sweep.
+    for span in records.iter().filter(|s| s.name != SpanName::Sweep) {
+        for (key, value) in &scope {
+            assert_eq!(span.attributes.get(key), Some(value), "{key} on {:?}", span.name);
+        }
+    }
 }

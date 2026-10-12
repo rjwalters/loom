@@ -23,8 +23,8 @@ pub fn gate(d: QueueDisposition) -> Option<&'static str> {
         QueueDisposition::DeferredBuildBackoff => "build-backoff",
         QueueDisposition::DeferredOutOfSlice => "repo-slice",
         QueueDisposition::DeferredRepoCap => "repo-cap",
+        QueueDisposition::DeferredFileOverlap => "file-overlap",
         QueueDisposition::HostConstraint => "host-affinity",
-        QueueDisposition::HostClassRefused => "host-class",
         _ => return None,
     })
 }
@@ -66,7 +66,7 @@ pub fn wait(
     cap: Option<CapView>,
 ) -> Option<CapacityWait> {
     let gate = gate(row.disposition)?;
-    let queued = !matches!(gate, "host-affinity" | "host-class");
+    let queued = gate != "host-affinity";
     let rows = if queue.is_empty() { fallback } else { queue };
     let (position, total) = if queued {
         let (p, t) = position(rows, row);
@@ -113,7 +113,7 @@ pub fn advice(w: &CapacityWait) -> String {
         ("repo-cap", _) => {
             format!("Its repo is at `maxConcurrentPerRepo`: raise that cap, {rerank}.")
         }
-        ("host-affinity" | "host-class", _) => {
+        ("host-affinity", _) => {
             "This host may not run it: make sure a host that can is up and managing the repo, \
              or remove the host constraint."
                 .to_string()

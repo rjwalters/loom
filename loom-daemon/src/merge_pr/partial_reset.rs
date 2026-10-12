@@ -40,6 +40,9 @@
 
 use serde_json::Value;
 
+mod hold;
+pub use hold::{hold_from_json, parse_hold, reason_text, HELD_LABEL};
+
 /// The issue facts the retired function's three `jq` filters extracted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IssueView {
@@ -52,6 +55,9 @@ pub struct IssueView {
     /// Some line of `.labels[]?.name` is exactly `loom:building` (the shell's
     /// `grep -qx`).
     pub building: bool,
+    /// The body carries a `loom:remainder-hold` marker (#9264): `Some(reason)`
+    /// (`""` = unstated). Absent for a missing/null/non-string `body`.
+    pub hold: Option<String>,
 }
 
 /// `jq -r`'s rendering of one output value.
@@ -142,6 +148,7 @@ impl IssueView {
             is_pr: captured(&has) == "true",
             state: captured(&state),
             building: captured(&labels).split('\n').any(|l| l == "loom:building"),
+            hold: hold_from_json(body),
         }
     }
 }
@@ -158,8 +165,9 @@ pub enum Step {
     /// step runs, because a label swap on a still-closed issue returns
     /// nothing to any queue.
     Reopen,
-    /// `loom:building` -> `loom:issue`, plus the partial-increment comment.
-    Swap,
+    /// `loom:building` -> the carried label (`None` = `loom:issue`), plus the
+    /// partial-increment comment. `Some(HELD_LABEL)` is a held remainder (#9264).
+    Swap(Option<String>),
 }
 
 /// What the pre-merge `_check_partial_increment_close_conflict` guard
@@ -217,11 +225,21 @@ reopen it with: gh issue reopen {issue} --repo {repo}"
     // Read from the SAME pre-reopen body as the state, as the retired
     // function did: a reopen does not change the labels.
     if view.building {
-        steps.push(Step::Info(format!(
-            "Partial-increment reset: PR #{pr} merged as a partial slice of #{issue}; returning it \
-to the ready queue"
-        )));
-        steps.push(Step::Swap);
+        if let Some(reason) = &view.hold {
+            steps.push(Step::Info(format!(
+                "Partial-increment reset: PR #{pr} merged as a partial slice of #{issue}, but its \
+remainder is held for an operator ({}); applying {HELD_LABEL} instead of returning it to the ready \
+queue",
+                reason_text(reason)
+            )));
+            steps.push(Step::Swap(Some(HELD_LABEL.to_string())));
+        } else {
+            steps.push(Step::Info(format!(
+                "Partial-increment reset: PR #{pr} merged as a partial slice of #{issue}; \
+returning it to the ready queue"
+            )));
+            steps.push(Step::Swap(None));
+        }
     } else {
         steps.push(Step::Info(format!(
             "Partial-increment reset: issue #{issue} is not loom:building — skipping (idempotent)"
@@ -231,7 +249,7 @@ to the ready queue"
 }
 
 /// Render steps as the shell wrapper's line protocol: `INFO<TAB>text`,
-/// `WARNING<TAB>text`, or a bare `REOPEN` / `SWAP`.
+/// `WARNING<TAB>text`, a bare `REOPEN` / `SWAP`, or `SWAP<TAB>label` for a held remainder.
 ///
 /// A message spanning several lines (a multi-document `state`, say) is split
 /// with every line carrying the message's own level, so no continuation line
@@ -255,7 +273,12 @@ pub fn render(steps: &[Step]) -> String {
                 }
             }
             Step::Reopen => out.push_str("REOPEN\n"),
-            Step::Swap => out.push_str("SWAP\n"),
+            Step::Swap(None) => out.push_str("SWAP\n"),
+            Step::Swap(Some(label)) => {
+                out.push_str("SWAP\t");
+                out.push_str(label);
+                out.push('\n');
+            }
         }
     }
     out

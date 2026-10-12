@@ -1761,6 +1761,58 @@ if echo "$GH_PR_MERGE_SCAN_TEXT" | grep -qE 'gh\s+pr\s+merge'; then
 fi
 
 # =============================================================================
+# LOOM: Deny typed bypasses of the managed gh launcher (issue #9989, C6 of
+# epic #9983) — raw HTTP to the GitHub API host, `gh api` with an absolute
+# URL, GH_HOST / GH_CONFIG_DIR overrides, gh's hostname flag or api-host
+# config key, `gh auth login|setup-git|refresh`, gh under an emptied `env`,
+# a path-qualified gh other than the launcher, SDK installs/imports (full list
+# in guard.rs's `Bypass` enum, not repeated here). Classification, policy resolution and the
+# guards.forgeEgress / LOOM_GUARD_FORGE_EGRESS toggle all live in
+# `loom-daemon forge egress guard` (loom-daemon/src/forge_egress/guard.rs);
+# this block only passes it the same masked text the merge redirect scans and
+# denies on its exit-1 + `BLOCKED [routing.denied-by-guard]` answer. Inert
+# with no policy, an observe-only one, or no/older daemon (exit 2 = allow).
+# The bash regex is a fork-free prefilter so most commands never exec it; it
+# is also tried with quotes/backslashes stripped so g\h / g""h still reach it.
+# =============================================================================
+
+# requires-daemon: forge optional   a daemon without `forge egress guard` exits 2 on the unknown verb, which this block treats as allow (rule inert).
+FORGE_EGRESS_PREFILTER='(^|[^[:alnum:]_.-])gh([^[:alnum:]_.-]|$)|[Gg][Ii][Tt][Hh][Uu][Bb]|GH_(HOST|CONFIG_DIR)|[Oo][Cc][Tt][Oo]|(^|[^[:alnum:]_])env[[:space:]]+-'
+if [[ "$GH_PR_MERGE_SCAN_TEXT" =~ $FORGE_EGRESS_PREFILTER || "${GH_PR_MERGE_SCAN_TEXT//[\"\'\\]/}" =~ $FORGE_EGRESS_PREFILTER ]]; then
+    FORGE_EGRESS_RC=0
+    FORGE_EGRESS_DENY=$(cd "${REPO_ROOT:-${CWD:-.}}" 2>/dev/null && "${LOOM_DAEMON_SELF_BIN:-loom-daemon}" forge egress guard --for-command "$GH_PR_MERGE_SCAN_TEXT" 2>/dev/null) || FORGE_EGRESS_RC=$?
+    if [[ "$FORGE_EGRESS_RC" -eq 1 && "$FORGE_EGRESS_DENY" == "BLOCKED [routing.denied-by-guard]"* ]]; then
+        deny "$FORGE_EGRESS_DENY" "loom:forge-egress"
+    fi
+fi
+
+# =============================================================================
+# LOOM: Per-role tool restriction (issue #8256) — a role whose JSON declares
+# toolPolicy.allowedCapabilities cannot reach an undeclared sensitive
+# capability (ssh, cloud CLIs, gh secret, credential stores), however it was
+# persuaded to try. Matching and the allowlist live in `loom-daemon
+# role-tool-policy check`, read from THIS hook's own install (not the cwd, so a
+# PR checkout cannot grant itself a capability). Exit 0 allows, exit 1 +
+# prefix denies; any other answer (no binary, a daemon predating `check`)
+# fails CLOSED for the built-in read-only roles. guard-hooks.md has the rule.
+# =============================================================================
+
+# requires-daemon: role-tool-policy optional   #8256 — `check`; with no usable answer the built-in read-only roles are denied, every other role is allowed.
+if [[ -n "${LOOM_ROLE:-}" ]]; then
+    RTP_RC=0
+    # Only heredoc bodies and named text flags (--body/-m/…) are blanked here:
+    # the positional masking above also blanks quoted FILE operands, which would
+    # hide `grep x "$HOME/.ssh/id_rsa"` from the matcher. The matcher itself
+    # tells a grep/rg pattern from a path.
+    RTP_OUT=$("${LOOM_DAEMON_SELF_BIN:-loom-daemon}" role-tool-policy check --roles-dir "$SCRIPT_DIR/../roles" --workspace "$SCRIPT_DIR/../.." --command "$(mask_data_flag_values "$(mask_var_assigned_heredoc_bodies "$(mask_cat_heredoc_bodies "$COMMAND")")")" 2>/dev/null) || RTP_RC=$?
+    if [[ "$RTP_RC" -eq 1 && "$RTP_OUT" == "BLOCKED [role-tool-policy]"* ]]; then
+        deny "$RTP_OUT" "loom:role-tool-policy"
+    elif [[ "$RTP_RC" -ne 0 && " architect auditor champion curator guide hermit judge " == *" $(printf '%s' "$LOOM_ROLE" | tr '[:upper:]_' '[:lower:]-') "* ]]; then
+        deny "BLOCKED [role-tool-policy]: role '$LOOM_ROLE' is restricted, and loom-daemon role-tool-policy check could not answer (exit $RTP_RC), so this command is denied rather than allowed unchecked (#8256). Roll loom-daemon to a release with 'role-tool-policy check'." "loom:role-tool-policy"
+    fi
+fi
+
+# =============================================================================
 # LOOM: Block pip install -e inside worktrees (issue #2495, hardened by #4079)
 #
 # Editable pip installs overwrite a global .pth file in site-packages.

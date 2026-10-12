@@ -1,3 +1,4 @@
+use super::open_pr_listing::test_support::{pulls_arm, row};
 use chrono::Duration;
 use serial_test::serial;
 #[cfg(unix)]
@@ -1288,14 +1289,14 @@ fn write_fake_gh(
     let script = format!(
         r#"#!/usr/bin/env bash
 printf '%s\n' "$*" >> "{log}"
+if [[ "$*" == *'pulls?head='* ]]; then
+  # REST by-head read (#10382): no open linked PR by default (the
+  # Issue #4462 no-progress path treats `[]` as "no PR").
+  printf 'HTTP/2.0 200 OK\r\n\r\n'; echo '[]'; exit 0
+fi
 if [ "$1" = "api" ] && [[ "$*" != */comments* ]]; then
   printf 'HTTP/2.0 200 OK\r\n\r\n'
   echo '[{{"number":{issue_number},"state":"open","labels":[{{"name":"loom:building"}}],"updated_at":"{updated_at}"}}]'
-  exit 0
-fi
-if [ "$1" = "pr" ]; then
-  # `pr list --head feature/issue-N ...`: no open linked PR by default
-  # (the Issue #4462 no-progress path treats empty stdout as "no PR").
   exit 0
 fi
 exit 0
@@ -2200,20 +2201,20 @@ fn reconcile_workspace_no_fast_reclaim_when_open_pr_exists() {
 
     seed_checkpoint_phase(&repo_root, 82, "curator-done");
 
-    // Fake gh that reports an OPEN PR for `pr list` (so no_progress=false).
+    // Fake gh that reports an OPEN PR for the by-head read (so no_progress=false).
     let gh_log = dir.path().join("gh-invocations.log");
     let now = Utc::now().to_rfc3339();
     let fake_gh = dir.path().join("fake-gh-with-pr.sh");
     let script = format!(
         r#"#!/usr/bin/env bash
 printf '%s\n' "$*" >> "{log}"
+if [[ "$*" == *'pulls?head='* ]]; then
+  printf 'HTTP/2.0 200 OK\r\n\r\n'; echo '[{{"number":4242,"state":"open","head":{{"ref":"feature/issue-82"}}}}]'
+  exit 0
+fi
 if [ "$1" = "api" ] && [[ "$*" != */comments* ]]; then
   printf 'HTTP/2.0 200 OK\r\n\r\n'
   echo '[{{"number":82,"state":"open","labels":[{{"name":"loom:building"}}],"updated_at":"{now}"}}]'
-  exit 0
-fi
-if [ "$1" = "pr" ]; then
-  echo 4242
   exit 0
 fi
 exit 0
@@ -2930,7 +2931,7 @@ fn resolve_stale_treating_minutes_defaults_and_overrides() {
 /// Write a fake `gh` script (tests only) that logs every invocation to
 /// `gh_log`, reports exactly one PR carrying the requested claim label
 /// for `pr list`, and reports `extra_labels` (plus nothing else) for
-/// `pr view --json labels` -- letting a test control whether the
+/// the REST `pulls/{n}` read (#10507) -- letting a test control whether the
 /// safety-net `loom:review-requested` backfill should fire.
 fn write_fake_gh_pr(
     dir: &std::path::Path,
@@ -2949,17 +2950,16 @@ fn write_fake_gh_pr(
     let script = format!(
         r#"#!/usr/bin/env bash
 printf '%s\n' "$*" >> "{log}"
-if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
-  echo '[{{"number":{pr_number},"updatedAt":"{updated_at}","headRefName":"{head_ref_name}"}}]'
-  exit 0
-fi
-if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+{pulls}if [ "$*" = "api repos/{{owner}}/{{repo}}/pulls/{pr_number}" ]; then
   echo '{{"labels":[{labels_json}]}}'
   exit 0
 fi
 exit 0
 "#,
         log = gh_log.display(),
+        pulls = pulls_arm(&[row(pr_number, &["loom:reviewing"])
+            .head(head_ref_name)
+            .updated(updated_at)]),
     );
     std::fs::write(&fake_gh, &script).unwrap();
     #[cfg(unix)]
@@ -3335,12 +3335,10 @@ fn verdict_hold_labels_cover_every_parking_label() {
 
 #[test]
 fn decide_anchor_stamps_the_current_head_for_a_confirmed_unmarked_verdict() {
-    // The observed production case: an approving verdict with no marker.
+    // #9258: an unmarked APPROVAL is re-queued, never anchored to this head.
     assert_eq!(
         decide_anchor(&verdict_pr(VerdictKind::Approved, Some(SHA_B), None)),
-        AnchorAction::Anchor {
-            head_sha: SHA_B.to_string()
-        }
+        AnchorAction::RequeueApproval
     );
     assert_eq!(
         decide_anchor(&verdict_pr(VerdictKind::ChangesRequested, Some(SHA_A), None)),
@@ -3355,7 +3353,7 @@ fn decide_anchor_treats_an_empty_marker_as_unmarked() {
     // decide_verdict folds `Some("")` into Unverifiable; the anchoring
     // pass must agree, or an empty marker would be permanently stuck.
     assert_eq!(
-        decide_anchor(&verdict_pr(VerdictKind::Approved, Some(SHA_B), Some(""))),
+        decide_anchor(&verdict_pr(VerdictKind::ChangesRequested, Some(SHA_B), Some(""))),
         AnchorAction::Anchor {
             head_sha: SHA_B.to_string()
         }
@@ -3400,11 +3398,11 @@ fn decide_anchor_skips_when_the_comment_scan_failed() {
 #[test]
 fn decide_anchor_skips_without_a_resolvable_head_sha() {
     assert_eq!(
-        decide_anchor(&verdict_pr(VerdictKind::Approved, None, None)),
+        decide_anchor(&verdict_pr(VerdictKind::ChangesRequested, None, None)),
         AnchorAction::Skip(AnchorSkipReason::NoHeadSha)
     );
     assert_eq!(
-        decide_anchor(&verdict_pr(VerdictKind::Approved, Some(""), None)),
+        decide_anchor(&verdict_pr(VerdictKind::ChangesRequested, Some(""), None)),
         AnchorAction::Skip(AnchorSkipReason::NoHeadSha)
     );
 }
@@ -3471,19 +3469,15 @@ fn write_fake_gh_for_verdict_reconcile(
     let script = format!(
         r#"#!/usr/bin/env bash
 printf '%s\n' "$*" >> "{log}"
-if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
-  echo '[{{"number":192,"headRefOid":"{sha_b}","labels":[{{"name":"loom:pr"}},{{"name":"loom:changes-requested"}}]}}]'
-  exit 0
-fi
-if [ "$1" = "api" ]; then
+{pulls}if [ "$1" = "api" ]; then
   echo '[{{"user":{{"login":"loom-fleet-dispatch[bot]","type":"Bot"}},"author_association":"NONE","created_at":"2026-08-23T06:00:00Z","body":"Reviewed.\n\n<!-- loom:verdict-sha sha={sha_a} verdict=approved -->"}}]'
   exit 0
 fi
 exit 0
 "#,
         log = gh_log.display(),
+        pulls = pulls_arm(&[row(192, &["loom:pr", "loom:changes-requested"]).sha(SHA_B)]),
         sha_a = SHA_A,
-        sha_b = SHA_B,
     );
     std::fs::write(&fake_gh, &script).unwrap();
     #[cfg(unix)]

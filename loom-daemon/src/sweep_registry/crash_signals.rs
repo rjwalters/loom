@@ -96,7 +96,8 @@ pub(crate) fn parse_terminal_result_after(
     Some(TerminalResult {
         provider,
         account,
-        category: fields.get("category")?.parse().ok()?,
+        // A `session-exec` refusal in the same region names its own cause.
+        category: crate::session_exec::refusal::category_of(region, &fields)?,
         exit_code: fields.get("exit_code")?.parse().ok()?,
         model,
     })
@@ -1449,16 +1450,7 @@ mod tests {
         let lock = locks.join("issue-404");
         std::fs::create_dir(&lock).unwrap();
         let sweep_id = "sweep-issue-404-adopt";
-        let owner = LockOwner {
-            overflow: false,
-            pgid: None,
-            model: None,
-            effort: None,
-            issue: 404,
-            owner_pid: std::process::id(),
-            acquired_at: Utc::now().to_rfc3339(),
-            sweep_id: sweep_id.to_string(),
-        };
+        let owner = LockOwner::new(404, std::process::id(), sweep_id.to_string());
         std::fs::write(lock.join("owner.json"), serde_json::to_string_pretty(&owner).unwrap())
             .unwrap();
 

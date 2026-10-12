@@ -300,6 +300,23 @@ fn pgrep_blocks_a_dead_verdict_when_launchd_and_pidfile_are_negative() {
     assert_eq!(section.detail["declared_dead"], false);
 }
 
+/// #10110: once the pgrep fallback filters out session-exec workers and
+/// health/status probes, the assessor sees an empty set and, with IPC and
+/// install-state evidence negative, reports DEAD / `all-negative`.
+#[test]
+fn worker_only_candidates_filtered_to_empty_yield_all_negative_dead() {
+    let mut inputs = healthy_inputs();
+    inputs.status = None;
+    inputs.ipc_error = Some("connect failed".to_string());
+    inputs.install_state = Some(install_report(InstallState::NotExpected));
+    inputs.pgrep_pids = vec![];
+    let section = assess_liveness(&inputs);
+    assert_eq!(section.verdict, Verdict::Dead);
+    assert_eq!(section.detail["signal"], "all-negative");
+    assert_eq!(section.detail["install_state"], "not-expected");
+    assert_eq!(section.detail["declared_dead"], true);
+}
+
 /// An install-state classification of "alive but unresponsive" is DEGRADED,
 /// never DEAD — the daemon is running, it is just not answering. Uses a
 /// **non-timeout** IPC failure (`connect failed`) so this stays pinned to
@@ -1130,6 +1147,7 @@ fn tokens_degraded_when_a_registered_repos_own_ranking_is_stale_even_if_the_anch
     status.per_repo = vec![
         crate::types::RepoStatus {
             root: PathBuf::from("/repos/loom"),
+            maintain_only: None,
             priority: crate::workspace_registry::default_priority(),
             in_flight_count: 0,
             health_gate_halted: false,
@@ -1162,6 +1180,7 @@ fn tokens_degraded_when_a_registered_repos_own_ranking_is_stale_even_if_the_anch
         },
         crate::types::RepoStatus {
             root: PathBuf::from("/repos/anvil"),
+            maintain_only: None,
             priority: crate::workspace_registry::default_priority(),
             in_flight_count: 0,
             health_gate_halted: false,
@@ -1232,6 +1251,7 @@ fn tokens_per_repo_missing_ranking_counts_as_affected() {
     let status = inputs.status.as_mut().unwrap();
     status.per_repo = vec![crate::types::RepoStatus {
         root: PathBuf::from("/repos/never-bootstrapped"),
+        maintain_only: None,
         priority: crate::workspace_registry::default_priority(),
         in_flight_count: 0,
         health_gate_halted: false,
@@ -1669,6 +1689,7 @@ fn role_liveness_repo_with_intervals(
 ) -> crate::types::RepoStatus {
     crate::types::RepoStatus {
         root: PathBuf::from(root),
+        maintain_only: None,
         priority: crate::workspace_registry::default_priority(),
         in_flight_count: 0,
         health_gate_halted: false,
@@ -2130,6 +2151,7 @@ fn credential_preflight_ok() -> crate::types::CredentialPreflightReport {
         fingerprint: Some("rjwalters".to_string()),
         message: "authenticated as rjwalters via keyring".to_string(),
         checked_at: now(),
+        pool: None,
     }
 }
 

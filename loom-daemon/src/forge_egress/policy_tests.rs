@@ -130,6 +130,7 @@ fn resolution_precedence_env_then_machine_then_repo_then_none() {
         env_path: Some(env_path.clone()),
         machine_path: Some(machine_path.clone()),
         repo_path: Some(repo_path.clone()),
+        ..PolicySources::default()
     };
     let deployment = |s: &PolicySources| match resolve(s) {
         Resolution::Loaded(d) => {
@@ -153,6 +154,7 @@ fn resolution_precedence_env_then_machine_then_repo_then_none() {
         env_path: None,
         machine_path: Some(dir.path().join("absent.json")),
         repo_path: None,
+        ..PolicySources::default()
     };
     assert!(matches!(resolve(&none), Resolution::Unconfigured));
 }
@@ -168,6 +170,7 @@ fn machine_wins_and_the_repo_policy_is_reported_ignored() {
         env_path: None,
         machine_path: Some(write(dir.path(), "machine.json", &machine)),
         repo_path: Some(write(dir.path(), "repo.json", &weaker)),
+        ..PolicySources::default()
     };
     let Resolution::Loaded(doc) = resolve(&s) else {
         panic!()
@@ -204,6 +207,7 @@ fn a_machine_policy_that_cannot_be_stated_is_unreadable_not_absent() {
             env_path: None,
             machine_path: Some(machine_path.clone()),
             repo_path: Some(repo_path.clone()),
+            ..PolicySources::default()
         })
     });
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -237,6 +241,7 @@ fn an_unreadable_winner_never_falls_through() {
         env_path: Some(broken),
         machine_path: None,
         repo_path: Some(write(dir.path(), "repo.json", &example())),
+        ..PolicySources::default()
     };
     let Resolution::Unreadable {
         candidate,
@@ -267,4 +272,39 @@ fn repo_policy_path_reads_forge_egress_policy_path_relative_to_the_root() {
     )
     .unwrap();
     assert_eq!(repo_policy_path(root.path()), Some(root.path().join("ops/egress.json")));
+}
+
+#[test]
+fn the_deployment_path_is_a_machine_candidate_after_the_loom_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut dep = example();
+    dep["deployment"] = json!("2am");
+    let dep_path = write(dir.path(), "dep.json", &dep);
+    let only_dep = PolicySources {
+        machine_path: Some(dir.path().join("absent.json")),
+        deployment_path: Some(dep_path.clone()),
+        ..PolicySources::default()
+    };
+    match resolve(&only_dep) {
+        Resolution::Loaded(d) => {
+            assert_eq!(d.origin, Origin::Machine);
+            assert_eq!(d.path, dep_path);
+        }
+        other => panic!("{other:?}"),
+    }
+    let mut loom = example();
+    loom["deployment"] = json!("loom");
+    let loom_path = write(dir.path(), "loom.json", &loom);
+    let both = PolicySources {
+        machine_path: Some(loom_path.clone()),
+        deployment_path: Some(dep_path),
+        ..PolicySources::default()
+    };
+    match resolve(&both) {
+        Resolution::Loaded(d) => {
+            assert_eq!(d.path, loom_path);
+            assert_eq!(d.ignored.len(), 1);
+        }
+        other => panic!("{other:?}"),
+    }
 }

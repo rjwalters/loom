@@ -6,8 +6,7 @@
 //! The only signal was per-issue "no progress" comments blaming the work
 //! finder. Neither condition is an issue's problem, so neither belongs in a
 //! per-issue comment: each is one host-level [`Condition`], de-duplicated and
-//! delivered by the fleet-alert state machine and sinks (the event bus and,
-//! independently of Safehouse, the loom-ui inbox).
+//! delivered by the fleet-alert state machine and sinks (the event bus).
 
 use super::Condition;
 use crate::star_liveness::queue::waiting_star;
@@ -48,7 +47,8 @@ pub fn conditions(tick: &WorkFinderTickSummary) -> Vec<Condition> {
             String::new()
         };
         out.push(Condition {
-            key: KEY_CAPACITY_LIMITED,
+            key: KEY_CAPACITY_LIMITED.to_string(),
+            critical: false,
             headline: format!(
                 "{what} is capping concurrency at {effective}, below the configured {}{stars_part}.",
                 cap.configured
@@ -58,16 +58,13 @@ pub fn conditions(tick: &WorkFinderTickSummary) -> Vec<Condition> {
     }
 
     if waiting > STAR_BACKLOG_FACTOR.saturating_mul(effective.max(1)) {
-        let oldest = stars.first().map_or_else(String::new, |r| {
-            let at = r
-                .operator_priority_at
-                .as_deref()
-                .map_or_else(String::new, |t| format!(", starred {t}"));
-            format!(" The oldest is #{} in {}{at}.", r.issue, r.repo)
-        });
+        let oldest = stars
+            .first()
+            .map_or_else(String::new, |r| format!(" The oldest is #{} in {}.", r.issue, r.repo));
         let rounds = waiting.div_ceil(effective.max(1));
         out.push(Condition {
-            key: KEY_STAR_BACKLOG,
+            key: KEY_STAR_BACKLOG.to_string(),
+            critical: false,
             headline: format!(
                 "{waiting} starred issues are waiting for {effective} slot(s) on this host, more \
                  than {STAR_BACKLOG_FACTOR}x the cap: a new star is now position {} in a FIFO \

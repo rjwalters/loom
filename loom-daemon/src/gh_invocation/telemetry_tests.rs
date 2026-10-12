@@ -255,17 +255,172 @@ fn ambient_parsing_rejects_garbage_and_never_reads_third_party_traceparent() {
 
 #[test]
 fn every_span_attribute_survives_export_bounding() {
-    let inv = read_op();
+    // A write inside a caller scope, so the #10752 keys (`github.caller`,
+    // `github.number`, `github.repo`) are set too.
+    let _scope = super::super::caller_scope::enter("stale_blocked_release");
+    let inv = GhInvocation::new(
+        Operation::new("api.rest"),
+        AccessIntent::Write,
+        GhTarget::repo("acme/widgets").unwrap(),
+        Duration::from_secs(10),
+    )
+    .parent(ParentContext::Missing)
+    .args([
+        "api",
+        "-X",
+        "DELETE",
+        "repos/acme/widgets/issues/42/labels/loom%3Ablocked",
+    ]);
+    let billing = super::super::billing::Billing::not_sent(
+        "graphql",
+        &super::super::accounting::cred_of_with(None, false),
+        "writer",
+    )
+    .with_repo(Some("acme/widgets"));
     let span = InvocationSpan::open(&inv).record(
         &inv,
         GhBinSource::Policy,
         Outcome::ExitNonzero,
         Some(4),
         Utc::now(),
+        &billing,
     );
     let bounded = span.clone().bounded();
     for key in SPAN_ATTRIBUTE_KEYS {
         assert_eq!(bounded.attributes.get(*key), span.attributes.get(*key), "{key}");
         assert!(span.attributes.contains_key(*key), "record() never sets {key}");
     }
+}
+
+#[test]
+fn spans_carry_github_api_kind() {
+    let rest = read_op().args(["api", "repos/acme/widgets/issues"]);
+    let gql = read_op().args(["api", "graphql", "-f", "query=x"]);
+    let porcelain = read_op().args(["pr", "list"]);
+    let run_list = read_op().args(["run", "list"]);
+    // #10344 review: REST porcelain that was mislabelled `graphql`.
+    let latest_release = read_op().args(["release", "view", "--json", "tagName"]);
+    let search = read_op().args(["search", "prs", "is:open"]);
+    let tagged_release = read_op().args(["release", "view", "v1.0.0"]);
+    for (inv, want) in [
+        (rest, "rest"),
+        (gql, "graphql"),
+        (porcelain, "graphql"),
+        (run_list, "rest"),
+        (latest_release, "rest"),
+        (search, "rest"),
+        (tagged_release, "mixed"),
+    ] {
+        let (_, spans, _) = run(inv, "echo ok");
+        assert_eq!(attr(&spans[0], "github.api"), Some(want));
+    }
+}
+
+/// #10343: every span carries the nine billing keys; a `--include` 304 (gh
+/// exits non-zero on it) is billed `not_modified` while `github.outcome`
+/// keeps its process truth.
+#[test]
+fn a_304_span_is_billed_not_modified_with_process_truth_unchanged() {
+    let inv = read_op().args(["api", "--include", "repos/acme/widgets/issues"]);
+    let body =
+        "printf 'HTTP/2.0 304 Not Modified\\r\\nX-Ratelimit-Resource: core\\r\\n\\r\\n'; exit 1";
+    let (_, spans, _) = run(inv, body);
+    let span = &spans[0];
+    assert_eq!(attr(span, "github.outcome"), Some("exit_nonzero"));
+    assert_eq!(attr(span, "github.billing"), Some("not_modified"));
+    assert_eq!(attr(span, "github.http.status"), Some("304"));
+    assert_eq!(attr(span, "github.http.not_modified"), Some("true"));
+    assert_eq!(attr(span, "github.http.source"), Some("headers"));
+    assert_eq!(attr(span, "github.http.requests"), Some("1"));
+    assert_eq!(attr(span, "github.resource"), Some("core"));
+    for key in [
+        "github.http.status",
+        "github.http.not_modified",
+        "github.http.requests",
+        "github.http.source",
+        "github.billing",
+        "github.resource",
+        "github.account",
+        "github.cred_owner",
+        "github.role",
+    ] {
+        assert!(SPAN_ATTRIBUTE_KEYS.contains(&key), "{key} not allowlisted");
+        assert!(span.attributes.contains_key(key), "span lacks {key}");
+    }
+}
+
+#[test]
+fn a_span_without_http_evidence_records_unknown_never_a_guess() {
+    let (_, spans, _) = run(read_op().args(["issue", "list"]), "echo boom >&2; exit 1");
+    let span = &spans[0];
+    assert_eq!(attr(span, "github.http.status"), Some("unknown"));
+    assert_eq!(attr(span, "github.http.not_modified"), Some("unknown"));
+    assert_eq!(attr(span, "github.http.requests"), Some("unknown"));
+    assert_eq!(attr(span, "github.http.source"), Some("none"));
+    assert_eq!(attr(span, "github.billing"), Some("error"));
+    assert_eq!(attr(span, "github.resource"), Some("graphql"));
+
+    let (_, spans, _) = run(
+        read_op().args(["pr", "view", "9"]),
+        "echo 'gh: Not Found (HTTP 404)' >&2; exit 1",
+    );
+    assert_eq!(attr(&spans[0], "github.http.status"), Some("404"));
+    assert_eq!(attr(&spans[0], "github.http.source"), Some("stderr"));
+    assert_eq!(attr(&spans[0], "github.http.not_modified"), Some("false"));
+}
+
+#[test]
+fn a_spawn_failure_span_is_billed_not_sent_with_zero_requests() {
+    let inv = read_op().args(["api", "repos/acme/widgets"]);
+    let (result, captured) =
+        capture(|| inv.execute_with("/nonexistent/gh-10343", GhBinSource::EnvOverride));
+    assert!(result.is_err());
+    let span = &captured.spans[0];
+    assert_eq!(attr(span, "github.outcome"), Some("spawn_failed"));
+    assert_eq!(attr(span, "github.billing"), Some("not_sent"));
+    assert_eq!(attr(span, "github.http.requests"), Some("0"));
+    assert_eq!(attr(span, "github.http.status"), Some("unknown"));
+}
+
+/// #11407: the endpoint is a template from a finite table; the raw path,
+/// its owner, repo, number and query never reach the span.
+#[test]
+fn spans_name_the_endpoint_as_a_template_never_the_raw_path() {
+    let inv = read_op().args([
+        "api",
+        "--include",
+        "repos/acme/widgets/pulls/4242/reviews?per_page=100",
+    ]);
+    let (_, spans, _) = run(inv, "echo ok");
+    let span = &spans[0];
+    assert_eq!(attr(span, "github.route"), Some("/repos/{owner}/{repo}/pulls/{n}/reviews"));
+    assert_eq!(attr(span, "http.request.method"), Some("GET"));
+    assert_eq!(attr(span, "github.command"), Some("api"));
+    for key in ["github.route", "github.command", "http.request.method"] {
+        let value = attr(span, key).unwrap();
+        for raw in ["acme", "widgets", "4242", "per_page"] {
+            assert!(!value.contains(raw), "{key}={value} carries {raw}");
+        }
+    }
+
+    let (_, spans, _) = run(read_op().args(["pr", "list", "--json", "number"]), "echo ok");
+    assert_eq!(attr(&spans[0], "github.route"), Some("(porcelain)"));
+    assert_eq!(attr(&spans[0], "github.command"), Some("pr list"));
+    assert_eq!(attr(&spans[0], "http.request.method"), None);
+}
+
+/// #11407: in the agent `gh` front, the facade's `gh api` read is booked to
+/// the agent's own command, so `pr view --json statusCheckRollup` polling
+/// (#10629) is measurable by command and route.
+#[test]
+fn a_front_read_carries_the_agents_command_and_its_own_route() {
+    super::super::route::set_front_command(
+        &["pr", "view", "9", "--json", "statusCheckRollup"].map(String::from),
+    );
+    let inv = read_op().args(["api", "--include", "repos/acme/widgets/pulls/9"]);
+    let (_, spans, _) = run(inv, "echo ok");
+    super::super::route::clear_test_front_command();
+    assert_eq!(attr(&spans[0], "github.command"), Some("pr view"));
+    assert_eq!(attr(&spans[0], "github.route"), Some("/repos/{owner}/{repo}/pulls/{n}"));
+    assert_eq!(attr(&spans[0], "http.request.method"), Some("GET"));
 }

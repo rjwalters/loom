@@ -106,6 +106,19 @@ pub enum TerminalClassification {
     /// so it neither clears a hold nor stamps `last_success`. The runtime-level
     /// fall-through lives in `runtime_preference::sandbox_hold`.
     SandboxUnavailable,
+    /// The account's Codex session container was not running when the tick
+    /// tried to dispatch into it (#10455). Produced by `spawn-codex.sh`. Like
+    /// `SandboxUnavailable` it records **no** account hold and is not a
+    /// success: the account's credentials are fine, the container is down.
+    SessionDown,
+    /// The account's Codex session container was running but did not mount
+    /// the tick's working directory (#10364): a repository registered after
+    /// the container was created. Announced by `session-exec host`'s
+    /// pre-exec mount check and applied by the terminal-record parser
+    /// (`session_exec::refusal`), never written by the adapter script. Like
+    /// `SessionDown` it records **no** account hold and is not a success: the
+    /// container is stale, the account is fine.
+    SessionMountStale,
 }
 
 impl std::str::FromStr for TerminalClassification {
@@ -124,6 +137,8 @@ impl std::str::FromStr for TerminalClassification {
             "MODEL_REFUSAL" => Self::ModelRefusal,
             "SESSION_LIMIT" => Self::SessionLimit,
             "SANDBOX_UNAVAILABLE" => Self::SandboxUnavailable,
+            "SESSION_DOWN" => Self::SessionDown,
+            "SESSION_MOUNT_STALE" => Self::SessionMountStale,
             other => bail!("unknown terminal classification {other:?}"),
         })
     }
@@ -647,6 +662,8 @@ pub fn record_terminal_for_class_with_reset_at(
                 | TerminalClassification::CwdDeleted
                 | TerminalClassification::ModelRefusal
                 | TerminalClassification::SandboxUnavailable
+                | TerminalClassification::SessionDown
+                | TerminalClassification::SessionMountStale
         ) {
             return Ok(());
         }
@@ -756,7 +773,9 @@ pub fn record_terminal_for_class_with_reset_at(
             | TerminalClassification::Fatal
             | TerminalClassification::CwdDeleted
             | TerminalClassification::ModelRefusal
-            | TerminalClassification::SandboxUnavailable => unreachable!(),
+            | TerminalClassification::SandboxUnavailable
+            | TerminalClassification::SessionDown
+            | TerminalClassification::SessionMountStale => unreachable!(),
         }
         state.accounts.push(entry);
         state

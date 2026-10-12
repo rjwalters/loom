@@ -112,6 +112,15 @@ fn main() {
             std::env::var("LOOM_TEST_HARNESS_SECRET").ok().as_deref() == Some(expected.as_str())
         );
     }
+    // #9473: a gateway-routed guarded Pi launch overrides its provider in a
+    // per-launch `models.json` inside Loom's private agent directory.
+    if std::env::var_os("FIXTURE_PRINT_PI_MODELS").is_some() {
+        let models = std::env::var_os("PI_CODING_AGENT_DIR")
+            .map(|dir| std::path::PathBuf::from(dir).join("models.json"))
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .unwrap_or_default();
+        println!("pi_models={}", models.trim());
+    }
     if std::env::var("FIXTURE_NATIVE_CONFIG").is_ok() {
         println!("native_config={}", std::env::var("OPENCODE_CONFIG_CONTENT").unwrap());
         println!(

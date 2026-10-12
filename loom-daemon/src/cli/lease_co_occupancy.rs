@@ -175,6 +175,7 @@ pub(crate) fn read_rows(
         GhTarget::None,
         timeout,
     )
+    .forge_op(loom_daemon::forge_call_stats::ops::COMMENT_LIST)
     .program(gh_bin)
     .arg("api")
     .arg(format!("repos/{{owner}}/{{repo}}/issues/{issue}/comments"))

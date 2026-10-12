@@ -2,6 +2,7 @@
 
 #![allow(clippy::unwrap_used)]
 
+use super::sink::sink_file;
 use super::*;
 use crate::forge_listing::parse_http_response;
 
@@ -18,6 +19,10 @@ fn line(t: i64, caller: &str, p: Pool, o: Outcome, rem: Option<u64>) -> String {
         pv: None,
         og: None,
         rp: None,
+        ir: None,
+        ib: None,
+        at: CallAttribution::default(),
+        ag: agent::AgentStamp::default(),
     })
     .unwrap()
 }
@@ -41,6 +46,10 @@ fn id_line(t: i64, caller: &str, o: Outcome, identity: &CallIdentity) -> String 
         pv: identity.provider.clone(),
         og: identity.origin.clone(),
         rp: identity.repo.clone(),
+        ir: identity.role.clone(),
+        ib: identity.bucket.clone(),
+        at: CallAttribution::default(),
+        ag: agent::AgentStamp::default(),
     })
     .unwrap()
 }
@@ -110,6 +119,33 @@ fn outcome_classification() {
     assert_eq!(classify(None, false, "gh: Not Found (HTTP 404)").1, Outcome::Error);
 }
 
+/// #11418: a secondary limit is its own outcome, never the primary pool's
+/// `rate_limited`, by the same test `forge_denial` applies.
+#[test]
+fn a_secondary_limit_is_classified_apart_from_primary_exhaustion() {
+    let retry = parse_http_response("HTTP/2.0 403 Forbidden\r\nRetry-After: 60\r\n\r\n{}");
+    let worded = parse_http_response(
+        "HTTP/2.0 403 Forbidden\r\n\r\n{\"message\":\"You have exceeded a secondary rate limit.\"}",
+    );
+    let throttled = parse_http_response("HTTP/2.0 429 Too Many\r\nRetry-After: 30\r\n\r\n");
+    let exhausted =
+        parse_http_response("HTTP/2.0 403 Forbidden\r\nX-Ratelimit-Remaining: 0\r\n\r\n{}");
+    for r in [&retry, &worded, &throttled] {
+        assert_eq!(classify(r.as_ref(), false, "").1, Outcome::SecondaryLimited);
+    }
+    assert_eq!(classify(exhausted.as_ref(), false, "").1, Outcome::RateLimited);
+    assert_eq!(
+        classify(None, false, "gh: You have exceeded a secondary rate limit (HTTP 403)").1,
+        Outcome::SecondaryLimited
+    );
+    let wire = serde_json::to_string(&Outcome::SecondaryLimited).unwrap();
+    assert_eq!(wire, "\"secondary_limited\"");
+    assert_eq!(
+        crate::gh_invocation::billing::BillingClass::from(Outcome::SecondaryLimited).as_str(),
+        "secondary_limited"
+    );
+}
+
 // ===== rolling window with an injected clock =====
 
 #[test]
@@ -177,6 +213,8 @@ fn sink_round_trips_prunes_old_hours_and_feeds_status() {
         remaining: Some(4321),
         used: Some(679),
         reset_epoch: Some(now + 900),
+        limit: None,
+        retry_after_secs: None,
     };
     record("test_sink_caller", Pool::Core, Outcome::NotModified, Some(&headers));
     record("test_sink_caller", Pool::Core, Outcome::Ok, None);
@@ -239,6 +277,88 @@ fn a_newer_breaker_probe_overrides_an_older_header_reading() {
     assert_eq!((core.remaining, core.observed_at), (7, probed_at));
     // The probe's pool-wide spend rides along (#9855).
     assert_eq!((core.used, gql.used), (Some(4993), Some(4992)));
+}
+
+#[test]
+fn readings_of_two_reader_buckets_with_one_role_stay_separate() {
+    let with_bucket = |t: i64, role: &str, bucket: Option<&str>, rem: u64| {
+        let mut l: SinkLine =
+            serde_json::from_str(&line(t, "c", Pool::Core, Outcome::Ok, Some(rem))).unwrap();
+        l.ir = Some(role.to_string());
+        l.ib = bucket.map(str::to_string);
+        l
+    };
+    let mut agg = Aggregate::default();
+    // Reader A exhausted; reader B (same `reader` role) answers more recently
+    // with budget left; the writer's fallback read and an unattributed line
+    // name no bucket.
+    agg.add(&with_bucket(100, "reader", Some("reader:1@org"), 0));
+    agg.add(&with_bucket(200, "reader", Some("reader:2@org"), 4000));
+    agg.add(&with_bucket(250, "writer-fallback", None, 3000));
+    agg.add(&with_bucket(300, "writer", None, 4999));
+    let a = agg.latest_by_bucket[&(Pool::Core, "reader:1@org".to_string())];
+    let b = agg.latest_by_bucket[&(Pool::Core, "reader:2@org".to_string())];
+    assert_eq!((a.remaining, b.remaining), (0, 4000));
+    // A writer line naming no owner (no credential owner, no repo) lands in
+    // no bucket (#10334); the pool-wide reading is still the newest.
+    assert_eq!(agg.latest_by_bucket.len(), 2);
+    assert_eq!(agg.latest[&Pool::Core].remaining, 4999);
+    // An unattributed line (no role, no bucket) lands in no bucket.
+    let mut unattributed = with_bucket(400, "x", None, 1);
+    unattributed.ir = None;
+    agg.add(&unattributed);
+    assert_eq!(agg.latest_by_bucket.len(), 2);
+}
+
+/// #10334 (Judge P2): one writer per managed owner. Owner A's writer is
+/// exhausted; owner B's writer answers later with budget left. Each lands
+/// under its own `writer@<owner>` bucket, so B's healthy reading never
+/// overwrites A's exhausted one; the writer fallback lands under the same
+/// owner's writer; and no bucket label is credential-shaped.
+#[test]
+fn two_owners_writers_keep_separate_buckets() {
+    let writer = |t: i64, role: &str, co: Option<&str>, rp: Option<&str>, rem: u64| {
+        let mut l: SinkLine =
+            serde_json::from_str(&line(t, "c", Pool::Core, Outcome::Ok, Some(rem))).unwrap();
+        l.ir = Some(role.to_string());
+        l.ib = None;
+        l.at.co = co.map(str::to_string);
+        l.rp = rp.map(str::to_string);
+        l
+    };
+    let mut agg = Aggregate::default();
+    agg.add(&writer(100, "writer", Some("org-a"), Some("org-a/x"), 0));
+    agg.add(&writer(200, "writer", Some("org-b"), Some("org-b/y"), 4000));
+    let key = |owner: &str| (Pool::Core, crate::forge_identity::writer_bucket(owner).unwrap());
+    assert_eq!(agg.latest_by_bucket[&key("org-a")].remaining, 0);
+    assert_eq!(agg.latest_by_bucket[&key("org-b")].remaining, 4000);
+    // The pool-wide reading still collapses identities (B's, the newest).
+    assert_eq!(agg.latest[&Pool::Core].remaining, 4000);
+
+    // A writer line with no credential owner is booked under its repo's
+    // owner; a writer-fallback resolves to that same owner's writer.
+    agg.add(&writer(300, "writer-fallback", None, Some("Org-A/x"), 1));
+    assert_eq!(agg.latest_by_bucket[&key("org-a")].remaining, 1);
+    assert_eq!(agg.latest_by_bucket[&key("org-b")].remaining, 4000);
+    assert_eq!(agg.latest_by_bucket.len(), 2);
+
+    // A credential-shaped "owner" never becomes a label.
+    agg.add(&writer(400, "writer", Some("ghp_abcdef123456"), None, 9));
+    assert_eq!(agg.latest_by_bucket.len(), 2);
+    for (_, label) in agg.latest_by_bucket.keys() {
+        assert!(label.starts_with(crate::forge_identity::WRITER_BUCKET_PREFIX), "{label}");
+        for shape in [
+            "ghp_",
+            "gho_",
+            "ghs_",
+            "ghu_",
+            "github_pat_",
+            "Bearer ",
+            "-----BEGIN",
+        ] {
+            assert!(!label.contains(shape), "{label}");
+        }
+    }
 }
 
 // ===== #9777 call identity =====
@@ -368,4 +488,30 @@ fn quota_rate_limit_reading() {
             .as_deref(),
         Some("gitea.example.com")
     );
+}
+
+/// #10210: only a pool read at zero whose reset is still ahead (or, with no
+/// reset, whose reading is fresh) is an exhausted pool.
+#[test]
+fn exhausted_in_keeps_only_live_zero_readings() {
+    let now = 1_000_000;
+    let reading = |remaining, reset_epoch, observed_at| Reading {
+        remaining,
+        used: None,
+        reset_epoch,
+        observed_at,
+    };
+    let mut latest = BTreeMap::new();
+    latest.insert(Pool::Core, reading(0, Some(now + 600), now - 10));
+    latest.insert(Pool::Graphql, reading(0, Some(now - 1), now - 10));
+    latest.insert(Pool::Search, reading(5, Some(now + 600), now - 10));
+    latest.insert(Pool::Other, reading(0, None, now - 10));
+    let exhausted = exhausted_in(&latest, now);
+    assert_eq!(
+        exhausted,
+        vec![(Pool::Core, epoch(now + 600)), (Pool::Other, None)],
+        "graphql already reset; search has budget"
+    );
+    latest.insert(Pool::Other, reading(0, None, now - WINDOW_SECS - 1));
+    assert_eq!(exhausted_in(&latest, now).len(), 1, "a stale unreset reading is no stall");
 }

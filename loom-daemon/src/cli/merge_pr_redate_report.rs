@@ -2,9 +2,11 @@
 //! which paths forced the #8508 re-dates, from the trailers `redate-checks`
 //! writes into each re-date commit's body.
 //!
-//! Read-only: one local `git log`, no fetch, no forge call, no write. See
+//! Read-only: local `git log` only, no fetch, no forge call, no write. See
 //! `loom_daemon::merge_pr::redate::report` for what is counted and why `main`
-//! is a sufficient source on a merge-commit repo.
+//! is a sufficient source on a merge-commit repo. The per-PR rows (#10163,
+//! `chains` in `--json`) come from `redate::chain_telemetry`, which also reads
+//! remote-tracking PR branches so a PR that has not landed still shows.
 //!
 //! | outcome | stdout | exit |
 //! |---|---|---|
@@ -12,6 +14,7 @@
 //! | bad `--since`, or `git log` failed | reason on stderr | 1 |
 
 use anyhow::{anyhow, Result};
+use loom_daemon::merge_pr::redate::chain_telemetry;
 use loom_daemon::merge_pr::redate::report::{
     aggregate, count_other_redates, parse_log, render_text, run_git_log,
 };
@@ -42,8 +45,14 @@ impl RedateReportArgs {
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_default();
         let raw = run_git_log(&dir, &self.git_ref, since).map_err(|e| anyhow!(e))?;
-        let report =
+        let mut report =
             aggregate(&parse_log(&raw), count_other_redates(&raw), &self.git_ref, &since_str);
+        // Per-PR re-date counts and time-to-land (#10163). Best effort: a
+        // failure here leaves the per-check report intact.
+        // Reads remote-tracking PR branches too, so an unlanded PR shows.
+        if let Ok(chains) = chain_telemetry::collect(&dir, &self.git_ref, since) {
+            report.chains = chains;
+        }
         if self.json {
             println!("{}", serde_json::to_string_pretty(&report)?);
         } else {

@@ -25,6 +25,31 @@ fn first_sync_fetches_only_contract_files_and_records_the_commit() {
 }
 
 #[test]
+fn fleet_json_is_fetched_when_present_and_its_absence_is_not_an_error() {
+    // #10711: `fleet.json` joined the contract additively. A store without it
+    // (every store today) fetches exactly the files it did before.
+    let forge = FakeForge::new(sample_files());
+    let dir = tempfile::tempdir().unwrap();
+    let (snap, _) = sync(&forge, dir.path(), &location(), t0()).unwrap();
+    assert_eq!(snap.text(crate::fleet_store::FLEET_JSON_PATH).unwrap(), None);
+    assert_eq!(forge.blob_fetches(), 6, "the other contract files are unchanged");
+
+    let mut files = sample_files();
+    files.insert("fleet.json".to_string(), r#"{"loom_min_version":"0.19.830"}"#.to_string());
+    let forge = FakeForge::new(files);
+    let dir = tempfile::tempdir().unwrap();
+    let (snap, _) = sync(&forge, dir.path(), &location(), t0()).unwrap();
+    assert_eq!(
+        snap.text(crate::fleet_store::FLEET_JSON_PATH)
+            .unwrap()
+            .as_deref(),
+        Some(r#"{"loom_min_version":"0.19.830"}"#)
+    );
+    assert!(snap.files.contains_key("repos.yml"));
+    assert_eq!(forge.blob_fetches(), 7);
+}
+
+#[test]
 fn unchanged_store_is_one_conditional_request_answered_304() {
     let forge = FakeForge::new(sample_files());
     let dir = tempfile::tempdir().unwrap();

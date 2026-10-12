@@ -68,11 +68,31 @@ pub fn regex_escape(literal: &str) -> String {
 /// release assets themselves.
 #[must_use]
 pub fn identity_regexp(repo_slug: &str, tag: &str) -> Option<String> {
+    identity_regexp_pinned(repo_slug, tag, None)
+}
+
+/// [`identity_regexp`] with an optional approved-workflow pin (#10470).
+///
+/// `approved_workflow` is the workflow path inside `.github/workflows/`
+/// (e.g. `release.yml`). `None` or empty keeps the unpinned `[^@]+` default.
+/// When set, the path is embedded through [`regex_escape`], so it can only
+/// ever match literally -- and a workflow rename then needs an explicit
+/// policy update, which is the point of the pin.
+#[must_use]
+pub fn identity_regexp_pinned(
+    repo_slug: &str,
+    tag: &str,
+    approved_workflow: Option<&str>,
+) -> Option<String> {
     if repo_slug.is_empty() || tag.is_empty() {
         return None;
     }
+    let workflow = match approved_workflow.map(str::trim).filter(|w| !w.is_empty()) {
+        Some(w) => regex_escape(w.trim_start_matches('/')),
+        None => "[^@]+".to_string(),
+    };
     Some(format!(
-        r"^https://github\.com/{}/\.github/workflows/[^@]+@refs/tags/{}$",
+        r"^https://github\.com/{}/\.github/workflows/{workflow}@refs/tags/{}$",
         regex_escape(repo_slug),
         regex_escape(tag)
     ))

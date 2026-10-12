@@ -13,6 +13,11 @@ pub struct LoomMetadata {
     pub commit: Option<String>,
     /// Installation date (generated at runtime)
     pub install_date: String,
+    /// The oldest daemon the installed files work with (#10716), recorded as
+    /// `requires_daemon` in `install-metadata.json`: this binary's
+    /// `install_compat::REQUIRES_DAEMON`. (`scripts/install-loom.sh`, which
+    /// rewrites the file afterwards, reads the source tree's value instead.)
+    pub requires_daemon: Option<String>,
 }
 
 impl LoomMetadata {
@@ -33,6 +38,7 @@ impl LoomMetadata {
             version: env_or_compiled("LOOM_VERSION", env!("CARGO_PKG_VERSION")),
             commit: env_or_compiled("LOOM_COMMIT", crate::self_update::BUILT_COMMIT),
             install_date: Local::now().format("%Y-%m-%d").to_string(),
+            requires_daemon: Some(crate::install_compat::REQUIRES_DAEMON.to_string()),
         }
     }
 }
@@ -124,6 +130,26 @@ pub fn localize_dotloom_doc_links(content: &str) -> String {
         .replace("](.github/", "](../.github/")
 }
 
+/// Render a `.loom/`-nested guide (`.loom/CLAUDE.md`, `.loom/AGENTS.md`)
+/// from its template: substitute the variables, then re-base the links for
+/// the destination's depth. The one rendering `init` and the daemon resync
+/// (`payload::surfaces`, #10895) share, so a resync that re-renders an
+/// unchanged template with the recorded install date reproduces the installed
+/// file byte for byte.
+pub fn render_dotloom_guide(
+    template: &str,
+    repo_owner: Option<&str>,
+    repo_name: Option<&str>,
+    loom_metadata: &LoomMetadata,
+) -> String {
+    localize_dotloom_doc_links(&substitute_template_variables(
+        template,
+        repo_owner,
+        repo_name,
+        loom_metadata,
+    ))
+}
+
 /// Template variable placeholders that must be substituted before a file is written.
 ///
 /// Used by [`assert_no_placeholders`] to fail-fast if a templated file is about to be
@@ -183,6 +209,7 @@ mod tests {
             version: Some("1.2.3".to_string()),
             commit: Some("abc1234".to_string()),
             install_date: "2024-01-15".to_string(),
+            requires_daemon: None,
         };
 
         let result =
@@ -198,6 +225,7 @@ mod tests {
             version: None,
             commit: None,
             install_date: "2024-01-15".to_string(),
+            requires_daemon: None,
         };
 
         let result_fallback = substitute_template_variables(content, None, None, &metadata_empty);

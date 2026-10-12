@@ -4,7 +4,6 @@ use anyhow::Result;
 use serde::Deserialize;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
 
 use loom_daemon::sweep_registry;
 use loom_daemon::types::{Request, Response, SweepKind};
@@ -16,6 +15,7 @@ use super::common::{query_daemon_bounded, resolve_dispatch_ack_timeout, resolve_
 /// (`--workspace`/`--model`/`--effort`/`--depends-on`) is unit-testable without
 /// a socket. Mirrors the field mapping the `mcp__loom__dispatch_sweep` tool uses
 /// so both operator surfaces enqueue byte-for-byte-equivalent requests.
+#[cfg(test)]
 fn build_dispatch_request(
     issue: u32,
     workspace: Option<String>,
@@ -23,6 +23,22 @@ fn build_dispatch_request(
     effort: Option<String>,
     depends_on: Option<u32>,
     force: bool,
+) -> Request {
+    build_dispatch_request_with_tap(issue, workspace, model, effort, depends_on, force, None, None)
+}
+
+/// [`build_dispatch_request`] plus the optional per-dispatch `runtime` /
+/// `modelProfile` tap for the Builder and Doctor phases (#11284).
+#[allow(clippy::too_many_arguments)]
+fn build_dispatch_request_with_tap(
+    issue: u32,
+    workspace: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+    depends_on: Option<u32>,
+    force: bool,
+    runtime: Option<String>,
+    model_profile: Option<String>,
 ) -> Request {
     Request::DispatchSweep {
         kind: SweepKind::Issue(issue),
@@ -36,6 +52,11 @@ fn build_dispatch_request(
         // Host-distress circuit-breaker override (#4235): default false, so a
         // tripped breaker refuses the dispatch unless the operator passes --force.
         force,
+        runtime,
+        model_profile,
+        // #11444: a human ran `loom-daemon dispatch`. The daemon records an
+        // absent origin as `unknown`, so the CLI must say so explicitly.
+        dispatch_origin: Some(loom_daemon::telemetry::DispatchOrigin::Operator),
     }
 }
 
@@ -98,22 +119,19 @@ struct GhIssueLabelsAndBody {
 /// not run this time" and proceeds, exactly as it would with
 /// `--ignore-host-constraint`.
 fn fetch_issue_for_host_check(root: &Path, issue: u32) -> Option<(Vec<String>, Option<String>)> {
-    let mut cmd = Command::new(loom_daemon::gh_invocation::gh_bin());
-    cmd.arg("issue")
-        .arg("view")
-        .arg(issue.to_string())
-        .arg("--json")
-        .arg("labels,body");
-    cmd.current_dir(root);
-    loom_daemon::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
+    use loom_daemon::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+    // #10089: through the facade (counted, bounded, and run under `root`'s
+    // owner credential).
+    let op = Operation::new("dispatch.host_check");
+    let timeout = std::time::Duration::from_secs(30);
+    let mut inv = GhInvocation::new(op, AccessIntent::Read, GhTarget::None, timeout)
+        .current_dir(root)
+        .args(["issue", "view", &issue.to_string(), "--json", "labels,body"]);
     if let Ok(repo) = std::env::var("LOOM_REPO") {
-        cmd.arg("--repo").arg(repo);
+        inv = inv.arg("--repo").arg(repo);
     }
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let out = cmd.output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
+    let outcome = inv.run();
+    let out = outcome.ok_output()?;
     let parsed: GhIssueLabelsAndBody = serde_json::from_slice(&out.stdout).ok()?;
     Some((parsed.labels.into_iter().map(|l| l.name).collect(), parsed.body))
 }
@@ -147,27 +165,19 @@ fn host_constraint_refusal(
     ))
 }
 
-/// Decide whether `issue`'s `loom:heavy` label refuses an explicit dispatch
-/// when this host is classified `local-dev` (Issue #9034). `None` means no
-/// refusal: the issue is not `loom:heavy`, or this host is not `local-dev`.
-///
-/// Pure and side-effect-free — mirrors [`host_constraint_refusal`] exactly,
-/// including reusing the same best-effort label fetch
-/// ([`fetch_issue_for_host_check`]) the caller already made for the
-/// host-affinity check above, so this needs no extra `gh` call.
-fn heavy_local_refusal(
-    issue: u32,
-    labels: &[String],
-    host_class: loom_daemon::work_finder::host_class::HostClass,
-) -> Option<String> {
-    use loom_daemon::work_finder::host_class::{HostClass, LOOM_HEAVY_LABEL};
-    if host_class != HostClass::LocalDev || !labels.iter().any(|l| l == LOOM_HEAVY_LABEL) {
-        return None;
-    }
-    Some(format!(
-        "dispatch refused: issue #{issue} carries `{LOOM_HEAVY_LABEL}` and this host is \
-         classified `local-dev` (Issue #9034). Re-run with --allow-local to dispatch anyway."
-    ))
+/// Per-dispatch runtime tap flags for `loom-daemon dispatch` (#11284), kept here
+/// (flattened into `Commands::Dispatch`) so `main.rs` does not grow.
+#[derive(clap::Args, Debug, Clone, Default)]
+pub(crate) struct DispatchTapArgs {
+    /// Run the sweep's Builder and Doctor phases on this runtime (#11284),
+    /// e.g. `opencode`. An unavailable or unadmitted runtime is refused,
+    /// never silently replaced. Curator/Judge keep their role policy.
+    #[arg(long, value_name = "RUNTIME")]
+    pub(crate) runtime: Option<String>,
+
+    /// Model profile for `--runtime` (e.g. `zai-flash`). Requires `--runtime`.
+    #[arg(long, value_name = "PROFILE", requires = "runtime")]
+    pub(crate) model_profile: Option<String>,
 }
 
 /// Handle the `dispatch` subcommand (Issue #3952). Connects to the running
@@ -191,18 +201,9 @@ fn heavy_local_refusal(
 /// happens entirely client-side, before the socket round-trip: the CLI
 /// process and the daemon it talks to over a Unix socket always share one
 /// host identity, so there is no protocol change to make here.
-///
-/// # Host-class gate (#9034)
-///
-/// Same fetch, same client-side timing: unless `allow_local` is set, refuses
-/// a `loom:heavy` issue when this host resolves to `host_class: local-dev`
-/// (env `LOOM_HOST_CLASS` / `autonomous.workFinder.hostClass`), mirroring
-/// the work-finder's own autonomous gate (see [`heavy_local_refusal`] and
-/// `loom_daemon::work_finder::host_class`).
 #[allow(clippy::too_many_arguments)] // one flag per independent CLI override
-                                     // (`--force`, `--ignore-host-constraint`, `--allow-local`,
-                                     // #9034); splitting into a struct is a bigger refactor than
-                                     // this issue's scope.
+                                     // (`--force`, `--ignore-host-constraint`, `--runtime`,
+                                     // `--model-profile`)
 pub(crate) async fn handle_dispatch_command(
     issue: u32,
     workspace: Option<String>,
@@ -211,44 +212,53 @@ pub(crate) async fn handle_dispatch_command(
     depends_on: Option<u32>,
     force: bool,
     ignore_host_constraint: bool,
-    allow_local: bool,
+    runtime: Option<String>,
+    model_profile: Option<String>,
 ) -> Result<()> {
+    // Fail fast, client-side, on a malformed runtime/modelProfile (#11284).
+    if let Err(message) = loom_daemon::runtime_preference::explicit_tap::parse_explicit_tap(
+        runtime.as_deref(),
+        model_profile.as_deref(),
+    ) {
+        eprintln!("loom-daemon dispatch: {message}");
+        std::process::exit(2);
+    }
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let registry =
         loom_daemon::workspace_registry::WorkspaceRegistry::load_default().unwrap_or_default();
     let workspace = resolve_cli_dispatch_workspace(workspace, &cwd, &registry);
 
-    if !ignore_host_constraint || !allow_local {
+    if !ignore_host_constraint {
         let root = workspace
             .as_ref()
             .map(PathBuf::from)
             .unwrap_or_else(|| cwd.clone());
         if let Some((labels, body)) = fetch_issue_for_host_check(&root, issue) {
-            if !ignore_host_constraint {
-                let current_host_id = sweep_registry::host_identity();
-                if let Some(refusal) =
-                    host_constraint_refusal(issue, &labels, body.as_deref(), &current_host_id)
-                {
-                    eprintln!("{refusal}");
-                    std::process::exit(1);
-                }
-            }
-            if !allow_local {
-                let host_class = loom_daemon::work_finder::host_class::resolve_at_startup(&root);
-                if let Some(refusal) = heavy_local_refusal(issue, &labels, host_class) {
-                    eprintln!("{refusal}");
-                    std::process::exit(1);
-                }
+            let current_host_id = sweep_registry::host_identity();
+            if let Some(refusal) =
+                host_constraint_refusal(issue, &labels, body.as_deref(), &current_host_id)
+            {
+                eprintln!("{refusal}");
+                std::process::exit(1);
             }
         }
         // A fetch failure (missing `gh`, offline, etc.) falls through and
-        // proceeds with the dispatch for both checks above — see
+        // proceeds with the dispatch for the check above — see
         // `fetch_issue_for_host_check`'s doc comment for why this fails open
         // rather than refusing every dispatch on a transient forge hiccup.
     }
 
     let socket_path = resolve_socket_path()?;
-    let request = build_dispatch_request(issue, workspace, model, effort, depends_on, force);
+    let request = build_dispatch_request_with_tap(
+        issue,
+        workspace,
+        model,
+        effort,
+        depends_on,
+        force,
+        runtime,
+        model_profile,
+    );
     let ack_timeout = resolve_dispatch_ack_timeout();
 
     match query_daemon_bounded(&socket_path, &request, ack_timeout).await {
@@ -317,7 +327,7 @@ mod dispatch_tests {
     //! against a fake daemon, and the bounded-timeout path against a
     //! deliberately-unresponsive socket (the #3945 wedge must never hang).
     use super::{
-        build_dispatch_request, heavy_local_refusal, host_constraint_refusal,
+        build_dispatch_request, build_dispatch_request_with_tap, host_constraint_refusal,
         resolve_cli_dispatch_workspace,
     };
     use crate::cli::common::{
@@ -325,11 +335,36 @@ mod dispatch_tests {
         DISPATCH_ACK_TIMEOUT,
     };
     use loom_daemon::types::{Request, Response, SweepKind};
-    use loom_daemon::work_finder::host_class::HostClass;
     use serial_test::serial;
     use std::time::Duration;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
+
+    /// #11284: `--runtime` / `--model-profile` reach the request.
+    #[test]
+    fn build_dispatch_request_plumbs_runtime_and_profile() {
+        let request = build_dispatch_request_with_tap(
+            7,
+            None,
+            None,
+            None,
+            None,
+            false,
+            Some("opencode".into()),
+            Some("zai-flash".into()),
+        );
+        match request {
+            Request::DispatchSweep {
+                runtime,
+                model_profile,
+                ..
+            } => {
+                assert_eq!(runtime.as_deref(), Some("opencode"));
+                assert_eq!(model_profile.as_deref(), Some("zai-flash"));
+            }
+            other => panic!("expected DispatchSweep, got {other:?}"),
+        }
+    }
 
     /// `build_dispatch_request` maps every flag into the right `DispatchSweep`
     /// field — the core plumbing acceptance criterion.
@@ -352,9 +387,17 @@ mod dispatch_tests {
                 depends_on,
                 workspace_root,
                 force,
+                runtime: _,
+                model_profile: _,
+                dispatch_origin,
             } => {
                 assert_eq!(kind, SweepKind::Issue(3952));
                 assert_eq!(idempotency_key, None);
+                assert_eq!(
+                    dispatch_origin,
+                    Some(loom_daemon::telemetry::DispatchOrigin::Operator),
+                    "the operator CLI must name its origin (#11444)"
+                );
                 assert_eq!(model.as_deref(), Some("sonnet"));
                 assert_eq!(effort.as_deref(), Some("high"));
                 assert_eq!(depends_on, Some(3945));
@@ -475,43 +518,6 @@ mod dispatch_tests {
         let body = "<!-- loom:requires-host=loom-worker-2 -->";
         assert!(host_constraint_refusal(42, &[], Some(body), "mac-studio").is_some());
         assert!(host_constraint_refusal(42, &[], Some(body), "loom-worker-2").is_none());
-    }
-
-    // ===== Host-class gate (#9034) =====
-
-    /// The core acceptance criterion: a `loom:heavy` issue refuses an
-    /// explicit dispatch on a `local-dev`-classified host, naming both the
-    /// label and the override flag.
-    #[test]
-    fn heavy_local_refusal_on_a_local_dev_host() {
-        let labels = vec!["loom:issue".to_string(), "loom:heavy".to_string()];
-        let refusal = heavy_local_refusal(42, &labels, HostClass::LocalDev);
-        let message = refusal.expect("must refuse a heavy issue on a local-dev host");
-        assert!(message.contains("#42"), "{message}");
-        assert!(message.contains("loom:heavy"), "{message}");
-        assert!(message.contains("--allow-local"), "{message}");
-    }
-
-    /// A non-heavy issue is never refused, on any host class.
-    #[test]
-    fn heavy_local_refusal_none_for_a_non_heavy_issue() {
-        let labels = vec!["loom:issue".to_string()];
-        for class in [
-            HostClass::LocalDev,
-            HostClass::RemoteWorker,
-            HostClass::Unclassified,
-        ] {
-            assert!(heavy_local_refusal(42, &labels, class).is_none(), "{class:?}");
-        }
-    }
-
-    /// A `loom:heavy` issue is never refused on a `remote-worker` or
-    /// unclassified host — only `local-dev` gates.
-    #[test]
-    fn heavy_local_refusal_none_off_local_dev() {
-        let labels = vec!["loom:issue".to_string(), "loom:heavy".to_string()];
-        assert!(heavy_local_refusal(42, &labels, HostClass::RemoteWorker).is_none());
-        assert!(heavy_local_refusal(42, &labels, HostClass::Unclassified).is_none());
     }
 
     /// A fake daemon that accepts one connection, verifies the received request

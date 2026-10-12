@@ -393,6 +393,7 @@ failure (network, quota, token scope) or re-run the required checks, then re-run
 pub mod evidence;
 pub mod fetch;
 pub mod inputs;
+pub mod local_eval;
 pub mod repo_specs;
 pub mod workflow_scope;
 pub use fetch::LiveInputs;

@@ -419,9 +419,9 @@ fn an_artifact_the_poller_cannot_trust_is_rejected_by_name() {
         Err(RejectReason::NoUniqueJob { matches: 2, .. })
     ));
 
-    // The family is load-bearing, not cosmetic: `ci.yml` has TWO
-    // nextest-partition families both sharding 1..3, so (kind, k, N) alone
-    // would match both and reject every record.
+    // The family is load-bearing, not cosmetic: were two nextest-partition
+    // families to shard 1..3 (as `ci.yml` did before #10823), (kind, k, N)
+    // alone would match both and reject every record.
     let both_families = [
         (NEXTEST_JOB, "Rust Unit Tests (2/3)", parse_shard("Rust Unit Tests (2/3)")),
         (
@@ -489,8 +489,8 @@ fn every_ci_yml_test_timings_upload_pairs_with_its_own_jobs_display_name() {
     }
     assert_eq!(
         uploads.len(),
-        2,
-        "ci.yml has two nextest-partition families, each uploading its JUnit XML: {uploads:?}"
+        1,
+        "ci.yml has one nextest-partition family (Rust Unit Tests, #10823) uploading its JUnit XML: {uploads:?}"
     );
 
     for (display_name, artifact_suffix) in &uploads {

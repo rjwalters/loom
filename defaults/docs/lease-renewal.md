@@ -95,20 +95,25 @@ startup" — because that is precisely what a restart would drop.
   still running **the same process** and the loop is under its absolute age
   cap. Prints the loop's PID. See
   [The loop's four exits](#the-loops-four-exits-7825) below.
-- **`renew-once <issue> [--host H] [--sweep-id S] [--cached-lease ID@CREATED_AT]`** — one synchronous
+- **`renew-once <issue> [--host H] [--sweep-id S] [--cached-lease ID@SINCE]`** — one synchronous
   renewal cycle: locate the newest comment on `<issue>` whose body starts
   with the lease marker (or, if `--host`/`--sweep-id` are both given, the
   comment whose marker line matches them exactly), and idempotently PATCH
   it. Exit 0 on success, 2 when no matching lease comment exists (a normal,
   silent no-op — not every sweep is daemon-dispatched), 1 on a `gh` failure.
-  **`--cached-lease ID@CREATED_AT`** (#10021) is the steady-state path the
-  loop uses: each successful cycle reports `lease-cache=<id>@<created_at>`
+  **`--cached-lease ID@SINCE`** (#10021) is the steady-state path the
+  loop uses: each successful cycle reports `lease-cache=<id>@<since>`
   on stderr, and the next cycle passes it back. That cycle makes one
-  non-paginated read of the comments updated since `CREATED_AT` (the lease
-  itself plus any later `loom:lease-yield` record, so the own-yield guard is
-  unchanged) and one PATCH — never a `--paginate` listing of the whole
-  issue. It falls back to the full listing only when the cached comment is
-  gone or no longer matches, the window is a full page, or the PATCH 404s.
+  non-paginated read and one PATCH, never a `--paginate` listing of the
+  whole issue. The read covers the comments updated since `SINCE`, which is
+  the lease comment's `updated_at` as the previous cycle listed it (#10229).
+  That window holds the lease itself and every `loom:lease-yield` record
+  created after the previous listing, so the own-yield guard is unchanged.
+  It falls back to the full listing only when the cached comment is gone or
+  no longer matches, the window is a full page, or the PATCH 404s. A loop
+  whose lookups find no lease on two consecutive cycles stops (#10229). Each
+  call runs on the host's GitHub App credential when one is configured; see
+  [`lease-record.md`](lease-record.md#renewer-ownership-completion-and-request-budget-issue-10229).
 - **`stop <PID>`** — best-effort kill of a loop PID. Not required for
   correctness; the loop already self-terminates.
 
@@ -134,6 +139,18 @@ than one:
 In every case the lease comment is **left in place** to age out. A
 terminating loop never deletes it — the epic requires positive evidence on
 the reclaim side, and the renew side simply stops broadcasting.
+
+**Before a loop exists: the deferred publisher (#10570).** When an attended
+`loom-daemon lease ensure` is declined (publish exit 4, a peer lease still in
+its TTL, or exit 2, a failed `gh` write), there is no lease to renew yet. A
+detached `lease ensure --deferred` retries the publish instead (see
+`lease-record.md`). It watches the same `(pid, start-time identity)` pair, so a
+short-lived tool shell or a recycled pid ends it. It is always capped (the
+`--max-age` it was given, 4 h by default, even when that is `0`). It hands this
+loop only the remainder of that cap, so publication plus renewal never
+outlives the original bound. Its attempts and its exit reason (`SessionEnded`,
+`CapReached`, or the settled outcome) go to
+`.loom/logs/lease-ensure/issue-<N>.log`.
 
 #### Identity, not just a PID number
 

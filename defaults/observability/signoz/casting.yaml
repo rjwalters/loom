@@ -18,8 +18,8 @@ spec:
         SIGNOZ_PROMETHEUS_ACTIVE__QUERY__TRACKER_PATH: /tmp/signoz-active-queries
   ingester:
     spec:
-      version: v0.144.10
-      image: signoz/signoz-otel-collector:v0.144.10@sha256:34ecb436b687cc23bef5f706904cdf005998ca4ebe543653a634055a9fe204f6
+      version: v0.144.12
+      image: signoz/signoz-otel-collector:v0.144.12@sha256:deb566a7a3c0ba544ee58ccc92ee1f0e6da827bc40383e52f3c824705e100a3d
       config:
         data:
           opamp.yaml: |
@@ -27,8 +27,8 @@ spec:
   telemetrystore:
     kind: clickhouse
     spec:
-      version: 25.12.5
-      image: clickhouse/clickhouse-server:25.12.5@sha256:cacf32d6884291dc2ff5e0156a97f46fc53ff7c929a7906d114e268a929dfd3a
+      version: 25.12.11
+      image: clickhouse/clickhouse-server:25.12.11@sha256:8a790dd3468db22b1d4e7b18a176f378ff5ff6053b9c48dd4ea1fa71a24c5ba6
   telemetrykeeper:
     kind: clickhousekeeper
     spec:

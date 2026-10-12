@@ -35,6 +35,20 @@ pub const POLICY_ENV: &str = "LOOM_FORGE_EGRESS_POLICY";
 /// The machine-owned default location. Outside every checkout.
 pub const MACHINE_POLICY_PATH: &str = "/etc/loom/forge-egress/policy.json";
 
+/// The deployment-owned location (2am's `scripts/github-egress.py`). Probed as
+/// a second machine-tier candidate (`origin: machine`) after
+/// [`MACHINE_POLICY_PATH`], so one provisioned policy satisfies both
+/// validators without reprovisioning either.
+pub const DEPLOYMENT_POLICY_PATH: &str = "/etc/2am/github-egress/policy.json";
+
+/// Env var that declares this host managed: an unconfigured policy is then a
+/// routing failure (exit 2), not a notice. Truthy: `1`, `true`, `yes`, `on`.
+pub const MANAGED_ENV: &str = "LOOM_FORGE_EGRESS_MANAGED";
+
+/// A deployment marker file that declares the host managed (same effect as
+/// [`MANAGED_ENV`]). A predicate on the host; it can only add strictness.
+pub const MANAGED_MARKER_PATH: &str = "/etc/loom/forge-egress/managed";
+
 /// The repo-config key naming a repo-local policy (`origin: repo`).
 pub const REPO_POLICY_KEY: &str = "forge.egress.policyPath";
 
@@ -87,6 +101,15 @@ impl Origin {
     /// must never be able to make the daemon execute something.
     #[must_use]
     pub fn may_run_canary(self) -> bool {
+        self.may_choose_executable()
+    }
+
+    /// Whether this origin is trusted to choose which executable the daemon
+    /// runs — `toolchain.launcherPath` as the `gh` resolver's first rung
+    /// (#9995). Same rule as [`Self::may_run_canary`]: env and machine
+    /// policies are operator-owned; a repo-local one is checkout content.
+    #[must_use]
+    pub fn may_choose_executable(self) -> bool {
         matches!(self, Self::Env | Self::Machine)
     }
 }
@@ -106,6 +129,11 @@ pub struct PolicySources {
     pub env_path: Option<PathBuf>,
     /// The machine path to probe (production: [`MACHINE_POLICY_PATH`]).
     pub machine_path: Option<PathBuf>,
+    /// The deployment's machine path (production: [`DEPLOYMENT_POLICY_PATH`]).
+    pub deployment_path: Option<PathBuf>,
+    /// The host declares itself managed ([`MANAGED_ENV`] or
+    /// [`MANAGED_MARKER_PATH`]): no policy is then a failure, not a notice.
+    pub managed: bool,
     /// `forge.egress.policyPath`, already resolved against the repo root.
     pub repo_path: Option<PathBuf>,
 }
@@ -118,9 +146,14 @@ impl PolicySources {
             .filter(|v| !v.is_empty())
             .map(PathBuf::from);
         let repo_path = repo_root.and_then(repo_policy_path);
+        let managed = std::env::var(MANAGED_ENV).is_ok_and(|v| {
+            matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+        }) || Path::new(MANAGED_MARKER_PATH).exists();
         Self {
             env_path,
             machine_path: Some(PathBuf::from(MACHINE_POLICY_PATH)),
+            deployment_path: Some(PathBuf::from(DEPLOYMENT_POLICY_PATH)),
+            managed,
             repo_path,
         }
     }
@@ -141,7 +174,10 @@ impl PolicySources {
         // `Unreadable` (exit 2) — never a fall-through to the repo tier or to
         // `unconfigured`. Matches 2am's `load_policy`, which skips only
         // `FileNotFoundError`.
-        if let Some(p) = &self.machine_path {
+        for p in [&self.machine_path, &self.deployment_path]
+            .into_iter()
+            .flatten()
+        {
             match std::fs::symlink_metadata(p) {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 _ => out.push(Candidate {

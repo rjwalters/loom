@@ -9,6 +9,7 @@
 //! advisory from crying wolf on every sweep.
 
 use super::*;
+use crate::park_record::BlockerRef;
 
 fn dep(number: i64, checked: bool, state: Option<&str>) -> named::Dep {
     named::Dep {
@@ -73,7 +74,8 @@ fn prose_cited_blocker_still_open_is_not_reported() {
 // --- Stale via a `## Dependencies` checklist: #179's row ---------------------
 
 #[test]
-fn every_checklist_prerequisite_resolved_is_stale() {
+fn every_checklist_prerequisite_resolved_but_unticked_is_unticked_not_stale() {
+    // #9274 classes 2/3: an unchecked box is unmet whatever its ref's state.
     let e = Evidence {
         named: vec![
             dep(176, false, Some("CLOSED")),
@@ -81,15 +83,93 @@ fn every_checklist_prerequisite_resolved_is_stale() {
         ],
         ..Evidence::default()
     };
-    match classify(&e) {
-        Verdict::Stale(reasons) => {
-            assert_eq!(reasons.len(), 1);
-            assert!(reasons[0].contains("checklist"), "{:?}", reasons);
-            assert!(reasons[0].contains("176:CLOSED"), "{:?}", reasons);
-            assert!(reasons[0].contains("177:MERGED"), "{:?}", reasons);
+    assert_eq!(
+        classify(&e),
+        Verdict::Unticked {
+            resolved_refs: vec!["#176".to_string(), "#177".to_string()],
+            unparsed: 0
         }
-        other => panic!("expected Stale, got {other:?}"),
+    );
+}
+
+/// 2am#1325: the checklist cites a PR closed without merging.
+#[test]
+fn closed_unmerged_pr_in_checklist_is_still_blocked() {
+    let e = Evidence {
+        named: vec![dep(305, false, Some("CLOSED_UNMERGED"))],
+        ..Evidence::default()
+    };
+    assert_eq!(classify(&e), Verdict::StillBlocked);
+}
+
+/// 2am#1344 / gf180-trng#256: an unparseable unchecked line beside resolved
+/// entries is Unticked, never Stale.
+#[test]
+fn unparseable_unchecked_line_next_to_resolved_entries_is_unticked() {
+    let e = Evidence {
+        named: vec![dep(268, false, Some("CLOSED"))],
+        unparsed_unchecked: 1,
+        ..Evidence::default()
+    };
+    assert_eq!(
+        classify(&e),
+        Verdict::Unticked {
+            resolved_refs: vec!["#268".to_string()],
+            unparsed: 1
+        }
+    );
+}
+
+/// A checklist whose only unchecked lines are unreadable is documented and
+/// unmet, but it has no open parseable ref: the empty parseable set is
+/// vacuously resolved, so it goes to `Unticked` for a human to read the lines.
+#[test]
+fn only_unparseable_unchecked_lines_is_unticked() {
+    let e = Evidence {
+        unparsed_unchecked: 2,
+        ..Evidence::default()
+    };
+    assert_eq!(
+        classify(&e),
+        Verdict::Unticked {
+            resolved_refs: vec![],
+            unparsed: 2
+        }
+    );
+}
+
+/// An open parseable unchecked ref beside an unparseable line keeps the
+/// checklist `StillBlocked`: the open ref is a real, current blocker.
+#[test]
+fn open_parseable_ref_beside_unparseable_line_is_still_blocked() {
+    for state in [Some("OPEN"), None] {
+        let e = Evidence {
+            named: vec![dep(42, false, state)],
+            unparsed_unchecked: 1,
+            ..Evidence::default()
+        };
+        assert_eq!(classify(&e), Verdict::StillBlocked, "state {state:?}");
     }
+}
+
+/// gf180-tmds-tx#186: `- [ ] #187: ... do not infer ratification`, #187 merged.
+#[test]
+fn merged_ref_on_an_unchecked_line_is_unticked() {
+    let e = Evidence {
+        named: vec![dep(187, false, Some("MERGED"))],
+        ..Evidence::default()
+    };
+    assert!(matches!(classify(&e), Verdict::Unticked { .. }));
+}
+
+/// sky130-pll#98 / kicad-tools#5240: a merged closing PR is no blocker reference.
+#[test]
+fn prose_ref_closed_unmerged_is_still_blocked() {
+    let e = Evidence {
+        prose: vec![prose_ref(9, "CLOSED_UNMERGED")],
+        ..Evidence::default()
+    };
+    assert_eq!(classify(&e), Verdict::StillBlocked);
 }
 
 #[test]
@@ -116,45 +196,19 @@ fn all_ticked_checklist_is_stale() {
     assert!(matches!(classify(&e), Verdict::Stale(_)));
 }
 
-// --- Stale via a linked closing PR ------------------------------------------
+// --- A linked closing PR is not a blocker reference (#9274 class 4) ---------
 
 #[test]
-fn merged_closing_pr_is_stale() {
-    let e = Evidence {
-        closing: vec![pr(4743, "MERGED")],
-        ..Evidence::default()
-    };
-    match classify(&e) {
-        Verdict::Stale(reasons) => {
-            assert_eq!(reasons.len(), 1);
-            assert!(reasons[0].contains("closing PR"), "{:?}", reasons);
-        }
-        other => panic!("expected Stale, got {other:?}"),
+fn closing_pr_alone_is_undocumented_whatever_its_state() {
+    for state in ["MERGED", "OPEN", "CLOSED", ""] {
+        let mut p = pr(4743, state);
+        p.labels = vec!["loom:changes-requested".to_string()];
+        let e = Evidence {
+            closing: vec![p],
+            ..Evidence::default()
+        };
+        assert_eq!(classify(&e), Verdict::Undocumented, "{state}");
     }
-}
-
-#[test]
-fn open_closing_pr_is_not_reported() {
-    let e = Evidence {
-        closing: vec![pr(4743, "OPEN")],
-        ..Evidence::default()
-    };
-    assert_eq!(classify(&e), Verdict::StillBlocked);
-}
-
-#[test]
-fn open_closing_pr_carrying_a_block_label_is_still_not_stale() {
-    // `recheck::verdict` would call this `blocked`. That is a fact about the
-    // PR, not about the issue's `loom:blocked` label, and either way the PR is
-    // open — so the block is not stale. Asserted because reaching for
-    // `recheck::verdict` here is the obvious wrong shortcut.
-    let mut p = pr(4743, "OPEN");
-    p.labels = vec!["loom:changes-requested".to_string()];
-    let e = Evidence {
-        closing: vec![p],
-        ..Evidence::default()
-    };
-    assert_eq!(classify(&e), Verdict::StillBlocked);
 }
 
 // --- Mixed and multi-signal cases -------------------------------------------
@@ -174,7 +228,7 @@ fn a_partially_resolved_prose_set_is_reported() {
 #[test]
 fn two_independent_signals_produce_two_reasons() {
     let e = Evidence {
-        named: vec![dep(176, false, Some("CLOSED"))],
+        named: vec![dep(176, true, None)],
         prose: vec![prose_ref(7, "MERGED")],
         ..Evidence::default()
     };
@@ -197,10 +251,6 @@ fn a_reference_in_any_shape_prevents_the_undocumented_verdict() {
             prose: vec![prose_ref(1, "OPEN")],
             ..Evidence::default()
         },
-        Evidence {
-            closing: vec![pr(1, "OPEN")],
-            ..Evidence::default()
-        },
     ] {
         assert_eq!(classify(&e), Verdict::StillBlocked);
     }
@@ -214,10 +264,11 @@ fn an_unrecognised_state_is_treated_as_open() {
     // Reporting it as resolved would be the "confident wrong answer" the
     // dep_recheck module's own fail-safe rule exists to prevent.
     let e = Evidence {
-        closing: vec![pr(4743, "")],
+        prose: vec![prose_ref(4743, "")],
         ..Evidence::default()
     };
     assert_eq!(classify(&e), Verdict::StillBlocked);
+    assert!(!resolved("CLOSED_UNMERGED"));
     assert!(!resolved(""));
     assert!(!resolved("DRAFT"));
     assert!(resolved("MERGED"));
@@ -232,7 +283,7 @@ fn an_unrecognised_state_is_treated_as_open() {
 fn a_parked_pr_whose_blocker_closed_is_stale() {
     let e = Evidence {
         prose: vec![prose_ref(8322, "CLOSED")],
-        declared: vec![8322],
+        declared: vec![BlockerRef::local(8322)],
         self_block: None,
         ..Evidence::default()
     };
@@ -246,7 +297,7 @@ fn a_parked_pr_whose_blocker_closed_is_stale() {
 fn a_parked_pr_with_a_cleared_blocker_but_an_operator_hold_is_superseded() {
     let e = Evidence {
         prose: vec![prose_ref(8322, "CLOSED")],
-        declared: vec![8322],
+        declared: vec![BlockerRef::local(8322)],
         self_block: park_self_block(&{
             let mut p = pr(8314, "OPEN");
             p.labels = vec!["loom:operator".to_string()];
@@ -272,7 +323,7 @@ fn a_parked_pr_that_cannot_land_is_superseded() {
     p.merge_state_status = "DIRTY".to_string();
     let e = Evidence {
         prose: vec![prose_ref(8322, "MERGED")],
-        declared: vec![8322],
+        declared: vec![BlockerRef::local(8322)],
         self_block: park_self_block(&p),
         ..Evidence::default()
     };
@@ -296,7 +347,7 @@ fn a_prs_own_review_state_labels_are_not_a_self_block() {
 
     let e = Evidence {
         prose: vec![prose_ref(8322, "CLOSED")],
-        declared: vec![8322],
+        declared: vec![BlockerRef::local(8322)],
         self_block: park_self_block(&p),
         ..Evidence::default()
     };
@@ -326,7 +377,7 @@ fn a_self_block_alone_never_manufactures_a_finding() {
     p.labels = vec!["loom:operator".to_string()];
     let e = Evidence {
         prose: vec![prose_ref(8322, "OPEN")],
-        declared: vec![8322],
+        declared: vec![BlockerRef::local(8322)],
         self_block: park_self_block(&p),
         ..Evidence::default()
     };
@@ -345,22 +396,15 @@ fn a_blocker_cited_only_in_prose_is_undeclared() {
     assert!(undeclared(&e), "prose-only park must be flagged");
 }
 
-/// A checklist or closing-PR reference with no park record counts as prose-only
+/// A checklist reference with no park record counts as prose-only
 /// too: the park record is the declaration, not the reference shape.
 #[test]
-fn a_checklist_or_closing_pr_reference_without_a_record_is_undeclared() {
-    for e in [
-        Evidence {
-            named: vec![dep(1, false, Some("OPEN"))],
-            ..Evidence::default()
-        },
-        Evidence {
-            closing: vec![pr(1, "OPEN")],
-            ..Evidence::default()
-        },
-    ] {
-        assert!(undeclared(&e));
-    }
+fn a_checklist_reference_without_a_record_is_undeclared() {
+    let e = Evidence {
+        named: vec![dep(1, false, Some("OPEN"))],
+        ..Evidence::default()
+    };
+    assert!(undeclared(&e));
 }
 
 /// An artifact with nothing cited at all is `Undocumented`, the louder finding —
@@ -453,4 +497,55 @@ fn cited_among_reports_every_closed_number_cited_once_each() {
 #[test]
 fn cited_among_is_empty_on_an_empty_input() {
     assert!(cited_among(Artifact::Issue, &input("", &[]), &[180]).is_empty());
+}
+
+fn remote(repo: &str, number: i64, state: &str) -> RemoteRef {
+    RemoteRef {
+        repo: repo.to_string(),
+        number,
+        state: state.to_string(),
+    }
+}
+
+#[test]
+fn a_closed_cross_repo_declared_blocker_is_stale() {
+    let e = Evidence {
+        declared: vec![BlockerRef {
+            repo: Some("example-org/tool-repo".into()),
+            number: 202,
+        }],
+        remote: vec![remote("example-org/tool-repo", 202, "CLOSED")],
+        ..Evidence::default()
+    };
+    assert!(!undeclared(&e));
+    match classify(&e) {
+        Verdict::Stale(r) => assert!(r[0].contains("example-org/tool-repo#202:CLOSED"), "{r:?}"),
+        v => panic!("{v:?}"),
+    }
+}
+
+#[test]
+fn an_open_cross_repo_declared_blocker_stays_blocked() {
+    let e = Evidence {
+        remote: vec![remote("o/r", 5, "OPEN")],
+        ..Evidence::default()
+    };
+    assert_eq!(classify(&e), Verdict::StillBlocked);
+}
+
+#[test]
+fn a_closed_local_number_does_not_clear_a_cross_repo_blocker() {
+    // Local #5 closed (prose), but the park names o/r#5 which is open: the park
+    // text, once masked, carries no local #5 at all.
+    let body = "<!-- loom:park Blocked by: o/r#5 -->";
+    let input = crate::dep_recheck::extract::Input {
+        body: body.to_string(),
+        comments: Vec::new(),
+    };
+    assert!(cited_among(Artifact::Issue, &input, &[5]).is_empty());
+    let local = crate::dep_recheck::extract::Input {
+        body: "<!-- loom:park Blocked by: #5 -->".to_string(),
+        comments: Vec::new(),
+    };
+    assert_eq!(cited_among(Artifact::Issue, &local, &[5]), vec![5]);
 }

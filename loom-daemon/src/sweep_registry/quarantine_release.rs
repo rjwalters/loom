@@ -27,14 +27,24 @@ impl SweepRegistry {
     /// that field's doc comment for why that would leak into other tests).
     #[cfg(test)]
     fn quarantine_release_rate_limited(&self) -> bool {
-        self.test_force_rate_limited || crate::rate_limit_breaker::global_is_suppressed()
+        self.test_force_rate_limited
+            || crate::rate_limit_breaker::global_skip_pass("quarantine_release")
     }
 
     /// Non-test build of [`Self::quarantine_release_rate_limited`] above —
     /// same contract, minus the test-only override.
     #[cfg(not(test))]
     fn quarantine_release_rate_limited(&self) -> bool {
-        crate::rate_limit_breaker::global_is_suppressed()
+        crate::rate_limit_breaker::global_skip_pass("quarantine_release")
+    }
+
+    /// One reaper-tick pass over every label-restoring hold: retry failed
+    /// quarantine restores, then release no-op holds whose inputs changed
+    /// (Issue #10156). Lives here so `reaper.rs`, frozen by the file-size
+    /// ratchet, gains no line for it.
+    pub(crate) fn release_pending_holds(&mut self) {
+        self.retry_pending_quarantine_releases();
+        self.reconcile_noop_holds(std::time::Instant::now());
     }
 
     /// Retry every issue in [`pending_quarantine_release`](Self::pending_quarantine_release_issues)

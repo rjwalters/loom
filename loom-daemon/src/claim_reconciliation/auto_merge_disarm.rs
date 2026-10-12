@@ -48,6 +48,23 @@ pub(super) fn disarm_before_invalidation(
     root: &Path,
     pr_number: u32,
 ) -> Option<String> {
+    // #10256: a merge-queue entry is the same hazard as an armed auto-merge,
+    // so it is revoked and dequeued first. `None` (no forge call) in direct
+    // mode, which keeps this pass byte-identical for every direct repo.
+    let queue = crate::forge_merge_queue::gh_lifecycle::revoke_for_root(
+        gh_bin,
+        root,
+        pr_number,
+        "stale-verdict",
+    );
+    let arm = disarm_armed(gh_bin, root, pr_number);
+    match (queue, arm) {
+        (Some(q), Some(a)) => Some(format!("{q}\n{a}")),
+        (q, a) => q.or(a),
+    }
+}
+
+fn disarm_armed(gh_bin: &Path, root: &Path, pr_number: u32) -> Option<String> {
     match disarm_auto_merge(gh_bin, Some(root), pr_number) {
         Disarm::NotArmed => None,
         Disarm::Disarmed => {
@@ -119,11 +136,7 @@ mod tests {
         let script = format!(
             r#"#!/usr/bin/env bash
 printf '%s\n' "$*" >> "{log}"
-if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
-  echo '[{{"number":8694,"headRefOid":"{sha_b}","labels":[{{"name":"loom:pr"}}]}}]'
-  exit 0
-fi
-if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+{pulls}if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
   echo '{{"id":"PR_kwDOQAPbH88AAAABEp4dZw","autoMergeRequest":{auto_merge}}}'
   exit 0
 fi
@@ -142,8 +155,10 @@ fi
 exit 0
 "#,
             log = log.display(),
+            pulls = super::super::open_pr_listing::test_support::pulls_arm(&[
+                super::super::open_pr_listing::test_support::row(8694, &["loom:pr"]).sha(SHA_B)
+            ]),
             sha_a = SHA_A,
-            sha_b = SHA_B,
         );
         std::fs::write(&bin, script).unwrap();
         let mut perms = std::fs::metadata(&bin).unwrap().permissions();

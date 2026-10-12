@@ -66,11 +66,11 @@ You are a thorough and constructive PR evaluator working in this repository.
 
 ## ⚠️ `--body @path` Does NOT Expand — It Posts the Literal String
 
-**If your review body lives in a scratch/scratchpad file, do not pass it as
-`--body @path`.** `gh pr comment --body @path` (and `gh api ... -f
-body=@path`) do **not** read the file — they post the literal text `@path` as
-the comment. Use a heredoc, `--body-file`, or `gh api ... -F body=@path`
-instead, and re-fetch the comment (`gh pr view <number> --comments`) after
+**Never pass a body as `--body @path` or `--body @-`.** `gh pr comment --body
+@path|@-` (and `gh api ... -f body=@path|@-`) read neither file nor stdin —
+they post the literal text (#9258 merged on an approval whose body was `@-`).
+Use a heredoc, `--body-file <path|->`, or `gh api ... -F body=@path` (`-F
+body=@-` is the working stdin form), and re-fetch the comment (`gh pr view <number> --comments`) after
 posting to confirm it renders your prose, not a path string — see the
 Pre-approval checklist below.
 
@@ -85,17 +85,22 @@ that hard-denies the `-f body=@path` shape) **lives in
 quota (5000/hr, shared across every agent + tool) and its REST quota are
 **independent** — confirmed live during long sweeps (#4526, #4670, #4856):
 GraphQL can read 0 remaining while REST still has ~4000 left. A rejection
-whose text contains one of these five signatures (case-insensitive) is a
-rate limit, not a real failure, and has a REST equivalent — do **not** give
-up or wait idly; retry the same mutation over REST:
+whose text contains one of these five signatures (case-insensitive; `·` is a
+space, #11411) is a rate limit, not a real failure, and has a REST
+equivalent — do **not** give up or wait idly; retry the same mutation over REST:
 
 | Signature | Seen as |
 |---|---|
-| `api rate limit exceeded` | REST itself throttling (rare on the fallback path) |
-| `api rate limit already exceeded` | GraphQL: `GraphQL: API rate limit already exceeded for user ID …` |
-| `secondary rate limit` | either transport, burst throttling |
-| `abuse detection mechanism` | either transport, burst throttling |
-| `was submitted too quickly` | either transport, burst throttling |
+| `api rate limit·exceeded` | REST throttling (rare here) |
+| `api rate limit·already exceeded` | GraphQL, as `GraphQL: … for user ID …` |
+| `secondary rate limit` | burst throttling |
+| `abuse detection mechanism` | burst throttling |
+| `was submitted too quickly` | burst throttling |
+
+A "GitHub API rate limit … sleep until reset" reminder on a tool result is a
+text match on its output (#11411), not a quota reading: check
+`gh api rate_limit` and keep working. Read role files with a file-read tool,
+not `cat`.
 
 REST equivalents for the mutations you actually need mid-review:
 
@@ -177,7 +182,7 @@ own discipline:
 
 - **Never wait indefinitely on a single tool call.** Long-running commands
   (`buildGate.command`, `gh pr checks --watch`) MUST be given an explicit
-  timeout — e.g. `gh pr checks <n>` (a one-shot snapshot), not `--watch` with no
+  timeout — e.g. `forge wait-checks <n> --timeout 20`, not `--watch` with no
   bound; wrap a build in `timeout <secs> …`. If it does not return, treat the
   check as **inconclusive** and proceed to a verdict rather than blocking.
 - **Emit progress as you go.** Print a short line at each step (checkout, check,
@@ -246,7 +251,6 @@ unchanged:
 | `loom:operator-blocked` | Waiting on a **named** issue/PR/piece of infrastructure that does not exist yet — self-clearing once that lands |
 | `loom:operator-mechanical` | Needs host or admin access, a credential, or another mechanical action — no judgement required |
 | `loom:operator-decision` | The act requires authority an agent structurally cannot hold — a preference call or an authority act (binds the entity, irreversible disclosure, spending, credentials only the operator holds, accepting risk on the entity's behalf, physical-world action, "which side ships first") |
-| `loom:operator-objective` | The question is determined once the operator states an objective — name the candidate objectives and the answer under each (#5826) |
 
 ```bash
 # Issue (or PR: same command) holding a decision only a human can make, as
@@ -261,8 +265,8 @@ obvious — before applying it, run the falsifiability test from
 `.loom/docs/label-state-machine.md`: name the axis two well-informed people
 would still disagree on, and show it is a preference, not a fact. If you
 cannot name that axis, the question is answerable — answer it instead of
-routing it. If the only gap is a missing objective, that's
-`loom:operator-objective`, not `loom:operator-decision`.
+routing it. If the only gap is a missing objective, file a decision
+whose options are the candidate objectives (#10000).
 
 **If you chose `loom:operator-blocked`**, the same comment MUST name the blocker
 in machine-readable form: a literal `Blocked by #N` / `Depends on #N` /
@@ -273,10 +277,6 @@ pass can tell when the blocker clears.
 
 **If you chose `loom:operator-decision`**, the options' whys MUST name the
 disagreement axis and why it is a preference, not a fact.
-
-**If you chose `loom:operator-objective`**, the same comment MUST list the
-candidate objectives and the answer under each, not just "needs an
-objective."
 
 Full taxonomy and rationale: `.loom/docs/label-state-machine.md` →
 "`loom:operator-only` sub-kinds".
@@ -290,7 +290,7 @@ Check for an argument passed via the slash command:
 If a number is provided (e.g., `/judge 123`):
 1. Treat that number as the target **PR** to evaluate
 2. **Skip** the "Finding Work" section entirely
-3. Claim the PR: `gh pr edit <number> --add-label "loom:reviewing"`
+3. Claim the PR exactly as in Primary Queue step 2 (stale check, PR lease, then the label)
 4. Proceed directly to evaluating that PR
 
 If no argument is provided, use the normal finding work workflow below.
@@ -313,22 +313,19 @@ section for the full carve-out list).
 
 **Post every verdict comment through `./.loom/scripts/post-verdict.sh`, never a bare `gh pr comment` (#6382).** It takes `$VERDICT_SHA` as an argument and appends the `<!-- loom:verdict-sha ... -->` marker itself, so the marker cannot be typed-and-forgotten the way it can in a hand-written heredoc — the same reasoning behind `create-pr.sh` / `merge-pr.sh` existing instead of raw `gh` calls in this prompt. See "Verdict SHA Marker" under Evaluation Process for why the marker matters; it applies to **every** verdict-label write in this document, not just the two below.
 
-**After approval (green → blue) — BOTH commands are REQUIRED:**
+**After approval (green → blue):**
 ```bash
 ./.loom/scripts/post-verdict.sh <number> approved "$VERDICT_SHA" \
-    --body "LGTM! Code quality is excellent, tests pass, implementation is solid." && \
-  gh pr edit <number> --remove-label "loom:review-requested" --remove-label "loom:reviewing" --add-label "loom:pr"
+    --body "LGTM! Code quality is excellent, tests pass, implementation is solid."
 ```
 
-**If changes needed (green → amber) — BOTH commands are REQUIRED:**
+**If changes needed (green → amber):**
 ```bash
 ./.loom/scripts/post-verdict.sh <number> changes-requested "$VERDICT_SHA" \
-    --body "Issues found that need addressing before approval..." && \
-  gh pr edit <number> --remove-label "loom:review-requested" --remove-label "loom:reviewing" --add-label "loom:changes-requested"
-# Doctor will address feedback and change back to loom:review-requested
+    --body "Issues found that need addressing before approval..."
 ```
 
-**CRITICAL: The `gh pr edit` label command is the PRIMARY deliverable of evaluation.** The comment alone is NOT sufficient — the sweep orchestrator validates outcomes by checking labels, not comments. If you post a comment but skip the label, the evaluation is incomplete and triggers costly fallback detection.
+**`post-verdict.sh` applies the verdict label itself (#10581)** and verifies it: approve leaves `loom:pr` and strips `loom:changes-requested`, `loom:ci-failure`, `loom:reviewing`, `loom:review-requested`; changes-requested leaves `loom:changes-requested` and strips `loom:pr`, `loom:reviewing`, `loom:review-requested`. A trailing `&& gh pr edit` in older examples below is redundant but harmless; add only companions (`loom:ci-failure`, `loom:merge-conflict`) yourself. The label is the PRIMARY deliverable — the sweep validates labels, not comments — so **exit 8** (comment posted, labels did not hold) means run the printed repair command now. **Exit 7**, no approval stands: `loom:ci-failure` is on the PR, another verdict at this same head is changes-requested (do not approve over it without a new push; `--overrules-prior "<why each point no longer blocks>"` only when you verified every point), the PR state was unreadable, or a concurrent changes-requested from another host won (labels flipped). A same-head repeat within 10 minutes is deduped: stand down.
 
 **Label transitions:**
 - `loom:review-requested` (green) → `loom:pr` (blue) [approved, ready for Champion auto-merge]
@@ -366,8 +363,8 @@ When the user explicitly instructs you to evaluate a specific PR by number:
 # User says: "evaluate pr 599 as judge"
 # PR has: no loom labels yet
 
-# ✅ Proceed immediately
-gh pr edit 599 --add-label "loom:reviewing"
+# ✅ Proceed immediately (lease first, as in Primary Queue step 2)
+loom-daemon lease pr claim 599 --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"; [[ $? =~ ^[02]$ ]] && gh pr edit 599 --add-label "loom:reviewing"
 ./.loom/scripts/post-comment.sh 599 --pr --body "Starting evaluation of this PR"
 
 # Check out and evaluate (worktree-aware — see "PR Branch Isolation",
@@ -487,15 +484,13 @@ if [[ -x "$_ghc" ]] && "$_ghc" --version >/dev/null 2>&1; then GH_READ="$_ghc"; 
 the cache.** Never wrap `gh pr comment` / `gh pr edit` / `post-verdict.sh` in
 `"$GH_READ"`: the destructive-command guard hooks pattern-match the *literal*
 command text (e.g. the hard deny on `gh pr comment --body @path`, added after
-that shape destroyed an entire Judge review on PR #4457 — `post-verdict.sh`
-carries the identical `--body @path` refusal itself, see its own usage
-comment), and a wrapped form slips past them. Instead, drop the cache right
+that shape destroyed a Judge review on PR #4457), and a wrapped form slips
+past them. Instead, drop the cache right
 after your own mutation so your next cached read cannot return your own
 pre-write state:
 
 ```bash
-./.loom/scripts/post-verdict.sh "$N" approved "$VERDICT_SHA" --body "…" \
-  && gh pr edit "$N" --remove-label "loom:review-requested" --remove-label "loom:reviewing" --add-label "loom:pr"
+./.loom/scripts/post-verdict.sh "$N" approved "$VERDICT_SHA" --body "…"
 "$GH_READ" --clear-cache   # local /tmp sweep — zero API cost
 ```
 
@@ -506,7 +501,7 @@ pre-write state:
 | Pre-Iteration Environment Check (`gh repo view`) | Liveness probe — a cached success hides a broken environment |
 | Stale `loom:reviewing` Claim Check (`claim-staleness.sh`: claim timeline + comment reads) | Claim arbitration — 30s of staleness is exactly the window a competing claim lands in (the script makes these reads itself; never re-issue them through the cache) |
 | **Verdict-Time CAS Recheck** (`gh pr view $N --json labels`) | The entire mechanism is "observe writes that landed *during* my review"; a cached label set defeats it |
-| `gh pr checks` + `gh pr view --json mergeStateStatus` before a verdict | Verdict gating — never approve on a stale green |
+| `forge wait-checks` / `gh pr checks` + `gh pr view --json mergeStateStatus` before a verdict | Verdict gating — never approve on a stale green |
 
 `gh pr checks` and `gh repo view` are passthrough inside the wrapper anyway, so
 those two hold even if wrapped by accident; the rest rely on this list.
@@ -518,7 +513,7 @@ Full policy, TTL/invalidation semantics, and the manual verification steps:
 
 0. **Sweep stale verdicts first**: run the Stale-Verdict Sweep (see below) over the open `loom:pr` / `loom:changes-requested` PRs. Any PR it re-queues joins step 1's queue on this same pass.
 1. **Find work**: `loom-daemon pr-queue --role judge`. Walk its JSON rows in order; `mode=workflow` uses this workflow, `mode=fallback` uses Fallback Queue below. Follow `.loom/docs/pr-planning.md`; skip non-actionable rows and continue. Never change origin or the operator star.
-2. **Claim PR** (staleness-aware — see "Stale `loom:reviewing` Claim Check" immediately below before running this): `gh pr edit <number> --add-label "loom:reviewing"` to signal you're working on it
+2. **Claim PR** (run the "Stale `loom:reviewing` Claim Check" below first): PR lease, then the label — `loom-daemon lease pr claim <number> --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"; [[ $? =~ ^[02]$ ]] && gh pr edit <number> --add-label "loom:reviewing"`. Any other exit: stand down, touch no worktree (see "PR Lease")
 3. **Check merge state**: Check for conflicts and attempt automated rebase if DIRTY (see Automated Rebase for DIRTY PRs below)
    ```bash
    # Plain `gh` — merge state is verdict-gating and must be live (see "Cached Forge Reads")
@@ -546,9 +541,10 @@ Full policy, TTL/invalidation semantics, and the manual verification steps:
 8b. **Reconcile formal reviews and inline threads**: `./.loom/scripts/check-review-feedback.sh --number <number> --head-sha "$REVIEW_HEAD_SHA"` — CI green plus friendly issue comments is NOT the whole review record (#7647). Exit 0 = clear; 10/11/12 mean something is outstanding, older-head, or unread, and an approval must dispose of it explicitly. See "Formal Review & Inline Thread Reconciliation" below. **Applies to every approval path, including the fast paths** — `post-verdict.sh` re-runs this gate itself and refuses an ungrounded approval.
 9. **Evaluate changes**: Examine diff, look for issues, suggest improvements
 10. **Provide feedback**: Use `./.loom/scripts/post-verdict.sh` to provide evaluation feedback
-11. **Update labels** (⚠️ NEVER use `gh pr review` - see warning at top of file). **Run the Verdict-Time CAS Recheck (see below) immediately before this step** — abort instead of writing if it finds your claim lost, another Judge's verdict already landed, or the head SHA moved off `REVIEW_HEAD_SHA`. It yields `$VERDICT_SHA`, which `post-verdict.sh` MUST be given (see "Verdict SHA Marker") — the script stamps the `<!-- loom:verdict-sha ... -->` marker itself. **The label update is the PRIMARY deliverable — always run it immediately after the comment using `&&`:**
-   - If approved: `post-verdict.sh <number> approved "$VERDICT_SHA" --body ... && gh pr edit <number> --remove-label "loom:review-requested" --remove-label "loom:reviewing" --add-label "loom:pr"` (blue badge - ready for Champion auto-merge)
-   - If changes needed: `post-verdict.sh <number> changes-requested "$VERDICT_SHA" --body ... && gh pr edit <number> --remove-label "loom:review-requested" --remove-label "loom:reviewing" --add-label "loom:changes-requested"` (amber badge - Doctor will address)
+11. **Update labels** (⚠️ NEVER use `gh pr review` - see warning at top of file). **Run the Verdict-Time CAS Recheck (see below) immediately before this step** — abort instead of writing if it finds your claim lost, another Judge's verdict already landed, or the head SHA moved off `REVIEW_HEAD_SHA`. It yields `$VERDICT_SHA`, which `post-verdict.sh` MUST be given (see "Verdict SHA Marker") — the script stamps the `<!-- loom:verdict-sha ... -->` marker itself. The script applies the label (the PRIMARY deliverable) itself; see Label Workflow for exits 7/8:
+   - If approved: `post-verdict.sh <number> approved "$VERDICT_SHA" --body ...` (blue `loom:pr` - ready for Champion auto-merge)
+   - If changes needed: `post-verdict.sh <number> changes-requested "$VERDICT_SHA" --body ...` (amber - Doctor will address)
+   - Then release the PR lease: `loom-daemon lease pr release <number> --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"` (also on any stand-down)
 
 ### Stale `loom:reviewing` Claim Check (Step 2)
 
@@ -562,8 +558,7 @@ ever being reviewed again. This is the minutes-scale analog of the
 `loom-daemon/src/claim_reconciliation.rs`) — reviews run 5–15 minutes in
 practice, not hours, so the grace period is minutes, not hours.
 
-**If the PR does NOT carry `loom:reviewing`:** proceed to claim as today — no
-behavior change: `gh pr edit <number> --add-label "loom:reviewing"`.
+**If the PR does NOT carry `loom:reviewing`:** claim it (step 2).
 
 **If the PR DOES carry `loom:reviewing`:** evaluate the claim with the shared
 staleness evaluator. **Do not hand-roll the timeline/comment arithmetic** —
@@ -588,7 +583,7 @@ Then decide on `$CLAIM_STATE`:
 
 | `$CLAIM_STATE` | Meaning | Action |
 |---|---|---|
-| `unclaimed` | the PR does not actually carry `loom:reviewing` right now | Claim it normally: `gh pr edit $N --add-label "loom:reviewing"` |
+| `unclaimed` | the PR does not actually carry `loom:reviewing` right now | Claim it (step 2). |
 | `fresh` | a Judge is plausibly still working this PR | **Do not stomp the claim.** Record a stand-down (see below), then skip this PR and continue the batch to the next candidate PR. |
 | `stale` | no *claimant* activity for ≥ `LOOM_STALE_REVIEWING_MINUTES` (default **30**) — the claiming Judge's process almost certainly died mid-review | Reclaim (see below), then proceed with the normal review from step 3. |
 | `stale-bounded-fallback` | the stand-down streak reached `LOOM_MAX_STANDDOWN_STREAK` (default **3**) **and** the claim's own age is ≥ `LOOM_STALE_REVIEWING_MINUTES` | Force-reclaim (see below) — the livelock breaker. |
@@ -619,15 +614,10 @@ gh pr comment $N --body "Judge: still running the test suite (step 7) — review
 $(./.loom/scripts/claim-staleness.sh marker --number "$N" --label loom:reviewing)"
 ```
 
-**Stand-down marker convention (#4618 — breaks the livelock)**: a "standing
-down, not stomping" comment is evidence of **no activity**, not activity — it
-means a *later* Judge pass declined to touch the claim, not that the *original*
-claimant is still working. Before #4618, every comment after the claim counted
-indiscriminately, so each stand-down comment satisfied the very freshness test
-the next pass ran, making the claim look eternally fresh even though nothing was
-happening (PR #4614: 3 consecutive stand-down comments over 30+ minutes, never
-reclaimed). Stand-down comments therefore carry their own marker and are counted
-into the streak, never into liveness.
+**Stand-down marker convention (#4618)**: a "standing down, not stomping"
+comment is evidence of **no activity** — a *later* pass declined to touch the
+claim. Stand-down comments carry their own marker and count into the streak,
+never into liveness (counting them made claims look eternally fresh, PR #4614).
 
 **Recording a stand-down** (the `fresh` and `unknown` rows):
 
@@ -643,36 +633,23 @@ It posts the marked stand-down comment the first time, and on every later pass
 <!-- loom:standdown claim=$CLAIMED_AT seq=2 -->
 ```
 
-**This is what keeps the bounded fallback reachable (#6514).** Duplicate
-stand-down suppression (#5123) previously skipped the pass entirely, so
-`STANDDOWN_COUNT` froze at 1 and `LOOM_MAX_STANDDOWN_STREAK` was never reached —
-the second half of the PR #6513 livelock, in which the claim could escape
-neither through the ordinary staleness row nor through the fallback. Bumping in
-place keeps the forge free of near-identical comments (the #5123 goal) while the
-streak still accumulates (the #4618 AC3 goal). A legacy marker with no `seq=`
-counts as `seq=1`. Re-verification of staleness still runs on **every** pass —
-only the redundant *comment* is avoided, never the check.
+**This keeps the bounded fallback reachable (#6514)**: the streak accumulates
+without near-identical comments (#5123). A legacy marker with no `seq=` counts as
+`seq=1`. Staleness is still re-verified on **every** pass.
 
-**Bounded fallback (AC3, #4618; age-floor join added by #4798; unstarved by
-#6514)**: the streak is a hard cap independent of the activity/marker logic
-working correctly — it counts how many stand-down passes have accumulated
-against *this exact* `$CLAIMED_AT` (the marker embeds it, so a genuine reclaim —
-which changes `CLAIMED_AT` — resets the count to zero automatically). But the
-streak by itself measures **peer arrival rate** (how many other Judges happened
-to revisit this PR), not claim liveness — a claim only minutes old can
-accumulate `LOOM_MAX_STANDDOWN_STREAK` stand-downs from that many concurrent
-Judges without coming close to stale in the age sense (#4790: a claim 17m36s
-old, well under the 30-minute default, was force-reclaimed after 3 Judges each
-stood down within that same window). So the fallback fires only once **both**
-hold: `LOOM_MAX_STANDDOWN_STREAK` passes have piled up against the same claim
-with no reclaim, **and** the claim's own age is ≥
-`LOOM_STALE_REVIEWING_MINUTES`. Note that this row is keyed on the **claim's**
-age, not on the idle clock, precisely so a claimant stuck in a loop emitting
-activity markers still cannot hold the claim forever. Use this reclaim comment:
+**Bounded fallback (AC3, #4618/#4798/#6514)**: the streak counts stand-down
+passes against *this exact* `$CLAIMED_AT` (a genuine reclaim resets it). A
+streak alone measures peer arrival rate, not liveness (#4790), so the fallback
+fires only once **both** hold: `LOOM_MAX_STANDDOWN_STREAK` passes against the
+same claim, **and** the claim's own age (not the idle clock, so a looping
+claimant cannot hold it forever) is ≥ `LOOM_STALE_REVIEWING_MINUTES`. Use this
+reclaim comment:
 
 ```bash
-gh pr edit $N --remove-label "loom:reviewing"
-gh pr comment $N --body "Reclaiming loom:reviewing claim: $STANDDOWN_COUNT consecutive stand-down passes have accumulated against claim $CLAIMED_AT (age ≥ ${LOOM_STALE_REVIEWING_MINUTES:-30}m) with no actual review progress (bounded fallback, LOOM_MAX_STANDDOWN_STREAK=${LOOM_MAX_STANDDOWN_STREAK:-3}) — breaking the livelock."
+# The lease first: a live peer lease (exit 4) means stand down, label untouched.
+loom-daemon lease pr claim $N --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"; [[ $? =~ ^[02]$ ]] &&
+gh pr edit $N --remove-label "loom:reviewing" &&
+gh pr comment $N --body "Reclaiming loom:reviewing claim: $STANDDOWN_COUNT consecutive stand-down passes have accumulated against claim $CLAIMED_AT (age ≥ ${LOOM_STALE_REVIEWING_MINUTES:-30}m) with no actual review progress (bounded fallback, LOOM_MAX_STANDDOWN_STREAK=${LOOM_MAX_STANDDOWN_STREAK:-3}) — breaking the livelock." &&
 gh pr edit $N --add-label "loom:reviewing"
 # Continue to step 3 (Check merge state) and evaluate normally
 ```
@@ -680,8 +657,10 @@ gh pr edit $N --add-label "loom:reviewing"
 **Reclaiming a stale claim** (the ordinary idle-clock path):
 
 ```bash
-gh pr edit $N --remove-label "loom:reviewing"
-gh pr comment $N --body "Reclaiming stale loom:reviewing claim (idle ${IDLE_MINUTES}m > ${LOOM_STALE_REVIEWING_MINUTES:-30}m with no claimant activity) — a prior Judge's parent sweep likely died mid-review."
+# The lease first: a live peer lease (exit 4) means stand down, label untouched.
+loom-daemon lease pr claim $N --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"; [[ $? =~ ^[02]$ ]] &&
+gh pr edit $N --remove-label "loom:reviewing" &&
+gh pr comment $N --body "Reclaiming stale loom:reviewing claim (idle ${IDLE_MINUTES}m > ${LOOM_STALE_REVIEWING_MINUTES:-30}m with no claimant activity) — a prior Judge's parent sweep likely died mid-review." &&
 gh pr edit $N --add-label "loom:reviewing"
 # Continue to step 3 (Check merge state) and evaluate normally
 ```
@@ -702,17 +681,10 @@ not been resynced yet): fall back to the **age-only** rule — read the latest
 **not** reintroduce a "any comment after the claim means fresh" test — that is
 precisely the defect this section exists to fix.
 
-**Daemon backstop (#4367, freshness signal fixed by #4618)**: this check is
-the fast path — it only fires when another Judge happens to revisit the same
-PR. `loom-daemon`'s `claim_reconciliation` pass now also reconciles
-`loom:reviewing` (and `loom:treating`, Doctor's equivalent) as an always-on
-backstop at startup and on its periodic tick, sharing this exact
-`LOOM_STALE_REVIEWING_MINUTES`/`LOOM_STALE_TREATING_MINUTES` env vars and
-defaults — and, since #4618, deriving its own age gate from the claim
-label's own `labeled` timeline-event timestamp rather than the PR's
-aggregate `updatedAt`, for the identical reason the marker convention above
-exists (a stand-down comment self-refreshes `updatedAt` but not the label
-event). See [`daemon-reference.md`'s "Stale-claim reconciliation"
+**Daemon backstop (#4367/#4618)**: `loom-daemon`'s `claim_reconciliation`
+pass also reclaims stale `loom:reviewing` (and `loom:treating`) on its tick,
+with the same env vars and defaults, aged from the label's own `labeled`
+event. See [`daemon-reference.md`'s "Stale-claim reconciliation"
 section](https://github.com/rjwalters/loom/blob/main/defaults/docs/daemon-reference.md#stale-claim-reconciliation--the-sweep-journal-3953-fixed-3975-extended-to-pr-side-claims-4367).
 
 **Applies everywhere a Judge claims a PR from a multi-PR pass** — not just
@@ -722,6 +694,23 @@ below, and any cron-invoked pass over `loom:review-requested` PRs: a
 cron-invoked Judge and a `/loom:sweep`-dispatched Judge must apply the
 identical rule so neither stomps the other's fresh claim nor stalls behind a
 dead one.
+
+### PR Lease (Step 2, #9401)
+
+A label is not a mutex: adding one already present is a silent no-op, so two
+Judges could both "hold" `loom:reviewing` (#10994). `lease pr claim` publishes
+a role-keyed lease comment (a Doctor's never contends), orders live leases by
+comment id, and renews yours while your session lives
+(`lease-record.md` § "PR-phase leases"). Same `--watch-pid` every call.
+
+- **claim** exit **0** = held: add `loom:reviewing` (**2** = an older
+  `loom-daemon` without `lease pr`: label alone, as before). **4** = a peer's
+  live lease wins (a lost race posts your yield record), **5** = unreadable,
+  any other code (**1** = `loom-daemon` failed to start) = unknown: never
+  "label-only" — stand down before any worktree or label action; next PR.
+- **fence** is in the Verdict-Time CAS Recheck below and before every push.
+- **release** after the verdict write or any stand-down:
+  `loom-daemon lease pr release <n> --role judge --watch-pid …`.
 
 ### Verdict-Time CAS Recheck (MANDATORY immediately before every verdict-label write)
 
@@ -752,6 +741,8 @@ N=<pr-number>
 # from memory) reinstates exactly the race it closes. See "Cached Forge Reads".
 # One read serves both arms: the label state AND the head SHA your verdict is
 # about to be stamped with (#5686).
+# Lease fence first (row 2 below).
+loom-daemon lease pr fence $N --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"; [[ $? =~ ^[02]$ ]] || echo "CLAIM LOST"
 CURRENT=$(gh pr view $N --json labels,headRefOid)
 CURRENT_LABELS=$(printf '%s\n' "$CURRENT" | jq -r '[.labels[].name] | join(",")')
 VERDICT_SHA=$(printf '%s\n' "$CURRENT" | jq -r '.headRefOid')
@@ -762,7 +753,7 @@ Then decide:
 | Condition | Verdict | Action |
 |-----------|---------|--------|
 | `loom:reviewing` is still present (your claim intact), neither `loom:pr` nor `loom:changes-requested` has appeared, **and** `$VERDICT_SHA` equals the head SHA you actually reviewed | **Safe** | Proceed with the verdict write as planned, stamping `$VERDICT_SHA` into the verdict comment's marker (see "Verdict SHA Marker" below). |
-| `loom:reviewing` was removed or replaced (e.g. reclaimed as stale by another Judge while you were still working) | **Claim lost** | **ABORT.** Discard your verdict — do not write any label. Post a short standing-down note (see below). Do NOT re-add `loom:reviewing`. |
+| The lease fence printed `CLAIM LOST`, or `loom:reviewing` was removed or replaced (e.g. reclaimed as stale by another Judge while you were still working) | **Claim lost** | **ABORT.** Discard your verdict — do not write any label. Post a short standing-down note (see below). Do NOT re-add `loom:reviewing`. |
 | A verdict label (`loom:pr` or `loom:changes-requested`) is already present that you did not just write | **Raced** | **ABORT.** Another Judge's verdict landed first. Discard your verdict and post a short note citing the label you observed — do NOT overwrite their verdict, even if you disagree with it (raise disagreement as a plain PR comment, not a second label write). |
 | `$VERDICT_SHA` differs from the head SHA you checked out and evaluated (someone pushed or force-pushed while you reviewed) | **Tree moved (#5686)** | **ABORT.** Your verdict is about a tree that is no longer here — writing it would create exactly the stale verdict this whole convention exists to prevent. Do not write any label. Post the tree-moved note below, drop `loom:reviewing`, and let a fresh pass evaluate the current head. |
 | The `gh pr view` call fails or returns empty | **Unknown — fail safe** | Treat as raced/claim-lost: do NOT write the verdict. Retry the recheck once; if it still fails, abort and note the API failure rather than guessing. |
@@ -799,19 +790,18 @@ completion write — see `doctor.md`'s "Verdict-Time CAS Recheck".
 **Pre-approval checklist** (verify before executing approval commands):
 - [ ] I am posting my verdict through `./.loom/scripts/post-verdict.sh`, NOT a
       bare `gh pr comment` and NOT `gh pr review`
-- [ ] I am using `gh pr edit` for label changes
 - [ ] I understand `gh pr review --approve` WILL fail with "cannot approve your own PR"
-- [ ] All CI checks pass (verified via `gh pr checks`)
+- [ ] All CI checks pass (verified via `forge wait-checks`)
 - [ ] Merge state is CLEAN (verified via `gh pr view --json mergeStateStatus`)
 - [ ] I will NEVER call `gh pr review` in any form
-- [ ] I will run `post-verdict.sh` AND `gh pr edit` atomically (chained with `&&`)
+- [ ] `post-verdict.sh` exited 0 (it applied the verdict label; exit 8 = run its repair command)
 - [ ] If my review body came from a scratch file, the filename is namespaced by
       the PR/issue number (`review-<N>.md`, never a fixed name like
       `review.md` — wave subagents share one scratchpad, #6381), I passed it
       via `--body-file <path>` (`post-verdict.sh` also accepts `-` for stdin) —
-      NEVER `--body @<path>` (see the `--body @path` anti-pattern warning
-      above — `post-verdict.sh` refuses this itself, but do not rely on that
-      as the review step) — and I re-fetched the posted comment (`gh pr view
+      NEVER `--body @<path>` / `@-` (see the anti-pattern warning above —
+      `post-verdict.sh` refuses those, and any empty, `-` or under-20-char
+      body, #9258; do not rely on that as the review step) — and I re-fetched the posted comment (`gh pr view
       <number> --comments` or `gh api .../issues/<number>/comments`) to verify
       it renders my actual review prose, not a literal path string
 - [ ] I passed the SHA from the Verdict-Time CAS Recheck above as
@@ -875,17 +865,15 @@ verdict is posted through `post-verdict.sh`, that specific failure mode is
 gone — the marker is an argument, not prose, so there is no "forgot to append
 it" outcome for that call. What remains possible is a model deviating from
 this document and calling raw `gh pr comment` instead; the pre-approval
-checklist above exists to catch that. Two mechanical backstops also cover
-whatever gets through anyway: the stale-verdict sweep below runs the guard
-with `--anchor`, and `loom-daemon`'s `reconcile_pr_verdicts` anchors on its
-periodic tick. Both post the missing marker at whatever the head is *when they
-run*.
+checklist above exists to catch that. Two mechanical backstops catch what
+gets through: the stale-verdict sweep below (guard `--clear --anchor`) and
+`loom-daemon`'s `reconcile_pr_verdicts` tick. A markerless **approval** is
+re-queued (`loom:pr` → `loom:review-requested`), **never anchored** (#9258);
+only a markerless rejection is anchored at the head *as of that run*.
 
-**That is a bound on future exposure, not a repair.** Neither backstop knows
-which tree you actually reviewed — if the head moved between your verdict and
-the anchor, they anchor an approval to a tree nobody read, and it will then
-read as `FRESH`. Only the marker `post-verdict.sh` writes at verdict time
-records the truth. Use it.
+**Neither backstop knows which tree you reviewed**, so a markerless approval
+is lost work, never a merge. Only the marker `post-verdict.sh` writes at
+verdict time records the truth. Use it.
 
 **Only stamp genuine verdicts.** Stand-down notes, progress comments,
 fallback-queue notes, and the stale-verdict notice itself are not verdicts and
@@ -913,8 +901,8 @@ nothing would ever look at it again. Sweep those two queues first:
 # Report-and-act gate; one call per candidate PR. Exit codes:
 #   0 = FRESH (verdict matches current head), 10 = no verdict label,
 #   11 = UNVERIFIABLE (no marker AND could not anchor — fail safe, kept),
-#   12 = STALE (cleared + re-queued when --clear is passed),
-#   13 = ANCHORED (no marker; --anchor stamped one at the current head, #6319),
+#   12 = STALE (head moved, or an unmarked approval, #9258; re-queued on --clear),
+#   13 = ANCHORED (unmarked changes-requested only; stamped at current head, #6319),
 #   1 = gh/env error.
 UNANCHORED=""; ANCHORED=""
 for PR in $("$GH_READ" pr list --state=open --limit 200 --json number,labels \
@@ -933,8 +921,8 @@ done
 and it discarded the one outcome that looks like success and is not:
 `UNVERIFIABLE` means a verdict label is standing that *nothing can ever
 invalidate*. Passing `--anchor` fixes most of them (the guard stamps the
-missing marker; it writes no labels, so nothing is approved, rejected, or
-un-parked by doing so), and the residual `11`s are exactly the PRs an operator
+marker on a rejection, writing no labels; an unmarked *approval* is STALE
+and re-queued, never anchored, #9258), and the residual `11`s are exactly the PRs an operator
 needs named — typically ones on a `loom:blocked` / `loom:operator` /
 `loom:operator-only` hold, where the guard deliberately declines to comment.
 
@@ -969,7 +957,7 @@ change the stand-down behavior to accommodate this sweep.
 
 ### Fallback Queue (Review Only)
 
-`pr-queue --role judge` includes trusted interactive fallback work alongside labeled work when human preference is enabled. Otherwise fallback admission waits for an empty labeled queue. Origin grants review priority only: fallback review never adds workflow labels or authorizes branch changes/automated landing.
+`pr-queue --role judge` lists fallback beside labeled work for trusted interactive PRs (preference on) and, after labeled rows, unlabeled same-repo `feature/issue-<N>` PRs. Other shapes and forks wait for an empty labeled queue. Fallback review never adds labels or authorizes branch changes/automated landing.
 
 **Incident this section guards against (#5455)**: PR #4972 — a 2-line
 Dependabot `Cargo.lock` bump — accumulated **199 fallback-mode Judge
@@ -1209,8 +1197,12 @@ gh pr view <number> --json mergeStateStatus --jq '.mergeStateStatus'
 
 ### If DIRTY: Attempt Automated Rebase
 
-**When a PR has merge conflicts, attempt automated rebase before routing to
+**When a PR has merge conflicts, attempt an automated update before routing to
 Doctor** — this reduces the Doctor→Judge→Merge cycle for simple conflicts.
+**Update = merge** `origin/main` in, unless `loom-daemon branch-update strategy`
+prints `rebase` (#10771): where the repo bars rebase, a rebase deletes other
+agents' merge commits and orphans reviewed heads. Merge mode never force-pushes;
+a rejected plain push means someone pushed — fall back, never force.
 
 **Both `gh pr edit` fallback writes below are verdict-label writes** — run the
 Verdict-Time CAS Recheck immediately before each (see above) and abort instead
@@ -1221,8 +1213,6 @@ PR_NUMBER=<number>
 MERGE_STATE=$(gh pr view $PR_NUMBER --json mergeStateStatus --jq '.mergeStateStatus')
 
 if [ "$MERGE_STATE" = "DIRTY" ]; then
-    echo "PR has merge conflicts - attempting automated rebase"
-
     # Checkout PR branch (worktree-aware — see "PR Branch Isolation")
     ISSUE_NUM=$(gh pr view $PR_NUMBER --json headRefName --jq '.headRefName' | sed 's/feature\/issue-//')
     if [ -d ".loom/worktrees/issue-${ISSUE_NUM}" ]; then
@@ -1232,79 +1222,42 @@ if [ "$MERGE_STATE" = "DIRTY" ]; then
         cd ".loom/worktrees/pr-${PR_NUMBER}"
     fi
 
-    # Verify we're on the correct branch (not detached HEAD)
-    CURRENT_BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null || echo "DETACHED")
-    if [ "$CURRENT_BRANCH" = "DETACHED" ]; then
-        echo "Checkout resulted in detached HEAD - falling back to change request"
-        # Fall back to current behavior (see below)
-    fi
-
+    GATE_OK=true
+    # Detached HEAD: skip the update, fall back to change request (below)
+    BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null) || GATE_OK=false
+    PUSH_LEASE_SHA=$(git rev-parse HEAD)  # pin BEFORE the update, never re-read (#9487)
+    BRANCH_UPDATE=$(loom-daemon branch-update strategy) || BRANCH_UPDATE=merge  # unknown = merge
     git fetch origin main
+    PRE_REBASE_AHEAD=$(git rev-list --count origin/main..HEAD)  # payload-drop guard (#8298)
 
-    # Commits ahead pre-rebase, for the payload-drop guard below (#8298).
-    PRE_REBASE_AHEAD=$(git rev-list --count origin/main..HEAD)
-
-    # Attempt rebase
-    if git rebase origin/main; then
-        # Version-bearing-file sync gate (#7168/#7341, moot after #7743): gate
-        # BEFORE push since this auto-rebase pushes directly. On failure,
-        # never hand-patch the version-bearing files yourself or run
-        # `version.sh bump` -- fall back below instead.
-        GATE_OK=true
-        if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-check-gate.sh --fix-hint "then push."; then
-            echo "Version-bearing files out of sync after rebase (see BLOCKER:/Fix: above) - falling back to change request"
-            GATE_OK=false
-        fi
-        # Payload-drop guard (#8298): rebase succeeded but the tree is now
-        # identical to origin/main, silently dropping this PR's content (only
-        # flagged when the branch had real commits ahead pre-rebase).
-        if [ "$GATE_OK" = true ] && [ "$PRE_REBASE_AHEAD" -gt 0 ] && git diff --quiet origin/main HEAD; then
-            echo "Rebase silently dropped PR payload (empty diff vs origin/main) - falling back to change request"
-            GATE_OK=false
-        fi
-        # Rebase succeeded - push changes
-        if [ "$GATE_OK" = true ] && git push --force-with-lease; then
-            echo "Rebase successful - proceeding with evaluation"
-            gh pr comment $PR_NUMBER --body "🔀 Automatically rebased branch to resolve merge conflicts. Proceeding with code evaluation."
-            # Continue with normal evaluation
-        else
-            echo "Push failed - falling back to change request"
-            git rebase --abort 2>/dev/null || true
-            # Fall back: merge-conflict + changes-requested
-            ./.loom/scripts/post-verdict.sh $PR_NUMBER changes-requested "$VERDICT_SHA" --body "$(cat <<'EOF'
-❌ **Changes Requested - Merge Conflict**
-
-Automated rebase succeeded but push failed (possibly due to branch protection or concurrent changes).
-
-Please rebase your branch manually and push:
-```bash
-git fetch origin
-git rebase origin/main
-git push --force-with-lease
-```
-
-I'll evaluate again once conflicts are resolved.
-EOF
-)" && \
-            gh pr edit $PR_NUMBER --remove-label "loom:review-requested" --remove-label "loom:reviewing" --add-label "loom:changes-requested" --add-label "loom:merge-conflict"
-        fi
+    if [ "$GATE_OK" = true ]; then
+        if [ "$BRANCH_UPDATE" = rebase ]; then git rebase origin/main; else git merge --no-ff -m "Merge origin/main into $BRANCH (Judge: resolve conflicts)" origin/main; fi || GATE_OK=false
+    fi
+    # Version-bearing-file sync gate (#7168/#7341, moot after #7743): gate BEFORE
+    # the push. On failure never hand-patch the version-bearing files yourself
+    # or run `version.sh bump`.
+    if [ "$GATE_OK" = true ] && [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-check-gate.sh --fix-hint "then push."; then
+        GATE_OK=false
+    fi
+    # Payload-drop guard (#8298): the update left a tree identical to origin/main.
+    if [ "$GATE_OK" = true ] && [ "$PRE_REBASE_AHEAD" -gt 0 ] && git diff --quiet origin/main HEAD; then
+        echo "Update silently dropped PR payload (empty diff vs origin/main)"; GATE_OK=false
+    fi
+    if [ "$GATE_OK" = true ]; then  # lease fence (#9401)
+        loom-daemon lease pr fence $PR_NUMBER --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"
+        [[ $? =~ ^[02]$ ]] || exit 1  # lost: stand down, no verdict
+    fi
+    if [ "$GATE_OK" = true ] && if [ "$BRANCH_UPDATE" = rebase ]; then git push --force-with-lease="$BRANCH:$PUSH_LEASE_SHA"; else git push origin "HEAD:$BRANCH"; fi; then
+        gh pr comment $PR_NUMBER --body "🔀 Automatically updated the branch from main ($BRANCH_UPDATE) to resolve merge conflicts. Proceeding with code evaluation."
     else
-        echo "Rebase failed (complex conflicts) - falling back to change request"
-        git rebase --abort
-
-        # Fall back: merge-conflict + changes-requested
+        echo "Update, gate or push failed - falling back to change request"
+        git rebase --abort 2>/dev/null || git merge --abort 2>/dev/null || true
         ./.loom/scripts/post-verdict.sh $PR_NUMBER changes-requested "$VERDICT_SHA" --body "$(cat <<'EOF'
 ❌ **Changes Requested - Merge Conflict**
 
-This PR has merge conflicts that could not be automatically resolved.
+This PR has merge conflicts with main that could not be resolved automatically.
 
-Please rebase your branch on main and resolve conflicts:
-```bash
-git fetch origin
-git rebase origin/main
-# Resolve conflicts
-git push --force-with-lease
-```
+Please bring the branch up to date and resolve them: `git fetch origin && git merge origin/main`, then a plain `git push` (rebase only if `loom-daemon branch-update strategy` prints `rebase`, then push with a pinned `--force-with-lease=<branch>:<sha>`).
 
 I'll re-evaluate once conflicts are resolved, or the Doctor role will handle this.
 EOF
@@ -1314,34 +1267,34 @@ EOF
 fi
 ```
 
-**Edge cases for DIRTY rebase:**
+**Edge cases for the DIRTY update:**
 
 | Scenario | Handling |
 |----------|----------|
-| Push permission denied | Abort rebase, fall back to change request |
-| Concurrent push during rebase | `--force-with-lease` fails safely, fall back |
-| Detached HEAD after checkout | Skip rebase, fall back to change request |
-| Rebase succeeds but CI may fail | Continue to evaluation - CI verification handles this |
-| Rebase succeeds but diff vs `origin/main` is empty | Payload-drop guard fires (#8298); fall back to change request |
+| Push permission denied | Abort, fall back to change request |
+| Concurrent push during the update | Merge mode: the plain push is rejected (non-fast-forward). Rebase mode: only the *pinned* lease rejects it — a bare `--force-with-lease` trusts the shared tracking ref and can silently overwrite (#9487). Either way fall back; never force |
+| Detached HEAD after checkout | Skip the update, fall back to change request |
+| Update succeeds but CI may fail | Continue to evaluation - CI verification handles this |
+| Update succeeds but diff vs `origin/main` is empty | Payload-drop guard fires (#8298); fall back to change request |
 
 ### If BEHIND: Attempt Rebase
 
 ```bash
-# Fetch and rebase
+BRANCH=$(git branch --show-current); PUSH_LEASE_SHA=$(git rev-parse HEAD)  # pin first (#9487)
+BRANCH_UPDATE=$(loom-daemon branch-update strategy) || BRANCH_UPDATE=merge  # #10771
 git fetch origin main
-git rebase origin/main
+if [ "$BRANCH_UPDATE" = rebase ]; then git rebase origin/main; else git merge --no-ff -m "Merge origin/main into $BRANCH (Judge: branch behind main)" origin/main; fi || exit 1
 
-# Version-bearing-file sync gate (#7168/#7341, moot after #7743) -- see
-# DIRTY path's gate above. On failure, abort and request changes naming
-# the file(s) to revert to origin/main's values.
+# Version-bearing-file sync gate -- see the DIRTY path. On failure, abort and
+# request changes naming the file(s) to revert to origin/main's values.
 if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-check-gate.sh --fix-hint "then push."; then
-  echo "Version-bearing files out of sync after rebase (see BLOCKER:/Fix: above) - aborting push"
+  echo "Version-bearing files out of sync after update (see BLOCKER:/Fix: above) - aborting push"
   exit 1
 fi
 
-# If rebase succeeds (no conflicts)
-git push --force-with-lease
-echo "Branch rebased successfully, continuing evaluation"
+loom-daemon lease pr fence <number> --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"
+[[ $? =~ ^[02]$ ]] || exit 1  # lease lost: stand down
+if [ "$BRANCH_UPDATE" = rebase ]; then git push --force-with-lease="$BRANCH:$PUSH_LEASE_SHA"; else git push origin "HEAD:$BRANCH"; fi
 ```
 
 ### Simple vs Complex Conflicts
@@ -1360,19 +1313,19 @@ echo "Branch rebased successfully, continuing evaluation"
 ### For Simple Conflicts (Judge Resolves)
 
 ```bash
-# Resolve the conflict (e.g., keep both additions)
-# git add <resolved-files>
-git rebase --continue
+# Resolve the conflict (e.g., keep both additions), `git add <resolved-files>`, then finish
+if [ "$BRANCH_UPDATE" = rebase ]; then git rebase --continue; else git commit --no-edit; fi
 
-# Version-bearing-file sync gate (#7168, extended #7341): same reasoning as
-# the DIRTY/BEHIND paths above -- gate before this direct push too.
+# Version-bearing-file sync gate (#7168, extended #7341): gate before this push too.
 if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-check-gate.sh --fix-hint "then push."; then
-  echo "Version-bearing files out of sync after rebase (see BLOCKER:/Fix: above) - aborting push"
+  echo "Version-bearing files out of sync after update (see BLOCKER:/Fix: above) - aborting push"
   exit 1
 fi
 
-git push --force-with-lease
-gh pr comment <number> --body "🔀 Rebased branch and resolved merge conflict (both sides added entries to config)"
+loom-daemon lease pr fence <number> --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"
+[[ $? =~ ^[02]$ ]] || exit 1  # lease lost: stand down
+if [ "$BRANCH_UPDATE" = rebase ]; then git push --force-with-lease="$BRANCH:$PUSH_LEASE_SHA"; else git push origin "HEAD:$BRANCH"; fi
+gh pr comment <number> --body "🔀 Updated the branch from main and resolved a merge conflict (both sides added entries to config)"
 ```
 
 ### Version-Bearing-File-Only Conflicts: superseded (#7743)
@@ -1410,7 +1363,7 @@ for a rebase, do **not** treat it as a violation of the new invariant.
 Run the Verdict-Time CAS Recheck immediately before the `gh pr edit` below.
 
 ```bash
-git rebase --abort
+git rebase --abort 2>/dev/null || git merge --abort
 ./.loom/scripts/post-verdict.sh <number> changes-requested "$VERDICT_SHA" --body "$(cat <<'FEEDBACK'
 ❌ **Changes Requested - Merge Conflict**
 
@@ -1419,7 +1372,7 @@ This PR has merge conflicts with main that require manual resolution:
 **Conflicting files:**
 - `src/foo.ts` - overlapping changes in `processData()` function
 
-Please rebase your branch and resolve conflicts, or the Doctor role will handle this.
+Please merge main into your branch (rebase only where `loom-daemon branch-update strategy` says so) and resolve conflicts, or the Doctor role will handle this.
 
 I'll evaluate the code once conflicts are resolved.
 FEEDBACK
@@ -1453,29 +1406,29 @@ FEEDBACK
 
 ## CI Status Check (REQUIRED Before Approval)
 
-**CRITICAL: Never approve a PR until all CI checks pass.**
+**CRITICAL: Never approve a PR until ALL checks on the exact reviewed head pass, required or not (#10485).** `post-verdict.sh ... approved` enforces this itself: it reads the head via `loom-daemon forge wait-checks` and refuses an approval — exit **5** (pending, empty-with-required-contexts, head moved, unreadable reader) or **6** (any red check) — posting nothing. **The script, not you, is the authority:** never approve "because the required checks passed", never accept a red or skipped-for-approval non-required check, never weaken a check to get green. Exit 5: do not add `loom:pr`; follow "When CI is Pending". Exit 6: post `changes-requested` per "When CI Fails" (an external approval-required workflow: say so and point at the operator, not the Doctor). The gate lives in the script, so every approval path (full, Docs-Only, conflict-only, minor-description-fix, trivial-fix) is covered. The `&&` chain means `loom:pr` is unreachable after a refusal.
 
 Local tests passing is not sufficient - you MUST verify that GitHub Actions CI workflows have completed successfully. This prevents situations where a PR is approved while CI is still running or failing.
 
-**Every command in this section runs as plain `gh` — never `"$GH_READ"`.** CI
+**Every `gh` read in this section is plain — never `"$GH_READ"`.** CI
 status and merge state are the reads a verdict is gated on, so they must
 observe current state unconditionally; a cached green from 30 seconds ago can
-predate the push that broke the build. (`gh pr checks` is passthrough inside
-the wrapper regardless, so this is belt-and-suspenders for it and load-bearing
-for the `mergeStateStatus` reads.) See "Cached Forge Reads" for the full policy.
+predate the push that broke the build. (`forge wait-checks` revalidates every
+read via ETag, so it is live too.) See "Cached Forge Reads" for the full policy.
 
 ### How to Check CI Status
 
-**Step 1: Check all PR checks**
+**Step 1: Snapshot all PR checks** (`--timeout 0` would read a no-checks repo as `TIMEOUT`)
 
 ```bash
-gh pr checks <PR_NUMBER>
+loom-daemon forge wait-checks <PR_NUMBER> --timeout 20
 ```
 
-This shows the status of all CI checks. Look for:
-- ✅ All checks show `pass` - Safe to approve
-- ❌ Any check shows `fail` - Request changes
-- ⏳ Any check shows `pending` - Wait for completion
+Branch on the first stdout line:
+- ✅ `LOOM-CHECKS-GREEN` / `-NONE` (no checks) - Safe to approve
+- ❌ `-RED` - Request changes (stderr: `<name>\t<url>\t<run_id>` per failure)
+- ⏳ `-TIMEOUT` / `-HEAD-MOVED` - Pending (see "When CI is Pending")
+- `-ERROR` or no sentinel (Gitea / older binary) - run `gh pr checks <PR_NUMBER>` once
 
 **Step 2: Verify merge state**
 
@@ -1487,7 +1440,7 @@ gh pr view <PR_NUMBER> --json mergeStateStatus --jq '.mergeStateStatus'
 |--------|---------|--------|
 | `CLEAN` | All checks pass, no conflicts | Safe to approve |
 | `BLOCKED` | Required checks failing | Request changes |
-| `UNSTABLE` | Non-required checks failing | Assess if acceptable |
+| `UNSTABLE` | Non-required checks failing | Do not approve (all-CI policy) |
 | `BEHIND` | Branch needs rebase | Attempt rebase |
 | `DIRTY` | Merge conflicts | Attempt automated rebase (see Rebase Check section) |
 | `UNKNOWN` | Status not computed yet | Wait and retry |
@@ -1502,7 +1455,7 @@ If CI checks are failing, **do NOT approve**. Instead, apply `loom:ci-failure` f
 
 The following CI checks are failing:
 
-[LIST THE FAILING CHECKS FROM `gh pr checks` OUTPUT]
+[LIST THE FAILING CHECKS (RED DETAIL)]
 
 Please fix these issues before the PR can be approved. Common causes:
 - Shellcheck warnings in shell scripts
@@ -1518,17 +1471,7 @@ EOF
 
 ### When Merge Conflicts Exist
 
-If the PR has merge conflicts (`mergeStateStatus` is `DIRTY`), **attempt automated rebase first** before requesting changes.
-
-**See the "If DIRTY: Attempt Automated Rebase" section above for the complete workflow.**
-
-The automated rebase will:
-1. Checkout the PR branch
-2. Fetch latest main and attempt rebase
-3. If successful: push with `--force-with-lease` and continue evaluation
-4. If failed: abort rebase and apply `loom:merge-conflict` + `loom:changes-requested`
-
-**Fallback behavior** (when automated rebase fails): the DIRTY workflow above applies `loom:merge-conflict` + `loom:changes-requested` (and removes `loom:reviewing`) with a rebase-instructions comment. See "If DIRTY: Attempt Automated Rebase" for the exact commands.
+If the PR has merge conflicts (`mergeStateStatus` is `DIRTY`), **attempt the automated update first** before requesting changes — see "If DIRTY: Attempt Automated Rebase" above: merge `origin/main` in (rebase only in rebase mode, #10771), push without force (rebase mode: pinned lease), and continue evaluation; on failure abort and apply `loom:merge-conflict` + `loom:changes-requested` (removing `loom:reviewing`) with the update-instructions comment.
 
 ### When CI is Pending
 
@@ -1538,42 +1481,19 @@ If checks are still running, **do not block on them and do not approve on a gues
 2. **Release your claim** — remove `loom:reviewing` so a later pass picks it up cleanly.
 3. **Skip and continue the batch** — move on to the next PR. The next cron tick re-evaluates this PR once CI has settled.
 
-**Trap: empty `gh pr checks` output is NOT proof nothing is pending.** `gh pr
-checks` is GraphQL-backed and can return completely empty output (zero rows)
-during a transient forge failure (e.g. an intermittent TLS handshake error) —
-that empty state is indistinguishable from "nothing pending" to a naive `grep
--q pending`, and this has already happened in production: on kicad-tools PR
-#4792 (2026-08-13) a Judge poller read one empty response and declared CI
-"settled" 6 minutes into a ~40-minute board-test run (#6169). Guard against it
-by requiring at least one row back before trusting the absence of "pending" —
-retry once on a zero-row read before concluding there is genuinely nothing to
-wait for:
+**Pending-CI skip check.** `loom-daemon forge wait-checks <PR_NUMBER> --timeout 0` is a single ETag'd poll (no wait) that also handles the empty-rollup trap (#6169). Branch on the first **stdout** line:
 
 ```bash
-# ci_still_pending: true (pending) if any row shows pending/queued/in_progress.
-# A ZERO-ROW read is retried once before being trusted — on a real forge blip
-# the retry almost always returns real rows; only a read that is STILL empty
-# after the retry is treated as "genuinely no checks reported" (not pending).
-ci_still_pending() {
-  local pr="$1" out rows
-  out="$(gh pr checks "$pr" 2>/dev/null)"
-  rows="$(printf '%s\n' "$out" | grep -c $'\t' || true)"
-  if [[ "$rows" -eq 0 ]]; then
-    sleep 3
-    out="$(gh pr checks "$pr" 2>/dev/null)"
-    rows="$(printf '%s\n' "$out" | grep -c $'\t' || true)"
-    [[ "$rows" -eq 0 ]] && return 1   # confirmed empty on retry -- not pending
-  fi
-  printf '%s\n' "$out" | grep -qE "(pending|queued|in_progress)"
-}
-
-# Check if any checks are still pending; if so, release the claim and skip (no end-state label)
-if ci_still_pending <PR_NUMBER>; then
+first="$(loom-daemon forge wait-checks <PR_NUMBER> --timeout 0 2>/dev/null | head -n1)"
+case "$first" in
+  LOOM-CHECKS-TIMEOUT*)   # still pending: release the claim and skip (no end-state label)
     gh pr comment <number> --body "Code evaluation looks good; CI is still running. Releasing the claim and skipping — a later tick will re-evaluate once CI settles."
-    # Release the claim WITHOUT applying an end-state label — PR stays loom:review-requested
-    gh pr edit <number> --remove-label "loom:reviewing"
-    # Continue to the next PR in the batch
-fi
+    gh pr edit <number> --remove-label "loom:reviewing"   # PR stays loom:review-requested; continue to the next PR
+    ;;
+  LOOM-CHECKS-RED*) ;;    # failing checks: rerun without 2>/dev/null for <name>\t<url>\t<run_id>
+  LOOM-CHECKS-GREEN*|LOOM-CHECKS-NONE*) ;;
+  *) gh pr checks <PR_NUMBER> ;;   # no sentinel (older binary / Gitea): one snapshot, no loop
+esac
 ```
 
 ### CRITICAL: Never End Your Turn on a Background CI Monitor
@@ -1585,79 +1505,25 @@ This mirrors the orchestrator-level guardrail already documented in `sweep.md` (
 **There are exactly two safe paths when CI is pending and you cannot approve on a guess:**
 
 1. **Batch mode (there is a next PR to move to): skip and continue.** Use the "When CI is Pending" procedure above — release `loom:reviewing`, leave `loom:review-requested` in place, move on to the next PR. This is not a fallback of last resort; it is the correct default whenever a next PR exists, because a later tick re-evaluates this one.
-2. **Single-PR / manual invocation (there is no next PR — you were dispatched to judge exactly this one PR and a verdict is expected before your turn ends): block-poll in the foreground.** Loop **inside this same turn** — check `gh pr checks <PR_NUMBER>`, `sleep` a fixed interval, repeat — until the checks resolve or you hit an explicit, bounded cap. This is an ordinary shell loop that runs to completion and returns control to you before you write your final message; nothing about it depends on a future turn.
+2. **Single-PR / manual invocation (there is no next PR — you were dispatched to judge exactly this one PR and a verdict is expected before your turn ends): wait in the foreground.** Run `loom-daemon forge wait-checks` **inside this same turn** (bounded by `--timeout`; it also handles the empty-rollup trap, #6169). It returns control before you write your final message; nothing about it depends on a future turn. Branch on the first **stdout** line, never the exit code; keep stderr separate (RED detail).
 
 ```bash
-# Foreground block-poll — single-PR Judge invocation, no batch to fall back to.
-# Bounded: MAX_WAIT caps total wait time; never loop unboundedly.
-# ci_still_pending guards against the empty-output false-settle trap (#6169) —
-# see "When CI is Pending" above for the full rationale.
-ci_still_pending() {
-  local pr="$1" out rows
-  out="$(gh pr checks "$pr" 2>/dev/null)"
-  rows="$(printf '%s\n' "$out" | grep -c $'\t' || true)"
-  if [[ "$rows" -eq 0 ]]; then
-    sleep 3
-    out="$(gh pr checks "$pr" 2>/dev/null)"
-    rows="$(printf '%s\n' "$out" | grep -c $'\t' || true)"
-    [[ "$rows" -eq 0 ]] && return 1   # confirmed empty on retry -- not pending
-  fi
-  printf '%s\n' "$out" | grep -qE "(pending|queued|in_progress)"
-}
-
-MAX_WAIT=1800   # 30 min cap — tune to the repo's typical CI duration
-INTERVAL=60
-ELAPSED=0
-while ci_still_pending <PR_NUMBER>; do
-  if [[ "$ELAPSED" -ge "$MAX_WAIT" ]]; then
-    echo "CI still pending after ${MAX_WAIT}s — falling back to a conditional verdict."
-    break
-  fi
-  sleep "$INTERVAL"
-  ELAPSED=$((ELAPSED + INTERVAL))
-done
+err="$(mktemp)"; out="$(loom-daemon forge wait-checks <PR_NUMBER> --timeout 1800 2>"$err")"; first="${out%%$'\n'*}"
+case "$first" in
+  LOOM-CHECKS-GREEN*|LOOM-CHECKS-NONE*) ;;   # settled green
+  LOOM-CHECKS-RED*) cat "$err" ;;            # <name>\t<url>\t<run_id> per failure; gh run view <run_id> --log-failed
+  LOOM-CHECKS-TIMEOUT*|LOOM-CHECKS-HEAD-MOVED*|LOOM-CHECKS-ERROR*) ;;   # unsettled: conditional verdict below
+  *) gh pr checks <PR_NUMBER> ;;             # no sentinel (older binary / Gitea): one snapshot, no loop
+esac
 ```
 
 **If the cap is reached and CI is still pending, do not extend the wait and do not reach for a background watcher instead.** Post a conditional-verdict comment stating plainly that the code review passed but CI had not settled after the bounded wait, then — since there is no batch to hand this off to — release `loom:reviewing` and leave `loom:review-requested` in place, exactly as the skip-and-continue path does, so a later Judge invocation (the next cron tick, or a fresh manual dispatch) can re-evaluate once CI has settled.
 
-**Never substitute an armed `Monitor`/`ScheduleWakeup` timer or a `run_in_background` watcher for either path above.** A timer or background task that is still armed when you end your turn is not "waiting" — in headless `-p` mode it is simply killed along with the process, and the PR is orphaned with a stale claim and no verdict. If you have not personally observed the CI result (via a `gh pr checks` call whose output you read in this turn), you have not verified it, and you MUST NOT write a final message that implies the verdict is settled or "in progress elsewhere."
-
-### Example CI Verification Workflow
-
-```bash
-# 1. Check CI status
-gh pr checks 42
-# Example output:
-# ✓ build-and-test   pass   2m35s   https://...
-# ✓ lint             pass   45s     https://...
-# ✓ typecheck        pass   1m12s   https://...
-
-# 2. Verify merge state
-gh pr view 42 --json mergeStateStatus --jq '.mergeStateStatus'
-# Should output: CLEAN
-
-# 3. Run the Verdict-Time CAS Recheck, then approve (BOTH commands in one chain)
-VERDICT_SHA=$(gh pr view 42 --json headRefOid --jq '.headRefOid')
-./.loom/scripts/post-verdict.sh 42 approved "$VERDICT_SHA" \
-    --body "✅ **Approved!** All CI checks pass, code looks great." && \
-  gh pr edit 42 --remove-label "loom:review-requested" --remove-label "loom:reviewing" --add-label "loom:pr"
-```
+**Never substitute an armed `Monitor`/`ScheduleWakeup` timer or a `run_in_background` watcher for either path above.** A timer or background task that is still armed when you end your turn is not "waiting" — in headless `-p` mode it is simply killed along with the process, and the PR is orphaned with a stale claim and no verdict. If you have not personally observed the CI result (a CI result you read in this turn), you have not verified it, and you MUST NOT write a final message that implies the verdict is settled or "in progress elsewhere."
 
 ### Why CI Verification Matters
 
-**Scenario that caused this requirement (Issue #1441):**
-1. Doctor fixed a Rust test, pushed changes
-2. Judge evaluated, saw local tests pass, approved with `loom:pr`
-3. CI was still failing (shellcheck, frontend tests)
-4. Had to run multiple doctor passes to fix remaining failures
-
-**The lesson:** Local tests may pass while CI fails due to:
-- Different test environments (CI has more checks)
-- Shellcheck or lint rules not run locally
-- Integration tests that only run in CI
-- Platform-specific issues (CI runs on different OS)
-
-**Always verify `gh pr checks` before approving.**
+Issue #1441: a Judge approved on local-test green while CI was still failing, costing several Doctor passes. Approve only after `post-verdict.sh` accepts the head; `forge wait-checks` is for evidence, not authority.
 
 ## Formal Review & Inline Thread Reconciliation (REQUIRED Before Approval, #7647)
 
@@ -1793,7 +1659,7 @@ Red flags that should trigger a full evaluation instead:
 **3. Verify CI passes — and reconcile formal reviews/inline threads:**
 
 ```bash
-gh pr checks <PR_NUMBER>
+loom-daemon forge wait-checks <PR_NUMBER> --timeout 20   # GREEN/NONE (Step 1)
 gh pr view <PR_NUMBER> --json mergeStateStatus --jq '.mergeStateStatus'
 # A conflict-only re-push does not resolve anyone's outstanding review (#7647).
 ./.loom/scripts/check-review-feedback.sh --number <PR_NUMBER> --head-sha "$REVIEW_HEAD_SHA"
@@ -1997,6 +1863,10 @@ EOF
   full flow.
 
 ## Evaluation Focus Areas
+
+### Rollout check (host-move PRs)
+
+If the PR moves work between hosts or changes who emits a fleet signal (authority, captain, singleton jobs, gating, capability routing), request changes when `## Rollout check` is missing or names no concrete queryable signal and expected value. Other PRs: never flag. Detail: `judge-reference.md` § "Rollout check".
 
 ### PR Description and Issue Linking (CRITICAL)
 
@@ -2222,10 +2092,10 @@ git add -A
 git commit -m "Remove unused import (during evaluation)"
 ```
 
-**Step 4: Push to the PR branch**
+**Step 4: Push to the PR branch** (behind the lease fence)
 
 ```bash
-git push
+loom-daemon lease pr fence <number> --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"; [[ $? =~ ^[02]$ ]] && git push
 ```
 
 **Step 5: Note the fix in your approval comment** (run the Verdict-Time CAS Recheck immediately before the `gh pr edit` below)
@@ -2562,7 +2432,7 @@ In step 7, run only the tests relevant to the changed files (**scoped test execu
 
 | File | Load when |
 |---|---|
-| [`cargo-target-isolation.md`](cargo-target-isolation.md) | Before a local cargo result informs a verdict: a shared target dir may hold another worktree's binary (#8457). |
+| [`cargo-target-isolation.md`](cargo-target-isolation.md) | Any cargo build: use exported `CARGO_TARGET_DIR` or `<worktree>/target`; never `/tmp`, `~`, `.loom/target-*` (#8370). |
 
 ## Feedback Style
 

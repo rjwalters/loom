@@ -56,6 +56,12 @@ enum WorkerCommand {
     /// proxy to bad-mark this launch's current account and swap in another
     /// behind the same placeholder. Prints `export LOOM_TOKEN_NAME='…'`.
     ProxyRotate(super::egress_proxy::rotate_client::RotateArgs),
+
+    /// Launch one sweep phase (`--role builder|doctor`) out of process on the
+    /// runtime its `rolePreference` resolves to (#11285). Blocking; exits 0
+    /// with `delegate-to-claude` when the role resolves to Claude. Judge and
+    /// Curator are refused (exit 2).
+    Run(super::phase_run::RunArgs),
 }
 
 fn report(name: Option<&str>, runtime: Option<&str>) -> Result<(String, bool), LaunchError> {
@@ -80,15 +86,23 @@ fn report(name: Option<&str>, runtime: Option<&str>) -> Result<(String, bool), L
     for harness in harnesses {
         let _ = writeln!(out, "harness {harness}: provider {}", profile.providers[harness]);
         let mapping = profiles::credentials(&profile, harness)?;
+        // #9473: a routed profile takes its key from the LLM gateway, never
+        // the environment or the pool. Decided without reading the key.
+        let gateway = profiles::resolve_shape(harness, &name, &profile)
+            .ok()
+            .map(|(selection, _)| super::llm_gateway::plan(harness, &selection, &config));
+        let routed = matches!(gateway, Some(Ok(Some(_))));
         let mut pool_would_refuse = false;
         for (source, target) in &mapping.pairs {
             let is_set = std::env::var_os(source).is_some_and(|v| !v.is_empty());
-            let mut state = if is_set {
+            let mut state = if routed {
+                "supplied by the LLM gateway virtual key".to_string()
+            } else if is_set {
                 "present".to_string()
             } else {
                 "unset".to_string()
             };
-            if !is_set {
+            if !is_set && !routed {
                 if let Some(status) = pool_status(&root, &profile, source) {
                     if status.would_refuse() {
                         pool_would_refuse = true;
@@ -109,8 +123,19 @@ fn report(name: Option<&str>, runtime: Option<&str>) -> Result<(String, bool), L
                 let _ = writeln!(out, "  {key}: {}", keys.join(", "));
             }
         }
+        let gateway_refusal = match &gateway {
+            Some(Ok(Some(plan))) => {
+                let _ = writeln!(out, "  llm gateway: routed, {}", plan.summary());
+                plan.check_source().err()
+            }
+            Some(Err(error)) => Some(error.message.clone()),
+            _ => None,
+        };
         let unset = profiles::missing(&mapping.required);
-        if !unset.is_empty() {
+        if let Some(why) = gateway_refusal {
+            resolvable = false;
+            let _ = writeln!(out, "  status: unresolvable, spawn would refuse at 78 ({why})");
+        } else if !routed && !unset.is_empty() {
             resolvable = false;
             let _ = writeln!(out, "  status: unresolvable, set {}", unset.join(", "));
         } else if pool_would_refuse {
@@ -233,6 +258,7 @@ pub fn cli(args: WorkerArgs) -> anyhow::Result<()> {
         WorkerCommand::Readiness(args) => return args.run(),
         WorkerCommand::ProxyExec(args) => return super::egress_proxy::exec::cli(args),
         WorkerCommand::ProxyRotate(args) => return super::egress_proxy::rotate_client::cli(args),
+        WorkerCommand::Run(args) => return super::phase_run::cli(args),
     };
     match report(name.as_deref(), runtime.as_deref()) {
         Ok((text, resolvable)) => {
@@ -265,6 +291,8 @@ mod tests {
             provider_options: std::collections::BTreeMap::new(),
             provider_definition: std::collections::BTreeMap::new(),
             allowed_efforts: Vec::new(),
+            billing: None,
+            excluded_roles: Vec::new(),
         }
     }
 

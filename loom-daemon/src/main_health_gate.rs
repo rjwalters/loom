@@ -1099,6 +1099,9 @@ pub enum UnevaluatedClass {
     /// ([`crate::credential_preflight::resolve_forge_credential_stale_grace`])
     /// expires and normal fail-safe evaluation resumes.
     ForgeCredentialStale,
+    /// The checkout's volume was below the disk floor, so the pre-run fetch was
+    /// skipped rather than risk leaving a partial `tmp_pack_*` behind (#10995).
+    LowDisk,
 }
 
 impl UnevaluatedClass {
@@ -1116,6 +1119,7 @@ impl UnevaluatedClass {
             Self::SpawnFailure => "spawn-failure",
             Self::ContradictedByForgeCi => "contradicted-by-forge-ci",
             Self::ForgeCredentialStale => "forge-credential-stale",
+            Self::LowDisk => "low-disk",
         }
     }
 }
@@ -1324,8 +1328,6 @@ impl ForgeCiStatus for GhForgeCi {
     fn conclusion_for(&self, repo_root: &Path, sha: &str) -> CiVerdict {
         let limit = CI_PROBE_RUN_LIMIT.to_string();
         let args = [
-            "run",
-            "list",
             "--branch",
             GATE_BRANCH,
             "--limit",
@@ -1333,13 +1335,14 @@ impl ForgeCiStatus for GhForgeCi {
             "--json",
             "headSha,status,conclusion,workflowName",
         ];
-        let stdout = match run_capture_with_timeout("gh", &args, repo_root, CI_PROBE_TIMEOUT) {
-            Ok(s) => s,
-            Err(e) => {
-                log::debug!("main_health_gate: forge CI probe unavailable ({e})");
-                return CiVerdict::Unknown;
-            }
-        };
+        let stdout =
+            match crate::gh_state_probe::run_list_stdout(repo_root, &args, CI_PROBE_TIMEOUT) {
+                Ok(s) => s,
+                Err(e) => {
+                    log::debug!("main_health_gate: forge CI probe unavailable ({e})");
+                    return CiVerdict::Unknown;
+                }
+            };
         parse_gh_run_list(&stdout, sha, self.ci_workflow.as_deref())
     }
 }
@@ -1911,15 +1914,11 @@ fn diff_touches_globs(
     // Make sure the local repo actually has both commits to diff — a cheap,
     // idempotent fetch. The caller already knows `main` moved, so this is not
     // extra work beyond what a real run would have paid anyway.
-    let _ = Command::new("git")
-        // `--` before the ref operand (#9106 mitigation B, #9479) — both names
-        // are crate constants here, so this is form, not a live exposure.
-        .args(["fetch", GATE_REMOTE, "--", GATE_BRANCH])
-        .current_dir(repo_root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    // `--` before the ref operand (#9106 mitigation B, #9479) — both names
+    // are crate constants here, so this is form, not a live exposure. Skipped
+    // below the disk floor (#10995): the diff below then fails on a missing
+    // object and the caller fails safe by running the gate.
+    crate::fetch_headroom::fetch_quietly(repo_root, &["fetch", GATE_REMOTE, "--", GATE_BRANCH]);
     let mut cmd = Command::new("git");
     cmd.args(["diff", "--name-only", &format!("{from_sha}..{to_sha}")])
         .current_dir(repo_root)
@@ -1942,7 +1941,7 @@ fn diff_touches_globs(
 /// `*.sh`). A pattern containing no `/` matches by **basename** anywhere in
 /// the tree (so `*.rs` matches `loom-daemon/src/main.rs`); a pattern
 /// containing `/` matches the full path.
-fn glob_matches(pattern: &str, path: &str) -> bool {
+pub(crate) fn glob_matches(pattern: &str, path: &str) -> bool {
     let candidate = if pattern.contains('/') {
         path
     } else {
@@ -2458,7 +2457,14 @@ pub fn prepare_workspace_to_origin_main(repo_root: &Path) -> PrepOutcome {
         }
     }
 
-    // 3. Fetch origin/main.
+    // 3. Fetch origin/main — unless the checkout's volume is below the disk
+    // floor, where an aborted fetch leaves a partial tmp_pack_* behind
+    // (#10995). That skip is LowDisk, never GitFailure: it says nothing about
+    // `main`.
+    if let Some(reason) = crate::fetch_headroom::skip_reason(repo_root) {
+        let class = UnevaluatedClass::LowDisk;
+        return PrepOutcome::Skip { class, reason };
+    }
     // `--` before the ref operand (#9106 mitigation B, #9479).
     if let Err(e) = run_git(repo_root, &["fetch", GATE_REMOTE, "--", GATE_BRANCH]) {
         return PrepOutcome::Skip {

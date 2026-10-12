@@ -8,6 +8,8 @@ use std::time::Duration;
 
 use loom_daemon::sweep_registry::SweepRegistryConfig;
 
+use loom_daemon::workspace_registry::MaintainOnlySource;
+
 use crate::{FleetAction, WorkspaceAction};
 
 /// Handle `loom-daemon calibrate` (issue #4390; measurement-only since #4512):
@@ -312,26 +314,75 @@ fn auto_init_missing_sweep_command(canonical: &std::path::Path) -> Result<()> {
     }
 }
 
+/// After a registry change, name the host-mode Codex session containers whose
+/// workspace mounts no longer match it (#10364): a running container never
+/// sees a `workspace add`/`remove`, so a new repo stays unreachable from it and
+/// a removed one stays mounted read-write. Best-effort (never fails the
+/// command) and zero `docker` calls unless a profile is session-managed.
+/// The session reconciler recreates them once idle (`session_reconcile::drift`,
+/// #10364 Part B); the report says so and keeps the manual recreate.
+fn report_session_mount_drift(registry: &loom_daemon::workspace_registry::WorkspaceRegistry) {
+    let profile_root = loom_daemon::tokens_pool::paths::codex_profile_root();
+    let docker = std::env::var("LOOM_CODEX_SESSION_DOCKER")
+        .ok()
+        .filter(|d| !d.is_empty())
+        .unwrap_or_else(|| "docker".to_string());
+    for line in loom_daemon::tokens_pool::session_drift_report::report(
+        profile_root.as_deref(),
+        &docker,
+        &registry.roots(),
+    ) {
+        println!("{line}");
+    }
+}
+
 /// Handle the `workspace` subcommand — mutate/inspect the machine-level
 /// workspace registry (`~/.loom/workspaces.json`) directly on the filesystem.
 /// This runs whether or not the daemon is up; a running daemon re-reads the
 /// same file on its next tick (hot-apply), and its `RegisterWorkspace` /
 /// `DeregisterWorkspace` / `ListWorkspaces` IPC handlers touch the same file.
 ///
-/// `Add`/`SetPriority`/`Remove` are gated by
+/// `Add`/`SetPriority`/`Remove`/`Hold`/`Release` are gated by
 /// [`refuse_if_daemon_admin_delegated`] (issue #5345) — `List` is read-only
 /// and is deliberately never gated.
 pub(crate) fn handle_workspace_command(action: WorkspaceAction) -> Result<()> {
+    handle_workspace_command_by(action, MaintainOnlySource::Operator)
+}
+
+/// The path to a registered workspace's root, for `workspace hold|release`.
+#[derive(clap::Args, Debug, Clone)]
+pub(crate) struct WorkspaceRoot {
+    /// Path to the repo root (normalized the same way as `add`).
+    #[arg(value_name = "PATH")]
+    pub(crate) path: String,
+}
+
+/// [`handle_workspace_command`], recording a maintain-only mark it sets
+/// (`add --maintain-only`, `hold`) as set `by` that source:
+/// `fleet-config roster --apply` passes the fleet store (#11186).
+pub(crate) fn handle_workspace_command_by(
+    action: WorkspaceAction,
+    by: MaintainOnlySource,
+) -> Result<()> {
     use loom_daemon::workspace_registry::{AddOutcome, WorkspaceRegistry};
 
     let path = loom_daemon::workspace_registry::default_registry_path()?;
 
     match action {
+        WorkspaceAction::Hold(WorkspaceRoot { path: repo_path }) => {
+            refuse_if_daemon_admin_delegated("workspace holds");
+            set_maintain_only(&path, &repo_path, Some(by))
+        }
+        WorkspaceAction::Release(WorkspaceRoot { path: repo_path }) => {
+            refuse_if_daemon_admin_delegated("workspace holds");
+            set_maintain_only(&path, &repo_path, None)
+        }
         WorkspaceAction::Add {
             path: repo_path,
             priority,
             config_overrides,
             no_init,
+            maintain_only,
         } => {
             refuse_if_daemon_admin_delegated("workspace registration");
             let overrides = match config_overrides {
@@ -354,6 +405,10 @@ pub(crate) fn handle_workspace_command(action: WorkspaceAction) -> Result<()> {
                 priority,
                 &claude_state_path,
             )? {
+                AddOutcome::AlreadyPresent { canonical } if maintain_only => {
+                    println!("Already registered: {}", canonical.display());
+                    set_maintain_only(&path, &repo_path, Some(by))?;
+                }
                 AddOutcome::AlreadyPresent { canonical } => {
                     println!("Already registered: {}", canonical.display());
                     println!(
@@ -366,8 +421,16 @@ pub(crate) fn handle_workspace_command(action: WorkspaceAction) -> Result<()> {
                     canonical,
                     looks_like_workspace,
                 } => {
+                    // #11186: in the same write, so it is never dispatchable.
+                    let mode = maintain_only.then_some(by);
+                    registry.set_maintain_only(&canonical, mode, chrono::Utc::now());
                     registry.save(&path)?;
-                    println!("Registered workspace: {} (priority {priority})", canonical.display());
+                    let note = if maintain_only { ", maintain-only" } else { "" };
+                    println!(
+                        "Registered workspace: {} (priority {priority}{note})",
+                        canonical.display()
+                    );
+                    report_session_mount_drift(&registry);
                     if !looks_like_workspace {
                         eprintln!(
                             "  warning: {} has no .git or .loom — register it anyway, but confirm \
@@ -446,6 +509,7 @@ pub(crate) fn handle_workspace_command(action: WorkspaceAction) -> Result<()> {
             if registry.remove(std::path::Path::new(&repo_path)) {
                 registry.save(&path)?;
                 println!("Deregistered workspace: {repo_path}");
+                report_session_mount_drift(&registry);
             } else {
                 println!("Not registered (no-op): {repo_path}");
             }
@@ -479,12 +543,50 @@ pub(crate) fn handle_workspace_command(action: WorkspaceAction) -> Result<()> {
                     } else {
                         ""
                     };
-                    println!("  {:>4}  {}{overrides}", ws.priority, ws.root.display());
+                    let mode = ws
+                        .maintain_only
+                        .map_or_else(String::new, |m| format!(" [{}]", m.label()));
+                    println!("  {:>4}  {}{overrides}{mode}", ws.priority, ws.root.display());
                 }
             }
             Ok(())
         }
     }
+}
+
+/// `workspace hold` (`Some`) / `release` (`None`) against the registry at
+/// `registry_path` (#11186). Hot-applies: dispatch reads the file on its
+/// next decision. An unregistered path is an error, never an implicit add.
+fn set_maintain_only(
+    registry_path: &std::path::Path,
+    repo_path: &str,
+    by: Option<MaintainOnlySource>,
+) -> Result<()> {
+    use loom_daemon::workspace_registry::WorkspaceRegistry;
+    let mut registry = WorkspaceRegistry::load(registry_path)?;
+    let root = std::path::Path::new(repo_path);
+    let Some(changed) = registry.set_maintain_only(root, by, chrono::Utc::now()) else {
+        return Err(anyhow!(
+            "not registered: {repo_path}. Register it with `loom-daemon workspace add \
+             {repo_path} --maintain-only`"
+        ));
+    };
+    if changed {
+        registry.save(registry_path)?;
+    }
+    match (by, changed) {
+        (Some(_), true) => println!(
+            "Holding {repo_path}: maintain-only. Its Loom install is kept current; no sweep, \
+             role or epic dispatch starts there (in-flight work is not touched)."
+        ),
+        (Some(_), false) => {
+            let mark = registry.maintain_only_of(root).map(|m| m.label());
+            println!("Already held: {repo_path} ({})", mark.unwrap_or_default());
+        }
+        (None, true) => println!("Released {repo_path}: dispatch resumes."),
+        (None, false) => println!("Not held (no-op): {repo_path}"),
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -580,5 +682,67 @@ mod tests {
             !tmp.path().join(".loom").join("config.json").exists(),
             "no .loom scaffolding should have been written into a non-git directory"
         );
+    }
+
+    /// #11186: `workspace hold|release <root>` and `add --maintain-only`
+    /// parse, and hold/release flip the registry mark in place without a
+    /// fleet store.
+    #[test]
+    fn workspace_hold_and_release_set_the_mark_in_place() {
+        use crate::cli::whole_cli_parse::try_parse_cli;
+        use crate::{Commands, WorkspaceAction};
+        use loom_daemon::workspace_registry::{MaintainOnlySource, WorkspaceRegistry};
+
+        for verb in ["hold", "release"] {
+            let cli = try_parse_cli(&["loom-daemon", "workspace", verb, "/x"]).expect("parses");
+            let path = match cli.command {
+                Some(Commands::Workspace {
+                    action: WorkspaceAction::Hold(r),
+                }) if verb == "hold" => r.path,
+                Some(Commands::Workspace {
+                    action: WorkspaceAction::Release(r),
+                }) if verb == "release" => r.path,
+                _ => panic!("{verb} parsed to another action"),
+            };
+            assert_eq!(path, "/x");
+        }
+        let cli = try_parse_cli(&["loom-daemon", "workspace", "add", "/x", "--maintain-only"]);
+        assert!(matches!(
+            cli.expect("parses").command,
+            Some(Commands::Workspace {
+                action: WorkspaceAction::Add {
+                    maintain_only: true,
+                    ..
+                }
+            })
+        ));
+
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let registry = tmp.path().join("workspaces.json");
+        let root = repo.to_string_lossy().to_string();
+        let operator = Some(MaintainOnlySource::Operator);
+
+        let err = super::set_maintain_only(&registry, &root, operator).unwrap_err();
+        assert!(err.to_string().contains("not registered"), "{err}");
+
+        let mut reg = WorkspaceRegistry::default();
+        reg.add_with_priority(&repo, None, 5).unwrap();
+        reg.save(&registry).unwrap();
+
+        super::set_maintain_only(&registry, &root, operator).unwrap();
+        let reg = WorkspaceRegistry::load(&registry).unwrap();
+        assert_eq!(reg.maintain_only_of(&repo).unwrap().by, MaintainOnlySource::Operator);
+        let since = reg.maintain_only_of(&repo).unwrap().since;
+        // Holding again changes nothing.
+        super::set_maintain_only(&registry, &root, operator).unwrap();
+        let reg = WorkspaceRegistry::load(&registry).unwrap();
+        assert_eq!(reg.maintain_only_of(&repo).unwrap().since, since);
+
+        super::set_maintain_only(&registry, &root, None).unwrap();
+        let reg = WorkspaceRegistry::load(&registry).unwrap();
+        assert!(reg.maintain_only_of(&repo).is_none());
+        assert_eq!((reg.workspaces.len(), reg.workspaces[0].priority), (1, 5), "in place");
     }
 }

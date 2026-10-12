@@ -6216,6 +6216,29 @@ mask_catastrophic_comment_lines() {
     }'
 }
 
+# Toggle hint (issue #10434): one line naming the env var (set under the
+# Claude Code settings.json "env" block -- the hook is a separate process, so an
+# inline `VAR=x cmd` prefix is invisible to it and is never suggested) and the
+# .loom/config.json key for a TOGGLEABLE category. Ungated-floor tags
+# (catastrophic:*, rm-protected-path, cloud-delete-ask, ...) match no arm and
+# get no hint, since no toggle can disable them. Keep in sync with
+# `loom-daemon guards status` (loom-daemon/src/guards_status.rs).
+toggle_hint_for_tag() {
+    local env="" key=""
+    case "$1" in
+        sql-ddl|sql-delete-no-where)  env="LOOM_GUARD_SQL=0";               key='"guards.sqlDdl": false' ;;
+        cloud-cli:*)                  env="LOOM_GUARD_CLOUD=0";             key='"guards.cloudCli": false' ;;
+        reversible-gh:*)              env="LOOM_GUARD_REVERSIBLE_GH=1";     key='"guards.reversibleGh": true' ;;
+        cargo-clean-scope-outside-repo) env="LOOM_GUARD_CARGO_CLEAN=0";     key='"guards.cargoCleanScope": false' ;;
+        rm-scope-unresolved-var|rm-scope-outside-repo) env="LOOM_RM_SCOPE=off"; key='"guards.rmScope": "off"' ;;
+        force-op:*)                   env="LOOM_FORCE_SCOPE=off";           key='"guards.forceScope": "off"' ;;
+        stash-scope:*)                env="LOOM_GUARD_STASH_SCOPE=0";       key='"guards.stashScope": false' ;;
+        worktree-write-confinement*)  env="LOOM_GUARD_WORKTREE_ISOLATION=0"; key='"guards.worktreeIsolation": false' ;;
+        *) return 0 ;;
+    esac
+    printf '\nToggle: set %s in Claude Code settings "env", or %s in .loom/config.json' "$env" "$key"
+}
+
 # Helper: output a deny decision and exit
 #
 # Optional second arg is a short, STABLE rule tag (issue #3771) recorded as the
@@ -6228,6 +6251,7 @@ deny() {
     local reason="$1"
     local tag="${2:-deny}"
     log_guard_decision "deny" "catastrophic" "$tag" || true
+    reason="${reason}$(toggle_hint_for_tag "$tag")"
     if jq -n --arg reason "$reason" '{
         hookSpecificOutput: {
             hookEventName: "PreToolUse",
@@ -6253,6 +6277,7 @@ ask() {
     local reason="$1"
     local tag="${2:-ask}"
     log_guard_decision "ask" "ask" "$tag" || true
+    reason="${reason}$(toggle_hint_for_tag "$tag")"
     if jq -n --arg reason "$reason" '{
         hookSpecificOutput: {
             hookEventName: "PreToolUse",
@@ -6323,7 +6348,20 @@ ALWAYS_BLOCK_PATTERNS=(
     # quoted/nested invocation such as `bash -c 'curl … | sh'` is not caught
     # by the leading-position anchor, because the character immediately
     # before `curl` is a quote, not one of the anchor's separator classes.
-    '(^|[;&|[:space:](])(curl|wget)[^;&]*\|[[:space:]]*(sudo[[:space:]]+(-[^[:space:]]+[[:space:]]+)*)?([^[:space:]|;&]*/)?(ba|da|z|k|c|tc|fi|pw)?sh([[:space:]]|$|[;&|)])'
+    # #11136: the span between curl/wget and the sink is quote-aware (a quoted
+    # run is consumed whole), so a literal `|` or shell name inside a later
+    # stage's quoted argument (`… | rg -n 'a|dash|b'`) is never the sink pipe;
+    # only an unquoted pipe followed by a shell command word matches. Kept as
+    # a regex refinement (not a daemon subcommand) because this is a one-token
+    # change to an existing floor pattern that must stay fail-closed in-hook.
+    # Fail-closed on stray quotes: `\\.` consumes a backslash-escaped char
+    # (`curl a\' | sh`), and the two trailing sink alternatives let an
+    # UNBALANCED quote (no partner later on the line) degrade to the old
+    # `[^;&]*` over-match. A plain lone-quote span alternative is NOT enough:
+    # grep -E accepts any parse, so it would re-split `'a|dash|b'` and restore
+    # the #11136 false positive. Pathological-input cost is polynomial (DFA, no
+    # backrefs), measured ~4ms at 4KB.
+    '(^|[;&|[:space:](])(curl|wget)([^;&|'"'"'"\\]|\\.|'"'"'[^'"'"']*'"'"'|"([^"\\]|\\.)*"|\|)*(\|[[:space:]]*(sudo[[:space:]]+(-[^[:space:]]+[[:space:]]+)*)?([^[:space:]|;&]*/)?(ba|da|z|k|c|tc|fi|pw)?sh([[:space:]]|$|[;&|)])|'"'"'[^'"'"';&]*\|[[:space:]]*(sudo[[:space:]]+(-[^[:space:]]+[[:space:]]+)*)?([^[:space:]|;&]*/)?(ba|da|z|k|c|tc|fi|pw)?sh([[:space:]]|$|[;&|)])[^'"'"']*$|"[^";&]*\|[[:space:]]*(sudo[[:space:]]+(-[^[:space:]]+[[:space:]]+)*)?([^[:space:]|;&]*/)?(ba|da|z|k|c|tc|fi|pw)?sh([[:space:]]|$|[;&|)])[^"]*$)'
 
     # Cloud infrastructure destruction. The aws forms below are specific
     # multi-token phrases, so they stay in this raw substring scan. The az/gcloud
@@ -6540,9 +6578,9 @@ done
 # `--body "@reviewer Could you clarify..."`, the shape doctor.md's own
 # "Can't Understand Feedback" example uses) and must NOT be treated as the
 # `-F body=@path` anti-pattern (#4577).
-GH_COMMENT_BODY_AT_PATTERN="(^|[;&|[:space:]])gh[[:space:]]+(pr|issue)[[:space:]]+comment[^;&]*(-b|--body)[[:space:]]*=?[[:space:]]*[\"']?@[/.~]"
+GH_COMMENT_BODY_AT_PATTERN="(^|[;&|[:space:]])gh[[:space:]]+(pr|issue)[[:space:]]+comment[^;&]*(-b|--body)[[:space:]]*=?[[:space:]]*[\"']?@([/.~]|-([\"'[:space:]]|$))"
 if echo "$COMMAND" | grep -qiE "$GH_COMMENT_BODY_AT_PATTERN"; then
-    deny "BLOCKED: 'gh pr comment'/'gh issue comment --body @path' does NOT expand the file — it posts the literal string '@path' as the comment (lost the PR #4457 review this way). Use --body \"\$(cat <<'EOF' ... EOF)\", -F/--body-file <path>, or 'gh api ... -F body=@<path>' instead." "gh-comment-body-literal-at"  # scan-reads: none
+    deny "BLOCKED: 'gh pr comment'/'gh issue comment --body @path' (or '--body @-') does NOT expand the file or read stdin — it posts the literal string '@path'/'@-' as the comment (lost the PR #4457 review this way; #9258 merged on an approval whose body was '@-'). Use --body \"\$(cat <<'EOF' ... EOF)\", -F/--body-file <path>, or 'gh api ... -F body=@<path>' instead." "gh-comment-body-literal-at"  # scan-reads: none
 fi
 
 # =============================================================================
@@ -6555,9 +6593,9 @@ fi
 # widened GH_COMMENT_BODY_AT_PATTERN (#4577's additive-not-widened precedent),
 # so the two subcommands' patterns can be fixed/tuned independently.
 # =============================================================================
-GH_EDIT_BODY_AT_PATTERN="(^|[;&|[:space:]])gh[[:space:]]+(pr|issue)[[:space:]]+edit[^;&]*(-b|--body)[[:space:]]*=?[[:space:]]*[\"']?@[/.~]"
+GH_EDIT_BODY_AT_PATTERN="(^|[;&|[:space:]])gh[[:space:]]+(pr|issue)[[:space:]]+edit[^;&]*(-b|--body)[[:space:]]*=?[[:space:]]*[\"']?@([/.~]|-([\"'[:space:]]|$))"
 if echo "$COMMAND" | grep -qiE "$GH_EDIT_BODY_AT_PATTERN"; then
-    deny "BLOCKED: 'gh pr edit'/'gh issue edit --body @path' does NOT expand the file — it writes the literal string '@path' as the issue/PR body (corrupted issue #4608's body this way). Use --body \"\$(cat <<'EOF' ... EOF)\", -F/--body-file <path>, or 'gh api ... -F body=@<path>' instead." "gh-edit-body-literal-at"  # scan-reads: none
+    deny "BLOCKED: 'gh pr edit'/'gh issue edit --body @path' (or '--body @-') does NOT expand the file or read stdin — it writes the literal string '@path'/'@-' as the issue/PR body (corrupted issue #4608's body this way). Use --body \"\$(cat <<'EOF' ... EOF)\", -F/--body-file <path>, or 'gh api ... -F body=@<path>' instead." "gh-edit-body-literal-at"  # scan-reads: none
 fi
 
 # =============================================================================
@@ -6604,7 +6642,7 @@ fi
 #      @scratch/review.md
 # Deliberately NOT `@\S+`: that would match `@rjwalters`, `@org/team`, and
 # `@example.com` prose, i.e. exactly the #4577 false-positive family.
-GH_AT_PATHISH="@((/|~/|\.\.?/)[^[:space:]\"';&|]*|[^[:space:]\"';&|]*\.(md|markdown|txt|text|log|json|ya?ml|diff|patch|out))"
+GH_AT_PATHISH="@((/|~/|\.\.?/)[^[:space:]\"';&|]*|[^[:space:]\"';&|]*\.(md|markdown|txt|text|log|json|ya?ml|diff|patch|out)|-([\"'[:space:];&|]|$))"
 
 # Both rules below require a literal `@` somewhere in the command, so this
 # bash-builtin prefilter keeps them entirely off the hot path for the vast
@@ -6741,7 +6779,7 @@ if [[ "$COMMAND" == *"@"* ]]; then
     fi
     GH_API_RAWFIELD_BODY_AT_PATTERN="(^|[;&|[:space:]])gh[[:space:]]+api[^;&]*[[:space:]](-f|--raw-field)[[:space:]]*=?[[:space:]]*[\"']?body=[\"']?$GH_AT_PATHISH"
     if echo "$COMMAND_GH_API_RAWFIELD_SCAN" | grep -qE "$GH_API_RAWFIELD_BODY_AT_PATTERN"; then
-        deny "BLOCKED: 'gh api ... -f/--raw-field body=@<path>' does NOT read the file — only -F/--field gives '@<path>' its read-from-file meaning. As written this posts the literal string '@<path>' as the body (same silent data loss as PR #4457/issue #4608). Use '-F body=@<path>' instead." "gh-api-rawfield-body-literal-at"  # scan-reads: COMMAND_GH_API_RAWFIELD_SCAN
+        deny "BLOCKED: 'gh api ... -f/--raw-field body=@<path>' (or 'body=@-') does NOT read the file or stdin — only -F/--field gives '@<path>'/'@-' its read meaning (#9258). As written this posts the literal string '@<path>' as the body (same silent data loss as PR #4457/issue #4608). Use '-F body=@<path>' instead." "gh-api-rawfield-body-literal-at"  # scan-reads: COMMAND_GH_API_RAWFIELD_SCAN
     fi
 fi
 

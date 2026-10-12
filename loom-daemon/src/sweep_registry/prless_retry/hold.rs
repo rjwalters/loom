@@ -298,7 +298,9 @@ impl SweepRegistry {
     /// Apply the hold's `loom:blocked` label and report **honestly** whether
     /// the park actually happened (Issue #9239).
     ///
-    /// Three bounded steps, in order, stopping at the first success:
+    /// First the body park record (`reason="pr-less hold"`, `by=daemon`,
+    /// #10161), through [`Self::record_daemon_hold`]. Then three bounded steps,
+    /// in order, stopping at the first success:
     ///
     /// 1. The combined flip — `--add-label loom:blocked --remove-label
     ///    loom:issue` — which is what a healthy hold does in one call.
@@ -315,15 +317,22 @@ impl SweepRegistry {
     ///
     /// A **timeout** is never retried — it means `gh` is wedged, and this runs
     /// inside `reap_once` on the `ListSweeps` / `GetSweepStatus` read path
-    /// whose per-call budget (#3973) is 5s. The worst case here is two fast
-    /// rejections plus one probe; the wedged case still costs exactly one
-    /// timeout, as before.
+    /// whose per-call budget (#3973) is 5s. The worst case here is the
+    /// record's read and write, two fast rejections, and one probe; the wedged
+    /// case still costs exactly one timeout, as before (a timed-out record
+    /// ends the attempt before any label edit).
     ///
     /// Fails **closed**: an unconfirmable label is reported as a failed hold.
     /// The cost of a false "failed" is one more spaced-out dispatch attempt
     /// (the backoff window is armed either way); the cost of a false "applied"
     /// is #9239 itself.
     fn write_prless_hold_label(&self, issue: u32) -> Result<(), String> {
+        // The body park record goes first (#10161), so the park is named for
+        // `star_liveness` / `check-stale-blocked`. A refused record still lets
+        // the label follow: the label is the deliverable. A timed-out record
+        // means `gh` is wedged, so it ends the attempt here, the same as a
+        // timed-out label edit below (see `sweep_registry::park_hold`).
+        self.record_daemon_hold(issue, crate::sweep_registry::park_hold::PRLESS_HOLD_REASON)?;
         let first = match self.run_prless_hold_edit(issue, true) {
             Ok(()) => return Ok(()),
             Err(HoldEditFailure::TimedOut(detail)) => {

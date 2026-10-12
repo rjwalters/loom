@@ -175,7 +175,7 @@ static AUTH_DEAD_FALLBACK: LazyLock<Regex> = LazyLock::new(|| {
         r"(?i)",
         r"401[^a-z]*authentication_error",
         "|\"type\"[[:space:]]*:[[:space:]]*\"?authentication_error",
-        r"|token (has been|was) revoked",
+        r"|token (has been |was )?revoked",
         r"|invalid bearer token",
         r"|OAuth token has expired",
         r"|token has expired",

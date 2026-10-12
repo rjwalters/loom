@@ -8,9 +8,9 @@
 //! for what dispatched work will hit; the fresh assert is what *this* shell
 //! would hit.
 //!
-//! **Silent when unconfigured**: no policy and no cache ⇒ nothing printed and
-//! no `forge_egress` JSON key, so `status` is byte-identical to a build
-//! without this feature.
+//! **Unconfigured is visible** (#10168): no policy ⇒ the `policy.unconfigured`
+//! notice (non-fatal; a finding on a managed host) is printed and the JSON key
+//! carries it.
 
 use loom_daemon::forge_egress::{self, gate, report::Severity, Report};
 use serde_json::{json, Value};
@@ -29,6 +29,14 @@ fn verdict(code: i64) -> &'static str {
     }
 }
 
+fn severity_mark(s: Severity) -> &'static str {
+    match s {
+        Severity::Notice => "NOTICE",
+        Severity::Finding => "FINDING",
+        Severity::Incomplete => "INCOMPLETE",
+    }
+}
+
 fn cached() -> Option<Value> {
     gate::cache_path().and_then(|p| gate::read_cache(&p))
 }
@@ -39,9 +47,6 @@ fn render(
     cache: Option<&Value>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Option<String> {
-    if !fresh.is_configured() && cache.is_none() {
-        return None;
-    }
     let mut out = Vec::new();
     if fresh.is_configured() {
         let j = fresh.to_json();
@@ -54,16 +59,24 @@ fn render(
             p["origin"].as_str().unwrap_or("-"),
         ));
         for f in &fresh.routing {
-            let mark = if f.severity == Severity::Finding {
-                "FINDING"
-            } else {
-                "INCOMPLETE"
-            };
+            let mark = severity_mark(f.severity);
             let fix = f.to_json()["remedy"].as_str().unwrap_or("").to_string();
             out.push(format!("               {mark} {} — fix: {fix}", f.code));
         }
     } else {
-        out.push("Forge egress:  no policy resolves for this shell".to_string());
+        out.push(format!(
+            "Forge egress:  no policy resolves for this shell (routing: {})",
+            verdict(i64::from(fresh.exit_code()))
+        ));
+        for f in &fresh.routing {
+            let fix = f.to_json()["remedy"].as_str().unwrap_or("").to_string();
+            out.push(format!(
+                "               {} {} — {}; fix: {fix}",
+                severity_mark(f.severity),
+                f.code,
+                f.invariant
+            ));
+        }
     }
     if let Some(c) = cache {
         let r = &c["report"];
@@ -111,25 +124,47 @@ fn render(
     Some(out.join("\n"))
 }
 
-/// Print the block, or nothing when unconfigured.
+/// The `hosts.yml` publication rollback line (#9986), `None` when the last
+/// publication was not rolled back.
+fn rollback_line(rollback: Option<&Value>) -> Option<String> {
+    let r = rollback?;
+    let codes: Vec<&str> = r["codes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    Some(format!(
+        "               FINDING publication rolled back at {} for {} [{}] — previous profile restored",
+        r["at"].as_str().unwrap_or("?"),
+        r["dir"].as_str().unwrap_or("?"),
+        codes.join(", ")
+    ))
+}
+
+/// Print the block.
 pub fn print() {
+    let ws = workspace();
     if let Some(block) =
-        render(&forge_egress::assert_for(&workspace()), cached().as_ref(), chrono::Utc::now())
+        render(&forge_egress::assert_for(&ws), cached().as_ref(), chrono::Utc::now())
     {
         println!("{block}");
+        if let Some(line) = rollback_line(forge_egress::publication::read_rollback(&ws).as_ref()) {
+            println!("{line}");
+        }
     }
 }
 
-/// The `--json` counterpart, `Null` when unconfigured (callers insert the key
-/// only when non-null).
+/// The `--json` counterpart.
 #[must_use]
 pub fn json() -> Value {
     let fresh = forge_egress::assert_for(&workspace());
     let cache = cached();
-    if !fresh.is_configured() && cache.is_none() {
-        return Value::Null;
-    }
-    json!({"assert": fresh.to_json(), "last_doctor": cache})
+    json!({
+        "assert": fresh.to_json(),
+        "last_doctor": cache,
+        "publication_rollback": forge_egress::publication::read_rollback(&workspace()),
+    })
 }
 
 #[cfg(test)]
@@ -139,13 +174,23 @@ mod tests {
     use loom_daemon::forge_egress::policy::PolicySources;
 
     #[test]
-    fn unconfigured_renders_nothing() {
+    fn rollback_line_names_codes_and_dir_only() {
+        let rec = json!({"dir": "/w/.loom/gh-config", "codes": ["apiconfig.api-host-missing"], "at": "t"});
+        let line = rollback_line(Some(&rec)).unwrap();
+        assert!(line.contains("apiconfig.api-host-missing") && line.contains("/w/.loom/gh-config"));
+        assert!(rollback_line(None).is_none());
+    }
+
+    #[test]
+    fn unconfigured_renders_the_notice_line() {
         let r = forge_egress::run_with(
             &PolicySources::default(),
             std::path::Path::new("/x"),
             forge_egress::Mode::Assert,
         );
-        assert!(render(&r, None, chrono::Utc::now()).is_none());
+        let out = render(&r, None, chrono::Utc::now()).unwrap();
+        assert!(out.contains("no policy resolves"), "{out}");
+        assert!(out.contains("NOTICE policy.unconfigured"), "{out}");
     }
 
     #[test]

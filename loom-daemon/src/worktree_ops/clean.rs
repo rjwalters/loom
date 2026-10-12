@@ -13,6 +13,9 @@ use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Utc};
 
+use super::branch_holders::{
+    branch_holders, held_by_worktree, kept_line, skip_if_held, skip_if_held_in,
+};
 use super::gh;
 use super::liveness::active_spawn_loop_issues;
 use super::naming::{self, BRANCH_PREFIX};
@@ -20,6 +23,7 @@ use super::safety::{
     check_uncommitted_changes, check_uncommitted_or_untracked_changes,
     find_processes_using_directory, read_in_use_marker, InUseMarker,
 };
+use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
 use crate::quarantine_stash_status::QUARANTINE_STASH_LABEL;
 
 /// Default grace period after PR merge before a worktree is eligible for
@@ -184,7 +188,12 @@ pub struct CleanupStats {
     pub skipped_uncommitted: usize,
     pub skipped_editable: usize,
     pub cleaned_branches: usize,
+    /// Local branches kept by a policy decision (OPEN issue, `--safe` retain
+    /// prefix, unreachable commits under `--safe`): real leftovers.
     pub kept_branches: usize,
+    /// Local branches skipped because a worktree holds them (checked out,
+    /// mid-rebase, mid-bisect); not leftovers (#10851).
+    pub held_branches: usize,
     pub errored_branches: usize,
     pub killed_tmux: usize,
     /// Tmux sessions preserved because they have an attached client (a live
@@ -290,7 +299,7 @@ struct PrRow {
 }
 
 fn gh_pr_list(repo_root: &Path, args: &[&str]) -> Option<Vec<PrRow>> {
-    let out = gh::bounded_counted("clean.pr_list", repo_root, args)?;
+    let out = gh::bounded_hygiene("clean.pr_list", repo_root, args)?;
     if !out.status.success() {
         return None;
     }
@@ -351,7 +360,7 @@ fn gh_pr_list_by_issue_search(repo_root: &Path, issue_num: u32) -> Option<Vec<Pr
 ///    closed PR) — covers `ClosedNoMerge`/`Unknown` rows.
 ///
 /// An empty row list resolves to [`PrStatus::NoPr`].
-fn select_pr_status<I: IntoIterator<Item = PrStatus>>(rows: I) -> PrStatus {
+pub(crate) fn select_pr_status<I: IntoIterator<Item = PrStatus>>(rows: I) -> PrStatus {
     let mut best: Option<PrStatus> = None;
     for status in rows {
         if matches!(status, PrStatus::Merged { .. }) {
@@ -414,38 +423,25 @@ pub fn check_pr_status_for_branch(repo_root: &Path, branch: &str) -> PrStatus {
     rows_to_status(gh_pr_list_by_head(repo_root, branch))
 }
 
-#[derive(serde::Deserialize)]
-struct PrRowRest {
-    state: String,
-    #[serde(default)]
-    merged_at: Option<String>,
-    #[serde(default)]
-    closed_at: Option<String>,
-    #[serde(default)]
-    head: Option<PrHeadRest>,
-}
-
-/// The `head` object of a REST pull-request payload. Only `sha` is read: it is
-/// the safety criterion for force-deleting a `pr-<N>` worktree's local branch
-/// (issue #5939, mirroring `merge-pr.sh`'s #4100 rule).
-#[derive(Debug, serde::Deserialize)]
-struct PrHeadRest {
-    #[serde(default)]
-    sha: Option<String>,
-}
-
 /// Resolve the repository owner via the **REST** API
-/// (`gh api repos/{owner}/{repo} --jq .owner.login`).
+/// (`gh api repos/{owner}/{repo} --jq .owner.login`, `GH_REPO` stripped so
+/// gh names the checkout's own repo — W6).
 ///
 /// Used to build the `head=<owner>:<branch>` filter [`check_pr_merged_rest`]
 /// needs. Returns `None` on any failure so callers can fall back to the
 /// GraphQL-backed [`check_pr_merged`].
 #[must_use]
 pub fn repo_owner_rest(repo_root: &Path) -> Option<String> {
-    let out = gh::bounded_counted(
-        "clean.repo_owner",
-        repo_root,
-        ["api", "repos/{owner}/{repo}", "--jq", ".owner.login"],
+    let out = gh::bounded_via(
+        GhInvocation::new(
+            Operation::new("clean.repo_owner"),
+            AccessIntent::Read,
+            GhTarget::None,
+            gh::GH_PROBE_TIMEOUT,
+        )
+        .args(["api", "repos/{owner}/{repo}", "--jq", ".owner.login"])
+        .current_dir(repo_root)
+        .strip_env("GH_REPO"),
     )?;
     if !out.status.success() {
         return None;
@@ -489,20 +485,10 @@ pub fn check_pr_merged_rest(repo_root: &Path, owner: &str, issue_num: u32) -> Pr
 /// [`select_pr_status`] for the preference order applied across rows.
 #[must_use]
 pub fn check_pr_status_for_branch_rest(repo_root: &Path, owner: &str, branch: &str) -> PrStatus {
-    let path =
-        format!("repos/{{owner}}/{{repo}}/pulls?state=all&head={owner}:{branch}&per_page=30");
-    let Some(out) = gh::bounded_counted("clean.pr_status_rest", repo_root, ["api", &path]) else {
-        return PrStatus::Unknown;
-    };
-    if !out.status.success() {
-        return PrStatus::Unknown;
+    match super::clean_owner::fetch_pr_rows(repo_root, owner, branch, None) {
+        Ok(rows) => super::clean_owner::rows_status(&rows),
+        Err(_) => PrStatus::Unknown,
     }
-    let Ok(rows) = serde_json::from_slice::<Vec<PrRowRest>>(&out.stdout) else {
-        return PrStatus::Unknown;
-    };
-    select_pr_status(rows.into_iter().map(|row| {
-        classify_pr_row(row.state.as_str(), row.merged_at.as_deref(), row.closed_at.as_deref())
-    }))
 }
 
 /// Map a REST pull-request `(state, merged_at, closed_at)` triple onto a
@@ -571,33 +557,17 @@ impl PrProbe {
 }
 
 /// The full single-PR REST probe behind [`check_pr_status_by_number_rest`]
-/// (issue #5939): one `gh api repos/{owner}/{repo}/pulls/<n>` call yielding
-/// both the eligibility status and the head SHA.
+/// (issue #5939): one `GET repos/<repo>/pulls/<n>` yielding both the
+/// eligibility status and the head SHA — a fresh, conditional read of the
+/// checkout's own repo through [`super::forge_state::pull_facts`] (W6).
 #[must_use]
 pub fn check_pr_by_number_rest(repo_root: &Path, pr_num: u32) -> PrProbe {
-    let Some(out) = gh::bounded_counted(
-        "clean.pr_by_number_rest",
-        repo_root,
-        ["api", &format!("repos/{{owner}}/{{repo}}/pulls/{pr_num}")],
-    ) else {
-        return PrProbe::unknown();
-    };
-    if !out.status.success() {
-        return PrProbe::unknown();
-    }
-    let Ok(row) = serde_json::from_slice::<PrRowRest>(&out.stdout) else {
-        return PrProbe::unknown();
-    };
-    PrProbe {
-        status: classify_pr_row(
-            row.state.as_str(),
-            row.merged_at.as_deref(),
-            row.closed_at.as_deref(),
-        ),
-        head_sha: row
-            .head
-            .and_then(|h| h.sha)
-            .filter(|s| !s.trim().is_empty()),
+    match super::forge_state::pull_facts(repo_root, pr_num, "clean.pr_by_number_rest").ok() {
+        Some(f) => PrProbe {
+            status: f.status,
+            head_sha: f.head_sha,
+        },
+        None => PrProbe::unknown(),
     }
 }
 
@@ -1425,11 +1395,12 @@ pub fn cleanup_worktree(
         "classify_worktree=Remove",
     );
 
-    let deleted = Command::new("git")
-        .args(["branch", "-d", &branch_name])
-        .current_dir(repo_root)
-        .status()
-        .is_ok_and(|s| s.success());
+    let deleted = skip_if_held(repo_root, &branch_name)
+        || Command::new("git")
+            .args(["branch", "-d", &branch_name])
+            .current_dir(repo_root)
+            .status()
+            .is_ok_and(|s| s.success());
     if !deleted {
         let _ = Command::new("git")
             .args(["branch", "-D", &branch_name])
@@ -1492,8 +1463,10 @@ pub fn cleanup_worktree(
 pub fn quarantine_dirty_worktree(worktree_path: &Path, label: &str) -> Option<String> {
     let before = stash_ref_commit(worktree_path);
     let msg = format!("{QUARANTINE_STASH_LABEL} {label}");
+    // #11075: never write a cargo build tree (content-verified marker, any
+    // name, ignored or not) into refs/stash — see `generated_artifact`.
     let status = Command::new("git")
-        .args(["stash", "push", "--include-untracked", "-m", &msg])
+        .args(crate::generated_artifact::quarantine_stash_args(worktree_path, &msg))
         .current_dir(worktree_path)
         .status();
     if !status.is_ok_and(|s| s.success()) {
@@ -1789,6 +1762,7 @@ pub fn cleanup_pr_worktree(
                      pr-{pr_num}'s worktree"
                 );
             }
+            _ if skip_if_held(repo_root, &branch_name) => {}
             BranchDeleteMode::ForceSafe => {
                 // Every commit on the branch is part of what the forge merged
                 // (tip == head SHA), so `-D` cannot lose anything — and it is
@@ -1873,14 +1847,15 @@ pub fn clean_worktrees(repo_root: &Path, stats: &mut CleanupStats, opts: &CleanO
         .collect();
     worktree_dirs.sort_by_key(std::fs::DirEntry::path);
 
-    let issue_state_fn = |n: u32| gh::issue_state(repo_root, n);
-    // #6653: REST is fine here even though `issue_state_fn` above uses the
-    // GraphQL-backed `gh issue view` — this probe is only ever consulted for
-    // a `PrStatus::NoPr` worktree (rare), so there is no meaningful GraphQL
-    // quota pressure to avoid the way there is for the reaper's per-tick,
-    // per-worktree probes.
-    let issue_closed_at_fn = |n: u32| gh::issue_closed_at_rest(repo_root, n);
-    let pr_status_fn = |n: u32| check_pr_merged(repo_root, n);
+    // W6 PR2 (`hygiene_pass`): the issue is the REST item read of the
+    // checkout's own repo, held for this pass (its `closed_at`, #6653, is the
+    // same body), and the PR status is the owner-confirmed REST listing with
+    // `gh pr list` as the last resort. `LOOM_HYGIENE_MEMO=0` restores
+    // `gh issue view` / `gh pr list`.
+    let pass = super::hygiene_pass::Pass::begin(repo_root);
+    let issue_state_fn = |n: u32| pass.clean_issue_state(n);
+    let issue_closed_at_fn = |n: u32| pass.issue_closed_at(n);
+    let pr_status_fn = |n: u32| pass.clean_pr_status(n);
     let branch_reachable_fn =
         |n: u32| branch_reachable_from_remotes(repo_root, &naming::branch_name(n));
     // #6652: one `git worktree list` per pass, not once per worktree.
@@ -1905,7 +1880,10 @@ pub fn clean_worktrees(repo_root: &Path, stats: &mut CleanupStats, opts: &CleanO
 
         println!("Checking worktree: issue-{issue_num}");
 
-        match classify_worktree(&worktree_path, issue_num, opts, &probes) {
+        // A decision that removes is confirmed by one fresh unconditional
+        // read first, and comes back as a skip when that read disagrees.
+        let decision = classify_worktree(&worktree_path, issue_num, opts, &probes);
+        match pass.gate(issue_num, opts.dry_run, decision) {
             WorktreeDecision::SkipInUse(reason) => {
                 println!("  {reason} - preserving");
                 stats.skipped_in_use += 1;
@@ -2077,25 +2055,20 @@ pub fn current_branch(repo_root: &Path) -> Option<String> {
     }
 }
 
-fn checked_out_branches(repo_root: &Path) -> std::collections::HashSet<String> {
-    let mut out_set = std::collections::HashSet::new();
-    let Ok(out) = Command::new("git")
-        .args(["worktree", "list", "--porcelain"])
-        .current_dir(repo_root)
-        .output()
-    else {
-        return out_set;
-    };
-    if !out.status.success() {
-        return out_set;
+/// Tally a failed `git branch -D`: a worktree-held branch is a skip
+/// (`held_branches`, no error); anything else is a real error.
+pub(super) fn record_branch_delete_failure(
+    stats: &mut CleanupStats,
+    branch: &str,
+    target: &str,
+    cause: &str,
+) {
+    if let Some(path) = held_by_worktree(cause) {
+        println!("  {}", kept_line(&path, branch));
+        stats.held_branches += 1;
+    } else {
+        stats.record_error(target, "git branch -D", cause);
     }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    for line in stdout.lines() {
-        if let Some(name) = line.strip_prefix("branch refs/heads/") {
-            out_set.insert(name.trim().to_string());
-        }
-    }
-    out_set
 }
 
 /// The repo's default branch, resolved from `origin/HEAD` — `None` if that
@@ -2132,10 +2105,19 @@ fn remote_branch_exists(repo_root: &Path, branch: &str) -> bool {
 /// Force-delete one local branch. `Err` carries git's own message (e.g.
 /// `error: branch 'x' not found.`) so a failure can be reported against the
 /// branch that failed instead of vanishing into the error tally (#4877).
-fn force_delete_branch(repo_root: &Path, branch: &str) -> Result<(), String> {
+pub(super) fn force_delete_branch(repo_root: &Path, branch: &str) -> Result<(), String> {
+    run_checked(force_delete_cmd(repo_root, branch))
+}
+
+/// The `git branch -D` behind [`force_delete_branch`]. `LC_ALL=C` because
+/// [`record_branch_delete_failure`] parses git's English refusal text; gettext
+/// also ignores `LANGUAGE` under the C locale (#10851).
+pub(super) fn force_delete_cmd(repo_root: &Path, branch: &str) -> Command {
     let mut cmd = Command::new("git");
-    cmd.args(["branch", "-D", branch]).current_dir(repo_root);
-    run_checked(cmd)
+    cmd.args(["branch", "-D", branch])
+        .current_dir(repo_root)
+        .env("LC_ALL", "C");
+    cmd
 }
 
 /// Name prefixes that signal "do not garbage-collect this" (issue #5737): a
@@ -2263,8 +2245,8 @@ pub fn branch_reachable_from_remotes(repo_root: &Path, branch: &str) -> bool {
 /// question, while `landed`'s forge rung also carries the merged head SHA the
 /// #7872 tip-match rule needs.
 fn branch_pr_merged(repo_root: &Path, branch: &str) -> bool {
-    let status = match repo_owner_rest(repo_root)
-        .map(|owner| check_pr_status_for_branch_rest(repo_root, &owner, branch))
+    let status = match super::clean_owner::repo_owner(repo_root)
+        .map(|owner| super::clean_owner::pr_status_validated(repo_root, &owner, branch))
     {
         Some(PrStatus::Unknown) | None => check_pr_status_for_branch(repo_root, branch),
         Some(status) => status,
@@ -2281,7 +2263,9 @@ fn delete_stale_branch(repo_root: &Path, stats: &mut CleanupStats, dry_run: bool
     }
     match force_delete_branch(repo_root, branch) {
         Ok(()) => stats.cleaned_branches += 1,
-        Err(cause) => stats.record_error(&format!("branch {branch}"), "git branch -D", &cause),
+        Err(cause) => {
+            record_branch_delete_failure(stats, branch, &format!("branch {branch}"), &cause);
+        }
     }
 }
 
@@ -2367,11 +2351,15 @@ pub fn clean_branches(repo_root: &Path, stats: &mut CleanupStats, opts: &CleanOp
     if let Some(c) = current_branch(repo_root) {
         protected.insert(c);
     }
-    protected.extend(checked_out_branches(repo_root));
+    let holders = branch_holders(repo_root);
 
     let mut issue_pass_candidates: Vec<String> = Vec::new();
     for branch in &branches {
         if protected.contains(branch) {
+            continue;
+        }
+        if skip_if_held_in(&holders, branch) {
+            stats.held_branches += 1;
             continue;
         }
         if !remote_branch_exists(repo_root, branch) {
@@ -2389,7 +2377,8 @@ pub fn clean_branches(repo_root: &Path, stats: &mut CleanupStats, opts: &CleanOp
             continue;
         };
 
-        let status = gh::issue_state(repo_root, issue_num);
+        // `CLOSED` deletes the branch: confirmed by a fresh read (W6 PR2).
+        let status = super::hygiene_pass::branch_issue_state(repo_root, issue_num, opts.dry_run);
         match status.as_str() {
             "CLOSED" => {
                 let hint = sha_hint(repo_root, branch);
@@ -2397,9 +2386,10 @@ pub fn clean_branches(repo_root: &Path, stats: &mut CleanupStats, opts: &CleanOp
                 if !opts.dry_run {
                     match force_delete_branch(repo_root, branch) {
                         Ok(()) => stats.cleaned_branches += 1,
-                        Err(cause) => stats.record_error(
+                        Err(cause) => record_branch_delete_failure(
+                            stats,
+                            branch,
                             &format!("branch {branch} (issue #{issue_num} CLOSED)"),
-                            "git branch -D",
                             &cause,
                         ),
                     }
@@ -3359,13 +3349,20 @@ pub fn print_summary(stats: &CleanupStats, dry_run: bool, safe_mode: bool) {
         println!("  Skipped (grace period): {}", stats.skipped_grace);
         println!("  Skipped (uncommitted): {}", stats.skipped_uncommitted);
     }
-    if stats.cleaned_branches > 0 || stats.kept_branches > 0 || stats.errored_branches > 0 {
+    if stats.cleaned_branches > 0
+        || stats.kept_branches > 0
+        || stats.held_branches > 0
+        || stats.errored_branches > 0
+    {
         if dry_run {
             println!("  Would delete: {} branch(es)", stats.cleaned_branches);
         } else {
             println!("  Deleted: {} branch(es)", stats.cleaned_branches);
         }
         println!("  Kept: {} branch(es)", stats.kept_branches);
+        if stats.held_branches > 0 {
+            println!("  In use (held by a worktree): {} branch(es)", stats.held_branches);
+        }
         if stats.errored_branches > 0 {
             println!("  Errored (gh probe failed): {} branch(es)", stats.errored_branches);
         }
@@ -3490,6 +3487,10 @@ pub fn run_clean(repo_root: &Path, opts: &CleanOptions) -> i32 {
 
         println!("Cleaning Stale Logs\n");
         clean_log_files(repo_root, &mut stats, opts.dry_run);
+        println!();
+
+        println!("Cleaning Aborted-Fetch Git Temp Files\n");
+        let _ = crate::git_tmp_reclaim::clean_section(repo_root, opts.dry_run);
         println!();
     }
 

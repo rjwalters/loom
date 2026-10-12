@@ -105,6 +105,65 @@ fn the_two_surfaces_9345_reported_missing_are_present() {
     }
 }
 
+/// Does the daemon resync cover the script's surface pattern `pattern`
+/// (`.loom/hooks/*`, `.gitignore`)? Covered means one of the roots the
+/// payload diff walks, or the stamp it writes itself.
+fn daemon_covers(pattern: &str, roots: &[String]) -> bool {
+    let path = pattern.trim_end_matches("/*");
+    path == crate::install_compat::INSTALL_METADATA_PATH || roots.iter().any(|r| r == path)
+}
+
+/// #10895 (the "one table" ask of #8952): every surface `resync-installed.sh`
+/// writes is either refreshed by the daemon resync (`payload::surfaces`) or
+/// named in its install-time-only list with a reason. A surface added to the
+/// script and to neither fails here, instead of silently staying stale in
+/// every repo once the script stops being run fleet-wide.
+#[test]
+fn every_script_surface_is_covered_by_the_daemon_or_declared_install_time_only() {
+    use super::payload::surfaces::{EXTRA_SURFACES, INSTALL_TIME_ONLY};
+
+    let defaults = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../defaults");
+    let roots = super::payload::resync_roots(&defaults);
+    let install_time: BTreeSet<&str> = INSTALL_TIME_ONLY.iter().map(|(p, _)| *p).collect();
+
+    let undecided: Vec<String> = resync_installed_surfaces()
+        .into_iter()
+        .filter(|p| !daemon_covers(p, &roots) && !install_time.contains(p.as_str()))
+        .collect();
+    assert!(
+        undecided.is_empty(),
+        "resync-installed.sh writes {undecided:?}, which the daemon resync neither covers \
+         (loom-daemon/src/init/payload/surfaces.rs: EXTRA_SURFACES) nor declares install-time \
+         only (INSTALL_TIME_ONLY, with a reason). Decide it in one of the two."
+    );
+
+    for (path, reason) in INSTALL_TIME_ONLY {
+        assert!(!reason.trim().is_empty(), "{path} needs a reason");
+        assert!(
+            !roots.iter().any(|r| r == path),
+            "{path} is declared install-time only but the daemon resync diffs it"
+        );
+    }
+    // The surfaces #10895 moved under the daemon stay there, and the ones it
+    // deliberately left stay declared.
+    for covered in [
+        ".agents/skills",
+        ".gitignore",
+        ".loom/CLAUDE.md",
+        ".claude/biome.jsonc",
+    ] {
+        assert!(EXTRA_SURFACES.iter().any(|s| s.path == covered), "{covered}");
+    }
+    for left in [
+        ".loom/config.json",
+        "package.json",
+        "CLAUDE.md",
+        ".gitattributes",
+    ] {
+        assert!(install_time.contains(left), "{left}");
+    }
+}
+
 /// The operator-facing copy of the same recipe. `.loom/docs/troubleshooting.md`
 /// is a tracked symlink to this file, so an operator on any consumer repo
 /// reads (and copy-pastes) exactly these bytes — which makes a stale recipe

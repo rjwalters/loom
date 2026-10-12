@@ -41,6 +41,7 @@ fn load_with(all_comments: bool) -> (World, Vec<RepoInput>, Value) {
             world.add(
                 slug,
                 RestIssue {
+                    comments: 0,
                     number,
                     title: it["title"].as_str().map(str::to_string),
                     labels: it["labels"]
@@ -55,6 +56,7 @@ fn load_with(all_comments: bool) -> (World, Vec<RepoInput>, Value) {
                     state: it["state"].as_str().unwrap_or("open").into(),
                     body: it["body"].as_str().map(str::to_string),
                     author: it["author"].as_str().map(str::to_string),
+                    author_association: None,
                     is_pull_request: it["pr"].as_bool().unwrap_or(false),
                 },
             );
@@ -113,7 +115,7 @@ fn row<'a>(
 #[test]
 fn replay_2026_09_28_one_escalation_each_within_one_tick() {
     let (world, repos, fx) = load_with(false);
-    let mut host = Host::new("host-75acf4b9");
+    let mut host = Host::without_propagation("host-75acf4b9");
     let first = host.pass(&world, &repos, Vec::new(), t(8, 0));
     // The pools-exhausted ask waits out its grace window (a peer host with
     // capacity may claim the issue first); the second pass is past it.

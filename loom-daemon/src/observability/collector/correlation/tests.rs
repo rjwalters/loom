@@ -14,6 +14,7 @@ fn dispatch(issue: u32, sweep: &str) -> Event {
         kind: SweepKind::Issue(issue),
         runtime: None,
         runtime_source: None,
+        start: None,
         repo: None,
     }
 }
@@ -234,6 +235,10 @@ fn lock_adopted_registry(
         pgid: None,
         model: None,
         effort: None,
+        item_id: None,
+        scope_unit: None,
+        agent_started_at: None,
+        resume_handle: None,
     };
     std::fs::write(lock.join("owner.json"), serde_json::to_string(&owner).unwrap()).unwrap();
     let log_path = registry.compute_log_path(issue);

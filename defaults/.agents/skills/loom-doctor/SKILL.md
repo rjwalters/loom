@@ -163,7 +163,7 @@ WT_STATUS=$(git -C "$WORKTREE_ABS" status --porcelain)
 if [ "$WT_HEAD_SHA" != "$PR_HEAD_SHA" ] || [ -n "$WT_STATUS" ]; then
     echo "Worktree drift detected (HEAD=$WT_HEAD_SHA, PR head=$PR_HEAD_SHA, dirty=$([ -n "$WT_STATUS" ] && echo yes || echo no)) - resyncing"
     if [ -n "$WT_STATUS" ]; then
-        ./.loom/scripts/worktree.sh snapshot <ISSUE_NUM> --include-untracked   # save WIP, never a bare `git stash` (see below)
+        ./.loom/scripts/worktree.sh snapshot <ISSUE_NUM> --include-untracked   # save WIP (never bare `git stash`); post its path in a PR comment
         git -C "$WORKTREE_ABS" checkout -- .
     fi
     git -C "$WORKTREE_ABS" pull --ff-only
@@ -236,17 +236,22 @@ handoff below) are **GraphQL-backed mutations**. GitHub's GraphQL quota
 (5000/hr, shared across every agent + tool) and its REST quota are
 **independent** — confirmed live during long sweeps (#4526, #4670, #4856):
 GraphQL can read 0 remaining while REST still has ~4000 left. A rejection
-whose text contains one of these five signatures (case-insensitive) is a
-rate limit, not a real failure, and has a REST equivalent — do **not** give
-up or wait idly; retry the same mutation over REST:
+whose text contains one of these five signatures (case-insensitive; `·` is a
+space, #11411) is a rate limit, not a real failure, and has a REST
+equivalent — do **not** give up or wait idly; retry the same mutation over REST:
 
 | Signature | Seen as |
 |---|---|
-| `api rate limit exceeded` | REST itself throttling (rare on the fallback path) |
-| `api rate limit already exceeded` | GraphQL: `GraphQL: API rate limit already exceeded for user ID …` |
-| `secondary rate limit` | either transport, burst throttling |
-| `abuse detection mechanism` | either transport, burst throttling |
-| `was submitted too quickly` | either transport, burst throttling |
+| `api rate limit·exceeded` | REST throttling (rare here) |
+| `api rate limit·already exceeded` | GraphQL, as `GraphQL: … for user ID …` |
+| `secondary rate limit` | burst throttling |
+| `abuse detection mechanism` | burst throttling |
+| `was submitted too quickly` | burst throttling |
+
+A "GitHub API rate limit … sleep until reset" reminder on a tool result is a
+text match on its output (#11411), not a quota reading: check
+`gh api rate_limit` and keep working. Read role files with a file-read tool,
+not `cat`.
 
 REST equivalents for the mutations you actually need mid-fix:
 
@@ -343,12 +348,8 @@ Check for an argument passed via the slash command:
 If a number is provided (e.g., `/doctor 123`):
 1. Treat that number as the target **PR** to fix
 2. **Skip** the "Finding Work" section entirely
-3. Claim the PR — run the "Stale `loom:treating` Claim Check" first (a
-   dispatched PR can already be claimed by a concurrent Doctor), then:
-   ```bash
-   gh pr edit <number> --add-label "loom:treating"
-   CLAIM_HEAD_SHA=$(gh pr view <number> --json headRefOid --jq '.headRefOid')
-   ```
+3. Claim the PR exactly as in Work Process step 2 (a dispatched PR can
+   already be claimed by a concurrent Doctor)
 4. Proceed directly to fixing that PR
 
 **How judge feedback reaches you.** When `/loom:sweep` dispatches a Doctor after a
@@ -497,7 +498,6 @@ operator-hold exclusion above and every filter keyed on it are unaffected:
 | `loom:operator-blocked` | Waiting on a **named** issue/PR/piece of infrastructure that does not exist yet — self-clearing once that lands |
 | `loom:operator-mechanical` | Needs host or admin access, a credential, or another mechanical action — no judgement required (the typical Doctor case: a fix that requires a secret rotation or a machine you cannot reach) |
 | `loom:operator-decision` | The fix requires authority you structurally cannot hold — a preference call or an authority act (binds the entity, irreversible disclosure, spending, credentials only the operator holds, accepting risk on the entity's behalf, physical-world action) |
-| `loom:operator-objective` | The fix is determined once the operator states an objective — name the candidate objectives and the answer under each (#5826) |
 
 ```bash
 ./.loom/scripts/post-comment.sh <number> --pr --body "Routing to the operator: <what a human must do>."
@@ -511,8 +511,8 @@ obvious — before applying it, run the falsifiability test from
 `.loom/docs/label-state-machine.md`: name the axis two well-informed people
 would still disagree on, and show it is a preference, not a fact. If you
 cannot name that axis, the fix is determined — finish diagnosing it instead of
-parking. If the only gap is a missing objective, that's
-`loom:operator-objective`, not `loom:operator-decision`.
+parking. If the only gap is a missing objective, file a decision
+whose options are the candidate objectives (#10000).
 
 **If you chose `loom:operator-blocked`**, the same comment MUST name the blocker
 in machine-readable form: a literal `Blocked by #N` / `Depends on #N` /
@@ -522,10 +522,6 @@ does not satisfy this.
 
 **If you chose `loom:operator-decision`**, use `loom-daemon operator-decision
 apply` (`operator-decision.md`); the ranked whys name the axis.
-
-**If you chose `loom:operator-objective`**, the same comment MUST list the
-candidate objectives and the answer under each, not just "needs an
-objective."
 
 Full taxonomy and rationale: `.loom/docs/label-state-machine.md` →
 "`loom:operator-only` sub-kinds".
@@ -608,27 +604,10 @@ if [ "$PRIORITY_1" -eq 0 ] && [ "$PRIORITY_2" -eq 0 ]; then
     # Check for merge conflicts (ask the forge; `git merge-tree origin/main`
     # alone is not a valid invocation — it needs the base + two commits).
     if [ "$(gh pr view "$UNLABELED_PR" --json mergeable --jq '.mergeable')" = "CONFLICTING" ]; then
-      # Resolve conflicts
-      git fetch origin main
-      git rebase origin/main
-      # ... resolve conflicts ...
-      # If commit.signoff is true (or the repo requires DCO), re-signed commits
-      # must keep their Signed-off-by: trailer — use `git commit --amend --signoff`
-      # when re-authoring a commit during the rebase. See defaults/docs/commit-signoff.md.
-
-      # Version-bearing-file sync gate (#7168, largely moot after #7743): no
-      # PR may carry an edit to a version-bearing file's value anymore (bumps
-      # are version-bump-on-merge.yml's job, once, after merge), so a rebase
-      # now lands exactly origin/main's values with nothing of yours to go
-      # stale. Kept as cheap defense-in-depth -- this path pushes directly,
-      # never through create-pr.sh. If it fires, that is an anomaly: do NOT
-      # hand-edit a version-bearing file or run `version.sh bump patch` --
-      # stop, do not push, report it on the PR.
-      if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-check-gate.sh --fix-hint "then push."; then
-        echo "Aborting: version-bearing files are out of sync after rebase (see BLOCKER:/Fix: above) -- unexpected under #7743; report, do not hand-bump." >&2
-        exit 1
-      fi
-      git push --force-with-lease
+      # Pin = the head just checked out, BEFORE the update; never the forge (#9487).
+      PUSH_LEASE_SHA=$(git rev-parse HEAD)
+      # Now run "PR Has Merge Conflicts" (below) top to bottom: merge (or rebase,
+      # per `branch-update strategy`, #10771), resolve, version gate, push.
 
       # Comment but don't add labels
       ./.loom/scripts/post-comment.sh $UNLABELED_PR --pr --body "🔧 Fixed merge conflicts with main branch."
@@ -671,7 +650,7 @@ When the user explicitly instructs you to work on a specific PR by number:
 # PR has: no loom labels yet
 
 # ✅ Proceed immediately (still run the stale-claim check if loom:treating is present)
-gh pr edit 588 --add-label "loom:treating"
+loom-daemon lease pr claim 588 --role doctor --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"; [[ $? =~ ^[02]$ ]] && gh pr edit 588 --add-label "loom:treating"
 CLAIM_HEAD_SHA=$(gh pr view 588 --json headRefOid --jq '.headRefOid')
 ./.loom/scripts/post-comment.sh 588 --pr --body "Addressing issues on this PR per user request"
 
@@ -712,16 +691,17 @@ gh pr edit 588 --remove-label "loom:treating" --add-label "loom:review-requested
 ## Work Process
 
 1. **Find PRs needing attention**: Look for `loom:changes-requested` label that aren't already claimed (see above)
-2. **Claim the PR** (staleness-aware — see "Stale `loom:treating` Claim Check" immediately below **before** running this): Add `loom:treating` to prevent duplicate work, and record the head SHA you are starting from
+2. **Claim the PR** (run the "Stale `loom:treating` Claim Check" below **first**): take the PR lease ("PR Lease" below), add `loom:treating` only once it is held, and record the head SHA you start from
    ```bash
-   gh pr edit <number> --add-label "loom:treating"
+   loom-daemon lease pr claim <number> --role doctor --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"
+   [[ $? =~ ^[02]$ ]] && gh pr edit <number> --add-label "loom:treating"   # else: stand down, touch no worktree
    CLAIM_HEAD_SHA=$(gh pr view <number> --json headRefOid --jq '.headRefOid')
    ```
 3. **Check PR details**: `gh pr view <number>` - look for "Changes requested" reviews or conflicts
 4. **Read feedback**: Understand what the reviewer is asking for
-5. **Check out PR branch in a dedicated worktree** (see "PR Branch Isolation" above): use `./.loom/scripts/worktree.sh <ISSUE_NUM>` for `feature/issue-<N>` branches or `./.loom/scripts/pr-worktree.sh <PR_NUMBER>` for external/ad-hoc branches, then `cd` into the worktree before running `gh pr checkout`.
+5. **Check out PR branch in a dedicated worktree** (see "PR Branch Isolation" above): use `./.loom/scripts/worktree.sh <ISSUE_NUM>` for `feature/issue-<N>` branches or `./.loom/scripts/pr-worktree.sh <PR_NUMBER>` for external/ad-hoc branches, then `cd` into the worktree before running `gh pr checkout`. Then "Verify the pin" (below), before any edit.
 6. **CRITICAL: Assess ALL CI failures FIRST** (see "CI Assessment" section below):
-   - Run `gh pr checks <number>` to identify ALL failing checks
+   - Run `forge wait-checks <number> --timeout 20` to identify ALL failing checks
    - Fetch logs for each failing check
    - Create a complete list of ALL issues before starting ANY fixes
 7. **Address ALL issues comprehensively**:
@@ -733,16 +713,17 @@ gh pr edit 588 --remove-label "loom:treating" --add-label "loom:review-requested
    - Do NOT push until all local checks pass
    - This prevents multiple fix-push-fail cycles
 9. **Commit and push**: Push your fixes to the PR branch
-   - **Pre-open rebase onto `origin/main` (MANDATORY, #7668)**: immediately before this push — whatever your dispatch reason — run `git fetch origin main && git rebase origin/main`, as in `builder-pr.md` § "Pre-Push Rebase". If it conflicts, resolve it now using the "PR Has Merge Conflicts" recipe below (including its version-bearing-file sync gate) rather than re-requesting review on a PR that lands `DIRTY` on the next pass (the reactive round-trip of Priority 1 above). A no-op when `main` hasn't moved.
    - **Pre-push head-SHA recheck (MANDATORY)**: before the push, re-compare the PR's `headRefOid` against the `CLAIM_HEAD_SHA` you captured in step 2 — see "Pre-Push Head-SHA Recheck" below. If the head moved, another agent pushed while you were working; re-verify the blocker is still unaddressed and stand down rather than duplicating (or clobbering) their fix.
+   - **Then run "Pin the lease" below, top to bottom**: the pre-open update from `origin/main` (MANDATORY, #7668, as `builder-pr.md` § "Pre-Push Rebase"; a merge unless `loom-daemon branch-update strategy` says rebase, #10771) and the push (#9487). Never update before it. On a conflict resolve in place (`git add`, then `git commit --no-edit` or `git rebase --continue`), resume at its version gate, not "PR Has Merge Conflicts". No-op if `main` hasn't moved.
+   - **Lease fence (MANDATORY)**: its `lease pr fence` runs right before the push.
    - **DCO / sign-off**: if `commit.signoff` is `true` in `.loom/config.json` (read it the same way as `buildGate.command`), or the repo has a DCO / required `sign-off` check, add `--signoff` to **every** commit you author — including `git commit --amend --signoff` when re-authoring during a rebase — so each carries a `Signed-off-by:` trailer. Harmless when not required; git will not add a duplicate trailer. Reference: `defaults/docs/commit-signoff.md`.
    - **9a. Rebase any stacked children** (best-effort): if the just-pushed branch matches `feature/issue-<N>` (i.e. you amended a stacked *parent*), run:
      ```bash
      ./.loom/scripts/rebase-stacked-children.sh feature/issue-<N>
      ```
-     This discovers open child PRs stacked on your branch and rebases any that went stale onto your new tip (safe children auto-rebase + force-with-lease; children whose issue is still `loom:building` get a deferred-reconciliation comment instead). It is a no-op when there are no stacked children. This is **best-effort** — a failure here (rebase conflict, non-GitHub forge) never fails your own Doctor work; carry on to step 10. Preview first with `--dry-run` if unsure.
-10. **Verify CI remotely**: Run `gh pr checks <number>` after push to confirm all checks pass
-11. **Signal completion and unclaim** (run the Verdict-Time CAS Recheck — see below — immediately before this write; abort/stand down instead if it finds your claim lost or the PR already moved):
+     It rebases open child PRs that went stale onto your new tip (safe children auto-rebase with a *pinned* force-with-lease; a child whose issue is still `loom:building` gets a deferred-reconciliation comment). No-op without stacked children, and **best-effort** — a failure (conflict, non-GitHub forge) never fails your own work; carry on to step 10. `--dry-run` previews.
+10. **Verify CI remotely**: after push, `forge wait-checks <number> --timeout 20` (GREEN/NONE = pass; else CI Assessment Step 5)
+11. **Signal completion and unclaim** (run the lease fence and the Verdict-Time CAS Recheck — see below — immediately before this write; abort/stand down instead if either finds your claim lost or the PR already moved; then `lease pr release`):
     - Remove `loom:changes-requested` and `loom:treating` labels
     - Add `loom:review-requested` label (green badge)
     - Comment to notify reviewer that feedback is addressed
@@ -759,8 +740,7 @@ still alive. Without this check a dead claim blocks the PR from ever being
 treated again; without the *fresh* half of it, two live Doctors duplicate the
 same fix (the failure this section exists to prevent).
 
-**If the PR does NOT carry `loom:treating`:** proceed to claim as today — no
-behavior change: `gh pr edit <number> --add-label "loom:treating"`.
+**If the PR does NOT carry `loom:treating`:** claim it (step 2).
 
 **If the PR DOES carry `loom:treating`:** evaluate the claim with the shared
 staleness evaluator. **Do not hand-roll the timeline/comment arithmetic** —
@@ -785,7 +765,7 @@ Then decide on `$CLAIM_STATE`:
 
 | `$CLAIM_STATE` | Meaning | Action |
 |---|---|---|
-| `unclaimed` | the PR does not actually carry `loom:treating` right now | Claim it normally: `gh pr edit $N --add-label "loom:treating"` |
+| `unclaimed` | the PR does not actually carry `loom:treating` right now | Claim it (step 2). |
 | `fresh` | a Doctor is plausibly still fixing this PR | **Do not stomp the claim.** Record a stand-down (see below), then skip this PR and move to the next candidate in the queue. |
 | `stale` | no *claimant* activity for ≥ `LOOM_STALE_TREATING_MINUTES` (default **60**) — the claiming Doctor's process almost certainly died mid-fix | Reclaim (see below), then proceed with the normal fix from step 3. |
 | `stale-bounded-fallback` | the stand-down streak reached `LOOM_MAX_STANDDOWN_STREAK` (default **3**) **and** the claim's own age is ≥ `LOOM_STALE_TREATING_MINUTES` | Force-reclaim (see below) — the livelock breaker. |
@@ -818,16 +798,10 @@ live claim, so you never hand-assemble it:
 $(./.loom/scripts/claim-staleness.sh marker --number "$N" --label loom:treating)"
 ```
 
-**Stand-down marker convention (#4618 — breaks the livelock)**: a "standing
-down, not stomping" comment is evidence of **no activity**, not activity — it
-means a *later* Doctor pass declined to touch the claim, not that the *original*
-claimant is still working. Before #4618, every comment after the claim counted
-indiscriminately, so each stand-down comment satisfied the very freshness test
-the next pass ran, making the claim look eternally fresh even though nothing was
-happening (the `loom:reviewing` analog played out on PR #4614: 3 consecutive
-stand-down comments over 30+ minutes, never reclaimed). Stand-down comments
-therefore carry their own marker and are counted into the streak, never into
-liveness.
+**Stand-down marker convention (#4618)**: a "standing down, not stomping"
+comment is evidence of **no activity** — a *later* pass declined to touch the
+claim. Stand-down comments carry their own marker and count into the streak,
+never into liveness (counting them made claims look eternally fresh, PR #4614).
 
 **Recording a stand-down** (the `fresh` and `unknown` rows):
 
@@ -843,37 +817,23 @@ It posts the marked stand-down comment the first time, and on every later pass
 <!-- loom:standdown claim=$CLAIMED_AT seq=2 -->
 ```
 
-**This is what keeps the bounded fallback reachable (#6514).** Duplicate
-stand-down suppression (#5123) previously skipped the pass entirely, so
-`STANDDOWN_COUNT` froze at 1 and `LOOM_MAX_STANDDOWN_STREAK` was never reached —
-the second half of the PR #6513 livelock, in which the claim could escape
-neither through the ordinary staleness row nor through the fallback. Bumping in
-place keeps the forge free of near-identical comments (the #5123 goal) while the
-streak still accumulates (the #4618 AC3 goal). A legacy marker with no `seq=`
-counts as `seq=1`. Re-verification of staleness still runs on **every** pass —
-only the redundant *comment* is avoided, never the check.
+**This keeps the bounded fallback reachable (#6514)**: the streak accumulates
+without near-identical comments (#5123). A legacy marker with no `seq=` counts as
+`seq=1`. Staleness is still re-verified on **every** pass.
 
-**Bounded fallback (AC3, #4618; age-floor join added by #4798; unstarved by
-#6514)**: the streak is a hard cap independent of the activity/marker logic
-working correctly — it counts how many stand-down passes have accumulated
-against *this exact* `$CLAIMED_AT` (the marker embeds it, so a genuine reclaim —
-which changes `CLAIMED_AT` — resets the count to zero automatically). But the
-streak by itself measures **peer arrival rate** (how many other Doctors happened
-to revisit this PR), not claim liveness — a claim only minutes old can
-accumulate `LOOM_MAX_STANDDOWN_STREAK` stand-downs from that many concurrent
-Doctors without coming close to stale in the age sense (the `loom:reviewing`
-analog played out on PR #4790: a claim 17m36s old, well under the 30-minute
-default, was force-reclaimed after 3 Judges each stood down within that same
-window). So the fallback fires only once **both** hold:
-`LOOM_MAX_STANDDOWN_STREAK` passes have piled up against the same claim with no
-reclaim, **and** the claim's own age is ≥ `LOOM_STALE_TREATING_MINUTES`. Note
-that this row is keyed on the **claim's** age, not on the idle clock, precisely
-so a claimant stuck in a loop emitting activity markers still cannot hold the
-claim forever. Use this reclaim comment:
+**Bounded fallback (AC3, #4618/#4798/#6514)**: the streak counts stand-down
+passes against *this exact* `$CLAIMED_AT` (a genuine reclaim resets it). A
+streak alone measures peer arrival rate, not liveness (PR #4790), so the
+fallback fires only once **both** hold: `LOOM_MAX_STANDDOWN_STREAK` passes
+against the same claim, **and** the claim's own age (not the idle clock, so a
+looping claimant cannot hold it forever) is ≥ `LOOM_STALE_TREATING_MINUTES`.
+Use this reclaim comment:
 
 ```bash
-gh pr edit $N --remove-label "loom:treating"
-./.loom/scripts/post-comment.sh $N --pr --body "Reclaiming loom:treating claim: $STANDDOWN_COUNT stand-down passes, no fix progress for ${LOOM_STALE_TREATING_MINUTES:-60}m (bounded by LOOM_MAX_STANDDOWN_STREAK=${LOOM_MAX_STANDDOWN_STREAK:-3}) — breaking the livelock."
+# The lease first: a live peer lease (exit 4) means stand down, label untouched.
+loom-daemon lease pr claim $N --role doctor --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"; [[ $? =~ ^[02]$ ]] &&
+gh pr edit $N --remove-label "loom:treating" &&
+./.loom/scripts/post-comment.sh $N --pr --body "Reclaiming loom:treating claim: $STANDDOWN_COUNT stand-down passes, no fix progress for ${LOOM_STALE_TREATING_MINUTES:-60}m (bounded by LOOM_MAX_STANDDOWN_STREAK=${LOOM_MAX_STANDDOWN_STREAK:-3}) — breaking the livelock." &&
 gh pr edit $N --add-label "loom:treating"
 CLAIM_HEAD_SHA=$(gh pr view $N --json headRefOid --jq '.headRefOid')
 # Continue to step 3 (Check PR details) and fix normally
@@ -882,8 +842,10 @@ CLAIM_HEAD_SHA=$(gh pr view $N --json headRefOid --jq '.headRefOid')
 **Reclaiming a stale claim** (the ordinary idle-clock path):
 
 ```bash
-gh pr edit $N --remove-label "loom:treating"
-./.loom/scripts/post-comment.sh $N --pr --body "Reclaiming stale loom:treating claim (idle ${IDLE_MINUTES}m > ${LOOM_STALE_TREATING_MINUTES:-60}m, no claimant activity) — the prior process likely died mid-fix."
+# The lease first: a live peer lease (exit 4) means stand down, label untouched.
+loom-daemon lease pr claim $N --role doctor --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"; [[ $? =~ ^[02]$ ]] &&
+gh pr edit $N --remove-label "loom:treating" &&
+./.loom/scripts/post-comment.sh $N --pr --body "Reclaiming stale loom:treating claim (idle ${IDLE_MINUTES}m > ${LOOM_STALE_TREATING_MINUTES:-60}m, no claimant activity) — the prior process likely died mid-fix." &&
 gh pr edit $N --add-label "loom:treating"
 CLAIM_HEAD_SHA=$(gh pr view $N --json headRefOid --jq '.headRefOid')
 # Continue to step 3 (Check PR details) and fix normally
@@ -905,28 +867,39 @@ not been resynced yet): fall back to the **age-only** rule — read the latest
 **not** reintroduce a "any comment after the claim means fresh" test — that is
 precisely the defect this section exists to fix.
 
-**Daemon backstop (#4367, freshness signal fixed by #4618)**: this check is
-the fast path — it only fires when another Doctor happens to revisit the same
-PR. `loom-daemon`'s `claim_reconciliation` pass (`reconcile_pr_claims`)
-reconciles stale `loom:treating` (and `loom:reviewing`) as an always-on
-backstop at startup and on its periodic tick, sharing this exact env var and
-default — and, since #4618, deriving its own age gate from the claim label's
-own `labeled` timeline-event timestamp rather than the PR's aggregate
-`updatedAt`, for the identical reason the marker convention above exists (a
-stand-down comment self-refreshes `updatedAt` but not the label event). That
-pass runs on an interval (up to ~10 minutes of lag) and cannot see an
-*in-flight* Doctor, so it never substitutes for this check or the pre-push
-recheck below. See [`daemon-reference.md`'s "Stale-claim reconciliation"
-section](https://github.com/rjwalters/loom/blob/main/defaults/docs/daemon-reference.md#stale-claim-reconciliation--the-sweep-journal-3953-fixed-3975-extended-to-pr-side-claims-4367).
+**Daemon backstop (#4367/#4618)**: `loom-daemon`'s `claim_reconciliation`
+pass also reclaims stale `loom:treating` on its tick, with the same env var and
+default, aged from the label's own `labeled` event. It lags up to ~10 minutes
+and cannot see an in-flight Doctor, so it never replaces this check
+(`daemon-reference.md` § "Stale-claim reconciliation").
+
+### PR Lease (Step 2, #9401)
+
+A label is not a mutex: adding one already present is a silent no-op, so two
+Doctors could both "hold" `loom:treating`. `lease pr claim` publishes a
+role-keyed lease comment (a Judge's never contends), orders live leases by
+comment id, and renews yours while your session lives
+(`lease-record.md` § "PR-phase leases"). Same `--watch-pid` every call.
+
+- **claim** exit **0** = held: add `loom:treating` (**2** = an older
+  `loom-daemon` without `lease pr`: label alone, as before). **4** = a peer's
+  live lease wins (a lost race posts your yield record), **5** = unreadable,
+  any other code (**1** = `loom-daemon` failed to start) = unknown: never
+  "label-only" — stand down **before** any worktree, snapshot or label action.
+  Never touch a worktree a peer's lease holds, or its `loom:treating`.
+- **fence** before every push and the completion write (step 11):
+  `lease pr fence <n> --role doctor --watch-pid …`; not 0/2 = lost, stand down.
+- **release** when you finish or stand down: `loom-daemon lease pr release <n>
+  --role doctor --watch-pid …`.
 
 ### Pre-Push Head-SHA Recheck (Step 9)
 
 The claim check above closes the window at *claim* time. It does not close the
 window that opens **while you work**: a Doctor dispatched from another path
 (fleet vs. orchestrator) may claim and fix the same PR after you started, or a
-Builder may push to the branch. `--force-with-lease` protects the *branch* from
-a clobbering push, but it does nothing to stop two Doctors from duplicating an
-hour of *work* before either one pushes.
+Builder may push to the branch. A *pinned* `--force-with-lease` (below)
+protects the *branch*, but nothing stops two Doctors duplicating an hour of
+*work* before either pushes.
 
 So immediately before your final push (step 9), re-read the PR head and compare
 it to the SHA you captured at claim time:
@@ -935,7 +908,7 @@ it to the SHA you captured at claim time:
 N=<pr-number>
 CURRENT_HEAD_SHA=$(gh pr view $N --json headRefOid --jq '.headRefOid')
 if [ -z "$CURRENT_HEAD_SHA" ]; then
-  echo "Head SHA unavailable — fail safe: push with --force-with-lease and re-verify CI after"
+  echo "Head SHA unavailable — re-verify the blocker by hand; the pinned lease below still fails closed"
 elif [ "$CURRENT_HEAD_SHA" = "$CLAIM_HEAD_SHA" ]; then
   echo "Head unchanged since claim — safe to push"
 else
@@ -948,7 +921,7 @@ dispatched for is still unaddressed:
 
 ```bash
 gh pr view $N --comments          # is the Judge's blocking comment already answered?
-gh pr checks $N                   # are the failing checks that sent you here now green?
+loom-daemon forge wait-checks $N --timeout 20   # failing ones now GREEN/NONE?
 gh pr view $N --json labels --jq '.labels[].name'   # is it back on loom:review-requested / loom:pr?
 git fetch origin && git log --oneline "$CLAIM_HEAD_SHA..origin/$(git branch --show-current)"
 ```
@@ -956,34 +929,54 @@ git fetch origin && git log --oneline "$CLAIM_HEAD_SHA..origin/$(git branch --sh
 | Finding | Action |
 |---------|--------|
 | The concurrent push already fixes the blocker (checks green / Judge feedback addressed) | **Stand down.** Do not push. Comment, drop your claim, and exit (see below). |
-| The blocker is still unaddressed, and the new commits are unrelated (e.g. a rebase onto main, an unrelated fix) | Rebase your work onto the new head, re-run local checks, then push with `--force-with-lease`. Never `--force`. |
-| Your work and theirs overlap partially | Keep only the parts still needed, rebase, re-run local checks, then push with `--force-with-lease`. |
+| The blocker is still unaddressed, and the new commits are unrelated (e.g. a merge of main, an unrelated fix) | Bring your work onto the new head (merge it in; rebase only in rebase mode), re-run local checks, then **re-pin** `PUSH_LEASE_SHA=$CURRENT_HEAD_SHA`, re-run "Verify the pin" before any further amend, and push (below). Never `--force`. |
+| Your work and theirs overlap partially | Keep only the parts still needed, update as above, re-run local checks, then re-pin and push. |
 | You cannot tell | Prefer standing down and commenting — a duplicate fix costs more than a deferred one. |
 
-**If you rebase in either of the two "then push" rows above, gate the push the
-same way the merge-conflict recipes do** (#7168, extended #7341; largely moot
-after #7743 -- see below). Rebasing onto a moved head silently absorbs whatever
-version-bearing values that head already carried, and `.loom/install-metadata.json`
-never raises a git conflict (your branch's own commits never touched it) — so
-it can drift stale relative to `VERSION` and the files that *were* rewritten,
-invisible until CI's "Installer Integration Tests" fails:
+### Verify the pin — after setup, BEFORE any edit or rewrite (#9487)
+
+The pin must be in `HEAD`'s history, checkable only until the first amend or
+rebase drops it. Verify once; the push block reuses it through every rewrite.
 
 ```bash
-# Run in the worktree, after `git rebase`, BEFORE `git push --force-with-lease`.
-if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-check-gate.sh --fix-hint "then push."; then
-  echo "Aborting: version-bearing files are out of sync after rebase (see BLOCKER:/Fix: above)." >&2
-  exit 1
-fi
-git push --force-with-lease
+PUSH_LEASE_SHA="${PUSH_LEASE_SHA:-$CLAIM_HEAD_SHA}"
+git merge-base --is-ancestor "$PUSH_LEASE_SHA" HEAD || { echo "Pin not in HEAD: STOP." >&2; exit 1; }
+PUSH_LEASE_OK=$PUSH_LEASE_SHA
 ```
 
-**Never hand-patch VERSION/CLAUDE.md/`Cargo.toml`/… to "re-add a bump the rebase
-dropped"** — and since #7743 never run `./scripts/version.sh bump …` here either,
-even if the gate's Fix: line suggests it. Bumps are `version-bump-on-merge.yml`'s
-job (once, after merge) and no PR may carry its own, so this gate should never
-fire on a rebase anymore. If it does, stop, do not push, and report it on the PR
-rather than hand-bumping — a hand-rolled bump is what produced `bef3e07a` (#7341:
-8 core files patched, `.loom/install-metadata.json` missed, CI red).
+### Pin the lease — a bare `--force-with-lease` is unsafe here (#9487)
+
+The recheck above is the *social* layer; this one is **mandatory**. A bare
+`--force-with-lease` checks `refs/remotes/origin/<branch>`, **shared by every
+linked worktree**: a sibling's `git fetch` makes your push delete their commit
+(PR #9483). Pin the head you built on; never "freshen" it. Why: `defaults/docs/push-lease-pinning.md`.
+
+**Merge mode (#10771)**, the default unless the repo allows rebase merges:
+never rebase, amend or force a commit already on the remote; add commits. A
+rejected plain push means someone pushed: redo the Head-SHA Recheck (merge
+their head in, or stand down), never force.
+
+```bash
+BRANCH=$(git branch --show-current)
+BRANCH_UPDATE=$(loom-daemon branch-update strategy) || BRANCH_UPDATE=merge  # unknown = merge
+# CLAIM_HEAD_SHA (step 2, read BEFORE checkout); re-pin only per the table / last line.
+PUSH_LEASE_SHA="${PUSH_LEASE_SHA:-$CLAIM_HEAD_SHA}"
+[ -n "$PUSH_LEASE_SHA" ] || { echo "No pin: STOP. Do not push or re-read the head." >&2; exit 1; }
+# git accepts ANY full-SHA pin, even unfetched: "Verify the pin" must have run first.
+[ "${PUSH_LEASE_OK:-}" = "$PUSH_LEASE_SHA" ] || { echo "Pin unverified: STOP." >&2; exit 1; }
+git fetch origin main || exit 1
+if [ "$BRANCH_UPDATE" = rebase ]; then git rebase origin/main; else git merge --no-ff -m "Merge origin/main into $BRANCH (Doctor: update before push)" origin/main; fi || exit 1  # conflict: resolve, add, `--continue` / `git commit --no-edit`, resume here
+if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-check-gate.sh --fix-hint "then push."; then
+  echo "Aborting: version-bearing files out of sync after update (see BLOCKER:/Fix:)." >&2
+  exit 1
+fi
+loom-daemon lease pr fence "$N" --role doctor --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"
+[[ $? =~ ^[02]$ ]] || exit 1  # lease lost: stand down
+if [ "$BRANCH_UPDATE" = rebase ]; then git push --force-with-lease="$BRANCH:$PUSH_LEASE_SHA"; else git push origin "HEAD:$BRANCH"; fi &&
+  { PUSH_LEASE_SHA=$(git rev-parse HEAD); PUSH_LEASE_OK=$PUSH_LEASE_SHA; CLAIM_HEAD_SHA=$PUSH_LEASE_SHA; }  # own push: re-pin
+```
+
+Never hand-bump `VERSION` & co. here (#7743; `bef3e07a`, #7341): if the gate fires, stop and report on the PR.
 
 **Standing down** (a concurrent fix already landed):
 
@@ -1037,11 +1030,15 @@ This is the same technique as the Pre-Push Head-SHA Recheck, applied to the
 write that actually matters, not just at claim time.
 
 **Pre-completion checklist** (verify before signaling completion):
-- [ ] All CI checks pass (verified via `gh pr checks <number>`)
+- [ ] All CI checks pass (verified via `forge wait-checks <number>`)
 - [ ] I ran the stale `loom:treating` claim check before claiming (skipped the PR
       on a fresh claim; reclaimed only on a stale one)
+- [ ] I held the PR lease before adding `loom:treating`, fenced it before each
+      push and the completion write, and release it now (#9401)
 - [ ] I re-compared the PR's `headRefOid` against `CLAIM_HEAD_SHA` immediately
       before pushing, and on a mismatch re-verified the blocker (or stood down)
+- [ ] Merge mode: no rebase, amend or force push; rebase mode: every force-push pinned a
+      SHA in my HEAD (`--force-with-lease=<branch>:<sha>`), re-pinned, never bare (#9487, #10771)
 - [ ] I re-read the PR's labels immediately before the completion write (Verdict-Time
       CAS Recheck above), and aborted/stood down on a lost claim or a raced verdict
       label instead of writing over it
@@ -1072,13 +1069,10 @@ In past orchestration runs, Doctors often required 3+ separate passes because th
 ### Step 1: Identify ALL Failing Checks
 
 ```bash
-# Get ALL failing checks at once
-gh pr checks <PR_NUMBER> 2>&1 | grep -E "fail|pending"
-
-# Example output showing multiple failures:
-# Frontend Unit Tests    fail    1m23s  https://github.com/...
-# Shellcheck             fail    0m45s  https://github.com/...
-# TypeScript Type Check  fail    0m32s  https://github.com/...
+# Get ALL failing checks at once (RED omits still-running ones; TIMEOUT names them)
+loom-daemon forge wait-checks <PR_NUMBER> --timeout 20
+# stdout: LOOM-CHECKS-RED <sha> Shellcheck,Unit Tests
+# stderr: <name>\t<url>\t<RUN_ID> per failure. -ERROR/no sentinel: gh pr checks <PR_NUMBER>
 ```
 
 ### Step 2: Fetch Logs for Each Failure
@@ -1086,14 +1080,8 @@ gh pr checks <PR_NUMBER> 2>&1 | grep -E "fail|pending"
 For each failing check, fetch the relevant logs:
 
 ```bash
-# List recent workflow runs to find the run ID
-gh run list --limit 5
-
-# Get failed logs for a specific run
+# RUN_ID: 3rd field of a RED stderr line (else gh run list --limit 5)
 gh run view <RUN_ID> --log-failed | tail -100
-
-# Or view in browser for detailed analysis
-gh run view <RUN_ID> --web
 ```
 
 ### Step 3: Create Comprehensive Fix Plan
@@ -1136,7 +1124,8 @@ shellcheck scripts/*.sh # Shell scripts (if applicable)
 
 | File | Load when |
 |---|---|
-| [`cargo-target-isolation.md`](../loom-cargo-target-isolation/SKILL.md) | Before a local cargo result counts as "the fix works": a shared target dir may hold another worktree's binary (#8457). |
+| [`cargo-target-isolation.md`](../loom-cargo-target-isolation/SKILL.md) | Any cargo build: use exported `CARGO_TARGET_DIR` or `<worktree>/target`; never `/tmp`, `~`, `.loom/target-*` (#8370). |
+| [`ci-refusals-reference.md`](../loom-ci-refusals-reference/SKILL.md) | A CI read got 403/429, or a job needs a re-run. |
 
 ### Step 5: Verify Remote CI After Push
 
@@ -1144,8 +1133,8 @@ shellcheck scripts/*.sh # Shell scripts (if applicable)
 # Push fixes
 git push
 
-# Wait briefly, then verify ALL checks pass
-sleep 30 && gh pr checks <PR_NUMBER>
+# Verify ALL checks pass (ETag'd, backed-off wait; see "CI has not settled" below)
+loom-daemon forge wait-checks <PR_NUMBER> --timeout 1200
 
 # If any still failing, repeat assessment (but should be rare now)
 ```
@@ -1166,49 +1155,18 @@ This rule is about *when your own turn may end*, not about *whether someone else
 **There are exactly two safe paths when CI has not settled:**
 
 1. **You have made the fix and pushed it: hand back to Judge instead of waiting.** This is the correct default. Verifying the final CI verdict is **Judge's** gate — complete the `loom:changes-requested` → `loom:review-requested` transition, state in your PR comment that CI was still running at hand-off, and finish your turn. A later Judge pass re-evaluates once CI settles.
-2. **Single-PR / manual invocation where a settled result is expected before your turn ends: block-poll in the foreground.** Loop **inside this same turn** — `gh pr checks`, `sleep`, repeat — until the checks resolve or you hit an explicit, bounded cap. This is an ordinary shell loop that runs to completion and returns control to you before you write your final message; nothing about it depends on a future turn.
+2. **Single-PR / manual invocation where a settled result is expected before your turn ends: block-poll in the foreground.** Run `loom-daemon forge wait-checks` **inside this same turn** in the foreground (bounded by `--timeout`). It returns control to you before you write your final message; nothing about it depends on a future turn.
 
-**Empty `gh pr checks` output is NOT proof CI has settled.** `gh pr checks` is
-GraphQL-backed and can return completely empty output (zero rows) during a
-transient forge failure (e.g. an intermittent TLS handshake error) — a state
-indistinguishable from "nothing pending" if your loop condition only greps the
-output for the word "pending" (#6169: a Judge poller on kicad-tools PR #4792
-declared CI "settled" 6 minutes into a ~40-minute run this way). Guard against
-it by asserting a minimum row count before trusting an absence of "pending":
+**Use `loom-daemon forge wait-checks`, not a `gh pr checks` loop.** It is ETag'd and settles the empty-rollup trap (#6169). Branch on the first **stdout** line (never the exit code; keep stderr separate, it carries the RED detail). For a snapshot use `--timeout 20` (`0` reads a no-checks repo as TIMEOUT). 
 
 ```bash
-# Foreground block-poll after `git push` — bounded, in-turn, no watcher.
-# MAX_WAIT caps the total wait; never loop unboundedly (see "Time budget" above).
-# ci_still_pending: true (pending) if any row shows pending/queued/in_progress.
-# A ZERO-ROW read is retried once before being trusted — on a real forge blip
-# the retry almost always returns real rows; only a read that is STILL empty
-# after the retry is treated as "genuinely no checks reported" (not pending).
-ci_still_pending() {
-  local pr="$1" out rows
-  out="$(gh pr checks "$pr" 2>/dev/null)"
-  rows="$(printf '%s\n' "$out" | grep -c $'\t' || true)"
-  if [[ "$rows" -eq 0 ]]; then
-    sleep 3
-    out="$(gh pr checks "$pr" 2>/dev/null)"
-    rows="$(printf '%s\n' "$out" | grep -c $'\t' || true)"
-    [[ "$rows" -eq 0 ]] && return 1   # confirmed empty on retry -- not pending
-  fi
-  printf '%s\n' "$out" | grep -qE "(pending|queued|in_progress)"
-}
-
-MAX_WAIT=1200   # 20 min cap — tune to the repo's typical CI duration
-INTERVAL=60
-ELAPSED=0
-while ci_still_pending <PR_NUMBER>; do
-  if [ "$ELAPSED" -ge "$MAX_WAIT" ]; then
-    echo "CI still pending after ${MAX_WAIT}s — handing back to Judge unsettled."
-    break
-  fi
-  sleep "$INTERVAL"
-  ELAPSED=$((ELAPSED + INTERVAL))
-  echo "…CI still running (${ELAPSED}s)"
-done
-gh pr checks <PR_NUMBER>
+err="$(mktemp)"; out="$(loom-daemon forge wait-checks <PR_NUMBER> --timeout 1200 2>"$err")"; first="${out%%$'\n'*}"
+case "$first" in
+  LOOM-CHECKS-GREEN*|LOOM-CHECKS-NONE*) ;;   # settled green
+  LOOM-CHECKS-RED*) cat "$err" ;;            # <name>\t<url>\t<run_id> per failure; gh run view <run_id> --log-failed
+  LOOM-CHECKS-TIMEOUT*|LOOM-CHECKS-HEAD-MOVED*|LOOM-CHECKS-ERROR*) echo "CI unsettled after the bounded wait; hand back to Judge" ;;
+  *) gh pr checks <PR_NUMBER> ;;             # no sentinel (older binary / Gitea): one snapshot, no loop
+esac
 ```
 
 **If the cap is reached, do not extend the wait and do not substitute a background watcher for either path.** Comment on the PR that the fixes are pushed but CI had not settled after the bounded wait, complete the `loom:review-requested` hand-off exactly as path 1 does, and finish. **If you have not personally read the result in this turn**, you have not verified it — do not write a final message that implies CI is green or that a verdict is "in progress elsewhere."
@@ -1296,7 +1254,7 @@ Read the full review, not just individual comments; check what the reviewer alre
 
 ### Make Focused Changes
 
-Address exactly what was requested — no new features or refactoring beyond the feedback (see "Scope Discipline"). Keep commits focused and well-described, and run tests after each change.
+Address exactly what was requested, nothing beyond it (see "Scope Discipline"); keep commits focused and run tests after each change.
 
 ### Fixing a Role Prompt or Dispatch Brief
 
@@ -1312,13 +1270,17 @@ Comment on the PR when pushing fixes ("Addressed: formatting, added tests for ed
 
 ### Quality Checks
 ```bash
-# Always run full CI before pushing
-pnpm check:ci   # your repo's check command — see buildGate.command in .loom/config.json
+# Full CI; Rust lint = each CI `cargo clippy` line verbatim, apart from tests; no clippy = unvalidated.
+# Production shell changed + CI runs shell-budget --check? After the final commit, before re-review:
+# `loom-daemon shell-budget --check --base <PR base, default origin/main>`; nonzero = this branch's
+# growth (never pre-existing): cut counted shell or move it to the daemon, rerun to exit 0.
+# Comments, follow-up issues or arbitrary trailers are not permission.
+pnpm check:ci   # repo check: buildGate.command in .loom/config.json
 
-# Check specific areas if review mentioned them
-pnpm test              # If review mentioned testing
-pnpm lint              # If review mentioned code style
-pnpm exec tsc --noEmit # If review mentioned types
+# If review mentioned tests / style / types:
+pnpm test
+pnpm lint
+pnpm exec tsc --noEmit
 ```
 
 ### Test Output: Truncate for Token Efficiency
@@ -1326,28 +1288,13 @@ pnpm exec tsc --noEmit # If review mentioned types
 When running tests during PR fixes, truncate verbose output to conserve tokens:
 
 ```bash
-# Failures + summary only (recommended)
+# Failures + summary only
 pnpm test 2>&1 | grep -E "(FAIL|PASS|Error|✓|✗|Summary|Tests:)" | head -100
-
-# Just the summary
-pnpm test 2>&1 | tail -30
-
-# Show only failures with context
-pnpm test 2>&1 | grep -A 5 -B 2 "FAIL\|Error\|✗"
 ```
 
-**Why truncate?**
-- Test output can exceed 10,000+ lines
-- Most of that is passing tests (not actionable)
-- Wastes tokens that could be used for actual fix work
-- Pollutes context for subsequent operations
+**Why truncate?** Output can exceed 10,000 lines of mostly passing, non-actionable tests that waste tokens and pollute context.
 
-**Report failures concisely:**
-```
-❌ 2 tests failing after fix:
-1. `state.test.ts:45` - still returns undefined (need null check)
-2. `worktree.test.ts:89` - timeout (async issue remains)
-```
+Report failures concisely: one `file:line` - cause line per failing test.
 
 ## Example Commands
 
@@ -1392,10 +1339,10 @@ pnpm check:ci   # your repo's check command — see buildGate.command in .loom/c
 
 # Commit and push
 git add .
-# DCO / sign-off: if commit.signoff is true in .loom/config.json (or the repo has a
-# DCO / required sign-off check), add --signoff so the commit carries a
-# Signed-off-by: trailer — same rule the Builder follows. Applies to EVERY commit
-# you author, including --amend. See defaults/docs/commit-signoff.md.
+# DCO: if commit.signoff is true in .loom/config.json (or a DCO check is required),
+# pass --signoff on EVERY commit, --amend too (defaults/docs/commit-signoff.md).
+# Never write a skip-CI marker ("[skip ci]" etc.) literally — no CI would run
+# (#11389); add a space inside or describe it.
 git commit -m "Address review feedback
 
 - Fix null handling in foo.ts:15
@@ -1405,7 +1352,7 @@ git commit -m "Address review feedback
 # Pre-push head-SHA recheck — did another agent push while you worked?
 CURRENT_HEAD_SHA=$(gh pr view 42 --json headRefOid --jq '.headRefOid')
 if [ -n "$CURRENT_HEAD_SHA" ] && [ "$CURRENT_HEAD_SHA" != "$CLAIM_HEAD_SHA" ]; then
-  # Re-verify the blocker (gh pr view 42 --comments / gh pr checks 42) before
+  # Re-verify the blocker (gh pr view 42 --comments / forge wait-checks 42) before
   # continuing — stand down if a concurrent fix already landed.
   echo "Head moved: $CLAIM_HEAD_SHA -> $CURRENT_HEAD_SHA"
 fi
@@ -1435,42 +1382,34 @@ All CI checks passing. Ready for re-review!"
 This is a critical issue that blocks merging. Fix it immediately:
 
 ```bash
-# Fetch latest main
+# Pin = the claim-time head, never re-read; verify BEFORE any rewrite.
+# Mid-rebase, check passed pre-rebase (step 9)? Skip to `git rebase --continue`.
+PUSH_LEASE_SHA="${PUSH_LEASE_SHA:-${CLAIM_HEAD_SHA:?}}"
+BRANCH=$(git branch --show-current)
+# Nothing rewritten yet? Verify now (an amend fails safe).
+[ "${PUSH_LEASE_OK:-}" = "$PUSH_LEASE_SHA" ] || { git merge-base --is-ancestor "$PUSH_LEASE_SHA" HEAD && PUSH_LEASE_OK=$PUSH_LEASE_SHA; } || { echo "Pin not in HEAD: STOP." >&2; exit 1; }
+BRANCH_UPDATE=$(loom-daemon branch-update strategy) || BRANCH_UPDATE=merge  # #10771; unknown = merge
+
 git fetch origin main
+if [ "$BRANCH_UPDATE" = rebase ]; then git rebase origin/main; else git merge --no-ff -m "Merge origin/main into $BRANCH (Doctor: resolve conflicts)" origin/main; fi
+# Conflict: resolve each file, `git add` it, then `git commit --no-edit` (merge) or `git rebase --continue`.
 
-# Try rebasing onto main
-git rebase origin/main
-
-# If conflicts occur:
-# 1. Git will stop and show conflicting files
-# 2. Open each file and resolve conflicts (look for <<<<<<< markers)
-# 3. After fixing each file:
-git add <file>
-
-# Continue rebase after all conflicts resolved
-git rebase --continue
-
-# Version-bearing-file sync gate (#7168, largely moot after #7743): no PR may
-# carry an edit to a version-bearing file's value anymore (bumps are
-# version-bump-on-merge.yml's job, once, after merge), so a rebase now lands
-# exactly origin/main's values with nothing of yours to go stale. Kept as
-# cheap defense-in-depth -- this path pushes directly, never through
-# create-pr.sh. If it fires, that is an anomaly: do NOT hand-edit a
-# version-bearing file or run `version.sh bump patch` -- stop, do not push,
-# report it on the PR.
+# Version-bearing-file sync gate (#7168): if it fires, stop and report; never hand-bump.
 if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-check-gate.sh --fix-hint "then push."; then
-  echo "Aborting: version-bearing files are out of sync after rebase (see BLOCKER:/Fix: above) -- unexpected under #7743; report, do not hand-bump." >&2
+  echo "Aborting: version-bearing files are out of sync after update (see BLOCKER:/Fix: above) -- unexpected under #7743; report, do not hand-bump." >&2
   exit 1
 fi
 
-# Force push (PR branch is safe to force push)
-git push --force-with-lease
+# Merge: plain push (rejected: Head-SHA Recheck, never force). Rebase: PINNED lease.
+loom-daemon lease pr fence 42 --role doctor --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"
+[[ $? =~ ^[02]$ ]] || exit 1  # lease lost: stand down
+if [ "$BRANCH_UPDATE" = rebase ]; then git push --force-with-lease="$BRANCH:$PUSH_LEASE_SHA"; else git push origin "HEAD:$BRANCH"; fi &&
+  { PUSH_LEASE_SHA=$(git rev-parse HEAD); PUSH_LEASE_OK=$PUSH_LEASE_SHA; CLAIM_HEAD_SHA=$PUSH_LEASE_SHA; }
 
-# Verify CI passes after rebase
-gh pr checks 42
+loom-daemon forge wait-checks 42 --timeout 20
 ```
 
-**Important**: Always use `--force-with-lease` instead of `--force` to avoid overwriting others' work.
+**Important**: never `--force`, and never a *bare* `--force-with-lease` — pin it.
 
 #### Which labels to touch after a conflict-only fix
 
@@ -1552,7 +1491,7 @@ EOF
 
 ```bash
 # First: Check ALL CI failures, not just tests
-gh pr checks <PR_NUMBER> 2>&1 | grep -E "fail"
+loom-daemon forge wait-checks <PR_NUMBER> --timeout 20
 
 # Then fix ALL issues locally
 pnpm test              # Run tests

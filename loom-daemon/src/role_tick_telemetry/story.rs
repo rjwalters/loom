@@ -57,9 +57,10 @@ use crate::telemetry::trace::{
     SpanLink, SpanName, SpanRecord, SpanStatus, TraceAttributes, STORY_KEY_VERSION,
 };
 
-/// Every attribute key a story span can carry, besides provenance. Each must
-/// survive the daemon's span allowlist and the gateway's span `keep_keys`
-/// (contract-tested).
+/// Every attribute key a story span can carry, besides provenance and — on a
+/// failed tick's copy — [`crate::observability::lifecycle::ROLE_FAILURE_ATTRIBUTE_KEYS`]
+/// (#10640). Each must survive the daemon's span allowlist and the gateway's
+/// span `keep_keys` (contract-tested).
 pub const STORY_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.role",
     "loom.issue",
@@ -107,6 +108,9 @@ pub struct TickFacts {
     /// The tick's per-model usage (#9303); attempt-scoped usage joins the
     /// story only when exactly one target is stitched ([`super::usage`]).
     pub tokens_by_model: Option<Vec<crate::script_helpers::sweep_experiment::ModelUsageTotals>>,
+    /// How the tick was billed (#10749); copied onto the story spans and their
+    /// attempt-scoped usage.
+    pub llm_billing: Option<crate::observability::llm_billing::LlmBilling>,
 }
 
 /// Join `facts`' tick to the stories of `targets`. Blocking and best-effort:
@@ -144,7 +148,8 @@ pub fn emit(root: &Path, facts: &TickFacts, targets: &BTreeSet<Target>) {
         );
         return;
     };
-    let mut spans = plan(facts, &identity, &slug, &numbers, &resolved);
+    // #10637: `loom.repo` is GitHub's spelling, as on the tick's own root.
+    let mut spans = plan(facts, &identity, &identity.full_name, &numbers, &resolved);
     spans.extend(super::usage::attempt_usage(
         &spans,
         facts.tokens_by_model.as_deref(),
@@ -206,7 +211,7 @@ fn target_key(story: &StoryRef) -> String {
     }
 }
 
-/// One tick's span in `story`.
+/// One tick's span in `story`; `slug` is its `loom.repo`, as given.
 #[must_use]
 pub fn story_span(facts: &TickFacts, slug: &str, story: &StoryRef) -> SpanRecord {
     let context =
@@ -218,7 +223,7 @@ pub fn story_span(facts: &TickFacts, slug: &str, story: &StoryRef) -> SpanRecord
         ("loom.issue", story.issue.to_string()),
         ("loom.story", story.story.clone()),
         ("loom.story.key_version", STORY_KEY_VERSION.to_string()),
-        ("loom.repo", slug.to_ascii_lowercase()),
+        ("loom.repo", slug.to_string()),
         ("loom.result", facts.result.clone()),
         ("loom.sweep_id", facts.trace.execution.clone()),
         ("loom.timing_source", "tick".to_string()),
@@ -235,6 +240,13 @@ pub fn story_span(facts: &TickFacts, slug: &str, story: &StoryRef) -> SpanRecord
         if let Some(value) = value.filter(|v| !v.is_empty()) {
             attributes.insert(key.to_string(), value);
         }
+    }
+    if let Some(billing) = &facts.llm_billing {
+        billing.stamp(&mut attributes);
+    }
+    // #10640: a failed tick's copy says why, exactly as its root does.
+    if let Some(failure) = &facts.trace.failure {
+        attributes.extend(failure.attributes());
     }
     // #9420: a story copy is the whole tick's interval, so it carries the same
     // dwell-conditioning flag as the tick's own root. A story copy only exists

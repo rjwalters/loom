@@ -67,6 +67,9 @@ path = "loom-daemon/src/main_health_gate.rs"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/merge_pr/stale_checks/fetch.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/forge_wait_checks/reads.rs"
 
 [[operation]]
 id = "ci.workflow-runs-for-sha"
@@ -109,6 +112,15 @@ path = "loom-daemon/src/ci_telemetry/api.rs"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/ci_telemetry/suites.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/gh_state_probe.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/merge_pr/ci_result.rs"
+[[operation.callers]]
+kind = "script"
+path = "scripts/ci-image-inputs.sh"
 
 [[operation]]
 id = "ci.stale-check-freshness"
@@ -420,6 +432,9 @@ notes = "forge_merge_config derives the effective merge-method set from repo fla
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/forge_merge_config.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/branch_update.rs"
 [[operation.callers]]
 kind = "script"
 path = "defaults/scripts/land-resync-commit.sh"

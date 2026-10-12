@@ -40,12 +40,25 @@
 //!   (claim and quarantine reconciliation, star liveness, sweep dispatch, and
 //!   every scheduled role tick), which is also where the refusal is logged,
 //!   once per change of reason.
+//! - [`repo_writable`] before the workspace resync (#10718) takes a repo's
+//!   claim: its target is the workspace's `origin`, named explicitly.
 //! - `loom-daemon forge may-write` for shell, wrapped by `loom_write_repo` in
 //!   `defaults/scripts/lib/forge-helpers.sh`; the `forge issue|pr` write
 //!   passthroughs and the auto-merge verbs vet with it before they run.
 //! - `tests::daemon_write_paths_are_scoped` fails when a new daemon file
 //!   issues a forge write without being reviewed into its list, and
 //!   `tests::shell_write_paths_are_vetted` does the same for `defaults/scripts`.
+//!
+//! # The one autonomous write outside this rule
+//!
+//! The captain's gauge heartbeat (`captain_gauges::store`, #10395) writes to
+//! the configured fleet store (`fleet.repo`), which is not a managed workspace
+//! repo and is written under the store's writer App, not `root`'s credential,
+//! so this rule cannot vet it. Its `FleetStore` entry in
+//! `tests::daemon_write_paths_are_scoped` asserts the narrower scope instead:
+//! a config-derived target (never gh base-repo resolution), writes only
+//! through the store's `WriteTransport`, never the reviewed branch, and only
+//! from the declared captain.
 //!
 //! See `defaults/docs/comment-trust.md` § "Loom writes only to repos it
 //! manages".
@@ -55,6 +68,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 pub(crate) mod probe;
+mod probe_snapshot;
 pub(crate) mod target;
 
 use probe::{Permission, PermissionProbe};
@@ -379,3 +393,7 @@ pub fn gate_repo_with(root: &Path, repo: &str, gh: &Path, what: &str) -> bool {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod gitea_tests;

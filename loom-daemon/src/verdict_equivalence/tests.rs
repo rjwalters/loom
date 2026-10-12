@@ -57,6 +57,38 @@ exit 1
     bin
 }
 
+/// Assert what [`assess_with`] answers for `reviewed -> head` on PR 9416, and
+/// make a mismatch self-explaining (#10727): an unexpected `Indeterminate`
+/// only says that SOME forge read returned no answer, so the failure prints
+/// the assessment's `unavailable` reasons and the fake `gh`'s argv log (an
+/// absent log means the fake never ran at all).
+#[track_caller]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn assert_assessed(
+    expected: Equivalence,
+    carveout_enabled: bool,
+    new_kinds_enabled: bool,
+    gh: &Path,
+    cwd: &Path,
+    log: &Path,
+    reviewed: &str,
+    head: &str,
+) -> Assessment {
+    let a = assess_with(carveout_enabled, new_kinds_enabled, gh, Some(cwd), 9416, reviewed, head);
+    if a.equivalence != expected {
+        let argv = std::fs::read_to_string(log)
+            .unwrap_or_else(|e| format!("<no gh log at {}: {e}>", log.display()));
+        panic!(
+            "assess_with answered {:?}, expected {expected:?}\n  unavailable: {:?}\n  gh log \
+             ({}):\n{argv}",
+            a.equivalence,
+            a.unavailable,
+            log.display(),
+        );
+    }
+    a
+}
+
 /// `{"baseRefName": "main"}` — what `gh pr view --json baseRefName` returns.
 pub(super) const BASE_MAIN: (&str, &str) = ("--json baseRefName", r#"{"baseRefName": "main"}"#);
 
@@ -137,9 +169,15 @@ fn tree_identical_wins_without_asking_anything_else() {
         &log,
         &[(&format!("compare/{REVIEWED}...{HEAD}"), r#"{"status": "ahead", "files": []}"#)],
     );
-    assert_eq!(
-        detect_with(true, true, &gh, Some(dir.path()), 9416, REVIEWED, HEAD),
-        Equivalence::Equivalent(EquivalenceKind::Tree)
+    assert_assessed(
+        Equivalence::Equivalent(EquivalenceKind::Tree),
+        true,
+        true,
+        &gh,
+        dir.path(),
+        &log,
+        REVIEWED,
+        HEAD,
     );
     let argv = std::fs::read_to_string(&log).unwrap();
     assert!(
@@ -158,10 +196,7 @@ fn outer_kill_switch_answers_nothing_without_calling_gh() {
         &log,
         &[(&format!("compare/{REVIEWED}...{HEAD}"), r#"{"status": "ahead", "files": []}"#)],
     );
-    assert_eq!(
-        detect_with(false, true, &gh, Some(dir.path()), 9416, REVIEWED, HEAD),
-        Equivalence::Indeterminate
-    );
+    assert_assessed(Equivalence::Indeterminate, false, true, &gh, dir.path(), &log, REVIEWED, HEAD);
     assert!(!log.exists(), "a disabled carve-out must not call gh");
 }
 
@@ -179,9 +214,15 @@ fn inner_kill_switch_keeps_the_tree_kind_and_drops_the_new_ones() {
             BASE_MAIN,
         ],
     );
-    assert_eq!(
-        detect_with(true, false, &gh, Some(dir.path()), 9416, REVIEWED, HEAD),
-        Equivalence::Equivalent(EquivalenceKind::Tree)
+    assert_assessed(
+        Equivalence::Equivalent(EquivalenceKind::Tree),
+        true,
+        false,
+        &gh,
+        dir.path(),
+        &log,
+        REVIEWED,
+        HEAD,
     );
 
     // Same switch, a head whose tree DID change: no new kind is tried.
@@ -197,9 +238,15 @@ fn inner_kill_switch_keeps_the_tree_kind_and_drops_the_new_ones() {
             BASE_MAIN,
         ],
     );
-    assert_eq!(
-        detect_with(true, false, &gh2, Some(dir.path()), 9416, REVIEWED, HEAD),
-        Equivalence::Indeterminate
+    assert_assessed(
+        Equivalence::Indeterminate,
+        true,
+        false,
+        &gh2,
+        dir.path(),
+        &log2,
+        REVIEWED,
+        HEAD,
     );
     let argv = std::fs::read_to_string(&log2).unwrap();
     assert!(
@@ -222,10 +269,7 @@ fn unresolvable_base_ref_is_indeterminate() {
             r#"{"status": "diverged", "files": [{"filename": "x"}]}"#,
         )],
     );
-    assert_eq!(
-        detect_with(true, true, &gh, Some(dir.path()), 9416, REVIEWED, HEAD),
-        Equivalence::Indeterminate
-    );
+    assert_assessed(Equivalence::Indeterminate, true, true, &gh, dir.path(), &log, REVIEWED, HEAD);
 }
 
 #[test]
@@ -240,9 +284,15 @@ fn non_sha_arguments_are_refused_without_calling_gh() {
         (REVIEWED, "111111"),
         (REVIEWED, "AAAAAAAAAA"),
     ] {
-        assert_eq!(
-            detect_with(true, true, &gh, Some(dir.path()), 9416, reviewed, head),
-            Equivalence::Indeterminate
+        assert_assessed(
+            Equivalence::Indeterminate,
+            true,
+            true,
+            &gh,
+            dir.path(),
+            &log,
+            reviewed,
+            head,
         );
     }
     assert!(!log.exists(), "no gh call may be made for a malformed ref");
@@ -270,9 +320,15 @@ fn byte_identical_patch_across_a_rebase_carries_the_verdict() {
             (&format!("compare/main...{HEAD}"), &body),
         ],
     );
-    assert_eq!(
-        detect_with(true, true, &gh, Some(dir.path()), 9416, REVIEWED, HEAD),
-        Equivalence::Equivalent(EquivalenceKind::RebasePatchIdentical)
+    assert_assessed(
+        Equivalence::Equivalent(EquivalenceKind::RebasePatchIdentical),
+        true,
+        true,
+        &gh,
+        dir.path(),
+        &log,
+        REVIEWED,
+        HEAD,
     );
 }
 
@@ -821,8 +877,14 @@ fn detect_reports_clean_merge_for_a_merge_of_the_base() {
             BASE_MAIN,
         ],
     );
-    assert_eq!(
-        detect_with(true, true, &gh, Some(repo), 9416, &reviewed, &head),
-        Equivalence::Equivalent(EquivalenceKind::CleanMerge)
+    assert_assessed(
+        Equivalence::Equivalent(EquivalenceKind::CleanMerge),
+        true,
+        true,
+        &gh,
+        repo,
+        &log,
+        &reviewed,
+        &head,
     );
 }

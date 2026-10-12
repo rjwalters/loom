@@ -82,9 +82,10 @@ pub fn resolve_story(root: &Path, issue: u32) -> Option<StoryRef> {
         }
     };
     Some(StoryRef {
-        // Lowercased so `loom.repo` agrees across hosts whose origins differ
-        // only in case; `story` carries GitHub's own spelling.
-        repo: slug.to_ascii_lowercase(),
+        // GitHub's own spelling (#10637), so `loom.repo` agrees across hosts
+        // whose origins differ only in case and matches `loom.dispatch.*`.
+        // Not an ID input: the story key is the `repo_id`.
+        repo: identity.full_name.clone(),
         story: format!("{}#{issue}", identity.full_name),
         issue,
         context,

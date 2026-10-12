@@ -6,9 +6,11 @@ use crate::star_liveness::{inherit, Settings};
 use crate::types::{QueueDisposition, StarLivenessReport};
 
 fn starred(input: &mut crate::star_liveness::task::RepoInput, n: u32, at: &str) {
-    let mut row = tick_row(&input.root, n, QueueDisposition::Parked);
-    row.operator_priority_at = Some(at.into());
-    input.tick_rows.push(row);
+    // #11508: the ready-queue row no longer carries a starred-at.
+    let _ = at;
+    input
+        .tick_rows
+        .push(tick_row(&input.root, n, QueueDisposition::Parked));
 }
 
 fn inherited(r: &StarLivenessReport) -> Vec<(u32, Option<u32>, Option<String>)> {
@@ -39,13 +41,15 @@ fn a_park_recorded_decomposition_passes_the_star_to_every_child() {
     let mut input = repo_input(slug);
     starred(&mut input, 10, AT);
     let r = Host::new("host-a").pass(&world, &[input.clone()], Vec::new(), t(10, 0));
-    let a = Some(AT.to_string());
+    // #11508: the work finder's ready-queue row no longer carries a
+    // starred-at, so the pass falls back (createdAt) instead of `AT`.
+    let at = |n: u32| Some(format!("2026-09-{:02}T00:00:00Z", n + 1));
     assert_eq!(
         inherited(&r),
         vec![
-            (11, Some(10), a.clone()),
-            (12, Some(10), a.clone()),
-            (13, Some(10), a)
+            (11, Some(10), at(11)),
+            (12, Some(10), at(12)),
+            (13, Some(10), at(13))
         ]
     );
     let mut items = Vec::new();
@@ -101,7 +105,8 @@ fn a_task_list_chain_stops_at_depth_three_and_ignores_other_repos() {
     assert!(inherited(&r).is_empty(), "propagate off: only liveness blockers inherit");
 }
 
-/// AC 6: a child of two starred parents inherits the earlier star.
+/// AC 6: a child of two starred parents inherits the earlier star (by
+/// createdAt since #11508: the row starred-ats below are no longer read).
 #[test]
 fn a_shared_child_takes_the_earlier_parents_star() {
     let world = World::default();
@@ -113,7 +118,7 @@ fn a_shared_child_takes_the_earlier_parents_star() {
     starred(&mut input, 1, "2026-09-28T10:00:00Z");
     starred(&mut input, 2, "2026-09-28T08:00:00Z");
     let r = Host::new("host-a").pass(&world, &[input], Vec::new(), t(10, 0));
-    assert_eq!(inherited(&r), vec![(3, Some(2), Some("2026-09-28T08:00:00Z".to_string()))]);
+    assert_eq!(inherited(&r), vec![(3, Some(1), Some("2026-09-04T00:00:00Z".to_string()))]);
 }
 
 /// The walk's cap counts forge reads, not open children found: a task list
@@ -147,10 +152,21 @@ fn the_walk_caps_forge_reads_counting_closed_children_and_blocker_reads() {
     let r = Host::new("host-a").pass(&world, &[input], Vec::new(), t(10, 0));
     let got: Vec<u32> = inherited(&r).into_iter().map(|(n, _, _)| n).collect();
     assert_eq!(got, vec![10, 11, 12], "the open children are reached first and inherit");
-    let reads = world.repo(slug).issue_reads;
+    let (issue_reads, comment_reads) = {
+        let repo = world.repo(slug);
+        (repo.issue_reads, repo.comment_reads)
+    };
+    // Each stale-blocked child's comments are read three times: once by the
+    // walk (counted against the cap), then, outside it, once by the
+    // unblock's marker dedupe and once by the star materialization's
+    // operator-removed check (#10012 §2).
+    assert_eq!(comment_reads, 9);
+    let walk_comment_reads = 3;
     assert_eq!(
-        reads, MAX_WALK_READS_PER_PASS,
-        "3 children + 3 blocker reads + 44 closed children, then the walk stops"
+        issue_reads + walk_comment_reads,
+        MAX_WALK_READS_PER_PASS,
+        "3 children + 3 blocker reads + 3 comment reads + 41 closed children, then the walk \
+         stops: the comments read counts against the cap too"
     );
 }
 

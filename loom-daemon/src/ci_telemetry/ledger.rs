@@ -33,7 +33,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -169,58 +169,152 @@ pub struct PendingUnit {
     pub envelopes: Vec<TelemetryEnvelope>,
 }
 
-/// Read `path` as complete lines, truncating a torn (newline-less) trailing
-/// fragment in place. Returns the complete lines and whether a repair
-/// happened. A missing file is an empty, unrepaired read. **Only a writer
-/// holding the cycle lock may call this** — a concurrent writer's in-flight
-/// append looks exactly like a torn tail; readers use
-/// [`read_complete_lines`].
-pub fn read_repaired_lines(path: &Path) -> io::Result<(Vec<String>, bool)> {
+/// Bytes read per step when scanning backwards for the last newline, and the
+/// read buffer of every forward line scan. Memory for a repair or a scan is
+/// bounded by this plus the longest single line, never by the file size
+/// (#11045: a 5.4 GB journal read whole OOM-killed the fleet captain).
+pub const SCAN_BLOCK_BYTES: usize = 64 * 1024;
+
+/// Length of `file`'s prefix that ends in a newline (`0` when it holds
+/// none), found by reading backwards from the end in [`SCAN_BLOCK_BYTES`]
+/// blocks. A torn tail costs at most its own length plus one block.
+pub fn complete_len(file: &mut File) -> io::Result<u64> {
+    let len = file.metadata()?.len();
+    let mut end = len;
+    let mut block = vec![0_u8; SCAN_BLOCK_BYTES];
+    while end > 0 {
+        let start = end.saturating_sub(SCAN_BLOCK_BYTES as u64);
+        let size = usize::try_from(end - start).unwrap_or(SCAN_BLOCK_BYTES);
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut block[..size])?;
+        if let Some(i) = block[..size].iter().rposition(|b| *b == b'\n') {
+            return Ok(start + i as u64 + 1);
+        }
+        end = start;
+    }
+    Ok(0)
+}
+
+/// Truncate a torn (newline-less) trailing fragment of `path` in place,
+/// reading only the tail ([`complete_len`]). Returns whether a repair
+/// happened; a missing file is unrepaired. **Only a writer holding the cycle
+/// lock may call this** — a concurrent writer's in-flight append looks
+/// exactly like a torn tail.
+pub fn repair_torn_tail(path: &Path) -> io::Result<bool> {
     let mut file = match OpenOptions::new().read(true).write(true).open(path) {
         Ok(file) => file,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((Vec::new(), false)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(e),
     };
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-    let complete_len = complete_prefix_len(&bytes);
-    let repaired = complete_len < bytes.len();
-    if repaired {
-        log::warn!(
-            "ci_telemetry: {} had a torn trailing line ({} byte(s)) — truncated to the last complete line",
-            path.display(),
-            bytes.len() - complete_len
-        );
-        file.set_len(complete_len as u64)?;
-        file.sync_all()?;
-        bytes.truncate(complete_len);
+    let len = file.metadata()?.len();
+    let complete = complete_len(&mut file)?;
+    if complete == len {
+        return Ok(false);
     }
-    Ok((split_lines(&bytes), repaired))
+    log::warn!(
+        "ci_telemetry: {} had a torn trailing line ({} byte(s)) — truncated to the last complete line",
+        path.display(),
+        len - complete
+    );
+    file.set_len(complete)?;
+    file.sync_all()?;
+    Ok(true)
 }
 
-/// Read-only counterpart of [`read_repaired_lines`]: the complete lines of
-/// `path`, ignoring (never touching) any trailing fragment.
-pub fn read_complete_lines(path: &Path) -> io::Result<Vec<String>> {
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+/// Stream the complete (newline-terminated) lines of `path` from byte `from`,
+/// handing each to `visit` without its `\n`. A trailing fragment is never
+/// visited. `visit` returning `false` stops the scan *before* that line is
+/// consumed. Returns the offset just past the last consumed line (`from`
+/// when nothing was, or when the file is missing).
+///
+/// A line longer than `max_line` is skipped (consumed, never buffered whole,
+/// and named in a warning), so one corrupt newline-less run cannot pull the
+/// whole file into memory.
+pub fn scan_lines(
+    path: &Path,
+    from: u64,
+    max_line: u64,
+    mut visit: impl FnMut(&[u8]) -> bool,
+) -> io::Result<u64> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(from),
         Err(e) => return Err(e),
     };
-    Ok(split_lines(&bytes[..complete_prefix_len(&bytes)]))
+    let mut reader = BufReader::with_capacity(SCAN_BLOCK_BYTES, file);
+    reader.seek(SeekFrom::Start(from))?;
+    let mut offset = from;
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let read = (&mut reader).take(max_line).read_until(b'\n', &mut line)? as u64;
+        if read == 0 {
+            break;
+        }
+        if line.last() != Some(&b'\n') {
+            if read < max_line {
+                break; // a trailing fragment: never consumed
+            }
+            let Some(rest) = skip_past_newline(&mut reader)? else {
+                break; // an oversized trailing fragment
+            };
+            log::warn!(
+                "ci_telemetry: skipping a {}-byte line at offset {offset} of {} (over the {max_line}-byte line cap)",
+                read + rest,
+                path.display()
+            );
+            offset += read + rest;
+            continue;
+        }
+        if !visit(&line[..line.len() - 1]) {
+            break;
+        }
+        offset += read;
+    }
+    Ok(offset)
 }
 
-/// Length of the prefix of `bytes` that ends in a newline.
-#[must_use]
-pub fn complete_prefix_len(bytes: &[u8]) -> usize {
-    bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1)
+/// Consume `reader` through its next newline without buffering the bytes.
+/// Returns how many bytes that was, or `None` at end of file.
+fn skip_past_newline(reader: &mut impl BufRead) -> io::Result<Option<u64>> {
+    let mut skipped = 0_u64;
+    loop {
+        let buffer = reader.fill_buf()?;
+        if buffer.is_empty() {
+            return Ok(None);
+        }
+        if let Some(i) = buffer.iter().position(|b| *b == b'\n') {
+            reader.consume(i + 1);
+            return Ok(Some(skipped + i as u64 + 1));
+        }
+        let size = buffer.len();
+        reader.consume(size);
+        skipped += size as u64;
+    }
 }
 
-fn split_lines(bytes: &[u8]) -> Vec<String> {
-    String::from_utf8_lossy(bytes)
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(str::to_string)
-        .collect()
+/// Read `path` as complete lines, truncating a torn trailing fragment in
+/// place ([`repair_torn_tail`]). Returns the complete non-blank lines and
+/// whether a repair happened. Same lock rule as [`repair_torn_tail`];
+/// readers use [`read_complete_lines`]. For the ledger, which needs every
+/// line — the journal never loads its lines (#11045).
+pub fn read_repaired_lines(path: &Path) -> io::Result<(Vec<String>, bool)> {
+    let repaired = repair_torn_tail(path)?;
+    Ok((read_complete_lines(path)?, repaired))
+}
+
+/// Read-only counterpart of [`read_repaired_lines`]: the complete non-blank
+/// lines of `path`, ignoring (never touching) any trailing fragment.
+pub fn read_complete_lines(path: &Path) -> io::Result<Vec<String>> {
+    let mut lines = Vec::new();
+    scan_lines(path, 0, u64::MAX, |line| {
+        let text = String::from_utf8_lossy(line);
+        if !text.trim().is_empty() {
+            lines.push(text.trim_end_matches('\r').to_string());
+        }
+        true
+    })?;
+    Ok(lines)
 }
 
 /// Append `bytes` (one or more complete lines) to `path` and fsync it —
@@ -270,6 +364,15 @@ pub struct Ledger {
     log_wanted: BTreeMap<(String, u64), LogTarget>,
     /// `(repo, job_id)` → (cumulative attempts, last named reason).
     log_failures: BTreeMap<(String, u64), (u32, String)>,
+    /// True while the file holds `unit` lines (envelope payloads) a
+    /// compaction would fold into key-only `seen` lines: set when such a
+    /// line is loaded or committed, cleared by a compaction (#11160).
+    has_uncompacted_units: bool,
+    /// On-disk size right after the last compaction this process ran
+    /// (`0` = none yet). Compaction keeps every `seen` key, so a ledger
+    /// that stays above the threshold afterwards must not be rewritten
+    /// again until it has really grown.
+    compacted_size: u64,
 }
 
 impl Ledger {
@@ -278,7 +381,13 @@ impl Ledger {
     /// unparseable complete line is skipped with a warning.
     pub fn open(path: PathBuf) -> io::Result<Self> {
         let (lines, repaired) = read_repaired_lines(&path)?;
-        Ok(Self::from_lines(path, lines, repaired))
+        let mut ledger = Self::from_lines(path, lines, repaired);
+        // A loaded file with no `unit` lines is already compact: skip the
+        // redundant rewrite a fresh process would otherwise do (#11160).
+        if !ledger.has_uncompacted_units {
+            ledger.compacted_size = std::fs::metadata(&ledger.path).map_or(0, |m| m.len());
+        }
+        Ok(ledger)
     }
 
     /// Load the ledger read-only (for `status`): never repairs, so it is
@@ -299,6 +408,8 @@ impl Ledger {
             repaired,
             log_wanted: BTreeMap::new(),
             log_failures: BTreeMap::new(),
+            has_uncompacted_units: false,
+            compacted_size: 0,
         };
         let mut units: Vec<PendingUnit> = Vec::new();
         for line in lines {
@@ -312,6 +423,7 @@ impl Ledger {
                     logs,
                     envelopes,
                 }) => {
+                    ledger.has_uncompacted_units = true;
                     let key = UnitKey {
                         repo,
                         run_id,
@@ -452,6 +564,7 @@ impl Ledger {
         }
         append_durable(&self.path, buffer.as_bytes())?;
         self.next_seq = seq;
+        self.has_uncompacted_units = true;
         for unit in &committed {
             self.seen.insert(unit.key.clone());
         }
@@ -641,9 +754,19 @@ impl Ledger {
     /// `threshold` bytes and nothing is pending. Atomic: temp file + fsync +
     /// rename + directory fsync, so a crash leaves either the old or the new
     /// ledger, never a mix.
+    ///
+    /// A no-op (`Ok(false)`) unless a rewrite could actually shrink the
+    /// file (#11160): compaction keeps every `seen` key, so a compacted
+    /// ledger can itself exceed `threshold`; it is rewritten again only
+    /// when `unit` lines were committed since, or the file has grown past
+    /// twice its last compacted size.
     pub fn compact_if_large(&mut self, threshold: u64) -> io::Result<bool> {
         let size = std::fs::metadata(&self.path).map_or(0, |m| m.len());
         if size <= threshold || !self.pending.is_empty() {
+            return Ok(false);
+        }
+        let grown = self.compacted_size > 0 && size > self.compacted_size.saturating_mul(2);
+        if self.compacted_size > 0 && !self.has_uncompacted_units && !grown {
             return Ok(false);
         }
         let mut buffer = String::new();
@@ -720,6 +843,8 @@ impl Ledger {
                 let _ = dir.sync_all();
             }
         }
+        self.has_uncompacted_units = false;
+        self.compacted_size = std::fs::metadata(&self.path).map_or(0, |m| m.len());
         Ok(true)
     }
 }

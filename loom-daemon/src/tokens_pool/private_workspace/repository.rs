@@ -1,6 +1,6 @@
 use super::*;
 use serde_json::json;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::process::{Command, Stdio};
 
 #[derive(clap::Subcommand)]
@@ -322,14 +322,27 @@ fn credential(operation: &str) -> Result<()> {
     }
     let sources = crate::forge_egress::policy::PolicySources::from_process(None);
     ensure_gh_helper_allowed(policy_governs_host(&sources)?)?;
-    let mut helper = Command::new("gh").args(["auth", "git-credential", "get"])
-        .stdin(Stdio::piped()).stdout(Stdio::inherit()).stderr(Stdio::null()).spawn()
-        .context("forge authentication unavailable; provide an external gh profile or supported token environment")?;
-    helper.stdin.take().unwrap().write_all(request.as_bytes())?;
-    if !helper.wait()?.success() {
-        bail!("forge authentication helper failed");
+    use crate::gh_invocation::{AccessIntent, GhCompletion, GhInvocation, GhTarget, Operation};
+    use crate::proc_exec::ExecError;
+    // Through the one `gh` choke point (#9985): stdin is the request, stdout
+    // git's answer, stderr discarded — never captured.
+    let helper = GhInvocation::new(
+        Operation::new("auth.git_credential"),
+        AccessIntent::Read,
+        GhTarget::None,
+        std::time::Duration::ZERO,
+    )
+    .args(["auth", "git-credential", "get"])
+    .credential_helper(request)
+    .execute();
+    match helper {
+        Ok(GhCompletion::Passthrough(status)) if status.success() => Ok(()),
+        Err(ExecError::Spawn(e)) => Err(anyhow::Error::new(e).context(
+            "forge authentication unavailable; provide an external gh profile or supported token environment",
+        )),
+        Err(ExecError::Collect(e)) => Err(e.into()),
+        Ok(_) => bail!("forge authentication helper failed"),
     }
-    Ok(())
 }
 
 /// True when a forge-egress policy with `enforcement.api = required` governs

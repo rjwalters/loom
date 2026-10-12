@@ -17,6 +17,9 @@ pub const SCHEMA_VERSION: u64 = 1;
 /// How bad one finding is. Decides the exit class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Severity {
+    /// Visible but non-fatal: never changes the exit code (e.g. the
+    /// `policy.unconfigured` notice on a host that is not declared managed).
+    Notice,
     /// Something is definitely wrong — exit 1.
     Finding,
     /// Something that must be true could not be established — exit 2. Not a
@@ -28,6 +31,7 @@ impl Severity {
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Notice => "notice",
             Self::Finding => "finding",
             Self::Incomplete => "incomplete",
         }
@@ -116,6 +120,12 @@ impl Finding {
     #[must_use]
     pub fn incomplete(mut self) -> Self {
         self.severity = Severity::Incomplete;
+        self
+    }
+
+    #[must_use]
+    pub fn notice(mut self) -> Self {
+        self.severity = Severity::Notice;
         self
     }
 

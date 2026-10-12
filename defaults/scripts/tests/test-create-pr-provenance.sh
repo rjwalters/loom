@@ -71,6 +71,13 @@ if [[ "\$1" == "forge" && "\$2" == "check-open-pr" ]]; then
   printf '%s\n' "\$*" > "\$LOOM_TEST_STUB_DIR/daemon-forge-args.txt"
   exit 1
 fi
+# Likewise the #10476 pre-PR gate receipt probe (\`preflight --check\`):
+# exit 0 (receipt present) silently, outside the provenance call's capture.
+if [[ "\$1" == "preflight" ]]; then
+  exit 0
+fi
+# #10518: the priority-label copy asks too; nothing to copy here.
+if [[ "\$1" == "forge" && "\$2" == "priority-labels" ]]; then cat >/dev/null; exit 0; fi
 printf '%s\n' "\$*" > "\$LOOM_TEST_STUB_DIR/daemon-args.txt"
 cat > "\$LOOM_TEST_STUB_DIR/daemon-stdin.txt"
 echo '$MARKER'

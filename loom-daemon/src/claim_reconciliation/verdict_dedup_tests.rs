@@ -287,11 +287,7 @@ mod tree_carveout_e2e {
         let script = format!(
             r#"#!/usr/bin/env bash
 printf '%s\n' "$*" >> "{log}"
-if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
-  echo '[{{"number":9124,"headRefOid":"{sha_b}","labels":[{{"name":"loom:pr"}}]}}]'
-  exit 0
-fi
-if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+{pulls}if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
   echo '{{"id":"PR_kwDOQAPbH88AAAABEp4dZw","autoMergeRequest":null,"baseRefName":"main"}}'
   exit 0
 fi
@@ -313,9 +309,11 @@ fi
 exit 0
 "#,
             log = log.display(),
+            pulls = super::super::open_pr_listing::test_support::pulls_arm(&[
+                super::super::open_pr_listing::test_support::row(9124, &["loom:pr"]).sha(SHA_B)
+            ]),
             dir = dir.display(),
             sha_a = SHA_A,
-            sha_b = SHA_B,
             compare_body = compare_body,
         );
         std::fs::write(&bin, script).unwrap();

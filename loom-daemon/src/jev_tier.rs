@@ -175,6 +175,7 @@ fn gather_issue_context(issue: u64) -> Result<GhIssueView> {
     let issue_arg = issue.to_string();
 
     let view_query = gh_json::<GhIssueView, _>(
+        "jev.tier_issue_view",
         Path::new(&gh),
         &["issue", "view", &issue_arg, "--json", "number,title,body"],
         &dir,

@@ -39,6 +39,11 @@ pub enum LandingStage {
     Merging,
     /// An open issue blocks it; the blocker inherits its star.
     BlockedBy,
+    /// `loom:blocked`, but no open blocker is named in its body or comments
+    /// (#10151): every cited blocker has closed, or none is cited and Curator
+    /// has not yet looked. The pass unblocks it or hands it to Curator; the
+    /// operator is asked only once a Curator pass failed to name a blocker.
+    StaleBlock,
     /// Only the operator can move it. [`StarLandingRow::ask`] says what to do.
     /// (A watchdog escalation keeps the agent-owned stage and sets `ask`.)
     NeedsOperator,
@@ -62,6 +67,7 @@ impl LandingStage {
             Self::Mergeable => "mergeable",
             Self::Merging => "merging",
             Self::BlockedBy => "blocked-by",
+            Self::StaleBlock => "stale-block",
             Self::NeedsOperator => "needs-operator",
             Self::NoCapacity => "no-capacity",
             Self::Unknown => "unknown",
@@ -89,7 +95,8 @@ pub enum AskKind {
     /// No host this daemon knows of manages the repo (a loom-ui star for a
     /// repo outside this host's workspace registry).
     UnmanagedRepo,
-    /// `loom:blocked` with no open blocking issue named anywhere.
+    /// `loom:blocked` with no open blocking issue named anywhere, after a
+    /// Curator pass failed to name one (#10151).
     BlockedUnnamed,
     /// `loom:blocked` by an issue in another repo, which a star does not
     /// cross (#9244 C review).
@@ -178,6 +185,37 @@ pub struct StarLandingRow {
     /// every host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_progress_at: Option<DateTime<Utc>>,
+    /// The row's effective operator priority level (#10307): 1 the star,
+    /// 2 `loom:operator-high-priority` (own or inherited), … 0 for a row
+    /// that only inherits the plain star in memory.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub level: u8,
+    /// Set when this row inherits a level >= 2 from an issue it blocks,
+    /// directly or transitively (#10307): that source, as `owner/repo#N`
+    /// (it may be in another managed repo). What loom-ui's "via #N" badge
+    /// shows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level_inherited_from: Option<String>,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if signature
+fn is_zero(n: &u8) -> bool {
+    *n == 0
+}
+
+/// An operator priority level over its cap (#10307). The daemon never
+/// refuses a label a human added; it reports the level here instead.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OverCapLevel {
+    pub level: u8,
+    /// The level's operator label.
+    pub label: String,
+    pub cap: usize,
+    /// Open issues carrying the label across the repos this host manages.
+    pub count: usize,
+    /// Those issues, as `owner/repo#N`, oldest first.
+    #[serde(default)]
+    pub issues: Vec<String>,
 }
 
 /// A loom-ui star intent this host dropped instead of applying.
@@ -212,6 +250,13 @@ pub struct StarLivenessReport {
     /// missing).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failed_repos: Vec<String>,
+    /// Operator priority levels over their cap (#10307).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub over_cap: Vec<OverCapLevel>,
+    /// Blockers of a level >= 2 issue in a repo no workspace here manages:
+    /// reported, not followed (#10307). `owner/repo#N`, sorted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unfollowed_blockers: Vec<String>,
 }
 
 impl StarLivenessReport {
@@ -239,6 +284,7 @@ mod tests {
             LandingStage::Mergeable,
             LandingStage::Merging,
             LandingStage::BlockedBy,
+            LandingStage::StaleBlock,
             LandingStage::NeedsOperator,
             LandingStage::NoCapacity,
         ] {

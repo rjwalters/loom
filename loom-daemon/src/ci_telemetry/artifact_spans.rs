@@ -131,6 +131,7 @@ pub(super) fn for_run(
 
     let artifacts = paginate(
         api,
+        Some(&repo.full_name),
         suites::artifacts_path(&repo.full_name, run.id),
         &mut report.summary.requests,
         |body| serde_json::from_str::<ArtifactsPage>(body).map(|p| p.artifacts),

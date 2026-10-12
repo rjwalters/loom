@@ -6,7 +6,13 @@ mod log_paths;
 
 use super::*;
 
+// Issue #8865: per-cause streak and log wording of the dispatch backoff.
+mod backoff_cause;
 pub(super) mod child_env_markers;
+
+// Issue #10348: the dispatched `sweep-lease-renew.sh start` command.
+mod lease_renewal_start;
+use lease_renewal_start::lease_renewal_start_command;
 
 /// Issue #3943: print-mode background-task wait ceiling (milliseconds). A
 /// daemon-spawned sweep child is a headless `claude -p` session; in print mode
@@ -83,7 +89,7 @@ const LEASE_RENEW_START_TIMEOUT: Duration = Duration::from_secs(10);
 ///   persisted group is the only handle on any surviving descendants. Every
 ///   consumer re-checks `group_has_members` before signalling, so a fully-dead
 ///   group is a no-op.
-fn spawned_leader_pgid(pid: u32) -> Option<u32> {
+pub(super) fn spawned_leader_pgid(pid: u32) -> Option<u32> {
     if !cfg!(unix) {
         return None;
     }
@@ -457,7 +463,7 @@ impl std::fmt::Display for TokenSelectionDispatchError {
         write!(
             f,
             "issue #{}: spawned child exited immediately — token selection failed (no usable \
-             OAuth token in the pool). Add accounts to ~/.claude-monitor/accounts.env then \
+             OAuth token in the pool). Add accounts to ~/.llm-monitor/accounts.env then \
              `loom-daemon tokens bootstrap`, or re-probe an existing pool with `loom-daemon \
              tokens check --ranking`. See the sweep log for the exact failure: {}",
             self.issue,
@@ -1215,10 +1221,11 @@ impl SweepRegistry {
         let max_secs =
             i64::try_from(self.dispatch_backoff_config.max.as_secs()).unwrap_or(i64::MAX);
         let consecutive = match self.dispatch_backoff.get(&issue) {
-            Some(prev) if (now - prev.last_failure_at).num_seconds() <= max_secs => {
+            Some(prev) if backoff_cause::continues(prev, cause, now, max_secs) => {
                 prev.consecutive.saturating_add(1)
             }
-            // No prior record, or the streak went cold — start a fresh streak.
+            // No prior record, the streak went cold, or it was the other
+            // cause's streak (#8865) — start a fresh streak.
             _ => 1,
         };
         let delay = backoff_delay(
@@ -1237,11 +1244,7 @@ impl SweepRegistry {
                 cause,
             },
         );
-        log::info!(
-            "sweep_registry: issue #{issue} dispatch backoff armed — {consecutive} consecutive \
-             failed dispatch(es), next attempt allowed in {}s (#4485; cause={cause:?})",
-            delay.as_secs()
-        );
+        backoff_cause::log_armed(issue, consecutive, delay, cause);
         // Issue #7477: broadcast the armed window fleet-wide so a peer host
         // does not immediately re-attempt the same failing candidate this
         // host just backed off on — see `publish_peer_cooldown_claim`'s doc
@@ -1577,6 +1580,7 @@ impl SweepRegistry {
             None,
             None,
             Some(resume_pr),
+            DispatchOrigin::ReaperRetry,
         )
     }
 
@@ -1593,6 +1597,7 @@ impl SweepRegistry {
     /// IPC handler for `DispatchSweep`, `ipc.rs::dispatch_sweep_nonblocking`).
     /// Kept for `dispatch()` / `dispatch_resume_after_crash()` and unit
     /// tests, where lock contention is irrelevant.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn dispatch_inner(
         &mut self,
         kind: &SweepKind,
@@ -1601,6 +1606,7 @@ impl SweepRegistry {
         effort: Option<&str>,
         depends_on: Option<u32>,
         resume_bypass_pr: Option<u32>,
+        origin: DispatchOrigin,
     ) -> Result<DispatchOutcome> {
         match self.begin_issue_dispatch_with_model(
             kind,
@@ -1609,6 +1615,7 @@ impl SweepRegistry {
             effort,
             depends_on,
             resume_bypass_pr,
+            origin,
         )? {
             BeginIssueDispatch::Done(result) => result,
             BeginIssueDispatch::Spawned(mut prepared) => {
@@ -1698,6 +1705,7 @@ impl SweepRegistry {
         depends_on: Option<u32>,
         resume_bypass_pr: Option<u32>,
         prepared_launch: Option<private_dispatch::PreparedLaunch>,
+        dispatch_origin: DispatchOrigin,
     ) -> Result<BeginIssueDispatch> {
         // 1. Idempotency dedup against Running entries.
         if let Some(ref key) = idempotency_key {
@@ -1747,6 +1755,9 @@ impl SweepRegistry {
                 })));
             }
         }
+
+        // #10974: a daemon roll is pausing agents; nothing new may start.
+        self.roll_gate.admit(kind)?;
 
         // Forge egress admission (#9984): a fresh `forge egress assert`. Under
         // `enforcement.api = required` a routing finding refuses the dispatch
@@ -1815,6 +1826,7 @@ impl SweepRegistry {
             let resolved_model = model.resolve(&self.config, kind, admission.admitted.as_ref());
             (admission, resolved_model, None)
         };
+        let model_source = model.source();
         let model = resolved_model.as_deref();
 
         // 2. `Issue` and `PrSet` dispatch diverge here (Issue #5342): `PrSet`
@@ -1825,6 +1837,8 @@ impl SweepRegistry {
         let issue_number = match kind {
             SweepKind::Issue(n) => *n,
             SweepKind::PrSet(prs) => {
+                // #11191: disk admission, as for an issue before step 3.
+                crate::disk_admission::admit_dispatch(&self.config.workspace_root, kind)?;
                 return Ok(BeginIssueDispatch::Done(self.dispatch_prset_inner(
                     prs,
                     kind,
@@ -1862,6 +1876,11 @@ impl SweepRegistry {
             .into());
         }
 
+        // 2.45 Workspace hold (Issue #10719): the installed Loom here cannot
+        //      work with this daemon (W3/W4). Structural like 2.4, so `force`
+        //      does not bypass it; before any lock, label flip or forge call.
+        crate::workspace_hold::guard(&self.config.workspace_root)?;
+
         // 2.5 Closed-issue guard (Issue #4088, widened in #4504). All three
         //     watchdogs (startup #3887, mid-build-death #3895, review-stall
         //     #3910) re-dispatch through this method, and `gh issue edit`
@@ -1895,26 +1914,22 @@ impl SweepRegistry {
         //     `WorkDispatcher::backed_off` before `dispatch()` (and this
         //     REST call) is even attempted again — see that method's doc
         //     comment for the full rationale.
+        //
+        //     W9: a resume never consults the memo (`dispatch_open_pr_memo`,
+        //     see `guards/refusal_memo.rs`), and the probe below is a
+        //     conditional read whose verdict comes from the body it serves.
         if !self.config.skip_label_flip {
-            if let Some(memo) = self.fresh_open_pr_memo(issue_number, Utc::now()) {
-                if resume_bypass_pr != Some(memo.pr) {
-                    self.record_open_pr_guard_backoff(issue_number);
-                    return Err(OpenPrDispatchError {
-                        issue: issue_number,
-                        pr: memo.pr,
-                    }
-                    .into());
+            if let Some(memo) = self.dispatch_open_pr_memo(issue_number, resume_bypass_pr) {
+                self.record_open_pr_guard_backoff(issue_number);
+                return Err(OpenPrDispatchError {
+                    issue: issue_number,
+                    pr: memo.pr,
                 }
+                .into());
             }
 
-            if self.issue_is_closed_or_pr(issue_number) == Some(true) {
-                return Err(anyhow!(
-                    "refusing to dispatch issue #{issue_number}: it is closed on the forge, or \
-                     the number resolves to a pull request rather than an open issue (#4088/#4504 \
-                     closed-issue guard). A watchdog re-dispatch must not re-claim a closed/merged \
-                     issue or a PR number."
-                ));
-            }
+            // #11429: a closed issue is refused as `already_landed`.
+            self.refuse_closed_issue(issue_number)?;
         }
 
         // 2.6 Open-PR guard (Issue #4123). Every in-memory dedup signal — the
@@ -1963,7 +1978,9 @@ impl SweepRegistry {
             // Fail-open (#4452): only a VERIFIED `Open(pr)` blocks; both
             // `NoneOpen` and `ProbeFailed` fall through and proceed, so a forge
             // outage can never wedge dispatch (unchanged pre-#4452 behavior).
-            if let OpenPrProbe::Open(pr) = self.probe_open_linked_pr(issue_number) {
+            // W9: live (memo-free) for a resume — see `dispatch_open_pr_probe`.
+            let probe = self.dispatch_open_pr_probe(issue_number, resume_bypass_pr);
+            if let OpenPrProbe::Open(pr) = probe {
                 if resume_bypass_pr != Some(pr) {
                     // Issue #7606: a verified refusal here is exactly the
                     // same event the 2.5-position memo short-circuit above
@@ -1981,6 +1998,15 @@ impl SweepRegistry {
                      open-PR guard for its own PR #{pr} (#4256)"
                 );
             }
+        }
+
+        // #11429: a `landed` outcome on this host's journal refuses as
+        //     `already_landed`. It runs after 2.6, so an issue whose PR is
+        //     still open gets `OpenPrDispatchError` first, which the
+        //     review-stall watchdog converts to a PrSet dispatch (#7649). A
+        //     crash resume of the issue's own sweep is exempt.
+        if resume_bypass_pr.is_none() {
+            self.refuse_recent_landing(issue_number, Utc::now())?;
         }
 
         // 2.7 Park-label guard (Issue #4444). The work-finder's `SKIP_LABELS`
@@ -2026,7 +2052,7 @@ impl SweepRegistry {
         let dispatch_labels = if self.config.skip_label_flip {
             None
         } else {
-            self.current_labels_via_rest(issue_number)
+            self.guard_issue_labels(issue_number)
         };
         if let Some(labels) = dispatch_labels.as_deref() {
             if let Some(label) = self.first_park_label_in(issue_number, labels) {
@@ -2156,12 +2182,8 @@ impl SweepRegistry {
         if resume_bypass_pr.is_none() {
             if let Some(remaining) = self.dispatch_backoff_remaining(issue_number, Utc::now()) {
                 let consecutive = self.dispatch_failure_count(issue_number);
-                log::info!(
-                    "sweep_registry: refusing to dispatch issue #{issue_number} — \
-                     {consecutive} consecutive failed dispatch(es), {}s of backoff remaining \
-                     (#4485)",
-                    remaining.as_secs()
-                );
+                let window = self.dispatch_backoff.get(&issue_number);
+                backoff_cause::log_refused(issue_number, window, remaining);
                 return Err(DispatchBackoffError {
                     issue: issue_number,
                     consecutive,
@@ -2266,6 +2288,17 @@ impl SweepRegistry {
             .into());
         }
 
+        // 2.98 Disk admission (#11191): the repo's measured disk charge must fit
+        //      the free space left after the halt floor and the growth the
+        //      in-flight sweeps are still expected to write. Last of the guards,
+        //      so a candidate another guard refuses never leaves a pending
+        //      reservation behind; before any claim, label or spawn. Every
+        //      dispatch route converges here — the work finder, the watchdogs'
+        //      re-dispatch (#3910) and PR-set conversion (#7649, the PrSet arm
+        //      above), the reaper's resume (#4256), IPC/CLI and the epic
+        //      supervisor — so none of them bypasses the work finder's rule.
+        crate::disk_admission::admit_dispatch(&self.config.workspace_root, kind)?;
+
         // 3. Acquire the claim lock atomically.
         let sweep_id = generate_sweep_id(kind);
         if let Some(selection) = &selection {
@@ -2307,6 +2340,10 @@ impl SweepRegistry {
         // round trips below have already spent wall-clock time.
         let episode_start = Utc::now();
         let mut lease_order_yield: Option<(String, String)> = None;
+        // #10345: set when the yield is the leaseless-label variant, with the
+        // local window of this dispatcher's own flip, so step 4d can tell a
+        // phantom (own flip misread) from a genuine hand-claim.
+        let mut leaseless_flip_window: Option<(DateTime<Utc>, DateTime<Utc>)> = None;
         if !self.config.skip_label_flip {
             // 4a. Cross-host collision guard (Issue #4085, Phase 0 of #4028;
             //     upgraded from detection-only to enforcement by #5789): read
@@ -2373,9 +2410,11 @@ impl SweepRegistry {
                     //     young LEASELESS foreign `loom:building` — a claim
                     //     from a lane that published no lease record — which
                     //     `yield_identity` reports through this same channel.
-                    lease_order_yield = self
-                        .resolve_lease_order(issue_number, &sweep_id, episode_start)
-                        .yield_identity();
+                    let decision = self.resolve_lease_order(issue_number, &sweep_id, episode_start);
+                    if matches!(decision, LeaseOrderDecision::YieldToLeaselessClaim { .. }) {
+                        leaseless_flip_window = Some((episode_start, Utc::now()));
+                    }
+                    lease_order_yield = decision.yield_identity();
                 }
                 Err(e) => {
                     log::warn!(
@@ -2412,6 +2451,29 @@ impl SweepRegistry {
             );
             self.publish_peer_claim(peer_claims::ClaimKind::Retract, issue_number);
             let _ = self.release_lock_owned(issue_number, &sweep_id);
+            // #10345: a leaseless yield whose `loom:building` event is provably
+            // this dispatcher's own flip (fleet actor, inside the flip window,
+            // no foreign lease) is a phantom: revert it in the same step so the
+            // issue is not stranded. Anything unverifiable keeps the label.
+            if let Some((flip_start, flip_end)) = leaseless_flip_window {
+                if self.leaseless_yield_is_own_phantom(
+                    issue_number,
+                    &sweep_id,
+                    flip_start,
+                    flip_end,
+                ) {
+                    log::warn!(
+                        "sweep_registry: leaseless yield for issue #{issue_number} \
+                         sweep_id={sweep_id} is this dispatcher's own phantom `loom:building` \
+                         (#10345) - reverting the label before standing down."
+                    );
+                    if let Err(e) = self.restore_label_to_ready(issue_number) {
+                        log::warn!(
+                            "sweep_registry: phantom-claim revert for #{issue_number} failed: {e}"
+                        );
+                    }
+                }
+            }
             self.post_lease_yield_comment(
                 issue_number,
                 &sweep_id,
@@ -2516,6 +2578,9 @@ impl SweepRegistry {
             depends_on,
             admission,
             story_points,
+            model_source,
+            dispatch_origin,
+            mid_spawn: self.roll_gate.enter(),
         })))
     }
 
@@ -2552,6 +2617,9 @@ impl SweepRegistry {
             depends_on,
             mut admission,
             story_points,
+            model_source,
+            dispatch_origin,
+            mid_spawn: _mid_spawn, // #10974: held until the entry is recorded
         } = prepared;
 
         // Issue #4689: the child already died — synchronously observed,
@@ -2777,19 +2845,16 @@ impl SweepRegistry {
         // 7. Emit `sweep.global.dispatch` (best-effort — never block
         //    dispatch progress on the bus). If no subscribers are
         //    listening, the bus returns NoSubscribers; log at debug.
-        self.emit_event(Event::SweepGlobalDispatch {
-            sweep_id: sweep_id.clone(),
-            kind: kind.clone(),
-            runtime: admission.admitted.as_ref().map(|a| a.runtime.clone()),
-            runtime_source: admission.admitted.as_ref().map(|a| a.source.clone()),
-            // Stamped by `emit_event` -> `set_repo_if_absent` below (#4201),
-            // matching the pattern already used for SweepPhase/Blocker/Exited/
-            // Crashed — leave it `None` at construction.
-            repo: None,
-            // #9432: the size estimate resolved at step 2.71 from the labels
-            // the park guard already read. Absent for an unsized issue.
+        //    #9432: `story_points` is the size estimate resolved at step 2.71
+        //    from the labels the park guard already read. #11280: the event
+        //    also carries this sweep's start facts (`start_facts.rs`).
+        //    #11444: and who asked for it (`dispatch_origin`).
+        self.emit_dispatch(
+            &sweep_id,
+            &admission,
             story_points,
-        });
+            Some((model_source, dispatch_origin)),
+        );
 
         Ok(DispatchOutcome {
             sweep_id,
@@ -2850,6 +2915,9 @@ impl SweepRegistry {
             .into());
         }
 
+        // Workspace hold (Issue #10719), mirroring step 2.45.
+        crate::workspace_hold::guard(&self.config.workspace_root)?;
+
         let sweep_id = generate_sweep_id(kind);
 
         // Per-PR claim lock (Issue #5342): acquired atomically, one mkdir per
@@ -2901,7 +2969,7 @@ impl SweepRegistry {
             }
             return Err(anyhow!(
                 "PR set {prs:?}: spawned child exited immediately — token selection failed (no \
-                 usable OAuth token in the pool). Add accounts to ~/.claude-monitor/accounts.env \
+                 usable OAuth token in the pool). Add accounts to ~/.llm-monitor/accounts.env \
                  then `loom-daemon tokens bootstrap`, or re-probe an existing pool with \
                  `loom-daemon tokens check --ranking`. See the sweep log for the exact failure: {}",
                 log_path.display()
@@ -2954,17 +3022,10 @@ impl SweepRegistry {
         // stranded `loom:building` claim — a `PrSet` dispatch claims no
         // issue, so there is nothing for that recovery path to re-arm.
 
-        self.emit_event(Event::SweepGlobalDispatch {
-            sweep_id: sweep_id.clone(),
-            kind: kind.clone(),
-            runtime: admission.admitted.as_ref().map(|a| a.runtime.clone()),
-            runtime_source: admission.admitted.as_ref().map(|a| a.source.clone()),
-            repo: None,
-            // A `PrSet` dispatch claims no issue (see this method's doc
-            // comment), so there is no `points:*` label to resolve — omitted,
-            // never `0` (#9432).
-            story_points: None,
-        });
+        // A `PrSet` dispatch claims no issue (see this method's doc
+        // comment), so there is no `points:*` label to resolve — omitted,
+        // never `0` (#9432) — and no attempt lineage (#11280).
+        self.emit_dispatch(&sweep_id, &admission, None, None);
 
         Ok(DispatchOutcome {
             sweep_id,
@@ -3191,30 +3252,8 @@ fn run_lease_renewal_start(
         );
         return None;
     }
-    let mut cmd = Command::new(&script);
-    cmd.arg("start")
-        .arg(issue.to_string())
-        .arg("--watch-pid")
-        .arg(child_pid.to_string())
-        // Exact-match targeting (#6485): without BOTH of these the loop
-        // falls back to "newest lease wins" and can spend the sweep
-        // renewing a PEER dispatcher's lease comment while this claim's
-        // own `updated_at` never advances. The daemon knows both values
-        // exactly — it published them itself in `write_lease_comment`.
-        .arg("--host")
-        .arg(host)
-        .arg("--sweep-id")
-        .arg(sweep_id)
-        // Same workspace every other forge mutation in this registry runs
-        // in, so `gh` resolves this repo in a multi-workspace daemon
-        // (#3928/#3937).
-        .current_dir(workspace_root)
-        .stdin(Stdio::null())
-        // Piped and read below purely to capture the loop pid `start`
-        // prints. Safe to read to EOF: the detached loop redirects its OWN
-        // stdout to /dev/null, so nothing holds this pipe open past
-        // `start`'s return.
-        .stdout(Stdio::piped());
+    let mut cmd =
+        lease_renewal_start_command(&script, issue, sweep_id, child_pid, host, workspace_root);
     match std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -3398,6 +3437,7 @@ pub(crate) fn dispatch_model_releasing_poll_lock(
     model: DispatchModel<'_>,
     effort: Option<&str>,
     depends_on: Option<u32>,
+    origin: DispatchOrigin,
 ) -> Result<DispatchOutcome> {
     let prepared_launch = if tokio::runtime::Handle::try_current().is_ok() {
         tokio::task::block_in_place(|| {
@@ -3420,6 +3460,7 @@ pub(crate) fn dispatch_model_releasing_poll_lock(
             depends_on,
             None,
             prepared_launch,
+            origin,
         )
     };
 

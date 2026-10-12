@@ -155,6 +155,7 @@ fn test_credential_preflight() -> crate::types::CredentialPreflightReport {
         fingerprint: None,
         message: "test fixture — not a real preflight".to_string(),
         checked_at: chrono::Utc::now(),
+        pool: None,
     }
 }
 

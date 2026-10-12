@@ -48,7 +48,8 @@ pub use crate::api_keys_pool::ingest::LAUNCH_RECORD_PREFIX as LAUNCH_RECORD_MARK
 /// per-account failure attribution are reconstructable from the journal alone.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CredentialAttribution {
-    /// `"pool"`, `"env"` or `"none"` — `worker_spawn::credential::Source`.
+    /// `"pool"`, `"env"`, `"gateway"` (#9473) or `"none"` —
+    /// `worker_spawn::credential::Source`.
     pub source: String,
     /// The API-key pool's provider namespace (`zai`, …). `None` for an
     /// env-sourced or unpooled spawn.
@@ -108,6 +109,12 @@ pub struct RuntimeAttribution {
     /// The resolved model profile name, when one was selected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
+    /// `llm.billing` the launch stamped (#10749), when it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_billing: Option<String>,
+    /// `llm.credential.kind` the launch stamped (#10749), when it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_credential_kind: Option<String>,
 }
 
 /// Parse one `# LOOM_LAUNCH {…}` record body's runtime attribution (Issue
@@ -135,6 +142,8 @@ pub fn parse_launch_runtime(record_json: &str) -> Option<RuntimeAttribution> {
         provider: string("provider"),
         model: string("model"),
         profile: string("profile"),
+        llm_billing: string("llmBilling"),
+        llm_credential_kind: string("llmCredentialKind"),
     })
 }
 
@@ -468,6 +477,100 @@ pub fn parse_launch_tap(record_json: &str) -> Option<TapAttribution> {
 pub fn parse_launch_tap_after(contents: &str, header_anchor: &str) -> Option<TapAttribution> {
     let region = crate::api_keys_pool::ingest::region_after(contents, header_anchor)?;
     parse_launch_tap(crate::api_keys_pool::ingest::last_launch_record_body(region)?)
+}
+
+// ============================================================================
+// Phase-worker logs (Issue #11360)
+// ============================================================================
+
+/// File-name prefix of a `loom-daemon worker run` phase log (#11285 Slice 1).
+pub const PHASE_LOG_PREFIX: &str = "worker-run-";
+
+/// Where `worker run --role <role>` writes one phase launch's log: a file of
+/// its own beside the sweep log, never the sweep log itself. That separation is
+/// why the outcome journal has to join phase logs explicitly (Issue #11360):
+/// reading only [`sweep_log_path`] misses every out-of-process Builder/Doctor.
+#[must_use]
+pub fn phase_log_path(
+    workspace_root: &std::path::Path,
+    role: &str,
+    issue: u64,
+    timestamp: i64,
+) -> std::path::PathBuf {
+    workspace_root
+        .join(".loom")
+        .join("logs")
+        .join(format!("{PHASE_LOG_PREFIX}{role}-{issue}-{timestamp}.log"))
+}
+
+/// What a phase header names when `worker run` had no parent sweep.
+pub const PHASE_LOG_NO_SWEEP: &str = "none";
+
+/// The phase header's key for the parent sweep id. See [`phase_log_header`]
+/// for why it must not be `sweep_id`.
+pub const PHASE_LOG_SWEEP_KEY: &str = "parent_sweep";
+
+/// The header `worker run` writes as a phase log's first line, naming the
+/// parent sweep (`$LOOM_SWEEP_ID`) the launch belongs to. Without a sweep id
+/// (an operator running `worker run` by hand) it says
+/// `parent_sweep=`[`PHASE_LOG_NO_SWEEP`], which no sweep's [`phase_log_anchor`]
+/// matches, so the log is charged to nobody.
+///
+/// The key is deliberately **not** `sweep_id=`: the parent sweep log is
+/// anchored by a plain-substring search for `sweep_id=<id>`, so a header
+/// carrying that text, quoted into the parent's stream (an orchestrator that
+/// `cat`s a phase log while diagnosing it), would move the parent's region
+/// start past its own launch record.
+#[must_use]
+pub fn phase_log_header(sweep_id: Option<&str>, role: &str, issue: u64) -> String {
+    let sweep_id = sweep_id.map(str::trim).filter(|s| !s.is_empty());
+    format!(
+        "==== loom-daemon worker run: {PHASE_LOG_SWEEP_KEY}={} role={role} issue={issue} ====",
+        sweep_id.unwrap_or(PHASE_LOG_NO_SWEEP)
+    )
+}
+
+/// The anchor a sweep's terminal transition scopes a phase log by. The
+/// trailing space is load-bearing: `parent_sweep=sweep-issue-7-1` must not match a
+/// header naming `sweep-issue-7-10`. `None` for an empty id or
+/// [`PHASE_LOG_NO_SWEEP`], which name no sweep and so must match no header.
+#[must_use]
+pub fn phase_log_anchor(sweep_id: &str) -> Option<String> {
+    let sweep_id = sweep_id.trim();
+    (!sweep_id.is_empty() && sweep_id != PHASE_LOG_NO_SWEEP)
+        .then(|| format!("worker run: {PHASE_LOG_SWEEP_KEY}={sweep_id} "))
+}
+
+/// Every phase log for `issue` under `workspace_root`, as `(role, path)`, in
+/// launch order (timestamp, then name). Unreadable directory ⇒ empty: "no
+/// opinion", never a failure. Which of them belong to a given sweep is decided
+/// by [`phase_log_anchor`], not by the file name.
+#[must_use]
+pub fn phase_logs_for_issue(
+    workspace_root: &std::path::Path,
+    issue: u32,
+) -> Vec<(String, std::path::PathBuf)> {
+    let Ok(entries) = std::fs::read_dir(workspace_root.join(".loom").join("logs")) else {
+        return Vec::new();
+    };
+    let mut logs: Vec<(i64, String, String, std::path::PathBuf)> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            let rest = name.strip_prefix(PHASE_LOG_PREFIX)?.strip_suffix(".log")?;
+            let (role, rest) = rest.split_once('-')?;
+            let (log_issue, timestamp) = rest.split_once('-')?;
+            if log_issue.parse::<u32>().ok()? != issue {
+                return None;
+            }
+            let timestamp = timestamp.parse::<i64>().ok()?;
+            Some((timestamp, name.clone(), role.to_string(), entry.path()))
+        })
+        .collect();
+    logs.sort();
+    logs.into_iter()
+        .map(|(_, _, role, path)| (role, path))
+        .collect()
 }
 
 #[cfg(test)]

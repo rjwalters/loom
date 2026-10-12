@@ -298,3 +298,29 @@ fn yield_identity_maps_each_variant_onto_the_dispatch_shape() {
         Some(("peer-host".to_string(), "sweep-peer".to_string()))
     );
 }
+
+/// #10345: own-flip attribution needs BOTH the fleet actor and the flip window.
+#[test]
+fn claim_event_is_own_flip_requires_fleet_actor_and_window() {
+    use crate::forge_identity::FleetLogins;
+    let fleet = FleetLogins::single("loom-fleet-dispatch");
+    let start = Utc::now();
+    let end = start + chrono::Duration::milliseconds(300);
+    let near = start - chrono::Duration::seconds(1);
+    assert!(claim_event_is_own_flip("loom-fleet-dispatch", near, start, end, &fleet));
+    assert!(claim_event_is_own_flip("loom-fleet-dispatch[bot]", near, start, end, &fleet));
+    assert!(!claim_event_is_own_flip("someone-else", near, start, end, &fleet));
+    assert!(!claim_event_is_own_flip("", near, start, end, &fleet));
+    let far = start - chrono::Duration::seconds(30);
+    assert!(!claim_event_is_own_flip("loom-fleet-dispatch", far, start, end, &fleet));
+}
+
+#[test]
+fn parse_claim_event_takes_newest_and_rejects_bare_timestamps() {
+    let out = b"a\t2026-01-01T00:00:00Z\nb\t2026-01-01T00:00:05Z\n";
+    let (actor, ts) = parse_claim_event(out).unwrap();
+    assert_eq!(actor, "b");
+    assert_eq!(ts.to_rfc3339(), "2026-01-01T00:00:05+00:00");
+    assert!(parse_claim_event(b"2026-01-01T00:00:00Z\n").is_none());
+    assert!(parse_claim_event(b"").is_none());
+}

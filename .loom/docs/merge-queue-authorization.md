@@ -1,0 +1,1 @@
+../../defaults/docs/merge-queue-authorization.md

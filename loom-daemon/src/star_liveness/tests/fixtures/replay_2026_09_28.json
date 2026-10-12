@@ -150,7 +150,17 @@
      "body": "sky130-modexp resync BLOCKED: four fleet-bot commits fixed Loom-managed files in place; upstream or pin them."
     }
    ],
-   "comments": {}
+   "comments": {
+    "869": [
+     {
+      "_comment": "#10151: not in the 2026-09-28 record. Stands for a Curator handoff the liveness check made before the snapshot; without it the pass would hand #869 to Curator instead of asking the operator, since no blocker is named.",
+      "created_at": "2026-09-27T08:00:00Z",
+      "author": "loom-fleet-dispatch-1[bot]",
+      "association": "CONTRIBUTOR",
+      "body": "<!-- loom:operator-priority-curator-handoff -->\n**Handed to Curator** (replay stand-in)."
+     }
+    ]
+   }
   }
  ],
  "expect_escalations": [

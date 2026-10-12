@@ -171,6 +171,39 @@ pub struct VerifyResult {
     /// downgrade). `None` off-darwin: there is no destination-signature
     /// comparison there.
     pub had_authority: Option<bool>,
+    /// Which verifier actually succeeded, and what it actually checked
+    /// (#10470). `Some` exactly where `outcome` is [`Outcome::Verified`]
+    /// because a verifier RAN and passed; `None` on every skip, failure and
+    /// on the unrecognized-target pass-through (nothing was verified there).
+    /// The required-mode evidence line is built from this alone, so it can
+    /// never report an identity no verifier checked.
+    pub verified_by: Option<VerifiedBy>,
+    /// `true` only on an [`Outcome::Failed`] where the verifier never
+    /// produced a verdict (timed out, uncollectable): a block, but not tamper
+    /// evidence. A verifier that ran to completion and rejected is `false`.
+    pub inconclusive: bool,
+}
+
+/// What a successful verification actually established (#10470).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerifiedBy {
+    /// macOS `codesign --verify --strict` passed. No signer, team or GitHub
+    /// workflow identity was established by this check.
+    Codesign,
+    /// `cosign verify-blob --key` passed against a public key. No signer or
+    /// GitHub workflow identity was established -- only possession of the key.
+    CosignKey,
+    /// Keyless, against one exact certificate identity
+    /// (`--certificate-identity`).
+    KeylessExactIdentity { identity: String, issuer: String },
+    /// Keyless, against a certificate-identity regexp
+    /// (`--certificate-identity-regexp`). `workflow_pinned` is true only when
+    /// an approved-workflow pin was folded into `regexp` and so enforced.
+    KeylessIdentityRegexp {
+        regexp: String,
+        issuer: String,
+        workflow_pinned: bool,
+    },
 }
 
 /// Inputs to one verification.
@@ -190,19 +223,33 @@ pub struct VerifyInputs<'a> {
 /// Verify `inputs.bin_path`'s signature, present-only.
 #[must_use]
 pub fn verify(inputs: &VerifyInputs<'_>) -> VerifyResult {
+    verify_with_workflow(inputs, None)
+}
+
+/// [`verify`] with an optional approved-workflow pin for the derived keyless
+/// identity (#10470; see [`cosign::identity_regexp_pinned`]). `None` is
+/// exactly [`verify`]. Ignored when an exact identity is supplied through
+/// `inputs.cosign_identity_env`, which is already stricter.
+#[must_use]
+pub fn verify_with_workflow(
+    inputs: &VerifyInputs<'_>,
+    approved_workflow: Option<&str>,
+) -> VerifyResult {
     if inputs.target.ends_with("-apple-darwin") {
         return verify_darwin(inputs.bin_path);
     }
     if inputs.target.contains("-linux-") {
-        return verify_linux(inputs);
+        return verify_linux(inputs, approved_workflow);
     }
     // An unrecognized target verifies nothing rather than failing — the
     // shell's `*) return 0 ;;`.
     VerifyResult {
         outcome: Outcome::Verified,
         state: Some(SignatureState::Skipped),
+        inconclusive: false,
         message: String::new(),
         had_authority: None,
+        verified_by: None,
     }
 }
 
@@ -222,6 +269,7 @@ fn verify_darwin(bin_path: &Path) -> VerifyResult {
         return VerifyResult {
             outcome: Outcome::Skipped,
             state: Some(SignatureState::Unavailable),
+            inconclusive: false,
             message: match u {
                 Unavailable::Spawn(_) => {
                     "'codesign' not available -- skipping macOS signature verification \
@@ -239,6 +287,7 @@ fn verify_darwin(bin_path: &Path) -> VerifyResult {
                 ),
             },
             had_authority: None,
+            verified_by: None,
         };
     }
 
@@ -263,11 +312,13 @@ fn verify_darwin(bin_path: &Path) -> VerifyResult {
         return VerifyResult {
             outcome: Outcome::Skipped,
             state: Some(SignatureState::Skipped),
+            inconclusive: false,
             message: "Downloaded artifact is unsigned (no Developer ID secrets were configured \
                       for this release) -- proceeding without signature verification, per design \
                       (checksum is unconditional; signature is optional)."
                 .to_string(),
             had_authority: Some(had_authority),
+            verified_by: None,
         };
     }
 
@@ -288,20 +339,24 @@ fn verify_darwin(bin_path: &Path) -> VerifyResult {
         CmdOutcome::Ran(o) if o.status.success() => VerifyResult {
             outcome: Outcome::Verified,
             state: Some(SignatureState::Verified),
+            inconclusive: false,
             message: format!("macOS codesign verification passed for {name}."),
             had_authority: Some(had_authority),
+            verified_by: Some(VerifiedBy::Codesign),
         },
         // Ran to completion and reported a bad signature: tamper evidence,
         // still a hard block.
         CmdOutcome::Ran(_) => VerifyResult {
             outcome: Outcome::Failed,
             state: None,
+            inconclusive: false,
             message: format!(
                 "macOS codesign verification FAILED for {name} -- an embedded signature is \
                  present but invalid. This is NOT the 'unsigned' case; treating as tamper \
                  evidence."
             ),
             had_authority: Some(had_authority),
+            verified_by: None,
         },
         // Never answered (timed out, or its output could not be collected):
         // UNKNOWN. A loud skip like absent tooling — never a block, and never
@@ -309,12 +364,14 @@ fn verify_darwin(bin_path: &Path) -> VerifyResult {
         CmdOutcome::Unavailable(u) => VerifyResult {
             outcome: Outcome::Skipped,
             state: Some(SignatureState::Unavailable),
+            inconclusive: false,
             message: format!(
                 "macOS codesign verification could not be completed for {name} ({u}) -- \
                  SKIPPING verification (inconclusive, NOT tamper evidence; checksum already \
                  verified)."
             ),
             had_authority: Some(had_authority),
+            verified_by: None,
         },
     }
 }
@@ -328,7 +385,7 @@ fn cosign_available() -> bool {
     )
 }
 
-fn verify_linux(inputs: &VerifyInputs<'_>) -> VerifyResult {
+fn verify_linux(inputs: &VerifyInputs<'_>, approved_workflow: Option<&str>) -> VerifyResult {
     let name = file_name(inputs.bin_path);
 
     // No .sig asset published for this release (cosign secret was not
@@ -338,8 +395,10 @@ fn verify_linux(inputs: &VerifyInputs<'_>) -> VerifyResult {
         return VerifyResult {
             outcome: Outcome::Skipped,
             state: Some(SignatureState::Skipped),
+            inconclusive: false,
             message: String::new(),
             had_authority: None,
+            verified_by: None,
         };
     };
     let sig_name = file_name(sig_path);
@@ -348,12 +407,14 @@ fn verify_linux(inputs: &VerifyInputs<'_>) -> VerifyResult {
         return VerifyResult {
             outcome: Outcome::Skipped,
             state: Some(SignatureState::Unavailable),
+            inconclusive: false,
             message: format!(
                 "A detached signature ({sig_name}) is present for this release but 'cosign' is \
                  not installed -- SKIPPING verification (loud skip, not a block; checksum \
                  already verified)."
             ),
             had_authority: None,
+            verified_by: None,
         };
     }
 
@@ -364,12 +425,17 @@ fn verify_linux(inputs: &VerifyInputs<'_>) -> VerifyResult {
         let (identity_flag, identity_desc) =
             match inputs.cosign_identity_env.filter(|v| !v.is_empty()) {
                 Some(exact) => ("--certificate-identity", exact.to_string()),
-                None => match cosign::identity_regexp(inputs.repo_slug, inputs.tag) {
+                None => match cosign::identity_regexp_pinned(
+                    inputs.repo_slug,
+                    inputs.tag,
+                    approved_workflow,
+                ) {
                     Some(re) => ("--certificate-identity-regexp", re),
                     None => {
                         return VerifyResult {
                             outcome: Outcome::Skipped,
                             state: Some(SignatureState::Unavailable),
+                            inconclusive: false,
                             message: format!(
                             "A detached signature ({sig_name}) and its signing certificate are \
                              present but the expected signer identity could not be derived (no \
@@ -377,6 +443,7 @@ fn verify_linux(inputs: &VerifyInputs<'_>) -> VerifyResult {
                              a block; checksum already verified)."
                         ),
                             had_authority: None,
+                            verified_by: None,
                         };
                     }
                 },
@@ -394,27 +461,42 @@ fn verify_linux(inputs: &VerifyInputs<'_>) -> VerifyResult {
             .arg(&issuer)
             .arg(inputs.bin_path)
             .stdin(Stdio::null());
-        let outcome = cmd_out::run_command(cmd, VERIFY_TIMEOUT);
+        let outcome = cmd_out::run_command(cmd, verify_timeout());
         return if outcome.succeeded() {
             VerifyResult {
                 outcome: Outcome::Verified,
                 state: Some(SignatureState::Verified),
+                inconclusive: false,
                 message: format!(
                     "cosign keyless signature verification passed for {name} (signer identity \
                      {identity_desc}, issuer {issuer})."
                 ),
                 had_authority: None,
+                verified_by: Some(if identity_flag == "--certificate-identity" {
+                    VerifiedBy::KeylessExactIdentity {
+                        identity: identity_desc,
+                        issuer,
+                    }
+                } else {
+                    VerifiedBy::KeylessIdentityRegexp {
+                        regexp: identity_desc,
+                        issuer,
+                        workflow_pinned: approved_workflow.is_some_and(|w| !w.trim().is_empty()),
+                    }
+                }),
             }
         } else {
             VerifyResult {
                 outcome: Outcome::Failed,
                 state: None,
+                inconclusive: matches!(outcome, CmdOutcome::Unavailable(_)),
                 message: format!(
                     "cosign keyless signature verification FAILED for {name} against \
                      {sig_name} + {cert_name} (expected signer identity {identity_desc}, issuer \
                      {issuer})."
                 ),
                 had_authority: None,
+                verified_by: None,
             }
         };
     }
@@ -424,6 +506,7 @@ fn verify_linux(inputs: &VerifyInputs<'_>) -> VerifyResult {
         return VerifyResult {
             outcome: Outcome::Skipped,
             state: Some(SignatureState::Unavailable),
+            inconclusive: false,
             message: format!(
                 "A detached signature ({sig_name}) is present without a signing certificate \
                  (key-signed release) and no cosign public key is resolvable (set \
@@ -431,6 +514,7 @@ fn verify_linux(inputs: &VerifyInputs<'_>) -> VerifyResult {
                  block; checksum already verified)."
             ),
             had_authority: None,
+            verified_by: None,
         };
     };
 
@@ -442,24 +526,28 @@ fn verify_linux(inputs: &VerifyInputs<'_>) -> VerifyResult {
         .arg(sig_path)
         .arg(inputs.bin_path)
         .stdin(Stdio::null());
-    let outcome = cmd_out::run_command(cmd, VERIFY_TIMEOUT);
+    let outcome = cmd_out::run_command(cmd, verify_timeout());
     if outcome.succeeded() {
         VerifyResult {
             outcome: Outcome::Verified,
             state: Some(SignatureState::Verified),
+            inconclusive: false,
             message: format!("cosign signature verification passed for {name}."),
             had_authority: None,
+            verified_by: Some(VerifiedBy::CosignKey),
         }
     } else {
         VerifyResult {
             outcome: Outcome::Failed,
             state: None,
+            inconclusive: matches!(outcome, CmdOutcome::Unavailable(_)),
             message: format!(
                 "cosign signature verification FAILED for {name} against {sig_name} using key \
                  {}.",
                 pubkey.display()
             ),
             had_authority: None,
+            verified_by: None,
         }
     }
 }

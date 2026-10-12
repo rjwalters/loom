@@ -61,8 +61,9 @@
 -- Either mistake answers "this fleet has no rework" from a store full of it.
 --
 -- READ IE5 FIRST. Every number below is a share of the attempts this
--- classification can attribute. `operator_redispatch` and `unknown` triggers,
--- and every pre-#9444 record (no `trigger` key at all), land in
+-- classification can attribute. `redispatch_after_success`,
+-- `operator_redispatch` and `unknown` triggers, and every pre-#9444 record (no
+-- `trigger` key at all), land in
 -- `unattributed_sec` and are never silently folded into a rework bucket. If
 -- IE5 says coverage is low for your window, IE1..IE4 are describing a
 -- minority of the cost.
@@ -122,7 +123,7 @@ WITH attempt AS (
             WHEN 'ci_failure_fix'                  THEN 'environmental'
             WHEN 'rebase_main_moved'               THEN 'environmental'
             WHEN 'first'                           THEN 'clean'
-            ELSE 'unattributed'   -- operator_redispatch, unknown, absent
+            ELSE 'unattributed'   -- redispatch_after_success, operator_redispatch, unknown, absent
         END                                                           AS attempt_bucket
       FROM records r
      WHERE r.kind = 'sweep.outcome'
@@ -266,8 +267,10 @@ SELECT
 -- attribute. `attributed_pct` is the denominator every other number here is a
 -- share of. The three unattributed populations are reported separately because
 -- they need different fixes: `no_trigger` is retention/rollout (pre-#9444
--- records aging out), `operator_redispatch` is a dispatch-source plumb this
--- daemon does not have, and `unknown` is a real measurement gap to drive down.
+-- records aging out), `redispatch_after_success` is a re-dispatch of work
+-- that had already succeeded (#11429; called `operator_redispatch` before it),
+-- `operator_redispatch` is a dispatch-source plumb this daemon does not have,
+-- and `unknown` is a real measurement gap to drive down.
 -- ---------------------------------------------------------------------------
 SELECT
     COUNT(*)                                                             AS attempts,
@@ -275,6 +278,8 @@ SELECT
              THEN 1 ELSE 0 END)                                          AS no_trigger,
     SUM(CASE WHEN json_extract(payload, '$.trigger') = 'operator_redispatch'
              THEN 1 ELSE 0 END)                                          AS operator_redispatch,
+    SUM(CASE WHEN json_extract(payload, '$.trigger') = 'redispatch_after_success'
+             THEN 1 ELSE 0 END)                                          AS redispatch_after_success,
     SUM(CASE WHEN json_extract(payload, '$.trigger') = 'unknown'
              THEN 1 ELSE 0 END)                                          AS unknown_trigger,
     SUM(CASE WHEN json_extract(payload, '$.rework_events') IS NULL
@@ -283,7 +288,8 @@ SELECT
              THEN 1 ELSE 0 END)                                          AS no_attempt_index,
     ROUND(100.0 * SUM(CASE WHEN json_extract(payload, '$.trigger') IS NOT NULL
                             AND json_extract(payload, '$.trigger') NOT IN
-                                ('operator_redispatch', 'unknown')
+                                ('redispatch_after_success',
+                                 'operator_redispatch', 'unknown')
                            THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0), 1)  AS attributed_pct
   FROM records
  WHERE kind = 'sweep.outcome'

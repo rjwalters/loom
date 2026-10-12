@@ -58,9 +58,10 @@ fn establish_hook_trust(profile: &std::path::Path) {
 }
 
 fn environment(f: &Fixture, root: &std::path::Path, name: &str, gh_host: &str) -> Environment {
-    let [gh_bin, write_scope_cache] = f.write_scope_env();
+    let [gh_bin, no_policy_launcher, write_scope_cache] = f.write_scope_env();
     Environment::set(&[
         gh_bin,
+        no_policy_launcher,
         write_scope_cache,
         ("LOOM_WORKSPACE", Some(root.to_owned().into_os_string())),
         ("LOOM_CODEX_PROFILE_ROOT", Some(f.root.path().join("profiles").into_os_string())),
@@ -201,6 +202,7 @@ fn every_unverified_private_shape_is_refused_for_a_mutable_role() {
         None,
         None,
         None,
+        loom_daemon::sweep_registry::DispatchOrigin::Unknown,
     )
     .unwrap_err();
     assert!(rejected.to_string().contains("hook trust"), "{rejected}");

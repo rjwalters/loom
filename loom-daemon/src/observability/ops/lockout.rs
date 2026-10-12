@@ -113,6 +113,14 @@ impl LockoutTracker {
     pub fn is_locked(&self, slug: &str) -> bool {
         self.since.contains_key(slug)
     }
+
+    /// Every slug currently tracked as locked, sorted.
+    #[must_use]
+    pub fn locked_slugs(&self) -> Vec<String> {
+        let mut slugs: Vec<String> = self.since.keys().cloned().collect();
+        slugs.sort();
+        slugs
+    }
 }
 
 static TRACKER: OnceLock<Mutex<LockoutTracker>> = OnceLock::new();
@@ -146,6 +154,16 @@ pub fn duration_secs(slug: &str, now: DateTime<Utc>) -> Option<i64> {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .duration_secs(slug, now)
+}
+
+/// Every repo the global tracker holds as locked right now — the ETA's
+/// `pr_open_lockout` stall input (#10210). Read-only.
+#[must_use]
+pub fn locked_slugs() -> Vec<String> {
+    tracker()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .locked_slugs()
 }
 
 /// Test-only reset of the process-global tracker.

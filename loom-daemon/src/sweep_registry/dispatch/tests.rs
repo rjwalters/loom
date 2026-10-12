@@ -5,11 +5,14 @@ use std::os::unix::fs::PermissionsExt;
 use std::time::SystemTime;
 use tempfile::tempdir;
 
-// The runtime-env guard lives in its own sibling file so this over-threshold
-// file does not grow (#9964, `.loom/docs/file-size-policy.md`).
-#[path = "cleared_runtime_env.rs"]
-mod cleared_runtime_env;
-use cleared_runtime_env::ClearedLoomRuntimeEnv;
+// RAII guard that clears the ambient runtime-selection env vars for the scope
+// of a test and restores them on drop. Some host/dev-container shells export
+// `LOOM_RUNTIME` (the `spawn-worker.sh` runtime selector) and every Loom agent
+// session is spawned with it pinned, where that ambient value silently outranks
+// the `runtimes.default` config precedence these tests exercise (#4739). The
+// local copy this alias replaced cleared only the global var, never the per-role
+// `LOOM_RUNTIME_<ROLE>` pin that decides the same binding (#9360).
+use crate::runtime_selection_test_support::ClearedRuntimeSelectionEnv as ClearedLoomRuntimeEnv;
 
 /// As [`ClearedLoomRuntimeEnv`] but for `GH_CONFIG_DIR` (#6529): the test
 /// process — or a PREVIOUS test in this same `#[serial]` suite — may
@@ -1284,6 +1287,22 @@ fn dispatch_forwards_experiment_env_and_sets_cwd() {
         "expected child cwd pinned to workspace root {}; got: {recorded}",
         expected_cwd.display()
     );
+}
+
+/// #9473: a sweep child spawned through anything but `spawn-worker.sh` (here
+/// the `spawn-claude.sh` fixture) never inherits the LLM-gateway contract.
+#[test]
+#[serial]
+fn dispatch_withholds_the_llm_gateway_contract_from_a_non_seam_child() {
+    let dir = tempdir().unwrap();
+    let (mut registry, record_log) = fixture_registry(dir.path());
+    std::env::set_var("LOOM_LLM_GATEWAY_VK", "sk-bf-sweep-fixture");
+    let outcome = registry.dispatch(&SweepKind::Issue(49), None, None, None, None);
+    std::env::remove_var("LOOM_LLM_GATEWAY_VK");
+    let outcome = outcome.expect("dispatch should succeed");
+    let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
+    let recorded = assert_child_wrote(&record_log, &needle);
+    assert!(recorded.contains("LOOM_LLM_GATEWAY_VK=unset"), "{recorded}");
 }
 
 /// Issue #3730 no-op criterion: when none of the experiment env vars are

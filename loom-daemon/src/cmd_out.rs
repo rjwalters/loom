@@ -98,6 +98,16 @@ pub enum Unavailable {
         after: Duration,
         partial_stdout: Vec<u8>,
     },
+    /// The managed `gh` launcher exited `78`: routing is blocked (#9987).
+    /// Not an answer from GitHub, so never retried nor read as "no results".
+    RoutingBlocked(String),
+    /// The managed `gh` launcher exited `69`: its adapter is down (#9987).
+    AdapterUnavailable(String),
+    /// Not run (W4-C): a deferrable forge read whose reader budget is
+    /// exhausted until `until`. Nothing was sent. Its text deliberately
+    /// matches no rate-limit signature, so feeding it to the rate-limit
+    /// breaker can never trip it.
+    Shed { until: std::time::SystemTime },
 }
 
 impl std::fmt::Display for Unavailable {
@@ -106,11 +116,32 @@ impl std::fmt::Display for Unavailable {
             Unavailable::Spawn(e) => write!(f, "could not start: {e}"),
             Unavailable::Collect(e) => write!(f, "could not collect output: {e}"),
             Unavailable::TimedOut { after, .. } => write!(f, "timed out after {after:?}"),
+            Unavailable::RoutingBlocked(e) => write!(f, "routing_blocked: {e}"),
+            Unavailable::AdapterUnavailable(e) => write!(f, "adapter_unavailable: {e}"),
+            Unavailable::Shed { until } => write!(
+                f,
+                "deferred: reader budget low until {} (loom-shed)",
+                chrono::DateTime::<chrono::Utc>::from(*until)
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            ),
         }
     }
 }
 
 impl CmdOutcome {
+    /// The process's output when it ran (any exit status), else why not —
+    /// the `Command::output()` shape, for sites migrated from it.
+    ///
+    /// # Errors
+    ///
+    /// The [`Unavailable`] reason when the command did not run to completion.
+    pub fn into_result(self) -> Result<std::process::Output, Unavailable> {
+        match self {
+            CmdOutcome::Ran(o) => Ok(o),
+            CmdOutcome::Unavailable(u) => Err(u),
+        }
+    }
+
     /// The output of a command that ran **and exited zero**.
     ///
     /// `None` for a non-zero exit and for [`CmdOutcome::Unavailable`] alike —
@@ -282,7 +313,12 @@ pub fn run_command(cmd: Command, timeout: Duration) -> CmdOutcome {
 }
 
 fn finish(cmd: Command, timeout: Duration) -> CmdOutcome {
-    match run_bounded(cmd, timeout) {
+    outcome_of(run_bounded(cmd, timeout), timeout)
+}
+
+/// Classify an already-run [`run_bounded`]-style result as [`finish`] does.
+pub fn outcome_of(result: Result<Completion, ExecError>, timeout: Duration) -> CmdOutcome {
+    match result {
         Ok(Completion::Exited(out)) => CmdOutcome::Ran(out),
         Ok(Completion::TimedOut { stdout, .. }) => CmdOutcome::Unavailable(Unavailable::TimedOut {
             after: timeout,
@@ -339,7 +375,12 @@ where
 /// Callers pass `--json <fields>` and **no `--jq`** — the whole point is that
 /// the structure survives into Rust instead of being flattened to a scalar by a
 /// second interpreter inside the subprocess.
+///
+/// `op` is the stable [`crate::gh_invocation::Operation`] name the read is
+/// counted under: it runs through the `gh` facade (#10089), so it reaches
+/// `forge_call_stats` and gets the facade's credential/`GH_REPO` routing.
 pub fn gh_json<T, F>(
+    op: &'static str,
     gh: &Path,
     args: &[&str],
     dir: &Path,
@@ -350,14 +391,19 @@ where
     T: serde::de::DeserializeOwned,
     F: FnOnce(&T) -> bool,
 {
+    use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
     debug_assert!(
         !args.contains(&"--jq"),
         "gh_json decodes in-process; passing --jq flattens the JSON in the subprocess \
          and reintroduces the ambiguity this exists to remove"
     );
-    let mut cmd = Command::new(gh);
-    cmd.args(args).current_dir(dir).stdin(Stdio::null());
-    decode_json(finish(cmd, timeout), is_empty)
+    let outcome =
+        GhInvocation::new(Operation::new(op), AccessIntent::Read, GhTarget::None, timeout)
+            .program(gh)
+            .current_dir(dir)
+            .args(args)
+            .run();
+    decode_json(outcome, is_empty)
 }
 
 #[cfg(test)]

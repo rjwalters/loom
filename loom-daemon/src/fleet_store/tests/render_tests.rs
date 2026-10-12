@@ -109,6 +109,47 @@ fn check_reports_each_differing_path() {
 }
 
 #[test]
+fn lost_top_level_keys_names_what_a_write_would_drop() {
+    // 2am#1653's shape: the on-disk machine tier is rich, the store render
+    // carries one of its blocks — the write would drop the rest.
+    let p = paths();
+    std::fs::create_dir_all(p.machine.parent().unwrap()).unwrap();
+    std::fs::write(
+        &p.machine,
+        r#"{"runtimes":{"judge":"claude"},"autonomous":{"roleRunner":{}},"safehouse":{},"forge":{"githubApp":{"appId":"1"}}}"#,
+    )
+    .unwrap();
+    let store = snapshot_of(&sample_files()); // renders autonomous + forge only
+    let targets = render(&store, "build-1", &p.machine, &p.local).unwrap();
+    let machine = targets.iter().find(|t| t.tier == Tier::Machine).unwrap();
+    let mut lost = lost_top_level_keys(machine);
+    lost.sort();
+    assert_eq!(lost, vec!["runtimes", "safehouse"]);
+}
+
+#[test]
+fn lost_top_level_keys_is_empty_when_nothing_is_lost_or_unreadable() {
+    let p = paths();
+    std::fs::create_dir_all(p.machine.parent().unwrap()).unwrap();
+    // target ⊇ disk: nothing lost
+    std::fs::write(&p.machine, r#"{"forge":{}}"#).unwrap();
+    let store = snapshot_of(&sample_files());
+    let targets = render(&store, "build-1", &p.machine, &p.local).unwrap();
+    let machine = targets.iter().find(|t| t.tier == Tier::Machine).unwrap();
+    assert!(lost_top_level_keys(machine).is_empty());
+    // unparseable disk: the separate error class, not a lossy reduction
+    std::fs::write(&p.machine, "not json").unwrap();
+    let targets = render(&store, "build-1", &p.machine, &p.local).unwrap();
+    let machine = targets.iter().find(|t| t.tier == Tier::Machine).unwrap();
+    assert!(lost_top_level_keys(machine).is_empty());
+    // missing disk: nothing to lose
+    std::fs::remove_file(&p.machine).unwrap();
+    let targets = render(&store, "build-1", &p.machine, &p.local).unwrap();
+    let machine = targets.iter().find(|t| t.tier == Tier::Machine).unwrap();
+    assert!(lost_top_level_keys(machine).is_empty());
+}
+
+#[test]
 fn unparseable_target_is_drift() {
     let p = paths();
     let targets = render(&snapshot_of(&sample_files()), "build-1", &p.machine, &p.local).unwrap();

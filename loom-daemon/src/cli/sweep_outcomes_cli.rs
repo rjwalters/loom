@@ -325,13 +325,14 @@ fn handle_summary(args: &SweepOutcomesSummaryArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::Parser;
+    use crate::cli::whole_cli_parse::try_parse_cli;
 
     /// Parse a full argv through the real top-level `Cli`, so these tests see
     /// exactly the `Command` tree the binary builds — the `Args`-struct move
-    /// this module performs is only safe if that tree is unchanged.
+    /// this module performs is only safe if that tree is unchanged. Parsed on
+    /// an 8 MiB thread like the binary's (#10616).
     fn parse(args: &[&str]) -> crate::Commands {
-        crate::Cli::try_parse_from(args)
+        try_parse_cli(args)
             .expect("parse")
             .command
             .expect("a subcommand")
@@ -540,7 +541,7 @@ mod tests {
     /// default-widening rule needs exactly one answer, not a precedence quiz.
     #[test]
     fn all_workspaces_and_this_workspace_conflict() {
-        assert!(crate::Cli::try_parse_from([
+        assert!(try_parse_cli(&[
             "loom-daemon",
             "sweep-outcomes",
             "summary",

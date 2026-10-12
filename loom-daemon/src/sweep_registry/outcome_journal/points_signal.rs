@@ -42,7 +42,7 @@ impl SweepRegistry {
         if self.config.skip_label_flip {
             return None;
         }
-        if crate::rate_limit_breaker::global_is_suppressed() {
+        if crate::rate_limit_breaker::global_skip_pass("outcome_journal") {
             log::debug!(
                 "sweep_outcomes: skipping the issue #{issue} points-marker read — the rate-limit \
                  breaker is suppressing forge polling (#9056)"

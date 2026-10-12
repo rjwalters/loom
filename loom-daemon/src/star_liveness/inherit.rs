@@ -77,13 +77,9 @@ pub fn current(root: &Path) -> Vec<Inherited> {
 pub fn apply_list(items: &mut Vec<WorkItem>, list: &[Inherited]) {
     for inh in list {
         if let Some(item) = items.iter_mut().find(|i| i.number == inh.number) {
-            let own_star = item
-                .labels
-                .iter()
-                .any(|l| l == crate::work_finder::OPERATOR_PRIORITY_LABEL);
+            let own_star = crate::operator_levels::is_starred(&item.labels);
             if !own_star {
                 item.operator_priority_inherited_from = Some(inh.from);
-                item.operator_priority_at.clone_from(&inh.starred_at);
             }
             continue;
         }
@@ -93,14 +89,14 @@ pub fn apply_list(items: &mut Vec<WorkItem>, list: &[Inherited]) {
         );
         if let Some(mut item) = added.pop() {
             item.operator_priority_inherited_from = Some(inh.from);
-            item.operator_priority_at.clone_from(&inh.starred_at);
             items.push(item);
         }
     }
 }
 
-/// [`apply_list`] with the list published for `root`. `None` (a listing
-/// with no workspace root) is a no-op.
+/// [`apply_list`] with the list published for `root`, then
+/// [`apply_levels`] with the level list. `None` (a listing with no
+/// workspace root) is a no-op.
 pub fn apply(root: Option<&Path>, items: &mut Vec<WorkItem>) {
     let Some(root) = root else {
         return;
@@ -108,5 +104,66 @@ pub fn apply(root: Option<&Path>, items: &mut Vec<WorkItem>) {
     let list = current(root);
     if !list.is_empty() {
         apply_list(items, &list);
+    }
+    let levels = current_levels(root);
+    if !levels.is_empty() {
+        apply_levels(items, &levels);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Inherited levels (#10307): the zero-latency twin of the derived label.
+// ---------------------------------------------------------------------------
+
+fn level_registry() -> &'static Mutex<HashMap<String, Vec<WorkItem>>> {
+    static REG: OnceLock<Mutex<HashMap<String, Vec<WorkItem>>>> = OnceLock::new();
+    REG.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Replace the level-inheriting blockers for the workspace at `root`. Each
+/// item already carries its level's inherited label and the source's
+/// starred-at, exactly as the next listing will show it once the pass's
+/// label write lands (or, with writes off, as it would).
+pub fn publish_levels(root: &Path, list: Vec<WorkItem>) {
+    let mut guard = level_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if list.is_empty() {
+        guard.remove(&key(root));
+    } else {
+        guard.insert(key(root), list);
+    }
+}
+
+/// The level-inheriting blockers currently published for `root`.
+#[must_use]
+pub fn current_levels(root: &Path) -> Vec<WorkItem> {
+    level_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key(root))
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Give every listed item in `list` its inherited level label (and, when
+/// that raises its level, the source's starred-at); add an unlisted one the
+/// way [`apply_list`] adds an inherited star. Pure given `list`.
+pub fn apply_levels(items: &mut Vec<WorkItem>, list: &[WorkItem]) {
+    for inh in list {
+        if let Some(item) = items.iter_mut().find(|i| i.number == inh.number) {
+            for l in &inh.labels {
+                if crate::operator_levels::by_inherited_label(crate::operator_levels::table(), l)
+                    .is_some()
+                    && !item.labels.contains(l)
+                {
+                    item.labels.push(l.clone());
+                }
+            }
+            continue;
+        }
+        let mut added =
+            crate::work_finder::operator_priority::merge_starred(Vec::new(), vec![inh.clone()]);
+        items.append(&mut added);
     }
 }

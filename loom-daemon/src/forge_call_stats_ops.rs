@@ -49,23 +49,40 @@ impl ForgeOp {
 
 /// `GET repos/{o}/{r}/issues?labels=…` — the ETag-cached issue listings.
 pub const ISSUE_LIST: ForgeOp = ForgeOp::inventoried("issue.list");
+/// `GET repos/{o}/{r}/issues/{n}` — one issue's (or PR's) state and labels.
+pub const ISSUE_VIEW_STATE: ForgeOp = ForgeOp::inventoried("issue.view-state");
+/// The PRs that close a batch of issues (GraphQL `closedByPullRequestsReferences`).
+pub const ISSUE_CLOSED_BY_PULL_REQUESTS: ForgeOp =
+    ForgeOp::inventoried("issue.closed-by-pull-requests");
 /// `GET search/issues` — duplicate/phrase searches.
 pub const ISSUE_SEARCH: ForgeOp = ForgeOp::inventoried("issue.search");
 /// `GET repos/{o}/{r}/issues/{n}/comments`.
 pub const COMMENT_LIST: ForgeOp = ForgeOp::inventoried("comment.list");
 /// `GET repos/{o}/{r}/pulls/{n}` — one PR's decision state (mergeability…).
 pub const PR_VIEW_STATE: ForgeOp = ForgeOp::inventoried("pr.view-state");
+/// `GET repos/{o}/{r}` — default branch / visibility.
+pub const REPO_VIEW: ForgeOp = ForgeOp::inventoried("repo.view");
 /// The closing-issue references of a batch of PRs (GraphQL).
 pub const PR_CLOSING_ISSUE_REFERENCES: ForgeOp =
     ForgeOp::inventoried("pr.closing-issue-references");
+/// `GET repos/{o}/{r}/pulls/{n}/reviews` — one PR's formal reviews.
+pub const REVIEW_LIST_FORMAL: ForgeOp = ForgeOp::inventoried("review.list-formal");
+/// `GET repos/{o}/{r}/commits/{sha}/check-runs` — one commit's check runs.
+pub const CI_CHECK_RUNS_FOR_SHA: ForgeOp = ForgeOp::inventoried("ci.check-runs-for-sha");
 /// `GET repos/{o}/{r}/actions/runs…` (and the jobs of one run).
 pub const CI_WORKFLOW_RUNS_FOR_SHA: ForgeOp = ForgeOp::inventoried("ci.workflow-runs-for-sha");
 /// Job logs, run artifacts and artifact downloads.
 pub const CI_RUN_LOGS_AND_ARTIFACTS: ForgeOp = ForgeOp::inventoried("ci.run-logs-and-artifacts");
 /// `GET orgs/{o}/repos` / `GET users/{u}/repos`.
 pub const REPO_LIST_FOR_OWNER: ForgeOp = ForgeOp::inventoried("repo.list-for-owner");
+/// `GET installation/repositories` — every repo a credential's App
+/// installation reaches (the W8 per-credential snapshot).
+pub const REPO_LIST_FOR_INSTALLATION: ForgeOp = ForgeOp::inventoried("repo.list-for-installation");
 /// Git-database / contents reads of the fleet store.
 pub const GIT_READ_OBJECTS: ForgeOp = ForgeOp::inventoried("git.read-objects");
+/// The default-branch head of a batch of repositories, in one GraphQL query
+/// (the workspace resync's per-tick head check, #10987).
+pub const GIT_DEFAULT_BRANCH_HEADS: ForgeOp = ForgeOp::inventoried("git.default-branch-heads");
 /// Git-database / contents / ref writes of the fleet store.
 pub const GIT_WRITE_REFS_AND_CONTENTS: ForgeOp =
     ForgeOp::inventoried("git.write-refs-and-contents");
@@ -73,19 +90,54 @@ pub const GIT_WRITE_REFS_AND_CONTENTS: ForgeOp =
 pub const TIMELINE_READ: ForgeOp = ForgeOp::inventoried("timeline.read");
 /// `GET rate_limit` — the free budget probe.
 pub const QUOTA_RATE_LIMIT_READING: ForgeOp = ForgeOp::inventoried("quota.rate-limit-reading");
+/// The open PR whose head is a given branch.
+pub const PR_LIST_BY_HEAD: ForgeOp = ForgeOp::inventoried("pr.list-by-head");
+/// `GET repos/{o}/{r}/pulls?state=open` — every open PR (#10382).
+pub const PR_LIST_OPEN: ForgeOp = ForgeOp::inventoried("pr.list-open");
+/// Add / remove labels on one issue or PR (a PR's labels are issue labels).
+pub const ISSUE_EDIT_LABELS: ForgeOp = ForgeOp::inventoried("issue.edit-labels");
+/// `PATCH repos/{o}/{r}/issues/{n}` — replace an issue's (or PR's) body.
+pub const ISSUE_EDIT_BODY: ForgeOp = ForgeOp::inventoried("issue.edit-body");
+/// Post a comment on an issue or PR.
+pub const COMMENT_CREATE: ForgeOp = ForgeOp::inventoried("comment.create");
+/// Edit or delete an existing comment by id.
+pub const COMMENT_EDIT_DELETE: ForgeOp = ForgeOp::inventoried("comment.edit-delete");
+/// A PR's changed-file list.
+pub const PR_DIFF_AND_FILES: ForgeOp = ForgeOp::inventoried("pr.diff-and-files");
+/// Resolve a release and download its artifact (`gh release view|download`).
+pub const RELEASE_RESOLVE_AND_FETCH: ForgeOp = ForgeOp::inventoried("release.resolve-and-fetch");
+
+/// Re-run a workflow run or job in place (`forge rerun`, #10633).
+pub const CI_RERUN: ForgeOp = ForgeOp::inventoried("ci.rerun");
 
 /// Every inventoried constant above — the set the inventory test checks.
 pub const ALL_INVENTORIED: &[ForgeOp] = &[
     ISSUE_LIST,
+    ISSUE_VIEW_STATE,
+    ISSUE_CLOSED_BY_PULL_REQUESTS,
     ISSUE_SEARCH,
     COMMENT_LIST,
     PR_VIEW_STATE,
+    REPO_VIEW,
     PR_CLOSING_ISSUE_REFERENCES,
+    REVIEW_LIST_FORMAL,
+    CI_CHECK_RUNS_FOR_SHA,
     CI_WORKFLOW_RUNS_FOR_SHA,
     CI_RUN_LOGS_AND_ARTIFACTS,
+    CI_RERUN,
     REPO_LIST_FOR_OWNER,
+    REPO_LIST_FOR_INSTALLATION,
     GIT_READ_OBJECTS,
+    GIT_DEFAULT_BRANCH_HEADS,
     GIT_WRITE_REFS_AND_CONTENTS,
     TIMELINE_READ,
     QUOTA_RATE_LIMIT_READING,
+    PR_LIST_BY_HEAD,
+    PR_LIST_OPEN,
+    ISSUE_EDIT_LABELS,
+    ISSUE_EDIT_BODY,
+    COMMENT_CREATE,
+    COMMENT_EDIT_DELETE,
+    PR_DIFF_AND_FILES,
+    RELEASE_RESOLVE_AND_FETCH,
 ];

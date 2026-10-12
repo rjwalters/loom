@@ -4,8 +4,9 @@
 //!
 //! # Reads per pass (only for a repo with at least one starred issue)
 //!
-//! - the ETag-cached `loom:operator-priority` listing (issues **and** PRs:
-//!   Builder copies the star onto its PR, slice B);
+//! - the ETag-cached listing of each level's operator label
+//!   (`loom:operator-priority`, `loom:operator-high-priority`, #10307; issues
+//!   **and** PRs: Builder copies the star onto its PR, slice B);
 //! - the ETag-cached listings for [`PR_LABELS`], to find each starred
 //!   issue's open PR by its closing / `Part of` reference;
 //! - the comments of a starred issue's **approved** PR, only when that PR's
@@ -15,7 +16,10 @@
 //!   the refusal quotes one of the specific forge phrases, one issue search
 //!   for that phrase (repeated each pass only while no open incident is
 //!   known; hits must be trusted-authored and quote it word-bounded);
-//! - one single-issue read per same-repo blocker of a starred issue;
+//! - one single-issue read per same-repo blocker of a starred issue (the
+//!   blocker's state, and its labels when it inherits a star);
+//! - the comments of a `loom:blocked` starred issue whose body names no open
+//!   blocker (#10151): blockers named there, and the stale-block markers;
 //! - the inheritance walk: one single-issue read per same-repo child not
 //!   already read this pass (closed children and PRs included), plus the
 //!   reads of each evaluated child's own same-repo blockers. Together these
@@ -28,12 +32,15 @@ use anyhow::Result;
 
 use super::edges::{self, Edge, EdgeSource, Node, Root};
 use super::forge::StarForge;
+use super::inherited_star::RootState;
 use super::landing::{
     classify, BlockerRef, Capacity, ItemFacts, Landing, MergeRefusal, PrFacts, StarFacts,
     BLOCKED_LABEL,
 };
+use super::materialize::{self, Classified, OwnerCache, Plan};
 use super::progress::{fingerprint, short_hash};
 use super::refusal::{self, Detected};
+use super::stale::{self, CommentFacts};
 use crate::forge_listing::RestIssue;
 use crate::types::{AskKind, CapView, QueueDisposition, ReadyQueueRow};
 use crate::work_finder::{WorkItem, OPERATOR_PRIORITY_LABEL};
@@ -85,6 +92,8 @@ pub struct RefusalCache {
     /// Children the read cap deferred, not yet evaluated, each with the edges
     /// from its starred root down to it.
     deferred: BTreeMap<(String, u32), Vec<Edge>>,
+    /// Who owns each starred issue's star (#10012 §3).
+    owners: OwnerCache,
 }
 
 /// Everything about the repo that is not a forge read.
@@ -120,9 +129,31 @@ pub struct Evaluated {
     pub fingerprint: String,
     /// The issue as a work item (for the inheritance registry).
     pub item: WorkItem,
+    /// The level >= 2 source this row inherits a level from, as
+    /// `owner/repo#N` (#10307; set by [`super::levels`]).
+    pub level_inherited_from: Option<String>,
+    /// The inherited level, when [`Self::level_inherited_from`] is set.
+    pub inherited_level: u8,
+    /// That level's inherited label, from the table the walk used.
+    pub inherited_label: Option<&'static str>,
+    /// The level source's starred-at, when [`Self::level_inherited_from`]
+    /// is set: a row promoted to that level sorts by it (#10307).
+    pub level_requested_at: Option<String>,
 }
 
-fn item_facts(r: &RestIssue) -> ItemFacts {
+impl Evaluated {
+    /// The row's effective operator priority level (#10307): its own level
+    /// labels, an inherited level, or the in-memory inherited star (1).
+    #[must_use]
+    pub fn level(&self) -> u8 {
+        self.item
+            .operator_level()
+            .max(self.inherited_level)
+            .max(u8::from(self.inherited_from.is_some()))
+    }
+}
+
+pub(crate) fn item_facts(r: &RestIssue) -> ItemFacts {
     ItemFacts {
         number: r.number,
         labels: r.labels.clone(),
@@ -133,7 +164,7 @@ fn item_facts(r: &RestIssue) -> ItemFacts {
     }
 }
 
-fn work_item(r: &RestIssue) -> WorkItem {
+pub(crate) fn work_item(r: &RestIssue) -> WorkItem {
     WorkItem::with_created_at(r.number, r.labels.clone(), r.created_at.clone())
         .with_body(r.body.clone())
         .with_updated_at(r.updated_at.clone())
@@ -172,10 +203,17 @@ pub struct Evaluator<'a> {
     issues: HashMap<u32, Option<RestIssue>>,
     prs_by_issue: BTreeMap<u32, RestIssue>,
     propagate: bool,
+    /// Whether the pass plans label writes for the inherited star
+    /// (`autonomous.operatorPriority.materializeLabels`, default on).
+    materialize: bool,
     /// Single-issue forge reads (cache misses) made so far.
     reads: usize,
     /// While set, no read past this count reaches the forge (the walk).
     read_cap: Option<usize>,
+    /// The star writes this pass's walk calls for (#10012 §2–§3), made by
+    /// the caller ([`materialize::apply`]). Empty unless both `propagate`
+    /// and `materialize` are on.
+    pub plan: Plan,
 }
 
 impl<'a> Evaluator<'a> {
@@ -192,8 +230,10 @@ impl<'a> Evaluator<'a> {
             issues: HashMap::new(),
             prs_by_issue: BTreeMap::new(),
             propagate: true,
+            materialize: false,
             reads: 0,
             read_cap: None,
+            plan: Plan::default(),
         }
     }
 
@@ -204,6 +244,21 @@ impl<'a> Evaluator<'a> {
     pub fn with_propagate(mut self, propagate: bool) -> Self {
         self.propagate = propagate;
         self
+    }
+
+    /// Whether the pass plans the inherited star as label writes, and reads
+    /// star owners to do so (`autonomous.operatorPriority.materializeLabels`,
+    /// #10012 §2–§3; the pass passes the setting, on by default). Off — the
+    /// bare `new` — the walk treats every starred issue as a root, plan empty.
+    #[must_use]
+    pub fn with_materialize(mut self, materialize: bool) -> Self {
+        self.materialize = materialize;
+        self
+    }
+
+    /// Whether this pass materializes: `propagate` and `materialize` both on.
+    fn writes_labels(&self) -> bool {
+        self.propagate && self.materialize
     }
 
     /// The children of `parent`: the issues its landing says inherit
@@ -350,7 +405,7 @@ impl<'a> Evaluator<'a> {
         })
     }
 
-    /// The dependency refs [`Self::blockers`] reads, when `issue` is blocked.
+    /// The dependency refs a `loom:blocked` issue's body names.
     fn dependency_refs(&self, issue: &RestIssue) -> Vec<String> {
         if !issue.labels.iter().any(|l| l == BLOCKED_LABEL) {
             return Vec::new();
@@ -367,8 +422,8 @@ impl<'a> Evaluator<'a> {
             .and_then(|n| n.parse::<u32>().ok())
     }
 
-    /// Forge reads [`Self::blockers`] would make for `issue` (its same-repo
-    /// blockers not read yet this pass).
+    /// Forge reads [`Self::blocked_facts`] would make for `issue` from its
+    /// body (its same-repo blockers not read yet this pass).
     fn pending_blocker_reads(&self, issue: &RestIssue) -> usize {
         self.dependency_refs(issue)
             .iter()
@@ -378,39 +433,89 @@ impl<'a> Evaluator<'a> {
             .len()
     }
 
-    fn blockers(&mut self, issue: &RestIssue) -> Vec<BlockerRef> {
-        self.dependency_refs(issue)
-            .into_iter()
-            .map(|r| {
-                let same = self.same_repo_number(&r);
-                match same {
-                    Some(n) if n != issue.number => {
-                        let open = self.issue(n).map(|b| b.state.eq_ignore_ascii_case("open"));
-                        BlockerRef {
-                            display: format!("#{n}"),
-                            number: Some(n),
-                            open,
-                            cross_repo_managed: None,
-                        }
-                    }
-                    Some(_) => BlockerRef {
-                        display: r,
-                        number: None,
-                        open: Some(false),
-                        cross_repo_managed: None,
-                    },
-                    None => {
-                        let slug = r.split('#').next().unwrap_or_default().to_string();
-                        BlockerRef {
-                            display: r,
-                            number: None,
-                            open: None,
-                            cross_repo_managed: Some((self.ctx.managed)(&slug)),
-                        }
-                    }
+    /// One named ref (`owner/repo#N`) as a [`BlockerRef`], its state read
+    /// when it is in this repo.
+    fn blocker_ref(&mut self, r: String, issue: u32) -> BlockerRef {
+        match self.same_repo_number(&r) {
+            Some(n) if n != issue => {
+                let open = self.issue(n).map(|b| b.state.eq_ignore_ascii_case("open"));
+                BlockerRef {
+                    display: format!("#{n}"),
+                    number: Some(n),
+                    open,
+                    cross_repo_managed: None,
                 }
-            })
-            .collect()
+            }
+            Some(_) => BlockerRef {
+                display: r,
+                number: None,
+                open: Some(false),
+                cross_repo_managed: None,
+            },
+            None => {
+                let slug = r.split('#').next().unwrap_or_default().to_string();
+                BlockerRef {
+                    display: r,
+                    number: None,
+                    open: None,
+                    cross_repo_managed: Some((self.ctx.managed)(&slug)),
+                }
+            }
+        }
+    }
+
+    /// The blockers a `loom:blocked` issue names, and what its comments say
+    /// about the block (#10151). The body is read first; only when it names
+    /// no open blocker are the issue's trusted comments read, both for
+    /// blockers named there and for the pass's own stale-block markers.
+    fn blocked_facts(&mut self, issue: &RestIssue) -> (Vec<BlockerRef>, Option<CommentFacts>) {
+        if !issue.labels.iter().any(|l| l == BLOCKED_LABEL) {
+            return (Vec::new(), Some(CommentFacts::default()));
+        }
+        let mut refs: BTreeSet<String> = self.dependency_refs(issue).into_iter().collect();
+        let mut blockers: Vec<BlockerRef> = refs
+            .clone()
+            .into_iter()
+            .map(|r| self.blocker_ref(r, issue.number))
+            .collect();
+        if blockers.iter().any(|b| b.open != Some(false)) {
+            return (blockers, Some(CommentFacts::default()));
+        }
+        // The comments read counts against the walk's read cap like any other
+        // single-issue read; past the cap it is not made, which reads as
+        // "comments unread" (no write this pass).
+        if self.read_cap.is_some_and(|cap| self.reads >= cap) {
+            log::debug!(
+                "star_liveness: {} reached its read cap this pass; comments of #{} not read",
+                self.ctx.slug,
+                issue.number
+            );
+            return (blockers, None);
+        }
+        self.reads += 1;
+        let facts = match self.forge.comments(issue.number) {
+            Ok(comments) => {
+                let me = self.forge.self_login();
+                stale::comment_facts(&comments, me.as_deref())
+            }
+            Err(e) => {
+                log::debug!(
+                    "star_liveness: reading comments of {}#{} failed: {e}",
+                    self.ctx.slug,
+                    issue.number
+                );
+                return (blockers, None);
+            }
+        };
+        for text in &facts.bodies {
+            for r in crate::dep_classify::refs::parse_named_blocker_refs(text, self.ctx.slug) {
+                if refs.insert(r.clone()) {
+                    let b = self.blocker_ref(r, issue.number);
+                    blockers.push(b);
+                }
+            }
+        }
+        (blockers, Some(facts))
     }
 
     fn capacity(&self, n: u32) -> Capacity {
@@ -433,6 +538,68 @@ impl<'a> Evaluator<'a> {
             .filter(|r| r.main_red_fix)
             .map(|r| r.issue)
             .min()
+    }
+
+    /// The state of `root`, the root an inherited star names: starred when it
+    /// is in this pass's starred listing or, closed, still carries an
+    /// operator label (labels are never cleaned on close, AC 5).
+    fn root_state(&mut self, root: u32, listed: &BTreeSet<u32>) -> RootState {
+        if listed.contains(&root) {
+            return RootState::Starred;
+        }
+        match self.issue(root) {
+            Some(i)
+                if crate::operator_levels::own_level_in(
+                    crate::operator_levels::table(),
+                    &i.labels,
+                ) >= 1 =>
+            {
+                RootState::Starred
+            }
+            Some(_) => RootState::Unstarred,
+            None => RootState::Unknown,
+        }
+    }
+
+    /// Whether `issue` names, in its own text, a parent that is still
+    /// starred (or unreadable): a child-side link the walk does not follow,
+    /// checked before an orphaned star is removed.
+    fn has_starred_parent(&mut self, issue: &RestIssue, listed: &BTreeSet<u32>) -> bool {
+        let node = Node {
+            number: issue.number,
+            title: issue.title.as_deref().unwrap_or_default(),
+            body: issue.body.as_deref().unwrap_or_default(),
+            labels: &issue.labels,
+            is_pull_request: issue.is_pull_request,
+        };
+        let parents: Vec<u32> = edges::parent_edges(self.ctx.slug, &node)
+            .into_iter()
+            .map(|e| e.parent)
+            .collect();
+        parents
+            .into_iter()
+            .any(|p| self.root_state(p, listed) != RootState::Unstarred)
+    }
+
+    /// Split the starred listing by owner (#10012 §3). Without
+    /// materialization every starred issue is a root, as before, and no
+    /// owner is read.
+    fn classify(&mut self, issues: &[RestIssue]) -> Classified {
+        let listed: BTreeSet<u32> = issues.iter().map(|i| i.number).collect();
+        if !self.writes_labels() {
+            return Classified {
+                roots: listed,
+                ..Classified::default()
+            };
+        }
+        let known = materialize::owners(
+            self.forge,
+            &mut self.refusals.owners,
+            self.ctx.slug,
+            issues,
+            materialize::MAX_OWNER_READS_PER_PASS,
+        );
+        materialize::classify(&known, |root| self.root_state(root, &listed))
     }
 
     /// One step of the walk onto `child`: skip it when it is known to
@@ -483,13 +650,20 @@ impl<'a> Evaluator<'a> {
         };
         let row = self.tick_row(n);
         let disposition = row.map(|r| r.disposition);
-        let row_starred_at = row.and_then(|r| r.operator_priority_at.clone());
+        // #11508: the ready-queue row no longer carries a starred-at.
+        let row_starred_at: Option<String> = None;
+        let (blockers, comment_facts) = self.blocked_facts(issue);
+        let comments_unread = comment_facts.is_none();
+        let comment_facts = comment_facts.unwrap_or_default();
         let facts = StarFacts {
             repo: self.ctx.slug.to_string(),
             managed: true,
             issue: item_facts(issue),
             pr: pr_facts,
-            blockers: self.blockers(issue),
+            blockers,
+            curator_handoff: comment_facts.handoff,
+            unblocked_before: comment_facts.unblocked,
+            comments_unread,
             red_main_fix: self.red_main_fix(),
             live_sweep: matches!(
                 disposition,
@@ -525,6 +699,10 @@ impl<'a> Evaluator<'a> {
             inherited_from,
             fingerprint: fp,
             item: work_item(issue),
+            level_inherited_from: None,
+            inherited_level: 0,
+            level_requested_at: None,
+            inherited_label: None,
         }
     }
 
@@ -534,20 +712,44 @@ impl<'a> Evaluator<'a> {
     /// # Errors
     /// The starred listing itself failed (nothing can be said about the repo).
     pub fn run(&mut self) -> Result<Vec<Evaluated>> {
-        let starred = self.forge.list_open(OPERATOR_PRIORITY_LABEL)?;
+        // Every operator level's label (#10307): level >= 2 counts as
+        // starred, and a level-2 issue need not also carry the star. The
+        // star's own listing failing still fails the repo, as before.
+        let mut by_number: BTreeMap<u32, RestIssue> = BTreeMap::new();
+        // A failed level listing may hide a root: nothing is unstarred then.
+        let mut listings_complete = true;
+        for label in crate::operator_levels::operator_labels(crate::operator_levels::table()) {
+            let rows = match self.forge.list_open(label) {
+                Ok(rows) => rows,
+                Err(e) if label == OPERATOR_PRIORITY_LABEL => return Err(e),
+                Err(e) => {
+                    log::debug!("star_liveness: listing {label} in {} failed: {e}", self.ctx.slug);
+                    listings_complete = false;
+                    Vec::new()
+                }
+            };
+            for r in rows {
+                by_number.entry(r.number).or_insert(r);
+            }
+        }
+        let starred: Vec<RestIssue> = by_number.into_values().collect();
         let issues: Vec<RestIssue> = starred
             .iter()
             .filter(|r| !r.is_pull_request)
             .cloned()
             .collect();
-        if issues.is_empty() {
+        // Starred open PRs: never roots, but the pass stars the PR of a
+        // starred issue and takes back an inherited PR star (#10591).
+        let starred_prs: Vec<RestIssue> = starred
+            .iter()
+            .filter(|r| r.is_pull_request)
+            .cloned()
+            .collect();
+        if issues.is_empty() && !(self.writes_labels() && !starred_prs.is_empty()) {
             return Ok(Vec::new());
         }
-        let mut prs: BTreeMap<u32, RestIssue> = starred
-            .into_iter()
-            .filter(|r| r.is_pull_request)
-            .map(|r| (r.number, r))
-            .collect();
+        let mut prs: BTreeMap<u32, RestIssue> =
+            starred_prs.iter().map(|r| (r.number, r.clone())).collect();
         for label in PR_LABELS {
             match self.forge.list_open(label) {
                 Ok(rows) => prs.extend(
@@ -569,9 +771,14 @@ impl<'a> Evaluator<'a> {
         for i in &issues {
             self.issues.insert(i.number, Some(i.clone()));
         }
+        // An inherited star is walked as a child of its root, not as a root
+        // of its own (#10012 §3).
+        let owned: Vec<RestIssue> = issues.iter().chain(&starred_prs).cloned().collect();
+        let classified = self.classify(&owned);
 
         let mut out: Vec<Evaluated> = issues
             .iter()
+            .filter(|i| classified.roots.contains(&i.number))
             .map(|i| self.evaluate_one(i, None, None))
             .collect();
         let roots: Vec<Root> = out
@@ -587,7 +794,7 @@ impl<'a> Evaluator<'a> {
         // decides, per child, which starred ancestor it inherits from
         // (earliest starred-at). Every open child inherits, not only the
         // first one named (#10012).
-        let mut seen: BTreeSet<u32> = issues.iter().map(|i| i.number).collect();
+        let mut seen: BTreeSet<u32> = classified.roots.clone();
         let mut found: Vec<Evaluated> = Vec::new();
         let mut graph: Vec<Edge> = Vec::new();
         // Nodes to expand, by depth: a deferred child resumed below joins its
@@ -693,16 +900,157 @@ impl<'a> Evaluator<'a> {
             }
         }
         self.read_cap = None;
+        let walk_complete =
+            listings_complete && !self.refusals.deferred.keys().any(|(s, _)| *s == slug);
         let open: BTreeSet<u32> = found.iter().map(|e| e.facts.issue.number).collect();
         graph.retain(|e| open.contains(&e.child));
         let inherited = edges::descendants(&roots, &graph, MAX_INHERIT_DEPTH);
+        // Only a parent/child link the issue text records materializes as
+        // the label (#10012 §1). A landing-only edge (a blocker named in a
+        // comment, a merge refusal's incident, the red-main fix) is a
+        // transient liveness fact: it orders the work in memory but never
+        // writes a lasting star.
+        let structural: Vec<Edge> = graph
+            .iter()
+            .filter(|e| e.source != EdgeSource::LandingBlocker)
+            .copied()
+            .collect();
+        let materialized = edges::descendants(&roots, &structural, MAX_INHERIT_DEPTH);
+        let mut unreached: BTreeMap<u32, Evaluated> = BTreeMap::new();
+        // (issue, root, starred_at) for each starred row this pass keeps — a
+        // root, a child reached by a recorded link, or an inherited star kept
+        // without being walked: its open PR inherits the star too.
+        let mut pr_targets: Vec<(u32, u32, Option<String>)> = Vec::new();
+        for r in &roots {
+            let carries = issues.iter().any(|i| {
+                i.number == r.number && i.labels.iter().any(|l| l == OPERATOR_PRIORITY_LABEL)
+            });
+            if carries {
+                pr_targets.push((r.number, r.number, r.starred_at.clone()));
+            }
+        }
         for mut e in found {
-            let Some(inh) = inherited.get(&e.facts.issue.number) else {
+            let n = e.facts.issue.number;
+            let Some(inh) = inherited.get(&n) else {
+                unreached.insert(n, e);
                 continue;
             };
+            if let Some(m) = materialized.get(&n) {
+                pr_targets.push((n, m.root, m.starred_at.clone()));
+            } else if let Some(&root) = classified.held.get(&n) {
+                // Reached only by a landing edge, but it carries an inherited
+                // star of its own: the PR names that star's root.
+                pr_targets.push((n, root, e.starred_at.clone()));
+            }
+            if let Some(m) = materialized.get(&n).filter(|_| {
+                self.writes_labels()
+                    && !e
+                        .facts
+                        .issue
+                        .labels
+                        .iter()
+                        .any(|l| l == OPERATOR_PRIORITY_LABEL)
+            }) {
+                self.plan.adds.push(materialize::Add {
+                    child: n,
+                    root: m.root,
+                    starred_at: m.starred_at.clone(),
+                });
+            }
             e.inherited_from = Some(inh.via);
             e.starred_at = inh.starred_at.clone().or(e.starred_at);
+            super::landing::withhold_inherited_handoff(&e.facts, &mut e.landing, inh.via, inh.root);
             out.push(e);
+        }
+        // An inherited star nothing reaches: removed when its root lost its
+        // star and the walk saw everything, else kept as a starred row.
+        let listed: BTreeSet<u32> = issues.iter().map(|i| i.number).collect();
+        let roots_at: BTreeMap<u32, Option<String>> = roots
+            .iter()
+            .map(|r| (r.number, r.starred_at.clone()))
+            .collect();
+        for i in &issues {
+            let n = i.number;
+            if classified.roots.contains(&n) || inherited.contains_key(&n) {
+                continue;
+            }
+            // The kept row's PR inherits the star from the same root its own
+            // marker names — never from the child as a new root (#10591).
+            let mut pr_root = classified.held.get(&n).copied();
+            if let Some(&root) = classified.orphaned.get(&n) {
+                // Only an orphaned star a still-starred parent keeps passes
+                // its star on; one kept only because the walk was incomplete
+                // is on its way out.
+                let wants_pr = self.writes_labels()
+                    && self
+                        .prs_by_issue
+                        .get(&n)
+                        .is_some_and(|pr| !pr.labels.iter().any(|l| l == OPERATOR_PRIORITY_LABEL));
+                let parent_starred =
+                    (walk_complete || wants_pr) && self.has_starred_parent(i, &listed);
+                if walk_complete && !parent_starred {
+                    self.plan
+                        .removes
+                        .push(materialize::Remove { child: n, root });
+                    continue;
+                }
+                if parent_starred {
+                    pr_root = Some(root);
+                }
+            }
+            let e = match unreached.remove(&n) {
+                Some(e) => e,
+                None => self.evaluate_one(i, None, None),
+            };
+            if let Some(root) = pr_root {
+                let at = roots_at
+                    .get(&root)
+                    .cloned()
+                    .flatten()
+                    .or_else(|| e.starred_at.clone());
+                pr_targets.push((n, root, at));
+            }
+            out.push(e);
+        }
+        if self.writes_labels() {
+            let mut planned: BTreeSet<u32> = BTreeSet::new();
+            for (n, root, starred_at) in pr_targets {
+                let Some(pr) = self.prs_by_issue.get(&n) else {
+                    continue;
+                };
+                if pr.labels.iter().any(|l| l == OPERATOR_PRIORITY_LABEL)
+                    || !planned.insert(pr.number)
+                {
+                    continue;
+                }
+                self.plan.adds.push(materialize::Add {
+                    child: pr.number,
+                    root,
+                    starred_at,
+                });
+            }
+        }
+        self.plan.adds.sort_by_key(|a| a.child);
+        // An inherited PR star whose root lost its star, whose linked issue
+        // is neither starred nor inherited (an issue this pass is taking the
+        // star off counts as neither), after a complete walk. A star the
+        // operator owns (or whose owner is unread) is never touched.
+        if walk_complete {
+            let removed: BTreeSet<u32> = self.plan.removes.iter().map(|r| r.child).collect();
+            for pr in &starred_prs {
+                let Some(&root) = classified.orphaned.get(&pr.number) else {
+                    continue;
+                };
+                let alive = linked_issues(pr).into_iter().any(|n| {
+                    inherited.contains_key(&n) || (listed.contains(&n) && !removed.contains(&n))
+                });
+                if !alive {
+                    self.plan.removes.push(materialize::Remove {
+                        child: pr.number,
+                        root,
+                    });
+                }
+            }
         }
         Ok(out)
     }
@@ -730,5 +1078,9 @@ pub fn unmanaged(slug: &str, number: u32, starred_at: Option<String>) -> Evaluat
         inherited_from: None,
         fingerprint: String::new(),
         item: WorkItem::new(number, Vec::new()),
+        level_inherited_from: None,
+        inherited_level: 0,
+        level_requested_at: None,
+        inherited_label: None,
     }
 }

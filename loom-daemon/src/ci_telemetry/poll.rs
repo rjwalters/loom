@@ -40,12 +40,13 @@ use super::ledger::{Ledger, PendingUnit, UnitDraft, UnitKey, COMPACT_THRESHOLD_B
 use super::logs::{self, LogTarget};
 use super::owners::{discover, resolve_kind, KindCache, Owner, OwnerStatus};
 use super::records::{
-    envelope_identity, job_envelopes_with_reason, run_envelopes, JobCreationBaselines, JobJson,
-    JobsPage, RepoJson, RunJson, RunsPage,
+    job_envelopes_with_reason, run_envelopes, JobCreationBaselines, JobJson, JobsPage, RepoJson,
+    RunJson, RunsPage,
 };
 use super::state::{self, CycleLock, CycleSummary, PollStatus};
 use super::story::{self, RepoIdentityFn, RepoStories, Stitch};
 use super::{journal_path, log_capture_gate, state_dir, LogCaptureGate, ResolvedCiTelemetry};
+use crate::telemetry::TelemetryEnvelope;
 
 pub mod targeted;
 
@@ -427,7 +428,7 @@ fn run_locked(
     if let Some(until) = status.backoff_until.filter(|until| *until > ctx.now) {
         return Err(CycleError::BackingOff { until: Some(until) });
     }
-    if crate::rate_limit_breaker::global_is_suppressed() {
+    if crate::rate_limit_breaker::global_skip_pass("ci_telemetry") {
         return Err(CycleError::BackingOff { until: None });
     }
 
@@ -627,13 +628,13 @@ fn recover(ledger: &mut Ledger, journal: &Journal) -> io::Result<usize> {
     if pending.is_empty() {
         return Ok(0);
     }
-    let present = journal.identities()?;
-    let missing: Vec<_> = pending
+    // #11045: streamed, and bounded by the pending envelopes — never a
+    // whole-journal identity set.
+    let wanted: Vec<TelemetryEnvelope> = pending
         .iter()
-        .flat_map(|unit| unit.envelopes.iter())
-        .filter(|env| envelope_identity(env).is_none_or(|id| !present.contains(&id)))
-        .cloned()
+        .flat_map(|unit| unit.envelopes.iter().cloned())
         .collect();
+    let missing = journal.missing(&wanted)?;
     log::info!(
         "ci_telemetry: recovering {} committed-but-unconfirmed unit(s) ({} envelope(s) missing from the journal)",
         pending.len(),
@@ -647,12 +648,21 @@ fn recover(ledger: &mut Ledger, journal: &Journal) -> io::Result<usize> {
 }
 
 /// Follow `rel="next"` from `first`, collecting each page's parsed items.
+///
+/// Every page is read for `repo` (else the repo `first` names): GitHub spells
+/// page 2+ of a repo listing as `repositories/<id>/…`, which names no repo,
+/// so without it those pages would leave the repo's reader App for the
+/// writer and be accounted under no repo.
 pub(super) fn paginate<T>(
     api: &dyn GithubApi,
+    repo: Option<&str>,
     first: String,
     requests: &mut usize,
     parse: impl Fn(&str) -> Result<Vec<T>, serde_json::Error>,
 ) -> Result<Vec<T>, ApiError> {
+    let repo = repo
+        .map(str::to_string)
+        .or_else(|| super::api::repo_of_path(&first));
     let mut items = Vec::new();
     let mut visited = HashSet::new();
     let mut next = Some(first);
@@ -661,7 +671,7 @@ pub(super) fn paginate<T>(
             break;
         }
         *requests += 1;
-        let response = api.get(&path, None)?;
+        let response = api.get_in(repo.as_deref(), &path, None)?;
         items.extend(parse(&response.body).map_err(|e| ApiError::Parse {
             path: path.clone(),
             detail: e.to_string(),
@@ -758,7 +768,7 @@ fn poll_repo(
     let watermark = recorded.unwrap_or(ctx.now - ctx.initial_lookback);
     let floor = runs_floor(recorded, ctx.now, ctx.initial_lookback, ctx.rescan_window);
     let mut runs: Vec<RunJson> =
-        paginate(api, runs_path(full, floor), &mut report.summary.requests, |body| {
+        paginate(api, Some(full), runs_path(full, floor), &mut report.summary.requests, |body| {
             serde_json::from_str::<RunsPage>(body).map(|p| p.workflow_runs)
         })?;
     runs.sort_by_key(|r| (r.created_at, r.id));
@@ -852,7 +862,7 @@ fn record_run(
         return Ok(RunOutcome::Seen);
     }
     let jobs: Vec<JobJson> =
-        paginate(api, jobs_path(full, run.id), &mut report.summary.requests, |body| {
+        paginate(api, Some(full), jobs_path(full, run.id), &mut report.summary.requests, |body| {
             serde_json::from_str::<JobsPage>(body).map(|p| p.jobs)
         })?;
     if jobs.iter().any(|job| !job.is_completed()) {

@@ -204,3 +204,50 @@ case "$*" in *issues*) echo '[]';; *) cat pulls.json;; esac"#,
     assert_eq!(skipped, Ok(false));
     assert_eq!(disabled, Ok(false));
 }
+
+/// #10307: every role drains by effective level, highest first. An
+/// inherited level counts like the operator's own, and the reason stays
+/// `operator-priority` with the level beside it.
+#[test]
+fn every_role_drains_level_two_before_the_star_before_ordinary_work() {
+    for (role, label) in [
+        (PrRole::Judge, "loom:review-requested"),
+        (PrRole::Doctor, "loom:changes-requested"),
+        (PrRole::Champion, "loom:pr"),
+    ] {
+        let rows = vec![
+            pr(1, "interactive", &[label]),
+            pr(2, "autonomous", &[label, "loom:operator-priority"]),
+            pr(3, "autonomous", &[label, "loom:high-priority-inherited"]),
+            pr(4, "autonomous", &[label, "loom:operator-high-priority"]),
+        ];
+        for prefer in [true, false] {
+            let out = ordered_queue(rows.clone(), role, prefer, &policy());
+            assert_eq!(ids(&out), vec![3, 4, 2, 1], "{role:?} prefer={prefer}");
+            assert_eq!(out[0]["operatorPriorityLevel"], 2);
+            assert_eq!(out[0]["priorityReason"], "operator-priority");
+            assert_eq!(out[2]["operatorPriorityLevel"], 1);
+            assert_eq!(out[3]["operatorPriorityLevel"], 0);
+        }
+    }
+}
+
+/// #10307 AC: a level-3 row in the table is enough for the PR queue to read
+/// level 3 above level 2 (the level key is generic over the table).
+#[test]
+fn a_level_three_row_orders_above_level_two() {
+    let mut table = crate::operator_levels::LEVELS.to_vec();
+    table.push(crate::operator_levels::PriorityLevel {
+        level: 3,
+        glyph: "⭐⭐⭐",
+        name: "operator top priority",
+        operator_label: "loom:operator-top-priority",
+        inherited_label: Some("loom:top-priority-inherited"),
+        default_cap: Some(2),
+    });
+    let two = pr(1, "autonomous", &["loom:pr", "loom:operator-high-priority"]);
+    let three = pr(2, "autonomous", &["loom:pr", "loom:top-priority-inherited"]);
+    assert_eq!(operator_level_in(&table, &two), 2);
+    assert_eq!(operator_level_in(&table, &three), 3);
+    assert_eq!(operator_level(&three), 0, "unknown to the production table");
+}

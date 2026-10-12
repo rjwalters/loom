@@ -665,3 +665,164 @@ fn section_five_null_guards_every_job_sourced_column() {
          returns nothing"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Section 18 (#10670): main's cancellations, split by whether the run started.
+// ---------------------------------------------------------------------------
+
+/// A repository the shared fixture never seeds, so section 18's counts here
+/// come only from [`MAIN_CANCEL_ROWS`].
+const MAIN_REPO: &str = "synthetic/ci-main";
+
+/// One `ci.run` row (and, per `jobs`, its `ci.job` rows) for [`MAIN_REPO`].
+fn main_run(
+    run_id: u64,
+    attempt: u32,
+    event: &str,
+    git_ref: &str,
+    conclusion: &str,
+    jobs: &[u64],
+) -> String {
+    let mut out = format!(
+        "(1789992000000000000, 'ci.run', \
+         {{'loom.repo': '{MAIN_REPO}', 'loom.ci.workflow': 'CI', 'loom.ci.conclusion': '{conclusion}', \
+           'loom.ci.event': '{event}', 'loom.ci.ref': '{git_ref}'}}, \
+         {{'loom.ci.run_id': {run_id}, 'loom.ci.run_attempt': {attempt}}}, {{}}, {{}})"
+    );
+    for job_id in jobs {
+        out.push_str(&format!(
+            ",\n(1789992000000000000, 'ci.job', \
+             {{'loom.repo': '{MAIN_REPO}', 'loom.ci.workflow': 'CI', 'loom.ci.job': 'Build', \
+               'loom.ci.conclusion': 'cancelled'}}, \
+             {{'loom.ci.run_id': {run_id}, 'loom.ci.attempts': {attempt}, 'loom.ci.job_id': {job_id}}}, \
+             {{'loom.ci.timed_out': false}}, {{}})"
+        ));
+    }
+    out
+}
+
+/// The scenario #10670 describes, plus the rows section 18 must exclude.
+fn main_cancel_rows() -> String {
+    let rows = [
+        // The oldest run: it ran and finished.
+        main_run(5001, 1, "push", "main", "success", &[80001]),
+        // Pending runs superseded by the concurrency bound: no job at all.
+        // 5003 is delivered twice (at-least-once) and must count once.
+        main_run(5002, 1, "push", "main", "cancelled", &[]),
+        main_run(5003, 1, "push", "main", "cancelled", &[]),
+        main_run(5003, 1, "push", "main", "cancelled", &[]),
+        // A STARTED main run that was cancelled: the rule-2 violation.
+        main_run(5004, 1, "push", "main", "cancelled", &[80004, 80005]),
+        // A red main run, `refs/heads/main` spelling.
+        main_run(5007, 1, "push", "refs/heads/main", "failure", &[80007]),
+        // Attempt 2 of a run whose attempt 1 started: the attempts are
+        // separate rows, and attempt 2 (no job) is superseded, not started.
+        main_run(5008, 1, "push", "main", "failure", &[80008]),
+        main_run(5008, 2, "push", "main", "cancelled", &[]),
+        // Excluded: a superseded PR run, and a push to a non-default branch.
+        main_run(5005, 1, "pull_request", "feature/issue-1", "cancelled", &[80050]),
+        main_run(5006, 1, "push", "feature/issue-2", "cancelled", &[80060]),
+    ];
+    format!(
+        "INSERT INTO signoz_logs.logs_v2 \
+         (timestamp, body, attributes_string, attributes_number, attributes_bool, resources_string) VALUES\n{};",
+        rows.join(",\n")
+    )
+}
+
+/// Section 18, located by the `main_runs` CTE no other section declares.
+fn section_eighteen() -> String {
+    let found: Vec<String> = statements(CI_QUERIES)
+        .into_iter()
+        .filter(|s| s.contains("main_runs AS"))
+        .collect();
+    assert_eq!(
+        found.len(),
+        1,
+        "exactly one statement in ci-queries.sql declares the main_runs CTE; found {}",
+        found.len()
+    );
+    found.into_iter().next().unwrap()
+}
+
+fn section_eighteen_rows(sql: &str) -> Vec<Row> {
+    clickhouse(&format!("{FIXTURE}\n{}\n{sql};", main_cancel_rows()), MAIN_REPO)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).expect("JSONEachRow line"))
+        .collect()
+}
+
+/// A pending run the concurrency bound superseded (no job) and a started run
+/// that was cancelled (has a job) land in different columns, so a regression
+/// to #7779's "cancel every in-progress main run" shows as a non-zero
+/// `cancelled_after_start` instead of hiding inside a high cancel rate.
+#[test]
+#[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
+fn section_eighteen_separates_superseded_from_started_cancellations() {
+    let rows = section_eighteen_rows(&section_eighteen());
+    assert_eq!(rows.len(), 1, "one row for {MAIN_REPO}/CI: {rows:?}");
+    let r = &rows[0];
+    assert_eq!(text(r, "repo"), Some(MAIN_REPO));
+    assert_eq!(text(r, "workflow"), Some("CI"));
+    // 5001, 5002, 5003 (once), 5004, 5007, 5008#1, 5008#2. Not 5005 (PR) or
+    // 5006 (other branch).
+    assert_eq!(num(r, "runs"), Some(7), "{r:?}");
+    assert_eq!(num(r, "success"), Some(1), "{r:?}");
+    assert_eq!(num(r, "failed"), Some(2), "{r:?}");
+    assert_eq!(num(r, "cancelled"), Some(4), "{r:?}");
+    assert_eq!(num(r, "superseded_before_start"), Some(3), "{r:?}");
+    assert_eq!(num(r, "cancelled_after_start"), Some(1), "{r:?}");
+    assert_eq!(num(r, "unreported"), Some(0), "{r:?}");
+    let ratio = |k: &str| {
+        r[k].as_f64()
+            .unwrap_or_else(|| panic!("{k} not a number: {r:?}"))
+    };
+    assert!((ratio("cancelled_ratio") - 0.571).abs() < 1e-9, "{r:?}");
+    assert!((ratio("verified_ratio") - 0.429).abs() < 1e-9, "{r:?}");
+}
+
+/// A run whose `ci.run` record lands just after `since` but whose job record
+/// is stamped just before it still reads as STARTED: `run_jobs` looks back a
+/// day before `since`, so the job join is not cut at the window edge.
+#[test]
+#[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
+fn section_eighteen_keeps_jobs_stamped_just_before_since() {
+    // SINCE (2026-09-20 00:00:00 UTC) is 1789862400; the run lands 1 min
+    // after it, its job 1 h before it.
+    let edge = format!(
+        "INSERT INTO signoz_logs.logs_v2 \
+         (timestamp, body, attributes_string, attributes_number, attributes_bool, resources_string) VALUES\n\
+         (1789862460000000000, 'ci.run', \
+          {{'loom.repo': '{MAIN_REPO}', 'loom.ci.workflow': 'CI', 'loom.ci.conclusion': 'cancelled', \
+            'loom.ci.event': 'push', 'loom.ci.ref': 'main'}}, \
+          {{'loom.ci.run_id': 5009, 'loom.ci.run_attempt': 1}}, {{}}, {{}}),\n\
+         (1789858800000000000, 'ci.job', \
+          {{'loom.repo': '{MAIN_REPO}', 'loom.ci.workflow': 'CI', 'loom.ci.job': 'Build', \
+            'loom.ci.conclusion': 'cancelled'}}, \
+          {{'loom.ci.run_id': 5009, 'loom.ci.attempts': 1, 'loom.ci.job_id': 80009}}, \
+          {{'loom.ci.timed_out': false}}, {{}});"
+    );
+    let rows: Vec<Row> = clickhouse(
+        &format!("{FIXTURE}\n{}\n{edge}\n{};", main_cancel_rows(), section_eighteen()),
+        MAIN_REPO,
+    )
+    .lines()
+    .filter(|l| !l.trim().is_empty())
+    .map(|l| serde_json::from_str(l).expect("JSONEachRow line"))
+    .collect();
+    assert_eq!(num(&rows[0], "cancelled_after_start"), Some(2), "{rows:?}");
+    assert_eq!(num(&rows[0], "superseded_before_start"), Some(3), "{rows:?}");
+}
+
+/// The run-attempt join key is load-bearing: joining on run_id alone would
+/// let attempt 1's job mark attempt 2 (never started) as started.
+#[test]
+#[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
+fn section_eighteen_joins_on_the_run_attempt() {
+    let sql = section_eighteen();
+    let from = " AND j.run_attempt = r.run_attempt";
+    assert!(sql.contains(from), "section 18 no longer joins on the run attempt");
+    let rows = section_eighteen_rows(&sql.replacen(from, "", 1));
+    assert_eq!(num(&rows[0], "cancelled_after_start"), Some(2), "{rows:?}");
+}

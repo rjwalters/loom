@@ -7,7 +7,9 @@
 //!
 //! - `Command::new("gh")` — a literal program name;
 //! - `Command::new(gh…)` — a `gh` / `gh_bin…` variable, field
-//!   (`&self.gh_bin`), or call (`gh_bin()`), with optional `&` / `*`;
+//!   (`&self.gh_bin`), or call (`gh_bin()`), with optional `&` / `*` and an
+//!   optional path prefix (`crate::gh_invocation::gh_bin()` — #10089: the
+//!   resolver call spelled with its module path used to slip past the scan);
 //! - `fn gh_bin…` — a private resolver (`gh_bin`, `gh_bin_env`,
 //!   `gh_bin_or_default`, …).
 //!
@@ -51,7 +53,7 @@ const ALLOWLIST: &str = "tests/fixtures/gh-spawn-allowlist.txt";
 
 fn raw_site_regex() -> Regex {
     Regex::new(
-        r#"Command::new\(\s*"gh"\s*\)|Command::new\(\s*[&*]*\s*(?:self\.)?(?:gh|gh_bin\w*)\b|\bfn\s+gh_bin\w*\b"#,
+        r#"Command::new\(\s*"gh"\s*\)|Command::new\(\s*[&*]*\s*(?:[A-Za-z_]\w*::)*(?:self\.)?(?:gh|gh_bin\w*)\b|\bfn\s+gh_bin\w*\b"#,
     )
     .expect("valid regex")
 }
@@ -198,12 +200,14 @@ fn the_scan_flags_every_raw_site_shape() {
         let e = std::process::Command::new(&self.gh_bin);
         let f = tokio::process::Command::new(&gh);
         let g = Command::new( *gh );
+        let h = Command::new(crate::gh_invocation::gh_bin());
+        let i = tokio::process::Command::new(loom_daemon::forge_cmd::gh_bin());
         fn gh_bin() -> String { String::new() }
         pub fn gh_bin_env() -> String { String::new() }
         fn gh_bin_or_default(&self) -> PathBuf { PathBuf::new() }
 "#;
     let hits = scan(raw);
-    assert_eq!(hits.len(), 10, "every shape must be flagged: {hits:?}");
+    assert_eq!(hits.len(), 12, "every shape must be flagged: {hits:?}");
 }
 
 #[test]
@@ -214,6 +218,8 @@ fn the_scan_respects_word_boundaries_and_comments() {
         let c = Command::new("git");
         let d = Command::new(&self.gh_path_like);
         let e = Command::new(launcher);
+        let f = Command::new(crate::paths::git_bin());
+        let g = Command::new(crate::ghost::bin());
         fn ghbin() {}
         // Command::new("gh") in prose is not a site.
         //! nor is `fn gh_bin` in a doc comment.

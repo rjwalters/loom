@@ -82,6 +82,8 @@ fn a_checked_only_checklist_still_asks_and_lists_the_accepted_forms() {
         ),
     );
     world.add(slug, issue_with_body(11, &["loom:issue"], ""));
+    // Curator was already handed it once (#10151), and it came back blocked.
+    world.comment(slug, 10, crate::star_liveness::stale::HANDOFF_MARKER);
     let repos = vec![repo_input(slug)];
     let r = Host::new("host-a").pass(&world, &repos, Vec::new(), t(10, 0));
 

@@ -204,6 +204,74 @@ fn numbers<'t>(refs: impl Iterator<Item = &'t str>, slug: &str) -> BTreeSet<u32>
     refs.filter_map(|r| same_repo_number(r, slug)).collect()
 }
 
+/// Every reference a `<!-- loom:park … -->` record in `body` names (its
+/// `reason="…"` text excluded), in any repo, as written.
+#[must_use]
+pub fn park_refs(body: &str) -> Vec<String> {
+    park_re()
+        .captures_iter(body)
+        .filter_map(|c| c.get(1))
+        .flat_map(|m| {
+            let inner = park_reason_re().replace_all(m.as_str(), "").into_owned();
+            ref_re()
+                .find_iter(&inner)
+                .map(|r| r.as_str().to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// The `(owner/repo, N)` a reference names, any repo: `#N` is `slug`'s,
+/// `owner/repo#N` and an issues URL name their own. `None` for anything
+/// else. The repo keeps the case it was written in.
+#[must_use]
+pub fn ref_target(reference: &str, slug: &str) -> Option<(String, u32)> {
+    let r = reference.trim();
+    if let Some(n) = same_repo_number(r, slug) {
+        return Some((slug.to_string(), n));
+    }
+    let (repo, num) = if let Some(rest) = r
+        .strip_prefix("https://")
+        .or_else(|| r.strip_prefix("http://"))
+    {
+        let mut parts = rest.split('/');
+        let _host = parts.next()?;
+        let owner = parts.next()?;
+        let name = parts.next()?;
+        if parts.next()? != "issues" {
+            return None;
+        }
+        (format!("{owner}/{name}"), parts.next()?)
+    } else {
+        let (repo, num) = r.split_once('#')?;
+        (repo.to_string(), num)
+    };
+    if !repo.contains('/') {
+        return None;
+    }
+    let n: u32 = num.parse().ok().filter(|n| *n > 0)?;
+    Some((repo, n))
+}
+
+/// Whether an edge of this kind carries an operator priority **level**
+/// (#10307): the explicit blocking and sequencing links the issue names
+/// (park records, dependency phrases, liveness blockers, epic phase
+/// markers, `Part of`). Containment alone never does — a task-list entry, a
+/// native sub-issue, a parent marker or a title prefix — so raising an epic
+/// to level 2 does not pull its children in and undo the cap. The plain
+/// star's propagation (#10012) is unaffected.
+#[must_use]
+pub fn blocks_for_level(source: EdgeSource) -> bool {
+    matches!(
+        source,
+        EdgeSource::ParkRecord
+            | EdgeSource::BlockedBy
+            | EdgeSource::LandingBlocker
+            | EdgeSource::EpicPhase
+            | EdgeSource::PartOf
+    )
+}
+
 /// Children `node` names in its own body, as P (park records, dependency
 /// phrases when it is `loom:blocked`, task-list entries), ascending by number.
 #[must_use]
@@ -217,17 +285,9 @@ pub fn child_edges(slug: &str, node: &Node<'_>) -> Vec<Edge> {
             source,
         }));
     };
-    let park: BTreeSet<u32> = park_re()
-        .captures_iter(node.body)
-        .filter_map(|c| c.get(1))
-        .flat_map(|m| {
-            let inner = park_reason_re().replace_all(m.as_str(), "").into_owned();
-            ref_re()
-                .find_iter(&inner)
-                .map(|r| r.as_str().to_string())
-                .collect::<Vec<_>>()
-        })
-        .filter_map(|r| same_repo_number(&r, slug))
+    let park: BTreeSet<u32> = park_refs(node.body)
+        .iter()
+        .filter_map(|r| same_repo_number(r, slug))
         .collect();
     push(park, EdgeSource::ParkRecord);
     if node.labels.iter().any(|l| l == BLOCKED_LABEL) {

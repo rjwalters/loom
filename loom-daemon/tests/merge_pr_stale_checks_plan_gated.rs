@@ -32,41 +32,45 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-/// A mock `gh` answering the three `api` calls `live_inputs` makes, emitting
-/// POST-`--jq` output (real `gh` applies the filter itself):
+/// A mock `gh` answering the `api` calls `live_inputs` makes. The REST reads
+/// are conditional since #11418, so they come with `--include` and get an
+/// HTTP status line before the JSON body; the GraphQL read keeps `--jq` and
+/// gets POST-filter output (real `gh` applies the filter itself):
 ///
-/// - `repos/…/commits/<base>` → `<sha>\t<committer date>`
-/// - `repos/…/rules/branches/<base>` → one context per line, or the failure
-///   named by `MOCK_RULES_RC` / `MOCK_RULES_STDERR`
+/// - `repos/…/commits/<base>` → `{sha, commit.committer.date}`
+/// - `repos/…/rules/branches/<base>` → the rules array (`MOCK_RULES_OUT`), or
+///   the failure named by `MOCK_RULES_RC` / `MOCK_RULES_STDERR`
 /// - `graphql` → one classic context per line
-/// - `repos/…/commits/<sha>/check-runs` → the projected `{total_count,
-///   check_runs}` rollup, one such object per page (#8987: the projection keeps
-///   `total_count` so a read short of the forge's own count fails closed, and
-///   `--paginate` makes a real read arrive as one object per page)
+/// - `repos/…/commits/<sha>/check-runs` → the `{total_count, check_runs}`
+///   rollup
 fn write_mock_gh(dir: &Path) -> PathBuf {
     let path = dir.join("gh");
     std::fs::write(
         &path,
         r#"#!/bin/sh
 [ "$1" = "api" ] || exit 1
-case "$2" in
+shift
+inc=""
+[ "$1" = "--include" ] && { inc=1; shift; }
+ok() { [ -n "$inc" ] && printf 'HTTP/2.0 200 OK\r\n\r\n'; printf '%s' "$1"; }
+case "$1" in
   graphql)
     [ "${MOCK_CLASSIC_RC:-0}" = 0 ] || { printf '%s\n' "${MOCK_CLASSIC_STDERR:-}" >&2; exit "$MOCK_CLASSIC_RC"; }
     printf '%s' "${MOCK_CLASSIC_OUT:-}"
     ;;
   *rules/branches/*)
     [ "${MOCK_RULES_RC:-0}" = 0 ] || { printf '%s\n' "${MOCK_RULES_STDERR:-}" >&2; exit "$MOCK_RULES_RC"; }
-    printf '%s' "${MOCK_RULES_OUT:-}"
+    ok "${MOCK_RULES_OUT:-[]}"
     ;;
   *check-runs*)
     if [ -n "${MOCK_RUNS_OUT:-}" ]; then
-      printf '%s' "$MOCK_RUNS_OUT"
+      ok "$MOCK_RUNS_OUT"
     else
-      printf '{"total_count":0,"check_runs":[]}'
+      ok '{"total_count":0,"check_runs":[]}'
     fi
     ;;
   *commits/*)
-    printf '%s\t%s\n' "${MOCK_TIP_SHA:-abc123}" "${MOCK_TIP_DATE:-2026-09-18T11:45:21Z}"
+    ok "{\"sha\":\"${MOCK_TIP_SHA:-abc123}\",\"commit\":{\"committer\":{\"date\":\"${MOCK_TIP_DATE:-2026-09-18T11:45:21Z}\"}}}"
     ;;
   *) exit 1 ;;
 esac
@@ -112,6 +116,10 @@ fn run(env: &[(&str, &str)]) -> Output {
     ])
     .current_dir(dir.path())
     .env("LOOM_GH_BIN", &gh)
+    .env("LOOM_GH_NO_POLICY_LAUNCHER", "1")
+    // Hermetic: a private ETag store / hold file, and no request spacing.
+    .env("LOOM_LISTING_CACHE_DIR", dir.path().join("store"))
+    .env("LOOM_STALE_CHECKS_MIN_GAP_MS", "0")
     .env("MOCK_RUNS_OUT", STALE_GREEN_RUNS);
     for (k, v) in env {
         cmd.env(k, v);
@@ -216,7 +224,10 @@ fn a_plan_gated_source_does_not_silence_the_other_ones_required_check() {
 /// requiring the check still blocks on the incident's stale green run.
 #[test]
 fn the_ungated_path_is_unchanged() {
-    let out = run(&[("MOCK_RULES_OUT", "File Size Ratchet\n")]);
+    let out = run(&[(
+        "MOCK_RULES_OUT",
+        r#"[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"File Size Ratchet"}]}}]"#,
+    )]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(out.status.code(), Some(1), "stdout: {stdout}");
     assert!(stdout.contains("File Size Ratchet"), "stdout: {stdout}");

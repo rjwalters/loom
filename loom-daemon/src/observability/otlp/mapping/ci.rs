@@ -198,6 +198,7 @@ mod tests {
                 assert!(
                     kv.key.starts_with("loom.ci.")
                         || kv.key == "loom.record_id"
+                        || kv.key == "loom.kind"
                         || kv.key == "loom.repo"
                         || kv.key == "loom.repo.visibility",
                     "unexpected attribute {}",
@@ -273,6 +274,7 @@ mod tests {
                 assert!(
                     CI_LOG_ATTRIBUTE_KEYS.contains(&kv.key.as_str())
                         || kv.key == "loom.record_id"
+                        || kv.key == "loom.kind"
                         || kv.key == "loom.repo"
                         || kv.key == "loom.repo.visibility",
                     "unexpected attribute {}",

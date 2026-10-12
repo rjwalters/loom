@@ -289,6 +289,8 @@ fn gh_api(gh: &str, path: &str) -> crate::cmd_out::CmdOutcome {
         GhTarget::None,
         PROBE_TIMEOUT,
     )
+    // Merge settings may be hidden from a reader App (W4-C writer_only).
+    .writer_identity()
     .program(gh)
     .args(["api", path])
     .run()

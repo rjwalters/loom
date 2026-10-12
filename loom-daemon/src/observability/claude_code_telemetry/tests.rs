@@ -18,6 +18,7 @@ const ENV_KEYS: &[&str] = &[
     LOG_TOOL_DETAILS_ENV,
     super::super::ENABLED_ENV,
     super::super::ENDPOINT_ENV,
+    RESOURCE_ATTRIBUTES_ENV,
 ];
 
 /// Clears [`ENV_KEYS`] for the duration of a test and restores exactly what
@@ -323,4 +324,48 @@ fn prepare_child_removes_the_managed_set_when_off_and_sets_it_when_on() {
     assert!(observed
         .contains(&("OTEL_EXPORTER_OTLP_ENDPOINT".to_string(), Some(LOCAL_EDGE.to_string()))));
     assert!(observed.contains(&("OTEL_LOG_TOOL_DETAILS".to_string(), None)));
+}
+
+#[test]
+fn attribute_values_are_percent_encoded() {
+    assert_eq!(
+        encode_attribute_value("role-judge-2026-10-07T13:02:29.1Z"),
+        "role-judge-2026-10-07T13:02:29.1Z"
+    );
+    assert_eq!(encode_attribute_value("a,b=c d%"), "a%2Cb%3Dc%20d%25");
+}
+
+#[test]
+#[serial]
+fn prepare_scheduled_child_stamps_role_and_tick_only_when_on() {
+    let _guard = EnvGuard::clear();
+    let dir = tempfile::tempdir().unwrap();
+    let attrs = |command: &Command| {
+        command
+            .get_envs()
+            .find(|(key, _)| *key == RESOURCE_ATTRIBUTES_ENV)
+            .map(|(_, value)| value.map(|v| v.to_string_lossy().to_string()))
+    };
+
+    let mut command = Command::new("/usr/bin/true");
+    assert!(!prepare_scheduled_child(&mut command, dir.path(), "judge", Some("t")));
+    assert_eq!(attrs(&command), None, "off: inheritance untouched, nothing stamped");
+
+    std::env::set_var(ENABLED_ENV, "1");
+    std::env::set_var(ENDPOINT_ENV, LOCAL_EDGE);
+    let mut command = Command::new("/usr/bin/true");
+    assert!(prepare_scheduled_child(&mut command, dir.path(), "judge", Some("role-judge-1")));
+    assert_eq!(
+        attrs(&command),
+        Some(Some("loom.role=judge,loom.sweep_id=role-judge-1".to_string()))
+    );
+
+    std::env::set_var(RESOURCE_ATTRIBUTES_ENV, "deployment.environment=prod");
+    let mut command = Command::new("/usr/bin/true");
+    assert!(prepare_scheduled_child(&mut command, dir.path(), "guide", None));
+    assert_eq!(
+        attrs(&command),
+        Some(Some("deployment.environment=prod,loom.role=guide".to_string())),
+        "an inherited value is extended, never replaced"
+    );
 }

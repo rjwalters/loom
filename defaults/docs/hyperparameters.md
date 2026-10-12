@@ -48,8 +48,21 @@ below. Types/ranges are strict **on this surface** (see Validation).
 | `dispatch` | `maxAdmissionsPerTick` | 3 | 1–64 | Ramp cap: new sweeps admitted per tick (#4234) | `autonomous.workFinder.maxAdmissionsPerTick` | `LOOM_WORK_FINDER_MAX_ADMISSIONS_PER_TICK` |
 | `lifecycle` | `leaseTtlMinutes` | 15.0 | >0–1440 | Lease-freshness TTL (#6286) | — | `LOOM_LEASE_TTL_MINUTES` |
 | `lifecycle` | `idleExitMinutes` | 60 | 1–10080 | Idle-exit turnaround (#4467) | `autonomous.idleExit.idleMinutes` | `LOOM_AUTONOMOUS_IDLE_EXIT_MINUTES` |
-| `rework` | `buildBackoffHigh` | 40 | 1–100000 | PR-debt level that engages the build back-off (#9410) | `autonomous.workFinder.buildBackoff.high` | — |
-| `rework` | `buildBackoffLow` | 25 | 0–100000, `< high` | PR-debt level that releases it | `autonomous.workFinder.buildBackoff.low` | — |
+| `rework` | `buildBackoffHigh` | 40 | 1–100000 | Per-repo PR-debt level that engages a repo's build back-off (#9410, #10624) | `autonomous.workFinder.buildBackoff.high` | — |
+| `rework` | `buildBackoffLow` | 25 | 0–100000, `< high` | Per-repo PR-debt level that releases it | `autonomous.workFinder.buildBackoff.low` | — |
+| `champion` | `prSlice` | 10 | 1–1000 | PR rows Champion handles before the promotion pass (#10753) | — | `LOOM_CHAMPION_PR_SLICE` |
+| `champion` | `promotionSlice` | 3 | 1–100 | Fresh promotion verdicts per pause while PR rows remain | — | `LOOM_CHAMPION_PROMOTION_SLICE` |
+| `champion` | `tier2Cap` | 2 | 0–100 (0 disables) | Tier 2 promotions per repo per pass | — | `LOOM_CHAMPION_TIER2_CAP` |
+| `champion` | `tier3Cap` | 1 | 0–100 (0 disables) | Tier 3 promotions per repo per pass | — | `LOOM_CHAMPION_TIER3_CAP` |
+| `champion` | `tier3BacklogCap` | 5 | 0–1000 | Open unheld `tier:maintenance` issues that gate Tier 3 promotion | — | `LOOM_CHAMPION_TIER3_BACKLOG_CAP` |
+
+The `champion` values enter the run digest. Champion's shell snippets read
+the `LOOM_CHAMPION_*` env vars directly, so the resolver honours them at the
+top tier (provenance `env`) with the shell's own parse: a non-negative
+integer wins (`0` included, unclamped), empty/non-integer falls through. The
+daemon does not yet export block/vector values into role sessions (follow-up
+on #10753): until it does, a config/vector value is digested but only the env
+var changes Champion's behaviour.
 
 ## Precedence
 
@@ -120,8 +133,8 @@ $ loom-daemon hyperparams --validate   # run the startup gate without a daemon
 ```
 
 `sources` reports, per field, which tier supplied it
-(`env-vector | config | legacy | default`) — the first thing to check when
-an injected vector "didn't take".
+(`env | env-vector | config | legacy | default`; `env` is champion-only) —
+the first thing to check when an injected vector "didn't take".
 
 `--validate` runs the same strict gate daemon startup enforces (unknown
 keys, types, ranges, crossed backoff pair, unparseable vector) against a
@@ -150,6 +163,66 @@ loom-daemon hyperparams --json | jq '.sources["dispatch.maxConcurrent"]'  # env-
 
 Invalid samples abort startup with the offending path named — treat a
 non-booting daemon as an infeasible point, not a crash.
+
+## Merge-queue mode: enablement prerequisites and rollback
+
+Queue mode (#9978) is not a hyperparameter. It is a per-repository merge-mode
+setting, defined by Phase A (#10255), that defaults to direct. Before any
+repository switches to queue mode, it must pass
+`loom-daemon merge-group-ci eligibility`. That check requires an
+organization-owned repository, push permission, an active `merge_queue` rule,
+required checks, and a workflow audit proving that every required suite
+validates the combined merge-group tree. The switch also needs operator
+authorization, because a ruleset change is a protected-settings change. To
+roll back, set the mode back to direct and have the operator remove the
+`merge_queue` rule. The `merge_group` workflow trigger can stay, because it is
+inert without a queue. Full checklist, evidence and rollback steps:
+[merge-queue-ci](merge-queue-ci.md).
+
+### The setting: `champion.mergeMode` (#10255)
+
+There is one key, `champion.mergeMode`. It is a top-level config key, not part
+of the `"hyperparameters"` block, and the strict gate described above does not
+cover it.
+
+| Value | Meaning |
+|---|---|
+| `direct` (default) | `merge-pr.sh` merges the approved PR itself. This is today's behaviour. |
+| `queue` | Put the approved head on the forge's merge queue. This is dormant; see below. |
+
+Precedence is `$LOOM_MERGE_MODE` (an empty value counts as unset), then the
+tier-merged config (`config_resolver.rs`, with `.loom-local` above
+`.loom-project` above `.loom/config.json` above machine defaults), then
+`direct`. Any other value, including `"Queue"`, `"queued"` or a non-string, is
+an error that names the value and where it came from. It **never** falls back
+to `direct`.
+
+`loom-daemon forge merge-queue` exposes the typed controls in
+`loom-daemon/src/forge_merge_queue/`:
+
+- `mode` prints the resolved mode, its source and the execution gate.
+- `preflight [--repo] [--branch]` is read-only. It reports one of these
+  distinct kinds: `UNSUPPORTED_FORGE`, `UNSUPPORTED_REPOSITORY`,
+  `MISSING_QUEUE_RULE`, `MISSING_REQUIRED_CHECKS`, `CONFIG_INACCESSIBLE` or
+  `RATE_LIMITED`.
+- `status <pr>` shows the PR's head and its queue entry.
+- `enqueue <pr> --approved-sha SHA` always sends `expectedHeadOid` set to the
+  approved head and never sends `jump`.
+- `dequeue <pr>` removes the PR from the queue.
+
+Enqueue and dequeue are idempotent: if the PR is already queued at the approved
+head, or is not queued at all, nothing is sent. A head mismatch is reported and
+never retried with the refreshed SHA. Diagnostics redact anything that looks
+like a token.
+
+Exit codes are 0 for ok, 1 for failed or not capable, 2 for an invalid config,
+3 for could-not-determine, and 4 for a refusal before any forge call.
+
+**Dormant.** Queue execution is compiled off (`QUEUE_EXECUTION_ENABLED = false`).
+Under `direct`, `enqueue` and `dequeue` refuse with `NOT_QUEUE_MODE` before any
+forge call. Under `queue`, they refuse with `EXECUTION_DORMANT` until #9978's
+later phases install the lifecycle safety contract and the required
+merge-group checks. No role or script invokes these verbs yet.
 
 ## Tranche roadmap
 

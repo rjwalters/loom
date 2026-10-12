@@ -4,9 +4,10 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::fs::{File, OpenOptions};
+use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 pub const TRACEPARENT_ENV: &str = "LOOM_TRACEPARENT";
 /// The standard W3C `traceparent` env var (#9215), mirrored from
@@ -20,6 +21,11 @@ pub const W3C_TRACEPARENT_ENV: &str = "TRACEPARENT";
 pub const CONTEXT_FILE_ENV: &str = "LOOM_TRACE_CONTEXT_FILE";
 const MAX_CONTEXT_BYTES: u64 = 4096;
 const MAX_ACTIVE_CONTEXTS: usize = 1024;
+/// How long [`TraceStore`] waits for its directory lock before reporting the
+/// store busy. Every holder does a few small file operations, so a real
+/// holder is gone in milliseconds; this bounds the wait when one is not.
+const LOCK_WAIT: Duration = Duration::from_millis(500);
+const LOCK_POLL: Duration = Duration::from_millis(5);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionContext {
@@ -75,18 +81,40 @@ impl TraceStore {
         }
     }
 
-    /// The repo key for an execution outside a story, lowercased:
-    /// `$LOOM_REPO`, else the checkout's GitHub `owner/repo` (so a PR-set
-    /// sweep groups with the same repo's issue sweeps), else the workspace
-    /// basename ([`crate::peer_claims::repo_slug`]).
+    /// The repo key for an execution outside a story: [`Self::repo_name`],
+    /// lowercased so hosts whose origins differ only in case derive the same
+    /// IDs. An ID-derivation input only; the span's `loom.repo` is
+    /// [`Self::repo_attribute`], whose ASCII lowercase is exactly this key.
     #[must_use]
     pub fn fallback_repo(workspace: &Path) -> String {
+        Self::repo_name(workspace).to_ascii_lowercase()
+    }
+
+    /// `$LOOM_REPO`, else the checkout's GitHub `owner/repo` (so a PR-set
+    /// sweep groups with the same repo's issue sweeps), else the workspace
+    /// basename ([`crate::peer_claims::repo_slug`]), spelled as written there.
+    fn repo_name(workspace: &Path) -> String {
         let explicit = std::env::var("LOOM_REPO").is_ok_and(|v| !v.trim().is_empty());
         (!explicit)
             .then(|| crate::release_resolve::host::repo_slug(workspace))
             .flatten()
             .unwrap_or_else(|| crate::peer_claims::repo_slug(workspace))
-            .to_ascii_lowercase()
+    }
+
+    /// `loom.repo` for a span keyed on [`Self::fallback_repo`] (#10637): the
+    /// same repo, spelled as GitHub spells it. That is the checkout's
+    /// canonical repo-facts record (the value `loom.dispatch.*` carries) when
+    /// the record names this repo; otherwise the name as written. It is never
+    /// a different repo, so `ascii_lowercase(loom.repo)` is always exactly the
+    /// key and the span still carries its own ID-derivation input.
+    #[must_use]
+    pub fn repo_attribute(workspace: &Path) -> String {
+        use crate::forge_repo_facts::{canonical, GhRepoEnv, Lookup};
+        let name = Self::repo_name(workspace);
+        match canonical(workspace, GhRepoEnv::Ignore) {
+            Lookup::Fact(fact) if fact.full_name().eq_ignore_ascii_case(&name) => fact.full_name(),
+            _ => name,
+        }
     }
 
     #[must_use]
@@ -95,7 +123,15 @@ impl TraceStore {
             .join(format!("{}.json", Self::identity(workspace, execution)))
     }
 
-    /// Nonblocking lock: unavailable local telemetry must never stall dispatch.
+    /// Bounded lock: unavailable local telemetry must never stall dispatch,
+    /// so a lock still held after [`LOCK_WAIT`] is an error, not a wait.
+    ///
+    /// It is not a single attempt (#10955). `flock` belongs to the open file
+    /// description, and a child forked by another thread while this file is
+    /// open shares that description until its `exec` closes it. For that
+    /// moment the lock outlives the `File` that took it, and the next caller
+    /// in a process that spawns children (the daemon, or a threaded test run)
+    /// found the store "busy" with nobody using it.
     fn lock(&self) -> Result<File> {
         std::fs::create_dir_all(&self.directory)?;
         #[cfg(unix)]
@@ -108,8 +144,16 @@ impl TraceStore {
             .truncate(false)
             .write(true)
             .open(self.directory.join(".lock"))?;
-        file.try_lock().context("trace context store busy")?;
-        Ok(file)
+        let deadline = Instant::now() + LOCK_WAIT;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(file),
+                Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    std::thread::sleep(LOCK_POLL);
+                }
+                Err(e) => return Err(e).context("trace context store busy"),
+            }
+        }
     }
 
     pub fn load_or_create(&self, workspace: &Path, execution: &str) -> Result<ExecutionContext> {

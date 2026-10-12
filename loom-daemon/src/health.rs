@@ -21,7 +21,7 @@
 //!
 //! | section | source |
 //! |---------|--------|
-//! | liveness | [`crate::daemon_install_state`] (`probe()` + [`crate::daemon_install_state::pgrep_daemon_pids`]) plus the caller's IPC round-trip result |
+//! | liveness | [`crate::daemon_install_state`] (`probe()` + [`crate::daemon_install_state::pgrep_daemon_pids`], which already excludes `session-exec worker` / `health` / `status` and other subcommand processes - #10110) plus the caller's IPC round-trip result |
 //! | dispatch | [`crate::types::DaemonStatusReport`] + [`crate::work_finder::last_tick_summary`] |
 //! | tokens | [`crate::types::CapacityReport`] + the resolved pool's `.ranking` mtime |
 //! | roles | [`crate::role_runner::role_tick_records`] |
@@ -2727,6 +2727,10 @@ pub use ci_telemetry_section::assess_ci_telemetry;
 /// host that actually has Codex accounts.
 pub mod codex_accounts;
 
+/// The conditional `session_containers` section (#10600): the Codex session
+/// seats `loom-daemon status` lists, on a host that has any.
+pub mod session_containers;
+
 // ============================================================================
 // Roll-up
 // ============================================================================
@@ -2780,6 +2784,7 @@ pub fn assess(inputs: &HealthInputs) -> HealthReport {
         assess_pool_hold(inputs),
     ];
     sections.extend(codex_accounts::assess(inputs));
+    sections.extend(session_containers::assess(inputs));
     sections.extend(assess_observability(inputs));
     sections.extend(assess_codesign_identity(inputs));
     sections.extend(assess_limit_calibration(inputs));

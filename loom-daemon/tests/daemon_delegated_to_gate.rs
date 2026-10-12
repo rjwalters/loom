@@ -50,6 +50,9 @@ fn run_daemon_with_shared_pool(
         // (issue #4039's private/shared defaults file) or a real
         // ~/.loom/tokens shared pool leaking into `tokens select`.
         .env("LOOM_CONFIG_DEFAULTS_FILE", "")
+        // No Codex profile root: `workspace add`/`remove` must not ask the
+        // host's real docker about session containers (#10364).
+        .env("LOOM_CODEX_PROFILE_ROOT", "")
         .env("LOOM_SHARED_TOKENS_DIR", shared_tokens_dir)
         .output()
         .unwrap()

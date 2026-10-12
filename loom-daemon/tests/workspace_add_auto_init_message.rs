@@ -34,6 +34,9 @@ fn run_daemon(args: &[&str], cwd: &Path, workspaces_path: &Path) -> Output {
         // (issue #4039's private/shared defaults file) or a real
         // ~/.loom/tokens shared pool leaking in.
         .env("LOOM_CONFIG_DEFAULTS_FILE", "")
+        // No Codex profile root: `workspace add`/`remove` must not ask the
+        // host's real docker about session containers (#10364).
+        .env("LOOM_CODEX_PROFILE_ROOT", "")
         .env("LOOM_SHARED_TOKENS_DIR", "")
         .env("LOOM_DAEMON_DEFAULTS_DIR", defaults_dir)
         .output()

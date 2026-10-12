@@ -35,7 +35,7 @@ fn a_starred_needs_operator_issue_notices_once_across_ticks_hosts_and_restarts()
     seed_held(&world, slug);
     let repos = vec![repo_input(slug)];
 
-    let mut a = Host::new("host-a");
+    let mut a = Host::without_propagation("host-a");
     let report = a.pass(&world, &repos, Vec::new(), t(10, 0));
     let ask = report.rows[0].ask.as_ref().unwrap();
     assert_eq!(report.rows[0].stage, LandingStage::NeedsOperator);
@@ -59,7 +59,7 @@ fn a_starred_needs_operator_issue_notices_once_across_ticks_hosts_and_restarts()
     assert_eq!(a.notices.len(), 1, "no repeat across ticks");
 
     // A second host managing the same repo finds the forge marker.
-    let mut b = Host::new("host-b");
+    let mut b = Host::without_propagation("host-b");
     b.pass(&world, &repos, Vec::new(), t(10, 3));
     assert!(b.notices.is_empty(), "no repeat across hosts");
 
@@ -94,7 +94,7 @@ fn the_watchdog_stall_notices_too_and_resolves_when_progress_returns() {
     world.add(slug, issue(7, &[STAR, "loom:building"]));
     world.add(slug, pr(8, 7, &["loom:review-requested"]));
     let repos = vec![repo_input(slug)];
-    let mut host = Host::new("host-a");
+    let mut host = Host::without_propagation("host-a");
 
     host.pass(&world, &repos, Vec::new(), t(10, 0));
     host.pass(&world, &repos, Vec::new(), t(10, 29));

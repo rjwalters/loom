@@ -16,7 +16,8 @@ impl GhInvocation {
     /// exited (any status) ⇒ [`CmdOutcome::Ran`]; spawn failure, collect
     /// failure or the deadline ⇒ [`CmdOutcome::Unavailable`].
     ///
-    /// A [`OutputContract::Passthrough`] invocation has no captured output to
+    /// A [`OutputContract::Passthrough`] (or
+    /// [`OutputContract::CredentialHelper`]) invocation has no captured output to
     /// classify; it is **not run** (no side effects) and reported as
     /// [`Unavailable::Spawn`] — passthrough is never silently converted into
     /// captured output, nor the reverse.
@@ -29,6 +30,18 @@ impl GhInvocation {
         };
         classify(self.execute(), timeout)
     }
+
+    /// [`GhInvocation::run`] for an async caller (#10089): the bounded,
+    /// blocking execution moves to tokio's blocking pool so it never stalls
+    /// a runtime worker. A join failure (the blocking task panicked) is
+    /// [`Unavailable::Collect`] — no answer, never an invented one.
+    pub async fn run_async(self) -> CmdOutcome {
+        tokio::task::spawn_blocking(move || self.run())
+            .await
+            .unwrap_or_else(|e| {
+                CmdOutcome::Unavailable(Unavailable::Collect(format!("gh task failed: {e}")))
+            })
+    }
 }
 
 /// `cmd_out::run_command`'s mapping, over the facade's result.
@@ -37,7 +50,21 @@ pub(super) fn classify(
     timeout: std::time::Duration,
 ) -> CmdOutcome {
     match result {
-        Ok(GhCompletion::Captured(Completion::Exited(out))) => CmdOutcome::Ran(out),
+        Ok(GhCompletion::Captured(Completion::Exited(out))) => {
+            // The managed launcher's own exit codes (#9987) are routing
+            // outcomes, not forge answers: surface them as unavailable so no
+            // caller retries them or reads them as an empty result.
+            let detail = || String::from_utf8_lossy(&out.stderr).trim().to_string();
+            match out.status.code() {
+                Some(super::telemetry::EXIT_ROUTING_BLOCKED) => {
+                    CmdOutcome::Unavailable(Unavailable::RoutingBlocked(detail()))
+                }
+                Some(super::telemetry::EXIT_ADAPTER_UNAVAILABLE) => {
+                    CmdOutcome::Unavailable(Unavailable::AdapterUnavailable(detail()))
+                }
+                _ => CmdOutcome::Ran(out),
+            }
+        }
         Ok(GhCompletion::Captured(Completion::TimedOut { stdout, .. })) => {
             CmdOutcome::Unavailable(Unavailable::TimedOut {
                 after: timeout,
@@ -49,6 +76,10 @@ pub(super) fn classify(
         Ok(GhCompletion::Passthrough(status)) => CmdOutcome::Unavailable(Unavailable::Collect(
             format!("passthrough completion ({status}) has no captured output"),
         )),
+        // W4-C: a deferred read is "no answer", never a negative one.
+        Ok(GhCompletion::Shed { until, .. }) => {
+            CmdOutcome::Unavailable(Unavailable::Shed { until })
+        }
         Err(ExecError::Spawn(e)) => CmdOutcome::Unavailable(Unavailable::Spawn(e.to_string())),
         Err(ExecError::Collect(e)) => CmdOutcome::Unavailable(Unavailable::Collect(e.to_string())),
     }
@@ -99,6 +130,42 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&o.stderr).trim(), "nope");
     }
 
+    /// [`run_with`] on a fresh stub, waiting out `ETXTBSY`: a concurrent test
+    /// thread that forked while the stub's write fd was open holds it until
+    /// its exec, and Linux refuses to exec the script meanwhile (#10446 CI).
+    fn run_stub(dir: &std::path::Path, body: &str) -> CmdOutcome {
+        let program = stub(dir, body);
+        for _ in 0..100 {
+            match run_with(inv(TIMEOUT), &program) {
+                CmdOutcome::Unavailable(Unavailable::Spawn(e)) if e.contains("os error 26") => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                out => return out,
+            }
+        }
+        run_with(inv(TIMEOUT), &program)
+    }
+
+    #[test]
+    fn launcher_exit_78_is_routing_blocked_and_69_is_adapter_unavailable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = run_stub(tmp.path(), "echo denied >&2; exit 78");
+        assert!(
+            matches!(&out, CmdOutcome::Unavailable(Unavailable::RoutingBlocked(m)) if m == "denied"),
+            "{out:?}"
+        );
+        assert!(!out.succeeded());
+        assert_eq!(out.stdout_lossy(), "");
+        let out = run_stub(tmp.path(), "exit 69");
+        assert!(
+            matches!(out, CmdOutcome::Unavailable(Unavailable::AdapterUnavailable(_))),
+            "{out:?}"
+        );
+        // Every other non-zero status is still an ordinary answer.
+        let out = run_stub(tmp.path(), "exit 70");
+        assert!(matches!(out, CmdOutcome::Ran(_)), "{out:?}");
+    }
+
     #[test]
     fn a_zero_exit_carries_stdout_unchanged() {
         let tmp = tempfile::tempdir().unwrap();
@@ -122,6 +189,26 @@ mod tests {
         assert!(matches!(
             run_with(inv(slow), &stub(tmp.path(), "sleep 5")),
             CmdOutcome::Unavailable(Unavailable::TimedOut { after, .. }) if after == slow
+        ));
+    }
+
+    #[test]
+    fn run_async_classifies_exactly_like_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gh = stub(tmp.path(), "printf ok; exit 3");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let out = rt.block_on(inv(TIMEOUT).program(&gh).run_async());
+        let CmdOutcome::Ran(o) = out else {
+            panic!("expected Ran, got {out:?}");
+        };
+        assert_eq!((o.status.code(), &o.stdout[..]), (Some(3), &b"ok"[..]));
+        let missing = tmp.path().join("no-such-gh");
+        assert!(matches!(
+            rt.block_on(inv(TIMEOUT).program(&missing).run_async()),
+            CmdOutcome::Unavailable(Unavailable::Spawn(_))
         ));
     }
 

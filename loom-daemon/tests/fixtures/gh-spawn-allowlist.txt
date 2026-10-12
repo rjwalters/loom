@@ -8,15 +8,9 @@
 # - Never add an entry: build the new site through
 #   `crate::gh_invocation::GhInvocation` instead.
 # - When you migrate a site, delete its line — a stale entry fails the test.
+# - #10089 drained the last entries: `fleet/drain.rs`'s claim resets (now
+#   `GhInvocation::child_path` carries their explicit `PATH`) and
+#   `cli/merge_pr_tree_checks.rs`'s comment (now `forge_comment::post_comment`,
+#   which sends the body as an `--input` file instead of stdin).
 #
 # Empty list == migration complete.
-
-src/cmd_out.rs | let mut cmd = Command::new(gh);
-src/forge_cmd.rs | pub(crate) fn gh_bin() -> String {
-src/pipeline_snapshot.rs | match Command::new(gh_bin).arg("--version").output() {
-src/safehouse.rs | let mut cmd = tokio::process::Command::new(&gh_bin);
-src/safehouse.rs | let mut cmd = tokio::process::Command::new(&gh_bin);
-src/safehouse.rs | let mut cmd = tokio::process::Command::new(gh_bin);
-src/safehouse.rs | let mut cmd = tokio::process::Command::new(gh_bin);
-src/tokens_pool/private_workspace/repository.rs | let mut helper = Command::new("gh").args(["auth", "git-credential", "get"])
-src/write_scope/probe.rs | let mut cmd = Command::new(&self.gh);

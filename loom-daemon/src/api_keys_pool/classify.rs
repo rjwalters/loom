@@ -474,6 +474,15 @@ fn without_transcript(region: &str) -> String {
         .join("\n")
 }
 
+/// The lines of `region` the provider or harness wrote — the exact text
+/// [`classify_launch_region`]'s prose table sees. Public so the reset-horizon
+/// parser ([`super::reset`], #11286) reads the same filtered text and an agent
+/// quoting a date can never *extend* a hold either.
+#[must_use]
+pub fn provider_lines(region: &str) -> String {
+    without_transcript(region)
+}
+
 /// [`classify`] for the **automatic** path: a region of a retained launch log,
 /// which is a whole run's transcript rather than a provider's error output.
 ///

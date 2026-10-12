@@ -195,6 +195,31 @@ pub enum Request {
         /// byte-for-byte compatible) a tripped breaker refuses the dispatch.
         #[serde(default)]
         force: bool,
+        /// Per-dispatch runtime override for the coding phases (#11284).
+        /// Together with `model_profile` it names one explicit tap that the
+        /// sweep's Builder and Doctor phases launch on. An unavailable or
+        /// unadmitted tap is refused with a reason, never passed down the
+        /// preference list. Curator, Judge and the orchestrator keep their
+        /// role policy. `None` (or absent on the wire, `#[serde(default)]`)
+        /// preserves existing behavior byte-for-byte.
+        #[serde(default)]
+        runtime: Option<String>,
+        /// Model profile paired with `runtime` (e.g. `zai-flash`). Requires
+        /// `runtime`; absent preserves the runtime's own default resolution.
+        #[serde(default)]
+        model_profile: Option<String>,
+        /// Who is asking (Issue #11444), recorded on the sweep's start facts
+        /// and exported as `loom.dispatch_origin`. `loom-daemon dispatch`,
+        /// the `dispatch_sweep` MCP tool and Safehouse ChatOps send
+        /// `operator`. Absent on the wire (a legacy client, or any IPC
+        /// client that does not say) records `unknown` — never assumed
+        /// `operator`, since automated tools share this request too.
+        ///
+        /// Client-supplied and trusted as-is: this is telemetry (which
+        /// `trigger` the sweep reports), not authorization. Nothing decides
+        /// whether to dispatch from it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dispatch_origin: Option<crate::telemetry::DispatchOrigin>,
     },
     /// List tracked sweeps, optionally filtered by state.
     ListSweeps {
@@ -406,6 +431,26 @@ pub enum Request {
     /// the IPC handler, so the `loom-daemon status` CLI shells out to
     /// `loom-tokens check --json` client-side (mirroring `probe-tokens.sh`).
     DaemonStatus,
+    /// `DaemonStatus` for only the named top-level sections of
+    /// `status --json` (Issue #10787, `loom-daemon status --json --section`).
+    /// The daemon runs only the build phases those sections need — notably
+    /// it skips the `O(roots)` per-root walk unless a section reads it (see
+    /// [`crate::status_section::SectionSet`]). The reply is the same
+    /// `Response::DaemonStatus`; fields of unrequested sections are
+    /// unspecified (typically their defaults) and the CLI emits only the
+    /// requested keys.
+    ///
+    /// A separate variant rather than a field on `DaemonStatus`, so the
+    /// existing `{"type":"DaemonStatus"}` frame and every client sending it
+    /// are untouched, an older daemon rejects this frame with a parse error
+    /// the CLI can name ("daemon too old for --section") instead of silently
+    /// answering with a full build, and the IPC latency metrics
+    /// (`loom.daemon.ipc.*`) label it with its own `kind`,
+    /// `DaemonStatusSections`, so cheap sectioned calls do not dilute the
+    /// full build's latency series.
+    DaemonStatusSections {
+        sections: Vec<crate::status_section::StatusSection>,
+    },
     // ========================================================================
     // Workspace Registry Requests (Issue #3926 — phase 1 of #3835)
     // ========================================================================
@@ -431,6 +476,16 @@ pub enum Request {
     },
     /// List the managed workspaces in the machine-level registry.
     ListWorkspaces,
+    /// Read one issue's OPEN/CLOSED state for a managed repo under the
+    /// daemon's own forge routing (#8876). The only inputs are a registered
+    /// root, the `owner/repo` slug of its `origin` remote, and an issue
+    /// number: no endpoint, no command, no credential. The daemon re-derives
+    /// the slug itself and answers [`crate::issue_state_read::IssueStateReply`].
+    ReadIssueState {
+        workspace_root: String,
+        repo: String,
+        issue: u64,
+    },
     // ========================================================================
     // Durable Watch Registry Requests (Issue #3971)
     // ========================================================================
@@ -783,6 +838,9 @@ pub enum Response {
     WorkspaceList {
         workspaces: Vec<crate::workspace_registry::Workspace>,
     },
+    /// Result of a `ReadIssueState` request (#8876): a validated state and a
+    /// non-secret route label, never a credential.
+    IssueState(crate::issue_state_read::IssueStateReply),
     // ========================================================================
     // Durable Watch Registry Responses (Issue #3971)
     // ========================================================================
@@ -1346,13 +1404,20 @@ pub struct DaemonStatusReport {
     /// transition) these are always queryable, so a host idling behind a roll
     /// is visible to a single `loom-daemon status --json`.
     #[serde(default)]
-    pub drain_roll: Option<crate::ipc::drain_roll::DrainRollStatus>,
+    pub drain_roll: Option<crate::ipc::drain_status::DrainRollStatus>,
     /// Cumulative dispatch-paused seconds attributable to drain-and-restart
     /// rolls, per UTC day (Issue #8652), from a ledger persisted across the
     /// restart a successful roll performs. Includes the elapsed portion of an
     /// in-progress pause. Empty from a pre-#8652 daemon (`#[serde(default)]`).
     #[serde(default)]
     pub drain_paused_by_day: std::collections::BTreeMap<chrono::NaiveDate, u64>,
+    /// The pause-and-roll resume state (#10832): the pause manifest this
+    /// process found at startup, the H5 step it is on (or how it ended), and
+    /// what became of each paused agent, with per-reason requeue counters and
+    /// observed durations. `None` when the process started without a manifest
+    /// (and from a pre-#10832 daemon). Rendered as `drain.resume`.
+    #[serde(default)]
+    pub pause_resume: Option<crate::auto_update::pause_resume::PauseResumeStatus>,
     /// Whether the autonomous self-update loop (Issue #4055) is enabled for this
     /// daemon process. `false` in the common opt-out case (the loop is
     /// default-OFF). `#[serde(default)]` keeps pre-#4055 wire data / older
@@ -1360,6 +1425,11 @@ pub struct DaemonStatusReport {
     /// mirroring the `draining` forward-compat convention.
     #[serde(default)]
     pub auto_update_enabled: bool,
+    /// Why the self-update loop runs, and in which mode (#10954), e.g. `fleet
+    /// floor only (autoUpdate.enabled=false)`. `None` before the spawn decision
+    /// and from an older daemon, which then renders as plain `enabled`.
+    #[serde(default)]
+    pub auto_update_mode: Option<String>,
     /// Wall-clock time of the auto-update loop's most recent staleness check
     /// (Issue #4055), or `None` when the loop has not ticked yet (or is
     /// disabled). `#[serde(default)]` keeps pre-#4055 wire data compatible.
@@ -1422,11 +1492,17 @@ pub struct DaemonStatusReport {
     /// wire data compatible.
     #[serde(default)]
     pub auto_update_stale_repo: Option<String>,
-    /// The roll schedule (Issue #9132): next window, target, dispatch-paused flag and
-    /// deferral reason. `None` when no `rollWindowSecs` is configured, or from a
-    /// pre-#9132 daemon. `#[serde(default)]` keeps older wire data compatible.
+    /// Every long-running daemon loop's liveness (Issue #10414): last beat,
+    /// staleness window, alive/dead. Empty from a pre-#10414 daemon.
     #[serde(default)]
-    pub auto_update_roll_window: Option<crate::auto_update::roll_window::RollWindowStatus>,
+    pub task_liveness: Vec<crate::task_liveness::TaskLivenessEntry>,
+    /// Codex session containers, per session-managed account (Issue
+    /// #10600): state, mounts, posture, hold, removal record and the
+    /// reconciler's last action, read from the published snapshot (no docker
+    /// call). `None` on a host without a session-managed account, and from a
+    /// pre-#10600 daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_containers: Option<crate::session_status::SessionContainersReport>,
     /// Host-distress circuit-breaker state (Issue #4235). `Some` when a breaker
     /// has been registered this process (the work-finder loop is running and the
     /// breaker is enabled); `None` when no breaker is active — which the status
@@ -1732,6 +1808,11 @@ pub struct DaemonStatusReport {
     /// `#[serde(default)]` keeps older wire data / older clients compatible.
     #[serde(default)]
     pub observability_exports: std::collections::BTreeMap<String, ObservabilityExportStatus>,
+    /// Whether this daemon exports OTLP to SigNoz (Issue #11353):
+    /// `no_exporter` / `failing` / `ok` / `exempt`. `None` only from a
+    /// pre-#11353 daemon; never read as `ok`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub otlp_export: Option<crate::observability::otlp_health::OtlpExportHealth>,
     /// State of the forge event-feed consumer (ADR-0021, #8765): whether this
     /// daemon is polling its operator-provisioned per-host event feed, under
     /// which `host_id`, how far its cursor has advanced, and — when it is not
@@ -1860,10 +1941,10 @@ pub use dispatch_plan::{
 };
 mod fleet_plan;
 pub use fleet_plan::{FleetPlan, FleetPlanItem, FleetPlanObservation, HostPlan, HostPlanRow};
-mod work_finder_tick;
+pub(crate) mod work_finder_tick;
 pub use work_finder_tick::{CapLimiter, CapView, CapacityWait, WorkFinderTickSummary};
 
-mod star_liveness;
+pub mod star_liveness;
 pub use star_liveness::{
     AskKind, DroppedStarIntent, LandingStage, OperatorAsk, StarLandingRow, StarLivenessReport,
 };
@@ -2296,6 +2377,98 @@ pub struct ForgeCallsStatus {
     /// computed one; empty when the sink carries no identity-bearing lines yet.
     #[serde(default)]
     pub operations: Option<Vec<ForgeOperationCounts>>,
+    /// Host-wide counts over the window per **identity role** (#9872):
+    /// `reader` (a reader App's own pool), `writer`, `writer-fallback` (a
+    /// read a reader failed on, re-run on the writer) and `unknown` (a line
+    /// from an older binary or a call recorded outside the `gh` facade).
+    /// `None` when the sink is disabled, or from an older daemon.
+    #[serde(default)]
+    pub identity_roles: Option<Vec<ForgeIdentityRoleCounts>>,
+    /// Host-wide counts over the window per billed bucket (W1), beside the
+    /// bucket book's newest reading. `None` when the sink is disabled, or
+    /// from an older daemon.
+    #[serde(default)]
+    pub buckets: Option<Vec<ForgeBucketStatus>>,
+    /// Reader Apps withdrawn from one `(owner, resource)` bucket right now
+    /// (W4-A), from this daemon's routing table. Empty when none are.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reader_withdrawals: Vec<ReaderWithdrawalStatus>,
+    /// Read-pool spill latches engaged right now (W4-B), from this daemon's
+    /// routing table. Empty when none are.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read_spills: Vec<ReadSpillStatus>,
+}
+
+/// One engaged read-pool spill latch of [`ForgeCallsStatus`] (W4-B).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReadSpillStatus {
+    /// The repo, `owner/repo` lowercased.
+    pub owner_repo: String,
+    /// `core`, `graphql` or `search`.
+    pub resource: String,
+    /// The home reader, `app-<id>`.
+    pub from: String,
+    /// `partial` or `full`.
+    pub mode: String,
+    /// When the latch releases.
+    pub until: DateTime<Utc>,
+}
+
+/// One live scoped reader withdrawal of [`ForgeCallsStatus`] (W4-A).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReaderWithdrawalStatus {
+    /// `app-<id>`.
+    pub account: String,
+    /// The owner, lowercased.
+    pub owner: String,
+    /// `core`, `graphql`, `search` or `all`.
+    pub resource: String,
+    pub until: DateTime<Utc>,
+}
+
+/// One billed GitHub rate-limit bucket of [`ForgeCallsStatus`] (W1):
+/// `(account, cred_owner, resource)`, what this host charged it over the
+/// window, and the bucket book's reading when one is believed.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForgeBucketStatus {
+    /// `app-<id>`, `app-unknown`, `env-token`, `ambient` or `unknown`.
+    pub account: String,
+    /// The installation's owner, or `-` when the credential has none.
+    pub cred_owner: String,
+    /// The App installation the bucket was read under (#10571), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installation: Option<String>,
+    pub resource: String,
+    /// Requests charged (`ok` rows × pages).
+    pub charged: u64,
+    pub not_modified: u64,
+    pub rate_limited: u64,
+    /// Secondary (burst) limits, apart from primary `rate_limited` (#11418).
+    #[serde(default)]
+    pub secondary_limited: u64,
+    #[serde(default)]
+    pub used: Option<u64>,
+    #[serde(default)]
+    pub limit: Option<u64>,
+    #[serde(default)]
+    pub reset_at: Option<DateTime<Utc>>,
+}
+
+/// One identity-role row of [`ForgeCallsStatus`] (#9872).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForgeIdentityRoleCounts {
+    /// `reader`, `writer`, `writer-fallback` or `unknown`.
+    pub role: String,
+    pub ok: u64,
+    pub not_modified: u64,
+    pub rate_limited: u64,
+    /// Secondary (burst) limits, apart from primary `rate_limited` (#11418).
+    #[serde(default)]
+    pub secondary_limited: u64,
+    pub error: u64,
+    /// Reads shed without a request (W4-C).
+    #[serde(default)]
+    pub shed: u64,
 }
 
 /// One call-identity row of [`ForgeCallsStatus`] (Issue #9777).
@@ -2320,7 +2493,13 @@ pub struct ForgeOperationCounts {
     pub ok: u64,
     pub not_modified: u64,
     pub rate_limited: u64,
+    /// Secondary (burst) limits, apart from primary `rate_limited` (#11418).
+    #[serde(default)]
+    pub secondary_limited: u64,
     pub error: u64,
+    /// Reads shed without a request (W4-C).
+    #[serde(default)]
+    pub shed: u64,
 }
 
 /// One caller × pool row of [`ForgeCallsStatus`].
@@ -2336,8 +2515,15 @@ pub struct ForgeCallCounts {
     pub not_modified: u64,
     /// Rate-limited responses.
     pub rate_limited: u64,
+    /// Secondary (burst) limits, apart from primary `rate_limited` (#11418).
+    #[serde(default)]
+    pub secondary_limited: u64,
     /// Any other failure.
     pub error: u64,
+    /// Reads a reader route deferred without a request (W4-C): charged
+    /// nothing.
+    #[serde(default)]
+    pub shed: u64,
 }
 
 /// A remaining-budget reading for one pool.
@@ -2529,6 +2715,11 @@ pub use roster_status::{RosterMemberStatus, RosterStatus};
 pub struct RepoStatus {
     /// The normalized workspace root this line describes.
     pub root: PathBuf,
+    /// The registry's maintain-only mark (#11186): the daemon keeps this
+    /// repo's Loom install current and dispatches nothing into it. `None` for
+    /// a normal workspace, and from a daemon that predates the mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintain_only: Option<crate::workspace_registry::MaintainOnly>,
     /// This repo's cross-repo dispatch priority tier (Issue #3946): lower = higher
     /// priority, default [`crate::workspace_registry::DEFAULT_WORKSPACE_PRIORITY`].
     /// Surfaced so `loom-daemon status` shows which repos the autonomous loops
@@ -2890,6 +3081,28 @@ pub struct CredentialPreflightReport {
     pub message: String,
     /// Wall-clock time this snapshot was taken (daemon startup).
     pub checked_at: DateTime<Utc>,
+    /// Which GitHub rate-limit pool the credential spends (#9872). `None`
+    /// when no credential resolved, the gateway owns it, or the report came
+    /// from an older daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool: Option<CredentialPool>,
+}
+
+/// The rate-limit pool a resolved writer credential spends (#9872).
+///
+/// Every personal access token (classic and fine-grained), OAuth token and
+/// `gh` login of one user shares that user's single pool; only a GitHub App
+/// installation token (or another account) has its own. Never a token value.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CredentialPool {
+    /// `installation` (a GitHub App installation token) or `user`.
+    pub kind: String,
+    /// The account login, for `user` (resolved once with `gh api user`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login: Option<String>,
+    /// The account's numeric id, for `user`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<u64>,
 }
 
 // ========================================================================
@@ -3052,6 +3265,11 @@ pub enum Event {
         /// compatible.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         story_points: Option<u32>,
+        /// Model, effort, runtime and attempt lineage as this dispatch knew
+        /// them (#11280), copied onto `sweep.started`. Absent for a `PrSet`
+        /// dispatch and on pre-#11280 wire data.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start: Option<Box<crate::telemetry::SweepStartFacts>>,
     },
     /// `sweep.global.runtime_rejected` — a dispatch was **refused** by
     /// fail-closed runtime admission (issue #4494, epic #4489 Phase 5), before

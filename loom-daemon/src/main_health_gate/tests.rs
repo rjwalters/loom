@@ -1,4 +1,5 @@
 use super::*;
+use crate::build_slot::test_support::{with_isolated_slot, BuildSlotEnvGuard};
 use serial_test::serial;
 use std::collections::VecDeque;
 
@@ -688,8 +689,7 @@ fn test_run_gate_tick_skip_path_does_not_stamp_last_verdict_at() {
     //
     // #4615: isolate the machine-wide build slot to a per-test tempdir so
     // this test never contends with a live daemon's real build slot.
-    let slot_dir = tempfile::tempdir().unwrap();
-    std::env::set_var(crate::build_slot::BUILD_SLOT_DIR_ENV, slot_dir.path());
+    let _slots = BuildSlotEnvGuard::isolated();
 
     let (_origin, clone) = make_origin_and_clone();
     let marker = tempfile::tempdir().unwrap();
@@ -720,8 +720,6 @@ fn test_run_gate_tick_skip_path_does_not_stamp_last_verdict_at() {
         after_first,
         "a skipped tick must never refresh the verdict timestamp"
     );
-
-    std::env::remove_var(crate::build_slot::BUILD_SLOT_DIR_ENV);
 }
 
 #[test]
@@ -896,6 +894,7 @@ fn test_full_red_then_green_sequence_via_fake_runner() {
 // ===================================================================
 
 #[test]
+#[serial]
 fn test_command_runner_green_on_zero_exit() {
     let cfg = BuildGateConfig {
         command: "exit 0".to_string(),
@@ -903,10 +902,11 @@ fn test_command_runner_green_on_zero_exit() {
         ..Default::default()
     };
     let mut runner = gate_runner(cfg, std::env::temp_dir()).without_sync();
-    assert!(runner.run_gate().is_green());
+    assert!(with_isolated_slot(|| runner.run_gate()).is_green());
 }
 
 #[test]
+#[serial]
 fn test_command_runner_red_on_nonzero_exit_captures_output() {
     let cfg = BuildGateConfig {
         command: "echo build-failed-marker >&2; exit 1".to_string(),
@@ -914,7 +914,7 @@ fn test_command_runner_red_on_nonzero_exit_captures_output() {
         ..Default::default()
     };
     let mut runner = gate_runner(cfg, std::env::temp_dir()).without_sync();
-    let outcome = runner.run_gate();
+    let outcome = with_isolated_slot(|| runner.run_gate());
     assert!(!outcome.is_green());
     assert!(
         outcome.is_verified_red(),
@@ -937,6 +937,7 @@ fn test_command_runner_red_on_nonzero_exit_captures_output() {
 // ===================================================================
 
 #[test]
+#[serial]
 fn test_command_runner_timeout_is_unevaluated_not_red() {
     let cfg = BuildGateConfig {
         command: "sleep 10".to_string(),
@@ -944,7 +945,7 @@ fn test_command_runner_timeout_is_unevaluated_not_red() {
         ..Default::default()
     };
     let mut runner = gate_runner(cfg, std::env::temp_dir()).without_sync();
-    let outcome = runner.run_gate();
+    let outcome = with_isolated_slot(|| runner.run_gate());
     assert!(!outcome.is_green());
     assert!(
         !outcome.is_verified_red(),
@@ -960,6 +961,7 @@ fn test_command_runner_timeout_is_unevaluated_not_red() {
 }
 
 #[test]
+#[serial]
 fn test_command_runner_exit_127_is_unevaluated_not_red() {
     // Exit 127 = `sh` could not find the command (the incident's
     // "cargo not on PATH after a launchd migration").
@@ -969,7 +971,7 @@ fn test_command_runner_exit_127_is_unevaluated_not_red() {
         ..Default::default()
     };
     let mut runner = gate_runner(cfg, std::env::temp_dir()).without_sync();
-    let outcome = runner.run_gate();
+    let outcome = with_isolated_slot(|| runner.run_gate());
     assert!(
         !outcome.is_verified_red(),
         "a command that could not be executed must NOT halt dispatch, got {outcome:?}"
@@ -978,6 +980,7 @@ fn test_command_runner_exit_127_is_unevaluated_not_red() {
 }
 
 #[test]
+#[serial]
 fn test_command_runner_exit_126_is_unevaluated_not_red() {
     // Exit 126 = found but not executable.
     let tmp = tempfile::tempdir().unwrap();
@@ -989,12 +992,13 @@ fn test_command_runner_exit_126_is_unevaluated_not_red() {
         ..Default::default()
     };
     let mut runner = gate_runner(cfg, std::env::temp_dir()).without_sync();
-    let outcome = runner.run_gate();
+    let outcome = with_isolated_slot(|| runner.run_gate());
     assert!(!outcome.is_verified_red(), "got {outcome:?}");
     assert_eq!(outcome.unevaluated_class(), Some(UnevaluatedClass::NotExecutable));
 }
 
 #[test]
+#[serial]
 fn test_command_runner_signal_death_is_unevaluated_not_red() {
     // An OOM/`kill -9` of the build (exit 137 as `sh` reports it) is an
     // environmental failure, not a failing build.
@@ -1004,12 +1008,13 @@ fn test_command_runner_signal_death_is_unevaluated_not_red() {
         ..Default::default()
     };
     let mut runner = gate_runner(cfg, std::env::temp_dir()).without_sync();
-    let outcome = runner.run_gate();
+    let outcome = with_isolated_slot(|| runner.run_gate());
     assert!(!outcome.is_verified_red(), "got {outcome:?}");
     assert_eq!(outcome.unevaluated_class(), Some(UnevaluatedClass::KilledBySignal));
 }
 
 #[test]
+#[serial]
 fn test_command_runner_cargo_style_failure_is_still_verified_red() {
     // Guard against overcorrection: `cargo test` exits 101 on a genuinely
     // failing test. That command ran to completion and reported failure, so
@@ -1020,7 +1025,7 @@ fn test_command_runner_cargo_style_failure_is_still_verified_red() {
         ..Default::default()
     };
     let mut runner = gate_runner(cfg, std::env::temp_dir()).without_sync();
-    let outcome = runner.run_gate();
+    let outcome = with_isolated_slot(|| runner.run_gate());
     assert!(
         outcome.is_verified_red(),
         "a completed non-zero exit must remain verified-red, got {outcome:?}"
@@ -1089,6 +1094,7 @@ impl ForgeCiStatus for FakeCi {
 }
 
 fn run_gate_with_ci(command: &str, verdict: CiVerdict) -> (GateOutcome, Vec<String>) {
+    let _slots = BuildSlotEnvGuard::isolated();
     let (_origin, clone) = make_origin_and_clone();
     let asked = Arc::new(Mutex::new(Vec::new()));
     let cfg = BuildGateConfig {
@@ -1964,6 +1970,7 @@ fn test_command_runner_returns_unevaluated_when_prep_skips() {
 }
 
 #[test]
+#[serial]
 fn test_command_runner_runs_gate_after_successful_prep() {
     // Sync ON against a real on-main clean clone ⇒ prep Ready ⇒ command runs.
     let (_origin, clone) = make_origin_and_clone();
@@ -1973,7 +1980,7 @@ fn test_command_runner_runs_gate_after_successful_prep() {
         ..Default::default()
     };
     let mut runner = gate_runner(cfg, clone.path().to_path_buf());
-    assert!(runner.run_gate().is_green());
+    assert!(with_isolated_slot(|| runner.run_gate()).is_green());
 }
 
 // ===================================================================
@@ -2136,8 +2143,7 @@ fn test_run_gate_tick_skips_second_run_for_unchanged_sha() {
     //
     // #4615: isolate the machine-wide build slot to a per-test tempdir so
     // this test never contends with a live daemon's real build slot.
-    let slot_dir = tempfile::tempdir().unwrap();
-    std::env::set_var(crate::build_slot::BUILD_SLOT_DIR_ENV, slot_dir.path());
+    let _slots = BuildSlotEnvGuard::isolated();
 
     let (_origin, clone) = make_origin_and_clone();
     let marker = tempfile::tempdir().unwrap();
@@ -2173,8 +2179,6 @@ fn test_run_gate_tick_skips_second_run_for_unchanged_sha() {
         invocations_after_second, 1,
         "no second gate command must be spawned for an unchanged SHA"
     );
-
-    std::env::remove_var(crate::build_slot::BUILD_SLOT_DIR_ENV);
 }
 
 #[test]
@@ -2182,8 +2186,7 @@ fn test_run_gate_tick_skips_second_run_for_unchanged_sha() {
 fn test_run_gate_tick_runs_again_after_main_advances() {
     // #4615: isolate the machine-wide build slot to a per-test tempdir so
     // this test never contends with a live daemon's real build slot.
-    let slot_dir = tempfile::tempdir().unwrap();
-    std::env::set_var(crate::build_slot::BUILD_SLOT_DIR_ENV, slot_dir.path());
+    let _slots = BuildSlotEnvGuard::isolated();
 
     let (origin, clone) = make_origin_and_clone();
     let marker = tempfile::tempdir().unwrap();
@@ -2221,8 +2224,6 @@ fn test_run_gate_tick_runs_again_after_main_advances() {
         2,
         "a real change to origin/main must trigger another run"
     );
-
-    std::env::remove_var(crate::build_slot::BUILD_SLOT_DIR_ENV);
 }
 
 #[test]
@@ -2230,8 +2231,7 @@ fn test_run_gate_tick_runs_again_after_main_advances() {
 fn test_run_gate_tick_skips_while_backing_off_after_timeout() {
     // #4615: isolate the machine-wide build slot to a per-test tempdir so
     // this test never contends with a live daemon's real build slot.
-    let slot_dir = tempfile::tempdir().unwrap();
-    std::env::set_var(crate::build_slot::BUILD_SLOT_DIR_ENV, slot_dir.path());
+    let _slots = BuildSlotEnvGuard::isolated();
 
     let (_origin, clone) = make_origin_and_clone();
     let marker = tempfile::tempdir().unwrap();
@@ -2271,8 +2271,6 @@ fn test_run_gate_tick_skips_while_backing_off_after_timeout() {
         1,
         "no second gate command must be spawned while backing off"
     );
-
-    std::env::remove_var(crate::build_slot::BUILD_SLOT_DIR_ENV);
 }
 
 #[test]
@@ -2287,8 +2285,7 @@ fn test_run_gate_tick_defers_when_host_is_saturated() {
     //
     // #4615: isolate the machine-wide build slot to a per-test tempdir so
     // this test never contends with a live daemon's real build slot.
-    let slot_dir = tempfile::tempdir().unwrap();
-    std::env::set_var(crate::build_slot::BUILD_SLOT_DIR_ENV, slot_dir.path());
+    let _slots = BuildSlotEnvGuard::isolated();
 
     let (_origin, clone) = make_origin_and_clone();
     let marker = tempfile::tempdir().unwrap();
@@ -2314,8 +2311,6 @@ fn test_run_gate_tick_defers_when_host_is_saturated() {
         "no gate command must spawn while deferring"
     );
     assert_eq!(state.last_verdict_at(), None, "a deferral is not a verdict");
-
-    std::env::remove_var(crate::build_slot::BUILD_SLOT_DIR_ENV);
 }
 
 // ===================================================================
@@ -2816,6 +2811,7 @@ fn run_gate_with_ci_and_credential(
     verdict: CiVerdict,
     credential_stale: bool,
 ) -> GateOutcome {
+    let _slots = BuildSlotEnvGuard::isolated();
     let (_origin, clone) = make_origin_and_clone();
     let cfg = BuildGateConfig {
         command: command.to_string(),
@@ -2916,8 +2912,7 @@ fn test_run_gate_tick_held_by_stale_credential_never_runs_the_command() {
     // The tick-level hold (AC2/AC3): with a stale credential the expensive
     // command does not run at all, the tick yields `None` (nothing to
     // apply), and the halt flag is untouched.
-    let slot_dir = tempfile::tempdir().unwrap();
-    std::env::set_var(crate::build_slot::BUILD_SLOT_DIR_ENV, slot_dir.path());
+    let _slots = BuildSlotEnvGuard::isolated();
 
     let (_origin, clone) = make_origin_and_clone();
     let marker = tempfile::tempdir().unwrap();
@@ -2946,8 +2941,6 @@ fn test_run_gate_tick_held_by_stale_credential_never_runs_the_command() {
         "a credential hold must NOT arm the indeterminate backoff — evaluation has to \
              resume on the very next tick once the credential recovers"
     );
-
-    std::env::remove_var(crate::build_slot::BUILD_SLOT_DIR_ENV);
 }
 
 #[test]
@@ -2956,8 +2949,7 @@ fn test_run_gate_tick_evaluates_normally_once_the_credential_recovers() {
     // AC3's other half: the hold is not sticky. The very next tick after
     // recovery evaluates for real — so a flapping refresh tick produces no
     // dispatch oscillation, and a genuinely red main is still caught.
-    let slot_dir = tempfile::tempdir().unwrap();
-    std::env::set_var(crate::build_slot::BUILD_SLOT_DIR_ENV, slot_dir.path());
+    let _slots = BuildSlotEnvGuard::isolated();
 
     let (_origin, clone) = make_origin_and_clone();
     let cfg = BuildGateConfig {
@@ -2978,8 +2970,6 @@ fn test_run_gate_tick_evaluates_normally_once_the_credential_recovers() {
         matches!(after, Some(GateOutcome::Red { .. })),
         "a genuinely red main must still be caught right after recovery, got {after:?}"
     );
-
-    std::env::remove_var(crate::build_slot::BUILD_SLOT_DIR_ENV);
 }
 
 #[test]
@@ -3012,8 +3002,7 @@ fn test_credential_hold_reason_is_none_when_credential_is_healthy() {
 #[test]
 #[serial]
 fn test_global_credential_tracker_holds_a_real_tick_and_releases_it() {
-    let slot_dir = tempfile::tempdir().unwrap();
-    std::env::set_var(crate::build_slot::BUILD_SLOT_DIR_ENV, slot_dir.path());
+    let _slots = BuildSlotEnvGuard::isolated();
     crate::credential_preflight::reset_forge_credential_streaks();
 
     let (_origin, clone) = make_origin_and_clone();
@@ -3072,5 +3061,4 @@ fn test_global_credential_tracker_holds_a_real_tick_and_releases_it() {
     assert_eq!(runs(), 2);
 
     crate::credential_preflight::reset_forge_credential_streaks();
-    std::env::remove_var(crate::build_slot::BUILD_SLOT_DIR_ENV);
 }

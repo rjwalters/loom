@@ -18,10 +18,6 @@ fn set<'a>(it: impl IntoIterator<Item = &'a str>) -> BTreeSet<&'a str> {
     it.into_iter().collect()
 }
 
-fn prop(p: &str) -> BTreeSet<&'static str> {
-    set(reg().with_property(p).expect("known property"))
-}
-
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -56,6 +52,48 @@ fn validation_rejects_bad_registries() {
         v["labels"][0]["skip"] = false.into();
     };
     assert!(mutate(&park_only).is_err());
+}
+
+#[test]
+fn validation_rejects_bad_propagate() {
+    let good: serde_json::Value = serde_json::from_str(REGISTRY_JSON).unwrap();
+    let idx = |name: &str| reg().labels.iter().position(|l| l.name == name).unwrap();
+    let (ext, tier) = (idx("external"), idx("tier:maintenance"));
+    let mutate = |i: usize, key: &str, val: serde_json::Value| {
+        let mut v = good.clone();
+        v["labels"][i]["propagate"][key] = val;
+        Registry::parse(&v.to_string())
+    };
+    assert!(mutate(ext, "direction", "child-to-parent".into()).is_err());
+    assert!(mutate(ext, "add", "sometimes".into()).is_err());
+    assert!(mutate(ext, "bogus", true.into()).is_err());
+    // A rank gap, and two rules sharing a rank.
+    assert!(mutate(ext, "rank", 9.into()).is_err());
+    assert!(mutate(ext, "rank", 1.into()).is_err());
+    // A family default without a family; a family that is not the prefix.
+    assert!(mutate(tier, "family", serde_json::Value::Null).is_err());
+    assert!(mutate(ext, "family", "tier:".into()).is_err());
+    // Family members must agree.
+    assert!(mutate(tier, "to_prs", true.into()).is_err());
+}
+
+#[test]
+fn propagate_holds_the_10012_table() {
+    let named: Vec<(&str, u32)> = reg()
+        .labels
+        .iter()
+        .filter_map(|l| l.propagate.as_ref().map(|p| (l.name.as_str(), p.rank)))
+        .collect();
+    assert_eq!(
+        named,
+        vec![
+            ("loom:operator-priority", 1),
+            ("tier:goal-advancing", 3),
+            ("tier:goal-supporting", 3),
+            ("tier:maintenance", 3),
+            ("external", 2),
+        ]
+    );
 }
 
 #[test]
@@ -131,6 +169,10 @@ fn derived_skip_labels_equal_the_previous_literal_in_order() {
             "loom:blocked",
             "loom:operator-only",
             "loom:operator",
+            // #11399: an epic is a tracking container, never build work. A
+            // skip (the work finder never lists it as a candidate) but not a
+            // park: an operator's explicit dispatch on an epic still runs.
+            "loom:epic",
             "loom:operator-decision",
         ]
     );
@@ -178,57 +220,91 @@ fn work_finder_name_constants_match_their_registry_properties() {
     assert_eq!(decision.requires_base.as_deref(), Some("loom:operator-only"));
 }
 
-// --- lockstep: one test per remaining hand-listed table (slice 2b) ------------
+// --- slice 2b: more derived tables, pinned to their previous literals --------
+
+/// #11087: `human_gated` is the notifier contract ("a human must act"). The
+/// self-clearing sub-kind, the capability gate and the decision bounce are
+/// not human asks; the curation workflow labels are not either.
+#[test]
+fn human_gated_is_exactly_the_human_must_act_labels() {
+    assert_eq!(
+        set(embedded_set("human_gated")),
+        set([
+            "loom:operator",
+            "loom:operator-only",
+            "loom:operator-mechanical",
+            "loom:operator-decision",
+            "external",
+        ])
+    );
+}
 
 #[test]
-fn lockstep_operator_gate_labels() {
+fn derived_operator_gate_labels_equal_the_previous_literal() {
     assert_eq!(
         set(crate::pr_latency::OPERATOR_GATE_LABELS.iter().copied()),
-        prop("operator_gate")
+        set([
+            "loom:operator",
+            "loom:operator-only",
+            "loom:needs-capability"
+        ])
     );
 }
 
 #[test]
-fn lockstep_pr_latency_hold_labels() {
+fn derived_pr_latency_hold_labels_equal_the_previous_set() {
+    // Previously: gates + parks + every `loom:operator-` label except the
+    // priority levels. Over the registry's labels that is exactly this set.
     let all: Vec<&str> = reg().labels.iter().map(|l| l.name.as_str()).collect();
     let got = crate::pr_latency::hold_labels(&all);
-    assert_eq!(set(got.iter().map(String::as_str)), prop("hold"));
+    assert_eq!(
+        set(got.iter().map(String::as_str)),
+        set([
+            "loom:blocked",
+            "loom:operator",
+            "loom:operator-only",
+            "loom:needs-capability",
+            "loom:operator-blocked",
+            "loom:operator-mechanical",
+            "loom:operator-decision",
+        ])
+    );
 }
 
 #[test]
-fn lockstep_eta_hold_labels() {
-    // eta::labels::hold_labels = blocked + park + skip (minus the claim) +
-    // queue_blocked's co-labels.
-    let mut want: BTreeSet<&str> = BTreeSet::new();
-    want.insert(crate::observability::queue_blocked::BLOCKED_LABEL);
-    want.extend(prop("park"));
-    want.extend(
-        prop("skip")
-            .into_iter()
-            .filter(|n| reg().get(n).unwrap().kind != "claim"),
-    );
-    want.extend(prop("blocked_colabel"));
-    assert_eq!(set(crate::eta::labels::hold_labels()), want);
+fn derived_queue_blocked_hold_labels() {
     assert_eq!(
         set(crate::observability::queue_blocked::HOLD_LABELS
             .iter()
             .copied()),
-        prop("blocked_colabel")
+        set([
+            "loom:operator",
+            "loom:operator-only",
+            "loom:operator-mechanical",
+            "loom:needs-capability"
+        ])
     );
 }
 
 #[test]
-fn lockstep_merge_pr_blocking_in_order() {
+fn derived_merge_pr_blocking_equals_the_previous_literal_in_order() {
+    // Order matters: the guard reports the first match in this order.
     assert_eq!(
-        crate::merge_pr::labels::BLOCKING.to_vec(),
-        reg().with_property("contradicts_approval").unwrap()
+        *crate::merge_pr::labels::BLOCKING,
+        [
+            "loom:changes-requested",
+            "loom:blocked",
+            "loom:operator",
+            "loom:sequenced",
+            "loom:review-requested"
+        ]
     );
 }
 
-#[test]
-fn lockstep_human_gated_labels() {
-    assert_eq!(set(crate::eta::labels::HUMAN_GATED_LABELS.iter().copied()), prop("human_gated"));
-}
+// dep_classify's operator-only base/sub-kind labels are single named labels
+// (each with its own writer and marker), not a set, so they stay consts; this
+// test keeps them and the registry's requires_base/remove_with pairing (#5671)
+// in lockstep.
 
 #[test]
 fn lockstep_dep_classify_operator_only_kinds() {

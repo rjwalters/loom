@@ -160,6 +160,11 @@ is uid 1000 regardless of which host user's files it's touching.
   and provisioned by Loom's own fleet tooling, not a general-purpose
   multi-tenant runtime, so "provision the host directory at uid 1000" is the
   supported answer, not a remap layer.
+- **Forge-call sink (#10607)**: at `$LOOM_FORGE_CALL_STATS_DIR` the container
+  gets the host sink's `contained/` subdirectory, read-write, so the agent `gh`
+  front's rows outlive `--rm` while the host's own rows stay out of reach; only
+  for a directory that is a sink (ours, `0700`, sink files only); on a uid
+  mismatch rows drop. The daemon reads them as untrusted input.
 
 ## 4. Build-cache placement
 

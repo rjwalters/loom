@@ -85,6 +85,7 @@ fn run(issue: u32, env: &[(&str, &str)]) -> Output {
     cmd.args(["forge", "check-open-pr", &issue.to_string()])
         .current_dir(dir.path())
         .env("LOOM_GH_BIN", &gh)
+        .env("LOOM_GH_NO_POLICY_LAUNCHER", "1")
         .env("LOOM_FORGE_TYPE", "github")
         .env("LOOM_CONFIG_DEFAULTS_FILE", "")
         .env("LOOM_WORKSPACES_PATH", dir.path().join("workspaces.json"));

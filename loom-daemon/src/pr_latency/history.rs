@@ -39,10 +39,14 @@ impl PrState {
 
 /// One thing that happened to a PR, at a known time.
 ///
-/// Only the four kinds any segment needs. Anything else on the timeline is
+/// Only the kinds something reads. Anything else on the timeline is
 /// dropped at parse time rather than carried as an `Other` variant nobody
-/// reads.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// reads. Serializable so a budget-interrupted timeline can be checkpointed
+/// (#10520). `Closed` / `Reopened` are lifecycle evidence a gap fill resolves
+/// into [`PrState`] (#10746); [`PrHistory::new`] drops them, so a published
+/// history carries the same event kinds whichever source built it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PrEvent {
     /// A label was applied.
     Labeled { label: String, at: DateTime<Utc> },
@@ -61,6 +65,12 @@ pub enum PrEvent {
     Pushed { at: DateTime<Utc> },
     /// The PR was merged.
     Merged { at: DateTime<Utc> },
+    /// The PR was closed (a `closed` timeline event; a merge emits one too,
+    /// which the `merged` event outranks). Only the gap-fill state
+    /// resolution reads it (#10746); never kept in a [`PrHistory`].
+    Closed { at: DateTime<Utc> },
+    /// The PR was reopened (a `reopened` timeline event).
+    Reopened { at: DateTime<Utc> },
 }
 
 impl PrEvent {
@@ -69,7 +79,9 @@ impl PrEvent {
             Self::Labeled { at, .. }
             | Self::Unlabeled { at, .. }
             | Self::Pushed { at }
-            | Self::Merged { at } => *at,
+            | Self::Merged { at }
+            | Self::Closed { at }
+            | Self::Reopened { at } => *at,
         }
     }
 
@@ -104,6 +116,10 @@ pub struct PrHistory {
     /// request errored). Every segment derived from a partial log is suspect,
     /// so such a PR is reported as *unmeasured*, never as a fast one.
     pub timeline_complete: bool,
+    /// When the PR closed, merged or not (the list's `closedAt`), when the
+    /// source read it. Lets the ETA stage episodes (#10218) end a PR closed
+    /// unmerged at its close; [`PrHistory::new`] leaves it `None`.
+    pub closed_at: Option<DateTime<Utc>>,
 }
 
 impl PrHistory {
@@ -116,6 +132,10 @@ impl PrHistory {
         mut events: Vec<PrEvent>,
         timeline_complete: bool,
     ) -> Self {
+        // Lifecycle evidence is resolved into `state` by the caller, never
+        // replayed as an event (#10746): a SigNoz-built history has no such
+        // events, and a published snapshot must not differ by source.
+        events.retain(|e| !matches!(e, PrEvent::Closed { .. } | PrEvent::Reopened { .. }));
         events.sort_by_key(PrEvent::at);
         Self {
             number,
@@ -125,7 +145,15 @@ impl PrHistory {
             current_labels,
             events,
             timeline_complete,
+            closed_at: None,
         }
+    }
+
+    /// The same history with [`PrHistory::closed_at`] set.
+    #[must_use]
+    pub fn with_closed_at(mut self, closed_at: Option<DateTime<Utc>>) -> Self {
+        self.closed_at = closed_at;
+        self
     }
 
     /// Time of the first `labeled <label>` event, if any.

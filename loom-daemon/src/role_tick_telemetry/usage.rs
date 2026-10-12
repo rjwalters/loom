@@ -17,6 +17,7 @@ use std::path::Path;
 use chrono::{DateTime, Utc};
 
 use crate::observability::lifecycle::RoleTrace;
+use crate::observability::llm_billing::LlmBilling;
 use crate::observability::runtime_usage::cost::Pricing;
 use crate::observability::runtime_usage::spans::{append_new, model_usage_spans, UsageScope};
 use crate::script_helpers::sweep_experiment::ModelUsageTotals;
@@ -31,9 +32,10 @@ pub fn journal_execution(
     role: &str,
     ended_at: DateTime<Utc>,
     runtime: Option<&str>,
+    billing: Option<&LlmBilling>,
     rows: &[ModelUsageTotals],
 ) {
-    let spans = execution_usage(trace, role, ended_at, runtime, rows, &Pricing::active());
+    let spans = execution_usage(trace, role, ended_at, runtime, billing, rows, &Pricing::active());
     let store = TraceStore::new(root);
     let journal = Journal::for_context(&store.path(root, &trace.execution));
     if let Err(error) = append_new(&journal, spans) {
@@ -48,6 +50,7 @@ pub fn execution_usage(
     role: &str,
     ended_at: DateTime<Utc>,
     runtime: Option<&str>,
+    billing: Option<&LlmBilling>,
     rows: &[ModelUsageTotals],
     pricing: &Pricing<'_>,
 ) -> Vec<SpanRecord> {
@@ -56,6 +59,9 @@ pub fn execution_usage(
     common.insert("loom.sweep_id".into(), trace.execution.clone());
     if let Some(runtime) = runtime {
         common.insert("loom.runtime".into(), runtime.to_string());
+    }
+    if let Some(billing) = billing {
+        billing.stamp(&mut common);
     }
     model_usage_spans(
         &trace.context,
@@ -84,6 +90,9 @@ pub fn attempt_usage(
         "loom.pr_number",
         "loom.sweep_id",
         "loom.runtime",
+        crate::observability::llm_billing::BILLING_KEY,
+        crate::observability::llm_billing::CREDENTIAL_KIND_KEY,
+        crate::observability::llm_billing::PROFILE_KEY,
     ]
     .into_iter()
     .filter_map(|key| {

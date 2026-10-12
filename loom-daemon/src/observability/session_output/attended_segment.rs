@@ -114,8 +114,19 @@ impl Segment {
     /// A newer claim on this transcript starts at byte `at`, so this run's
     /// lines end there.
     pub fn supersede(&mut self, at: u64) {
+        self.end_at(at, EndReason::Superseded);
+    }
+
+    /// The subagent returned its result to its parent while its transcript
+    /// was `len` bytes long, so its lines end there (#10125).
+    pub fn returned(&mut self, len: u64) {
+        self.end_at(len, EndReason::Returned);
+    }
+
+    /// End the run's lines at `at`, unless they already end earlier.
+    fn end_at(&mut self, at: u64, reason: EndReason) {
         if self.end.is_none_or(|(end, _)| at < end) {
-            self.end = Some((at, EndReason::Superseded));
+            self.end = Some((at, reason));
         }
     }
 

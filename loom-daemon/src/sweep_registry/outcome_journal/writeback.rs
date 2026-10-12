@@ -232,7 +232,7 @@ impl SweepRegistry {
         if !resolve_sweep_outcome_writeback_config(&self.config.workspace_root).enabled {
             return;
         }
-        if crate::rate_limit_breaker::global_is_suppressed() {
+        if crate::rate_limit_breaker::global_skip_pass("outcome_journal") {
             log::debug!(
                 "sweep_outcomes: skipping issue #{issue}'s sweep-outcome write-back — the \
                  rate-limit breaker is suppressing forge polling (#9056)"
@@ -277,7 +277,7 @@ impl SweepRegistry {
         );
         let args = ["api", path.as_str(), "--paginate", "--jq", jq.as_str()];
         let output = self
-            .gh_read("outcome.writeback_probe", args)
+            .gh_read_own_write("outcome.writeback_probe", args)
             .ok()
             .flatten()?;
         if !output.status.success() {
@@ -393,9 +393,11 @@ mod tests {
             complexity: Some("complex".to_string()),
             tokens_status: None,
             tokens_status_reason: None,
+            no_phase_cause: None,
             attempt_index: None,
             previous_sweep_id: None,
             trigger: None,
+            dispatch_origin: None,
             rework_events: None,
             pr_numbers: None,
             hw_lines_added: None,

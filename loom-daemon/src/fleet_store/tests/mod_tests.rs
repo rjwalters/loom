@@ -55,6 +55,7 @@ fn malformed_locations_are_refused() {
 fn contract_paths() {
     for p in [
         "repos.yml",
+        "fleet.json",
         "fleet/state.yml",
         "fleet/defaults.json",
         "fleet/hosts/h1/defaults.json",
@@ -65,6 +66,7 @@ fn contract_paths() {
     for p in [
         "hosts.yml",
         "README.md",
+        "fleet/fleet.json",
         "fleet/hosts/h1/notes.json",
         "fleet/hosts//local.json",
         "fleet/hosts/a/b/local.json",

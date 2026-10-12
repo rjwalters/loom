@@ -135,6 +135,8 @@ use launchctl::{
 };
 // Re-exported: callers outside this module resolved it here before the split.
 pub(crate) use launchctl::launchd_domain;
+mod pgrep_filter;
+use pgrep_filter::filter_dispatcher_candidates;
 
 const PROBE_TIMEOUT_SECS: u64 = 2;
 
@@ -510,6 +512,12 @@ const DAEMON_PROCESS_NAME: &str = "loom-daemon";
 /// [`crate::health`] — rather than silently changing `status`'s existing
 /// classification. Bounded by [`PROBE_TIMEOUT`]; an absent/hung `pgrep`
 /// degrades to an empty vec, i.e. "no answer", never "definitely dead".
+///
+/// Name-matched candidates are then filtered (#10110): `session-exec worker`,
+/// `health`, `status` and any other subcommand invocation are proven
+/// non-dispatchers (the dispatcher is the bare `loom-daemon` form) and are
+/// dropped. An unknown identity (failed/hung `ps`, malformed output) keeps the
+/// pid - uncertainty is never turned into "dead".
 #[must_use]
 pub fn pgrep_daemon_pids() -> Vec<u32> {
     let mut cmd = Command::new("pgrep");
@@ -526,10 +534,11 @@ pub fn pgrep_daemon_pids() -> Vec<u32> {
     let Ok(stdout) = String::from_utf8(output.stdout) else {
         return Vec::new();
     };
-    stdout
+    let candidates: Vec<u32> = stdout
         .lines()
         .filter_map(|line| line.trim().parse::<u32>().ok())
-        .collect()
+        .collect();
+    filter_dispatcher_candidates(candidates)
 }
 
 /// One liveness check result: whether the expected daemon is alive, a

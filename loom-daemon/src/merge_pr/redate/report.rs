@@ -199,6 +199,9 @@ pub struct Report {
     pub by_check: Vec<Subtotal>,
     /// Per clause, most frequent first.
     pub by_clause: Vec<Subtotal>,
+    /// Per-PR re-date counts and time-to-land (#10163); filled by the caller
+    /// via [`super::chain_telemetry`], empty from [`aggregate`].
+    pub chains: Vec<super::chain_telemetry::ChainStat>,
 }
 
 /// Aggregate parsed commits into a [`Report`]. Ties sort by name, so the
@@ -245,6 +248,7 @@ pub fn aggregate(
         rows,
         by_check: subtotals(by_check),
         by_clause: subtotals(by_clause),
+        chains: Vec::new(),
     }
 }
 
@@ -262,6 +266,7 @@ fn subtotals(m: BTreeMap<String, usize>) -> Vec<Subtotal> {
 pub fn render_text(r: &Report) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
+    let chains = super::chain_telemetry::render_text(&r.chains);
     let _ = writeln!(
         out,
         "Re-date commits on {} since {}: {} ({} attributed, {} untrailered)",
@@ -280,6 +285,7 @@ pub fn render_text(r: &Report) -> String {
             "\nNo attributed re-dates in this window. Untrailered commits predate #9746's \
 trailers (or their verdict could not be recomputed at re-date time)."
         );
+        out.push_str(&chains);
         return out;
     }
     let _ = writeln!(out, "\nBy check x base path x PR path (most frequent first):");
@@ -307,6 +313,7 @@ trailers (or their verdict could not be recomputed at re-date time)."
     for s in &r.by_clause {
         let _ = writeln!(out, "  {:>4}  {}", s.count, s.name);
     }
+    out.push_str(&chains);
     out
 }
 

@@ -8,3 +8,8 @@
 # here — they are the inventoried bootstrap exception, recognised in-source by
 # the `loom:egress-exception=github-app-bootstrap` marker.
 defaults/scripts/lib/forge-helpers.sh	gh-config-dir-assign	owner-config ladder rung selects a per-owner credential directory (#446), not a host; refactor once the egress policy (#9984) names a credential reference
+defaults/hooks/tests/test-guard-forge-egress.sh	absolute-gh-binary	hook test fixture: the forge-egress guard suite (#9989) must feed the hook the exact bypass commands it denies; fixture input, not an example to copy
+defaults/hooks/tests/test-guard-forge-egress.sh	api-github-literal	hook test fixture: the forge-egress guard suite (#9989) must feed the hook the exact bypass commands it denies; fixture input, not an example to copy
+defaults/hooks/tests/test-guard-forge-egress.sh	direct-http-api	hook test fixture: the forge-egress guard suite (#9989) must feed the hook the exact bypass commands it denies; fixture input, not an example to copy
+defaults/hooks/tests/test-guard-forge-egress.sh	env-i-gh	hook test fixture: the forge-egress guard suite (#9989) must feed the hook the exact bypass commands it denies; fixture input, not an example to copy
+defaults/hooks/tests/test-guard-forge-egress.sh	gh-host-assign	hook test fixture: the forge-egress guard suite (#9989) must feed the hook the exact bypass commands it denies; fixture input, not an example to copy

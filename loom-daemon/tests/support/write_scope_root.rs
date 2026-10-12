@@ -41,6 +41,8 @@ pub fn writable_env(root: &Path) -> Vec<(&'static str, PathBuf)> {
         .expect("chmod fake gh");
     vec![
         ("LOOM_GH_BIN", fake_gh),
+        // Keep a host egress policy's launcher from outranking the fake (#9995).
+        ("LOOM_GH_NO_POLICY_LAUNCHER", PathBuf::from("1")),
         ("LOOM_WRITE_SCOPE_CACHE_DIR", root.join(".write-scope-cache")),
     ]
 }
