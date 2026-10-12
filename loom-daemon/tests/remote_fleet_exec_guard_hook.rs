@@ -201,6 +201,7 @@ fn nested_hops_through_a_non_fleet_host_ask_through_the_hook() {
         "ssh dev-vm.example.test 'ssh loom-worker-1 \"rm -rf ~/GitHub\"'",
         "ssh bastion 'tailscale ssh loom-worker-1 git reset --hard'",
         "ssh bastion ssh ubuntu@100.101.102.103 bash -s < s.sh",
+        "ssh bastion bash -s <<'EOS'\nssh ubuntu@100.101.102.103 'git reset --hard'\nEOS",
     ] {
         let (d, reason, _) = f.run(cmd, &[]);
         assert_eq!(d, "ask", "{cmd}: {reason}");
@@ -210,6 +211,7 @@ fn nested_hops_through_a_non_fleet_host_ask_through_the_hook() {
         "ssh bastion ssh ubuntu@100.101.102.103 uptime",
         "ssh dev-vm.example.test 'ssh 10.0.0.5 rm -rf /tmp/x'",
         "ssh bastion ssh ubuntu@100.101.102.103 bash -s < ro.sh",
+        "ssh bastion bash -s <<'EOS'\nssh ubuntu@100.101.102.103 uptime\nEOS",
     ] {
         let (d, reason, _) = f.run(cmd, &[]);
         assert_eq!(d, "allow", "{cmd}: {reason}");

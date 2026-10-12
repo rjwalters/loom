@@ -34,6 +34,9 @@ impl Fx {
             "git -C ~/GitHub/2am status\ngrep -n foo README.md\n# never: git reset --hard\n",
         )
         .unwrap();
+        std::fs::write(dir.path().join("hop.sh"), "ssh ubuntu@100.64.1.2 'git reset --hard'\n")
+            .unwrap();
+        std::fs::write(dir.path().join("hop-ro.sh"), "ssh ubuntu@100.64.1.2 uptime\n").unwrap();
         Self { dir }
     }
 
@@ -426,6 +429,35 @@ fn read_only_or_non_fleet_nested_hops_pass() {
         "ssh bastion 'cat /etc/hosts | grep ssh'",
         "cat s.sh | ssh bastion ssh ubuntu@100.64.1.2 uptime",
         "echo ubuntu@100.64.1.2 | ssh bastion 'xargs -I{} ssh {} uptime' < s.sh",
+    ] {
+        assert_eq!(f.ask(cmd), None, "{cmd}");
+    }
+}
+
+/// Judge cycle 3 on #11610: a stdin script fed to a non-fleet hop is a
+/// command line of its own on that hop — its text is scanned for nested
+/// hops too, not just classified against the outer target.
+#[test]
+fn stdin_script_fed_to_a_non_fleet_hop_is_scanned_for_nested_hops() {
+    let f = Fx::new();
+    for cmd in [
+        "ssh bastion bash -s <<'EOS'\nssh ubuntu@100.64.1.2 'git reset --hard'\nEOS",
+        "ssh bastion 'bash -s' <<EOS\nssh loom-worker-1 rm -rf ~/GitHub\nEOS",
+        "ssh bastion bash -s <<'EOS'\nssh ubuntu@100.64.1.2 bash -s <<'EOS2'\ngit reset --hard\nEOS2\nEOS",
+        "ssh bastion bash -s <<< \"ssh ubuntu@100.64.1.2 'git reset --hard'\"",
+        "ssh bastion bash -s < hop.sh",
+        "ssh bastion < hop.sh",
+        "cat hop.sh | ssh bastion bash",
+    ] {
+        assert!(f.ask(cmd).is_some(), "should ask: {cmd}");
+    }
+    // The read-only counter-case still passes.
+    for cmd in [
+        "ssh bastion bash -s <<'EOS'\nssh ubuntu@100.64.1.2 uptime\nEOS",
+        "ssh bastion 'bash -s' <<EOS\nssh loom-worker-1 uptime\nEOS",
+        "ssh bastion bash -s < hop-ro.sh",
+        "ssh bastion < hop-ro.sh",
+        "cat hop-ro.sh | ssh bastion bash",
     ] {
         assert_eq!(f.ask(cmd), None, "{cmd}");
     }

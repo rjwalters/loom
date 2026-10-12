@@ -436,6 +436,18 @@ impl Scan<'_> {
         // shell here and any hop nested inside the remote command.
         let fed = self.input_payload(stage, producer);
         self.nested(&remote, fed.clone(), depth);
+        if remote.trim().is_empty() || text_runs_stdin_shell(&remote) {
+            // No inline command (or a remote shell reading its script on
+            // stdin): the fed script is a command line of its own on that
+            // host — scan its text for nested hops too (`ssh bastion
+            // bash -s <<'EOS' … ssh <fleet> … EOS` reaches the fleet
+            // through the bastion). Files the script names are that
+            // host's (`nested` scans with `remote = true`); a script that
+            // cannot be read here already fails closed in `fed`.
+            if let Some(script) = self.stdin_script_text(stage, producer) {
+                self.nested(&script, None, depth);
+            }
+        }
         if let Some(pattern) = destructive_pattern(&remote) {
             let source = "the inline remote command".to_string();
             self.push(transport, target, Payload::Destructive { pattern, source });
@@ -475,6 +487,67 @@ impl Scan<'_> {
             return self.fed.clone();
         }
         self.stdin_payload(stage, producer)
+    }
+
+    /// The text of the script this stage is fed on stdin, when it is known
+    /// here: a heredoc or here-string body, a readable `< file` (the same
+    /// file [`Scan::file_payload`] reads), or the words of an `echo` /
+    /// `printf` / `cat` producer. `None` when the stage inherits an
+    /// enclosing hop's stdin, or the text cannot be read here — the
+    /// classification in [`Scan::stdin_payload`] already fails closed on
+    /// those.
+    fn stdin_script_text(&self, stage: &Simple, producer: Option<&Simple>) -> Option<String> {
+        if let Some(stdin) = &stage.stdin {
+            return self.stdin_text(stdin);
+        }
+        let p = producer?;
+        let ci = command_index(&p.words)?;
+        match base(&p.words[ci].text) {
+            "cat" => {
+                let files: Vec<&Word> = p.words[ci + 1..]
+                    .iter()
+                    .filter(|w| !w.text.starts_with('-') || w.text == "-")
+                    .collect();
+                if files.is_empty() || files.iter().any(|w| w.text == "-") {
+                    return p.stdin.as_ref().and_then(|stdin| self.stdin_text(stdin));
+                }
+                let mut text = String::new();
+                for w in files {
+                    if let Some(body) = self.file_text(w) {
+                        text.push_str(&body);
+                        text.push('\n');
+                    }
+                }
+                Some(text).filter(|t| !t.trim().is_empty())
+            }
+            "echo" | "printf" => {
+                let joined: Vec<&str> = p.words[ci + 1..].iter().map(|w| w.text.as_str()).collect();
+                Some(joined.join(" ")).filter(|t| !t.trim().is_empty())
+            }
+            _ => None,
+        }
+    }
+
+    /// The literal text behind a stdin redirection.
+    fn stdin_text(&self, stdin: &Stdin) -> Option<String> {
+        match stdin {
+            Stdin::Heredoc { body, .. } => Some(body.clone()),
+            Stdin::HereString(w) => Some(w.text.clone()),
+            Stdin::File(w) => self.file_text(w),
+        }
+    }
+
+    /// The content of the file a `<`-redirect word names, when it is a
+    /// readable local file (never one on an intermediate host).
+    fn file_text(&self, w: &Word) -> Option<String> {
+        if self.remote || w.dynamic {
+            return None;
+        }
+        let path = self.resolve(&w.text);
+        std::fs::metadata(&path)
+            .ok()
+            .filter(|m| m.is_file() && m.len() <= MAX_SCRIPT_BYTES)
+            .and_then(|_| std::fs::read_to_string(&path).ok())
     }
 
     /// A redirected stdin as a script: a file is read, a heredoc / here-string
