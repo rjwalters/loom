@@ -149,8 +149,8 @@ pub fn hold_names(labels: &[String]) -> Vec<String> {
 /// Returns `None` for any non-PR stage (`ready_wait`, `sweep.curator`,
 /// `sweep.builder`). For a PR stage (`review_wait`, `doctor`, `merge_wait`,
 /// `merge_hold`) it always returns a reason, in descending precedence:
-/// `operator_hold` > `sequenced` > `conflict` > `ci_red` > `changes_requested`
-/// > `approval_pending` > `ready`. Pure.
+/// `operator_hold`, then `sequenced`, `conflict`, `ci_red`,
+/// `changes_requested`, `approval_pending`, and finally `ready`. Pure.
 #[must_use]
 pub fn merge_blocked_reason(
     stage: FleetStage,
@@ -659,13 +659,8 @@ pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Ut
         // Roll the row's own label-derived facts up into the merge-readiness
         // reason (#11644). Computed last, so it reflects the final stage, hold
         // and flags, whatever source set them.
-        row.merge_blocked_reason = merge_blocked_reason(
-            row.stage,
-            row.hold_kind,
-            &row.holds,
-            row.conflict,
-            row.ci_fail,
-        );
+        row.merge_blocked_reason =
+            merge_blocked_reason(row.stage, row.hold_kind, &row.holds, row.conflict, row.ci_fail);
         let state = repos.entry(repo).or_default();
         state.rows.insert(issue, row);
         state.sources.insert(issue, source);

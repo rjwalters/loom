@@ -426,9 +426,10 @@ fn is_zero(n: &u8) -> bool {
 /// `sweep.builder`) row.
 ///
 /// A closed, label-knowable set with a defined precedence (strongest first):
-/// `operator_hold` > `sequenced` > `conflict` > `ci_red` > `changes_requested`
-/// > `approval_pending` > `ready`. The emitter reads labels only, so it cannot
-/// tell `ci_pending` (needs `statusCheckRollup`) or `base_stale` (needs
+/// `operator_hold`, then `sequenced`, `conflict`, `ci_red`,
+/// `changes_requested`, `approval_pending`, and finally `ready`. The emitter
+/// reads labels only, so it cannot tell `ci_pending` (needs
+/// `statusCheckRollup`) or `base_stale` (needs
 /// `mergeStateStatus`) without a per-PR GraphQL read; those are deliberately
 /// not represented here. For the same reason Champion's merge-risk hold
 /// (`loom:operator` + a comment marker the emitter does not read) collapses
