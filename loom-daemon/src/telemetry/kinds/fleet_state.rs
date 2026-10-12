@@ -676,6 +676,31 @@ pub struct ChampionState {
     pub last_attempt_ok: Option<bool>,
 }
 
+/// Observed Curator role-runner cadence and last run (#11642), the triage
+/// analogue of [`ChampionState`]. A reader uses it to predict `triage_wait`
+/// drain: how fast the Curator empties the `loom:triage` queue, and when it
+/// last ran. Scheduling never implies the Curator did any work — `last_run_ok`
+/// is the runner's outcome for its last attempt, not a count of curations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CuratorState {
+    /// The interval runner currently selects Curator (its effective
+    /// enabled/roles resolvers), even when it is idle this instant.
+    pub interval_enabled: bool,
+    /// The Curator's resolved role-runner interval, in seconds.
+    pub cadence_secs: u64,
+    /// Where that interval came from: `env`, `effective_config` or `built_in`.
+    pub cadence_source: String,
+    /// The most recent recorded Curator attempt for this exact root
+    /// (failures and pre-spawn skips included), process-local. Absent when
+    /// unobserved or after a restart. Never a count of completed curations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_run_at: Option<DateTime<Utc>>,
+    /// The runner outcome for that attempt; never a claim that issues were
+    /// curated. Present exactly when `last_run_at` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_run_ok: Option<bool>,
+}
+
 /// One repo's `ready_wait` queue flow over a trailing window (#11645): how
 /// many issues entered and left the repo's dispatch queue within the window,
 /// so a reader can compute an arrival/drain **rate** (count / effective
@@ -764,6 +789,33 @@ pub struct FleetStateRepo {
     /// absent = unknown, never zero. Additive on `fleet-state/v1`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue_flow: Option<FleetQueueFlow>,
+    /// Pre-ready (`loom:triage`) only (#11642): issues of this repo waiting in
+    /// the triage queue the Curator drains — the depth of this host's last
+    /// complete `loom:triage` listing, the same listing the `triage_wait`
+    /// outcome facts come from. The dispatch-queue analogue of `queue_depth`
+    /// for the pre-ready stage. Read on the collector's forge pass, so it is
+    /// stable between those passes (a tick pass carries the last read value,
+    /// never a stale guess from a partial listing). Absent = unknown (no
+    /// complete triage listing read yet, or an older emitter), never zero.
+    /// Additive on `fleet-state/v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub triage_depth: Option<u32>,
+    /// Pre-ready only (#11642): this repo's `loom:triage` arrival/drain flow
+    /// over a trailing window, the `triage_wait` analogue of `queue_flow`.
+    /// `arrivals` is the triage arrival_rate numerator; `drains` (issues that
+    /// left `loom:triage` — curated, closed or relabelled) is the **Curator
+    /// drain rate** numerator a reader divides by the effective window for
+    /// `curator_rate`. Reuses [`FleetQueueFlow`]. Present once this host has
+    /// observed the repo's triage queue; absent = unknown, never zero.
+    /// Additive on `fleet-state/v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub triage_flow: Option<FleetQueueFlow>,
+    /// The Curator role-runner's cadence and last run for this repo (#11642):
+    /// `curator_last_run_at` and the curator cadence the `triage_wait` model
+    /// needs, the triage analogue of `champion`. Absent = unknown (an older
+    /// emitter). Additive on `fleet-state/v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub curator: Option<CuratorState>,
     /// The census. Absent means unknown at `as_of`, because the repo's
     /// listings were incomplete or not read. It never means zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]

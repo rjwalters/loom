@@ -73,6 +73,7 @@ fn ready(repo: &str, issue: u32, rank: u32) -> ReadyItem {
 fn input() -> FleetInput {
     FleetInput {
         champion: BTreeMap::new(),
+        curator: BTreeMap::new(),
         host_id: "robb-studio".to_string(),
         managed: [REPO, OTHER].iter().map(|s| (*s).to_string()).collect(),
         held: vec![held(REPO, 10, FleetStage::SweepBuilder, false)],
