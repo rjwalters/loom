@@ -487,6 +487,15 @@ pub(crate) enum ScriptPortCommand {
     /// shell-language policy and the #7810 shell-budget gate both send here.
     CheckGuardWiring(super::check_guard_wiring::CheckGuardWiringArgs),
 
+    /// CI gate (#8858): the private-control `POLICY` map in `bundle.rs` may only
+    /// change semantically together with a strictly greater `CONTROL_VERSION`,
+    /// measured against the merge base of `--base` and `--head` straight from
+    /// git objects (no network). Exit 1 on a violation or any missing ref /
+    /// malformed / duplicate / ambiguous declaration. New logic, not a shell port.
+    CheckPrivateControlVersion(
+        super::check_private_control_version::CheckPrivateControlVersionArgs,
+    ),
+
     /// The Renovate-side routing contract (#9418): every `labels` array in the
     /// repo's Renovate config (top-level, `packageRules`, `vulnerabilityAlerts`,
     /// `lockFileMaintenance`, …) contains `loom:review-requested`. Exit 1 on
@@ -527,6 +536,13 @@ pub(crate) enum ScriptPortCommand {
     /// new points check moved here, to keep the #7810 `shell-budget` gate a
     /// non-event for this addition.
     CheckPointsMarker(super::points_marker_check::CheckPointsMarkerArgs),
+
+    /// Per-agent-scope `MemoryMax` (MiB) sized from the repo's observed
+    /// `memory.peak` history (#11094), for `spawn-claude.sh`'s systemd
+    /// scope. Exit 0 = apply the MiB on stdout, 1 = no limit (an answer, not
+    /// an error), 3 = `--probe` found systemd rejects it. New logic behind a
+    /// `contract` script's name, so it lives here, not in the script.
+    RamScopeLimit(super::ram_scope_limit::RamScopeLimitArgs),
 
     /// Refuse content carrying a credential shape — a Claude OAuth/API key,
     /// GitHub/Tailscale/Slack token, AWS key id, private key — whatever its
@@ -691,11 +707,13 @@ impl ScriptPortCommand {
             ScriptPortCommand::CheckStaleBlocked(args) => args.run(),
             ScriptPortCommand::GuardMcpTools(args) => args.run(),
             ScriptPortCommand::CheckGuardWiring(args) => args.run(),
+            ScriptPortCommand::CheckPrivateControlVersion(args) => args.run(),
             ScriptPortCommand::CheckRenovateLabels(args) => args.run(),
             ScriptPortCommand::Guards(cmd) => cmd.run(),
             ScriptPortCommand::PrLatency(args) => args.run(),
             ScriptPortCommand::ParkRecord(cmd) => cmd.run(),
             ScriptPortCommand::CheckPointsMarker(args) => args.run(),
+            ScriptPortCommand::RamScopeLimit(args) => args.run(),
             ScriptPortCommand::SecretScan(args) => args.run(),
             ScriptPortCommand::NotifyClearedBlockers(args) => args.run(),
             ScriptPortCommand::ReleaseStaleBlocked(args) => args.run(),

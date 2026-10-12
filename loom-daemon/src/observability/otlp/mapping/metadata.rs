@@ -2,9 +2,17 @@
 //! token-price estimates, or provider billing guesses enter this mapping.
 use super::{
     any_string, any_value, kv, kv_int, kv_string, AnyValue, ArrayValue, KeyValue, KeyValueList,
+    RepoVisibility,
 };
 use crate::script_helpers::sweep_experiment::ModelUsageTotals;
 use crate::telemetry::{PhaseDuration, SweepOutcomeRecord, SweepStartFacts};
+pub(super) fn visibility_str(visibility: RepoVisibility) -> &'static str {
+    match visibility {
+        RepoVisibility::Public => "public",
+        RepoVisibility::Private => "private",
+    }
+}
+
 const MAX_GROUPS: usize = 64;
 const MAX_STRING_BYTES: usize = 256;
 

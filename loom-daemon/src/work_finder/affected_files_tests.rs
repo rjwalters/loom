@@ -248,8 +248,8 @@ fn run_lane(workspaces: &mut [(Src, Disp)], halted: bool, lane: RedMainLane) -> 
     )
 }
 
-/// #11508 (Judge): the red-main-fix lane (#9244) is not a priority, so it
-/// keeps its overlap bypass. On a verified-red `main` the in-flight work it
+/// #11508 (Judge): the red-main-fix lane (#9244) is not a level; it keeps
+/// its overlap bypass. On a verified-red `main` the in-flight work it
 /// shares `a.rs` with cannot merge, so deferring the fix would deadlock;
 /// a very-important candidate on the same surface is still deferred.
 #[test]

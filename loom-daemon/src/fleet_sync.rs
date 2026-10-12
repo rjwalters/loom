@@ -92,6 +92,7 @@ use crate::fleet_store::{self as store, StoreLocation};
 
 pub mod checkout_ff;
 mod floor_knowledge;
+pub mod git_spawn_log;
 mod loom_ui;
 pub mod offline_floor;
 pub mod roster_clone;

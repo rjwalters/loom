@@ -187,7 +187,7 @@ fn a_verified_red_main_fix_outside_this_hosts_slice_is_not_deferred() {
 }
 
 #[test]
-fn the_published_row_keys_are_level_created_at_number() {
+fn the_published_row_keys_are_main_red_fix_level_created_at_number() {
     let mut multi = vec![(FakeSource::once(vec![issue(1), vi(2)]), full(0))];
     let report = tick_multi(&mut multi, &[100], 10, &[false]);
     let rows = ready_queue::finish(&report.queue, &[]);
@@ -196,6 +196,11 @@ fn the_published_row_keys_are_level_created_at_number() {
     assert!(!rows[0].main_red_fix, "no verified red-main fix here");
     assert_eq!(
         ready_queue::ordering_names(),
-        vec!["level".to_string(), "created_at".into(), "number".into()]
+        vec![
+            "main_red_fix".to_string(),
+            "level".into(),
+            "created_at".into(),
+            "number".into()
+        ]
     );
 }

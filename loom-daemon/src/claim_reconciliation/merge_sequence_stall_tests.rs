@@ -352,6 +352,10 @@ fn a_stalled_chain_escalates_once_naming_head_action_and_held_prs() {
     assert!(chain.needs_escalation());
     let body = chain.comment_body(BOUND);
     assert!(body.starts_with(&escalation_marker(&chain.key())), "{body}");
+    assert!(
+        !body.contains("operator-priority-escalation"),
+        "no star-liveness marker (#11104)"
+    );
     assert!(body.contains("**Operator needed**"), "{body}");
     assert!(body.contains("merge decision on #5"), "{body}");
     assert!(body.contains("#12") && body.contains("#11"), "{body}");
@@ -408,6 +412,20 @@ fn the_second_tick_posts_nothing() {
     assert_eq!(calls.matches("pr comment").count(), 1, "{calls}");
     // A held PR label alone never counts as an escalation.
     assert!(!already_escalated(&[SEQUENCE_LABEL.to_string()], chain));
+}
+
+/// #11104: a stall escalation posted before the marker rename (it carried the
+/// removed star-liveness prefix) still counts as posted, so nothing re-posts.
+#[test]
+fn a_pre_rename_legacy_marker_still_dedupes() {
+    let head = pr(5, "2026-09-30T00:00:00Z", "2026-10-01T00:00:00Z", &["loom:operator"]);
+    let mut ledger = StallLedger::default();
+    ledger.record(&head, &StallCause::HumanHold("loom:operator".into()), 36.0, 11, false);
+    let chain = &ledger.chains[0];
+    let legacy = format!("{LEGACY_MARKER_PREFIX}{} -->\nOperator needed", chain.key());
+    assert!(already_escalated(&[legacy], chain));
+    let other = format!("{LEGACY_MARKER_PREFIX}no-progress:issue-5 -->");
+    assert!(!already_escalated(&[other], chain), "another key is not this chain's");
 }
 
 /// A fake `gh` for the #10089 dedupe test: `api` reads answer from the

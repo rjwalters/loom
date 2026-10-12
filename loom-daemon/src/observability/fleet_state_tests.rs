@@ -67,6 +67,8 @@ fn ready(repo: &str, issue: u32, rank: u32) -> ReadyItem {
         fleet_priority: 100,
         created_at: Some(t0() - Duration::days(3)),
         main_red_fix: false,
+        eligible_reason: None,
+        eligible_at: None,
     }
 }
 
@@ -92,6 +94,7 @@ fn input() -> FleetInput {
                 max_concurrent: 4,
                 occupancy: Some(1),
             }),
+            halts: BTreeMap::new(),
         }),
         capacity: None,
         main_ci: BTreeMap::new(),

@@ -14,6 +14,8 @@
 #   4. LOOM: Deny Bash writes that edit an INSTALLED Loom file in place in a
 #      CONSUMER repo (issue #7995) — the Bash-idiom counterpart of the
 #      Edit/Write denial in guard-worktree-paths.sh
+#   5. LOOM: Deny a cargo build whose target dir is under a root nothing owns
+#      (/tmp, $TMPDIR, ~, ~/.cache, .loom/target-*; issue #11582)
 #
 # The generic repository-hygiene guards (catastrophic denies, SQL/cloud toggles,
 # ASK patterns) live in guard-destructive.sh and are being migrated toward Repo
@@ -1787,6 +1789,32 @@ if [[ "$GH_PR_MERGE_SCAN_TEXT" =~ $FORGE_EGRESS_PREFILTER || "${GH_PR_MERGE_SCAN
 fi
 
 # =============================================================================
+# LOOM: Per-role tool restriction (issue #8256) — a role whose JSON declares
+# toolPolicy.allowedCapabilities cannot reach an undeclared sensitive
+# capability (ssh, cloud CLIs, gh secret, credential stores), however it was
+# persuaded to try. Matching and the allowlist live in `loom-daemon
+# role-tool-policy check`, read from THIS hook's own install (not the cwd, so a
+# PR checkout cannot grant itself a capability). Exit 0 allows, exit 1 +
+# prefix denies; any other answer (no binary, a daemon predating `check`)
+# fails CLOSED for the built-in read-only roles. guard-hooks.md has the rule.
+# =============================================================================
+
+# requires-daemon: role-tool-policy optional   #8256 — `check`; with no usable answer the built-in read-only roles are denied, every other role is allowed.
+if [[ -n "${LOOM_ROLE:-}" ]]; then
+    RTP_RC=0
+    # Only heredoc bodies and named text flags (--body/-m/…) are blanked here:
+    # the positional masking above also blanks quoted FILE operands, which would
+    # hide `grep x "$HOME/.ssh/id_rsa"` from the matcher. The matcher itself
+    # tells a grep/rg pattern from a path.
+    RTP_OUT=$("${LOOM_DAEMON_SELF_BIN:-loom-daemon}" role-tool-policy check --roles-dir "$SCRIPT_DIR/../roles" --workspace "$SCRIPT_DIR/../.." --command "$(mask_data_flag_values "$(mask_var_assigned_heredoc_bodies "$(mask_cat_heredoc_bodies "$COMMAND")")")" 2>/dev/null) || RTP_RC=$?
+    if [[ "$RTP_RC" -eq 1 && "$RTP_OUT" == "BLOCKED [role-tool-policy]"* ]]; then
+        deny "$RTP_OUT" "loom:role-tool-policy"
+    elif [[ "$RTP_RC" -ne 0 && " architect auditor champion curator guide hermit judge " == *" $(printf '%s' "$LOOM_ROLE" | tr '[:upper:]_' '[:lower:]-') "* ]]; then
+        deny "BLOCKED [role-tool-policy]: role '$LOOM_ROLE' is restricted, and loom-daemon role-tool-policy check could not answer (exit $RTP_RC), so this command is denied rather than allowed unchecked (#8256). Roll loom-daemon to a release with 'role-tool-policy check'." "loom:role-tool-policy"
+    fi
+fi
+
+# =============================================================================
 # LOOM: Block pip install -e inside worktrees (issue #2495, hardened by #4079)
 #
 # Editable pip installs overwrite a global .pth file in site-packages.
@@ -1816,6 +1844,26 @@ if [[ -n "$WORKTREE_PATH" ]]; then
     if echo "$COMMAND" | grep -qE '(pip|pip3|uv pip)\s+install\s+.*-e\s' || \
        echo "$COMMAND" | grep -qE '(pip|pip3|uv pip)\s+install\s+.*--editable\s'; then
         deny "BLOCKED: 'pip install -e' is not allowed inside worktrees. Editable installs overwrite the global .pth file, breaking parallel builders (issue #2495), and leave frozen console scripts on PATH that shadow later installs (incident #4079). Run the worktree's own code via '.loom/scripts/run-tests.sh' (it sets PYTHONPATH for you) instead of an editable install." "loom:pip-install-editable-worktree"
+    fi
+fi
+
+# =============================================================================
+# LOOM: Deny a cargo build into a target dir nothing owns (issue #11582) — the
+# enforced form of cargo-target-isolation.md's rule (#8370): no target dir
+# under /tmp, $TMPDIR, ~, ~/.cache or <repo>/.loom/target-*. Resolution
+# (--target-dir, inline/env/export assignment, the session's own value),
+# allowed roots, guards.cargoTargetDir / LOOM_GUARD_CARGO_TARGET_DIR and the
+# deny span all live in `loom-daemon cargo-target-dir guard`
+# (loom-daemon/src/cargo_target_guard.rs). Fork-free prefilter: only a command
+# that mentions cargo or CARGO_TARGET_DIR reaches it.
+# =============================================================================
+
+# requires-daemon: cargo-target-dir optional   #11582 — `guard`; a daemon without the verb exits 2, which this block treats as allow (rule inert).
+if [[ "$GH_PR_MERGE_SCAN_TEXT" == *cargo* || "$GH_PR_MERGE_SCAN_TEXT" == *CARGO_TARGET_DIR* ]]; then
+    CTD_RC=0
+    CTD_DENY=$("${LOOM_DAEMON_SELF_BIN:-loom-daemon}" cargo-target-dir guard --cwd "${CWD:-.}" --for-command "$GH_PR_MERGE_SCAN_TEXT" 2>/dev/null) || CTD_RC=$?
+    if [[ "$CTD_RC" -eq 1 && "$CTD_DENY" == "BLOCKED [cargo-target-dir]"* ]]; then
+        deny "$CTD_DENY" "loom:cargo-target-dir"
     fi
 fi
 

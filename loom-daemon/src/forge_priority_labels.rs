@@ -25,18 +25,12 @@
 //! one warning line naming the issue goes to stderr. The other issues still
 //! count. Exit 0 either way (exit 2 on bad arguments, 3 on Gitea).
 //!
-//! # Audit (`--audit-pr`)
+//! # `--audit-pr` is accepted and ignored (#11104)
 //!
-//! After the PR exists, `--audit-pr URL` posts one comment per issue whose
-//! labels were copied, in #10012 §2's inherited-star marker shape
-//! ([`crate::star_liveness::inherited_star::marker`], `inherited_from=#N`), so
-//! §3's removal rule treats the copied star as inherited from that issue, not
-//! as the operator's own. `requested_at` is the issue's starred-at, exactly as
-//! `create-issue.sh --parent` stars a child ([`crate::star_liveness::parent_link`]).
-//! Best-effort: a failed post warns and moves on. The target repo is resolved
-//! once ([`audit_target`]: `--repo`, else the reference's own `owner/repo`; a
-//! qualified reference disagreeing with `--repo` is refused) and that exact
-//! repo passes [`crate::write_scope::may_write_from`] before any POST.
+//! It used to post an `inherited_from=#N` audit comment on the created PR so
+//! the star-liveness removal rule treated the copied star as inherited. That
+//! subsystem is gone, so nothing reads the comment; the flag stays accepted so
+//! an older `create-pr.sh` keeps working against a newer binary.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -46,8 +40,6 @@ use crate::merge_pr::refs::{
     closing_refs, has_unnegated_closing_ref, loom_issue_trailer_refs, partial_increment_refs,
 };
 use crate::operator_levels::{self, PriorityLevel};
-use crate::star_liveness::forge::{GhStarForge, StarForge};
-use crate::work_finder::operator_priority::{GhTimelineStarredAt, StarredAtSource as _};
 
 /// The issues a PR body inherits priority labels from, ascending.
 ///
@@ -139,18 +131,6 @@ pub fn warning(issue: u32, reason: &str) -> String {
     )
 }
 
-/// The audit comment for labels `labels` copied from `issue` onto `pr`;
-/// `starred_at` is the issue's starred-at (the marker's `requested_at`).
-#[must_use]
-pub fn audit_comment(issue: u32, pr: u32, labels: &[String], starred_at: Option<&str>) -> String {
-    format!(
-        "Priority labels copied from #{issue} at PR creation: `{}` (#10518). They are \
-         inherited from #{issue}, not set on this PR by the operator.\n\n{}",
-        labels.join("`, `"),
-        crate::star_liveness::inherited_star::marker(issue, pr, starred_at)
-    )
-}
-
 /// One issue's label names over REST (`repos/{slug}/issues/N`), so a PR filed
 /// on the GraphQL-exhausted fallback path can still read them.
 ///
@@ -214,113 +194,6 @@ pub fn labels_for_body(root: &Path, body: &str) -> Vec<String> {
     outcome.labels
 }
 
-/// The audit PR number and the repository the whole call targets, resolved
-/// once from `--audit-pr` and `--repo`: `--repo` when given, else the audit
-/// reference's own `owner/repo` (`None`: the checkout's). A qualified audit
-/// reference naming a different repo than `--repo` is refused.
-///
-/// # Errors
-///
-/// `--audit-pr` is not a PR reference, or disagrees with `--repo`.
-pub fn audit_target(
-    audit_pr: Option<&str>,
-    repo: Option<&str>,
-) -> Result<(Option<u32>, Option<String>), String> {
-    let repo = repo.map(str::trim).filter(|r| !r.is_empty());
-    let Some(reference) = audit_pr else {
-        return Ok((None, repo.map(str::to_string)));
-    };
-    let (slug, n) = crate::forge_comment::parse_issue_ref(reference)
-        .ok_or_else(|| format!("--audit-pr: `{reference}` is not a PR reference"))?;
-    let pr = u32::try_from(n).map_err(|_| format!("--audit-pr: #{n} is out of range"))?;
-    match (repo, slug) {
-        (Some(r), Some(s)) if !r.eq_ignore_ascii_case(&s) => Err(format!(
-            "--audit-pr names {s} but --repo is {r}; refusing to post across repositories"
-        )),
-        (Some(r), _) => Ok((Some(pr), Some(r.to_string()))),
-        (None, s) => Ok((Some(pr), s)),
-    }
-}
-
-/// Vet `slug` with `may_write` (production: [`crate::write_scope::may_write_from`]
-/// on exactly that repo), then post the audit comment on `pr` for every issue
-/// in `outcome.sources` through the forge `forge_for` builds for the allowed
-/// repo. A denial posts nothing. Returns the number of comments posted.
-///
-/// # Errors
-///
-/// The write-scope gate denied `slug`.
-fn post_vetted(
-    slug: &str,
-    pr: u32,
-    outcome: &Outcome,
-    may_write: impl FnOnce(&str) -> crate::write_scope::Verdict,
-    forge_for: impl FnOnce(&str) -> Box<dyn StarForge + '_>,
-    mut starred_at: impl FnMut(&str, u32) -> Option<String>,
-) -> anyhow::Result<usize> {
-    let slug = match may_write(slug) {
-        crate::write_scope::Verdict::Allow(nwo) => nwo,
-        crate::write_scope::Verdict::Deny(why) => {
-            anyhow::bail!(
-                "forge priority-labels: refusing the audit comment on {slug}#{pr} (#9548): {why}"
-            )
-        }
-    };
-    let mut forge = forge_for(&slug);
-    let mut posted = 0;
-    for (issue, labels) in &outcome.sources {
-        let at = starred_at(&slug, *issue);
-        let body = audit_comment(*issue, pr, labels, at.as_deref());
-        match forge.post_comment(pr, &body) {
-            Ok(()) => posted += 1,
-            Err(e) => eprintln!(
-                "loom-daemon forge priority-labels: note: could not post the inherited-star \
-                 audit comment on {slug}#{pr} for #{issue}: {e:#} (best-effort)"
-            ),
-        }
-    }
-    Ok(posted)
-}
-
-/// [`post_vetted`] against the live forge from `root`.
-fn post_audits(root: &Path, slug: &str, pr: u32, outcome: &Outcome) -> anyhow::Result<usize> {
-    post_vetted(
-        slug,
-        pr,
-        outcome,
-        |s| crate::write_scope::may_write_from(root, Some(s)),
-        |s| Box::new(GhStarForge::new(root, s)),
-        |s, issue| {
-            GhTimelineStarredAt {
-                gh_bin: std::path::PathBuf::from(crate::gh_invocation::gh_bin()),
-                cwd: Some(root.to_path_buf()),
-                repo: Some(s.to_string()),
-            }
-            .starred_at(issue)
-            .ok()
-            .flatten()
-        },
-    )
-}
-
-/// The audit comment for a PR the daemon itself just opened (the recovery
-/// fallback, which has no `create-pr.sh` to post it): the same
-/// [`audit_target`] / write-scope-vetted [`post_audits`] path as `--audit-pr`.
-/// Returns the number of comments posted.
-///
-/// # Errors
-///
-/// `pr_url` is not a PR reference, or the write-scope gate denied its repo.
-pub fn audit_created_pr(root: &Path, body: &str, pr_url: &str) -> anyhow::Result<usize> {
-    let (pr, repo) = audit_target(Some(pr_url), None).map_err(anyhow::Error::msg)?;
-    let (Some(pr), Some(slug)) = (pr, repo.or_else(|| ambient_repo(root))) else {
-        return Ok(0);
-    };
-    let issues = source_issues(body, Some(&slug));
-    let outcome = collect_live(root, Some(&slug), &issues);
-    post_audits(root, &slug, pr, &outcome)
-}
-
 /// Arguments for the `forge priority-labels` verb ([`cli_entrypoint`]).
 pub struct PriorityLabelsArgs {
     /// Explicit issue numbers (added to whatever the body names).
@@ -329,20 +202,24 @@ pub struct PriorityLabelsArgs {
     pub body_file: Option<std::path::PathBuf>,
     /// The PR's `owner/repo`; `None` resolves from the working directory.
     pub repo: Option<String>,
-    /// Post the inherited-star audit comment on this PR (URL, `owner/repo#N`,
-    /// or a number).
+    /// Accepted and ignored since #11104 (see the module docs).
     pub audit_pr: Option<String>,
 }
 
 /// The `loom-daemon forge priority-labels` verb: print the labels to copy, one
-/// per line; warn (stderr) per failed lookup; with `--audit-pr`, post the
-/// audit comment for each contributing issue. See the module docs.
+/// per line; warn (stderr) per failed lookup. `--audit-pr` is ignored. See
+/// the module docs.
 ///
 /// # Errors
 ///
 /// When the working directory or the body file cannot be read.
 pub fn cli_entrypoint(args: PriorityLabelsArgs) -> anyhow::Result<()> {
     use anyhow::Context as _;
+    // A caller still passing `--audit-pr` is `create-pr.sh`'s post-creation
+    // follow-up, whose only job was the retired audit comment: do nothing.
+    if args.audit_pr.is_some() {
+        return Ok(());
+    }
     let root = std::env::current_dir().context("forge priority-labels: no working directory")?;
     if crate::forge_cmd::detect_forge(Some(&root)) == crate::forge_cmd::ForgeType::Gitea {
         eprintln!("loom-daemon forge priority-labels: GitHub-only; copy priority labels by hand");
@@ -355,25 +232,23 @@ pub fn cli_entrypoint(args: PriorityLabelsArgs) -> anyhow::Result<()> {
             std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?
         }
     };
-    // Resolved once: the lookups, the write-scope gate and the POST all use
-    // this one repo (#10518 review).
-    let (audit, repo) =
-        audit_target(args.audit_pr.as_deref(), args.repo.as_deref()).map_err(anyhow::Error::msg)?;
-    let repo = repo.or_else(|| ambient_repo(&root));
+    let repo = args
+        .repo
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .map(str::to_string)
+        .or_else(|| ambient_repo(&root));
     let mut issues = source_issues(&body, repo.as_deref());
     issues.extend(&args.issues);
     issues.sort_unstable();
     issues.dedup();
     let outcome = collect_live(&root, repo.as_deref(), &issues);
-    // The audit pass re-reads what the first call already warned about.
-    for (issue, reason) in outcome.failed.iter().filter(|_| audit.is_none()) {
+    for (issue, reason) in &outcome.failed {
         eprintln!("loom-daemon forge priority-labels: {}", warning(*issue, reason));
     }
     for label in &outcome.labels {
         println!("{label}");
-    }
-    if let (Some(pr), Some(slug)) = (audit, repo.as_deref()) {
-        post_audits(&root, slug, pr, &outcome)?;
     }
     Ok(())
 }
@@ -448,82 +323,5 @@ mod tests {
             w.contains("#4") && w.contains("HTTP 502: Bad Gateway") && !w.contains('\n'),
             "{w}"
         );
-    }
-
-    #[test]
-    fn the_audit_comment_carries_the_inherited_star_marker() {
-        let c = audit_comment(10, 20, &labels(&[STAR]), Some("2026-10-01T00:00:00Z"));
-        let m = crate::star_liveness::inherited_star::parse_marker(&c).unwrap();
-        assert_eq!(m.root, 10);
-        assert_eq!(m.requested_at.as_deref(), Some("2026-10-01T00:00:00Z"));
-        assert!(c.contains("inherited_from=#10"));
-    }
-
-    // #10518 review: the repo `--audit-pr` posts to is the repo that is vetted.
-    use crate::star_liveness::tests::fake::World;
-    use crate::write_scope::Verdict;
-
-    /// One starred issue (#1) contributing to the audit.
-    fn starred() -> Outcome {
-        collect(LEVELS, &[1], |_| Ok(labels(&[STAR])))
-    }
-
-    /// A gate that allows only `o/r`, recording every repo it was asked about.
-    fn gate(asked: &std::cell::RefCell<Vec<String>>) -> impl FnOnce(&str) -> Verdict + '_ {
-        move |slug: &str| {
-            asked.borrow_mut().push(slug.to_string());
-            if slug.eq_ignore_ascii_case("o/r") {
-                Verdict::Allow("o/r".into())
-            } else {
-                Verdict::Deny(format!("{slug} is not a managed repository"))
-            }
-        }
-    }
-
-    #[test]
-    fn an_unmanaged_audit_url_is_vetted_as_itself_and_denied_with_zero_posts() {
-        let (pr, repo) = audit_target(Some("https://github.com/other/repo/pull/2"), None).unwrap();
-        let (pr, slug) = (pr.unwrap(), repo.unwrap());
-        assert_eq!((pr, slug.as_str()), (2, "other/repo"), "the URL's repo is the target");
-        let (world, asked) = (World::default(), std::cell::RefCell::new(Vec::new()));
-        let r = post_vetted(&slug, pr, &starred(), gate(&asked), |s| world.forge(s), |_, _| None);
-        assert!(r.unwrap_err().to_string().contains("other/repo"));
-        assert_eq!(*asked.borrow(), vec!["other/repo".to_string()], "vets the posted repo");
-        assert!(world.posted("other/repo").is_empty() && world.posted("o/r").is_empty());
-    }
-
-    #[test]
-    fn an_audit_reference_disagreeing_with_repo_is_refused() {
-        for r in ["https://github.com/other/repo/pull/2", "other/repo#2"] {
-            let e = audit_target(Some(r), Some("o/r")).unwrap_err();
-            assert!(e.contains("other/repo") && e.contains("o/r"), "{e}");
-        }
-        assert!(audit_target(Some("not a ref"), Some("o/r")).is_err());
-        // Same repo (any case), or an unqualified number, is not a mismatch.
-        let same = audit_target(Some("https://github.com/O/R/pull/2"), Some("o/r")).unwrap();
-        assert_eq!(same, (Some(2), Some("o/r".to_string())));
-        assert_eq!(audit_target(Some("7"), Some("o/r")).unwrap(), (Some(7), Some("o/r".into())));
-        assert_eq!(audit_target(None, Some("o/r")).unwrap(), (None, Some("o/r".into())));
-    }
-
-    #[test]
-    fn a_permitted_matching_target_posts_one_audit_per_issue() {
-        let (pr, repo) = audit_target(Some("https://github.com/o/r/pull/2"), Some("o/r")).unwrap();
-        let (world, asked) = (World::default(), std::cell::RefCell::new(Vec::new()));
-        let n = post_vetted(
-            repo.as_deref().unwrap(),
-            pr.unwrap(),
-            &starred(),
-            gate(&asked),
-            |s| world.forge(s),
-            |_, _| Some("2026-10-01T00:00:00Z".into()),
-        )
-        .unwrap();
-        assert_eq!(n, 1);
-        assert_eq!(*asked.borrow(), vec!["o/r".to_string()]);
-        let posted = world.posted("o/r");
-        assert_eq!(posted.len(), 1);
-        assert_eq!(posted[0].0, 2);
-        assert!(posted[0].1.contains("inherited_from=#1"));
     }
 }
