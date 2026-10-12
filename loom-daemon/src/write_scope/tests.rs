@@ -431,14 +431,9 @@ fn daemon_write_paths_are_scoped() {
             ),
         ),
         ("worktree_ops/gh.rs", Gated),
-        ("star_liveness/task.rs", Gated),
         (
-            "star_liveness/parent_link.rs",
+            "parent_link.rs",
             Via("cli/forge_action.rs", "`forge parent link` is vetted via write_target"),
-        ),
-        (
-            "star_liveness/forge.rs",
-            Via("star_liveness/task.rs", "repos pass the task's gate"),
         ),
         ("role_runner/roster.rs", Gated),
         ("dep_classify/forge.rs", OriginResolved("dep_classify/cli.rs")),
@@ -540,7 +535,8 @@ fn daemon_write_paths_are_scoped() {
             NotAWrite("parses an agent's own gh argv for the claim it took (#10832), runs none"),
         ),
         ("operator_decision/cli.rs", Gated),
-        ("forge_priority_labels.rs", Gated),
+        ("cli/labels_undeclared.rs", Gated),
+        ("cli/pr_lease.rs", Gated),
         (
             "fleet/drain_reset.rs",
             OperatorOnly("`fleet drain`: the operator's own worker, by name (the claim resetter, split out of fleet/drain.rs by #10089)"),

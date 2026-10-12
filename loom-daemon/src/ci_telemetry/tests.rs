@@ -11,6 +11,7 @@ mod billing_block;
 mod captain_gate;
 mod compaction;
 mod credential_rejection;
+mod cursor_durability;
 #[cfg(unix)]
 mod cycle_lock;
 mod dependency_wait;
@@ -19,6 +20,7 @@ mod job_logs;
 mod join_keys;
 mod journal_rotation;
 mod journal_view;
+mod ledger_retention;
 mod owners;
 mod queue_time;
 mod reader_routing;

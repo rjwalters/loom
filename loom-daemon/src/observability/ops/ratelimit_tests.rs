@@ -62,7 +62,6 @@ fn jobs_are_a_closed_set_and_sources_classify_into_it() {
             "quarantine_reconciliation",
             "ci_telemetry",
             "outcome_journal",
-            "star_liveness",
             "other"
         ]
     );
@@ -74,7 +73,6 @@ fn jobs_are_a_closed_set_and_sources_classify_into_it() {
         ("quarantine_release", Job::QuarantineReconciliation),
         ("sweep_outcome_points_signal", Job::OutcomeJournal),
         ("ci_telemetry", Job::CiTelemetry),
-        ("star_liveness", Job::StarLiveness),
         ("work_finderish", Job::Other),
         ("free text from somewhere", Job::Other),
     ] {

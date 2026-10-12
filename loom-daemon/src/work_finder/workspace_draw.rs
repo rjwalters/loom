@@ -6,12 +6,13 @@
 //! [`crate::priority_pick`]:
 //!
 //! 1. each workspace's candidates are put in their in-workspace order —
-//!    level, then oldest `createdAt`, then issue number
-//!    ([`crate::priority_pick::issue_cmp`]);
+//!    verified red-main fix first (#11547), then level, then oldest
+//!    `createdAt`, then issue number ([`crate::priority_pick::issue_cmp`]);
 //! 2. a workspace is drawn among those with candidates left, weighted by its
 //!    `fleet_priority` ([`crate::priority_pick::weight_for_priority`]); a
-//!    workspace whose next candidate is `loom:very-important` wins the draw
-//!    (the draw is among just those when several qualify);
+//!    workspace whose next candidate is a verified red-main fix wins the
+//!    draw, else one whose next candidate is `loom:very-important` (the draw
+//!    is among just those when several qualify);
 //! 3. the drawn workspace's next candidate is appended, and the draw repeats
 //!    until every candidate is placed.
 //!
@@ -19,18 +20,13 @@
 //! (candidates, weights, roll, pick) are kept on the [`TickReport`] and
 //! exported in `pick.decision`, so a fixed seed reproduces the exact order.
 //!
-//! # Transitional level bridge
-//!
-//! Until the retired labels are migrated (#11103 slices 2 and 4),
-//! [`effective_level`] also maps the legacy signals onto the new levels:
-//! the star (`loom:operator-priority`) is `important`, a level-2 star and a
-//! verified red-main fix are `very-important`. The bridge goes with the
-//! legacy readers.
+//! The level is the issue's own `loom:important` / `loom:very-important`
+//! label ([`Level::of`]); there is no legacy bridge (#11508).
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, VecDeque};
 
-use super::{PriorityCandidate, TickReport, WorkItem};
+use super::{PriorityCandidate, TickReport};
 use crate::priority_pick::{self, IssueKey, Level, PickRng, WorkspaceDraw, WorkspaceEntry};
 use crate::workspace_registry::DEFAULT_WORKSPACE_PRIORITY;
 
@@ -74,30 +70,17 @@ pub fn workspace_idx(key: &str) -> Option<usize> {
     key.parse().ok()
 }
 
-/// `item`'s priority level: its `loom:important` / `loom:very-important`
-/// label, raised by the transitional legacy bridge (see the module docs).
-/// `red_fix` is whether it is a red-main fix on a verified-red `main`.
-#[must_use]
-pub fn effective_level(item: &WorkItem, red_fix: bool) -> Level {
-    let legacy = if red_fix || item.operator_level() >= 2 {
-        Level::VeryImportant
-    } else if item.is_operator_priority() {
-        Level::Important
-    } else {
-        Level::Default
-    };
-    Level::of(&item.labels).max(legacy)
-}
-
 fn issue_key(c: &PriorityCandidate) -> IssueKey {
     IssueKey {
         number: c.number,
         created_at: c.created_at.clone(),
         level: c.level,
+        main_red_fix: c.main_red_fix,
     }
 }
 
-/// The in-workspace order: level, oldest `createdAt`, issue number.
+/// The in-workspace order: verified red-main fix, level, oldest
+/// `createdAt`, issue number.
 #[must_use]
 pub fn in_workspace_cmp(a: &PriorityCandidate, b: &PriorityCandidate) -> std::cmp::Ordering {
     priority_pick::issue_cmp(&issue_key(a), &issue_key(b))
@@ -133,6 +116,7 @@ pub fn draw_order(
                         .copied()
                         .unwrap_or(DEFAULT_WORKSPACE_PRIORITY),
                     has_very_important: next.level == Level::VeryImportant,
+                    has_red_main_fix: next.main_red_fix,
                 })
             })
             .collect();

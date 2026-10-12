@@ -25,6 +25,13 @@ const MAX_HOLD_SECS: i64 = 3600;
 /// A hold with no `retry-after` (and no exhausted primary window).
 const DEFAULT_HOLD_SECS: i64 = 60;
 
+/// Filename prefix of a hold in the shared store directory.
+const HOLD_PREFIX: &str = "stale-checks-hold-";
+
+/// A hold file last written longer ago than this is expired whatever it
+/// says: no hold outlives [`MAX_HOLD_SECS`] once read back.
+const PRUNE_HORIZON: Duration = Duration::from_secs(2 * 3600);
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Hold {
     until: i64,
@@ -71,7 +78,7 @@ pub(crate) fn plant_hold_for_test(scope: &str, until: i64) {
 
 fn hold_path(scope: &str) -> Option<PathBuf> {
     crate::forge_etag_store::daemon_store_dir()
-        .map(|d| crate::forge_etag_store::entry_path_with_prefix(&d, "stale-checks-hold-", scope))
+        .map(|d| crate::forge_etag_store::entry_path_with_prefix(&d, HOLD_PREFIX, scope))
 }
 
 /// When the hold on `scope` ends, if one is in force at `now`. A stored value
@@ -123,6 +130,43 @@ pub(crate) fn note_secondary(scope: &str, retry_at: Option<i64>) {
     state::hold(scope, until);
     if let Some(path) = hold_path(scope) {
         crate::forge_etag_store::write_private_json(&path, &Hold { until });
+        if let Some(dir) = path.parent() {
+            prune(dir, now);
+        }
+    }
+}
+
+/// Remove expired holds from `dir` (#11478): one whose `until` has passed,
+/// one that cannot be read, or one older than [`PRUNE_HORIZON`]. Every scope
+/// that ever hit a limit would otherwise leave its file behind for good.
+pub(crate) fn prune(dir: &std::path::Path, now: i64) {
+    if !crate::forge_etag_store::private_dir(dir, false) {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let wall = std::time::SystemTime::now();
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let ours = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.starts_with(HOLD_PREFIX) && n.ends_with(".json"));
+        if !ours {
+            continue;
+        }
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| wall.duration_since(t).ok())
+            .is_some_and(|age| age > PRUNE_HORIZON);
+        let expired = crate::forge_etag_store::read_private_json::<Hold>(&path)
+            .is_none_or(|h| h.until <= now);
+        if old || expired {
+            let _ = std::fs::remove_file(&path);
+        }
     }
 }
 

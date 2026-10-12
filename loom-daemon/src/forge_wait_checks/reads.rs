@@ -248,6 +248,27 @@ impl GhReads {
         Ok(v)
     }
 
+    /// `GET repos/{o}/{r}/commits/{sha}/check-suites?app_id=…` — the
+    /// GitHub Actions check suites for `sha` (#11389, `forge_wait_checks::no_run`).
+    pub fn actions_suites(&mut self, sha: &str, app_id: u64) -> Result<Value, ReadError> {
+        let url = format!(
+            "repos/{}/commits/{sha}/check-suites?app_id={app_id}&per_page={PER_PAGE}",
+            self.nwo()
+        );
+        let body = self.get_checks_entry(&url, ops::CI_CHECK_RUNS_FOR_SHA)?;
+        parse(&body, "check-suites")
+    }
+
+    /// `GET repos/{o}/{r}/actions/runs?head_sha=…` — the workflow runs on
+    /// `sha`, read only to drop a superseded twin run's check-runs (#11097,
+    /// [`crate::merge_pr::superseded_runs`]). One page: a head with more
+    /// runs than that reads as truncated there, which drops nothing.
+    pub fn workflow_runs(&mut self, sha: &str) -> Result<Value, ReadError> {
+        let url = format!("repos/{}/actions/runs?head_sha={sha}&per_page={PER_PAGE}", self.nwo());
+        let body = self.get_checks_entry(&url, ops::CI_WORKFLOW_RUNS_FOR_SHA)?;
+        parse(&body, "workflow runs")
+    }
+
     /// `GET repos/{o}/{r}` → `default_branch` (SHA mode with no `--base`).
     pub fn default_branch(&mut self) -> Result<String, ReadError> {
         let url = format!("repos/{}", self.nwo());

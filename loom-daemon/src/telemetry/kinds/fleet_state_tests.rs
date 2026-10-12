@@ -28,13 +28,11 @@ fn listed_row() -> FleetStateRow {
 }
 
 /// A realistic `ready_wait` row: rank and every ranking input, worst case
-/// (starred, dated, level 2).
+/// (dated, level 2).
 fn ready_row(issue: u32, rank: u32) -> FleetStateRow {
     FleetStateRow {
         entered_at_lower_bound: true,
         rank: Some(rank),
-        star: true,
-        star_at: Some(at(9, 30)),
         level: 2,
         fleet_priority: Some(100),
         created_at: Some(at(8, 0) - Duration::days(30)),
@@ -71,6 +69,7 @@ fn record() -> FleetStateRecord {
             repo: "rjwalters/loom".to_string(),
             visibility: RepoVisibility::Public,
             main_ci: None,
+            halt: None,
             ready_complete: true,
             ready_replace: false,
             census: Some(FleetPrCensus {
@@ -93,6 +92,7 @@ fn anchor_with(n: u32) -> FleetStateRecord {
             repo: (*repo).to_string(),
             visibility: RepoVisibility::Private,
             main_ci: None,
+            halt: None,
             ready_complete: true,
             ready_replace: false,
             census: Some(FleetPrCensus::default()),
@@ -215,7 +215,8 @@ fn a_listed_row_omits_host_and_slot_and_flags_a_lower_bound_entry() {
 }
 
 /// A `ready_wait` row carries this host's planner rank and the planner's
-/// inputs: star, starred-at, level, fleet priority and the age instant.
+/// inputs: level, fleet priority and the age instant (no retired `star` /
+/// `star_at`, #11510).
 #[test]
 fn a_ready_row_carries_rank_and_the_planner_inputs() {
     let wire = serde_json::to_value(ready_row(7, 3)).unwrap();
@@ -229,9 +230,7 @@ fn a_ready_row_carries_rank_and_the_planner_inputs() {
             "issue",
             "level",
             "rank",
-            "stage",
-            "star",
-            "star_at"
+            "stage"
         ]
     );
     assert_eq!(wire["stage"], "ready_wait");
@@ -350,6 +349,7 @@ fn removals_and_census_only_repos_survive_a_split() {
             repo: "acme/a".to_string(),
             visibility: RepoVisibility::Private,
             main_ci: None,
+            halt: None,
             ready_complete: true,
             ready_replace: false,
             census: None,
@@ -360,6 +360,7 @@ fn removals_and_census_only_repos_survive_a_split() {
             repo: "acme/b".to_string(),
             visibility: RepoVisibility::Private,
             main_ci: None,
+            halt: None,
             ready_complete: true,
             ready_replace: false,
             census: Some(FleetPrCensus::default()),
@@ -400,6 +401,7 @@ fn ready_replace_is_additive_and_rides_every_chunk() {
         repo: "acme/a".to_string(),
         visibility: RepoVisibility::Private,
         main_ci: None,
+        halt: None,
         ready_complete: false,
         ready_replace: true,
         census: None,

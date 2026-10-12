@@ -60,6 +60,7 @@ pub mod disposition;
 mod envelope;
 pub mod kinds;
 pub mod no_phase_cause;
+pub mod phase_tap_usage;
 mod sweep_identity;
 pub use sweep_identity::SweepIdentityRecord;
 pub mod fixture;
@@ -69,14 +70,15 @@ pub mod queue_snapshot;
 pub mod repo_identity;
 mod start_facts;
 pub use start_facts::{
-    effort_source, model_source, SweepStartFacts, SWEEP_START_FACT_LOG_ATTRIBUTE_KEYS,
+    effort_source, model_source, DispatchOrigin, SweepStartFacts,
+    SWEEP_START_FACT_LOG_ATTRIBUTE_KEYS,
 };
 pub mod trace;
 pub mod visibility;
 pub use ci::{CiDurationRecord, CiJobLogRecord, CiJobRecord, CiRunRecord};
 pub use disposition::{
     apply_noop_loop_class, classify_disposition, result_for_disposition, DispositionSignals,
-    IssueEndState, SweepDisposition, NO_PHASE_SIGNAL_CLASS,
+    IssueEndState, SweepDisposition, NO_PHASE_SIGNAL_CLASS, SPAWN_DEATH_CLASS,
 };
 pub use envelope::TelemetryEnvelope;
 pub use kinds::{
@@ -85,6 +87,7 @@ pub use kinds::{
 };
 pub use no_phase_cause::NoPhaseCause;
 pub use ops::MetricPointsRecord;
+pub use phase_tap_usage::PhaseTapUsageRow;
 pub use queue_snapshot::QueueSnapshotRecord;
 
 /// Current telemetry wire-schema version. Bump on any breaking change to the
@@ -371,8 +374,10 @@ pub mod trigger {
     /// work already done, or the Curator closed or rescoped the issue (Issue
     /// #11429). Inferred from the journal; says nothing about who dispatched.
     pub const REDISPATCH_AFTER_SUCCESS: &str = "redispatch_after_success";
-    /// A human or external tool asked for this sweep. Reserved for a dispatch
-    /// path that knows an operator acted; the journal inference never sets it.
+    /// An operator re-dispatched an issue that already had an attempt on this
+    /// host. Set only from the recorded `dispatch_origin=operator` (Issue
+    /// #11444, `DispatchOrigin::apply_to_trigger`); the journal inference
+    /// never sets it.
     pub const OPERATOR_REDISPATCH: &str = "operator_redispatch";
     /// The dispatch reason was not observable. Counted, never silently merged.
     pub const UNKNOWN: &str = "unknown";
@@ -949,6 +954,13 @@ pub struct SweepOutcomeRecord {
     /// a bounded reason. Present only on records of that class.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub no_phase_cause: Option<NoPhaseCause>,
+    /// Usage of out-of-process phases (`worker run`, Issues #11360/#11488),
+    /// one row per `(role, tap, model)`, built from the same rows the
+    /// host-local outcome journal carries. Absent (never an empty array) when
+    /// no phase ran out of process, so such a record serializes as it did
+    /// before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub phase_tap_usage: Vec<PhaseTapUsageRow>,
     /// 1-based count of terminal sweeps for this repo#issue in this host's
     /// durable outcome journal (Issue #9444) — the attempt this sweep was.
     /// Absent when the journal could not be read.
@@ -964,6 +976,13 @@ pub struct SweepOutcomeRecord {
     /// `unknown` is counted, never silently merged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trigger: Option<String>,
+    /// Who asked for this sweep (Issue #11444) — a [`DispatchOrigin`] wire
+    /// value, copied from the sweep's start facts so `sweep.outcome` agrees
+    /// with `sweep.started`. Absent on journal lines that predate it and on
+    /// sweeps this daemon did not dispatch (adopted, PR-set); never
+    /// fabricated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_origin: Option<String>,
     /// In-sweep rework events (Issue #9444) observed by the paths that
     /// performed them, in event order. Absent (never `[]`) when none were
     /// observed for this sweep.

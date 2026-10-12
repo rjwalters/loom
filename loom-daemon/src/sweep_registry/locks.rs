@@ -187,8 +187,8 @@ pub(crate) struct LockOwner {
     /// default — which is a genuinely unknown level, never a fabricated one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) effort: Option<String>,
-    /// Whether this sweep took the host's single `loom:operator-priority`
-    /// overflow slot (#9244), stamped by [`SweepRegistry::mark_overflow`] the
+    /// Whether this sweep took the host's single overflow slot (#9244,
+    /// inert since #11508), stamped by [`SweepRegistry::mark_overflow`] the
     /// moment the work finder admits the over-limit dispatch (Issue #9314).
     ///
     /// Same schema-evolution contract and the same *reason* as

@@ -505,7 +505,7 @@ mod tests {
     fn unrelated_labels_are_ignored() {
         let signals = signals_from_events(&events(&[
             ("2026-09-18T12:00:00Z", "loom:treating"),
-            ("2026-09-18T12:01:00Z", "tier:goal-supporting"),
+            ("2026-09-18T12:01:00Z", "enhancement"),
         ]));
         assert_eq!(signals, TimelineSignals::default());
     }

@@ -155,8 +155,8 @@ enum Commands {
     },
 
     /// Show the work finder's ready queue in its real dispatch order
-    /// (starred `loom:operator-priority` first, then red-main fixes, workspace
-    /// priority, oldest first — #9244) with what the last
+    /// (verified red-main fixes first, then priority level, oldest first —
+    /// #11103, #11547) with what the last
     /// tick did with each issue and why, plus a freshness line (Issue #8852).
     Queue {
         /// Emit machine-readable JSON instead of the human-readable table.
@@ -347,14 +347,8 @@ enum Commands {
         #[arg(long)]
         ignore_host_constraint: bool,
 
-        /// Override the host-class gate (Issue #9034): by default, dispatching a
-        /// `loom:heavy` issue on a host classified `host_class: local-dev`
-        /// (`autonomous.workFinder.hostClass` / `LOOM_HOST_CLASS`) refuses with a
-        /// clear message. Pass `--allow-local` to dispatch anyway — an operator
-        /// hand-dispatching a known-heavy issue on their own machine on purpose is
-        /// not the case this gate exists to stop.
-        #[arg(long)]
-        allow_local: bool,
+        #[command(flatten)]
+        tap: cli::dispatch::DispatchTapArgs,
     },
 
     /// Cancel a running sweep via the running daemon (Issue #4980): the `dispatch`

@@ -258,7 +258,8 @@ fn rust_transcript(body: &str, gh_rc: i32, pre: PreMerge) -> String {
             Step::Info(m) => out.push_str(&format!("INFO\t{m}\n")),
             Step::Warning(m) => out.push_str(&format!("WARNING\t{m}\n")),
             Step::Reopen => out.push_str("REOPEN\n"),
-            Step::Swap => out.push_str("SWAP\n"),
+            // The corpus carries no hold marker, so every swap is the plain one.
+            Step::Swap(_) => out.push_str("SWAP\n"),
         }
     }
     out

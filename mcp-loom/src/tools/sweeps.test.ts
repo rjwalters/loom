@@ -10,11 +10,13 @@
  */
 
 import { describe, expect, it } from "vitest";
+import { buildDispatchSweepPayload } from "./sweep-dispatch-payload.js";
 import {
   extractRuntimeRejection,
   formatDispatchTokenLine,
   formatRuntimeRejection,
   formatStructuredError,
+  sweepTools,
   type RuntimeRejection,
 } from "./sweeps.js";
 
@@ -155,5 +157,49 @@ describe("formatStructuredError", () => {
 
   it("never throws on a fully empty payload", () => {
     expect(formatStructuredError({})).toBe("Unknown structured error");
+  });
+});
+
+describe("dispatch_sweep per-dispatch tap schema (issue #11284)", () => {
+  const tool = sweepTools.find((t) => t.name === "dispatch_sweep");
+  const schema = tool?.inputSchema as {
+    properties: Record<string, { type: string }>;
+    required: string[];
+  };
+
+  it("accepts optional runtime and model_profile strings", () => {
+    expect(schema.properties.runtime?.type).toBe("string");
+    expect(schema.properties.model_profile?.type).toBe("string");
+  });
+
+  it("keeps them optional so legacy callers are unchanged", () => {
+    expect(schema.required).toEqual(["kind"]);
+  });
+});
+
+/**
+ * Issue #11444: the `dispatch_sweep` tool is an operator surface, so its
+ * request names `dispatch_origin: "operator"`. The daemon records an absent
+ * origin as `unknown`, so the field must always be sent.
+ */
+describe("buildDispatchSweepPayload", () => {
+  it("names the operator as the dispatch origin", () => {
+    const payload = buildDispatchSweepPayload({ kind: { type: "Issue", value: 11444 } });
+    expect(payload.dispatch_origin).toBe("operator");
+  });
+
+  it("keeps the existing wire defaults", () => {
+    expect(buildDispatchSweepPayload({ kind: { type: "Issue", value: 7 } })).toEqual({
+      kind: { type: "Issue", value: 7 },
+      idempotency_key: null,
+      model: null,
+      effort: null,
+      depends_on: null,
+      workspace_root: null,
+      force: false,
+      runtime: null,
+      model_profile: null,
+      dispatch_origin: "operator",
+    });
   });
 });

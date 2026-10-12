@@ -33,7 +33,6 @@ fn qrow_held(
     ready_queue::TickQueueRow {
         // One priority per workspace, so rank order is (ws, number).
         key: key(ws, u32::try_from(ws).unwrap() * 10, number),
-        tier: None,
         disposition: Some(d),
         detail: None,
         updated_at: None,

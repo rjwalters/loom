@@ -79,6 +79,7 @@ pub fn daemon_bin() -> PathBuf {
 #[allow(dead_code)]
 pub fn isolate_daemon_state(cmd: &mut Command, fixture: &Path) {
     deny_real_gh(cmd);
+    deny_real_docker(cmd);
     cmd.current_dir(fixture)
         // #11111: a sweep's environment carries the production daemon's
         // `LOOM_DAEMON_SUPERVISOR=systemd`. A test daemon must never believe
@@ -182,6 +183,20 @@ pub fn deny_real_gh(cmd: &mut Command) {
     cmd.env("LOOM_GH_NO_POLICY_LAUNCHER", "1");
     if std::env::var_os("LOOM_GH_BIN").is_none() {
         cmd.env("LOOM_GH_BIN", gh_stub_path());
+    }
+}
+
+/// Point a spawned daemon's `LOOM_DOCKER_BIN` at a path that does not exist
+/// (#11449), so a sweep cancel's container teardown fails its spawn at once
+/// (the debug-level "no docker" no-op) instead of running the host's real
+/// `docker ps` — which, against a wedged Docker backend, hangs and outlives
+/// the test. The real binary is not `cfg(test)`, so the lib's own test-only
+/// fence does not apply to it. A caller-set value in the parent environment
+/// (an explicit stub) wins.
+#[allow(dead_code)]
+pub fn deny_real_docker(cmd: &mut Command) {
+    if std::env::var_os("LOOM_DOCKER_BIN").is_none() {
+        cmd.env("LOOM_DOCKER_BIN", "/nonexistent/loom-test-docker-disabled-11449");
     }
 }
 

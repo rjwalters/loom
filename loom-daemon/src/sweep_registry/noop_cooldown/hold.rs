@@ -27,8 +27,9 @@
 //! [`NoopCooldownConfig::hold_threshold`] the issue is parked with a forge
 //! label — `loom:blocked` for dependencies, `loom:operator-only` +
 //! `loom:operator-decision` for a human gate or when the kind is unclear — and
-//! one marked comment says why and what unparks it. `loom:operator-priority`
-//! never exempts an issue and is never touched; the park labels are already in
+//! one marked comment says why and what unparks it. A priority label
+//! (`loom:important` / `loom:very-important`) never exempts an issue and is
+//! never touched; the park labels are already in
 //! [`crate::work_finder::SKIP_LABELS`], which every candidate path applies.
 //!
 //! The label write is the deliverable, the comment is commentary (the #9239
@@ -238,6 +239,31 @@ impl SweepRegistry {
         }
     }
 
+    /// The reaper's feed for the under-60-s form of the same loop (Issue
+    /// #11438): a checkpoint-less **clean** exit (code 0) that the daemon saw
+    /// reach no phase at all, with a VERIFIED absence of an open linked PR,
+    /// that did not self-report (a self-report was already counted over IPC).
+    /// This is the shape journaled as `no-phase-signal` (and, before #11438,
+    /// `spawn-death`): "no build work", released, re-dispatched forever.
+    pub(crate) fn note_clean_phaseless_exit_outcome(
+        &mut self,
+        issue: u32,
+        sweep_id: &str,
+        open_pr: Option<OpenPrProbe>,
+        exit_code: Option<i32>,
+    ) {
+        if exit_code != Some(0)
+            || open_pr != Some(OpenPrProbe::NoneOpen)
+            || self.noop_cooldown_config.hold_threshold == 0
+            || self.noop_release_covers_dispatch(issue, sweep_id)
+            || self.sampled_pr_number(sweep_id).is_some()
+            || self.sampled_only_curator(sweep_id).is_some()
+        {
+            return;
+        }
+        self.note_noop_for_hold(issue, Some(sweep_id), None);
+    }
+
     /// Count one no-op toward `issue`'s hold (Issue #10156) and park it when
     /// the streak reaches [`NoopCooldownConfig::hold_threshold`].
     ///
@@ -439,8 +465,8 @@ impl SweepRegistry {
             .map_err(|(_, detail)| detail)
     }
 
-    /// Park `issue` and say why. Never touches `loom:building` or
-    /// `loom:operator-priority`.
+    /// Park `issue` and say why. Never touches `loom:building` or a priority
+    /// label.
     fn apply_noop_hold(
         &self,
         issue: u32,
@@ -501,8 +527,8 @@ impl SweepRegistry {
              **Held after {count} consecutive no-op sweeps.** Each of the last {count} sweeps \
              concluded there was nothing to do, and nothing this issue depends on changed in \
              between — {needs}. It now carries {} instead of being offered again \
-             (Issue #10156). A `loom:operator-priority` star does not exempt an issue from this \
-             hold and has been left in place.\n\n{why}Fingerprint compared: `{announced}`\n\n\
+             (Issue #10156). A priority label (`loom:important` / `loom:very-important`) does \
+             not exempt an issue from this hold and has been left in place.\n\n{why}Fingerprint compared: `{announced}`\n\n\
              **What unparks it**: {unparks}. Any new comment, label change, linked-PR change or \
              dependency state change also restarts the count from zero.",
             labels.join(" + "),

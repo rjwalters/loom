@@ -25,9 +25,10 @@
 //!   trusted `loom:sequence` markers and base-branch stacking are
 //!   authoritative constraints; everything else orders ready-first (#10371,
 //!   [`ready`]: approved PRs ahead of non-approved ones), then oldest-first
-//!   within a tier (stable tiebreak on PR number), except that a starred
-//!   (`loom:operator-priority`) placeable PR goes before an unstarred one of
-//!   its tier and a stalled no-verdict PR goes last (#10060). A constraint
+//!   within a tier (stable tiebreak on PR number), except that a placeable
+//!   PR of a higher priority level (`loom:very-important`, then
+//!   `loom:important`, #11103) goes before a lower one of its tier and a
+//!   stalled no-verdict PR goes last (#10060). A constraint
 //!   cycle skips the whole component for that tick — a half-rewritten order
 //!   is worse than a deferred one.
 //! - **Apply.** Edges are a DAG over DIRECT overlap (#10060): a follower
@@ -321,9 +322,10 @@ pub fn order_component(members: &[&SequencePr], constraints: &[(u32, u32)]) -> O
 /// [`order_component`] with the placeable-set ranking: among members that
 /// are placeable right now (no unplaced constraint predecessor), ready
 /// members go first (#10371, [`ready::tier`]); within a tier a `stalled`
-/// member goes last and a starred one goes first (#10060), then
-/// oldest-first. A rank never overrides a constraint edge; with every member
-/// in one tier, no star and no stall the order is exactly the oldest-first one.
+/// member goes last and a higher priority level goes first (#10060,
+/// #11510), then oldest-first. A rank never overrides a constraint edge;
+/// with every member in one tier, one level and no stall the order is
+/// exactly the oldest-first one.
 #[must_use]
 pub fn order_component_with(
     members: &[&SequencePr],
@@ -348,10 +350,11 @@ pub fn order_component_with(
     let mut ordered = Vec::with_capacity(members.len());
     while !ready.is_empty() {
         // Among the currently placeable: ready before not ready, then
-        // not-stalled before stalled, starred before unstarred, then
+        // not-stalled before stalled, higher level before lower, then
         // oldest-first — a stable total order independent of listing order.
-        let rank =
-            |p: &SequencePr| (ready::tier(p), stalled.contains(&p.number), !stall::starred(p));
+        let rank = |p: &SequencePr| {
+            (ready::tier(p), stalled.contains(&p.number), std::cmp::Reverse(stall::level(p)))
+        };
         ready.sort_by(|a, b| {
             let (pa, pb) = (by_number[a], by_number[b]);
             (rank(pa), &pa.created_at, pa.number).cmp(&(rank(pb), &pb.created_at, pb.number))

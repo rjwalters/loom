@@ -219,6 +219,7 @@ fn opts(timeout: u64) -> Opts {
         max_interval: DEFAULT_MAX_INTERVAL,
         settle_polls: zero_checks::DEFAULT_SETTLE_POLLS,
         settle_interval: zero_checks::DEFAULT_SETTLE_INTERVAL,
+        no_run_grace: Duration::from_secs(no_run::DEFAULT_GRACE),
     }
 }
 
@@ -802,4 +803,135 @@ fn a_persistent_secondary_rate_limit_ends_as_read_failed_naming_the_class() {
         }
         other => panic!("expected ERROR, got {other:?}"),
     }
+}
+
+fn suites_url(sha: &str) -> String {
+    format!("repos/o/r/commits/{sha}/check-suites?app_id=15368&per_page=100")
+}
+
+fn suite_reads(f: &Forge) -> usize {
+    f.calls()
+        .iter()
+        .filter(|c| c.contains("/check-suites"))
+        .count()
+}
+
+/// #11389: a skip-CI head has no Actions suite. Past the grace period, with
+/// only an unregistered required context to wait for, that is `NO-RUN` with
+/// a hint naming the skip marker — not a 30-minute `TIMEOUT`.
+#[test]
+fn zero_actions_suites_past_the_grace_period_is_no_run() {
+    let f = Forge::new();
+    f.runs(SHA, &[]);
+    f.required(&["Backend"]);
+    f.serve(&suites_url(SHA), &json!({"total_count": 0, "check_suites": []}));
+    let mut clock = FakeClock::new();
+    let (o, notes) = wait(&mut f.reads(), &Selector::Pr(42), &opts(1800), &mut clock);
+    assert_eq!(o, Outcome::NoRun { sha: SHA.into() });
+    assert_eq!(o.sentinel(), format!("LOOM-CHECKS-NO-RUN {SHA}"));
+    assert_eq!(o.exit_code(), 5);
+    assert!(clock.now >= Duration::from_secs(no_run::DEFAULT_GRACE), "{:?}", clock.now);
+    assert!(clock.now < Duration::from_secs(300), "ended early: {:?}", clock.now);
+    assert!(notes.iter().any(|n| n.contains("skip-CI marker")), "{notes:?}");
+
+    // Other apps' finished checks do not hide it.
+    let f = Forge::new();
+    f.runs(SHA, &[run("labeler", "completed", Some("success"))]);
+    f.required(&["Backend"]);
+    f.serve(
+        &suites_url(SHA),
+        &json!({"total_count": 1, "check_suites": [{"app": {"slug": "codecov", "id": 254}}]}),
+    );
+    let o = go(&f, Selector::Pr(42), &opts(1800), &mut FakeClock::new());
+    assert_eq!(o, Outcome::NoRun { sha: SHA.into() });
+}
+
+/// A queued Actions suite is a run that has not started: keep waiting, and
+/// stop asking once a suite has been seen.
+#[test]
+fn a_queued_actions_suite_still_waits() {
+    let f = Forge::new();
+    f.runs(SHA, &[]);
+    f.required(&["Backend"]);
+    f.serve(
+        &suites_url(SHA),
+        &json!({"total_count": 1, "check_suites": [
+            {"app": {"slug": "github-actions", "id": 15368}, "status": "queued"}]}),
+    );
+    let o = go(&f, Selector::Pr(42), &opts(600), &mut FakeClock::new());
+    assert_eq!(
+        o,
+        Outcome::Timeout {
+            sha: SHA.into(),
+            pending: vec!["Backend".into()]
+        }
+    );
+    assert_eq!(suite_reads(&f), 1);
+}
+
+/// Never probed before the grace period, nor while an observed check runs;
+/// a failed lookup is never `NO-RUN`.
+#[test]
+fn no_run_is_not_probed_early_or_while_a_check_runs_and_fails_toward_timeout() {
+    let f = Forge::new();
+    f.runs(SHA, &[]);
+    f.required(&["Backend"]);
+    f.serve(&suites_url(SHA), &json!({"total_count": 0, "check_suites": []}));
+    let o = go(&f, Selector::Pr(42), &opts(100), &mut FakeClock::new());
+    assert!(matches!(o, Outcome::Timeout { .. }), "{o:?}");
+    assert_eq!(suite_reads(&f), 0);
+
+    let f = Forge::new();
+    f.runs(SHA, &[run("build", "in_progress", None)]);
+    f.serve(&suites_url(SHA), &json!({"total_count": 0, "check_suites": []}));
+    let o = go(&f, Selector::Pr(42), &opts(600), &mut FakeClock::new());
+    assert!(matches!(o, Outcome::Timeout { .. }), "{o:?}");
+    assert_eq!(suite_reads(&f), 0);
+
+    // No fixture: the lookup 404s, once, and the wait times out as before.
+    let f = Forge::new();
+    f.runs(SHA, &[]);
+    f.required(&["Backend"]);
+    let (o, notes) = wait(&mut f.reads(), &Selector::Pr(42), &opts(600), &mut FakeClock::new());
+    assert!(matches!(o, Outcome::Timeout { .. }), "{o:?}");
+    assert_eq!(suite_reads(&f), 1);
+    assert!(notes.iter().any(|n| n.contains("suite lookup failed")), "{notes:?}");
+}
+
+/// #11097: one push fired two runs of one workflow on the head. The older
+/// twin's red residue is dropped once the newer twin concluded green; with no
+/// workflow-runs answer, nothing is dropped and the wait stays RED.
+#[test]
+fn superseded_twin_run_residue_is_dropped() {
+    let twin = |suite: u64, conclusion: &str| {
+        let mut r = run("Daemon Checks", "completed", Some(conclusion));
+        r["check_suite"] = json!({"id": suite});
+        r
+    };
+    let wrun = |id: u64, suite: u64, conclusion: &str| {
+        json!({"id": id, "workflow_id": 7, "check_suite_id": suite, "event": "pull_request",
+               "head_sha": SHA, "created_at": "2026-10-05T13:32:00Z", "status": "completed",
+               "conclusion": conclusion, "pull_requests": [{"number": 42}]})
+    };
+    let runs_url = format!("repos/o/r/actions/runs?head_sha={SHA}&per_page=100");
+
+    let f = Forge::new();
+    f.runs(SHA, &[twin(1, "failure"), twin(2, "success")]);
+    let o = go(&f, Selector::Pr(42), &opts(0), &mut FakeClock::new());
+    assert!(matches!(o, Outcome::Red { .. }), "{o:?}");
+
+    let f = Forge::new();
+    f.runs(SHA, &[twin(1, "failure"), twin(2, "success")]);
+    f.serve(
+        &runs_url,
+        &json!({"total_count": 2, "workflow_runs": [wrun(100, 1, "failure"), wrun(101, 2, "success")]}),
+    );
+    let o = go(&f, Selector::Pr(42), &opts(0), &mut FakeClock::new());
+    assert_eq!(o, Outcome::Green { sha: SHA.into() });
+
+    // A single suite never pays for the extra read.
+    let f = Forge::new();
+    f.runs(SHA, &[twin(1, "failure")]);
+    go(&f, Selector::Pr(42), &opts(0), &mut FakeClock::new());
+    assert!(!f.calls().iter().any(|c| c.contains("actions/runs")), "{:?}", f.calls());
 }

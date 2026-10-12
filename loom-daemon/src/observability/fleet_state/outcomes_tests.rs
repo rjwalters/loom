@@ -362,16 +362,17 @@ fn a_ready_row_surviving_the_review_departure_gives_landed_not_advance() {
                 repo: REPO.to_string(),
                 issue: 20,
                 rank: 1,
-                star: false,
-                star_at: None,
                 level: 0,
                 fleet_priority: 0,
                 created_at: None,
                 main_red_fix: false,
+                eligible_reason: None,
+                eligible_at: None,
             }],
             listed: [REPO.to_string()].into(),
             complete: BTreeSet::new(),
             slots: None,
+            halts: Default::default(),
         });
         with_ready
     };
@@ -507,17 +508,18 @@ fn ready(issues: &[u32], held: Vec<HeldSweep>) -> FleetInput {
                 repo: REPO.to_string(),
                 issue: *issue,
                 rank: 1,
-                star: false,
-                star_at: None,
                 level: 0,
                 fleet_priority: 0,
                 created_at: None,
                 main_red_fix: false,
+                eligible_reason: None,
+                eligible_at: None,
             })
             .collect(),
         listed: [REPO.to_string()].into(),
         complete: [REPO.to_string()].into(),
         slots: None,
+        halts: Default::default(),
     });
     with_ready
 }

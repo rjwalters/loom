@@ -251,8 +251,13 @@ pub(super) fn attempt(
             settle_current(env, &root, &candidate.branch, &commit, report, memory);
             report.reason = Some("already current once the claim was held; no commit".to_string());
         }
-        Ok(Done::NoWrite(state, reason)) => (report.state, report.reason) = (state, reason),
+        Ok(Done::NoWrite(state, reason)) => {
+            // W2's fetch read the repo (#11295).
+            memory.clear_refused(&root);
+            (report.state, report.reason) = (state, reason);
+        }
         Ok(Done::Aborted(why)) => {
+            memory.clear_refused(&root);
             log::info!("workspace_resync: {}: resync abandoned: {why}", candidate.nwo);
             report.reason = Some(why);
         }

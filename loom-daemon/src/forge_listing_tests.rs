@@ -165,7 +165,7 @@ fn header_parse_survives_lf_only_lines() {
 fn parses_issues_and_marks_pull_requests() {
     let body = r#"[
         {"number": 42, "state": "open",
-         "labels": [{"name": "loom:issue"}, {"name": "tier:goal-supporting"}],
+         "labels": [{"name": "loom:issue"}, {"name": "enhancement"}],
          "created_at": "2026-07-29T00:00:00Z", "updated_at": "2026-07-29T01:00:00Z",
          "body": "the body"},
         {"number": 43, "state": "open", "labels": [],
@@ -174,7 +174,7 @@ fn parses_issues_and_marks_pull_requests() {
     let issues = parse_rest_issues(body).unwrap();
     assert_eq!(issues.len(), 2);
     assert_eq!(issues[0].number, 42);
-    assert_eq!(issues[0].labels, vec!["loom:issue", "tier:goal-supporting"]);
+    assert_eq!(issues[0].labels, vec!["loom:issue", "enhancement"]);
     assert!(!issues[0].is_pull_request);
     assert_eq!(issues[0].state, "open");
     assert!(issues[1].is_pull_request);
@@ -941,7 +941,7 @@ fn the_paged_listing_reads_past_page_one_through_the_same_cache_entry() {
     std::fs::write(dir.path().join("p1.json"), page_json(1..101)).unwrap();
     std::fs::write(dir.path().join("pages.json"), page_json(101..106)).unwrap();
     let gh = paging_stub(dir.path());
-    let label = "loom:operator-priority";
+    let label = "loom:important";
 
     // The single-page listing sees only page 1 and caches it under W/"p1".
     let single = list_issues_cached_as("t", &gh, Some(dir.path()), Some(&repo), label, "open");
@@ -1144,4 +1144,24 @@ fn a_paged_walk_falls_short_with_its_rows_and_a_reason() {
     assert!(
         list_issues_cached_paged_as("t", &gh, Some(dir.path()), Some(&other), "x", "open").is_err()
     );
+}
+
+/// #11483: `sub_issues_summary` becomes the open-child count; an absent or
+/// malformed summary is `None` (fail open to the pre-#11483 behaviour).
+#[test]
+fn sub_issues_summary_parses_to_open_child_count() {
+    let body = r#"[
+        {"number": 1, "sub_issues_summary": {"total": 3, "completed": 1, "percent_completed": 33}},
+        {"number": 2, "sub_issues_summary": {"total": 3, "completed": 3, "percent_completed": 100}},
+        {"number": 3},
+        {"number": 4, "sub_issues_summary": null},
+        {"number": 5, "sub_issues_summary": {"total": "x", "completed": 1}},
+        {"number": 6, "sub_issues_summary": {"total": 1, "completed": 2}}
+    ]"#;
+    let open: Vec<Option<u32>> = parse_rest_issues(body)
+        .unwrap()
+        .iter()
+        .map(|r| r.open_sub_issues)
+        .collect();
+    assert_eq!(open, vec![Some(2), Some(0), None, None, None, None]);
 }

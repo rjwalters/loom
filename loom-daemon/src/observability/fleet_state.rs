@@ -34,6 +34,11 @@
 //! When one `(repo, issue)` is seen by several sources, the held row wins,
 //! then the PR row, then the ready row.
 //!
+//! The same tick also gives the ETA facts (#11564): each `ready_wait` row's
+//! `eligible_reason` / `eligible_at` (the clock holding it back and its end)
+//! and each held repo's `halt` (`work_finder::halt_cause::since`). Neither is
+//! capped.
+//!
 //! The same two consecutive views also give the outcome facts
 //! `eta.stage_outcome` and `pr.resolved` ([`outcomes`], #11126).
 //!
@@ -55,9 +60,9 @@ use serde_json::Value;
 
 use super::queue::{DurableQueue, FanoutQueue, QueueSink};
 use crate::telemetry::kinds::fleet_state::{
-    split_into_chunks, FleetCapacity, FleetHoldKind, FleetPrCensus, FleetSlot, FleetSlots,
-    FleetStage, FleetStateRecord, FleetStateRepo, FleetStateRow, MainCi, PlannerStamps,
-    ANCHOR_INTERVAL_SECS, CHUNK_BYTES, FLEET_STATE_SCHEMA,
+    split_into_chunks, FleetCapacity, FleetEligibleReason, FleetHoldKind, FleetPrCensus,
+    FleetRepoHalt, FleetSlot, FleetSlots, FleetStage, FleetStateRecord, FleetStateRepo,
+    FleetStateRow, MainCi, PlannerStamps, ANCHOR_INTERVAL_SECS, CHUNK_BYTES, FLEET_STATE_SCHEMA,
 };
 use crate::telemetry::{RepoVisibility, SweepStartFacts, TelemetryEnvelope, TelemetryRecord};
 
@@ -146,7 +151,7 @@ impl PrFacts {
             holds: hold_names(labels),
             conflict: has("loom:merge-conflict"),
             ci_fail: has("loom:ci-failure"),
-            level: crate::operator_levels::level(labels),
+            level: crate::priority_pick::Level::of(labels).rank(),
         }
     }
 
@@ -156,7 +161,6 @@ impl PrFacts {
         row.conflict = self.conflict;
         row.ci_fail = self.ci_fail;
         row.level = row.level.max(self.level);
-        row.star |= self.level >= 1;
     }
 }
 
@@ -213,12 +217,14 @@ pub struct ReadyItem {
     pub repo: String,
     pub issue: u32,
     pub rank: u32,
-    pub star: bool,
-    pub star_at: Option<DateTime<Utc>>,
     pub level: u8,
     pub fleet_priority: u32,
     pub created_at: Option<DateTime<Utc>>,
     pub main_red_fix: bool,
+    /// The clock holding it back this tick, when one does (#11564).
+    pub eligible_reason: Option<FleetEligibleReason>,
+    /// When that clock ends, when the work finder knows (#11564).
+    pub eligible_at: Option<DateTime<Utc>>,
 }
 
 /// The work finder's last tick, as `fleet.state` reads it.
@@ -233,6 +239,9 @@ pub struct ReadyQueue {
     /// `ready_complete`, #11139). A subset of `listed`.
     pub complete: BTreeSet<String>,
     pub slots: Option<FleetSlots>,
+    /// The repos the tick held, by lowercased slug (#11564). Every held repo
+    /// is here, whether or not it has ready rows.
+    pub halts: BTreeMap<String, FleetRepoHalt>,
 }
 
 /// Everything one pass read.
@@ -265,6 +274,8 @@ pub struct RepoView {
     pub sources: BTreeMap<u32, Source>,
     /// `main` CI status, when the host read it.
     pub main_ci: Option<MainCi>,
+    /// The work finder's hold on the repo, when it holds it (#11564).
+    pub halt: Option<FleetRepoHalt>,
 }
 
 /// The full state at one pass, before visibility tagging.
@@ -454,12 +465,12 @@ pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Ut
         for item in &ready.items {
             let row = FleetStateRow {
                 rank: Some(item.rank),
-                star: item.star,
-                star_at: item.star_at,
                 level: item.level,
                 fleet_priority: Some(item.fleet_priority),
                 created_at: item.created_at,
                 main_red_fix: item.main_red_fix,
+                eligible_reason: item.eligible_reason,
+                eligible_at: item.eligible_at,
                 ..FleetStateRow::new(item.issue, FleetStage::ReadyWait, now)
             };
             offer(&mut candidates, &item.repo, Source::Ready, row);
@@ -526,16 +537,12 @@ pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Ut
             }
         }
         // Facts a row carries from the item's earlier rows (#11391): the
-        // star and level an earlier (ready) row read, and the Judge
+        // level an earlier (ready) row read, and the Judge
         // rejections counted so far, one more when it just entered `doctor`.
         if let Some(was) = was {
-            // A ready row is rebuilt from the tick, so an un-star shows.
+            // A ready row is rebuilt from the tick, so a lowered level shows.
             if source != Source::Ready {
-                row.star |= was.star;
                 row.level = row.level.max(was.level);
-                if row.star_at.is_none() {
-                    row.star_at = was.star_at;
-                }
             }
             row.rework = row.rework.max(was.rework);
             if row.stage == FleetStage::Doctor && was.stage != FleetStage::Doctor {
@@ -578,6 +585,10 @@ pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Ut
     for (repo, main_ci) in &input.main_ci {
         repos.entry(repo.clone()).or_default().main_ci = Some(*main_ci);
     }
+    // Every held repo, rows or not (#11564): a halt is never capped.
+    for (repo, halt) in input.ready.iter().flat_map(|ready| &ready.halts) {
+        repos.entry(repo.clone()).or_default().halt = Some(halt.clone());
+    }
     FleetView {
         census_at: input.listed_at.filter(|_| !input.listings.is_empty()),
         slots: input.ready.as_ref().and_then(|r| r.slots),
@@ -599,6 +610,7 @@ pub fn needs_anchor(last: Option<&Emitted>, stamps: &PlannerStamps, now: DateTim
 
 fn repo_entry(view: &FleetView, repo: &str, census: Option<FleetPrCensus>) -> FleetStateRepo {
     let main_ci = view.repos.get(repo).and_then(|r| r.main_ci);
+    let halt = view.repos.get(repo).and_then(|r| r.halt.clone());
     let ready_complete = view.ready_complete(repo);
     FleetStateRepo {
         repo: repo.to_string(),
@@ -606,6 +618,7 @@ fn repo_entry(view: &FleetView, repo: &str, census: Option<FleetPrCensus>) -> Fl
         // until then is the safe default.
         visibility: RepoVisibility::Private,
         main_ci,
+        halt,
         census,
         ready_complete,
         ready_replace: !ready_complete,
@@ -701,6 +714,7 @@ pub fn decide(
             && !ready_changed
             && now_state.census == was.census
             && now_state.main_ci == was.main_ci
+            && now_state.halt == was.halt
             && view.ready_complete(repo) == last.view.ready_complete(repo)
         {
             continue;
@@ -1031,3 +1045,8 @@ fn send(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[path = "fleet_state_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[path = "fleet_state/facts_tests.rs"]
+mod facts_tests;

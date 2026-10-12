@@ -798,6 +798,15 @@ impl SweepRegistry {
         // disagree when the journal rotated or became unreadable in between.
         // Only a sweep with no captured facts (adopted, PR-set) derives it
         // here.
+        //
+        // Issue #11444: the dispatch origin rides the same captured facts, so
+        // `sweep.outcome`'s origin (and the `operator_redispatch` trigger it
+        // implies) equals `sweep.started`'s. A sweep with no captured facts
+        // has no observable origin: absent, never guessed.
+        let dispatch_origin = self
+            .start_facts
+            .get(sweep_id)
+            .and_then(|facts| facts.dispatch_origin.clone());
         let (attempt_index, previous_sweep_id, trigger) =
             if let Some(facts) = self.start_facts.get(sweep_id) {
                 (facts.attempt_index, facts.previous_sweep_id.clone(), facts.trigger.clone())
@@ -976,6 +985,7 @@ impl SweepRegistry {
             judge_verdicts: judge_verdicts.as_deref(),
             doctor_cycles,
             issue_end_state,
+            exit_code,
         };
         let (disposition, failure_class) = telemetry::classify_disposition(&signals);
         let reported_result = telemetry::result_for_disposition(&signals, disposition);
@@ -992,12 +1002,14 @@ impl SweepRegistry {
             });
 
         // Issue #10156: an `after-curator` stop that is part of a no-op loop is
-        // its own outcome class instead of `unclassified`.
+        // its own outcome class instead of `unclassified` — and so (#11438) is
+        // the clean-exit `no-phase-signal`/`spawn-death` form of the same loop.
         let failure_class = telemetry::apply_noop_loop_class(
             disposition,
             failure_class,
             self.noop_loop_kind(issue, sweep_id)
                 .map(ParkKind::failure_class),
+            exit_code == Some(0),
         );
         let process_result = result;
         let result = reported_result;
@@ -1037,6 +1049,7 @@ impl SweepRegistry {
             attempt_index,
             previous_sweep_id,
             trigger,
+            dispatch_origin,
             rework_events,
             pr_numbers,
             hw_lines_added: landing_size.as_ref().map(|size| size.hw_lines_added),
@@ -1046,6 +1059,9 @@ impl SweepRegistry {
             test_lines: landing_size.as_ref().map(|size| size.test_lines),
             tokens_status_reason,
             no_phase_cause,
+            phase_tap_usage: crate::telemetry::phase_tap_usage::rows_from(
+                &tap_region.phase_workers,
+            ),
         };
         // Issue #9441: both disposition invariants hold on every record this
         // daemon writes. A debug assertion rather than a runtime guard — the
@@ -1112,6 +1128,9 @@ impl SweepRegistry {
         }
         if let Some(trigger) = outcome_record.trigger.as_deref() {
             metadata.insert("loom.trigger".into(), trigger.to_string());
+        }
+        if let Some(origin) = outcome_record.dispatch_origin.as_deref() {
+            metadata.insert("loom.dispatch_origin".into(), origin.to_string());
         }
         for (key, value) in [
             ("loom.failure_class", outcome_record.failure_class.as_ref()),

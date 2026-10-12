@@ -299,8 +299,9 @@ pub struct OutcomeRecord {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tap_usage_all: Vec<crate::tap_usage::TapAccounting>,
     /// Out-of-process phase launches (`worker run --role builder|doctor`,
-    /// Issue #11360) that named this sweep, one row per `(role, tap)`, read from
-    /// their own phase logs. Never folded into [`Self::tap_usage`] /
+    /// Issue #11360) that named this sweep, one row per `(role, tap, model)`,
+    /// read from their own phase logs. Never folded into
+    /// [`Self::tap_usage`] /
     /// [`Self::tap_usage_all`], which stay the parent orchestrator's own region:
     /// the sweep's whole per-tap spend is the fold of both
     /// ([`crate::tap_usage::RegionAccounting::sweep_totals_by_tap`]). Empty, and
@@ -998,9 +999,11 @@ mod tests {
                 tokens_status: None,
                 tokens_status_reason: None,
                 no_phase_cause: None,
+                phase_tap_usage: Vec::new(),
                 attempt_index: None,
                 previous_sweep_id: None,
                 trigger: None,
+                dispatch_origin: None,
                 rework_events: None,
                 pr_numbers: None,
                 hw_lines_added: None,

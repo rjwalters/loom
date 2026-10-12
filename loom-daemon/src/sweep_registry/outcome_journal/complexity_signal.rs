@@ -390,7 +390,7 @@ mod tests {
         // The full hand-back shape a Curator actually leaves behind: the
         // persistent `loom:curated` milestone plus a fresh `loom:triage`.
         assert_eq!(
-            open_with(&["loom:curated", "loom:triage", "tier:goal-supporting"]).end_state(None),
+            open_with(&["loom:curated", "loom:triage", "enhancement"]).end_state(None),
             Some(IssueEndState::Rescoped)
         );
     }
@@ -416,7 +416,7 @@ mod tests {
         }
         // The real-world label set of a curated, promoted, claimed issue.
         assert_eq!(
-            open_with(&["loom:curated", "loom:building", "tier:goal-supporting"]).end_state(None),
+            open_with(&["loom:curated", "loom:building", "enhancement"]).end_state(None),
             Some(IssueEndState::StillOpen)
         );
     }

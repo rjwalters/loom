@@ -46,9 +46,8 @@
 //! The mode is read from the opened handle, so the file checked is the file
 //! read.
 //!
-//! Not gated behind the `otlp` Cargo feature: the config surface (and the
-//! policy below) exists in every build, and nothing here depends on the OTLP
-//! wire types.
+//! Nothing here depends on the OTLP wire types: the config surface and the
+//! policy below are plain data.
 
 use std::fmt;
 use std::io::Read;

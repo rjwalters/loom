@@ -429,6 +429,39 @@ fn tick_multi_threads_per_issue_complexity_into_dispatch() {
     );
 }
 
+/// #11483: a tracking parent with open sub-issues is not dispatched, on both
+/// tick paths; all-closed (`{3, 3}`) and an absent summary still dispatch.
+#[test]
+fn tick_skips_a_tracking_parent_with_open_sub_issues() {
+    let rows = || {
+        vec![
+            issue(30).with_open_sub_issues(Some(2)),
+            issue(31).with_open_sub_issues(Some(0)),
+            issue(32),
+        ]
+    };
+    let mut dispatcher = RecordingDispatcher::default();
+    let report = tick(&mut FakeSource::once(rows()), &mut dispatcher, 10, false).unwrap();
+    assert_eq!((report.dispatched, report.skipped_labeled), (2, 1));
+    let dispatched: Vec<u32> = dispatcher
+        .dispatched_complexity
+        .iter()
+        .map(|d| d.0)
+        .collect();
+    assert_eq!(dispatched, vec![31, 32]);
+
+    let mut workspaces = vec![(FakeSource::once(rows()), RecordingDispatcher::default())];
+    let report = tick_multi(&mut workspaces, &[0], 10, &[false]);
+    assert_eq!((report.dispatched, report.skipped_labeled), (2, 1));
+    let dispatched: Vec<u32> = workspaces[0]
+        .1
+        .dispatched_complexity
+        .iter()
+        .map(|d| d.0)
+        .collect();
+    assert_eq!(dispatched, vec![31, 32]);
+}
+
 // ===================================================================
 // Repo-sharding slice preference (Issue #6243)
 // ===================================================================
@@ -2520,14 +2553,15 @@ fn test_tick_multi_missing_halt_entry_defaults_not_halted() {
     assert_eq!(multi[1].1.dispatched, vec![10]);
 }
 
-// Cross-repo priority ordering (#3946) and the #9244 operator-priority /
-// red-main-fix lanes live in sibling files (this one is size-frozen).
+// Cross-repo priority ordering (#3946, #11103) and the #9244 red-main-fix
+// lane live in sibling files (this one is size-frozen).
 mod build_backoff;
 mod main_red_fix;
 mod maintain_only;
-mod operator_priority;
 mod ordering;
+mod priority_admission;
 mod ram_budget;
+mod vi_cap;
 mod workspace_draw;
 
 // ===================================================================
@@ -2657,15 +2691,11 @@ fn test_mechanical_item_with_an_unknown_capability_fails_closed() {
 
 #[test]
 fn test_other_operator_only_sub_kinds_remain_hard_skipped() {
-    // #6885 non-goal, asserted directly: the other three sub-kinds are
+    // #6885 non-goal, asserted directly: the other two sub-kinds are
     // unaffected — a marker in their body is ignored entirely, even for a
     // maximally-capable worker.
     let all_caps = caps(&["host-sudo", "forge-admin-token", "tailnet-access"]);
-    for sub_kind in [
-        "loom:operator-decision",
-        "loom:operator-blocked",
-        "loom:operator-objective",
-    ] {
+    for sub_kind in ["loom:operator-decision", "loom:operator-blocked"] {
         let item = WorkItem::new(
             1,
             vec![

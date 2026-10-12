@@ -30,8 +30,8 @@ const OTLP_EXPORTER: &str = "otlp";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OtlpExportState {
-    /// No OTLP exporter will run: not configured, observability off, or the
-    /// binary was built without the `otlp` feature (#10700).
+    /// No OTLP exporter will run: not configured or observability off. (The
+    /// exporter is compiled into every build since #10700.)
     NoExporter,
     /// An OTLP exporter is configured but no batch succeeded within the
     /// window, or `dropped_total` is growing.
@@ -68,8 +68,6 @@ pub struct OtlpExportHealth {
 /// Everything [`evaluate`] reads. Plain data so tests build it directly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OtlpHealthInputs {
-    /// `cfg!(feature = "otlp")` of the running binary.
-    pub feature_otlp: bool,
     /// The resolved config plans at least one OTLP exporter
     /// ([`super::planned_otlp_exporters`] non-empty).
     pub otlp_planned: bool,
@@ -92,12 +90,6 @@ pub fn evaluate(inputs: &OtlpHealthInputs, now: DateTime<Utc>) -> OtlpExportHeal
     let health = |state, detail: Option<String>| OtlpExportHealth { state, detail };
     if let Some(reason) = &inputs.exempt_reason {
         return health(OtlpExportState::Exempt, Some(reason.clone()));
-    }
-    if !inputs.feature_otlp {
-        return health(
-            OtlpExportState::NoExporter,
-            Some("this build has no `otlp` feature".to_string()),
-        );
     }
     if !inputs.otlp_planned {
         return health(
@@ -262,7 +254,6 @@ pub fn check_global(config: &ObservabilityConfig) -> OtlpExportHealth {
         .get(OTLP_EXPORTER)
         .map(|s| s.dropped_total);
     let inputs = OtlpHealthInputs {
-        feature_otlp: cfg!(feature = "otlp"),
         otlp_planned: !super::planned_otlp_exporters(config).is_empty(),
         exempt_reason,
         started_at: otlp.and_then(|s| s.started_at),

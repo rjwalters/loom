@@ -7,7 +7,6 @@ fn t(min: i64) -> DateTime<Utc> {
 
 fn base() -> OtlpHealthInputs {
     OtlpHealthInputs {
-        feature_otlp: true,
         otlp_planned: true,
         exempt_reason: None,
         started_at: Some(t(0)),
@@ -22,15 +21,6 @@ fn https_only_is_no_exporter() {
     let mut i = base();
     i.otlp_planned = false;
     assert_eq!(evaluate(&i, t(1)).state, OtlpExportState::NoExporter);
-}
-
-#[test]
-fn build_without_otlp_feature_is_no_exporter() {
-    let mut i = base();
-    i.feature_otlp = false;
-    let h = evaluate(&i, t(1));
-    assert_eq!(h.state, OtlpExportState::NoExporter);
-    assert!(h.detail.unwrap().contains("feature"));
 }
 
 #[test]

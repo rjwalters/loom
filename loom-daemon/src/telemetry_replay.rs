@@ -27,7 +27,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::signoz_read::{ClickhouseHttp, ReadError};
+use crate::signoz_read::{ReadError, TelemetryReader};
 
 /// R3's committed replay SQL, verbatim.
 pub const REPLAY_QUERIES: &str =
@@ -349,7 +349,7 @@ pub fn assemble_export(params: &ReplayParams, export: &str) -> Result<Replay, St
 ///
 /// The committed SQL has an unexpected shape, the store could not be read, or
 /// it returned rows this reader cannot parse.
-pub fn fetch(http: &ClickhouseHttp, params: &ReplayParams) -> Result<Replay, String> {
+pub fn fetch(http: &TelemetryReader, params: &ReplayParams) -> Result<Replay, String> {
     let (state_sql, coverage_sql) = state_and_coverage_queries(REPLAY_QUERIES)?;
     if params.knowable_since.is_none() {
         return Err(MISSING_KNOWABLE_SINCE.to_string());
@@ -417,7 +417,7 @@ where
 /// # Errors
 ///
 /// As for [`preflight_with`].
-pub fn preflight(http: &ClickhouseHttp) -> Result<(), String> {
+pub fn preflight(http: &TelemetryReader) -> Result<(), String> {
     preflight_with(|sql, params| http.post_with(sql, params))
 }
 
