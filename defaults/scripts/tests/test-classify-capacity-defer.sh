@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # test-classify-capacity-defer.sh - Tests for classify-capacity-defer.sh
 # (issue #6729), the no-comment-stream idempotency for Champion's level-
-# capacity deferral path (the old tier caps re-keyed on priority level, #11512).
+# capacity deferral path (the old tier caps mapped onto priority level, #11512).
 #
 # Champion's level-based rate limiting can hold back a proposal that passes
-# all 8 promotion criteria purely on capacity (no priority level: 1 promotion
-# per pass, only if fewer than 5 promoted default-level issues are open;
-# loom:important: up to 2 per pass). Without a guard, every later pass
+# all 8 promotion criteria purely on capacity (no priority level: up to
+# tier2Cap, default 2, promotions per pass; #11512 maps no level to the old
+# Tier 2 cap, with no backlog gate). Without a guard, every later pass
 # re-derives the same conclusion for an unrevised proposal and posts an
 # equivalent "backlog cap reached" comment again -- observed live as 10
 # near-identical comments on #6628 over ~22 hours, all citing the SAME five
@@ -452,6 +452,18 @@ assert_eq "1" "$RC" "exit 1 - first deferral, even with no occupants named"
 assert_contains "$OUT" "OCCUPANTS: " "the (empty) occupants line is still printed"
 
 echo
+echo "--- #11512: the per-pass cap's empty occupant set repeats -> SKIP_COMMENT (one comment per issue) ---"
+reset_state
+fp="$(capacity_fingerprint 'default' "")"
+issue_fixture 'o/r#5' "<!-- champion:capacity-defer:default:$fp -->
+<!-- champion:capacity-defer-seen:$fp:1 -->
+**Champion Review: no-level per-pass cap reached — deferring promotion**"
+run_ccd --issue 5 --repo o/r --level default --occupants "" --apply
+assert_eq "0" "$RC" "exit 0 - a repeat per-pass deferral stays silent"
+assert_contains "$OUT" "SKIP_COMMENT" "SKIP_COMMENT for the repeated empty occupant set"
+assert_eq "1" "$(jq '.comments | length' "$STUB_DIR/issue-o_r_5.json")" "still exactly one comment"
+
+echo
 echo "--- #11512: --tier stays an alias of --level; LEVEL is reported ---"
 reset_state
 issue_fixture 'o/r#5'
@@ -552,6 +564,8 @@ echo "--- Doc pins: the Champion prose actually calls the gate ---"
         "the capacity-deferral gate has its own named edge case"
     assert_doc_contains "$CHAMPION_PROMO_MD" '--level "default"' \
         "Step 3c passes the priority level, not a retired tier label (#11512)"
+    assert_doc_contains "$CHAMPION_PROMO_MD" '--occupants ""' \
+        "Step 3c passes no occupants for the per-pass no-level cap (#11512)"
 }
 
 echo

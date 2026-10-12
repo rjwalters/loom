@@ -308,11 +308,11 @@ gh issue edit <number> --add-label "loom:evaluating"
 
 ### Edge Case 5d: Capacity-Deferral Comments Re-Posted Every Pass for an Unchanged Backlog (#6729)
 
-**Scenario**: A proposal passes all 8 promotion criteria, but `champion-issue-promo.md`'s "Rate Limiting by Level" caps the promotion (the per-pass `loom:important` / default-level caps, or the default-level backlog cap; the old tier caps re-keyed on level, #11512). This is a **capacity deferral, not a rejection**, so Edge Case 5c's `VERDICT_MARKER` is never written. Without a guard every pass posts an equivalent "backlog cap reached" comment again (observed: 10 near-identical comments on #6628 over ~22 hours).
+**Scenario**: A proposal passes all 8 promotion criteria, but `champion-issue-promo.md`'s "Rate Limiting by Level" caps the promotion (the per-pass no-level cap; the old Tier 2 cap mapped by population, #11512). This is a **capacity deferral, not a rejection**, so Edge Case 5c's `VERDICT_MARKER` is never written. Without a guard every pass posts an equivalent "backlog cap reached" comment again (observed: 10 near-identical comments on #6628 over ~22 hours).
 
-**Handling**: `champion-issue-promo.md`'s "Step 3c: Capacity Deferral" keys a fingerprint to the **level and occupant set** that explains the deferral (`classify-capacity-defer.sh --level <level> --occupants <list>`; pure helpers `normalize_occupants` / `capacity_fingerprint`). The occupant set comes from the "Backlog Balance Check" and already excludes held issues (#7613). Exit `1` (`POST_COMMENT`): post the deferral comment with its markers; `0` (`SKIP_COMMENT`): post nothing, `--apply` bumped the seen-counter in place; `2`: fail toward posting.
+**Handling**: `champion-issue-promo.md`'s "Step 3c: Capacity Deferral" keys a fingerprint to the **level and occupant set** that explains the deferral (`classify-capacity-defer.sh --level <level> --occupants <list>`; pure helpers `normalize_occupants` / `capacity_fingerprint`). A per-pass cap has no standing occupant set, so Step 3c passes `--occupants ""`: the first deferral posts and later ones stay silent. Exit `1` (`POST_COMMENT`): post the deferral comment with its markers; `0` (`SKIP_COMMENT`): post nothing, `--apply` bumped the seen-counter in place; `2`: fail toward posting.
 
-**Rationale**: Same shape as Edge Case 5c (a fingerprint anchored to what actually changes) but **no escalation counterpart**: a capacity deferral is never a merits problem and self-resolves the moment the backlog composition changes.
+**Rationale**: Same shape as Edge Case 5c (a fingerprint anchored to what actually changes) but **no escalation counterpart**: a capacity deferral is never a merits problem and self-resolves once a later pass has a free slot.
 
 ---
 

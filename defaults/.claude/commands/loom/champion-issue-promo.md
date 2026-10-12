@@ -65,18 +65,15 @@ discover_project_goals
 
 ### Backlog Balance Check
 
-The per-level caps below are the old per-tier caps re-keyed on priority level
-(#11512): `loom:very-important` takes the old Tier 1 slot (no cap),
-`loom:important` the Tier 2 slot (`tier2Cap`), and an issue with no priority
-level the Tier 3 slot (`tier3Cap` plus `tier3BacklogCap`). The knobs keep their
-`tier*` names so existing config still applies.
-
-**The default-level count is promoted, unheld work only.** It counts open
-`loom:issue` / `loom:building` issues with no priority label (#10753) and
-excludes `loom:operator-only` / `loom:blocked` ones (#7613). A proposal still
-waiting for promotion, or a held issue, cannot free a slot through the normal
-pipeline, so counting it pins the cap indefinitely (2026-10-07: 19 counted, 2
-promoted in rjwalters/loom).
+The caps map the old tier caps by **population**, not by name (#11512):
+`loom:very-important` and `loom:important` take the old Tier 1 slot
+(uncapped; very important is already bounded by "keep at most one eligible"),
+and an issue with no priority level, the majority, takes the old Tier 2
+per-pass cap (`tier2Cap`) with **no backlog gate**. Keyed on no level, the
+Tier 3 backlog gate would count 46 promoted issues against its cap of 5 in
+rjwalters/loom (3 when it counted Tier 3 only), freezing no-level promotion. `tier3Cap` / `tier3BacklogCap` stay parsed for config
+compatibility but govern no level today. The counts below are informational:
+promoted (`loom:issue` / `loom:building`), unheld (#7613) issues per level.
 
 ```bash
 check_backlog_balance() {
@@ -88,8 +85,6 @@ check_backlog_balance() {
     [.[] | select([.labels[].name] | any(IN("loom:operator-only","loom:blocked")) | not) |
     {number, level: ([.labels[].name] | if index("loom:very-important") then "loom:very-important"
       elif index("loom:important") then "loom:important" else "default" end)}]')
-  # Sorted, comma-joined occupant list for a level; feed it verbatim into
-  # Step 3c's classify-capacity-defer.sh --occupants argument.
   _occupants() { printf '%s' "$promoted_json" | jq -r --arg l "$1" \
     '[.[] | select(.level == $l) | .number] | sort | map("#" + tostring) | join(",")'; }
   _count() { printf '%s' "$promoted_json" | jq --arg l "$1" '[.[] | select(.level == $l)] | length'; }
@@ -97,19 +92,14 @@ check_backlog_balance() {
   important=$(_count "loom:important"); important_occupants=$(_occupants "loom:important")
   default=$(_count "default"); default_occupants=$(_occupants "default")
 
-  # Per-pass caps (#10753): env > default; empty or not an integer -> default.
+  # Per-pass cap (#10753): env > default; empty or not an integer -> default.
   _cap() { case "$1" in ''|*[!0-9]*) echo "$2" ;; *) echo "$1" ;; esac; }
-  IMPORTANT_CAP=$(_cap "${LOOM_CHAMPION_TIER2_CAP:-}" 2)
-  DEFAULT_CAP=$(_cap "${LOOM_CHAMPION_TIER3_CAP:-}" 1)
-  DEFAULT_BACKLOG_CAP=$(_cap "${LOOM_CHAMPION_TIER3_BACKLOG_CAP:-}" 5)
+  DEFAULT_CAP=$(_cap "${LOOM_CHAMPION_TIER2_CAP:-}" 2)
 
   echo "loom:very-important: $very_important promoted"
   echo "loom:important:      $important promoted (occupants: ${important_occupants:-none})"
   echo "default (no level):  $default promoted (occupants: ${default_occupants:-none})"
-  echo "Caps this pass: IMPORTANT_CAP=$IMPORTANT_CAP DEFAULT_CAP=$DEFAULT_CAP DEFAULT_BACKLOG_CAP=$DEFAULT_BACKLOG_CAP"
-  if [ "$default" -ge "$DEFAULT_BACKLOG_CAP" ]; then
-    echo "DEFAULT_BACKLOG_FULL: $default >= $DEFAULT_BACKLOG_CAP, no default-level promotion this pass (Step 3c)."
-  fi
+  echo "Caps this pass: DEFAULT_CAP=$DEFAULT_CAP (no-level promotions; priority levels uncapped; no backlog gate)"
 }
 check_backlog_balance
 ```
@@ -120,13 +110,12 @@ Evaluate proposals by level (`loom:very-important`, then `loom:important`,
 then the rest), oldest first within a level (#11103); `champion.md`'s
 discovery queries already return them in that order.
 
-**Rate Limiting by Level** (per pass; the caps are the values the Backlog
-Balance Check printed: env vars `LOOM_CHAMPION_TIER2_CAP`,
-`LOOM_CHAMPION_TIER3_CAP`, `LOOM_CHAMPION_TIER3_BACKLOG_CAP`, defaults 2/1/5,
-#10753; where a fleet sets them: `.loom/docs/promotion-throughput.md`):
-- `loom:very-important`: promote all qualifying proposals (no limit)
-- `loom:important`: promote up to `$IMPORTANT_CAP`
-- No priority level: promote up to `$DEFAULT_CAP`, and only while the `default` count from the Backlog Balance Check above (promoted, unheld occupants) is below `$DEFAULT_BACKLOG_CAP`
+**Rate Limiting by Level** (per pass; `$DEFAULT_CAP` is the value the Backlog
+Balance Check printed: env var `LOOM_CHAMPION_TIER2_CAP`, default 2, #10753;
+`LOOM_CHAMPION_TIER3_CAP` / `LOOM_CHAMPION_TIER3_BACKLOG_CAP` are currently
+unused; where a fleet sets them: `.loom/docs/promotion-throughput.md`):
+- `loom:very-important` / `loom:important`: promote all qualifying proposals (no limit)
+- No priority level: promote up to `$DEFAULT_CAP`
 
 Count each promotion under the level it is promoted with. A cap that blocks a
 passing proposal is a Step 3c capacity deferral, not a rejection. While PR
@@ -1097,8 +1086,7 @@ fi
 **Step 3c: Capacity Deferral — the level's rate limit blocks promotion this pass (#6729)**
 
 All 8 criteria can pass and Step 3b still not fire: "Rate Limiting by Level"
-above caps `loom:important` and default-level promotions per pass, and the
-default level by its backlog too. When the cap is what blocks promotion — not
+above caps no-level promotions per pass. When the cap is what blocks promotion — not
 a quality problem — this is a **capacity deferral, not a rejection**: no
 revision is needed, so Step 4's `VERDICT_MARKER` is never written and the
 proposal's label (`loom:curated`/`loom:architect`/`loom:hermit`/`loom:auditor`)
@@ -1112,13 +1100,12 @@ occupant set** that explains the deferral, since a capacity deferral has no
 verdict comment to piggyback its marker on:
 
 ```bash
-# LEVEL: `default` (no priority label) or `loom:important`. OCCUPANTS: that
-# level's occupant list from the "Backlog Balance Check" ($default_occupants
-# or $important_occupants, which already exclude held issues, #7613) — pass it
-# through verbatim.
+# LEVEL: `default` (no priority label). OCCUPANTS: empty — a per-pass cap has
+# no standing occupant set, so the first deferral posts and later ones for the
+# same level stay silent (the seen-counter is bumped in place).
 CAP_RC=0
 ./.loom/scripts/classify-capacity-defer.sh --issue "$ISSUE_NUMBER" \
-  --level "default" --occupants "$default_occupants" \
+  --level "default" --occupants "" \
   --apply || CAP_RC=$?
 ```
 
@@ -1134,20 +1121,19 @@ next pass's call needs to recognize an unchanged recurrence:
 ```bash
 ./.loom/scripts/post-comment.sh "$ISSUE_NUMBER" --body "<!-- champion:capacity-defer:default:$FINGERPRINT -->
 <!-- champion:capacity-defer-seen:$FINGERPRINT:1 -->
-**Champion Review: default-level backlog cap reached — deferring promotion**
+**Champion Review: no-level per-pass cap reached — deferring promotion**
 
 Evaluated against all 8 promotion criteria; all pass:
 
 - [criterion-by-criterion rationale, as in a normal APPROVED verdict]
 
-**Not promoted this pass — default-level (no priority label) backlog cap.**
-The backlog holds [N] promoted issues with no priority label ([occupants]), at
-the cap of [DEFAULT_BACKLOG_CAP], so this one is held back this pass.
+**Not promoted this pass — no-level (no priority label) per-pass cap.**
+[DEFAULT_CAP] issues with no priority label were already promoted this pass,
+so this one is held back until a later pass.
 
 This is a **capacity deferral, not a rejection** — no revision is needed, so no
 verdict marker is being written and the proposal label is left untouched. A
-future Champion pass will re-evaluate it once the backlog drops below the cap
-(or a promotion slot for its level frees up).
+future Champion pass will re-evaluate it and promote it when a slot is free.
 
 ---
 *Automated by Champion role*"
@@ -1157,8 +1143,7 @@ future Champion pass will re-evaluate it once the backlog drops below the cap
 deferral is neither a promotion nor a rejection: continue the loop to the next
 issue and do not count it against the level caps. **No escalation
 counterpart, and none should be added**: it is never a merits problem, and it
-ends the moment the backlog composition changes, which the next pass's
-fingerprint comparison detects for free.
+ends on its own once a later pass has a free slot.
 
 ### Step 4: Reject (One or More Criteria Fail)
 
@@ -1362,7 +1347,7 @@ Do NOT remove the proposal label (`loom:curated`, `loom:architect`, `loom:hermit
 
 ## Issue Promotion Batch Processing
 
-**Process all qualifying issues in one iteration, in "Promotion Order" (level, then oldest), governed by the per-level rate limits that prevent backlog flooding** ("Rate Limiting by Level" above: `loom:very-important` uncapped, `loom:important` up to `$IMPORTANT_CAP` per pass, no level up to `$DEFAULT_CAP` per pass and only while the promoted default-level backlog is below `$DEFAULT_BACKLOG_CAP`).
+**Process all qualifying issues in one iteration, in "Promotion Order" (level, then oldest), governed by the per-level rate limits that prevent backlog flooding** ("Rate Limiting by Level" above: `loom:very-important` and `loom:important` uncapped, no level up to `$DEFAULT_CAP` per pass).
 
 Continue evaluating issues until all have been processed or all applicable level limits are reached — or, while PR rows still wait, until `${LOOM_CHAMPION_PROMOTION_SLICE:-3}` fresh verdicts are spent (`champion.md` → "Autonomous Operation", #10753). This prevents issues from waiting unnecessarily across multiple 10-minute intervals when they've already met quality criteria.
 

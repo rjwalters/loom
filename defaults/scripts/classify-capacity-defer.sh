@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # classify-capacity-defer.sh - Idempotency for Champion's level-capacity
-# deferral comment (issue #6729; tier caps re-keyed on priority level, #11512).
+# deferral comment (issue #6729; tier caps mapped onto priority level, #11512).
 #
 # THE FAILURE MODE THIS EXISTS FOR
 #
 # champion-issue-promo.md's level-based rate limiting ("Rate Limiting by Level")
 # can decide that a proposal passes all 8 promotion criteria but is held back
-# THIS PASS anyway -- per-pass loom:important/default caps and a default-level
-# backlog cap (defaults 2/1/5, #10753; the backlog counts promoted issues only).
+# THIS PASS anyway -- today the per-pass cap on no-level promotions (tier2Cap,
+# default 2, #10753; #11512 maps no level to the old Tier 2 cap and leaves no
+# backlog gate). The script also handles an occupant-enumerable backlog cap.
 # Every later Champion pass (cron tick, role-runner
 # tick, or a fresh dispatch) re-derives the same "criteria pass, capacity
 # gate blocks it" conclusion for an issue that has not been revised at all --
@@ -53,7 +54,7 @@
 # Options:
 #   --issue <N>          Issue number being evaluated (required).
 #   --level <level>       The priority level whose cap blocks promotion this
-#                         pass: `default` or `loom:important` (required;
+#                         pass, e.g. `default` (no level) (required;
 #                         `--tier` is an alias). Scopes the marker so a
 #                         re-levelled issue never matches a stale fingerprint.
 #   --occupants <list>    The current backlog occupant set for that level's cap
@@ -61,8 +62,9 @@
 #                         "Backlog Balance Check" / level-limit logic already
 #                         computed (comma- and/or whitespace-separated, `#`
 #                         prefix optional, e.g. "#6612,#6076,#6068,#5512,#4136"
-#                         or "6612 6076 6068 5512 4136"). Required (may be
-#                         empty for a cap that isn't occupant-enumerable).
+#                         or "6612 6076 6068 5512 4136"). Required (empty
+#                         for a per-pass cap, which has no occupant set:
+#                         Champion's Step 3c passes "" today).
 #   --repo <nwo>          owner/repo of --issue (default: current repo's
 #                         origin).
 #   --apply               Only meaningful when SKIP_COMMENT applies: PATCH the
@@ -116,7 +118,7 @@ err()  { echo -e "${RED}ERROR: $1${NC}" >&2; }
 warn() { echo -e "${YELLOW}WARNING: $1${NC}" >&2; }
 
 show_help() {
-    sed -n '2,105p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,107p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 # ---- defaults ----

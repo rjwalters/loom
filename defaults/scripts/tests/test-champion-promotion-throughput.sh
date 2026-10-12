@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # test-champion-promotion-throughput.sh - Regression test for issue #10753,
 # items 1 and 2 (merges must not starve promotion; the promotion caps are
-# configurable), with the caps re-keyed on priority level by #11512.
+# configurable), with the caps mapped onto priority level by #11512.
 #
 # THE FAILURE MODES THIS GUARDS AGAINST
 #
@@ -14,8 +14,10 @@
 #                 (waiting proposals, held issues: 19 counted vs 2 promoted in
 #                 rjwalters/loom), so the cap pinned itself.
 #   stale caps    #11103 retired the `tier:*` labels the caps keyed on; #11512
-#                 re-keys them on level (very-important uncapped, important =
-#                 tier2Cap, no level = tier3Cap + tier3BacklogCap).
+#                 maps them by population: very-important and important are
+#                 uncapped, no level = tier2Cap per pass with NO backlog gate.
+#                 Keyed on no level, the old Tier 3 backlog gate counted 46
+#                 promoted issues against a cap of 5 and froze promotion.
 #
 # WHAT THIS SUITE DOES
 #
@@ -175,34 +177,33 @@ if [[ "$BLOCK" != *"check_backlog_balance"* ]]; then
     fail "could not extract the Backlog Balance Check bash block from $PROMO_MD"
 else
     OUT="$(run_balance balance.sh)"
-    assert_contains "$OUT" "Caps this pass: IMPORTANT_CAP=2 DEFAULT_CAP=1 DEFAULT_BACKLOG_CAP=5" \
-        "unset env vars give the defaults 2 / 1 / 5"
+    assert_contains "$OUT" "Caps this pass: DEFAULT_CAP=2 " \
+        "unset env var gives the no-level per-pass default of 2 (the old Tier 2 cap)"
     assert_contains "$OUT" "default (no level):  3 promoted (occupants: #101,#102,#103)" \
         "the default level counts promoted, unheld, unlevelled issues only (#101-#103)"
     assert_contains "$OUT" "loom:important:      2 promoted (occupants: #301,#302)" \
         "loom:important issues are counted under their own level"
     assert_contains "$OUT" "loom:very-important: 1 promoted" \
         "loom:very-important issues are counted under their own level"
-    assert_not_contains "$OUT" "DEFAULT_BACKLOG_FULL" \
-        "3 promoted occupants are below the default backlog cap of 5"
+    assert_not_contains "$OUT" "BACKLOG" \
+        "no backlog gate: the old Tier 3 gate has no population under the level mapping"
 
-    OUT="$(run_balance balance.sh LOOM_CHAMPION_TIER2_CAP=4 LOOM_CHAMPION_TIER3_CAP=0 LOOM_CHAMPION_TIER3_BACKLOG_CAP=12)"
-    assert_contains "$OUT" "Caps this pass: IMPORTANT_CAP=4 DEFAULT_CAP=0 DEFAULT_BACKLOG_CAP=12" \
-        "each env var overrides its default, and 0 is honoured"
+    OUT="$(run_balance balance.sh LOOM_CHAMPION_TIER2_CAP=0)"
+    assert_contains "$OUT" "Caps this pass: DEFAULT_CAP=0 " "the env var overrides the default, and 0 is honoured"
 
-    OUT="$(run_balance balance.sh LOOM_CHAMPION_TIER3_BACKLOG_CAP=3)"
-    assert_contains "$OUT" "DEFAULT_BACKLOG_FULL: 3 >= 3" \
-        "a backlog cap at the promoted count blocks default-level promotion this pass"
+    OUT="$(run_balance balance.sh LOOM_CHAMPION_TIER3_CAP=0 LOOM_CHAMPION_TIER3_BACKLOG_CAP=1)"
+    assert_contains "$OUT" "Caps this pass: DEFAULT_CAP=2 " \
+        "the unused tier3 knobs change nothing (a backlog of 3 vs a cap of 1 does not gate)"
+    assert_not_contains "$OUT" "BACKLOG" "a tiny tier3BacklogCap never gates no-level promotion"
 
-    OUT="$(run_balance balance.sh LOOM_CHAMPION_TIER2_CAP=abc LOOM_CHAMPION_TIER3_CAP=-1 LOOM_CHAMPION_TIER3_BACKLOG_CAP=2.5)"
-    assert_contains "$OUT" "Caps this pass: IMPORTANT_CAP=2 DEFAULT_CAP=1 DEFAULT_BACKLOG_CAP=5" \
-        "non-integer values fall back to the defaults instead of breaking the comparison"
-    assert_not_contains "$OUT" "integer expression expected" \
-        "a malformed cap never reaches a numeric test"
+    OUT="$(run_balance balance.sh LOOM_CHAMPION_TIER2_CAP=abc)"
+    assert_contains "$OUT" "Caps this pass: DEFAULT_CAP=2 " \
+        "a non-integer value falls back to the default"
+    OUT="$(run_balance balance.sh LOOM_CHAMPION_TIER2_CAP=-1)"
+    assert_contains "$OUT" "Caps this pass: DEFAULT_CAP=2 " "a negative value falls back to the default"
 
-    OUT="$(run_balance balance.sh LOOM_CHAMPION_TIER2_CAP= LOOM_CHAMPION_TIER3_BACKLOG_CAP=)"
-    assert_contains "$OUT" "IMPORTANT_CAP=2 DEFAULT_CAP=1 DEFAULT_BACKLOG_CAP=5" \
-        "an empty value falls back to the default"
+    OUT="$(run_balance balance.sh LOOM_CHAMPION_TIER2_CAP=)"
+    assert_contains "$OUT" "Caps this pass: DEFAULT_CAP=2 " "an empty value falls back to the default"
 
     # Negative control: drop the held-issue exclusion (#7613). The same
     # fixture must then count the two held issues, or the occupant
@@ -215,8 +216,6 @@ else
         OUT="$(run_balance balance-old.sh)"
         assert_contains "$OUT" "default (no level):  5 promoted (occupants: #101,#102,#103,#107,#108)" \
             "negative control: without the filter the held issues count as occupants"
-        assert_contains "$OUT" "DEFAULT_BACKLOG_FULL: 5 >= 5" \
-            "negative control: without the filter the held issues pin the default cap"
     fi
 fi
 
@@ -230,12 +229,13 @@ assert_contains "$RATE" "oldest first within a level" "Promotion Order breaks ti
 for v in LOOM_CHAMPION_TIER2_CAP LOOM_CHAMPION_TIER3_CAP LOOM_CHAMPION_TIER3_BACKLOG_CAP; do
     assert_contains "$RATE" "$v" "Rate Limiting by Level names $v"
 done
-assert_contains "$RATE" "\`loom:very-important\`: promote all qualifying proposals (no limit)" \
-    "loom:very-important keeps the old Tier 1 slot (uncapped)"
-assert_contains "$RATE" "\`loom:important\`: promote up to \`\$IMPORTANT_CAP\`" \
-    "loom:important takes the old Tier 2 per-pass cap"
+assert_contains "$RATE" "\`LOOM_CHAMPION_TIER3_BACKLOG_CAP\` are currently
+unused" "the tier3 knobs are documented as unused by the level mapping"
+assert_contains "$RATE" "\`loom:very-important\` / \`loom:important\`: promote all qualifying proposals (no limit)" \
+    "both priority levels take the old Tier 1 slot (uncapped)"
 assert_contains "$RATE" "No priority level: promote up to \`\$DEFAULT_CAP\`" \
-    "an unlevelled proposal takes the old Tier 3 per-pass cap"
+    "an unlevelled proposal takes the old Tier 2 per-pass cap"
+assert_not_contains "$RATE" "DEFAULT_BACKLOG_CAP" "no-level promotion has no backlog gate"
 assert_contains "$(section_body "$PROMO_MD" "Setting Priority")" "label the blocker too" \
     "Champion labels a priority proposal's blocker itself (no daemon inheritance)"
 assert_contains "$(section_body "$PROMO_MD" "Setting Priority")" "never set a level just to get past a capacity cap" \
@@ -257,7 +257,8 @@ for v in LOOM_CHAMPION_PR_SLICE LOOM_CHAMPION_PROMOTION_SLICE LOOM_CHAMPION_TIER
          LOOM_CHAMPION_TIER3_CAP LOOM_CHAMPION_TIER3_BACKLOG_CAP; do
     assert_doc_contains "$THROUGHPUT_DOC" "\`$v\`" "promotion-throughput.md documents $v"
 done
-assert_doc_contains "$THROUGHPUT_DOC" "re-keyed" "promotion-throughput.md records the level mapping of the caps"
+assert_doc_contains "$THROUGHPUT_DOC" "mapped by population" "promotion-throughput.md records the level mapping of the caps"
+assert_doc_contains "$THROUGHPUT_DOC" "46" "promotion-throughput.md cites the measurement behind dropping the backlog gate"
 assert_doc_contains "$THROUGHPUT_DOC" "loom-daemon-start.sh" \
     "promotion-throughput.md says where a fleet sets the knobs"
 

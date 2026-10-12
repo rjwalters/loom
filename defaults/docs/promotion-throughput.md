@@ -40,25 +40,48 @@ would never be reached.
 |---|---|---|
 | `LOOM_CHAMPION_PR_SLICE` | 10 | PR rows visited before the pass pauses for promotion |
 | `LOOM_CHAMPION_PROMOTION_SLICE` | 3 | Fresh promotion verdicts per pause while PR rows wait |
-| `LOOM_CHAMPION_TIER2_CAP` | 2 | `loom:important` promotions per pass |
-| `LOOM_CHAMPION_TIER3_CAP` | 1 | No-level promotions per pass |
-| `LOOM_CHAMPION_TIER3_BACKLOG_CAP` | 5 | No-level promotes only while fewer promoted no-level issues are open |
+| `LOOM_CHAMPION_TIER2_CAP` | 2 | Promotions per pass of proposals with no priority level |
+| `LOOM_CHAMPION_TIER3_CAP` | 1 | Unused since #11512 (parsed for config compatibility) |
+| `LOOM_CHAMPION_TIER3_BACKLOG_CAP` | 5 | Unused since #11512 (parsed for config compatibility) |
 | `LOOM_MAX_UNREVISED_EVALUATIONS` | 2 | Revision rounds before the bound (existing knob, #4967) |
 
 A value that is empty or not a non-negative integer falls back to the default.
-`0` is honoured, so `LOOM_CHAMPION_TIER3_CAP=0` stops no-level promotion.
+`0` is honoured, so `LOOM_CHAMPION_TIER2_CAP=0` stops no-level promotion.
 
-**The caps are the old tier caps, re-keyed on level (#11512).** #11103
-retired the `tier:*` labels the caps read. The throttle is kept, mapped to the
-analogous tier: `loom:very-important` takes the old Tier 1 slot (uncapped),
-`loom:important` the Tier 2 slot (`tier2Cap`), and an issue with no priority
-level the Tier 3 slot (`tier3Cap` plus `tier3BacklogCap`). The knobs keep
-their `tier*` names so existing config still applies. A passing proposal a cap
-holds back gets a Step 3c capacity deferral, deduplicated by
-`classify-capacity-defer.sh` (#6729). An operator can rule otherwise on
-#11278.
+**The caps are the old tier caps, mapped by population (#11512).** #11103
+retired the `tier:*` labels the caps read without mapping them, so every old
+Tier 1, Tier 2 and unlabelled issue now has no level. Each cap goes to the
+level whose population matches the one it was sized for:
 
-**Why the backlog gate counts promoted, unheld work only.** The gate used to
+| Level | Old slot | What is counted | Cap |
+|---|---|---|---|
+| `loom:very-important` | Tier 1 | Nothing | None. Guide keeps at most one eligible per workspace |
+| `loom:important` | Tier 1 | Nothing | None |
+| No level | Tier 2 | Proposals promoted at that level in this pass | `tier2Cap` (2). No backlog gate |
+
+`tier3Cap` and `tier3BacklogCap` govern no level today. They stay parsed so
+existing config still loads. A passing proposal a cap holds back gets a Step
+3c capacity deferral, deduplicated by `classify-capacity-defer.sh` (#6729).
+Champion never sets a level to get past a cap. An operator can rule otherwise
+on #11278.
+
+**Why the no-level backlog gate was dropped.** A name mapping (no level to
+Tier 3) would have put the Tier 3 backlog gate, sized for the minority
+`tier:maintenance` population, onto the majority. Measured on 2026-10-12 in
+rjwalters/loom, among 57 promoted, unheld issues:
+
+| Gate | Counted | Cap | Effect |
+|---|---|---|---|
+| The pre-#11512 Tier 3 gate (`tier:maintenance`) | 3 | 5 | Tier 3 promotes |
+| The same gate keyed on no level | 46 | 5 | No no-level promotion until about 42 issues drain |
+
+That is the #10753 starvation pattern again. With no backlog gate, no-level
+proposals promote again in rjwalters/loom, up to 2 per pass. Both priority
+levels promote without a cap. The live Backlog Balance Check printed
+`DEFAULT_CAP=2`, with 13 curated proposals waiting (11 with no level, 2
+`loom:important`).
+
+**Why the old Tier 3 gate counted promoted, unheld work only.** It used to
 count every open Tier 3 issue that was not held. Most of those were proposals
 still waiting for promotion. Measured on 2026-10-07:
 
@@ -69,9 +92,10 @@ still waiting for promotion. Measured on 2026-10-07:
 | 2AMLogic/loom-ui | 8 | 0 | 0 |
 
 The gate pinned itself, the same failure as #7613: waiting proposals counted
-against the cap, which blocked every proposal at that level. The occupant set
-is open, unheld issues with no priority level that carry `loom:issue` or
-`loom:building`. That is the backlog the cap was written to bound. The 2 and
+against the cap, which blocked every proposal at that level. #10753 fixed it
+by counting only open, unheld issues that carry `loom:issue` or
+`loom:building`. That is the backlog the cap was written to bound. With the
+same default of 5, rjwalters/loom and loom-ui promoted Tier 3 again. The 2 and
 1 per-pass caps were not binding in that data, so they are unchanged.
 
 **The slice defaults.** 10 PR rows takes roughly 10 minutes of a 30-minute

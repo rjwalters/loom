@@ -46,8 +46,8 @@
 //! `lifecycle.{leaseTtlMinutes,idleExitMinutes}`, and
 //! `rework.{buildBackoffHigh,buildBackoffLow}`. The `champion` group (#10753)
 //! carries Champion's promotion-throughput knobs
-//! (`prSlice,promotionSlice,tier2Cap,tier3Cap,tier3BacklogCap`; the `tier*`
-//! caps keep their names but key on priority level since #11512). Later tranches migrate the
+//! (`prSlice,promotionSlice,tier2Cap,tier3Cap,tier3BacklogCap`; since #11512
+//! `tier2Cap` caps no-level promotions and the two `tier3*` caps are unused). Later tranches migrate the
 //! remaining knobs (host breaker, admission brake, merge-train bounds, role
 //! budgets) onto the same surface; the schema, validation and digest
 //! mechanics here are the whole point — adding a field is one struct entry,
@@ -167,19 +167,20 @@ pub struct ChampionParams {
     /// Fresh promotion verdicts per pause while PR rows remain. Env:
     /// `LOOM_CHAMPION_PROMOTION_SLICE`. Default 3. Range `[1, 100]`.
     pub promotion_slice: usize,
-    /// `loom:important` promotions per repository per pass (the old Tier 2
-    /// cap, re-keyed on priority level by #11512; the name is kept for config
-    /// compatibility). Env: `LOOM_CHAMPION_TIER2_CAP`. Default 2. Range
-    /// `[0, 100]` (`0` disables).
+    /// Promotions per repository per pass of proposals with no priority level
+    /// (the old Tier 2 cap, mapped by population in #11512; the name is kept
+    /// for config compatibility). Env: `LOOM_CHAMPION_TIER2_CAP`. Default 2.
+    /// Range `[0, 100]` (`0` disables).
     pub tier2_cap: usize,
-    /// Promotions per repository per pass of issues with no priority level
-    /// (the old Tier 3 cap, re-keyed by #11512). Env:
-    /// `LOOM_CHAMPION_TIER3_CAP`. Default 1. Range `[0, 100]` (`0` disables).
+    /// The old Tier 3 per-pass cap. Unused since #11512: no priority level
+    /// maps onto Tier 3's population. Still parsed and digested so existing
+    /// config loads. Env: `LOOM_CHAMPION_TIER3_CAP`. Default 1. Range
+    /// `[0, 100]`.
     pub tier3_cap: usize,
-    /// Open unheld `loom:issue`/`loom:building` issues with no priority level
-    /// above which no-level promotion is gated (the old Tier 3 backlog gate,
-    /// re-keyed by #11512). Env: `LOOM_CHAMPION_TIER3_BACKLOG_CAP`. Default 5.
-    /// Range `[0, 1000]`.
+    /// The old Tier 3 backlog gate. Unused since #11512: keyed on no level it
+    /// counted 46 promoted issues against 5 and froze promotion. Still parsed
+    /// and digested so existing config loads. Env:
+    /// `LOOM_CHAMPION_TIER3_BACKLOG_CAP`. Default 5. Range `[0, 1000]`.
     pub tier3_backlog_cap: usize,
 }
 
