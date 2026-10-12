@@ -58,11 +58,8 @@ fresh claim from a concurrent Champion evaluation, #4954), as well as
 `loom:operator-only` and `loom:blocked` — both put an issue permanently outside
 Champion's promotion authority per `champion-issue-promo.md`'s "When NOT to
 Promote", so there is no reason to hand them into the evaluation pass at all
-(#5163). Also exclude `loom:issue` and `loom:building` — promotion adds
-`loom:issue` but deliberately leaves `loom:curated` in place as a permanent
-milestone marker (see note below), so without this exclusion every
-already-promoted or already-claimed issue keeps matching this query forever
-(#5285). Exclude `loom:needs-revision` too: Curator holds the issue until it
+(#5163). Also exclude `loom:issue` and `loom:building` (why: the note below
+the query, #5285). Exclude `loom:needs-revision` too: Curator holds the issue until it
 revises the body (#10753). Excluding them here, not just in the evaluation step, so a batch
 doesn't re-discover work another pass already claimed or that is already
 terminal — `title`/`body` feed `champion-issue-promo.md`'s body-hash

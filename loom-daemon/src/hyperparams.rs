@@ -45,9 +45,9 @@
 //! `dispatch.{tickIntervalSecs,maxConcurrent,maxAdmissionsPerTick}`,
 //! `lifecycle.{leaseTtlMinutes,idleExitMinutes}`, and
 //! `rework.{buildBackoffHigh,buildBackoffLow}`. The `champion` group (#10753)
-//! carries Champion's promotion-throughput knobs (`prSlice,promotionSlice`;
-//! `tier2Cap,tier3Cap,tier3BacklogCap` are retired and inert since #11512, but
-//! still accepted so a config carrying them starts). Later tranches migrate the
+//! carries Champion's promotion-throughput knobs
+//! (`prSlice,promotionSlice,tier2Cap,tier3Cap,tier3BacklogCap`; the `tier*`
+//! caps keep their names but key on priority level since #11512). Later tranches migrate the
 //! remaining knobs (host breaker, admission brake, merge-train bounds, role
 //! budgets) onto the same surface; the schema, validation and digest
 //! mechanics here are the whole point — adding a field is one struct entry,
@@ -167,19 +167,19 @@ pub struct ChampionParams {
     /// Fresh promotion verdicts per pause while PR rows remain. Env:
     /// `LOOM_CHAMPION_PROMOTION_SLICE`. Default 3. Range `[1, 100]`.
     pub promotion_slice: usize,
-    /// **Retired (#11512), inert.** Was the per-pass Tier 2 promotion cap;
-    /// the tier labels it keyed on are retired (#11103) and no Champion
-    /// prompt reads it. Kept (validated, digested) so a config or env vector
-    /// carrying it still starts. Env: `LOOM_CHAMPION_TIER2_CAP`. Default 2.
-    /// Range `[0, 100]`.
+    /// `loom:important` promotions per repository per pass (the old Tier 2
+    /// cap, re-keyed on priority level by #11512; the name is kept for config
+    /// compatibility). Env: `LOOM_CHAMPION_TIER2_CAP`. Default 2. Range
+    /// `[0, 100]` (`0` disables).
     pub tier2_cap: usize,
-    /// **Retired (#11512), inert.** Was the per-pass Tier 3 promotion cap;
-    /// kept for the same reason as `tier2_cap`. Env:
-    /// `LOOM_CHAMPION_TIER3_CAP`. Default 1. Range `[0, 100]`.
+    /// Promotions per repository per pass of issues with no priority level
+    /// (the old Tier 3 cap, re-keyed by #11512). Env:
+    /// `LOOM_CHAMPION_TIER3_CAP`. Default 1. Range `[0, 100]` (`0` disables).
     pub tier3_cap: usize,
-    /// **Retired (#11512), inert.** Was the Tier 3 backlog gate; kept for the
-    /// same reason as `tier2_cap`. Env: `LOOM_CHAMPION_TIER3_BACKLOG_CAP`.
-    /// Default 5. Range `[0, 1000]`.
+    /// Open unheld `loom:issue`/`loom:building` issues with no priority level
+    /// above which no-level promotion is gated (the old Tier 3 backlog gate,
+    /// re-keyed by #11512). Env: `LOOM_CHAMPION_TIER3_BACKLOG_CAP`. Default 5.
+    /// Range `[0, 1000]`.
     pub tier3_backlog_cap: usize,
 }
 
@@ -352,9 +352,9 @@ const LEASE_TTL_MINUTES_MAX: f64 = 1440.0;
 const IDLE_EXIT_MINUTES_RANGE: (u64, u64) = (1, 10080);
 const BUILD_BACKOFF_HIGH_RANGE: (u64, u64) = (1, 100_000);
 const BUILD_BACKOFF_LOW_RANGE: (u64, u64) = (0, 100_000);
-/// Champion knobs: `(key, single-knob env var, range)`. The three retired
-/// caps (#11512, inert) admit `0` because Champion's shell `_cap` honoured it;
-/// the slices do not.
+/// Champion knobs: `(key, single-knob env var, range)`. The three caps admit
+/// `0` because Champion's shell `_cap` honours it (`0` disables that level /
+/// gates no-level promotion shut — promotion-throughput.md); the slices do not.
 const CHAMPION_KEYS: [(&str, &str, (u64, u64)); 5] = [
     ("prSlice", "LOOM_CHAMPION_PR_SLICE", (1, 1000)),
     ("promotionSlice", "LOOM_CHAMPION_PROMOTION_SLICE", (1, 100)),

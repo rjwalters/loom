@@ -2039,13 +2039,16 @@ jobs:
       - name: merge-pr loom:pr review-signal guard (#7419, #8191 slice)
         if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-loom-pr-label-guard.sh
-      # #9657 (#9548 slice): this suite pins the working-tree binary for the
-      # real `forge trusted-comments` filter, so it needs this job's shared
-      # build. (Its sibling, test-classify-capacity-defer.sh, was retired with
-      # the script by #11512.)
+      # #9657 (#9548 slice): both suites pin the working-tree binary for the
+      # real `forge trusted-comments` filter, so they need this job's shared
+      # build; capacity-defer moved out of shell-suite-tests/ci-wired.txt for
+      # exactly that reason.
       - name: merge-pr hold-state comment trust (#9657, #9548 slice)
         if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-hold-state-trust.sh
+      - name: classify-capacity-defer comment trust (#9657, #9548 slice)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
+        run: bash defaults/scripts/tests/test-classify-capacity-defer.sh
       - name: merge-pr PR-label fetch freshness (#8550)
         if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-label-freshness.sh

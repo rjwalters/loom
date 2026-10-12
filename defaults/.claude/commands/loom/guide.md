@@ -207,7 +207,7 @@ discover_project_goals
 
 | Label | When |
 |-------|------|
-| `loom:very-important` | The one thing this workspace should land next. Only one counts per workspace (the oldest eligible; extras rank as important), so keep at most one |
+| `loom:very-important` | The one thing this workspace should land next. Only one counts per workspace (the oldest eligible; extras rank as important), so keep at most one eligible; a blocked or unapproved one may keep its label |
 | `loom:important` | Directly advances a current milestone, or blocks work that does |
 | *(none)* | Everything else (the default) |
 
@@ -926,7 +926,7 @@ Still blocked until all dependencies resolve.
 
 - **Explain reasoning** - comment when you unblock, close, or re-prioritize an issue
 - **Stay current** - consider recent context and user feedback
-- **Keep priority scarce** - at most one `loom:very-important` per workspace;
+- **Keep priority scarce** - at most one eligible `loom:very-important` per workspace;
   the old urgent label is retired and must not be applied
 
 ## Terminal Probe Protocol

@@ -49,7 +49,7 @@ incident citation, and fixes**:
 
 ## Goal Discovery and Priority Order
 
-**CRITICAL**: Before evaluating proposals, check the project goals, so Value Alignment (criterion 4) and any priority you set reflect current milestones.
+**CRITICAL**: Before evaluating proposals, check the project goals and the current backlog balance, so Value Alignment (criterion 4) and any priority you set reflect current milestones, and promotion does not flood the backlog.
 
 ```bash
 discover_project_goals() {
@@ -63,26 +63,86 @@ discover_project_goals() {
 discover_project_goals
 ```
 
+### Backlog Balance Check
+
+The per-level caps below are the old per-tier caps re-keyed on priority level
+(#11512): `loom:very-important` takes the old Tier 1 slot (no cap),
+`loom:important` the Tier 2 slot (`tier2Cap`), and an issue with no priority
+level the Tier 3 slot (`tier3Cap` plus `tier3BacklogCap`). The knobs keep their
+`tier*` names so existing config still applies.
+
+**The default-level count is promoted, unheld work only.** It counts open
+`loom:issue` / `loom:building` issues with no priority label (#10753) and
+excludes `loom:operator-only` / `loom:blocked` ones (#7613). A proposal still
+waiting for promotion, or a held issue, cannot free a slot through the normal
+pipeline, so counting it pins the cap indefinitely (2026-10-07: 19 counted, 2
+promoted in rjwalters/loom).
+
+```bash
+check_backlog_balance() {
+  echo "=== Backlog Level Balance ==="
+  # Promoted (loom:issue/loom:building), unheld (#7613) issues, by level.
+  promoted_json=$( { gh issue list --label="loom:issue" --state=open --limit 500 --json number,labels
+    gh issue list --label="loom:building" --state=open --limit 500 --json number,labels; } |
+    jq -s 'add | unique_by(.number) |
+    [.[] | select([.labels[].name] | any(IN("loom:operator-only","loom:blocked")) | not) |
+    {number, level: ([.labels[].name] | if index("loom:very-important") then "loom:very-important"
+      elif index("loom:important") then "loom:important" else "default" end)}]')
+  # Sorted, comma-joined occupant list for a level; feed it verbatim into
+  # Step 3c's classify-capacity-defer.sh --occupants argument.
+  _occupants() { printf '%s' "$promoted_json" | jq -r --arg l "$1" \
+    '[.[] | select(.level == $l) | .number] | sort | map("#" + tostring) | join(",")'; }
+  _count() { printf '%s' "$promoted_json" | jq --arg l "$1" '[.[] | select(.level == $l)] | length'; }
+  very_important=$(_count "loom:very-important")
+  important=$(_count "loom:important"); important_occupants=$(_occupants "loom:important")
+  default=$(_count "default"); default_occupants=$(_occupants "default")
+
+  # Per-pass caps (#10753): env > default; empty or not an integer -> default.
+  _cap() { case "$1" in ''|*[!0-9]*) echo "$2" ;; *) echo "$1" ;; esac; }
+  IMPORTANT_CAP=$(_cap "${LOOM_CHAMPION_TIER2_CAP:-}" 2)
+  DEFAULT_CAP=$(_cap "${LOOM_CHAMPION_TIER3_CAP:-}" 1)
+  DEFAULT_BACKLOG_CAP=$(_cap "${LOOM_CHAMPION_TIER3_BACKLOG_CAP:-}" 5)
+
+  echo "loom:very-important: $very_important promoted"
+  echo "loom:important:      $important promoted (occupants: ${important_occupants:-none})"
+  echo "default (no level):  $default promoted (occupants: ${default_occupants:-none})"
+  echo "Caps this pass: IMPORTANT_CAP=$IMPORTANT_CAP DEFAULT_CAP=$DEFAULT_CAP DEFAULT_BACKLOG_CAP=$DEFAULT_BACKLOG_CAP"
+  if [ "$default" -ge "$DEFAULT_BACKLOG_CAP" ]; then
+    echo "DEFAULT_BACKLOG_FULL: $default >= $DEFAULT_BACKLOG_CAP, no default-level promotion this pass (Step 3c)."
+  fi
+}
+check_backlog_balance
+```
+
 ### Promotion Order
 
 Evaluate proposals by level (`loom:very-important`, then `loom:important`,
 then the rest), oldest first within a level (#11103); `champion.md`'s
-discovery queries already return them in that order. Promote **every**
-proposal that passes all 8 criteria. There is no per-level cap: the old
-per-tier caps and the Tier 3 backlog cap were retired with the `tier:*`
-labels (#11512). While PR rows wait, `LOOM_CHAMPION_PROMOTION_SLICE` still
-bounds fresh verdicts per pause (`champion.md` → "Autonomous Operation").
+discovery queries already return them in that order.
+
+**Rate Limiting by Level** (per pass; the caps are the values the Backlog
+Balance Check printed: env vars `LOOM_CHAMPION_TIER2_CAP`,
+`LOOM_CHAMPION_TIER3_CAP`, `LOOM_CHAMPION_TIER3_BACKLOG_CAP`, defaults 2/1/5,
+#10753; where a fleet sets them: `.loom/docs/promotion-throughput.md`):
+- `loom:very-important`: promote all qualifying proposals (no limit)
+- `loom:important`: promote up to `$IMPORTANT_CAP`
+- No priority level: promote up to `$DEFAULT_CAP`, and only while the `default` count from the Backlog Balance Check above (promoted, unheld occupants) is below `$DEFAULT_BACKLOG_CAP`
+
+Count each promotion under the level it is promoted with. A cap that blocks a
+passing proposal is a Step 3c capacity deferral, not a rejection. While PR
+rows wait, `LOOM_CHAMPION_PROMOTION_SLICE` also bounds fresh verdicts per
+pause (`champion.md` → "Autonomous Operation").
 
 ### Setting Priority
 
 You may add or remove `loom:important` / `loom:very-important` (#11103) when
 the evaluation shows it is warranted — the same scale as `guide.md` →
 "Priority Levels": very important is the one thing this workspace should land
-next (only one counts per workspace; keep at most one), important advances a
+next (only one counts per workspace; keep at most one eligible), important advances a
 current milestone or blocks work that does. Priority is never inherited: if a
-priority proposal waits on a blocker, label the blocker too. Priority changes
-order only: it never substitutes for a failing criterion and never exempts an
-issue from a hold or gate.
+priority proposal waits on a blocker, label the blocker too. Priority never
+substitutes for a failing criterion and never exempts an issue from a hold or
+gate; never set a level just to get past a capacity cap.
 
 ---
 
@@ -334,12 +394,11 @@ issue it does exactly one of:
 | `OK` | No APPROVED comment (a search false-positive, or `loom:issue` already present — a concurrent pass may have just reconciled it) — nothing done |
 | `OK` (timeline-confirmed) | `loom:issue` is currently absent, but the label timeline shows it WAS applied after the newest APPROVED comment and the issue has since legitimately progressed further (e.g. `loom:issue` -> `loom:building`, or -> `loom:blocked`) — the promotion landed; this is not #6862's failure mode, and re-adding `loom:issue` here would corrupt the issue's current, further-along state (#6933) |
 | `NOT_OPEN` | Issue is closed — nothing left to reconcile |
-| `COMPLETED` | Recovered the tier from the verdict comment's "Goal Alignment" line, applied `loom:issue` + that tier, and **confirmed the addition via its own read-back** — the issue is now a normal, Builder-visible `loom:issue` |
-| `ESCALATED` | Could not safely complete (tier unrecoverable from the comment text, or the completing edit's own read-back still failed) — posted an explanatory comment and added `loom:operator-only,loom:operator-mechanical` rather than guess |
-| `ALREADY_ESCALATED` | Tier unrecoverable, but the issue already carries `loom:operator-only` from a prior run — a human already owns it, so no duplicate comment is posted and no redundant label edit is issued (#6942) |
+| `COMPLETED` | Applied `loom:issue` and **confirmed the addition via its own read-back** — the issue is now a normal, Builder-visible `loom:issue` |
+| `ESCALATED` | Could not safely complete (the completing edit or its own read-back failed) — nothing is reported as done; a later pass retries |
+| `ALREADY_ESCALATED` | The issue already carries `loom:operator-only` — a human already owns it, so no duplicate comment is posted and no redundant label edit is issued (#6942) |
 
-Nothing here re-runs the 8 evaluation criteria or re-derives a tier from
-scratch — the original verdict already did that work; this pass only
+Nothing here re-runs the 8 evaluation criteria — the original verdict already did that work; this pass only
 reconciles a write that should have landed and did not.
 `LOOM_MAX_PROMOTION_MISMATCH_RESCANS` (default **5**) bounds the per-pass cost
 the same way `LOOM_MAX_UNESCALATION_RESCANS` and `LOOM_MAX_EVALUATING_RESCANS`
@@ -1035,6 +1094,72 @@ This issue has been evaluated and promoted to \`loom:issue\` status. All quality
 fi
 ```
 
+**Step 3c: Capacity Deferral — the level's rate limit blocks promotion this pass (#6729)**
+
+All 8 criteria can pass and Step 3b still not fire: "Rate Limiting by Level"
+above caps `loom:important` and default-level promotions per pass, and the
+default level by its backlog too. When the cap is what blocks promotion — not
+a quality problem — this is a **capacity deferral, not a rejection**: no
+revision is needed, so Step 4's `VERDICT_MARKER` is never written and the
+proposal's label (`loom:curated`/`loom:architect`/`loom:hermit`/`loom:auditor`)
+is left untouched, exactly as an ordinary re-queue for next iteration.
+
+**Without a guard this repeats every pass** for an issue that keeps losing the
+same capacity gate (observed live: #6628 accumulated 10 near-identical
+"backlog cap reached" comments over ~22 hours, all citing the SAME five
+occupants). `classify-capacity-defer.sh` closes it, keyed to the **level and
+occupant set** that explains the deferral, since a capacity deferral has no
+verdict comment to piggyback its marker on:
+
+```bash
+# LEVEL: `default` (no priority label) or `loom:important`. OCCUPANTS: that
+# level's occupant list from the "Backlog Balance Check" ($default_occupants
+# or $important_occupants, which already exclude held issues, #7613) — pass it
+# through verbatim.
+CAP_RC=0
+./.loom/scripts/classify-capacity-defer.sh --issue "$ISSUE_NUMBER" \
+  --level "default" --occupants "$default_occupants" \
+  --apply || CAP_RC=$?
+```
+
+| `CAP_RC` | Marker | What to do |
+|---|---|---|
+| `1` | `POST_COMMENT` + `REASON: first-deferral` or `composition-changed` | **Post the deferral comment** (template below) — the first time this issue hit this level's cap, or the occupant set changed since the last one |
+| `0` | `SKIP_COMMENT` | **Do not post a comment.** Level and occupant set match the last capacity-deferral comment on this issue — `--apply` already bumped that comment's `<!-- champion:capacity-defer-seen:<fingerprint>:<n> -->` counter in place (a stderr warning if nothing was patched is never a reason to post) |
+| `2` | — | The script could not read the issue or the arguments were malformed. Fail toward posting the deferral comment |
+
+**Posting the deferral comment (`CAP_RC=1`)** — carries the two markers the
+next pass's call needs to recognize an unchanged recurrence:
+
+```bash
+./.loom/scripts/post-comment.sh "$ISSUE_NUMBER" --body "<!-- champion:capacity-defer:default:$FINGERPRINT -->
+<!-- champion:capacity-defer-seen:$FINGERPRINT:1 -->
+**Champion Review: default-level backlog cap reached — deferring promotion**
+
+Evaluated against all 8 promotion criteria; all pass:
+
+- [criterion-by-criterion rationale, as in a normal APPROVED verdict]
+
+**Not promoted this pass — default-level (no priority label) backlog cap.**
+The backlog holds [N] promoted issues with no priority label ([occupants]), at
+the cap of [DEFAULT_BACKLOG_CAP], so this one is held back this pass.
+
+This is a **capacity deferral, not a rejection** — no revision is needed, so no
+verdict marker is being written and the proposal label is left untouched. A
+future Champion pass will re-evaluate it once the backlog drops below the cap
+(or a promotion slot for its level frees up).
+
+---
+*Automated by Champion role*"
+```
+
+`$FINGERPRINT` is the value the script printed — use it verbatim. A capacity
+deferral is neither a promotion nor a rejection: continue the loop to the next
+issue and do not count it against the level caps. **No escalation
+counterpart, and none should be added**: it is never a merits problem, and it
+ends the moment the backlog composition changes, which the next pass's
+fingerprint comparison detects for free.
+
 ### Step 4: Reject (One or More Criteria Fail)
 
 If any criteria fail, first check whether this rejection has reached **the bound** (#4967, #10753) instead of posting another ordinary verdict — the mechanism that stops the 6x duplicate-comment loop and the revise→reject ping-pong:
@@ -1237,9 +1362,9 @@ Do NOT remove the proposal label (`loom:curated`, `loom:architect`, `loom:hermit
 
 ## Issue Promotion Batch Processing
 
-**Process all qualifying issues in one iteration, in "Promotion Order" (level, then oldest).**
+**Process all qualifying issues in one iteration, in "Promotion Order" (level, then oldest), governed by the per-level rate limits that prevent backlog flooding** ("Rate Limiting by Level" above: `loom:very-important` uncapped, `loom:important` up to `$IMPORTANT_CAP` per pass, no level up to `$DEFAULT_CAP` per pass and only while the promoted default-level backlog is below `$DEFAULT_BACKLOG_CAP`).
 
-Continue evaluating issues until all have been processed — or, while PR rows still wait, until `${LOOM_CHAMPION_PROMOTION_SLICE:-3}` fresh verdicts are spent (`champion.md` → "Autonomous Operation", #10753). This prevents issues from waiting unnecessarily across multiple 10-minute intervals when they've already met quality criteria.
+Continue evaluating issues until all have been processed or all applicable level limits are reached — or, while PR rows still wait, until `${LOOM_CHAMPION_PROMOTION_SLICE:-3}` fresh verdicts are spent (`champion.md` → "Autonomous Operation", #10753). This prevents issues from waiting unnecessarily across multiple 10-minute intervals when they've already met quality criteria.
 
 **Per-issue order in the loop**: run the "Dependency-Defer Fast Path" first — before anything else, including the Idempotency check — then the "Idempotency check", then the "Claim" step (skip if a concurrent evaluation holds a fresh `loom:evaluating`, reclaim if stale) — the latter two from "Concurrency Guard and Idempotency" above — before Step 1 (Read). The idempotency check has **three** outcomes, not two:
 
@@ -1253,7 +1378,9 @@ Continue evaluating issues until all have been processed — or, while PR rows s
 | Marker match, `OPERATOR_RULED=yes` (`loom:operator-only` removed after this revision's rejection, #8245) | Continue the loop — no tally, no escalation, no comment. A human has already ruled on this exact body; only a revision (new hash, new verdict) restarts the ladder |
 | `FORCE_REEVALUATE=yes` (the self-healing un-escalation just cleared `loom:operator-only`) | Claim → Step 1 (Read) → Step 2 → Step 3 or 4, ignoring the marker entirely (#5664) |
 
-A skip (either the idempotency skip or a fresh-claim skip) means: continue the loop to the next issue, it is neither a promotion nor a rejection. An escalation **is** a verdict — count it as you would a rejection.
+A skip (either the idempotency skip or a fresh-claim skip) means: continue the loop to the next issue, do not count it against the level caps (it was neither promoted nor rejected this pass). An escalation **is** a verdict — count it as you would a rejection.
+
+**Capacity deferral (Step 3c, #6729) is a third kind of non-verdict**: all 8 criteria passed, but the level's rate limit blocked promotion this pass. `classify-capacity-defer.sh` decides whether it is worth a fresh comment (first time, or composition changed) or stays silent (same level + same occupant set) — see Step 3c. Either way, continue the loop without counting it against the level caps.
 
 ### When NOT to Promote
 

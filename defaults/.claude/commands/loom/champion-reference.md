@@ -306,6 +306,16 @@ gh issue edit <number> --add-label "loom:evaluating"
 
 ---
 
+### Edge Case 5d: Capacity-Deferral Comments Re-Posted Every Pass for an Unchanged Backlog (#6729)
+
+**Scenario**: A proposal passes all 8 promotion criteria, but `champion-issue-promo.md`'s "Rate Limiting by Level" caps the promotion (the per-pass `loom:important` / default-level caps, or the default-level backlog cap; the old tier caps re-keyed on level, #11512). This is a **capacity deferral, not a rejection**, so Edge Case 5c's `VERDICT_MARKER` is never written. Without a guard every pass posts an equivalent "backlog cap reached" comment again (observed: 10 near-identical comments on #6628 over ~22 hours).
+
+**Handling**: `champion-issue-promo.md`'s "Step 3c: Capacity Deferral" keys a fingerprint to the **level and occupant set** that explains the deferral (`classify-capacity-defer.sh --level <level> --occupants <list>`; pure helpers `normalize_occupants` / `capacity_fingerprint`). The occupant set comes from the "Backlog Balance Check" and already excludes held issues (#7613). Exit `1` (`POST_COMMENT`): post the deferral comment with its markers; `0` (`SKIP_COMMENT`): post nothing, `--apply` bumped the seen-counter in place; `2`: fail toward posting.
+
+**Rationale**: Same shape as Edge Case 5c (a fingerprint anchored to what actually changes) but **no escalation counterpart**: a capacity deferral is never a merits problem and self-resolves the moment the backlog composition changes.
+
+---
+
 ### Edge Case 6: PR Modifying Only Test Files
 
 **Scenario**: PR changes only test files (e.g., `*.test.ts`, `*.spec.rs`).
@@ -613,6 +623,7 @@ EXISTING=$(gh issue list --search "Follow-on from PR #$PR_NUMBER" --limit 500)
 | Proposal whose only recurring finding is an open, non-cycle dependency | Dependency-timing gate (`classify-dependency-block.sh --check-defer`) | **Defer, never escalate** — the condition self-clears when the blocker closes; blocker already closed → re-evaluate rather than escalate on a stale finding (#5664) |
 | Proposal stuck at `loom:operator-only` from a dependency-only escalation whose blocker has since closed | Pass 0 self-healing re-scan (`--check-unescalate --apply`) | Remove `loom:operator-only`, post one fingerprinted un-escalation comment, rejoin evaluation the same pass; merits/cycle/human-applied escalations are never touched (#5664) |
 | Proposal (parked or not) whose blocker is still open but that declares a `## Startable Subset` covering only part of its scope | Sub-issue granularity carve-out ("recurred after closure", #5664) | Criterion 2's dependency finding does not fail the whole issue; promote scoped to the declared subset (`Part of #<issue>`), or un-escalate an already-parked one via `--check-unescalate` (`SUBSET_CARVEOUT: yes`) even while the blocker stays open — `detect-startable-subset.sh` |
+| Proposal passes all 8 criteria but its level's rate limit blocks promotion this pass | Capacity-deferral idempotency (`classify-capacity-defer.sh`, #6729) | **Post the deferral comment only on first deferral or a changed occupant set**; same level + same occupant set → skip silently, bump the seen-counter in place; no escalation counterpart |
 | Test-only changes | Allow | Standard criteria apply |
 | Human holds PR (removes `loom:pr`) | Skip | Not a merge candidate without `loom:pr` |
 | Multiple linked issues | Allow | Verify all closed (each is gated independently by the out-of-band AC gate below) |

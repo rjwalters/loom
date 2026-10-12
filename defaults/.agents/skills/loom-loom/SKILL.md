@@ -675,7 +675,7 @@ loom-clean --deep       # Also remove build artifacts
 | `loom:building` | Being implemented | Builder |
 | `loom:blocked` | Work is blocked | Builder |
 | `loom:operator-only` | Needs a human; sweep skips | Human |
-| `loom:important`, `loom:very-important` | Order only | Guide/Champion |
+| `loom:important`, `loom:very-important` | Order (and Champion's promotion cap) | Operator/Guide/Champion |
 
 **Workflow labels (PR lifecycle):**
 

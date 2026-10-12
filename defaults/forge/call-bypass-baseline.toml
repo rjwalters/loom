@@ -62,6 +62,12 @@ owner = "role-scripts"
 removal_issue = 9799
 
 [[bypass]]
+path = "defaults/scripts/classify-capacity-defer.sh"
+calls = 2
+owner = "role-scripts"
+removal_issue = 9799
+
+[[bypass]]
 path = "defaults/scripts/clean-stale-building-labels.sh"
 calls = 2
 owner = "role-scripts"

@@ -34,28 +34,45 @@ pass was rejected because `pr-queue` does not sort held PRs last. Old held
 rows would fill the cap on every pass, and newer mergeable PRs behind them
 would never be reached.
 
-## 2. The slice knobs (the tier caps are retired)
+## 2. Promotion caps are configurable, keyed on priority level
 
 | Env var | Default | Governs |
 |---|---|---|
 | `LOOM_CHAMPION_PR_SLICE` | 10 | PR rows visited before the pass pauses for promotion |
 | `LOOM_CHAMPION_PROMOTION_SLICE` | 3 | Fresh promotion verdicts per pause while PR rows wait |
+| `LOOM_CHAMPION_TIER2_CAP` | 2 | `loom:important` promotions per pass |
+| `LOOM_CHAMPION_TIER3_CAP` | 1 | No-level promotions per pass |
+| `LOOM_CHAMPION_TIER3_BACKLOG_CAP` | 5 | No-level promotes only while fewer promoted no-level issues are open |
 | `LOOM_MAX_UNREVISED_EVALUATIONS` | 2 | Revision rounds before the bound (existing knob, #4967) |
 
-An unset or empty value falls back to the default.
+A value that is empty or not a non-negative integer falls back to the default.
+`0` is honoured, so `LOOM_CHAMPION_TIER3_CAP=0` stops no-level promotion.
 
-**The tier caps were retired (#11512).** #10753 made three caps on
-`tier:*` labels configurable: Tier 2 and Tier 3 promotions per pass, and a
-Tier 3 backlog cap that counted promoted, unheld Tier 3 issues
-(the earlier count of every open one pinned itself: 19 counted against 2
-promoted in rjwalters/loom on 2026-10-07). #11103 retired the `tier:*`
-labels with no mapping, so Champion now promotes every passing proposal in
-priority order (`loom:very-important`, then `loom:important`, then the rest,
-oldest first; `champion-issue-promo.md` → "Promotion Order"), and the Step 3c
-capacity deferral and `classify-capacity-defer.sh` went with the caps. The
-`tier2Cap`, `tier3Cap` and `tier3BacklogCap` hyperparameter keys and their
-`LOOM_CHAMPION_TIER*` env vars are still accepted, so a config carrying them
-starts, but nothing reads them.
+**The caps are the old tier caps, re-keyed on level (#11512).** #11103
+retired the `tier:*` labels the caps read. The throttle is kept, mapped to the
+analogous tier: `loom:very-important` takes the old Tier 1 slot (uncapped),
+`loom:important` the Tier 2 slot (`tier2Cap`), and an issue with no priority
+level the Tier 3 slot (`tier3Cap` plus `tier3BacklogCap`). The knobs keep
+their `tier*` names so existing config still applies. A passing proposal a cap
+holds back gets a Step 3c capacity deferral, deduplicated by
+`classify-capacity-defer.sh` (#6729). An operator can rule otherwise on
+#11278.
+
+**Why the backlog gate counts promoted, unheld work only.** The gate used to
+count every open Tier 3 issue that was not held. Most of those were proposals
+still waiting for promotion. Measured on 2026-10-07:
+
+| Repository | Counted by the old gate | Promoted (`loom:issue` / `loom:building`) | Curated issues held by a capacity deferral |
+|---|---|---|---|
+| rjwalters/loom | 19 | 2 | 9 |
+| 2AMLogic/2am | 24 | 6 | 19 |
+| 2AMLogic/loom-ui | 8 | 0 | 0 |
+
+The gate pinned itself, the same failure as #7613: waiting proposals counted
+against the cap, which blocked every proposal at that level. The occupant set
+is open, unheld issues with no priority level that carry `loom:issue` or
+`loom:building`. That is the backlog the cap was written to bound. The 2 and
+1 per-pass caps were not binding in that data, so they are unchanged.
 
 **The slice defaults.** 10 PR rows takes roughly 10 minutes of a 30-minute
 session, which leaves room for promotion and the rest of the PR pass. Priority
@@ -73,7 +90,8 @@ environment. See "Changing daemon environment variables" and "Env keys carried
 forward across a re-render" in `daemon-reference.md`. For a hand-run
 `/loom:champion`, export the value in that shell. The knobs are
 keys of the `champion` group of the `hyperparameters` config block
-(`prSlice`, `promotionSlice`; defaults 10, 3), so the fleet store's machine tier
+(`prSlice`, `promotionSlice`, `tier2Cap`, `tier3Cap`, `tier3BacklogCap`;
+defaults 10, 3, 2, 1, 5), so the fleet store's machine tier
 (`fleet/defaults.json`) can carry them and they enter the run digest
 (`hyperparameters.md`). Precedence is env var > `LOOM_HYPERPARAMS` vector >
 config block > default. Follow-on work: the daemon does not yet export the
