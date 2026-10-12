@@ -162,8 +162,14 @@ for `gate_listing`, only the forge listing order (select
 Run against `signoz_logs.distributed_logs_v2` (ClickHouse). Substitute the repo,
 number and instant. `rank = 0` means the item was **not** in that role's latest
 list at that instant. `candidates_total` says how many it had; the list is no longer
-truncated (#11567), so an item the role ranked is always listed; compare with
-`candidates_total` and reassemble chunks first.
+truncated (#11567), so an item the role ranked is always listed. The query below
+reads a single log row, so it is only correct when that record is unsplit
+(`chunk_count = 1`): a chunked tick exports one row per chunk, all with the same
+timestamp, so `LIMIT 1 BY role, host` picks one chunk arbitrarily and
+`arrayFirstIndex` then returns the candidate's position *inside that chunk*, not
+its rank. For a chunked record, take every chunk of the newest `tick_id`, order
+them by `chunk_index`, concatenate their `candidates[]` lists, and read the
+candidate's own `rank` field instead of an array position.
 
 ```sql
 SELECT
@@ -189,7 +195,8 @@ the instant.) This query is **not yet run against a live SigNoz or the pinned
 ClickHouse** (no engine-level harness covers it).
 
 Service cadence and stalls per host: `max(tick_at) - lag(tick_at)` over the same
-filter grouped by `role, host`.
+filter grouped by `role, host`, restricted to `chunk_index = 0` so the chunks of
+one tick are not counted as multiple ticks.
 
 ## Record volume
 
@@ -212,12 +219,14 @@ work-finder tick with ~575 candidates and ~350 draws is several hundred KB.
 At 1,440 work-finder ticks/day/host that is on the order of 0.5 GB/day/host
 in the worst case (typical ticks with a handful of candidates stay around
 1 KB). A record whose JSON exceeds `CHUNK_BYTES` (1,000,000) is split into
-chunks, so each chunk is bounded (`pick_decision_record_size_is_bounded` pins
-that); the compact `[repo_idx, number, reason_code]` encoding is the fallback
+chunks, so each chunk is bounded
+(`a_busy_tick_splits_into_bounded_chunks_and_reassembles_exactly` pins that);
+the compact `[repo_idx, number, reason_code]` encoding is the fallback
 if volume proves unacceptable.
 
 **Chunking.** Every record carries `chunk_index` (0-based) and `chunk_count`
-(`0` / `1` when unsplit; additive, `schema_version` stays `2`). Chunks of one
+(`chunk_index` 0 and `chunk_count` 1 when unsplit; additive, `schema_version`
+stays `2`). Chunks of one
 tick share `tick_id` and repeat the header (`role`, `host`, timestamps,
 `outcome`, `candidates_total`, `candidate_source`, `decisions_observed`,
 `workspace_draw.seed` / `draws_total`); the list entries are packed in order, so

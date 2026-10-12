@@ -1,6 +1,9 @@
 //! OTLP mapping for `pick.decision` (#10212).
 //!
-//! One log record per tick. The **body** is the record's JSON, so ClickHouse
+//! One log record per chunk: a tick whose JSON exceeds `CHUNK_BYTES` is
+//! split into bounded chunks, each exported as its own log record (see
+//! `telemetry-kind-pick-decision.md`). The **body** is the chunk's JSON, so
+//! ClickHouse
 //! can `JSONExtract` the ranked candidate list (see `telemetry-schema.md` for
 //! the rank query). The one attribute here is `loom.role`; `log_record_for`
 //! adds `loom.kind` (`pick.decision`, the key the SigNoz queries filter on,
@@ -30,7 +33,7 @@ pub(super) fn log_parts(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::super::log_record_for;
+    use super::super::{any_value, log_record_for};
     use crate::telemetry::kinds::pick_decision::{
         split_into_chunks, PickCandidate, PickDecisionRecord, PickDraw, PickDrawCandidate,
         PickTick, PickVerdict, PickWorkspaceDraw,
@@ -106,7 +109,12 @@ mod tests {
         for chunk in split_into_chunks(record, 2_000) {
             let envelope = TelemetryEnvelope::new("h", TelemetryRecord::PickDecision(chunk));
             let log = log_record_for(&envelope).expect("pick.decision exports as a log");
-            let body = serde_json::from_str::<serde_json::Value>(&log.body).expect("json body");
+            let Some(any_value::Value::StringValue(json)) =
+                log.body.as_ref().and_then(|b| b.value.as_ref())
+            else {
+                panic!("pick.decision body is a string: {:?}", log.body);
+            };
+            let body: serde_json::Value = serde_json::from_str(json).expect("json body");
             assert!(body["chunk_index"].is_u64(), "{body}");
             assert_eq!(body["tick_id"], "t");
             assert_eq!(body["workspace_draw"]["seed"], "42");
