@@ -242,6 +242,9 @@ impl Sampler {
 /// group is `pgid`. The child is its own group leader (`proc_exec`).
 #[cfg(target_os = "linux")]
 fn sample_group(pgid: u32, peak: &AtomicU64) {
+    // Read the leader by pid first: the full /proc walk reaches a short-lived
+    // child last, by which time it may be a zombie with no VmHWM line.
+    read_vmhwm(&pgid.to_string(), peak);
     let Ok(dir) = std::fs::read_dir("/proc") else {
         return;
     };
@@ -268,17 +271,24 @@ fn sample_group(pgid: u32, peak: &AtomicU64) {
         {
             continue;
         }
-        let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
-            continue;
-        };
-        let hwm = status
-            .lines()
-            .find_map(|l| l.strip_prefix("VmHWM:"))
-            .and_then(|v| v.split_whitespace().next())
-            .and_then(|v| v.parse::<u64>().ok());
-        if let Some(k) = hwm {
-            peak.fetch_max(k, Ordering::Relaxed);
-        }
+        read_vmhwm(pid, peak);
+    }
+}
+
+/// Raise `peak` to `/proc/<pid>/status` `VmHWM` (KiB); a gone or zombie pid
+/// has no such line and is skipped.
+#[cfg(target_os = "linux")]
+fn read_vmhwm(pid: &str, peak: &AtomicU64) {
+    let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+        return;
+    };
+    let hwm = status
+        .lines()
+        .find_map(|l| l.strip_prefix("VmHWM:"))
+        .and_then(|v| v.split_whitespace().next())
+        .and_then(|v| v.parse::<u64>().ok());
+    if let Some(k) = hwm {
+        peak.fetch_max(k, Ordering::Relaxed);
     }
 }
 
@@ -317,14 +327,15 @@ mod tests {
     fn run_logged_records_start_and_exit_with_argv_root_and_id() {
         let tmp = tempfile::tempdir().unwrap();
         let mut cmd = Command::new("git");
-        cmd.arg("--version").env("SECRET_TOKEN", "hunter2");
+        cmd.args(["-c", "alias.nap=!sleep 0.3", "nap"])
+            .env("SECRET_TOKEN", "hunter2");
         let out = run_logged("test", tmp.path(), cmd, Duration::from_secs(20)).unwrap();
         assert!(matches!(out, Completion::Exited(o) if o.status.success()));
         let root = tmp.path().display().to_string();
         let mine: Vec<_> = snapshot().into_iter().filter(|r| r.root == root).collect();
         assert_eq!(mine.len(), 1);
         let r = &mine[0];
-        assert_eq!(r.argv, ["git", "--version"]);
+        assert_eq!(r.argv, ["git", "-c", "alias.nap=!sleep 0.3", "nap"]);
         assert!(r.id > 0);
         assert!(!format!("{r:?}").contains("hunter2"));
         let exit = r.exit.as_ref().expect("exit record");
