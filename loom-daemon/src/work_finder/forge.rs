@@ -87,42 +87,30 @@ impl WorkSource for GhWorkSource {
     fn list_ready_issues(&mut self) -> Result<Vec<WorkItem>> {
         // Curator intake reconcile (#10041): cadence-gated, fail-soft, REST-only;
         // gives every unlabeled issue `loom:triage` so Curator has one queue.
+        // A label-transition write, so it runs on every tick, outside the gate.
         if let Some(root) = self.cwd.as_deref() {
             crate::intake_reconcile::maybe_run(&self.gh_bin, root);
             // The `loom:blocked` release pass (#10556) has its own task since
             // #10763: `crate::stale_blocked::release_task`.
         }
-        // ETag-cached REST listing (#4428), replacing the per-tick GraphQL
-        // `gh issue list`. Every page of it (#11139): a repo with more than
-        // 100 ready issues no longer starves its oldest ones. Page 1 failing
-        // fails the listing; any later shortfall keeps the rows read and
-        // marks this repo's queue incomplete.
-        self.complete = true;
-        let mut items = self.list_label("loom:issue", true)?;
-        // No priority side listing (#11508, operator ruling): priority changes
-        // order, never eligibility, so a `loom:important` /
-        // `loom:very-important` issue is dispatched only once it is
-        // `loom:issue`, like everything else. No starred-at or star
-        // inheritance is resolved here either.
-        // #10118: marker-bearing fixes still in triage / curated. The lane drops
-        // them again unless this repo's `main` is red (`main_red_fix::evaluate`).
-        // Only a trusted filer's marker counts (#9548); the policy is resolved
-        // at most once per tick, and only if a marker-bearing row needs it.
-        let mut policy: Option<crate::comment_trust::TrustPolicy> = None;
-        let root = self.cwd.clone().unwrap_or_else(|| PathBuf::from("."));
-        // First page only (#11139): these listings are large (this repo has
-        // ~300 `loom:triage`) and churn on every filing, so walking them would
-        // cost several requests a tick for rows the lane drops unless `main`
-        // is red; a fresh fix filing sorts first (newest first).
-        for label in super::main_red_fix::UNPROMOTED_LABELS {
-            let rows = self.list_side_label(label, false);
-            items = super::main_red_fix::merge_red_fix_candidates(items, rows, |author| {
-                policy
-                    .get_or_insert_with(|| crate::comment_trust::TrustPolicy::for_root(&root))
-                    .trusts(author)
+        // Event-gated polling (#9255, opt-in `forgeEvents.pollGating`, default
+        // off): while the feed is `healthy`, a repo with no event since its
+        // last poll returns its held *candidate* listing. Off, this is a bare
+        // call. The claim itself (`dispatch`) re-reads the forge and is never
+        // gated.
+        let repo = self.repo.clone();
+        let cwd = self.cwd.clone();
+        let listed =
+            crate::forge_events::poll_gate::gated_list(cwd.as_deref(), repo.as_deref(), || {
+                self.list_ready_issues_uncached()
             });
+        // #11139: a fresh listing that fell short is never held, so a gated
+        // tick cannot serve partial rows as the whole queue. (A held listing
+        // leaves `complete` at its per-tick default, `true`.)
+        if !self.complete {
+            crate::forge_events::poll_gate::forget_held(cwd.as_deref());
         }
-        Ok(items)
+        listed
     }
 
     fn listing_complete(&self) -> bool {
@@ -172,6 +160,42 @@ impl WorkSource for GhWorkSource {
                 None
             }
         }
+    }
+}
+
+impl GhWorkSource {
+    fn list_ready_issues_uncached(&mut self) -> Result<Vec<WorkItem>> {
+        // ETag-cached REST listing (#4428), replacing the per-tick GraphQL
+        // `gh issue list`. Every page of it (#11139): a repo with more than
+        // 100 ready issues no longer starves its oldest ones. Page 1 failing
+        // fails the listing; any later shortfall keeps the rows read and
+        // marks this repo's queue incomplete.
+        self.complete = true;
+        let mut items = self.list_label("loom:issue", true)?;
+        // No priority side listing (#11508, operator ruling): priority changes
+        // order, never eligibility, so a `loom:important` /
+        // `loom:very-important` issue is dispatched only once it is
+        // `loom:issue`, like everything else. No starred-at or star
+        // inheritance is resolved here either.
+        // #10118: marker-bearing fixes still in triage / curated. The lane drops
+        // them again unless this repo's `main` is red (`main_red_fix::evaluate`).
+        // Only a trusted filer's marker counts (#9548); the policy is resolved
+        // at most once per tick, and only if a marker-bearing row needs it.
+        let mut policy: Option<crate::comment_trust::TrustPolicy> = None;
+        let root = self.cwd.clone().unwrap_or_else(|| PathBuf::from("."));
+        // First page only (#11139): these listings are large (this repo has
+        // ~300 `loom:triage`) and churn on every filing, so walking them would
+        // cost several requests a tick for rows the lane drops unless `main`
+        // is red; a fresh fix filing sorts first (newest first).
+        for label in super::main_red_fix::UNPROMOTED_LABELS {
+            let rows = self.list_side_label(label, false);
+            items = super::main_red_fix::merge_red_fix_candidates(items, rows, |author| {
+                policy
+                    .get_or_insert_with(|| crate::comment_trust::TrustPolicy::for_root(&root))
+                    .trusts(author)
+            });
+        }
+        Ok(items)
     }
 }
 
