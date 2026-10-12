@@ -149,49 +149,6 @@ pub struct WorkFinderTickSummary {
     /// pre-#10214 payload and before the first tick.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cap: Option<CapView>,
-    /// How the starred-at cache answered since this process started: the
-    /// in-process cache, the restart store, a loom-ui intent, or a timeline
-    /// read (known / none / failed). `None` for a payload that predates it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub starred_at_cache: Option<StarredAtCacheTally>,
-}
-
-/// Outcome tally of the work finder's starred-at lookups, cumulative since
-/// the daemon started. The `read_*` rows are the forge timeline reads that
-/// remain; `read_none` vs `read_known` is the split that says whether
-/// unknown starred-ats (retried every 10 minutes) dominate them.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct StarredAtCacheTally {
-    /// A starred issue the in-process cache already answered.
-    pub mem_hit: u64,
-    /// An in-process miss answered by the restart store.
-    pub disk_hit: u64,
-    /// An in-process miss answered by a loom-ui intent's `requested_at`.
-    pub intent_hit: u64,
-    /// A timeline read that found the starred-at.
-    pub read_known: u64,
-    /// A timeline read that found no star event (unknown; retried later).
-    pub read_none: u64,
-    /// A timeline read that failed (unknown; retried later).
-    pub read_err: u64,
-}
-
-impl StarredAtCacheTally {
-    /// Add `other`'s counts to these.
-    pub fn add(&mut self, other: &Self) {
-        self.mem_hit += other.mem_hit;
-        self.disk_hit += other.disk_hit;
-        self.intent_hit += other.intent_hit;
-        self.read_known += other.read_known;
-        self.read_none += other.read_none;
-        self.read_err += other.read_err;
-    }
-
-    /// How many lookups went to the forge.
-    #[must_use]
-    pub fn reads(&self) -> u64 {
-        self.read_known + self.read_none + self.read_err
-    }
 }
 
 /// What holds a tick's effective concurrency cap where it is (Issue #10214).
@@ -289,8 +246,7 @@ impl CapView {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapacityWait {
     /// The work finder's gate: `capacity`, `ramp`, `saturation`,
-    /// `build-backoff`, `repo-cap`, `repo-slice`, `host-affinity` or
-    /// `host-class`.
+    /// `build-backoff`, `repo-cap`, `repo-slice` or `host-affinity`.
     pub gate: String,
     /// For the `capacity` gate: which cap term binds, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -311,11 +267,11 @@ pub struct CapacityWait {
 
 impl CapacityWait {
     /// Whether this is a queue wait (a capacity-style gate that frees up as
-    /// work ahead completes), as opposed to a host refusal (`host-affinity`,
-    /// `host-class`), which no amount of waiting on this host resolves.
+    /// work ahead completes), as opposed to a host refusal (`host-affinity`),
+    /// which no amount of waiting on this host resolves.
     #[must_use]
     pub fn queued(&self) -> bool {
-        !matches!(self.gate.as_str(), "host-affinity" | "host-class")
+        self.gate != "host-affinity"
     }
 
     /// The short phrase naming what limits it, e.g. `disk-limited`.
@@ -332,7 +288,6 @@ impl CapacityWait {
             ("repo-cap", _) => "per-repo cap",
             ("repo-slice", _) => "outside this host's repo slice",
             ("host-affinity", _) => "host affinity names another host",
-            ("host-class", _) => "heavy sweep refused on this host class",
             _ => "deferred",
         }
     }

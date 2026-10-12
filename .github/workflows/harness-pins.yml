@@ -207,5 +207,5 @@ jobs:
             # Also the recovery path: a branch pushed by an earlier run whose
             # PR creation failed, or whose PR was closed unmerged, gets one.
             gh pr create --base main --head "$branch" --title "$title" --body "$body" \
-              --label dependencies --label loom:review-requested
+              --label loom:review-requested
           fi

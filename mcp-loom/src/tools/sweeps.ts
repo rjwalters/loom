@@ -20,12 +20,16 @@
  */
 
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
+import { buildDispatchSweepPayload, type DispatchSweepArgs } from "./sweep-dispatch-payload.js";
 import {
   resolveDaemonIpcTimeoutMs,
   sendDaemonRequest,
   sendDaemonStreamRequest,
 } from "../shared/daemon.js";
-import { DISPATCH_OPTION_PROPERTIES, dispatchOptionBodyFields, extractDispatchOptions, type DispatchOptions } from "./sweep-dispatch-options.js";
+import {
+  DISPATCH_OPTION_PROPERTIES,
+  extractDispatchOptions,
+} from "./sweep-dispatch-options.js";
 
 // ============================================================================
 // Per-call IPC timeouts (issue #3945)
@@ -497,48 +501,14 @@ export function parseDuration(input: string): number | null {
 // Tool implementations
 // ============================================================================
 
-async function dispatchSweep(args: {
-  kind: SweepKind;
-  idempotency_key?: string;
-  model?: string;
-  effort?: string;
-  depends_on?: number;
-  workspace_root?: string;
-} & DispatchOptions): Promise<
+async function dispatchSweep(args: DispatchSweepArgs): Promise<
   | { success: true; result: DispatchResponse["payload"] }
   | { success: false; error: string; runtime_rejection?: RuntimeRejection }
 > {
   try {
     const response = (await sendDaemonRequest({
       type: "DispatchSweep",
-      payload: {
-        kind: args.kind,
-        idempotency_key: args.idempotency_key ?? null,
-        // Issue #3477 (Phase 1): optional model override. `null` (the
-        // default) means the daemon emits NO --model flag and the spawned
-        // child inherits the session/CLI default.
-        model: args.model ?? null,
-        // Issue #3716: optional reasoning-effort override, mirroring `model`.
-        // `null` (the default) means the daemon emits NO --effort flag and
-        // the spawned child inherits the session-default effort.
-        effort: args.effort ?? null,
-        // Issue #3729 (stacked-PR v1): optional single parent issue. `null`
-        // (the default) means the daemon emits NO --depends-on flag and the
-        // child branches off the default branch as usual. When set, the child
-        // branches its worktree/PR off `feature/issue-<depends_on>`.
-        depends_on: args.depends_on ?? null,
-        // Issue #3929: optional target managed-workspace root. `null` (the
-        // default) dispatches into the daemon's default workspace, exactly as
-        // before; a value routes the sweep into that managed repo's registry.
-        workspace_root: args.workspace_root ?? null,
-        // Issue #4317: operator override for the host-distress circuit
-        // breaker (#4235/#4316). Unlike the other optional params above, the
-        // Rust-side field is a bare `bool` (not `Option<bool>`) — sending
-        // `null` here would fail serde deserialization on every dispatch, so
-        // this MUST default to `false`, never `null`/omitted.
-        // `force` (#4317) and runtime/model_profile (#11284); see sweep-dispatch-options.ts.
-        ...dispatchOptionBodyFields(args),
-      },
+      payload: buildDispatchSweepPayload(args),
     }, Math.max(DISPATCH_TIMEOUT_MS, resolveDaemonIpcTimeoutMs()))) as DaemonResponse;
 
     if (response.type === "SweepDispatched") {

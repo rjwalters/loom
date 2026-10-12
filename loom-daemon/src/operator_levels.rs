@@ -236,7 +236,10 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name} missing from labels.json"));
             assert_eq!(label.kind, "priority", "{name}");
             assert!(!label.hold && !label.park && !label.skip, "{name} is not a hold");
-            assert!(!name.contains("urgent"), "{name}: avoid the retired loom:urgent's word");
+            assert!(
+                !name.contains("urgent"),
+                "{name}: avoid the retired urgent label's word (#9244)"
+            );
         }
     }
 

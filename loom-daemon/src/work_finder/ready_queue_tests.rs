@@ -97,16 +97,17 @@ fn order(rows: &[ReadyQueueRow]) -> Vec<(u32, QueueDisposition)> {
     rows.iter().map(|r| (r.issue, r.disposition)).collect()
 }
 
-/// The queue follows the daemon's own comparator (#9244): starred first, then
-/// workspace priority, then oldest first. A `tier:*` label is carried but does
-/// not move the issue.
+/// The queue follows the daemon's own comparator (#11508): level first, then
+/// oldest first, then number. Neither a `tier:*` label nor the legacy star
+/// moves the issue, and workspace priority is not a rank key.
 #[test]
 fn queue_is_ranked_by_dispatch_order_not_tier() {
     let mut multi = vec![
         (
             OneShotSource(Some(vec![
                 item(5, &["loom:issue", "tier:goal-advancing"], "2026-09-03T00:00:00Z"),
-                item(6, &["loom:issue", "loom:operator-priority"], "2026-09-04T00:00:00Z"),
+                item(6, &["loom:issue", "loom:important"], "2026-09-04T00:00:00Z"),
+                item(8, &["loom:issue", "loom:operator-priority"], "2026-09-05T00:00:00Z"),
                 item(7, &["loom:issue"], "2026-09-01T00:00:00Z"),
             ])),
             Disp::default(),
@@ -125,17 +126,18 @@ fn queue_is_ranked_by_dispatch_order_not_tier() {
         order(&q),
         vec![
             (6, QueueDisposition::Dispatched),
-            (1, QueueDisposition::Dispatched),
             (7, QueueDisposition::DeferredCapacity),
             (5, QueueDisposition::DeferredCapacity),
+            (8, QueueDisposition::DeferredCapacity),
+            (1, QueueDisposition::Dispatched),
         ]
     );
-    assert_eq!(q[1].repo, "/repo/b");
+    assert_eq!(q[4].repo, "/repo/b");
     assert_eq!(q[0].rank, 1);
-    assert_eq!(q[3].tier.as_deref(), Some("tier:goal-advancing"));
+    assert_eq!(q[2].tier.as_deref(), Some("tier:goal-advancing"));
     assert!(
-        q[0].operator_priority && !q[0].urgent,
-        "starred is reported, urgent is always false"
+        !q[3].operator_priority && !q[0].urgent,
+        "the star is no longer reported (#11508), urgent is always false"
     );
 }
 
@@ -359,40 +361,21 @@ fn oldest_first(a: Option<&String>, b: Option<&String>) -> std::cmp::Ordering {
     }
 }
 
-/// The documented #3946/#9244/#10307 lane order, written out independently of
-/// `candidate_keys`: highest operator level first; starred first; among
-/// starred, starred-at (else `createdAt`) oldest first; red-main fixes
-/// first. The first four `candidate_keys` must match this exactly.
-fn reference_lane_cmp(a: &PriorityCandidate, b: &PriorityCandidate) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    let starred_at =
-        |c: &PriorityCandidate| c.operator_priority_at.clone().or(c.created_at.clone());
-    let lane = b
-        .operator_level
-        .cmp(&a.operator_level)
-        .then(b.operator_priority.cmp(&a.operator_priority))
-        .then(if a.operator_priority && b.operator_priority {
-            oldest_first(starred_at(a).as_ref(), starred_at(b).as_ref())
-        } else {
-            Ordering::Equal
-        });
-    lane.then(b.main_red_fix.cmp(&a.main_red_fix))
-}
-
-/// The documented #3946/#9244 order, written out independently of
-/// `candidate_keys`: [`reference_lane_cmp`]; workspace priority asc;
-/// `createdAt` oldest first; number asc. A change to dispatch order must
-/// update both this and `candidate_keys` — which is the point.
+/// The documented #11103/#11508 order, written out independently of
+/// `candidate_keys`: level highest first; `createdAt` oldest first; number
+/// asc. A change to dispatch order must update both this and
+/// `candidate_keys` — which is the point.
 fn reference_cmp(a: &PriorityCandidate, b: &PriorityCandidate) -> std::cmp::Ordering {
-    reference_lane_cmp(a, b)
-        .then(a.workspace_priority.cmp(&b.workspace_priority))
+    b.level
+        .cmp(&a.level)
         .then(oldest_first(a.created_at.as_ref(), b.created_at.as_ref()))
         .then(a.number.cmp(&b.number))
 }
 
 /// Every candidate over a small domain that exercises every key's tie and
-/// both directions of every key, including the starred-at fallback.
+/// both directions of every key, plus a workspace priority the keys ignore.
 fn candidate_domain() -> Vec<PriorityCandidate> {
+    use crate::priority_pick::Level;
     let times = [
         None,
         Some("2026-01-01T00:00:00Z"),
@@ -400,24 +383,16 @@ fn candidate_domain() -> Vec<PriorityCandidate> {
     ];
     let mut out = Vec::new();
     for workspace_priority in [0, 100] {
-        for operator_level in [0u8, 1, 2] {
-            let operator_priority = operator_level >= 1;
-            for starred_at in times {
-                for main_red_fix in [false, true] {
-                    for created_at in times {
-                        for number in [1, 2] {
-                            out.push(PriorityCandidate {
-                                workspace_priority,
-                                operator_level,
-                                operator_priority,
-                                operator_priority_at: starred_at.map(str::to_string),
-                                main_red_fix,
-                                created_at: created_at.map(str::to_string),
-                                number,
-                                ..PriorityCandidate::default()
-                            });
-                        }
-                    }
+        for level in [Level::Default, Level::Important, Level::VeryImportant] {
+            for created_at in times {
+                for number in [1, 2] {
+                    out.push(PriorityCandidate {
+                        workspace_priority,
+                        level,
+                        created_at: created_at.map(str::to_string),
+                        number,
+                        ..PriorityCandidate::default()
+                    });
                 }
             }
         }
@@ -441,25 +416,14 @@ fn candidate_keys_lexicographic_compare_is_candidate_cmp() {
 }
 
 /// The wire projection names the keys in comparator order, carries each
-/// row's own values, and distinguishes every pair the comparator does.
+/// row's own values, and distinguishes every pair the comparator does
+/// (workspace priority, not a key, never distinguishes two rows).
 #[test]
 fn candidate_keys_project_to_named_wire_keys() {
-    assert_eq!(
-        ready_queue::ordering_names(),
-        vec![
-            "operator_priority_level",
-            "operator_priority",
-            "operator_priority_at",
-            "main_red_fix",
-            "workspace_priority",
-            "created_at",
-            "number"
-        ]
-    );
+    assert_eq!(ready_queue::ordering_names(), vec!["level", "created_at", "number"]);
     let c = PriorityCandidate {
         workspace_priority: 7,
-        operator_level: 2,
-        operator_priority: true,
+        level: crate::priority_pick::Level::VeryImportant,
         created_at: Some("2026-01-01T00:00:00Z".into()),
         number: 42,
         ..PriorityCandidate::default()
@@ -468,15 +432,10 @@ fn candidate_keys_project_to_named_wire_keys() {
         .into_iter()
         .map(|k| k.value)
         .collect();
-    // A starred candidate with no starred-at orders by its createdAt.
     assert_eq!(
         values,
         vec![
             serde_json::json!(2),
-            serde_json::json!(true),
-            serde_json::json!("2026-01-01T00:00:00Z"),
-            serde_json::json!(false),
-            serde_json::json!(7),
             serde_json::json!("2026-01-01T00:00:00Z"),
             serde_json::json!(42),
         ]

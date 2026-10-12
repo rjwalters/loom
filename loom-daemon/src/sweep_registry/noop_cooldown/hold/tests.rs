@@ -406,6 +406,54 @@ fn already_parked_or_closed_issues_keep_no_streak() {
     assert_eq!(reg.noop_streak_count(ISSUE), 0);
 }
 
+/// Issue #11438: the under-60-s form of the same loop — a checkpoint-less
+/// clean exit that reached no phase at all and never self-reported — feeds
+/// the hold from the reaper's own observations, once per dispatch.
+#[test]
+#[serial]
+fn clean_phaseless_reaper_outcomes_feed_the_hold() {
+    let (mut reg, forge, _dir) = forge_registry(3);
+    // A non-clean exit is the crash path, not this mechanism's shape.
+    reg.note_clean_phaseless_exit_outcome(ISSUE, "sweep-1", Some(OpenPrProbe::NoneOpen), Some(1));
+    // An unverified PR probe never counts (the #4452 fail-open contract).
+    reg.note_clean_phaseless_exit_outcome(ISSUE, "sweep-1", None, Some(0));
+    reg.note_clean_phaseless_exit_outcome(
+        ISSUE,
+        "sweep-1",
+        Some(OpenPrProbe::ProbeFailed),
+        Some(0),
+    );
+    assert_eq!(reg.noop_streak_count(ISSUE), 0);
+    // The verified shape counts once per dispatch.
+    reg.note_clean_phaseless_exit_outcome(ISSUE, "sweep-1", Some(OpenPrProbe::NoneOpen), Some(0));
+    reg.note_clean_phaseless_exit_outcome(ISSUE, "sweep-1", Some(OpenPrProbe::NoneOpen), Some(0));
+    assert_eq!(reg.noop_streak_count(ISSUE), 1, "one dispatch counts once");
+    reg.note_clean_phaseless_exit_outcome(ISSUE, "sweep-2", Some(OpenPrProbe::NoneOpen), Some(0));
+    assert!(reg.noop_loop_kind(ISSUE, "sweep-3").is_some(), "the next outcome is a loop");
+    reg.note_clean_phaseless_exit_outcome(ISSUE, "sweep-3", Some(OpenPrProbe::NoneOpen), Some(0));
+    assert!(reg.noop_hold_applied(ISSUE));
+    assert!(edit_args(&forge).contains("loom:operator-only"));
+}
+
+/// A sweep that DID self-report was already counted at IPC time
+/// (`record_noop_release` → `note_noop_for_hold`); the reaper's feed must not
+/// count the same dispatch a second time (#11438).
+#[test]
+#[serial]
+fn a_self_reported_clean_noop_is_not_counted_twice() {
+    let (mut reg, _forge, _dir) = forge_registry(3);
+    let sweep_id =
+        crate::sweep_registry::test_support::insert_clean_exit_running(&mut reg, ISSUE, 0);
+    reg.record_noop_release(ISSUE, None);
+    assert_eq!(reg.noop_streak_count(ISSUE), 1);
+    reg.note_clean_phaseless_exit_outcome(ISSUE, &sweep_id, Some(OpenPrProbe::NoneOpen), Some(0));
+    assert_eq!(
+        reg.noop_streak_count(ISSUE),
+        1,
+        "the reaper's feed must not double-count a self-reported dispatch"
+    );
+}
+
 /// A sweep that never calls `noop-cooldown record` is still counted from the
 /// reaper's Curator-only classification, once per dispatch.
 #[test]

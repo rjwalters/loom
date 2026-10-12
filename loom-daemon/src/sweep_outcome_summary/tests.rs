@@ -53,6 +53,7 @@ fn record(
         attempt_index: None,
         previous_sweep_id: None,
         trigger: None,
+        dispatch_origin: None,
         rework_events: None,
         pr_numbers: None,
         hw_lines_added: None,

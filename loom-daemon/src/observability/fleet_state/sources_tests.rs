@@ -346,4 +346,6 @@ fn an_anchor_taken_mid_sweep_carries_its_start_facts_on_the_running_row() {
     assert_eq!(row["attempt_index"], 1);
     assert_eq!(row["trigger"], "first");
     assert!(row.get("previous_sweep_id").is_none());
+    // #11444: the test-only `dispatch` names no origin.
+    assert_eq!(row["dispatch_origin"], "unknown");
 }

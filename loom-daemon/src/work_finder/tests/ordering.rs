@@ -1,5 +1,6 @@
-//! Dispatch ordering: cross-repo priority (#3946) and the #9244 keys
-//! (`loom:operator-priority` first, starred-at, red-main fix). Moved out of
+//! Dispatch ordering: cross-repo workspace priority (#3946) and the
+//! priority level (#11103, re-keyed by #11508: level, oldest, number; the
+//! star, starred-at and red-main-fix keys are gone). Moved out of
 //! `work_finder/tests.rs`, which is size-frozen.
 
 use super::*;
@@ -14,20 +15,6 @@ fn labelled_at(n: u32, extra: &str, created_at: &str) -> WorkItem {
         vec!["loom:issue".into(), extra.into()],
         Some(created_at.to_string()),
     )
-}
-
-/// A dispatcher whose host already runs its overflow sweep, so a cap of 1
-/// admits exactly one starred issue and the test sees pure ordering.
-fn no_overflow() -> RecordingDispatcher {
-    RecordingDispatcher {
-        overflow_live: true,
-        ..RecordingDispatcher::default()
-    }
-}
-
-fn starred_at(n: u32, created_at: &str, starred: Option<&str>) -> WorkItem {
-    labelled_at(n, OPERATOR_PRIORITY_LABEL, created_at)
-        .with_operator_priority_at(starred.map(str::to_string))
 }
 
 #[test]
@@ -64,11 +51,15 @@ fn test_tick_multi_higher_priority_repo_dispatches_first_under_cap() {
 }
 
 #[test]
-fn starred_in_a_priority_100_repo_beats_unstarred_in_a_priority_0_repo() {
-    // #9244 key 1: starring outranks the workspace tier, fleet-wide.
+fn very_important_in_a_priority_100_repo_beats_a_priority_0_repo() {
+    // #11103: a workspace with very-important work wins the draw.
     let mut multi = vec![
         (
-            FakeSource::once(vec![starred_at(7, "2026-01-01T00:00:00Z", None)]),
+            FakeSource::once(vec![labelled_at(
+                7,
+                "loom:very-important",
+                "2026-01-01T00:00:00Z",
+            )]),
             RecordingDispatcher::default(),
         ),
         (
@@ -78,45 +69,26 @@ fn starred_in_a_priority_100_repo_beats_unstarred_in_a_priority_0_repo() {
     ];
     let report = tick_multi(&mut multi, &[100, 0], 1, &[false, false]);
     assert_eq!(report.dispatched, 1);
-    assert_eq!(multi[0].1.dispatched, vec![7], "the starred issue dispatches first");
+    assert_eq!(multi[0].1.dispatched, vec![7], "the very-important issue dispatches first");
     assert!(multi[1].1.dispatched.is_empty());
 }
 
 #[test]
-fn two_starred_issues_order_by_age_not_starred_at() {
-    // #11103 removed the starred-at key: two issues at the same level order
-    // oldest `createdAt` first. #1 is older but was starred LATER than #2.
-    // (A live overflow sweep keeps the second starred issue from going over
-    // the cap.)
+fn two_important_issues_order_by_age() {
+    // Two issues at the same level order oldest `createdAt` first; a legacy
+    // star on the newest changes nothing (#11508).
     let mut multi = vec![(
         FakeSource::once(vec![
-            starred_at(2, "2026-01-01T00:00:00Z", Some("2026-09-01T00:00:00Z")),
-            starred_at(1, "2020-01-01T00:00:00Z", Some("2026-09-02T00:00:00Z")),
-            starred_at(3, "2019-08-01T00:00:00Z", None),
-        ]),
-        no_overflow(),
-    )];
-    let report = tick_multi(&mut multi, &[100], 1, &[false]);
-    assert_eq!(report.dispatched, 1);
-    assert_eq!(multi[0].1.dispatched, vec![3], "the oldest lands first");
-}
-
-#[test]
-fn loom_urgent_no_longer_changes_order() {
-    // #9244: `loom:urgent` is tolerated but is not a key. The older
-    // non-urgent issue dispatches first; the urgent one is not an error.
-    let mut multi = vec![(
-        FakeSource::once(vec![
-            labelled_at(9, URGENT_LABEL, "2026-01-01T00:00:00Z"),
-            issue_at(1, "2023-01-01T00:00:00Z"),
+            labelled_at(2, "loom:important", "2026-01-01T00:00:00Z"),
+            labelled_at(1, "loom:important", "2020-01-01T00:00:00Z"),
+            labelled_at(3, "loom:important", "2019-08-01T00:00:00Z"),
+            labelled_at(4, OPERATOR_PRIORITY_LABEL, "2010-01-01T00:00:00Z"),
         ]),
         RecordingDispatcher::default(),
     )];
     let report = tick_multi(&mut multi, &[100], 1, &[false]);
-    assert_eq!((report.dispatched, report.errors), (1, 0));
-    assert_eq!(multi[0].1.dispatched, vec![1], "age, not urgency, decides");
-    // The label is still parsed harmlessly.
-    assert!(labelled_at(9, URGENT_LABEL, "2026-01-01T00:00:00Z").is_urgent());
+    assert_eq!(report.dispatched, 1);
+    assert_eq!(multi[0].1.dispatched, vec![3], "the oldest lands first");
 }
 
 #[test]
@@ -150,82 +122,77 @@ fn test_tick_multi_missing_priority_entry_defaults() {
 }
 
 #[test]
-fn single_workspace_tick_moves_starred_first_then_oldest_first() {
-    // #11103: the single-workspace tick uses the in-workspace order — level
-    // (the star bridges to `important`), oldest `createdAt`, number — not the
-    // listing order (newest-first here).
+fn single_workspace_tick_moves_important_first_then_oldest_first() {
+    // #11103: the single-workspace tick uses the in-workspace order — level,
+    // oldest `createdAt`, number — not the listing order (newest-first
+    // here). The legacy star (#8) is a plain issue since #11508.
     let mut source = FakeSource::once(vec![
         issue_at(3, "2026-03-01T00:00:00Z"),
         issue_at(1, "2026-01-01T00:00:00Z"),
-        starred_at(9, "2026-09-01T00:00:00Z", None),
+        labelled_at(9, "loom:important", "2026-09-01T00:00:00Z"),
+        labelled_at(8, OPERATOR_PRIORITY_LABEL, "2026-08-01T00:00:00Z"),
         issue_at(2, "2026-02-01T00:00:00Z"),
     ]);
     let mut dispatcher = RecordingDispatcher::default();
     let report = tick(&mut source, &mut dispatcher, 10, false).unwrap();
-    assert_eq!(report.dispatched, 4);
-    assert_eq!(dispatcher.dispatched, vec![9, 1, 2, 3]);
+    assert_eq!(report.dispatched, 5);
+    assert_eq!(dispatcher.dispatched, vec![9, 1, 2, 3, 8]);
 
-    // Nothing starred and no `createdAt`: issue number ascending.
+    // No level and no `createdAt`: issue number ascending.
     let mut source = FakeSource::once(vec![issue(5), issue(4), issue(6)]);
     let mut dispatcher = RecordingDispatcher::default();
     tick(&mut source, &mut dispatcher, 10, false).unwrap();
     assert_eq!(dispatcher.dispatched, vec![4, 5, 6]);
 }
 
+/// AC (#11508): `candidate_cmp`'s keys are exactly level -> created_at ->
+/// number, over a fixed fixture. Workspace priority is not a key.
 #[test]
 fn test_candidate_cmp_ordering() {
+    use crate::priority_pick::Level;
     use std::cmp::Ordering;
-    let mk = |prio, created: Option<&str>, num| PriorityCandidate {
-        workspace_priority: prio,
+    let mk = |level, created: Option<&str>, num| PriorityCandidate {
+        level,
         created_at: created.map(str::to_string),
         number: num,
         ..PriorityCandidate::default()
     };
-    let star = |c: PriorityCandidate, at: Option<&str>| PriorityCandidate {
-        operator_priority: true,
-        operator_priority_at: at.map(str::to_string),
-        ..c
-    };
-    let fix = |c: PriorityCandidate| PriorityCandidate {
-        main_red_fix: true,
-        ..c
-    };
 
-    // 1. Starred beats everything: a starred prio-100 newer issue outranks an
-    //    unstarred prio-0 older red-main fix.
-    let starred = star(mk(100, Some("2026-01-01T00:00:00Z"), 99), None);
-    let other = fix(mk(0, Some("2000-01-01T00:00:00Z"), 1));
-    assert_eq!(candidate_cmp(&starred, &other), Ordering::Less);
+    // 1. Level beats age and number: a newer very-important outranks an
+    //    older important, which outranks an older default.
+    let vi = mk(Level::VeryImportant, Some("2026-01-01T00:00:00Z"), 99);
+    let imp = mk(Level::Important, Some("2020-01-01T00:00:00Z"), 5);
+    let plain = mk(Level::Default, Some("2000-01-01T00:00:00Z"), 1);
+    assert_eq!(candidate_cmp(&vi, &imp), Ordering::Less);
+    assert_eq!(candidate_cmp(&imp, &plain), Ordering::Less);
 
-    // 2. Among starred: starred-at ascending, with createdAt as fallback.
-    let early = star(mk(100, Some("2020-01-01T00:00:00Z"), 5), Some("2026-09-01T00:00:00Z"));
-    let late = star(mk(0, Some("2000-01-01T00:00:00Z"), 6), Some("2026-09-02T00:00:00Z"));
-    assert_eq!(candidate_cmp(&early, &late), Ordering::Less);
-    let fallback = star(mk(100, Some("2026-08-01T00:00:00Z"), 7), None);
-    assert_eq!(candidate_cmp(&fallback, &early), Ordering::Less);
-
-    // 3. A red-main fix beats a better workspace tier.
-    let fix100 = fix(mk(100, Some("2026-01-01T00:00:00Z"), 8));
-    let plain0 = mk(0, Some("2000-01-01T00:00:00Z"), 1);
-    assert_eq!(candidate_cmp(&fix100, &plain0), Ordering::Less);
-
-    // 4. Workspace priority dominates age.
-    let high = mk(0, Some("2025-01-01T00:00:00Z"), 999);
-    let low = mk(100, Some("2000-01-01T00:00:00Z"), 1);
-    assert_eq!(candidate_cmp(&high, &low), Ordering::Less);
-
-    // 5. Same tier: oldest-first, and a dated issue before an undated one.
-    let old = mk(100, Some("2020-01-01T00:00:00Z"), 80);
-    let new = mk(100, Some("2024-01-01T00:00:00Z"), 2);
+    // 2. Same level: oldest-first, and a dated issue before an undated one.
+    let old = mk(Level::Default, Some("2020-01-01T00:00:00Z"), 80);
+    let new = mk(Level::Default, Some("2024-01-01T00:00:00Z"), 2);
     assert_eq!(candidate_cmp(&old, &new), Ordering::Less);
-    assert_eq!(candidate_cmp(&new, &mk(100, None, 1)), Ordering::Less);
+    assert_eq!(candidate_cmp(&new, &mk(Level::Default, None, 1)), Ordering::Less);
 
-    // 6. Fully-tied keys fall through to the number tiebreak.
-    assert_eq!(candidate_cmp(&mk(100, None, 3), &mk(100, None, 8)), Ordering::Less);
-}
+    // 3. Fully-tied keys fall through to the number tiebreak.
+    assert_eq!(
+        candidate_cmp(&mk(Level::Default, None, 3), &mk(Level::Default, None, 8)),
+        Ordering::Less
+    );
 
-#[test]
-fn test_work_item_is_urgent_still_parses() {
-    assert!(!issue(1).is_urgent());
-    assert!(WorkItem::new(1, vec!["loom:issue".into(), "loom:urgent".into()]).is_urgent());
+    // 4. Workspace priority is not a key: two candidates differing only in it
+    //    compare equal.
+    let a = PriorityCandidate {
+        workspace_priority: 0,
+        ..mk(Level::Important, None, 4)
+    };
+    let b = PriorityCandidate {
+        workspace_priority: 100,
+        ..mk(Level::Important, None, 4)
+    };
+    assert_eq!(candidate_cmp(&a, &b), Ordering::Equal);
+
+    // 5. The fixture, shuffled, sorts to exactly this order.
+    let mut fixture = [plain, new, imp, mk(Level::Default, None, 1), vi, old];
+    fixture.sort_by(candidate_cmp);
+    let numbers: Vec<u32> = fixture.iter().map(|c| c.number).collect();
+    assert_eq!(numbers, vec![99, 5, 1, 80, 2, 1]);
 }

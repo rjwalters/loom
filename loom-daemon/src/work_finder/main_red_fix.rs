@@ -1,14 +1,16 @@
 //! The red-main-fix lane (#9244 §6).
 //!
 //! An issue whose body carries `<!-- loom:main-red-fix -->` claims to fix a
-//! red `main`. Two things follow, and **only while that repo's `main` is
-//! verified red**:
+//! red `main`. **Only while that repo's `main` is verified red**, a repo the
+//! main-health gate has halted still admits it — and nothing else. Every
+//! other ready issue in that repo, whatever its priority, keeps the
+//! `WorkspaceHalted` disposition.
 //!
-//! - it sorts ahead of every unstarred candidate (key 3 of
-//!   [`super::ordering::candidate_cmp`]);
-//! - a repo the main-health gate has halted still admits it — and nothing
-//!   else. Every other ready issue in that repo, starred or not, keeps the
-//!   `WorkspaceHalted` disposition.
+//! It no longer sorts ahead (#11508 removed the red-main ordering key), but
+//! it is not a priority either: it keeps its bypass of the build back-off,
+//! the file-overlap gate and the repo-sharding slice
+//! ([`super::ordering::PriorityCandidate::main_red_fix`]), which a red `main`
+//! would otherwise deadlock.
 //!
 //! "Verified red" is [`WorkspaceHealthStates::is_halted`], never the
 //! work finder's per-root `halted` hold, which is also set while a gate run is
@@ -19,7 +21,7 @@
 //! stands in for it — one cached forge read per repo per tick, made only when
 //! the repo has a marker-bearing candidate.
 //!
-//! A marker on a green repo is inert: no boost, no halt bypass.
+//! A marker on a green repo is inert: no halt or gate bypass.
 //!
 //! # Unpromoted fixes (#10118)
 //!
@@ -75,13 +77,11 @@ pub const RED_FIX_ESCALATE_AFTER: Duration = Duration::from_secs(30 * 60);
 
 impl WorkItem {
     /// A marker-bearing row that only the unpromoted listing contributed:
-    /// not `loom:issue` and not starred (a starred row is a candidate on its
-    /// own). Such a row is a candidate only while the repo is red (#10118).
+    /// not `loom:issue`. Such a row is a candidate only while the repo is red
+    /// (#10118); its priority label does not change that (#11508).
     #[must_use]
     pub fn is_unpromoted_red_fix(&self) -> bool {
-        self.is_main_red_fix()
-            && !self.labels.iter().any(|l| l == "loom:issue")
-            && !self.is_operator_priority()
+        self.is_main_red_fix() && !self.labels.iter().any(|l| l == "loom:issue")
     }
 
     /// Builder-style setter for [`Self::author`] (#10118).
@@ -107,7 +107,7 @@ impl WorkItem {
 /// Fold one unpromoted listing ([`UNPROMOTED_LABELS`]) into the candidate
 /// rows (#10118): keep only marker-bearing rows not already listed, and drop
 /// the rows [`super::operator_priority::excluded_from_side_listing`] drops
-/// from the starred listing (claimed, being curated, or Champion-path). Every
+/// (claimed, being curated, or Champion-path). Every
 /// kept row still goes through the normal skip filters.
 ///
 /// A row is kept only when `trusts` believes its [`WorkItem::author`] (#9548):

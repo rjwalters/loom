@@ -104,6 +104,10 @@ const KNOWN_PHASES: [&str; 5] = ["curator", "builder", "judge", "doctor", "merge
 /// retry hold).
 pub const NO_PHASE_SIGNAL_CLASS: &str = "unclassified:no-phase-signal";
 
+/// The synthesized class for a sub-minute, phase-less, NON-clean death
+/// (Issue #9441); a clean exit never earns it (Issue #11438).
+pub const SPAWN_DEATH_CLASS: &str = "unclassified:spawn-death";
+
 /// What a sweep actually did, independent of how its process ended (Issue
 /// #9441) — the axis [`SweepResult`] cannot express.
 ///
@@ -225,6 +229,11 @@ pub struct DispositionSignals<'a> {
     pub doctor_cycles: Option<u32>,
     /// The issue's end state; `None` when the forge read was skipped or failed.
     pub issue_end_state: Option<IssueEndState>,
+    /// The process exit code the reaper observed; `None` when no status was
+    /// observed (a signal death, or a reap with no retained child handle).
+    /// Only `Some(0)` is load-bearing: a clean exit is never a spawn death
+    /// (Issue #11438).
+    pub exit_code: Option<i32>,
 }
 
 impl DispositionSignals<'_> {
@@ -266,8 +275,16 @@ impl DispositionSignals<'_> {
 
     /// Whether this death never reached any observable phase and was too short
     /// to have done work — the spawn/pre-flight shape.
+    ///
+    /// A clean exit (code 0) is never a death (Issue #11438): a sweep that
+    /// decided in 30 s that the issue had no build work and exited 0 was being
+    /// recorded as `env_failure` + `unclassified:spawn-death`, which drove
+    /// `retry_after_env_failure` re-dispatch of a deliberate no-op. Only a
+    /// non-zero code or an unobserved status (signal death) qualifies.
     fn looks_like_spawn_death(&self) -> bool {
-        self.phase_durations.is_empty() && self.total_duration_sec < SPAWN_DEATH_MAX_DURATION_SEC
+        self.exit_code != Some(0)
+            && self.phase_durations.is_empty()
+            && self.total_duration_sec < SPAWN_DEATH_MAX_DURATION_SEC
     }
 
     /// The last observed phase, folded to the closed [`KNOWN_PHASES`]
@@ -289,14 +306,27 @@ impl DispositionSignals<'_> {
 /// `noop-loop:blocked`). Anything else — another disposition, another class,
 /// or no loop — passes through, so a first-time Curator-only stop stays
 /// `after-curator`.
+///
+/// Issue #11438 extends it to the under-60-s form of the same loop: a
+/// **clean** exit (`clean_exit`, code 0) synthesized as
+/// `unclassified:no-phase-signal` or `unclassified:spawn-death` is the same
+/// "no build work, released" conclusion seen before any phase was sampled.
+/// A non-clean exit with those classes is a real death and passes through.
 #[must_use]
 pub fn apply_noop_loop_class(
     disposition: SweepDisposition,
     class: Option<String>,
     loop_class: Option<&str>,
+    clean_exit: bool,
 ) -> Option<String> {
     match (disposition, class.as_deref(), loop_class) {
         (SweepDisposition::Unknown, Some("unclassified:after-curator"), Some(lc)) => {
+            Some(lc.to_string())
+        }
+        (SweepDisposition::Unknown, Some(NO_PHASE_SIGNAL_CLASS), Some(lc))
+        | (SweepDisposition::EnvFailure, Some(SPAWN_DEATH_CLASS), Some(lc))
+            if clean_exit =>
+        {
             Some(lc.to_string())
         }
         _ => class,
@@ -469,7 +499,7 @@ fn synthesized_failure_class(
     match disposition {
         SweepDisposition::EnvFailure => {
             if signals.looks_like_spawn_death() {
-                "unclassified:spawn-death".to_string()
+                SPAWN_DEATH_CLASS.to_string()
             } else {
                 "unclassified:env".to_string()
             }
@@ -533,6 +563,7 @@ mod tests {
             judge_verdicts: None,
             doctor_cycles: None,
             issue_end_state: None,
+            exit_code: None,
         }
     }
 
@@ -590,6 +621,7 @@ mod tests {
                                             judge_verdicts: Some(verdict_set),
                                             doctor_cycles: cycles,
                                             issue_end_state: end_state,
+                                            exit_code: None,
                                         };
                                         let (disposition, _) = classify_disposition(&signals);
                                         assert_eq!(
@@ -642,30 +674,33 @@ mod tests {
                             Some(IssueEndState::Rescoped),
                             Some(IssueEndState::StillOpen),
                         ] {
-                            let signals = DispositionSignals {
-                                result,
-                                pr_number: None,
-                                failure_class: class,
-                                phase_durations: phase_set,
-                                total_duration_sec: duration,
-                                judge_verdicts: None,
-                                doctor_cycles: None,
-                                issue_end_state: end_state,
-                            };
-                            let (disposition, resolved) = classify_disposition(&signals);
-                            if disposition.requires_failure_class() {
-                                required_seen += 1;
-                                let resolved = resolved
-                                    .as_deref()
-                                    .unwrap_or_else(|| panic!("missing class for {signals:?}"));
-                                assert!(!resolved.is_empty());
-                            }
-                            if let Some(original) = class {
-                                assert_eq!(
-                                    resolved.as_deref(),
-                                    Some(original),
-                                    "a real classifier label is never overwritten"
-                                );
+                            for exit_code in [None, Some(0), Some(1)] {
+                                let signals = DispositionSignals {
+                                    result,
+                                    pr_number: None,
+                                    failure_class: class,
+                                    phase_durations: phase_set,
+                                    total_duration_sec: duration,
+                                    judge_verdicts: None,
+                                    doctor_cycles: None,
+                                    issue_end_state: end_state,
+                                    exit_code,
+                                };
+                                let (disposition, resolved) = classify_disposition(&signals);
+                                if disposition.requires_failure_class() {
+                                    required_seen += 1;
+                                    let resolved = resolved
+                                        .as_deref()
+                                        .unwrap_or_else(|| panic!("missing class for {signals:?}"));
+                                    assert!(!resolved.is_empty());
+                                }
+                                if let Some(original) = class {
+                                    assert_eq!(
+                                        resolved.as_deref(),
+                                        Some(original),
+                                        "a real classifier label is never overwritten"
+                                    );
+                                }
                             }
                         }
                     }
@@ -915,15 +950,16 @@ mod tests {
         };
         let (disposition, class) = classify_disposition(&signals);
         assert_eq!(class.as_deref(), Some("unclassified:after-curator"));
-        let none = apply_noop_loop_class(disposition, class.clone(), None);
+        let none = apply_noop_loop_class(disposition, class.clone(), None, false);
         assert_eq!(none.as_deref(), Some("unclassified:after-curator"));
-        let looped = apply_noop_loop_class(disposition, class, Some("noop-loop:human-gate"));
+        let looped = apply_noop_loop_class(disposition, class, Some("noop-loop:human-gate"), false);
         assert_eq!(looped.as_deref(), Some("noop-loop:human-gate"));
         // A different class is never overwritten.
         let other = apply_noop_loop_class(
             SweepDisposition::Unknown,
             Some("unclassified:after-builder".into()),
             Some("noop-loop:blocked"),
+            true,
         );
         assert_eq!(other.as_deref(), Some("unclassified:after-builder"));
     }
@@ -1010,6 +1046,90 @@ mod tests {
             ..base(SweepResult::Cancelled)
         };
         assert_eq!(reported(&cancelled), (SweepDisposition::Landed, SweepResult::Cancelled));
+    }
+
+    /// Issue #11438 acceptance: a clean exit (code 0) with no checkpoint, no
+    /// phase and a sub-minute duration is never `EnvFailure` /
+    /// `spawn-death` — it is a deliberate no-op seen before any phase, not an
+    /// environmental fault.
+    #[test]
+    fn clean_exit_sub_minute_phaseless_failure_is_never_env_failure() {
+        for secs in [0, 27, SPAWN_DEATH_MAX_DURATION_SEC - 1] {
+            let signals = DispositionSignals {
+                total_duration_sec: secs,
+                exit_code: Some(0),
+                ..base(SweepResult::Failure)
+            };
+            let (disposition, class) = classify_disposition(&signals);
+            assert_ne!(disposition, SweepDisposition::EnvFailure, "{secs}s");
+            assert_eq!(disposition, SweepDisposition::Unknown, "{secs}s");
+            assert_eq!(class.as_deref(), Some(NO_PHASE_SIGNAL_CLASS), "{secs}s");
+        }
+        // An environmental classifier label still wins on a clean exit.
+        let env = DispositionSignals {
+            failure_class: Some("execution-error"),
+            exit_code: Some(0),
+            ..base(SweepResult::Failure)
+        };
+        assert_eq!(classify_disposition(&env).0, SweepDisposition::EnvFailure);
+    }
+
+    /// The spawn-death shape still holds for a non-zero code and for an
+    /// unobserved exit status (a signal death) — only code 0 is exempt.
+    #[test]
+    fn nonzero_or_unobserved_exit_sub_minute_is_still_spawn_death() {
+        for exit_code in [Some(1), Some(78), Some(137), None] {
+            let signals = DispositionSignals {
+                total_duration_sec: 20,
+                exit_code,
+                ..base(SweepResult::Failure)
+            };
+            let (disposition, class) = classify_disposition(&signals);
+            assert_eq!(disposition, SweepDisposition::EnvFailure, "{exit_code:?}");
+            assert_eq!(class.as_deref(), Some(SPAWN_DEATH_CLASS), "{exit_code:?}");
+        }
+    }
+
+    /// A self-reported no-op reaches the classifier as a clean `Success`
+    /// (the reaper no longer charges it as no-progress) and lands in
+    /// `noop_already_done`, never a failure bucket (Issue #11438).
+    #[test]
+    fn clean_short_success_without_phase_is_noop_already_done() {
+        let signals = DispositionSignals {
+            total_duration_sec: 27,
+            exit_code: Some(0),
+            ..base(SweepResult::Success)
+        };
+        let (disposition, class) = classify_disposition(&signals);
+        assert_eq!(disposition, SweepDisposition::NoopAlreadyDone);
+        assert_eq!(class, None);
+    }
+
+    /// Issue #11438: the no-op loop reclass covers the clean-exit
+    /// `no-phase-signal` / `spawn-death` forms, and only on a clean exit.
+    #[test]
+    fn noop_loop_reclasses_clean_exit_no_phase_and_spawn_death_forms() {
+        let lc = Some("noop-loop:human-gate");
+        for (disposition, class) in [
+            (SweepDisposition::Unknown, NO_PHASE_SIGNAL_CLASS),
+            (SweepDisposition::EnvFailure, SPAWN_DEATH_CLASS),
+        ] {
+            let clean = apply_noop_loop_class(disposition, Some(class.into()), lc, true);
+            assert_eq!(clean.as_deref(), lc, "{class} on a clean exit");
+            let dirty = apply_noop_loop_class(disposition, Some(class.into()), lc, false);
+            assert_eq!(dirty.as_deref(), Some(class), "{class} on a non-clean exit");
+            let first = apply_noop_loop_class(disposition, Some(class.into()), None, true);
+            assert_eq!(first.as_deref(), Some(class), "{class} with no loop yet");
+        }
+        // End to end: the clean-exit short failure classifies, then reclasses.
+        let signals = DispositionSignals {
+            total_duration_sec: 30,
+            exit_code: Some(0),
+            ..base(SweepResult::Failure)
+        };
+        let (disposition, class) = classify_disposition(&signals);
+        let looped = apply_noop_loop_class(disposition, class, Some("noop-loop:blocked"), true);
+        assert_eq!(looped.as_deref(), Some("noop-loop:blocked"));
     }
 
     /// The 2,810-record shape: stopped after the Curator, with no forge

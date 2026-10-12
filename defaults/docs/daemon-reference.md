@@ -2994,129 +2994,49 @@ starved. A repo with `loom:very-important` work next wins the draw outright.
 Cross-repo dependency awareness stays a role judgment (label the blocker).
 
 **`tier:*` labels do not affect dispatch order.** `tier:goal-advancing` and its
-siblings are triage metadata; no daemon code reads them. Neither does
-`loom:urgent` any more (#9244): the label is tolerated on an issue, but it is not
-a key. Only the six keys below order the queue.
+siblings are triage metadata; no daemon code reads them. Only the three keys
+below order the queue.
 
-### Dispatch order, the operator-priority star and the red-main-fix lane (#9244)
+### Dispatch order and the red-main-fix lane (#11103, #11508)
 
-`candidate_cmp` orders **issues** by six keys ([PR planning](pr-planning.md) is separate):
+`candidate_cmp` orders **issues** by three keys ([PR planning](pr-planning.md) is separate):
 
-1. **Starred first.** An issue carrying `loom:operator-priority` (the operator's
-   "land this ASAP", applied directly or through the loom-ui star) sorts ahead of
-   every other candidate, fleet-wide, whatever its repo's tier.
-2. **Starred-at**, among starred issues: the issue starred first lands first. The
-   work finder reads the `labeled` event for `loom:operator-priority` from the
-   issue's REST timeline once per starred issue and caches it per (repo, issue); it
-   never reads a timeline for an unstarred issue, and removing the star drops the
-   cache entry. A missing starred-at falls back to `createdAt`. A star applied
-   from loom-ui uses the intent's `requested_at` instead (#9244 C, below). A
-   blocker inheriting a star sorts at that star's position. The cache evicts
-   promptly (any tick that does not list the issue as starred drops its entry),
-   which is deliberate and has two accepted consequences (#9314): a star flipped
-   off and back on entirely *between* two ticks keeps its old starred-at, and an
-   issue that leaves the listing — every `loom:building` claim — is read again
-   when it returns. Both affect ordering among starred issues only; see
-   `StarredAtCache`'s "Accepted staleness" doc comment.
+1. **Level**, highest first: `loom:very-important`, then `loom:important`, then
+   none. The level comes only from those two labels (`Level::of`).
+2. `createdAt`, oldest first (a dated issue before an undated one).
+3. Issue number ascending.
 
-   **Restart store.** Known starred-ats also persist across a daemon restart or
-   roll, so a roll does not re-read every starred issue's timeline at once. The
-   file is `starred-<sha16(cwd|repo)>.json` in the daemon's private listing-cache
-   dir (`${TMPDIR:-/tmp}/loom-forge-listing-cache`, or `LOOM_LISTING_CACHE_DIR`),
-   one per workspace key, written atomically and deleted after 7 days untouched.
-   It is consulted only on an in-process miss, after a loom-ui intent's
-   `requested_at` (which always wins), and a persisted value is reused only when
-   the issue's level-label set is unchanged, the value was seen within the
-   last 30 minutes (`last_seen`, rewritten at most every 5 minutes), and the
-   issue's listed `updated_at` is no later than the one the value was confirmed
-   under (a missing `updated_at` reads). Label events advance `updated_at`, so
-   an unstar and re-star made while the daemon was down is read, not masked.
-   The same `updated_at` check applies in process: a known starred-at is read
-   again on the first tick whose listing shows the issue updated. Unknown
-   starred-ats are never persisted, so the 10-minute retry still applies. Every
-   in-process drop is mirrored: an issue that leaves the starred set loses its
-   entry and a nothing-starred tick deletes the file, so an unstar and re-star
-   reads the new time. **`LOOM_STARRED_AT_PERSIST=0`** (also `false`/`off`/`no`)
-   turns the store off: nothing is read or written. `status` shows how lookups
-   were answered under `last_work_finder_tick.starred_at_cache` (`mem_hit`,
-   `disk_hit`, `intent_hit`, `read_known`, `read_none`, `read_err`, cumulative
-   since start); the `read_*` rows are the timeline reads that remain.
-3. **Red-main fixes first**: an issue whose body carries
-   `<!-- loom:main-red-fix -->` at the start of a line, **only while its repo's
-   `main` is verified red** (`WorkspaceHealthStates::is_halted`). A marker on a
-   green repo is inert.
-4. Workspace priority ascending.
-5. `createdAt`, oldest first.
-6. Issue number ascending.
+These keys rank the published ready-queue rows (`rank`, `plan.keys`); dispatch
+follows the workspace draw, and the single-workspace tick uses the same three
+keys. #11508 removed the legacy keys: the star (`loom:operator-priority`), its
+levels and inherited levels, the starred-at time and its restart store
+(`starred-<sha16>.json`, no longer read or written; `LOOM_STARRED_AT_PERSIST` is
+ignored), the red-main-fix ordering boost, and `workspace_priority` as a rank
+key (it weights the workspace draw instead). The ready-queue row field
+`operator_priority` is always `false`, kept for wire compatibility;
+`main_red_fix` still marks a verified red-main fix.
 
-Since #11103 these keys rank the ready-queue rows only; dispatch follows the
-workspace draw, and the single-workspace tick uses level, oldest, number.
+**The red-main-fix lane is not a priority.** A candidate carrying
+`<!-- loom:main-red-fix -->` whose repo's `main` is verified red keeps three
+gate bypasses, because while `main` is red nothing merges and holding the fix
+would deadlock: the build back-off, the file-overlap gate (it still occupies)
+and the repo-sharding slice (kept in its draw position). On a green `main`
+the marker grants nothing.
 
-**Starred issues outside `loom:issue`.** Besides the `loom:issue` listing, each
-tick makes a second ETag-cached listing of open `loom:operator-priority` issues
-and merges it in, deduplicated by issue number. A starred issue labelled
-`loom:triage` or `loom:curated`, or carrying no workflow label at all, therefore
-becomes a candidate; the dispatched sweep starts from Curator. Starred rows
-already claimed (`loom:building`, `loom:curating`) are dropped. Skip and park labels
-still win: a starred issue carrying `loom:blocked`, `loom:operator-only`,
-`loom:operator-decision` or `loom:operator` is never dispatched
-(`loom:operator-decision` is a skip label in its own right since #9244). If the
-second listing fails, the tick carries on with the `loom:issue` rows. A starred
-`loom:epic` or proposal (`loom:architect`, `loom:hermit`, `loom:auditor`) is
-not taken from the second listing: the star does not make it build work, and it
-keeps its Champion path.
-
-**Lane candidates are not reshaped.** Starred and red-main-fix candidates stay at
-the head of the multi-workspace queue in comparator order. The per-repo cap's
-track affinity and the repo-sharding slice (#6243) reorder and defer only the
-ordinary work behind them, so a starred issue in a cold repo, or in a repo
-another host's slice prefers, is still picked first.
+**Priority changes order, never eligibility or admission** (operator ruling on
+#11508). There is no priority side listing: a `loom:important` /
+`loom:very-important` issue is dispatched only once it is `loom:issue`, like
+everything else. No priority label exempts a candidate from any gate: the
+concurrency and per-repo caps, the build back-off, the file-overlap gate and the
+repo-sharding slice defer it exactly like plain work. The per-host overflow slot
+(#9244) is inert: nothing is admitted over the cap, and `plan.slots.overflow_free`
+only reports whether an overflow sweep an older daemon started is still live
+(its `overflow: true` sweep record and claim-lock stamp are still honoured on
+adoption).
 
 `loom:operator-priority` is **not** `loom:operator` and is not a hold. Code that
 treats a `loom:operator-` prefix match as a hold must exclude it by name (see
 `pr_latency::hold_labels`).
-
-**Overflow slot (one over-limit sweep per host).** A starred candidate that only
-the global `maxConcurrent` cap and/or the per-repo cap (`maxConcurrentPerRepo`)
-refused may still be dispatched, as this host's single overflow sweep, when:
-
-- no live sweep on this host is already marked `overflow` (and no earlier
-  candidate took the slot this tick), and
-- occupancy is at most the **configured** `maxConcurrent`. The cap can drop
-  below occupancy mid-flight; a host already over its limit that way adds
-  nothing, and
-- the host has disk and RAM headroom for one more sweep (occupancy is below
-  `min(disk headroom, ram headroom)`, and the dynamic cap is not 0). Overflow
-  goes past the configured queue limit only, never past resource headroom:
-  when disk or RAM binds the dynamic cap, a starred issue waits like any other.
-
-The saturation brake, the host-class gate, token-pool and pre-flight holds, skip
-and park labels, quarantine, backoff, peer claims and the per-tick ramp cap all
-still apply. Unstarred work, including red-main fixes, never uses the slot. The
-sweep record carries `overflow: true` (shown in `list_sweeps`,
-`get_sweep_status`, and as `[overflow]` in `loom-daemon status`); the tick counts
-it in `TickReport::dispatched_overflow`, and its ready-queue row reads
-`dispatched this tick (overflow)`.
-
-**The flag survives a daemon restart (#9314).** It is stamped onto the sweep's
-claim lock (`.loom/locks/issue-<N>/owner.json`, `"overflow": true` — written
-only when true) the moment the slot is taken, and `reconstruct()` restores it
-onto the adopted entry. So a restart mid-flight keeps the `[overflow]` marker in
-`status`/`list_sweeps` and keeps the slot accounted as taken, instead of handing
-it to a second starred issue once one normal sweep ends. Two residual gaps, both
-deliberate and both bounded by the same `occupancy <= configured` gate (a host
-never exceeds max+1 either way):
-
-- a sweep adopted from the **machine sweep journal** rather than its lock
-  (`adopt_live_journal_sweeps`, #6262 — the survivor whose lock did *not*
-  survive) comes back without the flag: the journal records no such field, and
-  widening its schema is outside that pass's read-only adopt-only contract;
-- a checkpoint-only recovery is `Crashed`, and only non-terminal entries hold
-  the slot, so it never needs the flag.
-
-If the lock is already gone when the slot is taken (the sweep finished in that
-window), the stamp is skipped with a `warn` — the in-memory mark still governs
-the running daemon.
 
 **Main-health halt admits only fixes.** A repo halted because its `main` is
 verified red still admits its `<!-- loom:main-red-fix -->` candidates, and only
@@ -3125,7 +3045,7 @@ those; every other ready issue in it, starred or not, keeps `workspace_halted`.
 run in flight, a drain, the host-distress breaker, a pre-flight or token-pool
 hold) admits nothing, fixes included. With the main-health gate disabled for a
 repo (no enabled `buildGate`), there is no verified-red signal, so the latest
-`main` CI conclusion stands in for key 3: one cached `gh run list` per repo per
+`main` CI conclusion stands in for it: one cached `gh run list` per repo per
 tick, made only when the repo has a marker-bearing candidate.
 
 **Unpromoted red-main fixes (#10118).** A fix is usually filed in `loom:triage`,
@@ -3256,10 +3176,9 @@ quiet. One un-pinged `resolved ✓` line follows when the ask clears. With
 
 **Blocker inheritance.** The issue blocking a starred issue (named by
 `Blocked by #N` on a `loom:blocked` issue, the incident behind a merge refusal,
-or the repo's red-main fix while `main` is red) inherits the star: the work
-finder orders it at the star's position (and it may take the overflow slot),
-even from outside the `loom:issue` listing, and its landing row is marked
-`inherited_from`. Once it closes or stops blocking, the next pass drops it, and
+or the repo's red-main fix while `main` is red) inherits the star: its landing
+row is marked `inherited_from`. Since #11508 the work finder no longer reads the
+inheritance (no ordering, no listing outside `loom:issue`). Once it closes or stops blocking, the next pass drops it, and
 a repo unreadable for 3 passes in a row loses its inherited stars until a pass
 succeeds. A merge refusal's incident is an **open issue** named in the refusal
 comment itself, or else the newest open issue, filed by a trusted author,
@@ -3333,10 +3252,10 @@ human put on the child, and never after an incomplete walk. The
 `create-issue.sh --parent`; no pass edits bodies. **Never propagate**: holds
 (`loom:blocked`, `loom:operator`, `loom:operator-only` and its sub-kinds,
 `loom:needs-capability`), claim, lifecycle and PR-lane labels, proposal kinds,
-`loom:epic-phase`, `loom:heavy`, `points:*`, the retired `loom:urgent`, and the
+`loom:epic-phase`, `points:*`, and the
 #10307 level labels, which reach blockers by their own pass: all carry
 `propagate: null`, and a unit test fails if a hold, claim, lifecycle, PR-lane,
-proposal, structural, size or resource label gets a rule. The pass writes only the star so far (above); it
+proposal, structural or size label gets a rule. The pass writes only the star so far (above); it
 writes no `external` or `tier:*` label yet.
 
 **loom-ui stars.** The `/ingest` ack may carry `operator_priority_intents`
@@ -3387,7 +3306,7 @@ by `candidate_cmp`, with what the tick did with it:
   the label), `open_pr` (with the PR number), `dispatch_backoff`,
   `open_pr_backoff`, `quarantined`, `noop_cooldown`, `declined`,
   `prless_retry`, `peer_claim`, `recheck_interval`, `hard_exclusion`,
-  `host_constraint`, `host_class_refused` (#9034), `workspace_halted` (the whole repo's dispatch is held: red
+  `host_constraint`, `workspace_halted` (the whole repo's dispatch is held: red
   `main`, a gate in flight, a pre-flight or token-pool hold, a drain, or the
   host-distress breaker; the row does not say which), `workspace_commands_missing`,
   `dispatch_error` (with the error text), `already_landed` (#11429: the issue
@@ -4433,7 +4352,9 @@ api` read):
 - **Safe** (child issue not `loom:building`): invokes
   `./.loom/scripts/reconcile-stack.sh <child-pr> feature/issue-<parent>`
   (`git rebase --onto <the FETCHED default-branch commit> <parent-ref>
-  <child-branch>` + `--force-with-lease` + `gh pr edit --base <default>`).
+  <child-branch>` + `--force-with-lease` + `gh pr edit --base <default>`; in a
+  repo whose PR branches are not rebased, only the `gh pr edit`, see
+  [branch-update-strategy.md](branch-update-strategy.md), #10771).
   The destination is the commit that run fetched from the remote, never the
   local branch of the same name: the local default branch is normally stale at
   exactly this moment (the parent merged on the forge), and rebasing onto it
@@ -4477,7 +4398,8 @@ child that branched off its pre-amend tip goes stale. It discovers open child
 PRs with the same `gh pr list --base feature/issue-<parent> --state open` query,
 detects staleness via `git merge-base --is-ancestor`, and rebases safe stale
 children onto the parent's current tip (`git rebase` + `push --force-with-lease`,
-base **not** retargeted — the child stays stacked), deferring children whose
+base **not** retargeted — the child stays stacked; in a merge-only repo stale
+children are only reported, #10771/#9808), deferring children whose
 issue is still `loom:building` with a comment. Doctor invokes it as a documented
 best-effort step after pushing to a `feature/issue-<N>` branch. **Dependency
 auto-detection**, **diamonds / multi-parent**, and **auto-detach** remain **out
@@ -4894,8 +4816,8 @@ issue whose linked PR is in flight a non-candidate (`open_pr`), so the tick's
 next dispatch goes to another repo, and re-engagement when the PR merges is
 automatic. It composes with [repo sharding (#6243)](dispatcher-repo-sharding.md)
 in a fixed order: the sharding slice partition runs first, affinity reorders
-within its result, and the cap gates admission last. Starred and red-main-fix
-candidates are exempt from both partitions (#9244).
+within its result, and the cap gates admission last. No priority is exempt
+(#11508); a verified red-main fix is never deferred by the slice (#9244).
 
 #### Same-repo file-overlap deferral (#9781)
 
@@ -4915,7 +4837,8 @@ after the capacity, ramp, RAM and per-repo-cap gates, so it is work-conserving
   section, "To be determined", or no paths ⇒ *unknown*: never deferred and
   never occupying — same rule as `/loom:sweep`'s overlap-aware waves.
 - **Scheduling signal only**: no label, hold, stacking edge or extra forge read.
-  Starred and red-main-fix candidates are never deferred but still occupy.
+  No priority is exempt (#11508); a verified red-main fix is never deferred
+  but still occupies.
 - **v1 limitation**: an in-flight issue absent from the `loom:issue` listing
   (the usual case once it flips to `loom:building`) is not seen, so the gate
   mainly separates same-tick admissions; the reactive Doctor rebase stays the
@@ -5480,12 +5403,10 @@ adds no PR dispatch path of its own.
 
   So `debt == high` does not engage and `high + 1` does; while engaged,
   `debt == low` holds and `low − 1` releases.
-- **Bypass.** A `loom:operator-priority` (starred) issue is an explicit human
-  "now", so it is admitted anyway, still subject to the global cap, the #9244
-  overflow slot, the ramp cap and the per-repo cap. A verified red-main fix is
-  admitted too: a red `main` blocks merges, so the fix lowers the very debt
-  holding the back-off engaged. The saturation brake, a host-safety guard, is
-  checked first and still holds both.
+- **No priority bypass** (#11508). Priority changes order, never admission: a
+  `loom:important` / `loom:very-important` issue and a legacy star are held
+  like any other candidate in an engaged repo. A verified red-main fix
+  (#9244) bypasses it: it is what lets the repo merge and drain the debt.
 - **Explicit dispatch is unaffected** (`dispatch_sweep` over IPC does not go
   through the work-finder tick).
 - **Observability.** One `INFO` line per edge, naming the repo (or the host
@@ -6357,13 +6278,11 @@ knobs not yet audited here.
 | `autonomous.workFinder.maxConcurrent` | `LOOM_WORK_FINDER_MAX_CONCURRENT` | `3` | The per-machine **sweep-dispatch** admission knob since #4512 — **it bounds sweeps only; role-runner agents are admitted outside it and carry their own `autonomous.roleRunner.maxConcurrent` ceiling (#6102)** — an operator ceiling, not a fixed target, tuned empirically from `loom-daemon calibrate` / `status`. Per-machine **and workload-dependent** (#4903): ~10+ on an 8-core API-bound (software) worker, but **2–3** on the same 8 cores running analog/simulation sweeps. **Hot-applies (#9060)** — re-read every multi-workspace tick, so a config edit takes effect on the next tick without a restart; the transition is logged once (`work_finder: configured_max A -> B (source=config)`). The **env override is restart-only** (process environment is fixed at launch) and, while set, shadows config — the daemon logs `maxConcurrent=N is IGNORED` when that happens. The startup log line names the resolved value and its layer, `source=env`/`config`/`default` (#6203). See [Sizing `maxConcurrent`](#sizing-maxconcurrent-per-machine-and-per-workload-4512-4903) below |
 | `autonomous.workFinder.maxAdmissionsPerTick` | `LOOM_WORK_FINDER_MAX_ADMISSIONS_PER_TICK` | `3` | Per-tick **ramp** cap (#4234) — bounds how many *new* sweeps one tick may admit, independent of `maxConcurrent`/the dynamic cap. Zero/invalid → default; resolved once at startup — a startup-capture pattern `maxConcurrent` no longer shares (it hot-applies since #9060). **Restart required** to pick up a change (#5963) |
 | `autonomous.workFinder.maxConcurrentPerRepo` | `LOOM_WORK_FINDER_MAX_CONCURRENT_PER_REPO` | *(absent = uncapped)* | How many of the shared `maxConcurrent` budget's slots ONE repo may hold (#9090). **Absent is uncapped, not a number**: this is opt-in, so an upgrade throttles nothing. Setting it also turns on **track affinity** (a repo with a live sweep sorts ahead of a cold repo — ordering only, always subordinate to the cap). A candidate whose repo is at the cap is *deferred*, never dropped (`deferred_repo_cap` / the `repo_cap` decision reason), and the slot goes to another repo's candidate in the same tick. Zero/invalid → absent (a literal cap of `0` would deadlock every repo). A value above `maxConcurrent` is harmless. **Hot-applies (#9090)** — re-read every multi-workspace tick on the same path as `maxConcurrent`, transition logged once. See [Per-repo dispatch cap + track affinity](#per-repo-dispatch-cap--track-affinity-9090) |
-| `autonomous.workFinder.hostClass` | `LOOM_HOST_CLASS` | *(absent = unclassified)* | This host's operator-declared class (#9034): `"local-dev"` \| `"remote-worker"`. Any other value, or the key absent, is **unclassified** — for which the `loom:heavy` gate below never fires. **Do not** default an unset host to `local-dev`: that would silently start refusing heavy sweeps fleet-wide the moment this ships. An unrecognized value logs a one-time `WARN`. **Restart required** — a startup-capture, resolved ONCE when the work-finder starts (from the daemon's primary workspace) and threaded into every per-tick dispatcher, never re-read per tick, unlike `maxConcurrent`/`maxConcurrentPerRepo` above; one value per daemon, shared by every workspace it serves. **Set it per machine, on the machine** — `LOOM_HOST_CLASS`, or a machine-local tier (`~/.local/share/loom/config/defaults.json` or the ignored `.loom-local/local.json`), **never** a repo's committed `.loom/config.json`, which every clone shares and would classify each remote worker running that repo as `local-dev`. See [Host-class gate](#host-class-gate-9034) below |
-| `autonomous.workFinder.allowHeavyLocal` | `LOOM_ALLOW_HEAVY_LOCAL` | `false` | Suppresses the `loom:heavy`/`host_class` gate for this workspace's **autonomous** loop entirely (#9034) — the explicit opt-in override. Env truthy (`1`/`true`/`yes`/`on`) enables, any other value disables; wins over config. **Hot-applies** — re-read fresh every tick (like `extraSkipLabels`), so no daemon restart is needed. The other, independent override path is `loom-daemon dispatch <issue> --allow-local` for a one-off explicit dispatch. See [Host-class gate](#host-class-gate-9034) below |
 | `autonomous.workFinder.saturationBrake.enabled` | `LOOM_ADMISSION_BRAKE` | `true` | Saturation admission brake on/off (#4903). A safety backstop — **defaults on**. Holds *new* admissions while the host is already saturated; never preempts a running sweep. Env truthy (`1`/`true`/`yes`/`on`) enables, any other value disables; wins over config. **Restart required** — resolved once at startup and registered as a process-global handle alongside the host breaker (#5963). See [Saturation admission brake](#saturation-admission-brake-4903) below |
 | `autonomous.workFinder.saturationBrake.loadPerCoreHold` | `LOOM_ADMISSION_BRAKE_LOAD_PER_CORE` | `0.95` (`4.0` before #5270) | Load-per-core at/over which new admissions are held for that tick. `<= 0`/invalid → default. Since #5270 sits deliberately *below* the host breaker's `2.5` trip: the brake is now the primary "dumb mode" CPU gate and engages first (a single over-threshold reading), the breaker remains the slower sustained-distress trip. **Restart required** — same startup-resolved global as `enabled` above (#5963) |
 | `autonomous.workFinder.saturationBrake.starvationWarnSecs` | `LOOM_ADMISSION_BRAKE_STARVATION_WARN_SECS` | `300` | Seconds of continuous held+0-in-flight before the `WARN`-level `STARVING` log fires once per streak (#5715). `<= 0`/invalid → default. See [Starvation escape hatch](#starvation-escape-hatch-5715) |
 | `autonomous.workFinder.saturationBrake.starvationEscapeSecs` | `LOOM_ADMISSION_BRAKE_STARVATION_ESCAPE_SECS` | `900` | Seconds of continuous held+0-in-flight before the escape hatch yields one tick despite the raw load still being over threshold, logged at `ERROR` (#5715). `<= 0`/invalid → default |
-| `autonomous.workFinder.buildBackoff.enabled` | *(config only)* | `true` | Build back-off on review + merge debt (#9410), per repo (#10624). While a repo's is engaged, no new unstarred issue build is admitted in that repo; starred and red-main-fix issues bypass it. Reads the role runner's demand ledger, so it is inert with the role runner off. `false` → pre-#9410 admission. Non-bool → default. **Live**. See [Build back-off on review and merge debt](#build-back-off-on-review-and-merge-debt-9410) |
+| `autonomous.workFinder.buildBackoff.enabled` | *(config only)* | `true` | Build back-off on review + merge debt (#9410), per repo (#10624). While a repo's is engaged, no new issue build is admitted in that repo whatever its priority; only a verified red-main fix bypasses it. Reads the role runner's demand ledger, so it is inert with the role runner off. `false` → pre-#9410 admission. Non-bool → default. **Live**. See [Build back-off on review and merge debt](#build-back-off-on-review-and-merge-debt-9410) |
 | `autonomous.workFinder.buildBackoff.high` | *(config only)* | `40` | Engage a repo's back-off when **its own** `review + changes + merge` debt is **strictly above** this (#10624). Zero, negative or non-integer → default. **Live** |
 | `autonomous.workFinder.buildBackoff.low` | *(config only)* | `25` | Release a repo's back-off when its debt is **strictly below** this. Zero, negative or non-integer → default; `low >= high` rejects the pair (both fall back to `40`/`25`, one `WARN`). **Live** |
 | `autonomous.workFinder.buildBackoff.hostHigh` | *(config only)* | absent (off) | Optional host-wide ceiling (#10624): engage when the **host total** debt is strictly above this; while engaged, every repo's unstarred builds are held. Needs `hostLow` too. **Live** |
@@ -7399,90 +7318,6 @@ The Builder-side "landed on the wrong host, no changes made" bail-out this
 feature exists to make rare is unchanged and stays the backstop for a
 mislabelled issue — this is a `work_finder`/`dispatch`-level *filter*, not a
 replacement for the sweep's own toolchain check.
-
-### Host-class gate (#9034)
-
-The admission brake and host breaker above are **reactive**: they hold new
-admissions once a host is *already* saturated, measured by load-per-core. They
-cannot refuse a *known-heavy* sweep *before* it starts on a machine that was
-never meant to run it. The brake's own motivating incident shows the gap:
-`loom-worker-1`, a dedicated 8-vCPU worker, observed at load-average 95 (12x
-overcommit) from three in-flight heavy simulation sweeps — the incident that motivated the
-brake (#4903), which by design acts only once saturation is already measured.
-#9034 then reported the same shape on developer laptops (e.g.
-`MacBook-Air.localdomain`) picking up heavy autonomous sweeps: 14+ load/core
-and 31+ GB of swap thrash. This gate is the missing preventive half.
-
-A daemon instance declares what kind of machine it is via
-`autonomous.workFinder.hostClass` / `LOOM_HOST_CLASS`: `"local-dev"` or
-`"remote-worker"`. Any other value, or the key absent, is **unclassified** —
-the default for every existing install, for which this gate never fires (zero
-behavior change until an operator opts a specific machine in). A typo
-(`"local_dev"`) is logged once at `WARN` and still resolves to unclassified.
-
-`hostClass` is a fact about the **host**, not the repo. Unlike
-`maxConcurrent`/`maxConcurrentPerRepo`, it is a startup-capture: resolved
-ONCE when the work-finder starts (env > config > unclassified, from the
-daemon's primary workspace) and threaded into every per-tick dispatcher —
-never re-read per tick, and shared by every workspace the daemon serves.
-Reclassifying a machine is a rare, deliberate operator action, so a restart
-to pick it up is fine. **Set it with `LOOM_HOST_CLASS` or a machine-local
-config tier** (`~/.local/share/loom/config/defaults.json`, or the ignored
-`.loom-local/local.json`) — **not** in a repo's committed `.loom/config.json`:
-that file is shared by every clone, so `hostClass: "local-dev"` there would
-classify every remote worker running the repo as `local-dev` and refuse its
-heavy sweeps.
-
-The mechanical "heavy" signal is a new label, `loom:heavy` — a
-human/Architect/Curator-applied marker for a CPU/RAM-intensive build (e.g. a
-sustained simulation/EDA sweep). Deliberately **not** `tier:goal-advancing` /
-`tier:goal-supporting` / `tier:maintenance`: those are a *priority* axis, and
-reusing one as the "heavy" signal would refuse ordinary prioritized work (a
-one-line config fix) on every `local-dev` laptop the instant it is
-prioritized.
-
-The gate itself sits at the same checkpoint as the host-affinity constraint
-above — checked immediately after it, in both `work_finder`'s autonomous tick
-(single- and multi-workspace) and `loom-daemon dispatch` — and refuses with the
-same **zero-side-effect** contract: no claim flip, no comment, no
-cooldown/backoff record, since a `local-dev` host will never build a refused
-candidate without an operator action. It fires exactly when **all** of: this
-host's `hostClass` resolves to `local-dev`, the candidate carries
-`loom:heavy`, and neither override below is set.
-
-**MCP `mcp__loom__dispatch_sweep` is not gated.** It goes straight to the
-daemon's dispatch path, which never consults `hostClass` — the same as
-host-affinity (#7456), which is also enforced only in the work-finder ticks
-and client-side in `loom-daemon dispatch`. An MCP dispatch is an explicit
-operator action, equivalent to passing `--allow-local`.
-
-Two independent override paths (either is sufficient):
-
-- **Autonomous work-finder loop**: `autonomous.workFinder.allowHeavyLocal` /
-  `LOOM_ALLOW_HEAVY_LOCAL` (env > config > default `false`) — un-gates one
-  `local-dev` box's autonomous loop entirely. Unlike `hostClass`, this is
-  read fresh every tick (like `extraSkipLabels`), so it hot-applies without a
-  daemon restart.
-- **Explicit CLI dispatch**: `loom-daemon dispatch <issue> --allow-local`,
-  mirroring `--ignore-host-constraint` above exactly (same best-effort
-  `gh issue view` label fetch, same fail-open contract on a fetch failure). An
-  operator hand-dispatching a known-heavy issue on their own laptop on purpose
-  is not the case this gate exists to stop.
-
-Each refusal is counted per tick as `host-class-skip` on the `work_finder:
-tick` summary log line and as the `host_class` reason of the
-`loom.dispatch.decisions` OTLP counter. In the multi-workspace loop, a refused
-candidate also shows up as `host_class_refused` (`QueueDisposition`) in
-`loom-daemon queue` / the ready-queue rows, with reason "blocked: heavy sweep
-refused on local-dev host_class" — never tracked for starvation, the same
-treatment `host_constraint` gets, since this refusal never self-resolves by
-waiting.
-
-**Out of scope (deliberately, see #9034's curation):** a `/dashboard/hosts`
-panel showing live sweep distribution by `host_class`, and restricting
-`local-dev` hosts to lightweight *roles* (Curator, triage, lint) — the latter
-is a `autonomous.roleRunner` concern, a different subsystem from the
-work-finder sweep-dispatch path this gate lives in.
 
 ### Host-distress circuit breaker (#4235)
 

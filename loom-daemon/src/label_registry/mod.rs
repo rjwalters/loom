@@ -76,7 +76,6 @@ pub const KINDS: &[&str] = &[
     "structural",
     "tier",
     "size",
-    "resource",
     "external",
 ];
 

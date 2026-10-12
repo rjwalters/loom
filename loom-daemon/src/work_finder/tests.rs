@@ -2525,8 +2525,8 @@ fn test_tick_multi_missing_halt_entry_defaults_not_halted() {
 mod build_backoff;
 mod main_red_fix;
 mod maintain_only;
-mod operator_priority;
 mod ordering;
+mod priority_admission;
 mod ram_budget;
 mod workspace_draw;
 
@@ -2657,15 +2657,11 @@ fn test_mechanical_item_with_an_unknown_capability_fails_closed() {
 
 #[test]
 fn test_other_operator_only_sub_kinds_remain_hard_skipped() {
-    // #6885 non-goal, asserted directly: the other three sub-kinds are
+    // #6885 non-goal, asserted directly: the other two sub-kinds are
     // unaffected — a marker in their body is ignored entirely, even for a
     // maximally-capable worker.
     let all_caps = caps(&["host-sudo", "forge-admin-token", "tailnet-access"]);
-    for sub_kind in [
-        "loom:operator-decision",
-        "loom:operator-blocked",
-        "loom:operator-objective",
-    ] {
+    for sub_kind in ["loom:operator-decision", "loom:operator-blocked"] {
         let item = WorkItem::new(
             1,
             vec![

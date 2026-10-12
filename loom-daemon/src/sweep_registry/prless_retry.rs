@@ -626,6 +626,8 @@ impl SweepRegistry {
         if external_kill_exemption(exit_code).is_none() {
             self.note_curator_only_outcome(issue, sweep_id, None);
         }
+        // #11438: so does a clean exit that never reached a phase at all.
+        self.note_clean_phaseless_exit_outcome(issue, sweep_id, open_pr, exit_code);
     }
 
     /// Record one **PR-less release** for `issue` (Issue #7972): a dispatch

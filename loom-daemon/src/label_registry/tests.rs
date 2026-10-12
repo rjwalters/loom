@@ -234,7 +234,6 @@ fn human_gated_is_exactly_the_human_must_act_labels() {
             "loom:operator-only",
             "loom:operator-mechanical",
             "loom:operator-decision",
-            "loom:operator-objective",
             "external",
         ])
     );
@@ -268,7 +267,6 @@ fn derived_pr_latency_hold_labels_equal_the_previous_set() {
             "loom:operator-blocked",
             "loom:operator-mechanical",
             "loom:operator-decision",
-            "loom:operator-objective",
         ])
     );
 }

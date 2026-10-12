@@ -2,8 +2,8 @@
 //! as a daemon running at `t` could have known it (#10196 R6, #11127).
 //!
 //! Runs R3's committed replay SQL (queries 1 and 3 of
-//! `defaults/observability/signoz/replay-queries.sql`) against the telemetry
-//! store's ClickHouse, or reads an export of their output (`--from-file`),
+//! `defaults/observability/signoz/replay-queries.sql`) through the
+//! telemetry-reader, or reads an export of their output (`--from-file`),
 //! and prints every emitting host's coverage — `covered`, or `unknown` with
 //! the reason — and every reconstructed item. The logic lives in
 //! [`loom_daemon::telemetry_replay`]; this is the thin CLI.
@@ -13,9 +13,9 @@
 //! covered host agrees within `--threshold`; 1: one disagreed for longer; 2:
 //! the store or export could not be read.
 //!
-//! Endpoint resolution: flags, then `telemetry.signoz.*`, then (deprecated,
-//! one release) `autonomous.eta.fleetRefresh.signoz.*`. The password is read
-//! from an owner-only `--credential-file` at call time and never printed.
+//! Reader resolution: `--endpoint`, then `TELEMETRY_READER_URL`, then
+//! `telemetry.signoz.endpoint`. No credential: the reader identifies the
+//! caller by its network identity (#11357).
 
 use std::path::PathBuf;
 
@@ -23,7 +23,7 @@ use anyhow::{anyhow, bail, Result};
 use chrono::{DateTime, Utc};
 
 use loom_daemon::signoz_read::{
-    ClickhouseHttp, EndpointConfig, ENDPOINT_CONFIG_KEY, LEGACY_ENDPOINT_CONFIG_KEY,
+    EndpointConfig, TelemetryReader, ENDPOINT_CONFIG_KEY, ENDPOINT_ENV,
 };
 use loom_daemon::telemetry_replay::check::{
     self, CheckParams, DEFAULT_SPAN_SEC, DEFAULT_THRESHOLD_SEC, EXIT_UNREADABLE,
@@ -84,19 +84,11 @@ pub(crate) struct ReplayArgs {
     #[arg(long, value_name = "PATH", conflicts_with = "endpoint")]
     pub from_file: Option<PathBuf>,
 
-    /// ClickHouse HTTP endpoint of the telemetry store. Defaults to
+    /// The telemetry-reader's base URL (`http(s)://host[:port]`; queries go
+    /// to its `/v1/query`). Defaults to `TELEMETRY_READER_URL`, then
     /// `telemetry.signoz.endpoint`.
     #[arg(long, value_name = "URL")]
     pub endpoint: Option<String>,
-
-    /// ClickHouse user. Defaults to `telemetry.signoz.user`.
-    #[arg(long, value_name = "USER")]
-    pub user: Option<String>,
-
-    /// Owner-only file holding the user's password. Defaults to
-    /// `telemetry.signoz.credentialFile`.
-    #[arg(long, value_name = "PATH")]
-    pub credential_file: Option<PathBuf>,
 
     /// Directory whose Loom configuration to read. Defaults to the current
     /// directory.
@@ -230,41 +222,28 @@ impl ReplayArgs {
             .transpose()
     }
 
-    fn http(&self) -> Result<ClickhouseHttp> {
+    fn http(&self) -> Result<TelemetryReader> {
         let root = self
             .repo_root
             .clone()
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."));
         let configured = EndpointConfig::read(&root);
-        let endpoint = self.endpoint.clone().or(configured.endpoint);
-        let user = self.user.clone().or(configured.user);
-        let credential_file = self.credential_file.clone().or(configured.credential_file);
-        let Some(endpoint) = endpoint else {
-            bail!("no SigNoz source: pass --from-file or --endpoint, or configure {ENDPOINT_CONFIG_KEY}.endpoint");
-        };
-        // One warning, naming only the legacy fields a flag did not override.
-        let used: Vec<&str> = configured
-            .legacy
-            .iter()
-            .copied()
-            .filter(|field| match *field {
-                "endpoint" => self.endpoint.is_none(),
-                "user" => self.user.is_none(),
-                _ => self.credential_file.is_none(),
-            })
-            .collect();
-        if !used.is_empty() {
+        if !configured.ignored.is_empty() {
             eprintln!(
-                "[telemetry-replay] deprecated: {} read from {LEGACY_ENDPOINT_CONFIG_KEY}; \
-                 move it to {ENDPOINT_CONFIG_KEY} (the old key is a deprecated fallback and will be removed, #11098)",
-                used.join(", ")
+                "[telemetry-replay] ignored: {} (the telemetry-reader takes no credential; \
+                 only {ENDPOINT_CONFIG_KEY}.endpoint is read, #11357)",
+                configured.ignored.join(", ")
             );
         }
-        Ok(ClickhouseHttp {
+        let Some(endpoint) = self.endpoint.clone().or(configured.endpoint) else {
+            bail!(
+                "no SigNoz source: pass --from-file or --endpoint, set {ENDPOINT_ENV}, \
+                 or configure {ENDPOINT_CONFIG_KEY}.endpoint"
+            );
+        };
+        Ok(TelemetryReader {
             endpoint,
-            user,
-            credential_file,
             timeout: std::time::Duration::from_secs(120),
         })
     }

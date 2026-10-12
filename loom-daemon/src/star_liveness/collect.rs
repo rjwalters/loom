@@ -650,7 +650,8 @@ impl<'a> Evaluator<'a> {
         };
         let row = self.tick_row(n);
         let disposition = row.map(|r| r.disposition);
-        let row_starred_at = row.and_then(|r| r.operator_priority_at.clone());
+        // #11508: the ready-queue row no longer carries a starred-at.
+        let row_starred_at: Option<String> = None;
         let (blockers, comment_facts) = self.blocked_facts(issue);
         let comments_unread = comment_facts.is_none();
         let comment_facts = comment_facts.unwrap_or_default();
