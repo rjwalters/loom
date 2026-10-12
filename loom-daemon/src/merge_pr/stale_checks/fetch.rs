@@ -834,6 +834,24 @@ fn fetch_declaration(gh: &str, nwo: &str, tip_sha: &str) -> Result<String, Strin
     )
 }
 
+/// The base tip with trailing post-merge version bumps discounted (#11330),
+/// or `None` when the tip is not a bump or any read failed. Read lazily — only
+/// for a verdict that is already stale — one `commits/{sha}` per commit.
+/// The bump identity is a fleet App bot ([`crate::forge_identity::FleetLogins`]
+/// for the repo at `root`): the workflow commits as the fleet App.
+pub fn bump_tail(nwo: &str, tip_sha: &str, root: &Path) -> Option<super::bump_tail::BumpTail> {
+    let gh = gh_bin();
+    let fleet = crate::forge_identity::FleetLogins::for_root(root);
+    super::bump_tail::walk(
+        tip_sha,
+        &mut |sha| {
+            gh_api(&gh, nwo, &[&format!("repos/{nwo}/commits/{sha}")])
+                .and_then(|body| super::bump_tail::commit_from_json(&body))
+        },
+        &|login| fleet.contains(login),
+    )
+}
+
 /// Gather everything [`super::assess_scoped`] needs from the live forge.
 pub fn live_inputs(
     nwo: &str,

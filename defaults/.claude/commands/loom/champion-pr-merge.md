@@ -3179,7 +3179,7 @@ Safety Criteria, the Verdict-State Janitor, and every hold (merge-risk,
 critical-file, `loom:operator-only`, `loom:blocked`) apply unchanged. A starred
 PR that passes is merged this pass. A starred PR on a hold stays held and is
 never merged — it is listed first in the hold digest (Step 1 sorts it to the
-top, marked ⭐). A failed merge (exit 1, not the 3-6 re-queues below) on a
+top, marked ⭐). A failed merge (exit 1, not the 3-7 re-queues below) on a
 starred PR is retried **once** this pass; if that fails too, post the "Merge
 Failed" comment with the concrete refusal as a starred-PR escalation and do
 not retry it again this pass. Never add or remove the star.
@@ -3227,12 +3227,12 @@ Never the failure exit **1**; each means "the merge did not happen":
   **Do not "fix" a recurring 5 by raising `LOOM_AUTO_MERGE_TIMEOUT`** (pinned
   under Step 3's own timeout, #9096); re-queuing is cheap.
 - **6** — another PR holds the base's chain-head merge lock: a bounded defer.
-- **7** — set by Step 3, not `merge-pr.sh`: `forge merge-queue step` gave no
-  direct verdict, so `merge-pr.sh` never ran (#10256). QUEUED / DROPPED /
-  HANDED-OFF / MERGED is the queue working. Anything else (UNDETERMINED,
-  REFUSED, invalid mode, a `loom-daemon` too old to prove direct mode) is a
-  **stall** Step 3 already surfaced (`CHAMPION-MERGE-QUEUE-STALL`, one
-  `champion:merge-queue-stall` notice per head, #10628): name it in the
+- **7** — `merge-pr.sh`'s sequencing hold (`LOOM-SEQUENCED-HOLD`, #11330), or
+  Step 3's: `forge merge-queue step` gave no direct verdict, so `merge-pr.sh`
+  never ran (#10256). QUEUED / DROPPED / HANDED-OFF / MERGED is the queue
+  working; anything else (UNDETERMINED, REFUSED, invalid mode, a too-old
+  `loom-daemon`) is a **stall** Step 3 already surfaced
+  (`CHAMPION-MERGE-QUEUE-STALL`, one notice per head, #10628): name it in the
   summary, still not an error.
 
 **Do not follow the 5 failure steps above for any of these outcomes:**

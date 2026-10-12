@@ -43,6 +43,13 @@
 //! The `--from-stdin` payload accepts the new evidence as OPTIONAL fields
 //! (`pr_files`, `base_moves`); a payload without them behaves exactly as before.
 //!
+//! # Version-bump-only base moves (#11330)
+//!
+//! On the live path, a stale verdict is re-assessed once with the base tip's
+//! trailing post-merge version bumps discounted
+//! ([`loom_daemon::merge_pr::stale_checks::bump_tail`]); only a FRESH answer
+//! replaces it, with a `Note:` on stderr. `--from-stdin` never reads it.
+//!
 //! # Local merge-tree re-verification (#10388; default-on since #10465)
 //!
 //! Unless the repository opts out (`merge.reverifyStaleChecks`, default
@@ -66,7 +73,8 @@ use loom_daemon::merge_pr::stale_checks::inputs::{BaseMove, ScopedEvidence};
 use loom_daemon::merge_pr::stale_checks::repo_specs::RepoSpecs;
 use loom_daemon::merge_pr::stale_checks::workflow_scope::{self, CiScope};
 use loom_daemon::merge_pr::stale_checks::{
-    assess_scoped, local_eval, stale_inputs_message, unknown_message, Verdict, CLEAN,
+    assess_scoped, assess_with_bumps, fetch, local_eval, stale_inputs_message, unknown_message,
+    Verdict, CLEAN,
 };
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -127,12 +135,7 @@ impl StaleChecksArgs {
                 Err(why) => (String::new(), Verdict::Unknown(why)),
             }
         } else {
-            match loom_daemon::merge_pr::stale_checks::fetch::live_inputs(
-                &self.repo,
-                &self.pr,
-                &self.base_ref,
-                &self.head_sha,
-            ) {
+            match fetch::live_inputs(&self.repo, &self.pr, &self.base_ref, &self.head_sha) {
                 Ok(inputs) => {
                     // On STDERR, always: stdout carries the CLEAN sentinel and
                     // nothing else (callers compare it for exact equality), and
@@ -146,6 +149,7 @@ impl StaleChecksArgs {
                         inputs.scoped.as_ref(),
                     );
                     warn_all(&warnings);
+                    let verdict = self.discount_bumps(verdict, &inputs);
                     let ev = Evidence {
                         tip_sha: &inputs.tip_sha,
                         base_tip: inputs.base_tip,
@@ -199,6 +203,37 @@ impl StaleChecksArgs {
                 std::process::exit(2);
             }
         }
+    }
+
+    /// #11330: a stale verdict is re-assessed with the base tip's trailing
+    /// post-merge version bumps discounted. Anything but a fresh re-assessment
+    /// returns `verdict` unchanged (the fail-closed direction).
+    fn discount_bumps(&self, verdict: Verdict, inputs: &fetch::LiveInputs) -> Verdict {
+        if !matches!(verdict, Verdict::Stale { .. } | Verdict::StaleInputs { .. }) {
+            return verdict;
+        }
+        let root = loom_daemon::repo_root::find_repo_root_from_cwd()
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_default();
+        let Some(tail) = fetch::bump_tail(&self.repo, &inputs.tip_sha, &root) else {
+            return verdict;
+        };
+        let (rescored, _) = assess_with_bumps(
+            inputs.base_tip,
+            &inputs.required,
+            &inputs.runs,
+            inputs.scoped.as_ref(),
+            Some(&tail),
+        );
+        if rescored != Verdict::Fresh {
+            return verdict;
+        }
+        eprintln!(
+            "Note: the base moved only by {} post-merge version bump(s) since {} (#11330); \
+treating the required checks as fresh.",
+            tail.bumps, tail.effective_sha
+        );
+        rescored
     }
 
     /// #10388: a stale verdict whose every stale component is a cheap,
