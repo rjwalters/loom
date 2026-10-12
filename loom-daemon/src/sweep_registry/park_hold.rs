@@ -11,9 +11,9 @@
 //! - the PR-less retry hold (`write_prless_hold_label`, #7972 / #9239).
 //!
 //! Both applied `loom:blocked` with a bare `gh issue edit` and explained the
-//! park only in a comment. `star_liveness` reads such a park as
-//! `blocked-unnamed` and `check-stale-blocked` as UNDOCUMENTED, because both
-//! read the **body**.
+//! park only in a comment. `check-stale-blocked` reads such a park as
+//! UNDOCUMENTED (as did the star-liveness pass #11104 removed), because it
+//! reads the **body**.
 //!
 //! This module writes the record those readers look for, **before** each
 //! writer's existing label edit:
