@@ -65,16 +65,13 @@ pub struct QueueSnapshotRow {
     /// Deprecated (#9244): always `false`. Its label was deleted in #11105;
     /// kept on the wire only for compatibility.
     pub urgent: bool,
-    /// Deprecated (#11508): always `false`. The star is no longer an
-    /// ordering key; the row's level is its `keys` entry `level`.
+    /// The issue's priority level (#11510): `default`, `important` or
+    /// `very-important` (the ready-queue row's `level`; a blocked row reads
+    /// its own labels). Absent (an older daemon) reads as `default`.
     #[serde(default)]
-    pub operator_priority: bool,
+    pub level: crate::priority_pick::Level,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
-    /// The `tier:*` label, which is informational only and does not affect
-    /// dispatch order.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tier: Option<String>,
     pub disposition: QueueDisposition,
     /// `running` / `ready` / `blocked`.
     pub state: String,

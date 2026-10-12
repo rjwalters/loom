@@ -78,7 +78,7 @@ impl Forge {
 }
 
 /// A registry whose forge writes are enabled and a [`Forge`] to drive it. The
-/// issue starts open, starred, `loom:issue`, with no dependencies.
+/// issue starts open, `loom:important`, `loom:issue`, with no dependencies.
 fn forge_registry(threshold: u32) -> (SweepRegistry, Forge, tempfile::TempDir) {
     std::env::remove_var("LOOM_REPO");
     let dir = tempdir().unwrap();
@@ -135,7 +135,7 @@ fn forge_registry(threshold: u32) -> (SweepRegistry, Forge, tempfile::TempDir) {
         ..NoopCooldownConfig::default()
     });
     let forge = Forge { ws, log };
-    forge.set_issue(ISSUE, "open", "", &["loom:issue", "loom:operator-priority"]);
+    forge.set_issue(ISSUE, "open", "", &["loom:issue", "loom:important"]);
     (reg, forge, dir)
 }
 
@@ -143,12 +143,12 @@ fn edit_args(forge: &Forge) -> String {
     forge.calls("issue edit").join("\n")
 }
 
-/// The loom-ui#694 shape: a starred issue whose remaining work is a human
+/// The loom-ui#694 shape: a priority issue whose remaining work is a human
 /// gate. Repeated no-ops must produce at most K dispatches, then the operator
 /// park and exactly one comment.
 #[test]
 #[serial]
-fn starred_human_gate_issue_is_parked_after_k_dispatches() {
+fn important_human_gate_issue_is_parked_after_k_dispatches() {
     const K: u32 = 3;
     let (mut reg, forge, _dir) = forge_registry(K);
     let mut dispatches = 0;
@@ -164,7 +164,7 @@ fn starred_human_gate_issue_is_parked_after_k_dispatches() {
     assert!(edit.contains("--add-label loom:operator-only"), "{edit}");
     assert!(edit.contains("--add-label loom:operator-decision"), "{edit}");
     assert!(edit.contains("--remove-label loom:issue"), "{edit}");
-    assert!(!edit.contains("loom:operator-priority"), "the star is never touched: {edit}");
+    assert!(!edit.contains("loom:important"), "the priority label is never touched: {edit}");
     assert!(!edit.contains("loom:building"), "the claim is never touched: {edit}");
     assert_eq!(forge.comments_posted(), 1);
     assert!(forge.comment_bodies()[0].contains("What unparks it"));
@@ -196,13 +196,13 @@ fn each_changed_input_restarts_the_streak() {
     reg.record_noop_release(ISSUE, None);
     assert_eq!(reg.noop_streak_count(ISSUE), 1, "a new comment restarts the streak");
     // A label change.
-    forge.set_issue(ISSUE, "open", "", &["loom:issue", "loom:operator-priority", "x"]);
+    forge.set_issue(ISSUE, "open", "", &["loom:issue", "loom:important", "x"]);
     reg.record_noop_release(ISSUE, None);
     assert_eq!(reg.noop_streak_count(ISSUE), 1, "a label change restarts the streak");
     reg.record_noop_release(ISSUE, None);
     assert_eq!(reg.noop_streak_count(ISSUE), 2);
     // Daemon claim/release flapping alone does not.
-    forge.set_issue(ISSUE, "open", "", &["loom:building", "loom:operator-priority", "x"]);
+    forge.set_issue(ISSUE, "open", "", &["loom:building", "loom:important", "x"]);
     reg.record_noop_release(ISSUE, None);
     assert_eq!(reg.noop_streak_count(ISSUE), 3, "claim churn is not a change");
     assert!(forge.calls("issue edit").len() <= 1);
@@ -270,7 +270,7 @@ fn a_changed_input_releases_an_applied_park_without_a_manual_label_edit() {
     reg.record_noop_release(ISSUE, Some("human gate: operator must approve".into()));
     assert!(reg.noop_hold_applied(ISSUE));
     let parked = [
-        "loom:operator-priority",
+        "loom:important",
         "loom:operator-only",
         "loom:operator-decision",
     ];
@@ -296,14 +296,14 @@ fn a_changed_input_releases_an_applied_park_without_a_manual_label_edit() {
     assert!(lift.contains("--remove-label loom:operator-only"), "{lift}");
     assert!(lift.contains("--remove-label loom:operator-decision"), "{lift}");
     assert!(lift.contains("--add-label loom:issue"), "{lift}");
-    assert!(!lift.contains("loom:operator-priority"), "the star is never touched: {lift}");
+    assert!(!lift.contains("loom:important"), "the priority label is never touched: {lift}");
     assert!(forge
         .comment_bodies()
         .iter()
         .any(|c| c.contains("kind=released")));
 
     // Once lifted, the next no-op is a fresh streak at 1.
-    forge.set_issue(ISSUE, "open", "", &["loom:issue", "loom:operator-priority"]);
+    forge.set_issue(ISSUE, "open", "", &["loom:issue", "loom:important"]);
     reg.record_noop_release(ISSUE, None);
     assert_eq!(reg.noop_streak_count(ISSUE), 1);
 }
@@ -490,7 +490,7 @@ fn loop_kind_is_absent_for_a_first_time_stop() {
 #[test]
 fn parks_are_already_skipped_by_every_candidate_path() {
     // The park is only durable because the work finder applies SKIP_LABELS to
-    // every candidate regardless of `loom:operator-priority`.
+    // every candidate regardless of its priority label.
     for kind in [ParkKind::Blocked, ParkKind::HumanGate] {
         assert!(kind
             .labels()
@@ -563,7 +563,7 @@ fn an_applied_hold_is_released_after_a_daemon_restart() {
     reg.record_noop_release(ISSUE, Some("human gate: operator must approve".into()));
     assert!(reg.noop_hold_applied(ISSUE));
     let parked = [
-        "loom:operator-priority",
+        "loom:important",
         "loom:operator-only",
         "loom:operator-decision",
     ];

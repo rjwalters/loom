@@ -897,3 +897,41 @@ fn no_run_is_not_probed_early_or_while_a_check_runs_and_fails_toward_timeout() {
     assert_eq!(suite_reads(&f), 1);
     assert!(notes.iter().any(|n| n.contains("suite lookup failed")), "{notes:?}");
 }
+
+/// #11097: one push fired two runs of one workflow on the head. The older
+/// twin's red residue is dropped once the newer twin concluded green; with no
+/// workflow-runs answer, nothing is dropped and the wait stays RED.
+#[test]
+fn superseded_twin_run_residue_is_dropped() {
+    let twin = |suite: u64, conclusion: &str| {
+        let mut r = run("Daemon Checks", "completed", Some(conclusion));
+        r["check_suite"] = json!({"id": suite});
+        r
+    };
+    let wrun = |id: u64, suite: u64, conclusion: &str| {
+        json!({"id": id, "workflow_id": 7, "check_suite_id": suite, "event": "pull_request",
+               "head_sha": SHA, "created_at": "2026-10-05T13:32:00Z", "status": "completed",
+               "conclusion": conclusion, "pull_requests": [{"number": 42}]})
+    };
+    let runs_url = format!("repos/o/r/actions/runs?head_sha={SHA}&per_page=100");
+
+    let f = Forge::new();
+    f.runs(SHA, &[twin(1, "failure"), twin(2, "success")]);
+    let o = go(&f, Selector::Pr(42), &opts(0), &mut FakeClock::new());
+    assert!(matches!(o, Outcome::Red { .. }), "{o:?}");
+
+    let f = Forge::new();
+    f.runs(SHA, &[twin(1, "failure"), twin(2, "success")]);
+    f.serve(
+        &runs_url,
+        &json!({"total_count": 2, "workflow_runs": [wrun(100, 1, "failure"), wrun(101, 2, "success")]}),
+    );
+    let o = go(&f, Selector::Pr(42), &opts(0), &mut FakeClock::new());
+    assert_eq!(o, Outcome::Green { sha: SHA.into() });
+
+    // A single suite never pays for the extra read.
+    let f = Forge::new();
+    f.runs(SHA, &[twin(1, "failure")]);
+    go(&f, Selector::Pr(42), &opts(0), &mut FakeClock::new());
+    assert!(!f.calls().iter().any(|c| c.contains("actions/runs")), "{:?}", f.calls());
+}

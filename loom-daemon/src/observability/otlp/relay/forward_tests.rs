@@ -414,3 +414,27 @@ async fn session_churn_through_an_outage_keeps_gap_state_bounded_and_every_loss_
     assert_eq!(aggregated, 1);
     task.abort();
 }
+
+/// Issue #11197: the gap-marker path's `host_only` resource keeps the fleet
+/// provenance keys — a gap marker filed from a host mid-roll still names the
+/// store commit and build revision the rest of that host's records do.
+#[test]
+fn host_only_keeps_the_fleet_provenance_keys() {
+    let resource = Resource {
+        attributes: vec![
+            kv_string("service.name", "claude-code"),
+            kv_string("host.id", "host-fixture"),
+            kv_string("loom.fleet.config_sha", "0123456789abcdef0123456789abcdef01234567"),
+            kv_string("loom.daemon.revision", "0123456789abcdef0123456789abcdef01234567"),
+            kv_string("loom.sweep_id", "sweep-fixture-1"),
+            kv_string("loom.role", "judge"),
+        ],
+        ..Default::default()
+    };
+    let kept = host_only(&resource);
+    let keys: Vec<&str> = kept.attributes.iter().map(|kv| kv.key.as_str()).collect();
+    assert!(keys.contains(&"loom.fleet.config_sha"), "keys: {keys:?}");
+    assert!(keys.contains(&"loom.daemon.revision"), "keys: {keys:?}");
+    assert!(!keys.contains(&"loom.sweep_id"), "session keys must not survive: {keys:?}");
+    assert!(!keys.contains(&"loom.role"), "session keys must not survive: {keys:?}");
+}

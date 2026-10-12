@@ -53,21 +53,16 @@ pub fn has_label(row: &Value, label: &str) -> bool {
     })
 }
 
-/// The row's effective operator priority level (#10307): the highest level
-/// label it carries, own or inherited (0 = unstarred).
-pub fn operator_level(row: &Value) -> u8 {
-    operator_level_in(crate::operator_levels::table(), row)
-}
-
-/// [`operator_level`] against an explicit level `table`.
-pub fn operator_level_in(table: &[crate::operator_levels::PriorityLevel], row: &Value) -> u8 {
+/// The row's priority level (#11103): `loom:very-important`, then
+/// `loom:important`, else default.
+pub fn priority_level(row: &Value) -> crate::priority_pick::Level {
     let labels: Vec<&str> = row["labels"]
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(|l| l.as_str().or_else(|| l["name"].as_str()))
         .collect();
-    crate::operator_levels::level_in(table, &labels)
+    crate::priority_pick::Level::of(&labels)
 }
 
 fn fallback(row: &Value) -> bool {
@@ -164,11 +159,11 @@ pub fn ordered_queue(
         PrRole::Judge => {}
     }
     candidates.sort_by_key(|r| {
-        // Effective level, highest first (#10307): a level-2 row precedes a
-        // plain star, which precedes everything unstarred.
-        let star = std::cmp::Reverse(operator_level(r));
+        // Priority level, highest first (#11103): very important, then
+        // important, then everything else.
+        let level = std::cmp::Reverse(priority_level(r));
         let human = !(prefer && WorkOrigin::trusted_pr(r, trust) == WorkOrigin::Interactive);
-        // Doctor historically applied stars inside each queue. Disabled
+        // Doctor historically applied priority inside each queue. Disabled
         // preference reproduces that ordering exactly.
         let baseline = if role == PrRole::Doctor && !prefer {
             has_label(r, "loom:changes-requested")
@@ -179,7 +174,7 @@ pub fn ordered_queue(
         // by its shape goes behind every labeled row, so it cannot delay
         // enrolled review work. Interactive fallback keeps its preference.
         let shape_only = role == PrRole::Judge && labeled_review && human && fallback(r);
-        (baseline, shape_only, star, human)
+        (baseline, shape_only, level, human)
     });
     for row in &mut candidates {
         let origin = WorkOrigin::trusted_pr(row, trust);
@@ -188,9 +183,9 @@ pub fn ordered_queue(
         } else {
             "workflow"
         };
-        let level = operator_level(row);
-        let reason = if level >= 1 {
-            "operator-priority"
+        let level = priority_level(row);
+        let reason = if level > crate::priority_pick::Level::Default {
+            "priority"
         } else if prefer && origin == WorkOrigin::Interactive {
             "interactive"
         } else {
@@ -199,7 +194,7 @@ pub fn ordered_queue(
         row["origin"] = json!(origin);
         row["mode"] = json!(mode);
         row["priorityReason"] = json!(reason);
-        row["operatorPriorityLevel"] = json!(level);
+        row["priorityLevel"] = json!(level.rank());
     }
     candidates
 }

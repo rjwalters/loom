@@ -110,6 +110,7 @@ pub mod claude_code_telemetry;
 pub mod collector;
 pub mod cycle_guard;
 pub mod daemon_event;
+pub mod daemon_lifecycle;
 pub mod endpoint_policy;
 pub mod exporter;
 pub mod fleet_state;
@@ -117,7 +118,6 @@ pub mod lifecycle;
 pub mod llm_billing;
 pub mod loss_ledger;
 pub mod ops;
-#[cfg(feature = "otlp")]
 pub mod otlp;
 pub mod otlp_health;
 pub mod outcome;
@@ -249,9 +249,8 @@ pub enum ExporterKind {
     /// default, for backward compatibility with every deployment predating
     /// this issue.
     Https,
-    /// OTLP/HTTP+JSON push (`otlp::OtlpExporter`, only compiled in behind the
-    /// `otlp` Cargo feature) — an escape hatch for an existing OpenTelemetry
-    /// stack.
+    /// OTLP/HTTP+JSON push (`otlp::OtlpExporter`, compiled into every build
+    /// since #10700) — an escape hatch for an existing OpenTelemetry stack.
     Otlp,
 }
 
@@ -944,15 +943,6 @@ fn entry_endpoint(
         );
         return Err((Some(endpoint), detail));
     }
-    #[cfg(not(feature = "otlp"))]
-    if entry.kind == ExporterKind::Otlp {
-        return Err((
-            Some(endpoint),
-            "exporter=otlp requested but this daemon build was not compiled \
-                 with the `otlp` Cargo feature"
-                .to_string(),
-        ));
-    }
     // `headers_file` (Issue #10961): refused here, before the ingest key or
     // the headers file itself is read. A no-op for an entry without one.
     if let Err(detail) = request_headers::entry_policy(
@@ -1146,7 +1136,6 @@ pub fn spawn_task(
     // The non-OTLP subset, for the `queue.snapshot` sink (Issue #8852).
     let mut native_queues: Vec<Arc<DurableQueue>> = Vec::new();
     // The OTLP sinks whose senders started, for the agent relay (#10964).
-    #[cfg(feature = "otlp")]
     let mut relay_sinks: Vec<otlp::relay::Sink> = Vec::new();
     for (index, (entry, endpoint)) in planned.iter().enumerate() {
         let name = entry.kind.name();
@@ -1220,7 +1209,6 @@ pub fn spawn_task(
                 // from "checked, and they agree". Better to leave the surface
                 // honestly absent until an OTLP-side identity signal exists to
                 // check against.
-                #[cfg(feature = "otlp")]
                 {
                     // `headers_file` (#10961) is read here, at construction —
                     // a refused file lands in the `Err` arm below as this
@@ -1252,18 +1240,10 @@ pub fn spawn_task(
                         }
                     }
                 }
-                // Unreachable without the feature: the policy pass above
-                // already rejected `Otlp` entries on non-`otlp` builds.
-                #[cfg(not(feature = "otlp"))]
-                {
-                    let _ = (endpoint, ingest_key, batch_size, flush_interval);
-                    unreachable!("otlp entry rejected in the policy pass without the feature")
-                }
             }
         };
         statuses.insert(name.to_string(), export_status);
         if entry.kind == ExporterKind::Otlp {
-            #[cfg(feature = "otlp")]
             relay_sinks.push(otlp::relay::Sink {
                 endpoint: endpoint.clone(),
                 headers_file: entry.headers_file.clone(),
@@ -1305,7 +1285,6 @@ pub fn spawn_task(
     let mut ops_handles = Vec::new();
     // The agent telemetry relay (#10964): opt-in, and only over OTLP sinks
     // that just started — it cannot add or start an exporter either.
-    #[cfg(feature = "otlp")]
     ops_handles.extend(otlp::relay::start(&workspace_root, &host_id, &ingest_key, &relay_sinks));
     // `fleet.state` (#10196): the replay contract's state record, OTLP-only,
     // built after every work-finder tick (#11161) and on the collector's
@@ -1337,6 +1316,12 @@ pub fn spawn_task(
     if let Some(sink) = queue_snapshot::sink_for_native_queues(native_queues, &host_id) {
         queue_snapshot::register_global_sink(sink);
     }
+    // `daemon.start` (#11197): exactly one lifecycle record per process,
+    // offered once the exporters are up — every disabled/under-configured
+    // path above returned before a queue existed, so telemetry-off emits
+    // nothing. Rides the fan-out like any other producer; see
+    // `daemon_lifecycle`'s module doc for the naming contract with #10065.
+    daemon_lifecycle::emit_start(fanout.as_ref(), &host_id);
     // `daemon.event` collection (Issue #8760, G4): a second, independent bus
     // subscription alongside `collector::spawn_task` below — see
     // `daemon_event`'s module doc for why it is a separate subscriber rather

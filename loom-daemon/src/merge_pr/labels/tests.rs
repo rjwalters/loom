@@ -11,7 +11,7 @@ use super::*;
 #[test]
 fn a_clean_approval_is_not_a_contradiction() {
     assert_eq!(contradiction("loom:pr"), None);
-    assert_eq!(contradiction("loom:pr\nloom:operator-priority\ntier:goal-advancing"), None);
+    assert_eq!(contradiction("loom:pr\nloom:important\nenhancement"), None);
 }
 
 #[test]
@@ -40,11 +40,7 @@ fn the_verdict_does_not_depend_on_label_order() {
     // guard that read "whichever came first" could be silently defeated by
     // relabelling — which is exactly the race (#8112) that produced the
     // contradictory state in the first place.
-    let set = [
-        "loom:pr",
-        "loom:changes-requested",
-        "loom:operator-priority",
-    ];
+    let set = ["loom:pr", "loom:changes-requested", "loom:important"];
     // Every permutation of three elements.
     let orders = [
         [0, 1, 2],
@@ -86,7 +82,7 @@ fn a_released_critical_file_hold_merges_while_a_real_rejection_still_blocks() {
     //    `merge-pr.sh <N>` proceeds with no flag and no bypass. (What #9016
     //    fixed is Champion re-adding the label a tick later, not anything in
     //    this function — see the module docs.)
-    assert_eq!(contradiction("loom:pr\ntier:goal-supporting"), None);
+    assert_eq!(contradiction("loom:pr\nenhancement"), None);
     // 3. and the release is scoped to that ONE label: a genuine Judge
     //    rejection or re-review racing an approval still blocks, with or
     //    without `loom:operator` in the set. This is the #8112 property the
@@ -114,7 +110,7 @@ fn a_sequencing_hold_contradicts_an_approval_and_clears_by_label_removal() {
     // 2. the condition lives in a trusted `loom:sequence` marker evaluated by
     //    `merge-pr sequence-eval`; clearing is REMOVING THE LABEL, which is
     //    why this guard's label-set read is the whole gate;
-    assert_eq!(contradiction("loom:pr\ntier:goal-supporting"), None);
+    assert_eq!(contradiction("loom:pr\nenhancement"), None);
     // 3. and it composes with every other blocker: a sequenced PR that ALSO
     //    draws a real rejection still reports the rejection.
     assert_eq!(

@@ -61,8 +61,6 @@ fn ready(repo: &str, issue: u32, rank: u32) -> ReadyItem {
         repo: repo.to_string(),
         issue,
         rank,
-        star: rank == 1,
-        star_at: (rank == 1).then(|| t0() - Duration::hours(2)),
         level: u8::from(rank == 1),
         fleet_priority: 100,
         created_at: Some(t0() - Duration::days(3)),
@@ -142,7 +140,6 @@ fn rows_come_from_the_registry_the_review_listings_and_the_ready_queue() {
     let five = &view.repos[OTHER].rows[&5];
     assert_eq!(five.stage, FleetStage::ReadyWait);
     assert_eq!(five.rank, Some(1));
-    assert!(five.star);
     assert_eq!(five.level, 1);
     assert_eq!(five.fleet_priority, Some(100));
     assert_eq!(five.created_at, Some(t0() - Duration::days(3)));

@@ -451,8 +451,6 @@ fn a_claimed_ready_issue_is_one_fact_across_hosts() {
                     repo: "o/r".to_string(),
                     issue: 7,
                     rank: 1,
-                    star: false,
-                    star_at: None,
                     level: 0,
                     fleet_priority: 0,
                     created_at: None,

@@ -285,7 +285,7 @@ pub fn pr_queue_rows(rows: &[Value]) -> Vec<JournalRow> {
                 name: "pr_queue".to_string(),
                 value: format!(
                     "level={},reason={},origin={},mode={}",
-                    text(&row["operatorPriorityLevel"]),
+                    text(&row["priorityLevel"]),
                     text(&row["priorityReason"]),
                     text(&row["origin"]),
                     text(&row["mode"]),

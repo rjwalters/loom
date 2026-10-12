@@ -3,9 +3,13 @@
 //! file-size ratchet (`scripts/check-file-size-budget.sh`). Content is
 //! unchanged apart from dedenting and the new-module additions.
 
+use opentelemetry_proto::tonic::logs::v1::SeverityNumber;
+use opentelemetry_proto::tonic::resource::v1::Resource;
+
 use super::*;
 
 mod fact_id;
+mod fleet_provenance;
 mod host_name;
 mod loom_kind;
 mod record_id;
@@ -147,6 +151,7 @@ fn sweep_outcome_envelope() -> TelemetryEnvelope {
             tokens_status: None,
             tokens_status_reason: None,
             no_phase_cause: None,
+            phase_tap_usage: Vec::new(),
             attempt_index: None,
             previous_sweep_id: None,
             trigger: None,

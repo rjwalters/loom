@@ -196,7 +196,7 @@ fn run(cmd: LabelsCommand) -> Result<i32> {
 }
 
 fn label_json(l: &loom_daemon::label_registry::Label) -> serde_json::Value {
-    let mut v = serde_json::json!({
+    serde_json::json!({
         "name": l.name, "description": l.description, "color": l.color,
         "kind": l.kind, "applied_by": l.applied_by, "removed_by": l.removed_by,
         "park": l.park, "skip": l.skip, "hold": l.hold,
@@ -206,9 +206,5 @@ fn label_json(l: &loom_daemon::label_registry::Label) -> serde_json::Value {
         "merge_hold": l.merge_hold, "operator_hold": l.operator_hold, "contradicts_approval": l.contradicts_approval,
         "stale_after_minutes": l.stale_after_minutes, "requires_base": l.requires_base,
         "remove_with": l.remove_with, "lifecycle": l.lifecycle,
-    });
-    if let Some(p) = &l.propagate {
-        v["propagate"] = serde_json::to_value(p).unwrap_or_default();
-    }
-    v
+    })
 }

@@ -143,11 +143,7 @@ pub struct CandidateKey<'a> {
 /// 2 very important.
 #[must_use]
 pub fn level_rank(level: Level) -> u64 {
-    match level {
-        Level::Default => 0,
-        Level::Important => 1,
-        Level::VeryImportant => 2,
-    }
+    u64::from(level.rank())
 }
 
 /// The dispatch ordering keys of `c`, in comparator order (Issue #9288):

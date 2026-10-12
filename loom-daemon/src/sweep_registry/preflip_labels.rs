@@ -137,7 +137,7 @@ mod tests {
             vec!["loom:curated"],
             vec!["loom:triage"],
             vec!["loom:curating"],
-            vec!["loom:curated", "tier:goal-supporting"],
+            vec!["loom:curated", "enhancement"],
         ] {
             assert!(
                 matches!(classify(&labels), CollisionClass::NotYetApproved { .. }),
@@ -179,7 +179,7 @@ mod tests {
     /// named, never the incidental ones that shared the snapshot.
     #[test]
     fn claim_labels_in_extracts_only_claim_labels() {
-        let labels: Vec<String> = ["loom:curated", "loom:building", "tier:goal-supporting"]
+        let labels: Vec<String> = ["loom:curated", "loom:building", "enhancement"]
             .iter()
             .map(|s| (*s).to_string())
             .collect();
