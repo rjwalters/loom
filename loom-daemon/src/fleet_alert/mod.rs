@@ -12,9 +12,9 @@
 //! - [`state::AlertState`] (pure, injected clock) turns condition snapshots
 //!   into `Started` / `Reminder` / `Cleared` transitions: debounced, one alert
 //!   per edge, at most one reminder per interval, persisted across restarts.
-//! - [`capacity`] (pure, #10214) adds the host-level capacity asks: disk or
-//!   RAM headroom holding the cap below `maxConcurrent`, and a starred
-//!   backlog more than 3x the cap.
+//! - [`capacity`] (pure, #10214) adds the host-level capacity ask: disk or
+//!   RAM headroom holding the cap below `maxConcurrent` (the starred-backlog
+//!   ask was retired by #11510).
 //! - [`task`] delivers each transition to its sinks: the event bus (relayed
 //!   to Matrix by Safehouse) and, independently, loom-ui's Alerts page
 //!   ([`loom_ui`], #11295). Loom sends no inbox mail (#11087).
@@ -144,7 +144,7 @@ pub fn classify(
         });
     }
 
-    // #10214: a resource-limited cap and an outgrown starred backlog.
+    // #10214: a resource-limited cap.
     if let Some(tick) = &status.last_work_finder_tick {
         out.extend(capacity::conditions(tick));
     }

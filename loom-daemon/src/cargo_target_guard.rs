@@ -54,6 +54,7 @@ use crate::telemetry::trace::{SpanName, SpanRecord, SpanStatus, TraceAttributes,
 
 mod lex;
 use lex::Word;
+pub mod shared;
 
 /// The category toggle (`guards.cargoTargetDir`, default on).
 pub const TOGGLE_KEY: &str = "guards.cargoTargetDir";
@@ -155,6 +156,9 @@ pub struct Context {
     pub main_root: Option<PathBuf>,
     /// Loom-owned dirs outside both: the per-worktree target dir (#8458).
     pub owned: Vec<PathBuf>,
+    /// cargo's configured `build.target-dir` for `cwd`, computed only in a
+    /// Loom-managed worktree ([`shared`], #10646).
+    pub configured: Option<shared::Configured>,
 }
 
 impl Context {
@@ -174,9 +178,11 @@ impl Context {
         if let Some(wt) = &worktree {
             owned.extend(crate::worktree_ops::cargo_target::per_worktree::marker_value(wt));
         }
+        let home = env_path("HOME");
         Self {
             cwd: cwd.to_path_buf(),
-            home: env_path("HOME"),
+            configured: shared::for_process(cwd, worktree.as_deref(), home.as_deref()),
+            home,
             tmpdir: env_path("TMPDIR"),
             inherited: std::env::var(CTD).ok().filter(|v| !v.is_empty()),
             worktree,
@@ -204,6 +210,7 @@ impl Context {
         }
         Self {
             cwd: cwd.to_path_buf(),
+            configured: shared::for_process(cwd, worktree.as_deref(), self.home.as_deref()),
             worktree,
             main_root,
             owned,
@@ -275,21 +282,53 @@ pub fn check(command: &str, ctx: &Context, toggle: impl FnOnce() -> bool) -> Opt
     toggle().then_some(denial)
 }
 
-/// [`check`] against the process environment and config, for `cwd`.
+/// The hook's verdict on one command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    Deny(Denial),
+    /// `loom:cargo-shared-target` (#10646): the build falls through to a
+    /// shared `build.target-dir`.
+    Ask(shared::SharedAsk),
+}
+
+/// The deny (when its toggle is on), else the shared-target ask (when its
+/// toggle is on). Each toggle is read only once its verdict is about to fire.
 #[must_use]
-pub fn check_process(command: &str, cwd: &Path) -> Option<Denial> {
+pub fn check_all(
+    command: &str,
+    ctx: &Context,
+    toggle: impl Fn(&str, &str) -> bool,
+) -> Option<Verdict> {
+    let (denial, ask) = evaluate_all(command, ctx);
+    if let Some(d) = denial.filter(|_| toggle(TOGGLE_KEY, TOGGLE_ENV)) {
+        return Some(Verdict::Deny(d));
+    }
+    ask.filter(|_| toggle(shared::TOGGLE_KEY, shared::TOGGLE_ENV))
+        .map(Verdict::Ask)
+}
+
+/// [`check_all`] against the process environment and config, for `cwd`.
+#[must_use]
+pub fn check_process(command: &str, cwd: &Path) -> Option<Verdict> {
     let ctx = Context::from_process(cwd);
     let config_root = ctx.main_root.clone().unwrap_or_else(|| cwd.to_path_buf());
-    check(command, &ctx, || {
-        let env = std::env::var(TOGGLE_ENV).ok();
+    check_all(command, &ctx, |key, env_key| {
+        let env = std::env::var(env_key).ok();
         let config = crate::config_resolver::resolve_effective_config(&config_root);
-        toggle_enabled(env.as_deref(), crate::config_resolver::get_path(&config, TOGGLE_KEY))
+        toggle_enabled(env.as_deref(), crate::config_resolver::get_path(&config, key))
     })
 }
 
 /// The first build in `command` whose target dir is under a forbidden root.
 #[must_use]
 pub fn evaluate(command: &str, ctx: &Context) -> Option<Denial> {
+    evaluate_all(command, ctx).0
+}
+
+/// [`evaluate`], plus the first build with no explicit target dir that would
+/// fall through to a shared `build.target-dir` ([`shared::judge`]).
+#[must_use]
+pub fn evaluate_all(command: &str, ctx: &Context) -> (Option<Denial>, Option<shared::SharedAsk>) {
     let mut vars: HashMap<String, String> = HashMap::new();
     for (k, v) in [("HOME", &ctx.home), ("TMPDIR", &ctx.tmpdir)] {
         if let Some(v) = v {
@@ -303,8 +342,10 @@ pub fn evaluate(command: &str, ctx: &Context) -> Option<Denial> {
         vars,
         ctd: ctx.inherited.clone().map(|v| (Some(v), Source::Inherited)),
         cwd: Some(ctx.cwd.clone()),
+        ask: None,
     };
-    st.eval_text(command, ctx, 0)
+    let denial = st.eval_text(command, ctx, 0);
+    (denial, st.ask)
 }
 
 /// `Some(None)` = set to something unresolvable.
@@ -314,6 +355,8 @@ struct State {
     vars: HashMap<String, String>,
     ctd: Ctd,
     cwd: Option<PathBuf>,
+    /// The first shared-target ask seen (#10646).
+    ask: Option<shared::SharedAsk>,
 }
 
 const KEYWORDS: &[&str] = &[
@@ -437,8 +480,11 @@ impl State {
                     vars: self.vars.clone(),
                     ctd,
                     cwd: self.cwd.clone(),
+                    ask: None,
                 };
-                sub.eval_text(&script, ctx, depth + 1)
+                let denial = sub.eval_text(&script, ctx, depth + 1);
+                self.ask = self.ask.take().or(sub.ask);
+                denial
             }
             "cargo" => self.cargo(args, ctd, ctx),
             "make" | "gmake" => {
@@ -493,7 +539,7 @@ impl State {
         self.exec(args.get(j..)?, ctd, ctx, depth)
     }
 
-    fn cargo(&self, args: &[Word], ctd: Ctd, ctx: &Context) -> Option<Denial> {
+    fn cargo(&mut self, args: &[Word], ctd: Ctd, ctx: &Context) -> Option<Denial> {
         let mut i = 0;
         while let Some(w) = args.get(i) {
             let t = w.text.as_str();
@@ -530,6 +576,16 @@ impl State {
             Some(v) => Some((v, Source::TargetDirFlag)),
             None => ctd,
         };
+        if effective.is_none() && self.ask.is_none() {
+            // No explicit target dir anywhere: cargo's config decides (#10646).
+            // An unknown `cd` target leaves nothing to judge; a `cd` out of
+            // this worktree is judged from where it lands.
+            self.ask = self.cwd.as_ref().and_then(|c| {
+                let moved = ctx.worktree.as_ref().is_none_or(|w| !under(&forms(c), w));
+                let here = moved.then(|| ctx.at(c));
+                shared::judge(here.as_ref().unwrap_or(ctx))
+            });
+        }
         self.judge(effective, ctx)
     }
 

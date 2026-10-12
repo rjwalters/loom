@@ -165,8 +165,7 @@ fn a_busy_tick_splits_into_bounded_chunks_and_reassembles_exactly() {
             c.repo = "some-organisation/some-repository".to_string();
             c.sort_key = Some(PickSortKey {
                 name: "candidate_cmp".to_string(),
-                value: "level=2,reason=operator-priority,origin=interactive,mode=workflow"
-                    .to_string(),
+                value: "level=2,reason=priority,origin=interactive,mode=workflow".to_string(),
             });
             let verdict = if n % 2 == 0 {
                 PickVerdict::Acted("dispatched")

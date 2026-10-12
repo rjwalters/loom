@@ -1,6 +1,6 @@
-//! The OTLP `Resource` that describes the emitting daemon host (#10977,
-//! #11197). Extracted from `mapping.rs` when it grew past the file-size
-//! ratchet — every signal's resource is built here, and here only.
+//! The OTLP `Resource` describing the emitting daemon host — one constructor
+//! shared by the logs and metrics request builders here, the traces builder,
+//! and the relay's re-attachment path.
 
 use opentelemetry_proto::tonic::resource::v1::Resource;
 
@@ -11,10 +11,9 @@ use super::kv_string;
 
 /// A `Resource` describing the emitting daemon host. `service.version` is
 /// always present: a record-supplied `daemon_version` (from a `host.health`
-/// record, threaded in by [`build_metrics_request`](super::build_metrics_request))
-/// wins; otherwise — traces, logs, and metrics batches without `host.health`
-/// — it falls back to the exporting build's own `CARGO_PKG_VERSION`
-/// (Issue #9028).
+/// record, threaded in by `build_metrics_request`) wins; otherwise — traces,
+/// logs, and metrics batches without `host.health` — it falls back to the
+/// exporting build's own `CARGO_PKG_VERSION` (Issue #9028).
 ///
 /// `host.name` (Issue #10977) has one source: the envelope's `host_id`, the
 /// same string as `host.id` and `service.instance.id`. For a daemon that is

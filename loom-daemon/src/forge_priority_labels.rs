@@ -1,12 +1,14 @@
 //! `loom-daemon forge priority-labels` (#10518): the priority labels a new PR
 //! inherits from the issues its body closes.
 //!
-//! A PR that closes a starred issue carries the star (`loom:operator-priority`,
-//! or a higher level, #9244/#10307). That copy used to be a prompt instruction
-//! only, and two thirds of the PRs closing a starred issue opened without it
-//! (66% across the fleet, 2026-10-03..06; 94% on the default-model launch
-//! path). `create-pr.sh` and the daemon's recovery PR now ask this module
-//! instead, so the PR is correct from its first second.
+//! A PR that closes a priority issue carries its level label
+//! (`loom:important` / `loom:very-important`, #11103), so the PR queue and
+//! the merge sequence order it by the same level (#11510; until then the
+//! retired operator-star labels were copied). The copy used to be a prompt
+//! instruction only, and two thirds of the PRs closing a starred issue opened
+//! without it (66% across the fleet, 2026-10-03..06; 94% on the
+//! default-model launch path). `create-pr.sh` and the daemon's recovery PR
+//! ask this module instead, so the PR is correct from its first second.
 //!
 //! # What is copied, from which issues
 //!
@@ -15,9 +17,10 @@
 //!   `Loom-Issue: owner/repo#N` trailer naming *this* repo — unless the body
 //!   declares that issue `Part of #N`/`Contributes to #N`. A partial increment
 //!   copies nothing: the trailer is additive and rides on partial PRs too.
-//! - **Labels**: each label of the level table ([`crate::operator_levels`])
-//!   the issue carries — operator and inherited labels alike, ascending by
-//!   level; the union over every issue, deduplicated. Nothing else.
+//! - **Labels**: each priority label ([`PRIORITY_LABELS`]) the issue
+//!   carries, ascending by level; the union over every issue, deduplicated.
+//!   Nothing else. A PR's labels never count toward the very-important cap,
+//!   which reads issues only (#11509).
 //!
 //! # Fail open
 //!
@@ -39,7 +42,10 @@ use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
 use crate::merge_pr::refs::{
     closing_refs, has_unnegated_closing_ref, loom_issue_trailer_refs, partial_increment_refs,
 };
-use crate::operator_levels::{self, PriorityLevel};
+use crate::priority_pick::{IMPORTANT_LABEL, VERY_IMPORTANT_LABEL};
+
+/// The labels a PR inherits, ascending by level.
+pub const PRIORITY_LABELS: [&str; 2] = [IMPORTANT_LABEL, VERY_IMPORTANT_LABEL];
 
 /// The issues a PR body inherits priority labels from, ascending.
 ///
@@ -66,11 +72,10 @@ pub fn source_issues(body: &str, repo: Option<&str>) -> Vec<u32> {
         .collect()
 }
 
-/// The level-table labels among `labels`, in table order (ascending level,
-/// operator label before inherited label).
+/// The [`PRIORITY_LABELS`] among `labels`, ascending by level.
 #[must_use]
-pub fn priority_labels_in<S: AsRef<str>>(table: &[PriorityLevel], labels: &[S]) -> Vec<String> {
-    operator_levels::starred_labels(table)
+pub fn priority_labels_in<S: AsRef<str>>(labels: &[S]) -> Vec<String> {
+    PRIORITY_LABELS
         .into_iter()
         .filter(|p| labels.iter().any(|l| l.as_ref() == *p))
         .map(str::to_string)
@@ -80,7 +85,7 @@ pub fn priority_labels_in<S: AsRef<str>>(table: &[PriorityLevel], labels: &[S]) 
 /// What the lookups over a set of issues produced.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Outcome {
-    /// The union of every issue's priority labels, in table order.
+    /// The union of every issue's priority labels, ascending by level.
     pub labels: Vec<String>,
     /// Each issue that contributed at least one label, with its labels.
     pub sources: Vec<(u32, Vec<String>)>,
@@ -90,7 +95,6 @@ pub struct Outcome {
 
 /// Read each issue's labels through `fetch` and fold them into an [`Outcome`].
 pub fn collect(
-    table: &[PriorityLevel],
     issues: &[u32],
     mut fetch: impl FnMut(u32) -> Result<Vec<String>, String>,
 ) -> Outcome {
@@ -99,7 +103,7 @@ pub fn collect(
     for &issue in issues {
         match fetch(issue) {
             Ok(labels) => {
-                let found = priority_labels_in(table, &labels);
+                let found = priority_labels_in(&labels);
                 if !found.is_empty() {
                     seen.extend(found.iter().cloned());
                     out.sources.push((issue, found));
@@ -108,7 +112,7 @@ pub fn collect(
             Err(e) => out.failed.push((issue, e)),
         }
     }
-    out.labels = operator_levels::starred_labels(table)
+    out.labels = PRIORITY_LABELS
         .into_iter()
         .filter(|l| seen.contains(*l))
         .map(str::to_string)
@@ -126,8 +130,8 @@ pub fn warning(issue: u32, reason: &str) -> String {
     let reason: String = reason.trim().chars().take(200).collect();
     format!(
         "WARNING: could not read issue #{issue}'s labels ({reason}) -- its priority labels \
-         (the operator star) were NOT checked or copied onto this PR; if #{issue} is starred, \
-         add the star to the PR by hand (#10518)"
+         (loom:important / loom:very-important) were NOT checked or copied onto this PR; if \
+         #{issue} carries one, add it to the PR by hand (#10518)"
     )
 }
 
@@ -165,11 +169,9 @@ fn ambient_repo(root: &Path) -> Option<String> {
 /// Read `issues`' labels in `repo` (unresolvable: every lookup fails open).
 fn collect_live(root: &Path, repo: Option<&str>, issues: &[u32]) -> Outcome {
     let Some(slug) = repo else {
-        return collect(operator_levels::table(), issues, |_| {
-            Err("cannot resolve owner/repo".to_string())
-        });
+        return collect(issues, |_| Err("cannot resolve owner/repo".to_string()));
     };
-    collect(operator_levels::table(), issues, |n| fetch_labels(root, slug, n))
+    collect(issues, |n| fetch_labels(root, slug, n))
 }
 
 /// Everything a PR body inherits, read live. `repo` is the PR's `owner/repo`;
@@ -257,11 +259,9 @@ pub fn cli_entrypoint(args: PriorityLabelsArgs) -> anyhow::Result<()> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::operator_levels::LEVELS;
 
-    const STAR: &str = "loom:operator-priority";
-    const HIGH: &str = "loom:operator-high-priority";
-    const INH: &str = "loom:high-priority-inherited";
+    const IMP: &str = IMPORTANT_LABEL;
+    const VERY: &str = VERY_IMPORTANT_LABEL;
 
     fn labels(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| (*s).to_string()).collect()
@@ -287,36 +287,36 @@ mod tests {
     }
 
     #[test]
-    fn only_level_labels_are_copied_in_table_order() {
-        let got = priority_labels_in(LEVELS, &["loom:issue", INH, STAR, "loom:operator-only"]);
-        assert_eq!(got, labels(&[STAR, INH]));
-        assert!(priority_labels_in(LEVELS, &["loom:building"]).is_empty());
+    fn only_priority_labels_are_copied_in_level_order() {
+        let got = priority_labels_in(&["loom:issue", VERY, IMP, "loom:operator-only"]);
+        assert_eq!(got, labels(&[IMP, VERY]));
+        assert!(priority_labels_in(&["loom:building"]).is_empty());
     }
 
     #[test]
-    fn the_union_over_issues_is_deduplicated_and_unstarred_issues_add_nothing() {
-        let o = collect(LEVELS, &[1, 2, 3], |n| {
+    fn the_union_over_issues_is_deduplicated_and_default_issues_add_nothing() {
+        let o = collect(&[1, 2, 3], |n| {
             Ok(match n {
-                1 => labels(&[STAR]),
+                1 => labels(&[IMP]),
                 2 => labels(&["loom:issue"]),
-                _ => labels(&[HIGH, STAR]),
+                _ => labels(&[VERY, IMP]),
             })
         });
-        assert_eq!(o.labels, labels(&[STAR, HIGH]));
-        assert_eq!(o.sources, vec![(1, labels(&[STAR])), (3, labels(&[STAR, HIGH]))]);
+        assert_eq!(o.labels, labels(&[IMP, VERY]));
+        assert_eq!(o.sources, vec![(1, labels(&[IMP])), (3, labels(&[IMP, VERY]))]);
         assert!(o.failed.is_empty());
     }
 
     #[test]
     fn a_failed_lookup_fails_open_and_names_the_issue() {
-        let o = collect(LEVELS, &[4, 5], |n| {
+        let o = collect(&[4, 5], |n| {
             if n == 4 {
                 Err("HTTP 502: Bad Gateway\nmore".into())
             } else {
-                Ok(labels(&[STAR]))
+                Ok(labels(&[IMP]))
             }
         });
-        assert_eq!(o.labels, labels(&[STAR]), "the other issue still counts");
+        assert_eq!(o.labels, labels(&[IMP]), "the other issue still counts");
         assert_eq!(o.failed.len(), 1);
         let w = warning(o.failed[0].0, &o.failed[0].1);
         assert!(

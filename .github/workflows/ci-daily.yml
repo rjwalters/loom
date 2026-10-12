@@ -102,14 +102,9 @@ jobs:
         # The one place the full cross-test interaction surface exists. Under
         # ci.yml's `--partition count:k/3` two tests that collide can never
         # land in the same process tree, so the collision is unobservable.
+        # Since #10700 the OTLP exporter is compiled unconditionally, so this
+        # run already covers what a separate `--features otlp` run did.
         run: cargo nextest run --workspace --profile ci
-      - name: nextest, loom-daemon with --features otlp, UNPARTITIONED
-        if: ${{ !cancelled() }}
-        # `otlp` is not purely additive (three tests are `cfg(not(feature =
-        # "otlp"))`), so neither this nor the default-feature run subsumes the
-        # other. `--workspace --features otlp` is not a thing in a virtual
-        # workspace where only one member declares the feature.
-        run: cargo nextest run --package loom-daemon --features otlp --profile ci
       - name: nextest, whole workspace, --all-features
         if: ${{ !cancelled() }}
         run: cargo nextest run --workspace --all-features --profile ci

@@ -4,7 +4,7 @@
 //! arrived (#9321):
 //!
 //! - [`event_to_envelope`] — the frozen bus taxonomy's 1:1 mapping.
-//! - [`operator_priority_envelope`] — the operator-priority escalation line.
+//! - [`operator_priority_envelope`] — the `operator_priority.escalation` line.
 //!
 //! Neither touches the socket, the config or the clock: [`super::run_sink`]
 //! owns routing, dedupe and delivery. Keeping them here means an agent editing

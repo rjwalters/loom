@@ -785,7 +785,6 @@ async fn spawn_task_disabled_emits_no_daemon_start() {
     );
 }
 
-#[cfg(feature = "otlp")]
 #[tokio::test]
 #[serial]
 async fn spawn_task_two_exporters_spawns_collector_plus_two_senders() {
@@ -831,82 +830,6 @@ async fn spawn_task_two_exporters_spawns_collector_plus_two_senders() {
     }
 }
 
-/// Without the `otlp` Cargo feature the otlp ENTRY degrades to its own
-/// `misconfigured` status while the https exporter still runs (#8756):
-/// one bad sink must not take the healthy one down with it.
-#[cfg(not(feature = "otlp"))]
-#[tokio::test]
-#[serial]
-async fn spawn_task_two_exporters_isolate_the_unbuildable_kind() {
-    clear_env();
-    let bus = EventBus::new();
-    let dir = tempdir().unwrap();
-    let key_path = dir.path().join("ingest.key");
-    std::fs::write(&key_path, "s3cr3t\n").unwrap();
-    let config = ObservabilityConfig {
-        enabled: Some(true),
-        endpoint: Some(SAFE_TEST_ENDPOINT.to_string()),
-        ingest_key_file: Some(key_path.to_string_lossy().to_string()),
-        exporters: Some(vec![raw("https", None), raw("otlp", None)]),
-        flush_interval_secs: Some(3600),
-        ..Default::default()
-    };
-    let handles =
-        spawn_task(&config, dir.path().to_path_buf(), &bus, Instant::now(), test_workspace_pool())
-            .expect("the https exporter is fully configured and must still run");
-    // Issue #8760: `daemon_event::spawn_task` adds one more handle. No OTLP
-    // sink started, so no OTLP ops tasks (the ETA tasks are gone, #11098).
-    assert_eq!(handles.len(), 3, "collector + daemon_event + only the https sender");
-    let statuses = global_export_statuses();
-    assert_eq!(
-        statuses["otlp"].state,
-        crate::types::ObservabilityExportState::Misconfigured,
-        "the otlp entry reports its own misconfiguration"
-    );
-    assert_eq!(
-        statuses["https"].exporter.as_deref(),
-        Some("https"),
-        "the https entry started normally"
-    );
-    for handle in handles {
-        handle.abort();
-    }
-}
-
-/// `exporter=otlp` in a build that does NOT have the `otlp` Cargo
-/// feature compiled in must register a `Misconfigured` status (Issue
-/// #5337) and return `None` (never panic, never silently fall back to
-/// the HTTPS sink the operator did not ask for). Sticks to the
-/// pre-existing `handles.is_none()` contract — same as the other three
-/// under-configured `spawn_task` tests above — for the OnceLock reason
-/// documented on `export_status_misconfigured_reports_a_distinct_sticky_state`.
-/// Reject before starting collectors or doing queue IO.
-#[cfg(not(feature = "otlp"))]
-#[tokio::test]
-#[serial]
-async fn spawn_task_otlp_requested_without_the_feature_returns_none() {
-    clear_env();
-    let bus = EventBus::new();
-    let dir = tempdir().unwrap();
-    let key_path = dir.path().join("ingest.key");
-    std::fs::write(&key_path, "s3cr3t\n").unwrap();
-    let config = ObservabilityConfig {
-        enabled: Some(true),
-        endpoint: Some(SAFE_TEST_ENDPOINT.to_string()),
-        ingest_key_file: Some(key_path.to_string_lossy().to_string()),
-        exporter: Some("otlp".to_string()),
-        ..Default::default()
-    };
-    let handles =
-        spawn_task(&config, dir.path().to_path_buf(), &bus, Instant::now(), test_workspace_pool());
-    assert!(handles.is_none());
-    assert_eq!(bus.receiver_count(), 0);
-    assert!(!dir
-        .path()
-        .join(".loom/logs/observability-queue.jsonl")
-        .exists());
-}
-
 #[tokio::test]
 #[serial]
 async fn malformed_otlp_configuration_has_no_collector_or_queue_activity() {
@@ -942,12 +865,11 @@ async fn malformed_otlp_configuration_has_no_collector_or_queue_activity() {
     }
 }
 
-/// The `otlp`-feature counterpart of
+/// The OTLP counterpart of
 /// `spawn_task_fully_configured_spawns_three_tasks`: `exporter=otlp`
-/// with the feature compiled in spawns the same collector+daemon_event+sender
+/// spawns the same collector+daemon_event+sender
 /// trio, just wired to `otlp::OtlpExporter` instead of `HttpsExporter`, plus
 /// the three OTLP ops-sink tasks.
-#[cfg(feature = "otlp")]
 #[tokio::test]
 #[serial]
 async fn spawn_task_otlp_exporter_spawns_trio_plus_ops_tasks() {

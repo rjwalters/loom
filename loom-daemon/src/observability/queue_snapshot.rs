@@ -127,9 +127,8 @@ pub fn build_record(
             issue: row.issue,
             workspace_priority: row.workspace_priority,
             urgent: false,
-            operator_priority: row.operator_priority,
+            level: row.level,
             created_at: row.created_at.clone(),
-            tier: row.tier.clone(),
             disposition: row.disposition,
             state: row.disposition.state().to_string(),
             reason: cause

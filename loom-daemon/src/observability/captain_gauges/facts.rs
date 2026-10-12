@@ -4,7 +4,7 @@
 //!
 //! | job | the captain reads | a dispatcher stops reading |
 //! |---|---|---|
-//! | `star-facts` | each operator label's open listing, per repo (caller `star_facts`; inert since #11104 removed the liveness pass) | nothing any more |
+//! | `star-facts` | each priority label's open listing, per repo (caller `star_facts`; inert since #11104 removed the liveness pass, retired by #11579) | nothing any more |
 //! | `queue-blocked` | the open `loom:blocked` listing, per repo (caller `queue_blocked`) | the same listing, for every covered repo |
 //!
 //! The reads are recorded under the callers they replace, so
@@ -79,10 +79,10 @@ pub fn star_free(job: &JobFacts, labels: &[&str]) -> HashMap<String, DateTime<Ut
         .collect()
 }
 
-/// Whether a label name may be published: Loom's own vocabulary and the tier
-/// labels, which is everything a snapshot row is derived from.
+/// Whether a label name may be published: Loom's own vocabulary, which is
+/// everything a snapshot row is derived from.
 fn publishable(label: &str) -> bool {
-    label.starts_with("loom:") || label.starts_with("tier:")
+    label.starts_with("loom:")
 }
 
 /// One repo's `loom:blocked` listing reduced to what its snapshot rows need.
@@ -269,7 +269,11 @@ pub(super) async fn produce(
     if !config.star_facts && !config.queue_blocked {
         return;
     }
-    let labels = crate::operator_levels::operator_labels(crate::operator_levels::table());
+    // The two priority labels (#11103); the job itself is inert (#11579).
+    let labels = [
+        crate::priority_pick::IMPORTANT_LABEL,
+        crate::priority_pick::VERY_IMPORTANT_LABEL,
+    ];
     let mut targets = Vec::new();
     for root in crate::observability::collector::provisioned_roots(workspace_pool) {
         let root_str = root.to_string_lossy().to_string();

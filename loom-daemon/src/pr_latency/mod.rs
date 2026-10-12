@@ -113,9 +113,8 @@ static HOLD_SET: crate::label_registry::LabelSet =
 /// Every operator-gate / park label present, for the detail column.
 ///
 /// Derived (#10013): exactly the registry's `hold` labels. No name-prefix
-/// match, so a priority label that shares the `loom:operator-` prefix
-/// (`loom:operator-priority` #9244, `loom:operator-high-priority` #10307) is
-/// never a hold, and a new label cannot silently join the set.
+/// match, so a label that merely shares the `loom:operator-` prefix is never
+/// a hold, and a new label cannot silently join the set.
 pub fn hold_labels<S: AsRef<str>>(labels: &[S]) -> Vec<String> {
     labels
         .iter()
@@ -166,15 +165,14 @@ mod tests {
     }
 
     #[test]
-    fn a_starred_pr_is_not_held() {
-        // #9244: `loom:operator-priority` shares the `loom:operator-` prefix
-        // but is a priority signal, never a hold.
-        assert!(hold_labels(&["loom:pr", "loom:operator-priority"]).is_empty());
-        assert!(hold_labels(&["loom:operator-high-priority"]).is_empty(), "#10307");
-        assert!(!is_operator_gated(&["loom:pr", "loom:operator-priority"]));
-        assert!(!is_parked(&["loom:operator-priority"]));
+    fn a_priority_pr_is_not_held() {
+        // A priority label is an ordering signal, never a hold (#11103).
+        assert!(hold_labels(&["loom:pr", "loom:important"]).is_empty());
+        assert!(hold_labels(&["loom:very-important"]).is_empty());
+        assert!(!is_operator_gated(&["loom:pr", "loom:important"]));
+        assert!(!is_parked(&["loom:very-important"]));
         assert_eq!(
-            hold_labels(&["loom:operator-priority", "loom:operator-blocked"]),
+            hold_labels(&["loom:important", "loom:operator-blocked"]),
             vec!["loom:operator-blocked".to_string()]
         );
     }

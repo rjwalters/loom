@@ -28,13 +28,11 @@ fn listed_row() -> FleetStateRow {
 }
 
 /// A realistic `ready_wait` row: rank and every ranking input, worst case
-/// (starred, dated, level 2).
+/// (dated, level 2).
 fn ready_row(issue: u32, rank: u32) -> FleetStateRow {
     FleetStateRow {
         entered_at_lower_bound: true,
         rank: Some(rank),
-        star: true,
-        star_at: Some(at(9, 30)),
         level: 2,
         fleet_priority: Some(100),
         created_at: Some(at(8, 0) - Duration::days(30)),
@@ -217,7 +215,8 @@ fn a_listed_row_omits_host_and_slot_and_flags_a_lower_bound_entry() {
 }
 
 /// A `ready_wait` row carries this host's planner rank and the planner's
-/// inputs: star, starred-at, level, fleet priority and the age instant.
+/// inputs: level, fleet priority and the age instant (no retired `star` /
+/// `star_at`, #11510).
 #[test]
 fn a_ready_row_carries_rank_and_the_planner_inputs() {
     let wire = serde_json::to_value(ready_row(7, 3)).unwrap();
@@ -231,9 +230,7 @@ fn a_ready_row_carries_rank_and_the_planner_inputs() {
             "issue",
             "level",
             "rank",
-            "stage",
-            "star",
-            "star_at"
+            "stage"
         ]
     );
     assert_eq!(wire["stage"], "ready_wait");

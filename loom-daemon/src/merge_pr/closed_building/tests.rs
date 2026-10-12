@@ -55,7 +55,7 @@ fn t5_other_labels_do_not_change_the_decision() {
     // decision is all this side owns: it must still be Strip.
     assert_eq!(
         plan_for(
-            r#"{"state":"closed","labels":[{"name":"loom:building"},{"name":"tier:maintenance"}]}"#
+            r#"{"state":"closed","labels":[{"name":"loom:building"},{"name":"enhancement"}]}"#
         ),
         Plan::Strip
     );

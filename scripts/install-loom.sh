@@ -1358,17 +1358,17 @@ cd "$LOOM_ROOT"
 # from a genuine compile failure (exit 1), so this wrapper can report a
 # different, non-misleading top-level message for each (issue #5922) instead
 # of always claiming "Failed to build" when the build itself actually succeeded.
-# (Temporarily disable errexit so a nonzero exit doesn't abort before we can
-# branch on the specific status code.)
-set +e
-TARGET_DIR=$("$LOOM_ROOT/scripts/daemon-build.sh")
-DAEMON_BUILD_STATUS=$?
-set -e
-if [ "$DAEMON_BUILD_STATUS" -eq 3 ]; then
-  error "loom-daemon built successfully, but the binary was not found at the resolved Cargo target directory (see details above) — check build.target-dir / CARGO_TARGET_DIR"
-elif [ "$DAEMON_BUILD_STATUS" -ne 0 ]; then
-  error "Failed to build loom-daemon"
-fi
+# Exit 4 (#10700) means the build produced a binary whose
+# `telemetry-capabilities --require-otlp` probe failed — it cannot export
+# OTLP, so it must never be provisioned. (The `||` keeps errexit from aborting
+# before we can branch on the specific status code.)
+TARGET_DIR=$("$LOOM_ROOT/scripts/daemon-build.sh") && DAEMON_BUILD_STATUS=0 || DAEMON_BUILD_STATUS=$?
+case "$DAEMON_BUILD_STATUS" in
+  0) ;;
+  3) error "loom-daemon built successfully, but the binary was not found at the resolved Cargo target directory (see details above) — check build.target-dir / CARGO_TARGET_DIR" ;;
+  4) error "loom-daemon built, but the binary cannot export OTLP (telemetry-capabilities --require-otlp failed, see details above) — refusing to provision it (#10700)" ;;
+  *) error "Failed to build loom-daemon" ;;
+esac
 
 success "loom-daemon binary ready"
 

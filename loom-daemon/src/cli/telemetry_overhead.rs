@@ -28,11 +28,6 @@ pub(crate) struct OverheadArgs {
 
 impl OverheadArgs {
     pub(crate) fn run(self) -> Result<()> {
-        anyhow::ensure!(
-            cfg!(feature = "otlp"),
-            "this binary was built without the otlp feature, so nothing is \
-             instrumented and there is no overhead to measure"
-        );
         let reference = match self.reference_workspace {
             Some(path) => path,
             None => std::env::current_dir().context("resolving the reference workspace")?,

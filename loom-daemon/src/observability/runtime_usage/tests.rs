@@ -527,7 +527,7 @@ fn role_entry(role: &str, started: i64, ended: Option<i64>) -> JoinEntry {
 /// anywhere — produces a `loom.runtime.usage` span and a `session.summary`
 /// record that share one trace id. Fixture transcript, real trace store, real
 /// ingest pass, real usage journalling; the only thing stood in for is the
-/// enablement check (`tracing::enabled` is `cfg!(feature = "otlp")`-gated), so
+/// enablement check (`tracing::enabled` reads the workspace config), so
 /// the test calls the same functions the wired path calls, one layer in.
 #[test]
 fn a_traced_role_ticks_session_summary_and_usage_span_share_one_trace_id() {

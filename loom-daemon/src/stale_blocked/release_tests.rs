@@ -489,11 +489,11 @@ fn superseded_pr_is_skipped() {
 }
 
 #[test]
-fn operator_labels_are_holds_but_the_star_is_not() {
+fn operator_labels_are_holds_but_a_priority_label_is_not() {
     let mut w = World::new();
     w.parked(10, false, &[1], &["loom:operator-only", "loom:operator-decision"]);
     w.parked(11, false, &[1], &["loom:operator"]);
-    w.parked(12, false, &[1], &["loom:operator-priority"]);
+    w.parked(12, false, &[1], &["loom:important"]);
     w.state(1, "CLOSED", false);
     let r = w.run();
     assert_eq!(skipped(&r, "operator-hold"), 2);

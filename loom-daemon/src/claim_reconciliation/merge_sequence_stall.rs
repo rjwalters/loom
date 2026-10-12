@@ -77,11 +77,11 @@ pub fn stall_hours() -> f64 {
         .unwrap_or(DEFAULT_STALL_HOURS)
 }
 
-/// Is this PR starred (`loom:operator-priority`, or any higher level,
-/// #10307)?
+/// The PR's priority level (`loom:important` / `loom:very-important`,
+/// #11103), from its own labels.
 #[must_use]
-pub fn starred(pr: &SequencePr) -> bool {
-    crate::operator_levels::is_starred(&pr.labels)
+pub fn level(pr: &SequencePr) -> crate::priority_pick::Level {
+    crate::priority_pick::Level::of(&pr.labels)
 }
 
 /// Why a chain head is stalled.

@@ -35,7 +35,7 @@
 
 use std::cmp::Ordering;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// The "important" label.
 pub const IMPORTANT_LABEL: &str = "loom:important";
@@ -48,6 +48,8 @@ pub const VERY_IMPORTANT_LABEL: &str = "loom:very-important";
 pub const VERY_IMPORTANT_CAP: usize = 1;
 
 /// An issue's priority level. Declaration order is ascending importance.
+/// On the wire (status, queue snapshot, fleet state) it is `default` /
+/// `important` / `very-important`; an unknown value reads as `default`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Level {
@@ -74,6 +76,46 @@ impl Level {
             }
         }
         level
+    }
+
+    /// The wire name: `default`, `important` or `very-important`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Important => "important",
+            Self::VeryImportant => "very-important",
+        }
+    }
+
+    /// The level named `wire` ([`Self::as_str`]); anything else is
+    /// [`Level::Default`].
+    #[must_use]
+    pub fn from_wire(wire: &str) -> Self {
+        match wire {
+            "important" => Self::Important,
+            "very-important" => Self::VeryImportant,
+            _ => Self::Default,
+        }
+    }
+
+    /// The integer form some wire surfaces use (`fleet-state/v1` `level`,
+    /// the plan's `level` key, the PR queue): 0 default, 1 important,
+    /// 2 very important.
+    #[must_use]
+    pub fn rank(self) -> u8 {
+        match self {
+            Self::Default => 0,
+            Self::Important => 1,
+            Self::VeryImportant => 2,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Level {
+    /// Lenient: an unknown name (a newer daemon's level) reads as `default`.
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(Self::from_wire(&String::deserialize(d)?))
     }
 }
 

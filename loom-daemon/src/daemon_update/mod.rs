@@ -968,8 +968,9 @@ fn print_dry_run_plan(
             ));
         }
         out::say(&format!(
-            "[dry-run] Would run: (cd {} && cargo build --release --message-format=json-render-diagnostics)",
-            s.daemon_dir.display()
+            "[dry-run] Would run: (cd {} && cargo {})",
+            s.daemon_dir.display(),
+            rebuild::build_args(&s.daemon_dir).join(" ")
         ));
     }
     out::say(&format!(
