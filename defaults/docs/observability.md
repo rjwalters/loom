@@ -513,17 +513,6 @@ host is not exempt — logs one ERROR line, `observability: DEGRADED — this
 daemon's facts are not reaching SigNoz: <detail>`, and the daemon still starts
 (`otlp_health::startup_verdict`; the start policy itself is #11526).
 
-Since #11557 an attention state carries `since` (when the host first became
-`failing` / `no_exporter`; cleared on `ok` / `exempt`, kept across failure-detail
-changes, in memory so "since start" after a restart) and reads
-`otlp: failing since <T> (<reason>)` on the `status` line, in the WARN, and in
-`host.health`'s `otlp_export`. A `failing` reason includes the exporter's last
-failure (e.g. `OTLP HTTP 403 (credential refused …)`); a `misconfigured` OTLP
-entry counts as `no_exporter`. A degraded start — no OTLP entry starts and the
-host is not exempt — logs one ERROR line, `observability: DEGRADED — this
-daemon's facts are not reaching SigNoz: <detail>`, and the daemon still starts
-(`otlp_health::startup_verdict`; the start policy itself is #11526).
-
 ```json
 { "observability": {
     "otlp_required": false,

@@ -357,7 +357,12 @@ fn observe_global(config: &ObservabilityConfig) -> (Observation, Option<String>)
         last_success_at: otlp.and_then(|s| s.last_success_at),
         last_drop_growth_at: None,
         window: failure_window(config),
-        last_failure_detail: otlp.and_then(|s| s.last_failure_detail.clone()),
+        // Defence in depth: the exporter's error text is already credential
+        // free, but this detail rides `status` and `host.health` off the host,
+        // so scrub it with the producer redaction policy before it does.
+        last_failure_detail: otlp
+            .and_then(|s| s.last_failure_detail.as_deref())
+            .map(sanitize_failure_detail),
     };
     let observation = MONITOR
         .lock()
@@ -365,6 +370,14 @@ fn observe_global(config: &ObservabilityConfig) -> (Observation, Option<String>)
         .get_or_insert_with(OtlpHealthMonitor::default)
         .observe(inputs, dropped, now);
     (observation, warning)
+}
+
+/// The exporter's failure text as it may appear in health detail: scrubbed of
+/// anything credential-shaped (Issue #11557 — credential values must never
+/// enter health detail or exported comments).
+#[must_use]
+pub fn sanitize_failure_detail(detail: &str) -> String {
+    crate::telemetry::kinds::session_output::redact::scrub(detail)
 }
 
 /// Evaluate this process's OTLP export health from `config` and the

@@ -300,3 +300,16 @@ fn since_serializes_when_set() {
     let back: OtlpExportHealth = serde_json::from_value(v).unwrap();
     assert_eq!(back, h);
 }
+
+#[test]
+fn failure_detail_is_scrubbed_of_credential_values() {
+    let raw = "transport error: error sending request for url \
+               (https://ingest.example/v1/logs?token=s3cr3tvalue123): Authorization: Bearer abcdefghijklmnopqrstuvwxyz";
+    let clean = sanitize_failure_detail(raw);
+    assert!(!clean.contains("s3cr3tvalue123"), "{clean}");
+    assert!(!clean.contains("abcdefghijklmnopqrstuvwxyz"), "{clean}");
+    assert!(clean.contains("[REDACTED:"), "{clean}");
+    // A plain status detail passes through unchanged.
+    let plain = "OTLP HTTP 403 (credential refused; batch held until the credential is fixed)";
+    assert_eq!(sanitize_failure_detail(plain), plain);
+}
