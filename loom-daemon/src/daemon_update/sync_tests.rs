@@ -456,3 +456,66 @@ fn ff_abort_identical_plain_deletion_resolves() {
     assert_eq!(fx.status(), "");
     assert!(!fx.host.join("victim").exists());
 }
+
+// ── Raw bytes, never the filtered view (#11558 third pass) ──────────────
+
+impl Fixture {
+    /// A lossy clean filter `strip` (drops `OUTPUT` lines) on `path`, set in
+    /// the host's own config and `.git/info/attributes`.
+    fn lossy_filter(&self, path: &str) {
+        git(&self.host, &["config", "filter.strip.clean", "grep -v '^OUTPUT' || true"]);
+        git(&self.host, &["config", "filter.strip.smudge", "cat"]);
+        write(&self.host.join(".git/info/attributes"), &format!("{path} filter=strip\n"));
+    }
+}
+
+#[test]
+fn ff_abort_identical_lossy_clean_filter_hard_aborts() {
+    let fx = Fixture::new();
+    fx.in_head(&["f.nb"]);
+    fx.push(&[("f.nb", "two\n")]);
+    fx.lossy_filter("f.nb");
+    write(&fx.host.join("f.nb"), "two\nOUTPUT precious\n");
+    fx.assert_ff_refuses();
+    let before = fx.head();
+
+    assert_eq!(all_dirty_tracked_identical_to_origin(&fx.host, BRANCH), None);
+    let (ok, state) = fx.classify(true);
+    assert!(!ok);
+    assert!(!state.ff_synced);
+    assert_eq!(fx.head(), before);
+    assert_eq!(read(&fx.host.join("f.nb")), "two\nOUTPUT precious\n");
+}
+
+#[test]
+fn ff_abort_identical_raw_identical_under_a_filter_resolves() {
+    let fx = Fixture::new();
+    fx.in_head(&["f.nb"]);
+    fx.push(&[("f.nb", "two\n")]);
+    fx.lossy_filter("f.nb");
+    write(&fx.host.join("f.nb"), "two\n");
+    fx.assert_ff_refuses();
+
+    let (ok, state) = fx.classify(true);
+    assert!(ok);
+    assert!(state.ff_synced);
+    assert_eq!(fx.head(), fx.origin_tip());
+    assert_eq!(read(&fx.host.join("f.nb")), "two\n");
+}
+
+#[test]
+fn ff_abort_identical_crlf_only_difference_hard_aborts() {
+    let fx = Fixture::new();
+    fx.in_head(&["t.txt"]);
+    fx.push(&[("t.txt", "two\n")]);
+    write(&fx.host.join(".git/info/attributes"), "t.txt text=auto\n");
+    write(&fx.host.join("t.txt"), "two\r\n");
+    fx.assert_ff_refuses();
+    let before = fx.head();
+
+    assert_eq!(all_dirty_tracked_identical_to_origin(&fx.host, BRANCH), None);
+    let (ok, _) = fx.classify(true);
+    assert!(!ok);
+    assert_eq!(fx.head(), before);
+    assert_eq!(fs::read(fx.host.join("t.txt")).unwrap(), b"two\r\n");
+}

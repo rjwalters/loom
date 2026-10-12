@@ -35,6 +35,28 @@
 //! overwrite it. So [`worktree_entry_is_restorable`] (an `lstat` walk) and an
 //! index-entry probe fail closed on anything but an absent path or a tracked
 //! regular file or symlink under real directories.
+//!
+//! # Raw bytes, never the filtered view
+//!
+//! `git diff <ref> -- <p>` compares the working tree *after* the clean filter
+//! and EOL / `working-tree-encoding` conversion. A lossy clean filter
+//! (nbstripout, secret-to-placeholder, keyword stripping) or a CRLF-only
+//! local difference would diff as identical while the bytes on disk differ,
+//! and the discard would destroy the difference (#11558 third-pass P1). So
+//! every regular file on disk must also hash, with `hash-object
+//! --no-filters`, to exactly `<ref>:<p>`'s blob id; a mismatch or any error
+//! fails closed. Symlinks are never filtered or converted by git (their blob
+//! is the raw link text), so the tree diff is already exact for them.
+//!
+//! # Residual risks, documented rather than closed
+//!
+//! * The fast-forward itself (`merge --ff-only`) may overwrite an *ignored*
+//!   file sitting where an incoming path lands, as plain git does; this
+//!   predicate only vouches for the dirty tracked paths it discards.
+//! * There is a window between these probes and the discard: a write that
+//!   lands in between is not re-checked. The probes run immediately before
+//!   the discard to keep it short; closing it would need a lock git does not
+//!   offer for the working tree.
 
 /// The global option that makes every pathspec literal. Goes before the
 /// subcommand.
@@ -111,7 +133,8 @@ pub fn discard_args(paths: &[String]) -> Vec<&str> {
 /// `origin_ref` is the remote-tracking ref to compare with (`origin/<b>` or
 /// `refs/remotes/origin/<b>`). `paths` are the dirty tracked paths, exact
 /// (see [`tracked_paths_from_porcelain_z`]). `git_ok(args)` runs `git <args>`
-/// in the repo and answers whether it exited 0; the caller chooses the bound.
+/// in the repo and answers its stdout when it exited 0, `None` otherwise (a
+/// timeout or a spawn error included); the caller chooses the bound.
 ///
 /// What a discard of these paths costs: after a successful fast-forward each
 /// path holds that exact content anyway. If the merge then fails (a file in
@@ -141,32 +164,72 @@ pub fn discard_args(paths: &[String]) -> Vec<&str> {
 ///    actually saw it. A directory, any other type, a symlinked or
 ///    non-directory parent: not identical. `HEAD`'s entry must be a blob
 ///    (file or symlink), never a tree or gitlink.
+/// 6. **Raw bytes (#11558 third pass).** A regular file on disk must hash,
+///    unfiltered (`hash-object --no-filters`), to exactly `origin_ref`'s blob
+///    id for the path, so a lossy clean filter or an EOL / encoding
+///    conversion can never make differing bytes look identical.
 pub fn all_dirty_tracked_identical_to_origin(
     worktree: &Path,
     origin_ref: &str,
     paths: Vec<String>,
-    mut git_ok: impl FnMut(&[&str]) -> bool,
+    mut git: impl FnMut(&[&str]) -> Option<Vec<u8>>,
 ) -> Option<Vec<String>> {
     if paths.is_empty() {
         return None;
     }
-    if !git_ok(&["merge-base", "--is-ancestor", "HEAD", origin_ref]) {
-        return None;
-    }
+    git(&["merge-base", "--is-ancestor", "HEAD", origin_ref])?;
     let lit = LITERAL_PATHSPECS;
     let identical = paths.iter().all(|p| {
         let Some(on_disk) = worktree_entry_is_restorable(worktree, p) else {
             return false;
         };
-        // `cat-file blob` fails for a tree or a gitlink; `:0:<p>` is an exact
-        // index lookup (revision syntax, never a pathspec).
-        git_ok(&["cat-file", "blob", &format!("HEAD:{p}")])
-            && (on_disk == OnDisk::Absent || git_ok(&["cat-file", "-e", &format!(":0:{p}")]))
-            && git_ok(&[lit, "diff", "--quiet", origin_ref, "--", p])
-            && (git_ok(&[lit, "diff", "--cached", "--quiet", origin_ref, "--", p])
-                || git_ok(&[lit, "diff", "--cached", "--quiet", "HEAD", "--", p]))
+        // `cat-file -t` answers `blob` for a file or symlink, never for a
+        // tree or a gitlink; `:0:<p>` is an exact index lookup (revision
+        // syntax, never a pathspec).
+        let in_head = git(&["cat-file", "-t", &format!("HEAD:{p}")]);
+        let probes_agree = in_head.as_deref() == Some(b"blob\n".as_slice())
+            && (on_disk == OnDisk::Absent
+                || git(&["cat-file", "-e", &format!(":0:{p}")]).is_some())
+            && git(&[lit, "diff", "--quiet", origin_ref, "--", p]).is_some()
+            && (git(&[lit, "diff", "--cached", "--quiet", origin_ref, "--", p]).is_some()
+                || git(&[lit, "diff", "--cached", "--quiet", "HEAD", "--", p]).is_some());
+        probes_agree && (on_disk != OnDisk::File || raw_bytes_match(&mut git, origin_ref, p))
     });
     identical.then_some(paths)
+}
+
+/// The regular file at `p` hashes, with no clean filter and no EOL or
+/// encoding conversion, to exactly `origin_ref:<p>`'s blob id. `<ref>:<path>`
+/// is revision syntax (an exact path, never a pathspec); `hash-object` takes
+/// a file name, not a pathspec (it still gets [`LITERAL_PATHSPECS`], which
+/// is harmless, so every argv naming a path carries it). Any error, an empty
+/// answer or a mismatch is `false`.
+fn raw_bytes_match(
+    git: &mut impl FnMut(&[&str]) -> Option<Vec<u8>>,
+    origin_ref: &str,
+    p: &str,
+) -> bool {
+    let on_disk =
+        git(&[LITERAL_PATHSPECS, "hash-object", "--no-filters", "--", p]).and_then(object_id);
+    let at_origin = git(&[
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        // `<ref>:<path>` takes the whole rest as the path: no `^{blob}` suffix.
+        &format!("{origin_ref}:{p}"),
+    ])
+    .and_then(object_id);
+    matches!((on_disk, at_origin), (Some(a), Some(b)) if a == b)
+}
+
+/// One object id line -> the id: non-empty lowercase hex, nothing else.
+fn object_id(out: Vec<u8>) -> Option<String> {
+    let id = std::str::from_utf8(&out).ok()?.trim_end_matches('\n');
+    let hex = !id.is_empty()
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    hex.then(|| id.to_string())
 }
 
 /// What [`worktree_entry_is_restorable`] found at a path.
@@ -174,8 +237,10 @@ pub fn all_dirty_tracked_identical_to_origin(
 pub enum OnDisk {
     /// Nothing there (a deletion): the discard creates, never removes.
     Absent,
-    /// A regular file or a symlink (the link itself, never its target).
-    FileOrSymlink,
+    /// A regular file: its raw bytes are compared too.
+    File,
+    /// A symlink (the link itself, never its target).
+    Symlink,
 }
 
 /// `lstat` walk of `rel` under `worktree`, never following a symlink:
@@ -212,8 +277,10 @@ pub fn worktree_entry_is_restorable(worktree: &Path, rel: &str) -> Option<OnDisk
             if !ft.is_dir() {
                 return None;
             }
-        } else if ft.is_file() || ft.is_symlink() {
-            return Some(OnDisk::FileOrSymlink);
+        } else if ft.is_file() {
+            return Some(OnDisk::File);
+        } else if ft.is_symlink() {
+            return Some(OnDisk::Symlink);
         } else {
             return None;
         }
@@ -267,7 +334,7 @@ mod tests {
             Vec::new(),
             |_| {
                 calls += 1;
-                true
+                Some(Vec::new())
             },
         );
         assert_eq!(got, None);
@@ -282,7 +349,7 @@ mod tests {
                 Path::new("/nonexistent-11558"),
                 "origin/main",
                 paths,
-                |_| { false }
+                |_| None
             ),
             None
         );
@@ -298,7 +365,7 @@ mod tests {
             paths,
             |a| {
                 seen.push(a.iter().map(|s| s.to_string()).collect::<Vec<_>>());
-                true
+                Some(Vec::new())
             },
         );
         for argv in seen.iter().filter(|a| a.contains(&"a[1].txt".to_string())) {
@@ -315,7 +382,15 @@ mod tests {
             Path::new("/nonexistent-11558"),
             "origin/main",
             paths,
-            |a| !(a.contains(&"--cached") && a.contains(&"origin/main")),
+            |a| {
+                if a.contains(&"--cached") && a.contains(&"origin/main") {
+                    None
+                } else if a.contains(&"-t") {
+                    Some(b"blob\n".to_vec())
+                } else {
+                    Some(Vec::new())
+                }
+            },
         );
         assert_eq!(got, Some(vec!["a".to_string()]));
     }
@@ -365,7 +440,8 @@ mod tests {
 
     fn check(d: &Path, paths: Vec<String>) -> Option<Vec<String>> {
         all_dirty_tracked_identical_to_origin(d, "refs/remotes/origin/main", paths, |a| {
-            git_out(d, a).status.success()
+            let out = git_out(d, a);
+            out.status.success().then_some(out.stdout)
         })
     }
 
@@ -437,9 +513,9 @@ mod tests {
 
         assert_eq!(at("gone"), Some(OnDisk::Absent));
         assert_eq!(at("gone/deeper"), Some(OnDisk::Absent));
-        assert_eq!(at("file"), Some(OnDisk::FileOrSymlink));
-        assert_eq!(at("dir/f"), Some(OnDisk::FileOrSymlink));
-        assert_eq!(at("dangling"), Some(OnDisk::FileOrSymlink), "the link itself");
+        assert_eq!(at("file"), Some(OnDisk::File));
+        assert_eq!(at("dir/f"), Some(OnDisk::File));
+        assert_eq!(at("dangling"), Some(OnDisk::Symlink), "the link itself");
         assert_eq!(at("dir"), None, "a directory");
         assert_eq!(at("dir/sub"), None);
         assert_eq!(at("link/f"), None, "a symlinked parent is never followed");
@@ -458,5 +534,54 @@ mod tests {
         fs::write(d.join("victim/local-only.txt"), "precious\n").unwrap();
         assert_eq!(check(d, vec!["victim".to_string()]), None);
         assert!(d.join("victim/local-only.txt").exists());
+    }
+
+    /// `repo(files)`, then a lossy clean filter `strip` (drops `OUTPUT`
+    /// lines) applied to `f.nb` through `.git/info/attributes`.
+    fn repo_with_lossy_filter() -> tempfile::TempDir {
+        let tmp = repo(&["f.nb"]);
+        let d = tmp.path();
+        git(d, &["config", "filter.strip.clean", "grep -v '^OUTPUT' || true"]);
+        git(d, &["config", "filter.strip.smudge", "cat"]);
+        fs::write(d.join(".git/info/attributes"), "f.nb filter=strip\n").unwrap();
+        tmp
+    }
+
+    #[test]
+    fn git_ff_identical_lossy_clean_filter_is_not_vouched_for() {
+        let tmp = repo_with_lossy_filter();
+        let d = tmp.path();
+        fs::write(d.join("f.nb"), "two\nOUTPUT precious\n").unwrap();
+        // The filtered view really is identical: the old predicate vouched.
+        assert!(git_out(d, &["diff", "--quiet", "refs/remotes/origin/main", "--", "f.nb"])
+            .status
+            .success());
+        assert_eq!(check(d, dirty(d)), None);
+        assert_eq!(fs::read_to_string(d.join("f.nb")).unwrap(), "two\nOUTPUT precious\n");
+
+        // Raw bytes truly identical: still resolves under the same filter.
+        fs::write(d.join("f.nb"), "two\n").unwrap();
+        assert_eq!(check(d, dirty(d)), Some(vec!["f.nb".to_string()]));
+    }
+
+    #[test]
+    fn git_ff_identical_crlf_only_difference_is_not_vouched_for() {
+        let tmp = repo(&["t.txt"]);
+        let d = tmp.path();
+        fs::write(d.join(".git/info/attributes"), "t.txt text=auto\n").unwrap();
+        fs::write(d.join("t.txt"), "two\r\n").unwrap();
+        assert!(git_out(d, &["diff", "--quiet", "refs/remotes/origin/main", "--", "t.txt"])
+            .status
+            .success());
+        assert_eq!(check(d, dirty(d)), None);
+        assert_eq!(fs::read(d.join("t.txt")).unwrap(), b"two\r\n");
+    }
+
+    #[test]
+    fn git_ff_identical_plain_identical_file_resolves() {
+        let tmp = repo(&["p.txt"]);
+        let d = tmp.path();
+        fs::write(d.join("p.txt"), "two\n").unwrap();
+        assert_eq!(check(d, dirty(d)), Some(vec!["p.txt".to_string()]));
     }
 }

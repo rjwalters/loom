@@ -573,8 +573,20 @@ fn dirty_tracked_identical_to_origin(repo_root: &Path, branch: &str) -> Option<V
         repo_root,
         &format!("origin/{branch}"),
         dirty_tracked_paths(repo_root),
-        |args| util::git_ok(repo_root, args),
+        |args| git_stdout(repo_root, args),
     )
+}
+
+/// `git -C <repo_root> <args>`: raw stdout when it exited 0, else `None`.
+fn git_stdout(repo_root: &Path, args: &[&str]) -> Option<Vec<u8>> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(args)
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    out.status.success().then_some(out.stdout)
 }
 
 /// The resolved `resync-installed.sh`, exposed for the caller's own messages.

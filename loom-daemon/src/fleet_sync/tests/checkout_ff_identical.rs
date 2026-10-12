@@ -273,3 +273,54 @@ fn identical_dirt_plain_deletion_is_fast_forwarded() {
     assert_eq!(git(&fx.host, &["status", "--porcelain"]), "");
     assert!(!fx.host.join("victim").exists());
 }
+
+// ── Raw bytes, never the filtered view (#11558 third pass) ──────────────
+
+/// A lossy clean filter `strip` (drops `OUTPUT` lines) on `path`, set in the
+/// host's own config and `.git/info/attributes`.
+fn lossy_filter(fx: &Fixture, path: &str) {
+    git(&fx.host, &["config", "filter.strip.clean", "grep -v '^OUTPUT' || true"]);
+    git(&fx.host, &["config", "filter.strip.smudge", "cat"]);
+    write(&fx.host.join(".git/info/attributes"), &format!("{path} filter=strip\n"));
+}
+
+#[test]
+fn identical_dirt_lossy_clean_filter_stays_dirty() {
+    // The filtered view equals origin; the bytes on disk do not. The discard
+    // would delete "OUTPUT precious".
+    let fx = Fixture::new();
+    in_head(&fx, &["f.nb"]);
+    fx.push("f.nb", "two\n");
+    lossy_filter(&fx, "f.nb");
+    write(&fx.host.join("f.nb"), "two\nOUTPUT precious\n");
+
+    assert_skipped(&fx, &Knobs::default(), CheckoutState::Dirty);
+    assert_eq!(read(&fx, "f.nb"), "two\nOUTPUT precious\n");
+}
+
+#[test]
+fn identical_dirt_raw_identical_under_a_filter_is_fast_forwarded() {
+    let fx = Fixture::new();
+    in_head(&fx, &["f.nb"]);
+    let tip = fx.push("f.nb", "two\n");
+    lossy_filter(&fx, "f.nb");
+    write(&fx.host.join("f.nb"), "two\n");
+
+    let found = pass(&fx, &Knobs::default());
+
+    assert_eq!(only(&found).state, CheckoutState::FastForwarded, "{found:?}");
+    assert_eq!(fx.head(), tip);
+    assert_eq!(read(&fx, "f.nb"), "two\n");
+}
+
+#[test]
+fn identical_dirt_crlf_only_difference_stays_dirty() {
+    let fx = Fixture::new();
+    in_head(&fx, &["t.txt"]);
+    fx.push("t.txt", "two\n");
+    write(&fx.host.join(".git/info/attributes"), "t.txt text=auto\n");
+    write(&fx.host.join("t.txt"), "two\r\n");
+
+    assert_skipped(&fx, &Knobs::default(), CheckoutState::Dirty);
+    assert_eq!(fs::read(fx.host.join("t.txt")).unwrap(), b"two\r\n");
+}

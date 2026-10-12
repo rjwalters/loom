@@ -908,7 +908,7 @@ fn identical_to_origin(
         root,
         &git::tracking(branch),
         paths,
-        |args| git::quiet_ok(root, &index, args, local()),
+        |args| git::quiet_out(root, &index, args, local()),
     )
 }
 

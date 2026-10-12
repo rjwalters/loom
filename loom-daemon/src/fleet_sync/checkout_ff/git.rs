@@ -281,19 +281,19 @@ pub(super) fn scratch_index(root: &Path, timeout: Duration) -> Result<ScratchInd
     Ok(ScratchIndex { _dir: dir, path })
 }
 
-/// A bounded success probe against `index`: `true` only when `git <args>`
-/// ran and exited 0. A timeout or an error answers `false`, so a check built
-/// on it fails closed. `core.splitIndex=false`, so a refresh written to the
-/// copy never puts a shared-index file in the real git dir.
-pub(super) fn quiet_ok(
+/// A bounded probe against `index`: its stdout only when `git <args>` ran
+/// and exited 0. A timeout or an error answers `None`, so a check built on it
+/// fails closed. `core.splitIndex=false`, so a refresh written to the copy
+/// never puts a shared-index file in the real git dir.
+pub(super) fn quiet_out(
     root: &Path,
     index: &ScratchIndex,
     args: &[&str],
     timeout: Duration,
-) -> bool {
+) -> Option<Vec<u8>> {
     let config = ["core.splitIndex=false"];
-    run_with_index(root, &config, args, timeout, Some(&index.path))
-        .is_ok_and(|out| out.status.success())
+    let out = run_with_index(root, &config, args, timeout, Some(&index.path)).ok()?;
+    out.status.success().then_some(out.stdout)
 }
 
 /// The second write (#11553): `git --literal-pathspecs checkout HEAD --
