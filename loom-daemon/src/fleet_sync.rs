@@ -91,8 +91,9 @@ use crate::fleet_store::roster::{self, Change, Plan, Registered};
 use crate::fleet_store::{self as store, StoreLocation};
 
 pub mod checkout_ff;
-mod floor_knowledge;
+pub mod git_spawn_log;
 mod loom_ui;
+pub mod git_spawn_log;
 pub mod offline_floor;
 pub mod roster_clone;
 pub mod workspace_resync;
