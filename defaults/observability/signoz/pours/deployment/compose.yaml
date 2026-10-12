@@ -89,6 +89,7 @@ services:
     - SIGNOZ_TELEMETRYSTORE_PROVIDER=clickhouse
     - SIGNOZ_TOKENIZER_JWT_SECRET=${SIGNOZ_TOKENIZER_JWT_SECRET:?set a private random
       session-signing secret}
+    - SIGNOZ_TOKENIZER_PROVIDER=jwt
     healthcheck:
       interval: 30s
       retries: 3
