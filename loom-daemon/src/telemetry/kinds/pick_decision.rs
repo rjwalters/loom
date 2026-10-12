@@ -165,7 +165,7 @@ impl PickSkipReason {
             Qd::WorkspaceCommandsMissing | Qd::Quarantined | Qd::LabelledBlocked | Qd::Unknown => {
                 Self::Blocked
             }
-            Qd::HostConstraint | Qd::HostClassRefused | Qd::PeerClaim => Self::HostConstraint,
+            Qd::HostConstraint | Qd::PeerClaim => Self::HostConstraint,
             Qd::Parked | Qd::HardExclusion | Qd::Declined => Self::OperatorHold,
             Qd::OpenPrBackoff | Qd::OpenPr => Self::PrOpenSkip,
             Qd::DispatchError => Self::Error,
@@ -265,6 +265,18 @@ pub struct PickWorkspaceDraw {
     pub draws: Vec<PickDraw>,
 }
 
+/// A `loom:very-important` issue the flood cap ranked as `loom:important`
+/// this tick (#11509): its workspace already has an older open one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PickViDemotion {
+    /// Forge `owner/repo`, or `repo_unresolved`.
+    pub repo: String,
+    /// The demoted issue.
+    pub number: u32,
+    /// The issue holding the workspace's very-important slot.
+    pub holder: u32,
+}
+
 /// What the tick concluded about one ranked candidate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PickVerdict {
@@ -316,6 +328,11 @@ pub struct PickDecisionRecord {
     /// for a work-finder tick with nothing to draw.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_draw: Option<PickWorkspaceDraw>,
+    /// The work finder's `loom:very-important` flood-cap demotions (#11509),
+    /// at most [`MAX_PICK_CANDIDATES`]; empty (and absent on the wire) when
+    /// the cap demoted nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub very_important_demoted: Vec<PickViDemotion>,
 }
 
 /// Identity of the tick a record describes.
@@ -385,6 +402,7 @@ impl PickDecisionRecord {
             candidate_source: source::NONE.to_string(),
             decisions_observed: false,
             workspace_draw: None,
+            very_important_demoted: Vec::new(),
         }
     }
 
@@ -410,6 +428,15 @@ impl PickDecisionRecord {
             d.draws.truncate(MAX_PICK_CANDIDATES);
             d
         });
+        self
+    }
+
+    /// Attach the work finder's flood-cap demotions (#11509), capping the
+    /// list at [`MAX_PICK_CANDIDATES`].
+    #[must_use]
+    pub fn with_very_important_demoted(mut self, mut demoted: Vec<PickViDemotion>) -> Self {
+        demoted.truncate(MAX_PICK_CANDIDATES);
+        self.very_important_demoted = demoted;
         self
     }
 

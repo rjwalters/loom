@@ -298,6 +298,15 @@ pub struct OutcomeRecord {
     /// any line that fails to deserialize.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tap_usage_all: Vec<crate::tap_usage::TapAccounting>,
+    /// Out-of-process phase launches (`worker run --role builder|doctor`,
+    /// Issue #11360) that named this sweep, one row per `(role, tap)`, read from
+    /// their own phase logs. Never folded into [`Self::tap_usage`] /
+    /// [`Self::tap_usage_all`], which stay the parent orchestrator's own region:
+    /// the sweep's whole per-tap spend is the fold of both
+    /// ([`crate::tap_usage::RegionAccounting::sweep_totals_by_tap`]). Empty, and
+    /// absent from the line, when no phase ran out of process.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub phase_tap_usage: Vec<crate::tap_usage::PhaseTapAccounting>,
     /// Elapsed wall-clock seconds from dispatch to this terminal outcome.
     pub duration_sec: i64,
 }
@@ -752,6 +761,7 @@ mod tests {
             jev_confidence: None,
             tap_usage: None,
             tap_usage_all: Vec::new(),
+            phase_tap_usage: Vec::new(),
             duration_sec: 1,
         }
     }
@@ -991,6 +1001,7 @@ mod tests {
                 attempt_index: None,
                 previous_sweep_id: None,
                 trigger: None,
+                dispatch_origin: None,
                 rework_events: None,
                 pr_numbers: None,
                 hw_lines_added: None,

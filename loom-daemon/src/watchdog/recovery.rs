@@ -83,6 +83,9 @@ pub fn write(path: &Path, state: &State) {
 pub fn clear(state_path: &Path, escalation_sentinel: &Path) {
     let _ = std::fs::remove_file(state_path);
     let _ = std::fs::remove_file(escalation_sentinel);
+    // #11295: resolve a `daemon.down` loom-ui still has open (a no-op, with
+    // no config read, when it has none).
+    super::loom_ui::daemon_up(escalation_sentinel);
 }
 
 /// Seconds to wait before attempt `n` (1-based).

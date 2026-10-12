@@ -107,7 +107,9 @@
 pub mod availability;
 pub mod ceiling;
 pub mod codex_guard;
+pub mod explicit_tap;
 pub mod handoff;
+pub mod launch_failure_hold;
 pub mod resolve;
 pub mod sandbox_hold;
 
@@ -377,9 +379,12 @@ pub fn resolve_for_dispatch_with(
     preparer: &mut dyn ContainmentPreparer,
 ) -> Result<DispatchAdmission, RuntimeRejection> {
     let now = u64::try_from(chrono::Utc::now().timestamp()).unwrap_or(0);
+    // A sweep dispatch, not a role tick: the launch-failure hold (#11453)
+    // never applies here.
     let context = DispatchContext {
         complexity: None,
         intent: Intent::Dispatch,
+        role_tick: false,
     };
     let mut decision = resolve_runtime_contained(root, role, explicit, now, context, preparer)?;
     if let Some(marker) = decision.marker_line() {
@@ -570,6 +575,12 @@ pub struct DispatchContext<'a> {
     /// that consumed capacity would refuse the very dispatch it was asked
     /// about.
     pub intent: Intent,
+    /// Whether this resolution is for a **role tick** (set only by
+    /// `role_runner::runtime_preflight::check`). Only a role-tick walk
+    /// consults the per-workspace launch-failure hold
+    /// ([`launch_failure_hold`], #11453); a sweep dispatch and every
+    /// `work_finder::pool_preflight` probe default to `false` and ignore it.
+    pub role_tick: bool,
 }
 
 /// The operator pin in force for `role`, if any — the three tiers that
@@ -807,6 +818,21 @@ fn resolve_runtime_in(
                     preparer.borrow_mut().release();
                 }
             };
+            // #11453: a tap that failed to launch the same deterministic way
+            // N times in a row in this workspace is passed over by this
+            // role's ticks until its hold clears. Role ticks only: a sweep
+            // never reads the hold, and an operator pin never reaches here.
+            if context.role_tick {
+                let key = launch_failure_hold::Key::new(root, canonical, tap);
+                let fingerprint = || launch_failure_hold::fingerprint(&config, tap);
+                if let Some(hold) = launch_failure_hold::active(&key, fingerprint, now) {
+                    release();
+                    return Err(SkipReason::Unavailable {
+                        source: launch_failure_hold::SKIP_SOURCE.to_string(),
+                        detail: hold.describe(now),
+                    });
+                }
+            }
             match availability::availability_in(root, tap, admitted, now, binary_env) {
                 state if state.is_spawnable() => {}
                 state => {
@@ -862,6 +888,9 @@ mod excluded_role_tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod gateway_tests;
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod launch_failure_hold_tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod sandbox_hold_tests;

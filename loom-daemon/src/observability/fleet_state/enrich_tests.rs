@@ -39,6 +39,13 @@ impl ForgeReads for Forge {
     fn pull(&mut self, _: &str, _: u32) -> Option<PullFacts> {
         None
     }
+    fn issue(
+        &mut self,
+        _: &str,
+        _: u32,
+    ) -> Option<crate::observability::fleet_state::outcomes::IssueFacts> {
+        Some(crate::observability::fleet_state::outcomes::IssueFacts::Open)
+    }
 
     fn label_history(&mut self, _: &str, n: u32) -> Option<LabelHistory> {
         self.reads.push(n);
@@ -121,6 +128,8 @@ fn a_ready_row_is_dated_by_its_issue_history() {
             fleet_priority: 100,
             created_at: None,
             main_red_fix: false,
+            eligible_reason: None,
+            eligible_at: None,
         }],
         ..ReadyQueue::default()
     });

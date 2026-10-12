@@ -1002,6 +1002,7 @@ fn dispatch_resolve(root: &Path, role: &str, complexity: Option<&str>) -> Decisi
     let context = super::DispatchContext {
         complexity,
         intent: ceiling::Intent::Dispatch,
+        role_tick: false,
     };
     super::resolve_runtime_for(root, role, None, 0, context).unwrap()
 }

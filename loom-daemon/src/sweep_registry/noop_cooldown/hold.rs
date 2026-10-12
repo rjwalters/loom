@@ -238,6 +238,31 @@ impl SweepRegistry {
         }
     }
 
+    /// The reaper's feed for the under-60-s form of the same loop (Issue
+    /// #11438): a checkpoint-less **clean** exit (code 0) that the daemon saw
+    /// reach no phase at all, with a VERIFIED absence of an open linked PR,
+    /// that did not self-report (a self-report was already counted over IPC).
+    /// This is the shape journaled as `no-phase-signal` (and, before #11438,
+    /// `spawn-death`): "no build work", released, re-dispatched forever.
+    pub(crate) fn note_clean_phaseless_exit_outcome(
+        &mut self,
+        issue: u32,
+        sweep_id: &str,
+        open_pr: Option<OpenPrProbe>,
+        exit_code: Option<i32>,
+    ) {
+        if exit_code != Some(0)
+            || open_pr != Some(OpenPrProbe::NoneOpen)
+            || self.noop_cooldown_config.hold_threshold == 0
+            || self.noop_release_covers_dispatch(issue, sweep_id)
+            || self.sampled_pr_number(sweep_id).is_some()
+            || self.sampled_only_curator(sweep_id).is_some()
+        {
+            return;
+        }
+        self.note_noop_for_hold(issue, Some(sweep_id), None);
+    }
+
     /// Count one no-op toward `issue`'s hold (Issue #10156) and park it when
     /// the streak reaches [`NoopCooldownConfig::hold_threshold`].
     ///

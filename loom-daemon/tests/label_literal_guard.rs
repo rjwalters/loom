@@ -21,7 +21,6 @@ use regex::Regex;
 /// Only ever remove entries.
 const SOURCE_ALLOWLIST: &[(&str, &str)] = &[
     ("epic_supervisor.rs", "loom:epic:"),
-    ("guards_status.rs", "loom:forge-egress"),
     ("host_affinity.rs", "loom:host:"),
     ("intake_reconcile.rs", "loom:"),
     ("intake_reconcile/singleton.rs", "loom:"),
@@ -130,6 +129,31 @@ fn strip_inline_test_mods(text: &str) -> String {
     out
 }
 
+/// `guards_status.rs` lists each guard category's decision-log rule tags in
+/// `tags: &[..]` fields (e.g. `loom:forge-egress`, `loom:cargo-target-dir`).
+/// Those are hook rule identifiers matched against the decision log, never
+/// GitHub labels, so those lines are structurally exempt: only a line whose
+/// trimmed text starts with `tags: &[` in that one file is dropped.
+fn strip_guard_rule_tags(path: &Path, body: &str) -> String {
+    if !path.ends_with("guards_status.rs") {
+        return body.to_string();
+    }
+    body.lines()
+        .filter(|l| !l.trim_start().starts_with("tags: &["))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn strip_guard_rule_tags_drops_only_tags_fields_in_guards_status() {
+    let src = "        tags: &[\"loom:cargo-target-dir\"],\nconst A: &str = \"loom:x\";\n";
+    let kept = strip_guard_rule_tags(Path::new("src/guards_status.rs"), src);
+    assert!(!kept.contains("loom:cargo-target-dir"), "{kept}");
+    assert!(kept.contains("loom:x"), "{kept}");
+    let other = strip_guard_rule_tags(Path::new("src/other.rs"), src);
+    assert!(other.contains("loom:cargo-target-dir"), "{other}");
+}
+
 #[test]
 fn strip_inline_test_mods_keeps_production_code_around_test_items() {
     // Unbalanced braces in comments, raw strings, char literals and strings
@@ -193,6 +217,7 @@ fn no_unregistered_loom_literal_in_non_test_daemon_source() {
     for f in files {
         let text = std::fs::read_to_string(&f).expect("read");
         let body = strip_inline_test_mods(&text);
+        let body = strip_guard_rule_tags(&f, &body);
         let rel = f
             .strip_prefix(&src)
             .expect("under src")

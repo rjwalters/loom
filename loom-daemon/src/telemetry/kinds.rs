@@ -425,8 +425,9 @@ macro_rules! telemetry_kind_table {
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             /// This host's export view (Issue #11124, R2 of #10196): active
-            /// exporters, queue depth, cumulative `dropped_total` per exporter
-            /// and the last successful flush. OTLP-only. See [`host_export`].
+            /// exporters, queue depth, the durable by-reason loss counts
+            /// (`dropped_total`/`dropped_by_reason`, #11527) per exporter and
+            /// the last successful flush. OTLP-only. See [`host_export`].
             HostExport = "host.export" => $crate::telemetry::kinds::host_export::HostExportRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 

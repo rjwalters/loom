@@ -42,6 +42,10 @@ pub struct RunArgs {
     /// e.g. `feature/issue-<parent>` (passed to `worktree.sh --base`).
     #[arg(long, value_name = "BRANCH", requires = "issue")]
     base: Option<String>,
+    /// Doctor only (#11359): skip the role preference and hand the attempt to
+    /// the Claude escalation ladder. Never re-enters the GLM tap.
+    #[arg(long, value_name = "WHY")]
+    escalate_claude: Option<String>,
 }
 
 /// The Builder's pre-launch PR snapshot. An unreadable one is refused rather
@@ -107,6 +111,33 @@ pub struct Report {
     /// otherwise reach the caller with no reason).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diagnostic: Option<String>,
+    /// Why this attempt bypassed the preference list (#11359).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub escalation_reason: Option<String>,
+}
+
+/// An operator pin to a non-Claude runtime contradicts a Claude escalation and
+/// is refused with a bounded diagnostic rather than honoured silently.
+pub fn escalation_pin_conflict(
+    doctor_pin: Option<&str>,
+    global_pin: Option<&str>,
+    global_role: Option<&str>,
+) -> Option<String> {
+    let global = global_pin.filter(|_| !is_inherited_dispatch_pin(global_pin, global_role));
+    [
+        ("LOOM_RUNTIME_DOCTOR", doctor_pin),
+        ("LOOM_RUNTIME", global),
+    ]
+    .into_iter()
+    .find_map(|(name, v)| {
+        let v = v?.trim();
+        (!v.is_empty() && v != "claude").then(|| {
+            format!(
+                "{name}={v} pins the Doctor to a non-Claude runtime, which contradicts the \
+                     GLM-rejection escalation to Claude; unset the pin or set it to claude"
+            )
+        })
+    })
 }
 
 /// Bytes of worker stderr kept as the `diagnostic` on a failed launch.
@@ -256,9 +287,30 @@ pub fn cli(args: RunArgs) -> anyhow::Result<()> {
 
 /// Resolve the role's runtime the way a dispatch does (#8554). `Err` carries
 /// the exit code: 75 no seat, 78 config.
+#[cfg(test)]
 fn admit(
     root: &Path,
     role: Role,
+) -> Result<
+    (
+        crate::runtime_admission::ResolvedRuntime,
+        Option<crate::runtime_preference::Reservation>,
+    ),
+    LaunchError,
+> {
+    admit_for_issue(root, role, None)
+}
+
+/// [`admit`] for a phase of the sweep on `issue` (the Builder's `--issue`; a
+/// Doctor passes `None` and inherits the sweep's issue from the daemon's
+/// `LOOM_SWEEP_CLAIM_OWNED`). A per-dispatch explicit tap recorded for that
+/// issue (#11284) is applied here, for Builder and Doctor only: it pins the
+/// runtime, and an unavailable or unadmitted tap is refused with its reason
+/// rather than falling through to the role preference.
+fn admit_for_issue(
+    root: &Path,
+    role: Role,
+    issue: Option<u64>,
 ) -> Result<
     (
         crate::runtime_admission::ResolvedRuntime,
@@ -272,11 +324,20 @@ fn admit(
     ) {
         std::env::remove_var("LOOM_RUNTIME");
     }
-    let mut admission = crate::runtime_preference::resolve_for_dispatch(root, role.as_str(), None)
-        .map_err(|r| LaunchError {
-            code: rejection_exit_code(&r.reason),
-            message: r.diagnostic(),
-        })?;
+    let explicit = crate::dispatch_tap::phase_issue(issue)
+        .and_then(|issue| crate::dispatch_tap::load(root, issue));
+    let resolved = match &explicit {
+        Some(tap) => crate::runtime_preference::explicit_tap::resolve_for_dispatch_tap(
+            root,
+            role.as_str(),
+            tap,
+        ),
+        None => crate::runtime_preference::resolve_for_dispatch(root, role.as_str(), None),
+    };
+    let mut admission = resolved.map_err(|r| LaunchError {
+        code: rejection_exit_code(&r.reason),
+        message: r.diagnostic(),
+    })?;
     let backstop = admission.backstop.take();
     let admitted = admission
         .admitted
@@ -356,6 +417,47 @@ fn ensure_worktree(
     Ok(wt)
 }
 
+/// Write the phase log's sweep header (Issue #11360). Best-effort: a log that
+/// cannot be stamped only loses usage attribution, never the launch.
+pub fn write_phase_log_header(log: &Path, sweep_id: Option<&str>, role: Role, issue: u64) {
+    use std::io::Write;
+    let header = crate::launch_record::phase_log_header(sweep_id, role.as_str(), issue);
+    let written = log
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log)
+        })
+        .and_then(|mut file| writeln!(file, "{header}"));
+    if let Err(e) = written {
+        eprintln!(
+            "warning: cannot stamp {} with its sweep id; its usage will not reach the outcome journal: {e}",
+            log.display()
+        );
+    }
+}
+
+/// The report `worker run --role doctor --escalate-claude` prints (#11359).
+/// It names Claude as the runtime and carries no `log_path`: the escalation
+/// hands the attempt to a Claude Task, so no phase log exists for usage
+/// accounting to join (Issue #11360).
+pub fn escalation_report(pr: Option<u64>, reason: &str) -> Report {
+    Report {
+        role: Role::Doctor.as_str().into(),
+        issue: None,
+        pr,
+        runtime: "claude".into(),
+        model_profile: None,
+        outcome: "delegate-to-claude".into(),
+        log_path: None,
+        diagnostic: None,
+        escalation_reason: Some(reason.to_owned()),
+    }
+}
+
 /// How long a signalled worker group gets to exit before it is killed.
 const STOP_GRACE: Duration = Duration::from_secs(15);
 
@@ -376,8 +478,25 @@ fn launch_bounded(
 }
 
 fn run(args: &RunArgs, role: Role) -> Result<i32, LaunchError> {
+    if let Some(reason) = args.escalate_claude.as_deref() {
+        if role != Role::Doctor {
+            return Err(LaunchError::config("--escalate-claude applies to doctor only"));
+        }
+        if let Some(conflict) = escalation_pin_conflict(
+            std::env::var("LOOM_RUNTIME_DOCTOR").ok().as_deref(),
+            std::env::var("LOOM_RUNTIME").ok().as_deref(),
+            std::env::var("LOOM_ROLE").ok().as_deref(),
+        ) {
+            return Err(LaunchError::config(conflict));
+        }
+        // Issue #11360: this path launches nothing and opens no phase log, so
+        // there is no header to stamp. The escalated Doctor runs as a Claude
+        // Task in the parent session; its usage is the transcript reader's.
+        emit(args, &escalation_report(args.pr, reason));
+        return Ok(0);
+    }
     let root = super::workspace(None)?;
-    let (admitted, backstop) = admit(&root, role)?;
+    let (admitted, backstop) = admit_for_issue(&root, role, args.issue)?;
     let model_profile = admitted
         .preference
         .as_ref()
@@ -391,6 +510,7 @@ fn run(args: &RunArgs, role: Role) -> Result<i32, LaunchError> {
         outcome: "delegate-to-claude".into(),
         log_path: None,
         diagnostic: None,
+        escalation_reason: None,
     };
     if delegates_to_claude(&admitted.runtime) {
         emit(args, &report);
@@ -418,12 +538,15 @@ fn run(args: &RunArgs, role: Role) -> Result<i32, LaunchError> {
         Role::Doctor => serde_json::Value::Null,
     };
     let worktree = ensure_worktree(&root, role, issue, args.pr, args.base.as_deref())?;
-    let log = root.join(".loom/logs").join(format!(
-        "worker-run-{}-{}-{}.log",
+    let log = crate::launch_record::phase_log_path(
+        &root,
         role.as_str(),
         issue,
-        chrono::Utc::now().timestamp()
-    ));
+        chrono::Utc::now().timestamp(),
+    );
+    // Issue #11360: stamp the parent sweep so its terminal transition can join
+    // this log's usage to the outcome journal (spawn-worker appends after it).
+    write_phase_log_header(&log, std::env::var("LOOM_SWEEP_ID").ok().as_deref(), role, issue);
     let target = args.issue.or(args.pr).unwrap_or(issue);
     let mut cmd = Command::new(super::scripts_dir(&root).join("spawn-worker.sh"));
     cmd.current_dir(&worktree)
@@ -732,6 +855,7 @@ mod tests {
                 "LOOM_RUNTIME_BUILDER",
                 "LOOM_RUNTIME_DOCTOR",
                 "LOOM_WORKTREE_ROOT",
+                "LOOM_SWEEP_CLAIM_OWNED",
                 // #11400: the zai-flash tap needs a seat from the fixture.
                 "ZAI_API_KEY",
                 "LOOM_NATIVE_AUTH_FILE",
@@ -818,6 +942,103 @@ mod tests {
         assert_eq!(admit(dir.path(), Role::Doctor).unwrap().0.runtime, "claude");
     }
 
+    /// A fixture whose role preference is Claude-only, optionally with a
+    /// selectable zai seat, so any opencode launch can only come from an
+    /// explicit per-dispatch tap (#11284).
+    fn explicit_tap_fixture(with_seat: bool) -> tempfile::TempDir {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        for kind in ["roles", "runtimes"] {
+            let to = dir.path().join(".loom").join(kind);
+            std::fs::create_dir_all(&to).unwrap();
+            for entry in std::fs::read_dir(repo.join("defaults").join(kind))
+                .unwrap()
+                .flatten()
+            {
+                let p = entry.path();
+                if p.extension().and_then(|e| e.to_str()) == Some("json") {
+                    std::fs::copy(&p, to.join(p.file_name().unwrap())).unwrap();
+                }
+            }
+        }
+        for rt in ["claude", "opencode"] {
+            write_exec(&dir.path().join(format!(".loom/scripts/spawn-{rt}.sh")), "#!/bin/sh\n");
+        }
+        let config = serde_json::json!({
+            "runtimes": {"rolePreference": {"builder": ["claude"], "doctor": ["claude"]}}
+        });
+        std::fs::write(dir.path().join(".loom/config.json"), config.to_string()).unwrap();
+        if with_seat {
+            let pool = crate::api_keys_pool::paths::per_repo_api_keys_dir(dir.path());
+            crate::api_keys_pool::registry::add(&pool, "zai", "a", "ZAI_API_KEY", "k", false)
+                .unwrap();
+        }
+        dir
+    }
+
+    fn zai_flash() -> crate::runtime_preference::Tap {
+        crate::runtime_preference::Tap {
+            runtime: "opencode".into(),
+            model_profile: Some("zai-flash".into()),
+        }
+    }
+
+    /// #11284: an explicit tap recorded at dispatch reaches Builder (by
+    /// `--issue`) and Doctor (by the daemon's `LOOM_SWEEP_CLAIM_OWNED`), and
+    /// keeps doing so on a retry or a resumed sweep (each is a fresh `admit`).
+    /// Without a record the role preference (Claude here) is unchanged.
+    #[test]
+    #[serial_test::serial]
+    fn explicit_tap_steers_builder_and_doctor_across_retries() {
+        let _env = EnvGuard::clear();
+        let dir = explicit_tap_fixture(true);
+        // The Claude-only preference has no token pool in this fixture, so
+        // without a record the launch is (correctly) unservable: the tap
+        // below succeeds only because it bypasses the preference list.
+        assert!(admit_for_issue(dir.path(), Role::Builder, Some(42)).is_err());
+
+        crate::dispatch_tap::save(dir.path(), 42, &zai_flash()).unwrap();
+        std::env::set_var("LOOM_SWEEP_CLAIM_OWNED", "42");
+        for attempt in 0..3 {
+            let (b, _) = admit_for_issue(dir.path(), Role::Builder, Some(42)).unwrap();
+            assert_eq!(b.runtime, "opencode", "builder attempt {attempt}");
+            let (d, _) = admit_for_issue(dir.path(), Role::Doctor, None).unwrap();
+            assert_eq!(d.runtime, "opencode", "doctor retry {attempt}");
+            let stamp = d.preference.unwrap();
+            assert_eq!(stamp.tap, "opencode:zai-flash");
+            assert_eq!(stamp.model_profile.as_deref(), Some("zai-flash"));
+        }
+        // A different issue is untouched.
+        assert!(admit_for_issue(dir.path(), Role::Builder, Some(43)).is_err());
+    }
+
+    /// #11284: an explicit tap with no spawnable seat is refused with the
+    /// reason, not handed to the Claude preference.
+    #[test]
+    #[serial_test::serial]
+    fn unavailable_explicit_tap_is_refused_not_replaced() {
+        let _env = EnvGuard::clear();
+        let dir = explicit_tap_fixture(false);
+        crate::dispatch_tap::save(dir.path(), 42, &zai_flash()).unwrap();
+        for role in [Role::Builder, Role::Doctor] {
+            let err = admit_for_issue(dir.path(), role, Some(42)).err().unwrap();
+            assert!(err.message.contains("opencode:zai-flash"), "{role:?}: {}", err.message);
+            assert!(err.message.contains("refusing"), "{role:?}: {}", err.message);
+        }
+        // The dispatch-time check agrees and records nothing for a new issue.
+        let refused = crate::dispatch_tap::validate_request(
+            dir.path(),
+            &crate::types::SweepKind::Issue(77),
+            Some("opencode"),
+            Some("zai-flash"),
+        );
+        assert!(matches!(
+            refused.as_ref().map_err(|e| &**e),
+            Err(crate::types::Response::RuntimeRejected(_))
+        ));
+        assert!(crate::dispatch_tap::load(dir.path(), 77).is_none());
+    }
+
     /// #11303 review (P1 at d7fa7f835): setup and reuse resolve the helpers'
     /// effective root, for an env and a config override, Builder and Doctor;
     /// a stacked Builder passes `--base`.
@@ -894,5 +1115,85 @@ mod tests {
         assert!(
             Cli::try_parse_from(["x", "--role", "builder", "--issue", "1", "--pr", "2"]).is_err()
         );
+    }
+    #[test]
+    fn claude_escalation_refuses_non_claude_pins_but_ignores_inherited_ones() {
+        assert!(escalation_pin_conflict(None, None, None).is_none());
+        assert!(escalation_pin_conflict(Some("claude"), None, None).is_none());
+        assert!(escalation_pin_conflict(None, Some(" "), None).is_none());
+        let doc = escalation_pin_conflict(Some("opencode"), None, None).unwrap();
+        assert!(doc.contains("LOOM_RUNTIME_DOCTOR=opencode"), "{doc}");
+        assert!(escalation_pin_conflict(None, Some("opencode"), None).is_some());
+        // A global pin that arrived with LOOM_ROLE is the parent phase's own.
+        assert!(escalation_pin_conflict(None, Some("opencode"), Some("sweep")).is_none());
+    }
+
+    #[test]
+    fn escalate_claude_flag_parses_for_doctor() {
+        use clap::Parser;
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: RunArgs,
+        }
+        let ok = Cli::try_parse_from([
+            "x",
+            "--role",
+            "doctor",
+            "--pr",
+            "5",
+            "--escalate-claude",
+            "why",
+        ])
+        .unwrap();
+        assert_eq!(ok.args.escalate_claude.as_deref(), Some("why"));
+    }
+
+    /// #11360: the phase log names its parent sweep before spawn-worker
+    /// appends, so the sweep's terminal transition can join it; the doctor's
+    /// launch then lands after the header, inside the anchored region.
+    #[test]
+    fn the_phase_log_is_stamped_with_the_parent_sweep_before_the_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = crate::launch_record::phase_log_path(dir.path(), "doctor", 7, 1);
+        write_phase_log_header(&log, Some("sweep-issue-7-3"), Role::Doctor, 7);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, b"spawn-worker: go\n"))
+            .unwrap();
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            text,
+            "==== loom-daemon worker run: parent_sweep=sweep-issue-7-3 role=doctor issue=7 ====\n\
+             spawn-worker: go\n"
+        );
+        let anchor = crate::launch_record::phase_log_anchor("sweep-issue-7-3").unwrap();
+        assert!(text.contains(&anchor));
+        assert_eq!(
+            crate::launch_record::phase_logs_for_issue(dir.path(), 7),
+            vec![("doctor".to_string(), log)]
+        );
+        // No parent sweep: stamped, but matched by no sweep.
+        let orphan = dir.path().join("orphan.log");
+        write_phase_log_header(&orphan, None, Role::Builder, 7);
+        assert!(std::fs::read_to_string(&orphan)
+            .unwrap()
+            .contains("parent_sweep=none "));
+        assert_eq!(crate::launch_record::phase_log_anchor("none"), None);
+        // The parent sweep log is anchored on `sweep_id=<id>`; the phase
+        // header must never carry that text, or quoting it would re-anchor.
+        assert!(!text.contains("sweep_id=sweep-issue-7-3"));
+    }
+
+    /// #11359 + #11360: the escalation path opens no phase log (nothing to
+    /// stamp, nothing to join) and names the runtime it hands off to.
+    #[test]
+    fn the_claude_escalation_report_names_claude_and_carries_no_phase_log() {
+        let report = escalation_report(Some(5), "2 GLM rejections");
+        assert_eq!(report.runtime, "claude");
+        assert_eq!(report.outcome, "delegate-to-claude");
+        assert_eq!(report.log_path, None);
+        assert_eq!(report.escalation_reason.as_deref(), Some("2 GLM rejections"));
     }
 }

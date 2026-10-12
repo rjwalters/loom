@@ -158,7 +158,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
                 depends_on,
                 force,
                 ignore_host_constraint,
-                allow_local,
+                tap,
             } => {
                 handle_dispatch_command(
                     issue,
@@ -168,7 +168,8 @@ pub(crate) async fn run_daemon() -> Result<()> {
                     depends_on,
                     force,
                     ignore_host_constraint,
-                    allow_local,
+                    tap.runtime,
+                    tap.model_profile,
                 )
                 .await
             }
@@ -528,6 +529,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // #9872: name the rate-limit pool the credential spends (WARN on a
     // personal one: shared with every PAT/OAuth/`gh` login of that user).
     let credential_preflight = credential_preflight::attach_pool(github_app_preflight.report);
+    credential_preflight::loom_ui::startup(&credential_preflight); // #11295
 
     // Per-owner managed-repo credentials (#5401). The GitHub App mechanism
     // above mints exactly ONE installation token, keyed on this daemon's
@@ -1561,6 +1563,11 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // The bus handle (#9321) carries each new escalation / recovery onto
     // `operator_priority.escalation` so the Safehouse sink relays it into the
     // team's Matrix room rather than leaving the ask as a forge comment only.
+    // #11295: loom-ui's Alerts page, before its producers below start.
+    // Started before the watches below; alerts raised earlier wait in its outbox.
+    if loom_daemon::loom_ui_alerts::start(&sweep_workspace).is_some() {
+        loom_daemon::loom_ui_alerts::watches::spawn_all(&sweep_workspace);
+    }
     let _star_liveness = _work_finder_handle.is_some().then(|| {
         loom_daemon::star_liveness::task::spawn(sweep_workspace.clone(), Some(event_bus.clone()))
     });

@@ -491,6 +491,12 @@ fn stub_gh(dir: &Path) -> String {
         r#"#!/usr/bin/env bash
 printf '%s\n' "$*" >> "{d}/argv.log"
 if [ "$2" = "--include" ]; then
+  case "$3" in
+    repos/o/r/commits/*/check-runs*)
+      [ -f "{d}/runs.json" ] || exit 1
+      printf 'HTTP/2.0 200 OK\n\n'; cat "{d}/runs.json"; exit 0 ;;
+    repos/o/r/rules/branches/*) printf 'HTTP/2.0 200 OK\n\n[]'; exit 0 ;;
+  esac
   [ -f "{d}/comments.json" ] || exit 1
   page=1
   [[ "$3" =~ \&page=([0-9]+) ]] && page="${{BASH_REMATCH[1]}}"

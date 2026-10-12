@@ -125,6 +125,7 @@ pub struct GroupRow {
     pub free: u64,
     pub not_modified: u64,
     pub rate_limited: u64,
+    pub secondary_limited: u64,
     pub error: u64,
     /// Rows a reader route shed without a request (W4-C).
     pub shed: u64,
@@ -208,6 +209,7 @@ pub fn aggregate_lines<'a>(
             Outcome::Ok => {}
             Outcome::NotModified => g.not_modified += 1,
             Outcome::RateLimited => g.rate_limited += 1,
+            Outcome::SecondaryLimited => g.secondary_limited += 1,
             Outcome::Error => g.error += 1,
             Outcome::Shed => g.shed += 1,
         }
@@ -253,6 +255,7 @@ pub fn status_rows(dir: &Path, now: i64) -> Vec<crate::types::ForgeBucketStatus>
         row.charged += g.charged;
         row.not_modified += g.not_modified;
         row.rate_limited += g.rate_limited;
+        row.secondary_limited += g.secondary_limited;
     }
     let mut book = crate::forge_bucket_book::snapshot(now);
     if book.is_empty() {

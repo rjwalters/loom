@@ -530,8 +530,13 @@ fn resolve_bind() -> (IpAddr, String) {
     (IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), "host.docker.internal".to_string())
 }
 
+/// Probe the docker bridge gateway. The program resolves through the shared
+/// [`docker_program`](crate::sweep_registry::reaper::container_stop::docker_program)
+/// so a `cfg(test)` build never runs the host's real `docker` (#11449,
+/// #11523): there the probe fails at once and the caller takes the loopback
+/// fallback.
 fn docker_bridge_gateway() -> Option<IpAddr> {
-    let mut command = Command::new("docker");
+    let mut command = Command::new(crate::sweep_registry::reaper::container_stop::docker_program());
     command.args([
         "network",
         "inspect",

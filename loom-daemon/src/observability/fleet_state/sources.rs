@@ -18,7 +18,10 @@ use super::{
     held_stage, FleetInput, HeldSweep, ListedPr, ReadyItem, ReadyQueue, RepoListing, REVIEW_LABELS,
 };
 use crate::sweep_registry::SweepRegistry;
-use crate::telemetry::kinds::fleet_state::{FleetCapacity, FleetSlots, MainCi, PlannerStamps};
+use crate::telemetry::kinds::fleet_state::{
+    FleetCapacity, FleetEligibleReason, FleetHaltReason, FleetRepoHalt, FleetSlots, MainCi,
+    PlannerStamps,
+};
 use crate::telemetry::RepoVisibility;
 use crate::types::{ReadyQueueRow, SweepKind, WorkFinderTickSummary};
 use crate::workspace_pool::WorkspacePool;
@@ -240,17 +243,32 @@ async fn review_listings(roots: &[(PathBuf, String)]) -> Vec<RepoListing> {
 ///
 /// The walk failed, read `MAX_PAGES` full pages or saw the listing shift: the
 /// set may be incomplete, so the repo has no curated listing this pass.
+#[cfg(test)]
 fn curated_listing_with(
     gh: &Path,
     root: &Path,
     repo: Option<&str>,
+) -> anyhow::Result<BTreeMap<u32, Option<DateTime<Utc>>>> {
+    label_listing_with(gh, root, repo, super::outcomes::CURATED_LABEL)
+}
+
+/// [`curated_listing_with`] for any issue label (`loom:triage`, #11398).
+///
+/// # Errors
+///
+/// As [`curated_listing_with`].
+fn label_listing_with(
+    gh: &Path,
+    root: &Path,
+    repo: Option<&str>,
+    label: &str,
 ) -> anyhow::Result<BTreeMap<u32, Option<DateTime<Utc>>>> {
     let items = crate::forge_listing::list_issues_cached_all_as(
         CALLER,
         gh,
         Some(root),
         repo,
-        super::outcomes::CURATED_LABEL,
+        label,
         "open",
     )?;
     Ok(items
@@ -260,15 +278,16 @@ fn curated_listing_with(
         .collect())
 }
 
-/// Each managed repo's curated listing; an incomplete one leaves the repo out
-/// (a partial listing would read as issues arriving).
-async fn curated_listings(roots: &[(PathBuf, String)]) -> Curated {
+/// Each managed repo's listing of open `label` issues; an incomplete one
+/// leaves the repo out (a partial listing would read as issues arriving or
+/// leaving).
+async fn label_listings(roots: &[(PathBuf, String)], label: &'static str) -> Curated {
     let mut out = Curated::new();
     for (root, slug) in roots {
         let root = root.clone();
         let result = tokio::task::spawn_blocking(move || {
             let gh = PathBuf::from(crate::gh_invocation::gh_bin());
-            curated_listing_with(&gh, &root, None)
+            label_listing_with(&gh, &root, None, label)
         })
         .await;
         match result {
@@ -276,10 +295,10 @@ async fn curated_listings(roots: &[(PathBuf, String)]) -> Curated {
                 out.insert(slug.clone(), listing);
             }
             Ok(Err(error)) => {
-                log::debug!("fleet.state: curated listing of {slug} incomplete: {error:#}");
+                log::debug!("fleet.state: {label} listing of {slug} incomplete: {error:#}");
             }
             Err(join_error) => {
-                log::debug!("fleet.state: curated listing of {slug} panicked: {join_error}");
+                log::debug!("fleet.state: {label} listing of {slug} panicked: {join_error}");
             }
         }
     }
@@ -292,7 +311,7 @@ fn level(row: &ReadyQueueRow) -> u8 {
     row.plan
         .keys
         .iter()
-        .find(|k| k.name == "operator_priority_level")
+        .find(|k| k.name == "level")
         .and_then(|k| k.value.as_u64())
         .and_then(|n| u8::try_from(n).ok())
         .unwrap_or(u8::from(row.operator_priority))
@@ -307,7 +326,30 @@ async fn ready_queue(
     let summary = crate::work_finder::last_tick_summary()?;
     let refs = crate::observability::queue_snapshot::resolve_repos(&summary, slug_cache).await;
     let slug = |root: &str| refs.get(root).map(|r| r.repo.to_ascii_lowercase());
-    Some(ready_from_tick(&summary, slug, managed))
+    let mut ready = ready_from_tick(&summary, slug, managed);
+    ready.halts = halts_by_slug(&crate::work_finder::halt_cause::since::current(), slug);
+    Some(ready)
+}
+
+/// The work finder's held roots (#11564) by lowercased slug, each as its
+/// `fleet.state` fact. Every held root is kept (no cap); a root `slug` cannot
+/// name is left out, as its ready rows are. Pure.
+pub(super) fn halts_by_slug(
+    halts: &Option<Vec<crate::work_finder::halt_cause::since::RootHalt>>,
+    slug: impl Fn(&str) -> Option<String>,
+) -> BTreeMap<String, FleetRepoHalt> {
+    let mut out = BTreeMap::new();
+    for halt in halts.iter().flatten() {
+        let Some(repo) = slug(&halt.root.to_string_lossy()) else {
+            continue;
+        };
+        out.entry(repo).or_insert_with(|| FleetRepoHalt {
+            reason: FleetHaltReason::from_cause(halt.cause),
+            since: halt.since,
+            since_lower_bound: halt.since_lower_bound,
+        });
+    }
+    out
 }
 
 /// [`ready_queue`] over one tick, with `slug` resolving a root. Pure.
@@ -333,11 +375,16 @@ fn ready_from_tick(
                 issue: row.issue,
                 rank: small(row.rank),
                 star: row.operator_priority,
-                star_at: parse_instant(row.operator_priority_at.as_deref()),
+                star_at: None,
                 level: level(row),
                 fleet_priority: row.workspace_priority,
                 created_at: parse_instant(row.created_at.as_deref()),
                 main_red_fix: row.main_red_fix,
+                eligible_reason: FleetEligibleReason::from_disposition(row.disposition),
+                // Only a clocked hold's own expiry: never a stray one.
+                eligible_at: FleetEligibleReason::from_disposition(row.disposition)
+                    .filter(|reason| reason.has_clock())
+                    .and(row.plan.held_until),
             })
         })
         .collect();
@@ -365,6 +412,7 @@ fn ready_from_tick(
         listed,
         complete,
         slots,
+        halts: BTreeMap::new(),
     }
 }
 
@@ -416,12 +464,18 @@ fn capacity(workspace_root: &Path, live_workers: usize) -> FleetCapacity {
 }
 
 /// `main` CI status of the repo rooted at `root` from the main-health gate:
-/// red when halted on a verified-red run, unknown when the gate has not
-/// produced a verdict or could not evaluate, else green.
+/// red when halted on a verified-red run, green when the gate has produced a
+/// green verdict, unknown otherwise (#11565). Unknown means the gate has no
+/// verdict for the root: it is not enabled for it (`autonomous.mainHealthGate`
+/// is off by default, or the repo has no usable `buildGate`), has not
+/// completed a run yet this process, or its last tick could not evaluate.
 fn main_ci(states: &crate::main_health_gate::WorkspaceHealthStates, root: &Path) -> MainCi {
-    if states.is_halted(root) {
+    let Some(state) = states.find(root) else {
+        return MainCi::Unknown;
+    };
+    if state.is_halted() {
         MainCi::Red
-    } else if states.is_unevaluated(root) || states.last_verdict_at(root).is_none() {
+    } else if state.is_unevaluated() || state.last_verdict_at().is_none() {
         MainCi::Unknown
     } else {
         MainCi::Green
@@ -485,7 +539,7 @@ pub(super) async fn gather(
     slug_cache: &mut HashMap<String, String>,
     host_id: &str,
     now: DateTime<Utc>,
-) -> (FleetInput, Reused, Curated) {
+) -> (FleetInput, Reused, Curated, Curated) {
     // Resolves every provisioned root, so the registries' roots are cached.
     let roots = managed_roots(workspace_pool, slug_cache).await;
     let managed: BTreeSet<String> = roots.iter().map(|(_, slug)| slug.clone()).collect();
@@ -493,7 +547,8 @@ pub(super) async fn gather(
         slug_cache.get(root).map(|s| s.to_ascii_lowercase())
     });
     let listings = review_listings(&roots).await;
-    let curated = curated_listings(&roots).await;
+    let curated = label_listings(&roots, super::outcomes::CURATED_LABEL).await;
+    let triage = label_listings(&roots, super::outcomes::close::TRIAGE_LABEL).await;
     let ready = ready_queue(&managed, slug_cache).await;
     let main_ci = main_ci_by_slug(
         roots
@@ -526,7 +581,7 @@ pub(super) async fn gather(
         listings,
         ready,
     };
-    (input, reused, curated)
+    (input, reused, curated, triage)
 }
 
 /// A tick pass's input (#11161): the registries and the work finder's last
@@ -575,10 +630,13 @@ pub(super) fn reused_input(host_id: &str, reused: &Reused) -> FleetInput {
     }
 }
 
-/// The ready queue of `summary`, its roots named by the collector's slugs.
-/// Pure.
+/// The ready queue of `summary`, its roots named by the collector's slugs,
+/// with the work finder's current repo halts (#11564).
 pub(super) fn ready_input(summary: &WorkFinderTickSummary, reused: &Reused) -> ReadyQueue {
-    ready_from_tick(summary, |root| reused.slug(root), &reused.managed)
+    let mut ready = ready_from_tick(summary, |root| reused.slug(root), &reused.managed);
+    let halts = crate::work_finder::halt_cause::since::current();
+    ready.halts = halts_by_slug(&halts, |root| reused.slug(root));
+    ready
 }
 
 /// The seconds between passes: the work finder's tick interval once it has

@@ -852,8 +852,9 @@ pub const SPECS: &[CheckSpec<'static>] = &[
     // Rust surface: `update-gitignore`'s handler in `cli/misc_cmds.rs` calls
     // `loom_daemon::init::update_gitignore` (`init/post_init.rs`, which owns
     // EPHEMERAL_PATTERNS). The whole `init` module tree is listed, plus the
-    // modules its production code reaches (`agent_skills`, `install_compat`,
-    // `proc_exec`, `release_provenance`, `self_update`), and the dispatch chain.
+    // modules its production code reaches (`agent_skills`, `fleet_policy`,
+    // `config_resolver`, `install_compat`, `proc_exec`, `release_provenance`,
+    // `self_update`), and the dispatch chain.
     // MUST grow if the checker starts using another module —
     // `daemon_surface_tests.rs` fails until it does. The script also runs
     // `scripts/cargo-target-dir.sh`.
@@ -865,6 +866,8 @@ pub const SPECS: &[CheckSpec<'static>] = &[
             "loom-daemon/src/cli/misc_cmds.rs",
             "loom-daemon/src/init/**",
             "loom-daemon/src/agent_skills.rs",
+            "loom-daemon/src/fleet_policy.rs",
+            "loom-daemon/src/config_resolver.rs",
             "loom-daemon/src/install_compat.rs",
             "loom-daemon/src/install_compat/**",
             "loom-daemon/src/proc_exec.rs",

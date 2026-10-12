@@ -755,6 +755,9 @@ fn terminal_records(
         judge_verdicts: None,
         doctor_cycles: None,
         issue_end_state: None,
+        // `result` already encodes the only exit fact this path has
+        // (`Success` ⇔ exit 0), so a `Failure` here is never a clean exit.
+        exit_code: None,
     };
     let (disposition, failure_class) = crate::telemetry::classify_disposition(&signals);
     let outcome_result = crate::telemetry::result_for_disposition(&signals, disposition);
@@ -830,6 +833,7 @@ fn terminal_records(
             attempt_index: None,
             previous_sweep_id: None,
             trigger: None,
+            dispatch_origin: None,
             rework_events: None,
             pr_numbers: None,
             hw_lines_added: None,

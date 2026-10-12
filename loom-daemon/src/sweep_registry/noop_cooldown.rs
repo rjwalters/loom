@@ -97,6 +97,7 @@ use super::*;
 
 mod fingerprint;
 mod hold;
+mod peer_expiry;
 
 pub(crate) use fingerprint::ParkKind;
 pub(crate) use hold::NoopCooldownTable;
@@ -860,6 +861,64 @@ mod tests {
             1,
             "the suppression is scoped to one release, not to the issue (#8912)"
         );
+    }
+
+    // --- One release, one classification, one journal row (#11438) ---------
+
+    /// Issue #11438 end to end: the self-reported clean exit journals as a
+    /// no-op — `success` / `noop_already_done`, no failure class — never
+    /// `failure` + `env_failure` + `unclassified:spawn-death`, the pair that
+    /// drove `retry_after_env_failure` re-dispatch of a deliberate no-op.
+    #[test]
+    fn a_self_reported_clean_noop_journals_as_a_noop_not_a_death() {
+        let dir = tempdir().unwrap();
+        let mut reg = no_progress_test_registry(dir.path(), "OPEN", "", false);
+        let telemetry_path = dir.path().join("test-sweep-outcome-telemetry.jsonl");
+        reg.config.outcome_telemetry_path = Some(telemetry_path.clone());
+
+        let sweep_id = insert_clean_exit_running(&mut reg, 89_124, 0);
+        reg.record_noop_release(89_124, Some("no build work".into()));
+        reg.reap_once();
+
+        let record = crate::sweep_outcomes::read_all_sweep_outcomes(&telemetry_path)
+            .into_iter()
+            .rev()
+            .find(|r| r.sweep_id == sweep_id)
+            .expect("the reap must write a sweep.outcome record");
+        assert_eq!(record.result, crate::telemetry::SweepResult::Success);
+        assert_eq!(record.disposition, crate::telemetry::SweepDisposition::NoopAlreadyDone);
+        assert!(
+            record.failure_class.is_none(),
+            "a deliberate no-op carries no failure class: {:?}",
+            record.failure_class
+        );
+    }
+
+    /// The guard on the fix: the SAME shape with no self-report still journals
+    /// `failure` (a genuine no-progress candidate for the hold) — but as
+    /// `unknown` + `unclassified:no-phase-signal`, never
+    /// `env_failure`/`unclassified:spawn-death`: a clean exit (code 0) is not
+    /// an environmental fault (#11438).
+    #[test]
+    fn an_unreported_clean_short_exit_is_never_an_env_failure() {
+        let dir = tempdir().unwrap();
+        let mut reg = no_progress_test_registry(dir.path(), "OPEN", "", false);
+        let telemetry_path = dir.path().join("test-sweep-outcome-telemetry.jsonl");
+        reg.config.outcome_telemetry_path = Some(telemetry_path.clone());
+
+        let sweep_id = insert_clean_exit_running(&mut reg, 89_125, 0);
+        reg.reap_once();
+
+        let record = crate::sweep_outcomes::read_all_sweep_outcomes(&telemetry_path)
+            .into_iter()
+            .rev()
+            .find(|r| r.sweep_id == sweep_id)
+            .expect("the reap must write a sweep.outcome record");
+        assert_eq!(record.result, crate::telemetry::SweepResult::Failure);
+        assert_eq!(record.disposition, crate::telemetry::SweepDisposition::Unknown);
+        assert_eq!(record.failure_class.as_deref(), Some(crate::telemetry::NO_PHASE_SIGNAL_CLASS));
+        // ...and the reaper's own feed counted it toward the #10156 hold.
+        assert_eq!(reg.noop_streak_count(89_125), 1);
     }
 
     // --- Config resolution precedence (env > config > default) -------------

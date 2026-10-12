@@ -229,3 +229,65 @@ fn an_announced_mount_stale_refusal_classifies_from_the_log() {
         "role child exited with code 78; runtime adapter reported SESSION_MOUNT_STALE"
     );
 }
+
+/// #11453: the launch-failure hold counts only an explicit allowlist of
+/// deterministic classes. Every other class this module can emit is transient
+/// (fail open to today's retry-next-tick), and `sandbox-unavailable` is owned
+/// by `sandbox_hold`, so it must never double-arm.
+#[test]
+fn only_the_allowlisted_classes_are_deterministic() {
+    let deterministic = [
+        "launch-failed",
+        "toolless-launch",
+        "preflight-auth-failed",
+        "credential-expired",
+        "preflight-no-cli-start",
+        "preflight-mcp-failed",
+        "preflight-token-selection-failed",
+        "exit-78",
+        "exit-126",
+        "exit-127",
+    ];
+    let transient = [
+        "wait-failed",
+        "timeout-ceiling",
+        "killed-by-signal",
+        "sandbox-unavailable",
+        "session-down",
+        "session-mount-stale",
+        "account-pool-exhausted",
+        "account-exhausted:token-exhausted",
+        "account-exhausted:model-credits-exhausted",
+        "account-exhausted:rate-limited",
+        "session-limit",
+        "runtime-timeout",
+        "runtime-fatal",
+        "cwd-deleted",
+        "model-refusal",
+        "no-usable-account",
+        "execution-error",
+        "self-kill:background-wait",
+        "exit-1",
+        "exit-2",
+        "exit-75",
+        "exit-137",
+        crate::observability::lifecycle::UNCLASSIFIED,
+        "",
+    ];
+    for class in deterministic {
+        assert!(is_deterministic(class), "{class} must count toward the hold");
+    }
+    for class in transient {
+        assert!(!is_deterministic(class), "{class} must stay transient");
+    }
+    // The classes the launch-side constructors build, checked through them.
+    let spawn_error = std::io::Error::from(std::io::ErrorKind::ArgumentListTooLong);
+    assert!(is_deterministic(launch_failed(&spawn_error).class()));
+    assert!(is_deterministic(toolless_launch().class()));
+    assert!(!is_deterministic(sandbox_unavailable().class()));
+    assert!(!is_deterministic(timed_out(Duration::from_secs(1)).class()));
+    assert!(!is_deterministic(wait_failed(&spawn_error).class()));
+    // A RECOVERABLE adapter verdict (#6201's shape) falls to `exit-<code>`.
+    let recoverable = classify_exit(CLI_START, Some(TerminalClassification::Recoverable), 1);
+    assert!(!is_deterministic(&recoverable), "{recoverable}");
+}

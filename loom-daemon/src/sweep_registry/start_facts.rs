@@ -43,13 +43,14 @@ impl SweepRegistry {
 
     /// Emit `sweep.global.dispatch` for the entry just recorded under
     /// `sweep_id`. An `Issue` dispatch also records and carries its start
-    /// facts; `model_source` is `None` for a `PrSet` dispatch, which has none.
+    /// facts; `start` (its `model_source` and [`DispatchOrigin`]) is `None`
+    /// for a `PrSet` dispatch, which has none.
     pub(super) fn emit_dispatch(
         &mut self,
         sweep_id: &SweepId,
         admission: &DispatchAdmission,
         story_points: Option<u32>,
-        model_source: Option<&'static str>,
+        start: Option<(&'static str, DispatchOrigin)>,
     ) {
         let Some(info) = self.entries.get(sweep_id) else {
             return;
@@ -57,8 +58,8 @@ impl SweepRegistry {
         let (kind, model, effort) = (info.kind.clone(), info.model.clone(), info.effort.clone());
         let launch_runtime = info.runtime.clone();
         let runtime = admission.admitted.as_ref().map(|a| a.runtime.clone());
-        let start = match (&kind, model_source) {
-            (SweepKind::Issue(issue), Some(source)) => {
+        let start = match (&kind, start) {
+            (SweepKind::Issue(issue), Some((source, origin))) => {
                 let lineage = self.attempt_lineage(*issue, sweep_id);
                 // #11370: report the resolved facts, not the literal launch
                 // arguments (those stay on `SweepInfo` and the child's argv).
@@ -77,7 +78,10 @@ impl SweepRegistry {
                     runtime: runtime.clone(),
                     attempt_index: lineage.as_ref().map(|l| l.0),
                     previous_sweep_id: lineage.as_ref().and_then(|l| l.1.clone()),
-                    trigger: lineage.map(|l| l.2.to_string()),
+                    // #11444: only an operator re-dispatch becomes
+                    // `operator_redispatch`; an unknown lineage stays absent.
+                    trigger: lineage.map(|l| origin.apply_to_trigger(l.2).to_string()),
+                    dispatch_origin: Some(origin.as_str().to_string()),
                 };
                 self.start_facts.insert(sweep_id.clone(), facts.clone());
                 Some(Box::new(facts))
@@ -101,3 +105,8 @@ impl SweepRegistry {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[path = "start_facts_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[path = "dispatch_origin_tests.rs"]
+mod dispatch_origin_tests;

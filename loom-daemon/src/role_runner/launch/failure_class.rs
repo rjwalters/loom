@@ -44,6 +44,39 @@ const AUTH_PREFLIGHT_SENTINEL: &str = "# AUTH_PREFLIGHT_FAILED";
 /// table), which the sweep exhaustion signatures do not match.
 const ACCOUNT_POOL_EXHAUSTED_SENTINEL: &str = "# ACCOUNT_POOL_EXHAUSTED";
 
+/// Whether a failure `class` is **deterministic** — the same launch will fail
+/// the same way next tick — and so counts toward the per-workspace
+/// launch-failure hold (`runtime_preference::launch_failure_hold`, #11453).
+///
+/// An explicit allowlist: every class not named here is transient and keeps
+/// today's retry-next-tick behaviour, so a misclassification fails open to
+/// the status quo. Deliberately absent:
+///
+/// - `sandbox-unavailable` — owned by `sandbox_hold` (#10003); never
+///   double-armed.
+/// - `account-exhausted:*`, `account-pool-exhausted`, `session-limit`,
+///   `no-usable-account` — rate/quota, self-healing, already pool holds.
+/// - `runtime-timeout`, `timeout-ceiling`, `killed-by-signal`, `wait-failed`,
+///   `runtime-fatal`, `execution-error` — network, slowness, ops.
+/// - `session-down`, `session-mount-stale` — own handling (#10454/#10364).
+/// - `model-refusal`, `cwd-deleted`, and any other `exit-<code>`.
+#[must_use]
+pub(crate) fn is_deterministic(class: &str) -> bool {
+    matches!(
+        class,
+        "launch-failed"
+            | "toolless-launch"
+            | "preflight-auth-failed"
+            | "credential-expired"
+            | "preflight-no-cli-start"
+            | "preflight-mcp-failed"
+            | "preflight-token-selection-failed"
+            | "exit-78"
+            | "exit-126"
+            | "exit-127"
+    )
+}
+
 /// `Command::spawn` failed: no child process exists.
 pub(super) fn launch_failed(error: &std::io::Error) -> RoleFailure {
     RoleFailure::new(

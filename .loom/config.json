@@ -1,31 +1,5 @@
 {
   "version": "2",
-  "offlineMode": false,
-  "autonomous": {
-    "roleRunner": {
-      "enabled": true,
-      "roles": [
-        "curator",
-        "champion",
-        "judge",
-        "doctor",
-        "guide"
-      ],
-      "onIdle": [
-        "auditor"
-      ]
-    },
-    "collisionDetection": {
-      "enabled": true
-    },
-    "workFinder": {
-      "maxConcurrent": 8,
-      "enabled": true
-    },
-    "autoUpdate": {
-      "enabled": true
-    }
-  },
   "buildGate": {
     "enabled": true,
     "command": "bash .loom/scripts/build-gate.sh",
@@ -131,71 +105,5 @@
       },
       "theme": "midnight"
     }
-  ],
-  "safehouse": {
-    "enabled": false,
-    "room": "!ROOM_ID:safehouse.example.com",
-    "persona": "loom_daemon",
-    "workerPersonas": [
-      "loom_builder_1",
-      "loom_builder_2",
-      "loom_builder_3",
-      "loom_builder_4",
-      "loom_builder_5",
-      "loom_builder_6",
-      "loom_builder_7",
-      "loom_builder_8"
-    ]
-  },
-  "sweep": {
-    "modelExperiment": "observe"
-  },
-  "guide": {
-    "docsMaintenance": {
-      "poolPressureThreshold": 0.7,
-      "poolPressureMaxDeferSecs": 14400
-    }
-  },
-  "runtimes": {
-    "roles": {
-      "judge": "codex"
-    },
-    "_comment": "preference follows the operator's runtime order: Claude -> Codex -> OpenCode (z.ai GLM, zai-flash) -> gemini (last). Builder and Doctor are GLM-first (#11400): rolePreference.builder and rolePreference.doctor put opencode:zai-flash ahead of claude, so Doctor ticks and a sweep's Builder phase (routed through rolePreference.builder by loom-daemon worker run, #11303) run on a Z.ai seat while one is selectable in the zai api-keys pool, and fall through to Claude when the pool is dry or the host has no zai pool at all (a guarded launch never reuses OpenCode's own login, so an unprovisioned host is passed over as unavailable unless LOOM_NATIVE_AUTH_FILE, an exported ZAI_API_KEY, or an LLM gateway route supplies the credential). Judge and Curator never run on GLM: the zai-flash model profile declares excludedRoles [judge, curator], enforced at admission for every source (a preference entry is skipped as opencode:not-admitted(excludedRole), a pin is refused), so rolePreference.judge is codex -> claude only. Codex is NOT dropped for Builder/Doctor by a per-role list: defaults/runtimes/codex.json declares worktreeIsolation 'partial' (#4495) and defaults/roles/builder.json / doctor.json require it, so the admission gate skips Codex for those two roles only (logged as codex:not-admitted(worktreeIsolation)) and lifts automatically once the capability is promoted. Judge (requires only loomControl) keeps Codex first, for review independence from the Builder's runtime.",
-    "preference": [
-      "claude",
-      "codex",
-      {
-        "runtime": "opencode",
-        "modelProfile": "zai-flash"
-      },
-      "gemini"
-    ],
-    "rolePreference": {
-      "builder": [
-        {
-          "runtime": "opencode",
-          "modelProfile": "zai-flash"
-        },
-        "claude"
-      ],
-      "doctor": [
-        {
-          "runtime": "opencode",
-          "modelProfile": "zai-flash"
-        },
-        "claude"
-      ],
-      "judge": [
-        "codex",
-        "claude"
-      ]
-    }
-  },
-  "observability": {
-    "enabled": false,
-    "endpoint": "https://dashboard.example.com/ingest",
-    "batchSize": 50,
-    "flushIntervalSecs": 30,
-    "queueCapacity": 2000
-  }
+  ]
 }

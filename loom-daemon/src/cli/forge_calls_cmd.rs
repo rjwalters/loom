@@ -120,21 +120,23 @@ pub(crate) fn render(
         line("  no rows recorded in this window".to_string());
     } else {
         line(format!(
-            "  {}  {:>8} {:>6} {:>8} {:>6}",
+            "  {}  {:>8} {:>6} {:>8} {:>8} {:>6}",
             key_text(columns.iter().map(|c| (*c).to_string()).collect()),
             "CHARGED",
             "304",
             "LIMITED",
+            "2ND-LIM",
             "ERROR"
         ));
         for g in &agg.groups {
             let cells = (0..columns.len()).map(|i| cell(by, i, &g.key)).collect();
             line(format!(
-                "  {}  {:>8} {:>6} {:>8} {:>6}",
+                "  {}  {:>8} {:>6} {:>8} {:>8} {:>6}",
                 key_text(cells),
                 g.charged,
                 g.not_modified,
                 g.rate_limited,
+                g.secondary_limited,
                 g.error
             ));
         }
