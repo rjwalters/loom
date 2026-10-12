@@ -123,3 +123,77 @@ fn identical_dirt_on_a_held_host_writes_nothing() {
 
     assert_skipped(&fx, &held, CheckoutState::Behind);
 }
+
+/// `paths` land upstream holding `"one\n"` and the host pulls them, so each
+/// is in HEAD before the change under test.
+fn in_head(fx: &Fixture, paths: &[&str]) {
+    for path in paths {
+        fx.push(path, "one\n");
+    }
+    git(&fx.host, &["pull", "--quiet", "--ff-only", "origin", fx.branch]);
+}
+
+#[test]
+fn identical_dirt_non_ascii_path_is_fast_forwarded() {
+    let fx = Fixture::new();
+    in_head(&fx, &["é.txt"]);
+    let tip = fx.push("é.txt", "two\n");
+    write(&fx.host.join("é.txt"), "two\n");
+
+    let found = pass(&fx, &Knobs::default());
+
+    assert_eq!(only(&found).state, CheckoutState::FastForwarded, "{found:?}");
+    assert_eq!(fx.head(), tip);
+    assert_eq!(git(&fx.host, &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn identical_dirt_non_ascii_path_that_differs_stays_dirty() {
+    let fx = Fixture::new();
+    in_head(&fx, &["é.txt"]);
+    fx.push("é.txt", "two\n");
+    write(&fx.host.join("é.txt"), "mine\n");
+
+    assert_skipped(&fx, &Knobs::default(), CheckoutState::Dirty);
+    assert_eq!(read(&fx, "é.txt"), "mine\n");
+}
+
+#[test]
+fn identical_dirt_glob_path_does_not_vouch_for_its_lookalike() {
+    let fx = Fixture::new();
+    in_head(&fx, &["a[1].txt", "a1.txt"]);
+    fx.push("a[1].txt", "two\n");
+    write(&fx.host.join("a[1].txt"), "two\n");
+    write(&fx.host.join("a1.txt"), "mine\n");
+
+    assert_skipped(&fx, &Knobs::default(), CheckoutState::Dirty);
+    assert_eq!(read(&fx, "a1.txt"), "mine\n", "a1.txt is untouched");
+    assert_eq!(read(&fx, "a[1].txt"), "two\n");
+}
+
+#[test]
+fn identical_dirt_path_with_spaces_is_fast_forwarded() {
+    let fx = Fixture::new();
+    in_head(&fx, &["with space.txt"]);
+    let tip = fx.push("with space.txt", "two\n");
+    write(&fx.host.join("with space.txt"), "two\n");
+
+    let found = pass(&fx, &Knobs::default());
+
+    assert_eq!(only(&found).state, CheckoutState::FastForwarded, "{found:?}");
+    assert_eq!(fx.head(), tip);
+    assert_eq!(read(&fx, "with space.txt"), "two\n");
+}
+
+#[test]
+fn identical_dirt_rename_stays_dirty() {
+    // The new name is not in HEAD, so `checkout HEAD --` could not restore
+    // it: never vouched for.
+    let fx = Fixture::new();
+    fx.push("README.md", "two\n");
+    git(&fx.host, &["mv", "README.md", "moved.md"]);
+
+    assert_skipped(&fx, &Knobs::default(), CheckoutState::Dirty);
+    assert_eq!(read(&fx, "moved.md"), "one\n");
+    assert!(!fx.host.join("README.md").exists());
+}

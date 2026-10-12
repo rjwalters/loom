@@ -293,7 +293,8 @@ fn classify_and_report(repo_root: &Path, branch: &str, args: &Args, state: &mut 
             managed.join(" ")
         ));
         if args.auto_resolve_safe_abort {
-            let mut checkout: Vec<&str> = vec!["checkout", "--"];
+            let mut checkout: Vec<&str> =
+                vec![git_ff_identical::LITERAL_PATHSPECS, "checkout", "--"];
             checkout.extend(managed.iter().map(String::as_str));
             let merged = git_inherit(repo_root, &checkout)
                 && git_inherit(
@@ -346,8 +347,7 @@ fn classify_and_report(repo_root: &Path, branch: &str, args: &Args, state: &mut 
             identical.join(" ")
         ));
         if args.auto_resolve_safe_abort {
-            let mut checkout: Vec<&str> = vec!["checkout", "HEAD", "--"];
-            checkout.extend(identical.iter().map(String::as_str));
+            let checkout = git_ff_identical::discard_args(&identical);
             let merged = git_inherit(repo_root, &checkout)
                 && git_inherit(
                     repo_root,
@@ -364,7 +364,7 @@ fn classify_and_report(repo_root: &Path, branch: &str, args: &Args, state: &mut 
             return false;
         }
         out::err(&format!(
-            "Safe to resolve: git -C \"{}\" checkout HEAD -- {}",
+            "Safe to resolve: git -C \"{}\" --literal-pathspecs checkout HEAD -- {}",
             repo_root.display(),
             identical.join(" ")
         ));
@@ -531,12 +531,24 @@ fn is_managed_path(repo_root: &Path, path: &str) -> bool {
     false
 }
 
-/// Every TRACKED dirty path from `git status --porcelain`, `??` skipped, a
-/// rename reduced to its destination, and one surrounding quote pair dropped
-/// ([`git_ff_identical::tracked_paths_from_porcelain`]).
+/// Every TRACKED dirty path, exact: `git status --porcelain -z`
+/// (NUL-separated, never C-quoted; a rename contributes both of its paths),
+/// parsed by [`git_ff_identical::tracked_paths_from_porcelain_z`]. Empty —
+/// so neither auto-resolve class applies — when git fails or a path is not
+/// exact UTF-8.
 fn dirty_tracked_paths(repo_root: &Path) -> Vec<String> {
-    let lines = porcelain(repo_root);
-    git_ff_identical::tracked_paths_from_porcelain(lines.iter().map(String::as_str))
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(git_ff_identical::STATUS_ARGS)
+        .stderr(Stdio::null())
+        .output();
+    match out {
+        Ok(out) if out.status.success() => {
+            git_ff_identical::tracked_paths_from_porcelain_z(&out.stdout).unwrap_or_default()
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// `_ff_abort_all_dirty_tracked_managed` — `Some(paths)` iff at least one

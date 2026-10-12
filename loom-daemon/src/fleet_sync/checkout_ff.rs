@@ -138,8 +138,11 @@
 //! The git writes are both in row 10 ([`git`]): the `merge --ff-only`, and,
 //! immediately before it, a `checkout HEAD -- <paths>` of local edits that
 //! are byte-identical to `origin/<default>` (row 9's exception, #11553). That
-//! discard is the only thing this step can discard, and it loses nothing: the
-//! merge writes exactly that content to those paths anyway. Every other
+//! discard is the only thing this step can discard. When the merge succeeds
+//! it writes exactly that content to those paths anyway; when it then fails
+//! (a file in the way, `index.lock` taken in between), the edits are gone
+//! from the working tree and the merge has not happened, but their content
+//! is still in `origin/<default>`, so no local work is lost. Every other
 //! checkout that is not clean and strictly behind is left exactly as it is
 //! and reported. This is stricter than the main-health gate's own sync
 //! (`main_health_gate::prepare_workspace_to_origin_main`), which resets and

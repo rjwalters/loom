@@ -3,8 +3,8 @@
 //!
 //! Two commands here write to the checkout: [`fast_forward`], a
 //! `merge --ff-only` with hooks off, and [`discard_identical`], a
-//! `checkout HEAD -- <paths>` with hooks off that is only ever run on paths
-//! proven identical to `origin/<branch>`, immediately before the merge
+//! `checkout HEAD -- <paths>` with hooks off and literal pathspecs that is
+//! only ever run on paths proven identical to `origin/<branch>`, immediately before the merge
 //! (#11553). Everything else is a read, a `git ls-remote` that writes
 //! nothing, or a `fetch` that moves only the remote-tracking ref (not even
 //! `FETCH_HEAD`). Nothing here runs `reset`, `rebase`, `stash` or `clean`,
@@ -232,22 +232,18 @@ pub(super) fn tracked_changes(root: &Path, timeout: Duration) -> Result<Vec<Stri
     Ok(raw.lines().map(|l| l.trim().to_string()).collect())
 }
 
-/// The tracked dirty paths, parsed from untrimmed porcelain by
-/// [`crate::git_ff_identical::tracked_paths_from_porcelain`] (the path
-/// column is fixed, so [`tracked_changes`]'s trimmed lines will not do).
+/// The tracked dirty paths, exact: `status --porcelain -z` (NUL-separated,
+/// never C-quoted) parsed by
+/// [`crate::git_ff_identical::tracked_paths_from_porcelain_z`]. `Err` when
+/// the output cannot be parsed into exact paths (malformed, or not UTF-8).
 pub(super) fn tracked_paths(root: &Path, timeout: Duration) -> Result<Vec<String>, String> {
-    let args = [
-        "--no-optional-locks",
-        "status",
-        "--porcelain",
-        "--untracked-files=no",
-    ];
+    let args = crate::git_ff_identical::STATUS_ARGS;
     let out = run(root, &[], &args, timeout)?;
     if !out.status.success() {
         return Err(format!("git {} failed: {}", args.join(" "), stderr(&out)));
     }
-    let raw = String::from_utf8_lossy(&out.stdout);
-    Ok(crate::git_ff_identical::tracked_paths_from_porcelain(raw.lines()))
+    crate::git_ff_identical::tracked_paths_from_porcelain_z(&out.stdout)
+        .ok_or_else(|| "git status -z: a path that is not exact UTF-8".to_string())
 }
 
 /// A private copy of a checkout's index, for probes that would otherwise
@@ -268,18 +264,20 @@ pub(super) fn scratch_index(root: &Path, timeout: Duration) -> Result<ScratchInd
     let dir = tempfile::TempDir::new().map_err(|e| format!("scratch index: {e}"))?;
     let path = dir.path().join("index");
     let copy_err = |e: std::io::Error| format!("scratch index from {}: {e}", real.display());
-    std::fs::copy(&real, &path).map_err(copy_err)?;
+    // One handle for both the bytes and the mtime: a second `metadata(&real)`
+    // could see a newer index renamed into place after the copy, and pair the
+    // old contents with the new mtime.
+    let mut src = std::fs::File::open(&real).map_err(copy_err)?;
     // Keep the index file's own mtime: git's racy-entry check compares each
     // entry's mtime with it, and a newer copy would make git trust a stale
     // stat entry for a file edited in the same second the index was written.
-    let mtime = std::fs::metadata(&real)
+    let mtime = src
+        .metadata()
         .and_then(|m| m.modified())
         .map_err(copy_err)?;
-    std::fs::File::options()
-        .write(true)
-        .open(&path)
-        .and_then(|f| f.set_modified(mtime))
-        .map_err(copy_err)?;
+    let mut dst = std::fs::File::create(&path).map_err(copy_err)?;
+    std::io::copy(&mut src, &mut dst).map_err(copy_err)?;
+    dst.set_modified(mtime).map_err(copy_err)?;
     Ok(ScratchIndex { _dir: dir, path })
 }
 
@@ -298,7 +296,8 @@ pub(super) fn quiet_ok(
         .is_ok_and(|out| out.status.success())
 }
 
-/// The second write (#11553): `git checkout HEAD -- <paths>`, discarding
+/// The second write (#11553): `git --literal-pathspecs checkout HEAD --
+/// <paths>` ([`crate::git_ff_identical::discard_args`]), discarding
 /// local edits that are byte-identical to `origin/<branch>`. Only ever called
 /// with paths [`crate::git_ff_identical::all_dirty_tracked_identical_to_origin`]
 /// vouched for, and only immediately before [`fast_forward`].
@@ -307,8 +306,7 @@ pub(super) fn quiet_ok(
 /// `submodule.recurse`, as for [`fast_forward`]. Bounded like the merge, and
 /// for the same reason.
 pub(super) fn discard_identical(root: &Path, paths: &[String]) -> Result<(), String> {
-    let mut args = vec!["checkout", "HEAD", "--"];
-    args.extend(paths.iter().map(String::as_str));
+    let args = crate::git_ff_identical::discard_args(paths);
     let out = run(
         root,
         &["core.hooksPath=/dev/null", "submodule.recurse=false"],

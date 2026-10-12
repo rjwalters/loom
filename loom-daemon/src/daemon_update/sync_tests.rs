@@ -268,3 +268,98 @@ fn ff_abort_identical_diverged_is_not_this_class() {
     assert_eq!(fx.head(), before);
     assert_eq!(read(&fx.host.join(ACCOUNTS)), NEW_ACCOUNTS);
 }
+
+impl Fixture {
+    /// `paths` land upstream holding `"one\n"` and the host fast-forwards to
+    /// them, so each is in HEAD before the change under test.
+    fn in_head(&self, paths: &[&str]) {
+        let files: Vec<(&str, &str)> = paths.iter().map(|p| (*p, "one\n")).collect();
+        self.push(&files);
+        git(&self.host, &["merge", "--ff-only", "--quiet", &format!("origin/{BRANCH}")]);
+    }
+}
+
+#[test]
+fn ff_abort_identical_non_ascii_path_resolves() {
+    let fx = Fixture::new();
+    fx.in_head(&["é.txt"]);
+    fx.push(&[("é.txt", "two\n")]);
+    write(&fx.host.join("é.txt"), "two\n");
+    fx.assert_ff_refuses();
+
+    assert_eq!(
+        all_dirty_tracked_identical_to_origin(&fx.host, BRANCH),
+        Some(vec!["é.txt".to_string()])
+    );
+    let (ok, state) = fx.classify(true);
+    assert!(ok);
+    assert!(state.ff_synced);
+    assert_eq!(fx.head(), fx.origin_tip());
+    assert_eq!(fx.status(), "");
+}
+
+#[test]
+fn ff_abort_identical_non_ascii_path_that_differs_hard_aborts() {
+    let fx = Fixture::new();
+    fx.in_head(&["é.txt"]);
+    fx.push(&[("é.txt", "two\n")]);
+    write(&fx.host.join("é.txt"), "mine\n");
+    fx.assert_ff_refuses();
+    let before = fx.head();
+
+    assert_eq!(all_dirty_tracked_identical_to_origin(&fx.host, BRANCH), None);
+    let (ok, _) = fx.classify(true);
+    assert!(!ok);
+    assert_eq!(fx.head(), before);
+    assert_eq!(read(&fx.host.join("é.txt")), "mine\n");
+}
+
+#[test]
+fn ff_abort_identical_glob_path_does_not_vouch_for_its_lookalike() {
+    let fx = Fixture::new();
+    fx.in_head(&["a[1].txt", "a1.txt"]);
+    fx.push(&[("a[1].txt", "two\n")]);
+    write(&fx.host.join("a[1].txt"), "two\n");
+    write(&fx.host.join("a1.txt"), "mine\n");
+    fx.assert_ff_refuses();
+    let before = fx.head();
+
+    assert_eq!(all_dirty_tracked_identical_to_origin(&fx.host, BRANCH), None);
+    let (ok, _) = fx.classify(true);
+    assert!(!ok);
+    assert_eq!(fx.head(), before);
+    assert_eq!(read(&fx.host.join("a1.txt")), "mine\n", "a1.txt is untouched");
+    assert_eq!(read(&fx.host.join("a[1].txt")), "two\n");
+}
+
+#[test]
+fn ff_abort_identical_path_with_spaces_resolves() {
+    let fx = Fixture::new();
+    fx.in_head(&["with space.txt"]);
+    fx.push(&[("with space.txt", "two\n")]);
+    write(&fx.host.join("with space.txt"), "two\n");
+    fx.assert_ff_refuses();
+
+    let (ok, state) = fx.classify(true);
+    assert!(ok);
+    assert!(state.ff_synced);
+    assert_eq!(fx.head(), fx.origin_tip());
+    assert_eq!(read(&fx.host.join("with space.txt")), "two\n");
+}
+
+#[test]
+fn ff_abort_identical_rename_hard_aborts() {
+    // The new name is not in HEAD, so `checkout HEAD --` could not restore
+    // it: never vouched for.
+    let fx = Fixture::new();
+    fx.push(&[("README.md", "two\n")]);
+    git(&fx.host, &["mv", "README.md", "moved.md"]);
+    fx.assert_ff_refuses();
+    let before = fx.head();
+
+    assert_eq!(all_dirty_tracked_identical_to_origin(&fx.host, BRANCH), None);
+    let (ok, _) = fx.classify(true);
+    assert!(!ok);
+    assert_eq!(fx.head(), before);
+    assert_eq!(read(&fx.host.join("moved.md")), "one\n");
+}
