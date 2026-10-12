@@ -171,6 +171,6 @@ fn age_identity_inside_repository_is_refused_before_subprocess() {
         identity: Some(identity),
     };
     let error = source.credential().unwrap_err();
-    assert!(matches!(error, JoinError::Credential(_)));
+    assert!(matches!(error, JoinError::HeadersWrite(_)));
     assert!(error.to_string().contains("repository"));
 }
