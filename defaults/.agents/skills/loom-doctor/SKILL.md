@@ -966,8 +966,7 @@ if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-che
   echo "Aborting: version-bearing files out of sync after update (see BLOCKER:/Fix:)." >&2
   exit 1
 fi
-# Discard guard (#9282): rc 0 = BLOCKED (the update emptied the PR or dropped a
-# hand-made merge resolution) - do NOT push; report its BLOCKER:/Fix: on the PR.
+# Discard guard (#9282): rc 0 = BLOCKED, do NOT push; report its BLOCKER:/Fix:.
 loom-daemon forge rebase-guard --base origin/main; RG=$?
 [ "$RG" = 0 ] && exit 1
 [ "$RG" = 1 ] || echo "WARNING: rebase-guard gave no answer (rc=$RG) - pushing UNCHECKED (#9282)" >&2
@@ -986,9 +985,8 @@ Never hand-bump `VERSION` & co. here (#7743; `bef3e07a`, #7341): if the gate fir
 gh pr edit $N --remove-label "loom:treating"
 ```
 
-Do **not** add `loom:review-requested` when standing down — the Doctor who
-actually pushed owns that transition. Leave the PR's state labels alone and
-exit; your only label action is removing your own claim.
+Do **not** add `loom:review-requested` when standing down (the Doctor who pushed owns
+it). Leave state labels alone and exit; only remove your own claim.
 
 **Note on new-PR creation (#6277):** Doctor normally pushes fixes to an
 *existing* PR, so the recheck above is the relevant freshness guard. If a fix
@@ -1395,14 +1393,13 @@ git fetch origin main
 if [ "$BRANCH_UPDATE" = rebase ]; then git rebase origin/main; else git merge --no-ff -m "Merge origin/main into $BRANCH (Doctor: resolve conflicts)" origin/main; fi
 # Conflict: resolve each file, `git add` it, then `git commit --no-edit` (merge) or `git rebase --continue`.
 
-# Version-bearing-file sync gate (#7168): if it fires, stop and report; never hand-bump.
+# Version-gate: if it fires, stop and report; never hand-bump.
 if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-check-gate.sh --fix-hint "then push."; then
-  echo "Aborting: version-bearing files are out of sync after update (see BLOCKER:/Fix: above) -- unexpected under #7743; report, do not hand-bump." >&2
+  echo "Aborting: version-bearing files out of sync (see BLOCKER:/Fix:); report, do not hand-bump." >&2
   exit 1
 fi
 
-# Discard guard (#9282): rc 0 = BLOCKED (the update emptied the PR or dropped a
-# hand-made merge resolution) - do NOT push; report its BLOCKER:/Fix: on the PR.
+# Discard guard (#9282): rc 0 = BLOCKED, do NOT push; report its BLOCKER:/Fix:.
 loom-daemon forge rebase-guard --base origin/main; RG=$?
 [ "$RG" = 0 ] && exit 1
 [ "$RG" = 1 ] || echo "WARNING: rebase-guard gave no answer (rc=$RG) - pushing UNCHECKED (#9282)" >&2
@@ -1444,11 +1441,9 @@ states Doctor exists to clear:
 | `loom:merge-conflict` | PR has merge conflicts requiring resolution | **Remove it once you have rebased and the conflicts are resolved** (the PR is no longer conflicting). Apply it if you triage a conflicted PR you cannot immediately fix. |
 | `loom:ci-failure` | PR has failing CI checks | **Remove it once CI is green again** after your fix. Apply it if you are flagging a PR whose CI is red and leaving it for a follow-up. |
 
-These are informational status flags, not queue gates — the primary Doctor queues
-are still `loom:pr` (conflicts) and `loom:changes-requested` (feedback). Keep them
-accurate: they should reflect the PR's **current** state, so clear them the moment
-the underlying problem is gone, and never leave a stale `loom:merge-conflict` /
-`loom:ci-failure` on a PR you have just made mergeable.
+These are informational flags, not queue gates (the queues are `loom:pr` for conflicts and
+`loom:changes-requested` for feedback). Keep them current: clear each the moment its
+problem is gone; never leave a stale one on a PR you just made mergeable.
 
 ### Signaling Conflict-Only Resolution (Fast-Track Review)
 

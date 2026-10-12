@@ -303,7 +303,7 @@ Parent branch \`$parent_branch\` advanced (amended/pushed) after this child bran
     # hand-made merge resolution. rc 0 = blocked, no push; rc >1 = no answer, warn.
     # requires-daemon: forge optional   rebase-guard (#9282): with no binary, or one predating the verb, the push proceeds unchecked behind a warning
     local rg=1
-    [[ "$DRY_RUN" == "true" ]] || { rg=0; "${DAEMON_BIN:-loom-daemon}" forge rebase-guard --base "origin/$parent_branch" --old "origin/$child_branch" --new "$child_branch" || rg=$?; }
+    [[ "$DRY_RUN" == "true" ]] || { rg=0; "$DAEMON_BIN" forge rebase-guard --base "origin/$parent_branch" --old "origin/$child_branch" --new "$child_branch" || rg=$?; }
     [[ $rg -ne 0 ]] || { err "Not pushing '$child_branch': its rebase onto '$parent_branch' would discard work (see BLOCKER:/Fix: above)."; RSC_FAILURE=2; return 0; }
     [[ $rg -eq 1 ]] || warn "rebase-guard gave no answer (rc=$rg) for '$child_branch' — pushing UNCHECKED for a dropped merge resolution or an emptied branch (#9282)."
 

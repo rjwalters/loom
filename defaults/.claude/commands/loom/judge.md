@@ -1232,14 +1232,11 @@ if [ "$MERGE_STATE" = "DIRTY" ]; then
     if [ "$GATE_OK" = true ]; then
         if [ "$BRANCH_UPDATE" = rebase ]; then git rebase origin/main; else git merge --no-ff -m "Merge origin/main into $BRANCH (Judge: resolve conflicts)" origin/main; fi || GATE_OK=false
     fi
-    # Version-bearing-file sync gate (#7168/#7341, moot after #7743): gate BEFORE
-    # the push. On failure never hand-patch the version-bearing files yourself
-    # or run `version.sh bump`.
+    # Version gate before the push; on failure never hand-patch version files or run `version.sh bump`.
     if [ "$GATE_OK" = true ] && [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-check-gate.sh --fix-hint "then push."; then
         GATE_OK=false
     fi
-    # Discard guard (#9282, was #8298): rc 0 = BLOCKED -- an update (clean or not) can
-    # empty the PR or drop a hand-made merge resolution.
+    # Discard guard (#9282, was #8298): rc 0 = BLOCKED.
     if [ "$GATE_OK" = true ]; then
         loom-daemon forge rebase-guard --base origin/main; RG=$?
         [ "$RG" = 0 ] && GATE_OK=false
@@ -1287,8 +1284,7 @@ BRANCH_UPDATE=$(loom-daemon branch-update strategy) || BRANCH_UPDATE=merge  # #1
 git fetch origin main
 if [ "$BRANCH_UPDATE" = rebase ]; then git rebase origin/main; else git merge --no-ff -m "Merge origin/main into $BRANCH (Judge: branch behind main)" origin/main; fi || exit 1
 
-# Version-bearing-file sync gate -- see the DIRTY path. On failure, abort and
-# request changes naming the file(s) to revert to origin/main's values.
+# Version gate (see DIRTY path): on failure abort; request changes naming the file(s) to revert.
 if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-check-gate.sh --fix-hint "then push."; then
   echo "Version-bearing files out of sync after update (see BLOCKER:/Fix: above) - aborting push"
   exit 1
@@ -1321,7 +1317,7 @@ if [ "$BRANCH_UPDATE" = rebase ]; then git push --force-with-lease="$BRANCH:$PUS
 # Resolve the conflict (e.g., keep both additions), `git add <resolved-files>`, then finish
 if [ "$BRANCH_UPDATE" = rebase ]; then git rebase --continue; else git commit --no-edit; fi
 
-# Version-bearing-file sync gate (#7168, extended #7341): gate before this push too.
+# Version gate before this push too.
 if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-check-gate.sh --fix-hint "then push."; then
   echo "Version-bearing files out of sync after update (see BLOCKER:/Fix: above) - aborting push"
   exit 1
@@ -1338,22 +1334,13 @@ gh pr comment <number> --body "🔀 Updated the branch from main and resolved a 
 
 ### Version-Bearing-File-Only Conflicts: superseded (#7743)
 
-`baa3fff5` (#7687) added a Judge-resolves recipe here for rebase conflicts
-confined entirely to version-bearing files — the recurring "VERSION bump goes
-stale before review lands" race (#7684), where `main` bumped those
-single-line/single-field values on nearly every merge and collided with this
-branch's own bump on the exact same lines.
-
-That race is now structurally impossible: since #7743, no PR may carry its
-own edit to a version-bearing file's value at all (bumps are exclusively
-`.github/workflows/version-bump-on-merge.yml`'s job, run once, after merge;
-see `check-defaults-version-bump.sh --forbid-bump`). A
-version-bearing-file-only conflict can no longer occur, because this branch
-never touched those files to begin with (`Cargo.lock`/`mcp-loom/package-lock.json`
-included, #7705 — `version-check-gate.sh` owns their uncommitted-bump case).
-This section intentionally has no recipe anymore — if you ever DO see a
-conflict confined to version-bearing files, that means something violated the
-new invariant; treat it as a **complex conflict** (below) and flag it.
+The recurring "VERSION bump goes stale before review lands" race (#7684) is now
+structurally impossible: since #7743 no PR may edit a version-bearing file's value
+(bumps are `.github/workflows/version-bump-on-merge.yml`'s job, after merge; see
+`check-defaults-version-bump.sh --forbid-bump`; `version-check-gate.sh` owns the
+`Cargo.lock`/`mcp-loom/package-lock.json` uncommitted-bump case, #7705). This section
+intentionally has no recipe: a conflict confined to version-bearing files means the
+invariant was violated; treat it as a **complex conflict** (below) and flag it.
 
 **Scope of that impossibility (#7823):** it covers *git rebase conflicts*, not
 every way a stale branch can surface a version-bearing-file complaint. A
