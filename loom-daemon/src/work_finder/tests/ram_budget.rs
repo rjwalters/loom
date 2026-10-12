@@ -7,8 +7,8 @@ use super::*;
 use crate::ram_headroom::{RamBudget, RepoCharge};
 use crate::ram_peaks::ChargeSource;
 
-fn starred(n: u32) -> WorkItem {
-    WorkItem::new(n, vec![OPERATOR_PRIORITY_LABEL.to_string()])
+fn important(n: u32) -> WorkItem {
+    WorkItem::new(n, vec!["loom:important".to_string()])
 }
 
 /// Workspace 0 is `heavy` (15 GB observed charge), workspace 1 is `small`
@@ -92,15 +92,15 @@ fn each_admission_debits_the_remaining_budget() {
 }
 
 #[test]
-fn a_starred_overflow_candidate_still_meets_its_ram_charge() {
-    // The shared cap is full (1 running, cap 1), so a star would take the
-    // overflow slot — but its heavy repo's charge does not fit.
+fn an_important_candidate_still_meets_its_ram_charge() {
+    // The shared cap is full (1 running, cap 1): no priority takes an
+    // overflow slot (#11508), and its heavy repo's charge does not fit.
     let busy = RecordingDispatcher {
         in_flight: [99].into_iter().collect(),
         ..RecordingDispatcher::default()
     };
     let mut multi = vec![
-        (FakeSource::once(vec![starred(1)]), busy),
+        (FakeSource::once(vec![important(1)]), busy),
         (FakeSource::once(vec![]), RecordingDispatcher::default()),
     ];
     let report = run(&mut multi, 1, budget(14));

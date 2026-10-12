@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 /// Every request the mock sink saw, as `(path, body)` — shared between the
 /// accept-loop thread and the asserting test. Aliased rather than written
 /// inline so `clippy::type_complexity` stays satisfied under
-/// `--all-targets --features otlp`.
+/// `--all-targets`.
 type RecordedRequests = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
 
 /// A minimal two-path mock sink: records every request's path + body so
@@ -164,9 +164,7 @@ fn sweep_started_envelope() -> TelemetryEnvelope {
             issue: 4858,
             sweep_id: "sweep-issue-4858-0".to_string(),
             started_at: chrono::Utc::now(),
-            model: None,
-            effort: None,
-            runtime: None,
+            facts: Default::default(),
         }),
     )
 }
@@ -197,6 +195,7 @@ fn host_health_envelope() -> TelemetryEnvelope {
             captainless_singleton_jobs: Vec::new(),
             exported_kinds: Vec::new(),
             exporters: Vec::new(),
+            otlp_export: None,
             memory: None,
         }),
     )
@@ -284,6 +283,12 @@ async fn partial_logs_are_acknowledged_before_metrics_retry() {
     assert_eq!(snapshot.signal_counts["log_records"].rejected, 1);
     assert!(snapshot.signal_counts["metric_data_points"].retry_scheduled > 0);
     assert!(!snapshot.last_failure_detail.unwrap().contains("secret-key"));
+    // The partially rejected log record is a permanent, counted loss in
+    // signal units (Issue #11527); the 503-held metrics batch is not.
+    assert_eq!(
+        queue.dropped_by_reason(),
+        std::collections::BTreeMap::from([("receiver_rejected".to_string(), 1)])
+    );
     // Restart recovery sees only the unacknowledged metric envelope.
     let reopened = DurableQueue::open(dir.path().join("q.jsonl"), 10);
     assert_eq!(reopened.len(), 1);
@@ -298,8 +303,30 @@ async fn partial_logs_are_acknowledged_before_metrics_retry() {
 }
 
 #[tokio::test]
-async fn http_policy_drops_poison_batches_and_continues() {
-    for status_code in [400, 401, 403, 404, 413, 500] {
+async fn http_401_403_hold_the_batch() {
+    for status_code in [401, 403] {
+        let sink =
+            MockSink::with_responses(vec![(status_code, "secret-key".to_string(), Duration::ZERO)]);
+        let exporter = OtlpExporter::new(sink.base_url(), "secret-key".to_string()).unwrap();
+        let result = exporter
+            .emit_batch_outcome(&[sweep_started_envelope()])
+            .await;
+        // A credential refusal is a hold, not a drop (Issue #11527): the
+        // batch stays queued (retry), nothing is lost, and the detail names
+        // the credential so an operator knows what to fix.
+        assert_eq!(result.acknowledged, 0, "nothing acked under {status_code}");
+        assert_eq!(result.signals["log_records"].retry_scheduled, 1);
+        assert!(result.lost.is_empty(), "a held batch loses nothing");
+        let detail = result.error.unwrap().to_string();
+        assert!(detail.contains("credential refused"), "{detail}");
+        assert!(detail.contains(&status_code.to_string()), "{detail}");
+        assert!(!detail.contains("secret-key"));
+    }
+}
+
+#[tokio::test]
+async fn http_policy_drops_and_counts_poison_batches() {
+    for status_code in [400, 404, 413, 500] {
         let sink =
             MockSink::with_responses(vec![(status_code, "secret-key".to_string(), Duration::ZERO)]);
         let exporter = OtlpExporter::new(sink.base_url(), "secret-key".to_string()).unwrap();
@@ -310,6 +337,14 @@ async fn http_policy_drops_poison_batches_and_continues() {
         assert_eq!(result.signals["log_records"].dropped, 1);
         assert!(result.signals["metric_data_points"].accepted > 0);
         assert!(!result.error.unwrap().to_string().contains("secret-key"));
+        // The refused logs group (the mock answers only the first request
+        // with the status; metrics falls through to the default 200) counts
+        // its envelope under `status_<code>` in the durable loss ledger's
+        // feed (Issue #11527).
+        assert_eq!(
+            result.lost,
+            std::collections::BTreeMap::from([(format!("status_{status_code}"), 1)])
+        );
     }
     for status_code in [429, 502, 503, 504] {
         let sink =
@@ -320,7 +355,81 @@ async fn http_policy_drops_poison_batches_and_continues() {
             .await;
         assert_eq!(result.acknowledged, 0);
         assert_eq!(result.signals["log_records"].retry_scheduled, 1);
+        assert!(result.lost.is_empty(), "a retried batch loses nothing");
     }
+}
+
+#[tokio::test]
+async fn credential_refusal_holds_then_recovers_in_fifo_order() {
+    use crate::observability::{
+        queue::DurableQueue, sender::try_flush, sender::FlushOutcome, ExportStatus,
+    };
+    // Two credential refusals, then the default 200: the sink's key was
+    // fixed between flushes without restarting the daemon.
+    let sink = MockSink::with_responses(vec![
+        (403, "secret-key".to_string(), Duration::ZERO),
+        (403, "secret-key".to_string(), Duration::ZERO),
+    ]);
+    let exporter = OtlpExporter::new(sink.base_url(), "secret-key".to_string()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let queue = DurableQueue::open(dir.path().join("q.jsonl"), 100);
+    let status = ExportStatus::started("host", &sink.base_url(), "otlp", 30);
+    let first = sweep_started_issue(1);
+    let second = sweep_started_issue(2);
+    let third = sweep_started_issue(3);
+    queue.push(first.clone());
+    queue.push(second.clone());
+    assert_eq!(try_flush(&queue, &exporter, 10, &status).await, FlushOutcome::Failed);
+    assert_eq!(queue.len(), 2, "the held batch stays queued");
+    queue.push(third.clone());
+    assert_eq!(try_flush(&queue, &exporter, 10, &status).await, FlushOutcome::Failed);
+    assert_eq!(queue.len(), 3, "depth keeps growing under a held 403");
+    assert_eq!(queue.dropped_total(), 0, "a held batch is never a loss");
+    assert!(queue.dropped_by_reason().is_empty());
+    // The credential is fixed: everything held arrives, oldest first.
+    assert_eq!(try_flush(&queue, &exporter, 10, &status).await, FlushOutcome::Sent(3));
+    assert!(queue.is_empty());
+    assert_eq!(queue.dropped_total(), 0);
+    let delivered = sink.requests();
+    assert_eq!(delivered.len(), 3, "one logs POST per attempt");
+    let last = &delivered[2].1;
+    let first_at = find_substring(last, &sweep_id_of(&first)).unwrap_or(usize::MAX);
+    let second_at = find_substring(last, &sweep_id_of(&second)).unwrap_or(usize::MAX);
+    let third_at = find_substring(last, &sweep_id_of(&third)).unwrap_or(usize::MAX);
+    assert!(
+        first_at < second_at && second_at < third_at,
+        "held records are delivered in FIFO order"
+    );
+}
+
+/// A `sweep.started` envelope whose `sweep_id` encodes `issue`, so a delivery
+/// test can assert FIFO order from the request body alone.
+fn sweep_started_issue(issue: u32) -> TelemetryEnvelope {
+    TelemetryEnvelope::new(
+        "host-otlp-test",
+        TelemetryRecord::SweepStarted(SweepStartedRecord {
+            story_points: None,
+            repo: "rjwalters/loom".to_string(),
+            visibility: crate::telemetry::RepoVisibility::Public,
+            issue,
+            sweep_id: format!("sweep-issue-{issue}-0"),
+            started_at: chrono::Utc::now(),
+            facts: Default::default(),
+        }),
+    )
+}
+
+fn sweep_id_of(envelope: &TelemetryEnvelope) -> String {
+    match &envelope.record {
+        TelemetryRecord::SweepStarted(record) => record.sweep_id.clone(),
+        other => panic!("unexpected record {other:?}"),
+    }
+}
+
+fn find_substring(haystack: &[u8], needle: &str) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle.as_bytes())
 }
 
 #[tokio::test]
@@ -334,6 +443,7 @@ async fn malformed_and_oversized_acknowledgments_are_not_success() {
         assert_eq!(result.acknowledged, 1);
         assert_eq!(result.exported, 0);
         assert_eq!(result.signals["log_records"].dropped, 1);
+        assert!(!result.lost.is_empty(), "a permanent drop always has a reason");
     }
 }
 
@@ -368,6 +478,10 @@ async fn empty_token_snapshot_advances_without_fabricating_metrics() {
         .emit_batch_outcome(&[empty, sweep_started_envelope()])
         .await;
     assert_eq!(result.acknowledged, 2);
+    assert!(
+        result.lost.is_empty(),
+        "kinds OTLP deliberately does not send are routing, not loss"
+    );
     assert_eq!(sink.requests().len(), 1);
 }
 

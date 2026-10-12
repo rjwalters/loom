@@ -11,7 +11,6 @@
 //! (that evidence is #8525's). `expected-spans.json` in the evidence directory
 //! is what a backend query must reproduce; see
 //! `defaults/observability/clickstack/README.md`.
-#![cfg(feature = "otlp")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use loom_daemon::{
     observability::{lifecycle, queue::DurableQueue},

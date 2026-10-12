@@ -126,7 +126,6 @@ test-guide-work-plan-operator-only-exclude.sh
 test-guide-work-plan-ready-open-pr-exclude.sh
 test-hard-exclusion-labels.sh
 test-host-sleep-config.sh
-test-inbox-mail.sh
 test-install-active-session.sh
 test-install-agents-md-reapply.sh
 test-install-full-reinstall-no-target-mutation.sh
@@ -160,6 +159,7 @@ test-merge-pr-rate-limit-fallback.sh
 test-merge-pr-stacked-child-branch-delete.sh
 test-merge-pr-tree-checks.sh
 test-merge-pr-ci-result.sh
+test-merge-pr-required-checks.sh
 test-nextest-daemon-guard.sh
 test-operator-only-subkind.sh
 test-post-verdict.sh
@@ -187,6 +187,7 @@ test-resync-installed-stamp.sh
 test-resync-installed-output-staging.sh
 test-resync-installed.sh
 test-resync-installed-egress-doctor.sh
+test-resync-installed-payload-fallback.sh
 test-review-feedback-reconciliation.sh
 test-run-ci-suites-daemon-guard.sh
 test-run-ci-suites-failure-excerpt.sh
@@ -213,6 +214,7 @@ test-sweep-lease-renew.sh
 test-sweep-lease-renew-lifecycle.sh
 test-sweep-pr-mode.sh
 test-sweep-run-registry.sh
+test-sweep-wave-judge-done-staleness.sh
 test-sync-labels-check.sh
 test-token-cache-affinity.sh
 test-claude-wrapper-proxy-rotation.sh
@@ -276,6 +278,7 @@ defaults/hooks/tests/test-skill-router.sh
 # previously orphaned entirely — appeared in ci.yml only as a paths-filter
 # trigger, never as an invoked job step). All confirmed hermetic (no live
 # network/forge calls, fake/stub binaries only) and ubuntu-portable.
+tests/install/test-daemon-build-otlp-probe.sh
 tests/install/test-daemon-build-shortcut.sh
 tests/install/test-dry-run-preview-manifest.sh
 tests/install/test-forge-detect.sh
@@ -311,3 +314,8 @@ test-spawn-claude-managed-gh.sh
 # #11076: spawn-claude.sh's systemd scope carries OOMPolicy=continue. Hermetic:
 # systemd-run/systemctl/claude stubs under mktemp -d, no daemon, forge or network.
 test-spawn-claude-oom-policy.sh
+
+# #11094: spawn-claude.sh's systemd scope gets MemoryMax from `loom-daemon
+# ram-scope-limit`. Hermetic: daemon/systemd-run/systemctl/claude stubs under
+# mktemp -d; no real daemon, forge or network.
+test-spawn-claude-memory-max.sh

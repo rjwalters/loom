@@ -10,7 +10,7 @@ Three concepts remain separate:
 | --- | --- |
 | Origin | Historical fact: `interactive`, `autonomous`, or `unknown` |
 | Planning preference | Prefer interactive PRs through review, repair, re-review and merge |
-| Operator star | Explicit `loom:operator-priority` override, stronger than human preference; higher levels (`loom:operator-high-priority`, `loom:high-priority-inherited`, #10307) drain first, highest level first (`operatorPriorityLevel` on each row) |
+| Priority level | `loom:very-important`, then `loom:important` (#11103), stronger than human preference; drains highest level first (`priorityLevel` on each row: 2, 1, 0; `priorityReason` `priority`). The PR carries the closing issue's level label, copied at creation (#10518). The retired operator-star labels are not read (#11510) |
 
 Set the origin explicitly at session start with `LOOM_WORK_ORIGIN=interactive`,
 or at creation:
@@ -79,6 +79,15 @@ SHA dedup. Its fleet App exception already permits a trusted interactive agent.
 Fallback review is comment-only: it grants no workflow enrollment, approval,
 branch mutation or automated landing. Existing labeled PRs retain the normal
 review, ownership, hold and merge requirements.
+
+An unlabeled, non-draft PR whose head branch is `feature/issue-<N>` in the base
+repository also joins the Judge's queue and opens its gate, whatever the queue
+depth or `planning.preferHumanPrs` (#9389): a Builder PR that lost its
+`loom:review-requested` label is found, in the same comment-only mode, behind
+every labeled PR. Same-repository is the forge's head/base repository identity,
+never a branch name. Fork PRs and other branch shapes are a deliberate
+exclusion: unless interactive, they are still admitted only when no open PR
+carries `loom:review-requested`, and nothing here adds a label.
 
 Drafts and hard holds never gain authority from origin. Doctor's existing
 `loom:operator` plus `loom:changes-requested` stale-diff repair route remains

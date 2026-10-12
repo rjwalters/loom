@@ -28,6 +28,11 @@
 //! defaults (snapshot TTL + probe TTL), not one. The write itself is still
 //! refused by the forge; what lags is this pre-check.
 //!
+//! A forced per-owner re-mint cuts both short (#9247): the stale-token write
+//! retry forgets the credential's snapshot and expires every answer cached
+//! here for it ([`expire_credential`]), since the key is the same before and
+//! after a re-mint.
+//!
 //! **Stale-while-unverifiable.** When an expired WRITE is re-probed and the
 //! probe cannot answer (rate limit, outage), a WRITE verified within the last
 //! [`STALE_WRITE_GRACE`] still answers WRITE. Without that, one GitHub blip at
@@ -452,6 +457,10 @@ struct DiskEntry {
     write: bool,
     detail: String,
     at: u64,
+    /// [`credential_tag`] of the credential that was probed (empty on an
+    /// entry written before #9247, which simply ages out).
+    #[serde(default)]
+    cred: String,
 }
 
 fn now_secs() -> u64 {
@@ -473,6 +482,8 @@ struct MemEntry {
     p: Permission,
     at: SystemTime,
     last_write: Option<SystemTime>,
+    /// [`credential_tag`] of the credential that was probed.
+    cred: String,
 }
 
 fn memory() -> &'static Mutex<HashMap<String, MemEntry>> {
@@ -497,7 +508,23 @@ pub(crate) fn cache_key(
 ) -> Option<String> {
     use sha2::{Digest, Sha256};
     let repo = repo.to_ascii_lowercase();
-    let material = match scope {
+    let material = format!("{}\0{repo}", credential_material(config_dir, scope)?);
+    Some(hex::encode(&Sha256::digest(material)[..16]))
+}
+
+/// The credential half of [`cache_key`], as a digest: what every answer
+/// probed under one credential has in common, whichever repository it is
+/// about ([`expire_credential`]). Never the token itself.
+fn credential_tag(config_dir: Option<&Path>, scope: &CacheScope) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let material = credential_material(config_dir, scope)?;
+    Some(hex::encode(&Sha256::digest(material)[..16]))
+}
+
+/// Forge, host and credential: [`cache_key`]'s material before the
+/// repository is appended.
+fn credential_material(config_dir: Option<&Path>, scope: &CacheScope) -> Option<String> {
+    Some(match scope {
         CacheScope::Unresolved => return None,
         CacheScope::GitHub => {
             let token = ["GH_TOKEN", "GITHUB_TOKEN"]
@@ -511,16 +538,46 @@ pub(crate) fn cache_key(
                 .to_ascii_lowercase();
             let env_dir = std::env::var("GH_CONFIG_DIR").unwrap_or_default();
             let dir = config_dir.map_or(env_dir, |d| d.display().to_string());
-            format!("github\0{host}\0{dir}\0{token}\0{repo}")
+            format!("github\0{host}\0{dir}\0{token}")
         }
         CacheScope::Gitea { base_url, id } => {
             if id.is_empty() {
                 return None;
             }
-            format!("gitea\0{base_url}\0{id}\0{repo}")
+            format!("gitea\0{base_url}\0{id}")
         }
+    })
+}
+
+/// Expire every answer cached for one credential, whichever repository it is
+/// about (#9247): its token was just re-minted, so an answer probed under the
+/// old one says nothing about the new. The next question re-probes.
+///
+/// A memory entry is expired, not removed, so a verified WRITE keeps its
+/// stale-while-unverifiable grace across the re-probe; disk entries carrying
+/// this credential's tag are deleted.
+pub(crate) fn expire_credential(config_dir: Option<&Path>, scope: &CacheScope) {
+    let Some(tag) = credential_tag(config_dir, scope) else {
+        return;
     };
-    Some(hex::encode(&Sha256::digest(material)[..16]))
+    if let Ok(mut m) = memory().lock() {
+        for e in m.values_mut().filter(|e| e.cred == tag) {
+            e.at = UNIX_EPOCH;
+        }
+    }
+    let Ok(entries) = std::fs::read_dir(cache_dir()) else {
+        return;
+    };
+    for path in entries.flatten().map(|e| e.path()) {
+        let ours = path.extension().is_some_and(|x| x == "json")
+            && std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|s| serde_json::from_str::<DiskEntry>(&s).ok())
+                .is_some_and(|e| e.cred == tag);
+        if ours {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 /// A probe with the memory + disk cache in front of it. The key space comes
@@ -564,6 +621,8 @@ impl<P: PermissionProbe> PermissionProbe for Cached<P> {
                 other => other,
             };
         };
+        let cred =
+            credential_tag(self.key_dir.as_deref(), &self.inner.cache_scope()).unwrap_or_default();
         let now = SystemTime::now();
         let fresh = |at: SystemTime, p: &Permission| {
             let limit = if matches!(p, Permission::Unknown(_)) {
@@ -611,6 +670,7 @@ impl<P: PermissionProbe> PermissionProbe for Cached<P> {
                     p: p.clone(),
                     at: now,
                     last_write,
+                    cred: cred.clone(),
                 },
             );
         }
@@ -626,6 +686,7 @@ impl<P: PermissionProbe> PermissionProbe for Cached<P> {
                     write,
                     detail,
                     at: now_secs(),
+                    cred,
                 },
             );
         }

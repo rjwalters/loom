@@ -6,11 +6,12 @@
 //! (`preflight_unresolved`, claim released, open NO PR); `5` timed out
 //! (#10860: not a failure, claim kept); `6` deferred, the host is above the
 //! load threshold (#10955: nothing ran, claim kept); `7` (`--check`) no
-//! passing receipt for the current `HEAD`.
+//! passing receipt for the current `HEAD`; `8` (`--check`) a commit carries a
+//! GitHub skip-CI marker (#11389, every repo, `buildGate` or not).
 
 use std::path::PathBuf;
 
-use loom_daemon::preflight::{self, Verdict};
+use loom_daemon::preflight::{self, skip_ci, Verdict};
 
 #[derive(clap::Args)]
 pub(crate) struct PreflightArgs {
@@ -22,8 +23,9 @@ pub(crate) struct PreflightArgs {
     #[arg(long, value_name = "PATH")]
     worktree: Option<PathBuf>,
 
-    /// Do not run the gate; exit 7 unless the current HEAD already passed.
-    /// Used by `create-pr.sh` to refuse an un-gated PR.
+    /// Do not run the gate; exit 7 unless the current HEAD already passed,
+    /// exit 8 if a commit since the base (`LOOM_PR_BASE`) carries a skip-CI
+    /// marker. Used by `create-pr.sh` to refuse an un-gated PR.
     #[arg(long)]
     check: bool,
 }
@@ -34,6 +36,15 @@ impl PreflightArgs {
             .worktree
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
         if self.check {
+            let base = std::env::var(skip_ci::BASE_ENV).ok();
+            match skip_ci::check(&wt, skip_ci::allowed_by_env(), base.as_deref()) {
+                Ok(None) => {}
+                Ok(Some(refusal)) => {
+                    eprintln!("{refusal}");
+                    std::process::exit(skip_ci::EXIT_SKIP_CI);
+                }
+                Err(why) => eprintln!("preflight: skip-CI marker check skipped: {why}"),
+            }
             if preflight::check(&wt) {
                 std::process::exit(0);
             }

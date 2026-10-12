@@ -190,6 +190,24 @@ const CATEGORIES: &[Category] = &[
         tags: &["loom:forge-egress"],
     },
     Category {
+        // Read by `loom-daemon cargo-target-dir guard` (#11582) through the
+        // shared resolver, only once a deny is about to fire.
+        key: "cargoTargetDir",
+        env: "LOOM_GUARD_CARGO_TARGET_DIR",
+        kind: tiered_bool(true),
+        tiers: Tiers::All,
+        tags: &["loom:cargo-target-dir"],
+    },
+    Category {
+        // Read by the same verb (#10646), only once a shared-target ask is
+        // about to fire.
+        key: "cargoSharedTarget",
+        env: "LOOM_GUARD_CARGO_SHARED_TARGET",
+        kind: tiered_bool(true),
+        tiers: Tiers::All,
+        tags: &["loom:cargo-shared-target"],
+    },
+    Category {
         key: "rmScope",
         env: "LOOM_RM_SCOPE",
         kind: Kind::RmScope,

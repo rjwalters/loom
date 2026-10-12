@@ -276,7 +276,7 @@ If no argument is provided, use the normal "Finding Work" workflow below.
 ```bash
 loom-daemon park-record apply --issue <number> --blocked-by <N> --by builder --remove-label loom:building
 ```
-Never a bare label edit: `check-stale-blocked` (#8927), star-liveness, Guide's unblock sweep and `merge-pr.sh` read the body, not comments. It refuses a closed blocker (#9102). No open numbered blocker? Pass `--reason "<why>"` instead; never invent one. See `.loom/docs/park-record.md`.
+Never a bare label edit: `check-stale-blocked` (#8927), Guide's unblock sweep and `merge-pr.sh` read the body, not comments. It refuses a closed blocker (#9102). No open numbered blocker? Pass `--reason "<why>"` instead; never invent one. See `.loom/docs/park-record.md`.
 
 ### Labels You NEVER Touch
 
@@ -595,31 +595,26 @@ never to fall back to the other tool for the same target path — that fallback
 is exactly how sweep #4063 escaped and edited live guard hooks in the main
 checkout.
 
-### NEVER run `resync-installed.sh` from your worktree (#4563)
+### Never run `resync-installed.sh` against main; mirror inside your worktree (#4563, #11291)
 
-**Do not run `./.loom/scripts/resync-installed.sh` (or any variant of it) while
-working an issue.** It always resolves the installed `.loom/` against the
-**primary** worktree, so running it from `.loom/worktrees/issue-<N>` writes to the
-**main checkout** — not to your worktree. Nothing in your own `git status`
-changes, so the contamination is invisible to you until `check-main-clean.sh`
-quarantines it (that is exactly what happened on 2026-07-30: a wave-2 builder
-resynced from its worktree and wrote four installed paths into `main` mid-sweep).
+**Do not run `./.loom/scripts/resync-installed.sh` bare or with `--allow-worktree`
+mid-issue**: it resolves installed `.loom/` against the **primary** checkout, so
+from `.loom/worktrees/issue-<N>` it writes into **main** (invisible in your
+`git status`; `check-main-clean.sh` quarantines it). A refusal (exit `1`) means
+stop. `--output` does not help either: it stages a copy of the *primary's*
+`defaults/`, not your unmerged edits.
 
-You never need it: **editing `defaults/` is the whole job.** Propagating those
-edits into the installed `.loom/hooks|scripts|roles|docs|bin/` +
-`.claude/commands/loom/` copies is the periodic `chore: resync installed Loom
-surfaces` commit's job, made from the main checkout **after** your PR merges. Do
-not "helpfully" refresh the installed copies in your PR.
+In `rjwalters/loom` the installed mirrors are tracked and CI requires them current
+before merge (`check-hooks-defaults-parity.sh`, `check-docs-defaults-parity.sh`,
+`check-dangling-links.sh`). So when your diff touches one, update it by hand
+**inside your worktree** (paths via `$WORKTREE_ABS`):
 
-The script now refuses to run from a linked worktree (exit `1`, `--dry-run`
-included). If you see that refusal, the fix is to **stop**, not to re-run with
-`--allow-worktree` — that override exists for a human operator deliberately
-rewriting the main checkout's installed copies, not for a Builder mid-issue.
-(A separate `--output <dir>` staging mode, #6106, exists for an operator who
-needs a complete resync generated safely while the fleet is live — it is also
-not for a Builder mid-issue: see
-`.loom/docs/troubleshooting.md` if you land
-here as the human operator rather than a Builder subagent.)
+- `defaults/hooks/X.sh` -> `cp -p defaults/hooks/X.sh .loom/hooks/X.sh`
+- new `defaults/docs/X.md` -> `ln -s ../../defaults/docs/X.md .loom/docs/X.md`
+- roles, scripts: `.loom/roles`, `.loom/scripts` are directory symlinks; nothing to do
+- skill copies: `loom-daemon generate-agent-skills`
+
+Then run the parity scripts above. Consumer repos: next section.
 
 ### Never fix an installed Loom file in place (consumer repos)
 
@@ -791,17 +786,17 @@ Run the appropriate build check after every meaningful code change:
 | Language | Build Check Command | What It Catches |
 |----------|-------------------|-----------------|
 | Rust | `cargo check` | Type errors, borrow checker violations, async Send issues |
-| Rust | `cargo clippy` | Common mistakes, anti-patterns, correctness issues |
+| Rust | CI's clippy lines | Anti-patterns, unused imports |
 | TypeScript | `pnpm tsc --noEmit` | Type errors, missing imports |
 
 For Rust changes specifically, run these **before committing**:
 ```bash
-cargo check          # Fast compilation check (no codegen)
-cargo clippy         # Lint for common mistakes
-cargo fmt            # Format code
+cargo check          # Fast (no codegen)
+grep -rn 'cargo clippy' .github/workflows  # run each hit verbatim
+cargo fmt
 ```
 
-`cargo check` is fast (seconds) and catches the most common errors. Don't rely solely on the project's check command (`buildGate.command` in `.loom/config.json`, or the repo's documented CI command, e.g. `pnpm check:ci`) at PR time — by then, a failed build wastes the entire implementation cycle.
+Scoped tests are not lint; report it apart (no CI hit: bare `cargo clippy`; no clippy: "unvalidated"). Don't rely solely on the project's check command (`buildGate.command` in `.loom/config.json`, or the repo's documented CI command, e.g. `pnpm check:ci`) at PR time — by then, a failed build wastes the entire implementation cycle.
 
 ### Build-time performance
 
@@ -845,11 +840,11 @@ Full background: `.loom/docs/guard-hooks.md` → "Known consequence".
 
 - **Pick the right work**: Choose issues labeled `loom:issue` (human-approved) that match your capabilities
 - **Update labels**: Always mark issues as `loom:building` when starting
-- **Read before writing**: Examine existing code to understand patterns and conventions
-- **Verify builds**: Run language-appropriate build checks after writing code (see Build Verification above)
-- **Test your changes**: Run relevant tests after making modifications
-- **Follow conventions**: Match the existing code style and architecture
-- **Be thorough**: Complete the full task, don't leave TODOs
+- **Read before writing**: Read existing code for patterns and conventions
+- **Verify builds**: Run language-appropriate build checks (see Build Verification above)
+- **Test your changes**: Grep fixtures, differential oracles, expectations for changed contracts (env names, CLI help, fields); align them; run the affected suite before review
+- **Follow conventions**: Match existing style and architecture
+- **Be thorough**: Complete the task; no TODOs
 - **Stay in scope**: If you discover new work, PAUSE and create an issue - don't expand scope
 - **Create quality PRs**: Clear description, references issue, requests review
 - **Get unstuck**: Mark `loom:blocked` if you can't proceed, explain why
@@ -979,7 +974,6 @@ exactly one sub-kind in the **same** command (additive; filters unchanged):
 | `loom:operator-blocked` | Waiting on a **named** issue/PR/piece of infrastructure that does not exist yet — self-clearing once that lands |
 | `loom:operator-mechanical` | Needs host or admin access, a credential, or another mechanical action — no judgement required |
 | `loom:operator-decision` | The act requires authority you structurally cannot hold — a preference call or an authority act (binds the entity, irreversible disclosure, spending, credentials only the operator holds, accepting risk on the entity's behalf, physical-world action) |
-| `loom:operator-objective` | The work is determined once the operator states an objective — name the candidate objectives and the answer under each (#5826) |
 
 ```bash
 # Builder parking a claimed issue on a decision: 2-4 ranked options, each with
@@ -995,8 +989,8 @@ it, name the axis along which two well-informed people would still disagree
 and show it is a preference, not a fact (the falsifiability test in
 `.loom/docs/label-state-machine.md`). If you cannot name that axis, the
 "decision" is really an unfinished derivation — keep working instead of
-parking it. If the only gap is an unstated objective, that is
-`loom:operator-objective`, not `loom:operator-decision`.
+parking it. If the only gap is an unstated objective, file a decision whose
+options are the candidate objectives (#10000).
 
 **If you chose `loom:operator-blocked`**, the same comment MUST name the blocker
 in machine-readable form: a literal `Blocked by #N` / `Depends on #N` /
@@ -1007,10 +1001,6 @@ pass can tell when the blocker clears.
 
 **If you chose `loom:operator-decision`**, the options' whys MUST name the
 disagreement axis and why it is a preference, not a fact.
-
-**If you chose `loom:operator-objective`**, the same comment MUST list the
-candidate objectives and the answer under each — not just "needs an
-objective."
 
 Full taxonomy and rationale: `.loom/docs/label-state-machine.md` →
 "`loom:operator-only` sub-kinds".
@@ -1039,12 +1029,19 @@ Workers use a three-level priority system to determine which issues to work on:
 
 ### How to Find Work
 
+Every tier filters on the resolved skip set (hard exclusions plus this repo's
+`autonomous.workFinder.extraSkipLabels`, #7528/#8255), so a priority label
+cannot lift a skip-labeled issue into a higher tier (#8911). Never swap in a
+bare `--label` query. Each `--jq` is DOUBLE-quoted so `$EXCL` expands.
+
 **Step 1: Check for starred issues first**
 
 ```bash
+EXCL="$(./.loom/scripts/skip-labels.sh --jq-not)"
 # level list: keep in sync with operator_levels.rs LEVELS until #10311
 for L in loom:operator-high-priority loom:high-priority-inherited loom:operator-priority; do
-gh issue list --label="loom:issue" --label="$L" --state=open --limit=5; done
+gh issue list --label="loom:issue" --label="$L" --state=open --limit=500 \
+  --json number,title,labels --jq ".[] | select($EXCL) | \"#\(.number): \(.title)\""; done
 ```
 
 If any exist, **claim one immediately**.
@@ -1052,7 +1049,9 @@ If any exist, **claim one immediately**.
 **Step 2: If none starred, check curated issues**
 
 ```bash
-gh issue list --label="loom:issue" --label="loom:curated" --state=open --limit=10
+EXCL="$(./.loom/scripts/skip-labels.sh --jq-not)"
+gh issue list --label="loom:issue" --label="loom:curated" --state=open --limit=500 \
+  --json number,title,labels --jq ".[] | select($EXCL) | \"#\(.number): \(.title)\""
 ```
 
 **Why prefer these**: human approved + Curator context.
@@ -1060,11 +1059,8 @@ gh issue list --label="loom:issue" --label="loom:curated" --state=open --limit=1
 **Step 3: If no curated, fall back to approved-only issues**
 
 ```bash
-# #7528/#8255: the exclusion fragment comes from the shared source (hard
-# exclusions plus this repo's autonomous.workFinder.extraSkipLabels), never a
-# hardcoded literal. Note the DOUBLE-quoted --jq so $EXCL expands.
 EXCL="$(./.loom/scripts/skip-labels.sh --jq-not)"
-gh issue list --label="loom:issue" --state=open --json number,title,labels \
+gh issue list --label="loom:issue" --state=open --limit=500 --json number,title,labels \
   --jq ".[] | select(([.labels[].name] | contains([\"loom:curated\"]) | not) and $EXCL) |
   \"#\(.number): \(.title)\""
 ```
@@ -1161,7 +1157,7 @@ round — none of which any offline fixture could have caught.
 
 ### MANDATORY: Derive Titles From Your Diff, Not the Issue
 
-**Before committing or creating a PR**, you MUST review your actual code changes and derive titles from them:
+**Before committing or creating a PR**, review your actual changes and derive titles from them:
 
 ```bash
 # Step 1: Review what you actually changed
@@ -1169,21 +1165,22 @@ git diff --stat
 git diff   # Read the actual changes
 
 # Step 2: Write a commit message that describes the CODE CHANGE
-#   Ask: "What does this diff do?" — NOT "What issue is this for?"
+#   Ask: "What does this diff do?", not "What issue is this for?"
 #
 #   WRONG: "feat: implement changes for issue #2678"
 #   WRONG: "Builder generates generic commit/PR titles despite explicit anti-patterns"
-#   WRONG: "feat: bug: MCP status bar noise..." (double prefix — copied issue title prefix)
+#   WRONG: "feat: bug: MCP status bar noise..." (double prefix copied from the issue)
 #   RIGHT: "docs: add mandatory diff-review step before commit/PR creation"
 #
-#   NOTE: If the issue title starts with a prefix like "bug:", "feat:", etc.,
-#   do NOT copy it verbatim. Strip the issue prefix and derive your own from the diff.
-#   "bug:" → use "fix:" in the PR title. See builder-pr.md for the full mapping.
+#   NOTE: never copy an issue-title prefix ("bug:", "feat:") verbatim; derive
+#   your own from the diff ("bug:" → "fix:"; full mapping in builder-pr.md).
+#   Never write a skip-CI marker ("[skip ci]" etc.) literally: no CI runs and
+#   create-pr.sh refuses it (#11389). Put a space inside, or describe it.
 
-# Step 3: Use the same approach for the PR title
+# Step 3: Same approach for the PR title
 ```
 
-**The PR title and commit message MUST describe what the code change does, not reference the issue.** See builder-pr.md for the full rules, anti-patterns, and examples.
+**The PR title and commit message MUST describe what the code change does, not reference the issue.** Full rules and examples: builder-pr.md.
 
 ### Commit Conventions: DCO / sign-off
 

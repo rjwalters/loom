@@ -1,0 +1,1 @@
+../../defaults/docs/branch-update-strategy.md

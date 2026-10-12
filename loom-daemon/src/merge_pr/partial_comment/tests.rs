@@ -6,7 +6,9 @@
 //! *every* input, including ones the retired shell could never have been fed
 //! through a `$(...)`-captured variable.
 
-use super::{now_timestamp, partial_merged_comment, premature_close_comment};
+use super::{
+    now_timestamp, partial_merged_comment, partial_merged_held_comment, premature_close_comment,
+};
 
 /// The `$reopen_note` fragment is the only conditional in either body, and it
 /// is a LEADING-newline bullet interpolated straight after `**Action taken**:`.
@@ -140,4 +142,17 @@ fn the_timestamp_keeps_the_retired_date_format() {
     assert_eq!(time.len(), 8, "unexpected time width: {time}");
     assert!(date.chars().all(|c| c.is_ascii_digit() || c == '-'), "non-ASCII date: {date}");
     assert!(time.chars().all(|c| c.is_ascii_digit() || c == ':'), "non-ASCII time: {time}");
+}
+
+#[test]
+fn the_held_body_names_operator_and_the_reason_not_the_ready_queue() {
+    let body =
+        partial_merged_held_comment("999", false, "needs fleet roll", "2026-10-11T00:00:00Z");
+    assert!(body.contains("`loom:operator`"), "{body}");
+    assert!(body.contains("reason: needs fleet roll"), "{body}");
+    assert!(!body.contains("ready queue"), "{body}");
+    assert!(!body.contains("Added `loom:issue`"), "{body}");
+    let unstated = partial_merged_held_comment("999", true, "", "2026-10-11T00:00:00Z");
+    assert!(unstated.contains("reason unstated"), "{unstated}");
+    assert!(unstated.contains("**Reopened**"), "{unstated}");
 }

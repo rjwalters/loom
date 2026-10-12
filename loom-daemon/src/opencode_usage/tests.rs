@@ -562,6 +562,144 @@ fn discover_opencode_dbs_reads_a_store_reachable_two_ways_once() {
     assert_eq!(found, vec![managed.join("opencode").join("opencode.db")]);
 }
 
+/// Issue #11286: a guarded launch's per-launch `XDG_DATA_HOME` store under
+/// the native-tools state dir is discovered too — that is where every
+/// daemon-dispatched OpenCode sweep's sessions land.
+#[test]
+#[serial_test::serial(opencode_db_env)]
+fn discover_opencode_dbs_includes_guarded_per_launch_stores() {
+    std::env::remove_var(OPENCODE_DB_ENV);
+    std::env::remove_var("XDG_DATA_HOME");
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join(".local/state/loom/native-tools");
+    let mut launches = Vec::new();
+    for (workspace, launch) in [("ws-a", "uuid-1"), ("ws-a", "uuid-2"), ("ws-b", "uuid-3")] {
+        let dir = base.join(workspace).join(launch).join("data/opencode");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("opencode.db"), b"").unwrap();
+        launches.push(dir.join("opencode.db"));
+    }
+    // A launch dir with no OpenCode store (a Pi launch), and a shared binding
+    // tree beside the launches, contribute nothing.
+    std::fs::create_dir_all(base.join("ws-a/uuid-pi/pi-agent")).unwrap();
+    std::fs::create_dir_all(base.join("ws-a/bindings-abc")).unwrap();
+
+    let mut found = discover_opencode_dbs(Some(tmp.path()));
+    found.sort();
+    launches.sort();
+    assert_eq!(found, launches);
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial(opencode_db_env)]
+fn per_launch_stores_are_deduplicated_by_canonical_path() {
+    std::env::remove_var(OPENCODE_DB_ENV);
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp
+        .path()
+        .join(".local/state/loom/native-tools/ws/uuid-1/data");
+    std::fs::create_dir_all(data.join("opencode")).unwrap();
+    std::fs::write(data.join("opencode/opencode.db"), b"").unwrap();
+    // An operator's XDG_DATA_HOME that is (through a symlink) that same dir.
+    let link = tmp.path().join("data-link");
+    std::os::unix::fs::symlink(&data, &link).unwrap();
+    std::env::set_var("XDG_DATA_HOME", &link);
+    let found = discover_opencode_dbs(Some(tmp.path()));
+    std::env::remove_var("XDG_DATA_HOME");
+    assert_eq!(found.len(), 1, "{found:?}");
+}
+
+#[test]
+fn the_per_launch_scan_is_bounded_and_prefers_the_most_recently_written() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path();
+    let total = MAX_NATIVE_LAUNCH_DBS + 5;
+    for i in 0..total {
+        let dir = base
+            .join("ws")
+            .join(format!("uuid-{i:04}"))
+            .join("data/opencode");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("opencode.db");
+        std::fs::write(&db, b"").unwrap();
+        let at = std::time::SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_secs(1_700_000_000 + i as u64);
+        std::fs::File::options()
+            .write(true)
+            .open(&db)
+            .unwrap()
+            .set_modified(at)
+            .unwrap();
+    }
+    // The oldest store has a fresh WAL: a live launch writing through it.
+    let oldest = base.join("ws/uuid-0000/data/opencode/opencode.db");
+    std::fs::write(base.join("ws/uuid-0000/data/opencode/opencode.db-wal"), b"x").unwrap();
+
+    let found = native_launch_dbs(base);
+    assert_eq!(found.len(), MAX_NATIVE_LAUNCH_DBS);
+    assert_eq!(found[0], oldest, "a fresh WAL counts as a recent write");
+    assert!(
+        !found.contains(&base.join("ws/uuid-0001/data/opencode/opencode.db")),
+        "the stalest stores fall outside the bound"
+    );
+    assert!(native_launch_dbs(&base.join("absent")).is_empty());
+}
+
+/// Judge note on PR #11307: when the launch backlog exceeds the inspection
+/// bound, the newest launch directories are inspected, not whichever ones
+/// `read_dir` happened to yield first.
+#[test]
+fn a_launch_backlog_over_the_inspection_bound_keeps_the_newest_launches() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path();
+    let total = 12;
+    for i in 0..total {
+        let launch = base.join("ws").join(format!("uuid-{i:04}"));
+        let dir = launch.join("data/opencode");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("opencode.db"), b"").unwrap();
+        let at = std::time::SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_secs(1_700_000_000 + i as u64);
+        std::fs::File::open(&launch)
+            .unwrap()
+            .set_modified(at)
+            .unwrap();
+    }
+    let found = native_launch_dbs_bounded(base, 3);
+    let mut expected: Vec<_> = (total - 3..total)
+        .map(|i| base.join(format!("ws/uuid-{i:04}/data/opencode/opencode.db")))
+        .collect();
+    expected.sort();
+    let mut got = found.clone();
+    got.sort();
+    assert_eq!(got, expected, "{found:?}");
+}
+
+/// End to end: a sweep's tokens in a guarded per-launch store reach the
+/// per-sweep usage reader (and, through the same discovery, the burn sampler).
+#[test]
+#[serial_test::serial(opencode_db_env)]
+fn tokens_by_model_reads_a_guarded_per_launch_store() {
+    std::env::remove_var(OPENCODE_DB_ENV);
+    std::env::remove_var("XDG_DATA_HOME");
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp
+        .path()
+        .join(".local/state/loom/native-tools/ws/uuid-1/data/opencode");
+    std::fs::create_dir_all(&dir).unwrap();
+    seed_db(
+        &dir.join("opencode.db"),
+        &[Row {
+            input: 11,
+            output: 2,
+            ..row(&model_json("glm-5.3-flash", "zai-coding-plan"), "/repo/wt", 1_000)
+        }],
+    );
+    let rows = tokens_by_model(&dirs(&["/repo/wt"]), None, Some(tmp.path())).unwrap();
+    assert_eq!((rows[0].model.as_str(), rows[0].input), ("glm-5.3-flash", 11));
+}
+
 #[test]
 #[serial_test::serial(opencode_db_env)]
 fn tokens_by_model_reads_the_xdg_default_store() {

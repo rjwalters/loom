@@ -111,20 +111,14 @@ pub mod collector;
 pub mod cycle_guard;
 pub mod daemon_event;
 pub mod endpoint_policy;
-pub mod eta;
-mod eta_dependency;
-pub mod eta_fit;
-pub mod eta_fleet_refresh;
-mod eta_friction;
-pub mod eta_nightly_folds;
-pub mod eta_snapshot;
 pub mod exporter;
 pub mod fleet_state;
 pub mod lifecycle;
 pub mod llm_billing;
+pub mod loss_ledger;
 pub mod ops;
-#[cfg(feature = "otlp")]
 pub mod otlp;
+pub mod otlp_health;
 pub mod outcome;
 pub mod overhead;
 pub mod pick_decision;
@@ -202,6 +196,15 @@ pub struct ObservabilityConfig {
     /// are kept as raw strings for the same reason as [`Self::exporter`]:
     /// [`resolve_exporters`] owns the warn-and-skip of an unknown kind.
     pub exporters: Option<Vec<RawExporterEntry>>,
+    /// `observability.otlp_required` (Issue #11353): `false` opts this host out
+    /// of the "must export OTLP" health check; needs
+    /// [`Self::otlp_exempt_reason`] to take effect.
+    pub otlp_required: Option<bool>,
+    /// `observability.otlp_exempt_reason`: why this host is exempt.
+    pub otlp_exempt_reason: Option<String>,
+    /// `observability.otlp_failure_window_minutes`: the no-success window
+    /// after which OTLP export is `failing` (default 15).
+    pub otlp_failure_window_minutes: Option<u64>,
 }
 
 /// One raw `observability.exporters` entry as parsed from config (Issue
@@ -245,9 +248,8 @@ pub enum ExporterKind {
     /// default, for backward compatibility with every deployment predating
     /// this issue.
     Https,
-    /// OTLP/HTTP+JSON push (`otlp::OtlpExporter`, only compiled in behind the
-    /// `otlp` Cargo feature) — an escape hatch for an existing OpenTelemetry
-    /// stack.
+    /// OTLP/HTTP+JSON push (`otlp::OtlpExporter`, compiled into every build
+    /// since #10700) — an escape hatch for an existing OpenTelemetry stack.
     Otlp,
 }
 
@@ -317,6 +319,19 @@ pub fn read_config(root: &Path) -> ObservabilityConfig {
             .filter(|s| !s.is_empty())
             .map(str::to_string),
         exporters: block.get("exporters").and_then(parse_raw_exporters),
+        otlp_required: ["otlp_required", "otlpRequired"]
+            .iter()
+            .find_map(|k| block.get(*k))
+            .and_then(serde_json::Value::as_bool),
+        otlp_exempt_reason: ["otlp_exempt_reason", "otlpExemptReason"]
+            .iter()
+            .find_map(|k| block.get(*k))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        otlp_failure_window_minutes: ["otlp_failure_window_minutes", "otlpFailureWindowMinutes"]
+            .iter()
+            .find_map(|k| block.get(*k))
+            .and_then(serde_json::Value::as_u64),
     }
 }
 
@@ -717,6 +732,7 @@ pub fn global_export_queue_stats(
                         crate::telemetry::kinds::host_export::QueueStats {
                             depth: u64::try_from(queue.len()).unwrap_or(u64::MAX),
                             dropped_total: queue.dropped_total(),
+                            dropped_by_reason: queue.dropped_by_reason(),
                         },
                     )
                 })
@@ -926,15 +942,6 @@ fn entry_endpoint(
         );
         return Err((Some(endpoint), detail));
     }
-    #[cfg(not(feature = "otlp"))]
-    if entry.kind == ExporterKind::Otlp {
-        return Err((
-            Some(endpoint),
-            "exporter=otlp requested but this daemon build was not compiled \
-                 with the `otlp` Cargo feature"
-                .to_string(),
-        ));
-    }
     // `headers_file` (Issue #10961): refused here, before the ingest key or
     // the headers file itself is read. A no-op for an entry without one.
     if let Err(detail) = request_headers::entry_policy(
@@ -1128,7 +1135,6 @@ pub fn spawn_task(
     // The non-OTLP subset, for the `queue.snapshot` sink (Issue #8852).
     let mut native_queues: Vec<Arc<DurableQueue>> = Vec::new();
     // The OTLP sinks whose senders started, for the agent relay (#10964).
-    #[cfg(feature = "otlp")]
     let mut relay_sinks: Vec<otlp::relay::Sink> = Vec::new();
     for (index, (entry, endpoint)) in planned.iter().enumerate() {
         let name = entry.kind.name();
@@ -1152,18 +1158,12 @@ pub fn spawn_task(
                 // already handle.
                 let host_id_status = Arc::new(HostIdStatus::default());
                 register_global_host_id_status(host_id_status.clone());
-                // loom-ui star intents (#9244 C) ride the same native ack, so
-                // the queue is registered here too and nowhere else (the OTLP
-                // arm below has no ack to read them from).
-                let intents = crate::star_liveness::intents::register_global_queue();
                 match HttpsExporter::new(
                     endpoint.clone(),
                     ingest_key.clone(),
                     host_id.clone(),
                     host_id_status,
-                )
-                .map(|e| e.with_intent_queue(intents))
-                {
+                ) {
                     Ok(exporter) => sender::spawn_task(
                         queue.clone(),
                         exporter,
@@ -1209,7 +1209,6 @@ pub fn spawn_task(
                 // from "checked, and they agree". Better to leave the surface
                 // honestly absent until an OTLP-side identity signal exists to
                 // check against.
-                #[cfg(feature = "otlp")]
                 {
                     // `headers_file` (#10961) is read here, at construction —
                     // a refused file lands in the `Err` arm below as this
@@ -1241,18 +1240,10 @@ pub fn spawn_task(
                         }
                     }
                 }
-                // Unreachable without the feature: the policy pass above
-                // already rejected `Otlp` entries on non-`otlp` builds.
-                #[cfg(not(feature = "otlp"))]
-                {
-                    let _ = (endpoint, ingest_key, batch_size, flush_interval);
-                    unreachable!("otlp entry rejected in the policy pass without the feature")
-                }
             }
         };
         statuses.insert(name.to_string(), export_status);
         if entry.kind == ExporterKind::Otlp {
-            #[cfg(feature = "otlp")]
             relay_sinks.push(otlp::relay::Sink {
                 endpoint: endpoint.clone(),
                 headers_file: entry.headers_file.clone(),
@@ -1294,52 +1285,15 @@ pub fn spawn_task(
     let mut ops_handles = Vec::new();
     // The agent telemetry relay (#10964): opt-in, and only over OTLP sinks
     // that just started — it cannot add or start an exporter either.
-    #[cfg(feature = "otlp")]
     ops_handles.extend(otlp::relay::start(&workspace_root, &host_id, &ingest_key, &relay_sinks));
-    // ETA (#9289): `eta.estimate` / `eta.outcome` are OTLP-only too; the
-    // tracker and its bus subscriber run (and journal) even without them.
-    eta::register_sink(otlp_queues.clone(), &host_id);
     // `fleet.state` (#10196): the replay contract's state record, OTLP-only,
-    // built on the collector's snapshot pass whether or not ETA is enabled.
+    // built after every work-finder tick (#11161) and on the collector's
+    // snapshot pass.
     fleet_state::register_sink(otlp_queues.clone(), &host_id);
-    let eta_handle =
-        eta::spawn_task(bus, workspace_root.clone(), host_id.clone(), workspace_pool.clone());
-    // #10414: the ETA pass runs inside the collector's 5-minute pass, which
-    // beats it after each `eta::record`; registered only when ETA is on.
-    if eta_handle.is_some() {
-        crate::task_liveness::register(
-            crate::task_liveness::ETA_PASS,
-            SNAPSHOT_INTERVAL,
-            crate::task_liveness::default_stale_after(SNAPSHOT_INTERVAL),
-        );
+    if !otlp_queues.is_empty() {
+        ops_handles
+            .extend(fleet_state::spawn_tick_task(workspace_root.clone(), workspace_pool.clone()));
     }
-    ops_handles.extend(eta_handle);
-    // The daily ETA refit (#10245) and the fleet snapshot refresh (#10263):
-    // either/or. With fleet refresh on, the refit check runs at the end of
-    // every refresh cycle (`eta_fleet_refresh::owns_fit`), so it always sees
-    // that cycle's snapshots and the standalone refit task is not spawned —
-    // two loops calling `refit_if_due` would only race.
-    if eta_fleet_refresh::owns_fit(&crate::eta::config::read(&workspace_root)) {
-        ops_handles.extend(eta_fleet_refresh::spawn_task(
-            workspace_root.clone(),
-            workspace_pool.clone(),
-            otlp_queues.clone(),
-            host_id.clone(),
-        ));
-    } else {
-        ops_handles.extend(eta_fit::spawn_task(
-            workspace_root.clone(),
-            otlp_queues.clone(),
-            host_id.clone(),
-        ));
-    }
-    // The captain's nightly walk-forward backtest folds (#10492): independent
-    // of the refit/refresh either/or above; `fleet.captain`-gated per check.
-    ops_handles.extend(eta_nightly_folds::spawn_task(
-        workspace_root.clone(),
-        otlp_queues.clone(),
-        host_id.clone(),
-    ));
     // Live agent output (#9764): `session.output` is OTLP-only too, and
     // additionally opt-in — `spawn_task` returns `None` unless
     // `observability.liveOutput.enabled` is set. Registered over the
@@ -1359,14 +1313,8 @@ pub fn spawn_task(
     }
     // `queue.snapshot` (Issue #8852, phase 2): the reverse split — native
     // HTTPS queues only, sampled by the collector below.
-    if let Some(sink) = queue_snapshot::sink_for_native_queues(native_queues.clone(), &host_id) {
+    if let Some(sink) = queue_snapshot::sink_for_native_queues(native_queues, &host_id) {
         queue_snapshot::register_global_sink(sink);
-    }
-    // `eta.snapshot` (Issue #9329): the ETA counterpart of the record above —
-    // the same native-HTTPS-only split, sampled by the same collector pass.
-    // SigNoz keeps the per-estimate `eta.estimate` records registered above.
-    if let Some(sink) = eta_snapshot::sink_for_native_queues(native_queues, &host_id) {
-        eta_snapshot::register_global_sink(sink);
     }
     // `daemon.event` collection (Issue #8760, G4): a second, independent bus
     // subscription alongside `collector::spawn_task` below — see

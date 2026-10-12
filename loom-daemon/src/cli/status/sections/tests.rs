@@ -274,6 +274,7 @@ fn a_sectioned_payload_is_exactly_those_keys_of_the_default_payload() {
     let mut report = sample_report();
     report.per_repo = vec![loom_daemon::types::RepoStatus {
         root: std::path::PathBuf::from("/repo/a"),
+        maintain_only: None,
         priority: 100,
         in_flight_count: 1,
         health_gate_halted: false,

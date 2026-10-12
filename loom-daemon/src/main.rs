@@ -155,8 +155,8 @@ enum Commands {
     },
 
     /// Show the work finder's ready queue in its real dispatch order
-    /// (starred `loom:operator-priority` first, then red-main fixes, workspace
-    /// priority, oldest first — #9244) with what the last
+    /// (verified red-main fixes first, then priority level, oldest first —
+    /// #11103, #11547) with what the last
     /// tick did with each issue and why, plus a freshness line (Issue #8852).
     Queue {
         /// Emit machine-readable JSON instead of the human-readable table.
@@ -244,22 +244,6 @@ enum Commands {
         #[command(subcommand)]
         action: FleetAction,
     },
-
-    /// The operator-agent persona's I/O surface (Issue #7947, Phase 3b of
-    /// #4196): read room intent, vet a typed command, relay it to the daemon.
-    ///
-    /// `concierge relay` is the ONLY sanctioned path from a natural-language
-    /// read of a room message to a daemon command, and it refuses `--verb
-    /// confirm` unconditionally — a confirmation nonce is answered by the human
-    /// it was shown to, never by the persona. Off unless
-    /// `safehouse.concierge` names at least one allowed sender; `concierge
-    /// check` reports which.
-    ///
-    /// A one-line tuple variant wrapping `ConciergeArgs` (which carries the
-    /// `#[command(subcommand)]`), for the same reason `Telemetry` above is:
-    /// this file is frozen by the file-size ratchet, so the subcommand's shape
-    /// and docs live in `cli::concierge` and only the dispatch arm is here.
-    Concierge(cli::concierge::ConciergeArgs),
 
     /// Manage insta-crash quarantines (Issue #3939): the in-memory pauses the
     /// daemon applies to issues whose sweeps insta-crash repeatedly. Connects to
@@ -363,14 +347,8 @@ enum Commands {
         #[arg(long)]
         ignore_host_constraint: bool,
 
-        /// Override the host-class gate (Issue #9034): by default, dispatching a
-        /// `loom:heavy` issue on a host classified `host_class: local-dev`
-        /// (`autonomous.workFinder.hostClass` / `LOOM_HOST_CLASS`) refuses with a
-        /// clear message. Pass `--allow-local` to dispatch anyway — an operator
-        /// hand-dispatching a known-heavy issue on their own machine on purpose is
-        /// not the case this gate exists to stop.
-        #[arg(long)]
-        allow_local: bool,
+        #[command(flatten)]
+        tap: cli::dispatch::DispatchTapArgs,
     },
 
     /// Cancel a running sweep via the running daemon (Issue #4980): the `dispatch`
@@ -1105,6 +1083,11 @@ enum Commands {
         /// Show verbose output including configured roles
         #[arg(long, short)]
         verbose: bool,
+
+        /// Run only the fleet-policy shadow check (#11441) and exit 2 on any
+        /// finding; skips role validation. Used by the CI guard.
+        #[arg(long)]
+        fleet_policy_only: bool,
     },
 
     /// Inspect the durable `sweep.outcome` telemetry journal (Issue #4704,
@@ -1132,6 +1115,9 @@ enum Commands {
     /// = drift detector), diff/apply the `roster`, and report the desired run
     /// `state`. Args live in `cli::fleet_config` (main.rs is size-frozen).
     FleetConfig(cli::fleet_config::FleetConfigArgs),
+
+    /// The shared bounded journal core (#11345): `verify` a journal root.
+    Journal(cli::journal_cli::JournalArgs),
 }
 
 /// Sub-actions for `loom-daemon checkpoint` (issue #4275).
@@ -1240,7 +1226,19 @@ enum WorkspaceAction {
         /// first-time consumer install layered on top, clobbering that work.
         #[arg(long)]
         no_init: bool,
+
+        /// Register it maintain-only (#11186): kept current, never dispatched
+        /// into. Same as `workspace hold` right after, in one write.
+        #[arg(long)]
+        maintain_only: bool,
     },
+    /// Make a registered workspace maintain-only (#11186): the daemon keeps
+    /// its Loom install current (resync, checkout fast-forward, floor checks)
+    /// but starts no sweep, role or epic dispatch there. Hot-applies. On a
+    /// host a fleet store drives, the roster (`fleet: maintain`) wins.
+    Hold(cli::workspace_fleet::WorkspaceRoot),
+    /// Lift `workspace hold`: dispatch into the workspace resumes (#11186).
+    Release(cli::workspace_fleet::WorkspaceRoot),
     /// Set the dispatch priority tier of an already-registered workspace (#3946).
     SetPriority {
         /// Path to the repo root (normalized the same way as `add`).
@@ -1904,10 +1902,10 @@ enum TokensAction {
     },
 
     /// Materialize `.loom/tokens/` from `ACCOUNT_*_N` triples, merging by email
-    /// with precedence claude-monitor (`~/.claude-monitor/accounts.env`,
-    /// primary) > repo-local. The home master (`~/.loom/accounts.env`) is
-    /// opt-in only: read solely when `$LOOM_ACCOUNTS_ENV` (or `--home-env`)
-    /// points at it. `ACCOUNT_TOKEN_FILE_N` is optional — auto-derived from
+    /// with precedence llm-monitor (`~/.llm-monitor/accounts.env`, or a 1.x
+    /// host's `~/.claude-monitor`; primary) > repo-local. The home master
+    /// (`~/.loom/accounts.env`) is opt-in only: read solely when
+    /// `$LOOM_ACCOUNTS_ENV` (or `--home-env`) points at it. `ACCOUNT_TOKEN_FILE_N` is optional — auto-derived from
     /// `ACCOUNT_EMAIL_N` when omitted. Native Rust port of the historical Python
     /// `loom-tokens bootstrap` CLI (issue #4105, epic #4081). That Python CLI no
     /// longer exists — the package was deleted in Phase 4 (#4557) — so this name
@@ -1955,8 +1953,9 @@ enum TokensAction {
         json: bool,
     },
 
-    /// Materialize `.loom/tokens/` from claude-monitor's LIVE credential store
-    /// (`~/.claude-monitor/usage.db`) instead of the `accounts.env` snapshot.
+    /// Materialize `.loom/tokens/` from llm-monitor's LIVE credential store
+    /// (`~/.llm-monitor/usage.db`, or a 1.x host's `~/.claude-monitor`) instead
+    /// of the `accounts.env` snapshot.
     /// Use this after rolling accounts: the snapshot keeps the old (now
     /// revoked) tokens, so `bootstrap --force` would rewrite them unchanged.
     /// Native Rust port of the historical Python `loom-tokens
@@ -1974,8 +1973,9 @@ enum TokensAction {
         #[arg(long)]
         shared: bool,
 
-        /// Path to claude-monitor's `usage.db` (default: `<claude-monitor
-        /// dir>/usage.db`, honoring `$LOOM_CLAUDE_MONITOR_DIR`).
+        /// Path to llm-monitor's `usage.db` (default: `<monitor dir>/usage.db`,
+        /// honoring `$LOOM_LLM_MONITOR_DIR`, then `$LOOM_CLAUDE_MONITOR_DIR`,
+        /// then `~/.llm-monitor`, then `~/.claude-monitor`).
         #[arg(long, value_name = "PATH")]
         db: Option<String>,
 
@@ -2368,9 +2368,11 @@ async fn handle_cli_command(command: Commands) -> Result<()> {
             format,
             strict,
             verbose,
-        } => handle_validate_command(&workspace, &format, strict, verbose),
+            fleet_policy_only,
+        } => handle_validate_command(&workspace, &format, strict, verbose, fleet_policy_only),
         Commands::SweepOutcomes(args) => cli::sweep_outcomes_cli::dispatch(args),
         Commands::FleetConfig(args) => cli::fleet_config::dispatch(args),
+        Commands::Journal(args) => cli::journal_cli::dispatch(args),
         Commands::Stats {
             command,
             role,
@@ -2530,7 +2532,6 @@ async fn handle_cli_command(command: Commands) -> Result<()> {
         // Async commands are dispatched by main before reaching this sync handler.
         Commands::JevMergeRisk { .. }
         | Commands::JevTier { .. }
-        | Commands::Concierge(..)
         | Commands::Hyperparams(..)
         | Commands::Quarantine { .. }
         | Commands::DispatchBackoff { .. }

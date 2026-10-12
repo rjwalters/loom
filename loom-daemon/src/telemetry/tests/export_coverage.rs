@@ -65,7 +65,7 @@ fn coverage_excludes_misconfigured_exporters_in_a_mixed_configuration() {
         "otlp".to_string(),
         ExportStatus::misconfigured(
             Some("http://127.0.0.1:4318".to_string()),
-            "exporter = \"otlp\" requires the `otlp` Cargo feature".to_string(),
+            "failed to construct OTLP exporter: headers_file refused".to_string(),
         )
         .snapshot(),
     );

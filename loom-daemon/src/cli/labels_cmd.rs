@@ -3,7 +3,8 @@
 //! frozen by the file-size ratchet.
 //!
 //! Exit codes: 0 ok; 1 unknown label (`get`) or drift (`check`); 2 unknown
-//! property/kind/field or unreadable registry.
+//! property/kind/field or unreadable registry. `undeclared` has its own
+//! (see [`super::labels_undeclared`]).
 
 use std::path::{Path, PathBuf};
 
@@ -49,6 +50,20 @@ pub(crate) enum LabelsCommand {
     Check {
         #[arg(long)]
         root: Option<PathBuf>,
+    },
+    /// List live `loom:*` labels on a GitHub repo that a `labels.yml` does not
+    /// declare (#11105); with `--prune`, delete each one no open issue or PR
+    /// carries. Exit 0 none remain, 3 some remain, 4 labels unreadable.
+    Undeclared {
+        /// The GitHub repo, `OWNER/NAME`.
+        #[arg(long)]
+        repo: String,
+        /// The `labels.yml` that declares the repo's labels.
+        #[arg(long)]
+        labels_file: PathBuf,
+        /// Delete the unused ones (default: report only).
+        #[arg(long)]
+        prune: bool,
     },
 }
 
@@ -150,6 +165,11 @@ fn run(cmd: LabelsCommand) -> Result<i32> {
             }
             Ok(0)
         }
+        LabelsCommand::Undeclared {
+            repo,
+            labels_file,
+            prune,
+        } => Ok(super::labels_undeclared::dispatch(&repo, &labels_file, prune)),
         LabelsCommand::Check { root } => {
             let root = root_of(root);
             let block = generate::loom_block(&load(&root)?);
@@ -176,7 +196,7 @@ fn run(cmd: LabelsCommand) -> Result<i32> {
 }
 
 fn label_json(l: &loom_daemon::label_registry::Label) -> serde_json::Value {
-    let mut v = serde_json::json!({
+    serde_json::json!({
         "name": l.name, "description": l.description, "color": l.color,
         "kind": l.kind, "applied_by": l.applied_by, "removed_by": l.removed_by,
         "park": l.park, "skip": l.skip, "hold": l.hold,
@@ -186,9 +206,5 @@ fn label_json(l: &loom_daemon::label_registry::Label) -> serde_json::Value {
         "merge_hold": l.merge_hold, "operator_hold": l.operator_hold, "contradicts_approval": l.contradicts_approval,
         "stale_after_minutes": l.stale_after_minutes, "requires_base": l.requires_base,
         "remove_with": l.remove_with, "lifecycle": l.lifecycle,
-    });
-    if let Some(p) = &l.propagate {
-        v["propagate"] = serde_json::to_value(p).unwrap_or_default();
-    }
-    v
+    })
 }

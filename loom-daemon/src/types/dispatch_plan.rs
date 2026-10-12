@@ -52,6 +52,8 @@ pub enum PlanGate {
     RepoCap,
     /// Outside this host's preferred repo slice while the slice had work.
     OutOfSlice,
+    /// Its affected files overlap same-repo work admitted or in flight (#9781).
+    FileOverlap,
     /// A gate this client does not know (forward compatibility).
     #[serde(other)]
     Unknown,
@@ -131,9 +133,9 @@ pub struct PlanSlots {
     pub saturation_held: bool,
     #[serde(default)]
     pub any_halted: bool,
-    /// Whether the host's single `loom:operator-priority` overflow slot
-    /// (#9244) is unused: a starred issue can still start past the
-    /// configured cap.
+    /// Whether the host's single overflow slot (#9244) is unused. Inert
+    /// since #11508: nothing is admitted past the configured cap any more,
+    /// so this only reports an overflow sweep an older daemon started.
     #[serde(default)]
     pub overflow_free: Option<bool>,
 }

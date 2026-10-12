@@ -15,7 +15,10 @@
 //! **Bounded, drop-oldest.** [`DurableQueue::push`] never grows the queue
 //! past `capacity`: once full, the oldest queued envelope is discarded and
 //! [`DurableQueue::dropped_total`] increments — logged once per drop, never a
-//! silent loss and never unbounded growth (per the issue's AC).
+//! silent loss and never unbounded growth (per the issue's AC). Every loss —
+//! capacity eviction, a reopen front-trim, an exporter-reported rejection —
+//! lands in this queue's durable [`super::loss_ledger`] by reason (Issue
+//! #11527), so `dropped_total` survives a restart instead of resetting.
 //!
 //! **Peek-then-ack, not pop.** The sender ([`super::sender`]) reads a batch
 //! via [`DurableQueue::peek_batch`] without removing it, attempts the export,
@@ -33,6 +36,7 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use super::loss_ledger::{LossLedger, REASON_CAPACITY_SHRINK, REASON_QUEUE_OVERFLOW};
 use crate::telemetry::TelemetryEnvelope;
 
 /// Env var overriding the queue file path (test seam), mirroring
@@ -69,7 +73,6 @@ pub fn default_queue_path(workspace_root: &Path) -> PathBuf {
 
 struct QueueState {
     items: VecDeque<TelemetryEnvelope>,
-    dropped_total: u64,
     /// Bulk-backfill offers refused at the backfill limit (#11115).
     deferred_total: u64,
     head_sequence: u128,
@@ -104,6 +107,11 @@ pub struct QueueSnapshot {
 pub struct DurableQueue {
     path: PathBuf,
     capacity: usize,
+    /// Durable, by-reason loss counts (Issue #11527): capacity evictions,
+    /// reopen front-trims and exporter-reported losses all land here, and
+    /// [`Self::dropped_total`] is its sum — so the count a `host.export`
+    /// reports survives a restart.
+    ledger: LossLedger,
     state: Mutex<QueueState>,
 }
 
@@ -116,29 +124,54 @@ impl std::fmt::Debug for DurableQueue {
     }
 }
 
+/// The loss-ledger path for a queue at `queue_path`: the queue filename with
+/// its extension replaced by `loss.json` — `observability-queue.jsonl` keeps
+/// a ledger at `observability-queue.loss.json`, `observability-queue.otlp
+/// .jsonl` at `observability-queue.otlp.loss.json`. One ledger per queue
+/// file, derived (never configured), so every [`DurableQueue`] — including
+/// the sole-exporter legacy name and the overhead journal — gets exactly one.
+fn loss_ledger_path(queue_path: &Path) -> PathBuf {
+    queue_path.with_extension("loss.json")
+}
+
 impl DurableQueue {
     /// Open (or create) the queue at `path`, replaying any envelopes left
     /// over from a prior process (best-effort — a missing, unreadable, or
     /// partially-corrupt file degrades to an empty queue rather than
     /// erroring; a corrupt individual line is skipped, matching
     /// [`crate::sweep_outcomes::read_all`]'s soft-fail contract). `capacity`
-    /// is clamped to at least 1.
+    /// is clamped to at least 1. Envelopes trimmed off the front by a
+    /// capacity that shrank since the file was last written are recorded in
+    /// the queue's loss ledger as [`REASON_CAPACITY_SHRINK`].
     #[must_use]
     pub fn open(path: PathBuf, capacity: usize) -> Self {
         let capacity = capacity.max(1);
+        let ledger = LossLedger::open(loss_ledger_path(&path));
         let mut items = load_existing(&path);
         // A capacity that shrank since the file was last written (e.g. a
         // config edit between restarts) must not resurrect more than the
         // new bound allows.
+        let mut shrunk = 0u64;
         while items.len() > capacity {
             items.pop_front();
+            shrunk += 1;
+        }
+        if shrunk > 0 {
+            ledger.record(REASON_CAPACITY_SHRINK, shrunk);
+            // Persist the trimmed queue too: the file still holds the
+            // pre-trim lines, so without this rewrite every reopen would
+            // re-trim (and re-count) the same front until a push/ack
+            // happened to rewrite it.
+            if let Err(error) = persist_to(&path, &items) {
+                log::warn!("observability: failed to persist trimmed queue: {error}");
+            }
         }
         DurableQueue {
             path,
             capacity,
+            ledger,
             state: Mutex::new(QueueState {
                 items,
-                dropped_total: 0,
                 deferred_total: 0,
                 head_sequence: 0,
             }),
@@ -176,12 +209,12 @@ impl DurableQueue {
         if state.items.len() >= self.capacity {
             state.items.pop_front();
             state.head_sequence += 1;
-            state.dropped_total += 1;
+            self.ledger.record(REASON_QUEUE_OVERFLOW, 1);
             log::warn!(
                 "observability: queue at capacity ({}); dropped oldest record \
-                 (dropped_total={})",
+                 (queue_overflow, dropped_total={})",
                 self.capacity,
-                state.dropped_total
+                self.ledger.total()
             );
         }
     }
@@ -221,11 +254,29 @@ impl DurableQueue {
         self.len() == 0
     }
 
-    /// Total envelopes dropped (oldest-first) over this queue's lifetime for
-    /// having arrived while already at capacity.
+    /// Total envelopes (and, for `receiver_rejected`, signal items — see the
+    /// reason vocabulary in [`super::loss_ledger`]) lost over this queue's
+    /// lifetime, by every reason. **Durable** (Issue #11527): the sum of the
+    /// on-disk loss ledger, so it survives daemon restarts instead of
+    /// resetting to 0.
     #[must_use]
     pub fn dropped_total(&self) -> u64 {
-        self.lock().dropped_total
+        self.ledger.total()
+    }
+
+    /// The durable by-reason breakdown behind [`Self::dropped_total`], for
+    /// `host.export`'s `dropped_by_reason` (Issue #11527).
+    #[must_use]
+    pub fn dropped_by_reason(&self) -> std::collections::BTreeMap<String, u64> {
+        self.ledger.by_reason()
+    }
+
+    /// Record exporter-reported losses (Issue #11527): the sender feeds the
+    /// [`super::outcome::BatchOutcome::lost`] map of every flush here, so a
+    /// permanently rejected batch (e.g. OTLP 400) is counted durably by
+    /// reason instead of vanishing between restarts.
+    pub fn record_losses(&self, losses: &std::collections::BTreeMap<String, u64>) {
+        self.ledger.record_losses(losses);
     }
 
     /// Total bulk-backfill offers refused at the backfill limit over this
@@ -243,7 +294,7 @@ impl DurableQueue {
             depth: state.items.len() as u64,
             capacity: self.capacity as u64,
             backfill_limit: backfill_limit(self.capacity) as u64,
-            dropped_total: state.dropped_total,
+            dropped_total: self.ledger.total(),
             backfill_deferred_total: state.deferred_total,
         }
     }
@@ -682,9 +733,7 @@ mod tests {
                 issue,
                 sweep_id: format!("sweep-issue-{issue}-0"),
                 started_at: chrono::Utc::now(),
-                model: None,
-                effort: None,
-                runtime: None,
+                facts: Default::default(),
             }),
         )
     }
@@ -762,6 +811,10 @@ mod tests {
         queue.push(envelope(3)); // over capacity: drops issue 1
         assert_eq!(queue.len(), 2);
         assert_eq!(queue.dropped_total(), 1);
+        assert_eq!(
+            queue.dropped_by_reason(),
+            std::collections::BTreeMap::from([("queue_overflow".to_string(), 1)])
+        );
         let batch = queue.peek_batch(10);
         match &batch[0].record {
             TelemetryRecord::SweepStarted(r) => assert_eq!(r.issue, 2),
@@ -771,6 +824,28 @@ mod tests {
         queue.push(envelope(5));
         assert_eq!(queue.dropped_total(), 3, "never grows unbounded — every overflow is counted");
         assert_eq!(queue.len(), 2);
+        // The count is durable (Issue #11527): a reopen over the same files
+        // sees the same ledger, it does not restart at 0.
+        let reopened = DurableQueue::open(dir.path().join("q.jsonl"), 2);
+        assert_eq!(reopened.dropped_total(), 3);
+        assert_eq!(reopened.dropped_by_reason().get("queue_overflow"), Some(&3));
+    }
+
+    #[test]
+    fn exporter_reported_losses_land_in_the_ledger_by_reason() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("q.jsonl");
+        let queue = DurableQueue::open(path.clone(), 10);
+        queue.record_losses(&std::collections::BTreeMap::from([
+            ("status_400".to_string(), 2),
+            ("receiver_rejected".to_string(), 5),
+        ]));
+        assert_eq!(queue.dropped_total(), 7, "total = the sum over reasons");
+        assert_eq!(queue.dropped_by_reason().get("status_400"), Some(&2));
+        let reopened = DurableQueue::open(path, 10);
+        assert_eq!(reopened.dropped_by_reason().get("status_400"), Some(&2));
+        assert_eq!(reopened.dropped_by_reason().get("receiver_rejected"), Some(&5));
+        assert_eq!(reopened.dropped_total(), 7);
     }
 
     #[test]
@@ -818,6 +893,15 @@ mod tests {
             TelemetryRecord::SweepStarted(r) => assert_eq!(r.issue, 4),
             other => panic!("unexpected record {other:?}"),
         }
+        // The front-trim is a counted, durable loss (Issue #11527).
+        assert_eq!(reopened.dropped_total(), 3);
+        assert_eq!(reopened.dropped_by_reason().get("capacity_shrink"), Some(&3));
+        let reopened_again = DurableQueue::open(dir.path().join("q.jsonl"), 2);
+        assert_eq!(
+            reopened_again.dropped_by_reason().get("capacity_shrink"),
+            Some(&3),
+            "no double count on a second reopen at the same capacity"
+        );
     }
 
     #[test]

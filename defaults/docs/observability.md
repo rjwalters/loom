@@ -16,8 +16,10 @@
 - [2. What gets sent: the wire schema](#2-what-gets-sent-the-wire-schema)
 - [3. Exporters: HTTPS (default) or OTLP (opt-in)](#3-exporters-https-default-or-otlp-opt-in)
 - [3b. Confirming telemetry is actually flowing](#3b-confirming-telemetry-is-actually-flowing)
+- [3b-2. Every daemon must export OTLP: `otlp_export` (Issue #11353)](#3b-2-every-daemon-must-export-otlp-otlp_export-issue-11353)
 - [3c. Operational signals from daemon loops (Issue #8860)](#3c-operational-signals-from-daemon-loops-issue-8860)
 - [3d. Agent telemetry relay (Issue #10964)](#3d-agent-telemetry-relay-issue-10964)
+- [3e. Alerts on loom-ui's Alerts page (Issue #11295)](#3e-alerts-on-loom-uis-alerts-page-issue-11295)
 - [4. The backend: deploy your own Cloudflare Worker](#4-the-backend-deploy-your-own-cloudflare-worker)
 - [5. Authenticated vs. public: two views, one redaction policy](#5-authenticated-vs-public-two-views-one-redaction-policy)
 - [5b. Doc-maintenance throughput (Guide, local-only, issue #6136)](#5b-doc-maintenance-throughput-guide-local-only-issue-6136)
@@ -236,8 +238,8 @@ Back-compat and upgrade rules:
 - Entries dedupe by kind (first wins; queues and status are keyed by kind
   name, so `"https"` can appear once). An unrecognized kind is logged and
   skipped, never a hard error.
-- A policy failure on one entry (bad endpoint, placeholder host, missing
-  `otlp` Cargo feature in this build) degrades **that entry** to its own
+- A policy failure on one entry (bad endpoint, placeholder host, refused
+  `headers_file`) degrades **that entry** to its own
   `misconfigured` status while the other exporters run; only when *no*
   exporter survives — or the shared ingest key is unusable — is export off
   entirely.
@@ -482,6 +484,40 @@ new config knob, an HTTP scrape in the sender loop, and a new state wired
 through every surface. Tracked separately — until it exists, the end-to-end
 check is external and the daemon says so instead of implying otherwise.
 
+## 3b-2. Every daemon must export OTLP: `otlp_export` (Issue #11353)
+
+A daemon that does not export to SigNoz looks healthy everywhere else, so the
+condition is a first-class health check with four states, shown on the
+`OTLP export:` line of `loom-daemon status`, as `otlp_export` in
+`status --json`, and as `otlp_export` on the `host.health` record:
+
+| State | Meaning |
+|---|---|
+| `no_exporter` | The resolved `observability.exporters` has no usable `otlp` entry (or observability is off). Every build compiles the OTLP exporter in (#10700), so a binary can no longer lack it. |
+| `failing` | An `otlp` exporter is configured, but no batch was acked within the window, or the OTLP queue's `dropped_total` grew within the window. |
+| `ok` | The last successful export is recent (a fresh exporter gets the window as startup grace). |
+| `exempt` | The host opted out; the reason is shown. |
+
+Precedence is `exempt`, `no_exporter`, `failing`, `ok`. A line is logged at
+daemon start and on each change of state, never per tick: WARN for `no_exporter`
+and `failing`, INFO for recovery to `ok` and entry into `exempt`.
+
+```json
+{ "observability": {
+    "otlp_required": false,
+    "otlp_exempt_reason": "robb-studio: no SigNoz route, see 2am#3649",
+    "otlp_failure_window_minutes": 15
+} }
+```
+
+`otlp_required: false` takes effect only with a non-empty `otlp_exempt_reason`;
+without one the daemon warns and treats the host as not exempt. The window
+defaults to 15 minutes. The `host.health` field is carried in the record body
+on the native HTTPS path. Over OTLP, where `host.health` becomes gauges, the
+state is the `loom.host.otlp_export` gauge (value 1) with a `state` label and,
+when exempt, a `reason` label; both labels are already on the collector's
+datapoint allowlist.
+
 ## 3c. Operational signals from daemon loops (Issue #8860)
 
 `observability::ops` is the shared path every daemon loop uses to put a
@@ -536,30 +572,13 @@ Import it with `POST /api/v1/rules` or paste its query into a new ClickHouse
 alert. The rule's shape has not yet been tested against a live SigNoz. Standing queries are in
 `defaults/observability/signoz/queue-dwell.sql`.
 
-**Fleet singleton outputs (#10916).** A one-host fleet job can stop producing
-while every host looks healthy (2026-10-07: 28 of ~30 repos had no
-`eta.estimate` for ~31 h). `defaults/observability/signoz/alerts/fleet-singleton-output.json`
-is the cross-host detector: over the logs table it takes the newest record per
-`loom.kind` (and per `loom.repo` for per-repo rows) and fires when one is older
-than its row's deadline in `fleet_outputs::SINGLETON_OUTPUTS` (2 x cadence, or
-the row's override). It checks the output, never the owning host, and a kind
-with no record in the 72 h window fires. A per-repo output (`eta.fleet_refresh`)
-is expected for every repo the fleet is working on, read from an independent
-roster: any repo with a `pass.summary`, `role_tick.outcome` or `sweep.started`
-record in the window (emitted by the host that works the repo, never by a
-fleet singleton). A roster repo with no output in the window fires, so a repo
-the producing host does not cover, or an outage older than the window, stays
-visible while that activity continues. The roster is activity, not
-configuration: a repo with none of those records in the window (no work finder
-or role runner serving it, or none exporting OTLP) is not expected. An
-`eta.estimate` repo is judged only while it owes estimates: an item stops
-owing once a `land` `eta.outcome` closes it or its newest estimate is a
-refusal. That row is not roster-expanded (owing needs the forge's open items,
-which SigNoz does not hold), so an estimate outage older than the window is
-left to the in-daemon path. `signoz_fleet_singleton_output_alert.rs` asserts
-each embedded deadline equals the registry's. Captain-gauge rows (a
-fleet-store heartbeat, not a log kind) and the Warning `ci.run` row are not in
-this critical rule. The in-daemon `fleet_alert` path is #10924.
+**Fleet singleton outputs (#10916).** The in-daemon `fleet_alert` path
+(#10924) judges the registered one-host fleet outputs (`ci.run`, the captain
+gauges, and the intake-reconcile completed-pass heartbeat
+`.loom/state/intake-reconcile/last-pass.json`) against
+`fleet_outputs::SINGLETON_OUTPUTS`. The SigNoz
+cross-host alert that watched the ETA singletons was removed with the ETA
+subsystem (#11098).
 
 **Subscription quota utilization (#9005).** The per-account `tokens.snapshot`
 gauges carry both Claude limit windows: `loom.tokens.usage_fraction` (5-hour)
@@ -604,7 +623,7 @@ merge-chain head that `main` keeps moving under. Details are in
 **Per-issue dispatch disposition (#9222).** `loom.dispatch.admission` only
 covers candidates that reached a `dispatch()` attempt — a candidate filtered
 out earlier (`workspace_halted`, `parked`, `deferred_saturation`,
-`host_class_refused`, a backoff, a cooldown, …) had no per-issue SigNoz record
+`host_constraint`, a backoff, a cooldown, …) had no per-issue SigNoz record
 at all before this. Every ready-queue row now gets a `loom.dispatch.disposition`
 span on a disposition transition (including first sight), on a periodic
 refresh (`LOOM_DISPATCH_DISPOSITION_REFRESH_SECS`, default 600s = 10 min), or
@@ -630,6 +649,7 @@ vocabulary (`loom.queue.disposition`'s wire values):
 | "build back-off" / "WIP limit" (PR debt high) | `deferred_build_backoff` (decisions reason `build_backoff`, tick result `build_backoff_held`, #9410) |
 | "dependency blocked" | Loom has no issue-dependency gate. Nearest: `parked` (a `PARK_LABELS`/`SKIP_LABELS` entry, e.g. `loom:blocked`, alongside `loom:issue`) or `labelled_blocked` (`loom:blocked` without `loom:issue` — forge-side only, from `queue.snapshot`, never a tick outcome so it never appears on a `loom.dispatch.disposition` span) |
 | "lower tier" (ranked behind others) | `deferred_capacity` (machine concurrency cap full), `deferred_ramp_cap` (per-tick admission cap), `deferred_repo_cap` (per-repo cap), or `deferred_out_of_slice` (repo sharding) — `tier:*` labels do not affect dispatch order, only `loom.queue.rank` does |
+| "waiting on overlapping work" (same files) | `deferred_file_overlap` (#9781): its `## Affected Files` share a path with same-repo work admitted earlier this tick or already in flight; the row's `detail` (and the `pick.decision` skip's `detail`) names the shared paths. A one-tick scheduling deferral, never a label or hold — see `daemon-reference.md` §"Same-repo file-overlap deferral" |
 | "repo locked by an open PR" | `open_pr` (the #4123 guard's `pr-open-skip`). Since #9674 the repo's `open_pr` rows carry the repo-level `lockout.frozen_candidates_count` / `lockout.frozen_points_sum` / `lockout.duration_seconds` attributes, so rank which repo's lockout is starving the most ready work by grouping those spans on `loom.repo` |
 
 A `workspace_halted` row names its cause on `loom.queue.halt_cause` (#9673):
@@ -706,11 +726,16 @@ without an exporter, `loom-daemon forge calls --by bucket` shows the same
 picture from the local forge-call sink. Each `invoke github` span carries the
 same facts per call (#10343): `github.http.{status,not_modified,requests,source}`
 (`unknown` when `gh` gave no HTTP evidence — never guessed),
-`github.billing` (`ok`|`not_modified`|`rate_limited`|`error`|`not_sent`) and
+`github.billing` (`ok`|`not_modified`|`rate_limited`|`secondary_limited`|`error`|`not_sent`) and
 the bucket join keys `github.{resource,account,cred_owner,role}`. Since
 #10752 a span also carries `github.repo`, a write carries `github.number`, and
 a call made by a daemon pass inside its caller scope carries `github.caller`
-(the `loom:blocked` release pass: `stale_blocked_release`). That pass also
+(the `loom:blocked` release pass: `stale_blocked_release`). Since #11407
+every span also names the endpoint: `github.route` (a template such as
+`/repos/{owner}/{repo}/pulls/{n}`, from the same finite table as gh-shim's
+`github.api.route`), `http.request.method`, and `github.command` (`pr view`
+for an agent front read), so `api.rest` and `agent_gh_front` spend can be
+ranked by route. That pass also
 emits a `pass.summary` log per pass and a `pass.verdict` per artifact; see
 [`telemetry-schema.md`](telemetry-schema.md) and
 `defaults/observability/signoz/pass-queries.sql`.
@@ -817,8 +842,7 @@ operational check on a fleet host (shadow recipe above), not a CI check.
 **Long-running task liveness and self-update decisions (#10414).** Each
 long-running daemon loop beats a process-global liveness registry
 (`crate::task_liveness`) once per finished iteration. The loops are the
-self-update loop (`auto_update`), the ETA fleet refresh
-(`eta_fleet_refresh`), the 5-minute ETA pass (`eta_pass`) and each role-runner
+self-update loop (`auto_update`) and each role-runner
 loop (`role_runner.<role>`). Every 60 s, on its own ticker independent of the
 collector pass, the daemon exports `loom.daemon.task_alive{task}`. The value
 is `1` while the loop has beaten within its staleness window. That window is
@@ -828,9 +852,7 @@ marked itself dead. So a loop that exited, or whose blocking cycle never
 returns, reads `0` within one window. Before #10414 it simply went silent.
 `loom.daemon.task_faults{task,reason}` counts `panic` (an iteration panicked
 and the loop caught it), `overrun` (an iteration ran past the loop's own
-bound), `exit` (the loop stopped for good) and, on `task=eta_pass` only,
-`eta_non_authority_emit` (a host that is not the fleet's ETA authority reached
-the ETA sink; the records were dropped, #10498). The same entries are listed
+bound) and `exit` (the loop stopped for good). The same entries are listed
 under `Task liveness:` in `loom-daemon status`, and as `task_liveness` in
 `status --json`. Alert on `task_alive == 0`, and also on the series going
 silent: that means the sampler or the whole daemon stopped. The self-update
@@ -945,7 +967,6 @@ could read. A machine with no daemon running has no receiver at all.
 
 The same switch is read again at each launch against the launched session's
 own workspace, so one repository of a multi-workspace daemon can opt out.
-Requires a daemon built with the `otlp` Cargo feature (release builds are).
 
 **What a wired session is given.** `CLAUDE_CODE_ENABLE_TELEMETRY=1`,
 `CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1`, `OTEL_{METRICS,LOGS,TRACES}_EXPORTER=otlp`,
@@ -1088,6 +1109,56 @@ in view:
 A session that outlives the daemon that launched it (a sweep adopted after a
 restart) keeps a stale address and exports nothing until it is relaunched —
 unless something else now holds that address, as above.
+
+## 3e. Alerts on loom-ui's Alerts page (Issue #11295)
+
+loom-ui is the alert hub for every repo. With the native ingest export
+configured (section 1), the daemon also posts its alerts to
+`POST {loom-ui}/api/alerts/external` (2AMLogic/loom-ui
+`docs/alerts/external.md`) — same ingest key, same host id as `source`, URL
+derived from `observability.endpoint` by replacing its `/ingest` path. No
+ingest config means the output is off. `LOOM_LOOM_UI_ALERTS=0` turns it off
+on a host that exports telemetry; `LOOM_LOOM_UI_ALERTS_URL` overrides the URL.
+The host id must be in loom-ui's `ALERTS_EXTERNAL_HOSTS` (else 403, logged
+and dropped).
+
+| Rule | From | Open / resolved |
+|---|---|---|
+| `fleet.<condition>` (`dispatch-halted`, `roles-persistent`, `capacity-limited`, `output-missing`; `star-backlog` retired by #11510) | `fleet_alert` | condition started (and each reminder) / cleared |
+| `daemon.down` (critical) | the watchdog, a separate process | recovery exhausted / any tick ending the outage |
+| `watchdog.peer-coord-degraded` (critical) | the watchdog | coordination degraded / green |
+| `safehouse.unreachable` (critical) | narration sink state | unreachable over 5 minutes / reconnected |
+| `fleet.floor-unsatisfiable` | `auto_update` | the floor ERROR line / floor met |
+| `fleet.floor-malformed` | fleet-sync pass | `loom_min_version` malformed / a valid (or no) floor |
+| `fleet.sync-error` | fleet-sync pass | 3 erroring passes in a row / a clean pass |
+| `daemon.task-dead` (key = task) | `task_liveness`, sampled each minute | loop past its staleness window / beating again or gone |
+| `forge.credential-missing` (critical) | startup credential preflight | no usable GitHub credential / a good start or github-app refresh |
+| `resync.<kind>` (`failure`, `repo-access`, `branch-protection`: key = repo; `network`, `head-query`, `pass-stuck`: key `workspaces`) | workspace resync | its alert threshold (3 in a row) / the repo or host healthy again |
+| `forge.ratelimit-breaker` | rate-limit breaker, sampled each minute | polling held off over 15 minutes / released |
+| `version.pause-failed` (key = version) | pause roll (H7 `pause-failed`) | the failed pause / a start on another version |
+| `version.config-rejected` | pause roll | `pauseRoll.*` tuning rejected / accepted (each roll and each start) |
+| `llm-monitor.stale` | llm-monitor `ranking.json` | older than 30 minutes (or unreadable) on two reads 5 minutes apart / fresh (no file: nothing) |
+| `install.<invariant>` (key = workspace root) | `install_self_check`, when enabled | violation standing after the tick / gone, or the check off |
+
+`tokens-zero-healthy` is not sent: loom-ui derives `provider-pool-exhausted`
+from the daemon's pool gauge itself. Delivery is a bounded FIFO drained by one
+task (open always before resolved): a 2xx is done, any other 4xx except 429 is
+dropped and logged, 429 / 5xx / network errors back off (5 s doubling to
+15 min, at most 20 tries). The watchdog posts synchronously (10 s bound) and
+keeps a `<sentinel>.loom-ui` record so an unanswered post retries next tick.
+
+Level-triggered sources keep the incidents they hold open in
+`~/.loom/loom-ui-alerts/<scope>.json`, so a restarted daemon resolves one
+the previous process opened once it finds the condition gone, and keeps one
+open while its failure count (process memory) builds up again; a daemon
+that finds the output off removes those files. The single-key
+watches (safehouse, breaker, llm-monitor) send one `resolved` on their first
+healthy sample instead. Alerts raised before the output starts (credential
+preflight, the fleet-sync startup pass) wait in the outbox. llm-monitor's
+quota step-change alert is not in `ranking.json` yet, so it is not sent.
+
+`fleet_alert` only runs when `autonomous.fleetAlert.enabled` is on (off by
+default here); the fleet defaults (fleet-gitops) are where to enable it.
 
 ## 4. The backend: deploy your own Cloudflare Worker
 

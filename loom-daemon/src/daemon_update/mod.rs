@@ -635,6 +635,7 @@ fn resolve_json_and_exit(a: &Args, repo_root: &Path, installed_bin: Option<&Path
             || std::env::var("LOOM_DAEMON_UPDATE_FETCH")
                 .map(|v| matches!(v.trim(), "0" | "false" | "no" | "off"))
                 .unwrap_or(false),
+        min_version: None,
     };
     let resolution = resolve(&inputs);
     // Exactly one line on stdout, and nothing else ever written there.
@@ -967,8 +968,9 @@ fn print_dry_run_plan(
             ));
         }
         out::say(&format!(
-            "[dry-run] Would run: (cd {} && cargo build --release --message-format=json-render-diagnostics)",
-            s.daemon_dir.display()
+            "[dry-run] Would run: (cd {} && cargo {})",
+            s.daemon_dir.display(),
+            rebuild::build_args(&s.daemon_dir).join(" ")
         ));
     }
     out::say(&format!(

@@ -177,6 +177,33 @@ so the decision lives once, in `loom-daemon worktree-closed-pr-branch`. A
 daemon predating the subcommand degrades to the pre-#9083 reuse behavior
 rather than surfacing a clap usage error.
 
+### An existing worktree still aliases `node_modules` on a pnpm workspace (#9152)
+
+**Symptom**: on a pnpm workspace, `ls -l .loom/worktrees/issue-N/node_modules`
+shows a symlink into the primary clone's `node_modules` (or a nested
+`apps/*/node_modules` does). #8944 stopped `worktree-link` creating these, but
+only for **new** worktrees: re-running `worktree.sh N` on an existing worktree
+returns early and never re-links. The alias is dangerous — pnpm purges
+**through** it into the main workspace, destroying every worktree's
+dependencies at once.
+
+**Fix**: retire the aliases once per repo, from the primary clone:
+
+```bash
+loom-daemon worktree-link --retire-aliases --repo-root "$(git rev-parse --show-toplevel)"
+# or one worktree:   ... --worktree .loom/worktrees/issue-N
+```
+
+Then run `pnpm install` in each worktree it names (cheap — hardlinks from
+pnpm's store).
+
+**What it touches**: only a symlink named `node_modules` whose target resolves
+to a directory inside the main workspace and outside that worktree. It
+`unlink`s the link — never its target, never a real directory (someone's own
+install), never a link pointing elsewhere. It does nothing on a non-pnpm repo
+or when `worktree.linkNodeModules` is `true`. The stale `.git/info/exclude`
+entry is harmless and left in place. Exit 1 only if an unlink failed.
+
 ### `git push --force-with-lease` prints a rejection for a ref update that landed (#6695)
 
 On a repository using Git LFS, `git push --force-with-lease=<branch>:<old-sha>
@@ -584,10 +611,12 @@ du -sh <repo>/.loom/targets/* <repo>/.loom/target-* /tmp/loom-target-* \
 ```
 
 **Fix**: `loom-daemon clean --dry-run` lists the orphans and the bytes they
-hold, and `loom-daemon clean -y` removes them. A dir is an orphan only when its
-newest file is older than 3 hours (`LOOM_TARGET_ORPHAN_RECLAIM_MAX_AGE_HOURS`),
-no process holds it open, no live claim names its issue, and it is not your
-configured `CARGO_TARGET_DIR` / `build.target-dir`. The daemon runs the same
+hold, and `loom-daemon clean -y` removes them. A dir is an orphan only when no
+process holds it open, no live claim names its issue, it is not your
+configured `CARGO_TARGET_DIR` / `build.target-dir`, and its newest file is old
+enough: 10 minutes for a `.loom/targets` run dir whose recorded owner has
+exited (`LOOM_TARGET_ORPHAN_RECLAIM_DEAD_OWNER_GRACE_MINUTES`), 3 hours for
+everything else (`LOOM_TARGET_ORPHAN_RECLAIM_MAX_AGE_HOURS`). The daemon runs the same
 sweep every 15 minutes and whenever free disk drops below the floor
 (`category=cargo_target_orphan` in its log). Then re-run the test.
 
@@ -605,8 +634,10 @@ root and logs `not scanning … is a symlink`; set `CARGO_TARGET_DIR` or
 
 **Prevention**: every role run now gets a Loom-owned `CARGO_TARGET_DIR` under
 `<repo>/.loom/targets/`. A role-runner tick's dir is removed when the run
-ends; a daemon sweep's or manual spawn's is collected by the orphan sweep
-after its owner exits. Agents must use it (or
+ends, and a daemon sweep's when the daemon sees the sweep end (completed,
+failed, cancelled or watchdog-cancelled); a manual spawn's, or one kept at run
+end, is collected by the orphan sweep about 10 minutes after its owner
+exits. Agents must use it (or
 their worktree's `target/`) and never create one under `/tmp`, `~`, `~/.cache`
 or `.loom/target-*`; see `cargo-target-isolation.md`. The disk-headroom
 estimate per worktree (`LOOM_PER_WORKTREE_GB`) defaults to 8 GB, measured
@@ -2158,6 +2189,72 @@ precisely the shape of the one stash in 148 that mattered.
 - It only ever considers `loom-quarantine:`-labelled entries. An Auditor drift
   shelf, a Judge park stash, or an ad-hoc `git stash` is never a candidate.
 
+**Which credential reads the issue state (#8876).** `stashes` is a standalone
+process, so it cannot see the credentials the daemon holds in memory. It never
+looks for them on disk either: no token is published into, copied to, or
+discovered from a checkout, `.loom/gh-config`, or a sidecar. Instead the route
+is chosen **once per run**, and the run prints `issue-state route: ...` on
+stderr naming the one that was used:
+
+1. **Daemon-assisted (`daemon-gh/<launcher>`).** If the machine-level daemon
+   socket (`$LOOM_SOCKET_PATH`, else `~/.loom/loom-daemon.sock`) is a socket
+   owned by you in a directory only you can write, and not inside the
+   checkout, `stashes` sends it one read-only `ReadIssueState` request: the
+   repo root, its `owner/repo`, and an issue number. The daemon accepts it only
+   for a root in `~/.loom/workspaces.json`, re-derives the slug from that
+   root's `origin` itself (a mismatch is *unknown*), applies the forge-egress
+   admission gate, and runs the single `gh issue view` through its own
+   `GhInvocation` routing (per-owner App credential, managed launcher). Only
+   `OPEN`/`CLOSED`/unknown and a non-secret route label come back; the daemon
+   may live anywhere, including outside every managed root. Once the daemon
+   has answered, its answer is final for the run: an *unknown* from it is
+   never retried under ambient credentials.
+2. **Standalone (`standalone-gh/<launcher>`).** With no daemon (absent, down,
+   an untrusted socket, a daemon too old to know the request) or a repo the
+   daemon does not manage, the read runs in the CLI process through the same
+   `GhInvocation` facade, behind the same admission gate. An unconfigured host
+   keeps its ambient `gh` login, unchanged. A governed host uses the policy's
+   managed launcher, and a routing refusal (`standalone-refused:<codes>`) is
+   *unknown*, never a direct request.
+
+Whenever no policy-compliant path exists the answer is *unknown*, and unknown
+never retires a stash.
+
+**A blind run is an error, not "0 retirable" (#8876).** When at least one issue was looked up and
+*every* lookup failed, the run prints one line ahead of the per-stash verdicts
+and exits **1**:
+
+```
+BLIND RUN: issue state unreadable for all 9 stash(es): every lookup failed (8 distinct issue(s)), so the ambient gh login this command runs under cannot read this repo's issues. Nothing was retired and nothing can be until that is fixed.
+```
+
+The same line is repeated on stderr as `Error: ...`. With `--json`, stdout
+stays one JSON document and carries the condition as an explicit field, which
+is present on every run:
+
+```json
+"issue_state": {
+  "unreadable_for_all": true,
+  "lookups_attempted": 8,
+  "lookups_unknown": 8,
+  "stashes_unknown": 9
+}
+```
+
+This applies to `list`, `retire` and `retire --execute` alike, and nothing is
+dropped. It is deliberately all-or-nothing: a run where some issues were read
+and one was not keeps the per-stash `KEEP ... could not determine the state of
+issue #N` line and exits 0, and stashes with no `issue=` token are never looked
+up, so they neither cause nor hide a blind run. Note that `--issue N` scoped to
+a single unreadable issue *is* a blind run: the only lookup failed.
+
+To fix a blind run, read the `issue-state route:` line first. On
+`daemon-gh/...` the daemon's own credential cannot read the repo (see
+`loom-daemon status` credential preflight). On `standalone-gh/...` check what
+the shell's `gh` login can see: `gh issue view
+<N> --json state` from the repo. A 404 on an issue you know exists means that
+account has no access to the repo; `gh auth login` as one that can read it.
+
 ### Taking a stash back off the stack without leaving conflict markers (#6501)
 
 **Never run a bare `git stash pop` in the primary checkout.** Use the verified
@@ -3169,24 +3266,24 @@ overwrites it, list its relative path (e.g. `hooks/guard-destructive.sh`,
 init` / installer run already performs the equivalent recursive copy, so a normal
 reinstall keeps the copies current too.
 
-**Precondition: this flow needs a resolvable `defaults/` source tree (#6202).**
-`resync-installed.sh` resolves its source in priority order: (1) this checkout
-IS the Loom source repo (`defaults/hooks` or `defaults/scripts` present), (2)
-the gitignored `.loom/loom-source-path` sidecar (written only by a local
-`install.sh` / `install-loom.sh` run) points at a local clone of it, or (3) a
-legacy `install-metadata.json` `"loom_source"` field (dead for any post-#5624
-install — that field is no longer written, since it leaked the installing
-machine's absolute path). **None of these exist on a checkout that never ran
-the Loom installer locally** — a fresh developer clone, a CI checkout, or any
-machine that received the repo rather than installing into it — which is
-exactly the population most likely to be running stale surfaces, since they
-never ran the installer that would have refreshed them. On that population the
-script fails on first use with `Could not locate a defaults/ source tree to
-sync from`. `check-main-freshness.sh` now detects the same gap and appends a
-note to its own staleness warning before you reach that failure, rather than
-only after (#6202). Fix: clone <https://github.com/rjwalters/loom> locally,
-then either re-run its installer against this repo or write the sidecar
-yourself: `echo /path/to/local/loom-clone > .loom/loom-source-path`.
+**Where the files come from: a `defaults/` source tree, else the daemon's
+embedded payload (#6202, #8961).** `resync-installed.sh` resolves its source in
+priority order: (1) this checkout IS the Loom source repo (`defaults/hooks` or
+`defaults/scripts` present), (2) the gitignored `.loom/loom-source-path`
+sidecar (written only by a local `install.sh` / `install-loom.sh` run) points
+at a local clone of it, or (3) a legacy `install-metadata.json` `"loom_source"`
+field (dead for any post-#5624 install). **None of these exist on a checkout
+that never ran the Loom installer locally** (a fresh clone, a re-clone, a CI
+checkout). There the script hands off to `loom-daemon resync-payload`, which
+resyncs from the payload embedded in the installed daemon: same pins and
+symlink rules, exit `2` on `--dry-run` drift, never a downgrade, and only a
+verified official release build applies. It skips the script-only steps and
+names them in its output. A refusal prints its reason and exits `1`. Only with
+no source tree AND no `loom-daemon` that has that subcommand does the script
+fail with `Could not locate a defaults/ source tree to sync from`
+(`check-main-freshness.sh` says which path is next). Fix for that case: install
+or update `loom-daemon`, or clone <https://github.com/rjwalters/loom> and run
+`echo /path/to/local/loom-clone > .loom/loom-source-path`.
 
 **`.loom/loom-source-path` is a DURABLE pointer — never point it into scratch
 space (#6780).** Every future `resync-installed.sh` / `check-main-freshness.sh`
@@ -3337,10 +3434,11 @@ git reflog show <default-branch>   # every ref update this local checkout has se
 The script leaves exactly two signatures on the default branch's reflog, and
 nothing else:
 
-- **Direct push**: a single `commit: chore: resync installed Loom surfaces`
+- **Direct push**: a single `loom:resync: chore: resync installed Loom surfaces`
   entry (a fresh commit; the branch then matches `origin`).
-- **Branch + PR fallback**: `commit: chore: resync installed Loom surfaces`
-  immediately followed by `reset: moving to origin/<default>` — the reset is
+- **Branch + PR fallback**: `loom:resync: chore: resync installed Loom surfaces`
+  immediately followed by `loom:resync: updating HEAD` (a reset to
+  `origin/<default>`; git omits the target when the entry is tagged) — the reset is
   the script putting the default branch back on `origin`'s tip after pushing
   the commit to the side branch. The commit it moved away from is on
   `origin/chore/resync-installed` (with an open PR for it) — `git log
@@ -3348,8 +3446,12 @@ nothing else:
 
 Anything else is not this script. An entry reading `pull --ff-only` /
 `merge <sha>: Fast-forward` is an ordinary fast-forward picking up someone
-else's merged PR (also benign). A `rebase (finish):` entry — or a `reset:`
-that is *not* immediately preceded by that `commit:` entry, or one moving to
+else's merged PR (also benign). The `loom:resync:` prefix is the script's
+`GIT_REFLOG_ACTION` tag (#11566) — it is what keeps the daemon's out-of-band
+checkout detector from reporting the landing as a `checkout.external_change`;
+copies installed before #11566 wrote the same two entries untagged (`commit:` /
+`reset: moving to origin/<default>`). A `rebase (finish):` entry — or a reset
+that is *not* immediately preceded by that commit entry, or one moving to
 anything other than `origin/<default>` — is the signature this script is
 specifically designed never to produce: if you see one, it did **not** come
 from `land-resync-commit.sh`; track down what did. If a commit's SHA
@@ -3363,7 +3465,7 @@ outcome) even though the identity changed.
 starting `disk_full: <n> GB free`, `loom-daemon status` reports the host
 breaker `open` with the same reason, and `dispatch_sweep` is refused. On the
 2026-10-08 incident a worker's worktree volume reached 0 GB and, because that
-host was the ETA authority, fleet ETAs went `stale_inputs` for hours.
+host was the ETA authority, fleet ETAs went `stale_inputs` for hours (ETA has since been removed from Loom, #11098).
 
 **What the daemon does by itself.** Each work-finder tick samples free GB on
 the worktree-root volume. Two consecutive readings below the floor
@@ -3391,11 +3493,3 @@ heartbeats but its work finder has not ticked for 2x its own interval.
 4. Reclaim only touches Loom-managed paths. Space held by anything else (logs,
    caches, another tenant) must be freed by hand.
 5. The halt lifts within a tick or two of free space reaching the resume level.
-
-**Move the ETA authority off a sick host.** Set `fleet.etaAuthority` in the
-committed config to a healthy host id (or `LOOM_ETA_AUTHORITY=<host id>` on
-that host), per "One ETA authority per fleet" above, and confirm with
-`loom-daemon eta doctor`. Caveat (#10933): estimates issued before the move
-may never receive an `eta.outcome` (no outcome-coverage accounting or backfill
-yet), so headline ETA scores can look optimistic until that lands; do not
-read the gap as a regression.

@@ -1,7 +1,7 @@
 {
   "$comment": [
     "Single source of truth for Loom label semantics (#10013). Embedded in loom-daemon; the Loom block of .github/labels.yml and defaults/.github/labels.yml is GENERATED from this file by `loom-daemon labels generate`. Edit here, then run `loom-daemon labels generate --write`.",
-    "stale_after_minutes and lifecycle are INERT: no consumer reads them yet (the daemon's own constants remain authoritative). propagate is #10012's propagation rule (null = never propagates; star_liveness::propagation_rules derives its table from it): direction, rank (rule order; a family counts once), family (shared prefix rule, e.g. tier:), add (always | default-if-family-absent), removal (with-parent | never), to_prs. contradicts_approval is the 1-based report order of labels that contradict loom:pr (null = does not contradict)."
+    "stale_after_minutes and lifecycle are INERT: no consumer reads them yet (the daemon's own constants remain authoritative). lifecycle `retired` marks a label the daemon no longer reads, kept until its live forge migration (#11103: the operator-star levels and tier:*). contradicts_approval is the 1-based report order of labels that contradict loom:pr (null = does not contradict)."
   ],
   "yaml_header": [
     "# ============================================================================",
@@ -43,7 +43,7 @@
       "blocked_colabel": false,
       "hard_exclusion": false,
       "champion_path": false,
-      "human_gated": true,
+      "human_gated": false,
       "merge_hold": false,
       "operator_hold": false,
       "contradicts_approval": null,
@@ -51,7 +51,6 @@
       "requires_base": null,
       "remove_with": [],
       "lifecycle": "active",
-      "propagate": null,
       "color_note": "gray-400 - neutral initial state",
       "yaml_preamble": [
         "# Core Workflow States"
@@ -79,7 +78,6 @@
       "requires_base": null,
       "remove_with": [],
       "lifecycle": "active",
-      "propagate": null,
       "color_note": "blue-500",
       "yaml_preamble": []
     },
@@ -105,10 +103,9 @@
       "requires_base": null,
       "remove_with": [],
       "lifecycle": "active",
-      "propagate": null,
       "color_note": "amber-500 - matches other in-progress states",
       "yaml_preamble": [
-        "# DEPRECATED: loom:in-progress removed (use role-specific labels)",
+        "# Role-specific claim labels (they replaced one shared in-progress label):",
         "# - loom:building (Builder implementing issue)",
         "# - loom:curating (Curator enhancing issue)",
         "# - loom:reviewing (Judge reviewing PR)",
@@ -168,7 +165,7 @@
       "blocked_colabel": false,
       "hard_exclusion": false,
       "champion_path": false,
-      "human_gated": true,
+      "human_gated": false,
       "merge_hold": false,
       "operator_hold": false,
       "contradicts_approval": null,
@@ -176,7 +173,6 @@
       "requires_base": null,
       "remove_with": [],
       "lifecycle": "active",
-      "propagate": null,
       "color_note": "amber-500 - matches other in-progress states",
       "yaml_preamble": []
     },
@@ -202,7 +198,6 @@
       "requires_base": null,
       "remove_with": [],
       "lifecycle": "active",
-      "propagate": null,
       "color_note": "amber-500 - matches other in-progress states",
       "yaml_preamble": []
     },
@@ -228,7 +223,6 @@
       "requires_base": null,
       "remove_with": [],
       "lifecycle": "active",
-      "propagate": null,
       "color_note": "amber-500 - matches other in-progress states",
       "yaml_preamble": []
     },
@@ -254,7 +248,6 @@
       "requires_base": null,
       "remove_with": [],
       "lifecycle": "active",
-      "propagate": null,
       "color_note": "amber-500 - matches other in-progress states",
       "yaml_preamble": []
     },
@@ -280,7 +273,6 @@
       "requires_base": null,
       "remove_with": [],
       "lifecycle": "active",
-      "propagate": null,
       "color_note": "emerald-500",
       "yaml_preamble": []
     },
@@ -306,7 +298,6 @@
       "requires_base": null,
       "remove_with": [],
       "lifecycle": "active",
-      "propagate": null,
       "color_note": "amber-500 - matches other \"action required\" labels",
       "yaml_preamble": []
     },
@@ -332,7 +323,6 @@
       "requires_base": null,
       "remove_with": [],
       "lifecycle": "active",
-      "propagate": null,
       "color_note": "red-600 - indicates broken state",
       "yaml_preamble": []
     },
@@ -358,7 +348,6 @@
       "requires_base": null,
       "remove_with": [],
       "lifecycle": "active",
-      "propagate": null,
       "color_note": "yellow-700 - a scheduling hold, one shade apart from the in-progress ambers and the operator orange",
       "yaml_preamble": [
         "# loom:sequenced (#9378) is the durable \"approved, but not yet\" ordering hold:",
@@ -394,7 +383,6 @@
       "requires_base": null,
       "remove_with": [],
       "lifecycle": "active",
-      "propagate": null,
       "color_note": "emerald-500 - signals safe to proceed",
       "yaml_preamble": []
     },
@@ -420,7 +408,6 @@
       "requires_base": null,
       "remove_with": [],
       "lifecycle": "active",
-      "propagate": null,
       "color_note": "red-600 - indicates broken state",
       "yaml_preamble": []
     },
@@ -446,7 +433,6 @@
       "requires_base": null,
       "remove_with": [],
       "lifecycle": "active",
-      "propagate": null,
       "color_note": "blue-500",
       "yaml_preamble": []
     },
@@ -472,7 +458,6 @@
       "requires_base": null,
       "remove_with": [],
       "lifecycle": "active",
-      "propagate": null,
       "color_note": "purple (violet-600)",
       "yaml_preamble": [
         "# Agent Proposal Labels"
@@ -500,7 +485,6 @@
       "requires_base": null,
       "remove_with": [],
       "lifecycle": "active",
-      "propagate": null,
       "color_note": "purple (violet-600)",
       "yaml_preamble": []
     },
@@ -526,7 +510,6 @@
       "requires_base": null,
       "remove_with": [],
       "lifecycle": "active",
-      "propagate": null,
       "color_note": "red - indicates runtime/build issue",
       "yaml_preamble": []
     },
@@ -552,7 +535,6 @@
       "requires_base": null,
       "remove_with": [],
       "lifecycle": "active",
-      "propagate": null,
       "color_note": "indigo-500 - indicates meta/tooling request",
       "yaml_preamble": []
     },
@@ -570,7 +552,7 @@
       "blocked_colabel": false,
       "hard_exclusion": false,
       "champion_path": false,
-      "human_gated": true,
+      "human_gated": false,
       "merge_hold": false,
       "operator_hold": false,
       "contradicts_approval": null,
@@ -578,7 +560,6 @@
       "requires_base": null,
       "remove_with": [],
       "lifecycle": "active",
-      "propagate": null,
       "color_note": "emerald-500",
       "yaml_preamble": []
     },
@@ -604,7 +585,6 @@
       "requires_base": null,
       "remove_with": [],
       "lifecycle": "active",
-      "propagate": null,
       "color_note": "emerald-300 - one step back from loom:curated",
       "yaml_preamble": [
         "# loom:needs-revision (#10753): Champion's NEEDS REVISION verdict routes the",
@@ -636,19 +616,18 @@
       "requires_base": null,
       "remove_with": [],
       "lifecycle": "active",
-      "propagate": null,
       "color_note": "red-500",
       "yaml_preamble": [
         "# Status Labels"
       ]
     },
     {
-      "name": "loom:urgent",
-      "description": "Retired (#9244): use loom:operator-priority",
-      "color": "DC2626",
-      "kind": "priority",
-      "applied_by": null,
-      "removed_by": null,
+      "name": "loom:blocked-unnamed",
+      "description": "loom:blocked names no blocker: queued for Curator to name it or release it",
+      "color": "F87171",
+      "kind": "workflow",
+      "applied_by": "daemon tick (stale-blocked unnamed-queue pass, #10558)",
+      "removed_by": "Curator (after naming the blocker, recording a reason, or releasing the block) or the daemon tick once the issue is documented",
       "park": false,
       "skip": false,
       "hold": false,
@@ -663,10 +642,14 @@
       "stale_after_minutes": null,
       "requires_base": null,
       "remove_with": [],
-      "lifecycle": "retired",
-      "propagate": null,
-      "color_note": "red-600",
-      "yaml_preamble": []
+      "lifecycle": "active",
+      "color_note": "red-400",
+      "yaml_preamble": [
+        "# loom:blocked-unnamed (#10558): a queue marker, NOT a park label. It coexists",
+        "# with loom:blocked. Applied by the daemon tick to an open loom:blocked issue",
+        "# that names no blocker and states no reason; removed by Curator after it names",
+        "# the blocker, records a reason, or releases the block."
+      ]
     },
     {
       "name": "loom:abort",
@@ -690,7 +673,6 @@
       "requires_base": null,
       "remove_with": [],
       "lifecycle": "active",
-      "propagate": null,
       "color_note": "orange-500 - warning/signal color",
       "yaml_preamble": []
     },
@@ -708,7 +690,7 @@
       "blocked_colabel": true,
       "hard_exclusion": false,
       "champion_path": false,
-      "human_gated": false,
+      "human_gated": true,
       "merge_hold": true,
       "operator_hold": true,
       "contradicts_approval": null,
@@ -717,11 +699,9 @@
       "remove_with": [
         "loom:operator-blocked",
         "loom:operator-mechanical",
-        "loom:operator-decision",
-        "loom:operator-objective"
+        "loom:operator-decision"
       ],
       "lifecycle": "active",
-      "propagate": null,
       "color_note": "orange-500 - operator-action signal (matches loom:abort)",
       "yaml_preamble": [
         "# loom:operator-only vs loom:blocked: operator-only = a human must act or rule",
@@ -754,7 +734,6 @@
       "requires_base": null,
       "remove_with": [],
       "lifecycle": "active",
-      "propagate": null,
       "color_note": "amber-200 - distinct from the operator-only orange family",
       "yaml_preamble": [
         "# loom:needs-capability (#5817): a narrower claim than loom:operator-only —",
@@ -789,19 +768,20 @@
       "requires_base": "loom:operator-only",
       "remove_with": [],
       "lifecycle": "active",
-      "propagate": null,
       "color_note": "orange-300 - lightest: transient, expected to clear on its own",
       "yaml_preamble": [
         "# loom:operator-only sub-kind labels (#5671). A single `loom:operator-only` was",
-        "# carrying at least four meanings with no mechanical way to tell them apart —",
-        "# these four ALWAYS accompany `loom:operator-only` (never replace it; every",
+        "# carrying several meanings with no mechanical way to tell them apart —",
+        "# these three ALWAYS accompany `loom:operator-only` (never replace it; every",
         "# existing filter/skip that keys off the base label is unaffected) and record",
-        "# WHICH kind at the point of application. Exactly one of the four is applied",
+        "# WHICH kind at the point of application. Exactly one of the three is applied",
         "# per issue/PR. See .loom/docs/label-state-machine.md \"operator-only sub-kinds\"",
         "# for the full decision table and the machine-readable-blocker convention.",
         "# NOTE (#5826): loom:operator-decision is no longer the safe unsure-default —",
         "# being unsure is a sign the analysis is incomplete, not a reason to apply the",
-        "# label. Only apply loom:operator-only once a specific sub-kind fits.",
+        "# label. Only apply loom:operator-only once a specific sub-kind fits. An",
+        "# unstated objective is filed as a decision (#10000; the objective sub-kind was",
+        "# retired in #11105).",
         "# NOTE (#6881, updated #6893): loom:operator-mechanical's \"no judgement",
         "# required\" describes the WORK. The base loom:operator-only label's hard skip",
         "# still wins for every sub-kind by default -- with ONE narrow, fail-closed",
@@ -809,7 +789,7 @@
         "# `<!-- loom:capability=<name> -->` marker(s) (#6892) that the executing HOST",
         "# holds (LOOM_WORKER_CAPABILITIES, env-only) is routed to a PROPOSE-ONLY lane",
         "# instead of parked -- it emits the commands / a PR for an operator to",
-        "# approve, never a live credentialed action. The other three sub-kinds are",
+        "# approve, never a live credentialed action. The other two sub-kinds are",
         "# unchanged and hard-skip unconditionally, marker or no marker."
       ]
     },
@@ -827,7 +807,7 @@
       "blocked_colabel": true,
       "hard_exclusion": false,
       "champion_path": false,
-      "human_gated": false,
+      "human_gated": true,
       "merge_hold": false,
       "operator_hold": true,
       "contradicts_approval": null,
@@ -835,12 +815,11 @@
       "requires_base": "loom:operator-only",
       "remove_with": [],
       "lifecycle": "active",
-      "propagate": null,
       "color_note": "orange-400",
       "yaml_preamble": [
         "# A loom:operator-mechanical item may additionally declare the capability(ies)",
         "# it needs via `<!-- loom:capability=<name> -->` marker(s) in its body (#6892)",
-        "# -- meaningful only alongside THIS sub-kind, ignored by the other three. See",
+        "# -- meaningful only alongside THIS sub-kind, ignored by the other two. See",
         "# .loom/docs/label-state-machine.md \"Capability-declaration convention\" for",
         "# the closed vocabulary and parser contract, and its \"Dispatch path (#6893)\"",
         "# subsection for the four gates that consume it."
@@ -860,7 +839,7 @@
       "blocked_colabel": false,
       "hard_exclusion": false,
       "champion_path": false,
-      "human_gated": false,
+      "human_gated": true,
       "merge_hold": true,
       "operator_hold": true,
       "contradicts_approval": null,
@@ -868,7 +847,6 @@
       "requires_base": "loom:operator-only",
       "remove_with": [],
       "lifecycle": "active",
-      "propagate": null,
       "color_note": "orange-700 - darkest",
       "yaml_preamble": []
     },
@@ -894,34 +872,7 @@
       "requires_base": null,
       "remove_with": [],
       "lifecycle": "active",
-      "propagate": null,
       "color_note": "same family as loom:operator-decision",
-      "yaml_preamble": []
-    },
-    {
-      "name": "loom:operator-objective",
-      "description": "operator-only sub-kind: determined once operator states objective; lists candidates",
-      "color": "FED7AA",
-      "kind": "hold",
-      "applied_by": null,
-      "removed_by": null,
-      "park": false,
-      "skip": false,
-      "hold": true,
-      "operator_gate": false,
-      "blocked_colabel": false,
-      "hard_exclusion": false,
-      "champion_path": false,
-      "human_gated": false,
-      "merge_hold": false,
-      "operator_hold": false,
-      "contradicts_approval": null,
-      "stale_after_minutes": null,
-      "requires_base": "loom:operator-only",
-      "remove_with": [],
-      "lifecycle": "active",
-      "propagate": null,
-      "color_note": "orange-200 - lightest of all: clears on a single stated preference",
       "yaml_preamble": []
     },
     {
@@ -938,7 +889,7 @@
       "blocked_colabel": true,
       "hard_exclusion": false,
       "champion_path": false,
-      "human_gated": false,
+      "human_gated": true,
       "merge_hold": true,
       "operator_hold": true,
       "contradicts_approval": 3,
@@ -946,7 +897,6 @@
       "requires_base": null,
       "remove_with": [],
       "lifecycle": "active",
-      "propagate": null,
       "color_note": "orange-600 - operator-action signal, one shade darker than operator-only",
       "yaml_preamble": [
         "# loom:operator is the first-class \"a human is needed\" pipeline state (#5502):",
@@ -963,7 +913,9 @@
         "# Applied by: Champion (merge-risk and critical-file holds), and by",
         "# merge-pr.sh's #8508 escalation when the #8248 required-check freshness guard",
         "# blocks a merge that its own automated re-date remedy could not unblock",
-        "# (defaults/docs/merge-pr-exit-code-exceptions.md). Removed by a human."
+        "# (defaults/docs/merge-pr-exit-code-exceptions.md), and by merge-pr.sh's",
+        "# partial-increment reset (#9264) when the issue body carries a",
+        "# `loom:remainder-hold` marker. Removed by a human."
       ]
     },
     {
@@ -987,15 +939,7 @@
       "stale_after_minutes": null,
       "requires_base": null,
       "remove_with": [],
-      "lifecycle": "active",
-      "propagate": {
-        "direction": "parent-to-child",
-        "rank": 1,
-        "family": null,
-        "add": "always",
-        "removal": "with-parent",
-        "to_prs": true
-      },
+      "lifecycle": "retired",
       "color_note": "yellow-600 - matches loom-ui's star",
       "yaml_preamble": [
         "# loom:operator-priority (#9244) is the operator's \"star\": land this ASAP,",
@@ -1012,6 +956,69 @@
         "# children of a starred parent, inherited (#10012: `create-issue.sh --parent`",
         "# stars a new child; the audit comment names `inherited_from=#P`). Removed by:",
         "# humans; a star propagation applied goes with the parent's star."
+      ]
+    },
+    {
+      "name": "loom:important",
+      "description": "Priority level 2 of 3: dispatched before unlabeled work (not a hold). Anyone may set.",
+      "color": "CA8A04",
+      "kind": "priority",
+      "applied_by": "operator, Guide, Champion",
+      "removed_by": "operator, Guide, Champion",
+      "park": false,
+      "skip": false,
+      "hold": false,
+      "operator_gate": false,
+      "blocked_colabel": false,
+      "hard_exclusion": false,
+      "champion_path": false,
+      "human_gated": false,
+      "merge_hold": false,
+      "operator_hold": false,
+      "contradicts_approval": null,
+      "stale_after_minutes": null,
+      "requires_base": null,
+      "remove_with": [],
+      "lifecycle": "active",
+      "color_note": "yellow-600 - the middle priority level",
+      "yaml_preamble": [
+        "# loom:important (#11103) is the middle of Loom's three priority levels (none /",
+        "# important / very important). Within a workspace the queue order is level,",
+        "# then oldest createdAt, then issue number. NOT a hold, never inherited by the",
+        "# daemon: whoever sets the priority labels a blocker too. Applied by / removed",
+        "# by: the operator, Guide and Champion alike."
+      ]
+    },
+    {
+      "name": "loom:very-important",
+      "description": "Priority level 3 of 3: wins the workspace draw. Capped at 1 per workspace; extras rank important.",
+      "color": "B45309",
+      "kind": "priority",
+      "applied_by": "operator, Guide, Champion",
+      "removed_by": "operator, Guide, Champion",
+      "park": false,
+      "skip": false,
+      "hold": false,
+      "operator_gate": false,
+      "blocked_colabel": false,
+      "hard_exclusion": false,
+      "champion_path": false,
+      "human_gated": false,
+      "merge_hold": false,
+      "operator_hold": false,
+      "contradicts_approval": null,
+      "stale_after_minutes": null,
+      "requires_base": null,
+      "remove_with": [],
+      "lifecycle": "active",
+      "color_note": "amber-700 - one shade above important",
+      "yaml_preamble": [
+        "# loom:very-important (#11103) is the top priority level. A workspace holding",
+        "# dispatchable very-important work wins the workspace draw. Capped at one per",
+        "# workspace (#11509): only the oldest open one counts, the rest rank as",
+        "# loom:important, enforced at dispatch (see priority-model.md). NOT a hold,",
+        "# never inherited by the daemon. Applied by / removed by: the operator, Guide",
+        "# and Champion alike."
       ]
     },
     {
@@ -1035,8 +1042,7 @@
       "stale_after_minutes": null,
       "requires_base": null,
       "remove_with": [],
-      "lifecycle": "active",
-      "propagate": null,
+      "lifecycle": "retired",
       "color_note": "amber-700 - one shade above the star",
       "yaml_preamble": [
         "# loom:operator-high-priority (#10307) is operator priority LEVEL 2, the",
@@ -1072,8 +1078,7 @@
       "stale_after_minutes": null,
       "requires_base": null,
       "remove_with": [],
-      "lifecycle": "active",
-      "propagate": null,
+      "lifecycle": "retired",
       "color_note": "amber-600 - the double star's shade, lighter",
       "yaml_preamble": [
         "# loom:high-priority-inherited (#10307) is DERIVED, never a human's or a",
@@ -1094,7 +1099,7 @@
       "applied_by": null,
       "removed_by": null,
       "park": false,
-      "skip": false,
+      "skip": true,
       "hold": false,
       "operator_gate": false,
       "blocked_colabel": false,
@@ -1108,7 +1113,6 @@
       "requires_base": null,
       "remove_with": [],
       "lifecycle": "active",
-      "propagate": null,
       "color_note": "violet-600 - distinguishes from regular proposals",
       "yaml_preamble": [
         "# Epic Labels"
@@ -1136,7 +1140,6 @@
       "requires_base": null,
       "remove_with": [],
       "lifecycle": "active",
-      "propagate": null,
       "color_note": "violet-500 - lighter variant for child issues",
       "yaml_preamble": []
     },
@@ -1161,15 +1164,7 @@
       "stale_after_minutes": null,
       "requires_base": null,
       "remove_with": [],
-      "lifecycle": "active",
-      "propagate": {
-        "direction": "parent-to-child",
-        "rank": 3,
-        "family": "tier:",
-        "add": "default-if-family-absent",
-        "removal": "never",
-        "to_prs": false
-      },
+      "lifecycle": "retired",
       "color_note": "green - highest priority",
       "yaml_preamble": [
         "# Tier Labels (Goal Alignment)"
@@ -1196,15 +1191,7 @@
       "stale_after_minutes": null,
       "requires_base": null,
       "remove_with": [],
-      "lifecycle": "active",
-      "propagate": {
-        "direction": "parent-to-child",
-        "rank": 3,
-        "family": "tier:",
-        "add": "default-if-family-absent",
-        "removal": "never",
-        "to_prs": false
-      },
+      "lifecycle": "retired",
       "color_note": "yellow - medium priority",
       "yaml_preamble": []
     },
@@ -1229,15 +1216,7 @@
       "stale_after_minutes": null,
       "requires_base": null,
       "remove_with": [],
-      "lifecycle": "active",
-      "propagate": {
-        "direction": "parent-to-child",
-        "rank": 3,
-        "family": "tier:",
-        "add": "default-if-family-absent",
-        "removal": "never",
-        "to_prs": false
-      },
+      "lifecycle": "retired",
       "color_note": "purple - lower priority",
       "yaml_preamble": []
     },
@@ -1263,7 +1242,6 @@
       "requires_base": null,
       "remove_with": [],
       "lifecycle": "paused",
-      "propagate": null,
       "color_note": "cyan-500 - story-point size family",
       "yaml_preamble": [
         "# Story-Point Size Labels (#9431, epic #9429): estimation is paused.",
@@ -1293,7 +1271,6 @@
       "requires_base": null,
       "remove_with": [],
       "lifecycle": "paused",
-      "propagate": null,
       "color_note": "cyan-500 - story-point size family",
       "yaml_preamble": []
     },
@@ -1319,7 +1296,6 @@
       "requires_base": null,
       "remove_with": [],
       "lifecycle": "paused",
-      "propagate": null,
       "color_note": "cyan-500 - story-point size family",
       "yaml_preamble": []
     },
@@ -1345,7 +1321,6 @@
       "requires_base": null,
       "remove_with": [],
       "lifecycle": "paused",
-      "propagate": null,
       "color_note": "cyan-500 - story-point size family",
       "yaml_preamble": []
     },
@@ -1371,7 +1346,6 @@
       "requires_base": null,
       "remove_with": [],
       "lifecycle": "paused",
-      "propagate": null,
       "color_note": "cyan-500 - story-point size family",
       "yaml_preamble": []
     },
@@ -1397,40 +1371,8 @@
       "requires_base": null,
       "remove_with": [],
       "lifecycle": "paused",
-      "propagate": null,
       "color_note": "cyan-500 - story-point size family",
       "yaml_preamble": []
-    },
-    {
-      "name": "loom:heavy",
-      "description": "CPU/RAM-intensive sweep; refused on local-dev host_class. Applied by: humans/Curator/Architect.",
-      "color": "B60205",
-      "kind": "resource",
-      "applied_by": "humans/Curator/Architect",
-      "removed_by": null,
-      "park": false,
-      "skip": false,
-      "hold": false,
-      "operator_gate": false,
-      "blocked_colabel": false,
-      "hard_exclusion": false,
-      "champion_path": false,
-      "human_gated": false,
-      "merge_hold": false,
-      "operator_hold": false,
-      "contradicts_approval": null,
-      "stale_after_minutes": null,
-      "requires_base": null,
-      "remove_with": [],
-      "lifecycle": "active",
-      "propagate": null,
-      "color_note": "red - resource-intensive caution signal",
-      "yaml_preamble": [
-        "# loom:heavy (#9034): the mechanical \"heavy\" signal the host-class gate refuses",
-        "# on a host_class: local-dev machine (autonomous.workFinder.hostClass) unless",
-        "# explicitly overridden (--allow-local / allowHeavyLocal). A resource-weight",
-        "# axis, deliberately NOT the same thing as the tier:* priority axis above."
-      ]
     },
     {
       "name": "external",
@@ -1446,7 +1388,7 @@
       "blocked_colabel": false,
       "hard_exclusion": true,
       "champion_path": false,
-      "human_gated": false,
+      "human_gated": true,
       "merge_hold": false,
       "operator_hold": false,
       "contradicts_approval": null,
@@ -1454,14 +1396,6 @@
       "requires_base": null,
       "remove_with": [],
       "lifecycle": "active",
-      "propagate": {
-        "direction": "parent-to-child",
-        "rank": 2,
-        "family": null,
-        "add": "always",
-        "removal": "with-parent",
-        "to_prs": false
-      },
       "color_note": "gray-200 - external/hold marker",
       "yaml_preamble": [
         "# External Contribution Gate",

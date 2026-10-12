@@ -148,7 +148,10 @@ fn harness_auth_and_session_paths_are_private_and_auth_snapshot_never_changes_so
             // see `every_guarded_runtime_pins_tmpdir_into_a_short_reclaimable_path`
             // for its own placement/length assertions) — every other `*DIR` /
             // `XDG_*` var stays scoped to the launch's own state directory.
-            if name == "TMPDIR" {
+            // GH_CONFIG_DIR deliberately names the host's own `gh` login
+            // (#11400, `ambient_gh_config_dir`): forge credentials are not
+            // harness state.
+            if name == "TMPDIR" || name == "GH_CONFIG_DIR" {
                 continue;
             }
             if name.ends_with("DIR") || name.starts_with("XDG_") {
@@ -343,4 +346,35 @@ fn auth_format_is_harness_specific_and_diagnostics_never_contain_secrets() {
         assert!(validate_auth_format(oauth, runtime).is_ok());
         assert!(validate_auth_format(br#"{"provider":{"type":"oauth"}}"#, runtime).is_err());
     }
+}
+
+fn env_of(pairs: Vec<(&'static str, String)>) -> impl Fn(&str) -> Option<std::ffi::OsString> {
+    move |key| {
+        pairs
+            .iter()
+            .find(|(name, _)| *name == key)
+            .map(|(_, value)| value.into())
+    }
+}
+
+/// #11400: a guarded OpenCode launch redirects `XDG_CONFIG_HOME`, so `gh` is
+/// pointed back at the host's own config — unless an inherited credential
+/// (`GH_CONFIG_DIR`, `GH_TOKEN`, `GITHUB_TOKEN`) already outranks it.
+#[test]
+fn guarded_launch_keeps_gh_pointed_at_the_ambient_login() {
+    let home = tempfile::tempdir().unwrap();
+    // No gh login on this host: nothing to point at.
+    assert_eq!(ambient_gh_config_dir(env_of(vec![]), Some(home.path())), None);
+    let gh = home.path().join(".config/gh");
+    fs::create_dir_all(&gh).unwrap();
+    assert_eq!(ambient_gh_config_dir(env_of(vec![]), Some(home.path())), Some(gh));
+    for key in ["GH_CONFIG_DIR", "GH_TOKEN", "GITHUB_TOKEN"] {
+        let env = env_of(vec![(key, "set".to_string())]);
+        assert_eq!(ambient_gh_config_dir(env, Some(home.path())), None, "{key}");
+    }
+    // An ambient XDG_CONFIG_HOME is where gh looked before the redirect.
+    let xdg = tempfile::tempdir().unwrap();
+    fs::create_dir_all(xdg.path().join("gh")).unwrap();
+    let env = env_of(vec![("XDG_CONFIG_HOME", xdg.path().display().to_string())]);
+    assert_eq!(ambient_gh_config_dir(env, Some(home.path())), Some(xdg.path().join("gh")));
 }

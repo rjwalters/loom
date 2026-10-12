@@ -13,6 +13,10 @@
 //! host whose state is not reconstructable at `t` is reported as **unknown**
 //! (with the reason the SQL gave), never as an empty host.
 //!
+//! `--check` (#10196 R7, #11128) lives in [`check`]: queries 6 and 7 of the
+//! same file compare each covered host's reconstruction with the
+//! webhook-derived label state over a run of sample instants.
+//!
 //! Rules it keeps (#10196): no row caps (every row the queries return is
 //! reported), every host's own view is reported (nothing is elected; the
 //! per-item merge is the SQL's own documented rule), and no estimate or
@@ -23,21 +27,33 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::signoz_read::{ClickhouseHttp, ReadError};
+use crate::signoz_read::{ReadError, TelemetryReader};
 
 /// R3's committed replay SQL, verbatim.
 pub const REPLAY_QUERIES: &str =
     include_str!("../../defaults/observability/signoz/replay-queries.sql");
 
+/// The knowable-at column on `signoz_logs.distributed_logs_v2`: the backend's
+/// own insert clock, `Int64` epoch milliseconds (the name SigNoz uses on its
+/// metrics tables). The store owner adds it; see `telemetry-replay.md`.
+pub const KNOWABLE_AT_COLUMN: &str = "inserted_at_unix_milli";
+
+/// The reason a replay at an instant before the column existed is unknown.
+pub const NO_KNOWABLE_AT: &str = "no_knowable_at";
+
 const PREFIX_BEGIN: &str = "-- >>> replay-prefix";
 const PREFIX_END: &str = "-- <<< replay-prefix";
 
-/// The documented statement count: query 0, 1-3, 4a-4c and 5.
-const STATEMENTS: usize = 8;
+/// The documented statement count: query 0, 1-3, 4a-4c, 5 and 6-7.
+const STATEMENTS: usize = 10;
 
 /// Default lookback for the base anchor and its chain, seconds: one anchor
 /// interval plus one pass, as `replay-queries.sql` documents.
 pub const DEFAULT_WINDOW_SEC: u32 = 3900;
+
+/// Seconds between sample instants when a caller does not choose: one
+/// `fleet.state` pass.
+pub const DEFAULT_STEP_SEC: u32 = 300;
 
 fn strip_comments(sql: &str) -> String {
     sql.lines()
@@ -54,17 +70,28 @@ fn strip_comments(sql: &str) -> String {
 /// `sql` no longer has the documented shape (markers, statement count, or
 /// query 1 not starting with the prefix): the file changed under this reader.
 pub fn state_and_coverage_queries(sql: &str) -> Result<(String, String), String> {
-    let begin = sql
-        .find(PREFIX_BEGIN)
-        .ok_or("replay-queries.sql: no replay-prefix begin marker")?
-        + PREFIX_BEGIN.len();
-    let end = sql
-        .find(PREFIX_END)
-        .ok_or("replay-queries.sql: no replay-prefix end marker")?;
-    if end < begin {
-        return Err("replay-queries.sql: replay-prefix markers out of order".to_string());
+    let (prefix, statements) = prefix_and_statements(sql)?;
+    Ok((statements[1].clone(), format!("{prefix}\n{}", statements[3])))
+}
+
+/// The text between two markers, comments stripped.
+fn marked(sql: &str, begin: &str, end: &str, name: &str) -> Result<String, String> {
+    let from = sql
+        .find(begin)
+        .ok_or(format!("replay-queries.sql: no {name} begin marker"))?
+        + begin.len();
+    let to = sql
+        .find(end)
+        .ok_or(format!("replay-queries.sql: no {name} end marker"))?;
+    if to < from {
+        return Err(format!("replay-queries.sql: {name} markers out of order"));
     }
-    let prefix = strip_comments(&sql[begin..end]).trim().to_string();
+    Ok(strip_comments(&sql[from..to]).trim().to_string())
+}
+
+/// The replay prefix and the committed statements, the shape checked.
+fn prefix_and_statements(sql: &str) -> Result<(String, Vec<String>), String> {
+    let prefix = marked(sql, PREFIX_BEGIN, PREFIX_END, "replay-prefix")?;
     let statements: Vec<String> = strip_comments(sql)
         .split(';')
         .map(str::trim)
@@ -73,14 +100,14 @@ pub fn state_and_coverage_queries(sql: &str) -> Result<(String, String), String>
         .collect();
     if statements.len() != STATEMENTS {
         return Err(format!(
-            "replay-queries.sql: expected {STATEMENTS} statements (0, 1-3, 4a-4c, 5), found {}",
+            "replay-queries.sql: expected {STATEMENTS} statements (0, 1-3, 4a-4c, 5, 6-7), found {}",
             statements.len()
         ));
     }
     if !statements[1].starts_with(&prefix) {
         return Err("replay-queries.sql: query 1 does not begin with the replay prefix".into());
     }
-    Ok((statements[1].clone(), format!("{prefix}\n{}", statements[3])))
+    Ok((prefix, statements))
 }
 
 /// The bound parameters of queries 1-3.
@@ -92,17 +119,39 @@ pub struct ReplayParams {
     pub window_sec: u32,
     /// `owner/name` to scope to one repository; empty for all.
     pub repo: String,
+    /// The instant [`KNOWABLE_AT_COLUMN`] began to hold real insert times
+    /// (the store owner's ALTER instant). An `as_of` before it is unknown
+    /// (`no_knowable_at`). `None` only for a read of an export, which runs no
+    /// query; a live read refuses to run without it.
+    pub knowable_since: Option<DateTime<Utc>>,
+}
+
+fn millis(at: DateTime<Utc>) -> String {
+    at.format("%Y-%m-%d %H:%M:%S%.3f").to_string()
 }
 
 impl ReplayParams {
+    /// Whether `as_of` is before the knowable-at column existed.
+    #[must_use]
+    pub fn before_knowable(&self) -> bool {
+        self.knowable_since.is_some_and(|since| self.as_of < since)
+    }
+
     /// As ClickHouse query parameters (`t` is a `DateTime64(3)` in UTC).
+    /// Queries 1-3 read the instant `t` only, so the sample span is 0.
     #[must_use]
     pub fn params(&self) -> Vec<(String, String)> {
-        vec![
-            ("t".to_string(), self.as_of.format("%Y-%m-%d %H:%M:%S%.3f").to_string()),
+        let mut out = vec![
+            ("t".to_string(), millis(self.as_of)),
             ("window".to_string(), self.window_sec.to_string()),
             ("repo".to_string(), self.repo.clone()),
-        ]
+            ("span".to_string(), "0".to_string()),
+            ("step".to_string(), DEFAULT_STEP_SEC.to_string()),
+        ];
+        if let Some(since) = self.knowable_since {
+            out.push(("knowable_since".to_string(), millis(since)));
+        }
+        out
     }
 }
 
@@ -156,6 +205,12 @@ pub struct Replay {
     pub repo: String,
     pub hosts: Vec<HostCoverage>,
     pub state: Vec<StateRow>,
+    /// Set when the whole replay is unknown, not just some hosts: `as_of` is
+    /// before the knowable-at column existed ([`NO_KNOWABLE_AT`]). `hosts`
+    /// and `state` are then empty, and nothing is reconstructed from the
+    /// producer's `observed_timestamp`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unknown_reason: Option<String>,
 }
 
 fn field<'a>(row: &'a Value, key: &str) -> Result<&'a Value, String> {
@@ -238,6 +293,16 @@ fn json(n: usize, line: &str) -> Result<Value, String> {
 ///
 /// A line is not JSON or lacks a column the committed query selects.
 pub fn assemble(params: &ReplayParams, state: &str, coverage: &str) -> Result<Replay, String> {
+    if params.before_knowable() {
+        return Ok(Replay {
+            as_of: params.as_of,
+            window_sec: params.window_sec,
+            repo: params.repo.clone(),
+            hosts: Vec::new(),
+            state: Vec::new(),
+            unknown_reason: Some(NO_KNOWABLE_AT.to_string()),
+        });
+    }
     let state = lines(state)
         .map(|(n, l)| json(n, l).and_then(|v| state_row(&v)))
         .collect::<Result<Vec<_>, _>>()
@@ -252,6 +317,7 @@ pub fn assemble(params: &ReplayParams, state: &str, coverage: &str) -> Result<Re
         repo: params.repo.clone(),
         hosts,
         state,
+        unknown_reason: None,
     })
 }
 
@@ -283,8 +349,15 @@ pub fn assemble_export(params: &ReplayParams, export: &str) -> Result<Replay, St
 ///
 /// The committed SQL has an unexpected shape, the store could not be read, or
 /// it returned rows this reader cannot parse.
-pub fn fetch(http: &ClickhouseHttp, params: &ReplayParams) -> Result<Replay, String> {
+pub fn fetch(http: &TelemetryReader, params: &ReplayParams) -> Result<Replay, String> {
     let (state_sql, coverage_sql) = state_and_coverage_queries(REPLAY_QUERIES)?;
+    if params.knowable_since.is_none() {
+        return Err(MISSING_KNOWABLE_SINCE.to_string());
+    }
+    if params.before_knowable() {
+        // The column did not exist at `as_of`: nothing to ask the store.
+        return assemble(params, "", "");
+    }
     let bound = params.params();
     let post = |sql: &str, which: &str| {
         http.post_with(&format!("{sql}\nFORMAT JSONEachRow"), &bound)
@@ -296,6 +369,56 @@ pub fn fetch(http: &ClickhouseHttp, params: &ReplayParams) -> Result<Replay, Str
     let state = post(&state_sql, "state")?;
     let coverage = post(&coverage_sql, "coverage")?;
     assemble(params, &state, &coverage)
+}
+
+/// Why a live read cannot run without `--knowable-since`.
+pub const MISSING_KNOWABLE_SINCE: &str =
+    "no knowable-since instant: pass --knowable-since <RFC3339>, \
+     the instant the store's knowable-at column began to hold real insert times; \
+     an instant before it cannot be replayed (no_knowable_at)";
+
+/// The `system.columns` lookup behind [`preflight_with`].
+const PREFLIGHT_SQL: &str = "SELECT count() AS n FROM system.columns \
+     WHERE database = 'signoz_logs' AND table = 'distributed_logs_v2' \
+     AND name = {column:String} FORMAT JSONEachRow";
+
+/// Check, before any replay query runs, that the store has the knowable-at
+/// column; `post` runs one query against it. A missing column is reported as
+/// `knowable-at column `<name>` absent on the store`, never as the raw
+/// ClickHouse `UNKNOWN_IDENTIFIER` the replay SQL would otherwise raise.
+///
+/// # Errors
+///
+/// The column is absent, or the lookup itself could not be answered. The
+/// caller exits 2 either way.
+pub fn preflight_with<F>(post: F) -> Result<(), String>
+where
+    F: FnOnce(&str, &[(String, String)]) -> Result<String, ReadError>,
+{
+    let bound = [("column".to_string(), KNOWABLE_AT_COLUMN.to_string())];
+    let out = post(PREFLIGHT_SQL, &bound).map_err(|e| match e {
+        ReadError::Unavailable(why) => format!("column check: store unavailable: {why}"),
+        ReadError::Refused(why) => format!("column check: store refused: {why}"),
+    })?;
+    let present = lines(&out)
+        .next()
+        .map(|(n, l)| json(n, l).and_then(|v| uint(&v, "n")))
+        .transpose()
+        .map_err(|e| format!("column check: {e}"))?
+        .unwrap_or(0);
+    if present == 0 {
+        return Err(format!("knowable-at column `{KNOWABLE_AT_COLUMN}` absent on the store"));
+    }
+    Ok(())
+}
+
+/// [`preflight_with`] against the live store.
+///
+/// # Errors
+///
+/// As for [`preflight_with`].
+pub fn preflight(http: &TelemetryReader) -> Result<(), String> {
+    preflight_with(|sql, params| http.post_with(sql, params))
 }
 
 /// Human-readable report: every host with its verdict, then every item.
@@ -314,6 +437,13 @@ pub fn render(replay: &Replay) -> String {
         replay.as_of.to_rfc3339(),
         replay.window_sec
     );
+    if let Some(reason) = &replay.unknown_reason {
+        let _ = writeln!(
+            out,
+            "unknown: {reason} (the knowable-at column did not exist at this instant; nothing is reconstructed)"
+        );
+        return out;
+    }
     let covered = replay.hosts.iter().filter(|h| h.covered).count();
     let _ = writeln!(out, "hosts: {} ({covered} covered)", replay.hosts.len());
     for h in &replay.hosts {
@@ -346,6 +476,9 @@ pub fn render(replay: &Replay) -> String {
     }
     out
 }
+
+#[path = "telemetry_replay_check.rs"]
+pub mod check;
 
 #[cfg(test)]
 #[path = "telemetry_replay_tests.rs"]

@@ -886,9 +886,16 @@ fn a_nonce_is_never_published_on_the_bus() {
 fn every_executable_command_maps_to_an_existing_request() {
     assert!(matches!(command_to_request(&Command::Status), Some(Request::DaemonStatus)));
     match command_to_request(&Command::Dispatch { issue: 7893 }) {
-        Some(Request::DispatchSweep { kind, force, .. }) => {
+        Some(Request::DispatchSweep {
+            kind,
+            force,
+            dispatch_origin,
+            ..
+        }) => {
             assert_eq!(kind, SweepKind::Issue(7893));
             assert!(!force, "chatops must never force past the breaker");
+            // #11444: a human typed it, so the sweep records an operator.
+            assert_eq!(dispatch_origin, Some(crate::telemetry::DispatchOrigin::Operator));
         }
         other => panic!("{other:?}"),
     }

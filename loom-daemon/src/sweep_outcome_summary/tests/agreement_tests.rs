@@ -36,6 +36,7 @@ fn jev(sweep_id: &str, tier: Option<&str>) -> sweep_outcomes::OutcomeRecord {
         jev_confidence: tier.map(|_| 0.9),
         tap_usage: None,
         tap_usage_all: Vec::new(),
+        phase_tap_usage: Vec::new(),
         duration_sec: 600,
     }
 }

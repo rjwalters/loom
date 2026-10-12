@@ -306,6 +306,18 @@ fn save(key: &str, snap: &Snapshot) {
     }
 }
 
+/// Forget `cred`'s snapshot, in memory and on disk (#9247): its token was
+/// just re-minted, and the key (host + `GH_CONFIG_DIR`) is the same before
+/// and after, so the listing read under the old token would otherwise answer
+/// for the rest of its TTL. The next [`lookup`] refetches unconditionally.
+pub(crate) fn forget(cred: &Credential) {
+    let key = cred.key();
+    state::with(|s| s.snapshots.remove(&key));
+    if let Some(path) = snapshot_path(&key) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 /// What `cred`'s snapshot says about `owner_repo`, revalidating it (through
 /// `gh`) only when it is older than [`ttl_secs`] and not backing off.
 pub(crate) fn lookup(gh: &Path, cred: &Credential, owner_repo: &str) -> Answer {

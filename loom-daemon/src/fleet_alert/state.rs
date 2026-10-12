@@ -23,7 +23,7 @@ pub struct Transition {
     pub key: String,
     pub headline: String,
     pub fix: String,
-    /// Inbox severity is `critical` (see [`Condition::critical`]).
+    /// Evaluator severity (see [`Condition::critical`]).
     pub critical: bool,
 }
 

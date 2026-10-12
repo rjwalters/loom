@@ -371,8 +371,8 @@ pub fn measure(
     anyhow::ensure!(repetitions > 0, "repetitions must be at least 1");
     anyhow::ensure!(
         super::tracing::enabled(instrumented_root),
-        "instrumented arm is not tracing: this binary needs the otlp feature and an \
-         observability config resolving to exporter=otlp with a valid endpoint"
+        "instrumented arm is not tracing: it needs an observability config \
+         resolving to exporter=otlp with a valid endpoint"
     );
     anyhow::ensure!(
         !super::tracing::enabled(baseline_root),
@@ -438,7 +438,5 @@ pub fn measure(
     })
 }
 
-// Tracing is inert without the `otlp` feature (`tracing::enabled` returns
-// false), so these exercise the instrumented arm only where it can exist.
-#[cfg(all(test, feature = "otlp"))]
+#[cfg(test)]
 mod tests;

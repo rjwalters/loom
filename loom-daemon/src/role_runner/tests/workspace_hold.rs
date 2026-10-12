@@ -65,3 +65,42 @@ fn a_held_workspace_going_idle_starts_no_on_idle_role_and_its_sibling_still_does
     let after = plan_idle_runs(&mut trigger, &set, held_ws.path(), &cfg, true, false, now);
     assert_eq!(names(&after), ["champion"], "dispatch resumes once the hold clears");
 }
+
+/// #11186: a maintain-only workspace is refused the same way, through the
+/// real idle-edge planner; its sibling still fires, and releasing it lets
+/// the next idle edge fire.
+#[test]
+#[serial]
+fn a_maintain_only_workspace_going_idle_starts_no_on_idle_role() {
+    use crate::workspace_hold::set_maintain_only_for_test;
+    use crate::workspace_registry::{MaintainOnly, MaintainOnlySource};
+    let _env = ShardEnvGuard::capture();
+    let held_ws = enabled_workspace();
+    let free_ws = enabled_workspace();
+    let cfg = on_idle_config(Some(true), vec!["champion"]);
+    let set = new_in_progress_guard();
+    let now = Instant::now();
+    let mark = MaintainOnly {
+        by: MaintainOnlySource::FleetStore,
+        since: chrono::Utc::now(),
+    };
+    set_maintain_only_for_test(held_ws.path(), Some(mark));
+
+    let mut trigger = IdleTrigger::new();
+    assert!(plan_idle_runs(&mut trigger, &set, held_ws.path(), &cfg, false, false, now).is_empty());
+    let from_held = plan_idle_runs(&mut trigger, &set, held_ws.path(), &cfg, true, false, now);
+    assert!(from_held.is_empty(), "a maintain-only workspace starts no onIdle role");
+    assert_eq!(active_run_count(&set), 0);
+
+    let mut sibling = IdleTrigger::new();
+    assert!(plan_idle_runs(&mut sibling, &set, free_ws.path(), &cfg, false, false, now).is_empty());
+    let from_free = plan_idle_runs(&mut sibling, &set, free_ws.path(), &cfg, true, false, now);
+    assert_eq!(names(&from_free), ["champion"], "the normal sibling still fires");
+    drop(from_free);
+
+    set_maintain_only_for_test(held_ws.path(), None);
+    let mut trigger = IdleTrigger::new();
+    assert!(plan_idle_runs(&mut trigger, &set, held_ws.path(), &cfg, false, false, now).is_empty());
+    let after = plan_idle_runs(&mut trigger, &set, held_ws.path(), &cfg, true, false, now);
+    assert_eq!(names(&after), ["champion"], "released: dispatch resumes");
+}

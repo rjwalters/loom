@@ -1,6 +1,7 @@
-//! The red-main-fix lane (#9244 §6): key 3 only on a verified-red `main`,
-//! a halted repo admits only its fixes, and the CI fallback when the gate is
-//! disabled.
+//! The red-main-fix lane (#9244 §6): a halted repo admits only its fixes on
+//! a verified-red `main`, and the CI fallback when the gate is disabled.
+//! #11547: while `main` is verified red the fix leads the dispatch order; on
+//! a green `main` the marker reorders nothing.
 
 use super::*;
 use crate::work_finder::main_red_fix::latest_run_is_failure;
@@ -31,10 +32,16 @@ fn the_marker_is_line_anchored() {
     assert!(!quoted.is_main_red_fix(), "prose quoting the marker does not fire");
 }
 
+fn very_important(item: WorkItem) -> WorkItem {
+    let mut item = item;
+    item.labels.push("loom:very-important".into());
+    item
+}
+
 #[test]
-fn a_fix_sorts_first_only_while_main_is_verified_red() {
-    // The fix (#9) is newer than #1. On a red repo it goes first; on a green
-    // repo the marker is inert and age decides.
+fn the_marker_leads_the_order_only_on_a_red_main() {
+    // The fix (#9) is newer than #1. #11547: on a verified-red repo the fix
+    // goes first anyway; on a green repo age decides.
     let items = || {
         vec![
             dated(issue(1), "2026-01-01T00:00:00Z"),
@@ -55,23 +62,34 @@ fn a_fix_sorts_first_only_while_main_is_verified_red() {
         &[RED],
     );
     assert_eq!(report.dispatched, 1);
-    assert_eq!(multi[0].1.dispatched, vec![9], "red main: the fix jumps the queue");
+    assert_eq!(multi[0].1.dispatched, vec![9], "red main: the fix leads");
 
-    let mut multi = vec![(FakeSource::once(items()), RecordingDispatcher::default())];
+    // Single-workspace path: red leads with the fix, green keeps age order.
+    for (lane, want) in [(RED, 9), (RedMainLane::default(), 1)] {
+        let mut dispatcher = RecordingDispatcher::default();
+        let src = &mut FakeSource::once(items());
+        tick_with_lanes(src, &mut dispatcher, (1.into(), usize::MAX), false, false, lane).unwrap();
+        assert_eq!(dispatcher.dispatched, vec![want], "{lane:?}");
+    }
+
+    // Labelled very-important, the fix goes first (red or green).
+    let labelled = || {
+        vec![
+            dated(issue(1), "2026-01-01T00:00:00Z"),
+            dated(very_important(fix(9)), "2026-09-01T00:00:00Z"),
+        ]
+    };
+    let mut multi = vec![(FakeSource::once(labelled()), RecordingDispatcher::default())];
     tick_multi(&mut multi, &[100], 1, &[false]);
-    assert_eq!(multi[0].1.dispatched, vec![1], "green main: no boost");
-
-    // Single-workspace path.
-    let mut dispatcher = RecordingDispatcher::default();
-    let src = &mut FakeSource::once(items());
-    tick_with_lanes(src, &mut dispatcher, (1.into(), usize::MAX), false, false, RED).unwrap();
-    assert_eq!(dispatcher.dispatched, vec![9]);
+    assert_eq!(multi[0].1.dispatched, vec![9]);
 }
 
 #[test]
-fn a_starred_issue_still_outranks_a_red_main_fix() {
-    let starred = WorkItem::new(5, vec![OPERATOR_PRIORITY_LABEL.into()]);
-    let mut multi = vec![(FakeSource::once(vec![fix(9), starred]), RecordingDispatcher::default())];
+fn a_labelled_red_main_fix_outranks_an_important_issue_without_overflow() {
+    // The very-important fix goes first and nothing goes over the cap of 1.
+    let important = WorkItem::new(5, vec!["loom:important".into()]);
+    let items = vec![very_important(fix(9)), important];
+    let mut multi = vec![(FakeSource::once(items), RecordingDispatcher::default())];
     tick_multi_with_repo_cap(
         &mut multi,
         &[100],
@@ -84,13 +102,13 @@ fn a_starred_issue_still_outranks_a_red_main_fix() {
         None,
         &[RED],
     );
-    assert_eq!(multi[0].1.dispatched, vec![5]);
+    assert_eq!(multi[0].1.dispatched, vec![9]);
 }
 
 #[test]
 fn a_halted_red_repo_admits_its_fixes_and_nothing_else() {
-    let starred = WorkItem::new(5, vec![OPERATOR_PRIORITY_LABEL.into()]);
-    let items = || vec![issue(1), starred.clone(), fix(9)];
+    let important = WorkItem::new(5, vec!["loom:important".into()]);
+    let items = || vec![issue(1), important.clone(), fix(9)];
 
     let mut multi = vec![(FakeSource::once(items()), RecordingDispatcher::default())];
     let report = tick_multi_with_repo_cap(
@@ -113,8 +131,10 @@ fn a_halted_red_repo_admits_its_fixes_and_nothing_else() {
         .filter(|r| r.disposition == Qd::WorkspaceHalted)
         .map(|r| r.issue)
         .collect();
-    assert_eq!(halted, vec![5, 1], "the starred issue waits with the rest");
-    assert!(rows.iter().any(|r| r.issue == 9 && r.main_red_fix));
+    assert_eq!(halted, vec![5, 1], "the important issue waits with the rest (ranked first)");
+    assert!(rows
+        .iter()
+        .any(|r| r.issue == 9 && r.disposition == Qd::Dispatched));
 
     let mut dispatcher = RecordingDispatcher::default();
     let src = &mut FakeSource::once(items());
@@ -188,27 +208,11 @@ fn with_the_gate_disabled_ci_decides_red() {
         gate_disabled: true,
         ..RedMainLane::default()
     };
-    let items = || vec![issue(1), fix(9)];
-    for (ci_red, expect) in [(true, 9), (false, 1)] {
-        let dispatcher = RecordingDispatcher {
-            ci_red,
-            ..RecordingDispatcher::default()
-        };
-        let mut multi = vec![(FakeSource::once(items()), dispatcher)];
-        tick_multi_with_repo_cap(
-            &mut multi,
-            &[100],
-            1.into(),
-            &[false],
-            None,
-            usize::MAX,
-            false,
-            None,
-            None,
-            &[gate_off],
-        );
-        assert_eq!(multi[0].1.dispatched, vec![expect], "ci_red={ci_red}");
-    }
+    // #11508 removed the ordering boost this used to be observed through;
+    // what CI decides now is whether `main` counts as red (which admits an
+    // unpromoted fix, see the `..._unpromoted_fix_is_admitted` test).
+    assert!(gate_off.is_red(&[issue(1), fix(9)], || true), "CI red");
+    assert!(!gate_off.is_red(&[issue(1), fix(9)], || false), "CI green");
     // The CI read happens only when a marker-bearing candidate exists.
     let mut asked = false;
     assert!(!gate_off.is_red(&[issue(1)], || {
@@ -337,7 +341,7 @@ fn an_unpromoted_fix_is_buildable_on_a_red_repo() {
                 dated(fix.clone(), "2026-09-01T00:00:00Z"),
             ]
         };
-        // Red: the fix is a candidate, ahead of the older ordinary issue.
+        // Red: the fix is a candidate (seen) and leads the order (#11547).
         assert_eq!(multi_tick(items(), RED, false, false), (vec![9], 2), "{label}");
         // Red and halted by the gate: it is still admitted, alone.
         assert_eq!(multi_tick(items(), RED, true, false).0, vec![9], "{label}");
@@ -425,11 +429,14 @@ fn the_unpromoted_listing_keeps_only_unclaimed_marker_rows() {
     // The second listing dedups against the first.
     let merged = merge(merged, vec![unpromoted(2, "loom:curated")]);
     assert_eq!(merged.len(), 2);
-    // A promoted or starred fix is not "unpromoted": it is a candidate anyway.
+    // A promoted fix is not "unpromoted": it is a candidate anyway. A
+    // priority label does not promote it (#11508): it still needs a red main.
     assert!(!fix(1).is_unpromoted_red_fix());
-    let mut starred = unpromoted(2, "loom:triage");
-    starred.labels.push(OPERATOR_PRIORITY_LABEL.into());
-    assert!(!starred.is_unpromoted_red_fix());
+    for label in ["loom:important", "loom:very-important"] {
+        let mut prioritised = unpromoted(2, "loom:triage");
+        prioritised.labels.push(label.into());
+        assert!(prioritised.is_unpromoted_red_fix(), "{label}");
+    }
 }
 
 /// #10118 / #9548: the marker is content, not control, unless a trusted

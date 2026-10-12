@@ -35,6 +35,7 @@ documented here.
 - [Yield/renewal/fence coordination gap, closed (Issue #6485)](#yieldrenewalfence-coordination-gap-closed-issue-6485)
 - [Publish-side yield-exclusion (Loom #7639; kicad-tools #5331)](#publish-side-yield-exclusion-loom-7639-kicad-tools-5331)
 - [Reclaim instrumentation: absent vs. stale (#6320)](#reclaim-instrumentation-absent-vs-stale-6320)
+- [PR-phase leases (#9401)](#pr-phase-leases-9401)
 <!-- toc:end -->
 
 ## What a lease record is
@@ -315,8 +316,24 @@ future reclamation decision's evidence, not the claim's own validity.
   `lease renewer check`: `closed`, a release or a newer owner ends the loop
   even while the interactive parent lives; an unreadable state skips that
   cycle's PATCH and keeps the loop. `release <issue>` ends that key's loop
-  explicitly (idempotent). A daemon predating the verb renews as before (`start` probes `lease renewer --help` once and then skips the state read, `check` and `claim`, #10348). A daemon-dispatched start (`LOOM_SWEEP_LEASE_RENEW_SOURCE=dispatch`, set by `run_lease_renewal_start`) also skips the state read and passes `--issue-state open`: its watched pid is the sweep child, which already bounds the loop. A
-  remote authenticated release marker is not defined.
+  explicitly (idempotent). A daemon predating the verb renews as before (`start` probes `lease renewer --help` once and then skips the state read, `check` and `claim`, #10348). A daemon-dispatched start (`LOOM_SWEEP_LEASE_RENEW_SOURCE=dispatch`, set by `run_lease_renewal_start`) also skips the state read and passes `--issue-state open`: its watched pid is the sweep child, which already bounds the loop.
+- **Release signal and identity (defined, not inferred).** The only release
+  signal is the host-local tombstone `lease renewer release` writes under
+  `~/.loom/lease-renew/` (owner-only state outside every worktree and outside
+  the forge): it is authenticated by that filesystem ownership, not by comment
+  text, so a forge comment, an open PR or a temporary label change can never
+  end a loop (see `comment-trust.md`: forge text is prose). It matches the
+  exact (repo, sweep, issue) key, plus the host when `--host` is given (the
+  sweep wave always passes it). A peer's key (other sweep, issue, repo or
+  host) is untouched, and a release that matches nothing leaves no tombstone,
+  so it cannot pre-stop a later start. The loop's next `check`, within one
+  interval, honours the tombstone even if the SIGTERM could not be delivered,
+  and an unverifiable issue state never overrides it. The other completion
+  signal, a `closed` issue, comes from the explicit state read; a failed or
+  malformed read or a 5xx/auth failure on any call is "unverified": the PATCH
+  is skipped, the loop lives, nothing is released. A release marker on the
+  forge is deliberately not defined: leases are per host, so no peer host needs
+  to see one.
 - **Budget.** Per path at the default 300 s (#10348): daemon-dispatched and
   verb-absent loops make two requests per cycle (one non-paginated `?since=`
   window, one PATCH), 24/h per held lease. In-session loops with the verb add
@@ -352,6 +369,11 @@ future reclamation decision's evidence, not the claim's own validity.
   created after that listing is still inside the window, so the own-yield
   guard sees every new `loom:lease-yield`. The window now spans about two
   intervals.
+  The remaining re-list reasons are the rare-miss cases (first cycle, a full
+  100-comment window, a deleted or no-longer-matching cached comment, a PATCH
+  404). Truncated data is never ignored: a full page always re-lists with
+  `--paginate`, and a failed window read is a failed cycle, not a miss, so it
+  neither re-lists nor PATCHes an unverified target.
 
 ## For Phase 2 (reclamation) and Phase 3 (fencing)
 
@@ -654,3 +676,119 @@ Grepping `lease_evidence=` in `daemon.log` therefore answers, per reclaim,
 which evidence class drove it. `absent` deliberately renders with its own
 caveat: per this document's reader contract, a missing lease is *no evidence
 either way*, never proof of abandonment.
+
+## PR-phase leases (#9401)
+
+Everything above is about the issue claim, `loom:building`. The two PR-phase
+claims, Doctor's `loom:treating` and Judge's `loom:reviewing`, were bare labels
+until #9401. Adding a label that is already present is a silent no-op, so two
+claimants could each believe they took it. Two incidents: two in-session
+sweeps' Doctors sharing one worktree, where the second reset the first's
+uncommitted work; and two daemon-dispatched Doctors working one review for
+about 20 minutes until one force-pushed over the other.
+
+`loom-daemon lease pr` (`loom-daemon/src/cli/pr_lease.rs`) gives those claims
+the same lease semantics, **keyed by role**:
+
+```
+<!-- loom:pr-lease role=<doctor|judge> host=<host-id> sweep=<sweep-id> -->
+<!-- loom:pr-lease-yield role=… host=… sweep=… earliest_host=… earliest_sweep=… -->
+<!-- loom:pr-lease-released role=… host=… sweep=… -->
+```
+
+- **Separate marker family.** None of these starts with `<!-- loom:lease host=`,
+  so no issue-path reader (publish, fence, renew, reclaim, dispatch ordering,
+  check-claim, co-occupancy) ever sees one. Those readers assume one claim per
+  number, and a Judge's lease would read as a peer to a Doctor's.
+- **Identity.** `host=` is the same published id issue leases use (opaque by
+  default, #6322). `sweep=` resolves as `--sweep-id`, then `LOOM_SWEEP_RUN_ID`,
+  then `LOOM_TERMINAL_ID`'s `daemon-<id>`, then the attended per-session id
+  derived from `--watch-pid` (#10570). Every verb resolves it the same way, so a
+  claimant's `fence` and `release` find the lease its `claim` wrote.
+- **Live.** A lease is live while its forge `updated_at` is inside the lease
+  TTL (`LOOM_LEASE_TTL_MINUTES`, default 15) and no later yield record names
+  the same identity. That TTL is also the episode window: a finished claim is
+  released or ages out, so an old lease never outranks a live one.
+- **`claim`** reads the role's live leases first. A peer's live lease means
+  exit 4, nothing written. An unreadable list means exit 5, nothing written: an
+  unknown claim state is never "free" (#11118). Otherwise it posts its lease,
+  reads back (bounded retries, plus confirmation re-reads, #6816/#6951), and the
+  **earliest live comment `id` of the role wins** (#6287). A loser posts a
+  `loom:pr-lease-yield` record and exits 4. A winner starts the renewer and
+  exits 0, and only then does the role add its label. The label is a
+  projection of the lease, never the evidence. After its own lease is posted,
+  an unverifiable ordering proceeds, as on the issue path.
+- **Renewal** is a detached `lease pr renew-loop`, one per
+  `(repo, host, sweep#pr-<role>, pr)` through the issue renewer's ownership
+  store (#10229). Every 300 s (`SWEEP_LEASE_RENEW_INTERVAL_SECS`) it makes one
+  `GET issues/<pr>`, one read of the lease comments and one PATCH, adding a
+  `loom:pr-lease-renewed at=` line so `updated_at` advances. It stops when the
+  watched session dies, at the 4 h cap, on `release`, when the PR closes, when
+  the comment is gone, or after the role's claim label has been absent for two
+  consecutive cycles. That last one is the backstop for a claimant that
+  finished without releasing.
+- **A renewal never revives an expired lease.** A PATCH would make an aged-out
+  lease live again, and its older comment `id` would then outrank a peer that
+  claimed after it expired. So the renewer stops, without patching, once its
+  last successful renewal (or the claim) is within a margin of the TTL, and it
+  renews only while the re-read shows its own comment as the role's earliest
+  live lease against the TTL less that margin (peers are still judged at the
+  full TTL). The margin is two `gh` timeouts plus slack (130 s; a quarter of
+  the TTL if smaller), and the clock is re-checked right before the PATCH, so a
+  slow re-read cannot carry a just-inside check past it. Both the TTL age and the 4 h cap use the wall clock: on macOS,
+  `Instant` does not advance while the machine sleeps, so a lid-closed renewer
+  would otherwise wake believing its lease fresh. An unreadable re-read falls
+  back to the wall-clock guard alone.
+- **`fence`** runs before every Doctor push and completion write, before
+  every Judge branch-update push, and inside the Judge's Verdict-Time CAS
+  Recheck. Exit 0 if this claimant holds the
+  earliest live lease, or if there is no evidence either way (an unreadable
+  list, or a claimant on an older prompt that never leased). Exit 3 if its own
+  lease is no longer live. Exit 4 if a peer's live lease is earliest.
+- **`release`** tombstones and signals the renewer, then rewrites the lease's
+  first line to `loom:pr-lease-released`. The claim frees at once, without
+  waiting out the TTL.
+- **`check`** prints `PR_LEASE_STATE=free|held-self|held-peer|unknown`: the
+  PR-phase shape of #11118's `claim_state(item)`.
+- **Provenance.** Lease and yield comments end with the `loom:provenance v1`
+  line (`loom-daemon provenance`'s format). Its `host=` carries the published id
+  rather than the raw hostname, so one comment never pairs an opaque id with
+  the name it hides.
+- **Gitea** has no `gh api` comments path, so every verb exits 0 there and
+  the label claim works as before.
+- **Older binaries.** A `loom-daemon` without `lease pr` exits 2 (clap's usage
+  error), which no verb here uses. The role prompts read 2 as "claim by label
+  alone, as before", so prompts that resync ahead of the binary degrade to the
+  old behaviour instead of standing every Doctor and Judge down. Only 0 and 2
+  proceed (`[[ $? =~ ^[02]$ ]]`). Exit 1 is `loom-daemon`'s startup failure, an
+  unknown state, and stands down like 3, 4 and 5.
+
+**Not yet covered (#11118):** the daemon's `claim_reconciliation` still ages
+`loom:treating` and `loom:reviewing` by label events, not by these leases
+(#10235). If it strips the label from a claimant that is still working, the
+renewer stops within two cycles, the lease ages out, and the claimant's next
+`fence` fails. That is the same "claim lost" outcome a label-only claim has
+today, now detected at the fence instead of being missed. Making reclamation
+read the lease is #10235's job. The role runner's Doctor lanes also do not
+consult PR leases before they dispatch. A Doctor spawned onto a PR with a live
+peer lease stands down at `claim`, which costs one agent start and no
+duplicated work.
+
+**Known limits.**
+
+- *Siblings of one in-session sweep share an identity.* Subagents of one
+  session see the same `LOOM_SWEEP_RUN_ID` and the same session pid, and
+  neither the environment nor the pid tree gives a cheap per-agent
+  discriminator. A second Doctor (or Judge) of the same sweep on the same PR
+  therefore resolves `held-self`, re-attaches and proceeds. In that case the
+  sweep orchestrator is the arbiter: it must not dispatch two agents of one
+  role onto one PR. A per-agent identity belongs with #11118's
+  `claim_state(item)`.
+- *Read-back lag.* If a peer's earlier lease takes longer to become visible
+  than the read-back plus about 1 s of confirmation re-reads, both claimants
+  pass `claim`, as on the issue path (#6287). The later one's `fence` stops it
+  before it pushes, but not before its worktree resync and snapshot steps.
+- *Hosts must be NTP-synchronised.* Lease age is the forge's `updated_at`
+  read against the reader's clock. The renewer's own offset cancels out, but a
+  peer whose clock runs ahead of the forge by more than the remaining margin
+  sees the lease expire early and may claim. Keep skew well under the margin.

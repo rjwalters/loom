@@ -36,6 +36,9 @@
 //!   any dispatch producer exists), and then on the workspace resync's own
 //!   task, right after each resync pass, so the timer never waits for it
 //!   either. It writes only with `fleet.autoApply` on.
+//! - **Roster clones** ([`roster_clone`], #11218): with `fleet.autoApply` on, a
+//!   timer pass clones a desired repo that is not cloned under `root` yet
+//!   (HTTPS, bounded per pass) and registers it in the same pass.
 //!
 //! # Invariants this module keeps
 //!
@@ -73,7 +76,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
@@ -89,7 +92,10 @@ use crate::fleet_store::{self as store, StoreLocation};
 
 pub mod checkout_ff;
 mod floor_knowledge;
+pub mod git_spawn_log;
+mod loom_ui;
 pub mod offline_floor;
+pub mod roster_clone;
 pub mod workspace_resync;
 
 pub use floor_knowledge::{floor_knowledge, floor_wake, FloorKnowledge, FloorWake};
@@ -303,11 +309,15 @@ pub fn config_pass(
         let drifted = drift != Drift::InSync;
         let mut wrote = false;
         let mut detail = describe_drift(&drift);
+        let keys = crate::config_journal::restart_keys(target, mode == Mode::Write && drifted);
         if mode == Mode::Write && drifted {
             let lost = render::lost_top_level_keys(target);
             if lost.is_empty() {
                 match render::write(target, &stamp) {
-                    Ok((w, _backup)) => wrote = w,
+                    Ok((w, backup)) => {
+                        wrote = w;
+                        crate::config_journal::record_rendered(w, target, backup, &commit, &keys);
+                    }
                     Err(e) => {
                         error = Some(format!("writing {}: {e:#}", target.path.display()));
                     }
@@ -369,6 +379,9 @@ pub struct RosterPass {
     pub applied: usize,
     /// Desired repos that could not be applied (not cloned under `root`).
     pub unapplied: usize,
+    /// Missing clones this pass cloned or tried to (#11218).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub clones: Vec<roster_clone::CloneAttempt>,
     /// Why the pass could not be completed, when it could not be.
     pub error: Option<String>,
     /// Why the roster was not consulted at all this pass — set when the
@@ -411,39 +424,16 @@ pub fn roster_pass(
 }
 
 /// Turn a [`Plan`] into a [`RosterPass`], applying it through `apply` when
-/// `auto_apply` is set. `apply` is a seam so tests never touch a real registry;
-/// production passes [`apply_change`].
+/// `auto_apply` is set, and never cloning: a missing clone is counted
+/// unapplied. `apply` is a seam so tests never touch a real registry;
+/// production passes [`apply_change`]. The timer clones through
+/// [`roster_clone::summarize`] instead (#11218).
 pub fn summarize_roster(
     plan: &Plan,
     auto_apply: bool,
     apply: &mut dyn FnMut(&Change) -> Result<()>,
 ) -> RosterPass {
-    let drift: Vec<String> = plan.changes.iter().map(roster::describe).collect();
-    let mut out = RosterPass {
-        drift,
-        ..RosterPass::default()
-    };
-    if !auto_apply {
-        return out;
-    }
-    for change in &plan.changes {
-        if matches!(change, Change::MissingClone { .. }) {
-            out.unapplied += 1;
-            continue;
-        }
-        match apply(change) {
-            Ok(()) => out.applied += 1,
-            Err(e) => {
-                out.unapplied += 1;
-                let detail = format!("{}: {e:#}", roster::describe(change));
-                out.error = Some(match out.error.take() {
-                    Some(prev) => format!("{prev}; {detail}"),
-                    None => detail,
-                });
-            }
-        }
-    }
-    out
+    roster_clone::summarize(plan, auto_apply, &roster_clone::Clones::off(), apply)
 }
 
 /// Apply one planned change to the machine-level workspace registry at
@@ -452,20 +442,31 @@ pub fn summarize_roster(
 /// those verbs use. Loads and saves per change so a mid-plan failure leaves the
 /// earlier changes durably applied, exactly as the CLI's per-verb loop does.
 pub fn apply_change(registry_path: &Path, change: &Change) -> Result<()> {
-    use crate::workspace_registry::WorkspaceRegistry;
+    use crate::workspace_registry::{MaintainOnlySource, WorkspaceRegistry};
     let mut registry = WorkspaceRegistry::load(registry_path)
         .with_context(|| format!("reading {}", registry_path.display()))?;
+    // #11186: the store's maintain-only mark. An add carries it in the same
+    // write, so the workspace is never registered dispatchable first.
+    let mode = |on: bool| on.then_some(MaintainOnlySource::FleetStore);
     let changed = match change {
-        Change::Add { path, priority, .. } => {
+        Change::Add {
+            path,
+            priority,
+            maintain_only,
+            ..
+        } => {
             let claude_state = crate::terminal::claude_config_state_path();
             registry.add_and_trust(path, None, *priority, &claude_state)?;
+            registry.set_maintain_only(path, mode(*maintain_only), Utc::now());
             true
         }
         Change::Remove { path, .. } => registry.remove(path),
         Change::SetPriority { path, to, .. } => registry.set_priority(path, *to),
-        // Never reachable: `summarize_roster` counts these as unapplied
-        // without calling here — a desired repo that is not cloned is
-        // reported, never cloned (the roster's own contract).
+        Change::SetMaintainOnly { path, to, .. } => registry
+            .set_maintain_only(path, mode(*to), Utc::now())
+            .unwrap_or(false),
+        // Never reachable: a missing clone is counted unapplied, or cloned
+        // and then applied as an `Add` (`roster_clone`, #11218).
         Change::MissingClone { .. } => false,
     };
     if changed {
@@ -772,7 +773,9 @@ fn publish_checkouts(found: Option<&[checkout_ff::CheckoutReport]>, note: Option
 fn write_status(path: &Path, status: &FleetSyncStatus) -> Result<()> {
     let mut body = serde_json::to_vec_pretty(status)?;
     body.push(b'\n');
-    fetch::write_atomic(path, &body)
+    fetch::write_atomic(path, &body)?;
+    crate::config_journal::record_sync(status); // J3 shadow, after the legacy write
+    Ok(())
 }
 
 /// The last pass this process recorded, if any.
@@ -823,10 +826,13 @@ pub fn clear_status() {
         return;
     };
     match std::fs::remove_file(&path) {
-        Ok(()) => log::info!(
-            "fleet_sync: no fleet store configured — removed the stale snapshot {}",
-            path.display()
-        ),
+        Ok(()) => {
+            log::info!(
+                "fleet_sync: no fleet store configured — removed the stale snapshot {}",
+                path.display()
+            );
+            crate::config_journal::record_sync_cleared();
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => log::debug!("fleet_sync: could not remove {}: {e:#}", path.display()),
     }
@@ -887,6 +893,7 @@ pub fn render_line(status: Option<&FleetSyncStatus>, now: DateTime<Utc>) -> Opti
     for d in &s.roster.drift {
         lines.push(format!("  roster: DRIFT — {d}"));
     }
+    lines.extend(roster_clone::lines(&s.roster.clones));
     if s.roster.applied > 0 || s.roster.unapplied > 0 {
         lines.push(format!(
             "  roster: {} applied, {} unapplied",
@@ -983,6 +990,7 @@ struct PassInputs {
     cache: PathBuf,
     interval: Duration,
     auto_apply: bool,
+    clones: roster_clone::CloneConfig,
 }
 
 /// Run one complete pass (config tiers + roster) against the real forge. Pure
@@ -1027,7 +1035,9 @@ fn run_pass(inputs: &PassInputs, pass: &str, mode: Mode, now: DateTime<Utc>) -> 
             ..ConfigPass::default()
         },
     };
-    let roster = roster_half(inputs, &transport, &config, mode, now);
+    // #11218: only a timer pass on a host free to dispatch clones.
+    let clone = pass == "timer" && enforced == Enforcement::Proceed;
+    let roster = roster_half(inputs, &transport, &config, (mode, clone), now);
     // #10711: the floor, from the snapshot the halves above just refreshed,
     // into the process-wide value — never the config tiers, whose
     // `autonomous.autoUpdate` changes need a restart.
@@ -1035,6 +1045,8 @@ fn run_pass(inputs: &PassInputs, pass: &str, mode: Mode, now: DateTime<Utc>) -> 
     // #10885: a floor that differs from the previous pass's wakes the
     // self-update loop, so it acts now and not at its next interval.
     floor_knowledge::record_floor(&floor);
+    // J3 shadow (#11349): config as resolved after this pass (deduplicated).
+    crate::config_journal::record_resolved(&inputs.workspace);
     FleetSyncStatus {
         repo: inputs.location.repo.clone(),
         reference: inputs.location.reference.clone(),
@@ -1075,7 +1087,7 @@ fn roster_half(
     inputs: &PassInputs,
     transport: &dyn Transport,
     config: &ConfigPass,
-    mode: Mode,
+    (mode, clone): (Mode, bool),
     now: DateTime<Utc>,
 ) -> RosterPass {
     if config.cached {
@@ -1112,6 +1124,7 @@ fn roster_half(
         .map(|w| Registered {
             root: w.root.clone(),
             priority: w.priority,
+            maintain_only: w.maintain_only.is_some(),
         })
         .collect();
     let Some(home) = dirs::home_dir() else {
@@ -1130,10 +1143,17 @@ fn roster_half(
         &|p: &Path| p.join(".git").exists(),
         now,
     );
+    let clones = if clone {
+        let memory = roster_clone::memory::global();
+        roster_clone::Clones::on(&roster_clone::GitCloner, inputs.clones, memory, Instant::now())
+    } else {
+        roster_clone::Clones::off()
+    };
+    let write = mode == Mode::Write && inputs.auto_apply;
     match plan {
-        Ok(plan) => summarize_roster(&plan, mode == Mode::Write && inputs.auto_apply, &mut |c| {
-            apply_change(&registry_path, c)
-        }),
+        Ok(plan) => {
+            roster_clone::summarize(&plan, write, &clones, &mut |c| apply_change(&registry_path, c))
+        }
         Err(e) => RosterPass {
             error: Some(format!("{e:#}")),
             ..RosterPass::default()
@@ -1152,6 +1172,8 @@ fn report(status: &FleetSyncStatus, bus: Option<&crate::event_bus::EventBus>) {
     } else {
         log::debug!("fleet_sync: {summary}");
     }
+    roster_clone::announce(status, bus);
+    loom_ui::report(status); // #11295
     let (Some(bus), true) = (bus, status.drifted() || status.errored()) else {
         return;
     };
@@ -1237,6 +1259,21 @@ pub async fn start(
                 workspace.display()
             );
             clear_status();
+            // #11029: "unset" is only trustworthy when every config tier was
+            // readable. A tier that failed to read may be the one carrying
+            // `fleet.repo`; running as `NoStore` would chase the latest
+            // release. Treat that as a fleet host with an unknown floor.
+            let dead = crate::config_resolver::unreadable_tiers(workspace);
+            if let Some((path, why)) = dead.first() {
+                let why = format!(
+                    "config tier {} is unreadable ({why}), so whether this host reads a fleet \
+                     store is not known",
+                    path.display()
+                );
+                log::warn!("fleet_sync: {why} — treating the fleet floor as unknown");
+                floor_knowledge::set_unreadable_config(why);
+                return None;
+            }
             // #10885: not a fleet host, so it has no floor by definition.
             floor_knowledge::set_store_mode(floor_knowledge::StoreMode::Absent);
             return None;
@@ -1285,6 +1322,7 @@ pub async fn start(
         cache,
         interval: config.interval,
         auto_apply,
+        clones: roster_clone::resolve_config(&effective, &|k| std::env::var(k).ok()),
     };
     log::info!(
         "fleet_sync: enabled — store {} @ {}, host {}, every {}s, autoApply={auto_apply}",

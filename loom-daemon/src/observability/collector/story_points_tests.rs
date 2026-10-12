@@ -17,6 +17,7 @@ fn dispatch_event(issue: u32, story_points: Option<u32>) -> Event {
         kind: SweepKind::Issue(issue),
         runtime: None,
         runtime_source: None,
+        start: None,
         repo: Some("/repos/loom".to_string()),
         story_points,
     }

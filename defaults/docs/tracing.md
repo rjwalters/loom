@@ -2,8 +2,8 @@
 
 Loom's opt-in OTLP exporter carries completed spans alongside lifecycle logs and
 metrics. Trace IDs and span IDs are native OTLP fields, so a backend can join a
-log to its exact execution span. Enable the `otlp` Cargo feature and configure
-`observability.enabled`, `exporter: "otlp"`, an endpoint, and an ingest key file
+log to its exact execution span. Every build includes the exporter (#10700);
+configure `observability.enabled`, `exporter: "otlp"`, an endpoint, and an ingest key file
 as described in [observability](observability.md).
 
 ## Identity and process boundaries
@@ -217,8 +217,7 @@ synthetic zero-duration completion, the two `loom.timing_source` values in
 nothing either way, and guessing would publish a measurement that was never
 taken. Any percentile/dwell aggregate over `loom.role_attempt` must filter
 `loom.attempt.worked = "true"` — unconditioned, the `false` population
-dominates and the median collapses to milliseconds (see
-[`eta.md`](eta.md) § "Role-attempt stages: which percentile to read").
+dominates and the median collapses to milliseconds.
 
 Since #9438 the role runner removes most of that population at the source: a
 role-runner tick opens its `loom.role_attempt` root only at the launch (the
@@ -348,6 +347,13 @@ The tick's story copies (`loom.timing_source=tick`) carry the same class,
 code and message. A recovered `process_lost` close carries
 `loom.failure_class=supervisor-lost` — the child and its supervisor both
 exited before either recorded a close — and keeps an unset status.
+A run a planned roll ended (#11263) instead closes as
+`loom.result=interrupted_by_roll`, unset status, no failure class, with
+`loom.roll.disposition` (`paused`|`requeued`|`budget-missed`) and
+`loom.roll.item_id`; recovery keys strictly on pause-manifest membership, so an
+unplanned crash stays `process_lost`. A resumed role run carries
+`loom.resumed_from` = that item id. Failure-rate queries and the role-failures
+watch should exclude `interrupted_by_roll`.
 
 ## Journals and recovery
 

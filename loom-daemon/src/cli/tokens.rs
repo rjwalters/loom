@@ -539,8 +539,8 @@ fn source_label(source: &str) -> &str {
         "home" => "home",
         "repo" => "repo",
         "repo-override" => "repo (overrides home)",
-        "monitor" => "claude-monitor",
-        "monitor-override" => "claude-monitor (overrides repo/home)",
+        "monitor" => "llm-monitor",
+        "monitor-override" => "llm-monitor (overrides repo/home)",
         other => other,
     }
 }
@@ -558,7 +558,7 @@ fn print_effective_accounts(result: &loom_daemon::tokens_pool::bootstrap::Bootst
     // `bootstrap` run touched (per-repo, `--shared`, or `--workspace`).
     println!("Resolved pool: {}", disp(&result.tokens_dir));
     println!("Account sources:");
-    println!("  claude-monitor: {}", disp(&result.monitor_env));
+    println!("  llm-monitor: {}", disp(&result.monitor_env));
     println!("  home: {}", disp(&result.home_env));
     println!("  repo: {}", disp(&result.repo_env));
 
@@ -587,7 +587,7 @@ fn print_monitor_import(result: &loom_daemon::tokens_pool::monitor_db::MonitorIm
         p.as_ref()
             .map_or_else(|| "(none)".to_string(), |p| p.display().to_string())
     };
-    println!("claude-monitor store: {}", disp(&result.db_path));
+    println!("llm-monitor store: {}", disp(&result.db_path));
     println!("Destination pool: {}", disp(&result.tokens_dir));
 
     if result.effective.is_empty() {

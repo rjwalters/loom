@@ -60,13 +60,12 @@ fn trigger_from_previous(prev: &SweepOutcomeRecord) -> &'static str {
             trigger::RETRY_AFTER_ENV_FAILURE
         }
         SweepDisposition::SubstantiveFailure => trigger::RETRY_AFTER_SUBSTANTIVE_FAILURE,
-        // A re-dispatch after a landing/no-op/curator disposal is the
-        // no-op re-dispatch storm (#9441) — an operator- or policy-level
-        // decision this host cannot attribute further.
+        // #11429: the journal cannot tell who asked, so this is not
+        // `operator_redispatch`.
         SweepDisposition::Landed
         | SweepDisposition::NoopAlreadyDone
         | SweepDisposition::CuratorClosed
-        | SweepDisposition::CuratorRescoped => trigger::OPERATOR_REDISPATCH,
+        | SweepDisposition::CuratorRescoped => trigger::REDISPATCH_AFTER_SUCCESS,
         // Pre-#9441 journal lines deserialize as `Unknown`; their
         // result + failure_class still carry the env/substantive split.
         SweepDisposition::Unknown => legacy_trigger(prev),
@@ -79,7 +78,7 @@ fn legacy_trigger(prev: &SweepOutcomeRecord) -> &'static str {
     use crate::telemetry::trigger;
     match prev.result {
         SweepResult::Cancelled => trigger::RETRY_AFTER_ENV_FAILURE,
-        SweepResult::Success => trigger::OPERATOR_REDISPATCH,
+        SweepResult::Success => trigger::REDISPATCH_AFTER_SUCCESS,
         SweepResult::Blocked | SweepResult::Failure => {
             let env_class = prev.failure_class.as_deref().is_some_and(|class| {
                 class.starts_with("preflight")
@@ -108,6 +107,7 @@ mod tests {
             tokens_status: None,
             tokens_status_reason: None,
             no_phase_cause: None,
+            phase_tap_usage: Vec::new(),
             issue,
             sweep_id: sweep_id.to_string(),
             model: None,
@@ -136,6 +136,7 @@ mod tests {
             attempt_index: None,
             previous_sweep_id: None,
             trigger: None,
+            dispatch_origin: None,
             rework_events: None,
             pr_numbers: None,
             hw_lines_added: None,
@@ -182,6 +183,26 @@ mod tests {
         let prev = record("s-1", "o/r", 9, SweepResult::Failure);
         let (_, _, trigger) = derive_lineage(&[prev], "o/r", 9, "s-2").unwrap();
         assert_eq!(trigger, crate::telemetry::trigger::RETRY_AFTER_SUBSTANTIVE_FAILURE);
+    }
+
+    /// Issue #11429: a re-dispatch after a success is not an operator action.
+    #[test]
+    fn redispatch_after_a_success_is_not_called_an_operator_redispatch() {
+        use crate::telemetry::trigger;
+        for disposition in [
+            SweepDisposition::Landed,
+            SweepDisposition::NoopAlreadyDone,
+            SweepDisposition::CuratorClosed,
+            SweepDisposition::CuratorRescoped,
+        ] {
+            let mut prev = record("s-1", "o/r", 9, SweepResult::Failure);
+            prev.disposition = disposition;
+            let (_, _, got) = derive_lineage(&[prev], "o/r", 9, "s-2").unwrap();
+            assert_eq!(got, trigger::REDISPATCH_AFTER_SUCCESS, "{disposition:?}");
+        }
+        let legacy = record("s-1", "o/r", 9, SweepResult::Success);
+        let (_, _, got) = derive_lineage(&[legacy], "o/r", 9, "s-2").unwrap();
+        assert_eq!(got, trigger::REDISPATCH_AFTER_SUCCESS);
     }
 
     #[test]

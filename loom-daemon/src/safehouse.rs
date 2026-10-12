@@ -63,6 +63,7 @@ use crate::types::{Event, SweepKind};
 /// file is over `.loom/docs/file-size-policy.md`'s threshold and frozen.
 mod completion_runtime;
 mod forge_gate;
+pub mod loom_ui_watch;
 
 // ============================================================================
 // Constants
@@ -276,7 +277,7 @@ pub struct SafehouseConfig {
     pub rooms: Option<RoomMap>,
     /// Persona to authenticate as; must be in safehoused's allowlist.
     pub persona: String,
-    /// Who an operator-priority escalation (#9321) pings in the room: a Matrix
+    /// Who an `operator_priority.escalation` (#9321) pings in the room: a Matrix
     /// display name or user id (`@operator:example.org`). `None` ⇒ the escalation
     /// line is still posted, just without a mention — the ask is never dropped
     /// over a missing handle. This is a **handle, not a credential**: nothing
@@ -1515,8 +1516,8 @@ fn decode_exit_code_annotation(code: i32) -> &'static str {
 // Event → envelope mapping
 // ============================================================================
 //
-// Both renderers — the frozen-taxonomy mapping and the operator-priority
-// escalation line (#9321) — live in the `envelopes` sibling module. Re-exported
+// Both renderers — the frozen-taxonomy mapping and the
+// `operator_priority.escalation` line (#9321) — live in the `envelopes` sibling module. Re-exported
 // here so every existing caller and `use super::*` test keeps its path.
 
 mod envelopes;
@@ -2981,6 +2982,8 @@ pub fn spawn_sink(
         config.persona,
         socket.display()
     );
+    // #11295: safehouse.unreachable on loom-ui.
+    loom_ui_watch::spawn(runtime, state.clone());
     // Empty topic set ⇒ receive every event; we filter in `event_to_envelope`.
     let subscription = bus.subscribe(Vec::<String>::new());
     Some(runtime.spawn(async move {

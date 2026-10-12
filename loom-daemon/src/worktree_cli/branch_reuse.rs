@@ -85,6 +85,9 @@
 //! | 0 | reuse the local branch |
 //! | 1 | refuse — its tip is an already-merged PR's head; a message was printed |
 //!
+//! The refusal names the worktree still holding the branch, if any (#9319) —
+//! see [`holder`]. It stays a diagnosis: nothing is removed or deleted here.
+//!
 //! 2 is never returned: the shell's own `--help` probe reserves it for "could
 //! not run at all".
 //!
@@ -101,6 +104,8 @@ use std::process::{Command, Stdio};
 
 use super::branch_landed::{self, Verdict};
 use super::wip::Out;
+
+mod holder;
 
 /// Everything the arm needs, assembled by the shell wrapper.
 pub struct Options {
@@ -229,30 +234,70 @@ fn contains_base_history(repo: &Path, opts: &Options) -> bool {
 
 /// The refusal, in whichever of the two output modes the caller is in — an
 /// if/else in the retired shell, so exactly one of the two is emitted.
+///
+/// Both modes name the worktree still holding the branch, when there is one
+/// (#9319): `git branch -D` refuses a held branch, so the bare remedy is
+/// wrong in exactly that state. See [`holder`].
 fn report_refusal(opts: &Options, out: &Out, pr_number: Option<&str>) {
+    let held_by = holder::find(&opts.repo, &opts.branch);
     if opts.json() {
-        out.json_line(
-            &serde_json::json!({
-                "success": false,
-                "error": "branch-already-landed",
-                "issueNumber": json_issue(&opts.issue),
-                "branch": opts.branch,
-                "prNumber": json_pr(pr_number),
-            })
-            .to_string(),
-        );
+        out.json_line(&refusal_document(opts, pr_number, held_by.as_ref()).to_string());
         return;
     }
+    Out::error(&refusal_message(opts, pr_number, held_by.as_ref()));
+}
+
+/// The `--json` refusal document. `heldByWorktree` is additive (#9319): the
+/// holding worktree's path, present only when a worktree holds the branch.
+///
+/// Absent rather than `null` with no holder, so that document is the retired
+/// shell's key for key — the differential test compares the two as values —
+/// just as the human line is its line byte for byte. A consumer reading
+/// `.heldByWorktree` sees `null` either way. The other five keys and their
+/// types never change.
+fn refusal_document(
+    opts: &Options,
+    pr_number: Option<&str>,
+    held_by: Option<&holder::Holder>,
+) -> serde_json::Value {
+    let mut doc = serde_json::json!({
+        "success": false,
+        "error": "branch-already-landed",
+        "issueNumber": json_issue(&opts.issue),
+        "branch": opts.branch,
+        "prNumber": json_pr(pr_number),
+    });
+    if let Some(h) = held_by {
+        doc["heldByWorktree"] = h.path.to_string_lossy().into_owned().into();
+    }
+    doc
+}
+
+/// The human refusal line. With no holder it is the retired shell's line,
+/// byte for byte — the differential test pins that.
+fn refusal_message(
+    opts: &Options,
+    pr_number: Option<&str>,
+    held_by: Option<&holder::Holder>,
+) -> String {
     let pr = pr_number
         .filter(|n| !n.is_empty())
         .map(|n| format!(" (already-merged PR #{n})"))
         .unwrap_or_default();
-    Out::error(&format!(
-        "Local branch '{branch}' has already landed on {base}{pr} - refusing to reuse it. Delete it and re-run: git branch -D {branch} && ./.loom/scripts/worktree.sh {issue}",
+    let delete_and_rerun = format!(
+        "git branch -D {branch} && ./.loom/scripts/worktree.sh {issue}",
+        branch = opts.branch,
+        issue = opts.issue,
+    );
+    let remedy = held_by.map_or_else(
+        || format!("Delete it and re-run: {delete_and_rerun}"),
+        |h| h.remedy(&opts.default_branch, &delete_and_rerun),
+    );
+    format!(
+        "Local branch '{branch}' has already landed on {base}{pr} - refusing to reuse it. {remedy}",
         branch = opts.branch,
         base = opts.base_display,
-        issue = opts.issue,
-    ));
+    )
 }
 
 /// `"issueNumber": '"$ISSUE_NUMBER"'` — unquoted in the retired shell, so a

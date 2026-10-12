@@ -21,8 +21,8 @@ use serde::{Deserialize, Serialize};
 pub struct ObservabilityHostIdMismatch {
     /// What this daemon calls itself —
     /// [`crate::sweep_registry::host_identity`], resolved with the precedence
-    /// `$LOOM_HOST_ID`, then `$HOSTNAME`, then the `hostname` binary, then
-    /// `"unknown-host"`. The same value it stamps on every outgoing envelope.
+    /// `fleet.hostId`, then `$LOOM_HOST_ID`, then the persisted
+    /// `~/.loom/host-id`, then `"unknown-host"` (#11530). The same value it stamps on every outgoing envelope.
     pub daemon_host_id: String,
     /// The `host_id` the `/ingest` response echoed — the identity the
     /// authenticated key is bound to, i.e. the host every pushed record is
@@ -350,8 +350,8 @@ pub enum ObservabilityExportState {
     /// `observability.enabled` is `true` but a required piece of config could
     /// not be resolved: no `endpoint`, no `ingestKeyFile`, or the configured
     /// `ingestKeyFile` could not be read (missing, unreadable, or empty after
-    /// trimming) — see #5337. Also covers `exporter = "otlp"` requested on a
-    /// build without the `otlp` Cargo feature. The exporter never started, so
+    /// trimming) — see #5337. Also covers a per-sink policy refusal (bad
+    /// endpoint, refused `headers_file`). The exporter never started, so
     /// there is no `started_at`, but this is a **config error an operator
     /// should fix**, not the same benign absence as [`Self::Disabled`].
     /// [`ObservabilityExportStatus::endpoint`] carries whatever *did* resolve
