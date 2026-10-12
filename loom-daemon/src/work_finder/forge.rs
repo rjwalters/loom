@@ -128,6 +128,51 @@ impl WorkSource for GhWorkSource {
     fn listing_complete(&self) -> bool {
         self.complete
     }
+
+    /// The open `loom:very-important` issues, any state (#11509): one more
+    /// ETag-cached listing, read only on a tick whose ready listing holds a
+    /// very-important issue (a 304 costs no rate limit). A failure is logged
+    /// and returns `None` (an incomplete walk returns the rows read, which
+    /// the cap unions with the ready listing); it never marks the ready queue incomplete, because
+    /// the ready rows themselves were read whole.
+    fn list_open_very_important(&mut self) -> Option<Vec<WorkItem>> {
+        let (gh, cwd, repo) = (&self.gh_bin, self.cwd.as_deref(), self.repo.as_deref());
+        let label = crate::priority_pick::VERY_IMPORTANT_LABEL;
+        match crate::forge_listing::list_issues_cached_paged_as(
+            "work_finder",
+            gh,
+            cwd,
+            repo,
+            label,
+            "open",
+        ) {
+            Ok(listing) => {
+                if let Some(e) = &listing.incomplete {
+                    log::warn!(
+                        "work_finder: the {label} listing is incomplete ({e:#}); the flood cap \
+                         counts the {} rows read plus the ready listing",
+                        listing.rows.len()
+                    );
+                }
+                Some(
+                    listing
+                        .rows
+                        .into_iter()
+                        .filter(|r| !r.is_pull_request)
+                        .map(|r| WorkItem::with_created_at(r.number, r.labels, r.created_at))
+                        .collect(),
+                )
+            }
+            Err(e) => {
+                log::warn!(
+                    "work_finder: listing {label} issues failed ({e}); the flood cap counts the \
+                     ready listing only this tick"
+                );
+                crate::rate_limit_breaker::global_observe_failure(&e.to_string(), "work_finder");
+                None
+            }
+        }
+    }
 }
 
 impl GhWorkSource {

@@ -243,6 +243,7 @@ mod recheck_interval;
 mod tick_line;
 mod tick_report;
 mod tick_summary;
+pub mod vi_cap;
 pub mod workspace_draw;
 use crate::types::QueueDisposition as Qd;
 pub use labels::{BUILDING_LABEL, OPERATOR_HOLD_LABEL, PARK_LABELS, SKIP_LABELS};
@@ -493,6 +494,16 @@ pub trait WorkSource {
     /// cannot fall short keeps the default.
     fn listing_complete(&self) -> bool {
         true
+    }
+
+    /// Every open `loom:very-important` issue of this repo, in any state
+    /// (`loom:issue`, `loom:building`, in curation, ...), for the flood cap
+    /// ([`vi_cap`], #11509), so an issue being built keeps the workspace's
+    /// very-important slot. `None` when unknown (a failed read, or a source
+    /// without the listing): the cap then counts the ready listing alone.
+    /// Called only on a tick whose ready listing holds a very-important issue.
+    fn list_open_very_important(&mut self) -> Option<Vec<WorkItem>> {
+        None
     }
 }
 
@@ -1042,6 +1053,8 @@ pub fn tick_with_lanes(
         ..TickReport::default()
     };
     report.note_listing(0, source.listing_complete());
+    // #11509: one `loom:very-important` per workspace; the rest rank important.
+    vi_cap::enforce(0, source, &mut ready, &mut report);
     ready_queue::sort_lanes(&mut ready);
     let (max_concurrent, _) = OverflowSlot::open(dispatcher.overflow_in_flight(), terms);
 
@@ -1785,6 +1798,8 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
         report.note_listing(idx, source.listing_complete());
         let lane = lanes.get(idx).copied().unwrap_or_default();
         let red = main_red_fix::evaluate(lane, &mut ready, dispatcher);
+        // #11509: one `loom:very-important` per workspace; the rest rank important.
+        vi_cap::enforce(idx, source, &mut ready, &mut report);
         report.seen += ready.len();
         let workspace_priority = priorities
             .get(idx)
