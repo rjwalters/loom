@@ -54,6 +54,7 @@ fn key(item: &WorkItem) -> IssueKey {
         number: item.number,
         created_at: item.created_at.clone(),
         level: Level::VeryImportant,
+        main_red_fix: false,
     }
 }
 
