@@ -103,7 +103,7 @@ fn running_newer_twin_is_never_superseded() {
         wrun(101, 7, 2, "2026-10-05T13:33:00Z", "in_progress", None),
     ]);
     let s = superseded_suites(&p, SHA).unwrap();
-    assert!(!s.contains(&2), "{s:?}");
+    assert!(!s.contains_key(&2), "{s:?}");
 }
 
 #[test]
@@ -149,7 +149,7 @@ fn rows_without_suite_ids_are_untouched() {
         {"name": "ci", "status": "completed", "conclusion": "success"}]});
     assert!(!needs_runs(doc["check_runs"].as_array().unwrap()));
     let mut d = doc.clone();
-    assert_eq!(drop_superseded(&mut d, &BTreeSet::from([1, 2])), 0);
+    assert_eq!(drop_superseded(&mut d, &BTreeMap::from([(1, 2), (2, 1)])), 0);
     assert_eq!(d, doc);
 }
 
@@ -176,7 +176,7 @@ fn green_duplicates_need_no_read() {
 #[test]
 fn drop_lowers_total_count() {
     let mut doc = twin_rows("failure", "success");
-    assert_eq!(drop_superseded(&mut doc, &BTreeSet::from([1])), 2);
+    assert_eq!(drop_superseded(&mut doc, &BTreeMap::from([(1, 2)])), 2);
     assert_eq!(doc["total_count"], 2);
     assert_eq!(doc["check_runs"].as_array().unwrap().len(), 2);
 }
@@ -208,4 +208,28 @@ fn runs_for_another_sha_are_ignored() {
     assert!(superseded_suites(&twin_runs("failure", "success"), "")
         .unwrap()
         .is_empty());
+}
+
+#[test]
+fn check_unique_to_the_older_run_is_kept() {
+    // Older run red on "Extra Job"; the newer green twin has no such row.
+    // Nothing newer vouches for it, so it must still fail.
+    let doc = rollup(vec![
+        row("Structural Checks", "success", 1),
+        row("Extra Job", "failure", 1),
+        row("Structural Checks", "success", 2),
+    ]);
+    assert_eq!(failing_after(doc, &twin_runs("failure", "success")), "Extra Job");
+}
+
+#[test]
+fn same_name_dropped_while_unique_name_kept() {
+    let mut doc = rollup(vec![
+        row("Structural Checks", "failure", 1),
+        row("Extra Job", "failure", 1),
+        row("Structural Checks", "success", 2),
+    ]);
+    let s = superseded_suites(&twin_runs("failure", "success"), SHA).unwrap();
+    assert_eq!(drop_superseded(&mut doc, &s), 1);
+    assert_eq!(doc["total_count"], 2);
 }

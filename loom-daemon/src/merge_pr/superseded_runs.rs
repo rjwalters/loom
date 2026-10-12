@@ -28,8 +28,11 @@
 //!   twin keeps the wait pending rather than letting an older verdict settle
 //!   it.
 //!
-//! Then every check-run whose check suite belongs to a superseded run is
-//! dropped. A check-run whose suite maps to no run (a third-party app, or a
+//! Then a check-run whose check suite belongs to a superseded run is dropped
+//! ONLY when the authority run's suite reported a check of the SAME NAME: the
+//! authority's row replaces it. A check the authority never reported (a red
+//! job unique to the older run) is kept, because nothing newer vouches for
+//! that commit on it. A check-run whose suite maps to no run (a third-party app, or a
 //! payload without suite ids) is always kept.
 //!
 //! # Fail direction
@@ -123,14 +126,14 @@ fn run_of(i: usize, v: &Value) -> Result<Run, String> {
     })
 }
 
-/// The check-suite ids of superseded runs in a `GET actions/runs?head_sha=`
-/// payload, considering only runs whose `head_sha` is exactly `sha`.
+/// Superseded check-suite id -> the authority run's check-suite id, for a
+/// `GET actions/runs?head_sha=` payload, considering only runs whose `head_sha` is exactly `sha`.
 ///
 /// # Errors
 ///
 /// When the payload is unreadable or truncated, or any run on `sha` lacks a
 /// field the rule reads — the caller then drops nothing.
-pub fn superseded_suites(payload: &Value, sha: &str) -> Result<BTreeSet<u64>, String> {
+pub fn superseded_suites(payload: &Value, sha: &str) -> Result<BTreeMap<u64, u64>, String> {
     let arr = payload
         .get("workflow_runs")
         .and_then(Value::as_array)
@@ -148,36 +151,51 @@ pub fn superseded_suites(payload: &Value, sha: &str) -> Result<BTreeSet<u64>, St
         let run = run_of(i, v)?;
         groups.entry(run.key.clone()).or_default().push(run);
     }
-    let mut out = BTreeSet::new();
+    let mut out = BTreeMap::new();
     for runs in groups.values().filter(|g| g.len() > 1) {
         let Some(authority) = runs
             .iter()
             .filter(|r| r.completed && !r.cancelled)
-            .map(|r| &r.order)
-            .max()
+            .max_by(|a, b| a.order.cmp(&b.order))
         else {
             continue;
         };
         out.extend(
             runs.iter()
-                .filter(|r| r.completed && (r.cancelled || r.order < *authority))
-                .map(|r| r.suite),
+                .filter(|r| r.completed && (r.cancelled || r.order < authority.order))
+                .map(|r| (r.suite, authority.suite)),
         );
     }
     Ok(out)
 }
 
-/// Remove every row of `doc["check_runs"]` whose suite is in `superseded`,
-/// lowering `total_count` by the number removed. Returns that number.
-pub fn drop_superseded(doc: &mut Value, superseded: &BTreeSet<u64>) -> usize {
+/// Remove the rows of `doc["check_runs"]` that a newer run replaces: a row
+/// whose suite is a key of `superseded` AND whose name the mapped authority
+/// suite also reported. Other rows stay (a check only the older run ran still
+/// counts). Lowers `total_count` by the number removed and returns it.
+pub fn drop_superseded(doc: &mut Value, superseded: &BTreeMap<u64, u64>) -> usize {
     if superseded.is_empty() {
         return 0;
     }
     let Some(Value::Array(rows)) = doc.get_mut("check_runs") else {
         return 0;
     };
+    let reported: BTreeSet<(u64, String)> = rows
+        .iter()
+        .filter_map(|r| {
+            let name = r.get("name").and_then(Value::as_str)?;
+            Some((suite_of(r)?, name.to_string()))
+        })
+        .collect();
     let before = rows.len();
-    rows.retain(|r| !suite_of(r).is_some_and(|s| superseded.contains(&s)));
+    rows.retain(|r| {
+        let (Some(suite), Some(name)) = (suite_of(r), r.get("name").and_then(Value::as_str)) else {
+            return true;
+        };
+        !superseded
+            .get(&suite)
+            .is_some_and(|auth| reported.contains(&(*auth, name.to_string())))
+    });
     let removed = before - rows.len();
     if let Some(n) = doc.get("total_count").and_then(Value::as_u64) {
         doc["total_count"] = Value::from(n.saturating_sub(removed as u64));

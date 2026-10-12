@@ -521,22 +521,6 @@ fn resolve_required(reads: &mut GhReads, st: &mut State) -> Result<Option<Vec<St
     Ok(st.required.clone())
 }
 
-/// The legacy commit statuses for `sha` (`GET …/commits/{sha}/status`).
-///
-/// GitHub gates that endpoint on the App permission **Commit statuses:
-/// read**, separate from the **Checks: read** the check-runs read needs —
-/// and the fleet Apps hold only the latter (#10633). A permission refusal
-/// therefore degrades instead of ending the wait: the poll folds an empty
-/// status list, a stderr note says so and names the permission to grant,
-/// and later polls skip the read. That stays safe because
-/// - a required context that only a legacy status reports is never `seen`,
-///   so the verdict waits for it ([`verdict::decide`]) — never GREEN;
-/// - an empty rollup never settles `NONE` while statuses are unreadable
-///   (see [`poll`]): it may be a status-only repository.
-///
-/// What the degraded verdict cannot see is a failing **non-required**
-/// legacy status; the note says that too. Every other refusal (a rate
-/// limit, a bad credential) is returned unchanged.
 /// Drop the check-runs of a superseded twin workflow run on `sha` (#11097,
 /// [`crate::merge_pr::superseded_runs`]). Read only when the rollup could
 /// hold twin residue; a failed read or a doubtful payload drops nothing, so
@@ -560,6 +544,22 @@ fn drop_superseded_twins(reads: &mut GhReads, sha: &str, runs: &mut serde_json::
     }
 }
 
+/// The legacy commit statuses for `sha` (`GET …/commits/{sha}/status`).
+///
+/// GitHub gates that endpoint on the App permission **Commit statuses:
+/// read**, separate from the **Checks: read** the check-runs read needs —
+/// and the fleet Apps hold only the latter (#10633). A permission refusal
+/// therefore degrades instead of ending the wait: the poll folds an empty
+/// status list, a stderr note says so and names the permission to grant,
+/// and later polls skip the read. That stays safe because
+/// - a required context that only a legacy status reports is never `seen`,
+///   so the verdict waits for it ([`verdict::decide`]) — never GREEN;
+/// - an empty rollup never settles `NONE` while statuses are unreadable
+///   (see [`poll`]): it may be a status-only repository.
+///
+/// What the degraded verdict cannot see is a failing **non-required**
+/// legacy status; the note says that too. Every other refusal (a rate
+/// limit, a bad credential) is returned unchanged.
 fn legacy_statuses(
     reads: &mut GhReads,
     sha: &str,
