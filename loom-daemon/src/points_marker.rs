@@ -115,12 +115,13 @@ pub fn scan(text: &str) -> SourceMarkers {
             continue;
         };
         let rest = rest.trim_start();
-        if rest.starts_with("loom:points") {
+        let tag = rest.strip_prefix("loom").unwrap_or("");
+        if tag.starts_with(":points") {
             match points_line_re().captures(trimmed) {
                 Some(c) => out.points.push(c[1].to_string()),
                 None => out.malformed.push(trimmed.to_string()),
             }
-        } else if rest.starts_with("loom:complexity") {
+        } else if tag.starts_with(":complexity") {
             out.complexity.push(trimmed.to_string());
         }
     }
