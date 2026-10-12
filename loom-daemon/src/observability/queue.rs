@@ -1,42 +1,63 @@
-//! Durable, bounded, disk-backed offline queue for [`TelemetryEnvelope`]
-//! records (Epic #4702, Phase 1 — issue #4705).
+//! Durable, disk-backed offline queue for [`TelemetryEnvelope`] records
+//! (Epic #4702, Phase 1 — issue #4705; spill tail — issue #11556).
 //!
 //! Fleet hosts sleep and idle-shutdown (#4467/#4697), so an in-memory-only
 //! queue would silently lose every unsent record across a host's downtime
-//! window. This queue instead mirrors its in-memory state to a single JSONL
-//! file (`<workspace>/.loom/logs/observability-queue.jsonl`, override via
-//! [`QUEUE_PATH_ENV`]) on every mutation, using the same create-temp +
-//! atomic-rename write pattern [`crate::idle_exit::write_marker`] and
-//! [`crate::sweep_outcomes::append_outcome`] already use elsewhere in this
-//! crate. [`DurableQueue::open`] replays that file at startup, so a record
-//! enqueued just before a clean daemon exit (the idle-exit path never kills
-//! `-9`) is still there to drain on the next boot.
+//! window. This queue instead keeps every record on disk and replays it in
+//! [`DurableQueue::open`], so a record enqueued just before a clean daemon
+//! exit (the idle-exit path never kills `-9`) is still there to drain on the
+//! next boot.
 //!
-//! **Bounded, drop-oldest.** [`DurableQueue::push`] never grows the queue
-//! past `capacity`: once full, the oldest queued envelope is discarded and
-//! [`DurableQueue::dropped_total`] increments — logged once per drop, never a
-//! silent loss and never unbounded growth (per the issue's AC). Every loss —
-//! capacity eviction, a reopen front-trim, an exporter-reported rejection —
-//! lands in this queue's durable [`super::loss_ledger`] by reason (Issue
-//! #11527), so `dropped_total` survives a restart instead of resetting.
+//! **Head window + append-only spill tail — never drop-oldest.** The queue is
+//! two files, read in FIFO order:
+//!
+//! 1. The **head** (`<workspace>/.loom/logs/observability-queue.jsonl`,
+//!    override via [`QUEUE_PATH_ENV`]): at most `capacity` envelopes, the hot
+//!    window the sender peeks from. It is rewritten whole on every mutation
+//!    with the create-temp + atomic-rename pattern
+//!    [`crate::idle_exit::write_marker`] uses — `O(capacity)` per write.
+//! 2. The **spill tail** (`<queue>.spill.jsonl`): once the head is full (or
+//!    anything is already spilled, to keep FIFO), [`DurableQueue::push`]
+//!    appends exactly one JSONL line with `O_APPEND` — `O(1)` bytes written
+//!    per push, nothing rewritten. A persisted read offset
+//!    (`<queue>.spill.offset`, written atomically) marks how much of the tail
+//!    has been moved back into the head.
+//!
+//! [`DurableQueue::ack`] / [`DurableQueue::ack_snapshot`] refill the head from
+//! the spill tail up to `capacity`. When the offset reaches the end of the
+//! tail both spill files are removed; when it passes half the tail, the tail
+//! is compacted (rewritten from the offset). A reopen with a shrunk
+//! `capacity` moves the head's excess onto the front of the tail instead of
+//! trimming it. [`DurableQueue::len`] counts head + tail, so
+//! `host.export.queue_depth` and `status` see the whole backlog.
+//!
+//! **No byte cap** is configured (#10196 "no caps"). The **only** drop is a
+//! spill write that fails (full or unwritable disk): it is recorded in this
+//! queue's durable [`super::loss_ledger`] as [`REASON_SPILL_WRITE_FAILED`]
+//! and logged at WARN with the count — never silent (Issue #11527).
+//!
+//! **Crash safety prefers duplicates over loss.** Every write is ordered so a
+//! crash between two steps replays records twice rather than dropping them:
+//! the head is persisted before the offset advances, a compaction resets the
+//! offset to 0 before the compacted tail replaces the old one, and the
+//! spilled count is re-derived from the tail file (minus the offset) on
+//! reopen rather than trusted from memory. A torn final line (a crash mid
+//! append) is cut off on reopen.
 //!
 //! **Peek-then-ack, not pop.** The sender ([`super::sender`]) reads a batch
-//! via [`DurableQueue::peek_batch`] without removing it, attempts the export,
-//! and only calls [`DurableQueue::ack`] on success — a failed export leaves
-//! the batch queued for the next retry rather than losing it.
-//!
-//! This whole-file rewrite on every mutation is `O(queue length)` per push/ack,
-//! not an append-only journal — deliberately simple for Phase 1's expected
-//! queue sizes (hundreds to a few thousand envelopes, per
-//! `queueCapacity`'s default). A future phase can switch to an append+compact
-//! journal (mirroring [`crate::sweep_outcomes`]'s rotation) if profiling ever
-//! shows this matters.
+//! via [`DurableQueue::peek_snapshot`] without removing it, attempts the
+//! export, and only acks the confirmed prefix — a failed export leaves the
+//! batch queued for the next retry rather than losing it. Batches are peeked
+//! from the head only, and the sender bounds them by bytes
+//! (`sender::MAX_BATCH_BYTES`, #10928), so a refill from spill never makes a
+//! batch the sink cannot accept.
 
 use std::collections::VecDeque;
+use std::io::{BufRead, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use super::loss_ledger::{LossLedger, REASON_CAPACITY_SHRINK, REASON_QUEUE_OVERFLOW};
+use super::loss_ledger::LossLedger;
 use crate::telemetry::TelemetryEnvelope;
 
 /// Env var overriding the queue file path (test seam), mirroring
@@ -45,6 +66,11 @@ pub const QUEUE_PATH_ENV: &str = "LOOM_OBSERVABILITY_QUEUE_PATH";
 
 /// Default filename under `<workspace_root>/.loom/logs/`.
 pub const QUEUE_FILENAME: &str = "observability-queue.jsonl";
+
+/// Loss reason (Issue #11556): an envelope that had to spill past the head
+/// window could not be appended to the spill tail (full or unwritable disk),
+/// so it was dropped. The only way this queue loses a record. Envelope units.
+pub const REASON_SPILL_WRITE_FAILED: &str = "spill_write_failed";
 
 /// Per-exporter queue filename under `<workspace_root>/.loom/logs/` when more
 /// than one exporter is configured (Issue #8756) — `observability-queue.<name>
@@ -71,9 +97,22 @@ pub fn default_queue_path(workspace_root: &Path) -> PathBuf {
         .join(QUEUE_FILENAME)
 }
 
+/// In-memory view of the spill tail: how many records remain past `offset`,
+/// and the tail file's length as this process last wrote it.
+#[derive(Debug, Default, Clone, Copy)]
+struct SpillState {
+    count: u64,
+    offset: u64,
+    bytes: u64,
+}
+
 struct QueueState {
     items: VecDeque<TelemetryEnvelope>,
+    /// FIFO position of `items[0]`. Advanced only by acks — nothing is
+    /// evicted from the front any more — so refills and pushes behind an
+    /// in-flight snapshot get later positions and are never acked by it.
     head_sequence: u128,
+    spill: SpillState,
 }
 
 /// An in-process queue cursor plus immutable payload snapshot. Sequence identity
@@ -83,14 +122,16 @@ pub struct QueueSnapshot {
     pub envelopes: Vec<TelemetryEnvelope>,
 }
 
-/// A bounded, disk-backed FIFO queue of [`TelemetryEnvelope`]s.
+/// A disk-backed FIFO queue of [`TelemetryEnvelope`]s: a bounded head window
+/// plus an append-only spill tail (see the module docs).
 pub struct DurableQueue {
     path: PathBuf,
+    spill_path: PathBuf,
+    offset_path: PathBuf,
     capacity: usize,
-    /// Durable, by-reason loss counts (Issue #11527): capacity evictions,
-    /// reopen front-trims and exporter-reported losses all land here, and
-    /// [`Self::dropped_total`] is its sum — so the count a `host.export`
-    /// reports survives a restart.
+    /// Durable, by-reason loss counts (Issue #11527): failed spill writes and
+    /// exporter-reported losses all land here, and [`Self::dropped_total`]
+    /// is its sum — so the count a `host.export` reports survives a restart.
     ledger: LossLedger,
     state: Mutex<QueueState>,
 }
@@ -105,55 +146,86 @@ fn loss_ledger_path(queue_path: &Path) -> PathBuf {
     queue_path.with_extension("loss.json")
 }
 
+/// The append-only spill tail for a queue at `queue_path`
+/// (`observability-queue.jsonl` → `observability-queue.spill.jsonl`).
+fn spill_path(queue_path: &Path) -> PathBuf {
+    queue_path.with_extension("spill.jsonl")
+}
+
+/// The spill tail's persisted read offset (`observability-queue.spill.offset`).
+fn spill_offset_path(queue_path: &Path) -> PathBuf {
+    queue_path.with_extension("spill.offset")
+}
+
 impl DurableQueue {
-    /// Open (or create) the queue at `path`, replaying any envelopes left
-    /// over from a prior process (best-effort — a missing, unreadable, or
+    /// Open (or create) the queue at `path`, replaying the head and spill tail
+    /// left over from a prior process (best-effort — a missing, unreadable, or
     /// partially-corrupt file degrades to an empty queue rather than
     /// erroring; a corrupt individual line is skipped, matching
     /// [`crate::sweep_outcomes::read_all`]'s soft-fail contract). `capacity`
-    /// is clamped to at least 1. Envelopes trimmed off the front by a
-    /// capacity that shrank since the file was last written are recorded in
-    /// the queue's loss ledger as [`REASON_CAPACITY_SHRINK`].
+    /// is clamped to at least 1. A head larger than a capacity that shrank
+    /// since the file was last written moves its excess onto the front of the
+    /// spill tail — nothing is trimmed — and a head with room left (a grown
+    /// capacity, or a crash mid-refill) is refilled from the tail.
     #[must_use]
     pub fn open(path: PathBuf, capacity: usize) -> Self {
         let capacity = capacity.max(1);
         let ledger = LossLedger::open(loss_ledger_path(&path));
+        let spill_path = spill_path(&path);
+        let offset_path = spill_offset_path(&path);
         let mut items = load_existing(&path);
-        // A capacity that shrank since the file was last written (e.g. a
-        // config edit between restarts) must not resurrect more than the
-        // new bound allows.
-        let mut shrunk = 0u64;
-        while items.len() > capacity {
-            items.pop_front();
-            shrunk += 1;
-        }
-        if shrunk > 0 {
-            ledger.record(REASON_CAPACITY_SHRINK, shrunk);
-            // Persist the trimmed queue too: the file still holds the
-            // pre-trim lines, so without this rewrite every reopen would
-            // re-trim (and re-count) the same front until a push/ack
-            // happened to rewrite it.
-            if let Err(error) = persist_to(&path, &items) {
-                log::warn!("observability: failed to persist trimmed queue: {error}");
+        let mut spill = open_spill(&spill_path, &offset_path);
+        if items.len() > capacity {
+            let excess = items.split_off(capacity);
+            match prepend_to_spill(&spill_path, &offset_path, &excess, spill) {
+                Ok(moved) => {
+                    spill = moved;
+                    // The excess is durably at the front of the tail; only
+                    // now shrink the head file. A crash in between replays
+                    // the excess twice, never zero times.
+                    if let Err(error) = persist_to(&path, &items) {
+                        log::warn!("observability: failed to persist shrunk queue head: {error}");
+                    }
+                }
+                Err(error) => {
+                    // Keep the oversized head in memory (and on disk) rather
+                    // than lose it; pushes spill behind it and acks drain it.
+                    log::warn!(
+                        "observability: failed to move {} queued record(s) past the shrunk \
+                         capacity to the spill tail: {error}",
+                        excess.len()
+                    );
+                    items.extend(excess);
+                }
             }
         }
-        DurableQueue {
+        let queue = DurableQueue {
             path,
+            spill_path,
+            offset_path,
             capacity,
             ledger,
             state: Mutex::new(QueueState {
                 items,
                 head_sequence: 0,
+                spill,
             }),
+        };
+        {
+            let mut state = queue.lock();
+            if state.items.len() < capacity && state.spill.count > 0 {
+                queue.refill_and_persist(&mut state);
+            }
         }
+        queue
     }
 
-    /// Enqueue `envelope`, dropping the oldest queued envelope first if the
-    /// queue is already at `capacity`. Persists the new state to disk
-    /// best-effort — a write failure is logged and swallowed (matches
+    /// Enqueue `envelope`: into the head while it has room and nothing is
+    /// spilled, else as one appended line on the spill tail. Persists
+    /// best-effort — a head write failure is logged and swallowed (matches
     /// [`crate::sweep_outcomes::append_outcome`]'s "never block the caller on
-    /// a journal-write failure" contract) so a full/unwritable disk degrades
-    /// this queue to in-memory-only rather than crashing the collector.
+    /// a journal-write failure" contract); a spill write failure is the one
+    /// counted loss ([`REASON_SPILL_WRITE_FAILED`]).
     pub fn push(&self, envelope: TelemetryEnvelope) {
         if let Err(error) = self.push_inner(envelope, false) {
             log::warn!("observability: failed to persist queue: {error}");
@@ -162,42 +234,56 @@ impl DurableQueue {
 
     /// Offer a terminal span and confirm its queue file and directory reached
     /// stable storage before the caller removes active execution context.
-    /// On failure the in-memory offer remains; retain context for recovery.
+    /// On failure the in-memory offer remains (head) or is counted lost
+    /// (spill); either way, retain context for recovery.
     pub fn push_durable(&self, envelope: TelemetryEnvelope) -> std::io::Result<()> {
         self.push_inner(envelope, true)
     }
 
     fn push_inner(&self, envelope: TelemetryEnvelope, durable: bool) -> std::io::Result<()> {
         let mut state = self.lock();
-        if state.items.len() >= self.capacity {
-            state.items.pop_front();
-            state.head_sequence += 1;
-            self.ledger.record(REASON_QUEUE_OVERFLOW, 1);
-            log::warn!(
-                "observability: queue at capacity ({}); dropped oldest record \
-                 (queue_overflow, dropped_total={})",
-                self.capacity,
-                self.ledger.total()
-            );
+        if state.spill.count == 0 && state.items.len() < self.capacity {
+            state.items.push_back(envelope);
+            persist_to(&self.path, &state.items)?;
+            if durable {
+                sync_file_and_parent(&self.path)?;
+            }
+            return Ok(());
         }
-        state.items.push_back(envelope);
-        persist_to(&self.path, &state.items)?;
+        // Write the line before counting it: a record is spilled only once it
+        // is in the tail file, which is what a reopen re-derives the count from.
+        match append_spill_line(&self.spill_path, &envelope, state.spill.bytes) {
+            Ok(written) => {
+                state.spill.count += 1;
+                state.spill.bytes += written;
+            }
+            Err(error) => {
+                self.ledger.record(REASON_SPILL_WRITE_FAILED, 1);
+                log::warn!(
+                    "observability: failed to append to spill tail {} ({error}); dropped 1 \
+                     record (spill_write_failed={}, dropped_total={})",
+                    self.spill_path.display(),
+                    self.ledger
+                        .by_reason()
+                        .get(REASON_SPILL_WRITE_FAILED)
+                        .copied()
+                        .unwrap_or(0),
+                    self.ledger.total()
+                );
+                return Err(error);
+            }
+        }
         if durable {
-            std::fs::File::open(&self.path)?.sync_all()?;
-            let parent = self
-                .path
-                .parent()
-                .filter(|parent| !parent.as_os_str().is_empty())
-                .unwrap_or_else(|| Path::new("."));
-            std::fs::File::open(parent)?.sync_all()?;
+            sync_file_and_parent(&self.spill_path)?;
         }
         Ok(())
     }
 
-    /// Current queue length.
+    /// Current queue length: the head window plus every spilled record.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.lock().items.len()
+        let state = self.lock();
+        state.items.len() + usize::try_from(state.spill.count).unwrap_or(usize::MAX)
     }
 
     /// True when the queue holds no envelopes.
@@ -231,7 +317,7 @@ impl DurableQueue {
         self.ledger.record_losses(losses);
     }
 
-    /// Clone up to `n` envelopes from the front of the queue **without**
+    /// Clone up to `n` envelopes from the front of the head window **without**
     /// removing them — the sender only removes a batch after a confirmed
     /// successful export, via [`Self::ack`].
     #[must_use]
@@ -249,9 +335,12 @@ impl DurableQueue {
         }
     }
 
-    /// Acknowledge only the exported snapshot prefix still present in the FIFO.
-    /// Concurrent capacity drops may advance the head; newly pushed records must
-    /// never be mistaken for records sent before that advance.
+    /// Acknowledge only the exported snapshot prefix still present in the FIFO,
+    /// then refill the head from the spill tail. Nothing is evicted from the
+    /// front, so the head advances only through acks; a replayed (or
+    /// overlapping) acknowledgment is idempotent, and records pushed or
+    /// refilled while the export was in flight sit at later sequence positions
+    /// and are never mistaken for the records it sent.
     pub fn ack_snapshot(&self, snapshot: &QueueSnapshot, acknowledged: usize) {
         let end = snapshot.start_sequence + acknowledged.min(snapshot.envelopes.len()) as u128;
         let mut state = self.lock();
@@ -260,17 +349,17 @@ impl DurableQueue {
             .min(state.items.len() as u128) as usize;
         state.items.drain(..count);
         state.head_sequence += count as u128;
-        self.persist(&state.items);
+        self.refill_and_persist(&mut state);
     }
 
-    /// Remove the front `n` envelopes (clamped to the current length) after a
-    /// successful export, persisting the drained state to disk.
+    /// Remove the front `n` envelopes (clamped to the head's length) after a
+    /// successful export, refill the head from the spill tail, and persist.
     pub fn ack(&self, n: usize) {
         let mut state = self.lock();
         let n = n.min(state.items.len());
         state.items.drain(0..n);
         state.head_sequence += n as u128;
-        self.persist(&state.items);
+        self.refill_and_persist(&mut state);
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, QueueState> {
@@ -279,11 +368,68 @@ impl DurableQueue {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn persist(&self, items: &VecDeque<TelemetryEnvelope>) {
-        if let Err(error) = persist_to(&self.path, items) {
+    /// Move spilled records back into the head up to `capacity`, persist the
+    /// head, then — only after the head is durable — advance the spill
+    /// offset (removing or compacting the tail when due). A crash between the
+    /// two writes replays the refilled records from both files: duplicates,
+    /// never loss.
+    fn refill_and_persist(&self, state: &mut QueueState) {
+        let need = self.capacity.saturating_sub(state.items.len());
+        let before = state.spill;
+        if need > 0 && state.spill.count > 0 {
+            match read_spill(&self.spill_path, state.spill.offset, need) {
+                Ok(read) => {
+                    state.items.extend(read.records);
+                    state.spill.offset = read.offset;
+                    state.spill.count = if read.eof {
+                        // The tail ran out before the count did (the file
+                        // shrank under us): resync rather than spin.
+                        0
+                    } else {
+                        state.spill.count.saturating_sub(read.lines)
+                    };
+                }
+                Err(error) => log::warn!(
+                    "observability: failed to refill queue head from spill tail {}: {error}",
+                    self.spill_path.display()
+                ),
+            }
+        }
+        if let Err(error) = persist_to(&self.path, &state.items) {
             log::warn!(
                 "observability: failed to persist queue to {}: {error}",
                 self.path.display()
+            );
+            // The head did not reach disk, so the offset must not advance
+            // past records that now live only in memory.
+            return;
+        }
+        if before.offset == state.spill.offset && before.count == state.spill.count {
+            return;
+        }
+        if state.spill.count == 0 {
+            // Fully drained: truncate both files. Tail first; a stale offset
+            // left by a crash here is discarded by `open_spill` because the
+            // tail it pointed into is gone.
+            remove_if_present(&self.spill_path);
+            remove_if_present(&self.offset_path);
+            state.spill = SpillState::default();
+        } else if state.spill.offset.saturating_mul(2) > state.spill.bytes {
+            if let Err(error) = compact_spill(&self.spill_path, &self.offset_path, &mut state.spill)
+            {
+                log::warn!("observability: failed to compact spill tail: {error}");
+                self.write_offset(state.spill.offset);
+            }
+        } else {
+            self.write_offset(state.spill.offset);
+        }
+    }
+
+    fn write_offset(&self, offset: u64) {
+        if let Err(error) = write_offset(&self.offset_path, offset) {
+            log::warn!(
+                "observability: failed to persist spill offset to {}: {error}",
+                self.offset_path.display()
             );
         }
     }
@@ -371,10 +517,6 @@ fn load_existing(path: &Path) -> VecDeque<TelemetryEnvelope> {
 /// line — a temp-file-then-rename, mirroring
 /// [`crate::idle_exit::write_marker`].
 fn persist_to(path: &Path, items: &VecDeque<TelemetryEnvelope>) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let temporary = path.with_extension(format!("jsonl.tmp-{}", std::process::id()));
     let mut buffer = String::new();
     for item in items {
         if let Ok(line) = serde_json::to_string(item) {
@@ -382,8 +524,230 @@ fn persist_to(path: &Path, items: &VecDeque<TelemetryEnvelope>) -> std::io::Resu
             buffer.push('\n');
         }
     }
-    std::fs::write(&temporary, buffer)?;
+    write_atomic(path, buffer.as_bytes())
+}
+
+/// Temp-file-then-rename write of `bytes` to `path`, creating the parent.
+fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut temporary = path.as_os_str().to_owned();
+    temporary.push(format!(".tmp-{}", std::process::id()));
+    let temporary = PathBuf::from(temporary);
+    std::fs::write(&temporary, bytes)?;
     std::fs::rename(temporary, path)
+}
+
+fn sync_file_and_parent(path: &Path) -> std::io::Result<()> {
+    std::fs::File::open(path)?.sync_all()?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::File::open(parent)?.sync_all()
+}
+
+fn remove_if_present(path: &Path) {
+    if let Err(error) = std::fs::remove_file(path) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            log::warn!("observability: failed to remove {}: {error}", path.display());
+        }
+    }
+}
+
+fn read_offset(path: &Path) -> u64 {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+fn write_offset(path: &Path, offset: u64) -> std::io::Result<()> {
+    write_atomic(path, format!("{offset}\n").as_bytes())
+}
+
+fn is_blank(line: &[u8]) -> bool {
+    line.iter().all(u8::is_ascii_whitespace)
+}
+
+/// Re-derive the spill tail's state from disk: cut off a torn final line,
+/// clamp the offset to the tail (moving it back to a line start, which can
+/// only replay a record, never skip one), and count the records past it.
+/// A missing or empty tail discards any stale offset sidecar.
+fn open_spill(spill_path: &Path, offset_path: &Path) -> SpillState {
+    let data = std::fs::read(spill_path).unwrap_or_default();
+    let valid = data
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    if valid < data.len() {
+        log::warn!(
+            "observability: cutting a torn {}-byte line off spill tail {}",
+            data.len() - valid,
+            spill_path.display()
+        );
+        if let Err(error) = std::fs::OpenOptions::new()
+            .write(true)
+            .open(spill_path)
+            .and_then(|file| file.set_len(valid as u64))
+        {
+            log::warn!("observability: failed to truncate spill tail: {error}");
+        }
+    }
+    let data = &data[..valid];
+    if data.is_empty() {
+        remove_if_present(offset_path);
+        return SpillState::default();
+    }
+    let mut offset = usize::try_from(read_offset(offset_path))
+        .unwrap_or(usize::MAX)
+        .min(data.len());
+    while offset > 0 && data[offset - 1] != b'\n' {
+        offset -= 1;
+    }
+    let count = data[offset..]
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !is_blank(line))
+        .count();
+    SpillState {
+        count: count as u64,
+        offset: offset as u64,
+        bytes: data.len() as u64,
+    }
+}
+
+/// Append one JSONL line for `envelope` to the spill tail (`O_APPEND`, no
+/// rewrite) and return the bytes written. A failed write is rolled back to
+/// `prior_len` so a partial line cannot corrupt the next append.
+fn append_spill_line(
+    spill_path: &Path,
+    envelope: &TelemetryEnvelope,
+    prior_len: u64,
+) -> std::io::Result<u64> {
+    let mut line = serde_json::to_string(envelope).map_err(std::io::Error::other)?;
+    line.push('\n');
+    if let Some(parent) = spill_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(spill_path)?;
+    if let Err(error) = file.write_all(line.as_bytes()) {
+        let _ = file.set_len(prior_len);
+        return Err(error);
+    }
+    Ok(line.len() as u64)
+}
+
+struct SpillRead {
+    records: Vec<TelemetryEnvelope>,
+    /// Non-blank lines consumed (parsed or not).
+    lines: u64,
+    offset: u64,
+    eof: bool,
+}
+
+/// Read up to `max` records from the spill tail starting at byte `offset`.
+fn read_spill(spill_path: &Path, offset: u64, max: usize) -> std::io::Result<SpillRead> {
+    let mut file = std::fs::File::open(spill_path)?;
+    file.seek(std::io::SeekFrom::Start(offset))?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut read = SpillRead {
+        records: Vec::new(),
+        lines: 0,
+        offset,
+        eof: false,
+    };
+    let mut line = String::new();
+    while read.lines < max as u64 {
+        line.clear();
+        let n = reader.read_line(&mut line)?;
+        if n == 0 || !line.ends_with('\n') {
+            read.eof = true;
+            break;
+        }
+        read.offset += n as u64;
+        if is_blank(line.as_bytes()) {
+            continue;
+        }
+        read.lines += 1;
+        match serde_json::from_str(&line) {
+            Ok(envelope) => read.records.push(envelope),
+            Err(error) => log::warn!(
+                "observability: skipping unparseable spill line in {}: {error}",
+                spill_path.display()
+            ),
+        }
+    }
+    Ok(read)
+}
+
+/// Rewrite the spill tail from the current offset. The offset is reset to 0
+/// **before** the compacted tail replaces the old one: a crash in between
+/// replays the already-consumed prefix (duplicates) instead of pointing a
+/// stale offset into the shorter file (loss).
+fn compact_spill(
+    spill_path: &Path,
+    offset_path: &Path,
+    spill: &mut SpillState,
+) -> std::io::Result<()> {
+    let data = std::fs::read(spill_path)?;
+    let start = usize::try_from(spill.offset)
+        .unwrap_or(usize::MAX)
+        .min(data.len());
+    let tail = &data[start..];
+    replace_spill(spill_path, offset_path, tail)?;
+    spill.offset = 0;
+    spill.bytes = tail.len() as u64;
+    Ok(())
+}
+
+/// Put `excess` (head records past a shrunk capacity) in front of the
+/// unconsumed spill tail, preserving FIFO order.
+fn prepend_to_spill(
+    spill_path: &Path,
+    offset_path: &Path,
+    excess: &VecDeque<TelemetryEnvelope>,
+    spill: SpillState,
+) -> std::io::Result<SpillState> {
+    let mut bytes = Vec::new();
+    let mut moved = 0u64;
+    for envelope in excess {
+        if let Ok(line) = serde_json::to_string(envelope) {
+            bytes.extend_from_slice(line.as_bytes());
+            bytes.push(b'\n');
+            moved += 1;
+        }
+    }
+    if spill.bytes > 0 {
+        let data = std::fs::read(spill_path)?;
+        let start = usize::try_from(spill.offset)
+            .unwrap_or(usize::MAX)
+            .min(data.len());
+        bytes.extend_from_slice(&data[start..]);
+    }
+    replace_spill(spill_path, offset_path, &bytes)?;
+    Ok(SpillState {
+        count: spill.count + moved,
+        offset: 0,
+        bytes: bytes.len() as u64,
+    })
+}
+
+/// Swap in `contents` as the whole spill tail, read from offset 0. Offset
+/// first, then the rename — see [`compact_spill`].
+fn replace_spill(spill_path: &Path, offset_path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let mut temporary = spill_path.as_os_str().to_owned();
+    temporary.push(format!(".tmp-{}", std::process::id()));
+    let temporary = PathBuf::from(temporary);
+    if let Some(parent) = spill_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&temporary, contents)?;
+    write_offset(offset_path, 0)?;
+    std::fs::rename(temporary, spill_path)
 }
 
 #[cfg(test)]
@@ -394,12 +758,12 @@ mod tests {
     use serial_test::serial;
     use tempfile::tempdir;
 
-    fn envelope(issue: u32) -> TelemetryEnvelope {
+    fn envelope_with_repo(issue: u32, repo: String) -> TelemetryEnvelope {
         TelemetryEnvelope::new(
             "host-test",
             TelemetryRecord::SweepStarted(SweepStartedRecord {
                 story_points: None,
-                repo: "rjwalters/loom".to_string(),
+                repo,
                 visibility: RepoVisibility::Public,
                 issue,
                 sweep_id: format!("sweep-issue-{issue}-0"),
@@ -409,8 +773,38 @@ mod tests {
         )
     }
 
+    fn envelope(issue: u32) -> TelemetryEnvelope {
+        envelope_with_repo(issue, "rjwalters/loom".to_string())
+    }
+
+    fn issue_of(envelope: &TelemetryEnvelope) -> u32 {
+        match &envelope.record {
+            TelemetryRecord::SweepStarted(r) => r.issue,
+            other => panic!("unexpected record {other:?}"),
+        }
+    }
+
+    fn issues(envelopes: &[TelemetryEnvelope]) -> Vec<u32> {
+        envelopes.iter().map(issue_of).collect()
+    }
+
+    /// Drain the whole queue one head-batch at a time, returning issue order.
+    fn drain_all(queue: &DurableQueue) -> Vec<u32> {
+        let mut out = Vec::new();
+        loop {
+            let batch = queue.peek_batch(usize::MAX);
+            if batch.is_empty() {
+                break;
+            }
+            out.extend(issues(&batch));
+            queue.ack(batch.len());
+        }
+        assert_eq!(queue.len(), 0);
+        out
+    }
+
     #[test]
-    fn snapshot_ack_survives_capacity_eviction_and_identical_new_payloads() {
+    fn snapshot_ack_survives_spill_refill_and_identical_new_payloads() {
         let dir = tempdir().unwrap();
         let queue = DurableQueue::open(dir.path().join("q.jsonl"), 2);
         let first = envelope(1);
@@ -418,16 +812,41 @@ mod tests {
         queue.push(first.clone());
         queue.push(second.clone());
         let snapshot = queue.peek_snapshot(2);
-        queue.push(second.clone()); // evicts first; identical to an in-flight record
+        queue.push(second.clone()); // spills; identical to an in-flight record
         queue.ack_snapshot(&snapshot, 2);
-        assert_eq!(queue.peek_batch(2), vec![second.clone()]);
+        assert_eq!(queue.peek_batch(2), vec![second.clone()], "refilled from spill");
         queue.ack_snapshot(&snapshot, 2); // replayed acknowledgment is idempotent
         assert_eq!(queue.peek_batch(2), vec![second.clone()]);
         let snapshot = queue.peek_snapshot(1);
         queue.push(first.clone());
-        queue.push(second.clone()); // evicts every record in snapshot
+        queue.push(second.clone()); // spills behind a full head
         queue.ack_snapshot(&snapshot, 1);
         assert_eq!(queue.peek_batch(2), vec![first, second]);
+        assert_eq!(queue.dropped_total(), 0, "nothing is ever evicted");
+    }
+
+    #[test]
+    fn ack_refill_keeps_fifo_with_pushes_during_an_in_flight_snapshot() {
+        let dir = tempdir().unwrap();
+        let queue = DurableQueue::open(dir.path().join("q.jsonl"), 2);
+        for i in 1..=3 {
+            queue.push(envelope(i));
+        }
+        let in_flight = queue.peek_snapshot(2);
+        assert_eq!(issues(&in_flight.envelopes), vec![1, 2]);
+        queue.push(envelope(4)); // pushed while the export is in flight
+        queue.ack_snapshot(&in_flight, 2);
+        assert_eq!(issues(&queue.peek_batch(10)), vec![3, 4]);
+        let in_flight = queue.peek_snapshot(2);
+        queue.push(envelope(5));
+        queue.push(envelope(6));
+        queue.ack_snapshot(&in_flight, 1); // partial ack: only issue 3
+        assert_eq!(issues(&queue.peek_batch(10)), vec![4, 5]);
+        queue.ack_snapshot(&in_flight, 1); // replay acks nothing new
+        assert_eq!(issues(&queue.peek_batch(10)), vec![4, 5]);
+        assert_eq!(queue.len(), 3);
+        assert_eq!(drain_all(&queue), vec![4, 5, 6]);
+        assert_eq!(queue.dropped_total(), 0);
     }
 
     #[test]
@@ -439,11 +858,7 @@ mod tests {
         queue.push(envelope(3));
         assert_eq!(queue.len(), 3);
         let batch = queue.peek_batch(2);
-        assert_eq!(batch.len(), 2);
-        match &batch[0].record {
-            TelemetryRecord::SweepStarted(r) => assert_eq!(r.issue, 1),
-            other => panic!("unexpected record {other:?}"),
-        }
+        assert_eq!(issues(&batch), vec![1, 2]);
         // peek does not remove.
         assert_eq!(queue.len(), 3);
     }
@@ -457,11 +872,7 @@ mod tests {
         }
         queue.ack(2);
         assert_eq!(queue.len(), 1);
-        let remaining = queue.peek_batch(10);
-        match &remaining[0].record {
-            TelemetryRecord::SweepStarted(r) => assert_eq!(r.issue, 3),
-            other => panic!("unexpected record {other:?}"),
-        }
+        assert_eq!(issues(&queue.peek_batch(10)), vec![3]);
     }
 
     #[test]
@@ -474,32 +885,157 @@ mod tests {
     }
 
     #[test]
-    fn bounded_capacity_drops_oldest_and_counts_it() {
+    fn overflow_spills_instead_of_dropping_and_drains_in_fifo_order() {
         let dir = tempdir().unwrap();
-        let queue = DurableQueue::open(dir.path().join("q.jsonl"), 2);
+        let path = dir.path().join("q.jsonl");
+        let queue = DurableQueue::open(path.clone(), 3);
+        for i in 1..=10 {
+            queue.push(envelope(i));
+        }
+        assert_eq!(queue.len(), 10, "len counts head + spilled");
+        assert_eq!(queue.dropped_total(), 0);
+        assert!(queue.dropped_by_reason().is_empty());
+        assert_eq!(issues(&queue.peek_batch(usize::MAX)), vec![1, 2, 3], "head window only");
+        assert!(spill_path(&path).exists());
+        assert_eq!(drain_all(&queue), (1..=10).collect::<Vec<_>>());
+        assert_eq!(queue.dropped_total(), 0);
+        assert!(!spill_path(&path).exists(), "drained tail is truncated");
+        assert!(!spill_offset_path(&path).exists(), "drained offset is truncated");
+    }
+
+    #[test]
+    fn spilled_tail_is_replayed_after_the_head_across_a_reopen() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("q.jsonl");
+        {
+            let queue = DurableQueue::open(path.clone(), 3);
+            for i in 1..=10 {
+                queue.push(envelope(i));
+            }
+        }
+        let reopened = DurableQueue::open(path.clone(), 3);
+        assert_eq!(reopened.len(), 10);
+        assert_eq!(reopened.dropped_total(), 0);
+        // Part-drain (refill + offset advance + compaction), then reopen again.
+        reopened.ack(2);
+        reopened.ack(3);
+        drop(reopened);
+        let again = DurableQueue::open(path, 3);
+        assert_eq!(again.len(), 5);
+        assert_eq!(drain_all(&again), (6..=10).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_lost_offset_replays_duplicates_never_drops() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("q.jsonl");
+        {
+            let queue = DurableQueue::open(path.clone(), 2);
+            for i in 1..=8 {
+                queue.push(envelope(i));
+            }
+            queue.ack(1); // refills issue 3 into the head, offset advances
+        }
+        // Simulate a crash that lost the offset write after the head write.
+        std::fs::remove_file(spill_offset_path(&path)).unwrap();
+        let reopened = DurableQueue::open(path, 2);
+        let drained = drain_all(&reopened);
+        for issue in 2..=8 {
+            assert!(drained.contains(&issue), "issue {issue} must survive: {drained:?}");
+        }
+        assert!(drained.len() > 7, "the refilled record is replayed, not lost");
+    }
+
+    #[test]
+    fn a_torn_final_spill_line_is_cut_on_reopen() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("q.jsonl");
+        {
+            let queue = DurableQueue::open(path.clone(), 1);
+            for i in 1..=3 {
+                queue.push(envelope(i));
+            }
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(spill_path(&path))
+            .unwrap();
+        file.write_all(b"{\"torn").unwrap();
+        drop(file);
+        let reopened = DurableQueue::open(path, 1);
+        assert_eq!(reopened.len(), 3);
+        reopened.push(envelope(4));
+        assert_eq!(drain_all(&reopened), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn a_failed_spill_write_is_counted_as_spill_write_failed() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("q.jsonl");
+        // A directory where the spill file should be: every append fails.
+        std::fs::create_dir_all(spill_path(&path)).unwrap();
+        let queue = DurableQueue::open(path, 2);
         queue.push(envelope(1));
         queue.push(envelope(2));
-        queue.push(envelope(3)); // over capacity: drops issue 1
+        assert_eq!(queue.dropped_total(), 0, "the head window still has room");
+        queue.push(envelope(3));
+        assert!(queue.push_durable(envelope(4)).is_err(), "a durable spill failure surfaces");
         assert_eq!(queue.len(), 2);
-        assert_eq!(queue.dropped_total(), 1);
         assert_eq!(
             queue.dropped_by_reason(),
-            std::collections::BTreeMap::from([("queue_overflow".to_string(), 1)])
+            std::collections::BTreeMap::from([(REASON_SPILL_WRITE_FAILED.to_string(), 2)])
         );
-        let batch = queue.peek_batch(10);
-        match &batch[0].record {
-            TelemetryRecord::SweepStarted(r) => assert_eq!(r.issue, 2),
-            other => panic!("unexpected record {other:?}"),
-        }
-        queue.push(envelope(4));
-        queue.push(envelope(5));
-        assert_eq!(queue.dropped_total(), 3, "never grows unbounded — every overflow is counted");
-        assert_eq!(queue.len(), 2);
-        // The count is durable (Issue #11527): a reopen over the same files
-        // sees the same ledger, it does not restart at 0.
+        assert_eq!(queue.dropped_total(), 2);
+        // Durable (Issue #11527): a reopen sees the same ledger.
         let reopened = DurableQueue::open(dir.path().join("q.jsonl"), 2);
-        assert_eq!(reopened.dropped_total(), 3);
-        assert_eq!(reopened.dropped_by_reason().get("queue_overflow"), Some(&3));
+        assert_eq!(reopened.dropped_by_reason().get("spill_write_failed"), Some(&2));
+    }
+
+    #[test]
+    fn push_past_the_head_appends_and_never_rewrites_the_spill_or_head() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("q.jsonl");
+        let queue = DurableQueue::open(path.clone(), 2);
+        queue.push(envelope(1));
+        queue.push(envelope(2));
+        let head = std::fs::read(&path).unwrap();
+        #[cfg(unix)]
+        let head_inode = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(&path).unwrap().ino()
+        };
+        queue.push(envelope(3));
+        #[cfg(unix)]
+        let spill_inode = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(spill_path(&path)).unwrap().ino()
+        };
+        let mut previous = std::fs::read(spill_path(&path)).unwrap();
+        for i in 4..=50 {
+            queue.push(envelope(i));
+            let current = std::fs::read(spill_path(&path)).unwrap();
+            let line = serde_json::to_string(&envelope(i)).unwrap().len() + 1;
+            assert!(current.starts_with(&previous), "push {i} rewrote the spill prefix");
+            // Same record shape each time, so O(1): one line's worth of bytes.
+            assert!(
+                current.len() - previous.len() <= line + 8,
+                "push {i} wrote {} bytes for a ~{line}-byte line",
+                current.len() - previous.len()
+            );
+            previous = current;
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), head, "a spilling push leaves the head alone");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().ino(), head_inode, "head not renamed");
+            assert_eq!(
+                std::fs::metadata(spill_path(&path)).unwrap().ino(),
+                spill_inode,
+                "the spill tail is appended in place, never replaced on push"
+            );
+        }
+        assert_eq!(queue.len(), 50);
     }
 
     #[test]
@@ -532,11 +1068,7 @@ mod tests {
         // restart across host sleep/idle-shutdown (#4467/#4697).
         let reopened = DurableQueue::open(path, 10);
         assert_eq!(reopened.len(), 2);
-        let batch = reopened.peek_batch(10);
-        match &batch[0].record {
-            TelemetryRecord::SweepStarted(r) => assert_eq!(r.issue, 1),
-            other => panic!("unexpected record {other:?}"),
-        }
+        assert_eq!(issues(&reopened.peek_batch(10)), vec![1, 2]);
     }
 
     #[test]
@@ -548,7 +1080,7 @@ mod tests {
     }
 
     #[test]
-    fn shrunk_capacity_on_reopen_drops_from_the_front() {
+    fn shrunk_capacity_on_reopen_spills_the_excess() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("q.jsonl");
         {
@@ -557,22 +1089,74 @@ mod tests {
                 queue.push(envelope(i));
             }
         }
-        let reopened = DurableQueue::open(path, 2);
-        assert_eq!(reopened.len(), 2);
-        let batch = reopened.peek_batch(10);
-        match &batch[0].record {
-            TelemetryRecord::SweepStarted(r) => assert_eq!(r.issue, 4),
-            other => panic!("unexpected record {other:?}"),
+        {
+            let reopened = DurableQueue::open(path.clone(), 2);
+            assert_eq!(reopened.len(), 5, "nothing trimmed");
+            assert_eq!(issues(&reopened.peek_batch(10)), vec![1, 2]);
+            assert_eq!(reopened.dropped_total(), 0);
+            assert!(reopened.dropped_by_reason().is_empty());
+            reopened.push(envelope(6)); // behind the moved excess
         }
-        // The front-trim is a counted, durable loss (Issue #11527).
-        assert_eq!(reopened.dropped_total(), 3);
-        assert_eq!(reopened.dropped_by_reason().get("capacity_shrink"), Some(&3));
-        let reopened_again = DurableQueue::open(dir.path().join("q.jsonl"), 2);
-        assert_eq!(
-            reopened_again.dropped_by_reason().get("capacity_shrink"),
-            Some(&3),
-            "no double count on a second reopen at the same capacity"
-        );
+        let reopened_again = DurableQueue::open(path.clone(), 2);
+        assert_eq!(reopened_again.len(), 6, "no double move on a second reopen");
+        drop(reopened_again);
+        // An older, still-spilled tail stays behind the newly moved excess.
+        let shrunk_more = DurableQueue::open(path, 1);
+        assert_eq!(drain_all(&shrunk_more), vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn grown_capacity_on_reopen_refills_the_head() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("q.jsonl");
+        {
+            let queue = DurableQueue::open(path.clone(), 2);
+            for i in 1..=5 {
+                queue.push(envelope(i));
+            }
+        }
+        let reopened = DurableQueue::open(path.clone(), 10);
+        assert_eq!(issues(&reopened.peek_batch(10)), vec![1, 2, 3, 4, 5]);
+        assert!(!spill_path(&path).exists());
+    }
+
+    #[tokio::test]
+    async fn refills_from_spill_still_flush_in_byte_bounded_batches() {
+        use super::super::exporter::{ExportError, Exporter};
+        use super::super::sender::{json_len, try_flush, FlushOutcome, MAX_BATCH_BYTES};
+
+        struct Recording(Mutex<Vec<Vec<TelemetryEnvelope>>>);
+        impl Exporter for Recording {
+            async fn emit_batch(&self, batch: &[TelemetryEnvelope]) -> Result<(), ExportError> {
+                self.0.lock().unwrap().push(batch.to_vec());
+                Ok(())
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let queue = DurableQueue::open(dir.path().join("q.jsonl"), 4);
+        // ~1.5 MiB each: a full 4-record head is ~6 MiB, over the 4 MiB budget.
+        for i in 1..=7 {
+            queue.push(envelope_with_repo(i, "x".repeat(1_500_000)));
+        }
+        assert_eq!(queue.len(), 7);
+        let exporter = Recording(Mutex::new(Vec::new()));
+        let status =
+            super::super::ExportStatus::started("host-test", "https://x.invalid", "https", 30);
+        while !queue.is_empty() {
+            assert!(matches!(
+                try_flush(&queue, &exporter, 100, &status).await,
+                FlushOutcome::Sent(_)
+            ));
+        }
+        let batches = exporter.0.into_inner().unwrap();
+        assert!(batches.len() > 2, "refilled head was split by bytes");
+        for batch in &batches {
+            assert!(json_len(batch) <= MAX_BATCH_BYTES, "batch over the byte budget");
+        }
+        let sent: Vec<u32> = batches.iter().flat_map(|b| issues(b.as_slice())).collect();
+        assert_eq!(sent, (1..=7).collect::<Vec<_>>());
+        assert_eq!(queue.dropped_total(), 0);
     }
 
     #[test]
@@ -633,10 +1217,7 @@ mod tests {
     fn fanout_offer_durable_propagates_sync_failures() {
         let dir = tempdir().unwrap();
         let ok = Arc::new(DurableQueue::open(dir.path().join("q.https.jsonl"), 10));
-        // A queue whose backing file cannot be persisted: capacity-1 queue
-        // backed by a path whose parent does not exist yet still accepts
-        // in-memory — so instead use a directory as the file path to force
-        // the persist to fail.
+        // A directory as the queue file path forces the persist to fail.
         let bad_path = dir.path().join("not-a-file");
         std::fs::create_dir_all(&bad_path).unwrap();
         let bad = Arc::new(DurableQueue::open(bad_path, 10));
