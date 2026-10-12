@@ -26,6 +26,8 @@ pub(super) struct Fake {
     pub(super) archived: Option<Result<bool, String>>,
     pub(super) archived_calls: usize,
     pub(super) rows: Vec<RestIssue>,
+    /// What the `loom:blocked-unnamed` listing returns (#10558).
+    pub(super) unnamed: Vec<RestIssue>,
     pub(super) list_fails: bool,
     pub(super) comments: HashMap<u32, Vec<extract::Comment>>,
     pub(super) states: HashMap<Key, RefState>,
@@ -64,6 +66,10 @@ impl StaleBlockedForge for Fake {
             return Err(anyhow!("HTTP 502"));
         }
         Ok(self.rows.clone())
+    }
+
+    fn list_unnamed(&mut self) -> Result<Vec<RestIssue>> {
+        Ok(self.unnamed.clone())
     }
 
     fn comments(&mut self, number: u32) -> Result<Vec<extract::Comment>> {
@@ -614,4 +620,22 @@ fn checklist_lines_are_never_also_read_as_prose() {
         }
         v => panic!("257: {v:?}"),
     }
+}
+
+#[test]
+fn a_body_record_with_a_reason_and_no_blocker_is_held_with_reason() {
+    let reasoned = crate::park_record::render_park(&[], Some("curator"), None, Some("waiting"));
+    let empty = crate::park_record::render_park(&[], Some("curator"), None, None);
+    let mut fake = Fake::default();
+    fake.rows.push(issue(1, &reasoned));
+    fake.rows.push(issue(2, &empty));
+    let (out, _) = run(&mut fake);
+    assert_eq!(
+        verdict_of(find(&out, 1)),
+        Verdict::HeldWithReason {
+            by: Some("curator".to_string()),
+            reason: "waiting".to_string(),
+        }
+    );
+    assert_eq!(verdict_of(find(&out, 2)), Verdict::Undocumented);
 }

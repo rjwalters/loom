@@ -158,12 +158,13 @@ impl Cloner for GitCloner {
         dest: &Path,
         timeout: Duration,
     ) -> Result<(), String> {
-        use crate::proc_exec::{run_bounded, Completion};
+        use crate::fleet_sync::git_spawn_log::run_logged;
+        use crate::proc_exec::Completion;
         // A clone on a nearly full volume aborts mid-pack (#10995).
         if let Some(why) = dest.parent().and_then(crate::fetch_headroom::skip_reason) {
             return Err(why.replace("git fetch", "git clone"));
         }
-        match run_bounded(clone_command(slug, url, dest), timeout) {
+        match run_logged("roster_clone", dest, clone_command(slug, url, dest), timeout) {
             Ok(Completion::Exited(out)) if out.status.success() => Ok(()),
             Ok(Completion::Exited(out)) => {
                 let err = String::from_utf8_lossy(&out.stderr);
@@ -197,7 +198,10 @@ pub const CLONE_CONFIG: &[&str] = &[
 #[must_use]
 pub fn clone_command(slug: &str, url: &str, dest: &Path) -> Command {
     let mut cmd = Command::new("git");
-    for pair in CLONE_CONFIG {
+    for pair in CLONE_CONFIG
+        .iter()
+        .chain(crate::fleet_sync::git_spawn_log::MEMORY_BOUND_CONFIG)
+    {
         cmd.arg("-c").arg(pair);
     }
     cmd.args(["clone", "--quiet", "--no-recurse-submodules", "--", url])

@@ -12,6 +12,13 @@ fn cand(idx: usize, n: u32, created: Option<&str>, labels: &[&str]) -> PriorityC
     super::super::ready_queue::key_of(idx, 0, &item(n, created, labels), false)
 }
 
+/// A `loom:main-red-fix` marker-bearing candidate; `repo_red` is whether its
+/// repo's `main` is verified red this tick.
+fn fix_cand(idx: usize, n: u32, created: Option<&str>, repo_red: bool) -> PriorityCandidate {
+    let fix = item(n, created, &[]).with_body(Some("<!-- loom:main-red-fix -->".into()));
+    super::super::ready_queue::key_of(idx, 0, &fix, repo_red)
+}
+
 fn numbers(c: &[PriorityCandidate]) -> Vec<(usize, u32)> {
     c.iter().map(|c| (c.workspace_idx, c.number)).collect()
 }
@@ -32,7 +39,7 @@ fn fixture() -> Vec<WorkItem> {
 #[test]
 fn in_workspace_order_is_level_then_oldest_then_number() {
     let mut items = fixture();
-    super::super::ready_queue::sort_lanes(&mut items);
+    super::super::ready_queue::sort_lanes(&mut items, false);
     let order: Vec<u32> = items.iter().map(|i| i.number).collect();
     // very-important; important by age (2 and 4 tie on age -> number); then
     // the unlabelled by age (8 and 9 tie -> number); the undated last.
@@ -44,8 +51,8 @@ fn in_workspace_order_is_independent_of_listing_order() {
     let mut a = fixture();
     let mut b = fixture();
     b.reverse();
-    super::super::ready_queue::sort_lanes(&mut a);
-    super::super::ready_queue::sort_lanes(&mut b);
+    super::super::ready_queue::sort_lanes(&mut a, false);
+    super::super::ready_queue::sort_lanes(&mut b, false);
     let na: Vec<u32> = a.iter().map(|i| i.number).collect();
     let nb: Vec<u32> = b.iter().map(|i| i.number).collect();
     assert_eq!(na, nb);
@@ -82,6 +89,62 @@ fn a_workspace_with_very_important_work_always_wins_the_draw() {
         let first = &log.unwrap().steps[0].draw;
         assert_eq!(first.pool, "very-important");
         assert_eq!(first.candidates.len(), 1);
+    }
+}
+
+/// #11547: a priority-100 workspace whose repo is verified red with a fix
+/// takes the first slot over a priority-0 workspace with very-important
+/// work, for every seed; on a green repo the same fixture keeps today's
+/// order (the very-important workspace first).
+#[test]
+fn a_red_main_fix_workspace_wins_the_draw_only_while_main_is_red() {
+    for seed in 0..200 {
+        let build = |red: bool| {
+            vec![
+                cand(0, 1, Some("2026-01-01T00:00:00Z"), &[VERY_IMPORTANT_LABEL]),
+                cand(1, 7, Some("2026-05-01T00:00:00Z"), &[]),
+                fix_cand(1, 9, Some("2026-09-01T00:00:00Z"), red),
+            ]
+        };
+        let (order, log) = draw_order(build(true), &[0, 100], seed);
+        assert_eq!(numbers(&order)[0], (1, 9), "seed {seed}");
+        let first = &log.unwrap().steps[0].draw;
+        assert_eq!(first.pool, "red-main-fix");
+        assert_eq!(first.candidates.len(), 1);
+
+        let (order, log) = draw_order(build(false), &[0, 100], seed);
+        assert_eq!(numbers(&order)[0], (0, 1), "seed {seed}");
+        assert_eq!(log.unwrap().steps[0].draw.pool, "very-important");
+        // On green the marker grants nothing: the fix keeps its age place.
+        let ws1: Vec<u32> = order
+            .iter()
+            .filter(|c| c.workspace_idx == 1)
+            .map(|c| c.number)
+            .collect();
+        assert_eq!(ws1, vec![7, 9]);
+    }
+}
+
+/// `in_workspace_cmp` and `candidate_cmp` agree on one workspace's
+/// candidates, red-main fix included (#11547).
+#[test]
+fn in_workspace_order_agrees_with_candidate_cmp() {
+    let mut cands: Vec<PriorityCandidate> = fixture()
+        .iter()
+        .map(|i| super::super::ready_queue::key_of(0, 0, i, true))
+        .collect();
+    cands.push(fix_cand(0, 40, Some("2026-09-01T00:00:00Z"), true));
+    cands.push(fix_cand(0, 41, Some("2026-08-01T00:00:00Z"), false));
+    for a in &cands {
+        for b in &cands {
+            assert_eq!(
+                in_workspace_cmp(a, b),
+                super::super::candidate_cmp(a, b),
+                "#{} vs #{}",
+                a.number,
+                b.number
+            );
+        }
     }
 }
 

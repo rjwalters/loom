@@ -116,6 +116,7 @@ pub mod exporter;
 pub mod fleet_state;
 pub mod lifecycle;
 pub mod llm_billing;
+pub mod loss_ledger;
 pub mod ops;
 #[cfg(feature = "otlp")]
 pub mod otlp;
@@ -734,6 +735,7 @@ pub fn global_export_queue_stats(
                         crate::telemetry::kinds::host_export::QueueStats {
                             depth: u64::try_from(queue.len()).unwrap_or(u64::MAX),
                             dropped_total: queue.dropped_total(),
+                            dropped_by_reason: queue.dropped_by_reason(),
                         },
                     )
                 })

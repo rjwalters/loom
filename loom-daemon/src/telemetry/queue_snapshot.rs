@@ -92,10 +92,11 @@ pub struct QueueSnapshotRow {
     pub halt_cause: Option<String>,
     /// The dispatch-plan fields (Issue #9288), flattened beside `rank`:
     /// `position`, `plan_state`, `keys`, `gate`, `in_slice`, `hot`,
-    /// `owning_shard`, `repo_cap`. The `keys` names are the three
-    /// `candidate_keys` (#11508): `level` (0 default, 1 `loom:important`,
-    /// 2 `loom:very-important`), `created_at`, `number` (this row's
-    /// `issue`).
+    /// `owning_shard`, `repo_cap`. The `keys` names are the four
+    /// `candidate_keys` (#11508, #11547): `main_red_fix` (bool, true only for
+    /// a verified red-main fix while its repo's `main` is red), `level`
+    /// (0 default, 1 `loom:important`, 2 `loom:very-important`),
+    /// `created_at`, `number` (this row's `issue`).
     #[serde(flatten, default)]
     pub plan: RowPlan,
 }

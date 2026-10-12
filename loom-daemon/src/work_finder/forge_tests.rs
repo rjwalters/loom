@@ -221,7 +221,7 @@ fn a_repo_with_more_than_a_page_of_ready_issues_yields_every_one() {
     // Single-workspace order (#11103): level, oldest, number — the oldest
     // first here too, whatever the listing order.
     let mut lanes = items.clone();
-    super::super::ready_queue::sort_lanes(&mut lanes);
+    super::super::ready_queue::sort_lanes(&mut lanes, false);
     assert_eq!(
         lanes.iter().map(|i| i.number).collect::<Vec<_>>(),
         (1..=250).collect::<Vec<_>>()

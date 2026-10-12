@@ -145,6 +145,8 @@ pub mod build_slot;
 pub mod calibrate;
 pub mod capability;
 pub mod capacity;
+/// The `loom:cargo-target-dir` guard: deny a cargo build into an unowned target dir (#11582).
+pub mod cargo_target_guard;
 pub mod ci_telemetry;
 pub mod claim_reconciliation;
 pub mod cmd_out;
@@ -296,6 +298,7 @@ pub mod preflight;
 pub mod premise_check;
 pub mod primary_checkout_reaper;
 pub mod priority_pick;
+pub mod private_control_gate;
 pub mod proc_exec;
 pub mod provenance;
 pub mod quarantine_reconciliation;

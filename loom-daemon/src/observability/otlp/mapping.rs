@@ -3,6 +3,7 @@
 //! this module is the field-by-field implementation plus its unit tests.
 
 mod auto_update;
+mod checkout_external_change;
 mod ci;
 mod fact_id;
 mod fleet_state;
@@ -15,6 +16,8 @@ mod pick_decision;
 mod resource;
 mod session_output;
 mod token_ranking;
+
+use metadata::visibility_str;
 
 use std::collections::BTreeMap;
 
@@ -76,13 +79,6 @@ pub(super) fn nanos(ts: DateTime<Utc>) -> u64 {
     ts.timestamp_nanos_opt()
         .and_then(|n| u64::try_from(n).ok())
         .unwrap_or(0)
-}
-
-fn visibility_str(visibility: RepoVisibility) -> &'static str {
-    match visibility {
-        RepoVisibility::Public => "public",
-        RepoVisibility::Private => "private",
-    }
 }
 
 fn result_str(result: SweepResult) -> &'static str {
@@ -591,6 +587,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         TelemetryRecord::AutoUpdateTick(_)
         | TelemetryRecord::TokenRankingRefresh(_)
         | TelemetryRecord::HostExport(_)
+        | TelemetryRecord::CheckoutExternalChange(_)
         | TelemetryRecord::PassSummary(_)
         | TelemetryRecord::PassVerdict(_)
         | TelemetryRecord::FleetState(_)
@@ -607,6 +604,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             let (event_name, severity, at, attributes, body) = auto_update::log_parts(r)
                 .or_else(|| token_ranking::log_parts(r))
                 .or_else(|| host_export::log_parts(r))
+                .or_else(|| checkout_external_change::log_parts(r))
                 .or_else(|| pass::log_parts(r))
                 .or_else(|| fleet_state::log_parts(r))
                 .or_else(|| pick_decision::log_parts(r))?;

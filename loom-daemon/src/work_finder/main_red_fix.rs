@@ -6,8 +6,10 @@
 //! other ready issue in that repo, whatever its priority, keeps the
 //! `WorkspaceHalted` disposition.
 //!
-//! It no longer sorts ahead (#11508 removed the red-main ordering key), but
-//! it is not a priority either: it keeps its bypass of the build back-off,
+//! While `main` is verified red it also leads the dispatch order (#11547:
+//! `candidate_cmp`'s leading key, first in its workspace and its workspace
+//! first in the draw). It is not a level: it keeps its bypass of the build
+//! back-off,
 //! the file-overlap gate and the repo-sharding slice
 //! ([`super::ordering::PriorityCandidate::main_red_fix`]), which a red `main`
 //! would otherwise deadlock.

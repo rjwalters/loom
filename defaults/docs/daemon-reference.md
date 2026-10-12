@@ -3038,35 +3038,45 @@ ordering (superseded by the weighted draw in [`priority-model.md`](priority-mode
 
 **Starvation stance:** since #11103 the cross-repo order is a weighted draw, not
 strict tiers: a default-priority repo is drawn less often than a tool repo, never
-starved. A repo with `loom:very-important` work next wins the draw outright.
+starved. A repo whose next candidate is a verified red-main fix wins the draw
+outright; failing that, a repo with `loom:very-important` work next does.
 Cross-repo dependency awareness stays a role judgment (label the blocker).
 
 **`tier:*` labels do not affect dispatch order.** `tier:goal-advancing` and its
-siblings are triage metadata; no daemon code reads them. Only the three keys
+siblings are triage metadata; no daemon code reads them. Only the four keys
 below order the queue.
 
-### Dispatch order and the red-main-fix lane (#11103, #11508)
+### Dispatch order and the red-main-fix lane (#11103, #11508, #11547)
 
-`candidate_cmp` orders **issues** by three keys ([PR planning](pr-planning.md) is separate):
+`candidate_cmp` orders **issues** by four keys, `main_red_fix → level →
+created_at → number` ([PR planning](pr-planning.md) is separate):
 
+0. **Verified red-main fix** first (`main_red_fix`, #11547): true only for a
+   `<!-- loom:main-red-fix -->` candidate whose repo's `main` is verified red
+   this tick. On a green `main` it is `false` for every candidate.
 1. **Level**, highest first: `loom:very-important`, then `loom:important`, then
    none. The level comes only from those two labels (`Level::of`).
 2. `createdAt`, oldest first (a dated issue before an undated one).
 3. Issue number ascending.
 
 These keys rank the published ready-queue rows (`rank`, `plan.keys`); dispatch
-follows the workspace draw, and the single-workspace tick uses the same three
-keys. #11508 removed the legacy keys: the star (`loom:operator-priority`), its
+follows the workspace draw, and the single-workspace tick uses the same four
+keys (passed the repo's real verified-red state). The workspace draw's pool is
+three-tier: workspaces whose next candidate is a verified red-main fix if any
+(`pool: "red-main-fix"`), else those with very-important work
+(`"very-important"`), else all (`"all"`). #11508 removed the legacy keys: the star (`loom:operator-priority`), its
 levels and inherited levels, the starred-at time and its restart store
 (`starred-<sha16>.json`, no longer read or written; `LOOM_STARRED_AT_PERSIST` is
-ignored), the red-main-fix ordering boost, and `workspace_priority` as a rank
-key (it weights the workspace draw instead). The ready-queue row field
+ignored), and `workspace_priority` as a rank key (it weights the workspace
+draw instead); #11547 restored the red-main-fix key above, live only while
+`main` is verified red. The ready-queue row field
 `operator_priority` is always `false`, kept for wire compatibility;
 `main_red_fix` still marks a verified red-main fix.
 
-**The red-main-fix lane is not a priority.** A candidate carrying
-`<!-- loom:main-red-fix -->` whose repo's `main` is verified red keeps three
-gate bypasses, because while `main` is red nothing merges and holding the fix
+**The red-main-fix lane reorders; it is not a level.** A candidate carrying
+`<!-- loom:main-red-fix -->` whose repo's `main` is verified red leads the
+dispatch order (every slot spent elsewhere while `main` is red is wasted) and
+keeps three gate bypasses, no more, because while `main` is red nothing merges and holding the fix
 would deadlock: the build back-off, the file-overlap gate (it still occupies)
 and the repo-sharding slice (kept in its draw position). On a green `main`
 the marker grants nothing.
@@ -8324,9 +8334,9 @@ pass, on the captain.
 > line against the fleet's repo list.
 >
 > **A dead captain means no intake anywhere.** Unlabelled issues wait until it
-> is back. Today the only signal is `intake-reconcile` missing from the
-> captain's `host.health.armed_singleton_jobs`; there is no per-repo
-> heartbeat or age gauge yet.
+> is back. The signals are `intake-reconcile` missing from the captain's
+> `host.health.armed_singleton_jobs` and the completed-pass heartbeat (below)
+> going stale in the singleton-output watchdog.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -8381,6 +8391,42 @@ captain that dispatches nothing still runs it:
 - **Rate-limit breaker**: no pass while it is open, and the pass stops between
   repos if it opens. A failed or shed listing is not reported to it.
 
+**The completed-pass heartbeat (#10924).** A healthy pass that labels nothing
+emits no forge output, so a watcher could not tell a quiet fleet from a
+stopped reconciler. After every pass the captain folds the outcome into
+`<root>/.loom/state/intake-reconcile/last-pass.json` on the captain
+(`intake_reconcile::singleton::PassHeartbeat`): the record carries the pass's
+counts and outcome, and `last_completed_at` — the timestamp the watchdog ages —
+advances **only** when the pass completed its intended scan (every registered
+repo walked, every listing read). A pass that was stopped early by the
+rate-limit breaker, or shed or failed a listing, is recorded but keeps the
+previous stamp, so it can never masquerade as successful output. Label
+outcomes (a denied write scope, races, reverts, cap leftovers) do not block
+the stamp: the pass retries them next pass by design. A captain with no
+registered repos returns before any scan, so its stamp ages the same way: an
+empty roster surfaces as stale, not as a quiet healthy fleet.
+
+The heartbeat is the `fleet_outputs::SINGLETON_OUTPUTS` row for job
+`intake-reconcile` (record kind `intake-reconcile.pass`, gated on
+`fleet.intakeReconcile.singleton`): a stamp older than twice the *default*
+pass cadence — the row is built from the built-in 300 s constant, so its
+deadline is fixed at 600 s; overriding `LOOM_INTAKE_RECONCILE_INTERVAL_SECS`
+does not move it, and an interval above 600 s would trip the row on every
+quiet gap once the source is wired — or no stamp at all, is a Critical
+`output-missing:` condition once the in-daemon `fleet_alert` output source is
+wired (follow-up slice). The file is local to
+the captain, like the other on-host health records; the cross-host detector
+for a captain that is down entirely is `intake-reconcile` missing from its
+`host.health.armed_singleton_jobs`.
+
+**Rollout signal.** After deploying, confirm on the captain that
+`last_completed_at` in the heartbeat file advances on every pass even when
+nothing was labelled:
+
+```bash
+cat .loom/state/intake-reconcile/last-pass.json   # last_completed_at is fresh
+```
+
 In the forge-call ledger the pass is `intake.list_open`, `intake.recheck`,
 `intake.add_triage` and `intake.remove_triage`; with the singleton on, only
 the captain books them.
@@ -8403,9 +8449,10 @@ label: the write is idempotent and each is preceded by a re-read.
    host that does not see the key runs intake per host as soon as its own
    variable is removed.
 4. Confirm: the captain lists `intake-reconcile` in
-   `host.health.armed_singleton_jobs`, logs the covered slugs you expect, and
+   `host.health.armed_singleton_jobs`, logs the covered slugs you expect,
    is the only host whose `loom-daemon forge calls --by caller` books
-   `intake.*` rows.
+   `intake.*` rows, and its `.loom/state/intake-reconcile/last-pass.json`
+   shows a fresh `last_completed_at` on every pass (#10924).
 5. Remove `LOOM_INTAKE_RECONCILE=0` from the other hosts. They stay off because
    the key, not the environment, now stands them down. A host still on an older
    daemon must keep the variable until it is upgraded.

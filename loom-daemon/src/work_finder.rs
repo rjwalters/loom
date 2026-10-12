@@ -1043,7 +1043,7 @@ pub fn tick_with_lanes(
 ) -> Result<TickReport> {
     let mut ready = source.list_ready_issues()?;
     // #10118: unpromoted red-main fixes stay only while `main` is red.
-    main_red_fix::evaluate(lane, &mut ready, dispatcher);
+    let red = main_red_fix::evaluate(lane, &mut ready, dispatcher);
     let mut report = TickReport {
         seen: ready.len(),
         // Record the brake's engagement even on a tick that defers nothing, so a
@@ -1055,7 +1055,8 @@ pub fn tick_with_lanes(
     report.note_listing(0, source.listing_complete());
     // #11509: one `loom:very-important` per workspace; the rest rank important.
     vi_cap::enforce(0, source, &mut ready, &mut report);
-    ready_queue::sort_lanes(&mut ready);
+    // #11547: a verified red-main fix leads the order while `main` is red.
+    ready_queue::sort_lanes(&mut ready, red);
     let (max_concurrent, _) = OverflowSlot::open(dispatcher.overflow_in_flight(), terms);
 
     // Reactive backstop: a red `main` halts all new dispatch this tick — except
@@ -3129,7 +3130,8 @@ pub fn spawn_multi_work_finder_task(
                 breaker_suppressed,
             );
             // #11191: a repo whose disk charge does not fit is held, named.
-            let halt_causes = halt_cause::with_disk_holds(halt_causes, disk_budget.as_ref());
+            // #11564: the result is recorded with its start for `fleet.state`.
+            let halt_causes = halt_cause::publish(halt_causes, disk_budget.as_ref(), &roots);
             let disk_note = crate::disk_admission::note(disk_budget.as_ref());
             let halted: Vec<bool> = halt_causes.iter().map(Option::is_some).collect();
             let preflight_held_count = preflight_held.iter().filter(|&&h| h).count();

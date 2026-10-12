@@ -161,6 +161,9 @@ pub struct TelemetryKindMeta {
 /// `auto_update.tick` (#10414).
 pub mod auto_update_tick;
 
+/// `checkout.external_change` (#11566) — a managed checkout moved by non-Loom git.
+pub mod checkout_external_change;
+
 /// `host.export` (#11124).
 pub mod host_export;
 
@@ -425,9 +428,16 @@ macro_rules! telemetry_kind_table {
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             /// This host's export view (Issue #11124, R2 of #10196): active
-            /// exporters, queue depth, cumulative `dropped_total` per exporter
-            /// and the last successful flush. OTLP-only. See [`host_export`].
+            /// exporters, queue depth, the durable by-reason loss counts
+            /// (`dropped_total`/`dropped_by_reason`, #11527) per exporter and
+            /// the last successful flush. OTLP-only. See [`host_export`].
             HostExport = "host.export" => $crate::telemetry::kinds::host_export::HostExportRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// A managed checkout's history was moved by something other than
+            /// Loom (Issue #11566): the reflog entry, from/to sha and the commits
+            /// it made unreachable. OTLP-only. See [`checkout_external_change`].
+            CheckoutExternalChange = "checkout.external_change" => $crate::telemetry::kinds::checkout_external_change::CheckoutExternalChangeRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             // APPEND NEW KINDS ABOVE THIS LINE (one row; `gate:` stays
