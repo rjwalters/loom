@@ -102,12 +102,13 @@ for it, #4966):
 > than looping forever — see Pass 0b for the bound.
 
 ```bash
+# Level, then oldest first (#11103)
 gh issue list \
   --label="loom:curated" \
   --state=open \
   --limit=500 \
-  --json number,title,body,labels,comments \
-  --jq '.[] | select([.labels[].name] | any(IN("loom:evaluating","loom:operator-only","loom:blocked","loom:issue","loom:building","loom:needs-revision")) | not) |
+  --json number,title,body,labels,comments,createdAt \
+  --jq 'sort_by([([.labels[].name] | if index("loom:very-important") then 0 elif index("loom:important") then 1 else 2 end), .createdAt]) | .[] | select([.labels[].name] | any(IN("loom:evaluating","loom:operator-only","loom:blocked","loom:issue","loom:building","loom:needs-revision")) | not) |
   "#\(.number) \(.title)"'
 ```
 
@@ -131,8 +132,8 @@ gh issue list \
   --label="loom:$P" \
   --state=open \
   --limit=500 \
-  --json number,title,body,labels,comments \
-  --jq '.[] | select([.labels[].name] | any(IN("loom:evaluating","loom:operator-only","loom:blocked","loom:issue","loom:building","loom:needs-revision")) | not) |
+  --json number,title,body,labels,comments,createdAt \
+  --jq 'sort_by([([.labels[].name] | if index("loom:very-important") then 0 elif index("loom:important") then 1 else 2 end), .createdAt]) | .[] | select([.labels[].name] | any(IN("loom:evaluating","loom:operator-only","loom:blocked","loom:issue","loom:building","loom:needs-revision")) | not) |
   "#\(.number) \(.title) ['"$P"']"'
 done
 ```
@@ -146,14 +147,13 @@ If found, **read and follow instructions in `.claude/commands/loom/champion-issu
 If no individual proposals need promotion, check for epic proposals:
 
 ```bash
-# Epic proposals, highest priority level first (#9244, #10307)
-# level list: keep in sync with operator_levels.rs LEVELS until #10311
+# Epic proposals, highest priority level first (#11103)
 gh issue list \
   --label="loom:epic" \
   --state=open \
   --limit=500 \
   --json number,title,body,labels,comments \
-  --jq 'sort_by([.labels[].name] | if any(test("high-priority")) then 0 elif index("loom:operator-priority") then 1 else 2 end) | .[] | "#\(.number) \(.title) [epic]"'
+  --jq 'sort_by([.labels[].name] | if index("loom:very-important") then 0 elif index("loom:important") then 1 else 2 end) | .[] | "#\(.number) \(.title) [epic]"'
 ```
 
 If found, **read and follow instructions in `.claude/commands/loom/champion-epic.md`**. Epics have their own evaluation criteria focused on structure and phase decomposition.

@@ -34,42 +34,31 @@ pass was rejected because `pr-queue` does not sort held PRs last. Old held
 rows would fill the cap on every pass, and newer mergeable PRs behind them
 would never be reached.
 
-## 2. Tier caps are configurable, and the Tier 3 gate counts promoted work only
+## 2. The slice knobs (the tier caps are retired)
 
 | Env var | Default | Governs |
 |---|---|---|
 | `LOOM_CHAMPION_PR_SLICE` | 10 | PR rows visited before the pass pauses for promotion |
 | `LOOM_CHAMPION_PROMOTION_SLICE` | 3 | Fresh promotion verdicts per pause while PR rows wait |
-| `LOOM_CHAMPION_TIER2_CAP` | 2 | Tier 2 (`tier:goal-supporting`) promotions per pass |
-| `LOOM_CHAMPION_TIER3_CAP` | 1 | Tier 3 (`tier:maintenance`) promotions per pass |
-| `LOOM_CHAMPION_TIER3_BACKLOG_CAP` | 5 | Tier 3 promotes only while fewer promoted Tier 3 issues are open |
 | `LOOM_MAX_UNREVISED_EVALUATIONS` | 2 | Revision rounds before the bound (existing knob, #4967) |
 
-A value that is empty or not a non-negative integer falls back to the default.
-`0` is honoured, so `LOOM_CHAMPION_TIER3_CAP=0` stops Tier 3 promotion.
+An unset or empty value falls back to the default.
 
-**Why the defaults stay where they were.** The evidence did not point at the
-numbers. It pointed at what the Tier 3 gate counted. The gate used to count
-every open `tier:maintenance` issue that was not held. Most of those were
-proposals still waiting for promotion: Hermit proposals arrive already
-labelled, and curated issues carry the label too. Measured on 2026-10-07:
-
-| Repository | Counted by the old gate | Promoted (`loom:issue` / `loom:building`) | Curated issues held by a capacity deferral |
-|---|---|---|---|
-| rjwalters/loom | 19 | 2 | 9 |
-| 2AMLogic/2am | 24 | 6 | 19 |
-| 2AMLogic/loom-ui | 8 | 0 | 0 |
-
-The gate pinned itself, the same failure as #7613: waiting Tier 3 proposals
-counted against the cap, which blocked every Tier 3 proposal. The occupant
-set is now open, unheld `tier:maintenance` issues that carry `loom:issue` or
-`loom:building`. That is the backlog the cap was written to bound. With the
-same default of 5, rjwalters/loom and loom-ui promote Tier 3 again and 2am
-stays gated by its six real occupants. The 2 and 1 per-pass caps were not
-binding in that data, so they are unchanged.
+**The tier caps were retired (#11512).** #10753 made three caps on
+`tier:*` labels configurable: Tier 2 and Tier 3 promotions per pass, and a
+Tier 3 backlog cap that counted promoted, unheld Tier 3 issues
+(the earlier count of every open one pinned itself: 19 counted against 2
+promoted in rjwalters/loom on 2026-10-07). #11103 retired the `tier:*`
+labels with no mapping, so Champion now promotes every passing proposal in
+priority order (`loom:very-important`, then `loom:important`, then the rest,
+oldest first; `champion-issue-promo.md` → "Promotion Order"), and the Step 3c
+capacity deferral and `classify-capacity-defer.sh` went with the caps. The
+`tier2Cap`, `tier3Cap` and `tier3BacklogCap` hyperparameter keys and their
+`LOOM_CHAMPION_TIER*` env vars are still accepted, so a config carrying them
+starts, but nothing reads them.
 
 **The slice defaults.** 10 PR rows takes roughly 10 minutes of a 30-minute
-session, which leaves room for promotion and the rest of the PR pass. Starred
+session, which leaves room for promotion and the rest of the PR pass. Priority
 and interactive PRs lead the queue, so they still go first. 3 fresh verdicts
 per pause bounds the merge delay to a few minutes. That is still well above
 promotion demand: 683 curated issues over five days across the fleet is about
@@ -84,8 +73,7 @@ environment. See "Changing daemon environment variables" and "Env keys carried
 forward across a re-render" in `daemon-reference.md`. For a hand-run
 `/loom:champion`, export the value in that shell. The knobs are
 keys of the `champion` group of the `hyperparameters` config block
-(`prSlice`, `promotionSlice`, `tier2Cap`, `tier3Cap`, `tier3BacklogCap`;
-defaults 10, 3, 2, 1, 5), so the fleet store's machine tier
+(`prSlice`, `promotionSlice`; defaults 10, 3), so the fleet store's machine tier
 (`fleet/defaults.json`) can carry them and they enter the run digest
 (`hyperparameters.md`). Precedence is env var > `LOOM_HYPERPARAMS` vector >
 config block > default. Follow-on work: the daemon does not yet export the

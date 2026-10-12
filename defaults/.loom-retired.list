@@ -105,3 +105,8 @@ scripts/tests/test-inbox-mail.sh
 roles/concierge.md
 roles/concierge.json
 commands/loom/concierge.md
+
+# #11512: Champion's tier-capacity deferral (Step 3c) was retired with the
+# tier:* labels and the per-tier promotion caps (#11103).
+scripts/classify-capacity-defer.sh
+scripts/tests/test-classify-capacity-defer.sh
