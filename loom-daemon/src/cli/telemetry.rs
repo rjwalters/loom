@@ -36,6 +36,8 @@ mod record_rework;
 mod telemetry_export;
 #[path = "telemetry_fixture.rs"]
 mod telemetry_fixture;
+#[path = "telemetry_join.rs"]
+mod telemetry_join;
 #[path = "telemetry_live.rs"]
 mod telemetry_live;
 #[path = "telemetry_overhead.rs"]
@@ -55,6 +57,11 @@ pub(crate) enum TelemetryCommand {
     TelemetryOverhead(telemetry_overhead::OverheadArgs),
     /// Send a bounded JSONL fixture to an explicit OTLP Collector endpoint.
     TelemetryExport(telemetry_export::TelemetryExportArgs),
+    /// Provision this host's SigNoz identity and prove a probe lands under
+    /// it (Issue #11528): fetch the per-host token, write the 0600 headers
+    /// file, send one `host.export` probe, and read it back requiring
+    /// `host.id == harness.ingest.principal == <host>`.
+    TelemetryJoin(telemetry_join::JoinArgs),
     /// Print fleet state at an instant from SigNoz, as a daemon then could have known it.
     TelemetryReplay(telemetry_replay::ReplayArgs),
     /// Report transport capabilities of this installed binary without reading configuration.
@@ -189,6 +196,7 @@ impl TelemetryCommand {
             TelemetryCommand::TelemetryFixture(args) => args.run(),
             TelemetryCommand::TelemetryOverhead(args) => args.run(),
             TelemetryCommand::TelemetryExport(args) => args.run().await,
+            TelemetryCommand::TelemetryJoin(args) => args.run().await,
             TelemetryCommand::TelemetryReplay(args) => args.run(),
             TelemetryCommand::TelemetryCapabilities { require_otlp } => {
                 println!(

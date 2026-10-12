@@ -163,6 +163,27 @@ impl OtlpExporter {
     }
 }
 
+/// The HTTP status a transport error names when the receiver answered with a
+/// refusal — `transport.rs`'s failure wording is `OTLP HTTP <status> …` — for
+/// callers (like `telemetry_join`, #11528) that must treat a credential
+/// refusal as terminal rather than retryable. `None` for pure transport
+/// failures and every other error shape.
+#[must_use]
+pub fn rejected_status(error: &ExportError) -> Option<u16> {
+    let ExportError::Transport(message) = error else {
+        return None;
+    };
+    let rest = message.strip_prefix("OTLP HTTP ")?;
+    let digits: &str = rest
+        .split(|c: char| !c.is_ascii_digit())
+        .next()
+        .unwrap_or_default();
+    if digits.len() != 3 {
+        return None;
+    }
+    digits.parse().ok()
+}
+
 impl Exporter for OtlpExporter {
     async fn emit_batch(&self, envelopes: &[TelemetryEnvelope]) -> Result<(), ExportError> {
         match self.emit_batch_outcome(envelopes).await.error {

@@ -328,6 +328,20 @@ list with a single bare kind — drops it along with any per-entry `endpoint`.
 `loom-daemon telemetry-export` (the one-shot fixture replay) does not read
 it.
 
+**Provisioning and proving a host: `loom-daemon telemetry-join --host <roster-id>`
+(#11528).** Resolves this host's id (`fleet.hostId` / `$LOOM_HOST_ID`) and exits
+non-zero *before any fetch, write or send* if it differs from `--host`. It then
+fetches the per-host Access token (`--credential-source ssm://<param>`, default
+`ssm:///2am/cloudflare/otlp-host/<host>`; or `age-file:<path>` / `file:<path>`),
+writes `~/.config/loom/otlp-headers` mode 0600 (atomically replacing any looser
+file; the `headers_file` parser must accept it), sends one `host.export` probe to
+`--endpoint` (default `https://otlp-cf.2amlogic.com`), and polls the
+telemetry-reader (`--reader-url`) until the row shows
+`host.id == harness.ingest.principal == <roster-id>` (`--timeout`, default 60 s).
+Failures exit non-zero with a distinct reason: credential fetch, `OTLP HTTP 401/403`,
+identity mismatch, probe never arrived, reader unavailable. The token is never
+printed. Needs the `otlp` feature. `--probe-sql` overrides the read-back query if
+the store keeps the principal elsewhere.
 
 See [OTLP transport and artifact verification](otlp-transport.md) for response
 classification, per-signal counters, retry/drop policy and the real Collector
