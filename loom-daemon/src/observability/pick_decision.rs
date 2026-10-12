@@ -1,6 +1,6 @@
 //! `pick.decision` emission (Issue #10212): per role tick and per work-finder
 //! tick, the ranked candidates, what was acted on, and why the rest were
-//! skipped. The payload and its caps live in
+//! skipped. The payload and its chunk split live in
 //! [`crate::telemetry::kinds::pick_decision`].
 //!
 //! **No forge calls are added.** The work-finder side reads the
@@ -33,9 +33,9 @@ use super::pick_journal::{
 use crate::forge_listing::RestIssue;
 use crate::role_runner::RoleTickOutcome;
 use crate::telemetry::kinds::pick_decision::{
-    source, PickAction, PickCandidate, PickDecisionRecord, PickDraw, PickDrawCandidate,
-    PickSkipReason, PickSortKey, PickTick, PickVerdict, PickViDemotion, PickWorkspaceDraw,
-    WORK_FINDER_ROLE,
+    source, split_into_chunks, PickAction, PickCandidate, PickDecisionRecord, PickDraw,
+    PickDrawCandidate, PickSkipReason, PickSortKey, PickTick, PickVerdict, PickViDemotion,
+    PickWorkspaceDraw, CHUNK_BYTES, WORK_FINDER_ROLE,
 };
 use crate::telemetry::{RoleTickResult, TelemetryRecord};
 use crate::types::{QueueDisposition, WorkFinderTickSummary};
@@ -113,7 +113,11 @@ fn repo_label(root: &Path) -> String {
 
 fn emit(record: PickDecisionRecord) {
     if let Some(sink) = super::ops::global_ops_sink() {
-        sink.emit_record(TelemetryRecord::PickDecision(record));
+        // A record over the byte budget is split, never truncated (#11567):
+        // the chunks share `tick_id` and their union is the original.
+        for chunk in split_into_chunks(record, CHUNK_BYTES) {
+            sink.emit_record(TelemetryRecord::PickDecision(chunk));
+        }
     }
 }
 
