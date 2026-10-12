@@ -126,8 +126,9 @@ pub struct BeforeSync {
     /// The release resolution it made, reused so the run installs the
     /// release that was checked (and `gh` is asked once).
     pub resolution: Option<Resolution>,
-    /// The operator saw the warning and continued: do not ask again.
-    pub confirmed: bool,
+    /// The version the operator saw the warning for and continued with: the
+    /// post-sync check skips only when the real target is this exact version.
+    pub confirmed: Option<String>,
 }
 
 /// The fleet floor check, before the checkout sync, for the runs it can
@@ -166,7 +167,7 @@ pub fn floor_before_sync(a: &Args, repo_root: &Path, installed: &Installed) -> B
         let refused_later = (!r.ok && a.tag.is_some()) || a.fetch_mode == FetchMode::Force;
         done.resolution = Some(r);
         if let Some((version, how)) = release {
-            done.confirmed = check(&version, &how);
+            done.confirmed = check(&version, &how).then_some(version);
             return done;
         }
         // No release to install: a pinned tag or `--fetch` refuses after
@@ -185,7 +186,7 @@ pub fn floor_before_sync(a: &Args, repo_root: &Path, installed: &Installed) -> B
     let version = std::fs::read_to_string(repo_root.join("VERSION"))
         .map(|t| t.chars().filter(|c| !c.is_whitespace()).collect::<String>())
         .unwrap_or_default();
-    done.confirmed = check(&version, &format!("a source build of {head}"));
+    done.confirmed = check(&version, &format!("a source build of {head}")).then_some(version);
     done
 }
 

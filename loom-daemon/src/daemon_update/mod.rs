@@ -267,8 +267,9 @@ struct Stage {
     drain: bool,
     drain_defaulted: bool,
     drain_poll_secs: String,
-    /// The pre-sync floor check warned and the operator continued (#11064).
-    floor_confirmed: bool,
+    /// The version the pre-sync floor check warned about and the operator
+    /// continued with (#11064). A sync that moves VERSION invalidates it.
+    floor_confirmed: Option<String>,
 }
 
 impl Stage {
@@ -729,7 +730,7 @@ fn stage_two(a: &Args, s: Stage) -> ! {
     let synced = s.sync.ff_synced.then(|| {
         format!("the source checkout was fast-forwarded to origin/{}", s.sync.default_branch)
     });
-    if !s.floor_confirmed {
+    if s.floor_confirmed.as_deref() != Some(target_version) {
         floor_guard::enforce(
             &s.roots.repo_root,
             floor_guard::Target {

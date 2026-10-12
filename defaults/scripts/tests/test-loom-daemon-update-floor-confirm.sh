@@ -23,6 +23,10 @@
 #   L  --to-floor, installed daemon's version unreadable -> refused before
 #      any release lookup, sync or build (#11064)
 #   M  --to-floor, no installed daemon -> still plans the floor (bootstrap)
+#   O  confirmed at the pre-sync prompt, then the sync moves VERSION -> the
+#      post-sync guard asks again, naming the new version (#11064)
+#   P  confirmed at the pre-sync prompt, the sync leaves VERSION alone -> one
+#      prompt only
 #   N  the sync moves a source target off the floor -> the post-sync refusal
 #      names the fast-forward instead of "Nothing was changed"
 #
@@ -158,7 +162,7 @@ answer = sys.argv[1]
 pid, fd = pty.fork()
 if pid == 0:
     os.execvp(sys.argv[2], sys.argv[2:])
-out, sent, deadline = b"", False, time.time() + 60
+out, sent, deadline = b"", 0, time.time() + 60
 while True:
     if time.time() > deadline:
         os.kill(pid, 9)
@@ -175,9 +179,10 @@ while True:
     if not data:
         break
     out += data
-    if not sent and answer != "-" and b"[y/N]" in out:
+    # Answer every prompt (a run may legitimately ask twice, #11064).
+    if answer != "-" and out.count(b"[y/N]") > sent:
         os.write(fd, (answer + "\n").encode())
-        sent = True
+        sent += 1
 _, status = os.waitpid(pid, 0)
 sys.stdout.write(out.decode(errors="replace"))
 sys.exit(os.WEXITSTATUS(status) if os.WIFEXITED(status) else 125)
@@ -376,6 +381,34 @@ check "names what changed instead of 'Nothing was changed'" "$outN" \
     has "The installed daemon was not changed, but the source checkout was fast-forwarded to origin/main." "$outN"
 check "never claims nothing changed" "$outN" lacks "Nothing was changed" "$outN"
 check "the installed daemon is untouched" "$outN" eq "0.19.950" "$(installed_version "$WN")"
+
+if [[ "$HAVE_PTY" == "1" ]]; then
+    echo "O. a confirmed version is not a blanket pass: the sync moved VERSION"
+    WO="$BASE_WORKDIR/o"
+    fixture "$WO" fleet
+    behind_origin "$WO" "$BASE_WORKDIR/o-origin.git" "0.19.960"
+    outO="$(in_fixture "$WO" python3 "$PTY_DRIVER" y bash "$UPDATE_SCRIPT" --no-fetch --no-restart 2>&1)"
+    rcO=$?
+    check "the sync ran" "$outO" has "Fast-forwarded" "$outO"
+    check "asked twice" "$outO" eq "2" "$(printf '%s' "$outO" | grep -o '\[y/N\]' | wc -l | tr -d ' ')"
+    check "the first warning names the pre-sync version" "$outO" has "0.19.953" "$outO"
+    check "the second warning names the real, synced version" "$outO" has "0.19.960" "$outO"
+    check "exits 0 once both are confirmed" "$outO" eq "0" "$rcO"
+    check "installed the synced build" "$outO" eq "0.19.960" "$(installed_version "$WO")"
+
+    echo "P. the sync leaves VERSION alone: the confirmation stands, no second prompt"
+    WP="$BASE_WORKDIR/p"
+    fixture "$WP" fleet
+    behind_origin "$WP" "$BASE_WORKDIR/p-origin.git"
+    outP="$(in_fixture "$WP" python3 "$PTY_DRIVER" y bash "$UPDATE_SCRIPT" --no-fetch --no-restart 2>&1)"
+    rcP=$?
+    check "the sync ran" "$outP" has "Fast-forwarded" "$outP"
+    check "asked once" "$outP" eq "1" "$(printf '%s' "$outP" | grep -o '\[y/N\]' | wc -l | tr -d ' ')"
+    check "exits 0" "$outP" eq "0" "$rcP"
+    check "installed the 0.19.953 build" "$outP" eq "0.19.953" "$(installed_version "$WP")"
+else
+    echo -e "  ${YELLOW}SKIP${NC}: O, P need python3 for a pseudo-terminal"
+fi
 
 # no_gh <dir> -- a `gh` that records any call, to prove nothing was fetched.
 no_gh() {
