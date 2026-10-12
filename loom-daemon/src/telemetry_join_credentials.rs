@@ -1,6 +1,7 @@
 //! Credential shapes for telemetry-join. Values stay in memory or owner-only
 //! files and never implement revealing Debug/Display.
 use super::{JoinError, DEFAULT_SSM_PARAM};
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 const CREDENTIAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
