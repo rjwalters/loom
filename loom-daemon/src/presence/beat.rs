@@ -137,6 +137,41 @@ fn save_state(root: &Path, session_id: &str, state: &SessionState) -> Result<()>
     std::fs::rename(&tmp, &path).context("replacing presence state")
 }
 
+/// An exclusive advisory lock over every state file under
+/// `<root>/.loom/presence/`, held across each load-modify-save so concurrent
+/// hook processes (several sessions, or a beat racing `lease ensure`) cannot
+/// lose a `last_emit_at` or `driving` update. One host-local lock for all
+/// sessions: `beat` and `sweep_outcome` touch the `unknown` session's file as
+/// well as their own, and every critical section is a few small file writes.
+/// Released when dropped (the descriptor closes). Same pattern as
+/// `fleet_captain::ShellArmLock`.
+struct StateLock {
+    _file: std::fs::File,
+}
+
+impl StateLock {
+    fn acquire(root: &Path) -> Result<Self> {
+        let dir = root.join(".loom/presence");
+        std::fs::create_dir_all(&dir).context("creating presence state dir")?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join(".lock"))
+            .context("opening presence state lock")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            // SAFETY: `flock` on a descriptor we own for the duration of the
+            // call; no memory is shared with the kernel.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+                return Err(std::io::Error::last_os_error()).context("locking presence state");
+            }
+        }
+        Ok(Self { _file: file })
+    }
+}
+
 /// What a beat did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BeatOutcome {
@@ -153,6 +188,7 @@ pub enum BeatOutcome {
 /// # Errors
 /// When the state or journal cannot be written.
 pub fn beat(ctx: &Ctx, event: &str) -> Result<BeatOutcome> {
+    let _lock = StateLock::acquire(&ctx.root)?;
     let mut state = load_state(&ctx.root, &ctx.session_id);
     // A lease taken where the session id was unknowable is filed under
     // `unknown`; it belongs to whichever session beats on this host.
@@ -225,6 +261,7 @@ pub fn sweep_started(ctx: &Ctx, repo: &str, kind: &str, number: u32, sweep_id: &
         story_points: None,
     };
     journal::append(&ctx.journal, &envelope(ctx, TelemetryRecord::SweepStarted(record)))?;
+    let _lock = StateLock::acquire(&ctx.root)?;
     let mut state = load_state(&ctx.root, &ctx.session_id);
     state.driving.retain(|i| i.sweep_id != sweep_id);
     state.driving.push(StateItem {
@@ -241,6 +278,11 @@ pub fn sweep_started(ctx: &Ctx, repo: &str, kind: &str, number: u32, sweep_id: &
 /// and drop the lease from the `driving` set. The duration comes from the
 /// recorded start when this session saw it.
 ///
+/// A lease started where the session id was unknowable is filed under the
+/// `unknown` session, and [`beat`] reports it for every session on the host.
+/// So the lease is also dropped from (and its start looked up in) `unknown`'s
+/// state, or it would be reported as driven forever.
+///
 /// # Errors
 /// When the state or journal cannot be written, or the record cannot be built.
 pub fn sweep_outcome(
@@ -251,10 +293,14 @@ pub fn sweep_outcome(
     result: SweepResult,
     pr_number: Option<u32>,
 ) -> Result<()> {
+    let _lock = StateLock::acquire(&ctx.root)?;
     let mut state = load_state(&ctx.root, &ctx.session_id);
+    let mut unattributed =
+        (ctx.session_id != UNKNOWN_SESSION).then(|| load_state(&ctx.root, UNKNOWN_SESSION));
     let started = state
         .driving
         .iter()
+        .chain(unattributed.iter().flat_map(|u| u.driving.iter()))
         .find(|i| i.sweep_id == sweep_id)
         .cloned();
     let repo = repo
@@ -285,6 +331,13 @@ pub fn sweep_outcome(
     let record: crate::telemetry::SweepOutcomeRecord =
         serde_json::from_value(value).context("building sweep.outcome record")?;
     journal::append(&ctx.journal, &envelope(ctx, TelemetryRecord::SweepOutcome(record)))?;
+    if let Some(u) = unattributed.as_mut() {
+        let before = u.driving.len();
+        u.driving.retain(|i| i.sweep_id != sweep_id);
+        if u.driving.len() != before {
+            save_state(&ctx.root, UNKNOWN_SESSION, u)?;
+        }
+    }
     state.driving.retain(|i| i.sweep_id != sweep_id);
     save_state(&ctx.root, &ctx.session_id, &state)
 }

@@ -17,5 +17,9 @@ _lib="$(cd "$(dirname "${BASH_SOURCE[0]}")/../scripts/lib" 2>/dev/null && pwd)/l
 if [[ -z "$_bin" && -r "$_lib" ]] && source "$_lib" 2>/dev/null; then
     _bin="$(loom_resolve_self_daemon_bin 2>/dev/null)" || _bin=""
 fi
-"${_bin:-loom-daemon}" presence beat >/dev/null 2>&1
+_bin="${_bin:-loom-daemon}"
+# Output is discarded so the hook never prints into the session. Failures are
+# not lost: the binary appends each one to `.loom/logs/operator-presence.errors`
+# and `loom-daemon presence status` reports the count and the last one.
+"$_bin" presence beat >/dev/null 2>&1
 exit 0

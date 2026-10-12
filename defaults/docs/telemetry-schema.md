@@ -3191,6 +3191,10 @@ journal never rotates and never drops: `loom-daemon presence export` stages it,
 hands the whole batch to the transport, and deletes staged files only after the
 transport accepted them. With no transport it reports the pending count and
 leaves everything in place; unparseable lines go to `<journal>.rejected`.
+The hook path is fail-open and discards output, so a failed journal or state
+write is appended (one `<timestamp>\t<error>` line) to the breadcrumb file
+beside the journal, `.loom/logs/operator-presence.errors`;
+`loom-daemon presence status` prints its count and last line.
 
 ## Persistence & read surface (`sweep.outcome`, Issue #4704)
 

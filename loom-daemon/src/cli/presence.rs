@@ -5,6 +5,9 @@
 //! hook JSON from stdin for `session_id` and `hook_event_name` only. Every
 //! subcommand on the hook path is fail-open: an error goes to stderr and the
 //! exit status stays `0`, so a presence problem can never block a prompt.
+//! Because the hook discards that stderr, every error is also appended to the
+//! breadcrumb file beside the journal (`journal::record_error`), and
+//! `presence status` reports how many there are and the last one.
 
 use std::io::{IsTerminal, Read};
 use std::path::Path;
@@ -112,7 +115,17 @@ pub(crate) struct SweepOutcomeArgs {
 }
 
 impl PresenceCommand {
+    fn workspace(&self) -> &str {
+        match self {
+            Self::Beat(a) => &a.common.workspace,
+            Self::SweepStart(a) => &a.common.workspace,
+            Self::SweepOutcome(a) => &a.common.workspace,
+            Self::Export(a) | Self::Status(a) => &a.workspace,
+        }
+    }
+
     fn run(self) -> Result<()> {
+        let workspace = self.workspace().to_string();
         let outcome = match self {
             Self::Beat(a) => run_beat(&a),
             Self::SweepStart(a) => run_sweep_start(&a),
@@ -121,9 +134,26 @@ impl PresenceCommand {
             Self::Status(a) => run_status(&a),
         };
         if let Err(e) = outcome {
-            eprintln!("presence: {e:#}");
+            report_failure(&workspace, &format!("{e:#}"));
         }
         Ok(())
+    }
+}
+
+/// Fail-open error reporting: stderr, plus a durable breadcrumb beside the
+/// journal so a failure on the hook path (whose output is discarded) is never
+/// silent. When the workspace cannot even be resolved, stderr is all there is.
+fn report_failure(workspace: &str, message: &str) {
+    eprintln!("presence: {message}");
+    let Ok(root) = loom_daemon::repo_root::resolve_repo_root(workspace) else {
+        return;
+    };
+    let journal = journal::default_journal_path(&root);
+    if !journal::record_error(&journal, Utc::now(), message) {
+        eprintln!(
+            "presence: could not record the failure in {} either",
+            journal::errors_path(&journal).display()
+        );
     }
 }
 
@@ -213,6 +243,14 @@ fn run_status(args: &CommonArgs) -> Result<()> {
         journal::pending_count(&ctx.journal),
         ctx.journal.display()
     );
+    let (failures, last) = journal::error_summary(&ctx.journal);
+    if failures > 0 {
+        println!(
+            "presence: {failures} failed write(s) recorded in {}; last: {}",
+            journal::errors_path(&ctx.journal).display(),
+            last.unwrap_or_default()
+        );
+    }
     Ok(())
 }
 
@@ -262,6 +300,26 @@ pub(crate) fn on_lease_published(workspace: &str, issue: u64, sweep_id: &str) {
         beat::sweep_started(&ctx, &repo, "issue", number, sweep_id)
     });
     if let Err(e) = result {
-        eprintln!("presence: sweep.started not journaled: {e:#}");
+        report_failure(workspace, &format!("sweep.started not journaled: {e:#}"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The hook path discards stderr, so a failure must reach the breadcrumb
+    /// file beside the workspace's journal.
+    #[test]
+    fn report_failure_writes_the_breadcrumb_beside_the_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".loom")).unwrap();
+        let ws = dir.path().to_str().unwrap();
+        report_failure(ws, "appending to presence journal: No space left on device");
+        let root = loom_daemon::repo_root::resolve_repo_root(ws).unwrap();
+        let (count, last) = journal::error_summary(&journal::default_journal_path(&root));
+        assert_eq!(count, 1);
+        assert!(last.unwrap().contains("No space left on device"));
     }
 }

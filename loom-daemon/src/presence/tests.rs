@@ -264,3 +264,57 @@ fn session_ids_are_filename_safe() {
     assert_eq!(beat::sanitize_session("../../etc/passwd"), "etcpasswd");
     assert_eq!(beat::sanitize_session(""), "unknown");
 }
+
+/// A lease filed under `unknown` (started with no session id) and finished
+/// under a known session id is pruned from `unknown`, so later beats on the
+/// host stop reporting it as driven. Its recorded start still gives the
+/// outcome a duration.
+#[test]
+fn an_outcome_under_a_known_session_prunes_an_unknown_session_lease() {
+    let dir = tempfile::tempdir().unwrap();
+    let anon = Ctx {
+        session_id: beat::UNKNOWN_SESSION.to_string(),
+        ..ctx(dir.path(), t0())
+    };
+    beat::sweep_started(&anon, "rjwalters/loom", "issue", 7, "sweep-issue-7-1").unwrap();
+    let known = ctx(dir.path(), t0() + Duration::seconds(30));
+    beat::sweep_outcome(&known, None, 7, "sweep-issue-7-1", SweepResult::Success, None).unwrap();
+    assert!(beat::load_state(dir.path(), beat::UNKNOWN_SESSION)
+        .driving
+        .is_empty());
+
+    beat::beat(&ctx(dir.path(), t0() + Duration::seconds(40)), "UserPromptSubmit").unwrap();
+    let records = read(&known);
+    let TelemetryRecord::SweepOutcome(o) = &records[1].record else {
+        panic!()
+    };
+    assert_eq!(o.total_duration_sec, 30);
+    assert_eq!(o.repo.as_deref(), Some("rjwalters/loom"));
+    let TelemetryRecord::OperatorPresence(p) = &records[2].record else {
+        panic!()
+    };
+    assert!(p.driving.is_empty(), "a finished unknown-session lease is still driven");
+}
+
+/// A failed journal write is not silent: the error lands in the breadcrumb
+/// file beside the journal, and the summary `presence status` prints counts it.
+#[test]
+fn a_failed_write_leaves_a_durable_breadcrumb() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = ctx(dir.path(), t0());
+    assert_eq!(journal::error_summary(&c.journal), (0, None));
+    // A directory where the journal file should be: the append must fail.
+    std::fs::create_dir_all(&c.journal).unwrap();
+    let err = beat::beat(&c, "UserPromptSubmit").unwrap_err();
+    assert!(journal::record_error(&c.journal, t0(), &format!("{err:#}\nsecond line")));
+    assert!(journal::record_error(&c.journal, t0(), "later failure"));
+
+    let crumbs = journal::errors_path(&c.journal);
+    assert_eq!(crumbs, dir.path().join(".loom/logs/operator-presence.errors"));
+    let text = std::fs::read_to_string(&crumbs).unwrap();
+    assert!(text.contains("presence journal"), "{text}");
+    assert_eq!(text.lines().count(), 2, "one line per failure: {text}");
+    let (count, last) = journal::error_summary(&c.journal);
+    assert_eq!(count, 2);
+    assert!(last.unwrap().ends_with("\tlater failure"));
+}

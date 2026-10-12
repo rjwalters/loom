@@ -14,6 +14,9 @@
 //!   send leaves them in place for the next export.
 //! - A line that no longer parses is moved to `<journal>.rejected` and counted
 //!   in [`ExportReport::rejected`], not deleted.
+//! - A failure on the (fail-open, output-discarding) hook path is appended to
+//!   the breadcrumb file [`errors_path`] by [`record_error`], and
+//!   `loom-daemon presence status` reports the count and the last one.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -62,6 +65,43 @@ pub fn append(path: &Path, envelope: &TelemetryEnvelope) -> Result<()> {
         .with_context(|| format!("opening presence journal {}", path.display()))?;
     file.write_all(line.as_bytes())
         .with_context(|| format!("appending to presence journal {}", path.display()))
+}
+
+/// The error breadcrumb file beside `journal`: `operator-presence.jsonl` ->
+/// `operator-presence.errors`.
+#[must_use]
+pub fn errors_path(journal: &Path) -> PathBuf {
+    journal.with_extension("errors")
+}
+
+/// Append one failure to the breadcrumb file beside `journal`, best effort.
+///
+/// The hook path is fail-open and discards stdout/stderr, so without this a
+/// failed journal or state write (full disk, bad permissions) would leave no
+/// trace. One line per failure: `<rfc3339>\t<message>`, newlines flattened.
+/// Returns whether the line was written; when even this fails, stderr is all
+/// that is left.
+pub fn record_error(journal: &Path, now: chrono::DateTime<chrono::Utc>, message: &str) -> bool {
+    let path = errors_path(journal);
+    let line = format!("{}\t{}\n", now.to_rfc3339(), message.replace(['\n', '\r', '\t'], " "));
+    let write = || -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?
+            .write_all(line.as_bytes())
+    };
+    write().is_ok()
+}
+
+/// How many failures the breadcrumb file holds, and the most recent line.
+#[must_use]
+pub fn error_summary(journal: &Path) -> (usize, Option<String>) {
+    let lines = non_empty_lines(&errors_path(journal));
+    (lines.len(), lines.last().cloned())
 }
 
 /// Where a staged (renamed-for-export) copy of `path` goes. `nanos` keeps two
