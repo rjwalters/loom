@@ -45,6 +45,7 @@ pub mod floor_guard;
 pub mod notice;
 pub mod out;
 pub mod paths;
+pub mod preflight;
 pub mod provision;
 pub mod rebuild;
 pub mod relaunch;
@@ -266,6 +267,9 @@ struct Stage {
     drain: bool,
     drain_defaulted: bool,
     drain_poll_secs: String,
+    /// The version the pre-sync floor check warned about and the operator
+    /// continued with (#11064). A sync that moves VERSION invalidates it.
+    floor_confirmed: Option<String>,
 }
 
 impl Stage {
@@ -308,6 +312,14 @@ impl Stage {
             exit(1);
         };
 
+        // ---- read-only preflight, BEFORE the checkout sync (#11064) ----
+        // A run refused here (`--to-floor` against an unreadable version, or
+        // an unconfirmed fleet-floor move) has fetched and moved nothing.
+        let sup = Detected::probe(&pid_file);
+        let installed = preflight::Installed::probe(&roots.repo_root, &sup);
+        preflight::to_floor(a, &installed);
+        let before_sync = preflight::floor_before_sync(a, &roots.repo_root, &installed);
+
         // --resolve-json is strictly read-only (#7609): it must never `git
         // fetch` or fast-forward the operator's checkout just to answer "what
         // is the latest release artifact?", which has nothing to do with the
@@ -317,30 +329,15 @@ impl Stage {
             exit(1);
         }
 
-        let sup = Detected::probe(&pid_file);
-
         // ---- staleness detection ----
-        let daemon_bin = crate::daemon_start::paths::locate_daemon_bin(&roots.repo_root);
-        // Compared against the binary the detected supervisor actually
-        // launches, falling back to the PATH-resolved one only when no
-        // supervisor is detected or its exec path could not be determined
-        // (#6009) — PATH resolution alone cannot notice a supervisor pointed
-        // at a different absolute path than the PATH-resolved one.
-        let (staleness_bin, staleness_source) = match sup.supervisor_bin.as_ref() {
-            Some(b) => (Some(b.clone()), format!("{} supervisor config", sup.manager.word())),
-            None => (daemon_bin.clone(), "PATH resolution".to_string()),
-        };
-
-        let mut installed_commit = "unknown".to_string();
-        let mut installed_version = String::new();
-        if let Some(bin) = staleness_bin.as_ref().filter(|b| util::is_executable(b)) {
-            let output = util::version_output(bin);
-            let extracted = util::extract_commit(&output);
-            if !extracted.is_empty() {
-                installed_commit = extracted;
-            }
-            installed_version = util::extract_version(&output);
-        }
+        let preflight::Installed {
+            daemon_bin,
+            staleness_bin,
+            staleness_source,
+            commit: installed_commit,
+            version: installed_state,
+        } = installed;
+        let installed_version = installed_state.as_str().to_string();
 
         let source_commit = util::git(&roots.repo_root, &["rev-parse", "--short", "HEAD"])
             .filter(|s| !s.is_empty())
@@ -417,19 +414,6 @@ impl Stage {
             update_needed = true;
         }
 
-        // #11044: `--to-floor` never moves a host down, and a host already at
-        // the floor has nothing to fetch.
-        if a.to_floor {
-            if let Some(met) = floor_guard::to_floor_met(
-                a.tag.as_deref().unwrap_or_default(),
-                &installed_version,
-                a.force,
-            ) {
-                out::ok(&met);
-                exit(0);
-            }
-        }
-
         // ---- artifact-fetch resolution (Epic #4990 Phase 3, #5020) ----
         // Read-only resolution (no downloads yet). When a newer release
         // resolves for this host's platform it takes precedence over the
@@ -450,24 +434,15 @@ impl Stage {
         // unusable fleet-wide once releases fell behind `main`.
         let mut fetch_release_behind_source = false;
         if a.fetch_mode != FetchMode::Off {
-            let r = artifact::fetch_resolve_latest(&roots.repo_root, a.tag.as_deref());
+            // The preflight's resolution when it made one (#11064): the
+            // release a floor confirmation named is the one installed.
+            let r = before_sync.resolution.unwrap_or_else(|| {
+                artifact::fetch_resolve_latest(&roots.repo_root, a.tag.as_deref())
+            });
             if r.ok {
                 fetch_repo_slug = r.repo_slug.clone();
                 fetch_latest_version = r.latest_version.clone();
-                let installed_for_cmp = if installed_version.is_empty() {
-                    "0.0.0"
-                } else {
-                    installed_version.as_str()
-                };
-                let cmp = util::semver_compare(&r.latest_version, installed_for_cmp);
-                // Strictly newer wins. An EQUAL version only wins under an
-                // explicit --fetch: `--force` alone keeps its established
-                // meaning ("rebuild this checkout even though it isn't
-                // stale"), which an operator running it inside a source tree
-                // would be surprised to see silently turn into a download.
-                let newer = cmp == std::cmp::Ordering::Greater
-                    || (cmp == std::cmp::Ordering::Equal && a.fetch_mode == FetchMode::Force);
-                if newer {
+                if preflight::artifact_wins(&r, &installed_version, a.fetch_mode) {
                     artifact_mode = true;
                     artifact_tag = r.latest_tag.clone();
                     artifact_version = r.latest_version.clone();
@@ -594,6 +569,7 @@ impl Stage {
             drain,
             drain_defaulted,
             drain_poll_secs,
+            floor_confirmed: before_sync.confirmed,
         }
     }
 
@@ -743,22 +719,29 @@ fn stage_two(a: &Args, s: Stage) -> ! {
     // Before anything is fetched, built or provisioned: on a fleet host, a
     // version that is not what the floor implies needs confirmation. Silent
     // on a host with no fleet store. `--check` and `--resolve-json` exited
-    // above and never reach it.
+    // above and never reach it. A manual run was already checked before the
+    // checkout sync (#11064); this catches a source target the sync moved,
+    // and prints the warning for runs that never ask.
     let (target_version, target_how) = if s.artifact_mode {
         (s.artifact_version.as_str(), format!("release {}", s.artifact_tag))
     } else {
         (s.source_version.as_str(), format!("a source build of {}", s.source_commit))
     };
-    floor_guard::enforce(
-        &s.roots.repo_root,
-        floor_guard::Target {
-            version: target_version,
-            how: &target_how,
-        },
-        &s.installed_version,
-        a.dry_run,
-        a.yes,
-    );
+    let synced = s.sync.ff_synced.then(|| {
+        format!("the source checkout was fast-forwarded to origin/{}", s.sync.default_branch)
+    });
+    if s.floor_confirmed.as_deref() != Some(target_version) {
+        floor_guard::enforce(
+            &s.roots.repo_root,
+            floor_guard::Target {
+                version: target_version,
+                how: &target_how,
+            },
+            &s.installed_version,
+            (a.dry_run, a.yes),
+            synced.as_deref(),
+        );
+    }
 
     // ---- resolve the restart plan up front (read-only; safe for --dry-run) ----
     // The flags below are only consulted for the pid-file/nohup restart path —

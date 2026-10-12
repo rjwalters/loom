@@ -294,6 +294,18 @@ pub fn sweep_outcome(
     pr_number: Option<u32>,
 ) -> Result<()> {
     let _lock = StateLock::acquire(&ctx.root)?;
+    outcome_locked(ctx, repo, number, sweep_id, result, pr_number)
+}
+
+/// [`sweep_outcome`]'s body; the caller holds the [`StateLock`].
+fn outcome_locked(
+    ctx: &Ctx,
+    repo: Option<&str>,
+    number: u32,
+    sweep_id: &str,
+    result: SweepResult,
+    pr_number: Option<u32>,
+) -> Result<()> {
     let mut state = load_state(&ctx.root, &ctx.session_id);
     let mut unattributed =
         (ctx.session_id != UNKNOWN_SESSION).then(|| load_state(&ctx.root, UNKNOWN_SESSION));
@@ -340,4 +352,55 @@ pub fn sweep_outcome(
     }
     state.driving.retain(|i| i.sweep_id != sweep_id);
     save_state(&ctx.root, &ctx.session_id, &state)
+}
+
+/// The automatic end of an in-session sweep: journal `sweep.outcome` for every
+/// lease on issue `number` that any session on this host still lists as
+/// driven, and stop listing it. Returns the sweep ids it finished.
+///
+/// Called from the code paths a sweep already runs when it ends (the
+/// checkpoint delete after a merge, the renewal loop's release or its
+/// issue-closed stop), so no prompt has to remember an extra step. Only a
+/// sweep this host recorded as started is finished, which makes a second
+/// end signal for the same sweep a no-op and keeps daemon-dispatched sweeps
+/// (never in the `driving` set) out of it. `ctx.session_id` is ignored: each
+/// lease is finished under the session that holds it.
+///
+/// # Errors
+/// When the state or journal cannot be written.
+pub fn finish_driven(
+    ctx: &Ctx,
+    number: u32,
+    result: SweepResult,
+    pr_number: Option<u32>,
+) -> Result<Vec<String>> {
+    let _lock = StateLock::acquire(&ctx.root)?;
+    let mut held: Vec<(String, String)> = Vec::new();
+    let dir = ctx.root.join(".loom/presence");
+    for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|x| x != "json") {
+            continue;
+        }
+        let Some(session) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        for item in load_state(&ctx.root, session).driving {
+            let seen = held.iter().any(|(_, id)| *id == item.sweep_id);
+            if item.kind == "issue" && item.number == number && !seen {
+                held.push((session.to_string(), item.sweep_id));
+            }
+        }
+    }
+    // A named session first, so the `unknown` fallback inside
+    // `outcome_locked` prunes both copies under the session that owns it.
+    held.sort_by_key(|(session, _)| session == UNKNOWN_SESSION);
+    for (session, sweep_id) in &held {
+        let owner = Ctx {
+            session_id: session.clone(),
+            ..ctx.clone()
+        };
+        outcome_locked(&owner, None, number, sweep_id, result, pr_number)?;
+    }
+    Ok(held.into_iter().map(|(_, id)| id).collect())
 }

@@ -58,10 +58,10 @@
     },
     {
       "name": "loom:issue",
-      "description": "Approved for work. Applied by: humans, Champion, sweep gate, Curator (starred) — see curator.md.",
+      "description": "Approved for work. Applied by: humans, Champion, sweep gate — see curator.md.",
       "color": "3B82F6",
       "kind": "workflow",
-      "applied_by": "humans, Champion, sweep gate, Curator (starred)",
+      "applied_by": "humans, Champion, sweep gate",
       "removed_by": null,
       "park": false,
       "skip": false,

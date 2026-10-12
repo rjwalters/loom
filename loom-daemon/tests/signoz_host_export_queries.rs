@@ -1,7 +1,7 @@
 //! Proof for `host-export-queries.sql` and `alerts/host-export-silent.json` (#11198).
 //!
 //! Static tests read the committed files and run in ordinary CI. The replay test
-//! runs queries 1-3 verbatim, and the alert's embedded query with SigNoz's
+//! runs queries 1-4 verbatim, and the alert's embedded query with SigNoz's
 //! `{{.start_timestamp_nano}}` / `{{.end_timestamp_nano}}` substituted, on
 //! `clickhouse local` in the pinned image over a synthetic
 //! `signoz_logs.distributed_logs_v2`. It needs Docker, is `#[ignore]`d, and CI
@@ -245,4 +245,69 @@ fn replayed_queries_find_silent_roster_hosts_and_drop_steps() {
         .collect();
     let want_alert: BTreeSet<String> = expect.keys().cloned().collect();
     assert_eq!(fired, want_alert);
+}
+
+#[test]
+#[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
+fn replayed_exporter_loss_keeps_reset_steps_and_unknown_coverage() {
+    // Change only the clock expression, not the committed accounting SQL.
+    let query = sql_query(4).replace("now64(9)", "toDateTime64('2026-10-12 17:10:00', 9, 'UTC')");
+    let fixture = include_str!("fixtures/signoz_host_export/loss_steps.sql");
+    let number = |v: &serde_json::Value| {
+        v.as_f64()
+            .unwrap_or_else(|| v.as_str().unwrap().parse::<f64>().unwrap())
+    };
+    let output = rows(&clickhouse(&format!("{fixture}\n{query}")));
+    let losses: BTreeMap<(String, String, String), (f64, f64)> = output
+        .iter()
+        .map(|r| {
+            (
+                (
+                    r["host"].as_str().unwrap().to_owned(),
+                    r["exporter"].as_str().unwrap().to_owned(),
+                    r["reason"].as_str().unwrap().to_owned(),
+                ),
+                (number(&r["delta"]), number(&r["reason_delta"])),
+            )
+        })
+        .collect();
+    let expected = [
+        ("captain", "queue_overflow", 2825.0, 1584.0),
+        ("captain", "unattributed", 2825.0, 1241.0),
+        ("unknown", "queue_overflow", 2.0, 2.0),
+        ("unknown-flat", "coverage_unknown", 0.0, 0.0),
+        ("reason-reset", "a", 6.0, 4.0),
+        ("reason-reset", "b", 6.0, 2.0),
+        ("legacy", "a", 3.0, 1.0),
+        ("legacy", "unattributed", 3.0, 2.0),
+        ("inconsistent", "unattributed", 2.0, 2.0),
+        ("conflict", "coverage_unknown", 0.0, 0.0),
+    ]
+    .into_iter()
+    .map(|(h, r, total, reason)| {
+        ((h.to_owned(), "https".to_owned(), r.to_owned()), (total, reason))
+    })
+    .collect();
+    assert_eq!(losses, expected, "flat, other exporter and future sample are not loss");
+    let captain = output.iter().find(|r| r["host"] == "captain").unwrap();
+    assert_eq!(number(&captain["samples"]), 6.0, "repeat delivery is one sample");
+    assert_eq!(number(&captain["reset_count"]), 1.0);
+    assert_eq!(number(&captain["baseline_known"]), 1.0);
+    assert_eq!(number(&captain["max_queue_depth"]), 2.0);
+    assert_eq!(captain["versions"], serde_json::json!(["0.19.1127"]));
+    for row in &output {
+        let host = row["host"].as_str().unwrap();
+        if host.starts_with("unknown") {
+            assert_eq!(number(&row["baseline_known"]), 0.0);
+        }
+        if host == "reason-reset" {
+            assert_eq!(number(&row["reset_count"]), 2.0);
+        }
+        if host == "legacy" || host == "inconsistent" {
+            assert!(number(&row["unknown_reason_steps"]) > 0.0);
+        }
+        if host == "conflict" {
+            assert_eq!(number(&row["conflicting_samples"]), 1.0);
+        }
+    }
 }

@@ -345,6 +345,7 @@ fn two_hosts_running_the_producer_at_different_times_emit_one_fact() {
         }
     }
     let input = |label: &str| FleetInput {
+        champion: BTreeMap::new(),
         host_id: "h".to_string(),
         managed: ["o/r".to_string()].into(),
         held: Vec::new(),
@@ -427,6 +428,7 @@ fn a_claimed_ready_issue_is_one_fact_across_hosts() {
         }
     }
     let input = |ready: bool, held: bool| FleetInput {
+        champion: BTreeMap::new(),
         host_id: "h".to_string(),
         managed: ["o/r".to_string()].into(),
         held: held
@@ -464,6 +466,7 @@ fn a_claimed_ready_issue_is_one_fact_across_hosts() {
             complete: ["o/r".to_string()].into(),
             slots: None,
             halts: Default::default(),
+            limits: Default::default(),
         }),
         capacity: None,
         main_ci: BTreeMap::new(),
@@ -526,6 +529,7 @@ fn a_hand_closed_issue_mid_sweep_is_one_abandoned_fact_across_hosts() {
         }
     }
     let input = |held: bool| FleetInput {
+        champion: BTreeMap::new(),
         host_id: "h".to_string(),
         managed: ["o/r".to_string()].into(),
         held: held

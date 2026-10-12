@@ -299,6 +299,16 @@ impl RepoCap {
         RepoCapSnapshot {
             cap: self.cap,
             occupancy: self.occupancy.clone(),
+            occupancy_end: Vec::new(),
+        }
+    }
+
+    /// Record each workspace's occupancy as pass 2 left it on `report`'s
+    /// snapshot (Issue #11606), so the published limits agree with the exact
+    /// admissions the cap gated on. No read: the counter is already live.
+    pub fn finish(&self, report: &mut TickReport) {
+        if let Some(snapshot) = report.repo_cap.as_mut() {
+            snapshot.occupancy_end.clone_from(&self.occupancy);
         }
     }
 
@@ -323,6 +333,9 @@ impl RepoCap {
 pub struct RepoCapSnapshot {
     pub cap: Option<usize>,
     pub occupancy: Vec<usize>,
+    /// The same counts when pass 2 finished (Issue #11606); empty until
+    /// [`RepoCap::finish`] runs.
+    pub occupancy_end: Vec<usize>,
 }
 
 /// Shape the globally-sorted candidate list for pass 2: the #6243 repo-sharding
@@ -447,3 +460,8 @@ pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
 #[cfg(test)]
 #[path = "repo_cap_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[path = "repo_limits_tests.rs"]
+mod limits_tests;

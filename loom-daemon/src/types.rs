@@ -1921,7 +1921,7 @@ pub struct DeepCleanRepoStatus {
 mod observability_export;
 pub use observability_export::{
     ObservabilityExportScope, ObservabilityExportState, ObservabilityExportStatus,
-    ObservabilityHostIdMismatch, NEVER_EXPORTED_GRACE_FLOOR_SECS,
+    ObservabilityHostIdMismatch, ObservabilityQueuePressure, NEVER_EXPORTED_GRACE_FLOOR_SECS,
 };
 
 mod forge_events;
@@ -1937,7 +1937,9 @@ pub use dispatch_plan::{
 mod fleet_plan;
 pub use fleet_plan::{FleetPlan, FleetPlanItem, FleetPlanObservation, HostPlan, HostPlanRow};
 pub(crate) mod work_finder_tick;
-pub use work_finder_tick::{CapLimiter, CapView, CapacityWait, WorkFinderTickSummary};
+pub use work_finder_tick::{
+    CapLimiter, CapView, CapacityWait, RepoLimitView, WorkFinderTickSummary,
+};
 
 /// One role-runner tick outcome for one `(root, role)` pair (Issue #4761).
 ///

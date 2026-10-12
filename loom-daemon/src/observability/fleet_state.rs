@@ -51,6 +51,8 @@
 //! ETA is enabled does not matter. An anchor with zero rows is still sent,
 //! because it truthfully says "nothing here".
 
+mod champion;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -61,15 +63,19 @@ use serde_json::Value;
 use super::queue::{DurableQueue, FanoutQueue, QueueSink};
 use crate::telemetry::kinds::fleet_state::{
     split_into_chunks, FleetCapacity, FleetEligibleReason, FleetHoldKind, FleetPrCensus,
-    FleetRepoHalt, FleetSlot, FleetSlots, FleetStage, FleetStateRecord, FleetStateRepo,
-    FleetStateRow, MainCi, PlannerStamps, ANCHOR_INTERVAL_SECS, CHUNK_BYTES, FLEET_STATE_SCHEMA,
+    FleetQueueFlow, FleetRepoHalt, FleetSlot, FleetSlots, FleetStage, FleetStateRecord,
+    FleetStateRepo, FleetStateRow, MainCi, PlannerStamps, ANCHOR_INTERVAL_SECS, CHUNK_BYTES,
+    FLEET_STATE_SCHEMA,
 };
 use crate::telemetry::{RepoVisibility, SweepStartFacts, TelemetryEnvelope, TelemetryRecord};
 
 pub mod enrich;
+mod flow;
 pub mod history;
 pub mod outcomes;
 mod sources;
+
+use flow::{QueueFlowTracker, QUEUE_FLOW_WINDOW_SECS};
 
 /// The review labels whose listings give the PR stages and the census.
 pub const REVIEW_LABELS: [&str; 3] = ["loom:review-requested", "loom:changes-requested", "loom:pr"];
@@ -227,6 +233,17 @@ pub struct ReadyItem {
     pub eligible_at: Option<DateTime<Utc>>,
 }
 
+/// One repo's dispatch limits from the work finder's last tick (#11606).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RepoLimits {
+    /// Host-local sweeps counted against the cap when the tick finished.
+    pub in_flight: u32,
+    /// The resolved per-repo cap; `None` is uncapped, observed.
+    pub cap: Option<u32>,
+    /// Ready candidates the tick deferred for the cap.
+    pub deferred_repo_cap: u32,
+}
+
 /// The work finder's last tick, as `fleet.state` reads it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReadyQueue {
@@ -242,11 +259,16 @@ pub struct ReadyQueue {
     /// The repos the tick held, by lowercased slug (#11564). Every held repo
     /// is here, whether or not it has ready rows.
     pub halts: BTreeMap<String, FleetRepoHalt>,
+    /// Every repo the tick resolved dispatch limits for, by lowercased slug
+    /// (#11606). A repo the tick did not cover is absent: unknown.
+    pub limits: BTreeMap<String, RepoLimits>,
 }
 
 /// Everything one pass read.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FleetInput {
+    /// Per-root Champion dispatch observations.
+    pub champion: BTreeMap<String, crate::telemetry::kinds::fleet_state::ChampionState>,
     /// This host's id.
     pub host_id: String,
     /// Every managed repo's lowercased slug.
@@ -266,6 +288,8 @@ pub struct FleetInput {
 /// One repo's full state at one pass.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RepoView {
+    /// Champion dispatch metadata.
+    pub champion: Option<crate::telemetry::kinds::fleet_state::ChampionState>,
     /// The census, when the repo was completely listed this pass.
     pub census: Option<FleetPrCensus>,
     /// Rows by issue.
@@ -276,6 +300,14 @@ pub struct RepoView {
     pub main_ci: Option<MainCi>,
     /// The work finder's hold on the repo, when it holds it (#11564).
     pub halt: Option<FleetRepoHalt>,
+    /// The work finder's dispatch limits for the repo (#11606).
+    pub limits: Option<RepoLimits>,
+    /// Items waiting in the repo's `ready_wait` queue this tick, when the
+    /// listing was read whole (#11645). Absent = unknown, never zero.
+    pub queue_depth: Option<u32>,
+    /// The repo's `ready_wait` arrival/drain flow over the trailing window
+    /// (#11645), once this host has observed its queue.
+    pub flow: Option<FleetQueueFlow>,
 }
 
 /// The full state at one pass, before visibility tagging.
@@ -582,12 +614,19 @@ pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Ut
     for (repo, repo_census) in census {
         repos.entry(repo).or_default().census = Some(repo_census);
     }
+    for (repo, champion) in &input.champion {
+        repos.entry(repo.clone()).or_default().champion = Some(champion.clone());
+    }
     for (repo, main_ci) in &input.main_ci {
         repos.entry(repo.clone()).or_default().main_ci = Some(*main_ci);
     }
     // Every held repo, rows or not (#11564): a halt is never capped.
     for (repo, halt) in input.ready.iter().flat_map(|ready| &ready.halts) {
         repos.entry(repo.clone()).or_default().halt = Some(halt.clone());
+    }
+    // Every repo the tick covered, rows or not (#11606): never capped.
+    for (repo, limits) in input.ready.iter().flat_map(|ready| &ready.limits) {
+        repos.entry(repo.clone()).or_default().limits = Some(*limits);
     }
     FleetView {
         census_at: input.listed_at.filter(|_| !input.listings.is_empty()),
@@ -609,16 +648,24 @@ pub fn needs_anchor(last: Option<&Emitted>, stamps: &PlannerStamps, now: DateTim
 }
 
 fn repo_entry(view: &FleetView, repo: &str, census: Option<FleetPrCensus>) -> FleetStateRepo {
-    let main_ci = view.repos.get(repo).and_then(|r| r.main_ci);
-    let halt = view.repos.get(repo).and_then(|r| r.halt.clone());
+    let state = view.repos.get(repo);
+    let main_ci = state.and_then(|r| r.main_ci);
+    let halt = state.and_then(|r| r.halt.clone());
+    let limits = state.and_then(|r| r.limits);
     let ready_complete = view.ready_complete(repo);
     FleetStateRepo {
+        champion: state.and_then(|r| r.champion.clone()),
         repo: repo.to_string(),
         // Tagged by the caller once the record is known to be sent; private
         // until then is the safe default.
         visibility: RepoVisibility::Private,
         main_ci,
         halt,
+        in_flight: limits.map(|l| l.in_flight),
+        cap: limits.map(|l| l.cap),
+        deferred_repo_cap: limits.map(|l| l.deferred_repo_cap),
+        queue_depth: state.and_then(|r| r.queue_depth),
+        queue_flow: state.and_then(|r| r.flow),
         census,
         ready_complete,
         ready_replace: !ready_complete,
@@ -713,8 +760,12 @@ pub fn decide(
             && removed.is_empty()
             && !ready_changed
             && now_state.census == was.census
+            && now_state.champion == was.champion
             && now_state.main_ci == was.main_ci
             && now_state.halt == was.halt
+            && now_state.limits == was.limits
+            && now_state.queue_depth == was.queue_depth
+            && now_state.flow == was.flow
             && view.ready_complete(repo) == last.view.ready_complete(repo)
         {
             continue;
@@ -803,12 +854,15 @@ struct PassState {
     emitted: Option<Emitted>,
     outcomes: outcomes::Memory,
     enrich: enrich::EnrichMemory,
+    /// Per-repo `ready_wait` arrival/drain history (#11645).
+    flow: QueueFlowTracker,
 }
 
 static STATE: Mutex<PassState> = Mutex::new(PassState {
     prev: None,
     emitted: None,
     enrich: enrich::EnrichMemory::new(),
+    flow: QueueFlowTracker::new(QUEUE_FLOW_WINDOW_SECS),
     outcomes: outcomes::Memory {
         listed: BTreeMap::new(),
         unread: BTreeMap::new(),
@@ -950,9 +1004,15 @@ pub(super) async fn record(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
     let view = build_view(&input, state.prev.as_ref(), now);
-    let view =
+    let mut view =
         record_outcomes(sink, &input, (curated, triage), view, now, workspace_pool, slug_cache)
             .await;
+    {
+        let mut live = STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        annotate_flow(&mut view, &mut live.flow, input.ready.as_ref(), now);
+    }
     for repo in view.repos.keys().chain(&input.managed) {
         if !reused.visibility.contains_key(repo) {
             let visibility = super::collector::resolve_visibility(repo).await;
@@ -978,8 +1038,47 @@ async fn record_tick(workspace_root: &Path, workspace_pool: &crate::workspace_po
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
-    let view = build_view(&input, state.prev.as_ref(), now);
+    let mut view = build_view(&input, state.prev.as_ref(), now);
+    {
+        let mut live = STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        annotate_flow(&mut view, &mut live.flow, input.ready.as_ref(), now);
+    }
     send(sink, workspace_root, view, state, now, &reused);
+}
+
+/// Fold this pass's ready queue into `tracker` and stamp each repo's
+/// [`RepoView`] with its depth and flow (#11645). Only repos whose ready
+/// listing was read whole this pass (`ready.complete`) are observed: a partial
+/// set would read its missing rows as drains. A complete repo with no ready
+/// rows gets depth `0` — an empty queue is a fact, not unknown.
+fn annotate_flow(
+    view: &mut FleetView,
+    tracker: &mut QueueFlowTracker,
+    ready: Option<&ReadyQueue>,
+    now: DateTime<Utc>,
+) {
+    let Some(ready) = ready else {
+        return;
+    };
+    let mut sets: BTreeMap<String, BTreeSet<u32>> = BTreeMap::new();
+    for repo in &ready.complete {
+        sets.entry(repo.clone()).or_default();
+    }
+    for item in &ready.items {
+        if ready.complete.contains(&item.repo) {
+            sets.entry(item.repo.clone())
+                .or_default()
+                .insert(item.issue);
+        }
+    }
+    for (repo, set) in &sets {
+        tracker.observe(repo, set, now);
+        let state = view.repos.entry(repo.clone()).or_default();
+        state.queue_depth = Some(u32::try_from(set.len()).unwrap_or(u32::MAX));
+        state.flow = tracker.flow(repo, now);
+    }
 }
 
 /// Diff `view` against what was last sent, send the record if any, and keep
@@ -1050,3 +1149,13 @@ mod tests;
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[path = "fleet_state/facts_tests.rs"]
 mod facts_tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[path = "fleet_state/limits_tests.rs"]
+mod limits_tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[path = "fleet_state/queue_flow_tests.rs"]
+mod queue_flow_tests;

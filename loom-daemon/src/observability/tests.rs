@@ -76,49 +76,9 @@ fn absent_config_resolves_to_documented_defaults() {
 }
 
 // ------------------------------------------------------------------
-// resolve_ingest_key_file — env > config > $HOME-relative default (#5336).
+// resolve_ingest_key_file — env > config > $HOME-relative default
+// (#5336) — now lives, with its tests, in `ingest_key.rs`.
 // ------------------------------------------------------------------
-
-#[test]
-fn ingest_key_file_under_joins_the_conventional_relative_path() {
-    assert_eq!(
-        ingest_key_file_under(Path::new("/home/ubuntu")),
-        "/home/ubuntu/.loom/observability/ingest.key"
-    );
-    assert_eq!(
-        ingest_key_file_under(Path::new("/Users/robb-studio")),
-        "/Users/robb-studio/.loom/observability/ingest.key",
-        "must resolve against WHATEVER home is passed in — never a value \
-         baked in from a different host"
-    );
-}
-
-#[test]
-#[serial]
-fn resolve_ingest_key_file_config_wins_over_default_when_no_env_set() {
-    clear_env();
-    let config = ObservabilityConfig {
-        ingest_key_file: Some("/etc/loom/observability-ingest.key".to_string()),
-        ..Default::default()
-    };
-    assert_eq!(
-        resolve_ingest_key_file(&config),
-        Some("/etc/loom/observability-ingest.key".to_string())
-    );
-}
-
-#[test]
-#[serial]
-fn resolve_ingest_key_file_env_overrides_config() {
-    clear_env();
-    std::env::set_var(INGEST_KEY_FILE_ENV, "/run/secrets/ingest.key");
-    let config = ObservabilityConfig {
-        ingest_key_file: Some("/etc/loom/observability-ingest.key".to_string()),
-        ..Default::default()
-    };
-    assert_eq!(resolve_ingest_key_file(&config), Some("/run/secrets/ingest.key".to_string()));
-    clear_env();
-}
 
 // ------------------------------------------------------------------
 // resolve_exporter — env > config > default("https"); unknown ⇒ https.

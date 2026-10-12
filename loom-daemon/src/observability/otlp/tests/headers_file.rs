@@ -196,7 +196,8 @@ fn all_signals() -> Vec<TelemetryEnvelope> {
 }
 
 fn exporter_for(sink: &HeaderSink, headers_file: Option<&str>) -> OtlpExporter {
-    OtlpExporter::with_headers_file(sink.base_url(), INGEST_KEY.to_string(), headers_file).unwrap()
+    OtlpExporter::with_headers_file(sink.base_url(), Some(INGEST_KEY.to_string()), headers_file)
+        .unwrap()
 }
 
 const SIGNAL_PATHS: [&str; 3] = ["/v1/traces", "/v1/logs", "/v1/metrics"];
@@ -332,7 +333,7 @@ fn a_refused_headers_file_fails_construction_naming_file_and_line_only() {
     let (_dir, path) = headers_file(&format!("X-Client-Id: {CLIENT_ID}\n{CLIENT_SECRET}\n"));
     let error = OtlpExporter::with_headers_file(
         "https://otlp.test-fixture.internal".to_string(),
-        INGEST_KEY.to_string(),
+        Some(INGEST_KEY.to_string()),
         Some(&path),
     )
     .err()
@@ -354,7 +355,7 @@ fn a_group_or_world_readable_headers_file_fails_construction() {
         set_mode(std::path::Path::new(&path), mode);
         let error = OtlpExporter::with_headers_file(
             "https://otlp.test-fixture.internal".to_string(),
-            INGEST_KEY.to_string(),
+            Some(INGEST_KEY.to_string()),
             Some(&path),
         )
         .err()
@@ -371,7 +372,7 @@ fn the_endpoint_is_validated_before_the_headers_file_is_opened() {
     // A missing file would be its own error; the endpoint's comes first.
     let error = OtlpExporter::with_headers_file(
         "ftp://otlp.test-fixture.internal".to_string(),
-        INGEST_KEY.to_string(),
+        Some(INGEST_KEY.to_string()),
         Some("/nonexistent/otlp-headers"),
     )
     .err()
@@ -442,7 +443,7 @@ fn header_values_never_reach_logs_errors_status_or_exported_records() {
             drop(listener);
             let exporter = OtlpExporter::with_headers_file(
                 format!("http://{addr}"),
-                INGEST_KEY.to_string(),
+                Some(INGEST_KEY.to_string()),
                 Some(&path),
             )
             .unwrap();
@@ -472,6 +473,179 @@ fn header_values_never_reach_logs_errors_status_or_exported_records() {
     for body in &bodies {
         for secret in secrets {
             assert!(!body.contains(secret), "an exported record carries a header value");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// #11555 — `headers_file` without ingest.key, re-read on file change.
+// ---------------------------------------------------------------------
+
+/// An entry whose `headers_file` carries all its credentials exports with
+/// no ingest key at all: the file's headers are sent, and no
+/// `Authorization: Bearer` is added (#11555).
+#[tokio::test]
+async fn a_headers_file_exporter_without_an_ingest_key_sends_no_bearer() {
+    let sink = HeaderSink::start();
+    let (_dir, path) = headers_file(&proxy_headers());
+    let exporter = OtlpExporter::with_headers_file(sink.base_url(), None, Some(&path)).unwrap();
+    exporter.emit_batch(&all_signals()).await.unwrap();
+
+    let requests = sink.requests();
+    assert_all_three_signals(&requests);
+    for request in &requests {
+        let path = &request.path;
+        assert_eq!(request.values("x-client-id"), vec![CLIENT_ID], "{path}");
+        assert_eq!(request.values("x-client-secret"), vec![CLIENT_SECRET], "{path}");
+        assert!(
+            request.values("authorization").is_empty(),
+            "no Authorization at all — not even an empty Bearer ({path})"
+        );
+    }
+}
+
+/// An atomically rotated headers file (write a sibling, rename it over the
+/// live path) is picked up by the *same, running* exporter — no restart, no
+/// rebuild (#11555). The two values are the same length, so the change is
+/// caught by mtime/inode, not by a length delta.
+#[tokio::test]
+async fn a_rotated_headers_file_is_re_read_by_the_running_exporter() {
+    let sink = HeaderSink::start();
+    let (dir, path) = headers_file("X-Token: rotation-one\n");
+    let exporter = exporter_for(&sink, Some(&path));
+    exporter
+        .emit_batch(&[sweep_started_envelope()])
+        .await
+        .unwrap();
+
+    let staged = dir.path().join("otlp-headers.staged");
+    std::fs::write(&staged, "X-Token: rotation-two\n").unwrap();
+    set_mode(&staged, 0o600);
+    std::fs::rename(&staged, &path).unwrap();
+
+    exporter
+        .emit_batch(&[sweep_started_envelope()])
+        .await
+        .unwrap();
+    let tokens: Vec<String> = sink
+        .requests()
+        .iter()
+        .map(|request| request.values("x-token").join(","))
+        .collect();
+    assert_eq!(
+        tokens,
+        vec!["rotation-one", "rotation-two"],
+        "the second request must carry the rotated value"
+    );
+}
+
+/// The last request's `X-Client-Secret`, if any.
+fn last_secret(sink: &HeaderSink) -> String {
+    sink.requests()
+        .last()
+        .and_then(|request| request.values("x-client-secret").into_iter().next())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// A reload that fails — a malformed line, then loose permissions — keeps
+/// the last good headers, never panics or stops the sender, and logs one
+/// WARN per distinct file state naming the path (and line), never a value
+/// (#10961 rules, #11555). Fixing the file recovers on the next request.
+///
+/// A plain `#[test]` driving a current-thread runtime, because
+/// [`crate::test_log_capture`] collects on the calling thread only.
+#[test]
+fn a_failed_reload_keeps_the_last_good_headers_and_warns_once_per_state() {
+    let sink = HeaderSink::start();
+    let (dir, path) = headers_file(&proxy_headers());
+    let exporter = exporter_for(&sink, Some(&path));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let mut secret_after_each_step: Vec<String> = Vec::new();
+    let logs = crate::test_log_capture::capture_logs(|| {
+        runtime.block_on(async {
+            exporter
+                .emit_batch(&[sweep_started_envelope()])
+                .await
+                .unwrap();
+
+            // Broken state 1: a malformed line 2.
+            std::fs::write(&path, format!("X-Client-Secret: {CLIENT_SECRET}\n{CLIENT_ID}\n"))
+                .unwrap();
+            // Two requests under the same broken state: the WARN fires once.
+            exporter
+                .emit_batch(&[sweep_started_envelope()])
+                .await
+                .unwrap();
+            exporter
+                .emit_batch(&[sweep_started_envelope()])
+                .await
+                .unwrap();
+            secret_after_each_step.push(last_secret(&sink));
+
+            // Broken state 2: a rotation whose replacement file has loose
+            // permissions — a new inode, so a reload is attempted and
+            // refused. (An in-place `chmod` of the live file changes none
+            // of mtime/len/inode and so is deliberately not re-read.)
+            let staged = dir.path().join("otlp-headers.loose");
+            std::fs::write(&staged, "X-Client-Secret: rotated-7f31\n").unwrap();
+            set_mode(&staged, 0o644);
+            std::fs::rename(&staged, &path).unwrap();
+            exporter
+                .emit_batch(&[sweep_started_envelope()])
+                .await
+                .unwrap();
+            secret_after_each_step.push(last_secret(&sink));
+
+            // Fixed: the very next request carries the fresh value.
+            let fixed = dir.path().join("otlp-headers.fixed");
+            std::fs::write(&fixed, "X-Client-Secret: rotated-7f31\n").unwrap();
+            set_mode(&fixed, 0o600);
+            std::fs::rename(&fixed, &path).unwrap();
+            exporter
+                .emit_batch(&[sweep_started_envelope()])
+                .await
+                .unwrap();
+            secret_after_each_step.push(last_secret(&sink));
+        });
+    });
+
+    assert_eq!(sink.requests().len(), 5, "the sender never stopped");
+    // Both failures kept the last good headers…
+    assert_eq!(secret_after_each_step[0], CLIENT_SECRET);
+    assert_eq!(secret_after_each_step[1], CLIENT_SECRET);
+    // …and the fix reached the next request.
+    assert_eq!(secret_after_each_step[2], "rotated-7f31");
+
+    let warnings: Vec<&str> = logs
+        .iter()
+        .filter(|(level, _)| *level == log::Level::Warn)
+        .map(|(_, message)| message.as_str())
+        .collect();
+    assert_eq!(
+        warnings.len(),
+        2,
+        "one WARN per distinct broken state, not per request: {logs:?}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|message| message.contains(&path) && message.contains("line 2")),
+        "the parse refusal names path and line: {warnings:?}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|message| message.contains(&path) && message.contains("group or others")),
+        "the permissions refusal names the path: {warnings:?}"
+    );
+    for (_, message) in &logs {
+        for value in [CLIENT_ID, CLIENT_SECRET, "rotated-7f31"] {
+            assert!(!message.contains(value), "log line leaked a header value: {message}");
         }
     }
 }
