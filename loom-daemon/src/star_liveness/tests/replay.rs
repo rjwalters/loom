@@ -58,6 +58,7 @@ fn load_with(all_comments: bool) -> (World, Vec<RepoInput>, Value) {
                     author: it["author"].as_str().map(str::to_string),
                     author_association: None,
                     is_pull_request: it["pr"].as_bool().unwrap_or(false),
+                    open_sub_issues: None,
                 },
             );
             if let Some(a) = it["association"].as_str() {

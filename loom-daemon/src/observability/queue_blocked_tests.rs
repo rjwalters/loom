@@ -23,6 +23,7 @@ fn item(number: u32, labels: &[&str]) -> RestIssue {
         author: Some("someone".into()),
         author_association: None,
         is_pull_request: false,
+        open_sub_issues: None,
     }
 }
 
