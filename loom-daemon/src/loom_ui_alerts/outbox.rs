@@ -75,6 +75,11 @@ impl Outbox {
         self.queue.is_empty()
     }
 
+    /// Drop every queued alert.
+    pub fn clear(&mut self) {
+        self.queue.clear();
+    }
+
     /// Append `alert`, due now. Returns the alert dropped to make room.
     pub fn push(&mut self, alert: Alert, now: Instant) -> Option<Alert> {
         let lost = (self.queue.len() >= self.capacity)

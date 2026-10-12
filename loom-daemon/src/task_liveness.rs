@@ -28,6 +28,8 @@
 //! The registry is process-global and in memory. A restart forgets it, which
 //! is correct: a fresh process registers its loops again as it spawns them.
 
+pub mod loom_ui;
+
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};

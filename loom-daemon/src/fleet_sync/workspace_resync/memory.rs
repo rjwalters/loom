@@ -281,6 +281,12 @@ impl Memory {
             .collect()
     }
 
+    /// The host-level conditions alerted and still standing (#11295): the
+    /// network outage and the failing head query.
+    pub(super) fn host_alerts_standing(&self) -> (bool, bool) {
+        (self.outage.alerted, self.head_query.1)
+    }
+
     /// Is the host staying off the network after an outage?
     pub(super) fn outage_hold(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
         self.outage.hold_until.filter(|until| now < *until)

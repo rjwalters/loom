@@ -286,10 +286,13 @@ async fn a_refused_alert_is_dropped_and_the_next_one_still_goes() {
 }
 
 #[test]
-fn post_without_start_is_a_no_op() {
-    // The global is never started in the unit-test binary.
+fn post_before_start_waits_in_the_outbox() {
+    // The global is never started in the unit-test binary: the alert is
+    // queued for a drain that has not begun, never sent.
     assert!(!is_active());
+    assert!(!is_off());
     post(alert("r", "k", State::Open));
+    assert!(global().queued() >= 1);
 }
 
 // ----------------------------------------------- real HTTP, loopback sink
