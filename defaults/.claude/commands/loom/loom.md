@@ -648,8 +648,6 @@ loom-clean --deep       # Also remove build artifacts
 
 ### Sub-topic: labels
 
-**Label Reference**
-
 **Workflow labels (issue lifecycle):**
 
 | Label | Meaning | Set by |
@@ -660,7 +658,7 @@ loom-clean --deep       # Also remove build artifacts
 | `loom:building` | Being implemented | Builder |
 | `loom:blocked` | Work is blocked | Builder |
 | `loom:operator-only` | Needs a human; sweep skips | Human |
-| `loom:important`, `loom:very-important` | Order (and Champion's promotion cap) | Operator/Guide/Champion |
+| `loom:important`, `loom:very-important` | Order, promotion cap | Human/Guide/Champion |
 
 **Workflow labels (PR lifecycle):**
 
