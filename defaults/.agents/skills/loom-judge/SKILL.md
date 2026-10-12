@@ -1247,11 +1247,11 @@ if [ "$MERGE_STATE" = "DIRTY" ]; then
     if [ "$GATE_OK" = true ]; then
         if [ "$BRANCH_UPDATE" = rebase ]; then git rebase origin/main; else git merge --no-ff -m "Merge origin/main into $BRANCH (Judge: resolve conflicts)" origin/main; fi || GATE_OK=false
     fi
-    # Version gate before the push; on failure never hand-patch version files or run `version.sh bump`.
+    # Version gate before the push; on failure never hand-patch the version-bearing files yourself or run `version.sh bump`.
     if [ "$GATE_OK" = true ] && [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-check-gate.sh --fix-hint "then push."; then
         GATE_OK=false
     fi
-    # Discard guard (#9282, was #8298): rc 0 = BLOCKED.
+    # Discard guard (#9282): rc 0 = BLOCKED.
     if [ "$GATE_OK" = true ]; then
         loom-daemon forge rebase-guard --base origin/main; RG=$?
         [ "$RG" = 0 ] && GATE_OK=false
