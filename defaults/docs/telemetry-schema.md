@@ -3222,6 +3222,38 @@ invoked by a person *through Loom's own tagged environment* (a shell inheriting
 entries other than start/finish/abort are ignored, so one rebase is one or two
 records, not one per picked commit.
 
+
+### `issue.estimate` — completed curation's blind pre-build estimate
+
+One OTLP log per completed curation, produced by `loom-daemon curation-complete`
+for both attended Curators and daemon-mediated role sessions. The command
+fetches the current issue body's standalone `loom:estimate` marker and durably
+journals the envelope before the role applies `loom:curated`. No historical
+backfill or inference from Builder outcomes is performed.
+
+The JSON body contains `repo` (owner/repo), `issue`, `difficulty` (integer 1–5),
+`lines` and `files` (nonnegative integers), `doctor_risk` (finite [0,1]), actual
+Curator `model` and `runtime` (null when unknown, never inferred), `estimated_at` (UTC completion time),
+`completion_id` (UUID), and standard `loom` build provenance. `loom.repo`,
+`loom.issue`, `loom.model`, `loom.runtime` and `loom.fact_id` are log attributes.
+Both OTLP source and observed timestamps are the saved completion time: an ETA
+consumer may use the estimate only at or after `estimated_at`.
+
+`loom.fact_id` keys on repo, issue and completion UUID. A transport retry reuses
+the original envelope and time; a genuine re-curation generates a new UUID and
+time even if its numeric fields do not change. Readers dedupe by fact id and
+select the latest estimate known at their as-of instant. Files under the main
+workspace's `.loom/logs/issue-estimates/` are the local queue of record; normal
+observability backfill offers each to the configured durable export queue.
+
+Difficulty estimates expected work. The retained `loom:complexity` marker
+independently measures the cost of an unnoticed error and keeps its existing
+routing definition; there is no mapping between them. Estimates never alter
+curation decisions. Missing historical estimates stay absent. Markdown examples
+in backticks or code fences, duplicates, invalid counts and nonfinite/out-of-range
+risk are rejected or excluded before export.
+
+
 ## Persistence & read surface (`sweep.outcome`, Issue #4704)
 
 The daemon durably records one `sweep.outcome` [`TelemetryEnvelope`] per
