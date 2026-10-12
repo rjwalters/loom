@@ -8,7 +8,7 @@ const PAIR: &str = "CF-Access-Client-Id: FAKE-client-id-for-tests\nCF-Access-Cli
 #[serial]
 async fn existing_access_pair_reaches_the_live_sender_without_bearer() {
     let _guard = HostGuard::at("this-host");
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let path = dir.path().join("otlp-headers");
     write_credential_headers(&path, PAIR).unwrap();
     let spec = parse_credential_spec(&format!("headers-file:{}", path.display())).unwrap();
@@ -52,7 +52,7 @@ async fn existing_access_pair_reaches_the_live_sender_without_bearer() {
 
 #[test]
 fn invalid_or_partial_headers_leave_existing_pair_untouched() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let path = dir.path().join("otlp-headers");
     write_credential_headers(&path, PAIR).unwrap();
     for invalid in [
@@ -72,14 +72,14 @@ fn invalid_or_partial_headers_leave_existing_pair_untouched() {
 
 #[test]
 fn repository_and_symlink_destinations_are_refused_without_clobbering() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     std::fs::create_dir(dir.path().join(".git")).unwrap();
     let path = dir.path().join("credentials");
     assert!(write_credential_headers(&path, PAIR).is_err());
     assert!(!path.exists());
     #[cfg(unix)]
     {
-        let external = tempfile::tempdir().unwrap();
+        let external = private_tempdir();
         let target = external.path().join("target");
         write_credential_headers(&target, PAIR).unwrap();
         let link = external.path().join("link");
@@ -93,7 +93,7 @@ fn repository_and_symlink_destinations_are_refused_without_clobbering() {
 #[test]
 fn loose_header_source_is_refused_before_copying() {
     use std::os::unix::fs::PermissionsExt;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let path = dir.path().join("source");
     std::fs::write(&path, PAIR).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
@@ -130,7 +130,7 @@ fn access_default_and_legacy_scalar_specs_remain_distinct() {
 
 #[test]
 fn missing_parent_traversal_cannot_create_a_repository_secret() {
-    let sandbox = tempfile::tempdir().unwrap();
+    let sandbox = private_tempdir();
     let outside = sandbox.path().join("outside");
     let repo = sandbox.path().join("repo");
     std::fs::create_dir(&outside).unwrap();
@@ -146,7 +146,7 @@ fn missing_parent_traversal_cannot_create_a_repository_secret() {
 #[test]
 fn new_parents_are_private_and_shared_parent_is_not_changed() {
     use std::os::unix::fs::PermissionsExt;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let path = dir.path().join("new/nested/headers");
     write_credential_headers(&path, PAIR).unwrap();
     for parent in [dir.path().join("new"), dir.path().join("new/nested")] {
@@ -162,8 +162,8 @@ fn new_parents_are_private_and_shared_parent_is_not_changed() {
 
 #[test]
 fn age_identity_inside_repository_is_refused_before_subprocess() {
-    let external = tempfile::tempdir().unwrap();
-    let repository = tempfile::tempdir().unwrap();
+    let external = private_tempdir();
+    let repository = private_tempdir();
     std::fs::create_dir(repository.path().join(".git")).unwrap();
     let identity = repository.path().join("FAKE-age-identity");
     let source = AgeFileSource {

@@ -9,6 +9,17 @@ use super::*;
 use serial_test::serial;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+/// Fake credential sandboxes are private independently of the runner's umask.
+fn private_tempdir() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    dir
+}
+
 /// Pins the identity inputs for the test's duration: `LOOM_HOST_ID` to
 /// `host`, and the config-tier / persisted-file inputs cleared so `env` is
 /// the winning source (the engine resolves through
@@ -173,7 +184,7 @@ const TOKEN: &str = "super-secret-token-abc";
 #[serial]
 async fn identity_mismatch_provisions_nothing() {
     let _guard = HostGuard::at("this-host");
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let plan = plan_at(dir.path(), "other-host");
     let credential = FakeCredential {
         recorder: Recorder::default(),
@@ -208,7 +219,7 @@ async fn identity_mismatch_provisions_nothing() {
 #[serial]
 async fn wrong_token_names_the_status_and_never_the_token() {
     let _guard = HostGuard::at("this-host");
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let plan = plan_at(dir.path(), "this-host");
     let credential = FakeCredential {
         recorder: Recorder::default(),
@@ -238,7 +249,7 @@ async fn wrong_token_names_the_status_and_never_the_token() {
 #[serial]
 async fn credential_failure_stops_before_send() {
     let _guard = HostGuard::at("this-host");
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let plan = plan_at(dir.path(), "this-host");
     let credential = FailingCredential(Recorder::default());
     let sender = FakeSender::ok();
@@ -257,7 +268,7 @@ async fn credential_failure_stops_before_send() {
 #[serial]
 async fn probe_timeout_is_distinct() {
     let _guard = HostGuard::at("this-host");
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let mut plan = plan_at(dir.path(), "this-host");
     plan.timeout = Duration::from_secs(0);
     let credential = FakeCredential {
@@ -278,7 +289,7 @@ async fn probe_timeout_is_distinct() {
 #[serial]
 async fn reader_outage_is_distinct_from_probe_timeout() {
     let _guard = HostGuard::at("this-host");
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let mut plan = plan_at(dir.path(), "this-host");
     plan.timeout = Duration::from_secs(0);
     let credential = FakeCredential {
@@ -299,7 +310,7 @@ async fn reader_outage_is_distinct_from_probe_timeout() {
 #[serial]
 async fn reader_outage_then_success() {
     let _guard = HostGuard::at("this-host");
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let mut plan = plan_at(dir.path(), "this-host");
     plan.timeout = Duration::from_secs(5);
     let credential = FakeCredential {
@@ -328,7 +339,7 @@ async fn reader_outage_then_success() {
 #[serial]
 async fn readback_identity_mismatch_is_distinct() {
     let _guard = HostGuard::at("this-host");
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let plan = plan_at(dir.path(), "this-host");
     let credential = FakeCredential {
         recorder: Recorder::default(),
@@ -359,7 +370,7 @@ async fn readback_identity_mismatch_is_distinct() {
 #[serial]
 async fn success_round_trip_and_exact_needle() {
     let _guard = HostGuard::at("this-host");
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let plan = plan_at(dir.path(), "this-host");
     let credential = FakeCredential {
         recorder: Recorder::default(),
@@ -406,7 +417,7 @@ async fn headers_file_round_trips_at_0600_and_replaces_loose_modes() {
     use std::os::unix::fs::PermissionsExt;
 
     let _guard = HostGuard::at("this-host");
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let path = dir.path().join("otlp-headers");
     std::fs::write(&path, "X-Stale: yes\n").unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
@@ -533,7 +544,7 @@ async fn headers_file_holds_the_fresh_token_at_send_time() {
         None,
         Some("Authorization: Bearer stale-token-from-last-run\n"),
     ] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let plan = plan_at(dir.path(), "this-host");
         if let Some(stale) = stale {
             std::fs::write(&plan.headers_path, stale).unwrap();
@@ -706,7 +717,7 @@ async fn live_sender_sends_the_fresh_token_on_clean_host_and_rerun() {
         Some("Authorization: Bearer stale-token-from-last-run\n"),
     ] {
         let sink = AuthSink::answering(200);
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let mut plan = plan_at(dir.path(), "this-host");
         plan.endpoint = sink.base_url();
         if let Some(stale) = stale {
@@ -743,7 +754,7 @@ async fn live_sender_classifies_receiver_statuses() {
         (503, false),
     ] {
         let sink = AuthSink::answering(status);
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let mut plan = plan_at(dir.path(), "this-host");
         plan.endpoint = sink.base_url();
         let sender = OtlpProbeSender::new(plan.endpoint.clone(), plan.headers_path.clone());
