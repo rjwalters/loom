@@ -133,9 +133,11 @@ fn a_verified_red_main_fix_bypasses_the_backoff_but_priority_does_not() {
         .iter()
         .filter(|r| r.issue != 9)
         .all(|r| !r.main_red_fix));
-    // Not an ordering key: the VI (level 2) still ranks ahead of the fix.
+    // #11547: on a verified-red main the fix leads the published rank, ahead
+    // of the VI (level 2). Ordering only; the back-off counts above are the
+    // gate behaviour and are unchanged.
     let rank = |n: u32| rows.iter().find(|r| r.issue == n).unwrap().rank;
-    assert!(rank(5) < rank(9));
+    assert!(rank(9) < rank(5));
 
     // Without a verified-red main the marker is inert: the fix waits too.
     let mut multi = vec![(FakeSource::once(vec![fix(9)]), RecordingDispatcher::default())];
@@ -171,10 +173,11 @@ fn not_held_is_the_repo_cap_tick_exactly() {
         }
         format!("{r:?}")
     };
-    // The very-important #2 sorts first and fills the repo's cap of 1;
-    // nothing overflows it (#11508).
+    // On this verified-red repo the fix #4 sorts first (#11547, ahead of the
+    // very-important #2) and fills the repo's cap of 1; nothing overflows it
+    // (#11508).
     assert_eq!(via_backoff.admissions.len(), 1);
-    assert_eq!(a[0].1.dispatched, vec![2]);
+    assert_eq!(a[0].1.dispatched, vec![4]);
     assert_eq!(unstamped(via_backoff.clone()), unstamped(via_repo_cap));
     assert_eq!(a[0].1.dispatched, b[0].1.dispatched);
     assert_eq!((via_backoff.deferred_build_backoff, via_backoff.build_backoff_held), (0, false));
