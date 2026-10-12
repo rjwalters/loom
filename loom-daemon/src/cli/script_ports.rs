@@ -375,6 +375,28 @@ pub(crate) enum ScriptPortCommand {
     /// refused with nothing mutated, 2 the rebase itself failed.
     ReconcileStack(super::reconcile_stack::ReconcileStackArgs),
 
+    /// Build a PINNED `--force-with-lease=<branch>:<oid>` push argument, or
+    /// refuse (#9487). Backs the lease capture in `reconcile-stack.sh` and
+    /// `rebase-stacked-children.sh`. A bare `--force-with-lease` compares
+    /// against `refs/remotes/<remote>/<branch>`, a ref shared by every linked
+    /// worktree of a Loom clone that a sibling's fetch can advance — so the
+    /// lease is satisfied by construction and the push silently deletes the
+    /// sibling's commit (the live PR #9483 incident). Exit 0 + the argument
+    /// on stdout, 3 the remote could not be queried, 4 the remote holds
+    /// commits this checkout never incorporated. There is no bare-flag
+    /// fallback by design: see `cli/push_lease.rs`.
+    #[command(subcommand)]
+    PushLease(super::push_lease::PushLeaseCommand),
+
+    /// May this repository's PR branches be rebased (#10771)? `strategy`
+    /// prints `merge` or `rebase` for the roles and stack scripts that bring a
+    /// PR branch up to date. `merge` (the answer whenever the forge does not
+    /// positively allow rebase merges, or anything is unknown) means merge the
+    /// default branch in and push without force — a rebase in a merge-only
+    /// repo deletes other agents' merge commits and orphans reviewed heads.
+    #[command(subcommand)]
+    BranchUpdate(super::branch_update::BranchUpdateCommand),
+
     /// Generate `.agents/skills/loom-<name>/SKILL.md` from every
     /// `defaults/roles/<name>.md` role prompt (#8673) — the cross-vendor
     /// skill-discovery surface Codex, Kimi Code, Mistral Vibe, and Grok read
@@ -392,6 +414,13 @@ pub(crate) enum ScriptPortCommand {
     /// citation as a miss — on a script that BLOCKS FILING. Ported out of the
     /// `contract`-category script per the shell language policy.
     GitBlobLines(super::git_blob_lines::GitBlobLinesArgs),
+
+    /// Curator's Affected-Files preflight (#9400): `affected-files check`
+    /// classifies each listed path against the build base. Not a port: it
+    /// replaces a bash loop inlined in the Curator prompt, which parked every
+    /// issue that listed a file it creates.
+    #[command(subcommand)]
+    AffectedFiles(super::affected_files_check::AffectedFilesCommand),
 
     /// The fleet singleton-job captain gate (#8848), shell-facing half: is
     /// THIS host the one declared to run `<job-name>`? Exit 0 arm, 3 another
@@ -421,13 +450,23 @@ pub(crate) enum ScriptPortCommand {
     /// manifest or an unrecognized `launch` key.
     RuntimeLaunchEnv(super::runtime_launch_cmd::RuntimeLaunchEnvArgs),
 
-    /// The fleet-wide `loom:blocked` re-check (#8927): every open
-    /// `loom:blocked` issue whose cited blocker has since closed/merged (a
-    /// stale block), plus every one carrying the label with no parseable
-    /// blocker reference at all (an undocumented block). The fourth pre-wave
-    /// advisory check, backing `check-stale-blocked.sh`. Strictly read-only,
-    /// **always exit 0** — it reports, it never relabels. Not a port: brand-new
-    /// logic, native from the start per the shell-language policy.
+    /// The per-repository `loom:blocked` re-check (#8927): one invocation
+    /// examines one repository (the one `--repo` / `--repo-root` resolves) and
+    /// reports every open `loom:blocked` issue or PR whose cited blocker has
+    /// since closed/merged (a stale block), plus every one carrying the label
+    /// with no parseable blocker reference at all (an undocumented block). The
+    /// fourth pre-wave advisory check, backing `check-stale-blocked.sh`.
+    /// Strictly read-only, **always exit 0** — it reports, it never relabels.
+    ///
+    /// Do not loop it across many repositories by hand (#9191): each
+    /// invocation is a fresh process with no rate-limit breaker (that exists
+    /// only in the running daemon), so a refusal stops nothing and reaches no
+    /// later repository, and the budget floor cannot see a GitHub secondary
+    /// rate limit. See `.loom/docs/github-authentication.md`
+    /// -> "Secondary rate limits and hand-rolled loops".
+    ///
+    /// Not a port: brand-new logic, native from the start per the
+    /// shell-language policy.
     CheckStaleBlocked(super::stale_blocked::StaleBlockedArgs),
 
     /// The `PreToolUse` decision for the `mcp__loom__*` tool namespace (#9108),
@@ -636,8 +675,11 @@ impl ScriptPortCommand {
             ScriptPortCommand::PremiseCheck(args) => args.run(),
             ScriptPortCommand::OperatorDecision(cmd) => cmd.run(),
             ScriptPortCommand::ReconcileStack(args) => args.run(),
+            ScriptPortCommand::PushLease(cmd) => cmd.run(),
+            ScriptPortCommand::BranchUpdate(cmd) => cmd.run(),
             ScriptPortCommand::GenerateAgentSkills(args) => args.run(),
             ScriptPortCommand::GitBlobLines(args) => args.run(),
+            ScriptPortCommand::AffectedFiles(cmd) => cmd.run(),
             ScriptPortCommand::FleetCaptain(args) => args.run(),
             ScriptPortCommand::RoleToolPolicy(cmd) => cmd.run(),
             ScriptPortCommand::RuntimeLaunchEnv(args) => args.run(),
@@ -693,6 +735,12 @@ pub(crate) enum MergePrCommand {
     /// success, 0+UNVERIFIED = no definite verdict (caller warns), 1 = refuse,
     /// 2 = forge unreachable (caller warns).
     CiResult(super::merge_pr_ci_result::CiResultArgs),
+
+    /// Refuse a plain (non-`--auto`) merge whose head has a required context
+    /// that concluded red (#10688); hold (exit 3) on a missing/pending one.
+    /// `--allow-red-required <ctx>` overrides named contexts with an audit
+    /// comment. Exit 0 = clean/bypassed, 1 = refuse, 2 = forge unreadable.
+    RequiredChecks(super::merge_pr_required_checks::RequiredChecksArgs),
 
     /// The stale-cached-mergeable recheck decision (#6104): once REST
     /// `.mergeable` has read `false`, classify the backoff re-reads plus the
@@ -957,6 +1005,13 @@ pub(crate) enum MergePrCommand {
     /// decision — see `cli::merge_pr_closed_building`.
     ClosedBuilding(super::merge_pr_closed_building::ClosedBuildingArgs),
 
+    /// Did THIS PR's merge close `--issue` (#8942)? The gate in front of
+    /// Champion Step 4's negated-reference reopen. Facts on stdin (the
+    /// `--print-query` GraphQL response and/or REST issue + pull objects);
+    /// exit 0 = yes, 1 = no, 3 = could not answer, each with one
+    /// `LOOM-CLOSED-BY-MERGE` line — see `cli::merge_pr_closed_by_merge`.
+    ClosedByMerge(super::merge_pr_closed_by_merge::ClosedByMergeArgs),
+
     /// The post-merge stacked-child reconcile PLAN (#3747 item 1): the
     /// parent-branch gate, the `[{number, headRefName}]` children-rollup parse
     /// (on stdin) and each child's derived issue number. Prints
@@ -1046,6 +1101,7 @@ impl MergePrCommand {
             MergePrCommand::TreeChecks(args) => args.run(),
             MergePrCommand::ChainLock(args) => args.run(),
             MergePrCommand::CiResult(args) => args.run(),
+            MergePrCommand::RequiredChecks(args) => args.run(),
             MergePrCommand::HeadSyncRetry(args) => args.run(),
             MergePrCommand::RedateChecks(args) => args.run(),
             MergePrCommand::RedateReport(args) => args.run(),
@@ -1077,6 +1133,7 @@ impl MergePrCommand {
             MergePrCommand::PartialComment(args) => args.run(),
             MergePrCommand::ClassifyResponse(args) => args.run(),
             MergePrCommand::ClosedBuilding(args) => args.run(),
+            MergePrCommand::ClosedByMerge(args) => args.run(),
             MergePrCommand::ReconcilePlan(args) => args.run(),
             MergePrCommand::ReconcileChild(args) => args.run(),
             MergePrCommand::RetargetChildren(args) => args.run(),

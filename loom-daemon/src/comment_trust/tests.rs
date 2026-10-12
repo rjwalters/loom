@@ -242,6 +242,10 @@ fn verdict_sha_readers_go_through_the_trust_filter() {
         // gh_lifecycle.rs`) filters through `TrustPolicy::for_root` before
         // `extract_latest_verdict_sha` sees a body.
         ("forge_merge_queue/lifecycle_tests.rs", "test fixture"),
+        // #10156: fixture only. Feeds a human comment carrying a verdict marker
+        // through the real `COMMENTS_JQ` to prove the hold's fingerprint filter
+        // excludes only its own marker; it reads no forge comments.
+        ("sweep_registry/noop_cooldown/hold/tests.rs", "test fixture"),
         // #10581: parses markers out of bodies `forge_verdict_cmd` already read
         // through `fetch_trusted_comments`; it fetches nothing itself.
         ("verdict_gate.rs", "parses already-filtered bodies"),

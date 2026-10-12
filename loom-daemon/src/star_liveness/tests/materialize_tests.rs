@@ -13,9 +13,11 @@ const AT: &str = "2026-09-28T09:00:00Z";
 const EARLY: &str = "2026-09-20T09:00:00Z";
 
 fn starred(input: &mut RepoInput, n: u32, at: &str) {
-    let mut row = tick_row(&input.root, n, QueueDisposition::Parked);
-    row.operator_priority_at = Some(at.into());
-    input.tick_rows.push(row);
+    // #11508: the ready-queue row no longer carries a starred-at.
+    let _ = at;
+    input
+        .tick_rows
+        .push(tick_row(&input.root, n, QueueDisposition::Parked));
 }
 
 fn park_body(children: &[u32]) -> String {
@@ -61,7 +63,8 @@ fn a_park_recorded_decomposition_gets_the_star_label_on_every_child() {
     for (n, m) in got {
         assert!((11..=13).contains(&n));
         assert_eq!(m.root, 10);
-        assert_eq!(m.requested_at.as_deref(), Some(AT));
+        // #11508: the ready-queue row no longer carries P's starred-at.
+        assert_eq!(m.requested_at, None);
     }
 }
 
@@ -80,7 +83,9 @@ fn a_materialized_child_is_not_a_root_of_its_own() {
     for n in 11..=13 {
         let row = r.rows.iter().find(|row| row.issue == n).unwrap();
         assert_eq!(row.inherited_from, Some(10), "#{n} is still P's child");
-        assert_eq!(row.operator_priority_at.as_deref(), Some(AT));
+        // #11508: no row starred-at any more; the createdAt fallback.
+        let created = format!("2026-09-{:02}T00:00:00Z", n + 1);
+        assert_eq!(row.operator_priority_at.as_deref(), Some(created.as_str()));
     }
 }
 
@@ -178,7 +183,8 @@ fn a_parent_closed_while_starred_leaves_its_children_starred() {
 }
 
 /// AC 6: a child of two starred parents keeps the star until both are
-/// unstarred, and it carries the earlier parent's starred-at.
+/// unstarred. Since #11508 the row starred-ats are not read, so the
+/// earlier-created parent (#1) is the root.
 #[test]
 fn a_child_of_two_starred_parents_keeps_the_star_until_both_lose_theirs() {
     let world = World::default();
@@ -193,13 +199,12 @@ fn a_child_of_two_starred_parents_keeps_the_star_until_both_lose_theirs() {
     host.pass(&world, std::slice::from_ref(&input), Vec::new(), t(10, 0));
     let got = markers(&world, slug);
     assert_eq!(got.len(), 1);
-    assert_eq!(got[0].1.root, 2, "the earlier star is the root");
-    assert_eq!(got[0].1.requested_at.as_deref(), Some(EARLY));
+    assert_eq!(got[0].1.root, 1, "the earlier-created star is the root");
     // The root the marker names loses its star; the other still reaches #3.
-    world.human_unstar(slug, 2);
-    host.pass(&world, std::slice::from_ref(&input), Vec::new(), t(10, 2));
-    assert!(world.starred(slug, 3), "#1 still reaches it");
     world.human_unstar(slug, 1);
+    host.pass(&world, std::slice::from_ref(&input), Vec::new(), t(10, 2));
+    assert!(world.starred(slug, 3), "#2 still reaches it");
+    world.human_unstar(slug, 2);
     host.pass(&world, &[input], Vec::new(), t(10, 4));
     assert!(!world.starred(slug, 3), "no starred parent is left");
 }

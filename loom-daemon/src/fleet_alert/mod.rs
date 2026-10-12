@@ -16,7 +16,11 @@
 //!   RAM headroom holding the cap below `maxConcurrent`, and a starred
 //!   backlog more than 3x the cap.
 //! - [`task`] delivers each transition to its sinks: the event bus (relayed
-//!   to Matrix by Safehouse). Loom sends no inbox mail (#11087).
+//!   to Matrix by Safehouse) and, independently, loom-ui's Alerts page
+//!   ([`loom_ui`], #11295). Loom sends no inbox mail (#11087).
+//!
+//! The evaluator is off by default (`autonomous.fleetAlert.enabled`); the
+//! fleet defaults (fleet-gitops) are where it is turned on fleet-wide.
 //!
 //! **No forge calls anywhere in this path**: the whole point is that the alert
 //! still arrives while `gh` is rate-limited. `loom-daemon health` output and
@@ -32,6 +36,7 @@ use crate::types::DaemonStatusReport;
 
 pub mod capacity;
 pub mod causes;
+pub mod loom_ui;
 pub mod outputs;
 pub mod state;
 pub mod task;

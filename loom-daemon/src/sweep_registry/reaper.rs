@@ -848,8 +848,10 @@ impl SweepRegistry {
             // #4463/#5017/#5282: a claim held elsewhere (locally superseded OR
             // forge-superseded) means a different sweep now holds the claim —
             // never restore the label out from under it.
+            // #11438: a dispatch that self-reported a no-op release before the
+            // cancel landed deliberately left `loom:issue` off — keep it off.
             if !self.config.skip_label_flip && !produced_pr && !claim_held_elsewhere {
-                let _ = self.restore_label_to_ready(*issue);
+                let _ = self.restore_label_after_reap(*issue, sweep_id);
                 self.note_label_flip(*issue); // #4485 flap detection
             }
             // Durable terminal-outcome record (Issue #4644) — a cancel is a
@@ -969,9 +971,10 @@ impl SweepRegistry {
         // has aged past the configured window before this tick's work. Cheap
         // early-return when nothing is quarantined.
         self.expire_quarantine();
-        // Retry any previously-failed quarantine label restores (Issue #4110).
-        // Cheap early-return when nothing is pending.
-        self.retry_pending_quarantine_releases();
+        // Retry any previously-failed quarantine label restores (Issue #4110)
+        // and release no-op holds whose inputs changed (Issue #10156). Cheap
+        // early-return when nothing is pending or held.
+        self.release_pending_holds();
         // SIGKILL-escalate any orphaned process group that survived a
         // crash-path SIGTERM (Issue #4980). Cheap early-return when nothing is
         // pending; never blocks (the grace is deadline-based, not slept).
@@ -1089,7 +1092,7 @@ impl SweepRegistry {
                             // #4463: never restore the label when a newer sweep
                             // owns the lock — it is actively building.
                             if !self.config.skip_label_flip && !superseded {
-                                let _ = self.restore_label_to_ready(issue);
+                                let _ = self.restore_label_after_reap(issue, &sweep_id);
                                 self.note_label_flip(issue); // #4485 flap detection
                             }
                             let checkpoint_phase = read_checkpoint_phase(&checkpoint);
@@ -1534,7 +1537,7 @@ impl SweepRegistry {
                                             // end to end under `&mut self`, so
                                             // it cannot let its caller release
                                             // the registry mutex for the poll.
-                                            // Calling `begin_issue_dispatch`
+                                            // Calling the begin step
                                             // directly instead — the same
                                             // first step
                                             // `dispatch_resume_after_crash`
@@ -1544,13 +1547,14 @@ impl SweepRegistry {
                                             // so a `Spawned` child's poll can
                                             // be deferred to the caller instead
                                             // of run here inline.
-                                            match self.begin_issue_dispatch(
+                                            match self.begin_issue_dispatch_with_model(
                                                 &SweepKind::Issue(issue),
                                                 None,
-                                                None,
+                                                DispatchModel::Resolved(None),
                                                 None,
                                                 None,
                                                 Some(pr),
+                                                DispatchOrigin::ReaperRetry,
                                             ) {
                                                 Ok(BeginIssueDispatch::Done(result)) => {
                                                     self.log_and_emit_resume_result(
@@ -1739,7 +1743,7 @@ impl SweepRegistry {
                             // #4463: skip the restore when a newer sweep owns
                             // the lock (superseded) — it holds the live claim.
                             if !self.config.skip_label_flip && !produced_pr && !superseded {
-                                let _ = self.restore_label_to_ready(issue);
+                                let _ = self.restore_label_after_reap(issue, &sweep_id);
                                 self.note_label_flip(issue); // #4485 flap detection
                             }
                             // #7528: the claim restore above is deliberately

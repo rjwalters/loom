@@ -79,6 +79,7 @@ pub fn start_pause_roll(
         );
     };
     let Some(manifest_path) = pause_manifest::manifest_path() else {
+        super::loom_ui::pause_failed(env!("CARGO_PKG_VERSION"), "no pause-manifest state dir");
         return refuse(
             "pause-failed",
             "no state directory resolves for the pause manifest (no home directory and \
@@ -126,6 +127,7 @@ pub fn start_pause_roll(
         return refuse_as("roll-attempt-backoff", &key, why);
     }
     let (tuning, rejected) = PauseRollTuning::resolve(fallback_root);
+    super::loom_ui::config_checked(rejected.as_deref()); // #11295
     if let Some(why) = rejected {
         log::error!("pause_roll: {why}");
         let _ = event_bus
@@ -260,6 +262,7 @@ pub(crate) fn end_unfinished(
         ledger.undo(host);
         host.close_dispatch(false, ledger.id());
         log::error!("pause_roll: {note}");
+        super::loom_ui::pause_failed(&plan.from_version, &note); // #11295
         host.emit(
             "daemon.roll.pause_failed",
             serde_json::json!({ "manifest_id": ledger.id(), "error": why }),

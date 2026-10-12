@@ -19,18 +19,13 @@
 //! (candidates, weights, roll, pick) are kept on the [`TickReport`] and
 //! exported in `pick.decision`, so a fixed seed reproduces the exact order.
 //!
-//! # Transitional level bridge
-//!
-//! Until the retired labels are migrated (#11103 slices 2 and 4),
-//! [`effective_level`] also maps the legacy signals onto the new levels:
-//! the star (`loom:operator-priority`) is `important`, a level-2 star and a
-//! verified red-main fix are `very-important`. The bridge goes with the
-//! legacy readers.
+//! The level is the issue's own `loom:important` / `loom:very-important`
+//! label ([`Level::of`]); there is no legacy bridge (#11508).
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, VecDeque};
 
-use super::{PriorityCandidate, TickReport, WorkItem};
+use super::{PriorityCandidate, TickReport};
 use crate::priority_pick::{self, IssueKey, Level, PickRng, WorkspaceDraw, WorkspaceEntry};
 use crate::workspace_registry::DEFAULT_WORKSPACE_PRIORITY;
 
@@ -72,21 +67,6 @@ pub fn workspace_key(idx: usize) -> String {
 #[must_use]
 pub fn workspace_idx(key: &str) -> Option<usize> {
     key.parse().ok()
-}
-
-/// `item`'s priority level: its `loom:important` / `loom:very-important`
-/// label, raised by the transitional legacy bridge (see the module docs).
-/// `red_fix` is whether it is a red-main fix on a verified-red `main`.
-#[must_use]
-pub fn effective_level(item: &WorkItem, red_fix: bool) -> Level {
-    let legacy = if red_fix || item.operator_level() >= 2 {
-        Level::VeryImportant
-    } else if item.is_operator_priority() {
-        Level::Important
-    } else {
-        Level::Default
-    };
-    Level::of(&item.labels).max(legacy)
 }
 
 fn issue_key(c: &PriorityCandidate) -> IssueKey {

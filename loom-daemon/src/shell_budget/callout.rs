@@ -199,14 +199,47 @@ fn contains_word(haystack: &str, word: &str) -> bool {
     false
 }
 
+/// The rendering flags for the one `git diff` whose TEXT [`measure_evidence`]
+/// parses (#9529).
+///
+/// The parser depends on two properties of that text, and git's defaults for
+/// both are overridable from repo, global or system config — so each is pinned
+/// here rather than assumed:
+///
+///  - **The `+++` header is `b/<path>`.** `diff.mnemonicPrefix` writes `w/`,
+///    `diff.dstPrefix` writes anything; either leaves a path that misses
+///    `Budget::by_file`, and a present, correct call-site is refused as absent.
+///    Explicit prefix flags override all three prefix settings, `diff.noprefix`
+///    included.
+///  - **A hunk is one contiguous block of added lines.** `--unified=0` alone
+///    does not deliver that: `diff.interHunkContext` fuses neighbouring hunks,
+///    and every added line of a matching hunk is credited — so an unrelated
+///    line near a call-site was billed to the callout.
+///
+/// `--no-ext-diff` (which also covers `GIT_EXTERNAL_DIFF`) and `--no-textconv`
+/// keep the hunk bodies the script's own bytes, not another program's output.
+///
+/// `secret_scan.rs` has a sibling `DIFF_FLAGS`. The two are deliberately not
+/// shared: that one needs `--no-renames` and reads no paths or hunk shapes.
+pub const EVIDENCE_DIFF_FLAGS: &[&str] = &[
+    "--unified=0",
+    "--no-color",
+    "--no-ext-diff",
+    "--no-textconv",
+    "--src-prefix=a/",
+    "--dst-prefix=b/",
+    "--inter-hunk-context=0",
+];
+
 /// Measure, from a unified diff, how many added code lines each declared
 /// subcommand's call-site is actually made of.
 ///
 /// The unit of attribution is the HUNK, not the line. A call-site is not one
 /// line — it is the invocation plus the lines that build its arguments and read
-/// its result, and those arrive as one contiguous block. `--unified=0` makes a
-/// hunk exactly that block: it carries no context lines, so every added line in
-/// it is adjacent in the new file.
+/// its result, and those arrive as one contiguous block. `--unified=0` with
+/// `--inter-hunk-context=0` ([`EVIDENCE_DIFF_FLAGS`]) makes a hunk exactly that
+/// block: it carries no context lines, so every added line in it is adjacent
+/// in the new file.
 ///
 /// A hunk is credited to a declared subcommand when BOTH hold:
 ///
@@ -286,8 +319,9 @@ fn parse_new_path(header: &str) -> Option<String> {
     if path == "/dev/null" {
         return None;
     }
-    // git writes `b/<path>`; `--no-prefix` and `/dev/null` are the only other
-    // shapes this ever sees.
+    // `EVIDENCE_DIFF_FLAGS` pins `--dst-prefix=b/`, so `b/<path>` and
+    // `/dev/null` are the only shapes the production diff produces. The bare
+    // path fallback is for a hand-written diff, not for `diff.noprefix`.
     Some(path.strip_prefix("b/").unwrap_or(path).to_string())
 }
 
@@ -433,3 +467,6 @@ pub fn render_granted(declared: &[CalloutDeclaration], evidence: &[CalloutEviden
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod hostile_git;

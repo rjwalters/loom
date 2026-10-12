@@ -92,6 +92,7 @@ use crate::fleet_store::{self as store, StoreLocation};
 
 pub mod checkout_ff;
 mod floor_knowledge;
+mod loom_ui;
 pub mod offline_floor;
 pub mod roster_clone;
 pub mod workspace_resync;
@@ -307,11 +308,15 @@ pub fn config_pass(
         let drifted = drift != Drift::InSync;
         let mut wrote = false;
         let mut detail = describe_drift(&drift);
+        let keys = crate::config_journal::restart_keys(target, mode == Mode::Write && drifted);
         if mode == Mode::Write && drifted {
             let lost = render::lost_top_level_keys(target);
             if lost.is_empty() {
                 match render::write(target, &stamp) {
-                    Ok((w, _backup)) => wrote = w,
+                    Ok((w, backup)) => {
+                        wrote = w;
+                        crate::config_journal::record_rendered(w, target, backup, &commit, &keys);
+                    }
                     Err(e) => {
                         error = Some(format!("writing {}: {e:#}", target.path.display()));
                     }
@@ -767,7 +772,9 @@ fn publish_checkouts(found: Option<&[checkout_ff::CheckoutReport]>, note: Option
 fn write_status(path: &Path, status: &FleetSyncStatus) -> Result<()> {
     let mut body = serde_json::to_vec_pretty(status)?;
     body.push(b'\n');
-    fetch::write_atomic(path, &body)
+    fetch::write_atomic(path, &body)?;
+    crate::config_journal::record_sync(status); // J3 shadow, after the legacy write
+    Ok(())
 }
 
 /// The last pass this process recorded, if any.
@@ -818,10 +825,13 @@ pub fn clear_status() {
         return;
     };
     match std::fs::remove_file(&path) {
-        Ok(()) => log::info!(
-            "fleet_sync: no fleet store configured — removed the stale snapshot {}",
-            path.display()
-        ),
+        Ok(()) => {
+            log::info!(
+                "fleet_sync: no fleet store configured — removed the stale snapshot {}",
+                path.display()
+            );
+            crate::config_journal::record_sync_cleared();
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => log::debug!("fleet_sync: could not remove {}: {e:#}", path.display()),
     }
@@ -1034,6 +1044,8 @@ fn run_pass(inputs: &PassInputs, pass: &str, mode: Mode, now: DateTime<Utc>) -> 
     // #10885: a floor that differs from the previous pass's wakes the
     // self-update loop, so it acts now and not at its next interval.
     floor_knowledge::record_floor(&floor);
+    // J3 shadow (#11349): config as resolved after this pass (deduplicated).
+    crate::config_journal::record_resolved(&inputs.workspace);
     FleetSyncStatus {
         repo: inputs.location.repo.clone(),
         reference: inputs.location.reference.clone(),
@@ -1160,6 +1172,7 @@ fn report(status: &FleetSyncStatus, bus: Option<&crate::event_bus::EventBus>) {
         log::debug!("fleet_sync: {summary}");
     }
     roster_clone::announce(status, bus);
+    loom_ui::report(status); // #11295
     let (Some(bus), true) = (bus, status.drifted() || status.errored()) else {
         return;
     };

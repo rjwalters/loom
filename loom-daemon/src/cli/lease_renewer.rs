@@ -177,7 +177,7 @@ pub(crate) struct Store {
 }
 
 impl Store {
-    fn from_env() -> Self {
+    pub(crate) fn from_env() -> Self {
         let dir = std::env::var(STATE_DIR_ENV)
             .ok()
             .filter(|v| !v.trim().is_empty())
@@ -407,7 +407,7 @@ pub(crate) fn start_identity(pid: u32) -> Option<String> {
     (!s.is_empty()).then(|| format!("lstart:{s}"))
 }
 
-fn owner_is_live(pid: u32, ident: &str) -> bool {
+pub(crate) fn owner_is_live(pid: u32, ident: &str) -> bool {
     loom_daemon::live_claim::pid_is_live_process(pid)
         && (ident.is_empty() || start_identity(pid).as_deref() == Some(ident))
 }

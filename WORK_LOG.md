@@ -6,7 +6,117 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-10-11
+
+- **PR #10173**: feat: daemon-enforced hold for no-op dispatch loops (#10156)
+- **PR #11428**: feat(stashes): read issue state via the daemon's forge routing (#8876)
+- **PR #11427**: fix(runtime-preference): skip a tier-3 tap whose CLI binary is not installed
+- **PR #11303**: feat(worker): worker run --role builder|doctor (Slice 1 of #11285)
+- **PR #11413**: fix(work-finder): make loom:epic a skip label so an approved epic is never dispatched
+- **PR #11397**: feat(observability): sample Z.ai seat quota into tokens.snapshot
+- **PR #11409**: eta.stage_outcome: derive fact_id deterministically for every exit, else a missing reason
+- **PR #11408**: fix: exempt a bare "What happened" heading from the incident-report trigger
+- **PR #11404**: fix(sweep): skip loom:epic containers in Mode A/B pre-flight without requeueing them
+- **PR #11395**: fix(daemon): re-mint and retry once when a forge write is refused as not accessible by the integration
+- **PR #11392**: feat: J3 configuration shadow journal records (#11349)
+- **PR #11393**: feat(fleet.state): forge-dated entered_at, rework, conflict/ci_fail, holds, star/level on every row
+- **PR #11390**: fix(install): make the shipped issue templates repo-neutral
+- **PR #11387**: fix(resync): recognise the daemon's resync commit subject in the local-fix guard
+- **Issue #10156** (closed): Daemon re-dispatches human-gated/blocked issues forever after no-op sweeps (275 after-curator loops, ~600M tokens/24h)
+- **Issue #8876** (closed): loom-daemon stashes can never retire anything on a private repo: it reads issue state via ambient gh auth, not the App credential the daemon already mints
+- **Issue #9368** (closed): runtimes: preference fall-through taps a runtime whose binary is absent — hard failure instead of a clean skip
+- **Issue #11421** (closed): Auditor Capability Request: install build toolchain on auditor host
+- **Issue #11399** (closed): Daemon re-queues a loom:issue epic after the sweep session skips it: reaper restores loom:issue, work finder has no loom:epic skip
+- **Issue #11396** (closed): Z.ai seats are invisible on loom-ui Tokens/Q1: sample the api-keys pool's quota into the collector's account readings
+- **Issue #8984** (closed): link_dogfood_agent_skills falsely reports success on non-unix (no #6440-style fallback)
+- **Issue #11401** (closed): eta.stage_outcome: fact_id is empty on 100% of sweep-stage and merge_hold exits and 6-18% of others; derive it deterministically
+- **Issue #9549** (closed): premise-check: a bare 'What happened' heading gates ordinary bug reports as incident reports
+- **Issue #8881** (closed): sweep-wave-lifecycle.md Mode A/B pre-flight has no loom:epic skip rule — sessions improvise, often restoring loom:issue
+- **Issue #9247** (closed): daemon: re-mint and retry once when a write hits 'Resource not accessible by integration' (public-repo sibling of #6171)
+- **Issue #11349** (closed): [Epic #9908] Phase 2e: Configuration snapshot journal shadow records
+- **Issue #11391** (closed): fleet.state rows: forge-dated entered_at (96% are lower bounds after a restart), plus rework, conflict/ci_fail, all holds, and star/level on every row, for the ETA fit features
+- **Issue #9001** (closed): Rebasing a resync PR can silently drop its install-metadata.json payload with no conflict signal
+- **Issue #8862** (closed): Installed issue templates send consumer-repo issue filers to Loom's own Discussions
+- **Issue #8920** (closed): resync-installed.sh's local-fix guard does not recognise the daemon's resync commit as routine lineage (residual of the stale-copy false positives)
+
+- **PR #11383**: feat(journal): shared bounded journal core and verify seam (Phase 2a)
+- **PR #11382**: fix(sweep): base-conflict rebase pass no longer spends the Doctor-cycle cap
+- **PR #11379**: fix(stashes): fail a run whose every issue-state lookup fails (#8876 Part B)
+- **PR #11380**: docs(stale-blocked): describe check-stale-blocked as per-repository and document the hand-rolled loop hazard
+- **PR #11378**: feat(fleet_state): pre-ready triage_wait/approval_wait stage outcomes (#11368)
+- **Issue #11345** (closed): [Epic #9908] Phase 2a: Shared bounded journal core and verification seam
+- **Issue #9265** (closed): Sweep Doctor-cycle cap counts merge-conflict-only rebases caused by main moving
+- **Issue #9191** (closed): check-stale-blocked calls itself fleet-wide but is per-repo, and the obvious fleet loop triggers secondary rate limiting
+- **Issue #11368** (closed): eta.stage_outcome: add pre-ready stages triage_wait and approval_wait
+
 ### 2026-10-10
+
+- **PR #11375**: telemetry: record resolved effort and full model ids on sweep facts (#11370)
+- **PR #11374**: fix(champion): gate the negated-reference reopen on closed-by-merge attribution
+- **PR #11373**: test: pin #9973 reset-test holder (detached git maintenance) with trace2 regression
+- **PR #11372**: eta.stage_outcome: forge-dated entered_at + entered_at_source; one ready_wait exit fact per claim (#11367)
+- **PR #11371**: fix(tokens): make check --source probe really probe bad-marked accounts and report probed + the standing mark
+- **Issue #11370** (closed): sweep facts: loom.effort absent on 100% of sweep.started/outcome (record the resolved effort); loom.model mixes aliases and ''
+- **Issue #8942** (closed): Champion Step 4 negation-guard reopen doesn't confirm the close came from this merge
+- **Issue #9973** (closed): Flaky: worktree_cli::reset rescue test unexpectedly hits the live-process veto under nextest
+- **Issue #11367** (closed): eta.stage_outcome: most wait-stage exits lack entered_at/dwell_sec (ready_wait 0 of 1,396), ready_wait 'unknown' floods, no pre-ready stages
+- **Issue #8972** (closed): tokens check --source probe does not probe a bad-marked account — it echoes the stored reason, so a stale bad-mark reads as confirmed
+- **Issue #8911** (closed): extraSkipLabels is bypassed by find-work tiers 1 and 2 (only the tier-3 fallback filters on skip-labels.sh)
+- **PR #11365**: fix(builder): apply the skip-label set to every find-work tier (#8911)
+- **Issue #11195** (closed): Docker image retention removes nothing on containerd-store workers: digest-only untagged images and unused third-party images (37.9 GB reclaimable on fleet worker)
+- **PR #11363**: fix(docker_image_clean): untagged digest-only images + pressure-gated unused image prune (#11195)
+- **Issue #11353** (closed): health: every daemon must export OTLP to SigNoz; report no_exporter / failing / exempt in loom status and host.health
+- **PR #11355**: health: report OTLP export state (no_exporter/failing/ok/exempt) in status and host.health
+- **Issue #9208** (closed): check-duplicate.sh's closed-issue dedup window (limit 20) lets month-old duplicates re-file
+- **PR #11362**: fix(check-duplicate): select the closed-issue pool by a 90-day keyword search
+- **Issue #11078** (closed): Decision: pause / shrink / remove the ETA prediction subsystem (paused during stability focus)
+- **Issue #11211** (closed): ETA repo_priority: exclude fleet: maintain records from fleet-membership rank
+- **Issue #9529** (closed): shell-budget callout evidence: pin git diff prefix/filter config (diff.mnemonicPrefix false-refuses a valid call-site)
+- **PR #11354**: fix(shell_budget): pin the callout evidence diff against git config (#9529)
+- **Issue #9397** (closed): check-stale-blocked reports all 62 Champion merge-risk digests as undocumented blocks — a digest has no blocker to cite
+- **PR #11351**: fix(stale_blocked): exclude Champion's merge-risk digest issue from the loom:blocked gather
+- **Issue #9129** (closed): A standalone 'loom-daemon init' leaves .loom/config/skill-routes.json absent — manifest-listed but copied only by install-loom.sh
+- **PR #11339**: fix(init): install defaults/config/*.json in loom-daemon init (#9129)
+- **Issue #10269** (closed): Builder preflight: classify new forge callers before requesting review
+- **PR #11342**: builder-pr: conditional forge-inventory preflight (#10269)
+- **Issue #9435** (closed): role runner: Doctor queue gate opens on an all-parked loom:changes-requested queue (follow-up to #9421)
+- **PR #11344**: fix(role_runner): keep the Doctor queue gate shut on an all-parked queue (#9435)
+- **Issue #10145** (closed): Builder preflight: check portable-shell budget before requesting review
+- **PR #11341**: docs(prompts): Builder/Doctor run shell-budget --check before review handoff
+- **Issue #11288** (closed): [Epic #9908] Inventory persistent stores and design authoritative journals (Phase 1)
+- **PR #11343**: docs: persistence inventory and one-journal-per-concern design (epic #9908 phase 1)
+- **PR #11226**: test(worktree_cli): harden reset rescue-test fixture against detached git maintenance (#9973)
+- **Issue #11149** (closed): check-main-clean build-tree filter: renames into a build tree drop the source deletion; partial daemon output vs warning (#11099 follow-ups)
+- **PR #11337**: fix(quarantine): rename into a build tree keeps its source deletion (#11149)
+- **PR #11335**: feat(work_finder): dispatch by weighted workspace draw, then level/oldest/number (part of #11103)
+- **Issue #11206** (closed): [ci-daily] Flake Detection (Rust)
+- **Issue #11207** (closed): [ci-daily] Full Suite (clean, unpartitioned)
+- **Issue #11291** (closed): Reconcile Builder installed-copy policy with pre-merge parity gates
+- **PR #11328**: Reconcile Builder installed-copy policy with pre-merge parity gates
+- **Issue #11182** (closed): RAM admission follow-ups from #11106: role-keyed history, one-tick gap, heavy-repo starvation, downgrade-safe store, stale unreadable scopes
+- **PR #11324**: RAM admission: role-keyed peaks, downgrade-safe store, stale scope age-out (#11182)
+- **Issue #9319** (closed): worktree.sh: the 'branch has already landed' remedy fails when a stale pr-<N> worktree still holds the branch
+- **PR #11319**: fix(worktree): name the worktree holding an already-landed branch in the refusal remedy (#9319)
+- **Issue #8961** (closed): resync-installed.sh hard-fails on a missing gitignored loom-source-path instead of falling back to the machine-level defaults mirror (#5389)
+- **PR #11266**: feat(resync): fall back to the daemon's embedded payload when no source tree resolves
+- **Issue #11148** (closed): Builder preflight: check vendored documentation links before requesting review
+- **PR #11310**: feat(opencode): plain-object plugin default export for 2.x (#11283)
+- **PR #11311**: refactor: forge-lease cross-host proof + ADR-0025; remove the Concierge role (#11112 slices 1+2)
+- **Issue #10880** (closed): auto-update persistence: follow-ups from #10877 (floor roll in a consumed window, rollback refetch loop, hardening)
+- **PR #11312**: auto-update: persisted failed-roll guard, held-roll alert, persistence hardening (#10880)
+- **PR #11309**: feat(egress-proxy): transparent observe mode, per-request telemetry (slice 1 of #11300)
+- **PR #11307**: feat(api-keys): reset-aligned cooldowns, in-run exhaustion marks, per-launch OpenCode burn, per-account pool gauges (#11286)
+- **Issue #11024** (closed): Build-slot test isolation follow-ups: one unserialised guard holder, and daemons spawned by the integration harness
+- **PR #11249**: test: isolate build slot for harness daemons (#11024)
+- **Issue #9781** (closed): Daemon dispatch: don't admit two same-repo candidates with overlapping Curator affected files in one tick (mirror sweep's #4161 wave rule)
+- **PR #11201**: Daemon dispatch: defer same-repo candidates with overlapping Affected Files (#9781)
+- **Issue #11136** (closed): Guard: pipe-curl-to-shell rule denies read-only curl piped through sed
+- **PR #11296**: fix(guard): pipe-to-shell rule false positive on quoted pipes (#11136)
+- **Issue #11280** (closed): telemetry: model, effort, runtime and attempt on sweep.started (knowable at dispatch, for ETA fits)
+- **PR #11294**: telemetry: model, effort, runtime and attempt on sweep.started and fleet.state running rows (#10196)
+- **Issue #10110** (closed): Build/runtime failure on main: health mistakes session-exec workers for the daemon
+- **PR #11293**: fix(health): exclude session-exec workers and probes from pgrep fallback (#10110)
+- **Issue #11204** (closed): Auditor Capability Request: Cargo toolchain for Rust validation hosts
 
 - **Issue #9492** (closed): Decide which other required CI jobs the local build gate should mirror (follow-up to #9140)
 - **PR #11281**: docs(build-gate): per-job CI coverage audit and installed-tree link independence (#9492)

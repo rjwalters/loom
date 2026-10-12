@@ -130,3 +130,40 @@ fn draw_records_candidates_weights_and_pick() {
     assert_eq!(v["picked"], d.picked);
     assert!(draw_workspace(&[], &mut PickRng::from_seed(1)).is_none());
 }
+
+/// ACCEPTANCE (#11509): with N+2 open very-important issues in a workspace
+/// (N = [`VERY_IMPORTANT_CAP`] = 1), exactly the N oldest keep the level, in
+/// any input order. The fixtures carry no actor: only number and age.
+#[test]
+fn only_the_oldest_very_important_issue_holds_the_cap() {
+    assert_eq!(VERY_IMPORTANT_CAP, 1);
+    let open = vec![
+        key(30, Some("2026-03-01T00:00:00Z"), &[VERY_IMPORTANT_LABEL]),
+        key(10, Some("2026-02-01T00:00:00Z"), &[VERY_IMPORTANT_LABEL]),
+        key(20, Some("2026-01-01T00:00:00Z"), &[VERY_IMPORTANT_LABEL]),
+    ];
+    assert_eq!(very_important_holders(&open), vec![20]);
+    let mut reversed = open.clone();
+    reversed.reverse();
+    assert_eq!(very_important_holders(&reversed), vec![20]);
+}
+
+#[test]
+fn very_important_holder_ties_break_by_number_and_dated_first() {
+    let same_age = vec![
+        key(9, Some("2026-01-01T00:00:00Z"), &[]),
+        key(4, Some("2026-01-01T00:00:00Z"), &[]),
+    ];
+    assert_eq!(very_important_holders(&same_age), vec![4]);
+    let undated = vec![key(1, None, &[]), key(8, Some("2026-05-01T00:00:00Z"), &[])];
+    assert_eq!(very_important_holders(&undated), vec![8]);
+    // A number listed twice (ready listing + VI listing) counts once, and its
+    // known age wins over a missing one.
+    let dup = vec![
+        key(5, None, &[]),
+        key(5, Some("2026-01-01T00:00:00Z"), &[]),
+        key(6, Some("2026-02-01T00:00:00Z"), &[]),
+    ];
+    assert_eq!(very_important_holders(&dup), vec![5]);
+    assert!(very_important_holders(&[]).is_empty());
+}

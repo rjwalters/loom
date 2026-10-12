@@ -989,7 +989,6 @@ exactly one sub-kind in the **same** command (additive; filters unchanged):
 | `loom:operator-blocked` | Waiting on a **named** issue/PR/piece of infrastructure that does not exist yet — self-clearing once that lands |
 | `loom:operator-mechanical` | Needs host or admin access, a credential, or another mechanical action — no judgement required |
 | `loom:operator-decision` | The act requires authority you structurally cannot hold — a preference call or an authority act (binds the entity, irreversible disclosure, spending, credentials only the operator holds, accepting risk on the entity's behalf, physical-world action) |
-| `loom:operator-objective` | The work is determined once the operator states an objective — name the candidate objectives and the answer under each (#5826) |
 
 ```bash
 # Builder parking a claimed issue on a decision: 2-4 ranked options, each with
@@ -1005,8 +1004,8 @@ it, name the axis along which two well-informed people would still disagree
 and show it is a preference, not a fact (the falsifiability test in
 `.loom/docs/label-state-machine.md`). If you cannot name that axis, the
 "decision" is really an unfinished derivation — keep working instead of
-parking it. If the only gap is an unstated objective, that is
-`loom:operator-objective`, not `loom:operator-decision`.
+parking it. If the only gap is an unstated objective, file a decision whose
+options are the candidate objectives (#10000).
 
 **If you chose `loom:operator-blocked`**, the same comment MUST name the blocker
 in machine-readable form: a literal `Blocked by #N` / `Depends on #N` /
@@ -1017,10 +1016,6 @@ pass can tell when the blocker clears.
 
 **If you chose `loom:operator-decision`**, the options' whys MUST name the
 disagreement axis and why it is a preference, not a fact.
-
-**If you chose `loom:operator-objective`**, the same comment MUST list the
-candidate objectives and the answer under each — not just "needs an
-objective."
 
 Full taxonomy and rationale: `.loom/docs/label-state-machine.md` →
 "`loom:operator-only` sub-kinds".
@@ -1049,12 +1044,19 @@ Workers use a three-level priority system to determine which issues to work on:
 
 ### How to Find Work
 
+Every tier filters on the resolved skip set (hard exclusions plus this repo's
+`autonomous.workFinder.extraSkipLabels`, #7528/#8255), so a priority label
+cannot lift a skip-labeled issue into a higher tier (#8911). Never swap in a
+bare `--label` query. Each `--jq` is DOUBLE-quoted so `$EXCL` expands.
+
 **Step 1: Check for starred issues first**
 
 ```bash
+EXCL="$(./.loom/scripts/skip-labels.sh --jq-not)"
 # level list: keep in sync with operator_levels.rs LEVELS until #10311
 for L in loom:operator-high-priority loom:high-priority-inherited loom:operator-priority; do
-gh issue list --label="loom:issue" --label="$L" --state=open --limit=5; done
+gh issue list --label="loom:issue" --label="$L" --state=open --limit=500 \
+  --json number,title,labels --jq ".[] | select($EXCL) | \"#\(.number): \(.title)\""; done
 ```
 
 If any exist, **claim one immediately**.
@@ -1062,7 +1064,9 @@ If any exist, **claim one immediately**.
 **Step 2: If none starred, check curated issues**
 
 ```bash
-gh issue list --label="loom:issue" --label="loom:curated" --state=open --limit=10
+EXCL="$(./.loom/scripts/skip-labels.sh --jq-not)"
+gh issue list --label="loom:issue" --label="loom:curated" --state=open --limit=500 \
+  --json number,title,labels --jq ".[] | select($EXCL) | \"#\(.number): \(.title)\""
 ```
 
 **Why prefer these**: human approved + Curator context.
@@ -1070,11 +1074,8 @@ gh issue list --label="loom:issue" --label="loom:curated" --state=open --limit=1
 **Step 3: If no curated, fall back to approved-only issues**
 
 ```bash
-# #7528/#8255: the exclusion fragment comes from the shared source (hard
-# exclusions plus this repo's autonomous.workFinder.extraSkipLabels), never a
-# hardcoded literal. Note the DOUBLE-quoted --jq so $EXCL expands.
 EXCL="$(./.loom/scripts/skip-labels.sh --jq-not)"
-gh issue list --label="loom:issue" --state=open --json number,title,labels \
+gh issue list --label="loom:issue" --state=open --limit=500 --json number,title,labels \
   --jq ".[] | select(([.labels[].name] | contains([\"loom:curated\"]) | not) and $EXCL) |
   \"#\(.number): \(.title)\""
 ```

@@ -9,8 +9,9 @@ everyone. The operator, Guide and Champion may all add or remove both.
 | important | `loom:important` |
 | very important | `loom:very-important` |
 
-`loom:very-important` is to be capped so it cannot be flooded; the cap is
-follow-up #11278 and is not enforced yet. Neither label is a
+`loom:very-important` is capped at **one per workspace** so it cannot be
+flooded (see "The very-important cap" below); `loom:important` is uncapped.
+Neither label is a
 hold, and the daemon never inherits either one: if a blocker must go first,
 whoever sets the priority labels the blocker too. That judgment belongs to
 roles (Guide, Champion), not to dispatch.
@@ -25,9 +26,14 @@ shared concurrency budget is filled in that order. The RNG is seeded once
 per tick, and the seed plus every draw are exported as
 `pick.decision.workspace_draw` (and the published plan's `position` is the
 draw order). The single-workspace tick uses the in-workspace order alone.
-Until the old labels are migrated, a legacy bridge maps
-`loom:operator-priority` to important, and `loom:operator-high-priority` and
-a verified red-main fix to very important.
+Since #11508 the level comes only from the two labels: there is no legacy
+bridge, so `loom:operator-priority` / `loom:operator-high-priority` carry no
+dispatch weight until they are migrated (table below).
+
+**Priority changes order, never eligibility or admission** (operator ruling,
+#11508). A priority issue is dispatched only once it is `loom:issue` (there is
+no priority side listing), and no priority exempts a candidate from any gate
+(caps, build back-off, file overlap, repo-sharding slice).
 
 ## Selection: workspace first, then issue
 
@@ -51,10 +57,35 @@ a verified red-main fix to very important.
    (`loom:very-important`, then `loom:important`, then none); oldest
    `createdAt` first; issue number ascending.
 
-**Removed ordering keys** (they go away as the rollout lands): the starred-at
-time and its `starred_at_store`, the red-main-fix key (whoever finds a
-red-main fix labels it `loom:very-important`), the inherited-level key, and
-the cross-workspace tier and round-robin interleave.
+**Removed ordering keys** (gone from dispatch since #11508): the star, the
+starred-at time and its restart store, the red-main-fix key, the
+inherited-level key, and the cross-workspace tier and round-robin interleave.
+A verified red-main fix is not a priority: it gains no place in the order, but
+keeps its bypass of the build back-off, the file-overlap gate and the
+repo-sharding slice, which a red `main` would otherwise deadlock.
+
+## The very-important cap (#11509)
+
+At any time, a workspace has at most one very-important issue:
+`priority_pick::VERY_IMPORTANT_CAP = 1` (a constant, not a config knob;
+operator ruling on #11278).
+
+- **Which one.** The oldest **open** `loom:very-important` issue of the
+  workspace, by `createdAt` then issue number (`very_important_holders`). Open
+  means any state: an issue being built (`loom:building`) or still in curation
+  keeps the slot, so a second one is not promoted while the first is in
+  flight. Every other open very-important issue ranks as `loom:important`.
+- **Where.** Labels cannot be refused when applied, so the cap is enforced at
+  dispatch, each tick, before the level is read (`work_finder/vi_cap.rs`).
+  The work finder reads the workspace's open very-important listing only
+  when its ready listing holds one; if that read fails it caps the ready
+  listing alone. Forge labels are never changed.
+- **Who.** No actor information is an input: the cap binds the operator,
+  Guide and Champion alike.
+- **Seen.** Each demotion is logged as a warning (once per issue per
+  process) and exported as `pick.decision.very_important_demoted`
+  (`repo`, `number`, `holder`). The ready queue shows the demoted issue at
+  the `important` level.
 
 ## Migration
 

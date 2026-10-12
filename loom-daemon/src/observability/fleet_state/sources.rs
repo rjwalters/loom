@@ -13,6 +13,7 @@ use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
 
+use super::outcomes::Curated;
 use super::{
     held_stage, FleetInput, HeldSweep, ListedPr, ReadyItem, ReadyQueue, RepoListing, REVIEW_LABELS,
 };
@@ -148,6 +149,7 @@ fn held_sweeps(
                 pr,
                 overflow: info.overflow,
                 start: starts.get(&info.sweep_id).cloned().unwrap_or_default(),
+                sweep_id: Some(info.sweep_id.clone()),
             });
         }
     }
@@ -230,13 +232,83 @@ async fn review_listings(roots: &[(PathBuf, String)]) -> Vec<RepoListing> {
     out
 }
 
+/// One repo's open `loom:curated` issues with their creation instants, walked
+/// to the last page through the same ETag cache as the review listings
+/// (#11368). Blocking.
+///
+/// # Errors
+///
+/// The walk failed, read `MAX_PAGES` full pages or saw the listing shift: the
+/// set may be incomplete, so the repo has no curated listing this pass.
+#[cfg(test)]
+fn curated_listing_with(
+    gh: &Path,
+    root: &Path,
+    repo: Option<&str>,
+) -> anyhow::Result<BTreeMap<u32, Option<DateTime<Utc>>>> {
+    label_listing_with(gh, root, repo, super::outcomes::CURATED_LABEL)
+}
+
+/// [`curated_listing_with`] for any issue label (`loom:triage`, #11398).
+///
+/// # Errors
+///
+/// As [`curated_listing_with`].
+fn label_listing_with(
+    gh: &Path,
+    root: &Path,
+    repo: Option<&str>,
+    label: &str,
+) -> anyhow::Result<BTreeMap<u32, Option<DateTime<Utc>>>> {
+    let items = crate::forge_listing::list_issues_cached_all_as(
+        CALLER,
+        gh,
+        Some(root),
+        repo,
+        label,
+        "open",
+    )?;
+    Ok(items
+        .into_iter()
+        .filter(|item| !item.is_pull_request)
+        .map(|item| (item.number, parse_instant(item.created_at.as_deref())))
+        .collect())
+}
+
+/// Each managed repo's listing of open `label` issues; an incomplete one
+/// leaves the repo out (a partial listing would read as issues arriving or
+/// leaving).
+async fn label_listings(roots: &[(PathBuf, String)], label: &'static str) -> Curated {
+    let mut out = Curated::new();
+    for (root, slug) in roots {
+        let root = root.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let gh = PathBuf::from(crate::gh_invocation::gh_bin());
+            label_listing_with(&gh, &root, None, label)
+        })
+        .await;
+        match result {
+            Ok(Ok(listing)) => {
+                out.insert(slug.clone(), listing);
+            }
+            Ok(Err(error)) => {
+                log::debug!("fleet.state: {label} listing of {slug} incomplete: {error:#}");
+            }
+            Err(join_error) => {
+                log::debug!("fleet.state: {label} listing of {slug} panicked: {join_error}");
+            }
+        }
+    }
+    out
+}
+
 /// The effective operator priority level the planner ranked `row` on: its
 /// `operator_priority_level` comparator key, else the bare star.
 fn level(row: &ReadyQueueRow) -> u8 {
     row.plan
         .keys
         .iter()
-        .find(|k| k.name == "operator_priority_level")
+        .find(|k| k.name == "level")
         .and_then(|k| k.value.as_u64())
         .and_then(|n| u8::try_from(n).ok())
         .unwrap_or(u8::from(row.operator_priority))
@@ -277,7 +349,7 @@ fn ready_from_tick(
                 issue: row.issue,
                 rank: small(row.rank),
                 star: row.operator_priority,
-                star_at: parse_instant(row.operator_priority_at.as_deref()),
+                star_at: None,
                 level: level(row),
                 fleet_priority: row.workspace_priority,
                 created_at: parse_instant(row.created_at.as_deref()),
@@ -429,7 +501,7 @@ pub(super) async fn gather(
     slug_cache: &mut HashMap<String, String>,
     host_id: &str,
     now: DateTime<Utc>,
-) -> (FleetInput, Reused) {
+) -> (FleetInput, Reused, Curated, Curated) {
     // Resolves every provisioned root, so the registries' roots are cached.
     let roots = managed_roots(workspace_pool, slug_cache).await;
     let managed: BTreeSet<String> = roots.iter().map(|(_, slug)| slug.clone()).collect();
@@ -437,6 +509,8 @@ pub(super) async fn gather(
         slug_cache.get(root).map(|s| s.to_ascii_lowercase())
     });
     let listings = review_listings(&roots).await;
+    let curated = label_listings(&roots, super::outcomes::CURATED_LABEL).await;
+    let triage = label_listings(&roots, super::outcomes::close::TRIAGE_LABEL).await;
     let ready = ready_queue(&managed, slug_cache).await;
     let main_ci = main_ci_by_slug(
         roots
@@ -469,7 +543,7 @@ pub(super) async fn gather(
         listings,
         ready,
     };
-    (input, reused)
+    (input, reused, curated, triage)
 }
 
 /// A tick pass's input (#11161): the registries and the work finder's last

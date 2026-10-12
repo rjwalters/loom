@@ -62,17 +62,13 @@ pub struct QueueSnapshotRow {
     pub visibility: RepoVisibility,
     pub issue: u32,
     pub workspace_priority: u32,
-    /// Deprecated (#9244): always `false`. `loom:urgent` no longer affects
-    /// dispatch order; kept on the wire for one release.
+    /// Deprecated (#9244): always `false`. Its label was deleted in #11105;
+    /// kept on the wire only for compatibility.
     pub urgent: bool,
-    /// Whether the issue is starred (`loom:operator-priority`, #9244), which
-    /// sorts it ahead of all other work.
+    /// Deprecated (#11508): always `false`. The star is no longer an
+    /// ordering key; the row's level is its `keys` entry `level`.
     #[serde(default)]
     pub operator_priority: bool,
-    /// When it was starred (RFC 3339), when known. Absent for an unstarred
-    /// issue, or a starred one ordered by its `created_at` fallback.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub operator_priority_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
     /// The `tier:*` label, which is informational only and does not affect
@@ -88,14 +84,18 @@ pub struct QueueSnapshotRow {
     /// number (`open_pr`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// Why a `workspace_halted` row is held (#11417): the closed
+    /// `work_finder::halt_cause` vocabulary, same tokens as the SigNoz
+    /// `loom.queue.halt_cause` attribute. Absent on other dispositions and
+    /// when the cause is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub halt_cause: Option<String>,
     /// The dispatch-plan fields (Issue #9288), flattened beside `rank`:
     /// `position`, `plan_state`, `keys`, `gate`, `in_slice`, `hot`,
-    /// `owning_shard`, `repo_cap`. The `keys` names are the seven
-    /// `candidate_keys` (#9244, #10307): `operator_priority_level`,
-    /// `operator_priority`, `operator_priority_at`,
-    /// `main_red_fix`, `workspace_priority`, `created_at`, `number` (this
-    /// row's `issue`). `main_red_fix` and `number` are not otherwise
-    /// `QueueSnapshotRow` fields, so `keys` is the only place they appear.
+    /// `owning_shard`, `repo_cap`. The `keys` names are the three
+    /// `candidate_keys` (#11508): `level` (0 default, 1 `loom:important`,
+    /// 2 `loom:very-important`), `created_at`, `number` (this row's
+    /// `issue`).
     #[serde(flatten, default)]
     pub plan: RowPlan,
 }
@@ -169,7 +169,8 @@ pub struct QueueLandingRow {
 /// paths (#9781; the daemon formats `file overlap: <paths>`, never forge free
 /// text), and a `workspace_halted` row's closed-vocabulary hold
 /// cause (#9017 — `main_red`, `gate_pending`, `token_pool`, …, emitted by
-/// `work_finder::halt_cause`, never free-form text).
+/// `work_finder::halt_cause`, never free-form text), and an `already_landed`
+/// row's evidence (#11429: `forge_closed` or `journal_landed`).
 #[must_use]
 pub fn exportable_detail(disposition: QueueDisposition, detail: Option<&str>) -> Option<String> {
     match disposition {
@@ -177,7 +178,8 @@ pub fn exportable_detail(disposition: QueueDisposition, detail: Option<&str>) ->
         | QueueDisposition::OpenPr
         | QueueDisposition::LabelledBlocked
         | QueueDisposition::DeferredFileOverlap
-        | QueueDisposition::WorkspaceHalted => detail.map(str::to_string),
+        | QueueDisposition::WorkspaceHalted
+        | QueueDisposition::AlreadyLanded => detail.map(str::to_string),
         _ => None,
     }
 }

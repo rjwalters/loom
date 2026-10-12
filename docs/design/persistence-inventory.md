@@ -235,6 +235,8 @@ already has every property needed here:
   "Single writer" means one module and one lock. The daemon and the
   `loom-daemon` CLI subcommands (for example `sweep-checkpoint write`) are the
   same crate, so they share it. Q2 discusses why IPC was not chosen.
+  *Implemented deviation (2a, #11345):* the lock is a stable per-stream
+  `<stream>/.lock` file, not the active segment, whose identity changes on rotation.
 - **Segments**: `<journal>/<stream>/<seq:010>.jsonl`. A new segment starts
   at a size bound. The segment holding the oldest unacknowledged cursor
   position is never deleted. This is the #11045 rule (`ci_telemetry/rotation.rs`)
@@ -290,6 +292,21 @@ SHA). `data` depends on the kind. New fields are optional only (§11.4).
 | `claim.released` | E1 removal, lock release | `outcome: released\|retained\|lost` |
 | `recovery.event` | E10 | the existing event payload |
 | `snapshot` | (new) compaction | the materialised projections (§10) as of `seq` |
+
+*Implemented (2b, #11346):* `journal::execution`, default off
+(`LOOM_EXECUTION_JOURNAL=shadow`; root `LOOM_JOURNAL_DIR`, default
+`~/.loom/journal`; a root inside a git repository is refused;
+`LOOM_JOURNAL_SHADOW_VERIFY=off` skips the per-append comparison). Deviations:
+the 2a envelope has no `subject`/`writer.host`, so each record's `data`
+carries `subject`, plus `store`/`path`/`item` and an `op` (`set`, an RFC 7386
+`patch`, or `remove`) from which projections rebuild. E2 rewrites journal a
+`patch`. The PR-less counted sidecar uses E9's own `prless.counted` kind,
+because the count is decided after `sweep.terminal` is written, so
+`sweep.terminal` has no `prless_counted`. `prless.cleared` has no `reason`,
+because the producer does not know one. The divergence counter is in-process
+(`divergence_count()`) plus a WARN and the durable `journal.divergence` record.
+`loom-daemon journal verify --concern execution` is the read-only full
+sweep. It also runs, logged, at daemon start when the journal is enabled.
 
 ### 9.3 J2, the telemetry journal
 

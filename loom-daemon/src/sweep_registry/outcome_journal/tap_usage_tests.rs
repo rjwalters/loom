@@ -361,4 +361,139 @@ fn a_pre_8659_journal_line_with_only_the_single_tap_row_still_parses() {
         records[0].tap_usage_all.is_empty(),
         "an absent breakdown means the single row is the whole region"
     );
+    // …and a line written before #11360 has no phase rows rather than failing.
+    assert!(records[0].phase_tap_usage.is_empty());
+}
+
+// ============================================================================
+// Mixed sweep: out-of-process phase logs (Issue #11360)
+// ============================================================================
+
+use crate::tap_usage::fixtures::{self as mixed, CODEX_KEY, GLM_KEY};
+
+/// Write a `worker run` phase log where `worker run` itself puts it.
+fn write_phase_log(registry: &SweepRegistry, role: &str, timestamp: i64, body: &str) {
+    let path = crate::launch_record::phase_log_path(
+        &registry.config().workspace_root,
+        role,
+        u64::from(mixed::ISSUE),
+        timestamp,
+    );
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, body).unwrap();
+}
+
+/// The sweep's per-tap totals as a journal reader computes them: the parent's
+/// rows plus the phase rows, each line read once.
+fn journal_totals(
+    record: &sweep_outcomes::OutcomeRecord,
+) -> std::collections::BTreeMap<String, crate::tap_usage::TapUsage> {
+    let parent: Vec<&crate::tap_usage::TapAccounting> = if record.tap_usage_all.is_empty() {
+        record.tap_usage.iter().collect()
+    } else {
+        record.tap_usage_all.iter().collect()
+    };
+    crate::tap_usage::fold_by_tap(
+        parent
+            .into_iter()
+            .chain(record.phase_tap_usage.iter().map(|p| &p.accounting)),
+    )
+}
+
+/// AC 1 + 2 end to end: a Codex parent with GLM Builder and Doctor phases in
+/// their own logs. Both journals keep the parent's row as it was, the phase
+/// rows land beside it exactly once, and the journal's per-tap totals equal
+/// the hand-computed ones.
+#[test]
+fn a_mixed_sweeps_phase_logs_reach_the_journal_once_beside_the_parent() {
+    let dir = tempdir().unwrap();
+    let (mut registry, _rec) = fixture_registry(dir.path());
+    let sweep_id = format!("sweep-issue-{}-0", mixed::ISSUE);
+    write_phase_log(&registry, "builder", 1_700_000_100, &mixed::builder_log(&sweep_id));
+    write_phase_log(&registry, "doctor", 1_700_000_200, &mixed::doctor_log(&sweep_id));
+    insert_dead_running_with_log(
+        &mut registry,
+        mixed::ISSUE,
+        0,
+        "unknown",
+        &mixed::codex_parent_log(&sweep_id),
+    );
+    registry.reap_once();
+
+    let record = outcome_for(&registry, mixed::ISSUE);
+    let parent = record.tap_usage.as_ref().expect("the parent's own row");
+    assert_eq!(parent.key(), CODEX_KEY);
+    assert_eq!(parent.usage.input, Some(3000), "never overwritten by a phase");
+    assert!(record.tap_usage_all.is_empty(), "the parent region is single-tap");
+    assert_eq!(
+        record
+            .phase_tap_usage
+            .iter()
+            .map(|p| (p.role.clone(), p.accounting.key()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("builder".to_string(), GLM_KEY.to_string()),
+            ("doctor".to_string(), GLM_KEY.to_string())
+        ]
+    );
+    let totals = journal_totals(&record);
+    assert_eq!(totals.keys().cloned().collect::<Vec<_>>(), vec![CODEX_KEY, GLM_KEY]);
+    mixed::assert_glm_total(&totals[GLM_KEY]);
+    assert_eq!(totals[CODEX_KEY].input, Some(3000));
+
+    // The paired telemetry record keeps naming the parent's launch and only
+    // flags the phase taps, so `--group-by tap` cannot charge GLM spend to it.
+    let raw = std::fs::read_to_string(registry.config().resolve_outcome_telemetry_path())
+        .expect("telemetry journal written");
+    assert!(raw.contains("\"tap\":\"codex@env\""), "{raw}");
+    assert!(raw.contains("\"tap_input_tokens\":\"3000\""), "{raw}");
+    assert!(
+        raw.contains(&format!("\"tap_phase_keys\":\"builder={GLM_KEY},doctor={GLM_KEY}\"")),
+        "{raw}"
+    );
+    // The journal line round-trips: `read_all` drops any line it cannot parse.
+    assert!(outcome_line(&registry, mixed::ISSUE).contains("\"phase_tap_usage\""));
+}
+
+/// AC 3 + 4 end to end: a Claude parent (no tap of its own) whose Builder
+/// fell back to Claude (no phase log), a predecessor sweep's Builder log still
+/// on disk, and a Doctor that launched on GLM but reported nothing. Only this
+/// sweep's Doctor is journaled, as unmeasured, with no counter invented.
+#[test]
+fn a_fallback_and_resumed_sweep_journals_only_its_own_phases_and_no_invented_counters() {
+    let dir = tempdir().unwrap();
+    let (mut registry, _rec) = fixture_registry(dir.path());
+    let sweep_id = format!("sweep-issue-{}-1", mixed::ISSUE);
+    let predecessor = format!("sweep-issue-{}-0", mixed::ISSUE);
+    write_phase_log(&registry, "builder", 1_700_000_100, &mixed::builder_log(&predecessor));
+    write_phase_log(
+        &registry,
+        "doctor",
+        1_700_000_300,
+        &mixed::phase_log("doctor", &sweep_id, "spawn-worker: exec"),
+    );
+    insert_dead_running_with_log(
+        &mut registry,
+        mixed::ISSUE,
+        1,
+        "agent-2",
+        &mixed::claude_parent_log(&sweep_id),
+    );
+    registry.reap_once();
+
+    let record = outcome_for(&registry, mixed::ISSUE);
+    assert_eq!(record.tap_usage, None, "a Claude parent names no tap");
+    assert!(record.tap_usage_all.is_empty());
+    assert_eq!(record.phase_tap_usage.len(), 1, "the predecessor's Builder is not this sweep's");
+    let doctor = &record.phase_tap_usage[0];
+    assert_eq!(doctor.role, "doctor");
+    assert_eq!(doctor.accounting.key(), GLM_KEY);
+    assert!(!doctor.accounting.usage.is_measured());
+    assert_eq!(doctor.accounting.usage.total_tokens(), None);
+
+    let raw = std::fs::read_to_string(registry.config().resolve_outcome_telemetry_path())
+        .expect("telemetry journal written");
+    assert!(raw.contains(&format!("\"tap_phase_keys\":\"doctor={GLM_KEY}\"")), "{raw}");
+    assert!(!raw.contains("\"tap\":"), "no parent tap is fabricated: {raw}");
+    assert!(!raw.contains("tap_input_tokens"), "no counter may be invented: {raw}");
 }

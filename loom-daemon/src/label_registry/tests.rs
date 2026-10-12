@@ -169,6 +169,10 @@ fn derived_skip_labels_equal_the_previous_literal_in_order() {
             "loom:blocked",
             "loom:operator-only",
             "loom:operator",
+            // #11399: an epic is a tracking container, never build work. A
+            // skip (the work finder never lists it as a candidate) but not a
+            // park: an operator's explicit dispatch on an epic still runs.
+            "loom:epic",
             "loom:operator-decision",
         ]
     );
@@ -230,7 +234,6 @@ fn human_gated_is_exactly_the_human_must_act_labels() {
             "loom:operator-only",
             "loom:operator-mechanical",
             "loom:operator-decision",
-            "loom:operator-objective",
             "external",
         ])
     );
@@ -264,7 +267,6 @@ fn derived_pr_latency_hold_labels_equal_the_previous_set() {
             "loom:operator-blocked",
             "loom:operator-mechanical",
             "loom:operator-decision",
-            "loom:operator-objective",
         ])
     );
 }

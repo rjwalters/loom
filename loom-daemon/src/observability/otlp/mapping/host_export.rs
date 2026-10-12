@@ -21,6 +21,7 @@ pub(super) fn log_parts(
         kv_int("loom.host_export.exporters", to_i64(r.exporters.len() as u64)),
         kv_int("loom.host_export.queue_depth", to_i64(r.queue_depth_sum())),
         kv_int("loom.host_export.dropped_total", to_i64(r.dropped_total_sum())),
+        kv_int("loom.host_export.fact_id_missing_total", to_i64(r.fact_id_missing_total)),
     ];
     if let Some(at) = r.last_flush_ok_at() {
         attributes.push(kv_string("loom.host_export.last_flush_ok_at", at.to_rfc3339()));
@@ -55,9 +56,21 @@ mod tests {
                 dropped_total: 7,
                 last_flush_ok_at: Some(chrono::Utc::now()),
             }],
+            fact_id_missing_total: 3,
         });
         let (_, _, _, attributes, body) = log_parts(&record).unwrap();
         assert!(body.contains("\"dropped_total\":7"), "{body}");
+        assert!(body.contains("\"fact_id_missing_total\":3"), "{body}");
+        assert!(
+            attributes
+                .iter()
+                .any(|kv| kv.key == "loom.host_export.fact_id_missing_total"
+                    && kv.value.as_ref().and_then(|v| v.value.as_ref())
+                        == Some(
+                            &opentelemetry_proto::tonic::common::v1::any_value::Value::IntValue(3)
+                        )),
+            "the count rides as an attribute"
+        );
         for kv in &attributes {
             assert!(HOST_EXPORT_LOG_ATTRIBUTE_KEYS.contains(&kv.key.as_str()), "{}", kv.key);
         }

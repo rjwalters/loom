@@ -410,6 +410,12 @@ owner = "daemon-other"
 removal_issue = 9799
 
 [[bypass]]
+path = "loom-daemon/src/star_liveness/dispatch_shim.rs"
+calls = 1
+owner = "daemon-sweep"
+removal_issue = 11104
+
+[[bypass]]
 path = "loom-daemon/src/star_liveness/forge.rs"
 calls = 4
 owner = "daemon-other"
@@ -422,6 +428,12 @@ owner = "daemon-sweep"
 removal_issue = 9799
 
 [[bypass]]
+path = "loom-daemon/src/sweep_registry/noop_cooldown/hold.rs"
+calls = 3
+owner = "daemon-sweep"
+removal_issue = 9799
+
+[[bypass]]
 path = "loom-daemon/src/sweep_registry/prless_retry/hold.rs"
 calls = 3
 owner = "daemon-sweep"
@@ -429,12 +441,6 @@ removal_issue = 9799
 
 [[bypass]]
 path = "loom-daemon/src/sweep_registry/quarantine.rs"
-calls = 1
-owner = "daemon-sweep"
-removal_issue = 9799
-
-[[bypass]]
-path = "loom-daemon/src/work_finder/operator_priority.rs"
 calls = 1
 owner = "daemon-sweep"
 removal_issue = 9799

@@ -139,6 +139,11 @@ pub(crate) enum LeaseCommand {
     /// `cli::lease_renewer`.
     #[command(subcommand)]
     Renewer(super::lease_renewer::RenewerAction),
+
+    /// Role-keyed leases for the PR-phase claims (`loom:treating`,
+    /// `loom:reviewing`), #9401. See `cli::pr_lease`.
+    #[command(subcommand)]
+    Pr(super::pr_lease::PrLeaseAction),
 }
 
 impl LeaseCommand {
@@ -147,6 +152,7 @@ impl LeaseCommand {
             LeaseCommand::Ensure(args) => args.run(),
             LeaseCommand::CoOccupancy(args) => args.run(),
             LeaseCommand::Renewer(action) => action.run(),
+            LeaseCommand::Pr(action) => action.run(),
         }
     }
 }

@@ -399,6 +399,7 @@ fn run_live(
     let mut pass = super::run(&env, &registered_roots(), mode, &mut guard);
     // #10719: rebuild the dispatch holds and the roll demand from this pass.
     let seen = super::observations(&env, &pass, &mut guard);
+    super::loom_ui::after_pass(&guard, &pass); // #11295
     drop(guard);
     let held = crate::workspace_hold::apply(&seen, running, Utc::now(), bus);
     for workspace in &mut pass.workspaces {
@@ -505,6 +506,7 @@ pub(super) fn note_refused(refused: &AtomicU32) -> (u32, bool) {
 
 fn publish_stuck(bus: Option<&EventBus>, ticks: u32, detail: String) {
     log::error!("fleet_sync: {detail}");
+    super::loom_ui::stuck(ticks, &detail); // #11295
     let alert = Alert {
         root: PathBuf::new(),
         repo: None,

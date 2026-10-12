@@ -119,6 +119,7 @@ fn disabled_mechanism_never_refuses_on_a_peer_armed_window() {
     registry.set_noop_cooldown_config(crate::sweep_registry::NoopCooldownConfig {
         enabled: false,
         cooldown: Duration::from_secs(60),
+        ..crate::sweep_registry::NoopCooldownConfig::default()
     });
     attach_peer_armed_cooldown(&mut registry, 9932, 3600);
 
