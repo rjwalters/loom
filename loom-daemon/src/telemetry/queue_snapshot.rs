@@ -92,10 +92,11 @@ pub struct QueueSnapshotRow {
     pub halt_cause: Option<String>,
     /// The dispatch-plan fields (Issue #9288), flattened beside `rank`:
     /// `position`, `plan_state`, `keys`, `gate`, `in_slice`, `hot`,
-    /// `owning_shard`, `repo_cap`. The `keys` names are the three
-    /// `candidate_keys` (#11508): `level` (0 default, 1 `loom:important`,
-    /// 2 `loom:very-important`), `created_at`, `number` (this row's
-    /// `issue`).
+    /// `owning_shard`, `repo_cap`. The `keys` names are the four
+    /// `candidate_keys` (#11508, #11547): `main_red_fix` (bool, true only for
+    /// a verified red-main fix while its repo's `main` is red), `level`
+    /// (0 default, 1 `loom:important`, 2 `loom:very-important`),
+    /// `created_at`, `number` (this row's `issue`).
     #[serde(flatten, default)]
     pub plan: RowPlan,
 }
@@ -142,25 +143,6 @@ pub struct QueueSnapshotRecord {
     /// shard posture, scope and key ordering. Absent from a pre-#9288 daemon.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<DispatchPlanContext>,
-    /// The landing state of every starred issue this host watches, and of
-    /// every blocker inheriting a star (#9244 C), in starred-at order. A
-    /// separate list rather than fields on `rows`: `rows` is what the work
-    /// finder did with its ready listing this tick, and most starred issues
-    /// (building, in review, parked) are not in it. Join on `(repo, issue)`.
-    /// Absent from older daemons and when nothing is starred.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub operator_priority_landing: Vec<QueueLandingRow>,
-}
-
-/// One starred issue's landing state, with its repo's visibility tag (the
-/// same anti-leak rule as [`QueueSnapshotRow`]). Every text field is
-/// templated by the daemon; no forge free text is carried.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct QueueLandingRow {
-    #[serde(flatten)]
-    pub row: crate::types::StarLandingRow,
-    #[serde(default)]
-    pub visibility: RepoVisibility,
 }
 
 /// `detail` survives only for dispositions whose detail is structured: the

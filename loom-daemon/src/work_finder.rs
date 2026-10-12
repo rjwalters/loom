@@ -243,6 +243,7 @@ mod recheck_interval;
 mod tick_line;
 mod tick_report;
 mod tick_summary;
+mod tracking_parent;
 pub mod vi_cap;
 pub mod workspace_draw;
 use crate::types::QueueDisposition as Qd;
@@ -301,13 +302,12 @@ pub struct WorkItem {
     /// last-dispatch clock. `None` (a synthetic item, or a listing without
     /// timestamps) simply disables the recheck-interval check for that item.
     pub updated_at: Option<String>,
-    /// Set by `star_liveness` (#11104) when this issue blocks a starred
-    /// issue. Dispatch never reads it (#11508).
-    pub operator_priority_inherited_from: Option<u32>,
     /// Who filed the issue, when the listing supplied it (#10118). Only a
     /// trusted author's red-main-fix marker admits an unpromoted row (#9548);
     /// `None` (a synthetic item) is never trusted. See [`main_red_fix`].
     pub author: Option<crate::comment_trust::Author>,
+    /// Open native sub-issues (#11483); see [`tracking_parent`].
+    pub open_sub_issues: Option<u32>,
 }
 
 impl WorkItem {
@@ -327,8 +327,8 @@ impl WorkItem {
             created_at,
             body: None,
             updated_at: None,
-            operator_priority_inherited_from: None,
             author: None,
+            open_sub_issues: None,
         }
     }
 
@@ -1043,7 +1043,7 @@ pub fn tick_with_lanes(
 ) -> Result<TickReport> {
     let mut ready = source.list_ready_issues()?;
     // #10118: unpromoted red-main fixes stay only while `main` is red.
-    main_red_fix::evaluate(lane, &mut ready, dispatcher);
+    let red = main_red_fix::evaluate(lane, &mut ready, dispatcher);
     let mut report = TickReport {
         seen: ready.len(),
         // Record the brake's engagement even on a tick that defers nothing, so a
@@ -1055,7 +1055,8 @@ pub fn tick_with_lanes(
     report.note_listing(0, source.listing_complete());
     // #11509: one `loom:very-important` per workspace; the rest rank important.
     vi_cap::enforce(0, source, &mut ready, &mut report);
-    ready_queue::sort_lanes(&mut ready);
+    // #11547: a verified red-main fix leads the order while `main` is red.
+    ready_queue::sort_lanes(&mut ready, red);
     let (max_concurrent, _) = OverflowSlot::open(dispatcher.overflow_in_flight(), terms);
 
     // Reactive backstop: a red `main` halts all new dispatch this tick — except
@@ -1156,6 +1157,11 @@ pub fn tick_with_lanes(
         if item.is_skipped_with_capabilities(&extra_skip_labels, &held_capabilities) {
             report.skipped_labeled += 1;
             log_capability_gap(&item, &held_capabilities);
+            continue;
+        }
+        if let Some(open) = item.open_sub_issues_blocking() {
+            report.skipped_labeled += 1;
+            log::info!("{}", tracking_parent::skip_line(item.number, open));
             continue;
         }
         // 1a. Hard-exclusion labels (#7528): the same rule the Curator and
@@ -1875,6 +1881,12 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
                 report.skipped_labeled += 1;
                 skip(Qd::Parked, ready_queue::park_label(&item, &extra_skip_label_sets[idx]), None);
                 log_capability_gap(&item, &held_capability_sets[idx]);
+                continue;
+            }
+            if let Some(open) = item.open_sub_issues_blocking() {
+                report.skipped_labeled += 1;
+                skip(Qd::Parked, Some(tracking_parent::skip_detail(open)), None);
+                log::info!("{}", tracking_parent::skip_line(item.number, open));
                 continue;
             }
             // Hard-exclusion labels (#7528) — mirrors
@@ -3129,7 +3141,8 @@ pub fn spawn_multi_work_finder_task(
                 breaker_suppressed,
             );
             // #11191: a repo whose disk charge does not fit is held, named.
-            let halt_causes = halt_cause::with_disk_holds(halt_causes, disk_budget.as_ref());
+            // #11564: the result is recorded with its start for `fleet.state`.
+            let halt_causes = halt_cause::publish(halt_causes, disk_budget.as_ref(), &roots);
             let disk_note = crate::disk_admission::note(disk_budget.as_ref());
             let halted: Vec<bool> = halt_causes.iter().map(Option::is_some).collect();
             let preflight_held_count = preflight_held.iter().filter(|&&h| h).count();

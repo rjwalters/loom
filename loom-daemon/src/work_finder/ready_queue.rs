@@ -71,7 +71,8 @@ fn tier_of(item: &WorkItem) -> Option<String> {
 ///
 /// `repo_red` is whether that repo's `main` is verified red this tick
 /// (#9244): [`PriorityCandidate::main_red_fix`] is set only then, so a marker
-/// on a green repo is inert. It is a gate bypass, never an ordering key.
+/// on a green repo is inert. It is the leading ordering key (#11547) and the
+/// three red-main gate bypasses; on a green repo it is neither.
 #[must_use]
 pub fn key_of(
     idx: usize,
@@ -91,13 +92,17 @@ pub fn key_of(
 }
 
 /// Sort one workspace's ready items into the in-workspace order (#11103):
-/// level, oldest `createdAt`, issue number. The single-workspace tick's
-/// ordering; the multi-workspace tick applies the same order inside each
-/// drawn workspace. A red-main fix is not an ordering key, so `repo_red` is
-/// irrelevant here and passed as `false`.
-pub fn sort_lanes(items: &mut [WorkItem]) {
+/// verified red-main fix first (#11547), level, oldest `createdAt`, issue
+/// number. The single-workspace tick's ordering; the multi-workspace tick
+/// applies the same order inside each drawn workspace. `repo_red` is whether
+/// the repo's `main` is verified red this tick (`main_red_fix::evaluate`'s
+/// return): on a green repo the marker has no effect on the order.
+pub fn sort_lanes(items: &mut [WorkItem], repo_red: bool) {
     items.sort_by(|a, b| {
-        super::workspace_draw::in_workspace_cmp(&key_of(0, 0, a, false), &key_of(0, 0, b, false))
+        super::workspace_draw::in_workspace_cmp(
+            &key_of(0, 0, a, repo_red),
+            &key_of(0, 0, b, repo_red),
+        )
     });
 }
 

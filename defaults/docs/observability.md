@@ -573,8 +573,10 @@ alert. The rule's shape has not yet been tested against a live SigNoz. Standing 
 `defaults/observability/signoz/queue-dwell.sql`.
 
 **Fleet singleton outputs (#10916).** The in-daemon `fleet_alert` path
-(#10924) judges the registered one-host fleet outputs (`ci.run` and the
-captain gauges) against `fleet_outputs::SINGLETON_OUTPUTS`. The SigNoz
+(#10924) judges the registered one-host fleet outputs (`ci.run`, the captain
+gauges, and the intake-reconcile completed-pass heartbeat
+`.loom/state/intake-reconcile/last-pass.json`) against
+`fleet_outputs::SINGLETON_OUTPUTS`. The SigNoz
 cross-host alert that watched the ETA singletons was removed with the ETA
 subsystem (#11098).
 
@@ -1123,7 +1125,6 @@ and dropped).
 | Rule | From | Open / resolved |
 |---|---|---|
 | `fleet.<condition>` (`dispatch-halted`, `roles-persistent`, `capacity-limited`, `star-backlog`, `output-missing`) | `fleet_alert` | condition started (and each reminder) / cleared |
-| `star.<ask kind>` (link = the issue) | `star_liveness` escalations | escalation posted / ask cleared |
 | `daemon.down` (critical) | the watchdog, a separate process | recovery exhausted / any tick ending the outage |
 | `watchdog.peer-coord-degraded` (critical) | the watchdog | coordination degraded / green |
 | `safehouse.unreachable` (critical) | narration sink state | unreachable over 5 minutes / reconnected |

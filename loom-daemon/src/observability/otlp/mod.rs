@@ -259,6 +259,13 @@ impl Exporter for OtlpExporter {
                         .or_default()
                         .dropped += (count - items) as u64;
                     let Some(request) = request else {
+                        // Every envelope in the group is unmappable and the
+                        // group is acknowledged without ever being posted:
+                        // the loss is decided here, not on a later retry.
+                        *outcome
+                            .lost
+                            .entry(super::loss_ledger::REASON_TRACE_UNMAPPABLE.to_string())
+                            .or_default() += count as u64;
                         outcome.acknowledged += count;
                         offset += count;
                         continue;
@@ -282,11 +289,47 @@ impl Exporter for OtlpExporter {
                 .entry(signal.unit().to_string())
                 .or_default()
                 .accumulate(&response.counts);
+            // Permanently lost groups get a durable, by-reason count (Issue
+            // #11527): envelope units for a refused/unreadable response,
+            // signal units for partial rejection (the receiver counts items
+            // and does not identify the envelopes that carried them).
+            if !response.retry && response.counts.dropped > 0 {
+                if let Some(reason) = &response.loss_reason {
+                    // A traces group's `count - exported_envelopes`
+                    // unmappable envelopes were never submitted — they are
+                    // counted under `trace_unmappable`, so the status reason
+                    // counts only the envelopes actually sent (#11588).
+                    let lost = if signal == Signal::Traces {
+                        exported_envelopes
+                    } else {
+                        count
+                    };
+                    *outcome.lost.entry(reason.clone()).or_default() += lost as u64;
+                }
+            }
+            if response.counts.rejected > 0 {
+                *outcome
+                    .lost
+                    .entry(super::loss_ledger::REASON_RECEIVER_REJECTED.to_string())
+                    .or_default() += response.counts.rejected;
+            }
             if response.error.is_some() {
                 outcome.error = response.error;
             }
             if response.retry {
                 break;
+            }
+            // Unmappable trace envelopes are a permanent, counted loss (Issue
+            // #11527) — the mapping will never send them. Recorded only once
+            // the group's fate is decided: a held batch (401/403, transient
+            // statuses, timeouts) is still queued at this point, and counting
+            // before the retry decision would charge the same envelope on
+            // every retry attempt (#11588).
+            if signal == Signal::Traces && exported_envelopes < count {
+                *outcome
+                    .lost
+                    .entry(super::loss_ledger::REASON_TRACE_UNMAPPABLE.to_string())
+                    .or_default() += (count - exported_envelopes) as u64;
             }
             outcome.acknowledged += count;
             if fully_accepted {

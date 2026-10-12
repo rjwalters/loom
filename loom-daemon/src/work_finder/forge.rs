@@ -243,6 +243,7 @@ impl GhWorkSource {
                 WorkItem::with_created_at(r.number, r.labels, r.created_at)
                     .with_body(r.body)
                     .with_updated_at(r.updated_at)
+                    .with_open_sub_issues(r.open_sub_issues)
                     .with_author(r.author.as_deref().map(|login| {
                         crate::comment_trust::Author::new(
                             Some(login),
@@ -331,17 +332,24 @@ impl WorkDispatcher for RegistryDispatcher {
         }
     }
 
-    /// [`WorkDispatcher::dispatch_backoff_expiry`] (Issue #9311): this host's
-    /// own local window only, mirroring [`Self::pr_open_backed_off`]'s scope
-    /// rather than [`Self::backed_off`]'s fleet union — a peer-armed window's
-    /// expiry is not available here.
+    /// [`WorkDispatcher::dispatch_backoff_expiry`] (Issue #9311): every
+    /// window [`Self::backed_off`] skips on: the later of this host's own end
+    /// and a peer-armed window's broadcast end (#11564).
     fn dispatch_backoff_expiry(&self) -> HashMap<u32, chrono::DateTime<chrono::Utc>> {
         match self.registry.lock() {
             Ok(reg) => {
                 let now = chrono::Utc::now();
                 reg.dispatch_backoff_issues(now)
                     .into_iter()
-                    .filter_map(|issue| reg.dispatch_backoff_until(issue, now).map(|u| (issue, u)))
+                    .filter_map(|issue| {
+                        // The skip lasts until the later of the two windows.
+                        let local = reg.dispatch_backoff_until(issue, now);
+                        let until = local
+                            .into_iter()
+                            .chain(reg.peer_dispatch_backoff_until(issue, now))
+                            .max();
+                        until.map(|u| (issue, u))
+                    })
                     .collect()
             }
             Err(poisoned) => {
@@ -378,16 +386,24 @@ impl WorkDispatcher for RegistryDispatcher {
         }
     }
 
-    /// [`WorkDispatcher::noop_cooldown_expiry`] (Issue #9311): this host's own
-    /// local window only — a peer-armed window's expiry is not available
-    /// here, mirroring [`Self::dispatch_backoff_expiry`]'s scope.
+    /// [`WorkDispatcher::noop_cooldown_expiry`] (Issue #9311): like
+    /// [`Self::dispatch_backoff_expiry`], the later of the local and the
+    /// peer-armed window's end (#11564).
     fn noop_cooldown_expiry(&self) -> HashMap<u32, chrono::DateTime<chrono::Utc>> {
         match self.registry.lock() {
             Ok(reg) => {
                 let now = chrono::Utc::now();
                 reg.noop_cooldown_issues(now)
                     .into_iter()
-                    .filter_map(|issue| reg.noop_cooldown_until(issue, now).map(|u| (issue, u)))
+                    .filter_map(|issue| {
+                        // The skip lasts until the later of the two windows.
+                        let local = reg.noop_cooldown_until(issue, now);
+                        let until = local
+                            .into_iter()
+                            .chain(reg.peer_noop_cooldown_until(issue, now))
+                            .max();
+                        until.map(|u| (issue, u))
+                    })
                     .collect()
             }
             Err(poisoned) => {

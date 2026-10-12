@@ -18,7 +18,6 @@ mod holds;
 mod last_tick_line;
 mod model_class;
 mod observability_line;
-mod operator_priority_line;
 mod otlp_export_line;
 mod peer_claims_line;
 mod pending_restart_line;
@@ -429,7 +428,6 @@ pub(crate) fn build_status_json_value_for(
         "work_finder": {
             "enabled": report.work_finder_enabled,
         },
-        "operator_priority_landing": report.operator_priority_landing,
         // Host-wide `LOOM_ROLE_RUNNER` env override state (#6470), resolved
         // once for the whole report — `null` when unset (each root's own
         // config decides independently).
@@ -2267,8 +2265,6 @@ pub(crate) fn print_status_human(
     // "off", "never provisioned", "wrong key", "wrong host" and "quiet feed"
     // are five different answers that would otherwise all render as nothing.
     println!("{}", forge_events_line::render_block(report.forge_events.as_ref(), Utc::now()));
-    // Starred issues' landing states (#9244 C); nothing when nothing is starred.
-    operator_priority_line::print(report.operator_priority_landing.as_ref());
     // Fleet-store sync (#9596): what the last startup/timer pass found — the
     // drift the timer detects but deliberately does not write. Nothing at all
     // on a host with no `fleet.repo`.

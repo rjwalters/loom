@@ -410,18 +410,6 @@ owner = "daemon-other"
 removal_issue = 9799
 
 [[bypass]]
-path = "loom-daemon/src/star_liveness/dispatch_shim.rs"
-calls = 1
-owner = "daemon-sweep"
-removal_issue = 11104
-
-[[bypass]]
-path = "loom-daemon/src/star_liveness/forge.rs"
-calls = 4
-owner = "daemon-other"
-removal_issue = 9799
-
-[[bypass]]
 path = "loom-daemon/src/sweep_registry/guards.rs"
 calls = 4
 owner = "daemon-sweep"
