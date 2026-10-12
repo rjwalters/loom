@@ -2660,7 +2660,28 @@ Each row:
 | `eligible_reason` | string, optional | `ready_wait` only (#11564): the clock the work finder held the item back on at its last tick, one of `recheck_interval`, `dispatch_backoff`, `open_pr_backoff`, `noop_cooldown`, `declined`, `prless_retry`, `build_backoff`. Present on every such row, dated or not. Absent = no clock holds it. Additive on `fleet-state/v1` |
 | `eligible_at` | RFC 3339, optional | `ready_wait` only (#11564): when that clock ends, the absolute expiry the work finder computed (the same instant as `queue.snapshot` `rows[].held_until`). Absent for `build_backoff` (no clock) and when this host cannot date the window. Additive on `fleet-state/v1` |
 
-#### Repo halts and eligible-at
+#### Champion dispatch metadata (`fleet.state.repos[].champion`)
+
+Additive on `fleet-state/v1`; missing means an older emitter, not human approval.
+`approval` and `merge` are explicitly null (unknown): Champion authority is
+prompt-defined, and no effective auto/human policy configuration exists to read.
+Scheduling, role absence and elapsed approval waits never imply human authority.
+`prompt_source` is the actual runner command (`/loom:champion`); `prompt_hash`
+is SHA-256 of the installed command and promotion/merge companions, or null
+when any file is unavailable. A custom prompt changes provenance without
+inventing a policy classification.
+
+`interval_enabled` uses the runner's effective enabled/roles resolvers;
+`cadence_secs` and `cadence_source` use its actual interval resolver (env,
+effective_config, built_in), even when interval dispatch is disabled. Idle/manual
+runs remain possible. `last_attempt_at` and `last_attempt_ok` reflect the latest
+process-local recorded Champion attempt for this exact root, including failed
+and pre-spawn skipped ticks. They are not last completed evaluations or last
+successful runs. Both are null when unobserved or after process restart.
+Metadata changes trigger deltas without row changes; chunking retains metadata
+and OTLP carries it in the existing serialized repo attribute/body.
+
+### Repo halts and eligible-at
 
 Facts for an ETA reader (#11564): a wait in a halted repo, or behind a
 backoff, cannot be modelled without **that** it is held, **why** and **since
@@ -3488,24 +3509,3 @@ Set `LOOM_PRICING_CARD` to an explicit path to load the asset from elsewhere,
 or to the empty string to pin a process to the compiled card.
 
 [`TelemetryEnvelope`]: #envelope
-
-### Champion dispatch metadata (`fleet.state.repos[].champion`)
-
-Additive on `fleet-state/v1`; missing means an older emitter, not human approval.
-`approval` and `merge` are explicitly null (unknown): Champion authority is
-prompt-defined, and no effective auto/human policy configuration exists to read.
-Scheduling, role absence and elapsed approval waits never imply human authority.
-`prompt_source` is the actual runner command (`/loom:champion`); `prompt_hash`
-is SHA-256 of the installed command and promotion/merge companions, or null
-when any file is unavailable. A custom prompt changes provenance without
-inventing a policy classification.
-
-`interval_enabled` uses the runner's effective enabled/roles resolvers;
-`cadence_secs` and `cadence_source` use its actual interval resolver (env,
-effective_config, built_in), even when interval dispatch is disabled. Idle/manual
-runs remain possible. `last_attempt_at` and `last_attempt_ok` reflect the latest
-process-local recorded Champion attempt for this exact root, including failed
-and pre-spawn skipped ticks. They are not last completed evaluations or last
-successful runs. Both are null when unobserved or after process restart.
-Metadata changes trigger deltas without row changes; chunking retains metadata
-and OTLP carries it in the existing serialized repo attribute/body.

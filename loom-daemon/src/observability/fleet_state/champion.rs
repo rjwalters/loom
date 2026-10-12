@@ -63,7 +63,13 @@ fn prompt_hash(root: &std::path::Path) -> Option<String> {
         digest.update((bytes.len() as u64).to_be_bytes());
         digest.update(bytes);
     }
-    Some(format!("{:x}", digest.finalize()))
+    Some(
+        digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -82,9 +88,15 @@ mod tests {
         ] {
             std::fs::write(commands.join(name), "custom operator-only policy").expect("prompt");
         }
-        let old = prompt_hash(root.path()).expect("hash");
-        std::fs::write(commands.join("champion.md"), "different policy").expect("prompt");
-        assert_ne!(Some(old), prompt_hash(root.path()));
+        for name in [
+            "champion.md",
+            "champion-issue-promo.md",
+            "champion-pr-merge.md",
+        ] {
+            let old = prompt_hash(root.path()).expect("hash");
+            std::fs::write(commands.join(name), format!("changed {name}")).expect("prompt");
+            assert_ne!(Some(old), prompt_hash(root.path()));
+        }
     }
     #[test]
     fn attempts_are_attributed_to_exact_root_and_failed_skips_are_not_success() {
@@ -110,5 +122,25 @@ mod tests {
         assert_eq!(state["acme/second"].last_attempt_ok, None);
         assert_eq!(state["acme/first"].approval, None);
         assert_eq!(state["acme/second"].merge, None);
+    }
+    #[test]
+    fn effective_config_selects_champion_and_cadence() {
+        let root = tempfile::tempdir().expect("root");
+        std::fs::create_dir_all(root.path().join(".loom")).expect("config directory");
+        std::fs::write(root.path().join(".loom/config.json"), r#"{"autonomous":{"roleRunner":{"enabled":true,"roles":["champion"],"intervalSecs":123}}}"#).expect("config");
+        let roots = vec![(root.path().to_path_buf(), "acme/repo".into())];
+        let actual = champion_with_ticks(&roots, &[]);
+        let config = crate::role_runner::read_role_runner_config(root.path());
+        let spec = crate::role_runner::resolve_roles(&config)
+            .into_iter()
+            .find(|s| s.name == "champion")
+            .expect("Champion selected");
+        assert_eq!(actual["acme/repo"].prompt_source, spec.prompt);
+        assert_eq!(
+            actual["acme/repo"].cadence_secs,
+            crate::role_runner::resolve_interval_for_role(&spec, &config).as_secs()
+        );
+        assert!(actual["acme/repo"].interval_enabled);
+        assert_eq!(actual["acme/repo"].last_attempt_at, None);
     }
 }
