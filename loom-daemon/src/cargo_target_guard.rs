@@ -186,6 +186,32 @@ impl Context {
     }
 }
 
+impl Context {
+    /// This context re-rooted at `cwd`: the working tree, its main checkout
+    /// and its owned dirs are recomputed; the machine facts carry over.
+    fn at(&self, cwd: &Path) -> Self {
+        let (worktree, main_root) = git_roots(cwd);
+        let mut owned: Vec<PathBuf> = self
+            .owned
+            .iter()
+            .filter(|_| worktree == self.worktree)
+            .cloned()
+            .collect();
+        if worktree != self.worktree {
+            if let Some(wt) = &worktree {
+                owned.extend(crate::worktree_ops::cargo_target::per_worktree::marker_value(wt));
+            }
+        }
+        Self {
+            cwd: cwd.to_path_buf(),
+            worktree,
+            main_root,
+            owned,
+            ..self.clone()
+        }
+    }
+}
+
 /// The nearest ancestor of `start` with a `.git` entry, and the main checkout
 /// it belongs to (a linked worktree's `gitdir:` pointer followed back). No
 /// `git` subprocess: this runs on a hook's hot path.
@@ -223,6 +249,9 @@ pub struct Denial {
     pub root: Root,
     pub source: Source,
     alternative: String,
+    /// The main checkout the target is under, when it is one (its `target/`
+    /// is shared between every worktree, not unowned).
+    shared_with: Option<PathBuf>,
 }
 
 /// The toggle: env wins (`0|false|no` off, `1|true|yes` on), then config
@@ -508,12 +537,31 @@ impl State {
         let (value, source) = effective?;
         let value = value.filter(|v| !v.is_empty())?;
         let target = self.absolutize(&value)?;
+        // After a `cd` into another working tree, that tree's roots apply: a
+        // sibling repo's own `target/` is not a leak. No `git` subprocess.
+        let moved = self.cwd.as_ref().filter(|c| {
+            **c != ctx.cwd && !ctx.worktree.as_ref().is_some_and(|w| under(&forms(c), w))
+        });
+        let rebased;
+        let ctx = match moved {
+            Some(c) => {
+                rebased = ctx.at(c);
+                &rebased
+            }
+            None => ctx,
+        };
         let root = classify(&target, ctx)?;
+        let shared_with = ctx
+            .main_root
+            .as_ref()
+            .map(|m| m.join("target"))
+            .filter(|t| under(&forms(&target), t));
         Some(Denial {
             alternative: alternative(ctx),
             target,
             root,
             source,
+            shared_with,
         })
     }
 
@@ -714,6 +762,21 @@ fn alternative(ctx: &Context) -> String {
 /// The denial text the hook passes through verbatim.
 #[must_use]
 pub fn deny_reason(d: &Denial) -> String {
+    if let Some(main) = &d.shared_with {
+        return format!(
+            "{DENY_PREFIX}: this cargo command would build into '{}' (from {}), which is the \
+             main checkout's target dir ({}). That dir is shared by every worktree of the repo, \
+             so concurrent builds clobber each other and no one worktree can reclaim it (#8370, \
+             #11582). {}. Do not move it to another unowned dir (/tmp, $TMPDIR, ~, ~/.cache, \
+             <repo>/.loom/target-*); see /loom:cargo-target-isolation. To turn the rule off for an \
+             attended session: LOOM_GUARD_CARGO_TARGET_DIR=0 in Claude Code's settings env, or \
+             guards.cargoTargetDir=false.",
+            d.target.display(),
+            d.source.describe(),
+            main.display(),
+            d.alternative,
+        );
+    }
     format!(
         "{DENY_PREFIX}: this cargo command would build into '{}' (from {}), which is under {}. \
          Nothing owns that path, so an interrupted or abandoned run leaks the whole build \

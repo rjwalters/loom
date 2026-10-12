@@ -344,3 +344,34 @@ fn git_roots_follows_a_linked_worktree_to_its_main_checkout() {
     let (w, m) = git_roots(&main);
     assert_eq!((w.as_deref(), m.as_deref()), (Some(main.as_path()), Some(main.as_path())));
 }
+
+#[test]
+fn cd_into_a_sibling_repo_uses_that_repos_roots() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let sibling = home.join("GitHub/anvil");
+    std::fs::create_dir_all(sibling.join(".git")).unwrap();
+    let c = Context {
+        home: Some(home),
+        ..ctx()
+    };
+    let cmd = format!("cd {} && CARGO_TARGET_DIR=$PWD/target cargo build", sibling.display());
+    assert!(evaluate(&cmd, &c).is_none());
+    // A plain directory that is no working tree stays under `~`.
+    let plain = tmp.path().join("home/scratch");
+    std::fs::create_dir_all(&plain).unwrap();
+    let cmd = format!("cd {} && CARGO_TARGET_DIR=$PWD/target cargo build", plain.display());
+    assert_eq!(evaluate(&cmd, &c).unwrap().root, Root::Home);
+}
+
+#[test]
+fn main_checkout_target_is_called_shared_not_unowned() {
+    let mut c = ctx();
+    c.home = Some(PathBuf::from("/work"));
+    let d = evaluate("CARGO_TARGET_DIR=/work/repo/target cargo test", &c).unwrap();
+    let msg = deny_reason(&d);
+    assert!(msg.contains("shared by every worktree"), "{msg}");
+    assert!(!msg.contains("Nothing owns"), "{msg}");
+    let d = evaluate("CARGO_TARGET_DIR=/tmp/x cargo test", &c).unwrap();
+    assert!(deny_reason(&d).contains("Nothing owns"));
+}
