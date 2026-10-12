@@ -847,7 +847,6 @@ pub fn run_with(
         if !item.labels.iter().any(|l| l == label) {
             item.labels.push(label.to_string());
         }
-        item.operator_priority_at.clone_from(&reach.requested_at);
         items.push((reach.key.clone(), item));
     }
     Outcome {

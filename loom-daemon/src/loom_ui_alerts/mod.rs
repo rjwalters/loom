@@ -22,6 +22,9 @@
 //! ([`crate::observability`]): `observability.enabled`, the endpoint with its
 //! `/ingest` path replaced by [`ALERTS_PATH`], and the same ingest key file.
 //! No ingest config means this module is off and every [`post`] is a no-op.
+//! An alert posted before [`start`] has decided waits in the outbox, so the
+//! startup checks that run first (credential preflight, the fleet-sync
+//! startup pass) still reach loom-ui.
 //! `LOOM_LOOM_UI_ALERTS=0` turns it off on a host that exports telemetry;
 //! `LOOM_LOOM_UI_ALERTS_URL` overrides the derived URL.
 //!
@@ -33,14 +36,25 @@
 //! logged (retrying a refused body cannot help); 429, 5xx and network errors
 //! are retried with capped exponential backoff, a bounded number of times.
 //! The watchdog, a separate one-shot process, uses [`post_blocking`] instead.
+//!
+//! # Open incidents across a restart
+//!
+//! A level-triggered source keeps a [`ledger::Ledger`]: the incidents it has
+//! open, persisted, so a daemon restarted while one was open resolves it on its
+//! first healthy evaluation. A single-key watch can use [`sustain::Tracker`],
+//! which owes one `resolved` at its first healthy sample instead.
 
+pub mod ledger;
 pub mod outbox;
 pub mod sanitize;
+pub mod sustain;
+pub mod watches;
 
 #[cfg(test)]
 mod tests;
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -492,45 +506,81 @@ fn now() -> Instant {
     tokio::time::Instant::now().into_std()
 }
 
+/// The process's outbox. Created on first use, so an alert raised before
+/// [`start`] (the credential preflight, the fleet-sync startup pass) waits in
+/// it and goes out once the drain task runs.
 static GLOBAL: OnceLock<Arc<Shared>> = OnceLock::new();
 
+/// [`start`] has not decided yet.
+const UNDECIDED: u8 = 0;
+/// [`start`] is draining the outbox.
+const ACTIVE: u8 = 1;
+/// [`start`] found no ingest config: posts are dropped.
+const OFF: u8 = 2;
+
+static STATE: AtomicU8 = AtomicU8::new(UNDECIDED);
+
+fn global() -> &'static Arc<Shared> {
+    GLOBAL.get_or_init(|| Shared::new(outbox::DEFAULT_CAPACITY, None))
+}
+
 /// Start the output for the daemon at `root` on the current tokio runtime.
-/// `None`, with one log line naming why, when there is no ingest config.
+/// `None`, with one log line naming why, when there is no ingest config; the
+/// alerts queued before this call are then discarded.
 #[must_use]
 pub fn start(root: &Path) -> Option<tokio::task::JoinHandle<()>> {
+    let off = |why: String| {
+        log::info!("loom_ui_alerts: off — {why}");
+        STATE.store(OFF, Ordering::Release);
+        ledger::forget_all();
+        global()
+            .outbox
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        None
+    };
     let target = match resolve_target(root) {
         Ok(target) => target,
-        Err(why) => {
-            log::info!("loom_ui_alerts: off — {why}");
-            return None;
-        }
+        Err(why) => return off(why),
     };
     let url = target.url.clone();
     let transport = match HttpTransport::new(target) {
         Ok(t) => t,
-        Err(e) => {
-            log::warn!("loom_ui_alerts: off — cannot build the HTTP client: {e}");
-            return None;
-        }
+        Err(e) => return off(format!("cannot build the HTTP client: {e}")),
     };
-    let shared = Shared::new(outbox::DEFAULT_CAPACITY, None);
-    if GLOBAL.set(shared.clone()).is_err() {
+    if STATE
+        .compare_exchange(UNDECIDED, ACTIVE, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
         return None;
     }
-    log::info!("loom_ui_alerts: recording alerts on loom-ui at {url} (#11295)");
+    let shared = global().clone();
+    log::info!(
+        "loom_ui_alerts: recording alerts on loom-ui at {url} (#11295); {} queued before start",
+        shared.queued()
+    );
     Some(tokio::spawn(drain(shared, transport)))
 }
 
 /// Whether [`start`] is running in this process.
 #[must_use]
 pub fn is_active() -> bool {
-    GLOBAL.get().is_some()
+    STATE.load(Ordering::Acquire) == ACTIVE
 }
 
-/// Queue `alert` for loom-ui. Never blocks; a no-op when the output is off.
+/// Whether [`start`] has found the output off. Before [`start`] runs this is
+/// `false`: an alert may still go out.
+#[must_use]
+pub fn is_off() -> bool {
+    STATE.load(Ordering::Acquire) == OFF
+}
+
+/// Queue `alert` for loom-ui. Never blocks. Before [`start`] it waits in the
+/// outbox; once the output is off it is a no-op.
 pub fn post(alert: Alert) {
-    if let Some(shared) = GLOBAL.get() {
-        shared.push(alert);
+    if !is_off() {
+        global().push(alert);
     }
 }
 

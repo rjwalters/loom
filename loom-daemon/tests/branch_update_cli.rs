@@ -339,7 +339,7 @@ fn bash(tools: &Tools, dir: &Path, script: &str) -> Output {
 
 fn doctor_push_script(fix: &str) -> String {
     format!(
-        "set -e\nCLAIM_HEAD_SHA=$(git rev-parse HEAD)\n{}\n{fix}\n{}",
+        "set -e\nN=1\nCLAIM_HEAD_SHA=$(git rev-parse HEAD)\n{}\n{fix}\n{}",
         prompt_block("### Verify the pin"),
         prompt_block("### Pin the lease")
     )
@@ -366,7 +366,7 @@ fn the_doctor_merges_a_conflicting_branch_and_pushes_without_force() {
     ok(&work, &["add", "f.txt"]);
     ok(&work, &["commit", "-q", "--no-edit"]);
     let resume = format!(
-        "set -e\nCLAIM_HEAD_SHA={claim}\n{}\n{}",
+        "set -e\nN=1\nCLAIM_HEAD_SHA={claim}\n{}\n{}",
         prompt_block("### Verify the pin"),
         prompt_block("### Pin the lease")
     );
@@ -377,6 +377,10 @@ fn the_doctor_merges_a_conflicting_branch_and_pushes_without_force() {
         String::from_utf8_lossy(&second.stderr)
     );
 
+    // The PR-lease fence ran before the push (#9401). This fixture is no
+    // Loom checkout, so it finds no lease evidence and lets the push through.
+    let err = String::from_utf8_lossy(&second.stderr);
+    assert!(err.contains("lease pr: "), "the lease fence ran: {err}");
     let head = ok(&work, &["rev-parse", "HEAD"]);
     let live = ok(&work, &["ls-remote", "origin", "refs/heads/feature/x"]);
     assert!(live.starts_with(&head), "the remote is at the Doctor's head");

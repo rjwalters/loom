@@ -2525,9 +2525,10 @@ fn test_tick_multi_missing_halt_entry_defaults_not_halted() {
 mod build_backoff;
 mod main_red_fix;
 mod maintain_only;
-mod operator_priority;
 mod ordering;
+mod priority_admission;
 mod ram_budget;
+mod vi_cap;
 mod workspace_draw;
 
 // ===================================================================

@@ -18,9 +18,9 @@ use super::kv_string;
 ///
 /// `host.name` (Issue #10977) has one source: the envelope's `host_id`, the
 /// same string as `host.id` and `service.instance.id`. For a daemon that is
-/// [`host_identity()`](crate::sweep_registry::host_identity) — the
-/// operator-assigned `$LOOM_HOST_ID` when set, else the OS hostname
-/// (`$HOSTNAME`, then the `hostname` binary). It is set here, on every signal,
+/// [`host_identity()`](crate::sweep_registry::host_identity) — fleet-gitops
+/// `fleet.hostId`, else `$LOOM_HOST_ID`, else the persisted `~/.loom/host-id`
+/// (#11530; never the OS hostname). It is set here, on every signal,
 /// so a receiver reached without a collector still gets a readable host axis.
 ///
 /// # Fleet provenance (Issue #11197)

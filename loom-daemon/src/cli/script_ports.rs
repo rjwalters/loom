@@ -618,6 +618,11 @@ pub(crate) enum ScriptPortCommand {
     /// `shell-budget`.
     #[command(subcommand)]
     MergeGroupCi(super::merge_group_ci_cmd::MergeGroupCiCommand),
+
+    /// Print this host's identity (#11530): `fleet.hostId` > `LOOM_HOST_ID` >
+    /// the persisted `~/.loom/host-id`, never the hostname. One line on
+    /// stdout, exit 0; exits non-zero (nothing on stdout) on `unknown-host`.
+    HostId(super::host_id_cmd::HostIdArgs),
 }
 
 impl ScriptPortCommand {
@@ -700,6 +705,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::ForgeProbe(args) => args.run(),
             ScriptPortCommand::ResyncPin(cmd) => cmd.run(),
             ScriptPortCommand::ResyncPayload(args) => args.run(),
+            ScriptPortCommand::HostId(args) => args.run(),
         }
     }
 }

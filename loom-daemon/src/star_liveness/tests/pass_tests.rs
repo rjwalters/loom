@@ -166,9 +166,8 @@ fn a_blocker_inherits_the_star_and_loses_it_when_it_clears() {
     world.add(slug, issue(11, &["loom:issue"]));
     world.add(slug, issue(12, &["loom:issue"]));
     let mut input = repo_input(slug);
-    let mut row = tick_row(&input.root, 10, QueueDisposition::Parked);
-    row.operator_priority_at = Some("2026-09-28T09:00:00Z".into());
-    input.tick_rows = vec![row];
+    // #11508: the ready-queue row no longer carries a starred-at.
+    input.tick_rows = vec![tick_row(&input.root, 10, QueueDisposition::Parked)];
     let repos = vec![input.clone()];
     let mut host = Host::new("host-a");
 
@@ -179,19 +178,19 @@ fn a_blocker_inherits_the_star_and_loses_it_when_it_clears() {
     assert_eq!(r.rows[1].issue, 11);
     assert_eq!(r.rows[1].inherited_from, Some(10), "marked inherited");
     assert_eq!(r.rows[1].stage, LandingStage::Ready);
-    assert_eq!(r.rows[1].operator_priority_at.as_deref(), Some("2026-09-28T09:00:00Z"));
 
-    // The work finder's listing gives #11 the star's position.
+    // The listing marks #11 inherited (dispatch no longer orders by it,
+    // #11508).
     let mut items = vec![
         WorkItem::new(12, vec!["loom:issue".into()]),
         WorkItem::new(11, vec!["loom:issue".into()]),
     ];
     inherit::apply(Some(&input.root), &mut items);
-    let key = |i: &WorkItem| crate::work_finder::ready_queue::key_of(0, 100, i, false);
-    let mut keys: Vec<_> = items.iter().map(key).collect();
-    keys.sort_by(crate::work_finder::candidate_cmp);
-    assert_eq!(keys[0].number, 11, "the blocker sorts first");
-    assert!(keys[0].operator_priority);
+    assert!(items
+        .iter()
+        .find(|i| i.number == 11)
+        .unwrap()
+        .is_operator_priority());
     assert!(!items
         .iter()
         .find(|i| i.number == 12)

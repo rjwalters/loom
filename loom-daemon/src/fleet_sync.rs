@@ -93,6 +93,7 @@ use crate::fleet_store::{self as store, StoreLocation};
 mod applied;
 pub mod checkout_ff;
 mod floor_knowledge;
+mod loom_ui;
 pub mod offline_floor;
 pub mod roster_clone;
 pub mod workspace_resync;
@@ -1183,6 +1184,7 @@ fn report(status: &FleetSyncStatus, bus: Option<&crate::event_bus::EventBus>) {
         log::debug!("fleet_sync: {summary}");
     }
     roster_clone::announce(status, bus);
+    loom_ui::report(status); // #11295
     let (Some(bus), true) = (bus, status.drifted() || status.errored()) else {
         return;
     };

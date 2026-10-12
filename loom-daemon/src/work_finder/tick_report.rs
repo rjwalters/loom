@@ -297,6 +297,9 @@ pub struct TickReport {
     /// weights, roll and pick, in order. `None` when nothing was drawn (an
     /// idle tick, and the single-workspace tick).
     pub workspace_draw: Option<super::workspace_draw::DrawLog>,
+    /// The `loom:very-important` issues the flood cap ranked as important
+    /// this tick (#11509), in listing order; exported in `pick.decision`.
+    pub vi_demotions: Vec<super::vi_cap::ViDemotion>,
 }
 
 impl TickReport {
