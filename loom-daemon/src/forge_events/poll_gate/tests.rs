@@ -34,6 +34,15 @@ fn healthy_with_no_event_skips_and_serves_the_held_listing() {
 }
 
 #[test]
+fn a_hold_recorded_for_another_repo_is_never_served() {
+    let mut g = gate(true);
+    let t0 = Instant::now();
+    poll(&mut g, PollReason::FirstPoll, vec![1], t0);
+    let other = g.decide(WS, Some("o/other"), ReadKind::Discovery, true, t0 + BASE / 2);
+    assert_eq!(other, Decision::Poll(PollReason::FirstPoll));
+}
+
+#[test]
 fn an_event_for_the_repo_forces_a_repoll_but_another_repo_does_not() {
     let mut g = gate(true);
     let t0 = Instant::now();

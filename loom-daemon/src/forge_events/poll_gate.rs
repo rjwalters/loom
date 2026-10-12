@@ -37,7 +37,9 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
+#[cfg(not(test))]
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use crate::types::{PollGatingStatus, PollGatingWorkspace};
@@ -225,7 +227,9 @@ impl<T: Clone> PollGate<T> {
         let cap = hard_cap(self.base_cadence);
         let verdict = match self.workspaces.get(key) {
             None => Decision::Poll(PollReason::FirstPoll),
-            Some(ws) if ws.held.is_none() => Decision::Poll(PollReason::FirstPoll),
+            Some(ws) if ws.held.is_none() || !ws.repo.eq_ignore_ascii_case(repo) => {
+                Decision::Poll(PollReason::FirstPoll)
+            }
             Some(ws) if self.event_since(repo, ws.seen_clock) => Decision::Poll(PollReason::Event),
             Some(ws) => match ws.last_poll {
                 Some(at) if now.saturating_duration_since(at) < cap => Decision::Skip,
@@ -348,14 +352,31 @@ impl<T: Clone> PollGate<T> {
 
 type WorkItems = Vec<crate::work_finder::WorkItem>;
 
+fn new_global_gate() -> Mutex<PollGate<WorkItems>> {
+    Mutex::new(PollGate::new(
+        false,
+        Duration::from_secs(crate::work_finder::DEFAULT_WORK_FINDER_INTERVAL_SECS),
+    ))
+}
+
+#[cfg(not(test))]
 fn global() -> &'static Mutex<PollGate<WorkItems>> {
     static GATE: OnceLock<Mutex<PollGate<WorkItems>>> = OnceLock::new();
-    GATE.get_or_init(|| {
-        Mutex::new(PollGate::new(
-            false,
-            Duration::from_secs(crate::work_finder::DEFAULT_WORK_FINDER_INTERVAL_SECS),
-        ))
-    })
+    GATE.get_or_init(new_global_gate)
+}
+
+// Under `cargo test` each test thread owns a fresh, disabled gate: no test can
+// observe another's armed state, event clock or held listings, and a panicking
+// test cannot leak an armed gate (the thread's gate dies with it). Tests that
+// drive the gate are synchronous, so the thread is the isolation boundary
+// (#9255). Leaked once per test thread so the `'static` signature holds.
+#[cfg(test)]
+fn global() -> &'static Mutex<PollGate<WorkItems>> {
+    thread_local! {
+        static GATE: &'static Mutex<PollGate<WorkItems>> =
+            Box::leak(Box::new(new_global_gate()));
+    }
+    GATE.with(|gate| *gate)
 }
 
 fn lock() -> std::sync::MutexGuard<'static, PollGate<WorkItems>> {

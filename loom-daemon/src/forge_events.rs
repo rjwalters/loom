@@ -677,12 +677,44 @@ impl FeedStatus {
 
 /// Process-global status handle, registered by [`spawn_task`] when the loop
 /// starts **or** when provisioning failed. Unset means off by choice.
+#[cfg(not(test))]
 static GLOBAL_STATUS: std::sync::OnceLock<Arc<FeedStatus>> = std::sync::OnceLock::new();
+
+// Under `cargo test` every test thread gets its own cell, so one test's
+// registration never leaks into a concurrently running test (#9255): the
+// default `cargo test` runner shares one process across all tests.
+#[cfg(test)]
+thread_local! {
+    static GLOBAL_STATUS_TEST: std::cell::RefCell<Option<Arc<FeedStatus>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The registered process-global status handle, if any.
+fn registered_status() -> Option<Arc<FeedStatus>> {
+    #[cfg(not(test))]
+    {
+        GLOBAL_STATUS.get().cloned()
+    }
+    #[cfg(test)]
+    {
+        GLOBAL_STATUS_TEST.with(|cell| cell.borrow().clone())
+    }
+}
 
 /// Register the consumer's status handle as the process-global. Idempotent:
 /// the first registration wins (one consumer per process).
 pub fn register_global_status(status: Arc<FeedStatus>) {
-    let _ = GLOBAL_STATUS.set(status);
+    #[cfg(not(test))]
+    {
+        let _ = GLOBAL_STATUS.set(status);
+    }
+    #[cfg(test)]
+    GLOBAL_STATUS_TEST.with(|cell| {
+        let mut cell = cell.borrow_mut();
+        if cell.is_none() {
+            *cell = Some(status);
+        }
+    });
 }
 
 /// This process's feed status — **always** an answer, never silence.
@@ -696,9 +728,8 @@ pub fn register_global_status(status: Arc<FeedStatus>) {
 /// pairing.
 #[must_use]
 pub fn global_status() -> ForgeEventsStatus {
-    let mut status = GLOBAL_STATUS
-        .get()
-        .map_or_else(ForgeEventsStatus::disabled, |status| status.snapshot());
+    let mut status =
+        registered_status().map_or_else(ForgeEventsStatus::disabled, |status| status.snapshot());
     status.wakes = wake::armed_snapshot();
     status.poll_gating = poll_gate::snapshot();
     status
@@ -710,9 +741,7 @@ pub fn global_status() -> ForgeEventsStatus {
 /// [`global_feed_live`] instead.
 #[must_use]
 pub fn global_state() -> ForgeEventsState {
-    GLOBAL_STATUS
-        .get()
-        .map_or(ForgeEventsState::Disabled, |status| status.snapshot().state)
+    registered_status().map_or(ForgeEventsState::Disabled, |status| status.snapshot().state)
 }
 
 /// Is the feed `healthy` **and** has it polled recently? The poll gate's one
@@ -730,8 +759,7 @@ pub fn global_feed_live() -> bool {
 /// [`global_feed_live`] at an explicit instant.
 #[must_use]
 pub fn global_feed_live_at(now: DateTime<Utc>) -> bool {
-    GLOBAL_STATUS
-        .get()
+    registered_status()
         .is_some_and(|status| crate::ci_telemetry::feed::feed_is_live(&status.snapshot(), now))
 }
 
