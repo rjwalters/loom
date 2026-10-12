@@ -133,7 +133,7 @@ services:
       - -q
       - ls
       timeout: 30s
-    image: clickhouse/clickhouse-keeper:25.12.5@sha256:525b8b0f93ccb371131c46f22a066ea43d33d74aba314203e8044609945d8524
+    image: clickhouse/clickhouse-keeper:26.9.5@sha256:367f3f6a113e14046a547f7ffb962d70a2fc281379d59869aa718ab372c020cf
     logging:
       driver: json-file
       options:

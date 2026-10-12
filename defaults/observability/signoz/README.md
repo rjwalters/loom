@@ -36,13 +36,23 @@ After any render, run `cargo test --test signoz_deployment_contract`: it re-read
 the committed `pours/` output and fails if a regenerated deployment stops matching
 what this README promises — see [Rendered-deployment contract](#rendered-deployment-contract).
 All component images pin multi-platform index digests in the casting: SigNoz
-**v0.143.0**, its collector **v0.144.12**, ClickHouse **25.12.11**, Keeper **25.12.5**,
+**v0.143.0**, its collector **v0.144.12**, ClickHouse **26.9.5**, Keeper **26.9.5**,
 and PostgreSQL **16**. Each index includes Linux amd64 and arm64. The upstream
 histogram helper **v0.0.1** init command is patched declaratively to verify SHA-256
 before extraction and reject unsupported architectures. Independent downloads
 matched the [upstream checksum manifest](https://github.com/SigNoz/signoz/releases/download/histogram-quantile%2Fv0.0.1/histogram-quantile_0.0.1_checksums.txt):
 Linux arm64 `e5605ebffa82a450ebbcdf6cf19dad546e1e40d52dbf3e03cfd2d2d5b7394211`,
 Linux amd64 `33997073eb6d82b7be4f27f9fc8ec9e28a395e0f20674d5d54bb2fa28a75488d`.
+
+ClickHouse and Keeper move in lockstep. The pinned SigNoz release is tested
+upstream on 25.12, not 26.x. ClickHouse 26.7 started rejecting an
+`AggregatingMergeTree` that has a column outside both the sorting key and the
+aggregate states, and SigNoz's schema migrator creates such tables
+(`signoz_metrics.metadata`). A casting patch therefore sets the server's
+`merge_tree.allow_dimensions_outside_sorting_key: 1`, which restores the 25.12
+behaviour. Without it, the migration on a fresh volume fails. The upgrade from
+25.12 is one-way: 26.x parts are not guaranteed to be readable by 25.12, so back
+up the volumes before rolling an existing deployment.
 
 ## Start and trust boundary
 
@@ -729,8 +739,11 @@ them, which ClickHouse applies only during merges. The casting switches
 `system.metric_log` to ClickHouse's `transposed_with_wide_view` schema
 because the default 1,552-column table's merge memory grows with input parts
 times columns. Under the 2 GiB cap, its TTL-applying merge failed thousands of
-times an hour, and parts outlived their TTL. `system.metric_log` stays
-queryable as a view with the same columns.
+times an hour, and parts outlived their TTL. ClickHouse 26.1 removed the wide
+view, so on the pinned 26.x the same setting makes `system.metric_log` itself
+the narrow `metric`/`value` table, still with the 1-day TTL. A volume upgraded
+from 25.12 keeps its old `system.transposed_metric_log`, which ClickHouse no
+longer writes and which its own 1-day TTL empties.
 
 A deployment first started from an older render keeps its wide table. Its
 rendered files live in the deployment's own state directory, **not** in this
