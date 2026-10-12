@@ -9,8 +9,9 @@
 //!
 //! This verb finds every `ssh` / `tailscale ssh` / `scp` / `rsync` / `aws ssm
 //! send-command|start-session` invocation in a command (through `bash -c`,
-//! `eval`, wrappers, `xargs` / `parallel` fan-out, `$( … )` and heredocs fed
-//! to a local shell), works out what it
+//! `eval`, wrappers, `xargs` / `parallel` fan-out, `$( … )`, heredocs fed
+//! to a local shell, and the remote command of another hop — `ssh bastion
+//! ssh <fleet> …`), works out what it
 //! would run or change remotely — the inline remote command, and for a remote
 //! shell reading stdin, the `< file`, heredoc, here-string or `cat file |`
 //! script it is fed — and answers ASK when that payload is not read-only (or
@@ -44,7 +45,9 @@ pub const TOGGLE_ENV: &str = "LOOM_GUARD_REMOTE_FLEET_EXEC";
 
 /// Largest script file read for classification; a bigger one is unresolvable.
 const MAX_SCRIPT_BYTES: u64 = 1 << 20;
-const MAX_DEPTH: usize = 4;
+/// How deep `bash -c` / `eval` / `$( … )` / nested-hop recursion goes. A
+/// remote hop nested deeper than this is undeterminable (see [`Scan::text`]).
+const MAX_DEPTH: usize = 6;
 
 /// Where an invocation is aimed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -273,7 +276,19 @@ fn text_runs_stdin_shell(text: &str) -> bool {
 struct Scan<'a> {
     ctx: &'a Context<'a>,
     findings: Vec<Finding>,
+    /// The script an enclosing hop feeds on stdin, already classified
+    /// (`None` = nothing, or read-only). A nested command with no stdin of
+    /// its own inherits it: `ssh bastion ssh <fleet> bash -s < fix.sh` runs
+    /// `fix.sh` on the fleet host, not on the bastion.
+    fed: Option<Payload>,
+    /// Scanning a command that runs on an intermediate host: its files are
+    /// that host's, so none can be read here.
+    remote: bool,
 }
+
+/// A remote-execution word, for the too-deep check.
+static TRANSPORT_WORD: LazyLock<Regex> =
+    LazyLock::new(|| re(r"\b(?:ssh|scp|rsync|ssm|xargs|parallel)\b"));
 
 /// Every remote invocation in `command` whose payload is not read-only.
 #[must_use]
@@ -281,6 +296,8 @@ pub fn findings(command: &str, ctx: &Context<'_>) -> Vec<Finding> {
     let mut scan = Scan {
         ctx,
         findings: Vec::new(),
+        fed: None,
+        remote: false,
     };
     scan.text(command, 0);
     scan.findings
@@ -289,6 +306,15 @@ pub fn findings(command: &str, ctx: &Context<'_>) -> Vec<Finding> {
 impl Scan<'_> {
     fn text(&mut self, text: &str, depth: usize) {
         if depth > MAX_DEPTH {
+            // Too deep to follow: if it could still reach a host, it is
+            // undeterminable — and any hop could be a fleet host.
+            if TRANSPORT_WORD.is_match(text) {
+                self.push(
+                    "nested remote command",
+                    Target::Dynamic(format!("a hop nested more than {MAX_DEPTH} levels deep")),
+                    Payload::Unresolvable(format!("`{}`", text.trim())),
+                );
+            }
             return;
         }
         for pipeline in lex::pipelines(text) {
@@ -333,13 +359,13 @@ impl Scan<'_> {
                     }
                 }
             }
-            "ssh" => self.ssh("ssh", rest, stage, producer),
+            "ssh" => self.ssh("ssh", rest, stage, producer, depth),
             "tailscale" => {
                 // `tailscale [--socket=…] ssh [ssh options] dest cmd` —
                 // Tailscale's own ssh, the native one on a tailnet fleet.
                 let sub = rest.iter().position(|w| !w.text.starts_with('-'));
                 if let Some(sub) = sub.filter(|&k| rest[k].text == "ssh") {
-                    self.ssh("tailscale ssh", &rest[sub + 1..], stage, producer);
+                    self.ssh("tailscale ssh", &rest[sub + 1..], stage, producer, depth);
                 }
             }
             "xargs" | "parallel" => {
@@ -352,7 +378,16 @@ impl Scan<'_> {
                         words: fan.words,
                         stdin,
                     };
+                    // Without `-a`, the per-input command does not get
+                    // `xargs`'s stdin, so it inherits no fed script either.
+                    let fed = if fan.passes_stdin {
+                        self.fed.clone()
+                    } else {
+                        None
+                    };
+                    let outer = std::mem::replace(&mut self.fed, fed);
                     self.simple(&inner, None, depth + 1);
+                    self.fed = outer;
                 }
             }
             "scp" => self.copy(
@@ -361,7 +396,7 @@ impl Scan<'_> {
                 &["-c", "-F", "-i", "-J", "-l", "-o", "-P", "-S", "-D", "-X"],
             ),
             "rsync" => self.copy("rsync", rest, RSYNC_ARG_FLAGS),
-            "aws" => self.aws(rest),
+            "aws" => self.aws(rest, depth),
             _ => {}
         }
     }
@@ -380,42 +415,34 @@ impl Scan<'_> {
         args: &[Word],
         stage: &Simple,
         producer: Option<&Simple>,
+        depth: usize,
     ) {
-        const TAKES: &str = "BbcDEeFIiJLlmOoPpQRSWw";
-        let mut i = 0;
-        while let Some(a) = args.get(i) {
-            let t = a.text.as_str();
-            if t == "--" {
-                i += 1;
-                break;
-            }
-            if t.len() < 2 || !t.starts_with('-') {
-                break;
-            }
-            i += 1;
-            for (k, ch) in t[1..].char_indices() {
-                if TAKES.contains(ch) {
-                    if k + ch.len_utf8() == t.len() - 1 {
-                        i += 1; // argument is the next word
-                    }
-                    break;
-                }
-            }
-        }
+        let (i, terminated) = skip_ssh_options(args, 0);
         let Some(dest) = args.get(i) else {
             return;
         };
+        // OpenSSH parses options after the destination too (`ssh host -t
+        // cmd`), unless a `--` ended them.
+        let start = if terminated {
+            i + 1
+        } else {
+            skip_ssh_options(args, i + 1).0
+        };
         let target = host_target(dest, true);
-        let local: Vec<&Word> = args[i + 1..].iter().collect();
+        let local: Vec<&Word> = args.get(start..).unwrap_or_default().iter().collect();
         let remote: Vec<&str> = local.iter().map(|w| w.text.as_str()).collect();
         let remote = remote.join(" ");
+        // What this hop feeds the remote side on stdin, for both the remote
+        // shell here and any hop nested inside the remote command.
+        let fed = self.input_payload(stage, producer);
+        self.nested(&remote, fed.clone(), depth);
         if let Some(pattern) = destructive_pattern(&remote) {
             let source = "the inline remote command".to_string();
             self.push(transport, target, Payload::Destructive { pattern, source });
             return;
         }
         if remote.trim().is_empty() || text_runs_stdin_shell(&remote) {
-            if let Some(payload) = self.stdin_payload(stage, producer) {
+            if let Some(payload) = fed {
                 self.push(transport, target, payload);
                 return;
             }
@@ -424,6 +451,30 @@ impl Scan<'_> {
             let src = format!("the inline remote command ({why})");
             self.push(transport, target, Payload::Unresolvable(src));
         }
+    }
+
+    /// Scan a command that runs on another host as a command line of its
+    /// own, whatever that host is: `ssh bastion ssh <fleet> '…'` and
+    /// `ssh devvm "tailscale ssh <fleet> …"` reach a fleet host through a
+    /// hop that is not one. `fed` is what the outer hop feeds on stdin.
+    fn nested(&mut self, remote: &str, fed: Option<Payload>, depth: usize) {
+        if remote.trim().is_empty() {
+            return;
+        }
+        let outer_fed = std::mem::replace(&mut self.fed, fed);
+        let outer_remote = std::mem::replace(&mut self.remote, true);
+        self.text(remote, depth + 1);
+        self.fed = outer_fed;
+        self.remote = outer_remote;
+    }
+
+    /// The script on this stage's stdin: its own redirection or producer,
+    /// else whatever an enclosing hop feeds it.
+    fn input_payload(&self, stage: &Simple, producer: Option<&Simple>) -> Option<Payload> {
+        if stage.stdin.is_none() && producer.is_none() {
+            return self.fed.clone();
+        }
+        self.stdin_payload(stage, producer)
     }
 
     /// A redirected stdin as a script: a file is read, a heredoc / here-string
@@ -488,6 +539,10 @@ impl Scan<'_> {
     }
 
     fn file_payload(&self, w: &Word) -> Option<Payload> {
+        if self.remote {
+            let why = "a file on an intermediate host, unreadable here";
+            return Some(Payload::Unresolvable(format!("`{}` ({why})", w.text)));
+        }
         if w.dynamic {
             return Some(Payload::Unresolvable(format!("`{}` (a variable path)", w.text)));
         }
@@ -542,7 +597,7 @@ impl Scan<'_> {
         }
     }
 
-    fn aws(&mut self, args: &[Word]) {
+    fn aws(&mut self, args: &[Word], depth: usize) {
         let texts: Vec<&str> = args.iter().map(|w| w.text.as_str()).collect();
         let Some(ssm) = texts.iter().position(|t| *t == "ssm") else {
             return;
@@ -595,6 +650,13 @@ impl Scan<'_> {
         } else {
             "aws ssm start-session"
         };
+        for p in &params {
+            if !p.text.starts_with("file://") {
+                for command in ssm_commands(&p.text) {
+                    self.nested(&command, None, depth);
+                }
+            }
+        }
         for p in params {
             let payload = if let Some(file) = p.text.strip_prefix("file://") {
                 self.file_payload(&Word {
@@ -650,6 +712,43 @@ const RSYNC_ARG_FLAGS: &[&str] = &[
     "--usermap",
     "--groupmap",
 ];
+
+/// Skip ssh options from `args[i]`: the index of the first non-option word,
+/// and whether a `--` ended the options.
+fn skip_ssh_options(args: &[Word], mut i: usize) -> (usize, bool) {
+    const TAKES: &str = "BbcDEeFIiJLlmOoPpQRSWw";
+    while let Some(a) = args.get(i) {
+        let t = a.text.as_str();
+        if t == "--" {
+            return (i + 1, true);
+        }
+        if t.len() < 2 || !t.starts_with('-') {
+            break;
+        }
+        i += 1;
+        for (k, ch) in t[1..].char_indices() {
+            if TAKES.contains(ch) {
+                if k + ch.len_utf8() == t.len() - 1 {
+                    i += 1; // argument is the next word
+                }
+                break;
+            }
+        }
+    }
+    (i, false)
+}
+
+/// The shell commands in an SSM `--parameters` value: `commands=["a","b"]`
+/// (or a bare `commands=a`), each scanned as a command line.
+fn ssm_commands(value: &str) -> Vec<String> {
+    let v = value.trim();
+    let v = v.strip_prefix("commands=").unwrap_or(v);
+    let v = v.trim().trim_start_matches('[').trim_end_matches(']');
+    v.split("\",\"")
+        .map(|c| c.trim().trim_matches('"').replace("\\\"", "\""))
+        .filter(|c| !c.trim().is_empty())
+        .collect()
+}
 
 fn text_payload(text: &str, source: &str) -> Option<Payload> {
     destructive_pattern(text).map(|pattern| Payload::Destructive {

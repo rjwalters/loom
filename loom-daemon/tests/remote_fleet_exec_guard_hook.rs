@@ -187,3 +187,31 @@ fn runtime_built_payloads_and_fan_out_ask_through_the_hook() {
         assert_eq!(d, "allow", "{cmd}: {reason}");
     }
 }
+
+/// Judge cycle 2 on #11568: a hop through a host that is not on the fleet
+/// (a bastion, a dev VM) still reaches a fleet host, and the script fed to
+/// the outer hop runs on the inner one.
+#[test]
+fn nested_hops_through_a_non_fleet_host_ask_through_the_hook() {
+    let f = Fixture::new();
+    for cmd in [
+        "ssh bastion ssh ubuntu@100.101.102.103 'git reset --hard'",
+        "ssh bastion -t ssh ubuntu@100.101.102.103 'git reset --hard'",
+        "ssh dev-vm.example.test \"ssh ubuntu@100.101.102.103 'git reset --hard'\"",
+        "ssh dev-vm.example.test 'ssh loom-worker-1 \"rm -rf ~/GitHub\"'",
+        "ssh bastion 'tailscale ssh loom-worker-1 git reset --hard'",
+        "ssh bastion ssh ubuntu@100.101.102.103 bash -s < s.sh",
+    ] {
+        let (d, reason, _) = f.run(cmd, &[]);
+        assert_eq!(d, "ask", "{cmd}: {reason}");
+        assert!(reason.starts_with("ASK [remote-fleet-exec]"), "{cmd}: {reason}");
+    }
+    for cmd in [
+        "ssh bastion ssh ubuntu@100.101.102.103 uptime",
+        "ssh dev-vm.example.test 'ssh 10.0.0.5 rm -rf /tmp/x'",
+        "ssh bastion ssh ubuntu@100.101.102.103 bash -s < ro.sh",
+    ] {
+        let (d, reason, _) = f.run(cmd, &[]);
+        assert_eq!(d, "allow", "{cmd}: {reason}");
+    }
+}

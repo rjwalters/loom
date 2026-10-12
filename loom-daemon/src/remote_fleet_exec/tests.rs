@@ -373,3 +373,87 @@ fn heredoc_delimiter_quoting_is_tracked() {
         }
     }
 }
+
+/// Judge cycle 2 on #11568: a hop through a host that is not on the fleet
+/// still reaches one. The remote command of every hop is scanned as a
+/// command line of its own, and a script fed to the outer hop reaches the
+/// inner one.
+#[test]
+fn nested_hops_through_a_non_fleet_host_ask() {
+    let f = Fx::new();
+    for cmd in [
+        "ssh bastion ssh ubuntu@100.64.1.2 'git reset --hard'",
+        "ssh bastion -t ssh ubuntu@100.64.1.2 'git reset --hard'",
+        "ssh devvm.example.com \"ssh ubuntu@100.64.1.2 'git reset --hard'\"",
+        "ssh devvm.example.com 'ssh loom-worker-1 \"rm -rf ~/GitHub\"'",
+        "ssh bastion 'tailscale ssh loom-worker-1 git reset --hard'",
+        "ssh bastion ssh ubuntu@100.64.1.2 bash -s < s.sh",
+        "cat s.sh | ssh bastion ssh ubuntu@100.64.1.2 bash -s",
+        "ssh bastion ssh ubuntu@100.64.1.2 bash -s <<< 'git reset --hard'",
+        "ssh bastion ssh devvm ssh ubuntu@100.64.1.2 'git reset --hard'",
+        "tailscale ssh bastion ssh loom-worker-2 'git clean -fdx'",
+        "ssh bastion 'echo ubuntu@100.64.1.2 | xargs -I{} ssh {} git reset --hard'",
+        "ssh bastion 'bash -c \"ssh ubuntu@100.64.1.2 git reset --hard\"'",
+        "ssh bastion 'rsync -a ./x ubuntu@100.64.1.2:/srv/'",
+        "ssh bastion 'for h in a b; do ssh $h rm -rf /srv/x; done'",
+        // A script on the bastion cannot be read from here.
+        "ssh bastion 'ssh ubuntu@100.64.1.2 bash -s < /tmp/fix.sh'",
+        "ssh bastion 'ssh ubuntu@100.64.1.2 bash -s < s.sh'",
+        "aws ssm send-command --instance-ids i-0other --document-name AWS-RunShellScript --parameters 'commands=[\"ssh ubuntu@100.64.1.2 git reset --hard\"]'",
+    ] {
+        assert!(f.ask(cmd).is_some(), "should ask: {cmd}");
+    }
+    let r = f
+        .ask("ssh bastion ssh ubuntu@100.64.1.2 bash -s < s.sh")
+        .expect("asks");
+    assert!(r.contains("fleet host `100.64.1.2`"), "{r}");
+}
+
+#[test]
+fn read_only_or_non_fleet_nested_hops_pass() {
+    let f = Fx::new();
+    for cmd in [
+        "ssh bastion ssh ubuntu@100.64.1.2 uptime",
+        "ssh bastion -t ssh ubuntu@100.64.1.2 'git status'",
+        "ssh devvm 'ssh 10.0.0.5 rm -rf /tmp/x'",
+        "ssh devvm \"ssh ubuntu@100.64.1.2 'ls $HOME'\"",
+        "ssh bastion 'tailscale ssh loom-worker-1 uptime'",
+        "ssh bastion ssh ubuntu@100.64.1.2 bash -s < ro.sh",
+        "ssh bastion 'echo ubuntu@100.64.1.2 | xargs -I{} ssh {} uptime'",
+        "ssh bastion 'scp loom-worker-1:/tmp/x ./'",
+        "ssh bastion 'git reset --hard'",
+        "ssh bastion 'for h in a b; do ssh $h uptime; done'",
+        "ssh bastion 'cat /etc/hosts | grep ssh'",
+        "cat s.sh | ssh bastion ssh ubuntu@100.64.1.2 uptime",
+        "echo ubuntu@100.64.1.2 | ssh bastion 'xargs -I{} ssh {} uptime' < s.sh",
+    ] {
+        assert_eq!(f.ask(cmd), None, "{cmd}");
+    }
+}
+
+#[test]
+fn hops_nested_past_the_depth_limit_are_undeterminable() {
+    let f = Fx::new();
+    let mut cmd = "ssh 10.0.0.9 uptime".to_string();
+    for _ in 0..=MAX_DEPTH {
+        cmd = format!("bash -c {}", shell_quote(&cmd));
+    }
+    let r = f.ask(&cmd).expect("asks");
+    assert!(r.contains("nested more than"), "{r}");
+    // Within the limit, the same read-only hop passes.
+    assert_eq!(f.ask("bash -c 'bash -c \"ssh 10.0.0.9 uptime\"'"), None);
+}
+
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+#[test]
+fn ssh_options_after_the_destination_are_skipped() {
+    let f = Fx::new();
+    assert!(f
+        .ask("ssh loom-worker-1 -t -o BatchMode=yes 'git reset --hard'")
+        .is_some());
+    assert!(f.ask("ssh loom-worker-1 -t bash -s < s.sh").is_some());
+    assert_eq!(f.ask("ssh loom-worker-1 -t -- uptime"), None);
+}
