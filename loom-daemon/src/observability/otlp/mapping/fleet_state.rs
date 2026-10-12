@@ -80,6 +80,7 @@ mod tests {
                 repo: "rjwalters/loom".to_string(),
                 visibility: RepoVisibility::Public,
                 main_ci: None,
+                halt: None,
                 ready_complete: false,
                 ready_replace: true,
                 census: Some(FleetPrCensus {

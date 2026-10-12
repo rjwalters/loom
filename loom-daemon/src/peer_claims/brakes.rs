@@ -357,6 +357,19 @@ impl PeerClaimView {
         (*expiry > now).then(|| *expiry - now)
     }
 
+    /// [`Self::noop_cooldown_remaining_at`]'s sibling for dispatch backoff
+    /// (Issue #11564): what lets the work finder date a peer-armed window.
+    #[must_use]
+    pub fn dispatch_backoff_remaining_at(
+        &self,
+        repo: &str,
+        issue: u32,
+        now: Instant,
+    ) -> Option<Duration> {
+        let expiry = self.dispatch_backoffs.get(&(repo.to_string(), issue))?;
+        (*expiry > now).then(|| *expiry - now)
+    }
+
     /// [`Self::noop_cooldown_issues_at`]'s sibling for dispatch backoff
     /// (Issue #7477).
     #[must_use]
