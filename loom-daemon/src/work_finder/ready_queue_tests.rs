@@ -361,13 +361,14 @@ fn oldest_first(a: Option<&String>, b: Option<&String>) -> std::cmp::Ordering {
     }
 }
 
-/// The documented #11103/#11508 order, written out independently of
-/// `candidate_keys`: level highest first; `createdAt` oldest first; number
-/// asc. A change to dispatch order must update both this and
+/// The documented #11103/#11508/#11547 order, written out independently of
+/// `candidate_keys`: verified red-main fix first; level highest first;
+/// `createdAt` oldest first; number asc. A change to dispatch order must update both this and
 /// `candidate_keys` — which is the point.
 fn reference_cmp(a: &PriorityCandidate, b: &PriorityCandidate) -> std::cmp::Ordering {
-    b.level
-        .cmp(&a.level)
+    b.main_red_fix
+        .cmp(&a.main_red_fix)
+        .then(b.level.cmp(&a.level))
         .then(oldest_first(a.created_at.as_ref(), b.created_at.as_ref()))
         .then(a.number.cmp(&b.number))
 }
@@ -383,16 +384,19 @@ fn candidate_domain() -> Vec<PriorityCandidate> {
     ];
     let mut out = Vec::new();
     for workspace_priority in [0, 100] {
-        for level in [Level::Default, Level::Important, Level::VeryImportant] {
-            for created_at in times {
-                for number in [1, 2] {
-                    out.push(PriorityCandidate {
-                        workspace_priority,
-                        level,
-                        created_at: created_at.map(str::to_string),
-                        number,
-                        ..PriorityCandidate::default()
-                    });
+        for main_red_fix in [false, true] {
+            for level in [Level::Default, Level::Important, Level::VeryImportant] {
+                for created_at in times {
+                    for number in [1, 2] {
+                        out.push(PriorityCandidate {
+                            workspace_priority,
+                            main_red_fix,
+                            level,
+                            created_at: created_at.map(str::to_string),
+                            number,
+                            ..PriorityCandidate::default()
+                        });
+                    }
                 }
             }
         }
@@ -420,12 +424,16 @@ fn candidate_keys_lexicographic_compare_is_candidate_cmp() {
 /// (workspace priority, not a key, never distinguishes two rows).
 #[test]
 fn candidate_keys_project_to_named_wire_keys() {
-    assert_eq!(ready_queue::ordering_names(), vec!["level", "created_at", "number"]);
+    assert_eq!(
+        ready_queue::ordering_names(),
+        vec!["main_red_fix", "level", "created_at", "number"]
+    );
     let c = PriorityCandidate {
         workspace_priority: 7,
         level: crate::priority_pick::Level::VeryImportant,
         created_at: Some("2026-01-01T00:00:00Z".into()),
         number: 42,
+        main_red_fix: true,
         ..PriorityCandidate::default()
     };
     let values: Vec<serde_json::Value> = ready_queue::plan_keys(&c)
@@ -435,6 +443,7 @@ fn candidate_keys_project_to_named_wire_keys() {
     assert_eq!(
         values,
         vec![
+            serde_json::json!(true),
             serde_json::json!(2),
             serde_json::json!("2026-01-01T00:00:00Z"),
             serde_json::json!(42),

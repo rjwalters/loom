@@ -171,9 +171,11 @@ impl NotifyClearedBlockersArgs {
                     unparsed,
                 } => vec![unticked_reason(&resolved_refs, unparsed)],
                 // StillBlocked: the forge does not (yet) read the cited number
-                // as resolved. Undocumented cannot follow a citation. Neither is
-                // a cleared block worth a comment.
-                Verdict::Undocumented | Verdict::StillBlocked => continue,
+                // as resolved. Undocumented cannot follow a citation. Neither
+                // is a cleared block worth a comment.
+                Verdict::Undocumented | Verdict::HeldWithReason { .. } | Verdict::StillBlocked => {
+                    continue
+                }
             };
             let posted =
                 !self.dry_run && post_comment(g.kind, g.number, &cited, &reasons, repo, &root);

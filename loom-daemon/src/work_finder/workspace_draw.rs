@@ -6,12 +6,13 @@
 //! [`crate::priority_pick`]:
 //!
 //! 1. each workspace's candidates are put in their in-workspace order —
-//!    level, then oldest `createdAt`, then issue number
-//!    ([`crate::priority_pick::issue_cmp`]);
+//!    verified red-main fix first (#11547), then level, then oldest
+//!    `createdAt`, then issue number ([`crate::priority_pick::issue_cmp`]);
 //! 2. a workspace is drawn among those with candidates left, weighted by its
 //!    `fleet_priority` ([`crate::priority_pick::weight_for_priority`]); a
-//!    workspace whose next candidate is `loom:very-important` wins the draw
-//!    (the draw is among just those when several qualify);
+//!    workspace whose next candidate is a verified red-main fix wins the
+//!    draw, else one whose next candidate is `loom:very-important` (the draw
+//!    is among just those when several qualify);
 //! 3. the drawn workspace's next candidate is appended, and the draw repeats
 //!    until every candidate is placed.
 //!
@@ -74,10 +75,12 @@ fn issue_key(c: &PriorityCandidate) -> IssueKey {
         number: c.number,
         created_at: c.created_at.clone(),
         level: c.level,
+        main_red_fix: c.main_red_fix,
     }
 }
 
-/// The in-workspace order: level, oldest `createdAt`, issue number.
+/// The in-workspace order: verified red-main fix, level, oldest
+/// `createdAt`, issue number.
 #[must_use]
 pub fn in_workspace_cmp(a: &PriorityCandidate, b: &PriorityCandidate) -> std::cmp::Ordering {
     priority_pick::issue_cmp(&issue_key(a), &issue_key(b))
@@ -113,6 +116,7 @@ pub fn draw_order(
                         .copied()
                         .unwrap_or(DEFAULT_WORKSPACE_PRIORITY),
                     has_very_important: next.level == Level::VeryImportant,
+                    has_red_main_fix: next.main_red_fix,
                 })
             })
             .collect();

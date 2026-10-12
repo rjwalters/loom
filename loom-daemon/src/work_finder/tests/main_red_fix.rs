@@ -1,7 +1,7 @@
 //! The red-main-fix lane (#9244 §6): a halted repo admits only its fixes on
-//! a verified-red `main`, and the CI fallback when the gate is disabled. The
-//! marker no longer reorders anything (#11508): a fix that must go first is
-//! labelled `loom:very-important`.
+//! a verified-red `main`, and the CI fallback when the gate is disabled.
+//! #11547: while `main` is verified red the fix leads the dispatch order; on
+//! a green `main` the marker reorders nothing.
 
 use super::*;
 use crate::work_finder::main_red_fix::latest_run_is_failure;
@@ -39,9 +39,9 @@ fn very_important(item: WorkItem) -> WorkItem {
 }
 
 #[test]
-fn the_marker_alone_gives_no_ordering_boost_even_on_a_red_main() {
-    // The fix (#9) is newer than #1. #11508 removed the red-main key: age
-    // decides on a red repo too, unless the fix is labelled very-important.
+fn the_marker_leads_the_order_only_on_a_red_main() {
+    // The fix (#9) is newer than #1. #11547: on a verified-red repo the fix
+    // goes first anyway; on a green repo age decides.
     let items = || {
         vec![
             dated(issue(1), "2026-01-01T00:00:00Z"),
@@ -62,13 +62,15 @@ fn the_marker_alone_gives_no_ordering_boost_even_on_a_red_main() {
         &[RED],
     );
     assert_eq!(report.dispatched, 1);
-    assert_eq!(multi[0].1.dispatched, vec![1], "red main: no boost from the marker");
+    assert_eq!(multi[0].1.dispatched, vec![9], "red main: the fix leads");
 
-    // Single-workspace path.
-    let mut dispatcher = RecordingDispatcher::default();
-    let src = &mut FakeSource::once(items());
-    tick_with_lanes(src, &mut dispatcher, (1.into(), usize::MAX), false, false, RED).unwrap();
-    assert_eq!(dispatcher.dispatched, vec![1]);
+    // Single-workspace path: red leads with the fix, green keeps age order.
+    for (lane, want) in [(RED, 9), (RedMainLane::default(), 1)] {
+        let mut dispatcher = RecordingDispatcher::default();
+        let src = &mut FakeSource::once(items());
+        tick_with_lanes(src, &mut dispatcher, (1.into(), usize::MAX), false, false, lane).unwrap();
+        assert_eq!(dispatcher.dispatched, vec![want], "{lane:?}");
+    }
 
     // Labelled very-important, the fix goes first (red or green).
     let labelled = || {
@@ -340,9 +342,8 @@ fn an_unpromoted_fix_is_buildable_on_a_red_repo() {
                 dated(fix.clone(), "2026-09-01T00:00:00Z"),
             ]
         };
-        // Red: the fix is a candidate (seen), ordered by age behind the older
-        // ordinary issue (#11508: no red-main ordering key).
-        assert_eq!(multi_tick(items(), RED, false, false), (vec![1], 2), "{label}");
+        // Red: the fix is a candidate (seen) and leads the order (#11547).
+        assert_eq!(multi_tick(items(), RED, false, false), (vec![9], 2), "{label}");
         // Red and halted by the gate: it is still admitted, alone.
         assert_eq!(multi_tick(items(), RED, true, false).0, vec![9], "{label}");
 
@@ -351,7 +352,7 @@ fn an_unpromoted_fix_is_buildable_on_a_red_repo() {
         let report =
             tick_with_lanes(src, &mut dispatcher, (1.into(), usize::MAX), false, false, RED)
                 .unwrap();
-        assert_eq!((dispatcher.dispatched, report.seen), (vec![1], 2), "{label}");
+        assert_eq!((dispatcher.dispatched, report.seen), (vec![9], 2), "{label}");
     }
 }
 
