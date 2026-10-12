@@ -241,6 +241,7 @@ cycle) is added only when loom-ui's error tracking shows it is needed.
 | [`loom.dispatch.disposition`](#loomdispatchdisposition-issue-9222-per-issue-why-is-it-waiting) rows (`loom.queue.*` attributes) and `loom.queue.disposition_rows_dropped` | span + metric, OTLP only | `observability/ops/disposition.rs` |
 | [`host.health`](#hosthealth) | gauges, native + OTLP | `observability/collector.rs` (+ `exporter.rs`, `sender.rs`) |
 | [`host.export`](#hostexport) | log, OTLP only | `observability/collector.rs` |
+| [`operator.presence`](#operatorpresence) | local journal only until #11525 | `loom-daemon presence beat` (opt-in operator hook) |
 | Captain gauges: `loom.captain.gauge_age_seconds`, `loom.captain.gauge_fallback`, `loom.forge.stage_dwell`, `loom.forge.stage_items` ([`metric.points`](#metricpoints)) | metric | `observability/captain_gauges.rs`, `observability/ops/stage_dwell.rs` |
 | [`eta.stage_outcome`](#etastage_outcome) (kept, non-ETA owner since #11126) | log, OTLP only | `observability/fleet_state/outcomes.rs` (diff of two `fleet.state` views) |
 | [`pr.resolved`](#prresolved) (kept, non-ETA owner since #11126) | log, OTLP only | `observability/fleet_state/outcomes.rs` (a PR that left the review listings) |
@@ -3143,6 +3144,53 @@ decrease as a counter reset (take the post-reset value, not a negative delta).
 The committed query is
 [`defaults/observability/signoz/host-export-queries.sql`](https://github.com/rjwalters/loom/blob/main/defaults/observability/signoz/host-export-queries.sql):
 hosts with drops, or with no `host.export` at all, in the last 2 h. Query 3 compares a rendered `hosts.yml` roster against `host.export` to find silent hosts by absence (#11198).
+
+### `operator.presence`
+
+Whether a person is at the keyboard of an operator session (Issue #11563).
+ETA could not tell operator-driven work that stalls (the operator stepped away)
+from work that is merely slow, and in-session `/loom:sweep` runs on
+workstations with no daemon emitted nothing. Envelopes carry
+`schema_version: 12`. **Not exported yet** (`otlp: NotExported`; `native: true` only because
+the registry requires a carrier, as for `queue.snapshot`): it goes to a local journal until the transport of #11525 exists, then
+the registry row flips to `otlp: Logs` with a mapping sibling. The
+`loom.presence.*` attribute names (`session_id`, `operator`, `last_input_at`,
+`last_activity_at`, `driving_count`) are reserved for that mapping.
+
+**No prompt or transcript content, by construction.** The record has no text
+field beyond ids and a forge login, and the producer reads only `session_id`
+and `hook_event_name` from the hook payload. A test asserts a distinctive
+prompt string appears in neither the journal nor the state file.
+
+| Field | Type | Notes |
+|---|---|---|
+| `captured_at` | RFC3339 | the beat time; the record time |
+| `host` | string | the session's host |
+| `session_id` | string | opaque Claude Code session id |
+| `operator` | string? | forge login (`--operator` / `LOOM_OPERATOR`); omitted when unknown |
+| `last_input_at` | RFC3339? | last `UserPromptSubmit` (a human typed); omitted when none seen |
+| `last_activity_at` | RFC3339 | last tool call or Stop |
+| `driving[]` | array | issues/PRs this session holds an in-session lease on: `kind` (`issue`/`pr`), `number`, `sweep_id` |
+
+**Producer.** `loom-daemon presence beat`, called by the opt-in hook
+`presence-beat.sh` on `UserPromptSubmit`, `PostToolUse` and `Stop`. A prompt
+always emits; other events emit at most once per 5 minutes. The hook is wired
+only when the operator provisions with `LOOM_OPERATOR_PRESENCE=1`
+(`scripts/install/provision-hooks.sh`); it is absent by default.
+
+**In-session sweeps.** `loom-daemon presence sweep-start` / `sweep-outcome`
+journal `sweep.started` / `sweep.outcome` with `loom.dispatch_origin=operator`
+and the `sweep_id` that appears in the in-session lease comment. With
+`LOOM_OPERATOR_PRESENCE=1`, `lease ensure` calls `sweep-start` itself once the
+lease is publishing; `sweep-outcome` is an explicit call at the sweep's end.
+
+**Transport and journal.** Until the transport of #11525 exists, every fact is
+appended to `.loom/logs/operator-presence.jsonl` (override
+`LOOM_OPERATOR_PRESENCE_JOURNAL_PATH`) as one `TelemetryEnvelope` line. The
+journal never rotates and never drops: `loom-daemon presence export` stages it,
+hands the whole batch to the transport, and deletes staged files only after the
+transport accepted them. With no transport it reports the pending count and
+leaves everything in place; unparseable lines go to `<journal>.rejected`.
 
 ## Persistence & read surface (`sweep.outcome`, Issue #4704)
 

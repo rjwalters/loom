@@ -164,6 +164,9 @@ pub mod auto_update_tick;
 /// `host.export` (#11124).
 pub mod host_export;
 
+/// `operator.presence` (#11563) — an operator session's keyboard presence.
+pub mod operator_presence;
+
 /// `pass.summary` / `pass.verdict` (#10752) — what a pass over artifacts did.
 pub mod pass;
 
@@ -429,6 +432,14 @@ macro_rules! telemetry_kind_table {
             /// and the last successful flush. OTLP-only. See [`host_export`].
             HostExport = "host.export" => $crate::telemetry::kinds::host_export::HostExportRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// An operator session's presence beat (Issue #11563): who is at the
+            /// keyboard (`last_input_at`), when the session last did anything,
+            /// and which issues and PRs it is driving. No prompt or transcript
+            /// content exists in the record. Journal-only until the transport of #11525
+            /// exists; `native: true` only so the registry names a carrier for it. See [`operator_presence`].
+            OperatorPresence = "operator.presence" => $crate::telemetry::kinds::operator_presence::OperatorPresenceRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: NotExported, native: true;
 
             // APPEND NEW KINDS ABOVE THIS LINE (one row; `gate:` stays
             // NEW_KIND_SCHEMA_VERSION). Do not renumber or reorder existing rows —

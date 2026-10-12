@@ -125,6 +125,8 @@ fn samples() -> Vec<TelemetryRecord> {
                     "anchor_as_of": AT, "repos": []})),
         wire(json!({"kind": "host.export", "captured_at": AT, "host": "host-a",
                     "exporters": []})),
+        wire(json!({"kind": "operator.presence", "captured_at": AT, "host": "host-a",
+                    "session_id": "s1", "last_activity_at": AT, "driving": []})),
         TelemetryRecord::PickDecision(pick_decision()),
         wire(json!({"kind": "pr.resolved", "repo": "rjwalters/loom", "pr_number": 1,
                     "state": "merged", "resolved_at": AT, "observed_at": AT,
