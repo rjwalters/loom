@@ -692,6 +692,27 @@ impl WorkspaceHealthStates {
             .clone()
     }
 
+    /// `root`'s [`MainHealthState`] if the gate has ever seen it, else `None`
+    /// (#11565). Tries the exact key first, then falls back to comparing
+    /// canonical paths, so a reader whose root differs from the gate loop's
+    /// only by a symlink, `..` or trailing slash (the registry stores
+    /// normalized roots, the workspace pool keys by the caller's literal
+    /// value) still finds the state. Never creates an entry.
+    #[must_use]
+    pub fn find(&self, root: &Path) -> Option<Arc<MainHealthState>> {
+        let map = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(s) = map.get(root) {
+            return Some(s.clone());
+        }
+        let wanted = std::fs::canonicalize(root).ok()?;
+        map.iter()
+            .find(|(k, _)| std::fs::canonicalize(k).is_ok_and(|c| c == wanted))
+            .map(|(_, s)| s.clone())
+    }
+
     /// Whether `root`'s dispatch is currently halted. A never-seen root is
     /// treated as green (not halted) — no gate has run against it.
     #[must_use]

@@ -432,12 +432,18 @@ fn capacity(workspace_root: &Path, live_workers: usize) -> FleetCapacity {
 }
 
 /// `main` CI status of the repo rooted at `root` from the main-health gate:
-/// red when halted on a verified-red run, unknown when the gate has not
-/// produced a verdict or could not evaluate, else green.
+/// red when halted on a verified-red run, green when the gate has produced a
+/// green verdict, unknown otherwise (#11565). Unknown means the gate has no
+/// verdict for the root: it is not enabled for it (`autonomous.mainHealthGate`
+/// is off by default, or the repo has no usable `buildGate`), has not
+/// completed a run yet this process, or its last tick could not evaluate.
 fn main_ci(states: &crate::main_health_gate::WorkspaceHealthStates, root: &Path) -> MainCi {
-    if states.is_halted(root) {
+    let Some(state) = states.find(root) else {
+        return MainCi::Unknown;
+    };
+    if state.is_halted() {
         MainCi::Red
-    } else if states.is_unevaluated(root) || states.last_verdict_at(root).is_none() {
+    } else if state.is_unevaluated() || state.last_verdict_at().is_none() {
         MainCi::Unknown
     } else {
         MainCi::Green
