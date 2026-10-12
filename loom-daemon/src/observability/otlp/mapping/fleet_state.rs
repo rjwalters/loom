@@ -82,6 +82,9 @@ mod tests {
                 visibility: RepoVisibility::Public,
                 main_ci: None,
                 halt: None,
+                in_flight: None,
+                cap: None,
+                deferred_repo_cap: None,
                 ready_complete: false,
                 ready_replace: true,
                 census: Some(FleetPrCensus {

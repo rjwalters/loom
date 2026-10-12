@@ -574,6 +574,16 @@ pub struct FleetPrCensus {
     pub by_stage: BTreeMap<String, u32>,
 }
 
+/// Decode a present field, `null` included, as `Some(..)`; an absent field
+/// stays `None` through `#[serde(default)]` (#11606: uncapped vs unknown).
+fn observed_option<'de, D, T>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(de).map(Some)
+}
+
 /// Observed Champion dispatch metadata, independent of approval authority.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChampionState {
@@ -617,6 +627,26 @@ pub struct FleetStateRepo {
     /// `fleet-state/v1`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub halt: Option<FleetRepoHalt>,
+    /// Sweeps this host's work finder counts against the repo's dispatch cap
+    /// when its last tick finished (#11606): host-local, the dispatcher's
+    /// own occupancy count plus that tick's admissions. Absent means unknown
+    /// (no tick, or an older emitter), never zero. Additive on `fleet-state/v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_flight: Option<u32>,
+    /// The repo's resolved `maxConcurrentPerRepo` on that tick (#11606).
+    /// Three states: absent = unknown, `null` = uncapped (observed), a number
+    /// = the cap. Present exactly when `in_flight` is. Additive.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "observed_option"
+    )]
+    pub cap: Option<Option<u32>>,
+    /// Ready candidates of the repo that tick deferred for the cap (#11606).
+    /// `0` is a measured result; absent means unknown. Present exactly when
+    /// `in_flight` is. Additive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred_repo_cap: Option<u32>,
     /// The census. Absent means unknown at `as_of`, because the repo's
     /// listings were incomplete or not read. It never means zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]

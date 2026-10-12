@@ -94,6 +94,7 @@ fn input() -> FleetInput {
                 occupancy: Some(1),
             }),
             halts: BTreeMap::new(),
+            limits: Default::default(),
         }),
         capacity: None,
         main_ci: BTreeMap::new(),

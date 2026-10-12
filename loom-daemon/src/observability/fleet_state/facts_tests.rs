@@ -51,6 +51,7 @@ fn input(items: Vec<ReadyItem>, halts: BTreeMap<String, FleetRepoHalt>) -> Fleet
             complete: repos,
             slots: None,
             halts,
+            limits: Default::default(),
         }),
         ..FleetInput::default()
     }

@@ -466,6 +466,7 @@ fn a_claimed_ready_issue_is_one_fact_across_hosts() {
             complete: ["o/r".to_string()].into(),
             slots: None,
             halts: Default::default(),
+            limits: Default::default(),
         }),
         capacity: None,
         main_ci: BTreeMap::new(),

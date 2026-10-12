@@ -374,6 +374,7 @@ fn a_ready_row_surviving_the_review_departure_gives_landed_not_advance() {
             complete: BTreeSet::new(),
             slots: None,
             halts: Default::default(),
+            limits: Default::default(),
         });
         with_ready
     };
@@ -521,6 +522,7 @@ fn ready(issues: &[u32], held: Vec<HeldSweep>) -> FleetInput {
         complete: [REPO.to_string()].into(),
         slots: None,
         halts: Default::default(),
+        limits: Default::default(),
     });
     with_ready
 }

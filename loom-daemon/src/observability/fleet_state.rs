@@ -229,6 +229,17 @@ pub struct ReadyItem {
     pub eligible_at: Option<DateTime<Utc>>,
 }
 
+/// One repo's dispatch limits from the work finder's last tick (#11606).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RepoLimits {
+    /// Host-local sweeps counted against the cap when the tick finished.
+    pub in_flight: u32,
+    /// The resolved per-repo cap; `None` is uncapped, observed.
+    pub cap: Option<u32>,
+    /// Ready candidates the tick deferred for the cap.
+    pub deferred_repo_cap: u32,
+}
+
 /// The work finder's last tick, as `fleet.state` reads it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReadyQueue {
@@ -244,6 +255,9 @@ pub struct ReadyQueue {
     /// The repos the tick held, by lowercased slug (#11564). Every held repo
     /// is here, whether or not it has ready rows.
     pub halts: BTreeMap<String, FleetRepoHalt>,
+    /// Every repo the tick resolved dispatch limits for, by lowercased slug
+    /// (#11606). A repo the tick did not cover is absent: unknown.
+    pub limits: BTreeMap<String, RepoLimits>,
 }
 
 /// Everything one pass read.
@@ -282,6 +296,8 @@ pub struct RepoView {
     pub main_ci: Option<MainCi>,
     /// The work finder's hold on the repo, when it holds it (#11564).
     pub halt: Option<FleetRepoHalt>,
+    /// The work finder's dispatch limits for the repo (#11606).
+    pub limits: Option<RepoLimits>,
 }
 
 /// The full state at one pass, before visibility tagging.
@@ -598,6 +614,10 @@ pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Ut
     for (repo, halt) in input.ready.iter().flat_map(|ready| &ready.halts) {
         repos.entry(repo.clone()).or_default().halt = Some(halt.clone());
     }
+    // Every repo the tick covered, rows or not (#11606): never capped.
+    for (repo, limits) in input.ready.iter().flat_map(|ready| &ready.limits) {
+        repos.entry(repo.clone()).or_default().limits = Some(*limits);
+    }
     FleetView {
         census_at: input.listed_at.filter(|_| !input.listings.is_empty()),
         slots: input.ready.as_ref().and_then(|r| r.slots),
@@ -620,6 +640,7 @@ pub fn needs_anchor(last: Option<&Emitted>, stamps: &PlannerStamps, now: DateTim
 fn repo_entry(view: &FleetView, repo: &str, census: Option<FleetPrCensus>) -> FleetStateRepo {
     let main_ci = view.repos.get(repo).and_then(|r| r.main_ci);
     let halt = view.repos.get(repo).and_then(|r| r.halt.clone());
+    let limits = view.repos.get(repo).and_then(|r| r.limits);
     let ready_complete = view.ready_complete(repo);
     FleetStateRepo {
         champion: view.repos.get(repo).and_then(|r| r.champion.clone()),
@@ -629,6 +650,9 @@ fn repo_entry(view: &FleetView, repo: &str, census: Option<FleetPrCensus>) -> Fl
         visibility: RepoVisibility::Private,
         main_ci,
         halt,
+        in_flight: limits.map(|l| l.in_flight),
+        cap: limits.map(|l| l.cap),
+        deferred_repo_cap: limits.map(|l| l.deferred_repo_cap),
         census,
         ready_complete,
         ready_replace: !ready_complete,
@@ -726,6 +750,7 @@ pub fn decide(
             && now_state.champion == was.champion
             && now_state.main_ci == was.main_ci
             && now_state.halt == was.halt
+            && now_state.limits == was.limits
             && view.ready_complete(repo) == last.view.ready_complete(repo)
         {
             continue;
@@ -1061,3 +1086,8 @@ mod tests;
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[path = "fleet_state/facts_tests.rs"]
 mod facts_tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[path = "fleet_state/limits_tests.rs"]
+mod limits_tests;
