@@ -241,6 +241,7 @@ cycle) is added only when loom-ui's error tracking shows it is needed.
 | [`loom.dispatch.disposition`](#loomdispatchdisposition-issue-9222-per-issue-why-is-it-waiting) rows (`loom.queue.*` attributes) and `loom.queue.disposition_rows_dropped` | span + metric, OTLP only | `observability/ops/disposition.rs` |
 | [`host.health`](#hosthealth) | gauges, native + OTLP | `observability/collector.rs` (+ `exporter.rs`, `sender.rs`) |
 | [`host.export`](#hostexport) | log, OTLP only | `observability/collector.rs` |
+| [`checkout.external_change`](#checkoutexternal_change) | log, OTLP only | `fleet_sync/checkout_ff/external_change.rs` |
 | Captain gauges: `loom.captain.gauge_age_seconds`, `loom.captain.gauge_fallback`, `loom.forge.stage_dwell`, `loom.forge.stage_items` ([`metric.points`](#metricpoints)) | metric | `observability/captain_gauges.rs`, `observability/ops/stage_dwell.rs` |
 | [`eta.stage_outcome`](#etastage_outcome) (kept, non-ETA owner since #11126) | log, OTLP only | `observability/fleet_state/outcomes.rs` (diff of two `fleet.state` views) |
 | [`pr.resolved`](#prresolved) (kept, non-ETA owner since #11126) | log, OTLP only | `observability/fleet_state/outcomes.rs` (a PR that left the review listings) |
@@ -3205,6 +3206,66 @@ additive (serde-defaulted), so records from before #11527 still parse and no
 `schema_version` bump is needed. The committed query is
 [`defaults/observability/signoz/host-export-queries.sql`](https://github.com/rjwalters/loom/blob/main/defaults/observability/signoz/host-export-queries.sql):
 hosts with drops, or with no `host.export` at all, in the last 2 h. Query 3 compares a rendered `hosts.yml` roster against `host.export` to find silent hosts by absence (#11198).
+
+### `checkout.external_change`
+
+A managed checkout's history was moved by something that was not Loom (Issue
+#11566). One record per reflog entry, emitted by the `checkout_ff` pass.
+Envelopes carry `schema_version: 12`. **OTLP-only** (native: `false`), severity
+`WARN`, stamped at the **reflog entry's own time** (`at`), not when the daemon
+noticed it. The body is the record's JSON; the scalars ride as `loom.checkout.*`
+attributes (`CHECKOUT_EXTERNAL_CHANGE_LOG_ATTRIBUTE_KEYS`, which the collector's
+`transform/privacy` allowlists), plus `loom.repo` / `loom.repo.visibility`.
+Facts only: it names what the reflog says and what became unreachable; it does
+not guess who ran the command and it repairs nothing.
+
+**How Loom tells its own moves apart.** Every daemon git child that can move a
+ref in a managed checkout runs with `GIT_REFLOG_ACTION=loom:<op>` (`ff`,
+`resync`, `gate`, `update`), so git writes `loom:ff: Fast-forward` instead of
+its default message. On each pass the daemon reads `logs/HEAD` and
+`logs/refs/heads/<default>`, compares them with what it last saw, and reports
+each *new* entry that (a) does not start with `loom:`, (b) moved the ref (old and
+new sha differ), and (c) is a `reset:` / `branch: Reset`, a `checkout: moving
+from`, or a `rebase (start|finish|abort)`. Plain `commit`, `merge` and `pull`
+entries only add history and are not reported. The first sight of a root, a
+reflog that shrank or was rewritten (`gc`, `reflog expire`), and an unreadable
+reflog **seed the comparison and emit nothing**: unknown is not a change.
+
+| Field | Type | Notes |
+|---|---|---|
+| `change_id` | string | stable id: a hash of root, from, to and the reflog time; the hold-clear note cites it |
+| `repo` | string? | `owner/repo` from `origin`, when it parses |
+| `visibility` | `public` \| `private` | `private` until resolved (a missing tag never decodes to public) |
+| `root` | string | the registered root |
+| `host` | string | the host whose checkout it is (the reflog is per clone, so only that host can read it) |
+| `move_kind` | string | `reset`, `checkout` or `rebase` (not `kind`: that is the envelope's record-kind tag) |
+| `ref` | string | the log that carried it: `HEAD` or `refs/heads/<default>` |
+| `reflog_line` | string | the reflog message as git wrote it |
+| `from_sha`, `to_sha` | string | the commit before and after the move |
+| `at` | RFC3339 | when git wrote the entry; the record time |
+| `observed_at` | RFC3339 | when the daemon read it |
+| `discarded_commits` | object? | `{count, subjects[]}`: commits reachable from `from_sha` and from no ref now (`git rev-list <from> --not --all`), subjects newest first, at most 20. Omitted when unknown (the old tip is gone, git failed): unknown, never "nothing" |
+| `hold_active` | boolean | a dispatch hold stood on this checkout when the pass read the entry |
+| `loom` | object | the observing build's provenance (required; a record without valid provenance is not emitted) |
+
+Attributes: `loom.checkout.change_id`, `.kind`, `.ref`, `.from_sha`, `.to_sha`,
+`.discarded_count`, `.hold_active`, and the build as `.version`, `.revision`,
+`.tree_state`, `.provenance_complete`.
+
+**Holds.** When a dispatch hold clears and one or more `checkout.external_change`
+records were emitted for that root since the hold began, the hold-clear log line
+(`workspace_hold: ...: hold cleared ...`) appends `; coincides with
+checkout.external_change <change_id>[, ...]`, so a hold that cleared because the
+checkout was moved by hand is not mistaken for one the resync fixed. Whether the
+hold cleared on the *next* pass is read from that line and the hold `cleared`
+event, not carried on the record (a record cannot know the future).
+
+**Limits.** The reflog is local and expirable; an entry the daemon was not
+running to see, or one removed by `reflog expire` first, is not reported. Git
+invoked by a person *through Loom's own tagged environment* (a shell inheriting
+`GIT_REFLOG_ACTION=loom:...`) is indistinguishable from Loom. The `rebase`
+entries other than start/finish/abort are ignored, so one rebase is one or two
+records, not one per picked commit.
 
 ## Persistence & read surface (`sweep.outcome`, Issue #4704)
 
