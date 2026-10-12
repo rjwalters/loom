@@ -25,6 +25,11 @@
 //! | `LOOM-CHECKS-TIMEOUT <sha> <pending,…>` | 2 |
 //! | `LOOM-CHECKS-ERROR <reason>` | 3 |
 //! | `LOOM-CHECKS-HEAD-MOVED <old> <new>` | 4 |
+//! | `LOOM-CHECKS-NO-RUN <sha>` | 5 |
+//!
+//! `NO-RUN` (#11389): no GitHub Actions run exists for the head after a grace
+//! period, while nothing observed is running — usually a skip-CI marker in
+//! the head commit message. A stderr hint says so. See [`no_run`].
 //!
 //! `--timeout 0` takes exactly one poll (a snapshot). A RED is reported as
 //! soon as a failing check is terminal, without waiting for the rest.
@@ -79,6 +84,7 @@ use std::time::{Duration, Instant};
 
 use crate::merge_pr::zero_checks::{self, Action, Required};
 
+pub mod no_run;
 pub mod reads;
 pub mod verdict;
 
@@ -185,6 +191,8 @@ pub struct Opts {
     pub max_interval: u64,
     pub settle_polls: u64,
     pub settle_interval: u64,
+    /// Grace before a missing Actions run is `NO-RUN` (#11389).
+    pub no_run_grace: Duration,
 }
 
 /// CLI arguments, as parsed by `cli::forge_action`.
@@ -243,6 +251,9 @@ fn run_cli(args: &WaitArgs) -> (Outcome, Vec<String>) {
             env("LOOM_ZERO_CHECKS_SETTLE_INTERVAL").as_deref(),
             min_interval,
         ),
+        no_run_grace: Duration::from_secs(
+            env_secs("LOOM_WAIT_CHECKS_NO_RUN_GRACE").unwrap_or(no_run::DEFAULT_GRACE),
+        ),
     };
     wait(&mut reads, &selector, &opts, &mut RealClock(Instant::now()))
 }
@@ -265,11 +276,13 @@ fn env(key: &str) -> Option<String> {
 enum Poll {
     Done(Outcome),
     /// Not settled: these are still pending. `sleep` overrides the backoff
-    /// (the zero-row settle's short spacing).
+    /// (the zero-row settle's short spacing). `idle`: no observed check is
+    /// running ([`no_run`]).
     Pending {
         sha: String,
         names: Vec<String>,
         sleep: Option<u64>,
+        idle: bool,
     },
 }
 
@@ -309,10 +322,16 @@ pub fn wait<C: Clock>(
         notes: Vec::new(),
     };
     let mut backoff = Backoff::new(opts.min_interval, opts.max_interval);
+    let mut probe = no_run::Probe::new(opts.no_run_grace);
     let mut transient: u32 = 0;
     loop {
         let deadline_reached = clock.elapsed() >= opts.timeout;
         let (sha, names, sleep) = match poll(reads, selector, opts, &mut st, deadline_reached) {
+            Ok(Poll::Done(Outcome::Timeout { sha, pending })) => {
+                // Only the zero-row settle times out inside a poll: idle.
+                let nr = probe.check(reads, &sha, clock.elapsed(), true, &mut st.notes);
+                return (nr.unwrap_or(Outcome::Timeout { sha, pending }), st.notes);
+            }
             Ok(Poll::Done(o)) => return (o, st.notes),
             Err(ReadError::Fatal(why)) => return (Outcome::Error(why), st.notes),
             Err(ReadError::Denied { denial, why }) if !denial.is_transient() => {
@@ -326,8 +345,16 @@ pub fn wait<C: Clock>(
                 }
                 (None, Vec::new(), None)
             }
-            Ok(Poll::Pending { sha, names, sleep }) => {
+            Ok(Poll::Pending {
+                sha,
+                names,
+                sleep,
+                idle,
+            }) => {
                 transient = 0;
+                if let Some(nr) = probe.check(reads, &sha, clock.elapsed(), idle, &mut st.notes) {
+                    return (nr, st.notes);
+                }
                 (Some(sha), names, sleep)
             }
         };
@@ -411,6 +438,7 @@ fn poll(
                 sha,
                 names,
                 sleep: (req_state == Required::None).then_some(d.sleep_secs),
+                idle: true,
             },
         });
     }
@@ -455,6 +483,7 @@ fn poll(
             sha,
             names,
             sleep: None,
+            idle: rollup.pending.is_empty(),
         },
     })
 }

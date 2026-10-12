@@ -33,6 +33,9 @@ pub const HOST_EXPORT_LOG_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.host_export.dropped_total",
     "loom.host_export.last_flush_ok_at",
     "loom.host_export.fact_id_missing_total",
+    // #11530: `opaque_host_id(host)`, the `host-XXXXXXXX` form `loom:lease`
+    // comments publish, derived in the OTLP mapping (no wire field).
+    "host.lease_id",
 ];
 
 /// One exporter's queue and flush facts.

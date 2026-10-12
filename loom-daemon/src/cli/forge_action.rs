@@ -131,9 +131,10 @@ pub(crate) enum ForgeAction {
     ///
     /// Prints exactly one sentinel on stdout — `LOOM-CHECKS-GREEN <sha>`,
     /// `-NONE <sha>`, `-RED <sha> <names>`, `-TIMEOUT <sha> <pending>`,
-    /// `-ERROR <reason>`, `-HEAD-MOVED <old> <new>` — and, on RED, one
+    /// `-ERROR <reason>`, `-HEAD-MOVED <old> <new>`, `-NO-RUN <sha>` (no
+    /// GitHub Actions run for the head, #11389) — and, on RED, one
     /// `<name>\t<url>\t<run_id>` line per failing check on stderr. Branch
-    /// on the sentinel, not the exit code (0/1/2/3/4). `--timeout 0` takes
+    /// on the sentinel, not the exit code (0/1/2/3/4/5). `--timeout 0` takes
     /// one snapshot. See `loom_daemon::forge_wait_checks`.
     #[command(name = "wait-checks")]
     WaitChecks {
