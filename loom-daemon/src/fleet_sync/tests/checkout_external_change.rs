@@ -251,6 +251,65 @@ fn loom_own_fast_forward_emits_nothing_and_logs_the_loom_tag() {
     assert_eq!(watch(&host, &mut memory).external_changes.len(), 1);
 }
 
+/// `land-resync-commit.sh`, the one installed script that moves the default
+/// branch of a managed root (#6646): its fallback commits the resync change and
+/// then `reset --hard origin/<default>`s the primary checkout. Both run under
+/// an inline `GIT_REFLOG_ACTION="$LOOM_REFLOG_ACTION"`, which must be a Loom tag.
+const LAND_RESYNC_SCRIPT: &str = include_str!("../../../../defaults/scripts/land-resync-commit.sh");
+
+#[test]
+fn land_resync_commit_tags_its_ref_moves_as_loom() {
+    assert!(
+        LAND_RESYNC_SCRIPT
+            .lines()
+            .any(|l| l == format!("LOOM_REFLOG_ACTION=\"{}\"", tag("resync"))),
+        "land-resync-commit.sh must set LOOM_REFLOG_ACTION={}",
+        tag("resync")
+    );
+    let tagged = "GIT_REFLOG_ACTION=\"$LOOM_REFLOG_ACTION\" git -C \"$REPO_ROOT\"";
+    for op in ["commit --quiet", "reset --hard"] {
+        assert!(
+            LAND_RESYNC_SCRIPT.contains(&format!("{tagged} {op}")),
+            "land-resync-commit.sh's `git {op}` must run under the Loom reflog tag"
+        );
+    }
+}
+
+#[test]
+fn land_resync_commit_fallback_reset_emits_nothing() {
+    let (_t, host, _seed) = with_origin();
+    let mut memory = Memory::default();
+    watch(&host, &mut memory);
+    git(&host, &["fetch", "--quiet", "origin"]);
+    // The script's own sequence, with the env it exports: commit on the
+    // default branch, then reset back to origin's tip (discarding the commit
+    // locally; it lives on the pushed side branch).
+    let resync = |args: &[&str]| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&host)
+            .args(args)
+            .env("GIT_REFLOG_ACTION", tag("resync"))
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    };
+    fs::write(host.join("resync.txt"), "x").unwrap();
+    git(&host, &["add", "-A"]);
+    resync(&[
+        "commit",
+        "--quiet",
+        "-m",
+        "chore: resync installed Loom surfaces",
+    ]);
+    resync(&["reset", "--quiet", "--hard", "origin/main"]);
+    let log = fs::read_to_string(host.join(".git/logs/refs/heads/main")).unwrap();
+    let last = log.lines().last().unwrap();
+    assert!(last.contains("\tloom:resync: updating HEAD"), "{log}");
+    let pass = watch(&host, &mut memory);
+    assert!(pass.external_changes.is_empty(), "{:?}", pass.external_changes);
+}
+
 #[test]
 fn a_standing_hold_is_recorded_and_cited_when_it_clears() {
     let (_t, dir) = repo();
