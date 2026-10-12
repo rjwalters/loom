@@ -100,7 +100,7 @@ services:
       - -q
       - http://localhost:8080/api/v1/health
       timeout: 30s
-    image: signoz/signoz:v0.142.1@sha256:49501b04d77a1e8328d31519c977dd4503b724c74425764a3ab83768db3ee8ff
+    image: signoz/signoz:v0.143.0@sha256:7da6b9c07db100cfcf7949966211b16543e3d6828df31f0f7a24110d734a811c
     logging:
       driver: json-file
       options:
