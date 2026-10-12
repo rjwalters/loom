@@ -542,7 +542,6 @@ fn an_undetermined_attempt_leaves_the_worked_key_absent() {
 // #9438: a role tick that never launches emits no `loom.role_attempt` span
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "otlp")]
 mod role_tick_spans {
     use super::*;
     use crate::role_runner::{CredentialPool, PoolHold, RoleTickOutcome};
@@ -792,7 +791,6 @@ fn a_begun_phase_completes_with_its_real_duration() {
 
 /// Begin with no done: the attempt stays open (no fabricated close) until the
 /// execution ends, which closes it `exit_unobserved` with `worked` absent.
-#[cfg(feature = "otlp")]
 #[test]
 fn a_begun_phase_with_no_completion_closes_unobserved_at_execution_end() {
     let dir = tempfile::tempdir().unwrap();

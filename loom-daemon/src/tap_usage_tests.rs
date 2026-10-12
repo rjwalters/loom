@@ -806,6 +806,43 @@ fn a_repeated_header_in_one_phase_log_counts_once() {
     assert_eq!(rows[0].accounting.usage.usage_events, 1);
 }
 
+/// Two same-role/same-tap launches naming different models stay separate rows,
+/// each holding only its own usage (Judge feedback on #11501): folding by
+/// `(role, tap)` alone charged the second model's tokens to the first launch's
+/// model, because a row kept the first non-empty model it saw.
+#[test]
+fn a_same_tap_relaunch_with_a_different_model_keeps_its_own_row() {
+    let log = mixed::phase_log(
+        "doctor",
+        SWEEP,
+        &format!(
+            "{}\n{}\n{}",
+            mixed::step(700, 70, None, Some(0.007)),
+            mixed::glm_launch_with_model("glm-fixture-pro"),
+            mixed::step(300, 30, None, Some(0.003)),
+        ),
+    );
+    let rows = account_phase_logs([("doctor", log.as_str())], SWEEP);
+    assert_eq!(rows.len(), 2, "one row per (role, tap, model)");
+    assert_eq!(rows[0].role, "doctor");
+    assert_eq!(rows[1].role, "doctor");
+    assert_eq!(rows[0].accounting.key(), GLM_KEY, "both rows are the same tap");
+    assert_eq!(rows[1].accounting.key(), GLM_KEY);
+    assert_eq!(rows[0].model.as_deref(), Some("glm-fixture-flash"));
+    assert_eq!(rows[0].accounting.usage.input, Some(700));
+    assert_eq!(rows[0].accounting.usage.output, Some(70));
+    assert_eq!(rows[0].accounting.usage.usage_events, 1);
+    assert_eq!(rows[1].model.as_deref(), Some("glm-fixture-pro"));
+    assert_eq!(rows[1].accounting.usage.input, Some(300));
+    assert_eq!(rows[1].accounting.usage.output, Some(30));
+    assert_eq!(rows[1].accounting.usage.usage_events, 1);
+
+    // The tap-level total still sees both launches.
+    let totals = fold_by_tap(rows.iter().map(|row| &row.accounting));
+    assert_eq!(totals[GLM_KEY].input, Some(1000));
+    assert_eq!(totals[GLM_KEY].usage_events, 2);
+}
+
 /// AC 4: a resumed sweep does not re-count its predecessor's phase logs (they
 /// name a different sweep id, and were journaled at that sweep's own terminal
 /// transition), and an id that merely shares a prefix is a different sweep.
@@ -939,7 +976,7 @@ fn an_escalated_claude_doctor_is_attributed_to_the_runtime_it_actually_ran_on() 
         .iter()
         .filter(|p| p.role == "doctor")
         .collect();
-    assert_eq!(doctor.len(), 1, "one row per (role, tap)");
+    assert_eq!(doctor.len(), 1, "one row per (role, tap, model)");
     assert_eq!(doctor[0].accounting.key(), GLM_KEY);
     assert_eq!(doctor[0].accounting.usage.input, Some(1400));
     assert_eq!(doctor[0].accounting.usage.output, Some(140));

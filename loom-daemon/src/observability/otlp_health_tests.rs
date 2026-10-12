@@ -7,13 +7,13 @@ fn t(min: i64) -> DateTime<Utc> {
 
 fn base() -> OtlpHealthInputs {
     OtlpHealthInputs {
-        feature_otlp: true,
         otlp_planned: true,
         exempt_reason: None,
         started_at: Some(t(0)),
         last_success_at: None,
         last_drop_growth_at: None,
         window: Duration::minutes(15),
+        last_failure_detail: None,
     }
 }
 
@@ -22,15 +22,6 @@ fn https_only_is_no_exporter() {
     let mut i = base();
     i.otlp_planned = false;
     assert_eq!(evaluate(&i, t(1)).state, OtlpExportState::NoExporter);
-}
-
-#[test]
-fn build_without_otlp_feature_is_no_exporter() {
-    let mut i = base();
-    i.feature_otlp = false;
-    let h = evaluate(&i, t(1));
-    assert_eq!(h.state, OtlpExportState::NoExporter);
-    assert!(h.detail.unwrap().contains("feature"));
 }
 
 #[test]
@@ -188,7 +179,137 @@ fn serializes_snake_case_and_omits_empty_detail() {
     let v = serde_json::to_value(OtlpExportHealth {
         state: OtlpExportState::NoExporter,
         detail: None,
+        since: None,
     })
     .unwrap();
     assert_eq!(v, serde_json::json!({"state": "no_exporter"}));
+}
+
+// ---- Issue #11557: `since`, failure cause, degraded start ----------------
+
+fn failing_inputs(cause: &str) -> OtlpHealthInputs {
+    OtlpHealthInputs {
+        started_at: Some(t(-60)),
+        last_failure_detail: Some(cause.to_string()),
+        ..base()
+    }
+}
+
+#[test]
+fn repeated_failing_samples_keep_the_original_since() {
+    let mut m = OtlpHealthMonitor::default();
+    let i = failing_inputs("OTLP HTTP 503");
+    for min in 0..5 {
+        let h = m.observe(i.clone(), None, t(min)).health;
+        assert_eq!(h.state, OtlpExportState::Failing);
+        assert_eq!(h.since, Some(t(0)));
+    }
+}
+
+#[test]
+fn failure_detail_updates_do_not_reset_since() {
+    let mut m = OtlpHealthMonitor::default();
+    m.observe(failing_inputs("OTLP HTTP 503"), None, t(0));
+    let h = m
+        .observe(failing_inputs("OTLP HTTP 403 (credential refused …)"), None, t(3))
+        .health;
+    assert_eq!(h.since, Some(t(0)));
+    assert!(h.detail.unwrap().contains("403"));
+    // Failing -> no_exporter is still the same stretch of attention.
+    let mut none = base();
+    none.otlp_planned = false;
+    assert_eq!(m.observe(none, None, t(4)).health.since, Some(t(0)));
+}
+
+#[test]
+fn recovery_clears_since_and_a_later_failure_starts_a_new_interval() {
+    let mut m = OtlpHealthMonitor::default();
+    m.observe(failing_inputs("OTLP HTTP 503"), None, t(0));
+    let mut ok = failing_inputs("OTLP HTTP 503");
+    ok.last_success_at = Some(t(10));
+    let h = m.observe(ok.clone(), None, t(10)).health;
+    assert_eq!((h.state, h.since), (OtlpExportState::Ok, None));
+    assert_eq!(h.summary(), None);
+    // The success ages out: a new interval opens at the first failing sample.
+    let h = m.observe(ok.clone(), None, t(26)).health;
+    assert_eq!((h.state, h.since), (OtlpExportState::Failing, Some(t(26))));
+    // Exempt also closes the interval.
+    let mut exempt = ok;
+    exempt.exempt_reason = Some("lab".into());
+    assert_eq!(m.observe(exempt, None, t(27)).health.since, None);
+}
+
+#[test]
+fn failing_detail_names_the_exporters_last_failure() {
+    let h = evaluate(&failing_inputs("OTLP HTTP 403 (credential refused; batch held)"), t(0));
+    let detail = h.detail.unwrap();
+    assert!(detail.contains("no successful OTLP export since start"), "{detail}");
+    assert!(detail.contains("last failure: OTLP HTTP 403 (credential refused"), "{detail}");
+    // No exporter failure recorded: the symptom alone, as before.
+    let mut i = base();
+    i.started_at = Some(t(-60));
+    assert!(!evaluate(&i, t(0)).detail.unwrap().contains("last failure"));
+}
+
+#[test]
+fn warn_line_says_since() {
+    let mut m = OtlpHealthMonitor::default();
+    let o = m.observe(failing_inputs("OTLP HTTP 403"), None, t(0));
+    let (level, line) = log_line(&o).unwrap();
+    assert_eq!(level, log::Level::Warn);
+    assert!(line.contains("otlp: failing since 2026-10-10T00:00:00Z ("), "{line}");
+}
+
+#[test]
+fn startup_verdict_is_degraded_only_for_no_exporter() {
+    let mut m = OtlpHealthMonitor::default();
+    // A misconfigured OTLP cell reaches the monitor as not-planned plus its
+    // own detail; `since` is this first (daemon-start) observation.
+    let mut misconfigured = base();
+    misconfigured.otlp_planned = false;
+    misconfigured.started_at = None;
+    misconfigured.last_failure_detail =
+        Some("observability.ingestKeyFile not configured".to_string());
+    let h = m.observe(misconfigured, None, t(0)).health;
+    assert_eq!(h.since, Some(t(0)));
+    let StartupVerdict::Degraded(detail) = startup_verdict(&h) else {
+        panic!("no_exporter must be a degraded start");
+    };
+    assert!(detail.contains("no_exporter since 2026-10-10T00:00:00Z"), "{detail}");
+    assert!(detail.contains("ingestKeyFile not configured"), "{detail}");
+    assert!(degraded_line(&detail).starts_with(
+        "observability: DEGRADED — this daemon's facts are not reaching SigNoz: otlp: no_exporter"
+    ));
+    // A fresh exporter in grace, and an exempt host, start fine.
+    assert_eq!(startup_verdict(&evaluate(&base(), t(1))), StartupVerdict::Ok);
+    let mut exempt = base();
+    exempt.otlp_planned = false;
+    exempt.exempt_reason = Some("lab".into());
+    assert_eq!(startup_verdict(&evaluate(&exempt, t(1))), StartupVerdict::Ok);
+}
+
+#[test]
+fn since_serializes_when_set() {
+    let h = OtlpExportHealth {
+        state: OtlpExportState::Failing,
+        detail: None,
+        since: Some(t(0)),
+    };
+    let v = serde_json::to_value(&h).unwrap();
+    assert_eq!(v["since"], serde_json::json!("2026-10-10T00:00:00Z"));
+    let back: OtlpExportHealth = serde_json::from_value(v).unwrap();
+    assert_eq!(back, h);
+}
+
+#[test]
+fn failure_detail_is_scrubbed_of_credential_values() {
+    let raw = "transport error: error sending request for url \
+               (https://ingest.example/v1/logs?token=s3cr3tvalue123): Authorization: Bearer abcdefghijklmnopqrstuvwxyz";
+    let clean = sanitize_failure_detail(raw);
+    assert!(!clean.contains("s3cr3tvalue123"), "{clean}");
+    assert!(!clean.contains("abcdefghijklmnopqrstuvwxyz"), "{clean}");
+    assert!(clean.contains("[REDACTED:"), "{clean}");
+    // A plain status detail passes through unchanged.
+    let plain = "OTLP HTTP 403 (credential refused; batch held until the credential is fixed)";
+    assert_eq!(sanitize_failure_detail(plain), plain);
 }

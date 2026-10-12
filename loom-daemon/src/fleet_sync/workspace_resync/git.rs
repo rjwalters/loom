@@ -140,7 +140,11 @@ fn command(dir: &Path, args: &[&str]) -> Command {
         .arg(dir)
         .args(args)
         .stdin(Stdio::null())
-        .env("GIT_TERMINAL_PROMPT", "0");
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env(
+            "GIT_REFLOG_ACTION",
+            crate::fleet_sync::checkout_ff::external_change::tag("resync"),
+        );
     cmd
 }
 

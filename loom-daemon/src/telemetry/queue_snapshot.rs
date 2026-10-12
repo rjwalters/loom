@@ -65,16 +65,13 @@ pub struct QueueSnapshotRow {
     /// Deprecated (#9244): always `false`. Its label was deleted in #11105;
     /// kept on the wire only for compatibility.
     pub urgent: bool,
-    /// Deprecated (#11508): always `false`. The star is no longer an
-    /// ordering key; the row's level is its `keys` entry `level`.
+    /// The issue's priority level (#11510): `default`, `important` or
+    /// `very-important` (the ready-queue row's `level`; a blocked row reads
+    /// its own labels). Absent (an older daemon) reads as `default`.
     #[serde(default)]
-    pub operator_priority: bool,
+    pub level: crate::priority_pick::Level,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
-    /// The `tier:*` label, which is informational only and does not affect
-    /// dispatch order.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tier: Option<String>,
     pub disposition: QueueDisposition,
     /// `running` / `ready` / `blocked`.
     pub state: String,
@@ -143,25 +140,6 @@ pub struct QueueSnapshotRecord {
     /// shard posture, scope and key ordering. Absent from a pre-#9288 daemon.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<DispatchPlanContext>,
-    /// The landing state of every starred issue this host watches, and of
-    /// every blocker inheriting a star (#9244 C), in starred-at order. A
-    /// separate list rather than fields on `rows`: `rows` is what the work
-    /// finder did with its ready listing this tick, and most starred issues
-    /// (building, in review, parked) are not in it. Join on `(repo, issue)`.
-    /// Absent from older daemons and when nothing is starred.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub operator_priority_landing: Vec<QueueLandingRow>,
-}
-
-/// One starred issue's landing state, with its repo's visibility tag (the
-/// same anti-leak rule as [`QueueSnapshotRow`]). Every text field is
-/// templated by the daemon; no forge free text is carried.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct QueueLandingRow {
-    #[serde(flatten)]
-    pub row: crate::types::StarLandingRow,
-    #[serde(default)]
-    pub visibility: RepoVisibility,
 }
 
 /// `detail` survives only for dispositions whose detail is structured: the

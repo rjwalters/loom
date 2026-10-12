@@ -47,13 +47,18 @@ pub(super) enum Refusal {
     Other(String),
 }
 
-fn tracking(branch: &str) -> String {
+pub(super) fn tracking(branch: &str) -> String {
     format!("refs/remotes/origin/{branch}")
 }
 
 /// Run `git` in `root` to an exit. `config` is `-c` pairs placed before the
 /// subcommand. `Err` when it could not be run or outlived `timeout`.
-fn run(root: &Path, config: &[&str], args: &[&str], timeout: Duration) -> Result<Output, String> {
+pub(super) fn run(
+    root: &Path,
+    config: &[&str],
+    args: &[&str],
+    timeout: Duration,
+) -> Result<Output, String> {
     let mut cmd = command(root, config, args);
     crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
     let result = run_logged("checkout_ff", root, cmd, timeout);
@@ -78,6 +83,8 @@ fn command(root: &Path, config: &[&str], args: &[&str]) -> Command {
         .args(args)
         .stdin(Stdio::null())
         .env("GIT_TERMINAL_PROMPT", "0")
+        // Loom's own ref moves are not external changes (#11566).
+        .env("GIT_REFLOG_ACTION", super::external_change::tag("ff"))
         // Refusals are read from stderr below, so the wording must be git's own.
         .env("LC_ALL", "C");
     // An inherited repository override would aim every command at some other
@@ -88,16 +95,16 @@ fn command(root: &Path, config: &[&str], args: &[&str]) -> Command {
     cmd
 }
 
-fn stderr(out: &Output) -> String {
+pub(super) fn stderr(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).trim().to_string()
 }
 
-fn stdout(out: &Output) -> String {
+pub(super) fn stdout(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
 /// [`run`], requiring exit 0. Returns trimmed stdout.
-fn ok(root: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
+pub(super) fn ok(root: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
     let out = run(root, &[], args, timeout)?;
     if out.status.success() {
         Ok(stdout(&out))

@@ -110,14 +110,15 @@ pub mod claude_code_telemetry;
 pub mod collector;
 pub mod cycle_guard;
 pub mod daemon_event;
+pub mod daemon_lifecycle;
 pub mod endpoint_policy;
 pub mod exporter;
 pub mod fleet_state;
+mod ingest_key;
 pub mod lifecycle;
 pub mod llm_billing;
 pub mod loss_ledger;
 pub mod ops;
-#[cfg(feature = "otlp")]
 pub mod otlp;
 pub mod otlp_health;
 pub mod outcome;
@@ -146,7 +147,17 @@ use crate::workspace_pool::WorkspacePool;
 
 use endpoint_policy::reserved_placeholder_host;
 use exporter::HttpsExporter;
+use ingest_key::{
+    entry_needs_key, read_ingest_key, resolve_for_planned, PlannedKey, NOT_CONFIGURED_DETAIL,
+};
 use queue::DurableQueue;
+
+// The ingest-key resolution lives in `ingest_key`; the `pub use` keeps the
+// pre-#11555 path (`crate::observability::resolve_ingest_key_file`) working
+// for `loom_ui_alerts` and the attended live-output tailer, and the private
+// `read_ingest_key` re-import keeps `super::super::read_ingest_key` alive
+// for the latter.
+pub use ingest_key::resolve_ingest_key_file;
 
 /// `observability.enabled` env override.
 pub const ENABLED_ENV: &str = "LOOM_OBSERVABILITY_ENABLED";
@@ -249,9 +260,8 @@ pub enum ExporterKind {
     /// default, for backward compatibility with every deployment predating
     /// this issue.
     Https,
-    /// OTLP/HTTP+JSON push (`otlp::OtlpExporter`, only compiled in behind the
-    /// `otlp` Cargo feature) — an escape hatch for an existing OpenTelemetry
-    /// stack.
+    /// OTLP/HTTP+JSON push (`otlp::OtlpExporter`, compiled into every build
+    /// since #10700) — an escape hatch for an existing OpenTelemetry stack.
     Otlp,
 }
 
@@ -410,56 +420,6 @@ pub fn resolve_enabled(config: &ObservabilityConfig) -> bool {
 #[must_use]
 pub fn resolve_endpoint(config: &ObservabilityConfig) -> Option<String> {
     env_nonempty(ENDPOINT_ENV).or_else(|| config.endpoint.clone())
-}
-
-/// **env > config > default** (`$HOME/.loom/observability/ingest.key`).
-///
-/// The default keeps resolution host-relative even when no tier sets
-/// `ingestKeyFile` explicitly, so no host ever *needs* a value copied
-/// verbatim from a different host's `$HOME` in its config (#5336: a macOS
-/// `ingestKeyFile` landed in the shared, committed `.loom/config.json` and
-/// was inherited unreadable by a Linux worker via a plain `git pull` — the
-/// copy path, not the value, was the defect). Provisioning a host now needs
-/// only to place its key at this conventional path (or set an explicit
-/// override via `.loom-local/local.json` / `$LOOM_OBSERVABILITY_INGEST_KEY_FILE`
-/// for a non-default location, e.g. a system path like
-/// `/etc/loom/observability-ingest.key`).
-#[must_use]
-pub fn resolve_ingest_key_file(config: &ObservabilityConfig) -> Option<String> {
-    env_nonempty(INGEST_KEY_FILE_ENV)
-        .or_else(|| config.ingest_key_file.clone())
-        .or_else(default_ingest_key_file)
-}
-
-/// Join `home` with the conventional relative ingest-key-file location. Pure
-/// and unit-testable independent of the real `$HOME` (see
-/// [`default_ingest_key_file`] for why the `$HOME` lookup itself is not
-/// unit-tested in-process).
-fn ingest_key_file_under(home: &Path) -> String {
-    home.join(".loom")
-        .join("observability")
-        .join("ingest.key")
-        .to_string_lossy()
-        .to_string()
-}
-
-/// This crate's single `src/` test binary links every `#[test]` together, and
-/// several modules (`tokens_pool::paths::shared_tokens_dir`, `fleet::drain`,
-/// `fleet::path_bootstrap`) already `set_var`/`remove_var("HOME")` for their
-/// own isolation — a real ambient `$HOME` must never leak into a *different*
-/// module's resolved default mid-test-run. Refusing the default under
-/// `cfg(test)` closes that race structurally, mirroring
-/// `shared_tokens_dir`'s `#4657` fix exactly: production behavior reads the
-/// real `$HOME`, every in-process test observes `None` from this function
-/// and exercises [`ingest_key_file_under`] directly instead.
-#[cfg(not(test))]
-fn default_ingest_key_file() -> Option<String> {
-    dirs::home_dir().map(|h| ingest_key_file_under(&h))
-}
-
-#[cfg(test)]
-fn default_ingest_key_file() -> Option<String> {
-    None
 }
 
 /// **env > config > default** ([`DEFAULT_BATCH_SIZE`]).
@@ -817,36 +777,6 @@ pub fn resolve_exporters(config: &ObservabilityConfig) -> Vec<ExporterEntry> {
     resolved
 }
 
-/// Read `path` and return its trimmed contents as the ingest key. Every
-/// failure (missing file, unreadable, empty after trimming) is logged **by
-/// path only** — the key itself never reaches a log line — and yields `Err`
-/// with a detail string safe to surface on `loom-daemon status` (Issue
-/// #5337): the offending path and, for I/O failures, the [`std::io::Error`]'s
-/// `Display` (which includes the OS errno on platforms that report one, e.g.
-/// `No such file or directory (os error 2)`). [`spawn_task`] treats `Err` as
-/// "not configured" — it registers the detail as a
-/// [`crate::types::ObservabilityExportState::Misconfigured`] status rather
-/// than dropping it.
-fn read_ingest_key(path: &str) -> Result<String, String> {
-    match std::fs::read_to_string(path) {
-        Ok(contents) => {
-            let key = contents.trim().to_string();
-            if key.is_empty() {
-                let detail = format!("ingest key file {path} is empty after trimming whitespace");
-                log::warn!("observability: {detail} — export disabled");
-                Err(detail)
-            } else {
-                Ok(key)
-            }
-        }
-        Err(error) => {
-            let detail = format!("could not read ingest key file {path}: {error}");
-            log::warn!("observability: {detail} — export disabled");
-            Err(detail)
-        }
-    }
-}
-
 /// Resolve the durable-queue path for the exporter named `name` (Issue
 /// #8756). A **sole** configured exporter keeps the pre-fan-out
 /// [`queue::default_queue_path`] unchanged — byte-compat with every existing
@@ -943,15 +873,6 @@ fn entry_endpoint(
              observability.enabled=false"
         );
         return Err((Some(endpoint), detail));
-    }
-    #[cfg(not(feature = "otlp"))]
-    if entry.kind == ExporterKind::Otlp {
-        return Err((
-            Some(endpoint),
-            "exporter=otlp requested but this daemon build was not compiled \
-                 with the `otlp` Cargo feature"
-                .to_string(),
-        ));
     }
     // `headers_file` (Issue #10961): refused here, before the ingest key or
     // the headers file itself is read. A no-op for an entry without one.
@@ -1077,35 +998,41 @@ pub fn spawn_task(
         return None;
     }
 
-    let Some(key_file) = resolve_ingest_key_file(config) else {
-        let detail = "observability.ingestKeyFile not configured \
-             (set observability.ingestKeyFile or $LOOM_OBSERVABILITY_INGEST_KEY_FILE)"
-            .to_string();
-        log::warn!("observability: enabled but {detail} — export off");
-        // The key is shared by every exporter, so every planned entry is
-        // equally misconfigured (Issue #5337's detail string preserved).
-        for (entry, endpoint) in &planned {
-            statuses.insert(
-                entry.kind.name().to_string(),
-                Arc::new(ExportStatus::misconfigured(Some(endpoint.clone()), detail.clone())),
+    // The ingest key is resolved for the planned entries only (#11555): an
+    // `otlp` entry with a `headers_file` authenticates with that file, so it
+    // still starts — alone or alongside refused sinks — with no
+    // `observability.ingestKeyFile` at all. #7815's rule survives per entry:
+    // the key file is read only when some entry that would use it survived
+    // the policy pass above.
+    let ingest_key: Option<String> = match resolve_for_planned(config, &planned) {
+        PlannedKey::Key(key) => Some(key),
+        PlannedKey::NotNeeded => None,
+        PlannedKey::Missing(detail) => {
+            log::warn!(
+                "observability: enabled but {detail} — export off for the exporter(s) that \
+                 authenticate with the ingest key"
             );
-        }
-        register_global_export_statuses(statuses.clone());
-        register_global_export_status(primary_status_for(&entries, &statuses));
-        return None;
-    };
-    let ingest_key = match read_ingest_key(&key_file) {
-        Ok(key) => key,
-        Err(detail) => {
-            for (entry, endpoint) in &planned {
-                statuses.insert(
-                    entry.kind.name().to_string(),
-                    Arc::new(ExportStatus::misconfigured(Some(endpoint.clone()), detail.clone())),
-                );
+            // Only the entries that need the key are misconfigured; the
+            // `headers_file` ones still start below.
+            planned.retain(|(entry, endpoint)| {
+                if entry_needs_key(entry) {
+                    reject(
+                        &mut statuses,
+                        entry.kind.name(),
+                        Some(endpoint.clone()),
+                        detail.clone(),
+                    );
+                    false
+                } else {
+                    true
+                }
+            });
+            if planned.is_empty() {
+                register_global_export_statuses(statuses.clone());
+                register_global_export_status(primary_status_for(&entries, &statuses));
+                return None;
             }
-            register_global_export_statuses(statuses.clone());
-            register_global_export_status(primary_status_for(&entries, &statuses));
-            return None;
+            None
         }
     };
     // Resolved ONCE and threaded into every consumer below (Issue #4830): the
@@ -1146,7 +1073,6 @@ pub fn spawn_task(
     // The non-OTLP subset, for the `queue.snapshot` sink (Issue #8852).
     let mut native_queues: Vec<Arc<DurableQueue>> = Vec::new();
     // The OTLP sinks whose senders started, for the agent relay (#10964).
-    #[cfg(feature = "otlp")]
     let mut relay_sinks: Vec<otlp::relay::Sink> = Vec::new();
     for (index, (entry, endpoint)) in planned.iter().enumerate() {
         let name = entry.kind.name();
@@ -1157,6 +1083,7 @@ pub fn spawn_task(
         let queue = Arc::new(DurableQueue::open(queue_path, capacity));
         let export_status =
             Arc::new(ExportStatus::started(&host_id, endpoint, name, flush_interval.as_secs()));
+        export_status.attach_queue(queue.clone());
         let sender_handle = match entry.kind {
             ExporterKind::Https => {
                 // Host-identity mismatch detection (Issue #4830) is created and
@@ -1169,18 +1096,26 @@ pub fn spawn_task(
                 // already handle.
                 let host_id_status = Arc::new(HostIdStatus::default());
                 register_global_host_id_status(host_id_status.clone());
-                // loom-ui star intents (#9244 C) ride the same native ack, so
-                // the queue is registered here too and nowhere else (the OTLP
-                // arm below has no ack to read them from).
-                let intents = crate::star_liveness::intents::register_global_queue();
+                // Unreachable in practice — an HTTPS entry needs the key,
+                // and every key-needing entry was refused above when the
+                // key did not resolve — but kept total rather than
+                // `unwrap`ped so a later edit to `entry_needs_key` cannot
+                // turn into a panic here.
+                let Some(key) = ingest_key.as_ref() else {
+                    reject(
+                        &mut statuses,
+                        name,
+                        Some(endpoint.clone()),
+                        NOT_CONFIGURED_DETAIL.to_string(),
+                    );
+                    continue;
+                };
                 match HttpsExporter::new(
                     endpoint.clone(),
-                    ingest_key.clone(),
+                    key.clone(),
                     host_id.clone(),
                     host_id_status,
-                )
-                .map(|e| e.with_intent_queue(intents))
-                {
+                ) {
                     Ok(exporter) => sender::spawn_task(
                         queue.clone(),
                         exporter,
@@ -1226,11 +1161,13 @@ pub fn spawn_task(
                 // from "checked, and they agree". Better to leave the surface
                 // honestly absent until an OTLP-side identity signal exists to
                 // check against.
-                #[cfg(feature = "otlp")]
                 {
                     // `headers_file` (#10961) is read here, at construction —
                     // a refused file lands in the `Err` arm below as this
                     // sink's own `misconfigured` detail (path and line only).
+                    // The ingest key is `None` when no surviving entry
+                    // needed one (#11555): the file's headers are then this
+                    // entry's whole authentication.
                     match otlp::OtlpExporter::with_headers_file(
                         endpoint.clone(),
                         ingest_key.clone(),
@@ -1258,18 +1195,10 @@ pub fn spawn_task(
                         }
                     }
                 }
-                // Unreachable without the feature: the policy pass above
-                // already rejected `Otlp` entries on non-`otlp` builds.
-                #[cfg(not(feature = "otlp"))]
-                {
-                    let _ = (endpoint, ingest_key, batch_size, flush_interval);
-                    unreachable!("otlp entry rejected in the policy pass without the feature")
-                }
             }
         };
         statuses.insert(name.to_string(), export_status);
         if entry.kind == ExporterKind::Otlp {
-            #[cfg(feature = "otlp")]
             relay_sinks.push(otlp::relay::Sink {
                 endpoint: endpoint.clone(),
                 headers_file: entry.headers_file.clone(),
@@ -1310,9 +1239,16 @@ pub fn spawn_task(
     // them. No OTLP exporter ⇒ nothing registered ⇒ every emit is a no-op.
     let mut ops_handles = Vec::new();
     // The agent telemetry relay (#10964): opt-in, and only over OTLP sinks
-    // that just started — it cannot add or start an exporter either.
-    #[cfg(feature = "otlp")]
-    ops_handles.extend(otlp::relay::start(&workspace_root, &host_id, &ingest_key, &relay_sinks));
+    // that just started — it cannot add or start an exporter either. The
+    // ingest key is threaded through as `None` when no surviving sink
+    // needed one (#11555); a relay sink with its own `headers_file` needs
+    // no key, and one without would not have started without one.
+    ops_handles.extend(otlp::relay::start(
+        &workspace_root,
+        &host_id,
+        ingest_key.as_deref(),
+        &relay_sinks,
+    ));
     // `fleet.state` (#10196): the replay contract's state record, OTLP-only,
     // built after every work-finder tick (#11161) and on the collector's
     // snapshot pass.
@@ -1343,6 +1279,12 @@ pub fn spawn_task(
     if let Some(sink) = queue_snapshot::sink_for_native_queues(native_queues, &host_id) {
         queue_snapshot::register_global_sink(sink);
     }
+    // `daemon.start` (#11197): exactly one lifecycle record per process,
+    // offered once the exporters are up — every disabled/under-configured
+    // path above returned before a queue existed, so telemetry-off emits
+    // nothing. Rides the fan-out like any other producer; see
+    // `daemon_lifecycle`'s module doc for the naming contract with #10065.
+    daemon_lifecycle::emit_start(fanout.as_ref(), &host_id);
     // `daemon.event` collection (Issue #8760, G4): a second, independent bus
     // subscription alongside `collector::spawn_task` below — see
     // `daemon_event`'s module doc for why it is a separate subscriber rather

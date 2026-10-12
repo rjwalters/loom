@@ -36,7 +36,7 @@ After any render, run `cargo test --test signoz_deployment_contract`: it re-read
 the committed `pours/` output and fails if a regenerated deployment stops matching
 what this README promises — see [Rendered-deployment contract](#rendered-deployment-contract).
 All component images pin multi-platform index digests in the casting: SigNoz
-**v0.142.1**, its collector **v0.144.12**, ClickHouse **25.12.11**, Keeper **25.12.5**,
+**v0.143.0**, its collector **v0.144.12**, ClickHouse **25.12.11**, Keeper **25.12.5**,
 and PostgreSQL **16**. Each index includes Linux amd64 and arm64. The upstream
 histogram helper **v0.0.1** init command is patched declaratively to verify SHA-256
 before extraction and reject unsupported architectures. Independent downloads
@@ -364,6 +364,33 @@ with no earlier sample has an unknown baseline and its first value counts as
 0. Queries 1-3 run verbatim against the pinned ClickHouse in CI
 (`signoz_host_export_queries.rs`, fixtures for increment, no-increase, reset
 and no-baseline).
+
+Query 4 (#11639, reset regression #11146) reads each exporter's JSON body and
+sums observed positive counter steps, including increments before and after a
+ledger decrease. The latest sample in the bounded 24 h pre-window lookback is
+the baseline. Without it, the first value contributes zero and `baseline_known`
+is false. `delta` and `reason_delta` are observed lower bounds: `reset_count`
+flags decreases, and no query reconstructs loss between observations or proves
+journal recovery. Zero observed loss with incomplete coverage produces a
+`coverage_unknown` row; known flat counters produce no row. Empty output is
+never proof that historical loss was recovered.
+
+A present `dropped_by_reason` map omits zero keys; a missing legacy map is
+unknown. Reasons are compared at consecutive exporter samples; resets use the
+current map. Missing, decreasing or inconsistent reason breakdowns leave the
+step `unattributed`, while `unknown_reason_steps` exposes incomplete attribution.
+The attributed reasons plus unexplained remainder equal the observed total.
+Duplicate `(host, exporter, timestamp, exporter JSON)` delivery collapses;
+conflicting same-time bodies select lexical maximum deterministically and set
+`conflicting_samples`, which makes coverage incomplete. Steps touching a conflict contribute zero,
+so conflicting observations cannot invent a loss lower bound. Peak in-window queue
+depth and observed versions remain context, not evidence of recovery. Durable
+loss-ledger counts only: admission deferrals are not exporter drops.
+
+The existing pinned ClickHouse CI harness now executes query 4 with a fixed
+clock, including the captain's 16:14 reset and later 851/1584 queue-overflow
+samples, missing baselines/maps, reason resets, duplicate delivery and separate
+exporters. Authoritative journal recovery remains separate incident work (#11639).
 
 Query 3 (#11198) finds roster hosts silent by absence, which queries 1-2
 cannot (they anchor on logs a host sent). The roster sits between

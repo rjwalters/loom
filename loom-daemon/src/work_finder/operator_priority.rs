@@ -15,22 +15,13 @@
 //! - [`OverflowSlot`]: **inert** since #11508. Nothing is admitted over the
 //!   cap any more; the slot only reports whether an overflow sweep started
 //!   by an older daemon is still live (`plan.slots.overflow_free`).
-//!
-//! The legacy star readers that `star_liveness/` (#11104) and
-//! `forge_priority_labels` (#11510) still use live in
-//! `crate::star_liveness::dispatch_shim` and are re-exported below so their
-//! import paths are unchanged; dispatch does not call them.
+//! - [`warn_retired_config`]: the one startup warning for a host config
+//!   that still carries the removed `autonomous.operatorPriority` block
+//!   (#11104: the star-liveness subsystem that read it is gone).
+
+use std::path::Path;
 
 use super::{WorkDispatcher, WorkItem, BUILDING_LABEL};
-
-pub use crate::star_liveness::dispatch_shim::{
-    merge_starred, GhTimelineStarredAt, StarredAtSource,
-};
-
-/// The legacy operator-priority ("starred") label (#9244). Dispatch no
-/// longer reads it (#11508); kept for the non-dispatch readers #11510 and
-/// #11104 remove.
-pub const OPERATOR_PRIORITY_LABEL: &str = "loom:operator-priority";
 
 /// The in-progress Curator claim. A side-listed row carrying it is being
 /// curated right now, so it is left alone this tick.
@@ -152,5 +143,108 @@ impl OverflowSlot {
     #[must_use]
     pub fn is_free(&self) -> bool {
         !self.taken
+    }
+}
+
+/// The `autonomous` sub-block the removed star-liveness subsystem read
+/// (`propagate`, `noProgressMinutes`, `poolsExhaustedGraceMinutes`,
+/// `intervalSecs`, `escalate`, `materializeLabels`, `levelCaps`). Removed by
+/// #11104; a config that still carries it is ignored with one warning.
+pub const RETIRED_CONFIG_BLOCK: &str = "operatorPriority";
+
+/// The retired `autonomous.operatorPriority` keys present in `effective` (an
+/// effective config document), sorted. Empty when the block is absent. Pure.
+#[must_use]
+pub fn retired_config_keys(effective: &serde_json::Value) -> Vec<String> {
+    let Some(block) = crate::config_resolver::get_path(effective, "autonomous")
+        .and_then(|a| a.get(RETIRED_CONFIG_BLOCK))
+    else {
+        return Vec::new();
+    };
+    let mut keys: Vec<String> = match block.as_object() {
+        Some(obj) if !obj.is_empty() => obj
+            .keys()
+            .map(|k| format!("autonomous.{RETIRED_CONFIG_BLOCK}.{k}"))
+            .collect(),
+        _ => vec![format!("autonomous.{RETIRED_CONFIG_BLOCK}")],
+    };
+    keys.sort();
+    keys
+}
+
+/// Log one warning when the workspace at `root` still configures the removed
+/// `autonomous.operatorPriority` block (#11104). The keys are otherwise
+/// ignored: nothing reads them, so the daemon starts exactly as without them.
+/// Returns the keys warned about.
+pub fn warn_retired_config(root: &Path) -> Vec<String> {
+    let keys = retired_config_keys(&crate::config_resolver::resolve_effective_config(root));
+    if !keys.is_empty() {
+        log::warn!(
+            "config: ignoring {} (removed with the star-liveness subsystem, #11104); \
+             delete them from .loom/config.json",
+            keys.join(", ")
+        );
+    }
+    keys
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod retired_config_tests {
+    use super::*;
+
+    #[test]
+    fn a_config_without_the_block_has_nothing_to_warn_about() {
+        assert!(retired_config_keys(&serde_json::json!({})).is_empty());
+        let other = serde_json::json!({"autonomous": {"workFinder": {"maxConcurrent": 2}}});
+        assert!(retired_config_keys(&other).is_empty());
+    }
+
+    #[test]
+    fn every_retired_key_is_named_once() {
+        let cfg = serde_json::json!({"autonomous": {"operatorPriority": {
+            "propagate": true, "noProgressMinutes": 30, "poolsExhaustedGraceMinutes": 5
+        }}});
+        assert_eq!(
+            retired_config_keys(&cfg),
+            [
+                "autonomous.operatorPriority.noProgressMinutes",
+                "autonomous.operatorPriority.poolsExhaustedGraceMinutes",
+                "autonomous.operatorPriority.propagate",
+            ]
+        );
+        let odd = serde_json::json!({"autonomous": {"operatorPriority": false}});
+        assert_eq!(retired_config_keys(&odd), ["autonomous.operatorPriority"]);
+    }
+
+    /// AC (#11104): a host config that still carries the removed keys starts
+    /// cleanly: they resolve to a warning, and the work-finder config the
+    /// daemon starts from is the same as without them.
+    #[test]
+    fn a_workspace_still_carrying_the_keys_starts_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".loom")).unwrap();
+        let with = serde_json::json!({"autonomous": {
+            "workFinder": {"enabled": true, "maxConcurrent": 3},
+            "operatorPriority": {"propagate": true, "noProgressMinutes": 45,
+                                 "poolsExhaustedGraceMinutes": 10, "levelCaps": {"2": 1}}
+        }});
+        std::fs::write(dir.path().join(".loom/config.json"), with.to_string()).unwrap();
+        let warned = warn_retired_config(dir.path());
+        for key in [
+            "propagate",
+            "noProgressMinutes",
+            "poolsExhaustedGraceMinutes",
+            "levelCaps",
+        ] {
+            let key = format!("autonomous.operatorPriority.{key}");
+            assert!(warned.contains(&key), "{key} not in {warned:?}");
+        }
+        let effective = crate::config_resolver::resolve_effective_config(dir.path());
+        assert_eq!(
+            crate::config_resolver::get_path(&effective, "autonomous.workFinder.maxConcurrent"),
+            Some(&serde_json::json!(3)),
+            "the rest of the config still resolves"
+        );
     }
 }

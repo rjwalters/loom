@@ -140,32 +140,6 @@ fn test_daemon_status_request_response_round_trip() {
             ..Default::default()
         }),
         // #9244 C: a starred issue escalated to the operator must survive the wire.
-        operator_priority_landing: Some(crate::types::StarLivenessReport {
-            at: Some(chrono::Utc::now()),
-            rows: vec![crate::types::StarLandingRow {
-                repo: "o/r".to_string(),
-                issue: 8191,
-                stage: crate::types::LandingStage::NeedsOperator,
-                next_actor: "operator".to_string(),
-                stage_since: None,
-                time_in_stage_secs: 60,
-                pr: Some(9276),
-                blocked_by: None,
-                no_capacity: None,
-                capacity_wait: None,
-                ask: Some(crate::types::OperatorAsk {
-                    kind: crate::types::AskKind::MergeRefused,
-                    key: "merge-refused:pr-9276".to_string(),
-                    text: "reconcile the merge settings".to_string(),
-                }),
-                inherited_from: None,
-                operator_priority_at: None,
-                last_progress_at: None,
-                level: 2,
-                level_inherited_from: Some("o/other#7".to_string()),
-            }],
-            ..Default::default()
-        }),
         role_tick_records: vec![crate::types::RoleTickRecord {
             root: std::path::PathBuf::from("/repo/a"),
             role: "champion".to_string(),
@@ -225,6 +199,7 @@ fn test_daemon_status_request_response_round_trip() {
         otlp_export: Some(crate::observability::otlp_health::OtlpExportHealth {
             state: crate::observability::otlp_health::OtlpExportState::Exempt,
             detail: Some("robb-studio per 2am#3649".to_string()),
+            since: None,
         }),
         forge_events: Some(crate::types::ForgeEventsStatus {
             state: crate::types::ForgeEventsState::Backoff,
@@ -281,15 +256,6 @@ fn test_daemon_status_request_response_round_trip() {
                 .expect("session containers survive");
             assert!(sessions.degraded);
             assert_eq!(sessions.accounts[0].state, "stopped");
-            let landing = r
-                .operator_priority_landing
-                .as_ref()
-                .expect("landing survives");
-            assert_eq!(landing.rows[0].issue, 8191);
-            assert_eq!(
-                landing.rows[0].ask.as_ref().map(|a| a.kind),
-                Some(crate::types::AskKind::MergeRefused)
-            );
             assert_eq!(r.token_pool_dir, Some(std::path::PathBuf::from("/repo/a/.loom/tokens")));
             assert_eq!(r.disk_headroom, 10);
             assert_eq!(r.logical_cpus, 8);

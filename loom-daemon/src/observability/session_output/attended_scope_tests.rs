@@ -152,7 +152,6 @@ fn inline_main_agent_session(projects: &Path) -> Session {
 
 /// Acceptance 3: an inline claim by the main agent is still refused, with a
 /// recorded reason, and nothing is started or written.
-#[cfg(feature = "otlp")]
 #[test]
 fn an_inline_main_agent_claim_is_refused_with_a_recorded_reason() {
     let scratch = Scratch::new("top-level");
@@ -183,7 +182,6 @@ fn an_inline_main_agent_claim_is_refused_with_a_recorded_reason() {
 
 /// A slash command that names a different issue does not open this claim's
 /// turn either.
-#[cfg(feature = "otlp")]
 #[test]
 fn a_slash_command_naming_another_issue_is_refused() {
     let scratch = Scratch::new("top-level-other");
@@ -205,7 +203,6 @@ fn a_slash_command_naming_another_issue_is_refused() {
 
 /// Acceptance 1, start half: `/loom:builder 10116` in a top-level session is
 /// started, from its own claim line.
-#[cfg(feature = "otlp")]
 #[test]
 fn a_slash_command_turn_is_started_from_its_claim_line() {
     let scratch = Scratch::new("top-level-start");
@@ -234,7 +231,6 @@ fn a_slash_command_turn_is_started_from_its_claim_line() {
 
 /// The detached tailer re-checks the turn itself, so no path into it follows
 /// an inline claim.
-#[cfg(feature = "otlp")]
 #[tokio::test]
 async fn the_foreground_tailer_refuses_an_inline_claim() {
     let scratch = Scratch::new("top-level-fg");
@@ -572,7 +568,6 @@ async fn a_second_claim_takes_the_transcript_over_at_its_own_line() {
 /// The same handover through the real start path: a second claim on a
 /// transcript a tailer still holds is started, not refused as
 /// `AlreadyRunning`, and is recorded as the transcript's newest claim.
-#[cfg(feature = "otlp")]
 #[test]
 fn a_second_claim_is_started_not_refused() {
     let scratch = Scratch::new("second-claim-start");
@@ -647,7 +642,6 @@ fn a_second_claim_is_started_not_refused() {
 
 /// A tailer whose claim was already overtaken before it got the transcript
 /// stops at once instead of waiting out the handover.
-#[cfg(feature = "otlp")]
 #[tokio::test]
 async fn a_tailer_overtaken_before_it_starts_stops_at_once() {
     let scratch = Scratch::new("overtaken");
@@ -729,7 +723,6 @@ fn a_doctor_is_found_by_its_own_command_not_by_a_sibling_naming_its_issue() {
 
 /// The same Doctor through the real start path: the tailer it starts follows
 /// the Doctor's transcript.
-#[cfg(feature = "otlp")]
 #[test]
 fn a_doctors_claim_starts_a_tailer_on_the_doctors_transcript() {
     let scratch = Scratch::new("doctor-start");
@@ -767,7 +760,6 @@ fn a_doctors_claim_starts_a_tailer_on_the_doctors_transcript() {
 
 /// When the process tree cannot be read, nothing is published and the reason
 /// is recorded.
-#[cfg(feature = "otlp")]
 #[test]
 fn an_unreadable_process_tree_publishes_nothing() {
     let scratch = Scratch::new("no-tree");

@@ -243,12 +243,13 @@ mod recheck_interval;
 mod tick_line;
 mod tick_report;
 mod tick_summary;
+mod tracking_parent;
 pub mod vi_cap;
 pub mod workspace_draw;
 use crate::types::QueueDisposition as Qd;
 pub use labels::{BUILDING_LABEL, OPERATOR_HOLD_LABEL, PARK_LABELS, SKIP_LABELS};
 pub use main_red_fix::RedMainLane;
-pub use operator_priority::{CapTerms, OverflowSlot, OPERATOR_PRIORITY_LABEL};
+pub use operator_priority::{CapTerms, OverflowSlot};
 pub use ordering::{candidate_cmp, PriorityCandidate};
 use tick_report::record_dispatch_outcome;
 pub use tick_report::{Admission, TickReport};
@@ -301,13 +302,12 @@ pub struct WorkItem {
     /// last-dispatch clock. `None` (a synthetic item, or a listing without
     /// timestamps) simply disables the recheck-interval check for that item.
     pub updated_at: Option<String>,
-    /// Set by `star_liveness` (#11104) when this issue blocks a starred
-    /// issue. Dispatch never reads it (#11508).
-    pub operator_priority_inherited_from: Option<u32>,
     /// Who filed the issue, when the listing supplied it (#10118). Only a
     /// trusted author's red-main-fix marker admits an unpromoted row (#9548);
     /// `None` (a synthetic item) is never trusted. See [`main_red_fix`].
     pub author: Option<crate::comment_trust::Author>,
+    /// Open native sub-issues (#11483); see [`tracking_parent`].
+    pub open_sub_issues: Option<u32>,
 }
 
 impl WorkItem {
@@ -327,8 +327,8 @@ impl WorkItem {
             created_at,
             body: None,
             updated_at: None,
-            operator_priority_inherited_from: None,
             author: None,
+            open_sub_issues: None,
         }
     }
 
@@ -784,7 +784,7 @@ pub trait WorkDispatcher {
     fn dispatch(&mut self, issue: u32, complexity: Option<&str>) -> Result<bool>;
 
     /// [`dispatch`](Self::dispatch), additionally recording whether this is
-    /// the host's `loom:operator-priority` overflow sweep (#9244) on the sweep
+    /// the host's overflow sweep (#9244, inert since #11508) on the sweep
     /// record. Defaults to plain `dispatch` (the flag dropped), so a
     /// dispatcher that does not model overflow opts out with zero boilerplate.
     ///
@@ -1157,6 +1157,11 @@ pub fn tick_with_lanes(
         if item.is_skipped_with_capabilities(&extra_skip_labels, &held_capabilities) {
             report.skipped_labeled += 1;
             log_capability_gap(&item, &held_capabilities);
+            continue;
+        }
+        if let Some(open) = item.open_sub_issues_blocking() {
+            report.skipped_labeled += 1;
+            log::info!("{}", tracking_parent::skip_line(item.number, open));
             continue;
         }
         // 1a. Hard-exclusion labels (#7528): the same rule the Curator and
@@ -1878,6 +1883,12 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
                 log_capability_gap(&item, &held_capability_sets[idx]);
                 continue;
             }
+            if let Some(open) = item.open_sub_issues_blocking() {
+                report.skipped_labeled += 1;
+                skip(Qd::Parked, Some(tracking_parent::skip_detail(open)), None);
+                log::info!("{}", tracking_parent::skip_line(item.number, open));
+                continue;
+            }
             // Hard-exclusion labels (#7528) — mirrors
             // `tick_with_saturation_brake`'s step 1a: see that step's comment
             // for the full rationale (no role has standing, so never dispatch,
@@ -2052,6 +2063,7 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
 
     report.halted = any_halted;
     report.occupancy = Some(occupancy);
+    cap.finish(&mut report); // #11606
     report.overflow_free = Some(overflow.is_free());
     // Sum the cumulative cross-host collision totals across every workspace's
     // dispatcher (#4085), read after pass 2 so this tick's collisions count.

@@ -243,6 +243,7 @@ impl GhWorkSource {
                 WorkItem::with_created_at(r.number, r.labels, r.created_at)
                     .with_body(r.body)
                     .with_updated_at(r.updated_at)
+                    .with_open_sub_issues(r.open_sub_issues)
                     .with_author(r.author.as_deref().map(|login| {
                         crate::comment_trust::Author::new(
                             Some(login),

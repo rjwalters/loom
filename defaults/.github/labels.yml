@@ -28,7 +28,7 @@
   color: "9CA3AF"  # gray-400 - neutral initial state
 
 - name: loom:issue
-  description: "Approved for work. Applied by: humans, Champion, sweep gate, Curator (starred) — see curator.md."
+  description: "Approved for work. Applied by: humans, Champion, sweep gate — see curator.md."
   color: "3B82F6"  # blue-500
 
 # Role-specific claim labels (they replaced one shared in-progress label):
@@ -166,6 +166,14 @@
 - name: loom:blocked
   description: "Implementation blocked, needs help or clarification"
   color: "EF4444"  # red-500
+
+# loom:blocked-unnamed (#10558): a queue marker, NOT a park label. It coexists
+# with loom:blocked. Applied by the daemon tick to an open loom:blocked issue
+# that names no blocker and states no reason; removed by Curator after it names
+# the blocker, records a reason, or releases the block.
+- name: loom:blocked-unnamed
+  description: "loom:blocked names no blocker: queued for Curator to name it or release it"
+  color: "F87171"  # red-400
 
 - name: loom:abort
   description: "Signal to abort the sweep for this issue (returns to loom:issue)"

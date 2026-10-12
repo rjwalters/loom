@@ -2349,8 +2349,7 @@ fn run_git(repo_root: &Path, args: &[&str]) -> std::result::Result<(String, Stri
     // Every caller still fails safe — any `Err` skips the gate — so the
     // `Result` shape is deliberately unchanged; only the duplicate execution
     // management goes away.
-    let mut cmd = Command::new("git");
-    cmd.args(args).current_dir(repo_root).stdin(Stdio::null());
+    let cmd = crate::fleet_sync::checkout_ff::external_change::git_cmd("gate", repo_root, args);
     let outcome = run_command(cmd, GIT_GATE_TIMEOUT);
     if outcome.succeeded() {
         Ok((outcome.stdout_trimmed(), outcome.stderr_trimmed()))
