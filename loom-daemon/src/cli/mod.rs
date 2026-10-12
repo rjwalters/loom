@@ -135,6 +135,7 @@ mod pr_latency_render;
 pub(crate) mod pr_lease;
 pub(crate) mod preflight;
 pub(crate) mod premise_check;
+pub(crate) mod presence;
 pub(crate) mod provenance;
 pub(crate) mod push_lease;
 pub(crate) mod quarantine;
