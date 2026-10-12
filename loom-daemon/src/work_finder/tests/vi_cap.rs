@@ -55,6 +55,37 @@ fn the_single_workspace_tick_dispatches_the_cap_order() {
     assert_eq!(report.vi_demotions, vec![d(30), d(40)]);
 }
 
+/// ACCEPTANCE (#11559): an older blocked very-important issue in the open
+/// listing does not hold the slot, so the older of two ready very-important
+/// issues does: it is the reported holder and dispatches first.
+#[test]
+fn a_blocked_open_very_important_issue_does_not_hold_the_slot_in_the_tick() {
+    let vi = VERY_IMPORTANT_LABEL;
+    let blocked = issue(1, "2025-01-01T00:00:00Z", &["loom:blocked", vi]);
+    let mut src = ViSource {
+        ready: FakeSource::once(vec![
+            issue(30, "2026-03-01T00:00:00Z", &[vi]),
+            issue(10, "2026-01-01T00:00:00Z", &[]),
+            issue(20, "2026-02-01T00:00:00Z", &[vi]),
+        ]),
+        open_vi: Some(vec![blocked]),
+        vi_reads: 0,
+    };
+    let mut dispatcher = RecordingDispatcher::default();
+    let report = tick(&mut src, &mut dispatcher, 10, false).unwrap();
+    // 20 (VI holder), then 30 (demoted to important), then plain 10.
+    assert_eq!(dispatcher.dispatched, vec![20, 30, 10]);
+    assert_eq!(
+        report.vi_demotions,
+        vec![ViDemotion {
+            workspace_idx: 0,
+            number: 30,
+            holder: 20,
+        }]
+    );
+    assert_eq!(src.vi_reads, 1);
+}
+
 /// Multi-workspace tick: a workspace whose only very-important ready issue
 /// is demoted (an older one is being built) no longer wins the draw pool.
 #[test]

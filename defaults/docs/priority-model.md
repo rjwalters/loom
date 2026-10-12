@@ -80,11 +80,17 @@ At any time, a workspace has at most one very-important issue:
 `priority_pick::VERY_IMPORTANT_CAP = 1` (a constant, not a config knob;
 operator ruling on #11278).
 
-- **Which one.** The oldest **open** `loom:very-important` issue of the
-  workspace, by `createdAt` then issue number (`very_important_holders`). Open
-  means any state: an issue being built (`loom:building`) or still in curation
-  keeps the slot, so a second one is not promoted while the first is in
-  flight. Every other open very-important issue ranks as `loom:important`.
+- **Which one.** The oldest **eligible** `loom:very-important` issue of the
+  workspace, by `createdAt` then issue number (`very_important_holders`).
+  Eligible means it carries `loom:issue` or `loom:building` and no hold label
+  (the label registry's `hold` property, `defaults/labels.json`; operator
+  ruling round 3 on #11278, #11559). A building issue keeps the slot, so a
+  second one is not promoted while the first is in flight; an open PR is
+  covered by that same `loom:building`, which stays until the closing merge
+  (#6199). A blocked, operator-held or not-yet-approved very-important issue
+  keeps its label but does not hold the slot while it cannot move. Once a
+  holder exists, every other very-important issue in the ready listing ranks
+  as `loom:important`.
 - **Where.** Labels cannot be refused when applied, so the cap is enforced at
   dispatch, each tick, before the level is read (`work_finder/vi_cap.rs`).
   The work finder reads the workspace's open very-important listing only
