@@ -168,7 +168,7 @@ services:
       - -q
       - http://localhost:8123/ping
       timeout: 30s
-    image: clickhouse/clickhouse-server:25.12.11@sha256:8a790dd3468db22b1d4e7b18a176f378ff5ff6053b9c48dd4ea1fa71a24c5ba6
+    image: clickhouse/clickhouse-server:26.9.5@sha256:b1081d3f26191692d7717699def7c624763f220f461ad60fccf55bbc186f06a0
     logging:
       driver: json-file
       options:
@@ -201,7 +201,7 @@ services:
       tar -xzf histogram-quantile.tar.gz
       mv histogram-quantile /var/lib/clickhouse/user_scripts/histogramQuantile
     container_name: loom-signoz-telemetrystore-clickhouse-user-scripts
-    image: clickhouse/clickhouse-server:25.12.11@sha256:8a790dd3468db22b1d4e7b18a176f378ff5ff6053b9c48dd4ea1fa71a24c5ba6
+    image: clickhouse/clickhouse-server:26.9.5@sha256:b1081d3f26191692d7717699def7c624763f220f461ad60fccf55bbc186f06a0
     logging:
       driver: json-file
       options:
