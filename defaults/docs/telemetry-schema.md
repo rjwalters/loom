@@ -3120,7 +3120,22 @@ elected, there are no caps, and no rate or estimate is computed in the daemon.
 
 Attributes: `loom.host_export.exporters` (count), `.queue_depth` (sum),
 `.dropped_total` (sum), `.last_flush_ok_at` (latest),
-`.fact_id_missing_total`.
+`.fact_id_missing_total`, and `host.lease_id` (#11530).
+
+**`host.lease_id`** is `opaque_host_id(host.id)`: `host-` plus 8 hex chars of
+a salted SHA-256, the same form `loom:lease` comments publish (see
+[`lease-record.md`](lease-record.md)). It is derived in the OTLP mapping from
+the record's `host`, not carried on the wire, so records from older daemons
+still decode. Use it to join a SigNoz row to a lease record.
+
+**Join caveat.** Lease comments are keyed on the *lease* host chain
+(`LOOM_HOST_ID` > `$HOSTNAME` > `hostname`, unchanged so the
+`sweep-lease-*.sh` scripts and the daemon agree), while `host.id` is
+`fleet.hostId` > `LOOM_HOST_ID` > the persisted `~/.loom/host-id` (see
+[`daemon-reference.md`](daemon-reference.md) → `loom-daemon host-id`). The
+join matches only on hosts where both chains resolve to the same string, in
+practice roster hosts where `LOOM_HOST_ID` equals `fleet.hostId`. On any other
+host the SigNoz-to-lease join misses for that host.
 
 **`dropped_total` is cumulative per process lifetime.** It restarts at 0 when
 the daemon restarts, so a reader computing "drops in a window" must treat a

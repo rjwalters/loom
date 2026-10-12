@@ -389,13 +389,16 @@ pub(crate) fn ordering(state: &ClaimState) -> Ordering {
 
 /// The host id every lease-shaped comment publishes (#6322): opaque unless
 /// `LOOM_LEASE_PUBLISH_HOSTNAME` opts into the raw name. Same rule as
-/// `SweepRegistry::published_host_id`.
+/// `SweepRegistry::published_host_id`, including its lease-only host chain
+/// (`lease_host_identity`, not `host_identity`, #11530).
 pub(crate) fn published_host() -> String {
-    use loom_daemon::sweep_registry::{host_identity, opaque_host_id, LEASE_PUBLISH_HOSTNAME_ENV};
+    use loom_daemon::sweep_registry::{
+        lease_host_identity, opaque_host_id, LEASE_PUBLISH_HOSTNAME_ENV,
+    };
     let raw = std::env::var(LEASE_PUBLISH_HOSTNAME_ENV).is_ok_and(|v| {
         matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
     });
-    let host = host_identity();
+    let host = lease_host_identity();
     if raw {
         host
     } else {
