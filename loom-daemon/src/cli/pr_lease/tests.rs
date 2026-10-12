@@ -6,7 +6,8 @@
 //! yield record are observed exactly as a claimant sees them.
 
 use super::renew::{
-    decide, forge_guard, wall_secs, Clocks, Step, LABEL_MISS_LIMIT, RENEW_MARGIN_SECS,
+    decide, forge_guard, forge_state, pre_patch_guard, renew_margin_secs, wall_secs, Clocks, Step,
+    LABEL_MISS_LIMIT, RENEW_MARGIN_SECS,
 };
 use super::*;
 use std::fs;
@@ -390,6 +391,71 @@ fn the_forge_guard_renews_only_the_holders_own_earliest_live_lease() {
     assert_eq!(forge_guard(Some(&ClaimState::Unknown), 100), Step::Renew);
 }
 
+#[test]
+fn the_margin_outlasts_the_gh_calls_after_the_clock_check() {
+    // The forge read and the PATCH, each bounded by GH_TIMEOUT, plus slack.
+    assert!(RENEW_MARGIN_SECS > 2 * GH_TIMEOUT.as_secs());
+    // At the default TTL the clamp does not bite.
+    assert_eq!(renew_margin_secs(900), RENEW_MARGIN_SECS);
+    assert_eq!(renew_margin_secs(60), 15);
+}
+
+#[test]
+fn the_wall_clock_is_rechecked_immediately_before_the_patch() {
+    // The top-of-cycle check passes one second inside the margin…
+    let open = (true, vec!["loom:treating".to_string()]);
+    let limit = i64::try_from(900 - RENEW_MARGIN_SECS).unwrap();
+    let last_renewed = now() - chrono::Duration::seconds(limit - 1);
+    let checked = Clocks {
+        since_renewal_secs: wall_secs(now(), last_renewed),
+        ..fresh(10, 14_400)
+    };
+    let mut m = 0;
+    assert_eq!(
+        decide(true, checked, lease_renewer_exit_renew(), Some(&open), "loom:treating", &mut m),
+        Step::Renew
+    );
+    assert_eq!(pre_patch_guard(now(), last_renewed, 900), Step::Renew);
+    // …then a slow forge read (up to GH_TIMEOUT) carries it into the margin:
+    // the pre-PATCH re-check stops the loop rather than PATCH.
+    let after_read = now() + chrono::Duration::from_std(GH_TIMEOUT).unwrap();
+    assert!(matches!(pre_patch_guard(after_read, last_renewed, 900), Step::Stop(_)));
+    // One second is enough to cross it.
+    assert!(matches!(
+        pre_patch_guard(now() + chrono::Duration::seconds(1), last_renewed, 900),
+        Step::Stop(_)
+    ));
+}
+
+#[test]
+fn the_forge_guard_judges_its_own_lease_against_ttl_less_the_margin() {
+    let a = who(Role::Doctor, "sweep-a");
+    let b = who(Role::Doctor, "sweep-b");
+    // Live against the full TTL (13 min < 15) but inside the margin
+    // (13 min > 15 min - RENEW_MARGIN_SECS): no renewal.
+    let late = vec![lease(100, 13, &a)];
+    assert_eq!(state(&late, &a), ClaimState::HeldBySelf { id: 100 });
+    assert_eq!(forge_state(&late, &a, now(), ttl()), ClaimState::Free);
+    assert!(matches!(
+        forge_guard(Some(&forge_state(&late, &a, now(), ttl())), 100),
+        Step::Stop(_)
+    ));
+    // Comfortably live: renew.
+    let ok = vec![lease(100, 5, &a)];
+    assert_eq!(forge_guard(Some(&forge_state(&ok, &a, now(), ttl())), 100), Step::Renew);
+    // A peer's older lease inside the margin is still judged at the full
+    // TTL, as its own fence judges it: the peer holds, A must not renew.
+    let peer = vec![lease(100, 13, &b), lease(200, 1, &a)];
+    assert!(matches!(
+        forge_state(&peer, &a, now(), ttl()),
+        ClaimState::HeldByPeer { id: 100, .. }
+    ));
+    assert!(matches!(
+        forge_guard(Some(&forge_state(&peer, &a, now(), ttl())), 200),
+        Step::Stop(_)
+    ));
+}
+
 fn lease_renewer_exit_renew() -> i32 {
     super::super::lease_renewer::EXIT_RENEW
 }
@@ -564,22 +630,22 @@ fn prompt_lease_gates_proceed_only_on_exit_0_or_2() {
         (
             "doctor.md",
             include_str!("../../../../defaults/.claude/commands/loom/doctor.md"),
-            4,
+            6,
         ),
         (
             "judge.md",
             include_str!("../../../../defaults/.claude/commands/loom/judge.md"),
-            6,
+            9,
         ),
         (
             "loom-doctor/SKILL.md",
             include_str!("../../../../defaults/.agents/skills/loom-doctor/SKILL.md"),
-            4,
+            6,
         ),
         (
             "loom-judge/SKILL.md",
             include_str!("../../../../defaults/.agents/skills/loom-judge/SKILL.md"),
-            6,
+            9,
         ),
     ];
     for (name, text, gates) in prompts {

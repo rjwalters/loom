@@ -513,7 +513,7 @@ Full policy, TTL/invalidation semantics, and the manual verification steps:
 
 0. **Sweep stale verdicts first**: run the Stale-Verdict Sweep (see below) over the open `loom:pr` / `loom:changes-requested` PRs. Any PR it re-queues joins step 1's queue on this same pass.
 1. **Find work**: `loom-daemon pr-queue --role judge`. Walk its JSON rows in order; `mode=workflow` uses this workflow, `mode=fallback` uses Fallback Queue below. Follow `.loom/docs/pr-planning.md`; skip non-actionable rows and continue. Never change origin or the operator star.
-2. **Claim PR** (run the "Stale `loom:reviewing` Claim Check" below first): take the PR lease, then add the label only once it is held — `loom-daemon lease pr claim <number> --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"; [[ $? =~ ^[02]$ ]] && gh pr edit <number> --add-label "loom:reviewing"`. Any other exit: stand down, touch no worktree (see "PR Lease")
+2. **Claim PR** (run the "Stale `loom:reviewing` Claim Check" below first): PR lease, then the label — `loom-daemon lease pr claim <number> --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"; [[ $? =~ ^[02]$ ]] && gh pr edit <number> --add-label "loom:reviewing"`. Any other exit: stand down, touch no worktree (see "PR Lease")
 3. **Check merge state**: Check for conflicts and attempt automated rebase if DIRTY (see Automated Rebase for DIRTY PRs below)
    ```bash
    # Plain `gh` — merge state is verdict-gating and must be live (see "Cached Forge Reads")
@@ -701,16 +701,14 @@ A label is not a mutex: adding one already present is a silent no-op, so two
 Judges could both "hold" `loom:reviewing` (#10994). `lease pr claim` publishes
 a role-keyed lease comment (a Doctor's never contends), orders live leases by
 comment id, and renews yours while your session lives
-(`.loom/docs/lease-record.md` § "PR-phase leases"). Pass the same
-`--watch-pid` every call.
+(`lease-record.md` § "PR-phase leases"). Same `--watch-pid` every call.
 
 - **claim** exit **0** = held: add `loom:reviewing` (**2** = an older
   `loom-daemon` without `lease pr`: label alone, as before). **4** = a peer's
   live lease wins (a lost race posts your yield record), **5** = unreadable,
   any other code (**1** = `loom-daemon` failed to start) = unknown: never
-  "label-only" — stand down **before** any worktree or label action and continue the batch;
-  leave the peer's `loom:reviewing` alone.
-- **fence** is part of the Verdict-Time CAS Recheck below.
+  "label-only" — stand down before any worktree or label action; next PR.
+- **fence** is in the Verdict-Time CAS Recheck below and before every push.
 - **release** after the verdict write or any stand-down:
   `loom-daemon lease pr release <n> --role judge --watch-pid …`.
 
@@ -743,7 +741,7 @@ N=<pr-number>
 # from memory) reinstates exactly the race it closes. See "Cached Forge Reads".
 # One read serves both arms: the label state AND the head SHA your verdict is
 # about to be stamped with (#5686).
-# The lease fence first: any exit but 0 or 2 means the claim is lost (row 2 below).
+# Lease fence first (row 2 below).
 loom-daemon lease pr fence $N --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"; [[ $? =~ ^[02]$ ]] || echo "CLAIM LOST"
 CURRENT=$(gh pr view $N --json labels,headRefOid)
 CURRENT_LABELS=$(printf '%s\n' "$CURRENT" | jq -r '[.labels[].name] | join(",")')
@@ -1245,6 +1243,10 @@ if [ "$MERGE_STATE" = "DIRTY" ]; then
     if [ "$GATE_OK" = true ] && [ "$PRE_REBASE_AHEAD" -gt 0 ] && git diff --quiet origin/main HEAD; then
         echo "Update silently dropped PR payload (empty diff vs origin/main)"; GATE_OK=false
     fi
+    if [ "$GATE_OK" = true ]; then  # lease fence (#9401)
+        loom-daemon lease pr fence $PR_NUMBER --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"
+        [[ $? =~ ^[02]$ ]] || exit 1  # lost: stand down, no verdict
+    fi
     if [ "$GATE_OK" = true ] && if [ "$BRANCH_UPDATE" = rebase ]; then git push --force-with-lease="$BRANCH:$PUSH_LEASE_SHA"; else git push origin "HEAD:$BRANCH"; fi; then
         gh pr comment $PR_NUMBER --body "🔀 Automatically updated the branch from main ($BRANCH_UPDATE) to resolve merge conflicts. Proceeding with code evaluation."
     else
@@ -1290,6 +1292,8 @@ if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-che
   exit 1
 fi
 
+loom-daemon lease pr fence <number> --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"
+[[ $? =~ ^[02]$ ]] || exit 1  # lease lost: stand down
 if [ "$BRANCH_UPDATE" = rebase ]; then git push --force-with-lease="$BRANCH:$PUSH_LEASE_SHA"; else git push origin "HEAD:$BRANCH"; fi
 ```
 
@@ -1318,6 +1322,8 @@ if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-che
   exit 1
 fi
 
+loom-daemon lease pr fence <number> --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"
+[[ $? =~ ^[02]$ ]] || exit 1  # lease lost: stand down
 if [ "$BRANCH_UPDATE" = rebase ]; then git push --force-with-lease="$BRANCH:$PUSH_LEASE_SHA"; else git push origin "HEAD:$BRANCH"; fi
 gh pr comment <number> --body "🔀 Updated the branch from main and resolved a merge conflict (both sides added entries to config)"
 ```
@@ -2086,7 +2092,7 @@ git add -A
 git commit -m "Remove unused import (during evaluation)"
 ```
 
-**Step 4: Push to the PR branch** (behind the lease fence; any exit but 0 or 2 = claim lost, do not push)
+**Step 4: Push to the PR branch** (behind the lease fence)
 
 ```bash
 loom-daemon lease pr fence <number> --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"; [[ $? =~ ^[02]$ ]] && git push

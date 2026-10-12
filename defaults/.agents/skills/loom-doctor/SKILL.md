@@ -715,7 +715,7 @@ gh pr edit 588 --remove-label "loom:treating" --add-label "loom:review-requested
 9. **Commit and push**: Push your fixes to the PR branch
    - **Pre-push head-SHA recheck (MANDATORY)**: before the push, re-compare the PR's `headRefOid` against the `CLAIM_HEAD_SHA` you captured in step 2 — see "Pre-Push Head-SHA Recheck" below. If the head moved, another agent pushed while you were working; re-verify the blocker is still unaddressed and stand down rather than duplicating (or clobbering) their fix.
    - **Then run "Pin the lease" below, top to bottom**: the pre-open update from `origin/main` (MANDATORY, #7668, as `builder-pr.md` § "Pre-Push Rebase"; a merge unless `loom-daemon branch-update strategy` says rebase, #10771) and the push (#9487). Never update before it. On a conflict resolve in place (`git add`, then `git commit --no-edit` or `git rebase --continue`), resume at its version gate, not "PR Has Merge Conflicts". No-op if `main` hasn't moved.
-   - **Lease fence (MANDATORY)**: `lease pr fence` immediately before the push — see "PR Lease".
+   - **Lease fence (MANDATORY)**: its `lease pr fence` runs right before the push.
    - **DCO / sign-off**: if `commit.signoff` is `true` in `.loom/config.json` (read it the same way as `buildGate.command`), or the repo has a DCO / required `sign-off` check, add `--signoff` to **every** commit you author — including `git commit --amend --signoff` when re-authoring during a rebase — so each carries a `Signed-off-by:` trailer. Harmless when not required; git will not add a duplicate trailer. Reference: `defaults/docs/commit-signoff.md`.
    - **9a. Rebase any stacked children** (best-effort): if the just-pushed branch matches `feature/issue-<N>` (i.e. you amended a stacked *parent*), run:
      ```bash
@@ -870,8 +870,8 @@ precisely the defect this section exists to fix.
 **Daemon backstop (#4367/#4618)**: `loom-daemon`'s `claim_reconciliation`
 pass also reclaims stale `loom:treating` on its tick, with the same env var and
 default, aged from the label's own `labeled` event. It lags up to ~10 minutes
-and cannot see an in-flight Doctor, so it never replaces this check. See [`daemon-reference.md`'s "Stale-claim reconciliation"
-section](https://github.com/rjwalters/loom/blob/main/defaults/docs/daemon-reference.md#stale-claim-reconciliation--the-sweep-journal-3953-fixed-3975-extended-to-pr-side-claims-4367).
+and cannot see an in-flight Doctor, so it never replaces this check
+(`daemon-reference.md` § "Stale-claim reconciliation").
 
 ### PR Lease (Step 2, #9401)
 
@@ -879,19 +879,16 @@ A label is not a mutex: adding one already present is a silent no-op, so two
 Doctors could both "hold" `loom:treating`. `lease pr claim` publishes a
 role-keyed lease comment (a Judge's never contends), orders live leases by
 comment id, and renews yours while your session lives
-(`.loom/docs/lease-record.md` § "PR-phase leases"). Pass the same
-`--watch-pid` every call.
+(`lease-record.md` § "PR-phase leases"). Same `--watch-pid` every call.
 
 - **claim** exit **0** = held: add `loom:treating` (**2** = an older
   `loom-daemon` without `lease pr`: label alone, as before). **4** = a peer's
   live lease wins (a lost race posts your yield record), **5** = unreadable,
   any other code (**1** = `loom-daemon` failed to start) = unknown: never
-  "label-only" — stand down **before** any worktree, snapshot or label action, next PR. Never
-  reset, snapshot or kill anything in a worktree a peer's lease holds, and leave
-  its `loom:treating` alone.
-- **fence** immediately before every push (step 9) and the completion write
-  (step 11): `loom-daemon lease pr fence <n> --role doctor --watch-pid …`;
-  any exit but 0 or 2 = claim lost, stand down.
+  "label-only" — stand down **before** any worktree, snapshot or label action.
+  Never touch a worktree a peer's lease holds, or its `loom:treating`.
+- **fence** before every push and the completion write (step 11):
+  `lease pr fence <n> --role doctor --watch-pid …`; not 0/2 = lost, stand down.
 - **release** when you finish or stand down: `loom-daemon lease pr release <n>
   --role doctor --watch-pid …`.
 
@@ -973,6 +970,8 @@ if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-che
   echo "Aborting: version-bearing files out of sync after update (see BLOCKER:/Fix:)." >&2
   exit 1
 fi
+loom-daemon lease pr fence "$N" --role doctor --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"
+[[ $? =~ ^[02]$ ]] || exit 1  # lease lost: stand down
 if [ "$BRANCH_UPDATE" = rebase ]; then git push --force-with-lease="$BRANCH:$PUSH_LEASE_SHA"; else git push origin "HEAD:$BRANCH"; fi &&
   { PUSH_LEASE_SHA=$(git rev-parse HEAD); PUSH_LEASE_OK=$PUSH_LEASE_SHA; CLAIM_HEAD_SHA=$PUSH_LEASE_SHA; }  # own push: re-pin
 ```
@@ -1402,6 +1401,8 @@ if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-che
 fi
 
 # Merge: plain push (rejected: Head-SHA Recheck, never force). Rebase: PINNED lease.
+loom-daemon lease pr fence 42 --role doctor --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"
+[[ $? =~ ^[02]$ ]] || exit 1  # lease lost: stand down
 if [ "$BRANCH_UPDATE" = rebase ]; then git push --force-with-lease="$BRANCH:$PUSH_LEASE_SHA"; else git push origin "HEAD:$BRANCH"; fi &&
   { PUSH_LEASE_SHA=$(git rev-parse HEAD); PUSH_LEASE_OK=$PUSH_LEASE_SHA; CLAIM_HEAD_SHA=$PUSH_LEASE_SHA; }
 

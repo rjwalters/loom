@@ -730,14 +730,18 @@ the same lease semantics, **keyed by role**:
 - **A renewal never revives an expired lease.** A PATCH would make an aged-out
   lease live again, and its older comment `id` would then outrank a peer that
   claimed after it expired. So the renewer stops, without patching, once its
-  last successful renewal (or the claim) is within 60 s of the TTL, and it
+  last successful renewal (or the claim) is within a margin of the TTL, and it
   renews only while the re-read shows its own comment as the role's earliest
-  live lease. Both the TTL age and the 4 h cap use the wall clock: on macOS,
+  live lease against the TTL less that margin (peers are still judged at the
+  full TTL). The margin is two `gh` timeouts plus slack (130 s; a quarter of
+  the TTL if smaller), and the clock is re-checked right before the PATCH, so a
+  slow re-read cannot carry a just-inside check past it. Both the TTL age and the 4 h cap use the wall clock: on macOS,
   `Instant` does not advance while the machine sleeps, so a lid-closed renewer
   would otherwise wake believing its lease fresh. An unreadable re-read falls
   back to the wall-clock guard alone.
-- **`fence`** runs before every Doctor push and completion write, and inside
-  the Judge's Verdict-Time CAS Recheck. Exit 0 if this claimant holds the
+- **`fence`** runs before every Doctor push and completion write, before
+  every Judge branch-update push, and inside the Judge's Verdict-Time CAS
+  Recheck. Exit 0 if this claimant holds the
   earliest live lease, or if there is no evidence either way (an unreadable
   list, or a claimant on an older prompt that never leased). Exit 3 if its own
   lease is no longer live. Exit 4 if a peer's live lease is earliest.
@@ -784,3 +788,7 @@ duplicated work.
   than the read-back plus about 1 s of confirmation re-reads, both claimants
   pass `claim`, as on the issue path (#6287). The later one's `fence` stops it
   before it pushes, but not before its worktree resync and snapshot steps.
+- *Hosts must be NTP-synchronised.* Lease age is the forge's `updated_at`
+  read against the reader's clock. The renewer's own offset cancels out, but a
+  peer whose clock runs ahead of the forge by more than the remaining margin
+  sees the lease expire early and may claim. Keep skew well under the margin.

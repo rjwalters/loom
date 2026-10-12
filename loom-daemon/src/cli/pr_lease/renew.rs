@@ -31,11 +31,14 @@
 //!   claim itself) is within [`RENEW_MARGIN_SECS`] of the TTL. Measured with
 //!   `chrono::Utc::now()`, never `Instant`: on macOS `Instant` does not
 //!   advance while the machine sleeps, which is exactly the lid-closed case.
-//!   The 4 h cap uses the same wall clock.
+//!   The 4 h cap uses the same wall clock. It is checked at the top of the
+//!   cycle and again immediately before the PATCH ([`pre_patch_guard`]), so a
+//!   slow forge read cannot carry a just-inside check past the margin.
 //! - **The forge.** It re-reads the role's leases and renews only while its
-//!   own comment is still this role's earliest live lease. A peer holding the
-//!   claim, or its own lease no longer live, stops the loop. An unreadable
-//!   list falls back to the wall-clock guard alone.
+//!   own comment is still this role's earliest live lease *with the margin to
+//!   spare* ([`forge_state`]: live against `TTL - margin`, not the full TTL).
+//!   A peer holding the claim, or its own lease no longer live, stops the
+//!   loop. An unreadable list falls back to the wall-clock guard alone.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -45,7 +48,9 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 
 use super::super::lease_renewer::{self, Key, Store};
-use super::{claim_state, lease_body, provenance_line, ClaimState, Ctx, Gh, Identity, Role};
+use super::{
+    claim_state, lease_body, provenance_line, ClaimState, Ctx, Gh, Identity, Role, Row, GH_TIMEOUT,
+};
 
 /// Renewal cadence, shared with the issue renewer's knob.
 const INTERVAL_ENV: &str = "SWEEP_LEASE_RENEW_INTERVAL_SECS";
@@ -54,10 +59,14 @@ pub(crate) const DEFAULT_INTERVAL_SECS: u64 = 300;
 pub(crate) const DEFAULT_MAX_AGE_SECS: u64 = 14_400;
 /// Consecutive cycles without the claim label before the loop stops.
 pub(crate) const LABEL_MISS_LIMIT: u32 = 2;
+/// Slack on top of the `gh` timeouts the margin must outlast.
+const MARGIN_SLACK_SECS: u64 = 10;
 /// Stop this far short of the TTL: a renewal checked just inside it must
-/// still land (one `gh` call, bounded by its timeout) before the lease ages
-/// out. Clamped to a quarter of the TTL for short TTLs.
-pub(crate) const RENEW_MARGIN_SECS: u64 = 60;
+/// still land before the lease ages out. Derived from the `gh` timeout so the
+/// two cannot drift apart: two calls (the forge read and the PATCH) plus
+/// slack, although the pre-PATCH re-check leaves only the PATCH inside it.
+/// Clamped to a quarter of the TTL for short TTLs ([`renew_margin_secs`]).
+pub(crate) const RENEW_MARGIN_SECS: u64 = 2 * GH_TIMEOUT.as_secs() + MARGIN_SLACK_SECS;
 /// How often a sleeping loop re-checks the watched session.
 const POLL: Duration = Duration::from_secs(5);
 
@@ -128,10 +137,57 @@ pub(crate) struct Clocks {
 impl Clocks {
     /// The lease is too old to renew: within the margin of the TTL.
     fn lease_aged_out(&self) -> bool {
-        let margin = RENEW_MARGIN_SECS.min(self.ttl_secs / 4);
-        let limit = self.ttl_secs.saturating_sub(margin);
-        i64::try_from(limit).is_ok_and(|limit| self.since_renewal_secs >= limit)
+        aged_out(self.since_renewal_secs, self.ttl_secs)
     }
+}
+
+/// The renewal margin for a TTL: [`RENEW_MARGIN_SECS`], clamped to a quarter
+/// of the TTL.
+pub(crate) fn renew_margin_secs(ttl_secs: u64) -> u64 {
+    RENEW_MARGIN_SECS.min(ttl_secs / 4)
+}
+
+/// A lease last written `since_secs` ago is within the margin of `ttl_secs`.
+fn aged_out(since_secs: i64, ttl_secs: u64) -> bool {
+    let limit = ttl_secs.saturating_sub(renew_margin_secs(ttl_secs));
+    i64::try_from(limit).is_ok_and(|limit| since_secs >= limit)
+}
+
+/// The wall-clock re-check taken immediately before the PATCH, at `attempt`
+/// (after the forge read): the top-of-cycle check ran before up to two `gh`
+/// calls, so it is repeated here. Pure.
+pub(crate) fn pre_patch_guard(
+    attempt: DateTime<Utc>,
+    last_renewed: DateTime<Utc>,
+    ttl_secs: u64,
+) -> Step {
+    if aged_out(wall_secs(attempt, last_renewed), ttl_secs) {
+        Step::Stop("the lease aged into the renewal margin during the forge read; renewing could revive it")
+    } else {
+        Step::Renew
+    }
+}
+
+/// The forge state the renewal guard reads: [`claim_state`] at the full TTL
+/// (peers are judged exactly as a fence would judge them), except that this
+/// claimant's own earliest lease must also be live against `TTL - margin`,
+/// or it reads [`ClaimState::Free`]. Pure.
+pub(crate) fn forge_state(
+    rows: &[Row],
+    me: &Identity,
+    now: DateTime<Utc>,
+    ttl: chrono::Duration,
+) -> ClaimState {
+    let full = claim_state(Some(rows), me, now, ttl);
+    if let ClaimState::HeldBySelf { id } = full {
+        let ttl_secs = u64::try_from(ttl.num_seconds()).unwrap_or(0);
+        let margin = i64::try_from(renew_margin_secs(ttl_secs)).unwrap_or(i64::MAX);
+        let inner = ttl - chrono::Duration::seconds(margin);
+        if claim_state(Some(rows), me, now, inner) != (ClaimState::HeldBySelf { id }) {
+            return ClaimState::Free;
+        }
+    }
+    full
 }
 
 /// Seconds from `then` to `now` on the wall clock.
@@ -195,7 +251,7 @@ pub(crate) fn forge_guard(state: Option<&ClaimState>, comment_id: u64) -> Step {
             Step::Stop("a peer holds this role's earliest live lease")
         }
         Some(ClaimState::Free) => {
-            Step::Stop("this lease is no longer live; renewing would revive it")
+            Step::Stop("this lease is no longer live (or is within the renewal margin); renewing could revive it")
         }
     }
 }
@@ -381,7 +437,7 @@ pub(crate) fn run_loop(args: &RenewLoopArgs) {
             let rows = gh.read_rows(args.pr, &policy);
             let state = rows
                 .as_deref()
-                .map(|rows| claim_state(Some(rows), &me, Utc::now(), ttl));
+                .map(|rows| forge_state(rows, &me, Utc::now(), ttl));
             step = forge_guard(state.as_ref(), args.comment_id);
         }
         match step {
@@ -394,6 +450,12 @@ pub(crate) fn run_loop(args: &RenewLoopArgs) {
                 // Taken BEFORE the PATCH: the forge's `updated_at` is no
                 // earlier, so the guard never overestimates the lease's life.
                 let attempt = Utc::now();
+                // Re-check after the forge read (#9401 review): only the
+                // PATCH's own timeout may now sit inside the margin.
+                if let Step::Stop(why) = pre_patch_guard(attempt, last_renewed, clocks.ttl_secs) {
+                    say(&format!("renewer stopping: {why}"));
+                    return;
+                }
                 let body = lease_body(&me, args.pr, Some(attempt), &provenance);
                 match gh.patch(args.comment_id, &body) {
                     Ok(()) => {
