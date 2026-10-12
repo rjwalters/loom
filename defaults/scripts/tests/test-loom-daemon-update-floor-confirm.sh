@@ -382,11 +382,26 @@ check "names what changed instead of 'Nothing was changed'" "$outN" \
 check "never claims nothing changed" "$outN" lacks "Nothing was changed" "$outN"
 check "the installed daemon is untouched" "$outN" eq "0.19.950" "$(installed_version "$WN")"
 
+# commit_version <dir> -- track the fixture's VERSION so a fast-forward may move it.
+commit_version() {
+    git -C "$1" add VERSION
+    git -C "$1" -c user.email=test@test -c user.name=test commit -q -m "track VERSION"
+}
+
+# fake_build_after_sync <dir> <origin-clone> <version> -- the fake cargo's build
+# must report the commit the fast-forward lands on, or build verification fails.
+fake_build_after_sync() {
+    write_fake_artifact_daemon "$1/new-loom-daemon" "$3" \
+        "$(git -C "$2" rev-parse --short HEAD)"
+}
+
 if [[ "$HAVE_PTY" == "1" ]]; then
     echo "O. a confirmed version is not a blanket pass: the sync moved VERSION"
     WO="$BASE_WORKDIR/o"
     fixture "$WO" fleet
+    commit_version "$WO"
     behind_origin "$WO" "$BASE_WORKDIR/o-origin.git" "0.19.960"
+    fake_build_after_sync "$WO" "$BASE_WORKDIR/o-origin.git-clone" "0.19.960"
     outO="$(in_fixture "$WO" python3 "$PTY_DRIVER" y bash "$UPDATE_SCRIPT" --no-fetch --no-restart 2>&1)"
     rcO=$?
     check "the sync ran" "$outO" has "Fast-forwarded" "$outO"
@@ -399,7 +414,9 @@ if [[ "$HAVE_PTY" == "1" ]]; then
     echo "P. the sync leaves VERSION alone: the confirmation stands, no second prompt"
     WP="$BASE_WORKDIR/p"
     fixture "$WP" fleet
+    commit_version "$WP"
     behind_origin "$WP" "$BASE_WORKDIR/p-origin.git"
+    fake_build_after_sync "$WP" "$BASE_WORKDIR/p-origin.git-clone" "0.19.953"
     outP="$(in_fixture "$WP" python3 "$PTY_DRIVER" y bash "$UPDATE_SCRIPT" --no-fetch --no-restart 2>&1)"
     rcP=$?
     check "the sync ran" "$outP" has "Fast-forwarded" "$outP"
