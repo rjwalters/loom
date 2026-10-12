@@ -2528,6 +2528,7 @@ mod maintain_only;
 mod ordering;
 mod priority_admission;
 mod ram_budget;
+mod vi_cap;
 mod workspace_draw;
 
 // ===================================================================
