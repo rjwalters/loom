@@ -28,6 +28,7 @@
 //! rule.
 
 use serde::Deserialize;
+use std::ffi::OsStr;
 use std::path::Path;
 
 use crate::runtime_admission::{bundled_runtime_manifest, roots};
@@ -133,16 +134,12 @@ fn push_default(lines: &mut Vec<String>, var: &str, value: &str) {
     ));
 }
 
-/// Resolve `runtime`'s `launch` object into eval-ready shell lines.
-///
-/// `root` is the working tree to resolve `.loom/runtimes/<name>.json` /
-/// `defaults/runtimes/<name>.json` against (the same two-tier resolution
-/// `runtime_admission::roots` uses for every other manifest lookup), falling
-/// back to the manifest the daemon binary was built with when neither exists
-/// on disk (`runtime_admission::bundled_runtime_manifest` — covers `aider`
-/// today).
-#[must_use]
-pub fn resolve_launch_env(root: &Path, runtime: &str) -> LaunchEnvOutcome {
+/// Read `runtime`'s manifest and return its `launch` object — the one
+/// manifest read behind both [`resolve_launch_env`] and [`cli_bin_with`], so
+/// the launch path and the availability gate cannot disagree about which file
+/// (or bundled fallback) describes a runtime. `Ok(None)` is a manifest with no
+/// `launch` object; `Err` carries the non-`Resolved` outcome to report.
+fn read_launch(root: &Path, runtime: &str) -> Result<Option<LaunchSpec>, LaunchEnvOutcome> {
     let (_roles, runtimes_dir, _scripts) = roots(root);
     let manifest_path = runtimes_dir.join(format!("{runtime}.json"));
 
@@ -152,18 +149,18 @@ pub fn resolve_launch_env(root: &Path, runtime: &str) -> LaunchEnvOutcome {
             match bundled_runtime_manifest(runtime) {
                 Some(bundled) => bundled.as_bytes().to_vec(),
                 None => {
-                    return LaunchEnvOutcome::NoManifest(format!(
+                    return Err(LaunchEnvOutcome::NoManifest(format!(
                         "no runtime manifest found for {runtime:?} at {} (and no bundled fallback)",
                         manifest_path.display()
-                    ))
+                    )))
                 }
             }
         }
         Err(e) => {
-            return LaunchEnvOutcome::NoManifest(format!(
+            return Err(LaunchEnvOutcome::NoManifest(format!(
                 "could not read {}: {e}",
                 manifest_path.display()
-            ))
+            )))
         }
     };
 
@@ -175,12 +172,58 @@ pub fn resolve_launch_env(root: &Path, runtime: &str) -> LaunchEnvOutcome {
         // valid JSON at all. Both are manifest authoring errors, not "no
         // manifest" — EX_CONFIG, not the soft `NoManifest` degrade.
         Err(e) => {
-            return LaunchEnvOutcome::Fatal(format!("{}: {e}", manifest_path.display()));
+            return Err(LaunchEnvOutcome::Fatal(format!("{}: {e}", manifest_path.display())));
         }
     };
+    Ok(doc.launch)
+}
 
-    let Some(launch) = doc.launch else {
-        return LaunchEnvOutcome::Resolved(Vec::new());
+/// The environment variable that pins a tier-3 runtime's CLI binary,
+/// overriding the manifest's `launch.cliBin` (see [`push_default`]).
+pub const CLI_BIN_ENV: &str = "LOOM_GENERIC_CLI_BIN";
+
+/// The CLI binary `runtime`'s tier-3 launch would exec, when the daemon can
+/// know it (issue #9368): a non-empty [`CLI_BIN_ENV`] wins, else the
+/// manifest's `launch.cliBin` — the same "env > manifest" precedence
+/// [`push_default`] gives the launch itself.
+///
+/// `None` means **unknown**, never "absent": no manifest, no `launch` object,
+/// no `cliBin`, an unparseable manifest, or an override that is not UTF-8. A
+/// caller must treat it as unobservable — the launch path reports those cases
+/// itself, with full context.
+#[must_use]
+pub fn cli_bin(root: &Path, runtime: &str) -> Option<String> {
+    cli_bin_with(root, runtime, std::env::var_os(CLI_BIN_ENV).as_deref())
+}
+
+/// [`cli_bin`] with the [`CLI_BIN_ENV`] value injected rather than read from
+/// the process environment, so a test never has to mutate it.
+#[must_use]
+pub fn cli_bin_with(root: &Path, runtime: &str, env_override: Option<&OsStr>) -> Option<String> {
+    if let Some(pinned) = env_override.filter(|value| !value.is_empty()) {
+        return pinned.to_str().map(str::to_owned);
+    }
+    read_launch(root, runtime)
+        .ok()
+        .flatten()
+        .and_then(|launch| launch.cli_bin)
+        .filter(|bin| !bin.is_empty())
+}
+
+/// Resolve `runtime`'s `launch` object into eval-ready shell lines.
+///
+/// `root` is the working tree to resolve `.loom/runtimes/<name>.json` /
+/// `defaults/runtimes/<name>.json` against (the same two-tier resolution
+/// `runtime_admission::roots` uses for every other manifest lookup), falling
+/// back to the manifest the daemon binary was built with when neither exists
+/// on disk (`runtime_admission::bundled_runtime_manifest` — covers `aider`
+/// today).
+#[must_use]
+pub fn resolve_launch_env(root: &Path, runtime: &str) -> LaunchEnvOutcome {
+    let launch = match read_launch(root, runtime) {
+        Ok(Some(launch)) => launch,
+        Ok(None) => return LaunchEnvOutcome::Resolved(Vec::new()),
+        Err(outcome) => return outcome,
     };
 
     let mut lines = Vec::new();
@@ -353,5 +396,42 @@ mod tests {
                 r#"[ -n "${LOOM_GENERIC_PROMPT_FLAG:-}" ] || LOOM_GENERIC_PROMPT_FLAG="--odd}flag"; export LOOM_GENERIC_PROMPT_FLAG"#
             ]
         );
+    }
+
+    /// #9368: the accessor the availability gate reads — manifest value, env
+    /// override, no `launch` object, no manifest. The override is injected,
+    /// never set on the process.
+    #[test]
+    fn cli_bin_prefers_the_env_override_and_is_unknown_when_undeclared() {
+        let dir = tempdir().unwrap();
+        write_manifest(
+            dir.path(),
+            "widget",
+            r#"{"runtime": "widget", "capabilities": {}, "launch": {"cliBin": "widget-cli"}}"#,
+        );
+        write_manifest(dir.path(), "bare", r#"{"runtime": "bare", "capabilities": {}}"#);
+        write_manifest(dir.path(), "broken", r#"{"launch": {"bogusKey": "oops"}}"#);
+        let root = dir.path();
+
+        assert_eq!(cli_bin_with(root, "widget", None).as_deref(), Some("widget-cli"));
+        // An empty override is "unset", exactly as `push_default` treats it.
+        assert_eq!(
+            cli_bin_with(root, "widget", Some(OsStr::new(""))).as_deref(),
+            Some("widget-cli")
+        );
+        assert_eq!(
+            cli_bin_with(root, "widget", Some(OsStr::new("pinned-cli"))).as_deref(),
+            Some("pinned-cli")
+        );
+        // The override names the binary even where no manifest could.
+        assert_eq!(
+            cli_bin_with(root, "totally-unknown-runtime", Some(OsStr::new("pinned-cli")))
+                .as_deref(),
+            Some("pinned-cli")
+        );
+        // Unknown, not absent: no `launch` object, no manifest, bad manifest.
+        assert_eq!(cli_bin_with(root, "bare", None), None);
+        assert_eq!(cli_bin_with(root, "totally-unknown-runtime", None), None);
+        assert_eq!(cli_bin_with(root, "broken", None), None);
     }
 }

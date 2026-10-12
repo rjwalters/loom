@@ -32,6 +32,7 @@ pub(super) fn start_facts(facts: &SweepStartFacts) -> Vec<KeyValue> {
     for (key, value) in [
         ("loom.model", &facts.model),
         ("loom.effort", &facts.effort),
+        ("loom.effort_source", &facts.effort_source),
         ("loom.model_source", &facts.model_source),
         ("loom.runtime", &facts.runtime),
     ] {
@@ -45,6 +46,7 @@ pub(super) fn start_facts(facts: &SweepStartFacts) -> Vec<KeyValue> {
     for (key, value) in [
         ("loom.trigger", &facts.trigger),
         ("loom.previous_sweep_id", &facts.previous_sweep_id),
+        ("loom.dispatch_origin", &facts.dispatch_origin),
     ] {
         if let Some(value) = value.as_ref().filter(|v| text(v)) {
             attrs.push(kv_string(key, value.clone()));
@@ -153,6 +155,11 @@ pub(super) fn outcome(record: &SweepOutcomeRecord) -> Vec<KeyValue> {
     let mut attrs = Vec::new();
     // Config is otherwise a free-form map (including token_account). Export
     // only known execution settings, retaining legacy config.runtime queries.
+    for key in ["effort_source", "model_source"] {
+        if let Some(value) = record.config.get(key).filter(|value| text(value)) {
+            attrs.push(kv_string(&format!("loom.{key}"), value.clone()));
+        }
+    }
     for key in ["runtime", "provider", "configured_model", "arm"] {
         if let Some(value) = record.config.get(key).filter(|value| text(value)) {
             attrs.push(kv_string(&format!("loom.config.{key}"), value.clone()));
@@ -285,6 +292,10 @@ pub(super) fn outcome(record: &SweepOutcomeRecord) -> Vec<KeyValue> {
     }
     if let Some(value) = record.trigger.as_ref().filter(|v| text(v)) {
         attrs.push(kv_string("loom.trigger", value.clone()));
+    }
+    // Issue #11444: who asked for this sweep, equal to `sweep.started`'s.
+    if let Some(value) = record.dispatch_origin.as_ref().filter(|v| text(v)) {
+        attrs.push(kv_string("loom.dispatch_origin", value.clone()));
     }
     if let Some(numbers) = &record.pr_numbers {
         if !numbers.is_empty() && numbers.len() <= MAX_GROUPS {

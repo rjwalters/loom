@@ -468,6 +468,10 @@ fn daemon_write_paths_are_scoped() {
             Via(DISPATCH, "body park record of a dispatched sweep's quarantine / PR-less hold"),
         ),
         (
+            "sweep_registry/noop_cooldown/hold.rs",
+            Via(DISPATCH, "acts on dispatched sweeps"),
+        ),
+        (
             "sweep_registry/outcome_journal/writeback.rs",
             Via(DISPATCH, "dispatched sweeps"),
         ),
@@ -537,6 +541,8 @@ fn daemon_write_paths_are_scoped() {
         ),
         ("operator_decision/cli.rs", Gated),
         ("forge_priority_labels.rs", Gated),
+        ("cli/labels_undeclared.rs", Gated),
+        ("cli/pr_lease.rs", Gated),
         (
             "fleet/drain_reset.rs",
             OperatorOnly("`fleet drain`: the operator's own worker, by name (the claim resetter, split out of fleet/drain.rs by #10089)"),
@@ -594,6 +600,14 @@ fn daemon_write_paths_are_scoped() {
         (
             "gh_invocation/api_kind.rs",
             NotAWrite("classifies an invocation's argv for the github.api span attribute, runs none"),
+        ),
+        (
+            "gh_invocation/route.rs",
+            NotAWrite("templates an invocation's argv for the github.route span attribute, runs none"),
+        ),
+        (
+            "gh_invocation/route_table.rs",
+            NotAWrite("the route, command and flag vocabularies behind route.rs, runs none"),
         ),
         (
             "gh_invocation/own_writes.rs",

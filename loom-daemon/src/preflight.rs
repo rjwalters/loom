@@ -37,6 +37,7 @@ use serde::{Deserialize, Serialize};
 
 mod flaky;
 mod load_defer;
+pub mod skip_ci;
 mod tree_kill;
 
 /// Default `buildGate.preflightMaxAttempts`.

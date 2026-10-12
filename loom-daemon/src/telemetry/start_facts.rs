@@ -16,6 +16,82 @@ pub mod model_source {
     /// The daemon chose it (config, experiment arm or runtime default), or
     /// the runtime picks its own (no `model`).
     pub const DEFAULT: &str = "default";
+    /// No model id could be named (empty, or the runtime picks its own); the
+    /// `model` fact is then absent (#11370).
+    pub const UNKNOWN: &str = "unknown";
+}
+
+/// `effort_source` values (#11370).
+pub mod effort_source {
+    /// The dispatch request named the effort.
+    pub const EXPLICIT: &str = "explicit";
+    /// A config, environment or runtime default applies.
+    pub const DEFAULT: &str = "default";
+}
+
+/// Who or what asked for a sweep (Issue #11444), exported as
+/// `loom.dispatch_origin` on `sweep.started` and `sweep.outcome`.
+///
+/// A closed, low-cardinality vocabulary serialized as a snake_case string
+/// like `trigger`. Every production caller of the dispatch core names its
+/// own origin; nothing defaults to [`Self::Operator`]. An IPC request that
+/// does not say (a legacy client) records [`Self::Unknown`], counted and
+/// never guessed. A value this daemon does not know (a newer client) also
+/// reads as `unknown` rather than refusing the dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DispatchOrigin {
+    /// A human asked: `loom-daemon dispatch`, the `dispatch_sweep` MCP tool,
+    /// or a Safehouse ChatOps `dispatch` command.
+    Operator,
+    /// The daemon's autonomous work finder picked the issue.
+    WorkFinder,
+    /// The epic supervisor dispatched the next phase.
+    EpicSupervisor,
+    /// A registry watchdog re-dispatched after a stall or early exit.
+    Watchdog,
+    /// The reaper resumed a crashed sweep from its checkpoint.
+    ReaperRetry,
+    /// The requester did not say, or named a value this daemon does not know.
+    #[serde(other)]
+    Unknown,
+}
+
+impl DispatchOrigin {
+    /// The wire value, as exported on `loom.dispatch_origin`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Operator => "operator",
+            Self::WorkFinder => "work_finder",
+            Self::EpicSupervisor => "epic_supervisor",
+            Self::Watchdog => "watchdog",
+            Self::ReaperRetry => "reaper_retry",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// The origin an IPC `DispatchSweep` request records: what it named, or
+    /// `unknown` when the field was absent. Never assumed `operator`, since
+    /// automated tools and legacy clients share the same request.
+    #[must_use]
+    pub fn from_request(origin: Option<Self>) -> Self {
+        origin.unwrap_or(Self::Unknown)
+    }
+
+    /// The `trigger` this dispatch records, given the journal-derived one
+    /// (Issue #11444). Only an operator re-dispatch of an issue that already
+    /// has an attempt on this host becomes `operator_redispatch`; a first
+    /// attempt stays `first`, and every other origin keeps the journal
+    /// derivation, which never yields `operator_redispatch` on its own.
+    #[must_use]
+    pub fn apply_to_trigger(self, derived: &'static str) -> &'static str {
+        if self == Self::Operator && derived != super::trigger::FIRST {
+            super::trigger::OPERATOR_REDISPATCH
+        } else {
+            derived
+        }
+    }
 }
 
 /// The OTLP log attributes `sweep.started` exports for these facts. The
@@ -24,11 +100,13 @@ pub mod model_source {
 pub const SWEEP_START_FACT_LOG_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.model",
     "loom.effort",
+    "loom.effort_source",
     "loom.model_source",
     "loom.runtime",
     "loom.attempt_index",
     "loom.trigger",
     "loom.previous_sweep_id",
+    "loom.dispatch_origin",
 ];
 
 /// Dispatch-time facts of one sweep. Every field is absent when unknown,
@@ -42,7 +120,12 @@ pub struct SweepStartFacts {
     /// The reasoning-effort level, when one was set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
-    /// [`model_source::EXPLICIT`] or [`model_source::DEFAULT`].
+    /// [`effort_source::EXPLICIT`] or [`effort_source::DEFAULT`]; absent with
+    /// `effort` (#11370).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_source: Option<String>,
+    /// [`model_source::EXPLICIT`], [`model_source::DEFAULT`] or
+    /// [`model_source::UNKNOWN`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_source: Option<String>,
     /// The admitted runtime adapter (`claude`, `codex`, ...). Never defaulted.
@@ -58,6 +141,9 @@ pub struct SweepStartFacts {
     /// The previous attempt's `sweep_id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_sweep_id: Option<String>,
+    /// Who asked for this sweep ([`DispatchOrigin`], Issue #11444).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_origin: Option<String>,
 }
 
 #[cfg(test)]

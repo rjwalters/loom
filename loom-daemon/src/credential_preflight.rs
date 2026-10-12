@@ -784,6 +784,9 @@ pub fn record_forge_credential_success(source: &str) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .record_success(source);
+    if source == CREDENTIAL_SOURCE_PRIMARY {
+        loom_ui::credential_restored(); // #11295
+    }
 }
 
 /// Whether **any** of the daemon's forge credentials is currently within a
@@ -860,11 +863,10 @@ pub fn nwo_from_git_remote(cwd: &Path) -> Option<String> {
         // HTTPS: https://host/owner/repo
         let (_host, p) = rest.split_once('/')?;
         p
-    } else if let Some(rest) = stripped.strip_prefix("http://") {
+    } else {
+        let rest = stripped.strip_prefix("http://")?;
         let (_host, p) = rest.split_once('/')?;
         p
-    } else {
-        return None;
     };
 
     let trimmed = path.trim_matches('/');
@@ -1606,6 +1608,7 @@ pub fn force_refresh_owner_credential(repo_root: &Path) -> bool {
     force_refresh_owner_credential_with(workspace_root, repo_root, &minter)
 }
 
+pub mod loom_ui;
 pub mod pool;
 pub use pool::attach as attach_pool;
 mod minted;

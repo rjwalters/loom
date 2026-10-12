@@ -101,6 +101,10 @@ use owned_paths::{
     LOOM_OWNED_PREFIXES,
 };
 
+// `WorkspaceHealthStates::find` (#11565) lives in its own sibling module for
+// the same reason: this file is frozen by the file-size ratchet.
+mod workspace_find;
+
 /// Ceiling for a `git` invocation made by the main-health gate.
 ///
 /// Covers `git fetch`, which reaches the network — generous enough for a slow

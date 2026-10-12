@@ -158,9 +158,9 @@ fn severity_text(severity: SeverityNumber) -> &'static str {
 ///
 /// `host.name` (Issue #10977) has one source: the envelope's `host_id`, the
 /// same string as `host.id` and `service.instance.id`. For a daemon that is
-/// [`host_identity()`](crate::sweep_registry::host_identity) — the
-/// operator-assigned `$LOOM_HOST_ID` when set, else the OS hostname
-/// (`$HOSTNAME`, then the `hostname` binary). It is set here, on every signal,
+/// [`host_identity()`](crate::sweep_registry::host_identity) — fleet-gitops
+/// `fleet.hostId`, else `$LOOM_HOST_ID`, else the persisted `~/.loom/host-id`
+/// (#11530; never the OS hostname). It is set here, on every signal,
 /// so a receiver reached without a collector still gets a readable host axis.
 pub(super) fn resource_for_host(host_id: &str, daemon_version: Option<&str>) -> Resource {
     let version = daemon_version
@@ -330,8 +330,12 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             if r.repo_unresolved {
                 attributes.push(kv_string("loom.repo_unresolved", "true".to_string()));
             }
-            if let Some(model) = &r.model {
-                attributes.push(kv_string("loom.model", model.clone()));
+            if let Some(model) = r
+                .model
+                .as_deref()
+                .and_then(crate::sweep_registry::normalize_model_id)
+            {
+                attributes.push(kv_string("loom.model", model));
             }
             if let Some(effort) = &r.effort {
                 attributes.push(kv_string("loom.effort", effort.clone()));
@@ -369,8 +373,12 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             ];
             // Every optional field stays optional here too: an unobserved
             // measurement must be an ABSENT attribute, never a zero one.
-            if let Some(model) = &r.model {
-                attributes.push(kv_string("loom.model", model.clone()));
+            if let Some(model) = r
+                .model
+                .as_deref()
+                .and_then(crate::sweep_registry::normalize_model_id)
+            {
+                attributes.push(kv_string("loom.model", model));
             }
             if let Some(effort) = &r.effort {
                 attributes.push(kv_string("loom.effort", effort.clone()));
@@ -844,6 +852,28 @@ fn metric_samples_for(envelope: &TelemetryEnvelope) -> Vec<MetricSample> {
                     time_unix_nano,
                 },
             ];
+            // Issue #11353: `host.health` reaches OTLP as gauges only, so the
+            // OTLP-export state rides as a state-labelled gauge. `state` and
+            // `reason` are already on the collector's datapoint allowlist; the
+            // exemption reason is the `reason` label, present only when exempt.
+            // Absent (pre-#11353 daemon) stays absent, never a fabricated `ok`.
+            if let Some(otlp_export) = &r.otlp_export {
+                let mut attributes = vec![kv_string("state", otlp_export.state.as_str())];
+                if otlp_export.state == crate::observability::otlp_health::OtlpExportState::Exempt {
+                    if let Some(reason) = otlp_export.detail.as_deref() {
+                        attributes.push(kv_string("reason", reason));
+                    }
+                }
+                samples.push(MetricSample {
+                    name: "loom.host.otlp_export",
+                    description: "OTLP export health of this daemon (1 per current state; \
+                                  state label: no_exporter|failing|ok|exempt).",
+                    unit: "1",
+                    attributes,
+                    value: number_data_point::Value::AsInt(1),
+                    time_unix_nano,
+                });
+            }
             if let Some(cpu_idle_fraction) = r.cpu_idle_fraction {
                 samples.push(MetricSample {
                     name: "loom.host.cpu_idle_fraction",

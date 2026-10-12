@@ -74,6 +74,14 @@ pub struct ModelProfile {
     /// e.g. the z.ai coding plan), `api` (metered) or `local`. Absent: a
     /// profile that reads a provider credential is treated as metered.
     pub billing: Option<String>,
+    /// Roles this profile must never be admitted for (#11400), e.g.
+    /// `["judge", "curator"]` on `zai-flash`: review and triage stay off the
+    /// model. Enforced at runtime admission for every selection source — a
+    /// preference entry is skipped as `not-admitted(excludedRole)`, an
+    /// explicit pin / role binding / env pin is refused with the reason. Names
+    /// must be known roles (`loom-daemon validate` rejects anything else).
+    #[serde(default)]
+    pub excluded_roles: Vec<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -151,6 +159,86 @@ pub fn lookup(name: Option<&str>, config: &Value) -> Result<(String, ModelProfil
         return Err(LaunchError::config("model profile has an empty model or effort"));
     }
     Ok((name, profile))
+}
+
+/// Unit name of the admission refusal a profile's `excludedRoles` produces,
+/// rendered in a preference walk as `not-admitted(excludedRole)` (#11400).
+pub const EXCLUDED_ROLE: &str = "excludedRole";
+
+/// The model profile a native launch of `runtime` would resolve, when that
+/// profile lists `role` (canonical name) in its `excludedRoles` (#11400).
+///
+/// `profile` is the explicitly chosen profile (a preference tap's
+/// `modelProfile`); `None` falls back exactly as [`lookup`] does for a launch —
+/// `LOOM_MODEL_PROFILE`, then `runtimes.defaultModelProfile`, then the bundled
+/// `zai-flash` default — so a bare `opencode` binding is judged against the
+/// profile it would actually run. Returns `None` (no objection) for a
+/// non-native runtime, an unknown profile (the launch itself fails closed on
+/// that), or a profile with no provider for this harness (it cannot be the
+/// model that harness runs).
+#[must_use]
+pub fn excluded_role(
+    runtime: &str,
+    profile: Option<&str>,
+    role: &str,
+    config: &Value,
+) -> Option<String> {
+    if !super::is_native(runtime) {
+        return None;
+    }
+    let env_profile = super::nonempty_env("LOOM_MODEL_PROFILE");
+    let requested = profile
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .or(env_profile.as_deref());
+    let (name, resolved) = lookup(requested, config).ok()?;
+    if !resolved.providers.contains_key(runtime) {
+        return None;
+    }
+    resolved
+        .excluded_roles
+        .iter()
+        .any(|listed| crate::runtime_admission::canonical_role(listed) == Some(role))
+        .then_some(name)
+}
+
+/// `loom-daemon validate` findings for `excludedRoles` (#11400): every entry,
+/// in configured `runtimes.modelProfiles` and in the bundled set, must name a
+/// known role. An unknown name would silently exclude nothing.
+#[must_use]
+pub fn check_excluded_roles_config(config: &Value) -> Vec<String> {
+    fn unknown_roles(origin: &str, name: &str, roles: &[String]) -> Option<String> {
+        let unknown: Vec<&str> = roles
+            .iter()
+            .map(String::as_str)
+            .filter(|role| crate::runtime_admission::canonical_role(role).is_none())
+            .collect();
+        (!unknown.is_empty()).then(|| {
+            format!("{origin}.{name}.excludedRoles: unknown role name(s): {}", unknown.join(", "))
+        })
+    }
+    let mut findings = Vec::new();
+    if let Some(Value::Object(map)) = config.pointer("/runtimes/modelProfiles") {
+        for (name, profile) in map {
+            match profile.get("excludedRoles") {
+                None | Some(Value::Null) => {}
+                Some(Value::Array(entries)) => {
+                    let roles: Vec<String> = entries
+                        .iter()
+                        .map(|e| e.as_str().map_or_else(|| e.to_string(), str::to_string))
+                        .collect();
+                    findings.extend(unknown_roles("runtimes.modelProfiles", name, &roles));
+                }
+                Some(_) => findings.push(format!(
+                    "runtimes.modelProfiles.{name}.excludedRoles must be an array of role names"
+                )),
+            }
+        }
+    }
+    for (name, profile) in bundled() {
+        findings.extend(unknown_roles("model-profiles.json", &name, &profile.excluded_roles));
+    }
+    findings
 }
 
 /// One harness's credential mapping: (source variable, child variable) pairs,
@@ -452,6 +540,7 @@ mod tests {
             provider_definition: BTreeMap::new(),
             allowed_efforts: Vec::new(),
             billing: None,
+            excluded_roles: Vec::new(),
         }
     }
 

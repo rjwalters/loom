@@ -348,7 +348,7 @@ fn log_recovery_event(
     let mut events: Vec<Value> = super::read_json_file(&recovery_file)
         .and_then(|v| v.as_array().cloned())
         .unwrap_or_default();
-    events.push(event);
+    events.push(event.clone());
     if events.len() > MAX_RECOVERY_EVENTS {
         events.drain(..events.len() - MAX_RECOVERY_EVENTS);
     }
@@ -357,6 +357,8 @@ fn log_recovery_event(
             "Failed to write recovery event to {}",
             recovery_file.display()
         ));
+    } else {
+        crate::journal::execution::recovery_event(repo_root, issue, &recovery_file, &event);
     }
 }
 

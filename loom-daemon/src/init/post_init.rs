@@ -217,6 +217,8 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     ".loom/claims/",
     ".loom/locks/",
     ".loom/signals/",
+    // #11284: per-dispatch runtime/modelProfile tap records (daemon-written).
+    ".loom/sweep-dispatch-tap/",
     ".loom/status/",
     ".loom/retry-state/",
     ".loom/exit-codes/",

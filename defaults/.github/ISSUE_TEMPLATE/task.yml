@@ -1,18 +1,13 @@
 name: "Development Task"
-description: "Create a development task for Loom"
+description: "Create a development task"
 labels: ["loom:triage"]
 body:
   - type: markdown
     attributes:
       value: |
-        **Welcome to Loom Issue Tracker**
+        Use this template for an actionable development task: a bug to fix, a feature to build, or other concrete work.
 
-        **Important**: Loom uses GitHub Issues to control the AI-driven development process. Issues are actionable development tasks, not discussions.
-
-        - **For questions, ideas, or feedback**: Use [GitHub Discussions](https://github.com/rjwalters/loom/discussions)
-        - **For development tasks**: Use this template
-
-        **External contributors**: Your issue will be automatically labeled as `external` and reviewed by maintainers. Our AI agents focus on internal workflow, so external issues require manual triage.
+        This repository uses GitHub Issues to drive an AI-assisted development workflow. A new task starts with the `loom:triage` label and is reviewed before any work begins.
 
   - type: dropdown
     id: task_type
@@ -39,12 +34,12 @@ body:
       placeholder: |
         For bugs:
         Steps to reproduce:
-        1. Launch Loom
-        2. Select workspace
-        3. Click "Start"
+        1. First step
+        2. Second step
+        3. Third step
 
-        Expected: Engine starts successfully
-        Actual: Error message appears
+        Expected: What should happen
+        Actual: What happens instead
 
         For features/improvements:
         - What problem does this solve?
@@ -60,9 +55,9 @@ body:
       label: "Technical Notes"
       description: "Implementation details, affected files, environment details, dependencies"
       placeholder: |
-        - Files to modify: src/lib/state.ts
+        - Files to modify: path/to/file
         - Related issues: #123, #456
-        - Environment: macOS 14.5, Loom 0.1.0
+        - Environment: OS and version, tool versions
         - Breaking changes: No
     validations:
       required: false

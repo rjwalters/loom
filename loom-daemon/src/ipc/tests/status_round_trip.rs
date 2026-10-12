@@ -222,6 +222,10 @@ fn test_daemon_status_request_response_round_trip() {
         )]
         .into_iter()
         .collect(),
+        otlp_export: Some(crate::observability::otlp_health::OtlpExportHealth {
+            state: crate::observability::otlp_health::OtlpExportState::Exempt,
+            detail: Some("robb-studio per 2am#3649".to_string()),
+        }),
         forge_events: Some(crate::types::ForgeEventsStatus {
             state: crate::types::ForgeEventsState::Backoff,
             endpoint: Some("https://events.internal".to_string()),

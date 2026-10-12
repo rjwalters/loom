@@ -6,6 +6,8 @@ mod log_paths;
 
 use super::*;
 
+// Issue #8865: per-cause streak and log wording of the dispatch backoff.
+mod backoff_cause;
 pub(super) mod child_env_markers;
 
 // Issue #10348: the dispatched `sweep-lease-renew.sh start` command.
@@ -1219,10 +1221,11 @@ impl SweepRegistry {
         let max_secs =
             i64::try_from(self.dispatch_backoff_config.max.as_secs()).unwrap_or(i64::MAX);
         let consecutive = match self.dispatch_backoff.get(&issue) {
-            Some(prev) if (now - prev.last_failure_at).num_seconds() <= max_secs => {
+            Some(prev) if backoff_cause::continues(prev, cause, now, max_secs) => {
                 prev.consecutive.saturating_add(1)
             }
-            // No prior record, or the streak went cold — start a fresh streak.
+            // No prior record, the streak went cold, or it was the other
+            // cause's streak (#8865) — start a fresh streak.
             _ => 1,
         };
         let delay = backoff_delay(
@@ -1241,11 +1244,7 @@ impl SweepRegistry {
                 cause,
             },
         );
-        log::info!(
-            "sweep_registry: issue #{issue} dispatch backoff armed — {consecutive} consecutive \
-             failed dispatch(es), next attempt allowed in {}s (#4485; cause={cause:?})",
-            delay.as_secs()
-        );
+        backoff_cause::log_armed(issue, consecutive, delay, cause);
         // Issue #7477: broadcast the armed window fleet-wide so a peer host
         // does not immediately re-attempt the same failing candidate this
         // host just backed off on — see `publish_peer_cooldown_claim`'s doc
@@ -1581,6 +1580,7 @@ impl SweepRegistry {
             None,
             None,
             Some(resume_pr),
+            DispatchOrigin::ReaperRetry,
         )
     }
 
@@ -1597,6 +1597,7 @@ impl SweepRegistry {
     /// IPC handler for `DispatchSweep`, `ipc.rs::dispatch_sweep_nonblocking`).
     /// Kept for `dispatch()` / `dispatch_resume_after_crash()` and unit
     /// tests, where lock contention is irrelevant.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn dispatch_inner(
         &mut self,
         kind: &SweepKind,
@@ -1605,6 +1606,7 @@ impl SweepRegistry {
         effort: Option<&str>,
         depends_on: Option<u32>,
         resume_bypass_pr: Option<u32>,
+        origin: DispatchOrigin,
     ) -> Result<DispatchOutcome> {
         match self.begin_issue_dispatch_with_model(
             kind,
@@ -1613,6 +1615,7 @@ impl SweepRegistry {
             effort,
             depends_on,
             resume_bypass_pr,
+            origin,
         )? {
             BeginIssueDispatch::Done(result) => result,
             BeginIssueDispatch::Spawned(mut prepared) => {
@@ -1702,6 +1705,7 @@ impl SweepRegistry {
         depends_on: Option<u32>,
         resume_bypass_pr: Option<u32>,
         prepared_launch: Option<private_dispatch::PreparedLaunch>,
+        dispatch_origin: DispatchOrigin,
     ) -> Result<BeginIssueDispatch> {
         // 1. Idempotency dedup against Running entries.
         if let Some(ref key) = idempotency_key {
@@ -1924,14 +1928,8 @@ impl SweepRegistry {
                 .into());
             }
 
-            if self.guard_closed_or_pr(issue_number) == Some(true) {
-                return Err(anyhow!(
-                    "refusing to dispatch issue #{issue_number}: it is closed on the forge, or \
-                     the number resolves to a pull request rather than an open issue (#4088/#4504 \
-                     closed-issue guard). A watchdog re-dispatch must not re-claim a closed/merged \
-                     issue or a PR number."
-                ));
-            }
+            // #11429: a closed issue is refused as `already_landed`.
+            self.refuse_closed_issue(issue_number)?;
         }
 
         // 2.6 Open-PR guard (Issue #4123). Every in-memory dedup signal — the
@@ -2000,6 +1998,15 @@ impl SweepRegistry {
                      open-PR guard for its own PR #{pr} (#4256)"
                 );
             }
+        }
+
+        // #11429: a `landed` outcome on this host's journal refuses as
+        //     `already_landed`. It runs after 2.6, so an issue whose PR is
+        //     still open gets `OpenPrDispatchError` first, which the
+        //     review-stall watchdog converts to a PrSet dispatch (#7649). A
+        //     crash resume of the issue's own sweep is exempt.
+        if resume_bypass_pr.is_none() {
+            self.refuse_recent_landing(issue_number, Utc::now())?;
         }
 
         // 2.7 Park-label guard (Issue #4444). The work-finder's `SKIP_LABELS`
@@ -2175,12 +2182,8 @@ impl SweepRegistry {
         if resume_bypass_pr.is_none() {
             if let Some(remaining) = self.dispatch_backoff_remaining(issue_number, Utc::now()) {
                 let consecutive = self.dispatch_failure_count(issue_number);
-                log::info!(
-                    "sweep_registry: refusing to dispatch issue #{issue_number} — \
-                     {consecutive} consecutive failed dispatch(es), {}s of backoff remaining \
-                     (#4485)",
-                    remaining.as_secs()
-                );
+                let window = self.dispatch_backoff.get(&issue_number);
+                backoff_cause::log_refused(issue_number, window, remaining);
                 return Err(DispatchBackoffError {
                     issue: issue_number,
                     consecutive,
@@ -2576,6 +2579,7 @@ impl SweepRegistry {
             admission,
             story_points,
             model_source,
+            dispatch_origin,
             mid_spawn: self.roll_gate.enter(),
         })))
     }
@@ -2614,6 +2618,7 @@ impl SweepRegistry {
             mut admission,
             story_points,
             model_source,
+            dispatch_origin,
             mid_spawn: _mid_spawn, // #10974: held until the entry is recorded
         } = prepared;
 
@@ -2843,7 +2848,13 @@ impl SweepRegistry {
         //    #9432: `story_points` is the size estimate resolved at step 2.71
         //    from the labels the park guard already read. #11280: the event
         //    also carries this sweep's start facts (`start_facts.rs`).
-        self.emit_dispatch(&sweep_id, &admission, story_points, Some(model_source));
+        //    #11444: and who asked for it (`dispatch_origin`).
+        self.emit_dispatch(
+            &sweep_id,
+            &admission,
+            story_points,
+            Some((model_source, dispatch_origin)),
+        );
 
         Ok(DispatchOutcome {
             sweep_id,
@@ -3426,6 +3437,7 @@ pub(crate) fn dispatch_model_releasing_poll_lock(
     model: DispatchModel<'_>,
     effort: Option<&str>,
     depends_on: Option<u32>,
+    origin: DispatchOrigin,
 ) -> Result<DispatchOutcome> {
     let prepared_launch = if tokio::runtime::Handle::try_current().is_ok() {
         tokio::task::block_in_place(|| {
@@ -3448,6 +3460,7 @@ pub(crate) fn dispatch_model_releasing_poll_lock(
             depends_on,
             None,
             prepared_launch,
+            origin,
         )
     };
 

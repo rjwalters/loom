@@ -1,30 +1,10 @@
 {
   "version": "2",
-  "offlineMode": false,
   "forge": {
     "type": "auto",
     "gitea": {
       "api_url": null,
       "known_hosts": []
-    }
-  },
-  "runtimes": {
-    "default": "claude"
-  },
-  "safehouse": {
-    "enabled": false,
-    "socket": null,
-    "room": null,
-    "persona": "loom_daemon",
-    "operatorMention": null,
-    "workerPersonas": [],
-    "mcpCommand": "safehouse-mcp",
-    "peerClaimTtlSecs": 120,
-    "chatops": {
-      "enabled": false,
-      "allowedSenders": [],
-      "room": null,
-      "confirmTtlSecs": 120
     }
   },
   "health_monitoring": {

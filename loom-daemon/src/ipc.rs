@@ -5,6 +5,7 @@ use crate::event_bus::EventBus;
 use crate::forge_parser::parse_forge_events;
 use crate::git_parser;
 use crate::git_utils;
+use crate::issue_state_read;
 use crate::main_health_gate::WorkspaceHealthStates;
 use crate::role_validation;
 use crate::sweep_registry::{
@@ -708,6 +709,9 @@ async fn handle_client(
             depends_on,
             workspace_root,
             force,
+            runtime,
+            model_profile,
+            dispatch_origin,
         } = request
         {
             let response = dispatch_sweep_nonblocking(
@@ -721,10 +725,30 @@ async fn handle_client(
                 depends_on,
                 workspace_root,
                 force,
+                runtime,
+                model_profile,
+                // #11444: absent on the wire records `unknown`, never `operator`.
+                crate::sweep_registry::DispatchOrigin::from_request(dispatch_origin),
             )
             .await;
             let response_json = serde_json::to_string(&response)?;
             writer.write_all(response_json.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+            continue;
+        }
+
+        // ReadIssueState (#8876): a blocking `gh` read, kept off the runtime.
+        if let Request::ReadIssueState {
+            workspace_root,
+            repo,
+            issue,
+        } = request
+        {
+            let reply =
+                issue_state_read::daemon::handle_blocking(workspace_root, repo, issue).await;
+            writer
+                .write_all(serde_json::to_string(&Response::IssueState(reply))?.as_bytes())
+                .await?;
             writer.write_all(b"\n").await?;
             continue;
         }
@@ -1577,6 +1601,11 @@ pub fn build_daemon_status_for(
         // a daemon with observability off — the singular field above already
         // distinguishes that state.
         observability_exports: crate::observability::global_export_statuses(),
+        // OTLP-export health (#11353): evaluated from config + live exporter
+        // status, so a daemon with no exporter at all still answers.
+        otlp_export: Some(crate::observability::otlp_health::check_global(
+            &crate::observability::read_config(workspace_root),
+        )),
         // Forge event-feed consumer (ADR-0021, #8765) — same process-global
         // snapshot pattern. Always `Some` from a daemon of this vintage: a
         // consumer that never started reports `disabled`, so "is my cursor
@@ -2822,6 +2851,9 @@ fn handle_request(
             depends_on,
             workspace_root,
             force,
+            runtime,
+            model_profile,
+            dispatch_origin,
         } => {
             // Host-distress circuit breaker (#4235): a *tripped* breaker
             // represents SUSTAINED, already-observed host distress across
@@ -2907,6 +2939,19 @@ fn handle_request(
             // daemon-dispatched child is pinned to an explicit model.
             let repo_root = sr.config().workspace_root.clone();
 
+            // Per-dispatch runtime/modelProfile (#11284): validate (refusing an
+            // unavailable or unadmitted tap, no silent fallback) with no side
+            // effects; the record is saved only after the dispatch is accepted.
+            let tap_plan = match crate::dispatch_tap::validate_request(
+                &repo_root,
+                &kind,
+                runtime.as_deref(),
+                model_profile.as_deref(),
+            ) {
+                Ok(plan) => plan,
+                Err(response) => return *response,
+            };
+
             // Headroom advisory (#4234, Gap 1 of #4231's decomposition): consult
             // the same dynamic concurrency cap the autonomous work finder
             // applies to its own dispatches, and advise — never gate — an
@@ -2941,13 +2986,23 @@ fn handle_request(
                 crate::sweep_registry::DispatchModel::Request(model.as_deref()),
                 effort.as_deref(),
                 depends_on,
+                crate::sweep_registry::DispatchOrigin::from_request(dispatch_origin),
             ) {
-                Ok(outcome) => Response::SweepDispatched {
-                    sweep_id: outcome.sweep_id,
-                    pid: outcome.pid,
-                    token_name: outcome.token_name,
-                    log_path: outcome.log_path,
-                },
+                Ok(outcome) => {
+                    // Accepted and spawned. An idempotency hit is the
+                    // in-flight sweep itself: leave its record alone.
+                    if outcome.was_new {
+                        if let Err(response) = tap_plan.commit(&repo_root) {
+                            return *response;
+                        }
+                    }
+                    Response::SweepDispatched {
+                        sweep_id: outcome.sweep_id,
+                        pid: outcome.pid,
+                        token_name: outcome.token_name,
+                        log_path: outcome.log_path,
+                    }
+                }
                 Err(e) => match e.downcast::<crate::runtime_admission::RuntimeRejection>() {
                     Ok(rejection) => Response::RuntimeRejected(rejection),
                     Err(e) => {
@@ -3343,6 +3398,9 @@ fn handle_request(
                 .count();
             build_restart_decision(in_flight).0
         }
+        Request::ReadIssueState { .. } => Response::Error {
+            message: "internal: ReadIssueState is handled by handle_client".to_string(),
+        },
         Request::DrainAndRestartDaemon { .. } | Request::AbortDrain => {
             // Structurally unreachable: `handle_client` intercepts both drain
             // requests (#4090) before dispatching here, because a drain must ack

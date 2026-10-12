@@ -389,12 +389,20 @@ fn cmd_render(
             (false, _) => println!("{}: in sync — {}", t.tier.name(), t.path.display()),
             (true, backup) => {
                 wrote = true;
+                loom_daemon::config_journal::append_rendered(
+                    t.tier.name(),
+                    &t.path,
+                    backup.as_deref(),
+                    Some(&loaded.snapshot.manifest.commit),
+                    &restart_required,
+                );
                 let b = backup.map_or_else(String::new, |b| format!(" (backup: {})", b.display()));
                 println!("{}: wrote {}{b}", t.tier.name(), t.path.display());
             }
         }
     }
     if wrote {
+        loom_daemon::config_journal::record_resolved(&ctx.workspace);
         super::fleet_config_reload::report(&ctx.workspace, &live, &restart_required);
     }
     Ok(0)

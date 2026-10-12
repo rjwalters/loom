@@ -3,13 +3,11 @@
 //!
 //! Split out of `work_finder.rs` (Issue #9034) for the same file-size-ratchet
 //! reason as [`super::repo_cap`] / [`super::configured_max`]: `work_finder.rs`
-//! is frozen at its current size (`.loom/docs/file-size-policy.md`), and this
-//! issue's `hostClass` / `allowHeavyLocal` fields needed room to land. Pure
-//! move plus two new fields — no other behavior change.
+//! is frozen at its current size (`.loom/docs/file-size-policy.md`).
 
 use std::path::Path;
 
-use super::{host_class, repo_cap};
+use super::repo_cap;
 
 /// The subset of `.loom/config.json → autonomous.workFinder` this module
 /// consumes. Each field is `Option` so an absent key falls through to the
@@ -42,15 +40,6 @@ pub struct WorkFinderConfig {
     /// distinct from `Some(vec![])`, which an explicit `[]` in config would
     /// produce, though both resolve to the same empty-list default behavior.
     pub extra_skip_labels: Option<Vec<String>>,
-    /// `autonomous.workFinder.hostClass` — this host's declared class (Issue
-    /// #9034): `"local-dev"` | `"remote-worker"`; any other value, or the key
-    /// absent, is `None` here (unclassified). See [`host_class`].
-    pub host_class: Option<host_class::HostClass>,
-    /// `autonomous.workFinder.allowHeavyLocal` — an operator override (Issue
-    /// #9034) that suppresses the `host_class`/`loom:heavy` gate for this
-    /// workspace's autonomous loop. `None` when the key is absent (falls
-    /// through to the env var, then to `false`). See [`host_class`].
-    pub allow_heavy_local: Option<bool>,
     /// Names of **retired** config keys found in `autonomous` — currently
     /// `cpuUtilizationTarget` / `estCoresPerSweep` ([`DEPRECATED_CPU_CONFIG_KEYS`]),
     /// whose CPU-headroom admission term #4512 deleted.
@@ -137,8 +126,6 @@ pub fn parse_effective(effective: &serde_json::Value) -> WorkFinderConfig {
                     .collect()
             })
         }),
-        host_class: host_class::parse_config(wf),
-        allow_heavy_local: host_class::parse_config_allow_heavy_local(wf),
         deprecated_cpu_keys,
     }
 }
@@ -253,7 +240,3 @@ pub fn warn_deprecated_cpu_knobs(config: &WorkFinderConfig) {
         log::warn!("work_finder: {notice}");
     });
 }
-
-#[cfg(test)]
-#[path = "config_tests.rs"]
-mod tests;

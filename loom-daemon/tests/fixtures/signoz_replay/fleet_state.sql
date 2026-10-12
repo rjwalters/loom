@@ -40,7 +40,7 @@ CREATE TABLE signoz_logs.distributed_logs_v2
 (
     timestamp          UInt64,
     observed_timestamp UInt64,
-    created_at         DateTime64(9),
+    inserted_at_unix_milli Int64,
     body               String,
     attributes_string  Map(LowCardinality(String), String),
     attributes_number  Map(LowCardinality(String), Float64),
@@ -49,9 +49,9 @@ CREATE TABLE signoz_logs.distributed_logs_v2
 ) ENGINE = Memory;
 
 INSERT INTO signoz_logs.distributed_logs_v2
-    (timestamp, observed_timestamp, created_at, body,
+    (timestamp, observed_timestamp, inserted_at_unix_milli, body,
      attributes_string, attributes_number, attributes_bool, resources_string)
-SELECT 0, 0, toDateTime64(c, 9), b,
+SELECT 0, 0, toUnixTimestamp64Milli(toDateTime64(c, 3)), b,
        map('loom.kind', k, 'loom.record_id', id), m, map(), map('host.name', h)
 FROM values('h String, id String, k String, c String, m Map(String, Float64), b String',
     -- h-readd

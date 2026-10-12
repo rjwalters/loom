@@ -199,6 +199,7 @@ fn request_fallback_and_native_first_ignore_claude_experiment() {
                 DispatchModel::Request(None),
                 None,
                 None,
+                crate::sweep_registry::DispatchOrigin::Unknown,
             )
             .unwrap();
         let options = captured_options(&record, "opencode");
@@ -284,6 +285,7 @@ fn native_launch_keeps_config_and_explicit_pins_including_invalid_ones() {
                 DispatchModel::Request(explicit),
                 None,
                 None,
+                crate::sweep_registry::DispatchOrigin::Unknown,
             )
             .unwrap();
         let options = captured_options(&record, "opencode");
@@ -322,6 +324,7 @@ fn refused_preferences_and_explicit_runtime_never_claim_or_spawn() {
             DispatchModel::Request(None),
             None,
             None,
+            crate::sweep_registry::DispatchOrigin::Unknown,
         );
         // A pinned Claude runtime keeps the legacy static-admission behavior,
         // even with no pool; it must not silently fall through to OpenCode.

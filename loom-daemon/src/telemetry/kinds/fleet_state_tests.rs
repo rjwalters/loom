@@ -71,6 +71,7 @@ fn record() -> FleetStateRecord {
             repo: "rjwalters/loom".to_string(),
             visibility: RepoVisibility::Public,
             main_ci: None,
+            halt: None,
             ready_complete: true,
             ready_replace: false,
             census: Some(FleetPrCensus {
@@ -93,6 +94,7 @@ fn anchor_with(n: u32) -> FleetStateRecord {
             repo: (*repo).to_string(),
             visibility: RepoVisibility::Private,
             main_ci: None,
+            halt: None,
             ready_complete: true,
             ready_replace: false,
             census: Some(FleetPrCensus::default()),
@@ -251,6 +253,8 @@ fn stage_wire_names_are_the_contract_names() {
         (FleetStage::Doctor, "doctor"),
         (FleetStage::MergeWait, "merge_wait"),
         (FleetStage::MergeHold, "merge_hold"),
+        (FleetStage::TriageWait, "triage_wait"),
+        (FleetStage::ApprovalWait, "approval_wait"),
     ] {
         assert_eq!(stage.as_str(), name);
         assert_eq!(serde_json::to_value(stage).unwrap(), name);
@@ -348,6 +352,7 @@ fn removals_and_census_only_repos_survive_a_split() {
             repo: "acme/a".to_string(),
             visibility: RepoVisibility::Private,
             main_ci: None,
+            halt: None,
             ready_complete: true,
             ready_replace: false,
             census: None,
@@ -358,6 +363,7 @@ fn removals_and_census_only_repos_survive_a_split() {
             repo: "acme/b".to_string(),
             visibility: RepoVisibility::Private,
             main_ci: None,
+            halt: None,
             ready_complete: true,
             ready_replace: false,
             census: Some(FleetPrCensus::default()),
@@ -398,6 +404,7 @@ fn ready_replace_is_additive_and_rides_every_chunk() {
         repo: "acme/a".to_string(),
         visibility: RepoVisibility::Private,
         main_ci: None,
+        halt: None,
         ready_complete: false,
         ready_replace: true,
         census: None,

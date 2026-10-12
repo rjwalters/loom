@@ -18,6 +18,10 @@
 //! 2. [`order_in_workspace`] / [`next_in_workspace`] pick the issue inside
 //!    the workspace: level, then oldest `createdAt`, then issue number.
 //!
+//! `loom:very-important` is capped per workspace ([`VERY_IMPORTANT_CAP`],
+//! #11509): [`very_important_holders`] names the oldest open one, which keeps
+//! the level; every other open one ranks as `loom:important`.
+//!
 //! There is no inheritance, no starred-at time, no red-main key and no
 //! cross-workspace round-robin here. The module is pure: the RNG is a
 //! seedable [`PickRng`], so a fixed seed reproduces an exact pick sequence,
@@ -29,14 +33,20 @@ use serde::Serialize;
 
 /// The "important" label.
 pub const IMPORTANT_LABEL: &str = "loom:important";
-/// The "very important" label (capped; see `daemon-reference.md`).
+/// The "very important" label (capped: [`VERY_IMPORTANT_CAP`]).
 pub const VERY_IMPORTANT_LABEL: &str = "loom:very-important";
 
+/// How many open `loom:very-important` issues one workspace holds at a time
+/// (#11509, operator ruling C on #11278). Every further one ranks as
+/// `loom:important`. A constant on purpose, not a config knob.
+pub const VERY_IMPORTANT_CAP: usize = 1;
+
 /// An issue's priority level. Declaration order is ascending importance.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Level {
     /// No priority label.
+    #[default]
     Default,
     /// `loom:important`.
     Important,
@@ -99,6 +109,36 @@ pub fn order_in_workspace(mut items: Vec<IssueKey>) -> Vec<IssueKey> {
 #[must_use]
 pub fn next_in_workspace(items: &[IssueKey]) -> Option<&IssueKey> {
     items.iter().min_by(|a, b| issue_cmp(a, b))
+}
+
+/// The open `loom:very-important` issues of one workspace that keep the
+/// level: the [`VERY_IMPORTANT_CAP`] oldest, by `createdAt` (a dated issue
+/// before an undated one) then issue number. `open` is every open
+/// very-important issue of the workspace, in any state; its `level` fields
+/// are ignored and a number listed twice counts once. Nothing about who
+/// applied the label is an input, so the cap is the same for every actor.
+#[must_use]
+pub fn very_important_holders(open: &[IssueKey]) -> Vec<u32> {
+    let mut by_number: std::collections::BTreeMap<u32, IssueKey> =
+        std::collections::BTreeMap::new();
+    for k in open {
+        let entry = by_number.entry(k.number).or_insert_with(|| k.clone());
+        if entry.created_at.is_none() {
+            entry.created_at.clone_from(&k.created_at);
+        }
+    }
+    let mut keys: Vec<IssueKey> = by_number
+        .into_values()
+        .map(|k| IssueKey {
+            level: Level::VeryImportant,
+            ..k
+        })
+        .collect();
+    keys.sort_by(issue_cmp);
+    keys.into_iter()
+        .take(VERY_IMPORTANT_CAP)
+        .map(|k| k.number)
+        .collect()
 }
 
 /// Draw weight of a workspace from its `fleet_priority` (lower number =

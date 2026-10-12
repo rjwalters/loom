@@ -65,6 +65,10 @@ pub fn spawn(
         Instant::now(),
         workspace_pool,
     );
+    // OTLP-export health (#11353): evaluate once at start so a host with no
+    // OTLP exporter logs its single WARN immediately, even when no collector
+    // runs to re-check it; later changes WARN from the collector tick / status.
+    let _ = observability::otlp_health::check_global(&observability_config);
 
     // Forge event-feed consumer (ADR-0021, epic #8764 Phase 1 — #8765). Off
     // by default. Observe-only in this phase: it publishes one `forge.event`
