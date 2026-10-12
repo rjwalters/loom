@@ -13100,7 +13100,11 @@ with the floor and the installed version:
 
 On a warning a run with a terminal on stdin asks `Continue? [y/N]`, and only a
 typed `y` continues. A run without one **refuses** with exit 1 and names the
-override, and never reads stdin. `--yes` or `LOOM_DAEMON_UPDATE_YES=1`
+override, and never reads stdin. A manual run is checked **before** the source
+checkout is fetched or fast-forwarded (#11064), so "Nothing was changed" is
+literal. A source build's target is then the checkout's current `VERSION`; if
+the fast-forward moves it off the floor, the post-sync check refuses with "the
+installed daemon was not changed, but the source checkout was fast-forwarded". `--yes` or `LOOM_DAEMON_UPDATE_YES=1`
 continues without asking. `--dry-run` prints the warning and never asks.
 `--check` and `--resolve-json` are unchanged.
 
@@ -13134,7 +13138,10 @@ Continue? [y/N]
   `--fetch --tag`) to bring a lagging host up to the fleet, for example a
   fleet-paused host held by an operator stop. A host already at or above the
   floor installs nothing (exit 0); it never moves a host down. A host with no
-  fleet store, or whose floor is unknown, is refused (exit 1).
+  fleet store, or whose floor is unknown, is refused (exit 1). So is a host
+  whose installed daemon exists but reports no readable `--version` (#11064):
+  it may be above the floor. A host with no installed daemon installs the
+  floor (bootstrap). Both are decided before any fetch or checkout sync.
 
 **One-shot drain roll (Issue #5138).** Before this, a drained roll needed the
 documented two-step dance — `loom-daemon-update.sh --no-restart` followed by a

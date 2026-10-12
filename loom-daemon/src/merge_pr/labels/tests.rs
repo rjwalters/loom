@@ -183,3 +183,26 @@ fn the_clean_sentinel_matches_the_string_merge_pr_sh_checks_for() {
         "merge-pr.sh must test for {sentinel:?}; if the constant moved, move it there too"
     );
 }
+
+#[test]
+fn a_sequencing_hold_alone_is_the_retryable_kind() {
+    // #11330: the ordering hold is re-queued (exit 7), never a failure.
+    assert!(sequenced_hold_only("loom:pr\nloom:sequenced"));
+    assert!(sequenced_hold_only("loom:sequenced\nloom:operator-priority\nloom:pr"));
+    // Nothing to hold without an approval, and nothing sequenced to hold on.
+    assert!(!sequenced_hold_only("loom:sequenced"));
+    assert!(!sequenced_hold_only("loom:pr"));
+    assert!(!sequenced_hold_only("loom:pr\nloom:changes-requested"));
+    // A second blocker keeps the hard refusal: the PR stays blocked after the
+    // predecessor lands, so re-queueing would loop.
+    for b in BLOCKING.iter().filter(|b| **b != SEQUENCED) {
+        let labels = format!("loom:pr\nloom:sequenced\n{b}");
+        assert!(!sequenced_hold_only(&labels), "{b} beside loom:sequenced must stay exit 1");
+    }
+}
+
+#[test]
+fn the_sequencing_hold_line_is_stable() {
+    assert_eq!(sequenced_hold_line("112", Some(111)), "LOOM-SEQUENCED-HOLD pr=112 after=111");
+    assert_eq!(sequenced_hold_line("112", None), "LOOM-SEQUENCED-HOLD pr=112 after=unknown");
+}

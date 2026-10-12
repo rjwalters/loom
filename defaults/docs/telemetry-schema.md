@@ -213,6 +213,7 @@ cycle) is added only when loom-ui's error tracking shows it is needed.
 | [`loom.dispatch.disposition`](#loomdispatchdisposition-issue-9222-per-issue-why-is-it-waiting) rows (`loom.queue.*` attributes) and `loom.queue.disposition_rows_dropped` | span + metric, OTLP only | `observability/ops/disposition.rs` |
 | [`host.health`](#hosthealth) | gauges, native + OTLP | `observability/collector.rs` (+ `exporter.rs`, `sender.rs`) |
 | [`host.export`](#hostexport) | log, OTLP only | `observability/collector.rs` |
+| [`operator.presence`](#operatorpresence) | local journal only until #11525 | `loom-daemon presence beat` (opt-in operator hook) |
 | [`checkout.external_change`](#checkoutexternal_change) | log, OTLP only | `fleet_sync/checkout_ff/external_change.rs` |
 | Captain gauges: `loom.captain.gauge_age_seconds`, `loom.captain.gauge_fallback`, `loom.forge.stage_dwell`, `loom.forge.stage_items` ([`metric.points`](#metricpoints)) | metric | `observability/captain_gauges.rs`, `observability/ops/stage_dwell.rs` |
 | [`eta.stage_outcome`](#etastage_outcome) (kept, non-ETA owner since #11126) | log, OTLP only | `observability/fleet_state/outcomes.rs` (diff of two `fleet.state` views) |
@@ -1575,6 +1576,18 @@ On the OTLP path this maps to a log record (severity `Info`) with
 `loom.topic` and `loom.payload` (the payload carried whole as one
 compact-JSON string, since its shape varies per topic) attributes.
 
+**`daemon.start` (#11197)** — the one topic in this kind that is not a
+mirrored bus event. Exactly one record per daemon process, enqueued by
+`observability::spawn_task` when the exporters come up (never when telemetry
+is disabled), so a fleet-gitops roll is visible in the backend the moment a
+host's daemon restarts onto new config. Its payload is
+`{"version", "revision", "tree_state", "supervisor", "config_sha", "pid"}` —
+the exporting build (`provenance::daemon()`), the process supervisor
+(`launchd`/`systemd`, else `none`), the applied fleet-config SHA (the same
+value the resource's `loom.fleet.config_sha` carries), and the pid.
+`daemon.shutdown` and a heartbeat stay with #10023/#10065; the naming here
+matches that draft so the later of the two is a deletion, not a conflict.
+
 ### `ci.run` / `ci.job` / `ci.duration`
 
 GitHub Actions telemetry from the `loom-daemon ci-telemetry` poller (#8824).
@@ -2659,7 +2672,28 @@ Each row:
 | `eligible_reason` | string, optional | `ready_wait` only (#11564): the clock the work finder held the item back on at its last tick, one of `recheck_interval`, `dispatch_backoff`, `open_pr_backoff`, `noop_cooldown`, `declined`, `prless_retry`, `build_backoff`. Present on every such row, dated or not. Absent = no clock holds it. Additive on `fleet-state/v1` |
 | `eligible_at` | RFC 3339, optional | `ready_wait` only (#11564): when that clock ends, the absolute expiry the work finder computed (the same instant as `queue.snapshot` `rows[].held_until`). Absent for `build_backoff` (no clock) and when this host cannot date the window. Additive on `fleet-state/v1` |
 
-#### Repo halts and eligible-at
+#### Champion dispatch metadata (`fleet.state.repos[].champion`)
+
+Additive on `fleet-state/v1`; missing means an older emitter, not human approval.
+`approval` and `merge` are explicitly null (unknown): Champion authority is
+prompt-defined, and no effective auto/human policy configuration exists to read.
+Scheduling, role absence and elapsed approval waits never imply human authority.
+`prompt_source` is the actual runner command (`/loom:champion`); `prompt_hash`
+is SHA-256 of the installed command and promotion/merge companions, or null
+when any file is unavailable. A custom prompt changes provenance without
+inventing a policy classification.
+
+`interval_enabled` uses the runner's effective enabled/roles resolvers;
+`cadence_secs` and `cadence_source` use its actual interval resolver (env,
+effective_config, built_in), even when interval dispatch is disabled. Idle/manual
+runs remain possible. `last_attempt_at` and `last_attempt_ok` reflect the latest
+process-local recorded Champion attempt for this exact root, including failed
+and pre-spawn skipped ticks. They are not last completed evaluations or last
+successful runs. Both are null when unobserved or after process restart.
+Metadata changes trigger deltas without row changes; chunking retains metadata
+and OTLP carries it in the existing serialized repo attribute/body.
+
+### Repo halts and eligible-at
 
 Facts for an ETA reader (#11564): a wait in a halted repo, or behind a
 backoff, cannot be modelled without **that** it is held, **why** and **since
@@ -3185,6 +3219,65 @@ additive (serde-defaulted), so records from before #11527 still parse and no
 [`defaults/observability/signoz/host-export-queries.sql`](https://github.com/rjwalters/loom/blob/main/defaults/observability/signoz/host-export-queries.sql):
 hosts with drops, or with no `host.export` at all, in the last 2 h. Query 3 compares a rendered `hosts.yml` roster against `host.export` to find silent hosts by absence (#11198).
 
+### `operator.presence`
+
+Whether a person is at the keyboard of an operator session (Issue #11563).
+ETA could not tell operator-driven work that stalls (the operator stepped away)
+from work that is merely slow, and in-session `/loom:sweep` runs on
+workstations with no daemon emitted nothing. Envelopes carry
+`schema_version: 12`. **Not exported yet** (`otlp: NotExported`; `native: true` only because
+the registry requires a carrier, as for `queue.snapshot`): it goes to a local journal until the transport of #11525 exists, then
+the registry row flips to `otlp: Logs` with a mapping sibling. The
+`loom.presence.*` attribute names (`session_id`, `operator`, `last_input_at`,
+`last_activity_at`, `driving_count`) are reserved for that mapping.
+
+**No prompt or transcript content, by construction.** The record has no text
+field beyond ids and a forge login, and the producer reads only `session_id`
+and `hook_event_name` from the hook payload. A test asserts a distinctive
+prompt string appears in neither the journal nor the state file.
+
+| Field | Type | Notes |
+|---|---|---|
+| `captured_at` | RFC3339 | the beat time; the record time |
+| `host` | string | the session's host |
+| `session_id` | string | opaque Claude Code session id |
+| `operator` | string? | forge login (`--operator` / `LOOM_OPERATOR`); omitted when unknown |
+| `last_input_at` | RFC3339? | last `UserPromptSubmit` (a human typed); omitted when none seen |
+| `last_activity_at` | RFC3339 | last tool call or Stop |
+| `driving[]` | array | issues/PRs this session holds an in-session lease on: `kind` (`issue`/`pr`), `number`, `sweep_id` |
+
+**Producer.** `loom-daemon presence beat`, called by the opt-in hook
+`presence-beat.sh` on `UserPromptSubmit`, `PostToolUse` and `Stop`. A prompt
+always emits; other events emit at most once per 5 minutes. The hook is wired
+only when the operator provisions with `LOOM_OPERATOR_PRESENCE=1`
+(`scripts/install/provision-hooks.sh`); it is absent by default.
+
+**In-session sweeps.** `loom-daemon presence sweep-start` / `sweep-outcome`
+journal `sweep.started` / `sweep.outcome` with `loom.dispatch_origin=operator`
+and the `sweep_id` that appears in the in-session lease comment. With
+`LOOM_OPERATOR_PRESENCE=1`, `lease ensure` calls `sweep-start` itself once the
+lease is publishing, and the sweep's own end emits `sweep.outcome` with no
+extra step: `sweep-checkpoint.sh delete` (the merge's terminal step, or an
+issue found closed) reports `success` with the checkpoint's PR; the renewal
+loop stopping on a closed issue reports `success`; `sweep-lease-renew.sh
+release` while the sweep is still driven reports `failure` (it ended without
+landing). Only a lease this host journaled `sweep.started` for is finished,
+once: the first end signal wins and later ones are no-ops, so a
+daemon-dispatched sweep never gets one. `sweep-outcome` stays available as an
+explicit call.
+
+**Transport and journal.** Until the transport of #11525 exists, every fact is
+appended to `.loom/logs/operator-presence.jsonl` (override
+`LOOM_OPERATOR_PRESENCE_JOURNAL_PATH`) as one `TelemetryEnvelope` line. The
+journal never rotates and never drops: `loom-daemon presence export` stages it,
+hands the whole batch to the transport, and deletes staged files only after the
+transport accepted them. With no transport it reports the pending count and
+leaves everything in place; unparseable lines go to `<journal>.rejected`.
+The hook path is fail-open and discards output, so a failed journal or state
+write is appended (one `<timestamp>\t<error>` line) to the breadcrumb file
+beside the journal, `.loom/logs/operator-presence.errors`;
+`loom-daemon presence status` prints its count and last line.
+
 ### `checkout.external_change`
 
 A managed checkout's history was moved by something that was not Loom (Issue
@@ -3244,6 +3337,38 @@ invoked by a person *through Loom's own tagged environment* (a shell inheriting
 `GIT_REFLOG_ACTION=loom:...`) is indistinguishable from Loom. The `rebase`
 entries other than start/finish/abort are ignored, so one rebase is one or two
 records, not one per picked commit.
+
+
+### `issue.estimate` — completed curation's blind pre-build estimate
+
+One OTLP log per completed curation, produced by `loom-daemon curation-complete`
+for both attended Curators and daemon-mediated role sessions. The command
+fetches the current issue body's standalone `loom:estimate` marker and durably
+journals the envelope before the role applies `loom:curated`. No historical
+backfill or inference from Builder outcomes is performed.
+
+The JSON body contains `repo` (owner/repo), `issue`, `difficulty` (integer 1–5),
+`lines` and `files` (nonnegative integers), `doctor_risk` (finite [0,1]), actual
+Curator `model` and `runtime` (null when unknown, never inferred), `estimated_at` (UTC completion time),
+`completion_id` (UUID), and standard `loom` build provenance. `loom.repo`,
+`loom.issue`, `loom.model`, `loom.runtime` and `loom.fact_id` are log attributes.
+Both OTLP source and observed timestamps are the saved completion time: an ETA
+consumer may use the estimate only at or after `estimated_at`.
+
+`loom.fact_id` keys on repo, issue and completion UUID. A transport retry reuses
+the original envelope and time; a genuine re-curation generates a new UUID and
+time even if its numeric fields do not change. Readers dedupe by fact id and
+select the latest estimate known at their as-of instant. Files under the main
+workspace's `.loom/logs/issue-estimates/` are the local queue of record; normal
+observability backfill offers each to the configured durable export queue.
+
+Difficulty estimates expected work. The retained `loom:complexity` marker
+independently measures the cost of an unnoticed error and keeps its existing
+routing definition; there is no mapping between them. Estimates never alter
+curation decisions. Missing historical estimates stay absent. Markdown examples
+in backticks or code fences, duplicates, invalid counts and nonfinite/out-of-range
+risk are rejected or excluded before export.
+
 
 ## Persistence & read surface (`sweep.outcome`, Issue #4704)
 

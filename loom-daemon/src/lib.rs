@@ -296,6 +296,7 @@ pub mod pr_latency;
 pub mod pr_planning;
 pub mod preflight;
 pub mod premise_check;
+pub mod presence;
 pub mod primary_checkout_reaper;
 pub mod priority_pick;
 pub mod private_control_gate;

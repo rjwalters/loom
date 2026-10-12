@@ -72,6 +72,7 @@ fn ready(repo: &str, issue: u32, rank: u32) -> ReadyItem {
 
 fn input() -> FleetInput {
     FleetInput {
+        champion: BTreeMap::new(),
         host_id: "robb-studio".to_string(),
         managed: [REPO, OTHER].iter().map(|s| (*s).to_string()).collect(),
         held: vec![held(REPO, 10, FleetStage::SweepBuilder, false)],
@@ -1077,4 +1078,35 @@ async fn a_finished_tick_wakes_the_tick_pass() {
     tokio::time::timeout(std::time::Duration::from_secs(1), super::ticked().notified())
         .await
         .expect("the tick left a wake-up");
+}
+
+#[test]
+fn champion_metadata_alone_triggers_delta_and_old_payload_remains_unknown() {
+    use crate::telemetry::kinds::fleet_state::ChampionState;
+    let original = build_view(&input(), None, t0());
+    let last = emitted(original.clone(), t0(), t0());
+    let mut changed = original;
+    let state = ChampionState {
+        approval: None,
+        merge: None,
+        prompt_source: "/loom:champion".into(),
+        prompt_hash: None,
+        interval_enabled: false,
+        cadence_secs: 600,
+        cadence_source: "built_in".into(),
+        last_attempt_at: Some(t0()),
+        last_attempt_ok: Some(false),
+    };
+    changed.repos.get_mut(REPO).unwrap().champion = Some(state.clone());
+    let delta = decide(&changed, &stamps(), Some(&last), t0() + Duration::seconds(1)).unwrap();
+    assert!(!delta.anchor);
+    assert_eq!(entry(&delta, REPO).champion, Some(state));
+    let mut old = serde_json::to_value(entry(&delta, REPO)).unwrap();
+    old.as_object_mut().unwrap().remove("champion");
+    assert_eq!(
+        serde_json::from_value::<FleetStateRepo>(old)
+            .unwrap()
+            .champion,
+        None
+    );
 }

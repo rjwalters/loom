@@ -77,6 +77,7 @@ mod tests {
             slots: None,
             capacity: None,
             repos: vec![FleetStateRepo {
+                champion: None,
                 repo: "rjwalters/loom".to_string(),
                 visibility: RepoVisibility::Public,
                 main_ci: None,

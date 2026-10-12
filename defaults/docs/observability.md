@@ -190,6 +190,8 @@ resource per emitting host with exactly these attributes:
 | `host.id` | the envelope's `host_id` |
 | `host.name` | the envelope's `host_id` (#10977) |
 | `service.version` | the reporting daemon's version (a `host.health` record's `daemon_version`, else the exporting build's) |
+| `loom.daemon.revision` | the exporting build's full git SHA (`unknown` for a tarball build) — the same value every span carries (#11197) |
+| `loom.fleet.config_sha` | the fleet-gitops commit whose rendered config tiers are **on disk on this host right now**: a 40-hex SHA, `unknown` (a fleet host where no applied commit is established yet, e.g. during a startup-pass timeout), or `none` (no fleet store, `fleet.repo` unset). Never empty, never omitted (#11197) |
 
 `host.name` has one source, the same string as `host.id`: the daemon's host
 identity, which is the operator-assigned `$LOOM_HOST_ID` when it is set and
@@ -198,6 +200,31 @@ otherwise the OS hostname (`$HOSTNAME`, then the `hostname` binary). Set
 you chose (a cloud instance's is derived from its address). The daemon sets
 `host.name` itself, so a receiver reached without a collector gets it too; the
 bundled collector's resource allowlist forwards it unchanged.
+
+**Fleet-roll visibility (#11197).** The two provenance keys are read at export
+time — the resource is rebuilt for every batch, never memoized — so a
+fleet-sync pass that applies a new commit shows up on the next batch with no
+restart. Two caveats: "applied" means *on disk*, not *live in this process*
+(restart-only keys take effect on the next start), and a record queued before a
+roll and exported after it carries the **new** SHA, describing the exporting
+daemon rather than the moment the record was made (the same accepted behaviour
+as the `service.version` fallback). Which hosts are on which store commit:
+
+```sql
+SELECT DISTINCT
+  resources_string['host.id']               AS host_id,
+  resources_string['loom.fleet.config_sha'] AS config_sha
+FROM signoz_logs.distributed_logs_v2
+WHERE resources_string['loom.fleet.config_sha'] != ''
+  AND timestamp >= toUnixTimestamp64Nano(now64() - INTERVAL 24 HOUR)
+```
+
+A roster host stuck on `unknown`, or showing `none`, is the roll's laggard —
+query `= 'unknown'` / `= 'none'` directly; the empty-count check holds by
+construction because the attribute is never absent or empty. One
+`daemon.start` log record (topic `daemon.start`, see
+[telemetry-schema.md](telemetry-schema.md) §`daemon.event`) marks each
+process's exporter coming up.
 
 ### Multi-exporter fan-out (#8756)
 
@@ -501,6 +528,17 @@ condition is a first-class health check with four states, shown on the
 Precedence is `exempt`, `no_exporter`, `failing`, `ok`. A line is logged at
 daemon start and on each change of state, never per tick: WARN for `no_exporter`
 and `failing`, INFO for recovery to `ok` and entry into `exempt`.
+
+Since #11557 an attention state carries `since` (when the host first became
+`failing` / `no_exporter`; cleared on `ok` / `exempt`, kept across failure-detail
+changes, in memory so "since start" after a restart) and reads
+`otlp: failing since <T> (<reason>)` on the `status` line, in the WARN, and in
+`host.health`'s `otlp_export`. A `failing` reason includes the exporter's last
+failure (e.g. `OTLP HTTP 403 (credential refused …)`); a `misconfigured` OTLP
+entry counts as `no_exporter`. A degraded start — no OTLP entry starts and the
+host is not exempt — logs one ERROR line, `observability: DEGRADED — this
+daemon's facts are not reaching SigNoz: <detail>`, and the daemon still starts
+(`otlp_health::startup_verdict`; the start policy itself is #11526).
 
 ```json
 { "observability": {
@@ -1014,6 +1052,7 @@ hash of it, and it is never logged or forwarded.
 |---|---|
 | `service.name` | the harness — `claude-code` |
 | `service.instance.id`, `host.id`, `host.name` (whatever host attributes the daemon's own telemetry carries) | this daemon's host identity |
+| `loom.daemon.revision`, `loom.fleet.config_sha` | the relaying build's revision and the host's applied fleet-config SHA (#11197), with the daemon's value — sender-supplied copies are scrubbed with every other `loom.*` key |
 | `loom.runtime`, `loom.session.kind` (`sweep`/`role`), `loom.session.launch` (`daemon`) | from the launch |
 | `loom.repo` | the workspace's forge `owner/name`; absent until resolved, never a directory name |
 | `loom.issue`, `loom.role`, `loom.sweep_id` | the issue, role and sweep (or role-tick execution) id the session was launched for, when it has one |
