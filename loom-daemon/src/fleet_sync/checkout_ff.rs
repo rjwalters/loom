@@ -125,13 +125,8 @@
 //!
 //! # What it never does
 //!
-//! The only git write is the `merge --ff-only` of row 10 ([`git`]). A
-//! checkout that is not clean and strictly behind is left exactly as it is
-//! and reported. This is stricter than the main-health gate's own sync
-//! (`main_health_gate::prepare_workspace_to_origin_main`), which resets and
-//! may therefore ignore some dirt: this step discards nothing, so any tracked
-//! change is `dirty`. The gate's sync is unchanged; after a fast-forward its
-//! reset is a no-op.
+//! The only ordinary write is row 10's `merge --ff-only` ([`git`]). Anything
+//! else blocking it is reported, unless [`self_heal`] clears it (#11425).
 //!
 //! # The Loom source checkout
 //!
@@ -165,6 +160,7 @@
 
 mod git;
 mod host;
+mod self_heal;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -355,7 +351,7 @@ impl CheckoutPass {
     pub fn fast_forwarded(&self) -> Vec<PathBuf> {
         self.transitions
             .iter()
-            .filter(|t| t.report.state == CheckoutState::FastForwarded)
+            .filter(|t| t.kind == "fast-forwarded")
             .map(|t| t.report.root.clone())
             .collect()
     }
@@ -431,6 +427,7 @@ pub struct Memory {
     /// Where the next pass starts, so a pass that ran out of time does not
     /// starve the workspaces at the end of the list.
     cursor: usize,
+    escalated: self_heal::Ledger,
 }
 
 impl Memory {
@@ -639,6 +636,7 @@ struct Net {
     misses: u32,
     /// The rate-limit breaker was found open: nothing more is asked.
     breaker_open: bool,
+    repairs: Vec<self_heal::Repair>,
 }
 
 /// Run one checkout pass over `roots`. Never fails: every failure is a state.
@@ -653,7 +651,8 @@ pub fn run(env: &Env<'_>, roots: &[PathBuf], memory: &mut Memory) -> CheckoutPas
             break;
         }
         let found = attempt(env, root, &mut net);
-        memory.record(root, found, (env.clock)(), &mut pass.transitions);
+        let report = memory.record(root, found, (env.clock)(), &mut pass.transitions);
+        self_heal::after(env, memory, &mut net, &report, &mut pass.transitions);
         reached += 1;
     }
     pass.deferred = roots.len() - reached;
@@ -754,6 +753,7 @@ fn attempt(env: &Env<'_>, root: &Path, net: &mut Net) -> Decided {
         return found.end(S::NoDefaultBranch, why.to_string());
     };
     found.branch = Some(branch.clone());
+    self_heal::heal(env, root, &branch, net);
     found.head = git::head(root, local());
 
     // 2. HEAD is on it.

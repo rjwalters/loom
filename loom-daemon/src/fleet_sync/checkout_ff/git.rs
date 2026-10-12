@@ -46,13 +46,18 @@ pub(super) enum Refusal {
     Other(String),
 }
 
-fn tracking(branch: &str) -> String {
+pub(super) fn tracking(branch: &str) -> String {
     format!("refs/remotes/origin/{branch}")
 }
 
 /// Run `git` in `root` to an exit. `config` is `-c` pairs placed before the
 /// subcommand. `Err` when it could not be run or outlived `timeout`.
-fn run(root: &Path, config: &[&str], args: &[&str], timeout: Duration) -> Result<Output, String> {
+pub(super) fn run(
+    root: &Path,
+    config: &[&str],
+    args: &[&str],
+    timeout: Duration,
+) -> Result<Output, String> {
     let mut cmd = Command::new("git");
     for pair in config {
         cmd.arg("-c").arg(pair);
@@ -76,16 +81,16 @@ fn run(root: &Path, config: &[&str], args: &[&str], timeout: Duration) -> Result
     }
 }
 
-fn stderr(out: &Output) -> String {
+pub(super) fn stderr(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).trim().to_string()
 }
 
-fn stdout(out: &Output) -> String {
+pub(super) fn stdout(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
 /// [`run`], requiring exit 0. Returns trimmed stdout.
-fn ok(root: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
+pub(super) fn ok(root: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
     let out = run(root, &[], args, timeout)?;
     if out.status.success() {
         Ok(stdout(&out))
