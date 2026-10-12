@@ -42,7 +42,8 @@ use sha2::{Digest, Sha256};
 
 use crate::cmd_out::{run_command, CmdOutcome};
 use crate::telemetry::kinds::checkout_external_change::{
-    CheckoutExternalChangeRecord, DiscardedCommits, LOOM_REFLOG_PREFIX, MAX_DISCARDED_SUBJECTS,
+    is_loom_reflog_message, loom_reflog_action, CheckoutExternalChangeRecord, DiscardedCommits,
+    MAX_DISCARDED_SUBJECTS,
 };
 use crate::telemetry::provenance::Provenance;
 use crate::telemetry::{RepoVisibility, TelemetryRecord};
@@ -56,7 +57,7 @@ const KEEP_CITED: usize = 8;
 /// The value of `GIT_REFLOG_ACTION` for a Loom git operation `op`.
 #[must_use]
 pub(crate) fn tag(op: &str) -> String {
-    format!("{LOOM_REFLOG_PREFIX}{op}")
+    loom_reflog_action(op)
 }
 
 /// `git <args>` in `dir`, tagged as Loom's `op`, with stdin closed.
@@ -164,7 +165,7 @@ impl Kind {
 #[must_use]
 pub fn classify(entry: &Entry) -> Option<Kind> {
     let m = entry.message.as_str();
-    if m.starts_with(LOOM_REFLOG_PREFIX) || entry.from == entry.to {
+    if is_loom_reflog_message(m) || entry.from == entry.to {
         return None;
     }
     if m.starts_with("reset:") || m.starts_with("branch: Reset") {

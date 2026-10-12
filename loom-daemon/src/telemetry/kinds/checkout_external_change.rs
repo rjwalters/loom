@@ -7,7 +7,7 @@
 //! appeared in a managed checkout's reflog that no Loom code path wrote. They
 //! discarded unpushed commits, and the only evidence was a `git reflog` read by
 //! hand hours later. Loom's own git operations carry
-//! `GIT_REFLOG_ACTION=loom:<op>` ([`LOOM_REFLOG_PREFIX`]); the `checkout_ff`
+//! `GIT_REFLOG_ACTION=loom:<op>` ([`loom_reflog_action`]); the `checkout_ff`
 //! pass compares each managed checkout's reflog with what it last saw and emits
 //! this record for every history-moving entry that is **not** so tagged.
 //!
@@ -29,10 +29,29 @@ use serde::{Deserialize, Serialize};
 use crate::telemetry::provenance::Provenance;
 use crate::telemetry::RepoVisibility;
 
-/// The reflog-action prefix every Loom-initiated git operation carries
-/// (`GIT_REFLOG_ACTION=loom:<op>`). A reflog entry whose message starts with it
-/// is Loom's own and never produces this record.
-pub const LOOM_REFLOG_PREFIX: &str = "loom:";
+/// The namespace of every Loom-initiated git operation's reflog action
+/// (`GIT_REFLOG_ACTION=loom:<op>`, see [`loom_reflog_action`]). Kept apart
+/// from [`REFLOG_ACTION_SEPARATOR`] so no bare label-shaped `loom:` literal
+/// exists here: this is a reflog namespace, not a label (#10013 guard).
+pub const LOOM_REFLOG_NAMESPACE: &str = "loom";
+
+/// Separates [`LOOM_REFLOG_NAMESPACE`] from the operation name.
+pub const REFLOG_ACTION_SEPARATOR: char = ':';
+
+/// The `GIT_REFLOG_ACTION` value for a Loom git operation `op` (`loom:<op>`).
+#[must_use]
+pub fn loom_reflog_action(op: &str) -> String {
+    format!("{LOOM_REFLOG_NAMESPACE}{REFLOG_ACTION_SEPARATOR}{op}")
+}
+
+/// Whether a reflog message was written by a Loom git operation: it starts
+/// with `loom:`. Such an entry never produces this record.
+#[must_use]
+pub fn is_loom_reflog_message(message: &str) -> bool {
+    message
+        .strip_prefix(LOOM_REFLOG_NAMESPACE)
+        .is_some_and(|rest| rest.starts_with(REFLOG_ACTION_SEPARATOR))
+}
 
 /// Every log attribute key `checkout.external_change` exports.
 pub const CHECKOUT_EXTERNAL_CHANGE_LOG_ATTRIBUTE_KEYS: &[&str] = &[

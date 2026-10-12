@@ -137,15 +137,6 @@
 
 set -uo pipefail
 
-# The reflog tag for every git call below that moves a ref of the primary
-# checkout (the resync `commit` and the fallback's `reset --hard
-# origin/<default>`). Passed inline on exactly those calls -- not exported, so
-# it never leaks into create-pr.sh or other children -- it makes git write
-# `loom:resync: ...` reflog entries, which the daemon's out-of-band checkout
-# detector (#11566, `checkout.external_change`) recognises as Loom's own
-# instead of reporting an untagged `commit:` / `reset:` as an external change.
-LOOM_REFLOG_ACTION="loom:resync"
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 # shellcheck source=./lib/default-branch.sh
 source "$SCRIPT_DIR/lib/default-branch.sh"
@@ -521,7 +512,10 @@ if [[ "${#RESYNC_PATHS[@]}" -gt 0 ]]; then
     fi
     require_identity
     git -C "$REPO_ROOT" add -- "${RESYNC_PATHS[@]}"
-    if ! GIT_REFLOG_ACTION="$LOOM_REFLOG_ACTION" git -C "$REPO_ROOT" commit --quiet -m "$RESYNC_COMMIT_SUBJECT"; then
+    # GIT_REFLOG_ACTION is inline (not exported, so it never reaches
+    # create-pr.sh): git writes `loom:resync: ...`, which the daemon's
+    # out-of-band checkout detector (#11566) recognises as Loom's own.
+    if ! GIT_REFLOG_ACTION="loom:resync" git -C "$REPO_ROOT" commit --quiet -m "$RESYNC_COMMIT_SUBJECT"; then
         err "git commit failed."
         exit "$EXIT_ERROR"
     fi
@@ -716,7 +710,7 @@ fi
 # follows the `loom:resync: chore: resync installed Loom surfaces` commit
 # entry, and the commit it moves away from is on origin/<side branch>. The
 # inline GIT_REFLOG_ACTION tags both, so #11566's classifier skips them.
-GIT_REFLOG_ACTION="$LOOM_REFLOG_ACTION" git -C "$REPO_ROOT" reset --hard "origin/$DEFAULT_BRANCH"
+GIT_REFLOG_ACTION="loom:resync" git -C "$REPO_ROOT" reset --hard "origin/$DEFAULT_BRANCH"
 
 PR_BODY="Automated resync of installed Loom surfaces from \`defaults/\`.
 

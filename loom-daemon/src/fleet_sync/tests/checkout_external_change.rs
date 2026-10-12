@@ -254,19 +254,12 @@ fn loom_own_fast_forward_emits_nothing_and_logs_the_loom_tag() {
 /// `land-resync-commit.sh`, the one installed script that moves the default
 /// branch of a managed root (#6646): its fallback commits the resync change and
 /// then `reset --hard origin/<default>`s the primary checkout. Both run under
-/// an inline `GIT_REFLOG_ACTION="$LOOM_REFLOG_ACTION"`, which must be a Loom tag.
+/// an inline `GIT_REFLOG_ACTION="loom:resync"`, which must be a Loom tag.
 const LAND_RESYNC_SCRIPT: &str = include_str!("../../../../defaults/scripts/land-resync-commit.sh");
 
 #[test]
 fn land_resync_commit_tags_its_ref_moves_as_loom() {
-    assert!(
-        LAND_RESYNC_SCRIPT
-            .lines()
-            .any(|l| l == format!("LOOM_REFLOG_ACTION=\"{}\"", tag("resync"))),
-        "land-resync-commit.sh must set LOOM_REFLOG_ACTION={}",
-        tag("resync")
-    );
-    let tagged = "GIT_REFLOG_ACTION=\"$LOOM_REFLOG_ACTION\" git -C \"$REPO_ROOT\"";
+    let tagged = format!("GIT_REFLOG_ACTION=\"{}\" git -C \"$REPO_ROOT\"", tag("resync"));
     for op in ["commit --quiet", "reset --hard"] {
         assert!(
             LAND_RESYNC_SCRIPT.contains(&format!("{tagged} {op}")),
@@ -381,4 +374,16 @@ fn the_record_round_trips_and_names_the_ref() {
     assert!(json["ref"] == "HEAD" || json["ref"] == "refs/heads/main");
     let back: CheckoutExternalChangeRecord = serde_json::from_value(json).unwrap();
     assert_eq!(back, fact);
+}
+
+#[test]
+fn loom_reflog_tag_is_namespace_colon_op_and_only_that_counts_as_loom() {
+    use crate::telemetry::kinds::checkout_external_change::is_loom_reflog_message;
+    assert_eq!(tag("resync"), "loom:resync");
+    assert!(is_loom_reflog_message("loom:resync: updating HEAD"));
+    assert!(is_loom_reflog_message("loom:ff: fast-forward"));
+    // A namespace look-alike without the separator is not Loom's.
+    assert!(!is_loom_reflog_message("loomx: reset"));
+    assert!(!is_loom_reflog_message("loom reset: moving to HEAD~1"));
+    assert!(!is_loom_reflog_message("reset: moving to HEAD~1"));
 }
