@@ -939,3 +939,15 @@ fn curator_visits_the_largest_untriaged_backlog_first() {
     // `c` is unobserved and keeps its slot; A (40) outranks B (0).
     assert_eq!(curator_order(ledger, &paths), vec![a, b, c]);
 }
+
+#[test]
+fn curator_keeps_round_robin_for_unobserved_roots() {
+    let ledger: &'static triggers::TriggerLedger =
+        Box::leak(Box::new(triggers::TriggerLedger::default()));
+    let (a, b) = (PathBuf::from("/a"), PathBuf::from("/b"));
+    let paths = vec![a.clone(), b.clone()];
+    // Only B is observed: unobserved A keeps its round-robin slot ahead of
+    // B's backlog rather than being pushed behind it.
+    ledger.record_untriaged(&b, 40);
+    assert_eq!(curator_order(ledger, &paths), vec![a, b]);
+}
