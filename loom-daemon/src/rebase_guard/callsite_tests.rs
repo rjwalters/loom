@@ -1,4 +1,4 @@
-//! The eight rebase-then-force-push paths of Issue #9282 all ask
+//! The rebase-then-push paths of Issue #9282 (seven since #10771) all ask
 //! `forge rebase-guard` between their version gate and their push.
 //!
 //! Structural, on the shipped text: a path that loses its call would otherwise
@@ -18,7 +18,11 @@ fn shipped(rel: &str) -> String {
 /// Is this line a force-push that runs, as opposed to prose about one?
 fn is_push(line: &str) -> bool {
     let t = line.trim_start();
-    t.contains("push --force-with-lease")
+    // The prompts push `--force-with-lease[=pin]`; the scripts push a pinned
+    // lease held in a variable (#9487): `git push "$child_lease_arg" ...`.
+    (t.contains("push --force-with-lease")
+        || t.contains("push \"$child_lease_arg\"")
+        || t.contains("push \"$PUSH_LEASE_ARG\""))
         && !t.starts_with('#')
         && !["echo ", "printf ", "err ", "info ", "warn "]
             .iter()
@@ -48,10 +52,12 @@ fn guarded_paths(rel: &str, text: &str) -> usize {
 }
 
 #[test]
-fn all_eight_paths_call_the_guard_before_the_force_push() {
+fn all_paths_call_the_guard_before_the_force_push() {
     for (rel, expected) in [
         ("defaults/.claude/commands/loom/judge.md", 3),
-        ("defaults/.claude/commands/loom/doctor.md", 3),
+        // 2, not 3: the unlabeled-queue block no longer pushes itself; it defers to
+        // "PR Has Merge Conflicts" (#10771), so it has no gate-then-push path of its own.
+        ("defaults/.claude/commands/loom/doctor.md", 2),
         ("defaults/scripts/rebase-stacked-children.sh", 1),
         ("defaults/scripts/reconcile-stack.sh", 1),
     ] {
@@ -71,9 +77,9 @@ fn judge_no_longer_carries_its_own_empty_diff_predicate() {
 /// predates the verb prints only clap's usage error.
 #[test]
 fn every_prompt_call_site_warns_when_the_guard_gives_no_answer() {
-    for rel in [
-        "defaults/.claude/commands/loom/judge.md",
-        "defaults/.claude/commands/loom/doctor.md",
+    for (rel, expected) in [
+        ("defaults/.claude/commands/loom/judge.md", 3),
+        ("defaults/.claude/commands/loom/doctor.md", 2),
     ] {
         let text = shipped(rel);
         let calls = text
@@ -82,8 +88,8 @@ fn every_prompt_call_site_warns_when_the_guard_gives_no_answer() {
         let warnings = text
             .matches("WARNING: rebase-guard gave no answer (rc=$RG)")
             .count();
-        assert_eq!(calls, 3, "{rel}: guard calls that capture the exit code");
-        assert_eq!(warnings, 3, "{rel}: unanswered warnings");
+        assert_eq!(calls, expected, "{rel}: guard calls that capture the exit code");
+        assert_eq!(warnings, expected, "{rel}: unanswered warnings");
     }
 }
 
