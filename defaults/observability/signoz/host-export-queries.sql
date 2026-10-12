@@ -185,7 +185,7 @@ steps AS (
            tupleElement(previous, 4) AS prev_conflicting,
            in_window AND n > 1 AND dropped < prev_dropped AS reset,
            multiIf(NOT in_window OR n = 1 OR conflicting OR prev_conflicting, toUInt64(0), dropped >= prev_dropped,
-                   dropped - prev_dropped, dropped) AS increment
+                   toUInt64(dropped - prev_dropped), dropped) AS increment
     FROM ordered
 ),
 reason_steps AS (

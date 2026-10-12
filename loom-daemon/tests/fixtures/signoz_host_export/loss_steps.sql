@@ -1,7 +1,6 @@
--- Fixture for signoz_host_export_queries.rs (#11198). Timestamps are relative
--- to now64(9) because host-export-queries.sql reads the clock verbatim.
--- Columns: host, loom.kind, minutes ago, loom.host_export.dropped_total.
--- host.name and host.id are both set to the host.
+-- Fixed-clock query 4 fixture for #11146. Timestamps are UTC on 2026-10-12;
+-- the replay substitutes 17:10:00Z for the committed query clock.
+-- Each row is a host.export JSON body; host.name/id both identify the host.
 
 CREATE DATABASE IF NOT EXISTS signoz_logs;
 
