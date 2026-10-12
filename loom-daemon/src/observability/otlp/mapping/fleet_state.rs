@@ -85,6 +85,8 @@ mod tests {
                 in_flight: None,
                 cap: None,
                 deferred_repo_cap: None,
+                queue_depth: None,
+                queue_flow: None,
                 ready_complete: false,
                 ready_replace: true,
                 census: Some(FleetPrCensus {
