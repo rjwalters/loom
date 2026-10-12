@@ -279,6 +279,12 @@ pub struct FleetInput {
     pub listed_at: Option<DateTime<Utc>>,
     /// `None` before the work finder's first tick.
     pub ready: Option<ReadyQueue>,
+    /// This host's slots (`max_concurrent` + `occupancy`), measured from local
+    /// state every pass (#11643): `max_concurrent` from the work-finder config,
+    /// `occupancy` from the live-sweep count. Independent of `ready`, so it is
+    /// present before the first work-finder tick and after a roll/restart.
+    /// Preferred over the work-finder plan's `ready.slots` in [`build_view`].
+    pub slots: Option<FleetSlots>,
     /// Host capacity, when read.
     pub capacity: Option<FleetCapacity>,
     /// Each managed repo's `main` CI status, by lowercased slug.
@@ -315,7 +321,8 @@ pub struct RepoView {
 pub struct FleetView {
     /// When the census listings were read.
     pub census_at: Option<DateTime<Utc>>,
-    /// Plan slot use.
+    /// Slot use (`max_concurrent` + `occupancy`), measured from local state
+    /// every pass (#11643) — not gated on a work-finder tick.
     pub slots: Option<FleetSlots>,
     /// Host capacity beside `slots`.
     pub capacity: Option<FleetCapacity>,
@@ -630,7 +637,12 @@ pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Ut
     }
     FleetView {
         census_at: input.listed_at.filter(|_| !input.listings.is_empty()),
-        slots: input.ready.as_ref().and_then(|r| r.slots),
+        // Prefer the directly-provided, locally-measured slots (#11643); fall
+        // back to the work-finder plan's slots only when a pass did not provide
+        // them (e.g. legacy test inputs).
+        slots: input
+            .slots
+            .or_else(|| input.ready.as_ref().and_then(|r| r.slots)),
         capacity: input.capacity.clone(),
         repos,
         observed,

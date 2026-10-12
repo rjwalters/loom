@@ -2583,7 +2583,7 @@ its absence from the tick.
 anchor is at least 300 s old (`ANCHOR_INTERVAL_SECS`) or the planner stamps
 changed (a regime boundary). A lost delta therefore leaves a reader's
 reconstruction wrong for at most about 5 minutes. Between anchors a pass sends a **delta** (`anchor: false`) only if
-rows, a census, a repo's `ready_complete`, `main_ci`, `halt`, dispatch limits (`in_flight`, `cap`, `deferred_repo_cap`), queue flow (`queue_depth`, `queue_flow`), or the plan slots changed. A delta holds the added or changed
+rows, a census, a repo's `ready_complete`, `main_ci`, `halt`, dispatch limits (`in_flight`, `cap`, `deferred_repo_cap`), queue flow (`queue_depth`, `queue_flow`), or the `slots` changed. A delta holds the added or changed
 rows, the issues that left (`removed`), and the **full** census of each repo it
 names. **Ready replacement:** a repo with `ready_complete: false` is sent with `ready_replace: true`. Its `ready_wait` rows are not
 diffed: every record that names it carries the repo's **entire** observed
@@ -2619,7 +2619,7 @@ all `chunk_count` chunks of that `(host, as_of)`.
 | `fleet_config_hash` | string, optional | the fleet store commit this host's last fleet-sync config pass resolved; absent on a host with no fleet store |
 | `tick_interval_secs` | integer, optional | the seconds between the emitter's passes, its sampling resolution: the work finder's resolved tick interval once it has ticked in this process, else `300` (#11161). Absent from an older emitter, which sampled every 300 s |
 | `census_at` | RFC 3339, optional | when the review listings were read |
-| `slots` | object, optional | `{max_concurrent, occupancy?}` from the last work-finder dispatch plan |
+| `slots` | object, optional | `{max_concurrent, occupancy?}` measured from local state on **every** pass (#11643), independent of the work-finder dispatch plan: `max_concurrent` from the resolved work-finder config (precedence env > config > default), `occupancy` from this host's live-sweep count. Present from the first pass of a process and after a roll/restart, unlike the plan (absent until the first tick). `occupancy` stays optional (absent = unknown, never a synthetic `0`); a genuinely idle host emits `occupancy: 0`, distinct from "not yet measured" |
 | `capacity` | object, optional | host capacity beside `slots` (never repeating `max_concurrent` / `occupancy`); additive on `fleet-state/v1`, absent from older emitters. All discrete: `live_workers` (sweeps this host runs), `accounts_usable` (ranking accounts with status `available`) / `accounts_exhausted` (ranking accounts with status `exhausted` only; `blocked`, `rate_limited` and unknown statuses count in neither), both absent when the ranking is unreadable or lists no account, `host_breaker` / `rate_limit_breaker` (`closed` / `open` / `cooldown`, absent when none is enabled), `admission_brake_held` (bool, absent when none is enabled). No utilisation fraction is carried, so a quiet host stays quiet: a change in any field above is a delta, drift is not |
 | `repos[]` | array | per repo, ordered by slug. An anchor lists every repo with rows, a census, a `main_ci` or a `halt`; a delta lists only repos that changed |
 
