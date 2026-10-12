@@ -648,7 +648,7 @@ jobs:
       # #10973: replay of the host-disk and work-finder-stale alert rules
       - name: Verify the SigNoz disk and work-finder alert rules against a real pinned ClickHouse
         run: cargo test --package loom-daemon --features otlp --test signoz_ops_alerts -- --ignored --nocapture
-      # #11198: host-export-queries.sql queries 1-3 and the host-export-silent
+      # #11198: host-export-queries.sql queries 1-4 and the host-export-silent
       # alert, run verbatim (roster substituted) over a fixture.
       - name: Verify the SigNoz host-export queries and silent-host alert against a real pinned ClickHouse
         run: cargo test --package loom-daemon --features otlp --test signoz_host_export_queries -- --ignored --nocapture

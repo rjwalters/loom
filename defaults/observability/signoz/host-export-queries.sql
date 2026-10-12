@@ -127,97 +127,110 @@ FROM judged
 WHERE silent_seconds > threshold_seconds
 ORDER BY host;
 
--- 4. Per-exporter, per-reason loss in the last 2 h (Issue #11639): which
---    exporter (`https` vs `otlp`) on which host lost records, and why.
---    Query 1 stops at the host-level sum; this reads the `exporters` array in
---    the JSON body. `dropped_by_reason` holds the durable loss-ledger
---    breakdown (`queue_overflow`, `capacity_shrink`, `status_<code>`,
---    `non_json_response`, `response_too_large`, `invalid_response`,
---    `receiver_rejected`, `trace_unmappable`). The map omits zero counts, so
---    no entry for a reason means 0 at that sample. Facts only, read-only:
---    `first_dropped`/`last_dropped` are the cumulative counter at the
---    exporter's first/last in-window sample and `delta` is `last - first`
---    (negative or zero reads as no loss in the window; a ledger reset shows
---    as a negative delta, never a recovery). `reason_delta` is the reason's
---    count at the exporter's last sample carrying it minus its count at the
---    exporter's first in-window sample, where a reason first seen after that
---    sample starts from 0 (absent -> N counts N). Any part of `delta` the
---    reasons do not explain (samples from before #11527 carry no
---    breakdown) is reported as one extra row, reason `unattributed`.
---    Drops before the first in-window sample are not counted (no pre-window
---    baseline, unlike query 1).
---    Also reports `max_queue_depth` and the daemon versions seen, so a loss
---    can be tied to the running build rather than to a merged fix.
---    Durable ledger counts only: session-only admission deferrals are not
---    `host.export` drops and never appear here.
---    STATUS: written against the body shape in
---    telemetry/kinds/host_export.rs; not yet replayed by
---    signoz_host_export_queries.rs, so treat the first live run as its check.
-WITH samples AS (
+-- 4. Observed per-exporter/per-reason loss lower bounds in the last 2 h.
+-- A 24 h pre-window lookback supplies one baseline per host/exporter. Unknown
+-- first values contribute zero, never invented recent loss. Decreases contribute
+-- the observed post-reset value and flag uncertainty, never erase earlier steps.
+-- Identity here is (host, exporter, timestamp, exporter JSON): duplicate delivery
+-- collapses; conflicting same-timestamp JSON selects lexical max deterministically
+-- and is flagged. Steps touching conflicts contribute zero: no invented loss.
+-- A present reason map omits zero keys; a missing legacy map is unknown. Only
+-- sample-aligned, nondecreasing reason steps are attributed. A reset uses the
+-- current map; missing/inconsistent breakdowns put the step in unattributed.
+-- Zero-loss rows with uncertainty use coverage_unknown (not a loss reason).
+-- delta/reason_delta are observed lower bounds, not authoritative journal recovery.
+-- STATUS: query 4 is replayed with a fixed clock on pinned ClickHouse in CI.
+WITH raw AS (
     SELECT if(resources_string['host.name'] != '', resources_string['host.name'], resources_string['host.id']) AS host,
-           resources_string['service.version'] AS version,
-           timestamp,
-           JSONExtractString(e, 'name') AS exporter,
-           JSONExtractUInt(e, 'dropped_total') AS dropped_total,
-           JSONExtractUInt(e, 'queue_depth') AS queue_depth,
-           JSONExtractKeysAndValues(e, 'dropped_by_reason', 'UInt64') AS by_reason
+           resources_string['service.version'] AS version, timestamp,
+           JSONExtractString(e, 'name') AS exporter, e
     FROM signoz_logs.distributed_logs_v2
     ARRAY JOIN JSONExtractArrayRaw(body, 'exporters') AS e
     WHERE attributes_string['loom.kind'] = 'host.export'
-      AND timestamp >= toUnixTimestamp64Nano(now64(9) - INTERVAL 2 HOUR)
+      AND timestamp >= toUnixTimestamp64Nano(now64(9) - INTERVAL 26 HOUR)
+      AND timestamp <= toUnixTimestamp64Nano(now64(9))
 ),
-per_reason AS (
-    SELECT host, exporter, tupleElement(r, 1) AS reason,
-           min(timestamp) AS r_first_ts,
-           argMin(tupleElement(r, 2), timestamp) AS first_n,
-           argMax(tupleElement(r, 2), timestamp) AS last_n
+dedup AS (
+    SELECT host, exporter, timestamp, max(e) AS sample,
+           groupUniqArray(version) AS sample_versions, uniqExact(e) > 1 AS conflicting
+    FROM raw GROUP BY host, exporter, timestamp
+),
+parsed AS (
+    SELECT *, JSONExtractUInt(sample, 'dropped_total') AS dropped,
+           JSONExtractUInt(sample, 'queue_depth') AS queue_depth,
+           JSONHas(sample, 'dropped_by_reason') AS map_known,
+           JSONExtractKeysAndValues(sample, 'dropped_by_reason', 'UInt64') AS reasons,
+           timestamp >= toUnixTimestamp64Nano(now64(9) - INTERVAL 2 HOUR) AS in_window
+    FROM dedup
+),
+baselines AS (
+    SELECT *, row_number() OVER (PARTITION BY host, exporter ORDER BY timestamp DESC) AS baseline_rank
+    FROM parsed WHERE NOT in_window
+),
+samples AS (
+    SELECT * FROM parsed WHERE in_window
+    UNION ALL
+    SELECT * EXCEPT baseline_rank FROM baselines WHERE baseline_rank = 1
+),
+ordered AS (
+    SELECT *, row_number() OVER w AS n,
+           lagInFrame(tuple(dropped, map_known, reasons, conflicting)) OVER w AS previous
     FROM samples
-    ARRAY JOIN by_reason AS r
-    GROUP BY host, exporter, reason
+    WINDOW w AS (PARTITION BY host, exporter ORDER BY timestamp ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
 ),
-per_exporter AS (
-    SELECT host, exporter,
-           min(timestamp) AS e_first_ts,
-           argMin(dropped_total, timestamp) AS first_dropped,
-           argMax(dropped_total, timestamp) AS last_dropped,
-           max(queue_depth) AS max_queue_depth,
-           groupUniqArray(version) AS versions,
-           count() AS samples
-    FROM samples
-    GROUP BY host, exporter
+steps AS (
+    SELECT *, tupleElement(previous, 1) AS prev_dropped,
+           tupleElement(previous, 2) AS prev_map_known,
+           tupleElement(previous, 3) AS prev_reasons,
+           tupleElement(previous, 4) AS prev_conflicting,
+           in_window AND n > 1 AND dropped < prev_dropped AS reset,
+           multiIf(NOT in_window OR n = 1 OR conflicting OR prev_conflicting, toUInt64(0), dropped >= prev_dropped,
+                   dropped - prev_dropped, dropped) AS increment
+    FROM ordered
 ),
--- A reason absent at the exporter's first in-window sample had 0 there.
-reason_deltas AS (
-    SELECT r.host AS host, r.exporter AS exporter, r.reason AS reason,
-           toInt64(r.last_n) - toInt64(if(r.r_first_ts > e.e_first_ts, 0, r.first_n)) AS reason_delta
-    FROM per_reason AS r
-    INNER JOIN per_exporter AS e ON r.host = e.host AND r.exporter = e.exporter
+reason_steps AS (
+    SELECT *,
+           arrayMap(k -> tuple(k,
+               if(reset, toInt64(arraySum(arrayMap(r -> if(r.1 = k, r.2, toUInt64(0)), reasons))),
+                  toInt64(arraySum(arrayMap(r -> if(r.1 = k, r.2, toUInt64(0)), reasons))) -
+                  toInt64(arraySum(arrayMap(r -> if(r.1 = k, r.2, toUInt64(0)), prev_reasons))))),
+               arrayDistinct(arrayConcat(arrayMap(r -> r.1, reasons), arrayMap(r -> r.1, prev_reasons)))) AS changes
+    FROM steps
 ),
-attributed AS (
-    SELECT host, exporter, sum(reason_delta) AS attributed_delta
-    FROM reason_deltas
-    GROUP BY host, exporter
+qualified AS (
+    SELECT *, NOT conflicting AND NOT prev_conflicting AND map_known AND (reset OR prev_map_known) AND
+           NOT arrayExists(r -> r.2 < 0, changes) AND
+           arraySum(arrayMap(r -> r.2, changes)) <= increment AS attribution_known
+    FROM reason_steps
+),
+summary AS (
+    SELECT host, exporter, arrayDistinct(arrayFlatten(groupArray(sample_versions))) AS versions,
+           count() AS samples, argMin(dropped, timestamp) AS first_dropped,
+           argMax(dropped, timestamp) AS last_dropped, sum(increment) AS delta,
+           max(queue_depth) AS max_queue_depth, sum(reset) AS reset_count,
+           min(n) > 1 AS baseline_known,
+           countIf(NOT attribution_known AND n > 1) AS unknown_reason_steps,
+           sum(conflicting) AS conflicting_samples
+    FROM qualified WHERE in_window GROUP BY host, exporter
 ),
 reason_rows AS (
-    SELECT host, exporter, reason, reason_delta FROM reason_deltas
+    SELECT host, exporter, r.1 AS reason, sum(r.2) AS reason_delta
+    FROM qualified ARRAY JOIN changes AS r
+    WHERE in_window AND n > 1 AND attribution_known AND r.2 > 0
+    GROUP BY host, exporter, reason
     UNION ALL
-    SELECT e.host AS host, e.exporter AS exporter, 'unattributed' AS reason,
-           toInt64(e.last_dropped) - toInt64(e.first_dropped) - toInt64(a.attributed_delta) AS reason_delta
-    FROM per_exporter AS e
-    LEFT JOIN attributed AS a ON e.host = a.host AND e.exporter = a.exporter
-    WHERE reason_delta > 0
+    SELECT host, exporter, 'unattributed' AS reason,
+           sum(toInt64(increment - if(attribution_known, toUInt64(arraySum(arrayMap(r -> r.2, changes))), toUInt64(0)))) AS reason_delta
+    FROM qualified WHERE in_window GROUP BY host, exporter HAVING reason_delta > 0
+    UNION ALL
+    SELECT host, exporter, 'coverage_unknown' AS reason, toInt64(0) AS reason_delta
+    FROM summary WHERE delta = 0 AND (NOT baseline_known OR reset_count > 0 OR unknown_reason_steps > 0 OR conflicting_samples > 0)
 )
-SELECT e.host AS host,
-       e.exporter AS exporter,
-       e.versions AS versions,
-       e.samples AS samples,
-       e.first_dropped AS first_dropped,
-       e.last_dropped AS last_dropped,
-       toInt64(e.last_dropped) - toInt64(e.first_dropped) AS delta,
-       e.max_queue_depth AS max_queue_depth,
-       r.reason AS reason,
-       r.reason_delta AS reason_delta
-FROM per_exporter AS e
-LEFT JOIN reason_rows AS r ON e.host = r.host AND e.exporter = r.exporter
-WHERE delta > 0
+SELECT s.host AS host, s.exporter AS exporter, s.versions AS versions,
+       s.samples AS samples, s.first_dropped AS first_dropped, s.last_dropped AS last_dropped,
+       s.delta AS delta, s.max_queue_depth AS max_queue_depth,
+       s.reset_count AS reset_count, s.baseline_known AS baseline_known,
+       s.unknown_reason_steps AS unknown_reason_steps, s.conflicting_samples AS conflicting_samples,
+       r.reason AS reason, r.reason_delta AS reason_delta
+FROM summary AS s INNER JOIN reason_rows AS r ON s.host = r.host AND s.exporter = r.exporter
 ORDER BY delta DESC, host, exporter, reason_delta DESC;

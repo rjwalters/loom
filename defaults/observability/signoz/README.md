@@ -365,19 +365,32 @@ with no earlier sample has an unknown baseline and its first value counts as
 (`signoz_host_export_queries.rs`, fixtures for increment, no-increase, reset
 and no-baseline).
 
-Query 4 (#11639) is the per-exporter, per-reason drill-down for a query 1
-hit: for each host and exporter (`https`, `otlp`) whose cumulative
-`dropped_total` grew in the last 2 h it lists the by-reason ledger deltas
-(`queue_overflow`, `status_<code>`, ...), peak queue depth and the daemon
-versions seen, so a loss is tied to the running build and not to a merged fix.
-`dropped_by_reason` omits zero counts, so a missing reason means 0 at that
-sample: a reason that first appears mid-window (absent -> N) counts its full
-N. Growth the reasons do not explain (e.g. pre-#11527 samples) shows as one
-`unattributed` row. It reads only durable loss-ledger counts; session-only admission deferrals are
-not `host.export` drops. It is not yet replayed in CI (the first live run is
-its check). Whether lost records are recoverable from the authoritative
-journals (bounded replay, `replay-queries.sql`) is a separate, per-incident
-check, and gaps stay recorded as gaps, never synthesized.
+Query 4 (#11639, reset regression #11146) reads each exporter's JSON body and
+sums observed positive counter steps, including increments before and after a
+ledger decrease. The latest sample in the bounded 24 h pre-window lookback is
+the baseline. Without it, the first value contributes zero and `baseline_known`
+is false. `delta` and `reason_delta` are observed lower bounds: `reset_count`
+flags decreases, and no query reconstructs loss between observations or proves
+journal recovery. Zero observed loss with incomplete coverage produces a
+`coverage_unknown` row; known flat counters produce no row. Empty output is
+never proof that historical loss was recovered.
+
+A present `dropped_by_reason` map omits zero keys; a missing legacy map is
+unknown. Reasons are compared at consecutive exporter samples; resets use the
+current map. Missing, decreasing or inconsistent reason breakdowns leave the
+step `unattributed`, while `unknown_reason_steps` exposes incomplete attribution.
+The attributed reasons plus unexplained remainder equal the observed total.
+Duplicate `(host, exporter, timestamp, exporter JSON)` delivery collapses;
+conflicting same-time bodies select lexical maximum deterministically and set
+`conflicting_samples`, which makes coverage incomplete. Steps touching a conflict contribute zero,
+so conflicting observations cannot invent a loss lower bound. Peak in-window queue
+depth and observed versions remain context, not evidence of recovery. Durable
+loss-ledger counts only: admission deferrals are not exporter drops.
+
+The existing pinned ClickHouse CI harness now executes query 4 with a fixed
+clock, including the captain's 16:14 reset and later 851/1584 queue-overflow
+samples, missing baselines/maps, reason resets, duplicate delivery and separate
+exporters. Authoritative journal recovery remains separate incident work (#11639).
 
 Query 3 (#11198) finds roster hosts silent by absence, which queries 1-2
 cannot (they anchor on logs a host sent). The roster sits between
