@@ -168,6 +168,7 @@ pub(crate) fn work_item(r: &RestIssue) -> WorkItem {
     WorkItem::with_created_at(r.number, r.labels.clone(), r.created_at.clone())
         .with_body(r.body.clone())
         .with_updated_at(r.updated_at.clone())
+        .with_open_sub_issues(r.open_sub_issues)
 }
 
 /// Issues each PR declares it closes or contributes to.

@@ -316,6 +316,7 @@ pub fn issue(number: u32, labels: &[&str]) -> RestIssue {
         author: None,
         author_association: None,
         is_pull_request: false,
+        open_sub_issues: None,
     }
 }
 
