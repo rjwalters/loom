@@ -296,13 +296,23 @@ impl RequestHeaders {
     }
 
     /// Add the request's authentication: `Authorization: Bearer <bearer>`
-    /// unless the file supplies its own `Authorization`, then every header
-    /// from the file. With no headers this is exactly `bearer_auth(bearer)`.
-    pub fn apply(&self, request: reqwest::RequestBuilder, bearer: &str) -> reqwest::RequestBuilder {
+    /// when `bearer` is `Some` and the file does not supply its own
+    /// `Authorization`, then every header from the file. With no headers and
+    /// a key this is exactly `bearer_auth(bearer)`; with `None` and no
+    /// file-supplied `Authorization` no Bearer is sent at all — the caller's
+    /// headers are the request's whole authentication (#11555).
+    pub fn apply(
+        &self,
+        request: reqwest::RequestBuilder,
+        bearer: Option<&str>,
+    ) -> reqwest::RequestBuilder {
         let request = if self.sets_authorization() {
             request
         } else {
-            request.bearer_auth(bearer)
+            match bearer {
+                Some(bearer) => request.bearer_auth(bearer),
+                None => request,
+            }
         };
         self.entries
             .iter()
