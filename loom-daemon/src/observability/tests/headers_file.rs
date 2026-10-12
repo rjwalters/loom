@@ -268,3 +268,111 @@ async fn spawn_task_starts_an_otlp_exporter_with_a_headers_file() {
         handle.abort();
     }
 }
+
+/// #11555: an `otlp` entry whose `headers_file` carries its credentials
+/// starts with no ingest key configured at all — and a configured but
+/// unusable key file is still never read (#7815's rule, per-entry now: no
+/// surviving entry needs it).
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn spawn_task_starts_a_headers_file_entry_with_no_ingest_key() {
+    clear_env();
+    for key_file in [None, Some("absent.key")] {
+        let bus = EventBus::new();
+        let dir = tempdir().unwrap();
+        let headers_path =
+            write_headers_file(dir.path(), &format!("X-Client-Secret: {SECRET}\n"), 0o600);
+        let config = ObservabilityConfig {
+            enabled: Some(true),
+            // `None`, or a path that does not exist: either way the key is
+            // never read, because no planned entry needs it.
+            ingest_key_file: key_file
+                .map(|name| dir.path().join(name).to_string_lossy().into_owned()),
+            exporters: Some(vec![with_headers(
+                "otlp",
+                Some("https://otlp.test-fixture.internal"),
+                &headers_path,
+            )]),
+            flush_interval_secs: Some(3600), // no network attempt during the test
+            ..Default::default()
+        };
+        let handles = spawn_task(
+            &config,
+            dir.path().to_path_buf(),
+            &bus,
+            Instant::now(),
+            test_workspace_pool(),
+        )
+        .expect("a headers_file entry needs no ingest key (#11555)");
+        let status = &global_export_statuses()["otlp"];
+        assert_eq!(
+            status.state,
+            crate::types::ObservabilityExportState::Starting,
+            "started, not misconfigured"
+        );
+        assert!(!serde_json::to_string(status).unwrap().contains(SECRET));
+        for handle in handles {
+            handle.abort();
+        }
+    }
+}
+
+/// #11555: with no usable ingest key, only the entries that need one are
+/// `misconfigured` — the `headers_file` entry still starts, in the same
+/// `spawn_task` call.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn spawn_task_misconfigures_only_the_entries_that_need_the_missing_key() {
+    clear_env();
+    for (key_file, expected) in [
+        (None, "ingestKeyFile not configured"),
+        (Some("missing.key"), "could not read ingest key file"),
+    ] {
+        let bus = EventBus::new();
+        let dir = tempdir().unwrap();
+        let headers_path =
+            write_headers_file(dir.path(), &format!("X-Client-Secret: {SECRET}\n"), 0o600);
+        let config = ObservabilityConfig {
+            enabled: Some(true),
+            endpoint: Some(SAFE_TEST_ENDPOINT.to_string()),
+            ingest_key_file: key_file
+                .map(|name| dir.path().join(name).to_string_lossy().into_owned()),
+            exporters: Some(vec![
+                raw("https", None),
+                with_headers("otlp", Some("https://otlp.test-fixture.internal"), &headers_path),
+            ]),
+            flush_interval_secs: Some(3600), // no network attempt during the test
+            ..Default::default()
+        };
+        let handles = spawn_task(
+            &config,
+            dir.path().to_path_buf(),
+            &bus,
+            Instant::now(),
+            test_workspace_pool(),
+        )
+        .expect("the headers_file entry must survive the missing key");
+        let statuses = global_export_statuses();
+        let https = &statuses["https"];
+        assert_eq!(https.state, crate::types::ObservabilityExportState::Misconfigured);
+        assert!(
+            https
+                .last_failure_detail
+                .as_deref()
+                .unwrap()
+                .contains(expected),
+            "detail was: {}",
+            https.last_failure_detail.as_deref().unwrap()
+        );
+        assert_eq!(
+            statuses["otlp"].state,
+            crate::types::ObservabilityExportState::Starting,
+            "the headers_file entry started anyway"
+        );
+        for handle in handles {
+            handle.abort();
+        }
+    }
+}
