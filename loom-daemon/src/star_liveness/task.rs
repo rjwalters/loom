@@ -781,8 +781,10 @@ fn resolve_repos(
 /// pass proceeds unaffected. The ask is never *lost* by this — the forge
 /// comment carrying the same key was already posted before the notice existed.
 fn publish_notices(bus: Option<&crate::event_bus::EventBus>, host: &str, notices: Vec<Notice>) {
-    let Some(bus) = bus else { return };
     for notice in notices {
+        // #11295: loom-ui's Alerts page, independent of the bus.
+        crate::loom_ui_alerts::post(super::loom_ui::to_alert(&notice));
+        let Some(bus) = bus else { continue };
         let kind = if notice.resolved {
             "resolved"
         } else {

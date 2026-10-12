@@ -87,6 +87,7 @@ pub use crate::types::{AskKind, LandingStage, OperatorAsk, StarLandingRow};
 
 pub mod captain;
 pub mod collect;
+pub mod dispatch_shim;
 pub mod edges;
 pub mod escalate;
 pub mod forge;
@@ -95,6 +96,7 @@ pub mod inherited_star;
 pub mod intents;
 pub mod landing;
 pub mod levels;
+pub mod loom_ui;
 pub mod materialize;
 pub mod parent_link;
 pub mod progress;

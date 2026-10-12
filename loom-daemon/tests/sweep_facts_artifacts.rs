@@ -37,6 +37,7 @@ const CLICKSTACK_EXTRACT: &str =
     include_str!("../../defaults/observability/sweep-facts/sweep-facts-extract-clickstack.sql");
 const SIGNOZ_EXTRACT: &str =
     include_str!("../../defaults/observability/sweep-facts/sweep-facts-extract-signoz.sql");
+const IE_QUERIES: &str = include_str!("../../defaults/observability/issue-effort-queries.sql");
 
 /// The canonical question IDs. Restated here deliberately: this is the one
 /// place the *set* is pinned, and every artifact below is checked against it
@@ -300,6 +301,15 @@ fn the_effort_view_exposes_the_documented_effort_columns() {
         "clean_tokens_out",
         "rework_substantive",
         "rework_environmental",
+        "rework_substantive_open",
+        "rework_environmental_open",
+        "clean_sec",
+        "substantive_rework_sec",
+        "environmental_rework_sec",
+        "unattributed_sec",
+        "overaccounted_sec",
+        "attributed_attempts",
+        "attributed_wall_pct",
     ];
     assert_eq!(
         issue_effort_columns(),
@@ -308,6 +318,100 @@ fn the_effort_view_exposes_the_documented_effort_columns() {
          contract (lifecycle beside clean, with the completeness flag and the rework \
          split) (#9446)"
     );
+}
+
+/// The `(trigger, bucket)` pairs of the first `CASE … END` block that starts
+/// at `anchor` in `sql`, in written order.
+fn trigger_buckets(sql: &str, anchor: &str) -> Vec<(String, String)> {
+    let start = sql
+        .find(anchor)
+        .unwrap_or_else(|| panic!("no `{anchor}` trigger CASE to read"));
+    let end = start
+        + sql[start..]
+            .find("END")
+            .unwrap_or_else(|| panic!("the `{anchor}` CASE never terminates"));
+    let pairs: Vec<(String, String)> = Regex::new(r"WHEN '([a-z_]+)'\s+THEN '([a-z]+)'")
+        .unwrap()
+        .captures_iter(&sql[start..end])
+        .map(|capture| (capture[1].to_owned(), capture[2].to_owned()))
+        .collect();
+    let else_arm = Regex::new(r"ELSE '([a-z]+)'")
+        .unwrap()
+        .captures(&sql[start..end])
+        .map(|capture| capture[1].to_owned());
+    assert_eq!(
+        else_arm.as_deref(),
+        Some("unattributed"),
+        "the `{anchor}` trigger CASE must send everything it does not name — \
+         operator_redispatch, unknown, a triggerless pre-#9444 record — to 'unattributed'"
+    );
+    pairs
+}
+
+#[test]
+fn the_bundle_buckets_triggers_exactly_as_ie1_does() {
+    // Drift guard (#9507): the bundle's seconds partition and IE1 (raw
+    // `records`) must classify every trigger identically — two tables that
+    // disagreed would make the dashboards' split and the raw-store split two
+    // different answers to one question. IE1's own table is checked against
+    // the daemon's trigger vocabulary by `issue_effort_artifacts.rs`, so
+    // equality here carries that coverage over to the bundle.
+    let mut bundle = trigger_buckets(ISSUE_EFFORT, "CASE f.trigger");
+    let mut ie1 = trigger_buckets(IE_QUERIES, "CASE json_extract(r.payload, '$.trigger')");
+    assert!(ie1.len() >= 8, "parsed too little of IE1's trigger table: {ie1:?}");
+    bundle.sort();
+    ie1.sort();
+    assert_eq!(
+        bundle, ie1,
+        "issue-effort.sql's trigger → bucket table and IE1's (issue-effort-queries.sql) \
+         disagree; they are twins and must be edited together (#9507)"
+    );
+    for unbucketed in ["operator_redispatch", "unknown"] {
+        assert!(
+            !bundle.iter().any(|(trigger, _)| trigger == unbucketed),
+            "`{unbucketed}` must fall to 'unattributed', never into a named bucket (#9507)"
+        );
+    }
+}
+
+#[test]
+fn the_rework_seconds_are_fact_columns_on_every_side_of_the_seam() {
+    // The generic parity tests above compare the DDL, the INSERT list and both
+    // extraction views against each other; this names the #9507 columns so
+    // their removal from all of them at once is still loud.
+    let declared = fact_table_columns();
+    let clickstack = extract_output_columns(CLICKSTACK_EXTRACT);
+    let signoz = extract_output_columns(SIGNOZ_EXTRACT);
+    for column in [
+        "rework_substantive_sec",
+        "rework_environmental_sec",
+        "rework_substantive_open",
+        "rework_environmental_open",
+    ] {
+        for (side, columns) in [
+            ("sweep_facts DDL", &declared),
+            ("ClickStack extraction", &clickstack),
+            ("SigNoz extraction", &signoz),
+        ] {
+            assert!(
+                columns.contains(&column.to_owned()),
+                "{side} no longer exposes `{column}`; the bundle's seconds partition reads it \
+                 (#9507)"
+            );
+        }
+    }
+    // An open event (no `duration_sec`) must stay NULL in ClickHouse, not be
+    // defaulted to 0 by JSONExtract — that is what lets `_open` count it.
+    for (backend, sql) in [
+        ("ClickStack", CLICKSTACK_EXTRACT),
+        ("SigNoz", SIGNOZ_EXTRACT),
+    ] {
+        assert!(
+            sql.contains("duration_sec Nullable(Int64)"),
+            "the {backend} extraction reads rework `duration_sec` as a non-Nullable integer, \
+             so an open event would read as a measured 0 (#9507)"
+        );
+    }
 }
 
 #[test]

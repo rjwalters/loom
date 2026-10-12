@@ -33,6 +33,8 @@ fn record() -> StageOutcomeRecord {
         observed_at: at + chrono::Duration::seconds(120),
         resolution_sec: Some(0),
         forge_transition_at: Some(at),
+        sweep_id: None,
+        fact_id_missing_reason: None,
         loom: provenance(),
     }
 }
@@ -175,4 +177,12 @@ fn collector_keeps_every_outcome_fact_log_attribute() {
     ]) {
         assert!(log_keep.contains(&format!("\"{key}\"")), "collector drops {key}");
     }
+}
+
+#[test]
+fn abandoned_has_its_wire_name() {
+    assert_eq!(StageExit::Abandoned.as_str(), "abandoned");
+    assert_eq!(serde_json::to_value(StageExit::Abandoned).unwrap(), "abandoned");
+    let back: StageExit = serde_json::from_value("abandoned".into()).unwrap();
+    assert_eq!(back, StageExit::Abandoned);
 }

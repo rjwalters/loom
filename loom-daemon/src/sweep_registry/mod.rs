@@ -110,6 +110,8 @@ pub mod containment_signal;
 // `is_pid_alive` reaches every consumer (the reaper, the orphan reaper, and
 // #9464's claim-label heal) without a re-export line in this ratcheted file.
 pub(crate) mod crash_signals;
+/// Who asked for a dispatch (#11444); every dispatch-core entry takes one.
+pub use crate::telemetry::DispatchOrigin;
 // `generate_sweep_id` lives with the `SweepKind` it names (model.rs) — moved out
 // of this ratcheted file; re-exported for the existing callers.
 pub use model::generate_sweep_id;
@@ -118,6 +120,8 @@ mod decline_cooldown;
 mod dispatch;
 mod guards;
 mod heartbeat_broadcast;
+mod journal_shadow;
+mod landed_guard;
 mod lease_episode;
 mod locks;
 mod model;
@@ -166,6 +170,8 @@ pub use dispatch::*;
 #[allow(unused_imports)]
 pub use guards::*;
 #[allow(unused_imports)]
+pub use landed_guard::*;
+#[allow(unused_imports)]
 pub use locks::*;
 #[allow(unused_imports)]
 pub use model::*;
@@ -197,32 +203,13 @@ pub const SPAWN_BIN_ENV: &str = "LOOM_SWEEP_SPAWN_BIN";
 /// registry. Falls back to `LOOM_WORKSPACE`, then current dir.
 pub const WORKSPACE_ENV: &str = "LOOM_WORKSPACE";
 
-/// Env var overriding this host's identity string in collision records (Issue
-/// #4085). Falls back to `$HOSTNAME`, then the `hostname` binary, then
-/// `"unknown-host"`. Set it when the daemon runs somewhere `$HOSTNAME` is not
-/// exported (a non-interactive service unit) so cross-host collision logs stay
-/// attributable.
-///
-/// **Set this explicitly on every host (Issue #5063).** It is the only
-/// source in [`host_identity`]'s precedence chain that is stable across
-/// launch contexts (launchd/systemd vs. an interactive shell) and the only
-/// one an operator fully controls — see [`host_identity`]'s doc comment for
-/// why the other two fallbacks are not a substitute. Pin it to whatever
-/// name telemetry/dashboards/ingest keys already use for the host (its
-/// tailnet or fleet name), not to `hostname`'s output, so all four agree.
-pub const HOST_ID_ENV: &str = "LOOM_HOST_ID";
-
-/// Sentinel identity [`host_identity`] returns when every resolution source
-/// fails (no `LOOM_HOST_ID`, no `$HOSTNAME`, and the `hostname` binary is
-/// missing or produced empty output). Exported so callers that reason about
-/// self-claim recognition (e.g. [`crate::peer_claims::PeerClaimView`]) can
-/// special-case it without duplicating the literal string (Issue #5063).
-///
-/// **This value must never participate in self-claim recognition.** Two
-/// hosts that both fail identity resolution would otherwise advertise the
-/// same string and each would treat the other's peer claim as its own,
-/// silently defeating the collision-detection machinery in #4028/#5017.
-pub const UNKNOWN_HOST: &str = "unknown-host";
+/// This host's identity env override, unresolvable-identity sentinel and
+/// resolvers — defined in [`crate::host_identity`] (Issue #11530), re-exported
+/// here for the many existing `sweep_registry::` call sites. `host_identity`
+/// is `fleet.hostId` > `LOOM_HOST_ID` > the persisted `~/.loom/host-id`, never
+/// the hostname; `lease_host_identity` keeps the legacy `LOOM_HOST_ID` >
+/// `$HOSTNAME` > `hostname` chain for lease-shaped forge comments only.
+pub use crate::host_identity::{host_identity, lease_host_identity, HOST_ID_ENV, UNKNOWN_HOST};
 
 // ============================================================================
 // Registry
@@ -659,7 +646,7 @@ pub struct SweepRegistry {
     /// outcome classification, so it never overlaps or interferes with
     /// [`quarantined`](Self::quarantined) or
     /// [`dispatch_backoff`](Self::dispatch_backoff) above.
-    noop_cooldown: HashMap<u32, NoopCooldownState>,
+    noop_cooldown: NoopCooldownTable,
     /// Hard-exclusion decline cooldown parameters (Issue #7528). Set at
     /// provision time from the resolved env > config > default value,
     /// mirroring [`noop_cooldown_config`](Self::noop_cooldown_config).
@@ -864,95 +851,8 @@ pub struct SweepRegistry {
     roll_gate: roll_gate::RollGate,
 }
 
-/// Resolve this host's identity string for collision records (Issue #4085) and
-/// peer-claim advertisements (Issue #4028), precedence `LOOM_HOST_ID` env >
-/// `$HOSTNAME` env > the `hostname` binary > [`UNKNOWN_HOST`]. This is loom's
-/// single, explicit host-identity concept — derived (not a new config block).
-///
-/// **Only the `LOOM_HOST_ID` branch is stable across launch contexts (Issue
-/// #5063).** The other two are not, despite the *value* each one would
-/// return being fixed for a given machine:
-///
-/// - `$HOSTNAME` is typically **unset** under a service supervisor
-///   (launchd/systemd export nothing by that name) but **may be set and
-///   differ from the `hostname` binary's output** under an interactive
-///   shell (some shells export it, often in FQDN form). So the same
-///   machine can advertise two different identities depending on whether
-///   its daemon was started by a service unit or from a terminal.
-/// - The `hostname` binary's output is an accident of DHCP/cloud-init/OS
-///   defaults (`ip-198-51-100-42` on an unconfigured EC2 host), not a name
-///   any operator chose — it commonly disagrees with the host's tailnet/
-///   fleet name and with whatever name an observability ingest key was
-///   minted against.
-///
-/// Every caller that needs a name to actually *mean* something (telemetry
-/// attribution, dashboard rows, ingest-key binding, peer-claim self-
-/// recognition) should have `LOOM_HOST_ID` set at provisioning time — see
-/// [`HOST_ID_ENV`]. When it is not set, this function logs a one-time
-/// process-lifetime warning identifying which weaker source it fell back
-/// to, so an operator notices before the mismatch becomes a telemetry/
-/// dashboard-naming (or, worse, a self-claim-recognition, see
-/// [`UNKNOWN_HOST`]) problem.
-///
-/// safehoused stamps the socket `from` from the *persona* (all daemons share
-/// `loom_daemon`), which cannot distinguish hosts, so the claim payload carries
-/// this identity in its body for self-claim recognition.
-#[must_use]
-pub fn host_identity() -> String {
-    // One-time (process-lifetime) warning gate: `host_identity()` is called on
-    // every dispatch/re-advertisement/collision-record path, so logging on
-    // every call would spam the log without adding information — the
-    // resolution source does not change mid-process.
-    static FALLBACK_WARNED: OnceLock<()> = OnceLock::new();
-    let warn_once = |message: String| {
-        FALLBACK_WARNED.get_or_init(|| log::warn!("{message}"));
-    };
-
-    if let Ok(v) = std::env::var(HOST_ID_ENV) {
-        let t = v.trim();
-        if !t.is_empty() {
-            return t.to_string();
-        }
-    }
-    if let Ok(v) = std::env::var("HOSTNAME") {
-        let t = v.trim();
-        if !t.is_empty() {
-            warn_once(format!(
-                "sweep_registry: host identity resolved from $HOSTNAME ({t:?}), not an \
-                 explicit $LOOM_HOST_ID — this makes the identity launch-context-dependent (see \
-                 `host_identity()`'s doc comment) and it may disagree with telemetry/dashboard/\
-                 ingest-key naming for this host (Issue #5063). Set $LOOM_HOST_ID to pin a \
-                 stable, explicit identity."
-            ));
-            return t.to_string();
-        }
-    }
-    if let Ok(out) = Command::new("hostname").output() {
-        if out.status.success() {
-            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !s.is_empty() {
-                warn_once(format!(
-                    "sweep_registry: host identity resolved from the `hostname` binary \
-                     ({s:?}), not an explicit $LOOM_HOST_ID — this is commonly an accident of \
-                     DHCP/cloud-init/OS defaults and may disagree with telemetry/dashboard/\
-                     ingest-key naming for this host (Issue #5063). Set $LOOM_HOST_ID to pin a \
-                     stable, explicit identity."
-                ));
-                return s;
-            }
-        }
-    }
-    warn_once(format!(
-        "sweep_registry: host identity could not be resolved from $LOOM_HOST_ID, $HOSTNAME, or \
-         the `hostname` binary — falling back to {UNKNOWN_HOST:?}. This sentinel never \
-         participates in peer-claim self-recognition (Issue #5063); set $LOOM_HOST_ID to give \
-         this host a real identity."
-    ));
-    UNKNOWN_HOST.to_string()
-}
-
 /// Env var restoring the pre-#6322 behavior of publishing this host's RAW
-/// [`host_identity()`] value into a `loom:lease`/`loom:lease-yield` forge
+/// [`lease_host_identity()`] value into a `loom:lease`/`loom:lease-yield` forge
 /// *comment* (issue/PR comment bodies — a public, permanent, world-readable
 /// artifact on a public repo). Default **off**: `SweepRegistry::published_host_id`
 /// publishes [`opaque_host_id`] instead, because many repos this daemon
@@ -961,7 +861,7 @@ pub fn host_identity() -> String {
 /// record just because a claim happened to be posted there. `1`/`true`/
 /// `yes`/`on` (case-insensitive) restores raw publishing; anything else,
 /// including unset, keeps the opaque default. This ONLY changes what gets
-/// PUBLISHED to the forge — [`host_identity()`] itself, and every other
+/// PUBLISHED to the forge — [`host_identity()`], and every other
 /// consumer of it (peer-claim advertisements, collision-detection log lines,
 /// the fleet dashboard, telemetry), is unaffected: those channels are not a
 /// public issue-tracker comment. See `defaults/docs/lease-record.md` for the
@@ -1146,7 +1046,7 @@ impl SweepRegistry {
             dispatch_backoff_config: DispatchBackoffConfig::default(),
             dispatch_backoff: HashMap::new(),
             noop_cooldown_config: NoopCooldownConfig::default(),
-            noop_cooldown: HashMap::new(),
+            noop_cooldown: NoopCooldownTable::default(),
             decline_cooldown_config: DeclineCooldownConfig::default(),
             decline_cooldown: HashMap::new(),
             prless_retry_config: PrlessRetryConfig::default(),
@@ -1711,73 +1611,45 @@ mod tests {
         std::env::remove_var(SPAWN_BIN_ENV);
     }
 
-    /// RAII guard: saves `LOOM_HOST_ID`/`HOSTNAME`, clears both for the
-    /// duration of the test, and restores whatever the ambient process
-    /// environment actually had on drop — a test that unconditionally
-    /// `remove_var`s these without restoring would leak into the *next*
-    /// test's `host_identity()` result (and, worse, into the real value this
-    /// binary reports for the remainder of the process).
-    struct HostIdentityEnvGuard {
-        host_id: Option<String>,
-        hostname: Option<String>,
-    }
+    // RAII guard: saves and clears every host-identity input (`LOOM_HOST_ID`,
+    // `HOSTNAME`, `LOOM_HOST_ID_FILE`, `LOOM_CONFIG_DEFAULTS_FILE`) and
+    // restores the ambient values on drop.
+    use crate::host_identity::tests::EnvGuard as HostIdentityEnvGuard;
 
-    impl HostIdentityEnvGuard {
-        fn clear() -> Self {
-            let guard = Self {
-                host_id: std::env::var(HOST_ID_ENV).ok(),
-                hostname: std::env::var("HOSTNAME").ok(),
-            };
-            std::env::remove_var(HOST_ID_ENV);
-            std::env::remove_var("HOSTNAME");
-            guard
-        }
-    }
-
-    impl Drop for HostIdentityEnvGuard {
-        fn drop(&mut self) {
-            match &self.host_id {
-                Some(v) => std::env::set_var(HOST_ID_ENV, v),
-                None => std::env::remove_var(HOST_ID_ENV),
-            }
-            match &self.hostname {
-                Some(v) => std::env::set_var("HOSTNAME", v),
-                None => std::env::remove_var("HOSTNAME"),
-            }
-        }
-    }
-
-    /// Issue #5063: `LOOM_HOST_ID` must win over both `$HOSTNAME` and the
-    /// `hostname` binary, and the `unknown-host` sentinel constant used
-    /// elsewhere for self-claim recognition must match what this function
-    /// actually returns when every source is unavailable.
+    /// Issue #5063 / #11530: `fleet.hostId` > `LOOM_HOST_ID` > the persisted
+    /// id, blanks ignored, and never `$HOSTNAME`. Holds `loom_config_env`
+    /// (outer) and the default group (inner), the crate's nesting order.
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn host_identity_env_precedence() {
-        let _guard = HostIdentityEnvGuard::clear();
+        #[serial]
+        fn inner() {
+            let _guard = HostIdentityEnvGuard::clear();
+            let dir = tempfile::tempdir().unwrap();
+            let id_file = dir.path().join("host-id");
+            std::fs::write(&id_file, "persisted-studio\n").unwrap();
+            std::env::set_var(crate::host_identity::HOST_ID_FILE_ENV, &id_file);
+            let tier = dir.path().join("defaults.json");
+            std::fs::write(&tier, r#"{"fleet":{"hostId":"roster-studio"}}"#).unwrap();
+            std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, &tier);
+            std::env::set_var(HOST_ID_ENV, "robb-studio");
+            std::env::set_var("HOSTNAME", "studio");
+            assert_eq!(host_identity(), "roster-studio", "fleet.hostId beats LOOM_HOST_ID");
 
-        // Explicit LOOM_HOST_ID wins over everything else.
-        std::env::set_var(HOST_ID_ENV, "robb-studio");
-        std::env::set_var("HOSTNAME", "studio");
-        assert_eq!(host_identity(), "robb-studio");
+            std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+            assert_eq!(host_identity(), "robb-studio");
+            std::env::set_var(HOST_ID_ENV, "   ");
+            assert_eq!(host_identity(), "persisted-studio", "blank LOOM_HOST_ID is ignored");
+            std::env::remove_var(HOST_ID_ENV);
+            assert_eq!(host_identity(), "persisted-studio", "never $HOSTNAME");
 
-        // With LOOM_HOST_ID unset, $HOSTNAME is used.
-        std::env::remove_var(HOST_ID_ENV);
-        assert_eq!(host_identity(), "studio");
-
-        // Blank values are treated as absent at every precedence level.
-        std::env::set_var(HOST_ID_ENV, "   ");
-        assert_eq!(
-            host_identity(),
-            "studio",
-            "a whitespace-only LOOM_HOST_ID must not shadow $HOSTNAME"
-        );
-        std::env::remove_var(HOST_ID_ENV);
-        std::env::set_var("HOSTNAME", "  ");
-        // Falls all the way through to the `hostname` binary (present on any
-        // dev/CI machine this test runs on) or, failing that, the sentinel —
-        // either way it must not be the blank string.
-        assert_ne!(host_identity(), "");
+            // Lease identity is unchanged: the legacy chain, opaque-hashed.
+            let registry = SweepRegistry::new(SweepRegistryConfig::new(dir.path().to_path_buf()));
+            assert_eq!(registry.published_host_id(), opaque_host_id("studio"));
+            std::env::set_var(HOST_ID_ENV, "robb-studio");
+            assert_eq!(registry.published_host_id(), opaque_host_id("robb-studio"));
+        }
+        inner();
     }
 
     /// The `UNKNOWN_HOST` constant peer-claim self-recognition special-cases

@@ -62,6 +62,7 @@ pub mod codex;
 pub mod kimi;
 pub mod opencode;
 pub mod tail;
+pub mod zai;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -275,12 +276,34 @@ struct Sample {
     pool_start: Option<DateTime<Utc>>,
 }
 
+/// Fold the api-key pool into the `tokens.snapshot` accounts. A seat the
+/// snapshot already carries (Z.ai, #11396) is not counted a second time in the
+/// per-provider aggregates: it picks up the declared plan facts the snapshot
+/// row has no field for, and the pool's eligibility restriction (a seat the
+/// pool cannot vouch for is never usable, however the quota reads).
+fn merge_pool(accounts: &mut Vec<PoolAccount>, pool: Vec<PoolAccount>) {
+    for pooled in pool {
+        match accounts
+            .iter_mut()
+            .find(|a| a.provider == pooled.provider && a.account == pooled.account)
+        {
+            Some(known) => {
+                known.usable &= pooled.usable;
+                known.exhausted |= pooled.exhausted;
+                known.plan_token_limit = pooled.plan_token_limit;
+                known.plan_window_secs = pooled.plan_window_secs;
+            }
+            None => accounts.push(pooled),
+        }
+    }
+}
+
 fn sample(workspace_root: &Path, mut accounts: Vec<PoolAccount>, now: DateTime<Utc>) -> Sample {
     let api_keys = api_key_accounts_in(&crate::api_keys_pool::paths::pool_roots(workspace_root));
     let (pool, pool_start) = {
         let mut guard = STATE.lock().unwrap_or_else(PoisonError::into_inner);
         let state = guard.get_or_insert_with(QuotaState::default);
-        accounts.extend(state.api_key_pool(api_keys));
+        merge_pool(&mut accounts, state.api_key_pool(api_keys));
         let pool_start = state.last_pool_sample;
         (state.pool_points(&accounts, now), pool_start)
     };

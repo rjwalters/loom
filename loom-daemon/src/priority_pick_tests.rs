@@ -5,6 +5,14 @@ fn key(number: u32, created: Option<&str>, labels: &[&str]) -> IssueKey {
         number,
         created_at: created.map(str::to_string),
         level: Level::of(labels),
+        main_red_fix: false,
+    }
+}
+
+fn fix(number: u32, created: Option<&str>) -> IssueKey {
+    IssueKey {
+        main_red_fix: true,
+        ..key(number, created, &[])
     }
 }
 
@@ -13,6 +21,14 @@ fn ws(name: &str, priority: u32, vi: bool) -> WorkspaceEntry {
         workspace: name.to_string(),
         priority,
         has_very_important: vi,
+        has_red_main_fix: false,
+    }
+}
+
+fn ws_fix(name: &str, priority: u32) -> WorkspaceEntry {
+    WorkspaceEntry {
+        has_red_main_fix: true,
+        ..ws(name, priority, false)
     }
 }
 
@@ -129,4 +145,97 @@ fn draw_records_candidates_weights_and_pick() {
     let v = serde_json::to_value(&d).unwrap();
     assert_eq!(v["picked"], d.picked);
     assert!(draw_workspace(&[], &mut PickRng::from_seed(1)).is_none());
+}
+
+/// ACCEPTANCE (#11509): with N+2 open very-important issues in a workspace
+/// (N = [`VERY_IMPORTANT_CAP`] = 1), exactly the N oldest keep the level, in
+/// any input order. The fixtures carry no actor: only number and age.
+#[test]
+fn only_the_oldest_very_important_issue_holds_the_cap() {
+    assert_eq!(VERY_IMPORTANT_CAP, 1);
+    let open = vec![
+        key(30, Some("2026-03-01T00:00:00Z"), &[VERY_IMPORTANT_LABEL]),
+        key(10, Some("2026-02-01T00:00:00Z"), &[VERY_IMPORTANT_LABEL]),
+        key(20, Some("2026-01-01T00:00:00Z"), &[VERY_IMPORTANT_LABEL]),
+    ];
+    assert_eq!(very_important_holders(&open), vec![20]);
+    let mut reversed = open.clone();
+    reversed.reverse();
+    assert_eq!(very_important_holders(&reversed), vec![20]);
+}
+
+#[test]
+fn very_important_holder_ties_break_by_number_and_dated_first() {
+    let same_age = vec![
+        key(9, Some("2026-01-01T00:00:00Z"), &[]),
+        key(4, Some("2026-01-01T00:00:00Z"), &[]),
+    ];
+    assert_eq!(very_important_holders(&same_age), vec![4]);
+    let undated = vec![key(1, None, &[]), key(8, Some("2026-05-01T00:00:00Z"), &[])];
+    assert_eq!(very_important_holders(&undated), vec![8]);
+    // A number listed twice (ready listing + VI listing) counts once, and its
+    // known age wins over a missing one.
+    let dup = vec![
+        key(5, None, &[]),
+        key(5, Some("2026-01-01T00:00:00Z"), &[]),
+        key(6, Some("2026-02-01T00:00:00Z"), &[]),
+    ];
+    assert_eq!(very_important_holders(&dup), vec![5]);
+    assert!(very_important_holders(&[]).is_empty());
+}
+
+#[test]
+fn red_main_fix_leads_the_workspace_order() {
+    // #11547: a verified red-main fix (default level, newest) goes ahead of
+    // every level and every older issue.
+    let items = vec![
+        key(9, Some("2026-01-01T00:00:00Z"), &[]),
+        key(30, Some("2026-02-01T00:00:00Z"), &[VERY_IMPORTANT_LABEL]),
+        fix(77, Some("2026-09-01T00:00:00Z")),
+        key(2, Some("2026-02-01T00:00:00Z"), &[IMPORTANT_LABEL]),
+    ];
+    let order: Vec<u32> = order_in_workspace(items.clone())
+        .iter()
+        .map(|i| i.number)
+        .collect();
+    assert_eq!(order, vec![77, 30, 2, 9]);
+    assert_eq!(next_in_workspace(&items).unwrap().number, 77);
+}
+
+#[test]
+fn red_main_fix_workspace_wins_the_draw_over_very_important() {
+    let entries = vec![
+        ws("a/tool", 0, false),
+        ws("b/prod", 0, true),
+        ws_fix("c/red", 100),
+    ];
+    for seed in 0..200 {
+        let d = draw_workspace(&entries, &mut PickRng::from_seed(seed)).unwrap();
+        assert_eq!(d.picked, "c/red");
+        assert_eq!(d.pool, "red-main-fix");
+        assert_eq!(d.candidates.len(), 1);
+    }
+}
+
+#[test]
+fn without_a_red_main_fix_the_draw_pools_are_unchanged() {
+    let vi = vec![ws("a/tool", 0, false), ws("b/prod", 100, true)];
+    let all = vec![ws("a/tool", 0, false), ws("b/prod", 100, false)];
+    for seed in 0..200 {
+        let d = draw_workspace(&vi, &mut PickRng::from_seed(seed)).unwrap();
+        assert_eq!((d.pool, d.picked.as_str()), ("very-important", "b/prod"));
+        let d = draw_workspace(&all, &mut PickRng::from_seed(seed)).unwrap();
+        assert_eq!(d.pool, "all");
+        assert_eq!(d.candidates.len(), 2);
+    }
+}
+
+#[test]
+fn red_main_fix_is_not_an_input_to_the_very_important_cap() {
+    // The holder is the oldest very-important issue whatever the flag says.
+    let open = vec![
+        fix(30, Some("2026-03-01T00:00:00Z")),
+        key(20, Some("2026-01-01T00:00:00Z"), &[VERY_IMPORTANT_LABEL]),
+    ];
+    assert_eq!(very_important_holders(&open), vec![20]);
 }

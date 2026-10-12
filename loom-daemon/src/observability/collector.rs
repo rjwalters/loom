@@ -78,6 +78,8 @@ use crate::workspace_pool::WorkspacePool;
 use super::queue::QueueSink;
 mod correlation;
 mod identity;
+mod zai_accounts;
+use zai_accounts::sample_zai_accounts;
 pub(crate) type DispatchKey = (String, u32);
 
 /// Timeout on the `gh repo view` slug lookup — generous but bounded so a
@@ -742,17 +744,23 @@ fn terminal_records(
     // and the classifier hands back the mandatory `failure_class` (a
     // synthesized `unclassified:*` label here, since nothing classified this
     // transition) together with the disposition.
-    let (disposition, failure_class) =
-        crate::telemetry::classify_disposition(&crate::telemetry::DispositionSignals {
-            result,
-            pr_number,
-            failure_class: None,
-            phase_durations: &[],
-            total_duration_sec,
-            judge_verdicts: None,
-            doctor_cycles: None,
-            issue_end_state: None,
-        });
+    // #11429: no Judge verdicts are read here, so a `landed` failure stays a
+    // `failure` (no proof it landed clean).
+    let signals = crate::telemetry::DispositionSignals {
+        result,
+        pr_number,
+        failure_class: None,
+        phase_durations: &[],
+        total_duration_sec,
+        judge_verdicts: None,
+        doctor_cycles: None,
+        issue_end_state: None,
+        // `result` already encodes the only exit fact this path has
+        // (`Success` ⇔ exit 0), so a `Failure` here is never a clean exit.
+        exit_code: None,
+    };
+    let (disposition, failure_class) = crate::telemetry::classify_disposition(&signals);
+    let outcome_result = crate::telemetry::result_for_disposition(&signals, disposition);
     vec![
         TelemetryRecord::SweepCompleted(crate::telemetry::SweepCompletedRecord {
             repo: repo.clone(),
@@ -779,7 +787,7 @@ fn terminal_records(
             config: std::collections::BTreeMap::new(),
             phase_durations: Vec::<PhaseDuration>::new(),
             total_duration_sec,
-            result,
+            result: outcome_result,
             disposition,
             pr_number,
             // Token fields (and `tokens_status`) are filled by
@@ -825,6 +833,7 @@ fn terminal_records(
             attempt_index: None,
             previous_sweep_id: None,
             trigger: None,
+            dispatch_origin: None,
             rework_events: None,
             pr_numbers: None,
             hw_lines_added: None,
@@ -940,6 +949,12 @@ async fn sample_snapshots(
     token_record
         .accounts
         .extend(sample_registry_provider_accounts(workspace_root));
+    // The Z.ai api-keys seats (#11396): per-seat 5h/weekly burn from the
+    // read-only quota endpoint, cached between ticks; unknown, never 0, on any
+    // failure. Skipped entirely (no client, no request) with no zai seats.
+    token_record
+        .accounts
+        .extend(sample_zai_accounts(workspace_root).await);
     // Token burn + per-provider pool state (Issue #8857), through the
     // OTLP-only ops sink — a no-op (no reads at all) without an OTLP exporter.
     super::ops::quota::record(workspace_root, &token_record.accounts).await;

@@ -150,6 +150,10 @@ pub(crate) fn check(
     let context = crate::runtime_preference::DispatchContext {
         complexity: None,
         intent: crate::runtime_preference::Intent::Dispatch,
+        // #11453: a role tick consults the per-workspace launch-failure hold,
+        // so a tap that keeps failing deterministically falls through
+        // `rolePreference` instead of being relaunched every interval.
+        role_tick: true,
     };
     let Ok(crate::runtime_preference::Decision::Preference {
         source,

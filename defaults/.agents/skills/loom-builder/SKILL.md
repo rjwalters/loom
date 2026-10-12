@@ -989,7 +989,6 @@ exactly one sub-kind in the **same** command (additive; filters unchanged):
 | `loom:operator-blocked` | Waiting on a **named** issue/PR/piece of infrastructure that does not exist yet — self-clearing once that lands |
 | `loom:operator-mechanical` | Needs host or admin access, a credential, or another mechanical action — no judgement required |
 | `loom:operator-decision` | The act requires authority you structurally cannot hold — a preference call or an authority act (binds the entity, irreversible disclosure, spending, credentials only the operator holds, accepting risk on the entity's behalf, physical-world action) |
-| `loom:operator-objective` | The work is determined once the operator states an objective — name the candidate objectives and the answer under each (#5826) |
 
 ```bash
 # Builder parking a claimed issue on a decision: 2-4 ranked options, each with
@@ -1005,8 +1004,8 @@ it, name the axis along which two well-informed people would still disagree
 and show it is a preference, not a fact (the falsifiability test in
 `.loom/docs/label-state-machine.md`). If you cannot name that axis, the
 "decision" is really an unfinished derivation — keep working instead of
-parking it. If the only gap is an unstated objective, that is
-`loom:operator-objective`, not `loom:operator-decision`.
+parking it. If the only gap is an unstated objective, file a decision whose
+options are the candidate objectives (#10000).
 
 **If you chose `loom:operator-blocked`**, the same comment MUST name the blocker
 in machine-readable form: a literal `Blocked by #N` / `Depends on #N` /
@@ -1017,10 +1016,6 @@ pass can tell when the blocker clears.
 
 **If you chose `loom:operator-decision`**, the options' whys MUST name the
 disagreement axis and why it is a preference, not a fact.
-
-**If you chose `loom:operator-objective`**, the same comment MUST list the
-candidate objectives and the answer under each — not just "needs an
-objective."
 
 Full taxonomy and rationale: `.loom/docs/label-state-machine.md` →
 "`loom:operator-only` sub-kinds".
@@ -1177,7 +1172,7 @@ round — none of which any offline fixture could have caught.
 
 ### MANDATORY: Derive Titles From Your Diff, Not the Issue
 
-**Before committing or creating a PR**, you MUST review your actual code changes and derive titles from them:
+**Before committing or creating a PR**, review your actual changes and derive titles from them:
 
 ```bash
 # Step 1: Review what you actually changed
@@ -1185,21 +1180,22 @@ git diff --stat
 git diff   # Read the actual changes
 
 # Step 2: Write a commit message that describes the CODE CHANGE
-#   Ask: "What does this diff do?" — NOT "What issue is this for?"
+#   Ask: "What does this diff do?", not "What issue is this for?"
 #
 #   WRONG: "feat: implement changes for issue #2678"
 #   WRONG: "Builder generates generic commit/PR titles despite explicit anti-patterns"
-#   WRONG: "feat: bug: MCP status bar noise..." (double prefix — copied issue title prefix)
+#   WRONG: "feat: bug: MCP status bar noise..." (double prefix copied from the issue)
 #   RIGHT: "docs: add mandatory diff-review step before commit/PR creation"
 #
-#   NOTE: If the issue title starts with a prefix like "bug:", "feat:", etc.,
-#   do NOT copy it verbatim. Strip the issue prefix and derive your own from the diff.
-#   "bug:" → use "fix:" in the PR title. See builder-pr.md for the full mapping.
+#   NOTE: never copy an issue-title prefix ("bug:", "feat:") verbatim; derive
+#   your own from the diff ("bug:" → "fix:"; full mapping in builder-pr.md).
+#   Never write a skip-CI marker ("[skip ci]" etc.) literally: no CI runs and
+#   create-pr.sh refuses it (#11389). Put a space inside, or describe it.
 
-# Step 3: Use the same approach for the PR title
+# Step 3: Same approach for the PR title
 ```
 
-**The PR title and commit message MUST describe what the code change does, not reference the issue.** See builder-pr.md for the full rules, anti-patterns, and examples.
+**The PR title and commit message MUST describe what the code change does, not reference the issue.** Full rules and examples: builder-pr.md.
 
 ### Commit Conventions: DCO / sign-off
 

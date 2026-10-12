@@ -21,7 +21,7 @@ fn actions(steps: &[Step]) -> Vec<&'static str> {
             Step::Info(_) => "info",
             Step::Warning(_) => "warning",
             Step::Reopen => "reopen",
-            Step::Swap => "swap",
+            Step::Swap(_) => "swap",
         })
         .collect()
 }
@@ -150,7 +150,8 @@ fn a_failed_read_reads_as_an_empty_unknown_state() {
             IssueView {
                 is_pr: false,
                 state: String::new(),
-                building: false
+                building: false,
+                hold: None
             },
             "{body:?}"
         );
@@ -239,7 +240,7 @@ fn render_emits_one_record_per_step() {
         Step::Warning("w".into()),
         Step::Reopen,
         Step::Info("i".into()),
-        Step::Swap,
+        Step::Swap(None),
     ];
     assert_eq!(render(&steps), "WARNING\tw\nREOPEN\nINFO\ti\nSWAP\n");
 }
@@ -257,4 +258,93 @@ fn render_gives_every_continuation_line_its_level() {
 #[test]
 fn render_of_nothing_is_empty() {
     assert_eq!(render(&[]), "");
+}
+
+// --- the remainder-hold marker (#9264) --------------------------------------
+
+fn held_body(body_field: &str) -> String {
+    format!(
+        r#"{{"state":"open","labels":[{{"name":"loom:building"}}],"body":{}}}"#,
+        serde_json::to_string(body_field).unwrap()
+    )
+}
+
+const MARKER: &str =
+    r#"text <!-- loom:remainder-hold reason="needs the fleet on a release" --> more"#;
+
+fn swap_target(steps: &[Step]) -> Option<Option<String>> {
+    steps.iter().rev().find_map(|s| match s {
+        Step::Swap(t) => Some(t.clone()),
+        _ => None,
+    })
+}
+
+#[test]
+fn a_marker_swaps_to_operator_and_quotes_the_reason() {
+    let steps = plan_for(&held_body(MARKER), PreMerge::default());
+    assert_eq!(swap_target(&steps), Some(Some("loom:operator".into())));
+    let Step::Info(m) = &steps[0] else { panic!() };
+    assert!(m.contains("needs the fleet on a release"), "{m}");
+}
+
+#[test]
+fn no_marker_missing_or_null_body_swaps_to_issue() {
+    let plain = plan_for(OPEN_BUILDING, PreMerge::default());
+    for body in [
+        held_body("nothing here"),
+        r#"{"state":"open","labels":[{"name":"loom:building"}],"body":null}"#.to_string(),
+        OPEN_BUILDING.to_string(),
+    ] {
+        let steps = plan_for(&body, PreMerge::default());
+        assert_eq!(swap_target(&steps), Some(None), "{body}");
+        assert_eq!(steps[0], plain[0], "{body}");
+    }
+}
+
+#[test]
+fn a_marker_on_a_non_building_issue_is_the_idempotent_skip() {
+    let body = format!(
+        r#"{{"state":"open","labels":[],"body":{}}}"#,
+        serde_json::to_string(MARKER).unwrap()
+    );
+    let steps = plan_for(&body, PreMerge::default());
+    assert_eq!(actions(&steps), ["info"]);
+}
+
+#[test]
+fn a_conflicted_close_with_a_marker_reopens_then_holds() {
+    let body = held_body(MARKER).replace("open", "closed");
+    let pre = PreMerge {
+        conflicted: true,
+        open_before_merge: true,
+    };
+    let steps = plan_for(&body, pre);
+    assert_eq!(actions(&steps), ["warning", "reopen", "info", "swap"]);
+    assert_eq!(swap_target(&steps), Some(Some("loom:operator".into())));
+}
+
+#[test]
+fn a_marker_in_a_fenced_block_is_ignored() {
+    let fenced = format!("example:\n```\n{MARKER}\n```\n");
+    let steps = plan_for(&held_body(&fenced), PreMerge::default());
+    assert_eq!(swap_target(&steps), Some(None));
+}
+
+#[test]
+fn a_marker_without_a_reason_still_holds() {
+    for m in [
+        "<!-- loom:remainder-hold -->",
+        r#"<!-- loom:remainder-hold reason="" -->"#,
+    ] {
+        let steps = plan_for(&held_body(m), PreMerge::default());
+        assert_eq!(swap_target(&steps), Some(Some("loom:operator".into())), "{m}");
+        let Step::Info(t) = &steps[0] else { panic!() };
+        assert!(t.contains("reason unstated"), "{t}");
+    }
+}
+
+#[test]
+fn render_emits_the_target_only_for_a_held_swap() {
+    assert_eq!(render(&[Step::Swap(None)]), "SWAP\n");
+    assert_eq!(render(&[Step::Swap(Some("loom:operator".into()))]), "SWAP\tloom:operator\n");
 }

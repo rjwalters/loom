@@ -449,7 +449,7 @@ pub fn forge_queue_probe() -> QueueProbe {
             }
         }
         if labels.contains(&"loom:review-requested") {
-            return crate::pr_planning::has_interactive_fallback(root, &gh_bin)
+            return crate::pr_planning::has_judge_fallback(root, &gh_bin)
                 .map_err(|e| e.to_string());
         }
         Ok(false)

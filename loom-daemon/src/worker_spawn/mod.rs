@@ -15,11 +15,16 @@ pub mod launch_outcome;
 // `pub(crate)` so the daemon's dispatch surfaces can call `guard_dispatch`.
 pub(crate) mod llm_gateway;
 mod opencode_version;
+mod phase_run;
 mod profile_check;
 pub(crate) mod profiles;
 mod prompt;
 
 pub use profile_check::{cli as profile_cli, WorkerArgs as WorkerCommand};
+// #11360: the mixed-sweep accounting fixture builds its escalated-Doctor log
+// from the exact report `worker run --escalate-claude` prints.
+#[cfg(test)]
+pub(crate) use phase_run::escalation_report;
 
 use harness::Harness;
 use std::{
@@ -399,11 +404,46 @@ fn run_preflight(
             .as_deref()
             .and_then(prompt::role_invocation)
             .map(|(r, _)| r);
+        // #11400: judge exclusion against the profile this launch will select —
+        // an explicit `--profile` — not the env/default profile it overrides.
+        let launch_profile = options
+            .profile
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty());
         for role in role.as_deref().into_iter().chain(prompt_role) {
-            crate::runtime_admission::resolve_and_admit(root, role, Some(&runtime))
-                .map_err(|e| LaunchError::config(e.diagnostic()))?;
+            crate::runtime_admission::resolve_and_admit_profiled(
+                root,
+                role,
+                Some(&runtime),
+                launch_profile,
+                crate::runtime_admission::AdmissionContext::Host,
+            )
+            .map_err(|e| LaunchError::config(e.diagnostic()))?;
         }
         let mut selection = profiles::select(&runtime, &options, &config)?;
+        // #11400: the profile actually selected (an explicit `--profile` may
+        // differ from the one admission judged) must not exclude this role.
+        if let Some(name) = selection.profile.as_deref() {
+            for role in role.as_deref().into_iter().chain(prompt_role) {
+                let Some(canonical) = crate::runtime_admission::canonical_role(role) else {
+                    continue;
+                };
+                // A native sweep runs every phase in this one session.
+                let phases: &[&str] = if canonical == "sweep-lifecycle" {
+                    &["builder", "curator", "judge", "doctor"]
+                } else {
+                    &[canonical]
+                };
+                for &checked in phases {
+                    if profiles::excluded_role(&runtime, Some(name), checked, &config).is_some() {
+                        return Err(LaunchError::config(format!(
+                            "model profile {name:?} excludes role {checked:?} (excludedRoles, #11400)"
+                        )));
+                    }
+                }
+            }
+        }
         trace_identity.insert("loom.provider".into(), selection.provider.clone());
         trace_identity.insert("loom.model".into(), selection.model.clone());
         if let Some(effort) = &selection.effort {
@@ -539,7 +579,12 @@ fn run_preflight(
             Some(profile) => crate::runtime_preference::Tap::with_profile(&runtime, profile),
             None => crate::runtime_preference::Tap::runtime(&runtime),
         };
-        writeln!(log, "# LOOM_LAUNCH {}", serde_json::json!({"schema":1,"runtime":runtime,"tap":tap.to_string(),"provider":selection.provider,"model":selection.model,"profile":selection.profile,"effort":selection.effort,"credentialSource":credential.source.as_str(),"credentialProvider":credential.provider,"credentialAccount":credential.account,"usage":"native-json-events","billing":"not-measured","llmBilling":llm_billing.billing,"llmCredentialKind":llm_billing.credential_kind,"prompt_bytes":expanded.as_deref().map(str::len)})).map_err(|e| LaunchError::config(e.to_string()))?;
+        let launch = serde_json::json!({"schema":1,"runtime":runtime,"tap":tap.to_string(),"provider":selection.provider,"model":selection.model,"profile":selection.profile,"effort":selection.effort,"credentialSource":credential.source.as_str(),"credentialProvider":credential.provider,"credentialAccount":credential.account,"usage":"native-json-events","billing":"not-measured","llmBilling":llm_billing.billing,"llmCredentialKind":llm_billing.credential_kind,"prompt_bytes":expanded.as_deref().map(str::len)}).to_string();
+        writeln!(log, "# LOOM_LAUNCH {launch}").map_err(|e| LaunchError::config(e.to_string()))?;
+        // J1 shadow (#11346): attribution only, after the legacy line is written.
+        if let Some(log_path) = options.log.as_deref() {
+            crate::journal::execution::launch_recorded(root, log_path, &launch);
+        }
         if let Some(route) = &gateway {
             writeln!(log, "{}", route.marker(&runtime))
                 .map_err(|e| LaunchError::config(e.to_string()))?;

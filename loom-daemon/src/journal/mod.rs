@@ -2,9 +2,9 @@
 //!
 //! One writer/reader implementation for every concern journal
 //! (`docs/design/persistence-inventory.md` §9.1). It generalises
-//! `telemetry/trace/journal.rs` (which stays as it is). **Nothing in the
-//! daemon calls this module yet**: no producer is migrated or wired, and no
-//! production journal root is chosen (Q1 stays open for 2b). The only entry
+//! `telemetry/trace/journal.rs` (which stays as it is). Its first caller is
+//! [`execution`] (J1, Phase 2b, #11346): default-off shadow appends from the
+//! daemon's execution producers, rooted machine-level per Q1. Other entry
 //! points are this API and `loom-daemon journal verify`.
 //!
 //! # Layout
@@ -48,6 +48,7 @@
 
 mod cursor;
 mod envelope;
+pub mod execution;
 mod lock;
 mod reader;
 mod segment;

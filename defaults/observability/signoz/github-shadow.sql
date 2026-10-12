@@ -168,6 +168,7 @@ SELECT JSONExtractString(t.labels, 'account') AS account,
        sumIf(s.value, JSONExtractString(t.labels, 'outcome') IN ('ok', 'error')) AS attributed_max,
        sumIf(s.value, JSONExtractString(t.labels, 'outcome') = 'not_modified') AS free_304,
        sumIf(s.value, JSONExtractString(t.labels, 'outcome') = 'rate_limited') AS refused,
+       sumIf(s.value, JSONExtractString(t.labels, 'outcome') = 'secondary_limited') AS secondary_refused,
        sumIf(s.value, JSONExtractString(t.labels, 'outcome') = 'ok'
                       AND JSONExtractString(t.labels, 'agent') NOT IN ('', '-')) AS agent_attributed,
        sumIf(s.value, JSONExtractString(t.labels, 'outcome') = 'not_modified'

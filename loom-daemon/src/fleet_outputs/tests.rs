@@ -1,4 +1,5 @@
 use super::*;
+use crate::intake_reconcile::singleton::{next_heartbeat, PassReport, PASS_HEARTBEAT_KIND};
 use chrono::TimeZone;
 
 #[derive(Default)]
@@ -185,14 +186,22 @@ fn disabled_opt_in_jobs_do_not_fire() {
     let r = roster(30);
     let mut f = whole_fleet_at(ago(1), &r);
     for o in SINGLETON_OUTPUTS {
-        if o.record_kind.starts_with("captain-gauges/v1:") || o.record_kind == "ci.run" {
+        if o.record_kind.starts_with("captain-gauges/v1:")
+            || o.record_kind == "ci.run"
+            || o.job == crate::intake_reconcile::singleton::SINGLETON_JOB_NAME
+        {
             f.fleet.remove(o.record_kind);
         }
     }
-    assert_eq!(evaluate(SINGLETON_OUTPUTS, &f, &r, now()).len(), 4);
-    f.disabled = BTreeSet::from([gauges::ENABLED_KEY, CI_TELEMETRY_KEY]);
+    assert_eq!(evaluate(SINGLETON_OUTPUTS, &f, &r, now()).len(), 5);
+    f.disabled = BTreeSet::from([
+        gauges::ENABLED_KEY,
+        CI_TELEMETRY_KEY,
+        crate::intake_reconcile::singleton::SINGLETON_KEY,
+    ]);
     assert!(evaluate(SINGLETON_OUTPUTS, &f, &r, now()).is_empty());
-    // Only the sub-switches off: stage-dwell is still owed.
+    // Only the sub-switches off: stage-dwell is still owed, and so is the
+    // intake pass (gated by the singleton key alone).
     f.disabled = BTreeSet::from([
         gauges::STAR_FACTS_KEY,
         gauges::QUEUE_BLOCKED_KEY,
@@ -200,6 +209,57 @@ fn disabled_opt_in_jobs_do_not_fire() {
     ]);
     assert_eq!(
         kinds(&evaluate(SINGLETON_OUTPUTS, &f, &r, now())),
-        ["captain-gauges/v1:stage-dwell"]
+        ["captain-gauges/v1:stage-dwell", PASS_HEARTBEAT_KIND]
     );
+}
+
+// ===== intake-reconcile completed-pass heartbeat (#10924) =====
+
+/// The row derives its cadence from the pass's own default interval, so its
+/// deadline cannot drift from `LOOM_INTAKE_RECONCILE_INTERVAL_SECS`.
+#[test]
+fn intake_reconcile_row_derives_from_the_pass_cadence() {
+    let row = row_for(PASS_HEARTBEAT_KIND);
+    assert_eq!(row.job, crate::intake_reconcile::singleton::SINGLETON_JOB_NAME);
+    assert_eq!(row.cadence, Duration::from_secs(crate::intake_reconcile::DEFAULT_INTERVAL_SECS));
+    assert_eq!(
+        row.deadline(),
+        Duration::from_secs(2 * crate::intake_reconcile::DEFAULT_INTERVAL_SECS)
+    );
+    // The pass runs on a fixed cadence, quiet or not: absence is Critical.
+    assert_eq!(row.severity, Severity::Critical);
+}
+
+/// A current quiet-pass heartbeat (nothing labelled) is healthy; a stale or
+/// absent one fires.
+#[test]
+fn intake_reconcile_quiet_pass_is_fresh_and_stale_or_absent_fires() {
+    let row = row_for(PASS_HEARTBEAT_KIND);
+    let mut f = Fake::default();
+    assert_eq!(evaluate(&[row], &f, &[], now()).len(), 1);
+    f.fleet.insert(PASS_HEARTBEAT_KIND, ago(5));
+    assert!(evaluate(&[row], &f, &[], now()).is_empty());
+    f.fleet.insert(PASS_HEARTBEAT_KIND, ago(11));
+    assert_eq!(evaluate(&[row], &f, &[], now()).len(), 1);
+}
+
+/// Only the heartbeat's success timestamp feeds the watchdog, and only a
+/// completed pass refreshes it.
+#[test]
+fn only_a_completed_pass_feeds_the_watchdog_row() {
+    let quiet = PassReport {
+        repos: 2,
+        ..PassReport::default()
+    };
+    let stamp = next_heartbeat(None, "cap", ago(5), &quiet, 2);
+    assert_eq!(stamp.success_at(), Some(ago(5)));
+    // The next pass shed both repos: the success timestamp is kept, not
+    // refreshed, so the row ages on the old stamp's deadline.
+    let shed = PassReport {
+        listing_failed: 2,
+        shed: 2,
+        ..PassReport::default()
+    };
+    let kept = next_heartbeat(Some(&stamp), "cap", ago(1), &shed, 2);
+    assert_eq!(kept.success_at(), Some(ago(5)));
 }

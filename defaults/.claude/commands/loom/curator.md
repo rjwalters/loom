@@ -23,6 +23,7 @@ You are an issue curator who maintains and enhances the quality of GitHub issues
 - [Checking Dependencies](#checking-dependencies)
 - [Repairing `loom:decision-malformed` (#10057)](#repairing-loomdecision-malformed-10057)
 - [Revising `loom:needs-revision` (#10753)](#revising-loomneeds-revision-10753)
+- [Draining `loom:blocked-unnamed` (#10558)](#draining-loomblocked-unnamed-10558)
 - [Checking Operator-Only Premises (#6849)](#checking-operator-only-premises-6849)
 - [De-escalating Fact-Based Champion Escalations (#7650)](#de-escalating-fact-based-champion-escalations-7650)
 - [Issue Quality Checklist](#issue-quality-checklist)
@@ -72,6 +73,11 @@ gh api rate_limit --jq '[.resources.core.remaining, .resources.graphql.remaining
 Either under ~500, or a failed read: claim nothing new, report the rest as
 deferred, no retry loop (finishing/releasing a claim you hold is fine). At most
 ~3 Curators per identity, all repos combined (policy, not enforced).
+
+A "GitHub API rate limit … sleep until reset" reminder on a tool result is a
+text match on its output (#11411), not a quota reading: check
+`gh api rate_limit` and keep working. Read role files with a file-read tool,
+not `cat`.
 
 | File | Load |
 |---|---|
@@ -370,17 +376,17 @@ unlabeled-issue fallback.
 
 Note: `loom:blocked` and `loom:operator-only` stay excluded here, but not from
 Curator's purview (open `loom:decision-malformed` issues are work even with
-`loom:operator-only`: "Repairing `loom:decision-malformed`"): "Checking Dependencies" re-checks `loom:blocked` issues, and
-"Checking Operator-Only Premises" (#6849) runs the same read-only premise
-re-check (has the named blocker/epic closed?) on `loom:operator-only` issues.
-That re-check never removes the label or auto-releases the issue.
+`loom:operator-only`): "Checking Dependencies" re-checks `loom:blocked` issues, and
+"Checking Operator-Only Premises" (#6849) runs the same read-only re-check
+(has the named blocker/epic closed?) on `loom:operator-only` issues, never
+removing the label or auto-releasing the issue.
 
 **Workflow**:
-1. Priority 0 (starred, red-main fixes, then `loom:needs-revision`) first; then Priority 1
-2. If no results, use Priority 2
+1. **Drain `loom:blocked-unnamed` every pass** (below), whether or not ordinary queues have work.
+2. Priority 0 (starred, red-main fixes, then `loom:needs-revision`) first; then Priority 1; if no results, Priority 2
 3. Take the first result — the query now returns oldest-first (`sort_by(.createdAt)`), so no manual age comparison is needed
 4. Enhance and mark as `loom:curated`
-5. **If neither Priority 1 nor Priority 2 yields a candidate**, do not end the session silently. State explicitly in the session's final output that no curate-able issue was found this tick (e.g. "No curate-able issues found this tick") — this lets a downstream consumer (e.g. a fleet-health check polling session output/logs) distinguish "ran, found nothing" from "didn't run"/"died".
+5. **If no priority issue and the drain yielded nothing**, do not end the session silently. State explicitly in the session's final output that no curate-able issue was found this tick (e.g. "No curate-able issues found this tick") — this lets a fleet-health check distinguish "ran, found nothing" from "didn't run"/"died".
 
 ## Claiming Work
 
@@ -657,7 +663,7 @@ If, during curation, you determine an issue is too large to be a single Builder 
 4. **Do not close the parent during decomposition** — it now tracks its children; keep it open (or relabel it as a tracking issue). Closing here would orphan the sub-issues. (Closing/rescoping in general is allowed with a rationale — see "Issues Are Suggestions — Close or Rescope With Rationale" below — but a freshly-decomposed parent is not a close candidate.)
 5. **Do not self-curate your own sub-issues in the same session.** A separate Curator pass (could be the same human-role agent in a later session, or a different agent) must independently review each sub-issue before it can earn `loom:curated`.
 6. **Serialize this `gh issue create` burst against any other issue-creating agent (#3707).** Do not run your sub-issue creation concurrently with another issue-creating agent (Architect / another Curator-decomposition / Champion epic-phase) in the same repo — concurrent `gh issue create` bursts race on server-assigned issue numbers and cross-contaminate bodies. One filer finishes its full burst before the next starts. See `sweep.md` → "Execution Model → Only Builders parallelize" for the invariant.
-7. **File each sub-issue with `./.loom/scripts/create-issue.sh`, never a bare `gh issue create` (#5047).** `gh issue create` is GraphQL-backed and dies outright once the shared GraphQL pool exhausts — while the independent REST pool sits ~99% unused. The script takes the same flags (`--title`, `--body`/`--body-file`, repeatable `--label`, `--repo`) and prints the same issue URL, but falls back to a single REST POST that applies labels **atomically with creation**. A decomposition burst files several issues in a row, so it is the likeliest place in a Curator run to meet an exhausted pool mid-sequence. Recipe and rationale: `.loom/docs/gh-issue-create-rest-fallback.md`. (`loom-daemon forge issue create` is a byte-identical `gh` passthrough — NOT a fallback.)
+7. **File each sub-issue with `./.loom/scripts/create-issue.sh`, never a bare `gh issue create` (#5047).** `gh issue create` is GraphQL-backed and dies once the GraphQL pool exhausts, while the REST pool sits unused. The script takes the same flags (`--title`, `--body`/`--body-file`, repeatable `--label`, `--repo`) and prints the same URL, but falls back to one REST POST that applies labels atomically. Recipe: `.loom/docs/gh-issue-create-rest-fallback.md`. (`loom-daemon forge issue create` is a `gh` passthrough, NOT a fallback.)
 
 **Why a separate pass**: it catches AC gaps, drifted file:line citations, missed sub-issue dependencies, and loose scope guards at curate time, not as a Builder scope-guard trigger or Doctor cycle.
 
@@ -722,43 +728,20 @@ them into the one you are curating. Never absorb a sibling that has:
 
 > **Verify enumerations.** If the issue body lists specific callers, files, sites, or line numbers, treat the enumeration as a *starting point*, not authoritative. Run a comprehensive `git ls-files <pattern> | xargs grep -nE '<pattern>'` to verify completeness. Report any additions in your curator comment so the builder gets the correct scope.
 
-> **Verify against build base (origin/main).** You run in the user's working tree (uncommitted files visible); the builder runs in a fresh worktree off `origin/main`. If your "Affected Files" enumeration silently includes uncommitted paths, the builder will block on a broken setup. Before applying `loom:curated`, verify every path you enumerated under `## Affected Files` exists on the build base:
+> **Verify against build base (origin/main).** You run in the user's working tree (uncommitted files visible); the Builder runs in a fresh worktree off `origin/main`. Before applying `loom:curated`, save the text holding your `## Affected Files` section (issue body or comment draft) to a file and classify its paths:
 >
 > ```bash
-> # Curator pre-flight: verify Affected Files exist on origin/main
 > git fetch origin --quiet
->
-> # AFFECTED_FILES is the set of paths you enumerated under `## Affected Files`
-> MISSING=()
-> for path in "${AFFECTED_FILES[@]}"; do
->   if ! git ls-tree -r origin/main --name-only | grep -qFx "$path"; then
->     MISSING+=("$path")
->   fi
-> done
->
-> if (( ${#MISSING[@]} > 0 )); then
->   # Surface in a warning comment + apply loom:blocked; do NOT apply loom:curated
->   COMMENT="⚠️ **Curator pre-flight: uncommitted source files**
->
-> The following files in the Affected Files enumeration are not on \`origin/main\`:
-> $(printf -- '- \`%s\`\n' "${MISSING[@]}")
->
-> This will block the Builder, which dispatches into a fresh worktree off \`origin/main\`. Either:
-> - Commit + push these files first, then remove the \`loom:blocked\` label, OR
-> - Adjust the Affected Files section to scope down to committed-only changes."
->   ./.loom/scripts/post-comment.sh "$N" --body "$COMMENT"
->   loom-daemon park-record apply --issue "$N" --reason "uncommitted Affected Files" --by curator
->   # Exit without further state changes — the next curator tick will re-evaluate.
->   exit 0
-> fi
+> loom-daemon affected-files check --body-file "$BODY_FILE"; rc=$?   # prints <class><TAB><path>
 > ```
 >
-> Implementation notes:
-> - Use `grep -qFx` (exact match) — not `grep -qF` — so `src/foo.ts` doesn't match `src/foo.ts.bak`.
-> - Run `git fetch origin --quiet` once at the top of the verification pass; do not refetch per file.
-> - If the issue has no `## Affected Files` section yet, this check is a no-op for this tick — add the section in the same pass and let the next curator tick run the verification.
-> - The `loom:blocked` label is the right escape hatch: it's already in the workflow, and is removed by the user (not by Loom) once the underlying files are committed and pushed. No numbered blocker exists; the `COMMENT` above is the recorded reason ("Adding Dependencies").
-> - If this instead names a resolvable dependency on another issue/PR, record it as a park record — see `.loom/docs/park-record.md`.
+> Branch on `rc` alone:
+> - **`0`**: proceed. Every path is on `origin/main` or marked new (no section yet: also `0`).
+> - **`11`** (an `uncommitted` path: in your working tree, not on `origin/main`): the Builder's worktree would lack it. Comment naming those paths and the two fixes (commit + push them, or rescope the section to committed files), then `loom-daemon park-record apply --issue "$N" --reason "uncommitted Affected Files" --by curator`. Do not apply `loom:curated`; stop. The user removes `loom:blocked` once the files are pushed.
+> - **`10`** (an `unknown` path: on neither): a typo, or a file the issue creates that you did not mark. If you can tell which, fix the section (correct the path, or mark it new) and re-run (two fixes at most). Still `10`, or you cannot tell: name the paths in your curator comment, ask which it is, and continue curating. **Never `loom:blocked`**, with one exception: a path an open issue/PR is to create is a dependency, parked with `park-record apply --blocked-by <that number>` (`.loom/docs/park-record.md`).
+> - **anything else** (`3`; `2`/`127` from a daemon without this verb): the check did not run. Say so in your curator comment and continue: never park on it, never report it as passed.
+>
+> **Mark a file the issue creates** with `(new)` after its path, or list it under a `### New files` sub-heading; unmarked, it reads as `unknown`.
 
 ### Date-stamp volatile facts
 
@@ -946,7 +929,6 @@ Champion's exclusions, the Priority-2 query above) is unchanged:
 | `loom:operator-blocked` | Waiting on a **named** issue/PR/piece of infrastructure that does not exist yet — self-clearing once that lands |
 | `loom:operator-mechanical` | Needs a human's hands: host or admin access, a credential, hardware — no judgement required |
 | `loom:operator-decision` | The act requires authority an agent structurally cannot hold — a preference call or an authority act (binds the entity, irreversible disclosure, spending, credentials only the operator holds, accepting risk on the entity's behalf, physical-world action) |
-| `loom:operator-objective` | Determined once the operator states an objective — list the candidate objectives and the answer under each (#5826); a missing objective is this, not `-decision` |
 
 ```bash
 # Curator routing a genuine PO-level decision: 2-4 ranked options, each with
@@ -959,15 +941,14 @@ label is safe to reach for (#5826).** `loom:operator-decision` is **not** a
 safe default: run the falsifiability test from
 `.loom/docs/label-state-machine.md` — name the axis two well-informed people
 would still disagree on, and show it is a preference, not a fact. If you
-can't, the item is determined: finish it, don't park it.
+can't, the item is determined: finish it, don't park it. A missing objective
+is a decision whose options are the candidate objectives (#10000).
 
 **Comment requirements, same comment as the label:** `loom:operator-blocked`
 — a literal `Blocked by #N` / `Depends on #N` / `Requires #N` line (the
 phrasings `detect-dependency-cycle.sh` and `warn-operator-gated.sh` parse; a
 backtick-quoted reference does not count). `loom:operator-decision` — name
-the disagreement axis and why it is a preference, not a fact.
-`loom:operator-objective` — the candidate objectives and the answer under
-each. Full taxonomy: `.loom/docs/label-state-machine.md` →
+the disagreement axis and why it is a preference, not a fact. Full taxonomy: `.loom/docs/label-state-machine.md` →
 "`loom:operator-only` sub-kinds".
 
 **Composes with the work-finder**: a **closed** issue leaves the queue automatically (the autonomous work-finder only polls *open* `loom:issue` items), so a well-reasoned close will not be re-picked-up. A **rescoped** issue must have its labels reset (per above) so it is not re-dispatched in a loop with a stale scope.
@@ -1231,7 +1212,7 @@ behavior with no inferred mechanism attached.]
 
 ### Affected Files
 - \`path/to/file.ts\` - [what changes are needed]
-- \`path/to/other.py\` - [what changes are needed]
+- \`path/to/created.py\` (new) - [what it adds]
 
 ### Test Plan
 - [ ] Manual verification: [describe how to verify the fix/feature works]
@@ -1749,11 +1730,9 @@ silently.
 | Same orthogonal condition, second pass | Silent skip via the `loom:operator-only` terminal check — exactly one escalation per condition |
 | Orthogonal condition clears, tracked blocker still stale | `ORTHOGONAL` empties, the hash changes again, the ordinary "changed conclusion" comment fires |
 
-**This does not consume the reserved #4967 counter above.** That hook counts *N
-unchanged confirmations of the same blocker* and still does not exist. This
-branch is the opposite trigger: it fires immediately, on the first pass whose
-reasoning names a different active condition, and needs no tally because the
-finding is a change of identity, not a repetition.
+**This does not consume the reserved #4967 counter above** (*N unchanged
+confirmations of the same blocker*; it does not exist). This branch fires on the
+first pass naming a different active condition: a change of identity, no tally.
 
 ## Repairing `loom:decision-malformed` (#10057)
 
@@ -1768,7 +1747,7 @@ with `loom:operator-only`. Read body, escalation comment, and bounce comment, th
   then `loom-daemon operator-decision apply <number>` (clears the bounce label).
   Same for a prose `loom:operator-decision` issue you touch, if faithful.
 - **No real operator call**: remove the label, comment why, and re-route per
-  `label-state-machine.md` (normal flow, `loom:operator-objective`, or a human-gated park).
+  `label-state-machine.md` (normal flow or a human-gated park).
 - **No-loop guard**: a decision-bounce comment newer than your repair marker means
   the repair bounced. Comment once and leave it alone.
 
@@ -1796,6 +1775,13 @@ A routing comment carrying `<!-- champion:revision-exhausted -->` is the
 preference or authority failure goes to the operator; a factual one gets a
 `<!-- champion:revision-disposition -->` round: close, split or file a decision,
 never edit. Bounds: `.loom/docs/promotion-throughput.md`.
+
+## Draining `loom:blocked-unnamed` (#10558)
+
+The daemon labels a `loom:blocked` issue naming no blocker or reason
+`loom:blocked-unnamed`. Every pass, regardless of Priority 0-2, query
+`gh issue list --label loom:blocked-unnamed` oldest first, at most **3 per pass**; procedure and outcomes (named, kept, released):
+`.loom/docs/unnamed-block-review.md`. Never add `loom:issue`.
 
 ## Checking Operator-Only Premises (#6849)
 
@@ -1871,7 +1857,7 @@ bot's own historical heartbeat comments are never treated as new evidence,
 while a genuine NEW human-authored "Blocked by #N" comment still is.
 
 - **No reference found** (`REFS` empty) → no-op. Most `loom:operator-mechanical` /
-  `loom:operator-decision` / `loom:operator-objective` issues have nothing
+  `loom:operator-decision` issues have nothing
   checkable — leave them exactly as found, silently.
 - **One or more references found** → compute the fingerprint with the same
   shared script "Re-check Idempotency" above uses (a distinct `operator-premise`
@@ -2191,7 +2177,7 @@ Every curated issue MUST have an `## Affected Files` section listing files/compo
 ## Affected Files
 
 - `path/to/file.ts` - [what changes are needed]
-- `path/to/another.py` - [what changes are needed]
+- `path/to/created.py` (new) - [a file this issue creates]
 ```
 
 **How to find affected files**:
@@ -2334,4 +2320,4 @@ When you receive a probe command, respond with: `AGENT:Curator:<brief-task>` —
 
 **Work completion is detected automatically.**
 
-When you complete your task (issue enhanced and labeled with `loom:curated`), the orchestration layer detects this and terminates the session automatically. No explicit exit command is needed.
+When you complete your task (issue enhanced and labeled with `loom:curated`, or the drain and queues found nothing and you said so), the orchestration layer detects this and terminates the session automatically. No explicit exit command is needed.

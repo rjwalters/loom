@@ -39,6 +39,13 @@ impl ForgeReads for Forge {
     fn pull(&mut self, _: &str, _: u32) -> Option<PullFacts> {
         None
     }
+    fn issue(
+        &mut self,
+        _: &str,
+        _: u32,
+    ) -> Option<crate::observability::fleet_state::outcomes::IssueFacts> {
+        Some(crate::observability::fleet_state::outcomes::IssueFacts::Open)
+    }
 
     fn label_history(&mut self, _: &str, n: u32) -> Option<LabelHistory> {
         self.reads.push(n);
@@ -121,6 +128,8 @@ fn a_ready_row_is_dated_by_its_issue_history() {
             fleet_priority: 100,
             created_at: None,
             main_red_fix: false,
+            eligible_reason: None,
+            eligible_at: None,
         }],
         ..ReadyQueue::default()
     });
@@ -160,6 +169,7 @@ fn a_sweep_row_with_a_lower_bound_entry_is_dated_again_each_pass_without_a_read(
         pr: Some(21),
         overflow: false,
         start: Default::default(),
+        sweep_id: None,
     }];
     let mut memory = EnrichMemory::default();
     let first = run(&inp, None, &mut memory, &mut forge, t0());
@@ -288,6 +298,7 @@ fn a_sweep_row_takes_the_linked_prs_flags_and_keeps_its_earlier_star() {
         pr: Some(21),
         overflow: false,
         start: Default::default(),
+        sweep_id: None,
     }];
     let mut prev = build_view(&input(vec![]), None, t0());
     let mut earlier = FleetStateRow::new(20, FleetStage::ReadyWait, t0());

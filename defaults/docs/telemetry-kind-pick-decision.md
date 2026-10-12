@@ -44,7 +44,8 @@ no journal is created, when no OTLP exporter runs.
 | `skipped[]` | array | one `{repo, number, reason}` per skipped candidate listed in `candidates`, plus an optional `detail`: today only a work-finder `deferred_file_overlap` row sets it, to the shared `## Affected Files` paths (`file overlap: a, b`, one line, truncated at 160 chars, #9781). Additive (absent otherwise and on older daemons), so `schema_version` stays `2`; no other disposition's detail (e.g. dispatch-error text) is carried |
 | `candidate_source` | string | `ready_queue` (work finder), `serving_queue` (the role's `pr-queue` result), `listing` (the issue/PR listings the role read, e.g. Curator), `gate_listing` (fallback: the daemon's gate listing), `none` (nothing observed) |
 | `decisions_observed` | boolean | `true` when the agent's writes were observed, so every candidate without an action is a real skip; `false` when only a ranking was seen, and an unexplained candidate is then in neither `acted` nor `skipped` |
-| `workspace_draw` | object, optional | work finder only (#11103), absent when nothing was drawn: `seed` (decimal string), `draws_total`, and `draws[]` (first 50, in order), each `{pool, candidates[{repo, weight}], total_weight, roll, picked, number}`. Replaying the draws from `seed` reproduces the dispatch order; see [`priority-model.md`](priority-model.md) |
+| `workspace_draw` | object, optional | work finder only (#11103), absent when nothing was drawn: `seed` (decimal string), `draws_total`, and `draws[]` (first 50, in order), each `{pool, candidates[{repo, weight}], total_weight, roll, picked, number}`; `pool` is `"red-main-fix"`, `"very-important"` or `"all"` (#11547). Replaying the draws from `seed` reproduces the dispatch order; see [`priority-model.md`](priority-model.md) |
+| `very_important_demoted` | array, optional | work finder only (#11509), absent when empty: one `{repo, number, holder}` per `loom:very-important` issue the per-workspace cap ranked as important this tick (`holder` keeps the slot; first 50). Additive, so `schema_version` is unchanged; see [`priority-model.md`](priority-model.md) |
 
 ## What "ranking" means per source
 
@@ -138,11 +139,13 @@ it, only a hold label names a reason; other candidates are undecided.
 | `in_flight` | a live sweep or claim covers it | `in_flight`; roles: a claim label the agent did not write |
 | `backoff` | inside a back-off, cooldown, recheck or retry window | `deferred_build_backoff`, `recheck_interval`, `dispatch_backoff`, `noop_cooldown`, `prless_retry` |
 | `halted` | the repo's dispatch is halted (red main, gate, drain, breaker) | `workspace_halted` |
-| `host_constraint` | not for this host | `host_constraint`, `host_class_refused`, `peer_claim` |
+| `host_constraint` | not for this host | `host_constraint`, `peer_claim` |
 | `blocked` | blocked by something specific to the item | `workspace_commands_missing`, `quarantined`, `labelled_blocked`, `unknown`; roles: `loom:blocked`, `loom:ci-failure` |
 | `error` | the dispatch attempt failed | `dispatch_error` |
 | `tick_skipped` | the role tick did not run for another reason | roles: runtime rejected, model/runtime mismatch, load, queue gate |
 | `not_selected` | the role ran, its writes were observed, and it did not act on this candidate | roles only, with `decisions_observed` |
+| `already_landed` | the item's work already landed: the issue is closed, or this host recorded a `landed` sweep for it in the last 30 minutes (#11429) | `already_landed` |
+| `already_closed` | the issue is closed as not planned (#11429) | `already_closed` |
 
 `QueueDisposition::Dispatched` is the one disposition with no reason: it is
 *acted*. The mapping is a total match in

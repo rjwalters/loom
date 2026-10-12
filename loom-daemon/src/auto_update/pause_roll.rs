@@ -101,6 +101,7 @@ use crate::sweep_registry::roll_requeue::RollRequeueNotice;
 
 pub(crate) mod host;
 pub(crate) mod ledger;
+pub mod loom_ui;
 mod refusal;
 mod stops;
 mod supervise;
@@ -743,6 +744,7 @@ pub(crate) fn run_h4_with(
             plan.from_version
         );
         log::error!("pause_roll: {note}");
+        loom_ui::pause_failed(&plan.from_version, &note); // #11295
         run.host.emit(
             "daemon.roll.pause_failed",
             serde_json::json!({ "manifest_id": manifest_id, "error": e.to_string(), "items": items }),

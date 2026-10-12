@@ -107,14 +107,16 @@ fn charged_counts_ok_pages_and_never_a_304_or_a_limited_call() {
         w1_line(1_900_000_002, "a", Outcome::NotModified, attributed(None)),
         w1_line(1_900_000_003, "a", Outcome::RateLimited, attributed(None)),
         w1_line(1_900_000_004, "a", Outcome::Error, attributed(None)),
+        w1_line(1_900_000_005, "a", Outcome::SecondaryLimited, attributed(None)),
         w1_line(1_800_000_000, "a", Outcome::Ok, attributed(None)),
     ];
     let agg = aggregate_lines(lines.iter().map(String::as_str), 1_900_000_000, GroupBy::Bucket);
-    assert_eq!(agg.lines, 5, "the old line is outside the window");
+    assert_eq!(agg.lines, 6, "the old line is outside the window");
     let g = &agg.groups[0];
     assert_eq!(g.key, ["app-42", "acme", "7", "core", "1900003600"]);
-    assert_eq!((g.rows, g.charged, g.not_modified, g.rate_limited, g.error), (5, 4, 1, 1, 1));
-    assert_eq!(agg.cwd_route_disagree, 5);
+    assert_eq!((g.rows, g.charged, g.not_modified, g.rate_limited, g.error), (6, 4, 1, 1, 1));
+    assert_eq!(g.secondary_limited, 1, "#11418: never folded into rate_limited");
+    assert_eq!(agg.cwd_route_disagree, 6);
 
     let by_role = aggregate_lines(lines.iter().map(String::as_str), 0, GroupBy::Role);
     assert_eq!(by_role.groups[0].key, ["reader"]);

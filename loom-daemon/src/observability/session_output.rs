@@ -357,8 +357,11 @@ struct Tracker {
     /// Attempt counter per `(workspace root, issue)`, so a retry of the same
     /// issue is separable from the original.
     attempts: HashMap<(String, u32), u32>,
-    /// Last observed queue drop total, for gap accounting.
-    last_dropped_total: u64,
+    /// Last observed queue drop total, for gap accounting. `None` until the
+    /// first tick: the total is a durable ledger sum (Issue #11527), so a
+    /// restarted producer must baseline on its first observation rather than
+    /// delta from 0 — losses from before this process belong to no open run.
+    last_dropped_total: Option<u64>,
     /// Whether the `max_runs` ceiling has already been logged.
     warned_full: bool,
 }
@@ -545,6 +548,16 @@ fn handle_event(tracker: &mut Tracker, sink: &SessionOutputSink, event: &Event, 
     }
 }
 
+/// Gap-accounting delta over the queues' durable drop total (Issue #11527):
+/// the first observation is a baseline — the loss ledger survives restarts,
+/// so losses recorded before this process belong to no open run — and every
+/// later observation counts only the increase since the previous one.
+fn newly_dropped_since(last: &mut Option<u64>, observed: u64) -> u64 {
+    let delta = last.map_or(0, |last| observed.saturating_sub(last));
+    *last = Some(observed);
+    delta
+}
+
 async fn tick(
     tracker: &mut Tracker,
     sink: &SessionOutputSink,
@@ -555,8 +568,7 @@ async fn tick(
     // that can attribute it to the runs it was publishing for. Checked once
     // per tick, before any new record is offered.
     let dropped_total = sink.dropped_total();
-    let newly_dropped = dropped_total.saturating_sub(tracker.last_dropped_total);
-    tracker.last_dropped_total = dropped_total;
+    let newly_dropped = newly_dropped_since(&mut tracker.last_dropped_total, dropped_total);
 
     // Canonical repo resolution: one bounded `gh` call per unseen workspace
     // root, memoized for the process. Never a directory basename. An attended

@@ -132,6 +132,24 @@ pub async fn try_flush<E: Exporter>(
     let outcome = exporter.emit_batch_outcome(batch).await;
     let acknowledged = outcome.acknowledged.min(batch.len());
     queue.ack_snapshot(&snapshot, acknowledged);
+    if !outcome.lost.is_empty() {
+        // Fail loud (Issue #11527): every permanently lost envelope is
+        // counted durably by reason, and the flush says so — one line naming
+        // the reasons and counts, not a silent ack-and-continue.
+        queue.record_losses(&outcome.lost);
+        let reasons = outcome
+            .lost
+            .iter()
+            .map(|(reason, count)| format!("{reason}={count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        log::warn!(
+            "observability: export permanently lost records — {reasons} \
+             (dropped_total={}, queue_depth={})",
+            queue.dropped_total(),
+            queue.len()
+        );
+    }
     status.record_signals(&outcome.signals);
     if outcome.exported > 0 {
         status.record_success(outcome.exported);

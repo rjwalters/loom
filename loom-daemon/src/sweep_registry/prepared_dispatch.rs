@@ -49,6 +49,9 @@ pub struct PreparedIssueDispatch {
     /// `explicit` when the dispatch request named the model, else `default`
     /// (#11280, `telemetry::model_source`).
     pub(crate) model_source: &'static str,
+    /// Who asked for this dispatch (#11444), carried across the
+    /// begin→poll→finish seam into the sweep's start facts.
+    pub(crate) dispatch_origin: crate::telemetry::DispatchOrigin,
     /// #10974: counts this dispatch as mid-spawn until it is dropped (`roll_gate`).
     pub(crate) mid_spawn: roll_gate::MidSpawn,
 }

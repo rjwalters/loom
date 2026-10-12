@@ -120,6 +120,17 @@
 //! outcome's tap first. It closes the residual gap slicing left behind — an
 //! earlier launch is no longer misattributed, but under a one-row reader it was
 //! not recorded at all — without ever merging two taps into one row.
+//!
+//! # Out-of-process phases have logs of their own (Issue #11360)
+//!
+//! `loom-daemon worker run --role builder|doctor` launches a phase in a
+//! separate process writing a separate log
+//! ([`crate::launch_record::phase_log_path`]), stamped
+//! `parent_sweep=<id>` (deliberately not `sweep_id=`, the parent log's own
+//! anchor text). Those launches are not in the sweep log's region at all, so
+//! [`account_phase_logs`] joins them by that stamp and
+//! [`RegionAccounting::phase_workers`] carries them beside — never inside — the
+//! parent's own rows.
 
 use std::collections::BTreeMap;
 
@@ -502,6 +513,11 @@ pub struct RegionAccounting {
     /// Whether the region's last `# LOOM_LAUNCH` record was attributable — in
     /// which case `per_tap[0]` is its tap. See [`Self::outcome`].
     pub outcome_attributed: bool,
+    /// Out-of-process phase launches (`worker run`, Issue #11360) that named
+    /// this sweep, read from their **own** logs. Kept beside `per_tap`, never
+    /// folded into it, so the parent orchestrator's row is neither overwritten
+    /// by a phase's spend nor charged with it. See [`account_phase_logs`].
+    pub phase_workers: Vec<PhaseTapAccounting>,
 }
 
 impl RegionAccounting {
@@ -536,6 +552,86 @@ impl RegionAccounting {
             &self.per_tap
         }
     }
+
+    /// The whole sweep's spend per tap: the parent region plus every phase
+    /// worker, each launch counted once. This is the number a mixed sweep's
+    /// per-tap total must equal (Issue #11360).
+    #[must_use]
+    pub fn sweep_totals_by_tap(&self) -> BTreeMap<String, TapUsage> {
+        fold_by_tap(
+            self.per_tap
+                .iter()
+                .chain(self.phase_workers.iter().map(|phase| &phase.accounting)),
+        )
+    }
+}
+
+/// One phase role's usage on one tap, read from `worker run` phase logs
+/// (Issue #11360). Serialized flat: `{"role": …, "tap": …, "usage": …}`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PhaseTapAccounting {
+    /// The phase role (`builder`, `doctor`) the log's file name records.
+    pub role: String,
+    #[serde(flatten)]
+    pub accounting: TapAccounting,
+}
+
+/// Fold phase logs (`(role, contents)`, in launch order) to one row per
+/// `(role, tap)` for the sweep `sweep_id`.
+///
+/// Each log contributes only its region at/after this sweep's
+/// [`phase_log_anchor`](crate::launch_record::phase_log_anchor), sliced per
+/// `# LOOM_LAUNCH` record exactly as [`account_launch_logs`] slices a sweep
+/// log. So a log naming another sweep (a resumed sweep's predecessor), or no
+/// sweep at all, adds nothing; a header repeated inside one log counts only its
+/// last region; and a phase that ran on Claude (`delegate-to-claude`, which
+/// writes no phase log, or a launch with no `# LOOM_LAUNCH` record) charges no
+/// tap. Unmeasured rows are kept, so "a GLM Builder ran and reported nothing"
+/// stays visible rather than becoming zero.
+#[must_use]
+pub fn account_phase_logs<'a, I>(logs: I, sweep_id: &str) -> Vec<PhaseTapAccounting>
+where
+    I: IntoIterator<Item = (&'a str, &'a str)>,
+{
+    let Some(anchor) = crate::launch_record::phase_log_anchor(sweep_id) else {
+        return Vec::new();
+    };
+    let mut rows: Vec<PhaseTapAccounting> = Vec::new();
+    for (role, contents) in logs {
+        for accounting in account_launch_logs(contents, &anchor) {
+            match rows
+                .iter_mut()
+                .find(|row| row.role == role && row.accounting.key() == accounting.key())
+            {
+                Some(row) => row.accounting.usage.absorb(&accounting.usage),
+                None => rows.push(PhaseTapAccounting {
+                    role: role.to_string(),
+                    accounting,
+                }),
+            }
+        }
+    }
+    rows
+}
+
+/// Filesystem wrapper over [`account_phase_logs`]: every phase log for
+/// `issue` under `workspace_root`, each read once. Unreadable logs are skipped.
+#[must_use]
+pub fn account_phase_logs_at(
+    workspace_root: &std::path::Path,
+    issue: u32,
+    sweep_id: &str,
+) -> Vec<PhaseTapAccounting> {
+    let logs: Vec<(String, String)> =
+        crate::launch_record::phase_logs_for_issue(workspace_root, issue)
+            .into_iter()
+            .filter_map(|(role, path)| Some((role, std::fs::read_to_string(path).ok()?)))
+            .collect();
+    account_phase_logs(
+        logs.iter()
+            .map(|(role, contents)| (role.as_str(), contents.as_str())),
+        sweep_id,
+    )
 }
 
 /// The region at/after `header_anchor` folded per tap — see
@@ -579,6 +675,7 @@ pub fn account_region_by_tap(contents: &str, header_anchor: &str) -> RegionAccou
     RegionAccounting {
         per_tap,
         outcome_attributed: outcome_tap.is_some(),
+        phase_workers: Vec::new(),
     }
 }
 
@@ -613,3 +710,7 @@ where
 #[cfg(test)]
 #[path = "tap_usage_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tap_usage_fixtures.rs"]
+pub(crate) mod fixtures;

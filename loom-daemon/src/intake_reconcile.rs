@@ -35,7 +35,9 @@ pub mod singleton;
 
 /// The intake label applied.
 pub const TRIAGE_LABEL: &str = "loom:triage";
-const DEFAULT_INTERVAL_SECS: u64 = 300;
+/// Default pass cadence (`LOOM_INTAKE_RECONCILE_INTERVAL_SECS` overrides);
+/// the singleton-output registry derives its deadline from it (#10924).
+pub const DEFAULT_INTERVAL_SECS: u64 = 300;
 const DEFAULT_MAX_PER_PASS: usize = 50;
 /// A filer commonly creates then labels; leave brand-new issues alone.
 const MIN_AGE_SECS: i64 = 120;

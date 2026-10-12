@@ -131,9 +131,10 @@ pub(crate) enum ForgeAction {
     ///
     /// Prints exactly one sentinel on stdout — `LOOM-CHECKS-GREEN <sha>`,
     /// `-NONE <sha>`, `-RED <sha> <names>`, `-TIMEOUT <sha> <pending>`,
-    /// `-ERROR <reason>`, `-HEAD-MOVED <old> <new>` — and, on RED, one
+    /// `-ERROR <reason>`, `-HEAD-MOVED <old> <new>`, `-NO-RUN <sha>` (no
+    /// GitHub Actions run for the head, #11389) — and, on RED, one
     /// `<name>\t<url>\t<run_id>` line per failing check on stderr. Branch
-    /// on the sentinel, not the exit code (0/1/2/3/4). `--timeout 0` takes
+    /// on the sentinel, not the exit code (0/1/2/3/4/5). `--timeout 0` takes
     /// one snapshot. See `loom_daemon::forge_wait_checks`.
     #[command(name = "wait-checks")]
     WaitChecks {
@@ -577,6 +578,27 @@ pub(crate) enum ForgeAction {
         gh_shape: bool,
     },
 
+    /// `forge claim-liveness --number N --label L --claimed-at TS` (#10235) —
+    /// print the newest liveness evidence the claim reconciler honors beyond the
+    /// claim-activity marker (trusted Judge-progress comment for
+    /// `loom:reviewing`, claimant head force-push), as an RFC3339 `...Z`
+    /// timestamp after `TS`; prints nothing when there is none or a read
+    /// failed. `claim-staleness.sh` folds it into its idle clock so the
+    /// in-session evaluator agrees with the daemon.
+    #[command(name = "claim-liveness")]
+    ClaimLiveness {
+        #[arg(long, value_name = "N")]
+        number: u32,
+        #[arg(long, value_name = "LABEL")]
+        label: String,
+        /// The claim's own `labeled` event time (RFC3339, `...Z`).
+        #[arg(long, value_name = "TS")]
+        claimed_at: String,
+        /// `OWNER/REPO` the claim lives in; default is `gh`'s own resolution.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+    },
+
     /// `forge verdict-stale-notice --label L --marker-sha M --head-sha H
     /// [--source S]` (#9709) — print the stale-verdict audit comment for a
     /// `M -> H` invalidation, rendered by the SAME template the daemon's pass
@@ -948,6 +970,19 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
         }
         ForgeAction::VerdictLabels { pr, repo, verdict } => {
             return super::forge_verdict_cmd::verdict_labels(pr, &repo, &verdict);
+        }
+        ForgeAction::ClaimLiveness {
+            number,
+            label,
+            claimed_at,
+            repo,
+        } => {
+            return super::forge_identity_cmd::claim_liveness(
+                number,
+                &label,
+                &claimed_at,
+                repo.as_deref(),
+            );
         }
         ForgeAction::VerdictStaleNotice {
             label,

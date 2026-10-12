@@ -24,7 +24,7 @@
 //! ```
 //!
 //! `host` is [`crate::sweep_registry::opaque_host_id`] of
-//! [`crate::sweep_registry::host_identity`] — the same id lease records
+//! [`crate::sweep_registry::lease_host_identity`] — the same id lease records
 //! publish. `serves` is the set of this host's registered workspace shard
 //! keys ([`super::hash_key`]), as lowercase hex, sorted ascending. Everything
 //! after the marker's closing `-->` is free-form prose; machine readers must

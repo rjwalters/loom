@@ -3,7 +3,7 @@
 //! `spawn-claude.sh` can use it without growing the shell budget's portable
 //! pool (epic #7810, `.loom/docs/shell-language-policy.md`).
 //!
-//! Six verbs, deliberately narrow. Two write (the creation half):
+//! Seven verbs, deliberately narrow. Two write (the creation half):
 //!
 //! * `provision <worktree>` — decide, create the directory, write the marker.
 //!   Prints the directory on stdout when there is one, so the caller can
@@ -55,6 +55,13 @@
 //! exit 0 always — the merge has already succeeded by the time either runs, so
 //! "there is nothing to reclaim" and "the reclaim was refused" are answers, and
 //! a non-zero status would only give the caller something to suppress.
+//!
+//! And one that is a guard (issue #11582):
+//!
+//! * `guard --for-command <text> [--cwd <dir>]` — the `loom:cargo-target-dir`
+//!   `PreToolUse` rule [`loom_daemon::cargo_target_guard`]: exit 1 with a
+//!   `BLOCKED [cargo-target-dir]` denial for a cargo build into a target dir
+//!   nothing owns, exit 0 otherwise.
 
 use std::path::PathBuf;
 
@@ -93,6 +100,13 @@ pub(crate) enum CargoTargetDirCommand {
     /// itself is gone. Prints at most one `LEVEL<TAB>message` record; silent
     /// for the un-redirected layout. Always exits 0.
     Reclaim(ReclaimArgs),
+
+    /// Judge one Bash command for the `loom:cargo-target-dir` `PreToolUse`
+    /// rule (#11582): a cargo build whose target dir resolves under `/tmp`,
+    /// `$TMPDIR`, `~/.cache`, `~` or `.loom/target-*` prints the denial
+    /// (`BLOCKED [cargo-target-dir]: …`) and exits 1. Silent exit 0
+    /// otherwise, including with `guards.cargoTargetDir=false`.
+    Guard(GuardArgs),
 }
 
 #[derive(clap::Args)]
@@ -187,6 +201,17 @@ pub(crate) struct ReclaimArgs {
     pub dry_run: bool,
 }
 
+#[derive(clap::Args)]
+pub(crate) struct GuardArgs {
+    /// The (masked) command text the hook is judging.
+    #[arg(long = "for-command", value_name = "TEXT")]
+    pub for_command: String,
+
+    /// The tool call's working directory. Defaults to the current directory.
+    #[arg(long, value_name = "PATH")]
+    pub cwd: Option<PathBuf>,
+}
+
 impl CargoTargetDirCommand {
     pub(crate) fn run(self) -> Result<()> {
         match self {
@@ -196,6 +221,7 @@ impl CargoTargetDirCommand {
             Self::Marker(a) => a.run(),
             Self::Resolve(a) => a.run(),
             Self::Reclaim(a) => a.run(),
+            Self::Guard(a) => a.run(),
         }
     }
 }
@@ -297,6 +323,21 @@ impl ReclaimArgs {
         // unchanged unless something was actually reclaimed or deliberately kept.
         if let Some((level, message)) = outcome.report_record() {
             println!("{level}\t{message}");
+        }
+        Ok(())
+    }
+}
+
+impl GuardArgs {
+    fn run(self) -> Result<()> {
+        let cwd = repo_root_or_cwd(self.cwd);
+        if let Some(denial) =
+            loom_daemon::cargo_target_guard::check_process(&self.for_command, &cwd)
+        {
+            loom_daemon::cargo_target_guard::publish(&denial);
+            println!("{}", loom_daemon::cargo_target_guard::deny_reason(&denial));
+            // The exit code is the verdict the hook branches on.
+            std::process::exit(1);
         }
         Ok(())
     }
