@@ -371,6 +371,7 @@ deny9870 "catastrophic (#9870): gh issue comment --body-file - <<'EOF' still den
 # -> "inert" -> FIFO/symlink sinks silently allowed on macOS.
 EXTRACT9870=$(sed -n '/^heredoc_filesink_candidate_targets() {/,/^}/p;/^heredoc_filesink_targets_are_inert() {/,/^}/p' "$GUARD")
 run9870_fn() { # <PATH-prefix> <command-text> -> prints "rc=<n> out=<...>" from a subshell
+    # shellcheck disable=SC2034 # CWD is read by the eval-extracted guard functions
     ( PATH="$1:$PATH"; CWD=/tmp; eval "$EXTRACT9870"; heredoc_filesink_targets_are_inert "$2" >/dev/null 2>&1; echo "rc=$?" )
 }
 CAND9870=$(PATH="$PATH"; eval "$EXTRACT9870"; heredoc_filesink_candidate_targets "$(hd9870 "cat > /tmp/loom-fifo-9870 <<'EOF'" body EOF)" 2>&1)
