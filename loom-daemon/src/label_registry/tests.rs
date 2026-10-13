@@ -207,6 +207,8 @@ fn derived_skip_labels_equal_the_previous_literal_in_order() {
             "loom:building",
             "loom:blocked",
             "loom:operator-only",
+            // #11480: a bounced Decision issue is never build work.
+            "loom:decision-malformed",
             "loom:operator",
             // #11399: an epic is a tracking container, never build work. A
             // skip (the work finder never lists it as a candidate) but not a

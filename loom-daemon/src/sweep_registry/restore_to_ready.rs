@@ -71,31 +71,25 @@ impl SweepRegistry {
     /// lives here (a sibling module) so the size-ratcheted `guards.rs` only
     /// keeps the delegating entry point.
     pub(crate) fn restore_label_to_ready_with_state_check(&self, issue: u32) -> Result<()> {
-        let blocked = self.issue_has_blocked_label(issue);
-        // Only probe `loom:operator-only` when `loom:blocked` doesn't already
-        // decide the outcome — avoids a redundant `gh` call in the (more
-        // common) blocked path.
-        let operator_only = !blocked && self.issue_has_operator_only_label(issue);
-        let parked = blocked || operator_only;
-        // Only probe PR-ness when a park carve-out doesn't already decide the
-        // outcome — avoids a redundant `gh` call on the parked path.
-        let is_pr = !parked && self.issue_is_pull_request(issue).unwrap_or(false);
-        // Issue #9463: the closed-state probe runs last (only when no other
-        // carve-out already decided against the re-add), so the common
-        // non-restore paths pay nothing and a parked/PR restore pays the
-        // same one probe it always did.
-        let closed = if parked || is_pr {
+        // #11480: one REST read (state + labels) answers both the park
+        // carve-outs and #9463's closed-state probe, and the shared
+        // `restore_veto` decides the park side for every release path. It
+        // replaces the #4206 (`loom:blocked`) and #4887 (`loom:operator-only`)
+        // one-label GraphQL probes. Fail-open as before: a failed read yields
+        // no labels and no state, so the restore goes ahead.
+        let signals = self.fetch_issue_signals(issue);
+        let veto = crate::work_finder::restore_veto(&signals.labels, &[]);
+        // Only probe PR-ness when a veto doesn't already decide the outcome.
+        let is_pr = veto.is_none() && self.issue_is_pull_request(issue).unwrap_or(false);
+        let closed = if veto.is_some() || is_pr {
             None
         } else {
-            // Reuses #9441's combined issue-signals read (state + labels off
-            // one REST call) instead of a separate probe — same fail-open
-            // contract: `None` falls back to the unconditional restore.
-            self.fetch_issue_signals(issue).closed
+            signals.closed
         };
         // Issue #10955: last of all, and only when the re-add would otherwise
         // happen — did the claim take `loom:issue` away in the first place?
         // Only a positive "no" skips the re-add (see `prior_label`).
-        let never_ready = !(parked || is_pr || closed == Some(true))
+        let never_ready = !(veto.is_some() || is_pr || closed == Some(true))
             && self.claim_took_ready_label(issue) == Some(false);
         let mut args = vec![
             "issue".to_string(),
@@ -104,18 +98,11 @@ impl SweepRegistry {
             "--remove-label".to_string(),
             "loom:building".to_string(),
         ];
-        if blocked {
+        if let Some(label) = veto {
             log::info!(
-                "sweep_registry: restore_label_to_ready for #{issue} found `loom:blocked` \
-                 already present — preserving the operator's park by removing the stale \
-                 `loom:building` claim only, NOT re-adding `loom:issue` (#4206)"
-            );
-        } else if operator_only {
-            log::info!(
-                "sweep_registry: restore_label_to_ready for #{issue} found \
-                 `loom:operator-only` already present — preserving the authoritative \
-                 reroute by removing the stale `loom:building` claim only, NOT re-adding \
-                 `loom:issue` (#4887)"
+                "sweep_registry: restore_label_to_ready for #{issue} found `{label}` — \
+                 preserving that hold by removing the stale `loom:building` claim only, NOT \
+                 re-adding `loom:issue` (#11480; was #4206/#4887)"
             );
         } else if is_pr {
             log::info!(
@@ -183,6 +170,12 @@ mod tests {
     /// A fake `gh` satisfying every probe the restore path makes, with a
     /// parameterized `.state` answer, recording every invocation.
     fn fake_gh(dir: &Path, state: &str) -> (PathBuf, PathBuf) {
+        fake_gh_labels(dir, state, "")
+    }
+
+    /// [`fake_gh`] whose issue-signals read also reports `labels` (a JSON
+    /// list body, e.g. `"loom:needs-capability"` quoted).
+    fn fake_gh_labels(dir: &Path, state: &str, labels: &str) -> (PathBuf, PathBuf) {
         let fake_gh = dir.join("fake-gh.sh");
         let gh_log = dir.join("gh-calls.log");
         let script = format!(
@@ -196,7 +189,7 @@ if [ "$1" = "api" ]; then
   case "$*" in
     *".pull_request != null"*) echo "false" ;;
     # #9441's combined issue-signals projection (body/state/closed_at/labels).
-    *".state"*) printf '{{"body":"","state":"{state}","closed_at":null,"labels":[]}}' ;;
+    *".state"*) printf '{{"body":"","state":"{state}","closed_at":null,"labels":[{labels}]}}' ;;
     *) echo "" ;;
   esac
   exit 0
@@ -215,6 +208,23 @@ exit 0
         config.gh_bin = Some(fake_gh.to_path_buf());
         config.skip_label_flip = false; // exercise the real restore path
         SweepRegistry::new(config)
+    }
+
+    /// #11480: a lane veto that is not a skip label (`loom:needs-capability`)
+    /// keeps the claim release from re-arming `loom:issue`; the claim goes.
+    #[test]
+    #[serial_test::serial]
+    fn a_veto_label_keeps_the_queue_label_off_on_claim_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let (fake_gh, gh_log) =
+            fake_gh_labels(dir.path(), "open", r#""loom:building","loom:needs-capability""#);
+        let registry = registry_with(&fake_gh, dir.path());
+
+        registry.restore_label_to_ready(11480).unwrap();
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap();
+        assert!(calls.contains("issue edit 11480 --remove-label loom:building"), "{calls}");
+        assert!(!calls.contains("--add-label loom:issue"), "{calls}");
     }
 
     /// #9463 regression: merge closes the issue, then the sweep exits — the

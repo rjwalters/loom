@@ -220,6 +220,9 @@ kind = "rust"
 path = "loom-daemon/src/claim_reconciliation.rs"
 [[operation.callers]]
 kind = "rust"
+path = "loom-daemon/src/reclaim_pr_warning.rs"
+[[operation.callers]]
+kind = "rust"
 path = "loom-daemon/src/claim_reconciliation/unanchored_verdict.rs"
 [[operation.callers]]
 kind = "rust"

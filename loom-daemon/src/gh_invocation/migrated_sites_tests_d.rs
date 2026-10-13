@@ -106,6 +106,7 @@ fn every_mapped_claim_name_is_an_inventoried_op() {
         "outcome.writeback_comment",
         "prless.comment",
         "park_hold.issue_view",
+        "release_veto.issue_labels",
         "park_hold.issue_body",
         "park_hold.issue_labels",
     ];

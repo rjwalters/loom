@@ -316,10 +316,21 @@ pub mod forge {
 
     fn release(gh_bin: &Path, root: &Path, issue: u32) -> Result<()> {
         let n = issue.to_string();
+        // #11480: never hand the item back to the queue past another hold.
+        let veto = crate::release_veto::veto(gh_bin, root, issue, &["loom:blocked"]);
+        let add: &[&str] = if let Some(label) = &veto {
+            log::info!(
+                "quarantine_reconciliation: #{issue} carries `{label}` — removing the \
+                 quarantine's `loom:blocked` only, NOT re-adding `loom:issue` (#11480)"
+            );
+            &[]
+        } else {
+            &["--add-label", "loom:issue"]
+        };
         let out = gh_call::output(
             gh_call::write("quarantine.issue_release", gh_bin, root)
                 .args(["issue", "edit", &n, "--remove-label", "loom:blocked"])
-                .args(["--add-label", "loom:issue"])
+                .args(add)
                 .args(gh_call::loom_repo_flag()),
         )?;
         if !out.status.success() {
@@ -695,6 +706,44 @@ exit 0
             gh_calls.contains("issue edit 99 --remove-label loom:blocked --add-label loom:issue"),
             "expected the real label-flip argv; got: {gh_calls:?}"
         );
+    }
+
+    /// #11480: the startup pass releases the quarantine's own `loom:blocked`
+    /// but does not re-arm `loom:issue` beside another veto.
+    #[test]
+    #[serial]
+    fn reconcile_workspace_keeps_the_queue_label_off_past_a_veto() {
+        let dir = tempdir().unwrap();
+        let repo_root = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        let gh_log = dir.path().join("gh-invocations.log");
+        let script = format!(
+            r#"#!/bin/bash
+printf '%s\n' "$*" >> "{log}"
+case "$*" in *issues?labels=loom:blocked*)
+  printf 'HTTP/2.0 200 OK\r\n\r\n'
+  echo '[{{"number":99,"state":"open","updated_at":"2026-01-01T00:00:00Z","labels":[{{"name":"loom:blocked"}}]}}]'
+  exit 0 ;; esac
+case "$*" in
+*/issues/99/comments*)
+  echo '[{{"body":"Auto-quarantined by loom-daemon (#3939): insta-crashed 3 times","user":{{"login":"loom-fleet-dispatch[bot]","type":"Bot"}}}}]'
+  exit 0 ;;
+*"/issues/99 --jq"*)
+  echo '["loom:blocked","loom:needs-capability"]'
+  exit 0 ;;
+esac
+exit 0
+"#,
+            log = gh_log.display(),
+        );
+        let fake_gh = write_fake_gh(dir.path(), &script);
+
+        let ws = WritableRoot::register_with_gh(&repo_root, &fake_gh);
+        assert_eq!(forge::reconcile_workspace(&ws.gh, &repo_root), (1, 1));
+
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(gh_calls.contains("issue edit 99 --remove-label loom:blocked"), "{gh_calls}");
+        assert!(!gh_calls.contains("--add-label loom:issue"), "{gh_calls}");
     }
 
     /// #10089: N unchanged passes over a re-parked `loom:blocked` issue cost

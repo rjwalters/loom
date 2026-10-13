@@ -93,7 +93,7 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "sequence.trusted_bodies"
         | "roster.comments" => ops::COMMENT_LIST,
         "claim.pr_labels" | "sequence.predecessor" => ops::PR_VIEW_STATE,
-        "park_hold.issue_view" => ops::ISSUE_VIEW_STATE,
+        "park_hold.issue_view" | "release_veto.issue_labels" => ops::ISSUE_VIEW_STATE,
         "park_hold.issue_body" => ops::ISSUE_EDIT_BODY,
         "intake.list_open" | "quarantine.issue_list" => ops::ISSUE_LIST,
         "claim.issue_reclaim"
