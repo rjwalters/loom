@@ -149,9 +149,12 @@ fn test_upgrade_keeps_modified_fleet_values_and_reports_them() {
         .map(|f| f.key)
         .collect();
     keys.sort();
+    // The retained `safehouse` block is no longer fleet policy: the
+    // integration is retired (#11112) and the daemon ignores the block with
+    // one boot-time warning, so `validate` does not flag it.
     assert_eq!(
         keys,
-        ["autonomous", "runtimes", "safehouse"],
+        ["autonomous", "runtimes"],
         "exactly the retained fleet content must be reported"
     );
 }
