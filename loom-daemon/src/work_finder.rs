@@ -1506,14 +1506,14 @@ pub fn tick_multi_with_saturation_brake<S: WorkSource, D: WorkDispatcher>(
         halted,
         max_admissions_per_tick,
         saturation_held,
-        None,
     )
 }
 
 /// Like [`tick_multi_with_saturation_brake`], but additionally applies the
-/// **repo-sharding slice preference** (Issue #6243, `defaults/docs/dispatcher-repo-sharding.md`)
-/// and the **per-repo dispatch cap + track affinity** (Issue #9090, see
-/// [`repo_cap`]).
+/// **per-repo dispatch cap + track affinity** (Issue #9090, see
+/// [`repo_cap`]). The #6243 repo-sharding slice preference that used to ride
+/// here was retired from dispatch (#11682,
+/// `defaults/docs/dispatcher-repo-sharding.md`).
 ///
 /// # Per-repo cap + track affinity (#9090)
 ///
@@ -1536,35 +1536,6 @@ pub fn tick_multi_with_saturation_brake<S: WorkSource, D: WorkDispatcher>(
 /// already sums for its global seed — so it costs no extra forge/registry
 /// reads. The workspace-draw order ([`workspace_draw`]) is untouched.
 ///
-/// # Repo-sharding slice preference (#6243)
-///
-/// When `preferred_slice` is `Some`, it must be a mask **parallel to
-/// `workspaces`** (`preferred_slice[i]` is whether workspace `i` is in this
-/// host's preferred slice, computed by the caller — in production, from
-/// [`crate::role_shard::decide`]'s `owned` verdict per root, see
-/// [`spawn_multi_work_finder_task`]).
-///
-/// The already-ordered candidate list (by [`workspace_draw`]) is split
-/// into in-slice / out-of-slice while preserving each partition's relative
-/// order, so the draw order holds WITHIN either
-/// partition unchanged. Out-of-slice candidates are dispatched THIS TICK only
-/// when the slice was completely empty at the top of the tick
-/// (work-conservation, #6243's AC) — never interleaved by priority with
-/// in-slice ones, so a lower-priority in-slice repo still holds a shared slot
-/// ahead of a higher-priority OUT-of-slice repo for as long as this host has
-/// ANY in-slice candidate at all.
-///
-/// `None` (what [`tick_multi_with_saturation_brake`] passes — e.g. an
-/// unsharded host, or sharding not wired at the call site) is byte-for-byte
-/// the pre-#6243 candidate list: every existing `tick_multi`
-/// priority-ordering test is unaffected.
-///
-/// **Preference, not the role runner's hard filter.** [`crate::role_shard`]
-/// (#6374) uses the same `owned` verdict to decide whether a workspace's role
-/// rotation runs here *at all* — an unowned workspace simply never ticks. This
-/// function deliberately does NOT do that: dispatch is work-conserving, so an
-/// unowned repo is only ever *deferred behind* the owned ones, and is picked
-/// up in full the moment this host's own slice runs dry.
 /// `halt_causes` (optional, parallel to `halted`) names WHICH hold tripped
 /// workspace `i` (#9017): `halt_causes[i]` is the closed-vocabulary cause
 /// recorded in that workspace's `workspace_halted` rows (`None` for a
@@ -1573,7 +1544,7 @@ pub fn tick_multi_with_saturation_brake<S: WorkSource, D: WorkDispatcher>(
 /// authoritative for routing: a cause at a not-held index is ignored, and a
 /// held index without a cause records a cause-less row.
 // Each argument is an independently-resolved admission knob (global ceiling,
-// per-tick ramp, saturation brake, repo slice, per-repo cap) that the caller
+// per-tick ramp, saturation brake, per-repo cap) that the caller
 // reads from a different source; bundling them into a struct would only move
 // the same list one indirection away. The narrower pre-#9090 arity stays
 // available as [`tick_multi_with_sharding`].
@@ -1586,7 +1557,6 @@ pub fn tick_multi_with_repo_cap<S: WorkSource, D: WorkDispatcher>(
     halt_causes: Option<&[Option<halt_cause::HaltCause>]>,
     max_admissions_per_tick: usize,
     saturation_held: bool,
-    preferred_slice: Option<&[bool]>,
     max_concurrent_per_repo: Option<usize>,
     lanes: &[RedMainLane],
 ) -> TickReport {
@@ -1598,7 +1568,6 @@ pub fn tick_multi_with_repo_cap<S: WorkSource, D: WorkDispatcher>(
         halt_causes,
         max_admissions_per_tick,
         saturation_held,
-        preferred_slice,
         max_concurrent_per_repo,
         lanes,
         &[],
@@ -1623,7 +1592,6 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
     halt_causes: Option<&[Option<halt_cause::HaltCause>]>,
     max_admissions_per_tick: usize,
     saturation_held: bool,
-    preferred_slice: Option<&[bool]>,
     max_concurrent_per_repo: impl Into<repo_cap::RepoLimits>,
     lanes: &[RedMainLane],
     build_backoff_held: &[bool],
@@ -1988,13 +1956,12 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
     // the drawn workspace's next candidate (level, oldest, number).
     let candidates = workspace_draw::order(candidates, priorities, &mut report);
 
-    // Candidate-list shaping (`repo_cap::shape_queue`): the #6243 repo-sharding
-    // slice partition, then #9090's track-affinity partition. Both are stable
-    // partitions of the ALREADY-drawn list, so the draw order still decides
-    // order within each group; with `preferred_slice: None` and no per-repo cap
-    // the list is byte-for-byte unchanged, and every pre-#6243/#9090
-    // priority-ordering test stays exactly as it was.
-    let candidates = repo_cap::shape_queue(candidates, preferred_slice, &cap, &mut report);
+    // Candidate-list shaping (`repo_cap::shape_queue`): #9090's track-affinity
+    // partition, a stable partition of the ALREADY-drawn list, so the draw
+    // order still decides order within each group; with no per-repo cap the
+    // list is byte-for-byte unchanged. (No repo-sharding slice: retired from
+    // dispatch, #11682.)
+    let candidates = repo_cap::shape_queue(candidates, &cap, &mut report);
 
     // Ramp-admission counter (#4234), shared across every workspace exactly
     // like `occupancy` — see `tick_with_admission_cap`'s single-workspace
@@ -3002,43 +2969,13 @@ pub fn spawn_multi_work_finder_task(
             // priority. The empty-registry cwd fallback resolves to the default.
             let priorities: Vec<u32> = roots.iter().map(|r| registry.priority_of(r)).collect();
 
-            // Dispatcher repo-sharding preferred slice (#6243): reuse the
-            // SAME host ring #6374 already established for the role runner
-            // (`role_shard`) rather than deriving a second, independent one.
-            // A workspace's owner is `fnv1a64(shard_key) % shardCount ==
-            // shardIndex` over its cross-host-stable key (repo NWO), so two
-            // hosts' slices are disjoint BY ARITHMETIC — no roster, no
-            // election, no convergence window. Every unconfigured /
-            // malformed / single-shard case resolves to
-            // `ShardPosture::Unsharded`, which owns EVERY workspace, so an
-            // unsharded daemon's dispatch order is byte-for-byte pre-#6243.
-            //
-            // The `owned` verdict means something WEAKER here than it does
-            // in the role runner: there it is a hard filter (unowned => never
-            // ticks), here it is only a preference with a work-conserving
-            // fallback (unowned => dispatched as soon as this host's own
-            // slice is dry). Dispatch can therefore never be *dropped* by a
-            // sharding misconfiguration, only reordered. See
-            // `defaults/docs/dispatcher-repo-sharding.md`.
-            //
-            // Roster mode (#7691) keeps that contract intact: when the
-            // roster's admission fence YIELDS, `ShardDecision::owned` still
-            // carries the pre-roster (#6374) verdict — only the role runner's
-            // `admits_role_tick()` flips. A fence yield therefore never
-            // reaches this line as "owns nothing"; it degrades to exactly the
-            // work-conserving preference this host had before the roster
-            // existed. (When the fence *admits*, `owned` is the roster ring's
-            // own verdict, which is the intended, in-scope change: a
-            // preference reshuffle, never a dropped dispatch.)
-            //
-            // Deliberately NOT calling `role_shard::log_decision_once` here:
-            // it renders a `role_runner:`-prefixed line and dedups through a
-            // process-global per-root map, so calling it from this loop would
-            // both mislabel the line and suppress the role runner's own
-            // edge-triggered one. The aggregate lands in the axis line below
-            // instead.
+            // Shard verdicts, per root, for the dispatch plan's `owning_shard`
+            // only (the fleet-merge primary rule, #9288). They no longer
+            // shape dispatch: the #6243 slice preference was retired (#11682)
+            // because pass 2 could reject every in-slice candidate after the
+            // slice had already deferred everything else. The role runner's
+            // own (#6374) use of the same ring is unchanged.
             let shard_decisions = dispatch_plan::shard_decisions(&roots);
-            let preferred_slice: Vec<bool> = shard_decisions.iter().map(|d| d.owned).collect();
 
             // Per-repo main-health halt (#3930): look up each root's own gate
             // state, parallel to `pairs`. A red repo halts only its own dispatch.
@@ -3219,7 +3156,6 @@ pub fn spawn_multi_work_finder_task(
                 }
             }
 
-            let in_slice_count = preferred_slice.iter().filter(|&&b| b).count();
             let axis_line = format!(
                 "work_finder: dynamic cap = {max_concurrent} (pool={pool_size}, \
                  healthy_tokens={token_limit} [informational only, not capacity-limiting \
@@ -3229,11 +3165,9 @@ pub fn spawn_multi_work_finder_task(
                  preflight_held={preflight_held_count}, \
                  saturation_held={saturation_held}, \
                  build_backoff_held={build_backoff_held} (#9410), \
-                 observed_idle={}, workspaces={}, priorities={priorities:?}, \
-                 shard_slice={in_slice_count}/{} preferred (#6243/#6374))",
+                 observed_idle={}, workspaces={}, priorities={priorities:?})",
                 format_idle(idle),
-                pairs.len(),
-                preferred_slice.len()
+                pairs.len()
             );
             if was_max_concurrent != Some(max_concurrent) {
                 log::info!("{axis_line}");
@@ -3251,7 +3185,6 @@ pub fn spawn_multi_work_finder_task(
                 Some(&halt_causes),
                 max_admissions_per_tick,
                 saturation_held,
-                Some(&preferred_slice),
                 (max_concurrent_per_repo, ram_budget, disk_budget),
                 &lanes,
                 &build_backoff_held.per_workspace,
@@ -3493,8 +3426,7 @@ pub mod configured_max;
 pub use configured_max::{ConfiguredMax, ConfiguredMaxReloader};
 
 /// Per-repo dispatch cap + repo-track affinity (#9090), including the
-/// candidate-list shaping (#6243's slice partition and its new affinity
-/// sibling) and the pre-#9090 [`tick_multi_with_sharding`] entry point. Its own
+/// candidate-list shaping (the affinity partition) and the pre-#9090 [`tick_multi_with_sharding`] entry point. Its own
 /// file for the same file-size-ratchet reason as [`registry_refresh`].
 pub mod repo_cap;
 pub use repo_cap::{tick_multi_with_sharding, RepoCap};

@@ -268,7 +268,8 @@ impl CapView {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapacityWait {
     /// The work finder's gate: `capacity`, `ramp`, `saturation`,
-    /// `build-backoff`, `repo-cap`, `repo-slice` or `host-affinity`.
+    /// `build-backoff`, `repo-cap` or `host-affinity` (`repo-slice` is
+    /// retired with the dispatch slice, #11682, and only read back).
     pub gate: String,
     /// For the `capacity` gate: which cap term binds, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]

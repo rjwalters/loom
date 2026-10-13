@@ -54,7 +54,7 @@ fn item(n: u32, body: Option<String>, extra_label: Option<&str>) -> WorkItem {
 fn run(workspaces: &mut [(Src, Disp)]) -> TickReport {
     let halted = vec![false; workspaces.len()];
     let prios = vec![0; workspaces.len()];
-    tick_multi_with_sharding(workspaces, &prios, 10, &halted, usize::MAX, false, None)
+    tick_multi_with_sharding(workspaces, &prios, 10, &halted, usize::MAX, false)
 }
 
 fn row(report: &TickReport, n: u32) -> Option<(Qd, Option<String>)> {
@@ -242,7 +242,6 @@ fn run_lane(workspaces: &mut [(Src, Disp)], halted: bool, lane: RedMainLane) -> 
         None,
         usize::MAX,
         false,
-        None,
         None,
         &[lane],
     )
