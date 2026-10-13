@@ -324,6 +324,26 @@ out="$(run_argv LOOM_CODEX_MODEL=adapter-default LOOM_MODEL=tier-model -- -p x)"
 assert_contains "-m tier-model" "$out" \
     "LOOM_MODEL outranks the adapter's static default"
 
+# model@effort split (#8387): base -> -m, suffix -> lowest-priority effort.
+out="$(run_argv LOOM_MODEL=gpt-5-codex@high -- -p x)"
+assert_contains "-m gpt-5-codex -c model_reasoning_effort=high" "$out" "model@effort splits into -m base + effort"
+out="$(run_argv LOOM_MODEL=gpt-5-codex@high LOOM_EFFORT=low -- -p x)"
+assert_contains "model_reasoning_effort=low" "$out" "LOOM_EFFORT outranks the model suffix"
+assert_not_contains "model_reasoning_effort=high" "$out" "suffix dropped when LOOM_EFFORT set"
+out="$(run_argv LOOM_MODEL=gpt-5-codex@high LOOM_EFFORT=low -- -p x -c model_reasoning_effort=medium)"
+assert_contains "model_reasoning_effort=medium" "$out" "explicit -c outranks suffix and LOOM_EFFORT"
+assert_not_contains "model_reasoning_effort=high" "$out" "suffix dropped when explicit -c set"
+out="$(run_argv LOOM_MODEL=gpt-5-codex@ -- -p x)"
+assert_contains "-m gpt-5-codex" "$out" "empty suffix forwards the base only"
+assert_not_contains "model_reasoning_effort" "$out" "empty suffix routes no effort"
+out="$(run_argv LOOM_MODEL=@high LOOM_CODEX_MODEL=dflt -- -p x)"
+assert_contains "-m dflt" "$out" "empty base falls through to the default model"
+out="$(run_argv LOOM_CODEX_MODEL=dflt@low -- -p x)"
+assert_contains "-m dflt -c model_reasoning_effort=low" "$out" "LOOM_CODEX_MODEL suffix is split too"
+out="$(run_argv LOOM_MODEL=@high -- -p x)"
+assert_not_contains " -m " "$out" "empty base with no default emits no -m"
+assert_not_contains "@" "$out" "no @ forwarded for an empty base"
+
 # codex exec has no --effort flag; the knob is a config override.
 out="$(run_argv LOOM_EFFORT=high -- -p x)"
 assert_contains "-c model_reasoning_effort=high" "$out" \

@@ -503,7 +503,32 @@ fi
 # OpenAI model IDs is epic #4167 Phase 4. Until then LOOM_MODEL is forwarded
 # verbatim and the adapter's static default is "whatever the profile already
 # chose", which is the operator's own selection.
+#
+# `model@effort` rung grammar (#8387): split on the first `@`. Only the base is
+# ever forwarded as `-m`; the suffix is the LOWEST-priority effort source,
+# routed below as `-c model_reasoning_effort=` (explicit -c > --effort >
+# LOOM_EFFORT > suffix). Empty base -> falls through; empty suffix -> ignored.
+# An explicit `-m foo@high` in args is user-supplied and left unchanged.
+MODEL_SUFFIX_EFFORT=""
+_split_model() { # $1=value $2=source; sets _SM_BASE, records first suffix
+    _SM_BASE="${1%%@*}"
+    [[ "$1" == *@* ]] || return 0
+    local _sfx="${1#*@}"
+    if [[ -z "$_SM_BASE" ]]; then
+        log_info "spawn-codex: $2='$1' has an empty model base; ignoring it (falls through to the default-model path)"
+    elif [[ -n "$_sfx" && -z "$MODEL_SUFFIX_EFFORT" ]]; then
+        MODEL_SUFFIX_EFFORT="$_sfx"
+    fi
+    [[ -z "$_SM_BASE" ]] || log_info "spawn-codex: split $2='$1' -> model=$_SM_BASE effort=${_sfx:-none}"
+}
+_LOOM_MODEL_BASE=""
+if [[ "$HAS_MODEL_ARG" != "true" && -n "${LOOM_MODEL:-}" ]]; then
+    _split_model "$LOOM_MODEL" LOOM_MODEL; _LOOM_MODEL_BASE="$_SM_BASE"
+fi
 CODEX_DEFAULT_MODEL="${LOOM_CODEX_MODEL:-}"
+if [[ -n "$CODEX_DEFAULT_MODEL" && "$HAS_MODEL_ARG" != "true" && -z "$_LOOM_MODEL_BASE" ]]; then
+    _split_model "$CODEX_DEFAULT_MODEL" LOOM_CODEX_MODEL; CODEX_DEFAULT_MODEL="$_SM_BASE"
+fi
 EFFECTIVE_MODEL=""
 if [[ "$HAS_MODEL_ARG" == "true" ]]; then
     if [[ -n "${LOOM_MODEL:-}" ]]; then
@@ -511,10 +536,10 @@ if [[ "$HAS_MODEL_ARG" == "true" ]]; then
     fi
     EFFECTIVE_MODEL="$EXPLICIT_MODEL"
     log_info "spawn-codex: model=${EXPLICIT_MODEL:-default} (from -m/--model arg)"
-elif [[ -n "${LOOM_MODEL:-}" ]]; then
-    EFFECTIVE_MODEL="$LOOM_MODEL"
-    PASSTHROUGH_ARGS+=(-m "$LOOM_MODEL")
-    log_info "spawn-codex: model=$LOOM_MODEL (from LOOM_MODEL)"
+elif [[ -n "$_LOOM_MODEL_BASE" ]]; then
+    EFFECTIVE_MODEL="$_LOOM_MODEL_BASE"
+    PASSTHROUGH_ARGS+=(-m "$_LOOM_MODEL_BASE")
+    log_info "spawn-codex: model=$_LOOM_MODEL_BASE (from LOOM_MODEL)"
 elif [[ -n "$CODEX_DEFAULT_MODEL" ]]; then
     EFFECTIVE_MODEL="$CODEX_DEFAULT_MODEL"
     PASSTHROUGH_ARGS+=(-m "$CODEX_DEFAULT_MODEL")
@@ -569,7 +594,11 @@ elif [[ -n "$GENERIC_EFFORT" ]]; then
 elif [[ -n "${LOOM_EFFORT:-}" ]]; then
     PASSTHROUGH_ARGS+=(-c "model_reasoning_effort=$LOOM_EFFORT")
     log_info "spawn-codex: effort=$LOOM_EFFORT (from LOOM_EFFORT)"
+elif [[ -n "$MODEL_SUFFIX_EFFORT" ]]; then
+    PASSTHROUGH_ARGS+=(-c "model_reasoning_effort=$MODEL_SUFFIX_EFFORT")
+    log_info "spawn-codex: effort=$MODEL_SUFFIX_EFFORT (from model@effort suffix)"
 fi
+[[ -z "$MODEL_SUFFIX_EFFORT" ]] || { [[ "$HAS_EFFORT_OVERRIDE" != "true" && -z "$GENERIC_EFFORT" && -z "${LOOM_EFFORT:-}" ]] || log_info "spawn-codex: model suffix '@$MODEL_SUFFIX_EFFORT' ignored: overridden by explicit effort source"; }
 
 # --- Sandbox mapping (SAFETY-CRITICAL; see header + guardrail-parity-codex.md) ---
 VALID_SANDBOX_MODES="read-only workspace-write danger-full-access"
