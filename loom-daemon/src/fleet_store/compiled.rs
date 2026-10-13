@@ -135,6 +135,21 @@ impl Compiled {
         self.host_tier(host, "defaults")
     }
 
+    /// Every host with a `config.hosts.<host>.defaults` overlay (#11740).
+    #[must_use]
+    pub fn host_names(&self) -> Vec<String> {
+        self.doc["config"]["hosts"]
+            .as_object()
+            .map(|hosts| {
+                hosts
+                    .keys()
+                    .filter(|h| self.host_defaults(h).is_some())
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// `config.hosts.<host>.local`: `host`'s host-local tier.
     #[must_use]
     pub fn host_local(&self, host: &str) -> Option<&Value> {

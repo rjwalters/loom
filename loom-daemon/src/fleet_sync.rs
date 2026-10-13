@@ -98,9 +98,11 @@ pub mod applied;
 pub mod checkout_ff;
 mod floor_knowledge;
 pub mod git_spawn_log;
+pub mod identity;
 mod loom_ui;
 pub mod offline_floor;
 pub mod roster_clone;
+mod status_lines;
 pub mod workspace_resync;
 
 pub use floor_knowledge::{floor_knowledge, floor_wake, FloorKnowledge, FloorWake};
@@ -250,6 +252,10 @@ pub struct ConfigPass {
     pub tiers: Vec<TierReport>,
     /// Why the pass could not be completed, when it could not be.
     pub error: Option<String>,
+    /// The render failed because this host's id names no store host, so the
+    /// host is off fleet config (#11740). Omitted when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub host_not_in_store: bool,
 }
 
 impl ConfigPass {
@@ -303,6 +309,7 @@ pub fn config_pass(
                 cached,
                 tiers: Vec::new(),
                 error: Some(format!("{e:#}")),
+                host_not_in_store: identity::host_not_in_store(&loaded.snapshot, host),
             }
         }
     };
@@ -356,6 +363,7 @@ pub fn config_pass(
         cached,
         tiers,
         error,
+        host_not_in_store: false,
     }
 }
 
@@ -868,8 +876,16 @@ pub fn render_line(status: Option<&FleetSyncStatus>, now: DateTime<Utc>) -> Opti
     }
     head.push(')');
     let mut lines = vec![head];
-    lines.extend(state_lines(s));
-    lines.extend(floor_lines(&s.floor));
+    if s.config.host_not_in_store {
+        lines.push(format!(
+            "  {}: `{}` names no store host; this host runs on its last rendered config. Set \
+             LOOM_HOST_ID or fleet.hostId to its roster name (#11740)",
+            identity::NOT_IN_STORE.to_uppercase(),
+            s.host
+        ));
+    }
+    lines.extend(status_lines::state_lines(s));
+    lines.extend(status_lines::floor_lines(&s.floor));
     let interval = std::time::Duration::from_secs(s.interval_secs);
     lines.extend(s.workspaces.lines_at(Some((now, interval))));
     lines.extend(checkout_ff::lines(&s.checkouts));
@@ -922,68 +938,6 @@ pub fn render_line(status: Option<&FleetSyncStatus>, now: DateTime<Utc>) -> Opti
     Some(lines.join("\n"))
 }
 
-/// The floor lines of the `Fleet store:` block (#10711). Empty when no floor
-/// is set and none was malformed, so `status` is unchanged for such a host.
-fn floor_lines(f: &FloorPass) -> Vec<String> {
-    let mut lines = Vec::new();
-    if let Some(floor) = &f.floor {
-        let from = match (&f.source, f.carried) {
-            (_, true) => " (LAST GOOD floor, carried over)".to_string(),
-            (Some(src), false) => format!(" (from {src})"),
-            (None, false) => String::new(),
-        };
-        lines.push(format!("  {}: {floor}{from}", floor::KEY));
-    }
-    if let Some(e) = &f.error {
-        lines.push(format!("  {}: ERROR — {e}", floor::KEY));
-    }
-    lines
-}
-
-/// The run-state lines of the `Fleet store:` block (#9598) — the *desired*
-/// state the store named, and the *actual* enforcement this host applied.
-///
-/// Empty when the pass resolved no state at all (a store with no
-/// `fleet/state.yml`, a first boot behind an unreachable forge), except that a
-/// read *error* is always reported: "the state could not be read" is the one
-/// thing an operator must not have to infer from silence.
-fn state_lines(s: &FleetSyncStatus) -> Vec<String> {
-    let mut lines = Vec::new();
-    if let Some(desired) = s.state.desired {
-        let from = match s.state.source.as_deref() {
-            Some("host") => "host entry",
-            Some(_) => "fleet default",
-            None => "unknown entry",
-        };
-        let how = if s.state.from_last_recorded {
-            ", from this host's LAST RECORDED state — no snapshot was readable"
-        } else if s.state.cached {
-            ", from a CACHED snapshot"
-        } else {
-            ""
-        };
-        let actual = match s.enforced {
-            Enforcement::Proceed => "dispatching normally",
-            Enforcement::Hold => "new dispatch HELD, in-flight work finishes",
-            Enforcement::Stop => "refusing to start / draining to exit",
-        };
-        lines.push(format!("  run state: desired {} ({from}{how}) -> {actual}", desired.as_str()));
-        for (k, v) in [
-            ("by", &s.state.by),
-            ("since", &s.state.since),
-            ("reason", &s.state.reason),
-        ] {
-            if let Some(v) = v {
-                lines.push(format!("    {k}: {v}"));
-            }
-        }
-    }
-    if let Some(e) = &s.state.error {
-        lines.push(format!("  run state: NOT ENFORCED — {e}"));
-    }
-    lines
-}
-
 // ============================================================================
 // The daemon's startup pass and timer loop
 // ============================================================================
@@ -1011,11 +965,13 @@ fn run_pass(inputs: &PassInputs, pass: &str, mode: Mode, now: DateTime<Utc>) -> 
     // make a `stopped` host look like it converged before it was told to stop.
     // The fallback is this host's *last recorded* state (see `state_pass`), so a
     // forge outage with a wiped cache still cannot resume a stopped host.
+    // #11740: a generated id the store does not know may adopt its roster name.
+    let host = identity::pass_host(&transport, &inputs.cache, &inputs.location, &inputs.host, now);
     let state = fleet_state::state_pass(
         &transport,
         &inputs.cache,
         &inputs.location,
-        &inputs.host,
+        &host,
         last_recorded_state(),
         now,
     );
@@ -1028,7 +984,7 @@ fn run_pass(inputs: &PassInputs, pass: &str, mode: Mode, now: DateTime<Utc>) -> 
             &transport,
             &inputs.cache,
             &inputs.location,
-            &inputs.host,
+            &host,
             &machine_path,
             &local_path,
             mode,
@@ -1057,7 +1013,7 @@ fn run_pass(inputs: &PassInputs, pass: &str, mode: Mode, now: DateTime<Utc>) -> 
     FleetSyncStatus {
         repo: inputs.location.repo.clone(),
         reference: inputs.location.reference.clone(),
-        host: inputs.host.clone(),
+        host,
         pass: pass.to_string(),
         at: now,
         interval_secs: inputs.interval.as_secs(),
@@ -1172,7 +1128,9 @@ fn roster_half(
 /// on the event bus when there is something to say.
 fn report(status: &FleetSyncStatus, bus: Option<&crate::event_bus::EventBus>) {
     let summary = render_line(Some(status), status.at).unwrap_or_default();
-    if status.errored() {
+    if status.config.host_not_in_store {
+        log::error!("fleet_sync: {summary}");
+    } else if status.errored() {
         log::warn!("fleet_sync: {summary}");
     } else if status.drifted() {
         log::info!("fleet_sync: {summary}");
@@ -1339,8 +1297,10 @@ pub async fn start(
         inputs.interval.as_secs()
     );
     workspace_resync::mark_boot();
+    let mut inputs = inputs;
     let state = startup_pass(&inputs, bus.as_deref()).await;
-    // Diverges on `stopped`: this host is not meant to be up at all.
+    inputs.host = identity::adopted().unwrap_or(inputs.host); // #11740
+                                                              // Diverges on `stopped`: this host is not meant to be up at all.
     let hold_note = fleet_state::enforce_at_boot(&state, &inputs.host, &inputs.location.repo).await;
     Some(Started {
         hold_note,
