@@ -769,6 +769,11 @@ impl SweepRegistry {
             .start_facts
             .get(sweep_id)
             .and_then(|facts| facts.dispatch_origin.clone());
+        // 2am#4393: the draw that chose this sweep's tap, from the same facts.
+        let role_draw = self
+            .start_facts
+            .get(sweep_id)
+            .and_then(|facts| facts.role_draw.clone());
         let (attempt_index, previous_sweep_id, trigger) =
             if let Some(facts) = self.start_facts.get(sweep_id) {
                 (facts.attempt_index, facts.previous_sweep_id.clone(), facts.trigger.clone())
@@ -1010,6 +1015,7 @@ impl SweepRegistry {
             previous_sweep_id,
             trigger,
             dispatch_origin,
+            role_draw,
             rework_events,
             pr_numbers,
             hw_lines_added: landing_size.as_ref().map(|size| size.hw_lines_added),

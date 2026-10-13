@@ -71,8 +71,8 @@ pub mod queue_snapshot;
 pub mod repo_identity;
 mod start_facts;
 pub use start_facts::{
-    effort_source, model_source, DispatchOrigin, SweepStartFacts,
-    SWEEP_START_FACT_LOG_ATTRIBUTE_KEYS,
+    effort_source, model_source, DispatchOrigin, SweepRoleDraw, SweepStartFacts,
+    SWEEP_ROLE_DRAW_LOG_ATTRIBUTE_KEYS, SWEEP_START_FACT_LOG_ATTRIBUTE_KEYS,
 };
 pub mod trace;
 pub mod visibility;
@@ -958,6 +958,12 @@ pub struct SweepOutcomeRecord {
     /// fabricated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_origin: Option<String>,
+    /// The weighted agent draw that chose this sweep's tap (#11726;
+    /// 2AMLogic/2am#4393), copied from the sweep's start facts. Absent when no
+    /// `roleDraw` table decided the sweep, on journal lines that predate it,
+    /// and on sweeps this daemon did not dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_draw: Option<SweepRoleDraw>,
     /// In-sweep rework events (Issue #9444) observed by the paths that
     /// performed them, in event order. Absent (never `[]`) when none were
     /// observed for this sweep.

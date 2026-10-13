@@ -25,6 +25,21 @@ use crate::telemetry::trace::journal::Journal;
 use crate::telemetry::trace::store::TraceStore;
 use crate::telemetry::trace::{SpanRecord, TraceAttributes};
 
+/// The `loom.runtime` a tick's usage spans carry (2am#4393): the resolved
+/// runtime when one is known, else `claude` when the tokens came from Claude
+/// Code's own transcripts. Every non-Claude source is selected BY a named
+/// runtime, so a transcript-sourced tick with no name is a Claude tick; before
+/// this its usage spans left `loom.runtime` empty and read as model-only.
+#[must_use]
+pub fn span_runtime(
+    runtime: Option<&str>,
+    source: crate::usage_source::UsageSource,
+) -> Option<&str> {
+    runtime.filter(|r| !r.trim().is_empty()).or_else(|| {
+        (source == crate::usage_source::UsageSource::ClaudeTranscripts).then_some("claude")
+    })
+}
+
 /// Journal the tick's execution-scoped usage. Best-effort: logs, never fails.
 pub fn journal_execution(
     root: &Path,
