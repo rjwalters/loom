@@ -146,6 +146,8 @@ use serde_json::Value;
 #[path = "session_reconcile_drift.rs"]
 pub mod drift;
 pub use drift::DeferReason;
+#[path = "session_reconcile_skew.rs"]
+pub mod skew;
 
 /// Master on/off override (`0`/`false`/`no`/`off` disables).
 pub const SESSION_RECONCILE_ENABLE_ENV: &str = "LOOM_SESSION_RECONCILE";
@@ -352,6 +354,19 @@ pub enum Outcome {
     /// Missing, and a recorded [`Outcome::DriftRemoved`] still stands (the
     /// denial applies, or cannot be re-checked): not recreated.
     DriftRemovalStands,
+    /// Running with a `loom-daemon` older than the host's but not recreated
+    /// this pass (busy, changed, lock unknown); re-checked on the next one
+    /// (#11727).
+    SkewDeferred {
+        reason: DeferReason,
+    },
+    /// Running with a `loom-daemon` older than the host's and idle: recreated
+    /// from the image pinned to the host version (#11727).
+    SkewRecreated {
+        workspace: PathBuf,
+        from: skew::DaemonVersion,
+        to: skew::DaemonVersion,
+    },
     /// Skipped without any `docker` call until `retry_at` (unix secs).
     BackingOff {
         retry_at: u64,
@@ -372,7 +387,13 @@ impl Outcome {
     /// The container was (re)started by this pass.
     #[must_use]
     pub fn started(&self) -> bool {
-        matches!(self, Self::Resumed | Self::Recreated { .. } | Self::DriftRecreated { .. })
+        matches!(
+            self,
+            Self::Resumed
+                | Self::Recreated { .. }
+                | Self::DriftRecreated { .. }
+                | Self::SkewRecreated { .. }
+        )
     }
 }
 
@@ -396,6 +417,8 @@ struct AccountMemory {
     held_reported: bool,
     /// Started by a previous pass; confirm it on the next running sighting.
     awaiting_confirm: bool,
+    /// Daemon-version skew bookkeeping (#11727).
+    skew: skew::SkewMemory,
     failures: u32,
     retry_at: u64,
     last_error: Option<String>,
@@ -510,6 +533,9 @@ pub struct PassInputs<'a> {
     /// Act only on accounts of this [`drift::priority`] class (`run_tick`
     /// walks the classes in order across every root); `None`: all, sorted.
     pub class: Option<u8>,
+    /// The host daemon's version; `None` when it could not be read, which
+    /// disables every version-coupling decision (#11727).
+    pub host_version: Option<skew::DaemonVersion>,
 }
 
 /// The pass's single container read: one [`Snapshot`] from `take`, taken on
@@ -862,7 +888,14 @@ fn reconcile_one<R: ContainerRunner>(
     let is_held = || ctx.index.is_held(name);
     Ok(match decision {
         Decision::Healthy => match inspect {
-            Some(inspect) => drift::reconcile_running(lifecycle, account, inspect, ctx, mem)?,
+            Some(inspect) => {
+                let outcome = drift::reconcile_running(lifecycle, account, inspect, ctx, mem)?;
+                if outcome == Outcome::Running {
+                    skew::reconcile_skew(lifecycle, account, inspect, ctx, mem)?.unwrap_or(outcome)
+                } else {
+                    outcome
+                }
+            }
             None => Outcome::Running,
         },
         Decision::Restarting => {
@@ -929,6 +962,7 @@ fn reconcile_one<R: ContainerRunner>(
                     workspace.display()
                 );
             }
+            skew::guard_image(ctx, recreate_image.as_deref())?;
             let undo = UndoLock::Take(ctx.dispatch_locks);
             recreate_container(lifecycle, name, &workspace, recreate_image, &is_held, undo)?;
             mem.awaiting_confirm = true;
@@ -1055,6 +1089,9 @@ pub fn run_tick(fallback_root: &Path, state: &mut ReconcileState, now: u64) -> V
                 },
                 dispatch_locks: dispatch_locks.as_deref(),
                 class: Some(class),
+                host_version: skew::DaemonVersion::from_version_output(
+                    crate::self_update::BUILD_IDENTITY,
+                ),
             };
             let outcomes =
                 reconcile_accounts(&mut lifecycle, &accounts, &inputs, &mut observe, state, now);

@@ -30,6 +30,8 @@ mod hold_tests;
 mod removal_tests;
 #[path = "session_reconcile_safety_tests.rs"]
 mod safety_tests;
+#[path = "session_reconcile_skew_tests.rs"]
+mod skew_tests;
 
 /// Shared so a pass can snapshot it while the lifecycle owns it.
 #[derive(Default, Clone)]
@@ -97,6 +99,11 @@ struct FakeState {
     /// The next N `stop_and_remove` calls stop the container, then fail the
     /// `docker rm` (it stays present, stopped).
     rm_fails: Mutex<u32>,
+    /// What `loom-daemon --version` prints inside each container; a missing
+    /// entry makes the probe fail (exit 127).
+    daemon_versions: Mutex<HashMap<String, String>>,
+    /// The host daemon's version as the pass reads it (`None`: unreadable).
+    host_version: Mutex<Option<skew::DaemonVersion>>,
 }
 
 impl FakeState {
@@ -151,7 +158,12 @@ impl FakeState {
     fn mutations(&self) -> Vec<String> {
         self.calls()
             .into_iter()
-            .filter(|c| c != "inspect" && c != "has_active_exec")
+            .filter(|c| {
+                !matches!(
+                    c.as_str(),
+                    "inspect" | "has_active_exec" | "exec_capture" | "version_probe"
+                )
+            })
             .collect()
     }
     fn log(&self, method: &str) {
@@ -257,6 +269,13 @@ impl ContainerRunner for Fake {
             .clone()
             .unwrap_or(intended);
         self.mounts.lock().unwrap().insert(container.into(), mounts);
+        // The new container ships the daemon its image tag names.
+        if let Some(tag) = skew::DaemonVersion::from_image(image) {
+            self.daemon_versions
+                .lock()
+                .unwrap()
+                .insert(container.into(), format!("loom-daemon {tag} (commit abc1234)"));
+        }
         Ok(())
     }
     fn start_existing(&self, container: &str) -> Result<()> {
@@ -323,8 +342,19 @@ impl ContainerRunner for Fake {
         self.log("attach_interactive");
         Ok(0)
     }
-    fn exec_capture(&self, _c: &str, _argv: &[&str], _t: Duration) -> Result<ExecOutput> {
+    fn exec_capture(&self, c: &str, argv: &[&str], _t: Duration) -> Result<ExecOutput> {
         self.log("exec_capture");
+        if argv == ["loom-daemon", "--version"] {
+            self.log("version_probe");
+            let printed = self.daemon_versions.lock().unwrap().get(c).cloned();
+            return Ok(ExecOutput {
+                success: printed.is_some(),
+                unavailable: false,
+                timed_out: false,
+                exit_code: Some(if printed.is_some() { 0 } else { 127 }),
+                output: printed.unwrap_or_else(|| "exec: loom-daemon: not found".into()),
+            });
+        }
         Ok(ExecOutput {
             success: true,
             unavailable: false,
@@ -430,6 +460,7 @@ fn fake_inputs<'a>(
         would_create_accept: &|_| Ok(()),
         dispatch_locks: Some(Box::leak(fake.lock_dir().into_boxed_path())),
         class: None,
+        host_version: None,
     }
 }
 
@@ -450,6 +481,7 @@ fn pass_named(
     let mut observe = PassSnapshot::new(&mut take);
     let inputs = fake_inputs(&fake, &index, private, fallback, &registered);
     let inputs = PassInputs {
+        host_version: fake.host_version.lock().unwrap().clone(),
         registered: (!*fake.registry_unreadable.lock().unwrap()).then_some(&registered[..]),
         denials_for: &|_| {
             if *fake.roster_unreadable.lock().unwrap() {

@@ -263,6 +263,8 @@ pub fn action_of(outcome: &Outcome) -> Option<String> {
         Outcome::DriftUnachievable => "drift not actionable (see the daemon log)".into(),
         Outcome::DriftRemoved { .. } => "removed (denied mount)".into(),
         Outcome::DriftRemovalStands => "kept down (removal stands)".into(),
+        Outcome::SkewDeferred { .. } => "deferred (daemon older than the host's)".into(),
+        Outcome::SkewRecreated { .. } => "recreated (daemon older than the host's)".into(),
         Outcome::BackingOff { retry_at } => format!("backoff until {}", utc(*retry_at)),
         Outcome::DockerUnavailable { retry_at, .. } => {
             format!("docker unavailable; backoff until {}", utc(*retry_at))
