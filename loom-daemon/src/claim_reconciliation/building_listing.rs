@@ -14,9 +14,10 @@ use super::BuildingIssue;
 
 pub(super) fn list_building_issues(gh_bin: &Path, root: &Path) -> Result<Vec<BuildingIssue>> {
     // An unchanged claim set costs zero rate limit (304). `LOOM_REPO`
-    // precedence is handled inside; the `pull_request` filter keeps the
-    // pre-#4428 issue-only semantics.
-    let rows = crate::forge_listing::list_issues_cached_as(
+    // precedence is handled inside; the issues-only listing keeps the
+    // pre-#4428 semantics (#9929: a `loom:building` PR row must never be
+    // reconciled as if it were a claimed issue).
+    let rows = crate::forge_listing::list_issues_only_cached_as(
         "claim_reconciliation",
         gh_bin,
         Some(root),
@@ -26,7 +27,6 @@ pub(super) fn list_building_issues(gh_bin: &Path, root: &Path) -> Result<Vec<Bui
     )?;
     Ok(rows
         .into_iter()
-        .filter(|r| !r.is_pull_request)
         .map(|r| BuildingIssue {
             number: r.number,
             updated_at: r
