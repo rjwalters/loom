@@ -1321,6 +1321,8 @@ impl SweepRegistry {
             pr_number,
             jev,
         });
+        let stage_attempt =
+            super::work_started::stage_attempt(&phase, history.iter().map(|o| o.phase.as_str()));
         // Genuine transition — publish it (see the "Bus emission" doc section
         // above). Ordered after the history push so the dedupe state is already
         // committed even if a subscriber panics on delivery.
@@ -1330,6 +1332,15 @@ impl SweepRegistry {
             pr_number: pr_number.and_then(|n| i32::try_from(n).ok()),
             repo: None, // stamped by emit_event (#3929)
         });
+        // #11641: the role this marker hands the item to began now.
+        self.emit_work_started(
+            sweep_id,
+            *issue,
+            Some(&phase),
+            super::work_started::read_checkpoint_timestamp(&checkpoint),
+            pr_number,
+            stage_attempt,
+        );
     }
 
     /// The most recent `pr_number` observed on this sweep's checkpoint (Issue
