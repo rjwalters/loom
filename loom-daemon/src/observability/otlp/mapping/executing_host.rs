@@ -24,6 +24,8 @@ use crate::telemetry::{TelemetryEnvelope, TelemetryRecord};
 
 /// The log attribute keys this module adds. The collector's
 /// `transform/privacy` log `keep_keys` must list each one (contract-tested).
+/// Only the contract test reads it, so it is test-only.
+#[cfg(test)]
 pub(in crate::observability::otlp) const EXECUTING_HOST_LOG_ATTRIBUTE_KEYS: &[&str] =
     &["loom.version", "loom.revision", "host.id"];
 
