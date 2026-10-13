@@ -92,14 +92,6 @@ pub struct TickReport {
     /// an operator tells them apart by the admission span, which only an
     /// in-dispatch refusal has.
     pub pr_open_prefiltered: usize,
-    /// Issues skipped because a **peer host** advertised a live soft claim over
-    /// the safehouse room (Issue #4028, Phase 1). Counted under its **own**
-    /// distinct reason — never folded into [`collisions`](Self::collisions)
-    /// (#4085's post-hoc collision *count*) or the label/in-flight skips — so an
-    /// operator can see how many dispatches the soft claim actively prevented,
-    /// separate from the collisions it did not. Always `0` when
-    /// `safehouse.enabled` is false (the dispatcher's `peer_claimed()` is empty).
-    pub skipped_peer_claim: usize,
     /// Issues skipped because they are inside a per-issue dispatch-backoff
     /// window after a failed dispatch (Issue #4485) — either filtered out before
     /// the capacity gate via [`WorkDispatcher::backed_off`](super::WorkDispatcher::backed_off), or refused by the

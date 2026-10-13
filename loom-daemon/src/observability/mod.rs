@@ -5,8 +5,7 @@
 //! [`crate::telemetry`] already defines (issue #4703):
 //!
 //! - [`collector`] — a pure [`crate::event_bus::EventBus`] subscriber (adds
-//!   no new emit call sites anywhere else in the daemon, mirroring
-//!   [`crate::safehouse`]'s design) that maps sweep-lifecycle events plus
+//!   no new emit call sites anywhere else in the daemon) that maps sweep-lifecycle events plus
 //!   periodic host/token samples into [`crate::telemetry::TelemetryEnvelope`]s.
 //! - [`queue`] — a bounded, disk-backed offline queue those envelopes land in,
 //!   so a sink outage (or a sleeping/idle-shut-down host, #4467/#4697) never
@@ -62,8 +61,8 @@
 //! subscription, no queue file, no HTTP client construction, zero syscalls —
 //! whenever the resolved config is disabled or under-configured (no endpoint,
 //! no readable ingest key file). This is the same "disabled means truly
-//! inert" contract [`crate::safehouse::spawn_sink`] and
-//! [`crate::idle_exit::spawn_task`]'s callers already rely on.
+//! inert" contract [`crate::idle_exit::spawn_task`]'s callers already rely
+//! on.
 //!
 //! # Read-only invariant
 //!

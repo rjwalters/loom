@@ -1222,11 +1222,11 @@ mod tests {
 
     #[test]
     fn ps_lines_parse_into_absolute_executables_only() {
-        let parsed = parse_ps_exe_line("  1234 /Users/x/repo/target/release/safehoused").unwrap();
+        let parsed = parse_ps_exe_line("  1234 /Users/x/repo/target/release/svcd").unwrap();
         assert_eq!(parsed.pid, 1234);
-        assert_eq!(parsed.exe, PathBuf::from("/Users/x/repo/target/release/safehoused"));
+        assert_eq!(parsed.exe, PathBuf::from("/Users/x/repo/target/release/svcd"));
         // Linux `comm` (a bare name) and kernel threads carry no path to match.
-        assert!(parse_ps_exe_line("  1234 safehoused").is_none());
+        assert!(parse_ps_exe_line("  1234 svcd").is_none());
         assert!(parse_ps_exe_line("").is_none());
         assert!(parse_ps_exe_line("not-a-pid /bin/sh").is_none());
     }
@@ -1238,11 +1238,9 @@ mod tests {
         // suffix must not defeat containment matching.
         let live = LiveExecutable {
             pid: 7,
-            exe: PathBuf::from("/home/u/GitHub/safehouse/target/release/safehoused (deleted)"),
+            exe: PathBuf::from("/home/u/GitHub/svc/target/release/svcd (deleted)"),
         };
-        assert!(live
-            .exe
-            .starts_with(Path::new("/home/u/GitHub/safehouse/target")));
+        assert!(live.exe.starts_with(Path::new("/home/u/GitHub/svc/target")));
         assert!(live.to_string().contains("pid 7"));
     }
 

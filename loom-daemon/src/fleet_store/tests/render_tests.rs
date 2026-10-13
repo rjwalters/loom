@@ -116,7 +116,7 @@ fn lost_top_level_keys_names_what_a_write_would_drop() {
     std::fs::create_dir_all(p.machine.parent().unwrap()).unwrap();
     std::fs::write(
         &p.machine,
-        r#"{"runtimes":{"judge":"claude"},"autonomous":{"roleRunner":{}},"safehouse":{},"forge":{"githubApp":{"appId":"1"}}}"#,
+        r#"{"runtimes":{"judge":"claude"},"autonomous":{"roleRunner":{}},"retiredBlock":{},"forge":{"githubApp":{"appId":"1"}}}"#,
     )
     .unwrap();
     let store = snapshot_of(&sample_files()); // renders autonomous + forge only
@@ -124,7 +124,7 @@ fn lost_top_level_keys_names_what_a_write_would_drop() {
     let machine = targets.iter().find(|t| t.tier == Tier::Machine).unwrap();
     let mut lost = lost_top_level_keys(machine);
     lost.sort();
-    assert_eq!(lost, vec!["runtimes", "safehouse"]);
+    assert_eq!(lost, vec!["retiredBlock", "runtimes"]);
 }
 
 #[test]

@@ -4,8 +4,8 @@
 //! This is the *reading* half of the ingestion path; [`super::transcript_ingest`]
 //! is the *writing* half. Per-record decoding is not re-implemented here — it
 //! is [`crate::script_helpers::transcript_usage::usage_from_record`], the same
-//! decoder the safehouse completion feed folds — so the two paths can never
-//! disagree about what a record cost.
+//! decoder `sweep.outcome`'s per-model totals fold — so the two paths can
+//! never disagree about what a record cost.
 //!
 //! # Why deduping on `message.id` is mandatory
 //!

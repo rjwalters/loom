@@ -2,7 +2,7 @@
 //! #10023).
 //!
 //! Every surface that names "this host" — telemetry Resources (`host.id`),
-//! the envelope `host_id`, peer-claim self-recognition, collision records,
+//! the envelope `host_id`, lease self-recognition, collision records,
 //! fleet-store keys, the fleet dashboard — resolves the same value through
 //! [`host_identity`] (re-exported as `sweep_registry::host_identity`).
 //!
@@ -30,7 +30,7 @@
 //! under two `host.id`s. Only when no id can be read or persisted at all (no
 //! home directory, a read-only `~/.loom`, any other I/O error) does this fall
 //! back to [`UNKNOWN_HOST`] (WARN logged once), which never participates in
-//! peer-claim self-recognition. `loom-daemon host-id` exits non-zero on it.
+//! lease self-recognition. `loom-daemon host-id` exits non-zero on it.
 //!
 //! # Lease identity is separate
 //!
@@ -77,14 +77,12 @@ pub const GENERATED_PREFIX: &str = "loom-host-";
 const MAX_ID_LEN: usize = 128;
 
 /// Sentinel returned when no identity can be resolved or persisted. Exported
-/// so callers that reason about self-claim recognition (e.g.
-/// [`crate::peer_claims::PeerClaimView`]) can special-case it without
-/// duplicating the literal string (Issue #5063).
+/// so callers that reason about self-claim recognition can special-case it
+/// without duplicating the literal string (Issue #5063).
 ///
 /// **This value must never participate in self-claim recognition.** Two
-/// hosts that both fail identity resolution would otherwise advertise the
-/// same string and each would treat the other's peer claim as its own,
-/// silently defeating the collision-detection machinery in #4028/#5017.
+/// hosts that both fail identity resolution would otherwise share the same
+/// string and each would treat the other's claim as its own.
 pub const UNKNOWN_HOST: &str = "unknown-host";
 
 /// Where a resolved id came from.

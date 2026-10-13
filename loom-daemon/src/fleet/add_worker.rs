@@ -41,58 +41,10 @@ use super::{
 /// Default upstream Loom repo cloned to the worker's machine-level layout.
 pub const DEFAULT_LOOM_REPO_URL: &str = "https://github.com/rjwalters/loom";
 
-/// Default checkout the `safehoused` binary is built from on the worker
-/// (issue #3998's spin-up half — `safehoused` itself is owned by the external
-/// `rjwalters/safehouse` repo, never vendored here).
-pub const DEFAULT_SAFEHOUSE_REPO_URL: &str = "https://github.com/rjwalters/safehouse";
-
-/// The AF_UNIX socket path `safehoused` is supervised to bind on a fleet
-/// worker, and the value wired into the worker's `loom-daemon` unit as
-/// `LOOM_SAFEHOUSE_SOCKET` (#3998). Deterministic (not resolved via the
-/// shared `mcp-config.sh` chain) so the two ends of the pipe always agree on
-/// a fresh worker with no prior `.loom/config.json` safehouse block.
-const SAFEHOUSE_SOCKET_PATH: &str = "$HOME/.loom/safehoused.sock";
-
-/// Default invocation for the safehouse#39 daemon-side room-membership
-/// `invite` op, run once against the freshly-written config so the host's
-/// Matrix account joins the fleet room without raw CS-API temp devices.
-/// Overridable via `--safehouse-invite-exec` (mirrors
-/// `safehoused-service.sh`'s `--exec`: this repo does not vendor safehoused's
-/// argv, since that is owned by the external `rjwalters/safehouse` repo).
-const DEFAULT_SAFEHOUSE_INVITE_EXEC: &str =
-    r#"safehoused invite --config "$HOME/.loom/safehoused/config.toml""#;
-
 /// The `uname -s` value of the only target platform this command's plan
 /// supports (#5395). Every step is built on `apt-get` and `systemd --user`,
 /// so a non-Linux target is refused up front rather than half-provisioned.
 const SUPPORTED_TARGET_UNAME: &str = "Linux";
-
-/// Default `delay_seconds` a worker's opt-in `[egress]` block buffers a
-/// decrypted event by before publishing it (issue #6383). A *mechanism*
-/// default (how long to buffer), which is why it still has one — unlike the
-/// two egress knobs that carry operator identity and therefore deliberately
-/// have no default at all (see the note immediately below, #7814).
-pub const DEFAULT_FEED_EGRESS_DELAY_SECONDS: u32 = 300;
-
-// No `DEFAULT_FEED_EGRESS_SINK_URL` constant and no
-// `default_feed_egress_deny_patterns()` helper exist here, deliberately
-// (#7814, continuing #6650 under the #4990 public/private seam: "public repo
-// = mechanism, operator identity = overlay").
-//
-// The fleet-feed ingest endpoint and the narration-scrub deny list are
-// operator identity, not Loom mechanism. When they carried this fleet's own
-// values as compiled-in defaults, a fork running `fleet add-worker
-// --feed-egress` without the override flags provisioned a worker that
-// published its decrypted narration to an unrelated operator's ingest
-// endpoint, and scrubbed against that operator's hostname, home directory,
-// and VPC prefix rather than its own.
-//
-// Both are now ordinary operator inputs, in the same tier as
-// `--safehouse-homeserver-url` / `--safehouse-room`: the sink URL is
-// *required* when `--feed-egress` is opted in (see [`preflight`]) and the
-// deny list is empty unless repeated `--feed-egress-deny-pattern` flags
-// supply it. An operator's real values live in that operator's own infra
-// repo's invocation, never here.
 
 /// The probe run on the target host — before any plan step — to learn its
 /// platform (#5395). Deliberately the cheapest possible remote command: it
@@ -131,69 +83,9 @@ pub struct AddWorkerConfig {
     /// Local path to the operator's `accounts.env` (the full token pool).
     /// Transferred to the worker only via ssh stdin.
     pub accounts_env_file: Option<PathBuf>,
-    /// Whether to wire safehouse fleet-comms (config-gated; see [`build_plan`]).
-    pub safehouse_enabled: bool,
     /// Idle-shutdown guard: power the host off after this many idle minutes.
     /// `None` disables the guard.
     pub idle_shutdown_minutes: Option<u32>,
-    /// Local path to the operator-minted, ephemeral + `tag:loom-worker`
-    /// Tailscale auth key. Read locally at preflight; transferred to the
-    /// worker only via ssh stdin. Required when `safehouse_enabled`.
-    pub safehouse_tailnet_auth_key_file: Option<PathBuf>,
-    /// Local path to a `KEY=VALUE` env-style file carrying the per-host
-    /// Matrix account credentials and store/recovery passphrases
-    /// (`SAFEHOUSE_MATRIX_USER_ID`, `SAFEHOUSE_MATRIX_PASSWORD`,
-    /// `SAFEHOUSE_STORE_PASSPHRASE`, `SAFEHOUSE_RECOVERY_PASSPHRASE`). Read
-    /// locally at preflight; transferred to the worker only via ssh stdin.
-    /// Required when `safehouse_enabled`.
-    pub safehouse_secrets_file: Option<PathBuf>,
-    /// The external `rjwalters/safehouse` checkout `safehoused` is built
-    /// from on the worker.
-    pub safehouse_repo_url: String,
-    /// The homeserver URL (resolves inside the tailnet) written into
-    /// safehoused's config. Not secret. Required when `safehouse_enabled`.
-    pub safehouse_homeserver_url: Option<String>,
-    /// The fleet room safehoused joins. Not secret. Required when
-    /// `safehouse_enabled`.
-    pub safehouse_room: Option<String>,
-    /// The persona allowlist this host's `safehoused` boots with — mirrors
-    /// the studio host's allowlist (#3999). Not secret. Must be non-empty
-    /// when `safehouse_enabled`; written into the boot-time TOML **before**
-    /// safehoused's first start (hard ordering constraint — no reload).
-    pub safehouse_personas: Vec<String>,
-    /// Override for the safehouse#39 room-`invite` op invocation. `None`
-    /// uses [`DEFAULT_SAFEHOUSE_INVITE_EXEC`]. loom does not vendor
-    /// safehoused's real CLI surface (owned by the external repo), so this
-    /// mirrors `safehoused-service.sh --exec`.
-    pub safehouse_invite_exec: Option<String>,
-    /// Whether to write a `[egress]` block into this worker's
-    /// `~/.loom/safehoused/config.toml` so it publishes decrypted
-    /// `completion-v1` fleet-feed events from birth (issue #6383). Opt-in —
-    /// a consumer of loom with no public feed must not get a dangling sink.
-    /// Requires `safehouse_enabled` (egress publishes from the same room
-    /// safehoused already decrypts) plus `feed_egress_ingest_key_file`.
-    pub feed_egress_enabled: bool,
-    /// Local path to a file holding the fleet-feed ingest key (a single
-    /// secret value, no `KEY=VALUE` framing required). Read locally at
-    /// preflight; transferred to the worker only via ssh stdin, appended to
-    /// the same sourced-then-deleted `$ENV_FILE` the safehouse Matrix
-    /// credentials already travel over (never a literal in the rendered
-    /// config template). Required when `feed_egress_enabled`.
-    pub feed_egress_ingest_key_file: Option<PathBuf>,
-    /// Fleet-feed ingest endpoint the worker's `[egress]` block publishes
-    /// completions to. Not secret, but operator identity rather than Loom
-    /// mechanism — so it carries no default and is **required** when
-    /// `feed_egress_enabled`, exactly like `safehouse_room` (#7814).
-    pub feed_egress_sink_url: Option<String>,
-    /// Narration-scrub patterns applied before publication — a parameter,
-    /// not a literal baked into the rendered template (issue #6383) — and
-    /// empty unless the operator supplies it: a real scrub list names that
-    /// operator's hostnames, home directory, and VPC prefix, which must not
-    /// ship as a compiled-in default (#7814).
-    pub feed_egress_deny_patterns: Vec<String>,
-    /// Seconds the worker's `[egress]` block buffers a decrypted event
-    /// before publishing it.
-    pub feed_egress_delay_seconds: u32,
 }
 
 /// Secret payloads read locally during preflight, then fed to the plan over
@@ -204,15 +96,6 @@ pub struct Secrets {
     pub pat: Option<String>,
     /// `accounts.env` contents, if `--accounts-env` was supplied.
     pub accounts_env: Option<String>,
-    /// Tailnet auth-key contents, if `--safehouse-tailnet-auth-key-file` was
-    /// supplied.
-    pub safehouse_tailnet_auth_key: Option<String>,
-    /// The safehouse secrets env-file contents, if
-    /// `--safehouse-secrets-file` was supplied.
-    pub safehouse_secrets: Option<String>,
-    /// The fleet-feed ingest key, if `--feed-egress-ingest-key-file` was
-    /// supplied (issue #6383).
-    pub feed_egress_ingest_key: Option<String>,
 }
 
 /// The production [`CommandRunner`]: runs one rendered shell command per call
@@ -299,45 +182,6 @@ fn repo_dir_name(repo: &str) -> &str {
     repo.rsplit('/').next().unwrap_or(repo)
 }
 
-/// Non-secret operator strings that get interpolated into rendered shell
-/// (homeserver URL, room) must pass this before they are ever formatted into
-/// a step's `apply`/`check` text — mirrors [`validate_repo`]'s shell-injection
-/// defense for the same reason: this text is echoed verbatim in `--dry-run`
-/// output and executed on the worker.
-fn validate_safe_token(label: &str, value: &str, extra: &str) -> Result<()> {
-    if value.trim().is_empty() {
-        bail!("--{label} must not be empty");
-    }
-    if !value
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || extra.contains(c))
-    {
-        bail!(
-            "--{label} '{value}' contains characters outside [A-Za-z0-9{extra}]; refusing to \
-             render it into shell"
-        );
-    }
-    Ok(())
-}
-
-/// A safehouse persona name: `[a-z0-9_]`, 1..=64 chars (mirrors
-/// `safehouse.rs`'s `valid_persona` charset — this module cannot depend on
-/// `safehouse` directly without pulling in its async/tokio surface, so the
-/// charset is duplicated deliberately, the same tradeoff `drain.rs`'s module
-/// doc makes for `DEFAULT_DRAIN_TIMEOUT_SECS`).
-fn validate_persona_name(persona: &str) -> Result<()> {
-    if persona.is_empty() || persona.len() > 64 {
-        bail!("--safehouse-persona '{persona}' must be 1..=64 characters");
-    }
-    if !persona
-        .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
-    {
-        bail!("--safehouse-persona '{persona}' must match [a-z0-9_]");
-    }
-    Ok(())
-}
-
 /// `%h`-relative workspace path for a repo (systemd expands `%h` to the user's
 /// home in a user unit; the shell steps use `"$HOME/..."` for the same path).
 fn workspace_rel(repo: &str) -> String {
@@ -377,130 +221,6 @@ pub fn preflight(config: &AddWorkerConfig) -> Result<Secrets> {
             bail!("--accounts-env {} is empty", path.display());
         }
         secrets.accounts_env = Some(contents);
-    }
-
-    // Safehouse (#3998): when requested, every input is required up front —
-    // a half-specified `--safehouse` would otherwise render a broken plan
-    // (a config step with no homeserver/room, or a join step with no key)
-    // rather than failing fast before any remote action (AC: "no half-joined
-    // host").
-    if config.safehouse_enabled {
-        let mut missing = Vec::new();
-        if config.safehouse_tailnet_auth_key_file.is_none() {
-            missing.push("--safehouse-tailnet-auth-key-file");
-        }
-        if config.safehouse_secrets_file.is_none() {
-            missing.push("--safehouse-secrets-file");
-        }
-        if config
-            .safehouse_homeserver_url
-            .as_deref()
-            .unwrap_or("")
-            .trim()
-            .is_empty()
-        {
-            missing.push("--safehouse-homeserver-url");
-        }
-        if config
-            .safehouse_room
-            .as_deref()
-            .unwrap_or("")
-            .trim()
-            .is_empty()
-        {
-            missing.push("--safehouse-room");
-        }
-        if config.safehouse_personas.is_empty() {
-            missing.push("--safehouse-persona (at least one)");
-        }
-        if !missing.is_empty() {
-            bail!(
-                "--safehouse requires the following input(s), none of which were supplied: {}",
-                missing.join(", ")
-            );
-        }
-        if let Some(homeserver) = &config.safehouse_homeserver_url {
-            validate_safe_token("safehouse-homeserver-url", homeserver, ".:/_-")?;
-        }
-        if let Some(room) = &config.safehouse_room {
-            validate_safe_token("safehouse-room", room, "!#:._-")?;
-        }
-        for persona in &config.safehouse_personas {
-            validate_persona_name(persona)?;
-        }
-    }
-
-    // Fleet-feed egress (#6383): opt-in, and only meaningful alongside
-    // safehouse (egress publishes decrypted events from the same room
-    // safehoused already joins/decrypts). Checked here — structural, before
-    // any file is read — so a dangling `--feed-egress` (no `--safehouse`) or
-    // a `--feed-egress` with no ingest key supplied fails fast rather than
-    // tripping over an unrelated safehouse secret file first.
-    if config.feed_egress_enabled && !config.safehouse_enabled {
-        bail!(
-            "--feed-egress requires --safehouse (egress publishes decrypted events from the \
-             same room safehoused decrypts)"
-        );
-    }
-    if config.feed_egress_enabled && config.feed_egress_ingest_key_file.is_none() {
-        bail!("--feed-egress requires --feed-egress-ingest-key-file");
-    }
-    // `feed_egress_sink_url` and `feed_egress_deny_patterns` are interpolated
-    // into the same unquoted heredoc as `homeserver`/`room` in
-    // `render_safehouse_config` — so, like those fields, they must be
-    // shell-safe before they are ever rendered. Without this, an
-    // operator-supplied deny-pattern or sink URL containing `$` or backticks
-    // could have the remote shell expand it against the secrets already
-    // exported into that shell (`SAFEHOUSE_MATRIX_PASSWORD`,
-    // `FLEET_FEED_INGEST_KEY`, ...) or execute arbitrary commands.
-    //
-    // The sink URL is also *required* here (#7814): the ingest endpoint is
-    // operator identity, not Loom mechanism, so there is no compiled-in
-    // default to fall back to and an omitted `--feed-egress-sink-url` fails
-    // now rather than rendering an `[egress]` block that publishes this
-    // worker's decrypted narration to somebody else's endpoint.
-    if config.feed_egress_enabled {
-        let sink = config.feed_egress_sink_url.as_deref().unwrap_or("").trim();
-        if sink.is_empty() {
-            bail!("--feed-egress requires --feed-egress-sink-url (operator-specific: no default)");
-        }
-        validate_safe_token("feed-egress-sink-url", sink, ".:/_-?=&")?;
-        for pattern in &config.feed_egress_deny_patterns {
-            validate_safe_token("feed-egress-deny-pattern", pattern, ".:/_-?=&")?;
-        }
-    }
-
-    if let Some(path) = &config.safehouse_tailnet_auth_key_file {
-        let contents = std::fs::read_to_string(path).with_context(|| {
-            format!("reading --safehouse-tailnet-auth-key-file {} (does it exist?)", path.display())
-        })?;
-        let trimmed = contents.trim();
-        if trimmed.is_empty() {
-            bail!("--safehouse-tailnet-auth-key-file {} is empty", path.display());
-        }
-        secrets.safehouse_tailnet_auth_key = Some(trimmed.to_string());
-    }
-    if let Some(path) = &config.safehouse_secrets_file {
-        let contents = std::fs::read_to_string(path).with_context(|| {
-            format!("reading --safehouse-secrets-file {} (does it exist?)", path.display())
-        })?;
-        if contents.trim().is_empty() {
-            bail!("--safehouse-secrets-file {} is empty", path.display());
-        }
-        secrets.safehouse_secrets = Some(contents);
-    }
-
-    // Fleet-feed egress ingest key (#6383): structural presence was already
-    // validated above; read + trim it here, alongside the other secret files.
-    if let Some(path) = &config.feed_egress_ingest_key_file {
-        let contents = std::fs::read_to_string(path).with_context(|| {
-            format!("reading --feed-egress-ingest-key-file {} (does it exist?)", path.display())
-        })?;
-        let trimmed = contents.trim();
-        if trimmed.is_empty() {
-            bail!("--feed-egress-ingest-key-file {} is empty", path.display());
-        }
-        secrets.feed_egress_ingest_key = Some(trimmed.to_string());
     }
 
     Ok(secrets)
@@ -609,7 +329,7 @@ pub fn build_plan_with_policy(
     let mut plan = Plan::new();
     let primary_rel = workspace_rel(&config.repos[0]);
 
-    // 1. Base deps (safehouse#38: libsqlite3-dev is required). Deliberately
+    // 1. Base deps (libsqlite3-dev for the from-source fallback). Deliberately
     //    does NOT install a Rust toolchain (#5067, Epic #4990 Phase 4): the
     //    happy path (a release artifact resolves for this host's platform)
     //    never needs one. `machine-layout` below installs rustup itself, as a
@@ -744,23 +464,7 @@ pub fn build_plan_with_policy(
         ),
     }
 
-    // 10. Optional safehouse wiring: tailnet join, safehoused build/config/
-    //     room-invite/supervision, then restart the worker's loom-daemon with
-    //     LOOM_SAFEHOUSE_* env so narration flows (#3998). Every sub-step
-    //     below follows the same check/apply contract as the rest of the
-    //     plan, so a re-run against an already-provisioned host (the pilot,
-    //     `loom-worker-1`) reports every one `AlreadyDone`.
-    if config.safehouse_enabled {
-        push_safehouse_steps(&mut plan, config, secrets, &primary_rel);
-    } else {
-        plan.push_skip(
-            "safehouse",
-            "wire safehouse fleet-comms",
-            "safehouse not requested (pass --safehouse plus its input flags to enable)",
-        );
-    }
-
-    // 11. Verify: daemon reachable from the workspace cwd, ranking fresh, repos registered.
+    // 10. Verify: daemon reachable    // 11. Verify: daemon reachable from the workspace cwd, ranking fresh, repos registered.
     plan.push_step(Step::new(
         "verify",
         "verify: loom-daemon status sane from the workspace cwd, token ranking fresh, workspace registered",
@@ -768,132 +472,9 @@ pub fn build_plan_with_policy(
         render_verify(&primary_rel, &config.repos),
     ));
 
-    egress.inspect(|_| egress::push_doctor_step(&mut plan, &primary_rel)); // 12 (#10050)
+    egress.inspect(|_| egress::push_doctor_step(&mut plan, &primary_rel)); // 11 (#10050)
 
     plan
-}
-
-/// Append the safehouse spin-up sub-sequence (#3998) to `plan`: tailnet join,
-/// `safehoused` build, boot-time TOML config, room-membership invite,
-/// supervision, then a restart of the worker's own `loom-daemon` with
-/// `LOOM_SAFEHOUSE_*` env. Split out of [`build_plan`] purely for
-/// readability — still pure, still called only when `config.safehouse_enabled`.
-///
-/// **Ordering is the load-bearing part of this function**: `safehouse-config`
-/// (which writes the boot-time persona TOML) MUST precede
-/// `safehouse-supervise` (which first starts `safehoused`) — the allowlist is
-/// boot-time-only, no reload (AC: "written before the unit first starts").
-fn push_safehouse_steps(
-    plan: &mut Plan,
-    config: &AddWorkerConfig,
-    secrets: &Secrets,
-    primary_rel: &str,
-) {
-    // 10a. Install the tailscale package (apt repo, arch/codename-agnostic).
-    plan.push_step(Step::new(
-        "safehouse-tailscale-install",
-        "install the tailscale package (apt repo)",
-        Some("command -v tailscale >/dev/null 2>&1".to_string()),
-        render_safehouse_tailscale_install(),
-    ));
-
-    // 10b. Join the tailnet with an operator-minted ephemeral + tag:loom-worker
-    //     auth key (fed over stdin, never on a command line — an expired/
-    //     revoked key fails this step's apply fast, with tailscale's own
-    //     diagnostic surfaced via the checklist's stderr tail).
-    plan.push_step(
-        Step::new(
-            "safehouse-tailscale-join",
-            "tailscale up with an ephemeral + tag:loom-worker auth key (via stdin)",
-            Some("tailscale ip -4 >/dev/null 2>&1".to_string()),
-            render_safehouse_tailscale_join(),
-        )
-        .with_stdin(StepStdin {
-            content: secrets
-                .safehouse_tailnet_auth_key
-                .clone()
-                .unwrap_or_default(),
-            secret: true,
-        }),
-    );
-
-    // 10c. Build safehoused from the external rjwalters/safehouse checkout.
-    plan.push_step(Step::new(
-        "safehouse-build",
-        "cargo build --release -p safehoused from a safehouse checkout",
-        Some(r#"test -x "$HOME/.local/bin/safehoused""#.to_string()),
-        render_safehouse_build(&config.safehouse_repo_url),
-    ));
-
-    // 10d. Write the boot-time config.toml (0600): homeserver URL, per-host
-    //     Matrix account, fresh store/recovery passphrases (via stdin), and
-    //     the persona allowlist mirroring the studio host. MUST land before
-    //     10f (first start) — see this function's doc comment.
-    let homeserver = config.safehouse_homeserver_url.as_deref().unwrap_or("");
-    let room = config.safehouse_room.as_deref().unwrap_or("");
-    let egress_params = config.feed_egress_enabled.then(|| EgressParams {
-        room,
-        deny_patterns: &config.feed_egress_deny_patterns,
-        delay_seconds: config.feed_egress_delay_seconds,
-        // Non-empty whenever egress is opted in — `preflight` requires the
-        // operator to supply it (#7814); there is no default to fall back to.
-        sink_url: config.feed_egress_sink_url.as_deref().unwrap_or(""),
-    });
-    let config_step_description = if config.feed_egress_enabled {
-        "write ~/.loom/safehoused/config.toml (0600): homeserver, account, passphrases, \
-         personas, egress"
-    } else {
-        "write ~/.loom/safehoused/config.toml (0600): homeserver, account, passphrases, personas"
-    };
-    plan.push_step(
-        Step::new(
-            "safehouse-config",
-            config_step_description,
-            Some(r#"test -f "$HOME/.loom/safehoused/config.toml""#.to_string()),
-            render_safehouse_config(
-                homeserver,
-                room,
-                &config.safehouse_personas,
-                egress_params.as_ref(),
-            ),
-        )
-        .with_stdin(StepStdin {
-            content: safehouse_config_stdin(secrets, config.feed_egress_enabled),
-            secret: true,
-        }),
-    );
-
-    // 10e. Room membership via safehouse#39's daemon-side `invite` op — not
-    //     raw CS-API temp devices.
-    plan.push_step(Step::new(
-        "safehouse-room-invite",
-        "join the fleet room via safehouse#39's invite op",
-        Some(r#"test -f "$HOME/.loom/safehoused/.invited""#.to_string()),
-        render_safehouse_room_invite(config.safehouse_invite_exec.as_deref()),
-    ));
-
-    // 10f. Supervise safehoused under systemd --user + linger (mirrors the
-    //     daemon-unit step's own supervision pattern, step 8). This is the
-    //     first point safehoused ever starts — 10d must precede this.
-    plan.push_step(Step::new(
-        "safehouse-supervise",
-        "install + enable the safehoused systemd --user unit (linger)",
-        Some("systemctl --user is-enabled safehoused.service >/dev/null 2>&1".to_string()),
-        render_safehouse_supervise(primary_rel),
-    ));
-
-    // 10g. Restart the worker's own loom-daemon with LOOM_SAFEHOUSE_* env so
-    //     sweep narration flows (env-only wiring, #3997 — no worker-side
-    //     .loom/config.json edit).
-    plan.push_step(Step::new(
-        "safehouse-daemon-restart",
-        "wire LOOM_SAFEHOUSE_ENABLED/SOCKET/ROOM into the loom-daemon unit and restart it",
-        Some(
-            r#"grep -q '^Environment=LOOM_SAFEHOUSE_ENABLED=true$' "$HOME/.config/systemd/user/loom-daemon.service" 2>/dev/null"#
-                .to_string(),
-        ),
-        render_safehouse_daemon_restart(room),
-    ));
 }
 
 /// Build the [`WorkerRecord`] a fully-successful bootstrap upserts into the
@@ -1484,227 +1065,13 @@ LIST="$(loom-daemon workspace list --json 2>/dev/null || echo '{{}}')"
     )
 }
 
-// ---------------------------------------------------------------------------
-// Safehouse spin-up templates (#3998)
-// ---------------------------------------------------------------------------
-
-fn render_safehouse_tailscale_install() -> String {
-    // Codename-derived apt repo (works across Ubuntu releases, not just the
-    // pilot's 24.04/"noble") — the same approach `base-deps` uses for the gh
-    // apt repo.
-    r#"set -e
-if ! command -v tailscale >/dev/null 2>&1; then
-  CODENAME="$(lsb_release -cs 2>/dev/null || echo noble)"
-  curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/${CODENAME}.noarmor.gpg" | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
-  curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/${CODENAME}.tailscale-keyring.list" | sudo tee /etc/apt/sources.list.d/tailscale.list >/dev/null
-  sudo apt-get update -qq
-  sudo apt-get install -y tailscale
-fi
-sudo systemctl enable --now tailscaled 2>/dev/null || true
-"#
-    .to_string()
-}
-
-fn render_safehouse_tailscale_join() -> String {
-    // The auth key arrives on stdin; written to a 0600 tempfile and fed to
-    // `tailscale up` via the `file:` prefix so the raw key never appears on
-    // the command line (where `ps` on the worker would expose it) or in a
-    // rendered plan/log line. The key is operator-minted ephemeral +
-    // tag:loom-worker (epic #4340's boundary: loom never calls the Tailscale
-    // API itself), so no --advertise-tags flag is needed here — the tag is
-    // baked into the key server-side.
-    r#"set -e
-umask 077
-KEY_FILE="$(mktemp)"
-cat > "$KEY_FILE"
-chmod 600 "$KEY_FILE"
-sudo tailscale up --auth-key="file:$KEY_FILE" --hostname="$(hostname -s)" --ssh=false
-rm -f "$KEY_FILE"
-"#
-    .to_string()
-}
-
-fn render_safehouse_build(safehouse_repo_url: &str) -> String {
-    format!(
-        r#"set -e
-. "$HOME/.cargo/env" 2>/dev/null || true
-SH_SRC="$HOME/.local/share/safehouse"
-if [ -d "$SH_SRC/.git" ]; then
-  git -C "$SH_SRC" pull --ff-only
-else
-  mkdir -p "$(dirname "$SH_SRC")"
-  git clone {safehouse_repo_url} "$SH_SRC"
-fi
-cd "$SH_SRC"
-cargo build --release -p safehoused
-mkdir -p "$HOME/.local/bin"
-install -m 0755 "$SH_SRC/target/release/safehoused" "$HOME/.local/bin/safehoused"
-"#
-    )
-}
-
-/// Operator-controlled fleet-feed egress parameters rendered into the
-/// worker's boot-time `config.toml` (issue #6383). `room` and `sink_url` are
-/// pre-validated/operator-supplied non-secret values; the ingest key itself
-/// is never held here — [`render_safehouse_config`] references it only via
-/// the `$FLEET_FEED_INGEST_KEY` shell variable sourced from the same
-/// `$ENV_FILE` the Matrix credentials already travel over.
-struct EgressParams<'a> {
-    room: &'a str,
-    deny_patterns: &'a [String],
-    delay_seconds: u32,
-    sink_url: &'a str,
-}
-
-/// Combine the safehouse Matrix-account env-file contents with the
-/// fleet-feed ingest key (when egress is opt-in) into the single stdin
-/// payload the `safehouse-config` step sources through `$ENV_FILE` (issue
-/// #6383) — the ingest key travels the same sourced-then-deleted mechanism
-/// as the rest of this step's secrets, never a literal in the rendered
-/// template.
-fn safehouse_config_stdin(secrets: &Secrets, feed_egress_enabled: bool) -> String {
-    let mut content = secrets.safehouse_secrets.clone().unwrap_or_default();
-    if feed_egress_enabled {
-        if !content.is_empty() && !content.ends_with('\n') {
-            content.push('\n');
-        }
-        content.push_str(&format!(
-            "FLEET_FEED_INGEST_KEY={}\n",
-            secrets.feed_egress_ingest_key.clone().unwrap_or_default()
-        ));
-    }
-    content
-}
-
-/// `homeserver`/`room` are pre-validated shell-safe (`validate_safe_token`) by
-/// [`preflight`] before this is ever called. `personas` are pre-validated by
-/// [`validate_persona_name`] — safe to interpolate as bare TOML string
-/// literals. The Matrix account + store/recovery passphrases arrive on stdin
-/// as a `KEY=VALUE` env file and are sourced into shell variables that are
-/// referenced (never literal) in the rendered heredoc, so the secret VALUES
-/// never appear in this rendered text (only the variable NAMES do).
-///
-/// `egress` is `Some` only when fleet-feed egress is opt-in (issue #6383):
-/// the appended `[egress]` block's `sink_url` references
-/// `$FLEET_FEED_INGEST_KEY` (sourced from the same `$ENV_FILE` as the Matrix
-/// credentials above) rather than embedding the key as a literal.
-fn render_safehouse_config(
-    homeserver: &str,
-    room: &str,
-    personas: &[String],
-    egress: Option<&EgressParams<'_>>,
-) -> String {
-    let persona_list = personas
-        .iter()
-        .map(|p| format!("\"{p}\""))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let egress_block = match egress {
-        Some(e) => {
-            let deny_list = e
-                .deny_patterns
-                .iter()
-                .map(|p| format!("\"{p}\""))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!(
-                "\n[egress]\nrooms = [\"{}\"]\ndeny_patterns = [{deny_list}]\ndelay_seconds = {}\nsink_url = \"{}?key=$FLEET_FEED_INGEST_KEY\"\n",
-                e.room, e.delay_seconds, e.sink_url
-            )
-        }
-        None => String::new(),
-    };
-    format!(
-        r#"set -e
-umask 077
-mkdir -p "$HOME/.loom/safehoused"
-ENV_FILE="$(mktemp)"
-cat > "$ENV_FILE"
-chmod 600 "$ENV_FILE"
-set -a
-. "$ENV_FILE"
-set +a
-cat > "$HOME/.loom/safehoused/config.toml" <<TOML
-homeserver_url = "{homeserver}"
-room = "{room}"
-personas = [{persona_list}]
-
-[account]
-user_id = "$SAFEHOUSE_MATRIX_USER_ID"
-password = "$SAFEHOUSE_MATRIX_PASSWORD"
-
-[encryption]
-store_passphrase = "$SAFEHOUSE_STORE_PASSPHRASE"
-recovery_passphrase = "$SAFEHOUSE_RECOVERY_PASSPHRASE"
-{egress_block}TOML
-chmod 600 "$HOME/.loom/safehoused/config.toml"
-rm -f "$ENV_FILE"
-"#
-    )
-}
-
-fn render_safehouse_room_invite(invite_exec: Option<&str>) -> String {
-    let exec = invite_exec.unwrap_or(DEFAULT_SAFEHOUSE_INVITE_EXEC);
-    let export_line = path_bootstrap::canonical_path_export_line();
-    format!(
-        r#"set -e
-{export_line}{exec}
-touch "$HOME/.loom/safehoused/.invited"
-"#
-    )
-}
-
-fn render_safehouse_supervise(primary_rel: &str) -> String {
-    // Reuses the already-shipped `safehoused-service.sh` (cloned onto the
-    // worker by the workspace-clone step's `loom-daemon init`) rather than a
-    // one-off `systemd-run` invocation, so the worker gets the same
-    // Restart=always + linger-aware supervision contract the interactive-host
-    // runbook documents (`.loom/docs/safehouse.md`). `--socket` is pinned to
-    // a deterministic path (not the config-driven resolver) so a fresh worker
-    // with no prior `.loom/config.json` safehouse block still agrees with the
-    // env this plan wires into loom-daemon in the next step.
-    let export_line = path_bootstrap::canonical_path_export_line();
-    format!(
-        r#"set -e
-{export_line}"$HOME/{primary_rel}/.loom/scripts/cli/safehoused-service.sh" install \
-  --bin "$HOME/.local/bin/safehoused" \
-  --socket "{SAFEHOUSE_SOCKET_PATH}" \
-  --config "$HOME/.loom/safehoused/config.toml"
-loginctl enable-linger "$USER" 2>/dev/null || true
-"#
-    )
-}
-
-fn render_safehouse_daemon_restart(room: &str) -> String {
-    // Patches the loom-daemon unit's env in place (idempotent: strips any
-    // prior LOOM_SAFEHOUSE_* lines before re-inserting) rather than a
-    // worker-side .loom/config.json edit — #3997's decision that loom's
-    // safehouse config is wired entirely via env on a fleet worker.
-    format!(
-        r#"set -e
-UNIT="$HOME/.config/systemd/user/loom-daemon.service"
-test -f "$UNIT" || {{ echo "loom-daemon systemd unit not found (the daemon-unit step must run first)" >&2; exit 1; }}
-sed -i '/^Environment=LOOM_SAFEHOUSE_/d' "$UNIT"
-sed -i "/^Environment=PATH=/a Environment=LOOM_SAFEHOUSE_ENABLED=true\nEnvironment=LOOM_SAFEHOUSE_SOCKET={SAFEHOUSE_SOCKET_PATH}\nEnvironment=LOOM_SAFEHOUSE_ROOM={room}" "$UNIT"
-systemctl --user daemon-reload
-systemctl --user restart loom-daemon.service
-"#
-    )
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests;
 
-// The fleet-feed egress group lives in its own sibling file rather than in
-// `tests.rs`, which is over the file-size ratchet's threshold (#7814; see
+// #11044: the update-script invoker marker, in its own sibling file rather
+// than `tests.rs`, which is over the file-size ratchet's threshold (see
 // `.loom/docs/file-size-policy.md`).
-#[cfg(test)]
-#[allow(clippy::unwrap_used)]
-mod feed_egress_tests;
-
-// #11044: the update-script invoker marker, in its own sibling for the same
-// reason.
 #[cfg(test)]
 mod invoker_tests;
 

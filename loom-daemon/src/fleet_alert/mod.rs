@@ -15,8 +15,8 @@
 //! - [`capacity`] (pure, #10214) adds the host-level capacity ask: disk or
 //!   RAM headroom holding the cap below `maxConcurrent` (the starred-backlog
 //!   ask was retired by #11510).
-//! - [`task`] delivers each transition to its sinks: the event bus (relayed
-//!   to Matrix by Safehouse) and, independently, loom-ui's Alerts page
+//! - [`task`] delivers each transition to its sinks: the event bus and,
+//!   independently, loom-ui's Alerts page
 //!   ([`loom_ui`], #11295). Loom sends no inbox mail (#11087).
 //!
 //! The evaluator is off by default (`autonomous.fleetAlert.enabled`); the

@@ -139,21 +139,6 @@ enum Commands {
     /// sections, and the daemon builds only what they need.
     Status(cli::status::sections::StatusArgs),
 
-    /// Show the peer-claim view: which issues this host currently sees a
-    /// peer host claiming, by which host and with what remaining TTL, plus
-    /// the four transport counters (advertised / received / expired /
-    /// dispatch-skipped) that make the re-advertisement heartbeat and the
-    /// #5789 duplicate-dispatch backoff observable instead of a `debug!`-only
-    /// log line (Issue #5921). A thin standalone view of the same data
-    /// `loom-daemon status` renders in its "Peer claims" section — useful for
-    /// a fleet script comparing two hosts' views directly (`ssh host-a
-    /// loom-daemon peer-claims --json` vs `ssh host-b …`).
-    PeerClaims {
-        /// Emit machine-readable JSON instead of the human-readable table.
-        #[arg(long)]
-        json: bool,
-    },
-
     /// Show the work finder's ready queue in its real dispatch order
     /// (verified red-main fixes first, then priority level, oldest first —
     /// #11103, #11547) with what the last
@@ -1244,11 +1229,11 @@ enum WorkspaceAction {
 }
 
 /// Sub-actions for `loom-daemon fleet` (epic #4340).
-// `AddWorker` legitimately carries many operator-supplied `--safehouse-*`
-// flags (#3998) next to `Drain`/`Status`'s few fields — boxing individual
-// clap-derive `Option`/`Vec` fields would break the derive macro's
-// Option-arity detection for negligible benefit on a parsed-once-at-startup
-// CLI enum, so this size skew is accepted rather than worked around.
+// `AddWorker`/`BootstrapSpice` carry many operator-supplied flags next to
+// `Drain`/`Status`'s few fields — boxing individual clap-derive
+// `Option`/`Vec` fields would break the derive macro's Option-arity detection
+// for negligible benefit on a parsed-once-at-startup CLI enum, so this size
+// skew is accepted rather than worked around.
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum FleetAction {
@@ -1293,103 +1278,6 @@ enum FleetAction {
         /// Upstream Loom repo URL cloned to the worker's machine-level layout.
         #[arg(long, value_name = "URL", default_value = loom_daemon::fleet::add_worker::DEFAULT_LOOM_REPO_URL)]
         loom_repo: String,
-
-        /// Wire safehouse fleet-comms on the worker (issue #3998): tailnet
-        /// join, `safehoused` build/config/room-invite/supervision, then a
-        /// restart of the worker's own loom-daemon with `LOOM_SAFEHOUSE_*`
-        /// env. Requires every `--safehouse-*` input below; preflight fails
-        /// fast (before touching the host) if any is missing.
-        #[arg(long)]
-        safehouse: bool,
-
-        /// Local path to the operator-minted, ephemeral + `tag:loom-worker`
-        /// Tailscale auth key. Read locally at preflight; transferred to the
-        /// worker only via ssh stdin. Required with `--safehouse`.
-        #[arg(long, value_name = "PATH")]
-        safehouse_tailnet_auth_key_file: Option<String>,
-
-        /// Local path to a `KEY=VALUE` env-style file carrying the per-host
-        /// Matrix account credentials and store/recovery passphrases
-        /// (`SAFEHOUSE_MATRIX_USER_ID`, `SAFEHOUSE_MATRIX_PASSWORD`,
-        /// `SAFEHOUSE_STORE_PASSPHRASE`, `SAFEHOUSE_RECOVERY_PASSPHRASE`).
-        /// Read locally at preflight; transferred to the worker only via ssh
-        /// stdin. Required with `--safehouse`.
-        #[arg(long, value_name = "PATH")]
-        safehouse_secrets_file: Option<String>,
-
-        /// The external `rjwalters/safehouse` checkout `safehoused` is built
-        /// from on the worker.
-        #[arg(long, value_name = "URL", default_value = loom_daemon::fleet::add_worker::DEFAULT_SAFEHOUSE_REPO_URL)]
-        safehouse_repo_url: String,
-
-        /// The homeserver URL (resolves inside the tailnet) written into
-        /// safehoused's config. Not secret. Required with `--safehouse`.
-        #[arg(long, value_name = "URL")]
-        safehouse_homeserver_url: Option<String>,
-
-        /// The fleet room safehoused joins. Not secret. Required with
-        /// `--safehouse`.
-        #[arg(long, value_name = "ROOM")]
-        safehouse_room: Option<String>,
-
-        /// A persona this host's safehoused boots with (repeat for several).
-        /// Mirrors the studio host's allowlist (#3999). Not secret. At least
-        /// one is required with `--safehouse` — the allowlist is written
-        /// into the boot-time TOML before safehoused's first start
-        /// (boot-time-only, no reload).
-        #[arg(long = "safehouse-persona", value_name = "NAME")]
-        safehouse_personas: Vec<String>,
-
-        /// Override the safehouse#39 room-`invite` op invocation (loom does
-        /// not vendor safehoused's argv — owned by the external
-        /// `rjwalters/safehouse` repo). Default: `safehoused invite --config
-        /// <path>`.
-        #[arg(long, value_name = "ARGV")]
-        safehouse_invite_exec: Option<String>,
-
-        /// Write a `[egress]` block into this worker's
-        /// `~/.loom/safehoused/config.toml` so it publishes decrypted
-        /// `completion-v1` fleet-feed events from birth (issue #6383).
-        /// Opt-in — a consumer of loom with no public feed does not get a
-        /// dangling sink. Requires `--safehouse` (egress publishes the same
-        /// room safehoused already decrypts) plus
-        /// `--feed-egress-ingest-key-file` and `--feed-egress-sink-url`.
-        #[arg(long)]
-        feed_egress: bool,
-
-        /// Local path to a file holding the fleet-feed ingest key (a single
-        /// secret value, no `KEY=VALUE` framing required). Read locally at
-        /// preflight; transferred to the worker only via ssh stdin, appended
-        /// to the same sourced-then-deleted `$ENV_FILE` the safehouse Matrix
-        /// credentials already travel over — never a literal in the
-        /// generated config file's template source. Required with
-        /// `--feed-egress`.
-        #[arg(long, value_name = "PATH")]
-        feed_egress_ingest_key_file: Option<String>,
-
-        /// Fleet-feed ingest endpoint the worker's `[egress]` block publishes
-        /// completions to. Not secret, but operator-specific: there is no
-        /// default, so a fork never publishes to another operator's endpoint
-        /// (#7814). Required with `--feed-egress`.
-        #[arg(long, value_name = "URL")]
-        feed_egress_sink_url: Option<String>,
-
-        /// A narration-scrub pattern applied before publication (repeat for
-        /// several). Empty unless supplied — a real scrub list names the
-        /// operator's own hostnames, home directory, and VPC prefix, so it
-        /// lives in that operator's infra-repo invocation rather than as a
-        /// compiled-in default (#7814).
-        #[arg(long = "feed-egress-deny-pattern", value_name = "PATTERN")]
-        feed_egress_deny_patterns: Vec<String>,
-
-        /// Seconds the worker's `[egress]` block buffers a decrypted event
-        /// before publishing it.
-        #[arg(
-            long,
-            value_name = "SECS",
-            default_value_t = loom_daemon::fleet::add_worker::DEFAULT_FEED_EGRESS_DELAY_SECONDS
-        )]
-        feed_egress_delay_seconds: u32,
 
         /// Install an idle-shutdown cron guard that powers the host off after
         /// this many idle minutes (skipping while claude / loom-daemon work).
@@ -1514,15 +1402,13 @@ enum FleetAction {
         timeout_secs: u64,
     },
 
-    /// Retire a worker without losing in-flight work, forge claims, or (when
-    /// wired) E2E room keys (issue #4343). SSH orchestration over the existing
+    /// Retire a worker without losing in-flight work or forge claims (issue
+    /// #4343). SSH orchestration over the existing
     /// `restart --drain` primitive (#4090), plus the teardown-specific deltas:
     /// a drain-then-*exit* remote invocation (never restart into new dispatch
     /// on a box about to be powered off), an immediate targeted `loom:building`
-    /// claim reset via `gh` (not SSH — the forge is global), a safehoused
-    /// key-backup flush check (a supervised `systemctl --user stop
-    /// safehoused` IS the flush, #3998 — see `loom_daemon::fleet::drain`'s
-    /// module doc), workspace deregistration, and
+    /// claim reset via `gh` (not SSH — the forge is global), workspace
+    /// deregistration, and
     /// finally removing the worker from the fleet registry. Idempotent +
     /// resumable: an interrupted drain re-runs from its last completed phase.
     /// Never calls a cloud CLI itself — prints the exact `repo:remote --down`
@@ -2501,10 +2387,10 @@ async fn handle_cli_command(command: Commands) -> Result<()> {
             // sync handler.
             unreachable!("Health is handled in main() before handle_cli_command")
         }
-        Commands::PeerClaims { .. } | Commands::Queue { .. } => {
+        Commands::Queue { .. } => {
             // Routed directly in `main()` (it needs the async runtime for the
             // socket round-trip), never dispatched through this sync handler.
-            unreachable!("PeerClaims/Queue are handled in main() before handle_cli_command")
+            unreachable!("Queue is handled in main() before handle_cli_command")
         }
         // Async commands are dispatched by main before reaching this sync handler.
         Commands::JevMergeRisk { .. }

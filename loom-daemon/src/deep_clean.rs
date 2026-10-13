@@ -55,7 +55,7 @@
 //!    its own branch. Since #6127 that is only the outer half: the shared
 //!    engine ([`clean::sweep_primary_checkout_artifacts`]) independently keeps
 //!    any artifact directory backing **any** live process, which is what
-//!    protects a co-located service (`safehoused` and friends) that
+//!    protects a co-located service daemon that
 //!    `current_exe()` could never see.
 //! 4. **It only ever removes [`clean::PRIMARY_CHECKOUT_ARTIFACTS`]** —
 //!    literally the same `target/` + `node_modules/` list `clean --deep`

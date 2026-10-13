@@ -1,5 +1,5 @@
 //! A single-key condition that must hold for a while before it is an alert
-//! (#11295): safehoused unreachable, the rate-limit breaker open, llm-monitor's
+//! (#11295): the rate-limit breaker open, llm-monitor's
 //! `ranking.json` stale.
 //!
 //! [`Tracker`] debounces healthy/unhealthy samples: it opens once the

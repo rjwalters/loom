@@ -1,5 +1,5 @@
 //! Machine-wide **issue-filing lock** — serializes `gh issue create` bursts
-//! across every workspace on a host, and (softly) across hosts (Issue #6714).
+//! across every workspace on a host (Issue #6714).
 //!
 //! # Why this exists
 //!
@@ -33,28 +33,14 @@
 //! (`.loom/scripts/create-issue.sh`, the single-sourced entry point every
 //! issue-creating role already goes through).
 //!
-//! # Two tiers, with an honest boundary
+//! # Scope: one host
 //!
-//! | Tier | Scope | Strength |
-//! |---|---|---|
-//! | Host | every workspace + every agent process on one machine | **hard** mutual exclusion (`mkdir`-atomic) |
-//! | Fleet | other hosts' daemons | **soft**, TTL-bounded backoff |
-//!
-//! The host tier is what actually closes the 2026-08-08 hazard: two processes
-//! can only swap each other's *body text* if they share memory or a filesystem,
-//! which by definition means one machine. The fleet tier covers the weaker,
-//! genuinely cross-host hazard #3707 also named — a burst binding the wrong
-//! freshly-minted issue **number** into a `Part of #N` cross-reference.
-//!
-//! The fleet tier is deliberately soft, and this is not a shortcut: it rides
-//! [`crate::peer_claims`]'s advertise/observe/expire transport, whose own module
-//! documentation states the contract — *"A room broadcast is eventually
-//! consistent, so this is a fast backoff, not a lock."* A real cross-host mutex
-//! would need an atomic authority ([`crate::peer_claims`]'s still-unbuilt Phase
-//! 2 CAS), not a broadcast. Rather than pretend otherwise, the fleet tier
-//! **mirrors** an observed peer hold into this same on-disk store
-//! ([`record_peer_hold`]), so host-local filers back off from it through exactly
-//! the one code path they already consult.
+//! The lock gives **hard** mutual exclusion (`mkdir`-atomic) across every
+//! workspace and every agent process on one machine, which is what closes the
+//! 2026-08-08 hazard: two processes can only swap each other's *body text* if
+//! they share memory or a filesystem, which by definition means one machine.
+//! A soft cross-host tier once rode the Matrix peer-claim channel; it was
+//! removed with that channel (#11112).
 //!
 //! # On-disk protocol (shared with the Bash half)
 //!
@@ -66,8 +52,6 @@
 //! <store>/                     # ~/.loom/locks/issue-filing by default
 //!   holder/                    # the lock itself — `mkdir`-atomic
 //!     owner.json               # {"host","pid","label","acquired_at"}
-//!   peers/
-//!     <host>                   # a peer host's advertised hold; mtime = LOCAL receipt
 //! ```
 //!
 //! # Four safety properties (all load-bearing)
@@ -133,17 +117,6 @@ pub const FILING_LOCK_STALE_SECS_ENV: &str = "LOOM_FILING_LOCK_STALE_SECS";
 /// long-running stage, so a wedged holder should clear in minutes.
 pub const DEFAULT_STALE_SECS: u64 = 300;
 
-/// TTL (seconds) for a **peer** host's advertised hold, measured against LOCAL
-/// receipt time. Mirrors [`crate::peer_claims`]'s own rule: a peer's wall clock
-/// is not comparable across hosts, so it is never used for TTL math.
-pub const FILING_LOCK_PEER_TTL_SECS_ENV: &str = "LOOM_FILING_LOCK_PEER_TTL_SECS";
-
-/// Default peer-hold TTL: 60s. Short on purpose — a peer's `FilingUnlock` ad
-/// may be lost by the eventually-consistent transport, and a lost unlock must
-/// cost at most one minute of extra queuing on every other host, never a
-/// fleet-wide wedge.
-pub const DEFAULT_PEER_TTL_SECS: u64 = 60;
-
 /// Re-entrancy sentinel exported into a holder's child environment.
 pub const FILING_LOCK_HELD_ENV: &str = "LOOM_FILING_LOCK_HELD";
 
@@ -191,12 +164,6 @@ pub fn resolve_stale() -> Duration {
     resolve_secs(FILING_LOCK_STALE_SECS_ENV, DEFAULT_STALE_SECS)
 }
 
-/// Resolve the peer-hold TTL from [`FILING_LOCK_PEER_TTL_SECS_ENV`].
-#[must_use]
-pub fn resolve_peer_ttl() -> Duration {
-    resolve_secs(FILING_LOCK_PEER_TTL_SECS_ENV, DEFAULT_PEER_TTL_SECS)
-}
-
 /// The machine-wide store directory: [`FILING_LOCK_DIR_ENV`] when set, else
 /// `~/.loom/locks/issue-filing`. `None` when neither resolves (no home
 /// directory) — the caller degrades open.
@@ -220,34 +187,6 @@ pub fn store_dir() -> Option<PathBuf> {
 #[must_use]
 pub fn holder_path(store: &Path) -> PathBuf {
     store.join("holder")
-}
-
-/// The peer-hold directory inside `store`.
-#[must_use]
-pub fn peers_dir(store: &Path) -> PathBuf {
-    store.join("peers")
-}
-
-/// Reduce a host identity to a safe single path component. Anything outside
-/// `[A-Za-z0-9._-]` folds to `_`, so a hostile or merely exotic advertised host
-/// string can never escape [`peers_dir`] (no `/`, no `..`).
-#[must_use]
-pub fn sanitize_host(host: &str) -> String {
-    let mapped: String = host
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    // `.`/`..` would still be path-traversal-ish components after mapping.
-    match mapped.as_str() {
-        "" | "." | ".." => "_".to_string(),
-        _ => mapped,
-    }
 }
 
 // ============================================================================
@@ -322,75 +261,6 @@ fn now_epoch_secs() -> u64 {
 fn age_of(path: &Path) -> Option<Duration> {
     let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok()?;
     SystemTime::now().duration_since(modified).ok()
-}
-
-// ============================================================================
-// Peer holds (the fleet tier's on-disk mirror)
-// ============================================================================
-
-/// Record that peer `host` advertised holding the filing lock (Issue #6714).
-///
-/// Called from [`crate::safehouse::PeerClaimSink`] on an observed
-/// [`crate::peer_claims::ClaimKind::FilingLock`] ad. The marker file's **mtime
-/// is the local receipt time**, which is what [`live_peer_holds`] ages against
-/// — the advertiser's wall clock is never trusted (clock skew), exactly as
-/// [`crate::peer_claims`] documents for its own TTL.
-///
-/// Best-effort: a failure to write the marker degrades the fleet tier to
-/// host-only serialization, which is strictly better than failing the caller.
-pub fn record_peer_hold(store: &Path, host: &str) {
-    let dir = peers_dir(store);
-    if std::fs::create_dir_all(&dir).is_err() {
-        return;
-    }
-    let path = dir.join(sanitize_host(host));
-    // Rewriting refreshes the mtime, which is exactly the re-advertisement
-    // heartbeat semantics `PeerClaimView::observe_at` gives repeat ads.
-    let _ = std::fs::write(&path, host.as_bytes());
-}
-
-/// Clear peer `host`'s advertised hold (an observed
-/// [`crate::peer_claims::ClaimKind::FilingUnlock`], or a TTL lapse).
-pub fn clear_peer_hold(store: &Path, host: &str) {
-    let _ = std::fs::remove_file(peers_dir(store).join(sanitize_host(host)));
-}
-
-/// Every peer host whose advertised hold is still within `ttl` of local
-/// receipt, pruning the ones that are not. Sorted, so log lines and test
-/// assertions are deterministic.
-#[must_use]
-pub fn live_peer_holds(store: &Path, ttl: Duration) -> Vec<String> {
-    let dir = peers_dir(store);
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Vec::new();
-    };
-    let mut live = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        match age_of(&path) {
-            // Expired: prune it here so a crashed peer's marker cannot outlive
-            // its TTL and wedge every other host's filing.
-            Some(age) if age >= ttl => {
-                let _ = std::fs::remove_file(&path);
-            }
-            // Unreadable mtime: cannot age it, so cannot trust it as a live
-            // hold either. Dropping it is the fail-OPEN direction, which is
-            // the correct one for a soft advisory tier.
-            None => {
-                let _ = std::fs::remove_file(&path);
-            }
-            Some(_) => {
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    live.push(name.to_string());
-                }
-            }
-        }
-    }
-    live.sort();
-    live
 }
 
 // ============================================================================
@@ -535,7 +405,6 @@ pub fn acquire(label: &str) -> AcquireOutcome {
         resolve_wait(),
         DEFAULT_POLL,
         resolve_stale(),
-        resolve_peer_ttl(),
     )
 }
 
@@ -551,7 +420,6 @@ pub fn acquire_in(
     wait: Duration,
     poll: Duration,
     stale: Duration,
-    peer_ttl: Duration,
 ) -> AcquireOutcome {
     if std::fs::create_dir_all(store).is_err() {
         // Property 3: a store nobody can write is a store nobody is serialized
@@ -568,56 +436,48 @@ pub fn acquire_in(
     let mut logged_wait = false;
 
     loop {
-        // Fleet tier first: a peer host's advertised hold blocks us just like a
-        // local holder would, and pruning here is what keeps a crashed peer's
-        // marker from outliving its TTL.
-        let peers = live_peer_holds(store, peer_ttl);
-        if peers.is_empty() {
-            match std::fs::create_dir(&holder) {
-                Ok(()) => {
-                    let owner = FilingLockOwner {
-                        host: self_host.to_owned(),
-                        pid,
-                        label: label.to_owned(),
-                        acquired_at: now_epoch_secs(),
-                    };
-                    // Best-effort: the owner record only enables the dead-PID
-                    // reap leg. Losing it costs precision, not correctness —
-                    // the mtime leg still bounds the hold.
-                    let _ = std::fs::write(holder.join("owner.json"), owner.to_json());
-                    log::info!(
-                        "filing_lock: acquired for '{label}' after {:.2}s ({})",
-                        started.elapsed().as_secs_f64(),
-                        holder.display()
-                    );
-                    return AcquireOutcome::Acquired(FilingLockGuard {
-                        holder,
-                        label: label.to_owned(),
-                        acquired_at: Instant::now(),
-                    });
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if holder_is_abandoned(store, self_host, stale) {
-                        reap_holder(store);
-                        // Retry immediately: a racing peer may have reaped and
-                        // re-taken it first, which is an ordinary busy round.
-                        continue;
-                    }
-                    last_blocker = match read_owner(store) {
-                        Some(o) => {
-                            format!("host {} pid {} is filing ('{}')", o.host, o.pid, o.label)
-                        }
-                        None => "another filer holds the issue-filing lock".to_string(),
-                    };
-                }
-                Err(e) => {
-                    return AcquireOutcome::DegradedOpen {
-                        reason: format!("lock path {} is unusable: {e}", holder.display()),
-                    };
-                }
+        match std::fs::create_dir(&holder) {
+            Ok(()) => {
+                let owner = FilingLockOwner {
+                    host: self_host.to_owned(),
+                    pid,
+                    label: label.to_owned(),
+                    acquired_at: now_epoch_secs(),
+                };
+                // Best-effort: the owner record only enables the dead-PID
+                // reap leg. Losing it costs precision, not correctness —
+                // the mtime leg still bounds the hold.
+                let _ = std::fs::write(holder.join("owner.json"), owner.to_json());
+                log::info!(
+                    "filing_lock: acquired for '{label}' after {:.2}s ({})",
+                    started.elapsed().as_secs_f64(),
+                    holder.display()
+                );
+                return AcquireOutcome::Acquired(FilingLockGuard {
+                    holder,
+                    label: label.to_owned(),
+                    acquired_at: Instant::now(),
+                });
             }
-        } else {
-            last_blocker = format!("peer host(s) {} are filing", peers.join(", "));
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if holder_is_abandoned(store, self_host, stale) {
+                    reap_holder(store);
+                    // Retry immediately: a racing peer may have reaped and
+                    // re-taken it first, which is an ordinary busy round.
+                    continue;
+                }
+                last_blocker = match read_owner(store) {
+                    Some(o) => {
+                        format!("host {} pid {} is filing ('{}')", o.host, o.pid, o.label)
+                    }
+                    None => "another filer holds the issue-filing lock".to_string(),
+                };
+            }
+            Err(e) => {
+                return AcquireOutcome::DegradedOpen {
+                    reason: format!("lock path {} is unusable: {e}", holder.display()),
+                };
+            }
         }
 
         if !logged_wait {
@@ -664,7 +524,6 @@ mod tests {
             Duration::from_millis(120),
             Duration::from_millis(10),
             Duration::from_secs(300),
-            Duration::from_secs(60),
         )
     }
 
@@ -762,7 +621,6 @@ mod tests {
             Duration::from_millis(120),
             Duration::from_millis(10),
             Duration::from_secs(0),
-            Duration::from_secs(60),
         );
         assert!(
             matches!(outcome, AcquireOutcome::Acquired(_)),
@@ -810,64 +668,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&store);
     }
 
-    // ===== fleet tier: peer holds =====
-
-    #[test]
-    fn a_live_peer_hold_blocks_local_filing_and_expires() {
-        let store = tmp_store("peer-hold");
-        record_peer_hold(&store, "host-remote");
-        assert_eq!(live_peer_holds(&store, Duration::from_secs(60)), vec!["host-remote"]);
-
-        // Live peer hold ⇒ a local filer defers rather than filing alongside it.
-        match quick(&store, "host-a", std::process::id(), "architect") {
-            AcquireOutcome::Deferred { reason } => {
-                assert!(reason.contains("host-remote"), "reason: {reason}");
-            }
-            other => panic!("expected Deferred, got {}", other.as_str()),
-        }
-
-        // Property 1, fleet tier: a peer that crashes without sending
-        // FilingUnlock must not wedge us — a zero TTL makes any marker expired.
-        assert!(live_peer_holds(&store, Duration::from_secs(0)).is_empty());
-        let outcome = acquire_in(
-            &store,
-            "host-a",
-            std::process::id(),
-            "architect",
-            Duration::from_millis(120),
-            Duration::from_millis(10),
-            Duration::from_secs(300),
-            Duration::from_secs(0),
-        );
-        assert!(
-            matches!(outcome, AcquireOutcome::Acquired(_)),
-            "an expired peer hold must not wedge filing: {}",
-            outcome.as_str()
-        );
-        let _ = std::fs::remove_dir_all(&store);
-    }
-
-    #[test]
-    fn clearing_a_peer_hold_unblocks_immediately() {
-        let store = tmp_store("peer-clear");
-        record_peer_hold(&store, "host-remote");
-        clear_peer_hold(&store, "host-remote");
-        assert!(live_peer_holds(&store, Duration::from_secs(60)).is_empty());
-        assert!(matches!(
-            quick(&store, "host-a", std::process::id(), "architect"),
-            AcquireOutcome::Acquired(_)
-        ));
-        let _ = std::fs::remove_dir_all(&store);
-    }
-
-    #[test]
-    fn peer_host_names_cannot_escape_the_peers_directory() {
-        assert_eq!(sanitize_host("../../etc/passwd"), ".._.._etc_passwd");
-        assert_eq!(sanitize_host(".."), "_");
-        assert_eq!(sanitize_host(""), "_");
-        assert_eq!(sanitize_host("host-e1d4c843"), "host-e1d4c843");
-    }
-
     // ===== the #6714 regression: two filers in DIFFERENT repos =====
 
     /// The 2026-08-08 shape, mechanized: two issue-creating agents working
@@ -912,7 +712,6 @@ mod tests {
                         Duration::from_secs(10),
                         Duration::from_millis(1),
                         Duration::from_secs(300),
-                        Duration::from_secs(60),
                     );
                     let guard = match outcome {
                         AcquireOutcome::Acquired(g) => g,

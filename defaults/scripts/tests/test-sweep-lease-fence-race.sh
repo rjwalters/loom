@@ -20,8 +20,8 @@
 # reclamation-side lease-freshness guard, `claim_reconciliation.rs`'s
 # `lease_is_fresh` / `fetch_freshest_lease_updated_at`) -- that is already
 # covered end-to-end by
-# `loom-daemon/src/sweep_registry/dispatch.rs`'s
-# `combined_dispatch_and_reclaim_race_produces_no_duplicate_build_with_safehouse_down`
+# `loom-daemon/src/sweep_registry/dispatch/tests.rs`'s
+# `combined_dispatch_and_reclaim_race_produces_no_duplicate_build_on_the_lease_alone`
 # test (Issue #6288). Where #6288 composes Phase 2's dispatch-time
 # claim-then-verify-order tie-break (#6287) with Phase 2's reclamation
 # lease-freshness guard (#6286), this suite composes Phase 3's fencing

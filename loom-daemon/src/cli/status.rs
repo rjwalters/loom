@@ -1178,7 +1178,7 @@ fn check_local_tailnet_state_with_path_override(
         Ok(out) => out,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
         // Some other launch failure (permissions, etc.) — degrade rather
-        // than erroring the report, same as `SafehousedProbe::Unknown`.
+        // than erroring the report.
         Err(_) => return Some(LocalTailnetState::Unknown),
     };
 

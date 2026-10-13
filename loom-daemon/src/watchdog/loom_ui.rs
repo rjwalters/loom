@@ -1,6 +1,6 @@
 //! The watchdog's loom-ui output (#11295): `daemon.down` once recovery is
-//! exhausted, and `watchdog.peer-coord-degraded`, as incidents on loom-ui's
-//! Alerts page beside the forge issue each already files.
+//! exhausted, as an incident on loom-ui's Alerts page beside the forge issue
+//! it already files.
 //!
 //! These are the only alerts that still work when the daemon itself is dead,
 //! so they come from this separate one-shot process, with the daemon's ingest
@@ -22,8 +22,6 @@ use crate::loom_ui_alerts::{self, Alert, Delivery, Severity, State, Target};
 pub const POST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Rule for an outage recovery could not end.
 pub const RULE_DAEMON_DOWN: &str = "daemon.down";
-/// Rule for degraded peer-claim coordination.
-pub const RULE_PEER_COORD: &str = "watchdog.peer-coord-degraded";
 
 /// The "loom-ui has this open" record kept beside `sentinel`.
 #[must_use]
@@ -111,18 +109,6 @@ pub fn daemon_up(escalation_sentinel: &Path) {
         State::Resolved,
     );
     send(&record_for(escalation_sentinel), &alert);
-}
-
-/// Peer-claim coordination degraded (`open`) or green again (`resolved`).
-pub fn peer_coord(peer_coord_sentinel: &Path, degraded: bool, hostname: &str, summary: &str) {
-    let (state, title) = if degraded {
-        (State::Open, format!("Peer-claim coordination is DEGRADED on {hostname}"))
-    } else {
-        (State::Resolved, format!("Peer-claim coordination recovered on {hostname}"))
-    };
-    let alert = Alert::new(RULE_PEER_COORD, "peer-claims", title, Severity::Critical, state)
-        .with_detail(summary);
-    send(&record_for(peer_coord_sentinel), &alert);
 }
 
 #[cfg(test)]

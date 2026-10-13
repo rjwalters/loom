@@ -32,11 +32,7 @@
 //! `defaults/scripts/tests/test-loom-daemon-watchdog.sh` (188 assertions, plus
 //! 4 retired records) is a retained black-box suite: it invokes the stub **by
 //! path** with environment overrides and asserts on stdout, the log file and
-//! exit codes. The peer-coordination dedup window's own equivalence suite,
-//! `test-loom-daemon-watchdog-dedup.sh`, was retired in #8587 once this
-//! module's `peer_coord` submodule (with its own `#[cfg(test)]` coverage)
-//! became the only implementation — its pre-port shell counterpart had
-//! already been orphaned by this port.
+//! exit codes.
 //!
 //! They run against this code with two harness changes and no altered
 //! expectations: `LOOM_DAEMON_SELF_BIN` pins the binary that implements the
@@ -65,7 +61,6 @@ pub mod load_avg;
 pub mod locate;
 pub mod loom_ui;
 pub mod marker;
-pub mod peer_coord;
 pub mod probe;
 pub mod probe_state;
 pub mod recovery;
@@ -160,13 +155,11 @@ fn marker_present(
     // #5118: the out-of-band signals can only ever be a hint. Before declaring
     // an outage, ask the socket — a served socket is authoritative and an
     // absent pid file is no evidence at all.
-    let mut socket_proved_healthy = false;
     if !snap.alive() {
         let corroboration = socket_corroboration(paths, reporter, &mut snap);
         if let Some(code) = corroboration.exit {
             return code;
         }
-        socket_proved_healthy = corroboration.healthy;
     }
 
     if !snap.alive() {
@@ -182,18 +175,6 @@ fn marker_present(
     let probe_outcome = ipc_probe(paths, reporter, state, &snap);
     if let Some(code) = probe_outcome.exit {
         return code;
-    }
-
-    // The 50-series: only on a tick whose probe came back healthy. Asking a
-    // daemon that is not answering produces no information, and a "could not
-    // determine" reported alongside a confirmed hang is noise on a real signal.
-    // `probe_outcome.healthy`, NOT `!reporter.diverged()`. A probe that was
-    // disabled or skipped also fails to diverge, and this check must never
-    // become a new hang surface for a tick that deliberately spent no
-    // round-trip — `LOOM_WATCHDOG_IPC_PROBE=0` against a never-returning
-    // binary took 15s here before this distinction existed.
-    if probe_outcome.healthy || socket_proved_healthy {
-        peer_coordination(paths, reporter, state, &snap);
     }
 
     let heartbeat_file = snap.heartbeat_file.clone().unwrap_or_else(|| {
@@ -832,19 +813,9 @@ fn now_secs() -> u64 {
 }
 
 /// What the bounded in-band probe concluded.
-///
-/// `healthy` is NOT `exit.is_none()`. A probe that was disabled, skipped, or
-/// never ran (no pid to ask about) also produces no exit code, and treating
-/// that as healthy is what let the 50-series peer-coordination check spend a
-/// SECOND round-trip on a tick that had deliberately spent none — turning
-/// `LOOM_WATCHDOG_IPC_PROBE=0` into a 15-second hang against a mock that never
-/// returns. The shell gates that check on `probe_verdict == healthy`; this is
-/// that value, carried explicitly rather than inferred.
 struct ProbeOutcome {
     /// An exit code the tick must return immediately.
     exit: Option<i32>,
-    /// The round-trip actually succeeded this tick.
-    healthy: bool,
 }
 
 /// Sections 12-22: the bounded in-band IPC probe.
@@ -870,10 +841,7 @@ fn ipc_probe(
     snap: &liveness::Snapshot,
 ) -> ProbeOutcome {
     let Some(pid) = snap.pid else {
-        return ProbeOutcome {
-            exit: None,
-            healthy: false,
-        };
+        return ProbeOutcome { exit: None };
     };
 
     let repo_root = marker::get_nonempty(&paths.marker, "repo_root").map(PathBuf::from);
@@ -932,10 +900,7 @@ fn ipc_probe(
             } else {
                 reporter.report(report::Level::Ok, &format!("IPC probe OK: {detail}."));
             }
-            ProbeOutcome {
-                exit: None,
-                healthy: true,
-            }
+            ProbeOutcome { exit: None }
         }
 
         probe::IpcVerdict::Unresponsive => {
@@ -974,10 +939,7 @@ fn ipc_probe(
                 if let Some(line) = hang.restart_line {
                     reporter.report(report::Level::Divergence, &line);
                 }
-                return ProbeOutcome {
-                    exit: Some(1),
-                    healthy: false,
-                };
+                return ProbeOutcome { exit: Some(1) };
             }
 
             // #7855: a not-yet-CONFIRMED tick interrupts the dual-signal streak.
@@ -994,10 +956,7 @@ fn ipc_probe(
                 ),
             );
             reporter.mark_diverged();
-            ProbeOutcome {
-                exit: None,
-                healthy: false,
-            }
+            ProbeOutcome { exit: None }
         }
 
         // Nothing was learned. Explicitly not counted as a hang, and the window
@@ -1008,10 +967,7 @@ fn ipc_probe(
             // one, so it interrupts the #7855 dual-signal streak.
             hang_recover::reset_streak(&state.hang_streak);
             reporter.report(report::Level::Ok, &format!("IPC probe skipped: {detail}."));
-            ProbeOutcome {
-                exit: None,
-                healthy: false,
-            }
+            ProbeOutcome { exit: None }
         }
     }
 }
@@ -1067,199 +1023,6 @@ fn hang_recovery(
     )
 }
 
-/// The 50-series: peer-claim coordination health (#6222/#7258/#7664).
-///
-/// A degraded receive path is silent by construction — each host still believes
-/// it is coordinating while actually working alone, so two can claim the same
-/// issue and neither notices. That is why this is asked explicitly rather than
-/// waited for.
-///
-/// Reports only; it never exits. Coordination degradation is a fleet-level
-/// concern, and failing this tick would conflate it with the daemon-liveness
-/// question the exit code answers.
-fn peer_coordination(
-    paths: &config::Paths,
-    reporter: &report::Reporter,
-    state: &consts::StateFiles,
-    snap: &liveness::Snapshot,
-) {
-    if !peer_coord::enabled() {
-        return;
-    }
-    let repo_root = marker::get_nonempty(&paths.marker, "repo_root").map(PathBuf::from);
-    let Some(bin) = locate::daemon_bin(repo_root.as_deref()) else {
-        return;
-    };
-
-    let mut cmd = std::process::Command::new(&bin);
-    cmd.args(["peer-claims", "--json"])
-        .env("LOOM_SOCKET_PATH", &paths.socket_path);
-    let timeout =
-        std::time::Duration::from_secs(env::num("LOOM_WATCHDOG_PEER_COORD_TIMEOUT_SECS", 15));
-    let Some(out) = crate::sweep_registry::output_with_timeout(cmd, timeout)
-        .ok()
-        .flatten()
-    else {
-        return;
-    };
-    if !out.status.success() {
-        return;
-    }
-    // `None` is "could not determine", which is deliberately NOT reported.
-    // Saying nothing is correct here; saying "healthy" would be a claim, and
-    // saying "unknown" every tick on a host without peers is noise.
-    let Some(health) = peer_coord::parse(&String::from_utf8_lossy(&out.stdout)) else {
-        return;
-    };
-
-    let degraded = health.verdict == peer_coord::Verdict::Degraded;
-    let host = escalate::hostname();
-    loom_ui::peer_coord(&state.peer_coord_sentinel, degraded, &host, &health.summary); // #11295
-    match health.verdict {
-        peer_coord::Verdict::Degraded => {
-            let note = if state.peer_coord_sentinel.exists() {
-                reporter.report(
-                    report::Level::Ok,
-                    &format!(
-                        "peer-coordination degradation already escalated out-of-band (sentinel \
-                         {}).",
-                        state.peer_coord_sentinel.display()
-                    ),
-                );
-                return;
-            } else if let Some(remaining) = peer_coord::cooldown_remaining(
-                &state.peer_coord_cooldown,
-                now_secs(),
-                peer_coord::cooldown_secs(),
-            ) {
-                // #7258: a path that recovers and re-degrades within minutes is
-                // ONE episode to an operator, not two. Filing per flap buries
-                // the signal under duplicates of itself.
-                format!(
-                    "Suppressing a duplicate tracking issue: a previous episode on this host \
-                     recovered within the last {}s cooldown window (#7258) — {remaining}s \
-                     remaining before a repeat degradation would file fresh again. {} is the \
-                     signal for this flap.",
-                    peer_coord::cooldown_secs(),
-                    paths.log.display()
-                )
-            } else if env::var("LOOM_WATCHDOG_ESCALATE").is_some_and(|v| env::is_false(&v)) {
-                format!(
-                    "Out-of-band escalation is disabled — THIS LOGFILE IS THE ONLY SIGNAL for \
-                     this degradation, {}.",
-                    paths.log.display()
-                )
-            } else if let Some(note) = peer_coord::read_cooldown(&state.peer_coord_cooldown)
-                .and_then(|c| {
-                    // #7664: the cooldown has ELAPSED, but this is still the
-                    // same episode if we are inside the (longer) dedup window
-                    // and have a usable prior issue reference. Comment on that
-                    // issue and reopen it rather than filing a duplicate.
-                    //
-                    // This path existed as `repeat_action`/`flap_comment` with
-                    // unit tests and NO callers — the fifth instance in this
-                    // port of code that a comment claimed was wired. The
-                    // CI-wired dedup suite is what proved it: 10 of its 27
-                    // assertions exercise exactly this, and I had not run it.
-                    match peer_coord::repeat_action(
-                        Some(&c),
-                        now_secs(),
-                        peer_coord::dedup_window_secs(),
-                    ) {
-                        peer_coord::Repeat::CommentOn { flap, .. } => peer_coord::dedup_comment(
-                            &c,
-                            &state.peer_coord_sentinel,
-                            &state.peer_coord_cooldown,
-                            &escalate::hostname(),
-                            &health.summary,
-                            flap,
-                            reporter,
-                        ),
-                        peer_coord::Repeat::FileFresh => None,
-                    }
-                })
-            {
-                note
-            } else {
-                // #6222: file a forge tracking issue so the degradation is not
-                // confined to a logfile nobody tails.
-                let cli_dir = cli_dir();
-                let fallback =
-                    env::var("LOOM_WATCHDOG_CREATE_ISSUE_FALLBACK_DIR").map(PathBuf::from);
-                let script = escalate::resolve_issue_script(
-                    repo_root.as_deref(),
-                    &cli_dir,
-                    fallback.as_deref(),
-                );
-                let hostname = escalate::hostname();
-                match script.as_deref().and_then(|s| {
-                    peer_coord::file(s, &hostname, &health, &paths.log, &state.peer_coord_sentinel)
-                }) {
-                    Some(issue_ref) => {
-                        peer_coord::write_sentinel(
-                            &state.peer_coord_sentinel,
-                            &issue_ref,
-                            reporter,
-                        );
-                        "ESCALATED out-of-band: filed a forge tracking issue so this degradation \
-                         is not confined to a logfile nobody tails (#6222)."
-                            .to_string()
-                    }
-                    None => format!(
-                        "Out-of-band escalation was NOT possible (no create-issue.sh reachable, \
-                         or the forge call failed) — THIS LOGFILE IS THE ONLY SIGNAL for this \
-                         degradation, {}.",
-                        paths.log.display()
-                    ),
-                }
-            };
-            reporter.report(
-                report::Level::Divergence,
-                &format!("peer-claim coordination is DEGRADED: {}. {note}", health.summary),
-            );
-        }
-        peer_coord::Verdict::Green => {
-            // Only worth a line when there was something to recover FROM.
-            if state.peer_coord_sentinel.exists() {
-                let hostname = escalate::hostname();
-                if peer_coord::recover(
-                    &state.peer_coord_sentinel,
-                    &state.peer_coord_cooldown,
-                    &hostname,
-                    &health.summary,
-                ) {
-                    // Level and wording are contract: the shell reports OK
-                    // here (not WARN) and the retained assertion greps for
-                    // "cleared the escalation sentinel". A paraphrase reads
-                    // the same to a human and silently fails the assertion.
-                    reporter.report(
-                        report::Level::Ok,
-                        &format!(
-                            "peer-claim coordination has RECOVERED ({}) — closed the tracking \
-                             issue and cleared the escalation sentinel (#6222).",
-                            health.summary
-                        ),
-                    );
-                } else {
-                    // Best-effort by design: a missing `gh`, no forge auth, or
-                    // a failed close leaves the sentinel so a LATER healthy
-                    // tick retries, rather than losing track of an open issue.
-                    reporter.report(
-                        report::Level::Warn,
-                        &format!(
-                            "peer-claim coordination has RECOVERED ({}) but closing/commenting \
-                             the tracking issue failed — the sentinel is left in place so a \
-                             later healthy tick retries (#6222).",
-                            health.summary
-                        ),
-                    );
-                }
-            }
-        }
-    }
-    let _ = snap;
-}
-
 /// #5118: ask the socket before concluding a daemon is gone.
 ///
 /// The incident this closes: the pid file alone was treated as sufficient to
@@ -1272,11 +1035,6 @@ fn peer_coordination(
 /// Returns `exit: Some(code)` when this tick's answer is settled here; `None`
 /// when the caller should continue to the outage path. May flip `snap` to
 /// alive.
-///
-/// `healthy` reports that THIS round-trip answered — the shell's
-/// SOCKET_ONLY_LIVENESS path, which sets `probe_verdict=healthy` directly.
-/// The later in-band probe cannot re-derive it, because on this path there is
-/// no pid to ask about and it returns before probing at all.
 fn socket_corroboration(
     paths: &config::Paths,
     reporter: &report::Reporter,
@@ -1321,10 +1079,7 @@ fn socket_corroboration(
                     report::Level::Ok,
                     &format!("daemon healthy via the in-band socket round-trip: {}.", snap.detail),
                 );
-                ProbeOutcome {
-                    exit: None,
-                    healthy: true,
-                }
+                ProbeOutcome { exit: None }
             } else {
                 // A supervisor says the job is gone, yet something serves the
                 // socket. Dispatch is running, so this is NOT an outage — but
@@ -1344,10 +1099,7 @@ fn socket_corroboration(
                         snap.detail
                     ),
                 );
-                ProbeOutcome {
-                    exit: Some(1),
-                    healthy: false,
-                }
+                ProbeOutcome { exit: Some(1) }
             }
         }
 
@@ -1355,10 +1107,7 @@ fn socket_corroboration(
             // Two independent signals agree. That is a real outage.
             snap.detail =
                 format!("{}; and the in-band probe confirms it: {socket_detail}", snap.detail);
-            ProbeOutcome {
-                exit: None,
-                healthy: false,
-            }
+            ProbeOutcome { exit: None }
         }
 
         probe::SocketVerdict::Indeterminate => {
@@ -1384,19 +1133,13 @@ fn socket_corroboration(
                         snap.detail
                     ),
                 );
-                return ProbeOutcome {
-                    exit: Some(3),
-                    healthy: false,
-                };
+                return ProbeOutcome { exit: Some(3) };
             }
             snap.detail = format!(
                 "{}; the in-band probe could not corroborate: {socket_detail}",
                 snap.detail
             );
-            ProbeOutcome {
-                exit: None,
-                healthy: false,
-            }
+            ProbeOutcome { exit: None }
         }
     }
 }

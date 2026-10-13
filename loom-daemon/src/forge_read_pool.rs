@@ -159,8 +159,7 @@ fn member(app_id: &str, key_path: &str) -> Option<PoolMember> {
 /// assignment must be identical on every host and across Rust releases so two
 /// daemons polling the same repo agree without coordinating; `DefaultHasher`
 /// guarantees neither (it is explicitly documented as unstable across
-/// releases, and is randomly seeded per process for `HashMap`). The same
-/// reasoning already governs `tokens_pool::select::pool_account_fingerprint`.
+/// releases, and is randomly seeded per process for `HashMap`).
 #[must_use]
 pub fn assignment_index(owner_repo: &str, len: usize) -> Option<usize> {
     if len == 0 {
@@ -636,7 +635,7 @@ mod tests {
             "rjwalters/anvil",
             "2AMLogic/gf180-pll",
             "2AMLogic/klayout-tools",
-            "rjwalters/safehouse",
+            "rjwalters/vibesql",
         ];
         let seen: std::collections::HashSet<_> = repos
             .iter()

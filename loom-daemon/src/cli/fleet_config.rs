@@ -338,7 +338,7 @@ fn cmd_render(
     // operator names it. The store is the tier's record of truth, so the
     // blocks belong IN the store first (`fleet-config propose adopt`
     // pushes them there) — a silent write that loses `runtimes`/`forge`/
-    // `autonomous`/`safehouse` for half a day is the failure this refuses.
+    // `autonomous` for half a day is the failure this refuses.
     for t in &targets {
         let lost = render::lost_top_level_keys(t);
         if lost.is_empty() {

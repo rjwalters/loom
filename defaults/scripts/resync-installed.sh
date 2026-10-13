@@ -236,8 +236,7 @@
 #                              fully out of scope either way.
 #   loom-daemon binary      - owned by the #4055 self-update mechanism
 #   .mcp.json               - vestigial post-#4230 (loom is user-scoped); setup-mcp.sh
-#     is demoted to a bundle-rebuild/legacy-migration tool with a safehouse-only
-#     residual emission role
+#     is demoted to a bundle-rebuild/legacy-migration tool
 #   install-metadata.json's install_date + installed_files - owned by the installer
 #
 # WORKTREE RESTRICTION (#4563): the installed .loom/ is ALWAYS resolved against
@@ -2896,7 +2895,7 @@ _gitignore_restore_managed_block() {
 # from whenever it was built, and `update-gitignore` exits 0 either way: it
 # silently DROPS a pattern added since (05cf67e8 / 94fa30f2 reintroduced #5267's
 # gitlink hazard that way, #5985) or re-ADDS one removed since (febfc4335
-# re-added `.loom/concierge/`, #11323). Restore the block from source (else
+# re-added a removed pattern, #11323). Restore the block from source (else
 # revert the file) so neither lands; no source list = cannot verify, no-op.
 _gitignore_warn_if_stale() {
     local bin="$1" post_init="$SOURCE_ROOT/loom-daemon/src/init/post_init.rs" pattern block current wanted

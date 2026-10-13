@@ -166,28 +166,18 @@ async fn a_fresh_memo_never_makes_a_crash_resume_eligible() {
     std::env::remove_var("LOOM_REPO");
 }
 
-/// Resume safety the red team asked to pin: a peer's `DispatchBackoffArmed`
-/// for the issue reaches only the work-finder pre-filter, never the
-/// reaper-driven resume's own 2.8 check.
+/// Resume safety the red team asked to pin: a live backoff window for the
+/// issue reaches only the work-finder pre-filter, never the reaper-driven
+/// resume's own 2.8 check.
 #[test]
 #[serial]
-fn a_peer_backoff_does_not_refuse_a_resume() {
+fn a_backoff_does_not_refuse_a_resume() {
     std::env::set_var("LOOM_REPO", "acme/widget");
     let dir = tempdir().unwrap();
     let (mut reg, log) = open_pr_guard_registry(dir.path(), "9305", 0, false);
-    let repo = peer_claims::repo_slug(&reg.config().workspace_root);
-    let view = Arc::new(Mutex::new(PeerClaimView::new("self".into(), Duration::from_secs(120))));
-    view.lock().unwrap().observe_dispatch_backoff_at(
-        &ClaimAd::dispatch_backoff_armed(9205, repo, "peer".into(), 1, "ts".into(), 600),
-        Instant::now(),
-    );
-    reg.set_peer_claims(view);
-    assert!(
-        reg.dispatch_backoff_issues(Utc::now()).contains(&9205),
-        "the peer window is live"
-    );
-    // This host's own window too: 2.8 refuses a fresh dispatch, never a resume.
+    // 2.8 refuses a fresh dispatch, never a resume.
     reg.record_open_pr_guard_backoff(9205);
+    assert!(reg.dispatch_backoff_issues(Utc::now()).contains(&9205), "the window is live");
     let began =
         reg.begin_issue_dispatch(&SweepKind::Issue(9205), None, None, None, None, Some(9305));
     if let Err(e) = &began {

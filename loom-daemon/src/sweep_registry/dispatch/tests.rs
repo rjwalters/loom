@@ -136,65 +136,6 @@ fn runtime_rejection_precedes_every_dispatch_side_effect() {
 /// exec bit, because parallel-test load on macOS occasionally races the
 /// chmod with the child's posix_spawn exec call and the script silently
 /// fails to launch (no shebang resolution, no exec-bit yet).
-/// #4431: the reaper's peer-claim heartbeat must re-advertise every live
-/// (`Running`/`Pending`) Issue sweep's claim — and ONLY those (a
-/// terminal-state entry is a dead sweep whose claim must be allowed to
-/// expire), and be a publisher-less no-op (safehouse disabled).
-#[test]
-fn readvertise_republishes_live_issue_claims_only() {
-    let dir = tempdir().unwrap();
-    let (mut registry, _log) = fixture_registry(dir.path());
-
-    // No publisher attached (safehouse.enabled false): a silent no-op.
-    assert_eq!(registry.readvertise_peer_claims(), 0);
-
-    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-    registry.set_peer_claim_publisher(tx);
-
-    let mk_info = |sweep_id: &str, issue: u32, state: SweepState, log_path: PathBuf| SweepInfo {
-        pgid: None,
-        sweep_id: sweep_id.to_string(),
-        kind: SweepKind::Issue(issue),
-        pid: 0,
-        token_name: "unknown".into(),
-        runtime: "unknown".into(),
-        runtime_source: None,
-        log_path,
-        idempotency_key: None,
-        started_at: Utc::now(),
-        state,
-        latest_phase: None,
-        pr_number: None,
-        model: None,
-        effort: None,
-        depends_on: None,
-        repo: None,
-        overflow: false,
-    };
-    let live_log = registry.compute_log_path(4431);
-    let dead_log = registry.compute_log_path(999);
-    registry.entries.insert(
-        "sweep-live".to_string(),
-        mk_info("sweep-live", 4431, SweepState::Running, live_log),
-    );
-    let exited = SweepState::Exited {
-        code: None,
-        at: Utc::now(),
-    };
-    registry
-        .entries
-        .insert("sweep-dead".to_string(), mk_info("sweep-dead", 999, exited, dead_log));
-
-    assert_eq!(registry.readvertise_peer_claims(), 1);
-    let ad = rx.try_recv().expect("one re-advertisement published");
-    assert_eq!(ad.issue, 4431);
-    assert_eq!(ad.kind, crate::peer_claims::ClaimKind::Advertise);
-    assert!(
-        rx.try_recv().is_err(),
-        "the terminal-state sweep's claim must NOT be re-advertised"
-    );
-}
-
 #[test]
 #[serial]
 fn dispatch_happy_path_records_entry() {
@@ -252,140 +193,9 @@ fn dispatch_happy_path_records_entry() {
     );
 }
 
-/// Issue #4028 fail-open: an unreachable safehouse coordination channel (its
-/// receiver dropped ⇒ `try_send` returns `Closed`) must NEVER block or fail a
-/// dispatch — the soft claim is an optimization, never a liveness dependency.
-/// This is the single most important #4028 test.
-#[test]
-fn dispatch_proceeds_when_peer_claim_channel_is_closed_fail_open() {
-    let dir = tempdir().unwrap();
-    let (mut registry, _record_log) = fixture_registry(dir.path());
-    // Attach a publisher whose receiver is immediately dropped, so every
-    // `try_send` fails — modeling an absent/refusing safehoused.
-    let (tx, rx) = tokio::sync::mpsc::channel::<ClaimAd>(1);
-    drop(rx);
-    registry.set_peer_claim_publisher(tx);
-
-    let outcome = registry
-        .dispatch(&SweepKind::Issue(77), None, None, None, None)
-        .expect("dispatch must proceed even when the safehouse channel is closed");
-    assert!(outcome.was_new, "the sweep still starts");
-    assert_eq!(registry.len(), 1);
-}
-
-/// Issue #4028: the work-finder's peer-claim skip set reflects the attached
-/// shared view, scoped to this registry's repo, and is empty when no view is
-/// attached (byte-for-byte no-op).
-#[test]
-fn peer_claimed_issues_reflects_the_attached_view() {
-    let dir = tempdir().unwrap();
-    let (mut registry, _record_log) = fixture_registry(dir.path());
-    // No view attached ⇒ empty (the no-op default).
-    assert!(registry.peer_claimed_issues().is_empty());
-
-    let repo = peer_claims::repo_slug(&registry.config().workspace_root);
-    let view = Arc::new(Mutex::new(PeerClaimView::new("self".into(), Duration::from_secs(120))));
-    {
-        let mut v = view.lock().unwrap();
-        let now = Instant::now();
-        v.observe_at(&ClaimAd::advertise(500, repo.clone(), "peer".into(), 1, "ts".into()), now);
-    }
-    registry.set_peer_claims(view);
-    assert!(registry.peer_claimed_issues().contains(&500));
-}
-
-/// Issue #5789: the 2.95 peer-claim guard turns the soft-claim
-/// advertisement from a passive "the work-finder happens to check this
-/// first" signal into an enforced gate inside `dispatch()` itself, so
-/// EVERY call site (not just the work-finder's own pre-tick filter) backs
-/// off on a live peer claim. Simulates two hosts racing on the same issue
-/// with two independent `SweepRegistry` instances bridged only by a
-/// manually-relayed `ClaimAd` — deterministic, no sleeps, mirroring
-/// `peer_claims::tests::two_hosts_one_issue_second_host_backs_off_deterministically`
-/// but exercised through the real `dispatch()` call path instead of the
-/// bare `PeerClaimView`.
-#[test]
-fn dispatch_backs_off_when_a_peer_hosts_claim_is_already_live() {
-    let dir_a = tempdir().unwrap();
-    let dir_b = tempdir().unwrap();
-
-    // Host A dispatches first and advertises its claim.
-    let (mut registry_a, _log_a) = fixture_registry(dir_a.path());
-    let (tx_a, mut rx_a) = tokio::sync::mpsc::channel(8);
-    registry_a.set_peer_claim_publisher(tx_a);
-
-    let outcome_a = registry_a
-        .dispatch(&SweepKind::Issue(9789), None, None, None, None)
-        .expect("host A should win the race and dispatch normally");
-    assert!(outcome_a.was_new);
-    assert_eq!(registry_a.len(), 1, "host A recorded exactly one sweep");
-
-    let ad = rx_a
-        .try_recv()
-        .expect("host A published an advertise ad for #9789");
-    assert_eq!(ad.issue, 9789);
-    assert_eq!(ad.kind, crate::peer_claims::ClaimKind::Advertise);
-
-    // Host B's inbound safehouse coordination task observes A's ad before
-    // B ever attempts its own dispatch — the peer-claim view this closes
-    // over is exactly what `set_peer_claims` wires into a live daemon.
-    let (mut registry_b, _log_b) = fixture_registry(dir_b.path());
-    let repo_b = peer_claims::repo_slug(&registry_b.config().workspace_root);
-    // The ad carries host A's own repo slug; re-key it under B's (in this
-    // fixture the two temp dirs have different basenames, so re-derive
-    // the ad with B's repo identity — a real fleet shares one `LOOM_REPO`
-    // across hosts, which this mirrors).
-    let relayed = ClaimAd::advertise(ad.issue, repo_b, ad.host, ad.pid, ad.ts);
-    let view_b = Arc::new(Mutex::new(PeerClaimView::new(
-        "hostB".into(),
-        peer_claims::DEFAULT_PEER_CLAIM_TTL,
-    )));
-    view_b.lock().unwrap().observe_at(&relayed, Instant::now());
-    registry_b.set_peer_claims(view_b);
-
-    let err = registry_b
-        .dispatch(&SweepKind::Issue(9789), None, None, None, None)
-        .expect_err("host B must back off — a peer's claim is already live");
-    assert!(
-        err.downcast_ref::<CollisionDispatchError>()
-            .is_some_and(|e| e.issue == 9789 && e.source == CollisionSource::PeerClaim),
-        "expected a PeerClaim CollisionDispatchError, got: {err:#}"
-    );
-    assert_eq!(
-        registry_b.len(),
-        0,
-        "host B must not record a sweep entry — only one host claims #9789"
-    );
-}
-
-/// Issue #5789: a peer claim on a DIFFERENT issue never blocks this
-/// dispatch — the guard is scoped per-issue, not per-repo.
-#[test]
-fn dispatch_proceeds_when_the_peer_claim_is_for_a_different_issue() {
-    let dir = tempdir().unwrap();
-    let (mut registry, _log) = fixture_registry(dir.path());
-    let repo = peer_claims::repo_slug(&registry.config().workspace_root);
-    let view = Arc::new(Mutex::new(PeerClaimView::new(
-        "self".into(),
-        peer_claims::DEFAULT_PEER_CLAIM_TTL,
-    )));
-    view.lock()
-        .unwrap()
-        .observe_at(&ClaimAd::advertise(1, repo, "peer".into(), 1, "ts".into()), Instant::now());
-    registry.set_peer_claims(view);
-
-    let outcome = registry
-        .dispatch(&SweepKind::Issue(2), None, None, None, None)
-        .expect("a peer claim on a different issue must not block this dispatch");
-    assert!(outcome.was_new);
-}
-
 /// Issue #5789: upgrades the #4085 pre-flip forge-label collision probe
-/// from detection-only into enforcement. Simulates the case the 2.95
-/// peer-claim guard cannot catch (no safehouse view attached, mirroring a
-/// fleet where the winning host's ad never reached this one) but the
-/// forge's own label state already shows the peer's `loom:building`
-/// flip — this host must back off instead of duplicating the sweep, MUST
+/// from detection-only into enforcement. The forge's own label state
+/// already shows the peer's `loom:building` flip — this host must back off instead of duplicating the sweep, MUST
 /// NOT reach `gh issue edit`, and MUST log the collision (the existing
 /// `detect_and_record_collision` diagnostic, reused verbatim).
 #[test]
@@ -618,7 +428,7 @@ fn dispatch_proceeds_when_this_sweeps_own_lease_is_the_earliest() {
 
 // ------------------------------------------------------------------------
 // Epic #6165 Phase 2 combined regression suite (Issue #6288, Scenario 3):
-// "no duplicate builds when safehouse is down"
+// "no duplicate builds on the forge lease alone"
 // ------------------------------------------------------------------------
 //
 // Scenarios 1 (reclaim-race) and 2 (acquisition-race) already have
@@ -630,28 +440,23 @@ fn dispatch_proceeds_when_this_sweeps_own_lease_is_the_earliest() {
 // file, Issue #6287). This test is the higher-level composition Issue
 // #6288 actually asks for: the exact shape of the historical duplicate-
 // build incidents (loom#6147, loom#6129, klayout-tools#939) — two hosts
-// racing to claim the same issue while the peer-claims/safehouse channel
-// gives neither of them any evidence about the other — with BOTH Phase 2
+// racing to claim the same issue with no side channel giving either of them
+// any evidence about the other — with BOTH Phase 2
 // guards composed against the SAME lease-comment record, not two
 // independently-scripted fakes.
 
-/// Epic #6165's own end-to-end success criterion ("stopping `safehoused`
-/// on every host produces zero duplicate builds"), scoped to the Phase 2
+/// Epic #6165's own end-to-end success criterion (zero duplicate builds with
+/// no side channel at all — the shape #11112 / ADR-0025 made permanent),
+/// scoped to the Phase 2
 /// mechanisms (#6286 reclamation lease-freshness guard, #6287
 /// claim-then-verify-order dedup) — regression coverage for the
 /// duplicate-build shape behind loom#6147, loom#6129, and
 /// klayout-tools#939.
 ///
-/// Models two hosts racing to dispatch the SAME issue with the
-/// peer-claims/safehouse channel simulated fully absent for the whole
-/// scenario (no `PeerClaimView` ever registered — "no evidence either
-/// way", the exact reading a host with `safehoused` killed produces).
-/// Since Epic #6165 Phase 4 (#6317) that channel is never consulted by
-/// the reclamation decision at all — the call below goes through the
-/// plain [`crate::claim_reconciliation::forge::reconcile_workspace`],
-/// with no coordination-evidence seam left to inject in the first
-/// place, so this scenario now proves #6286/#6287 are load-bearing on
-/// their own by construction rather than by an explicit `None` stand-in:
+/// Models two hosts racing to dispatch the SAME issue with only the forge
+/// as shared state. The call below goes through the plain
+/// [`crate::claim_reconciliation::forge::reconcile_workspace`], so this
+/// scenario proves #6286/#6287 are load-bearing on their own:
 ///
 /// 1. A peer host's dispatcher already won the race: its lease comment
 ///    (id 1) is pre-seeded in the shared store, modeling a live, already-
@@ -667,12 +472,11 @@ fn dispatch_proceeds_when_this_sweeps_own_lease_is_the_earliest() {
 ///    dispatch's own tie-break just read) is still fresh — the
 ///    reclamation lease-freshness guard (#6286).
 ///
-/// Together: exactly one live claim survives the combined race, and the
-/// peer-claims/safehouse channel contributed no evidence to either
-/// decision.
+/// Together: exactly one live claim survives the combined race, on the
+/// forge lease alone.
 #[test]
 #[serial]
-fn combined_dispatch_and_reclaim_race_produces_no_duplicate_build_with_safehouse_down() {
+fn combined_dispatch_and_reclaim_race_produces_no_duplicate_build_on_the_lease_alone() {
     let dir = tempdir().unwrap();
     let repo_root = dir.path().join("repo");
     std::fs::create_dir_all(&repo_root).unwrap();
@@ -699,7 +503,7 @@ fn combined_dispatch_and_reclaim_race_produces_no_duplicate_build_with_safehouse
     sweep_journal::save(&journal_path, &journal).unwrap();
 
     let label_updated_at = Utc::now().to_rfc3339();
-    let (mut registry, gh_log, spawn_log, comments_store) = safehouse_down_combined_registry(
+    let (mut registry, gh_log, spawn_log, comments_store) = lease_only_combined_registry(
         &repo_root,
         &["<!-- loom:lease host=peer-host sweep=sweep-issue-9830-peer -->"],
         ISSUE,
@@ -735,8 +539,7 @@ fn combined_dispatch_and_reclaim_race_produces_no_duplicate_build_with_safehouse
     );
 
     // --- Step 2 (Scenario 1's mechanism, composed): a reclamation pass
-    //     against the peer's surviving claim, with the safehouse channel
-    //     simulated fully absent, must still refuse -- the peer's lease
+    //     against the peer's surviving claim must still refuse -- the peer's lease
     //     (the very comment this dispatch's own tie-break just read) is
     //     still fresh. ---
     let gh_bin = registry.config().gh_bin.clone().unwrap();
@@ -749,8 +552,7 @@ fn combined_dispatch_and_reclaim_race_produces_no_duplicate_build_with_safehouse
     assert_eq!(
         reclaimed, 0,
         "the peer's fresh lease must block reclamation even though the dead-pid journal \
-             evidence alone would normally reclaim immediately, and even with the \
-             peer-claims/safehouse channel contributing no evidence at all (#6286, composed \
+             evidence alone would normally reclaim immediately (#6286, composed \
              with #6287's own acquisition-race tie-break above -- Issue #6288 Scenario 3)"
     );
 
@@ -1584,54 +1386,6 @@ fn dispatch_refused_while_backoff_window_is_live() {
         .dispatch(&SweepKind::Issue(4485), None, None, None, None)
         .expect("dispatch proceeds once the window is cleared");
     assert!(outcome.was_new);
-}
-
-/// Issue #7477: arming a LOCAL dispatch-backoff window must also
-/// broadcast it fleet-wide over the same peer-claim channel dispatch
-/// claims use, so a peer host does not immediately re-attempt the same
-/// failing candidate this host just backed off on.
-#[test]
-fn record_dispatch_failure_broadcasts_fleet_wide() {
-    let dir = tempdir().unwrap();
-    let mut registry = backoff_registry(dir.path(), 60, 900);
-    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-    registry.set_peer_claim_publisher(tx);
-
-    registry.record_dispatch_failure(4485);
-
-    let ad = rx
-        .try_recv()
-        .expect("a cooldown/backoff ad must be published");
-    assert_eq!(ad.kind, crate::peer_claims::ClaimKind::DispatchBackoffArmed);
-    assert_eq!(ad.issue, 4485);
-    assert_eq!(ad.remaining_secs, Some(60), "the first failure's delay is `base` (60s)");
-}
-
-/// Issue #7477: `dispatch_backoff_issues` must union this host's own
-/// local backoff state with a live window a PEER host has broadcast —
-/// the fleet-scope fix. A registry with NO local record for an issue
-/// still must not offer it while a peer's broadcast window is live.
-#[test]
-fn dispatch_backoff_issues_reflects_a_peer_armed_window() {
-    let dir = tempdir().unwrap();
-    let mut registry = backoff_registry(dir.path(), 60, 900);
-    // No local record at all for issue 9001.
-    assert!(!registry.dispatch_backoff_issues(Utc::now()).contains(&9001));
-
-    let repo = peer_claims::repo_slug(&registry.config().workspace_root);
-    let view = Arc::new(Mutex::new(PeerClaimView::new("self".into(), Duration::from_secs(120))));
-    {
-        let mut v = view.lock().unwrap();
-        v.observe_dispatch_backoff_at(
-            &ClaimAd::dispatch_backoff_armed(9001, repo, "peer".into(), 1, "ts".into(), 60),
-            Instant::now(),
-        );
-    }
-    registry.set_peer_claims(view);
-    assert!(
-        registry.dispatch_backoff_issues(Utc::now()).contains(&9001),
-        "a peer-armed backoff window must suppress this host's dispatch too"
-    );
 }
 
 /// A disabled backoff is byte-for-byte the pre-#4485 path: no window is ever

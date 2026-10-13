@@ -2176,7 +2176,7 @@ pub(crate) fn lease_order_dispatch_registry(
 /// both) —
 /// against the SAME on-disk lease-comment store `lease_order_dispatch_registry`
 /// already models. This is the harness for Issue #6288 Scenario 3 (Epic
-/// #6165 Phase 2's combined, safehouse-down regression test): one fake `gh`,
+/// #6165 Phase 2's combined, lease-only regression test): one fake `gh`,
 /// one shared store, so a reclamation attempt made *after* a dispatch race
 /// resolves is provably reading the very lease record the dispatch-time
 /// tie-break just wrote — not an independently-scripted double of it.
@@ -2185,7 +2185,7 @@ pub(crate) fn lease_order_dispatch_registry(
 /// listing response with a single `loom:building` issue (the claim a
 /// reclamation pass would inspect); `other_lease_markers` pre-seeds the
 /// lease-comment store exactly like `lease_order_dispatch_registry`.
-pub(crate) fn safehouse_down_combined_registry(
+pub(crate) fn lease_only_combined_registry(
     ws: &Path,
     other_lease_markers: &[&str],
     building_issue_number: u32,

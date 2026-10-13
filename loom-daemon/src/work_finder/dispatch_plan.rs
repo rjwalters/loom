@@ -187,8 +187,8 @@ fn annotate_rows(
         });
         // Issue #9311: a time-boxed hold's absolute expiry, straight from the
         // tick row — never touched for any other disposition, so it stays
-        // `None` for capacity/ramp gates, in-flight, quarantined, peer-claimed
-        // and every disposition that isn't one of the five recorded holds.
+        // `None` for capacity/ramp gates, in-flight, quarantined and every
+        // disposition that isn't one of the five recorded holds.
         plan.held_until = tick_row.held_until;
     }
     promote_next(rows, report.max_admissions_per_tick.unwrap_or(usize::MAX));

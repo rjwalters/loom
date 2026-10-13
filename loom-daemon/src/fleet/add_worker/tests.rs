@@ -10,52 +10,7 @@ pub(super) fn base_config() -> AddWorkerConfig {
         loom_repo_url: DEFAULT_LOOM_REPO_URL.to_string(),
         pat_file: None,
         accounts_env_file: None,
-        safehouse_enabled: false,
         idle_shutdown_minutes: None,
-        safehouse_tailnet_auth_key_file: None,
-        safehouse_secrets_file: None,
-        safehouse_repo_url: DEFAULT_SAFEHOUSE_REPO_URL.to_string(),
-        safehouse_homeserver_url: None,
-        safehouse_room: None,
-        safehouse_personas: Vec::new(),
-        safehouse_invite_exec: None,
-        feed_egress_enabled: false,
-        feed_egress_ingest_key_file: None,
-        // Both left at the command's own defaults — no sink URL, no scrub
-        // patterns (#7814): neither carries a compiled-in operator identity.
-        feed_egress_sink_url: None,
-        feed_egress_deny_patterns: Vec::new(),
-        feed_egress_delay_seconds: DEFAULT_FEED_EGRESS_DELAY_SECONDS,
-    }
-}
-
-/// A full, valid `--safehouse` config — every required input present and
-/// well-formed. Individual tests mutate a field to exercise a specific
-/// failure.
-pub(super) fn safehouse_config() -> AddWorkerConfig {
-    let mut config = base_config();
-    config.safehouse_enabled = true;
-    config.safehouse_tailnet_auth_key_file = Some(PathBuf::from("/does/not/matter"));
-    config.safehouse_secrets_file = Some(PathBuf::from("/does/not/matter"));
-    config.safehouse_homeserver_url = Some("matrix.internal.example".to_string());
-    config.safehouse_room = Some("!fleet:matrix.internal.example".to_string());
-    config.safehouse_personas = vec!["loom_daemon".to_string()];
-    config
-}
-
-pub(super) fn safehouse_secrets() -> Secrets {
-    Secrets {
-        pat: None,
-        accounts_env: None,
-        safehouse_tailnet_auth_key: Some("tskey-auth-ephemeral-tagged".to_string()),
-        safehouse_secrets: Some(
-            "SAFEHOUSE_MATRIX_USER_ID=@safehoused-worker1:matrix.internal.example\n\
-                 SAFEHOUSE_MATRIX_PASSWORD=hunter2-matrix-pw\n\
-                 SAFEHOUSE_STORE_PASSPHRASE=store-pass-xyz\n\
-                 SAFEHOUSE_RECOVERY_PASSPHRASE=recovery-pass-xyz\n"
-                .to_string(),
-        ),
-        feed_egress_ingest_key: None,
     }
 }
 
@@ -264,7 +219,6 @@ fn plan_step_ordering_matches_the_eight_pilot_steps() {
     let secrets = Secrets {
         pat: Some("pat".to_string()),
         accounts_env: Some("ACCOUNT_EMAIL_1=a@b.c".to_string()),
-        ..Secrets::default()
     };
     let plan = build_plan(&config, &secrets);
     let names: Vec<&str> = plan
@@ -287,7 +241,6 @@ fn plan_step_ordering_matches_the_eight_pilot_steps() {
             "daemon-unit",
             "daemon-watchdog",
             "idle-shutdown",
-            "safehouse",
             "verify",
         ]
     );
@@ -330,7 +283,7 @@ fn workspace_clone_only_inits_an_unconfigured_workspace() {
 
 #[test]
 fn base_deps_check_includes_libsqlite3_dev() {
-    // safehouse#38: libsqlite3-dev must be part of the base deps.
+    // libsqlite3-dev stays part of the base deps (from-source fallback).
     let plan = build_plan(&base_config(), &Secrets::default());
     let base = plan
         .entries
@@ -501,7 +454,6 @@ fn forge_auth_and_token_accounts_carry_secret_stdin() {
     let secrets = Secrets {
         pat: Some("the-pat".to_string()),
         accounts_env: Some("ACCOUNT_EMAIL_1=a@b.c".to_string()),
-        ..Secrets::default()
     };
     let plan = build_plan(&config, &secrets);
     for name in ["forge-auth", "token-accounts"] {
@@ -612,7 +564,6 @@ fn daemon_watchdog_step_has_an_idempotent_check_and_follows_daemon_unit() {
     let secrets = Secrets {
         pat: Some("pat".to_string()),
         accounts_env: Some("ACCOUNT_EMAIL_1=a@b.c".to_string()),
-        ..Secrets::default()
     };
     let plan = build_plan(&config, &secrets);
     let names: Vec<&str> = plan.entries.iter().map(PlanEntry::name).collect();
@@ -857,324 +808,6 @@ pub(super) fn write_executable(path: &std::path::Path, contents: &str) {
     let mut perms = std::fs::metadata(path).unwrap().permissions();
     perms.set_mode(0o755);
     std::fs::set_permissions(path, perms).unwrap();
-}
-
-#[test]
-fn safehouse_disabled_stays_a_single_skip_and_plain_worker_unchanged() {
-    // AC: "Without --safehouse, behavior is unchanged: skip-with-notice,
-    // plain worker, zero safehouse provisioning."
-    let plan = build_plan(&base_config(), &Secrets::default());
-    let names: Vec<&str> = plan.entries.iter().map(PlanEntry::name).collect();
-    assert_eq!(names.iter().filter(|n| n.starts_with("safehouse")).count(), 1);
-    let entry = plan
-        .entries
-        .iter()
-        .find(|e| e.name() == "safehouse")
-        .unwrap();
-    match entry {
-        PlanEntry::Skip { reason, .. } => assert!(
-            reason.contains("not requested"),
-            "reason should explain safehouse was not requested: {reason}"
-        ),
-        other => panic!("expected safehouse skip, got {other:?}"),
-    }
-}
-
-// ---- safehouse enabled: real steps (#3998) --------------------------
-
-fn safehouse_step_names() -> Vec<&'static str> {
-    vec![
-        "safehouse-tailscale-install",
-        "safehouse-tailscale-join",
-        "safehouse-build",
-        "safehouse-config",
-        "safehouse-room-invite",
-        "safehouse-supervise",
-        "safehouse-daemon-restart",
-    ]
-}
-
-#[test]
-fn safehouse_enabled_renders_full_step_sequence_in_order_between_idle_shutdown_and_verify() {
-    let config = safehouse_config();
-    let plan = build_plan(&config, &safehouse_secrets());
-    let names: Vec<&str> = plan.entries.iter().map(PlanEntry::name).collect();
-
-    // No bare "safehouse" skip entry remains once real steps render.
-    assert!(!names.contains(&"safehouse"));
-
-    let idle_pos = names.iter().position(|n| *n == "idle-shutdown").unwrap();
-    let verify_pos = names.iter().position(|n| *n == "verify").unwrap();
-    let safehouse_positions: Vec<usize> = safehouse_step_names()
-        .iter()
-        .map(|want| {
-            names
-                .iter()
-                .position(|n| n == want)
-                .unwrap_or_else(|| panic!("missing step {want}"))
-        })
-        .collect();
-
-    // Exact ordering, and the whole block sits between idle-shutdown and verify.
-    let mut sorted = safehouse_positions.clone();
-    sorted.sort_unstable();
-    assert_eq!(
-        safehouse_positions, sorted,
-        "safehouse steps must render in the documented order"
-    );
-    assert!(safehouse_positions
-        .iter()
-        .all(|&p| p > idle_pos && p < verify_pos));
-}
-
-#[test]
-fn safehouse_config_step_precedes_supervise_step_boot_time_ordering_constraint() {
-    // AC: the persona allowlist is written before safehoused's first
-    // start (boot-time-only, no reload) — asserted directly on the
-    // rendered plan's step order, not just by construction.
-    let config = safehouse_config();
-    let plan = build_plan(&config, &safehouse_secrets());
-    let names: Vec<&str> = plan.entries.iter().map(PlanEntry::name).collect();
-    let config_pos = names.iter().position(|n| *n == "safehouse-config").unwrap();
-    let supervise_pos = names
-        .iter()
-        .position(|n| *n == "safehouse-supervise")
-        .unwrap();
-    assert!(
-        config_pos < supervise_pos,
-        "safehouse-config ({config_pos}) must precede safehouse-supervise ({supervise_pos})"
-    );
-}
-
-#[test]
-fn safehouse_every_step_has_a_check_for_idempotent_rerun() {
-    // AC: a re-run on an already-provisioned host reports AlreadyDone —
-    // that classification is driven entirely by a present `check`.
-    let config = safehouse_config();
-    let plan = build_plan(&config, &safehouse_secrets());
-    for want in safehouse_step_names() {
-        let step = plan
-            .entries
-            .iter()
-            .find_map(|e| match e {
-                PlanEntry::Step(s) if s.name == want => Some(s),
-                _ => None,
-            })
-            .unwrap_or_else(|| panic!("missing step {want}"));
-        assert!(step.check.is_some(), "{want} must have a check phase (idempotency)");
-    }
-}
-
-#[test]
-fn safehouse_full_plan_reruns_idempotently_when_every_check_passes() {
-    struct AlwaysOkRunner;
-    impl CommandRunner for AlwaysOkRunner {
-        fn run(&self, _shell: &str, _stdin: Option<&str>) -> Result<CommandOutput> {
-            Ok(CommandOutput {
-                code: 0,
-                stdout: String::new(),
-                stderr: String::new(),
-            })
-        }
-    }
-    let config = safehouse_config();
-    let plan = build_plan(&config, &safehouse_secrets());
-    let reports = super::super::execute_plan(&AlwaysOkRunner, &plan);
-    for name in safehouse_step_names() {
-        let report = reports.iter().find(|r| r.name == name).unwrap();
-        assert_eq!(
-            report.status,
-            StepStatus::AlreadyDone,
-            "{name} should be AlreadyDone on a passing check"
-        );
-    }
-}
-
-#[test]
-fn safehouse_tailscale_join_and_config_steps_carry_secret_stdin_not_in_rendered_text() {
-    let config = safehouse_config();
-    let secrets = safehouse_secrets();
-    let plan = build_plan(&config, &secrets);
-
-    for name in ["safehouse-tailscale-join", "safehouse-config"] {
-        let step = plan
-            .entries
-            .iter()
-            .find_map(|e| match e {
-                PlanEntry::Step(s) if s.name == name => Some(s),
-                _ => None,
-            })
-            .unwrap();
-        let stdin = step.stdin.as_ref().expect("secret step must carry stdin");
-        assert!(stdin.secret, "{name} stdin must be marked secret");
-    }
-
-    let dry = plan.render_dry_run("fleet add-worker", "worker-1");
-    assert!(!dry.contains("tskey-auth-ephemeral-tagged"));
-    assert!(!dry.contains("hunter2-matrix-pw"));
-    assert!(!dry.contains("store-pass-xyz"));
-    assert!(!dry.contains("recovery-pass-xyz"));
-}
-
-#[test]
-fn safehouse_config_step_apply_references_secret_vars_not_values() {
-    let config = safehouse_config();
-    let secrets = safehouse_secrets();
-    let plan = build_plan(&config, &secrets);
-    let step = plan
-        .entries
-        .iter()
-        .find_map(|e| match e {
-            PlanEntry::Step(s) if s.name == "safehouse-config" => Some(s),
-            _ => None,
-        })
-        .unwrap();
-    // Non-secret operator values ARE interpolated.
-    assert!(step.apply.contains("matrix.internal.example"));
-    assert!(step.apply.contains("!fleet:matrix.internal.example"));
-    assert!(step.apply.contains("loom_daemon"));
-    // Secret values are referenced only via their sourced variable names.
-    assert!(step.apply.contains("$SAFEHOUSE_MATRIX_USER_ID"));
-    assert!(step.apply.contains("$SAFEHOUSE_MATRIX_PASSWORD"));
-    assert!(step.apply.contains("$SAFEHOUSE_STORE_PASSPHRASE"));
-    assert!(step.apply.contains("$SAFEHOUSE_RECOVERY_PASSPHRASE"));
-    assert!(!step.apply.contains("hunter2-matrix-pw"));
-}
-
-#[test]
-fn safehouse_room_invite_uses_the_daemon_side_op_not_raw_cs_api() {
-    let config = safehouse_config();
-    let plan = build_plan(&config, &safehouse_secrets());
-    let step = plan
-        .entries
-        .iter()
-        .find_map(|e| match e {
-            PlanEntry::Step(s) if s.name == "safehouse-room-invite" => Some(s),
-            _ => None,
-        })
-        .unwrap();
-    assert!(step.apply.contains("safehoused invite"));
-    assert!(!step.apply.to_lowercase().contains("client-server"));
-    assert!(!step.apply.contains("/_matrix/client"));
-
-    // An operator override replaces the default invocation.
-    let mut overridden = safehouse_config();
-    overridden.safehouse_invite_exec = Some("safehoused invite --room-override x".to_string());
-    let plan2 = build_plan(&overridden, &safehouse_secrets());
-    let step2 = plan2
-        .entries
-        .iter()
-        .find_map(|e| match e {
-            PlanEntry::Step(s) if s.name == "safehouse-room-invite" => Some(s),
-            _ => None,
-        })
-        .unwrap();
-    assert!(step2.apply.contains("--room-override x"));
-}
-
-#[test]
-fn safehouse_supervise_step_installs_via_the_shared_service_script_and_lingers() {
-    let config = safehouse_config();
-    let plan = build_plan(&config, &safehouse_secrets());
-    let step = plan
-        .entries
-        .iter()
-        .find_map(|e| match e {
-            PlanEntry::Step(s) if s.name == "safehouse-supervise" => Some(s),
-            _ => None,
-        })
-        .unwrap();
-    assert!(step.apply.contains("safehoused-service.sh"));
-    assert!(step.apply.contains("install"));
-    assert!(step.apply.contains("enable-linger"));
-}
-
-#[test]
-fn safehouse_daemon_restart_step_wires_env_and_restarts() {
-    let config = safehouse_config();
-    let plan = build_plan(&config, &safehouse_secrets());
-    let step = plan
-        .entries
-        .iter()
-        .find_map(|e| match e {
-            PlanEntry::Step(s) if s.name == "safehouse-daemon-restart" => Some(s),
-            _ => None,
-        })
-        .unwrap();
-    assert!(step.apply.contains("LOOM_SAFEHOUSE_ENABLED=true"));
-    assert!(step.apply.contains("LOOM_SAFEHOUSE_SOCKET"));
-    assert!(step
-        .apply
-        .contains("LOOM_SAFEHOUSE_ROOM=!fleet:matrix.internal.example"));
-    assert!(step
-        .apply
-        .contains("systemctl --user restart loom-daemon.service"));
-}
-
-// ---- safehouse preflight ---------------------------------------------
-
-#[test]
-fn preflight_safehouse_enabled_requires_every_input() {
-    let mut config = base_config();
-    config.safehouse_enabled = true;
-    let err = preflight(&config).unwrap_err().to_string();
-    assert!(err.contains("--safehouse-tailnet-auth-key-file"), "err: {err}");
-    assert!(err.contains("--safehouse-secrets-file"), "err: {err}");
-    assert!(err.contains("--safehouse-homeserver-url"), "err: {err}");
-    assert!(err.contains("--safehouse-room"), "err: {err}");
-    assert!(err.contains("--safehouse-persona"), "err: {err}");
-}
-
-#[test]
-fn preflight_safehouse_enabled_with_full_inputs_reads_secrets() {
-    let dir = tempfile::tempdir().unwrap();
-    let key_file = dir.path().join("tailnet.key");
-    let secrets_file = dir.path().join("safehouse.env");
-    std::fs::write(&key_file, "tskey-ephemeral-tagged\n").unwrap();
-    std::fs::write(
-        &secrets_file,
-        "SAFEHOUSE_MATRIX_USER_ID=@w1:example\nSAFEHOUSE_MATRIX_PASSWORD=pw\n\
-             SAFEHOUSE_STORE_PASSPHRASE=sp\nSAFEHOUSE_RECOVERY_PASSPHRASE=rp\n",
-    )
-    .unwrap();
-
-    let mut config = safehouse_config();
-    config.safehouse_tailnet_auth_key_file = Some(key_file);
-    config.safehouse_secrets_file = Some(secrets_file);
-
-    let secrets = preflight(&config).unwrap();
-    assert_eq!(secrets.safehouse_tailnet_auth_key.as_deref(), Some("tskey-ephemeral-tagged"));
-    assert!(secrets
-        .safehouse_secrets
-        .as_ref()
-        .unwrap()
-        .contains("SAFEHOUSE_MATRIX_USER_ID"));
-}
-
-#[test]
-fn preflight_rejects_invalid_persona_name() {
-    let mut config = safehouse_config();
-    config.safehouse_personas = vec!["Not-Valid!".to_string()];
-    let err = preflight(&config).unwrap_err().to_string();
-    assert!(err.contains("safehouse-persona"), "err: {err}");
-}
-
-#[test]
-fn preflight_rejects_unsafe_homeserver_url_and_room() {
-    let mut config = safehouse_config();
-    config.safehouse_homeserver_url = Some("https://evil; rm -rf /".to_string());
-    assert!(preflight(&config).is_err());
-
-    let mut config2 = safehouse_config();
-    config2.safehouse_room = Some("!room`whoami`:example".to_string());
-    assert!(preflight(&config2).is_err());
-}
-
-#[test]
-fn preflight_safehouse_disabled_ignores_missing_safehouse_inputs() {
-    // AC: without --safehouse, nothing about safehouse gates preflight.
-    let config = base_config();
-    assert!(preflight(&config).is_ok());
 }
 
 #[test]
@@ -1608,7 +1241,6 @@ fn provisioning_steps_export_the_full_canonical_path_not_a_narrower_subset() {
     let secrets = Secrets {
         pat: Some("the-pat".to_string()),
         accounts_env: Some("ACCOUNT_EMAIL_1=a@b.c".to_string()),
-        ..Secrets::default()
     };
     let plan = build_plan(&config, &secrets);
     let export_line = super::super::path_bootstrap::canonical_path_export_line();
@@ -1654,7 +1286,6 @@ fn no_python_loom_tools_or_pip_step_anywhere() {
     let secrets = Secrets {
         pat: Some("pat".to_string()),
         accounts_env: Some("ACCOUNT_EMAIL_1=a@b.c".to_string()),
-        ..Secrets::default()
     };
     let plan = build_plan(&config, &secrets);
     for entry in &plan.entries {
@@ -1692,11 +1323,10 @@ fn dry_run_render_is_stable_and_lists_all_steps() {
     let secrets = Secrets {
         pat: Some("pat".to_string()),
         accounts_env: Some("env".to_string()),
-        ..Secrets::default()
     };
     let plan = build_plan(&config, &secrets);
     let out = plan.render_dry_run("fleet add-worker", &config.ssh_host);
-    assert!(out.contains("14 steps"));
+    assert!(out.contains("13 steps"));
     assert!(out.contains("base-deps"));
     assert!(out.contains("verify"));
     assert!(out.contains("feeds a secret via stdin"));

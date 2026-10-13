@@ -635,7 +635,7 @@ mod tests {
         std::env::remove_var("LOOM_REPO");
         let (mut reg, gh_log) = forge_registry(dir.path(), "open", "", "");
 
-        hold_at_threshold(&mut reg, 7893, 2, "scope `safehouse_chatops/` does not exist on main");
+        hold_at_threshold(&mut reg, 7893, 2, "scope `widget_engine/` does not exist on main");
 
         let comments = gh_calls_starting_with(&gh_log, "issue comment ");
         assert_eq!(comments.len(), 1, "the hold posts exactly one notice, got: {comments:?}");
@@ -651,7 +651,7 @@ mod tests {
             "the notice names the count: {body}"
         );
         assert!(
-            body.contains("scope `safehouse_chatops/` does not exist on main"),
+            body.contains("scope `widget_engine/` does not exist on main"),
             "the notice names the failure: {body}"
         );
     }

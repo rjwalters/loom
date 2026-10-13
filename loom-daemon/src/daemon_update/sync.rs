@@ -399,7 +399,7 @@ fn classify_and_report(repo_root: &Path, branch: &str, args: &Args, state: &mut 
         .join(" ");
     if !dirty_cfg_tiers.is_empty() {
         out::err(&format!("Dirty TRACKED config tier(s) present: {dirty_cfg_tiers}"));
-        out::err("If that diff is host-specific — a per-host path or socket, or an on/off switch that is true of this box and false of the others (worktree.root, safehouse.enabled, safehouse.socket) — it does not belong in a tracked file at all. Move it to the gitignored .loom-local/local.json tier, which never shows up in git status and so can never block this sync again. Per-key runbook: https://github.com/rjwalters/loom/blob/main/docs/design/config-resolution-tiers.md");
+        out::err("If that diff is host-specific — a per-host path or socket, or an on/off switch that is true of this box and false of the others (worktree.root, host.preventSleep) — it does not belong in a tracked file at all. Move it to the gitignored .loom-local/local.json tier, which never shows up in git status and so can never block this sync again. Per-key runbook: https://github.com/rjwalters/loom/blob/main/docs/design/config-resolution-tiers.md");
     }
     let _ = state;
     false

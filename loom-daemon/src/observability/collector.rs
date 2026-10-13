@@ -1,7 +1,6 @@
 //! Bus-subscriber telemetry collector (Epic #4702, Phase 1 — issue #4705).
 //!
-//! Mirrors [`crate::safehouse`]'s "subscribe to the existing bus, add no new
-//! call sites" design: this module adds **zero** new emit sites anywhere
+//! "Subscribe to the existing bus, add no new call sites": this module adds **zero** new emit sites anywhere
 //! else in the daemon. It subscribes to the already-frozen `sweep.global.
 //! dispatch` / `sweep.issue.*` topics (`event_bus.rs`'s taxonomy), maps each
 //! relevant event to the [`crate::telemetry`] schema's record types, resolves
@@ -847,7 +846,7 @@ fn terminal_records(
 
 /// [`fetch_repo_slug`] with a process-lifetime cache keyed by workspace root
 /// path (a repo's slug does not change while the daemon runs — same
-/// rationale as [`crate::safehouse`]'s own `slug_cache`).
+/// rationale as any other per-root slug cache).
 ///
 /// With repo facts on (W3a) the slug comes from the fingerprint-invalidated
 /// repo-facts record instead (`gh repo view` semantics, no forge call when

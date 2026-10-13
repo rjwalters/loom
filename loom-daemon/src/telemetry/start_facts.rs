@@ -41,8 +41,7 @@ pub mod effort_source {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DispatchOrigin {
-    /// A human asked: `loom-daemon dispatch`, the `dispatch_sweep` MCP tool,
-    /// or a Safehouse ChatOps `dispatch` command.
+    /// A human asked: `loom-daemon dispatch` or the `dispatch_sweep` MCP tool.
     Operator,
     /// The daemon's autonomous work finder picked the issue.
     WorkFinder,

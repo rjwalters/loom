@@ -34,7 +34,7 @@ fn summary(rows: Vec<(u32, QueueDisposition)>) -> WorkFinderTickSummary {
         "at": "2026-10-04T12:00:00Z", "max_concurrent": 2, "seen": 0,
         "dispatched": 0, "skipped_labeled": 0, "skipped_in_flight": 0,
         "skipped_quarantined": 0, "skipped_pr_open": 0,
-        "skipped_peer_claim": 0, "skipped_backoff": 0,
+        "skipped_backoff": 0,
         "deferred_capacity": 0, "deferred_ramp_cap": 0, "errors": 0,
         "halted": false
     }))

@@ -182,8 +182,8 @@ pub fn check_exit_code(drifts: &[Drift]) -> i32 {
 /// The top-level keys the file on disk carries that `target`'s rendered
 /// value does not — a **lossy reduction** if written (2am#1653's ask: the
 /// writer that clobbered two Macs' machine-tier config set out to update
-/// one block and wrote the file fresh, losing `runtimes`, `autonomous`,
-/// `safehouse` and `forge` for ~10 h). The store is the tier's record of
+/// one block and wrote the file fresh, losing `runtimes`, `autonomous` and
+/// `forge` (among others) for ~10 h). The store is the tier's record of
 /// truth, so a legitimate reduction happens — but it must never happen by
 /// default: the caller refuses until the operator names it (`--allow-reduce`,
 /// or `fleet-config propose adopt [--host <HOST>]` to push the blocks INTO

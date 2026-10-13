@@ -382,7 +382,6 @@ impl FleetEligibleReason {
             | Qd::Parked
             | Qd::HardExclusion
             | Qd::Quarantined
-            | Qd::PeerClaim
             | Qd::OpenPr
             | Qd::DispatchError
             | Qd::AlreadyLanded

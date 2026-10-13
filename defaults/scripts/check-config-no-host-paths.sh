@@ -4,12 +4,12 @@
 #
 # Root cause this guards against: `.loom/config.json` (and, once a repo
 # migrates onto it, `.loom-project/project.json`) is TRACKED and shared
-# across every host, but a value like `observability.ingestKeyFile` or
-# `safehouse.socket` is inherently per-host — an absolute path under
+# across every host, but a value like `observability.ingestKeyFile` is
+# inherently per-host — an absolute path under
 # `/home/<user>/…`, `/Users/<user>/…`, or `/root/…` committed there is
 # correct on at most one host and silently wrong (or foreign-home, #5336) on
 # every other one that `git pull`s it. This exact class recurred three times
-# before this guard existed: #5354 (ingestKeyFile), #5464 (safehouse.socket),
+# before this guard existed: #5354 (ingestKeyFile), #5464 (a per-host socket path),
 # and #6499 (a stash-pop conflict re-introduced ingestKeyFile as a committed
 # `/home/ubuntu/…` path, fixed reactively by #6506). This script is the
 # structural gate that stops a fourth recurrence — the config-content
@@ -35,8 +35,8 @@
 # The fix for a real violation is NOT always ".loom-local/local.json" — check
 # whether the value's own $HOME-relative default already does the right
 # thing per-host (the ingestKeyFile fix, #6506: just delete the committed
-# line) before reaching for the local tier (the safehouse.socket fix, #5457
-# + #5523: no code-level default exists, so the value must live somewhere,
+# line) before reaching for the local tier (the #5457 + #5523 socket-path
+# fix: no code-level default exists, so the value must live somewhere,
 # and that somewhere is `.loom-local/local.json`). See
 # defaults/docs/fleet-config-lifecycle.md and
 # docs/design/config-resolution-tiers.md §5 for the full runbook.
@@ -157,7 +157,7 @@ EOF
 
     # 2. A committed /Users/ path -> flagged.
     cat > "$st_dir/positive-users.json" <<'EOF'
-{"safehouse": {"socket": "/Users/alice/.loom/safehoused/state/safehoused.sock"}}
+{"observability": {"ingestKeyFile": "/Users/alice/.loom/keys/ingest.key"}}
 EOF
     out="$(scan_file "$st_dir/positive-users.json")"
     st_assert "flags a committed /Users/<user>/... path" "1" \

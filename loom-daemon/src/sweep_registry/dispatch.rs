@@ -1,5 +1,5 @@
 //! The dispatch call path: `SweepRegistry::dispatch`, dispatch-backoff
-//! bookkeeping, and peer-claim publishing.
+//! bookkeeping.
 
 #[path = "log_paths.rs"]
 mod log_paths;
@@ -325,11 +325,6 @@ impl std::error::Error for WorkspaceCommandsMissingDispatchError {}
 /// detection-only to enforcement).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CollisionSource {
-    /// Caught by the fast, in-memory soft-claim broadcast (Issue #4028's
-    /// [`crate::peer_claims::PeerClaimView`]) — a peer host's advertisement for
-    /// this same issue is still live. Cheapest and earliest signal: no `gh`
-    /// round trip, checked before the claim lock is even acquired.
-    PeerClaim,
     /// Caught by the opt-in forge-label pre-flip read
     /// ([`SweepRegistry::classify_preflip_labels`]) — a peer's
     /// claim label (`loom:building` / `loom:reviewing` / `loom:treating`)
@@ -343,9 +338,6 @@ pub enum CollisionSource {
 impl std::fmt::Display for CollisionSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CollisionSource::PeerClaim => {
-                write!(f, "a peer host's live soft-claim advertisement")
-            }
             CollisionSource::ForgeLabel { labels } => {
                 f.write_str(&preflip_labels::describe_claim_evidence(labels))
             }
@@ -359,9 +351,8 @@ impl std::fmt::Display for CollisionSource {
 /// #4085's collision detection from detection-only into real enforcement).
 ///
 /// Every side effect this host had already applied before the collision was
-/// caught — the claim lock ([`SweepRegistry::acquire_lock`]) and, for the
-/// [`CollisionSource::ForgeLabel`] case, the peer-claim advertisement
-/// ([`SweepRegistry::publish_peer_claim`]) — is unwound before this error is
+/// caught — the claim lock ([`SweepRegistry::acquire_lock`]) — is unwound
+/// before this error is
 /// returned, so a losing host leaves no trace of its aborted attempt: the
 /// issue is exactly as claimable as it was before this host ever looked at
 /// it (modulo the winning peer's own claim, which this host must not touch).
@@ -405,8 +396,8 @@ impl std::error::Error for CollisionDispatchError {}
 /// happened first by the forge's own comment-creation order — the residual
 /// race #4a's pre-flip read cannot fully close since two flips can both
 /// commit in the same window with neither pre-flip read observing the
-/// other. Every side effect this host exclusively controls (the peer-claim
-/// advertisement, the claim lock) is unwound before this error is returned;
+/// other. Every side effect this host exclusively controls (the claim lock)
+/// is unwound before this error is returned;
 /// the shared `loom:building` label is deliberately left alone — see
 /// `dispatch_inner`'s 4d comment for why reverting it would be unsafe.
 ///
@@ -915,254 +906,6 @@ pub fn stagger_wait(last_spawn_at: Option<Instant>, stagger: Duration, now: Inst
 }
 
 impl SweepRegistry {
-    /// Attach the outbound peer-claim advertiser (Issue #4028). The workspace
-    /// pool / `main.rs` call this once at provision time **only when
-    /// `safehouse.enabled`** — an unset publisher keeps dispatch byte-for-byte
-    /// unchanged.
-    pub fn set_peer_claim_publisher(&mut self, tx: tokio::sync::mpsc::Sender<ClaimAd>) {
-        self.peer_claim_publisher = Some(tx);
-    }
-
-    /// Attach the shared inbound peer-claim view (Issue #4028), fed by the
-    /// safehouse coordination task. Only set when `safehouse.enabled`.
-    pub fn set_peer_claims(&mut self, view: Arc<Mutex<PeerClaimView>>) {
-        self.peer_claims = Some(view);
-    }
-
-    /// The set of issues a **peer** host has advertised as in-flight and not yet
-    /// expired (Issue #4028) — the work-finder's peer-claim skip set. Empty when
-    /// no view is attached (`safehouse.enabled` false) or the mutex is poisoned
-    /// (fail-open: an unavailable view never blocks dispatch). Scoped to this
-    /// registry's repo via [`peer_claims::repo_slug`], so two managed repos'
-    /// issue #N never cross-suppress.
-    #[must_use]
-    pub fn peer_claimed_issues(&self) -> HashSet<u32> {
-        let Some(view) = &self.peer_claims else {
-            return HashSet::new();
-        };
-        let repo = peer_claims::repo_slug(&self.config.workspace_root);
-        match view.lock() {
-            Ok(v) => v.claimed_issues_at(&repo, Instant::now()),
-            Err(poisoned) => {
-                log::error!("sweep_registry: peer-claim view mutex poisoned ({poisoned:?})");
-                HashSet::new()
-            }
-        }
-    }
-
-    /// Publish a peer-claim advertisement/retraction over the safehouse room
-    /// (Issue #4028). Best-effort and **non-blocking** — a bounded `try_send` so
-    /// the dispatch path never waits on the coordination task, and a `Full`
-    /// (safehoused outage backlog) or `Closed` (task gone) channel is a
-    /// **fail-open** drop: logged once, dispatch proceeds. A no-op when no
-    /// publisher is attached (`safehouse.enabled` false).
-    ///
-    /// Dispatch-only: `kind` is always [`peer_claims::ClaimKind::Advertise`]
-    /// or [`peer_claims::ClaimKind::Retract`] from every caller in this
-    /// module. [`peer_claims::ClaimKind::Completed`] (Issue #6352) is a
-    /// narration-layer concern published from
-    /// [`crate::safehouse::build_and_narrate_completion`] instead, over the
-    /// same channel/room but never through this method — reached here only
-    /// if a future caller mis-threads it, in which case this degrades to a
-    /// logged no-op rather than mis-publishing a claim-shaped envelope for a
-    /// kind this method was never designed to carry. The same applies to
-    /// [`peer_claims::ClaimKind::FilingLock`]/`FilingUnlock` (Issue #6714):
-    /// those are published by the **filer itself** — the shell half of
-    /// [`crate::filing_lock`] (`lib/filing-lock.sh`, via `fleet-send.sh`) at
-    /// the instant it takes/releases the machine-wide lock, because a
-    /// 30s-cadence reaper republish is far too coarse for a burst that lasts
-    /// seconds. The daemon's role in that lane is purely the *receive* side
-    /// ([`crate::safehouse::PeerClaimSink`] + its on-disk mirror).
-    pub(crate) fn publish_peer_claim(&self, kind: peer_claims::ClaimKind, issue: u32) {
-        if kind == peer_claims::ClaimKind::Completed || kind.is_filing_lock_lane() {
-            log::warn!(
-                "sweep_registry: publish_peer_claim called with a non-dispatch ClaimKind for \
-                 issue #{issue} — this is a dispatch-only path (#6352/#6714); dropping"
-            );
-            return;
-        }
-        let Some(tx) = &self.peer_claim_publisher else {
-            return;
-        };
-        // #5921: count every outbound `Advertise` attempt (dispatch-time plus
-        // each reaper re-advertisement heartbeat, #4431) BEFORE the `try_send`
-        // below, so a saturated/closed channel is still visible as "we tried"
-        // — the counter answers "did this host attempt to advertise", not
-        // "did the room confirm delivery" (the transport is fire-and-forget
-        // by design, same fail-open contract as the rest of this method).
-        if kind == peer_claims::ClaimKind::Advertise {
-            if let Some(view) = &self.peer_claims {
-                match view.lock() {
-                    Ok(mut v) => v.record_advertised(),
-                    Err(poisoned) => poisoned.into_inner().record_advertised(),
-                }
-            }
-        }
-        let repo = peer_claims::repo_slug(&self.config.workspace_root);
-        let host = host_identity();
-        let pid = std::process::id();
-        let ts = Utc::now().to_rfc3339();
-        let ad = match kind {
-            peer_claims::ClaimKind::Advertise => ClaimAd::advertise(issue, repo, host, pid, ts),
-            peer_claims::ClaimKind::Retract => ClaimAd::retract(issue, repo, host, pid, ts),
-            // Unreachable: the early return above already handles `Completed`
-            // and the filing-lock lane. The cooldown lane (Issue #7477) and
-            // the pool-hold lane (Issue #8001) each have their own dedicated
-            // publisher (`publish_peer_cooldown_claim` /
-            // `publish_peer_pool_hold_claim`), since each carries a payload
-            // this method's signature has no parameter for. The PR-less-retry
-            // lane (Issue #9292) does the same, for the same reason — its ad
-            // carries the advertiser's own consecutive tally (see
-            // `publish_peer_prless_release_claim`).
-            peer_claims::ClaimKind::Completed
-            | peer_claims::ClaimKind::FilingLock
-            | peer_claims::ClaimKind::FilingUnlock
-            | peer_claims::ClaimKind::NoopCooldownArmed
-            | peer_claims::ClaimKind::DispatchBackoffArmed
-            | peer_claims::ClaimKind::PrlessReleaseArmed
-            | peer_claims::ClaimKind::PoolHoldArmed
-            | peer_claims::ClaimKind::PoolHoldCleared
-            | peer_claims::ClaimKind::Heartbeat => return,
-        };
-        if let Err(e) = tx.try_send(ad) {
-            // Fail-open: the soft claim is an optimization, never a liveness
-            // dependency. Debug (not warn) so a persistent safehoused outage
-            // does not spam the log once per dispatch.
-            log::debug!(
-                "sweep_registry: peer-claim advertisement for issue #{issue} dropped \
-                 ({e}); dispatch unaffected (#4028)"
-            );
-        }
-    }
-
-    /// Publish a fleet-wide cooldown/backoff advertisement (Issue #7477) —
-    /// the [`Self::publish_peer_claim`] sibling for
-    /// [`peer_claims::ClaimKind::NoopCooldownArmed`]/
-    /// [`peer_claims::ClaimKind::DispatchBackoffArmed`], reusing the exact
-    /// same outbound channel and fail-open contract: a no-op without a
-    /// publisher (`safehouse.enabled` false), and a full/closed channel
-    /// drops the ad without blocking the caller.
-    ///
-    /// One-shot, not re-advertised: unlike a live sweep's in-flight claim
-    /// (refreshed every reaper tick by [`Self::readvertise_peer_claims`]), a
-    /// cooldown/backoff window is armed once per record call and its
-    /// receiver computes its own local expiry from `remaining` — there is no
-    /// ongoing local state that needs a heartbeat to stay live. A repeat
-    /// `record_noop_release`/`record_dispatch_failure` call (each pass that
-    /// still finds "nothing to do") naturally re-broadcasts and refreshes
-    /// every peer's local expiry, mirroring the local re-arm semantics
-    /// exactly.
-    pub(crate) fn publish_peer_cooldown_claim(
-        &self,
-        kind: peer_claims::ClaimKind,
-        issue: u32,
-        remaining: Duration,
-    ) {
-        let Some(tx) = &self.peer_claim_publisher else {
-            return;
-        };
-        let repo = peer_claims::repo_slug(&self.config.workspace_root);
-        let host = host_identity();
-        let pid = std::process::id();
-        let ts = Utc::now().to_rfc3339();
-        let remaining_secs = remaining.as_secs();
-        let ad = match kind {
-            peer_claims::ClaimKind::NoopCooldownArmed => {
-                ClaimAd::noop_cooldown_armed(issue, repo, host, pid, ts, remaining_secs)
-            }
-            peer_claims::ClaimKind::DispatchBackoffArmed => {
-                ClaimAd::dispatch_backoff_armed(issue, repo, host, pid, ts, remaining_secs)
-            }
-            // Unreachable: every call site below passes one of the two kinds
-            // above.
-            _ => {
-                log::warn!(
-                    "sweep_registry: publish_peer_cooldown_claim called with a non-cooldown-lane \
-                     kind for issue #{issue} — this is a cooldown/backoff-only path (#7477); \
-                     dropping"
-                );
-                return;
-            }
-        };
-        if let Err(e) = tx.try_send(ad) {
-            // Fail-open, mirroring `publish_peer_claim`: the fleet-wide
-            // broadcast is an optimization on top of the still-correct local
-            // cooldown/backoff, never a liveness dependency.
-            log::debug!(
-                "sweep_registry: cooldown/backoff advertisement for issue #{issue} dropped \
-                 ({e}); local cooldown/backoff unaffected (#7477)"
-            );
-        }
-    }
-
-    /// Re-advertise the peer claim of every live (`Running`/`Pending`) Issue
-    /// sweep over the safehouse room (Issue #4431).
-    ///
-    /// The dispatch-time advertisement is a one-shot publish, and peer claims
-    /// expire after [`crate::peer_claims::DEFAULT_PEER_CLAIM_TTL`] (120s) —
-    /// tuned for the *soft-backoff* era when the forge label was the durable
-    /// signal behind it. With claim reconciliation slowed to a healing cadence
-    /// on safehouse-enabled hosts (#4431), a live sweep's claim must not
-    /// silently fall out of peers' [`crate::peer_claims::PeerClaimView`]s
-    /// mid-run. The reaper calls this every tick (default 30s, well under the
-    /// TTL), so a live claim is refreshed ~4× per TTL window while a crashed
-    /// host's claims still expire within one TTL of its last heartbeat — the
-    /// crash-release property the short TTL exists for is preserved exactly.
-    ///
-    /// Same fail-open contract as [`Self::publish_peer_claim`]: a no-op
-    /// without a publisher (`safehouse.enabled` false), and a full/closed
-    /// channel drops the ad without blocking the reaper. Returns how many
-    /// claims were re-advertised (for the reaper's debug line).
-    pub fn readvertise_peer_claims(&self) -> usize {
-        if self.peer_claim_publisher.is_none() {
-            return 0;
-        }
-        let live: Vec<u32> = self
-            .entries
-            .values()
-            .filter(|info| matches!(info.state, SweepState::Running | SweepState::Pending))
-            .filter_map(|info| match info.kind {
-                SweepKind::Issue(issue) => Some(issue),
-                _ => None,
-            })
-            .collect();
-        for issue in &live {
-            self.publish_peer_claim(peer_claims::ClaimKind::Advertise, *issue);
-        }
-        live.len()
-    }
-
-    /// Evaluate this host's peer-coordination health at the current instant
-    /// (Issue #6157) — called by the reaper on its own cadence, right after
-    /// [`Self::readvertise_peer_claims`]. `None` when no view is attached
-    /// (`safehouse.enabled` false), a byte-for-byte no-op matching every
-    /// other peer-claim method's disabled-state contract.
-    ///
-    /// Multiple registries (one per managed repo, #3928) can share the SAME
-    /// injected view when they are all in one safehouse-enabled fleet
-    /// ([`crate::workspace_pool::WorkspacePool::inject_peer_coordination`]
-    /// clones one `Arc` into every provisioned registry), so more than one
-    /// reaper may call this on the same tick cadence — harmless, since
-    /// [`peer_claims::PeerClaimView::evaluate_coordination`] only changes
-    /// state when a grace/threshold boundary is actually crossed.
-    pub fn evaluate_peer_coordination(&self) -> Option<peer_claims::CoordinationEvaluation> {
-        let view = self.peer_claims.as_ref()?;
-        let grace = peer_claims::resolve_coordination_degrade_grace();
-        let threshold = peer_claims::resolve_coordination_recovery_threshold();
-        let now = Instant::now();
-        match view.lock() {
-            Ok(mut v) => Some(v.evaluate_coordination(now, grace, threshold)),
-            Err(poisoned) => {
-                log::error!("sweep_registry: peer-claim view mutex poisoned ({poisoned:?})");
-                Some(
-                    poisoned
-                        .into_inner()
-                        .evaluate_coordination(now, grace, threshold),
-                )
-            }
-        }
-    }
-
     // ------------------------------------------------------------------------
     // Per-issue dispatch backoff (Issue #4485)
     // ------------------------------------------------------------------------
@@ -1248,15 +991,6 @@ impl SweepRegistry {
             },
         );
         backoff_cause::log_armed(issue, consecutive, delay, cause);
-        // Issue #7477: broadcast the armed window fleet-wide so a peer host
-        // does not immediately re-attempt the same failing candidate this
-        // host just backed off on — see `publish_peer_cooldown_claim`'s doc
-        // comment for why this is one-shot rather than re-advertised.
-        self.publish_peer_cooldown_claim(
-            peer_claims::ClaimKind::DispatchBackoffArmed,
-            issue,
-            delay,
-        );
     }
 
     /// Clear `issue`'s dispatch-backoff record (Issue #4485) — called on any
@@ -1285,10 +1019,7 @@ impl SweepRegistry {
     /// Absolute dispatch-backoff expiry for `issue` at `now` (Issue #9311), or
     /// `None` when it may be dispatched immediately. Mirrors
     /// [`Self::dispatch_backoff_remaining`] but returns the instant itself
-    /// rather than the duration until it — this host's own local window only,
-    /// same scope as [`Self::open_pr_backoff_issues`] (not the fleet-unioned
-    /// [`Self::dispatch_backoff_issues`]): a peer-armed window's expiry is not
-    /// available here.
+    /// rather than the duration until it.
     #[must_use]
     pub fn dispatch_backoff_until(&self, issue: u32, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
         if !self.dispatch_backoff_config.enabled {
@@ -1313,24 +1044,17 @@ impl SweepRegistry {
     /// backed-off candidate never reserves a shared dispatch slot (mirroring
     /// [`quarantined_issues`](Self::quarantined_issues)).
     ///
-    /// Fleet-wide as of Issue #7477: unions this host's own local backoff
-    /// state with any live backoff window a **peer** host has broadcast (see
-    /// [`Self::fleet_dispatch_backoff_issues`]) — the fix for the fleet-scope
-    /// gap that let a multi-host fleet round-robin a claim/release bail loop
-    /// faster than a single-host backoff was designed to prevent.
+    /// Per-host only (ADR-0025): a peer host's window is not visible here.
     #[must_use]
     pub fn dispatch_backoff_issues(&self, now: DateTime<Utc>) -> HashSet<u32> {
         if !self.dispatch_backoff_config.enabled {
             return HashSet::new();
         }
-        let mut set: HashSet<u32> = self
-            .dispatch_backoff
+        self.dispatch_backoff
             .iter()
             .filter(|(_, s)| s.until > now)
             .map(|(issue, _)| *issue)
-            .collect();
-        set.extend(self.fleet_dispatch_backoff_issues());
-        set
+            .collect()
     }
 
     /// The subset of [`Self::dispatch_backoff_issues`] whose CURRENT
@@ -1339,15 +1063,6 @@ impl SweepRegistry {
     /// to its `pr-open-backoff` tick-summary counter instead of the generic
     /// `backoff-skip` when a candidate is filtered out before `dispatch()` is
     /// even called.
-    ///
-    /// This host's own local backoff state only — unlike
-    /// [`Self::dispatch_backoff_issues`], it does NOT union in a peer host's
-    /// fleet-broadcast window: [`peer_claims::ClaimKind::DispatchBackoffArmed`]
-    /// does not carry a cause, so a peer-armed window's true cause is unknown
-    /// here. Undercounting `pr-open-backoff` for a peer-armed window is a
-    /// purely cosmetic gap (the peer's own host still counts it correctly, and
-    /// the peer-armed window still refuses dispatch via `dispatch_backoff_issues`
-    /// either way) — never a correctness one.
     #[must_use]
     pub fn open_pr_backoff_issues(&self, now: DateTime<Utc>) -> HashSet<u32> {
         if !self.dispatch_backoff_config.enabled {
@@ -1358,25 +1073,6 @@ impl SweepRegistry {
             .filter(|(_, s)| s.until > now && s.cause == DispatchBackoffCause::OpenPrGuard)
             .map(|(issue, _)| *issue)
             .collect()
-    }
-
-    /// Issues with a live fleet-wide dispatch-backoff window armed by a
-    /// **peer** host (Issue #7477) — empty when no peer-claim view is
-    /// attached (`safehouse.enabled` false), mirroring
-    /// [`Self::peer_claimed_issues`]'s disabled-state contract.
-    #[must_use]
-    fn fleet_dispatch_backoff_issues(&self) -> HashSet<u32> {
-        let Some(view) = &self.peer_claims else {
-            return HashSet::new();
-        };
-        let repo = peer_claims::repo_slug(&self.config.workspace_root);
-        match view.lock() {
-            Ok(v) => v.dispatch_backoff_issues_at(&repo, Instant::now()),
-            Err(poisoned) => {
-                log::error!("sweep_registry: peer-claim view mutex poisoned ({poisoned:?})");
-                HashSet::new()
-            }
-        }
     }
 
     // ------------------------------------------------------------------------
@@ -1641,7 +1337,7 @@ impl SweepRegistry {
     /// First, lock-scoped step of a split `Issue`/`PrSet` dispatch (Issue
     /// #6592): idempotency dedup, the FULL `Issue`-kind guard chain
     /// (workspace-commands / closed-issue / open-PR / park-label / backoff /
-    /// live-claim / peer-claim), claim-lock acquisition, the forge label
+    /// live-claim), claim-lock acquisition, the forge label
     /// flip, the #3887 dispatch stagger, and finally `Command::spawn()` for
     /// the child — everything through obtaining a live [`Child`] handle.
     /// Deliberately does **not** poll the child for its account-selection log
@@ -2107,18 +1803,6 @@ impl SweepRegistry {
         //      below, this is NOT gated on `skip_label_flip`, and a refusal
         //      costs no lock, no label write, and no forge round trip.
         //
-        //      Issue #9928: it reads the FLEET-AWARE window (this host's own
-        //      ∪ any live one a peer host broadcast under #7477), not the
-        //      host-local `noop_cooldown_remaining` this guard originally
-        //      called. The work finder's advisory pre-filter has consulted the
-        //      unioned view since #7477, but THIS guard — the one every route
-        //      above funnels through, including the work finder's own — did
-        //      not, so a window armed by host A left every dispatch reaching
-        //      this point on hosts B/C/D free to re-claim the same issue
-        //      inside it: four hosts re-dispatching one unchanged tracker
-        //      issue in ~10 minutes, the exact round-robin #7477 exists to
-        //      stop. See `noop_cooldown_dispatch_block`'s own doc comment.
-        //
         //      Placed AFTER the 2.7 park-label guard, deliberately: when an
         //      issue is both parked and mid-cooldown, the park is the more
         //      actionable, durable operator decision and must win — this
@@ -2133,8 +1817,8 @@ impl SweepRegistry {
         if let Some(remaining) = self.noop_cooldown_dispatch_block(issue_number, Utc::now()) {
             log::info!(
                 "sweep_registry: refusing to dispatch issue #{issue_number} — a live no-op \
-                 release cooldown is armed on this host or a fleet peer, {}s remaining \
-                 (#6670/#6917/#9928 noop-cooldown guard); the last sweep found nothing had \
+                 release cooldown is armed on this host, {}s remaining \
+                 (#6670/#6917 noop-cooldown guard); the last sweep found nothing had \
                  changed since its previous check.",
                 remaining.as_secs()
             );
@@ -2247,50 +1931,6 @@ impl SweepRegistry {
             .into());
         }
 
-        // 2.95 Peer-claim guard (Issue #5789, upgrading #4028's soft claim from
-        //      detection into enforcement). `self.peer_claimed_issues()` is a
-        //      free, in-memory lookup — no `gh` round trip, no lock, nothing to
-        //      unwind — fed by the safehouse coordination task's inbound read
-        //      of peer advertisements. If a **peer** host (never this host's own
-        //      ad — `PeerClaimView::observe_at` ignores self-claims) still has a
-        //      live claim on this issue, dispatching here would duplicate a
-        //      sweep another host already started. This closes the same gap for
-        //      every `dispatch()` call site (work-finder, epic supervisor,
-        //      IPC/CLI, all three watchdogs) that the work-finder's own
-        //      pre-tick `peer_claimed()` filter only ever covered for ITS one
-        //      route (#4028's original scope).
-        //
-        //      A no-op (empty set) when no view is attached (`safehouse.enabled`
-        //      false) or the mutex is poisoned — same fail-open contract as
-        //      `peer_claimed_issues` itself, so a safehouse outage can never
-        //      wedge dispatch.
-        if self.peer_claimed_issues().contains(&issue_number) {
-            self.collision_count += 1;
-            // #5921: the proof-of-mechanism counter — a peer-claim view can
-            // be non-empty (received > 0) yet never actually prevent a
-            // duplicate if this guard were ever bypassed; this increments
-            // exactly when it did.
-            if let Some(view) = &self.peer_claims {
-                match view.lock() {
-                    Ok(mut v) => v.record_dispatch_skipped(),
-                    Err(poisoned) => poisoned.into_inner().record_dispatch_skipped(),
-                }
-            }
-            log::warn!(
-                "sweep_registry: BACKING OFF dispatch of issue #{issue_number} — a peer host's \
-                 soft-claim advertisement is still live for this issue (#4028/#5789 peer-claim \
-                 enforcement, running collision count={count}). Refusing to duplicate a sweep \
-                 another host already claimed; no lock was acquired and no advertisement was \
-                 published by this host for this issue.",
-                count = self.collision_count,
-            );
-            return Err(CollisionDispatchError {
-                issue: issue_number,
-                source: CollisionSource::PeerClaim,
-            }
-            .into());
-        }
-
         // 2.98 Disk admission (#11191): the repo's measured disk charge must fit
         //      the free space left after the halt floor and the growth the
         //      in-flight sweeps are still expected to write. Last of the guards,
@@ -2323,15 +1963,6 @@ impl SweepRegistry {
                 .insert(key.clone(), sweep_id.clone());
         }
 
-        // 3a. Soft cross-host claim (Issue #4028): advertise this claim over the
-        //     shared safehouse room **before** the non-atomic label flip below,
-        //     so a peer daemon backs off far faster than the `loom:building`
-        //     label propagates. Best-effort, non-blocking, fail-open (a no-op
-        //     when `safehouse.enabled` is false) — the room broadcast is a soft
-        //     claim/fast backoff, NOT a mutex; the forge label remains the
-        //     human-visible claim signal and Phase 2 is the atomic authority.
-        self.publish_peer_claim(peer_claims::ClaimKind::Advertise, issue_number);
-
         // 4. Flip the forge label loom:issue -> loom:building (best-effort
         //    when the dispatcher has gh credentials; tests opt out via
         //    `skip_label_flip`).
@@ -2360,20 +1991,15 @@ impl SweepRegistry {
             //     one extra `gh issue view` round trip), so the disabled flip
             //     path stays byte-for-byte unchanged. Must run BEFORE the flip:
             //     once this host flips, a collided issue is indistinguishable
-            //     from a clean one — and this is also the fallback net for the
-            //     race the cheaper 2.95 peer-claim guard above can miss (no
-            //     safehouse view attached, or the peer's ad simply hadn't
-            //     arrived yet): a host that proceeded past 2.95 still gets
-            //     caught — and logged — here when the collision is confirmed
-            //     against the forge's own label state.
+            //     from a clean one.
             if let Some(CollisionClass::Collision { labels }) =
                 self.detect_and_record_collision(issue_number)
             {
                 log::warn!(
                     "sweep_registry: BACKING OFF dispatch of issue #{issue_number} — the \
                      pre-flip forge-label read confirmed another host already claimed it \
-                     (#4085/#5789 enforcement); reverting the claim lock and peer-claim \
-                     advertisement this host had already applied instead of flipping the label \
+                     (#4085/#5789 enforcement); reverting the claim lock this host had \
+                     already applied instead of flipping the label \
                      and duplicating the sweep."
                 );
                 // #9572: also releases the in-flight idempotency key (3.05).
@@ -2437,8 +2063,7 @@ impl SweepRegistry {
         //     reverting it here would destroy the earlier claimant's only
         //     cross-host mutex out from under its still-live sweep — the
         //     loom#5270 failure mode). Only this host's own, purely local
-        //     side effects are unwound: the peer-claim advertisement (3a)
-        //     and the claim lock (3), mirroring the #5236/#4689 unwind
+        //     side effect is unwound: the claim lock (3), mirroring the #5236/#4689 unwind
         //     branches below for every side effect this dispatch attempt
         //     itself controls exclusively.
         if let Some((earliest_host, earliest_sweep_id)) = lease_order_yield {
@@ -2450,7 +2075,6 @@ impl SweepRegistry {
                  `loom:building` (#9453 Phase 3.1). Standing down before spawning a builder; the \
                  label is left in place since it already protects the winning claimant's claim."
             );
-            self.publish_peer_claim(peer_claims::ClaimKind::Retract, issue_number);
             let _ = self.release_lock_owned(issue_number, &sweep_id);
             // #10345: a leaseless yield whose `loom:building` event is provably
             // this dispatcher's own flip (fleet actor, inside the flip window,
@@ -2546,8 +2170,8 @@ impl SweepRegistry {
                 // process is ever spawned). Unlike the #4689 branch in
                 // `finish_issue_dispatch`, this is a synchronous `Err`, not a
                 // synchronously-observed dead child — but the side effects
-                // already applied above (claim lock, peer-claim
-                // advertisement, label flip) are identical, and leaving them
+                // already applied above (claim lock, label flip) are
+                // identical, and leaving them
                 // in place is exactly what wedges every retry: the leaked
                 // lock's `owner_pid` is this daemon's own (still-alive) pid,
                 // which the #4556 live-claim guard then reads as a
@@ -2557,7 +2181,7 @@ impl SweepRegistry {
                 // starts from a clean slate instead of a permanent wedge.
                 log::warn!(
                     "sweep_registry: issue #{issue_number} sweep_id={sweep_id} failed to spawn \
-                     — reverting the claim lock, label, and peer-claim advertisement instead of \
+                     — reverting the claim lock and label instead of \
                      leaking them (#5236): {e:#}"
                 );
                 if !self.config.skip_label_flip {
@@ -2596,7 +2220,7 @@ impl SweepRegistry {
     /// WITHOUT the registry mutex held, between the two lock-scoped steps).
     ///
     /// On a confirmed preflight death (token selection failed), unwinds the
-    /// claim lock / label flip / peer-claim advertisement exactly like
+    /// claim lock / label flip exactly like
     /// `begin_issue_dispatch`'s own spawn-failure branch, and returns `Err`.
     /// On success, records the entry, the sweep journal, and the
     /// `sweep.global.dispatch` event, then returns the same
@@ -2639,8 +2263,7 @@ impl SweepRegistry {
         // bookkeeping below (`self.children`/`self.entries` insert, sweep
         // journal record, `sweep.global.dispatch` event) has happened, so the
         // only side effects to unwind are the ones already applied by
-        // `begin_issue_dispatch`: the peer-claim advertisement (3a), the
-        // label flip (4), and the claim lock (3). Reverting those returns the
+        // `begin_issue_dispatch`: the label flip (4) and the claim lock (3). Reverting those returns the
         // issue to exactly the pre-dispatch state, and the caller gets a real
         // `Err` — surfaced by both the CLI (`Daemon rejected the dispatch:
         // ...`) and `mcp__loom__dispatch_sweep` (`Failed`) — instead of a
@@ -2660,7 +2283,6 @@ impl SweepRegistry {
                 let _ = self.restore_label_to_ready(issue_number);
                 self.note_label_flip(issue_number); // #4485 flap detection
             }
-            self.publish_peer_claim(peer_claims::ClaimKind::Retract, issue_number);
             let _ = self.release_lock_owned(issue_number, &sweep_id);
             // Issue #6614: this path returns BEFORE any `entries` record exists,
             // so the reaper never sees this death — and therefore neither the
@@ -3514,12 +3136,6 @@ mod tests;
 // note on this pattern.
 #[cfg(test)]
 mod idempotency_inflight_tests;
-
-// Issue #9928's fleet-aware noop-cooldown guard coverage. A sibling module for
-// the same reason as `idempotency_inflight_tests` above: `dispatch/tests.rs` is
-// over the file-size ratchet threshold.
-#[cfg(test)]
-mod fleet_noop_cooldown_tests;
 
 // Issue #9984's forge-egress dispatch admission coverage — a sibling module
 // for the same reason as the two above.

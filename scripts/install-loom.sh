@@ -2109,8 +2109,7 @@ echo ""
 #
 # setup-mcp.sh is still run first, but in its DEMOTED role: it builds the bundle
 # (what the user-scope server serves), strips any legacy project-scope `loom`
-# entry so it cannot shadow the user-scope server, and emits a safehouse-only
-# .mcp.json when safehouse is enabled.
+# entry so it cannot shadow the user-scope server.
 info "Building the mcp-loom bundle and migrating any legacy .mcp.json (demoted setup-mcp.sh)..."
 if "$LOOM_ROOT/scripts/setup-mcp.sh"; then
   success "mcp-loom bundle built; legacy .mcp.json migrated (loom is now user-scoped)"

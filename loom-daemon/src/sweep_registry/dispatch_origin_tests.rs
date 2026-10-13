@@ -4,9 +4,9 @@
 //!
 //! One test per in-process dispatch path (work finder, epic supervisor,
 //! watchdog, reaper) drives that path's real caller and reads the origin off
-//! the sweep's start facts. The IPC paths (operator CLI, MCP, ChatOps, legacy
-//! clients) are covered in `ipc/tests/dispatch_origin.rs`,
-//! `cli/dispatch.rs` and `safehouse_chatops/tests.rs`.
+//! the sweep's start facts. The IPC paths (operator CLI, MCP, legacy
+//! clients) are covered in `ipc/tests/dispatch_origin.rs` and
+//! `cli/dispatch.rs`.
 
 use super::*;
 use crate::sweep_registry::test_support::*;

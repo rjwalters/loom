@@ -157,14 +157,12 @@ pub fn body(ctx: &Context) -> String {
 
 /// Record that this outage has been escalated, so later ticks do not refile.
 ///
-/// #8649: shares the same failure-reporting fix as
-/// [`super::peer_coord::write_sentinel`] — a failed write here used to vanish
+/// #8649: a failed write here used to vanish
 /// via `let _ =`, so a still-open outage would refile every tick for as long
 /// as the write kept failing (e.g. a full disk). This now reports the failure
 /// loudly instead of discarding it.
 ///
-/// FAILS OPEN, same as before and for the same reason as its peer-coordination
-/// sibling: the outage issue itself was already filed by the caller (a network
+/// FAILS OPEN: the outage issue itself was already filed by the caller (a network
 /// call, independent of this write), so blocking or retrying here would only
 /// trade "occasionally duplicated" for "occasionally silent".
 pub fn write_sentinel(sentinel: &Path, reporter: &report::Reporter) {

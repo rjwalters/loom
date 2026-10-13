@@ -289,73 +289,9 @@ pub fn spawn_reaper_task(registry: Arc<Mutex<SweepRegistry>>) -> tokio::task::Jo
             // releases the mutex for that poll internally, taking/dropping
             // the lock itself as needed.
             let changed = reap_once_releasing_poll_lock(&registry);
-            match registry.lock() {
-                Ok(r) => {
-                    // Peer-claim heartbeat (#4431): re-advertise every
-                    // live claim each reaper tick so it never expires
-                    // from peers' views mid-run, now that label
-                    // reconciliation is a slow healing cadence on
-                    // safehouse-enabled hosts. Runs after `reap_once` so
-                    // a just-reaped (dead) sweep is never re-advertised.
-                    let readvertised = r.readvertise_peer_claims();
-                    if readvertised > 0 {
-                        // #5921: promoted from `debug!` — at the default
-                        // log level this heartbeat was previously
-                        // invisible, making every duplicate-dispatch
-                        // report undiagnosable ("did the re-advertise
-                        // path even run?"). The running count is also
-                        // now visible without log-scraping via
-                        // `PeerClaimStatus::advertised`
-                        // (`loom-daemon status` / `loom-daemon
-                        // peer-claims`).
-                        log::info!(
-                            "sweep_registry: re-advertised {readvertised} live peer \
-                             claim(s) (#4431)"
-                        );
-                    }
-                    // Liveness heartbeat (Issue #8736): published every tick
-                    // regardless of live-sweep count — unlike the
-                    // dispatch-claim re-advertise above, which only fires for
-                    // `Running`/`Pending` entries. Closes the converse of the
-                    // #8026 idle gate: this host busy, its peers idle. Silent
-                    // by design (no per-tick log line) — see
-                    // `heartbeat_broadcast`'s module doc for the cost/cadence
-                    // tradeoff.
-                    r.publish_peer_heartbeat();
-                    // Peer-coordination health (Issue #6157): evaluate on
-                    // this same cadence, right after re-advertising, so
-                    // the DEGRADED grace window is measured in reaper-tick
-                    // units. Only log on an actual transition — every
-                    // other tick would just repeat the same verdict.
-                    // Diagnostic-only as of Epic #6165 Phase 4 (#6317):
-                    // this verdict no longer gates stale-claim
-                    // reclamation (the lease record, #6286, is the sole
-                    // fleet-scoped gate for that) — it purely surfaces
-                    // whether the peer-claim/safehouse advertisement
-                    // channel itself looks healthy, for
-                    // `loom-daemon health`/`status`.
-                    if let Some(eval) = r.evaluate_peer_coordination() {
-                        if eval.transitioned {
-                            if eval.degraded {
-                                log::warn!(
-                                    "sweep_registry: peer coordination DEGRADED — {} \
-                                     (#6157, diagnostic-only since #6317)",
-                                    eval.reason
-                                );
-                            } else {
-                                log::info!(
-                                    "sweep_registry: peer coordination RECOVERED — {} \
-                                     (#6157)",
-                                    eval.reason
-                                );
-                            }
-                        }
-                    }
-                }
-                Err(poisoned) => {
-                    log::error!("sweep_registry: mutex poisoned ({poisoned:?})");
-                    return;
-                }
+            if let Err(poisoned) = registry.lock() {
+                log::error!("sweep_registry: mutex poisoned ({poisoned:?})");
+                return;
             }
             if changed > 0 {
                 log::info!(
@@ -1262,10 +1198,8 @@ impl SweepRegistry {
                                 // filed this issue. Neither arm nor clear it;
                                 // arm the HOST-level pool hold instead, which
                                 // holds every issue at once.
-                                self.broadcast_pool_hold(
-                                    crate::work_finder::pool_preflight::note_pool_dead(
-                                        &self.config.workspace_root,
-                                    ),
+                                crate::work_finder::pool_preflight::note_pool_dead(
+                                    &self.config.workspace_root,
                                 );
                             } else if insta_crash {
                                 self.charge_dispatch_failure(&sweep_id, issue);
@@ -1958,10 +1892,8 @@ impl SweepRegistry {
                             // host-level pool hold is armed instead; see the
                             // sibling carve-out in the crashed branch above.
                             if pool_dead {
-                                self.broadcast_pool_hold(
-                                    crate::work_finder::pool_preflight::note_pool_dead(
-                                        &self.config.workspace_root,
-                                    ),
+                                crate::work_finder::pool_preflight::note_pool_dead(
+                                    &self.config.workspace_root,
                                 );
                             } else if insta_crash || no_progress || yielded_open_pr {
                                 self.charge_dispatch_failure(&sweep_id, issue);

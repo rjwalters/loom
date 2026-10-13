@@ -1,8 +1,8 @@
 //! Issue #11112 (slice 1): what the forge lease ALONE does, and does not,
 //! guarantee across two hosts.
 //!
-//! Loom is dropping its Matrix (safehouse) peer-claim side channel. That
-//! channel was only a soft pre-flip advisory; the cross-host claim has always
+//! Loom dropped its Matrix peer-claim side channel (#11112). That channel
+//! was only a soft pre-flip advisory; the cross-host claim has always
 //! been the forge `loom:lease` comment plus the claim-then-verify-order
 //! tie-break ([`SweepRegistry::resolve_lease_order`]). This file pins the
 //! behaviour of that tie-break with nothing else in play:
@@ -11,8 +11,8 @@
 //!   the two share **no** local state (no claim lock, no journal);
 //! - each runs under its own `LOOM_HOST_ID`, so it recognises only its own
 //!   lease record, exactly like two machines;
-//! - neither has a peer-claim publisher (safehouse is off by default), so the
-//!   only thing the two can both see is the forge's `loom:lease` comment list.
+//! - there is no side channel at all, so the only thing the two can both see
+//!   is the forge's `loom:lease` comment list.
 //!
 //! **What is verified here is a narrower property than "two hosts never build
 //! one issue at once".** When both hosts' leases are visible to each host
@@ -93,10 +93,6 @@ fn decide_seeing(
     let _id = HostIdGuard::set(host);
     let workspace = tempdir().unwrap();
     let registry = fixture_registry_with_lease_gh(workspace.path(), forge, exit);
-    assert!(
-        registry.peer_claim_publisher.is_none(),
-        "the proof must not lean on the safehouse peer-claim channel"
-    );
     assert_eq!(registry.published_host_id(), opaque_host_id(host));
     registry.resolve_lease_order(ISSUE, sweep, episode_start)
 }
@@ -229,7 +225,6 @@ fn share_comment_store(
 /// Dispatch `ISSUE` on `host`'s registry; returns whether a builder spawned.
 fn dispatch_spawns(host: &str, registry: &mut SweepRegistry, spawn_log: &std::path::Path) -> bool {
     let _id = HostIdGuard::set(host);
-    assert!(registry.peer_claim_publisher.is_none());
     match registry.dispatch(&SweepKind::Issue(ISSUE), None, None, None, None) {
         Ok(_) => wait_for_contents(spawn_log, "spawned", FIXTURE_CHILD_WAIT_MS),
         Err(err) => {

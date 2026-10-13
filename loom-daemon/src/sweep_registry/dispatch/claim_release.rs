@@ -2,17 +2,16 @@
 //! hold that file at its file-size ratchet (Issue #11304).
 //!
 //! - [`SweepRegistry::unwind_local_claim`]: undo this dispatch attempt's own
-//!   purely local side effects (peer-claim advertisement, claim lock,
-//!   in-flight idempotency key) — shared by every abandon branch whose unwind
-//!   is exactly those three steps in that order.
+//!   purely local side effects (claim lock, in-flight idempotency key) —
+//!   shared by every abandon branch whose unwind is exactly those two steps
+//!   in that order.
 //! - [`SweepRegistry::release_claim_if_closed_after_flip`]: step 4e, the
 //!   post-claim closed-issue re-verification.
 
 use super::*;
 
 impl SweepRegistry {
-    /// Retract this host's peer-claim advertisement (3a), release the claim
-    /// lock (3) it owns, and — #9572 — release the in-flight idempotency key
+    /// Release the claim lock (3) this host owns, and — #9572 — release the in-flight idempotency key
     /// claimed at step 3.05 so a later same-key dispatch is not wedged behind
     /// a sweep that never spawned.
     pub(super) fn unwind_local_claim(
@@ -21,7 +20,6 @@ impl SweepRegistry {
         sweep_id: &str,
         idempotency_key: Option<&String>,
     ) {
-        self.publish_peer_claim(peer_claims::ClaimKind::Retract, issue_number);
         let _ = self.release_lock_owned(issue_number, sweep_id);
         if let Some(key) = idempotency_key {
             self.inflight_idempotency.remove(key);

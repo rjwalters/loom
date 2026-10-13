@@ -4176,15 +4176,15 @@ W73="$BASE_WORKDIR/w73"
 BARE73="$BASE_WORKDIR/w73-origin.git"
 new_fixture_with_origin "$W73" "$BARE73"
 mkdir -p "$W73/.loom"
-printf '{"safehouse":{"enabled":true}}\n' > "$W73/.loom/config.json"
+printf '{"observability":{"enabled":true}}\n' > "$W73/.loom/config.json"
 ( cd "$W73" && git add .loom/config.json && git -c user.email=test@test -c user.name=test commit -q -m "track legacy config" && git push -q origin HEAD:refs/heads/main )
 TMPCLONE73="$(mktemp -d)"
 git clone -q "$BARE73" "$TMPCLONE73"
-printf '{"safehouse":{"enabled":true,"room":"loom-fleet"}}\n' > "$TMPCLONE73/.loom/config.json"
+printf '{"observability":{"enabled":true,"endpoint":"loom-fleet"}}\n' > "$TMPCLONE73/.loom/config.json"
 ( cd "$TMPCLONE73" && git commit -aq -m "origin updates the tracked config" && git push -q origin HEAD:refs/heads/main )
 rm -rf "$TMPCLONE73"
-# The host's deliberate, host-specific edit: safehoused is not provisioned here.
-printf '{"safehouse":{"enabled":false}}\n' > "$W73/.loom/config.json"
+# The host's deliberate, host-specific edit: no exporter is provisioned here.
+printf '{"observability":{"enabled":false}}\n' > "$W73/.loom/config.json"
 HEAD_BEFORE73="$(cd "$W73" && git rev-parse --short HEAD)"
 out73=$( cd "$W73" && PATH="$TEST_PATH" bash "$UPDATE_SCRIPT" --auto-resolve-safe-abort 2>&1 )
 rc73=$?

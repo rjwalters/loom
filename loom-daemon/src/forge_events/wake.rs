@@ -42,7 +42,7 @@
 //!    spent after the previous tick of *either* kind, so the early-tick path
 //!    can never raise a loop's forge-request rate above
 //!    `interval / min_spacing` times its configured cadence — 2x for the work
-//!    finder, up to 60x for the slowest claim-reconciliation cadence (the
+//!    finder, up to 20x for the slowest claim-reconciliation cadence (the
 //!    per-loop table is on [`DEFAULT_MIN_SPACING_SECS`]), and never a new
 //!    endpoint or a new rate-limit envelope.
 //!
@@ -136,12 +136,11 @@ pub const MIN_SPACING_SECS_ENV: &str = "LOOM_FORGE_EVENTS_WAKE_MIN_SPACING_SECS"
 /// | work finder ([`crate::work_finder::DEFAULT_WORK_FINDER_INTERVAL_SECS`]) | 60s | 2x |
 /// | watch monitor ([`crate::watch_registry::DEFAULT_WATCH_MONITOR_INTERVAL_SECS`]) | 120s | 4x |
 /// | claim reconciliation ([`crate::claim_reconciliation::DEFAULT_RECONCILE_INTERVAL_SECS`]) | 600s | 20x |
-/// | claim reconciliation, safehouse host ([`crate::claim_reconciliation::DEFAULT_SAFEHOUSE_RECONCILE_INTERVAL_SECS`]) | 1800s | 60x |
 ///
 /// A multiplier is a *ceiling that needs a saturated feed to reach*, not an
 /// expectation: it costs one extra pass per 30s only while qualifying pages
 /// keep arriving, over the same endpoints and the same #4429 breaker. But 20x
-/// and 60x are the numbers to hold against a measured pass cost before
+/// is the number to hold against a measured pass cost before
 /// defaulting the claim-reconciliation consumer on — that pass is the heaviest
 /// `gh` consumer of the three (a workspace reconcile plus PR-claim and
 /// PR-verdict reconciles, per registered workspace root).

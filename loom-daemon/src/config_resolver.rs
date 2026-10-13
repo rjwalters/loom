@@ -134,7 +134,7 @@ pub(crate) fn soft_read_json_object(path: &Path) -> Value {
 
 /// A loud, top-of-boot-block diagnosis of the **legacy** `.loom/config.json`
 /// tier only (#6499) — the one tier every existing repo actually has
-/// populated, and the one a host-local patch (e.g. `safehouse.socket`,
+/// populated, and the one a host-local patch (e.g.
 /// `observability.ingestKeyFile`, `daemon.delegatedTo`) lives in today ahead
 /// of #5457's durable fix. `resolve_effective_config`'s own
 /// [`soft_read_json_object`] already soft-fails a parse error to `{}` at
@@ -553,7 +553,7 @@ mod tests {
         let dir = tempdir().unwrap();
         write(
             &dir.path().join(LEGACY_CONFIG_REL),
-            "{\n  \"safehouse\": {\n<<<<<<< Updated upstream\n    \"room\": \"a\"\n=======\n    \"room\": \"b\"\n>>>>>>> Stashed changes\n  }\n}\n",
+            "{\n  \"observability\": {\n<<<<<<< Updated upstream\n    \"room\": \"a\"\n=======\n    \"room\": \"b\"\n>>>>>>> Stashed changes\n  }\n}\n",
         );
         let diagnosis = diagnose_legacy_config(dir.path());
         assert!(diagnosis.is_some());

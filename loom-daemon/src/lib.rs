@@ -54,8 +54,7 @@
 //!   isolation makes leakage invisible under nextest but not under `cargo test`.
 //! * **Do not depend on a var being *absent*.** Process isolation gives you the
 //!   *real* ambient environment, not a sibling test's leftovers. A test that
-//!   needs `$LOOM_*` unset must clear it itself (see
-//!   `workspace_pool::tests::clear_safehouse_env`) — any agent session spawned by
+//!   needs `$LOOM_*` unset must clear it itself — any agent session spawned by
 //!   a running daemon exports a pile of `LOOM_*` vars.
 //! * **Prefer an explicit seam over an env var** where one exists (e.g. pass a
 //!   `gh` binary path in with `with_gh_bin`, take a root `&Path` argument). A
@@ -290,7 +289,6 @@ pub mod orphan_process_reaper;
 pub mod overlap_replay;
 pub mod parent_link;
 pub mod park_record;
-pub mod peer_claims;
 pub mod phase_join;
 pub mod pi_usage;
 pub mod pipeline_snapshot;
@@ -328,6 +326,7 @@ pub mod repo_root;
 pub mod restart_verify;
 /// Fork-point provenance for `.loom/resync-ignore` pins (#8726).
 pub mod resync_pin;
+pub mod retired_config;
 pub mod retry_classify;
 /// The `sweep.outcome` rework-event marker protocol (#9444): where the file
 /// lives, the `kind` vocabulary, the substantive/environmental table, and the
@@ -350,7 +349,6 @@ pub mod runtime_launch;
 pub mod runtime_preference;
 #[cfg(test)]
 pub(crate) mod runtime_selection_test_support;
-pub mod safehouse;
 pub mod scratch_reclaim;
 pub mod script_helpers;
 /// Content scan for credential-shaped values before commit/push (#9133).

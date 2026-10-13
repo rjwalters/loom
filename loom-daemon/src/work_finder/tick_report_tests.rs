@@ -184,7 +184,9 @@ fn collisions_and_claim_lock_contention_get_their_own_reasons() {
     let mut report = TickReport::default();
     let collision: Result<bool> = Err(CollisionDispatchError {
         issue: 1,
-        source: CollisionSource::PeerClaim,
+        source: CollisionSource::ForgeLabel {
+            labels: vec!["loom:building".to_string()],
+        },
     }
     .into());
     let lock: Result<bool> = Err(ClaimLockDispatchError {

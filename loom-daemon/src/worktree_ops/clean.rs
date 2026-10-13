@@ -3058,7 +3058,7 @@ pub enum ArtifactOutcome {
 /// had only [`crate::deep_clean::exe_is_inside_artifacts`] — a comparison
 /// against `current_exe()` that protects loom-daemon's own binary and nothing
 /// else. A 4-hourly `clean --deep --safe -y` therefore unlinked a live
-/// `safehoused` on a fleet host, which kept running from the deleted inode for
+/// service daemon on a fleet host, which kept running from the deleted inode for
 /// three days and would have failed on its next start.
 ///
 /// It is an **ungated floor**, with no `--force` override and no config toggle:

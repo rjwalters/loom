@@ -18,7 +18,7 @@
 //!    credential dir), so the reading belongs to the credential that was
 //!    refused rather than the host's ambient one. The reading is filtered by
 //!    [`super::evidence::from_probe`]. [`ProbeMode::Background`] runs this on
-//!    a detached thread so an async caller (safehouse's event loop) or the
+//!    a detached thread so an async caller (an event loop) or the
 //!    dispatch path never waits on a bounded-but-slow `gh`.
 
 use std::fmt;

@@ -728,7 +728,7 @@ jobs:
       # abandoned `git stash pop` left live conflict markers in the tracked
       # `.loom/config.json`, a later `chore: resync installed Loom surfaces`
       # pass COMMITTED them, and the daemon then silently ran on built-in
-      # defaults (observability/safehouse/roleRunner config lost) for ~70
+      # defaults (observability/roleRunner config lost) for ~70
       # minutes. Every other detector is blind to the committed case:
       # check-main-clean.sh (#6162 AC3) and primary_checkout_reaper key on an
       # unmerged INDEX entry, which a commit clears; check-shell-syntax.sh
@@ -903,7 +903,7 @@ jobs:
 
       # component: Config Host-Path Guard
       # Cheap structural check; always runs. #6504: a per-host absolute path
-      # (observability.ingestKeyFile, safehouse.socket, …) committed into the
+      # (observability.ingestKeyFile, worktree.root, …) committed into the
       # TRACKED .loom/config.json is correct on at most one host and silently
       # wrong on every other one that `git pull`s it — this recurred three
       # times (#5354, #5464, #6499's config half) before this guard existed.
@@ -923,7 +923,7 @@ jobs:
       # FROM defaults/docs/ (resync-installed.sh), so a doc authored only in
       # .loom/docs/ never ships, and a defaults/docs/ link to a sibling that only
       # exists in .loom/docs/ is a dead link in every install — this happened
-      # twice (safehouse.md, token-pool.md) before anything caught it (#4841).
+      # twice (a since-retired fleet-comms doc, token-pool.md) before anything caught it (#4841).
       # The self-test step regression-tests the checker itself against a
       # synthetic fixture reproducing that exact case.
       - name: Self-test the checker against a synthetic fixture
@@ -2017,16 +2017,6 @@ jobs:
       - name: spawn-* session identity is not inherited by the agent (#10830)
         if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-spawn-session-env.sh
-      # #9517: fleet-send.sh is a thin SILENT stub over `loom-daemon
-      # fleet-send` (its whole interface is a best-effort exit 0, so it
-      # bypasses lib/script-helper.sh's loud missing-daemon path). The suite
-      # pins the working-tree binary via lib/require-daemon-bin.sh — it needs
-      # this job's shared build, not shell-suite-tests' toolchain-free
-      # runner — and was moved out of shell-suite-tests/ci-wired.txt for
-      # exactly that reason.
-      - name: fleet-send safehouse envelope (#9517)
-        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
-        run: bash defaults/scripts/tests/test-fleet-send.sh
       - name: merge-pr close-triggered loom:blocked re-check (#9102)
         if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-notify-cleared-blockers.sh

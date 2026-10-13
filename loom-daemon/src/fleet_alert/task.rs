@@ -34,8 +34,8 @@ pub fn render_body(t: &Transition) -> String {
     }
 }
 
-/// Event-bus sink: relayed into Matrix by the Safehouse sink as an
-/// `operator_priority.escalation` handoff line (issue number 0 = fleet-wide).
+/// Event-bus sink: publishes an `operator_priority.escalation` event (issue
+/// number 0 = fleet-wide) for bus subscribers.
 pub struct BusSink(pub Arc<crate::event_bus::EventBus>);
 
 impl AlertSink for BusSink {
@@ -55,7 +55,7 @@ impl AlertSink for BusSink {
             inherited_from: None,
             resolved: t.kind == Kind::Cleared,
         };
-        // No subscriber (Safehouse off) is not a failure.
+        // No subscriber is not a failure.
         let _ = self.0.publish(event);
         Ok(())
     }

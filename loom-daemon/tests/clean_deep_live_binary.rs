@@ -12,8 +12,9 @@
 //! `… (deleted)`) — so the damage is invisible until the next restart, where
 //! the supervisor cannot exec a missing path.
 //!
-//! The confirmed repro on `loom-worker-1`: `safehoused` ran for ~3 days on a
-//! deleted `target/release/safehoused` after a routine 4-hourly pass.
+//! The confirmed repro on `loom-worker-1`: a co-located service daemon ran for
+//! ~3 days on its deleted `target/release/` binary after a routine 4-hourly
+//! pass.
 //!
 //! `deep_clean.rs`'s pre-existing `exe_is_inside_artifacts` gate only ever
 //! compared against `std::env::current_exe()` — it protects loom-daemon's *own*

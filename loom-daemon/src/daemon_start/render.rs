@@ -672,13 +672,7 @@ pub fn warn_dropped_env_keys(
         old_file.display()
     ));
     for k in &dropped {
-        if k.starts_with("LOOM_SAFEHOUSE_") {
-            out::warn(&format!(
-                "  - {k} (config-tier equivalent: the \"safehouse\" block in .loom/config.json + --from-config, #4353)"
-            ));
-        } else {
-            out::warn(&format!("  - {k}"));
-        }
+        out::warn(&format!("  - {k}"));
     }
     out::warn(
         "This usually means this invocation ran without the operator's exported env (a watchdog / automated re-render / a bare re-run from a different shell).",
@@ -872,22 +866,12 @@ mod tests {
         let old = dir.path().join("old.plist");
         std::fs::write(
             &old,
-            launchd_plist(
-                "l",
-                "/b",
-                "/w",
-                "/lg",
-                "/p",
-                "/h",
-                &pairs(&[("LOOM_SAFEHOUSE_ENABLED", "1")]),
-            ),
+            launchd_plist("l", "/b", "/w", "/lg", "/p", "/h", &pairs(&[("LOOM_WORK_FINDER", "1")])),
         )
         .expect("write");
         let new = launchd_plist("l", "/b", "/w", "/lg", "/p", "/h", &[]);
         let merged = warn_dropped_env_keys(&old, "/tmp/new.plist", &new, Mechanism::Launchd, false);
-        assert!(merged
-            .new_text
-            .contains("<key>LOOM_SAFEHOUSE_ENABLED</key>"));
+        assert!(merged.new_text.contains("<key>LOOM_WORK_FINDER</key>"));
         assert!(merged.new_text.contains("<string>1</string>"));
     }
 
@@ -897,13 +881,13 @@ mod tests {
         let old = dir.path().join("old.service");
         std::fs::write(
             &old,
-            systemd_unit("/b", "/w", "/lg", "/p", "/h", &pairs(&[("LOOM_SAFEHOUSE_ENABLED", "1")])),
+            systemd_unit("/b", "/w", "/lg", "/p", "/h", &pairs(&[("LOOM_WORK_FINDER", "1")])),
         )
         .expect("write");
         let new = systemd_unit("/b", "/w", "/lg", "/p", "/h", &[]);
         let merged =
             warn_dropped_env_keys(&old, "/tmp/new.service", &new, Mechanism::Systemd, true);
-        assert!(!merged.new_text.contains("LOOM_SAFEHOUSE_ENABLED"));
+        assert!(!merged.new_text.contains("LOOM_WORK_FINDER"));
     }
 
     #[test]

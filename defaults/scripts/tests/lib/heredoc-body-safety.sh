@@ -180,14 +180,14 @@ read_d_with_triggers() {
     # A comment quoting body="$(cat <<EOF ... EOF)" must not be mistaken
     # for the opener.
     IFS= read -r -d '' body <<EOF || true
-This host's peer-claim path (Safehouse, #6157)
+This host's claim path (Lease, #6157)
 See \`advertised\` (#1270) for the suspected cause.
 EOF
 }
 
 cmdsubst_with_triggers() {
     body="$(cat <<EOF
-This host's peer-claim path (Safehouse, #6157)
+This host's claim path (Lease, #6157)
 See \`advertised\` (#1270) for the suspected cause.
 EOF
 )"
@@ -195,7 +195,7 @@ EOF
 
 cmdsubst_clean() {
     body="$(cat <<EOF
-This host has a peer-claim path (Safehouse, see 6157)
+This host has a claim path (Lease, see 6157)
 See the advertised counter for the suspected cause.
 EOF
 )"

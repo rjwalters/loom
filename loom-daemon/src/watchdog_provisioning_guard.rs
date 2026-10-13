@@ -435,9 +435,8 @@ mod tests {
     /// such a host it resolves to the real (present) marker instead of the
     /// tempdir fixture these "marker absent" tests are built around. Save/clear
     /// it for the duration of the test and restore whatever the host had on
-    /// exit (even on panic), the same guard-on-Drop idiom `safehouse.rs` uses
-    /// for the analogous `LOOM_SAFEHOUSE_ROOM` ambient-state hazard (#5805,
-    /// commit a1428779).
+    /// exit (even on panic) — a guard-on-Drop for an ambient-state hazard
+    /// (#5805).
     struct RestoreAmbientAutonomyMarker(Option<String>);
     impl RestoreAmbientAutonomyMarker {
         fn clear() -> Self {
