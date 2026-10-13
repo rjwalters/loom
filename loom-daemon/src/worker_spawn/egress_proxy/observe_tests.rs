@@ -639,6 +639,7 @@ fn attributed_runtime(config: &serde_json::Value) -> (String, String) {
         header: HeaderStyle::AuthorizationBearer,
         base_url_env: vec!["ANTHROPIC_BASE_URL".into()],
         observe: true,
+        base_url_config: None,
     });
     std::env::set_var("LOOM_TEST_OBSERVE_KEY_11300", CREDENTIAL);
     let prepared = super::super::prepare(tmp.path(), &selection, &effective, &runtime)

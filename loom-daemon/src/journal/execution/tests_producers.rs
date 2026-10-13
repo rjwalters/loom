@@ -221,8 +221,6 @@ fn outcome(issue: u32) -> crate::sweep_outcomes::OutcomeRecord {
         crash_classification: Some("exit-1".to_string()),
         token_name: "agent-1".to_string(),
         credential: None,
-        jev_tier: None,
-        jev_confidence: None,
         tap_usage: None,
         tap_usage_all: Vec::new(),
         phase_tap_usage: Vec::new(),

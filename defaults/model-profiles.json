@@ -18,6 +18,11 @@
       "pi": "ZAI_API_KEY",
       "opencode": "ZHIPU_API_KEY"
     },
+    "credentialProxy": {
+      "upstream": "https://api.z.ai/api/coding/paas/v4",
+      "header": "authorization-bearer",
+      "baseUrlConfig": "baseURL"
+    },
     "excludedRoles": [
       "judge",
       "curator"

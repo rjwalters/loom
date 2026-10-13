@@ -16,7 +16,7 @@
 //! | Submodule | Shell / CLI entry point | Replaces |
 //! |---|---|---|
 //! | [`log_filter`] | `strip-ansi.sh` | `loom_tools.log_filter` |
-//! | [`model_tiers`] | `resolve-model.sh`, `resolve-tier-model.sh` | `loom_tools.model_tiers` |
+//! | [`model_tiers`] | `resolve-model.sh` | `loom_tools.model_tiers` |
 //! | [`usage`] | `check-usage.sh` | `loom_tools.common.usage` |
 //! | [`checkpoints`] | `checkpoint.sh` | `loom_tools.checkpoints` |
 //! | [`claim`] | `loom-claim` (PATH shim → `loom-daemon claim`) | `loom_tools.claim` |

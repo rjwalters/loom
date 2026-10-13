@@ -99,9 +99,8 @@ fn every_retired_label_has_its_mapping_entry() {
         ("tier:goal-advancing", None, true, "#11103"),
         ("tier:goal-supporting", None, true, "#11103"),
         ("tier:maintenance", None, true, "#11103"),
-        // Never declared by Loom (a consumer's label): add the replacement,
-        // never remove or delete it.
-        ("priority:high", Some("loom:important"), false, "#11103"),
+        // Operator ruling (#11675): owned, relabelled then deleted.
+        ("priority:high", Some("loom:important"), true, "#11103"),
         ("loom:urgent", None, true, "#11105"),
         ("loom:heavy", None, true, "#11105"),
         ("loom:operator-objective", None, true, "#11105"),
