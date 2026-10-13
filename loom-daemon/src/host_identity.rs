@@ -49,6 +49,14 @@
 //! and `fleet.captain` all key on `host.id`, so a host that must keep its old
 //! name sets `fleet.hostId` (or `LOOM_HOST_ID`) to it before upgrading. The
 //! generated id is announced with a one-time WARN naming that remedy.
+//!
+//! A host that upgraded without doing so is recovered once, by the fleet-sync
+//! pass, not here (Issue #11740): when the resolved id is a generated one the
+//! fleet store does not know, and exactly one store host is named by this
+//! machine's short hostname, [`adopt_roster_name`] rewrites the persisted id
+//! to that roster name (WARN logged). The hostname is only ever *matched
+//! against the roster*, never adopted on its own, so a launchd-style
+//! `MacBook-Air.localdomain` that names no store host changes nothing.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -459,6 +467,84 @@ fn write_owner_only(path: &Path, id: &str) -> std::io::Result<()> {
     let mut file = options.open(path)?;
     file.write_all(format!("{id}\n").as_bytes())?;
     file.sync_all()
+}
+
+/// This machine's short hostnames, the candidates [`adopt_roster_name`]'s
+/// caller matches against the fleet-store roster (Issue #11740): `$HOSTNAME`,
+/// the `hostname` binary and, on macOS, `scutil --get LocalHostName` (the
+/// name launchd-started processes see differs from a login shell's). Each is
+/// cut at its first `.`; blanks and duplicates are dropped. Never an identity
+/// on its own.
+#[must_use]
+pub fn hostname_candidates() -> Vec<String> {
+    let run = |program: &str, args: &[&str]| {
+        Command::new(program)
+            .args(args)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+    };
+    let mut raw = vec![std::env::var("HOSTNAME").ok(), run("hostname", &[])];
+    if cfg!(target_os = "macos") {
+        raw.push(run("scutil", &["--get", "LocalHostName"]));
+    }
+    let mut out: Vec<String> = Vec::new();
+    for name in raw.into_iter().flatten() {
+        let short = name
+            .trim()
+            .split('.')
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        if !short.is_empty() && !out.iter().any(|o| o.eq_ignore_ascii_case(&short)) {
+            out.push(short);
+        }
+    }
+    out
+}
+
+/// Replace a **generated** persisted id with the roster name `name` (Issue
+/// #11740), so a host the fleet store knows by its hostname keeps receiving
+/// its config after #11530 stopped resolving hostnames.
+///
+/// Refuses (`Ok(false)`, nothing written) unless the id currently resolves
+/// from the persisted file *and* that file holds a generated
+/// (`loom-host-…`) id: an explicit `fleet.hostId`, `LOOM_HOST_ID`, or an
+/// operator-written id file always wins over a hostname match. The new id is
+/// written atomically (owner-only temp file, then `rename`) and the in-process
+/// cache is updated, so later [`host_identity`] calls in this process return
+/// it.
+pub fn adopt_roster_name(name: &str) -> std::io::Result<bool> {
+    let current = resolve();
+    match (current.source, current.path) {
+        (HostIdSource::Persisted | HostIdSource::Generated, Some(path)) => {
+            adopt_at(&path, &current.id, name)
+        }
+        _ => Ok(false),
+    }
+}
+
+pub(crate) fn adopt_at(path: &Path, expected: &str, name: &str) -> std::io::Result<bool> {
+    if !expected.starts_with(GENERATED_PREFIX) || !is_valid_id(name) {
+        return Ok(false);
+    }
+    // Re-read under the recovery lock: only the generated id we resolved may
+    // be replaced, never a value another process or the operator just wrote.
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let _lock = RecoveryLock::acquire(dir)?;
+    if read_id(path)?.as_deref() != Some(expected) {
+        return Ok(false);
+    }
+    let tmp = dir.join(format!(".{HOST_ID_FILENAME}.tmp.{}", uuid::Uuid::new_v4().simple()));
+    let placed = write_owner_only(&tmp, name).and_then(|()| std::fs::rename(&tmp, path));
+    let _ = std::fs::remove_file(&tmp);
+    placed?;
+    cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(path.to_path_buf(), name.to_string());
+    Ok(true)
 }
 
 /// The **lease** host identity: `LOOM_HOST_ID` > `$HOSTNAME` > the

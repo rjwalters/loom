@@ -357,3 +357,58 @@ fn pass_two_debits_each_disk_admission() {
     assert_eq!(multi[1].1.dispatched, vec![3, 4]);
     assert_eq!(report.deferred_capacity, 2);
 }
+
+// ---- the tick's own result (#11649) ----------------------------------------
+
+/// **#11649.** The tick report carries the distinct causes of the workspaces
+/// it held — not just "something was halted" — so the `loom.dispatch.tick`
+/// result can say `halted_disk_reservation` instead of `halted_main_red`.
+/// Duplicates fold, the order is `HaltCause::ALL`, and a cause at a not-held
+/// index is ignored.
+#[test]
+fn tick_report_carries_the_held_workspaces_distinct_causes() {
+    let mut multi: Vec<_> = (0..4)
+        .map(|n| (OneShotSource(Some(vec![item(n + 1)])), Disp::default()))
+        .collect();
+    let report = tick_multi_with_repo_cap(
+        &mut multi,
+        &[],
+        10.into(),
+        &[true, true, true, false],
+        Some(&[
+            Some(HaltCause::DiskReservation),
+            Some(HaltCause::Drain),
+            Some(HaltCause::DiskReservation),
+            Some(HaltCause::MainRed),
+        ]),
+        usize::MAX,
+        false,
+        None,
+        &[],
+    );
+    assert!(report.halted);
+    assert_eq!(report.halt_causes, vec![HaltCause::Drain, HaltCause::DiskReservation]);
+    // The not-held workspace still dispatched, and that outranks the hold.
+    let tick = crate::observability::ops::dispatch::tick_result_with(&report, false);
+    assert_eq!((report.dispatched, tick), (1, "dispatched"));
+
+    // A cause-less caller holds without naming a cause.
+    let mut multi = vec![(OneShotSource(Some(vec![item(9)])), Disp::default())];
+    let report =
+        tick_multi_with_repo_cap(&mut multi, &[], 10.into(), &[true], None, 1, false, None, &[]);
+    assert!(report.halted);
+    assert!(report.halt_causes.is_empty());
+}
+
+/// #11649: the single-workspace loop's cause follows `causes_per_root`'s
+/// precedence, and is `None` exactly when nothing holds the root.
+#[test]
+fn single_root_names_the_highest_precedence_hold() {
+    let root = PathBuf::from("/nonexistent/loom-11649");
+    let cause = |holds| super::single_root(&root, holds);
+    assert_eq!(cause((false, false, false, false)), None);
+    assert_eq!(cause((true, true, true, true)), Some(HaltCause::MainRed));
+    assert_eq!(cause((false, true, true, true)), Some(HaltCause::GatePending));
+    assert_eq!(cause((false, false, true, true)), Some(HaltCause::Breaker));
+    assert_eq!(cause((false, false, true, false)), Some(HaltCause::TokenPool));
+}

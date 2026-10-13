@@ -15,7 +15,8 @@
 //! 1. **A per-repo high-water mark.** A sampler thread measures every live
 //!    sweep's footprint each [`DEFAULT_SAMPLE_SECS`]. When a unit leaves the
 //!    live set its peak is folded into its repo's rolling history (the last
-//!    [`HISTORY_LEN`] runs). [`crate::disk_admission`] charges the max of that.
+//!    [`HISTORY_LEN`] runs). [`crate::disk_admission`] charges the
+//!    [`CHARGE_PERCENTILE`]th percentile of that (#11736), not its max.
 //! 2. **The in-flight units**, with what each has written so far, so admission
 //!    can reserve what each is still expected to write.
 //!
@@ -73,10 +74,31 @@ pub const SAMPLE_SECS_ENV: &str = "LOOM_DISK_SAMPLE_SECS";
 /// Default sampler interval: one work-finder tick.
 pub const DEFAULT_SAMPLE_SECS: u64 = 60;
 
-/// Runs kept per repo. The charge is their max, so it takes this many later
-/// runs for one heavy build to age out. Long on purpose: a run of no-op sweeps
-/// must not talk a build-heavy repo's charge down before its next build.
+/// Runs kept per repo. Long on purpose: a run of no-op sweeps must not talk a
+/// build-heavy repo's charge down before its next build.
 pub const HISTORY_LEN: usize = 20;
+
+/// The percentile of a history the charge is read from (#11736). Nearest
+/// rank, so a history of up to 9 runs still charges its max, and a full
+/// 20-run window drops only its top two runs. The max made one rare build
+/// (43.5 GB for loom on loom-worker-2, median 3.2 GB) the charge of every
+/// sweep for 20 runs, and held whole repos with more than 100 GB free. The
+/// rare heavy build is still covered by the disk-full halt floor, the
+/// reaper and the per-sweep build bounds (#11189).
+pub const CHARGE_PERCENTILE: usize = 90;
+
+/// The [`CHARGE_PERCENTILE`]th percentile (nearest rank) of `samples`, or
+/// `None` when it is empty or zero.
+#[must_use]
+pub fn charge_basis_bytes(samples: &[u64]) -> Option<u64> {
+    if samples.is_empty() {
+        return None;
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    let rank = (sorted.len() * CHARGE_PERCENTILE).div_ceil(100).max(1);
+    Some(sorted[rank - 1]).filter(|&b| b > 0)
+}
 
 /// How long a pending unit (admitted, not yet sampled) is kept without a
 /// sample adopting it.
@@ -201,22 +223,20 @@ impl Store {
             .is_some_and(|t| now.saturating_sub(t) < STALE_AFTER_SECS)
     }
 
-    /// `repo`'s observed high-water mark (bytes), if it has history.
+    /// `repo`'s observed high-water mark (bytes), if it has history: the
+    /// [`CHARGE_PERCENTILE`]th percentile of its sweep peaks.
     #[must_use]
     pub fn high_water_bytes(&self, repo: &str) -> Option<u64> {
-        self.repos
-            .get(repo)
-            .and_then(|h| h.iter().copied().max())
-            .filter(|&b| b > 0)
+        self.repos.get(repo).and_then(|h| charge_basis_bytes(h))
     }
 
-    /// The observed high-water mark (bytes) of `role` runs in `repo`.
+    /// The observed high-water mark (bytes) of `role` runs in `repo`: the
+    /// [`CHARGE_PERCENTILE`]th percentile of their peaks.
     #[must_use]
     pub fn role_high_water_bytes(&self, repo: &str, role: &str) -> Option<u64> {
         self.role_runs
             .get(&role_key(repo, role))
-            .and_then(|h| h.iter().copied().max())
-            .filter(|&b| b > 0)
+            .and_then(|h| charge_basis_bytes(h))
     }
 }
 

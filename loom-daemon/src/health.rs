@@ -575,6 +575,9 @@ pub struct HealthInputs {
     /// [`ci_telemetry_section::assess_ci_telemetry`] — no section unless the
     /// poller is enabled here.
     pub ci_telemetry: Option<crate::ci_telemetry::CiTelemetryHealth>,
+    /// The last fleet-sync pass snapshot ([`crate::fleet_sync::probe_status`]),
+    /// rendered by [`fleet_identity_section::assess_fleet_identity`] (#11740).
+    pub fleet_sync: Option<crate::fleet_sync::FleetSyncStatus>,
 }
 
 // ============================================================================
@@ -2557,6 +2560,12 @@ mod ci_telemetry_section;
 
 pub use ci_telemetry_section::assess_ci_telemetry;
 
+/// The `fleet_identity` section (#11740): Degraded when this host's identity
+/// names no fleet-store host, so its fleet config is not being applied.
+mod fleet_identity_section;
+
+pub use fleet_identity_section::assess_fleet_identity;
+
 // ============================================================================
 // Codex accounts (Issue #8407) — conditional
 // ============================================================================
@@ -2629,6 +2638,7 @@ pub fn assess(inputs: &HealthInputs) -> HealthReport {
     sections.extend(assess_transcript_ingest(inputs));
     sections.extend(assess_tmpfs_visibility(inputs));
     sections.extend(assess_ci_telemetry(inputs));
+    sections.extend(assess_fleet_identity(inputs));
     let overall = if dead {
         Verdict::Dead
     } else if sections.iter().all(|s| s.verdict.is_green()) {

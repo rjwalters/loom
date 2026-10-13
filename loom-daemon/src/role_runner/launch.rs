@@ -7,6 +7,8 @@ pub(super) mod sandbox_noop;
 // #10455: a tick refused because the session container was down gets its own
 // failure reason (and `loom.admission.reason`), not a bare RECOVERABLE/78.
 mod curation;
+// #11727: an exit-0 tick whose every tool call a guard hook denied is a failure.
+mod hook_denied;
 mod session_down;
 // #10364: likewise a tick refused because the running container does not
 // mount the tick's working directory (a repo registered after it was created).
@@ -440,6 +442,14 @@ pub(super) fn run_role_with_timeout(
                         hold.failure(failure_class::sandbox_unavailable());
                         return RoleTickOutcome::Failure(detail);
                     }
+                }
+                // Issue #11727: likewise when a guard hook denied every tool
+                // call (role-tool-policy `check` could not answer). The class
+                // is deterministic, so the launch-failure hold skips the tap.
+                if let Some(detail) = hook_denied::detect(&log_path, &tick_anchor) {
+                    log::warn!("role_runner: role={role} {detail}");
+                    hold.failure(failure_class::hook_denied());
+                    return RoleTickOutcome::Failure(detail);
                 }
                 hold.success();
                 return RoleTickOutcome::Success;

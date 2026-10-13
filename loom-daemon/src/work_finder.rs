@@ -1687,8 +1687,8 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
     // logged "main-health gate cleared — resuming dispatch" in the same window
     // the gate was logging "still RED". Reading the flags directly means the
     // two loops can never disagree: this is the same `WorkspaceHealthStates`
-    // the gate writes.
-    let any_halted = halted.iter().take(workspaces.len()).any(|&h| h);
+    // the gate writes. `TickReport::note_halts` (#11649), at the end of the
+    // tick, folds them together with their named causes.
 
     // Pass 1 (mutable source reads): gather every eligible candidate across all
     // workspaces, applying the per-workspace skip-label / in-flight filters and
@@ -1957,7 +1957,7 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
         }
     }
 
-    report.halted = any_halted;
+    report.note_halts(halted, halt_causes, workspaces.len()); // #11649
     report.occupancy = Some(occupancy);
     cap.finish(&mut report); // #11606
     report.overflow_free = Some(overflow.is_free());
@@ -2449,11 +2449,14 @@ where
             // `pool_preflight::preflight_held_per_root`. Re-derived from the
             // live pool every tick, so it self-heals within one tick of a
             // readmission.
-            let other_hold = crate::host_breaker::global_is_suppressed()
-                || pool_preflight::observe_root(&workspace_root, chrono::Utc::now());
-            let halted = health_state.is_halted()
-                || (suppress_dispatch_during_gate && health_state.is_gate_in_flight())
-                || other_hold;
+            let breaker = crate::host_breaker::global_is_suppressed();
+            let other_hold =
+                breaker || pool_preflight::observe_root(&workspace_root, chrono::Utc::now());
+            // #11649: name the hold, so the tick result says which one it is.
+            let gate = suppress_dispatch_during_gate && health_state.is_gate_in_flight();
+            let holds = (health_state.is_halted(), gate, other_hold, breaker);
+            let cause = halt_cause::single_root(&workspace_root, holds);
+            let halted = cause.is_some();
             // #9244: whether this halt still admits verified red-main fixes.
             let lane = main_red_fix::lane_for(
                 &health_state,
@@ -2523,9 +2526,10 @@ where
                 saturation_held,
                 lane,
             ) {
-                Ok(report) => {
-                    // Publish before any logging so `loom-daemon health` sees the
-                    // same tick the log line describes (#4761).
+                Ok(mut report) => {
+                    report.note_halts(&[report.halted], Some(&[cause]), 1); // #11649
+                                                                            // Publish before any logging so `loom-daemon health` sees the
+                                                                            // same tick the log line describes (#4761).
                     publish_tick(&report, max_concurrent, tick_started, &[], None);
                     if report.halted && !was_halted {
                         log::warn!(

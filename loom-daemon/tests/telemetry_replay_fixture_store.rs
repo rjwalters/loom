@@ -23,6 +23,9 @@
 //! tests read (`check_export.jsonl`) must equal this live run.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "common/hub_image.rs"]
+mod hub_image;
+
 use std::io::Write;
 use std::process::{Command, Stdio};
 
@@ -48,7 +51,7 @@ fn run_on(fixture: &str, params: &[(String, String)], sql: &str) -> String {
         "-i",
         "--entrypoint",
         "clickhouse",
-        CLICKHOUSE_IMAGE,
+        &hub_image::resolve(CLICKHOUSE_IMAGE),
         "local",
         "--multiquery",
         "--format=JSONEachRow",
