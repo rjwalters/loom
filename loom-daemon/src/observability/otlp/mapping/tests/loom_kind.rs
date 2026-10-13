@@ -153,6 +153,10 @@ fn samples() -> Vec<TelemetryRecord> {
                     "workspace": "loom", "outcome": "success", "source": "probe",
                     "probed_count": 0, "api_key_probe_count": 0, "accounts": [],
                     "duration_ms": 0, "loom": p})),
+        wire(json!({"kind": "stage.work_started", "repo": "rjwalters/loom", "issue": 1,
+                    "stage": "doctor", "role": "doctor", "sweep_id": "s",
+                    "stage_attempt": 1, "started_at": AT, "source": "sweep_checkpoint",
+                    "observed_at": AT, "loom": p})),
     ]
 }
 
