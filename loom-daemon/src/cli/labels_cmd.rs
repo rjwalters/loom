@@ -81,6 +81,10 @@ pub(crate) enum LabelsCommand {
         /// Make the forge writes (default: dry run, reads only).
         #[arg(long)]
         apply: bool,
+        /// Migrate open items only; never delete a retired label's
+        /// definition (deleting strips it from every closed item).
+        #[arg(long)]
+        keep_labels: bool,
         /// Print the report as JSON.
         #[arg(long)]
         json: bool,
@@ -194,6 +198,7 @@ fn run(cmd: LabelsCommand) -> Result<i32> {
             repo,
             all_workspaces,
             apply,
+            keep_labels,
             json,
         } => {
             use super::labels_migrate::{dispatch, Scope};
@@ -203,7 +208,7 @@ fn run(cmd: LabelsCommand) -> Result<i32> {
                 (None, true) => Scope::AllWorkspaces,
                 (None, false) => Scope::Here(root.clone()),
             };
-            Ok(dispatch(&load(&root)?.retired, scope, apply, json))
+            Ok(dispatch(&load(&root)?.retired, scope, apply, keep_labels, json))
         }
         LabelsCommand::Check { root } => {
             let root = root_of(root);
