@@ -1596,6 +1596,22 @@ and no `LOOM_HOST_ID`, `fleet-config render` defaults `--host` to the
 generated id and fails with "host not in the store"; set `LOOM_HOST_ID` or
 pass `--host` for that first render.
 
+**Recovery for a host that rolled without doing so (#11740).** The daemon's
+fleet-sync pass migrates such a host once: when the resolved id is a
+*generated* `loom-host-…` that names no store host, and exactly one store host
+equals one of this machine's short hostnames (`$HOSTNAME`, `hostname`, and on
+macOS `scutil --get LocalHostName`, each cut at the first `.`, compared
+case-insensitively), the persisted `~/.loom/host-id` is rewritten to that
+roster name (WARN logged) and the pass renders that host's config. The
+hostname is only matched against the roster, never adopted on its own, and an
+explicit `fleet.hostId`, `LOOM_HOST_ID` or hand-written id file is never
+replaced. Telemetry already labelled with the generated id keeps it until the
+daemon restarts. When nothing matches, the host is off fleet config and says
+so: `fleet config not applied: host identity not in store` appears in
+`loom-daemon status` (text, and `fleet_store.config.hostNotInStore` in
+`--json`), as a Degraded `fleet_identity` section of `loom-daemon health` and
+the daemon's health route, and as an ERROR in the fleet-sync log.
+
 ### `fleet-config render [--host H] [--check] [--offline] [--allow-reduce]`
 
 Computes the host's machine tier as `deep_merge(fleet/defaults.json,
