@@ -15,7 +15,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use loom_daemon::presence::beat::{self, Ctx};
-use loom_daemon::presence::journal;
+use loom_daemon::presence::{flush, journal};
 use loom_daemon::telemetry::SweepResult;
 
 /// Opt-in switch for the automatic in-session `sweep.started` that
@@ -48,8 +48,12 @@ enum PresenceCommand {
     /// Journal `sweep.outcome` (`dispatch_origin=operator`) for an in-session
     /// sweep and stop reporting it as driven.
     SweepOutcome(SweepOutcomeArgs),
-    /// Hand every journaled fact to the transport. No transport exists yet
-    /// (#11525), so this reports the pending count and leaves the journal intact.
+    /// One-shot, daemon-less drain (#11713): POST every journaled fact to the
+    /// OTLP ingest the workspace's `observability` config (or
+    /// `$LOOM_PRESENCE_OTLP_ENDPOINT`) names, release what the collector
+    /// acknowledged, and exit. `beat` runs this itself on `Stop`.
+    Flush(CommonArgs),
+    /// Alias of `flush` (kept for the pre-#11713 spelling).
     Export(CommonArgs),
     /// Print how many facts are waiting in the journal.
     Status(CommonArgs),
@@ -120,7 +124,7 @@ impl PresenceCommand {
             Self::Beat(a) => &a.common.workspace,
             Self::SweepStart(a) => &a.common.workspace,
             Self::SweepOutcome(a) => &a.common.workspace,
-            Self::Export(a) | Self::Status(a) => &a.workspace,
+            Self::Flush(a) | Self::Export(a) | Self::Status(a) => &a.workspace,
         }
     }
 
@@ -130,7 +134,7 @@ impl PresenceCommand {
             Self::Beat(a) => run_beat(&a),
             Self::SweepStart(a) => run_sweep_start(&a),
             Self::SweepOutcome(a) => run_sweep_outcome(&a),
-            Self::Export(a) => run_export(&a),
+            Self::Flush(a) | Self::Export(a) => run_export(&a),
             Self::Status(a) => run_status(&a),
         };
         if let Err(e) = outcome {
@@ -197,6 +201,12 @@ fn run_beat(args: &BeatArgs) -> Result<()> {
         .unwrap_or_else(|| "PostToolUse".to_string());
     let ctx = ctx(&args.common, fields.session_id)?;
     beat::beat(&ctx, &event)?;
+    // Session end: drain the journal now, since an operator host has no daemon
+    // to do it later (#11713). A failure leaves the facts journaled and is
+    // reported through the fail-open path.
+    if event == "Stop" {
+        flush::flush(&ctx.root, &ctx.journal)?;
+    }
     Ok(())
 }
 
@@ -223,12 +233,12 @@ fn run_sweep_outcome(args: &SweepOutcomeArgs) -> Result<()> {
 
 fn run_export(args: &CommonArgs) -> Result<()> {
     let ctx = ctx(args, None)?;
-    match journal::export(&ctx.journal, &mut journal::NoTransport) {
+    match flush::flush(&ctx.root, &ctx.journal) {
         Ok(r) => {
-            println!("presence export: sent {} record(s), {} rejected", r.exported, r.rejected)
+            println!("presence flush: sent {} record(s), {} rejected", r.exported, r.rejected)
         }
         Err(e) => println!(
-            "presence export: {} record(s) pending, kept in {}: {e:#}",
+            "presence flush: {} record(s) pending, kept in {}: {e:#}",
             journal::pending_count(&ctx.journal),
             ctx.journal.display()
         ),
@@ -243,6 +253,10 @@ fn run_status(args: &CommonArgs) -> Result<()> {
         journal::pending_count(&ctx.journal),
         ctx.journal.display()
     );
+    match flush::resolve_target(&ctx.root) {
+        Ok(t) => println!("presence: export target {}", t.endpoint),
+        Err(e) => println!("presence: no export target ({e:#}); facts stay in the journal"),
+    }
     let (failures, last) = journal::error_summary(&ctx.journal);
     if failures > 0 {
         println!(

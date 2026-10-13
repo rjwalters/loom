@@ -60,6 +60,9 @@ pub const CLASSIFICATION: &[(&str, KeyClass)] = &[
     ("health_monitoring", KeyClass::Host),
     ("observability", KeyClass::Fleet),
     ("offlineMode", KeyClass::Fleet),
+    // Operator-host presence wiring (#11713): read by install/resync, not by
+    // a daemon; a per-operator opt-out lives in the host's own env/marker file.
+    ("operatorPresence", KeyClass::Fleet),
     ("reflection", KeyClass::Repo),
     // Per-repo approval/merge policy contract (#11674, `merge_policy.rs`).
     ("repos", KeyClass::Fleet),

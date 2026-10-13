@@ -236,6 +236,89 @@ _phook_cmd() {
     printf '%s' "bash -c 'ROOT=\$(cd \"\$(git rev-parse --git-common-dir 2>/dev/null)/..\" 2>/dev/null && pwd); [ -n \"\$ROOT\" ] || exit 0; { [ -f \"\$ROOT/.loom-project/project.json\" ] || [ -f \"\$ROOT/.loom/config.json\" ]; } || exit 0; [ -x \"\$ROOT/.loom/hooks/${name}\" ] && [ -f \"\$ROOT/.claude/settings.json\" ] && case \"\$(<\"\$ROOT/.claude/settings.json\")\" in *\".loom/hooks/${name}\"*) exit 0 ;; esac; H=\"\${LOOM_HOME:-\$HOME/.local/share/loom}/defaults/hooks/${name}\"; [ -x \"\$H\" ] && LOOM_PROJECT_ROOT=\"\$ROOT\" exec \"\$H\" || exit 0'"
 }
 
+# ── Operator presence (#11563, #11713) ────────────────────────────────────────
+# _phook_presence_mode -> echoes `on`, `off` or `unset`. First match wins:
+#   LOOM_OPERATOR_PRESENCE=1|0       per-run / per-shell override
+#   ~/.loom/operator-presence.optout per-operator local opt-out (touch to disable
+#                                    even when fleet policy turns presence on)
+#   operatorPresence.enabled         fleet key, read from the machine-level
+#                                    defaults.json (fleet-gitops tier 1)
+_phook_presence_mode() {
+    case "${LOOM_OPERATOR_PRESENCE:-}" in 1) echo on; return ;; 0) echo off; return ;; esac
+    [[ -e "${LOOM_PRESENCE_OPTOUT_FILE:-$HOME/.loom/operator-presence.optout}" ]] && { echo off; return; }
+    local cfg="${LOOM_CONFIG_DEFAULTS_FILE-$HOME/.local/share/loom/config/defaults.json}" v=""
+    [[ -n "$cfg" && -r "$cfg" ]] && command -v jq >/dev/null 2>&1 \
+        && v="$(jq -r '.operatorPresence.enabled | if type == "boolean" then tostring else empty end' "$cfg" 2>/dev/null)"
+    case "$v" in true) echo on ;; false) echo off ;; *) echo unset ;; esac
+}
+
+# _phook_presence_apply <settings_file>: merge (on) or strip (off) the three
+# presence-beat.sh hook entries and the LOOM_OPERATOR_PRESENCE=1 env entry,
+# touching nothing else. Idempotent; a no-op when already in the wanted state.
+_phook_presence_apply() {
+    local settings="$1" mode pevent rc=0
+    mode="$(_phook_presence_mode)"
+    [[ "$mode" == unset ]] && return 0
+    if [[ "$mode" == on ]]; then
+        for pevent in UserPromptSubmit PostToolUse Stop; do
+            if _phook_merge_one "$settings" "$pevent" "" "defaults/hooks/presence-beat.sh" \
+                "$(_phook_cmd presence-beat.sh)" "" "$_PHOOK_WRAPPER_MARKER"; then
+                _phook_ok "wired $pevent/<all> -> presence-beat.sh (operator presence)"
+            else
+                _phook_warn "failed to wire presence-beat.sh ($pevent) into $settings"
+                rc=1
+            fi
+        done
+        _phook_presence_edit "$settings" '.env = ((.env // {}) + {"LOOM_OPERATOR_PRESENCE": "1"})' || rc=1
+    else
+        _phook_presence_edit "$settings" '
+            (if .hooks then .hooks |= (to_entries | map(.value |= (map(.hooks |= map(select((.command // "") | contains("defaults/hooks/presence-beat.sh") | not))) | map(select((.hooks | length) > 0)))) | map(select((.value | length) > 0)) | from_entries) else . end)
+            | if (.hooks // {}) == {} then del(.hooks) else . end
+            | if (.env.LOOM_OPERATOR_PRESENCE // "") == "1" then del(.env.LOOM_OPERATOR_PRESENCE) else . end
+            | if (.env // {}) == {} then del(.env) else . end' || rc=1
+    fi
+    return "$rc"
+}
+
+# _phook_presence_edit <settings_file> <jq filter>: apply the filter only when it
+# changes the file (back up first), so a converged host is byte-stable.
+_phook_presence_edit() {
+    local settings="$1" filter="$2" tmp
+    [[ -s "$settings" ]] || return 0
+    tmp="$(mktemp 2>/dev/null)" || return 1
+    if jq "$filter" "$settings" >"$tmp" 2>/dev/null; then
+        if [[ "$(jq -S . "$tmp")" == "$(jq -S . "$settings")" ]]; then rm -f "$tmp"; return 0; fi
+        _phook_backup_settings "$settings" >/dev/null
+        mv "$tmp" "$settings" 2>/dev/null || { rm -f "$tmp"; return 1; }
+        _phook_ok "updated operator presence settings in $settings"
+        return 0
+    fi
+    rm -f "$tmp"
+    return 1
+}
+
+# provision_operator_presence [claude_dir]
+#
+# Standalone presence-only pass for resync-installed.sh (#11713): applies
+# `_phook_presence_mode` to the user-scope settings without re-running the full
+# guard-hook wiring. Best-effort, never fatal; a no-op when mode is `unset`.
+provision_operator_presence() {
+    local claude_dir="${1:-$HOME/.claude}" settings mode
+    settings="$claude_dir/settings.json"
+    mode="$(_phook_presence_mode)"
+    [[ "$mode" == unset ]] && return 0
+    command -v jq >/dev/null 2>&1 || { _phook_warn "jq not available; cannot apply operator presence."; return 1; }
+    if [[ -s "$settings" ]] && ! jq empty "$settings" >/dev/null 2>&1; then
+        _phook_warn "$settings is not valid JSON; leaving it untouched."
+        return 1
+    fi
+    if [[ ! -s "$settings" ]]; then
+        [[ "$mode" == on ]] || return 0
+        mkdir -p "$claude_dir" 2>/dev/null && printf '{}\n' >"$settings" 2>/dev/null || return 1
+    fi
+    _phook_presence_apply "$settings"
+}
+
 # provision_loom_hooks [claude_dir]
 #
 # Idempotently merge the Loom guard-hook wiring into the user-scope
@@ -318,21 +401,9 @@ provision_loom_hooks() {
         fi
     done
 
-    # Operator presence heartbeat (#11563) is OPT-IN per operator: wired only
-    # when LOOM_OPERATOR_PRESENCE=1 at provision time. The beat is throttled
-    # inside `loom-daemon presence beat`; the hook stores no prompt content.
-    if [[ "${LOOM_OPERATOR_PRESENCE:-}" == "1" ]]; then
-        local pevent
-        for pevent in UserPromptSubmit PostToolUse Stop; do
-            if _phook_merge_one "$settings" "$pevent" "" "defaults/hooks/presence-beat.sh" \
-                "$(_phook_cmd presence-beat.sh)" "" "$_PHOOK_WRAPPER_MARKER"; then
-                _phook_ok "wired $pevent/<all> -> presence-beat.sh (opt-in)"
-            else
-                _phook_warn "failed to wire presence-beat.sh ($pevent) into $settings"
-                soft_fail=1
-            fi
-        done
-    fi
+    # Operator presence heartbeat (#11563/#11713): wired, or removed, per
+    # _phook_presence_mode. Unset leaves any existing wiring untouched.
+    _phook_presence_apply "$settings" || soft_fail=1
 
     return "$soft_fail"
 }
