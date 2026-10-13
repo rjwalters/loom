@@ -293,31 +293,31 @@
   description: "Issue is part of an epic phase (references parent epic)"
   color: "8B5CF6"  # violet-500 - lighter variant for child issues
 
-# Story-Point Size Labels (#9431, epic #9429): estimation is paused.
-# Retained for historical data; Curators do not assign or refresh these labels.
-# The archived rubric lives in .loom/docs/story-points.md.
+# Story-Point Size Labels (#9431, epic #9429; restarted by #11659).
+# Projected by loom-daemon curation-complete from the Curator's points marker.
+# The rubric lives in .loom/docs/story-points.md.
 - name: points:1
-  description: "Story-point size class 1 (paused). Applied by: Curator only."
+  description: "Story-point size class 1. Applied by: Curator via loom-daemon curation-complete."
   color: "06B6D4"  # cyan-500 - story-point size family
 
 - name: points:2
-  description: "Story-point size class 2 (paused). Applied by: Curator only."
+  description: "Story-point size class 2. Applied by: Curator via loom-daemon curation-complete."
   color: "06B6D4"  # cyan-500 - story-point size family
 
 - name: points:3
-  description: "Story-point size class 3 (paused). Applied by: Curator only."
+  description: "Story-point size class 3. Applied by: Curator via loom-daemon curation-complete."
   color: "06B6D4"  # cyan-500 - story-point size family
 
 - name: points:5
-  description: "Story-point size class 5 (paused). Applied by: Curator only."
+  description: "Story-point size class 5. Applied by: Curator via loom-daemon curation-complete."
   color: "06B6D4"  # cyan-500 - story-point size family
 
 - name: points:8
-  description: "Story-point size class 8 (paused). Applied by: Curator only."
+  description: "Story-point size class 8. Applied by: Curator via loom-daemon curation-complete."
   color: "06B6D4"  # cyan-500 - story-point size family
 
 - name: points:13
-  description: "Story-point size class 13, the largest (paused). Applied by: Curator only."
+  description: "Story-point size class 13, the largest. Applied by: Curator via loom-daemon curation-complete."
   color: "06B6D4"  # cyan-500 - story-point size family
 
 # External Contribution Gate

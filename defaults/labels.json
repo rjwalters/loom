@@ -1036,7 +1036,7 @@
     },
     {
       "name": "points:1",
-      "description": "Story-point size class 1 (paused). Applied by: Curator only.",
+      "description": "Story-point size class 1. Applied by: Curator via loom-daemon curation-complete.",
       "color": "06B6D4",
       "kind": "size",
       "applied_by": "Curator",
@@ -1055,17 +1055,17 @@
       "stale_after_minutes": null,
       "requires_base": null,
       "remove_with": [],
-      "lifecycle": "paused",
+      "lifecycle": "active",
       "color_note": "cyan-500 - story-point size family",
       "yaml_preamble": [
-        "# Story-Point Size Labels (#9431, epic #9429): estimation is paused.",
-        "# Retained for historical data; Curators do not assign or refresh these labels.",
-        "# The archived rubric lives in .loom/docs/story-points.md."
+        "# Story-Point Size Labels (#9431, epic #9429; restarted by #11659).",
+        "# Projected by loom-daemon curation-complete from the Curator's points marker.",
+        "# The rubric lives in .loom/docs/story-points.md."
       ]
     },
     {
       "name": "points:2",
-      "description": "Story-point size class 2 (paused). Applied by: Curator only.",
+      "description": "Story-point size class 2. Applied by: Curator via loom-daemon curation-complete.",
       "color": "06B6D4",
       "kind": "size",
       "applied_by": "Curator",
@@ -1084,13 +1084,13 @@
       "stale_after_minutes": null,
       "requires_base": null,
       "remove_with": [],
-      "lifecycle": "paused",
+      "lifecycle": "active",
       "color_note": "cyan-500 - story-point size family",
       "yaml_preamble": []
     },
     {
       "name": "points:3",
-      "description": "Story-point size class 3 (paused). Applied by: Curator only.",
+      "description": "Story-point size class 3. Applied by: Curator via loom-daemon curation-complete.",
       "color": "06B6D4",
       "kind": "size",
       "applied_by": "Curator",
@@ -1109,13 +1109,13 @@
       "stale_after_minutes": null,
       "requires_base": null,
       "remove_with": [],
-      "lifecycle": "paused",
+      "lifecycle": "active",
       "color_note": "cyan-500 - story-point size family",
       "yaml_preamble": []
     },
     {
       "name": "points:5",
-      "description": "Story-point size class 5 (paused). Applied by: Curator only.",
+      "description": "Story-point size class 5. Applied by: Curator via loom-daemon curation-complete.",
       "color": "06B6D4",
       "kind": "size",
       "applied_by": "Curator",
@@ -1134,13 +1134,13 @@
       "stale_after_minutes": null,
       "requires_base": null,
       "remove_with": [],
-      "lifecycle": "paused",
+      "lifecycle": "active",
       "color_note": "cyan-500 - story-point size family",
       "yaml_preamble": []
     },
     {
       "name": "points:8",
-      "description": "Story-point size class 8 (paused). Applied by: Curator only.",
+      "description": "Story-point size class 8. Applied by: Curator via loom-daemon curation-complete.",
       "color": "06B6D4",
       "kind": "size",
       "applied_by": "Curator",
@@ -1159,13 +1159,13 @@
       "stale_after_minutes": null,
       "requires_base": null,
       "remove_with": [],
-      "lifecycle": "paused",
+      "lifecycle": "active",
       "color_note": "cyan-500 - story-point size family",
       "yaml_preamble": []
     },
     {
       "name": "points:13",
-      "description": "Story-point size class 13, the largest (paused). Applied by: Curator only.",
+      "description": "Story-point size class 13, the largest. Applied by: Curator via loom-daemon curation-complete.",
       "color": "06B6D4",
       "kind": "size",
       "applied_by": "Curator",
@@ -1184,7 +1184,7 @@
       "stale_after_minutes": null,
       "requires_base": null,
       "remove_with": [],
-      "lifecycle": "paused",
+      "lifecycle": "active",
       "color_note": "cyan-500 - story-point size family",
       "yaml_preamble": []
     },

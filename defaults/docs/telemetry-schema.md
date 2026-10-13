@@ -3448,12 +3448,14 @@ records, not one per picked commit.
 
 One OTLP log per completed curation, produced by `loom-daemon curation-complete`
 for both attended Curators and daemon-mediated role sessions. The command
-fetches the current issue body's standalone `loom:estimate` marker and durably
-journals the envelope before the role applies `loom:curated`. No historical
-backfill or inference from Builder outcomes is performed.
+fetches the current issue body's standalone `loom:estimate` marker, resolves
+the story points (#11663), and durably journals the envelope before it applies
+`points:N` and `loom:curated`. No historical backfill or inference from
+Builder outcomes is performed.
 
-The JSON body contains `repo` (owner/repo), `issue`, `difficulty` (integer 1–5),
-`lines` and `files` (nonnegative integers), `doctor_risk` (finite [0,1]), actual
+The JSON body contains `repo` (owner/repo), `issue`, `points` (the story points
+the gate resolved: 1, 2, 3, 5, 8 or 13; absent on records journaled before
+#11663), `lines` and `files` (nonnegative integers), `doctor_risk` (finite [0,1]), actual
 Curator `model` and `runtime` (null when unknown, never inferred), `estimated_at` (UTC completion time),
 `completion_id` (UUID), and standard `loom` build provenance. `loom.repo`,
 `loom.issue`, `loom.model`, `loom.runtime` and `loom.fact_id` are log attributes.
@@ -3467,10 +3469,12 @@ select the latest estimate known at their as-of instant. Files under the main
 workspace's `.loom/logs/issue-estimates/` are the local queue of record; normal
 observability backfill offers each to the configured durable export queue.
 
-Difficulty estimates expected work. The retained `loom:complexity` marker
-independently measures the cost of an unnoticed error and keeps its existing
-routing definition; there is no mapping between them. Estimates never alter
-curation decisions. Missing historical estimates stay absent. Markdown examples
+`lines`, `files` and `doctor_risk` are an observational forecast: no consumer
+may route, gate or order on them. Story points are the only decision-bearing
+size. Records journaled before #11664 may also carry a `difficulty` field
+(integer 1–5); readers ignore it. A legacy `difficulty=` field in the marker is
+accepted and ignored. Estimates never alter curation decisions. Missing
+historical estimates stay absent. Markdown examples
 in backticks or code fences, duplicates, invalid counts and nonfinite/out-of-range
 risk are rejected or excluded before export.
 
