@@ -7,6 +7,43 @@
 use super::*;
 use skew::{pinned_image, refuse_downgrade, DaemonVersion};
 
+/// The fake runner's version-skew behaviour (kept here so the shared fake in
+/// `session_reconcile_tests.rs` stays under the file-size threshold).
+impl FakeState {
+    /// `docker exec <c> loom-daemon --version`: what the container's daemon
+    /// prints; a missing entry fails like an image without the binary.
+    pub(super) fn version_probe(&self, c: &str) -> ExecOutput {
+        self.log("version_probe");
+        let printed = self.daemon_versions.lock().unwrap().get(c).cloned();
+        ExecOutput {
+            success: printed.is_some(),
+            unavailable: false,
+            timed_out: false,
+            exit_code: Some(if printed.is_some() { 0 } else { 127 }),
+            output: printed.unwrap_or_else(|| "exec: loom-daemon: not found".into()),
+        }
+    }
+
+    /// A created container ships the daemon its image tag names.
+    pub(super) fn ship_daemon(&self, container: &str, image: &str) {
+        if let Some(tag) = DaemonVersion::from_image(image) {
+            self.daemon_versions
+                .lock()
+                .unwrap()
+                .insert(container.into(), format!("loom-daemon {tag} (commit abc1234)"));
+        }
+    }
+
+    /// `ensure_image` (inspect, then pull): fails while `fail_pull` is set.
+    pub(super) fn pull(&self, image: &str) -> Result<()> {
+        self.log("ensure_image");
+        if *self.fail_pull.lock().unwrap() {
+            bail!("docker pull {image} failed: manifest unknown");
+        }
+        Ok(())
+    }
+}
+
 fn v(text: &str) -> DaemonVersion {
     DaemonVersion::parse(text).unwrap()
 }
@@ -93,6 +130,9 @@ fn an_idle_skewed_container_is_recreated_from_the_host_pinned_image() {
         }]
     );
     assert_eq!(lifecycle.runner().mutations(), ["stop_and_remove", "create"]);
+    let calls = lifecycle.runner().calls();
+    let at = |m: &str| calls.iter().position(|c| c == m).unwrap();
+    assert!(at("ensure_image") < at("stop_and_remove"), "image first: {calls:?}");
     let creates = lifecycle.runner().creates.lock().unwrap().clone();
     assert_eq!(creates[0].1, "example/session:0.19.1151", "pinned to the host, not :latest");
     // The fresh container carries the host's daemon: confirmed, then left alone.
@@ -256,4 +296,10 @@ fn an_unavailable_pinned_image_leaves_the_seat_running() {
     // The pair is recorded: not retried until a version changes.
     let _ = skew_pass(&mut lifecycle, &env, &mut state, 60);
     assert_eq!(lifecycle.runner().count("ensure_image"), 1);
+    // A new host version is a new attempt.
+    *lifecycle.runner().fail_pull.lock().unwrap() = false;
+    *lifecycle.runner().host_version.lock().unwrap() = Some(v("0.19.1152"));
+    let out = skew_pass(&mut lifecycle, &env, &mut state, 120);
+    assert!(matches!(out[..], [Outcome::SkewRecreated { .. }]), "{out:?}");
+    assert_eq!(lifecycle.runner().mutations(), ["stop_and_remove", "create"]);
 }

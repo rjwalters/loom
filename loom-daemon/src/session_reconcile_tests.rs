@@ -158,19 +158,10 @@ impl FakeState {
     }
     /// Calls that change a container (anything but `inspect`).
     fn mutations(&self) -> Vec<String> {
-        self.calls()
-            .into_iter()
-            .filter(|c| {
-                !matches!(
-                    c.as_str(),
-                    "inspect"
-                        | "has_active_exec"
-                        | "exec_capture"
-                        | "version_probe"
-                        | "ensure_image"
-                )
-            })
-            .collect()
+        let reads = "inspect has_active_exec exec_capture version_probe ensure_image";
+        let mut calls = self.calls();
+        calls.retain(|c| !reads.split(' ').any(|r| r == c));
+        calls
     }
     fn log(&self, method: &str) {
         self.calls.lock().unwrap().push(method.into());
@@ -275,21 +266,11 @@ impl ContainerRunner for Fake {
             .clone()
             .unwrap_or(intended);
         self.mounts.lock().unwrap().insert(container.into(), mounts);
-        // The new container ships the daemon its image tag names.
-        if let Some(tag) = skew::DaemonVersion::from_image(image) {
-            self.daemon_versions
-                .lock()
-                .unwrap()
-                .insert(container.into(), format!("loom-daemon {tag} (commit abc1234)"));
-        }
+        self.ship_daemon(container, image);
         Ok(())
     }
     fn ensure_image(&self, image: &str) -> Result<()> {
-        self.log("ensure_image");
-        if *self.fail_pull.lock().unwrap() {
-            bail!("docker pull {image} failed: manifest unknown");
-        }
-        Ok(())
+        self.pull(image)
     }
     fn start_existing(&self, container: &str) -> Result<()> {
         self.log("start_existing");
@@ -358,15 +339,7 @@ impl ContainerRunner for Fake {
     fn exec_capture(&self, c: &str, argv: &[&str], _t: Duration) -> Result<ExecOutput> {
         self.log("exec_capture");
         if argv == ["loom-daemon", "--version"] {
-            self.log("version_probe");
-            let printed = self.daemon_versions.lock().unwrap().get(c).cloned();
-            return Ok(ExecOutput {
-                success: printed.is_some(),
-                unavailable: false,
-                timed_out: false,
-                exit_code: Some(if printed.is_some() { 0 } else { 127 }),
-                output: printed.unwrap_or_else(|| "exec: loom-daemon: not found".into()),
-            });
+            return Ok(self.version_probe(c));
         }
         Ok(ExecOutput {
             success: true,
