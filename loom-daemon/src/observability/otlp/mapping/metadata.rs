@@ -367,6 +367,16 @@ pub(super) fn outcome(record: &SweepOutcomeRecord) -> Vec<KeyValue> {
     if let Some(value) = record.dispatch_origin.as_ref().filter(|v| text(v)) {
         attrs.push(kv_string("loom.dispatch_origin", value.clone()));
     }
+    // 2AMLogic/2am#4393: the weighted agent draw's pick (#11726).
+    if let Some(draw) = &record.role_draw {
+        attrs.push(kv_string("loom.role_draw.pick", draw.pick.clone()));
+        attrs.push(kv(
+            "loom.role_draw.model_pinned",
+            AnyValue {
+                value: Some(any_value::Value::BoolValue(draw.model_pinned)),
+            },
+        ));
+    }
     if let Some(numbers) = &record.pr_numbers {
         if !numbers.is_empty() && numbers.len() <= MAX_GROUPS {
             attrs.push(array(

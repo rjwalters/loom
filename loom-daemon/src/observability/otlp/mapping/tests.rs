@@ -155,6 +155,7 @@ fn sweep_outcome_envelope() -> TelemetryEnvelope {
             previous_sweep_id: None,
             trigger: None,
             dispatch_origin: None,
+            role_draw: None,
             rework_events: None,
             pr_numbers: None,
             hw_lines_added: None,
