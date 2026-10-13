@@ -103,7 +103,7 @@ queue: the pinned hold digest (#6877) and label queries in
 
 > **Note on label cleanup**: Loom intentionally does **not** remove labels from
 > closed issues or merged PRs (harmless — all agents filter by open state — and it
-> saves gh API calls). Do not implement label cleanup on merge/close (see #2838) — exception: `merge-pr.sh` strips `loom:building` from an issue its own merge closes, see [`troubleshooting.md`](.loom/docs/troubleshooting.md) (#6199).
+> saves gh API calls). Do not implement label cleanup on merge/close (see #2838) — exception: `merge-pr.sh` strips `loom:building` and (#11517, operator ruling 2026-10-13) `loom:issue` from an issue its own merge closes, see [`troubleshooting.md`](.loom/docs/troubleshooting.md) (#6199).
 
 ### Issues Are Suggestions (Role Autonomy)
 

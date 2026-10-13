@@ -31,7 +31,11 @@
 //! that skipped for the wrong reason — a live issue mistaken for a PR, say —
 //! still has to be caught by the corpus rather than hidden by it.
 //!
-//! There are no known divergences: the port changes no decision.
+//! There are no known divergences on the `loom:building` decision. #11517
+//! (operator ruling 2026-10-13) extends the port to also strip `loom:issue`,
+//! which the retired shell never did, so the comparison is on whether
+//! `loom:building` is removed: `STRIP` / `STRIP-BOTH` versus the shell's
+//! `STRIP`, and `STRIP-READY` versus its silence.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -167,8 +171,8 @@ fn plan_agrees_with_the_retired_shell_on_every_input() {
             let shell = shell_transcript(tmp.path(), gh_rc);
             let decision = plan(&IssueView::from_json(&captured_issue_json(body, gh_rc)));
             let rust = match decision {
-                Plan::Strip => "STRIP\n",
-                Plan::Skip(_) => "",
+                Plan::Strip | Plan::StripBoth => "STRIP\n",
+                Plan::StripReady | Plan::Skip(_) => "",
             };
             assert_eq!(
                 rust, shell,
@@ -176,7 +180,8 @@ fn plan_agrees_with_the_retired_shell_on_every_input() {
 (port decided {decision:?}). Input: {body:?}"
             );
             match decision {
-                Plan::Strip => stripped += 1,
+                Plan::Strip | Plan::StripBoth => stripped += 1,
+                Plan::StripReady => {}
                 Plan::Skip(why) => {
                     if !reasons.contains(&why) {
                         reasons.push(why);
