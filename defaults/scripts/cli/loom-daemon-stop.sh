@@ -293,8 +293,8 @@ INTENT_MARKER="${LOOM_AUTONOMY_MARKER:-$LOOM_DIR/autonomy-desired}"
 # first, joined by `<` (e.g. `bash<claude<launchd`). basename because macOS
 # `ps -o comm=` prints the executable's full path. `unknown` when ps is absent.
 stop_caller_chain() {
-    local pid="$PPID" chain="" comm i
-    for i in 1 2 3; do
+    local pid="$PPID" chain="" comm
+    for _ in 1 2 3; do
         [[ "$pid" =~ ^[0-9]+$ ]] && (( pid > 0 )) || break
         comm="$(ps -o comm= -p "$pid" 2>/dev/null)" || break
         comm="${comm##*/}"
