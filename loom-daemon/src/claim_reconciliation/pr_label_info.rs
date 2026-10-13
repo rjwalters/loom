@@ -6,6 +6,18 @@ use std::path::Path;
 
 use super::gh_call;
 
+/// The PR holds every PR-side pass leaves alone; re-exported as
+/// [`super::VERDICT_HOLD_LABELS`] (defined here because `claim_reconciliation.rs`
+/// is size-frozen). #11743 adds `loom:frozen`: review-conflict flagging, stale-
+/// verdict clearing and anchoring, and merge-order planning must not write to
+/// a frozen PR.
+pub(crate) const VERDICT_HOLDS: [&str; 4] = [
+    "loom:blocked",
+    "loom:operator",
+    "loom:operator-only",
+    "loom:frozen",
+];
+
 /// The PR's currently-applied state labels plus its draft status (a
 /// best-effort subset of the REST `pulls/{n}` body — `labels[].name` and
 /// `draft` — used only to decide whether [`super::forge::reclaim_pr`]'s

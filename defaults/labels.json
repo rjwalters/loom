@@ -928,7 +928,7 @@
       "removed_by": "humans only",
       "park": true,
       "skip": true,
-      "hold": false,
+      "hold": true,
       "operator_gate": false,
       "blocked_colabel": false,
       "hard_exclusion": true,

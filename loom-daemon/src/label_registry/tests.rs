@@ -316,6 +316,8 @@ fn derived_pr_latency_hold_labels_equal_the_previous_set() {
             "loom:operator-blocked",
             "loom:operator-mechanical",
             "loom:operator-decision",
+            // #11743: a frozen PR is held, not waiting on a reviewer.
+            "loom:frozen",
         ])
     );
 }

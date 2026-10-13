@@ -16,15 +16,15 @@
 # A diff that RAISES a budget needs a clear reason in the PR description.
 # Do not hand-edit these upward; that is the ratchet slipping. See
 # .loom/docs/file-size-policy.md.
-architect      14951        -
-auditor        20540        -
-builder        30117        -
-champion       14248        -
-curator        45555    30000
-doctor         33080    30000
-driver         10798        -
-guide          44260        -
-hermit         16493        -
-judge          54338    30000
-loom           19317        -
-sweep          62872    60000
+architect      14963        -
+auditor        20552        -
+builder        30128        -
+champion       14260        -
+curator        45611    30000
+doctor         33092    30000
+driver         10810        -
+guide          44272        -
+hermit         16505        -
+judge          54350    30000
+loom           19329        -
+sweep          62884    60000
