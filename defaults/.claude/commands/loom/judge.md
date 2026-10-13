@@ -2182,9 +2182,10 @@ gh pr view <number> --json body --jq '.body'
 
 | Category | Examples | Action |
 |----------|----------|--------|
-| **Automatable** | "run `pnpm test:unit`", "verify output contains X", "check file Z exists", "run `pnpm check:ci`" | Execute and capture output |
+| **Automatable** | "run `pnpm test:unit`", "verify output contains X", "check file Z exists", "run `pnpm test:unit -- path/to/one.test.ts`" | Execute and capture output |
 | **Observation-only** | "watch for N seconds", "start daemon and observe", "verify UI behavior", "manually test in browser" | Flag as not executed — **except** when the diff touches browser-driving / scraper / DOM-parsing code, or the PR's linked issue reports a silent-omission failure (#6883), where "manually test in browser" is not sufficient on its own: see "Live Verification and the Circular-Fixture Smell" below |
 | **Long-running (>2 min)** | "run full integration suite", "stress test for 5 minutes" | Skip with explanation |
+| **Full suite / build gate** | "run `pnpm check:ci`", "run `buildGate.command`", "run `cargo test --workspace`", "run `build-gate.sh`" | Skip: CI already ran it — cite the green CI from step 2b (#11690) |
 | **External dependency** | "test against staging API", "verify email delivery" | Skip with explanation |
 | **Unclear/ambiguous** | Vague steps without concrete commands | Ask for clarification |
 
