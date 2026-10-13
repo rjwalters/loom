@@ -6451,7 +6451,7 @@ or a `loom:blocked` stop, to avoid comment spam on every dead-end attempt — th
 daemon can post ONE Markdown comment onto the sweep's **issue** (not just its
 PR) summarizing the already-assembled `sweep.outcome` telemetry record
 (`loom-daemon/src/telemetry/mod.rs`): the Curator's `loom:complexity` /
-`loom:points` estimate (see "Points estimate marker" in `curator.md`), actual
+`loom:points` estimate (see "Story points marker" in `curator.md`), actual
 token burn, wall-clock duration (total and per phase), Doctor cycle count, and
 the first-pass Judge verdict. This is the write-back half of #9056; the
 matching estimate-side marker (`<!-- loom:points=<N> -->`) is documented in

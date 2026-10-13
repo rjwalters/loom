@@ -61,10 +61,9 @@
 //! Two properties are reproduced exactly:
 //!
 //! 1. **Anchored to the full `<!-- ... -->` comment form**, never a bare
-//!    substring — the same anchoring `require-complexity-marker.sh` uses, for
-//!    the same reason (#4840): prose that merely *quotes* the marker syntax as
-//!    literal example text (as the convention doc itself does) must never be
-//!    mistaken for a live marker. A `<name>` placeholder breaks the `-->`
+//!    substring — the #4840 anchoring rule: prose that merely *quotes* the
+//!    marker syntax as literal example text (as the convention doc itself
+//!    does) must never be mistaken for a live marker. A `<name>` placeholder breaks the `-->`
 //!    anchor and is therefore skipped.
 //! 2. **Every match is collected, deduplicated** — unlike the complexity marker
 //!    (`tail -1`, last match wins, one tier per item), the whole declared set

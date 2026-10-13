@@ -183,8 +183,8 @@ pub(crate) const DEFAULT_TIER_ALIASES: &[(&str, &str)] = &[("opus", "claude-opus
 /// `crate::script_helpers::model_tiers` now calls straight into this function
 /// (via [`model_aliases_from_config`]), so the Rust semantics below — blank
 /// keys AND blank values dropped, cross-tier `deep_merge` union — are the only
-/// surviving definition. The `resolve-model.sh` / `resolve-tier-model.sh` /
-/// `sweep-experiment.sh` entry points and the daemon dispatch path therefore
+/// surviving definition. The `resolve-model.sh` / `sweep-experiment.sh` entry
+/// points and the daemon dispatch path therefore
 /// cannot disagree by construction.
 #[must_use]
 pub fn read_model_aliases(repo_root: &Path) -> BTreeMap<String, String> {
@@ -505,7 +505,7 @@ fn resolve_autonomous_model_for_runtime(
             log::warn!("sweep-experiment: {w}");
         }
         // The budget-fraction cap (#9122): an issue sampled OUT carries no arm
-        // and falls through to unmodified tier-2.5/tier-3 resolution below,
+        // and falls through to unmodified tier-3 resolution below,
         // exactly as if the experiment were off for it. Its stats records keep
         // `mode=experiment` with a null arm — the `observe`-mode convention.
         if se_arms::in_experiment(i64::from(issue), complexity.as_deref(), fraction) {
@@ -540,8 +540,7 @@ fn resolve_autonomous_model_for_runtime(
 ///
 /// **Never fails the dispatch.** A spawn failure, timeout, non-zero exit,
 /// unparseable payload, or absent marker all resolve to `None` — the unchanged
-/// pre-#4827 `routine` stratum. Mirrors `resolve-tier-model.sh`'s
-/// GraphQL-then-REST fallback (#4472): `gh issue view` is a GraphQL call, and
+/// pre-#4827 `routine` stratum. GraphQL-then-REST fallback (#4472): `gh issue view` is a GraphQL call, and
 /// GraphQL quota exhausts independently of REST under fleet load (epic #4432).
 ///
 /// Only ever called from inside [`resolve_autonomous_dispatch_model_lazy`]'s
@@ -553,7 +552,7 @@ pub fn fetch_issue_complexity(gh_bin: &Path, workspace_root: &Path, issue: u32) 
     let timeout = super::reaper::reap_gh_timeout();
     let repo = std::env::var("LOOM_REPO").ok();
 
-    // 1. GraphQL (`gh issue view`) — the same call `resolve-tier-model.sh` tries first.
+    // 1. GraphQL (`gh issue view`) first.
     // #10089: both reads are counted via the facade (`model.issue_body*`).
     use crate::claim_reconciliation::gh_call;
     let view = gh_call::read_within("model.issue_body", gh_bin, workspace_root, timeout)
@@ -1248,7 +1247,7 @@ mod tests {
     }
 
     /// The budget-fraction cap: `0.0` samples every issue OUT, so no arm is
-    /// forced and normal (tier-2.5/tier-3) resolution proceeds — `1.0` (the
+    /// forced and normal (tier-3) resolution proceeds — `1.0` (the
     /// default) keeps today's always-forced behavior.
     #[test]
     #[serial]

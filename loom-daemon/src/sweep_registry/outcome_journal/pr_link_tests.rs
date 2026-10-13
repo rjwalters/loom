@@ -73,7 +73,6 @@ fn seed_phase_history_with_prs(
                 phase: (*phase).to_string(),
                 at: started_at + chrono::Duration::seconds(60 * (i as i64 + 1)),
                 pr_number: *pr_number,
-                jev: None,
             })
             .collect(),
     );
@@ -89,7 +88,6 @@ impl SweepRegistry {
                 phase: "curator-done".to_string(),
                 at: Utc::now(),
                 pr_number: None,
-                jev: None,
             }],
         );
     }

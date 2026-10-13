@@ -260,7 +260,6 @@ pub mod ipc;
 pub mod issue_creation_mutex;
 pub mod issue_state_read;
 pub mod jev_merge_risk;
-pub mod jev_tier;
 pub mod journal;
 pub mod kimi_usage;
 pub mod label_registry;

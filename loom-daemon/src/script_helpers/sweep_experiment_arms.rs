@@ -39,8 +39,8 @@
 //! Arms are **Claude-runtime only**. An arm naming a non-Claude `runtime` is
 //! rejected loudly rather than silently ignored or dispatched — non-Claude
 //! runtime arms are Phase 2 (see issue #9122). An arm resolving to `fable` is
-//! likewise rejected, mirroring `resolve_tier_model`'s No-Fable refusal
-//! (#3702): warn, fall through, never fail the sweep.
+//! likewise rejected under the No-Fable bound (#3702): warn, fall through,
+//! never fail the sweep.
 
 use serde_json::Value;
 
@@ -286,8 +286,7 @@ fn parse_arm(item: &Value, idx: usize, config: &Value) -> Result<ExperimentArm, 
         }
     };
 
-    // No-Fable bound (#3702), checked before AND after alias resolution — the
-    // same two-sided refusal `model_tiers::resolve_tier_model` applies, so an
+    // No-Fable bound (#3702), checked before AND after alias resolution, so an
     // arm cannot reach fable through a `sweep.modelAliases` indirection either.
     if base_of(&model).contains("fable") {
         return Err(format!(
@@ -387,7 +386,7 @@ pub fn format_budget_skip_banner(issue: i64, fraction: f64, canary_source: Optio
         bar.clone(),
         format!("  LOOM MODEL EXPERIMENT — mode=EXPERIMENT  issue #{issue}"),
         format!("  NOT IN EXPERIMENT — sampled out by budget fraction {fraction}"),
-        "  No arm, no model forcing: normal tier-2.5/tier-3 resolution applies.".to_string(),
+        "  No arm, no model forcing: normal tier-3 resolution applies.".to_string(),
         "  Stats -> .loom/stats/sweep-model-stats.jsonl (arm null)".to_string(),
     ];
     if let Some(src) = canary_source {
