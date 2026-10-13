@@ -144,6 +144,7 @@ check_dependencies() {
             case $dep in
                 tmux)
                     echo "  brew install tmux (macOS) or apt-get install tmux (Linux)" >&2
+                    echo "  (or, to start only the daemon without tmux: start-daemon.sh --headless)" >&2
                     ;;
                 jq)
                     echo "  brew install jq (macOS) or apt-get install jq (Linux)" >&2
