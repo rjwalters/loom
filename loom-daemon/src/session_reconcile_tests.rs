@@ -75,6 +75,8 @@ struct FakeState {
     /// `(container, image, workspace)` per `create`.
     creates: Mutex<Vec<(String, String, PathBuf)>>,
     fail_create: Mutex<bool>,
+    /// `ensure_image` (inspect, then pull) cannot get the image.
+    fail_pull: Mutex<bool>,
     /// `docker inspect` fails with this error (Docker down / timed out).
     fail_inspect: Mutex<Option<String>>,
     /// A started/created container exits at once: `Some(true)` leaves it
@@ -161,7 +163,11 @@ impl FakeState {
             .filter(|c| {
                 !matches!(
                     c.as_str(),
-                    "inspect" | "has_active_exec" | "exec_capture" | "version_probe"
+                    "inspect"
+                        | "has_active_exec"
+                        | "exec_capture"
+                        | "version_probe"
+                        | "ensure_image"
                 )
             })
             .collect()
@@ -275,6 +281,13 @@ impl ContainerRunner for Fake {
                 .lock()
                 .unwrap()
                 .insert(container.into(), format!("loom-daemon {tag} (commit abc1234)"));
+        }
+        Ok(())
+    }
+    fn ensure_image(&self, image: &str) -> Result<()> {
+        self.log("ensure_image");
+        if *self.fail_pull.lock().unwrap() {
+            bail!("docker pull {image} failed: manifest unknown");
         }
         Ok(())
     }

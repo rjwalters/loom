@@ -321,6 +321,16 @@ pub(super) fn reconcile_skew<R: ContainerRunner>(
     // until a version changes (rule 3).
     mem.attempted = Some((have.clone(), host.clone()));
     mem.deferred = None;
+    // The pinned tag must be on hand before the teardown: `docker run` would
+    // pull it implicitly, but only after the seat is already gone. A failed
+    // pull leaves the container running on its old daemon.
+    if let Err(error) = lifecycle.runner().ensure_image(&pinned) {
+        log::warn!(
+            "session_reconcile: {container}: not recreating for skew: {pinned} is not \
+             available ({error:#}); left running"
+        );
+        return Ok(None);
+    }
     lifecycle.runner().stop_and_remove(&container, STOP_GRACE)?;
     let undo = UndoLock::HeldByCaller;
     recreate_container(lifecycle, name, &workspace, Some(pinned.clone()), &is_held, undo)?;

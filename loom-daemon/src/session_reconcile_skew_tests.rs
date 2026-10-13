@@ -227,3 +227,33 @@ fn a_failed_pinned_recreate_is_not_retried_until_a_version_changes() {
     let _ = skew_pass(&mut lifecycle, &env, &mut state, 10_000);
     assert_eq!(lifecycle.runner().count("stop_and_remove"), attempts);
 }
+
+#[test]
+#[serial]
+fn an_unavailable_pinned_image_leaves_the_seat_running() {
+    let env = setup(&["alice"], &["alice"]);
+    let mut lifecycle = SessionLifecycle::new(env.workspace.path(), Fake::default(), None);
+    seed(&lifecycle, Some("0.19.1151"), Some("0.19.624"));
+    *lifecycle.runner().fail_pull.lock().unwrap() = true;
+    let mut state = ReconcileState::default();
+    let out = skew_pass(&mut lifecycle, &env, &mut state, 0);
+    assert!(
+        !out.iter()
+            .any(|o| matches!(o, Outcome::SkewRecreated { .. })),
+        "{out:?}"
+    );
+    let fake = lifecycle.runner();
+    assert_eq!(fake.count("ensure_image"), 1);
+    assert_eq!(fake.count("stop_and_remove"), 0, "no teardown");
+    assert_eq!(fake.count("create"), 0);
+    let alice = fake
+        .containers
+        .lock()
+        .unwrap()
+        .get(&container_name("alice"))
+        .cloned();
+    assert!(alice.is_some_and(|c| c.running), "the seat is still running");
+    // The pair is recorded: not retried until a version changes.
+    let _ = skew_pass(&mut lifecycle, &env, &mut state, 60);
+    assert_eq!(lifecycle.runner().count("ensure_image"), 1);
+}
