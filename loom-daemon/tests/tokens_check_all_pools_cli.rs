@@ -2,7 +2,8 @@
 //! #7527).
 //!
 //! Uses `--source monitor` with `LOOM_CLAUDE_MONITOR_DIR` pointed at an empty
-//! directory so `run_check` takes the "no fresh claude-monitor ranking.json"
+//! directory (and an inherited `LOOM_LLM_MONITOR_DIR` removed, since it would
+//! win — #8849) so `run_check` takes the "no fresh claude-monitor ranking.json"
 //! early-return path (an empty report, no probe) — deterministic and
 //! network-free, since this suite is only exercising the `--all-pools`
 //! pool-enumeration/fan-out plumbing, not the probe itself (already covered
@@ -64,6 +65,7 @@ fn check_all_pools_prints_one_section_per_discovered_pool() {
         .args(["tokens", "check", "--all-pools", "--source", "monitor"])
         .env("LOOM_WORKSPACES_PATH", &registry_path)
         .env("LOOM_SHARED_TOKENS_DIR", &shared_dir)
+        .env_remove("LOOM_LLM_MONITOR_DIR")
         .env("LOOM_CLAUDE_MONITOR_DIR", &empty_monitor_dir)
         .output()
         .unwrap();
@@ -123,6 +125,7 @@ fn check_all_pools_json_lists_each_discovered_pool_once() {
         ])
         .env("LOOM_WORKSPACES_PATH", &registry_path)
         .env("LOOM_SHARED_TOKENS_DIR", &shared_dir)
+        .env_remove("LOOM_LLM_MONITOR_DIR")
         .env("LOOM_CLAUDE_MONITOR_DIR", &empty_monitor_dir)
         .output()
         .unwrap();

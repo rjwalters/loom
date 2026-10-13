@@ -18,15 +18,12 @@
 //!
 //! ```bash
 //! LOOM_E2E_OTLP_ENDPOINT=http://127.0.0.1:14319 \
-//!   cargo test -p loom-daemon --features otlp session_output::e2e \
+//!   cargo test -p loom-daemon session_output::e2e \
 //!   -- --ignored --nocapture
 //! ```
 //!
-//! The `otlp` feature is required: [`OtlpExporter`] is behind it, and a plain
-//! `cargo test` deliberately does not pull in `opentelemetry-proto`. That is
-//! also why this module is `#[cfg(feature = "otlp")]` rather than merely
-//! `#[ignore]`d — without the feature there is no real exporter to exercise,
-//! and a version of this test that hand-rolled the HTTP POST would be
+//! These drive the real [`OtlpExporter`] (compiled into every build since
+//! #10700); a version of this test that hand-rolled the HTTP POST would be
 //! verifying its own plumbing instead of the daemon's.
 //!
 //! Each test prints the `event_id`s it published. Those are the join key for

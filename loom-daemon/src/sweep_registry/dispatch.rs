@@ -6,7 +6,12 @@ mod log_paths;
 
 use super::*;
 
+// Issue #8865: per-cause streak and log wording of the dispatch backoff.
+mod backoff_cause;
 pub(super) mod child_env_markers;
+
+// Issue #11304: claim-unwind + post-claim closed-issue re-verification.
+mod claim_release;
 
 // Issue #10348: the dispatched `sweep-lease-renew.sh start` command.
 mod lease_renewal_start;
@@ -461,7 +466,7 @@ impl std::fmt::Display for TokenSelectionDispatchError {
         write!(
             f,
             "issue #{}: spawned child exited immediately — token selection failed (no usable \
-             OAuth token in the pool). Add accounts to ~/.claude-monitor/accounts.env then \
+             OAuth token in the pool). Add accounts to ~/.llm-monitor/accounts.env then \
              `loom-daemon tokens bootstrap`, or re-probe an existing pool with `loom-daemon \
              tokens check --ranking`. See the sweep log for the exact failure: {}",
             self.issue,
@@ -1219,10 +1224,11 @@ impl SweepRegistry {
         let max_secs =
             i64::try_from(self.dispatch_backoff_config.max.as_secs()).unwrap_or(i64::MAX);
         let consecutive = match self.dispatch_backoff.get(&issue) {
-            Some(prev) if (now - prev.last_failure_at).num_seconds() <= max_secs => {
+            Some(prev) if backoff_cause::continues(prev, cause, now, max_secs) => {
                 prev.consecutive.saturating_add(1)
             }
-            // No prior record, or the streak went cold — start a fresh streak.
+            // No prior record, the streak went cold, or it was the other
+            // cause's streak (#8865) — start a fresh streak.
             _ => 1,
         };
         let delay = backoff_delay(
@@ -1241,11 +1247,7 @@ impl SweepRegistry {
                 cause,
             },
         );
-        log::info!(
-            "sweep_registry: issue #{issue} dispatch backoff armed — {consecutive} consecutive \
-             failed dispatch(es), next attempt allowed in {}s (#4485; cause={cause:?})",
-            delay.as_secs()
-        );
+        backoff_cause::log_armed(issue, consecutive, delay, cause);
         // Issue #7477: broadcast the armed window fleet-wide so a peer host
         // does not immediately re-attempt the same failing candidate this
         // host just backed off on — see `publish_peer_cooldown_claim`'s doc
@@ -1581,6 +1583,7 @@ impl SweepRegistry {
             None,
             None,
             Some(resume_pr),
+            DispatchOrigin::ReaperRetry,
         )
     }
 
@@ -1597,6 +1600,7 @@ impl SweepRegistry {
     /// IPC handler for `DispatchSweep`, `ipc.rs::dispatch_sweep_nonblocking`).
     /// Kept for `dispatch()` / `dispatch_resume_after_crash()` and unit
     /// tests, where lock contention is irrelevant.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn dispatch_inner(
         &mut self,
         kind: &SweepKind,
@@ -1605,6 +1609,7 @@ impl SweepRegistry {
         effort: Option<&str>,
         depends_on: Option<u32>,
         resume_bypass_pr: Option<u32>,
+        origin: DispatchOrigin,
     ) -> Result<DispatchOutcome> {
         match self.begin_issue_dispatch_with_model(
             kind,
@@ -1613,6 +1618,7 @@ impl SweepRegistry {
             effort,
             depends_on,
             resume_bypass_pr,
+            origin,
         )? {
             BeginIssueDispatch::Done(result) => result,
             BeginIssueDispatch::Spawned(mut prepared) => {
@@ -1702,6 +1708,7 @@ impl SweepRegistry {
         depends_on: Option<u32>,
         resume_bypass_pr: Option<u32>,
         prepared_launch: Option<private_dispatch::PreparedLaunch>,
+        dispatch_origin: DispatchOrigin,
     ) -> Result<BeginIssueDispatch> {
         // 1. Idempotency dedup against Running entries.
         if let Some(ref key) = idempotency_key {
@@ -1822,6 +1829,7 @@ impl SweepRegistry {
             let resolved_model = model.resolve(&self.config, kind, admission.admitted.as_ref());
             (admission, resolved_model, None)
         };
+        let model_source = model.source();
         let model = resolved_model.as_deref();
 
         // 2. `Issue` and `PrSet` dispatch diverge here (Issue #5342): `PrSet`
@@ -1832,6 +1840,8 @@ impl SweepRegistry {
         let issue_number = match kind {
             SweepKind::Issue(n) => *n,
             SweepKind::PrSet(prs) => {
+                // #11191: disk admission, as for an issue before step 3.
+                crate::disk_admission::admit_dispatch(&self.config.workspace_root, kind)?;
                 return Ok(BeginIssueDispatch::Done(self.dispatch_prset_inner(
                     prs,
                     kind,
@@ -1921,14 +1931,8 @@ impl SweepRegistry {
                 .into());
             }
 
-            if self.guard_closed_or_pr(issue_number) == Some(true) {
-                return Err(anyhow!(
-                    "refusing to dispatch issue #{issue_number}: it is closed on the forge, or \
-                     the number resolves to a pull request rather than an open issue (#4088/#4504 \
-                     closed-issue guard). A watchdog re-dispatch must not re-claim a closed/merged \
-                     issue or a PR number."
-                ));
-            }
+            // #11429: a closed issue is refused as `already_landed`.
+            self.refuse_closed_issue(issue_number)?;
         }
 
         // 2.6 Open-PR guard (Issue #4123). Every in-memory dedup signal — the
@@ -1997,6 +2001,15 @@ impl SweepRegistry {
                      open-PR guard for its own PR #{pr} (#4256)"
                 );
             }
+        }
+
+        // #11429: a `landed` outcome on this host's journal refuses as
+        //     `already_landed`. It runs after 2.6, so an issue whose PR is
+        //     still open gets `OpenPrDispatchError` first, which the
+        //     review-stall watchdog converts to a PrSet dispatch (#7649). A
+        //     crash resume of the issue's own sweep is exempt.
+        if resume_bypass_pr.is_none() {
+            self.refuse_recent_landing(issue_number, Utc::now())?;
         }
 
         // 2.7 Park-label guard (Issue #4444). The work-finder's `SKIP_LABELS`
@@ -2172,12 +2185,8 @@ impl SweepRegistry {
         if resume_bypass_pr.is_none() {
             if let Some(remaining) = self.dispatch_backoff_remaining(issue_number, Utc::now()) {
                 let consecutive = self.dispatch_failure_count(issue_number);
-                log::info!(
-                    "sweep_registry: refusing to dispatch issue #{issue_number} — \
-                     {consecutive} consecutive failed dispatch(es), {}s of backoff remaining \
-                     (#4485)",
-                    remaining.as_secs()
-                );
+                let window = self.dispatch_backoff.get(&issue_number);
+                backoff_cause::log_refused(issue_number, window, remaining);
                 return Err(DispatchBackoffError {
                     issue: issue_number,
                     consecutive,
@@ -2282,6 +2291,17 @@ impl SweepRegistry {
             .into());
         }
 
+        // 2.98 Disk admission (#11191): the repo's measured disk charge must fit
+        //      the free space left after the halt floor and the growth the
+        //      in-flight sweeps are still expected to write. Last of the guards,
+        //      so a candidate another guard refuses never leaves a pending
+        //      reservation behind; before any claim, label or spawn. Every
+        //      dispatch route converges here — the work finder, the watchdogs'
+        //      re-dispatch (#3910) and PR-set conversion (#7649, the PrSet arm
+        //      above), the reaper's resume (#4256), IPC/CLI and the epic
+        //      supervisor — so none of them bypasses the work finder's rule.
+        crate::disk_admission::admit_dispatch(&self.config.workspace_root, kind)?;
+
         // 3. Acquire the claim lock atomically.
         let sweep_id = generate_sweep_id(kind);
         if let Some(selection) = &selection {
@@ -2327,6 +2347,9 @@ impl SweepRegistry {
         // local window of this dispatcher's own flip, so step 4d can tell a
         // phantom (own flip misread) from a genuine hand-claim.
         let mut leaseless_flip_window: Option<(DateTime<Utc>, DateTime<Utc>)> = None;
+        // #11304: set once the flip below succeeds, so the post-claim state
+        // re-check (4e) only runs for a claim this dispatch actually took.
+        let mut claim_flipped = false;
         if !self.config.skip_label_flip {
             // 4a. Cross-host collision guard (Issue #4085, Phase 0 of #4028;
             //     upgraded from detection-only to enforcement by #5789): read
@@ -2353,14 +2376,8 @@ impl SweepRegistry {
                      advertisement this host had already applied instead of flipping the label \
                      and duplicating the sweep."
                 );
-                self.publish_peer_claim(peer_claims::ClaimKind::Retract, issue_number);
-                let _ = self.release_lock_owned(issue_number, &sweep_id);
-                // #9572: this attempt is abandoned — release the in-flight
-                // idempotency key claimed at step 3.05 so a later same-key
-                // dispatch is not wedged behind a sweep that never spawned.
-                if let Some(ref key) = idempotency_key {
-                    self.inflight_idempotency.remove(key);
-                }
+                // #9572: also releases the in-flight idempotency key (3.05).
+                self.unwind_local_claim(issue_number, &sweep_id, idempotency_key.as_ref());
                 return Err(CollisionDispatchError {
                     issue: issue_number,
                     source: CollisionSource::ForgeLabel { labels },
@@ -2369,6 +2386,7 @@ impl SweepRegistry {
             }
             match self.flip_label_to_building(issue_number) {
                 Ok(()) => {
+                    claim_flipped = true;
                     // 4b. Write the lease record (Issue #6179, Epic #6165
                     //     Phase 1): a best-effort forge comment documenting
                     //     which host/sweep now holds this claim, posted only
@@ -2488,6 +2506,16 @@ impl SweepRegistry {
             .into());
         }
 
+        // 4e. Post-claim closed-issue re-verification (Issue #11304): release a
+        //     claim the fail-open 2.5 guard let through. See `claim_release.rs`.
+        if claim_flipped {
+            self.release_claim_if_closed_after_flip(
+                issue_number,
+                &sweep_id,
+                idempotency_key.as_ref(),
+            )?;
+        }
+
         // 5. Compute the log path and spawn the child.
         //
         // Serialize concurrent child startups (Issue #3887): enforce a minimum
@@ -2536,14 +2564,8 @@ impl SweepRegistry {
                     let _ = self.restore_label_to_ready(issue_number);
                     self.note_label_flip(issue_number); // #4485 flap detection
                 }
-                self.publish_peer_claim(peer_claims::ClaimKind::Retract, issue_number);
-                let _ = self.release_lock_owned(issue_number, &sweep_id);
-                // #9572: this attempt is abandoned — release the in-flight
-                // idempotency key claimed at step 3.05 so a later same-key
-                // dispatch is not wedged behind a sweep that never spawned.
-                if let Some(ref key) = idempotency_key {
-                    self.inflight_idempotency.remove(key);
-                }
+                // #9572: also releases the in-flight idempotency key (3.05).
+                self.unwind_local_claim(issue_number, &sweep_id, idempotency_key.as_ref());
                 return Err(e.context("failed to spawn sweep child"));
             }
         };
@@ -2561,6 +2583,8 @@ impl SweepRegistry {
             depends_on,
             admission,
             story_points,
+            model_source,
+            dispatch_origin,
             mid_spawn: self.roll_gate.enter(),
         })))
     }
@@ -2598,6 +2622,8 @@ impl SweepRegistry {
             depends_on,
             mut admission,
             story_points,
+            model_source,
+            dispatch_origin,
             mid_spawn: _mid_spawn, // #10974: held until the entry is recorded
         } = prepared;
 
@@ -2824,19 +2850,16 @@ impl SweepRegistry {
         // 7. Emit `sweep.global.dispatch` (best-effort — never block
         //    dispatch progress on the bus). If no subscribers are
         //    listening, the bus returns NoSubscribers; log at debug.
-        self.emit_event(Event::SweepGlobalDispatch {
-            sweep_id: sweep_id.clone(),
-            kind: kind.clone(),
-            runtime: admission.admitted.as_ref().map(|a| a.runtime.clone()),
-            runtime_source: admission.admitted.as_ref().map(|a| a.source.clone()),
-            // Stamped by `emit_event` -> `set_repo_if_absent` below (#4201),
-            // matching the pattern already used for SweepPhase/Blocker/Exited/
-            // Crashed — leave it `None` at construction.
-            repo: None,
-            // #9432: the size estimate resolved at step 2.71 from the labels
-            // the park guard already read. Absent for an unsized issue.
+        //    #9432: `story_points` is the size estimate resolved at step 2.71
+        //    from the labels the park guard already read. #11280: the event
+        //    also carries this sweep's start facts (`start_facts.rs`).
+        //    #11444: and who asked for it (`dispatch_origin`).
+        self.emit_dispatch(
+            &sweep_id,
+            &admission,
             story_points,
-        });
+            Some((model_source, dispatch_origin)),
+        );
 
         Ok(DispatchOutcome {
             sweep_id,
@@ -2951,7 +2974,7 @@ impl SweepRegistry {
             }
             return Err(anyhow!(
                 "PR set {prs:?}: spawned child exited immediately — token selection failed (no \
-                 usable OAuth token in the pool). Add accounts to ~/.claude-monitor/accounts.env \
+                 usable OAuth token in the pool). Add accounts to ~/.llm-monitor/accounts.env \
                  then `loom-daemon tokens bootstrap`, or re-probe an existing pool with \
                  `loom-daemon tokens check --ranking`. See the sweep log for the exact failure: {}",
                 log_path.display()
@@ -3004,17 +3027,10 @@ impl SweepRegistry {
         // stranded `loom:building` claim — a `PrSet` dispatch claims no
         // issue, so there is nothing for that recovery path to re-arm.
 
-        self.emit_event(Event::SweepGlobalDispatch {
-            sweep_id: sweep_id.clone(),
-            kind: kind.clone(),
-            runtime: admission.admitted.as_ref().map(|a| a.runtime.clone()),
-            runtime_source: admission.admitted.as_ref().map(|a| a.source.clone()),
-            repo: None,
-            // A `PrSet` dispatch claims no issue (see this method's doc
-            // comment), so there is no `points:*` label to resolve — omitted,
-            // never `0` (#9432).
-            story_points: None,
-        });
+        // A `PrSet` dispatch claims no issue (see this method's doc
+        // comment), so there is no `points:*` label to resolve — omitted,
+        // never `0` (#9432) — and no attempt lineage (#11280).
+        self.emit_dispatch(&sweep_id, &admission, None, None);
 
         Ok(DispatchOutcome {
             sweep_id,
@@ -3426,6 +3442,7 @@ pub(crate) fn dispatch_model_releasing_poll_lock(
     model: DispatchModel<'_>,
     effort: Option<&str>,
     depends_on: Option<u32>,
+    origin: DispatchOrigin,
 ) -> Result<DispatchOutcome> {
     let prepared_launch = if tokio::runtime::Handle::try_current().is_ok() {
         tokio::task::block_in_place(|| {
@@ -3448,6 +3465,7 @@ pub(crate) fn dispatch_model_releasing_poll_lock(
             depends_on,
             None,
             prepared_launch,
+            origin,
         )
     };
 
@@ -3511,3 +3529,8 @@ mod forge_egress_tests;
 // Issue #8997's rate-limited label-flip breaker coverage (same reason).
 #[cfg(test)]
 mod rate_limit_tests;
+
+// Issue #11304's post-claim closed-issue re-verification coverage — a sibling
+// module for the same reason as the ones above.
+#[cfg(test)]
+mod closed_after_claim_tests;

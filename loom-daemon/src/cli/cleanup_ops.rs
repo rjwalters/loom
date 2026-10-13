@@ -188,7 +188,7 @@ fn clean_cargo_target_orphans(repo_root: &std::path::Path, dry_run: bool, force:
     println!();
     println!("Cleaning Orphaned Cargo Target Dirs\n");
     let remove = force && !dry_run;
-    let report = orphans::run_now(repo_root, orphans::resolve_max_age_hours(&config), !remove);
+    let report = orphans::run_now(repo_root, orphans::resolve_ages(&config), !remove);
     let listed = if remove {
         &report.removed
     } else {

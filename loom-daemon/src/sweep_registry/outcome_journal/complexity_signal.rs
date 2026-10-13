@@ -1,19 +1,15 @@
-//! Curator complexity-tier signal for `sweep.outcome` (Issue #8542), plus the
-//! issue's own end state (Issue #9441) — both off ONE forge read.
+//! Issue signals for `sweep.outcome`: the issue's own end state (Issue #9441)
+//! and its `points:*` labels (Issue #9432), both off ONE forge read. The file
+//! keeps its historical name; the Curator complexity tier it once also parsed
+//! was retired in #11665 (issue-sizing design §6.3).
 //!
 //! # Why a forge read at terminal transition, not a dispatch-time plumb
 //!
-//! `resolve-tier-model.sh` already reads an issue's `<!-- loom:complexity=
-//! <tier> -->` marker at dispatch time to pick a model, but that resolution
-//! happens in a shell process outside the daemon (and via several different
-//! entry points — `dispatch_sweep`, the epic supervisor, the work finder, the
-//! role runner), so there is no single dispatch-time seam that could hand the
-//! resolved tier to [`crate::sweep_registry::SweepRegistry`] without plumbing
-//! a new parameter through every one of them.
-//!
-//! The marker itself is a durable, essentially-static property of the
-//! ISSUE (the Curator sets it once; it does not change over the sweep's
-//! lifetime the way PR labels do), so re-reading it from the forge at the
+//! A sweep is dispatched via several different entry points —
+//! `dispatch_sweep`, the epic supervisor, the work finder, the role runner —
+//! so there is no single dispatch-time seam that could hand the issue's state
+//! to [`crate::sweep_registry::SweepRegistry`] without plumbing a new
+//! parameter through every one of them. Re-reading it from the forge at the
 //! SAME terminal transition that already reads the PR label timeline for
 //! [`crate::telemetry::SweepOutcomeRecord::doctor_cycles`] /
 //! [`judge_verdicts`](crate::telemetry::SweepOutcomeRecord::judge_verdicts)
@@ -28,7 +24,7 @@
 //! Curator handed it back for re-scoping". All three are the issue's own
 //! state, and the single REST object this module already fetches carries
 //! every field that answers them (`state`, `closed_at`, `labels`). So the
-//! `--jq` filter widened from `.body` to a small projection and the SAME call
+//! `--jq` filter is a small projection and the SAME call
 //! now yields both signals: **no extra forge round trip**, and the two can
 //! never disagree about which issue they described.
 //!
@@ -36,21 +32,13 @@
 //!
 //! Every failure — `skip_label_flip`, the fleet rate-limit breaker
 //! suppressing forge polling, spawn error, timeout, non-zero exit, unparseable
-//! output, an issue body with no recognized marker — yields an empty
-//! [`IssueSignals`], which the caller turns into an **absent** `complexity`
-//! key and an unconstrained (`None`) end state. Never a fabricated
-//! `"routine"`: unlike `resolve-tier-model.sh`'s own dispatch-time fold (an
-//! absent/unrecognized marker there is a deliberate SAFE DEFAULT for model
-//! selection), this journal field must stay honest about "unobserved" — a
-//! routing-evaluation consumer needs the true absence rate, not a default
-//! masquerading as data. The end state is held to the same standard: an
-//! unread issue is `None`, which classifies as "no forge opinion", never as
-//! "still open".
+//! output — yields an empty [`IssueSignals`], which the caller turns into an
+//! unconstrained (`None`) end state and an absent `story_points`. An unread
+//! issue is `None`, which classifies as "no forge opinion", never as "still
+//! open".
 
 use super::*;
 
-use crate::script_helpers::model_tiers::COMPLEXITY_TIERS;
-use crate::script_helpers::sweep_experiment::extract_complexity_marker;
 use crate::telemetry::IssueEndState;
 
 /// The pre-build labels a Curator hands an issue BACK to when it rescopes
@@ -90,9 +78,6 @@ const PIPELINE_LABELS: [&str; 2] = ["loom:issue", "loom:building"];
 /// whatever it did resolve.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct IssueSignals {
-    /// The Curator's `<!-- loom:complexity=<tier> -->` marker, validated
-    /// against the closed `mechanical`/`routine`/`complex` vocabulary.
-    pub(crate) complexity: Option<String>,
     /// Whether the issue's `state` is `closed`. `None` when the read failed.
     pub(crate) closed: Option<bool>,
     /// When it was closed, for a closed issue that reported a timestamp.
@@ -145,7 +130,7 @@ impl IssueSignals {
     /// The Curator's story-point size for this issue (Issue #9432, epic #9429),
     /// folded out of [`Self::labels`] — the label list this read ALREADY
     /// carries for the #9441 end state, so points cost **no** extra forge round
-    /// trip and can never describe a different issue than `complexity` does.
+    /// trip and can never describe a different issue than the end state does.
     ///
     /// Delegates the vocabulary and the one-`points:*`-label-per-issue guard to
     /// [`crate::story_points::resolve_story_points`], which is also what the
@@ -169,12 +154,6 @@ fn parse_issue_signals(stdout: &str) -> IssueSignals {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(stdout.trim()) else {
         return IssueSignals::default();
     };
-    let complexity = value
-        .get("body")
-        .and_then(serde_json::Value::as_str)
-        .and_then(extract_complexity_marker)
-        .filter(|tier| COMPLEXITY_TIERS.contains(tier))
-        .map(str::to_string);
     let closed = value
         .get("state")
         .and_then(serde_json::Value::as_str)
@@ -196,7 +175,6 @@ fn parse_issue_signals(stdout: &str) -> IssueSignals {
         })
         .unwrap_or_default();
     IssueSignals {
-        complexity,
         closed,
         closed_at,
         labels,
@@ -204,8 +182,8 @@ fn parse_issue_signals(stdout: &str) -> IssueSignals {
 }
 
 impl SweepRegistry {
-    /// Best-effort issue signals for `issue` — the Curator complexity tier
-    /// (Issue #8542) and the issue's end state (Issue #9441) — read via ONE
+    /// Best-effort issue signals for `issue` — the issue's end state
+    /// (Issue #9441) and its labels (Issue #9432) — read via ONE
     /// REST `gh api` call on the independent, larger pool, not the GraphQL one
     /// every agent-side `gh issue view` burns (the same reasoning
     /// [`super::label_timeline::fetch_timeline_signals`] documents for the PR
@@ -222,15 +200,15 @@ impl SweepRegistry {
         if crate::rate_limit_breaker::global_skip_pass("outcome_journal") {
             log::debug!(
                 "sweep_outcomes: skipping the issue #{issue} signal read — the \
-                 rate-limit breaker is suppressing forge polling (#8542/#9441)"
+                 rate-limit breaker is suppressing forge polling (#9441/#9432)"
             );
             return IssueSignals::default();
         }
         let path = format!("repos/{{owner}}/{{repo}}/issues/{issue}");
-        // One projection, four signals. Kept to exactly the keys this module
+        // One projection, three signals. Kept to exactly the keys this module
         // consumes so the payload stays small and no unrelated issue content
-        // (title, assignees, comment bodies) is ever read into the daemon.
-        let jq = "{body: .body, state: .state, closed_at: .closed_at, \
+        // (title, body, assignees, comments) is ever read into the daemon.
+        let jq = "{state: .state, closed_at: .closed_at, \
                   labels: [(.labels // [])[] | .name]}";
         // Resolved against THIS registry's repo with its own GH_CONFIG_DIR and
         // `LOOM_REPO` as GH_REPO (#8263) — the same rationale as the
@@ -246,8 +224,8 @@ impl SweepRegistry {
                 );
                 log::warn!(
                     "sweep_outcomes: issue #{issue} signal read failed ({}) — \
-                     omitting complexity/disposition signals, record still written \
-                     (#8542/#9441): {stderr}",
+                     omitting disposition/points signals, record still written \
+                     (#9441/#9432): {stderr}",
                     o.status
                 );
                 return IssueSignals::default();
@@ -255,15 +233,15 @@ impl SweepRegistry {
             Ok(None) => {
                 log::warn!(
                     "sweep_outcomes: issue #{issue} signal read timed out — omitting \
-                     complexity/disposition signals, record still written (#8542/#9441)"
+                     disposition/points signals, record still written (#9441/#9432)"
                 );
                 return IssueSignals::default();
             }
             Err(e) => {
                 log::warn!(
                     "sweep_outcomes: could not invoke gh for issue #{issue}'s signals: \
-                     {e} — omitting complexity/disposition signals, record still written \
-                     (#8542/#9441)"
+                     {e} — omitting disposition/points signals, record still written \
+                     (#9441/#9432)"
                 );
                 return IssueSignals::default();
             }
@@ -283,25 +261,12 @@ mod tests {
             .with_timezone(&Utc)
     }
 
-    /// The marker vocabulary this module accepts is exactly
-    /// `resolve-tier-model.sh`'s closed enum — nothing else, not even a value
-    /// that `resolve-tier-model.sh` itself would fold to `routine`.
-    #[test]
-    fn valid_tiers_are_exactly_the_closed_vocabulary() {
-        for tier in ["mechanical", "routine", "complex"] {
-            assert!(COMPLEXITY_TIERS.contains(&tier));
-        }
-        assert!(!COMPLEXITY_TIERS.contains(&"trivial"));
-        assert!(!COMPLEXITY_TIERS.contains(&""));
-    }
-
     #[test]
     fn parses_the_full_projection() {
         let signals = parse_issue_signals(
-            r#"{"body":"text\n<!-- loom:complexity=complex -->\n","state":"closed",
+            r#"{"state":"closed",
                 "closed_at":"2026-09-29T10:00:00Z","labels":["loom:building","tier:2"]}"#,
         );
-        assert_eq!(signals.complexity.as_deref(), Some("complex"));
         assert_eq!(signals.closed, Some(true));
         assert_eq!(signals.closed_at, Some(at("2026-09-29T10:00:00Z")));
         assert_eq!(signals.labels, vec!["loom:building", "tier:2"]);
@@ -309,9 +274,7 @@ mod tests {
 
     #[test]
     fn an_open_issue_has_no_closed_at_and_is_not_closed() {
-        let signals =
-            parse_issue_signals(r#"{"body":null,"state":"open","closed_at":null,"labels":[]}"#);
-        assert_eq!(signals.complexity, None);
+        let signals = parse_issue_signals(r#"{"state":"open","closed_at":null,"labels":[]}"#);
         assert_eq!(signals.closed, Some(false));
         assert_eq!(signals.closed_at, None);
         assert_eq!(
@@ -390,7 +353,7 @@ mod tests {
         // The full hand-back shape a Curator actually leaves behind: the
         // persistent `loom:curated` milestone plus a fresh `loom:triage`.
         assert_eq!(
-            open_with(&["loom:curated", "loom:triage", "tier:goal-supporting"]).end_state(None),
+            open_with(&["loom:curated", "loom:triage", "enhancement"]).end_state(None),
             Some(IssueEndState::Rescoped)
         );
     }
@@ -416,7 +379,7 @@ mod tests {
         }
         // The real-world label set of a curated, promoted, claimed issue.
         assert_eq!(
-            open_with(&["loom:curated", "loom:building", "tier:goal-supporting"]).end_state(None),
+            open_with(&["loom:curated", "loom:building", "enhancement"]).end_state(None),
             Some(IssueEndState::StillOpen)
         );
     }
@@ -427,14 +390,14 @@ mod tests {
     #[test]
     fn story_points_are_folded_out_of_the_same_projection() {
         let sized = parse_issue_signals(
-            r#"{"body":"text","state":"open","closed_at":null,
+            r#"{"state":"open","closed_at":null,
                 "labels":["loom:building","loom:curated","points:5"]}"#,
         );
         assert_eq!(sized.story_points(9432), Some(5));
 
         // No points label at all: absent, NOT zero.
         let no_points = parse_issue_signals(
-            r#"{"body":"text","state":"open","closed_at":null,
+            r#"{"state":"open","closed_at":null,
                 "labels":["loom:building","loom:curated"]}"#,
         );
         assert_eq!(no_points.story_points(9432), None);
@@ -442,7 +405,7 @@ mod tests {
         // Stacked labels: logged loudly by `resolve_story_points` and resolved
         // to NO value — never to either of the two candidates.
         let stacked = parse_issue_signals(
-            r#"{"body":"text","state":"open","closed_at":null,
+            r#"{"state":"open","closed_at":null,
                 "labels":["points:3","points:8"]}"#,
         );
         assert_eq!(stacked.story_points(9432), None);

@@ -131,8 +131,8 @@ and storage checks independently of UI exports.
 ## Real trace and repair-waterfall verification
 
 This closes the two acceptance items `evidence.md`'s "Dependency status
-update" section leaves open. It needs a `loom-daemon` binary built with
-`--features otlp` and this deployment running with the shared collector from
+update" section leaves open. It needs a `loom-daemon` binary (every build
+exports OTLP since #10700) and this deployment running with the shared collector from
 `../collector` in front of it (`LOOM_CLICKSTACK_INGEST_KEY_FILE` pointed at
 this project's ingestion key).
 
@@ -162,15 +162,14 @@ the equivalent one-shot POST for an already-assembled envelope batch.
 checkpoint CLI sequence as the two tests above, and a real
 `telemetry-export` POST) into one reproducible, credential-free recipe —
 `#[ignore]`d so CI never runs it against a receiver, and compiled/linted like
-any other in-tree test (`cargo clippy --package loom-daemon --features otlp
---all-targets`) so it cannot silently rot. Run it once this deployment (or
+any other in-tree test (`cargo clippy --package loom-daemon --all-targets`) so it cannot silently rot. Run it once this deployment (or
 the neutral collector in front of it) is up:
 
 ```console
 LOOM_TRIAL_COLLECTOR_ENDPOINT=http://localhost:<collector port> \
 LOOM_TRIAL_COLLECTOR_KEY_FILE=/absolute/private/clickstack-ingest.key \
 LOOM_TRIAL_EVIDENCE_DIR=/absolute/private/new-evidence-dir \
-cargo test -p loom-daemon --features otlp --test clickstack_trial_canary \
+cargo test -p loom-daemon --test clickstack_trial_canary \
   -- --ignored --nocapture
 ```
 

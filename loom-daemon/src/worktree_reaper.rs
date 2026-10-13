@@ -785,7 +785,12 @@ pub fn reap_repo(repo_root: &Path, config: &WorktreeReaperConfig) -> ReapReport 
     // both worktree reclaim passes above, so the cheap regenerable-artifact
     // sweeps get their bytes back before the expensive pressure-gated one
     // decides whether the host is still short (#5939 rebase).
-    crate::deep_clean::run_for(repo_root, resolve_disk_warn_free_gb(config));
+    //
+    // #11192: below the floor, the cross-root idle worktree target pass
+    // (#11071) runs first, on this scheduled path as well as the eager one,
+    // sharing one host-wide window with it — so it no longer depends on the
+    // eager trigger re-arming. Then the deep pass, exactly as before.
+    crate::eager_reclaim::scheduled_pressure_tier(repo_root, resolve_disk_warn_free_gb(config));
 
     // #7332: Docker image retention — the session-container CI/smoke/audit
     // flows leave dangling/superseded `loom-worker*` images on the executing

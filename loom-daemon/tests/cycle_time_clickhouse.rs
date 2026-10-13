@@ -27,8 +27,10 @@
 //! seven rows on insert to that same 168h TTL. That is the data loss this whole
 //! artifact set exists to survive, so the fixture is relative-time now and the
 //! incident is recorded in the template's own header.
-#![cfg(feature = "otlp")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+#[path = "common/hub_image.rs"]
+mod hub_image;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -135,7 +137,7 @@ impl Stack {
             &format!("CLICKHOUSE_PASSWORD={}", stack.password),
             "--ulimit",
             "nofile=262144:262144",
-            CLICKHOUSE_IMAGE,
+            &hub_image::resolve(CLICKHOUSE_IMAGE),
         ]));
         let deadline = Instant::now() + Duration::from_secs(120);
         while stack.try_query("SELECT 1").is_none() {
@@ -162,7 +164,7 @@ impl Stack {
                     .join("tests/fixtures/cycle_time/collector.yaml")
                     .display()
             ))
-            .arg(COLLECTOR_IMAGE));
+            .arg(hub_image::resolve(COLLECTOR_IMAGE)));
         stack
     }
 

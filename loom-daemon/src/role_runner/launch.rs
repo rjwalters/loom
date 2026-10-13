@@ -6,6 +6,9 @@ use super::*;
 pub(super) mod sandbox_noop;
 // #10455: a tick refused because the session container was down gets its own
 // failure reason (and `loom.admission.reason`), not a bare RECOVERABLE/78.
+mod curation;
+// #11727: an exit-0 tick whose every tool call a guard hook denied is a failure.
+mod hook_denied;
 mod session_down;
 // #10364: likewise a tick refused because the running container does not
 // mount the tick's working directory (a repo registered after it was created).
@@ -61,7 +64,9 @@ pub(super) fn apply_role_observability(
 
 // #10640: why a launched tick failed, for its `loom.role_attempt` span.
 mod failure_class;
-use crate::observability::lifecycle::note_role_failure;
+// #11453: each launched tick's failure class (or success) is also counted
+// against its (workspace, role, tap) launch-failure hold.
+mod hold_feed;
 
 /// Run `spawn-claude.sh -p "<prompt>" --model <model> [--effort <level>]
 /// --dangerously-skip-permissions` in `workspace_root`, appending combined
@@ -196,6 +201,7 @@ pub(super) fn run_role_with_timeout(
 
     let mut cmd = Command::new(script);
     cmd.env(crate::provenance::origin::ENV, "autonomous");
+    curation::prepare(&mut cmd, role, model, admission.map(|a| a.runtime.as_str()));
     // #10832: a roll resume passes no prompt of its own (see
     // `sweep_registry::spawn_process`'s identical branch).
     match resume.map(|r| r.launch.runtime.as_str()) {
@@ -332,10 +338,13 @@ pub(super) fn run_role_with_timeout(
                 .to_string(),
         );
     };
+    // #11453: from here on every failure note also feeds the tap's
+    // launch-failure streak; a pre-spawn refusal above never counts.
+    let hold = hold_feed::HoldFeed::new(workspace_root, role, admission);
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            note_role_failure(failure_class::launch_failed(&e));
+            hold.failure(failure_class::launch_failed(&e));
             return RoleTickOutcome::Failure(format!(
                 "could not spawn `{}`: {e}",
                 script.display()
@@ -417,7 +426,7 @@ pub(super) fn run_role_with_timeout(
                 // `toolless_launch`'s module doc for the four conditions.
                 if let Some(detail) = toolless_launch::detect(&log_path, admission, &tick_anchor) {
                     log::warn!("role_runner: {detail}");
-                    note_role_failure(failure_class::toolless_launch());
+                    hold.failure(failure_class::toolless_launch());
                     return RoleTickOutcome::Failure(detail);
                 }
                 // Issue #10003: exit 0 is not evidence a CODEX tick did
@@ -430,10 +439,19 @@ pub(super) fn run_role_with_timeout(
                     let verdict = sandbox_noop::detect(&log_path, admission, &tick_anchor);
                     if let Some(detail) = sandbox_noop::apply(verdict, &admitted.runtime, now) {
                         log::warn!("role_runner: role={role} {detail}");
-                        note_role_failure(failure_class::sandbox_unavailable());
+                        hold.failure(failure_class::sandbox_unavailable());
                         return RoleTickOutcome::Failure(detail);
                     }
                 }
+                // Issue #11727: likewise when a guard hook denied every tool
+                // call (role-tool-policy `check` could not answer). The class
+                // is deterministic, so the launch-failure hold skips the tap.
+                if let Some(detail) = hook_denied::detect(&log_path, &tick_anchor) {
+                    log::warn!("role_runner: role={role} {detail}");
+                    hold.failure(failure_class::hook_denied());
+                    return RoleTickOutcome::Failure(detail);
+                }
+                hold.success();
                 return RoleTickOutcome::Success;
             }
             Ok(Some(status)) => {
@@ -448,7 +466,7 @@ pub(super) fn run_role_with_timeout(
                 // present — see `describe_role_failure`.
                 let full_log = read_role_log(&log_path);
                 let detail = describe_role_failure(&full_log, &log_path, &tick_anchor);
-                note_role_failure(failure_class::exited(status, &full_log, &tick_anchor));
+                hold.failure(failure_class::exited(status, &full_log, &tick_anchor));
                 // Issue #8443: same terminal-record feedback on a non-zero
                 // exit — this is the path a `TOKEN_EXHAUSTED` death actually
                 // takes.
@@ -491,14 +509,14 @@ pub(super) fn run_role_with_timeout(
                         terminate_timed_out(&mut child, pid, script, &log_path, load_per_core);
                     // A load-saturated ceiling is `skipped_load`, not a failure.
                     if matches!(outcome, RoleTickOutcome::Failure(_)) {
-                        note_role_failure(failure_class::timed_out(timeout));
+                        hold.failure(failure_class::timed_out(timeout));
                     }
                     return outcome;
                 }
                 std::thread::sleep(INVOCATION_POLL_INTERVAL);
             }
             Err(e) => {
-                note_role_failure(failure_class::wait_failed(&e));
+                hold.failure(failure_class::wait_failed(&e));
                 return RoleTickOutcome::Failure(format!(
                     "could not poll `{}`: {e}",
                     script.display()

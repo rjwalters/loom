@@ -1,5 +1,6 @@
-//! `check-stale-blocked` — the fleet-wide re-check of every open `loom:blocked`
-//! issue (issue #8927, items 3 + 4 of that issue's own fix list).
+//! `check-stale-blocked` — the per-repository re-check of every open
+//! `loom:blocked` issue (issue #8927, items 3 + 4 of that issue's own fix
+//! list). One invocation covers one repository (#9191).
 //!
 //! # The gap this closes
 //!
@@ -63,15 +64,20 @@ use crate::dep_recheck::{extract, named, premise, recheck};
 
 pub mod batch;
 pub mod budget;
+pub mod hold;
 pub mod notify;
 pub mod release;
 pub mod release_gh;
 pub mod release_outcome;
 pub mod release_task;
+pub mod unnamed;
 
 // The release pass's per-artifact verdicts and their SigNoz export (#10752).
 pub mod release_items;
 pub mod release_telemetry;
+
+// Champion's merge-risk hold digest is exempt from the gather (#9397).
+pub mod digest;
 
 /// Which kind of artifact a finding is about.
 ///
@@ -158,6 +164,24 @@ pub struct Evidence {
     /// ([`park_self_block`]). Always `None` for an issue, whose superseding-block
     /// question is answered by [`Evidence::closing`] instead.
     pub self_block: Option<String>,
+    /// A body park record that names **no** blocker but states a reason
+    /// (`<!-- loom:park Blocked by: (unstated) by=… reason="…" -->`, #10558).
+    /// Such a hold is documented by its reason, so with no numbered reference
+    /// [`classify`] reports [`Verdict::HeldWithReason`], not
+    /// [`Verdict::Undocumented`]. Read from the body only.
+    pub held: Option<Held>,
+}
+
+/// The stated-reason park record behind [`Verdict::HeldWithReason`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Held {
+    /// `by=` of the record, if written.
+    pub by: Option<String>,
+    /// The non-empty `reason="…"`.
+    pub reason: String,
+    /// `at=` as written, if any: [`hold::documents_current_block`] compares it
+    /// to the latest `loom:blocked` application.
+    pub at: Option<String>,
 }
 
 /// A cross-repo park-record blocker with its live state (#10443).
@@ -249,6 +273,15 @@ pub enum Verdict {
     /// applied — a defect on its own terms, independent of whether the block
     /// is real.
     Undocumented,
+    /// No numbered blocker, but a body park record states why the artifact is
+    /// held (#10558). Documented by its reason, so not [`Verdict::Undocumented`];
+    /// the record itself is the idempotency key for anything that reviews it.
+    HeldWithReason {
+        /// `by=` of the record, if written.
+        by: Option<String>,
+        /// The stated reason.
+        reason: String,
+    },
     /// Every cited blocker has resolved, but the artifact itself still cannot
     /// proceed (#8925) — today only reachable for a PR, via
     /// [`park_self_block`]. Reported in its own section rather than folded into
@@ -321,7 +354,16 @@ pub fn classify(e: &Evidence) -> Verdict {
     let has_remote = !e.remote.is_empty();
 
     if !has_checklist && !has_prose && !has_remote {
-        return Verdict::Undocumented;
+        // A reason-only park record documents the hold only when nothing else
+        // is cited; an all-unparseable checklist (`unparsed_unchecked > 0`)
+        // counts as a checklist and still classifies as `Unticked` (#9274).
+        return match &e.held {
+            Some(h) => Verdict::HeldWithReason {
+                by: h.by.clone(),
+                reason: h.reason.clone(),
+            },
+            None => Verdict::Undocumented,
+        };
     }
 
     let mut reasons = Vec::new();
@@ -388,7 +430,7 @@ pub fn classify(e: &Evidence) -> Verdict {
 /// called from `merge-pr.sh`'s post-merge path). It narrows the open
 /// `loom:blocked` population to the artifacts that named a just-closed
 /// issue/PR, so the close path neither re-reports blocks that were already
-/// stale (the fleet-wide advisory's job) nor pays for a full [`Evidence`]
+/// stale (the `check-stale-blocked` advisory's job) nor pays for a full [`Evidence`]
 /// gather on every artifact — this runs on text already fetched, with no
 /// state lookups.
 ///
@@ -463,3 +505,6 @@ mod notify_tests;
 
 #[cfg(test)]
 mod archived_tests;
+
+#[cfg(test)]
+mod unnamed_tests;

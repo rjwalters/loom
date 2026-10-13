@@ -14,6 +14,7 @@ fn dispatch(issue: u32, sweep: &str) -> Event {
         kind: SweepKind::Issue(issue),
         runtime: None,
         runtime_source: None,
+        start: None,
         repo: None,
     }
 }
@@ -65,9 +66,7 @@ fn same_issue_number_in_different_repositories_retains_independent_dispatches() 
     assert!(state.is_empty());
 }
 
-#[cfg(feature = "otlp")]
 struct TraceEnvironment(Vec<(&'static str, Option<std::ffi::OsString>)>);
-#[cfg(feature = "otlp")]
 impl TraceEnvironment {
     fn isolate() -> Self {
         let saved = [
@@ -85,7 +84,6 @@ impl TraceEnvironment {
         Self(saved)
     }
 }
-#[cfg(feature = "otlp")]
 impl Drop for TraceEnvironment {
     fn drop(&mut self) {
         for (key, value) in &self.0 {
@@ -97,7 +95,6 @@ impl Drop for TraceEnvironment {
     }
 }
 
-#[cfg(feature = "otlp")]
 fn configured_workspace() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir(dir.path().join(".loom")).unwrap();
@@ -106,7 +103,6 @@ fn configured_workspace() -> tempfile::TempDir {
     dir
 }
 
-#[cfg(feature = "otlp")]
 #[test]
 #[serial_test::serial]
 fn live_logs_keep_correct_context_after_durable_execution_state_is_retired() {
@@ -158,7 +154,6 @@ fn live_logs_keep_correct_context_after_durable_execution_state_is_retired() {
     assert!(state.is_empty());
 }
 
-#[cfg(feature = "otlp")]
 #[test]
 #[serial_test::serial]
 fn restart_without_dispatch_does_not_guess_trace_identity_from_issue_number() {

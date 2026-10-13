@@ -87,12 +87,35 @@ HANG-AWARE IPC LIVENESS PROBE (#4398)
       error (the IPC round-trip demonstrably WORKED) skips the probe rather
       than inventing a divergence. The probe must never become a new hard
       dependency that pages on its own absence.
-    * REPORT-ONLY, DELIBERATELY. Unlike #4232's narrow auto-`kickstart`, there
-      is NO provably-safe unattended remediation for a wedged-but-alive
-      process: the only real fix is killing it, which would also kill a daemon
-      that is merely under heavy legitimate load. A confirmed hang therefore
-      escalates to a maximally actionable DIVERGENCE report (exit 1) with the
-      explicit recovery commands — never an automatic kill/restart.
+    * REPORT-ONLY BY DEFAULT; BOUNDED, SUPERVISED RECOVERY ONLY BY OPT-IN
+      (#7855). Unlike #4232's narrow auto-`kickstart` of a DEAD job, there is
+      no provably-safe unattended remediation for a wedged-but-alive process:
+      the only real fix is ending it, and a failed round-trip is ALSO what a
+      daemon under heavy legitimate load looks like (the 2026-09-16 robb-pro
+      wedge sat at load 16.8 on 18 cores) — an IPC-only trigger would misfire
+      on exactly the busiest hosts. So by default a confirmed hang escalates
+      to a maximally actionable DIVERGENCE report (exit 1) with the explicit
+      recovery commands and no automatic kill/restart.
+      A host may opt in (LOOM_WATCHDOG_HANG_RECOVER=1 or config
+      autonomous.watchdogHangRecover.enabled=true at loom-daemon-start.sh,
+      persisted to the marker's watchdog_hang_recover= field, which is what
+      the scheduled job reads). Even then it acts only
+      when ALL hold: >= 3 consecutive CONFIRMED ticks on which the IPC
+      round-trip failed AND the heartbeat is positively STALE for the
+      current boot (fresh, missing, unreadable, prior-boot, or unprovable
+      heartbeats never count and reset that streak — it is separate from the
+      raw IPC-failure threshold above); no restart in the last >= 30 min (a
+      durable, lock-serialised record that survives pid changes and watchdog
+      restarts); fewer than N restarts without an intervening healthy tick;
+      and no deliberate stop / drain / host opt-out on record. The ONLY
+      action is the supervisor's own restart of the job it is proven to own
+      (`launchctl kickstart -k <svc>` / `systemctl --user restart <unit>`) —
+      never a bare signal, never an unsupervised fallback, never anything
+      sent over the wedged socket. A pid-file-only daemon stays report-only.
+      Every automatic restart is logged as a `HANG RECOVERY` DIVERGENCE line
+      with the IPC evidence, heartbeat age and threshold, host load, and the
+      supervisor command's result. The dead-daemon paths (plain kickstart,
+      bounded #5391 recovery) are unchanged.
 
 TICK-GRANULARITY DETECTION LATENCY IS AN ACCEPTED TRADEOFF (#5790)
   An operator saw `loom-daemon status` itself time out on IPC twice ~20
@@ -433,6 +456,30 @@ Environment:
                                (default: LOOM_DAEMON_STARTUP_GRACE_SECS, else 90).
   LOOM_WATCHDOG_IPC_PROBE_STATE  #4398: path to the consecutive-failure counter
                                (default <loom dir>/.watchdog-probe-fail-count).
+  LOOM_WATCHDOG_HANG_RECOVER    #7855: 1/true/yes opts in to bounded, supervised
+                               recovery of a live-but-wedged daemon (default:
+                               OFF — report-only). Set it (or config
+                               autonomous.watchdogHangRecover.enabled) for
+                               loom-daemon-start.sh; the start resolves env >
+                               config > prior marker and persists it (and the
+                               three knobs below, config keys confirmations /
+                               cooldownSecs / maxUnhealed) into the marker's
+                               watchdog_hang_recover* fields, carried across
+                               restarts until 0/false/no or an operator stop.
+                               Env > marker > default here.
+  LOOM_WATCHDOG_HANG_RECOVER_CONFIRMATIONS  #7855: consecutive dual-signal
+                               CONFIRMED ticks required (default and floor 3).
+  LOOM_WATCHDOG_HANG_RECOVER_COOLDOWN_SECS  #7855: at most one automatic hang
+                               restart per window (default and floor 1800).
+  LOOM_WATCHDOG_HANG_RECOVER_MAX_UNHEALED  #7855: restarts allowed without an
+                               intervening healthy IPC tick before the
+                               hang-recovery breaker opens (default 3).
+  LOOM_WATCHDOG_HANG_RECOVER_STATE  #7855: durable cooldown/attempt record
+                               (default <loom dir>/.watchdog-hang-recover-state;
+                               delete it to re-arm). A sibling .lock dir
+                               serialises concurrent invocations.
+  LOOM_WATCHDOG_HANG_RECOVER_STREAK_STATE  #7855: per-pid dual-signal streak
+                               (default <loom dir>/.watchdog-hang-streak).
   LOOM_WATCHDOG_IPC_PROBE_WINDOW_TICKS  #5944: size (in ticks) of the rolling
                                window used for the rate-based failure signal,
                                alongside (not instead of) the consecutive

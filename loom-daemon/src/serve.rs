@@ -708,7 +708,9 @@ async fn handle_health(
         // `tmpfs_visibility` section renders here.
         tmpfs_visibility: None,
         ci_telemetry: None,
-        inbox_mail: None,
+        // #11740: the in-process last fleet-sync pass, so the dashboard's
+        // health route raises `fleet_identity` too.
+        fleet_sync: crate::fleet_sync::cached_status(),
     });
 
     let mut body = serde_json::to_value(&health)?;
@@ -1559,6 +1561,7 @@ mod tests {
                 kind: SweepKind::Issue(4392),
                 runtime: None,
                 runtime_source: None,
+                start: None,
                 repo: None,
             },
             Event::SweepGlobalCompleted {
@@ -1678,6 +1681,7 @@ mod tests {
             kind: SweepKind::Issue(4392),
             runtime: None,
             runtime_source: None,
+            start: None,
             repo: Some("/repos/loom".to_string()),
         });
         let data = frame.trim_start_matches("data: ").trim_end_matches("\n\n");
@@ -1985,6 +1989,7 @@ mod tests {
                 kind: SweepKind::Issue(4392),
                 runtime: None,
                 runtime_source: None,
+                start: None,
                 repo: None,
             })
             .expect("publish");
@@ -2413,6 +2418,7 @@ mod tests {
         let mut report = empty_report();
         report.per_repo = vec![crate::types::RepoStatus {
             root: root.to_path_buf(),
+            maintain_only: None,
             priority: crate::workspace_registry::default_priority(),
             in_flight_count: 0,
             health_gate_halted: false,

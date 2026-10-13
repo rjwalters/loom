@@ -34,8 +34,9 @@
 //! Two more per-host forge reads are the same on every host, and each has its
 //! own switch (off by default, so a part 1 fleet is unchanged):
 //!
-//! - **`star-facts`** (`starFacts`). The starred-issue liveness pass
-//!   ([`crate::star_liveness`]) evaluator lists every operator label of every
+//! - **`star-facts`** (`starFacts`). **Inert since #11104**, which removed its
+//!   only consumer; #11579 retires the job. The starred-issue
+//!   liveness pass's evaluator listed every operator label of every
 //!   managed repo every two minutes, and does nothing else for a repo with no
 //!   open starred issue (the level step after it lists its own labels and is
 //!   not covered). The captain publishes, per repo, how many open starred
@@ -122,8 +123,8 @@ use crate::telemetry::ops::{MetricName, MetricPoint};
 
 /// Forge label-stage dwell ([`super::ops::stage_dwell`]).
 pub const STAGE_DWELL_JOB: &str = "stage-dwell";
-/// Whether each repo has an open starred issue ([`facts`], for
-/// [`crate::star_liveness`]).
+/// Whether each repo has an open starred issue ([`facts`]). Inert since
+/// #11104 removed the star-liveness pass that read it.
 pub const STAR_FACTS_JOB: &str = "star-facts";
 /// Each repo's open `loom:blocked` issues ([`facts`], for
 /// [`super::queue_blocked`]).

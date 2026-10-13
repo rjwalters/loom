@@ -74,7 +74,8 @@ fn write_executable(path: &Path, body: &str) {
 /// Environment Is Not a Clean Shell"), which would otherwise outrank the
 /// workspace's own `runtimes.roles.judge` pin and resolve the tick onto
 /// `claude` instead of the native runtime under test.
-const GUARDED_ENV: [&str; 2] = ["LOOM_RUNTIME", "LOOM_RUNTIME_JUDGE"];
+/// `LOOM_MODEL_PROFILE` picks the profile whose `excludedRoles` admission checks (#11400).
+const GUARDED_ENV: [&str; 3] = ["LOOM_RUNTIME", "LOOM_RUNTIME_JUDGE", "LOOM_MODEL_PROFILE"];
 
 struct EnvGuard(Vec<(&'static str, Option<String>)>);
 
@@ -111,8 +112,13 @@ fn opencode_judge_workspace(root: &Path, stream: &str) {
     for sub in [".loom/roles", ".loom/runtimes", ".loom/scripts"] {
         fs::create_dir_all(root.join(sub)).unwrap();
     }
-    fs::write(root.join(".loom/config.json"), r#"{"runtimes":{"roles":{"judge":"opencode"}}}"#)
-        .unwrap();
+    // #11400: the bundled default profile (`zai-flash`) excludes Judge, so
+    // pin one that does not — the axis under test is the tool-use verdict.
+    fs::write(
+        root.join(".loom/config.json"),
+        r#"{"runtimes":{"roles":{"judge":"opencode"},"defaultModelProfile":"quick-flash"}}"#,
+    )
+    .unwrap();
     fs::write(
         root.join(".loom/roles/judge.json"),
         r#"{"runtimeRequirements":["loomControl"]}"#,

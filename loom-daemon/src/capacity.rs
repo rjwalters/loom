@@ -547,7 +547,7 @@ impl CapacityAdvisory {
         let message = format!(
             "token capacity: {queued} issue(s) queued; {healthy}/{total} accounts healthy, \
              {exhausted} exhausted/near-ceiling; est. ~{drain} to drain at current capacity. \
-             Add accounts to ~/.claude-monitor/accounts.env then `loom-daemon tokens bootstrap`, or buy \
+             Add accounts to ~/.llm-monitor/accounts.env then `loom-daemon tokens bootstrap`, or buy \
              API credits, then re-probe with `loom-daemon tokens check --ranking`. If accounts are \
              'blocked' on revoked tokens, 'bootstrap --force' cannot recover — run \
              'loom-daemon tokens import-from-monitor --force && loom-daemon tokens check --ranking'.",

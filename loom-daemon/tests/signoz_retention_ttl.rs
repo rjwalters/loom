@@ -53,6 +53,9 @@
 //! breaks it run as a counterfactual rather than described.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "common/hub_image.rs"]
+mod hub_image;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::PathBuf;
@@ -61,7 +64,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Same pin as the SigNoz trial's telemetry store (`signoz/casting.yaml`) and
 /// as `signoz_usage_queries.rs` / `signoz_cycle_time.rs` /
-/// `signoz_queue_quota_queries.rs` / `signoz_eta_queries.rs` /
+/// `signoz_queue_quota_queries.rs` /
 /// `signoz_ci_failed_run_logs.rs`, so no proof in this repo can drift from the
 /// deployment on ClickHouse version.
 const CLICKHOUSE_IMAGE: &str = "clickhouse/clickhouse-server:25.12.5@sha256:cacf32d6884291dc2ff5e0156a97f46fc53ff7c929a7906d114e268a929dfd3a";
@@ -113,16 +116,8 @@ const SIBLING_ARTIFACTS: &[(&str, &str)] = &[
         include_str!("../../defaults/observability/signoz/quota-utilization.sql"),
     ),
     (
-        "eta-queries.sql",
-        include_str!("../../defaults/observability/signoz/eta-queries.sql"),
-    ),
-    (
         "alerts/queue-starvation.json",
         include_str!("../../defaults/observability/signoz/alerts/queue-starvation.json"),
-    ),
-    (
-        "alerts/fleet-singleton-output.json",
-        include_str!("../../defaults/observability/signoz/alerts/fleet-singleton-output.json"),
     ),
 ];
 
@@ -280,7 +275,7 @@ impl Retention {
 }
 
 /// The committed file's statements. Line comments are stripped **before** the
-/// split on `;`, mirroring `signoz_usage_queries.rs` / `signoz_eta_queries.rs`:
+/// split on `;`, mirroring `signoz_usage_queries.rs`:
 /// the file's own prose uses semicolons and a naive split would cut a statement
 /// in half mid-sentence. No `;` or `--` occurs inside a string literal in this
 /// artifact.
@@ -420,7 +415,7 @@ fn local(script: &str, format: &str) -> String {
             "none",
             "--entrypoint",
             "clickhouse",
-            CLICKHOUSE_IMAGE,
+            &hub_image::resolve(CLICKHOUSE_IMAGE),
             "local",
             "--multiquery",
             &format!("--format={format}"),
@@ -508,7 +503,7 @@ impl Server {
                     "{}:/etc/clickhouse-server/config.d/trial.yaml:ro",
                     scratch.join("trial.yaml").display()
                 ),
-                CLICKHOUSE_IMAGE,
+                &hub_image::resolve(CLICKHOUSE_IMAGE),
             ])
             .output()
             .expect("docker is required for this test");

@@ -358,6 +358,22 @@ fn a_routed_profile_that_cannot_be_routed_safely_refuses_at_78_without_secrets()
             },
             "exactly one API-key variable",
         ),
+        // #11300: bundled zai-flash declares credentialProxy; once the proxy
+        // switch is ARMED it and the gateway would both re-point the endpoint.
+        (
+            "armed credential proxy",
+            {
+                let mut c = worker(d.path(), "opencode");
+                c.env("LOOM_ROLE", "builder")
+                    .env("LOOM_NATIVE_CREDENTIAL_PROXY", "1")
+                    .env("LOOM_LLM_GATEWAY_URL", URL)
+                    .env("LOOM_LLM_GATEWAY_PROFILES", "zai-flash")
+                    .env("LOOM_LLM_GATEWAY_VK_FILE", &good)
+                    .args(["-p", "hello"]);
+                c
+            },
+            "also declares credentialProxy",
+        ),
         // A Claude credential presented as the virtual key.
         (
             "anthropic key",

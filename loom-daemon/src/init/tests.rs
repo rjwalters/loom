@@ -2059,7 +2059,7 @@ fn test_find_missing_files_detects_entire_missing_subdir() {
 
 /// Write a minimal defaults/ tree with the given config.json body and
 /// return (workspace, defaults) paths for `initialize_workspace`.
-fn setup_config_merge_repo(
+pub(super) fn setup_config_merge_repo(
     temp: &TempDir,
     template: &str,
 ) -> (std::path::PathBuf, std::path::PathBuf) {
@@ -2316,7 +2316,7 @@ fn test_config_invalid_existing_json_falls_back_to_template() {
 // ------------------------------------------------------------------
 
 /// Collect only this module's `init: config.json:` lines from a capture.
-fn config_log_lines(records: &[(log::Level, String)]) -> Vec<(log::Level, String)> {
+pub(super) fn config_log_lines(records: &[(log::Level, String)]) -> Vec<(log::Level, String)> {
     records
         .iter()
         .filter(|(_, msg)| msg.contains("init: config.json:"))

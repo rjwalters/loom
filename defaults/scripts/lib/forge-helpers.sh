@@ -401,26 +401,20 @@ forge_update_branch() {
 # Get PR details.
 # Usage: forge_get_pr NWO PR_NUMBER
 # Returns JSON with .state, .merged, .head.ref, .title, .mergeable
+# On failure stderr carries the forge's own error (#9192) -- silence it at the
+# call site (`2>/dev/null`) if unwanted; the helper no longer discards it.
+# (Compacted to offset forge_fetch_error_cause on the shell-budget ratchet.)
 forge_get_pr() {
-  local nwo="$1"
-  local pr_number="$2"
-  local gh_cmd="${3:-gh}"
-
-  if [[ "$FORGE_TYPE" == "gitea" ]]; then
-    forge_split_nwo "$nwo"
-    gitea_api GET "repos/$FORGE_OWNER/$FORGE_REPO/pulls/$pr_number"
-  else
-    "$gh_cmd" api "repos/$nwo/pulls/$pr_number" 2>/dev/null
-  fi
-}
+  local nwo="$1" pr_number="$2" gh_cmd="${3:-gh}"
+  if [[ "$FORGE_TYPE" == "gitea" ]]; then forge_split_nwo "$nwo"; gitea_api GET "repos/$FORGE_OWNER/$FORGE_REPO/pulls/$pr_number"; else "$gh_cmd" api "repos/$nwo/pulls/$pr_number"; fi; }
 
 # Get PR details without cache (for race-condition rechecks).
-# Usage: forge_get_pr_nocache NWO PR_NUMBER
+# Usage: forge_get_pr_nocache NWO PR_NUMBER [GH_CMD]
+# Like forge_get_pr, stderr is NOT discarded (#9192): a 401 / rate-limit 403 /
+# 404 reaches the caller, which can hand it to forge_fetch_error_cause. Every
+# recheck caller in merge-pr.sh silences it itself (`2>/dev/null || echo '{}'`).
 forge_get_pr_nocache() {
-  local nwo="$1"
-  local pr_number="$2"
-  local gh_cmd="${3:-gh}"
-
+  local nwo="$1" pr_number="$2" gh_cmd="${3:-gh}"
   if [[ "$FORGE_TYPE" == "gitea" ]]; then
     # Gitea has no caching layer like gh-cached
     forge_get_pr "$nwo" "$pr_number"
@@ -431,11 +425,30 @@ forge_get_pr_nocache() {
     # flag, and with 2>/dev/null the error is swallowed and callers substitute
     # '{}', silently breaking merge verification and race-condition rechecks
     # whenever gh-cached is absent (issue #3547).
-    "$gh_cmd" api "repos/$nwo/pulls/$pr_number" 2>/dev/null
+    "$gh_cmd" api "repos/$nwo/pulls/$pr_number"
   else
     # gh-cached wrapper: --no-cache bypasses its cache layer as intended.
-    "$gh_cmd" --no-cache api "repos/$nwo/pulls/$pr_number" 2>/dev/null
+    "$gh_cmd" --no-cache api "repos/$nwo/pulls/$pr_number"
   fi
+}
+
+# forge_fetch_error_cause STDERR [BODY] -> one line naming the HTTP status, what
+# it means for the operator, and the forge's own message (#9192). A bare "could
+# not fetch" made a 401 (re-authenticate), a rate-limit 403 (wait for the reset)
+# and a 404 (fix the reference) indistinguishable; worse, `gh auth status` also
+# reports a rate-limited token as "invalid". A rate-limit 403 names the
+# authenticated user ID, which a bad credential cannot -- so it is classified as
+# a rate limit (is_rate_limit_error) BEFORE the generic 403 arm. Token-shaped
+# strings are redacted and the message is capped at 300 chars.
+forge_fetch_error_cause() {
+  local all="$1 $2" code msg; code=$(grep -oE 'HTTP [0-9]{3}' <<<"$all" | head -1 | cut -c6- || true); [[ -n "$code" ]] || code=$(jq -r '.status // empty' <<<"$2" 2>/dev/null || true)
+  msg=$(jq -r '.message // empty' <<<"$2" 2>/dev/null || true); [[ -n "$msg" ]] || msg=$(jq -r '.message // empty' <<<"$1" 2>/dev/null || true); msg=$(printf '%s' "${msg:-$1}" | tr '\n' ' ' | sed -E 's/(gh[opsur]_|github_pat_)[A-Za-z0-9_]+/<redacted>/g' | cut -c1-300)
+  if is_rate_limit_error "$all" || [[ "$code" == 429 ]]; then printf 'HTTP %s rate limit -- the credential DID authenticate (do not re-authenticate); wait for the reset' "${code:-403}"
+  elif [[ "$code" == 401 ]]; then printf 'HTTP 401 auth failure -- the credential is invalid or expired; re-authenticate'
+  elif [[ "$code" == 403 ]]; then printf 'HTTP 403 forbidden (not a rate limit) -- the credential lacks access to this repository'
+  elif [[ "$code" == 404 ]]; then printf 'HTTP 404 not found -- the PR does not exist in this repository, or the credential cannot see the repository'
+  elif is_forge_transient_error "$all"; then printf 'transient forge/network failure%s -- retry' "${code:+ (HTTP $code)}"
+  else printf 'HTTP %s' "${code:-status unknown}"; fi; printf ': %s' "${msg:-<no message from the forge>}"
 }
 
 # Get an issue's open/closed state.
@@ -635,7 +648,7 @@ forge_get_check_runs() {
     out_file=$(mktemp); err_file=$(mktemp)
     gh api "repos/$nwo/commits/$commit/check-runs?per_page=100" --paginate \
       --header "Accept: application/vnd.github+json" \
-      --jq '{total_count: (.total_count // 0), check_runs: [(.check_runs // [])[] | {name: .name, status: .status, conclusion: .conclusion, html_url: .html_url}]}' \
+      --jq '{total_count: (.total_count // 0), check_runs: [(.check_runs // [])[] | {name: .name, status: .status, conclusion: .conclusion, html_url: .html_url, check_suite_id: .check_suite.id}]}' \
       >"$out_file" 2>"$err_file" || rc=$?
 
     if [[ $rc -ne 0 ]]; then
@@ -653,7 +666,7 @@ forge_get_check_runs() {
     # short-read check below). An empty stdout from a `gh` that exited 0 is not
     # an authoritative "this commit has no checks": treat it as a transient
     # failure, the same way a nonzero exit is treated.
-    local merged=""; [[ -s "$out_file" ]] && merged=$(jq -cs '{total_count: ([.[].total_count // 0] | max // 0), check_runs: [.[] | (.check_runs // [])[]]}' "$out_file" 2>/dev/null)
+    local merged=""; [[ -s "$out_file" ]] && merged=$(jq -cs --arg nwo "$nwo" --arg sha "$commit" '{total_count: ([.[].total_count // 0] | max // 0), check_runs: [.[] | (.check_runs // [])[]], repository: $nwo, head_sha: $sha}' "$out_file" 2>/dev/null)
     rm -f "$out_file" "$err_file"
     [[ -n "$merged" ]] || return 1
 
@@ -708,7 +721,7 @@ forge_get_commit_status() {
 # Get GitHub Actions workflow runs (or the Gitea Actions equivalent) for a
 # commit, independent of the Checks API.
 # Usage: forge_get_workflow_runs NWO COMMIT_SHA
-# Returns JSON: {"workflow_runs": [{"name": ..., "status": ..., "conclusion": ...}]}
+# Returns JSON: {"workflow_runs": [{"name", "status", "conclusion", "event" (GitHub only)}]}
 #
 # Why this exists (#5495): the Checks API (forge_get_check_runs, above) only
 # ever reports check-runs that already exist -- a workflow_run that is still
@@ -765,7 +778,7 @@ forge_get_workflow_runs() {
     echo "$runs_json" | jq '{
       workflow_runs: [(.workflow_runs // [])[] | {
         name: .name,
-        status: .status,
+        status: .status, event: .event,
         conclusion: .conclusion
       }]
     }' 2>/dev/null || echo '{"workflow_runs": []}'
@@ -1242,10 +1255,7 @@ forge_gh_perm_safe() {
 # missing a scope, it is scoped to the wrong repository entirely, so rung 1
 # (ambient) 404s/GraphQL-fails outright and #6074's ladder never fires (its
 # classifier doesn't match either signature above). `sweep-lease-renew.sh`'s
-# renewal loop failed on every cycle as a direct result, and
-# `resolve-tier-model.sh` (which does not source this file at all before this
-# fix) silently fell through to its tier-3 default with a misleading "likely
-# API quota" diagnosis.
+# renewal loop failed on every cycle as a direct result.
 #
 # The fix borrows the SAME mechanism FLEET.md's "Private-repo clones over ssh"
 # contract already documents for a human ssh session on a locked keychain: a

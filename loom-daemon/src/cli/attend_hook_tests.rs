@@ -112,12 +112,38 @@ fn a_refusal_that_matters_is_reported_in_one_line() {
     assert!(line.contains("#10129") && !line.contains('\n'), "{line}");
 }
 
+/// Turns the machine-level defaults tier off for one test and restores it on
+/// drop. This bin target links the lib without `cfg(test)`, so a fleet host's
+/// `~/.local/share/loom/config/defaults.json` (with its
+/// `observability.exporters`) would otherwise merge into the fixture's config
+/// and change the outcome per host (#11690, umbrella #9720).
+struct DefaultsTierOff(Option<std::ffi::OsString>);
+
+impl DefaultsTierOff {
+    fn new() -> Self {
+        let prior = std::env::var_os(loom_daemon::config_resolver::PRIVATE_DEFAULTS_ENV);
+        std::env::set_var(loom_daemon::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        Self(prior)
+    }
+}
+
+impl Drop for DefaultsTierOff {
+    fn drop(&mut self) {
+        let key = loom_daemon::config_resolver::PRIVATE_DEFAULTS_ENV;
+        match self.0.take() {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+    }
+}
+
 /// `/loom:curator 10120` typed into a top-level session: live output is
 /// configured, yet the session's own transcript is refused (#10129), exactly
 /// as for a Builder's `lease ensure`.
-#[cfg(feature = "otlp")]
 #[test]
+#[serial_test::serial(loom_config_env)]
 fn a_top_level_session_starts_nothing() {
+    let _tier = DefaultsTierOff::new();
     let scratch = tempfile::tempdir().unwrap();
     let root = scratch.path().join("checkout");
     std::fs::create_dir_all(root.join(".git")).unwrap();

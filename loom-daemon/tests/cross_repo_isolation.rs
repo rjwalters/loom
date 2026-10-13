@@ -13,7 +13,6 @@
 //! Both arms drive the real [`loom_daemon::observability::lifecycle`] entry
 //! points and drain through `lifecycle::backfill`, so the assertions are made
 //! against records that were durably queued for export.
-#![cfg(feature = "otlp")]
 #![allow(clippy::unwrap_used)]
 use loom_daemon::{
     observability::{lifecycle, queue::DurableQueue},

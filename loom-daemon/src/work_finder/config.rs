@@ -3,13 +3,11 @@
 //!
 //! Split out of `work_finder.rs` (Issue #9034) for the same file-size-ratchet
 //! reason as [`super::repo_cap`] / [`super::configured_max`]: `work_finder.rs`
-//! is frozen at its current size (`.loom/docs/file-size-policy.md`), and this
-//! issue's `hostClass` / `allowHeavyLocal` fields needed room to land. Pure
-//! move plus two new fields — no other behavior change.
+//! is frozen at its current size (`.loom/docs/file-size-policy.md`).
 
 use std::path::Path;
 
-use super::{host_class, repo_cap};
+use super::repo_cap;
 
 /// The subset of `.loom/config.json → autonomous.workFinder` this module
 /// consumes. Each field is `Option` so an absent key falls through to the
@@ -35,6 +33,12 @@ pub struct WorkFinderConfig {
     /// **uncapped** rather than "use a built-in default": a non-`None` default
     /// would silently throttle every fleet on upgrade. See [`repo_cap`].
     pub max_concurrent_per_repo: Option<usize>,
+    /// `hyperparameters.dispatch.drawTemperature` — the workspace draw's
+    /// softmax temperature (#11684). Hyperparameters-only: there is no
+    /// `autonomous.workFinder` home, so [`parse_effective`] leaves it `None`
+    /// and only [`apply_hyperparams`] fills it (an out-of-range value is
+    /// dropped). Read through [`resolve_draw_temperature`].
+    pub draw_temperature: Option<u32>,
     /// `autonomous.workFinder.extraSkipLabels` — additional label names
     /// (Issue #6685) beyond the hardcoded [`super::PARK_LABELS`] this workspace
     /// wants the work-finder to treat as a skip/park signal (e.g. a
@@ -42,15 +46,6 @@ pub struct WorkFinderConfig {
     /// distinct from `Some(vec![])`, which an explicit `[]` in config would
     /// produce, though both resolve to the same empty-list default behavior.
     pub extra_skip_labels: Option<Vec<String>>,
-    /// `autonomous.workFinder.hostClass` — this host's declared class (Issue
-    /// #9034): `"local-dev"` | `"remote-worker"`; any other value, or the key
-    /// absent, is `None` here (unclassified). See [`host_class`].
-    pub host_class: Option<host_class::HostClass>,
-    /// `autonomous.workFinder.allowHeavyLocal` — an operator override (Issue
-    /// #9034) that suppresses the `host_class`/`loom:heavy` gate for this
-    /// workspace's autonomous loop. `None` when the key is absent (falls
-    /// through to the env var, then to `false`). See [`host_class`].
-    pub allow_heavy_local: Option<bool>,
     /// Names of **retired** config keys found in `autonomous` — currently
     /// `cpuUtilizationTarget` / `estCoresPerSweep` ([`DEPRECATED_CPU_CONFIG_KEYS`]),
     /// whose CPU-headroom admission term #4512 deleted.
@@ -127,6 +122,7 @@ pub fn parse_effective(effective: &serde_json::Value) -> WorkFinderConfig {
             .filter(|&n| n > 0)
             .and_then(|n| usize::try_from(n).ok()),
         max_concurrent_per_repo: repo_cap::parse_config(wf),
+        draw_temperature: None,
         extra_skip_labels: wf.and_then(|w| w.get("extraSkipLabels")).and_then(|v| {
             v.as_array().map(|arr| {
                 arr.iter()
@@ -137,8 +133,6 @@ pub fn parse_effective(effective: &serde_json::Value) -> WorkFinderConfig {
                     .collect()
             })
         }),
-        host_class: host_class::parse_config(wf),
-        allow_heavy_local: host_class::parse_config_allow_heavy_local(wf),
         deprecated_cpu_keys,
     }
 }
@@ -181,6 +175,26 @@ fn apply_hyperparams(effective: &serde_json::Value, config: &mut WorkFinderConfi
     {
         config.max_admissions_per_tick = Some(max);
     }
+    let (lo, hi) = crate::priority_pick::DRAW_TEMPERATURE_RANGE;
+    if let Some(t) = dispatch
+        .get("drawTemperature")
+        .filter(|v| !v.is_null())
+        .and_then(serde_json::Value::as_u64)
+        .filter(|t| (lo..=hi).contains(t))
+        .and_then(|t| u32::try_from(t).ok())
+    {
+        config.draw_temperature = Some(t);
+    }
+}
+
+/// The workspace draw's temperature for `config` (#11684): the
+/// hyperparameters value, else
+/// [`crate::priority_pick::DEFAULT_DRAW_TEMPERATURE`].
+#[must_use]
+pub fn resolve_draw_temperature(config: &WorkFinderConfig) -> u32 {
+    config
+        .draw_temperature
+        .unwrap_or(crate::priority_pick::DEFAULT_DRAW_TEMPERATURE)
 }
 
 /// Retired `autonomous.*` config keys, accepted-but-ignored since #4512 (they
@@ -253,7 +267,3 @@ pub fn warn_deprecated_cpu_knobs(config: &WorkFinderConfig) {
         log::warn!("work_finder: {notice}");
     });
 }
-
-#[cfg(test)]
-#[path = "config_tests.rs"]
-mod tests;

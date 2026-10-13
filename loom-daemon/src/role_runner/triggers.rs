@@ -56,8 +56,10 @@ pub const TRIGGER_CALLER: &str = "role_event_trigger";
 pub const UNTRIAGED_AXIS: &str = "untriaged";
 
 /// Labels that mean Curator has queued work: new issues and Champion's
-/// revision requests (#10753), which never carry `loom:triage`.
-pub const CURATOR_WORK_LABELS: [&str; 2] = ["loom:triage", "loom:needs-revision"];
+/// revision requests (#10753) and the undocumented-`loom:blocked` hand-off
+/// queue (#10558), neither of which carries `loom:triage`.
+pub const CURATOR_WORK_LABELS: [&str; 3] =
+    ["loom:triage", "loom:needs-revision", "loom:blocked-unnamed"];
 
 /// The resolved `autonomous.roleRunner.eventTriggers` block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -316,6 +318,9 @@ struct LedgerEntry {
 #[derive(Debug, Default)]
 pub struct TriggerLedger {
     entries: Mutex<HashMap<(PathBuf, &'static str), LedgerEntry>>,
+    /// Last-known untriaged count per root (#9000), kept whatever its age so a
+    /// root's own curator output cannot starve it of its next admission.
+    counts: Mutex<HashMap<PathBuf, usize>>,
 }
 
 impl TriggerLedger {
@@ -351,6 +356,24 @@ impl TriggerLedger {
         self.with_entry(root, role, now, |e| {
             (e.fingerprint.clone(), now.saturating_duration_since(e.quiet_since))
         })
+    }
+
+    /// Record the untriaged count a curator probe observed for `root`.
+    pub fn record_untriaged(&self, root: &Path, count: usize) {
+        self.counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(root.to_path_buf(), count);
+    }
+
+    /// The last untriaged count observed for `root`, if any (any age).
+    #[must_use]
+    pub fn last_untriaged(&self, root: &Path) -> Option<usize> {
+        self.counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(root)
+            .copied()
     }
 
     /// Record a successful launch: reset the quiet clock and, when given,
@@ -442,7 +465,8 @@ fn observe_untriaged(root: &Path) -> Observation {
     let gh = concurrent_dispatch::gate_gh_bin();
     let mut total = 0;
     // Champion's NEEDS REVISION requests (`loom:needs-revision`, #10753) are
-    // Curator work that never carries `loom:triage`, so they count too.
+    // Curator work that never carries `loom:triage`, so they count too, as does
+    // the `loom:blocked-unnamed` queue (#10558).
     for label in CURATOR_WORK_LABELS {
         match crate::forge_listing::list_issues_cached_as(
             TRIGGER_CALLER,
@@ -536,6 +560,9 @@ pub fn run_with_trigger_gate(
         return run();
     }
     let observation = probe(root, role);
+    if let ("curator", Observation::Count(n)) = (role, &observation) {
+        ledger.record_untriaged(root, *n);
+    }
     let (last_fingerprint, quiet_for) = ledger.read(root, role, Instant::now());
     let fingerprint = match &observation {
         Observation::Fingerprint(f) => Some(f.clone()),

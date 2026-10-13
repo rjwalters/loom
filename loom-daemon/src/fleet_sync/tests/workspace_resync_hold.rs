@@ -131,6 +131,56 @@ fn interrupted(version: &str, requires: Option<&str>, pending: &str) -> String {
     )
 }
 
+/// A checkout whose resync to a release at or below the daemon was
+/// interrupted still shows an old, compatible stamp plus `resync_pending`.
+/// It must be held, not cleared by the behind-but-compatible shortcut
+/// (#11109).
+#[test]
+fn a_checkout_with_resync_pending_is_held_whatever_its_versions_say() {
+    let fx = Fixture::new(Seed {
+        version: RUNNING,
+        current: true,
+        ..STALE
+    });
+    let host = Host::new(&fx, "host-a");
+    let mut holds = Holds::default();
+    assert_eq!(verdicts(&hold_pass(&host, None, &mut holds)), (Verdict::Clear, Verdict::Clear));
+
+    write(
+        &host.root.join(INSTALL_METADATA_PATH),
+        &interrupted("0.19.801", Some("0.19.772"), "0.19.802"),
+    );
+    host.advance(INTERVAL);
+    let seen = hold_pass(&host, Some("0.19.800"), &mut holds);
+    assert_eq!(verdicts(&seen).1, Verdict::Hold(HoldKind::InstallIncompatible));
+    assert_eq!(seen[0].checkout.demand, None);
+}
+
+/// The same interrupted checkout, but its stamp is already above this
+/// daemon: `RepoAheadOfDaemon` is refused before the pending key is read, and
+/// that refusal alone would clear it. It is held too, with no roll demand
+/// (#11109).
+#[test]
+fn a_repo_ahead_checkout_with_resync_pending_is_held() {
+    let fx = Fixture::new(Seed {
+        version: RUNNING,
+        current: true,
+        ..STALE
+    });
+    let host = Host::new(&fx, "host-a");
+    let mut holds = Holds::default();
+    assert_eq!(verdicts(&hold_pass(&host, None, &mut holds)), (Verdict::Clear, Verdict::Clear));
+
+    write(
+        &host.root.join(INSTALL_METADATA_PATH),
+        &interrupted("0.19.900", Some("0.19.772"), "0.19.901"),
+    );
+    host.advance(INTERVAL);
+    let seen = hold_pass(&host, None, &mut holds);
+    assert_eq!(verdicts(&seen).1, Verdict::Hold(HoldKind::InstallIncompatible));
+    assert_eq!(seen[0].checkout.demand, None);
+}
+
 /// A newer daemon started a resync on the default branch and did not finish
 /// it. The files are a mix of two releases, so dispatch is held; the hold
 /// asks for no roll, and this host never completes the run from its own
@@ -341,4 +391,33 @@ fn a_checkout_hold_clears_when_the_checkout_fast_forwards_in_the_same_pass() {
     let events = holds.rejudge(&seen, v(host.version), host.now.get(), ALERT_AFTER);
     assert_eq!(events.iter().map(|e| e.event).collect::<Vec<_>>(), ["cleared"]);
     assert!(holds.holds().is_empty(), "cleared in the same pass");
+}
+
+/// #11186: a maintain-only workspace is maintained exactly like any other.
+/// The pass resyncs it (it never asks about dispatch holds), the hold the
+/// pass judges stays clear, and nothing raises a roll demand; dispatch is
+/// refused all the while.
+#[test]
+fn a_maintain_only_workspace_is_still_resynced() {
+    use crate::workspace_hold::{hold_for, set_maintain_only_for_test};
+    use crate::workspace_registry::{MaintainOnly, MaintainOnlySource};
+    let fx = Fixture::new(STALE);
+    let host = Host::new(&fx, "host-a");
+    let mark = MaintainOnly {
+        by: MaintainOnlySource::FleetStore,
+        since: t0(),
+    };
+    set_maintain_only_for_test(&host.root, Some(mark));
+    let commits = fx.origin_commits();
+
+    let mut holds = Holds::default();
+    let (pass, _) = hold_pass_in(&host, Mode::Write, None, &mut holds);
+    assert_eq!(only(&pass).state, WState::W0, "{pass:?}");
+    assert!(reason(only(&pass)).starts_with("resynced to v0.19.880"), "{pass:?}");
+    assert_eq!(fx.origin_commits(), commits + 1, "resynced");
+    assert!(holds.holds().is_empty(), "no pass hold");
+    assert_eq!(holds.demand(), None, "no roll demand");
+    assert_eq!(hold_for(&host.root).unwrap().kind, HoldKind::MaintainOnly);
+
+    set_maintain_only_for_test(&host.root, None);
 }

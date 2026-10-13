@@ -256,6 +256,10 @@ pub fn git(dir: &Path, args: &[&str]) -> Option<String> {
         .arg("-C")
         .arg(dir)
         .args(args)
+        .env(
+            "GIT_REFLOG_ACTION",
+            crate::fleet_sync::checkout_ff::external_change::tag("update"),
+        )
         .stderr(Stdio::null())
         .output()
         .ok()?;

@@ -222,6 +222,22 @@ pub fn assess_scoped(
     runs: &[CheckRun],
     scoped: Option<&inputs::ScopedEvidence>,
 ) -> (Verdict, Vec<String>) {
+    assess_with_bumps(base_tip, required, runs, scoped, None)
+}
+
+/// [`assess_scoped`] with the base tip's trailing version bumps discounted
+/// (#11330, [`bump_tail`]): a context whose tested base IS the effective tip
+/// is fresh, and the time rule measures against the effective tip's commit
+/// time instead of the literal tip's. `tail: None` is exactly [`assess_scoped`].
+#[must_use]
+pub fn assess_with_bumps(
+    base_tip: DateTime<Utc>,
+    required: &[String],
+    runs: &[CheckRun],
+    scoped: Option<&inputs::ScopedEvidence>,
+    tail: Option<&bump_tail::BumpTail>,
+) -> (Verdict, Vec<String>) {
+    let base_tip = tail.map_or(base_tip, |t| t.effective_at.min(base_tip));
     let mut required_sorted: Vec<&String> = required.iter().collect();
     required_sorted.sort();
     required_sorted.dedup();
@@ -238,6 +254,9 @@ pub fn assess_scoped(
         }
 
         if let Some(mv) = scoped.and_then(|s| s.base_moves.get(ctx)) {
+            if tail.is_some_and(|t| t.is_effective(&mv.tested_base)) {
+                continue; // Only version bumps landed since the tested base.
+            }
             // A composite context (#9065) is stale iff any component is; the
             // refusal names the component so the operator knows which gate.
             let (check, reason) = match inputs::specs_for(ctx) {
@@ -390,6 +409,7 @@ failure (network, quota, token scope) or re-run the required checks, then re-run
     )
 }
 
+pub mod bump_tail;
 pub mod evidence;
 pub mod fetch;
 pub mod inputs;

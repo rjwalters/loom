@@ -80,7 +80,6 @@ fn seed_phase_history(
                 phase: (*phase).to_string(),
                 at: *at,
                 pr_number: None,
-                jev: None,
             })
             .collect(),
     );

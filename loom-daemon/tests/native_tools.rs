@@ -148,7 +148,7 @@ fn native_sweep_uses_profile_and_does_not_inherit_claude_pool_holds() {
         r#"{"runtimes":{"default":"pi"},"autonomous":{"modelExperiment":{"mode":"experiment"}}}"#,
     )
     .unwrap();
-    let model = loom_daemon::sweep_registry::resolve_autonomous_dispatch_model(d.path(), 1, None);
+    let model = loom_daemon::sweep_registry::resolve_autonomous_dispatch_model(d.path(), 1);
     assert!(model.model.is_empty(), "{model:?}");
     assert!(model.arm.is_none());
     let holds = loom_daemon::work_finder::pool_preflight::PoolHoldState::new();

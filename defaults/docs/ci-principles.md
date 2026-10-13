@@ -206,11 +206,11 @@ contract's direction A against the release `SUPPORTS_INSTALLED` names, where
 `ci.yml` tests only the release just before the change
 ([`release-cadence.md`](release-cadence.md), "Compatibility contract").
 
-The full **default-feature** suite runs only here (#10823): `ci.yml`'s
-`Rust Unit Tests` legs run the whole workspace with `--features
-loom-daemon/otlp` (the shipped configuration), and the PR gate adds only a
-targeted `--lib` step for the `#[cfg(not(feature = "otlp"))]` tests, whose
-names it derives from source.
+Since #10700 the OTLP exporter is compiled unconditionally, so there is one
+build configuration: `ci.yml`'s `Rust Unit Tests` legs and the nightly
+unpartitioned run test the same code (`--features loom-daemon/otlp` is a no-op
+alias where it still appears), and the former PR-gate step for
+`#[cfg(not(feature = "otlp"))]` tests is gone with the tests themselves.
 
 **A red daily run nobody reads is worse than none**, because it trains people
 to ignore red. So the `report` job is part of the mechanism, not a nicety:
@@ -238,6 +238,13 @@ to ignore red. So the `report` job is part of the mechanism, not a nicety:
   the label set is intentional and `.github/labels.yml` is authoritative.
   Identity lives in the title, which is why the lookup ignores labels and the
   issue body asks that the title be left unchanged.
+- **This repo's ci-daily also records the same decisions on its dashboard's
+  alert hub** (see the workflow's header comment). After the issue step, the
+  `report` job posts `open` for each job whose issue it opened or updated and
+  `resolved` for each green job, with the job's Actions OIDC token (no secret).
+  It is best-effort (`continue-on-error`, warnings only) and posts only from
+  `main`; it never changes an issue, and an outage there never turns the
+  report red.
 
 SigNoz needs nothing workflow-side: `loom-daemon ci-telemetry` captures every
 run of every workflow of the configured owners by auto-discovery, so the daily

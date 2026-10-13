@@ -80,6 +80,52 @@ pub(crate) fn probe(
     (owner_repo, issue): (&str, u32),
     timeout: Option<Duration>,
 ) -> Option<OpenPrProbe> {
+    let rows = read_rows(caller, gh_bin, root, owner_repo, timeout)?;
+    let policy = TrustPolicy::for_root(root);
+    match classify_open_linked_pr_rows(&rows, issue, owner_repo, &policy) {
+        OpenPrProbe::ProbeFailed => None,
+        verdict => Some(verdict),
+    }
+}
+
+/// [`probe`] for many issues from ONE listing read (#8865): the verified
+/// verdict of each issue in `issues`, in that order. `None` when the listing
+/// could not be read, which is no verdict for any of them.
+///
+/// The read, the repo, the classifier and the trust rule are [`probe`]'s, so
+/// an issue's verdict here is exactly what [`probe`] over the same rows would
+/// answer for it: `Open(pr)` or `NoneOpen`. An issue the classifier could not
+/// answer for (`ProbeFailed`) is left out, so every pair returned is a
+/// verified one. `NoneOpen` is the same verified absence the 2.6 guard's leg
+/// 0 acts on; the work finder's pre-filter, the one caller, uses it only to
+/// invalidate the #6788 memo and never as a permit.
+pub(crate) fn probe_many(
+    caller: &'static str,
+    gh_bin: &Path,
+    root: &Path,
+    (owner_repo, issues): (&str, &[u32]),
+    timeout: Option<Duration>,
+) -> Option<Vec<(u32, OpenPrProbe)>> {
+    let rows = read_rows(caller, gh_bin, root, owner_repo, timeout)?;
+    let policy = TrustPolicy::for_root(root);
+    let verified = issues.iter().filter_map(|&issue| {
+        match classify_open_linked_pr_rows(&rows, issue, owner_repo, &policy) {
+            OpenPrProbe::ProbeFailed => None,
+            verdict => Some((issue, verdict)),
+        }
+    });
+    Some(verified.collect())
+}
+
+/// The open-PR listing of `owner_repo`, or `None` when it could not be read
+/// (or failed for `root` less than [`LISTING_RETRY_AFTER`] ago).
+fn read_rows(
+    caller: &'static str,
+    gh_bin: &Path,
+    root: &Path,
+    owner_repo: &str,
+    timeout: Option<Duration>,
+) -> Option<Vec<RestPull>> {
     if listing_down(root) {
         return None;
     }
@@ -92,21 +138,16 @@ pub(crate) fn probe(
         timeout,
     );
     mark_listing(root, listed.is_ok());
-    let rows = match listed {
-        Ok(rows) => rows,
+    match listed {
+        Ok(rows) => Some(rows),
         Err(e) => {
             log::debug!(
-                "issue #{issue}: open-PR listing unavailable ({e:#}); falling back to the \
-                 closes-graph + timeline union for {}s (#10514)",
+                "{caller}: open-PR listing of {owner_repo} unavailable ({e:#}); no listing \
+                 verdict for {}s (#10514)",
                 LISTING_RETRY_AFTER.as_secs()
             );
-            return None;
+            None
         }
-    };
-    let policy = TrustPolicy::for_root(root);
-    match classify_open_linked_pr_rows(&rows, issue, owner_repo, &policy) {
-        OpenPrProbe::ProbeFailed => None,
-        verdict => Some(verdict),
     }
 }
 

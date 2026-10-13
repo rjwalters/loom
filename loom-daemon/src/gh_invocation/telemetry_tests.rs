@@ -381,3 +381,46 @@ fn a_spawn_failure_span_is_billed_not_sent_with_zero_requests() {
     assert_eq!(attr(span, "github.http.requests"), Some("0"));
     assert_eq!(attr(span, "github.http.status"), Some("unknown"));
 }
+
+/// #11407: the endpoint is a template from a finite table; the raw path,
+/// its owner, repo, number and query never reach the span.
+#[test]
+fn spans_name_the_endpoint_as_a_template_never_the_raw_path() {
+    let inv = read_op().args([
+        "api",
+        "--include",
+        "repos/acme/widgets/pulls/4242/reviews?per_page=100",
+    ]);
+    let (_, spans, _) = run(inv, "echo ok");
+    let span = &spans[0];
+    assert_eq!(attr(span, "github.route"), Some("/repos/{owner}/{repo}/pulls/{n}/reviews"));
+    assert_eq!(attr(span, "http.request.method"), Some("GET"));
+    assert_eq!(attr(span, "github.command"), Some("api"));
+    for key in ["github.route", "github.command", "http.request.method"] {
+        let value = attr(span, key).unwrap();
+        for raw in ["acme", "widgets", "4242", "per_page"] {
+            assert!(!value.contains(raw), "{key}={value} carries {raw}");
+        }
+    }
+
+    let (_, spans, _) = run(read_op().args(["pr", "list", "--json", "number"]), "echo ok");
+    assert_eq!(attr(&spans[0], "github.route"), Some("(porcelain)"));
+    assert_eq!(attr(&spans[0], "github.command"), Some("pr list"));
+    assert_eq!(attr(&spans[0], "http.request.method"), None);
+}
+
+/// #11407: in the agent `gh` front, the facade's `gh api` read is booked to
+/// the agent's own command, so `pr view --json statusCheckRollup` polling
+/// (#10629) is measurable by command and route.
+#[test]
+fn a_front_read_carries_the_agents_command_and_its_own_route() {
+    super::super::route::set_front_command(
+        &["pr", "view", "9", "--json", "statusCheckRollup"].map(String::from),
+    );
+    let inv = read_op().args(["api", "--include", "repos/acme/widgets/pulls/9"]);
+    let (_, spans, _) = run(inv, "echo ok");
+    super::super::route::clear_test_front_command();
+    assert_eq!(attr(&spans[0], "github.command"), Some("pr view"));
+    assert_eq!(attr(&spans[0], "github.route"), Some("/repos/{owner}/{repo}/pulls/{n}"));
+    assert_eq!(attr(&spans[0], "http.request.method"), Some("GET"));
+}

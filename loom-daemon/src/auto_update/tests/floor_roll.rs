@@ -708,3 +708,6 @@ fn an_unparseable_latest_version_is_unresolved_not_a_stall() {
 
 #[path = "repo_ahead.rs"]
 mod repo_ahead;
+
+#[path = "failed_roll.rs"]
+mod failed_roll;

@@ -16,6 +16,7 @@
 //! | `killed-by-signal` | the child was ended by a signal it did not send itself |
 //! | `toolless-launch` | exit 0, but the native launch never offered the `loom_*` tools (#8448) |
 //! | `sandbox-unavailable` | exit 0, but the runtime sandbox refused every tool call (#10003) |
+//! | `hook-denied` | exit 0, but a guard hook denied every tool call (#11727) |
 //! | `preflight-auth-failed` | the wrapper's auth pre-flight refused the session |
 //! | `session-down`, `session-mount-stale` | a `session-exec` refusal (#10455, #10364): the account's session container was down, or did not mount the workdir |
 //! | `preflight-mcp-failed`, `preflight-token-selection-failed`, `preflight-no-cli-start` | the sweep's pre-flight classifier: the adapter died before its CLI started |
@@ -43,6 +44,40 @@ const AUTH_PREFLIGHT_SENTINEL: &str = "# AUTH_PREFLIGHT_FAILED";
 /// The wrapper's mid-run rotation-exhausted sentinel (`failure_sentinel`'s
 /// table), which the sweep exhaustion signatures do not match.
 const ACCOUNT_POOL_EXHAUSTED_SENTINEL: &str = "# ACCOUNT_POOL_EXHAUSTED";
+
+/// Whether a failure `class` is **deterministic** — the same launch will fail
+/// the same way next tick — and so counts toward the per-workspace
+/// launch-failure hold (`runtime_preference::launch_failure_hold`, #11453).
+///
+/// An explicit allowlist: every class not named here is transient and keeps
+/// today's retry-next-tick behaviour, so a misclassification fails open to
+/// the status quo. Deliberately absent:
+///
+/// - `sandbox-unavailable` — owned by `sandbox_hold` (#10003); never
+///   double-armed.
+/// - `account-exhausted:*`, `account-pool-exhausted`, `session-limit`,
+///   `no-usable-account` — rate/quota, self-healing, already pool holds.
+/// - `runtime-timeout`, `timeout-ceiling`, `killed-by-signal`, `wait-failed`,
+///   `runtime-fatal`, `execution-error` — network, slowness, ops.
+/// - `session-down`, `session-mount-stale` — own handling (#10454/#10364).
+/// - `model-refusal`, `cwd-deleted`, and any other `exit-<code>`.
+#[must_use]
+pub(crate) fn is_deterministic(class: &str) -> bool {
+    matches!(
+        class,
+        "launch-failed"
+            | "toolless-launch"
+            | "hook-denied"
+            | "preflight-auth-failed"
+            | "credential-expired"
+            | "preflight-no-cli-start"
+            | "preflight-mcp-failed"
+            | "preflight-token-selection-failed"
+            | "exit-78"
+            | "exit-126"
+            | "exit-127"
+    )
+}
 
 /// `Command::spawn` failed: no child process exists.
 pub(super) fn launch_failed(error: &std::io::Error) -> RoleFailure {
@@ -89,6 +124,15 @@ pub(super) fn sandbox_unavailable() -> RoleFailure {
         "sandbox-unavailable",
         Some(0),
         "role child exited 0 but the runtime sandbox refused every tool call",
+    )
+}
+
+/// Exit 0 from a session whose every tool call a guard hook denied (#11727).
+pub(super) fn hook_denied() -> RoleFailure {
+    RoleFailure::new(
+        super::hook_denied::CLASS,
+        Some(0),
+        "role child exited 0 but a guard hook denied every tool call",
     )
 }
 

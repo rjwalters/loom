@@ -110,13 +110,19 @@ pub(crate) const EXTRA_SURFACES: &[Surface] = &[
 
 /// What `resync-installed.sh` or the installer does that NO daemon resync
 /// does, and why. `daemon-reference.md` carries the same list for operators;
-/// the parity tests read this one (nothing at runtime does).
-#[cfg_attr(not(test), allow(dead_code))]
+/// the parity tests read this one, and `resync-payload` names its entries in
+/// the note it prints ([`super::standalone`], #8961).
 pub(crate) const INSTALL_TIME_ONLY: &[(&str, &str)] = &[
     (
         ".loom/config.json",
         "consumer configuration: the installer merges it, no resync migrates a key, so a release \
          that renames or retires a config key must keep reading the old one",
+    ),
+    (
+        ".loom/config/",
+        "consumer-editable configuration (skill-routes.json): the installer copies each file \
+         only when it is absent (#9129), so a resync never overwrites an edit or re-creates a \
+         deleted file, which is the documented way to switch the skill router off",
     ),
     (
         "package.json",

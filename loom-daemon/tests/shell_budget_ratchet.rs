@@ -241,6 +241,12 @@ const BASE_SCRIPT: &str = "#!/usr/bin/env bash\nset -euo pipefail\necho \"a\"\n"
 ///
 /// Returns the gate's own output for `--check --base main`.
 fn run_gate(added: &str, message: &str) -> Output {
+    run_gate_under(added, message, &[])
+}
+
+/// [`run_gate`], with `env` set on the GATE process only — the fixture's own
+/// git commands run under the ambient config.
+fn run_gate_under(added: &str, message: &str, env: &[(String, String)]) -> Output {
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path();
     std::fs::create_dir_all(root.join("scripts")).expect("mkdir");
@@ -269,6 +275,7 @@ fn run_gate(added: &str, message: &str) -> Output {
     Command::new(env!("CARGO_BIN_EXE_loom-daemon"))
         .args(["shell-budget", "--check", "--base", "main", "--root"])
         .arg(root)
+        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .output()
         .expect("the gate binary must run")
 }
@@ -420,4 +427,76 @@ fn the_two_trailers_do_not_pay_each_others_bills() {
     );
     let out = gate(root);
     assert!(out.status.success(), "stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+}
+
+// --- #9529: the evidence diff does not depend on the user's git config ---
+//
+// `shell_budget/callout/hostile_git.rs` pins the exact credited count at the
+// function. These pin it through the real binary, with the config arriving the
+// way a developer's `~/.gitconfig` does: from OUTSIDE the repository.
+
+/// `GIT_CONFIG_COUNT`/`KEY_n`/`VALUE_n` for `pairs` — config injected into the
+/// gate's child `git` processes and nowhere else.
+///
+/// Never `git config --global`: see [`git`].
+fn git_config_env(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+    let mut env = vec![("GIT_CONFIG_COUNT".to_string(), pairs.len().to_string())];
+    for (i, (key, value)) in pairs.iter().enumerate() {
+        env.push((format!("GIT_CONFIG_KEY_{i}"), (*key).to_string()));
+        env.push((format!("GIT_CONFIG_VALUE_{i}"), (*value).to_string()));
+    }
+    env
+}
+
+/// The declaration `a_declared_call_site_passes_the_real_gate` proves passes
+/// under default config must pass under `env` too, with the same measurement.
+fn assert_the_call_site_still_passes(env: &[(String, String)]) {
+    let out = run_gate_under(
+        CALL_SITE,
+        "feat: call the ported subcommand\n\nShell-Budget-Callout: shell-budget +6",
+        env,
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "env {env:?}\nstderr:\n{stderr}\nstdout:\n{stdout}");
+    assert!(
+        stdout.contains(DEFAULT_CONFIG_MEASUREMENT),
+        "env {env:?} changed what was measured:\n{stdout}"
+    );
+}
+
+/// What the gate prints for `CALL_SITE` + `shell-budget +6` under default
+/// config. The hostile runs must print the same.
+const DEFAULT_CONFIG_MEASUREMENT: &str = "(6 declared, 6 measured in the diff)";
+
+#[test]
+fn the_default_config_measurement_is_the_one_the_hostile_runs_are_held_to() {
+    assert_the_call_site_still_passes(&[]);
+}
+
+#[test]
+fn a_mnemonic_prefix_does_not_refuse_a_valid_call_site() {
+    assert_the_call_site_still_passes(&git_config_env(&[("diff.mnemonicPrefix", "true")]));
+}
+
+#[test]
+fn a_custom_dst_prefix_does_not_refuse_a_valid_call_site() {
+    assert_the_call_site_still_passes(&git_config_env(&[("diff.dstPrefix", "y/")]));
+}
+
+#[test]
+fn noprefix_does_not_refuse_a_valid_call_site() {
+    // A pin rather than a regression test: this passed before #9529 through
+    // the parser's bare-path fallback.
+    assert_the_call_site_still_passes(&git_config_env(&[("diff.noprefix", "true")]));
+}
+
+#[test]
+fn an_external_diff_command_does_not_refuse_a_valid_call_site() {
+    assert_the_call_site_still_passes(&git_config_env(&[("diff.external", "true")]));
+}
+
+#[test]
+fn git_external_diff_in_the_environment_does_not_refuse_a_valid_call_site() {
+    assert_the_call_site_still_passes(&[("GIT_EXTERNAL_DIFF".to_string(), "true".to_string())]);
 }

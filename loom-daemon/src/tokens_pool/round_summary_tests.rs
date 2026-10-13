@@ -10,6 +10,7 @@ use super::*;
 use crate::tokens_pool::check::{
     run_check_traced, CheckOptions, ProbeError, ProbeResponse, ProbeTransport, Source,
 };
+use crate::tokens_pool::monitor_dir::test_env::MonitorDirEnvGuard;
 
 /// Canned responses in order; records whether each request carried an
 /// `x-api-key` header (a metered API-key probe).
@@ -97,14 +98,15 @@ fn probe_pool(dir: &Path) {
 fn a_probe_run_reports_outcome_credential_kind_and_probed_per_account() {
     let tmp = tempfile::tempdir().unwrap();
     probe_pool(tmp.path());
-    // a-oauth then b-key are the only accounts that reach the network.
-    let stub = Stub::new(&[200, 429]);
+    // a-oauth, b-key, then d-dead reach the network: an explicit
+    // `--source probe` probes a bad-marked account too (#8972).
+    let stub = Stub::new(&[200, 429, 401]);
     let trace = RoundTrace::default();
     let report = run_check_traced(tmp.path(), &opts(Source::Probe), &stub, &trace);
     let summary = summarize(tmp.path(), &report, &trace);
 
     assert_eq!(summary.source, RankingSource::Probe);
-    assert_eq!(*stub.api_key_requests.borrow(), [false, true]);
+    assert_eq!(*stub.api_key_requests.borrow(), [false, true, false]);
 
     let a = entry(&summary, "a-oauth");
     assert_eq!(
@@ -124,7 +126,7 @@ fn a_probe_run_reports_outcome_credential_kind_and_probed_per_account() {
     let d = entry(&summary, "d-dead");
     assert_eq!(
         (d.outcome, d.credential_kind, d.probed),
-        (AccountOutcome::AuthDead, CredentialKind::Oauth, false)
+        (AccountOutcome::AuthDead, CredentialKind::Oauth, true)
     );
     let e = entry(&summary, "e-codex");
     assert_eq!(
@@ -132,10 +134,10 @@ fn a_probe_run_reports_outcome_credential_kind_and_probed_per_account() {
         (AccountOutcome::Unsupported, CredentialKind::Unknown, false, "codex")
     );
 
-    assert_eq!(summary.probed_count(), 2);
+    assert_eq!(summary.probed_count(), 3);
     assert_eq!(summary.api_key_probe_count(), 1);
     assert_eq!(summary.api_key_probed_accounts(), ["b-key"]);
-    assert_eq!(probed_names(&trace).len(), 2);
+    assert_eq!(probed_names(&trace).len(), 3);
 }
 
 #[test]
@@ -194,9 +196,9 @@ fn monitor_run(reset_days: i64, statuses: &[u16]) -> (RoundSummary, usize) {
     let (tokens_dir, monitor_dir) = monitor_fixture(tmp.path(), reset_days);
     let stub = Stub::new(statuses);
     let trace = RoundTrace::default();
-    std::env::set_var("LOOM_CLAUDE_MONITOR_DIR", &monitor_dir);
+    let env_guard = MonitorDirEnvGuard::legacy(&monitor_dir);
     let report = run_check_traced(&tokens_dir, &opts(Source::Auto), &stub, &trace);
-    std::env::remove_var("LOOM_CLAUDE_MONITOR_DIR");
+    drop(env_guard);
     let requests = stub.api_key_requests.borrow().len();
     (summarize(&tokens_dir, &report, &trace), requests)
 }

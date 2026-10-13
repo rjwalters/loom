@@ -161,25 +161,14 @@ pub struct TelemetryKindMeta {
 /// `auto_update.tick` (#10414).
 pub mod auto_update_tick;
 
+/// `checkout.external_change` (#11566) — a managed checkout moved by non-Loom git.
+pub mod checkout_external_change;
+
 /// `host.export` (#11124).
 pub mod host_export;
 
-/// `eta.estimate` / `eta.outcome` (#9289).
-pub mod eta;
-
-/// `eta.backtest.fold` / `eta.backtest.summary` (#10492).
-pub mod eta_backtest;
-
-/// `eta.fit` (#10391).
-pub mod eta_fit;
-/// `eta.fleet_refresh` (#10263).
-pub mod eta_fleet_refresh;
-
-/// `eta.snapshot` (#9329).
-pub mod eta_snapshot;
-
-/// `eta.stage_outcome` (#10929) — one stage an item left, from the ETA tracker.
-pub mod eta_stage_outcome;
+/// `operator.presence` (#11563) — an operator session's keyboard presence.
+pub mod operator_presence;
 
 /// `pass.summary` / `pass.verdict` (#10752) — what a pass over artifacts did.
 pub mod pass;
@@ -187,16 +176,23 @@ pub mod pass;
 /// `pick.decision` (#10212) — what a role / the work finder looked at per tick.
 pub mod pick_decision;
 
-/// `pr.resolved` (#10519) — a PR's merge or close instant, from the ETA pass.
+/// `pr.resolved` (#10519) — a PR's merge or close instant, from `fleet.state`.
 pub mod pr_resolved;
+
+/// `eta.stage_outcome` (#10929) — one stage an item left, from `fleet.state`.
+pub mod stage_outcome;
 
 /// `session.output` (#9764) — the live, redacted agent-output feed.
 pub mod session_output;
 
 /// `fleet.state` (#10196) — in-flight items and open-PR census over OTLP.
 pub mod fleet_state;
+pub mod issue_estimate;
 /// `token_ranking.refresh` (#10744) — one token-ranking refresh round.
 pub mod token_ranking_refresh;
+
+/// `stage.work_started` (#11641) — a role agent began working an item in a stage.
+pub mod work_started;
 
 /// The export-coverage pair `(exporters, exported_kinds)` for `host.health`
 /// (Issue #10196), derived from the per-exporter status map
@@ -375,23 +371,6 @@ macro_rules! telemetry_kind_table {
             QueueSnapshot = "queue.snapshot" => $crate::telemetry::QueueSnapshotRecord,
                 gate: 11, otlp: NotExported, native: true;
 
-            /// One ETA estimate with its `eta-explanation/v1` record (Issue #9289).
-            /// OTLP-only: explanations live in SigNoz. See [`eta`].
-            EtaEstimate = "eta.estimate" => $crate::telemetry::kinds::eta::EtaEstimateRecord,
-                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
-
-            /// One ETA estimate's scored outcome (Issue #9289). OTLP-only.
-            EtaOutcome = "eta.outcome" => $crate::telemetry::kinds::eta::EtaOutcomeRecord,
-                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
-
-            /// This host's live per-issue ETA estimate set (Issue #9329).
-            /// Native-HTTPS only — the dashboard's `eta:<hostId>` state key,
-            /// the mirror of [`QueueSnapshot`](Self::QueueSnapshot). SigNoz
-            /// gets every estimate as [`EtaEstimate`](Self::EtaEstimate)
-            /// instead. See [`eta_snapshot`].
-            EtaSnapshot = "eta.snapshot" => $crate::telemetry::kinds::eta_snapshot::EtaSnapshotRecord,
-                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: NotExported, native: true;
-
             /// One live agent-output event during an in-flight run (Issue
             /// #9764) — readable, producer-redacted, issue-scoped. The second
             /// kind whose OTLP body is text the daemon did not author, so it
@@ -403,12 +382,6 @@ macro_rules! telemetry_kind_table {
             /// See [`session_output`].
             SessionOutput = "session.output" => $crate::telemetry::kinds::session_output::SessionOutputRecord,
                 gate: 13, otlp: Logs, native: false;
-
-            /// One repo's outcome in one cycle of the daemon's fleet snapshot
-            /// refresh (Issue #10263). OTLP-only, like the other `eta.*` log
-            /// kinds. See [`eta_fleet_refresh`].
-            EtaFleetRefresh = "eta.fleet_refresh" => $crate::telemetry::kinds::eta_fleet_refresh::EtaFleetRefreshRecord,
-                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             /// One self-update loop decision (Issue #10414): decision, installed
             /// and target versions, defer reason, drain state. OTLP-only. See
@@ -424,40 +397,22 @@ macro_rules! telemetry_kind_table {
             FleetState = "fleet.state" => $crate::telemetry::kinds::fleet_state::FleetStateRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
-            /// One daily-fit check, whether it fitted or skipped (Issue
-            /// #10391). OTLP-only, like the other `eta.*` log kinds. See
-            /// [`eta_fit`].
-            EtaFit = "eta.fit" => $crate::telemetry::kinds::eta_fit::EtaFitRecord,
-                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
-
             /// One role tick's (or work-finder tick's) pick decision (Issue #10212):
             /// the ranked candidates it considered, what it acted on, and a
             /// closed-set reason per skip. OTLP-only. See [`pick_decision`].
             PickDecision = "pick.decision" => $crate::telemetry::kinds::pick_decision::PickDecisionRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
-            /// A PR the ETA pass saw leave the review listings, with its merge
-            /// or close instant (Issue #10519). Built from rows the pass
-            /// already journals, so no new forge read. OTLP-only. See
-            /// [`pr_resolved`].
+            /// A PR that left the review listings, with its forge merge or
+            /// close instant (Issue #10519; produced by `fleet.state` since
+            /// #11126). OTLP-only. See [`pr_resolved`].
             PrResolved = "pr.resolved" => $crate::telemetry::kinds::pr_resolved::PrResolvedRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
-            /// One stage an item left, with its entry and exit instants and the
-            /// estimates open for the item then (Issue #10929). Built from rows
-            /// the ETA tracker already journals, so no new forge read.
-            /// OTLP-only. See [`eta_stage_outcome`].
-            EtaStageOutcome = "eta.stage_outcome" => $crate::telemetry::kinds::eta_stage_outcome::EtaStageOutcomeRecord,
-                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
-
-            /// One heuristic's nightly walk-forward fold for one UTC day (Issue
-            /// #10492). OTLP-only. See [`eta_backtest`].
-            EtaBacktestFold = "eta.backtest.fold" => $crate::telemetry::kinds::eta_backtest::EtaBacktestFoldRecord,
-                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
-
-            /// One challenger's rolling backtest standing against `current`
-            /// (Issue #10492). OTLP-only. See [`eta_backtest`].
-            EtaBacktestSummary = "eta.backtest.summary" => $crate::telemetry::kinds::eta_backtest::EtaBacktestSummaryRecord,
+            /// One stage an item left, with its entry and exit instants (Issue
+            /// #10929; produced by `fleet.state` since #11126). The wire tag
+            /// keeps its `eta.` prefix. OTLP-only. See [`stage_outcome`].
+            StageOutcome = "eta.stage_outcome" => $crate::telemetry::kinds::stage_outcome::StageOutcomeRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             /// One pass over a workspace's artifacts (Issue #10752): mechanism,
@@ -480,9 +435,34 @@ macro_rules! telemetry_kind_table {
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             /// This host's export view (Issue #11124, R2 of #10196): active
-            /// exporters, queue depth, cumulative `dropped_total` per exporter
-            /// and the last successful flush. OTLP-only. See [`host_export`].
+            /// exporters, queue depth, the durable by-reason loss counts
+            /// (`dropped_total`/`dropped_by_reason`, #11527) per exporter and
+            /// the last successful flush. OTLP-only. See [`host_export`].
             HostExport = "host.export" => $crate::telemetry::kinds::host_export::HostExportRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// An operator session's presence beat (Issue #11563): who is at the
+            /// keyboard (`last_input_at`), when the session last did anything,
+            /// and which issues and PRs it is driving. No prompt or transcript
+            /// content exists in the record. Exported over OTLP (the `loom.presence.*`
+            /// scalars ride as attributes; the body is the record's JSON) now that
+            /// #11525 settled the transport — the same path as every other fact.
+            /// See [`operator_presence`].
+            OperatorPresence = "operator.presence" => $crate::telemetry::kinds::operator_presence::OperatorPresenceRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+            /// A managed checkout's history was moved by something other than
+            /// Loom (Issue #11566): the reflog entry, from/to sha and the commits
+            /// it made unreachable. OTLP-only. See [`checkout_external_change`].
+            CheckoutExternalChange = "checkout.external_change" => $crate::telemetry::kinds::checkout_external_change::CheckoutExternalChangeRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// One curation completion's blind difficulty estimate (#11608).
+            IssueEstimate = "issue.estimate" => $crate::telemetry::kinds::issue_estimate::IssueEstimateRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// A role agent began working an item in a stage (#11641): the
+            /// work-start that splits a stay into queue wait and work time.
+            WorkStarted = "stage.work_started" => $crate::telemetry::kinds::work_started::WorkStartedRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             // APPEND NEW KINDS ABOVE THIS LINE (one row; `gate:` stays

@@ -1,4 +1,4 @@
-//! Pins the four daemon-implemented gates' `G` sets to the Rust source their
+//! Pins the daemon-implemented gates' `G` sets to the Rust source their
 //! verdicts can actually reach (see "Gates implemented inside the daemon
 //! binary" in the `inputs` module docs).
 //!
@@ -83,6 +83,11 @@ const SURFACES: &[Surface] = &[
         component: "MCP Guard Wiring Contract",
         roots: &[Root::File("cli/check_guard_wiring.rs")],
         entry_symbol: "CheckGuardWiringArgs",
+    },
+    Surface {
+        component: "Fleet-Policy Shadow Guard",
+        roots: &[Root::Fn("cli/misc_cmds.rs", "handle_validate_command")],
+        entry_symbol: "handle_validate_command",
     },
 ];
 

@@ -1,21 +1,18 @@
 //! `singleton_registry`: every one-host fleet job in the source tree, whether
-//! a named singleton job (`arm_singleton_job` / `record_owned_singleton_job`)
-//! or elected by the ETA authority, has a registry row or an explicit,
-//! reasoned exemption.
+//! a named singleton job (`arm_singleton_job`),
+//! has a registry row or an explicit, reasoned exemption.
 
 use super::*;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 /// Files (relative to `src`) that own a named singleton job, i.e. call
-/// `arm_singleton_job(` or `record_owned_singleton_job(`. A new owning file
+/// `arm_singleton_job(`. A new owning file
 /// must be added here *and* its job registered.
 const OWNING_FILES: &[&str] = &[
     "ci_telemetry/mod.rs",
     "intake_reconcile/singleton.rs",
     "observability/captain_gauges.rs",
-    "observability/eta_fleet_refresh.rs",
-    "observability/eta_nightly_folds.rs",
 ];
 
 /// Every `.rs` under `src` as (relative path with `/`, contents), skipping
@@ -51,20 +48,19 @@ fn sources() -> Vec<(String, String)> {
 }
 
 /// A call that owns a named singleton job.
-const OWNS: &str = r"\b(?:arm|record_owned)_singleton_job\(";
+const OWNS: &str = r"\barm_singleton_job\(";
 
 fn re(s: &str) -> regex::Regex {
     regex::Regex::new(s).unwrap()
 }
 
 /// Singleton job names in source: every `*JOB_NAME` const (not only
-/// `SINGLETON_JOB_NAME`: `eta::retire_filing::JOB_NAME` gates on the captain
-/// too), the `captain_gauges` `*_JOB` consts, and string literals at call
+/// `SINGLETON_JOB_NAME`), the `captain_gauges` `*_JOB` consts, and string literals at call
 /// sites.
 fn discovered_jobs(srcs: &[(String, String)]) -> BTreeSet<String> {
     let konst = re(r#"const (?:[A-Z]+_)*JOB_NAME: &str = "([^"]+)""#);
     let gauge = re(r#"const [A-Z_]+_JOB: &str = "([^"]+)""#);
-    let literal = re(r#"\b(?:arm|record_owned)_singleton_job\(\s*"([^"]+)""#);
+    let literal = re(r#"\barm_singleton_job\(\s*"([^"]+)""#);
     let mut found = BTreeSet::new();
     for (rel, text) in srcs {
         let mut grab =
@@ -94,29 +90,10 @@ fn singleton_registry_owning_files_are_known() {
     );
 }
 
-/// `eta::job_owner` (#10918) hands the ETA jobs to the explicit authority;
-/// whoever consults it outside tests must record the job by name, which the
-/// registry then covers.
-#[test]
-fn singleton_registry_job_owner_callers_record_a_named_job() {
-    let owner = re(r"\bjob_owner::resolve(_with)?\(");
-    let owns = re(OWNS);
-    let unrecorded: Vec<String> = sources()
-        .into_iter()
-        .filter(|(rel, t)| {
-            !rel.contains("/tests/") && !rel.ends_with("_tests.rs") && owner.is_match(t)
-        })
-        .filter(|(_, t)| !owns.is_match(t))
-        .map(|(rel, _)| rel)
-        .collect();
-    assert!(unrecorded.is_empty(), "job_owner callers owning no named job: {unrecorded:?}");
-}
-
 #[test]
 fn singleton_registry_covers_every_singleton_job() {
     let jobs = discovered_jobs(&sources());
-    assert!(jobs.len() >= 8, "scan found too few jobs: {jobs:?}");
-    assert!(jobs.contains(crate::eta::retire_filing::JOB_NAME), "{jobs:?}");
+    assert!(jobs.len() >= 5, "scan found too few jobs: {jobs:?}");
     let known: BTreeSet<&str> = SINGLETON_OUTPUTS
         .iter()
         .filter(|o| o.gate == Gate::SingletonJob)
@@ -136,49 +113,11 @@ fn singleton_registry_covers_every_singleton_job() {
 }
 
 #[test]
-fn singleton_registry_covers_every_authority_site() {
-    let call = re(r"\bauthority::resolve(_with)?\(");
-    let found: BTreeSet<String> = sources()
-        .into_iter()
-        .filter(|(rel, t)| rel != "eta/authority.rs" && call.is_match(t))
-        .map(|(rel, _)| rel)
-        .collect();
-    let listed: BTreeSet<String> = AUTHORITY_SITES
-        .iter()
-        .map(|(f, _, _)| (*f).to_string())
-        .collect();
-    assert_eq!(
-        found, listed,
-        "eta::authority::resolve call sites changed: map each to a Gate::EtaAuthority row (or None + reason) \
-         in fleet_outputs::AUTHORITY_SITES"
-    );
-    let rows: BTreeSet<&str> = SINGLETON_OUTPUTS
-        .iter()
-        .filter(|o| o.gate == Gate::EtaAuthority)
-        .map(|o| o.record_kind)
-        .collect();
-    let gated: BTreeSet<&str> = AUTHORITY_SITES.iter().filter_map(|(_, k, _)| *k).collect();
-    assert_eq!(
-        rows, gated,
-        "every authority row needs a gating site and every gated kind a row"
-    );
-    for (file, _, reason) in AUTHORITY_SITES {
-        assert!(!reason.trim().is_empty(), "authority site {file} needs a reason");
-    }
-}
-
-#[test]
 fn singleton_registry_rows_are_well_formed() {
     let mut seen = BTreeSet::new();
     for o in SINGLETON_OUTPUTS {
         assert!(o.cadence > Duration::ZERO, "{} cadence is zero", o.record_kind);
         assert!(seen.insert((o.job, o.record_kind)), "duplicate row {}:{}", o.job, o.record_kind);
-        assert_eq!(
-            o.gate == Gate::EtaAuthority,
-            o.job == ETA_AUTHORITY,
-            "{}: gate/job mismatch",
-            o.record_kind
-        );
     }
     for o in SINGLETON_OUTPUTS {
         assert!(

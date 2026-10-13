@@ -56,12 +56,30 @@ fn git(repo: &Path, args: &[&str]) -> std::process::Output {
 }
 
 /// A one-commit repo at `<dir>/<name>`. `name` may contain spaces.
+///
+/// **Background maintenance is off (#9973).** This was the unexpected holder.
+/// On git >= 2.47, `git commit` ends by spawning `git maintenance run --auto
+/// --quiet --detach`. That process daemonizes without leaving the `git -C`
+/// cwd, and the daemonized half is still running after `git commit` itself
+/// has exited. Measured with trace2 on git 2.56 and no hooks (CI's shape): it
+/// outlived the commit in 37 of 40 runs, by 0.4–5 ms. A test that writes a
+/// file and calls [`super::run`] right after its only fixture commit lands in
+/// that window, and the #7463 liveness probe correctly refuses. All four
+/// recorded CI failures were tests of that shape. The production fetches that
+/// precede a reset already pass `-c maintenance.auto=false` (#9620), and
+/// `tests/worktree_reset_differential.rs` sets these keys too. Only the fixture
+/// changes; the probe and its veto are untouched, so every liveness case below
+/// still proves a *real* holder refuses.
+/// `a_fixture_commit_spawns_no_background_maintenance` pins this
+/// deterministically.
 fn repo(dir: &Path, name: &str) -> PathBuf {
     let repo = dir.join(name);
     fs::create_dir_all(&repo).unwrap();
     git(&repo, &["init", "-q", "-b", "main"]);
     git(&repo, &["config", "user.email", "t@t"]);
     git(&repo, &["config", "user.name", "t"]);
+    git(&repo, &["config", "maintenance.auto", "false"]);
+    git(&repo, &["config", "gc.auto", "0"]);
     fs::write(repo.join("tracked.txt"), "base content\n").unwrap();
     git(&repo, &["add", "tracked.txt"]);
     git(&repo, &["commit", "-q", "-m", "base"]);
@@ -90,6 +108,34 @@ fn opts(worktree: &Path, target_ref: &str, label: &str) -> Options {
         // needs excluding unless a case says so.
         ignore_pids: Vec::new(),
     }
+}
+
+/// [`super::run`] for a case that expects `0`, which on a nonzero return
+/// panics naming whatever has its cwd inside the worktree (#9973).
+///
+/// **Best-effort re-scan, not the refusing probe's own result.** `run` keeps
+/// its matched PIDs to itself, so this runs a *second*
+/// `find_processes_with_cwd_in_directory` immediately after the refusal. A
+/// holder that exited in between is missed (reported as an empty scan), so an
+/// empty list here does not prove there was no holder. The production probe and
+/// refusal text are untouched; the differential suite pins the latter.
+fn run_expecting_ok(o: &Options) {
+    let code = run(o);
+    if code == 0 {
+        return;
+    }
+    let rescan = match safety::find_processes_with_cwd_in_directory(&o.worktree) {
+        CwdProbe::Pids(pids) if pids.is_empty() => {
+            "re-scan found nothing (holder, if any, already gone)".to_string()
+        }
+        CwdProbe::Pids(pids) => describe_pids(&pids),
+        CwdProbe::Unprobable => "re-scan unavailable (no /proc, no lsof)".to_string(),
+    };
+    panic!(
+        "run({}) returned {code}, expected 0; best-effort re-scan of processes \
+         with cwd inside the worktree right after the return: {rescan}",
+        o.worktree.display()
+    );
 }
 
 fn set_mode(path: &Path, mode: u32) {
@@ -181,7 +227,7 @@ fn a_clean_worktree_resets_and_writes_no_rescue_patch() {
     let second = commit(&repo, "second\n", "second");
     git(&repo, &["reset", "-q", "--hard", &base]);
 
-    assert_eq!(run(&opts(&repo, &second, "test-rescue")), 0);
+    run_expecting_ok(&opts(&repo, &second, "test-rescue"));
     assert_eq!(head(&repo), second, "the reset must land on the target ref");
     assert!(patches(&repo).is_empty(), "a clean worktree has nothing to rescue");
 }
@@ -198,7 +244,7 @@ fn an_untracked_file_needs_no_rescue_and_survives_the_reset() {
     git(&repo, &["reset", "-q", "--hard", &base]);
     fs::write(repo.join("scratch.txt"), "untracked scratch\n").unwrap();
 
-    assert_eq!(run(&opts(&repo, &second, "test-rescue")), 0);
+    run_expecting_ok(&opts(&repo, &second, "test-rescue"));
     assert_eq!(fs::read_to_string(repo.join("scratch.txt")).unwrap(), "untracked scratch\n");
     assert!(patches(&repo).is_empty());
 }
@@ -214,7 +260,7 @@ fn foreign_tracked_changes_are_rescued_to_a_replayable_patch_before_the_reset() 
     let base = head(&repo);
     fs::write(repo.join("tracked.txt"), "foreign edit\n").unwrap();
 
-    assert_eq!(run(&opts(&repo, &base, "test-rescue")), 0);
+    run_expecting_ok(&opts(&repo, &base, "test-rescue"));
 
     let found = patches(&repo);
     assert_eq!(found.len(), 1, "expected exactly one rescue patch: {found:?}");
@@ -241,7 +287,7 @@ fn the_rescue_patch_is_named_from_the_label_and_a_utc_stamp() {
     let base = head(&repo);
     fs::write(repo.join("tracked.txt"), "foreign\n").unwrap();
 
-    assert_eq!(run(&opts(&repo, &base, "issue-42-stale-worktree-reset")), 0);
+    run_expecting_ok(&opts(&repo, &base, "issue-42-stale-worktree-reset"));
 
     let found = patches(&repo);
     let name = found[0].file_name().unwrap().to_string_lossy().to_string();
@@ -492,7 +538,7 @@ fn a_worktree_path_containing_spaces_is_rescued_and_reset_whole() {
     let base = head(&repo);
     fs::write(repo.join("tracked.txt"), "foreign edit\n").unwrap();
 
-    assert_eq!(run(&opts(&repo, &base, "label with spaces")), 0);
+    run_expecting_ok(&opts(&repo, &base, "label with spaces"));
 
     let found = patches(&repo);
     assert_eq!(found.len(), 1, "expected one patch: {found:?}");
@@ -545,7 +591,163 @@ fn a_live_holder_under_a_space_bearing_path_is_still_detected() {
 }
 
 // ---------------------------------------------------------------------------
-// 6. Helpers
+// 6. Fixture hermeticity (#9973)
+// ---------------------------------------------------------------------------
+
+/// `pid=… ppid=… exe=… cmdline=…` for each PID, read straight from `/proc`
+/// (best effort — a holder that has already exited reads as `<gone>`). Used
+/// only in failure messages. The probe guard below feeds it the PIDs from the
+/// same probe call that matched them; [`run_expecting_ok`] can only feed it a
+/// later re-scan, which misses a holder that has already exited.
+fn describe_pids(pids: &[u32]) -> String {
+    let read = |pid: u32, f: &str| {
+        fs::read(format!("/proc/{pid}/{f}"))
+            .map(|b| {
+                String::from_utf8_lossy(&b)
+                    .replace('\0', " ")
+                    .trim()
+                    .to_string()
+            })
+            .unwrap_or_else(|_| "<gone>".to_string())
+    };
+    pids.iter()
+        .map(|&pid| {
+            let cmdline = read(pid, "cmdline");
+            let ppid = read(pid, "status")
+                .lines()
+                .find_map(|l| l.strip_prefix("PPid:").map(|v| v.trim().to_string()))
+                .unwrap_or_else(|| "<gone>".to_string());
+            let exe = fs::read_link(format!("/proc/{pid}/exe"))
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "<gone>".to_string());
+            format!("pid={pid} ppid={ppid} exe={exe} cmdline={cmdline}")
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+#[test]
+fn fixture_repos_disable_gits_detached_background_maintenance() {
+    // A fixture pin (#9973): it asserts the keys are set. The regression test
+    // that tells the old fixture from the new is
+    // `a_fixture_commit_spawns_no_background_maintenance` below.
+    let dir = tmpdir("fixture-maintenance");
+    let repo = repo(&dir, "repo");
+    let get = |key: &str| {
+        String::from_utf8_lossy(&git(&repo, &["config", "--local", "--get", key]).stdout)
+            .trim()
+            .to_string()
+    };
+    assert_eq!(get("maintenance.auto"), "false");
+    assert_eq!(get("gc.auto"), "0");
+}
+
+#[test]
+fn a_fixture_commit_leaves_no_process_inside_the_worktree() {
+    // A guard, not proof: probe immediately after each fixture commit, which
+    // is when a detached maintenance child (if any) would be alive. The window
+    // is a few milliseconds (#9973), so this alone rarely trips on the old
+    // fixture. The deterministic check is the trace2 test below. With
+    // maintenance off there is nothing to find on any git, so this should not
+    // fail spuriously. If it ever does, the message names the holder from this
+    // same probe call.
+    let dir = tmpdir("fixture-no-holder");
+    let repo = repo(&dir, "repo");
+    if !probe_available(&repo) {
+        eprintln!("SKIP: no /proc and no lsof on this host");
+        return;
+    }
+    for n in 0..25 {
+        commit(&repo, &format!("commit {n}\n"), &format!("c{n}"));
+        if let CwdProbe::Pids(pids) = safety::find_processes_with_cwd_in_directory(&repo) {
+            assert!(
+                pids.is_empty(),
+                "a fixture commit left a live process inside the worktree, which \
+                 the reset's liveness probe would count as a foreign holder: {}",
+                describe_pids(&pids)
+            );
+        }
+    }
+}
+
+/// The argv of every child process a `git -C repo commit` started, read from
+/// its own trace2 event stream. trace2 records the spawn whether the child
+/// lives for a millisecond or a minute, so unlike a `/proc` scan this cannot
+/// miss a short-lived holder.
+fn children_spawned_by_a_commit(repo: &Path, trace: &Path) -> Vec<String> {
+    let _ = fs::remove_file(trace);
+    fs::write(repo.join("tracked.txt"), "traced commit\n").unwrap();
+    git(repo, &["add", "tracked.txt"]);
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["commit", "-q", "-m", "traced"])
+        .env("GIT_TRACE2_EVENT", trace)
+        .output()
+        .expect("run git commit");
+    assert!(
+        out.status.success(),
+        "traced commit failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    fs::read_to_string(trace)
+        .expect("git wrote no trace2 events")
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|e| e["event"] == "child_start")
+        .map(|e| {
+            e["argv"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+fn is_background_maintenance(argv: &str) -> bool {
+    argv.contains("maintenance run") || argv.contains("gc --auto")
+}
+
+#[test]
+fn a_fixture_commit_spawns_no_background_maintenance() {
+    // The regression for #9973's holder. A fixture repo's commit must not
+    // spawn `git maintenance run --auto` (detached on git >= 2.47), because
+    // that child keeps the repo as its cwd after `git commit` returns.
+    let dir = tmpdir("fixture-trace");
+    let hardened = repo(&dir, "repo");
+    let spawned = children_spawned_by_a_commit(&hardened, &dir.join("hardened.trace"));
+    assert!(
+        !spawned.iter().any(|a| is_background_maintenance(a)),
+        "a fixture commit spawned background maintenance, which would sit in \
+         the worktree and veto the reset: {spawned:?}"
+    );
+
+    // Negative control: the same commit in a repo shaped like the fixture
+    // before #11226 does spawn it. This is what makes the assertion above mean
+    // something on this git. `maintenance.auto=true` is explicit so a host's
+    // global config cannot make the control pass vacuously. It is git's
+    // default, and CI's runners leave it at that default.
+    let control = dir.join("control");
+    fs::create_dir_all(&control).unwrap();
+    git(&control, &["init", "-q", "-b", "main"]);
+    git(&control, &["config", "user.email", "t@t"]);
+    git(&control, &["config", "user.name", "t"]);
+    git(&control, &["config", "maintenance.auto", "true"]);
+    let spawned = children_spawned_by_a_commit(&control, &dir.join("control.trace"));
+    assert!(
+        spawned.iter().any(|a| is_background_maintenance(a)),
+        "control: an unhardened commit should spawn `git maintenance run --auto`; \
+         if git stopped doing that, this test no longer distinguishes anything: {spawned:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 7. Helpers
 // ---------------------------------------------------------------------------
 
 #[test]
