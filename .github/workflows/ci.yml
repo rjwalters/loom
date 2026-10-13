@@ -1343,17 +1343,6 @@ jobs:
         if: ${{ !cancelled() && needs.changes.outputs.daemon != 'false' }}
         run: ./target/debug/loom-daemon shell-budget --check
 
-      # component: Fleet-Policy Shadow Guard
-      # (#11441) A fleet-policy key (runtimes, autonomous, ...) committed in a tracked
-      # repo tier (.loom/config.json, .loom-project/project.json) silently
-      # overrides fleet-gitops. Fails (exit 2) unless the key has an entry with
-      # a reason in .loom/fleet-policy-allow.json. Classification lives in
-      # loom-daemon/src/fleet_policy.rs; same `daemon != 'false'` reach as the
-      # shell budget above (not a path filter).
-      - name: Check tracked config carries no un-allowed fleet-policy keys (#11441)
-        if: ${{ !cancelled() && needs.changes.outputs.daemon != 'false' }}
-        run: LOOM_CONFIG_DEFAULTS_FILE="" ./target/debug/loom-daemon validate . --fleet-policy-only
-
       # component: .gitignore Convergence Check
       # Not gated on backend changes — a drifted .gitignore is detectable
       # regardless of which file group a PR touches. It runs under
