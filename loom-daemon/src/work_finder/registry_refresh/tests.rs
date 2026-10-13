@@ -1,7 +1,7 @@
 //! Tests for [`refresh_local_workspace_state`](super::refresh_local_workspace_state)
 //! (issue #8121).
 //!
-//! `loom-daemon workspace add <path> --priority N` writes the machine
+//! `loom-daemon workspace add <path> --weight N` writes the machine
 //! registry and reports success immediately, but before #8121 the tick loop
 //! only reloaded that registry (and provisioned a new root's
 //! `SweepRegistry`/reaper/watchdog via `WorkspacePool::get_or_provision`)
@@ -115,7 +115,7 @@ async fn refresh_local_workspace_state_hot_applies_a_newly_registered_workspace(
     );
     assert!(pool.provisioned_registry_for(&new_repo).is_none());
 
-    // Simulate `loom-daemon workspace add <new_repo> --priority N`: it loads
+    // Simulate `loom-daemon workspace add <new_repo> --weight N`: it loads
     // the registry, adds the root, and saves — nothing more.
     let mut registry = WorkspaceRegistry::load(&registry_path).unwrap();
     registry.add(&new_repo, None).unwrap();
