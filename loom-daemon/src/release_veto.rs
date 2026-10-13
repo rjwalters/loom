@@ -16,13 +16,30 @@ pub(crate) const LABELS_OP: &str = "release_veto.issue_labels";
 /// failed: an unverifiable item is released as it was before #11480, so a
 /// forge hiccup never strands a claim.
 pub(crate) fn veto(gh_bin: &Path, root: &Path, issue: u32, removing: &[&str]) -> Option<String> {
+    let labels = labels(gh_bin, root, issue)?;
+    crate::work_finder::restore_veto(&labels, removing).map(str::to_string)
+}
+
+/// [`veto`] for a quarantine release, which must also not re-add
+/// `loom:issue` to an issue that is claimed right now (#11517): a live
+/// `loom:building` vetoes too, since this path never removes it.
+pub(crate) fn quarantine_veto(gh_bin: &Path, root: &Path, issue: u32) -> Option<String> {
+    let labels = labels(gh_bin, root, issue)?;
+    let building = crate::work_finder::BUILDING_LABEL;
+    if labels.iter().any(|l| l == building) {
+        return Some(building.to_string());
+    }
+    crate::work_finder::restore_veto(&labels, &["loom:blocked"]).map(str::to_string)
+}
+
+/// The issue's label names over REST; `None` when the read failed.
+fn labels(gh_bin: &Path, root: &Path, issue: u32) -> Option<Vec<String>> {
     let path = format!("repos/{{owner}}/{{repo}}/issues/{issue}");
     let jq = "[(.labels // [])[] | .name]";
     let stdout = gh_call::ok_stdout(
         gh_call::read(LABELS_OP, gh_bin, root).args(["api", &path, "--jq", jq]),
     )?;
-    let labels: Vec<String> = serde_json::from_slice(&stdout).ok()?;
-    crate::work_finder::restore_veto(&labels, removing).map(str::to_string)
+    serde_json::from_slice(&stdout).ok()
 }
 
 #[cfg(test)]
@@ -48,6 +65,15 @@ mod tests {
         );
         let gh = fake_gh(dir.path(), r#"["loom:blocked","loom:important"]"#);
         assert_eq!(veto(&gh, dir.path(), 1950, &["loom:blocked"]), None);
+    }
+
+    #[test]
+    fn a_quarantine_release_is_vetoed_by_a_live_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let gh = fake_gh(dir.path(), r#"["loom:blocked","loom:building"]"#);
+        assert_eq!(quarantine_veto(&gh, dir.path(), 2980).as_deref(), Some("loom:building"));
+        let gh = fake_gh(dir.path(), r#"["loom:blocked"]"#);
+        assert_eq!(quarantine_veto(&gh, dir.path(), 2980), None);
     }
 
     #[test]

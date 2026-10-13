@@ -162,3 +162,28 @@ fn quarantine_release_respects_the_shared_restore_veto() {
         assert_eq!(calls.contains("--add-label loom:issue"), restores, "{labels}: {calls}");
     }
 }
+
+/// #11517 (loom-ui#2980): the quarantine release never re-adds `loom:issue`
+/// beside a live `loom:building` claim, nor onto a closed issue.
+#[test]
+fn quarantine_release_never_requeues_a_claimed_or_closed_issue() {
+    for (state, labels) in [
+        ("open", r#""loom:blocked","loom:building""#),
+        ("closed", r#""loom:blocked""#),
+    ] {
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh.log");
+        let signals = format!(r#"{{"state":"{state}","closed_at":null,"labels":[{labels}]}}"#);
+        let fake_gh = install_fake_gh(dir.path(), &gh_log, &signals, 0);
+        let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+        config.gh_bin = Some(fake_gh);
+        config.skip_label_flip = false;
+        let registry = SweepRegistry::new(config);
+
+        assert!(registry.release_quarantine_label(2980));
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap();
+        assert!(calls.contains("issue edit 2980 --remove-label loom:blocked"), "{calls}");
+        assert!(!calls.contains("--add-label loom:issue"), "{state}: {calls}");
+    }
+}
