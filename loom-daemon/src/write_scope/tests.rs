@@ -621,6 +621,10 @@ fn daemon_write_paths_are_scoped() {
             NotAWrite("read-only probe: its only calls are `api --method GET`"),
         ),
         ("tokens_pool/check.rs", NotAWrite("Anthropic API, not the forge")),
+        (
+            "remote_fleet_exec/mod.rs",
+            NotAWrite("scp's `-X` option in a guard's argv vocabulary, runs none"),
+        ),
         ("worker_spawn/egress_proxy/server.rs", NotAWrite("HTTP method check in a proxy")),
         (
             "observability/otlp/relay/server.rs",

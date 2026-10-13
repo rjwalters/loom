@@ -506,6 +506,7 @@ pub(crate) enum ScriptPortCommand {
     /// Guard configuration diagnostics (#10434): `guards status` shows each
     /// guard category's effective value and source, hook wiring, a decision-log
     /// summary, and misconfiguration warnings. Read-only; always exits 0.
+    /// `guards remote-exec` is the remote-fleet-exec hook classifier (#11568).
     #[command(subcommand)]
     Guards(super::guards_status::GuardsCommand),
 
