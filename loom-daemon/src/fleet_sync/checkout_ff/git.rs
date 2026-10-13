@@ -19,7 +19,8 @@ use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::time::Duration;
 
-use crate::cmd_out::{run_command, CmdOutcome};
+use crate::cmd_out::CmdOutcome;
+use crate::fleet_sync::git_spawn_log::{memory_config_for, run_logged};
 
 /// Bound for `git ls-remote` of one ref: a connection and a ref advertisement.
 pub(super) const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -54,7 +55,12 @@ pub(super) fn tracking(branch: &str) -> String {
 
 /// Run `git` in `root` to an exit. `config` is `-c` pairs placed before the
 /// subcommand. `Err` when it could not be run or outlived `timeout`.
-fn run(root: &Path, config: &[&str], args: &[&str], timeout: Duration) -> Result<Output, String> {
+pub(super) fn run(
+    root: &Path,
+    config: &[&str],
+    args: &[&str],
+    timeout: Duration,
+) -> Result<Output, String> {
     run_with_index(root, config, args, timeout, None)
 }
 
@@ -66,8 +72,26 @@ fn run_with_index(
     timeout: Duration,
     index: Option<&Path>,
 ) -> Result<Output, String> {
+    let mut cmd = command(root, config, args);
+    if let Some(index) = index {
+        cmd.env("GIT_INDEX_FILE", index);
+    }
+    crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
+    let result = run_logged("checkout_ff", root, cmd, timeout);
+    match crate::cmd_out::outcome_of(result, timeout) {
+        CmdOutcome::Ran(out) => Ok(out),
+        CmdOutcome::Unavailable(why) => Err(format!("git {}: {why}", args.join(" "))),
+    }
+}
+
+/// The `git` command [`run`] spawns, before credentials. `fetch` always
+/// carries the memory bound (#11059).
+fn command(root: &Path, config: &[&str], args: &[&str]) -> Command {
     let mut cmd = Command::new("git");
-    for pair in config {
+    for pair in memory_config_for(args.first().copied().unwrap_or_default())
+        .iter()
+        .chain(config)
+    {
         cmd.arg("-c").arg(pair);
     }
     cmd.arg("-C")
@@ -75,6 +99,8 @@ fn run_with_index(
         .args(args)
         .stdin(Stdio::null())
         .env("GIT_TERMINAL_PROMPT", "0")
+        // Loom's own ref moves are not external changes (#11566).
+        .env("GIT_REFLOG_ACTION", super::external_change::tag("ff"))
         // Refusals are read from stderr below, so the wording must be git's own.
         .env("LC_ALL", "C");
     // An inherited repository override would aim every command at some other
@@ -82,26 +108,19 @@ fn run_with_index(
     for var in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"] {
         cmd.env_remove(var);
     }
-    if let Some(index) = index {
-        cmd.env("GIT_INDEX_FILE", index);
-    }
-    crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-    match run_command(cmd, timeout) {
-        CmdOutcome::Ran(out) => Ok(out),
-        CmdOutcome::Unavailable(why) => Err(format!("git {}: {why}", args.join(" "))),
-    }
+    cmd
 }
 
-fn stderr(out: &Output) -> String {
+pub(super) fn stderr(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).trim().to_string()
 }
 
-fn stdout(out: &Output) -> String {
+pub(super) fn stdout(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
 /// [`run`], requiring exit 0. Returns trimmed stdout.
-fn ok(root: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
+pub(super) fn ok(root: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
     let out = run(root, &[], args, timeout)?;
     if out.status.success() {
         Ok(stdout(&out))
@@ -378,4 +397,23 @@ pub(super) fn summarize(paths: &[String]) -> String {
         shown.push_str(&format!(", and {} more", paths.len() - NAMED_PATHS));
     }
     shown
+}
+
+#[cfg(test)]
+mod memory_bound_tests {
+    use super::*;
+    use crate::fleet_sync::git_spawn_log::{argv_of, MEMORY_BOUND_CONFIG};
+
+    #[test]
+    fn fetch_carries_the_memory_bound_and_reads_do_not() {
+        let fetch = argv_of(&command(Path::new("/r"), &[], &["fetch", "origin"]));
+        for pair in MEMORY_BOUND_CONFIG {
+            let at = fetch.iter().position(|a| a == pair).expect(pair);
+            assert_eq!(fetch[at - 1], "-c");
+            assert!(at < fetch.iter().position(|a| a == "fetch").unwrap());
+        }
+        let read = argv_of(&command(Path::new("/r"), &["x=y"], &["rev-parse", "HEAD"]));
+        assert!(read.contains(&"x=y".to_string()));
+        assert!(!read.iter().any(|a| a.starts_with("pack.")));
+    }
 }

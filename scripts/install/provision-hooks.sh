@@ -4,7 +4,7 @@
 #
 # Sibling of provision-skills.sh / provision-dispatcher.sh. Where those establish
 # the machine-level `loom` dispatcher and the user-scope `/loom:*` skills, this
-# wires the Loom PreToolUse / UserPromptSubmit / Stop guard HOOKS (plus the
+# wires the Loom PreToolUse / UserPromptSubmit / Stop / SubagentStop guard HOOKS (plus the
 # SessionStart gh front, #10516) into the
 # operator's user-scope `~/.claude/settings.json`, pointing at hook scripts that
 # execute from the SINGLE machine-level checkout instead of a per-repo
@@ -188,8 +188,16 @@ PROJECT_HOOKS_WIRED=0
 # daemon-dispatched agent's tool calls at a roll's safe point, and PostToolUse /
 # PostToolUseFailure close its in-flight ledger. It exits at once unless
 # LOOM_DAEMON_ITEM_ID is set, so attended sessions pay one `bash` start per call.
-_PHOOK_TYPES=(PreToolUse PreToolUse PreToolUse PreToolUse UserPromptSubmit UserPromptSubmit Stop SessionStart PreToolUse PostToolUse PostToolUseFailure)
-_PHOOK_MATCHERS=(Bash Bash "Edit|Write" "mcp__loom__.*" "" "" "" "" "*" "*" "*")
+#
+# `guard-uncommitted-work.sh` (#8372) is wired twice, Stop AND SubagentStop,
+# match-all: a Builder that runs as a Task subagent ends on SubagentStop, and
+# that is the session that owns a worktree. It is an opt-in CANARY — the daemon
+# behind the stub is silent unless the workspace sets
+# `guards.uncommittedWorkConsumerCanary: true` — so wiring it everywhere enables
+# nothing by itself. Each (type, name) pair dedups independently on the
+# `defaults/hooks/<name>` marker, so the two entries never collapse or duplicate.
+_PHOOK_TYPES=(PreToolUse PreToolUse PreToolUse PreToolUse UserPromptSubmit UserPromptSubmit Stop SessionStart PreToolUse PostToolUse PostToolUseFailure Stop SubagentStop)
+_PHOOK_MATCHERS=(Bash Bash "Edit|Write" "mcp__loom__.*" "" "" "" "" "*" "*" "*" "" "")
 _PHOOK_NAMES=(
     guard-destructive.sh
     guard-loom-workflow.sh
@@ -202,6 +210,8 @@ _PHOOK_NAMES=(
     roll-pause.sh
     roll-pause.sh
     roll-pause.sh
+    guard-uncommitted-work.sh
+    guard-uncommitted-work.sh
 )
 
 # Emit the fail-open, workspace-gated, transition-deferring command wrapper for a
@@ -307,6 +317,22 @@ provision_loom_hooks() {
             soft_fail=1
         fi
     done
+
+    # Operator presence heartbeat (#11563) is OPT-IN per operator: wired only
+    # when LOOM_OPERATOR_PRESENCE=1 at provision time. The beat is throttled
+    # inside `loom-daemon presence beat`; the hook stores no prompt content.
+    if [[ "${LOOM_OPERATOR_PRESENCE:-}" == "1" ]]; then
+        local pevent
+        for pevent in UserPromptSubmit PostToolUse Stop; do
+            if _phook_merge_one "$settings" "$pevent" "" "defaults/hooks/presence-beat.sh" \
+                "$(_phook_cmd presence-beat.sh)" "" "$_PHOOK_WRAPPER_MARKER"; then
+                _phook_ok "wired $pevent/<all> -> presence-beat.sh (opt-in)"
+            else
+                _phook_warn "failed to wire presence-beat.sh ($pevent) into $settings"
+                soft_fail=1
+            fi
+        done
+    fi
 
     return "$soft_fail"
 }

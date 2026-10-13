@@ -87,11 +87,84 @@ impl WorkSource for GhWorkSource {
     fn list_ready_issues(&mut self) -> Result<Vec<WorkItem>> {
         // Curator intake reconcile (#10041): cadence-gated, fail-soft, REST-only;
         // gives every unlabeled issue `loom:triage` so Curator has one queue.
+        // A label-transition write, so it runs on every tick, outside the gate.
         if let Some(root) = self.cwd.as_deref() {
             crate::intake_reconcile::maybe_run(&self.gh_bin, root);
             // The `loom:blocked` release pass (#10556) has its own task since
             // #10763: `crate::stale_blocked::release_task`.
         }
+        // Event-gated polling (#9255, opt-in `forgeEvents.pollGating`, default
+        // off): while the feed is `healthy`, a repo with no event since its
+        // last poll returns its held *candidate* listing. Off, this is a bare
+        // call. The claim itself (`dispatch`) re-reads the forge and is never
+        // gated.
+        let repo = self.repo.clone();
+        let cwd = self.cwd.clone();
+        let listed =
+            crate::forge_events::poll_gate::gated_list(cwd.as_deref(), repo.as_deref(), || {
+                self.list_ready_issues_uncached()
+            });
+        // #11139: a fresh listing that fell short is never held, so a gated
+        // tick cannot serve partial rows as the whole queue. (A held listing
+        // leaves `complete` at its per-tick default, `true`.)
+        if !self.complete {
+            crate::forge_events::poll_gate::forget_held(cwd.as_deref());
+        }
+        listed
+    }
+
+    fn listing_complete(&self) -> bool {
+        self.complete
+    }
+
+    /// The open `loom:very-important` issues, any state (#11509): one more
+    /// ETag-cached listing, read only on a tick whose ready listing holds a
+    /// very-important issue (a 304 costs no rate limit). A failure is logged
+    /// and returns `None` (an incomplete walk returns the rows read, which
+    /// the cap unions with the ready listing); it never marks the ready queue incomplete, because
+    /// the ready rows themselves were read whole.
+    fn list_open_very_important(&mut self) -> Option<Vec<WorkItem>> {
+        let (gh, cwd, repo) = (&self.gh_bin, self.cwd.as_deref(), self.repo.as_deref());
+        let label = crate::priority_pick::VERY_IMPORTANT_LABEL;
+        match crate::forge_listing::list_issues_cached_paged_as(
+            "work_finder",
+            gh,
+            cwd,
+            repo,
+            label,
+            "open",
+        ) {
+            Ok(listing) => {
+                if let Some(e) = &listing.incomplete {
+                    log::warn!(
+                        "work_finder: the {label} listing is incomplete ({e:#}); the flood cap \
+                         counts the {} rows read plus the ready listing",
+                        listing.rows.len()
+                    );
+                }
+                Some(
+                    listing
+                        .rows
+                        .into_iter()
+                        .filter(|r| !r.is_pull_request)
+                        .map(|r| WorkItem::with_created_at(r.number, r.labels, r.created_at))
+                        .collect(),
+                )
+            }
+            Err(e) => {
+                log::warn!(
+                    "work_finder: listing {label} issues failed ({e}); the flood cap counts the \
+                     ready listing only this tick"
+                );
+                crate::rate_limit_breaker::global_observe_failure(&e.to_string(), "work_finder");
+                None
+            }
+        }
+    }
+}
+
+impl GhWorkSource {
+    fn list_ready_issues_uncached(&mut self) -> Result<Vec<WorkItem>> {
         // ETag-cached REST listing (#4428), replacing the per-tick GraphQL
         // `gh issue list`. Every page of it (#11139): a repo with more than
         // 100 ready issues no longer starves its oldest ones. Page 1 failing
@@ -123,10 +196,6 @@ impl WorkSource for GhWorkSource {
             });
         }
         Ok(items)
-    }
-
-    fn listing_complete(&self) -> bool {
-        self.complete
     }
 }
 
@@ -198,6 +267,7 @@ impl GhWorkSource {
                 WorkItem::with_created_at(r.number, r.labels, r.created_at)
                     .with_body(r.body)
                     .with_updated_at(r.updated_at)
+                    .with_open_sub_issues(r.open_sub_issues)
                     .with_author(r.author.as_deref().map(|login| {
                         crate::comment_trust::Author::new(
                             Some(login),
@@ -286,17 +356,24 @@ impl WorkDispatcher for RegistryDispatcher {
         }
     }
 
-    /// [`WorkDispatcher::dispatch_backoff_expiry`] (Issue #9311): this host's
-    /// own local window only, mirroring [`Self::pr_open_backed_off`]'s scope
-    /// rather than [`Self::backed_off`]'s fleet union — a peer-armed window's
-    /// expiry is not available here.
+    /// [`WorkDispatcher::dispatch_backoff_expiry`] (Issue #9311): every
+    /// window [`Self::backed_off`] skips on: the later of this host's own end
+    /// and a peer-armed window's broadcast end (#11564).
     fn dispatch_backoff_expiry(&self) -> HashMap<u32, chrono::DateTime<chrono::Utc>> {
         match self.registry.lock() {
             Ok(reg) => {
                 let now = chrono::Utc::now();
                 reg.dispatch_backoff_issues(now)
                     .into_iter()
-                    .filter_map(|issue| reg.dispatch_backoff_until(issue, now).map(|u| (issue, u)))
+                    .filter_map(|issue| {
+                        // The skip lasts until the later of the two windows.
+                        let local = reg.dispatch_backoff_until(issue, now);
+                        let until = local
+                            .into_iter()
+                            .chain(reg.peer_dispatch_backoff_until(issue, now))
+                            .max();
+                        until.map(|u| (issue, u))
+                    })
                     .collect()
             }
             Err(poisoned) => {
@@ -333,16 +410,24 @@ impl WorkDispatcher for RegistryDispatcher {
         }
     }
 
-    /// [`WorkDispatcher::noop_cooldown_expiry`] (Issue #9311): this host's own
-    /// local window only — a peer-armed window's expiry is not available
-    /// here, mirroring [`Self::dispatch_backoff_expiry`]'s scope.
+    /// [`WorkDispatcher::noop_cooldown_expiry`] (Issue #9311): like
+    /// [`Self::dispatch_backoff_expiry`], the later of the local and the
+    /// peer-armed window's end (#11564).
     fn noop_cooldown_expiry(&self) -> HashMap<u32, chrono::DateTime<chrono::Utc>> {
         match self.registry.lock() {
             Ok(reg) => {
                 let now = chrono::Utc::now();
                 reg.noop_cooldown_issues(now)
                     .into_iter()
-                    .filter_map(|issue| reg.noop_cooldown_until(issue, now).map(|u| (issue, u)))
+                    .filter_map(|issue| {
+                        // The skip lasts until the later of the two windows.
+                        let local = reg.noop_cooldown_until(issue, now);
+                        let until = local
+                            .into_iter()
+                            .chain(reg.peer_noop_cooldown_until(issue, now))
+                            .max();
+                        until.map(|u| (issue, u))
+                    })
                     .collect()
             }
             Err(poisoned) => {

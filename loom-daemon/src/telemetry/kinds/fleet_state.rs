@@ -57,6 +57,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::telemetry::{RepoVisibility, SweepStartFacts};
+use crate::types::QueueDisposition;
+use crate::work_finder::halt_cause::HaltCause;
 
 /// Schema tag carried in every record.
 pub const FLEET_STATE_SCHEMA: &str = "fleet-state/v1";
@@ -148,7 +150,7 @@ impl FleetStage {
 pub enum FleetSlot {
     /// One of the host's `maxConcurrent` slots.
     Regular,
-    /// The host's single `loom:operator-priority` overflow slot (#9244).
+    /// The host's single overflow slot (#9244; inert since #11508).
     Overflow,
 }
 
@@ -220,8 +222,264 @@ pub enum MainCi {
     Unknown,
 }
 
+/// Why this host's work finder holds a whole repo (Issue #11564): the
+/// `work_finder::halt_cause::HaltCause` tokens, plus `unknown` for a hold no
+/// cause names. A closed enum, so no other value can be exported; built only
+/// through [`Self::from_cause`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetHaltReason {
+    MainRed,
+    GatePending,
+    TokenPool,
+    PreflightAdvisory,
+    Drain,
+    Breaker,
+    WriteScope,
+    CiBilling,
+    InstallIncompatible,
+    DaemonTooOld,
+    MaintainOnly,
+    DiskReservation,
+    /// A hold with no named cause. A reader also decodes any value it does
+    /// not know (from a newer emitter) as this.
+    #[serde(other)]
+    Unknown,
+}
+
+impl FleetHaltReason {
+    /// Every reason, in wire order.
+    pub const ALL: [FleetHaltReason; 13] = [
+        FleetHaltReason::MainRed,
+        FleetHaltReason::GatePending,
+        FleetHaltReason::TokenPool,
+        FleetHaltReason::PreflightAdvisory,
+        FleetHaltReason::Drain,
+        FleetHaltReason::Breaker,
+        FleetHaltReason::WriteScope,
+        FleetHaltReason::CiBilling,
+        FleetHaltReason::InstallIncompatible,
+        FleetHaltReason::DaemonTooOld,
+        FleetHaltReason::MaintainOnly,
+        FleetHaltReason::DiskReservation,
+        FleetHaltReason::Unknown,
+    ];
+
+    /// The reason for a hold with `cause`; `None` is [`Self::Unknown`].
+    /// Exhaustive, so a new `HaltCause` cannot reach the wire unmapped.
+    #[must_use]
+    pub fn from_cause(cause: Option<HaltCause>) -> Self {
+        match cause {
+            Some(HaltCause::MainRed) => Self::MainRed,
+            Some(HaltCause::GatePending) => Self::GatePending,
+            Some(HaltCause::TokenPool) => Self::TokenPool,
+            Some(HaltCause::PreflightAdvisory) => Self::PreflightAdvisory,
+            Some(HaltCause::Drain) => Self::Drain,
+            Some(HaltCause::Breaker) => Self::Breaker,
+            Some(HaltCause::WriteScope) => Self::WriteScope,
+            Some(HaltCause::CiBilling) => Self::CiBilling,
+            Some(HaltCause::InstallIncompatible) => Self::InstallIncompatible,
+            Some(HaltCause::DaemonTooOld) => Self::DaemonTooOld,
+            Some(HaltCause::MaintainOnly) => Self::MaintainOnly,
+            Some(HaltCause::DiskReservation) => Self::DiskReservation,
+            None => Self::Unknown,
+        }
+    }
+
+    /// The wire name: the `HaltCause::as_str` token, or `unknown`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MainRed => "main_red",
+            Self::GatePending => "gate_pending",
+            Self::TokenPool => "token_pool",
+            Self::PreflightAdvisory => "preflight_advisory",
+            Self::Drain => "drain",
+            Self::Breaker => "breaker",
+            Self::WriteScope => "write_scope",
+            Self::CiBilling => "ci_billing",
+            Self::InstallIncompatible => "install_incompatible",
+            Self::DaemonTooOld => "daemon_too_old",
+            Self::MaintainOnly => "maintain_only",
+            Self::DiskReservation => "disk_reservation",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// A repo this host's work finder holds (Issue #11564).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetRepoHalt {
+    /// Why.
+    pub reason: FleetHaltReason,
+    /// The first work-finder tick at which this process saw the repo held
+    /// with this `reason`. A reason change restarts it.
+    pub since: DateTime<Utc>,
+    /// The hold was already in force on this process's first tick, so
+    /// `since` is a lower bound. Absent when exact.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub since_lower_bound: bool,
+}
+
+/// Which clock holds a ready item back (Issue #11564): the time-boxed
+/// dispositions of the work finder's tick, plus the build back-off. A closed
+/// enum, built only through [`Self::from_disposition`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetEligibleReason {
+    /// The issue's own `loom:recheck-interval` marker.
+    RecheckInterval,
+    /// A dispatch-backoff window after a failed dispatch.
+    DispatchBackoff,
+    /// A backoff window armed by the open-PR guard.
+    OpenPrBackoff,
+    /// A no-op release cooldown.
+    NoopCooldown,
+    /// A hard-exclusion decline cooldown.
+    Declined,
+    /// The PR-less retry window.
+    PrlessRetry,
+    /// The repo's build back-off (review + merge debt). It has no clock: it
+    /// releases when the debt drains, so its rows carry no `eligible_at`.
+    BuildBackoff,
+}
+
+impl FleetEligibleReason {
+    /// Every reason, in wire order.
+    pub const ALL: [FleetEligibleReason; 7] = [
+        FleetEligibleReason::RecheckInterval,
+        FleetEligibleReason::DispatchBackoff,
+        FleetEligibleReason::OpenPrBackoff,
+        FleetEligibleReason::NoopCooldown,
+        FleetEligibleReason::Declined,
+        FleetEligibleReason::PrlessRetry,
+        FleetEligibleReason::BuildBackoff,
+    ];
+
+    /// The clock behind `disposition`, or `None` for one no clock holds.
+    /// Exhaustive, so a new disposition must be placed deliberately.
+    #[must_use]
+    pub fn from_disposition(disposition: QueueDisposition) -> Option<Self> {
+        use QueueDisposition as Qd;
+        match disposition {
+            Qd::RecheckInterval => Some(Self::RecheckInterval),
+            Qd::DispatchBackoff => Some(Self::DispatchBackoff),
+            Qd::OpenPrBackoff => Some(Self::OpenPrBackoff),
+            Qd::NoopCooldown => Some(Self::NoopCooldown),
+            Qd::Declined => Some(Self::Declined),
+            Qd::PrlessRetry => Some(Self::PrlessRetry),
+            Qd::DeferredBuildBackoff => Some(Self::BuildBackoff),
+            Qd::Dispatched
+            | Qd::InFlight
+            | Qd::DeferredCapacity
+            | Qd::DeferredRampCap
+            | Qd::DeferredSaturation
+            | Qd::DeferredOutOfSlice
+            | Qd::DeferredRepoCap
+            | Qd::DeferredFileOverlap
+            | Qd::WorkspaceHalted
+            | Qd::WorkspaceCommandsMissing
+            | Qd::HostConstraint
+            | Qd::Parked
+            | Qd::HardExclusion
+            | Qd::Quarantined
+            | Qd::PeerClaim
+            | Qd::OpenPr
+            | Qd::DispatchError
+            | Qd::AlreadyLanded
+            | Qd::AlreadyClosed
+            | Qd::LabelledBlocked
+            | Qd::Unknown => None,
+        }
+    }
+
+    /// The wire name.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RecheckInterval => "recheck_interval",
+            Self::DispatchBackoff => "dispatch_backoff",
+            Self::OpenPrBackoff => "open_pr_backoff",
+            Self::NoopCooldown => "noop_cooldown",
+            Self::Declined => "declined",
+            Self::PrlessRetry => "prless_retry",
+            Self::BuildBackoff => "build_backoff",
+        }
+    }
+
+    /// Whether this hold has an absolute expiry the work finder computes.
+    #[must_use]
+    pub fn has_clock(self) -> bool {
+        self != Self::BuildBackoff
+    }
+}
+
 fn is_zero(n: &u8) -> bool {
     *n == 0
+}
+
+/// Why a PR under review cannot merge yet, as `fleet.state` reports it
+/// (Issue #11644). A single rollup of the row's own label-derived fields
+/// (`stage`, `hold_kind` / `holds`, `conflict`, `ci_fail`) — never a new forge
+/// read. Only ever set on a PR row (`review_wait` / `doctor` / `merge_wait` /
+/// `merge_hold`); absent on a `ready_wait` or sweep (`sweep.curator` /
+/// `sweep.builder`) row.
+///
+/// A closed, label-knowable set with a defined precedence (strongest first):
+/// `operator_hold`, then `sequenced`, `conflict`, `ci_red`,
+/// `changes_requested`, `approval_pending`, and finally `ready`. The emitter
+/// reads labels only, so it cannot tell `ci_pending` (needs
+/// `statusCheckRollup`) or `base_stale` (needs
+/// `mergeStateStatus`) without a per-PR GraphQL read; those are deliberately
+/// not represented here. For the same reason Champion's merge-risk hold
+/// (`loom:operator` + a comment marker the emitter does not read) collapses
+/// into `operator_hold` rather than a distinct reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeBlockedReason {
+    /// Approved (`loom:pr`) with no hold or flag: nothing blocks the merge.
+    Ready,
+    /// Under review (`review_wait`), not yet judged.
+    ApprovalPending,
+    /// Judge requested changes (`doctor` / `loom:changes-requested`).
+    ChangesRequested,
+    /// `loom:ci-failure` on the PR.
+    CiRed,
+    /// `loom:merge-conflict` on the PR.
+    Conflict,
+    /// `loom:sequenced`: approved, but ordered behind another PR.
+    Sequenced,
+    /// Any operator/`loom:blocked` hold (incl. Champion's marker-refined
+    /// `merge_risk` / `critical_file` / `ac_hold`, indistinguishable from
+    /// labels alone) on the PR.
+    OperatorHold,
+}
+
+impl MergeBlockedReason {
+    /// Every reason, strongest precedence last.
+    pub const ALL: [MergeBlockedReason; 7] = [
+        MergeBlockedReason::Ready,
+        MergeBlockedReason::ApprovalPending,
+        MergeBlockedReason::ChangesRequested,
+        MergeBlockedReason::CiRed,
+        MergeBlockedReason::Conflict,
+        MergeBlockedReason::Sequenced,
+        MergeBlockedReason::OperatorHold,
+    ];
+
+    /// The wire name.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MergeBlockedReason::Ready => "ready",
+            MergeBlockedReason::ApprovalPending => "approval_pending",
+            MergeBlockedReason::ChangesRequested => "changes_requested",
+            MergeBlockedReason::CiRed => "ci_red",
+            MergeBlockedReason::Conflict => "conflict",
+            MergeBlockedReason::Sequenced => "sequenced",
+            MergeBlockedReason::OperatorHold => "operator_hold",
+        }
+    }
 }
 
 /// One `(repo, issue)` as this host sees it.
@@ -265,16 +523,11 @@ pub struct FleetStateRow {
     /// the work finder's dispatch order on its last tick.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rank: Option<u32>,
-    /// Starred (`loom:operator-priority`, any level). On every row since
-    /// #11391: a PR row reads it from the PR's labels, any row keeps what an
-    /// earlier row of the item carried.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub star: bool,
-    /// `ready_wait` only: when it was starred, when known.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub star_at: Option<DateTime<Utc>>,
-    /// The effective operator priority level (0 absent). On every row, like
-    /// `star` (#11391).
+    /// The priority level (0 absent, 1 `loom:important`, 2
+    /// `loom:very-important`; #11103). On every row (#11391): a `ready_wait`
+    /// row reads the planner's `level` key, a PR row the PR's own labels,
+    /// and any row keeps the level an earlier row of the item carried. The
+    /// retired `star` / `star_at` fields are no longer sent (#11510).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub level: u8,
     /// `ready_wait` only: the repo's fleet priority (the workspace priority
@@ -321,6 +574,22 @@ pub struct FleetStateRow {
     /// `blocked`, `sequenced`, `other`. Absent = none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub holds: Vec<String>,
+    /// Why this PR row cannot merge yet (#11644), a rollup of the row's own
+    /// label-derived fields. Set only on a PR row (`review_wait` / `doctor` /
+    /// `merge_wait` / `merge_hold`); absent on `ready_wait` / sweep rows and
+    /// on an older emitter. No extra forge read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_blocked_reason: Option<MergeBlockedReason>,
+    /// `ready_wait` only (#11564): the instant the time-boxed hold named by
+    /// `eligible_reason` ends, as the work finder computed it on its last
+    /// tick. Absent when no clock holds the item, when the hold has no clock
+    /// (`build_backoff`), or when this host does not know the expiry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eligible_at: Option<DateTime<Utc>>,
+    /// `ready_wait` only (#11564): which clock holds the item back. Present
+    /// on every row the work finder held under one, `eligible_at` or not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eligible_reason: Option<FleetEligibleReason>,
 }
 
 fn is_zero_u32(n: &u32) -> bool {
@@ -342,8 +611,6 @@ impl FleetStateRow {
             start: SweepStartFacts::default(),
             sweep_id: None,
             rank: None,
-            star: false,
-            star_at: None,
             level: 0,
             fleet_priority: None,
             created_at: None,
@@ -356,6 +623,9 @@ impl FleetStateRow {
             conflict: false,
             ci_fail: false,
             holds: Vec::new(),
+            merge_blocked_reason: None,
+            eligible_at: None,
+            eligible_reason: None,
         }
     }
 }
@@ -375,9 +645,99 @@ pub struct FleetPrCensus {
     pub by_stage: BTreeMap<String, u32>,
 }
 
+/// Decode a present field, `null` included, as `Some(..)`; an absent field
+/// stays `None` through `#[serde(default)]` (#11606: uncapped vs unknown).
+fn observed_option<'de, D, T>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(de).map(Some)
+}
+
+/// Observed Champion dispatch metadata, independent of approval authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChampionState {
+    /// Policy cannot be inferred from scheduling: absent means unknown.
+    pub approval: Option<String>,
+    /// Conditional merge authority is prompt-defined; absent means unknown.
+    pub merge: Option<String>,
+    /// Command actually selected by the role runner.
+    pub prompt_source: String,
+    /// SHA-256 of the installed Champion command and its two policy companions.
+    pub prompt_hash: Option<String>,
+    /// Whether the interval runner currently selects Champion.
+    pub interval_enabled: bool,
+    pub cadence_secs: u64,
+    pub cadence_source: String,
+    /// Most recent recorded attempt, including failures and pre-spawn skips.
+    pub last_attempt_at: Option<DateTime<Utc>>,
+    /// Runner outcome for that attempt; never a claim that issues were evaluated.
+    pub last_attempt_ok: Option<bool>,
+}
+
+/// Observed Curator role-runner cadence and last run (#11642), the triage
+/// analogue of [`ChampionState`]. A reader uses it to predict `triage_wait`
+/// drain: how fast the Curator empties the `loom:triage` queue, and when it
+/// last ran. Scheduling never implies the Curator did any work — `last_run_ok`
+/// is the runner's outcome for its last attempt, not a count of curations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CuratorState {
+    /// The interval runner currently selects Curator (its effective
+    /// enabled/roles resolvers), even when it is idle this instant.
+    pub interval_enabled: bool,
+    /// The Curator's resolved role-runner interval, in seconds.
+    pub cadence_secs: u64,
+    /// Where that interval came from: `env`, `effective_config` or `built_in`.
+    pub cadence_source: String,
+    /// The most recent recorded Curator attempt for this exact root
+    /// (failures and pre-spawn skips included), process-local. Absent when
+    /// unobserved or after a restart. Never a count of completed curations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_run_at: Option<DateTime<Utc>>,
+    /// The runner outcome for that attempt; never a claim that issues were
+    /// curated. Present exactly when `last_run_at` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_run_ok: Option<bool>,
+}
+
+/// One repo's `ready_wait` queue flow over a trailing window (#11645): how
+/// many issues entered and left the repo's dispatch queue within the window,
+/// so a reader can compute an arrival/drain **rate** (count / effective
+/// window) and predict backlog via Little's Law
+/// (wait ≈ `queue_depth` / drain_rate).
+///
+/// The counts are discrete, not a continuous rate: an idle repo's facts do
+/// not change between passes, so its `fleet.state` row stays unchanged — a
+/// float rate would make every pass a delta (cf. [`FleetCapacity`]). The
+/// window start is sent as an instant, not an elapsed span, for the same
+/// reason (as [`FleetStateRow::created_at`] is). A reader divides each count
+/// by the **effective** window `min(as_of - since, window_secs)`, so a daemon
+/// younger than the window is not read as a low rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetQueueFlow {
+    /// Issues that **entered** the repo's `ready_wait` queue within the
+    /// window — the `arrival_rate` numerator.
+    pub arrivals: u32,
+    /// Issues that **left** the repo's `ready_wait` queue within the window
+    /// (dispatched, closed, relabelled — gone from the queue the work finder
+    /// reads) — the `drain_rate` numerator.
+    pub drains: u32,
+    /// The nominal trailing window in seconds (the rate denominator, e.g.
+    /// 21600 for 6 h).
+    pub window_secs: u64,
+    /// When this host began observing the repo's queue. The effective window
+    /// is `min(as_of - since, window_secs)`; the counts before `since` are
+    /// unknown, never zero, so a reader divides by the effective window.
+    pub since: DateTime<Utc>,
+}
+
 /// One repo's part of a record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FleetStateRepo {
+    /// Unknown on older emitters. Scheduling never implies human approval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub champion: Option<ChampionState>,
     /// Forge `owner/repo`, lowercased.
     pub repo: String,
     #[serde(default)]
@@ -386,6 +746,76 @@ pub struct FleetStateRepo {
     /// the host did not read it (an older emitter). Additive on `fleet-state/v1`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub main_ci: Option<MainCi>,
+    /// This host's work finder holds the whole repo (#11564): present exactly
+    /// when it does, as of its last tick. Every record that names the repo
+    /// carries it, and a halt starting, changing reason or clearing names the
+    /// repo in a delta, so absence on a named repo means "not held". Absent
+    /// on every repo before the work finder's first tick. Additive on
+    /// `fleet-state/v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub halt: Option<FleetRepoHalt>,
+    /// Sweeps this host's work finder counts against the repo's dispatch cap
+    /// when its last tick finished (#11606): host-local, the dispatcher's
+    /// own occupancy count plus that tick's admissions. Absent means unknown
+    /// (no tick, or an older emitter), never zero. Additive on `fleet-state/v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_flight: Option<u32>,
+    /// The repo's resolved `maxConcurrentPerRepo` on that tick (#11606).
+    /// Three states: absent = unknown, `null` = uncapped (observed), a number
+    /// = the cap. Present exactly when `in_flight` is. Additive.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "observed_option"
+    )]
+    pub cap: Option<Option<u32>>,
+    /// Ready candidates of the repo that tick deferred for the cap (#11606).
+    /// `0` is a measured result; absent means unknown. Present exactly when
+    /// `in_flight` is. Additive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred_repo_cap: Option<u32>,
+    /// `ready_wait` only (#11645): issues of this repo waiting in the dispatch
+    /// queue right now — the depth of the queue the work finder read this
+    /// tick, the same source `ready_wait` rows come from. The single strongest
+    /// ETA signal for the `ready_wait` long tail (repo congestion has Spearman
+    /// +0.22 to dwell). Set only when the repo's ready listing was read whole
+    /// this tick (`ready_complete`); absent = unknown (partial/failed listing,
+    /// no tick, or an older emitter), never zero. Additive on `fleet-state/v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_depth: Option<u32>,
+    /// `ready_wait` only (#11645): this repo's queue flow (entries/exits) over
+    /// a trailing window, the `arrival_rate`/`drain_rate` facts for Little's
+    /// Law. Present once this host has observed the repo's ready queue;
+    /// absent = unknown, never zero. Additive on `fleet-state/v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_flow: Option<FleetQueueFlow>,
+    /// Pre-ready (`loom:triage`) only (#11642): issues of this repo waiting in
+    /// the triage queue the Curator drains — the depth of this host's last
+    /// complete `loom:triage` listing, the same listing the `triage_wait`
+    /// outcome facts come from. The dispatch-queue analogue of `queue_depth`
+    /// for the pre-ready stage. Read on the collector's forge pass, so it is
+    /// stable between those passes (a tick pass carries the last read value,
+    /// never a stale guess from a partial listing). Absent = unknown (no
+    /// complete triage listing read yet, or an older emitter), never zero.
+    /// Additive on `fleet-state/v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub triage_depth: Option<u32>,
+    /// Pre-ready only (#11642): this repo's `loom:triage` arrival/drain flow
+    /// over a trailing window, the `triage_wait` analogue of `queue_flow`.
+    /// `arrivals` is the triage arrival_rate numerator; `drains` (issues that
+    /// left `loom:triage` — curated, closed or relabelled) is the **Curator
+    /// drain rate** numerator a reader divides by the effective window for
+    /// `curator_rate`. Reuses [`FleetQueueFlow`]. Present once this host has
+    /// observed the repo's triage queue; absent = unknown, never zero.
+    /// Additive on `fleet-state/v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub triage_flow: Option<FleetQueueFlow>,
+    /// The Curator role-runner's cadence and last run for this repo (#11642):
+    /// `curator_last_run_at` and the curator cadence the `triage_wait` model
+    /// needs, the triage analogue of `champion`. Absent = unknown (an older
+    /// emitter). Additive on `fleet-state/v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub curator: Option<CuratorState>,
     /// The census. Absent means unknown at `as_of`, because the repo's
     /// listings were incomplete or not read. It never means zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -540,8 +970,8 @@ fn json_len<T: Serialize>(value: &T) -> usize {
 /// Every chunk shares the header (`as_of`, `anchor`, stamps, `slots`, ...);
 /// the repos' rows and `removed` entries are packed in order, so the union of
 /// the chunks is exactly `record`: nothing is dropped. A repo whose entries
-/// span chunks repeats its `repo`, `visibility`, `census`, `ready_complete`
-/// and `ready_replace` in each. Pure.
+/// span chunks repeats its `repo`, `visibility`, `main_ci`, `halt`, `census`,
+/// `ready_complete` and `ready_replace` in each. Pure.
 #[must_use]
 pub fn split_into_chunks(mut record: FleetStateRecord, max_bytes: usize) -> Vec<FleetStateRecord> {
     record.chunk_index = 0;
@@ -621,3 +1051,8 @@ pub fn split_into_chunks(mut record: FleetStateRecord, max_bytes: usize) -> Vec<
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[path = "fleet_state_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[path = "fleet_state_facts_tests.rs"]
+mod facts_tests;

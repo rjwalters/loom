@@ -291,7 +291,7 @@ If no argument is provided, use the normal "Finding Work" workflow below.
 ```bash
 loom-daemon park-record apply --issue <number> --blocked-by <N> --by builder --remove-label loom:building
 ```
-Never a bare label edit: `check-stale-blocked` (#8927), star-liveness, Guide's unblock sweep and `merge-pr.sh` read the body, not comments. It refuses a closed blocker (#9102). No open numbered blocker? Pass `--reason "<why>"` instead; never invent one. See `.loom/docs/park-record.md`.
+Never a bare label edit: `check-stale-blocked` (#8927), Guide's unblock sweep and `merge-pr.sh` read the body, not comments. It refuses a closed blocker (#9102). No open numbered blocker? Pass `--reason "<why>"` instead; never invent one. See `.loom/docs/park-record.md`.
 
 ### Labels You NEVER Touch
 
@@ -379,7 +379,7 @@ workflow) that require maintainer approval before being worked on.
 - **Check dependencies**: all task-list items checked before claiming
 - **Guard, then claim**: `loom-daemon forge check-claim <number>` must not exit 0 (exit 0 = blocked — open PR, claim label, fresh lease, or remote branch; take another issue), then `gh issue edit <number> --remove-label "loom:issue" --add-label "loom:building"`, then lease it: `loom-daemon lease ensure <number> --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"`. `worktree.sh` (below) runs this itself; a lane NOT using it MUST call `lease ensure` directly — a leaseless claim is invisible to other lanes and reclaimable (#9453)
 - **Do the work**: Implement, test, commit, create PR
-- **Mark PR for review**: `./.loom/scripts/create-pr.sh --label "loom:review-requested"` (copies the star, #10518) — never a bare `gh pr create` (#6074); body template: builder-pr.md § "Creating the PR"
+- **Mark PR for review**: `./.loom/scripts/create-pr.sh --label "loom:review-requested"` (copies the priority label, #10518) — never a bare `gh pr create` (#6074); body template: builder-pr.md § "Creating the PR"
 - **Complete**: Issue auto-closes when PR merges, or mark `loom:blocked` if stuck
 
 ## Exception: Explicit User Instructions
@@ -1038,7 +1038,7 @@ Workers use a three-level priority system to determine which issues to work on:
 
 ### Priority Order
 
-1. **Starred** (`loom:operator-priority`) - The operator wants it landed ASAP (#9244); level 2 (`loom:operator-high-priority` / `loom:high-priority-inherited`) first (#10307)
+1. **Priority** (`loom:very-important`, then `loom:important`, #11103) - order only; the issue still needs `loom:issue`
 2. **Curated** (`loom:issue` + `loom:curated`) - Approved and enhanced issues (highest quality)
 3. **Approved Only** (`loom:issue` without `loom:curated`) - Approved but not yet curated (fallback)
 
@@ -1049,19 +1049,18 @@ Every tier filters on the resolved skip set (hard exclusions plus this repo's
 cannot lift a skip-labeled issue into a higher tier (#8911). Never swap in a
 bare `--label` query. Each `--jq` is DOUBLE-quoted so `$EXCL` expands.
 
-**Step 1: Check for starred issues first**
+**Step 1: Check for priority issues first**
 
 ```bash
 EXCL="$(./.loom/scripts/skip-labels.sh --jq-not)"
-# level list: keep in sync with operator_levels.rs LEVELS until #10311
-for L in loom:operator-high-priority loom:high-priority-inherited loom:operator-priority; do
+for L in loom:very-important loom:important; do
 gh issue list --label="loom:issue" --label="$L" --state=open --limit=500 \
   --json number,title,labels --jq ".[] | select($EXCL) | \"#\(.number): \(.title)\""; done
 ```
 
 If any exist, **claim one immediately**.
 
-**Step 2: If none starred, check curated issues**
+**Step 2: If no priority issue, check curated issues**
 
 ```bash
 EXCL="$(./.loom/scripts/skip-labels.sh --jq-not)"
@@ -1093,7 +1092,7 @@ loom-daemon forge check-claim <number>   # exit 0 PRINTS the blocker token
 ### Priority Guidelines
 
 - **You should NOT add priority labels yourself** (conflict of interest)
-- If you encounter a critical issue during implementation, create an issue and let the Architect triage priority
+- If you encounter a critical issue during implementation, create an issue and let Guide set its priority
 - If an urgent issue appears while working on normal priority, finish your current task first before switching
 - Respect the priority system - urgent issues need immediate attention
 - Always prefer curated issues when available for better context and guidance
@@ -1172,7 +1171,7 @@ round — none of which any offline fixture could have caught.
 
 ### MANDATORY: Derive Titles From Your Diff, Not the Issue
 
-**Before committing or creating a PR**, you MUST review your actual code changes and derive titles from them:
+**Before committing or creating a PR**, review your actual changes and derive titles from them:
 
 ```bash
 # Step 1: Review what you actually changed
@@ -1180,21 +1179,22 @@ git diff --stat
 git diff   # Read the actual changes
 
 # Step 2: Write a commit message that describes the CODE CHANGE
-#   Ask: "What does this diff do?" — NOT "What issue is this for?"
+#   Ask: "What does this diff do?", not "What issue is this for?"
 #
 #   WRONG: "feat: implement changes for issue #2678"
 #   WRONG: "Builder generates generic commit/PR titles despite explicit anti-patterns"
-#   WRONG: "feat: bug: MCP status bar noise..." (double prefix — copied issue title prefix)
+#   WRONG: "feat: bug: MCP status bar noise..." (double prefix copied from the issue)
 #   RIGHT: "docs: add mandatory diff-review step before commit/PR creation"
 #
-#   NOTE: If the issue title starts with a prefix like "bug:", "feat:", etc.,
-#   do NOT copy it verbatim. Strip the issue prefix and derive your own from the diff.
-#   "bug:" → use "fix:" in the PR title. See builder-pr.md for the full mapping.
+#   NOTE: never copy an issue-title prefix ("bug:", "feat:") verbatim; derive
+#   your own from the diff ("bug:" → "fix:"; full mapping in builder-pr.md).
+#   Never write a skip-CI marker ("[skip ci]" etc.) literally: no CI runs and
+#   create-pr.sh refuses it (#11389). Put a space inside, or describe it.
 
-# Step 3: Use the same approach for the PR title
+# Step 3: Same approach for the PR title
 ```
 
-**The PR title and commit message MUST describe what the code change does, not reference the issue.** See builder-pr.md for the full rules, anti-patterns, and examples.
+**The PR title and commit message MUST describe what the code change does, not reference the issue.** Full rules and examples: builder-pr.md.
 
 ### Commit Conventions: DCO / sign-off
 
@@ -1254,7 +1254,7 @@ merged by Champion using `./.loom/scripts/merge-pr.sh` — never use `gh pr merg
 
 ## Working Style
 
-- **Start**: Find work using the three-tier priority order (see "Finding Work: Priority System") — starred → curated → approved-only; oldest-first is only the tiebreak **within** a tier, not a top-level rule
+- **Start**: Find work using the three-tier priority order (see "Finding Work: Priority System") — priority → curated → approved-only; oldest-first is only the tiebreak **within** a tier, not a top-level rule
 - **Verify before claiming**: Issue MUST have `loom:issue` label (unless explicit user override)
 - **Claim**: Remove `loom:issue`, add `loom:building` - always both labels together
 - **During work**: If you discover out-of-scope needs, PAUSE and create an issue (see builder-complexity.md)

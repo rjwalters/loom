@@ -411,6 +411,10 @@ fn git_inherit(repo_root: &Path, args: &[&str]) -> bool {
         .arg("-C")
         .arg(repo_root)
         .args(args)
+        .env(
+            "GIT_REFLOG_ACTION",
+            crate::fleet_sync::checkout_ff::external_change::tag("update"),
+        )
         .status()
         .is_ok_and(|s| s.success())
 }

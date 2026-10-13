@@ -2,7 +2,6 @@ use crate::activity::{ActivityDb, AgentInput, AgentOutput, InputContext, InputTy
 use crate::config_resolver;
 use crate::errors::DaemonError;
 use crate::event_bus::EventBus;
-use crate::forge_parser::parse_forge_events;
 use crate::git_parser;
 use crate::git_utils;
 use crate::issue_state_read;
@@ -1657,7 +1656,6 @@ pub fn build_daemon_status_for(
         // Unset globals (loop never spawned) read as `None` / empty — honestly
         // "no tick observed", never "nothing happened".
         last_work_finder_tick: crate::work_finder::last_tick_summary(),
-        operator_priority_landing: crate::star_liveness::last_report(),
         role_tick_records: crate::role_runner::role_tick_records(),
         // #6201: the never-evicted last-tick-per-pair companion to the ring
         // above — see `RoleLastTick`'s doc comment for why both are needed.
@@ -2361,6 +2359,8 @@ fn handle_request(
                     .expect("Terminal manager mutex poisoned");
                 tm.list_terminals().into_iter().find(|t| t.id == id)
             };
+            // Resolved outside both locks; cached per workspace (#11486).
+            let forge_host = crate::forge_host::host_for_terminal(terminal_info.as_ref());
 
             let tm = terminal_manager
                 .lock()
@@ -2399,24 +2399,13 @@ fn handle_request(
                                 log::warn!("Failed to record output to activity database: {e}");
                             }
 
-                            // Parse terminal output for forge events and record them
-                            // TODO: Read forge_host from configuration once #3135 lands
-                            let forge_host = "github.com";
-                            let forge_events = parse_forge_events(&output_str, forge_host);
-                            for parsed_event in forge_events {
-                                let prompt_event =
-                                    parsed_event.to_prompt_forge_event(correlated_input_id);
-                                if let Err(e) = db.record_prompt_forge_event(&prompt_event) {
-                                    log::warn!("Failed to record forge event: {e}");
-                                } else {
-                                    log::debug!(
-                                        "Recorded forge event: {:?} (issue: {:?}, pr: {:?})",
-                                        prompt_event.event_type,
-                                        prompt_event.issue_number,
-                                        prompt_event.pr_number
-                                    );
-                                }
-                            }
+                            // Forge events, matched on this terminal's forge host (#11486).
+                            crate::forge_host::record_forge_events(
+                                &db,
+                                &output_str,
+                                forge_host.as_deref(),
+                                correlated_input_id,
+                            );
 
                             // Parse terminal output for resource usage (token counts, costs)
                             match db.record_resource_usage_from_output(

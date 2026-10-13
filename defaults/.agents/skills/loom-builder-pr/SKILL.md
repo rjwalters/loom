@@ -648,7 +648,7 @@ body. `--signoff` is harmless when not required. See
 
 **When creating a NEW PR:**
 - Pass only `loom:review-requested`: `create-pr.sh` copies the closing issue's
-  priority labels (the star and its levels) itself (#10518); a role never invents one
+  priority labels (`loom:important` / `loom:very-important`) itself (#10518); a role never invents one
 - This is the ONLY time you add labels to a PR
 
 **After PR creation:**
@@ -793,11 +793,10 @@ close #2" closed #2 on merge, and it had to be reopened by hand).
     | grep -inE '\b(close[sd]?|fix(e[sd])?|resolve[sd]?)[[:space:]]+#N\b'
   ```
 
-merge-pr.sh backstops some of this — it warns on a whole-line backticked `Part of` trailer,
-warns naming which source carries a contradicting closing keyword, and reopens the issue if
-GitHub closed it anyway — but every warning reaches only whoever runs the merge, a reopen leaves
-a close/reopen flicker plus notification churn, and **nothing checks the `Loom-Issue:` trailer at
-merge time**. Get it right in the body. Full rationale,
+merge-pr.sh backstops some of this — it warns on a whole-line backticked `Part of` trailer
+or an unparseable `Loom-Issue:` one, warns naming which source carries a contradicting closing
+keyword, and reopens the issue if GitHub closed it anyway — but every warning reaches only
+whoever runs the merge, and a reopen leaves close/reopen churn. Get it right in the body. Full rationale,
 incidents, and the trailer's parser contract: `.loom/docs/issue-pr-linking.md`.
 
 ### PR Creation Checklist
@@ -964,7 +963,7 @@ still a transient credential window, never a signal to redo the work.
 ```bash
 # CORRECT way to create PR
 # Title MUST use conventional commit format: "fix:", "feat:", "refactor:", etc.
-# create-pr.sh adds the closing issue's priority labels (the star) itself (#10518)
+# create-pr.sh adds the closing issue's priority labels itself (#10518)
 ./.loom/scripts/create-pr.sh --title "fix: descriptive summary of the change" --label "loom:review-requested" --body "$(cat <<'EOF'
 ## Summary
 Brief description of what this PR does and why.

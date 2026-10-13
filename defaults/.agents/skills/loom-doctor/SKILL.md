@@ -427,7 +427,7 @@ Use the shared queue and walk its rows in order:
 QUEUE=$(loom-daemon pr-queue --role doctor) || exit 1
 printf '%s\n' "$QUEUE" | jq -r '.[] | [.number, .origin, .priorityReason] | @tsv'
 ```
-Follow `.loom/docs/pr-planning.md`. Stars precede interactive work; the classes
+Follow `.loom/docs/pr-planning.md`. Priority PRs precede interactive work; the classes
 below describe the baseline tie-break, not separate passes ahead of the queue.
 After each completed/skipped PR, refresh the queue and take the next unvisited
 row; keep a per-pass visited set. Preserve PR origin during repairs.
@@ -778,19 +778,15 @@ claim's* activity marker —
 <!-- loom:claim-activity claim=$CLAIMED_AT -->
 ```
 
-Every other comment is ignored: it neither pins nor extends the claim. This is
-the fix for the PR #6513 livelock (found on the Judge lane, identical in shape
-here). The old rule counted **any** non-stand-down comment posted after the
-claim (`COMMENTS_AFTER > 0`) as proof the claimant was alive, so a single
-routine Builder post-push status note — a different author, saying nothing about
-the fix — pinned that claim "fresh" for the rest of its life, because
-`CLAIMED_AT` never moves. And claimant activity now only **resets the idle
-clock** rather than pinning the claim, so even a genuine heartbeat buys only
-another `LOOM_STALE_TREATING_MINUTES`.
+Every other
+comment is ignored: it neither pins nor extends the claim (the PR #6513 livelock: a routine Builder
+post-push note used to pin a claim "fresh" forever). Claimant activity only **resets the idle
+clock**, so a genuine heartbeat buys another `LOOM_STALE_TREATING_MINUTES`.
 
 **A Doctor's fix cycle routinely runs long and silent** (assess → fix → verify
 locally → push → re-verify remotely), so post a progress comment ending with
-that marker whenever you cross a long step. The script prints the marker for the
+that marker whenever you cross a long step (esp. before a CI wait); the script also counts your own
+force-push of the PR head via the daemon (`forge claim-liveness`, #10235). The script prints the marker for the
 live claim, so you never hand-assemble it:
 
 ```bash
@@ -970,6 +966,10 @@ if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-che
   echo "Aborting: version-bearing files out of sync after update (see BLOCKER:/Fix:)." >&2
   exit 1
 fi
+# Discard guard (#9282): rc 0 = BLOCKED, do NOT push; report its BLOCKER:/Fix:.
+RG=0; loom-daemon forge rebase-guard --base origin/main || RG=$?
+[ "$RG" = 0 ] && exit 1
+[ "$RG" = 1 ] || echo "WARNING: rebase-guard gave no answer (rc=$RG) - pushing UNCHECKED (#9282)" >&2
 loom-daemon lease pr fence "$N" --role doctor --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"
 [[ $? =~ ^[02]$ ]] || exit 1  # lease lost: stand down
 if [ "$BRANCH_UPDATE" = rebase ]; then git push --force-with-lease="$BRANCH:$PUSH_LEASE_SHA"; else git push origin "HEAD:$BRANCH"; fi &&
@@ -985,9 +985,8 @@ Never hand-bump `VERSION` & co. here (#7743; `bef3e07a`, #7341): if the gate fir
 gh pr edit $N --remove-label "loom:treating"
 ```
 
-Do **not** add `loom:review-requested` when standing down — the Doctor who
-actually pushed owns that transition. Leave the PR's state labels alone and
-exit; your only label action is removing your own claim.
+Do **not** add `loom:review-requested` when standing down (the Doctor who pushed owns
+it). Leave state labels alone and exit; only remove your own claim.
 
 **Note on new-PR creation (#6277):** Doctor normally pushes fixes to an
 *existing* PR, so the recheck above is the relevant freshness guard. If a fix
@@ -1339,10 +1338,10 @@ pnpm check:ci   # your repo's check command — see buildGate.command in .loom/c
 
 # Commit and push
 git add .
-# DCO / sign-off: if commit.signoff is true in .loom/config.json (or the repo has a
-# DCO / required sign-off check), add --signoff so the commit carries a
-# Signed-off-by: trailer — same rule the Builder follows. Applies to EVERY commit
-# you author, including --amend. See defaults/docs/commit-signoff.md.
+# DCO: if commit.signoff is true in .loom/config.json (or a DCO check is required),
+# pass --signoff on EVERY commit, --amend too (defaults/docs/commit-signoff.md).
+# Never write a skip-CI marker ("[skip ci]" etc.) literally — no CI would run
+# (#11389); add a space inside or describe it.
 git commit -m "Address review feedback
 
 - Fix null handling in foo.ts:15
@@ -1394,11 +1393,16 @@ git fetch origin main
 if [ "$BRANCH_UPDATE" = rebase ]; then git rebase origin/main; else git merge --no-ff -m "Merge origin/main into $BRANCH (Doctor: resolve conflicts)" origin/main; fi
 # Conflict: resolve each file, `git add` it, then `git commit --no-edit` (merge) or `git rebase --continue`.
 
-# Version-bearing-file sync gate (#7168): if it fires, stop and report; never hand-bump.
+# Version-gate: if it fires, stop and report; never hand-bump.
 if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-check-gate.sh --fix-hint "then push."; then
-  echo "Aborting: version-bearing files are out of sync after update (see BLOCKER:/Fix: above) -- unexpected under #7743; report, do not hand-bump." >&2
+  echo "Aborting: version-bearing files out of sync (see BLOCKER:/Fix:); report, do not hand-bump." >&2
   exit 1
 fi
+
+# Discard guard (#9282): rc 0 = BLOCKED, do NOT push; report its BLOCKER:/Fix:.
+RG=0; loom-daemon forge rebase-guard --base origin/main || RG=$?
+[ "$RG" = 0 ] && exit 1
+[ "$RG" = 1 ] || echo "WARNING: rebase-guard gave no answer (rc=$RG) - pushing UNCHECKED (#9282)" >&2
 
 # Merge: plain push (rejected: Head-SHA Recheck, never force). Rebase: PINNED lease.
 loom-daemon lease pr fence 42 --role doctor --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"
@@ -1437,11 +1441,9 @@ states Doctor exists to clear:
 | `loom:merge-conflict` | PR has merge conflicts requiring resolution | **Remove it once you have rebased and the conflicts are resolved** (the PR is no longer conflicting). Apply it if you triage a conflicted PR you cannot immediately fix. |
 | `loom:ci-failure` | PR has failing CI checks | **Remove it once CI is green again** after your fix. Apply it if you are flagging a PR whose CI is red and leaving it for a follow-up. |
 
-These are informational status flags, not queue gates — the primary Doctor queues
-are still `loom:pr` (conflicts) and `loom:changes-requested` (feedback). Keep them
-accurate: they should reflect the PR's **current** state, so clear them the moment
-the underlying problem is gone, and never leave a stale `loom:merge-conflict` /
-`loom:ci-failure` on a PR you have just made mergeable.
+These are informational flags, not queue gates (the queues are `loom:pr` for conflicts and
+`loom:changes-requested` for feedback). Keep them current: clear each the moment its
+problem is gone; never leave a stale one on a PR you just made mergeable.
 
 ### Signaling Conflict-Only Resolution (Fast-Track Review)
 
@@ -1468,9 +1470,9 @@ When you **only** resolve merge conflicts without making substantive code change
 
 <!-- loom:conflict-only -->
 
-Changes:
-- Resolved conflicts in `src/foo.ts` (accepted upstream changes)
-- Resolved conflicts in `package-lock.json` (regenerated)
+Head before resolution: `<sha>`. Per conflicted file, the side kept and why:
+- `src/foo.ts`: kept main's side, because <reason>
+- `package-lock.json`: regenerated, because <reason>
 
 No substantive code changes made - only conflict resolution.
 EOF

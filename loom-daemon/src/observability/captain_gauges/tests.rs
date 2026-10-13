@@ -524,7 +524,7 @@ fn the_fact_fields_round_trip_and_stay_out_of_a_part_one_heartbeat() {
     }
 
     let mut star = facts(at(1), &["acme/app", "acme/lib"]);
-    star.labels = ["loom:operator-priority".to_string()].into();
+    star.labels = ["loom:important".to_string()].into();
     star.counts.insert("acme/lib".into(), 2);
     let mut blocked = facts(at(1), &["acme/app"]);
     blocked.blocked.insert(

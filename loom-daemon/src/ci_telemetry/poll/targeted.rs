@@ -213,6 +213,13 @@ fn record_one(
     if !run.is_completed() {
         return Ok(Recorded::Skipped("the run is not completed on the forge"));
     }
+    // The feed may name any run, however old; the ledger forgets keys past
+    // its retention boundary (#11159), so a run created before it would look
+    // unseen and be emitted a second time. `created_at` is the forge's, and
+    // stays fixed across re-runs, so a legitimate recent re-run is unaffected.
+    if ledger.run_is_past_retention(&repo.full_name, run.created_at) {
+        return Ok(Recorded::Skipped("the run is older than the ledger's retention window"));
+    }
     let stories = ctx.repo_identity.map(|resolve| {
         let mut graphql_ok = !cycle.graphql_suppressed;
         let stories = RepoStories::prepare(

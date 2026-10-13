@@ -15,8 +15,12 @@ fn important(n: u32) -> WorkItem {
     WorkItem::new(n, vec!["loom:issue".into(), "loom:important".into()])
 }
 
+/// The retired operator star (#11510): the daemon no longer knows it, so it
+/// is a plain label. The one dispatch-path fixture asserting that.
+const RETIRED_STAR: &str = "loom:operator-priority";
+
 fn starred(n: u32) -> WorkItem {
-    WorkItem::new(n, vec!["loom:issue".into(), OPERATOR_PRIORITY_LABEL.to_string()])
+    WorkItem::new(n, vec!["loom:issue".into(), RETIRED_STAR.to_string()])
 }
 
 /// A dispatcher whose occupancy is fixed, so a cap can be "full" without any
@@ -187,15 +191,20 @@ fn a_verified_red_main_fix_outside_this_hosts_slice_is_not_deferred() {
 }
 
 #[test]
-fn the_published_row_keys_are_level_created_at_number() {
+fn the_published_row_keys_are_main_red_fix_level_created_at_number() {
     let mut multi = vec![(FakeSource::once(vec![issue(1), vi(2)]), full(0))];
     let report = tick_multi(&mut multi, &[100], 10, &[false]);
     let rows = ready_queue::finish(&report.queue, &[]);
     assert_eq!(rows[0].issue, 2, "rank 1 is the very-important issue");
-    assert!(!rows[0].operator_priority, "deprecated, always false");
+    assert_eq!(rows[0].level, crate::priority_pick::Level::VeryImportant, "#11510");
     assert!(!rows[0].main_red_fix, "no verified red-main fix here");
     assert_eq!(
         ready_queue::ordering_names(),
-        vec!["level".to_string(), "created_at".into(), "number".into()]
+        vec![
+            "main_red_fix".to_string(),
+            "level".into(),
+            "created_at".into(),
+            "number".into()
+        ]
     );
 }

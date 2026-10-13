@@ -33,7 +33,6 @@ fn qrow_held(
     ready_queue::TickQueueRow {
         // One priority per workspace, so rank order is (ws, number).
         key: key(ws, u32::try_from(ws).unwrap() * 10, number),
-        tier: None,
         disposition: Some(d),
         detail: None,
         updated_at: None,
@@ -154,6 +153,7 @@ fn out_of_slice_rows_follow_the_plan_with_shaping_inputs() {
         repo_cap: Some(RepoCapSnapshot {
             cap: Some(2),
             occupancy: vec![0, 1],
+            occupancy_end: Vec::new(),
         }),
         max_admissions_per_tick: Some(1),
         ..TickReport::default()

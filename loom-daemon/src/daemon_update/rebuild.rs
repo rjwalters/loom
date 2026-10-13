@@ -1,6 +1,7 @@
 //! The source-build path: find `cargo`, rebuild, locate what cargo actually
-//! produced (#6160), and refuse to provision a binary stamped with the wrong
-//! commit (#4053).
+//! produced (#6160), refuse to provision a binary that cannot export OTLP
+//! (#10700), and refuse to provision a binary stamped with the wrong commit
+//! (#4053).
 //!
 //! Locating the artifact from cargo's OWN build output rather than probing two
 //! hardcoded `target/release/` paths is the whole point of the `#6160` shape.
@@ -92,10 +93,120 @@ pub enum BuildFailure {
     /// #6160) — a build that reports success must NEVER be silently treated as
     /// a no-op success.
     ArtifactNotFound,
+    /// The built binary failed its `telemetry-capabilities --require-otlp`
+    /// probe (exit 1, #10700): it cannot export OTLP, so installing it would
+    /// silently drop every configured `otlp` sink.
+    MissingOtlp,
 }
 
-/// `cargo build --release --message-format=json-render-diagnostics`, then
-/// locate the executable it reported.
+/// The `cargo build` arguments the source path runs in `daemon_dir`.
+///
+/// `--features otlp` is passed whenever the source's own manifest declares an
+/// `otlp` feature (#10700). On current source that feature is a no-op alias
+/// (the exporter is compiled unconditionally), but a roll to an older tag
+/// between #4879 and #10700 still gates the exporter behind it — and a tag
+/// that predates #4879 has no such feature, where cargo would hard-error on
+/// the unknown name, so the flag is omitted (with a WARN from [`rebuild`]).
+#[must_use]
+pub fn build_args(daemon_dir: &Path) -> Vec<&'static str> {
+    let mut args = vec!["build", "--release"];
+    if manifest_declares_otlp(daemon_dir) {
+        args.extend(["--features", "otlp"]);
+    }
+    args.push("--message-format=json-render-diagnostics");
+    args
+}
+
+fn manifest_declares_otlp(daemon_dir: &Path) -> bool {
+    std::fs::read_to_string(daemon_dir.join("Cargo.toml"))
+        .is_ok_and(|text| declares_otlp_feature(&text))
+}
+
+/// Does this `Cargo.toml` text declare an `otlp` key in its `[features]`
+/// table? A line scan, not a TOML parse: the only shapes this crate has ever
+/// written are `otlp = [...]` lines directly under `[features]`.
+fn declares_otlp_feature(manifest: &str) -> bool {
+    let mut in_features = false;
+    for line in manifest.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_features = line == "[features]";
+        } else if in_features {
+            if let Some(rest) = line.strip_prefix("otlp") {
+                if rest.trim_start().starts_with('=') {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// What the post-build OTLP probe's exit status means for the swap.
+#[derive(Debug, PartialEq, Eq)]
+pub enum OtlpProbe {
+    /// Exit 0: the binary exports OTLP.
+    Proceed,
+    /// Exit 2: clap's usage error — a binary too old to have
+    /// `telemetry-capabilities` (it predates #8535). Its OTLP support then
+    /// rests on `--features otlp` having been passed; warn and proceed.
+    TooOldToAsk,
+    /// Any other outcome (exit 1 = "built without the otlp feature", a signal,
+    /// or a binary that would not run): refuse the swap.
+    Refuse,
+}
+
+/// Classify the probe's exit code (`None` = killed by a signal, or never ran).
+#[must_use]
+pub fn classify_otlp_probe(code: Option<i32>) -> OtlpProbe {
+    match code {
+        Some(0) => OtlpProbe::Proceed,
+        Some(2) => OtlpProbe::TooOldToAsk,
+        _ => OtlpProbe::Refuse,
+    }
+}
+
+/// Run `<new_bin> telemetry-capabilities --require-otlp` and decide (#10700).
+fn probe_otlp(new_bin: &Path) -> Result<(), BuildFailure> {
+    let output = Command::new(new_bin)
+        .args(["telemetry-capabilities", "--require-otlp"])
+        .stdin(Stdio::null())
+        .output();
+    let (code, detail) = match &output {
+        Ok(o) => (
+            o.status.code(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&o.stdout).trim(),
+                String::from_utf8_lossy(&o.stderr).trim()
+            ),
+        ),
+        Err(e) => (None, e.to_string()),
+    };
+    match classify_otlp_probe(code) {
+        OtlpProbe::Proceed => {
+            out::ok("OTLP probe: the freshly-built binary exports OTLP.");
+            Ok(())
+        }
+        OtlpProbe::TooOldToAsk => {
+            out::warn("OTLP probe: the freshly-built binary has no 'telemetry-capabilities' subcommand (it predates #8535) — proceeding on the strength of the build's --features otlp.");
+            Ok(())
+        }
+        OtlpProbe::Refuse => {
+            out::err(&format!(
+                "OTLP probe FAILED: '{} telemetry-capabilities --require-otlp' exited {} ({detail}).",
+                new_bin.display(),
+                code.map_or_else(|| "without a status".to_string(), |c| c.to_string())
+            ));
+            out::err("Refusing to provision a loom-daemon that cannot export OTLP (#10700) — the running daemon (if any) was left untouched.");
+            Err(BuildFailure::MissingOtlp)
+        }
+    }
+}
+
+/// `cargo build --release --features otlp --message-format=json-render-diagnostics`
+/// (see [`build_args`]), then locate the executable it reported and probe it
+/// for OTLP export (#10700).
 ///
 /// `--message-format=json-render-diagnostics` keeps rustc's human-readable
 /// errors and warnings on stderr — unchanged from a plain `cargo build`, still
@@ -113,12 +224,12 @@ pub fn rebuild(daemon_dir: &Path, repo_root: &Path) -> Result<PathBuf, BuildFail
         return Err(BuildFailure::Compile);
     };
 
+    let args = build_args(daemon_dir);
+    if !args.contains(&"otlp") {
+        out::warn("This source's loom-daemon/Cargo.toml declares no `otlp` feature (a tag older than #4879) — building without --features otlp; the post-build probe decides whether the result may be installed.");
+    }
     let status = Command::new("cargo")
-        .args([
-            "build",
-            "--release",
-            "--message-format=json-render-diagnostics",
-        ])
+        .args(&args)
         .current_dir(daemon_dir)
         .stdout(Stdio::from(log_handle))
         .status();
@@ -145,6 +256,7 @@ pub fn rebuild(daemon_dir: &Path, repo_root: &Path) -> Result<PathBuf, BuildFail
         return Err(BuildFailure::ArtifactNotFound);
     };
     out::ok(&format!("Build succeeded: {}", new_bin.display()));
+    probe_otlp(&new_bin)?;
     Ok(new_bin)
 }
 
@@ -276,6 +388,83 @@ mod tests {
             last_executable(stream).as_deref(),
             Some("/Volumes/Stripe/cargo-target/release/loom-daemon")
         );
+    }
+
+    #[test]
+    fn the_otlp_probe_proceeds_only_on_zero_and_warns_on_a_usage_error() {
+        assert_eq!(classify_otlp_probe(Some(0)), OtlpProbe::Proceed);
+        assert_eq!(classify_otlp_probe(Some(2)), OtlpProbe::TooOldToAsk);
+        assert_eq!(classify_otlp_probe(Some(1)), OtlpProbe::Refuse);
+        assert_eq!(classify_otlp_probe(Some(101)), OtlpProbe::Refuse);
+        assert_eq!(classify_otlp_probe(None), OtlpProbe::Refuse);
+    }
+
+    #[cfg(unix)]
+    fn stub_binary(dir: &Path, exit_code: i32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join("loom-daemon");
+        std::fs::write(&bin, format!("#!/bin/sh\necho '{{\"otlp\":false}}'\nexit {exit_code}\n"))
+            .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        bin
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_otlp_probe_refuses_the_swap_for_a_binary_that_cannot_export() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(probe_otlp(&stub_binary(tmp.path(), 0)).is_ok());
+        assert!(probe_otlp(&stub_binary(tmp.path(), 2)).is_ok());
+        assert!(matches!(
+            probe_otlp(&stub_binary(tmp.path(), 1)),
+            Err(BuildFailure::MissingOtlp)
+        ));
+        assert!(matches!(
+            probe_otlp(&tmp.path().join("no-such-binary")),
+            Err(BuildFailure::MissingOtlp)
+        ));
+    }
+
+    #[test]
+    fn otlp_is_requested_only_when_the_manifest_declares_it() {
+        let current = "[package]\nname = \"loom-daemon\"\n\n[features]\n# no-op alias\notlp = []\n";
+        let gated = "[features]\notlp = [\"dep:opentelemetry-proto\", \"dep:prost\"]\n";
+        let before = "[package]\nname = \"loom-daemon\"\n[dependencies]\notlp-ish = \"1\"\n";
+        let elsewhere = "[dependencies]\notlp = \"1\"\n[features]\nfast = []\n";
+        assert!(declares_otlp_feature(current));
+        assert!(declares_otlp_feature(gated));
+        assert!(!declares_otlp_feature(before));
+        assert!(!declares_otlp_feature(elsewhere));
+
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            build_args(tmp.path()),
+            [
+                "build",
+                "--release",
+                "--message-format=json-render-diagnostics"
+            ],
+            "no manifest at all: no feature flag cargo could reject"
+        );
+        std::fs::write(tmp.path().join("Cargo.toml"), current).unwrap();
+        assert_eq!(
+            build_args(tmp.path()),
+            [
+                "build",
+                "--release",
+                "--features",
+                "otlp",
+                "--message-format=json-render-diagnostics"
+            ]
+        );
+    }
+
+    /// This crate's own manifest keeps the alias, so a source roll of THIS
+    /// tree passes `--features otlp` — and every external caller that does
+    /// keeps working (cargo hard-errors on an unknown feature name).
+    #[test]
+    fn this_crate_still_declares_the_otlp_alias() {
+        assert!(declares_otlp_feature(include_str!("../../Cargo.toml")));
     }
 
     #[test]

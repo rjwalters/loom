@@ -13,14 +13,20 @@ use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
 
+use super::champion::champion_by_slug;
+use super::curator::curator_by_slug;
 use super::outcomes::Curated;
 use super::{
-    held_stage, FleetInput, HeldSweep, ListedPr, ReadyItem, ReadyQueue, RepoListing, REVIEW_LABELS,
+    held_stage, FleetInput, HeldSweep, ListedPr, ReadyItem, ReadyQueue, RepoLimits, RepoListing,
+    REVIEW_LABELS,
 };
 use crate::sweep_registry::SweepRegistry;
-use crate::telemetry::kinds::fleet_state::{FleetCapacity, FleetSlots, MainCi, PlannerStamps};
+use crate::telemetry::kinds::fleet_state::{
+    FleetCapacity, FleetEligibleReason, FleetHaltReason, FleetRepoHalt, FleetSlots, MainCi,
+    PlannerStamps,
+};
 use crate::telemetry::RepoVisibility;
-use crate::types::{ReadyQueueRow, SweepKind, WorkFinderTickSummary};
+use crate::types::{ReadyQueueRow, RepoLimitView, SweepKind, WorkFinderTickSummary};
 use crate::workspace_pool::WorkspacePool;
 use crate::worktree_ops::gh::{linkage_refs, LinkageKind};
 
@@ -302,8 +308,9 @@ async fn label_listings(roots: &[(PathBuf, String)], label: &'static str) -> Cur
     out
 }
 
-/// The effective operator priority level the planner ranked `row` on: its
-/// `operator_priority_level` comparator key, else the bare star.
+/// The priority level the planner ranked `row` on (0 default, 1
+/// `loom:important`, 2 `loom:very-important`): its `level` comparator key,
+/// else the row's own `level` (#11510).
 fn level(row: &ReadyQueueRow) -> u8 {
     row.plan
         .keys
@@ -311,7 +318,7 @@ fn level(row: &ReadyQueueRow) -> u8 {
         .find(|k| k.name == "level")
         .and_then(|k| k.value.as_u64())
         .and_then(|n| u8::try_from(n).ok())
-        .unwrap_or(u8::from(row.operator_priority))
+        .unwrap_or_else(|| row.level.rank())
 }
 
 /// The work finder's last tick: every row not running, with its rank and
@@ -323,7 +330,30 @@ async fn ready_queue(
     let summary = crate::work_finder::last_tick_summary()?;
     let refs = crate::observability::queue_snapshot::resolve_repos(&summary, slug_cache).await;
     let slug = |root: &str| refs.get(root).map(|r| r.repo.to_ascii_lowercase());
-    Some(ready_from_tick(&summary, slug, managed))
+    let mut ready = ready_from_tick(&summary, slug, managed);
+    ready.halts = halts_by_slug(&crate::work_finder::halt_cause::since::current(), slug);
+    Some(ready)
+}
+
+/// The work finder's held roots (#11564) by lowercased slug, each as its
+/// `fleet.state` fact. Every held root is kept (no cap); a root `slug` cannot
+/// name is left out, as its ready rows are. Pure.
+pub(super) fn halts_by_slug(
+    halts: &Option<Vec<crate::work_finder::halt_cause::since::RootHalt>>,
+    slug: impl Fn(&str) -> Option<String>,
+) -> BTreeMap<String, FleetRepoHalt> {
+    let mut out = BTreeMap::new();
+    for halt in halts.iter().flatten() {
+        let Some(repo) = slug(&halt.root.to_string_lossy()) else {
+            continue;
+        };
+        out.entry(repo).or_insert_with(|| FleetRepoHalt {
+            reason: FleetHaltReason::from_cause(halt.cause),
+            since: halt.since,
+            since_lower_bound: halt.since_lower_bound,
+        });
+    }
+    out
 }
 
 /// [`ready_queue`] over one tick, with `slug` resolving a root. Pure.
@@ -348,12 +378,15 @@ fn ready_from_tick(
                 repo: slug(&row.repo)?,
                 issue: row.issue,
                 rank: small(row.rank),
-                star: row.operator_priority,
-                star_at: None,
                 level: level(row),
                 fleet_priority: row.workspace_priority,
                 created_at: parse_instant(row.created_at.as_deref()),
                 main_red_fix: row.main_red_fix,
+                eligible_reason: FleetEligibleReason::from_disposition(row.disposition),
+                // Only a clocked hold's own expiry: never a stray one.
+                eligible_at: FleetEligibleReason::from_disposition(row.disposition)
+                    .filter(|reason| reason.has_clock())
+                    .and(row.plan.held_until),
             })
         })
         .collect();
@@ -381,7 +414,30 @@ fn ready_from_tick(
         listed,
         complete,
         slots,
+        halts: BTreeMap::new(),
+        limits: limits_by_slug(&summary.repo_limits, slug),
     }
+}
+
+/// The tick's per-repo dispatch limits (#11606) by lowercased slug. Every
+/// entry is kept (no cap); a root `slug` cannot name is left out, as its
+/// ready rows are. Pure.
+pub(super) fn limits_by_slug(
+    limits: &[RepoLimitView],
+    slug: impl Fn(&str) -> Option<String>,
+) -> BTreeMap<String, RepoLimits> {
+    let mut out = BTreeMap::new();
+    for limit in limits {
+        let Some(repo) = slug(&limit.repo) else {
+            continue;
+        };
+        out.entry(repo).or_insert_with(|| RepoLimits {
+            in_flight: small(limit.in_flight),
+            cap: limit.cap.map(small),
+            deferred_repo_cap: small(limit.deferred_repo_cap),
+        });
+    }
+    out
 }
 
 /// Available and exhausted token accounts in the rotation ranking at
@@ -431,13 +487,39 @@ fn capacity(workspace_root: &Path, live_workers: usize) -> FleetCapacity {
     }
 }
 
+/// This host's slots, measured from local state (#11643): `max_concurrent`
+/// from the work-finder config (precedence env > config > default, via
+/// [`resolve_max_concurrent_with_source`]) and `occupancy` from the
+/// already-computed live-sweep count. Independent of the work-finder plan, so
+/// it is present from the first pass of a process and after a roll/restart —
+/// the plan, and thus `ready.slots`, is absent until the first tick.
+///
+/// `occupancy` stays an `Option` (absent = unknown, never a synthetic `0`);
+/// here it is always `Some`, because every pass re-measures the live count, so
+/// a genuinely idle host emits `occupancy: 0`, distinct from "not yet
+/// measured".
+fn local_slots(workspace_root: &Path, live_workers: usize) -> FleetSlots {
+    let config = crate::work_finder::read_work_finder_config(workspace_root);
+    let max_concurrent = crate::work_finder::resolve_max_concurrent_with_source(&config).0;
+    FleetSlots {
+        max_concurrent: small(max_concurrent),
+        occupancy: Some(small(live_workers)),
+    }
+}
+
 /// `main` CI status of the repo rooted at `root` from the main-health gate:
-/// red when halted on a verified-red run, unknown when the gate has not
-/// produced a verdict or could not evaluate, else green.
+/// red when halted on a verified-red run, green when the gate has produced a
+/// green verdict, unknown otherwise (#11565). Unknown means the gate has no
+/// verdict for the root: it is not enabled for it (`autonomous.mainHealthGate`
+/// is off by default, or the repo has no usable `buildGate`), has not
+/// completed a run yet this process, or its last tick could not evaluate.
 fn main_ci(states: &crate::main_health_gate::WorkspaceHealthStates, root: &Path) -> MainCi {
-    if states.is_halted(root) {
+    let Some(state) = states.find(root) else {
+        return MainCi::Unknown;
+    };
+    if state.is_halted() {
         MainCi::Red
-    } else if states.is_unevaluated(root) || states.last_verdict_at(root).is_none() {
+    } else if state.is_unevaluated() || state.last_verdict_at().is_none() {
         MainCi::Unknown
     } else {
         MainCi::Green
@@ -517,10 +599,9 @@ pub(super) async fn gather(
             .iter()
             .map(|(root, slug)| (root.as_path(), slug.as_str())),
     );
-    let capacity = Some(capacity(
-        workspace_root,
-        live_sweep_count(&workspace_pool.provisioned_registries()),
-    ));
+    let live_workers = live_sweep_count(&workspace_pool.provisioned_registries());
+    let capacity = Some(capacity(workspace_root, live_workers));
+    let slots = Some(local_slots(workspace_root, live_workers));
     let listed_at = (!listings.is_empty()).then_some(now);
     let reused = Reused {
         managed: managed.clone(),
@@ -533,8 +614,13 @@ pub(super) async fn gather(
             .collect(),
         visibility: BTreeMap::new(),
     };
+    let champion = champion_by_slug(&reused.roots);
+    let curator = curator_by_slug(&reused.roots);
     let input = FleetInput {
+        champion,
+        curator,
         capacity,
+        slots,
         main_ci,
         host_id: host_id.to_string(),
         managed,
@@ -555,11 +641,12 @@ pub(super) fn tick_input(
     host_id: &str,
     reused: &Reused,
 ) -> FleetInput {
+    let live_workers = live_sweep_count(&workspace_pool.provisioned_registries());
     FleetInput {
-        capacity: Some(capacity(
-            workspace_root,
-            live_sweep_count(&workspace_pool.provisioned_registries()),
-        )),
+        champion: champion_by_slug(&reused.roots),
+        curator: curator_by_slug(&reused.roots),
+        capacity: Some(capacity(workspace_root, live_workers)),
+        slots: Some(local_slots(workspace_root, live_workers)),
         main_ci: tick_main_ci(reused),
         held: held_sweeps(&workspace_pool.provisioned_registries(), |root| reused.slug(root)),
         ready: crate::work_finder::last_tick_summary().map(|summary| ready_input(&summary, reused)),
@@ -587,15 +674,21 @@ pub(super) fn reused_input(host_id: &str, reused: &Reused) -> FleetInput {
         listings: reused.listings.clone(),
         listed_at: reused.listed_at,
         ready: None,
+        slots: None,
         capacity: None,
+        champion: BTreeMap::new(),
+        curator: BTreeMap::new(),
         main_ci: BTreeMap::new(),
     }
 }
 
-/// The ready queue of `summary`, its roots named by the collector's slugs.
-/// Pure.
+/// The ready queue of `summary`, its roots named by the collector's slugs,
+/// with the work finder's current repo halts (#11564).
 pub(super) fn ready_input(summary: &WorkFinderTickSummary, reused: &Reused) -> ReadyQueue {
-    ready_from_tick(summary, |root| reused.slug(root), &reused.managed)
+    let mut ready = ready_from_tick(summary, |root| reused.slug(root), &reused.managed);
+    let halts = crate::work_finder::halt_cause::since::current();
+    ready.halts = halts_by_slug(&halts, |root| reused.slug(root));
+    ready
 }
 
 /// The seconds between passes: the work finder's tick interval once it has

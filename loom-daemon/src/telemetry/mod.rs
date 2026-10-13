@@ -60,6 +60,7 @@ pub mod disposition;
 mod envelope;
 pub mod kinds;
 pub mod no_phase_cause;
+pub mod phase_tap_usage;
 mod sweep_identity;
 pub use sweep_identity::SweepIdentityRecord;
 pub mod fixture;
@@ -86,6 +87,7 @@ pub use kinds::{
 };
 pub use no_phase_cause::NoPhaseCause;
 pub use ops::MetricPointsRecord;
+pub use phase_tap_usage::PhaseTapUsageRow;
 pub use queue_snapshot::QueueSnapshotRecord;
 
 /// Current telemetry wire-schema version. Bump on any breaking change to the
@@ -952,6 +954,13 @@ pub struct SweepOutcomeRecord {
     /// a bounded reason. Present only on records of that class.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub no_phase_cause: Option<NoPhaseCause>,
+    /// Usage of out-of-process phases (`worker run`, Issues #11360/#11488),
+    /// one row per `(role, tap, model)`, built from the same rows the
+    /// host-local outcome journal carries. Absent (never an empty array) when
+    /// no phase ran out of process, so such a record serializes as it did
+    /// before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub phase_tap_usage: Vec<PhaseTapUsageRow>,
     /// 1-based count of terminal sweeps for this repo#issue in this host's
     /// durable outcome journal (Issue #9444) — the attempt this sweep was.
     /// Absent when the journal could not be read.

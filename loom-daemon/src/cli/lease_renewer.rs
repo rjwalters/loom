@@ -52,6 +52,7 @@
 //! lets a peer reclaim work that is still being done.
 
 use anyhow::{Context, Result};
+use loom_daemon::telemetry::SweepResult;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -456,6 +457,13 @@ impl RenewerAction {
                 issue_state,
             } => {
                 let (code, why) = check(&store, &key_of(&key), &token, issue_state.as_deref());
+                // #11563: the issue closed under an in-session sweep's loop.
+                if code == EXIT_STOP
+                    && issue_state.as_deref().and_then(parse_state) == Some("closed")
+                {
+                    let ws = cwd.to_string_lossy();
+                    super::presence::on_sweep_finished(&ws, key.issue, SweepResult::Success, None);
+                }
                 if let Some(why) = why {
                     eprintln!("sweep-lease-renew: renewal loop for issue #{}: {why}", key.issue);
                 }
@@ -485,6 +493,10 @@ impl RenewerAction {
                     &signal,
                 )?;
                 eprintln!("released renewal for issue #{} ({n} renewer(s))", key.issue);
+                // #11563: released while still driven = ended without the
+                // merge's checkpoint delete, which finishes a landed sweep first.
+                let ws = cwd.to_string_lossy();
+                super::presence::on_sweep_finished(&ws, key.issue, SweepResult::Failure, None);
                 Ok(())
             }
         }

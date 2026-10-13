@@ -1,4 +1,4 @@
-//! Forge-dated entries, rework, conflict / CI flags, holds and star / level on
+//! Forge-dated entries, rework, conflict / CI flags, holds and level on
 //! `fleet.state` rows (#11391).
 
 use std::collections::BTreeMap;
@@ -122,12 +122,12 @@ fn a_ready_row_is_dated_by_its_issue_history() {
             repo: REPO.to_string(),
             issue: 7,
             rank: 1,
-            star: false,
-            star_at: None,
             level: 0,
             fleet_priority: 100,
             created_at: None,
             main_red_fix: false,
+            eligible_reason: None,
+            eligible_at: None,
         }],
         ..ReadyQueue::default()
     });
@@ -254,7 +254,7 @@ fn pr_rows_carry_conflict_ci_fail_holds_star_and_level() {
                 "loom:ci-failure",
                 "loom:operator",
                 "loom:sequenced",
-                "loom:operator-priority",
+                "loom:very-important",
             ]),
             issue: Some(20),
         },
@@ -268,16 +268,15 @@ fn pr_rows_carry_conflict_ci_fail_holds_star_and_level() {
     let r = row(&view, 20);
     assert!(r.conflict && r.ci_fail);
     assert_eq!(r.holds, vec!["operator".to_string(), "sequenced".to_string()]);
-    assert!(r.star);
-    assert!(r.level >= 1);
+    assert_eq!(r.level, 2, "the PR's own level label (#11510)");
     let plain = row(&view, 30);
-    assert!(!plain.conflict && !plain.ci_fail && !plain.star);
+    assert!(!plain.conflict && !plain.ci_fail);
     assert!(plain.holds.is_empty());
     assert_eq!(plain.level, 0);
 }
 
 #[test]
-fn a_sweep_row_takes_the_linked_prs_flags_and_keeps_its_earlier_star() {
+fn a_sweep_row_takes_the_linked_prs_flags_and_keeps_its_earlier_level() {
     let mut inp = input(vec![listing(vec![ListedPr {
         number: 21,
         labels: labels(&[
@@ -300,7 +299,6 @@ fn a_sweep_row_takes_the_linked_prs_flags_and_keeps_its_earlier_star() {
     }];
     let mut prev = build_view(&input(vec![]), None, t0());
     let mut earlier = FleetStateRow::new(20, FleetStage::ReadyWait, t0());
-    earlier.star = true;
     earlier.level = 2;
     let state = prev.repos.entry(REPO.to_string()).or_default();
     state.rows.insert(20, earlier);
@@ -311,7 +309,6 @@ fn a_sweep_row_takes_the_linked_prs_flags_and_keeps_its_earlier_star() {
     let r = row(&view, 20);
     assert!(r.conflict);
     assert_eq!(r.holds, vec!["blocked".to_string()]);
-    assert!(r.star);
     assert_eq!(r.level, 2);
 }
 
@@ -327,7 +324,7 @@ fn hold_names_lists_every_hold_strongest_first() {
 #[test]
 fn the_new_fields_round_trip_and_are_absent_when_empty() {
     let bare = serde_json::to_value(FleetStateRow::new(1, FleetStage::ReviewWait, t0())).unwrap();
-    for key in ["rework", "conflict", "ci_fail", "holds", "star", "level"] {
+    for key in ["rework", "conflict", "ci_fail", "holds", "level"] {
         assert!(bare.get(key).is_none(), "{key} must be absent when empty");
     }
     let mut full = FleetStateRow::new(1, FleetStage::Doctor, t0());
@@ -335,8 +332,7 @@ fn the_new_fields_round_trip_and_are_absent_when_empty() {
     full.conflict = true;
     full.ci_fail = true;
     full.holds = vec!["blocked".to_string()];
-    full.star = true;
-    full.level = 3;
+    full.level = 2;
     let back: FleetStateRow = serde_json::from_value(serde_json::to_value(&full).unwrap()).unwrap();
     assert_eq!(back, full);
     // A v1 row without any of them still reads.

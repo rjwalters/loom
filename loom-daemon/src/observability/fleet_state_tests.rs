@@ -61,17 +61,19 @@ fn ready(repo: &str, issue: u32, rank: u32) -> ReadyItem {
         repo: repo.to_string(),
         issue,
         rank,
-        star: rank == 1,
-        star_at: (rank == 1).then(|| t0() - Duration::hours(2)),
         level: u8::from(rank == 1),
         fleet_priority: 100,
         created_at: Some(t0() - Duration::days(3)),
         main_red_fix: false,
+        eligible_reason: None,
+        eligible_at: None,
     }
 }
 
 fn input() -> FleetInput {
     FleetInput {
+        champion: BTreeMap::new(),
+        curator: BTreeMap::new(),
         host_id: "robb-studio".to_string(),
         managed: [REPO, OTHER].iter().map(|s| (*s).to_string()).collect(),
         held: vec![held(REPO, 10, FleetStage::SweepBuilder, false)],
@@ -92,7 +94,10 @@ fn input() -> FleetInput {
                 max_concurrent: 4,
                 occupancy: Some(1),
             }),
+            halts: BTreeMap::new(),
+            limits: Default::default(),
         }),
+        slots: None,
         capacity: None,
         main_ci: BTreeMap::new(),
     }
@@ -139,7 +144,6 @@ fn rows_come_from_the_registry_the_review_listings_and_the_ready_queue() {
     let five = &view.repos[OTHER].rows[&5];
     assert_eq!(five.stage, FleetStage::ReadyWait);
     assert_eq!(five.rank, Some(1));
-    assert!(five.star);
     assert_eq!(five.level, 1);
     assert_eq!(five.fleet_priority, Some(100));
     assert_eq!(five.created_at, Some(t0() - Duration::days(3)));
@@ -1076,4 +1080,88 @@ async fn a_finished_tick_wakes_the_tick_pass() {
     tokio::time::timeout(std::time::Duration::from_secs(1), super::ticked().notified())
         .await
         .expect("the tick left a wake-up");
+}
+
+#[test]
+fn champion_metadata_alone_triggers_delta_and_old_payload_remains_unknown() {
+    use crate::telemetry::kinds::fleet_state::ChampionState;
+    let original = build_view(&input(), None, t0());
+    let last = emitted(original.clone(), t0(), t0());
+    let mut changed = original;
+    let state = ChampionState {
+        approval: None,
+        merge: None,
+        prompt_source: "/loom:champion".into(),
+        prompt_hash: None,
+        interval_enabled: false,
+        cadence_secs: 600,
+        cadence_source: "built_in".into(),
+        last_attempt_at: Some(t0()),
+        last_attempt_ok: Some(false),
+    };
+    changed.repos.get_mut(REPO).unwrap().champion = Some(state.clone());
+    let delta = decide(&changed, &stamps(), Some(&last), t0() + Duration::seconds(1)).unwrap();
+    assert!(!delta.anchor);
+    assert_eq!(entry(&delta, REPO).champion, Some(state));
+    let mut old = serde_json::to_value(entry(&delta, REPO)).unwrap();
+    old.as_object_mut().unwrap().remove("champion");
+    assert_eq!(
+        serde_json::from_value::<FleetStateRepo>(old)
+            .unwrap()
+            .champion,
+        None
+    );
+}
+
+/// #11643: `build_view` surfaces the directly-provided, locally-measured
+/// `slots` even before the work finder's first tick (`ready: None`), so
+/// `slots.max_concurrent` is present from the first pass of a process and
+/// after a roll — not gated on a dispatch plan.
+#[test]
+fn slots_present_before_first_tick_from_local_state() {
+    let input = FleetInput {
+        host_id: "robb-studio".to_string(),
+        ready: None,
+        slots: Some(FleetSlots {
+            max_concurrent: 6,
+            occupancy: Some(0),
+        }),
+        ..FleetInput::default()
+    };
+    let view = build_view(&input, None, t0());
+    assert_eq!(
+        view.slots,
+        Some(FleetSlots {
+            max_concurrent: 6,
+            occupancy: Some(0),
+        }),
+        "locally-measured slots must survive to the view without a work-finder tick"
+    );
+}
+
+/// #11643: the directly-provided local slots win over the work-finder plan's
+/// `ready.slots`; absent local slots fall back to the plan's.
+#[test]
+fn build_view_prefers_local_slots_over_plan_slots() {
+    let local = FleetSlots {
+        max_concurrent: 6,
+        occupancy: Some(2),
+    };
+    let plan = FleetSlots {
+        max_concurrent: 4,
+        occupancy: Some(1),
+    };
+    let with_ready = |slots: Option<FleetSlots>| FleetInput {
+        host_id: "robb-studio".to_string(),
+        slots,
+        ready: Some(ReadyQueue {
+            slots: Some(plan),
+            ..ReadyQueue::default()
+        }),
+        ..FleetInput::default()
+    };
+    // Local slots present → preferred.
+    assert_eq!(build_view(&with_ready(Some(local)), None, t0()).slots, Some(local));
+    // Local slots absent → fall back to the plan's.
+    assert_eq!(build_view(&with_ready(None), None, t0()).slots, Some(plan));
 }

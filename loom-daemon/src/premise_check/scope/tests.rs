@@ -21,7 +21,7 @@ fn ordinary_labels_are_not() {
         trigger(
             "bug: the retry loop double-counts attempts",
             "## Steps to reproduce\n1. run it\n\n## Expected\nonce\n\n## Actual\ntwice\n",
-            &labels(&["loom:triage", "loom:curated", "tier:goal-supporting"]),
+            &labels(&["loom:triage", "loom:curated", "enhancement"]),
         ),
         None
     );

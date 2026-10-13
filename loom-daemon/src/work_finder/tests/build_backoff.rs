@@ -10,8 +10,8 @@ fn vi(n: u32) -> WorkItem {
     WorkItem::new(n, vec!["loom:issue".into(), "loom:very-important".into()])
 }
 
-fn starred(n: u32) -> WorkItem {
-    WorkItem::new(n, vec![OPERATOR_PRIORITY_LABEL.to_string()])
+fn important(n: u32) -> WorkItem {
+    WorkItem::new(n, vec!["loom:important".to_string()])
 }
 
 fn fix(n: u32) -> WorkItem {
@@ -92,12 +92,12 @@ fn engaged_defers_every_plain_candidate_and_leaves_in_flight_alone() {
 // -- AC5 ----------------------------------------------------------------------
 
 /// #11508 (operator ruling): priority changes order, never admission. A
-/// `loom:very-important` candidate and a legacy star are deferred by the
-/// back-off exactly like a plain candidate.
+/// `loom:very-important` and a `loom:important` candidate are deferred by
+/// the back-off exactly like a plain candidate.
 #[test]
 fn a_very_important_candidate_is_held_by_the_backoff_like_any_other() {
     let mut multi = vec![(
-        FakeSource::once(vec![issue(1), vi(5), starred(6)]),
+        FakeSource::once(vec![issue(1), vi(5), important(6)]),
         RecordingDispatcher::default(),
     )];
     let report = run(&mut multi, 10, None, &[], &[true]);
@@ -113,14 +113,15 @@ fn a_very_important_candidate_is_held_by_the_backoff_like_any_other() {
     assert_eq!((report.dispatched, report.deferred_build_backoff), (1, 0));
 }
 
-/// The red-main-fix lane (#9244) is not a priority and keeps its bypass
+/// The red-main-fix lane (#9244) is not a level and keeps its bypass
 /// (#11508, Judge): while `main` is red nothing merges, so holding the fix
-/// would deadlock the debt the back-off waits on. The VI and the star in the
-/// same held repo still wait, and the fix gains no place in the order.
+/// would deadlock the debt the back-off waits on. The VI and the important
+/// issue in the same held repo still wait; on the red `main` the fix also leads the
+/// published rank (#11547), which changes order only, not the back-off.
 #[test]
 fn a_verified_red_main_fix_bypasses_the_backoff_but_priority_does_not() {
     let mut multi = vec![(
-        FakeSource::once(vec![issue(1), vi(5), starred(6), fix(9)]),
+        FakeSource::once(vec![issue(1), vi(5), important(6), fix(9)]),
         RecordingDispatcher::default(),
     )];
     let report = run(&mut multi, 10, None, &[RED], &[true]);
@@ -133,9 +134,11 @@ fn a_verified_red_main_fix_bypasses_the_backoff_but_priority_does_not() {
         .iter()
         .filter(|r| r.issue != 9)
         .all(|r| !r.main_red_fix));
-    // Not an ordering key: the VI (level 2) still ranks ahead of the fix.
+    // #11547: on a verified-red main the fix leads the published rank, ahead
+    // of the VI (level 2). Ordering only; the back-off counts above are the
+    // gate behaviour and are unchanged.
     let rank = |n: u32| rows.iter().find(|r| r.issue == n).unwrap().rank;
-    assert!(rank(5) < rank(9));
+    assert!(rank(9) < rank(5));
 
     // Without a verified-red main the marker is inert: the fix waits too.
     let mut multi = vec![(FakeSource::once(vec![fix(9)]), RecordingDispatcher::default())];
@@ -171,10 +174,11 @@ fn not_held_is_the_repo_cap_tick_exactly() {
         }
         format!("{r:?}")
     };
-    // The very-important #2 sorts first and fills the repo's cap of 1;
-    // nothing overflows it (#11508).
+    // On this verified-red repo the fix #4 sorts first (#11547, ahead of the
+    // very-important #2) and fills the repo's cap of 1; nothing overflows it
+    // (#11508).
     assert_eq!(via_backoff.admissions.len(), 1);
-    assert_eq!(a[0].1.dispatched, vec![2]);
+    assert_eq!(a[0].1.dispatched, vec![4]);
     assert_eq!(unstamped(via_backoff.clone()), unstamped(via_repo_cap));
     assert_eq!(a[0].1.dispatched, b[0].1.dispatched);
     assert_eq!((via_backoff.deferred_build_backoff, via_backoff.build_backoff_held), (0, false));

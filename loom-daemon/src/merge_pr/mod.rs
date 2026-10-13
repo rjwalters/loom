@@ -75,6 +75,10 @@
 //! nothing pending". It answers only inside the forge contract and refuses
 //! the rest, which the shell treats as still pending.
 //!
+//! [`superseded_runs`] narrows that READ (#11097): when one push fired two
+//! runs of the same workflow on one head, the superseded twin's check-runs
+//! are dropped before classification, so its residue cannot fail a green tree.
+//!
 //! [`check_runs_streak`] is the OTHER classification the same poll loop makes
 //! on a FAILED fetch attempt (#6389, an #8191 slice): whether a confirmed
 //! HTTP 404 — both the attempt and its retry-once agreeing — has now repeated
@@ -255,6 +259,12 @@
 //! it: it answers "did THIS merge close the issue?" for Champion Step 4's
 //! negated-reference reopen (#8942), which used to undo any close it found.
 
+//! [`pr_state`] is the gate that opens the whole flow once the PR is fetched
+//! (#8191 slice): already merged (exit 0) versus closed unmerged (refuse)
+//! versus carry on. Merged wins over closed, since a merged PR also reads
+//! `state: closed`. The shell acts on a positively received verdict; a lost
+//! one falls back to the retired shell predicate (as `revalidate-head` does).
+
 pub mod chain_lock;
 pub mod check_runs_rollup;
 pub mod check_runs_streak;
@@ -276,6 +286,7 @@ pub mod partial_comment;
 pub mod partial_conflict;
 pub mod partial_reset;
 pub mod poll_wait;
+pub mod pr_state;
 pub mod reconcile;
 pub mod redate;
 pub mod refs;
@@ -287,6 +298,7 @@ pub mod revalidate_head;
 pub mod sequence;
 pub mod stacked_children;
 pub mod stale_checks;
+pub mod superseded_runs;
 pub mod tree_checks;
 pub mod usage;
 pub mod version_policy;

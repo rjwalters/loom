@@ -121,25 +121,11 @@ pub(crate) fn queue_json(report: &DaemonStatusReport, now: DateTime<Utc>) -> ser
         "ordering": tick.and_then(ordering),
         "plan": tick.and_then(|t| t.plan.as_ref()),
         "queue": tick.map(|t| t.queue.as_slice()).unwrap_or_default(),
-        // Every starred issue's landing state (#9244 C), including the ones
-        // not in the ready listing (building, in review, parked).
-        "operator_priority_landing": report.operator_priority_landing,
     })
 }
 
-/// The human-readable table, then the starred issues' landing states
-/// (#9244 C).
+/// The human-readable table.
 pub(crate) fn render_queue(report: &DaemonStatusReport, now: DateTime<Utc>) -> String {
-    let mut out = render_ready(report, now);
-    for line in loom_daemon::star_liveness::render::lines(report.operator_priority_landing.as_ref())
-    {
-        out.push_str(&line);
-        out.push('\n');
-    }
-    out
-}
-
-fn render_ready(report: &DaemonStatusReport, now: DateTime<Utc>) -> String {
     let (state, age) = freshness(report, now);
     let mut out = String::new();
     let Some(tick) = &report.last_work_finder_tick else {
@@ -249,14 +235,12 @@ fn render_row(row: &ReadyQueueRow) -> String {
         .file_name()
         .map_or_else(|| row.repo.clone(), |n| n.to_string_lossy().into_owned());
     let mut flags = Vec::new();
-    if row.operator_priority {
-        flags.push("starred".to_string());
+    // The priority level (#11510), when it is not the default.
+    if row.level != loom_daemon::priority_pick::Level::Default {
+        flags.push(row.level.as_str().to_string());
     }
     if row.main_red_fix {
         flags.push("red-main-fix".to_string());
-    }
-    if let Some(tier) = &row.tier {
-        flags.push(tier.clone());
     }
     let flags = if flags.is_empty() {
         String::new()
@@ -305,10 +289,13 @@ mod tests {
             issue,
             workspace_priority: 100,
             urgent: false,
-            operator_priority: rank == 1,
+            level: if rank == 1 {
+                loom_daemon::priority_pick::Level::VeryImportant
+            } else {
+                loom_daemon::priority_pick::Level::Default
+            },
             main_red_fix: false,
             created_at: None,
-            tier: None,
             story_points: None,
             disposition: d,
             detail: None,
@@ -332,7 +319,8 @@ mod tests {
         let first = text.find("loom#10").unwrap();
         assert!(first < text.find("loom#11").unwrap());
         assert!(text.contains("waiting: concurrency cap full"));
-        assert!(text.contains("[starred]"));
+        assert!(text.contains("[very-important]"), "{text}");
+        assert!(!text.contains("[default]"), "the default level is no flag: {text}");
         assert!(!text.contains("[urgent]"), "urgent is no longer a row flag (#9244)");
         assert!(!text.contains("STALE"));
     }
@@ -458,17 +446,17 @@ mod tests {
                 ..PlanSlots::default()
             },
             tick_interval_secs: Some(60),
-            ordering: vec!["workspace_priority".into(), "operator_priority".into()],
+            ordering: vec!["level".into(), "created_at".into()],
             ..DispatchPlanContext::default()
         });
         let j = queue_json(&r, now);
-        assert_eq!(j["ordering"], serde_json::json!(["workspace_priority", "operator_priority"]));
+        assert_eq!(j["ordering"], serde_json::json!(["level", "created_at"]));
         assert_eq!(j["plan"]["slots"]["max_concurrent"], 2);
         assert_eq!(j["queue"][1]["plan_state"], "next");
         assert_eq!(j["queue"][1]["gate"], "ramp");
         assert_eq!(j["queue"][1]["position"], 2);
         let text = render_queue(&r, now);
-        assert!(text.contains("Order: workspace_priority, then operator_priority"), "{text}");
+        assert!(text.contains("Order: level, then created_at"), "{text}");
         assert!(
             text.contains("Plan: 0 free of 2 slot(s), 1 admission(s)/tick, every 60s"),
             "{text}"

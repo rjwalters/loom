@@ -1,4 +1,4 @@
-//! Fixtures for #10060: direct-overlap edges, star-first ordering, and the
+//! Fixtures for #10060: direct-overlap edges, level-first ordering, and the
 //! stalled-head release + escalation.
 
 use std::collections::BTreeMap;
@@ -7,7 +7,7 @@ use super::super::{
     hold_action, plan_group, plan_repo_with, EdgeReason, SequenceGroup, SEQUENCE_LABEL,
 };
 use super::*;
-use crate::work_finder::OPERATOR_PRIORITY_LABEL;
+use crate::priority_pick::{IMPORTANT_LABEL, VERY_IMPORTANT_LABEL};
 
 const NOW: &str = "2026-10-03T12:00:00Z";
 const BOUND: f64 = 12.0;
@@ -177,21 +177,27 @@ fn a_ready_group_with_no_stalled_head_is_unchanged() {
     }
 }
 
-// --- Slice 2: star-first ordering ---------------------------------------
+// --- Slice 2: level-first ordering (#11510) -----------------------------
 
 #[test]
-fn a_starred_pr_is_ordered_ahead_of_an_unstarred_predecessor() {
-    // All approved: one readiness tier (#10371), so only the star reorders.
+fn a_higher_level_pr_is_ordered_ahead_of_a_lower_level_predecessor() {
+    // All approved: one readiness tier (#10371), so only the level reorders.
     let old = fresh(1, "2026-10-01T00:00:00Z", &[APPROVED_LABEL]);
     let mid = fresh(2, "2026-10-01T01:00:00Z", &[APPROVED_LABEL]);
-    let star = fresh(3, "2026-10-01T02:00:00Z", &[APPROVED_LABEL, OPERATOR_PRIORITY_LABEL]);
+    let star = fresh(3, "2026-10-01T02:00:00Z", &[APPROVED_LABEL, IMPORTANT_LABEL]);
+    let very = fresh(4, "2026-10-01T03:00:00Z", &[APPROVED_LABEL, VERY_IMPORTANT_LABEL]);
     let f = files(&[(1, &["s"]), (2, &["s"]), (3, &["s"])]);
     let prs = [old.clone(), mid.clone(), star.clone()];
     let g = &plan_repo_with(&prs, &f, &NONE, &BTreeSet::new())[0];
-    assert_eq!(g.order, vec![3, 1, 2], "star first, then oldest-first");
+    assert_eq!(g.order, vec![3, 1, 2], "important first, then oldest-first");
     assert_eq!(edges(g), vec![(1, 3), (2, 1)]);
 
-    // No star anywhere ⇒ the old oldest-first order.
+    // Very important goes before important.
+    let f4 = files(&[(1, &["s"]), (2, &["s"]), (3, &["s"]), (4, &["s"])]);
+    let four = [old.clone(), mid.clone(), star.clone(), very];
+    assert_eq!(plan_repo_with(&four, &f4, &NONE, &BTreeSet::new())[0].order, vec![4, 3, 1, 2]);
+
+    // No level anywhere ⇒ the old oldest-first order.
     let plain = [
         old.clone(),
         mid.clone(),
@@ -199,16 +205,16 @@ fn a_starred_pr_is_ordered_ahead_of_an_unstarred_predecessor() {
     ];
     assert_eq!(plan_repo_with(&plain, &f, &NONE, &BTreeSet::new())[0].order, vec![1, 2, 3]);
 
-    // A constraint edge beats the star: a trusted marker puts #3 after #1.
+    // A constraint edge beats the level: a trusted marker puts #3 after #1.
     let mut markers = NONE;
     markers.insert(3, marker_between(3, 1));
     assert_eq!(plan_repo_with(&prs, &f, &markers, &BTreeSet::new())[0].order, vec![1, 3, 2]);
 }
 
 #[test]
-fn a_stacked_base_beats_the_star() {
+fn a_stacked_base_beats_the_level() {
     let base = fresh(1, "2026-10-01T00:00:00Z", &[APPROVED_LABEL]);
-    let mut stacked = fresh(2, "2026-10-01T01:00:00Z", &[APPROVED_LABEL, OPERATOR_PRIORITY_LABEL]);
+    let mut stacked = fresh(2, "2026-10-01T01:00:00Z", &[APPROVED_LABEL, IMPORTANT_LABEL]);
     stacked.base_ref = base.head_ref.clone();
     let other = fresh(3, "2026-10-01T02:00:00Z", &[APPROVED_LABEL]);
     let f = files(&[(1, &["s"]), (2, &["s"]), (3, &["s"])]);
@@ -352,6 +358,10 @@ fn a_stalled_chain_escalates_once_naming_head_action_and_held_prs() {
     assert!(chain.needs_escalation());
     let body = chain.comment_body(BOUND);
     assert!(body.starts_with(&escalation_marker(&chain.key())), "{body}");
+    assert!(
+        !body.contains("operator-priority-escalation"),
+        "no star-liveness marker (#11104)"
+    );
     assert!(body.contains("**Operator needed**"), "{body}");
     assert!(body.contains("merge decision on #5"), "{body}");
     assert!(body.contains("#12") && body.contains("#11"), "{body}");
@@ -408,6 +418,20 @@ fn the_second_tick_posts_nothing() {
     assert_eq!(calls.matches("pr comment").count(), 1, "{calls}");
     // A held PR label alone never counts as an escalation.
     assert!(!already_escalated(&[SEQUENCE_LABEL.to_string()], chain));
+}
+
+/// #11104: a stall escalation posted before the marker rename (it carried the
+/// removed star-liveness prefix) still counts as posted, so nothing re-posts.
+#[test]
+fn a_pre_rename_legacy_marker_still_dedupes() {
+    let head = pr(5, "2026-09-30T00:00:00Z", "2026-10-01T00:00:00Z", &["loom:operator"]);
+    let mut ledger = StallLedger::default();
+    ledger.record(&head, &StallCause::HumanHold("loom:operator".into()), 36.0, 11, false);
+    let chain = &ledger.chains[0];
+    let legacy = format!("{LEGACY_MARKER_PREFIX}{} -->\nOperator needed", chain.key());
+    assert!(already_escalated(&[legacy], chain));
+    let other = format!("{LEGACY_MARKER_PREFIX}no-progress:issue-5 -->");
+    assert!(!already_escalated(&[other], chain), "another key is not this chain's");
 }
 
 /// A fake `gh` for the #10089 dedupe test: `api` reads answer from the

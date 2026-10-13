@@ -17,7 +17,7 @@ use super::*;
 use crate::epic_state::PhaseChild;
 use crate::epic_supervisor::{plan_epic_transition, EpicSnapshot, EpicTransition};
 use crate::label_registry::Registry;
-use crate::work_finder::operator_priority::{excluded_from_side_listing, merge_starred};
+use crate::work_finder::operator_priority::excluded_from_side_listing;
 
 const EPIC: &str = labels::EPIC_LABEL;
 const EPIC_PHASE: &str = "loom:epic-phase";
@@ -139,10 +139,9 @@ fn the_mechanical_capability_lane_cannot_dispatch_an_epic() {
 }
 
 #[test]
-fn a_starred_epic_is_still_dropped_from_the_side_listing() {
-    let starred_epic = WorkItem::new(20, vec![OPERATOR_PRIORITY_LABEL.to_string(), EPIC.into()]);
-    assert!(excluded_from_side_listing(&starred_epic));
-    assert!(merge_starred(vec![], vec![starred_epic]).is_empty());
+fn a_priority_epic_is_still_dropped_from_the_side_listing() {
+    let important_epic = WorkItem::new(20, vec!["loom:very-important".to_string(), EPIC.into()]);
+    assert!(excluded_from_side_listing(&important_epic));
 }
 
 #[test]

@@ -90,8 +90,15 @@ use crate::fleet_store::render::{self, Drift};
 use crate::fleet_store::roster::{self, Change, Plan, Registered};
 use crate::fleet_store::{self as store, StoreLocation};
 
+// `applied` is `pub` so the OTLP resource code and its tests reach
+// `applied_config_sha` / `AppliedSha` / `FLEET_CONFIG_SHA` via
+// `fleet_sync::applied::…` directly, without a top-level re-export, and so
+// the otlp-only consumers do not leave them dead in a non-otlp build (#11197).
+pub mod applied;
 pub mod checkout_ff;
 mod floor_knowledge;
+pub mod git_spawn_log;
+mod loom_ui;
 pub mod offline_floor;
 pub mod roster_clone;
 pub mod workspace_resync;
@@ -723,6 +730,7 @@ pub fn publish(status: &FleetSyncStatus) {
     if let Ok(mut guard) = cell().lock() {
         *guard = Some(status.clone());
     }
+    applied::record_pass(status);
     let Some(path) = status_path() else {
         return;
     };
@@ -820,6 +828,7 @@ pub fn clear_status() {
     if let Ok(mut guard) = cell().lock() {
         *guard = None;
     }
+    applied::clear();
     let Some(path) = status_path() else {
         return;
     };
@@ -1171,6 +1180,7 @@ fn report(status: &FleetSyncStatus, bus: Option<&crate::event_bus::EventBus>) {
         log::debug!("fleet_sync: {summary}");
     }
     roster_clone::announce(status, bus);
+    loom_ui::report(status); // #11295
     let (Some(bus), true) = (bus, status.drifted() || status.errored()) else {
         return;
     };

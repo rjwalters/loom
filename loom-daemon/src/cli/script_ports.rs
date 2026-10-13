@@ -487,6 +487,15 @@ pub(crate) enum ScriptPortCommand {
     /// shell-language policy and the #7810 shell-budget gate both send here.
     CheckGuardWiring(super::check_guard_wiring::CheckGuardWiringArgs),
 
+    /// CI gate (#8858): the private-control `POLICY` map in `bundle.rs` may only
+    /// change semantically together with a strictly greater `CONTROL_VERSION`,
+    /// measured against the merge base of `--base` and `--head` straight from
+    /// git objects (no network). Exit 1 on a violation or any missing ref /
+    /// malformed / duplicate / ambiguous declaration. New logic, not a shell port.
+    CheckPrivateControlVersion(
+        super::check_private_control_version::CheckPrivateControlVersionArgs,
+    ),
+
     /// The Renovate-side routing contract (#9418): every `labels` array in the
     /// repo's Renovate config (top-level, `packageRules`, `vulnerabilityAlerts`,
     /// `lockFileMaintenance`, …) contains `loom:review-requested`. Exit 1 on
@@ -518,15 +527,17 @@ pub(crate) enum ScriptPortCommand {
     #[command(subcommand)]
     ParkRecord(super::park_record::ParkRecordCommand),
 
-    /// Curator's `<!-- loom:points=<N> -->` estimate-marker validation
-    /// (#9056), backing `require-complexity-marker.sh`'s points-marker gate.
-    /// Reads the issue body on stdin — the same body the shell script's own
-    /// complexity-tier check already fetched, no second `gh` call. Not a
-    /// port of a whole script: the complexity-tier half of
-    /// `require-complexity-marker.sh` stays inline shell, unchanged; only the
-    /// new points check moved here, to keep the #7810 `shell-budget` gate a
-    /// non-event for this addition.
+    /// Validate the Curator's `<!-- loom:points=<N> -->` marker in one issue
+    /// body read from stdin (#9056). The gate itself, which also reads
+    /// trusted comments, is `loom-daemon curation-complete` (#11663).
     CheckPointsMarker(super::points_marker_check::CheckPointsMarkerArgs),
+
+    /// Per-agent-scope `MemoryMax` (MiB) sized from the repo's observed
+    /// `memory.peak` history (#11094), for `spawn-claude.sh`'s systemd
+    /// scope. Exit 0 = apply the MiB on stdout, 1 = no limit (an answer, not
+    /// an error), 3 = `--probe` found systemd rejects it. New logic behind a
+    /// `contract` script's name, so it lives here, not in the script.
+    RamScopeLimit(super::ram_scope_limit::RamScopeLimitArgs),
 
     /// Refuse content carrying a credential shape — a Claude OAuth/API key,
     /// GitHub/Tailscale/Slack token, AWS key id, private key — whatever its
@@ -618,6 +629,11 @@ pub(crate) enum ScriptPortCommand {
     /// `shell-budget`.
     #[command(subcommand)]
     MergeGroupCi(super::merge_group_ci_cmd::MergeGroupCiCommand),
+
+    /// Print this host's identity (#11530): `fleet.hostId` > `LOOM_HOST_ID` >
+    /// the persisted `~/.loom/host-id`, never the hostname. One line on
+    /// stdout, exit 0; exits non-zero (nothing on stdout) on `unknown-host`.
+    HostId(super::host_id_cmd::HostIdArgs),
 }
 
 impl ScriptPortCommand {
@@ -686,11 +702,13 @@ impl ScriptPortCommand {
             ScriptPortCommand::CheckStaleBlocked(args) => args.run(),
             ScriptPortCommand::GuardMcpTools(args) => args.run(),
             ScriptPortCommand::CheckGuardWiring(args) => args.run(),
+            ScriptPortCommand::CheckPrivateControlVersion(args) => args.run(),
             ScriptPortCommand::CheckRenovateLabels(args) => args.run(),
             ScriptPortCommand::Guards(cmd) => cmd.run(),
             ScriptPortCommand::PrLatency(args) => args.run(),
             ScriptPortCommand::ParkRecord(cmd) => cmd.run(),
             ScriptPortCommand::CheckPointsMarker(args) => args.run(),
+            ScriptPortCommand::RamScopeLimit(args) => args.run(),
             ScriptPortCommand::SecretScan(args) => args.run(),
             ScriptPortCommand::NotifyClearedBlockers(args) => args.run(),
             ScriptPortCommand::ReleaseStaleBlocked(args) => args.run(),
@@ -700,6 +718,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::ForgeProbe(args) => args.run(),
             ScriptPortCommand::ResyncPin(cmd) => cmd.run(),
             ScriptPortCommand::ResyncPayload(args) => args.run(),
+            ScriptPortCommand::HostId(args) => args.run(),
         }
     }
 }
@@ -1079,6 +1098,12 @@ pub(crate) enum MergePrCommand {
     /// `cli::merge_pr_retries_used`.
     RetriesUsed(super::merge_pr_retries_used::RetriesUsedArgs),
 
+    /// The already-merged / closed-unmerged terminal-state gate at the top of
+    /// `merge-pr.sh` (#8191 slice). One line `LOOM-PR-STATE MERGED|CLOSED|OPEN`,
+    /// exit 0; the shell acts only on MERGED/CLOSED and proceeds otherwise —
+    /// see `cli::merge_pr_pr_state`.
+    PrState(super::merge_pr_pr_state::PrStateArgs),
+
     /// The wait-or-timeout decision for `--auto`'s unfetchable-check-runs and
     /// pending-checks poll arms (#8191 slice): one `LOOM-POLL-WAIT
     /// <WAIT|TIMEOUT> <level> <message>` line, exit 0; the shell keeps the
@@ -1142,6 +1167,7 @@ impl MergePrCommand {
             MergePrCommand::RemoveGate(args) => args.run(),
             MergePrCommand::DiscoveredWorktree(args) => args.run(),
             MergePrCommand::RetriesUsed(args) => args.run(),
+            MergePrCommand::PrState(args) => args.run(),
             MergePrCommand::PollWait(args) => args.run(),
             MergePrCommand::RevalidateHead(args) => args.run(),
             MergePrCommand::CleanupPaths(args) => args.run(),

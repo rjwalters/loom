@@ -1,6 +1,7 @@
 //! Dispatch ordering: cross-repo workspace priority (#3946) and the
 //! priority level (#11103, re-keyed by #11508: level, oldest, number; the
-//! star, starred-at and red-main-fix keys are gone). Moved out of
+//! star and starred-at keys are gone). #11547 restored a leading verified
+//! red-main-fix key, live only while the repo's `main` is verified red. Moved out of
 //! `work_finder/tests.rs`, which is size-frozen.
 
 use super::*;
@@ -75,14 +76,14 @@ fn very_important_in_a_priority_100_repo_beats_a_priority_0_repo() {
 
 #[test]
 fn two_important_issues_order_by_age() {
-    // Two issues at the same level order oldest `createdAt` first; a legacy
-    // star on the newest changes nothing (#11508).
+    // Issues at the same level order oldest `createdAt` first; an older
+    // issue with no level still goes after them.
     let mut multi = vec![(
         FakeSource::once(vec![
             labelled_at(2, "loom:important", "2026-01-01T00:00:00Z"),
             labelled_at(1, "loom:important", "2020-01-01T00:00:00Z"),
             labelled_at(3, "loom:important", "2019-08-01T00:00:00Z"),
-            labelled_at(4, OPERATOR_PRIORITY_LABEL, "2010-01-01T00:00:00Z"),
+            issue_at(4, "2010-01-01T00:00:00Z"),
         ]),
         RecordingDispatcher::default(),
     )];
@@ -125,12 +126,12 @@ fn test_tick_multi_missing_priority_entry_defaults() {
 fn single_workspace_tick_moves_important_first_then_oldest_first() {
     // #11103: the single-workspace tick uses the in-workspace order — level,
     // oldest `createdAt`, number — not the listing order (newest-first
-    // here). The legacy star (#8) is a plain issue since #11508.
+    // here).
     let mut source = FakeSource::once(vec![
         issue_at(3, "2026-03-01T00:00:00Z"),
         issue_at(1, "2026-01-01T00:00:00Z"),
         labelled_at(9, "loom:important", "2026-09-01T00:00:00Z"),
-        labelled_at(8, OPERATOR_PRIORITY_LABEL, "2026-08-01T00:00:00Z"),
+        issue_at(8, "2026-08-01T00:00:00Z"),
         issue_at(2, "2026-02-01T00:00:00Z"),
     ]);
     let mut dispatcher = RecordingDispatcher::default();
@@ -145,8 +146,43 @@ fn single_workspace_tick_moves_important_first_then_oldest_first() {
     assert_eq!(dispatcher.dispatched, vec![4, 5, 6]);
 }
 
-/// AC (#11508): `candidate_cmp`'s keys are exactly level -> created_at ->
-/// number, over a fixed fixture. Workspace priority is not a key.
+/// #11547: on a verified-red repo the single-workspace tick dispatches the
+/// marker-bearing fix first, ahead of `loom:important`; on a green repo the
+/// marker grants nothing and the fix keeps its level/age place.
+#[test]
+fn single_workspace_tick_moves_a_red_main_fix_first_only_while_main_is_red() {
+    let red = RedMainLane {
+        verified_red: true,
+        gate_disabled: false,
+        other_hold: false,
+    };
+    let fix = WorkItem::with_created_at(
+        9,
+        vec!["loom:issue".into()],
+        Some("2026-09-01T00:00:00Z".into()),
+    )
+    .with_body(Some("Fixes red main.\n\n<!-- loom:main-red-fix -->\n".into()));
+    let items = || {
+        vec![
+            issue_at(1, "2026-01-01T00:00:00Z"),
+            labelled_at(5, "loom:important", "2026-05-01T00:00:00Z"),
+            fix.clone(),
+        ]
+    };
+    for (lane, want) in [
+        (red, vec![9, 5, 1]),
+        (RedMainLane::default(), vec![5, 1, 9]),
+    ] {
+        let mut dispatcher = RecordingDispatcher::default();
+        let src = &mut FakeSource::once(items());
+        tick_with_lanes(src, &mut dispatcher, (10.into(), usize::MAX), false, false, lane).unwrap();
+        assert_eq!(dispatcher.dispatched, want, "{lane:?}");
+    }
+}
+
+/// AC (#11508, #11547): `candidate_cmp`'s keys are exactly main_red_fix ->
+/// level -> created_at -> number, over a fixed fixture. Workspace priority
+/// is not a key.
 #[test]
 fn test_candidate_cmp_ordering() {
     use crate::priority_pick::Level;
@@ -195,4 +231,36 @@ fn test_candidate_cmp_ordering() {
     fixture.sort_by(candidate_cmp);
     let numbers: Vec<u32> = fixture.iter().map(|c| c.number).collect();
     assert_eq!(numbers, vec![99, 5, 1, 80, 2, 1]);
+
+    // 6. #11547: a verified red-main fix (default level, newest) sorts ahead
+    //    of an older very-important candidate.
+    let red_fix = PriorityCandidate {
+        main_red_fix: true,
+        ..mk(Level::Default, Some("2026-09-01T00:00:00Z"), 200)
+    };
+    let older_vi = mk(Level::VeryImportant, Some("2020-01-01T00:00:00Z"), 3);
+    assert_eq!(candidate_cmp(&red_fix, &older_vi), Ordering::Less);
+
+    // 7. Green main: a marker-bearing item keyed with `repo_red = false` has
+    //    `main_red_fix == false` and sorts exactly as an unmarked one.
+    let marked = WorkItem::with_created_at(
+        200,
+        vec!["loom:issue".into()],
+        Some("2026-09-01T00:00:00Z".into()),
+    )
+    .with_body(Some("<!-- loom:main-red-fix -->".into()));
+    let green = ready_queue::key_of(0, 0, &marked, false);
+    assert!(!green.main_red_fix);
+    assert_eq!(candidate_cmp(&green, &older_vi), Ordering::Greater);
+    let plain_200 = mk(Level::Default, Some("2026-09-01T00:00:00Z"), 200);
+    let others = [
+        older_vi,
+        mk(Level::Important, Some("2026-10-01T00:00:00Z"), 4),
+        mk(Level::Default, Some("2020-01-01T00:00:00Z"), 80),
+        mk(Level::Default, None, 1),
+    ];
+    for other in &others {
+        assert_eq!(candidate_cmp(&green, other), candidate_cmp(&plain_200, other));
+    }
+    assert!(ready_queue::key_of(0, 0, &marked, true).main_red_fix);
 }

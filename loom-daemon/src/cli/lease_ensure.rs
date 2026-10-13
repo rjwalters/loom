@@ -367,6 +367,10 @@ impl LeaseEnsureArgs {
         let line = outcome.describe(self.issue);
         eprintln!("lease ensure: {line}");
         deferred::record(&self.workspace, self.issue, &line);
+        if let Outcome::Renewing { sweep_id, .. } = &outcome {
+            // #11563: an in-session sweep is an operator-origin sweep.start.
+            super::presence::on_lease_published(&self.workspace, self.issue, sweep_id);
+        }
         // #10570: a declined publish used to be final, so a claim made while a
         // released sweep's lease was still inside its TTL never got a lease of
         // its own and was reclaimed once that leftover aged out.
