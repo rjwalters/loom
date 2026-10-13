@@ -8,19 +8,19 @@
 //! 1. each workspace's candidates are put in their in-workspace order —
 //!    verified red-main fix first (#11547), then level, then oldest
 //!    `createdAt`, then issue number ([`crate::priority_pick::issue_cmp`]);
-//! 2. a workspace is drawn among those with candidates left, weighted by its
-//!    `fleet_priority` ([`crate::priority_pick::softmax_weight`], a softmax at
-//!    the tick's [`draw_temperature`], #11684); a
-//!    workspace whose next candidate is a verified red-main fix wins the
-//!    draw, else one whose next candidate is `loom:very-important` (the draw
-//!    is among just those when several qualify);
+//! 2. a workspace is drawn among those with candidates left, with
+//!    probability w / Σw ([`crate::priority_pick::draw_workspace`], #11742):
+//!    w is its roster `weight` plus the tick's [`weight_bonus`] points while
+//!    its remaining candidates include a verified red-main fix,
+//!    `loom:very-important` work or `loom:important` work. No tier wins
+//!    outright;
 //! 3. the drawn workspace's next candidate is appended, and the draw repeats
 //!    until every candidate is placed.
 //!
 //! The RNG is seeded once per tick ([`tick_seed`]) from the wall-clock
 //! minute and the host id ([`minute_seed`], #11683); the seed, its inputs and
-//! every draw (candidates, weights, temperature, `p_min`, roll, pick) are kept
-//! on the [`TickReport`] and exported in `pick.decision`, so the logged
+//! every draw (candidates, base weights, bonuses, roll, pick) are kept on the
+//! [`TickReport`] and exported in `pick.decision`, so the logged
 //! `(minute, host)` alone reproduces the exact order.
 //!
 //! The level is the issue's own `loom:important` / `loom:very-important`
@@ -28,11 +28,12 @@
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::atomic::AtomicU32;
 
 use super::{PriorityCandidate, TickReport};
-use crate::priority_pick::{self, IssueKey, Level, PickRng, WorkspaceDraw, WorkspaceEntry};
-use crate::workspace_registry::DEFAULT_WORKSPACE_PRIORITY;
+use crate::priority_pick::{
+    self, IssueKey, Level, PickRng, WeightBonus, WorkspaceDraw, WorkspaceEntry,
+};
+use crate::workspace_registry::DEFAULT_WORKSPACE_WEIGHT;
 
 /// At most this many draws are kept per tick (the first ones, which decide
 /// the slots); [`DrawLog::draws_total`] carries the uncapped count.
@@ -106,15 +107,16 @@ pub fn in_workspace_cmp(a: &PriorityCandidate, b: &PriorityCandidate) -> std::cm
 }
 
 /// `candidates` in draw order (see the module docs), plus the draw log
-/// (`None` when there was nothing to draw). `priorities[i]` is workspace
-/// `i`'s `fleet_priority`; a missing entry is the default. Every draw weighs
-/// at `temperature` (#11684).
+/// (`None` when there was nothing to draw). `weights[i]` is workspace `i`'s
+/// roster `weight`; a missing entry is [`DEFAULT_WORKSPACE_WEIGHT`]. Every
+/// draw adds `bonus` (#11742). A workspace of weight 0 is never drawn, so its
+/// candidates are left out of the order.
 #[must_use]
 pub fn draw_order(
     candidates: Vec<PriorityCandidate>,
-    priorities: &[u32],
+    weights: &[u32],
     seed: u64,
-    temperature: u32,
+    bonus: &WeightBonus,
 ) -> (Vec<PriorityCandidate>, Option<DrawLog>) {
     let mut queues: BTreeMap<usize, VecDeque<PriorityCandidate>> = BTreeMap::new();
     for c in candidates {
@@ -129,19 +131,19 @@ pub fn draw_order(
     loop {
         let entries: Vec<WorkspaceEntry> = queues
             .iter()
-            .filter_map(|(idx, q)| {
-                q.front().map(|next| WorkspaceEntry {
-                    workspace: workspace_key(*idx),
-                    priority: priorities
-                        .get(*idx)
-                        .copied()
-                        .unwrap_or(DEFAULT_WORKSPACE_PRIORITY),
-                    has_very_important: next.level == Level::VeryImportant,
-                    has_red_main_fix: next.main_red_fix,
-                })
+            .filter(|(_, q)| !q.is_empty())
+            .map(|(idx, q)| WorkspaceEntry {
+                workspace: workspace_key(*idx),
+                weight: weights
+                    .get(*idx)
+                    .copied()
+                    .unwrap_or(DEFAULT_WORKSPACE_WEIGHT),
+                has_red_main_fix: q.iter().any(|c| c.main_red_fix),
+                has_very_important: q.iter().any(|c| c.level == Level::VeryImportant),
+                has_important: q.iter().any(|c| c.level == Level::Important),
             })
             .collect();
-        let Some(draw) = priority_pick::draw_workspace(&entries, temperature, &mut rng) else {
+        let Some(draw) = priority_pick::draw_workspace(&entries, bonus, &mut rng) else {
             break;
         };
         let Some((idx, c)) = workspace_idx(&draw.picked).and_then(|idx| {
@@ -170,17 +172,17 @@ pub fn draw_order(
     (order, log)
 }
 
-/// Put the tick's candidates in draw order, seeded by [`tick_seed`] and
-/// weighted at [`draw_temperature`], and keep the draw log on `report`. The
+/// Put the tick's candidates in draw order, seeded by [`tick_seed`] with the
+/// [`weight_bonus`] in force, and keep the draw log on `report`. The
 /// multi-workspace tick's one call site.
 #[must_use]
 pub fn order(
     candidates: Vec<PriorityCandidate>,
-    priorities: &[u32],
+    weights: &[u32],
     report: &mut TickReport,
 ) -> Vec<PriorityCandidate> {
     let (seed, inputs) = tick_seed();
-    let (ordered, mut log) = draw_order(candidates, priorities, seed, draw_temperature());
+    let (ordered, mut log) = draw_order(candidates, weights, seed, &weight_bonus());
     if let Some(log) = log.as_mut() {
         log.seed_inputs = inputs;
     }
@@ -188,44 +190,58 @@ pub fn order(
     ordered
 }
 
-/// The process's current draw temperature (`dispatch.drawTemperature`,
-/// #11684). Published once per tick by the work-finder loop's config reload
+/// The process's current weight bonuses (`dispatch.weightBonus*`, #11742).
+/// Published once per tick by the work-finder loop's config reload
 /// ([`super::ConfiguredMaxReloader::refresh`]) so a committed-config or
 /// `LOOM_HYPERPARAMS` edit applies on the next tick without a restart, and
 /// read by [`order`]. A process global rather than a tick argument because
 /// the tick entry points live in the size-frozen `work_finder.rs`.
 #[cfg(not(test))]
-static DRAW_TEMPERATURE: AtomicU32 = AtomicU32::new(priority_pick::DEFAULT_DRAW_TEMPERATURE);
+static WEIGHT_BONUS: std::sync::Mutex<WeightBonus> = std::sync::Mutex::new(WeightBonus {
+    red_main_fix: priority_pick::DEFAULT_BONUS_RED_MAIN_FIX,
+    very_important: priority_pick::DEFAULT_BONUS_VERY_IMPORTANT,
+    important: priority_pick::DEFAULT_BONUS_IMPORTANT,
+});
 
 #[cfg(test)]
 thread_local! {
-    /// Under `cfg(test)` the temperature is per thread, so a test that
-    /// publishes one cannot change the draws of a tick another test runs
+    /// Under `cfg(test)` the bonuses are per thread, so a test that
+    /// publishes some cannot change the draws of a tick another test runs
     /// concurrently (the same isolation [`with_seed`] gives the seed).
-    static DRAW_TEMPERATURE: AtomicU32 =
-        const { AtomicU32::new(priority_pick::DEFAULT_DRAW_TEMPERATURE) };
+    static WEIGHT_BONUS: Cell<WeightBonus> = Cell::new(WeightBonus::default());
 }
 
-#[cfg(not(test))]
-fn temperature_cell<R>(f: impl FnOnce(&AtomicU32) -> R) -> R {
-    f(&DRAW_TEMPERATURE)
-}
-
-#[cfg(test)]
-fn temperature_cell<R>(f: impl FnOnce(&AtomicU32) -> R) -> R {
-    DRAW_TEMPERATURE.with(f)
-}
-
-/// The draw temperature the next tick uses.
+/// The weight bonuses the next tick uses.
 #[must_use]
-pub fn draw_temperature() -> u32 {
-    temperature_cell(|t| t.load(std::sync::atomic::Ordering::Relaxed))
+pub fn weight_bonus() -> WeightBonus {
+    #[cfg(not(test))]
+    {
+        *WEIGHT_BONUS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    #[cfg(test)]
+    {
+        WEIGHT_BONUS.with(Cell::get)
+    }
 }
 
-/// Publish the draw temperature for the next tick; `0` is stored as `1`.
-/// Returns the previous value, so a caller can log a transition.
-pub fn set_draw_temperature(temperature: u32) -> u32 {
-    temperature_cell(|t| t.swap(temperature.max(1), std::sync::atomic::Ordering::Relaxed))
+/// Publish the weight bonuses for the next tick. Returns the previous value,
+/// so a caller can log a transition.
+pub fn set_weight_bonus(bonus: WeightBonus) -> WeightBonus {
+    #[cfg(not(test))]
+    {
+        std::mem::replace(
+            &mut *WEIGHT_BONUS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            bonus,
+        )
+    }
+    #[cfg(test)]
+    {
+        WEIGHT_BONUS.with(|c| c.replace(bonus))
+    }
 }
 
 thread_local! {

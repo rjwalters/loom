@@ -164,13 +164,13 @@ fn host_health() -> TelemetryRecord {
             ManagedRepoEntry {
                 slug: "rjwalters/loom".to_string(),
                 visibility: RepoVisibility::Public,
-                priority: Some(0),
+                weight: Some(0),
                 stale_blocked_release: None,
             },
             ManagedRepoEntry {
                 slug: "2AMLogic/gf180-pll".to_string(),
                 visibility: RepoVisibility::Private,
-                priority: None,
+                weight: None,
                 stale_blocked_release: None,
             },
         ],

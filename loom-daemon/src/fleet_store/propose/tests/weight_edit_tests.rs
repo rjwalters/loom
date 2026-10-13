@@ -9,7 +9,7 @@ repos:
   - name: app
     dir: app
     fleet: true
-    fleet_priority: 5   # why 5
+    weight: 5   # why 5
   - name: infra
     dir: infra
     fleet: true
@@ -21,21 +21,21 @@ state:
 ";
 
 #[test]
-fn updates_an_existing_fleet_priority_in_place() {
+fn updates_an_existing_weight_in_place() {
     let out = edit(SAMPLE, "app", 20).unwrap();
-    let expected = SAMPLE.replace("fleet_priority: 5 ", "fleet_priority: 20 ");
+    let expected = SAMPLE.replace("weight: 5 ", "weight: 20 ");
     assert_eq!(out, expected);
 }
 
 #[test]
-fn inserts_fleet_priority_when_the_record_has_none() {
+fn inserts_weight_when_the_record_has_none() {
     let out = edit(SAMPLE, "infra", 7).unwrap();
     assert!(out.contains(
         "  - name: infra\n    dir: infra\n    fleet: true\n    firewall: false\n    \
-         fleet_priority: 7\n\nstate:\n"
+         weight: 7\n\nstate:\n"
     ));
     // The other record, and everything else, is untouched.
-    assert!(out.contains("fleet_priority: 5   # why 5"));
+    assert!(out.contains("weight: 5   # why 5"));
 }
 
 #[test]

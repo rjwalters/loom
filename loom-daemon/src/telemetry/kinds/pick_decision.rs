@@ -242,21 +242,26 @@ pub struct PickSkip {
 pub struct PickDrawCandidate {
     /// Forge `owner/repo`, or `repo_unresolved`.
     pub repo: String,
-    /// Its draw weight (from the workspace's `fleet_priority`). Relative:
-    /// only `weight / total_weight` is meaningful. Since #11684 it is a
-    /// softmax weight on a 1,000,000 scale, relative to the draw's `p_min`,
-    /// so one workspace's raw weight varies between draws.
+    /// Its effective draw weight: `base_weight + bonus` (#11742). The draw
+    /// picked it with probability `weight / total_weight`. (Records from
+    /// before #11742 carry a softmax weight here, on a 1,000,000 scale.)
     pub weight: u64,
+    /// The workspace's roster `weight` (#11742). Absent on older records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_weight: Option<u32>,
+    /// The bonus points it earned for a verified red-main fix,
+    /// `loom:very-important` or `loom:important` work (#11742). Absent on
+    /// older records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bonus: Option<u64>,
 }
 
 /// One weighted workspace draw of the work finder (#11103).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PickDraw {
-    /// `red-main-fix` when only workspaces whose next candidate is a verified
-    /// red-main fix were drawn over (#11547), else `very-important` when only
-    /// workspaces with `loom:very-important` work next were, `all` otherwise.
-    pub pool: String,
-    /// The workspaces drawn over, with weights.
+    /// The workspaces drawn over, with weights. (Records from before #11742
+    /// also carry a `pool` tier and a `p_min`; both are retired and ignored
+    /// when read.)
     pub candidates: Vec<PickDrawCandidate>,
     /// Sum of the weights.
     pub total_weight: u64,
@@ -266,10 +271,6 @@ pub struct PickDraw {
     pub picked: String,
     /// The issue the draw placed next in the dispatch order.
     pub number: u32,
-    /// The smallest `fleet_priority` in the pool: the workspace weighing the
-    /// full scale (#11684). Absent on records from before #11684.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub p_min: Option<u32>,
 }
 
 /// The work finder's workspace draws for one tick (#11103): enough to replay
@@ -297,11 +298,6 @@ pub struct PickWorkspaceDraw {
     /// `host`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed_host: Option<String>,
-    /// The softmax temperature every draw of the tick weighed at
-    /// (`dispatch.drawTemperature`, #11684). Per tick, like `seed`, and
-    /// repeated on every chunk like it. Absent on records from before #11684.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<u32>,
 }
 
 /// A `loom:very-important` issue the flood cap ranked as `loom:important`
@@ -586,7 +582,6 @@ pub fn split_into_chunks(record: PickDecisionRecord, max_bytes: usize) -> Vec<Pi
                     seed_scheme: None,
                     seed_minute: None,
                     seed_host: None,
-                    temperature: None,
                 })
                 .draws
                 .push(d),

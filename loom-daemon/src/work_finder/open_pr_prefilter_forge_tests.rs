@@ -311,7 +311,7 @@ fn closing(repo: &str, number: u32, issue: u32) -> Row {
 
 fn tick_one<D: WorkDispatcher>(disp: D, numbers: &[u32], cap: usize) -> (TickReport, D) {
     let mut multi = vec![(source(numbers), disp)];
-    let report = tick_multi(&mut multi, &[100], cap, &[false]);
+    let report = tick_multi(&mut multi, &[1], cap, &[false]);
     let (_, disp) = multi.remove(0);
     (report, disp)
 }

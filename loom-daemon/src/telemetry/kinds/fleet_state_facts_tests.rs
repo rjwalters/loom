@@ -25,6 +25,7 @@ fn halt_reason_vocabulary_is_the_halt_causes_plus_unknown() {
             "daemon_too_old",
             "maintain_only",
             "disk_reservation",
+            "weight_zero",
             "unknown",
         ]
     );

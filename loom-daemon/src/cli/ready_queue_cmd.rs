@@ -253,10 +253,10 @@ fn render_row(row: &ReadyQueueRow) -> String {
         .map(|d| format!(" ({d})"))
         .unwrap_or_default();
     format!(
-        "  {:>3}. {repo}#{:<6} p{:<3} {:<20} {}{detail}{flags}\n",
+        "  {:>3}. {repo}#{:<6} w{:<3} {:<20} {}{detail}{flags}\n",
         row.rank,
         row.issue,
-        row.workspace_priority,
+        row.workspace_weight,
         plan_column(row),
         row.disposition.reason(),
     )
@@ -287,7 +287,7 @@ mod tests {
             rank,
             repo: "/src/loom".into(),
             issue,
-            workspace_priority: 100,
+            workspace_weight: 100,
             urgent: false,
             level: if rank == 1 {
                 loom_daemon::priority_pick::Level::VeryImportant
@@ -422,7 +422,7 @@ mod tests {
             position: Some(1),
             plan_state: PlanState::Running,
             keys: vec![PlanKey {
-                name: "workspace_priority".into(),
+                name: "workspace_weight".into(),
                 value: serde_json::json!(100),
             }],
             ..RowPlan::default()
@@ -434,7 +434,7 @@ mod tests {
             ..RowPlan::default()
         };
         // Row keys alone are enough to name the ordering.
-        assert_eq!(queue_json(&r, now)["ordering"], serde_json::json!(["workspace_priority"]));
+        assert_eq!(queue_json(&r, now)["ordering"], serde_json::json!(["workspace_weight"]));
 
         let tick = r.last_work_finder_tick.as_mut().unwrap();
         tick.plan = Some(DispatchPlanContext {

@@ -1,7 +1,7 @@
 //! Purely-local workspace-registry refresh for the multi-workspace tick loop
 //! (issue #8121).
 //!
-//! `loom-daemon workspace add <path> --priority N` writes the machine-level
+//! `loom-daemon workspace add <path> --weight N` writes the machine-level
 //! registry (`~/.loom/workspaces.json`) and reports success immediately, but
 //! the daemon only *acts* on that write when its tick loop reloads the
 //! registry and provisions the new root's
@@ -42,7 +42,7 @@ use crate::workspace_registry::{filter_missing_roots, WorkspaceRegistry};
 /// tick loop MUST call this **before** the rate-limit circuit breaker's
 /// early-`continue`: prior to #8121 the registry reload (and therefore
 /// provisioning) sat after that check, so `loom-daemon workspace add <path>
-/// --priority N` — which writes the registry unconditionally and reports
+/// --weight N` — which writes the registry unconditionally and reports
 /// success immediately — could sit un-provisioned (invisible to `loom-daemon
 /// status` and dispatch) for the breaker's entire suppression window, even
 /// though nothing about a registry edit touches the GitHub API budget the

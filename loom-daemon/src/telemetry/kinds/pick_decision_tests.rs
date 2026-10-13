@@ -182,24 +182,23 @@ fn a_busy_tick_splits_into_bounded_chunks_and_reassembles_exactly() {
         draws_total: 400,
         draws: (0..400)
             .map(|d| PickDraw {
-                pool: "all".to_string(),
                 candidates: (0..60)
                     .map(|w| PickDrawCandidate {
                         repo: format!("org-{w}/workspace-{w}"),
                         weight: 1000 + w,
+                        base_weight: None,
+                        bonus: None,
                     })
                     .collect(),
                 total_weight: 60 * 1000,
                 roll: d,
                 picked: "org-0/workspace-0".to_string(),
                 number: u32::try_from(100_000 + d).unwrap(),
-                p_min: Some(12),
             })
             .collect(),
         seed_scheme: None,
         seed_minute: None,
         seed_host: None,
-        temperature: Some(80),
     });
     let whole_len = serde_json::to_string(&record).unwrap().len();
     assert!(whole_len > CHUNK_BYTES, "a busy tick is {whole_len} bytes");
@@ -279,22 +278,21 @@ fn draws_split_in_order_with_their_totals_on_every_chunk() {
             draws_total: 7,
             draws: (0u32..7)
                 .map(|d| PickDraw {
-                    pool: "all".to_string(),
                     candidates: vec![PickDrawCandidate {
                         repo: format!("o/w{d}"),
                         weight: u64::from(10 + d),
+                        base_weight: None,
+                        bonus: None,
                     }],
                     total_weight: u64::from(10 + d),
                     roll: u64::from(d),
                     picked: format!("o/w{d}"),
                     number: d,
-                    p_min: None,
                 })
                 .collect(),
             seed_scheme: Some("loom-draw/v1".to_string()),
             seed_minute: Some("29000000".to_string()),
             seed_host: Some("host-a".to_string()),
-            temperature: None,
         }),
     );
     let chunks = split_into_chunks(record.clone(), 900);

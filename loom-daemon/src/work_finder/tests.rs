@@ -364,7 +364,7 @@ fn tick_skips_a_tracking_parent_with_open_sub_issues() {
     assert_eq!(dispatcher.dispatch_attempts, vec![31, 32]);
 
     let mut workspaces = vec![(FakeSource::once(rows()), RecordingDispatcher::default())];
-    let report = tick_multi(&mut workspaces, &[0], 10, &[false]);
+    let report = tick_multi(&mut workspaces, &[1], 10, &[false]);
     assert_eq!((report.dispatched, report.skipped_labeled), (2, 1));
     assert_eq!(workspaces[0].1.dispatch_attempts, vec![31, 32]);
 }
@@ -386,7 +386,7 @@ fn tick_multi_with_saturation_brake_is_a_sharding_noop() {
     ];
     let report = tick_multi_with_saturation_brake(
         &mut workspaces,
-        &[0, 0],
+        &[1, 1],
         10,
         &[false, false],
         usize::MAX,
@@ -1693,7 +1693,7 @@ fn test_tick_multi_sums_collision_totals() {
             },
         ),
     ];
-    let report = tick_multi(&mut multi, &[0, 0], 10, &[false, false]);
+    let report = tick_multi(&mut multi, &[1, 1], 10, &[false, false]);
     assert_eq!(report.collisions, 7, "collision totals summed across workspaces");
 }
 
@@ -1943,7 +1943,7 @@ fn test_tick_multi_park_label_refusal_counts_as_labeled_skip() {
         ),
         (FakeSource::once(vec![issue(2)]), RecordingDispatcher::default()),
     ];
-    let report = tick_multi(&mut multi, &[0, 0], 10, &[false, false]);
+    let report = tick_multi(&mut multi, &[1, 1], 10, &[false, false]);
 
     assert_eq!(report.skipped_labeled, 1);
     assert_eq!(report.errors, 0);
@@ -2209,7 +2209,7 @@ fn test_tick_multi_existing_occupancy_is_summed_globally() {
             },
         ),
     ];
-    let report = tick_multi(&mut multi, &[], 4, &[false, false]);
+    let report = tick_multi(&mut multi, &[1000, 1], 4, &[false, false]);
     assert_eq!(report.dispatched, 1, "3 in-flight + cap 4 ⇒ 1 free slot globally");
     assert_eq!(report.deferred_capacity, 3);
     // The single free slot goes to the first workspace's first ready issue.
@@ -2799,7 +2799,7 @@ fn tick_multi_with_two_hosts_only_the_matching_one_claims_the_pinned_issue() {
             },
         ),
     ];
-    let report = tick_multi(&mut workspaces, &[0, 0], 10, &[false, false]);
+    let report = tick_multi(&mut workspaces, &[1, 1], 10, &[false, false]);
 
     assert_eq!(report.dispatched, 1, "exactly one of the two hosts claims it");
     assert_eq!(report.skipped_host_constraint, 1, "the other host skips it");
@@ -2988,7 +2988,7 @@ fn test_tick_multi_capability_declaration_is_per_workspace() {
             RecordingDispatcher::default(),
         ),
     ];
-    let report = tick_multi(&mut workspaces, &[0, 0], 10, &[false, false]);
+    let report = tick_multi(&mut workspaces, &[1, 1], 10, &[false, false]);
 
     assert_eq!(report.dispatched, 1);
     assert_eq!(report.skipped_labeled, 1);
@@ -3020,7 +3020,7 @@ fn test_tick_multi_skips_issue_with_per_workspace_extra_skip_label() {
             RecordingDispatcher::default(),
         ),
     ];
-    let report = tick_multi(&mut workspaces, &[0, 0], 10, &[false, false]);
+    let report = tick_multi(&mut workspaces, &[1, 1], 10, &[false, false]);
 
     assert_eq!(report.skipped_labeled, 1, "only workspace A's #1 is skipped");
     assert_eq!(report.dispatched, 1, "workspace B's #1 still dispatches");

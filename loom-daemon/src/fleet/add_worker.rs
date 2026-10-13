@@ -118,9 +118,9 @@ pub struct AddWorkerConfig {
     /// Workspace repos to clone + register on the worker (`owner/name`). At
     /// least one is required.
     pub repos: Vec<String>,
-    /// Cross-repo dispatch priority the workspaces are registered at (#3946;
-    /// lower = higher priority).
-    pub priority: u32,
+    /// Cross-repo draw weight the workspaces are registered at (#11742;
+    /// higher = more draws).
+    pub weight: u32,
     /// Print the ordered plan without contacting the host.
     pub dry_run: bool,
     /// Upstream Loom repo URL to clone on the worker.
@@ -703,9 +703,9 @@ pub fn build_plan_with_policy(
     // 7. Register workspaces in the machine-level registry (idempotent).
     plan.push_step(Step::new(
         "workspace-register",
-        &format!("loom-daemon workspace add each repo (priority {})", config.priority),
+        &format!("loom-daemon workspace add each repo (weight {})", config.weight),
         Some(render_workspace_register_check(&config.repos)),
-        render_workspace_register(&config.repos, config.priority),
+        render_workspace_register(&config.repos, config.weight),
     ));
 
     // 8. Start the daemon under a systemd --user unit (Restart=always, linger).
@@ -912,7 +912,7 @@ fn build_worker_record(
     WorkerRecord {
         ssh_host: config.ssh_host.clone(),
         repos: config.repos.clone(),
-        priority: config.priority,
+        weight: config.weight,
         bootstrapped_at: now_str.clone(),
         last_verify: verify_ok.map(|ok| VerifyResult {
             ok,
@@ -1238,7 +1238,7 @@ fn render_workspace_register_check(repos: &[String]) -> String {
     s
 }
 
-fn render_workspace_register(repos: &[String], priority: u32) -> String {
+fn render_workspace_register(repos: &[String], weight: u32) -> String {
     let export_line = path_bootstrap::canonical_path_export_line();
     let mut s = format!(
         r#"set -e
@@ -1246,7 +1246,7 @@ fn render_workspace_register(repos: &[String], priority: u32) -> String {
     );
     for repo in repos {
         let rel = workspace_rel(repo);
-        s.push_str(&format!("loom-daemon workspace add \"$HOME/{rel}\" --priority {priority}\n"));
+        s.push_str(&format!("loom-daemon workspace add \"$HOME/{rel}\" --weight {weight}\n"));
     }
     s
 }

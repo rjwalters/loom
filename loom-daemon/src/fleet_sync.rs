@@ -451,7 +451,7 @@ pub fn summarize_roster(
 
 /// Apply one planned change to the machine-level workspace registry at
 /// `registry_path` — the same registry `loom-daemon workspace add/remove/
-/// set-priority` edits, through the same [`crate::workspace_registry`] methods
+/// set-weight` edits, through the same [`crate::workspace_registry`] methods
 /// those verbs use. Loads and saves per change so a mid-plan failure leaves the
 /// earlier changes durably applied, exactly as the CLI's per-verb loop does.
 pub fn apply_change(registry_path: &Path, change: &Change) -> Result<()> {
@@ -464,17 +464,17 @@ pub fn apply_change(registry_path: &Path, change: &Change) -> Result<()> {
     let changed = match change {
         Change::Add {
             path,
-            priority,
+            weight,
             maintain_only,
             ..
         } => {
             let claude_state = crate::terminal::claude_config_state_path();
-            registry.add_and_trust(path, None, *priority, &claude_state)?;
+            registry.add_and_trust(path, None, *weight, &claude_state)?;
             registry.set_maintain_only(path, mode(*maintain_only), Utc::now());
             true
         }
         Change::Remove { path, .. } => registry.remove(path),
-        Change::SetPriority { path, to, .. } => registry.set_priority(path, *to),
+        Change::SetWeight { path, to, .. } => registry.set_weight(path, *to),
         Change::SetMaintainOnly { path, to, .. } => registry
             .set_maintain_only(path, mode(*to), Utc::now())
             .unwrap_or(false),
@@ -1086,7 +1086,7 @@ fn roster_half(
         .iter()
         .map(|w| Registered {
             root: w.root.clone(),
-            priority: w.priority,
+            weight: w.weight,
             maintain_only: w.maintain_only.is_some(),
         })
         .collect();
@@ -1268,7 +1268,7 @@ pub async fn start(
     };
     // A repo that delegates daemon administration elsewhere must not have its
     // workspace registry rewritten from here either — the same refusal
-    // `loom-daemon workspace add/remove/set-priority` makes (#5345), applied to
+    // `loom-daemon workspace add/remove/set-weight` makes (#5345), applied to
     // the unattended path.
     let auto_apply = match crate::config_resolver::daemon_delegated_to(workspace) {
         Some(delegate) if config.auto_apply => {

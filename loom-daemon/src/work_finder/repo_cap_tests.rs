@@ -107,7 +107,7 @@ fn rows_with(report: &TickReport, disposition: Qd) -> usize {
 #[test]
 fn per_repo_cap_bounds_admissions_while_the_global_cap_has_room() {
     let mut workspaces = [(OneShotSource::of(&[1, 2, 3, 4]), CapDispatcher::default())];
-    let report = tick_capped(&mut workspaces, &[0], 10, Some(1));
+    let report = tick_capped(&mut workspaces, &[1], 10, Some(1));
 
     assert_eq!(report.dispatched, 1, "one repo may hold only one slot");
     assert_eq!(workspaces[0].1.dispatched, vec![1], "and it is the first in global order");
@@ -125,7 +125,7 @@ fn per_repo_cap_bounds_admissions_while_the_global_cap_has_room() {
 #[test]
 fn per_repo_cap_admits_up_to_the_cap_then_defers() {
     let mut workspaces = [(OneShotSource::of(&[1, 2, 3]), CapDispatcher::default())];
-    let report = tick_capped(&mut workspaces, &[0], 10, Some(2));
+    let report = tick_capped(&mut workspaces, &[1], 10, Some(2));
 
     assert_eq!(workspaces[0].1.dispatched, vec![1, 2]);
     assert_eq!(report.deferred_repo_cap, 1);
@@ -140,7 +140,7 @@ fn a_repo_already_at_its_cap_admits_nothing_new() {
         (OneShotSource::of(&[1, 2]), CapDispatcher::holding(2)),
         (OneShotSource::of(&[10]), CapDispatcher::default()),
     ];
-    let report = tick_capped(&mut workspaces, &[0, 0], 10, Some(2));
+    let report = tick_capped(&mut workspaces, &[1, 1], 10, Some(2));
 
     assert!(
         workspaces[0].1.dispatched.is_empty(),
@@ -163,7 +163,7 @@ fn a_capped_repo_never_idles_a_slot_a_sibling_could_use() {
         // Priority 100 and cold — last in order.
         (OneShotSource::of(&[10, 11]), CapDispatcher::default()),
     ];
-    let report = tick_capped(&mut workspaces, &[0, 100], 10, Some(1));
+    let report = tick_capped(&mut workspaces, &[10, 1], 10, Some(1));
 
     assert!(workspaces[0].1.dispatched.is_empty(), "the hot repo is at its cap");
     assert_eq!(
@@ -180,7 +180,7 @@ fn a_capped_repo_never_idles_a_slot_a_sibling_could_use() {
 #[test]
 fn a_per_repo_cap_above_the_global_cap_is_harmless() {
     let mut workspaces = [(OneShotSource::of(&[1, 2, 3]), CapDispatcher::default())];
-    let report = tick_capped(&mut workspaces, &[0], 1, Some(99));
+    let report = tick_capped(&mut workspaces, &[1], 1, Some(99));
 
     assert_eq!(report.dispatched, 1);
     assert_eq!(report.deferred_capacity, 2);
@@ -192,7 +192,7 @@ fn a_per_repo_cap_above_the_global_cap_is_harmless() {
 #[test]
 fn a_zero_cap_is_treated_as_absent_never_as_a_cap_of_zero() {
     let mut workspaces = [(OneShotSource::of(&[1, 2]), CapDispatcher::default())];
-    let report = tick_capped(&mut workspaces, &[0], 10, Some(0));
+    let report = tick_capped(&mut workspaces, &[1], 10, Some(0));
 
     assert_eq!(report.dispatched, 2);
     assert_eq!(report.deferred_repo_cap, 0);
@@ -215,14 +215,14 @@ fn an_unset_cap_is_byte_for_byte_the_pre_9090_tick() {
         (OneShotSource::of(&issues_a), CapDispatcher::holding(1)),
         (OneShotSource::of(&issues_b), CapDispatcher::default()),
     ];
-    let with_none = tick_capped(&mut capped, &[0, 100], 10, None);
+    let with_none = tick_capped(&mut capped, &[10, 1], 10, None);
 
     let mut legacy = [
         (OneShotSource::of(&issues_a), CapDispatcher::holding(1)),
         (OneShotSource::of(&issues_b), CapDispatcher::default()),
     ];
     let pre_9090 =
-        tick_multi_with_sharding(&mut legacy, &[0, 100], 10, &[false, false], usize::MAX, false);
+        tick_multi_with_sharding(&mut legacy, &[10, 1], 10, &[false, false], usize::MAX, false);
 
     assert_eq!(with_none, pre_9090, "an absent cap must change nothing at all");
     assert_eq!(with_none.deferred_repo_cap, 0);
@@ -242,7 +242,7 @@ fn tick_multi_leaves_one_repo_free_to_take_the_whole_budget() {
     ];
     // A 1000-point priority gap: at the default draw temperature (#11684)
     // repo 0 weighs ~250,000x repo 1, so the draw is priority order.
-    let report = tick_multi(&mut workspaces, &[0, 1000], 3, &[false, false]);
+    let report = tick_multi(&mut workspaces, &[10, 1], 3, &[false, false]);
 
     assert_eq!(workspaces[0].1.dispatched, vec![1, 2, 3], "the whole budget, one repo");
     assert!(workspaces[1].1.dispatched.is_empty());
@@ -267,7 +267,7 @@ fn affinity_orders_a_hot_repos_next_issue_ahead_of_a_cold_repos() {
     ];
     // Global budget of 2 (the hot repo's live sweep seeds occupancy 1), cap 2:
     // both candidates are admissible, so only the ORDER is under test.
-    let report = tick_capped(&mut workspaces, &[0, 100], 3, Some(2));
+    let report = tick_capped(&mut workspaces, &[10, 1], 3, Some(2));
 
     assert_eq!(report.dispatched, 2);
     assert_eq!(
@@ -290,7 +290,7 @@ fn affinity_is_subordinate_to_the_per_repo_cap() {
         (OneShotSource::of(&[1]), CapDispatcher::default()),
         (OneShotSource::of(&[10]), CapDispatcher::holding(1)),
     ];
-    let report = tick_capped(&mut workspaces, &[0, 100], 10, Some(1));
+    let report = tick_capped(&mut workspaces, &[10, 1], 10, Some(1));
 
     assert_eq!(workspaces[0].1.dispatched, vec![1], "the cold repo dispatches");
     assert!(workspaces[1].1.dispatched.is_empty(), "the hot repo is at its cap");
@@ -306,7 +306,7 @@ fn affinity_is_off_while_the_cap_is_unset() {
         (OneShotSource::of(&[10]), CapDispatcher::holding(1)),
     ];
     // A 1000-point gap keeps the softmax draw (#11684) in priority order.
-    let report = tick_capped(&mut workspaces, &[0, 1000], 10, None);
+    let report = tick_capped(&mut workspaces, &[10, 1], 10, None);
 
     assert_eq!(
         report
@@ -325,12 +325,12 @@ fn affinity_is_off_while_the_cap_is_unset() {
 #[test]
 fn affinity_preserves_relative_order_within_each_group() {
     let mut workspaces = [
-        (OneShotSource::of(&[1]), CapDispatcher::default()), // cold, prio 0
-        (OneShotSource::of(&[2]), CapDispatcher::holding(1)), // hot, prio 10
-        (OneShotSource::of(&[3]), CapDispatcher::default()), // cold, prio 20
-        (OneShotSource::of(&[4]), CapDispatcher::holding(1)), // hot, prio 30
+        (OneShotSource::of(&[1]), CapDispatcher::default()), // cold, heaviest
+        (OneShotSource::of(&[2]), CapDispatcher::holding(1)), // hot, 2nd
+        (OneShotSource::of(&[3]), CapDispatcher::default()), // cold, 3rd
+        (OneShotSource::of(&[4]), CapDispatcher::holding(1)), // hot, lightest
     ];
-    let report = tick_capped(&mut workspaces, &[0, 10, 20, 30], 99, Some(9));
+    let report = tick_capped(&mut workspaces, &[1_000_000, 10_000, 100, 1], 99, Some(9));
 
     assert_eq!(
         report
@@ -350,7 +350,7 @@ fn affinity_preserves_relative_order_within_each_group() {
 fn shape_queue_never_adds_or_drops_a_candidate() {
     let cand = |idx: usize, number: u32| PriorityCandidate {
         workspace_idx: idx,
-        workspace_priority: 0,
+        workspace_weight: 0,
         number,
         ..PriorityCandidate::default()
     };
@@ -392,7 +392,7 @@ fn an_open_pr_repo_yields_the_tick_to_another_repos_work() {
     ];
     // Priority puts the PR-blocked repo first; a single slot is available.
     // (A 1000-point gap keeps the softmax draw, #11684, in priority order.)
-    let report = tick_capped(&mut workspaces, &[0, 1000], 1, None);
+    let report = tick_capped(&mut workspaces, &[10, 1], 1, None);
 
     assert_eq!(report.skipped_pr_open, 2, "both of repo A's issues are guard-refused");
     assert_eq!(rows_with(&report, Qd::OpenPr), 2);
@@ -471,7 +471,7 @@ fn a_missing_occupancy_entry_fails_open() {
     let mut cap = RepoCap::new(Some(1), vec![1]);
     let cand = PriorityCandidate {
         workspace_idx: 7,
-        workspace_priority: 0,
+        workspace_weight: 0,
         number: 1,
         ..PriorityCandidate::default()
     };
@@ -572,7 +572,7 @@ fn plan_order_without_shaping_is_the_sorted_order() {
         (OneShotSource::of(&[3, 4]), CapDispatcher::default()),
         (OneShotSource::of(&[1]), CapDispatcher::default()),
     ];
-    let report = tick_capped(&mut workspaces, &[5, 0], 10, None);
+    let report = tick_capped(&mut workspaces, &[1, 10], 10, None);
     let drawn: Vec<(usize, u32)> = report
         .workspace_draw
         .as_ref()
@@ -603,7 +603,7 @@ fn a_recheck_interval_hold_reports_its_expiry_end_to_end() {
         .with_body(Some("<!-- loom:recheck-interval=1h -->".to_string()))
         .with_updated_at(Some(updated_at.to_rfc3339()));
     let mut workspaces = [(OneShotSource(Some(vec![item])), CapDispatcher::default())];
-    let report = tick_capped(&mut workspaces, &[0], 10, None);
+    let report = tick_capped(&mut workspaces, &[1], 10, None);
     assert_eq!(report.skipped_recheck_interval, 1);
     assert_eq!(rows_with(&report, Qd::RecheckInterval), 1);
 

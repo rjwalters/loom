@@ -310,7 +310,7 @@ fn pass_two_defers_a_heavy_repo_on_disk_and_admits_a_light_one() {
     ];
     let report = super::super::tick_multi_with_build_backoff(
         &mut multi,
-        &[1, 100],
+        &[1000, 1],
         10.into(),
         &[false, false],
         None,
@@ -343,7 +343,7 @@ fn pass_two_debits_each_disk_admission() {
     ];
     let report = super::super::tick_multi_with_build_backoff(
         &mut multi,
-        &[1, 100],
+        &[1000, 1],
         10.into(),
         &[false, false],
         None,
