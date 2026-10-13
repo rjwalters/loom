@@ -540,6 +540,7 @@ fn row(number: u32, is_pr: bool, labels: &[&str]) -> crate::forge_listing::RestI
         author_association: None,
         is_pull_request: is_pr,
         comments: 0,
+        open_sub_issues: None,
     }
 }
 
