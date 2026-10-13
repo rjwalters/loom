@@ -89,7 +89,7 @@ impl WorkDispatcher for Disp {
             .filter_map(|n| self.open_pr.get(n).map(|pr| (*n, *pr)))
             .collect()
     }
-    fn dispatch(&mut self, issue: u32, _complexity: Option<&str>) -> Result<bool> {
+    fn dispatch(&mut self, issue: u32) -> Result<bool> {
         self.attempts.push(issue);
         self.fleet_attempts.borrow_mut().push(issue);
         if let Some(pr) = self.open_pr.get(&issue) {
@@ -205,8 +205,8 @@ fn a_candidate_the_listing_misses_still_meets_the_dispatch_guard() {
             seen.remove(&2);
             seen
         }
-        fn dispatch(&mut self, issue: u32, complexity: Option<&str>) -> Result<bool> {
-            self.0.dispatch(issue, complexity)
+        fn dispatch(&mut self, issue: u32) -> Result<bool> {
+            self.0.dispatch(issue)
         }
     }
     let disp = Disp::new(&[(1, 901), (2, 902)], Listing::Readable);

@@ -77,7 +77,7 @@ impl WorkDispatcher for Refusing {
     fn in_flight(&self) -> HashSet<u32> {
         HashSet::new()
     }
-    fn dispatch(&mut self, issue: u32, _complexity: Option<&str>) -> Result<bool> {
+    fn dispatch(&mut self, issue: u32) -> Result<bool> {
         if self.ok.contains(&issue) {
             Ok(true)
         } else {

@@ -1,11 +1,10 @@
-//! End-to-end tests for the `sweep.outcome` record's `complexity` field
-//! (Issue #8542).
+//! End-to-end tests for the `sweep.outcome` record's issue-signal fields
+//! (`story_points`, Issue #9432) and for the retired `complexity` key
+//! (Issue #11665: the record no longer carries it).
 //!
 //! Mirrors [`super::timeline_tests`]'s shape: what is tested HERE is the
 //! record-construction path in
-//! [`SweepRegistry::append_outcome_telemetry_journal`], not the pure
-//! marker-extraction logic (already unit-tested by
-//! [`crate::script_helpers::sweep_experiment`]'s own tests).
+//! [`SweepRegistry::append_outcome_telemetry_journal`].
 
 use super::*;
 use crate::sweep_registry::test_support::*;
@@ -46,18 +45,17 @@ fn complexity_registry(ws: &Path, script: &str) -> SweepRegistry {
     SweepRegistry::new(config)
 }
 
-/// A fake `gh` whose issue endpoint answers with the `{body, state,
-/// closed_at, labels}` projection `complexity_signal` asks for — one call,
-/// both the #8542 complexity marker and the #9441 end-state signals. Every
+/// A fake `gh` whose issue endpoint answers with the `{state, closed_at,
+/// labels}` projection `complexity_signal` asks for — one call, both the
+/// #9432 story points and the #9441 end-state signals. Every
 /// other call (the PR timeline, `repo view`) is a silent success with empty
 /// output, matching the real `gh` for a sweep whose PR has no notable
 /// timeline.
-fn gh_issue_body_ok(body: &str) -> String {
+fn gh_issue_ok(labels: &[&str]) -> String {
     let payload = serde_json::json!({
-        "body": body,
         "state": "open",
         "closed_at": serde_json::Value::Null,
-        "labels": Vec::<String>::new(),
+        "labels": labels,
     })
     .to_string();
     format!(
@@ -75,9 +73,9 @@ fn gh_issue_body_ok(body: &str) -> String {
     )
 }
 
-/// A fake `gh` whose issue-body endpoint FAILS — the forge-failure/rate-limit
+/// A fake `gh` whose issue endpoint FAILS — the forge-failure/rate-limit
 /// arm.
-fn gh_issue_body_failing() -> String {
+fn gh_issue_failing() -> String {
     "#!/usr/bin/env bash\n\
      if [[ \"$1\" == \"api\" && \"$2\" == repos/*/issues/* && \"$2\" != */timeline ]]; then\n\
      printf 'gh: API rate limit exceeded\\n' >&2\n\
@@ -104,14 +102,14 @@ fn raw_record(registry: &SweepRegistry, issue: u32) -> serde_json::Value {
         .clone()
 }
 
-/// AC: a sweep on an issue carrying a recognized complexity marker produces a
-/// journal record with `complexity` set.
+/// A sweep on an issue carrying a `points:*` label records `story_points`
+/// (label-sourced, off the single issue read) and no `complexity` key.
 #[test]
 #[serial]
-fn a_marked_issue_carries_complexity_on_the_record() {
+fn a_sized_issue_carries_story_points_and_no_complexity() {
     let dir = tempdir().unwrap();
-    let body = "Some issue body.\n\n<!-- loom:complexity=complex -->\n";
-    let mut registry = complexity_registry(dir.path(), &gh_issue_body_ok(body));
+    let mut registry =
+        complexity_registry(dir.path(), &gh_issue_ok(&["loom:building", "points:5"]));
     let issue = 8542;
     let sweep_id = insert_dead_running_with_log(&mut registry, issue, 0, "agent-1", "log\n");
 
@@ -128,16 +126,17 @@ fn a_marked_issue_carries_complexity_on_the_record() {
     let path = registry.config().resolve_outcome_telemetry_path();
     let records = sweep_outcomes::read_all_sweep_outcomes(&path);
     let record = records.iter().find(|r| r.issue == issue).unwrap();
-    assert_eq!(record.complexity, Some("complex".to_string()));
+    assert_eq!(record.story_points, Some(5));
+    let raw = raw_record(&registry, issue);
+    assert!(raw.get("complexity").is_none(), "the retired tier is never emitted: {raw}");
 }
 
-/// AC: a sweep on an unmarked issue omits the `complexity` key entirely —
-/// never a fabricated `"routine"`.
+/// An unsized issue omits `story_points` entirely, never a fabricated value.
 #[test]
 #[serial]
-fn an_unmarked_issue_omits_complexity() {
+fn an_unsized_issue_omits_story_points() {
     let dir = tempdir().unwrap();
-    let mut registry = complexity_registry(dir.path(), &gh_issue_body_ok("no marker here"));
+    let mut registry = complexity_registry(dir.path(), &gh_issue_ok(&["loom:building"]));
     let issue = 8543;
     let sweep_id = insert_dead_running_with_log(&mut registry, issue, 0, "agent-2", "log\n");
 
@@ -152,45 +151,17 @@ fn an_unmarked_issue_omits_complexity() {
     );
 
     let raw = raw_record(&registry, issue);
-    assert!(
-        raw.get("complexity").is_none(),
-        "an unmarked issue must omit complexity, never emit \"routine\": {raw}"
-    );
-}
-
-/// An issue body carrying an out-of-vocabulary tier (a Curator paraphrase of
-/// the closed enum) also omits `complexity` — this journal field never
-/// substitutes a default for an unobserved/invalid value.
-#[test]
-#[serial]
-fn an_invalid_tier_marker_omits_complexity() {
-    let dir = tempdir().unwrap();
-    let body = "<!-- loom:complexity=trivial -->";
-    let mut registry = complexity_registry(dir.path(), &gh_issue_body_ok(body));
-    let issue = 8544;
-    let sweep_id = insert_dead_running_with_log(&mut registry, issue, 0, "agent-3", "log\n");
-
-    registry.append_outcome_telemetry_journal(
-        issue,
-        &sweep_id,
-        60,
-        telemetry::SweepResult::Failure,
-        None,
-        None,
-        crate::tap_usage::RegionAccounting::default(),
-    );
-
-    let raw = raw_record(&registry, issue);
+    assert!(raw.get("story_points").is_none(), "{raw}");
     assert!(raw.get("complexity").is_none(), "{raw}");
 }
 
-/// A forge failure / rate limit during the fetch omits `complexity` and still
+/// A forge failure / rate limit during the fetch omits `story_points` and still
 /// writes the rest of the record.
 #[test]
 #[serial]
-fn a_failing_fetch_omits_complexity_and_still_writes_the_record() {
+fn a_failing_fetch_omits_story_points_and_still_writes_the_record() {
     let dir = tempdir().unwrap();
-    let mut registry = complexity_registry(dir.path(), &gh_issue_body_failing());
+    let mut registry = complexity_registry(dir.path(), &gh_issue_failing());
     let issue = 8545;
     let sweep_id = insert_dead_running_with_log(&mut registry, issue, 0, "agent-4", "log\n");
 
@@ -205,6 +176,7 @@ fn a_failing_fetch_omits_complexity_and_still_writes_the_record() {
     );
 
     let raw = raw_record(&registry, issue);
+    assert!(raw.get("story_points").is_none(), "{raw}");
     assert!(raw.get("complexity").is_none(), "{raw}");
     assert_eq!(raw["result"], "failure");
     assert_eq!(raw["failure_class"], "preflight-no-cli-start");
@@ -214,7 +186,7 @@ fn a_failing_fetch_omits_complexity_and_still_writes_the_record() {
 /// PR-timeline read behaves.
 #[test]
 #[serial]
-fn skip_label_flip_makes_the_complexity_fetch_a_no_op() {
+fn skip_label_flip_makes_the_issue_read_a_no_op() {
     let dir = tempdir().unwrap();
     let (mut registry, _rec) = fixture_registry(dir.path());
     let issue = 8546;

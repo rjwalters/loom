@@ -998,9 +998,8 @@ impl Drop for ScopedLeaseDir {
 /// *probe* seam (`work_finder::pool_preflight` calls it every tick and must
 /// consume nothing), so a ceiling test that used it would assert against a
 /// count that is never incremented.
-fn dispatch_resolve(root: &Path, role: &str, complexity: Option<&str>) -> Decision {
+fn dispatch_resolve(root: &Path, role: &str) -> Decision {
     let context = super::DispatchContext {
-        complexity,
         intent: ceiling::Intent::Dispatch,
         role_tick: false,
     };
@@ -1037,7 +1036,7 @@ fn the_n_plus_first_concurrent_backstop_dispatch_is_passed_over() {
 
     // N = 1: the first dispatch falls through to the backstop and takes the
     // host's only metered slot.
-    let first = dispatch_resolve(dir.path(), "builder", None);
+    let first = dispatch_resolve(dir.path(), "builder");
     let Decision::Preference {
         ref resolution,
         ref backstop,
@@ -1057,7 +1056,7 @@ fn the_n_plus_first_concurrent_backstop_dispatch_is_passed_over() {
     assert!(marker.contains("backstop=1/1"), "{marker}");
 
     // N+1: while that slot is held, the next dispatch is passed over.
-    let second = dispatch_resolve(dir.path(), "builder", None);
+    let second = dispatch_resolve(dir.path(), "builder");
     let Decision::Preference {
         resolution: second_resolution,
         backstop: second_backstop,
@@ -1081,7 +1080,7 @@ fn the_n_plus_first_concurrent_backstop_dispatch_is_passed_over() {
     // Releasing the first dispatch's slot frees the host immediately — the
     // bound is concurrency, not a cooldown, so nothing waits on a clock.
     drop(first);
-    let third = dispatch_resolve(dir.path(), "builder", None);
+    let third = dispatch_resolve(dir.path(), "builder");
     let Decision::Preference { resolution, .. } = third else {
         panic!("expected the preference path");
     };
@@ -1101,7 +1100,7 @@ fn a_recovered_higher_tap_is_still_preferred_while_the_backstop_is_at_its_ceilin
     let dir = ceiling_fixture(1);
 
     // Hold the host's only backstop slot.
-    let held = dispatch_resolve(dir.path(), "builder", None);
+    let held = dispatch_resolve(dir.path(), "builder");
     assert!(matches!(
         &held,
         Decision::Preference {
@@ -1114,7 +1113,7 @@ fn a_recovered_higher_tap_is_still_preferred_while_the_backstop_is_at_its_ceilin
     // though the backstop is pinned at its ceiling.
     provision_claude_pool(dir.path(), 3);
     for _ in 0..3 {
-        let decision = dispatch_resolve(dir.path(), "builder", None);
+        let decision = dispatch_resolve(dir.path(), "builder");
         let Decision::Preference {
             resolution,
             backstop,
@@ -1133,46 +1132,6 @@ fn a_recovered_higher_tap_is_still_preferred_while_the_backstop_is_at_its_ceilin
     drop(held);
 }
 
-/// The optional eligibility filter, through the resolver: low-value work never
-/// reaches the metered tap, while the work the operator considers worth paying
-/// for still does. Unmarked work is `routine`, the daemon's existing default
-/// for a missing `<!-- loom:complexity= -->` marker.
-#[test]
-#[serial_test::serial]
-fn the_eligibility_filter_keeps_low_value_work_off_the_metered_tap() {
-    let _env = ClearedRuntimeEnv::new();
-    let _leases = ScopedLeaseDir::new();
-    let dir = backstop_fixture();
-    write_config(
-        dir.path(),
-        &serde_json::json!({
-            "runtimes": {
-                "preference": ["claude", "opencode"],
-                "backstopCeiling": {"maxConcurrent": 4, "minComplexity": "complex"}
-            }
-        }),
-    );
-
-    let decision = dispatch_resolve(dir.path(), "builder", Some("mechanical"));
-    let Decision::Preference { resolution, .. } = decision else {
-        panic!("expected the preference path");
-    };
-    assert!(resolution.chosen.is_none());
-    assert_eq!(resolution.skipped[1].reason.kind(), "ceiling-ineligible");
-
-    let decision = dispatch_resolve(dir.path(), "builder", Some("complex"));
-    let Decision::Preference {
-        resolution,
-        backstop,
-        ..
-    } = decision
-    else {
-        panic!("expected the preference path");
-    };
-    assert_eq!(resolution.chosen.as_ref().unwrap().tier, 1);
-    assert!(backstop.is_some());
-}
-
 /// The no-ceiling edge case, end to end: with no `backstopCeiling` key the
 /// resolution is byte-identical to a build without the bound, and the lease
 /// store is never even created.
@@ -1189,7 +1148,7 @@ fn an_unconfigured_ceiling_touches_no_state_and_bounds_nothing() {
     let store = ceiling::lease_dir().unwrap();
     let mut held = Vec::new();
     for _ in 0..5 {
-        let decision = dispatch_resolve(dir.path(), "builder", None);
+        let decision = dispatch_resolve(dir.path(), "builder");
         let Decision::Preference {
             resolution,
             backstop,
@@ -1261,7 +1220,7 @@ fn the_probe_seam_the_work_finder_ticks_on_consumes_no_metered_capacity() {
 
     // And after all that probing the host's single slot is still there to be
     // taken by a real dispatch.
-    let dispatched = dispatch_resolve(dir.path(), "builder", None);
+    let dispatched = dispatch_resolve(dir.path(), "builder");
     assert!(matches!(
         dispatched,
         Decision::Preference {

@@ -1,27 +1,15 @@
-//! `--group-by complexity` / `--group-by model-complexity` support (Issue
-//! #8542): group-label resolution, the first-pass Judge approval-rate fold,
-//! and the render-time note/footnote helpers. Split out of
-//! `sweep_outcome_summary.rs` to stay under the file-size ratchet threshold
-//! (`scripts/check-file-size-budget.sh`, #7711) rather than growing that file
-//! past it.
+//! Group-label resolution for `--group-by model` and the first-pass Judge
+//! approval-rate fold (Issue #8542), plus the render-time footnote helper.
+//! Split out of `sweep_outcome_summary.rs` to stay under the file-size ratchet
+//! threshold (`scripts/check-file-size-budget.sh`, #7711) rather than growing
+//! that file past it. The `complexity` / `model-complexity` dimensions that
+//! once lived here were retired in #11665.
 
-use super::{Accum, GroupBy, GroupRow, UNKNOWN_GROUP};
+use super::{Accum, GroupRow};
 use crate::telemetry::SweepOutcomeRecord;
 
-/// Resolve a record's complexity-tier group label: the tier verbatim when the
-/// marker was read, else [`UNKNOWN_GROUP`] — never dropped, matching
-/// [`super::resolve_arm`]'s "nothing is dropped for want of a group" rule.
-#[must_use]
-pub fn resolve_complexity(record: &SweepOutcomeRecord) -> String {
-    record
-        .complexity
-        .clone()
-        .unwrap_or_else(|| UNKNOWN_GROUP.to_string())
-}
-
 /// Resolve a record's `model` group label — `default` for a record with no
-/// explicit model, exactly as `GroupBy::Model` resolves it. Factored out so
-/// [`GroupBy::ModelComplexity`]'s compound key reuses the identical fold.
+/// explicit model, exactly as `GroupBy::Model` resolves it.
 #[must_use]
 pub fn resolve_model_label(record: &SweepOutcomeRecord) -> String {
     record
@@ -43,18 +31,6 @@ pub fn first_pass_verdict(record: &SweepOutcomeRecord) -> Option<bool> {
         .as_ref()
         .and_then(|verdicts| verdicts.first())
         .map(|first| first.verdict == "pass")
-}
-
-/// The report note for a `complexity`/`model-complexity` grouping whose rows
-/// include the `unknown` bucket — `None` otherwise.
-pub fn unknown_group_note(group_by: GroupBy, rows: &[GroupRow]) -> Option<String> {
-    let has_unknown = matches!(group_by, GroupBy::Complexity | GroupBy::ModelComplexity)
-        && rows.iter().any(|r| r.group.contains(UNKNOWN_GROUP));
-    has_unknown.then(|| {
-        "records with no Curator complexity marker observed are bucketed as 'unknown' rather \
-         than dropped (issue #8542) — group counts still sum to records_grouped."
-            .to_string()
-    })
 }
 
 /// Accumulate one record's first-pass Judge verdict into `acc` — see

@@ -39,9 +39,6 @@ use serde_json::Value;
 use crate::config_resolver;
 use crate::sweep_registry;
 
-/// The three cost-of-being-wrong strata. An absent/unknown marker ⇒ `routine`.
-pub const COMPLEXITY_TIERS: [&str; 3] = ["mechanical", "routine", "complex"];
-
 /// The alias values the in-session Task/Agent tool's `model` parameter accepts,
 /// in **ascending capability/cost order**. The ordering is load-bearing for
 /// [`downgrade_task_alias`] (issue #5687) — it is the ladder a mid-wave model

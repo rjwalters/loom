@@ -77,7 +77,7 @@ impl WorkDispatcher for Disp {
     fn occupancy(&self) -> usize {
         self.dispatched.len()
     }
-    fn dispatch(&mut self, issue: u32, _complexity: Option<&str>) -> Result<bool> {
+    fn dispatch(&mut self, issue: u32) -> Result<bool> {
         if self.fail.contains(&issue) {
             return Err(anyhow::anyhow!("spawn failed\nsecond line"));
         }

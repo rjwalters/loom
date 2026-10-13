@@ -81,7 +81,6 @@ pub fn key_of(
         number: item.number,
         level: crate::priority_pick::Level::of(&item.labels),
         main_red_fix: repo_red && item.is_main_red_fix(),
-        complexity: None,
     }
 }
 
@@ -166,10 +165,7 @@ pub fn record_skip_held(
 /// time-boxed hold.
 pub fn record_candidate(rows: &mut Vec<TickQueueRow>, key: &PriorityCandidate, item: &WorkItem) {
     rows.push(TickQueueRow {
-        key: PriorityCandidate {
-            complexity: None,
-            ..key.clone()
-        },
+        key: key.clone(),
         disposition: None,
         detail: None,
         updated_at: item.updated_at.clone(),

@@ -71,16 +71,15 @@ fn workspace() -> tempfile::TempDir {
     dir
 }
 
-fn role_tick() -> DispatchContext<'static> {
+fn role_tick() -> DispatchContext {
     DispatchContext {
-        complexity: None,
         intent: Intent::Probe,
         role_tick: true,
     }
 }
 
 /// The walk's chosen tap, and every skipped tap's rendering.
-fn walk(root: &Path, role: &str, now: u64, context: DispatchContext<'_>) -> (String, Vec<String>) {
+fn walk(root: &Path, role: &str, now: u64, context: DispatchContext) -> (String, Vec<String>) {
     let Ok(Decision::Preference { resolution, .. }) =
         resolve_runtime_for(root, role, None, now, context)
     else {

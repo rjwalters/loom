@@ -46,7 +46,6 @@ fn record(
         runtime: None,
         provider: None,
         profile: None,
-        complexity: None,
         tokens_status: None,
         tokens_status_reason: None,
         no_phase_cause: None,
@@ -117,7 +116,7 @@ impl MergeLookup for ForgeDown {
 }
 
 #[test]
-fn group_by_parses_the_eight_documented_dimensions() {
+fn group_by_parses_the_six_documented_dimensions() {
     for (spec, expected) in [
         ("arm", GroupBy::Arm),
         ("MODEL", GroupBy::Model),
@@ -125,12 +124,13 @@ fn group_by_parses_the_eight_documented_dimensions() {
         ("host", GroupBy::Host),
         ("Day", GroupBy::Day),
         ("tap", GroupBy::Tap),
-        ("complexity", GroupBy::Complexity),
-        ("Model-Complexity", GroupBy::ModelComplexity),
     ] {
         assert_eq!(GroupBy::parse(spec).unwrap(), expected);
     }
     assert!(GroupBy::parse("phase").is_err());
+    // Retired in #11665.
+    assert!(GroupBy::parse("complexity").is_err());
+    assert!(GroupBy::parse("model-complexity").is_err());
 }
 
 /// Issue #8556: the tap stamp a post-#8556 native spawn writes is authoritative
@@ -1089,4 +1089,4 @@ fn rendered_text_names_the_card_and_the_relationship_to_the_old_summary() {
 }
 
 #[cfg(test)]
-mod complexity_tests;
+mod first_pass_tests;

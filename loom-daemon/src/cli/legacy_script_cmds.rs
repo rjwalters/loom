@@ -230,7 +230,6 @@ pub(crate) fn handle_sweep_experiment_command(action: SweepExperimentAction) -> 
         }
         SweepExperimentAction::AssignArm {
             issue,
-            complexity,
             format,
             resolve,
             config,
@@ -241,8 +240,7 @@ pub(crate) fn handle_sweep_experiment_command(action: SweepExperimentAction) -> 
             // fraction 1.0, so the output is unchanged.
             let cfg = model_tiers::load_config(config.as_deref().map(Path::new));
             let (roster, fraction) = arm_plan(&cfg, env_fraction.as_deref());
-            let assigned = arms::in_experiment(issue, complexity.as_deref(), fraction)
-                .then(|| roster.assign(issue, complexity.as_deref()));
+            let assigned = arms::in_experiment(issue, fraction).then(|| roster.assign(issue));
             // The default prints the logical alias (Arm A -> `opus`), which the
             // arm identity and the shell test key off. `--resolve` prints the
             // concrete ID the #3982 tier map resolves that alias to.
@@ -259,7 +257,6 @@ pub(crate) fn handle_sweep_experiment_command(action: SweepExperimentAction) -> 
                     "{}",
                     serde_json::json!({
                         "issue": issue,
-                        "complexity": se::normalize_complexity(complexity.as_deref()),
                         "arm": arm,
                         "model": model,
                         "in_experiment": arm.is_some(),
@@ -273,11 +270,7 @@ pub(crate) fn handle_sweep_experiment_command(action: SweepExperimentAction) -> 
             }
             Ok(())
         }
-        SweepExperimentAction::Banner {
-            issue,
-            complexity,
-            config,
-        } => {
+        SweepExperimentAction::Banner { issue, config } => {
             let cfg = model_tiers::load_config(config.as_deref().map(Path::new));
             let (raw_mode, _) = se::resolve_raw_mode(env_mode.as_deref(), &cfg);
             let (mode, warnings) = se::resolve_effective_mode_default(
@@ -296,7 +289,7 @@ pub(crate) fn handle_sweep_experiment_command(action: SweepExperimentAction) -> 
                 let (roster, fraction) = arm_plan(&cfg, env_fraction.as_deref());
                 let (_ok, source, _w) = se::evaluate_canary_default(env_canary.as_deref(), None);
                 canary_source = source.map(|s| s.label().to_string());
-                if !arms::in_experiment(issue, complexity.as_deref(), fraction) {
+                if !arms::in_experiment(issue, fraction) {
                     // Sampled out by the budget cap (#9122): no arm, no
                     // forcing, its own loud banner.
                     println!(
@@ -305,7 +298,7 @@ pub(crate) fn handle_sweep_experiment_command(action: SweepExperimentAction) -> 
                     );
                     return Ok(());
                 }
-                let assigned = roster.assign(issue, complexity.as_deref());
+                let assigned = roster.assign(issue);
                 arm = Some(assigned.id.clone());
                 model = assigned.model.clone();
             } else if raw_mode == "experiment" {
@@ -337,7 +330,7 @@ pub(crate) fn handle_sweep_experiment_command(action: SweepExperimentAction) -> 
             mode,
             arm,
             attempt,
-            complexity,
+            story_points,
             verdict,
             cycle_count,
             pr,
@@ -359,7 +352,7 @@ pub(crate) fn handle_sweep_experiment_command(action: SweepExperimentAction) -> 
                     mode: &mode,
                     arm: arm.as_deref(),
                     attempt,
-                    complexity: complexity.as_deref(),
+                    story_points,
                     judge_verdict: verdict.as_deref(),
                     cycle_count,
                     pr,

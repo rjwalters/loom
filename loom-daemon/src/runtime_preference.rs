@@ -114,7 +114,7 @@ pub mod resolve;
 pub mod sandbox_hold;
 
 pub use availability::{availability, availability_in, Availability, BinaryEnv, CredentialSource};
-pub use ceiling::{BackstopCeiling, ComplexityTier, Intent, Reservation};
+pub use ceiling::{BackstopCeiling, Intent, Reservation};
 pub use resolve::{
     CeilingSkip, ChosenTap, PreferenceStamp, Resolution, SkipReason, SkippedTap, Tap,
     PREFERENCE_LOG_MARKER,
@@ -382,7 +382,6 @@ pub fn resolve_for_dispatch_with(
     // A sweep dispatch, not a role tick: the launch-failure hold (#11453)
     // never applies here.
     let context = DispatchContext {
-        complexity: None,
         intent: Intent::Dispatch,
         role_tick: false,
     };
@@ -558,16 +557,10 @@ pub fn check_runtimes_preference_config(config: &Value) -> Vec<String> {
 /// What dispatch knows about the *work* being launched, as opposed to the role
 /// launching it.
 ///
-/// Only the backstop ceiling's optional eligibility filter reads this today
-/// (#8555): "low-value work never reaches the metered tap" is a property of the
-/// issue, not of the role. It is a struct rather than a bare argument so a
-/// later admission question can be added without re-churning every call site.
+/// It is a struct rather than a bare argument so a later admission question
+/// can be added without re-churning every call site.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct DispatchContext<'a> {
-    /// The issue's `<!-- loom:complexity=<tier> -->` stratum, as the work
-    /// finder already carries it through `dispatch(issue, complexity)`.
-    /// `None` ⇒ treated as `routine`.
-    pub complexity: Option<&'a str>,
+pub struct DispatchContext {
     /// Whether this resolution precedes a real launch (and so may take a
     /// metered slot) or is a read-only probe. Defaults to
     /// [`Intent::Probe`] — `work_finder::pool_preflight` re-resolves on every
@@ -638,7 +631,7 @@ pub fn resolve_runtime_for(
     role: &str,
     explicit: Option<&str>,
     now: u64,
-    context: DispatchContext<'_>,
+    context: DispatchContext,
 ) -> Result<Decision, RuntimeRejection> {
     resolve_runtime_contained(root, role, explicit, now, context, &mut NoContainment)
 }
@@ -722,7 +715,7 @@ pub fn resolve_runtime_contained(
     role: &str,
     explicit: Option<&str>,
     now: u64,
-    context: DispatchContext<'_>,
+    context: DispatchContext,
     preparer: &mut dyn ContainmentPreparer,
 ) -> Result<Decision, RuntimeRejection> {
     let binary_env = availability::BinaryEnv::from_process();
@@ -737,7 +730,7 @@ fn resolve_runtime_in(
     role: &str,
     explicit: Option<&str>,
     now: u64,
-    context: DispatchContext<'_>,
+    context: DispatchContext,
     preparer: &mut dyn ContainmentPreparer,
     binary_env: &availability::BinaryEnv,
 ) -> Result<Decision, RuntimeRejection> {
@@ -849,7 +842,7 @@ fn resolve_runtime_in(
             let Some(bound) = backstop_ceiling.as_ref().filter(|c| c.governs(tier)) else {
                 return Ok(());
             };
-            match ceiling::admit(bound, canonical, tap, context.complexity, context.intent) {
+            match ceiling::admit(bound, canonical, tap, context.intent) {
                 ceiling::Verdict::Admitted(slot) => {
                     reservation = slot;
                     Ok(())

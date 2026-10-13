@@ -40,7 +40,7 @@ impl WorkDispatcher for Repo {
     fn occupancy(&self) -> usize {
         self.live + self.dispatched
     }
-    fn dispatch(&mut self, _issue: u32, _complexity: Option<&str>) -> Result<bool> {
+    fn dispatch(&mut self, _issue: u32) -> Result<bool> {
         self.dispatched += 1;
         Ok(true)
     }

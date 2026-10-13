@@ -76,7 +76,7 @@ use crate::runtime_preference::CredentialSource;
 use crate::sweep_outcomes;
 use crate::telemetry::{SweepOutcomeRecord, SweepResult, TelemetryRecord};
 
-mod complexity;
+mod first_pass;
 mod group_by;
 
 pub use group_by::GroupBy;
@@ -1026,13 +1026,7 @@ pub fn summarize(
                 }
                 (arm, Some(source))
             }
-            GroupBy::Model => (complexity::resolve_model_label(record), None),
-            GroupBy::Complexity => (complexity::resolve_complexity(record), None),
-            GroupBy::ModelComplexity => {
-                let model = complexity::resolve_model_label(record);
-                let tier = complexity::resolve_complexity(record);
-                (format!("{model}/{tier}"), None)
-            }
+            GroupBy::Model => (first_pass::resolve_model_label(record), None),
             GroupBy::Repo => {
                 // Issue #9442: an unresolved repo groups under UNKNOWN_GROUP —
                 // records never carry a path to trim.
@@ -1081,7 +1075,7 @@ pub fn summarize(
         if doctor_engaged(record) {
             acc.doctor += 1;
         }
-        complexity::accumulate_first_pass(acc, record);
+        first_pass::accumulate_first_pass(acc, record);
         if let Some(usd) = weighted_tokens_usd(record) {
             acc.weighted_usd += usd;
             acc.weighted_records += 1;
@@ -1240,9 +1234,6 @@ pub fn summarize(
             ));
         }
     }
-    if let Some(note) = complexity::unknown_group_note(opts.group_by, &rows) {
-        notes.push(note);
-    }
     if !opts.merge_join_attempted {
         notes.push(
             "merge join skipped (--no-merge-join): merged_prs is unavailable, NOT zero."
@@ -1377,7 +1368,7 @@ pub fn render_text(report: &SummaryReport) -> String {
         let merged = row
             .merged_prs
             .map_or_else(|| "n/a".to_string(), |m| m.to_string());
-        let (first_pass, first_pass_judged) = complexity::render_first_pass_tail(row);
+        let (first_pass, first_pass_judged) = first_pass::render_first_pass_tail(row);
         let tail = format!(
             "{:>6} {:>5} {:>5} {:>5} {:>5} {:>8.1}% {:>7} {:>7} {:>7.1}% {:>7} {:>9} {:>9} {:>8} {:>8} {:>7} {:>6}",
             row.sweeps,
@@ -1414,7 +1405,7 @@ pub fn render_text(report: &SummaryReport) -> String {
         "Doctor% is approximate: derived from sampled phase_durations until doctor_cycles lands \
          (#8056).\n",
     );
-    out.push_str(complexity::FIRST_PASS_NOTE);
+    out.push_str(first_pass::FIRST_PASS_NOTE);
     for note in &report.notes {
         out.push_str(&format!("Note: {note}\n"));
     }

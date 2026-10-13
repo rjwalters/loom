@@ -138,7 +138,7 @@ impl OpenPrPrefilter {
             return (Qd::OpenPr, Some(format!("open PR #{pr}")));
         }
         let started = chrono::Utc::now();
-        let outcome = dispatcher.dispatch_with(cand.number, cand.complexity.as_deref(), overflow);
+        let outcome = dispatcher.dispatch_with(cand.number, overflow);
         record_dispatch_outcome(report, cand.number, cand.workspace_idx, started, &outcome)
     }
 

@@ -14,8 +14,7 @@
 # prints the deduplicated, sorted list of VALID capabilities to stdout, one
 # per line. Multiple markers are ANDed by convention (a caller enforcing
 # "does this worker satisfy every declared capability" needs the full set,
-# not just one) -- unlike the complexity marker, which has exactly one valid
-# value per item, this script collects every match rather than taking the
+# not just one) -- so this script collects every match rather than taking the
 # last.
 #
 # Anchoring rationale (the #4840 anchoring rule): a
@@ -53,7 +52,7 @@ body="$(cat)"
 
 # Value grammar: lowercase alnum, `:`/`_`/`-` separators (the colon supports
 # the `cloud-profile:<name>` family) -- same character-class discipline as
-# the complexity marker's `[a-z]*`, generalized for parameterized values.
+# a plain `[a-z]*` class, generalized for parameterized values.
 # `mapfile` is bash 4+; macOS ships 3.2 (#7751). The `|| true` means a
 # no-match grep yields no output, so empty lines are skipped -- the
 # `${#raw_matches[@]} -eq 0` check below is what distinguishes "no markers".

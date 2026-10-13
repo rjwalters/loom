@@ -189,10 +189,9 @@ struct RecordingDispatcher {
     /// `in_flight()` cannot see it (a reverted label, a released lock, or a
     /// second daemon instance on the same host).
     live_claim_issues: HashSet<u32>,
-    /// Every `(issue, complexity)` pair `dispatch` was called with (#4827),
-    /// so a test can assert the REAL per-issue complexity stratum reached
-    /// the dispatcher rather than the pre-#4827 `None`.
-    dispatched_complexity: Vec<(u32, Option<String>)>,
+    /// Every issue `dispatch` was called with, including attempts that
+    /// failed, so a test can assert dispatch was (or was never) reached.
+    dispatch_attempts: Vec<u32>,
     /// Issue numbers whose dispatch should be refused by the
     /// claim-then-verify-order lease guard (#6287) — the dispatcher
     /// returns the typed [`LeaseOrderDispatchError`], as
@@ -272,21 +271,15 @@ impl WorkDispatcher for RecordingDispatcher {
     fn main_red_via_ci(&self) -> bool {
         self.ci_red
     }
-    fn dispatch_with(
-        &mut self,
-        issue: u32,
-        complexity: Option<&str>,
-        overflow: bool,
-    ) -> Result<bool> {
-        let started = self.dispatch(issue, complexity);
+    fn dispatch_with(&mut self, issue: u32, overflow: bool) -> Result<bool> {
+        let started = self.dispatch(issue);
         if overflow && matches!(started, Ok(true)) {
             self.dispatched_overflow.push(issue);
         }
         started
     }
-    fn dispatch(&mut self, issue: u32, complexity: Option<&str>) -> Result<bool> {
-        self.dispatched_complexity
-            .push((issue, complexity.map(str::to_owned)));
+    fn dispatch(&mut self, issue: u32) -> Result<bool> {
+        self.dispatch_attempts.push(issue);
         if self.workspace_commands_missing {
             // Mirror the production `SweepRegistry::dispatch` workspace-
             // commands guard: refuse with the typed, downcast-matchable
@@ -354,81 +347,6 @@ fn issue(n: u32) -> WorkItem {
     WorkItem::new(n, vec!["loom:issue".to_string()])
 }
 
-// ===================================================================
-// Per-issue complexity threading (#4827)
-// ===================================================================
-
-/// A ready issue whose body carries the Curator's `<!-- loom:complexity=... -->`
-/// marker — the shape `GhWorkSource::list_ready_issues` now materializes
-/// from the REST listing's `body` field.
-fn issue_with_complexity(n: u32, tier: &str) -> WorkItem {
-    issue(n).with_body(Some(format!(
-        "## Context\n\nSome body text.\n\n<!-- loom:complexity={tier} -->\n"
-    )))
-}
-
-/// `WorkItem::complexity()` reads the marker out of the carried body, and
-/// degrades to `None` (the unchanged `routine` stratum) when the listing
-/// supplied no body or the body carries no marker.
-#[test]
-fn work_item_extracts_complexity_from_its_body() {
-    assert_eq!(issue_with_complexity(1, "complex").complexity(), Some("complex"));
-    assert_eq!(issue_with_complexity(1, "mechanical").complexity(), Some("mechanical"));
-    // No body at all (a synthetic item / a listing without bodies).
-    assert_eq!(issue(1).complexity(), None);
-    // A body with no marker (a pre-marker issue).
-    assert_eq!(issue(1).with_body(Some("no marker".into())).complexity(), None);
-}
-
-/// The core #4827 acceptance criterion for the single-workspace path: the
-/// issue's REAL complexity stratum reaches `dispatch()` instead of the
-/// pre-#4827 hardcoded `None`.
-#[test]
-fn tick_threads_per_issue_complexity_into_dispatch() {
-    let mut source = FakeSource::once(vec![
-        issue_with_complexity(10, "complex"),
-        issue_with_complexity(11, "mechanical"),
-        issue(12), // no body → None → `routine`, unchanged
-    ]);
-    let mut dispatcher = RecordingDispatcher::default();
-    let report = tick(&mut source, &mut dispatcher, 10, false).unwrap();
-
-    assert_eq!(report.dispatched, 3);
-    assert_eq!(
-        dispatcher.dispatched_complexity,
-        vec![
-            (10, Some("complex".to_string())),
-            (11, Some("mechanical".to_string())),
-            (12, None),
-        ]
-    );
-}
-
-/// The same criterion for the multi-workspace path, where the stratum
-/// travels on `PriorityCandidate` from pass 1 (listing) to pass 2
-/// (dispatch) — it must survive the global priority sort.
-#[test]
-fn tick_multi_threads_per_issue_complexity_into_dispatch() {
-    let mut workspaces = vec![
-        (
-            FakeSource::once(vec![issue_with_complexity(20, "complex")]),
-            RecordingDispatcher::default(),
-        ),
-        (
-            FakeSource::once(vec![issue_with_complexity(21, "routine"), issue(22)]),
-            RecordingDispatcher::default(),
-        ),
-    ];
-    let report = tick_multi(&mut workspaces, &[0, 0], 10, &[false, false]);
-
-    assert_eq!(report.dispatched, 3);
-    assert_eq!(workspaces[0].1.dispatched_complexity, vec![(20, Some("complex".to_string()))]);
-    assert_eq!(
-        workspaces[1].1.dispatched_complexity,
-        vec![(21, Some("routine".to_string())), (22, None)]
-    );
-}
-
 /// #11483: a tracking parent with open sub-issues is not dispatched, on both
 /// tick paths; all-closed (`{3, 3}`) and an absent summary still dispatch.
 #[test]
@@ -443,23 +361,12 @@ fn tick_skips_a_tracking_parent_with_open_sub_issues() {
     let mut dispatcher = RecordingDispatcher::default();
     let report = tick(&mut FakeSource::once(rows()), &mut dispatcher, 10, false).unwrap();
     assert_eq!((report.dispatched, report.skipped_labeled), (2, 1));
-    let dispatched: Vec<u32> = dispatcher
-        .dispatched_complexity
-        .iter()
-        .map(|d| d.0)
-        .collect();
-    assert_eq!(dispatched, vec![31, 32]);
+    assert_eq!(dispatcher.dispatch_attempts, vec![31, 32]);
 
     let mut workspaces = vec![(FakeSource::once(rows()), RecordingDispatcher::default())];
     let report = tick_multi(&mut workspaces, &[0], 10, &[false]);
     assert_eq!((report.dispatched, report.skipped_labeled), (2, 1));
-    let dispatched: Vec<u32> = workspaces[0]
-        .1
-        .dispatched_complexity
-        .iter()
-        .map(|d| d.0)
-        .collect();
-    assert_eq!(dispatched, vec![31, 32]);
+    assert_eq!(workspaces[0].1.dispatch_attempts, vec![31, 32]);
 }
 
 // ===================================================================
@@ -558,9 +465,7 @@ fn test_registry_dispatcher_exports_claim_ownership_marker() {
 
     let (mut dispatcher, _dir, record_log) = setup_registry_dispatcher_in_tempdir();
 
-    let was_new = dispatcher
-        .dispatch(3964, None)
-        .expect("dispatch should succeed");
+    let was_new = dispatcher.dispatch(3964).expect("dispatch should succeed");
     assert!(was_new, "expected a fresh dispatch, not an idempotency no-op");
 
     let start = std::time::Instant::now();
@@ -603,9 +508,7 @@ fn test_registry_dispatcher_early_line_says_attempting_not_dispatching() {
     let (mut dispatcher, _dir, _record_log) = setup_registry_dispatcher_in_tempdir();
 
     let records = capture::capture_logs(|| {
-        let was_new = dispatcher
-            .dispatch(3965, None)
-            .expect("dispatch should succeed");
+        let was_new = dispatcher.dispatch(3965).expect("dispatch should succeed");
         assert!(was_new, "expected a fresh dispatch, not an idempotency no-op");
     });
 
@@ -1175,10 +1078,10 @@ fn test_tick_skips_entire_batch_when_workspace_commands_missing() {
     assert_eq!(report.dispatched, 0);
     assert_eq!(report.errors, 0, "a structural skip is not an error");
     assert!(
-        disp.dispatched_complexity.is_empty(),
+        disp.dispatch_attempts.is_empty(),
         "dispatch() must never be called once the workspace is known to be missing \
              commands; got: {:?}",
-        disp.dispatched_complexity
+        disp.dispatch_attempts
     );
 }
 
@@ -1665,7 +1568,7 @@ fn test_tick_multi_workspace_commands_missing_does_not_starve_sibling() {
     );
     assert_eq!(report.dispatched, 1);
     assert!(
-        multi[0].1.dispatched_complexity.is_empty(),
+        multi[0].1.dispatch_attempts.is_empty(),
         "the broken workspace's dispatch() must never be called"
     );
     assert_eq!(multi[1].1.dispatched, vec![10], "healthy sibling gets the shared slot");
@@ -2780,7 +2683,7 @@ fn tick_never_dispatches_a_host_pinned_issue_on_a_non_matching_host() {
     assert_eq!(report.dispatched, 0);
     assert_eq!(report.skipped_host_constraint, 1);
     assert_eq!(report.skipped_labeled, 0, "not the ordinary park-label path");
-    assert!(dispatcher.dispatched_complexity.is_empty(), "dispatch() must never be called");
+    assert!(dispatcher.dispatch_attempts.is_empty(), "dispatch() must never be called");
 }
 
 /// AC2: the exact same issue, on the matching host, dispatches exactly as
@@ -2796,7 +2699,7 @@ fn tick_dispatches_a_host_pinned_issue_on_the_matching_host() {
 
     assert_eq!(report.dispatched, 1);
     assert_eq!(report.skipped_host_constraint, 0);
-    assert_eq!(dispatcher.dispatched_complexity, vec![(9, None)]);
+    assert_eq!(dispatcher.dispatch_attempts, vec![9]);
 }
 
 /// The body-marker convention behaves identically to the label
@@ -2899,12 +2802,12 @@ fn tick_multi_with_two_hosts_only_the_matching_one_claims_the_pinned_issue() {
     assert_eq!(report.dispatched, 1, "exactly one of the two hosts claims it");
     assert_eq!(report.skipped_host_constraint, 1, "the other host skips it");
     assert!(
-        workspaces[0].1.dispatched_complexity.is_empty(),
+        workspaces[0].1.dispatch_attempts.is_empty(),
         "loom-worker-1 (non-matching) must never call dispatch()"
     );
     assert_eq!(
-        workspaces[1].1.dispatched_complexity,
-        vec![(100, None)],
+        workspaces[1].1.dispatch_attempts,
+        vec![100],
         "loom-worker-2 (matching) claims it"
     );
 }
@@ -3128,8 +3031,7 @@ fn test_tick_multi_skips_issue_with_per_workspace_extra_skip_label() {
 // ===================================================================
 
 /// A ready issue whose body carries the `<!-- loom:recheck-interval=... -->`
-/// marker and a synthetic `updatedAt`, mirroring `issue_with_complexity`'s
-/// shape for the sibling marker.
+/// marker and a synthetic `updatedAt`, built on `issue`.
 fn issue_with_recheck_interval(n: u32, value: &str, updated_at: &str) -> WorkItem {
     issue(n)
         .with_body(Some(format!(

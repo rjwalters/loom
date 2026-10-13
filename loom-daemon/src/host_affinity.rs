@@ -210,8 +210,8 @@ fn is_marker_space(c: char) -> bool {
 /// value grammar"). Rejects the empty string and anything containing
 /// whitespace or `<`/`>`, so a `<host-id>` placeholder in prose that merely
 /// quotes the marker syntax (as this module's own doc does) is never mistaken
-/// for a live marker — the same placeholder-safety property #4840 established
-/// for the complexity marker and #6892 reused for the capability marker.
+/// for a live marker — the same placeholder-safety property the #4840 anchoring rule established
+/// and #6892 reused for the capability marker.
 fn is_valid_host_id(value: &str) -> bool {
     !value.is_empty()
         && value
@@ -339,7 +339,7 @@ mod tests {
 
     #[test]
     fn unrelated_html_comments_are_ignored() {
-        let body = "<!-- loom:complexity=complex -->\n<!-- just a note -->\n\
+        let body = "<!-- loom:points=3 -->\n<!-- just a note -->\n\
                     <!-- loom:requires-host=loom-worker-2 -->";
         assert_eq!(required_hosts_from_body(body), hosts(&["loom-worker-2"]));
     }

@@ -6,18 +6,13 @@ use super::*;
 /// #8222) — the source of the record's `judge_verdicts` and `doctor_cycles`.
 pub(crate) mod label_timeline;
 
-/// The Curator complexity-tier signal read off the sweep's issue body (Issue
-/// #8542) — the source of the record's `complexity`.
+/// The single terminal-transition issue read (end state #9441, `points:*`
+/// labels #9432) — the source of the record's `disposition` end state and
+/// `story_points`.
 pub(crate) mod complexity_signal;
 
-/// The Curator points-estimate signal read off the sweep's issue body (Issue
-/// #9056), consumed only by [`writeback`] — see its own module doc for why
-/// this is a separate, conditionally-fetched read rather than a permanent
-/// `SweepOutcomeRecord` field like `complexity`.
-pub(crate) mod points_signal;
-
 /// The opt-in, post-`Success` issue write-back comment (Issue #9056): renders
-/// [`telemetry::SweepOutcomeRecord`] + [`points_signal`]'s estimate to
+/// [`telemetry::SweepOutcomeRecord`] + the record's `story_points` to
 /// Markdown and posts it, once, to the sweep's originating issue.
 pub(crate) mod writeback;
 
@@ -581,9 +576,8 @@ impl SweepRegistry {
         // identically without needing a separate stored "explicit arm" field.
         // Kept in the free-form `config` map (not a new top-level schema field)
         // so this is additive per #4703 with no schema-version bump. Inference
-        // stays faithful under #4827's per-issue complexity stratification: the
-        // stratum only shifts WHICH arm an issue lands in, never the arm →
-        // model mapping this reads back.
+        // stays faithful because it reads back the arm → model mapping
+        // itself, whichever arm an issue was assigned.
         if let Some(arm) =
             crate::script_helpers::sweep_experiment::infer_arm_from_model(model.as_deref())
         {
@@ -648,7 +642,7 @@ impl SweepRegistry {
         //
         // The two branches differ ONLY in how far resolution may reach:
         // `skip_label_flip` gates every forge read at this site (timeline,
-        // complexity), so it keeps that property and resolves from the local
+        // issue signals), so it keeps that property and resolves from the local
         // `LOOM_REPO` override alone; the normal branch also asks `gh repo
         // view` (breaker-gated, fail-open). Visibility stays Private under
         // `skip_label_flip`, exactly as before.
@@ -922,19 +916,18 @@ impl SweepRegistry {
             (Some(signals.doctor_cycles), Some(signals.judge_verdicts))
         });
 
-        // Curator complexity tier (Issue #8542) plus the issue's own end state
-        // (Issue #9441), read off the sweep's own issue in ONE REST call — see
+        // The issue's own end state (Issue #9441) and `points:*` labels (Issue
+        // #9432), read off the sweep's own issue in ONE REST call — see
         // `complexity_signal`'s module doc for why this is a separate forge
         // read from the PR timeline above rather than a dispatch-time plumb,
         // why the two signals share one call, and their identical fail-open
         // contract.
         let issue_signals = self.fetch_issue_signals(issue);
-        let complexity = issue_signals.complexity.clone();
         let issue_end_state = issue_signals.end_state(started_at);
         // The Curator's story-point size (Issue #9432, epic #9429), folded out
         // of the SAME read's label list — no extra forge round trip, and the
-        // estimate can never describe a different issue than `complexity` and
-        // the end state do. Pure label folding with the one-label-per-issue
+        // estimate can never describe a different issue than the
+        // end state does. Pure label folding with the one-label-per-issue
         // guard: absent, out-of-vocabulary and stacked points labels all yield
         // `None` (the last two logged loudly), never a guessed or zero size.
         let story_points = issue_signals.story_points(issue);
@@ -1011,7 +1004,6 @@ impl SweepRegistry {
                 .as_ref()
                 .and_then(|r| r.provider.clone()),
             profile: runtime_attribution.as_ref().and_then(|r| r.profile.clone()),
-            complexity,
             story_points,
             tokens_status: Some(tokens_status),
             attempt_index,
@@ -1047,7 +1039,7 @@ impl SweepRegistry {
         // Issue #9056: opt-in, post-`Success`-only issue write-back comment.
         // Only a clone of the assembled record is taken HERE (`outcome_record`
         // itself moves into the telemetry envelope below); every forge call —
-        // the idempotency read, the points read, and the post — runs strictly
+        // the idempotency read and the post — runs strictly
         // AFTER the durable local writes at the end of this function, so a
         // slow or hung `gh` can never delay (or, via a daemon restart in that
         // window, lose) the `sweep.outcome` record. See `writeback`'s module
@@ -1535,7 +1527,7 @@ mod phase_usage_tests;
 )]
 mod tap_usage_tests;
 
-// End-to-end tests for the #8542 complexity-marker sourcing, in their own
+// End-to-end tests for the issue-signal sourcing (`story_points`), in their own
 // sibling file for the same file-size reason as `timeline_tests` above.
 #[cfg(test)]
 #[allow(
@@ -1548,7 +1540,7 @@ mod complexity_tests;
 
 // End-to-end tests for the #9056 issue write-back (posting, idempotency, the
 // `Success`-only gate), in their own sibling file for the same file-size
-// reason as `timeline_tests` above. `points_signal` and `writeback`'s own
+// reason as `timeline_tests` above. `writeback`'s own
 // pure/unit tests live inline in those modules instead.
 #[cfg(test)]
 #[allow(

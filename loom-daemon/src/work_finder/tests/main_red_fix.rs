@@ -550,8 +550,8 @@ impl WorkDispatcher for EscalationRecorder {
     fn in_flight(&self) -> HashSet<u32> {
         self.inner.in_flight()
     }
-    fn dispatch(&mut self, issue: u32, complexity: Option<&str>) -> Result<bool> {
-        self.inner.dispatch(issue, complexity)
+    fn dispatch(&mut self, issue: u32) -> Result<bool> {
+        self.inner.dispatch(issue)
     }
     fn escalate_red_fix(&mut self, red: bool, waiting: &[u32]) {
         self.calls.push((red, waiting.to_vec()));

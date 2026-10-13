@@ -6,13 +6,13 @@
 use super::*;
 
 mod admission_brake;
-mod complexity;
 mod daemon_event;
 mod export_coverage;
 mod fleet_captain;
 mod host_health;
 mod host_health_omissions;
 mod kind_registry;
+mod retired_complexity;
 mod role_tick;
 mod session_analysis;
 mod session_summary;
@@ -127,7 +127,6 @@ pub(super) fn sweep_outcome() -> TelemetryRecord {
         runtime: Some("opencode".to_string()),
         provider: Some("friendli".to_string()),
         profile: Some("zai-flash".to_string()),
-        complexity: Some("routine".to_string()),
         tokens_status: None,
         tokens_status_reason: None,
         no_phase_cause: None,
@@ -286,7 +285,6 @@ fn sweep_outcome_omits_work_output_fields_when_unavailable() {
         runtime: None,
         provider: None,
         profile: None,
-        complexity: None,
         tokens_status: None,
         tokens_status_reason: None,
         no_phase_cause: None,
@@ -314,7 +312,6 @@ fn sweep_outcome_omits_work_output_fields_when_unavailable() {
         "runtime",
         "provider",
         "profile",
-        "complexity",
     ] {
         assert!(
             value.get(field).is_none(),
@@ -424,7 +421,6 @@ fn sweep_outcome_round_trips_the_completeness_fields() {
         runtime: None,
         provider: None,
         profile: None,
-        complexity: Some("complex".to_string()),
         tokens_status: None,
         tokens_status_reason: None,
         no_phase_cause: None,
@@ -442,7 +438,6 @@ fn sweep_outcome_round_trips_the_completeness_fields() {
         test_lines: None,
     };
     let value = serde_json::to_value(&record).unwrap();
-    assert_eq!(value["complexity"], "complex");
     assert_eq!(value["failure_class"], "account-exhausted:model-credits-exhausted");
     assert_eq!(value["models_used"][1], "claude-sonnet-5");
     assert_eq!(value["doctor_cycles"], 2);
@@ -491,7 +486,6 @@ fn sweep_outcome_distinguishes_an_omitted_doctor_cycles_from_zero() {
         runtime: None,
         provider: None,
         profile: None,
-        complexity: None,
         tokens_status: None,
         tokens_status_reason: None,
         no_phase_cause: None,
@@ -515,7 +509,6 @@ fn sweep_outcome_distinguishes_an_omitted_doctor_cycles_from_zero() {
         "models_used",
         "doctor_cycles",
         "judge_verdicts",
-        "complexity",
         // Issue #9432: an unsized issue carries NO `story_points` key — a `0`
         // would claim the Curator sized it at nothing.
         "story_points",
@@ -576,7 +569,6 @@ fn sweep_outcome_from_a_pre_8056_daemon_still_decodes() {
             assert_eq!(r.models_used, None);
             assert_eq!(r.doctor_cycles, None);
             assert_eq!(r.judge_verdicts, None);
-            assert_eq!(r.complexity, None);
             // Issue #9432: a pre-story-points record decodes with no size,
             // which reads as "nobody sized this issue" — not as size 0.
             assert_eq!(r.story_points, None);
@@ -585,9 +577,8 @@ fn sweep_outcome_from_a_pre_8056_daemon_still_decodes() {
     }
 }
 
-// sweep.outcome Curator complexity tier (Issue #8542): see
-// `tests/complexity.rs` — extracted to a sibling module to stay inside the
-// file-size ratchet.
+// Back-compat for the retired sweep.outcome `complexity` field: see
+// `tests/retired_complexity.rs`.
 
 // ------------------------------------------------------------------
 // sweep.completed per-model token usage (Issue #6384): additive,
@@ -816,7 +807,6 @@ fn sweep_outcome_repo_is_a_slug_or_absent_and_repo_unresolved_marks_the_gap() {
         runtime: None,
         provider: None,
         profile: None,
-        complexity: None,
         tokens_status: None,
         tokens_status_reason: None,
         no_phase_cause: None,

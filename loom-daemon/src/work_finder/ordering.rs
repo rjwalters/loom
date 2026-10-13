@@ -39,11 +39,6 @@ pub struct PriorityCandidate {
     /// (#11508): the build back-off, the file-overlap gate and the
     /// repo-sharding slice.
     pub main_red_fix: bool,
-    /// The issue's `<!-- loom:complexity=<tier> -->` stratum (#4827), carried
-    /// from its work item so pass 2's `dispatch()` can stratify the
-    /// model-cost A/B arm assignment without re-fetching the body. Not part of
-    /// the ordering keys; [`candidate_cmp`] ignores it.
-    pub complexity: Option<String>,
 }
 
 /// Total ordering over dispatch candidates (#11103, #11508, #11547):

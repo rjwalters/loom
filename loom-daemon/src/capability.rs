@@ -65,9 +65,9 @@
 //!    marker syntax as literal example text (as the convention doc itself
 //!    does) must never be mistaken for a live marker. A `<name>` placeholder breaks the `-->`
 //!    anchor and is therefore skipped.
-//! 2. **Every match is collected, deduplicated** — unlike the complexity marker
-//!    (`tail -1`, last match wins, one tier per item), the whole declared set
-//!    matters because multiple markers are **ANDed**.
+//! 2. **Every match is collected, deduplicated** — the whole declared set
+//!    matters because multiple markers are **ANDed**, so there is no
+//!    last-match-wins.
 //!
 //! Matching is line-oriented, like `grep`: a marker split across a newline is
 //! recognized by neither implementation.
@@ -521,9 +521,9 @@ mod tests {
     }
 
     #[test]
-    fn collects_every_marker_deduplicated_unlike_the_complexity_marker() {
-        // The complexity marker takes `tail -1`; capability markers are ANDed,
-        // so all of them matter and repeats collapse.
+    fn collects_every_marker_deduplicated() {
+        // Capability markers are ANDed, so all of them matter and repeats
+        // collapse.
         let body = "<!-- loom:capability=host-sudo -->\n\
                     text\n\
                     <!-- loom:capability=cloud-profile:prod-aws -->\n\
@@ -633,7 +633,7 @@ mod tests {
     #[test]
     fn unrelated_html_comments_are_ignored() {
         let decl = extract_capability_markers(
-            "<!-- loom:complexity=complex -->\n<!-- just a note -->\n<!-- loom:capability=host-sudo -->",
+            "<!-- loom:points=3 -->\n<!-- just a note -->\n<!-- loom:capability=host-sudo -->",
         );
         assert_eq!(decl.required, held(&["host-sudo"]));
     }
@@ -676,7 +676,7 @@ mod tests {
             ("<!-- loom:capability=host_sudo -->", &[], &["host_sudo"]),
             ("<!-- loom:capability=host-sudo- -->", &[], &["host-sudo-"]),
             ("loom:capability=host-sudo", &[], &[]),
-            ("<!-- loom:complexity=complex -->", &[], &[]),
+            ("<!-- loom:points=3 -->", &[], &[]),
             (
                 "<!-- loom:capability=forge-admin-token --> and <!-- loom:capability=root -->",
                 &["forge-admin-token"],

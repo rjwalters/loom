@@ -94,8 +94,8 @@ impl WorkItem {
     }
 
     /// True when [`Self::body`] carries [`MAIN_RED_FIX_MARKER`] at the start
-    /// of a line (the same line-anchored style as the complexity and
-    /// recheck-interval markers, so prose quoting the marker mid-sentence does
+    /// of a line (the same line-anchored style as the
+    /// recheck-interval marker, so prose quoting the marker mid-sentence does
     /// not fire).
     #[must_use]
     pub fn is_main_red_fix(&self) -> bool {

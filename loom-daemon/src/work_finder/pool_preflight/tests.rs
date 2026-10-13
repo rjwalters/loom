@@ -249,7 +249,7 @@ impl WorkDispatcher for CountingDispatcher {
     fn in_flight(&self) -> HashSet<u32> {
         HashSet::new()
     }
-    fn dispatch(&mut self, _issue: u32, _complexity: Option<&str>) -> Result<bool> {
+    fn dispatch(&mut self, _issue: u32) -> Result<bool> {
         self.attempts += 1;
         Ok(true)
     }

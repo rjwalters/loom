@@ -963,7 +963,6 @@ mod tests {
                 runtime: None,
                 provider: None,
                 profile: None,
-                complexity: None,
                 tokens_status: None,
                 tokens_status_reason: None,
                 no_phase_cause: None,
