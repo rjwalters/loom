@@ -44,8 +44,33 @@ fn a_learned_charge_is_the_high_water_mark_plus_margin() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("loom");
     std::fs::create_dir_all(&root).unwrap();
-    // 26 GB + 10% = 28.6 -> 29, from the max of the history, not the latest.
+    // 26 GB + 10% = 28.6 -> 29: a short history's p90 is its max, not the
+    // latest.
     assert_eq!(charge_for_root(&root, &s, 8), charge("loom", 29, ChargeSource::Observed));
+}
+
+#[test]
+fn one_outlier_build_does_not_set_a_full_windows_charge() {
+    // #11736: loom on loom-worker-2, 20 sweeps with a 3.2 GB median and one
+    // 43.5 GB build. The max charged 48 GB; the p90 charges ~13 GB.
+    let mut hist = vec![2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 5, 5, 6, 7, 8, 12, 24];
+    hist.push(44);
+    let s = store(&[("loom", &hist)], &[("loom#1", "loom", 3)]);
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("loom");
+    std::fs::create_dir_all(&root).unwrap();
+    // Nearest-rank p90 of 20 is the 18th smallest: 12 GB + 10% -> 14.
+    let c = charge_for_root(&root, &s, 8);
+    assert_eq!(c, charge("loom", 14, ChargeSource::Observed));
+    // With 117 GB free and one loom sweep in flight, a second still fits
+    // (the max-based 48 GB charge reserved 45 and refused it with 117 free
+    // once other repos' reservations were added).
+    let b = assess(117, 3, &s, vec![c], 8, NOW, None);
+    assert_eq!(b.reserved_gb, 11, "14 - 3 still to be written");
+    assert!(b.fits(0));
+    // The floor is untouched: a host near the floor still refuses.
+    let tight = assess(20, 3, &s, vec![charge("loom", 14, ChargeSource::Observed)], 8, NOW, None);
+    assert!(!tight.fits(0), "20 - 3 - 11 = 6 < 14");
 }
 
 #[test]
