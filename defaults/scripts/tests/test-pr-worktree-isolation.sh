@@ -358,6 +358,29 @@ fi
 
 cd "$REPO_ROOT"
 
+# --- Test 5 (#11194): Judge guidance and helper --help agree on the fallback ---
+echo ""
+echo "Test 5: judge.md and pr-worktree.sh --help agree (no fabricated judge-* checkout)"
+JUDGE_MD="$REPO_ROOT/defaults/.claude/commands/loom/judge.md"
+[[ -f "$REPO_ROOT/.claude/commands/loom/judge.md" ]] && JUDGE_MD="$REPO_ROOT/.claude/commands/loom/judge.md"
+HELP_OUT=$("$PR_WORKTREE_SH" --help 2>&1)
+assert_grep "pr-worktree\.sh <PR_NUMBER>" "$JUDGE_MD" \
+    "judge.md routes the no-builder-checkout case through pr-worktree.sh"
+assert_grep "Never.*invent a .judge-\*" "$JUDGE_MD" \
+    "judge.md forbids inventing a judge-* checkout after a helper failure"
+if grep -qE "Judge's supported review checkout" <<<"$HELP_OUT" \
+    && grep -qE "names the holder" <<<"$HELP_OUT" \
+    && grep -qE "invent a judge-\* directory" <<<"$HELP_OUT"; then
+    pass "pr-worktree.sh --help states the Judge fallback and its collision failure behavior"
+else
+    fail "pr-worktree.sh --help does not match the Judge fallback guidance"
+fi
+if grep -qE "use worktree\.sh instead" <<<"$HELP_OUT"; then
+    fail "pr-worktree.sh --help still redirects issue PRs to worktree.sh"
+else
+    pass "pr-worktree.sh --help no longer contradicts judge.md"
+fi
+
 # --- Summary ---
 echo ""
 echo "Tests run: $TESTS_RUN, Passed: $TESTS_PASSED, Failed: $TESTS_FAILED"

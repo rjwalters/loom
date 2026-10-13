@@ -81,12 +81,16 @@ Loom PR Worktree Helper
 
 Usage: ./.loom/scripts/pr-worktree.sh <PR_NUMBER>
 
-Creates an isolated worktree at .loom/worktrees/pr-<PR_NUMBER>/ for a PR
-whose branch doesn't fit the `feature/issue-<N>` convention (typically
-external-fork PRs). The PR's branch is checked out inside the worktree —
-never in the orchestrator's main worktree.
+Creates an isolated worktree at .loom/worktrees/pr-<PR_NUMBER>/ for reviewing
+a PR when no builder worktree (.loom/worktrees/issue-<N>) already holds its
+branch: the Judge's supported review checkout for any PR shape, and Doctor's
+for external-fork or ad-hoc branches. The PR's branch is checked out inside
+the worktree - never in the orchestrator's main worktree. An existing pr-<N>
+worktree is reused.
 
-For Loom-issue PRs (branch = feature/issue-<N>), use worktree.sh instead.
+If the PR's branch is already checked out in another worktree, the helper
+exits 1 and names the holder; use that worktree or stop and report. Do not
+invent a judge-* directory or run raw `git worktree add` instead.
 
 Exit codes:
   0 = worktree ready at .loom/worktrees/pr-<PR_NUMBER>/

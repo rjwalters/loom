@@ -216,20 +216,15 @@ own discipline:
 Pick the right path before any `gh pr checkout` mutation:
 
 - **An existing builder worktree** (`.loom/worktrees/issue-N`, left behind by an active `/loom:sweep` that already ran Builder) — reuse it directly, no checkout needed (see "Worktree-Aware Code Access" below).
-- **Loom-issue PRs with no existing builder worktree** — branch matches the strict pattern `^feature/issue-([0-9]+)$`:
-  ```bash
-  ./.loom/scripts/worktree.sh <ISSUE_NUMBER>
-  cd .loom/worktrees/issue-<ISSUE_NUMBER>
-  gh pr checkout <PR_NUMBER>   # safe: already inside the issue worktree
-  ```
-- **External-fork, ad-hoc, or unlabeled PRs** — any other branch shape (e.g., `fix/foo-bar`, `release-1`, `jperla:fix/claude-code-2.1-compat`), or any time you cannot resolve an issue number:
+- **No existing builder worktree (any PR shape — `feature/issue-N`, external-fork, ad-hoc)** — use the one supported review helper:
   ```bash
   ./.loom/scripts/pr-worktree.sh <PR_NUMBER>
   cd .loom/worktrees/pr-<PR_NUMBER>
   # pr-worktree.sh already ran `gh pr checkout` inside the worktree
   ```
+  **Honor its result.** Exit `0` = ready (a previously created `pr-<N>` is reused). A non-zero exit — including the "branch already checked out in another worktree" collision, where the helper names the holder — is the answer: if the holder is a builder `issue-N` worktree, `cd` into that and run "Verify the Worktree Matches the PR" below; otherwise stop and report the failure (or fall back to `git merge-tree`/`gh pr diff` read-only review). **Never** invent a `judge-*`/`review-*` directory, pick another naming scheme, or run raw `git worktree add` / a bare `gh pr checkout` to get around a helper failure.
 
-Both worktree paths get a `.loom-managed` sentinel and are auto-cleaned by `merge-pr.sh` on merge. **Never fall back to a bare `gh pr checkout <N>` in the current directory** — every "no worktree exists" branch in this document's checkout snippets routes through `pr-worktree.sh`, mirroring the pattern in `doctor.md`.
+`pr-worktree.sh` writes a `.loom-managed` sentinel; `merge-pr.sh` auto-cleans it on merge. Every "no worktree exists" branch in this document routes through it, mirroring `doctor.md`.
 
 ## Issues Are Suggestions — Close or Rescope With Rationale (Role Autonomy)
 
@@ -1087,7 +1082,7 @@ else
     # No builder worktree — self-cleaning worktree via pr-worktree.sh, not a
     # bare checkout in the current directory
     ./.loom/scripts/pr-worktree.sh <number>
-    cd ".loom/worktrees/pr-<number>"
+    cd ".loom/worktrees/pr-<number>"   # only reached when the helper exited 0
 fi
 ```
 
