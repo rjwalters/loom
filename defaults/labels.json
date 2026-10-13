@@ -1265,7 +1265,7 @@
     {
       "name": "priority:high",
       "replaced_by": "loom:important",
-      "owned": false,
+      "owned": true,
       "retired_in": "#11103"
     },
     {
