@@ -1922,9 +1922,42 @@ stays env-passthrough even with the flag on.
 - `header` — `authorization-bearer` (Claude Code's `ANTHROPIC_AUTH_TOKEN`
   shape, and most OpenAI-compatible endpoints) or `x-api-key` (Anthropic's
   native API-key header).
-- `baseUrlEnv` — the environment variables set inside the container to the
-  proxy's own base URL. A harness that reads its base URL from injected
-  *configuration* rather than the environment cannot be proxied yet.
+- `baseUrlEnv` — the environment variables set to the proxy's own base URL.
+  Use this when the harness reads its base URL from the environment
+  (`ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`, …).
+- `baseUrlConfig` — for a harness that reads its base URL from injected
+  *configuration* instead: the provider-config option key that receives the
+  proxy's base URL (OpenCode's `provider.<id>.options.baseURL`, so
+  `"baseUrlConfig": "baseURL"`). The launcher patches that one option into
+  the `OPENCODE_CONFIG_CONTENT` it provisions for the launch. OpenCode is
+  the only harness with a config contract this writes, so the field is
+  **inert on any other runtime** — dropped from the selection at resolution,
+  so a profile may declare it for its OpenCode binding while its other
+  bindings keep launching. It is also refused on an armed **contained**
+  launch: that config is provisioned inside the container, where the
+  host-side launcher cannot patch it, so a contained OpenCode launch is
+  re-pointed with `baseUrlEnv`.
+
+The bundled `zai-flash` profile proxies Z.ai's coding-plan endpoint through
+the OpenCode harness this way (`upstream: https://api.z.ai/api/coding/paas/v4`,
+`authorization-bearer`, `baseUrlConfig: baseURL`), default off until an
+operator turns `credentialProxy` on (issue #11300). That profile also binds
+`pi`, which is intentionally **unproxied** in this slice: its block declares
+no `baseUrlEnv`, so with the flag on a `pi` launch of it fails closed —
+arming a proxy the harness would not follow would send the placeholder to
+the real upstream — and with the flag off it launches unchanged.
+
+**Uncontained native launches.** The same substitution is available without
+containment, on the same switch and the same per-profile opt-in: a native
+(pi/opencode/kimi) launch on the host arms the listener bound to
+**loopback only** — reachable by the harness, and no other address is ever
+needed — and the launcher stays alive as the harness's parent for exactly
+the launch's lifetime (the native path's one no-`exec` shape, mirroring the
+container path below). The credential ladder runs once, and the credential
+the proxy holds is the one handed to the harness command, so pool selection
+cannot land on a different account between the two. A profile routed
+through the LLM gateway and a proxy-declaring profile are refused together:
+both rewrite where the provider is reached, so only one may be active.
 
 **What the proxy enforces.**
 
@@ -1965,7 +1998,9 @@ proxied dispatch masks it with an empty, read-only tmpfs. A shared pool
 listener has to outlive the `docker run`, so the dispatcher stays alive as its
 parent and the placeholder's lifetime is exactly the container's. The child
 keeps the dispatcher's process group, so existing process-group teardown reaps
-both and `--rm` still removes the container.
+both and `--rm` still removes the container. (The uncontained native path
+above shares this shape; it is the native launch path's one no-`exec`
+dispatch.)
 
 **Fails closed, never falls back.** Every error in the substitution path is an
 error. A proxy that quietly degraded to env-passthrough would be
