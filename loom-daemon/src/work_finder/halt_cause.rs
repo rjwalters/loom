@@ -228,6 +228,29 @@ pub fn causes_per_root(
         .collect()
 }
 
+/// The single-workspace loop's cause (#11649): the [`causes_per_root`]
+/// precedence over the holds that loop folds, given as `(main_red,
+/// gate_pending, other_hold, breaker)`. `other_hold` is the breaker OR the
+/// root's token-pool hold, so with the breaker off it names the pool. `None`
+/// exactly when no hold is in force — the loop's `halted` bool.
+#[must_use]
+pub fn single_root(
+    root: &std::path::Path,
+    (main_red, gate_pending, other_hold, breaker): (bool, bool, bool, bool),
+) -> Option<HaltCause> {
+    if main_red {
+        Some(main_red_or_billing(root))
+    } else if gate_pending {
+        Some(HaltCause::GatePending)
+    } else if !other_hold {
+        None
+    } else if breaker {
+        Some(HaltCause::Breaker)
+    } else {
+        Some(HaltCause::TokenPool)
+    }
+}
+
 /// Fold the disk budget's holds (#11191) into the per-root causes: a root no
 /// other hold names, whose disk charge does not fit at the top of the tick,
 /// is held as [`HaltCause::DiskReservation`]. Lowest precedence, so a root
