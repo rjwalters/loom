@@ -2465,7 +2465,10 @@ acted on, and a closed-set reason code per skipped candidate. Role ticks record
 the queue the agent actually consumed (`pr-queue`, or Curator's listings) and
 the writes it issued, via a per-tick pick journal (#10432); `candidate_source`
 and `decisions_observed` say what was seen. Empty ticks still
-emit, so per-host service cadence is measurable. Full field reference, the
+emit, so per-host service cadence is measurable. Work-finder records carry
+the workspace draw; its seed's inputs (`seed_scheme`, `seed_minute`,
+`seed_host`, #11683) were added as optional fields under the stability promise
+above. Full field reference, the
 SigNoz rank-at-instant query and the rows/day volume:
 [`telemetry-kind-pick-decision.md`](telemetry-kind-pick-decision.md).
 

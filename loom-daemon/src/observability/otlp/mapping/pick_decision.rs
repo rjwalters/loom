@@ -104,6 +104,9 @@ mod tests {
                 seed: "42".into(),
                 draws_total: 200,
                 draws,
+                seed_scheme: Some("loom-draw/v1".into()),
+                seed_minute: Some("29000000".into()),
+                seed_host: Some("host-a".into()),
             },
         ));
         for chunk in split_into_chunks(record, 2_000) {
@@ -119,6 +122,9 @@ mod tests {
             assert_eq!(body["tick_id"], "t");
             assert_eq!(body["workspace_draw"]["seed"], "42");
             assert_eq!(body["workspace_draw"]["draws_total"], 200);
+            assert_eq!(body["workspace_draw"]["seed_scheme"], "loom-draw/v1");
+            assert_eq!(body["workspace_draw"]["seed_minute"], "29000000");
+            assert_eq!(body["workspace_draw"]["seed_host"], "host-a");
         }
     }
 }

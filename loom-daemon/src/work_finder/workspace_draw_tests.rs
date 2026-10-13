@@ -239,9 +239,59 @@ fn nothing_to_draw_is_no_log() {
 
 #[test]
 fn with_seed_pins_the_tick_seed_and_restores_it() {
-    assert_eq!(tick_seed(), TEST_DEFAULT_SEED);
-    assert_eq!(with_seed(7, tick_seed), 7);
-    assert_eq!(tick_seed(), TEST_DEFAULT_SEED);
+    assert_eq!(tick_seed(), (TEST_DEFAULT_SEED, None));
+    assert_eq!(with_seed(7, tick_seed), (7, None));
+    assert_eq!(tick_seed(), (TEST_DEFAULT_SEED, None));
+}
+
+/// #11683 known-answer vectors: pin the hash input, the byte slice and the
+/// big-endian read (`printf 'loom-draw/v1:%s:%s' m h | shasum -a 256`, first
+/// 16 hex digits). The first is quoted in `daemon-reference.md`.
+#[test]
+fn minute_seed_matches_the_known_answer_vectors() {
+    assert_eq!(DRAW_SEED_SCHEME, "loom-draw/v1");
+    assert_eq!(minute_seed(29_000_000, "host-a"), 0xfee0_c99c_e201_8983);
+    assert_eq!(minute_seed(29_000_000, "host-a"), 18_365_900_956_060_715_395);
+    assert_eq!(minute_seed(29_000_001, "host-a"), 0x9c0f_4254_8d82_e7e0);
+    assert_eq!(minute_seed(29_000_000, "host-b"), 0xac92_930e_1e14_aaf4);
+}
+
+#[test]
+fn minute_seed_is_stable_per_minute_and_host_and_differs_across_either() {
+    let s = minute_seed(29_000_000, "loom-host-0123456789abcdef");
+    assert_eq!(s, minute_seed(29_000_000, "loom-host-0123456789abcdef"));
+    assert_ne!(s, minute_seed(29_000_000, "loom-host-fedcba9876543210"));
+    assert_ne!(s, minute_seed(29_000_001, "loom-host-0123456789abcdef"));
+}
+
+/// Replaying a logged `(minute, host)` reproduces the logged order and draws.
+#[test]
+fn a_logged_minute_and_host_replay_the_order() {
+    let candidates = || -> Vec<PriorityCandidate> {
+        (0..4)
+            .flat_map(|ws| (1..=5).map(move |n| cand(ws, ws as u32 * 100 + n, None, &[])))
+            .collect()
+    };
+    let priorities = [0, 10, 50, 100];
+    let (minute, host) = (29_000_000, "host-a");
+    let (order, log) = draw_order(candidates(), &priorities, minute_seed(minute, host));
+    let log = log.unwrap();
+    let (replayed, relog) = draw_order(candidates(), &priorities, minute_seed(minute, host));
+    let relog = relog.unwrap();
+    assert_eq!(numbers(&order), numbers(&replayed));
+    assert_eq!(log.steps, relog.steps);
+    assert_eq!(log.seed, relog.seed);
+}
+
+/// `order` attaches nothing when the seed is pinned (no inputs to log).
+#[test]
+fn a_pinned_tick_logs_no_seed_inputs() {
+    let mut report = TickReport::default();
+    let ordered = with_seed(7, || order(vec![cand(0, 1, None, &[])], &[0], &mut report));
+    assert_eq!(ordered.len(), 1);
+    let log = report.workspace_draw.unwrap();
+    assert_eq!(log.seed, 7);
+    assert_eq!(log.seed_inputs, None);
 }
 
 #[test]

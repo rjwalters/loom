@@ -230,6 +230,9 @@ pub fn workspace_draw_record(
                 number: step.issue,
             })
             .collect(),
+        seed_scheme: log.seed_inputs.as_ref().map(|i| i.scheme.to_string()),
+        seed_minute: log.seed_inputs.as_ref().map(|i| i.minute.to_string()),
+        seed_host: log.seed_inputs.as_ref().map(|i| i.host.clone()),
     }
 }
 
