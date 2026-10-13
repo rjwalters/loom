@@ -163,14 +163,12 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
         let mut hits = Vec::new();
         walk(&root.join("defaults"), &mut hits);
-        for f in ["CLAUDE.md"] {
-            let txt = std::fs::read_to_string(root.join(f)).unwrap_or_default();
-            let flat = txt.split_whitespace().collect::<Vec<_>>().join(" ");
-            if flat.contains("--add-label \"loom:curated\"")
-                || flat.contains("--add-label loom:curated")
-            {
-                hits.push(f.to_string());
-            }
+        let txt = std::fs::read_to_string(root.join("CLAUDE.md")).unwrap_or_default();
+        let flat = txt.split_whitespace().collect::<Vec<_>>().join(" ");
+        if flat.contains("--add-label \"loom:curated\"")
+            || flat.contains("--add-label loom:curated")
+        {
+            hits.push("CLAUDE.md".to_string());
         }
         assert!(
             hits.is_empty(),
