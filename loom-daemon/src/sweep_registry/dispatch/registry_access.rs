@@ -33,7 +33,15 @@
 //! The local claim (lock dir + in-flight key) is taken under one continuous
 //! lock hold that begins with a dedup re-check, so two concurrent dispatches
 //! of one issue still yield exactly one spawn: the loser gets the idempotent
-//! hand-back (same key) or the `acquire_lock` collision refusal.
+//! hand-back (same key) or the `acquire_lock` collision refusal. That hand-back
+//! does not mean "spawned": a same-key retry arriving during the flip, the
+//! lease-order sleeps or the stagger is handed back an attempt that can still
+//! abort (4d yield, 4e release, spawn failure); see `idempotency_dedup`.
+//!
+//! The roll gate's `admit` and its `MidSpawn` guard (`roll_gate.enter()`) are
+//! taken in the same first lock hold, so a roll that closes the gate while
+//! this dispatch runs a lock-free forge step still counts it as mid-spawn
+//! (#10831 H4).
 //!
 //! [`forge_twin`]: SweepRegistry::forge_twin
 

@@ -123,6 +123,57 @@ fn registry_lock_is_free_while_a_forge_guard_is_in_flight() {
     reap(worker.join().unwrap());
 }
 
+/// #10831 H4 under #9573: a roll that closes the gate while an admitted
+/// `Shared` dispatch is parked in a lock-free forge read must either see that
+/// dispatch in `mid_spawn_dispatches()` (and so wait for it) or the dispatch
+/// must never spawn. Before the fix `enter()` ran only after the spawn, so the
+/// closer read zero and the child started after the pause snapshot.
+#[test]
+#[serial]
+fn roll_gate_close_during_a_forge_guard_counts_the_admitted_dispatch() {
+    let dir = tempdir().unwrap();
+    let ws = dir.path().to_path_buf();
+    std::env::remove_var("LOOM_REPO");
+    let (reg, gh_log, _spawns) = slow_gh_registry(&ws, "1.5");
+    let registry = Arc::new(Mutex::new(reg));
+
+    let worker = {
+        let registry = Arc::clone(&registry);
+        std::thread::spawn(move || begin_shared(&registry, 10_831, None))
+    };
+    assert!(
+        wait_for_condition(10_000, || std::fs::read_to_string(&gh_log)
+            .is_ok_and(|log| log.lines().any(|l| l.starts_with("api")))),
+        "dispatch never reached a forge guard"
+    );
+
+    // The roll's `close_dispatch` + `pending_dispatches` shape: close the
+    // gate and read the mid-spawn count in one lock hold.
+    let closer_saw = {
+        let mut reg = registry.lock().unwrap();
+        reg.close_for_roll("roll-9573", true);
+        reg.mid_spawn_dispatches()
+    };
+    assert!(
+        !worker.is_finished(),
+        "the dispatch finished before the closer could observe it mid-guard"
+    );
+
+    let outcome = worker.join().unwrap();
+    let spawned = matches!(outcome, Ok(BeginIssueDispatch::Spawned(_)));
+    assert!(
+        closer_saw > 0 || !spawned,
+        "a dispatch spawned after the roll closed the gate and read mid_spawn_dispatches() == 0"
+    );
+    assert_eq!(closer_saw, 1, "the admitted dispatch must be counted as mid-spawn");
+    reap(outcome);
+    assert_eq!(
+        registry.lock().unwrap().mid_spawn_dispatches(),
+        0,
+        "the guard is released once the hand-back is dropped"
+    );
+}
+
 /// Two concurrent dispatches of one issue and one idempotency key: exactly one
 /// spawns, the other gets the graceful hand-back or a refusal.
 #[test]

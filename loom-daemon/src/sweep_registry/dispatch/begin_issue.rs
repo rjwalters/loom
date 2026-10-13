@@ -143,6 +143,13 @@ impl SweepRegistry {
         let sr = acc.reg();
         // #10974: a daemon roll is pausing agents; nothing new may start.
         sr.roll_gate.admit(kind)?;
+        // Count this dispatch as mid-spawn in the SAME lock hold as `admit`
+        // (#10831 H4, kept atomic under #9573): the `Shared` path drops the
+        // lock for the forge guards below, so a roll that closes the gate in
+        // that window must still see this admitted dispatch in
+        // `mid_spawn_dispatches()` and wait for it. Every early return drops
+        // the guard; a `Spawned` hand-back carries it to `finish_issue_dispatch`.
+        let mid_spawn = sr.roll_gate.enter();
 
         // Runtime admission is the first decision for a new dispatch:
         // before account selection, claim lock, forge mutation,
@@ -854,9 +861,27 @@ impl SweepRegistry {
                  label is left in place since it already protects the winning claimant's claim."
             );
             {
+                // One lock hold: retract, release the claim lock, arm the
+                // backoff and drop the in-flight idempotency key together, so
+                // a same-key retry never gets a hand-back naming a sweep that
+                // has already released its claim (#9572/#9573).
                 let sr = acc.reg();
                 sr.publish_peer_claim(peer_claims::ClaimKind::Retract, issue_number);
                 let _ = sr.release_lock_owned(issue_number, &sweep_id);
+                // #6350: a lost lease-order tie-break is a no-progress outcome
+                // for THIS host exactly like the reaper's #4366 backstop —
+                // arming this host's own per-issue dispatch backoff (#4485)
+                // means the very next work-finder tick does not immediately
+                // re-attempt (and re-lose) the identical race against the same
+                // still-live earlier claimant. A redispatch-rate damper only:
+                // it never touches the quarantine tally and does not affect
+                // the `loom:building` label the earlier claimant still holds.
+                sr.record_dispatch_failure(issue_number);
+                // #9572: this attempt is abandoned — release the in-flight
+                // idempotency key claimed at step 3.05.
+                if let Some(ref key) = idempotency_key {
+                    sr.inflight_idempotency.remove(key);
+                }
             }
             // #10345: a leaseless yield whose `loom:building` event is provably
             // this dispatcher's own flip (fleet actor, inside the flip window,
@@ -886,23 +911,6 @@ impl SweepRegistry {
                     &earliest_sweep_id,
                 );
             });
-            // #6350: a lost lease-order tie-break is a no-progress outcome for
-            // THIS host exactly like the reaper's #4366 backstop below —
-            // arming this host's own per-issue dispatch backoff (#4485) here
-            // means the very next work-finder tick does not immediately
-            // re-attempt (and re-lose) the identical race against the same
-            // still-live earlier claimant. This is purely a redispatch-rate
-            // damper: it never touches the quarantine tally (this issue is
-            // not broken, it already has an owner), and it does not affect
-            // the `loom:building` label the earlier claimant still holds.
-            let sr = acc.reg();
-            sr.record_dispatch_failure(issue_number);
-            // #9572: this attempt is abandoned — release the in-flight
-            // idempotency key claimed at step 3.05 so a later same-key
-            // dispatch is not wedged behind a sweep that never spawned.
-            if let Some(ref key) = idempotency_key {
-                sr.inflight_idempotency.remove(key);
-            }
             return Err(LeaseOrderDispatchError {
                 issue: issue_number,
                 sweep_id: sweep_id.clone(),
@@ -1001,7 +1009,7 @@ impl SweepRegistry {
             story_points,
             model_source,
             dispatch_origin,
-            mid_spawn: acc.reg().roll_gate.enter(),
+            mid_spawn,
         })))
     }
 
@@ -1011,6 +1019,14 @@ impl SweepRegistry {
     /// instead of dispatching. Run once at the top and again right before the
     /// local claim (#9573), because the forge guards in between run with the
     /// registry lock released.
+    ///
+    /// A 1b hand-back (`was_new: false`) means "an attempt for this key holds
+    /// the claim", NOT "a child was spawned": on the `Shared` path the lock is
+    /// released between the local claim (3.05) and the spawn, so a same-key
+    /// retry can land during the label flip, the lease-order sleeps or the
+    /// stagger and be handed back an attempt that still aborts afterwards
+    /// (4d lease-order yield, the 4e closed-after-flip release, or a spawn
+    /// failure). Each abort clears the key, so the next retry dispatches anew.
     fn idempotency_dedup(
         &self,
         kind: &SweepKind,
