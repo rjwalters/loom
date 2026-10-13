@@ -248,7 +248,7 @@ to avoid the duplicate-build failure mode Epic #6165's own body measured at
 dispatch can be re-enabled with evidence rather than hope" — needs two things
 this document (plus the phases around it) supplies: correctness evidence (the
 lease gate, Phase 2 #6286, refusing to reclaim a fresh claim regardless of
-peer-claim channel state) and cost evidence (this document: renewal write
+any side-channel state) and cost evidence (this document: renewal write
 volume comfortably inside the shared forge rate-limit budget at current fleet
 size, ~3.5%, and at 2× fleet size, ~7%, both PROJECTED — see "Projected
 estimate" above). Re-enabling multi-host dispatch is a decision for whoever

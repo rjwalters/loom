@@ -15,7 +15,7 @@
 # Why this file exists (#7834): the scan started life inline in
 # test-loom-daemon-watchdog.sh, where it sliced the body with an awk pattern
 # that only matched openers ENDING in `<<EOF`. The #7508 fix had already moved
-# escalate_peer_coordination_degraded() to `IFS= read -r -d '' body <<EOF ||
+# the watchdog's escalation body to `IFS= read -r -d '' body <<EOF ||
 # true` — the line ends in `|| true`, the pattern never fired, the slice came
 # back EMPTY, and both of that function's assertions passed VACUOUSLY. Two
 # properties here are the structural fix for that whole class:

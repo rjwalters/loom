@@ -29,8 +29,8 @@
 //!
 //! # The equivalence proof
 //!
-//! `defaults/scripts/tests/test-loom-daemon-watchdog.sh` (188 assertions, plus
-//! 4 retired records) is a retained black-box suite: it invokes the stub **by
+//! `defaults/scripts/tests/test-loom-daemon-watchdog.sh` is a retained
+//! black-box suite: it invokes the stub **by
 //! path** with environment overrides and asserts on stdout, the log file and
 //! exit codes.
 //!

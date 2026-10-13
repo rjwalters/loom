@@ -146,7 +146,7 @@ the human view of `CLASSIFICATION` in `loom-daemon/src/fleet_policy.rs`, which
 
 | Class | Top-level keys | Lives in |
 |-------|----------------|----------|
-| **Fleet** | `autonomous`, `runtimes`, `safehouse`, `observability`, `offlineMode`, `operatorPresence`, `guide`, `sweep`, `daemon`, `fleet`, `repos` | fleet-gitops only |
+| **Fleet** | `autonomous`, `runtimes`, `observability`, `offlineMode`, `operatorPresence`, `guide`, `sweep`, `daemon`, `fleet`, `repos` | fleet-gitops only |
 | **Repo** | `terminals`, `buildGate`, `branchProtection`, `guards`, `labels`, `forge`, `reflection`, `version` | tracked `.loom/config.json` / `.loom-project/project.json` |
 | **Host** | `worktree`, `health_monitoring` (and per-host paths, see below) | `.loom-local/local.json` |
 
@@ -172,8 +172,8 @@ entry under a Fleet parent exempts just that subtree: with an entry for
 while one that also sets an unallowed sibling (`workFinder.enabled`) is still
 flagged at `autonomous`.
 
-This supersedes the "Project (default) or Local" ownership of `autonomous.*`,
-`safehouse.*` and `observability.*` in `docs/design/config-resolution-tiers.md`
+This supersedes the "Project (default) or Local" ownership of `autonomous.*`
+and `observability.*` in `docs/design/config-resolution-tiers.md`
 section 3: a repo is not the place to decide fleet behaviour. A repo with no
 `.loom/config.json` resolves entirely from tier 1 (the resolver soft-fails each
 missing tier).
@@ -191,7 +191,9 @@ Enforcement:
   `loom update`) removes a Fleet key from an installed `.loom/config.json`
   **only when its committed value equals the old template seed exactly** —
   `offlineMode: false`, `runtimes: {"default": "claude"}`, or the pre-#11445
-  `safehouse` block (the seeds live in `fleet_policy::legacy_template_seeds`).
+  block of the retired Matrix integration (the seeds live in
+  `fleet_policy::legacy_template_seeds`; any other leftover copy of that block
+  is ignored with one boot-time warning, #11112).
   This changes no behaviour: the current template no longer ships those keys,
   so fleet policy resolves from tier 1 either way. Any other Fleet content is
   left in place, logged (`init: config.json: stripped legacy template seed
@@ -245,14 +247,14 @@ attempted here.
 A related, distinct failure shape: `.loom/config.json` is **tracked and
 shared**, but some keys are inherently true of exactly one host — a
 filesystem path, a socket, an on/off switch that depends on how that
-specific machine is provisioned (`safehouse.socket`, `observability.ingestKeyFile`,
+specific machine is provisioned (`observability.ingestKeyFile`,
 `worktree.root`). Committing one of these bakes one host's local truth into
 every other host's `git pull`, and it has recurred repeatedly: #5354 and
 #5464 each fixed one committed instance reactively, and #6499 showed the
 sharpest failure mode — an abandoned `git stash pop` left live conflict
 markers straddling a host's local patch and the tracked file, which then got
 **committed**, making `.loom/config.json` invalid JSON and silently dropping
-`observability`/`safehouse`/`autonomous.roleRunner` config to built-in
+`observability`/`autonomous.roleRunner` config to built-in
 defaults for ~70 minutes.
 
 **The fix is structural, not a one-time cleanup:**

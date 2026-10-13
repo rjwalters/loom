@@ -5,6 +5,10 @@
 Accepted (design decision). Implementation is phased into follow-up issues — see
 "Suggested phasing" below; this ADR does not itself change any code.
 
+Partly superseded by [ADR-0025](0025-forge-lease-only-cross-host-claim.md)
+(#11112): the safehouse transport this ADR treats as an accelerator was
+removed from Loom. The forge-side memo reasoning stands.
+
 ## Context
 
 The forge (GitHub) does two jobs for Loom: it is the **durable record** (issues,

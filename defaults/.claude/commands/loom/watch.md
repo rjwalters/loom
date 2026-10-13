@@ -354,12 +354,9 @@ These land in the tick log and the end-of-window summary. They do not wake anyon
 | **E4** | **A remediation's stop condition was reached and the condition persists** (e.g. R2 recurring after a backfill) | The playbook is out of moves. Continuing would be repetition, not repair. |
 | **E5** | **The watch itself cannot continue** — probe unavailable *and* fallback failing, or the loop is out of context/budget | A silently-dead watch is worse than no watch; say so before stopping. |
 
-**How to page**: post the escalation to the operator's channel if one is
-configured (`./.loom/scripts/fleet-send.sh`, see
-[`.loom/docs/safehouse.md`](../../../.loom/docs/safehouse.md)), **and** print it
-prominently in the session, **and** carry it into the end-of-window summary's
-Incidents section. If no channel is configured, the session output plus the
-summary is the page — never swallow it because the fancy path is unavailable.
+**How to page**: print the escalation prominently in the session **and** carry
+it into the end-of-window summary's Incidents section. The session output plus
+the summary is the page — never swallow it.
 
 **Page once per condition per window**, not once per tick. Re-page only if the
 condition's character changes (E1 for 1 dead account → E1 for the whole pool).

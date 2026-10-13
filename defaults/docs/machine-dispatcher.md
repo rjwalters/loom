@@ -175,14 +175,10 @@ user-scope server and would silently pin a stale per-repo bundle forever — the
 
 - `scripts/setup-mcp.sh` is **demoted**: it no longer emits a `loom` entry, and
   it **strips** any pre-existing project-scope `loom` entry from the target's
-  `.mcp.json` (removing the file if `loom` was its only server). Its residual
-  role is **safehouse only** — when `safehouse` is enabled it emits a
-  `.mcp.json` containing just the per-repo `safehouse` server (whose socket +
-  persona are inherently per-repo/session; the per-worker persona is still
-  injected at spawn time by `spawn-claude.sh --mcp-config`, unchanged).
+  `.mcp.json` (removing the file if `loom` was its only server).
 - The `.mcp.json` symlink step in `worktree.sh` / `pr-worktree.sh` becomes
   **vestigial** under user scope (a user-scope server applies from any CWD) but
-  is left intact — it is harmless and still serves un-migrated / safehouse repos.
+  is left intact — it is harmless and still serves un-migrated repos.
 
 ### `claude-wrapper.sh` behavior with no `.mcp.json`
 
@@ -487,17 +483,17 @@ boundary no matter where it is invoked. What one pass does:
    a stray host-local value there would silently propagate one operator's machine
    to the whole team. The list is `MC_HOST_LOCAL_KEYS` in
    `scripts/install/migrate-consumer.sh` — currently `worktree.root` (per-host
-   scratch-disk path), `safehouse.enabled` and `safehouse.socket` (whether
-   safehoused is provisioned on this box, and where its socket lives). The
-   criterion for adding one is **"the value is materially true of one host and
-   false of the others"**, and routing is per-**sub-key**, never per-object:
-   `safehouse.room` / `.rooms` / `.persona` describe what the repo does regardless
-   of who runs it, so they stay in the tracked `project.json` while their siblings
-   move. An object emptied by the routing (a `safehouse` block that was *only*
-   `enabled`/`socket`) is pruned from `project.json`. An existing `project.json` is
-   left untouched (idempotency); an existing `local.json` override is preserved —
-   only keys unset there are filled in, so `safehouse.enabled=false` survives a
-   re-run rather than being re-derived. For a host whose dirt has *already* been
+   scratch-disk path) and `observability.ingestKeyFile` (a per-host credential
+   path). The criterion for adding one is **"the value is materially true of one
+   host and false of the others"**, and routing is per-**sub-key**, never
+   per-object: `observability.enabled` / `.endpoint` describe what the repo does
+   regardless of who runs it, so they stay in the tracked `project.json` while
+   their siblings move. An object emptied by the routing is pruned from
+   `project.json`, and a retired block (`MC_RETIRED_KEYS`, #11112) is dropped
+   from both tiers. An existing `project.json` is left untouched (idempotency);
+   an existing `local.json` override is preserved — only keys unset there are
+   filled in, so a host-local `false` survives a re-run rather than being
+   re-derived. For a host whose dirt has *already* been
    committed (migration is a one-time pass, not an ongoing per-field fixer), the
    by-hand per-key procedure is
    [`docs/design/config-resolution-tiers.md`](https://github.com/rjwalters/loom/blob/main/docs/design/config-resolution-tiers.md)
@@ -528,7 +524,7 @@ boundary no matter where it is invoked. What one pass does:
    worktree it kills every daemon-dispatched child at the claude-wrapper MCP
    pre-flight (a fleet-wide spawn outage with no surfaced error). Migration strips
    any repo-scoped `loom` entry from `.mcp.json` (deleting the file if `loom` was
-   its only server; other servers such as `safehouse` are kept — matching
+   its only server; other servers are kept — matching
    `setup-mcp.sh`'s #4230 migration), then **verifies the user-scope `loom`
    registration** exists and points at the machine checkout's
    `mcp-loom/dist/index.js`, `claude mcp add --scope user`-ing it if absent or

@@ -34,7 +34,7 @@ plist with:
 ```
 
 at `render_launchd_plist` (the daemon job) and again in the watchdog job's
-renderer. `safehoused-service.sh` does the same for the safehouse service.
+renderer.
 
 Per `launchd.plist(5)`, `ProcessType` "describes the intended purpose of the
 job" and the system "applies resource limits based on what kind of job it is";

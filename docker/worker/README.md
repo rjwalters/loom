@@ -30,7 +30,7 @@ reason: **it forks the fleet's restart-safety contract (#5119)**.
 > (`KillMode=mixed`) unless the daemon does an explicit `restart --drain`
 > first (see [`daemon-reference.md`](../../.loom/docs/daemon-reference.md)
 > around "Supervisor difference — on systemd, a plain stop/restart KILLS
-> sweeps (#5119)"). `fleet add-worker --safehouse`'s systemd-unit assumptions
+> sweeps (#5119)"). `fleet add-worker`'s systemd-unit assumptions
 > (`daemon-unit` step: `Restart=on-success`, `LOOM_DAEMON_SUPERVISOR=systemd`,
 > the `--drain` contract) are built entirely around that boundary.
 

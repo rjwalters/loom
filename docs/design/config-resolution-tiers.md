@@ -2,8 +2,7 @@
 
 **Status:** Resolver shipped, additive only, **and now the majority migration
 path** — the call-site migration follow-up (#4047) closed 2026-07-28 and most
-of #4047's ~40 sites (including `loom-daemon/src/safehouse.rs`, §3's
-`safehouse.*` row below) read through it today. A handful of documented
+of #4047's ~40 sites read through it today. A handful of documented
 exceptions remain on the legacy single-tier path by design — see
 ["Follow-ups"](#6-follow-ups-explicitly-out-of-scope-here) below for which
 ones and why.
@@ -101,10 +100,9 @@ partially-migrated repo work correctly).
 | `autonomous.workFinder`, `autonomous.mainHealthGate`, `autonomous.roleRunner` | object/number | Project (default) **or** Local (host override) | Same reasoning as model overrides: the *policy* (should this repo run a work finder at all) is project-shared; the *capacity* tuning for one specific host (e.g. `autonomous.workFinder.maxConcurrent` sized to that host's disk/RAM headroom) is a natural `.loom-local` override. |
 | `worktree.root` | string | Local (`.loom-local/local.json`) | Inherently host-specific (an external scratch volume path) — never meant to be shared across machines. |
 | `forge.*` (type, gitea url/token) | object | Project (type/url) / Local (token, if not using a repo secret) | `forge.type`/`forge.gitea.url` describe the repo; a raw token belongs host-local, never committed. |
-| `safehouse.*` (`enabled`, `socket`, `room`, `persona`) | object | Project (policy) **or** Local (host socket) | Optional daemon-side fleet-comms narration (#3997). Whether a repo narrates at all (`enabled`/`persona`/`room`) is a project-shared policy; the `socket` path (and often `enabled`) is a natural `.loom-local` host override since `safehoused` runs per-host. Resolved by `loom-daemon/src/safehouse.rs` with **env > config > default(disabled)**; see [`.loom/docs/safehouse.md`](../../.loom/docs/safehouse.md). |
-| `observability.ingestKeyFile` | string | Local (`.loom-local/local.json`) | A per-host filesystem path to that host's telemetry ingest credential — inherently host-specific the same way `safehouse.socket` is. `observability.enabled`/`.endpoint`/`.batchSize`/`.flushIntervalSecs`/`.queueCapacity` describe whether/how the repo reports telemetry regardless of who runs it and stay Project. Resolved by `loom-daemon/src/observability/mod.rs` with **env > config > `$HOME`-relative default** — a host that never overrides it still resolves to `$HOME/.loom/observability/ingest.key`, so deleting a stray committed value (rather than routing it through `.loom-local/`) is often the correct fix; see #5354, #5464, #6499, #6504. |
+| `observability.ingestKeyFile` | string | Local (`.loom-local/local.json`) | A per-host filesystem path to that host's telemetry ingest credential — inherently host-specific. `observability.enabled`/`.endpoint`/`.batchSize`/`.flushIntervalSecs`/`.queueCapacity` describe whether/how the repo reports telemetry regardless of who runs it and stay Project. Resolved by `loom-daemon/src/observability/mod.rs` with **env > config > `$HOME`-relative default** — a host that never overrides it still resolves to `$HOME/.loom/observability/ingest.key`, so deleting a stray committed value (rather than routing it through `.loom-local/`) is often the correct fix; see #5354, #5464, #6499, #6504. |
 
-> **Amended by #11441:** the `autonomous.*`, `safehouse.*` and `observability.*`
+> **Amended by #11441:** the `autonomous.*` and `observability.*`
 > rows above (other than `observability.ingestKeyFile`) are **fleet policy** and
 > are owned by fleet-gitops (tier 1), not by this repo tier. A tracked repo tier
 > may carry them only via a reasoned entry in `.loom/fleet-policy-allow.json`.
@@ -170,20 +168,20 @@ host-local — has to be moved by hand, once, per key.
 **Is the key host-local?** The criterion is not "does it look machine-ish" but
 **is the value materially true of one host and false of the others** — a per-host
 filesystem path, a socket, or an on/off switch that depends on how that box is
-provisioned. `worktree.root` (scratch-disk path) and `safehouse.enabled` /
-`safehouse.socket` (is safehoused provisioned here, and where) qualify;
-`safehouse.room` / `.rooms` / `.persona` do not — they describe what the repo
+provisioned. `worktree.root` (scratch-disk path) and
+`observability.ingestKeyFile` (a per-host credential path) qualify;
+`observability.enabled` / `.endpoint` do not — they describe what the repo
 does regardless of who runs it, so they stay tracked. The authoritative list the
 migration acts on is `MC_HOST_LOCAL_KEYS` in
 `scripts/install/migrate-consumer.sh`.
 
-**Move it.** Run from the repo root; `<dotted.path>` is e.g. `safehouse.socket`.
+**Move it.** Run from the repo root; `<dotted.path>` is e.g. `worktree.root`.
 This copies the effective value into the local tier only when that tier does not
 already set it (never clobber an operator's own override), then removes it from
 the tracked tier:
 
 ```bash
-KEY='safehouse.socket'
+KEY='worktree.root'
 
 # 1. Read the value you actually want to keep on THIS host (check both tracked
 #    tiers; the working-copy edit is usually in .loom/config.json).
@@ -194,7 +192,7 @@ jq --arg p "$KEY" 'getpath($p|split("."))' .loom/config.json .loom-project/proje
 #    managed block normally covers it, but an old repo may predate that.)
 mkdir -p .loom-local
 [ -f .loom-local/local.json ] || echo '{}' > .loom-local/local.json
-jq --arg p "$KEY" --argjson v '"/run/user/1000/safehoused.sock"' \
+jq --arg p "$KEY" --argjson v '"/mnt/scratch"' \
    '($p|split(".")) as $path
     | if ((getpath($path)) == null or (getpath($path)) == "")
       then setpath($path; $v) else . end' \
@@ -213,7 +211,7 @@ loom_config_get "$PWD" "$KEY"
 git status --short   # .loom-local/ must NOT appear (it is gitignored)
 ```
 
-`--argjson` (not `--arg`) is load-bearing for booleans: `safehouse.enabled=false`
+`--argjson` (not `--arg`) is load-bearing for booleans: a host-local `false`
 must land as JSON `false`, not the string `"false"`. Likewise, do not "simplify"
 step 2's `getpath(...) == null` test into `// empty` — `false // empty` discards
 exactly the value this move exists to preserve.
@@ -231,9 +229,9 @@ host** (e.g. `observability.ingestKeyFile` defaults to
 on every host, the fix for a stray committed value is simply deleting the
 line from the tracked tier (step 3 above), with no step 2 needed at all — this
 was the actual fix for `observability.ingestKeyFile` (#6506). Reach for the
-local tier only when no such default exists (`safehouse.socket`, `#5457`/`#5523`:
-there is no code-level guess for where `safehoused`'s socket lives, so the
-value has to live *somewhere*, and that somewhere is `.loom-local/local.json`).
+local tier only when no such default exists (`worktree.root`: there is no
+code-level guess for a host's scratch volume, so the value has to live
+*somewhere*, and that somewhere is `.loom-local/local.json`).
 
 **A newly-committed absolute path under a home directory
 (`/home/<user>/…`, `/Users/<user>/…`, `/root/…`) in the tracked

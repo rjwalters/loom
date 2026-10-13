@@ -86,7 +86,7 @@ The forge is the coordination substrate **every host already reads and writes**
 for the work it is coordinating. Three properties decide it:
 
 - **A shared clock for free.** Every host reads the *same* server-assigned
-  `updated_at` for the same comment. `peer_claims.rs` timestamps at local
+  `updated_at` for the same comment. A broadcast channel timestamps at local
   receipt and has to correct for skew; a forge comment does not have that
   problem. This is the same argument [`lease-record.md`](lease-record.md) makes
   for the reclamation gate, and it is what makes the eviction instant
@@ -96,7 +96,7 @@ for the work it is coordinating. Three properties decide it:
   nothing to provision on a host that is already running a daemon and a `gh`
   credential.
 - **Proven in this repo.** The same marker-comment idiom already carries lease
-  records (`<!-- loom:lease host=… sweep=… -->`), peer-claim standdowns
+  records (`<!-- loom:lease host=… sweep=… -->`), claim standdowns
   (`<!-- loom:standdown claim=… -->`), and Champion's merge-risk hold digest
   (an issue body overwritten in place behind a
   `<!-- champion:merge-risk-hold-digest -->` marker, #6877 — the digest is also
@@ -120,33 +120,14 @@ come from whichever host wrote them, so a skewed writer's heartbeat is
 indistinguishable from a fresh one, and the eviction-determinism argument
 below collapses.
 
-### Rejected: daemon-to-daemon (the safehouse peer mesh)
+### Rejected: daemon-to-daemon (a peer mesh)
 
-Deriving the roster from `peer_claims.rs` — the hosts this daemon has recently
-heard advertisements from over the safehouse room.
-
-**Rejected on four independent grounds:**
-
-1. **This repo already rejected it, in writing, for the adjacent problem.**
-   [`dispatcher-repo-sharding.md`](dispatcher-repo-sharding.md) (#6243)
-   considered deriving host rank from the observed peer roster and chose
-   #6374's declared ring instead — "a roster-derived rank is only as disjoint
-   as the roster is converged, and the roster converges by observing peer
-   traffic — precisely the eventually-consistent channel whose races this issue
-   exists to reduce." Building the opposite answer here would leave the two
-   sharding consumers on contradictory foundations. (That dispatcher consumer
-   was retired in #11682; the quoted reasoning is in the doc's git history.)
-2. **Its liveness signal was removed from load-bearing use on purpose.**
-   Epic #6165 Phase 4 (#6317) deleted the peer-coordination-DEGRADED gate
-   (#6157) from the reclamation decision path and replaced it with the lease
-   record. The mesh is *advisory* by current design; promoting it back to
-   load-bearing for the ring would reverse a shipped decision.
-3. **It is unreliable in practice.** The recurring peer-claim DEGRADED alerts
-   on the fleet's Linux worker are exactly the "I stopped hearing from peers"
-   false signal that would silently resize the ring.
-4. **It is off by default.** `safehouse.enabled` defaults to `false`, so a
-   roster built on it would be unavailable on a default install — and the
-   escape hatch for that would be… the static ring we are trying to replace.
+Deriving the roster from a daemon-to-daemon broadcast — the hosts this daemon
+has recently heard from. Rejected because a roster-derived rank is only as
+disjoint as the roster is converged, and a broadcast roster converges only
+eventually (#6243's reasoning for the dispatcher ring); the one such channel
+Loom had (Matrix peer claims) was chronically degraded and was removed in
+#11112.
 
 ### Rejected: leader election / compare-and-swap on a shared record
 

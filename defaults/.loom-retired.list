@@ -120,3 +120,18 @@ scripts/tests/test-resolve-tier-model.sh
 # #11707 (PR #11724, 2026-10-13) — the chain-head merge lock (#10428/#10478)
 # removed from merge-pr.sh; its dedicated shell suite goes with it.
 scripts/tests/test-merge-pr-chain-lock.sh
+
+# #11112 (final slice) — the Matrix fleet-comms integration (narration, the
+# peer-claim channel, the fleet room helpers and the worker-session MCP
+# injection) removed; Loom coordinates through labels and forge leases only.
+docs/safehouse.md
+docs/fleet-comms.md
+scripts/check-safehouse-socket.sh
+scripts/cli/safehoused-service.sh
+scripts/fleet-send.sh
+scripts/fleet-check.sh
+scripts/lib/mcp-config.sh
+scripts/tests/test-safehoused-service.sh
+scripts/tests/test-fleet-send.sh
+scripts/tests/test-fleet-check.sh
+scripts/tests/test-mcp-config.sh

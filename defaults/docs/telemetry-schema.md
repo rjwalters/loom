@@ -390,7 +390,7 @@ unknown, never guessed. They come from the dispatch itself, with no forge read.
 
   | Value | Dispatch path |
   |---|---|
-  | `operator` | `loom-daemon dispatch`, the `dispatch_sweep` MCP tool, Safehouse ChatOps `dispatch` |
+  | `operator` | `loom-daemon dispatch`, the `dispatch_sweep` MCP tool |
   | `work_finder` | the autonomous work finder |
   | `epic_supervisor` | the epic supervisor's next-phase dispatch |
   | `watchdog` | a registry watchdog re-dispatch (startup, mid-build death, review stall) |
@@ -533,13 +533,9 @@ transcript was found for this sweep. Each row is a
 (`input` = `input_tokens` + `cache_read_input_tokens` +
 `cache_creation_input_tokens`; `cache_read`/`cache_write_5m`/
 `cache_write_1h` further split the cache portion) and output token counts —
-the same shape and same underlying aggregation
-(`crate::transcript_tokens::sum_sweep_tokens_by_model`) the safehouse
-`completion-v1` envelope's own `tokens_by_model` field already carries, so
-the two paths report identical per-sweep token data. This closes the gap
-where a dashboard-sourced backfill (reconstructing completions from
-`sweep.completed` + GitHub when the safehouse→egress path is down) had no
-token data to fall back on.
+summed by `crate::transcript_tokens::sum_sweep_tokens_by_model`. This closes
+the gap where a dashboard-sourced backfill (reconstructing completions from
+`sweep.completed` + GitHub) had no token data to fall back on.
 
 Populated on the backfill/local-journal export path
 (`observability::backfill::synthesize_completed`, copied verbatim from the

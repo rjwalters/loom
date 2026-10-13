@@ -121,7 +121,7 @@ This is intentional: defaults/ are distribution templates, the root files are th
 ### `config.json`
 
 `config.json` uses the version 2 daemon schema: top-level blocks for `forge`,
-`runtimes`, `safehouse`, `health_monitoring`, `reflection`, `autonomous`, and
+`runtimes`, `health_monitoring`, `reflection`, `autonomous`, and
 friends, plus the `terminals` array (per-agent role/model). The committed
 `defaults/config.json` is the authoritative example of the structure; the full
 reference for the `autonomous` block and daemon behavior is

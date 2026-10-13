@@ -297,7 +297,7 @@ keeps an older installed `sweep.md` correct. Explicit flags always win.
   #6592/#7307 split that moved the account-selection poll out from under the
   lock.
 - **After** the #4689 immediate-preflight-death check, deliberately: that
-  branch unwinds the whole claim (label, claim lock, peer-claim ad) for a
+  branch unwinds the whole claim (label, claim lock) for a
   child that is already dead, and a loop must never be left watching a pid
   that has already exited. The cost is a bounded gap — the
   account-selection poll, ≤ `TOKEN_NAME_CAPTURE_TIMEOUT` — during which the

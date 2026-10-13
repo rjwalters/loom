@@ -685,7 +685,7 @@ mc_update_claude_md() {
 # every daemon-dispatched child at the claude-wrapper MCP pre-flight (a fleet-wide
 # spawn outage with no surfaced error). This step therefore:
 #   1. strips any repo-scoped `loom` entry from .mcp.json (deleting the file if
-#      `loom` was its only server; other servers such as `safehouse` are kept),
+#      `loom` was its only server; other servers are kept),
 #      matching setup-mcp.sh's #4230 migration;
 #   2. verifies the user-scope `loom` registration exists and points at the machine
 #      checkout's mcp-loom/dist/index.js, (re)adding it if absent or mis-pointed.
