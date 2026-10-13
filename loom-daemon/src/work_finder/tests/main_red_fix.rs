@@ -58,7 +58,6 @@ fn the_marker_leads_the_order_only_on_a_red_main() {
         usize::MAX,
         false,
         None,
-        None,
         &[RED],
     );
     assert_eq!(report.dispatched, 1);
@@ -99,7 +98,6 @@ fn a_labelled_red_main_fix_outranks_an_important_issue_without_overflow() {
         usize::MAX,
         false,
         None,
-        None,
         &[RED],
     );
     assert_eq!(multi[0].1.dispatched, vec![9]);
@@ -119,7 +117,6 @@ fn a_halted_red_repo_admits_its_fixes_and_nothing_else() {
         None,
         usize::MAX,
         false,
-        None,
         None,
         &[RED],
     );
@@ -165,7 +162,6 @@ fn a_hold_that_is_not_a_verified_red_main_admits_nothing() {
             usize::MAX,
             false,
             None,
-            None,
             &[lane],
         );
         assert!(multi[0].1.dispatched.is_empty(), "{lane:?}");
@@ -195,7 +191,6 @@ fn a_red_main_fix_does_not_get_the_overflow_slot() {
         None,
         usize::MAX,
         false,
-        None,
         None,
         &[RED],
     );
@@ -323,7 +318,6 @@ fn multi_tick(
         None,
         usize::MAX,
         false,
-        None,
         None,
         &[lane],
     );
@@ -581,7 +575,6 @@ fn the_tick_feeds_the_escalation_with_the_fixes_waiting_on_a_red_main() {
             None,
             usize::MAX,
             false,
-            None,
             None,
             &[lane],
         );

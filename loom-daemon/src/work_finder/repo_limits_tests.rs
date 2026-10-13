@@ -86,7 +86,6 @@ fn tick(cap: Option<usize>, a_live: usize) -> (TickReport, crate::types::WorkFin
         None,
         usize::MAX,
         false,
-        None,
         cap,
         &[],
     );
