@@ -2681,9 +2681,12 @@ Each row:
 #### Champion dispatch metadata (`fleet.state.repos[].champion`)
 
 Additive on `fleet-state/v1`; missing means an older emitter, not human approval.
-`approval` and `merge` are explicitly null (unknown): Champion authority is
-prompt-defined, and no effective auto/human policy configuration exists to read.
-Scheduling, role absence and elapsed approval waits never imply human authority.
+`approval` and `merge` read the per-repo policy contract (#11674): the Fleet key
+`repos[]` = `{repo, policy: {approval, merge}}` (each `auto` | `human`; defined
+once in `loom-daemon/src/merge_policy.rs`, the exporter only reads it). A repo
+with no entry, or a value outside `auto`/`human`, is null (unknown), never
+guessed. ETA join: `champion.merge` (`auto`/`human`/null) keyed by the repo's
+`fleet.state` row is the `merge_wait` predictor feature. Scheduling, role absence and elapsed approval waits never imply human authority.
 `prompt_source` is the actual runner command (`/loom:champion`); `prompt_hash`
 is SHA-256 of the installed command and promotion/merge companions, or null
 when any file is unavailable. A custom prompt changes provenance without
