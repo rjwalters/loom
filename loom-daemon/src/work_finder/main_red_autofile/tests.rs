@@ -42,6 +42,7 @@ fn open(number: u32, sha: &str) -> OpenAuto {
         sha: Some(sha.to_string()),
         has_open_pr: false,
         building: false,
+        green_descends: false,
     }
 }
 
@@ -89,9 +90,12 @@ fn red_with_an_existing_issue_reuses_it() {
 
 #[test]
 fn green_closes_our_issue_unless_a_pr_is_open() {
+    let mut ours = open(7, SHA);
+    ours.green_descends = true;
     let mut with_pr = open(9, SHA);
     with_pr.has_open_pr = true;
-    let actions = decide(&green(), &[open(7, SHA), with_pr], &[], "main");
+    with_pr.green_descends = true;
+    let actions = decide(&green(), &[ours, with_pr], &[], "main");
     let [Action::Close { number, comment }] = actions.as_slice() else {
         panic!("expected one close: {actions:?}");
     };
@@ -227,6 +231,17 @@ struct FakeForge {
     closed: Vec<(u32, bool)>,
     list_fails: bool,
     recently_closed: Vec<ListedIssue>,
+    /// Commits oldest first; `is_ancestor` answers from this order.
+    history: Vec<&'static str>,
+}
+
+impl FakeForge {
+    fn new() -> Self {
+        FakeForge {
+            history: vec![SHA, NEWER],
+            ..FakeForge::default()
+        }
+    }
 }
 
 impl AutofileForge for FakeForge {
@@ -238,6 +253,10 @@ impl AutofileForge for FakeForge {
     }
     fn recently_closed_auto(&mut self) -> Result<Vec<ListedIssue>, String> {
         Ok(self.recently_closed.clone())
+    }
+    fn is_ancestor(&mut self, older: &str, newer: &str) -> bool {
+        let at = |c: &str| self.history.iter().position(|h| *h == c);
+        matches!((at(older), at(newer)), (Some(o), Some(n)) if o <= n)
     }
     fn open_prs(&mut self, issues: &[u32]) -> HashSet<u32> {
         issues
@@ -280,7 +299,7 @@ impl AutofileForge for FakeForge {
 fn reconcile_creates_once_then_reuses_then_closes_on_green() {
     let mut forge = FakeForge {
         next: 100,
-        ..FakeForge::default()
+        ..FakeForge::new()
     };
     let mut memory = Memory::default();
     let (applied, _) = reconcile(&mut forge, &red(SHA), "main", &mut memory).unwrap();
@@ -321,7 +340,7 @@ fn reconcile_reports_a_found_issue_as_reused_once_per_host() {
             body: auto_body(SHA),
             building: false,
         }],
-        ..FakeForge::default()
+        ..FakeForge::new()
     };
     let mut memory = Memory::default();
     let (applied, _) = reconcile(&mut forge, &red(SHA), "main", &mut memory).unwrap();
@@ -352,7 +371,7 @@ fn reconcile_closes_the_newer_duplicate_and_keeps_a_pr_backed_issue_on_green() {
                 building: false,
             },
         ],
-        ..FakeForge::default()
+        ..FakeForge::new()
     };
     let (applied, _) = reconcile(&mut forge, &red(SHA), "main", &mut Memory::default()).unwrap();
     assert!(applied.contains(&Applied {
@@ -372,7 +391,7 @@ fn reconcile_closes_the_newer_duplicate_and_keeps_a_pr_backed_issue_on_green() {
 fn reconcile_creates_nothing_when_the_listing_fails_or_the_verdict_is_unknown() {
     let mut forge = FakeForge {
         list_fails: true,
-        ..FakeForge::default()
+        ..FakeForge::new()
     };
     assert!(reconcile(&mut forge, &red(SHA), "main", &mut Memory::default()).is_err());
     forge.list_fails = false;
@@ -453,7 +472,7 @@ fn a_change_emits_one_main_red_autofile_span() {
 #[test]
 fn hosts_that_disagree_on_one_sha_do_not_churn_the_issue() {
     // Host A's gate is red on SHA; host B's gate is green on the same SHA.
-    let mut forge = FakeForge::default();
+    let mut forge = FakeForge::new();
     let a_red = Verdict::Red(RedEvidence {
         source: Source::Gate,
         sha: Some(SHA.to_string()),
@@ -502,6 +521,7 @@ fn a_red_verdict_without_a_sha_files_nothing() {
 fn a_building_issue_is_never_closed() {
     let mut held = open(7, SHA);
     held.building = true;
+    held.green_descends = true;
     assert!(decide(&green(), &[held.clone()], &[], "main").is_empty());
     let mut dup = held;
     dup.number = 8;
@@ -579,6 +599,9 @@ fn a_failing_close_posts_no_comment() {
         fn close(&mut self, _issue: u32, _not_planned: bool) -> Result<(), String> {
             Err("forbidden".to_string())
         }
+        fn is_ancestor(&mut self, older: &str, newer: &str) -> bool {
+            self.0.is_ancestor(older, newer)
+        }
     }
     let mut forge = NoClose(FakeForge {
         open: vec![ListedIssue {
@@ -586,11 +609,79 @@ fn a_failing_close_posts_no_comment() {
             body: auto_body(SHA),
             building: false,
         }],
-        ..FakeForge::default()
+        ..FakeForge::new()
     });
     for _ in 0..3 {
         let (applied, _) = reconcile(&mut forge, &green(), "main", &mut Memory::default()).unwrap();
         assert!(applied.is_empty());
     }
     assert!(forge.0.comments.is_empty());
+}
+
+#[test]
+fn green_at_an_older_or_unrelated_sha_never_closes() {
+    // The issue was filed for NEWER; a host with a stale fetch reports
+    // green at the older SHA.
+    let mut forge = FakeForge {
+        open: vec![ListedIssue {
+            number: 7,
+            body: auto_body(NEWER),
+            building: false,
+        }],
+        ..FakeForge::new()
+    };
+    let stale_green = Verdict::Green {
+        source: Source::Gate,
+        sha: Some(SHA.to_string()),
+    };
+    let (applied, _) = reconcile(&mut forge, &stale_green, "main", &mut Memory::default()).unwrap();
+    assert!(applied.is_empty(), "{applied:?}");
+    // A green SHA the workspace does not know (missing object) never closes.
+    let unknown_green = Verdict::Green {
+        source: Source::Ci,
+        sha: Some("1111111111111111111111111111111111111111".to_string()),
+    };
+    let (applied, _) =
+        reconcile(&mut forge, &unknown_green, "main", &mut Memory::default()).unwrap();
+    assert!(applied.is_empty(), "{applied:?}");
+    assert!(forge.closed.is_empty());
+    // And decide never closes without the ancestry answer.
+    assert!(decide(&green(), &[open(7, SHA)], &[], "main").is_empty());
+}
+
+#[test]
+fn the_body_sha_must_be_a_commit_id() {
+    assert_eq!(body_sha(&sha_marker(SHA)).as_deref(), Some(SHA));
+    assert_eq!(body_sha(&sha_marker("--upload-pack=x")), None);
+    assert_eq!(body_sha(&sha_marker("abc")), None);
+}
+
+#[test]
+fn the_real_ancestry_check_reads_git() {
+    let dir = tempfile::tempdir().unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .current_dir(dir.path())
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{args:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    git(&["init", "-q"]);
+    git(&["commit", "-q", "--allow-empty", "-m", "a"]);
+    let a = git(&["rev-parse", "HEAD"]);
+    git(&["commit", "-q", "--allow-empty", "-m", "b"]);
+    let b = git(&["rev-parse", "HEAD"]);
+    assert!(git_is_ancestor(dir.path(), &a, &b));
+    assert!(!git_is_ancestor(dir.path(), &b, &a));
+    assert!(!git_is_ancestor(dir.path(), &a, "1111111111111111111111111111111111111111"));
 }

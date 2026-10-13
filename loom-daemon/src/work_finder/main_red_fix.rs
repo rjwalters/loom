@@ -421,6 +421,8 @@ pub fn lane_for(
     suppress_dispatch_during_gate: bool,
     other_hold: bool,
 ) -> RedMainLane {
+    // #11766: the autofiler names the commit the gate tested.
+    super::main_red_autofile::note_evaluated_sha(root, health.gate_last_evaluated_sha());
     RedMainLane {
         verified_red: health.is_halted(),
         // #11690: a `buildGate` block alone produces no verified-red signal;

@@ -3212,7 +3212,11 @@ issue exists (`loom-daemon/src/work_finder/main_red_autofile.rs`):
   cached `gh run list --event push`: a `failure` / `timed_out` /
   `startup_failure` run is red; all runs completed, none failed and one
   succeeded is green; anything else (runs in progress, no runs, an unreadable
-  listing) is unknown, and unknown never files or closes.
+  listing) is unknown, and unknown never files or closes. Because only
+  `push`-event runs on the default branch are read, a repo whose
+  default-branch CI runs only on `schedule`, `workflow_dispatch` or
+  `workflow_run` never reads red here. A gate verdict names the commit the
+  gate last evaluated (its SHA memo), else `origin/<branch>`.
 - **Find first.** An open `loom:very-important` issue whose body carries both
   `<!-- loom:main-red-fix -->` and `<!-- loom:main-red-auto -->` (each at the
   start of a line) and whose author the comment-trust rules trust is the fix.
@@ -3226,13 +3230,15 @@ issue exists (`loom-daemon/src/work_finder/main_red_autofile.rs`):
   a repo `write_scope` lets this installation write. Nothing is filed when the
   SHA is unknown, or when an auto-filed issue for the same SHA was closed in
   the last 6 hours.
-- **Close when green at a newer commit.** On a verified-green `main` each
+- **Close when green at a descendant.** On a verified-green `main` each
   auto-filed issue is closed (`completed`), then commented with the green
-  SHA, but only when `main` is green at a **different** commit than the one
-  the issue was filed for, and never while a PR is open against it or it is
+  SHA, but only when the issue's SHA is a strict ancestor of the green SHA
+  (`git merge-base --is-ancestor` in the workspace; a missing object or any
+  failure means no close), and never while a PR is open against it or it is
   `loom:building`. So one host whose local gate is red on a commit another
   host's gate passes cannot make the two of them file and close the same
-  issue every interval. An issue a person filed with only the fix marker is
+  issue every interval, and a host holding an old green (its fetch failing)
+  cannot close a red at the tip. An issue a person filed with only the fix marker is
   never counted, reused or closed.
 - **Many hosts.** Each host lists before it creates, so the forge is the lock.
   Two hosts that list at the same instant can both create; the next reconcile

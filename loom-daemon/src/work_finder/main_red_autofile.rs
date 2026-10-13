@@ -47,9 +47,9 @@
 //! - red, one open: reuse it; when the failing SHA moved, comment once naming
 //!   the newer SHA;
 //! - green: close each auto-filed issue, then comment naming the green SHA —
-//!   only when `main` is green at a **different** commit than the issue was
-//!   filed for, and never while a PR is open against it or it is
-//!   `loom:building`;
+//!   only when the issue's SHA is a strict ancestor of the green SHA
+//!   (`git merge-base --is-ancestor`; any doubt is no), and never while a PR
+//!   is open against it or it is `loom:building`;
 //! - more than one open (two hosts filed at once): keep the oldest, close the
 //!   rest as duplicates of it.
 //!
@@ -199,6 +199,10 @@ pub struct OpenAuto {
     pub has_open_pr: bool,
     /// A sweep holds it (`loom:building`): never closed under it.
     pub building: bool,
+    /// The issue's SHA is a strict ancestor of the green verdict's SHA
+    /// (`git merge-base --is-ancestor`): `main` moved past the red commit and
+    /// is green there. `false` when unknown, or when the verdict is not green.
+    pub green_descends: bool,
 }
 
 /// One forge change [`decide`] asks for.
@@ -247,7 +251,8 @@ pub fn body_sha(body: &str) -> Option<String> {
             .strip_prefix(SHA_MARKER_PREFIX)
             .and_then(|r| r.strip_suffix("-->"))
             .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
+            // A commit id only: it reaches `git merge-base` as an argument.
+            .filter(|s| (7..=64).contains(&s.len()) && s.chars().all(|c| c.is_ascii_hexdigit()))
     })
 }
 
@@ -307,8 +312,11 @@ pub fn body_for(e: &RedEvidence, branch: &str) -> String {
 ///
 /// Two rules keep hosts that disagree from churning one issue (#11766
 /// review): a green verdict closes an issue only when `main` is green at a
-/// **different** commit than the one the issue was filed for (one host's
-/// local gate can be red on a SHA another host's gate passes), and a red
+/// commit that **descends from** the one the issue was filed for
+/// ([`OpenAuto::green_descends`]): not the same commit (one host's local gate
+/// can be red on a SHA another host's gate passes) and not an older one (a
+/// host whose fetch is failing still holds an old green, #11766
+/// re-review); and a red
 /// verdict does not re-create for a SHA whose issue was closed recently. A
 /// red verdict with no known SHA files nothing, since neither rule could
 /// hold for it.
@@ -330,7 +338,7 @@ pub fn decide(
         } => open
             .iter()
             .filter(closable)
-            .filter(|o| o.sha.as_deref().is_some_and(|red| red != green))
+            .filter(|o| o.green_descends && o.sha.as_deref().is_some_and(|red| red != green))
             .map(|o| Action::Close {
                 number: o.number,
                 comment: format!(
@@ -581,6 +589,9 @@ pub trait AutofileForge {
     fn create(&mut self, title: &str, body: &str, labels: &[String]) -> Result<u32, String>;
     /// The bodies of `issue`'s comments.
     fn comments(&mut self, issue: u32) -> Result<Vec<String>, String>;
+    /// Whether `older` is an ancestor of `newer` in the workspace's
+    /// history. Any doubt (a missing object, a failed check) is `false`.
+    fn is_ancestor(&mut self, older: &str, newer: &str) -> bool;
     /// Post a comment.
     fn comment(&mut self, issue: u32, body: &str) -> Result<(), String>;
     /// Close an issue (`not_planned` for a duplicate, else `completed`).
@@ -627,13 +638,25 @@ pub fn reconcile(
     } else {
         forge.open_prs(&numbers)
     };
+    let green_sha = match verdict {
+        Verdict::Green { sha, .. } => sha.as_deref(),
+        _ => None,
+    };
     let open: Vec<OpenAuto> = listed
         .iter()
-        .map(|i| OpenAuto {
-            number: i.number,
-            sha: body_sha(&i.body),
-            has_open_pr: with_pr.contains(&i.number),
-            building: i.building,
+        .map(|i| {
+            let sha = body_sha(&i.body);
+            let green_descends = match (sha.as_deref(), green_sha) {
+                (Some(red), Some(green)) if red != green => forge.is_ancestor(red, green),
+                _ => false,
+            };
+            OpenAuto {
+                number: i.number,
+                sha,
+                has_open_pr: with_pr.contains(&i.number),
+                building: i.building,
+                green_descends,
+            }
         })
         .collect();
     // Read only when it can matter: red with nothing open. A failed read
@@ -859,8 +882,12 @@ fn reconcile_due(
     now: Instant,
 ) {
     let branch = super::main_red_fix::default_branch_for(root);
-    let verdict =
-        verdict_for(lane, note, || ci_from_lane_cache(root), || origin_sha(root, &branch));
+    let verdict = verdict_for(
+        lane,
+        note,
+        || ci_from_lane_cache(root),
+        || gate_evaluated_sha(root).or_else(|| origin_sha(root, &branch)),
+    );
     sched.last_at = Some(now);
     sched.last_kind = verdict.kind();
     if matches!(verdict, Verdict::Green { .. }) && !green_needs_listing(sched, now) {
@@ -940,7 +967,46 @@ fn emit(nwo: &str, verdict: &Verdict, a: &Applied) {
     });
 }
 
-/// `origin/<branch>`'s SHA in `root`: the commit the gate last synced to.
+fn evaluated_shas() -> &'static Mutex<HashMap<PathBuf, String>> {
+    static S: OnceLock<Mutex<HashMap<PathBuf, String>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Record the commit the main-health gate last settled for `root`
+/// (`MainHealthState::gate_last_evaluated_sha`), read by the lane each tick,
+/// so a gate verdict names the commit it tested rather than wherever
+/// `origin/<branch>` happens to be.
+pub fn note_evaluated_sha(root: &Path, sha: Option<String>) {
+    if let Some(sha) = sha {
+        evaluated_shas()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(root.to_path_buf(), sha);
+    }
+}
+
+fn gate_evaluated_sha(root: &Path) -> Option<String> {
+    evaluated_shas()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(root)
+        .cloned()
+}
+
+/// `git merge-base --is-ancestor older newer` in `root`: exit 0 is yes,
+/// anything else (exit 1, a missing object's 128, a timeout) is no.
+fn git_is_ancestor(root: &Path, older: &str, newer: &str) -> bool {
+    let mut cmd = std::process::Command::new("git");
+    cmd.current_dir(root)
+        .args(["merge-base", "--is-ancestor", older, newer]);
+    matches!(
+        crate::cmd_out::run_command(cmd, Duration::from_secs(10)),
+        CmdOutcome::Ran(out) if out.status.success()
+    )
+}
+
+/// `origin/<branch>`'s SHA in `root`: the fallback when the gate has not
+/// reported the commit it evaluated.
 fn origin_sha(root: &Path, branch: &str) -> Option<String> {
     let mut cmd = std::process::Command::new("git");
     cmd.current_dir(root)
@@ -1036,6 +1102,10 @@ impl AutofileForge for GhForge<'_> {
 
     fn open_prs(&mut self, issues: &[u32]) -> HashSet<u32> {
         (self.open_prs)(issues)
+    }
+
+    fn is_ancestor(&mut self, older: &str, newer: &str) -> bool {
+        git_is_ancestor(self.root, older, newer)
     }
 
     fn create(&mut self, title: &str, body: &str, labels: &[String]) -> Result<u32, String> {
