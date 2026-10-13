@@ -125,7 +125,6 @@ echo "Case 4: startup banner names mode + arm"
 BAN="$(LOOM_MODEL_EXPERIMENT=experiment LOOM_MODEL_EXPERIMENT_CANARY=1 SE banner --issue 100 --complexity complex --config /nonexistent 2>/dev/null)"
 assert_contains "$BAN" "mode=EXPERIMENT" "banner names experiment mode"
 assert_contains "$BAN" "ARM B" "banner names the assigned arm"
-assert_contains "$BAN" "SUPPRESSED" "banner notes tier-2.5 suppression"
 echo ""
 
 echo "Case 5: record append + harvest with transcript join (exact cost)"

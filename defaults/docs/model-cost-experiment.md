@@ -33,9 +33,8 @@ LOOM_MODEL_EXPERIMENT=experiment LOOM_MODEL_EXPERIMENT_CANARY=1 \
 via the `sweep.escalation` ladder). Arm assignment is a **deterministic,
 resume-safe** function of the issue number, **stratified by the Curator complexity
 marker** (#3702) so both arms see a comparable difficulty mix — a killed-and-resumed
-sweep re-lands the same arm. In `experiment` mode the tier-2.5 complexity bump is
-**suppressed** (the marker is used only as the stratification key), so a
-`complex`-marked issue on Arm B stays sonnet and the A/B is not confounded.
+sweep re-lands the same arm. The marker is used only as the stratification key;
+it never picks a model.
 
 ## N configurable arms (`sweep.modelExperimentArms`, #9122)
 
@@ -72,8 +71,7 @@ and each stratum converges to the configured weights independently.
 
 **Absent this key (or if it is rejected) behavior is byte-for-byte the
 pre-#9122 A/B pair.** Rejection is **loud on stderr and falls through** to the
-built-in pair — never a hard sweep failure, mirroring `resolve-tier-model.sh`'s
-No-Fable refusal. A roster is rejected **whole** (a partially-honored roster
+built-in pair — never a hard sweep failure. A roster is rejected **whole** (a partially-honored roster
 would silently change the weights you asked for) when any of these holds:
 
 | Rejection | Why |
@@ -110,7 +108,7 @@ An issue sampled **out** of the experiment:
 
 - gets **no arm** (`arm` null in its stats record — the existing `observe`-mode
   null-arm convention, not a new state; `assign-arm` prints `none -`),
-- proceeds with **unmodified** tier-2.5/tier-3 model resolution, exactly as if
+- proceeds with **unmodified** tier-3 model resolution, exactly as if
   the experiment were off for that issue,
 - and gets its own loud `NOT IN EXPERIMENT` banner naming the fraction.
 

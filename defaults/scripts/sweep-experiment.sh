@@ -21,7 +21,7 @@
 # `--resolve`. An unconfigured repo at the default fraction 1.0 is byte-for-byte
 # the pre-#9122 A/B behavior. An issue the fraction samples OUT prints
 # `none -` from `assign-arm` (no arm, no forced model; the caller proceeds with
-# normal tier-2.5/tier-3 resolution) and a `NOT IN EXPERIMENT` banner.
+# normal tier-3 resolution) and a `NOT IN EXPERIMENT` banner.
 #
 # Usage:
 #   sweep-experiment.sh resolve-mode

@@ -110,3 +110,9 @@ commands/loom/concierge.md
 # in loom-daemon curation-complete (#11663).
 scripts/require-complexity-marker.sh
 scripts/tests/test-require-complexity-marker.sh
+
+# #11665 (P3 of #11659, PR A) — tier-2.5 Builder routing by the Curator's
+# complexity tier, deleted with the Jev tier shadow; story points are the only
+# sizing signal and do not route.
+scripts/resolve-tier-model.sh
+scripts/tests/test-resolve-tier-model.sh

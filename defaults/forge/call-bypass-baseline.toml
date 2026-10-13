@@ -320,12 +320,6 @@ owner = "daemon-other"
 removal_issue = 9799
 
 [[bypass]]
-path = "loom-daemon/src/jev_tier.rs"
-calls = 1
-owner = "daemon-other"
-removal_issue = 9799
-
-[[bypass]]
 path = "loom-daemon/src/merge_pr/consolidate.rs"
 calls = 3
 owner = "daemon-landing"
