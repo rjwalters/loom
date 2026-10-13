@@ -120,7 +120,8 @@ retirements (`loom:urgent`, `loom:heavy`, `loom:operator-objective`). It is
 never rendered into `labels.yml`, so the additive `sync-labels.sh` cannot
 re-create a retired label. `owned: false` (a label Loom never declared)
 means the migration adds the replacement but never removes or deletes the old
-label; `priority:high` is `owned: true` (#11675). The registry change itself mutates no forge.
+label; `priority:high` is `owned: true` (#11675). The registry change itself
+mutates no forge.
 
 ### Running the forge-side migration (#11511)
 
