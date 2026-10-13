@@ -13943,7 +13943,7 @@ every 60 s.
 |---|---|---|
 | `LOOM_READ_POOL_SPILL` | *(unset: on)* | `0` keeps every read on its home reader: no split and no latch |
 | `LOOM_READ_POOL_SPLIT` | *(unset: on)* | `0` disables the split only |
-| `LOOM_READ_ROUTING` | *(unset: v2)* | `legacy` also restores the pre-W4-B walk: every reader counts (no `owners` filter), no split, no latch. In v2 a host whose egress policy gives the gateway the GitHub credential gets no reader pool (the writer path, unchanged); the plain `read_credential` path never had that check and still does not |
+| `LOOM_READ_ROUTING` | *(unset: v2)* | `legacy` also restores the pre-W4-B walk: every reader counts (no `owners` filter), no split, no latch. |
 
 ## Observability exporter (`observability`, #4705, epic #4702 Phase 1)
 
