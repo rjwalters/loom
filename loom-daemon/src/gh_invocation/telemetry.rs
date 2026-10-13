@@ -275,6 +275,14 @@ pub fn ambient_parent() -> Option<TraceContext> {
     ambient().0
 }
 
+/// The ambient execution's `(parent, trace journal)` — what a short-lived CLI
+/// span delivers through when no ops sink is registered (#11690). Test builds
+/// read the per-thread [`set_test_ambient`] value, never the real environment.
+#[must_use]
+pub fn ambient_journal() -> (Option<TraceContext>, Option<PathBuf>) {
+    ambient()
+}
+
 /// `(LOOM_TRACEPARENT, LOOM_TRACE_CONTEXT_FILE)` of this process.
 #[cfg(not(test))]
 fn ambient() -> (Option<TraceContext>, Option<PathBuf>) {

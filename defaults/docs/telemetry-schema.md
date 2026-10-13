@@ -1983,6 +1983,7 @@ Guard denies (Issue #11582):
 | Signal | Kind | Unit / attributes | Meaning |
 |---|---|---|---|
 | `guard.cargo_target_dir.denied` span | instant; a child of the agent's execution span, delivered through its trace journal (`LOOM_TRACE_CONTEXT_FILE`), so only a session inside a traced execution exports one | `loom.guard.root` (`/tmp`, `$TMPDIR`, `~/.cache`, `~`, `.loom/target-*`), `loom.guard.source` (`inherited`, `inline`, `env`, `export`, `target-dir-flag`, `make-arg`), `loom.role` | one `loom:cargo-target-dir` deny: a cargo build whose target dir was under a root nothing owns ([`guard-hooks.md`](guard-hooks.md#cargo-target-dir-guard-guardscargotargetdir--loom_guard_cargo_target_dir)). Never the path or the command |
+| `build_gate.run` span | one per host-side run of `buildGate.command`; pre-flight's is a child of the sweep's execution span, delivered through its trace journal (`LOOM_TRACE_CONTEXT_FILE`; an attended session with no `LOOM_TRACEPARENT` emits none), the main-health gate's is its own root through the ops sink | `loom.build_gate.stage` (`preflight` / `main_health`), `loom.build_gate.tier` (`fast` / `full`), `loom.build_gate.outcome` (`pass` / `pass_flaky` / `fail` / `unresolved` / `timeout` / `unevaluated`), `loom.build_gate.duration_ms`, `loom.build_gate.attempt` (1-based within the pre-flight episode; `1` for main-health) | what host-side gating costs and how often it fails, per stage and tier (#11690: CI is the test gate, pre-flight is the fast tier). Status `error` unless `pass` / `pass_flaky`. Never the command, a path or the output |
 
 GitHub rate limit (Issue #10022):
 
@@ -3365,11 +3366,13 @@ prompt string appears in neither the journal nor the state file.
 | `last_activity_at` | RFC3339 | last tool call or Stop |
 | `driving[]` | array | issues/PRs this session holds an in-session lease on: `kind` (`issue`/`pr`), `number`, `sweep_id` |
 
-**Producer.** `loom-daemon presence beat`, called by the opt-in hook
+**Producer.** `loom-daemon presence beat`, called by the hook
 `presence-beat.sh` on `UserPromptSubmit`, `PostToolUse` and `Stop`. A prompt
 always emits; other events emit at most once per 5 minutes. The hook is wired
-only when the operator provisions with `LOOM_OPERATOR_PRESENCE=1`
-(`scripts/install/provision-hooks.sh`); it is absent by default.
+by the installer/resync when the fleet key `operatorPresence.enabled` (or
+`LOOM_OPERATOR_PRESENCE=1`) says so, and is absent otherwise; on `Stop` the
+journal is flushed to OTLP with no daemon running. See
+[`operator-presence.md`](operator-presence.md).
 
 **In-session sweeps.** `loom-daemon presence sweep-start` / `sweep-outcome`
 journal `sweep.started` / `sweep.outcome` with `loom.dispatch_origin=operator`

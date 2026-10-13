@@ -246,7 +246,9 @@ fn the_presence_hook_is_wired_only_when_the_operator_opts_in() {
         let mut cmd = std::process::Command::new("bash");
         cmd.arg("-c")
             .arg(format!("source '{script}'; provision_loom_hooks '{}'", dir.path().display()))
-            .env_remove("LOOM_OPERATOR_PRESENCE");
+            .env_remove("LOOM_OPERATOR_PRESENCE")
+            .env("LOOM_CONFIG_DEFAULTS_FILE", "")
+            .env("LOOM_PRESENCE_OPTOUT_FILE", dir.path().join("no-such-optout"));
         if opt_in {
             cmd.env("LOOM_OPERATOR_PRESENCE", "1");
         }

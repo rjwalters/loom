@@ -236,6 +236,7 @@ pub mod generated_artifact;
 pub mod gh_invocation;
 pub mod gh_repo_env;
 pub mod gh_state_probe;
+pub mod git_ff_identical;
 pub mod git_parser;
 pub mod git_tmp_reclaim;
 pub mod git_utils;
@@ -401,6 +402,7 @@ pub mod target_orphan_reclaim;
 /// #10414): the `loom.daemon.task_alive` gauge and `Task liveness:` in status.
 pub mod task_liveness;
 pub mod telemetry;
+pub mod telemetry_join;
 pub mod telemetry_replay;
 pub mod terminal;
 pub mod terminal_restore;

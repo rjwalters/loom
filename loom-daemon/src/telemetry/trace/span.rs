@@ -99,6 +99,11 @@ pub enum SpanName {
     /// from — never the command or the path.
     #[serde(rename = "guard.cargo_target_dir.denied")]
     GuardCargoTargetDirDenied,
+    /// One host-side run of `buildGate.command` (Issue #11690): pre-flight's
+    /// fast tier or the main-health gate. Stage, tier, outcome, duration and
+    /// attempt only — never the command or its output.
+    #[serde(rename = "build_gate.run")]
+    BuildGateRun,
 }
 
 impl SpanName {
@@ -128,6 +133,7 @@ impl SpanName {
             Self::ForgeReadShed => "forge.read.shed",
             Self::EgressRequest => "loom.egress.request",
             Self::GuardCargoTargetDirDenied => "guard.cargo_target_dir.denied",
+            Self::BuildGateRun => "build_gate.run",
         }
     }
 }

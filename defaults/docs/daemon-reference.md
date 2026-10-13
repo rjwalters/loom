@@ -77,6 +77,10 @@ auto-dispatches sweeps, and the [epic supervisor](#epic-supervisor-3842)
 drives `loom:epic` fork-joins. See [Operability](#operability--config-startstop-e2e-phase-d-3813)
 for enabling and tuning them.
 
+Every listener and every outbound client whose response can change daemon
+behavior, classified as config, forge, wake-only webhook or removed, is
+audited in [`network-inputs.md`](network-inputs.md) (#11711).
+
 ## The `LOOM_ROLE` env-var contract (#6507)
 
 `LOOM_ROLE` is a **public, stable session-identity contract**: repo-level
@@ -2732,6 +2736,12 @@ enabling the gate for a genuine multi-repo deployment is done with the machine-
 global `LOOM_MAIN_HEALTH_GATE=1` env var (each repo's own `buildGate` block then
 decides whether it actually gates).
 
+Since #11690 CI is the test gate and Builders compile only, so this loop is
+the **one remaining host-side full-suite runner**, and only where an operator
+enables it. With it off, the red-main-fix lane reads CI on `main` instead.
+Each run emits a `build_gate.run` span (`stage=main_health`). See
+[`build-gate.md` → Where the gate runs](build-gate.md#where-the-gate-runs-11690).
+
 ## Gate verdicts: VERIFIED_RED vs UNEVALUATED (#3974)
 
 A safety gate that fails closed on **its own** infrastructure failures converts
@@ -3143,9 +3153,10 @@ verified red still admits its `<!-- loom:main-red-fix -->` candidates, and only
 those; every other ready issue in it, priority or not, keeps `workspace_halted`.
 `report.halted` is unchanged. A hold that is not a verified-red `main` (a gate
 run in flight, a drain, the host-distress breaker, a pre-flight or token-pool
-hold) admits nothing, fixes included. With the main-health gate disabled for a
-repo (no enabled `buildGate`), there is no verified-red signal, so the latest
-`main` CI conclusion stands in for it: one cached `gh run list` per repo per
+hold) admits nothing, fixes included. With the main-health gate loop off for a
+repo (no enabled `buildGate`, or `autonomous.mainHealthGate` off, #11690),
+there is no verified-red signal, so the latest `main` CI conclusion stands in
+for it: one cached `gh run list` per repo per
 tick, made only when the repo has a marker-bearing candidate.
 
 **Unpromoted red-main fixes (#10118).** A fix is usually filed in `loom:triage`,
