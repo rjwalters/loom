@@ -463,6 +463,7 @@ ISSUE_URL="$(forge_gh_create_issue_rl_safe "$REPO_NWO" "$TITLE" "$BODY" "${LABEL
 echo "$ISSUE_URL"
 
 # --- #11787: curated-at-filing goes through the one producer ----------------
+# requires-daemon: curation-complete optional   absent binary or failed call → the issue is left in loom:curating with a stderr note; the filing itself is already done (#11787)
 if [[ "$WANT_CURATED" == "true" ]]; then
   _cc_n="${ISSUE_URL##*/}"; _cc_repo="${ISSUE_URL#*://*/}"; _cc_repo="${_cc_repo%/issues/*}"
   if ! loom-daemon curation-complete --repo "$_cc_repo" --issue "$_cc_n" \
