@@ -5,7 +5,8 @@
 //! twice.
 //!
 //! Mirrors [`super::complexity_tests`]'s shape: a fake `gh` on `PATH` answers
-//! the issue-body fetch (shared by both the complexity and points markers),
+//! the single issue read (whose `points:*` label becomes the record's
+//! `story_points`),
 //! the `/comments` idempotency read, and the `issue comment` post itself,
 //! logging every invocation to a file this module inspects. The pure
 //! formatter/config-resolution logic is unit-tested inline in
@@ -70,8 +71,9 @@ fn enable_writeback(ws: &Path) {
 ///     server-side `startswith` filter; exits `comments_rc` (non-zero models
 ///     an unreadable check). Checked FIRST since its argv also matches the
 ///     plainer issue-body pattern below.
-///   - `gh api repos/.../issues/<n> --jq .body` (the complexity AND points
-///     fetches — same endpoint, same response) — echoes `body`.
+///   - `gh api repos/.../issues/<n> --jq <projection>` (the single issue
+///     read) — answers a `{state, closed_at, labels}` projection whose labels
+///     are `points_label` (when non-empty).
 ///   - `gh issue comment <n> --body <text>` — logs `issue comment <n>` plus
 ///     whether the `sweep.outcome` telemetry journal was ALREADY non-empty
 ///     at post time to `gh_log`, appends the full body (`$5`) to
@@ -79,7 +81,7 @@ fn enable_writeback(ws: &Path) {
 ///     so a SECOND idempotency check observes a real prior post, then exits
 ///     `post_rc` (or hangs when `post_rc` is `-1`).
 fn fake_gh_script_with(
-    body: &str,
+    points_label: &str,
     gh_log: &Path,
     posted_marker: &Path,
     comments_rc: i32,
@@ -112,24 +114,17 @@ fn fake_gh_script_with(
          exit {comments_rc}\n\
          fi\n\
          if [[ \"$1\" == \"api\" && \"$2\" == repos/*/issues/* ]]; then\n\
-         if [[ \"$4\" == \".body\" ]]; then printf '%s' '{body}'; \
-         else printf '%s' '{projection}'; fi\n\
+         printf '%s' '{projection}'\n\
          exit 0\n\
          fi\n\
          exit 0\n",
         telemetry = telemetry.display(),
         gh_log = gh_log.display(),
         posted_marker = posted_marker.display(),
-        body = body.replace('\'', "'\\''"),
-        // #9441: `complexity_signal` now asks for a `{body, state, closed_at,
-        // labels}` projection while `points_signal` still asks for a bare
-        // `.body`, so the fake discriminates on the `--jq` argument exactly
-        // as the real `gh` would.
         projection = serde_json::json!({
-            "body": body,
             "state": "open",
             "closed_at": serde_json::Value::Null,
-            "labels": Vec::<String>::new(),
+            "labels": Some(points_label).filter(|l| !l.is_empty()).into_iter().collect::<Vec<_>>(),
         })
         .to_string()
         .replace('\'', "'\\''"),
@@ -137,8 +132,8 @@ fn fake_gh_script_with(
 }
 
 /// [`fake_gh_script_with`] with every call succeeding.
-fn fake_gh_script(body: &str, gh_log: &Path, posted_marker: &Path) -> String {
-    fake_gh_script_with(body, gh_log, posted_marker, 0, 0)
+fn fake_gh_script(points_label: &str, gh_log: &Path, posted_marker: &Path) -> String {
+    fake_gh_script_with(points_label, gh_log, posted_marker, 0, 0)
 }
 
 fn posted_bodies(gh_log: &Path) -> String {
@@ -161,8 +156,7 @@ fn run_success(registry: &mut SweepRegistry, issue: u32, sweep_id: &str) {
     );
 }
 
-const MARKED_BODY: &str =
-    "Some issue.\n\n<!-- loom:complexity=complex -->\n<!-- loom:points=8 -->\n";
+const MARKED_BODY: &str = "points:8";
 
 fn count_comment_posts(gh_log: &Path) -> usize {
     std::fs::read_to_string(gh_log)
@@ -180,7 +174,7 @@ fn success_with_writeback_enabled_posts_one_marked_comment() {
     enable_writeback(ws);
     let gh_log = ws.join("gh-invocations.log");
     let posted_marker = ws.join("posted.marker");
-    let body = "Some issue.\n\n<!-- loom:complexity=complex -->\n<!-- loom:points=8 -->\n";
+    let body = "points:8";
     let mut registry = writeback_registry(ws, &fake_gh_script(body, &gh_log, &posted_marker));
     let issue = 90561;
     let sweep_id = insert_dead_running_with_log(&mut registry, issue, 0, "agent-wb-1", "log\n");
@@ -207,10 +201,7 @@ fn success_with_writeback_enabled_posts_one_marked_comment() {
         "the posted body opens with THIS sweep's marker: {bodies}"
     );
     assert!(bodies.contains("points `8`"), "the points read reaches the comment: {bodies}");
-    assert!(
-        bodies.contains("complexity `complex`"),
-        "the complexity read reaches the comment: {bodies}"
-    );
+    assert!(!bodies.contains("complexity"), "the retired tier is not rendered: {bodies}");
 }
 
 #[test]
@@ -222,7 +213,7 @@ fn writeback_disabled_by_default_never_posts() {
     // that has never opted in.
     let gh_log = ws.join("gh-invocations.log");
     let posted_marker = ws.join("posted.marker");
-    let body = "Some issue.\n\n<!-- loom:complexity=complex -->\n<!-- loom:points=8 -->\n";
+    let body = "points:8";
     let mut registry = writeback_registry(ws, &fake_gh_script(body, &gh_log, &posted_marker));
     let issue = 90562;
     let sweep_id = insert_dead_running_with_log(&mut registry, issue, 0, "agent-wb-2", "log\n");
@@ -252,7 +243,7 @@ fn failure_result_never_posts_even_when_enabled() {
     enable_writeback(ws);
     let gh_log = ws.join("gh-invocations.log");
     let posted_marker = ws.join("posted.marker");
-    let body = "Some issue.\n\n<!-- loom:complexity=complex -->\n<!-- loom:points=8 -->\n";
+    let body = "points:8";
     let mut registry = writeback_registry(ws, &fake_gh_script(body, &gh_log, &posted_marker));
     let issue = 90563;
     let sweep_id = insert_dead_running_with_log(&mut registry, issue, 0, "agent-wb-3", "log\n");
@@ -282,7 +273,7 @@ fn a_prior_comment_prevents_a_duplicate_post() {
     enable_writeback(ws);
     let gh_log = ws.join("gh-invocations.log");
     let posted_marker = ws.join("posted.marker");
-    let body = "Some issue.\n\n<!-- loom:complexity=complex -->\n<!-- loom:points=8 -->\n";
+    let body = "points:8";
     let mut registry = writeback_registry(ws, &fake_gh_script(body, &gh_log, &posted_marker));
     let issue = 90564;
     let sweep_id = insert_dead_running_with_log(&mut registry, issue, 0, "agent-wb-4", "log\n");
@@ -323,7 +314,7 @@ fn a_terminal_transition_observed_twice_posts_only_once() {
     enable_writeback(ws);
     let gh_log = ws.join("gh-invocations.log");
     let posted_marker = ws.join("posted.marker");
-    let body = "Some issue.\n\n<!-- loom:complexity=complex -->\n<!-- loom:points=8 -->\n";
+    let body = "points:8";
     let mut registry = writeback_registry(ws, &fake_gh_script(body, &gh_log, &posted_marker));
     let issue = 90565;
     let sweep_id = insert_dead_running_with_log(&mut registry, issue, 0, "agent-wb-5", "log\n");

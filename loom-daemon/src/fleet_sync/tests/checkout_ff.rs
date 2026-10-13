@@ -1096,8 +1096,14 @@ fn a_refused_merge_is_read_as_a_file_in_the_way_or_as_a_failure() {
 #[path = "checkout_ff_offline.rs"]
 mod offline;
 
+#[path = "checkout_ff_identical.rs"]
+mod identical;
+
 #[path = "checkout_ff_holds.rs"]
 mod holds;
+
+#[path = "checkout_ff_self_heal.rs"]
+mod self_heal_tests;
 
 /// #11186: a maintain-only workspace's checkout is fast-forwarded like any
 /// other: the step never consults dispatch holds.

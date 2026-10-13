@@ -236,7 +236,15 @@ The contract:
    including `setsid` descendants. The stop is queued with `--no-block` and
    the cgroup is sent `SIGKILL` after a 5 s grace, so H4 never waits on
    systemd's stop job (#11051). H4 runs the teardowns in parallel (8 at once)
-   and ends its stop phase at the pause budget plus a 15 s margin. On launchd it is the orphan reaper's
+   and ends its stop phase at the pause budget plus a 15 s margin. A tree
+   whose teardown has not returned by then gets `SIGKILL` on its process group
+   only. **This is the one exception to "nothing outlives H4"**: a queued
+   teardown that never started gets no `SIGTERM` and its scope is not stopped,
+   so `setsid` children can survive until H5 reaps leftovers before it
+   resumes. `daemon.roll.paused` reports `forced_stops`, the number of trees
+   ended this way. A parked item killed at the bound stays resumable (its
+   safe point is on disk), unlike the ledger's deadline path, which requeues
+   it; H5's reap makes either safe. On launchd it is the orphan reaper's
    freeze-first tree kill over the worktree-attributed and pgid-attributed
    seeds. A pgid-only `kill(-pgid)` is not enough
    (`orphan_process_reaper.rs:16-35`). For session-exec items it is the `.cancel`
@@ -580,6 +588,26 @@ recovers every claim.**
     host's, is the claim still held, is the issue still open. So it does not
     double-dispatch, and `restore_label_to_ready` is idempotent. The manifest is
     archived with `phase = abandoned`.
+- **What a rolled-back binary does with the roll-attempt record (#10880).**
+  Before it arms a version roll, the self-update tick writes a `roll_attempt`
+  record (target identity, version, tag, `target_source`, attempt count) into
+  `auto_update_state.json`, synchronously, ahead of the restart. Whatever
+  brings a binary below that version back (a candidate that fails before its
+  first tick, an H5 health failure, a supervisor rollback, an operator), the
+  process restores the record **whatever binary saved the file**, judges the
+  attempt failed because its own version is below the record's, and sets a
+  retry time: 15 min, doubling per failed attempt on the same target to 6 h,
+  then every 6 h, never terminal. Until then its tick neither fetches nor arms
+  that target, for every `target_source`, the floor included (a floor roll
+  skips settle, not this gate), and it raises the held-roll alert every tick
+  (ERROR below the floor). A different target is tried at once. The candidate
+  that did reach the version clears the record only after one tick past the
+  90 s startup grace, so one that dies in its first seconds leaves the record
+  for the binary that comes back. #9735's health probation, once it exists, is
+  the better clear signal. A binary older than #10880 ignores the key and
+  drops it on its next write. This is independent of the H5-observed record
+  (`roll-failed-target.json`, #10832), which keeps gating H3 as a backstop;
+  quarantine (an operator-clearable, checksum-keyed hold) stays with #9735.
 - **Requirement on #10715, so that this holds:** H4 must never delete a paused
   item's lock, journal entry or checkpoint. H5 alone removes them, after the
   item is resumed or requeued. PR 3's test suite includes a pre-#10715 binary
@@ -875,8 +903,9 @@ Consequences:
   floor different from the previous pass's wakes the self-update loop, so the
   worst case is one `fleet.syncIntervalSecs`, not that plus
   `autoUpdate.intervalSecs`. The wake fires on a change of value only: a floor
-  roll that keeps failing is paced by its backoff and by the failed-roll guard
-  in H3 (§8), not by the sync cadence.
+  roll that keeps failing is paced by its backoff and by the failed-roll
+  guards (§8: the tick-side attempt record, #10880, and H3's, #10832), not by
+  the sync cadence.
 - **No jitter.** Hosts already tick at different phases, a roll is a short
   pause, and the artifact fetch is a handful of hosts against the release CDN.
   A floor bump rolls every host within about one sync interval, and that is

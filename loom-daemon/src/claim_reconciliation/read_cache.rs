@@ -58,6 +58,10 @@ const MAX_ENTRIES: usize = 4096;
 pub(super) static CLAIM_LABELED: ReadCache<DateTime<Utc>> = ReadCache::new(CLAIM_MAX_AGE);
 /// A claimed PR's newest trusted claim-activity comment since that label.
 pub(super) static CLAIM_ACTIVITY: ReadCache<DateTime<Utc>> = ReadCache::new(CLAIM_MAX_AGE);
+/// A claimed PR's newest trusted Judge-progress comment since that label (#10235).
+pub(super) static JUDGE_ACTIVITY: ReadCache<DateTime<Utc>> = ReadCache::new(CLAIM_MAX_AGE);
+/// A claimed PR's newest claimant head force-push since that label (#10235).
+pub(super) static HEAD_PUSH: ReadCache<DateTime<Utc>> = ReadCache::new(CLAIM_MAX_AGE);
 /// A verdict PR's comment scan: `(latest marker sha, already recorded)`.
 /// Both halves are computed AFTER trusted-author filtering, so a change to
 /// the comment-trust configuration is not seen here until the entry expires.

@@ -955,7 +955,8 @@ fn publish(
                  In-flight work is not touched and no other workspace is affected"
             ),
             "cleared" => log::info!(
-                "workspace_hold: {name}: hold cleared ({kind}, {copy} copy); dispatch resumes"
+                "workspace_hold: {name}: hold cleared ({kind}, {copy} copy); dispatch resumes{}",
+                crate::fleet_sync::checkout_ff::external_change::cited(&t.root, t.hold.since)
             ),
             _ => log::error!(
                 "workspace_hold: {name}: dispatch has been held for {} minutes ({kind}, {copy} \

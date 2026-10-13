@@ -3,18 +3,27 @@
 //! this module is the field-by-field implementation plus its unit tests.
 
 mod auto_update;
+mod checkout_external_change;
 mod ci;
-mod eta;
 mod fact_id;
 mod fleet_state;
 mod host_export;
+mod host_resource;
+mod issue_estimate;
 mod metadata;
+mod operator_presence;
 mod ops;
 mod outcome_facts;
 mod pass;
 mod pick_decision;
 mod session_output;
 mod token_ranking;
+mod work_started;
+
+// The shared host `Resource` constructor; traces and the relay re-import it
+// from here, exactly as when it lived inline.
+pub(super) use host_resource::resource_for_host;
+use metadata::visibility_str;
 
 use std::collections::BTreeMap;
 
@@ -29,7 +38,6 @@ use opentelemetry_proto::tonic::metrics::v1::{
     metric, number_data_point, AggregationTemporality, Gauge, Histogram, HistogramDataPoint,
     Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics,
 };
-use opentelemetry_proto::tonic::resource::v1::Resource;
 
 use crate::telemetry::{
     AnomalyFlag, RepoVisibility, RoleTickResult, SweepResult, TelemetryEnvelope, TelemetryKindOtlp,
@@ -75,13 +83,6 @@ pub(super) fn nanos(ts: DateTime<Utc>) -> u64 {
     ts.timestamp_nanos_opt()
         .and_then(|n| u64::try_from(n).ok())
         .unwrap_or(0)
-}
-
-fn visibility_str(visibility: RepoVisibility) -> &'static str {
-    match visibility {
-        RepoVisibility::Public => "public",
-        RepoVisibility::Private => "private",
-    }
 }
 
 fn result_str(result: SweepResult) -> &'static str {
@@ -151,34 +152,8 @@ fn severity_text(severity: SeverityNumber) -> &'static str {
     }
 }
 
-/// A `Resource` describing the emitting daemon host. `service.version` is
-/// always present: a record-supplied `daemon_version` (from a `host.health`
-/// record, threaded in by [`build_metrics_request`]) wins; otherwise — traces,
-/// logs, and metrics batches without `host.health` — it falls back to the
-/// exporting build's own `CARGO_PKG_VERSION` (Issue #9028).
-///
-/// `host.name` (Issue #10977) has one source: the envelope's `host_id`, the
-/// same string as `host.id` and `service.instance.id`. For a daemon that is
-/// [`host_identity()`](crate::sweep_registry::host_identity) — the
-/// operator-assigned `$LOOM_HOST_ID` when set, else the OS hostname
-/// (`$HOSTNAME`, then the `hostname` binary). It is set here, on every signal,
-/// so a receiver reached without a collector still gets a readable host axis.
-pub(super) fn resource_for_host(host_id: &str, daemon_version: Option<&str>) -> Resource {
-    let version = daemon_version
-        .filter(|v| !v.is_empty())
-        .unwrap_or(env!("CARGO_PKG_VERSION"));
-    let attributes = vec![
-        kv_string("service.name", "loom-daemon"),
-        kv_string("service.instance.id", host_id),
-        kv_string("host.id", host_id),
-        kv_string("host.name", host_id),
-        kv_string("service.version", version),
-    ];
-    Resource {
-        attributes,
-        ..Default::default()
-    }
-}
+// `resource_for_host` — the shared host `Resource` — lives in the
+// `host_resource` sibling module, with the traces builder and the relay.
 
 // ============================================================================
 // Logs — the four sweep-lifecycle record kinds
@@ -231,15 +206,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 kv_int("loom.issue", i64::from(r.issue)),
                 kv_string("loom.sweep_id", r.sweep_id.clone()),
             ];
-            if let Some(model) = &r.model {
-                attributes.push(kv_string("loom.model", model.clone()));
-            }
-            if let Some(effort) = &r.effort {
-                attributes.push(kv_string("loom.effort", effort.clone()));
-            }
-            if let Some(runtime) = &r.runtime {
-                attributes.push(kv_string("loom.runtime", runtime.clone()));
-            }
+            attributes.extend(metadata::start_facts(&r.facts));
             // Issue #9432: the assigned story-point size of the work now in
             // flight, as a NUMERIC attribute so a backend can sum it. Pushed
             // only when the issue carried exactly one legal `points:*` label —
@@ -339,8 +306,12 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             if r.repo_unresolved {
                 attributes.push(kv_string("loom.repo_unresolved", "true".to_string()));
             }
-            if let Some(model) = &r.model {
-                attributes.push(kv_string("loom.model", model.clone()));
+            if let Some(model) = r
+                .model
+                .as_deref()
+                .and_then(crate::sweep_registry::normalize_model_id)
+            {
+                attributes.push(kv_string("loom.model", model));
             }
             if let Some(effort) = &r.effort {
                 attributes.push(kv_string("loom.effort", effort.clone()));
@@ -351,6 +322,9 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             attributes.extend(metadata::outcome(r));
             if let Some(phases) = metadata::phase_durations(&r.phase_durations) {
                 attributes.push(phases);
+            }
+            if let Some(usage) = metadata::phase_tap_usage(&r.phase_tap_usage) {
+                attributes.push(usage);
             }
             (
                 "sweep.outcome",
@@ -378,8 +352,12 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             ];
             // Every optional field stays optional here too: an unobserved
             // measurement must be an ABSENT attribute, never a zero one.
-            if let Some(model) = &r.model {
-                attributes.push(kv_string("loom.model", model.clone()));
+            if let Some(model) = r
+                .model
+                .as_deref()
+                .and_then(crate::sweep_registry::normalize_model_id)
+            {
+                attributes.push(kv_string("loom.model", model));
             }
             if let Some(effort) = &r.effort {
                 attributes.push(kv_string("loom.effort", effort.clone()));
@@ -610,27 +588,15 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             body_override = Some(r.text.clone());
             (event_name, severity, String::new(), attributes)
         }
-        TelemetryRecord::EtaEstimate(_)
-        | TelemetryRecord::EtaOutcome(_)
-        | TelemetryRecord::EtaFleetRefresh(_)
-        | TelemetryRecord::EtaFit(_)
-        | TelemetryRecord::EtaBacktestFold(_)
-        | TelemetryRecord::EtaBacktestSummary(_) => {
-            // Issue #9289: the body is the record's JSON; scalars are `loom.eta.*`.
-            let (event_name, severity, at, mut attributes, body) =
-                eta::log_parts(&envelope.record)?;
-            eta::push_authority(&mut attributes, &envelope.record, &envelope.host_id);
-            time_unix_nano = at;
-            body_override = Some(body);
-            (event_name, severity, String::new(), attributes)
-        }
         TelemetryRecord::AutoUpdateTick(_)
         | TelemetryRecord::TokenRankingRefresh(_)
         | TelemetryRecord::HostExport(_)
+        | TelemetryRecord::CheckoutExternalChange(_)
         | TelemetryRecord::PassSummary(_)
         | TelemetryRecord::PassVerdict(_)
         | TelemetryRecord::FleetState(_)
-        | TelemetryRecord::PickDecision(_) => {
+        | TelemetryRecord::PickDecision(_)
+        | TelemetryRecord::OperatorPresence(_) => {
             // One record, stamped at its own time; the body is the record's
             // JSON. Issue #10414: one self-update decision (the tick's start).
             // Issue #10744: one token-ranking refresh round (the round's
@@ -638,19 +604,25 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             // decided). Issue #10196: one fleet-state snapshot (rows +
             // census; anchor/delta scalars ride as `loom.fleet.*`
             // attributes). Issue #10212: one pick decision (the ranked
-            // candidates). Each `log_parts` is `None` for every other kind.
+            // candidates). Issue #11563: one operator presence beat (the
+            // `loom.presence.*` scalars ride as attributes; `driving[]` is in
+            // the body). Each `log_parts` is `None` for every other kind.
             let r = &envelope.record;
             let (event_name, severity, at, attributes, body) = auto_update::log_parts(r)
                 .or_else(|| token_ranking::log_parts(r))
                 .or_else(|| host_export::log_parts(r))
+                .or_else(|| checkout_external_change::log_parts(r))
                 .or_else(|| pass::log_parts(r))
                 .or_else(|| fleet_state::log_parts(r))
-                .or_else(|| pick_decision::log_parts(r))?;
+                .or_else(|| pick_decision::log_parts(r))
+                .or_else(|| operator_presence::log_parts(r))?;
             time_unix_nano = at;
             body_override = Some(body);
             (event_name, severity, String::new(), attributes)
         }
         TelemetryRecord::SessionOutput(_)
+        | TelemetryRecord::IssueEstimate(_)
+        | TelemetryRecord::WorkStarted(_)
         | TelemetryRecord::PrResolved(_)
         | TelemetryRecord::StageOutcome(_) => {
             // Issue #9764: the body is the producer-redacted readable text,
@@ -662,7 +634,9 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             // merge/close or stage exit and observed when the daemon saw it.
             let r = &envelope.record;
             let parts = session_output::log_parts(r)
-                .or_else(|| outcome_facts::log_parts(r, &envelope.host_id))?;
+                .or_else(|| outcome_facts::log_parts(r, &envelope.host_id))
+                .or_else(|| issue_estimate::log_parts(r))
+                .or_else(|| work_started::log_parts(r))?;
             time_unix_nano = parts.source_at;
             observed_time_unix_nano = parts.observed_at;
             body_override = Some(parts.body);
@@ -867,6 +841,28 @@ fn metric_samples_for(envelope: &TelemetryEnvelope) -> Vec<MetricSample> {
                     time_unix_nano,
                 },
             ];
+            // Issue #11353: `host.health` reaches OTLP as gauges only, so the
+            // OTLP-export state rides as a state-labelled gauge. `state` and
+            // `reason` are already on the collector's datapoint allowlist; the
+            // exemption reason is the `reason` label, present only when exempt.
+            // Absent (pre-#11353 daemon) stays absent, never a fabricated `ok`.
+            if let Some(otlp_export) = &r.otlp_export {
+                let mut attributes = vec![kv_string("state", otlp_export.state.as_str())];
+                if otlp_export.state == crate::observability::otlp_health::OtlpExportState::Exempt {
+                    if let Some(reason) = otlp_export.detail.as_deref() {
+                        attributes.push(kv_string("reason", reason));
+                    }
+                }
+                samples.push(MetricSample {
+                    name: "loom.host.otlp_export",
+                    description: "OTLP export health of this daemon (1 per current state; \
+                                  state label: no_exporter|failing|ok|exempt).",
+                    unit: "1",
+                    attributes,
+                    value: number_data_point::Value::AsInt(1),
+                    time_unix_nano,
+                });
+            }
             if let Some(cpu_idle_fraction) = r.cpu_idle_fraction {
                 samples.push(MetricSample {
                     name: "loom.host.cpu_idle_fraction",

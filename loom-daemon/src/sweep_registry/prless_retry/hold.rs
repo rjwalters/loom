@@ -328,7 +328,7 @@ impl SweepRegistry {
     /// is #9239 itself.
     fn write_prless_hold_label(&self, issue: u32) -> Result<(), String> {
         // The body park record goes first (#10161), so the park is named for
-        // `star_liveness` / `check-stale-blocked`. A refused record still lets
+        // `check-stale-blocked`. A refused record still lets
         // the label follow: the label is the deliverable. A timed-out record
         // means `gh` is wedged, so it ends the attempt here, the same as a
         // timed-out label edit below (see `sweep_registry::park_hold`).

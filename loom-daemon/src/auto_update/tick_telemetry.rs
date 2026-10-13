@@ -12,7 +12,7 @@ use chrono::{DateTime, Utc};
 use super::supersede::ArmedRoll;
 use super::{ArtifactResolution, UpdateCheck};
 use crate::telemetry::kinds::auto_update_tick::{
-    AutoUpdateTickRecord, DrainSnapshot, FloorNotRolling, TickDecisionKind,
+    AutoUpdateTickRecord, DrainSnapshot, FloorNotRolling, RollHeld, TickDecisionKind,
 };
 use crate::telemetry::provenance::Provenance;
 use crate::telemetry::TelemetryRecord;
@@ -45,6 +45,9 @@ pub struct TickSummary {
     pub floor_alerted: bool,
     /// #11042: why a host below the fleet floor did not roll on this tick.
     pub floor_not_rolling: Option<FloorNotRolling>,
+    /// #10880: the held-roll alert this tick raised (ERROR below the floor,
+    /// WARN otherwise). Set on every tick the roll stays held.
+    pub roll_held: Option<RollHeld>,
 }
 
 impl TickSummary {
@@ -72,6 +75,7 @@ impl TickSummary {
             floor_stall: None,
             floor_alerted: false,
             floor_not_rolling: None,
+            roll_held: None,
         }
     }
 
@@ -125,6 +129,7 @@ pub fn record(
         drain: summary.drain.clone(),
         floor_stall: summary.floor_stall.clone(),
         floor_not_rolling: summary.floor_not_rolling,
+        roll_held: summary.roll_held.clone(),
         consecutive_failures,
         duration_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
         loom,

@@ -182,6 +182,12 @@ pub fn run(raw: &[OsString]) -> i32 {
         // passthrough (`ledger`) — carries the agent role and `served` /
         // `passthrough` (`ag` / `vi`).
         crate::forge_call_stats::agent::set_agent_role(std::env::var("LOOM_ROLE").ok().as_deref());
+        // #11407: the front's own `gh api` reads carry the agent's command.
+        crate::gh_invocation::route::set_front_command(
+            &raw.iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+        );
         if let Some(out) = serve(raw, &next) {
             record("revalidated", raw);
             let mut stdout = std::io::stdout().lock();

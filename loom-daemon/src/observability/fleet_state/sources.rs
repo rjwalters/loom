@@ -1,18 +1,32 @@
 //! The reads behind one `fleet.state` pass (Issue #10196): the sweep
 //! registries, the review-label listings, the work finder's last tick and the
 //! planner stamps. None of them touches the ETA subsystem.
+//!
+//! Only the collector pass ([`gather`]) reads the forge: it resolves the repo
+//! slugs and visibility and walks the review listings, and keeps them in
+//! [`Reused`]. A tick pass ([`tick_input`], #11161) reads only local state
+//! and that copy.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
 
+use super::champion::champion_by_slug;
+use super::curator::curator_by_slug;
+use super::outcomes::Curated;
 use super::{
-    held_stage, FleetInput, HeldSweep, ListedPr, ReadyItem, ReadyQueue, RepoListing, REVIEW_LABELS,
+    held_stage, FleetInput, HeldSweep, ListedPr, ReadyItem, ReadyQueue, RepoLimits, RepoListing,
+    REVIEW_LABELS,
 };
 use crate::sweep_registry::SweepRegistry;
-use crate::telemetry::kinds::fleet_state::{FleetCapacity, FleetSlots, MainCi, PlannerStamps};
-use crate::types::{ReadyQueueRow, SweepKind, WorkFinderTickSummary};
+use crate::telemetry::kinds::fleet_state::{
+    FleetCapacity, FleetEligibleReason, FleetHaltReason, FleetRepoHalt, FleetSlots, MainCi,
+    PlannerStamps,
+};
+use crate::telemetry::RepoVisibility;
+use crate::types::{ReadyQueueRow, RepoLimitView, SweepKind, WorkFinderTickSummary};
 use crate::workspace_pool::WorkspacePool;
 use crate::worktree_ops::gh::{linkage_refs, LinkageKind};
 
@@ -99,15 +113,16 @@ fn live_sweep_count(registries: &[std::sync::Arc<std::sync::Mutex<SweepRegistry>
         .sum()
 }
 
-/// The live issue sweeps of every provisioned registry. Each registry lock is
-/// held only for the in-memory clone; checkpoint reads happen after.
-async fn held_sweeps(
-    workspace_pool: &WorkspacePool,
-    slug_cache: &mut HashMap<String, String>,
+/// The live issue sweeps of every provisioned registry, each root named by
+/// `slug`. Each registry lock is held only for the in-memory clone;
+/// checkpoint reads happen after.
+fn held_sweeps(
+    registries: &[std::sync::Arc<std::sync::Mutex<SweepRegistry>>],
+    slug: impl Fn(&str) -> Option<String>,
 ) -> Vec<HeldSweep> {
     let mut held = Vec::new();
-    for registry in workspace_pool.provisioned_registries() {
-        let (snapshot, root, checkpoint_dir) = {
+    for registry in registries {
+        let (snapshot, root, checkpoint_dir, starts) = {
             let guard = registry
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -115,14 +130,10 @@ async fn held_sweeps(
                 guard.snapshot(),
                 guard.config().workspace_root.clone(),
                 guard.config().checkpoint_dir(),
+                guard.start_facts_snapshot(),
             )
         };
-        let Some(slug) = crate::observability::collector::resolve_repo_slug_cached(
-            slug_cache,
-            &root.to_string_lossy(),
-        )
-        .await
-        else {
+        let Some(slug) = slug(&root.to_string_lossy()) else {
             continue;
         };
         for info in snapshot.list(None) {
@@ -143,6 +154,8 @@ async fn held_sweeps(
                 entered_at_lower_bound: lower_bound,
                 pr,
                 overflow: info.overflow,
+                start: starts.get(&info.sweep_id).cloned().unwrap_or_default(),
+                sweep_id: Some(info.sweep_id.clone()),
             });
         }
     }
@@ -225,16 +238,87 @@ async fn review_listings(roots: &[(PathBuf, String)]) -> Vec<RepoListing> {
     out
 }
 
-/// The effective operator priority level the planner ranked `row` on: its
-/// `operator_priority_level` comparator key, else the bare star.
+/// One repo's open `loom:curated` issues with their creation instants, walked
+/// to the last page through the same ETag cache as the review listings
+/// (#11368). Blocking.
+///
+/// # Errors
+///
+/// The walk failed, read `MAX_PAGES` full pages or saw the listing shift: the
+/// set may be incomplete, so the repo has no curated listing this pass.
+#[cfg(test)]
+fn curated_listing_with(
+    gh: &Path,
+    root: &Path,
+    repo: Option<&str>,
+) -> anyhow::Result<BTreeMap<u32, Option<DateTime<Utc>>>> {
+    label_listing_with(gh, root, repo, super::outcomes::CURATED_LABEL)
+}
+
+/// [`curated_listing_with`] for any issue label (`loom:triage`, #11398).
+///
+/// # Errors
+///
+/// As [`curated_listing_with`].
+fn label_listing_with(
+    gh: &Path,
+    root: &Path,
+    repo: Option<&str>,
+    label: &str,
+) -> anyhow::Result<BTreeMap<u32, Option<DateTime<Utc>>>> {
+    let items = crate::forge_listing::list_issues_cached_all_as(
+        CALLER,
+        gh,
+        Some(root),
+        repo,
+        label,
+        "open",
+    )?;
+    Ok(items
+        .into_iter()
+        .filter(|item| !item.is_pull_request)
+        .map(|item| (item.number, parse_instant(item.created_at.as_deref())))
+        .collect())
+}
+
+/// Each managed repo's listing of open `label` issues; an incomplete one
+/// leaves the repo out (a partial listing would read as issues arriving or
+/// leaving).
+async fn label_listings(roots: &[(PathBuf, String)], label: &'static str) -> Curated {
+    let mut out = Curated::new();
+    for (root, slug) in roots {
+        let root = root.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let gh = PathBuf::from(crate::gh_invocation::gh_bin());
+            label_listing_with(&gh, &root, None, label)
+        })
+        .await;
+        match result {
+            Ok(Ok(listing)) => {
+                out.insert(slug.clone(), listing);
+            }
+            Ok(Err(error)) => {
+                log::debug!("fleet.state: {label} listing of {slug} incomplete: {error:#}");
+            }
+            Err(join_error) => {
+                log::debug!("fleet.state: {label} listing of {slug} panicked: {join_error}");
+            }
+        }
+    }
+    out
+}
+
+/// The priority level the planner ranked `row` on (0 default, 1
+/// `loom:important`, 2 `loom:very-important`): its `level` comparator key,
+/// else the row's own `level` (#11510).
 fn level(row: &ReadyQueueRow) -> u8 {
     row.plan
         .keys
         .iter()
-        .find(|k| k.name == "operator_priority_level")
+        .find(|k| k.name == "level")
         .and_then(|k| k.value.as_u64())
         .and_then(|n| u8::try_from(n).ok())
-        .unwrap_or(u8::from(row.operator_priority))
+        .unwrap_or_else(|| row.level.rank())
 }
 
 /// The work finder's last tick: every row not running, with its rank and
@@ -246,7 +330,30 @@ async fn ready_queue(
     let summary = crate::work_finder::last_tick_summary()?;
     let refs = crate::observability::queue_snapshot::resolve_repos(&summary, slug_cache).await;
     let slug = |root: &str| refs.get(root).map(|r| r.repo.to_ascii_lowercase());
-    Some(ready_from_tick(&summary, slug, managed))
+    let mut ready = ready_from_tick(&summary, slug, managed);
+    ready.halts = halts_by_slug(&crate::work_finder::halt_cause::since::current(), slug);
+    Some(ready)
+}
+
+/// The work finder's held roots (#11564) by lowercased slug, each as its
+/// `fleet.state` fact. Every held root is kept (no cap); a root `slug` cannot
+/// name is left out, as its ready rows are. Pure.
+pub(super) fn halts_by_slug(
+    halts: &Option<Vec<crate::work_finder::halt_cause::since::RootHalt>>,
+    slug: impl Fn(&str) -> Option<String>,
+) -> BTreeMap<String, FleetRepoHalt> {
+    let mut out = BTreeMap::new();
+    for halt in halts.iter().flatten() {
+        let Some(repo) = slug(&halt.root.to_string_lossy()) else {
+            continue;
+        };
+        out.entry(repo).or_insert_with(|| FleetRepoHalt {
+            reason: FleetHaltReason::from_cause(halt.cause),
+            since: halt.since,
+            since_lower_bound: halt.since_lower_bound,
+        });
+    }
+    out
 }
 
 /// [`ready_queue`] over one tick, with `slug` resolving a root. Pure.
@@ -271,12 +378,15 @@ fn ready_from_tick(
                 repo: slug(&row.repo)?,
                 issue: row.issue,
                 rank: small(row.rank),
-                star: row.operator_priority,
-                star_at: parse_instant(row.operator_priority_at.as_deref()),
                 level: level(row),
                 fleet_priority: row.workspace_priority,
                 created_at: parse_instant(row.created_at.as_deref()),
                 main_red_fix: row.main_red_fix,
+                eligible_reason: FleetEligibleReason::from_disposition(row.disposition),
+                // Only a clocked hold's own expiry: never a stray one.
+                eligible_at: FleetEligibleReason::from_disposition(row.disposition)
+                    .filter(|reason| reason.has_clock())
+                    .and(row.plan.held_until),
             })
         })
         .collect();
@@ -304,7 +414,30 @@ fn ready_from_tick(
         listed,
         complete,
         slots,
+        halts: BTreeMap::new(),
+        limits: limits_by_slug(&summary.repo_limits, slug),
     }
+}
+
+/// The tick's per-repo dispatch limits (#11606) by lowercased slug. Every
+/// entry is kept (no cap); a root `slug` cannot name is left out, as its
+/// ready rows are. Pure.
+pub(super) fn limits_by_slug(
+    limits: &[RepoLimitView],
+    slug: impl Fn(&str) -> Option<String>,
+) -> BTreeMap<String, RepoLimits> {
+    let mut out = BTreeMap::new();
+    for limit in limits {
+        let Some(repo) = slug(&limit.repo) else {
+            continue;
+        };
+        out.entry(repo).or_insert_with(|| RepoLimits {
+            in_flight: small(limit.in_flight),
+            cap: limit.cap.map(small),
+            deferred_repo_cap: small(limit.deferred_repo_cap),
+        });
+    }
+    out
 }
 
 /// Available and exhausted token accounts in the rotation ranking at
@@ -354,51 +487,218 @@ fn capacity(workspace_root: &Path, live_workers: usize) -> FleetCapacity {
     }
 }
 
+/// This host's slots, measured from local state (#11643): `max_concurrent`
+/// from the work-finder config (precedence env > config > default, via
+/// [`resolve_max_concurrent_with_source`]) and `occupancy` from the
+/// already-computed live-sweep count. Independent of the work-finder plan, so
+/// it is present from the first pass of a process and after a roll/restart —
+/// the plan, and thus `ready.slots`, is absent until the first tick.
+///
+/// `occupancy` stays an `Option` (absent = unknown, never a synthetic `0`);
+/// here it is always `Some`, because every pass re-measures the live count, so
+/// a genuinely idle host emits `occupancy: 0`, distinct from "not yet
+/// measured".
+fn local_slots(workspace_root: &Path, live_workers: usize) -> FleetSlots {
+    let config = crate::work_finder::read_work_finder_config(workspace_root);
+    let max_concurrent = crate::work_finder::resolve_max_concurrent_with_source(&config).0;
+    FleetSlots {
+        max_concurrent: small(max_concurrent),
+        occupancy: Some(small(live_workers)),
+    }
+}
+
 /// `main` CI status of the repo rooted at `root` from the main-health gate:
-/// red when halted on a verified-red run, unknown when the gate has not
-/// produced a verdict or could not evaluate, else green.
+/// red when halted on a verified-red run, green when the gate has produced a
+/// green verdict, unknown otherwise (#11565). Unknown means the gate has no
+/// verdict for the root: it is not enabled for it (`autonomous.mainHealthGate`
+/// is off by default, or the repo has no usable `buildGate`), has not
+/// completed a run yet this process, or its last tick could not evaluate.
 fn main_ci(states: &crate::main_health_gate::WorkspaceHealthStates, root: &Path) -> MainCi {
-    if states.is_halted(root) {
+    let Some(state) = states.find(root) else {
+        return MainCi::Unknown;
+    };
+    if state.is_halted() {
         MainCi::Red
-    } else if states.is_unevaluated(root) || states.last_verdict_at(root).is_none() {
+    } else if state.is_unevaluated() || state.last_verdict_at().is_none() {
         MainCi::Unknown
     } else {
         MainCi::Green
     }
 }
 
-/// Everything one pass reads.
+/// Each repo's `main` CI status by lowercased slug, from `(root, slug)` pairs.
+fn main_ci_by_slug<'a>(
+    roots: impl Iterator<Item = (&'a Path, &'a str)>,
+) -> BTreeMap<String, MainCi> {
+    let health = crate::fleet_sync::checkout_ff::health_states();
+    roots
+        .map(|(root, slug)| (slug.to_string(), main_ci(&health, root)))
+        .collect()
+}
+
+/// What the last collector pass read from the forge, which every tick pass
+/// reuses as is (#11161): a tick pass makes no forge call.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct Reused {
+    pub managed: BTreeSet<String>,
+    pub listings: Vec<RepoListing>,
+    pub listed_at: Option<DateTime<Utc>>,
+    /// Root path to lowercased slug, for every root the collector cached.
+    pub slugs: HashMap<String, String>,
+    /// The managed `(root, slug)` pairs the collector's `main_ci` was read
+    /// from: unlike `slugs`, never an unprovisioned or respelled root.
+    pub roots: Vec<(PathBuf, String)>,
+    /// Lowercased slug to visibility. A repo missing here is private.
+    pub visibility: BTreeMap<String, RepoVisibility>,
+}
+
+impl Reused {
+    fn slug(&self, root: &str) -> Option<String> {
+        self.slugs.get(root).cloned()
+    }
+}
+
+static REUSED: Mutex<Option<Reused>> = Mutex::new(None);
+
+/// The last collector pass's reads; `None` before the first one.
+pub(super) fn reused() -> Option<Reused> {
+    REUSED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// Keep `reused` for the tick passes until the next collector pass.
+pub(super) fn keep(reused: Reused) {
+    *REUSED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reused);
+}
+
+/// Everything one collector pass reads, and the part of it a tick pass
+/// reuses (without `visibility`, which the caller resolves).
 pub(super) async fn gather(
     workspace_root: &Path,
     workspace_pool: &WorkspacePool,
     slug_cache: &mut HashMap<String, String>,
     host_id: &str,
     now: DateTime<Utc>,
-) -> FleetInput {
+) -> (FleetInput, Reused, Curated, Curated) {
+    // Resolves every provisioned root, so the registries' roots are cached.
     let roots = managed_roots(workspace_pool, slug_cache).await;
     let managed: BTreeSet<String> = roots.iter().map(|(_, slug)| slug.clone()).collect();
-    let held = held_sweeps(workspace_pool, slug_cache).await;
+    let held = held_sweeps(&workspace_pool.provisioned_registries(), |root| {
+        slug_cache.get(root).map(|s| s.to_ascii_lowercase())
+    });
     let listings = review_listings(&roots).await;
+    let curated = label_listings(&roots, super::outcomes::CURATED_LABEL).await;
+    let triage = label_listings(&roots, super::outcomes::close::TRIAGE_LABEL).await;
     let ready = ready_queue(&managed, slug_cache).await;
-    let health = crate::fleet_sync::checkout_ff::health_states();
-    let main_ci = roots
-        .iter()
-        .map(|(root, slug)| (slug.clone(), main_ci(&health, root)))
-        .collect();
-    let capacity = Some(capacity(
-        workspace_root,
-        live_sweep_count(&workspace_pool.provisioned_registries()),
-    ));
-    FleetInput {
+    let main_ci = main_ci_by_slug(
+        roots
+            .iter()
+            .map(|(root, slug)| (root.as_path(), slug.as_str())),
+    );
+    let live_workers = live_sweep_count(&workspace_pool.provisioned_registries());
+    let capacity = Some(capacity(workspace_root, live_workers));
+    let slots = Some(local_slots(workspace_root, live_workers));
+    let listed_at = (!listings.is_empty()).then_some(now);
+    let reused = Reused {
+        managed: managed.clone(),
+        listings: listings.clone(),
+        listed_at,
+        roots,
+        slugs: slug_cache
+            .iter()
+            .map(|(root, slug)| (root.clone(), slug.to_ascii_lowercase()))
+            .collect(),
+        visibility: BTreeMap::new(),
+    };
+    let champion = champion_by_slug(&reused.roots);
+    let curator = curator_by_slug(&reused.roots);
+    let input = FleetInput {
+        champion,
+        curator,
         capacity,
+        slots,
         main_ci,
         host_id: host_id.to_string(),
         managed,
         held,
-        listed_at: (!listings.is_empty()).then_some(now),
+        listed_at,
         listings,
         ready,
+    };
+    (input, reused, curated, triage)
+}
+
+/// A tick pass's input (#11161): the registries and the work finder's last
+/// tick, host capacity and `main` CI, which are local, with the slugs and review listings of the last
+/// collector pass. Nothing here reads the forge.
+pub(super) fn tick_input(
+    workspace_root: &Path,
+    workspace_pool: &WorkspacePool,
+    host_id: &str,
+    reused: &Reused,
+) -> FleetInput {
+    let live_workers = live_sweep_count(&workspace_pool.provisioned_registries());
+    FleetInput {
+        champion: champion_by_slug(&reused.roots),
+        curator: curator_by_slug(&reused.roots),
+        capacity: Some(capacity(workspace_root, live_workers)),
+        slots: Some(local_slots(workspace_root, live_workers)),
+        main_ci: tick_main_ci(reused),
+        held: held_sweeps(&workspace_pool.provisioned_registries(), |root| reused.slug(root)),
+        ready: crate::work_finder::last_tick_summary().map(|summary| ready_input(&summary, reused)),
+        ..reused_input(host_id, reused)
     }
+}
+
+/// A tick pass's `main` CI: the managed roots only, as the collector pass
+/// reads it, so the two passes never disagree about a repo.
+pub(super) fn tick_main_ci(reused: &Reused) -> BTreeMap<String, MainCi> {
+    main_ci_by_slug(
+        reused
+            .roots
+            .iter()
+            .map(|(root, slug)| (root.as_path(), slug.as_str())),
+    )
+}
+
+/// [`tick_input`] without the registries and the tick. Pure.
+pub(super) fn reused_input(host_id: &str, reused: &Reused) -> FleetInput {
+    FleetInput {
+        host_id: host_id.to_string(),
+        managed: reused.managed.clone(),
+        held: Vec::new(),
+        listings: reused.listings.clone(),
+        listed_at: reused.listed_at,
+        ready: None,
+        slots: None,
+        capacity: None,
+        champion: BTreeMap::new(),
+        curator: BTreeMap::new(),
+        main_ci: BTreeMap::new(),
+    }
+}
+
+/// The ready queue of `summary`, its roots named by the collector's slugs,
+/// with the work finder's current repo halts (#11564).
+pub(super) fn ready_input(summary: &WorkFinderTickSummary, reused: &Reused) -> ReadyQueue {
+    let mut ready = ready_from_tick(summary, |root| reused.slug(root), &reused.managed);
+    let halts = crate::work_finder::halt_cause::since::current();
+    ready.halts = halts_by_slug(&halts, |root| reused.slug(root));
+    ready
+}
+
+/// The seconds between passes: the work finder's tick interval once it has
+/// ticked in this process, else the collector's snapshot interval.
+pub(super) fn tick_interval_secs(workspace_root: &Path) -> u64 {
+    if crate::work_finder::last_tick_summary().is_none() {
+        return crate::observability::SNAPSHOT_INTERVAL.as_secs();
+    }
+    let config = crate::work_finder::read_work_finder_config(workspace_root);
+    crate::work_finder::resolve_interval_with_config(&config).as_secs()
 }
 
 /// This host's planner stamps: the daemon version, the hash of the

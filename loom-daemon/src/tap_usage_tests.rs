@@ -706,3 +706,359 @@ fn a_region_with_no_launch_record_is_empty_in_both_halves() {
         .per_tap
         .is_empty());
 }
+
+// ============================================================================
+// Mixed sweep: out-of-process phase logs (Issue #11360)
+// ============================================================================
+
+use super::fixtures::{self as mixed, CODEX_KEY, GLM_KEY};
+
+const SWEEP: &str = "sweep-issue-4242-1";
+
+/// The parent region plus the phase logs, joined the way the outcome journal
+/// joins them.
+fn mixed_accounting(parent: &str, phases: &[(&str, &str)]) -> RegionAccounting {
+    let mut region = account_region_by_tap(parent, &format!("sweep_id={SWEEP}"));
+    region.phase_workers = account_phase_logs(phases.iter().copied(), SWEEP);
+    region
+}
+
+/// AC 1 + 2: GLM Builder/Doctor usage lands on the GLM tap, the Codex parent's
+/// Curator/Judge usage stays on Codex, and the sweep total per tap equals the
+/// fold over every region exactly once.
+#[test]
+fn a_mixed_sweep_charges_each_phase_to_the_tap_that_actually_ran_it() {
+    let parent = mixed::codex_parent_log(SWEEP);
+    let (builder, doctor) = (mixed::builder_log(SWEEP), mixed::doctor_log(SWEEP));
+    let region = mixed_accounting(&parent, &[("builder", &builder), ("doctor", &doctor)]);
+
+    // The parent's own row is exactly its own usage: not overwritten by a
+    // phase, and not inflated by the report or the quoted phase log it echoed.
+    let outcome = region.outcome().expect("codex parent row");
+    assert_eq!(outcome.key(), CODEX_KEY);
+    assert_eq!(outcome.usage.input, Some(3000));
+    assert_eq!(outcome.usage.output, Some(300));
+    assert_eq!(outcome.usage.usage_events, 2);
+    assert!(region.breakdown().is_empty(), "the parent region is single-tap");
+
+    let phases: Vec<(&str, String)> = region
+        .phase_workers
+        .iter()
+        .map(|p| (p.role.as_str(), p.accounting.key()))
+        .collect();
+    assert_eq!(
+        phases,
+        vec![
+            ("builder", GLM_KEY.to_string()),
+            ("doctor", GLM_KEY.to_string())
+        ]
+    );
+    assert_eq!(region.phase_workers[0].accounting.usage.input, Some(8000));
+    assert_eq!(region.phase_workers[0].accounting.usage.cache_read, Some(20000));
+    assert_eq!(region.phase_workers[1].accounting.usage.input, Some(700));
+    assert_eq!(region.phase_workers[1].accounting.usage.cache_read, None);
+    assert_eq!(
+        region.phase_workers[0]
+            .accounting
+            .tap
+            .credential
+            .account
+            .as_deref(),
+        Some(mixed::FAKE_GLM_ACCOUNT)
+    );
+
+    let totals = region.sweep_totals_by_tap();
+    assert_eq!(totals.keys().cloned().collect::<Vec<_>>(), vec![CODEX_KEY, GLM_KEY]);
+    mixed::assert_glm_total(&totals[GLM_KEY]);
+    assert_eq!(totals[CODEX_KEY].input, Some(3000));
+
+    // The independent oracle: fold every region's per-record slices directly.
+    let mut every_launch = account_launch_logs(&parent, &format!("sweep_id={SWEEP}"));
+    let anchor = crate::launch_record::phase_log_anchor(SWEEP).unwrap();
+    every_launch.extend(account_launch_logs(&builder, &anchor));
+    every_launch.extend(account_launch_logs(&doctor, &anchor));
+    assert_eq!(totals, fold_by_tap(&every_launch));
+}
+
+/// AC 4: an interrupted phase log (killed mid-line) counts only the events it
+/// completed; the torn tail is not a reading.
+#[test]
+fn an_interrupted_phase_log_counts_only_its_completed_events() {
+    let torn = format!(
+        "{}{{\"type\":\"step_finish\",\"tokens\":{{\"input\":90",
+        mixed::doctor_log(SWEEP)
+    );
+    let rows = account_phase_logs([("doctor", torn.as_str())], SWEEP);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].accounting.usage.input, Some(700));
+    assert_eq!(rows[0].accounting.usage.usage_events, 1);
+}
+
+/// AC 4: one log carrying the same header twice (a relaunch appending to the
+/// same file) counts its last region only, never both copies.
+#[test]
+fn a_repeated_header_in_one_phase_log_counts_once() {
+    let doctor = mixed::doctor_log(SWEEP);
+    let twice = format!("{doctor}{doctor}");
+    let rows = account_phase_logs([("doctor", twice.as_str())], SWEEP);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].accounting.usage.input, Some(700));
+    assert_eq!(rows[0].accounting.usage.usage_events, 1);
+}
+
+/// Two same-role/same-tap launches naming different models stay separate rows,
+/// each holding only its own usage (Judge feedback on #11501): folding by
+/// `(role, tap)` alone charged the second model's tokens to the first launch's
+/// model, because a row kept the first non-empty model it saw.
+#[test]
+fn a_same_tap_relaunch_with_a_different_model_keeps_its_own_row() {
+    let log = mixed::phase_log(
+        "doctor",
+        SWEEP,
+        &format!(
+            "{}\n{}\n{}",
+            mixed::step(700, 70, None, Some(0.007)),
+            mixed::glm_launch_with_model("glm-fixture-pro"),
+            mixed::step(300, 30, None, Some(0.003)),
+        ),
+    );
+    let rows = account_phase_logs([("doctor", log.as_str())], SWEEP);
+    assert_eq!(rows.len(), 2, "one row per (role, tap, model)");
+    assert_eq!(rows[0].role, "doctor");
+    assert_eq!(rows[1].role, "doctor");
+    assert_eq!(rows[0].accounting.key(), GLM_KEY, "both rows are the same tap");
+    assert_eq!(rows[1].accounting.key(), GLM_KEY);
+    assert_eq!(rows[0].model.as_deref(), Some("glm-fixture-flash"));
+    assert_eq!(rows[0].accounting.usage.input, Some(700));
+    assert_eq!(rows[0].accounting.usage.output, Some(70));
+    assert_eq!(rows[0].accounting.usage.usage_events, 1);
+    assert_eq!(rows[1].model.as_deref(), Some("glm-fixture-pro"));
+    assert_eq!(rows[1].accounting.usage.input, Some(300));
+    assert_eq!(rows[1].accounting.usage.output, Some(30));
+    assert_eq!(rows[1].accounting.usage.usage_events, 1);
+
+    // The tap-level total still sees both launches.
+    let totals = fold_by_tap(rows.iter().map(|row| &row.accounting));
+    assert_eq!(totals[GLM_KEY].input, Some(1000));
+    assert_eq!(totals[GLM_KEY].usage_events, 2);
+}
+
+/// AC 4: a resumed sweep does not re-count its predecessor's phase logs (they
+/// name a different sweep id, and were journaled at that sweep's own terminal
+/// transition), and an id that merely shares a prefix is a different sweep.
+#[test]
+fn a_resumed_sweep_does_not_recount_a_predecessors_phase_logs() {
+    let predecessor = mixed::builder_log("sweep-issue-4242-0");
+    let prefix_twin = mixed::builder_log("sweep-issue-4242-10");
+    let resumed = mixed::builder_log(SWEEP);
+    let rows = account_phase_logs(
+        [
+            ("builder", predecessor.as_str()),
+            ("builder", prefix_twin.as_str()),
+            ("builder", resumed.as_str()),
+        ],
+        SWEEP,
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].accounting.usage.input, Some(8000));
+    assert_eq!(rows[0].accounting.usage.usage_events, 2);
+
+    // Two genuine launches for the SAME sweep (a Builder re-run after a resume)
+    // are both real spend, each counted once.
+    let rerun = mixed::builder_log(SWEEP);
+    let rows =
+        account_phase_logs([("builder", resumed.as_str()), ("builder", rerun.as_str())], SWEEP);
+    assert_eq!(rows[0].accounting.usage.input, Some(16000));
+    assert_eq!(rows[0].accounting.usage.usage_events, 4);
+}
+
+/// AC 4: a phase that launched but reported no usage is a row that says
+/// "unmeasured", never a zero, and contributes no counter to the total.
+#[test]
+fn a_phase_with_no_usage_events_is_unmeasured_not_zero() {
+    let silent = mixed::phase_log("doctor", SWEEP, "spawn-worker: exec");
+    let builder = mixed::builder_log(SWEEP);
+    let region = mixed_accounting(
+        &mixed::codex_parent_log(SWEEP),
+        &[("builder", &builder), ("doctor", &silent)],
+    );
+    let doctor = &region.phase_workers[1].accounting;
+    assert_eq!(doctor.key(), GLM_KEY);
+    assert!(!doctor.usage.is_measured());
+    assert_eq!(doctor.usage.total_tokens(), None);
+    assert_eq!(doctor.usage.cost_estimate, None);
+    let glm = &region.sweep_totals_by_tap()[GLM_KEY];
+    assert_eq!(glm.input, Some(8000));
+    assert_eq!(glm.usage_events, 2, "the silent Doctor adds no reading");
+}
+
+/// AC 3 (empty-pool Claude fallback): when the Builder's preference walk falls
+/// through to Claude, `worker run` delegates and writes no phase log, so the
+/// GLM tap is charged only for the Doctor that really ran on it. A Claude
+/// parent writes no launch record, so it charges no tap here at all (its usage
+/// is the transcript reader's), and its log still says Claude ran.
+#[test]
+fn an_empty_pool_claude_fallback_charges_no_glm_tap_for_the_delegated_phase() {
+    let parent = mixed::claude_parent_log(SWEEP);
+    let doctor = mixed::doctor_log(SWEEP);
+    let region = mixed_accounting(&parent, &[("doctor", &doctor)]);
+    assert!(region.per_tap.is_empty(), "Claude's stream-json is not tap usage");
+    assert!(region.outcome().is_none());
+    assert_eq!(region.phase_workers.len(), 1);
+    assert_eq!(region.phase_workers[0].role, "doctor");
+    let totals = region.sweep_totals_by_tap();
+    assert_eq!(totals.keys().cloned().collect::<Vec<_>>(), vec![GLM_KEY]);
+    assert_eq!(totals[GLM_KEY].input, Some(700));
+    assert_eq!(crate::launch_record::parse_launch_runtime_after(&parent, SWEEP), None);
+
+    // The phase log's own records name the runtime/model actually launched.
+    let launched = crate::launch_record::parse_launch_runtime_after(
+        &doctor,
+        &crate::launch_record::phase_log_anchor(SWEEP).unwrap(),
+    )
+    .expect("doctor launch record");
+    assert_eq!(launched.runtime, "opencode");
+    assert_eq!(launched.model.as_deref(), Some("glm-fixture-flash"));
+    assert_eq!(launched.profile.as_deref(), Some("zai-flash"));
+
+    // A `worker run` with no parent sweep stamps `parent_sweep=none`: charged to
+    // no sweep, rather than to whichever sweep reaps next.
+    let orphan = format!(
+        "{}\n{}\n{}\n",
+        crate::launch_record::phase_log_header(None, "doctor", 4242),
+        mixed::glm_launch(),
+        mixed::step(1, 1, None, None)
+    );
+    assert!(account_phase_logs([("doctor", orphan.as_str())], SWEEP).is_empty());
+    assert!(account_phase_logs([("doctor", orphan.as_str())], "none").is_empty());
+}
+
+/// AC 3 (escalated Doctor, #11359): two GLM Doctor attempts are rejected, so
+/// the third runs through `worker run --escalate-claude`, which prints a
+/// `runtime: claude` report, launches nothing and writes no phase log; the
+/// Doctor then runs as a Claude Task in the parent session. Each Doctor is
+/// attributed to what actually ran: the GLM attempts to the GLM tap, exactly,
+/// and the Claude attempt to no tap (Claude writes no launch record; its
+/// usage is the transcript reader's), so none of it lands on the GLM row.
+#[test]
+fn an_escalated_claude_doctor_is_attributed_to_the_runtime_it_actually_ran_on() {
+    let parent = mixed::claude_parent_log_after_escalation(SWEEP, 77);
+    let (glm_1, glm_2) = (mixed::doctor_log(SWEEP), mixed::doctor_log(SWEEP));
+    let builder = mixed::builder_log(SWEEP);
+    let region = mixed_accounting(
+        &parent,
+        &[
+            ("builder", &builder),
+            ("doctor", &glm_1),
+            ("doctor", &glm_2),
+        ],
+    );
+
+    // The escalated attempt's report, as printed into the parent's stream,
+    // names the runtime it handed off to and has no phase log to join.
+    let report: serde_json::Value = parent
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v.get("escalation_reason").is_some())
+        .expect("escalation report");
+    assert_eq!(report["role"], "doctor");
+    assert_eq!(report["runtime"], "claude");
+    assert_eq!(report["outcome"], "delegate-to-claude");
+    assert!(report["log_path"].is_null());
+
+    // Claude's Doctor (9000/900 in the parent's stream) charges no tap.
+    assert!(region.per_tap.is_empty(), "Claude's stream-json is not tap usage");
+    assert!(region.outcome().is_none());
+
+    // The GLM Doctor row is exactly the two GLM attempts (700/70 each).
+    let doctor: Vec<_> = region
+        .phase_workers
+        .iter()
+        .filter(|p| p.role == "doctor")
+        .collect();
+    assert_eq!(doctor.len(), 1, "one row per (role, tap, model)");
+    assert_eq!(doctor[0].accounting.key(), GLM_KEY);
+    assert_eq!(doctor[0].accounting.usage.input, Some(1400));
+    assert_eq!(doctor[0].accounting.usage.output, Some(140));
+    assert_eq!(doctor[0].accounting.usage.usage_events, 2);
+    let launched = crate::launch_record::parse_launch_runtime_after(
+        &glm_1,
+        &crate::launch_record::phase_log_anchor(SWEEP).unwrap(),
+    )
+    .expect("GLM doctor launch record");
+    assert_eq!(launched.runtime, "opencode");
+    assert_eq!(launched.model.as_deref(), Some("glm-fixture-flash"));
+
+    // Sweep totals: only the GLM tap, Builder 8000 + Doctors 1400; nothing
+    // from the Claude block.
+    let totals = region.sweep_totals_by_tap();
+    assert_eq!(totals.keys().cloned().collect::<Vec<_>>(), vec![GLM_KEY]);
+    assert_eq!(totals[GLM_KEY].input, Some(9400));
+    assert_eq!(totals[GLM_KEY].output, Some(940));
+    assert_eq!(totals[GLM_KEY].usage_events, 4);
+}
+
+/// AC 2 regression: a parent stream quoting a phase log from its first line
+/// (the `worker run` header included) yields byte-identical parent rows to one
+/// quoting it without the header, and to the parent log with no phase logs
+/// joined. The header's key is `parent_sweep=`, never the parent's own
+/// `sweep_id=<id>` anchor text, so the quote cannot re-anchor the parent.
+#[test]
+fn a_quoted_phase_log_header_does_not_move_the_parents_anchor() {
+    let anchor = format!("sweep_id={SWEEP}");
+    let header = crate::launch_record::phase_log_header(Some(SWEEP), "builder", 4242);
+    assert!(!header.contains(&anchor), "{header}");
+
+    let with_header = mixed::codex_parent_log_quoting(SWEEP, true);
+    let without_header = mixed::codex_parent_log_quoting(SWEEP, false);
+    assert!(with_header.contains("worker run: parent_sweep="));
+    let quoted = account_region_by_tap(&with_header, &anchor);
+    let plain = account_region_by_tap(&without_header, &anchor);
+    assert_eq!(quoted, plain);
+    assert_eq!(
+        serde_json::to_string(&quoted.per_tap).unwrap(),
+        serde_json::to_string(&plain.per_tap).unwrap()
+    );
+    let outcome = quoted.outcome().expect("codex parent row");
+    assert_eq!(outcome.key(), CODEX_KEY);
+    assert_eq!(outcome.usage.input, Some(3000));
+    assert_eq!(outcome.usage.usage_events, 2);
+    assert_eq!(
+        account_launch_logs(&with_header, &anchor),
+        account_launch_logs(&without_header, &anchor)
+    );
+
+    // Joining phase logs leaves the parent's rows untouched.
+    let builder = mixed::builder_log(SWEEP);
+    let joined = mixed_accounting(&with_header, &[("builder", &builder)]);
+    assert_eq!(joined.per_tap, quoted.per_tap);
+}
+
+/// `worker run`'s phase-log naming round-trips through the journal's lookup,
+/// in launch order, and other issues' or foreign files are not picked up.
+#[test]
+fn phase_logs_for_issue_finds_this_issues_worker_run_logs_in_launch_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let path = |role, issue, ts| crate::launch_record::phase_log_path(root, role, issue, ts);
+    std::fs::create_dir_all(root.join(".loom/logs")).unwrap();
+    for p in [
+        path("doctor", 4242, 200),
+        path("builder", 4242, 100),
+        path("builder", 42421, 50),
+        path("builder", 424, 60),
+        root.join(".loom/logs/sweep-issue-4242.log"),
+        root.join(".loom/logs/worker-run-builder-4242-notatime.log"),
+    ] {
+        std::fs::write(p, "x").unwrap();
+    }
+    let found = crate::launch_record::phase_logs_for_issue(root, 4242);
+    assert_eq!(
+        found,
+        vec![
+            ("builder".to_string(), path("builder", 4242, 100)),
+            ("doctor".to_string(), path("doctor", 4242, 200)),
+        ]
+    );
+    assert!(crate::launch_record::phase_logs_for_issue(&root.join("absent"), 4242).is_empty());
+}

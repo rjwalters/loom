@@ -47,8 +47,10 @@
 //! # Plan
 //!
 //! Against the registry: **adds** (desired, not registered — only applicable
-//! when already cloned under `root`; a missing clone is reported, never
-//! cloned), **removes** (registered, and the store has a record for that path
+//! when already cloned under `root`; a missing clone is a
+//! [`Change::MissingClone`], which this module never clones: the daemon's
+//! `fleet.autoApply` timer pass does, `crate::fleet_sync::roster_clone`,
+//! #11218), **removes** (registered, and the store has a record for that path
 //! that is not desired), and **priority changes**. A registered workspace the
 //! store has no record for is *unmanaged* and left alone — the store only
 //! governs the repos it names.
@@ -305,11 +307,21 @@ pub enum Change {
         maintain_only: bool,
     },
     /// A desired workspace that cannot be added: not cloned under `root`.
+    /// Carries what the add would need, so a caller that clones it (#11218)
+    /// registers it exactly as [`Change::Add`] would.
     MissingClone {
         /// Record name.
         name: String,
         /// Expected clone path.
         path: PathBuf,
+        /// The record's `remote`, when it has one.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        remote: Option<String>,
+        /// Priority tier it would be registered at.
+        priority: u32,
+        /// It would be registered maintain-only (`fleet: maintain`).
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        maintain_only: bool,
     },
     /// Deregister a workspace the store says must not be managed.
     Remove {
@@ -416,8 +428,15 @@ pub fn plan(
                 maintain_only: want.maintain_only,
             }),
             None => adds.push(Change::MissingClone {
+                remote: roster
+                    .records
+                    .iter()
+                    .find(|r| r.name == want.name)
+                    .and_then(|r| r.remote.clone()),
                 name: want.name,
                 path,
+                priority: want.priority,
+                maintain_only: want.maintain_only,
             }),
             Some(r) => {
                 let synced = r.priority == want.priority && r.maintain_only == want.maintain_only;
@@ -466,17 +485,27 @@ pub fn describe(change: &Change) -> String {
             priority,
             maintain_only,
         } => {
-            let mode = if *maintain_only { ", maintain-only" } else { "" };
+            let mode = if *maintain_only {
+                ", maintain-only"
+            } else {
+                ""
+            };
             format!("+ add      {name:<24} {} (priority {priority}{mode})", path.display())
         }
-        Change::MissingClone { name, path } => format!(
-            "! missing  {name:<24} {} — not cloned; clone it, then re-run (this command never clones)",
+        Change::MissingClone { name, path, .. } => format!(
+            "! missing  {name:<24} {} — not cloned (a daemon timer pass with fleet.autoApply \
+             clones it; `fleet-config roster --apply` never clones)",
             path.display()
         ),
         Change::Remove { name, path, reason } => {
             format!("- remove   {name:<24} {} ({reason})", path.display())
         }
-        Change::SetPriority { name, path, from, to } => {
+        Change::SetPriority {
+            name,
+            path,
+            from,
+            to,
+        } => {
             format!("~ priority {name:<24} {} ({from} -> {to})", path.display())
         }
         Change::SetMaintainOnly { name, path, to } => {

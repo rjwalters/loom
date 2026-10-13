@@ -121,12 +121,12 @@ fn resolve_this_host_serves(fallback_root: &Path) -> std::collections::BTreeSet<
 }
 
 /// This host's opaque roster-publishing id — the same transform lease records
-/// use (`opaque_host_id(host_identity())`), unless
+/// use (`opaque_host_id(lease_host_identity())`, unchanged by #11530), unless
 /// [`sweep_registry::LEASE_PUBLISH_HOSTNAME_ENV`] opts into publishing the raw
 /// hostname instead (kept consistent with every other lease-shaped forge
 /// comment this daemon publishes).
 fn roster_host_id() -> String {
-    let host = sweep_registry::host_identity();
+    let host = sweep_registry::lease_host_identity();
     let raw_opt_in = std::env::var(sweep_registry::LEASE_PUBLISH_HOSTNAME_ENV)
         .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false);

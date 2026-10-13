@@ -76,9 +76,15 @@ pub const OPERATOR_HOLD_LABEL: &str = "loom:operator";
 /// Derived from the registry's `skip` property, so it can never drift from
 /// [`PARK_LABELS`] (#4444: every park label is also a skip label, which
 /// `Registry::validate` enforces). Ordered as the claim ([`BUILDING_LABEL`]), the
-/// parks, the generic hold ([`OPERATOR_HOLD_LABEL`]), then the sub-kinds that
+/// parks, the skip-only labels in registry order (the generic hold
+/// [`OPERATOR_HOLD_LABEL`], then [`EPIC_LABEL`]), then the sub-kinds that
 /// require a base label ([`OPERATOR_DECISION_LABEL`]). The operator hold sits
 /// in this list but NOT in [`PARK_LABELS`] — see [`OPERATOR_HOLD_LABEL`] for why.
+///
+/// **Not every member is a human hold.** [`BUILDING_LABEL`] is the daemon's
+/// own claim and [`EPIC_LABEL`] marks a tracking container; a reader that
+/// needs "a human must act" keys on the registry's `hold` / `operator_hold`
+/// properties (or [`PARK_LABELS`]), never on membership here.
 pub static SKIP_LABELS: LabelSet = LabelSet::new(|| {
     let reg = Registry::embedded();
     let mut skip = embedded_set("skip");
@@ -89,14 +95,36 @@ pub static SKIP_LABELS: LabelSet = LabelSet::new(|| {
     skip
 });
 
+/// The epic tracking container (#11399). An epic is decomposed into
+/// `loom:epic-phase` children by Champion (or the epic supervisor); it is never
+/// build work itself, so a session dispatched onto one can only skip it.
+///
+/// A `loom:issue` row can legitimately carry it (nothing forbids approving an
+/// epic), and before #11399 the work finder dispatched such a row: the session
+/// skipped it, the reaper handed `loom:issue` back, and the finder offered it
+/// again until the PR-less retry bound (#7972) parked the epic under a
+/// `loom:blocked` that described nothing real. Skipping the candidate costs no
+/// session at all.
+///
+/// A skip, deliberately **not** a park ([`PARK_LABELS`]): the dispatch-time
+/// guard keys on parks only, so an operator's explicit `loom-daemon dispatch
+/// <N>` on an epic still runs, and the epic supervisor's own listing and its
+/// `loom:epic-phase` child dispatches never consult this set. Matching is
+/// exact, so `loom:epic-phase` stays dispatchable.
+///
+/// Membership in [`SKIP_LABELS`] comes from the registry's `skip` property
+/// (#10013), so outside tests this name is documentation only.
+#[cfg_attr(not(test), allow(dead_code))]
+pub const EPIC_LABEL: &str = "loom:epic";
+
 /// The `loom:operator-only` decision sub-kind (#5671): an owner has to rule.
 ///
 /// It always accompanies `loom:operator-only`, so on a `loom:issue` row it was
 /// already skipped through that base label. #9244 made it a skip label in its
-/// own right: a starred (`loom:operator-priority`) issue now reaches the
-/// candidate list from outside `loom:issue`, and starring an item that is
-/// waiting on an owner's decision must never dispatch a sweep onto it, even
-/// if the base label was dropped. Not a park ([`PARK_LABELS`]): the base
+/// own right: an operator-starred issue then reached the candidate list from
+/// outside `loom:issue` (no longer, #11508), and an item waiting on an
+/// owner's decision must never get a sweep dispatched onto it, even if the
+/// base label was dropped. Not a park ([`PARK_LABELS`]): the base
 /// label already is one wherever it matters.
 ///
 /// Membership in [`SKIP_LABELS`] now comes from the registry's `skip`

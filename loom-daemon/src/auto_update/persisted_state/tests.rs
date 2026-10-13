@@ -229,9 +229,7 @@ fn the_state_is_written_before_a_roll_is_armed_and_not_after_a_failed_install() 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join(STATE_FILE);
     let mut state = populated(Instant::now());
-    state.persist = Persistence {
-        path: Some(path.clone()),
-    };
+    state.persist.path = Some(path.clone());
     state.persist_before_arm(&RebuildOutcome::Retryable("fetch failed".to_string()));
     assert_eq!(load(&path), LoadOutcome::Missing, "nothing is armed after a failed install");
     state.persist_before_arm(&RebuildOutcome::Success);
@@ -318,9 +316,7 @@ fn writes_are_atomic_replacements_that_leave_no_temp_files() {
     assert!(matches!(load(&path), LoadOutcome::Corrupt(_)));
 
     let mut state = populated(Instant::now());
-    state.persist = Persistence {
-        path: Some(path.clone()),
-    };
+    state.persist.path = Some(path.clone());
     state.persist_state();
     state.persist_state();
     assert!(matches!(load(&path), LoadOutcome::Loaded(_)));
@@ -570,4 +566,103 @@ fn a_file_without_a_floor_stall_key_loads_with_none() {
         .floor
         .set_basis(FloorKnowledge::Set(FLOOR.to_string()), RUNNING);
     assert!(restarted.floor.stall().is_none());
+}
+
+/// #10880: the attempt record is additive at schema 1. A file without it
+/// loads (as `None`), and a file with it parses under a struct that lacks the
+/// field, which is what a binary older than #10880 does with it.
+#[test]
+fn the_roll_attempt_key_is_additive_at_schema_version_1() {
+    use crate::auto_update::roll_attempt::RollAttempt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(STATE_FILE);
+    let (now, now_utc) = (Instant::now(), fixed_utc());
+    let mut saved = populated(now).persisted_state(now, now_utc, BIN);
+    assert_eq!(saved.roll_attempt, None);
+    saved.roll_attempt = Some(RollAttempt {
+        target: "artifact:0.19.950:aaaa".to_string(),
+        version: "0.19.950".to_string(),
+        tag: "v0.19.950".to_string(),
+        source: "floor".to_string(),
+        from_binary: BIN.to_string(),
+        attempts: 2,
+        first_armed_at: now_utc,
+        last_armed_at: now_utc,
+        not_before: None,
+        last_failure: None,
+    });
+    store(&path, &saved).unwrap();
+    let raw: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(raw["schema_version"], 1);
+    assert_eq!(raw["roll_attempt"]["attempts"], 2);
+    assert_eq!(raw["roll_attempt"]["target"], "artifact:0.19.950:aaaa");
+
+    /// The shape a binary older than #10880 reads.
+    #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
+    struct Older {
+        schema_version: u64,
+        saved_at: DateTime<Utc>,
+        binary: String,
+        #[serde(default)]
+        settle: SettleClocks,
+    }
+    let older: Older = serde_json::from_value(raw).unwrap();
+    assert_eq!(older.schema_version, SCHEMA_VERSION);
+
+    let LoadOutcome::Loaded(loaded) = load(&path) else {
+        panic!("loads");
+    };
+    assert_eq!(loaded.roll_attempt, saved.roll_attempt);
+    saved.roll_attempt = None;
+    store(&path, &saved).unwrap();
+    assert!(!std::fs::read_to_string(&path)
+        .unwrap()
+        .contains("roll_attempt"));
+    assert!(matches!(load(&path), LoadOutcome::Loaded(s) if s.roll_attempt.is_none()));
+}
+
+/// #10880 item 5: the write still succeeds with the directory sync added, and
+/// leaves no temp file; a directory sync that fails or is unsupported is not
+/// an error of the write.
+#[test]
+fn store_syncs_the_directory_best_effort_and_leaves_no_temp_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(STATE_FILE);
+    let (now, now_utc) = (Instant::now(), fixed_utc());
+    store(&path, &populated(now).persisted_state(now, now_utc, BIN)).unwrap();
+    store(&path, &populated(now).persisted_state(now, now_utc, BIN)).unwrap();
+    let names: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, [STATE_FILE]);
+    #[cfg(unix)]
+    assert!(sync_dir(dir.path()).is_ok());
+    report_dir_sync(dir.path(), Err(std::io::ErrorKind::Unsupported.into()));
+    assert!(sync_dir(&dir.path().join("missing")).is_err());
+}
+
+/// #10880 item 6: the load line reports the file's age; a `saved_at` in the
+/// future is a warning, and the file still loads with its times clamped.
+#[test]
+fn saved_at_is_reported_and_a_future_one_warns_but_loads() {
+    let now_utc = fixed_utc();
+    assert_eq!(
+        saved_age(now_utc - chrono::Duration::seconds(120), now_utc),
+        Ok("saved 120s ago".to_string())
+    );
+    let warning = saved_age(now_utc + chrono::Duration::hours(1), now_utc).unwrap_err();
+    assert!(warning.contains("3600s in the future"), "{warning}");
+
+    let now = Instant::now();
+    let ahead = now_utc + chrono::Duration::hours(1);
+    let saved = populated(now).persisted_state(now, ahead, BIN);
+    let mut restarted = empty();
+    restarted.apply_persisted_state(saved, now, now_utc, BIN);
+    assert!(
+        restarted.first_stale_since.is_some_and(|at| at <= now),
+        "restored times are clamped to now"
+    );
 }

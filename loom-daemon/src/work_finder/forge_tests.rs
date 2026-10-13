@@ -1,24 +1,24 @@
-//! `GhWorkSource`'s listing merge (#9244 §4, #10118) against a scripted fake `gh`.
+//! `GhWorkSource`'s listing merge (#10118, #11508) against a scripted fake `gh`.
 
 use super::*;
 use std::os::unix::fs::PermissionsExt;
 
 const ISSUES: &str = r#"[
-  {"number":1,"labels":[{"name":"loom:issue"},{"name":"loom:operator-priority"}],"created_at":"2026-01-01T00:00:00Z"},
+  {"number":1,"labels":[{"name":"loom:issue"},{"name":"loom:important"}],"created_at":"2026-01-01T00:00:00Z"},
   {"number":2,"labels":[{"name":"loom:issue"}],"created_at":"2026-01-02T00:00:00Z"}
 ]"#;
 
-const STARRED: &str = r#"[
-  {"number":1,"labels":[{"name":"loom:issue"},{"name":"loom:operator-priority"}]},
-  {"number":3,"labels":[{"name":"loom:triage"},{"name":"loom:operator-priority"}]},
-  {"number":4,"labels":[{"name":"loom:operator-priority"}],"pull_request":{}},
-  {"number":5,"labels":[{"name":"loom:building"},{"name":"loom:operator-priority"}]}
+/// Priority issues outside `loom:issue` (#11508): a very-important triage
+/// row and a starred curated one. Neither may become a candidate.
+const PRIORITY: &str = r#"[
+  {"number":11,"labels":[{"name":"loom:triage"},{"name":"loom:very-important"}]},
+  {"number":12,"labels":[{"name":"loom:curated"},{"name":"loom:important"}]}
 ]"#;
 
 /// Pre-promotion rows (#10118): only marker-bearing, unclaimed ones filed by
 /// a trusted author (#9548) are kept. #10 is an outsider's marker.
 const TRIAGE: &str = r#"[
-  {"number":3,"labels":[{"name":"loom:triage"},{"name":"loom:operator-priority"}],"body":"<!-- loom:main-red-fix -->","user":{"login":"rjwalters"},"author_association":"OWNER"},
+  {"number":3,"labels":[{"name":"loom:triage"},{"name":"loom:important"}],"body":"<!-- loom:main-red-fix -->","user":{"login":"rjwalters"},"author_association":"OWNER"},
   {"number":6,"labels":[{"name":"loom:triage"}],"body":"Fix CI.\n<!-- loom:main-red-fix -->\n","user":{"login":"rjwalters"},"author_association":"OWNER"},
   {"number":7,"labels":[{"name":"loom:triage"}],"body":"No marker here.","user":{"login":"rjwalters"},"author_association":"OWNER"},
   {"number":8,"labels":[{"name":"loom:triage"},{"name":"loom:building"}],"body":"<!-- loom:main-red-fix -->","user":{"login":"rjwalters"},"author_association":"OWNER"},
@@ -30,26 +30,25 @@ const CURATED: &str = r#"[
   {"number":9,"labels":[{"name":"loom:curated"}],"body":"<!-- loom:main-red-fix -->","user":{"login":"teammate"},"author_association":"MEMBER"}
 ]"#;
 
-/// A fake `gh` answering the four listings and the timeline read, logging
-/// every timeline call. The starred listing fails while `fail-starred` exists.
+/// A fake `gh` answering the listings, logging every call. The priority
+/// labels answer with [`PRIORITY`] rows, so a listing of them would show.
 fn fake_gh(dir: &Path) -> PathBuf {
     let d = dir.display();
     std::fs::write(dir.join("issues.json"), ISSUES).unwrap();
-    std::fs::write(dir.join("starred.json"), STARRED).unwrap();
+    std::fs::write(dir.join("priority.json"), PRIORITY).unwrap();
     std::fs::write(dir.join("triage.json"), TRIAGE).unwrap();
     std::fs::write(dir.join("curated.json"), CURATED).unwrap();
     let script = format!(
         r#"#!/bin/bash
+echo "$*" >> {d}/calls.log
 case "$*" in
   *labels=loom:issue\&*) printf 'HTTP/2.0 200 OK\r\n\r\n'; cat {d}/issues.json ;;
-  *labels=loom:operator-priority\&*)
-    if [ -f {d}/fail-starred ]; then echo 'HTTP 502' >&2; exit 1; fi
-    printf 'HTTP/2.0 200 OK\r\n\r\n'; cat {d}/starred.json ;;
+  *labels=loom:very-important\&*|*labels=loom:important\&*|*labels=loom:operator-*)
+    printf 'HTTP/2.0 200 OK\r\n\r\n'; cat {d}/priority.json ;;
   *labels=loom:triage\&*)
     if [ -f {d}/fail-triage ]; then echo 'HTTP 502' >&2; exit 1; fi
     printf 'HTTP/2.0 200 OK\r\n\r\n'; cat {d}/triage.json ;;
   *labels=loom:curated\&*) printf 'HTTP/2.0 200 OK\r\n\r\n'; cat {d}/curated.json ;;
-  *timeline*) echo "$*" >> {d}/timeline.log; echo '2026-09-01T00:00:00Z' ;;
   *labels=*) printf 'HTTP/2.0 200 OK\r\n\r\n'; echo '[]' ;;
   *) exit 1 ;;
 esac
@@ -70,8 +69,8 @@ fn source(dir: &Path) -> GhWorkSource {
     }
 }
 
-fn timeline_calls(dir: &Path) -> Vec<String> {
-    std::fs::read_to_string(dir.join("timeline.log"))
+fn calls(dir: &Path) -> Vec<String> {
+    std::fs::read_to_string(dir.join("calls.log"))
         .unwrap_or_default()
         .lines()
         .map(str::to_string)
@@ -79,15 +78,14 @@ fn timeline_calls(dir: &Path) -> Vec<String> {
 }
 
 #[test]
-fn starred_rows_are_merged_deduped_and_stamped_with_starred_at() {
+fn only_loom_issue_and_unpromoted_red_fix_rows_are_listed() {
     let dir = tempfile::tempdir().unwrap();
     let mut src = source(dir.path());
     let items = src.list_ready_issues().unwrap();
     let numbers: Vec<u32> = items.iter().map(|i| i.number).collect();
-    // #1 deduped, #4 (a PR) and #5 (already claimed) dropped. Then the
-    // unpromoted red-main fixes (#10118): #3 already listed as starred, #7
-    // has no marker, #8 is claimed, #6 is listed once, and #10's marker is
-    // an outsider's (#9548): not admitted.
+    // The `loom:issue` rows, then the unpromoted red-main fixes (#10118): #3
+    // and #6 are trusted marker-bearing triage rows (#6 listed once), #7 has
+    // no marker, #8 is claimed, and #10's marker is an outsider's (#9548).
     assert_eq!(numbers, vec![1, 2, 3, 6, 9]);
     let owner = items[3]
         .author
@@ -97,28 +95,27 @@ fn starred_rows_are_merged_deduped_and_stamped_with_starred_at() {
         (owner.login.as_deref(), owner.association.as_deref()),
         (Some("rjwalters"), Some("OWNER"))
     );
+    assert!(items[2].is_unpromoted_red_fix(), "a starred fix is no longer special");
     assert!(items[3].is_unpromoted_red_fix() && items[4].is_unpromoted_red_fix());
-    assert!(!items[2].is_unpromoted_red_fix(), "a starred fix is a candidate anyway");
-    assert_eq!(items[0].operator_priority_at.as_deref(), Some("2026-09-01T00:00:00Z"));
-    assert_eq!(items[1].operator_priority_at, None, "unstarred");
-    assert_eq!(items[2].operator_priority_at.as_deref(), Some("2026-09-01T00:00:00Z"));
-    let calls = timeline_calls(dir.path());
-    assert_eq!(calls.len(), 2, "one timeline read per starred issue: {calls:?}");
-    assert!(calls.iter().all(|c| c.contains("repos/acme/app/issues/")));
-
-    // The next tick reads no timeline at all: starred-at is cached.
-    src.list_ready_issues().unwrap();
-    assert_eq!(timeline_calls(dir.path()).len(), 2);
 }
 
+/// #11508 (operator ruling): priority never makes an issue eligible. No
+/// priority label is listed outside `loom:issue`, so a very-important or
+/// starred triage / curated issue is not a candidate until promoted, and no
+/// starred-at timeline is read.
 #[test]
-fn a_failed_starred_listing_keeps_the_loom_issue_rows() {
+fn a_very_important_issue_outside_loom_issue_is_not_listed() {
     let dir = tempfile::tempdir().unwrap();
     let mut src = source(dir.path());
-    std::fs::write(dir.path().join("fail-starred"), "").unwrap();
-    let items = src.list_ready_issues().expect("loom:issue rows still used");
-    let numbers: Vec<u32> = items.iter().map(|i| i.number).collect();
-    assert_eq!(numbers, vec![1, 2, 3, 6, 9]);
+    let items = src.list_ready_issues().unwrap();
+    assert!(items.iter().all(|i| i.number != 11 && i.number != 12), "{items:?}");
+    let calls = calls(dir.path());
+    assert!(
+        calls.iter().all(|c| !c.contains("important")
+            && !c.contains("operator-")
+            && !c.contains("timeline")),
+        "{calls:?}"
+    );
 }
 
 #[test]
@@ -128,7 +125,8 @@ fn a_failed_unpromoted_listing_keeps_every_other_row() {
     std::fs::write(dir.path().join("fail-triage"), "").unwrap();
     let items = src.list_ready_issues().expect("other listings still used");
     let numbers: Vec<u32> = items.iter().map(|i| i.number).collect();
-    assert_eq!(numbers, vec![1, 2, 3, 6, 9], "#6 still arrives via loom:curated");
+    // #3 came only from loom:triage (no priority listing since #11508).
+    assert_eq!(numbers, vec![1, 2, 6, 9], "#6 still arrives via loom:curated");
 }
 
 // ===== paged ready queue (#11139) =====
@@ -194,7 +192,7 @@ fn ready_requests(dir: &Path) -> usize {
 }
 
 /// The multi-workspace planner's order over `items`: [`candidate_cmp`]
-/// (createdAt oldest first, then number, for unstarred work).
+/// (level, createdAt oldest first, then number).
 fn planner_order(items: &[WorkItem]) -> Vec<u32> {
     let mut keys: Vec<_> = items
         .iter()
@@ -220,10 +218,14 @@ fn a_repo_with_more_than_a_page_of_ready_issues_yields_every_one() {
     assert_eq!(numbers, (1..=250).rev().collect::<Vec<_>>(), "listing order kept");
     assert!(src.listing_complete());
     assert_eq!(planner_order(&items), (1..=250).collect::<Vec<_>>());
-    // Single-workspace order: unstarred work keeps its listing order.
+    // Single-workspace order (#11103): level, oldest, number — the oldest
+    // first here too, whatever the listing order.
     let mut lanes = items.clone();
     super::super::ready_queue::sort_lanes(&mut lanes, false);
-    assert_eq!(lanes.iter().map(|i| i.number).collect::<Vec<_>>(), numbers);
+    assert_eq!(
+        lanes.iter().map(|i| i.number).collect::<Vec<_>>(),
+        (1..=250).collect::<Vec<_>>()
+    );
     // Three pages, then the conditional re-reads of pages 1 and 2.
     assert_eq!(ready_requests(dir.path()), 5);
 }
@@ -296,7 +298,7 @@ fn hitting_the_page_cap_marks_the_queue_incomplete() {
     assert_eq!(ready_requests(dir.path()), cap);
 }
 
-/// A failed side listing (the starred one) also leaves the queue partial:
+/// A failed side listing (the unpromoted triage one) also leaves the queue partial:
 /// its rows are missing from the tick.
 #[test]
 fn a_failed_side_listing_marks_the_queue_incomplete() {
@@ -304,7 +306,7 @@ fn a_failed_side_listing_marks_the_queue_incomplete() {
     let mut src = source(dir.path());
     src.list_ready_issues().unwrap();
     assert!(src.listing_complete());
-    std::fs::write(dir.path().join("fail-starred"), "").unwrap();
+    std::fs::write(dir.path().join("fail-triage"), "").unwrap();
     src.list_ready_issues().unwrap();
     assert!(!src.listing_complete());
 }

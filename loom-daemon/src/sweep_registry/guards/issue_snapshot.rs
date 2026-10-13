@@ -75,6 +75,10 @@ pub(crate) struct IssueView {
     /// `Some(true)` closed or a PR, `Some(false)` an open issue, `None` an
     /// unrecognised state.
     pub(crate) closed_or_pr: Option<bool>,
+    /// The number is a pull request, in any state.
+    pub(crate) is_pr: bool,
+    /// The issue was closed as not planned (`state_reason`).
+    pub(crate) not_planned: bool,
     /// Label names, as [`SweepRegistry::current_labels_via_rest`] gives them.
     pub(crate) labels: Vec<String>,
 }
@@ -101,10 +105,55 @@ pub(crate) fn parse_issue_view(body: &str) -> Option<IssueView> {
         (false, Some("OPEN")) => Some(false),
         _ => None,
     };
+    let not_planned = v
+        .get("state_reason")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(is_not_planned);
     Some(IssueView {
         closed_or_pr,
+        is_pr,
+        not_planned,
         labels,
     })
+}
+
+/// What step 2.5 read about an issue number (Issue #11429 splits the PR case
+/// from the closed issue, so a closed issue can be refused as `already_landed`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IssueGate {
+    Open,
+    Closed,
+    /// Closed with `state_reason` `not_planned`: refused as `already_closed`.
+    ClosedNotPlanned,
+    PullRequest,
+}
+
+fn is_not_planned(state_reason: &str) -> bool {
+    state_reason.trim().eq_ignore_ascii_case("not_planned")
+}
+
+impl IssueGate {
+    /// The pre-#11429 2.5 verdict: anything but an open issue is terminal.
+    #[must_use]
+    pub(crate) fn closed_or_pr(self) -> bool {
+        self != Self::Open
+    }
+
+    fn from_view(view: &IssueView) -> Option<Self> {
+        if view.is_pr {
+            return Some(Self::PullRequest);
+        }
+        view.closed_or_pr
+            .map(|closed| Self::closed_or_open(closed, view.not_planned))
+    }
+
+    fn closed_or_open(closed: bool, not_planned: bool) -> Self {
+        match (closed, not_planned) {
+            (false, _) => Self::Open,
+            (true, true) => Self::ClosedNotPlanned,
+            (true, false) => Self::Closed,
+        }
+    }
 }
 
 /// Whether the conditional reads are on: the kill switch, and a daemon store
@@ -134,10 +183,57 @@ impl SweepRegistry {
     /// Step 2.5: is `issue` closed or a PR? The conditional read, else
     /// [`Self::issue_is_closed_or_pr`].
     pub(crate) fn guard_closed_or_pr(&self, issue: u32) -> Option<bool> {
+        self.guard_issue_gate(issue).map(IssueGate::closed_or_pr)
+    }
+
+    /// Step 2.5 as an [`IssueGate`]: the conditional read, else
+    /// [`Self::issue_gate_via_rest`].
+    pub(crate) fn guard_issue_gate(&self, issue: u32) -> Option<IssueGate> {
         match self.conditional_issue_view(issue, "guard.issue_view", STATE_PREFIX, false) {
-            Some(view) => view.closed_or_pr,
-            None => self.issue_is_closed_or_pr(issue),
+            Some(view) => IssueGate::from_view(&view),
+            None => self.issue_gate_via_rest(issue),
         }
+    }
+
+    /// The unconditional 2.5 read (see [`Self::issue_is_closed_or_pr`] for why
+    /// it is REST). `None` when the repo cannot be resolved or the answer does
+    /// not parse into `{state, is_pr}`.
+    pub(crate) fn issue_gate_via_rest(&self, issue: u32) -> Option<IssueGate> {
+        let (owner, repo) = self.resolve_owner_repo()?;
+        let gh = self.resolved_gh();
+        let cmd = self
+            .gh_inv("guard.issue_state", AccessIntent::Read, &gh)
+            .arg("api")
+            .arg(format!("repos/{owner}/{repo}/issues/{issue}"))
+            .arg("--jq")
+            .arg("{state, state_reason, is_pr: (.pull_request != null)}");
+        let output = self.run_counted(cmd).ok()??;
+        if !output.status.success() {
+            return None;
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).ok()?;
+        if parsed.get("is_pr")?.as_bool()? {
+            return Some(IssueGate::PullRequest);
+        }
+        let not_planned = parsed
+            .get("state_reason")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(is_not_planned);
+        let closed = match parsed
+            .get("state")?
+            .as_str()?
+            .trim()
+            .to_ascii_uppercase()
+            .as_str()
+        {
+            // REST reports a merged PR as `closed`; `MERGED` on an issue-shaped
+            // node must still never fall through to the fail-open arm (#4504).
+            "CLOSED" | "MERGED" => true,
+            "OPEN" => false,
+            _ => return None,
+        };
+        Some(IssueGate::closed_or_open(closed, not_planned))
     }
 
     /// Step 2.7 (and 2.71): `issue`'s labels. The writer-pinned conditional

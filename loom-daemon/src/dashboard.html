@@ -374,9 +374,8 @@ function renderQueue(report) {
       ? el("td", {}, [el("a", { href: base + "/issues/" + row.issue, target: "_blank", rel: "noopener", text: "#" + row.issue })])
       : el("td", { text: "#" + row.issue });
     var flags = [];
-    if (row.operator_priority) flags.push("starred");
+    if (row.level && row.level !== "default") flags.push(row.level);
     if (row.main_red_fix) flags.push("red-main-fix");
-    if (row.tier) flags.push(row.tier);
     tbody.appendChild(el("tr", {}, [
       el("td", { text: String(row.rank) }),
       issueCell,

@@ -116,18 +116,6 @@ fn tree_compare_of_two_shas_is_spent_once_and_counted() {
     assert_eq!(calls(&rows, "forge.tree_compare"), 3, "{rows:?}");
 }
 
-#[test]
-fn snapshot_and_complexity_reads_are_counted() {
-    let tmp = tempfile::tempdir().unwrap();
-    let gh = stub(tmp.path(), "gh-body", "echo 'no marker here'");
-    let mut body = Some("x".to_string());
-    let rows = rows_after(|| {
-        body = crate::sweep_registry::fetch_issue_complexity(&gh, tmp.path(), 5);
-    });
-    assert_eq!(body, None);
-    assert_eq!(calls(&rows, "model.issue_body"), 1, "{rows:?}");
-}
-
 // ---- #10089 increment 3: daemon tick readers + sweep_registry family ----
 
 #[test]

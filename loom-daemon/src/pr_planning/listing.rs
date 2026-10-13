@@ -45,16 +45,13 @@ fn read(root: &Path, gh: &Path, op: ForgeOp, suffix: &str) -> Result<Value> {
     serde_json::from_str(&body).context("parse PR queue response")
 }
 
-/// Listing and fallback guard failures are errors, never an empty queue.
-/// Fallback guard owns bot admission, lifetime cap and head dedup. It grants
-/// review only; no workflow labels or branch mutations occur here.
-pub fn fetch_queue(root: &Path, gh: &Path, role: PrRole) -> Result<Vec<Value>> {
+/// Every open PR, newest first: `GET pulls?state=open` (`pr.list-open`).
+fn list_open(root: &Path, gh: &Path) -> Result<Vec<Value>> {
     let mut rows = Vec::new();
     for page in 1.. {
         let value = read(
             root,
             gh,
-            // `GET pulls?state=open`: the open-PR queue (`pr.list-open`).
             ops::PR_LIST_OPEN,
             &format!("pulls?state=open&sort=created&direction=desc&per_page=100&page={page}"),
         )?;
@@ -64,6 +61,44 @@ pub fn fetch_queue(root: &Path, gh: &Path, role: PrRole) -> Result<Vec<Value>> {
             break;
         }
     }
+    Ok(rows)
+}
+
+/// Whether `judge-fallback-guard.sh` admits this fallback row. The guard owns
+/// bot admission, lifetime cap and head dedup; its failure is an error.
+fn guard_admits(root: &Path, row: &Value) -> Result<bool> {
+    let number = row["number"].as_u64().context("PR number missing")?;
+    let output = Command::new(root.join(".loom/scripts/judge-fallback-guard.sh"))
+        .current_dir(root)
+        .arg(number.to_string())
+        .output()
+        .context("run Judge fallback guard")?;
+    // Velocity is independent of admission, including an empty queue.
+    // Keep diagnostics off stdout, which belongs to the queue JSON.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if stdout.lines().any(|line| line == "VELOCITY_ALERT=1") {
+        let count = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("VELOCITY_COUNT="))
+            .unwrap_or("unknown");
+        eprintln!(
+            "Judge fallback warning for PR #{number}: VELOCITY_ALERT=1 VELOCITY_COUNT={count}"
+        );
+    }
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(10..=12) => Ok(false),
+        _ => Err(anyhow!(
+            "Judge fallback guard failed for #{number}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )),
+    }
+}
+
+/// Listing and fallback guard failures are errors, never an empty queue.
+/// Fallback review only; no workflow labels or branch mutations occur here.
+pub fn fetch_queue(root: &Path, gh: &Path, role: PrRole) -> Result<Vec<Value>> {
+    let mut rows = list_open(root, gh)?;
     if role == PrRole::Doctor {
         for row in &mut rows {
             if has_label(row, "loom:pr")
@@ -88,46 +123,29 @@ pub fn fetch_queue(root: &Path, gh: &Path, role: PrRole) -> Result<Vec<Value>> {
     if role == PrRole::Judge {
         let mut guarded = Vec::new();
         for row in queue {
-            if row["mode"] == "fallback" {
-                let number = row["number"].as_u64().context("PR number missing")?;
-                let output = Command::new(root.join(".loom/scripts/judge-fallback-guard.sh"))
-                    .current_dir(root)
-                    .arg(number.to_string())
-                    .output()
-                    .context("run Judge fallback guard")?;
-                // Velocity is independent of admission, including an empty queue.
-                // Keep diagnostics off stdout, which belongs to the queue JSON.
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if stdout.lines().any(|line| line == "VELOCITY_ALERT=1") {
-                    let count = stdout
-                        .lines()
-                        .find_map(|line| line.strip_prefix("VELOCITY_COUNT="))
-                        .unwrap_or("unknown");
-                    eprintln!("Judge fallback warning for PR #{number}: VELOCITY_ALERT=1 VELOCITY_COUNT={count}");
-                }
-                match output.status.code() {
-                    Some(0) => {}
-                    Some(10..=12) => continue,
-                    _ => {
-                        return Err(anyhow!(
-                            "Judge fallback guard failed for #{number}: {}",
-                            String::from_utf8_lossy(&output.stderr)
-                        ))
-                    }
-                }
+            if row["mode"] != "fallback" || guard_admits(root, &row)? {
+                guarded.push(row);
             }
-            guarded.push(row);
         }
         queue = guarded;
     }
     Ok(queue)
 }
 
-pub fn has_interactive_fallback(root: &Path, gh: &Path) -> Result<bool> {
-    if !prefer_human_prs(root) {
-        return Ok(false);
+/// Judge's role-runner gate on an empty labeled listing (#9389): is there a
+/// guard-admitted fallback PR that joins a busy queue — trusted interactive
+/// (preference on) or [`workflow_shaped`] (always)? The predicate runs on the
+/// one cached listing before the guard, so a repo with no such PR runs no
+/// guard at all, and the first admitted row settles it.
+pub fn has_judge_fallback(root: &Path, gh: &Path) -> Result<bool> {
+    let (prefer, trust) = (prefer_human_prs(root), TrustPolicy::for_root(root));
+    for row in ordered_queue(list_open(root, gh)?, PrRole::Judge, prefer, &trust) {
+        if row["mode"] == "fallback"
+            && joins_busy_queue(&row, prefer, &trust)
+            && guard_admits(root, &row)?
+        {
+            return Ok(true);
+        }
     }
-    Ok(fetch_queue(root, gh, PrRole::Judge)?
-        .iter()
-        .any(|r| r["mode"] == "fallback" && r["origin"] == "interactive"))
+    Ok(false)
 }

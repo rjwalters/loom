@@ -213,6 +213,7 @@ pub enum Outcome {
     Timeout { sha: String, pending: Vec<String> },
     Error(String),
     HeadMoved { old: String, new: String },
+    NoRun { sha: String },
 }
 
 impl Outcome {
@@ -236,6 +237,7 @@ impl Outcome {
             }
             Self::Error(why) => format!("LOOM-CHECKS-ERROR {why}"),
             Self::HeadMoved { old, new } => format!("LOOM-CHECKS-HEAD-MOVED {old} {new}"),
+            Self::NoRun { sha } => format!("LOOM-CHECKS-NO-RUN {sha}"),
         };
         one_line(&line)
     }
@@ -251,6 +253,7 @@ impl Outcome {
             Self::Timeout { .. } => 2,
             Self::Error(_) => 3,
             Self::HeadMoved { .. } => 4,
+            Self::NoRun { .. } => 5,
         }
     }
 

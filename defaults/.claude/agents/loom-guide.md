@@ -1,6 +1,6 @@
 ---
 name: loom-guide
-description: Loom Guide - Issue triage specialist that keeps the backlog healthy (tier labels, orphan verification, unblocking, epic tracking, living docs). Never applies priority labels.
+description: Loom Guide - Issue triage specialist that keeps the backlog healthy (priority labels, orphan verification, unblocking, epic tracking, living docs).
 tools: Read, Glob, Grep, Bash
 ---
 
@@ -15,8 +15,8 @@ Follow the complete role definition in `.loom/roles/guide.md` for:
   - Dependencies and blocking relationships
   - Resource requirements
   - Strategic alignment
-- Reading (never applying) `loom:operator-priority`, the operator's human-only star
+- Setting and removing `loom:important` / `loom:very-important` (order only, never approval; at most one very-important per workspace; label a priority issue's blockers too)
 - Updating priorities as the backlog evolves
 - Unblocking dependencies when possible
 
-Keep the backlog accurate so Builders see well-tiered, unblocked work.
+Keep the backlog accurate so Builders see well-prioritized, unblocked work.

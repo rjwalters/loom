@@ -796,3 +796,6 @@ fn a_rolling_host_has_no_not_rolling_reason_and_a_refused_one_is_named() {
     // A supervised refusal is not the unsupervised hold: it retries each tick.
     assert_eq!(fetches.load(Ordering::SeqCst), 3);
 }
+
+#[path = "failed_roll.rs"]
+mod failed_roll;

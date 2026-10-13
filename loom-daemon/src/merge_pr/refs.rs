@@ -253,6 +253,56 @@ pub fn has_unnegated_closing_ref(text: &str, issue: u64) -> bool {
     closing_ref_negation_status(text, issue) == ClosingRefNegationStatus::Unnegated
 }
 
+/// Whether `text` carries at least one closing-keyword reference to issue
+/// `issue` of repository `owner_repo` that is NOT negated — a bare `#N`
+/// (GitHub's same-repository rule) or a repository-qualified
+/// `owner/repo#N` naming `owner_repo`, compared case-insensitively (#11402).
+///
+/// [`has_unnegated_closing_ref`] sees only the bare shape: its pattern
+/// cannot span a qualifier, so `Closes rjwalters/loom#909` reads as no
+/// reference at all. That strictness is right for Champion's Verify-Issue-
+/// Auto-Close cross-check, which acts only on what it can parse; a
+/// merge-close classifier has the opposite failure mode — an unparseable
+/// close is misread as a hand close — so it gets this wider parser.
+///
+/// A qualifier naming a different repository (`Closes other/repo#N`) is a
+/// close of some other repository's issue, never this one, and is skipped:
+/// the scan continues to the next reference in the clause. Clause splitting
+/// and the negation window are identical to [`closing_ref_negation_status`].
+#[must_use]
+pub fn has_unnegated_closing_ref_in_repo(text: &str, owner_repo: &str, issue: u64) -> bool {
+    static NEG_NEAR_END: OnceLock<Regex> = OnceLock::new();
+    let neg_near_end = NEG_NEAR_END.get_or_init(|| {
+        Regex::new(r"(?i)(?:\bnot\b|\bnever\b|\w+n['’]t\b)(?:\s+\S+){0,2}\s*$")
+            .expect("static negation-window pattern")
+    });
+    let re = Regex::new(&format!(
+        r"(?i)\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\b[[:blank:]\x0B\x0C\r]+(?:([A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*))?#{issue}\b"
+    ))
+    .expect("closing-reference pattern");
+
+    for clause in text.split(['.', '!', '?', ';', '\n']) {
+        for caps in re.captures_iter(clause) {
+            if !caps
+                .get(3)
+                .is_none_or(|q| q.as_str().eq_ignore_ascii_case(owner_repo))
+            {
+                continue;
+            }
+            // The first reference in the clause that names this repository
+            // decides it, so text after it cannot retroactively negate the
+            // close — the same rule the bare parser applies to its first
+            // match.
+            let prefix = &clause[..caps.get(0).expect("keyword match").start()];
+            if !neg_near_end.is_match(prefix) {
+                return true;
+            }
+            break;
+        }
+    }
+    false
+}
+
 /// Render matched snippets the way the shell does: sorted, deduped, and joined
 /// with `", "` so the caller can drop the result straight into a quoted
 /// message.

@@ -6,7 +6,7 @@ slices 1 and R3/R4), the `fleet.state` record (slice R1),
 against the forge with the daily agreement report (slice R7, #11128).
 
 The question this contract answers: **what did the fleet look like at instant
-`t`, as a daemon running at `t` could have known it?** ETA backtesting
+`t`, as a daemon running at `t` could have known it?** Backtesting
 (#10193) and any retroactive analysis depend on it.
 
 ## Two clocks
@@ -16,8 +16,8 @@ conflated.
 
 | Clock | OTLP column | Meaning |
 |-------|-------------|---------|
-| **Event time** | `timestamp` (`time_unix_nano`) | When the thing happened (usually the envelope's `emitted_at`; `eta.*` and `session.output` override it with their own source instant). |
-| **Knowable-at** | `created_at` (SigNoz insert time) | When the record became *available to a reader*. The OTLP `observed_timestamp` is only a producer-side lower bound (see below). |
+| **Event time** | `timestamp` (`time_unix_nano`) | When the thing happened (usually the envelope's `emitted_at`; `session.output` overrides it with its own source instant). |
+| **Knowable-at** | `inserted_at_unix_milli` (backend insert time, `Int64` epoch ms) | When the record became *available to a reader*. The OTLP `observed_timestamp` is only a producer-side lower bound (see below). |
 
 Delivery is batched, retried and at-least-once, so a `sweep.outcome` can reach
 SigNoz long after its event time. A query over `timestamp < t` returns rows
@@ -32,12 +32,14 @@ decides membership.
 
 ### The knowable-at column (design decision, #10196 R3)
 
-**A reader uses SigNoz's own insert clock, `created_at` on
-`signoz_logs.distributed_logs_v2`, as the knowable-at instant.** It is set by
-the backend when the row becomes queryable, so it cannot be earlier than the
-moment a reader could have seen the record. `session-output.md` (Querying
-end-to-end latency) already relies on it and measured it against the producer
-clocks.
+**A reader uses a backend-side insert clock, `inserted_at_unix_milli`
+(`Int64`, epoch milliseconds) on `signoz_logs.distributed_logs_v2`, as the
+knowable-at instant.** It is set by the backend when the row becomes queryable,
+so it cannot be earlier than the moment a reader could have seen the record.
+It is the name SigNoz already uses on its metrics tables
+(`signoz_metrics.samples_v4`). The replay SQL exposes it as the `knowable_at`
+alias, `fromUnixTimestamp64Milli(inserted_at_unix_milli)`, defined once per
+query. `session-output.md` (Querying end-to-end latency) uses the same column.
 
 `observed_timestamp` is NOT the knowable-at column. The OTLP exporter sets it
 to a copy of `emitted_at` (`log_record_for` in `observability/otlp/mapping.rs`;
@@ -45,28 +47,69 @@ only `session.output` overrides it with the producer's read time). That is a
 producer-side value: a record delayed in the export queue still claims to have
 been observed at its event time. Use it only as a lower bound.
 
-This makes the collector-side receive stamp planned in slice 1 unnecessary: the
-collector processor is superseded and no collector change is needed.
-
-**Verification status: unverified on a live store.** The check below must
-return `0` in the second column. It was not run from the worker that wrote this
-change (no ClickHouse access), so treat `created_at` as verified only after its
-first live run. If the count is not `0`, fall back to
-`greatest(created_at, observed_timestamp)` and say so here.
+**Verification status (2026-10-11, live harness-ops store, ClickHouse
+25.12.5): the column does not exist yet.** An earlier version of this page
+named SigNoz's `created_at` here as "unverified on a live store". The first
+live check showed it is false: `signoz_logs.logs_v2` and
+`distributed_logs_v2` carry only `timestamp` and `observed_timestamp` as time
+columns, and `created_at` exists only on the `schema_migrations_v2` tables.
+Only metrics have an insert clock. Until the store owner adds the column, the
+replay SQL cannot run, and `telemetry-replay` / `--check` say so (see
+"Preflight" below) instead of surfacing ClickHouse's `UNKNOWN_IDENTIFIER`.
+The live change is tracked in #11463 and is not made by Loom; the owner's
+statement (option 1 there) is:
 
 ```sql
+ALTER TABLE signoz_logs.logs_v2 ADD COLUMN IF NOT EXISTS inserted_at_unix_milli
+    Int64 DEFAULT toUnixTimestamp64Milli(now64(3));
+-- and the same on signoz_logs.distributed_logs_v2, in the deployment's
+-- ON CLUSTER form if it has one.
+```
+
+Rows that predate the ALTER have no stored value; the non-materialized
+DEFAULT evaluates at read time, i.e. "knowable now". That is conservative and
+never leaks into the past, but it also means an instant earlier than the ALTER
+cannot be reconstructed: see "Before the column existed".
+
+The check below (query 0, rewritten) must return `0` in the second column once
+the column exists. Record the owner, the ALTER instant and its first live
+result in #11463.
+
+```sql
+WITH fromUnixTimestamp64Milli(inserted_at_unix_milli) AS knowable_at
 SELECT count(),
-       countIf(created_at < fromUnixTimestamp64Nano(toInt64(observed_timestamp)))
+       countIf(knowable_at < fromUnixTimestamp64Nano(toInt64(observed_timestamp)))
 FROM signoz_logs.distributed_logs_v2
 WHERE timestamp > toUnixTimestamp64Nano(now64(9) - INTERVAL 1 DAY);
 ```
+
+#### Before the column existed
+
+A record has a knowable-at only from the moment the column began to hold real
+insert times (the ALTER instant). An instant `t` earlier than that is
+**unknown**, reason `no_knowable_at`: the reader never falls back to
+`observed_timestamp`, which would leak delayed records into earlier instants.
+The reader is told the ALTER instant with `--knowable-since <RFC3339>` (the SQL
+parameter `knowable_since`); it is required for a live read, because the column
+alone cannot say it (an old row's value is the read-time DEFAULT). A replay with
+`--as-of` before it prints `unknown: no_knowable_at` and no hosts or items;
+query 3 reports each host's state as `no_knowable_at` (not `no_anchor`), and in
+`--check` such instants count as uncovered with that reason.
+
+#### Preflight
+
+Before any replay query, `telemetry-replay` and `telemetry-replay --check` look
+the column up in `system.columns` for `signoz_logs.distributed_logs_v2`. If it
+is absent they print ``knowable-at column `inserted_at_unix_milli` absent on the
+store`` and exit 2. `--print-sql` and `--from-file` make no store call and skip
+the preflight.
 
 The replay SQL is committed at
 [`observability/signoz/replay-queries.sql`](https://github.com/rjwalters/loom/blob/main/defaults/observability/signoz/replay-queries.sql):
 fleet state at `t` (anchors plus deltas, merged per `(repo, issue)`, preferring
 the row that carries a `host`), the spread between hosts' views, coverage at
 `t`, anchor completeness and volume, outcome facts, and agreement with the
-forge (queries 6-7, below). It filters on `created_at < t` and dedupes with
+forge (queries 6-7, below). It filters on `knowable_at < t` and dedupes with
 `LIMIT 1 BY`. It introduces no row caps. The shared prefix rebuilds the state
 at a run of sample instants (`t`, `t - step`, … `t - span`, each reading only
 records knowable before itself); queries 1-3 read the instant `t` only and
@@ -95,9 +138,7 @@ loom.record_id = derived_hex(["loom.record", kind, host_id, emitted_at, <record 
 It follows `trace-identity.md`: SHA-256 over NUL-terminated parts, never a
 random value. A retried delivery of the same envelope hashes identically; a
 re-snapshot of unchanged state is a distinct record because `emitted_at`
-differs. `eta.*` records additionally keep their own `loom.eta.estimate_id`,
-which is unchanged.
-
+differs.
 ### Outcome facts and the cross-host id
 
 `loom.record_id` includes `host_id`, so it dedupes repeated deliveries from one
@@ -116,21 +157,29 @@ nothing is elected, so duplicates across hosts are expected.
 
 | Kind | Natural key | Event time | Knowable-at | Notes |
 |------|-------------|------------|-------------|-------|
-| `pr.resolved` | `(repo, pr_number, state, closed_at)` | `resolved_at` | `created_at` | `state` is `merged` or `closed`; `closed_at` is the forge's, so a PR closed, reopened and closed again is two facts. |
-| `eta.stage_outcome` | `(repo, issue, stage, next_stage, forge_transition_at)` | `left_at` | `created_at` | `forge_transition_at` is the forge's own instant (a label event's `created_at`, a PR's `merged_at` / `closed_at`); `next_stage` is empty when the item left the view. Instants are RFC 3339 UTC, nanosecond precision. Re-homed outside ETA by #11126; the wire kind name and `loom.eta.*` attribute keys are kept (stage 1 is additive only). |
+| `pr.resolved` | `(repo, pr_number, state, closed_at)` | `resolved_at` | `inserted_at_unix_milli` | `state` is `merged` or `closed`; `closed_at` is the forge's, so a PR closed, reopened and closed again is two facts. |
+| `eta.stage_outcome` | `(repo, issue, stage, next_stage, forge_transition_at)` | `left_at` | `inserted_at_unix_milli` | `forge_transition_at` is the forge's own instant (a label event's `created_at`, a PR's `merged_at` / `closed_at`); `next_stage` is empty when the item left the view. Instants are RFC 3339 UTC, nanosecond precision. Re-homed outside ETA by #11126; the wire kind name and `loom.eta.*` attribute keys are kept (stage 1 is additive only). |
 
 Every key part is a forge-observed fact, identical on every host whatever its
 polling time. A host's own polling time (`left_at` for a polled move,
 `observed_at`) is never part of a key: two hosts that poll one transition at
 different times would otherwise emit two ids for it.
 
-**No forge instant, no fact id.** A stage exit the producer has no forge
-instant for (a sweep stage, a failed read, a label event outside the pass
-window) is emitted **without** `loom.fact_id`. So is a
-`pr.resolved` from a build before #11126 (no `closed_at`). Readers dedupe
-these by `(repo, issue, next_stage)` for `eta.stage_outcome` (`(repo,
-pr_number, state)` for `pr.resolved`) within a short window: two hosts'
-records of one transition are at most one pass interval apart (their
+**No forge instant: a fallback key, else a reason (#11401).** A stage exit
+the producer has no forge instant for keys on the id of the host's sweep that
+held the stage (only that host emits a sweep row, so the id is stable), else
+on the forge-dated `entered_at`: `(repo, issue, stage, next_stage, "sweep",
+sweep_id, checkpoint entered_at)` or `(repo, issue, stage, next_stage,
+"entry", entered_at)`. A forge-instant key is unchanged and always wins.
+With none of these the record has no `loom.fact_id` and carries
+`loom.fact_id_missing_reason` (`forge_read_failed` / `no_forge_instant`)
+instead, never neither, and `host.export` counts it
+(`loom.host_export.fact_id_missing_total`). A fallback id and a peer host's
+forge-instant id for the same move differ; so does a `pr.resolved` from a
+build before #11126 (no `closed_at`, no fact id). Readers dedupe records
+without a fact id by `(repo, issue, next_stage)` for `eta.stage_outcome`
+(`(repo, pr_number, state)` for `pr.resolved`) within a short window: two
+hosts' records of one transition are at most one pass interval apart (their
 `resolution_sec`), so a window of twice the largest `resolution_sec` in the
 group keeps one row per transition, the earliest knowable-at.
 
@@ -160,8 +209,12 @@ slice.
 
 ## Fleet state (`fleet.state`)
 
-Every host with an OTLP exporter sends `fleet.state` log records on its
-5-minute snapshot pass, whether or not ETA is enabled. **Each host emits its
+Every host with an OTLP exporter builds and diffs `fleet.state` after every
+work-finder tick (default 60 s; the header's `tick_interval_secs` names the
+cadence) and on its 5-minute snapshot pass.
+A pass with no change sends nothing. The review listings are read only on
+the 5-minute pass, so PR rows and the census move at that cadence; held and
+`ready_wait` rows move at tick cadence. **Each host emits its
 own view; nothing is elected.** The field reference is in
 [`telemetry-schema.md`](telemetry-schema.md#fleetstate). Per `(repo, issue)`
 the host can see, it carries stage, entered-at and PR; a row for a sweep the
@@ -192,7 +245,7 @@ read of that repo replaces or removes it.
 
 - **Anchor** (`loom.fleet.anchor = true`): the host's full view. Sent on the
   first pass of every daemon process, whenever the planner stamps change, and
-  at least every 3600 s after that.
+  at least every 300 s after that.
 - **Delta** (`loom.fleet.anchor = false`): sent between anchors only when
   something changed. It holds the added or changed rows, the issues that left
   (`removed`), and the full census and `ready_complete` of each repo it names;
@@ -215,8 +268,10 @@ To reconstruct one host's state at `t`:
    `loom.record_id`. Group them by `as_of`; a group is usable only when it
    holds all `chunk_count` chunks. The union of a group's chunks is the
    record (a repo split across chunks contributes rows from each).
-2. Take the newest complete anchor among them, A. Because anchors are hourly,
-   A is at most about 65 minutes before `t` on a healthy host. With no
+2. Take the newest complete anchor among them, A. Because anchors go out
+   every 5 minutes, A is at most about 6 minutes before `t` on a healthy
+   host (300 s plus one pass), which also bounds how long a lost delta
+   leaves the reconstruction wrong. With no
    complete anchor in that window, the host's state at `t` is **unknown**, not
    empty.
 3. Apply, in `as_of` order, every complete delta whose `anchor_as_of` equals
@@ -254,9 +309,8 @@ restart never chain into it, because their `anchor_as_of` differs.
 ## How to run a replay
 
 ```bash
-loom-daemon telemetry-replay --as-of 2026-10-04T13:00:00Z \
-  --endpoint https://clickhouse.example:8443 --user reader \
-  --credential-file ~/.config/loom/signoz-read.key   # owner-only (chmod 600)
+export TELEMETRY_READER_URL=http://reader.example:14341   # the telemetry-reader's base
+loom-daemon telemetry-replay --as-of 2026-10-04T13:00:00Z
 ```
 
 It runs queries 1 (state) and 3 (coverage) of `replay-queries.sql` exactly as
@@ -268,9 +322,15 @@ every emitting host as `covered`, or `unknown` with the SQL's reason
 An uncovered host is never shown as empty. No row is capped and no host is
 elected; it computes no estimate or statistic.
 
-- **Endpoint config**: flags, then `telemetry.signoz.{endpoint,user,credentialFile}`.
-  The old `autonomous.eta.fleetRefresh.signoz.*` key is read as a fallback for
-  one release, with a deprecation warning (it goes with #11098).
+- **Reader config**: reads go through the telemetry-reader (a query broker),
+  never to ClickHouse directly. Its base URL comes from `--endpoint`, then
+  `TELEMETRY_READER_URL`, then `telemetry.signoz.endpoint`; no address is
+  built in. There is **no credential**: the reader identifies the caller by
+  its network identity, runs the statement as that caller's read-only store
+  account, and audits it under the caller's name. Any other key under
+  `telemetry.signoz` (the old ClickHouse user and password-file settings) and
+  the retired `autonomous.eta.fleetRefresh.signoz` block are ignored with one
+  notice (#11357).
 - **Offline**: `--print-sql` prints both queries for `clickhouse-client
   --param_t=… --param_window=… --param_repo= --param_span=0 --param_step=300
   --format JSONEachRow`; feed the combined output back with `--from-file`.
@@ -284,10 +344,9 @@ elected; it computes no estimate or statistic.
   queries and reader over R3's fixture store in a pinned ClickHouse.
 
 The reader is the neutral client in `loom-daemon/src/signoz_read.rs` (#11127):
-`ClickhouseHttp` (bound `param_*` parameters, credential read from an
-owner-only file at call time and never logged) and `FileRows`. Nothing in it
-or in the replay command depends on `eta/`, so both survive the ETA
-subsystem's removal (#11098).
+`TelemetryReader` (`POST <base>/v1/query`, the SQL as the body, bound values as
+`param_<name>` URL parameters, no credential header — #11357) and `FileRows`
+(an offline export).
 
 ## Agreement with the forge (`--check`, the daily report)
 
@@ -304,13 +363,13 @@ loom-daemon telemetry-replay --check --as-of 2026-10-04T13:00:00Z \
 
 **The comparator** is the webhook-derived label state. The loom-ui webhook
 Worker files one `label.transition` record per `loom:*` label change (and per
-opened / closed / reopened of an item carrying one; contract:
-`loom-daemon/src/eta/fleet_events_webhook.rs` until loom-ui owns the reader)
+opened / closed / reopened of an item carrying one; contract pinned by
+`loom-daemon/src/telemetry_replay_check_tests.rs` until loom-ui owns the reader)
 and exports it to SigNoz with resource `service.name = loom-ui-d1-export` and
 the D1 record as a flat JSON body. Loom does not own that schema; the body
 keys `kind`, `repo`, `target` (`issue` / `pr`), `number`, `action`, `label`
-and `at` (the Worker's receipt time) are the whole dependency, pinned by a
-unit test. The forge state at an instant is built from the rows whose `at` is
+and `at` (the Worker's receipt time) are the whole dependency, exercised by the
+replay fixture store test. The forge state at an instant is built from the rows whose `at` is
 before it, whenever the export inserted them: a label is on when its last
 `labeled` / `unlabeled` was `labeled`, and an item whose last lifecycle row is
 `closed` is `closed`. An item with no webhook row yet is `no_forge_record`,

@@ -236,6 +236,17 @@ fn judged(judge: &Judge<'_>, raw: &str, diff_stale: Option<bool>) -> Finding {
     from_gate(judge, &meta, &gate, diff_stale)
 }
 
+/// The release an interrupted resync was heading for, if the metadata records
+/// one (`resync_pending` present and not null).
+fn pending_resync(raw: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(raw).ok()?;
+    match value.get("resync_pending")? {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(s) => Some(s.clone()),
+        other => Some(other.to_string()),
+    }
+}
+
 /// The checkout copy: the working tree's install metadata.
 fn checkout(
     judge: &Judge<'_>,
@@ -251,6 +262,21 @@ fn checkout(
         Err(_) => return Finding::unknown(),
     };
     let daemon = judge.daemon();
+    // A half-applied resync is held whatever its versions say: the stamp is
+    // written last, so it still names the old release (#11109).
+    if let Some(pending) = pending_resync(&raw) {
+        // A newer stamp (`RepoAheadOfDaemon`) is held too: `gate_metadata`
+        // returns it before it looks at the pending key, and the refusal
+        // alone maps to Clear. Other refusals keep their own verdicts.
+        if matches!(
+            gate_metadata(&raw, &daemon),
+            Ok(_) | Err(ResyncRefusal::RepoAheadOfDaemon { .. })
+        ) {
+            return Finding::install_incompatible(format!(
+                "a resync to {pending} was interrupted: the installed files are a mix of two releases"
+            ));
+        }
+    }
     let too_old = gate_metadata(&raw, &daemon) == Ok(Compat::InstalledTooOld);
     // Behind but compatible is not held whatever the files are, so there is
     // no payload to unpack for it.

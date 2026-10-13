@@ -58,6 +58,11 @@
 //! out: the predecessor lands and the pass (or an agent running the verb)
 //! clears the label — a recorded condition, not a flag.
 //!
+//! Because that release is mechanical, a refusal whose ONLY blocker is
+//! `loom:sequenced` is retryable (#11330): [`sequenced_hold_only`] lets the
+//! CLI answer exit 7 with a [`SEQUENCED_HOLD`] line instead of exit 1, so a
+//! caller re-queues rather than reporting a failure.
+//!
 //! # There is deliberately no override flag
 //!
 //! `--allow-unapproved` bypasses the *missing*-`loom:pr` guard. This one is
@@ -94,6 +99,35 @@ pub fn contradiction(labels: &str) -> Option<&'static str> {
         return None;
     }
     BLOCKING.iter().copied().find(|b| present(b))
+}
+
+/// The sequencing-hold label (#9378).
+pub const SEQUENCED: &str = "loom:sequenced";
+
+/// Stdout token leading a sequencing-hold refusal (#11330).
+pub const SEQUENCED_HOLD: &str = "LOOM-SEQUENCED-HOLD";
+
+/// Whether the ONLY contradiction is the `loom:sequenced` ordering hold (#11330).
+///
+/// That one is retryable: the predecessor landing clears it mechanically, so a
+/// caller re-queues instead of posting a failure. Any other blocker present
+/// beside it (a rejection, an operator hold) keeps the hard refusal, because
+/// the PR would still be blocked once the order resolves.
+#[must_use]
+pub fn sequenced_hold_only(labels: &str) -> bool {
+    let present = |want: &str| labels.lines().any(|l| l.trim() == want);
+    contradiction(labels).is_some()
+        && present(SEQUENCED)
+        && BLOCKING.iter().all(|b| *b == SEQUENCED || !present(b))
+}
+
+/// The machine-readable hold line: `LOOM-SEQUENCED-HOLD pr=<N> after=<M>`.
+/// `after` is the predecessor from the PR's live trusted sequence marker, or
+/// `unknown` when it could not be read (the hold stands either way).
+#[must_use]
+pub fn sequenced_hold_line(pr: &str, after: Option<u32>) -> String {
+    let after = after.map_or_else(|| "unknown".to_string(), |n| n.to_string());
+    format!("{SEQUENCED_HOLD} pr={pr} after={after}")
 }
 
 /// The refusal text, naming both labels and the head it was computed against.

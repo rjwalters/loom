@@ -24,10 +24,12 @@
 //!   re-planned straight back behind the head on the next tick.
 //! - [`escalate`]: one "operator needed" comment per stalled chain, on the
 //!   head PR, naming the action it needs and the approved PRs it holds. The
-//!   dedupe marker is the star-liveness escalation marker (#9244,
-//!   [`crate::star_liveness::escalate::marker`]) with a `sequence-stall:` key,
-//!   read through the same trusted-comment filter, so it is posted once per
-//!   cause across ticks, hosts and restarts.
+//!   dedupe marker ([`escalation_marker`], a `sequence-stall:` key) is read
+//!   through the trusted-comment filter, so it is posted once per cause
+//!   across ticks, hosts and restarts. Until #11104 it borrowed the removed
+//!   star-liveness subsystem's `loom:operator-priority-escalation` prefix; a
+//!   trusted comment carrying that legacy marker still counts as posted
+//!   ([`LEGACY_MARKER_PREFIX`]), so the rename re-posts nothing.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -38,7 +40,18 @@ use super::{
     evaluate, HoldAction, KeepReason, PredecessorState, SequenceMarker, SequencePr, Verdict,
 };
 use crate::merge_pr::sequence::fetch_trusted_bodies;
-use crate::star_liveness::escalate::marker as escalation_marker;
+
+/// The marker prefix every stall escalation comment carries.
+pub const MARKER_PREFIX: &str = "<!-- loom:merge-sequence-stall key=";
+/// The prefix stall escalations carried before #11104 (shared with the
+/// removed star-liveness escalations). Read for dedupe only; never written.
+pub const LEGACY_MARKER_PREFIX: &str = "<!-- loom:operator-priority-escalation key=";
+
+/// The dedupe marker for the stall key `key`.
+#[must_use]
+pub fn escalation_marker(key: &str) -> String {
+    format!("{MARKER_PREFIX}{key} -->")
+}
 
 /// How long a chain head may sit quiet on a human hold, or without a
 /// verdict, before soft holds behind it are released and the chain is
@@ -64,11 +77,11 @@ pub fn stall_hours() -> f64 {
         .unwrap_or(DEFAULT_STALL_HOURS)
 }
 
-/// Is this PR starred (`loom:operator-priority`, or any higher level,
-/// #10307)?
+/// The PR's priority level (`loom:important` / `loom:very-important`,
+/// #11103), from its own labels.
 #[must_use]
-pub fn starred(pr: &SequencePr) -> bool {
-    crate::operator_levels::is_starred(&pr.labels)
+pub fn level(pr: &SequencePr) -> crate::priority_pick::Level {
+    crate::priority_pick::Level::of(&pr.labels)
 }
 
 /// Why a chain head is stalled.
@@ -202,7 +215,7 @@ impl StalledChain {
         }
     }
 
-    /// The comment body, starting with the shared escalation marker.
+    /// The comment body, starting with the stall escalation marker.
     #[must_use]
     pub fn comment_body(&self, bound_hours: f64) -> String {
         let list = |v: &[u32]| {
@@ -294,8 +307,9 @@ impl StallLedger {
 /// escalation marker — the cross-host / cross-restart dedupe.
 #[must_use]
 pub fn already_escalated(bodies: &[String], chain: &StalledChain) -> bool {
-    let m = escalation_marker(&chain.key());
-    bodies.iter().any(|b| b.contains(&m))
+    let key = chain.key();
+    let (m, legacy) = (escalation_marker(&key), format!("{LEGACY_MARKER_PREFIX}{key} -->"));
+    bodies.iter().any(|b| b.contains(&m) || b.contains(&legacy))
 }
 
 /// Post the escalation for `chain` on its head PR unless already there.

@@ -153,9 +153,6 @@ pub(crate) fn enabled_role(
     else {
         return disabled(format!("`{role}` is not an enabled role for {}", root.display()));
     };
-    if let Some(why) = role_is_config_gated(&spec, root) {
-        return disabled(format!("`{role}` is gated: {why}"));
-    }
     Ok(spec.name)
 }
 
@@ -205,11 +202,15 @@ pub(crate) fn launch(
         cancelled: cancelled.clone(),
     });
     let root = spec.root.clone();
+    let resumed_from = old_item.clone();
     let spawned = std::thread::Builder::new()
         .name(format!("role-resume-{name}"))
         .spawn(move || {
             // Held for the whole resumed run, exactly as a live tick holds them.
             let (_guard, _seeded) = (guard, seeded);
+            // #11263: the resumed attempt names the run it continues, which
+            // closed `interrupted_by_roll` with this item id.
+            crate::observability::lifecycle::roll_interruption::set_resumed_from(&resumed_from);
             // The prompt is unused: a resume passes the saved session instead.
             let outcome = runner.invoke(name, "");
             record_role_tick(name, &root, &outcome);

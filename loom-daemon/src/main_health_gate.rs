@@ -101,6 +101,10 @@ use owned_paths::{
     LOOM_OWNED_PREFIXES,
 };
 
+// `WorkspaceHealthStates::find` (#11565) lives in its own sibling module for
+// the same reason: this file is frozen by the file-size ratchet.
+mod workspace_find;
+
 /// Ceiling for a `git` invocation made by the main-health gate.
 ///
 /// Covers `git fetch`, which reaches the network — generous enough for a slow
@@ -2173,7 +2177,8 @@ pub(crate) fn run_gate_tick_with_fns(
     // is what makes an injected answer actually cover the whole tick.
     let mut runner = CommandGateRunner::new(run_config, repo_root.to_path_buf())
         .with_credential_freshness(Box::new(FnCredentialFreshness(credential_stale)));
-    let outcome = runner.run_gate();
+    // #11690: the run is one `build_gate.run` span (a no-op without an ops sink).
+    let outcome = crate::observability::ops::build_gate::main_health(tier, || runner.run_gate());
     match &outcome {
         GateOutcome::Green { .. } | GateOutcome::Red { .. } => {
             // Record which tier produced this verdict so the status/log tier
@@ -2345,8 +2350,7 @@ fn run_git(repo_root: &Path, args: &[&str]) -> std::result::Result<(String, Stri
     // Every caller still fails safe — any `Err` skips the gate — so the
     // `Result` shape is deliberately unchanged; only the duplicate execution
     // management goes away.
-    let mut cmd = Command::new("git");
-    cmd.args(args).current_dir(repo_root).stdin(Stdio::null());
+    let cmd = crate::fleet_sync::checkout_ff::external_change::git_cmd("gate", repo_root, args);
     let outcome = run_command(cmd, GIT_GATE_TIMEOUT);
     if outcome.succeeded() {
         Ok((outcome.stdout_trimmed(), outcome.stderr_trimmed()))

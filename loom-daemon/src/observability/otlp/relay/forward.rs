@@ -345,6 +345,8 @@ fn host_only(resource: &Resource) -> Resource {
             "service.name"
                 | "service.instance.id"
                 | "loom.daemon.version"
+                | "loom.daemon.revision"
+                | "loom.fleet.config_sha"
                 | "loom.runtime"
                 | "loom.relay.redaction"
                 | "loom.session.launch"
@@ -452,11 +454,12 @@ impl Upstream for OtlpExporter {
         let outcome = match &payload {
             Payload::Logs(request) => {
                 let endpoint = &self.logs_endpoint;
+                let headers = self.extra_headers.current();
                 post(
                     &self.client,
                     endpoint,
-                    &self.ingest_key,
-                    &self.extra_headers,
+                    self.ingest_key.as_deref(),
+                    &headers,
                     signal,
                     batch.items,
                     request,
@@ -465,11 +468,12 @@ impl Upstream for OtlpExporter {
             }
             Payload::Metrics(request) => {
                 let endpoint = &self.metrics_endpoint;
+                let headers = self.extra_headers.current();
                 post(
                     &self.client,
                     endpoint,
-                    &self.ingest_key,
-                    &self.extra_headers,
+                    self.ingest_key.as_deref(),
+                    &headers,
                     signal,
                     batch.items,
                     request,
@@ -478,11 +482,12 @@ impl Upstream for OtlpExporter {
             }
             Payload::Traces(request) => {
                 let endpoint = &self.traces_endpoint;
+                let headers = self.extra_headers.current();
                 post(
                     &self.client,
                     endpoint,
-                    &self.ingest_key,
-                    &self.extra_headers,
+                    self.ingest_key.as_deref(),
+                    &headers,
                     signal,
                     batch.items,
                     request,

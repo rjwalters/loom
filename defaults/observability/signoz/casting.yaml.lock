@@ -150,8 +150,8 @@ spec:
       enabled: true
       env:
         SIGNOZ_OTEL_COLLECTOR_TIMEOUT: 10m
-      image: signoz/signoz-otel-collector:v0.144.10@sha256:34ecb436b687cc23bef5f706904cdf005998ca4ebe543653a634055a9fe204f6
-      version: v0.144.10
+      image: signoz/signoz-otel-collector:v0.144.12@sha256:deb566a7a3c0ba544ee58ccc92ee1f0e6da827bc40383e52f3c824705e100a3d
+      version: v0.144.12
     status:
       addresses:
         otlp:
@@ -338,6 +338,10 @@ spec:
     - op: add
       path: /metric_log/schema_type
       value: transposed_with_wide_view
+    - op: add
+      path: /merge_tree
+      value:
+        allow_dimensions_outside_sorting_key: 1
     target: deployment/telemetrystore/clickhouse/config-0-0.yaml
   - operations:
     - op: test
@@ -517,8 +521,9 @@ spec:
         SIGNOZ_TELEMETRYSTORE_PROVIDER: clickhouse
         SIGNOZ_TOKENIZER_JWT_SECRET: ${SIGNOZ_TOKENIZER_JWT_SECRET:?set a private
           random session-signing secret}
-      image: signoz/signoz:v0.142.1@sha256:49501b04d77a1e8328d31519c977dd4503b724c74425764a3ab83768db3ee8ff
-      version: v0.142.1
+        SIGNOZ_TOKENIZER_PROVIDER: jwt
+      image: signoz/signoz:v0.143.0@sha256:7da6b9c07db100cfcf7949966211b16543e3d6828df31f0f7a24110d734a811c
+      version: v0.143.0
     status:
       addresses:
         apiserver:
@@ -545,6 +550,7 @@ spec:
         SIGNOZ_TELEMETRYSTORE_PROVIDER: clickhouse
         SIGNOZ_TOKENIZER_JWT_SECRET: ${SIGNOZ_TOKENIZER_JWT_SECRET:?set a private
           random session-signing secret}
+        SIGNOZ_TOKENIZER_PROVIDER: jwt
   telemetrykeeper:
     kind: clickhousekeeper
     spec:
@@ -576,8 +582,8 @@ spec:
               snapshot_storage_path: /var/lib/clickhouse-keeper/coordination/snapshots
               tcp_port: 9181
       enabled: true
-      image: clickhouse/clickhouse-keeper:25.12.5@sha256:525b8b0f93ccb371131c46f22a066ea43d33d74aba314203e8044609945d8524
-      version: 25.12.5
+      image: clickhouse/clickhouse-keeper:26.9.5@sha256:367f3f6a113e14046a547f7ffb962d70a2fc281379d59869aa718ab372c020cf
+      version: 26.9.5
     status:
       addresses:
         client:
@@ -729,8 +735,8 @@ spec:
               return_type: Float64
               type: executable
       enabled: true
-      image: clickhouse/clickhouse-server:25.12.11@sha256:8a790dd3468db22b1d4e7b18a176f378ff5ff6053b9c48dd4ea1fa71a24c5ba6
-      version: 25.12.11
+      image: clickhouse/clickhouse-server:26.9.5@sha256:b1081d3f26191692d7717699def7c624763f220f461ad60fccf55bbc186f06a0
+      version: 26.9.5
     status:
       addresses:
         tcp:

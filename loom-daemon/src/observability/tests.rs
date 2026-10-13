@@ -76,49 +76,9 @@ fn absent_config_resolves_to_documented_defaults() {
 }
 
 // ------------------------------------------------------------------
-// resolve_ingest_key_file — env > config > $HOME-relative default (#5336).
+// resolve_ingest_key_file — env > config > $HOME-relative default
+// (#5336) — now lives, with its tests, in `ingest_key.rs`.
 // ------------------------------------------------------------------
-
-#[test]
-fn ingest_key_file_under_joins_the_conventional_relative_path() {
-    assert_eq!(
-        ingest_key_file_under(Path::new("/home/ubuntu")),
-        "/home/ubuntu/.loom/observability/ingest.key"
-    );
-    assert_eq!(
-        ingest_key_file_under(Path::new("/Users/robb-studio")),
-        "/Users/robb-studio/.loom/observability/ingest.key",
-        "must resolve against WHATEVER home is passed in — never a value \
-         baked in from a different host"
-    );
-}
-
-#[test]
-#[serial]
-fn resolve_ingest_key_file_config_wins_over_default_when_no_env_set() {
-    clear_env();
-    let config = ObservabilityConfig {
-        ingest_key_file: Some("/etc/loom/observability-ingest.key".to_string()),
-        ..Default::default()
-    };
-    assert_eq!(
-        resolve_ingest_key_file(&config),
-        Some("/etc/loom/observability-ingest.key".to_string())
-    );
-}
-
-#[test]
-#[serial]
-fn resolve_ingest_key_file_env_overrides_config() {
-    clear_env();
-    std::env::set_var(INGEST_KEY_FILE_ENV, "/run/secrets/ingest.key");
-    let config = ObservabilityConfig {
-        ingest_key_file: Some("/etc/loom/observability-ingest.key".to_string()),
-        ..Default::default()
-    };
-    assert_eq!(resolve_ingest_key_file(&config), Some("/run/secrets/ingest.key".to_string()));
-    clear_env();
-}
 
 // ------------------------------------------------------------------
 // resolve_exporter — env > config > default("https"); unknown ⇒ https.
@@ -714,23 +674,77 @@ async fn spawn_task_fully_configured_spawns_three_tasks() {
         spawn_task(&config, dir.path().to_path_buf(), &bus, Instant::now(), test_workspace_pool());
     let handles = handles.expect("fully configured ⇒ spawn_task must return Some");
     // Issue #8760: `daemon_event::spawn_task` adds a third handle alongside
-    // `collector`'s and the sender's.
-    // Issue #9289: the ETA tracker's bus subscriber (on by default) adds one.
-    // Issue #10245/#10263: the daily refit, run by the fleet snapshot refresh
-    // task (both on by default; either/or, so one handle) adds one.
-    // Issue #10492: the captain-gated nightly backtest-folds task (on by
-    // default, independent of the refit/refresh either/or) adds one.
-    assert_eq!(
-        handles.len(),
-        6,
-        "collector + daemon_event collector + eta + sender + eta fleet refresh owning the refit (#10263) + eta nightly folds (#10492)"
-    );
+    // `collector`'s and the sender's. The HTTPS-only sink starts no OTLP ops
+    // tasks, and the ETA subscriber / fleet refresh / nightly folds tasks are
+    // gone with the ETA subsystem (#11098).
+    assert_eq!(handles.len(), 3, "collector + daemon_event collector + sender");
     for handle in handles {
         handle.abort();
     }
 }
 
-#[cfg(feature = "otlp")]
+/// Issue #11197: `spawn_task` enqueues exactly one `daemon.start` record per
+/// call — the offer persists synchronously (`DurableQueue::push`), so the
+/// queue file already holds it when `spawn_task` returns, and the sender
+/// (flush_interval 1 h) has not drained it.
+#[tokio::test]
+#[serial]
+async fn spawn_task_offers_exactly_one_daemon_start_record() {
+    clear_env();
+    let bus = EventBus::new();
+    let dir = tempdir().unwrap();
+    let key_path = dir.path().join("ingest.key");
+    std::fs::write(&key_path, "s3cr3t\n").unwrap();
+    let config = ObservabilityConfig {
+        enabled: Some(true),
+        endpoint: Some(SAFE_TEST_ENDPOINT.to_string()),
+        ingest_key_file: Some(key_path.to_string_lossy().to_string()),
+        flush_interval_secs: Some(3600), // avoid a real network attempt during the test
+        ..Default::default()
+    };
+    let handles =
+        spawn_task(&config, dir.path().to_path_buf(), &bus, Instant::now(), test_workspace_pool());
+    assert!(handles.is_some(), "fully configured ⇒ export is on");
+    let queue = std::fs::read_to_string(
+        dir.path()
+            .join(".loom")
+            .join("logs")
+            .join("observability-queue.jsonl"),
+    )
+    .expect("the daemon.start offer persists to the sole exporter's queue file");
+    assert_eq!(
+        queue.matches("daemon.start").count(),
+        1,
+        "exactly one daemon.start per spawn_task call — queue: {queue}"
+    );
+    for handle in handles.unwrap() {
+        handle.abort();
+    }
+}
+
+/// Issue #11197: telemetry disabled ⇒ no `daemon.start` — the `enabled:
+/// false` path returns before any queue exists, so the queue file is never
+/// even created.
+#[tokio::test]
+#[serial]
+async fn spawn_task_disabled_emits_no_daemon_start() {
+    clear_env();
+    let bus = EventBus::new();
+    let dir = tempdir().unwrap();
+    let config = ObservabilityConfig::default();
+    let handles =
+        spawn_task(&config, dir.path().to_path_buf(), &bus, Instant::now(), test_workspace_pool());
+    assert!(handles.is_none());
+    assert!(
+        !dir.path()
+            .join(".loom")
+            .join("logs")
+            .join("observability-queue.jsonl")
+            .exists(),
+        "no exporter came up, so no queue file — and no daemon.start in it"
+    );
+}
+
 #[tokio::test]
 #[serial]
 async fn spawn_task_two_exporters_spawns_collector_plus_two_senders() {
@@ -756,16 +770,14 @@ async fn spawn_task_two_exporters_spawns_collector_plus_two_senders() {
     // Issue #8760: `daemon_event::spawn_task` adds one more handle alongside
     // `collector`'s and one sender per exporter.
     // Issue #8929: the OTLP ops sink adds the slot-turnaround subscriber.
-    // Issue #9289: the ETA tracker's bus subscriber (on by default).
-    // Issue #10245/#10263: the fleet refresh task, which owns the daily refit
-    // (either/or with the standalone refit task, so one handle).
     // Issue #10414: the OTLP ops sink also adds the task-liveness sampler.
-    // Issue #10492: the nightly backtest-folds task (on by default).
     // Issue #10765: the OTLP ops sink also adds the IPC latency exporter.
+    // (The ETA tasks were removed with the ETA subsystem, #11098.)
+    // Issue #11161: the `fleet.state` pass after each work-finder tick.
     assert_eq!(
         handles.len(),
-        10,
-        "collector + daemon_event + eta + turnaround + two senders + eta fleet refresh owning the refit (#10263) + eta nightly folds (#10492) + task-liveness sampler (#10414) + IPC latency exporter (#10765)"
+        8,
+        "collector + daemon_event + turnaround + two senders + task-liveness sampler (#10414) + IPC latency exporter (#10765) + fleet.state tick pass (#11161)"
     );
     let statuses = global_export_statuses();
     assert_eq!(
@@ -776,86 +788,6 @@ async fn spawn_task_two_exporters_spawns_collector_plus_two_senders() {
     for handle in handles {
         handle.abort();
     }
-}
-
-/// Without the `otlp` Cargo feature the otlp ENTRY degrades to its own
-/// `misconfigured` status while the https exporter still runs (#8756):
-/// one bad sink must not take the healthy one down with it.
-#[cfg(not(feature = "otlp"))]
-#[tokio::test]
-#[serial]
-async fn spawn_task_two_exporters_isolate_the_unbuildable_kind() {
-    clear_env();
-    let bus = EventBus::new();
-    let dir = tempdir().unwrap();
-    let key_path = dir.path().join("ingest.key");
-    std::fs::write(&key_path, "s3cr3t\n").unwrap();
-    let config = ObservabilityConfig {
-        enabled: Some(true),
-        endpoint: Some(SAFE_TEST_ENDPOINT.to_string()),
-        ingest_key_file: Some(key_path.to_string_lossy().to_string()),
-        exporters: Some(vec![raw("https", None), raw("otlp", None)]),
-        flush_interval_secs: Some(3600),
-        ..Default::default()
-    };
-    let handles =
-        spawn_task(&config, dir.path().to_path_buf(), &bus, Instant::now(), test_workspace_pool())
-            .expect("the https exporter is fully configured and must still run");
-    // Issue #8760: `daemon_event::spawn_task` adds one more handle.
-    // Issue #10492: the nightly backtest-folds task (on by default) adds one.
-    assert_eq!(
-        handles.len(),
-        6,
-        "collector + daemon_event + eta (#9289) + only the https sender + eta fleet refresh owning the refit (#10263) + eta nightly folds (#10492)"
-    );
-    let statuses = global_export_statuses();
-    assert_eq!(
-        statuses["otlp"].state,
-        crate::types::ObservabilityExportState::Misconfigured,
-        "the otlp entry reports its own misconfiguration"
-    );
-    assert_eq!(
-        statuses["https"].exporter.as_deref(),
-        Some("https"),
-        "the https entry started normally"
-    );
-    for handle in handles {
-        handle.abort();
-    }
-}
-
-/// `exporter=otlp` in a build that does NOT have the `otlp` Cargo
-/// feature compiled in must register a `Misconfigured` status (Issue
-/// #5337) and return `None` (never panic, never silently fall back to
-/// the HTTPS sink the operator did not ask for). Sticks to the
-/// pre-existing `handles.is_none()` contract — same as the other three
-/// under-configured `spawn_task` tests above — for the OnceLock reason
-/// documented on `export_status_misconfigured_reports_a_distinct_sticky_state`.
-/// Reject before starting collectors or doing queue IO.
-#[cfg(not(feature = "otlp"))]
-#[tokio::test]
-#[serial]
-async fn spawn_task_otlp_requested_without_the_feature_returns_none() {
-    clear_env();
-    let bus = EventBus::new();
-    let dir = tempdir().unwrap();
-    let key_path = dir.path().join("ingest.key");
-    std::fs::write(&key_path, "s3cr3t\n").unwrap();
-    let config = ObservabilityConfig {
-        enabled: Some(true),
-        endpoint: Some(SAFE_TEST_ENDPOINT.to_string()),
-        ingest_key_file: Some(key_path.to_string_lossy().to_string()),
-        exporter: Some("otlp".to_string()),
-        ..Default::default()
-    };
-    let handles =
-        spawn_task(&config, dir.path().to_path_buf(), &bus, Instant::now(), test_workspace_pool());
-    assert!(handles.is_none());
-    assert_eq!(bus.receiver_count(), 0);
-    assert!(!dir
-        .path()
-        .join(".loom/logs/observability-queue.jsonl")
-        .exists());
 }
 
 #[tokio::test]
@@ -893,14 +825,14 @@ async fn malformed_otlp_configuration_has_no_collector_or_queue_activity() {
     }
 }
 
-/// The `otlp`-feature counterpart of
+/// The OTLP counterpart of
 /// `spawn_task_fully_configured_spawns_three_tasks`: `exporter=otlp`
-/// with the feature compiled in spawns the same collector+daemon_event+sender
-/// trio, just wired to `otlp::OtlpExporter` instead of `HttpsExporter`.
-#[cfg(feature = "otlp")]
+/// spawns the same collector+daemon_event+sender
+/// trio, just wired to `otlp::OtlpExporter` instead of `HttpsExporter`, plus
+/// the three OTLP ops-sink tasks.
 #[tokio::test]
 #[serial]
-async fn spawn_task_otlp_exporter_spawns_three_tasks() {
+async fn spawn_task_otlp_exporter_spawns_trio_plus_ops_tasks() {
     clear_env();
     let bus = EventBus::new();
     let dir = tempdir().unwrap();
@@ -917,13 +849,14 @@ async fn spawn_task_otlp_exporter_spawns_three_tasks() {
     let handles =
         spawn_task(&config, dir.path().to_path_buf(), &bus, Instant::now(), test_workspace_pool());
     let handles = handles.expect("fully configured otlp exporter ⇒ spawn_task must return Some");
+    // Issue #8929: the OTLP ops sink adds the slot-turnaround subscriber.
     // Issue #10414: the OTLP ops sink also adds the task-liveness sampler.
-    // Issue #10492: the nightly backtest-folds task (on by default).
     // Issue #10765: the OTLP ops sink also adds the IPC latency exporter.
+    // Issue #11161: the `fleet.state` pass after each work-finder tick.
     assert_eq!(
         handles.len(),
-        9,
-        "collector + daemon_event + eta (#9289) + turnaround (#8929) + sender + eta fleet refresh owning the refit (#10263) + eta nightly folds (#10492) + task-liveness sampler (#10414) + IPC latency exporter (#10765)"
+        7,
+        "collector + daemon_event + turnaround (#8929) + sender + task-liveness sampler (#10414) + IPC latency exporter (#10765) + fleet.state tick pass (#11161)"
     );
     for handle in handles {
         handle.abort();

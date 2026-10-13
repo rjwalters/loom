@@ -51,7 +51,7 @@ fn classify_preflip_labels_treats_unpromoted_issue_as_not_a_collision() {
         &[][..],
         &["loom:curated"][..],
         &["loom:triage"][..],
-        &["tier:goal-supporting"][..],
+        &["enhancement"][..],
     ] {
         let dir = tempdir().unwrap();
         let registry = registry_reporting(dir.path(), labels);

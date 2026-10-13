@@ -1,8 +1,7 @@
 //! Parse a REST `issues/<n>/timeline` response into [`PrEvent`]s.
 //!
-//! Moved here from `cli/pr_latency_cmd.rs` (#10263) so the daemon's fleet
-//! snapshot refresh (`eta::fleet_fetch`) and the `pr-latency` / `eta fleet`
-//! CLI derive a PR's history with one parser — a second copy would let the two
+//! Moved here from `cli/pr_latency_cmd.rs` (#10263) so every reader of
+//! a PR's history uses one parser — a second copy would let two
 //! drift on exactly the event vocabulary every stage boundary is read from.
 
 use chrono::{DateTime, Utc};

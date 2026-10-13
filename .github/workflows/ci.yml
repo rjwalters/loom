@@ -454,50 +454,6 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --package loom-daemon --package loom-api -- -D warnings -A clippy::cast_precision_loss -A clippy::cast_possible_truncation -A clippy::cast_sign_loss -A clippy::too_many_lines -A clippy::panic -A clippy::unwrap_used -A clippy::nonminimal_bool -A clippy::redundant_closure -A clippy::redundant_closure_for_method_calls -A clippy::format_push_string -A clippy::uninlined_format_args
       - run: cargo check --workspace --all-targets
-      # Default-feature coverage of the `#[cfg(not(feature = "otlp"))]` tests
-      # (#10823). Rust Unit Tests runs the whole workspace with `otlp` on, so
-      # these tests never execute there; the full default-feature suite runs
-      # nightly (ci-daily.yml `full-suite`). The names are DERIVED by the
-      # compiler, never hand-listed (ci-principles rules 7 and 9): the lib
-      # tests `cargo nextest list` reports with default features minus those it
-      # reports with `--features otlp` (#10845), so every cfg form (on a `mod`,
-      # `all(test, not(..))`, one-line, `#[rstest]`, ...) is covered. Each is
-      # selected by its exact full name, and the step fails unless nextest's
-      # "N tests run" equals the derived count (catches under- and
-      # over-selection), on an empty derivation, or on an empty selection.
-      # This is an additional run, not a filterset that skips work. Cost: one
-      # extra compile of the loom-daemon lib test binary with `otlp` (~2 min
-      # locally); this trailing `!cancelled()` step is off the critical path.
-      - uses: taiki-e/install-action@45fceba0fc176f41d2aee1ca9d6598ba628eea62 # nextest
-        with:
-          tool: nextest
-      - name: Run the cfg(not(otlp)) tests (default features)
-        if: ${{ !cancelled() }}
-        run: |
-          set -euo pipefail
-          # The listing below is `--lib` only; integration tests are not in it.
-          if grep -rlF 'cfg(not(feature = "otlp"))' loom-daemon/tests; then
-            echo "::error::cfg(not(feature = \"otlp\")) under loom-daemon/tests/ is not covered: extend this step beyond --lib" >&2
-            exit 1
-          fi
-          tmp=$(mktemp -d)
-          # `otlp` first: its build replaces the default one, which the default
-          # listing and the run below then share (two compiles, not three).
-          cargo nextest list -p loom-daemon --lib --features otlp --message-format json > "$tmp/otlp.json"
-          cargo nextest list -p loom-daemon --lib --message-format json > "$tmp/default.json"
-          jq -r '."rust-suites"[].testcases | to_entries[] | select(.value.ignored | not) | .key' "$tmp/default.json" | sort -u > "$tmp/default.txt"
-          jq -r '."rust-suites"[].testcases | keys[]' "$tmp/otlp.json" | sort -u > "$tmp/otlp.txt"
-          comm -23 "$tmp/default.txt" "$tmp/otlp.txt" > "$tmp/derived.txt"
-          derived=$(wc -l < "$tmp/derived.txt" | tr -d ' ')
-          test "$derived" -gt 0 || { echo "::error::derived no cfg(not(otlp)) tests" >&2; exit 1; }
-          echo "derived $derived tests:"; cat "$tmp/derived.txt"
-          filter=$(sed 's/.*/test(=&)/' "$tmp/derived.txt" | paste -sd'|' - | sed 's/|/ | /g')
-          cargo nextest run -p loom-daemon --lib --profile ci --no-tests=fail --color never -E "$filter" 2>&1 | tee "$tmp/run.log"
-          ran=$(grep -oE '[0-9]+ tests? run' "$tmp/run.log" | tail -1 | grep -oE '^[0-9]+' || true)
-          if [ "${ran:-0}" != "$derived" ]; then
-            echo "::error::nextest ran ${ran:-0} tests but $derived were derived" >&2
-            exit 1
-          fi
       # Folded in from the former Rust Doctests job (#9065): nextest does not
       # run doctests, so libtest still owns them (#4385). `!cancelled()` so a
       # clippy failure above does not hide a doctest failure.
@@ -627,20 +583,17 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      # The `otlp` feature (#4858, Epic #4702 Phase 4) is off by default, so
-      # the default-feature jobs above never compile or run it — confirmed
-      # during Judge review of PR #4879 that CI had zero `--features otlp` /
-      # `--all-features` coverage anywhere (#4905). --all-targets is required
-      # here (unlike backend-lint-and-check's default job) so the feature's
-      # own unit tests (`otlp/mod.rs`, `otlp/mapping.rs`) are linted too, not
-      # just its non-test code paths.
+      # The OTLP exporter (#4858, Epic #4702 Phase 4) is compiled
+      # unconditionally since #10700; `--features otlp` is a no-op alias kept
+      # for CLI compatibility (see loom-daemon/Cargo.toml), so this job's flags
+      # are harmless. --all-targets is required here (unlike
+      # backend-lint-and-check's default job) so the exporter's own unit tests
+      # (`otlp/mod.rs`, `otlp/mapping.rs`) are linted too, not just its
+      # non-test code paths.
       - run: cargo clippy --package loom-daemon --features otlp --all-targets -- -D warnings -A clippy::cast_precision_loss -A clippy::cast_possible_truncation -A clippy::cast_sign_loss -A clippy::too_many_lines -A clippy::panic -A clippy::unwrap_used -A clippy::nonminimal_bool -A clippy::redundant_closure -A clippy::redundant_closure_for_method_calls -A clippy::format_push_string -A clippy::uninlined_format_args
-      # The feature's full nextest run lives in the partitioned Rust Unit Tests
-      # job (#10823): the whole workspace runs once, with the shipped `otlp`
-      # configuration. `otlp` is not purely additive -- some tests are
-      # `#[cfg(not(feature = "otlp"))]` -- so the default-feature coverage is
-      # the targeted step in backend-lint-and-check plus ci-daily.yml's
-      # `full-suite`.
+      # The exporter's full nextest run lives in the partitioned Rust Unit
+      # Tests job (#10823): the whole workspace runs once. Since #10700 there is
+      # one build configuration, so there is no separate default-feature leg.
       - name: Verify OTLP with a real pinned Collector
         run: cargo test --package loom-daemon --features otlp --test otlp_collector -- --ignored --nocapture
       # #8665: executes the committed cycle-time SQL verbatim against a real
@@ -692,38 +645,13 @@ jobs:
       # zero rows survive the SQL so SigNoz can see a series recover.
       - name: Verify the SigNoz queue-starvation alert rule against a real pinned ClickHouse
         run: cargo test --package loom-daemon --features otlp --test signoz_queue_starvation_alert -- --ignored --nocapture
-      # #10973: replay of the host-disk, work-finder-stale and ETA Ready-coverage alert rules
-      - name: Verify the SigNoz disk, work-finder and ETA Ready-coverage alert rules against a real pinned ClickHouse
+      # #10973: replay of the host-disk and work-finder-stale alert rules
+      - name: Verify the SigNoz disk and work-finder alert rules against a real pinned ClickHouse
         run: cargo test --package loom-daemon --features otlp --test signoz_ops_alerts -- --ignored --nocapture
-      # #10916: the fleet singleton-output alert (alerts/fleet-singleton-output.json),
-      # the cross-host detector for a one-host fleet job that stops producing
-      # while every host looks healthy. Only this run shows that the 2026-10-07
-      # replay (28 of 30 repos without eta.estimate) fires one evaluation past
-      # 2 x cadence and not before, that an idle or all-abstaining repo stays
-      # quiet, and that an empty logs table fires every watched row. Its
-      # deadline-vs-registry no-drift check runs in the ordinary test job.
-      - name: Verify the SigNoz fleet singleton-output alert rule against a real pinned ClickHouse
-        run: cargo test --package loom-daemon --features otlp --test signoz_fleet_singleton_output_alert -- --ignored --nocapture
-      # #8528 / #9289: the same technique for the trial's ETA-accuracy artifact
-      # (eta-queries.sql), whose Q2 mean pinball loss is the number an ETA
-      # heuristic is promoted on. eta_artifacts.rs already pins every attribute
-      # it reads to the emitted schema in ordinary CI; only this run shows that
-      # an abandoned sweep -- which carries no error field at all -- is scored as
-      # a PERFECT prediction once the presence filter goes, lowering the MAE that
-      # decides the promotion; that pooling two revisions hides a 5x regression
-      # behind an average belonging to neither build; that ROLLUP's subtotal rows
-      # are keyed with the same '' a missing heuristic attribute reads as; and
-      # that a feature which never varied scores rankCorr 0.5 rather than 0.
-      - name: Verify the SigNoz ETA accuracy queries against a real pinned ClickHouse
-        run: cargo test --package loom-daemon --features otlp --test signoz_eta_queries -- --ignored --nocapture
-      # #10233: the same technique for the late-surprise, stability,
-      # convergence and answer-rate views (eta-queries.sql Q4-Q7), over their
-      # own fixture. Only this run shows that dropping the common decidable
-      # subset lets a heuristic that refuses the hard cases read as better,
-      # that remaining seconds invert the stability ranking, and that counting
-      # rows inflates the answer rate because refusals are never refreshed.
-      - name: Verify the SigNoz ETA late-surprise/stability/convergence/answer-rate views against a real pinned ClickHouse
-        run: cargo test --package loom-daemon --features otlp --test signoz_eta_accuracy_views -- --ignored --nocapture
+      # #11198: host-export-queries.sql queries 1-3 and the host-export-silent
+      # alert, run verbatim (roster substituted) over a fixture.
+      - name: Verify the SigNoz host-export queries and silent-host alert against a real pinned ClickHouse
+        run: cargo test --package loom-daemon --features otlp --test signoz_host_export_queries -- --ignored --nocapture
       # #11125: the same technique for the replay reconstruction
       # (replay-queries.sql queries 1-3). Only this run shows that an issue
       # removed, re-added and removed again stays deleted, and that a lost
@@ -824,25 +752,44 @@ jobs:
           if [ -f .loom/config.json ]; then
             jq -e . .loom/config.json > /dev/null
           fi
-      - name: Check optional workflow templates parse as YAML (#9078)
+      - name: Check shipped YAML templates parse and are repo-neutral (#9078/#8862)
         if: ${{ !cancelled() }}
-        # Templates under defaults/optional/github-workflows/ are not live
-        # workflows here, so GitHub never parses them; a broken one (#9078: an
-        # unindented block-scalar line) only fails in the repo that copies it.
+        # Neither tree is live here, so GitHub never parses these files; a
+        # regression only shows up in the repo that installs or copies them.
+        #   - defaults/optional/github-workflows/: opt-in workflow templates.
+        #     #9078: an unindented block-scalar line made one unparseable.
+        #   - defaults/.github/ISSUE_TEMPLATE/: installed into every consumer
+        #     repo as a plain byte copy, with no placeholder substitution.
+        #     #8862: they sent the consumer's issue filers to Loom's own
+        #     Discussions. So a Loom repo URL is wrong there, and so is a
+        #     `{{PLACEHOLDER}}`, which would be installed literally.
         # An empty glob or a missing PyYAML fails this step rather than passing.
         run: |
           python3 - <<'EOF'
           import glob, sys, yaml
-          files = sorted(glob.glob('defaults/optional/github-workflows/*.y*ml'))
-          if not files:
-              sys.exit('no templates found: the glob is stale')
+          PARSE_ONLY = 'defaults/optional/github-workflows/*.y*ml'
+          INSTALLED = 'defaults/.github/ISSUE_TEMPLATE/*.y*ml'
+          FORBIDDEN = ('github.com/rjwalters/loom', '{' * 2)
           bad = 0
-          for f in files:
-              try:
-                  yaml.safe_load(open(f))
-              except yaml.YAMLError as e:
-                  print(f'::error file={f}::{e}'.replace('\n', ' '))
-                  bad += 1
+          for pattern in (PARSE_ONLY, INSTALLED):
+              files = sorted(glob.glob(pattern))
+              if not files:
+                  sys.exit(f'no templates found for {pattern}: the glob is stale')
+              for f in files:
+                  text = open(f, encoding='utf-8').read()
+                  try:
+                      yaml.safe_load(text)
+                  except yaml.YAMLError as e:
+                      print(f'::error file={f}::{e}'.replace('\n', ' '))
+                      bad += 1
+                  if pattern != INSTALLED:
+                      continue
+                  for n, line in enumerate(text.splitlines(), 1):
+                      for needle in FORBIDDEN:
+                          if needle in line.lower():
+                              print(f'::error file={f},line={n}::installed into consumer '
+                                    f'repos verbatim, must not contain {needle!r}')
+                              bad += 1
           sys.exit(1 if bad else 0)
           EOF
 
@@ -906,6 +853,9 @@ jobs:
       - name: Test the release decision and release.yml wiring (#10826)
         if: ${{ !cancelled() }}
         run: bash scripts/test-release-decision.sh
+      - name: Test the version-bump cadence gate (#11174)
+        if: ${{ !cancelled() }}
+        run: bash scripts/test-version-bump-gate.sh
 
       # component: Markdown Token Ratchet
       # Same ratchet as File Size Ratchet above, applied to agent-facing
@@ -1393,6 +1343,17 @@ jobs:
         if: ${{ !cancelled() && needs.changes.outputs.daemon != 'false' }}
         run: ./target/debug/loom-daemon shell-budget --check
 
+      # component: Fleet-Policy Shadow Guard
+      # (#11441) A fleet-policy key (runtimes, autonomous, ...) committed in a tracked
+      # repo tier (.loom/config.json, .loom-project/project.json) silently
+      # overrides fleet-gitops. Fails (exit 2) unless the key has an entry with
+      # a reason in .loom/fleet-policy-allow.json. Classification lives in
+      # loom-daemon/src/fleet_policy.rs; same `daemon != 'false'` reach as the
+      # shell budget above (not a path filter).
+      - name: Check tracked config carries no un-allowed fleet-policy keys (#11441)
+        if: ${{ !cancelled() && needs.changes.outputs.daemon != 'false' }}
+        run: LOOM_CONFIG_DEFAULTS_FILE="" ./target/debug/loom-daemon validate . --fleet-policy-only
+
       # component: .gitignore Convergence Check
       # Not gated on backend changes — a drifted .gitignore is detectable
       # regardless of which file group a PR touches. It runs under
@@ -1468,6 +1429,35 @@ jobs:
           fi
           echo "Scanning $range"
           ./target/debug/loom-daemon secret-scan --range "$range"
+
+      # #8858: a semantic change to the private-control POLICY map in
+      # bundle.rs must come with a strictly greater CONTROL_VERSION, measured
+      # against the MERGE BASE of base and head (not the moving base tip).
+      # Needs history, hence this job's `fetch-depth: 0`; reads git objects
+      # only, no network. Explicit refs per event so it is reproducible locally:
+      #   loom-daemon check-private-control-version --base origin/main --head HEAD
+      - name: Require a CONTROL_VERSION bump when the private-control POLICY changes (#8858)
+        if: ${{ !cancelled() && needs.changes.outputs.daemon != 'false' }}
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.sha }}
+          MG_BASE: ${{ github.event.merge_group.base_sha }}
+          MG_HEAD: ${{ github.event.merge_group.head_sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = pull_request ]; then
+            base="$PR_BASE"; head="$PR_HEAD"
+          elif [ "$EVENT" = merge_group ]; then
+            base="$MG_BASE"; head="$MG_HEAD"
+          elif [ -n "$PUSH_BEFORE" ] && git cat-file -e "$PUSH_BEFORE^{commit}" 2>/dev/null; then
+            base="$PUSH_BEFORE"; head="$PUSH_AFTER"
+          else
+            base="$PUSH_AFTER^"; head="$PUSH_AFTER"
+          fi
+          ./target/debug/loom-daemon check-private-control-version --repo-root . --base "$base" --head "$head"
 
   install-surface-checks:
     name: Install Surface Checks
@@ -1984,6 +1974,15 @@ jobs:
       - name: classify-dependency-block premise-false interaction (#7904)
         if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-classify-dependency-block-premise-false.sh
+      # #11208: the same suite shell-suite-tests runs (ci-wired.txt) as pure
+      # fallback evidence, re-run here with the build pinned via
+      # LOOM_DAEMON_SELF_BIN so it exercises the shell library's native
+      # delegation AND its shell-vs-native parity section on every vector.
+      # The suite passes in both modes by design; the pin only decides which
+      # half of the contract this job witnesses.
+      - name: classify-error native delegation + parity (#11208)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
+        run: LOOM_DAEMON_SELF_BIN="$PWD/target/debug/loom-daemon" bash defaults/scripts/tests/test-classify-error.sh
       - name: detect-dependency-cycle (#5671)
         if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-detect-dependency-cycle.sh
@@ -2001,6 +2000,9 @@ jobs:
       - name: check-main-clean (#3513, #11075)
         if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-check-main-clean.sh
+      - name: check-main-clean build trees (#11149)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
+        run: bash defaults/scripts/tests/test-check-main-clean-build-trees.sh
       # #9390: provision-codex-hooks.sh verify is a stub over `loom-daemon
       # codex-hooks verify`; the suite pins this job's shared build.
       - name: provision-codex-hooks (#4495, #5005, #9390)
@@ -2028,6 +2030,9 @@ jobs:
       - name: merge-pr close-triggered loom:blocked re-check (#9102)
         if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-notify-cleared-blockers.sh
+      - name: sync-labels --prune-undeclared (#11105)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
+        run: bash defaults/scripts/tests/test-sync-labels-prune-undeclared.sh
       - name: post-verdict.sh verdict gate + exclusive labels (#10581)
         if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-post-verdict-gate.sh
@@ -2114,6 +2119,11 @@ jobs:
       - name: loom-daemon-update fleet floor confirmation (#11044)
         if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-loom-daemon-update-floor-confirm.sh
+      # #10700: the post-build OTLP probe refusal (row split out of the
+      # frozen test-loom-daemon-update.sh); needs this job's shared build.
+      - name: loom-daemon-update OTLP probe refusal (#10700)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
+        run: bash defaults/scripts/tests/test-loom-daemon-update-otlp-probe.sh
       # #8712: the fixture library is the subject, not any one flow. A fake
       # loom-daemon from lib/daemon-update-fixtures.sh that escapes to a real
       # loom-daemon/target/release/ stalled a fleet host's auto_update for

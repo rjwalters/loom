@@ -390,6 +390,12 @@ impl FloorState {
         }
     }
 
+    /// The running version of this tick's basis (#10880's held-roll alert).
+    #[must_use]
+    pub fn running(&self) -> &str {
+        &self.running
+    }
+
     /// Whether this host reads a fleet store (#10885). A fleet host rolls only
     /// for the floor: [`Self::observe`] returning a target is the one version
     /// roll it makes.

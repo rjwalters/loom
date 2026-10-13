@@ -14,8 +14,9 @@
 //!    [`crate::merge_pr::labels::BLOCKING`], so a PR carrying it beside
 //!    `loom:pr` is refused by the existing verdict-contradiction guard on
 //!    every merge path, with the same no-override treatment. The merge path
-//!    reads ONLY the label — it never parses markers, never fetches
-//!    predecessor state, and grows no shell. A sequencing hold that cleared
+//!    DECIDES on the label alone — it never fetches predecessor state, and
+//!    grows no shell (its exit-7 refusal reads the marker only to name
+//!    `after=`, #11330). A sequencing hold that cleared
 //!    itself inside the merge script would need live forge reads at merge
 //!    time; instead the hold is *durable* precisely because it moves by a
 //!    separate, explicit evaluation step.

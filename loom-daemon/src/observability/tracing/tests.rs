@@ -14,9 +14,7 @@ fn legacy_queue_envelope_stays_compatible_and_native_context_is_stripped() {
             issue: 18,
             sweep_id: "fixture".into(),
             started_at: chrono::Utc::now(),
-            model: None,
-            effort: None,
-            runtime: None,
+            facts: Default::default(),
         }),
     );
     let bytes = serde_json::to_vec(&old).unwrap();
@@ -68,7 +66,7 @@ fn actual_propagation_hook_handles_enabled_disabled_and_invalid_configuration() 
     }
     let _restore = Restore(keys.into_iter().zip(previous).collect());
     for (enabled, endpoint, expect_context) in [
-        ("true", "http://127.0.0.1:4318", cfg!(feature = "otlp")),
+        ("true", "http://127.0.0.1:4318", true),
         ("false", "http://127.0.0.1:4318", false),
         ("true", "not a URL", false),
         ("true", "https://example.com", false),

@@ -1,6 +1,7 @@
-//! `loom-daemon check-stale-blocked` — the fleet-wide `loom:blocked` re-check
-//! (issue #8927), backing `defaults/scripts/check-stale-blocked.sh`'s Shape-A
-//! stub.
+//! `loom-daemon check-stale-blocked` — the per-repository `loom:blocked`
+//! re-check (issue #8927), backing `defaults/scripts/check-stale-blocked.sh`'s
+//! Shape-A stub. One invocation examines one repository; see "One repository
+//! per invocation" below.
 //!
 //! The fourth pre-wave advisory check, alongside `check-host-sleep.sh` (#3350),
 //! `check-main-freshness.sh` (#3770) and `check-quarantine-stashes.sh` (#5185).
@@ -26,6 +27,20 @@
 //! answers. `--json` carries what the run spent as `forge_cost`; the human
 //! report prints the same numbers as one stderr line unless `--quiet`.
 //! The logic is [`loom_daemon::stale_blocked::budget`].
+//!
+//! # One repository per invocation (#9191)
+//!
+//! `--repo` / `--repo-root` resolve exactly one repository and nothing here
+//! walks a workspace registry. A caller that wants several repositories has to
+//! invoke this once per repository, and that loop is not protected by anything
+//! in this process: the floor above reads the hourly buckets, which a GitHub
+//! secondary (burst) limit does not appear in, and this one-shot process has
+//! no rate-limit breaker (it exists only in the running daemon), so a refusal
+//! stops nothing here and reaches no later invocation.
+//! `.loom/docs/github-authentication.md` -> "Secondary rate limits and
+//! hand-rolled loops" has the caller-side rules. The daemon's own walk of
+//! every registered workspace is the *write* pass, `release-stale-blocked`,
+//! which runs in one process behind the breaker.
 //!
 //! # Why every failure is still exit 0
 //!
@@ -81,8 +96,9 @@ pub(crate) struct StaleBlockedArgs {
     #[arg(long)]
     pub json: bool,
 
-    /// Repository to scan, as `owner/name`. Defaults to whatever `gh` resolves
-    /// from `--repo-root`.
+    /// The one repository to scan, as `owner/name`. Defaults to whatever `gh`
+    /// resolves from `--repo-root`. Not repeatable: for several repositories,
+    /// pace separate invocations and stop at the first rate-limit refusal.
     #[arg(long, value_name = "OWNER/NAME")]
     pub repo: Option<String>,
 
@@ -162,6 +178,7 @@ impl StaleBlockedArgs {
         let mut superseded: Vec<Finding> = Vec::new();
         let mut unticked: Vec<Finding> = Vec::new();
         let mut undocumented: Vec<Finding> = Vec::new();
+        let mut held: Vec<Finding> = Vec::new();
         let mut prose_only: Vec<Finding> = Vec::new();
         let mut unevaluated: Vec<(String, String)> = Vec::new();
 
@@ -192,6 +209,7 @@ impl StaleBlockedArgs {
                 Verdict::Superseded { .. } => superseded.push(finding),
                 Verdict::Unticked { .. } => unticked.push(finding),
                 Verdict::Undocumented => undocumented.push(finding),
+                Verdict::HeldWithReason { .. } => held.push(finding),
                 Verdict::StillBlocked => {}
             }
         }
@@ -201,6 +219,7 @@ impl StaleBlockedArgs {
             superseded: &superseded,
             unticked: &unticked,
             undocumented: &undocumented,
+            held: &held,
             prose_only: &prose_only,
             unevaluated: &unevaluated,
             enumerate_error: enumerate_error.as_deref(),
@@ -225,6 +244,9 @@ struct Sections<'a> {
     superseded: &'a [Finding],
     unticked: &'a [Finding],
     undocumented: &'a [Finding],
+    /// Parked with a stated reason and no numbered blocker (#10558). Reported,
+    /// but not a warning: the record is the documentation.
+    held: &'a [Finding],
     prose_only: &'a [Finding],
     unevaluated: &'a [(String, String)],
     enumerate_error: Option<&'a str>,
@@ -450,6 +472,23 @@ fn render(w: &mut impl Write, out: &mut impl Write, s: &Sections<'_>, quiet: boo
         return;
     }
 
+    // Informational, not a warning: a held-with-reason issue needs no action,
+    // so `--quiet` (the sweep pre-flight) never prints it (#10602).
+    if !s.held.is_empty() {
+        let _ = writeln!(
+            w,
+            "HELD WITH A STATED REASON — a park record states why, no numbered blocker ({}):",
+            s.held.len()
+        );
+        for f in s.held {
+            let (by, reason) = match &f.verdict {
+                Verdict::HeldWithReason { by, reason } => (by.as_deref().unwrap_or("?"), reason),
+                _ => ("?", &String::new()),
+            };
+            let _ = writeln!(w, "  {} {} (by {by}: {reason})", f.reference(), f.title);
+        }
+    }
+
     // Only when something was examined: an empty population stays silent.
     if s.cost.projected != budget::Projection::default() {
         let _ = writeln!(w, "{}", s.cost.summary());
@@ -542,6 +581,18 @@ fn print_json(s: &Sections<'_>) {
         })
         .collect();
     let undoc_json: Vec<_> = s.undocumented.iter().map(row).collect();
+    let held_json: Vec<_> = s
+        .held
+        .iter()
+        .map(|f| {
+            let mut v = row(f);
+            if let Verdict::HeldWithReason { by, reason } = &f.verdict {
+                v["by"] = serde_json::json!(by);
+                v["reason"] = serde_json::json!(reason);
+            }
+            v
+        })
+        .collect();
     let prose_only_json: Vec<_> = s.prose_only.iter().map(row).collect();
     let uneval_json: Vec<_> = s
         .unevaluated
@@ -555,6 +606,7 @@ fn print_json(s: &Sections<'_>) {
             "superseded": superseded_json,
             "unticked": unticked_json,
             "undocumented": undoc_json,
+            "held_with_reason": held_json,
             "prose_only": prose_only_json,
             "unevaluated": uneval_json,
             "enumerate_error": s.enumerate_error,
@@ -567,6 +619,52 @@ fn print_json(s: &Sections<'_>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #9191: the command examines one repository per invocation, and its
+    /// help must say so. "Fleet-wide" invited a hand-rolled loop over many
+    /// repositories, which is the one caller shape that is unsafe to write.
+    /// Both renderings are pinned: the one-line summary `loom-daemon --help`
+    /// lists, and the subcommand's own `--help`.
+    #[test]
+    fn help_says_per_repository_and_never_fleet_wide() {
+        use crate::cli::whole_cli_parse::{on_stack, MAIN_THREAD_STACK};
+        let (summary, long) = on_stack("stale-blocked-help", MAIN_THREAD_STACK, || {
+            use clap::CommandFactory;
+            let mut cli = <crate::Cli as CommandFactory>::command();
+            cli.build();
+            let sub = cli
+                .find_subcommand_mut("check-stale-blocked")
+                .expect("check-stale-blocked is registered");
+            let summary = sub.get_about().map(ToString::to_string).unwrap_or_default();
+            (summary, sub.render_long_help().to_string())
+        });
+        // Help is re-wrapped to the terminal width, so compare on single spaces.
+        let flat = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+        let (summary, long) = (flat(&summary), flat(&long));
+
+        for (name, text) in [("summary", &summary), ("--help", &long)] {
+            assert!(
+                !text.to_lowercase().contains("fleet-wide"),
+                "{name} must not call the command fleet-wide: {text}"
+            );
+            assert!(
+                text.contains("per-repository"),
+                "{name} must say the command is per-repository: {text}"
+            );
+            assert!(
+                text.contains("one invocation examines one repository"),
+                "{name} must state the one-repository scope: {text}"
+            );
+        }
+        assert!(
+            long.contains("Do not loop it across many repositories by hand"),
+            "--help must warn against the hand-rolled loop: {long}"
+        );
+        assert!(
+            long.contains("github-authentication.md"),
+            "--help must point at the doc section: {long}"
+        );
+    }
 
     fn unticked() -> Finding {
         Finding {
@@ -590,6 +688,7 @@ mod tests {
             superseded: &[],
             unticked: &f,
             undocumented: &[],
+            held: &[],
             prose_only: &[],
             unevaluated: &uneval,
             enumerate_error: None,
@@ -611,6 +710,7 @@ mod tests {
             superseded: &[],
             unticked: &[],
             undocumented: &[],
+            held: &[],
             prose_only: &[],
             unevaluated: &[],
             enumerate_error: None,
@@ -647,5 +747,46 @@ mod tests {
             assert!(section < footer, "unticked must precede the footer:\n{err}");
             assert!(err.contains("issue #42 parked"));
         }
+    }
+
+    /// Judge (#10602): a held-with-reason issue needs no action, so a run
+    /// where every issue is held prints nothing at all under `--quiet`, and
+    /// without it lists them with no WARNING banner.
+    #[test]
+    fn quiet_prints_nothing_when_every_issue_is_held_with_a_reason() {
+        let held = [Finding {
+            kind: Artifact::Issue,
+            number: 7,
+            title: "waiting".into(),
+            verdict: Verdict::HeldWithReason {
+                by: Some("curator".into()),
+                reason: "vendor answer".into(),
+            },
+            undeclared: false,
+        }];
+        let cost = budget::ForgeCost::default();
+        let s = Sections {
+            stale: &[],
+            superseded: &[],
+            unticked: &[],
+            undocumented: &[],
+            held: &held,
+            prose_only: &[],
+            unevaluated: &[],
+            enumerate_error: None,
+            cost: &cost,
+            archived: Some(false),
+        };
+        let (mut err, mut out) = (Vec::new(), Vec::new());
+        render(&mut err, &mut out, &s, true);
+        assert!(err.is_empty(), "{}", String::from_utf8_lossy(&err));
+        assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
+
+        let (mut err, mut out) = (Vec::new(), Vec::new());
+        render(&mut err, &mut out, &s, false);
+        let err = String::from_utf8(err).unwrap();
+        assert!(err.contains("HELD WITH A STATED REASON"), "{err}");
+        assert!(err.contains("issue #7 waiting (by curator: vendor answer)"), "{err}");
+        assert!(!err.contains("WARNING"), "{err}");
     }
 }

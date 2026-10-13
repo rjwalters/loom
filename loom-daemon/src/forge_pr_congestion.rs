@@ -227,23 +227,6 @@ pub fn link_issue_number(head_ref: &str, body: &str) -> Option<u32> {
     None
 }
 
-/// The `points:*` story-point label value, when exactly the expected label
-/// shape is present. Multiple `points:*` labels are malformed by the label
-/// state machine ("exactly one"), so `None` — the row counts as unmapped —
-/// beats guessing which one is real.
-pub fn points_from_labels(labels: &[String]) -> Option<u32> {
-    let mut found: Option<u32> = None;
-    for label in labels {
-        if let Some(rest) = label.strip_prefix("points:") {
-            match rest.parse::<u32>() {
-                Ok(n) if found.is_none() => found = Some(n),
-                _ => return None,
-            }
-        }
-    }
-    found
-}
-
 /// Two file sets are bundle-compatible: no path in common. An empty set is
 /// compatible with anything — a PR that changed no files cannot collide on a
 /// path. (Truncation is handled by the caller, not here: an *incomplete* set
@@ -531,7 +514,7 @@ fn fetch_points(
             .context("unexpected issue shape in the points lookup")?;
         if let Some(labels) = node.labels {
             let names: Vec<String> = labels.nodes.into_iter().map(|n| n.name).collect();
-            if let Some(points) = points_from_labels(&names) {
+            if let Some(points) = crate::story_points::classify_points_labels(&names).value() {
                 out.insert(number, points);
             }
         }
@@ -731,13 +714,15 @@ mod tests {
         assert_eq!(link_issue_number("", "no links here, see #1234 for color"), None);
     }
 
-    // -- points_from_labels --------------------------------------------------
+    // -- points labels (story_points::classify_points_labels) ---------------
 
     #[test]
-    fn points_label_parses_and_multiple_points_labels_are_rejected() {
-        assert_eq!(points_from_labels(&["points:8".into()]), Some(8));
-        assert_eq!(points_from_labels(&["loom:pr".into()]), None);
-        assert_eq!(points_from_labels(&["points:3".into(), "points:5".into()]), None);
+    fn points_label_parses_and_multiple_or_out_of_vocabulary_labels_are_unmapped() {
+        let points = |labels: &[&str]| crate::story_points::classify_points_labels(labels).value();
+        assert_eq!(points(&["points:8"]), Some(8));
+        assert_eq!(points(&["loom:pr"]), None);
+        assert_eq!(points(&["points:3", "points:5"]), None);
+        assert_eq!(points(&["points:4"]), None);
     }
 
     // -- greedy_bundles ------------------------------------------------------

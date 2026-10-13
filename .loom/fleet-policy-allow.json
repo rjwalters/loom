@@ -1,0 +1,4 @@
+{
+  "_comment": "Deliberate per-repo overrides of fleet-policy keys (Issue #11441). Every entry needs a non-empty reason; `loom-daemon validate --strict` (CI) rejects a fleet key committed in .loom/config.json or .loom-project/project.json without one. Empty since #11450 moved this repo's runtimes/autonomous policy to fleet-gitops config.defaults: fleet-gitops is the only source.",
+  "allow": []
+}

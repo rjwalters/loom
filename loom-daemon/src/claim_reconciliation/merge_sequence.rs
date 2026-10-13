@@ -25,9 +25,10 @@
 //!   trusted `loom:sequence` markers and base-branch stacking are
 //!   authoritative constraints; everything else orders ready-first (#10371,
 //!   [`ready`]: approved PRs ahead of non-approved ones), then oldest-first
-//!   within a tier (stable tiebreak on PR number), except that a starred
-//!   (`loom:operator-priority`) placeable PR goes before an unstarred one of
-//!   its tier and a stalled no-verdict PR goes last (#10060). A constraint
+//!   within a tier (stable tiebreak on PR number), except that a placeable
+//!   PR of a higher priority level (`loom:very-important`, then
+//!   `loom:important`, #11103) goes before a lower one of its tier and a
+//!   stalled no-verdict PR goes last (#10060). A constraint
 //!   cycle skips the whole component for that tick — a half-rewritten order
 //!   is worse than a deferred one.
 //! - **Apply.** Edges are a DAG over DIRECT overlap (#10060): a follower
@@ -321,9 +322,10 @@ pub fn order_component(members: &[&SequencePr], constraints: &[(u32, u32)]) -> O
 /// [`order_component`] with the placeable-set ranking: among members that
 /// are placeable right now (no unplaced constraint predecessor), ready
 /// members go first (#10371, [`ready::tier`]); within a tier a `stalled`
-/// member goes last and a starred one goes first (#10060), then
-/// oldest-first. A rank never overrides a constraint edge; with every member
-/// in one tier, no star and no stall the order is exactly the oldest-first one.
+/// member goes last and a higher priority level goes first (#10060,
+/// #11510), then oldest-first. A rank never overrides a constraint edge;
+/// with every member in one tier, one level and no stall the order is
+/// exactly the oldest-first one.
 #[must_use]
 pub fn order_component_with(
     members: &[&SequencePr],
@@ -348,10 +350,11 @@ pub fn order_component_with(
     let mut ordered = Vec::with_capacity(members.len());
     while !ready.is_empty() {
         // Among the currently placeable: ready before not ready, then
-        // not-stalled before stalled, starred before unstarred, then
+        // not-stalled before stalled, higher level before lower, then
         // oldest-first — a stable total order independent of listing order.
-        let rank =
-            |p: &SequencePr| (ready::tier(p), stalled.contains(&p.number), !stall::starred(p));
+        let rank = |p: &SequencePr| {
+            (ready::tier(p), stalled.contains(&p.number), std::cmp::Reverse(stall::level(p)))
+        };
         ready.sort_by(|a, b| {
             let (pa, pb) = (by_number[a], by_number[b]);
             (rank(pa), &pa.created_at, pa.number).cmp(&(rank(pb), &pb.created_at, pb.number))
@@ -950,13 +953,14 @@ fn fetch_markers(
 pub struct PlanReport {
     pub open_prs: usize,
     pub groups: Vec<SequenceGroup>,
-    /// Edges already satisfied by an identical marker — no write would occur.
+    /// Suppressed edges whose follower's trusted marker already states this
+    /// very order (same `LandingKey`). Disjoint from `skipped_held` (#9771).
     pub already_planned: usize,
     pub holders: usize,
-    /// Edges suppressed because the follower already carries an ordering
-    /// state (trusted marker or hold label) or a sticky operator release
-    /// (#10398) — reported so the dry-run's "what would the pass write"
-    /// matches the live pass edge for edge (Judge re-review of #9707).
+    /// Every other suppressed edge: the follower carries a different order
+    /// (marker or hold label) or a sticky operator release (#10398). With
+    /// `already_planned`, leaves `groups` holding exactly what the live pass
+    /// would write (Judge re-review of #9707).
     pub skipped_held: usize,
     /// Existing holds Phase 1 would release as no-overlap (#10077):
     /// `(follower, predecessor)`.
@@ -1000,6 +1004,14 @@ pub fn plan_report(gh_bin: &Path, root: &Path) -> Result<PlanReport> {
     let bin = gh_bin.to_string_lossy().to_string();
     for g in &mut report.groups {
         g.edges.retain(|e| {
+            // #10634: the order key, not the plan id — the live pass keeps a
+            // comment whose key matches, whatever plan id it carries.
+            if markers.get(&e.follower).is_some_and(|m| {
+                landing::LandingKey::of(m) == landing::LandingKey::of(&edge_marker(e))
+            }) {
+                report.already_planned += 1;
+                return false;
+            }
             if markers.contains_key(&e.follower) || holder_numbers.contains(&e.follower) {
                 report.skipped_held += 1;
                 return false;
@@ -1014,17 +1026,6 @@ pub fn plan_report(gh_bin: &Path, root: &Path) -> Result<PlanReport> {
             }
             true
         });
-    }
-    for g in &report.groups {
-        for e in &g.edges {
-            // #10634: the order key, not the plan id — the live pass keeps a
-            // comment whose key matches, whatever plan id it carries.
-            if markers.get(&e.follower).is_some_and(|m| {
-                landing::LandingKey::of(m) == landing::LandingKey::of(&edge_marker(e))
-            }) {
-                report.already_planned += 1;
-            }
-        }
     }
     Ok(report)
 }

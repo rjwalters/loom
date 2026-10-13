@@ -1,12 +1,14 @@
 //! The git half of the checkout fast-forward (#10869): every command it runs
 //! in a registered workspace's main checkout.
 //!
-//! One command here writes to the checkout: [`fast_forward`], a
-//! `merge --ff-only` with hooks off. Everything else is a read, a
-//! `git ls-remote` that writes nothing, or a `fetch` that moves only the
-//! remote-tracking ref (not even `FETCH_HEAD`). Nothing here runs `reset`,
-//! `rebase`, `stash`, `checkout` or `clean`, makes a merge commit, or removes
-//! a lock file.
+//! Two commands here write to the checkout: [`fast_forward`], a
+//! `merge --ff-only` with hooks off, and [`discard_identical`], a
+//! `checkout HEAD -- <paths>` with hooks off and literal pathspecs that is
+//! only ever run on paths proven identical to `origin/<branch>`, immediately before the merge
+//! (#11553). Everything else is a read, a `git ls-remote` that writes
+//! nothing, or a `fetch` that moves only the remote-tracking ref (not even
+//! `FETCH_HEAD`). Nothing here runs `reset`, `rebase`, `stash` or `clean`,
+//! makes a merge commit, or removes a lock file.
 //!
 //! Two commands use the network: [`remote_head`] and [`fetch`]. Every ref
 //! operand that comes from the remote sits behind a standalone `--` (#9106,
@@ -17,7 +19,8 @@ use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::time::Duration;
 
-use crate::cmd_out::{run_command, CmdOutcome};
+use crate::cmd_out::CmdOutcome;
+use crate::fleet_sync::git_spawn_log::{memory_config_for, run_logged};
 
 /// Bound for `git ls-remote` of one ref: a connection and a ref advertisement.
 pub(super) const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -46,15 +49,49 @@ pub(super) enum Refusal {
     Other(String),
 }
 
-fn tracking(branch: &str) -> String {
+pub(super) fn tracking(branch: &str) -> String {
     format!("refs/remotes/origin/{branch}")
 }
 
 /// Run `git` in `root` to an exit. `config` is `-c` pairs placed before the
 /// subcommand. `Err` when it could not be run or outlived `timeout`.
-fn run(root: &Path, config: &[&str], args: &[&str], timeout: Duration) -> Result<Output, String> {
+pub(super) fn run(
+    root: &Path,
+    config: &[&str],
+    args: &[&str],
+    timeout: Duration,
+) -> Result<Output, String> {
+    run_with_index(root, config, args, timeout, None)
+}
+
+/// [`run`], with `GIT_INDEX_FILE` set to `index` when it is `Some`.
+fn run_with_index(
+    root: &Path,
+    config: &[&str],
+    args: &[&str],
+    timeout: Duration,
+    index: Option<&Path>,
+) -> Result<Output, String> {
+    let mut cmd = command(root, config, args);
+    if let Some(index) = index {
+        cmd.env("GIT_INDEX_FILE", index);
+    }
+    crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
+    let result = run_logged("checkout_ff", root, cmd, timeout);
+    match crate::cmd_out::outcome_of(result, timeout) {
+        CmdOutcome::Ran(out) => Ok(out),
+        CmdOutcome::Unavailable(why) => Err(format!("git {}: {why}", args.join(" "))),
+    }
+}
+
+/// The `git` command [`run`] spawns, before credentials. `fetch` always
+/// carries the memory bound (#11059).
+fn command(root: &Path, config: &[&str], args: &[&str]) -> Command {
     let mut cmd = Command::new("git");
-    for pair in config {
+    for pair in memory_config_for(args.first().copied().unwrap_or_default())
+        .iter()
+        .chain(config)
+    {
         cmd.arg("-c").arg(pair);
     }
     cmd.arg("-C")
@@ -62,6 +99,8 @@ fn run(root: &Path, config: &[&str], args: &[&str], timeout: Duration) -> Result
         .args(args)
         .stdin(Stdio::null())
         .env("GIT_TERMINAL_PROMPT", "0")
+        // Loom's own ref moves are not external changes (#11566).
+        .env("GIT_REFLOG_ACTION", super::external_change::tag("ff"))
         // Refusals are read from stderr below, so the wording must be git's own.
         .env("LC_ALL", "C");
     // An inherited repository override would aim every command at some other
@@ -69,23 +108,19 @@ fn run(root: &Path, config: &[&str], args: &[&str], timeout: Duration) -> Result
     for var in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"] {
         cmd.env_remove(var);
     }
-    crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-    match run_command(cmd, timeout) {
-        CmdOutcome::Ran(out) => Ok(out),
-        CmdOutcome::Unavailable(why) => Err(format!("git {}: {why}", args.join(" "))),
-    }
+    cmd
 }
 
-fn stderr(out: &Output) -> String {
+pub(super) fn stderr(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).trim().to_string()
 }
 
-fn stdout(out: &Output) -> String {
+pub(super) fn stdout(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
 /// [`run`], requiring exit 0. Returns trimmed stdout.
-fn ok(root: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
+pub(super) fn ok(root: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
     let out = run(root, &[], args, timeout)?;
     if out.status.success() {
         Ok(stdout(&out))
@@ -216,7 +251,95 @@ pub(super) fn tracked_changes(root: &Path, timeout: Duration) -> Result<Vec<Stri
     Ok(raw.lines().map(|l| l.trim().to_string()).collect())
 }
 
-/// The one write: fast-forward the checked-out branch to `origin/<branch>`.
+/// The tracked dirty paths, exact: `status --porcelain -z` (NUL-separated,
+/// never C-quoted) parsed by
+/// [`crate::git_ff_identical::tracked_paths_from_porcelain_z`]. `Err` when
+/// the output cannot be parsed into exact paths (malformed, or not UTF-8).
+pub(super) fn tracked_paths(root: &Path, timeout: Duration) -> Result<Vec<String>, String> {
+    let args = crate::git_ff_identical::STATUS_ARGS;
+    let out = run(root, &[], &args, timeout)?;
+    if !out.status.success() {
+        return Err(format!("git {} failed: {}", args.join(" "), stderr(&out)));
+    }
+    crate::git_ff_identical::tracked_paths_from_porcelain_z(&out.stdout)
+        .ok_or_else(|| "git status -z: a path that is not exact UTF-8".to_string())
+}
+
+/// A private copy of a checkout's index, for probes that would otherwise
+/// rewrite the real one. Removed on drop.
+pub(super) struct ScratchIndex {
+    _dir: tempfile::TempDir,
+    path: std::path::PathBuf,
+}
+
+/// Copy the checkout's index to a fresh temp dir. `git diff <commit> --
+/// <path>` refreshes the stat cache and writes the index back whenever it
+/// meets a file that is stat-dirty but identical, and `--no-optional-locks`
+/// does not stop it (git's `refresh_index_quietly`). A probe that runs
+/// against this copy leaves the operator's index and its lock alone.
+pub(super) fn scratch_index(root: &Path, timeout: Duration) -> Result<ScratchIndex, String> {
+    let at = ok(root, &["rev-parse", "--git-path", "index"], timeout)?;
+    let real = root.join(at);
+    let dir = tempfile::TempDir::new().map_err(|e| format!("scratch index: {e}"))?;
+    let path = dir.path().join("index");
+    let copy_err = |e: std::io::Error| format!("scratch index from {}: {e}", real.display());
+    // One handle for both the bytes and the mtime: a second `metadata(&real)`
+    // could see a newer index renamed into place after the copy, and pair the
+    // old contents with the new mtime.
+    let mut src = std::fs::File::open(&real).map_err(copy_err)?;
+    // Keep the index file's own mtime: git's racy-entry check compares each
+    // entry's mtime with it, and a newer copy would make git trust a stale
+    // stat entry for a file edited in the same second the index was written.
+    let mtime = src
+        .metadata()
+        .and_then(|m| m.modified())
+        .map_err(copy_err)?;
+    let mut dst = std::fs::File::create(&path).map_err(copy_err)?;
+    std::io::copy(&mut src, &mut dst).map_err(copy_err)?;
+    dst.set_modified(mtime).map_err(copy_err)?;
+    Ok(ScratchIndex { _dir: dir, path })
+}
+
+/// A bounded probe against `index`: its stdout only when `git <args>` ran
+/// and exited 0. A timeout or an error answers `None`, so a check built on it
+/// fails closed. `core.splitIndex=false`, so a refresh written to the copy
+/// never puts a shared-index file in the real git dir.
+pub(super) fn quiet_out(
+    root: &Path,
+    index: &ScratchIndex,
+    args: &[&str],
+    timeout: Duration,
+) -> Option<Vec<u8>> {
+    let config = ["core.splitIndex=false"];
+    let out = run_with_index(root, &config, args, timeout, Some(&index.path)).ok()?;
+    out.status.success().then_some(out.stdout)
+}
+
+/// The second write (#11553): `git --literal-pathspecs checkout HEAD --
+/// <paths>` ([`crate::git_ff_identical::discard_args`]), discarding
+/// local edits that are byte-identical to `origin/<branch>`. Only ever called
+/// with paths [`crate::git_ff_identical::all_dirty_tracked_identical_to_origin`]
+/// vouched for, and only immediately before [`fast_forward`].
+///
+/// Hooks are off (a path checkout still fires `post-checkout`), and so is
+/// `submodule.recurse`, as for [`fast_forward`]. Bounded like the merge, and
+/// for the same reason.
+pub(super) fn discard_identical(root: &Path, paths: &[String]) -> Result<(), String> {
+    let args = crate::git_ff_identical::discard_args(paths);
+    let out = run(
+        root,
+        &["core.hooksPath=/dev/null", "submodule.recurse=false"],
+        &args,
+        MERGE_TIMEOUT,
+    )?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!("git checkout HEAD -- failed: {}", stderr(&out)))
+    }
+}
+
+/// The main write: fast-forward the checked-out branch to `origin/<branch>`.
 ///
 /// Hooks are off (a repo's `post-merge` must not run unattended inside the
 /// daemon), and so are the two config switches that would make a plain merge
@@ -274,4 +397,23 @@ pub(super) fn summarize(paths: &[String]) -> String {
         shown.push_str(&format!(", and {} more", paths.len() - NAMED_PATHS));
     }
     shown
+}
+
+#[cfg(test)]
+mod memory_bound_tests {
+    use super::*;
+    use crate::fleet_sync::git_spawn_log::{argv_of, MEMORY_BOUND_CONFIG};
+
+    #[test]
+    fn fetch_carries_the_memory_bound_and_reads_do_not() {
+        let fetch = argv_of(&command(Path::new("/r"), &[], &["fetch", "origin"]));
+        for pair in MEMORY_BOUND_CONFIG {
+            let at = fetch.iter().position(|a| a == pair).expect(pair);
+            assert_eq!(fetch[at - 1], "-c");
+            assert!(at < fetch.iter().position(|a| a == "fetch").unwrap());
+        }
+        let read = argv_of(&command(Path::new("/r"), &["x=y"], &["rev-parse", "HEAD"]));
+        assert!(read.contains(&"x=y".to_string()));
+        assert!(!read.iter().any(|a| a.starts_with("pack.")));
+    }
 }

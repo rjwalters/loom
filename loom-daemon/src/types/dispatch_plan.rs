@@ -26,7 +26,7 @@ pub enum PlanState {
     /// plan order: what the next tick admits once slots free.
     Next,
     /// Deferred for a capacity-style reason, behind the `next` rows
-    /// (including out-of-slice and repo-capped rows).
+    /// (including repo-capped rows).
     Queued,
     /// Held by something specific to the issue, its repo, or its history.
     Blocked,
@@ -50,9 +50,11 @@ pub enum PlanGate {
     BuildBackoff,
     /// Its own repo was at `maxConcurrentPerRepo`.
     RepoCap,
-    /// Outside this host's preferred repo slice while the slice had work.
-    OutOfSlice,
-    /// A gate this client does not know (forward compatibility).
+    /// Its affected files overlap same-repo work admitted or in flight (#9781).
+    FileOverlap,
+    /// A gate this client does not know (forward compatibility). This
+    /// includes `out_of_slice`, retired with the dispatch slice (#11682) and
+    /// never emitted since: a historical record carrying it parses here.
     #[serde(other)]
     Unknown,
 }
@@ -79,8 +81,7 @@ pub struct RepoCapView {
 /// `QueueSnapshotRow` so they ride every existing queue surface.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RowPlan {
-    /// 1-based position in the shaped pass-2 order (out-of-slice rows follow
-    /// it). `None` ⇒ not dispatchable on this host this tick. Distinct from
+    /// 1-based position in the shaped pass-2 order. `None` ⇒ not dispatchable on this host this tick. Distinct from
     /// `rank`, which is the bare comparator rank over every row.
     #[serde(default)]
     pub position: Option<u32>,
@@ -91,9 +92,6 @@ pub struct RowPlan {
     pub keys: Vec<PlanKey>,
     #[serde(default)]
     pub gate: Option<PlanGate>,
-    /// Whether the workspace is in this host's preferred repo slice.
-    #[serde(default)]
-    pub in_slice: Option<bool>,
     /// Whether the workspace had a live sweep at the top of the tick (the
     /// track-affinity input).
     #[serde(default)]
@@ -106,7 +104,7 @@ pub struct RowPlan {
     /// When a time-boxed hold clears (Issue #9311): the recheck interval,
     /// dispatch backoff (including the open-PR-guard-armed subset), no-op
     /// cooldown, decline cooldown, or PR-less-retry window. `None` for a
-    /// `position`-bearing row (capacity/ramp/repo-cap/out-of-slice deferrals
+    /// `position`-bearing row (capacity/ramp/repo-cap deferrals
     /// name a gate, not a clock) and for every other `blocked` disposition
     /// this field does not (yet) trace — additive, never a substitute for
     /// `gate` or `plan_state`.
@@ -131,9 +129,9 @@ pub struct PlanSlots {
     pub saturation_held: bool,
     #[serde(default)]
     pub any_halted: bool,
-    /// Whether the host's single `loom:operator-priority` overflow slot
-    /// (#9244) is unused: a starred issue can still start past the
-    /// configured cap.
+    /// Whether the host's single overflow slot (#9244) is unused. Inert
+    /// since #11508: nothing is admitted past the configured cap any more,
+    /// so this only reports an overflow sweep an older daemon started.
     #[serde(default)]
     pub overflow_free: Option<bool>,
 }
@@ -199,11 +197,27 @@ mod tests {
         assert_eq!(row.gate, Some(PlanGate::Unknown));
     }
 
+    /// The dispatch slice's wire values are retired (#11682) but historical
+    /// records and the shared merge fixture still carry them: `out_of_slice`
+    /// parses as an unknown gate and a stray `in_slice` is ignored.
+    #[test]
+    fn retired_slice_values_still_parse() {
+        let row: RowPlan = serde_json::from_value(serde_json::json!({
+            "gate": "out_of_slice", "in_slice": false, "owning_shard": 1
+        }))
+        .unwrap();
+        assert_eq!(row.gate, Some(PlanGate::Unknown));
+        assert_eq!(row.owning_shard, Some(1));
+        assert!(serde_json::to_value(&row)
+            .unwrap()
+            .get("in_slice")
+            .is_none());
+    }
+
     #[test]
     fn wire_names_are_snake_case() {
         assert_eq!(serde_json::to_value(PlanState::Next).unwrap(), "next");
         assert_eq!(serde_json::to_value(PlanGate::RepoCap).unwrap(), "repo_cap");
-        assert_eq!(serde_json::to_value(PlanGate::OutOfSlice).unwrap(), "out_of_slice");
     }
 
     /// `held_until` (Issue #9311) round-trips as RFC-3339 when present, and
