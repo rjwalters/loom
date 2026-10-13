@@ -12,9 +12,10 @@ use loom_daemon::host_optout::{self, State};
 #[derive(Subcommand)]
 pub(crate) enum HostCommand {
     /// Opt this host out of autonomy: stop the daemon, remove its launchd/systemd
-    /// daemon + watchdog jobs and the autonomy-desired marker, and write the
-    /// `autonomy-disabled` marker. Every start / re-provision path then refuses
-    /// until `host enable`. Idempotent.
+    /// daemon job and the autonomy-desired marker, and write the
+    /// `autonomy-disabled` marker (the watchdog job stays loaded and refuses).
+    /// Every start / re-provision path then refuses until `host enable`.
+    /// Idempotent.
     Disable {
         /// Why (required; shown by every refusal, `status` and `health`).
         #[arg(long)]
@@ -100,8 +101,9 @@ fn disable(reason: &str) -> Result<()> {
     let _ = std::fs::remove_file(&desired);
     let _ = loom_daemon::operator_stop::discard(&desired);
 
-    // Stop the daemon and tear down its (and the watchdog's) supervisor jobs
-    // through the existing stop path - one implementation of that teardown.
+    // Stop the daemon and tear down its supervisor job through the existing
+    // stop path - one implementation of that teardown. Since #9957 the stop
+    // leaves the watchdog loaded; its tick refuses on the opt-out marker.
     let ok = match locate_stop_script() {
         Some(script) => match Command::new(&script).status() {
             Ok(st) if st.success() => true,
