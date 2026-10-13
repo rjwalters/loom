@@ -756,7 +756,7 @@ fn execute(
 
     let restored = if plan.releases() {
         match restore_label(extra, plan.kind, n) {
-            Ok(r) => r,
+            Ok(r) => r.filter(|label| !issue_restore_vetoed(n, label, &fresh.labels)),
             Err(e) => {
                 report.unread(n, format!("label-event read failed: {e}"));
                 return false;
@@ -817,6 +817,25 @@ fn restore_label(
             })
         }
     })
+}
+
+/// Whether #11480's shared restore veto forbids handing `loom:issue` back:
+/// another label on the issue (for example `loom:needs-capability`, which
+/// `body_skip`'s operator-hold check does not cover) keeps it out of the
+/// queue. Only `loom:blocked`, the label this release removes, is ignored.
+/// A PR's review label is never vetoed.
+fn issue_restore_vetoed(n: u64, label: &str, labels: &[String]) -> bool {
+    if label != ISSUE_LABEL {
+        return false;
+    }
+    let Some(veto) = crate::work_finder::restore_veto(labels, &[BLOCKED_LABEL]) else {
+        return false;
+    };
+    log::info!(
+        "stale_blocked: releasing #{n}'s `{BLOCKED_LABEL}` without restoring `{ISSUE_LABEL}` — \
+         it carries `{veto}` (#11480)"
+    );
+    true
 }
 
 /// The writes, in order: comment (unless already posted), then the edit.

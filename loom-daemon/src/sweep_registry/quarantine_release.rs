@@ -25,7 +25,7 @@ impl SweepRegistry {
     /// item was re-dispatched 31 times in 72 h. One REST read, fail-open (a
     /// failed read sees no labels and the release proceeds as before).
     pub(crate) fn quarantine_release_restores_ready(&self, issue: u32) -> bool {
-        let labels = self.fetch_issue_signals(issue).labels;
+        let labels = self.release_issue_signals(issue).labels;
         let Some(veto) = crate::work_finder::restore_veto(&labels, &["loom:blocked"]) else {
             return true;
         };
