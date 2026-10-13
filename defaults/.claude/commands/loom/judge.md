@@ -1066,8 +1066,8 @@ if [ -d ".loom/worktrees/issue-${ISSUE_NUM}" ]; then
 else
     # No builder worktree — self-cleaning worktree via pr-worktree.sh, not a
     # bare checkout in the current directory
-    ./.loom/scripts/pr-worktree.sh <number>
-    cd ".loom/worktrees/pr-<number>"   # only reached when the helper exited 0
+    # On a non-zero exit the cd is skipped: reuse the named holder or stop
+    ./.loom/scripts/pr-worktree.sh <number> && cd ".loom/worktrees/pr-<number>"
 fi
 ```
 
@@ -2063,8 +2063,7 @@ ISSUE_NUM=$(gh pr view <number> --json headRefName --jq '.headRefName' | sed 's/
 if [ -d ".loom/worktrees/issue-${ISSUE_NUM}" ]; then
     cd ".loom/worktrees/issue-${ISSUE_NUM}"
 else
-    ./.loom/scripts/pr-worktree.sh <number>
-    cd ".loom/worktrees/pr-<number>"
+    ./.loom/scripts/pr-worktree.sh <number> && cd ".loom/worktrees/pr-<number>"
 fi
 ```
 
