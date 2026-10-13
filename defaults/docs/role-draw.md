@@ -59,7 +59,9 @@ on one tap (`claude/opus`, `claude/fable`) share its availability.
 The daemon reads each config tier separately: machine defaults
 (`~/.local/share/loom/config/defaults.json`, where fleet-gitops renders
 `config.defaults` plus host-class and host overrides), `.loom/config.json`,
-`.loom-project/project.json`, then `.loom-local/local.json`. A higher tier
+`.loom-project/project.json`, the per-repo fleet tier
+`.loom-local/fleet-repo.json` (the fleet config's `repos[].config`, written by
+the fleet sync, #11738), then `.loom-local/local.json`. A higher tier
 replaces a role's table **per attempt**, so a host can replace `judge` attempt
 1 without restating attempt 2 or any other role. `null` at a higher tier clears
 that role (or, for `roleDraw: null`, every role). `excludeProviders` follows the

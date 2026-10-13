@@ -76,8 +76,8 @@ pub mod explain;
 
 use super::resolve::{Resolution, Tap};
 use crate::config_resolver::{
-    get_path, private_defaults_path, soft_read_json_object, LEGACY_CONFIG_REL, LOCAL_CONFIG_REL,
-    PROJECT_CONFIG_REL,
+    get_path, private_defaults_path, soft_read_json_object, FLEET_REPO_CONFIG_REL,
+    LEGACY_CONFIG_REL, LOCAL_CONFIG_REL, PROJECT_CONFIG_REL,
 };
 use crate::priority_pick::PickRng;
 use crate::runtime_admission::canonical_role;
@@ -170,6 +170,9 @@ pub enum Layer {
     RepoConfig,
     /// The workspace's tracked `.loom-project/project.json`.
     Project,
+    /// The per-repo fleet tier, `.loom-local/fleet-repo.json`, written by the
+    /// fleet sync from the fleet config's `repos[].config` (#11738).
+    FleetRepo,
     /// The workspace's ignored `.loom-local/local.json`.
     Local,
 }
@@ -182,6 +185,7 @@ impl Layer {
             Self::MachineDefaults => "machine-defaults",
             Self::RepoConfig => "repo-config",
             Self::Project => "project",
+            Self::FleetRepo => "fleet-repo",
             Self::Local => "local",
         }
     }
@@ -196,6 +200,7 @@ fn tiers(root: &Path) -> Vec<(Layer, PathBuf)> {
         .collect();
     tiers.push((Layer::RepoConfig, root.join(LEGACY_CONFIG_REL)));
     tiers.push((Layer::Project, root.join(PROJECT_CONFIG_REL)));
+    tiers.push((Layer::FleetRepo, root.join(FLEET_REPO_CONFIG_REL)));
     tiers.push((Layer::Local, root.join(LOCAL_CONFIG_REL)));
     tiers
 }
