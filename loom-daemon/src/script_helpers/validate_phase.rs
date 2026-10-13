@@ -9,7 +9,7 @@
 //!
 //! | Phase | Contract | Recovery |
 //! |---|---|---|
-//! | `curator` | issue has `loom:curated` | apply the label |
+//! | `curator` | issue has `loom:curated` | run `curation-complete` (never a bare label) |
 //! | `builder` | an open PR with `loom:review-requested` exists | add the label, or commit+push+open a PR from worktree changes |
 //! | `judge` | PR has `loom:pr` or `loom:changes-requested` | none (diagnose only) |
 //! | `doctor` | PR has `loom:review-requested` | none (diagnose only) |
@@ -226,7 +226,12 @@ pub struct ValidationResult {
 }
 
 impl ValidationResult {
-    fn new(phase: &str, issue: i64, status: ValidationStatus, message: impl Into<String>) -> Self {
+    pub(super) fn new(
+        phase: &str,
+        issue: i64,
+        status: ValidationStatus,
+        message: impl Into<String>,
+    ) -> Self {
         Self {
             phase: phase.to_string(),
             issue,
@@ -236,7 +241,7 @@ impl ValidationResult {
         }
     }
 
-    fn with_action(mut self, action: &str) -> Self {
+    pub(super) fn with_action(mut self, action: &str) -> Self {
         self.recovery_action = action.to_string();
         self
     }
@@ -285,7 +290,7 @@ pub struct ValidateOpts {
 
 /// Invoke `report-milestone.sh` when a task id is set (best-effort, never
 /// fatal — a missing script is simply skipped).
-fn report_milestone(task_id: Option<&str>, repo_root: &Path, action: &str) {
+pub(super) fn report_milestone(task_id: Option<&str>, repo_root: &Path, action: &str) {
     let Some(task_id) = task_id.filter(|t| !t.is_empty()) else {
         return;
     };
@@ -1296,7 +1301,6 @@ fn derive_commit_message(repo_root: &Path, issue: i64, staged_files: &[String]) 
 #[must_use]
 pub fn validate_curator(repo_root: &Path, opts: &ValidateOpts) -> ValidationResult {
     let issue = opts.issue;
-    let issue_s = issue.to_string();
     // #7810 PR 2: `Empty` (the issue genuinely has no labels) must keep flowing
     // to the "missing loom:curated" path below, while every way of NOT KNOWING
     // fails the check. Under `--jq .labels[].name` both produced no lines, so a
@@ -1330,38 +1334,14 @@ pub fn validate_curator(repo_root: &Path, opts: &ValidateOpts) -> ValidationResu
         );
     }
 
-    let r = run_gh(
-        &[
-            "issue",
-            "edit",
-            &issue_s,
-            "--remove-label",
-            "loom:curating",
-            "--add-label",
-            "loom:curated",
-        ],
-        repo_root,
-        false,
-    );
-    if r.succeeded() {
-        report_milestone(
-            opts.task_id.as_deref(),
-            repo_root,
-            "recovery: applied loom:curated label",
-        );
-        return ValidationResult::new(
-            "curator",
-            issue,
-            ValidationStatus::Recovered,
-            "Applied loom:curated label",
-        )
-        .with_action("apply_label");
-    }
-    ValidationResult::new(
-        "curator",
+    // #11787: never write `loom:curated` bare. Only `curation-complete` may
+    // apply it, because it journals the `issue.estimate` fact in the same step.
+    super::validate_phase_curator::recover_curator_with(
         issue,
-        ValidationStatus::Failed,
-        "Could not apply loom:curated label",
+        opts.task_id.as_deref(),
+        repo_root,
+        &|| super::validate_phase_curator::run_curation_complete(repo_root, issue),
+        &|| super::validate_phase_curator::release_curating_claim(repo_root, issue),
     )
 }
 

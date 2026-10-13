@@ -211,8 +211,10 @@ blocks self-review and Loom agents often create and review the same PR.
 
 Find unlabeled issues (use `-label:` search terms, **not** `--label` — gh ANDs
 `--label` values with no negation syntax, so a negated `--label` always returns
-empty), enhance with technical detail, then `gh issue edit 42 --add-label
-"loom:curated"`.
+empty), enhance with technical detail, then write the standalone `<!-- loom:points=N -->`
+marker and run `loom-daemon curation-complete --repo OWNER/REPO --issue 42 --model M
+--runtime R --completion-id $(uuidgen) --workspace-root ROOT` (it applies `loom:curated`;
+never a bare `--add-label`, #11787; recipe: `.loom/roles/curator-estimate.md`).
 
 ### Overnight / long-running orchestration
 
