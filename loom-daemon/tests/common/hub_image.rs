@@ -23,6 +23,17 @@
 //! Every `docker` call has a deadline, so a stalled registry costs one attempt
 //! instead of the job: the attempt count bounds retries, the deadline bounds
 //! time.
+//!
+//! An image that cannot be pulled at all is not a test failure (#11756). A
+//! test that only checks telemetry SQL or collector config guards itself with
+//! [`available`]: on a pull request it is skipped with a
+//! `::warning::image-unavailable <ref>` annotation and a job-summary line, so
+//! a registry outage cannot block merges; on `main` (and locally) it still
+//! fails, so a permanently broken image cannot hide behind skips. The
+//! decision is the pure [`on_unavailable`] + [`outcome`].
+
+// Each test binary uses its own subset of this module.
+#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -198,26 +209,155 @@ fn tail(stderr: &mut std::fs::File) -> String {
     String::from_utf8_lossy(&bytes).trim().to_string()
 }
 
-/// Returns the reference to pass to `docker` for the Docker Hub image `image`,
-/// pulling it if it is not already local. Panics, naming the failure as
-/// infrastructure, when neither the mirror nor Docker Hub can serve it.
-pub fn resolve(image: &str) -> String {
-    static RESOLVED: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
-    // Held across the pull on purpose: parallel tests in one binary wait for
-    // the first pull instead of racing their own.
-    let mut resolved = RESOLVED
+/// What an exhausted pull means for the test that asked for the image (#11756).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnUnavailable {
+    /// Skip the test, loudly: a pull request, where a registry outage must
+    /// not block the merge of a change that did not cause it.
+    Skip,
+    /// Fail the test: `main`, local runs and anything else, so a permanently
+    /// broken image cannot hide behind skips.
+    Fail,
+}
+
+/// Decides [`OnUnavailable`] from the environment, read through `env` so the
+/// decision is testable without touching the process environment.
+///
+/// Skips only when GitHub Actions says this is a pull request (or merge-queue)
+/// run whose ref is not `main`. Everything else fails closed: a push to
+/// `main`, a schedule, a `workflow_dispatch`, and a developer's own run.
+/// `LOOM_TEST_IMAGE_UNAVAILABLE=skip|fail` overrides, for reproducing either
+/// path by hand.
+pub fn on_unavailable(env: impl Fn(&str) -> Option<String>) -> OnUnavailable {
+    match env("LOOM_TEST_IMAGE_UNAVAILABLE").as_deref() {
+        Some("skip") => return OnUnavailable::Skip,
+        Some("fail") => return OnUnavailable::Fail,
+        _ => {}
+    }
+    if env("GITHUB_ACTIONS").as_deref() != Some("true")
+        || env("GITHUB_REF").as_deref() == Some("refs/heads/main")
+    {
+        return OnUnavailable::Fail;
+    }
+    match env("GITHUB_EVENT_NAME").as_deref() {
+        Some("pull_request" | "pull_request_target" | "merge_group") => OnUnavailable::Skip,
+        _ => OnUnavailable::Fail,
+    }
+}
+
+/// What a test does with one pull result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    /// Run, handing `docker` this reference.
+    Use(String),
+    /// Skip: the image is unavailable and this run may say so.
+    Skip(Vec<String>),
+    /// Fail: the image is unavailable and this run must not hide it.
+    Fail(Vec<String>),
+}
+
+/// The pure decision: a pulled image is used; an exhausted pull skips or
+/// fails as `policy` says. A test failure never reaches here — only the pull.
+pub fn outcome(pulled: Result<String, Vec<String>>, policy: OnUnavailable) -> Outcome {
+    match (pulled, policy) {
+        (Ok(reference), _) => Outcome::Use(reference),
+        (Err(failures), OnUnavailable::Skip) => Outcome::Skip(failures),
+        (Err(failures), OnUnavailable::Fail) => Outcome::Fail(failures),
+    }
+}
+
+/// A pull's result: the reference to use, or every attempt's failure.
+type Pulled = Result<String, Vec<String>>;
+
+/// One pull per image per test binary, success or failure: parallel tests
+/// wait for the first pull instead of racing their own, and a binary of a
+/// dozen tests does not re-run the whole bounded retry chain a dozen times
+/// once the registry has already said no.
+fn pulled(image: &str) -> Pulled {
+    static PULLED: OnceLock<Mutex<HashMap<String, Pulled>>> = OnceLock::new();
+    // Held across the pull on purpose (see above).
+    let mut pulled = PULLED
         .get_or_init(Mutex::default)
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    if let Some(reference) = resolved.get(image) {
-        return reference.clone();
+    pulled
+        .entry(image.to_string())
+        .or_insert_with(|| Puller::from_env().pull(image))
+        .clone()
+}
+
+fn summary_path() -> Option<PathBuf> {
+    std::env::var_os("GITHUB_STEP_SUMMARY").map(PathBuf::from)
+}
+
+/// Returns the reference to pass to `docker` for the Docker Hub image `image`,
+/// pulling it if it is not already local. Panics, naming the failure as
+/// infrastructure, when neither the mirror nor Docker Hub can serve it.
+///
+/// A test that may be skipped when the image is unavailable guards itself
+/// with [`available`] first; this function never skips.
+pub fn resolve(image: &str) -> String {
+    pulled(image).unwrap_or_else(|failures| {
+        panic!("{}", report_infrastructure_failure(image, &failures, summary_path().as_deref()))
+    })
+}
+
+/// True when `image` can be pulled, so the calling test should run.
+///
+/// When every pull path failed (rate limit, network, 5xx), the outcome
+/// follows [`on_unavailable`]: on a pull request this reports the skip — a
+/// `::warning::image-unavailable <ref>` annotation and a job-summary line
+/// naming the test — and returns false, so the test returns early and passes;
+/// everywhere else it panics as an infrastructure failure, as before.
+///
+/// ```ignore
+/// if !hub_image::available(CLICKHOUSE_IMAGE) {
+///     return;
+/// }
+/// ```
+pub fn available(image: &str) -> bool {
+    match outcome(pulled(image), on_unavailable(|name| std::env::var(name).ok())) {
+        Outcome::Use(_) => true,
+        Outcome::Skip(failures) => {
+            let test = std::thread::current()
+                .name()
+                .unwrap_or("<unnamed test>")
+                .to_string();
+            report_skip(image, &test, &failures, summary_path().as_deref());
+            false
+        }
+        Outcome::Fail(failures) => {
+            panic!("{}", report_infrastructure_failure(image, &failures, summary_path().as_deref()))
+        }
     }
-    let reference = Puller::from_env().pull(image).unwrap_or_else(|failures| {
-        let summary = std::env::var_os("GITHUB_STEP_SUMMARY").map(PathBuf::from);
-        panic!("{}", report_infrastructure_failure(image, &failures, summary.as_deref()))
-    });
-    resolved.insert(image.to_string(), reference.clone());
-    reference
+}
+
+/// Reports one skipped test: a greppable warning annotation on stderr, the
+/// failures behind it, and a line in the job summary when CI provides one, so
+/// a reviewer can count the tests that did not run. Returns the annotation.
+///
+/// Written to the stderr handle directly, not through `eprintln!`, so the
+/// test harness's output capture cannot swallow it on a passing test.
+pub fn report_skip(image: &str, test: &str, failures: &[String], summary: Option<&Path>) -> String {
+    let annotation = format!(
+        "::warning title=Image unavailable: test skipped::image-unavailable {image} \
+         (skipped {test}; every pull path failed, so this run did not exercise it)"
+    );
+    let mut stderr = std::io::stderr().lock();
+    let _ = writeln!(stderr, "{annotation}");
+    for failure in failures {
+        let _ = writeln!(stderr, "hub_image:   {failure}");
+    }
+    if let Some(path) = summary {
+        if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(path) {
+            let _ = writeln!(
+                file,
+                "- :warning: **SKIPPED** `{test}`: image-unavailable `{image}` \
+                 (registry outage on a pull request; `main` still fails on this)"
+            );
+        }
+    }
+    annotation
 }
 
 /// Reports an exhausted pull as infrastructure — in the job summary when CI

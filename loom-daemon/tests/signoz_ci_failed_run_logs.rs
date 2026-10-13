@@ -257,6 +257,9 @@ fn job_row(rows: &[Row], job_id: i64) -> &Row {
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn the_whole_committed_file_executes_on_the_pinned_engine() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
     let script = format!("{FIXTURE}\n{CYCLE_TIME_EXTRACT}\n{CI_QUERIES}");
     let out = clickhouse(&script, REPO);
     assert!(
@@ -284,6 +287,9 @@ fn the_whole_committed_file_executes_on_the_pinned_engine() {
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn a_captured_log_is_reported_chunk_by_chunk() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
     let rows = section_five_rows();
 
     let complete = job_row(&rows, 70001);
@@ -324,6 +330,9 @@ fn a_captured_log_is_reported_chunk_by_chunk() {
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn a_replayed_chunk_does_not_inflate_the_captured_count() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
     assert_eq!(num(job_row(&section_five_rows(), 70001), "chunks_present"), Some(3));
 
     let naive = run(
@@ -347,6 +356,9 @@ fn a_replayed_chunk_does_not_inflate_the_captured_count() {
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn a_replayed_run_record_does_not_fan_out_its_jobs() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
     assert_eq!(section_five_rows().len(), 5);
 
     let fanned = run(&mutated("LIMIT 1 BY repo, run_id, run_attempt", ""), REPO);
@@ -380,6 +392,9 @@ fn a_replayed_run_record_does_not_fan_out_its_jobs() {
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn the_two_absences_are_distinguishable() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
     let rows = section_five_rows();
 
     let log_missing = job_row(&rows, 70003);
@@ -445,6 +460,9 @@ fn the_two_absences_are_distinguishable() {
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn only_log_chunk_records_feed_the_chunk_counts() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
     let loosened = run(
         &mutated(
             "WHERE mapContains(attributes_number, 'loom.ci.chunk_index')\n      AND timestamp",
@@ -480,6 +498,9 @@ fn only_log_chunk_records_feed_the_chunk_counts() {
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn the_attempt_join_uses_the_key_each_record_kind_actually_emits() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
     let rows = section_five_rows();
     assert!(
         !rows.iter().any(|r| num(r, "job_id") == Some(70020)),
@@ -520,6 +541,9 @@ fn the_attempt_join_uses_the_key_each_record_kind_actually_emits() {
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn another_repositorys_chunks_do_not_count_toward_this_job() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
     assert_eq!(num(job_row(&section_five_rows(), 70001), "chunk_count"), Some(3));
 
     let leaky = run(
@@ -553,6 +577,9 @@ fn another_repositorys_chunks_do_not_count_toward_this_job() {
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn since_and_repo_bind_the_result() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
     let scoped = section_five_rows();
     assert!(
         !scoped.iter().any(|r| num(r, "run_id") == Some(8000)),
@@ -593,6 +620,9 @@ fn since_and_repo_bind_the_result() {
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn only_non_successful_jobs_are_listed() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
     let rows = section_five_rows();
     let listed: Vec<i64> = rows.iter().filter_map(|r| num(r, "job_id")).collect();
     assert_eq!(
@@ -763,6 +793,9 @@ fn section_eighteen_rows(sql: &str) -> Vec<Row> {
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn section_eighteen_separates_superseded_from_started_cancellations() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
     let rows = section_eighteen_rows(&section_eighteen());
     assert_eq!(rows.len(), 1, "one row for {MAIN_REPO}/CI: {rows:?}");
     let r = &rows[0];
@@ -791,6 +824,9 @@ fn section_eighteen_separates_superseded_from_started_cancellations() {
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn section_eighteen_keeps_jobs_stamped_just_before_since() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
     // SINCE (2026-09-20 00:00:00 UTC) is 1789862400; the run lands 1 min
     // after it, its job 1 h before it.
     let edge = format!(
@@ -823,6 +859,9 @@ fn section_eighteen_keeps_jobs_stamped_just_before_since() {
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn section_eighteen_joins_on_the_run_attempt() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
     let sql = section_eighteen();
     let from = " AND j.run_attempt = r.run_attempt";
     assert!(sql.contains(from), "section 18 no longer joins on the run attempt");
