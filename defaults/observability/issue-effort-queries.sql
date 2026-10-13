@@ -7,12 +7,12 @@
 -- SQLite dialect, `json_extract` / `json_each`. This is deliberately NOT the
 -- ClickHouse `loom_analytics.*` rollup the CT queries read, and deliberately
 -- NOT #9446's `sweep_facts` rollup (`defaults/observability/sweep-facts/`):
--- that rollup flattens `rework_events` into two per-classification COUNTS and
--- discards each event's `kind` and `duration_sec`, so every duration-level
--- question below (IE1, IE2, IE4) is unanswerable from it. The lineage fields
--- these need live on the raw `records` payload, so that is what is read here;
--- the two layers are complementary — `sweep_facts` answers "how many", this
--- file answers "how much, and which failure mode".
+-- that rollup flattens `rework_events` into per-classification counts and
+-- measured seconds (#9507) and discards each event's `kind`, so the per-kind
+-- question (IE4) is unanswerable from it. The lineage fields these need live on
+-- the raw `records` payload, so that is what is read here. IE1's split IS
+-- carried by the bundle since #9507 (`sweep-facts/issue-effort.sql`), using
+-- IE1's arithmetic and trigger → bucket table — see TWIN at IE1.
 --
 -- WHY THIS EXISTS. An issue's cost is not one number. Some of it is the work;
 -- some of it is a reviewer finding the work wanting (so the issue is HARD);
@@ -61,8 +61,9 @@
 -- Either mistake answers "this fleet has no rework" from a store full of it.
 --
 -- READ IE5 FIRST. Every number below is a share of the attempts this
--- classification can attribute. `operator_redispatch` and `unknown` triggers,
--- and every pre-#9444 record (no `trigger` key at all), land in
+-- classification can attribute. `redispatch_after_success`,
+-- `operator_redispatch` and `unknown` triggers, and every pre-#9444 record (no
+-- `trigger` key at all), land in
 -- `unattributed_sec` and are never silently folded into a rework bucket. If
 -- IE5 says coverage is low for your window, IE1..IE4 are describing a
 -- minority of the cost.
@@ -81,6 +82,11 @@
 -- An attempt with `trigger = 'first'` contributes its residual to `clean_sec`;
 -- that is the only source of clean time, which is why a first attempt riddled
 -- with conflicts still reports most of itself as environmental.
+--
+-- TWIN: `attempt_bucket` below is copied into `sweep-facts/issue-effort.sql`'s
+-- `charged` CTE (the bundle's seconds partition, #9507). Do not edit one
+-- without the other: `loom-daemon/tests/sweep_facts_artifacts.rs`
+-- (`the_bundle_buckets_triggers_exactly_as_ie1_does`) fails if they disagree.
 -- ---------------------------------------------------------------------------
 WITH attempt AS (
     SELECT
@@ -122,7 +128,7 @@ WITH attempt AS (
             WHEN 'ci_failure_fix'                  THEN 'environmental'
             WHEN 'rebase_main_moved'               THEN 'environmental'
             WHEN 'first'                           THEN 'clean'
-            ELSE 'unattributed'   -- operator_redispatch, unknown, absent
+            ELSE 'unattributed'   -- redispatch_after_success, operator_redispatch, unknown, absent
         END                                                           AS attempt_bucket
       FROM records r
      WHERE r.kind = 'sweep.outcome'
@@ -266,8 +272,10 @@ SELECT
 -- attribute. `attributed_pct` is the denominator every other number here is a
 -- share of. The three unattributed populations are reported separately because
 -- they need different fixes: `no_trigger` is retention/rollout (pre-#9444
--- records aging out), `operator_redispatch` is a dispatch-source plumb this
--- daemon does not have, and `unknown` is a real measurement gap to drive down.
+-- records aging out), `redispatch_after_success` is a re-dispatch of work
+-- that had already succeeded (#11429; called `operator_redispatch` before it),
+-- `operator_redispatch` is a dispatch-source plumb this daemon does not have,
+-- and `unknown` is a real measurement gap to drive down.
 -- ---------------------------------------------------------------------------
 SELECT
     COUNT(*)                                                             AS attempts,
@@ -275,6 +283,8 @@ SELECT
              THEN 1 ELSE 0 END)                                          AS no_trigger,
     SUM(CASE WHEN json_extract(payload, '$.trigger') = 'operator_redispatch'
              THEN 1 ELSE 0 END)                                          AS operator_redispatch,
+    SUM(CASE WHEN json_extract(payload, '$.trigger') = 'redispatch_after_success'
+             THEN 1 ELSE 0 END)                                          AS redispatch_after_success,
     SUM(CASE WHEN json_extract(payload, '$.trigger') = 'unknown'
              THEN 1 ELSE 0 END)                                          AS unknown_trigger,
     SUM(CASE WHEN json_extract(payload, '$.rework_events') IS NULL
@@ -283,7 +293,8 @@ SELECT
              THEN 1 ELSE 0 END)                                          AS no_attempt_index,
     ROUND(100.0 * SUM(CASE WHEN json_extract(payload, '$.trigger') IS NOT NULL
                             AND json_extract(payload, '$.trigger') NOT IN
-                                ('operator_redispatch', 'unknown')
+                                ('redispatch_after_success',
+                                 'operator_redispatch', 'unknown')
                            THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0), 1)  AS attributed_pct
   FROM records
  WHERE kind = 'sweep.outcome'

@@ -396,7 +396,8 @@ pub fn measure(workspace_root: &Path) -> HostMeasurements {
     // daemon's registered global, since a one-shot `calibrate` invocation runs
     // in a separate process that never sees that state.
     let brake_config = crate::admission_brake::resolve_config_for(workspace_root);
-    let brake_decision = crate::admission_brake::decide(&brake_config, loadavg_1m, logical_cpus);
+    let brake_decision =
+        crate::admission_brake::decide(&brake_config, loadavg_1m, logical_cpus, cpu_idle_fraction);
 
     // Role-runner agent budget (#6102) — read from the same root's config as
     // every other knob above.

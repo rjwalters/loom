@@ -55,6 +55,8 @@ pub enum BillingClass {
     Ok,
     NotModified,
     RateLimited,
+    /// A secondary (burst) limit (#11418).
+    SecondaryLimited,
     Error,
     NotSent,
 }
@@ -66,16 +68,18 @@ impl BillingClass {
             Self::Ok => "ok",
             Self::NotModified => "not_modified",
             Self::RateLimited => "rate_limited",
+            Self::SecondaryLimited => "secondary_limited",
             Self::Error => "error",
             Self::NotSent => "not_sent",
         }
     }
 
     /// Every value, for vocabulary tests and docs.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Ok,
         Self::NotModified,
         Self::RateLimited,
+        Self::SecondaryLimited,
         Self::Error,
         Self::NotSent,
     ];
@@ -87,6 +91,7 @@ impl From<Outcome> for BillingClass {
             Outcome::Ok => Self::Ok,
             Outcome::NotModified => Self::NotModified,
             Outcome::RateLimited => Self::RateLimited,
+            Outcome::SecondaryLimited => Self::SecondaryLimited,
             Outcome::Error => Self::Error,
             Outcome::Shed => Self::NotSent,
         }

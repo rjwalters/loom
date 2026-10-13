@@ -71,6 +71,8 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.dispatch.dispatched",
     "loom.dispatch.errors",
     "loom.dispatch.max_concurrent",
+    // #11649: a held tick's distinct halt causes, comma-joined.
+    "loom.dispatch.halt_causes",
     // ---- Telemetry mega PR A (Issues #8908, #8931) ----------------------
     // `loom.runtime.usage` (#8908): one execution's exact token breakdown.
     "loom.tokens.input",
@@ -160,6 +162,18 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.egress.ttft_ms",
     "loom.egress.error_code",
     "loom.egress.stream",
+    // `guard.cargo_target_dir.denied` spans (#11582): the forbidden root by
+    // name (`/tmp`, `$TMPDIR`, `~/.cache`, `~`, `.loom/target-*`) and where the
+    // value came from. Never the path or the command.
+    "loom.guard.root",
+    "loom.guard.source",
+    // `build_gate.run` spans (#11690): one host-side run of
+    // `buildGate.command` — stage, tier, outcome, duration and attempt.
+    "loom.build_gate.stage",
+    "loom.build_gate.tier",
+    "loom.build_gate.outcome",
+    "loom.build_gate.duration_ms",
+    "loom.build_gate.attempt",
 ];
 
 /// Longest label value kept, in bytes.

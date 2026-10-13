@@ -3,9 +3,13 @@
 //! file-size ratchet (`scripts/check-file-size-budget.sh`). Content is
 //! unchanged apart from dedenting and the new-module additions.
 
+use opentelemetry_proto::tonic::logs::v1::SeverityNumber;
+use opentelemetry_proto::tonic::resource::v1::Resource;
+
 use super::*;
 
 mod fact_id;
+mod fleet_provenance;
 mod host_name;
 mod loom_kind;
 mod record_id;
@@ -143,13 +147,14 @@ fn sweep_outcome_envelope() -> TelemetryEnvelope {
             models_used: None,
             doctor_cycles: None,
             judge_verdicts: None,
-            complexity: None,
             tokens_status: None,
             tokens_status_reason: None,
             no_phase_cause: None,
+            phase_tap_usage: Vec::new(),
             attempt_index: None,
             previous_sweep_id: None,
             trigger: None,
+            dispatch_origin: None,
             rework_events: None,
             pr_numbers: None,
             hw_lines_added: None,
@@ -602,6 +607,7 @@ fn otlp_export_state_rides_a_state_labelled_gauge() {
     let exempt = gauge_for(Some(OtlpExportHealth {
         state: OtlpExportState::Exempt,
         detail: Some("air-gapped lab".into()),
+        since: None,
     }))
     .unwrap();
     assert_eq!(attr(&exempt, "state").as_deref(), Some("exempt"));
@@ -610,6 +616,7 @@ fn otlp_export_state_rides_a_state_labelled_gauge() {
     let failing = gauge_for(Some(OtlpExportHealth {
         state: OtlpExportState::Failing,
         detail: Some("no ack for 20m".into()),
+        since: None,
     }))
     .unwrap();
     assert_eq!(attr(&failing, "state").as_deref(), Some("failing"));

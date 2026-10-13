@@ -3,7 +3,7 @@
 
 use chrono::{DateTime, TimeZone, Utc};
 
-use super::{api_key_accounts_in, PoolAccount, QuotaState};
+use super::{api_key_accounts_in, merge_pool, PoolAccount, QuotaState};
 use crate::telemetry::ops::{MetricName, MetricPoint, MetricValue};
 
 fn at(secs: i64) -> DateTime<Utc> {
@@ -295,4 +295,18 @@ fn a_failed_api_key_pool_read_carries_the_previous_accounts_forward() {
     let carried = state.api_key_pool(None);
     let second = state.pool_points(&carried, at(300));
     assert!(find(&second, MetricName::PoolExhaustions, &[]).is_none());
+}
+
+#[test]
+fn merging_a_snapshot_seat_keeps_the_pool_eligibility_restriction() {
+    // The quota read succeeded (usable), but the pool could not verify the
+    // seat's eligibility state (malformed): the merged row must not be usable.
+    let mut accounts = vec![account("zai", "z1", true, false)];
+    let mut pooled = account("zai", "z1", false, false);
+    pooled.plan_token_limit = Some(100);
+    merge_pool(&mut accounts, vec![pooled, account("zai", "z2", true, false)]);
+    assert_eq!(accounts.len(), 2);
+    assert!(!accounts[0].usable);
+    assert!(!accounts[0].exhausted);
+    assert_eq!(accounts[0].plan_token_limit, Some(100));
 }

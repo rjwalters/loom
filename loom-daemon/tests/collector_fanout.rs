@@ -1,5 +1,8 @@
 //! Opt-in real Collector contract: cargo test -p loom-daemon --test collector_fanout -- --ignored --nocapture
 //! Needs Docker, curl and the pinned image. Owns uniquely named containers/network.
+#[path = "common/hub_image.rs"]
+mod hub_image;
+
 use std::{
     fs,
     io::Write,
@@ -128,7 +131,7 @@ impl Trial {
             &format!("{}:/run/secrets:ro", self.dir.path().display()),
             "-v",
             &format!("{}:/var/lib/otelcol", data.display()),
-            IMAGE,
+            &hub_image::resolve(IMAGE),
             "--config=/etc/config.yaml",
         ]);
         name

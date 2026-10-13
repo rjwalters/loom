@@ -56,6 +56,8 @@ pub enum CallOutcome {
     Ok,
     NotModified,
     RateLimited,
+    /// A secondary (burst) limit (#11418).
+    SecondaryLimited,
     Error,
     /// Refused before it was sent by a budget gate (reserved: no producer
     /// yet; the per-bucket gate records it).
@@ -69,6 +71,7 @@ impl CallOutcome {
             Self::Ok => "ok",
             Self::NotModified => "not_modified",
             Self::RateLimited => "rate_limited",
+            Self::SecondaryLimited => "secondary_limited",
             Self::Error => "error",
             Self::Shed => "shed",
         }
@@ -298,6 +301,7 @@ mod tests {
             CallOutcome::Ok,
             CallOutcome::NotModified,
             CallOutcome::RateLimited,
+            CallOutcome::SecondaryLimited,
             CallOutcome::Error,
             CallOutcome::Shed,
         ];

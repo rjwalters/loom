@@ -89,6 +89,62 @@ fn the_merge_sequence_plan_reads_changed_files_over_rest_only() {
     assert_eq!(groups, vec![vec![1, 2]], "{report:?}");
 }
 
+/// #9771: a suppressed edge is counted exactly once — `already_planned` when
+/// the follower's trusted marker states the very order the planner produced
+/// (whatever plan id it carries), `skipped_held` otherwise — and is absent
+/// from `groups`, which is what `sequence-plan` prints as "would apply".
+#[test]
+#[serial]
+fn the_plan_counts_each_suppressed_edge_once() {
+    const OTHER: &str = "1111111111111111111111111111111111111111";
+    let marker = |pred_head: &str| {
+        format!("<!-- loom:sequence after=1 pred_head={pred_head} follower_head={SHA} plan=old -->")
+    };
+    // (follower labels, its marker, already_planned, skipped_held)
+    let cases = [
+        (&[][..], None, 0, 0),
+        (&[merge_sequence::SEQUENCE_LABEL][..], Some(marker(SHA)), 1, 0),
+        (&[merge_sequence::SEQUENCE_LABEL][..], Some(marker(OTHER)), 0, 1),
+        (&[merge_sequence::SEQUENCE_LABEL][..], None, 0, 1),
+    ];
+    for (labels, marker, already_planned, skipped_held) in cases {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        // PR 1 is approved: only a ready predecessor is ever sequenced behind.
+        let seq_row = |n: u32, labels: &[&str]| {
+            row(n, labels)
+                .sha(SHA)
+                .created(&format!("2026-10-0{n}T00:00:00Z"))
+                .updated("2026-10-03T00:00:00Z")
+        };
+        let comments = marker.as_ref().map_or_else(String::new, |m| {
+            format!(
+                "case \"$*\" in *'issues/2/comments'*) echo '[{{\"body\":\"{m}\",\
+                 \"author_association\":\"OWNER\",\"user\":{{\"login\":\"op\",\"type\":\"User\"}}}}]'; \
+                 exit 0 ;; esac\n"
+            )
+        });
+        let pulls = pulls_arm(&[
+            seq_row(3, &[]),
+            seq_row(2, labels),
+            seq_row(1, &["loom:pr"]),
+        ]);
+        let (gh, _log) = fake_gh(dir.path(), &format!("{comments}{pulls}"), "exit 1");
+        let report = merge_sequence::plan_report(&gh, &root).unwrap();
+        let case = format!("labels={labels:?} marker={marker:?}: {report:?}");
+        assert_eq!(report.groups.len(), 1, "{case}");
+        assert_eq!(report.already_planned, already_planned, "{case}");
+        assert_eq!(report.skipped_held, skipped_held, "{case}");
+        let written = report.groups[0]
+            .edges
+            .iter()
+            .filter(|e| e.follower == 2)
+            .count();
+        assert_eq!(written + already_planned + skipped_held, 1, "{case}");
+    }
+}
+
 /// Seed issue `issue`'s checkpoint at `curator-done`, long past the grace.
 fn seed_curator_done(root: &Path, issue: u32) {
     let dir = root.join(".loom").join("sweep-checkpoint");

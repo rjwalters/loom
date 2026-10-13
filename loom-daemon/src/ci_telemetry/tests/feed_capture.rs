@@ -16,6 +16,7 @@ use crate::ci_telemetry::feed::{
     feed_is_live, resolve_floor_interval_secs_with_env, spawn_bridge, Action, Driver,
     DEFAULT_FEED_FLOOR_INTERVAL_SECS, FEED_FLOOR_INTERVAL_SECS_ENV, MAX_FEED_FLOOR_INTERVAL_SECS,
 };
+use crate::ci_telemetry::ledger::SEEN_RETENTION_DAYS;
 use crate::ci_telemetry::poll::targeted::record_runs;
 use crate::event_bus::EventBus;
 use crate::forge_events::keys::RunKey;
@@ -348,4 +349,80 @@ fn health_staleness_follows_the_recorded_sweep_cadence() {
         ..status
     };
     assert!(matches!(classify_health(&floored, t, 120), Health::Ok { .. }));
+}
+
+// ---------------------------------------------------------------------------
+// #11159: the feed path honours the ledger's retention boundary
+// ---------------------------------------------------------------------------
+
+const BETA: &str = "fixture-org/beta";
+
+fn single_run_created_at(api: &FixtureApi, repo: &str, run_id: u64) -> DateTime<Utc> {
+    let responses = api.responses.lock().unwrap();
+    responses[&format!("repos/{repo}/actions/runs/{run_id}")]["body"]["created_at"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+/// Append a `watermark` line for `repo`, as a sweep that advanced it would.
+fn advance_watermark(root: &Path, repo: &str, to: DateTime<Utc>) {
+    let line = format!(
+        "{{\"type\":\"watermark\",\"repo\":\"{repo}\",\"created_at\":\"{}\"}}\n",
+        to.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    );
+    crate::ci_telemetry::ledger::append_durable(
+        &state_dir(root).join("seen.jsonl"),
+        line.as_bytes(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_hint_for_a_run_past_the_ledgers_retention_is_refused_not_re_emitted() {
+    let dir = TempDir::new().unwrap();
+    let api = api_with_single_runs();
+    let keys = [key(BETA, 2002)];
+    let first = record_runs(&ctx_with_logs(dir.path()), &api, &keys).unwrap();
+    assert_eq!(first.recorded, 1, "{:?}", first.dropped);
+    let emitted = journal(dir.path()).len();
+
+    // The sweep moves the repo's watermark far past retention; compaction
+    // then drops the run's and jobs' keys, and a reopen no longer sees them.
+    let path = state_dir(dir.path()).join("seen.jsonl");
+    advance_watermark(dir.path(), BETA, Utc::now() + Duration::days(SEEN_RETENTION_DAYS + 15));
+    let mut ledger = Ledger::open(path.clone()).unwrap();
+    assert!(ledger.compact_if_large(0).unwrap(), "compaction must have run");
+    drop(ledger);
+    let reopened = Ledger::open(path).unwrap();
+    assert!(!reopened.is_seen(&UnitKey::run(BETA, 2002, 1)), "the key expired");
+    drop(reopened);
+
+    // The same completed run is hinted again (the feed may over-report).
+    let requests_before = api.requests().len();
+    let again = record_runs(&ctx_with_logs(dir.path()), &api, &keys).unwrap();
+    assert_eq!((again.recorded, again.already_seen), (0, 0));
+    assert_eq!(again.dropped.len(), 1, "{:?}", again.dropped);
+    assert!(again.dropped[0].contains("retention window"), "{:?}", again.dropped);
+    assert_eq!(
+        api.requests().len(),
+        requests_before + 1,
+        "only the run fetch: no jobs, no logs"
+    );
+    assert_eq!(journal(dir.path()).len(), emitted, "no run, job, artifact or log re-emitted");
+    assert_no_duplicates(dir.path());
+}
+
+#[test]
+fn a_recent_run_is_still_recorded_when_the_watermark_is_ahead_but_inside_retention() {
+    let dir = TempDir::new().unwrap();
+    let api = api_with_single_runs();
+    let created = single_run_created_at(&api, BETA, 2002);
+    // A watermark well ahead of the run, but within the retention window: a
+    // legitimate not-yet-recorded (or re-run) run must still be captured.
+    advance_watermark(dir.path(), BETA, created + Duration::days(SEEN_RETENTION_DAYS - 5));
+    let report = record_runs(&ctx(dir.path()), &api, &[key(BETA, 2002)]).unwrap();
+    assert_eq!(report.recorded, 1, "{:?}", report.dropped);
+    assert_eq!(recorded_run_ids(dir.path()), vec![2002]);
 }

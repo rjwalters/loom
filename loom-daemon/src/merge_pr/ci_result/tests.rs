@@ -159,3 +159,33 @@ fn no_ci_workflow_is_a_separate_policy_from_cannot_inspect() {
     let v = assess("1", "abc", &empty, || Ok(disabled), |_| unreachable!());
     assert!(matches!(v, Verdict::Unverified(_)), "{v:?}");
 }
+
+// #11330: the refusal ends in a parseable classification line so a driver can
+// choose `gh run rerun --failed <id>` without scraping prose.
+#[test]
+fn refusal_carries_the_ci_result_failed_token() {
+    let v = assess("10403", "abc", &runs("failure", "completed"), with_ci, |_| {
+        Ok(json!({"jobs": [
+            {"name": "Detect Changes", "conclusion": "cancelled"},
+            {"name": "Rust Unit Tests (1/4)", "conclusion": "failure"},
+            {"name": "Structural Checks", "conclusion": "success"}
+        ]}))
+    });
+    let Verdict::Refuse(m) = v else {
+        panic!("{v:?}")
+    };
+    assert!(m.starts_with("Merge blocked:"), "{m}");
+    assert_eq!(
+        m.lines().last(),
+        Some("LOOM-CI-RESULT-FAILED run=2 jobs=Detect Changes,Rust Unit Tests (1/4)")
+    );
+}
+
+#[test]
+fn ci_result_failed_token_without_listable_jobs() {
+    let v = assess("1", "abc", &runs("cancelled", "completed"), with_ci, |_| Err("boom".into()));
+    let Verdict::Refuse(m) = v else {
+        panic!("{v:?}")
+    };
+    assert_eq!(m.lines().last(), Some("LOOM-CI-RESULT-FAILED run=2 jobs=-"));
+}

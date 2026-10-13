@@ -11,8 +11,9 @@ fn issue(n: u32, created_at: &str, extra: &[&str]) -> WorkItem {
     WorkItem::with_created_at(n, labels, Some(created_at.to_string()))
 }
 
-/// Three workspaces: 0 is a tool repo (priority 0, weight 1000), 1 and 2 are
-/// product repos (priority 10, weight 90; priority 100, weight 9).
+/// Three workspaces: 0 is a tool repo (priority 0, weight 1,000,000), 1 and 2
+/// are product repos (priority 10, weight 882,497; priority 100, weight
+/// 286,505) — the softmax at the default T = 80 (#11684).
 fn fleet() -> Vec<(FakeSource, RecordingDispatcher)> {
     vec![
         (
@@ -63,8 +64,8 @@ fn a_fixed_seed_reproduces_the_exact_dispatch_sequence() {
     let sequence = dispatch_sequence(&report);
     assert_eq!(
         sequence,
-        vec![(0, 1), (0, 2), (0, 3), (1, 10), (1, 11), (2, 20)],
-        "the pinned draw sequence for seed 7"
+        vec![(0, 1), (1, 10), (1, 11), (0, 2), (0, 3), (2, 20)],
+        "the pinned draw sequence for seed 7 (re-pinned for the #11684 softmax)"
     );
     assert_eq!(dispatch_sequence(&run()), sequence, "same seed, same sequence");
     assert_eq!(report.plan_order, sequence, "the published plan is the draw order");
@@ -80,8 +81,9 @@ fn a_fixed_seed_reproduces_the_exact_dispatch_sequence() {
     assert_eq!(picks, sequence);
     let first = &log.steps[0].draw;
     let weights: Vec<u64> = first.candidates.iter().map(|c| c.weight).collect();
-    assert_eq!(weights, vec![1000, 90, 9]);
-    assert_eq!(first.total_weight, 1099);
+    assert_eq!(weights, vec![1_000_000, 882_497, 286_505]);
+    assert_eq!(first.total_weight, 2_169_002);
+    assert_eq!((first.temperature, first.p_min), (80, 0));
     assert!(first.roll < first.total_weight);
 }
 
@@ -97,7 +99,7 @@ fn some_seed_serves_a_lower_priority_workspace_first() {
     };
     let firsts: std::collections::BTreeSet<usize> = (0..300).map(|s| first_pick(s).0).collect();
     assert!(firsts.contains(&0));
-    assert!(firsts.contains(&1), "weight 90 of 1099 wins some draws: {firsts:?}");
+    assert!(firsts.contains(&1), "weight 882,497 of 2,169,002 wins some draws: {firsts:?}");
 }
 
 /// ACCEPTANCE (#11103): a workspace with dispatchable `loom:very-important`
@@ -127,11 +129,11 @@ fn an_idle_tick_records_no_draw() {
     assert!(report.workspace_draw.is_none());
 }
 
-/// A `loom:very-important` issue shares the star's cap rules (#11103): when
-/// the global cap is full it may take the host's single overflow slot, and a
-/// second one waits; plain work never does. Both tick paths.
+/// #11508 (operator ruling): `loom:very-important` changes order, never
+/// admission. With the global cap full it waits like plain work; nothing
+/// takes an overflow slot. Both tick paths.
 #[test]
-fn very_important_takes_the_single_overflow_slot_over_the_cap() {
+fn very_important_never_goes_over_the_cap() {
     let vi = |n| issue(n, "2026-01-01T00:00:00Z", &[VERY_IMPORTANT_LABEL]);
     let full = || RecordingDispatcher {
         in_flight: (1000..1002).collect(),
@@ -142,13 +144,13 @@ fn very_important_takes_the_single_overflow_slot_over_the_cap() {
         full(),
     )];
     let report = tick_multi(&mut multi, &[100], 2, &[false]);
-    assert_eq!((report.dispatched, report.dispatched_overflow), (1, 1));
-    assert_eq!(multi[0].1.dispatched_overflow, vec![1]);
-    assert_eq!(report.deferred_capacity, 2, "second very-important and the plain one wait");
+    assert_eq!((report.dispatched, report.dispatched_overflow), (0, 0));
+    assert!(multi[0].1.dispatched_overflow.is_empty());
+    assert_eq!(report.deferred_capacity, 3, "every candidate waits for capacity");
 
     let mut dispatcher = full();
     let src = &mut FakeSource::once(vec![vi(1), vi(2), issue(3, "2026-01-01T00:00:00Z", &[])]);
     let report = tick(src, &mut dispatcher, 2, false).unwrap();
-    assert_eq!((report.dispatched_overflow, report.deferred_capacity), (1, 2));
-    assert_eq!(dispatcher.dispatched_overflow, vec![1]);
+    assert_eq!((report.dispatched_overflow, report.deferred_capacity), (0, 3));
+    assert!(dispatcher.dispatched_overflow.is_empty());
 }

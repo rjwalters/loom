@@ -24,6 +24,9 @@
 //! disagreement.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "common/hub_image.rs"]
+mod hub_image;
+
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -36,14 +39,18 @@ const FIXTURE: &str = include_str!("fixtures/signoz_replay/fleet_state.sql");
 const AGREEMENT_FIXTURE: &str = include_str!("fixtures/signoz_replay/agreement.sql");
 const T: &str = "2026-10-04 13:00:00";
 const WINDOW: &str = "3900";
+/// The ALTER instant the fixtures assume: before every fixture record.
+const SINCE: &str = "2026-01-01 00:00:00";
 
 /// Queries 1-3 read the instant t only (span 0).
-const AT_T: [(&str, &str); 5] = [
+const AT_T: [(&str, &str); 6] = [
     ("t", T),
     ("window", WINDOW),
     ("repo", ""),
     ("span", "0"),
     ("step", "300"),
+    // The knowable-at column is real from before every fixture record.
+    ("knowable_since", SINCE),
 ];
 
 const PREFIX_BEGIN: &str = "-- >>> replay-prefix";
@@ -54,13 +61,14 @@ const AGREEMENT_END: &str = "-- <<< agreement-prefix";
 type Row = BTreeMap<String, serde_json::Value>;
 
 fn clickhouse(script: &str, params: &[(&str, &str)]) -> String {
+    let image = hub_image::resolve(CLICKHOUSE_IMAGE);
     let mut args: Vec<String> = [
         "run",
         "--rm",
         "-i",
         "--entrypoint",
         "clickhouse",
-        CLICKHOUSE_IMAGE,
+        image.as_str(),
         "local",
         "--multiquery",
         "--format=JSONEachRow",
@@ -295,6 +303,7 @@ fn the_agreement_report_has_one_row_per_host_and_only_covered_hosts_disagree() {
         ("span", "3600"),
         ("step", "300"),
         ("threshold", "600"),
+        ("knowable_since", SINCE),
     ];
     let sections = run_on(AGREEMENT_FIXTURE, &queries_6_and_7(QUERIES), &params);
     let (runs, report) = (&sections[0], &sections[1]);
@@ -366,4 +375,45 @@ fn the_agreement_report_has_one_row_per_host_and_only_covered_hosts_disagree() {
     assert_eq!(text(&runs[1], "last_at"), "2026-10-04 12:40:00.000");
     assert_eq!(text(&runs[1], "forge_since"), "2026-10-04 12:34:00.000");
     assert_eq!(runs[1]["forge_stages"], serde_json::json!(["doctor", "merge_wait"]));
+}
+
+/// An instant before the knowable-at column existed is unknown, with its own
+/// reason: nothing is rebuilt from the producer's `observed_timestamp`, and
+/// the fixture's records (all knowable before `t`) contribute no state.
+#[test]
+#[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
+fn an_instant_before_the_knowable_at_column_existed_is_no_knowable_at() {
+    let early = [
+        ("t", T),
+        ("window", WINDOW),
+        ("repo", ""),
+        ("span", "0"),
+        ("step", "300"),
+        ("knowable_since", "2026-10-04 13:30:00"),
+    ];
+    let sections = run_on(FIXTURE, &queries_1_to_3(QUERIES), &early);
+    let (state, coverage) = (&sections[0], &sections[2]);
+    assert!(state.is_empty(), "state rebuilt before the column existed: {state:?}");
+    assert_eq!(coverage.len(), 9, "{coverage:?}");
+    for row in coverage {
+        assert_eq!(text(row, "state"), "no_knowable_at", "{row:?}");
+        assert_eq!(num(row, "covered"), 0, "{row:?}");
+    }
+
+    // The agreement report: instants before `knowable_since` (12:00 .. 12:25)
+    // are not covered, with that reason; later ones still are.
+    let mid = [
+        ("t", T),
+        ("window", WINDOW),
+        ("repo", ""),
+        ("span", "3600"),
+        ("step", "300"),
+        ("threshold", "600"),
+        ("knowable_since", "2026-10-04 12:30:00"),
+    ];
+    let sections = run_on(AGREEMENT_FIXTURE, &queries_6_and_7(QUERIES), &mid);
+    let agree = host(&sections[1], "h-agree");
+    assert_eq!(num(agree, "samples"), 13, "{agree:?}");
+    assert_eq!(num(agree, "covered_samples"), 7, "{agree:?}");
+    assert_eq!(agree["uncovered_states"], serde_json::json!(["no_knowable_at"]), "{agree:?}");
 }

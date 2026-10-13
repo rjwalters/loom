@@ -1,48 +1,16 @@
 use super::*;
 
-/// #6243 AC: work-conservation — when this host's slice has ZERO
-/// eligible candidates, it must still drain the global (out-of-slice)
-/// queue rather than starve while other repos have ready work.
-#[test]
-fn tick_multi_with_sharding_falls_back_to_out_of_slice_when_slice_is_empty() {
-    let mut workspaces = vec![
-        (FakeSource::once(vec![issue(1)]), RecordingDispatcher::default()),
-        (FakeSource::once(vec![issue(2)]), RecordingDispatcher::default()),
-    ];
-    // Neither workspace is in this host's preferred slice this tick.
-    let preferred_slice = [false, false];
-    let report = tick_multi_with_sharding(
-        &mut workspaces,
-        &[0, 0],
-        10,
-        &[false, false],
-        usize::MAX,
-        false,
-        Some(&preferred_slice),
-    );
-    assert_eq!(report.dispatched, 2, "empty slice must fall back to the full global queue");
-    assert_eq!(
-        report.deferred_out_of_slice, 0,
-        "a fallback dispatch is not a deferral — it went through"
-    );
-    assert_eq!(workspaces[0].1.dispatched, vec![1]);
-    assert_eq!(workspaces[1].1.dispatched, vec![2]);
-}
-
 /// Issue #7691 (Phase B of #6704), dispatcher non-regression: a roster-mode
-/// **yield** must not reach this loop as "owns nothing".
+/// **yield** gates role ticks only and never reaches dispatch.
 ///
-/// The role runner's fence and the dispatcher's slice read the same
-/// `role_shard::decide(root)`, but with deliberately different strength —
-/// there a hard filter, here a preference with a work-conserving fallback. If
-/// a fence yield flipped `owned` to `false`, a self-fenced host (one whose
-/// roster heartbeat is failing — i.e. one having forge trouble) would ALSO
-/// stop preferring its own repos, which is dispatch starvation caused by a
-/// role-rotation safety rule. This pins that it does not: `owned` keeps the
-/// pre-roster verdict, only `admits_role_tick()` flips.
+/// A fence yield must not flip `owned` to `false`: `owned` keeps the
+/// pre-roster verdict and only `admits_role_tick()` flips. Since #11682 the
+/// dispatcher reads no shard verdict at all (its repo slice is retired), so a
+/// self-fenced host — one whose roster heartbeat is failing — still
+/// dispatches every workspace.
 #[test]
 #[serial]
-fn a_roster_mode_yield_leaves_the_dispatcher_slice_work_conserving() {
+fn a_roster_mode_yield_leaves_dispatch_work_conserving() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     std::fs::create_dir_all(root.join(".loom")).unwrap();
@@ -94,23 +62,14 @@ fn a_roster_mode_yield_leaves_the_dispatcher_slice_work_conserving() {
         "a fence yield must NOT reach work_finder as `owns nothing` (#6704 blast radius)"
     );
 
-    // ...and with that mask, dispatch still drains every workspace.
-    let preferred_slice: Vec<bool> = vec![decision.owned, decision.owned];
+    // ...and dispatch still drains every workspace.
     let mut workspaces = vec![
         (FakeSource::once(vec![issue(1)]), RecordingDispatcher::default()),
         (FakeSource::once(vec![issue(2)]), RecordingDispatcher::default()),
     ];
-    let report = tick_multi_with_sharding(
-        &mut workspaces,
-        &[0, 0],
-        10,
-        &[false, false],
-        usize::MAX,
-        false,
-        Some(&preferred_slice),
-    );
+    let report =
+        tick_multi_with_sharding(&mut workspaces, &[0, 0], 10, &[false, false], usize::MAX, false);
     assert_eq!(report.dispatched, 2, "a roster yield must never starve dispatch");
-    assert_eq!(report.deferred_out_of_slice, 0);
 
     crate::role_shard::roster::clear_roster_snapshot_for_tests();
     crate::role_shard::roster::clear_generation_fence_for_tests();

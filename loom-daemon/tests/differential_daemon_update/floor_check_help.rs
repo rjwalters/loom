@@ -32,7 +32,7 @@ Loom tooling (LOOM_DAEMON_UPDATE_INVOKER) prints it and continues.
 /// #11044: the `--yes` and `--to-floor` usage lines, inserted before the
 /// `--help` usage line.
 const FLOOR_CHECK_USAGE_LINES: &str = r#"  ./.loom/scripts/cli/loom-daemon-update.sh --yes         Fleet hosts (Issue #11044): install even when the version would move this host off the fleet floor, without asking. Same as LOOM_DAEMON_UPDATE_YES=1. See "Fleet floor check" above.
-  ./.loom/scripts/cli/loom-daemon-update.sh --to-floor    Fleet hosts (Issue #11044): install EXACTLY the floor's release (vX.Y.Z of loom_min_version) instead of the newest one — to bring a lagging host up to the fleet. Implies --fetch --tag v<floor>. A host already at or above the floor installs nothing (exit 0); a host with no fleet store, or whose floor is not known, is refused (exit 1). Cannot be combined with --tag, --no-fetch or --resolve-json.
+  ./.loom/scripts/cli/loom-daemon-update.sh --to-floor    Fleet hosts (Issue #11044): install EXACTLY the floor's release (vX.Y.Z of loom_min_version) instead of the newest one — to bring a lagging host up to the fleet. Implies --fetch --tag v<floor>. A host already at or above the floor installs nothing (exit 0); a host with no fleet store, whose floor is not known, or whose installed daemon reports no readable version (a possible downgrade, Issue #11064), is refused (exit 1). Cannot be combined with --tag, --no-fetch or --resolve-json.
 "#;
 
 /// #11044: the `LOOM_DAEMON_UPDATE_YES` / `LOOM_DAEMON_UPDATE_INVOKER`
@@ -52,7 +52,11 @@ const FLOOR_CHECK_EXIT_1_LINES: &str = r#"     Also used by the fleet floor chec
      move off its floor and the run was not confirmed: the operator
      answered anything but y at the prompt, or there was no terminal to
      ask on and neither --yes nor LOOM_DAEMON_UPDATE_YES=1 was given.
-     Nothing was changed. Also used by --to-floor when there is no floor.
+     Nothing was changed: the check runs before the checkout is fetched
+     or fast-forwarded (#11064). If that fast-forward is what moves a
+     source build off the floor, the refusal names it instead. Also used
+     by --to-floor when there is no floor, or when the installed daemon's
+     version cannot be read.
 "#;
 
 /// The lines the four #11044 blocks sit directly in front of, in order.

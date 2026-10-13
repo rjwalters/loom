@@ -38,6 +38,14 @@ Options:
                          gate (checks run on base + PR head, #10026). Warns and
                          records an audit PR comment. Operator asserts
                          responsibility.
+  --allow-red-required <context>
+                         Repeatable. Merge over a red REQUIRED status-check
+                         context, for exactly the named context(s). Otherwise
+                         a plain (non --auto) merge refuses (exit 1) on any red
+                         required context and holds (exit 5) on a missing or
+                         pending one, even with a token that could bypass
+                         branch protection (#10688). Warns and, on a real
+                         merge, records an audit PR comment.
   --allow-unapproved     Bypass the pre-merge loom:pr review-signal guard.
                          By default the script refuses to merge (exit 1) a
                          PR whose current head does not carry the loom:pr
@@ -116,8 +124,8 @@ Precedence (highest wins):
 Exit codes:
   0 = merged (or --help) · 1 = failed
   3 = PR head moved past the SHA this attempt gated on (#5579) · 5 = --auto's bounded settle-wait expired before CI finished (#8896), or no concluded CI run for this exact head yet (#10567) — neither is a failure; retry later
-  4 = stale required checks re-running in place (#8914) or re-dated by a push (#8508) under --redate-stale-checks — not a failure; retry later
-  6 = deferred behind another PR's chain-head merge lock (#10167; --auto or LOOM_CHAIN_LOCK_GUARD=1; LOOM_CHAIN_LOCK_OVERRIDE=1 bypasses) — nothing written; retry later
+  4 = stale required checks re-dated by a no-op push (#8508) under --redate-stale-checks; the #8914 in-place re-run is gone (#8919) — not a failure; retry later
+  7 = held by a sequencing order, loom:pr + loom:sequenced only (#11330; prints LOOM-SEQUENCED-HOLD pr=N after=M) — nothing written; retry later
 
 Examples:
   ./.loom/scripts/merge-pr.sh 123

@@ -203,14 +203,22 @@ fn anchor_verdict(gh_bin: &Path, root: &Path, pr: &VerdictPr, head_sha: &str) ->
     );
 
     let n = pr.number.to_string();
-    let out = gh_call::output(
-        gh_call::write("verdict.anchor_comment", gh_bin, root)
-            .args(["pr", "comment", &n, "--body", &body])
-            .args(gh_call::loom_repo_flag()),
-    )?;
-    if !out.status.success() {
-        let (root, err) = (root.display(), gh_call::stderr(&out));
-        return Err(anyhow!("gh pr comment (anchor {label}) failed for #{n} in {root}: {err}"));
-    }
-    Ok(())
+    // #9247: a stale installation token refuses this write; re-mint and
+    // re-run it once.
+    crate::stale_token_retry::run("verdict.anchor_comment", root, || {
+        let out = gh_call::output(
+            gh_call::write("verdict.anchor_comment", gh_bin, root)
+                .args(["pr", "comment", &n, "--body", &body])
+                .args(gh_call::loom_repo_flag()),
+        )?;
+        if !out.status.success() {
+            let (root, err) = (root.display(), gh_call::stderr(&out));
+            return Err(anyhow!("gh pr comment (anchor {label}) failed for #{n} in {root}: {err}"));
+        }
+        Ok(())
+    })
 }
+
+#[cfg(test)]
+#[path = "unanchored_verdict_stale_token_tests.rs"]
+mod stale_token_tests;

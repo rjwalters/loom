@@ -72,6 +72,15 @@ provider. CLI configuration can override upstream endpoints, so use a clean
 CLI profile for reproducible experiments. Paid plan allowance and PAYG prices
 are separate; a harness's cost estimate is not a measured subscription charge.
 
+`zai-flash` also declares `"excludedRoles": ["judge", "curator"]` (#11400):
+Loom never admits Judge or Curator onto it, whatever selected it (a preference
+entry is skipped as `not-admitted(excludedRole)`; a pin, role binding or
+`--profile` is refused with the reason). Because `zai-flash` is the bundled
+default profile, a bare `opencode`/`pi` Judge or Curator binding is refused too
+unless `runtimes.defaultModelProfile` names a profile that does not exclude it.
+Doctor is the role this repo runs GLM-first; see `runtime-adapters.md` §
+"Model-profile role exclusion".
+
 Run in a disposable checkout with `ZAI_API_KEY` already exported:
 
 ```sh
@@ -735,8 +744,7 @@ it binds `opencode` as well as `pi`). Nothing is copied into
      "preference": ["claude", "codex", {"runtime": "pi", "modelProfile": "quick-cerebras"}],
      "backstopCeiling": {
        "maxConcurrent": 2,          // most concurrent metered dispatches this HOST may hold
-       "appliesFrom": 2,            // first tier the ceiling governs; here, the preset
-       "minComplexity": "routine"   // optional: keep trivia off the metered tap
+       "appliesFrom": 2             // first tier the ceiling governs; here, the preset
      }
    }
    ```

@@ -82,18 +82,14 @@ impl fmt::Display for Tap {
 
 /// Which form of backstop-ceiling refusal passed a tap over (#8555).
 ///
-/// Three kinds rather than one, because they call for three different operator
+/// Two kinds rather than one, because they call for two different operator
 /// responses: "the host is at its metered ceiling" is working as designed,
-/// "this work is below the eligibility tier" is a policy verdict on *this*
-/// dispatch, and "the ceiling state could not be read" is a host fault that
-/// must be repaired before the metered tier can be used again.
+/// and "the ceiling state could not be read" is a host fault that must be
+/// repaired before the metered tier can be used again.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CeilingSkip {
     /// The configured per-host concurrency ceiling is already held.
     AtCapacity { live: u32, limit: u32 },
-    /// The work is below the configured eligibility tier, so it never reaches
-    /// the metered tap at all.
-    Ineligible,
     /// The ceiling is configured but its live count could not be established
     /// (no resolvable lease directory, an unwritable store, an unreadable
     /// one). Fail closed: an unknown count must never read as "there is room".
@@ -132,7 +128,6 @@ impl SkipReason {
             Self::Unavailable { .. } => "unavailable",
             Self::Ceiling { skip, .. } => match skip {
                 CeilingSkip::AtCapacity { .. } => "ceiling-at-capacity",
-                CeilingSkip::Ineligible => "ceiling-ineligible",
                 CeilingSkip::Unknown => "ceiling-unknown",
             },
         }

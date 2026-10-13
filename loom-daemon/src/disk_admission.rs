@@ -13,7 +13,9 @@
 //! - `free` is the worktree-root volume's free space ([`worktree_root_free_gb`]).
 //! - `floor` is the disk-full halt floor ([`crate::disk_full_halt`], 3 GB by
 //!   default), so admission stops before the terminal halt would.
-//! - `charge(R)` is R's observed sweep high-water mark plus [`MARGIN_PCT`]
+//! - `charge(R)` is R's observed sweep high-water mark (the
+//!   [`CHARGE_PERCENTILE`](disk_footprint::CHARGE_PERCENTILE)th percentile of
+//!   its recent sweep peaks, #11736) plus [`MARGIN_PCT`]
 //!   ([`crate::disk_footprint`]), rounded up to whole GB, minimum 1, so a repo
 //!   that builds nothing stays cheap. R's configured [`REPO_CHARGE_KEY`] is a
 //!   floor under it (`max(observed, configured)`), so an operator can always

@@ -20,7 +20,7 @@ use super::gh;
 use super::liveness::active_spawn_loop_issues;
 use super::naming::{self, BRANCH_PREFIX};
 use super::safety::{
-    check_uncommitted_changes, check_uncommitted_or_untracked_changes,
+    check_uncommitted_changes, check_uncommitted_or_unproven_untracked_changes,
     find_processes_using_directory, read_in_use_marker, InUseMarker,
 };
 use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
@@ -1232,8 +1232,8 @@ pub fn production_pr_probes<'a>(
         // alone is blind to untracked files, and `git worktree remove --force`
         // deletes them. A `pr-<N>` worktree's contents come from outside Loom,
         // so it does not get the closed-issue gate that bounds that gap on the
-        // `issue-<N>` side.
-        uncommitted: &check_uncommitted_or_untracked_changes,
+        // `issue-<N>` side. Proven cargo output is not user work (#11193).
+        uncommitted: &check_uncommitted_or_unproven_untracked_changes,
         now,
     }
 }

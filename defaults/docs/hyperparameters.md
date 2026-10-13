@@ -22,7 +22,8 @@ host config → repo config — see `config_resolver.rs`).
     "dispatch": {
       "tickIntervalSecs": 60,
       "maxConcurrent": 3,
-      "maxAdmissionsPerTick": 3
+      "maxAdmissionsPerTick": 3,
+      "drawTemperature": 80
     },
     "lifecycle": {
       "leaseTtlMinutes": 15,
@@ -46,15 +47,16 @@ below. Types/ranges are strict **on this surface** (see Validation).
 | `dispatch` | `tickIntervalSecs` | 60 | 5–3600 | Work-finder tick cadence | `autonomous.workFinder.intervalSecs` | `LOOM_WORK_FINDER_INTERVAL_SECS` |
 | `dispatch` | `maxConcurrent` | 3 | 1–256 | Sweep concurrency ceiling (dynamic cap stays bounded by disk/RAM) | `autonomous.workFinder.maxConcurrent` | `LOOM_WORK_FINDER_MAX_CONCURRENT` |
 | `dispatch` | `maxAdmissionsPerTick` | 3 | 1–64 | Ramp cap: new sweeps admitted per tick (#4234) | `autonomous.workFinder.maxAdmissionsPerTick` | `LOOM_WORK_FINDER_MAX_ADMISSIONS_PER_TICK` |
+| `dispatch` | `drawTemperature` | 80 | 1–100000 (integer) | Temperature of the workspace draw's softmax over `fleet_priority` (#11684; [`priority-model.md`](priority-model.md)): small = nearly strict priority order, large = nearly uniform. Re-read every tick (hot-applies) | — | — |
 | `lifecycle` | `leaseTtlMinutes` | 15.0 | >0–1440 | Lease-freshness TTL (#6286) | — | `LOOM_LEASE_TTL_MINUTES` |
 | `lifecycle` | `idleExitMinutes` | 60 | 1–10080 | Idle-exit turnaround (#4467) | `autonomous.idleExit.idleMinutes` | `LOOM_AUTONOMOUS_IDLE_EXIT_MINUTES` |
 | `rework` | `buildBackoffHigh` | 40 | 1–100000 | Per-repo PR-debt level that engages a repo's build back-off (#9410, #10624) | `autonomous.workFinder.buildBackoff.high` | — |
 | `rework` | `buildBackoffLow` | 25 | 0–100000, `< high` | Per-repo PR-debt level that releases it | `autonomous.workFinder.buildBackoff.low` | — |
 | `champion` | `prSlice` | 10 | 1–1000 | PR rows Champion handles before the promotion pass (#10753) | — | `LOOM_CHAMPION_PR_SLICE` |
 | `champion` | `promotionSlice` | 3 | 1–100 | Fresh promotion verdicts per pause while PR rows remain | — | `LOOM_CHAMPION_PROMOTION_SLICE` |
-| `champion` | `tier2Cap` | 2 | 0–100 (0 disables) | Tier 2 promotions per repo per pass | — | `LOOM_CHAMPION_TIER2_CAP` |
-| `champion` | `tier3Cap` | 1 | 0–100 (0 disables) | Tier 3 promotions per repo per pass | — | `LOOM_CHAMPION_TIER3_CAP` |
-| `champion` | `tier3BacklogCap` | 5 | 0–1000 | Open unheld `tier:maintenance` issues that gate Tier 3 promotion | — | `LOOM_CHAMPION_TIER3_BACKLOG_CAP` |
+| `champion` | `tier2Cap` | 2 | 0–100 (0 disables) | No-level promotions per repo per pass (old Tier 2 cap, mapped by population #11512) | — | `LOOM_CHAMPION_TIER2_CAP` |
+| `champion` | `tier3Cap` | 1 | 0–100 | Unused since #11512; parsed for config compatibility (old Tier 3 per-pass cap) | — | `LOOM_CHAMPION_TIER3_CAP` |
+| `champion` | `tier3BacklogCap` | 5 | 0–1000 | Unused since #11512; parsed for config compatibility (old Tier 3 backlog gate) | — | `LOOM_CHAMPION_TIER3_BACKLOG_CAP` |
 
 The `champion` values enter the run digest. Champion's shell snippets read
 the `LOOM_CHAMPION_*` env vars directly, so the resolver honours them at the

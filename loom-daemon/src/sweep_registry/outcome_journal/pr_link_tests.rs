@@ -73,10 +73,24 @@ fn seed_phase_history_with_prs(
                 phase: (*phase).to_string(),
                 at: started_at + chrono::Duration::seconds(60 * (i as i64 + 1)),
                 pr_number: *pr_number,
-                jev: None,
             })
             .collect(),
     );
+}
+
+impl SweepRegistry {
+    /// Test seam for sibling suites (#10156 no-op hold): record a sampled
+    /// Curator-only phase history for `sweep_id`.
+    pub(crate) fn seed_curator_only_history_for_test(&mut self, sweep_id: &str) {
+        self.phase_history.insert(
+            sweep_id.to_string(),
+            vec![PhaseObservation {
+                phase: "curator-done".to_string(),
+                at: Utc::now(),
+                pr_number: None,
+            }],
+        );
+    }
 }
 
 fn outcome_for(registry: &SweepRegistry, issue: u32) -> telemetry::SweepOutcomeRecord {

@@ -23,6 +23,9 @@
 //! tests read (`check_export.jsonl`) must equal this live run.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "common/hub_image.rs"]
+mod hub_image;
+
 use std::io::Write;
 use std::process::{Command, Stdio};
 
@@ -48,7 +51,7 @@ fn run_on(fixture: &str, params: &[(String, String)], sql: &str) -> String {
         "-i",
         "--entrypoint",
         "clickhouse",
-        CLICKHOUSE_IMAGE,
+        &hub_image::resolve(CLICKHOUSE_IMAGE),
         "local",
         "--multiquery",
         "--format=JSONEachRow",
@@ -84,6 +87,7 @@ fn replay(repo: &str) -> Replay {
         as_of: Utc.with_ymd_and_hms(2026, 10, 4, 13, 0, 0).unwrap(),
         window_sec: 3900,
         repo: repo.to_string(),
+        knowable_since: Some(Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()),
     };
     let (state, coverage) = state_and_coverage_queries(REPLAY_QUERIES).unwrap();
     assemble(&params, &run_query(&params, &state), &run_query(&params, &coverage)).unwrap()
@@ -141,6 +145,7 @@ fn check_params(repo: &str, threshold_sec: u32) -> CheckParams {
             as_of: Utc.with_ymd_and_hms(2026, 10, 4, 13, 0, 0).unwrap(),
             window_sec: 3900,
             repo: repo.to_string(),
+            knowable_since: Some(Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()),
         },
         span_sec: 3600,
         step_sec: 300,

@@ -119,6 +119,33 @@ fn outcome_classification() {
     assert_eq!(classify(None, false, "gh: Not Found (HTTP 404)").1, Outcome::Error);
 }
 
+/// #11418: a secondary limit is its own outcome, never the primary pool's
+/// `rate_limited`, by the same test `forge_denial` applies.
+#[test]
+fn a_secondary_limit_is_classified_apart_from_primary_exhaustion() {
+    let retry = parse_http_response("HTTP/2.0 403 Forbidden\r\nRetry-After: 60\r\n\r\n{}");
+    let worded = parse_http_response(
+        "HTTP/2.0 403 Forbidden\r\n\r\n{\"message\":\"You have exceeded a secondary rate limit.\"}",
+    );
+    let throttled = parse_http_response("HTTP/2.0 429 Too Many\r\nRetry-After: 30\r\n\r\n");
+    let exhausted =
+        parse_http_response("HTTP/2.0 403 Forbidden\r\nX-Ratelimit-Remaining: 0\r\n\r\n{}");
+    for r in [&retry, &worded, &throttled] {
+        assert_eq!(classify(r.as_ref(), false, "").1, Outcome::SecondaryLimited);
+    }
+    assert_eq!(classify(exhausted.as_ref(), false, "").1, Outcome::RateLimited);
+    assert_eq!(
+        classify(None, false, "gh: You have exceeded a secondary rate limit (HTTP 403)").1,
+        Outcome::SecondaryLimited
+    );
+    let wire = serde_json::to_string(&Outcome::SecondaryLimited).unwrap();
+    assert_eq!(wire, "\"secondary_limited\"");
+    assert_eq!(
+        crate::gh_invocation::billing::BillingClass::from(Outcome::SecondaryLimited).as_str(),
+        "secondary_limited"
+    );
+}
+
 // ===== rolling window with an injected clock =====
 
 #[test]

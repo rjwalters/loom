@@ -3,6 +3,7 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+use loom_daemon::telemetry::SweepResult;
 use serde_json::{json, Value};
 
 const PHASES: &[&str] = &[
@@ -100,16 +101,34 @@ fn execute(root: &Path, args: &[String], out: &mut impl Write) -> Result<()> {
     }
     if !matches!(
         command,
-        "write" | "begin" | "read" | "phase" | "attempt" | "model" | "exists" | "delete" | "jev"
+        "write"
+            | "begin"
+            | "read"
+            | "phase"
+            | "attempt"
+            | "model"
+            | "exists"
+            | "delete"
+            | "doctor-attempt"
+            | "doctor-rejection"
+            | "doctor-route"
+            | "doctor-clear"
     ) {
-        return Err(invalid("usage: sweep-checkpoint write ISSUE PHASE [--task-id ID] [--pr-number N] [--attempt N] [--model M]; begin ISSUE ROLE [--attempt N] [--model M]; read/phase/attempt/model/exists/delete ISSUE; jev ISSUE TIER CONFIDENCE; list"));
+        return Err(invalid("usage: sweep-checkpoint doctor-attempt ISSUE|- --pr N --head SHA --runtime RT [--profile P] [--kind fix|rebase]; doctor-rejection ISSUE|- --pr N --head SHA; doctor-route ISSUE|- --pr N --attempt A --cap C; doctor-clear ISSUE|- --pr N; write ISSUE PHASE [--task-id ID] [--pr-number N] [--attempt N] [--model M]; begin ISSUE ROLE [--attempt N] [--model M]; read/phase/attempt/model/exists ISSUE; delete ISSUE [--pr P]; list"));
     }
     let issue_text = args.get(1).ok_or_else(|| invalid("issue is required"))?;
+    if let Some(verb) = command.strip_prefix("doctor-") {
+        // `-` means no issue scope (Mode C PR with zero/multiple closing issues).
+        let issue_target = if issue_text == "-" {
+            None
+        } else {
+            number(issue_text)?;
+            Some(dir.join(format!("issue-{issue_text}.json")))
+        };
+        return escalation::run(root, &dir, issue_target.as_deref(), verb, &args[2..], out);
+    }
     let issue = number(issue_text)?;
     let target = dir.join(format!("issue-{issue_text}.json"));
-    if command == "jev" {
-        return patch_jev(&target, args.get(2), args.get(3));
-    }
     if command == "begin" {
         // Telemetry only (#9935): the checkpoint file, which drives resume,
         // is never read or written, and tracing stays best effort.
@@ -118,7 +137,8 @@ fn execute(root: &Path, args: &[String], out: &mut impl Write) -> Result<()> {
         return Ok(());
     }
     if command == "write" {
-        let record = parse_write(&args[2..])?;
+        let mut record = parse_write(&args[2..])?;
+        escalation::carry_forward(&target, &mut record)?;
         persist(&dir, &target, &record)?;
         // Telemetry remains best effort, and only follows a successful durable write.
         loom_daemon::observability::lifecycle::checkpoint_completed(
@@ -139,6 +159,16 @@ fn execute(root: &Path, args: &[String], out: &mut impl Write) -> Result<()> {
         return Ok(());
     }
     if command == "delete" {
+        escalation::reset_on_delete(&dir, &target, &args[2..])?;
+        // Every delete marks the issue terminal (merged, or found closed), so
+        // an in-session sweep still driving it has ended (#11563).
+        let pr = std::fs::read(&target)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .and_then(|v| v["pr_number"].as_u64())
+            .and_then(|n| u32::try_from(n).ok());
+        let ws = root.to_string_lossy();
+        super::presence::on_sweep_finished(&ws, issue.into(), SweepResult::Success, pr);
         return match std::fs::remove_file(&target) {
             Ok(()) => {
                 std::fs::File::open(&dir)
@@ -255,43 +285,6 @@ fn parse_begin(args: &[String]) -> Result<(&str, Option<u32>, Option<&str>)> {
     Ok((role, attempt, model))
 }
 
-/// `sweep-checkpoint jev <issue> <tier> <confidence>` (Issue #8543) — patches
-/// a shadow-mode Jev complexity classification onto an ALREADY-EXISTING
-/// checkpoint, without disturbing `phase`/`task_id`/`pr_number`/`attempt`/
-/// `model`. Deliberately a merge, not a `write` (which always rebuilds the
-/// whole record): the Tier-2.5 dispatch step that calls this does not know —
-/// and must not need to know — the current phase/task-id, and calling
-/// `write` here would silently drop them.
-///
-/// Best-effort by design, matching the subcommand's own failure contract
-/// (`jev-tier` never blocks a sweep): a missing checkpoint (nothing written
-/// yet, or already deleted) is a silent no-op, exactly like the `phase`/
-/// `attempt`/`model` readers' own missing-file handling above — never an
-/// error that could make a shadow classification hold up dispatch.
-///
-/// Argument validation lives here (this is the CLI surface, and a bad
-/// argument must still exit non-zero); the merge itself is
-/// [`loom_daemon::jev_tier::patch_checkpoint_at`], shared with the in-process
-/// Tier-2.5 shadow sample so the two writers cannot drift.
-fn patch_jev(target: &Path, tier: Option<&String>, confidence: Option<&String>) -> Result<()> {
-    let tier = tier
-        .map(String::as_str)
-        .ok_or_else(|| invalid("tier is required"))?;
-    if !matches!(tier, "mechanical" | "routine" | "complex") {
-        return Err(invalid("tier must be mechanical, routine, or complex"));
-    }
-    let confidence: f64 = confidence
-        .ok_or_else(|| invalid("confidence is required"))?
-        .parse()
-        .map_err(|_| invalid("confidence must be a number"))?;
-    if !confidence.is_finite() || !(0.0..=1.0).contains(&confidence) {
-        return Err(invalid("confidence must be between 0 and 1"));
-    }
-    loom_daemon::jev_tier::patch_checkpoint_at(target, tier, confidence)
-        .map(|_| ())
-        .map_err(io_error)
-}
-
 fn persist(dir: &Path, target: &Path, record: &Value) -> Result<()> {
     let mut bytes = serde_json::to_vec_pretty(record).map_err(io_error)?;
     bytes.push(b'\n');
@@ -307,6 +300,8 @@ fn persist(dir: &Path, target: &Path, record: &Value) -> Result<()> {
         .and_then(|file| file.sync_all())
         .map_err(io_error)
 }
+
+mod escalation;
 
 #[cfg(test)]
 mod tests;

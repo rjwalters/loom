@@ -23,6 +23,9 @@
 
 use std::path::PathBuf;
 
+pub mod since;
+pub use since::publish;
+
 use super::ready_queue::{self, TickQueueRow};
 use super::WorkItem;
 use crate::main_health_gate::WorkspaceHealthStates;
@@ -121,6 +124,32 @@ impl HaltCause {
             Self::DiskReservation => "disk_reservation",
         }
     }
+
+    /// The short phrase naming this cause in a `workspace_halted` row's
+    /// human-readable `reason` (#11417).
+    #[must_use]
+    pub fn phrase(self) -> &'static str {
+        match self {
+            Self::MainRed => "main red",
+            Self::GatePending => "build gate running",
+            Self::TokenPool => "token pool exhausted",
+            Self::PreflightAdvisory => "pre-flight advisory tripped",
+            Self::Drain => "scheduled drain",
+            Self::Breaker => "host-distress breaker",
+            Self::WriteScope => "no write access to this repo",
+            Self::CiBilling => "CI billing failure",
+            Self::InstallIncompatible => "installed Loom incompatible",
+            Self::DaemonTooOld => "daemon too old for installed Loom",
+            Self::MaintainOnly => "maintain-only workspace",
+            Self::DiskReservation => "disk reservation does not fit",
+        }
+    }
+
+    /// The `reason` sentence for a `workspace_halted` row held by `self`.
+    #[must_use]
+    pub fn halted_reason(self) -> String {
+        format!("blocked: repo dispatch held — {}", self.phrase())
+    }
 }
 
 /// `2 token_pool, 1 daemon_too_old`: how many roots each cause holds, in
@@ -197,6 +226,29 @@ pub fn causes_per_root(
             breaker_suppressed.then_some(HaltCause::Breaker)
         })
         .collect()
+}
+
+/// The single-workspace loop's cause (#11649): the [`causes_per_root`]
+/// precedence over the holds that loop folds, given as `(main_red,
+/// gate_pending, other_hold, breaker)`. `other_hold` is the breaker OR the
+/// root's token-pool hold, so with the breaker off it names the pool. `None`
+/// exactly when no hold is in force — the loop's `halted` bool.
+#[must_use]
+pub fn single_root(
+    root: &std::path::Path,
+    (main_red, gate_pending, other_hold, breaker): (bool, bool, bool, bool),
+) -> Option<HaltCause> {
+    if main_red {
+        Some(main_red_or_billing(root))
+    } else if gate_pending {
+        Some(HaltCause::GatePending)
+    } else if !other_hold {
+        None
+    } else if breaker {
+        Some(HaltCause::Breaker)
+    } else {
+        Some(HaltCause::TokenPool)
+    }
 }
 
 /// Fold the disk budget's holds (#11191) into the per-root causes: a root no

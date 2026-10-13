@@ -887,10 +887,10 @@ mod tests {
         std::env::remove_var(PRIVATE_DEFAULTS_ENV);
         assert_eq!(captain, Some("loom-worker-1".to_string()));
         assert_eq!(get_path(&effective, "autonomous.ciTelemetry.enabled"), Some(&json!(true)));
-        // The one surviving reader degrades to a single deprecation notice.
-        let endpoint = crate::signoz_read::EndpointConfig::from_config(&effective);
-        assert_eq!(endpoint.endpoint.as_deref(), Some("http://127.0.0.1:8123"));
-        assert_eq!(endpoint.legacy, ["endpoint", "user"]);
+        // The SigNoz reader no longer reads the retired block; it only names it.
+        let endpoint = crate::signoz_read::EndpointConfig::resolve(&effective, None);
+        assert_eq!(endpoint.endpoint, None);
+        assert_eq!(endpoint.ignored, ["autonomous.eta.fleetRefresh.signoz"]);
     }
 
     #[test]

@@ -144,12 +144,30 @@ pub fn is_yes(answer: &str) -> bool {
     matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
-/// The check, end to end. Returns to let the run continue; exits 1 when the
-/// operator declines or no terminal can be asked.
-pub fn enforce(workspace: &Path, target: Target<'_>, installed: &str, dry_run: bool, yes: bool) {
+/// What a refusal says was changed: `None` when nothing was (the #11064
+/// preflight runs before the checkout sync), else what the run already did.
+#[must_use]
+pub fn nothing_changed(changed: Option<&str>) -> String {
+    match changed {
+        None => "Nothing was changed.".to_string(),
+        Some(what) => format!("The installed daemon was not changed, but {what}."),
+    }
+}
+
+/// The check, end to end. Returns `true` when it warned and the run may
+/// continue, `false` when there was nothing to warn about; exits 1 when the
+/// operator declines or no terminal can be asked. `changed` names what this
+/// run has already changed, for the refusal ([`nothing_changed`]).
+pub fn enforce(
+    workspace: &Path,
+    target: Target<'_>,
+    installed: &str,
+    (dry_run, yes): (bool, bool),
+    changed: Option<&str>,
+) -> bool {
     let floor = offline_floor(workspace);
     let Some(message) = warning(&floor, target, installed) else {
-        return;
+        return false;
     };
     let invoker = util::env_non_empty(INVOKER_ENV);
     let yes = yes || util::env_truthy(YES_ENV);
@@ -172,17 +190,23 @@ pub fn enforce(workspace: &Path, target: Target<'_>, installed: &str, dry_run: b
             let mut answer = String::new();
             let _ = std::io::stdin().lock().read_line(&mut answer);
             if !is_yes(&answer) {
-                out::err("Not confirmed: nothing was changed.");
+                out::err(&match changed {
+                    None => "Not confirmed: nothing was changed.".to_string(),
+                    Some(what) => {
+                        format!("Not confirmed: the installed daemon was not changed, but {what}.")
+                    }
+                });
                 exit(1);
             }
         }
         Decision::Refuse => {
             out::warn(&message);
-            out::err("Refusing to move a fleet host off the fleet floor without confirmation, and there is no terminal to ask on. Nothing was changed.");
+            out::err(&format!("Refusing to move a fleet host off the fleet floor without confirmation, and there is no terminal to ask on. {}", nothing_changed(changed)));
             out::say_err("Re-run with --yes (or LOOM_DAEMON_UPDATE_YES=1) to install it anyway, or raise the floor to move the whole fleet.");
             exit(1);
         }
     }
+    true
 }
 
 /// `--to-floor`: turn the floor into `--fetch --tag v<floor>`, or refuse
@@ -212,22 +236,64 @@ pub fn apply_to_floor(a: &mut Args, workspace: &Path) {
     }
 }
 
-/// Whether `--to-floor` has nothing to install: the installed version is
-/// above the floor (it never moves a host down) or at it (unless `--force`).
-#[must_use]
-pub fn to_floor_met(floor_tag: &str, installed: &str, force: bool) -> Option<String> {
-    let floor = floor_tag.trim_start_matches('v');
-    if installed.is_empty() {
-        return None;
+/// What the installed daemon's `--version` said, as `--to-floor` needs it
+/// (#11064): no binary at all is a bootstrap, but a binary whose version
+/// cannot be read may be newer than the floor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstalledVersion {
+    /// No installed binary resolved, or none that can be executed.
+    Absent,
+    /// An executable binary at this path gave no readable version.
+    Unreadable(String),
+    /// `X.Y.Z`.
+    Known(String),
+}
+
+impl InstalledVersion {
+    /// The version, or `""` when there is none.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            InstalledVersion::Known(v) => v,
+            _ => "",
+        }
     }
+}
+
+/// What `--to-floor` does about the installed version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToFloor {
+    /// Install the floor's release.
+    Install,
+    /// Nothing to install (exit 0): the message says why.
+    Met(String),
+    /// Refuse (exit 1): installing the floor could move the host down.
+    Refuse(String),
+}
+
+/// `--to-floor` against the installed version: it never moves a host down,
+/// a host at the floor has nothing to do (unless `--force`), and a binary
+/// whose version cannot be read is refused rather than overwritten (#11064).
+#[must_use]
+pub fn to_floor_decision(floor_tag: &str, installed: &InstalledVersion, force: bool) -> ToFloor {
+    let floor = floor_tag.trim_start_matches('v');
+    let installed = match installed {
+        InstalledVersion::Absent => return ToFloor::Install,
+        InstalledVersion::Unreadable(bin) => {
+            return ToFloor::Refuse(format!(
+                "--to-floor: the installed daemon {bin} reports no readable version, so installing the fleet floor {floor} could move this host DOWN. Refusing; nothing was changed. Check `{bin} --version`, or run without --to-floor."
+            ));
+        }
+        InstalledVersion::Known(v) => v.as_str(),
+    };
     match util::semver_compare(installed, floor) {
-        std::cmp::Ordering::Greater => Some(format!(
+        std::cmp::Ordering::Greater => ToFloor::Met(format!(
             "Installed {installed} is above the fleet floor {floor}; --to-floor never moves a host down. Nothing to do."
         )),
-        std::cmp::Ordering::Equal if !force => Some(format!(
+        std::cmp::Ordering::Equal if !force => ToFloor::Met(format!(
             "Installed {installed} is already the fleet floor's release. Nothing to do."
         )),
-        _ => None,
+        _ => ToFloor::Install,
     }
 }
 
@@ -307,11 +373,45 @@ mod tests {
 
     #[test]
     fn to_floor_installs_only_for_a_host_below_the_floor() {
-        assert_eq!(to_floor_met("v0.19.950", "0.19.940", false), None);
-        assert!(to_floor_met("v0.19.950", "0.19.950", false).is_some());
-        assert_eq!(to_floor_met("v0.19.950", "0.19.950", true), None, "--force reinstalls");
-        assert!(to_floor_met("v0.19.950", "0.19.953", true).is_some(), "never down");
-        assert_eq!(to_floor_met("v0.19.950", "", false), None, "unknown installed: install");
+        let known = |v: &str| InstalledVersion::Known(v.to_string());
+        let met = |d: ToFloor| matches!(d, ToFloor::Met(_));
+        assert_eq!(to_floor_decision("v0.19.950", &known("0.19.940"), false), ToFloor::Install);
+        assert!(met(to_floor_decision("v0.19.950", &known("0.19.950"), false)));
+        assert_eq!(
+            to_floor_decision("v0.19.950", &known("0.19.950"), true),
+            ToFloor::Install,
+            "--force reinstalls"
+        );
+        assert!(met(to_floor_decision("v0.19.950", &known("0.19.953"), true)), "never down");
+    }
+
+    #[test]
+    fn to_floor_bootstraps_a_missing_binary_but_refuses_an_unreadable_one() {
+        assert_eq!(
+            to_floor_decision("v0.19.950", &InstalledVersion::Absent, false),
+            ToFloor::Install,
+            "no installed binary: bootstrap"
+        );
+        let d = to_floor_decision(
+            "v0.19.950",
+            &InstalledVersion::Unreadable("/x/loom-daemon".to_string()),
+            true,
+        );
+        let ToFloor::Refuse(why) = d else {
+            panic!("an unreadable version must refuse, even with --force: {d:?}");
+        };
+        assert!(why.contains("/x/loom-daemon") && why.contains("no readable version"), "{why}");
+        assert!(why.contains("DOWN"), "{why}");
+    }
+
+    #[test]
+    fn a_refusal_says_exactly_what_changed() {
+        assert_eq!(nothing_changed(None), "Nothing was changed.");
+        let what = nothing_changed(Some("the source checkout was fast-forwarded to origin/main"));
+        assert!(
+            what.starts_with("The installed daemon was not changed, but the source"),
+            "{what}"
+        );
     }
 
     #[test]

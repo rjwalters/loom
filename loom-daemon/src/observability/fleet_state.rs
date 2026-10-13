@@ -34,6 +34,11 @@
 //! When one `(repo, issue)` is seen by several sources, the held row wins,
 //! then the PR row, then the ready row.
 //!
+//! The same tick also gives the ETA facts (#11564): each `ready_wait` row's
+//! `eligible_reason` / `eligible_at` (the clock holding it back and its end)
+//! and each held repo's `halt` (`work_finder::halt_cause::since`). Neither is
+//! capped.
+//!
 //! The same two consecutive views also give the outcome facts
 //! `eta.stage_outcome` and `pr.resolved` ([`outcomes`], #11126).
 //!
@@ -46,6 +51,9 @@
 //! ETA is enabled does not matter. An anchor with zero rows is still sent,
 //! because it truthfully says "nothing here".
 
+mod champion;
+mod curator;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -55,15 +63,20 @@ use serde_json::Value;
 
 use super::queue::{DurableQueue, FanoutQueue, QueueSink};
 use crate::telemetry::kinds::fleet_state::{
-    split_into_chunks, FleetCapacity, FleetHoldKind, FleetPrCensus, FleetSlot, FleetSlots,
-    FleetStage, FleetStateRecord, FleetStateRepo, FleetStateRow, MainCi, PlannerStamps,
+    split_into_chunks, CuratorState, FleetCapacity, FleetEligibleReason, FleetHoldKind,
+    FleetPrCensus, FleetQueueFlow, FleetRepoHalt, FleetSlot, FleetSlots, FleetStage,
+    FleetStateRecord, FleetStateRepo, FleetStateRow, MainCi, MergeBlockedReason, PlannerStamps,
     ANCHOR_INTERVAL_SECS, CHUNK_BYTES, FLEET_STATE_SCHEMA,
 };
 use crate::telemetry::{RepoVisibility, SweepStartFacts, TelemetryEnvelope, TelemetryRecord};
 
+pub mod enrich;
+mod flow;
 pub mod history;
 pub mod outcomes;
 mod sources;
+
+use flow::{QueueFlowTracker, QUEUE_FLOW_WINDOW_SECS};
 
 /// The review labels whose listings give the PR stages and the census.
 pub const REVIEW_LABELS: [&str; 3] = ["loom:review-requested", "loom:changes-requested", "loom:pr"];
@@ -97,6 +110,116 @@ pub fn hold_kind(labels: &[String]) -> Option<FleetHoldKind> {
     }
 }
 
+/// Every hold the labels in `labels` name, strongest first (#11391): the
+/// names `hold_kind` uses, plus `sequenced`. `other` is a merge-hold label
+/// that none of the named holds covers. Pure.
+#[must_use]
+pub fn hold_names(labels: &[String]) -> Vec<String> {
+    let has = |label: &str| labels.iter().any(|l| l == label);
+    let named: [(&[&str], &str); 5] = [
+        (&["loom:operator-decision"], "operator_decision"),
+        (&["loom:operator-only", "loom:operator-mechanical"], "operator_only"),
+        (&["loom:operator"], "operator"),
+        (&["loom:blocked"], "blocked"),
+        (&["loom:sequenced"], "sequenced"),
+    ];
+    let mut holds: Vec<String> = Vec::new();
+    let mut covered: Vec<&str> = Vec::new();
+    for (names, hold) in named {
+        covered.extend(names);
+        if names.iter().any(|l| has(l)) {
+            holds.push(hold.to_string());
+        }
+    }
+    if MERGE_HOLD_LABELS
+        .iter()
+        .any(|l| has(l) && !covered.contains(l))
+    {
+        holds.push("other".to_string());
+    }
+    holds
+}
+
+/// Why a PR row cannot merge yet (#11644), rolled up from the row's own
+/// label-derived fields: its `stage`, whether any hold holds it
+/// (`hold_kind`), whether it is `sequenced` (`holds`), and its
+/// `loom:merge-conflict` / `loom:ci-failure` flags. No forge read — every
+/// input is already on the row from the same review-label census
+/// Champion/Judge read.
+///
+/// Returns `None` for any non-PR stage (`ready_wait`, `sweep.curator`,
+/// `sweep.builder`). For a PR stage (`review_wait`, `doctor`, `merge_wait`,
+/// `merge_hold`) it always returns a reason, in descending precedence:
+/// `operator_hold`, then `sequenced`, `conflict`, `ci_red`,
+/// `changes_requested`, `approval_pending`, and finally `ready`. Pure.
+#[must_use]
+pub fn merge_blocked_reason(
+    stage: FleetStage,
+    hold_kind: Option<FleetHoldKind>,
+    holds: &[String],
+    conflict: bool,
+    ci_fail: bool,
+) -> Option<MergeBlockedReason> {
+    match stage {
+        FleetStage::ReviewWait
+        | FleetStage::Doctor
+        | FleetStage::MergeWait
+        | FleetStage::MergeHold => {}
+        _ => return None,
+    }
+    // `hold_kind` already collapses every operator/`loom:blocked` hold (and
+    // Champion's marker-refined holds, unreadable from labels) into one value.
+    let reason = if hold_kind.is_some() {
+        MergeBlockedReason::OperatorHold
+    } else if holds.iter().any(|h| h == "sequenced") {
+        MergeBlockedReason::Sequenced
+    } else if conflict {
+        MergeBlockedReason::Conflict
+    } else if ci_fail {
+        MergeBlockedReason::CiRed
+    } else if stage == FleetStage::Doctor {
+        MergeBlockedReason::ChangesRequested
+    } else if stage == FleetStage::ReviewWait {
+        MergeBlockedReason::ApprovalPending
+    } else {
+        // `merge_wait` with no hold or flag. (`merge_hold` always carries a
+        // merge-hold label, so `hold_kind` is set and this arm is unreached.)
+        MergeBlockedReason::Ready
+    };
+    Some(reason)
+}
+
+/// What one listed PR's labels say about the row of the issue it links.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct PrFacts {
+    hold_kind: Option<FleetHoldKind>,
+    holds: Vec<String>,
+    conflict: bool,
+    ci_fail: bool,
+    level: u8,
+}
+
+impl PrFacts {
+    fn from_labels(labels: &[String]) -> Self {
+        let has = |label: &str| labels.iter().any(|l| l == label);
+        PrFacts {
+            hold_kind: hold_kind(labels),
+            holds: hold_names(labels),
+            conflict: has("loom:merge-conflict"),
+            ci_fail: has("loom:ci-failure"),
+            level: crate::priority_pick::Level::of(labels).rank(),
+        }
+    }
+
+    fn apply(&self, row: &mut FleetStateRow) {
+        row.hold_kind = self.hold_kind;
+        row.holds.clone_from(&self.holds);
+        row.conflict = self.conflict;
+        row.ci_fail = self.ci_fail;
+        row.level = row.level.max(self.level);
+    }
+}
+
 /// Where a row came from, in ascending precedence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Source {
@@ -122,6 +245,8 @@ pub struct HeldSweep {
     pub overflow: bool,
     /// The sweep's dispatch-time facts (#11280), when this daemon has them.
     pub start: SweepStartFacts,
+    /// The sweep's id (#11401), keying its stages' `loom.fact_id`.
+    pub sweep_id: Option<String>,
 }
 
 /// One open item from a repo's review listings.
@@ -148,12 +273,25 @@ pub struct ReadyItem {
     pub repo: String,
     pub issue: u32,
     pub rank: u32,
-    pub star: bool,
-    pub star_at: Option<DateTime<Utc>>,
     pub level: u8,
     pub fleet_priority: u32,
     pub created_at: Option<DateTime<Utc>>,
     pub main_red_fix: bool,
+    /// The clock holding it back this tick, when one does (#11564).
+    pub eligible_reason: Option<FleetEligibleReason>,
+    /// When that clock ends, when the work finder knows (#11564).
+    pub eligible_at: Option<DateTime<Utc>>,
+}
+
+/// One repo's dispatch limits from the work finder's last tick (#11606).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RepoLimits {
+    /// Host-local sweeps counted against the cap when the tick finished.
+    pub in_flight: u32,
+    /// The resolved per-repo cap; `None` is uncapped, observed.
+    pub cap: Option<u32>,
+    /// Ready candidates the tick deferred for the cap.
+    pub deferred_repo_cap: u32,
 }
 
 /// The work finder's last tick, as `fleet.state` reads it.
@@ -168,11 +306,21 @@ pub struct ReadyQueue {
     /// `ready_complete`, #11139). A subset of `listed`.
     pub complete: BTreeSet<String>,
     pub slots: Option<FleetSlots>,
+    /// The repos the tick held, by lowercased slug (#11564). Every held repo
+    /// is here, whether or not it has ready rows.
+    pub halts: BTreeMap<String, FleetRepoHalt>,
+    /// Every repo the tick resolved dispatch limits for, by lowercased slug
+    /// (#11606). A repo the tick did not cover is absent: unknown.
+    pub limits: BTreeMap<String, RepoLimits>,
 }
 
 /// Everything one pass read.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FleetInput {
+    /// Per-root Champion dispatch observations.
+    pub champion: BTreeMap<String, crate::telemetry::kinds::fleet_state::ChampionState>,
+    /// Per-root Curator role-runner observations (#11642).
+    pub curator: BTreeMap<String, CuratorState>,
     /// This host's id.
     pub host_id: String,
     /// Every managed repo's lowercased slug.
@@ -183,6 +331,12 @@ pub struct FleetInput {
     pub listed_at: Option<DateTime<Utc>>,
     /// `None` before the work finder's first tick.
     pub ready: Option<ReadyQueue>,
+    /// This host's slots (`max_concurrent` + `occupancy`), measured from local
+    /// state every pass (#11643): `max_concurrent` from the work-finder config,
+    /// `occupancy` from the live-sweep count. Independent of `ready`, so it is
+    /// present before the first work-finder tick and after a roll/restart.
+    /// Preferred over the work-finder plan's `ready.slots` in [`build_view`].
+    pub slots: Option<FleetSlots>,
     /// Host capacity, when read.
     pub capacity: Option<FleetCapacity>,
     /// Each managed repo's `main` CI status, by lowercased slug.
@@ -192,6 +346,8 @@ pub struct FleetInput {
 /// One repo's full state at one pass.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RepoView {
+    /// Champion dispatch metadata.
+    pub champion: Option<crate::telemetry::kinds::fleet_state::ChampionState>,
     /// The census, when the repo was completely listed this pass.
     pub census: Option<FleetPrCensus>,
     /// Rows by issue.
@@ -200,6 +356,24 @@ pub struct RepoView {
     pub sources: BTreeMap<u32, Source>,
     /// `main` CI status, when the host read it.
     pub main_ci: Option<MainCi>,
+    /// The work finder's hold on the repo, when it holds it (#11564).
+    pub halt: Option<FleetRepoHalt>,
+    /// The work finder's dispatch limits for the repo (#11606).
+    pub limits: Option<RepoLimits>,
+    /// Items waiting in the repo's `ready_wait` queue this tick, when the
+    /// listing was read whole (#11645). Absent = unknown, never zero.
+    pub queue_depth: Option<u32>,
+    /// The repo's `ready_wait` arrival/drain flow over the trailing window
+    /// (#11645), once this host has observed its queue.
+    pub flow: Option<FleetQueueFlow>,
+    /// Issues waiting in the repo's `loom:triage` queue as of this host's last
+    /// complete triage listing (#11642). Absent = unknown, never zero.
+    pub triage_depth: Option<u32>,
+    /// The repo's `loom:triage` arrival/drain flow over the trailing window
+    /// (#11642), once this host has observed its triage queue.
+    pub triage_flow: Option<FleetQueueFlow>,
+    /// The Curator role-runner's cadence and last run for the repo (#11642).
+    pub curator: Option<CuratorState>,
 }
 
 /// The full state at one pass, before visibility tagging.
@@ -207,7 +381,8 @@ pub struct RepoView {
 pub struct FleetView {
     /// When the census listings were read.
     pub census_at: Option<DateTime<Utc>>,
-    /// Plan slot use.
+    /// Slot use (`max_concurrent` + `occupancy`), measured from local state
+    /// every pass (#11643) — not gated on a work-finder tick.
     pub slots: Option<FleetSlots>,
     /// Host capacity beside `slots`.
     pub capacity: Option<FleetCapacity>,
@@ -330,6 +505,7 @@ pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Ut
                 FleetSlot::Regular
             }),
             start: sweep.start.clone(),
+            sweep_id: sweep.sweep_id.clone(),
             ..FleetStateRow::new(sweep.issue, sweep.stage, sweep.entered_at)
         };
         offer(&mut candidates, &sweep.repo, Source::Held, row);
@@ -337,9 +513,9 @@ pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Ut
 
     let mut observed: BTreeMap<Source, BTreeSet<String>> = BTreeMap::new();
     let mut census: BTreeMap<String, FleetPrCensus> = BTreeMap::new();
-    // Label-derived hold kind of every listed PR that names an issue, so a
+    // Label-derived facts of every listed PR that names an issue, so a
     // sweep-owned row (which wins on precedence) can still carry the hold.
-    let mut pr_holds: BTreeMap<(String, u32), Option<FleetHoldKind>> = BTreeMap::new();
+    let mut pr_facts: BTreeMap<(String, u32), PrFacts> = BTreeMap::new();
     for listing in &input.listings {
         observed
             .entry(Source::Review)
@@ -356,17 +532,21 @@ pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Ut
                 .entry(stage.map_or("held", FleetStage::as_str).to_string())
                 .or_default() += 1;
             if let Some(issue) = pr.issue {
-                let slot = pr_holds
+                // The first PR naming the issue that holds wins, as before.
+                let facts = PrFacts::from_labels(&pr.labels);
+                let slot = pr_facts
                     .entry((listing.repo.clone(), issue))
-                    .or_insert(None);
-                *slot = slot.or_else(|| hold_kind(&pr.labels));
+                    .or_insert_with(|| facts.clone());
+                if slot.hold_kind.is_none() && facts.hold_kind.is_some() {
+                    *slot = facts;
+                }
             }
             if let (Some(stage), Some(issue)) = (stage, pr.issue) {
-                let row = FleetStateRow {
+                let mut row = FleetStateRow {
                     pr: Some(pr.number),
-                    hold_kind: hold_kind(&pr.labels),
                     ..FleetStateRow::new(issue, stage, now)
                 };
+                PrFacts::from_labels(&pr.labels).apply(&mut row);
                 offer(&mut candidates, &listing.repo, Source::Review, row);
             }
         }
@@ -384,12 +564,12 @@ pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Ut
         for item in &ready.items {
             let row = FleetStateRow {
                 rank: Some(item.rank),
-                star: item.star,
-                star_at: item.star_at,
                 level: item.level,
                 fleet_priority: Some(item.fleet_priority),
                 created_at: item.created_at,
                 main_red_fix: item.main_red_fix,
+                eligible_reason: item.eligible_reason,
+                eligible_at: item.eligible_at,
                 ..FleetStateRow::new(item.issue, FleetStage::ReadyWait, now)
             };
             offer(&mut candidates, &item.repo, Source::Ready, row);
@@ -442,11 +622,31 @@ pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Ut
             .get(&Source::Review)
             .is_some_and(|set| set.contains(&repo));
         if source == Source::Held {
-            row.hold_kind = if review_read {
-                pr_holds.get(&(repo.clone(), issue)).copied().flatten()
-            } else {
-                was.and_then(|w| w.hold_kind)
-            };
+            if review_read {
+                pr_facts
+                    .get(&(repo.clone(), issue))
+                    .cloned()
+                    .unwrap_or_default()
+                    .apply(&mut row);
+            } else if let Some(was) = was {
+                row.hold_kind = was.hold_kind;
+                row.holds.clone_from(&was.holds);
+                row.conflict = was.conflict;
+                row.ci_fail = was.ci_fail;
+            }
+        }
+        // Facts a row carries from the item's earlier rows (#11391): the
+        // level an earlier (ready) row read, and the Judge
+        // rejections counted so far, one more when it just entered `doctor`.
+        if let Some(was) = was {
+            // A ready row is rebuilt from the tick, so a lowered level shows.
+            if source != Source::Ready {
+                row.level = row.level.max(was.level);
+            }
+            row.rework = row.rework.max(was.rework);
+            if row.stage == FleetStage::Doctor && was.stage != FleetStage::Doctor {
+                row.rework += 1;
+            }
         }
         let hold_source = if source == Source::Held {
             Source::Review
@@ -474,6 +674,11 @@ pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Ut
             (None, Some(was)) => row.hold_released_at = was.hold_released_at,
             (None, None) => {}
         }
+        // Roll the row's own label-derived facts up into the merge-readiness
+        // reason (#11644). Computed last, so it reflects the final stage, hold
+        // and flags, whatever source set them.
+        row.merge_blocked_reason =
+            merge_blocked_reason(row.stage, row.hold_kind, &row.holds, row.conflict, row.ci_fail);
         let state = repos.entry(repo).or_default();
         state.rows.insert(issue, row);
         state.sources.insert(issue, source);
@@ -481,12 +686,31 @@ pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Ut
     for (repo, repo_census) in census {
         repos.entry(repo).or_default().census = Some(repo_census);
     }
+    for (repo, champion) in &input.champion {
+        repos.entry(repo.clone()).or_default().champion = Some(champion.clone());
+    }
+    for (repo, curator) in &input.curator {
+        repos.entry(repo.clone()).or_default().curator = Some(curator.clone());
+    }
     for (repo, main_ci) in &input.main_ci {
         repos.entry(repo.clone()).or_default().main_ci = Some(*main_ci);
     }
+    // Every held repo, rows or not (#11564): a halt is never capped.
+    for (repo, halt) in input.ready.iter().flat_map(|ready| &ready.halts) {
+        repos.entry(repo.clone()).or_default().halt = Some(halt.clone());
+    }
+    // Every repo the tick covered, rows or not (#11606): never capped.
+    for (repo, limits) in input.ready.iter().flat_map(|ready| &ready.limits) {
+        repos.entry(repo.clone()).or_default().limits = Some(*limits);
+    }
     FleetView {
         census_at: input.listed_at.filter(|_| !input.listings.is_empty()),
-        slots: input.ready.as_ref().and_then(|r| r.slots),
+        // Prefer the directly-provided, locally-measured slots (#11643); fall
+        // back to the work-finder plan's slots only when a pass did not provide
+        // them (e.g. legacy test inputs).
+        slots: input
+            .slots
+            .or_else(|| input.ready.as_ref().and_then(|r| r.slots)),
         capacity: input.capacity.clone(),
         repos,
         observed,
@@ -504,14 +728,27 @@ pub fn needs_anchor(last: Option<&Emitted>, stamps: &PlannerStamps, now: DateTim
 }
 
 fn repo_entry(view: &FleetView, repo: &str, census: Option<FleetPrCensus>) -> FleetStateRepo {
-    let main_ci = view.repos.get(repo).and_then(|r| r.main_ci);
+    let state = view.repos.get(repo);
+    let main_ci = state.and_then(|r| r.main_ci);
+    let halt = state.and_then(|r| r.halt.clone());
+    let limits = state.and_then(|r| r.limits);
     let ready_complete = view.ready_complete(repo);
     FleetStateRepo {
+        champion: state.and_then(|r| r.champion.clone()),
         repo: repo.to_string(),
         // Tagged by the caller once the record is known to be sent; private
         // until then is the safe default.
         visibility: RepoVisibility::Private,
         main_ci,
+        halt,
+        in_flight: limits.map(|l| l.in_flight),
+        cap: limits.map(|l| l.cap),
+        deferred_repo_cap: limits.map(|l| l.deferred_repo_cap),
+        queue_depth: state.and_then(|r| r.queue_depth),
+        queue_flow: state.and_then(|r| r.flow),
+        triage_depth: state.and_then(|r| r.triage_depth),
+        triage_flow: state.and_then(|r| r.triage_flow),
+        curator: state.and_then(|r| r.curator.clone()),
         census,
         ready_complete,
         ready_replace: !ready_complete,
@@ -606,7 +843,15 @@ pub fn decide(
             && removed.is_empty()
             && !ready_changed
             && now_state.census == was.census
+            && now_state.champion == was.champion
             && now_state.main_ci == was.main_ci
+            && now_state.halt == was.halt
+            && now_state.limits == was.limits
+            && now_state.queue_depth == was.queue_depth
+            && now_state.flow == was.flow
+            && now_state.triage_depth == was.triage_depth
+            && now_state.triage_flow == was.triage_flow
+            && now_state.curator == was.curator
             && view.ready_complete(repo) == last.view.ready_complete(repo)
         {
             continue;
@@ -694,78 +939,107 @@ struct PassState {
     prev: Option<FleetView>,
     emitted: Option<Emitted>,
     outcomes: outcomes::Memory,
+    enrich: enrich::EnrichMemory,
+    /// Per-repo `ready_wait` arrival/drain history (#11645).
+    flow: QueueFlowTracker,
+    /// Per-repo `loom:triage` arrival/drain history (#11642).
+    triage_flow: QueueFlowTracker,
 }
 
 static STATE: Mutex<PassState> = Mutex::new(PassState {
     prev: None,
     emitted: None,
+    enrich: enrich::EnrichMemory::new(),
+    flow: QueueFlowTracker::new(QUEUE_FLOW_WINDOW_SECS),
+    triage_flow: QueueFlowTracker::new(QUEUE_FLOW_WINDOW_SECS),
     outcomes: outcomes::Memory {
         listed: BTreeMap::new(),
         unread: BTreeMap::new(),
         settled: BTreeSet::new(),
         pending_ready: BTreeMap::new(),
+        pending_issue: BTreeMap::new(),
         curated: BTreeMap::new(),
         curated_now: None,
+        triage: BTreeMap::new(),
+        triage_now: None,
+        pre_ready_gone: BTreeMap::new(),
+        managed: BTreeSet::new(),
+        absent: BTreeMap::new(),
         pre_ready_done: BTreeSet::new(),
         pre_ready_retry: BTreeSet::new(),
+        warm: BTreeMap::new(),
         view: None,
         at: None,
     },
 });
 
-/// Emit this pass's outcome facts and remember the pass for the next diff.
-/// The forge reads run off the event loop.
+/// Date `view`'s rows from the forge (#11391), emit this pass's outcome
+/// facts and remember the pass for the next diff, and return the enriched
+/// view. The forge reads run off the event loop; `view` comes back as given
+/// when they fail.
 async fn record_outcomes(
     sink: &FleetStateSink,
     input: &FleetInput,
-    curated: outcomes::Curated,
-    view: &FleetView,
+    (curated, triage): (outcomes::Curated, outcomes::Curated),
+    view: FleetView,
     now: DateTime<Utc>,
     workspace_pool: &crate::workspace_pool::WorkspacePool,
     slug_cache: &mut std::collections::HashMap<String, String>,
-) {
-    let mut memory = STATE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .outcomes
-        .clone();
+) -> FleetView {
+    let (mut memory, mut enrich_memory) = {
+        let state = STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (state.outcomes.clone(), state.enrich.clone())
+    };
     memory.curated_now = Some(curated);
+    memory.triage_now = Some(triage);
     let roots = sources::managed_roots(workspace_pool, slug_cache)
         .await
         .into_iter()
         .map(|(root, slug)| (slug, root))
         .collect();
     let listed = outcomes::listed(&input.listings);
-    let (view, managed) = (view.clone(), input.managed.clone());
+    let managed = input.managed.clone();
+    let original = view.clone();
     let joined = tokio::task::spawn_blocking(move || {
+        let mut view = view;
+        let mut forge = outcomes::GhForgeReads { roots };
+        let mut histories = enrich::Histories::new();
+        enrich::enrich(&mut view, &mut enrich_memory, &mut forge, &mut histories, now);
+        memory.warm = histories;
         let pass = outcomes::Pass {
             view: &view,
             listed: &listed,
             managed: &managed,
             now,
         };
-        let mut forge = outcomes::GhForgeReads { roots };
         let records = outcomes::diff(
             &mut memory,
             &pass,
             &mut forge,
             &crate::telemetry::provenance::Provenance::current(),
         );
-        (records, outcomes::remember(memory, &pass))
+        let memory = outcomes::remember(memory, &pass);
+        (records, memory, enrich_memory, view)
     })
     .await;
-    let (records, memory) = match joined {
+    let (records, memory, enrich_memory, view) = match joined {
         Ok(done) => done,
         Err(join_error) => {
             log::warn!("fleet.state: outcome diff panicked: {join_error}");
-            return;
+            return original;
         }
     };
-    STATE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .outcomes = memory;
+    {
+        let mut state = STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.outcomes = memory;
+        state.enrich = enrich_memory;
+    }
     outcomes::offer(records, sink);
+    view
 }
 
 /// Held for a whole pass, so a tick pass and a collector pass never diff
@@ -812,14 +1086,29 @@ pub(super) async fn record(
     };
     let _pass = pass_lock().lock().await;
     let now = Utc::now();
-    let (input, mut reused, curated) =
+    let (input, mut reused, curated, triage) =
         sources::gather(workspace_root, workspace_pool, slug_cache, &sink.host_id, now).await;
+    // The complete `loom:triage` sets this pass read, before `triage` is moved
+    // into the outcome diff (#11642). Every repo present was read whole.
+    let triage_sets: BTreeMap<String, BTreeSet<u32>> = triage
+        .iter()
+        .map(|(repo, items)| (repo.clone(), items.keys().copied().collect()))
+        .collect();
     let state = STATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
     let view = build_view(&input, state.prev.as_ref(), now);
-    record_outcomes(sink, &input, curated, &view, now, workspace_pool, slug_cache).await;
+    let mut view =
+        record_outcomes(sink, &input, (curated, triage), view, now, workspace_pool, slug_cache)
+            .await;
+    {
+        let mut live = STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        annotate_flow(&mut view, &mut live.flow, input.ready.as_ref(), now);
+        annotate_triage(&mut view, &mut live.triage_flow, Some(&triage_sets), now);
+    }
     for repo in view.repos.keys().chain(&input.managed) {
         if !reused.visibility.contains_key(repo) {
             let visibility = super::collector::resolve_visibility(repo).await;
@@ -845,8 +1134,81 @@ async fn record_tick(workspace_root: &Path, workspace_pool: &crate::workspace_po
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
-    let view = build_view(&input, state.prev.as_ref(), now);
+    let mut view = build_view(&input, state.prev.as_ref(), now);
+    {
+        let mut live = STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        annotate_flow(&mut view, &mut live.flow, input.ready.as_ref(), now);
+        // No forge read on a tick pass: re-stamp triage from the tracker's
+        // last collector-pass observation (#11642).
+        annotate_triage(&mut view, &mut live.triage_flow, None, now);
+    }
     send(sink, workspace_root, view, state, now, &reused);
+}
+
+/// Fold this pass's ready queue into `tracker` and stamp each repo's
+/// [`RepoView`] with its depth and flow (#11645). Only repos whose ready
+/// listing was read whole this pass (`ready.complete`) are observed: a partial
+/// set would read its missing rows as drains. A complete repo with no ready
+/// rows gets depth `0` — an empty queue is a fact, not unknown.
+fn annotate_flow(
+    view: &mut FleetView,
+    tracker: &mut QueueFlowTracker,
+    ready: Option<&ReadyQueue>,
+    now: DateTime<Utc>,
+) {
+    let Some(ready) = ready else {
+        return;
+    };
+    let mut sets: BTreeMap<String, BTreeSet<u32>> = BTreeMap::new();
+    for repo in &ready.complete {
+        sets.entry(repo.clone()).or_default();
+    }
+    for item in &ready.items {
+        if ready.complete.contains(&item.repo) {
+            sets.entry(item.repo.clone())
+                .or_default()
+                .insert(item.issue);
+        }
+    }
+    for (repo, set) in &sets {
+        tracker.observe(repo, set, now);
+        let state = view.repos.entry(repo.clone()).or_default();
+        state.queue_depth = Some(u32::try_from(set.len()).unwrap_or(u32::MAX));
+        state.flow = tracker.flow(repo, now);
+    }
+}
+
+/// Fold this pass's `loom:triage` sets into `tracker` and stamp each repo's
+/// [`RepoView`] with its triage depth and flow (#11642), the pre-ready
+/// analogue of [`annotate_flow`]. Only the collector pass reads the triage
+/// listings (`triage` is `Some`), and `label_listings` already drops any repo
+/// whose listing came back partial — so every repo present was read whole.
+/// A tick pass passes `None`: it re-stamps each repo from the tracker's last
+/// observed set, so the facts persist unchanged between the collector's forge
+/// passes (no delta churn, as [`annotate_flow`]'s idle repos do not churn).
+fn annotate_triage(
+    view: &mut FleetView,
+    tracker: &mut QueueFlowTracker,
+    triage: Option<&BTreeMap<String, BTreeSet<u32>>>,
+    now: DateTime<Utc>,
+) {
+    if let Some(sets) = triage {
+        for (repo, set) in sets {
+            tracker.observe(repo, set, now);
+        }
+    }
+    // Re-stamp every repo the tracker knows (both passes): the depth is its
+    // last observed set size, stable between the collector's forge reads.
+    for repo in tracker.observed_repos() {
+        let Some(depth) = tracker.depth(repo) else {
+            continue;
+        };
+        let state = view.repos.entry(repo.to_string()).or_default();
+        state.triage_depth = Some(depth);
+        state.triage_flow = tracker.flow(repo, now);
+    }
 }
 
 /// Diff `view` against what was last sent, send the record if any, and keep
@@ -912,3 +1274,28 @@ fn send(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[path = "fleet_state_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[path = "fleet_state_merge_blocked_tests.rs"]
+mod merge_blocked_tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[path = "fleet_state/facts_tests.rs"]
+mod facts_tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[path = "fleet_state/limits_tests.rs"]
+mod limits_tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[path = "fleet_state/queue_flow_tests.rs"]
+mod queue_flow_tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[path = "fleet_state/triage_flow_tests.rs"]
+mod triage_flow_tests;

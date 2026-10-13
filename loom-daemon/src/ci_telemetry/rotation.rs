@@ -16,15 +16,19 @@
 //!   older rotations shift up one (`.1` → `.2`, …) and anything past
 //!   `autonomous.ciTelemetry.journalRotateKeep` (default
 //!   [`DEFAULT_ROTATE_KEEP`]) is deleted. The next append creates a fresh
-//!   journal; the caller then resets the cursor's byte offset to 0.
+//!   journal. The caller has **already durably saved** a zero cursor offset
+//!   before this runs (see `export::rotate_if_due`).
 //! - **Dedup is unaffected.** The ledger (`seen.jsonl`), not the journal, is
 //!   the "never emit twice" authority, and rotation never touches it. The one
 //!   reader of old journal content is the crash-recovery replay, which also
 //!   scans the retained rotations ([`super::journal::Journal::missing`]).
 //!
-//! A crash between the rename and the cursor reset leaves a cursor past the
-//! end of the (new, short or missing) journal, which the export pass already
-//! treats as "the journal was replaced": it restarts from offset 0.
+//! The zero cursor is persisted (file + parent-directory fsync) *before* the
+//! rename, so a crash at any point leaves either the old journal with a zero
+//! cursor (the already-offered generation is replayed: at-least-once) or a new
+//! generation with a zero cursor. An old offset is never trusted for a new
+//! generation, however long that generation grows. The length check in the
+//! export pass only covers a journal replaced by something other than us.
 
 use std::fs::File;
 use std::io;
@@ -133,9 +137,7 @@ pub fn rotate(journal: &Path, keep: usize) -> io::Result<()> {
         std::fs::rename(journal, rotated_path(journal, 1))?;
     }
     if let Some(dir) = journal.parent() {
-        if let Ok(dir) = File::open(dir) {
-            let _ = dir.sync_all();
-        }
+        File::open(dir)?.sync_all()?;
     }
     Ok(())
 }

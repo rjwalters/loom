@@ -721,3 +721,14 @@ fn a_run_with_no_locatable_source_is_degraded_not_silently_live() {
     assert!(advance_run(run, &projects, now()).is_empty());
     assert!(!run.ever_covered, "no stream was found, so coverage must not claim live");
 }
+
+/// Issue #11527: `dropped_total` is a durable ledger sum, so a restarted
+/// producer's first observation baselines instead of counting every
+/// pre-restart loss as a gap against whatever runs happen to be open now.
+#[test]
+fn first_drop_total_observation_is_a_baseline_not_a_gap() {
+    let mut last = None;
+    assert_eq!(newly_dropped_since(&mut last, 10_582), 0);
+    assert_eq!(newly_dropped_since(&mut last, 10_582), 0);
+    assert_eq!(newly_dropped_since(&mut last, 10_584), 2);
+}

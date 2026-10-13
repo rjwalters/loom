@@ -217,8 +217,10 @@ pub(super) fn cand(dir: &Path, id: &str, issue: u32, age_secs: i64) -> Candidate
         repo: dir.to_path_buf(),
         pause_dir: Some(roll_pause::item_dir(&dir.join("pause"), id)),
         issue: Some(issue),
-        pid: Some(1_000_000 + issue),
-        pgid: Some(1_000_000 + issue),
+        // Above every platform's pid_max (#11263): H4 notes each stopped pid
+        // process-wide, so a fake one must never name a real test child.
+        pid: Some(10_000_000 + issue),
+        pgid: Some(10_000_000 + issue),
         scope_unit: None,
         agent_started_at: Some(Utc::now() - chrono::Duration::seconds(age_secs)),
         run_started_at: Some(Utc::now() - chrono::Duration::seconds(age_secs)),

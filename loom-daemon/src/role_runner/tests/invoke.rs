@@ -50,14 +50,14 @@ fn test_invoke_short_circuits_with_no_token_pool_before_running_the_script() {
     fs::write(&worker, format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display())).unwrap();
     fs::set_permissions(&worker, fs::Permissions::from_mode(0o755)).unwrap();
 
-    let before = no_token_pool_skip_count();
+    let before = NO_TOKEN_POOL_SKIP_COUNT.on_this_thread();
     let mut runner = ScriptRoleInvocationRunner::new(root.to_path_buf());
     let outcome = runner.invoke("curator", "/loom:curator");
 
     assert_eq!(outcome, RoleTickOutcome::NoTokenPool);
     assert!(!outcome.is_success());
     assert!(!marker.exists(), "the doomed script must never actually run");
-    assert_eq!(no_token_pool_skip_count(), before + 1);
+    assert_eq!(NO_TOKEN_POOL_SKIP_COUNT.on_this_thread(), before + 1);
 
     match prev_shared {
         Some(v) => std::env::set_var("LOOM_SHARED_TOKENS_DIR", v),
@@ -130,7 +130,7 @@ fn test_invoke_short_circuits_with_exhausted_token_pool_before_running_the_scrip
     fs::write(&worker, format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display())).unwrap();
     fs::set_permissions(&worker, fs::Permissions::from_mode(0o755)).unwrap();
 
-    let before = pool_exhausted_skip_count();
+    let before = POOL_EXHAUSTED_SKIP_COUNT.on_this_thread();
     let mut runner = ScriptRoleInvocationRunner::new(root.to_path_buf());
     let outcome = runner.invoke("curator", "/loom:curator");
 
@@ -139,7 +139,7 @@ fn test_invoke_short_circuits_with_exhausted_token_pool_before_running_the_scrip
     };
     assert_eq!(total, 1);
     assert!(!marker.exists(), "the doomed script must never actually run");
-    assert_eq!(pool_exhausted_skip_count(), before + 1);
+    assert_eq!(POOL_EXHAUSTED_SKIP_COUNT.on_this_thread(), before + 1);
 
     match prev_shared {
         Some(v) => std::env::set_var("LOOM_SHARED_TOKENS_DIR", v),
@@ -824,10 +824,10 @@ fn test_load_skipped_count_increments_on_load_skip_body() {
         .with_timeout(Duration::from_millis(300))
         .with_load_per_core_override(2.0);
 
-    let before = load_skipped_count();
+    let before = LOAD_SKIPPED_COUNT.on_this_thread();
     let outcome = runner.invoke("auditor", "/loom:auditor");
     assert!(matches!(outcome, RoleTickOutcome::LoadSkipped { .. }), "{outcome:?}");
-    assert_eq!(load_skipped_count(), before + 1);
+    assert_eq!(LOAD_SKIPPED_COUNT.on_this_thread(), before + 1);
 }
 
 #[test]

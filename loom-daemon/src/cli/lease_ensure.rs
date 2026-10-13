@@ -139,6 +139,11 @@ pub(crate) enum LeaseCommand {
     /// `cli::lease_renewer`.
     #[command(subcommand)]
     Renewer(super::lease_renewer::RenewerAction),
+
+    /// Role-keyed leases for the PR-phase claims (`loom:treating`,
+    /// `loom:reviewing`), #9401. See `cli::pr_lease`.
+    #[command(subcommand)]
+    Pr(super::pr_lease::PrLeaseAction),
 }
 
 impl LeaseCommand {
@@ -147,6 +152,7 @@ impl LeaseCommand {
             LeaseCommand::Ensure(args) => args.run(),
             LeaseCommand::CoOccupancy(args) => args.run(),
             LeaseCommand::Renewer(action) => action.run(),
+            LeaseCommand::Pr(action) => action.run(),
         }
     }
 }
@@ -361,6 +367,10 @@ impl LeaseEnsureArgs {
         let line = outcome.describe(self.issue);
         eprintln!("lease ensure: {line}");
         deferred::record(&self.workspace, self.issue, &line);
+        if let Outcome::Renewing { sweep_id, .. } = &outcome {
+            // #11563: an in-session sweep is an operator-origin sweep.start.
+            super::presence::on_lease_published(&self.workspace, self.issue, sweep_id);
+        }
         // #10570: a declined publish used to be final, so a claim made while a
         // released sweep's lease was still inside its TTL never got a lease of
         // its own and was reclaimed once that leftover aged out.

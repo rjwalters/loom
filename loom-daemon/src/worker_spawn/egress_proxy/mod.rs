@@ -32,7 +32,7 @@
 //! stays env-passthrough exactly as before, and the whole mechanism is off
 //! until `runtimes.containment.credentialProxy` says otherwise.
 //!
-//! # Two entry points, one mechanism
+//! # Three entry points, one mechanism
 //!
 //! - The **native-harness** contained dispatch ([`super::containment`], #8674)
 //!   calls [`prepare`], which resolves the real credential through the #8401
@@ -43,9 +43,13 @@
 //!   credential the adapter already selected, swaps it for a placeholder in the
 //!   environment of the `docker run` it launches, and serves the proxy for
 //!   exactly that launch's lifetime.
+//! - An **uncontained native** launch ([`prepare_native`], #11300 slice 3)
+//!   arms the same mechanism bound loopback only — the harness runs on this
+//!   host — and stays alive as the harness's parent so the placeholder's
+//!   lifetime stays exactly the launch's, like the contained path.
 //!
-//! Both go through [`arm`] and [`run_with_proxy`], so they share one registry
-//! shape, one placeholder format and one set of refusals.
+//! All three go through [`arm`] and [`run_with_proxy`], so they share one
+//! registry shape, one placeholder format and one set of refusals.
 //!
 //! # Account rotation (#8818)
 //!
@@ -56,6 +60,9 @@
 //! installs nothing, and every rotation request there is refused.
 
 pub mod exec;
+#[cfg(test)]
+#[path = "native_tests.rs"]
+mod native_tests;
 pub mod observe;
 pub mod registry;
 pub mod rotate_client;
@@ -131,7 +138,21 @@ pub struct ProfileProxy {
     /// effect only when [`observe::enabled`] is also true; default off.
     #[serde(default)]
     pub observe: bool,
+    /// The provider-config option key that receives the proxy base URL when
+    /// the harness reads its provider base URL from injected *configuration*
+    /// rather than the environment (issue #11300, slice 3). OpenCode is that
+    /// harness: its `provider.<id>.options.baseURL` rides the launch's
+    /// provisioned config (`OPENCODE_CONFIG_CONTENT`), so the launcher patches
+    /// that one option to the proxy URL and leaves the environment alone.
+    /// Inert on any runtime but `opencode` — dropped from the selection at
+    /// resolution, so a profile may declare it for its opencode binding while
+    /// other bindings keep launching (#11714); arming a runtime left with no
+    /// usable redirection fails closed in [`prepare_scoped`].
+    #[serde(default)]
+    pub base_url_config: Option<String>,
 }
+/// Longest accepted provider-config option key.
+const MAX_BASE_URL_CONFIG_LEN: usize = 64;
 
 impl ProfileProxy {
     /// Validate without binding anything — called from profile resolution so a
@@ -144,6 +165,19 @@ impl ProfileProxy {
                 return Err(LaunchError::config(
                     "model profile credentialProxy.baseUrlEnv must contain environment \
                      variable names",
+                ));
+            }
+        }
+        if let Some(option) = &self.base_url_config {
+            let ok = !option.is_empty()
+                && option.len() <= MAX_BASE_URL_CONFIG_LEN
+                && option
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'));
+            if !ok {
+                return Err(LaunchError::config(
+                    "model profile credentialProxy.baseUrlConfig must be a provider-config \
+                     option key (e.g. \"baseURL\")",
                 ));
             }
         }
@@ -173,7 +207,14 @@ fn truthy(value: &str) -> bool {
 /// keep running contained with plain env-passthrough.
 #[must_use]
 pub fn enabled(config: &Value) -> bool {
-    if let Some(raw) = env_nonempty("LOOM_NATIVE_CREDENTIAL_PROXY") {
+    enabled_with(config, &env_nonempty)
+}
+
+/// [`enabled`] with the environment injected, so a caller that already reads
+/// env through a seam (the LLM gateway's `plan_with`) asks the same question.
+#[must_use]
+pub fn enabled_with(config: &Value, env: &dyn Fn(&str) -> Option<String>) -> bool {
+    if let Some(raw) = env("LOOM_NATIVE_CREDENTIAL_PROXY").filter(|v| !v.trim().is_empty()) {
         return truthy(&raw);
     }
     match config.pointer("/runtimes/containment/credentialProxy") {
@@ -188,18 +229,114 @@ pub fn enabled(config: &Value) -> bool {
 pub struct Prepared {
     pub injection: containment::Injection,
     pub launch_id: String,
+    /// The proxy's own base URL — what `base_url_env` assignments and the
+    /// `base_url_config` config patch both point the harness at.
+    base_url: String,
     registry: Registry,
     bound: server::Bound,
     marker: String,
 }
 
 impl Prepared {
+    /// The proxy base URL the harness is pointed at.
+    #[must_use]
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     /// Secret-free one-line record for the per-sweep log, mirroring
     /// [`containment::Profile::dispatch_marker`]'s shape.
     #[must_use]
     pub fn dispatch_marker(&self) -> &str {
         &self.marker
     }
+
+    /// Apply this launch's substitution to an **uncontained native** command
+    /// (issue #11300, slice 3): the placeholder replaces the real credential
+    /// under every mapped name (overriding the by-name forwarding
+    /// [`crate::worker_spawn::harness`] already applied), every
+    /// `base_url_env` name is set to the proxy URL, and — when the profile
+    /// declared `base_url_config` — the provider-config option named there is
+    /// patched to the proxy URL inside the `OPENCODE_CONFIG_CONTENT` the
+    /// launch provisions.
+    ///
+    /// # Errors
+    ///
+    /// A `OPENCODE_CONFIG_CONTENT` that does not parse as a JSON object fails
+    /// closed: that content was written by this launcher's own provisioning,
+    /// so a malformed value means a bug or tampering, and silently launching
+    /// un-patched would send the placeholder straight at the real provider.
+    pub fn apply_native_env(
+        &self,
+        command: &mut Command,
+        provider_id: &str,
+        config_option: Option<&str>,
+    ) -> Result<(), LaunchError> {
+        for (name, value) in &self.injection.assignments {
+            command.env(name, value);
+        }
+        if let Some(option) = config_option {
+            patch_opencode_provider_base_url(command, provider_id, option, &self.base_url)?;
+        }
+        Ok(())
+    }
+}
+
+/// Patch the OpenCode provider-config option `option` on provider `provider_id`
+/// to `base_url`, inside the `OPENCODE_CONFIG_CONTENT` env `command` already
+/// carries (`native_tools::provision` wrote it; the guarded path always does,
+/// the unguarded path only when the profile declared a provider block).
+///
+/// A missing or empty value starts a fresh config object — the same shape
+/// [`crate::native_tools::provision::merge_provider`] builds — because the
+/// only harness that reads this variable is the one being pointed at the
+/// proxy. An explicit assignment always wins over an inherited ambient value,
+/// so an ambient `OPENCODE_CONFIG_CONTENT` the launcher cannot see through
+/// [`std::process::Command::get_env`] is read from the launcher's own
+/// environment for the merge and then overridden.
+fn patch_opencode_provider_base_url(
+    command: &mut Command,
+    provider_id: &str,
+    option: &str,
+    base_url: &str,
+) -> Result<(), LaunchError> {
+    let explicit = command
+        .get_envs()
+        .find(|(name, _)| *name == std::ffi::OsStr::new("OPENCODE_CONFIG_CONTENT"))
+        .and_then(|(_, value)| value.map(std::ffi::OsString::from));
+    let raw = explicit
+        .or_else(|| std::env::var_os("OPENCODE_CONFIG_CONTENT"))
+        .filter(|value| !value.is_empty());
+    let mut config: Value = match raw {
+        Some(raw) => serde_json::from_slice(raw.as_encoded_bytes()).map_err(|error| {
+            LaunchError::config(format!(
+                "credentialProxy.baseUrlConfig cannot patch OPENCODE_CONFIG_CONTENT: {error}"
+            ))
+        })?,
+        None => serde_json::json!({}),
+    };
+    let object = config.as_object_mut().ok_or_else(|| {
+        LaunchError::config(
+            "credentialProxy.baseUrlConfig cannot patch OPENCODE_CONFIG_CONTENT: not a JSON \
+             object",
+        )
+    })?;
+    fn at<'a>(
+        object: &'a mut serde_json::Map<String, Value>,
+        key: &str,
+    ) -> &'a mut serde_json::Map<String, Value> {
+        let entry = object
+            .entry(key.to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        if !entry.is_object() {
+            *entry = serde_json::json!({});
+        }
+        entry.as_object_mut().expect("object entry")
+    }
+    let value = at(at(at(object, "provider"), provider_id), "options");
+    value.insert(option.to_string(), Value::String(base_url.to_string()));
+    command.env("OPENCODE_CONFIG_CONTENT", config.to_string());
+    Ok(())
 }
 
 /// Hand-written, NOT derived: this struct reaches both the placeholder (inside
@@ -234,6 +371,73 @@ pub fn prepare(
     config: &Value,
     runtime: &str,
 ) -> Result<Option<Prepared>, LaunchError> {
+    prepare_scoped(root, selection, config, runtime, Scope::Contained)
+        .map(|prepared| prepared.map(|(prepared, _)| prepared))
+}
+
+/// [`prepare`] for an **uncontained native** launch (issue #11300, item 5):
+/// the same substitution, bound **loopback only** — the harness runs on this
+/// host, so loopback is both reachable and the tightest scope available, and
+/// the container-only machinery (bridge-gateway discovery, the api-keys tmpfs
+/// mask, `host.docker.internal`) does not apply.
+///
+/// Returns the [`credential::Resolved`] alongside the [`Prepared`] so the
+/// launcher can hand the harness command exactly the credential the proxy
+/// holds: unlike the contained path, there is no container re-exec whose
+/// profile resolution would re-read the substitution — a second resolution
+/// here would run the pool ladder twice and could land on a different account.
+///
+/// Refused (fail closed) on a non-native runtime that declares a
+/// `credentialProxy` block. Selection has already dropped an inert
+/// `base_url_config` off a non-opencode runtime (#11714), so the check below
+/// only fires for a hand-built selection — defense in depth alongside
+/// `prepare_scoped`'s armed-path redirect check.
+pub fn prepare_native(
+    root: &std::path::Path,
+    selection: &Selection,
+    config: &Value,
+    runtime: &str,
+) -> Result<Option<(Prepared, credential::Resolved)>, LaunchError> {
+    if !super::is_native(runtime) {
+        if selection.credential_proxy.is_some() {
+            return Err(LaunchError::config(
+                "model profile credentialProxy is only supported on the native runtimes (pi, \
+                 opencode, kimi); this launch resolved a legacy adapter",
+            ));
+        }
+        return Ok(None);
+    }
+    if selection
+        .credential_proxy
+        .as_ref()
+        .is_some_and(|proxy| proxy.base_url_config.is_some())
+        && runtime != "opencode"
+    {
+        return Err(LaunchError::config(
+            "model profile credentialProxy.baseUrlConfig is only supported by the opencode \
+             harness, whose provider base URL is provisioned through OPENCODE_CONFIG_CONTENT",
+        ));
+    }
+    prepare_scoped(root, selection, config, runtime, Scope::NativeLoopback)
+}
+
+/// Where the listener binds and which container-only machinery applies.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    /// The launch runs in a container: docker-aware bind, per-repo api-keys
+    /// tmpfs mask, `--add-host …:host-gateway` (#8674).
+    Contained,
+    /// The launch runs on this host: loopback bind, nothing container-side.
+    NativeLoopback,
+}
+
+fn prepare_scoped(
+    root: &std::path::Path,
+    selection: &Selection,
+    config: &Value,
+    runtime: &str,
+    scope: Scope,
+) -> Result<Option<(Prepared, credential::Resolved)>, LaunchError> {
     if !enabled(config) {
         return Ok(None);
     }
@@ -241,6 +445,33 @@ pub fn prepare(
         return Ok(None);
     };
     let upstream = declared.validate()?;
+    // Where the armed proxy may re-point the harness. The container provisions
+    // its config INSIDE, where this launcher never runs: a config-side base
+    // URL override is patched on the host, into a command the launcher builds
+    // itself, so it is uncontained-native only (#11300 slice 3). Gated on
+    // `enabled` here so a flag-off launch stays plain env-passthrough — a
+    // profile may DECLARE config-side redirection for its opencode binding
+    // while other bindings launch unproxied (#11714).
+    if scope == Scope::Contained && declared.base_url_config.is_some() {
+        return Err(LaunchError::config(
+            "model profile credentialProxy.baseUrlConfig is only supported on uncontained \
+             native launches; a contained launch is re-pointed with baseUrlEnv instead",
+        ));
+    }
+    // A proxy the armed harness would not follow substitutes the placeholder
+    // while the traffic still goes to the real upstream: fail closed rather
+    // than half-proxy. OpenCode is re-pointed through its provisioned config;
+    // every other harness only through baseUrlEnv (#11714).
+    let redirected = !declared.base_url_env.is_empty()
+        || (scope == Scope::NativeLoopback && declared.base_url_config.is_some());
+    if !redirected {
+        return Err(LaunchError::config(format!(
+            "credentialProxy is enabled for this profile but nothing re-points the {runtime} \
+             harness at the proxy, so the credential placeholder would still be sent to the \
+             real upstream; declare credentialProxy.baseUrlEnv for this runtime or leave the \
+             credentialProxy flag off"
+        )));
+    }
     // One account file is one assignment, and one placeholder stands for one
     // credential. A multi-variable provider (Bedrock, Vertex) has no single
     // value to substitute, so refuse rather than proxy one variable and leak
@@ -301,19 +532,29 @@ pub fn prepare(
         let seat = pool_attribution
             .as_ref()
             .map_or("-", |attribution| attribution.account.as_str());
-        observe_context(runtime, selection, seat)
+        // The proxy runs in this launcher process, which has no ops sink:
+        // journal for the daemon's backfill instead (#11300).
+        observe_context(runtime, selection, seat).with_journal(root)
     });
-    arm(
+    let mask_dirs = match scope {
+        Scope::Contained => vec![crate::api_keys_pool::paths::per_repo_api_keys_dir(root)],
+        // No container filesystem to mask: the harness reads the workspace
+        // with host permissions by design, and the placeholder is the only
+        // credential it is ever handed.
+        Scope::NativeLoopback => Vec::new(),
+    };
+    let prepared = arm(
         secret,
         provider,
         &declared,
         upstream,
         &[source.as_str(), target.as_str()],
-        vec![crate::api_keys_pool::paths::per_repo_api_keys_dir(root)],
+        mask_dirs,
         pool_attribution,
         observe,
-    )
-    .map(Some)
+        scope,
+    )?;
+    Ok(Some((prepared, resolved)))
 }
 
 /// Observe-mode tags for a launch on `runtime` (the launcher's resolved
@@ -362,12 +603,21 @@ fn arm(
     mask_dirs: Vec<std::path::PathBuf>,
     pool_attribution: Option<PoolAttribution>,
     observe: Option<observe::ObserveContext>,
+    scope: Scope,
 ) -> Result<Prepared, LaunchError> {
-    let (bind_ip, container_host) = resolve_bind();
+    let (bind_ip, host) = match scope {
+        Scope::Contained => resolve_bind(),
+        // The harness runs on this host; loopback is reachable and no other
+        // address is ever needed, so no override is offered.
+        Scope::NativeLoopback => (
+            IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            std::net::Ipv4Addr::LOCALHOST.to_string(),
+        ),
+    };
     let bound = server::Bound::bind(bind_ip).map_err(|e| {
         LaunchError::config(format!("credentialProxy cannot bind a listener on {bind_ip}: {e}"))
     })?;
-    let base_url = format!("http://{container_host}:{}", bound.addr().port());
+    let base_url = format!("http://{host}:{}", bound.addr().port());
 
     let launch_id = uuid::Uuid::new_v4().simple().to_string();
     let placeholder = Placeholder::generate();
@@ -417,9 +667,10 @@ fn arm(
             assignments,
             withheld,
             mask_dirs,
-            add_host_gateway: true,
+            add_host_gateway: scope == Scope::Contained,
         },
         launch_id,
+        base_url,
         registry,
         bound,
         marker,
@@ -466,11 +717,11 @@ pub fn run_with_proxy(
         } else {
             126
         },
-        message: format!("cannot execute contained worker: {error}"),
+        message: format!("cannot execute worker harness under the credential proxy: {error}"),
     })?;
     let status = child.wait().map_err(|error| LaunchError {
         code: 126,
-        message: format!("contained worker could not be waited on: {error}"),
+        message: format!("worker harness could not be waited on: {error}"),
     });
     // Invalidate FIRST, whatever happened: a placeholder that escaped the
     // container must be dead the moment the launch is over.
@@ -530,8 +781,13 @@ fn resolve_bind() -> (IpAddr, String) {
     (IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), "host.docker.internal".to_string())
 }
 
+/// Probe the docker bridge gateway. The program resolves through the shared
+/// [`docker_program`](crate::sweep_registry::reaper::container_stop::docker_program)
+/// so a `cfg(test)` build never runs the host's real `docker` (#11449,
+/// #11523): there the probe fails at once and the caller takes the loopback
+/// fallback.
 fn docker_bridge_gateway() -> Option<IpAddr> {
-    let mut command = Command::new("docker");
+    let mut command = Command::new(crate::sweep_registry::reaper::container_stop::docker_program());
     command.args([
         "network",
         "inspect",

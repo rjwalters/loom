@@ -926,6 +926,11 @@ enum Divergence {
     /// corpus pins `$HOME` and the config tiers to a fixture with no fleet
     /// store. Any other difference stays unexplained.
     HelpDocumentsFleetFloorCheck,
+    /// MECHANISM: #11539 documented the third safe ff-abort class (dirty
+    /// tracked files all identical to origin) in `--help`: exactly the two
+    /// [`IDENTICAL_TO_ORIGIN_INSERTS`] blocks, each before its single anchor.
+    /// rc and stderr identical. Documentation only; anything else unexplained.
+    HelpDocumentsIdenticalToOriginSafeAbort,
     /// MECHANISM: #11069 stopped the stale-entry-point advisory from telling
     /// the operator to `rm` entries `--prune-stale-entry-points` would not
     /// remove (it had told them to delete provisioning's rollback copy). For
@@ -960,7 +965,7 @@ fn classify(shell: &Answer, port: &Answer) -> Result<Vec<Divergence>, ()> {
     // `--help` now carries several documented additions, so accept any
     // combination of them — never anything else.
     // Each class is one or more (anchor, block) insertions, applied together.
-    let additions: [(Divergence, &[(&str, &str)]); 4] = [
+    let additions: [(Divergence, &[(&str, &str)]); 5] = [
         (Divergence::HelpDocumentsTagPin, &[(TAG_PIN_ANCHOR, TAG_PIN_HELP_LINE)]),
         (
             Divergence::HelpDocumentsSymlinkedDest,
@@ -971,6 +976,10 @@ fn classify(shell: &Answer, port: &Answer) -> Result<Vec<Divergence>, ()> {
             &[(HELP_BLOCK_ANCHOR, REQUIRE_SIGNATURE_HELP_BLOCK)],
         ),
         (Divergence::HelpDocumentsFleetFloorCheck, &FLOOR_CHECK_INSERTS),
+        (
+            Divergence::HelpDocumentsIdenticalToOriginSafeAbort,
+            &IDENTICAL_TO_ORIGIN_INSERTS,
+        ),
     ];
     for mask in 1u8..(1 << additions.len()) {
         let mut expected = shell.stdout.clone();
@@ -1568,6 +1577,10 @@ mod corpus;
 #[path = "differential_daemon_update/floor_check_help.rs"]
 mod floor_check_help;
 use floor_check_help::FLOOR_CHECK_INSERTS;
+
+#[path = "differential_daemon_update/identical_to_origin_help.rs"]
+mod identical_to_origin_help;
+use identical_to_origin_help::IDENTICAL_TO_ORIGIN_INSERTS;
 
 #[path = "differential_daemon_update/stale_remediation.rs"]
 mod stale_remediation;

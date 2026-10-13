@@ -243,7 +243,8 @@ struct Script<'a> {
 }
 
 /// A registry with forge writes enabled, driven by a fake `gh` that logs every
-/// argv to `gh.log` and every `PATCH` payload to `payloads.log`.
+/// argv to `gh.log`, every `PATCH` payload to `payloads.log`, and each call's
+/// `GH_CONFIG_DIR` with its argv (`<dir>|<argv>`) to `gh-creds.log`.
 fn registry(ws: &Path, s: &Script) -> (SweepRegistry, PathBuf, PathBuf) {
     let log = ws.join("gh.log");
     let payloads = ws.join("payloads.log");
@@ -251,6 +252,7 @@ fn registry(ws: &Path, s: &Script) -> (SweepRegistry, PathBuf, PathBuf) {
     let script = format!(
         "#!/usr/bin/env bash\n\
          printf '%s\\n' \"$*\" >> \"{log}\"\n\
+         printf '%s|%s\\n' \"${{GH_CONFIG_DIR:-}}\" \"$*\" >> \"{creds}\"\n\
          if [[ \"$1\" == \"api\" && \"$2\" == \"-X\" && \"$3\" == \"PATCH\" ]]; then\n\
          cat \"$6\" >> \"{payloads}\"; printf '\\n' >> \"{payloads}\"\n\
          if [[ {patch} -ne 0 ]]; then printf 'HTTP 403: body write refused\\n' >&2; fi\n\
@@ -273,6 +275,7 @@ fn registry(ws: &Path, s: &Script) -> (SweepRegistry, PathBuf, PathBuf) {
          fi\n\
          exit 0\n",
         log = log.display(),
+        creds = ws.join("gh-creds.log").display(),
         payloads = payloads.display(),
         patch = s.patch_exit,
         sleep = s.view_sleep,
@@ -534,4 +537,69 @@ fn a_wedged_gh_fails_the_prless_hold_closed_without_a_label_edit() {
     );
     let calls = calls(&log);
     assert!(position(&calls, "issue edit").is_none(), "no second timeout: {calls:?}");
+}
+
+/// #11437: the no-op hold writes its record and label on a cross-owner
+/// (2AMLogic-style) workspace whose only write credential is its own
+/// per-owner one; the process credential there is read-only. The hold goes
+/// through the registry facade and never re-vets with the process credential.
+#[test]
+#[serial]
+fn the_prless_hold_writes_on_a_cross_owner_root() {
+    use crate::credential_preflight::{clear_owner_root_registry, register_root_gh_config_dir};
+    use crate::write_scope_test_support::WritableRoot;
+
+    std::env::remove_var("LOOM_REPO");
+    clear_owner_root_registry();
+    let dir = tempdir().unwrap();
+    let base = std::fs::canonicalize(dir.path()).unwrap();
+    let root = base.join("2amlogic-root");
+    // Process credential: pull only. The owner's credential is registered.
+    let fixture = WritableRoot::read_only(&root, None);
+    let owner_dir = base.join("gh-config-2amlogic");
+    std::fs::create_dir_all(&owner_dir).unwrap();
+    register_root_gh_config_dir(&root, &owner_dir);
+
+    let view = view_answer(121);
+    let (mut reg, log, payloads) = registry(
+        &root,
+        &Script {
+            view: &view,
+            view_sleep: 0,
+            patch_exit: 0,
+        },
+    );
+    hold_at_threshold(&mut reg, 121);
+
+    assert!(reg.prless_retry_held(121));
+    let calls = calls(&log);
+    assert!(
+        position(&calls, "api -X PATCH repos/").is_some(),
+        "no body write on the cross-owner root: {calls:?}"
+    );
+    assert!(
+        position(&calls, "issue edit 121 --add-label loom:blocked --remove-label loom:issue")
+            .is_some(),
+        "no label edit on the cross-owner root: {calls:?}"
+    );
+    assert_eq!(patched_bodies(&payloads).len(), 1);
+    // Both writes carried the owner's credential, not the process's.
+    let creds = std::fs::read_to_string(root.join("gh-creds.log")).unwrap_or_default();
+    let owner = owner_dir.display().to_string();
+    for write in [
+        "api -X PATCH repos/",
+        "issue edit 121 --add-label loom:blocked",
+    ] {
+        let lines: Vec<&str> = creds.lines().filter(|l| l.contains(write)).collect();
+        assert!(!lines.is_empty(), "no `{write}` call logged: {creds}");
+        for line in lines {
+            assert_eq!(
+                line.split('|').next(),
+                Some(owner.as_str()),
+                "`{write}` not under the owner's GH_CONFIG_DIR: {line}"
+            );
+        }
+    }
+    drop(fixture);
+    clear_owner_root_registry();
 }

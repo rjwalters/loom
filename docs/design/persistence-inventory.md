@@ -200,7 +200,7 @@ These were found by the R3-R5 sweeps and are listed so the coverage claim is
 complete. None of them holds execution, telemetry or configuration-snapshot
 data. They are **RETAIN**.
 
-- **Locks and mutexes**, which hold no data: `.loom/locks/{build-slot, issue-filing, worktree-add, docs-guide-lock}` (`build_slot.rs`, `filing_lock.rs`, `worktree_cli/lock.rs`); the machine in-flight registry `owner.json` (`inflight.rs:97`); the chain-head merge lock (`merge_pr/chain_lock.rs:60`); the ceiling control lock (`runtime_preference/ceiling.rs:123`); token-pool `.lock` siblings; the native binding locks (`native_tools/provision/shared.rs`).
+- **Locks and mutexes**, which hold no data: `.loom/locks/{build-slot, issue-filing, worktree-add, docs-guide-lock}` (`build_slot.rs`, `filing_lock.rs`, `worktree_cli/lock.rs`); the machine in-flight registry `owner.json` (`inflight.rs:97`); the ceiling control lock (`runtime_preference/ceiling.rs:123`); token-pool `.lock` siblings; the native binding locks (`native_tools/provision/shared.rs`).
 - **Credentials**, which are secret-bearing and stay outside every repo per policy: `~/.loom/tokens/` and its `.bad_tokens`, allowlist, failure counts, rotation cursor, `ranking.json`, `.ranking.weekly.json`, `.ranking.classes.json` (`tokens.rs:68`, `tokens_pool/*`); session holds (`tokens_pool/session_hold.rs:55`); `.session-managed.json` (`tokens_pool/session_lifecycle.rs:531`); account health (`tokens_pool/health.rs:431`); codex profiles and the profile ledger (`tokens_pool/paths.rs:90`, `tokens_pool/profile_ledger.rs:37`); the API-key pool and its `.bad_accounts.json`, `.limits.json`, `.sync_state.json` (`api_keys_pool/paths.rs:54`, `api_keys_pool/bad_marks.rs:58`, `api_keys_pool/limits.rs:42`, `api_keys_pool/sync.rs:61`); the private-workspace leases (`tokens_pool/private_workspace/lease.rs:24`); the forge identity sidecar (`forge_identity/sidecar.rs:22`); and `.loom/gh-config*/`.
 - **Caches**, rebuildable from their sources: the forge ETag / listing cache (`forge_etag_store.rs:60`); the forge-egress doctor cache (`forge_egress/gate.rs:40`); the package cache (`native_readiness/package_cache.rs:369`); `usage-cache.json` (`script_helpers/usage.rs:150`); `pr-merge-state.json` (`sweep_outcome_summary.rs:588`); `metrics_state.json` (`metrics_collector.rs:79`); the transcript archive manifests (`activity/transcript_archive.rs:29`); the token-ranking refresh summaries (`token_ranking_refresh.rs`).
 - **Install and provisioning artifacts**: `.loom/manifest.json` (`defaults/scripts/verify-install.sh:117`); the daemon install-state record (`daemon_update/provision/txn.rs:69`); the native session record (`native_tools/provision/reap.rs:63`); `gh-config-rollback.json` (`forge_egress/publication.rs:197`); the resync pins (`resync_pin.rs:242`); release adoption (`release_fetch/source.rs:109`); fleet experiments (`script_helpers/fleet_experiment/lifecycle.rs:92`).
@@ -235,6 +235,8 @@ already has every property needed here:
   "Single writer" means one module and one lock. The daemon and the
   `loom-daemon` CLI subcommands (for example `sweep-checkpoint write`) are the
   same crate, so they share it. Q2 discusses why IPC was not chosen.
+  *Implemented deviation (2a, #11345):* the lock is a stable per-stream
+  `<stream>/.lock` file, not the active segment, whose identity changes on rotation.
 - **Segments**: `<journal>/<stream>/<seq:010>.jsonl`. A new segment starts
   at a size bound. The segment holding the oldest unacknowledged cursor
   position is never deleted. This is the #11045 rule (`ci_telemetry/rotation.rs`)
@@ -291,6 +293,21 @@ SHA). `data` depends on the kind. New fields are optional only (§11.4).
 | `recovery.event` | E10 | the existing event payload |
 | `snapshot` | (new) compaction | the materialised projections (§10) as of `seq` |
 
+*Implemented (2b, #11346):* `journal::execution`, default off
+(`LOOM_EXECUTION_JOURNAL=shadow`; root `LOOM_JOURNAL_DIR`, default
+`~/.loom/journal`; a root inside a git repository is refused;
+`LOOM_JOURNAL_SHADOW_VERIFY=off` skips the per-append comparison). Deviations:
+the 2a envelope has no `subject`/`writer.host`, so each record's `data`
+carries `subject`, plus `store`/`path`/`item` and an `op` (`set`, an RFC 7386
+`patch`, or `remove`) from which projections rebuild. E2 rewrites journal a
+`patch`. The PR-less counted sidecar uses E9's own `prless.counted` kind,
+because the count is decided after `sweep.terminal` is written, so
+`sweep.terminal` has no `prless_counted`. `prless.cleared` has no `reason`,
+because the producer does not know one. The divergence counter is in-process
+(`divergence_count()`) plus a WARN and the durable `journal.divergence` record.
+`loom-daemon journal verify --concern execution` is the read-only full
+sweep. It also runs, logged, at daemon start when the journal is enabled.
+
 ### 9.3 J2, the telemetry journal
 
 **Location:** `<ws>/.loom/state/journal/telemetry/<stream>/`. Telemetry is
@@ -312,6 +329,22 @@ They all share one envelope, one writer and one cursor implementation.
 **Export:** each exporter keeps one cursor per stream. The sender reads from
 those cursors. T10 (the full-copy queue) and T11 (the timestamp cursor) become
 unnecessary.
+
+*Implemented in 2d (#11348), shadow only:* `telemetry::journal_shadow`
+appends T1-T6 after each legacy write succeeds. It is default-off: it runs only
+when `LOOM_TELEMETRY_JOURNAL` is truthy, and an absolute
+`LOOM_TELEMETRY_JOURNAL_ROOT` overrides the location above. A shadow failure is
+logged and never fails the legacy write. T1/T2/T5 `data` is the envelope
+verbatim; T3/T4/T6 `data` is the legacy line. T4 keys records by the legacy
+dedupe key, but the `seen` set stays authoritative. Deviations:
+(1) concern verify is `loom-daemon telemetry verify`, not
+`journal verify --concern`, so sibling slices do not conflict in `journal_cli`;
+(2) comparison happens on demand in `verify`, not per write
+(`persistence.shadowVerify` is not implemented);
+(3) divergence reports go to a separate journal,
+`…/telemetry-divergence/compare/`, not into the telemetry streams. They contain
+counts, kinds, keys and fingerprints only. `verify --rotate` acknowledges and
+rotates a stream only after it compares clean.
 
 ### 9.4 J3, the configuration-snapshot journal
 

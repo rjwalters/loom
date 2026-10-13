@@ -33,9 +33,14 @@ pub(super) struct ResponseOutcome {
     pub counts: SignalCounts,
     pub retry: bool,
     pub error: Option<ExportError>,
+    /// The durable loss-ledger reason (Issue #11527) when this outcome
+    /// permanently lost items — `status_400`, `non_json_response`, …
+    /// `None` for retries (a held or re-queued batch loses nothing) and for
+    /// accepted requests.
+    pub loss_reason: Option<String>,
 }
 impl ResponseOutcome {
-    fn failure(items: u64, retry: bool, detail: &str) -> Self {
+    fn failure(items: u64, retry: bool, detail: &str, loss_reason: Option<String>) -> Self {
         Self {
             counts: if retry {
                 SignalCounts {
@@ -50,6 +55,7 @@ impl ResponseOutcome {
             },
             retry,
             error: Some(ExportError::Transport(detail.to_string())),
+            loss_reason,
         }
     }
 }
@@ -57,13 +63,15 @@ impl ResponseOutcome {
 pub(super) async fn post<T: Serialize + Sync>(
     client: &reqwest::Client,
     endpoint: &str,
-    key: &str,
+    key: Option<&str>,
     extra_headers: &super::RequestHeaders,
     signal: Signal,
     items: u64,
     body: &T,
 ) -> ResponseOutcome {
-    // `apply` is `bearer_auth(key)` when there are no extra headers (#10961).
+    // `apply` is `bearer_auth(key)` when there are no extra headers
+    // (#10961), and adds no Bearer at all when no key was resolved
+    // (#11555).
     let result = extra_headers
         .apply(client.post(endpoint), key)
         .json(body)
@@ -80,17 +88,36 @@ pub(super) async fn post<T: Serialize + Sync>(
                 } else {
                     "OTLP request transport failed"
                 },
+                None,
             )
         }
     };
     let status = response.status().as_u16();
     if status != 200 {
-        // OTLP explicitly enumerates retriable HTTP responses. Other statuses,
-        // including 400 and 500, must not permanently pin a poison batch.
+        // A credential refusal (Issue #11527) is a *hold*, not a drop: 401
+        // and 403 mean the receiver refused this batch's authorization — an
+        // expired or rotated ingest key — so the batch stays queued until
+        // the credential is fixed, exactly like a transient outage. OTLP
+        // explicitly enumerates the other retriable statuses; anything else
+        // (400, 404, 413, 500, …) must not permanently pin a poison batch,
+        // so it is dropped — durably counted by reason.
+        if matches!(status, 401 | 403) {
+            return ResponseOutcome::failure(
+                items,
+                true,
+                &format!(
+                    "OTLP HTTP {status} (credential refused; batch held until the \
+                     credential is fixed)"
+                ),
+                None,
+            );
+        }
         return ResponseOutcome::failure(
             items,
             matches!(status, 429 | 502 | 503 | 504),
             &format!("OTLP HTTP {status}"),
+            (!matches!(status, 429 | 502 | 503 | 504))
+                .then(|| super::super::loss_ledger::reason_for_status(status)),
         );
     }
     let is_json = response
@@ -104,6 +131,7 @@ pub(super) async fn post<T: Serialize + Sync>(
             items,
             false,
             "OTLP response is not application/json; acceptance unknown",
+            Some(super::super::loss_ledger::REASON_NON_JSON_RESPONSE.to_string()),
         );
     }
     let mut bytes = Vec::new();
@@ -117,6 +145,7 @@ pub(super) async fn post<T: Serialize + Sync>(
                     items,
                     false,
                     "OTLP response exceeds 4096 bytes; acceptance unknown",
+                    Some(super::super::loss_ledger::REASON_RESPONSE_TOO_LARGE.to_string()),
                 )
             }
             Ok(None) => break,
@@ -127,6 +156,7 @@ pub(super) async fn post<T: Serialize + Sync>(
                     items,
                     true,
                     "OTLP response read failed; acceptance unknown",
+                    None,
                 )
             }
         }
@@ -135,8 +165,14 @@ pub(super) async fn post<T: Serialize + Sync>(
 }
 
 fn parse_response(signal: Signal, items: u64, bytes: &[u8]) -> ResponseOutcome {
-    let invalid =
-        || ResponseOutcome::failure(items, false, "invalid OTLP response; acceptance unknown");
+    let invalid = || {
+        ResponseOutcome::failure(
+            items,
+            false,
+            "invalid OTLP response; acceptance unknown",
+            Some(super::super::loss_ledger::REASON_INVALID_RESPONSE.to_string()),
+        )
+    };
     let Ok(serde_json::Value::Object(body)) = serde_json::from_slice(bytes) else {
         return invalid();
     };
@@ -150,6 +186,7 @@ fn parse_response(signal: Signal, items: u64, bytes: &[u8]) -> ResponseOutcome {
             },
             retry: false,
             error: None,
+            loss_reason: None,
         };
     };
     let Some(partial) = partial.as_object() else {
@@ -189,6 +226,7 @@ fn parse_response(signal: Signal, items: u64, bytes: &[u8]) -> ResponseOutcome {
                 signal.unit()
             ))
         }),
+        loss_reason: None,
     }
 }
 
