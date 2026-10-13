@@ -379,6 +379,84 @@ fn stop_pid_never_signals_a_real_unrelated_process() {
     child.wait().unwrap();
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn native_stop_preserves_script_filename_boundaries() {
+    // Own and reap only the fixture children, even if an assertion fails.
+    struct OwnedChild(std::process::Child);
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let spaced = dir.path().join("checkout with spaces");
+    std::fs::create_dir(&spaced).unwrap();
+    for (filename, genuine) in [
+        ("sweep-lease-renew.sh start 7", false),
+        ("sweep-lease-renew.sh", true),
+    ] {
+        let path = spaced.join(filename);
+        // read is a bash builtin, so there are no grandchildren to orphan.
+        std::fs::write(&path, "while :; do read -r -t 1 || :; done\n").unwrap();
+        let mut command = Command::new("/bin/bash");
+        command.arg(&path).stdin(std::process::Stdio::piped());
+        if genuine {
+            command.args(["start", "7"]);
+        }
+        let mut child = OwnedChild(command.spawn().unwrap());
+        let pid = child.0.id();
+        let expected = if genuine {
+            vec![
+                "/bin/bash".to_owned(),
+                path.to_str().unwrap().to_owned(),
+                "start".to_owned(),
+                "7".to_owned(),
+            ]
+        } else {
+            vec!["/bin/bash".to_owned(), path.to_str().unwrap().to_owned()]
+        };
+        // Wait for exec to complete; reading the pre-exec parent is not a
+        // statement about the script's argv.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while process_argv(pid).as_ref() != Some(&expected) {
+            assert!(std::time::Instant::now() < deadline, "native argv never matched {expected:?}");
+            assert!(child.0.try_wait().unwrap().is_none());
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let sent = RefCell::new(vec![]);
+        let result = stop_pid(
+            &pid.to_string(),
+            std::process::id(),
+            &start_identity,
+            &process_argv,
+            &|target| {
+                assert_eq!(target, pid, "only our fixture child can be signalled");
+                sent.borrow_mut().push(target);
+                // SAFETY: the target is this test's owned, verified child.
+                assert_eq!(
+                    unsafe { libc::kill(libc::pid_t::try_from(target).unwrap(), libc::SIGTERM) },
+                    0
+                );
+            },
+        );
+        if genuine {
+            assert_eq!(result, StopOutcome::Stopped);
+            assert_eq!(*sent.borrow(), [pid]);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while child.0.try_wait().unwrap().is_none() {
+                assert!(std::time::Instant::now() < deadline, "verified fixture did not stop");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        } else {
+            assert!(matches!(result, StopOutcome::Refused(_)), "{result:?}");
+            assert!(sent.borrow().is_empty());
+            assert!(child.0.try_wait().unwrap().is_none(), "unrelated script must survive");
+        }
+    }
+}
+
 #[test]
 fn end_owners_matches_any_sweep_for_the_issue_but_never_a_peer() {
     let (_d, s) = store();

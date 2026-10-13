@@ -440,25 +440,8 @@ pub(crate) fn is_renewer_argv(argv: &[String]) -> bool {
     script_start || daemon
 }
 
-/// A process's argv: `/proc/<pid>/cmdline` on Linux, `ps -o command=` elsewhere
-/// (macOS). `None` when the process is gone or unreadable.
-pub(crate) fn process_argv(pid: u32) -> Option<Vec<String>> {
-    if let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) {
-        let argv: Vec<String> = raw
-            .split(|b| *b == 0)
-            .filter(|p| !p.is_empty())
-            .map(|p| String::from_utf8_lossy(p).into_owned())
-            .collect();
-        return (!argv.is_empty()).then_some(argv);
-    }
-    let out = Command::new("ps")
-        .args(["-o", "command=", "-p", &pid.to_string()])
-        .output()
-        .ok()?;
-    let s = String::from_utf8_lossy(&out.stdout);
-    let argv: Vec<String> = s.split_whitespace().map(str::to_string).collect();
-    (out.status.success() && !argv.is_empty()).then_some(argv)
-}
+mod process_args;
+use process_args::process_argv;
 
 /// Result of [`verify_renewer`].
 #[derive(Debug, PartialEq, Eq)]
