@@ -272,6 +272,10 @@ fn a_veto_label_keeps_loom_issue_off_on_release() {
     assert_eq!(r.released[0].restored, None);
     assert_eq!(w.park.writes, vec!["remove #10 loom:blocked"]);
     assert!(!w.labels(10).contains("loom:issue"));
+    // The audit comment names the veto, never "it never carried loom:issue".
+    let comment = &w.extra.posted[0].1;
+    assert!(comment.contains("carries `loom:needs-capability`"), "{comment}");
+    assert!(!comment.contains("never carried"), "{comment}");
 }
 
 #[test]
