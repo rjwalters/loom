@@ -121,7 +121,7 @@ scripts/tests/test-resolve-tier-model.sh
 # removed from merge-pr.sh; its dedicated shell suite goes with it.
 scripts/tests/test-merge-pr-chain-lock.sh
 
-# #11790 (2AMLogic/2am#4367 P0, 2026-10-13) — the forge egress policy
+# #11790 (2026-10-13) — the forge egress policy
 # (forge_egress/: reader, guard, doctor, managed-launcher wiring) removed; its
 # doc and the shell suites that pinned its shell halves go with it.
 docs/forge-egress.md
