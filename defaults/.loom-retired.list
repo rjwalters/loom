@@ -134,4 +134,3 @@ scripts/lib/mcp-config.sh
 scripts/tests/test-safehoused-service.sh
 scripts/tests/test-fleet-send.sh
 scripts/tests/test-fleet-check.sh
-scripts/tests/test-mcp-config.sh

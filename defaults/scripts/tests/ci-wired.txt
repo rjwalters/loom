@@ -146,6 +146,7 @@ test-locate-daemon-bin.sh
 test-loom-daemon-quiesce.sh
 test-loom-daemon-stop.sh
 test-loom-status.sh
+test-mcp-config.sh
 test-mcp-pnpm-selfrepair.sh
 test-memory-budget.sh
 test-merge-admission-telemetry.sh
