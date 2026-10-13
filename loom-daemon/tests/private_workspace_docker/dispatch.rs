@@ -259,6 +259,7 @@ fn adapter_chain_pushes_private_branch_and_preserves_host_logs_and_work() {
         None,
         None,
         None,
+        loom_daemon::sweep_registry::DispatchOrigin::Unknown,
     )
     .unwrap_err();
     assert!(rejected.to_string().contains("capabilit"), "{rejected}");
@@ -415,6 +416,7 @@ fn adapter_chain_pushes_private_branch_and_preserves_host_logs_and_work() {
             None,
             None,
             None,
+            loom_daemon::sweep_registry::DispatchOrigin::Unknown,
         )
         .unwrap_err();
         assert!(refusal.to_string().contains("requires recovery"), "{refusal}");

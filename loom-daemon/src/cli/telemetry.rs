@@ -28,6 +28,8 @@ use anyhow::Result;
 
 use loom_daemon::script_helpers;
 
+#[path = "curation_complete.rs"]
+mod curation_complete;
 #[path = "live_output_attend.rs"]
 mod live_output_attend;
 #[path = "record_rework.rs"]
@@ -36,6 +38,8 @@ mod record_rework;
 mod telemetry_export;
 #[path = "telemetry_fixture.rs"]
 mod telemetry_fixture;
+#[path = "telemetry_journal_cli.rs"]
+mod telemetry_journal_cli;
 #[path = "telemetry_live.rs"]
 mod telemetry_live;
 #[path = "telemetry_overhead.rs"]
@@ -47,6 +51,12 @@ mod usage_record;
 
 #[derive(clap::Subcommand)]
 pub(crate) enum TelemetryCommand {
+    /// Journal one Curator completion before applying curated labels.
+    CurationComplete(curation_complete::CurationCompleteArgs),
+    /// J2 telemetry journal shadow streams (#11348): `append` one record
+    /// after a legacy write, `verify` the concern against the legacy stores.
+    #[command(name = "telemetry")]
+    TelemetryJournal(telemetry_journal_cli::TelemetryJournalArgs),
     /// Plan or explicitly execute two bounded Pi/OpenCode GLM smoke runs.
     TelemetryLiveCanary(telemetry_live::LiveArgs),
     /// Write deterministic synthetic telemetry and an independent-query manifest.
@@ -185,20 +195,20 @@ impl TelemetryCommand {
     /// it exits with the process code `check-usage.sh` branches on.
     pub(crate) async fn run(self) -> Result<()> {
         match self {
+            TelemetryCommand::CurationComplete(args) => args.run(),
+            TelemetryCommand::TelemetryJournal(args) => args.run(),
             TelemetryCommand::TelemetryLiveCanary(args) => args.run(),
             TelemetryCommand::TelemetryFixture(args) => args.run(),
             TelemetryCommand::TelemetryOverhead(args) => args.run(),
             TelemetryCommand::TelemetryExport(args) => args.run().await,
             TelemetryCommand::TelemetryReplay(args) => args.run(),
-            TelemetryCommand::TelemetryCapabilities { require_otlp } => {
-                println!(
-                    "{}",
-                    serde_json::json!({"otlp": cfg!(feature = "otlp"), "otlp_protocol": "http/json"})
-                );
-                anyhow::ensure!(
-                    !require_otlp || cfg!(feature = "otlp"),
-                    "this binary was built without the otlp feature"
-                );
+            // The OTLP exporter is compiled unconditionally (#10700), so
+            // `otlp` is always `true` and `--require-otlp` always passes. The
+            // flag stays so build/roll probes (`daemon-build.sh`,
+            // `daemon_update::rebuild`) keep one stable contract: exit 0 =
+            // this binary exports OTLP.
+            TelemetryCommand::TelemetryCapabilities { require_otlp: _ } => {
+                println!("{}", serde_json::json!({"otlp": true, "otlp_protocol": "http/json"}));
                 Ok(())
             }
 

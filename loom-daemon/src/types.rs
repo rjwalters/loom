@@ -195,6 +195,31 @@ pub enum Request {
         /// byte-for-byte compatible) a tripped breaker refuses the dispatch.
         #[serde(default)]
         force: bool,
+        /// Per-dispatch runtime override for the coding phases (#11284).
+        /// Together with `model_profile` it names one explicit tap that the
+        /// sweep's Builder and Doctor phases launch on. An unavailable or
+        /// unadmitted tap is refused with a reason, never passed down the
+        /// preference list. Curator, Judge and the orchestrator keep their
+        /// role policy. `None` (or absent on the wire, `#[serde(default)]`)
+        /// preserves existing behavior byte-for-byte.
+        #[serde(default)]
+        runtime: Option<String>,
+        /// Model profile paired with `runtime` (e.g. `zai-flash`). Requires
+        /// `runtime`; absent preserves the runtime's own default resolution.
+        #[serde(default)]
+        model_profile: Option<String>,
+        /// Who is asking (Issue #11444), recorded on the sweep's start facts
+        /// and exported as `loom.dispatch_origin`. `loom-daemon dispatch`,
+        /// the `dispatch_sweep` MCP tool and Safehouse ChatOps send
+        /// `operator`. Absent on the wire (a legacy client, or any IPC
+        /// client that does not say) records `unknown` — never assumed
+        /// `operator`, since automated tools share this request too.
+        ///
+        /// Client-supplied and trusted as-is: this is telemetry (which
+        /// `trigger` the sweep reports), not authorization. Nothing decides
+        /// whether to dispatch from it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dispatch_origin: Option<crate::telemetry::DispatchOrigin>,
     },
     /// List tracked sweeps, optionally filtered by state.
     ListSweeps {
@@ -451,6 +476,16 @@ pub enum Request {
     },
     /// List the managed workspaces in the machine-level registry.
     ListWorkspaces,
+    /// Read one issue's OPEN/CLOSED state for a managed repo under the
+    /// daemon's own forge routing (#8876). The only inputs are a registered
+    /// root, the `owner/repo` slug of its `origin` remote, and an issue
+    /// number: no endpoint, no command, no credential. The daemon re-derives
+    /// the slug itself and answers [`crate::issue_state_read::IssueStateReply`].
+    ReadIssueState {
+        workspace_root: String,
+        repo: String,
+        issue: u64,
+    },
     // ========================================================================
     // Durable Watch Registry Requests (Issue #3971)
     // ========================================================================
@@ -803,6 +838,9 @@ pub enum Response {
     WorkspaceList {
         workspaces: Vec<crate::workspace_registry::Workspace>,
     },
+    /// Result of a `ReadIssueState` request (#8876): a validated state and a
+    /// non-secret route label, never a credential.
+    IssueState(crate::issue_state_read::IssueStateReply),
     // ========================================================================
     // Durable Watch Registry Responses (Issue #3971)
     // ========================================================================
@@ -1021,7 +1059,7 @@ pub struct SweepInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
     /// Whether this sweep was admitted through the host's
-    /// `loom:operator-priority` overflow slot (#9244): a starred issue
+    /// overflow slot (#9244, inert since #11508): an operator-starred issue
     /// dispatched over the global and/or per-repo concurrency cap as this
     /// host's single over-limit sweep. `#[serde(default)]` keeps older wire
     /// data and clients compatible (absent parses as `false`).
@@ -1579,11 +1617,6 @@ pub struct DaemonStatusReport {
     /// data / older clients compatible.
     #[serde(default)]
     pub last_work_finder_tick: Option<WorkFinderTickSummary>,
-    /// The last starred-issue liveness pass (#9244 C): each starred issue's
-    /// landing stage, next actor and any operator ask. `None` when the pass
-    /// has not run this process, and for an older daemon's payload.
-    #[serde(default)]
-    pub operator_priority_landing: Option<StarLivenessReport>,
     /// A bounded, newest-last window of per-(root, role) role-runner tick
     /// outcomes (Issue #4761), published by the role-runner loop via
     /// [`crate::role_runner::record_role_tick`]. Carried as raw records rather
@@ -1810,6 +1843,11 @@ pub struct DaemonStatusReport {
     /// `#[serde(default)]` keeps older wire data / older clients compatible.
     #[serde(default)]
     pub observability_exports: std::collections::BTreeMap<String, ObservabilityExportStatus>,
+    /// Whether this daemon exports OTLP to SigNoz (Issue #11353):
+    /// `no_exporter` / `failing` / `ok` / `exempt`. `None` only from a
+    /// pre-#11353 daemon; never read as `ok`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub otlp_export: Option<crate::observability::otlp_health::OtlpExportHealth>,
     /// State of the forge event-feed consumer (ADR-0021, #8765): whether this
     /// daemon is polling its operator-provisioned per-host event feed, under
     /// which `host_id`, how far its cursor has advanced, and — when it is not
@@ -1923,11 +1961,14 @@ pub struct DeepCleanRepoStatus {
 mod observability_export;
 pub use observability_export::{
     ObservabilityExportScope, ObservabilityExportState, ObservabilityExportStatus,
-    ObservabilityHostIdMismatch, NEVER_EXPORTED_GRACE_FLOOR_SECS,
+    ObservabilityHostIdMismatch, ObservabilityQueuePressure, NEVER_EXPORTED_GRACE_FLOOR_SECS,
 };
 
 mod forge_events;
-pub use forge_events::{ForgeEventsState, ForgeEventsStatus, ForgeEventsWakeStatus};
+pub use forge_events::{
+    ForgeEventsState, ForgeEventsStatus, ForgeEventsWakeStatus, PollGatingStatus,
+    PollGatingWorkspace,
+};
 
 mod ready_queue;
 pub use ready_queue::{QueueDisposition, ReadyQueueRow};
@@ -1939,11 +1980,8 @@ pub use dispatch_plan::{
 mod fleet_plan;
 pub use fleet_plan::{FleetPlan, FleetPlanItem, FleetPlanObservation, HostPlan, HostPlanRow};
 pub(crate) mod work_finder_tick;
-pub use work_finder_tick::{CapLimiter, CapView, CapacityWait, WorkFinderTickSummary};
-
-pub mod star_liveness;
-pub use star_liveness::{
-    AskKind, DroppedStarIntent, LandingStage, OperatorAsk, StarLandingRow, StarLivenessReport,
+pub use work_finder_tick::{
+    CapLimiter, CapView, CapacityWait, RepoLimitView, WorkFinderTickSummary,
 };
 
 /// One role-runner tick outcome for one `(root, role)` pair (Issue #4761).
@@ -2440,6 +2478,9 @@ pub struct ForgeBucketStatus {
     pub charged: u64,
     pub not_modified: u64,
     pub rate_limited: u64,
+    /// Secondary (burst) limits, apart from primary `rate_limited` (#11418).
+    #[serde(default)]
+    pub secondary_limited: u64,
     #[serde(default)]
     pub used: Option<u64>,
     #[serde(default)]
@@ -2456,6 +2497,9 @@ pub struct ForgeIdentityRoleCounts {
     pub ok: u64,
     pub not_modified: u64,
     pub rate_limited: u64,
+    /// Secondary (burst) limits, apart from primary `rate_limited` (#11418).
+    #[serde(default)]
+    pub secondary_limited: u64,
     pub error: u64,
     /// Reads shed without a request (W4-C).
     #[serde(default)]
@@ -2484,6 +2528,9 @@ pub struct ForgeOperationCounts {
     pub ok: u64,
     pub not_modified: u64,
     pub rate_limited: u64,
+    /// Secondary (burst) limits, apart from primary `rate_limited` (#11418).
+    #[serde(default)]
+    pub secondary_limited: u64,
     pub error: u64,
     /// Reads shed without a request (W4-C).
     #[serde(default)]
@@ -2503,6 +2550,9 @@ pub struct ForgeCallCounts {
     pub not_modified: u64,
     /// Rate-limited responses.
     pub rate_limited: u64,
+    /// Secondary (burst) limits, apart from primary `rate_limited` (#11418).
+    #[serde(default)]
+    pub secondary_limited: u64,
     /// Any other failure.
     pub error: u64,
     /// Reads a reader route deferred without a request (W4-C): charged
@@ -3250,6 +3300,11 @@ pub enum Event {
         /// compatible.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         story_points: Option<u32>,
+        /// Model, effort, runtime and attempt lineage as this dispatch knew
+        /// them (#11280), copied onto `sweep.started`. Absent for a `PrSet`
+        /// dispatch and on pre-#11280 wire data.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start: Option<Box<crate::telemetry::SweepStartFacts>>,
     },
     /// `sweep.global.runtime_rejected` — a dispatch was **refused** by
     /// fail-closed runtime admission (issue #4494, epic #4489 Phase 5), before
@@ -3346,17 +3401,13 @@ pub enum Event {
         /// Operator-facing advisory message naming the concrete cause.
         message: String,
     },
-    /// `operator_priority.escalation` — a starred (`loom:operator-priority`)
-    /// issue reached (or left) a state only the operator can move (Issue
-    /// #9321, the delivery half of #9244/#9301).
+    /// `operator_priority.escalation` — something reached (or left) a state
+    /// only the operator can move (Issue #9321).
     ///
-    /// Published by [`crate::star_liveness`]'s liveness pass, **exactly once
-    /// per (repo, issue, dedupe key)** and only on the pass that actually
-    /// posts the forge escalation comment — the same
-    /// `<!-- loom:operator-priority-escalation key=… -->` marker dedupe that
-    /// makes the comment once-per-cause fleet-wide therefore makes this event
-    /// once-per-cause too, across ticks, hosts and restarts. A second event
-    /// with `resolved: true` fires once when that key's ask clears.
+    /// Published by the fleet-alert state machine (#10164) once per condition
+    /// key; a second event with `resolved: true` fires once when that key's
+    /// ask clears. (Its first publisher, the star-liveness pass, was removed
+    /// by #11104.)
     ///
     /// Consumed by the Safehouse narration sink
     /// ([`crate::safehouse::operator_priority_envelope`] — *not*
@@ -3378,13 +3429,11 @@ pub enum Event {
         slug: String,
         /// The escalated issue.
         issue: u32,
-        /// The escalation's dedupe key, `<kind>:<specifics>` — identical to
-        /// the key in the forge comment's marker
-        /// ([`crate::star_liveness::escalate::marker`]).
+        /// The escalation's dedupe key, `<kind>:<specifics>`.
         key: String,
-        /// [`AskKind`] wire name (e.g. `no-progress`, `merge-refused`).
+        /// The ask kind's wire name (e.g. a fleet-alert condition key).
         kind: String,
-        /// [`LandingStage`] wire name at escalation time (e.g. `in-review`).
+        /// The stage wire name at escalation time.
         stage: String,
         /// The ask itself, one or two sentences naming what to do.
         text: String,
@@ -3393,8 +3442,8 @@ pub enum Event {
         /// The host whose pass observed it (the same id the forge comment
         /// names).
         host: String,
-        /// Set when the escalated row is a blocker that inherited its star:
-        /// the starred issue it inherited from.
+        /// The starred issue a blocker inherited from (star-liveness only,
+        /// removed by #11104; unset by every current publisher).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         inherited_from: Option<u32>,
         /// `false` on the escalation itself; `true` on the recovery notice

@@ -34,6 +34,7 @@ use chrono::Utc;
 
 use super::host::{Candidate, PauseHost};
 use super::teardown;
+use super::{roll_interruption, RollDisposition};
 use crate::auto_update::pause_manifest::{
     self, Disposition, ItemStatus, ManifestEvent, PauseManifest,
 };
@@ -171,6 +172,11 @@ impl RunLedger {
                 continue;
             }
             let cand = cands.iter().find(|c| c.id == item.id);
+            roll_interruption::note_stopped(
+                cand.and_then(|c| c.pid),
+                &item.id,
+                RollDisposition::BudgetMissed,
+            );
             let killed = cand.is_some_and(|c| teardown::force_kill_group(&c.tree_spec()));
             if let Some(dir) = cand.and_then(|c| c.pause_dir.as_ref()) {
                 roll_pause::withdraw_for(dir, &self.manifest_id);

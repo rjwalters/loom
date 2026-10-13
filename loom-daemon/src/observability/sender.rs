@@ -42,10 +42,10 @@ pub const ESCALATE_EVERY_FAILURES: u32 = 24;
 
 /// Most bytes of envelopes (as the JSON array the HTTPS exporter POSTs) one
 /// batch carries (#10928), under `/ingest`'s 5 MiB body limit. `batch_size`
-/// counts envelopes, and a few queued `eta.snapshot`s (each up to
-/// [`crate::telemetry::kinds::eta_snapshot::MAX_RECORD_BYTES`], one per
-/// 5-minute pass while the sink is down) would otherwise make a batch the
-/// sink answers 413 to on every retry, wedging the queue for good.
+/// counts envelopes, and a few large queued records (the since-removed
+/// `eta.snapshot` was capped at 1 MiB each, one per 5-minute pass
+/// while the sink was down) would otherwise make a batch the sink answers
+/// 413 to on every retry, wedging the queue for good.
 pub const MAX_BATCH_BYTES: usize = 4 * 1024 * 1024;
 
 /// Bytes of `value`'s compact JSON, counted without buffering it.
@@ -132,6 +132,24 @@ pub async fn try_flush<E: Exporter>(
     let outcome = exporter.emit_batch_outcome(batch).await;
     let acknowledged = outcome.acknowledged.min(batch.len());
     queue.ack_snapshot(&snapshot, acknowledged);
+    if !outcome.lost.is_empty() {
+        // Fail loud (Issue #11527): every permanently lost envelope is
+        // counted durably by reason, and the flush says so — one line naming
+        // the reasons and counts, not a silent ack-and-continue.
+        queue.record_losses(&outcome.lost);
+        let reasons = outcome
+            .lost
+            .iter()
+            .map(|(reason, count)| format!("{reason}={count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        log::warn!(
+            "observability: export permanently lost records — {reasons} \
+             (dropped_total={}, queue_depth={})",
+            queue.dropped_total(),
+            queue.len()
+        );
+    }
     status.record_signals(&outcome.signals);
     if outcome.exported > 0 {
         status.record_success(outcome.exported);
@@ -302,6 +320,7 @@ mod tests {
                 captainless_singleton_jobs: Vec::new(),
                 exported_kinds: Vec::new(),
                 exporters: Vec::new(),
+                otlp_export: None,
                 memory: None,
             }),
         )

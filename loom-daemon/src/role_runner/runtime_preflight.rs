@@ -150,6 +150,10 @@ pub(crate) fn check(
     let context = crate::runtime_preference::DispatchContext {
         complexity: None,
         intent: crate::runtime_preference::Intent::Dispatch,
+        // #11453: a role tick consults the per-workspace launch-failure hold,
+        // so a tap that keeps failing deterministically falls through
+        // `rolePreference` instead of being relaunched every interval.
+        role_tick: true,
     };
     let Ok(crate::runtime_preference::Decision::Preference {
         source,
@@ -249,7 +253,7 @@ pub(crate) fn static_check(
 /// counters are byte-identical to the pre-#8408 preflight.
 fn claude_gate(root: &Path, logs: &Path, role: &str) -> Option<RoleTickOutcome> {
     if crate::tokens::token_pool_size(root) == 0 {
-        NO_TOKEN_POOL_SKIP_COUNT.fetch_add(1, Ordering::Relaxed);
+        NO_TOKEN_POOL_SKIP_COUNT.record();
         note_pre_spawn_skip(
             logs,
             role,
@@ -261,7 +265,7 @@ fn claude_gate(root: &Path, logs: &Path, role: &str) -> Option<RoleTickOutcome> 
     // Do not launch a known exhausted Claude pool (#7607).
     let pool = crate::tokens_pool::select::spawnable_pool_state(root);
     if pool.total > 0 && pool.usable == 0 {
-        POOL_EXHAUSTED_SKIP_COUNT.fetch_add(1, Ordering::Relaxed);
+        POOL_EXHAUSTED_SKIP_COUNT.record();
         let next_clear_at = crate::tokens_pool::select::pool_clear_estimate(&pool.dir);
         note_pre_spawn_skip(
             logs,
@@ -496,7 +500,7 @@ fn codex_gate(
     if state.spawnable > 0 {
         return None;
     }
-    POOL_EXHAUSTED_SKIP_COUNT.fetch_add(1, Ordering::Relaxed);
+    POOL_EXHAUSTED_SKIP_COUNT.record();
     let cap = now + chrono::Duration::seconds(CODEX_CLEAR_ESTIMATE_CAP_SECS);
     let next_clear_at = state
         .earliest_clear

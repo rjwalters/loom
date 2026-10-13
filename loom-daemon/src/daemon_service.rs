@@ -127,14 +127,6 @@ pub(crate) async fn run_daemon() -> Result<()> {
             // TypeSafe, issue #8545), so it needs the async runtime for the
             // same reason `status`/`health` do.
             Commands::JevMergeRisk { pr } => loom_daemon::jev_merge_risk::run(pr).await,
-            // `jev-tier` POSTs to the same external Jev endpoint as
-            // `jev-merge-risk` (issue #8543), so it needs the async runtime
-            // for the same reason.
-            Commands::JevTier { issue } => loom_daemon::jev_tier::run(issue).await,
-            // `concierge` connects to safehoused over its Unix socket to read
-            // the room and to relay a vetted command (Issue #7947), so it needs
-            // the async runtime for the same reason `quarantine` does.
-            Commands::Concierge(args) => args.action.run().await,
             // `hyperparams` prints the resolved hyperparameter vector
             // (Issue #9683) — pure config resolution, no live daemon, so it
             // needs neither the socket nor the async runtime.
@@ -162,7 +154,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
                 depends_on,
                 force,
                 ignore_host_constraint,
-                allow_local,
+                tap,
             } => {
                 handle_dispatch_command(
                     issue,
@@ -172,7 +164,8 @@ pub(crate) async fn run_daemon() -> Result<()> {
                     depends_on,
                     force,
                     ignore_host_constraint,
-                    allow_local,
+                    tap.runtime,
+                    tap.model_profile,
                 )
                 .await
             }
@@ -220,21 +213,6 @@ pub(crate) async fn run_daemon() -> Result<()> {
                         json,
                     },
             } => handle_fleet_roll_command(host, all, timeout, json).await,
-            // `resolve-model --tier` IS the Tier-2.5 dispatch step — the one
-            // place the Curator's `<!-- loom:complexity=<tier> -->` marker
-            // becomes a model — so it is where a calibrated second opinion
-            // about the SAME issue is worth recording (issue #8543), and the
-            // only reason this otherwise-sync command is routed through the
-            // async runtime. Strictly telemetry: the resolution itself is
-            // `handle_cli_command`'s, below, byte-for-byte unchanged and
-            // unable to observe either the sample or whether it ran. A
-            // two-env-var no-op unless BOTH `LOOM_JEV_SHADOW_ISSUE` (exported
-            // by `resolve-tier-model.sh`) and `TYPESAFE_API_KEY` are set —
-            // i.e. nothing happens on a keyless host, which is the default.
-            cmd @ Commands::ResolveModel { tier: Some(_), .. } => {
-                loom_daemon::jev_tier::shadow_sample_from_env().await;
-                handle_cli_command(cmd).await
-            }
             other => handle_cli_command(other).await,
         };
     }
@@ -420,6 +398,8 @@ pub(crate) async fn run_daemon() -> Result<()> {
         ),
         Err(e) => log::warn!("sweep_registry: reconstruction failed: {e}"),
     }
+    // #11346: J1 concern verification (logged, off-thread; no-op when disabled).
+    loom_daemon::journal::execution::log_startup_verification();
 
     // #6171: record the daemon's own primary workspace root once, before any
     // forge call that could trigger a forced per-owner credential refresh
@@ -531,6 +511,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // #9872: name the rate-limit pool the credential spends (WARN on a
     // personal one: shared with every PAT/OAuth/`gh` login of that user).
     let credential_preflight = credential_preflight::attach_pool(github_app_preflight.report);
+    credential_preflight::loom_ui::startup(&credential_preflight); // #11295
 
     // Per-owner managed-repo credentials (#5401). The GitHub App mechanism
     // above mints exactly ONE installation token, keyed on this daemon's
@@ -1449,6 +1430,8 @@ pub(crate) async fn run_daemon() -> Result<()> {
 
     let _work_finder_handle = if work_finder::resolve_enabled(&work_finder_config) {
         let interval = work_finder::resolve_interval_with_config(&work_finder_config);
+        // #9255: opt-in event-gated polling; read once at startup (restart to change).
+        loom_daemon::forge_events::poll_gate::configure_for(&sweep_workspace, interval);
         // #6203: also resolve *which layer* supplied `configured_max` (env /
         // config / default) so the startup log below can tell an operator
         // whether their `.loom/config.json` edit was actually picked up. This
@@ -1560,14 +1543,13 @@ pub(crate) async fn run_daemon() -> Result<()> {
         log::debug!("work_finder: disabled (set LOOM_WORK_FINDER=1 to enable)");
         None
     };
-    // Starred-issue liveness + loom-ui star intents (#9244 C), alongside dispatch.
-    // The bus handle (#9321) carries each new escalation / recovery onto
-    // `operator_priority.escalation` so the Safehouse sink relays it into the
-    // team's Matrix room rather than leaving the ask as a forge comment only.
-    let _star_liveness = _work_finder_handle.is_some().then(|| {
-        loom_daemon::star_liveness::task::spawn(sweep_workspace.clone(), Some(event_bus.clone()))
-    });
-
+    // #11295: loom-ui's Alerts page, before its producers below start.
+    // Started before the watches below; alerts raised earlier wait in its outbox.
+    if loom_daemon::loom_ui_alerts::start(&sweep_workspace).is_some() {
+        loom_daemon::loom_ui_alerts::watches::spawn_all(&sweep_workspace);
+    }
+    // #11104: star-liveness is gone; its `autonomous.operatorPriority` keys warn once.
+    work_finder::operator_priority::warn_retired_config(&sweep_workspace);
     let _fleet_alert = loom_daemon::fleet_alert::task::spawn(
         sweep_workspace.clone(),
         socket_path.clone(),

@@ -401,6 +401,10 @@ fn daemon_write_paths_are_scoped() {
         (PASS, Gated),
         ("claim_reconciliation.rs", Via(PASS, "reclaim + anchor passes")),
         ("claim_reconciliation/verdict_invalidation.rs", Via(PASS, "verdict pass")),
+        (
+            "claim_reconciliation/unanchored_verdict.rs",
+            Via(PASS, "verdict pass: anchor + unmarked-approval re-queue (#9258)"),
+        ),
         ("claim_reconciliation/review_conflict.rs", Via(PASS, "conflict pass")),
         ("claim_reconciliation/merge_sequence.rs", Via(PASS, "merge-sequence pass")),
         ("claim_reconciliation/merge_sequence_stall.rs", Via(PASS, "merge-sequence stall escalation")),
@@ -427,14 +431,9 @@ fn daemon_write_paths_are_scoped() {
             ),
         ),
         ("worktree_ops/gh.rs", Gated),
-        ("star_liveness/task.rs", Gated),
         (
-            "star_liveness/parent_link.rs",
+            "parent_link.rs",
             Via("cli/forge_action.rs", "`forge parent link` is vetted via write_target"),
-        ),
-        (
-            "star_liveness/forge.rs",
-            Via("star_liveness/task.rs", "repos pass the task's gate"),
         ),
         ("role_runner/roster.rs", Gated),
         ("dep_classify/forge.rs", OriginResolved("dep_classify/cli.rs")),
@@ -442,12 +441,15 @@ fn daemon_write_paths_are_scoped() {
         (DISPATCH, Gated),
         ("work_finder/pool_preflight.rs", Gated),
         ("intake_reconcile.rs", Gated),
-        ("eta/retire_filing.rs", Gated),
         ("intake_reconcile/singleton.rs", Gated),
         ("stale_blocked/release_gh.rs", Gated),
         (
             "sweep_registry/guards.rs",
             Via(DISPATCH, "claim flip + lease of a dispatched sweep"),
+        ),
+        (
+            "sweep_registry/dispatch/claim_release.rs",
+            Via(DISPATCH, "releases the claim of a dispatched sweep found closed post-flip (#11304)"),
         ),
         ("sweep_registry/watchdog.rs", Via(DISPATCH, "acts on dispatched sweeps")),
         ("sweep_registry/restore_to_ready.rs", Via(DISPATCH, "acts on dispatched sweeps")),
@@ -463,6 +465,10 @@ fn daemon_write_paths_are_scoped() {
         (
             "sweep_registry/park_hold.rs",
             Via(DISPATCH, "body park record of a dispatched sweep's quarantine / PR-less hold"),
+        ),
+        (
+            "sweep_registry/noop_cooldown/hold.rs",
+            Via(DISPATCH, "acts on dispatched sweeps"),
         ),
         (
             "sweep_registry/outcome_journal/writeback.rs",
@@ -533,7 +539,10 @@ fn daemon_write_paths_are_scoped() {
             NotAWrite("parses an agent's own gh argv for the claim it took (#10832), runs none"),
         ),
         ("operator_decision/cli.rs", Gated),
-        ("forge_priority_labels.rs", Gated),
+        ("cli/labels_migrate.rs", Gated),
+        ("cli/curation_complete.rs", Gated),
+        ("cli/labels_undeclared.rs", Gated),
+        ("cli/pr_lease.rs", Gated),
         (
             "fleet/drain_reset.rs",
             OperatorOnly("`fleet drain`: the operator's own worker, by name (the claim resetter, split out of fleet/drain.rs by #10089)"),
@@ -541,15 +550,6 @@ fn daemon_write_paths_are_scoped() {
         (
             "fleet_store/propose/mod.rs",
             OperatorOnly("`fleet-config propose`: a PR against the configured store"),
-        ),
-        (
-            "eta/fit/publish.rs",
-            FleetStore {
-                caller: "observability/eta_fleet_refresh.rs",
-                call: "distribute_publish(root, &publisher",
-                gate: "RefreshGate::Captain | RefreshGate::Authority)",
-                why: "the refresher (the captain, or the explicit ETA authority, #10918) publishes its ETA fit to `fleet.etaFitRef` every refresh cycle (#10395)",
-            },
         ),
         (
             "observability/captain_gauges/store.rs",
@@ -602,6 +602,14 @@ fn daemon_write_paths_are_scoped() {
             NotAWrite("classifies an invocation's argv for the github.api span attribute, runs none"),
         ),
         (
+            "gh_invocation/route.rs",
+            NotAWrite("templates an invocation's argv for the github.route span attribute, runs none"),
+        ),
+        (
+            "gh_invocation/route_table.rs",
+            NotAWrite("the route, command and flag vocabularies behind route.rs, runs none"),
+        ),
+        (
             "gh_invocation/own_writes.rs",
             NotAWrite("names the label flags to parse a write argv for the numbers it pins, runs none"),
         ),
@@ -617,6 +625,10 @@ fn daemon_write_paths_are_scoped() {
             NotAWrite("read-only probe: its only calls are `api --method GET`"),
         ),
         ("tokens_pool/check.rs", NotAWrite("Anthropic API, not the forge")),
+        (
+            "remote_fleet_exec/mod.rs",
+            NotAWrite("scp's `-X` option in a guard's argv vocabulary, runs none"),
+        ),
         ("worker_spawn/egress_proxy/server.rs", NotAWrite("HTTP method check in a proxy")),
         (
             "observability/otlp/relay/server.rs",

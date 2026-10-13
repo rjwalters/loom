@@ -83,6 +83,11 @@ pub const SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "github.caller",
     "github.repo",
     "github.number",
+    // #11407: the endpoint as a template, its method and the gh command
+    // ([`super::route`]).
+    "github.route",
+    "github.command",
+    "http.request.method",
 ];
 
 /// At most this many numbers in a write span's `github.number`.
@@ -182,12 +187,14 @@ impl Outcome {
 /// [`super::api_kind::classify`].
 #[must_use]
 pub fn github_api_kind(inv: &GhInvocation) -> &'static str {
-    let args: Vec<String> = inv
-        .args
+    super::api_kind::classify(&argv(inv)).as_str()
+}
+
+fn argv(inv: &GhInvocation) -> Vec<String> {
+    inv.args
         .iter()
         .map(|a| a.to_string_lossy().into_owned())
-        .collect();
-    super::api_kind::classify(&args).as_str()
+        .collect()
 }
 
 /// The `(outcome, exit code)` of a captured run.
@@ -403,6 +410,12 @@ impl InvocationSpan {
         }
         for (key, value) in billing.attributes() {
             attributes.insert(key.to_string(), value);
+        }
+        for (key, value) in super::route::classify(&argv(inv)).attributes() {
+            attributes.insert(key.to_string(), value.to_string());
+        }
+        if let Some(command) = super::route::front_command() {
+            attributes.insert("github.command".into(), command.to_string());
         }
         // #10752: which pass drove the call, and what a write touched, so a
         // label change joins to the mechanism that made it.

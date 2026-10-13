@@ -1244,7 +1244,6 @@ fn sweep_dead_queues(dir: &Path, stream_key: &str) {
 }
 
 /// The tailer's own OTLP queues and senders, over the plan's endpoints.
-#[cfg(feature = "otlp")]
 fn build_sink(
     plan: &ExportPlan,
     queue_dir: &Path,
@@ -1260,7 +1259,7 @@ fn build_sink(
         let headers_file = plan.headers_files.get(index).and_then(Option::as_deref);
         let Ok(exporter) = super::super::otlp::OtlpExporter::with_headers_file(
             endpoint.clone(),
-            ingest_key.to_string(),
+            Some(ingest_key.to_string()),
             headers_file,
         ) else {
             continue;
@@ -1284,18 +1283,6 @@ fn build_sink(
         files.push(file);
     }
     SessionOutputSink::new(queues, host_id).map(|sink| (sink, files))
-}
-
-/// Without the `otlp` feature there is no exporter to build; the policy pass
-/// already refused every OTLP entry, so this is unreachable in practice.
-#[cfg(not(feature = "otlp"))]
-fn build_sink(
-    _plan: &ExportPlan,
-    _queue_dir: &Path,
-    _key: &str,
-    _ingest_key: &str,
-) -> Option<(SessionOutputSink, Vec<PathBuf>)> {
-    None
 }
 
 #[cfg(test)]

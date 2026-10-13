@@ -1487,6 +1487,7 @@ pub mod forge {
                 crate::sweep_registry::DispatchModel::Request(None),
                 None,
                 None,
+                crate::sweep_registry::DispatchOrigin::EpicSupervisor,
             )
             .map(|_| ())
         }

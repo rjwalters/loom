@@ -182,6 +182,9 @@ fn a_missing_clone_is_reported_never_added() {
         vec![Change::MissingClone {
             name: "product".to_string(),
             path: PathBuf::from("/home/op/src/product-src"),
+            remote: Some("git@example.com:acme/product.git".to_string()),
+            priority: DEFAULT_WORKSPACE_PRIORITY,
+            maintain_only: false,
         }]
     );
     assert_eq!(plan.check_exit_code(), 1);

@@ -115,7 +115,6 @@ fn a_refusal_that_matters_is_reported_in_one_line() {
 /// `/loom:curator 10120` typed into a top-level session: live output is
 /// configured, yet the session's own transcript is refused (#10129), exactly
 /// as for a Builder's `lease ensure`.
-#[cfg(feature = "otlp")]
 #[test]
 fn a_top_level_session_starts_nothing() {
     let scratch = tempfile::tempdir().unwrap();

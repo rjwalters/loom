@@ -96,11 +96,13 @@ use super::pause_manifest::{
     SafePointRecord, TargetSource, WrittenBy,
 };
 use crate::ipc::{DrainState, PauseOwnership};
+use crate::observability::lifecycle::roll_interruption::{self, RollDisposition};
 use crate::roll_pause;
 use crate::sweep_registry::roll_requeue::RollRequeueNotice;
 
 pub(crate) mod host;
 pub(crate) mod ledger;
+pub mod loom_ui;
 mod refusal;
 mod stops;
 mod supervise;
@@ -743,6 +745,7 @@ pub(crate) fn run_h4_with(
             plan.from_version
         );
         log::error!("pause_roll: {note}");
+        loom_ui::pause_failed(&plan.from_version, &note); // #11295
         run.host.emit(
             "daemon.roll.pause_failed",
             serde_json::json!({ "manifest_id": manifest_id, "error": e.to_string(), "items": items }),
@@ -776,7 +779,7 @@ pub(crate) fn run_h4_with(
         if run.work[idx].item.disposition != Disposition::Requeue {
             continue;
         }
-        if !run.start_stop(&mut pool, idx) {
+        if !run.start_stop(&mut pool, idx, RollDisposition::Requeued) {
             if stopped_any {
                 break; // unreachable: a committed pause cannot lose the drain
             }
@@ -852,7 +855,7 @@ pub(crate) fn run_h4_with(
                 .as_deref()
                 .and_then(|d| roll_pause::read_safe_point_for(d, &request));
             if let Some(sp) = safe_point {
-                if !run.start_stop(&mut pool, idx) {
+                if !run.start_stop(&mut pool, idx, RollDisposition::Paused) {
                     let promoted =
                         drain.pause_ownership(plan.generation) == PauseOwnership::Promoted;
                     return run.stand_down(promoted);
@@ -910,7 +913,7 @@ pub(crate) fn run_h4_with(
     // stop phase then waits for the teardowns until the stop bound.
     drain.pause_enter_step(plan.generation, 7);
     for idx in stopping(&run) {
-        if !run.start_stop(&mut pool, idx) {
+        if !run.start_stop(&mut pool, idx, RollDisposition::BudgetMissed) {
             // Only reachable with nothing stopped yet.
             let promoted = drain.pause_ownership(plan.generation) == PauseOwnership::Promoted;
             return run.stand_down(promoted);
@@ -927,7 +930,7 @@ pub(crate) fn run_h4_with(
         let id = w.item.id.clone();
         run.event(Some(&id), "budget_missed", Some(detail));
     }
-    run.finish_stops(&mut pool, stop_bound);
+    let forced_stops = run.finish_stops(&mut pool, stop_bound);
     drop(pool);
     let stop_elapsed = stop_started.elapsed();
     let stop_secs = stop_elapsed.as_secs();
@@ -1061,6 +1064,7 @@ pub(crate) fn run_h4_with(
             "settle_secs": settle_secs,
             "stop_secs": stop_secs,
             "stop_ms": stop_ms,
+            "forced_stops": forced_stops,
             "total_secs": started.elapsed().as_secs(),
         }),
     );
@@ -1091,3 +1095,8 @@ mod handoff_tests;
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[path = "pause_roll/stops_tests.rs"]
 mod stops_tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[path = "pause_roll/interruption_tests.rs"]
+mod interruption_tests;

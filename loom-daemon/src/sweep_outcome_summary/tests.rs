@@ -50,9 +50,11 @@ fn record(
         tokens_status: None,
         tokens_status_reason: None,
         no_phase_cause: None,
+        phase_tap_usage: Vec::new(),
         attempt_index: None,
         previous_sweep_id: None,
         trigger: None,
+        dispatch_origin: None,
         rework_events: None,
         pr_numbers: None,
         hw_lines_added: None,
@@ -429,10 +431,9 @@ fn spawn_death_detection_covers_class_and_duration() {
             crash_classification: None,
             token_name: "acct".into(),
             credential: None,
-            jev_tier: None,
-            jev_confidence: None,
             tap_usage: None,
             tap_usage_all: Vec::new(),
+            phase_tap_usage: Vec::new(),
             duration_sec: 1200,
         },
         sweep_outcomes::OutcomeRecord {
@@ -446,10 +447,9 @@ fn spawn_death_detection_covers_class_and_duration() {
             crash_classification: Some("execution-error".into()),
             token_name: "acct".into(),
             credential: None,
-            jev_tier: None,
-            jev_confidence: None,
             tap_usage: None,
             tap_usage_all: Vec::new(),
+            phase_tap_usage: Vec::new(),
             duration_sec: 1200,
         },
     ]);
@@ -475,10 +475,9 @@ fn spawn_death_detection_covers_class_and_duration() {
         crash_classification: Some("account-exhausted:rate-limited".into()),
         token_name: "acct".into(),
         credential: None,
-        jev_tier: None,
-        jev_confidence: None,
         tap_usage: None,
         tap_usage_all: Vec::new(),
+        phase_tap_usage: Vec::new(),
         duration_sec: 900,
     }]);
     let exhausted = record("exhausted", "o/r", None, SweepResult::Failure, 900);
@@ -986,10 +985,9 @@ fn two_workspace_fixture_aggregates_across_both_journals() {
             crash_classification: None,
             token_name: "acct".into(),
             credential: None,
-            jev_tier: None,
-            jev_confidence: None,
             tap_usage: None,
             tap_usage_all: Vec::new(),
+            phase_tap_usage: Vec::new(),
             duration_sec: 900,
         }],
     );
@@ -1092,6 +1090,3 @@ fn rendered_text_names_the_card_and_the_relationship_to_the_old_summary() {
 
 #[cfg(test)]
 mod complexity_tests;
-
-#[cfg(test)]
-mod agreement_tests;

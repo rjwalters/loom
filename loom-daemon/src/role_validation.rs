@@ -307,6 +307,20 @@ pub fn validate_from_config(config: &serde_json::Value, mode: ValidationMode) ->
         result.errors.extend(preference_errors);
     }
 
+    // #11400: a model profile's `excludedRoles` must name known roles — an
+    // unknown name would silently exclude nothing.
+    let excluded_errors = crate::worker_spawn::profiles::check_excluded_roles_config(config);
+    if !excluded_errors.is_empty() {
+        result.valid = false;
+        result.errors.extend(excluded_errors);
+    }
+
+    let escalation_errors = crate::doctor_escalation::check_config(config);
+    if !escalation_errors.is_empty() {
+        result.valid = false;
+        result.errors.extend(escalation_errors);
+    }
+
     result
 }
 

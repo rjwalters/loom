@@ -30,7 +30,20 @@ fn env_inputs(root: &Path) -> Inputs<'_> {
         build_time_repo: build_time_repo(),
         installed_bin: running_binary(),
         fetch_disabled: artifact_fetch_disabled(),
+        min_version: below_floor(),
     }
+}
+
+/// The fleet floor when this running daemon is below it (#11029), else `None`.
+/// Only a below-floor host needs the walk-back to the newest complete release;
+/// every other tick keeps the cheaper Latest-only lookup.
+fn below_floor() -> Option<String> {
+    let crate::fleet_sync::FloorKnowledge::Set(floor) = crate::fleet_sync::floor_knowledge() else {
+        return None;
+    };
+    let min = crate::fleet_store::floor::parse_triple(&floor)?;
+    let run = crate::fleet_store::floor::parse_triple(env!("CARGO_PKG_VERSION"))?;
+    (run < min).then_some(floor)
 }
 
 /// The repo the tick would query for `root`, by [`resolve_repo`]'s priority

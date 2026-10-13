@@ -1,4 +1,4 @@
-//! The `loom:operator-priority` overflow flag on a sweep record (#9244).
+//! The overflow flag on a sweep record (#9244; inert since #11508).
 //!
 //! The work finder may admit one starred issue over the concurrency caps as
 //! this host's single over-limit sweep (`work_finder::OverflowSlot`). The

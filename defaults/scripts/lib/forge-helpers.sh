@@ -648,7 +648,7 @@ forge_get_check_runs() {
     out_file=$(mktemp); err_file=$(mktemp)
     gh api "repos/$nwo/commits/$commit/check-runs?per_page=100" --paginate \
       --header "Accept: application/vnd.github+json" \
-      --jq '{total_count: (.total_count // 0), check_runs: [(.check_runs // [])[] | {name: .name, status: .status, conclusion: .conclusion, html_url: .html_url}]}' \
+      --jq '{total_count: (.total_count // 0), check_runs: [(.check_runs // [])[] | {name: .name, status: .status, conclusion: .conclusion, html_url: .html_url, check_suite_id: .check_suite.id}]}' \
       >"$out_file" 2>"$err_file" || rc=$?
 
     if [[ $rc -ne 0 ]]; then
@@ -666,7 +666,7 @@ forge_get_check_runs() {
     # short-read check below). An empty stdout from a `gh` that exited 0 is not
     # an authoritative "this commit has no checks": treat it as a transient
     # failure, the same way a nonzero exit is treated.
-    local merged=""; [[ -s "$out_file" ]] && merged=$(jq -cs '{total_count: ([.[].total_count // 0] | max // 0), check_runs: [.[] | (.check_runs // [])[]]}' "$out_file" 2>/dev/null)
+    local merged=""; [[ -s "$out_file" ]] && merged=$(jq -cs --arg nwo "$nwo" --arg sha "$commit" '{total_count: ([.[].total_count // 0] | max // 0), check_runs: [.[] | (.check_runs // [])[]], repository: $nwo, head_sha: $sha}' "$out_file" 2>/dev/null)
     rm -f "$out_file" "$err_file"
     [[ -n "$merged" ]] || return 1
 
@@ -721,7 +721,7 @@ forge_get_commit_status() {
 # Get GitHub Actions workflow runs (or the Gitea Actions equivalent) for a
 # commit, independent of the Checks API.
 # Usage: forge_get_workflow_runs NWO COMMIT_SHA
-# Returns JSON: {"workflow_runs": [{"name": ..., "status": ..., "conclusion": ...}]}
+# Returns JSON: {"workflow_runs": [{"name", "status", "conclusion", "event" (GitHub only)}]}
 #
 # Why this exists (#5495): the Checks API (forge_get_check_runs, above) only
 # ever reports check-runs that already exist -- a workflow_run that is still
@@ -778,7 +778,7 @@ forge_get_workflow_runs() {
     echo "$runs_json" | jq '{
       workflow_runs: [(.workflow_runs // [])[] | {
         name: .name,
-        status: .status,
+        status: .status, event: .event,
         conclusion: .conclusion
       }]
     }' 2>/dev/null || echo '{"workflow_runs": []}'
@@ -1255,10 +1255,7 @@ forge_gh_perm_safe() {
 # missing a scope, it is scoped to the wrong repository entirely, so rung 1
 # (ambient) 404s/GraphQL-fails outright and #6074's ladder never fires (its
 # classifier doesn't match either signature above). `sweep-lease-renew.sh`'s
-# renewal loop failed on every cycle as a direct result, and
-# `resolve-tier-model.sh` (which does not source this file at all before this
-# fix) silently fell through to its tier-3 default with a misleading "likely
-# API quota" diagnosis.
+# renewal loop failed on every cycle as a direct result.
 #
 # The fix borrows the SAME mechanism FLEET.md's "Private-repo clones over ssh"
 # contract already documents for a human ssh session on a locked keychain: a

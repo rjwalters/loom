@@ -204,7 +204,7 @@ pub fn resolve_forge_config(cwd: Option<&Path>) -> Value {
 }
 
 /// Extract the hostname from a git remote URL (SSH or HTTPS form).
-fn parse_host(url: &str) -> Option<String> {
+pub(crate) fn parse_host(url: &str) -> Option<String> {
     // SSH: git@host:owner/repo.git
     if let Some(rest) = url.strip_prefix("git@") {
         if let Some((host, _)) = rest.split_once(':') {
@@ -226,7 +226,7 @@ fn parse_host(url: &str) -> Option<String> {
 }
 
 /// Get the `origin` remote URL from `cwd`, or `None`.
-fn get_remote_url(cwd: &Path) -> Option<String> {
+pub(crate) fn get_remote_url(cwd: &Path) -> Option<String> {
     let mut cmd = Command::new("git");
     cmd.args(["remote", "get-url", "origin"])
         .current_dir(cwd)
@@ -818,6 +818,8 @@ pub enum ForgeCmd {
         reviewed: String,
         head: String,
     },
+    /// `forge version-only-diff` (#9611): see [`crate::forge_version_only_diff`].
+    VersionOnlyDiff(crate::forge_version_only_diff::Args),
     /// `forge merge-method --repo <nwo> [--requested squash|merge|rebase]`
     /// (#8845) — resolve/validate the merge method `merge-pr.sh` should pass
     /// to `forge_merge_pr`. See
@@ -890,6 +892,7 @@ pub fn dispatch(cmd: ForgeCmd) -> Result<()> {
         ForgeCmd::VerdictEquivalent { pr, reviewed, head } => {
             crate::verdict_equivalence::handle(pr, &reviewed, &head)
         }
+        ForgeCmd::VersionOnlyDiff(args) => crate::forge_version_only_diff::handle(&args),
         ForgeCmd::MergeMethod { repo, requested } => {
             crate::forge_merge_method::handle_merge_method(&repo, requested.as_deref())
         }

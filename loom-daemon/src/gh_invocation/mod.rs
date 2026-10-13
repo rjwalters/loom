@@ -59,6 +59,7 @@ pub(crate) mod own_writes;
 mod paged;
 mod reader_route;
 pub mod resolver;
+pub mod route;
 pub mod telemetry;
 pub mod transparent;
 

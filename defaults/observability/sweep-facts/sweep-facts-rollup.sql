@@ -35,9 +35,20 @@
 -- one to 0/''/"unknown"), so every column the payload feeds is NULLable and
 -- stays NULL when the key is absent. The `disposition` (#9441),
 -- `tokens_status` (#9440), `hw_*`/`generated_lines`/`test_lines` (#9466),
--- `story_points` (#9432/#9433) and lineage (#9444) columns are NULL in bulk
--- until those emitters land and the backfill re-runs — that is the rollup
--- working, not failing.
+-- `story_points` (#9432/#9433), lineage (#9444) and `dispatch_origin`
+-- (#11444) columns are NULL in bulk until those emitters land and the backfill
+-- re-runs — that is the rollup working, not failing. `dispatch_origin` is
+-- absent on every row written before #11444 (a `sweep.outcome` payload that
+-- predates the field), where it reads NULL — never '' and never 'unknown'.
+--
+-- Upgrading an INSTALLED table (#9507). `IF NOT EXISTS` means a column added
+-- below never reaches a database that ran an earlier version of this file —
+-- the INSERT further down then fails loudly ("has no column named …") and
+-- writes nothing. This table is durable (it holds facts whose `records` rows
+-- were already evicted), so it is never dropped and rebuilt: run
+-- `sweep-facts-migrate.sql` first, which prints exactly the
+-- `ALTER TABLE … ADD COLUMN` statements still missing (none on an up-to-date
+-- table). Adding a column here means adding its row there.
 CREATE TABLE IF NOT EXISTS sweep_facts (
     repo                   TEXT    NOT NULL,
     issue                  INTEGER NOT NULL,
@@ -70,8 +81,13 @@ CREATE TABLE IF NOT EXISTS sweep_facts (
     attempt_index          INTEGER,
     previous_sweep_id      TEXT,
     trigger                TEXT,
+    dispatch_origin        TEXT,
     rework_substantive     INTEGER,
     rework_environmental   INTEGER,
+    rework_substantive_sec INTEGER,
+    rework_environmental_sec INTEGER,
+    rework_substantive_open INTEGER,
+    rework_environmental_open INTEGER,
     pr_number              INTEGER,
     pr_numbers             TEXT,
     suspect                INTEGER,
@@ -103,6 +119,16 @@ CREATE TABLE IF NOT EXISTS sweep_facts (
 -- was not read); `[]` → 0 (read, and no rework happened) — walked with
 -- json_each so the count is per-classification, never a total folded over it.
 --
+-- `rework_*_sec` / `rework_*_open` (#9507): the same walk in SECONDS. `_sec`
+-- sums each entry's measured `duration_sec` per classification; an entry with
+-- no `duration_sec` is an OPEN event (its clearing forge event was never
+-- observed — `rework_events.rs`: "never zero") and contributes nothing to the
+-- sum, but is counted in `_open` so it stays visible rather than being
+-- smoothed into a measured 0. Same absent-vs-zero contract as the counts:
+-- absent key → NULL in all four; `[]` → 0 in all four. A list holding only
+-- open events reads `_sec = 0, _open = n` — "nothing measured", not "nothing
+-- happened". `issue-effort.sql` charges these seconds to their class.
+--
 -- `suspect` (#9454): a derived 0/1 flag, not a measurement — 1 exactly when
 -- the emitter's plausibility guard downgraded this record's tokens to
 -- `tokens_status = 'suspect'`.
@@ -132,8 +158,10 @@ INSERT OR REPLACE INTO sweep_facts
      hw_lines_added, hw_lines_deleted, hw_files, generated_lines, test_lines,
      story_points,
      doctor_cycles, judge_verdicts,
-     attempt_index, previous_sweep_id, trigger,
+     attempt_index, previous_sweep_id, trigger, dispatch_origin,
      rework_substantive, rework_environmental,
+     rework_substantive_sec, rework_environmental_sec,
+     rework_substantive_open, rework_environmental_open,
      pr_number, pr_numbers, suspect, schema_version)
 SELECT
     r.repo                                            AS repo,
@@ -167,6 +195,7 @@ SELECT
     json_extract(r.payload, '$.attempt_index')        AS attempt_index,
     json_extract(r.payload, '$.previous_sweep_id')    AS previous_sweep_id,
     json_extract(r.payload, '$.trigger')              AS trigger,
+    json_extract(r.payload, '$.dispatch_origin')      AS dispatch_origin,
     CASE
         WHEN json_extract(r.payload, '$.rework_events') IS NULL THEN NULL
         ELSE (SELECT count(*) FROM json_each(r.payload, '$.rework_events') je
@@ -177,6 +206,30 @@ SELECT
         ELSE (SELECT count(*) FROM json_each(r.payload, '$.rework_events') je
               WHERE json_extract(je.value, '$.classification') = 'environmental')
     END                                               AS rework_environmental,
+    CASE
+        WHEN json_extract(r.payload, '$.rework_events') IS NULL THEN NULL
+        ELSE (SELECT COALESCE(sum(json_extract(je.value, '$.duration_sec')), 0)
+                FROM json_each(r.payload, '$.rework_events') je
+               WHERE json_extract(je.value, '$.classification') = 'substantive')
+    END                                               AS rework_substantive_sec,
+    CASE
+        WHEN json_extract(r.payload, '$.rework_events') IS NULL THEN NULL
+        ELSE (SELECT COALESCE(sum(json_extract(je.value, '$.duration_sec')), 0)
+                FROM json_each(r.payload, '$.rework_events') je
+               WHERE json_extract(je.value, '$.classification') = 'environmental')
+    END                                               AS rework_environmental_sec,
+    CASE
+        WHEN json_extract(r.payload, '$.rework_events') IS NULL THEN NULL
+        ELSE (SELECT count(*) FROM json_each(r.payload, '$.rework_events') je
+              WHERE json_extract(je.value, '$.classification') = 'substantive'
+                AND json_extract(je.value, '$.duration_sec') IS NULL)
+    END                                               AS rework_substantive_open,
+    CASE
+        WHEN json_extract(r.payload, '$.rework_events') IS NULL THEN NULL
+        ELSE (SELECT count(*) FROM json_each(r.payload, '$.rework_events') je
+              WHERE json_extract(je.value, '$.classification') = 'environmental'
+                AND json_extract(je.value, '$.duration_sec') IS NULL)
+    END                                               AS rework_environmental_open,
     json_extract(r.payload, '$.pr_number')            AS pr_number,
     json_extract(r.payload, '$.pr_numbers')           AS pr_numbers,
     CASE WHEN json_extract(r.payload, '$.tokens_status') = 'suspect'

@@ -74,6 +74,11 @@ pub struct RestIssue {
     /// The REST `comments` count (#10480): a row with `0` needs no comment
     /// read at all. `0` when the forge omitted it.
     pub comments: u32,
+    /// Open native sub-issues (`sub_issues_summary.total - completed`, #11483):
+    /// a tracking parent with open slices is not dispatchable. `None` when the
+    /// forge omitted the summary or sent a malformed one (Gitea, older
+    /// payloads), which keeps the pre-#11483 behaviour.
+    pub open_sub_issues: Option<u32>,
 }
 
 /// List open/closed issues carrying `label`, via the ETag cache.
@@ -735,6 +740,8 @@ pub fn parse_rest_issues(body: &str) -> Result<Vec<RestIssue>> {
         pull_request: Option<serde_json::Value>,
         #[serde(default)]
         comments: u32,
+        #[serde(default)]
+        sub_issues_summary: Option<serde_json::Value>,
     }
     let rows: Vec<RawIssue> = serde_json::from_str(body.trim())?;
     Ok(rows
@@ -752,8 +759,22 @@ pub fn parse_rest_issues(body: &str) -> Result<Vec<RestIssue>> {
             author: r.user.and_then(|u| u.login),
             author_association: r.author_association,
             is_pull_request: r.pull_request.is_some(),
+            open_sub_issues: r.sub_issues_summary.as_ref().and_then(open_sub_issues),
         })
         .collect())
+}
+
+/// Open children in a REST `sub_issues_summary` (#11483): `total - completed`,
+/// where `completed` counts every closed child whatever its close reason.
+/// `None` for a summary missing either count or with `completed > total`.
+fn open_sub_issues(summary: &serde_json::Value) -> Option<u32> {
+    let count = |key: &str| {
+        summary
+            .get(key)?
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+    };
+    count("total")?.checked_sub(count("completed")?)
 }
 
 // ============================================================================

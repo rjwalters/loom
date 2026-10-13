@@ -810,21 +810,25 @@ async fn the_receiver_starts_only_when_opted_in_and_an_otlp_sink_started() {
     let off = workspace(
         r#"{"observability":{"enabled":true,"exporter":"otlp","endpoint":"http://127.0.0.1:9"}}"#,
     );
-    assert!(launch(off.path(), "host-fixture", INGEST_KEY, std::slice::from_ref(&sink)).is_none());
-    assert!(start(off.path(), "host-fixture", INGEST_KEY, std::slice::from_ref(&sink)).is_empty());
+    assert!(
+        launch(off.path(), "host-fixture", Some(INGEST_KEY), std::slice::from_ref(&sink)).is_none()
+    );
+    assert!(
+        start(off.path(), "host-fixture", Some(INGEST_KEY), std::slice::from_ref(&sink)).is_empty()
+    );
     // The switch without an `otlp` sink that started: nothing.
     let on = workspace(OPTED_IN);
-    assert!(launch(on.path(), "host-fixture", INGEST_KEY, &[]).is_none());
+    assert!(launch(on.path(), "host-fixture", Some(INGEST_KEY), &[]).is_none());
     // A sink whose exporter cannot be built is not a sink.
     let unusable = Sink {
         endpoint: "ftp://127.0.0.1:9".to_string(),
         headers_file: None,
     };
-    assert!(launch(on.path(), "host-fixture", INGEST_KEY, &[unusable]).is_none());
+    assert!(launch(on.path(), "host-fixture", Some(INGEST_KEY), &[unusable]).is_none());
     assert!(agent_relay::global().is_none());
 
     // Both: a receiver on 127.0.0.1, on a port the kernel chose.
-    let (relay, tasks) = launch(on.path(), "host-fixture", INGEST_KEY, &[sink]).unwrap();
+    let (relay, tasks) = launch(on.path(), "host-fixture", Some(INGEST_KEY), &[sink]).unwrap();
     assert_eq!(relay.addr().ip(), std::net::IpAddr::V4(Ipv4Addr::LOCALHOST));
     assert_ne!(relay.addr().port(), 0);
     assert_eq!(tasks.len(), 2, "one drain per sink, plus the accept loop");
@@ -839,7 +843,7 @@ async fn the_receiver_starts_only_when_opted_in_and_an_otlp_sink_started() {
     let (second, more) = launch(
         on.path(),
         "host-fixture",
-        INGEST_KEY,
+        Some(INGEST_KEY),
         &[Sink {
             endpoint: "http://127.0.0.1:9".to_string(),
             headers_file: None,

@@ -44,6 +44,7 @@ use super::batch::GhStaleBlockedForge;
 use super::budget::Floor;
 use super::release::{run, Config, ReleaseForge, Report};
 use super::release_outcome::{classify_gate, classify_report, record};
+use super::unnamed::{run as run_unnamed, Report as UnnamedReport};
 use crate::comment_trust::TrustPolicy;
 use crate::forge_call_stats::ops;
 use crate::forge_etag_store as store;
@@ -65,6 +66,9 @@ pub const MAX_WRITES_ENV: &str = "LOOM_RELEASE_STALE_BLOCKED_MAX_WRITES";
 const DEFAULT_INTERVAL_SECS: u64 = 300;
 /// The per-pass write cap's default.
 pub const DEFAULT_MAX_WRITES: usize = 20;
+
+/// The refusal reported when the forge-write scope gate (#9548) says no.
+const OUT_OF_SCOPE: &str = "outside the forge-write scope (#9548)";
 
 const PAGE: usize = 100;
 const MAX_PAGES: u32 = 50;
@@ -162,7 +166,7 @@ pub fn maybe_run(gh_bin: &Path, root: &Path) -> Option<Report> {
     let report = gated(mode, owned, |dry_run| {
         if !dry_run && !crate::write_scope::gate_root_with(root, gh_bin, "stale-blocked release") {
             return Report {
-                enumerate_error: Some("outside the forge-write scope (#9548)".to_string()),
+                enumerate_error: Some(OUT_OF_SCOPE.to_string()),
                 ..Report::default()
             };
         }
@@ -179,6 +183,35 @@ pub fn maybe_run(gh_bin: &Path, root: &Path) -> Option<Report> {
     record(root, classify_report(mode == Mode::DryRun, &report), Some(&report));
     observer.finish(root, &report);
     log::info!("stale_blocked_release: {} — {} (#10556)", root.display(), report.summary());
+    if let Some(f) = report.failed.first() {
+        let (n, slug) = (report.failed.len(), root.display().to_string());
+        // #11437: a persistent refusal repeats every pass; warn once per
+        // (workspace, reason) per hour and count the repeats swallowed. A
+        // new reason is a new key, so it warns at once (as `write_scope::gate`
+        // does) instead of hiding behind the previous reason's window.
+        if let Some(suppressed) = failure_warn_due(&slug, &f.why, Instant::now()) {
+            log::warn!(
+                "stale_blocked_release: {slug} — {n} write(s) failed; #{}: {} \
+                 ({suppressed} identical warning(s) suppressed since the last one)",
+                f.number,
+                f.why
+            );
+        }
+    }
+    // The #10558 queue pass rides the same gates: the write-scope refusal
+    // above (and an unowned shard, which returned before this point) stops it.
+    if report.enumerate_error.as_deref() != Some(OUT_OF_SCOPE) {
+        let queue = run_unnamed_for_root(
+            root,
+            None,
+            &Config {
+                dry_run: mode == Mode::DryRun,
+                max_writes: env_num(MAX_WRITES_ENV, DEFAULT_MAX_WRITES),
+                floor: Floor::default(),
+            },
+        );
+        log::info!("stale_blocked_unnamed: {} — {} (#10558)", root.display(), queue.summary());
+    }
     Some(report)
 }
 
@@ -186,7 +219,13 @@ pub fn maybe_run(gh_bin: &Path, root: &Path) -> Option<Report> {
 #[must_use]
 pub fn run_for_root(root: &Path, repo: Option<&str>, cfg: &Config) -> Report {
     let mut gather = GhStaleBlockedForge::new(root, repo);
-    let mut park = GhForge::new(root.to_path_buf(), repo.map(str::to_string));
+    // #11437: vet the park writes under the root's own credential, as the
+    // tick's gate and `GhReleaseForge` do — not the daemon process's.
+    let mut park = GhForge::for_root_credential(
+        root.to_path_buf(),
+        repo.map(str::to_string),
+        PathBuf::from(crate::gh_invocation::gh_bin()),
+    );
     let mut extra = GhReleaseForge::new(root, repo);
     let mut report = run(
         &mut gather,
@@ -200,6 +239,54 @@ pub fn run_for_root(root: &Path, repo: Option<&str>, cfg: &Config) -> Report {
         report.enumerate_error = Some(why);
     }
     report
+}
+
+/// Minimum seconds between two write-failure warnings for one workspace and
+/// one failure reason.
+pub const FAILURE_WARN_SECS: u64 = 3600;
+
+/// Per (workspace, failure reason): when it last warned, and identical
+/// repeats suppressed since.
+type FailureWarnings = HashMap<(String, String), (Instant, u64)>;
+
+static FAILURE_WARNED: LazyLock<Mutex<FailureWarnings>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// `Some(suppressed_since_last_warning)` when `slug` may warn about `why` at
+/// `now` (recording it); `None` (counting the suppression) when the same
+/// workspace warned the same reason within [`FAILURE_WARN_SECS`]. A reason not
+/// warned within the window warns immediately, so the count only ever covers
+/// repeats of the reason it is printed with.
+fn failure_warn_due(slug: &str, why: &str, now: Instant) -> Option<u64> {
+    let mut map = FAILURE_WARNED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    failure_warn_due_in(&mut map, slug, why, now)
+}
+
+/// [`failure_warn_due`] against an explicit map, so tests feeding synthetic
+/// `Instant`s each own their state (the eviction below is relative to `now`,
+/// so a shared map lets one test's clock evict another test's keys).
+fn failure_warn_due_in(
+    map: &mut FailureWarnings,
+    slug: &str,
+    why: &str,
+    now: Instant,
+) -> Option<u64> {
+    let window = Duration::from_secs(FAILURE_WARN_SECS);
+    let key = (slug.to_string(), why.to_string());
+    if let Some((prev, count)) = map.get_mut(&key) {
+        if now.saturating_duration_since(*prev) < window {
+            *count += 1;
+            return None;
+        }
+    }
+    let suppressed = map.remove(&key).map_or(0, |(_, c)| c);
+    // Bound the map: drop keys whose window lapsed with nothing suppressed.
+    // A key holding an unreported count stays until its reason recurs.
+    map.retain(|_, (prev, c)| *c > 0 || now.saturating_duration_since(*prev) < window);
+    map.insert(key, (now, 0));
+    Some(suppressed)
 }
 
 /// Minimum seconds between two zero-row cross-checks of one repo.
@@ -286,6 +373,23 @@ fn zero_row_verdict(rows: Result<usize, String>, slug: &str) -> Option<String> {
     }
 }
 
+/// One `loom:blocked-unnamed` queue pass over the workspace at `root` (or the
+/// explicit `repo`) (#10558).
+#[must_use]
+pub fn run_unnamed_for_root(root: &Path, repo: Option<&str>, cfg: &Config) -> UnnamedReport {
+    let mut gather = GhStaleBlockedForge::new(root, repo);
+    let mut park = GhForge::new(root.to_path_buf(), repo.map(str::to_string));
+    let mut extra = GhReleaseForge::new(root, repo);
+    run_unnamed(
+        &mut gather,
+        &mut park,
+        &mut extra,
+        &FleetLogins::for_root(root),
+        &TrustPolicy::for_root(root),
+        cfg,
+    )
+}
+
 /// [`ReleaseForge`] over `gh`: REST + ETag reads through
 /// [`crate::forge_etag_store`], the comment through
 /// [`crate::forge_comment::post_comment`] after a write-scope check.
@@ -334,6 +438,33 @@ impl GhReleaseForge {
             cross_check_rows(&self.gh_bin, &self.root, &self.slug, CROSS_CHECK_TIMEOUT),
             &self.slug,
         )
+    }
+
+    /// The memoized write-scope verdict, vetted under **`root`'s own
+    /// credential** — the per-owner `GH_CONFIG_DIR` the comment itself is
+    /// posted under, and the one the tick's gate already admitted.
+    ///
+    /// #10837: this used `may_write_from`, which probes the *process's*
+    /// credential. On a daemon whose home workspace is another owner's, every
+    /// cross-owner root (#5401) was refused here after its gate passed, so
+    /// each release failed before its audit comment, silently.
+    fn write_scope(&mut self) -> Result<(), String> {
+        let (root, gh) = (&self.root, &self.gh_bin);
+        let repo = self.repo.as_deref();
+        self.write_ok
+            .get_or_insert_with(|| {
+                let verdict = match repo {
+                    Some(r) => crate::write_scope::repo_writable_with(root, r, gh),
+                    None => crate::write_scope::root_writable_with(root, gh),
+                };
+                match verdict {
+                    crate::write_scope::Verdict::Allow(_) => Ok(()),
+                    crate::write_scope::Verdict::Deny(why) => {
+                        Err(format!("refusing the write (#9548): {why}"))
+                    }
+                }
+            })
+            .clone()
     }
 
     fn get(&self, op: crate::forge_call_stats::ForgeOp, url: &str) -> Result<String, String> {
@@ -403,16 +534,34 @@ impl ReleaseForge for GhReleaseForge {
             .collect())
     }
 
+    fn last_labeled_at(&mut self, number: u64, label: &str) -> Result<Option<String>, String> {
+        let base = format!("repos/{}/issues/{number}/events", self.slug);
+        // The newest by parsed time, not by list position: the events API
+        // returns oldest-first today, but nothing here depends on that. A
+        // timestamp that will not parse fails the read (the caller counts the
+        // issue unevaluated and writes nothing) rather than being ignored.
+        let mut newest: Option<(chrono::DateTime<chrono::FixedOffset>, String)> = None;
+        for e in self.pages(ops::TIMELINE_READ, &base)? {
+            if e.get("event").and_then(Value::as_str) != Some("labeled")
+                || e.pointer("/label/name").and_then(Value::as_str) != Some(label)
+            {
+                continue;
+            }
+            let raw = e
+                .get("created_at")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("a {label} labeled event has no created_at"))?;
+            let at = chrono::DateTime::parse_from_rfc3339(raw.trim())
+                .map_err(|err| format!("unparseable {label} labeled time {raw:?}: {err}"))?;
+            if newest.as_ref().is_none_or(|(best, _)| at >= *best) {
+                newest = Some((at, raw.to_string()));
+            }
+        }
+        Ok(newest.map(|(_, raw)| raw))
+    }
+
     fn post_comment(&mut self, number: u64, is_pr: bool, body: &str) -> Result<(), String> {
-        let (root, repo) = (&self.root, self.repo.as_deref());
-        self.write_ok
-            .get_or_insert_with(|| match crate::write_scope::may_write_from(root, repo) {
-                crate::write_scope::Verdict::Allow(_) => Ok(()),
-                crate::write_scope::Verdict::Deny(why) => {
-                    Err(format!("refusing the write (#9548): {why}"))
-                }
-            })
-            .clone()?;
+        self.write_scope()?;
         crate::forge_comment::post_comment(
             &self.gh_bin,
             Some(&self.root),
@@ -424,6 +573,10 @@ impl ReleaseForge for GhReleaseForge {
         .map(|_| ())
     }
 }
+
+#[cfg(test)]
+#[path = "release_scope_tests.rs"]
+mod scope_tests;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]

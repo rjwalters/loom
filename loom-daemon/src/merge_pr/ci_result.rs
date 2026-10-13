@@ -18,7 +18,7 @@
 //! | latest `CI` run for EXACTLY this head concluded `success` | [`CLEAN`] | 0 |
 //! | the repository defines no `CI` workflow at all | [`NO_CI_WORKFLOW`] + reason | 0 |
 //! | a `CI` workflow exists but no run for this head / run still in progress | [`UNVERIFIED`] + reason | 3 |
-//! | latest run concluded anything else | the refusal (names the cancelled / failed jobs, hints `gh run rerun --failed`) | 1 |
+//! | latest run concluded anything else | the refusal (names the cancelled / failed jobs, hints `gh run rerun --failed`), ending in a [`FAILED`] line | 1 |
 //! | could not query the forge (runs or workflows) | the reason | 2 |
 //!
 //! Only [`CLEAN`] and [`NO_CI_WORKFLOW`] permit a merge (#10567). Every other
@@ -47,6 +47,29 @@ pub const UNVERIFIED: &str = "LOOM-CI-RESULT-UNVERIFIED";
 /// Stdout prefix when the repository defines no `CI` workflow (exit 0): the
 /// explicit no-CI policy, distinct from an inability to inspect CI.
 pub const NO_CI_WORKFLOW: &str = "LOOM-CI-RESULT-NO-CI-WORKFLOW";
+
+/// Prefix of the refusal's last line, `LOOM-CI-RESULT-FAILED run=<id>
+/// jobs=<names>` (#11330): a stable handle a driver can parse to decide on
+/// `gh run rerun --failed <id>`. Classification only — this gate never decides
+/// "flake vs. real" and never re-runs anything itself.
+pub const FAILED: &str = "LOOM-CI-RESULT-FAILED";
+
+/// `LOOM-CI-RESULT-FAILED run=<id> jobs=<names>`: `names` are the bad jobs'
+/// names, comma-separated, or `-` when none could be listed. Last on the line
+/// because a job name may contain spaces.
+#[must_use]
+pub fn failed_line(run: u64, jobs: &[String]) -> String {
+    let names: Vec<&str> = jobs
+        .iter()
+        .map(|j| j.rsplit_once(" (").map_or(j.as_str(), |(n, _)| n))
+        .collect();
+    let names = if names.is_empty() {
+        "-".to_string()
+    } else {
+        names.join(",")
+    };
+    format!("{FAILED} run={run} jobs={names}")
+}
 
 /// The workflow whose conclusion is gated: the `name:` of ci.yml.
 pub const WORKFLOW_NAME: &str = "CI";
@@ -179,6 +202,7 @@ pub fn assess(
             Vec::new()
         }
     };
+    let token = failed_line(id, &listed);
     let jobs = if listed.is_empty() {
         "no individual failed/cancelled job could be listed".to_string()
     } else {
@@ -188,7 +212,7 @@ pub fn assess(
         "Merge blocked: PR #{pr}'s head {sha} has a `{WORKFLOW_NAME}` run ({url}) that concluded `{conclusion}`, not `success` (#10444). \
 Required contexts being green is not enough: a cancelled or never-acquired job (e.g. Detect Changes) silently skips the lint and test jobs behind it. \
 Failed/cancelled jobs: {jobs}. \
-Re-run in place with `gh run rerun --failed {id}` (never cancel a run), wait for it to conclude `success`, then merge again."
+Re-run in place with `gh run rerun --failed {id}` (never cancel a run), wait for it to conclude `success`, then merge again.\n{token}"
     ))
 }
 

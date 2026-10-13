@@ -38,6 +38,7 @@ fn unchanged_identity_replays_after_start_or_phase_without_rereading_launch() {
             kind: SweepKind::Issue(42),
             runtime: None,
             runtime_source: None,
+            start: None,
             repo: None,
         },
         Event::SweepPhase {

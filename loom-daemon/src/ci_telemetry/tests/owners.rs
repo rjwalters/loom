@@ -145,12 +145,11 @@ fn env_owners_override_config_owners_and_the_env_org_alias() {
         org: Some("config-org".into()),
         ..CiTelemetryConfig::default()
     };
-    std::env::set_var(ORG_ENV, "env-org");
-    let org_only = resolve(&config);
-    std::env::set_var(OWNERS_ENV, "rjwalters, 2amlogic");
-    let both = resolve(&config);
-    std::env::remove_var(OWNERS_ENV);
-    std::env::remove_var(ORG_ENV);
+    let org_only = resolve_with_env(&config, &fixed_env(&[(ORG_ENV, "env-org")]));
+    let both = resolve_with_env(
+        &config,
+        &fixed_env(&[(ORG_ENV, "env-org"), (OWNERS_ENV, "rjwalters, 2amlogic")]),
+    );
     assert_eq!(org_only.owners, vec![Owner::org("env-org")]);
     assert_eq!(org_only.owners_source, SOURCE_ENV_ORG);
     assert_eq!(both.owners, vec![Owner::probed("rjwalters"), Owner::probed("2amlogic")]);

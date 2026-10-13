@@ -41,7 +41,7 @@
 //! | `daemon.preflight.advisory` | Daemon reaper (`SweepRegistry`) | `{workspace_root, consecutive_deaths, marker, message}` |
 //! | `daemon.agent_residue.reaped` | Agent residue reaper (#10802) | `{source, path, kind, unit, pids, issue, sweep_id, dry_run, detail}` |
 //! | `forge.event` | `forge_events.rs` feed consumer (#8765) | `{source: "forge-event-feed", host_id, count, first_seq, last_seq, types}` |
-//! | `operator_priority.escalation` | Star-liveness pass (#9321); `fleet_alert` (#10164) | `{slug, issue, key, kind, stage, text, url, host, inherited_from?, resolved}` |
+//! | `operator_priority.escalation` | `fleet_alert` (#10164; the star-liveness publisher, #9321, was removed by #11104) | `{slug, issue, key, kind, stage, text, url, host, inherited_from?, resolved}` |
 //!
 //! New topics require a follow-up issue — the taxonomy is intentionally
 //! pinned. The four `epic.issue.{N}.*` topics were authorized by **#3873**
@@ -106,10 +106,11 @@
 //! below is satisfied structurally: the early tick *is* the loop's own re-read.
 //!
 //! The `operator_priority.escalation` topic was authorized by **#9321** (the
-//! delivery half of #9244/#9301) so a starred issue's operator ask reaches the
-//! human in the team's Matrix room, not only as a forge comment nobody reads in
-//! time (the #9268 failure mode: four agents commented for seven hours). Publisher:
-//! [`crate::star_liveness`]'s liveness pass
+//! delivery half of #9244/#9301) so an operator ask reaches the human in the
+//! team's Matrix room, not only as a forge comment nobody reads in time (the
+//! #9268 failure mode: four agents commented for seven hours). Its original
+//! publisher, the star-liveness pass, was removed by #11104; the remaining
+//! publisher is `fleet_alert` (#10164)
 //! ([`crate::types::Event::OperatorPriorityEscalation`]); consumer: the
 //! Safehouse narration sink, which renders it as a `handoff` envelope into the
 //! `Signal` attention room.
@@ -741,6 +742,7 @@ mod tests {
             kind: SweepKind::Issue(42),
             runtime: None,
             runtime_source: None,
+            start: None,
             repo: None,
         };
         assert_eq!(ev.topic(), "sweep.global.dispatch");

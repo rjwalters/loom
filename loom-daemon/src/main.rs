@@ -155,8 +155,8 @@ enum Commands {
     },
 
     /// Show the work finder's ready queue in its real dispatch order
-    /// (starred `loom:operator-priority` first, then red-main fixes, workspace
-    /// priority, oldest first — #9244) with what the last
+    /// (verified red-main fixes first, then priority level, oldest first —
+    /// #11103, #11547) with what the last
     /// tick did with each issue and why, plus a freshness line (Issue #8852).
     Queue {
         /// Emit machine-readable JSON instead of the human-readable table.
@@ -244,22 +244,6 @@ enum Commands {
         #[command(subcommand)]
         action: FleetAction,
     },
-
-    /// The operator-agent persona's I/O surface (Issue #7947, Phase 3b of
-    /// #4196): read room intent, vet a typed command, relay it to the daemon.
-    ///
-    /// `concierge relay` is the ONLY sanctioned path from a natural-language
-    /// read of a room message to a daemon command, and it refuses `--verb
-    /// confirm` unconditionally — a confirmation nonce is answered by the human
-    /// it was shown to, never by the persona. Off unless
-    /// `safehouse.concierge` names at least one allowed sender; `concierge
-    /// check` reports which.
-    ///
-    /// A one-line tuple variant wrapping `ConciergeArgs` (which carries the
-    /// `#[command(subcommand)]`), for the same reason `Telemetry` above is:
-    /// this file is frozen by the file-size ratchet, so the subcommand's shape
-    /// and docs live in `cli::concierge` and only the dispatch arm is here.
-    Concierge(cli::concierge::ConciergeArgs),
 
     /// Manage insta-crash quarantines (Issue #3939): the in-memory pauses the
     /// daemon applies to issues whose sweeps insta-crash repeatedly. Connects to
@@ -363,14 +347,8 @@ enum Commands {
         #[arg(long)]
         ignore_host_constraint: bool,
 
-        /// Override the host-class gate (Issue #9034): by default, dispatching a
-        /// `loom:heavy` issue on a host classified `host_class: local-dev`
-        /// (`autonomous.workFinder.hostClass` / `LOOM_HOST_CLASS`) refuses with a
-        /// clear message. Pass `--allow-local` to dispatch anyway — an operator
-        /// hand-dispatching a known-heavy issue on their own machine on purpose is
-        /// not the case this gate exists to stop.
-        #[arg(long)]
-        allow_local: bool,
+        #[command(flatten)]
+        tap: cli::dispatch::DispatchTapArgs,
     },
 
     /// Cancel a running sweep via the running daemon (Issue #4980): the `dispatch`
@@ -889,17 +867,6 @@ enum Commands {
         pr: u64,
     },
 
-    /// Shadow-mode Jev (TypeSafe) complexity-tier classifier, run beside the
-    /// Curator's `<!-- loom:complexity=<tier> -->` marker (issue #8543) — a
-    /// calibrated second opinion, never a routing decision. Prints a JSON
-    /// object with a probability per tier (`mechanical`/`routine`/`complex`)
-    /// plus a confidence to stdout; exits non-zero with no stdout output on
-    /// any failure, including a missing `TYPESAFE_API_KEY`.
-    JevTier {
-        /// The issue number to classify.
-        issue: u64,
-    },
-
     // ---------------------------------------------------------------------
     // Script helpers (epic #4081 Phase 3 family 5, issue #4275) — native
     // replacements for the `loom_tools` modules that existed only to back a
@@ -922,7 +889,7 @@ enum Commands {
 
     /// Resolve a logical model tier/alias to the concrete model ID to dispatch
     /// on the wire (issue #3982; native port of `loom_tools.model_tiers`,
-    /// #4275). Backs `resolve-model.sh` and `resolve-tier-model.sh`.
+    /// #4275). Backs `resolve-model.sh`.
     ///
     /// Unknown aliases and pinned IDs pass through unchanged and the
     /// `model@effort` grammar is preserved. `--config` is an **explicit
@@ -931,14 +898,14 @@ enum Commands {
     /// Resolution never fails — outside a Loom repo the config is simply empty
     /// and the shipped default map applies.
     ///
-    /// Exit codes: `0` resolved, `2` usage error, `3` no mapping (both `--tier`
-    /// and `--task-alias`) so the caller falls through to its own precedence
-    /// chain.
+    /// Exit codes: `0` resolved, `2` usage error, `3` no mapping
+    /// (`--task-alias` / `--downgrade`) so the caller falls through to its own
+    /// precedence chain.
     ResolveModel {
         /// A logical tier/alias (`opus`, `sonnet`, `sonnet@xhigh`) or a pinned
         /// model ID.
         #[arg(value_name = "MODEL")]
-        model: Option<String>,
+        model: String,
 
         /// Path to a `.loom/config.json` to read verbatim (default: resolve
         /// the `./.loom` config tier chain).
@@ -964,16 +931,6 @@ enum Commands {
         /// mid-phase-death handling instead of guessing a model.
         #[arg(long)]
         downgrade: bool,
-
-        /// Complexity-tier mode (issue #4238): resolve
-        /// `sweep.tierModels[<runtime>][<tier>]`, falling back to the
-        /// `sweep.optimization` preset, instead of a bare alias.
-        #[arg(long, value_name = "TIER")]
-        tier: Option<String>,
-
-        /// Worker runtime for `--tier` resolution.
-        #[arg(long, default_value = "claude")]
-        runtime: String,
     },
 
     /// Token-cost telemetry: `usage` (live, from the Anthropic OAuth API) and
@@ -1030,6 +987,7 @@ enum Commands {
     #[command(flatten)]
     ScriptPorts(cli::script_ports::ScriptPortCommand),
     Labels(cli::labels_cmd::LabelsArgs),
+    Presence(cli::presence::PresenceArgs),
 
     /// Historical replay of scheduling predictions vs eventual PRs (#9785):
     /// `overlap-replay validate | outcomes | score`. Nested (not flattened)
@@ -1105,6 +1063,11 @@ enum Commands {
         /// Show verbose output including configured roles
         #[arg(long, short)]
         verbose: bool,
+
+        /// Run only the fleet-policy shadow check (#11441) and exit 2 on any
+        /// finding; skips role validation. Used by the CI guard.
+        #[arg(long)]
+        fleet_policy_only: bool,
     },
 
     /// Inspect the durable `sweep.outcome` telemetry journal (Issue #4704,
@@ -1132,6 +1095,9 @@ enum Commands {
     /// = drift detector), diff/apply the `roster`, and report the desired run
     /// `state`. Args live in `cli::fleet_config` (main.rs is size-frozen).
     FleetConfig(cli::fleet_config::FleetConfigArgs),
+
+    /// The shared bounded journal core (#11345): `verify` a journal root.
+    Journal(cli::journal_cli::JournalArgs),
 }
 
 /// Sub-actions for `loom-daemon checkpoint` (issue #4275).
@@ -2332,16 +2298,12 @@ async fn handle_cli_command(command: Commands) -> Result<()> {
             generation,
             task_alias,
             downgrade,
-            tier,
-            runtime,
         } => handle_resolve_model_command(
-            model.as_deref(),
+            &model,
             config.as_deref(),
             generation,
             task_alias,
             downgrade,
-            tier.as_deref(),
-            &runtime,
         ),
         Commands::Telemetry(cmd) => cmd.run().await,
         Commands::Checkpoint { action } => handle_checkpoint_command(action),
@@ -2352,6 +2314,7 @@ async fn handle_cli_command(command: Commands) -> Result<()> {
         Commands::ScriptPorts(cmd) => cmd.run(),
         Commands::OverlapReplay { action } => action.run(),
         Commands::Lease { action } => action.run(),
+        Commands::Presence(cmd) => cmd.run(),
         Commands::Inflight { action } => action.run(),
         Commands::SweepExperiment { action } => handle_sweep_experiment_command(action),
         Commands::ValidatePhase {
@@ -2382,9 +2345,11 @@ async fn handle_cli_command(command: Commands) -> Result<()> {
             format,
             strict,
             verbose,
-        } => handle_validate_command(&workspace, &format, strict, verbose),
+            fleet_policy_only,
+        } => handle_validate_command(&workspace, &format, strict, verbose, fleet_policy_only),
         Commands::SweepOutcomes(args) => cli::sweep_outcomes_cli::dispatch(args),
         Commands::FleetConfig(args) => cli::fleet_config::dispatch(args),
+        Commands::Journal(args) => cli::journal_cli::dispatch(args),
         Commands::Stats {
             command,
             role,
@@ -2543,8 +2508,6 @@ async fn handle_cli_command(command: Commands) -> Result<()> {
         }
         // Async commands are dispatched by main before reaching this sync handler.
         Commands::JevMergeRisk { .. }
-        | Commands::JevTier { .. }
-        | Commands::Concierge(..)
         | Commands::Hyperparams(..)
         | Commands::Quarantine { .. }
         | Commands::DispatchBackoff { .. }

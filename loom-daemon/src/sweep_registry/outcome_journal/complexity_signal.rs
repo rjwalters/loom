@@ -3,12 +3,10 @@
 //!
 //! # Why a forge read at terminal transition, not a dispatch-time plumb
 //!
-//! `resolve-tier-model.sh` already reads an issue's `<!-- loom:complexity=
-//! <tier> -->` marker at dispatch time to pick a model, but that resolution
-//! happens in a shell process outside the daemon (and via several different
-//! entry points — `dispatch_sweep`, the epic supervisor, the work finder, the
-//! role runner), so there is no single dispatch-time seam that could hand the
-//! resolved tier to [`crate::sweep_registry::SweepRegistry`] without plumbing
+//! A sweep is dispatched via several different entry points —
+//! `dispatch_sweep`, the epic supervisor, the work finder, the role runner —
+//! so there is no single dispatch-time seam that could hand the issue's
+//! `<!-- loom:complexity=<tier> -->` tier to [`crate::sweep_registry::SweepRegistry`] without plumbing
 //! a new parameter through every one of them.
 //!
 //! The marker itself is a durable, essentially-static property of the
@@ -39,9 +37,7 @@
 //! output, an issue body with no recognized marker — yields an empty
 //! [`IssueSignals`], which the caller turns into an **absent** `complexity`
 //! key and an unconstrained (`None`) end state. Never a fabricated
-//! `"routine"`: unlike `resolve-tier-model.sh`'s own dispatch-time fold (an
-//! absent/unrecognized marker there is a deliberate SAFE DEFAULT for model
-//! selection), this journal field must stay honest about "unobserved" — a
+//! `"routine"`: this journal field must stay honest about "unobserved" — a
 //! routing-evaluation consumer needs the true absence rate, not a default
 //! masquerading as data. The end state is held to the same standard: an
 //! unread issue is `None`, which classifies as "no forge opinion", never as
@@ -283,9 +279,8 @@ mod tests {
             .with_timezone(&Utc)
     }
 
-    /// The marker vocabulary this module accepts is exactly
-    /// `resolve-tier-model.sh`'s closed enum — nothing else, not even a value
-    /// that `resolve-tier-model.sh` itself would fold to `routine`.
+    /// The marker vocabulary this module accepts is exactly the closed enum —
+    /// nothing else, not even a value a lenient reader would fold to `routine`.
     #[test]
     fn valid_tiers_are_exactly_the_closed_vocabulary() {
         for tier in ["mechanical", "routine", "complex"] {
@@ -390,7 +385,7 @@ mod tests {
         // The full hand-back shape a Curator actually leaves behind: the
         // persistent `loom:curated` milestone plus a fresh `loom:triage`.
         assert_eq!(
-            open_with(&["loom:curated", "loom:triage", "tier:goal-supporting"]).end_state(None),
+            open_with(&["loom:curated", "loom:triage", "enhancement"]).end_state(None),
             Some(IssueEndState::Rescoped)
         );
     }
@@ -416,7 +411,7 @@ mod tests {
         }
         // The real-world label set of a curated, promoted, claimed issue.
         assert_eq!(
-            open_with(&["loom:curated", "loom:building", "tier:goal-supporting"]).end_state(None),
+            open_with(&["loom:curated", "loom:building", "enhancement"]).end_state(None),
             Some(IssueEndState::StillOpen)
         );
     }

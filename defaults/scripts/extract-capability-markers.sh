@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # extract-capability-markers.sh - reference parser for the
-# `<!-- loom:capability=<name> -->` convention (#6892), mirroring
-# require-complexity-marker.sh's `<!-- loom:complexity=<tier> -->` anchoring
-# so both sides of the fleet parse the same marker identically.
+# `<!-- loom:capability=<name> -->` convention (#6892), anchored per the #4840
+# rule so both sides of the fleet parse the same marker identically.
 #
 # This marker is meaningful ONLY alongside the `loom:operator-mechanical`
 # sub-kind label (see defaults/docs/label-state-machine.md, "Capability-
@@ -19,7 +18,7 @@
 # value per item, this script collects every match rather than taking the
 # last.
 #
-# Anchoring rationale (identical to require-complexity-marker.sh, #4840): a
+# Anchoring rationale (the #4840 anchoring rule): a
 # bare substring match would also fire on prose that merely *quotes* the
 # marker syntax as literal example text (this convention doc does exactly
 # that). Anchoring to the full `<!-- ... -->` comment form excludes that

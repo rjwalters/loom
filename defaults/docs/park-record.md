@@ -87,8 +87,7 @@ loom-daemon park-record apply --issue 8440 --reason operator --by human   # no b
 
 1. **Refuses** (exit 1, nothing changed) when there is neither `--blocked-by`
    nor an explicit `--reason`. A park with no named blocker reads as
-   `blocked-unnamed` to star-liveness and UNDOCUMENTED to
-   `check-stale-blocked`, and is never released automatically — so it must be
+   UNDOCUMENTED to `check-stale-blocked`, and is never released automatically — so it must be
    a written choice (`--reason operator`, a quarantine/scope ruling …), which
    renders an attributable `Blocked by: (unstated)` record, never an omission.
 2. **Refuses** a blocker that is already closed (#9102) — the unblock sweep
@@ -143,7 +142,8 @@ These writers differ from `apply` in two documented ways:
 ## Who reads one
 
 - `loom-daemon check-stale-blocked` (`defaults/scripts/check-stale-blocked.sh`,
-  #8927/#8925) — the pre-wave advisory. Reads `park_record::blockers` from an
+  #8927/#8925) — the pre-wave advisory, **per-repository**: one invocation
+  examines the one repository `--repo` / `--repo-root` resolves (#9191). Reads `park_record::blockers` from an
   artifact's body to populate `Evidence::declared`; an artifact whose only
   blocker reference is NOT inside a park record is reported as **PROSE-ONLY**
   (`stale_blocked::undeclared`), separate from **UNDOCUMENTED** (no blocker
@@ -163,7 +163,19 @@ These writers differ from `apply` in two documented ways:
   `release-stale-blocked` and the role runner): an archived repository is
   read-only, so nothing is listed, `--json` reports `archived: true` and the
   human report is one line. A probe that fails is NOT EVALUATED, never
-  archived and never clear (`archived: null`).
+  archived and never clear (`archived: null`). Champion's merge-risk hold
+  digest issue (exact title, or body starting with its marker) is exempt from
+  this pass, the notifier and the release pass: it is `loom:blocked` only to
+  stay out of curation and has no blocker to cite (#9397).
+  **Do not loop it over many repositories by hand.** The budget floor reads
+  the hourly buckets, which a secondary rate limit never shows in, and a
+  one-shot CLI invocation has no rate-limit breaker (it exists only in the
+  running daemon), so nothing carries a refusal from one invocation to the
+  next. A caller that needs several repositories must pace
+  the invocations and stop at the first one that reports a rate-limit refusal
+  (it still exits 0, so read the report, not the exit code). Why, and what to
+  check instead: [github-authentication.md → Secondary rate limits and
+  hand-rolled loops](github-authentication.md#secondary-rate-limits-and-hand-rolled-loops-9191).
 - `guide.md`'s `check_and_unblock` / `check_and_unblock_prs` — the active
   unblock sweep. A rendered park record's `Blocked by: #N` line already
   matches `parse_dependencies`'s existing pattern, so no separate parser is

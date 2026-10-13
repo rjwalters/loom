@@ -32,7 +32,9 @@
 //! Phase A resolved a single fixed cap once at daemon startup. Phase B replaces
 //! it with a cap **recomputed every tick** by [`resolve_dynamic_max_concurrent`]
 //! from two live inputs — the worktree-root disk headroom
-//! ([`crate::disk_headroom::disk_headroom_limit`]) and the host's
+//! ([`crate::disk_admission::tick`] since #11191: free space net of the
+//! in-flight sweeps' expected growth, at each repo's measured charge; the flat
+//! [`crate::disk_headroom::disk_headroom_limit`] when disabled) and the host's
 //! available-RAM headroom (#5270, [`crate::ram_headroom::ram_headroom_limit`])
 //! — bounded by the per-machine operator ceiling
 //! (`LOOM_WORK_FINDER_MAX_CONCURRENT` / `autonomous.workFinder.maxConcurrent`).
@@ -127,7 +129,6 @@ use std::time::Duration;
 use anyhow::Result;
 
 use crate::capacity::{self, CapacityAdvisory};
-use crate::disk_headroom::disk_headroom_limit;
 use crate::event_bus::EventBus;
 use crate::main_health_gate::{MainHealthState, WorkspaceHealthStates};
 #[cfg(test)]
@@ -227,22 +228,28 @@ pub const DEFAULT_MAX_ADMISSIONS_PER_TICK: usize = 3;
 /// config). See [`resolve_extra_skip_labels_with_config`].
 pub const WORK_FINDER_EXTRA_SKIP_LABELS_ENV: &str = "LOOM_WORK_FINDER_EXTRA_SKIP_LABELS";
 
+pub mod affected_files;
 pub mod build_backoff;
 pub mod dispatch_plan;
 pub mod dispatch_plan_merge;
 pub mod halt_cause;
 mod labels;
 pub mod main_red_fix;
+pub mod open_pr_prefilter;
 pub mod operator_priority;
 mod ordering;
 pub mod ready_queue;
 mod recheck_interval;
+mod tick_line;
 mod tick_report;
 mod tick_summary;
+mod tracking_parent;
+pub mod vi_cap;
+pub mod workspace_draw;
 use crate::types::QueueDisposition as Qd;
 pub use labels::{BUILDING_LABEL, OPERATOR_HOLD_LABEL, PARK_LABELS, SKIP_LABELS};
 pub use main_red_fix::RedMainLane;
-pub use operator_priority::{CapTerms, OverflowSlot, OPERATOR_PRIORITY_LABEL};
+pub use operator_priority::{CapTerms, OverflowSlot};
 pub use ordering::{candidate_cmp, PriorityCandidate};
 use tick_report::record_dispatch_outcome;
 pub use tick_report::{Admission, TickReport};
@@ -252,12 +259,6 @@ pub use tick_summary::{
     last_tick_summary, publish_tick, publish_tick_summary, publish_tick_summary_at,
     publish_tick_summary_with_roots_at, tick_summary,
 };
-
-/// The legacy urgency label (Issue #3946). Since #9244 it is **not** an
-/// ordering key: `loom:operator-priority` replaced it. It is still parsed
-/// harmlessly (an item carrying it is never an error) and still reported by
-/// the blocked-queue view; the constant goes in a follow-up after one release.
-pub const URGENT_LABEL: &str = "loom:urgent";
 
 // ============================================================================
 // Fetched work facts
@@ -301,18 +302,12 @@ pub struct WorkItem {
     /// last-dispatch clock. `None` (a synthetic item, or a listing without
     /// timestamps) simply disables the recheck-interval check for that item.
     pub updated_at: Option<String>,
-    /// When the issue was starred (`loom:operator-priority`, #9244), from the
-    /// cached `labeled` timeline event. `None` for an unstarred issue, or a
-    /// starred one whose event is unknown (ordering then falls back to
-    /// `createdAt`). See [`operator_priority`].
-    pub operator_priority_at: Option<String>,
-    /// Set when this issue blocks a starred issue and inherits its star
-    /// (#9244 C): the starred issue's number. See [`crate::star_liveness::inherit`].
-    pub operator_priority_inherited_from: Option<u32>,
     /// Who filed the issue, when the listing supplied it (#10118). Only a
     /// trusted author's red-main-fix marker admits an unpromoted row (#9548);
     /// `None` (a synthetic item) is never trusted. See [`main_red_fix`].
     pub author: Option<crate::comment_trust::Author>,
+    /// Open native sub-issues (#11483); see [`tracking_parent`].
+    pub open_sub_issues: Option<u32>,
 }
 
 impl WorkItem {
@@ -332,9 +327,8 @@ impl WorkItem {
             created_at,
             body: None,
             updated_at: None,
-            operator_priority_at: None,
-            operator_priority_inherited_from: None,
             author: None,
+            open_sub_issues: None,
         }
     }
 
@@ -436,9 +430,9 @@ impl WorkItem {
     /// `held_capabilities` fully covers, is **not** skipped — it is dispatchable
     /// into the propose-mode lane. Everything else about the park is unchanged:
     ///
-    /// - The other three sub-kinds (`loom:operator-decision`,
-    ///   `loom:operator-blocked`, `loom:operator-objective`) stay hard-skipped
-    ///   unconditionally, marker or no marker.
+    /// - The other two sub-kinds (`loom:operator-decision`,
+    ///   `loom:operator-blocked`) stay hard-skipped unconditionally, marker or
+    ///   no marker.
     /// - `loom:blocked`, `loom:needs-capability` and `loom:operator` veto the
     ///   exemption outright, as does [`BUILDING_LABEL`] and any
     ///   `extra_skip_labels` entry — the exemption only ever relaxes
@@ -473,13 +467,6 @@ impl WorkItem {
         }
         !self.mechanical_routing(held_capabilities).is_dispatchable()
     }
-
-    /// True when the issue carries the legacy [`URGENT_LABEL`] (#3946). Parsed
-    /// harmlessly only: since #9244 it no longer affects dispatch order.
-    #[must_use]
-    pub fn is_urgent(&self) -> bool {
-        self.labels.iter().any(|l| l == URGENT_LABEL)
-    }
 }
 
 // ============================================================================
@@ -507,6 +494,16 @@ pub trait WorkSource {
     /// cannot fall short keeps the default.
     fn listing_complete(&self) -> bool {
         true
+    }
+
+    /// Every open `loom:very-important` issue of this repo, in any state
+    /// (`loom:issue`, `loom:building`, in curation, ...), for the flood cap
+    /// ([`vi_cap`], #11509), so an issue being built keeps the workspace's
+    /// very-important slot. `None` when unknown (a failed read, or a source
+    /// without the listing): the cap then counts the ready listing alone.
+    /// Called only on a tick whose ready listing holds a very-important issue.
+    fn list_open_very_important(&mut self) -> Option<Vec<WorkItem>> {
+        None
     }
 }
 
@@ -760,7 +757,7 @@ pub trait WorkDispatcher {
     /// [`declared_capabilities`](Self::declared_capabilities).
     ///
     /// Defaults to [`crate::sweep_registry::host_identity`] — the same
-    /// `$LOOM_HOST_ID` / `$HOSTNAME` / `hostname`-binary resolution every
+    /// `fleet.hostId` / `$LOOM_HOST_ID` / persisted-id resolution every
     /// other host-identity consumer in the daemon (peer-claim
     /// self-recognition, observability) already uses, so this feature can
     /// never disagree with them about what "this host" means. A test fake
@@ -768,16 +765,6 @@ pub trait WorkDispatcher {
     /// env vars.
     fn current_host_id(&self) -> String {
         crate::sweep_registry::host_identity()
-    }
-
-    /// This host's `host_class` (startup-captured, #9034) plus this
-    /// workspace's live `allowHeavyLocal` override — see
-    /// [`host_class::HeavyLocalPolicy`]. Defaults to
-    /// `HeavyLocalPolicy::default()` (unclassified, no override), which is
-    /// both the zero-boilerplate test-fake opt-out and the real default for
-    /// every host that has not opted in.
-    fn heavy_local_policy(&self) -> host_class::HeavyLocalPolicy {
-        host_class::HeavyLocalPolicy::default()
     }
 
     /// Dispatch a build sweep for `issue`. Returns `true` when a **new** sweep
@@ -797,7 +784,7 @@ pub trait WorkDispatcher {
     fn dispatch(&mut self, issue: u32, complexity: Option<&str>) -> Result<bool>;
 
     /// [`dispatch`](Self::dispatch), additionally recording whether this is
-    /// the host's `loom:operator-priority` overflow sweep (#9244) on the sweep
+    /// the host's overflow sweep (#9244, inert since #11508) on the sweep
     /// record. Defaults to plain `dispatch` (the flag dropped), so a
     /// dispatcher that does not model overflow opts out with zero boilerplate.
     ///
@@ -812,6 +799,17 @@ pub trait WorkDispatcher {
     ) -> Result<bool> {
         let _ = overflow;
         self.dispatch(issue, complexity)
+    }
+
+    /// The batched open-PR pre-filter (#8865, [`open_pr_prefilter`]): the
+    /// issues in `candidates` with a VERIFIED open linked PR, each mapped to
+    /// that PR. Asked at most once per workspace per tick; the multi-workspace
+    /// tick skips those candidates without calling
+    /// [`dispatch_with`](Self::dispatch_with). It can only remove candidates:
+    /// anything not verified (unreadable listing included) must be left out,
+    /// and still meets `dispatch()`'s own open-PR guard. Defaults to empty.
+    fn open_pr_blocked(&self, _candidates: &[u32]) -> HashMap<u32, u32> {
+        HashMap::new()
     }
 
     /// Whether a live sweep on this host is already marked `overflow`
@@ -1025,13 +1023,12 @@ pub fn tick_with_saturation_brake(
     tick_with_lanes(source, dispatcher, caps, halted, saturation_held, RedMainLane::default())
 }
 
-/// Like [`tick_with_saturation_brake`], plus the #9244 lanes: starred and
-/// red-main-fix candidates sort first ([`ready_queue::sort_lanes`]; ordinary work
-/// keeps its listing order), a halted repo whose `main` is verified red still
-/// admits its `<!-- loom:main-red-fix -->` issues and nothing else (`lane`),
-/// and one starred issue refused only by the concurrency cap may take the
-/// host's [`OverflowSlot`]. `caps` is `(cap terms, max_admissions_per_tick)`;
-/// the effective cap is [`CapTerms::effective`].
+/// Like [`tick_with_saturation_brake`], plus the in-workspace priority order
+/// ([`ready_queue::sort_lanes`]: level, oldest, number) and the #9244 red-main
+/// lane: a halted repo whose `main` is verified red still admits its
+/// `<!-- loom:main-red-fix -->` issues and nothing else (`lane`). `caps` is
+/// `(cap terms, max_admissions_per_tick)`; the effective cap is
+/// [`CapTerms::effective`].
 ///
 /// # Errors
 ///
@@ -1056,8 +1053,11 @@ pub fn tick_with_lanes(
         ..TickReport::default()
     };
     report.note_listing(0, source.listing_complete());
+    // #11509: one `loom:very-important` per workspace; the rest rank important.
+    vi_cap::enforce(0, source, &mut ready, &mut report);
+    // #11547: a verified red-main fix leads the order while `main` is red.
     ready_queue::sort_lanes(&mut ready, red);
-    let (max_concurrent, mut overflow) = OverflowSlot::open(dispatcher.overflow_in_flight(), terms);
+    let (max_concurrent, _) = OverflowSlot::open(dispatcher.overflow_in_flight(), terms);
 
     // Reactive backstop: a red `main` halts all new dispatch this tick — except
     // its verified red-main fixes (#9244), which the loop below lets through.
@@ -1093,8 +1093,6 @@ pub fn tick_with_lanes(
     // tick, like `extra_skip_labels` above. Empty on every host that has not
     // opted in, which makes the check below byte-for-byte the pre-#6893 one.
     let held_capabilities = dispatcher.declared_capabilities();
-    // Host-class gate policy (#9034) — once per tick, like the sets above.
-    let heavy_local_policy = dispatcher.heavy_local_policy();
     // This host's identity (#7456) — resolved once per tick, like
     // `held_capabilities` above, so an issue's host-affinity constraint can
     // be checked per candidate without a repeated env/hostname resolution.
@@ -1152,13 +1150,6 @@ pub fn tick_with_lanes(
             );
             continue;
         }
-        // 0c. Host-class gate (#9034): a `loom:heavy` candidate is refused on
-        //     a `local-dev`-classified host, unless the workspace's
-        //     `allowHeavyLocal` override is set — see `host_class` module doc.
-        //     Same zero-side-effect contract as 0b above.
-        if host_class::gate(&item, heavy_local_policy, &mut report.skipped_host_class) {
-            continue;
-        }
         // 1. Defensive skip-label filter (stale forge cache), extended with
         //    this workspace's configured extra skip-label list (#6685) and made
         //    capability-aware for the `loom:operator-mechanical` sub-kind
@@ -1166,6 +1157,11 @@ pub fn tick_with_lanes(
         if item.is_skipped_with_capabilities(&extra_skip_labels, &held_capabilities) {
             report.skipped_labeled += 1;
             log_capability_gap(&item, &held_capabilities);
+            continue;
+        }
+        if let Some(open) = item.open_sub_issues_blocking() {
+            report.skipped_labeled += 1;
+            log::info!("{}", tracking_parent::skip_line(item.number, open));
             continue;
         }
         // 1a. Hard-exclusion labels (#7528): the same rule the Curator and
@@ -1275,11 +1271,9 @@ pub fn tick_with_lanes(
             report.deferred_saturation += 1;
             continue;
         }
-        // 3. Fixed concurrency cap — defer the rest to a future tick, unless
-        //    this starred issue can take the host's overflow slot (#9244).
-        let over =
-            occupancy >= max_concurrent && overflow.admits(item.is_operator_priority(), occupancy);
-        if occupancy >= max_concurrent && !over {
+        // 3. Fixed concurrency cap — defer the rest to a future tick. No
+        //    priority overflows it (#11508).
+        if occupancy >= max_concurrent {
             report.deferred_capacity += 1;
             continue;
         }
@@ -1295,15 +1289,12 @@ pub fn tick_with_lanes(
         // 4. Dispatch. The registry's idempotency key + claim lock make a
         //    double-dispatch of an already-running issue a no-op / loud error.
         let started = chrono::Utc::now();
-        let outcome = dispatcher.dispatch_with(item.number, item.complexity(), over);
+        let outcome = dispatcher.dispatch_with(item.number, item.complexity(), false);
         if record_dispatch_outcome(&mut report, item.number, 0, started, &outcome).0
             == Qd::Dispatched
         {
             occupancy += 1;
             admitted_this_tick += 1;
-            if over {
-                overflow.take(&mut report);
-            }
         }
     }
 
@@ -1362,16 +1353,14 @@ pub fn tick_with_lanes(
 /// workspace `i`'s dispatch tier (lower = higher priority; a missing entry
 /// defaults to [`crate::workspace_registry::DEFAULT_WORKSPACE_PRIORITY`]).
 /// Rather than dispatching each workspace's backlog in registration order, this
-/// gathers every eligible candidate across all workspaces into one queue, sorts
-/// it by [`candidate_cmp`] — **(starred first, starred-at, red-main fix,
-/// workspace priority asc, issue age asc, number asc)** (#9244) — and then
-/// fills the single shared concurrency budget in that global order. So a deep, old product-repo backlog never
-/// starves a small higher-priority tool repo: the tool repo's candidates are
-/// dispatched first even though the product repo has older / more work. The
-/// cap/budget mechanics are unchanged — this only orders the queue.
-///
-/// Strict priority is intentional (v1): a permanently-full higher tier starves
-/// lower tiers. Fairness reservations are an explicit follow-up.
+/// gathers every eligible candidate across all workspaces and orders them by
+/// **weighted workspace draws** ([`workspace_draw`], #11103): each draw picks a
+/// workspace at random weighted by its priority (a workspace with
+/// `loom:very-important` work next wins), then takes that workspace's next
+/// candidate by level, oldest `createdAt`, number. The single shared
+/// concurrency budget is filled in that order, so a higher-priority tool repo
+/// is usually served first without a permanently-full tier starving the rest.
+/// The cap/budget mechanics are unchanged — this only orders the queue.
 /// Compute, per root (parallel to `roots`), whether the work-finder should hold
 /// new dispatch off that root this tick — the `halted` slice `tick_multi`
 /// consumes.
@@ -1517,14 +1506,14 @@ pub fn tick_multi_with_saturation_brake<S: WorkSource, D: WorkDispatcher>(
         halted,
         max_admissions_per_tick,
         saturation_held,
-        None,
     )
 }
 
 /// Like [`tick_multi_with_saturation_brake`], but additionally applies the
-/// **repo-sharding slice preference** (Issue #6243, `defaults/docs/dispatcher-repo-sharding.md`)
-/// and the **per-repo dispatch cap + track affinity** (Issue #9090, see
-/// [`repo_cap`]).
+/// **per-repo dispatch cap + track affinity** (Issue #9090, see
+/// [`repo_cap`]). The #6243 repo-sharding slice preference that used to ride
+/// here was retired from dispatch (#11682,
+/// `defaults/docs/dispatcher-repo-sharding.md`).
 ///
 /// # Per-repo cap + track affinity (#9090)
 ///
@@ -1545,37 +1534,8 @@ pub fn tick_multi_with_saturation_brake<S: WorkSource, D: WorkDispatcher>(
 /// The per-repo counter is seeded from each dispatcher's OWN
 /// [`WorkDispatcher::occupancy`] — the same per-repo value this function
 /// already sums for its global seed — so it costs no extra forge/registry
-/// reads. [`candidate_cmp`] is untouched.
+/// reads. The workspace-draw order ([`workspace_draw`]) is untouched.
 ///
-/// # Repo-sharding slice preference (#6243)
-///
-/// When `preferred_slice` is `Some`, it must be a mask **parallel to
-/// `workspaces`** (`preferred_slice[i]` is whether workspace `i` is in this
-/// host's preferred slice, computed by the caller — in production, from
-/// [`crate::role_shard::decide`]'s `owned` verdict per root, see
-/// [`spawn_multi_work_finder_task`]).
-///
-/// The already-globally-sorted candidate list (by [`candidate_cmp`]) is split
-/// into in-slice / out-of-slice while preserving each partition's relative
-/// order, so `candidate_cmp`'s ordering guarantees hold WITHIN either
-/// partition unchanged. Out-of-slice candidates are dispatched THIS TICK only
-/// when the slice was completely empty at the top of the tick
-/// (work-conservation, #6243's AC) — never interleaved by priority with
-/// in-slice ones, so a lower-priority in-slice repo still holds a shared slot
-/// ahead of a higher-priority OUT-of-slice repo for as long as this host has
-/// ANY in-slice candidate at all.
-///
-/// `None` (what [`tick_multi_with_saturation_brake`] passes — e.g. an
-/// unsharded host, or sharding not wired at the call site) is byte-for-byte
-/// the pre-#6243 candidate list: every existing `tick_multi`
-/// priority-ordering test is unaffected.
-///
-/// **Preference, not the role runner's hard filter.** [`crate::role_shard`]
-/// (#6374) uses the same `owned` verdict to decide whether a workspace's role
-/// rotation runs here *at all* — an unowned workspace simply never ticks. This
-/// function deliberately does NOT do that: dispatch is work-conserving, so an
-/// unowned repo is only ever *deferred behind* the owned ones, and is picked
-/// up in full the moment this host's own slice runs dry.
 /// `halt_causes` (optional, parallel to `halted`) names WHICH hold tripped
 /// workspace `i` (#9017): `halt_causes[i]` is the closed-vocabulary cause
 /// recorded in that workspace's `workspace_halted` rows (`None` for a
@@ -1584,7 +1544,7 @@ pub fn tick_multi_with_saturation_brake<S: WorkSource, D: WorkDispatcher>(
 /// authoritative for routing: a cause at a not-held index is ignored, and a
 /// held index without a cause records a cause-less row.
 // Each argument is an independently-resolved admission knob (global ceiling,
-// per-tick ramp, saturation brake, repo slice, per-repo cap) that the caller
+// per-tick ramp, saturation brake, per-repo cap) that the caller
 // reads from a different source; bundling them into a struct would only move
 // the same list one indirection away. The narrower pre-#9090 arity stays
 // available as [`tick_multi_with_sharding`].
@@ -1597,7 +1557,6 @@ pub fn tick_multi_with_repo_cap<S: WorkSource, D: WorkDispatcher>(
     halt_causes: Option<&[Option<halt_cause::HaltCause>]>,
     max_admissions_per_tick: usize,
     saturation_held: bool,
-    preferred_slice: Option<&[bool]>,
     max_concurrent_per_repo: Option<usize>,
     lanes: &[RedMainLane],
 ) -> TickReport {
@@ -1609,7 +1568,6 @@ pub fn tick_multi_with_repo_cap<S: WorkSource, D: WorkDispatcher>(
         halt_causes,
         max_admissions_per_tick,
         saturation_held,
-        preferred_slice,
         max_concurrent_per_repo,
         lanes,
         &[],
@@ -1619,10 +1577,9 @@ pub fn tick_multi_with_repo_cap<S: WorkSource, D: WorkDispatcher>(
 /// Like [`tick_multi_with_repo_cap`], but additionally honors the **build
 /// back-off** (#9410, [`build_backoff`]): `build_backoff_held` is parallel to
 /// `workspaces` (#10624 — a repo's own debt, or the optional host ceiling);
-/// pass 2 defers each candidate of a held workspace that is neither starred
-/// (`loom:operator-priority`) nor a verified red-main fix
-/// ([`Qd::DeferredBuildBackoff`]). Checked after the saturation brake and
-/// before the overflow / cap gates; in-flight sweeps are untouched. An empty
+/// pass 2 defers every candidate of a held workspace, whatever its priority
+/// ([`Qd::DeferredBuildBackoff`], #11508). Checked after the saturation brake
+/// and before the cap gates; in-flight sweeps are untouched. An empty
 /// or all-`false` slice is [`tick_multi_with_repo_cap`] byte-for-byte.
 /// `halt_causes` is threaded through unchanged — see
 /// [`tick_multi_with_repo_cap`] for its contract (#9017).
@@ -1635,7 +1592,6 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
     halt_causes: Option<&[Option<halt_cause::HaltCause>]>,
     max_admissions_per_tick: usize,
     saturation_held: bool,
-    preferred_slice: Option<&[bool]>,
     max_concurrent_per_repo: impl Into<repo_cap::RepoLimits>,
     lanes: &[RedMainLane],
     build_backoff_held: &[bool],
@@ -1657,9 +1613,8 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
     let mut occupancy: usize = per_repo_occupancy.iter().sum();
     // #11094: `max_concurrent_per_repo` may carry the tick's per-repo RAM budget.
     let mut cap = RepoCap::from_limits(max_concurrent_per_repo.into(), per_repo_occupancy);
-    // The host's single `loom:operator-priority` overflow slot (#9244), taken
-    // up front when any workspace already has a live overflow sweep.
-    let (max_concurrent, mut overflow) = OverflowSlot::for_workspaces(workspaces, terms);
+    // The inert overflow slot (#11508) only reports a live legacy overflow sweep.
+    let (max_concurrent, overflow) = OverflowSlot::for_workspaces(workspaces, terms);
 
     // Snapshot each workspace's quarantined set (#3939) alongside its in-flight
     // set. Quarantined candidates are dropped in pass 1 *before* the global sort
@@ -1765,13 +1720,6 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
         .map(|(_, d)| d.current_host_id())
         .collect();
 
-    // Snapshot each workspace's host-class gate policy (#9034) alongside the
-    // host identities above.
-    let heavy_local_policies: Vec<host_class::HeavyLocalPolicy> = workspaces
-        .iter()
-        .map(|(_, d)| d.heavy_local_policy())
-        .collect();
-
     // Snapshot each workspace's workspace-commands-missing flag (#6440,
     // quarantining #4027 guard 2.4) alongside the other pre-filters. Unlike
     // those, this is a per-WORKSPACE bool, not a per-issue set: when set,
@@ -1824,6 +1772,8 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
         report.note_listing(idx, source.listing_complete());
         let lane = lanes.get(idx).copied().unwrap_or_default();
         let red = main_red_fix::evaluate(lane, &mut ready, dispatcher);
+        // #11509: one `loom:very-important` per workspace; the rest rank important.
+        vi_cap::enforce(idx, source, &mut ready, &mut report);
         report.seen += ready.len();
         let workspace_priority = priorities
             .get(idx)
@@ -1861,6 +1811,7 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
         let now = chrono::Utc::now();
 
         for item in ready {
+            cap.note_surface(idx, &item, in_flight.contains(&item.number));
             let key = ready_queue::key_of(idx, workspace_priority, &item, red);
             // `held_until` (Issue #9311): `None` for every disposition but
             // the five time-boxed holds below, which pass their computed
@@ -1891,17 +1842,6 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
                 );
                 continue;
             }
-            // Host-class gate (#9034) — mirrors the single-workspace step
-            // 0c above: same zero-side-effect contract as the host-affinity
-            // check just above.
-            if host_class::gate(&item, heavy_local_policies[idx], &mut report.skipped_host_class) {
-                skip(
-                    Qd::HostClassRefused,
-                    Some(heavy_local_policies[idx].class.as_str().to_string()),
-                    None,
-                );
-                continue;
-            }
             if item.is_skipped_with_capabilities(
                 &extra_skip_label_sets[idx],
                 &held_capability_sets[idx],
@@ -1909,6 +1849,12 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
                 report.skipped_labeled += 1;
                 skip(Qd::Parked, ready_queue::park_label(&item, &extra_skip_label_sets[idx]), None);
                 log_capability_gap(&item, &held_capability_sets[idx]);
+                continue;
+            }
+            if let Some(open) = item.open_sub_issues_blocking() {
+                report.skipped_labeled += 1;
+                skip(Qd::Parked, Some(tracking_parent::skip_detail(open)), None);
+                log::info!("{}", tracking_parent::skip_line(item.number, open));
                 continue;
             }
             // Hard-exclusion labels (#7528) — mirrors
@@ -2006,22 +1952,24 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
         }
     }
 
-    // Global priority sort (#3946, #9244): starred, starred-at, red-main fix,
-    // workspace priority, age, number.
-    candidates.sort_by(candidate_cmp);
+    // Workspace-first order (#11103): weighted workspace draws, each placing
+    // the drawn workspace's next candidate (level, oldest, number).
+    let candidates = workspace_draw::order(candidates, priorities, &mut report);
 
-    // Candidate-list shaping (`repo_cap::shape_queue`): the #6243 repo-sharding
-    // slice partition, then #9090's track-affinity partition. Both are stable
-    // partitions of the ALREADY-sorted list, so `candidate_cmp` still decides
-    // order within each group; with `preferred_slice: None` and no per-repo cap
-    // the list is byte-for-byte unchanged, and every pre-#6243/#9090
-    // priority-ordering test stays exactly as it was.
-    let candidates = repo_cap::shape_queue(candidates, preferred_slice, &cap, &mut report);
+    // Candidate-list shaping (`repo_cap::shape_queue`): #9090's track-affinity
+    // partition, a stable partition of the ALREADY-drawn list, so the draw
+    // order still decides order within each group; with no per-repo cap the
+    // list is byte-for-byte unchanged. (No repo-sharding slice: retired from
+    // dispatch, #11682.)
+    let candidates = repo_cap::shape_queue(candidates, &cap, &mut report);
 
     // Ramp-admission counter (#4234), shared across every workspace exactly
     // like `occupancy` — see `tick_with_admission_cap`'s single-workspace
     // analogue for the full rationale.
     let mut admitted_this_tick: usize = 0;
+    // #8865: one open-PR listing read per workspace answers for all of its
+    // candidates, lazily at the first one to reach the dispatch point.
+    let mut open_prs = open_pr_prefilter::OpenPrPrefilter::new(&candidates);
 
     // Pass 2 (mutable dispatcher calls): fill the single shared concurrency
     // budget in the sorted global order, routing each candidate back to its
@@ -2036,23 +1984,18 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
             ready_queue::resolve(q, &cand, Qd::DeferredSaturation, None);
             continue;
         }
-        // Build back-off (#9410), per repo since #10624: a WIP policy, so a star
-        // (a human's "now") and a red-main fix (which drains merge debt) both
-        // bypass it.
+        // Build back-off (#9410), per repo since #10624: a WIP policy no
+        // priority bypasses (#11508). A verified red-main fix does (#9244):
+        // it is what lets the repo merge again and drain the debt.
         if build_backoff::defers(build_backoff_held, &cand) {
             report.deferred_build_backoff += 1;
             ready_queue::resolve(q, &cand, Qd::DeferredBuildBackoff, None);
             continue;
         }
-        // #9244 overflow: a starred candidate refused ONLY by the global and/or
-        // per-repo cap may take the host's single over-limit slot. The ramp cap
-        // is not a queue limit, so it still applies (checked below).
-        let over = (occupancy >= max_concurrent || cap.at_cap(cand.workspace_idx))
-            && overflow.admits(cand.operator_priority, occupancy);
         // Shared global cap across all workspaces — defer once the combined
         // occupancy hits the budget, regardless of which workspace still has
         // ready items.
-        if occupancy >= max_concurrent && !over {
+        if occupancy >= max_concurrent {
             report.deferred_capacity += 1;
             ready_queue::resolve(q, &cand, Qd::DeferredCapacity, None);
             continue;
@@ -2068,34 +2011,26 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
         // of the admission gates, so a deferral only ever names a repo that the
         // machine-level gates above would have admitted. Work-conserving by
         // construction: the `continue` hands this slot to the next candidate,
-        // in another repo. The RAM charge binds an overflow candidate too.
-        if cap.defer_admission(&cand, over, &mut report) {
+        // in another repo.
+        if cap.defer_admission(&cand, &mut report) {
             continue;
         }
         let dispatcher = &mut workspaces[cand.workspace_idx].1;
-        let started = chrono::Utc::now();
-        let outcome = dispatcher.dispatch_with(cand.number, cand.complexity.as_deref(), over);
-        let (disposition, mut detail) = record_dispatch_outcome(
-            &mut report,
-            cand.number,
-            cand.workspace_idx,
-            started,
-            &outcome,
-        );
-        if disposition == Qd::Dispatched && over {
-            overflow.take(&mut report);
-            detail = Some("overflow".to_string());
-        }
+        // A candidate with a verified open linked PR is resolved `OpenPr`
+        // here without a dispatch attempt; every other one is dispatched and
+        // counted (`record_dispatch_outcome`) exactly as before (#8865).
+        let (disposition, detail) = open_prs.dispatch(dispatcher, &cand, false, &mut report);
         ready_queue::resolve(&mut report.queue, &cand, disposition, detail);
         if disposition == Qd::Dispatched {
             occupancy += 1;
             admitted_this_tick += 1;
-            cap.admit(cand.workspace_idx);
+            cap.admit_candidate(&cand);
         }
     }
 
     report.halted = any_halted;
     report.occupancy = Some(occupancy);
+    cap.finish(&mut report); // #11606
     report.overflow_free = Some(overflow.is_free());
     // Sum the cumulative cross-host collision totals across every workspace's
     // dispatcher (#4085), read after pass 2 so this tick's collisions count.
@@ -2615,12 +2550,15 @@ where
             // again while free space is below the floor or keeps falling, run
             // the existing reclaim passes for this workspace root right now
             // rather than waiting for the worktree reaper's own
-            // up-to-15-minute-away next tick. The disk term comes back
-            // re-probed after a pass, before this tick's cap is finalized —
-            // see `eager_reclaim::run_for`'s doc comment for the full
-            // rationale and the cooldown-safety argument.
-            let disk = eager_trigger
-                .tick(&workspace_root, disk_headroom_limit(&workspace_root), ram, configured_max)
+            // up-to-15-minute-away next tick. The disk term is #11191's
+            // admission term (one workspace, one charge, so the budget's cap
+            // term is the whole gate here; the per-repo hold is the
+            // multi-workspace loop's) and comes back re-ticked after a pass,
+            // before this tick's cap is finalized — see
+            // `EagerTrigger::tick_admission` and `eager_reclaim::run_for`.
+            let disk_roots = [workspace_root.clone()];
+            let (disk, _) = eager_trigger
+                .tick_admission(&disk_roots, &workspace_root, ram, configured_max)
                 .await;
             // Refresh the memoized CPU idle sample. Purely **observational**
             // since #4512 — it no longer feeds admission, it feeds the
@@ -2721,7 +2659,7 @@ where
                              {} backoff-skip, {} pr-open-backoff, {} noop-cooldown-skip, \
                              {} declined-skip, {} prless-retry-skip, \
                              {} recheck-interval-skip, \
-                             {} host-constraint-skip, {} host-class-skip, \
+                             {} host-constraint-skip, \
                              {} pr-open-skip, \
                              {} peer-claim-skip, \
                              {} deferred (capacity), {} deferred (ramp), \
@@ -2740,7 +2678,6 @@ where
                             report.skipped_prless_retry,
                             report.skipped_recheck_interval,
                             report.skipped_host_constraint,
-                            report.skipped_host_class,
                             report.skipped_pr_open,
                             report.skipped_peer_claim,
                             report.deferred_capacity,
@@ -2857,9 +2794,6 @@ pub fn spawn_multi_work_finder_task(
     mut startup_reconciliation_ready: tokio::sync::watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     configured_max::log_loop_start(interval, configured_max, max_admissions_per_tick);
-    // #9034: a fact about the host, resolved ONCE here — never per tick.
-    let host_class = host_class::resolve_at_startup(&fallback_root);
-    log::info!("work_finder: host_class={} (startup-captured, #9034)", host_class.as_str());
     tokio::spawn(async move {
         // #9060: the operator ceiling is re-resolved every tick (see the
         // `configured_max` module) — no longer a frozen startup value.
@@ -3000,12 +2934,14 @@ pub fn spawn_multi_work_finder_task(
             tmpfs_warning::check_and_warn(&fallback_root);
             // Eager, out-of-cycle reclaim (#7512, #11192) for `fallback_root`
             // — the same root this machine-level disk term is probed against.
-            // Edge plus level (below the floor, or still falling); the disk
-            // term comes back re-probed after a pass, before this tick's cap
-            // is finalized. See the single-workspace loop above for the
-            // identical wiring and `eager_reclaim::EagerTrigger` for the rules.
-            let disk = eager_trigger
-                .tick(&fallback_root, disk_headroom_limit(&fallback_root), ram, configured_max)
+            // Edge plus level (below the floor, or still falling). The disk
+            // term is #11191's admission term (it nets out the in-flight
+            // sweeps' expected growth; the budget charges each repo its
+            // measured footprint); both come back re-ticked after a pass,
+            // before this tick's cap is finalized. See the single-workspace
+            // loop above and `EagerTrigger::tick_admission`.
+            let (disk, disk_budget) = eager_trigger
+                .tick_admission(&roots, &fallback_root, ram, configured_max)
                 .await;
             // Refresh the memoized CPU idle sample — **observational only**
             // since #4512 (see the single-workspace loop above). It feeds the
@@ -3033,43 +2969,13 @@ pub fn spawn_multi_work_finder_task(
             // priority. The empty-registry cwd fallback resolves to the default.
             let priorities: Vec<u32> = roots.iter().map(|r| registry.priority_of(r)).collect();
 
-            // Dispatcher repo-sharding preferred slice (#6243): reuse the
-            // SAME host ring #6374 already established for the role runner
-            // (`role_shard`) rather than deriving a second, independent one.
-            // A workspace's owner is `fnv1a64(shard_key) % shardCount ==
-            // shardIndex` over its cross-host-stable key (repo NWO), so two
-            // hosts' slices are disjoint BY ARITHMETIC — no roster, no
-            // election, no convergence window. Every unconfigured /
-            // malformed / single-shard case resolves to
-            // `ShardPosture::Unsharded`, which owns EVERY workspace, so an
-            // unsharded daemon's dispatch order is byte-for-byte pre-#6243.
-            //
-            // The `owned` verdict means something WEAKER here than it does
-            // in the role runner: there it is a hard filter (unowned => never
-            // ticks), here it is only a preference with a work-conserving
-            // fallback (unowned => dispatched as soon as this host's own
-            // slice is dry). Dispatch can therefore never be *dropped* by a
-            // sharding misconfiguration, only reordered. See
-            // `defaults/docs/dispatcher-repo-sharding.md`.
-            //
-            // Roster mode (#7691) keeps that contract intact: when the
-            // roster's admission fence YIELDS, `ShardDecision::owned` still
-            // carries the pre-roster (#6374) verdict — only the role runner's
-            // `admits_role_tick()` flips. A fence yield therefore never
-            // reaches this line as "owns nothing"; it degrades to exactly the
-            // work-conserving preference this host had before the roster
-            // existed. (When the fence *admits*, `owned` is the roster ring's
-            // own verdict, which is the intended, in-scope change: a
-            // preference reshuffle, never a dropped dispatch.)
-            //
-            // Deliberately NOT calling `role_shard::log_decision_once` here:
-            // it renders a `role_runner:`-prefixed line and dedups through a
-            // process-global per-root map, so calling it from this loop would
-            // both mislabel the line and suppress the role runner's own
-            // edge-triggered one. The aggregate lands in the axis line below
-            // instead.
+            // Shard verdicts, per root, for the dispatch plan's `owning_shard`
+            // only (the fleet-merge primary rule, #9288). They no longer
+            // shape dispatch: the #6243 slice preference was retired (#11682)
+            // because pass 2 could reject every in-slice candidate after the
+            // slice had already deferred everything else. The role runner's
+            // own (#6374) use of the same ring is unchanged.
             let shard_decisions = dispatch_plan::shard_decisions(&roots);
-            let preferred_slice: Vec<bool> = shard_decisions.iter().map(|d| d.owned).collect();
 
             // Per-repo main-health halt (#3930): look up each root's own gate
             // state, parallel to `pairs`. A red repo halts only its own dispatch.
@@ -3172,6 +3078,10 @@ pub fn spawn_multi_work_finder_task(
                 draining,
                 breaker_suppressed,
             );
+            // #11191: a repo whose disk charge does not fit is held, named.
+            // #11564: the result is recorded with its start for `fleet.state`.
+            let halt_causes = halt_cause::publish(halt_causes, disk_budget.as_ref(), &roots);
+            let disk_note = crate::disk_admission::note(disk_budget.as_ref());
             let halted: Vec<bool> = halt_causes.iter().map(Option::is_some).collect();
             let preflight_held_count = preflight_held.iter().filter(|&&h| h).count();
             // Distinguish a pre-flight-advisory hold from the main-health /
@@ -3216,7 +3126,7 @@ pub fn spawn_multi_work_finder_task(
                 draining || breaker_suppressed,
             );
 
-            let mut pairs = forge::dispatcher_pairs(&pool, &roots, host_class);
+            let mut pairs = forge::dispatcher_pairs(&pool, &roots);
 
             // Workspace-commands-missing tripwire (#6440): a loud, ONE-TIME
             // WARN per root on the transition into (and recovery from) the
@@ -3246,7 +3156,6 @@ pub fn spawn_multi_work_finder_task(
                 }
             }
 
-            let in_slice_count = preferred_slice.iter().filter(|&&b| b).count();
             let axis_line = format!(
                 "work_finder: dynamic cap = {max_concurrent} (pool={pool_size}, \
                  healthy_tokens={token_limit} [informational only, not capacity-limiting \
@@ -3256,11 +3165,9 @@ pub fn spawn_multi_work_finder_task(
                  preflight_held={preflight_held_count}, \
                  saturation_held={saturation_held}, \
                  build_backoff_held={build_backoff_held} (#9410), \
-                 observed_idle={}, workspaces={}, priorities={priorities:?}, \
-                 shard_slice={in_slice_count}/{} preferred (#6243/#6374))",
+                 observed_idle={}, workspaces={}, priorities={priorities:?})",
                 format_idle(idle),
-                pairs.len(),
-                preferred_slice.len()
+                pairs.len()
             );
             if was_max_concurrent != Some(max_concurrent) {
                 log::info!("{axis_line}");
@@ -3278,8 +3185,7 @@ pub fn spawn_multi_work_finder_task(
                 Some(&halt_causes),
                 max_admissions_per_tick,
                 saturation_held,
-                Some(&preferred_slice),
-                (max_concurrent_per_repo, ram_budget),
+                (max_concurrent_per_repo, ram_budget, disk_budget),
                 &lanes,
                 &build_backoff_held.per_workspace,
             );
@@ -3299,70 +3205,20 @@ pub fn spawn_multi_work_finder_task(
             }
             was_halted = report.halted;
 
-            if report.dispatched > 0
-                || report.errors > 0
-                || report.skipped_quarantined > 0
-                || report.skipped_workspace_commands_missing > 0
-                || report.skipped_backoff > 0
-                || report.skipped_pr_open_backoff > 0
-                || report.skipped_noop_cooldown > 0
-                || report.skipped_declined > 0
-                || report.skipped_prless_retry > 0
-                || report.skipped_recheck_interval > 0
-                || report.skipped_host_constraint > 0
-                || report.skipped_pr_open > 0
-                || report.skipped_peer_claim > 0
-                || report.deferred_ramp_cap > 0
-                || report.deferred_saturation > 0
-                || report.deferred_out_of_slice > 0
-                || report.deferred_repo_cap > 0
-            {
-                log::info!(
-                    "work_finder: tick — cap {max_concurrent} (pool={pool_size}, \
-                     healthy={token_limit} [fallback_root probe only], \
-                     min_workspace_healthy={min_workspace_healthy} [minimum across every \
-                     registered workspace's own resolved pool, #7527], disk={disk}, \
-                     ram={ram}, ceiling={configured_max}, ramp_cap={max_admissions_per_tick}); \
-                     {} workspace(s), \
-                     {} seen, {} dispatched, {} labeled-skip, {} in-flight-skip, \
-                     {} quarantine-skip, {} workspace-commands-missing-skip, \
-                     {} backoff-skip, {} pr-open-backoff, {} noop-cooldown-skip, \
-                     {} declined-skip, {} prless-retry-skip, \
-                     {} recheck-interval-skip, \
-                     {} host-constraint-skip, {} host-class-skip, \
-                     {} pr-open-skip, \
-                     {} peer-claim-skip, \
-                     {} deferred (capacity), {} deferred (ramp), \
-                     {} deferred (host saturated), {} deferred (out-of-slice, #6243), \
-                     {} deferred (repo cap, #9090), {} deferred (build back-off, #9410), \
-                     {} error(s), {} cross-host-collision(s)",
-                    pairs.len(),
-                    report.seen,
-                    report.dispatched,
-                    report.skipped_labeled,
-                    report.skipped_in_flight,
-                    report.skipped_quarantined,
-                    report.skipped_workspace_commands_missing,
-                    report.skipped_backoff,
-                    report.skipped_pr_open_backoff,
-                    report.skipped_noop_cooldown,
-                    report.skipped_declined,
-                    report.skipped_prless_retry,
-                    report.skipped_recheck_interval,
-                    report.skipped_host_constraint,
-                    report.skipped_host_class,
-                    report.skipped_pr_open,
-                    report.skipped_peer_claim,
-                    report.deferred_capacity,
-                    report.deferred_ramp_cap,
-                    report.deferred_saturation,
-                    report.deferred_out_of_slice,
-                    report.deferred_repo_cap,
-                    report.deferred_build_backoff,
-                    report.errors,
-                    report.collisions
-                );
-            }
+            // The tick line, with the disk budget's figures (#11191).
+            let tick_line = tick_line::TickLine {
+                max_concurrent,
+                pool_size,
+                token_limit,
+                min_workspace_healthy,
+                disk,
+                ram,
+                configured_max,
+                max_admissions_per_tick,
+                workspaces: pairs.len(),
+                disk_note: &disk_note,
+            };
+            tick_line::log(&report, &tick_line);
             // #10624: which repos the build back-off deferred (INFO on change).
             build_backoff.log_deferred(&report.queue, &roots);
 
@@ -3570,15 +3426,10 @@ pub mod configured_max;
 pub use configured_max::{ConfiguredMax, ConfiguredMaxReloader};
 
 /// Per-repo dispatch cap + repo-track affinity (#9090), including the
-/// candidate-list shaping (#6243's slice partition and its new affinity
-/// sibling) and the pre-#9090 [`tick_multi_with_sharding`] entry point. Its own
+/// candidate-list shaping (the affinity partition) and the pre-#9090 [`tick_multi_with_sharding`] entry point. Its own
 /// file for the same file-size-ratchet reason as [`registry_refresh`].
 pub mod repo_cap;
 pub use repo_cap::{tick_multi_with_sharding, RepoCap};
-
-/// Host-class routing + the `loom:heavy` gate (#9034). Its own file for the
-/// same file-size-ratchet reason as [`registry_refresh`].
-pub mod host_class;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
@@ -3591,11 +3442,3 @@ mod tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod prless_retry_tests;
-
-/// Tick-level coverage for the #9034 host-class gate, in both
-/// `tick`/`tick_with_saturation_brake` and `tick_multi`. Its own file (with
-/// its own minimal fakes), mirroring [`prless_retry_tests`] exactly, for the
-/// same reason: `tests.rs` is over threshold and frozen.
-#[cfg(test)]
-#[allow(clippy::unwrap_used)]
-mod host_class_gate_tests;

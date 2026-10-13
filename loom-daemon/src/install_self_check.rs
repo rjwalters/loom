@@ -74,6 +74,7 @@ use crate::workspace_registry::WorkspaceRegistry;
 
 mod forge_egress_invariant;
 pub mod gh_front_invariant;
+pub mod loom_ui;
 
 // ============================================================================
 // Constants (env overrides + built-in defaults)
@@ -1259,8 +1260,11 @@ pub fn spawn_multi_install_self_check_task(
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // #11295: the violations standing after each tick, on loom-ui.
+        let mut ledger = crate::loom_ui_alerts::ledger::Ledger::load(loom_ui::SCOPE);
         loop {
             ticker.tick().await;
+            let (mut standing, mut unknown) = (Vec::new(), BTreeSet::new());
 
             let roots = WorkspaceRegistry::load_default()
                 .unwrap_or_else(|e| {
@@ -1289,22 +1293,37 @@ pub fn spawn_multi_install_self_check_task(
                 let root_for_task = root.clone();
                 let joined = tokio::task::spawn_blocking(move || {
                     let reporter = GhIssueFiler::new(root_for_task.clone());
-                    run_pass(
+                    let report = run_pass(
                         &root_for_task,
                         repair_mode,
-                        check_opts,
+                        check_opts.clone(),
                         &RepairContext::default(),
                         &reporter,
                     );
+                    // A repair may have fixed a violation: what stands is a
+                    // re-check, run only when there was one to repair.
+                    let report = if repair_mode && !report.is_all_ok() {
+                        run_checks(&root_for_task, check_opts)
+                    } else {
+                        report
+                    };
+                    loom_ui::alerts(&root_for_task, &report)
                 })
                 .await;
-                if let Err(e) = joined {
-                    log::error!(
-                        "install_self_check: pass for {} panicked ({e}); continuing to the next repo",
-                        root.display()
-                    );
+                match joined {
+                    Ok(found) => standing.extend(found),
+                    Err(e) => {
+                        log::error!(
+                            "install_self_check: pass for {} panicked ({e}); continuing to the \
+                             next repo",
+                            root.display()
+                        );
+                        unknown.insert(root.display().to_string());
+                    }
                 }
             }
+            // A root whose pass panicked keeps what it had open.
+            ledger.reconcile_where(standing, |_, key| !unknown.contains(key));
         }
     })
 }

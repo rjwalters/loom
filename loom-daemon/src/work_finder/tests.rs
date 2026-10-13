@@ -429,17 +429,48 @@ fn tick_multi_threads_per_issue_complexity_into_dispatch() {
     );
 }
 
+/// #11483: a tracking parent with open sub-issues is not dispatched, on both
+/// tick paths; all-closed (`{3, 3}`) and an absent summary still dispatch.
+#[test]
+fn tick_skips_a_tracking_parent_with_open_sub_issues() {
+    let rows = || {
+        vec![
+            issue(30).with_open_sub_issues(Some(2)),
+            issue(31).with_open_sub_issues(Some(0)),
+            issue(32),
+        ]
+    };
+    let mut dispatcher = RecordingDispatcher::default();
+    let report = tick(&mut FakeSource::once(rows()), &mut dispatcher, 10, false).unwrap();
+    assert_eq!((report.dispatched, report.skipped_labeled), (2, 1));
+    let dispatched: Vec<u32> = dispatcher
+        .dispatched_complexity
+        .iter()
+        .map(|d| d.0)
+        .collect();
+    assert_eq!(dispatched, vec![31, 32]);
+
+    let mut workspaces = vec![(FakeSource::once(rows()), RecordingDispatcher::default())];
+    let report = tick_multi(&mut workspaces, &[0], 10, &[false]);
+    assert_eq!((report.dispatched, report.skipped_labeled), (2, 1));
+    let dispatched: Vec<u32> = workspaces[0]
+        .1
+        .dispatched_complexity
+        .iter()
+        .map(|d| d.0)
+        .collect();
+    assert_eq!(dispatched, vec![31, 32]);
+}
+
 // ===================================================================
-// Repo-sharding slice preference (Issue #6243)
+// Repo-sharding slice preference (Issue #6243) — retired from dispatch
+// (Issue #11682). The no-slice regression tests live in `tests/no_slice.rs`.
 // ===================================================================
 
 /// `tick_multi_with_saturation_brake` (and therefore `tick_multi`/
 /// `tick_multi_with_admission_cap`) delegates to
-/// `tick_multi_with_sharding` with `preferred_slice: None` — the
-/// pre-#6243 candidate list must be byte-for-byte unaffected, so the
-/// existing `tick_multi_threads_per_issue_complexity_into_dispatch` test
-/// above (and every other pre-existing `tick_multi*` test) keeps passing
-/// unmodified. This test pins that delegation explicitly.
+/// `tick_multi_with_sharding`; every ready candidate across both workspaces
+/// dispatches when the cap allows.
 #[test]
 fn tick_multi_with_saturation_brake_is_a_sharding_noop() {
     let mut workspaces = vec![
@@ -455,92 +486,12 @@ fn tick_multi_with_saturation_brake_is_a_sharding_noop() {
         false,
     );
     assert_eq!(report.dispatched, 2);
-    assert_eq!(report.deferred_out_of_slice, 0);
     assert_eq!(workspaces[0].1.dispatched, vec![1]);
     assert_eq!(workspaces[1].1.dispatched, vec![2]);
 }
 
-/// The production mask in `spawn_multi_work_finder_task` is
-/// `role_shard::decide(root).owned` per root. This pins the load-bearing
-/// half of that contract for #6243: a root with NO sharding configuration
-/// resolves to `ShardPosture::Unsharded`, which owns every workspace — so
-/// the mask is all-`true`, every candidate is in-slice, and an unsharded
-/// daemon's dispatch order is byte-for-byte pre-#6243. (The sharded
-/// disjointness/coverage half is `role_shard`'s own property and is
-/// covered by its test module from #6374.)
-#[test]
-fn unconfigured_root_is_owned_so_the_production_slice_mask_is_all_true() {
-    let dir = tempfile::tempdir().unwrap();
-    let decision = crate::role_shard::decide(dir.path());
-    assert!(
-        !decision.posture.is_sharded(),
-        "an unconfigured root must resolve to Unsharded, got {:?}",
-        decision.posture
-    );
-    assert!(
-        decision.owned,
-        "Unsharded must own every workspace — otherwise an unconfigured \
-             host would silently defer its own repos (#6243)"
-    );
-}
-
-/// #6243 AC: a dispatcher prefers in-slice candidates — an out-of-slice
-/// workspace's ready issue must NOT dispatch while the in-slice
-/// workspace still has an eligible candidate, even though the
-/// out-of-slice workspace's priority tier would otherwise win.
-#[test]
-fn tick_multi_with_sharding_prefers_in_slice_over_higher_priority_out_of_slice() {
-    let mut workspaces = vec![
-        // Workspace 0: higher priority tier (0 < 100) but OUT of slice.
-        (FakeSource::once(vec![issue(1)]), RecordingDispatcher::default()),
-        // Workspace 1: lower priority tier but IN slice.
-        (FakeSource::once(vec![issue(2)]), RecordingDispatcher::default()),
-    ];
-    let preferred_slice = [false, true];
-    let report = tick_multi_with_sharding(
-        &mut workspaces,
-        &[0, 100],
-        10,
-        &[false, false],
-        usize::MAX,
-        false,
-        Some(&preferred_slice),
-    );
-    assert_eq!(report.dispatched, 1, "only the in-slice candidate dispatches this tick");
-    assert_eq!(report.deferred_out_of_slice, 1);
-    assert!(
-        workspaces[0].1.dispatched.is_empty(),
-        "out-of-slice workspace must not dispatch"
-    );
-    assert_eq!(workspaces[1].1.dispatched, vec![2], "in-slice workspace dispatches");
-}
-
+mod no_slice;
 mod roster_fence;
-
-/// A `preferred_slice` shorter than `workspaces` (a caller bug, or a
-/// workspace added between slice computation and dispatch) must not
-/// panic — a missing entry defaults to "in slice" (fail open toward the
-/// pre-#6243 behavior, never toward starving a real workspace).
-#[test]
-fn tick_multi_with_sharding_missing_slice_entry_defaults_to_in_slice() {
-    let mut workspaces = vec![
-        (FakeSource::once(vec![issue(1)]), RecordingDispatcher::default()),
-        (FakeSource::once(vec![issue(2)]), RecordingDispatcher::default()),
-    ];
-    let preferred_slice = [true]; // workspace 1 has no entry
-    let report = tick_multi_with_sharding(
-        &mut workspaces,
-        &[0, 0],
-        10,
-        &[false, false],
-        usize::MAX,
-        false,
-        Some(&preferred_slice),
-    );
-    assert_eq!(report.dispatched, 2);
-    assert_eq!(workspaces[0].1.dispatched, vec![1]);
-    assert_eq!(workspaces[1].1.dispatched, vec![2]);
-}
 
 // ===================================================================
 // RegistryDispatcher — production dispatch-path regression (Issue #3967)
@@ -1987,7 +1938,8 @@ fn test_tick_lease_order_refusal_counts_as_backoff_skip_not_error() {
 fn test_park_labels_are_the_non_building_subset_of_skip_labels() {
     // #4444: the dispatch-time guard keys on PARK_LABELS, so the two
     // constants must stay in lockstep — SKIP_LABELS is exactly
-    // BUILDING_LABEL + PARK_LABELS + OPERATOR_HOLD_LABEL, and PARK_LABELS
+    // BUILDING_LABEL + PARK_LABELS + OPERATOR_HOLD_LABEL + `loom:epic`
+    // (#11399) + the decision sub-kind, and PARK_LABELS
     // must never contain `loom:building` (a guard that refused it would break
     // the watchdogs' and the reaper's re-dispatch of the daemon's OWN claim).
     assert!(
@@ -2001,12 +1953,15 @@ fn test_park_labels_are_the_non_building_subset_of_skip_labels() {
             "{park} is a park label, so the work-finder query must skip it too"
         );
     }
-    let mut expected: Vec<&str> = vec![BUILDING_LABEL];
-    expected.extend_from_slice(&PARK_LABELS);
-    expected.extend([OPERATOR_HOLD_LABEL, labels::OPERATOR_DECISION_LABEL]);
+    let mut expected = [&[BUILDING_LABEL], PARK_LABELS.as_slice()].concat();
+    expected.extend([
+        OPERATOR_HOLD_LABEL,
+        labels::EPIC_LABEL,
+        labels::OPERATOR_DECISION_LABEL,
+    ]);
     assert_eq!(
         *SKIP_LABELS, expected,
-        "SKIP_LABELS is BUILDING_LABEL + PARK_LABELS + OPERATOR_HOLD_LABEL + the decision sub-kind"
+        "SKIP_LABELS is the claim + the parks + the hold + the epic container + the decision sub-kind"
     );
 }
 
@@ -2014,7 +1969,8 @@ fn test_park_labels_are_the_non_building_subset_of_skip_labels() {
 // sibling file rather than being appended here: this module is over the
 // 1000-line ratchet threshold and frozen at its current size
 // (`.loom/docs/file-size-policy.md`), the same pattern `roster_fence`
-// already uses in this file.
+// already uses in this file. `epic_container` (#11399) follows it.
+mod epic_container;
 mod operator_hold;
 
 #[test]
@@ -2515,14 +2471,16 @@ fn test_tick_multi_missing_halt_entry_defaults_not_halted() {
     assert_eq!(multi[1].1.dispatched, vec![10]);
 }
 
-// Cross-repo priority ordering (#3946) and the #9244 operator-priority /
-// red-main-fix lanes live in sibling files (this one is size-frozen).
+// Cross-repo priority ordering (#3946, #11103) and the #9244 red-main-fix
+// lane live in sibling files (this one is size-frozen).
 mod build_backoff;
 mod main_red_fix;
 mod maintain_only;
-mod operator_priority;
 mod ordering;
+mod priority_admission;
 mod ram_budget;
+mod vi_cap;
+mod workspace_draw;
 
 // ===================================================================
 // WorkItem
@@ -2651,15 +2609,11 @@ fn test_mechanical_item_with_an_unknown_capability_fails_closed() {
 
 #[test]
 fn test_other_operator_only_sub_kinds_remain_hard_skipped() {
-    // #6885 non-goal, asserted directly: the other three sub-kinds are
+    // #6885 non-goal, asserted directly: the other two sub-kinds are
     // unaffected — a marker in their body is ignored entirely, even for a
     // maximally-capable worker.
     let all_caps = caps(&["host-sudo", "forge-admin-token", "tailnet-access"]);
-    for sub_kind in [
-        "loom:operator-decision",
-        "loom:operator-blocked",
-        "loom:operator-objective",
-    ] {
+    for sub_kind in ["loom:operator-decision", "loom:operator-blocked"] {
         let item = WorkItem::new(
             1,
             vec![
