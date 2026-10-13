@@ -3365,11 +3365,13 @@ prompt string appears in neither the journal nor the state file.
 | `last_activity_at` | RFC3339 | last tool call or Stop |
 | `driving[]` | array | issues/PRs this session holds an in-session lease on: `kind` (`issue`/`pr`), `number`, `sweep_id` |
 
-**Producer.** `loom-daemon presence beat`, called by the opt-in hook
+**Producer.** `loom-daemon presence beat`, called by the hook
 `presence-beat.sh` on `UserPromptSubmit`, `PostToolUse` and `Stop`. A prompt
 always emits; other events emit at most once per 5 minutes. The hook is wired
-only when the operator provisions with `LOOM_OPERATOR_PRESENCE=1`
-(`scripts/install/provision-hooks.sh`); it is absent by default.
+by the installer/resync when the fleet key `operatorPresence.enabled` (or
+`LOOM_OPERATOR_PRESENCE=1`) says so, and is absent otherwise; on `Stop` the
+journal is flushed to OTLP with no daemon running. See
+[`operator-presence.md`](operator-presence.md).
 
 **In-session sweeps.** `loom-daemon presence sweep-start` / `sweep-outcome`
 journal `sweep.started` / `sweep.outcome` with `loom.dispatch_origin=operator`
