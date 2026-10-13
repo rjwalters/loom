@@ -38,7 +38,7 @@
 //! With no `splitRepos` and no home reading at or above `spillProjectedPct`
 //! the choice is byte-identical to the pre-W4-B walk.
 //! `LOOM_READ_ROUTING=legacy` restores that walk exactly (no owners filter,
-//! no scoped withdrawal, no egress check — `read_credential` never had one),
+//! no scoped withdrawal),
 //! `LOOM_READ_POOL_SPILL=0` disables the split and the latch, and
 //! `LOOM_READ_POOL_SPLIT=0` the split alone.
 
@@ -143,9 +143,8 @@ impl<'a> RouteRequest<'a> {
 /// Where a read goes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouteDecision {
-    /// No reader pool for this read: no readers, a non-github host, no
-    /// workspace, or (v2 only) the egress gateway owns the pool. The caller
-    /// uses the writer exactly as before.
+    /// No reader pool for this read: no readers, a non-github host or no
+    /// workspace. The caller uses the writer exactly as before.
     NoPool,
     /// Serve it under this reader.
     Reader {
@@ -658,9 +657,6 @@ pub fn eligible_readers<'a>(roster: &'a Roster, owner: &str) -> Vec<&'a Identity
 #[derive(Debug, Clone, Copy)]
 pub struct RouteEnv<'a> {
     pub mode: RoutingMode,
-    /// `forge_egress::publication::github_credential_forbidden` (honoured
-    /// in v2 only).
-    pub egress_forbidden: bool,
     pub cfg: &'a RoutingConfig,
 }
 
@@ -674,20 +670,8 @@ pub fn route_read(req: &RouteRequest<'_>, now: SystemTime) -> RouteDecision {
         return RouteDecision::NoPool;
     };
     let mode = RoutingMode::current();
-    let egress_forbidden = mode == RoutingMode::Scoped
-        && crate::forge_egress::publication::github_credential_forbidden(Some(ws));
     let cfg = cached_routing(ws);
-    route_read_in(
-        ws,
-        &super::cached(ws),
-        req,
-        &RouteEnv {
-            mode,
-            egress_forbidden,
-            cfg: &cfg,
-        },
-        now,
-    )
+    route_read_in(ws, &super::cached(ws), req, &RouteEnv { mode, cfg: &cfg }, now)
 }
 
 fn is_github(host: Option<&str>) -> bool {
@@ -707,9 +691,6 @@ pub fn route_read_in(
         return RouteDecision::NoPool;
     }
     let legacy = env.mode == RoutingMode::Legacy;
-    if !legacy && env.egress_forbidden {
-        return RouteDecision::NoPool;
-    }
     let owner = crate::credential_preflight::owner_of_nwo(req.owner_repo);
     if owner.is_empty() {
         return RouteDecision::NoPool;

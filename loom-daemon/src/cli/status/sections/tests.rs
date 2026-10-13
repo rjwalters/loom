@@ -212,7 +212,7 @@ fn every_top_level_key_belongs_to_a_section() {
     }
 }
 
-/// Snapshot of the default payload's top-level shape. The three host-local
+/// Snapshot of the default payload's top-level shape. The two host-local
 /// blocks that appear only when this host has one to report are left out.
 #[test]
 fn the_default_payload_keeps_its_top_level_keys() {
@@ -222,18 +222,11 @@ fn the_default_payload_keeps_its_top_level_keys() {
         .unwrap()
         .keys()
         .map(String::as_str)
-        .filter(|k| !matches!(*k, "fleet_store" | "pending_restart" | "forge_egress"))
+        .filter(|k| !matches!(*k, "fleet_store" | "pending_restart"))
         .collect();
     let mut expected: Vec<&str> = StatusSection::all()
         .iter()
-        .filter(|s| {
-            !matches!(
-                s,
-                StatusSection::FleetStore
-                    | StatusSection::PendingRestart
-                    | StatusSection::ForgeEgress
-            )
-        })
+        .filter(|s| !matches!(s, StatusSection::FleetStore | StatusSection::PendingRestart))
         .flat_map(|s| s.json_keys().iter().copied())
         .collect();
     expected.sort_unstable();
@@ -258,12 +251,7 @@ fn the_full_selection_is_the_default_payload() {
         None,
         &SectionSet::all(),
     );
-    let strip = |mut v: serde_json::Value| {
-        // `forge_egress.assert` re-reads the host at render time.
-        v.as_object_mut().unwrap().remove("forge_egress");
-        v
-    };
-    assert_eq!(strip(all), strip(default));
+    assert_eq!(all, default);
 }
 
 /// Snapshot of one cheap section (`daemon_build`) and one heavy one

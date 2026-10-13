@@ -1,1 +1,0 @@
-../../defaults/docs/forge-egress.md

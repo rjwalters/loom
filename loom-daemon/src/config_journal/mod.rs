@@ -154,7 +154,7 @@ pub fn redact(value: &Value) -> Value {
                 .collect(),
         ),
         Value::Array(items) => Value::Array(items.iter().map(redact).collect()),
-        Value::String(s) => Value::String(redact_userinfo(&crate::forge_egress::report::redact(s))),
+        Value::String(s) => Value::String(redact_userinfo(&crate::secret_scan::redact(s))),
         other => other.clone(),
     }
 }

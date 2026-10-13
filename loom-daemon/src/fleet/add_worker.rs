@@ -31,7 +31,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use super::path_bootstrap;
-mod egress;
+mod forge_auth;
 use super::{
     all_succeeded, default_fleet_registry_path, execute_plan, render_checklist, CommandOutput,
     CommandRunner, FleetRegistry, Plan, Step, StepStatus, StepStdin, VerifyResult, WorkerRecord,
@@ -597,15 +597,6 @@ pub fn ensure_supported_platform(runner: &dyn CommandRunner, ssh_host: &str) -> 
 /// `check` phase is what makes a re-run idempotent (AC 2).
 #[must_use]
 pub fn build_plan(config: &AddWorkerConfig, secrets: &Secrets) -> Plan {
-    build_plan_with_policy(config, secrets, None)
-}
-
-#[must_use]
-pub fn build_plan_with_policy(
-    config: &AddWorkerConfig,
-    secrets: &Secrets,
-    egress: Option<&egress::EgressProvisioning>,
-) -> Plan {
     let mut plan = Plan::new();
     let primary_rel = workspace_rel(&config.repos[0]);
 
@@ -646,9 +637,8 @@ pub fn build_plan_with_policy(
         render_claude_code(),
     ));
 
-    // 4. Forge auth (PAT over stdin; policy-governed hosts store none, #10050).
-    egress::push_forge_auth(&mut plan, secrets.pat.as_ref(), egress);
-    egress.inspect(|p| egress::push_toolchain_steps(&mut plan, p)); // 4b (#10050)
+    // 4. Forge auth (PAT over stdin).
+    forge_auth::push_forge_auth(&mut plan, secrets.pat.as_ref());
 
     // 5. Token pool: full account pool (#3979 decision — no pinned subsets).
     //    5a. Install accounts.env (secret, over stdin, 0600).
@@ -767,8 +757,6 @@ pub fn build_plan_with_policy(
         None,
         render_verify(&primary_rel, &config.repos),
     ));
-
-    egress.inspect(|_| egress::push_doctor_step(&mut plan, &primary_rel)); // 12 (#10050)
 
     plan
 }
@@ -960,10 +948,9 @@ fn build_worker_record(
 /// before a single `apt-get`/`systemd` step is rendered, let alone run.
 pub fn run(config: &AddWorkerConfig) -> Result<()> {
     let secrets = preflight(config)?;
-    let egress = egress::load_for_operator_from_process()?; // fails closed (#10050)
 
     if config.dry_run {
-        let plan = build_plan_with_policy(config, &secrets, egress.as_ref());
+        let plan = build_plan(config, &secrets);
         print!("{}", plan.render_dry_run("fleet add-worker", &config.ssh_host));
         println!(
             "\n(dry run — no action taken on {}. Re-run without --dry-run to execute.)",
@@ -980,7 +967,7 @@ pub fn run(config: &AddWorkerConfig) -> Result<()> {
     let runner = SshRunner::new(&config.ssh_host);
     ensure_supported_platform(&runner, &config.ssh_host)?;
 
-    let plan = build_plan_with_policy(config, &secrets, egress.as_ref());
+    let plan = build_plan(config, &secrets);
     let reports = execute_plan(&runner, &plan);
     print!("{}", render_checklist("fleet add-worker", &config.ssh_host, &reports));
 

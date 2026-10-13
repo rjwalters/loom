@@ -261,7 +261,7 @@ pub fn run(args: WorkerArgs) -> Result<(), LaunchError> {
         .as_ref()
         .and_then(|a| a.child(SpanName::RuntimePreflight, Default::default()))
         .or_else(|| lifecycle::inherited(&root, SpanName::RuntimePreflight, Default::default()));
-    let result = run_preflight(args, &root, preflight.as_ref(), attempt.as_ref(), None);
+    let result = run_preflight(args, &root, preflight.as_ref(), attempt.as_ref());
     if let Some(span) = preflight {
         // A rejected preflight is one of the two shapes an operator reports
         // ("the attempt failed in 300 ms with no runtime span"): record the
@@ -346,7 +346,6 @@ fn run_preflight(
     root: &Path,
     preflight: Option<&crate::observability::lifecycle::Span>,
     attempt: Option<&crate::observability::lifecycle::Span>,
-    egress_sources: Option<&crate::forge_egress::policy::PolicySources>,
 ) -> Result<(), LaunchError> {
     let mut trace_identity = crate::telemetry::trace::TraceAttributes::new();
     let config = crate::config_resolver::resolve_effective_config(root);
@@ -357,40 +356,6 @@ fn run_preflight(
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
     {
         return Err(LaunchError::config("invalid runtime name"));
-    }
-    // #9987: on a policy-governed host the managed launcher must be the first
-    // `gh` this worker (and its children) resolve. Its directory goes first on
-    // this process's own PATH so the admission below, the runtime child and
-    // the container re-exec all observe one environment. No policy (or a
-    // repo-origin one) resolves to `None` and nothing changes; an invalid one
-    // refuses, `observe` logs. Tests inject `egress_sources`, never the env.
-    let admission = egress_sources
-        .map_or_else(
-            crate::forge_egress::worker_env::WorkerEgress::admit_process,
-            crate::forge_egress::worker_env::WorkerEgress::admit,
-        )
-        .map_err(|f| LaunchError::config(crate::forge_egress::worker_env::refusal_message(&f)))?;
-    for warning in &admission.warnings {
-        log::warn!("{}", crate::forge_egress::worker_env::observe_message(warning));
-    }
-    let worker_egress = admission.egress;
-    if let (None, Some(path)) = (
-        egress_sources,
-        worker_egress
-            .as_ref()
-            .and_then(|e| e.worker_path(std::env::var_os("PATH").as_deref())),
-    ) {
-        std::env::set_var("PATH", path);
-    }
-    // Forge egress admission (#9984): `spawn-worker.sh` delegates here, so this
-    // is its `forge egress assert`. Under `enforcement.api = required` a routing
-    // finding means no worker is spawned; `observe` logs; no policy is a no-op.
-    // `egress_sources` is `None` in production (`from_process`); tests pin it.
-    if let Some(refusal) = egress_sources.map_or_else(
-        || crate::forge_egress::gate::spawn_refusal(root),
-        |sources| crate::forge_egress::gate::spawn_refusal_with(sources, root),
-    ) {
-        return Err(LaunchError::config(refusal));
     }
     let scripts = args.scripts_dir.unwrap_or_else(|| scripts_dir(root));
     let mut log: Box<dyn Write> = Box::new(std::io::stderr());
@@ -500,14 +465,7 @@ fn run_preflight(
             // forwarding the real value — and returns `None` only when the
             // feature is off or the profile opts out.
             let prepared = egress_proxy::prepare(root, &selection, &config, &runtime)?;
-            if worker_egress.as_ref().is_some_and(|e| e.required)
-                && !containment::image_has_python3(&profile.image)
-            {
-                return Err(LaunchError::config(crate::forge_egress::worker_env::refusal_message(
-                    &crate::forge_egress::worker_env::python3_missing_finding(&profile.image),
-                )));
-            }
-            let mut command = containment::docker_command_with(
+            let mut command = containment::docker_command(
                 &profile,
                 root,
                 &std::env::current_dir().map_err(|e| LaunchError::config(e.to_string()))?,
@@ -515,7 +473,6 @@ fn run_preflight(
                 &args.args,
                 &credentials,
                 prepared.as_ref().map(|p| &p.injection),
-                worker_egress.as_ref(),
             )?;
             llm_gateway::scrub(&mut command);
             let mut log = attach_log(&mut command, options.log.as_deref())?;
@@ -709,20 +666,10 @@ fn run_preflight(
     // #10331: plain `gh` in the worker reaches the agent `gh` front first, so
     // its `issue|pr view|list --json` reads are ETag-revalidated (never stale)
     // and everything else execs the next `gh` untouched. `LOOM_GH_SHIM=0`
-    // opts out; see defaults/docs/gh-cached.md. #9987: the managed launcher
-    // stays ahead of the front; under `enforcement.api = required` a worker
-    // whose first `gh` is anything else is not spawned. The order is
+    // opts out; see defaults/docs/gh-cached.md. The order is
     // `agent_gh::session_path`, shared with interactive sessions (#10516).
     let current = std::env::var_os("PATH");
-    let path = crate::agent_gh::session_path(current.as_deref(), worker_egress.as_ref());
-    if let Some(finding) = worker_egress
-        .as_ref()
-        .and_then(|e| e.launcher_first_finding(path.as_deref().or(current.as_deref())))
-    {
-        return Err(LaunchError::config(crate::forge_egress::worker_env::refusal_message(
-            &finding,
-        )));
-    }
+    let path = crate::agent_gh::session_path(current.as_deref());
     if let Some(path) = path {
         command.env("PATH", path);
     }

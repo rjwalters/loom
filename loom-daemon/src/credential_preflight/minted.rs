@@ -13,7 +13,6 @@ use std::fmt;
 use std::path::Path;
 
 use super::GithubAppOutcome;
-use crate::forge_egress::publication::{stance_for, workspace_of_profile_dir, Stance};
 use crate::forge_identity::sidecar::{remove_sidecar, write_sidecar, Sidecar, SidecarRole};
 
 /// One minted installation token and the identity it belongs to.
@@ -109,11 +108,6 @@ fn publish_minted_with(
     write: impl FnOnce(&Path, &Sidecar) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     super::publish_github_app_token(dir, &minted.token)?;
-    let workspace = workspace_of_profile_dir(dir);
-    if matches!(stance_for(workspace.as_deref()), Stance::Required { .. }) {
-        remove_sidecar(dir);
-        return Ok(());
-    }
     if let Err(e) = write(dir, &minted.sidecar()) {
         remove_sidecar(dir);
         log::warn!(
