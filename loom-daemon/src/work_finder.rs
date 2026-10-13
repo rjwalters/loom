@@ -1756,10 +1756,6 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
             .copied()
             .unwrap_or(DEFAULT_WORKSPACE_WEIGHT);
         let q = &mut report.queue;
-        if workspace_weight == 0 {
-            halt_cause::record_weight_zero(q, &ready, idx, red); // #11742: never drawn
-            continue;
-        }
 
         // Per-repo main-health gate (#3930): a red repo skips only its own
         // dispatch loop this tick. `seen` above still reflects its backlog so the
@@ -1770,6 +1766,10 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
         if repo_halted && !lane.admits_fixes_while_halted() {
             // #9017: name WHICH hold tripped, not just that one did.
             halt_cause::record_halted(q, &ready, idx, workspace_weight, red, halt_causes);
+            continue;
+        }
+        if workspace_weight == 0 {
+            halt_cause::record_weight_zero(q, &ready, idx, red); // #11742: after holds, which name their own cause
             continue;
         }
 
@@ -2720,7 +2720,7 @@ where
 ///    roots. Re-reading each tick — and provisioning any new root — happens in
 ///    `registry_refresh::refresh_local_workspace_state`, called BEFORE the
 ///    rate-limit breaker
-///    check (#8121), so `loom-daemon workspace add|remove|set-priority` is
+///    check (#8121), so `loom-daemon workspace add|remove|set-weight` is
 ///    hot-applied without a daemon restart even while gh polling is
 ///    suppressed.
 /// 2. Builds one `(GhWorkSource, RegistryDispatcher)` pair per root — the source
@@ -2842,7 +2842,7 @@ pub fn spawn_multi_work_finder_task(
             // below — see `registry_refresh`'s module doc comment for
             // why this purely-local, no-GitHub-API work must never be gated
             // behind the breaker (`loom-daemon workspace add|remove
-            // |set-priority` must hot-apply even while gh polling is
+            // |set-weight` must hot-apply even while gh polling is
             // suppressed).
             let (registry, roots) = registry_refresh::refresh_local_workspace_state(
                 &pool,

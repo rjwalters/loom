@@ -1228,7 +1228,7 @@ fn test_dispatch_sweep_unregistered_delegated_target_hint_names_delegate() {
 }
 
 /// Issue #5345 AC — `daemon.delegatedTo` gates only the CLI admin
-/// entry points (`workspace add/set-priority/remove`, `tokens
+/// entry points (`workspace add/set-weight/remove`, `tokens
 /// bootstrap`); `dispatch_sweep` into an **already-registered** target
 /// that happens to declare `daemon.delegatedTo` must dispatch exactly as
 /// it would without the key present — daemon-client actions are
