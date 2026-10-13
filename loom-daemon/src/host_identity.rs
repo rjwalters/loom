@@ -223,7 +223,7 @@ fn no_id_file_path() -> ResolvedHostId {
     {
         warn_once(&format!(
             "host identity: no {CONFIG_KEY}, no ${HOST_ID_ENV}, and no home directory to persist \
-             an id in — falling back to {UNKNOWN_HOST:?}, which never participates in peer-claim \
+             an id in — falling back to {UNKNOWN_HOST:?}, which never participates in lease \
              self-recognition. Set {CONFIG_KEY} or ${HOST_ID_ENV} to give this host an identity."
         ));
         ResolvedHostId {
@@ -272,7 +272,7 @@ fn resolve_persisted(path: &Path) -> ResolvedHostId {
             if created {
                 warn_once(&format!(
                     "host identity: generated a new persisted host id {id:?} at {} (no \
-                     {CONFIG_KEY} or ${HOST_ID_ENV} set). Telemetry host.id, peer claims and \
+                     {CONFIG_KEY} or ${HOST_ID_ENV} set). Telemetry host.id, collision records and \
                      fleet-store entries from this host are now keyed on it. If this host \
                      previously reported under its hostname and must keep that name (an ingest \
                      key bound to it, existing fleet-store entries, dashboards), set \

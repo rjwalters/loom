@@ -283,7 +283,7 @@ fn dispatch_proceeds_on_clean_preflip_labels_with_detection_enabled() {
 /// (id 1, an earlier forge-assigned comment order) and this dispatcher's
 /// own lease write lands second (id 2), the claim-then-verify-order
 /// tie-break MUST make this dispatcher yield: no builder spawned, the
-/// claim lock released, the peer-claim advertisement retracted, and a
+/// claim lock released, and a
 /// `LeaseOrderDispatchError` naming the earlier host/sweep returned. The
 /// `loom:building` label flip itself (`issue edit`) MUST still have been
 /// attempted — the yield happens strictly after it, never instead of it.
@@ -1825,9 +1825,7 @@ fn token_selection_failures_older_than_the_window_stop_counting() {
 /// file, so `Command::spawn()` fails at the OS level before any child
 /// ever exists — `dispatch_inner` must unwind the same side effects the
 /// #4689 branch above reverts: the claim lock, the `loom:building`
-/// label flip, and (implicitly, since nothing was ever advertised
-/// without a peer-claim publisher configured in this fixture) the
-/// peer-claim advertisement. Without this, the leaked lock's
+/// label flip. Without this, the leaked lock's
 /// `owner_pid` is this daemon's own (permanently alive, from its own
 /// point of view) pid, which the #4556 live-claim guard misreads as a
 /// confirmed-live claim on every retry — the exact wedge this issue
@@ -4230,8 +4228,8 @@ fn claim_owned_dispatch_starts_the_lease_renewal_loop_for_its_own_child() {
 
 /// AC (#7672), edge case (a) from the issue's test plan: a child that dies
 /// immediately at `spawn-claude.sh`'s token-selection preflight (#4689)
-/// takes the unwind path — claim lock, label and peer-claim advertisement
-/// are all reverted and dispatch returns `Err`. No renewal loop may be
+/// takes the unwind path — claim lock and label
+/// are both reverted and dispatch returns `Err`. No renewal loop may be
 /// started for it: there is no claim left to keep alive, and the pid it
 /// would watch is already gone.
 ///

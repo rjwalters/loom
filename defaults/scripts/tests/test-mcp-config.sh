@@ -77,9 +77,6 @@ assert_not_contains() {
     fi
 }
 
-HAVE_JQ=false
-command -v jq >/dev/null 2>&1 && HAVE_JQ=true
-
 # ============================================================
 # Section 5: claude-wrapper.sh MCP pre-flight resolves loom with 2 servers
 # ============================================================
