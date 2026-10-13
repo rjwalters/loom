@@ -64,7 +64,7 @@ fn metric_names_kinds_and_units() {
 fn wait_class_splits_ready_blocked_and_not_waiting() {
     use QueueDisposition as D;
     assert_eq!(wait_class(D::DeferredCapacity), Some(WaitClass::Ready));
-    assert_eq!(wait_class(D::DeferredOutOfSlice), Some(WaitClass::Ready));
+    assert_eq!(wait_class(D::DeferredRepoCap), Some(WaitClass::Ready));
     assert_eq!(wait_class(D::WorkspaceHalted), Some(WaitClass::Blocked));
     assert_eq!(wait_class(D::DispatchBackoff), Some(WaitClass::Blocked));
     for d in [

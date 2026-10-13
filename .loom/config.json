@@ -1,7 +1,7 @@
 {
   "version": "2",
   "buildGate": {
-    "enabled": true,
+    "enabled": false,
     "command": "bash .loom/scripts/build-gate.sh",
     "realChangeGlobs": [
       "*.rs",

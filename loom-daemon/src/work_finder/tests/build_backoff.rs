@@ -40,7 +40,6 @@ fn run(
         None,
         usize::MAX,
         false,
-        None,
         per_repo,
         lanes,
         held,
@@ -162,7 +161,6 @@ fn not_held_is_the_repo_cap_tick_exactly() {
         None,
         usize::MAX,
         false,
-        None,
         Some(1),
         &[RED],
     );
@@ -195,7 +193,6 @@ fn the_saturation_brake_outranks_the_backoff() {
         None,
         usize::MAX,
         true,
-        None,
         None,
         &[],
         &[true],
