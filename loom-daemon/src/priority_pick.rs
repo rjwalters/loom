@@ -12,7 +12,8 @@
 //! Dispatch is **workspace first, then issue**:
 //!
 //! 1. [`draw_workspace`] picks a workspace at random, weighted by workspace
-//!    priority ([`weight_for_priority`]). The pool is three-tier: workspaces
+//!    priority ([`softmax_weight`], a softmax with a temperature, #11684).
+//!    The pool is three-tier: workspaces
 //!    whose next issue is a verified red-main fix if any (#11547), else
 //!    workspaces holding dispatchable `loom:very-important` work if any,
 //!    else every workspace with dispatchable work.
@@ -196,12 +197,48 @@ pub fn very_important_holders(open: &[IssueKey]) -> Vec<u32> {
         .collect()
 }
 
+/// The weight of the pool's top workspace (the one at `p_min`) in
+/// [`softmax_weight`]. Large enough that the curve keeps ~6 decimal digits of
+/// resolution before the floor of 1 bites; small enough that a sum over any
+/// realistic fleet stays far inside `u64` (and inside a JS `Number`'s exact
+/// integer range, which `pick.decision` readers rely on).
+pub const DRAW_WEIGHT_SCALE: u64 = 1_000_000;
+
+/// Default draw temperature, in `fleet_priority` units
+/// (`dispatch.drawTemperature`, #11684). At 80, priority 20 outweighs
+/// priority 200 about 9.5x — roughly the spread the pre-#11684
+/// `1000 / (1 + p)` curve gave across the fleet's priority range.
+pub const DEFAULT_DRAW_TEMPERATURE: u32 = 80;
+
+/// The accepted `dispatch.drawTemperature` range. An integer on purpose: the
+/// draw records derive `Eq`, and the hyperparams range check is integer-only.
+pub const DRAW_TEMPERATURE_RANGE: (u64, u64) = (1, 100_000);
+
 /// Draw weight of a workspace from its `fleet_priority` (lower number =
-/// higher priority, default 100): `1000 / (1 + priority)`, at least 1. So
-/// priority 0 weighs 1000, 10 weighs 90, 100 (the default) weighs 9.
+/// higher priority, default 100): a softmax over priorities read as negative
+/// logits (#11684),
+///
+/// ```text
+/// w(p) = max(1, round(DRAW_WEIGHT_SCALE * exp(-(p - p_min) / T)))
+/// ```
+///
+/// `p_min` is the smallest priority in the pool being drawn over, so the top
+/// workspace always weighs exactly [`DRAW_WEIGHT_SCALE`] and only priority
+/// *differences* matter. `temperature` (`T`) is the one knob: small means
+/// nearly strict priority order, large means nearly uniform. A `p` below
+/// `p_min` is treated as `p_min`, and `T = 0` as `T = 1`, so the function is
+/// total. Never 0, never above [`DRAW_WEIGHT_SCALE`].
 #[must_use]
-pub fn weight_for_priority(priority: u32) -> u64 {
-    (1000 / (1 + u64::from(priority))).max(1)
+pub fn softmax_weight(priority: u32, p_min: u32, temperature: u32) -> u64 {
+    let gap = f64::from(priority.saturating_sub(p_min));
+    let t = f64::from(temperature.max(1));
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
+    let w = ((DRAW_WEIGHT_SCALE as f64) * (-gap / t).exp()).round() as u64;
+    w.clamp(1, DRAW_WEIGHT_SCALE)
 }
 
 /// A workspace with dispatchable work, as the draw sees it.
@@ -238,6 +275,12 @@ pub struct WorkspaceDraw {
     pub candidates: Vec<DrawCandidate>,
     /// Sum of the weights.
     pub total_weight: u64,
+    /// The draw temperature the weights were computed at
+    /// (`dispatch.drawTemperature`, #11684).
+    pub temperature: u32,
+    /// The smallest priority in the pool: the one weighing
+    /// [`DRAW_WEIGHT_SCALE`] (#11684).
+    pub p_min: u32,
     /// The RNG value in `0..total_weight`.
     pub roll: u64,
     /// The winning workspace.
@@ -275,9 +318,16 @@ impl PickRng {
 ///
 /// The pool is three-tier (#11547): the entries whose next candidate is a
 /// verified red-main fix if any; else those with very-important work if any;
-/// else all. Within the pool the draw is weighted by [`weight_for_priority`]. Entries are put in name order first,
-/// so the result depends only on the set and the RNG state.
-pub fn draw_workspace(entries: &[WorkspaceEntry], rng: &mut PickRng) -> Option<WorkspaceDraw> {
+/// else all. Within the pool the draw is weighted by [`softmax_weight`] at
+/// `temperature`, with `p_min` taken over the pool (not over every entry), so
+/// the pool's top workspace always weighs [`DRAW_WEIGHT_SCALE`]. Entries are
+/// put in name order first, so the result depends only on the set, the
+/// temperature and the RNG state.
+pub fn draw_workspace(
+    entries: &[WorkspaceEntry],
+    temperature: u32,
+    rng: &mut PickRng,
+) -> Option<WorkspaceDraw> {
     let any_fix = entries.iter().any(|e| e.has_red_main_fix);
     let any_vi = entries.iter().any(|e| e.has_very_important);
     let (pool_name, in_pool): (&'static str, fn(&WorkspaceEntry) -> bool) = if any_fix {
@@ -289,11 +339,12 @@ pub fn draw_workspace(entries: &[WorkspaceEntry], rng: &mut PickRng) -> Option<W
     };
     let mut pool: Vec<&WorkspaceEntry> = entries.iter().filter(|e| in_pool(e)).collect();
     pool.sort_by(|a, b| a.workspace.cmp(&b.workspace));
+    let p_min = pool.iter().map(|e| e.priority).min().unwrap_or(0);
     let candidates: Vec<DrawCandidate> = pool
         .iter()
         .map(|e| DrawCandidate {
             workspace: e.workspace.clone(),
-            weight: weight_for_priority(e.priority),
+            weight: softmax_weight(e.priority, p_min, temperature),
         })
         .collect();
     let total_weight: u64 = candidates.iter().map(|c| c.weight).sum();
@@ -314,6 +365,8 @@ pub fn draw_workspace(entries: &[WorkspaceEntry], rng: &mut PickRng) -> Option<W
         pool: pool_name,
         candidates,
         total_weight,
+        temperature,
+        p_min,
         roll,
         picked,
     })

@@ -7,7 +7,7 @@ provider's own endpoint and key. Budgets, rate limits and per-request telemetry
 then live in the gateway, not in per-host harness config. Claude Code and Codex
 never receive any of it (see [the red line](#who-never-receives-it-the-red-line)).
 
-The deployment shape this was built for (2AMLogic/2am `infra/bifrost/`) is a
+The deployment shape this was built for is a
 self-hosted [Bifrost](https://github.com/maximhq/bifrost) gateway with one
 virtual key per consumer class (`vk-loom-fleet` for Loom workers), rolled out
 one canary worker first, then the fleet. Nothing in Loom is Bifrost-specific

@@ -434,3 +434,67 @@ fn champion_values_enter_the_digest() {
     tweaked.champion.tier3_cap = 2;
     assert_ne!(digest_of(&base), digest_of(&tweaked));
 }
+
+// ---------------------------------------------------------------------------
+// dispatch.drawTemperature (#11684)
+// ---------------------------------------------------------------------------
+
+#[test]
+#[serial]
+fn draw_temperature_defaults_and_reads_the_config_block() {
+    let tmp = empty_workspace();
+    let resolved = resolve_effective(tmp.path());
+    assert_eq!(resolved.params.dispatch.draw_temperature, DEFAULT_DRAW_TEMPERATURE);
+    assert_eq!(resolved.sources["dispatch.drawTemperature"], Source::Default);
+
+    write_config(tmp.path(), r#"{"hyperparameters": {"dispatch": {"drawTemperature": 40}}}"#);
+    let resolved = resolve_effective(tmp.path());
+    assert_eq!(resolved.params.dispatch.draw_temperature, 40);
+    assert_eq!(resolved.sources["dispatch.drawTemperature"], Source::Config);
+    // A new field changes the digest (once, when it lands) and its value enters it.
+    assert_ne!(digest_of(&resolved.params), digest_of(&Hyperparameters::default()));
+}
+
+#[test]
+fn draw_temperature_is_validated_by_name() {
+    for bad in [
+        serde_json::json!(0),
+        serde_json::json!(100_001),
+        serde_json::json!(1.5),
+    ] {
+        let violations = validate_layer(&serde_json::json!({"dispatch": {"drawTemperature": bad}}));
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.path == "dispatch.drawTemperature"),
+            "{bad}: {violations:?}"
+        );
+    }
+    for good in [1, 80, 100_000] {
+        let violations =
+            validate_layer(&serde_json::json!({"dispatch": {"drawTemperature": good}}));
+        assert!(violations.is_empty(), "{good}: {violations:?}");
+    }
+}
+
+#[test]
+#[serial]
+fn work_finder_reader_hot_applies_the_draw_temperature() {
+    let tmp = empty_workspace();
+    let config = crate::work_finder::read_work_finder_config(tmp.path());
+    assert_eq!(config.draw_temperature, None);
+    assert_eq!(
+        crate::work_finder::config::resolve_draw_temperature(&config),
+        DEFAULT_DRAW_TEMPERATURE
+    );
+    write_config(tmp.path(), r#"{"hyperparameters": {"dispatch": {"drawTemperature": 120}}}"#);
+    let config = crate::work_finder::read_work_finder_config(tmp.path());
+    assert_eq!(config.draw_temperature, Some(120));
+    // Out of range soft-ignores to the default per tick (startup names it).
+    write_config(tmp.path(), r#"{"hyperparameters": {"dispatch": {"drawTemperature": 0}}}"#);
+    let config = crate::work_finder::read_work_finder_config(tmp.path());
+    assert_eq!(
+        crate::work_finder::config::resolve_draw_temperature(&config),
+        DEFAULT_DRAW_TEMPERATURE
+    );
+}

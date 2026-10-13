@@ -97,6 +97,7 @@ mod tests {
                 roll: u64::from(d),
                 picked: format!("o/w{d}"),
                 number: d,
+                p_min: Some(12),
             })
             .collect();
         let record = PickDecisionRecord::build(tick(), Vec::new()).with_workspace_draw(Some(
@@ -104,6 +105,7 @@ mod tests {
                 seed: "42".into(),
                 draws_total: 200,
                 draws,
+                temperature: Some(80),
             },
         ));
         for chunk in split_into_chunks(record, 2_000) {
@@ -119,6 +121,8 @@ mod tests {
             assert_eq!(body["tick_id"], "t");
             assert_eq!(body["workspace_draw"]["seed"], "42");
             assert_eq!(body["workspace_draw"]["draws_total"], 200);
+            // #11684: the per-tick temperature repeats on every chunk, like the seed.
+            assert_eq!(body["workspace_draw"]["temperature"], 80);
         }
     }
 }

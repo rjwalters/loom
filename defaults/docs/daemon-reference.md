@@ -3064,7 +3064,11 @@ ordering (superseded by the weighted draw in [`priority-model.md`](priority-mode
   candidate across all workspaces and orders them by **weighted workspace
   draws** (#11103, [`priority-model.md`](priority-model.md)): each draw picks a
   workspace weighted by its priority and places its next issue (level, oldest,
-  number). It fills the single shared concurrency budget in that order. The
+  number). Since #11684 the weight is a softmax over `fleet_priority`,
+  `max(1, round(1e6 * exp(-(p - p_min) / T)))` with `p_min` the pool's top
+  priority and `T` the hyperparameter `dispatch.drawTemperature` (default 80,
+  re-read every tick); `pick.decision` records `temperature` and each draw's
+  `p_min`. It fills the single shared concurrency budget in that order. The
   cap/budget mechanics (#3811/#3930) are unchanged; this only orders the queue.
   `candidate_cmp` (below) now only ranks the published ready-queue rows.
 
@@ -3105,7 +3109,10 @@ follows the workspace draw, and the single-workspace tick uses the same four
 keys (passed the repo's real verified-red state). The workspace draw's pool is
 three-tier: workspaces whose next candidate is a verified red-main fix if any
 (`pool: "red-main-fix"`), else those with very-important work
-(`"very-important"`), else all (`"all"`). #11508 removed the legacy keys: the star, its
+(`"very-important"`), else all (`"all"`). Within the pool the draw weighs each
+workspace by a softmax over `fleet_priority` at temperature
+`dispatch.drawTemperature` (#11684; `p_min` is taken over the pool, so its top
+workspace always weighs the full 1,000,000). #11508 removed the legacy keys: the star, its
 levels and inherited levels, the starred-at time and its restart store
 (`starred-<sha16>.json`, no longer read or written; `LOOM_STARRED_AT_PERSIST` is
 ignored), and `workspace_priority` as a rank key (it weights the workspace
