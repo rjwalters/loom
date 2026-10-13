@@ -888,6 +888,15 @@ LOOM_CONFIG_DEFAULTS_FILE="$CFG27" provision_operator_presence "$H27/.claude" >/
 printf '{"operatorPresence":{"enabled":false}}\n' > "$CFG27"
 LOOM_CONFIG_DEFAULTS_FILE="$CFG27" provision_operator_presence "$H27/.claude" >/dev/null 2>&1
 assert_eq "$(count_marker "$S27" presence-beat.sh)" "0" "enabled=false: presence stripped"
+# inherited LOOM_OPERATOR_PRESENCE=1 (the installer's own settings.json env) must not defeat opt-out / enabled=false
+LOOM_OPERATOR_PRESENCE=1 LOOM_CONFIG_DEFAULTS_FILE="$CFG27" provision_operator_presence "$H27/.claude" >/dev/null 2>&1
+assert_eq "$(count_marker "$S27" presence-beat.sh)" "0" "inherited env=1: enabled=false still strips"
+printf '{}\n' > "$CFG27"; touch "$H27/optout"
+LOOM_OPERATOR_PRESENCE=1 LOOM_CONFIG_DEFAULTS_FILE="$CFG27" provision_operator_presence "$H27/.claude" >/dev/null 2>&1
+assert_eq "$(count_marker "$S27" presence-beat.sh)" "0" "inherited env=1: opt-out file still strips"
+rm -f "$H27/optout"
+LOOM_OPERATOR_PRESENCE=1 LOOM_CONFIG_DEFAULTS_FILE="$CFG27" provision_operator_presence "$H27/.claude" >/dev/null 2>&1
+assert_eq "$(count_marker "$S27" presence-beat.sh)" "3" "env=1 with no opt-out/disable: wired"
 unset LOOM_PRESENCE_OPTOUT_FILE
 
 echo ""

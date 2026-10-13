@@ -238,18 +238,17 @@ _phook_cmd() {
 
 # ── Operator presence (#11563, #11713) ────────────────────────────────────────
 # _phook_presence_mode -> echoes `on`, `off` or `unset`. First match wins:
-#   LOOM_OPERATOR_PRESENCE=1|0       per-run / per-shell override
-#   ~/.loom/operator-presence.optout per-operator local opt-out (touch to disable
-#                                    even when fleet policy turns presence on)
-#   operatorPresence.enabled         fleet key, read from the machine-level
-#                                    defaults.json (fleet-gitops tier 1)
+#   LOOM_OPERATOR_PRESENCE=0         per-run / per-shell force-off
+#   ~/.loom/operator-presence.optout per-operator local opt-out (beats fleet policy)
+#   operatorPresence.enabled=false   fleet key (machine-level defaults.json, tier 1)
+#   LOOM_OPERATOR_PRESENCE=1 / enabled=true: on (=1 is below the opt-outs; the installer writes it)
 _phook_presence_mode() {
-    case "${LOOM_OPERATOR_PRESENCE:-}" in 1) echo on; return ;; 0) echo off; return ;; esac
-    [[ -e "${LOOM_PRESENCE_OPTOUT_FILE:-$HOME/.loom/operator-presence.optout}" ]] && { echo off; return; }
+    [[ "${LOOM_OPERATOR_PRESENCE:-}" == 0 || -e "${LOOM_PRESENCE_OPTOUT_FILE:-$HOME/.loom/operator-presence.optout}" ]] && { echo off; return; }
     local cfg="${LOOM_CONFIG_DEFAULTS_FILE-$HOME/.local/share/loom/config/defaults.json}" v=""
     [[ -n "$cfg" && -r "$cfg" ]] && command -v jq >/dev/null 2>&1 \
         && v="$(jq -r '.operatorPresence.enabled | if type == "boolean" then tostring else empty end' "$cfg" 2>/dev/null)"
-    case "$v" in true) echo on ;; false) echo off ;; *) echo unset ;; esac
+    [[ "$v" == false ]] && { echo off; return; }
+    if [[ "$v" == true || "${LOOM_OPERATOR_PRESENCE:-}" == 1 ]]; then echo on; else echo unset; fi
 }
 
 # _phook_presence_apply <settings_file>: merge (on) or strip (off) the three
