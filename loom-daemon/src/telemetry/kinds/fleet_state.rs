@@ -418,6 +418,70 @@ fn is_zero(n: &u8) -> bool {
     *n == 0
 }
 
+/// Why a PR under review cannot merge yet, as `fleet.state` reports it
+/// (Issue #11644). A single rollup of the row's own label-derived fields
+/// (`stage`, `hold_kind` / `holds`, `conflict`, `ci_fail`) — never a new forge
+/// read. Only ever set on a PR row (`review_wait` / `doctor` / `merge_wait` /
+/// `merge_hold`); absent on a `ready_wait` or sweep (`sweep.curator` /
+/// `sweep.builder`) row.
+///
+/// A closed, label-knowable set with a defined precedence (strongest first):
+/// `operator_hold`, then `sequenced`, `conflict`, `ci_red`,
+/// `changes_requested`, `approval_pending`, and finally `ready`. The emitter
+/// reads labels only, so it cannot tell `ci_pending` (needs
+/// `statusCheckRollup`) or `base_stale` (needs
+/// `mergeStateStatus`) without a per-PR GraphQL read; those are deliberately
+/// not represented here. For the same reason Champion's merge-risk hold
+/// (`loom:operator` + a comment marker the emitter does not read) collapses
+/// into `operator_hold` rather than a distinct reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeBlockedReason {
+    /// Approved (`loom:pr`) with no hold or flag: nothing blocks the merge.
+    Ready,
+    /// Under review (`review_wait`), not yet judged.
+    ApprovalPending,
+    /// Judge requested changes (`doctor` / `loom:changes-requested`).
+    ChangesRequested,
+    /// `loom:ci-failure` on the PR.
+    CiRed,
+    /// `loom:merge-conflict` on the PR.
+    Conflict,
+    /// `loom:sequenced`: approved, but ordered behind another PR.
+    Sequenced,
+    /// Any operator/`loom:blocked` hold (incl. Champion's marker-refined
+    /// `merge_risk` / `critical_file` / `ac_hold`, indistinguishable from
+    /// labels alone) on the PR.
+    OperatorHold,
+}
+
+impl MergeBlockedReason {
+    /// Every reason, strongest precedence last.
+    pub const ALL: [MergeBlockedReason; 7] = [
+        MergeBlockedReason::Ready,
+        MergeBlockedReason::ApprovalPending,
+        MergeBlockedReason::ChangesRequested,
+        MergeBlockedReason::CiRed,
+        MergeBlockedReason::Conflict,
+        MergeBlockedReason::Sequenced,
+        MergeBlockedReason::OperatorHold,
+    ];
+
+    /// The wire name.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MergeBlockedReason::Ready => "ready",
+            MergeBlockedReason::ApprovalPending => "approval_pending",
+            MergeBlockedReason::ChangesRequested => "changes_requested",
+            MergeBlockedReason::CiRed => "ci_red",
+            MergeBlockedReason::Conflict => "conflict",
+            MergeBlockedReason::Sequenced => "sequenced",
+            MergeBlockedReason::OperatorHold => "operator_hold",
+        }
+    }
+}
+
 /// One `(repo, issue)` as this host sees it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FleetStateRow {
@@ -510,6 +574,12 @@ pub struct FleetStateRow {
     /// `blocked`, `sequenced`, `other`. Absent = none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub holds: Vec<String>,
+    /// Why this PR row cannot merge yet (#11644), a rollup of the row's own
+    /// label-derived fields. Set only on a PR row (`review_wait` / `doctor` /
+    /// `merge_wait` / `merge_hold`); absent on `ready_wait` / sweep rows and
+    /// on an older emitter. No extra forge read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_blocked_reason: Option<MergeBlockedReason>,
     /// `ready_wait` only (#11564): the instant the time-boxed hold named by
     /// `eligible_reason` ends, as the work finder computed it on its last
     /// tick. Absent when no clock holds the item, when the hold has no clock
@@ -553,6 +623,7 @@ impl FleetStateRow {
             conflict: false,
             ci_fail: false,
             holds: Vec::new(),
+            merge_blocked_reason: None,
             eligible_at: None,
             eligible_reason: None,
         }
@@ -603,6 +674,31 @@ pub struct ChampionState {
     pub last_attempt_at: Option<DateTime<Utc>>,
     /// Runner outcome for that attempt; never a claim that issues were evaluated.
     pub last_attempt_ok: Option<bool>,
+}
+
+/// Observed Curator role-runner cadence and last run (#11642), the triage
+/// analogue of [`ChampionState`]. A reader uses it to predict `triage_wait`
+/// drain: how fast the Curator empties the `loom:triage` queue, and when it
+/// last ran. Scheduling never implies the Curator did any work — `last_run_ok`
+/// is the runner's outcome for its last attempt, not a count of curations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CuratorState {
+    /// The interval runner currently selects Curator (its effective
+    /// enabled/roles resolvers), even when it is idle this instant.
+    pub interval_enabled: bool,
+    /// The Curator's resolved role-runner interval, in seconds.
+    pub cadence_secs: u64,
+    /// Where that interval came from: `env`, `effective_config` or `built_in`.
+    pub cadence_source: String,
+    /// The most recent recorded Curator attempt for this exact root
+    /// (failures and pre-spawn skips included), process-local. Absent when
+    /// unobserved or after a restart. Never a count of completed curations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_run_at: Option<DateTime<Utc>>,
+    /// The runner outcome for that attempt; never a claim that issues were
+    /// curated. Present exactly when `last_run_at` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_run_ok: Option<bool>,
 }
 
 /// One repo's `ready_wait` queue flow over a trailing window (#11645): how
@@ -693,6 +789,33 @@ pub struct FleetStateRepo {
     /// absent = unknown, never zero. Additive on `fleet-state/v1`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue_flow: Option<FleetQueueFlow>,
+    /// Pre-ready (`loom:triage`) only (#11642): issues of this repo waiting in
+    /// the triage queue the Curator drains — the depth of this host's last
+    /// complete `loom:triage` listing, the same listing the `triage_wait`
+    /// outcome facts come from. The dispatch-queue analogue of `queue_depth`
+    /// for the pre-ready stage. Read on the collector's forge pass, so it is
+    /// stable between those passes (a tick pass carries the last read value,
+    /// never a stale guess from a partial listing). Absent = unknown (no
+    /// complete triage listing read yet, or an older emitter), never zero.
+    /// Additive on `fleet-state/v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub triage_depth: Option<u32>,
+    /// Pre-ready only (#11642): this repo's `loom:triage` arrival/drain flow
+    /// over a trailing window, the `triage_wait` analogue of `queue_flow`.
+    /// `arrivals` is the triage arrival_rate numerator; `drains` (issues that
+    /// left `loom:triage` — curated, closed or relabelled) is the **Curator
+    /// drain rate** numerator a reader divides by the effective window for
+    /// `curator_rate`. Reuses [`FleetQueueFlow`]. Present once this host has
+    /// observed the repo's triage queue; absent = unknown, never zero.
+    /// Additive on `fleet-state/v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub triage_flow: Option<FleetQueueFlow>,
+    /// The Curator role-runner's cadence and last run for this repo (#11642):
+    /// `curator_last_run_at` and the curator cadence the `triage_wait` model
+    /// needs, the triage analogue of `champion`. Absent = unknown (an older
+    /// emitter). Additive on `fleet-state/v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub curator: Option<CuratorState>,
     /// The census. Absent means unknown at `as_of`, because the repo's
     /// listings were incomplete or not read. It never means zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]

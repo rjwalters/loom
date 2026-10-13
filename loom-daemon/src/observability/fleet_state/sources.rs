@@ -14,6 +14,7 @@ use std::sync::Mutex;
 use chrono::{DateTime, Utc};
 
 use super::champion::champion_by_slug;
+use super::curator::curator_by_slug;
 use super::outcomes::Curated;
 use super::{
     held_stage, FleetInput, HeldSweep, ListedPr, ReadyItem, ReadyQueue, RepoLimits, RepoListing,
@@ -486,6 +487,26 @@ fn capacity(workspace_root: &Path, live_workers: usize) -> FleetCapacity {
     }
 }
 
+/// This host's slots, measured from local state (#11643): `max_concurrent`
+/// from the work-finder config (precedence env > config > default, via
+/// [`resolve_max_concurrent_with_source`]) and `occupancy` from the
+/// already-computed live-sweep count. Independent of the work-finder plan, so
+/// it is present from the first pass of a process and after a roll/restart —
+/// the plan, and thus `ready.slots`, is absent until the first tick.
+///
+/// `occupancy` stays an `Option` (absent = unknown, never a synthetic `0`);
+/// here it is always `Some`, because every pass re-measures the live count, so
+/// a genuinely idle host emits `occupancy: 0`, distinct from "not yet
+/// measured".
+fn local_slots(workspace_root: &Path, live_workers: usize) -> FleetSlots {
+    let config = crate::work_finder::read_work_finder_config(workspace_root);
+    let max_concurrent = crate::work_finder::resolve_max_concurrent_with_source(&config).0;
+    FleetSlots {
+        max_concurrent: small(max_concurrent),
+        occupancy: Some(small(live_workers)),
+    }
+}
+
 /// `main` CI status of the repo rooted at `root` from the main-health gate:
 /// red when halted on a verified-red run, green when the gate has produced a
 /// green verdict, unknown otherwise (#11565). Unknown means the gate has no
@@ -578,10 +599,9 @@ pub(super) async fn gather(
             .iter()
             .map(|(root, slug)| (root.as_path(), slug.as_str())),
     );
-    let capacity = Some(capacity(
-        workspace_root,
-        live_sweep_count(&workspace_pool.provisioned_registries()),
-    ));
+    let live_workers = live_sweep_count(&workspace_pool.provisioned_registries());
+    let capacity = Some(capacity(workspace_root, live_workers));
+    let slots = Some(local_slots(workspace_root, live_workers));
     let listed_at = (!listings.is_empty()).then_some(now);
     let reused = Reused {
         managed: managed.clone(),
@@ -595,9 +615,12 @@ pub(super) async fn gather(
         visibility: BTreeMap::new(),
     };
     let champion = champion_by_slug(&reused.roots);
+    let curator = curator_by_slug(&reused.roots);
     let input = FleetInput {
         champion,
+        curator,
         capacity,
+        slots,
         main_ci,
         host_id: host_id.to_string(),
         managed,
@@ -618,12 +641,12 @@ pub(super) fn tick_input(
     host_id: &str,
     reused: &Reused,
 ) -> FleetInput {
+    let live_workers = live_sweep_count(&workspace_pool.provisioned_registries());
     FleetInput {
         champion: champion_by_slug(&reused.roots),
-        capacity: Some(capacity(
-            workspace_root,
-            live_sweep_count(&workspace_pool.provisioned_registries()),
-        )),
+        curator: curator_by_slug(&reused.roots),
+        capacity: Some(capacity(workspace_root, live_workers)),
+        slots: Some(local_slots(workspace_root, live_workers)),
         main_ci: tick_main_ci(reused),
         held: held_sweeps(&workspace_pool.provisioned_registries(), |root| reused.slug(root)),
         ready: crate::work_finder::last_tick_summary().map(|summary| ready_input(&summary, reused)),
@@ -651,8 +674,10 @@ pub(super) fn reused_input(host_id: &str, reused: &Reused) -> FleetInput {
         listings: reused.listings.clone(),
         listed_at: reused.listed_at,
         ready: None,
+        slots: None,
         capacity: None,
         champion: BTreeMap::new(),
+        curator: BTreeMap::new(),
         main_ci: BTreeMap::new(),
     }
 }

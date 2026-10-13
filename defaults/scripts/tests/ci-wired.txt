@@ -173,7 +173,6 @@ test-rebase-stacked-children.sh
 test-record-noop-release.sh
 test-recover-orphaned-shepherds-diagnostics.sh
 test-repo-mismatch-fallback.sh
-test-require-complexity-marker.sh
 test-require-daemon-bin.sh
 test-require-daemon-bin-provenance.sh
 test-resolve-tier-model.sh
@@ -183,6 +182,7 @@ test-resync-installed-guard-check.sh
 test-resync-installed-host-optout.sh
 test-resync-installed-local-fix-guard.sh
 test-resync-installed-retired-dry-run.sh
+test-resync-installed-retired-migrate.sh
 test-resync-installed-dogfood-symlink.sh
 test-resync-installed-stamp.sh
 test-resync-installed-output-staging.sh
@@ -217,6 +217,7 @@ test-sweep-pr-mode.sh
 test-sweep-run-registry.sh
 test-sweep-wave-judge-done-staleness.sh
 test-sync-labels-check.sh
+test-sync-labels-migrate-retired.sh
 test-token-cache-affinity.sh
 test-claude-wrapper-proxy-rotation.sh
 test-sync-labels-repo-flag.sh

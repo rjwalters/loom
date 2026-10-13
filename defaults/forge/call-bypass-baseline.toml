@@ -134,12 +134,6 @@ owner = "role-scripts"
 removal_issue = 9799
 
 [[bypass]]
-path = "defaults/scripts/require-complexity-marker.sh"
-calls = 2
-owner = "role-scripts"
-removal_issue = 9799
-
-[[bypass]]
 path = "defaults/scripts/sweep-lease-fence.sh"
 calls = 1
 owner = "role-scripts"

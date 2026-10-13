@@ -1,7 +1,8 @@
 {
   "$comment": [
     "Single source of truth for Loom label semantics (#10013). Embedded in loom-daemon; the Loom block of .github/labels.yml and defaults/.github/labels.yml is GENERATED from this file by `loom-daemon labels generate`. Edit here, then run `loom-daemon labels generate --write`.",
-    "stale_after_minutes and lifecycle are INERT: no consumer reads them yet (the daemon's own constants remain authoritative). lifecycle `retired` marks a label the daemon no longer reads, kept until its live forge migration (#11103: the operator-star levels and tier:*). contradicts_approval is the 1-based report order of labels that contradict loom:pr (null = does not contradict)."
+    "stale_after_minutes and lifecycle are INERT: no consumer reads them yet (the daemon's own constants remain authoritative). contradicts_approval is the 1-based report order of labels that contradict loom:pr (null = does not contradict).",
+    "retired lists labels Loom no longer declares, with their old -> new mapping (#11513), consumed by the forge-side migration (#11511). It is NEVER rendered into labels.yml (sync-labels.sh is additive and would re-create it). replaced_by names an active label or null (remove, no replacement); owned=false means Loom never declared the label, so the migration only adds replaced_by and never removes or deletes it."
   ],
   "yaml_header": [
     "# ============================================================================",
@@ -919,48 +920,8 @@
       ]
     },
     {
-      "name": "loom:operator-priority",
-      "description": "Land ASAP, not a hold. Applied by: humans/loom-ui; inherited by a starred parent's children",
-      "color": "CA8A04",
-      "kind": "priority",
-      "applied_by": "humans, directly or via loom-ui star",
-      "removed_by": "humans",
-      "park": false,
-      "skip": false,
-      "hold": false,
-      "operator_gate": false,
-      "blocked_colabel": false,
-      "hard_exclusion": false,
-      "champion_path": false,
-      "human_gated": false,
-      "merge_hold": false,
-      "operator_hold": false,
-      "contradicts_approval": null,
-      "stale_after_minutes": null,
-      "requires_base": null,
-      "remove_with": [],
-      "lifecycle": "retired",
-      "color_note": "yellow-600 - matches loom-ui's star",
-      "yaml_preamble": [
-        "# loom:operator-priority (#9244) is the operator's \"star\": land this ASAP,",
-        "# ahead of all other work, fleet-wide. It is NOT loom:operator (the hold",
-        "# above) and it is NOT a hold of any kind -- nothing may treat a",
-        "# `loom:operator` / `loom:operator-` prefix match as a hold without excluding",
-        "# this label by name (see loom-daemon pr_latency::hold_labels). The daemon's",
-        "# work finder sorts starred issues first (by when they were starred), lists",
-        "# them even outside loom:issue (triage, curated, or unlabelled; the sweep then",
-        "# starts from Curator), and may run one starred sweep over the concurrency",
-        "# cap. Skip/park labels still win: a starred issue carrying loom:blocked,",
-        "# loom:operator-only, loom:operator-decision or loom:operator is never",
-        "# dispatched. Applied by: humans (directly or via the loom-ui star), and, for the",
-        "# children of a starred parent, inherited (#10012: `create-issue.sh --parent`",
-        "# stars a new child; the audit comment names `inherited_from=#P`). Removed by:",
-        "# humans; a star propagation applied goes with the parent's star."
-      ]
-    },
-    {
       "name": "loom:important",
-      "description": "Priority level 2 of 3: dispatched before unlabeled work (not a hold). Anyone may set.",
+      "description": "Priority 2 of 3: taken before unlabeled work, not a hold. Applied by: operator, Guide, Champion.",
       "color": "CA8A04",
       "kind": "priority",
       "applied_by": "operator, Guide, Champion",
@@ -1022,76 +983,6 @@
       ]
     },
     {
-      "name": "loom:operator-high-priority",
-      "description": "Level 2, above the star (capped, not a hold). Applied by: humans, directly or via loom-ui.",
-      "color": "B45309",
-      "kind": "priority",
-      "applied_by": "humans, directly or via loom-ui",
-      "removed_by": "humans",
-      "park": false,
-      "skip": false,
-      "hold": false,
-      "operator_gate": false,
-      "blocked_colabel": false,
-      "hard_exclusion": false,
-      "champion_path": false,
-      "human_gated": false,
-      "merge_hold": false,
-      "operator_hold": false,
-      "contradicts_approval": null,
-      "stale_after_minutes": null,
-      "requires_base": null,
-      "remove_with": [],
-      "lifecycle": "retired",
-      "color_note": "amber-700 - one shade above the star",
-      "yaml_preamble": [
-        "# loom:operator-high-priority (#10307) is operator priority LEVEL 2, the",
-        "# double star: above loom:operator-priority, which it nests over (level >= 2",
-        "# counts as starred everywhere; a level-2 item need not also carry the star).",
-        "# Every starred-first pass drains by effective level, highest first. Capped:",
-        "# at most 5 open issues fleet-wide by default (loom-ui enforces the cap at",
-        "# click time; the daemon reports an over-cap level in the star-liveness",
-        "# digest and never refuses a human's label). Its open blockers inherit the",
-        "# level as loom:high-priority-inherited. Like the star it is NOT a hold:",
-        "# every loom:operator- prefix match must exclude it by name. Applied by:",
-        "# humans (directly or via the loom-ui double star). Removed by: humans."
-      ]
-    },
-    {
-      "name": "loom:high-priority-inherited",
-      "description": "Blocks a level-2 issue, so treated as level 2. Applied by: loom-daemon star-liveness only.",
-      "color": "D97706",
-      "kind": "priority",
-      "applied_by": "loom-daemon star-liveness only",
-      "removed_by": "loom-daemon star-liveness only",
-      "park": false,
-      "skip": false,
-      "hold": false,
-      "operator_gate": false,
-      "blocked_colabel": false,
-      "hard_exclusion": false,
-      "champion_path": false,
-      "human_gated": false,
-      "merge_hold": false,
-      "operator_hold": false,
-      "contradicts_approval": null,
-      "stale_after_minutes": null,
-      "requires_base": null,
-      "remove_with": [],
-      "lifecycle": "retired",
-      "color_note": "amber-600 - the double star's shade, lighter",
-      "yaml_preamble": [
-        "# loom:high-priority-inherited (#10307) is DERIVED, never a human's or a",
-        "# role's: the daemon's star-liveness pass writes it on every open issue that",
-        "# blocks a loom:operator-high-priority issue, directly or transitively (across",
-        "# managed repos), with a body provenance marker naming the source, and removes it",
-        "# once no level-2 source reaches the issue. Every reader treats it exactly",
-        "# like level 2. It never counts toward the level-2 cap and is never accepted",
-        "# from a loom-ui intent. Applied by / removed by: the loom-daemon",
-        "# star-liveness pass only."
-      ]
-    },
-    {
       "name": "loom:epic",
       "description": "Multi-phase epic proposal (decomposes into implementation issues)",
       "color": "7C3AED",
@@ -1144,85 +1035,8 @@
       "yaml_preamble": []
     },
     {
-      "name": "tier:goal-advancing",
-      "description": "Directly implements a milestone deliverable or unblocks goal work",
-      "color": "0E8A16",
-      "kind": "tier",
-      "applied_by": null,
-      "removed_by": null,
-      "park": false,
-      "skip": false,
-      "hold": false,
-      "operator_gate": false,
-      "blocked_colabel": false,
-      "hard_exclusion": false,
-      "champion_path": false,
-      "human_gated": false,
-      "merge_hold": false,
-      "operator_hold": false,
-      "contradicts_approval": null,
-      "stale_after_minutes": null,
-      "requires_base": null,
-      "remove_with": [],
-      "lifecycle": "retired",
-      "color_note": "green - highest priority",
-      "yaml_preamble": [
-        "# Tier Labels (Goal Alignment)"
-      ]
-    },
-    {
-      "name": "tier:goal-supporting",
-      "description": "Infrastructure, testing, or docs for milestone features",
-      "color": "FBCA04",
-      "kind": "tier",
-      "applied_by": null,
-      "removed_by": null,
-      "park": false,
-      "skip": false,
-      "hold": false,
-      "operator_gate": false,
-      "blocked_colabel": false,
-      "hard_exclusion": false,
-      "champion_path": false,
-      "human_gated": false,
-      "merge_hold": false,
-      "operator_hold": false,
-      "contradicts_approval": null,
-      "stale_after_minutes": null,
-      "requires_base": null,
-      "remove_with": [],
-      "lifecycle": "retired",
-      "color_note": "yellow - medium priority",
-      "yaml_preamble": []
-    },
-    {
-      "name": "tier:maintenance",
-      "description": "Cleanup, refactoring, or improvements not tied to current goals",
-      "color": "D4C5F9",
-      "kind": "tier",
-      "applied_by": null,
-      "removed_by": null,
-      "park": false,
-      "skip": false,
-      "hold": false,
-      "operator_gate": false,
-      "blocked_colabel": false,
-      "hard_exclusion": false,
-      "champion_path": false,
-      "human_gated": false,
-      "merge_hold": false,
-      "operator_hold": false,
-      "contradicts_approval": null,
-      "stale_after_minutes": null,
-      "requires_base": null,
-      "remove_with": [],
-      "lifecycle": "retired",
-      "color_note": "purple - lower priority",
-      "yaml_preamble": []
-    },
-    {
       "name": "points:1",
-      "description": "Story-point size class 1 (paused). Applied by: Curator only.",
+      "description": "Story-point size class 1. Applied by: Curator via loom-daemon curation-complete.",
       "color": "06B6D4",
       "kind": "size",
       "applied_by": "Curator",
@@ -1241,17 +1055,17 @@
       "stale_after_minutes": null,
       "requires_base": null,
       "remove_with": [],
-      "lifecycle": "paused",
+      "lifecycle": "active",
       "color_note": "cyan-500 - story-point size family",
       "yaml_preamble": [
-        "# Story-Point Size Labels (#9431, epic #9429): estimation is paused.",
-        "# Retained for historical data; Curators do not assign or refresh these labels.",
-        "# The archived rubric lives in .loom/docs/story-points.md."
+        "# Story-Point Size Labels (#9431, epic #9429; restarted by #11659).",
+        "# Projected by loom-daemon curation-complete from the Curator's points marker.",
+        "# The rubric lives in .loom/docs/story-points.md."
       ]
     },
     {
       "name": "points:2",
-      "description": "Story-point size class 2 (paused). Applied by: Curator only.",
+      "description": "Story-point size class 2. Applied by: Curator via loom-daemon curation-complete.",
       "color": "06B6D4",
       "kind": "size",
       "applied_by": "Curator",
@@ -1270,13 +1084,13 @@
       "stale_after_minutes": null,
       "requires_base": null,
       "remove_with": [],
-      "lifecycle": "paused",
+      "lifecycle": "active",
       "color_note": "cyan-500 - story-point size family",
       "yaml_preamble": []
     },
     {
       "name": "points:3",
-      "description": "Story-point size class 3 (paused). Applied by: Curator only.",
+      "description": "Story-point size class 3. Applied by: Curator via loom-daemon curation-complete.",
       "color": "06B6D4",
       "kind": "size",
       "applied_by": "Curator",
@@ -1295,13 +1109,13 @@
       "stale_after_minutes": null,
       "requires_base": null,
       "remove_with": [],
-      "lifecycle": "paused",
+      "lifecycle": "active",
       "color_note": "cyan-500 - story-point size family",
       "yaml_preamble": []
     },
     {
       "name": "points:5",
-      "description": "Story-point size class 5 (paused). Applied by: Curator only.",
+      "description": "Story-point size class 5. Applied by: Curator via loom-daemon curation-complete.",
       "color": "06B6D4",
       "kind": "size",
       "applied_by": "Curator",
@@ -1320,13 +1134,13 @@
       "stale_after_minutes": null,
       "requires_base": null,
       "remove_with": [],
-      "lifecycle": "paused",
+      "lifecycle": "active",
       "color_note": "cyan-500 - story-point size family",
       "yaml_preamble": []
     },
     {
       "name": "points:8",
-      "description": "Story-point size class 8 (paused). Applied by: Curator only.",
+      "description": "Story-point size class 8. Applied by: Curator via loom-daemon curation-complete.",
       "color": "06B6D4",
       "kind": "size",
       "applied_by": "Curator",
@@ -1345,13 +1159,13 @@
       "stale_after_minutes": null,
       "requires_base": null,
       "remove_with": [],
-      "lifecycle": "paused",
+      "lifecycle": "active",
       "color_note": "cyan-500 - story-point size family",
       "yaml_preamble": []
     },
     {
       "name": "points:13",
-      "description": "Story-point size class 13, the largest (paused). Applied by: Curator only.",
+      "description": "Story-point size class 13, the largest. Applied by: Curator via loom-daemon curation-complete.",
       "color": "06B6D4",
       "kind": "size",
       "applied_by": "Curator",
@@ -1370,7 +1184,7 @@
       "stale_after_minutes": null,
       "requires_base": null,
       "remove_with": [],
-      "lifecycle": "paused",
+      "lifecycle": "active",
       "color_note": "cyan-500 - story-point size family",
       "yaml_preamble": []
     },
@@ -1409,6 +1223,68 @@
         "# lockstep by a unit test). Adding a hard exclusion means editing that list, not",
         "# just adding a label here."
       ]
+    }
+  ],
+  "retired": [
+    {
+      "name": "loom:operator-priority",
+      "replaced_by": "loom:important",
+      "owned": true,
+      "retired_in": "#11103"
+    },
+    {
+      "name": "loom:operator-high-priority",
+      "replaced_by": "loom:very-important",
+      "owned": true,
+      "retired_in": "#11103"
+    },
+    {
+      "name": "loom:high-priority-inherited",
+      "replaced_by": null,
+      "owned": true,
+      "retired_in": "#11103"
+    },
+    {
+      "name": "tier:goal-advancing",
+      "replaced_by": null,
+      "owned": true,
+      "retired_in": "#11103"
+    },
+    {
+      "name": "tier:goal-supporting",
+      "replaced_by": null,
+      "owned": true,
+      "retired_in": "#11103"
+    },
+    {
+      "name": "tier:maintenance",
+      "replaced_by": null,
+      "owned": true,
+      "retired_in": "#11103"
+    },
+    {
+      "name": "priority:high",
+      "replaced_by": "loom:important",
+      "owned": false,
+      "retired_in": "#11103"
+    },
+    {
+      "name": "loom:urgent",
+      "replaced_by": null,
+      "owned": true,
+      "retired_in": "#11105"
+    },
+    {
+      "name": "loom:heavy",
+      "replaced_by": null,
+      "owned": true,
+      "retired_in": "#11105"
+    },
+    {
+      "name": "loom:operator-objective",
+      "replaced_by": null,
+      "owned": true,
+      "retired_in": "#11105"
     }
   ]
 }

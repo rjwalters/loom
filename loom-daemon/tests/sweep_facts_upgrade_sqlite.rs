@@ -230,16 +230,22 @@ fn an_installed_pre_9507_database_upgrades_without_losing_a_fact() {
     // The failure modes the upgrade exists for, reproduced: the new rollup
     // refuses the old table, and the old view has no partition columns.
     let refused = execute_err(&conn, &committed(ROLLUP)).expect("the rollup ran on an old table");
-    assert!(refused.contains("rework_substantive_sec"), "{refused}");
+    // `dispatch_origin` (#11444) is the first INSERT column the pre-#9507/#11444
+    // table lacks, so it is the column SQLite names in the refusal.
+    assert!(refused.contains("dispatch_origin"), "{refused}");
     assert_eq!(facts(&conn, &old_columns), before, "a refused rollup must write nothing");
     assert!(conn.prepare("SELECT clean_sec FROM issue_effort").is_err());
 
-    // The migration prints exactly the four #9507 columns, in table order.
+    // The migration prints every column the old table lacks, in table order:
+    // `dispatch_origin` (#11444, TEXT, position 29) ahead of the four #9507
+    // rework columns (INTEGER). The fixture predates both.
     let applied = migrate(&conn);
-    let expected: Vec<String> = ADDED_9507
-        .iter()
-        .map(|c| format!("ALTER TABLE sweep_facts ADD COLUMN {c} INTEGER;"))
-        .collect();
+    let mut expected = vec!["ALTER TABLE sweep_facts ADD COLUMN dispatch_origin TEXT;".to_owned()];
+    expected.extend(
+        ADDED_9507
+            .iter()
+            .map(|c| format!("ALTER TABLE sweep_facts ADD COLUMN {c} INTEGER;")),
+    );
     assert_eq!(applied, expected);
     assert!(pending_ddl(&conn).is_empty(), "an upgraded table must need nothing more");
 
@@ -261,6 +267,19 @@ fn an_installed_pre_9507_database_upgrades_without_losing_a_fact() {
             // Still in `records`: re-derived by the new rollup.
             ["o/r", "61", "u-61a", "0", "100", "0", "0"],
             ["o/r", "61", "u-61b", "0", "0", "1", "0"],
+        ]
+        .map(|r| r.map(str::to_owned).to_vec())
+    );
+
+    // `dispatch_origin` (#11444) is absent from every fixture payload, so it
+    // reads NULL on every row — including the two re-derived from `records` —
+    // never '' and never a fabricated value (the absent-not-zero contract).
+    assert_eq!(
+        facts(&conn, &["repo", "issue", "sweep_id", "dispatch_origin"].map(str::to_owned)),
+        [
+            ["o/r", "60", "u-60a", "∅"],
+            ["o/r", "61", "u-61a", "∅"],
+            ["o/r", "61", "u-61b", "∅"],
         ]
         .map(|r| r.map(str::to_owned).to_vec())
     );
@@ -320,13 +339,15 @@ fn a_half_applied_upgrade_resumes_with_only_the_missing_columns() {
         conn.execute_batch(&format!("ALTER TABLE sweep_facts ADD COLUMN {column} INTEGER"))
             .unwrap();
     }
-    assert_eq!(
-        migrate(&conn),
+    // Still missing, in table order: `dispatch_origin` (#11444, TEXT, position
+    // 29) ahead of the two #9507 `_open` columns the operator had not yet added.
+    let mut expected = vec!["ALTER TABLE sweep_facts ADD COLUMN dispatch_origin TEXT;".to_owned()];
+    expected.extend(
         ADDED_9507[2..]
             .iter()
-            .map(|c| format!("ALTER TABLE sweep_facts ADD COLUMN {c} INTEGER;"))
-            .collect::<Vec<_>>()
+            .map(|c| format!("ALTER TABLE sweep_facts ADD COLUMN {c} INTEGER;")),
     );
+    assert_eq!(migrate(&conn), expected);
     assert!(pending_ddl(&conn).is_empty());
     execute(&conn, ROLLUP, &committed(ROLLUP));
     execute(&conn, VIEW, &committed(VIEW));

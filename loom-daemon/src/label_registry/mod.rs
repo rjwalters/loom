@@ -14,10 +14,13 @@
 //! operator-only labels are single named consts, kept in lockstep by a test.
 //!
 //! The `propagate` rule table (#10012) is gone (#11510): its only consumer,
-//! the star-liveness propagation pass, was removed by #11104. The labels the
-//! daemon no longer reads (the operator-star levels and `tier:*`, #11103)
-//! stay in the registry with `lifecycle: retired` until their live forge
-//! migration; the label cleanup (#11513) removes them.
+//! the star-liveness propagation pass, was removed by #11104.
+//!
+//! Retired labels (#11513) are not in `labels`: they are listed in the
+//! top-level `retired` array ([`RetiredLabel`]) with their old -> new
+//! mapping, which the forge-side migration (#11511) consumes. That array is
+//! never rendered into `labels.yml`, so the additive `sync-labels.sh` cannot
+//! re-create a retired label.
 //!
 //! Fields documented as inert (`stale_after_minutes`, `lifecycle`) have no
 //! consumer yet.
@@ -77,13 +80,13 @@ pub const KINDS: &[&str] = &[
     "hold",
     "priority",
     "structural",
-    "tier",
     "size",
     "external",
 ];
 
-/// Allowed values of [`Label::lifecycle`].
-pub const LIFECYCLES: &[&str] = &["active", "paused", "retired"];
+/// Allowed values of [`Label::lifecycle`]. A retired label leaves `labels`
+/// for [`Registry::retired`] instead (#11513).
+pub const LIFECYCLES: &[&str] = &["active", "paused"];
 
 /// One label's full definition.
 #[derive(Debug, Clone, Deserialize)]
@@ -117,13 +120,30 @@ pub struct Label {
     pub stale_after_minutes: Option<u32>,
     pub requires_base: Option<String>,
     pub remove_with: Vec<String>,
-    /// Inert: `active`, `paused` or `retired` (a label the daemon no longer
-    /// reads, kept until its forge migration).
+    /// Inert: `active` or `paused`.
     pub lifecycle: String,
     /// Trailing `# note` on the generated `color:` line.
     pub color_note: Option<String>,
     /// Comment/blank lines emitted verbatim above the generated entry.
     pub yaml_preamble: Vec<String>,
+}
+
+/// A label Loom no longer declares, and what replaces it on the forge
+/// (#11513). Read by the forge-side migration (#11511).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetiredLabel {
+    pub name: String,
+    /// The active label an item carrying `name` gets instead; `None` means
+    /// remove with no replacement.
+    pub replaced_by: Option<String>,
+    /// `true`: Loom declared this label, so the migration may strip it from
+    /// open items and delete it. `false`: Loom never declared it (a
+    /// consumer's label), so the migration only adds `replaced_by` and never
+    /// removes or deletes it.
+    pub owned: bool,
+    /// The issue that retired it, e.g. `#11103`.
+    pub retired_in: String,
 }
 
 /// The parsed registry.
@@ -133,6 +153,9 @@ pub struct Registry {
     pub comment: Vec<String>,
     pub yaml_header: Vec<String>,
     pub labels: Vec<Label>,
+    /// Retired labels and their mapping; never rendered into `labels.yml`.
+    #[serde(default)]
+    pub retired: Vec<RetiredLabel>,
 }
 
 impl Label {
@@ -228,7 +251,38 @@ impl Registry {
         if ranks.iter().copied().ne(1..=ranks.len() as u32) {
             bail!("contradicts_approval ranks must be 1..=N without gaps");
         }
+        self.validate_retired()
+    }
+
+    /// `retired` invariants (#11513): a retired name is unique and not also
+    /// declared, and each `replaced_by` names an active declared label.
+    fn validate_retired(&self) -> Result<()> {
+        let mut seen = HashSet::new();
+        for r in &self.retired {
+            if !seen.insert(r.name.as_str()) {
+                bail!("duplicate retired label {}", r.name);
+            }
+            if self.get(&r.name).is_some() {
+                bail!("{}: retired but still declared in labels", r.name);
+            }
+            if r.retired_in.is_empty() {
+                bail!("{}: retired_in must name the retiring issue", r.name);
+            }
+            if let Some(to) = &r.replaced_by {
+                match self.get(to) {
+                    Some(l) if l.lifecycle == "active" => {}
+                    Some(_) => bail!("{}: replaced_by {to} is not an active label", r.name),
+                    None => bail!("{}: replaced_by unknown label {to}", r.name),
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// Look a retired label up by name.
+    #[must_use]
+    pub fn get_retired(&self, name: &str) -> Option<&RetiredLabel> {
+        self.retired.iter().find(|r| r.name == name)
     }
 
     /// Look a label up by name.

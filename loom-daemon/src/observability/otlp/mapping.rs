@@ -11,6 +11,7 @@ mod host_export;
 mod host_resource;
 mod issue_estimate;
 mod metadata;
+mod operator_presence;
 mod ops;
 mod outcome_facts;
 mod pass;
@@ -594,7 +595,8 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         | TelemetryRecord::PassSummary(_)
         | TelemetryRecord::PassVerdict(_)
         | TelemetryRecord::FleetState(_)
-        | TelemetryRecord::PickDecision(_) => {
+        | TelemetryRecord::PickDecision(_)
+        | TelemetryRecord::OperatorPresence(_) => {
             // One record, stamped at its own time; the body is the record's
             // JSON. Issue #10414: one self-update decision (the tick's start).
             // Issue #10744: one token-ranking refresh round (the round's
@@ -602,7 +604,9 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             // decided). Issue #10196: one fleet-state snapshot (rows +
             // census; anchor/delta scalars ride as `loom.fleet.*`
             // attributes). Issue #10212: one pick decision (the ranked
-            // candidates). Each `log_parts` is `None` for every other kind.
+            // candidates). Issue #11563: one operator presence beat (the
+            // `loom.presence.*` scalars ride as attributes; `driving[]` is in
+            // the body). Each `log_parts` is `None` for every other kind.
             let r = &envelope.record;
             let (event_name, severity, at, attributes, body) = auto_update::log_parts(r)
                 .or_else(|| token_ranking::log_parts(r))
@@ -610,7 +614,8 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 .or_else(|| checkout_external_change::log_parts(r))
                 .or_else(|| pass::log_parts(r))
                 .or_else(|| fleet_state::log_parts(r))
-                .or_else(|| pick_decision::log_parts(r))?;
+                .or_else(|| pick_decision::log_parts(r))
+                .or_else(|| operator_presence::log_parts(r))?;
             time_unix_nano = at;
             body_override = Some(body);
             (event_name, severity, String::new(), attributes)

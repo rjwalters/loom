@@ -52,6 +52,7 @@
 //! because it truthfully says "nothing here".
 
 mod champion;
+mod curator;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -62,10 +63,10 @@ use serde_json::Value;
 
 use super::queue::{DurableQueue, FanoutQueue, QueueSink};
 use crate::telemetry::kinds::fleet_state::{
-    split_into_chunks, FleetCapacity, FleetEligibleReason, FleetHoldKind, FleetPrCensus,
-    FleetQueueFlow, FleetRepoHalt, FleetSlot, FleetSlots, FleetStage, FleetStateRecord,
-    FleetStateRepo, FleetStateRow, MainCi, PlannerStamps, ANCHOR_INTERVAL_SECS, CHUNK_BYTES,
-    FLEET_STATE_SCHEMA,
+    split_into_chunks, CuratorState, FleetCapacity, FleetEligibleReason, FleetHoldKind,
+    FleetPrCensus, FleetQueueFlow, FleetRepoHalt, FleetSlot, FleetSlots, FleetStage,
+    FleetStateRecord, FleetStateRepo, FleetStateRow, MainCi, MergeBlockedReason, PlannerStamps,
+    ANCHOR_INTERVAL_SECS, CHUNK_BYTES, FLEET_STATE_SCHEMA,
 };
 use crate::telemetry::{RepoVisibility, SweepStartFacts, TelemetryEnvelope, TelemetryRecord};
 
@@ -137,6 +138,55 @@ pub fn hold_names(labels: &[String]) -> Vec<String> {
         holds.push("other".to_string());
     }
     holds
+}
+
+/// Why a PR row cannot merge yet (#11644), rolled up from the row's own
+/// label-derived fields: its `stage`, whether any hold holds it
+/// (`hold_kind`), whether it is `sequenced` (`holds`), and its
+/// `loom:merge-conflict` / `loom:ci-failure` flags. No forge read — every
+/// input is already on the row from the same review-label census
+/// Champion/Judge read.
+///
+/// Returns `None` for any non-PR stage (`ready_wait`, `sweep.curator`,
+/// `sweep.builder`). For a PR stage (`review_wait`, `doctor`, `merge_wait`,
+/// `merge_hold`) it always returns a reason, in descending precedence:
+/// `operator_hold`, then `sequenced`, `conflict`, `ci_red`,
+/// `changes_requested`, `approval_pending`, and finally `ready`. Pure.
+#[must_use]
+pub fn merge_blocked_reason(
+    stage: FleetStage,
+    hold_kind: Option<FleetHoldKind>,
+    holds: &[String],
+    conflict: bool,
+    ci_fail: bool,
+) -> Option<MergeBlockedReason> {
+    match stage {
+        FleetStage::ReviewWait
+        | FleetStage::Doctor
+        | FleetStage::MergeWait
+        | FleetStage::MergeHold => {}
+        _ => return None,
+    }
+    // `hold_kind` already collapses every operator/`loom:blocked` hold (and
+    // Champion's marker-refined holds, unreadable from labels) into one value.
+    let reason = if hold_kind.is_some() {
+        MergeBlockedReason::OperatorHold
+    } else if holds.iter().any(|h| h == "sequenced") {
+        MergeBlockedReason::Sequenced
+    } else if conflict {
+        MergeBlockedReason::Conflict
+    } else if ci_fail {
+        MergeBlockedReason::CiRed
+    } else if stage == FleetStage::Doctor {
+        MergeBlockedReason::ChangesRequested
+    } else if stage == FleetStage::ReviewWait {
+        MergeBlockedReason::ApprovalPending
+    } else {
+        // `merge_wait` with no hold or flag. (`merge_hold` always carries a
+        // merge-hold label, so `hold_kind` is set and this arm is unreached.)
+        MergeBlockedReason::Ready
+    };
+    Some(reason)
 }
 
 /// What one listed PR's labels say about the row of the issue it links.
@@ -269,6 +319,8 @@ pub struct ReadyQueue {
 pub struct FleetInput {
     /// Per-root Champion dispatch observations.
     pub champion: BTreeMap<String, crate::telemetry::kinds::fleet_state::ChampionState>,
+    /// Per-root Curator role-runner observations (#11642).
+    pub curator: BTreeMap<String, CuratorState>,
     /// This host's id.
     pub host_id: String,
     /// Every managed repo's lowercased slug.
@@ -279,6 +331,12 @@ pub struct FleetInput {
     pub listed_at: Option<DateTime<Utc>>,
     /// `None` before the work finder's first tick.
     pub ready: Option<ReadyQueue>,
+    /// This host's slots (`max_concurrent` + `occupancy`), measured from local
+    /// state every pass (#11643): `max_concurrent` from the work-finder config,
+    /// `occupancy` from the live-sweep count. Independent of `ready`, so it is
+    /// present before the first work-finder tick and after a roll/restart.
+    /// Preferred over the work-finder plan's `ready.slots` in [`build_view`].
+    pub slots: Option<FleetSlots>,
     /// Host capacity, when read.
     pub capacity: Option<FleetCapacity>,
     /// Each managed repo's `main` CI status, by lowercased slug.
@@ -308,6 +366,14 @@ pub struct RepoView {
     /// The repo's `ready_wait` arrival/drain flow over the trailing window
     /// (#11645), once this host has observed its queue.
     pub flow: Option<FleetQueueFlow>,
+    /// Issues waiting in the repo's `loom:triage` queue as of this host's last
+    /// complete triage listing (#11642). Absent = unknown, never zero.
+    pub triage_depth: Option<u32>,
+    /// The repo's `loom:triage` arrival/drain flow over the trailing window
+    /// (#11642), once this host has observed its triage queue.
+    pub triage_flow: Option<FleetQueueFlow>,
+    /// The Curator role-runner's cadence and last run for the repo (#11642).
+    pub curator: Option<CuratorState>,
 }
 
 /// The full state at one pass, before visibility tagging.
@@ -315,7 +381,8 @@ pub struct RepoView {
 pub struct FleetView {
     /// When the census listings were read.
     pub census_at: Option<DateTime<Utc>>,
-    /// Plan slot use.
+    /// Slot use (`max_concurrent` + `occupancy`), measured from local state
+    /// every pass (#11643) — not gated on a work-finder tick.
     pub slots: Option<FleetSlots>,
     /// Host capacity beside `slots`.
     pub capacity: Option<FleetCapacity>,
@@ -607,6 +674,11 @@ pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Ut
             (None, Some(was)) => row.hold_released_at = was.hold_released_at,
             (None, None) => {}
         }
+        // Roll the row's own label-derived facts up into the merge-readiness
+        // reason (#11644). Computed last, so it reflects the final stage, hold
+        // and flags, whatever source set them.
+        row.merge_blocked_reason =
+            merge_blocked_reason(row.stage, row.hold_kind, &row.holds, row.conflict, row.ci_fail);
         let state = repos.entry(repo).or_default();
         state.rows.insert(issue, row);
         state.sources.insert(issue, source);
@@ -616,6 +688,9 @@ pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Ut
     }
     for (repo, champion) in &input.champion {
         repos.entry(repo.clone()).or_default().champion = Some(champion.clone());
+    }
+    for (repo, curator) in &input.curator {
+        repos.entry(repo.clone()).or_default().curator = Some(curator.clone());
     }
     for (repo, main_ci) in &input.main_ci {
         repos.entry(repo.clone()).or_default().main_ci = Some(*main_ci);
@@ -630,7 +705,12 @@ pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Ut
     }
     FleetView {
         census_at: input.listed_at.filter(|_| !input.listings.is_empty()),
-        slots: input.ready.as_ref().and_then(|r| r.slots),
+        // Prefer the directly-provided, locally-measured slots (#11643); fall
+        // back to the work-finder plan's slots only when a pass did not provide
+        // them (e.g. legacy test inputs).
+        slots: input
+            .slots
+            .or_else(|| input.ready.as_ref().and_then(|r| r.slots)),
         capacity: input.capacity.clone(),
         repos,
         observed,
@@ -666,6 +746,9 @@ fn repo_entry(view: &FleetView, repo: &str, census: Option<FleetPrCensus>) -> Fl
         deferred_repo_cap: limits.map(|l| l.deferred_repo_cap),
         queue_depth: state.and_then(|r| r.queue_depth),
         queue_flow: state.and_then(|r| r.flow),
+        triage_depth: state.and_then(|r| r.triage_depth),
+        triage_flow: state.and_then(|r| r.triage_flow),
+        curator: state.and_then(|r| r.curator.clone()),
         census,
         ready_complete,
         ready_replace: !ready_complete,
@@ -766,6 +849,9 @@ pub fn decide(
             && now_state.limits == was.limits
             && now_state.queue_depth == was.queue_depth
             && now_state.flow == was.flow
+            && now_state.triage_depth == was.triage_depth
+            && now_state.triage_flow == was.triage_flow
+            && now_state.curator == was.curator
             && view.ready_complete(repo) == last.view.ready_complete(repo)
         {
             continue;
@@ -856,6 +942,8 @@ struct PassState {
     enrich: enrich::EnrichMemory,
     /// Per-repo `ready_wait` arrival/drain history (#11645).
     flow: QueueFlowTracker,
+    /// Per-repo `loom:triage` arrival/drain history (#11642).
+    triage_flow: QueueFlowTracker,
 }
 
 static STATE: Mutex<PassState> = Mutex::new(PassState {
@@ -863,6 +951,7 @@ static STATE: Mutex<PassState> = Mutex::new(PassState {
     emitted: None,
     enrich: enrich::EnrichMemory::new(),
     flow: QueueFlowTracker::new(QUEUE_FLOW_WINDOW_SECS),
+    triage_flow: QueueFlowTracker::new(QUEUE_FLOW_WINDOW_SECS),
     outcomes: outcomes::Memory {
         listed: BTreeMap::new(),
         unread: BTreeMap::new(),
@@ -999,6 +1088,12 @@ pub(super) async fn record(
     let now = Utc::now();
     let (input, mut reused, curated, triage) =
         sources::gather(workspace_root, workspace_pool, slug_cache, &sink.host_id, now).await;
+    // The complete `loom:triage` sets this pass read, before `triage` is moved
+    // into the outcome diff (#11642). Every repo present was read whole.
+    let triage_sets: BTreeMap<String, BTreeSet<u32>> = triage
+        .iter()
+        .map(|(repo, items)| (repo.clone(), items.keys().copied().collect()))
+        .collect();
     let state = STATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1012,6 +1107,7 @@ pub(super) async fn record(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         annotate_flow(&mut view, &mut live.flow, input.ready.as_ref(), now);
+        annotate_triage(&mut view, &mut live.triage_flow, Some(&triage_sets), now);
     }
     for repo in view.repos.keys().chain(&input.managed) {
         if !reused.visibility.contains_key(repo) {
@@ -1044,6 +1140,9 @@ async fn record_tick(workspace_root: &Path, workspace_pool: &crate::workspace_po
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         annotate_flow(&mut view, &mut live.flow, input.ready.as_ref(), now);
+        // No forge read on a tick pass: re-stamp triage from the tracker's
+        // last collector-pass observation (#11642).
+        annotate_triage(&mut view, &mut live.triage_flow, None, now);
     }
     send(sink, workspace_root, view, state, now, &reused);
 }
@@ -1078,6 +1177,37 @@ fn annotate_flow(
         let state = view.repos.entry(repo.clone()).or_default();
         state.queue_depth = Some(u32::try_from(set.len()).unwrap_or(u32::MAX));
         state.flow = tracker.flow(repo, now);
+    }
+}
+
+/// Fold this pass's `loom:triage` sets into `tracker` and stamp each repo's
+/// [`RepoView`] with its triage depth and flow (#11642), the pre-ready
+/// analogue of [`annotate_flow`]. Only the collector pass reads the triage
+/// listings (`triage` is `Some`), and `label_listings` already drops any repo
+/// whose listing came back partial — so every repo present was read whole.
+/// A tick pass passes `None`: it re-stamps each repo from the tracker's last
+/// observed set, so the facts persist unchanged between the collector's forge
+/// passes (no delta churn, as [`annotate_flow`]'s idle repos do not churn).
+fn annotate_triage(
+    view: &mut FleetView,
+    tracker: &mut QueueFlowTracker,
+    triage: Option<&BTreeMap<String, BTreeSet<u32>>>,
+    now: DateTime<Utc>,
+) {
+    if let Some(sets) = triage {
+        for (repo, set) in sets {
+            tracker.observe(repo, set, now);
+        }
+    }
+    // Re-stamp every repo the tracker knows (both passes): the depth is its
+    // last observed set size, stable between the collector's forge reads.
+    for repo in tracker.observed_repos() {
+        let Some(depth) = tracker.depth(repo) else {
+            continue;
+        };
+        let state = view.repos.entry(repo.to_string()).or_default();
+        state.triage_depth = Some(depth);
+        state.triage_flow = tracker.flow(repo, now);
     }
 }
 
@@ -1147,6 +1277,11 @@ mod tests;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
+#[path = "fleet_state_merge_blocked_tests.rs"]
+mod merge_blocked_tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 #[path = "fleet_state/facts_tests.rs"]
 mod facts_tests;
 
@@ -1159,3 +1294,8 @@ mod limits_tests;
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[path = "fleet_state/queue_flow_tests.rs"]
 mod queue_flow_tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[path = "fleet_state/triage_flow_tests.rs"]
+mod triage_flow_tests;

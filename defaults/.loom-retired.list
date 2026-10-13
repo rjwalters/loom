@@ -105,3 +105,8 @@ scripts/tests/test-inbox-mail.sh
 roles/concierge.md
 roles/concierge.json
 commands/loom/concierge.md
+
+# #11664 (P2 of #11659) — the complexity-tier gate, replaced by the points gate
+# in loom-daemon curation-complete (#11663).
+scripts/require-complexity-marker.sh
+scripts/tests/test-require-complexity-marker.sh

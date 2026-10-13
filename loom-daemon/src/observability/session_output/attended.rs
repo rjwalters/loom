@@ -1259,7 +1259,7 @@ fn build_sink(
         let headers_file = plan.headers_files.get(index).and_then(Option::as_deref);
         let Ok(exporter) = super::super::otlp::OtlpExporter::with_headers_file(
             endpoint.clone(),
-            ingest_key.to_string(),
+            Some(ingest_key.to_string()),
             headers_file,
         ) else {
             continue;

@@ -22,6 +22,8 @@ pub struct Completion<'a> {
     pub id: &'a str,
     pub host_id: &'a str,
     pub at: DateTime<Utc>,
+    /// The story points the gate resolved for this curation (#11663).
+    pub points: Option<u32>,
 }
 
 fn known(value: &str) -> Option<String> {
@@ -80,6 +82,7 @@ pub fn record(
         repo: request.repo.to_string(),
         issue: request.issue,
         estimate,
+        points: request.points,
         model: known(request.model),
         runtime: known(request.runtime),
         estimated_at: request.at,
@@ -139,7 +142,7 @@ pub fn backfill(root: &Path, queue: &dyn QueueSink) -> usize {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    const BODY: &str = "<!-- loom:estimate difficulty=2 lines=50 files=2 doctor_risk=0.1 -->";
+    const BODY: &str = "<!-- loom:estimate lines=50 files=2 doctor_risk=0.1 -->";
     #[test]
     fn retry_and_recuration_have_distinct_semantics() {
         let dir = tempfile::tempdir().unwrap();
@@ -152,6 +155,7 @@ mod tests {
             id: &id,
             host_id: "volt",
             at: Utc::now(),
+            points: Some(3),
         };
         let first = record(dir.path(), BODY, &r).unwrap().unwrap();
         r.at += chrono::Duration::seconds(1);
@@ -174,6 +178,7 @@ mod tests {
             id: &id,
             host_id: "h",
             at: Utc::now(),
+            points: Some(3),
         };
         assert_eq!(record(dir.path(), "old issue", &r).unwrap(), None);
         assert!(!directory(dir.path()).exists());

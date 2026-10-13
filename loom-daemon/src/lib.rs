@@ -211,6 +211,7 @@ pub mod forge_disable_auto_merge;
 pub mod forge_egress;
 pub(crate) mod forge_etag_store;
 pub mod forge_events;
+pub mod forge_host;
 pub mod forge_identity;
 pub mod forge_inventory;
 pub mod forge_listing;
@@ -307,6 +308,7 @@ pub mod quarantine_stash_status;
 pub mod ram_headroom;
 pub mod ram_peaks;
 pub mod rate_limit_breaker;
+pub mod rebase_guard;
 pub mod reclaim_pr_warning;
 pub mod reconcile_stack;
 /// Ref-operand validation for forge-derived branch names (#9106). A sibling

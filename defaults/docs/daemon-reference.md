@@ -13910,8 +13910,12 @@ overrides the built-in default (`false` / *(none)* / `$HOME/.loom/observability/
 contents never appear in a log line or error message (only the *path* does),
 and requests authenticate via an `Authorization: Bearer <key>` header.
 `loom-daemon` refuses to export (logs a `WARN` and skips both background
-tasks) when enabled without a resolvable `endpoint` or a readable, non-empty
-`ingestKeyFile` — treated the same as "not configured", not a startup
+tasks) when enabled without a resolvable `endpoint` — or, since #11555, when
+no exporter at all can start: a missing or unreadable `ingestKeyFile`
+degrades only the entries that need the key (every `https` entry, an `otlp`
+entry without `headers_file`) to their own `misconfigured` status, while an
+`otlp` entry carrying a `headers_file` starts with no ingest key at all —
+treated the same as "not configured", not a startup
 failure.
 
 `ingestKeyFile` is deliberately **excluded** from the example above and must

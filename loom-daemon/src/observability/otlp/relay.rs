@@ -86,16 +86,18 @@ pub struct Sink {
 /// `workspace_root` **and** `sinks` is non-empty — the caller passes exactly
 /// the `otlp` exporters whose senders it just started, so the relay can never
 /// add, resolve or start an exporter of its own. Each sink gets a second
-/// [`OtlpExporter`] built from the same endpoint, ingest key and
-/// `headers_file`, on its own HTTP client, so relayed traffic shares nothing
-/// with the daemon's own export but its destination and credentials.
+/// [`OtlpExporter`] built from the same endpoint, `headers_file` and ingest
+/// key — the key `None` when no surviving sink needed one (#11555), in which
+/// case a sink without a `headers_file` cannot have started at all — on its
+/// own HTTP client, so relayed traffic shares nothing with the daemon's own
+/// export but its destination and credentials.
 ///
 /// Must be called from inside the daemon's tokio runtime.
 #[must_use]
 pub fn start(
     workspace_root: &Path,
     host_id: &str,
-    ingest_key: &str,
+    ingest_key: Option<&str>,
     sinks: &[Sink],
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let Some((relay, handles)) = launch(workspace_root, host_id, ingest_key, sinks) else {
@@ -115,7 +117,7 @@ pub fn start(
 fn launch(
     workspace_root: &Path,
     host_id: &str,
-    ingest_key: &str,
+    ingest_key: Option<&str>,
     sinks: &[Sink],
 ) -> Option<(Arc<Relay>, Vec<tokio::task::JoinHandle<()>>)> {
     if sinks.is_empty() || !agent_relay::enabled(workspace_root) {
@@ -125,7 +127,7 @@ fn launch(
     for sink in sinks {
         match OtlpExporter::with_headers_file(
             sink.endpoint.clone(),
-            ingest_key.to_string(),
+            ingest_key.map(str::to_string),
             sink.headers_file.as_deref(),
         ) {
             Ok(exporter) => upstreams.push(exporter),
