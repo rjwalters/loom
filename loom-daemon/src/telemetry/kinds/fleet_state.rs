@@ -241,6 +241,7 @@ pub enum FleetHaltReason {
     DaemonTooOld,
     MaintainOnly,
     DiskReservation,
+    WeightZero,
     /// A hold with no named cause. A reader also decodes any value it does
     /// not know (from a newer emitter) as this.
     #[serde(other)]
@@ -249,7 +250,7 @@ pub enum FleetHaltReason {
 
 impl FleetHaltReason {
     /// Every reason, in wire order.
-    pub const ALL: [FleetHaltReason; 13] = [
+    pub const ALL: [FleetHaltReason; 14] = [
         FleetHaltReason::MainRed,
         FleetHaltReason::GatePending,
         FleetHaltReason::TokenPool,
@@ -262,6 +263,7 @@ impl FleetHaltReason {
         FleetHaltReason::DaemonTooOld,
         FleetHaltReason::MaintainOnly,
         FleetHaltReason::DiskReservation,
+        FleetHaltReason::WeightZero,
         FleetHaltReason::Unknown,
     ];
 
@@ -282,6 +284,7 @@ impl FleetHaltReason {
             Some(HaltCause::DaemonTooOld) => Self::DaemonTooOld,
             Some(HaltCause::MaintainOnly) => Self::MaintainOnly,
             Some(HaltCause::DiskReservation) => Self::DiskReservation,
+            Some(HaltCause::WeightZero) => Self::WeightZero,
             None => Self::Unknown,
         }
     }
@@ -302,6 +305,7 @@ impl FleetHaltReason {
             Self::DaemonTooOld => "daemon_too_old",
             Self::MaintainOnly => "maintain_only",
             Self::DiskReservation => "disk_reservation",
+            Self::WeightZero => "weight_zero",
             Self::Unknown => "unknown",
         }
     }

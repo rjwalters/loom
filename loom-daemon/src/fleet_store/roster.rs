@@ -81,8 +81,8 @@ pub struct Record {
     /// `firewall`.
     pub firewall: bool,
     /// `weight` (#11742): the repo's relative share of draws. Required on a
-    /// `fleet: true` / `maintain` record, so it is `Some` on every record
-    /// [`Roster::desired`] returns; optional elsewhere.
+    /// `fleet: true` record; optional elsewhere, and a `fleet: maintain`
+    /// record without one is registered at 0 (it is never dispatched anyway).
     pub weight: Option<u32>,
 }
 
@@ -120,7 +120,8 @@ impl Roster {
             .map(|r| Desired {
                 name: r.name.clone(),
                 path: self.root.join(&r.dir),
-                // Parse time refused a fleet record without one.
+                // Parse time refused a dispatched record without one; a
+                // maintain-only record without one registers at 0.
                 weight: r.weight.unwrap_or_default(),
                 maintain_only: r.maintain_only,
             })
@@ -260,8 +261,9 @@ fn record(item: &Value) -> Result<Record, String> {
     };
     let firewall = flag("firewall")?;
     // #11742: the draw weight replaces `fleet_priority` (now ignored like any
-    // other unknown key) and is required on every managed record, with no
-    // default: a missing weight is a roster error naming the repo.
+    // other unknown key) and is required on every dispatched record, with no
+    // default: a missing weight is a roster error naming the repo. A
+    // `fleet: maintain` record is never dispatched, so it needs none.
     let weight = match m.get("weight") {
         None | Some(Value::Null) => None,
         Some(v) => Some(
@@ -272,7 +274,7 @@ fn record(item: &Value) -> Result<Record, String> {
                 })?,
         ),
     };
-    if fleet && !firewall && weight.is_none() {
+    if fleet && !maintain_only && !firewall && weight.is_none() {
         return Err(format!(
             "`{name}`: a `fleet` record needs a `weight` (its relative share of repo draws, #11742)"
         ));

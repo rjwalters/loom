@@ -451,7 +451,7 @@ pub fn summarize_roster(
 
 /// Apply one planned change to the machine-level workspace registry at
 /// `registry_path` — the same registry `loom-daemon workspace add/remove/
-/// set-priority` edits, through the same [`crate::workspace_registry`] methods
+/// set-weight` edits, through the same [`crate::workspace_registry`] methods
 /// those verbs use. Loads and saves per change so a mid-plan failure leaves the
 /// earlier changes durably applied, exactly as the CLI's per-verb loop does.
 pub fn apply_change(registry_path: &Path, change: &Change) -> Result<()> {
@@ -1268,7 +1268,7 @@ pub async fn start(
     };
     // A repo that delegates daemon administration elsewhere must not have its
     // workspace registry rewritten from here either — the same refusal
-    // `loom-daemon workspace add/remove/set-priority` makes (#5345), applied to
+    // `loom-daemon workspace add/remove/set-weight` makes (#5345), applied to
     // the unattended path.
     let auto_apply = match crate::config_resolver::daemon_delegated_to(workspace) {
         Some(delegate) if config.auto_apply => {

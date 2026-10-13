@@ -159,3 +159,21 @@ fn very_important_never_goes_over_the_cap() {
     assert_eq!((report.dispatched_overflow, report.deferred_capacity), (0, 3));
     assert!(dispatcher.dispatched_overflow.is_empty());
 }
+
+/// #11742: a weight-0 workspace is never drawn; its ready issues are held as
+/// `workspace_halted` with the `weight_zero` cause (never left unresolved),
+/// and the other workspace still dispatches.
+#[test]
+fn a_weight_zero_workspace_is_held_not_drawn() {
+    let mut multi = fleet();
+    let report = tick_multi(&mut multi, &[0, 6, 1], 10, &[false, false, false]);
+    assert!(dispatch_sequence(&report).iter().all(|(ws, _)| *ws != 0));
+    assert!(multi[0].1.dispatched.is_empty());
+    let rows = ready_queue::finish(&report.queue, &[]);
+    let held: Vec<_> = rows.iter().filter(|r| r.issue <= 3).collect();
+    assert_eq!(held.len(), 3);
+    for r in held {
+        assert_eq!(r.disposition, crate::types::QueueDisposition::WorkspaceHalted);
+        assert_eq!(r.detail.as_deref(), Some("weight_zero"));
+    }
+}

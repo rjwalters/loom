@@ -363,3 +363,14 @@ fn a_maintain_only_add_registers_it_maintain_only_in_one_change() {
         .get("maintain_only")
         .is_none());
 }
+
+/// #11742: a `fleet: maintain` record needs no weight (it is never
+/// dispatched); it registers at weight 0.
+#[test]
+fn a_maintain_record_needs_no_weight() {
+    let text = ROSTER.replacen(PRODUCT, "dir: product-src\n    fleet: maintain\n", 1);
+    let r = parse(&text, &home()).unwrap();
+    let d = r.desired();
+    assert!(d[1].maintain_only);
+    assert_eq!(d[1].weight, 0);
+}

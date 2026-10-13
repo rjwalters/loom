@@ -227,7 +227,10 @@ pub struct ReadyQueueRow {
     pub repo: String,
     /// The issue number.
     pub issue: u32,
-    /// The owning workspace's priority tier (lower dispatches first).
+    /// The owning workspace's draw weight (#11742; higher is drawn more).
+    /// Absent from an older daemon's rows (which sent `workspace_priority`,
+    /// a tier in the opposite direction, deliberately not aliased): 0.
+    #[serde(default)]
     pub workspace_weight: u32,
     /// Deprecated (#9244): always `false`. Its label was deleted in #11105;
     /// the field stays on the wire only for compatibility.

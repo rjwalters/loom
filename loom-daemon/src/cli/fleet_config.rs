@@ -84,7 +84,7 @@ enum FleetConfigCommand {
         /// Exit 1 when the registry does not match the store.
         #[arg(long, conflicts_with = "apply")]
         check: bool,
-        /// Apply the changes through `workspace add/remove/set-priority`, for
+        /// Apply the changes through `workspace add/remove/set-weight`, for
         /// repos already cloned under `root` only (never clones).
         #[arg(long)]
         apply: bool,
