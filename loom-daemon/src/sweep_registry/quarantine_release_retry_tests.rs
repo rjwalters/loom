@@ -186,6 +186,8 @@ fn quarantine_release_never_requeues_a_claimed_or_closed_issue() {
         assert!(calls.contains("issue edit 2980 --remove-label loom:blocked"), "{calls}");
         assert!(!calls.contains("--add-label loom:issue"), "{state}: {calls}");
     }
+}
+
 /// #11743: a frozen item's quarantine release writes nothing, not even the
 /// removal of the quarantine's own `loom:blocked`; it still counts as done.
 #[test]

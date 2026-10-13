@@ -836,7 +836,9 @@ fn a_claimed_issue_does_not_get_loom_issue_back_on_release() {
     let mut w = World::new();
     w.parked(10, false, &[1], &["loom:building"]);
     w.state(1, "CLOSED", false);
-    w.extra.events.insert(10, vec!["loom:issue".into(), "loom:blocked".into()]);
+    w.extra
+        .events
+        .insert(10, vec!["loom:issue".into(), "loom:blocked".into()]);
     let r = w.run();
     assert_eq!(r.released.len(), 1, "{}", r.summary());
     assert_eq!(r.released[0].restored, None);
