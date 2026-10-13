@@ -22,6 +22,7 @@ fn tick(result: RoleTickResult) -> RoleTickTelemetry {
         gated_pool: None,
         preference_tier: None,
         preference_tap: None,
+        role_draw: None,
     }
 }
 
@@ -811,6 +812,8 @@ fn a_preference_resolved_tick_records_the_chosen_tier_and_tap() {
                          tier=2 tap=opencode:zai-metered source=preference"
                         .to_string(),
                     model_profile: Some("zai-metered".to_string()),
+                    model: None,
+                    draw: None,
                 },
             )),
         ),

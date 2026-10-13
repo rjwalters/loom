@@ -111,9 +111,16 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
                 // interactive CLI default (`fable` on the host that filed the issue,
                 // where every role child burned the most constrained quota tier and then
                 // died on "You've reached your Fable 5 limit").
-                let (model, model_source) = match &self.model {
-                    Some(m) => (m.clone(), "override".to_string()),
-                    None => resolve_role_runner_model(&self.workspace_root, role),
+                // #11726: a role draw whose pick names a model (`claude/opus`)
+                // pins it, below only the runner's own test override.
+                let drawn_model = admission
+                    .as_ref()
+                    .and_then(|a| a.preference.as_ref())
+                    .and_then(|p| p.model.clone());
+                let (model, model_source) = match (&self.model, drawn_model) {
+                    (Some(m), _) => (m.clone(), "override".to_string()),
+                    (None, Some(drawn)) => (drawn, "role-draw".to_string()),
+                    (None, None) => resolve_role_runner_model(&self.workspace_root, role),
                 };
                 // Issue #7894: an UNPINNED model that conflicts with the admitted
                 // runtime degrades to the runtime CLI's own default rather than being

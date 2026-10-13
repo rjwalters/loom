@@ -158,6 +158,7 @@ pub(crate) fn check(
         source,
         resolution,
         backstop,
+        draw,
     }) = crate::runtime_preference::resolve_runtime_contained(
         root,
         role,
@@ -173,12 +174,21 @@ pub(crate) fn check(
         gate(admission)?;
         return Ok(crate::runtime_preference::DispatchAdmission::none());
     };
-    let marker = resolution.marker_line();
-    let exhausted = resolution.exhausted_diagnostic(role);
+    // #11726: a role draw's record rides on the marker, the diagnostic and
+    // the stamp, so the decision (seed, table, rolls, pick) is replayable.
+    let mut marker = resolution.marker_line();
+    if let Some(draw) = &draw {
+        marker.push_str(&format!(" {}", draw.marker_fragment()));
+    }
+    let exhausted =
+        crate::runtime_preference::exhausted_with_draw(&resolution, draw.as_deref(), role);
     // #8599: the stamp the chosen admission carries to the launch surfaces —
     // computed before `resolution.chosen` is moved out below. `None` in the
     // fail-closed case, which has no chosen tier to report.
-    let stamp = resolution.stamp(source.as_str());
+    let stamp = crate::runtime_preference::role_draw_stamp(
+        resolution.stamp(source.as_str()),
+        draw.as_deref(),
+    );
     let Some(chosen) = resolution.chosen else {
         // Every listed tap was skipped. Fail closed, reporting the
         // statically-admitted runtime's own gate outcome when it has one, so

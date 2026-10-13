@@ -10597,6 +10597,16 @@ Actions cron table below lists, plus `doctor` (added by #5272, see below). The
 a `/loom:sweep`) already run host-side on the rotated pool via
 `sweep_registry` and are unaffected by this loop.
 
+**Which runtime a tick runs on (#11726).** With a `runtimes.roleDraw.<role>`
+table, each tick draws its runtime (and optionally its model) by a seeded,
+weighted draw from the table for its **attempt**: `1 +` the role's consecutive
+failed or blocked launched ticks in that workspace, reset by a success. A
+blocked attempt 1 (for example a tick whose every tool call a guard hook denied)
+therefore draws from the attempt-2 table. Without a table, `rolePreference`
+decides as before. `loom-daemon roles draw --explain` shows each stage's
+effective per-attempt table on the host and the config tier that set it. See
+[role-draw.md](role-draw.md).
+
 **Doctor is dual-mode (#5272).** Every other role in `DEFAULT_ROLES` is
 *either* per-sweep (Builder) *or* standalone (this loop) — never both. Doctor
 is the exception: `sweep_registry` still dispatches it per-sweep, inside a
