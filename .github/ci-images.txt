@@ -1,0 +1,19 @@
+# Third-party images CI pulls, each pinned by digest (#11755).
+#
+# ONE list, read by both sides, so a bump cannot leave CI pulling an image that
+# was never copied:
+# - .github/workflows/ci-images.yml copies each entry BY DIGEST to
+#   ghcr.io/rjwalters/loom-ci-images/<repo>:<tag> (skopeo --preserve-digests);
+# - loom-daemon/tests/common/hub_image.rs pulls each entry from GHCR first,
+#   then mirror.gcr.io, then Docker Hub.
+# loom-daemon/tests/hub_image_refs.rs fails if a Docker Hub image a test or
+# ci.yml uses is missing here, or if an entry is not digest-pinned.
+#
+# Format: one Docker Hub reference per line, `<repo>:<tag>@sha256:<digest>`.
+# The digest is the multi-arch index digest (`docker buildx imagetools inspect`).
+# Bumping an entry re-runs the copy workflow on its push to main.
+
+clickhouse/clickhouse-server:25.12.5@sha256:cacf32d6884291dc2ff5e0156a97f46fc53ff7c929a7906d114e268a929dfd3a
+otel/opentelemetry-collector-contrib:0.139.0@sha256:faf125d656fa47cea568b2f3b4494efd2525083bc75c1e96038bc23f05cd68fd
+otel/opentelemetry-collector-contrib:0.161.0@sha256:fd328de2552466ad78385e1b1289c3f2402b1c45f265b252aab1955b42845ac1
+ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
