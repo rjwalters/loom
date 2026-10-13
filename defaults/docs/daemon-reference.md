@@ -5765,6 +5765,23 @@ row of the "retired" input table above. See also #5269/PR #5283's per-repo
 ranking-staleness surfacing on `loom-daemon health` — a separate, `health`-side
 mechanism this `status`-side headline must not contradict.
 
+**Native classifier subcommand (#11208).** The classifier these paragraphs
+describe — the category engine, the per-provider tables and the
+`classification_is_transient` deny-list — ships in the signed binary as
+`loom-daemon classify-error`: error text on stdin (or `--stdout-tail` /
+`--stderr-tail` files), `--exit-code`, optional `--provider` (explicit arg >
+`$LOOM_RUNTIME` > `claude`, same precedence as the shell), one category line
+out; `--transient <CATEGORY>` answers the deny-list in its exit code (0
+retryable, 1 terminal; 2 is a usage error with empty stdout). It exists so
+consumers stop vendoring `classify-error.sh` (miniset's E2B shim pins the
+daemon instead). The shell library remains the sourced entry point for
+in-repo callers: its public functions delegate to the subcommand when a
+daemon binary resolves and fall back to the in-file tables — byte-identical —
+when none does. The two renderings are pinned equal by
+`defaults/scripts/tests/test-classify-error.sh` (parity on every row of the
+shared `vectors.tsv` fixture) and by the Rust suite that reads the same
+fixture.
+
 **Session-limit fault handling (#3947).** Stacking can occasionally trip a
 **concurrent-session-limit** fault on a token (the account is healthy but cannot
 start another *simultaneous* session right now). This is a **capacity** signal,
