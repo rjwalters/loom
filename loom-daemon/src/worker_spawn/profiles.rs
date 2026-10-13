@@ -411,19 +411,21 @@ pub fn resolve_shape(
             ));
         }
     }
-    if let Some(proxy) = &profile.credential_proxy {
+    let mut credential_proxy = profile.credential_proxy.clone();
+    if let Some(proxy) = &mut credential_proxy {
         // Fail at selection, not at dispatch: a malformed upstream is a
         // misconfiguration that must never reach a launch that then decides
         // what to do about it.
         proxy.validate()?;
         // The config-side base URL override writes OpenCode's provider
         // configuration; no other harness has a config contract this module
-        // writes, so declaring it anywhere else is a misconfiguration (#11300).
-        if proxy.base_url_config.is_some() && runtime != "opencode" {
-            return Err(LaunchError::config(
-                "model profile credentialProxy.baseUrlConfig is only supported by the opencode \
-                 harness, whose provider base URL is provisioned through OPENCODE_CONFIG_CONTENT",
-            ));
+        // writes. INERT on any other runtime rather than refused: a profile
+        // like the bundled `zai-flash` binds BOTH `opencode` (which needs it)
+        // and `pi` (which must keep launching with the proxy flag off,
+        // #11714). When the flag is on and the armed runtime is left with no
+        // usable redirection, `egress_proxy::prepare_scoped` fails closed.
+        if runtime != "opencode" {
+            proxy.base_url_config = None;
         }
         // Both counts must be 1, not just `pairs`: an array-form
         // `credentialEnv` with a `credentialTargets` map that only covers
@@ -469,7 +471,7 @@ pub fn resolve_shape(
         provider_options,
         provider_definition,
         credential_pool: profile.credential_pool.clone(),
-        credential_proxy: profile.credential_proxy.clone(),
+        credential_proxy,
     };
     Ok((selection, mapping.required))
 }
@@ -659,6 +661,32 @@ mod tests {
         );
         let error = resolve("test-runtime", "gw", &profile).unwrap_err();
         assert!(error.message.contains("LOOM_TEST_9473_NEVER_SET"), "{}", error.message);
+    }
+
+    /// #11714: the bundled `zai-flash` profile binds BOTH `pi` and `opencode`,
+    /// and its `credentialProxy` block declares `baseUrlConfig` — an OpenCode
+    /// config contract. Selection must not refuse the `pi` binding for that:
+    /// an ordinary launch runs with the proxy flag off, so a hard refusal here
+    /// broke every default `pi` launch. `baseUrlConfig` is simply dropped from
+    /// a non-opencode selection (inert); the opencode selection keeps it.
+    #[test]
+    fn the_bundled_zai_flash_profile_resolves_for_both_runtimes_it_binds() {
+        let profile = bundled()
+            .get("zai-flash")
+            .cloned()
+            .expect("bundled zai-flash");
+        for runtime in ["pi", "opencode"] {
+            let (selection, _) = resolve_shape(runtime, "zai-flash", &profile)
+                .expect("every bound runtime resolves");
+            let proxy = selection
+                .credential_proxy
+                .expect("the proxy block survives selection");
+            assert_eq!(
+                proxy.base_url_config.as_deref(),
+                (runtime == "opencode").then_some("baseURL"),
+                "{runtime}: baseUrlConfig must be kept only for opencode"
+            );
+        }
     }
 
     /// Regression for the Judge's blocking finding on #8701: an array-form

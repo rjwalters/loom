@@ -1957,14 +1957,21 @@ stays env-passthrough even with the flag on.
   `"baseUrlConfig": "baseURL"`). The launcher patches that one option into
   the `OPENCODE_CONFIG_CONTENT` it provisions for the launch. OpenCode is
   the only harness with a config contract this writes, so the field is
-  refused on any other runtime, and on a **contained** launch — that config
-  is provisioned inside the container, where the host-side launcher cannot
-  patch it; a contained OpenCode launch is re-pointed with `baseUrlEnv`.
+  **inert on any other runtime** — dropped from the selection at resolution,
+  so a profile may declare it for its OpenCode binding while its other
+  bindings keep launching. It is also refused on an armed **contained**
+  launch: that config is provisioned inside the container, where the
+  host-side launcher cannot patch it, so a contained OpenCode launch is
+  re-pointed with `baseUrlEnv`.
 
 The bundled `zai-flash` profile proxies Z.ai's coding-plan endpoint through
 the OpenCode harness this way (`upstream: https://api.z.ai/api/coding/paas/v4`,
 `authorization-bearer`, `baseUrlConfig: baseURL`), default off until an
-operator turns `credentialProxy` on (issue #11300).
+operator turns `credentialProxy` on (issue #11300). That profile also binds
+`pi`, which is intentionally **unproxied** in this slice: its block declares
+no `baseUrlEnv`, so with the flag on a `pi` launch of it fails closed —
+arming a proxy the harness would not follow would send the placeholder to
+the real upstream — and with the flag off it launches unchanged.
 
 **Uncontained native launches.** The same substitution is available without
 containment, on the same switch and the same per-profile opt-in: a native

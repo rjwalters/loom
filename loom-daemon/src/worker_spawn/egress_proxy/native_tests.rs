@@ -117,6 +117,50 @@ fn prepare_refuses_a_config_only_override_on_a_contained_launch() {
     );
 }
 
+/// #11714: a profile may DECLARE config-side redirection for its opencode
+/// binding while it also binds `pi`. With the flag OFF, a contained launch of
+/// that profile is plain env-passthrough — the declaration alone must not
+/// refuse it.
+#[test]
+#[serial_test::serial]
+fn prepare_is_a_no_op_when_the_flag_is_off_even_with_a_config_only_proxy_block() {
+    let _g = env_lock();
+    let tmp = tempfile::tempdir().unwrap();
+    std::env::remove_var("LOOM_NATIVE_CREDENTIAL_PROXY");
+    let prepared =
+        prepare(tmp.path(), &selection_with(Some(zai_flash_proxy())), &json!({}), "opencode")
+            .unwrap();
+    assert!(prepared.is_none());
+}
+
+/// #11714: with the proxy flag ON, a `pi` selection of the bundled
+/// config-only profile has no usable redirection left — `baseUrlConfig` is
+/// inert off opencode and the block declares no `baseUrlEnv` — so arming it
+/// would swap in the placeholder while the traffic still went to the real
+/// upstream. `pi` is intentionally unproxied in this slice: refuse instead.
+#[test]
+#[serial_test::serial]
+fn prepare_native_fails_closed_for_a_pi_selection_with_no_usable_redirection() {
+    let _g = env_lock();
+    let tmp = tempfile::tempdir().unwrap();
+    std::env::remove_var("LOOM_NATIVE_CREDENTIAL_PROXY");
+    let on = json!({"runtimes":{"containment":{"credentialProxy":true}}});
+    let profile = crate::worker_spawn::profiles::bundled()
+        .get("zai-flash")
+        .cloned()
+        .expect("bundled zai-flash");
+    // Selection, not `resolve`: the flag-on refusal must not need a
+    // credential env var to be set before it can name the real problem.
+    let (selection, _) =
+        crate::worker_spawn::profiles::resolve_shape("pi", "zai-flash", &profile).unwrap();
+    let error = prepare_native(tmp.path(), &selection, &on, "pi").unwrap_err();
+    assert!(
+        error.message.contains("placeholder"),
+        "the refusal must name the leak it prevents: {}",
+        error.message
+    );
+}
+
 fn config_content(command: &std::process::Command) -> Value {
     let raw = command
         .get_envs()

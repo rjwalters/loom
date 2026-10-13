@@ -144,8 +144,10 @@ pub struct ProfileProxy {
     /// harness: its `provider.<id>.options.baseURL` rides the launch's
     /// provisioned config (`OPENCODE_CONFIG_CONTENT`), so the launcher patches
     /// that one option to the proxy URL and leaves the environment alone.
-    /// Refused at selection on any runtime but `opencode`, which is the only
-    /// harness whose config contract this module writes.
+    /// Inert on any runtime but `opencode` — dropped from the selection at
+    /// resolution, so a profile may declare it for its opencode binding while
+    /// other bindings keep launching (#11714); arming a runtime left with no
+    /// usable redirection fails closed in [`prepare_scoped`].
     #[serde(default)]
     pub base_url_config: Option<String>,
 }
@@ -362,21 +364,6 @@ pub fn prepare(
     config: &Value,
     runtime: &str,
 ) -> Result<Option<Prepared>, LaunchError> {
-    // The config-side base URL override is patched on the host, into the
-    // command the launcher builds itself. A contained launch provisions its
-    // config INSIDE the container, where this launcher never runs, so a block
-    // that declared only `baseUrlConfig` would leave the placeholder pointed
-    // at the real upstream — refuse instead of half-proxying (#11300 slice 3).
-    if selection
-        .credential_proxy
-        .as_ref()
-        .is_some_and(|proxy| proxy.base_url_config.is_some())
-    {
-        return Err(LaunchError::config(
-            "model profile credentialProxy.baseUrlConfig is only supported on uncontained \
-             native launches; a contained launch is re-pointed with baseUrlEnv instead",
-        ));
-    }
     prepare_scoped(root, selection, config, runtime, Scope::Contained)
         .map(|prepared| prepared.map(|(prepared, _)| prepared))
 }
@@ -394,8 +381,10 @@ pub fn prepare(
 /// here would run the pool ladder twice and could land on a different account.
 ///
 /// Refused (fail closed) on a non-native runtime that declares a
-/// `credentialProxy` block, and on `base_url_config` for any runtime but
-/// `opencode`.
+/// `credentialProxy` block. Selection has already dropped an inert
+/// `base_url_config` off a non-opencode runtime (#11714), so the check below
+/// only fires for a hand-built selection — defense in depth alongside
+/// `prepare_scoped`'s armed-path redirect check.
 pub fn prepare_native(
     root: &std::path::Path,
     selection: &Selection,
@@ -449,6 +438,33 @@ fn prepare_scoped(
         return Ok(None);
     };
     let upstream = declared.validate()?;
+    // Where the armed proxy may re-point the harness. The container provisions
+    // its config INSIDE, where this launcher never runs: a config-side base
+    // URL override is patched on the host, into a command the launcher builds
+    // itself, so it is uncontained-native only (#11300 slice 3). Gated on
+    // `enabled` here so a flag-off launch stays plain env-passthrough — a
+    // profile may DECLARE config-side redirection for its opencode binding
+    // while other bindings launch unproxied (#11714).
+    if scope == Scope::Contained && declared.base_url_config.is_some() {
+        return Err(LaunchError::config(
+            "model profile credentialProxy.baseUrlConfig is only supported on uncontained \
+             native launches; a contained launch is re-pointed with baseUrlEnv instead",
+        ));
+    }
+    // A proxy the armed harness would not follow substitutes the placeholder
+    // while the traffic still goes to the real upstream: fail closed rather
+    // than half-proxy. OpenCode is re-pointed through its provisioned config;
+    // every other harness only through baseUrlEnv (#11714).
+    let redirected = !declared.base_url_env.is_empty()
+        || (scope == Scope::NativeLoopback && declared.base_url_config.is_some());
+    if !redirected {
+        return Err(LaunchError::config(format!(
+            "credentialProxy is enabled for this profile but nothing re-points the {runtime} \
+             harness at the proxy, so the credential placeholder would still be sent to the \
+             real upstream; declare credentialProxy.baseUrlEnv for this runtime or leave the \
+             credentialProxy flag off"
+        )));
+    }
     // One account file is one assignment, and one placeholder stands for one
     // credential. A multi-variable provider (Bedrock, Vertex) has no single
     // value to substitute, so refuse rather than proxy one variable and leak
