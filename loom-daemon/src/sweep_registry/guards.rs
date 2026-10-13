@@ -398,11 +398,24 @@ impl SweepRegistry {
     /// confirmed collision — this detection/counting/logging behavior is
     /// reused verbatim from #4085, not replaced, so the existing collision
     /// tests below continue to pass unmodified.
+    #[cfg(test)] // production dispatch drives the two halves around a lock release (#9573)
     pub(crate) fn detect_and_record_collision(&mut self, issue: u32) -> Option<CollisionClass> {
         if !self.detect_collisions {
             return None;
         }
         let class = self.classify_preflip_labels(issue);
+        Some(self.record_collision_class(issue, class))
+    }
+
+    /// The counting/logging half of [`Self::detect_and_record_collision`],
+    /// split out (Issue #9573) so the dispatch path can run the forge probe
+    /// (`classify_preflip_labels`) with the registry lock released and take
+    /// the lock only for this in-memory bookkeeping.
+    pub(crate) fn record_collision_class(
+        &mut self,
+        issue: u32,
+        class: CollisionClass,
+    ) -> CollisionClass {
         match &class {
             CollisionClass::Collision { labels } => {
                 self.collision_count += 1;
@@ -453,7 +466,7 @@ impl SweepRegistry {
             }
             CollisionClass::Clean => {}
         }
-        Some(class)
+        class
     }
 
     // ------------------------------------------------------------------------
