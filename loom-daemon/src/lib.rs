@@ -437,6 +437,7 @@ pub mod verdict_stale_notice;
 pub mod watch_registry;
 pub mod watchdog;
 pub mod watchdog_provisioning_guard;
+pub mod weighted_draw;
 pub mod work_finder;
 pub mod worker_spawn;
 pub mod workspace_hold;

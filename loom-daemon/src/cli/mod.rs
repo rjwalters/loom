@@ -154,6 +154,7 @@ mod resync_payload_cmd;
 mod resync_pin_cmd;
 pub(crate) mod retry_classify;
 pub(crate) mod role_tool_policy;
+pub(crate) mod roles_draw_cmd;
 pub(crate) mod roll_pause_cli;
 mod runtime_launch_cmd;
 pub(crate) mod script_ports;

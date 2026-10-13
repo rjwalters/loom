@@ -1201,6 +1201,12 @@ pub struct RoleTickOutcomeRecord {
     /// [`Self::preference_tier`] is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preference_tap: Option<String>,
+    /// The weighted role draw that chose this tick's tap (#11726): role,
+    /// attempt, the table and the tier that set it, the seed and its inputs,
+    /// every roll, and the pick. Absent when no `runtimes.roleDraw` table
+    /// decided the launch — additive, no `schema_version` bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_draw: Option<crate::runtime_preference::role_draw::RoleDrawRecord>,
     /// Runtime adapter this tick actually launched on (Issue #8507), read off
     /// the tick's own `# LOOM_LAUNCH` record — same source and the same
     /// "absent, never a fabricated `claude` default" contract as
