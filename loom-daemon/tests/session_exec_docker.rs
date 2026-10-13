@@ -3,6 +3,9 @@
 //!   --test session_exec_docker -- --ignored --nocapture
 //! On macOS set LOOM_TEST_LINUX_BIN to a Linux build of the same source.
 
+#[path = "common/hub_image.rs"]
+mod hub_image;
+
 use std::fs;
 use std::io::Write;
 use std::os::unix::{fs::PermissionsExt, process::CommandExt};
@@ -87,8 +90,9 @@ normal) printf 'worker stdout\n'; printf 'session id: 11111111-1111-1111-1111-11
 esac
 "##).unwrap();
         fs::set_permissions(&worker, fs::Permissions::from_mode(0o755)).unwrap();
-        let image =
-            std::env::var("LOOM_TEST_SESSION_IMAGE").unwrap_or_else(|_| "ubuntu:24.04".into());
+        let image = hub_image::resolve(
+            &std::env::var("LOOM_TEST_SESSION_IMAGE").unwrap_or_else(|_| "ubuntu:24.04".into()),
+        );
         let mount = format!("{}:{}:ro", root_path.display(), root_path.display());
         let binary_mount = format!("{}:/usr/local/bin/loom-daemon:ro", linux_bin.display());
         let path = format!("PATH={}/bin:/usr/local/bin:/usr/bin:/bin", root_path.display());
