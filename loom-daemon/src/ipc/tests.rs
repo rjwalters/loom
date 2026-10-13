@@ -3763,6 +3763,23 @@ fn test_build_daemon_status_capacity_bound_tracks_occupancy() {
     let prev_shared = std::env::var("LOOM_SHARED_TOKENS_DIR").ok();
     std::env::set_var("LOOM_SHARED_TOKENS_DIR", "");
 
+    // #11679: pin the live RAM/disk probes so the cap does not depend on host
+    // load. The guard restores everything on drop, including on panic.
+    struct PinGuard;
+    impl Drop for PinGuard {
+        fn drop(&mut self) {
+            crate::ram_headroom::set_available_ram_gb_override(None);
+            crate::disk_headroom::set_free_gb_override(None);
+            std::env::remove_var("LOOM_PER_WORKTREE_RAM_GB");
+            std::env::remove_var("LOOM_PER_WORKTREE_GB");
+        }
+    }
+    let _pin = PinGuard;
+    crate::ram_headroom::set_available_ram_gb_override(Some(1024));
+    crate::disk_headroom::set_free_gb_override(Some(1024));
+    std::env::set_var("LOOM_PER_WORKTREE_RAM_GB", "1");
+    std::env::set_var("LOOM_PER_WORKTREE_GB", "1");
+
     // Provision a two-token pool so the dynamic cap is > 0 (a real ceiling).
     let tokens_dir = root.join(".loom").join("tokens");
     std::fs::create_dir_all(&tokens_dir).unwrap();

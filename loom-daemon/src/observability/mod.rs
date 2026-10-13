@@ -137,6 +137,7 @@ pub mod session_output;
 pub mod session_summary;
 pub mod shutdown;
 pub mod tracing;
+pub mod work_started;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

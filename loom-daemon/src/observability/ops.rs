@@ -219,6 +219,13 @@ pub fn emit_record(record: TelemetryRecord) {
     }
 }
 
+/// Whether [`emit_record`] would deliver a record from this thread (the same
+/// test as [`spans_exported`]), so a producer can skip building one (#11641).
+#[must_use]
+pub fn records_exported() -> bool {
+    spans_exported()
+}
+
 /// Whether [`emit_span`] would deliver a span from this thread: a global sink
 /// is registered, or (test builds) a [`capture::capture`] is active. Lets a
 /// seam avoid handing a child a parent span that will never be exported.

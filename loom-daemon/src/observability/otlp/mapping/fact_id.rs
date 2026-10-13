@@ -74,6 +74,22 @@ pub(super) fn of(record: &TelemetryRecord) -> Option<String> {
             r.forge_entered_at()
                 .map(|entered| with(&["entry", &instant(entered)]))
         }
+        // #11641: one agent start. Only the emitting host emits it, so the id
+        // dedupes replays: `(repo, issue, pr_number, stage, role, sweep_id,
+        // stage_attempt, started_at)`.
+        TelemetryRecord::WorkStarted(r) => Some(derive(
+            "stage.work_started",
+            &[
+                &r.repo,
+                &r.issue.map(|n| n.to_string()).unwrap_or_default(),
+                &r.pr_number.map(|n| n.to_string()).unwrap_or_default(),
+                r.stage.as_str(),
+                &r.role,
+                &r.sweep_id,
+                &r.stage_attempt.to_string(),
+                &instant(r.started_at),
+            ],
+        )),
         _ => None,
     }
 }
