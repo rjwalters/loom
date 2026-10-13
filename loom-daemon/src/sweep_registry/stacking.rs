@@ -104,19 +104,6 @@ impl SweepRegistry {
         self.issue_has_label_via_graphql(issue, "loom:blocked")
     }
 
-    /// Best-effort check of whether `issue` currently carries the
-    /// `loom:operator-only` label on the forge (Issue #4887). Used by
-    /// [`restore_label_to_ready`](super::guards::SweepRegistry::restore_label_to_ready)
-    /// alongside [`Self::issue_has_blocked_label`] so the crash-path claim
-    /// restore never re-adds `loom:issue` on top of either park label.
-    ///
-    /// Returns `false` on any error, when label flips are skipped (test
-    /// fixtures), or when `gh` is unavailable — the same fail-open default as
-    /// [`Self::issue_has_blocked_label`].
-    pub(crate) fn issue_has_operator_only_label(&self, issue: u32) -> bool {
-        self.issue_has_label_via_graphql(issue, "loom:operator-only")
-    }
-
     /// The [`crate::hard_exclusion::HARD_EXCLUSION_LABELS`] entry `issue`
     /// currently carries on the forge, if any is confirmed present — else
     /// whether absence was confirmed or the probe was inconclusive (Issue
@@ -143,8 +130,7 @@ impl SweepRegistry {
 
     /// Best-effort check of whether `issue` currently carries `label` on the
     /// forge, collapsing [`LabelProbe`]'s tri-state down to a bare bool for
-    /// [`Self::issue_has_blocked_label`] / [`Self::issue_has_operator_only_label`]
-    /// (#4887), which only ever need "is it present" and already fail closed
+    /// [`Self::issue_has_blocked_label`], which only ever needs "is it present" and already fail closed
     /// on anything else.
     ///
     /// Returns `false` on any error, when label flips are skipped (test
@@ -158,8 +144,7 @@ impl SweepRegistry {
 
     /// Shared GraphQL-backed (`gh issue view --json labels`) probe for a single
     /// label's presence on `issue`, factored out so
-    /// [`Self::issue_has_blocked_label`], [`Self::issue_has_operator_only_label`]
-    /// (#4887), and [`Self::issue_hard_exclusion_label`] (#7528/#7553) share
+    /// [`Self::issue_has_blocked_label`] and [`Self::issue_hard_exclusion_label`] (#7528/#7553) share
     /// the command-building/timeout plumbing.
     ///
     /// Returns [`LabelProbe::Unknown`] — never a silent `Absent` — on a `gh`
@@ -347,8 +332,7 @@ mod tests {
     }
 
     /// Issue #5431: `issue_has_label_via_graphql` (backing both
-    /// `issue_has_blocked_label` and `issue_has_operator_only_label`, which
-    /// `guards::restore_label_to_ready` depends on) must thread a registered
+    /// `issue_has_blocked_label`, which the stacked-child reap depends on) must thread a registered
     /// cross-owner workspace's installation-token `GH_CONFIG_DIR` through to
     /// the real `gh issue view` child.
     #[test]

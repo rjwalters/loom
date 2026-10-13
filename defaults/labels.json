@@ -859,7 +859,7 @@
       "applied_by": "operator UI (decision bounce)",
       "removed_by": "Curator",
       "park": false,
-      "skip": false,
+      "skip": true,
       "hold": false,
       "operator_gate": false,
       "blocked_colabel": false,

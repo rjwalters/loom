@@ -1916,6 +1916,10 @@ pub(crate) fn park_guard_registry(
              printf '%s\\n' '{state}'\n\
              exit 0\n\
              fi\n\
+             if [[ \"$1\" == \"api\" && \"$*\" == *\"{{state: .state\"* ]]; then\n\
+             printf '%s\\n' '{signals}'\n\
+             exit {rest_exit}\n\
+             fi\n\
              if [[ \"$1\" == \"api\" && \"$2\" == repos/* && \"$2\" != */issues/{linked_pr} ]]; then\n\
              printf '%s\\n' {labels}\n\
              exit {rest_exit}\n\
@@ -1930,6 +1934,13 @@ pub(crate) fn park_guard_registry(
         gql = fake_gh_graphql_arm(graphql_pr, 0),
         state = state_probe_json("open", false),
         labels = rest_labels,
+        // #11480: the claim release reads labels through the issue-signals
+        // projection (`fetch_issue_signals`), not a one-label probe.
+        signals = serde_json::json!({
+            "state": "open",
+            "closed_at": null,
+            "labels": rest_labels.split_whitespace().collect::<Vec<_>>(),
+        }),
         rest_exit = rest_exit,
         // `rest_labels` model the ISSUE's labels; the linked open PR reports
         // none, so the reaper's PR-side park check (#8689) does not mask the

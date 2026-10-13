@@ -422,6 +422,8 @@ fn daemon_write_paths_are_scoped() {
             Via(PASS, "verdict pass; shell guard vets its own call"),
         ),
         ("quarantine_reconciliation.rs", Gated),
+        // #11480: the vetoed reclaim; reached only from the reclaim pass.
+        ("reclaim_pr_warning.rs", Via(PASS, "reclaim pass (#11480 claim-only release)")),
         ("fleet_sync/workspace_resync/host.rs", Gated),
         (
             "fleet_store/resync_claim.rs",

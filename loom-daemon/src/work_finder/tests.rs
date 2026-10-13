@@ -1858,13 +1858,14 @@ fn test_park_labels_are_the_non_building_subset_of_skip_labels() {
     }
     let mut expected = [&[BUILDING_LABEL], PARK_LABELS.as_slice()].concat();
     expected.extend([
+        "loom:decision-malformed", // #11480
         OPERATOR_HOLD_LABEL,
         labels::EPIC_LABEL,
         labels::OPERATOR_DECISION_LABEL,
     ]);
     assert_eq!(
         *SKIP_LABELS, expected,
-        "SKIP_LABELS is the claim + the parks + the hold + the epic container + the decision sub-kind"
+        "SKIP_LABELS is the claim + the parks + the bounced decision + the hold + the epic container + the decision sub-kind"
     );
 }
 
@@ -1875,6 +1876,7 @@ fn test_park_labels_are_the_non_building_subset_of_skip_labels() {
 // already uses in this file. `epic_container` (#11399) follows it.
 mod epic_container;
 mod operator_hold;
+mod restore_veto;
 
 #[test]
 fn test_hard_exclusion_labels_are_disjoint_from_skip_labels() {

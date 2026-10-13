@@ -422,13 +422,10 @@ impl SweepRegistry {
         if snapshot.fingerprint_ignoring(ours) == announced {
             return;
         }
-        let other_hold = snapshot.labels.iter().any(|l| {
-            !ours.contains(&l.as_str())
-                && (crate::work_finder::PARK_LABELS.contains(&l.as_str())
-                    || l == crate::work_finder::OPERATOR_HOLD_LABEL)
-        });
+        // #11480: the shared veto, less the hold's own labels being lifted.
+        let other_hold = crate::work_finder::restore_veto(&snapshot.labels, ours);
         let claimed = snapshot.labels.iter().any(|l| l == "loom:building");
-        let restore = !other_hold && !claimed;
+        let restore = other_hold.is_none() && !claimed;
         if let Err(cause) = self.lift_park_labels(issue, ours, restore) {
             log::warn!(
                 "sweep_registry: no-op hold for #{issue} saw changed inputs but could not lift                  {ours:?}; retrying next interval (#10156): {cause}"

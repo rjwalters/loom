@@ -17,6 +17,25 @@
 use super::*;
 
 impl SweepRegistry {
+    /// Whether the quarantine release may re-add `loom:issue` (#11480): only
+    /// when nothing but its own `loom:blocked` holds the item, per the shared
+    /// [`crate::work_finder::restore_veto`]. loom-ui#1950 is the case: a
+    /// `loom:needs-capability` pre-flight skip counted as an insta-crash, the
+    /// quarantine's TTL release re-armed `loom:issue` beside that veto, and the
+    /// item was re-dispatched 31 times in 72 h. One REST read, fail-open (a
+    /// failed read sees no labels and the release proceeds as before).
+    pub(crate) fn quarantine_release_restores_ready(&self, issue: u32) -> bool {
+        let labels = self.fetch_issue_signals(issue).labels;
+        let Some(veto) = crate::work_finder::restore_veto(&labels, &["loom:blocked"]) else {
+            return true;
+        };
+        log::info!(
+            "sweep_registry: quarantine release for #{issue} found `{veto}` — removing the \
+             quarantine's `loom:blocked` only, NOT re-adding `loom:issue` (#11480)"
+        );
+        false
+    }
+
     /// Whether the quarantine-release retry path should treat the shared
     /// GitHub API rate limit as currently exhausted (Issue #8953). Production
     /// consults the real process-global breaker

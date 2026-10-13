@@ -127,7 +127,8 @@ pub const JUDGEMENT_SUB_KIND_LABELS: &[&str] = &["loom:operator-decision", "loom
 ///   it asserts the capability *does not exist yet*, which no worker can hold.
 /// - `loom:operator` means "the engine has stopped on this artifact and a human
 ///   must act"; un-parking past it would defeat the hold.
-const LANE_VETO_LABELS: &[&str] = &["loom:blocked", "loom:needs-capability", "loom:operator"];
+pub(crate) const LANE_VETO_LABELS: &[&str] =
+    &["loom:blocked", "loom:needs-capability", "loom:operator"];
 
 /// True when `value` is in the closed vocabulary above.
 ///

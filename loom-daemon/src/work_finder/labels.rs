@@ -132,6 +132,36 @@ pub const EPIC_LABEL: &str = "loom:epic";
 #[cfg_attr(not(test), allow(dead_code))]
 pub const OPERATOR_DECISION_LABEL: &str = "loom:operator-decision";
 
+/// The one shared veto on handing an item back to the build queue (#11480):
+/// the first label in `labels` that forbids re-adding `loom:issue`, or `None`
+/// when the re-add may proceed.
+///
+/// Every release path that restores `loom:issue` — the reaper's claim release,
+/// the quarantine TTL/clear release, the startup quarantine reconciliation,
+/// the no-op hold lift and claim reconciliation's reclaim — consults this, so
+/// an item a human (or a gate) took out of the queue is not put back by a
+/// daemon path that only knew about its own label. Before #11480 each site
+/// carried its own partial list, and loom-ui#1950 (`loom:blocked`) was
+/// re-dispatched 31 times in 72 h.
+///
+/// A veto is any [`SKIP_LABELS`] entry other than [`BUILDING_LABEL`] (the
+/// daemon's own claim, which every release removes) or any
+/// [`crate::capability::LANE_VETO_LABELS`] entry. `removing` names the
+/// label(s) the caller is itself taking off in the same edit (the quarantine
+/// release removes its own `loom:blocked`), which never veto their own
+/// removal. Matching is exact (#11366). `loom:decision-malformed` is a skip
+/// label in the registry, so a bounced Decision issue is covered here.
+///
+/// Pure: labels in, verdict out. Callers decide how to read the labels and
+/// fail open (no veto) when the read fails, as their existing probes do.
+pub fn restore_veto<'a>(labels: &'a [String], removing: &[&str]) -> Option<&'a str> {
+    labels.iter().map(String::as_str).find(|l| {
+        !removing.contains(l)
+            && *l != BUILDING_LABEL
+            && (SKIP_LABELS.contains(l) || crate::capability::LANE_VETO_LABELS.contains(l))
+    })
+}
+
 /// Log — at DEBUG, once per skipped candidate — that a candidate was dropped
 /// for carrying a hard-exclusion label (#7528), naming the rule.
 ///
