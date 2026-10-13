@@ -17,9 +17,13 @@ pub(super) fn recover_curator_with(
     task_id: Option<&str>,
     repo_root: &Path,
     complete: &dyn Fn() -> Result<(), String>,
+    release_claim: &dyn Fn(),
 ) -> ValidationResult {
     match complete() {
         Ok(()) => {
+            // `curation-complete` adds `loom:curated` but never drops the
+            // `loom:curating` claim; release it here (404 = already gone).
+            release_claim();
             report_milestone(
                 task_id,
                 repo_root,
@@ -43,6 +47,13 @@ pub(super) fn recover_curator_with(
             ),
         ),
     }
+}
+
+/// Drop the `loom:curating` claim after a successful `curation-complete`.
+/// Best-effort: a 404 (label already absent) or any failure is tolerated.
+pub(super) fn release_curating_claim(repo_root: &Path, issue: i64) {
+    let path = format!("repos/{{owner}}/{{repo}}/issues/{issue}/labels/loom%3Acurating");
+    let _ = run_gh(&["api", "-X", "DELETE", &path], repo_root, false);
 }
 
 /// Run `loom-daemon curation-complete` for `issue` with the session's
@@ -108,7 +119,9 @@ mod tests {
 
     #[test]
     fn curator_recovery_failure_leaves_issue_curating() {
-        let r = recover_curator_with(7, None, Path::new("."), &|| Err("no marker".into()));
+        let r = recover_curator_with(7, None, Path::new("."), &|| Err("no marker".into()), &|| {
+            panic!("claim must not be released on failure")
+        });
         assert_eq!(r.status, ValidationStatus::Failed);
         assert!(r.message.contains("loom:curating"), "{}", r.message);
         assert_eq!(r.recovery_action, "none");
@@ -116,7 +129,11 @@ mod tests {
 
     #[test]
     fn curator_recovery_success_goes_through_curation_complete() {
-        let r = recover_curator_with(7, None, Path::new("."), &|| Ok(()));
+        let released = std::cell::Cell::new(false);
+        let r = recover_curator_with(7, None, Path::new("."), &|| Ok(()), &|| {
+            released.set(true);
+        });
+        assert!(released.get(), "loom:curating claim must be released on success");
         assert_eq!(r.status, ValidationStatus::Recovered);
         assert_eq!(r.recovery_action, "curation_complete");
     }

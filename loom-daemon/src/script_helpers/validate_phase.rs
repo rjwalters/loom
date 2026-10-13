@@ -1341,6 +1341,7 @@ pub fn validate_curator(repo_root: &Path, opts: &ValidateOpts) -> ValidationResu
         opts.task_id.as_deref(),
         repo_root,
         &|| super::validate_phase_curator::run_curation_complete(repo_root, issue),
+        &|| super::validate_phase_curator::release_curating_claim(repo_root, issue),
     )
 }
 

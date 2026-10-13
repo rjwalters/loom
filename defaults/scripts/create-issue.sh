@@ -471,6 +471,9 @@ if [[ "$WANT_CURATED" == "true" ]]; then
       --completion-id "$(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid)" \
       --workspace-root "${LOOM_WORKSPACE_ROOT:-$PWD}" >&2; then
     echo "create-issue.sh: issue filed but left in loom:curating: curation-complete failed; fix the marker and rerun it" >&2
+  else
+    # curation-complete adds loom:curated but never drops the claim label; 404 = already absent.
+    gh api -X DELETE "repos/$_cc_repo/issues/$_cc_n/labels/loom%3Acurating" >/dev/null 2>&1 || true
   fi
 fi
 
