@@ -1,8 +1,7 @@
 //! Authoritative per-repo approval/merge policy contract (#11674).
 //!
-//! The fleet config (tier 1, fleet-gitops; `repos` is a Fleet key in
-//! [`crate::fleet_policy::CLASSIFICATION`]) may declare, per repo, who holds
-//! issue-approval and PR-merge authority:
+//! The fleet config (tier 1, fleet-gitops; `repos` is a fleet-tier key) may
+//! declare, per repo, who holds issue-approval and PR-merge authority:
 //!
 //! ```json
 //! { "repos": [ { "repo": "owner/name",

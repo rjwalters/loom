@@ -224,8 +224,8 @@ copies (and re-stamps install metadata). Details:
 ## Configuration
 
 Configuration lives in `.loom/config.json` (committed): a `terminals` array
-(per-agent role/model), plus the optional blocks below. Fleet keys (`autonomous`,
-`runtimes`, …) belong in fleet-gitops; CI rejects un-allow-listed ones here: [fleet-config-lifecycle](.loom/docs/fleet-config-lifecycle.md).
+(per-agent role/model), plus the optional blocks below. Fleet-wide keys (`autonomous`,
+`runtimes`, …) are normally set in the fleet tier; a key committed here overrides it for this repo (plain tier order): [fleet-config-lifecycle](.loom/docs/fleet-config-lifecycle.md).
 
 - **Daemon configuration (Tier 2)** — start/stop wrappers, self-update, epic
   supervisor: [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md)
