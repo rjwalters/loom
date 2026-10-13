@@ -102,10 +102,10 @@ fn host_health_serializes_managed_repos_with_slug_and_visibility() {
             .and_then(serde_json::Value::as_str),
         Some("private")
     );
-    // #9244: a registered repo's dispatch priority ships; an unknown one is
+    // #11742: a registered repo's draw weight ships; an unknown one is
     // omitted.
-    assert_eq!(repos[0]["priority"], 0);
-    assert!(repos[1].get("priority").is_none());
+    assert_eq!(repos[0]["weight"], 0);
+    assert!(repos[1].get("weight").is_none());
 }
 
 #[test]
@@ -138,27 +138,27 @@ fn managed_repo_entry_with_missing_visibility_defaults_to_private() {
     assert_eq!(decoded.visibility, RepoVisibility::Private);
     assert_eq!(decoded.slug, "owner/repo");
     // No `priority` either (an older daemon): it decodes as absent.
-    assert_eq!(decoded.priority, None);
+    assert_eq!(decoded.weight, None);
 }
 
 #[test]
-fn managed_repo_entry_priority_is_on_the_wire_only_when_known() {
-    // #9244 / loom-ui#153: `priority` ships for a registered workspace and is
+fn managed_repo_entry_weight_is_on_the_wire_only_when_known() {
+    // #11742 (was `priority`, #9244 / loom-ui#153): `weight` ships for a registered workspace and is
     // omitted (never a fabricated default) for one that is not.
     let known = ManagedRepoEntry {
         slug: "rjwalters/loom".to_string(),
         visibility: RepoVisibility::Public,
-        priority: Some(0),
+        weight: Some(0),
         stale_blocked_release: None,
     };
     let wire = serde_json::to_value(&known).unwrap();
-    assert_eq!(wire["priority"], 0);
+    assert_eq!(wire["weight"], 0);
     let unknown = ManagedRepoEntry {
-        priority: None,
+        weight: None,
         ..known
     };
     let wire = serde_json::to_value(&unknown).unwrap();
-    assert!(wire.get("priority").is_none(), "{wire}");
+    assert!(wire.get("weight").is_none(), "{wire}");
 }
 
 #[test]
@@ -168,7 +168,7 @@ fn managed_repo_entry_carries_release_counters_only_once_ticked() {
     let mut entry = ManagedRepoEntry {
         slug: "2AMLogic/loom-ui".to_string(),
         visibility: RepoVisibility::Private,
-        priority: None,
+        weight: None,
         stale_blocked_release: None,
     };
     let wire = serde_json::to_value(&entry).unwrap();

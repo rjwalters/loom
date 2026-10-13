@@ -1,3 +1,4 @@
+use crate::workspace_registry::DEFAULT_WORKSPACE_WEIGHT;
 use std::path::{Path, PathBuf};
 
 use super::*;
@@ -11,7 +12,8 @@ repos:
     dir: tooling
     visibility: public          # ignored: not part of the contract
     fleet: true
-    fleet_priority: 10          # drains first
+    weight: 10                  # drawn most
+    fleet_priority: 3           # ignored since #11742
     purpose: Build tooling — "the" tools.
     consumes: [lib-a, lib-b]    # ignored
 
@@ -19,6 +21,7 @@ repos:
     remote: git@example.com:acme/product.git
     dir: product-src
     fleet: true
+    weight: 1
     purpose: >-
       Folded purpose text
       over two lines.
@@ -43,10 +46,10 @@ fn ident(p: &Path) -> PathBuf {
     p.to_path_buf()
 }
 
-fn reg(path: &str, priority: u32) -> Registered {
+fn reg(path: &str, weight: u32) -> Registered {
     Registered {
         root: PathBuf::from(path),
-        priority,
+        weight,
         maintain_only: false,
     }
 }
@@ -65,14 +68,14 @@ fn parses_the_contract_and_ignores_other_keys() {
             fleet: true,
             maintain_only: false,
             firewall: false,
-            fleet_priority: Some(10),
+            weight: Some(10),
         }
     );
     assert_eq!(r.records[3].remote, None);
 }
 
 #[test]
-fn desired_is_fleet_true_and_not_firewall_with_default_priority() {
+fn desired_is_fleet_true_and_not_firewall_with_its_weight() {
     let r = parse(ROSTER, &home()).unwrap();
     let d = r.desired();
     assert_eq!(
@@ -81,13 +84,13 @@ fn desired_is_fleet_true_and_not_firewall_with_default_priority() {
             Desired {
                 name: "tooling".to_string(),
                 path: PathBuf::from("/home/op/src/tooling"),
-                priority: 10,
+                weight: 10,
                 maintain_only: false,
             },
             Desired {
                 name: "product".to_string(),
                 path: PathBuf::from("/home/op/src/product-src"),
-                priority: DEFAULT_WORKSPACE_PRIORITY,
+                weight: DEFAULT_WORKSPACE_WEIGHT,
                 maintain_only: false,
             },
         ]
@@ -107,10 +110,13 @@ fn fleet_and_firewall_together_is_a_hard_error_not_a_silent_exclusion() {
 }
 
 #[test]
-fn malformed_flags_and_priorities_are_hard_errors() {
+fn malformed_flags_and_weights_are_hard_errors() {
     for (from, to) in [
-        ("fleet_priority: 10", "fleet_priority: high"),
-        ("fleet_priority: 10", "fleet_priority: -1"),
+        ("weight: 10", "weight: high"),
+        ("weight: 10", "weight: -1"),
+        ("weight: 10", "weight: 1.5"),
+        // #11742: a fleet record with no weight is refused, with no default.
+        ("    weight: 1\n", ""),
         ("firewall: true", "firewall: \"yes\""),
         ("firewall: true", "firewall: yes"),
         ("dir: docs", "dir: ../docs"),
@@ -157,10 +163,10 @@ fn plan_adds_removes_and_reprioritizes() {
             Change::Add {
                 name: "product".to_string(),
                 path: PathBuf::from("/home/op/src/product-src"),
-                priority: DEFAULT_WORKSPACE_PRIORITY,
+                weight: DEFAULT_WORKSPACE_WEIGHT,
                 maintain_only: false,
             },
-            Change::SetPriority {
+            Change::SetWeight {
                 name: "tooling".to_string(),
                 path: PathBuf::from("/home/op/src/tooling"),
                 from: 50,
@@ -183,7 +189,7 @@ fn a_missing_clone_is_reported_never_added() {
             name: "product".to_string(),
             path: PathBuf::from("/home/op/src/product-src"),
             remote: Some("git@example.com:acme/product.git".to_string()),
-            priority: DEFAULT_WORKSPACE_PRIORITY,
+            weight: DEFAULT_WORKSPACE_WEIGHT,
             maintain_only: false,
         }]
     );
@@ -195,7 +201,7 @@ fn a_matching_registry_is_in_sync() {
     let r = parse(ROSTER, &home()).unwrap();
     let registered = vec![
         reg("/home/op/src/tooling", 10),
-        reg("/home/op/src/product-src", DEFAULT_WORKSPACE_PRIORITY),
+        reg("/home/op/src/product-src", DEFAULT_WORKSPACE_WEIGHT),
     ];
     let plan = plan(&r, &registered, &ident, &|_| true);
     assert!(plan.is_in_sync());
@@ -210,7 +216,7 @@ fn paths_are_compared_after_normalization() {
     let canon = |p: &Path| PathBuf::from(p.to_string_lossy().replace("/home/op", "/data/op"));
     let registered = vec![
         reg("/data/op/src/tooling", 10),
-        reg("/data/op/src/product-src", DEFAULT_WORKSPACE_PRIORITY),
+        reg("/data/op/src/product-src", DEFAULT_WORKSPACE_WEIGHT),
         reg("/data/op/src/secrets", 100),
     ];
     let plan = plan(&r, &registered, &canon, &|_| true);
@@ -222,7 +228,7 @@ fn paths_are_compared_after_normalization() {
 // #11186: `fleet: maintain`
 // ----------------------------------------------------------------------------
 
-const PRODUCT: &str = "dir: product-src\n    fleet: true\n";
+const PRODUCT: &str = "dir: product-src\n    fleet: true\n    weight: 1\n";
 
 fn maintain(path: &str, priority: u32) -> Registered {
     Registered {
@@ -233,7 +239,8 @@ fn maintain(path: &str, priority: u32) -> Registered {
 
 #[test]
 fn fleet_maintain_is_desired_and_maintain_only() {
-    let text = ROSTER.replacen(PRODUCT, "dir: product-src\n    fleet: maintain\n", 1);
+    let text =
+        ROSTER.replacen(PRODUCT, "dir: product-src\n    fleet: maintain\n    weight: 1\n", 1);
     let r = parse(&text, &home()).unwrap();
     assert!(r.records[1].fleet && r.records[1].maintain_only);
     assert!(!r.records[0].maintain_only);
@@ -242,7 +249,7 @@ fn fleet_maintain_is_desired_and_maintain_only() {
     assert!(d[1].maintain_only && !d[0].maintain_only);
 
     // The compiled `fleet.json` form reads the same.
-    let doc = serde_json::json!({"root": "/r", "repos": [{"name": "x", "fleet": "maintain"}]});
+    let doc = serde_json::json!({"root": "/r", "repos": [{"name": "x", "fleet": "maintain", "weight": 1}]});
     let r = from_compiled(doc.as_object().unwrap(), &home()).unwrap();
     assert!(r.desired()[0].maintain_only);
 }
@@ -272,19 +279,23 @@ fn fleet_must_be_true_false_or_maintain() {
 /// "other keys are ignored" is a deliberate one.
 #[test]
 fn an_unknown_dispatch_key_is_ignored_which_is_why_the_mode_lives_in_fleet() {
-    let text =
-        ROSTER.replacen(PRODUCT, "dir: product-src\n    fleet: true\n    dispatch: false\n", 1);
+    let text = ROSTER.replacen(
+        PRODUCT,
+        "dir: product-src\n    fleet: true\n    weight: 1\n    dispatch: false\n",
+        1,
+    );
     let r = parse(&text, &home()).unwrap();
     assert!(!r.desired()[1].maintain_only, "ignored: dispatched as fleet: true");
 }
 
 #[test]
 fn flipping_the_mode_is_a_change_in_place_never_a_remove_and_add() {
-    let into = ROSTER.replacen(PRODUCT, "dir: product-src\n    fleet: maintain\n", 1);
+    let into =
+        ROSTER.replacen(PRODUCT, "dir: product-src\n    fleet: maintain\n    weight: 1\n", 1);
     let r = parse(&into, &home()).unwrap();
     let registered = vec![
         reg("/home/op/src/tooling", 10),
-        reg("/home/op/src/product-src", DEFAULT_WORKSPACE_PRIORITY),
+        reg("/home/op/src/product-src", DEFAULT_WORKSPACE_WEIGHT),
     ];
     let p = plan(&r, &registered, &ident, &|_| true);
     assert_eq!(
@@ -302,7 +313,7 @@ fn flipping_the_mode_is_a_change_in_place_never_a_remove_and_add() {
     // In sync once the registry has it, whoever set it.
     let synced = vec![
         reg("/home/op/src/tooling", 10),
-        maintain("/home/op/src/product-src", DEFAULT_WORKSPACE_PRIORITY),
+        maintain("/home/op/src/product-src", DEFAULT_WORKSPACE_WEIGHT),
     ];
     assert!(plan(&r, &synced, &ident, &|_| true).is_in_sync());
 
@@ -323,12 +334,13 @@ fn flipping_the_mode_is_a_change_in_place_never_a_remove_and_add() {
     let p = plan(&r, &[reg("/home/op/src/product-src", 5)], &ident, &|_| true);
     assert!(matches!(p.changes[0], Change::SetMaintainOnly { to: true, .. }));
     assert!(matches!(p.changes[1], Change::Add { .. }), "tooling");
-    assert!(matches!(p.changes[2], Change::SetPriority { from: 5, .. }));
+    assert!(matches!(p.changes[2], Change::SetWeight { from: 5, .. }));
 }
 
 #[test]
 fn a_maintain_only_add_registers_it_maintain_only_in_one_change() {
-    let text = ROSTER.replacen(PRODUCT, "dir: product-src\n    fleet: maintain\n", 1);
+    let text =
+        ROSTER.replacen(PRODUCT, "dir: product-src\n    fleet: maintain\n    weight: 1\n", 1);
     let r = parse(&text, &home()).unwrap();
     let p = plan(&r, &[reg("/home/op/src/tooling", 10)], &ident, &|_| true);
     assert_eq!(
@@ -336,7 +348,7 @@ fn a_maintain_only_add_registers_it_maintain_only_in_one_change() {
         vec![Change::Add {
             name: "product".to_string(),
             path: PathBuf::from("/home/op/src/product-src"),
-            priority: DEFAULT_WORKSPACE_PRIORITY,
+            weight: DEFAULT_WORKSPACE_WEIGHT,
             maintain_only: true,
         }]
     );

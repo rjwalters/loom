@@ -529,10 +529,10 @@ pub struct FleetStateRow {
     /// retired `star` / `star_at` fields are no longer sent (#11510).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub level: u8,
-    /// `ready_wait` only: the repo's fleet priority (the workspace priority
-    /// tier; lower dispatches first).
+    /// `ready_wait` only: the repo's draw weight (#11742; higher is drawn
+    /// more). Older records carried `fleet_priority`, a tier, instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fleet_priority: Option<u32>,
+    pub weight: Option<u32>,
     /// `ready_wait` only: the issue's creation instant, the planner's age
     /// input. Age at a record is `as_of - created_at`; the instant is sent
     /// instead of the age so an unchanged row stays unchanged.
@@ -611,7 +611,7 @@ impl FleetStateRow {
             sweep_id: None,
             rank: None,
             level: 0,
-            fleet_priority: None,
+            weight: None,
             created_at: None,
             main_red_fix: false,
             hold_kind: None,

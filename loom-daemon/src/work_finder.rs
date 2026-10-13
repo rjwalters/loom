@@ -1327,7 +1327,7 @@ pub fn tick_with_lanes(
 ///
 /// `priorities` is a slice **parallel to `workspaces`**: `priorities[i]` is
 /// workspace `i`'s dispatch tier (lower = higher priority; a missing entry
-/// defaults to [`crate::workspace_registry::DEFAULT_WORKSPACE_PRIORITY`]).
+/// defaults to [`crate::workspace_registry::DEFAULT_WORKSPACE_WEIGHT`]).
 /// Rather than dispatching each workspace's backlog in registration order, this
 /// gathers every eligible candidate across all workspaces and orders them by
 /// **weighted workspace draws** ([`workspace_draw`], #11103): each draw picks a
@@ -1572,7 +1572,7 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
     lanes: &[RedMainLane],
     build_backoff_held: &[bool],
 ) -> TickReport {
-    use crate::workspace_registry::DEFAULT_WORKSPACE_PRIORITY;
+    use crate::workspace_registry::DEFAULT_WORKSPACE_WEIGHT;
 
     let mut report = TickReport::for_tick(saturation_held, max_admissions_per_tick);
     report.build_backoff_held = build_backoff::any_held(build_backoff_held, workspaces.len());
@@ -1751,10 +1751,10 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
         // #11509: one `loom:very-important` per workspace; the rest rank important.
         vi_cap::enforce(idx, source, &mut ready, &mut report);
         report.seen += ready.len();
-        let workspace_priority = priorities
+        let workspace_weight = priorities
             .get(idx)
             .copied()
-            .unwrap_or(DEFAULT_WORKSPACE_PRIORITY);
+            .unwrap_or(DEFAULT_WORKSPACE_WEIGHT);
         let q = &mut report.queue;
 
         // Per-repo main-health gate (#3930): a red repo skips only its own
@@ -1765,7 +1765,7 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
         let repo_halted = halted.get(idx).copied().unwrap_or(false);
         if repo_halted && !lane.admits_fixes_while_halted() {
             // #9017: name WHICH hold tripped, not just that one did.
-            halt_cause::record_halted(q, &ready, idx, workspace_priority, red, halt_causes);
+            halt_cause::record_halted(q, &ready, idx, workspace_weight, red, halt_causes);
             continue;
         }
 
@@ -1777,7 +1777,7 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
         if commands_missing[idx] {
             report.skipped_workspace_commands_missing += ready.len();
             for item in &ready {
-                let key = ready_queue::key_of(idx, workspace_priority, item, red);
+                let key = ready_queue::key_of(idx, workspace_weight, item, red);
                 ready_queue::record_skip(q, key, item, Qd::WorkspaceCommandsMissing, None);
             }
             continue;
@@ -1788,7 +1788,7 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
 
         for item in ready {
             cap.note_surface(idx, &item, in_flight.contains(&item.number));
-            let key = ready_queue::key_of(idx, workspace_priority, &item, red);
+            let key = ready_queue::key_of(idx, workspace_weight, &item, red);
             // `held_until` (Issue #9311): `None` for every disposition but
             // the five time-boxed holds below, which pass their computed
             // expiry explicitly as the third argument.
@@ -2944,7 +2944,7 @@ pub fn spawn_multi_work_finder_task(
 
             // Per-repo priority tiers (#3946), parallel to `pairs`: lower = higher
             // priority. The empty-registry cwd fallback resolves to the default.
-            let priorities: Vec<u32> = roots.iter().map(|r| registry.priority_of(r)).collect();
+            let priorities: Vec<u32> = roots.iter().map(|r| registry.weight_of(r)).collect();
 
             // Shard verdicts, per root, for the dispatch plan's `owning_shard`
             // only (the fleet-merge primary rule, #9288). They no longer

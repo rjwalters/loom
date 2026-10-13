@@ -72,7 +72,7 @@ pub(crate) fn handle_fleet_command(action: FleetAction) -> Result<()> {
         FleetAction::AddWorker {
             ssh_host,
             repo,
-            priority,
+            weight,
             pat_file,
             accounts_env,
             loom_repo,
@@ -95,7 +95,7 @@ pub(crate) fn handle_fleet_command(action: FleetAction) -> Result<()> {
             let config = AddWorkerConfig {
                 ssh_host,
                 repos: repo,
-                priority,
+                weight,
                 dry_run,
                 loom_repo_url: loom_repo,
                 pat_file: pat_file.map(PathBuf::from),
@@ -342,7 +342,7 @@ fn report_session_mount_drift(registry: &loom_daemon::workspace_registry::Worksp
 /// same file on its next tick (hot-apply), and its `RegisterWorkspace` /
 /// `DeregisterWorkspace` / `ListWorkspaces` IPC handlers touch the same file.
 ///
-/// `Add`/`SetPriority`/`Remove`/`Hold`/`Release` are gated by
+/// `Add`/`SetWeight`/`Remove`/`Hold`/`Release` are gated by
 /// [`refuse_if_daemon_admin_delegated`] (issue #5345) — `List` is read-only
 /// and is deliberately never gated.
 pub(crate) fn handle_workspace_command(action: WorkspaceAction) -> Result<()> {
@@ -379,7 +379,7 @@ pub(crate) fn handle_workspace_command_by(
         }
         WorkspaceAction::Add {
             path: repo_path,
-            priority,
+            weight,
             config_overrides,
             no_init,
             maintain_only,
@@ -402,7 +402,7 @@ pub(crate) fn handle_workspace_command_by(
             match registry.add_and_trust(
                 std::path::Path::new(&repo_path),
                 overrides,
-                priority,
+                weight,
                 &claude_state_path,
             )? {
                 AddOutcome::AlreadyPresent { canonical } if maintain_only => {
@@ -412,8 +412,8 @@ pub(crate) fn handle_workspace_command_by(
                 AddOutcome::AlreadyPresent { canonical } => {
                     println!("Already registered: {}", canonical.display());
                     println!(
-                        "  (priority unchanged — use `loom-daemon workspace set-priority {} <N>` \
-                         to retier it)",
+                        "  (weight unchanged — use `loom-daemon workspace set-weight {} <N>` \
+                         to change it)",
                         canonical.display()
                     );
                 }
@@ -427,7 +427,7 @@ pub(crate) fn handle_workspace_command_by(
                     registry.save(&path)?;
                     let note = if maintain_only { ", maintain-only" } else { "" };
                     println!(
-                        "Registered workspace: {} (priority {priority}{note})",
+                        "Registered workspace: {} (weight {weight}{note})",
                         canonical.display()
                     );
                     report_session_mount_drift(&registry);
@@ -486,19 +486,19 @@ pub(crate) fn handle_workspace_command_by(
             }
             Ok(())
         }
-        WorkspaceAction::SetPriority {
+        WorkspaceAction::SetWeight {
             path: repo_path,
-            priority,
+            weight,
         } => {
-            refuse_if_daemon_admin_delegated("workspace priority changes");
+            refuse_if_daemon_admin_delegated("workspace weight changes");
             let mut registry = WorkspaceRegistry::load(&path)?;
-            if registry.set_priority(std::path::Path::new(&repo_path), priority) {
+            if registry.set_weight(std::path::Path::new(&repo_path), weight) {
                 registry.save(&path)?;
-                println!("Set priority of {repo_path} to {priority}");
+                println!("Set weight of {repo_path} to {weight}");
             } else {
                 eprintln!(
                     "Not registered (no-op): {repo_path}\n  Register it first with \
-                     `loom-daemon workspace add {repo_path} --priority {priority}`."
+                     `loom-daemon workspace add {repo_path} --weight {weight}`."
                 );
             }
             Ok(())
@@ -526,17 +526,12 @@ pub(crate) fn handle_workspace_command_by(
             } else {
                 println!("Managed workspaces ({}):", registry.workspaces.len());
                 println!("Registry file: {}", path.display());
-                println!("(priority: lower = higher dispatch priority; default 100)\n");
-                println!("  {:>4}  WORKSPACE", "PRIO");
+                println!("(weight: relative share of repo draws, higher = more; 0 = never)\n");
+                println!("  {:>6}  WORKSPACE", "WEIGHT");
                 println!("  {:-<60}", "");
-                // Display in dispatch-priority order (#3946) — the same order the
-                // autonomous loops drain — without mutating stored insertion order.
+                // Heaviest first (#11742), without mutating stored insertion order.
                 let mut ordered: Vec<&_> = registry.workspaces.iter().collect();
-                ordered.sort_by(|a, b| {
-                    a.priority
-                        .cmp(&b.priority)
-                        .then_with(|| a.root.cmp(&b.root))
-                });
+                ordered.sort_by(|a, b| b.weight.cmp(&a.weight).then_with(|| a.root.cmp(&b.root)));
                 for ws in ordered {
                     let overrides = if ws.config_overrides.is_some() {
                         " (has config overrides)"
@@ -546,7 +541,7 @@ pub(crate) fn handle_workspace_command_by(
                     let mode = ws
                         .maintain_only
                         .map_or_else(String::new, |m| format!(" [{}]", m.label()));
-                    println!("  {:>4}  {}{overrides}{mode}", ws.priority, ws.root.display());
+                    println!("  {:>6}  {}{overrides}{mode}", ws.weight, ws.root.display());
                 }
             }
             Ok(())
@@ -728,7 +723,7 @@ mod tests {
         assert!(err.to_string().contains("not registered"), "{err}");
 
         let mut reg = WorkspaceRegistry::default();
-        reg.add_with_priority(&repo, None, 5).unwrap();
+        reg.add_with_weight(&repo, None, 5).unwrap();
         reg.save(&registry).unwrap();
 
         super::set_maintain_only(&registry, &root, operator).unwrap();
@@ -743,6 +738,6 @@ mod tests {
         super::set_maintain_only(&registry, &root, None).unwrap();
         let reg = WorkspaceRegistry::load(&registry).unwrap();
         assert!(reg.maintain_only_of(&repo).is_none());
-        assert_eq!((reg.workspaces.len(), reg.workspaces[0].priority), (1, 5), "in place");
+        assert_eq!((reg.workspaces.len(), reg.workspaces[0].weight), (1, 5), "in place");
     }
 }

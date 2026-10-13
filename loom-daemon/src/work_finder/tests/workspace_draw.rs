@@ -11,9 +11,8 @@ fn issue(n: u32, created_at: &str, extra: &[&str]) -> WorkItem {
     WorkItem::with_created_at(n, labels, Some(created_at.to_string()))
 }
 
-/// Three workspaces: 0 is a tool repo (priority 0, weight 1,000,000), 1 and 2
-/// are product repos (priority 10, weight 882,497; priority 100, weight
-/// 286,505) — the softmax at the default T = 80 (#11684).
+/// Three workspaces: 0 is a tool repo (weight 10), 1 and 2 are product repos
+/// (weights 6 and 1). Draw shares are linear in weight (#11742).
 fn fleet() -> Vec<(FakeSource, RecordingDispatcher)> {
     vec![
         (
@@ -38,7 +37,7 @@ fn fleet() -> Vec<(FakeSource, RecordingDispatcher)> {
     ]
 }
 
-const PRIORITIES: [u32; 3] = [0, 10, 100];
+const WEIGHTS: [u32; 3] = [10, 6, 1];
 
 fn dispatch_sequence(report: &TickReport) -> Vec<(usize, u32)> {
     report
@@ -57,15 +56,15 @@ fn a_fixed_seed_reproduces_the_exact_dispatch_sequence() {
     let run = || {
         crate::work_finder::workspace_draw::with_seed(7, || {
             let mut multi = fleet();
-            tick_multi(&mut multi, &PRIORITIES, 10, &[false, false, false])
+            tick_multi(&mut multi, &WEIGHTS, 10, &[false, false, false])
         })
     };
     let report = run();
     let sequence = dispatch_sequence(&report);
     assert_eq!(
         sequence,
-        vec![(0, 1), (1, 10), (1, 11), (0, 2), (0, 3), (2, 20)],
-        "the pinned draw sequence for seed 7 (re-pinned for the #11684 softmax)"
+        vec![(0, 1), (0, 2), (1, 10), (1, 11), (0, 3), (2, 20)],
+        "the pinned draw sequence for seed 7 (re-pinned for the #11742 linear weights)"
     );
     assert_eq!(dispatch_sequence(&run()), sequence, "same seed, same sequence");
     assert_eq!(report.plan_order, sequence, "the published plan is the draw order");
@@ -81,51 +80,57 @@ fn a_fixed_seed_reproduces_the_exact_dispatch_sequence() {
     assert_eq!(picks, sequence);
     let first = &log.steps[0].draw;
     let weights: Vec<u64> = first.candidates.iter().map(|c| c.weight).collect();
-    assert_eq!(weights, vec![1_000_000, 882_497, 286_505]);
-    assert_eq!(first.total_weight, 2_169_002);
-    assert_eq!((first.temperature, first.p_min), (80, 0));
+    assert_eq!(weights, vec![10, 6, 1]);
+    assert_eq!(first.total_weight, 17);
     assert!(first.roll < first.total_weight);
 }
 
 /// A different seed is a different, equally reproducible draw: the
-/// lower-priority workspaces are not starved behind a strict tier.
+/// lighter workspaces are not starved behind a strict tier.
 #[test]
-fn some_seed_serves_a_lower_priority_workspace_first() {
+fn some_seed_serves_a_lighter_workspace_first() {
     let first_pick = |seed: u64| {
         crate::work_finder::workspace_draw::with_seed(seed, || {
             let mut multi = fleet();
-            dispatch_sequence(&tick_multi(&mut multi, &PRIORITIES, 1, &[false, false, false]))[0]
+            dispatch_sequence(&tick_multi(&mut multi, &WEIGHTS, 1, &[false, false, false]))[0]
         })
     };
     let firsts: std::collections::BTreeSet<usize> = (0..300).map(|s| first_pick(s).0).collect();
     assert!(firsts.contains(&0));
-    assert!(firsts.contains(&1), "weight 882,497 of 2,169,002 wins some draws: {firsts:?}");
+    assert!(firsts.contains(&1), "weight 6 of 17 wins some draws: {firsts:?}");
 }
 
-/// ACCEPTANCE (#11103): a workspace with dispatchable `loom:very-important`
-/// work always wins the draw, however low its priority.
+/// #11742: dispatchable `loom:very-important` work adds its bonus to the
+/// workspace's weight. The weight-1 workspace with very-important work
+/// (1 + 100 against 16) takes the single slot most of the time, not always.
 #[test]
-fn very_important_work_wins_the_single_slot_for_every_seed() {
-    for seed in 0..100 {
+fn very_important_work_adds_its_bonus_to_the_draw() {
+    let mut wins = 0;
+    for seed in 0..200 {
         let report = crate::work_finder::workspace_draw::with_seed(seed, || {
             let mut multi = fleet();
             multi[2].0 = FakeSource::once(vec![
                 issue(20, "2024-01-01T00:00:00Z", &[]),
                 issue(21, "2026-09-01T00:00:00Z", &[VERY_IMPORTANT_LABEL]),
             ]);
-            tick_multi(&mut multi, &PRIORITIES, 1, &[false, false, false])
+            tick_multi(&mut multi, &WEIGHTS, 1, &[false, false, false])
         });
-        assert_eq!(dispatch_sequence(&report), vec![(2, 21)], "seed {seed}");
-        let log = report.workspace_draw.unwrap();
-        assert_eq!(log.steps[0].draw.pool, "very-important");
+        let log = report.workspace_draw.clone().unwrap();
+        let ws2 = &log.steps[0].draw.candidates[2];
+        assert_eq!((ws2.base_weight, ws2.bonus), (1, 100));
+        if dispatch_sequence(&report) == vec![(2, 21)] {
+            wins += 1;
+        }
     }
+    // Expected share 101 / 117, about 86%.
+    assert!((150..200).contains(&wins), "won {wins}/200");
 }
 
 /// An idle multi-workspace tick draws nothing and records no draw.
 #[test]
 fn an_idle_tick_records_no_draw() {
     let mut multi = vec![(FakeSource::once(Vec::new()), RecordingDispatcher::default())];
-    let report = tick_multi(&mut multi, &[0], 4, &[false]);
+    let report = tick_multi(&mut multi, &[1], 4, &[false]);
     assert!(report.workspace_draw.is_none());
 }
 
@@ -143,7 +148,7 @@ fn very_important_never_goes_over_the_cap() {
         FakeSource::once(vec![vi(1), vi(2), issue(3, "2026-01-01T00:00:00Z", &[])]),
         full(),
     )];
-    let report = tick_multi(&mut multi, &[100], 2, &[false]);
+    let report = tick_multi(&mut multi, &[1], 2, &[false]);
     assert_eq!((report.dispatched, report.dispatched_overflow), (0, 0));
     assert!(multi[0].1.dispatched_overflow.is_empty());
     assert_eq!(report.deferred_capacity, 3, "every candidate waits for capacity");

@@ -484,7 +484,7 @@ pub(crate) fn build_status_json_value_for(
         // Per-repo breakdown across every registered managed workspace (#3930).
         "per_repo": report.per_repo.iter().map(|r| serde_json::json!({
             "root": r.root,
-            "priority": r.priority,
+            "weight": r.weight,
             "in_flight_count": r.in_flight_count,
             "health_gate_halted": r.health_gate_halted,
             "health_gate_not_evaluated": r.health_gate_not_evaluated,
@@ -2554,7 +2554,7 @@ pub(crate) fn print_status_human(
     // workspace; with `loom-daemon workspace add <path>` it lists every managed
     // repo, its in-flight count, and its own gate state.
     println!(
-        "\nManaged repos: {} (priority: lower = higher dispatch priority)",
+        "\nManaged repos: {} (weight: relative share of repo draws, higher = more)",
         report.per_repo.len()
     );
     if report.per_repo.is_empty() {
@@ -2569,7 +2569,7 @@ pub(crate) fn print_status_human(
         // the separator below) is unchanged.
         println!(
             "  {:>4}  {:>9}  {:<13}  {:<5}  REPO",
-            "PRIO", "IN-FLIGHT", "HEALTH-GATE", "ROLES"
+            "WGHT", "IN-FLIGHT", "HEALTH-GATE", "ROLES"
         );
         println!("  {:-<68}", "");
         for r in &report.per_repo {
@@ -2592,7 +2592,7 @@ pub(crate) fn print_status_human(
             let roles = if r.role_runner_enabled { "on" } else { "off" };
             println!(
                 "  {:>4}  {:>9}  {:<13}  {:<5}  {}{}",
-                r.priority,
+                r.weight,
                 r.in_flight_count,
                 gate,
                 roles,
@@ -3184,7 +3184,7 @@ mod status_render_tests {
         // row is `2 + 4 + 2 + 9 + 2 + 13 + 2 + 5 + 2` of fixed columns before
         // the variable-width REPO column, and the separator is `2 + 68`.
         let header_row =
-            format!("  {:>4}  {:>9}  {:<13}  {:<5}  REPO", "PRIO", "IN-FLIGHT", HEADER, "ROLES");
+            format!("  {:>4}  {:>9}  {:<13}  {:<5}  REPO", "WGHT", "IN-FLIGHT", HEADER, "ROLES");
         let separator = format!("  {:-<68}", "");
         assert!(
             header_row.len() <= separator.len(),
@@ -4689,7 +4689,7 @@ mod stash_status_render_tests {
         loom_daemon::types::RepoStatus {
             root: std::path::PathBuf::from("/repos/loom"),
             maintain_only: None,
-            priority: 100,
+            weight: 100,
             in_flight_count: 0,
             health_gate_halted: false,
             quarantined_issues: vec![],
@@ -4938,7 +4938,7 @@ mod role_runner_diagnostic_source_render_tests {
         RepoStatus {
             root: std::path::PathBuf::from("/repos/loom"),
             maintain_only: None,
-            priority: 100,
+            weight: 100,
             in_flight_count: 0,
             health_gate_halted: false,
             quarantined_issues: vec![],

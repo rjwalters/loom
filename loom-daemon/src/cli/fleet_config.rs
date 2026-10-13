@@ -138,12 +138,12 @@ enum ProposeCommand {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Change one `fleet.yml` `repos:` record's dispatch priority.
-    Priority {
+    /// Change one `fleet.yml` `repos:` record's draw `weight` (#11742).
+    Weight {
         /// The record's `name:`.
         repo: String,
-        /// The new `fleet_priority`.
-        priority: u32,
+        /// The new `weight` (higher = more draws, 0 = never drawn).
+        weight: u32,
         /// Print the diff without opening a PR.
         #[arg(long)]
         dry_run: bool,
@@ -223,11 +223,11 @@ fn run(args: FleetConfigArgs) -> Result<i32> {
                 by,
                 dry_run,
             } => cmd_propose_state(&ctx, state, host, reason, by, dry_run),
-            ProposeCommand::Priority {
+            ProposeCommand::Weight {
                 repo,
-                priority,
+                weight,
                 dry_run,
-            } => cmd_propose_priority(&ctx, repo, priority, dry_run),
+            } => cmd_propose_weight(&ctx, repo, weight, dry_run),
             ProposeCommand::Adopt { host, dry_run } => cmd_propose_adopt(&ctx, host, dry_run),
         },
     }
@@ -484,7 +484,7 @@ fn cmd_roster(ctx: &Ctx, check: bool, apply: bool, json: bool) -> Result<i32> {
         .iter()
         .map(|w| Registered {
             root: w.root.clone(),
-            priority: w.priority,
+            weight: w.weight,
             maintain_only: w.maintain_only.is_some(),
         })
         .collect();
@@ -523,19 +523,19 @@ fn cmd_roster(ctx: &Ctx, check: bool, apply: bool, json: bool) -> Result<i32> {
             },
             Change::Add {
                 path,
-                priority,
+                weight,
                 maintain_only,
                 ..
             } => WorkspaceAction::Add {
                 path: path.to_string_lossy().to_string(),
-                priority: *priority,
+                weight: *weight,
                 config_overrides: None,
                 no_init: false,
                 maintain_only: *maintain_only,
             },
-            Change::SetPriority { path, to, .. } => WorkspaceAction::SetPriority {
+            Change::SetWeight { path, to, .. } => WorkspaceAction::SetWeight {
                 path: path.to_string_lossy().to_string(),
-                priority: *to,
+                weight: *to,
             },
             Change::SetMaintainOnly { path, to, .. } => {
                 let root = WorkspaceRoot {
@@ -619,12 +619,12 @@ fn cmd_propose_state(
     submit_or_print(ctx, &loaded, &source, "state", after, title, dry_run)
 }
 
-fn cmd_propose_priority(ctx: &Ctx, repo: String, priority: u32, dry_run: bool) -> Result<i32> {
+fn cmd_propose_weight(ctx: &Ctx, repo: String, weight: u32, dry_run: bool) -> Result<i32> {
     let loaded = ctx.load(Policy::FailClosed)?;
     let source = propose::source::load(&ctx.transport, &ctx.location.repo, &loaded.snapshot)?;
-    let after = propose::edit_priority(&source.text, &repo, priority)?;
-    let title = format!("fleet-config: set {repo} priority to {priority}");
-    submit_or_print(ctx, &loaded, &source, "priority", after, title, dry_run)
+    let after = propose::edit_weight(&source.text, &repo, weight)?;
+    let title = format!("fleet-config: set {repo} weight to {weight}");
+    submit_or_print(ctx, &loaded, &source, "weight", after, title, dry_run)
 }
 
 fn cmd_propose_adopt(ctx: &Ctx, host: Option<String>, dry_run: bool) -> Result<i32> {

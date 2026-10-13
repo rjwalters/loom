@@ -464,17 +464,17 @@ pub fn apply_change(registry_path: &Path, change: &Change) -> Result<()> {
     let changed = match change {
         Change::Add {
             path,
-            priority,
+            weight,
             maintain_only,
             ..
         } => {
             let claude_state = crate::terminal::claude_config_state_path();
-            registry.add_and_trust(path, None, *priority, &claude_state)?;
+            registry.add_and_trust(path, None, *weight, &claude_state)?;
             registry.set_maintain_only(path, mode(*maintain_only), Utc::now());
             true
         }
         Change::Remove { path, .. } => registry.remove(path),
-        Change::SetPriority { path, to, .. } => registry.set_priority(path, *to),
+        Change::SetWeight { path, to, .. } => registry.set_weight(path, *to),
         Change::SetMaintainOnly { path, to, .. } => registry
             .set_maintain_only(path, mode(*to), Utc::now())
             .unwrap_or(false),
@@ -1086,7 +1086,7 @@ fn roster_half(
         .iter()
         .map(|w| Registered {
             root: w.root.clone(),
-            priority: w.priority,
+            weight: w.weight,
             maintain_only: w.maintain_only.is_some(),
         })
         .collect();

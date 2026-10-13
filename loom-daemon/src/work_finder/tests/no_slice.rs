@@ -104,7 +104,7 @@ fn in_slice_repo_with_only_open_prs_yields_the_tick_to_other_repos() {
     ];
     let report = tick_multi_with_sharding(
         &mut workspaces,
-        &[0, 100, 100],
+        &[1000, 1, 1],
         10,
         &[false; 3],
         usize::MAX,
@@ -142,7 +142,7 @@ fn in_slice_repo_at_its_cap_yields_the_tick_to_other_repos() {
     ];
     let report = tick_multi_with_repo_cap(
         &mut workspaces,
-        &[0, 100, 100],
+        &[1000, 1, 1],
         10.into(),
         &[false; 3],
         None,
@@ -169,14 +169,8 @@ fn the_ring_neither_defers_nor_reorders_dispatch() {
         (FakeSource::once(vec![issue(2)]), RecordingDispatcher::default()),
         (FakeSource::once(vec![issue(3)]), RecordingDispatcher::default()),
     ];
-    let report = tick_multi_with_sharding(
-        &mut workspaces,
-        &[100, 100, 100],
-        10,
-        &[false; 3],
-        usize::MAX,
-        false,
-    );
+    let report =
+        tick_multi_with_sharding(&mut workspaces, &[1, 1, 1], 10, &[false; 3], usize::MAX, false);
     assert_eq!(report.dispatched, 3);
     let rows = ready_queue::finish(&report.queue, &[]);
     assert!(rows.iter().all(|r| r.disposition == Qd::Dispatched));

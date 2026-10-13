@@ -457,7 +457,7 @@ fn a_claimed_ready_issue_is_one_fact_across_hosts() {
                     issue: 7,
                     rank: 1,
                     level: 0,
-                    fleet_priority: 0,
+                    weight: 0,
                     created_at: None,
                     main_red_fix: false,
                     eligible_reason: None,
