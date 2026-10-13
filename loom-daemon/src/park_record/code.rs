@@ -93,7 +93,7 @@ pub(super) fn blank(text: &str) -> String {
             list_col = 0;
         }
         let opener = if indent < 4 {
-            [b'`', b'~']
+            (*b"`~")
                 .into_iter()
                 .map(|c| (c, run(c)))
                 .find(|&(_, r)| r >= 3)
