@@ -1935,7 +1935,7 @@ pub(crate) fn park_guard_registry(
         state = state_probe_json("open", false),
         labels = rest_labels,
         // #11480: the claim release reads labels through the issue-signals
-        // projection (`fetch_issue_signals`), not a one-label probe.
+        // projection (`release_issue_signals`), not a one-label probe.
         signals = serde_json::json!({
             "state": "open",
             "closed_at": null,
