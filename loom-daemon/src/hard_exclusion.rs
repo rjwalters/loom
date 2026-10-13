@@ -186,7 +186,7 @@ mod tests {
         let rendered = String::from_utf8_lossy(&out.stdout);
         for label in HARD_EXCLUSION_LABELS.iter() {
             assert!(
-                rendered.contains(&format!("contains([\"{label}\"]) | not")),
+                rendered.contains(&format!("(any(.labels[].name; . == \"{label}\") | not)")),
                 "--jq-not output {rendered:?} does not exclude {label}"
             );
         }
