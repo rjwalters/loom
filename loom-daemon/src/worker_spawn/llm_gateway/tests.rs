@@ -236,6 +236,7 @@ fn a_subscription_or_login_store_profile_refuses_instead_of_routing() {
         header: crate::worker_spawn::egress_proxy::HeaderStyle::AuthorizationBearer,
         base_url_env: vec![],
         observe: false,
+        base_url_config: None,
     });
     assert!(plan_of("opencode", &proxied, &env).is_err());
 }

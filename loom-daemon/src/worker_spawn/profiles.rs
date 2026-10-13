@@ -416,6 +416,15 @@ pub fn resolve_shape(
         // misconfiguration that must never reach a launch that then decides
         // what to do about it.
         proxy.validate()?;
+        // The config-side base URL override writes OpenCode's provider
+        // configuration; no other harness has a config contract this module
+        // writes, so declaring it anywhere else is a misconfiguration (#11300).
+        if proxy.base_url_config.is_some() && runtime != "opencode" {
+            return Err(LaunchError::config(
+                "model profile credentialProxy.baseUrlConfig is only supported by the opencode \
+                 harness, whose provider base URL is provisioned through OPENCODE_CONFIG_CONTENT",
+            ));
+        }
         // Both counts must be 1, not just `pairs`: an array-form
         // `credentialEnv` with a `credentialTargets` map that only covers
         // one of its declared names still produces `pairs.len() == 1`, but
@@ -685,6 +694,7 @@ mod tests {
             header: super::super::egress_proxy::HeaderStyle::AuthorizationBearer,
             base_url_env: vec!["ANTHROPIC_BASE_URL".to_string()],
             observe: false,
+            base_url_config: None,
         });
 
         let error = resolve("test-runtime", "test-profile", &profile);

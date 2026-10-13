@@ -394,6 +394,11 @@ fn run_preflight(
     }
     let scripts = args.scripts_dir.unwrap_or_else(|| scripts_dir(root));
     let mut log: Box<dyn Write> = Box::new(std::io::stderr());
+    // #11300 slice 3, item 5: an uncontained native launch whose profile
+    // declares `credentialProxy` arms a loopback-only proxy inside the native
+    // arm below and is served here, in place of the `exec`. Declared out here
+    // because the arm's `selection` (and everything it resolved) dies with it.
+    let mut native_prepared: Option<egress_proxy::Prepared> = None;
     let mut command = if let Some(harness) = Harness::parse(&runtime) {
         let options = Options::parse(&args.args)?;
         // A role-tagged invocation must meet the same capabilities as daemon dispatch.
@@ -533,12 +538,33 @@ fn run_preflight(
         // Fails closed (78) only when this host has a pool for the profile's
         // credential provider and none of its accounts is usable (#8401).
         let gateway = gateway.map(llm_gateway::Plan::open).transpose()?;
-        let credential = match &gateway {
-            Some(route) => {
+        // #11300 slice 3, item 5: substitute the credential for an
+        // UNCONTAINED native launch through a loopback-only proxy. Host side
+        // only — the in-container copy must never arm a second proxy (its
+        // credential is the placeholder already, and the real one is not
+        // present there).
+        let prepared = if nonempty_env("LOOM_SPAWN_CONTAINERIZED").is_none() {
+            if gateway.is_some()
+                && egress_proxy::enabled(&config)
+                && selection.credential_proxy.is_some()
+            {
+                return Err(LaunchError::config(
+                    "this model profile is routed through the LLM gateway and declares a \
+                     credentialProxy block; the two both rewrite where the provider is \
+                     reached, so only one may be active (#9473)",
+                ));
+            }
+            egress_proxy::prepare_native(root, &selection, &config, &runtime)?
+        } else {
+            None
+        };
+        let credential = match (&gateway, &prepared) {
+            (Some(route), _) => {
                 route.adapt(&runtime, &mut selection);
                 route.credential()
             }
-            None => credential::resolve(root, &selection)?,
+            (None, Some((_, resolved))) => resolved.clone(),
+            (None, None) => credential::resolve(root, &selection)?,
         };
         // #10749: how this launch is billed, from the profile's declared class
         // and the credential source actually resolved. Enumerated vocabulary
@@ -560,6 +586,15 @@ fn run_preflight(
         )?;
         if let Some(route) = &gateway {
             route.finish(&runtime, &selection.provider, &mut command)?;
+        }
+        // The substitution overrides the real credential `credential.apply`
+        // wrote above, whatever order the two ran in — later wins per name.
+        if let Some((prepared, _)) = &prepared {
+            let config_option = selection
+                .credential_proxy
+                .as_ref()
+                .and_then(|proxy| proxy.base_url_config.as_deref());
+            prepared.apply_native_env(&mut command, &selection.provider, config_option)?;
         }
         log = attach_log(&mut command, options.log.as_deref())?;
         // `credentialAccount` is an account NAME, never key material (#8401).
@@ -585,10 +620,16 @@ fn run_preflight(
         if let Some(log_path) = options.log.as_deref() {
             crate::journal::execution::launch_recorded(root, log_path, &launch);
         }
+        if let Some((prepared, _)) = &prepared {
+            writeln!(log, "{}", prepared.dispatch_marker())
+                .and_then(|()| log.flush())
+                .map_err(|e| LaunchError::config(e.to_string()))?;
+        }
         if let Some(route) = &gateway {
             writeln!(log, "{}", route.marker(&runtime))
                 .map_err(|e| LaunchError::config(e.to_string()))?;
         }
+        native_prepared = prepared.map(|(prepared, _)| prepared);
         command
     } else {
         let runner = scripts.join(format!("spawn-{runtime}.sh"));
@@ -830,7 +871,15 @@ fn run_preflight(
             runtime_span = Some(run);
         }
     }
-    let result = exec(command);
+    let result = if let Some(prepared) = native_prepared {
+        // #11300 slice 3, item 5: this launcher stays alive as the harness's
+        // parent for exactly the launch's lifetime — the one native path that
+        // does not `exec` — serving the proxy and closing the placeholder the
+        // moment the child exits.
+        egress_proxy::run_with_proxy(prepared, command, &mut log)
+    } else {
+        exec(command)
+    };
     if let Some(span) = runtime_span {
         span.finish("spawn_failed", crate::telemetry::trace::SpanStatus::Error);
     }
