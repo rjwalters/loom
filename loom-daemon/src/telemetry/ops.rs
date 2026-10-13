@@ -165,6 +165,13 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     // value came from. Never the path or the command.
     "loom.guard.root",
     "loom.guard.source",
+    // `build_gate.run` spans (#11690): one host-side run of
+    // `buildGate.command` — stage, tier, outcome, duration and attempt.
+    "loom.build_gate.stage",
+    "loom.build_gate.tier",
+    "loom.build_gate.outcome",
+    "loom.build_gate.duration_ms",
+    "loom.build_gate.attempt",
 ];
 
 /// Longest label value kept, in bytes.
