@@ -333,6 +333,9 @@ fn ready(endpoint: &str) {
 #[test]
 #[ignore = "requires Docker; starts three isolated pinned Collector containers"]
 fn three_signals_fan_out_auth_redact_and_survive_outage_restart() {
+    if !hub_image::available(IMAGE) {
+        return;
+    }
     let mut trial = Trial::new();
     let a = trial.start("clickstack", &sink_config(true), "clickstack-collector");
     let b = trial.start("signoz", &sink_config(false), "signoz-otel-collector");
@@ -415,6 +418,9 @@ fn wait_counter(trial: &Trial, gateway: &str, prefix: &str) {
 #[test]
 #[ignore = "requires Docker; isolated queue/storage/credential fault injections"]
 fn queue_retry_storage_and_credentials_fail_visibly() {
+    if !hub_image::available(IMAGE) {
+        return;
+    }
     let mut trial = Trial::new();
     let config = CONFIG
         .replace("limit_mib: 384", "limit_mib: 160")
@@ -501,6 +507,9 @@ fn queue_retry_storage_and_credentials_fail_visibly() {
 #[test]
 #[ignore = "requires Docker; starts three isolated pinned Collector containers"]
 fn ci_job_log_bodies_are_scrubbed_at_the_gateway_before_both_sinks() {
+    if !hub_image::available(IMAGE) {
+        return;
+    }
     let mut trial = Trial::new();
     let a = trial.start("clickstack", &sink_config(true), "clickstack-collector");
     let b = trial.start("signoz", &sink_config(false), "signoz-otel-collector");

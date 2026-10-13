@@ -168,6 +168,9 @@ fn by<'a>(rows: &'a [Row], key: &str, value: &str) -> &'a Row {
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn committed_usage_queries_answer_the_measured_usage_questions_on_real_clickhouse() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
     // ---- the file runs verbatim, as one pass, exactly as documented --------
     let verbatim = format!("{FIXTURE}\n{QUERIES}");
     clickhouse(&verbatim, "TSV");
@@ -310,6 +313,9 @@ fn committed_usage_queries_answer_the_measured_usage_questions_on_real_clickhous
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn reading_a_token_counter_from_attributes_number_silently_returns_zero() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
     let probe = format!(
         "{FIXTURE}\n\
          SELECT count() AS usage_spans,\n\

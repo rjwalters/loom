@@ -2,7 +2,6 @@
 //! and the pull's deadline, fallback and terminal report against a fake
 //! `docker` that stalls or fails on demand.
 
-#[allow(dead_code)] // `resolve` needs Docker; exercised by the Docker-backed proofs.
 #[path = "common/hub_image.rs"]
 mod hub_image;
 
@@ -36,6 +35,99 @@ fn only_hostless_references_are_docker_hub() {
     assert!(!hub_image::is_docker_hub("ghcr.io/rjwalters/loom-worker-session:latest"));
     assert!(!hub_image::is_docker_hub("localhost:5000/ubuntu:24.04"));
     assert!(!hub_image::is_docker_hub("localhost/ubuntu"));
+}
+
+/// `on_unavailable` over a fixed environment, never the process's own.
+fn policy(vars: &[(&str, &str)]) -> hub_image::OnUnavailable {
+    hub_image::on_unavailable(|name| {
+        vars.iter()
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| (*value).to_string())
+    })
+}
+
+#[test]
+fn a_pull_request_skips_an_unavailable_image() {
+    use hub_image::OnUnavailable::Skip;
+    for event in ["pull_request", "pull_request_target", "merge_group"] {
+        let env = [
+            ("GITHUB_ACTIONS", "true"),
+            ("GITHUB_EVENT_NAME", event),
+            ("GITHUB_REF", "refs/pull/11756/merge"),
+        ];
+        assert_eq!(policy(&env), Skip, "{event}");
+    }
+}
+
+#[test]
+fn main_and_everything_else_fail_closed() {
+    use hub_image::OnUnavailable::Fail;
+    let ci = |event: &'static str, git_ref: &'static str| {
+        policy(&[
+            ("GITHUB_ACTIONS", "true"),
+            ("GITHUB_EVENT_NAME", event),
+            ("GITHUB_REF", git_ref),
+        ])
+    };
+    assert_eq!(ci("push", "refs/heads/main"), Fail);
+    // A PR-shaped event that somehow carries main's ref is still main.
+    assert_eq!(ci("pull_request", "refs/heads/main"), Fail);
+    assert_eq!(ci("schedule", "refs/heads/main"), Fail);
+    assert_eq!(ci("workflow_dispatch", "refs/heads/feature/x"), Fail);
+    assert_eq!(ci("push", "refs/heads/feature/x"), Fail);
+    // Outside Actions (a developer's own --ignored run) the event is not trusted.
+    assert_eq!(policy(&[("GITHUB_EVENT_NAME", "pull_request")]), Fail);
+    assert_eq!(policy(&[]), Fail);
+}
+
+#[test]
+fn the_override_wins_in_both_directions() {
+    use hub_image::OnUnavailable::{Fail, Skip};
+    assert_eq!(policy(&[("LOOM_TEST_IMAGE_UNAVAILABLE", "skip")]), Skip);
+    let pr = [
+        ("GITHUB_ACTIONS", "true"),
+        ("GITHUB_EVENT_NAME", "pull_request"),
+        ("LOOM_TEST_IMAGE_UNAVAILABLE", "fail"),
+    ];
+    assert_eq!(policy(&pr), Fail);
+}
+
+#[test]
+fn only_an_exhausted_pull_is_skipped_or_failed() {
+    use hub_image::{outcome, OnUnavailable, Outcome};
+    let pulled = || Ok::<_, Vec<String>>("mirror.test/library/ubuntu:24.04".to_string());
+    let failed = || Err::<String, _>(vec!["toomanyrequests".to_string()]);
+    for policy in [OnUnavailable::Skip, OnUnavailable::Fail] {
+        assert_eq!(
+            outcome(pulled(), policy),
+            Outcome::Use("mirror.test/library/ubuntu:24.04".to_string())
+        );
+    }
+    assert_eq!(
+        outcome(failed(), OnUnavailable::Skip),
+        Outcome::Skip(vec!["toomanyrequests".to_string()])
+    );
+    assert_eq!(
+        outcome(failed(), OnUnavailable::Fail),
+        Outcome::Fail(vec!["toomanyrequests".to_string()])
+    );
+}
+
+#[test]
+fn a_skip_is_a_greppable_warning_and_a_summary_line_per_test() {
+    let dir = tempfile::tempdir().unwrap();
+    let summary = dir.path().join("summary.md");
+    std::fs::write(&summary, "").unwrap();
+    let failures = vec!["mirror.gcr.io/library/ubuntu:24.04 (attempt 1): 503".to_string()];
+    for test in ["first_test", "second_test"] {
+        let annotation = hub_image::report_skip("ubuntu:24.04", test, &failures, Some(&summary));
+        assert!(annotation.starts_with("::warning "), "{annotation}");
+        assert!(annotation.contains("::image-unavailable ubuntu:24.04 "), "{annotation}");
+        assert!(annotation.contains(test), "{annotation}");
+    }
+    let written = std::fs::read_to_string(&summary).unwrap();
+    assert_eq!(written.matches("**SKIPPED**").count(), 2, "{written}");
+    assert!(written.contains("`second_test`: image-unavailable `ubuntu:24.04`"));
 }
 
 #[cfg(unix)]

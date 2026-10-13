@@ -134,6 +134,9 @@ fn by_bucket(rows: &[Row], account: &str, column: &str) -> Vec<f64> {
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn committed_github_shadow_queries_charge_each_quota_window_once() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
     // The file runs verbatim, comments included, as the README says.
     clickhouse(&format!("{FIXTURE}\n{SHADOW}"), "TSV");
 
