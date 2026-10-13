@@ -228,6 +228,17 @@ _gitea_validate_basic_auth() {
 
 # --- Gitea API Helper ---
 
+# _curl_cfg_quote <value> -> value escaped for a double-quoted curl config
+# string (backslash and double quote; newlines stripped). Used with
+# `curl --config <(printf ...)` so credentials never reach curl's argv (#10463).
+_curl_cfg_quote() {
+  local v="$1"
+  v="${v//$'\n'/}"; v="${v//$'\r'/}"
+  v="${v//\\/\\\\}"
+  v="${v//\"/\\\"}"
+  printf '%s' "$v"
+}
+
 # Make a Gitea API request using curl.
 # Usage: gitea_api METHOD path [curl-args...]
 # Returns: response body on stdout, exit code 0 on 2xx, 1 on error
@@ -264,7 +275,7 @@ gitea_api() {
     # of "user:pass" internally; we never echo the password to the log.
     response=$(curl -s -w "\n%{http_code}" \
       -X "$method" \
-      -u "${_GITEA_USERNAME}:${_GITEA_TOKEN}" \
+      --config <(printf 'user = "%s:%s"\n' "$(_curl_cfg_quote "$_GITEA_USERNAME")" "$(_curl_cfg_quote "$_GITEA_TOKEN")") \
       -H "Content-Type: application/json" \
       -H "Accept: application/json" \
       "$@" \
@@ -273,7 +284,7 @@ gitea_api() {
     # Token auth (existing behavior, unchanged).
     response=$(curl -s -w "\n%{http_code}" \
       -X "$method" \
-      -H "Authorization: token $_GITEA_TOKEN" \
+      --config <(printf 'header = "Authorization: token %s"\n' "$(_curl_cfg_quote "$_GITEA_TOKEN")") \
       -H "Content-Type: application/json" \
       -H "Accept: application/json" \
       "$@" \
@@ -1990,13 +2001,13 @@ forge_get_required_status_check_contexts() {
     if [[ -n "$_GITEA_USERNAME" ]]; then
       response=$(curl -s -w "\n%{http_code}" \
         -X GET \
-        -u "${_GITEA_USERNAME}:${_GITEA_TOKEN}" \
+        --config <(printf 'user = "%s:%s"\n' "$(_curl_cfg_quote "$_GITEA_USERNAME")" "$(_curl_cfg_quote "$_GITEA_TOKEN")") \
         -H "Accept: application/json" \
         "$url" 2>/dev/null) || return 1
     else
       response=$(curl -s -w "\n%{http_code}" \
         -X GET \
-        -H "Authorization: token $_GITEA_TOKEN" \
+        --config <(printf 'header = "Authorization: token %s"\n' "$(_curl_cfg_quote "$_GITEA_TOKEN")") \
         -H "Accept: application/json" \
         "$url" 2>/dev/null) || return 1
     fi
