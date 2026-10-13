@@ -257,6 +257,7 @@ defaults/scripts/sweep-run-registry.sh                                         c
 defaults/scripts/sync-labels.sh                                                contract    Invocation contract: shipped to consumer repos and invoked as `.loom/scripts/sync-labels.sh` from role prompts, CI, or hooks. The name stays; new logic goes behind it into loom-daemon.
 defaults/scripts/tests/cargo-test-daemon-guard.sh                              test        Shell test harness/fixture for the suites in defaults/scripts/tests/ — follows its subject (#7758).
 defaults/scripts/tests/check-ci-suite-manifest.sh                              test        Shell test harness/fixture for the suites in defaults/scripts/tests/ — follows its subject (#7758).
+defaults/scripts/tests/lib/assert.sh                                           test        Shell test harness/fixture for the suites in defaults/scripts/tests/lib/ — follows its subject (#7758).
 defaults/scripts/tests/lib/bg-proc-trap.sh                                     test        Shell test harness/fixture for the suites in defaults/scripts/tests/lib/ — follows its subject (#7758).
 defaults/scripts/tests/lib/launchd-sandbox.sh                                  test        Shell test harness/fixture for the suites in defaults/scripts/tests/lib/ — follows its subject (#7758).
 defaults/scripts/tests/lib/live-state-sandbox.sh                               test        Shell test harness/fixture for the suites in defaults/scripts/tests/lib/ — follows its subject (#7758).
