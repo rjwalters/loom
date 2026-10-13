@@ -18,11 +18,13 @@
 //! or `|`. Comment-only lines start no statement.
 //!
 //! A statement is a **queue query** when it both
-//! 1. lists items: `issue list`, `pr list`, `gh search issues|prs`, or the
-//!    REST `search/issues` endpoint; and
+//! 1. lists items: `issue list`, `pr list`, `gh search issues|prs`, the
+//!    REST `search/issues` endpoint, or a REST `…/issues?…labels=…` listing;
+//!    and
 //! 2. positively selects by a Loom label: `--label loom:…` / `--label "$VAR"`
-//!    (a variable label is assumed to be a Loom one), or a search qualifier
-//!    `label:loom:…` that is not negated with `-`.
+//!    (a variable label is assumed to be a Loom one), a search qualifier
+//!    `label:loom:…` that is not negated with `-`, or a REST `labels=loom:…`
+//!    / `labels=$VAR` query parameter (`%3A` for the colon counts too).
 //!
 //! A queue query passes when the statement itself, or the comment lines
 //! directly above it, contain one of:
@@ -35,7 +37,7 @@
 //! - a direct call to `skip-labels.sh` or `hard-exclusion-labels.sh`.
 //!
 //! Known blind spots, by design: a query that selects only in its jq filter
-//! (no `--label`), and queries in prose. Both are left to review rather than a
+//! (no `--label` / `labels=`), and queries in prose. Both are left to review rather than a
 //! fuzzier heuristic that would flag non-queue `gh` calls.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -47,13 +49,20 @@ use std::sync::LazyLock;
 use regex::Regex;
 
 static LISTS_ITEMS: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b(?:issue|pr) list\b|search/issues|\bgh search (?:issues|prs)\b").unwrap()
+    Regex::new(
+        r"\b(?:issue|pr) list\b|search/issues|\bgh search (?:issues|prs)\b|/issues\?\S*\blabels=",
+    )
+    .unwrap()
 });
 
-/// `--label loom:x`, `--label="loom:x"`, `--label "$L"`, or a non-negated
-/// `label:loom:x` search qualifier.
+/// `--label loom:x`, `--label="loom:x"`, `--label "$L"`, a non-negated
+/// `label:loom:x` search qualifier, or a REST `labels=loom:x` / `labels=$L`
+/// parameter.
 static SELECTS_LABEL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"--label[= ]+["']?(?:loom:|\$)|(?:^|[\s"'+(])label:["']?loom:"#).unwrap()
+    Regex::new(
+        r#"--label[= ]+["']?(?:loom:|\$)|(?:^|[\s"'+(])label:["']?loom:|[?&]labels=(?:loom(?::|%3A)|\$)"#,
+    )
+    .unwrap()
 });
 
 static EXCLUDES_FROZEN: LazyLock<Regex> =
@@ -220,6 +229,19 @@ fn ignores_prose_comments_and_negated_or_unlabelled_queries() {
                gh issue edit 1 --add-label loom:issue\n```\n\
                gh issue list --label loom:issue\n";
     assert!(scan(doc).is_empty(), "{:?}", scan(doc));
+}
+
+#[test]
+fn flags_a_rest_labels_listing_and_passes_its_jq_exclusion() {
+    let q = "gh api --paginate \"repos/{owner}/{repo}/issues?state=open&labels=loom:issue\" \\\n  \
+             --jq '[.[] | select(.pull_request == null)";
+    assert_eq!(scan(&format!("```bash\n{q}]'\n```\n")).len(), 1);
+    let ok = format!("```bash\n{q} | select(all(.labels[].name; . != \"loom:frozen\"))]'\n```\n");
+    assert!(scan(&ok).is_empty());
+    let enc = "```bash\ngh api \"repos/o/r/issues?labels=loom%3Apr&state=open\"\n```\n";
+    assert_eq!(scan(enc).len(), 1);
+    // A REST read with no label selector is not a queue query.
+    assert!(scan("```bash\ngh api \"repos/o/r/issues?state=open\"\n```\n").is_empty());
 }
 
 #[test]

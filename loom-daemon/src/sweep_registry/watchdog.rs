@@ -4,6 +4,7 @@
 
 mod activity;
 mod dirty_probe;
+mod forge_comments;
 mod reset_quarantine;
 
 use super::*;
@@ -1150,67 +1151,6 @@ impl SweepRegistry {
         restarts
     }
 
-    /// Best-effort forge comment when the startup watchdog gives up (Issue
-    /// #5302): the bounded auto-restart (#3887) already retried this issue's
-    /// sweep exactly once and it is still stuck, so nothing further will
-    /// happen automatically until an operator acts. Before this, "giving up"
-    /// meant only a `log::error!` line — invisible unless someone was
-    /// tailing the daemon log at the moment it fired. Mirrors
-    /// [`SweepRegistry::apply_quarantine_label`]'s "post a comment so the
-    /// pause is visible to a human on the forge, not just in the daemon
-    /// log" pattern.
-    ///
-    /// Called from exactly one call site, already inside the
-    /// `self.watchdog_gaveup.insert(issue)` dedup guard [`watchdog_once`]
-    /// uses to log the give-up once — so this posts at most one comment per
-    /// issue no matter how many subsequent ticks re-observe the same
-    /// give-up (the same dedup fixture the existing
-    /// `watchdog_restarts_hung_sweep_once_then_gives_up` test already
-    /// exercises for the log line).
-    ///
-    /// Skipped when label flips are disabled (test fixtures /
-    /// `skip_label_flip`), matching every other best-effort forge mutation
-    /// in this registry. Every step is best-effort: a `gh` failure only logs
-    /// (at `warn`, not `debug` — a silently-dropped give-up notice defeats
-    /// the whole point of this method), it never affects the load-bearing
-    /// `watchdog_gaveup` dedup state, which the caller already committed
-    /// before this runs.
-    fn post_watchdog_gaveup_comment(&self, issue: u32, elapsed: Duration) {
-        if self.config.skip_label_flip {
-            return;
-        }
-        let body = format!(
-            "{marker}: this issue's sweep made no progress for {elapsed_secs}s, exhausted its \
-             one bounded auto-restart (#3887), and is still stuck — the daemon has stopped \
-             retrying and left it running for operator triage rather than looping forever. \
-             Investigate the sweep log, then either cancel the stuck sweep and re-dispatch the \
-             issue, or investigate the underlying hang (e.g. an MCP-init race, #3887). This \
-             issue remains held at `loom:building` until you act.",
-            marker = WATCHDOG_GAVEUP_COMMENT_MARKER,
-            elapsed_secs = elapsed.as_secs(),
-        );
-        // Counted as `watchdog.gaveup_comment` (#10089), scoped to the
-        // workspace (#5401 GH_CONFIG_DIR).
-        let issue_arg = issue.to_string();
-        let mut comment = vec!["issue", "comment", &issue_arg, "--body", &body];
-        let repo_flag = crate::claim_reconciliation::gh_call::loom_repo_flag();
-        comment.extend(repo_flag.iter().map(String::as_str));
-        let timeout = reap_gh_timeout();
-        match self.gh_write("watchdog.gaveup_comment", comment) {
-            Ok(Some(output)) if output.status.success() => {}
-            Ok(Some(output)) => log::warn!(
-                "watchdog: give-up comment for #{issue} exited {:?}: {}",
-                output.status.code(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            ),
-            Ok(None) => log::warn!(
-                "watchdog: give-up comment for #{issue} exceeded {}s, killed (#3973)",
-                timeout.as_secs()
-            ),
-            Err(e) => log::warn!("watchdog: give-up comment for #{issue} failed: {e}"),
-        }
-    }
-
     // ------------------------------------------------------------------------
     // Mid-build-death watchdog (Issue #3895)
     // ------------------------------------------------------------------------
@@ -2286,50 +2226,6 @@ impl SweepRegistry {
             }
         }
         reaped
-    }
-
-    /// Best-effort forge comment when the stale-sweep backstop reaps an
-    /// untracked sweep (Issue #7529) — mirrors
-    /// [`post_watchdog_gaveup_comment`](Self::post_watchdog_gaveup_comment)'s
-    /// "make the daemon-log-only fact visible on the forge" pattern, except
-    /// this backstop already acted (restored `loom:issue`) rather than
-    /// leaving the issue held.
-    fn post_stale_sweep_comment(&self, finding: &StaleSweepFinding) {
-        if self.config.skip_label_flip {
-            return;
-        }
-        let body = format!(
-            "{marker}: this issue's sweep (pid {pid}) had been running {elapsed_secs}s with its \
-             log silent and no daemon-retained process handle for it — a sweep that survived a \
-             prior daemon restart, which strips it of coverage from both the startup-hang \
-             (#3887) and review-stall (#3910) watchdogs (#7529). The daemon has cancelled the \
-             process and restored `loom:issue` so this issue can be re-dispatched.",
-            marker = STALE_SWEEP_COMMENT_MARKER,
-            pid = finding.pid,
-            elapsed_secs = finding.elapsed.as_secs(),
-        );
-        let issue_arg = finding.issue.to_string();
-        let mut comment = vec!["issue", "comment", &issue_arg, "--body", &body];
-        let repo_flag = crate::claim_reconciliation::gh_call::loom_repo_flag();
-        comment.extend(repo_flag.iter().map(String::as_str));
-        let timeout = reap_gh_timeout();
-        match self.gh_write("watchdog.stale_comment", comment) {
-            Ok(Some(output)) if output.status.success() => {}
-            Ok(Some(output)) => log::warn!(
-                "stale-sweep-watchdog: reap comment for #{} exited {:?}: {}",
-                finding.issue,
-                output.status.code(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            ),
-            Ok(None) => log::warn!(
-                "stale-sweep-watchdog: reap comment for #{} exceeded {}s, killed (#3973)",
-                finding.issue,
-                timeout.as_secs()
-            ),
-            Err(e) => {
-                log::warn!("stale-sweep-watchdog: reap comment for #{} failed: {e}", finding.issue)
-            }
-        }
     }
 }
 

@@ -1050,8 +1050,10 @@ impl SweepRegistry {
         // slow or hung `gh` can never delay (or, via a daemon restart in that
         // window, lose) the `sweep.outcome` record. See `writeback`'s module
         // doc for the full fail-open contract.
-        let writeback_record =
-            (process_result == telemetry::SweepResult::Success).then(|| outcome_record.clone());
+        // #11743: and only on an issue the same read shows is not frozen.
+        let writeback_record = (process_result == telemetry::SweepResult::Success
+            && writeback::writeback_admitted(issue, &issue_signals))
+        .then(|| outcome_record.clone());
         let result_name = serde_json::to_value(result)
             .ok()
             .and_then(|v| v.as_str().map(str::to_owned))
