@@ -265,7 +265,6 @@
 //! `state: closed`. The shell acts on a positively received verdict; a lost
 //! one falls back to the retired shell predicate (as `revalidate-head` does).
 
-pub mod chain_lock;
 pub mod check_runs_rollup;
 pub mod check_runs_streak;
 pub mod checks_failure;

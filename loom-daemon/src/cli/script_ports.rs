@@ -755,12 +755,6 @@ pub(crate) enum MergePrCommand {
     /// 2 = could not run (must also refuse).
     TreeChecks(super::merge_pr_tree_checks::TreeChecksArgs),
 
-    /// The chain-head merge lock (#10167): defer this merge while another
-    /// PR on the same base is a re-dating chain head whose required checks
-    /// have not reported. Exit 0 = proceed (CLEAR / OVERRIDDEN / FAIL-OPEN),
-    /// 6 = deferred (HELD / UNREADABLE). Never writes to the forge.
-    ChainLock(super::merge_pr_chain_lock::ChainLockArgs),
-
     /// Refuse a merge whose head's latest `CI` workflow run did not conclude
     /// `success` (#10444), naming the cancelled/failed jobs. Exit 0+CLEAN =
     /// success, 0+UNVERIFIED = no definite verdict (caller warns), 1 = refuse,
@@ -1142,7 +1136,6 @@ impl MergePrCommand {
             MergePrCommand::MergeableRecheck(args) => args.run(),
             MergePrCommand::StaleChecks(args) => args.run(),
             MergePrCommand::TreeChecks(args) => args.run(),
-            MergePrCommand::ChainLock(args) => args.run(),
             MergePrCommand::CiResult(args) => args.run(),
             MergePrCommand::RequiredChecks(args) => args.run(),
             MergePrCommand::HeadSyncRetry(args) => args.run(),

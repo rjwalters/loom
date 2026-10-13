@@ -116,3 +116,7 @@ scripts/tests/test-require-complexity-marker.sh
 # sizing signal and do not route.
 scripts/resolve-tier-model.sh
 scripts/tests/test-resolve-tier-model.sh
+
+# #11707 (PR #11724, 2026-10-13) — the chain-head merge lock (#10428/#10478)
+# removed from merge-pr.sh; its dedicated shell suite goes with it.
+scripts/tests/test-merge-pr-chain-lock.sh

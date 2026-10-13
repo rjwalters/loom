@@ -91,9 +91,8 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "verdict.pr_comments"
         | "quarantine.issue_comments"
         | "sequence.trusted_bodies"
-        | "chain_lock.comments"
         | "roster.comments" => ops::COMMENT_LIST,
-        "claim.pr_labels" | "sequence.predecessor" | "chain_lock.pr_base" => ops::PR_VIEW_STATE,
+        "claim.pr_labels" | "sequence.predecessor" => ops::PR_VIEW_STATE,
         "park_hold.issue_view" => ops::ISSUE_VIEW_STATE,
         "park_hold.issue_body" => ops::ISSUE_EDIT_BODY,
         "intake.list_open" | "quarantine.issue_list" => ops::ISSUE_LIST,
