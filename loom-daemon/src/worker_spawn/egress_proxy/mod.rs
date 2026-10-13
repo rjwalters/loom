@@ -207,7 +207,14 @@ fn truthy(value: &str) -> bool {
 /// keep running contained with plain env-passthrough.
 #[must_use]
 pub fn enabled(config: &Value) -> bool {
-    if let Some(raw) = env_nonempty("LOOM_NATIVE_CREDENTIAL_PROXY") {
+    enabled_with(config, &env_nonempty)
+}
+
+/// [`enabled`] with the environment injected, so a caller that already reads
+/// env through a seam (the LLM gateway's `plan_with`) asks the same question.
+#[must_use]
+pub fn enabled_with(config: &Value, env: &dyn Fn(&str) -> Option<String>) -> bool {
+    if let Some(raw) = env("LOOM_NATIVE_CREDENTIAL_PROXY").filter(|v| !v.trim().is_empty()) {
         return truthy(&raw);
     }
     match config.pointer("/runtimes/containment/credentialProxy") {

@@ -543,17 +543,9 @@ fn run_preflight(
         // only — the in-container copy must never arm a second proxy (its
         // credential is the placeholder already, and the real one is not
         // present there).
-        let prepared = if nonempty_env("LOOM_SPAWN_CONTAINERIZED").is_none() {
-            if gateway.is_some()
-                && egress_proxy::enabled(&config)
-                && selection.credential_proxy.is_some()
-            {
-                return Err(LaunchError::config(
-                    "this model profile is routed through the LLM gateway and declares a \
-                     credentialProxy block; the two both rewrite where the provider is \
-                     reached, so only one may be active (#9473)",
-                ));
-            }
+        // A gateway-routed profile never reaches here with an armed proxy:
+        // `llm_gateway::plan` refuses that pairing (gated on the same switch).
+        let prepared = if gateway.is_none() && nonempty_env("LOOM_SPAWN_CONTAINERIZED").is_none() {
             egress_proxy::prepare_native(root, &selection, &config, &runtime)?
         } else {
             None

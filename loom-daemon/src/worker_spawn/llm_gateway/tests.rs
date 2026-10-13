@@ -229,7 +229,10 @@ fn a_subscription_or_login_store_profile_refuses_instead_of_routing() {
     oauth.credential_sources = vec!["CLAUDE_CODE_OAUTH_TOKEN".into()];
     let error = plan_of("opencode", &oauth, &env).unwrap_err();
     assert!(error.message.contains("OAuth"), "{}", error.message);
-    // credentialProxy re-points the same endpoint.
+}
+
+#[test]
+fn a_declared_credential_proxy_collides_with_the_gateway_only_when_armed() {
     let mut proxied = api_key_selection("quick-cerebras");
     proxied.credential_proxy = Some(crate::worker_spawn::egress_proxy::ProfileProxy {
         upstream: "https://api.example.com".into(),
@@ -238,7 +241,31 @@ fn a_subscription_or_login_store_profile_refuses_instead_of_routing() {
         observe: false,
         base_url_config: None,
     });
-    assert!(plan_of("opencode", &proxied, &env).is_err());
+    // Switch off (the default): the declaration is inert, so the profile
+    // still routes through the gateway (#11300 — bundled zai-flash).
+    let off = routed_env();
+    assert!(matches!(plan_of("opencode", &proxied, &off), Ok(Some(_))));
+    // Switch armed by env: both would re-point the same endpoint -> refuse.
+    let on = env_of(&[
+        (URL_ENV, URL),
+        (PROFILES_ENV, "quick-cerebras"),
+        (VK_ENV, VK),
+        ("LOOM_NATIVE_CREDENTIAL_PROXY", "1"),
+    ]);
+    let error = plan_of("opencode", &proxied, &on).unwrap_err();
+    assert!(error.message.contains("credentialProxy"), "{}", error.message);
+    // Switch armed by config: same refusal.
+    let config = json!({"runtimes": {"containment": {"credentialProxy": true}}});
+    let error = plan_with("opencode", &proxied, &config, &off).unwrap_err();
+    assert!(error.message.contains("credentialProxy"), "{}", error.message);
+    // Env can turn an armed config back off.
+    let env_off = env_of(&[
+        (URL_ENV, URL),
+        (PROFILES_ENV, "quick-cerebras"),
+        (VK_ENV, VK),
+        ("LOOM_NATIVE_CREDENTIAL_PROXY", "0"),
+    ]);
+    assert!(matches!(plan_with("opencode", &proxied, &config, &env_off), Ok(Some(_))));
 }
 
 #[test]
