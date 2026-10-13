@@ -7,6 +7,9 @@
 //! this module makes sure exactly one open "Fix main CI" issue exists for it,
 //! and closes that issue again once `main` is verified green.
 //!
+//! **Off by default** (`autonomous.workFinder.redMainAutofile.enabled`); the
+//! fleet turns it on through its config once it has been seen to behave.
+//!
 //! # The verdict
 //!
 //! The same two sources the lane reads ([`RedMainLane`]):
@@ -17,7 +20,9 @@
 //!   tail of a red run's output for the issue body). Before the gate's first
 //!   verdict in this process the answer is unknown, and nothing happens.
 //! - **Gate off** ([`RedMainLane::gate_disabled`]). The newest default-branch
-//!   commit's workflow runs ([`ci_verdict`]): any run concluded `failure`,
+//!   commit's **push** workflow runs ([`ci_verdict`], read through the lane's
+//!   own cached `gh run list --event push`, so scheduled, `workflow_run`,
+//!   dynamic and fork-PR runs never count): any run concluded `failure`,
 //!   `timed_out` or `startup_failure` is red (the lane's own test,
 //!   [`super::main_red_fix::latest_run_is_failure`]); every run completed with
 //!   none failed and at least one success is green; anything else (runs still
@@ -28,20 +33,29 @@
 //! # The issue
 //!
 //! An open issue counts as the auto-filed fix when its body carries both
-//! [`MAIN_RED_FIX_MARKER`] and [`MAIN_RED_AUTO_MARKER`] at the start of a line
-//! and it is labelled `loom:very-important` (the listing reads that label, so
-//! only someone who can label issues can make one count). [`decide`] is the
-//! whole policy, pure:
+//! [`MAIN_RED_FIX_MARKER`] and [`MAIN_RED_AUTO_MARKER`] at the start of a
+//! line, it is labelled `loom:very-important` (the listing reads that label), and
+//! its author is trusted by [`crate::comment_trust`] (the daemon's own
+//! identity, this fleet's Apps, repo insiders, the allowlist). [`decide`] is
+//! the whole policy, pure:
 //!
 //! - red, none open: create `Fix red main CI (<short sha>)` with `loom:issue`
 //!   and `loom:very-important`, both markers, the failing SHA, what failed and
-//!   a run link (or the gate output tail);
+//!   a run link (or the gate output tail) — unless an auto-filed issue for
+//!   the same SHA was closed within [`RECREATE_COOLDOWN`], or the SHA is
+//!   unknown;
 //! - red, one open: reuse it; when the failing SHA moved, comment once naming
 //!   the newer SHA;
-//! - green: close each auto-filed issue with a comment naming the green SHA,
-//!   unless a PR is open against it;
+//! - green: close each auto-filed issue, then comment naming the green SHA —
+//!   only when `main` is green at a **different** commit than the issue was
+//!   filed for, and never while a PR is open against it or it is
+//!   `loom:building`;
 //! - more than one open (two hosts filed at once): keep the oldest, close the
 //!   rest as duplicates of it.
+//!
+//! The SHA rules are what keep hosts that disagree (one host's local gate red
+//! on a commit another host's gate passes) from filing and closing the same
+//! issue every interval.
 //!
 //! An issue a person filed with only the fix marker is never counted, reused
 //! or closed here.
@@ -59,11 +73,12 @@
 //!
 //! At most one reconcile per repo per [`DEFAULT_INTERVAL`]
 //! (`autonomous.workFinder.redMainAutofile.intervalSecs`), sooner only when
-//! the gate's verdict changes. A reconcile is one CI read (gate off), one
-//! issue listing, and writes only when something changes. A green repo whose
-//! last listing found nothing is listed again only every
-//! [`GREEN_RELIST_EVERY`]. `autonomous.workFinder.redMainAutofile.enabled:
-//! false` turns it off. The rate-limit breaker skips it like any forge read.
+//! the gate's verdict changes. A reconcile is one CI read (gate off, shared
+//! with the lane's cache), one issue listing, and writes only when something
+//! changes. A gate-off repo green with nothing open reads CI only every
+//! [`QUIET_GREEN_PROBE_EVERY`], and a green repo whose last listing found
+//! nothing is listed again only every [`GREEN_RELIST_EVERY`]. The rate-limit
+//! breaker skips it like any forge read.
 //!
 //! Each create, reuse, close and duplicate close is one `main_red.autofile`
 //! span (repo, SHA, action, issue number).
@@ -86,6 +101,17 @@ const SHA_MARKER_PREFIX: &str = "<!-- loom:main-red-sha ";
 /// The labels a created issue carries: ready for dispatch, and the
 /// very-important level (the label the listing also reads).
 pub const AUTO_LABELS: [&str; 2] = ["loom:issue", "loom:very-important"];
+
+/// The claim label: an issue a sweep holds is never closed here.
+const BUILDING_LABEL: &str = "loom:building";
+
+/// How long after an auto-filed issue for a SHA is closed that a red
+/// verdict on the same SHA does not file it again (#11766 review).
+pub const RECREATE_COOLDOWN: Duration = Duration::from_secs(6 * 3600);
+
+/// How often a gate-off repo whose last reconcile was green with nothing
+/// open reads CI (instead of every interval).
+pub const QUIET_GREEN_PROBE_EVERY: Duration = Duration::from_secs(1800);
 
 /// Default time between reconciles of one repo.
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(600);
@@ -171,6 +197,8 @@ pub struct OpenAuto {
     pub sha: Option<String>,
     /// A PR is open against it.
     pub has_open_pr: bool,
+    /// A sweep holds it (`loom:building`): never closed under it.
+    pub building: bool,
 }
 
 /// One forge change [`decide`] asks for.
@@ -273,31 +301,55 @@ pub fn body_for(e: &RedEvidence, branch: &str) -> String {
     body
 }
 
-/// What to do this reconcile. `open` is every open auto-filed issue.
+/// What to do this reconcile. `open` is every open auto-filed issue;
+/// `recently_closed` the SHAs of auto-filed issues closed within
+/// [`RECREATE_COOLDOWN`] (read only when red with none open).
+///
+/// Two rules keep hosts that disagree from churning one issue (#11766
+/// review): a green verdict closes an issue only when `main` is green at a
+/// **different** commit than the one the issue was filed for (one host's
+/// local gate can be red on a SHA another host's gate passes), and a red
+/// verdict does not re-create for a SHA whose issue was closed recently. A
+/// red verdict with no known SHA files nothing, since neither rule could
+/// hold for it.
 #[must_use]
-pub fn decide(verdict: &Verdict, open: &[OpenAuto], branch: &str) -> Vec<Action> {
+pub fn decide(
+    verdict: &Verdict,
+    open: &[OpenAuto],
+    recently_closed: &[String],
+    branch: &str,
+) -> Vec<Action> {
     let mut open: Vec<&OpenAuto> = open.iter().collect();
     open.sort_by_key(|o| o.number);
+    let closable = |o: &&&OpenAuto| !o.has_open_pr && !o.building;
     match verdict {
         Verdict::Unknown => Vec::new(),
-        Verdict::Green { sha, .. } => open
+        Verdict::Green { sha: None, .. } => Vec::new(),
+        Verdict::Green {
+            sha: Some(green), ..
+        } => open
             .iter()
-            .filter(|o| !o.has_open_pr)
+            .filter(closable)
+            .filter(|o| o.sha.as_deref().is_some_and(|red| red != green))
             .map(|o| Action::Close {
                 number: o.number,
                 comment: format!(
-                    "`{branch}` is verified green again at {}. Closing this auto-filed \
+                    "`{branch}` is verified green again at `{green}`. Closed this auto-filed \
                      fix issue (#11766).\n\n{}",
-                    sha.as_deref()
-                        .map_or("its latest commit".to_string(), |s| format!("`{s}`")),
-                    sha.as_deref().map(sha_marker).unwrap_or_default(),
+                    sha_marker(green),
                 ),
             })
             .collect(),
         Verdict::Red(e) => {
             let Some((keep, rest)) = open.split_first() else {
+                let Some(sha) = e.sha.as_deref() else {
+                    return Vec::new();
+                };
+                if recently_closed.iter().any(|c| c == sha) {
+                    return Vec::new();
+                }
                 return vec![Action::Create {
-                    title: title_for(e.sha.as_deref()),
+                    title: title_for(Some(sha)),
                     body: body_for(e, branch),
                     labels: AUTO_LABELS.iter().map(ToString::to_string).collect(),
                 }];
@@ -310,12 +362,14 @@ pub fn decide(verdict: &Verdict, open: &[OpenAuto], branch: &str) -> Vec<Action>
                 number: keep.number,
                 newer_sha,
             }];
-            actions.extend(rest.iter().filter(|o| !o.has_open_pr).map(|o| {
-                Action::CloseDuplicate {
-                    number: o.number,
-                    of: keep.number,
-                }
-            }));
+            actions.extend(
+                rest.iter()
+                    .filter(closable)
+                    .map(|o| Action::CloseDuplicate {
+                        number: o.number,
+                        of: keep.number,
+                    }),
+            );
             actions
         }
     }
@@ -326,13 +380,23 @@ pub fn decide(verdict: &Verdict, open: &[OpenAuto], branch: &str) -> Vec<Action>
 pub struct ListedIssue {
     pub number: u32,
     pub body: String,
+    /// It carries `loom:building`.
+    pub building: bool,
 }
 
-/// The auto-filed issues in a REST `repos/{o}/{r}/issues` page (PRs and
-/// issues without both markers dropped). `None` when the payload is not a
-/// JSON array.
+/// The auto-filed issues in a REST `repos/{o}/{r}/issues` page: PRs,
+/// issues without both markers, and issues whose author `trusts` rejects
+/// are dropped. `None` when the payload is not a JSON array.
+///
+/// `trusts` is the [`crate::comment_trust`] policy in production: the
+/// daemon's own identity, this fleet's Apps, repo insiders and the
+/// allowlist. An outsider's issue carrying both markers is content, not
+/// control (it could otherwise suppress the real filing).
 #[must_use]
-pub fn parse_listing(json: &str) -> Option<Vec<ListedIssue>> {
+pub fn parse_listing(
+    json: &str,
+    trusts: impl Fn(&serde_json::Value) -> bool,
+) -> Option<Vec<ListedIssue>> {
     let rows: Vec<serde_json::Value> = serde_json::from_str(json).ok()?;
     Some(
         rows.iter()
@@ -340,9 +404,19 @@ pub fn parse_listing(json: &str) -> Option<Vec<ListedIssue>> {
             .filter_map(|r| {
                 let number = u32::try_from(r.get("number")?.as_u64()?).ok()?;
                 let body = r.get("body").and_then(serde_json::Value::as_str)?;
-                is_auto_body(body).then(|| ListedIssue {
+                let building = r
+                    .get("labels")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|ls| {
+                        ls.iter().any(|l| {
+                            l.get("name").and_then(serde_json::Value::as_str)
+                                == Some(BUILDING_LABEL)
+                        })
+                    });
+                (is_auto_body(body) && trusts(r)).then(|| ListedIssue {
                     number,
                     body: body.to_string(),
+                    building,
                 })
             })
             .collect(),
@@ -353,7 +427,7 @@ pub fn parse_listing(json: &str) -> Option<Vec<ListedIssue>> {
 /// payload (newest first) gives for its newest commit.
 #[must_use]
 pub fn ci_verdict(stdout: &str) -> Verdict {
-    let Ok(runs) = serde_json::from_str::<Vec<serde_json::Value>>(stdout) else {
+    let Some(runs) = super::main_red_fix::push_runs(stdout) else {
         return Verdict::Unknown;
     };
     let field = |r: &serde_json::Value, k: &str| {
@@ -499,6 +573,8 @@ pub trait AutofileForge {
     /// Every open issue labelled `loom:very-important` that carries both
     /// markers.
     fn list_open_auto(&mut self) -> Result<Vec<ListedIssue>, String>;
+    /// The auto-filed issues closed within [`RECREATE_COOLDOWN`].
+    fn recently_closed_auto(&mut self) -> Result<Vec<ListedIssue>, String>;
     /// Which of `issues` have an open PR against them.
     fn open_prs(&mut self, issues: &[u32]) -> HashSet<u32>;
     /// Create an issue; its number.
@@ -557,10 +633,22 @@ pub fn reconcile(
             number: i.number,
             sha: body_sha(&i.body),
             has_open_pr: with_pr.contains(&i.number),
+            building: i.building,
         })
         .collect();
+    // Read only when it can matter: red with nothing open. A failed read
+    // files nothing (it could be hiding a just-closed issue for this SHA).
+    let recently_closed: Vec<String> = if matches!(verdict, Verdict::Red(_)) && open.is_empty() {
+        forge
+            .recently_closed_auto()?
+            .iter()
+            .filter_map(|i| body_sha(&i.body))
+            .collect()
+    } else {
+        Vec::new()
+    };
     let mut applied = Vec::new();
-    for action in decide(verdict, &open, branch) {
+    for action in decide(verdict, &open, &recently_closed, branch) {
         match action {
             Action::Create {
                 title,
@@ -588,16 +676,11 @@ pub fn reconcile(
                 }
             }
             Action::Close { number, comment } => {
-                if let Err(e) = forge.comment(number, &comment) {
-                    log::warn!("main_red_autofile: comment on #{number} failed: {e}");
-                    continue;
-                }
-                match forge.close(number, false) {
-                    Ok(()) => applied.push(Applied {
+                if close_then_comment(forge, number, false, &comment) {
+                    applied.push(Applied {
                         action: "closed",
                         issue: number,
-                    }),
-                    Err(e) => log::warn!("main_red_autofile: closing #{number} failed: {e}"),
+                    });
                 }
             }
             Action::CloseDuplicate { number, of } => {
@@ -605,21 +688,35 @@ pub fn reconcile(
                     "Duplicate of #{of}: two hosts filed a fix issue for the same red `main` \
                      at once, and the older one is kept (#11766)."
                 );
-                if let Err(e) = forge.comment(number, &comment) {
-                    log::warn!("main_red_autofile: comment on #{number} failed: {e}");
-                    continue;
-                }
-                match forge.close(number, true) {
-                    Ok(()) => applied.push(Applied {
+                if close_then_comment(forge, number, true, &comment) {
+                    applied.push(Applied {
                         action: "closed_duplicate",
                         issue: number,
-                    }),
-                    Err(e) => log::warn!("main_red_autofile: closing #{number} failed: {e}"),
+                    });
                 }
             }
         }
     }
     Ok((applied, open.len()))
+}
+
+/// Close `number`, then explain why. Closing first means a close that keeps
+/// failing posts nothing, so no comment repeats every interval (#11766
+/// review); a comment that fails after the close is only logged.
+fn close_then_comment(
+    forge: &mut impl AutofileForge,
+    number: u32,
+    not_planned: bool,
+    comment: &str,
+) -> bool {
+    if let Err(e) = forge.close(number, not_planned) {
+        log::warn!("main_red_autofile: closing #{number} failed: {e}");
+        return false;
+    }
+    if let Err(e) = forge.comment(number, comment) {
+        log::warn!("main_red_autofile: comment on closed #{number} failed: {e}");
+    }
+    true
 }
 
 /// Comment once (per host, and per forge when another host already did) that
@@ -667,6 +764,12 @@ struct Schedule {
 /// Whether a repo is due a reconcile. `gate_kind` is the gate verdict's kind
 /// when the gate decides (free to read), `None` when CI does (a forge read).
 fn due(s: &Schedule, now: Instant, interval: Duration, gate_kind: Option<u8>) -> bool {
+    // A gate-off repo that was green with nothing open reads CI less often.
+    let interval = if gate_kind.is_none() && s.green_and_none {
+        interval.max(QUIET_GREEN_PROBE_EVERY)
+    } else {
+        interval
+    };
     let elapsed = s
         .last_at
         .is_none_or(|at| now.saturating_duration_since(at) >= interval);
@@ -702,7 +805,7 @@ fn config(root: &Path) -> (bool, Duration) {
     };
     let enabled = get("enabled")
         .and_then(serde_json::Value::as_bool)
-        .unwrap_or(true);
+        .unwrap_or(false);
     let interval = get("intervalSecs")
         .and_then(serde_json::Value::as_u64)
         .filter(|s| *s > 0)
@@ -757,7 +860,7 @@ fn reconcile_due(
 ) {
     let branch = super::main_red_fix::default_branch_for(root);
     let verdict =
-        verdict_for(lane, note, || probe_ci(gh, root, &branch), || origin_sha(root, &branch));
+        verdict_for(lane, note, || ci_from_lane_cache(root), || origin_sha(root, &branch));
     sched.last_at = Some(now);
     sched.last_kind = verdict.kind();
     if matches!(verdict, Verdict::Green { .. }) && !green_needs_listing(sched, now) {
@@ -883,18 +986,11 @@ fn stdout_of(outcome: CmdOutcome) -> Result<String, String> {
     }
 }
 
-fn probe_ci(gh: &Path, root: &Path, branch: &str) -> Verdict {
-    let out = gh_read(gh, root, "run.list", crate::forge_call_stats::ops::CI_WORKFLOW_RUNS_FOR_SHA)
-        .args(["run", "list", "--branch", branch, "--limit", "30"])
-        .args(["--json", "headSha,status,conclusion,workflowName,url"])
-        .run();
-    match stdout_of(out) {
-        Ok(stdout) => ci_verdict(&stdout),
-        Err(e) => {
-            log::debug!("main_red_autofile: CI read for {} failed ({e})", root.display());
-            Verdict::Unknown
-        }
-    }
+/// The CI verdict from the lane's shared, cached push-run read
+/// ([`super::main_red_fix::ci_runs`]): one `gh run list` per repo per
+/// [`super::main_red_fix::CI_FALLBACK_TTL`] for both.
+fn ci_from_lane_cache(root: &Path) -> Verdict {
+    super::main_red_fix::ci_runs(root).map_or(Verdict::Unknown, |stdout| ci_verdict(&stdout))
 }
 
 /// The production forge: `gh` through the counted facade, writes as `--input`
@@ -906,15 +1002,36 @@ struct GhForge<'a> {
     open_prs: &'a dyn Fn(&[u32]) -> HashSet<u32>,
 }
 
-impl AutofileForge for GhForge<'_> {
-    fn list_open_auto(&mut self) -> Result<Vec<ListedIssue>, String> {
+impl GhForge<'_> {
+    /// One page of `loom:very-important` issues matching `query`, kept to
+    /// trusted auto-filed ones.
+    fn list(&mut self, query: &str) -> Result<Vec<ListedIssue>, String> {
         let path =
-            format!("repos/{}/issues?state=open&labels={}&per_page=100", self.nwo, AUTO_LABELS[1]);
+            format!("repos/{}/issues?{query}&labels={}&per_page=100", self.nwo, AUTO_LABELS[1]);
         let out =
             gh_read(self.gh, self.root, "issue.list", crate::forge_call_stats::ops::ISSUE_LIST)
                 .args(["api", &path])
                 .run();
-        parse_listing(&stdout_of(out)?).ok_or_else(|| "listing was not a JSON array".to_string())
+        let stdout = stdout_of(out)?;
+        let policy = std::cell::OnceCell::new();
+        parse_listing(&stdout, |row| {
+            policy
+                .get_or_init(|| crate::comment_trust::TrustPolicy::for_root(self.root))
+                .trusts_json(row)
+        })
+        .ok_or_else(|| "listing was not a JSON array".to_string())
+    }
+}
+
+impl AutofileForge for GhForge<'_> {
+    fn list_open_auto(&mut self) -> Result<Vec<ListedIssue>, String> {
+        self.list("state=open")
+    }
+
+    fn recently_closed_auto(&mut self) -> Result<Vec<ListedIssue>, String> {
+        let since =
+            chrono::Utc::now() - chrono::Duration::from_std(RECREATE_COOLDOWN).unwrap_or_default();
+        self.list(&format!("state=closed&since={}", since.format("%Y-%m-%dT%H:%M:%SZ")))
     }
 
     fn open_prs(&mut self, issues: &[u32]) -> HashSet<u32> {

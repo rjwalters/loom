@@ -76,7 +76,8 @@ merge, so the fix leads: first in its workspace and its workspace first in the
 draw. It is not a level and changes no gate: it keeps only its existing bypass
 of the build back-off, the file-overlap gate and the repo-sharding slice,
 which a red `main` would otherwise deadlock. On a green `main` the marker
-grants nothing. The daemon files that issue itself when `main` turns red, and
+grants nothing. With `autonomous.workFinder.redMainAutofile.enabled` on (off
+by default), the daemon files that issue itself when `main` turns red, and
 closes it when `main` is green again (#11766; daemon-reference.md,
 "Auto-filed red-main fix issue").
 

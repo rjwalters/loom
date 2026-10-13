@@ -41,12 +41,13 @@ fn open(number: u32, sha: &str) -> OpenAuto {
         number,
         sha: Some(sha.to_string()),
         has_open_pr: false,
+        building: false,
     }
 }
 
 #[test]
 fn red_with_no_issue_creates_one_with_both_markers_and_labels() {
-    let actions = decide(&red(SHA), &[], "main");
+    let actions = decide(&red(SHA), &[], &[], "main");
     let [Action::Create {
         title,
         body,
@@ -68,7 +69,7 @@ fn red_with_no_issue_creates_one_with_both_markers_and_labels() {
 
 #[test]
 fn red_with_an_existing_issue_reuses_it() {
-    let actions = decide(&red(SHA), &[open(7, SHA)], "main");
+    let actions = decide(&red(SHA), &[open(7, SHA)], &[], "main");
     assert_eq!(
         actions,
         vec![Action::Reuse {
@@ -76,7 +77,7 @@ fn red_with_an_existing_issue_reuses_it() {
             newer_sha: None
         }]
     );
-    let actions = decide(&red(NEWER), &[open(7, SHA)], "main");
+    let actions = decide(&red(NEWER), &[open(7, SHA)], &[], "main");
     assert_eq!(
         actions,
         vec![Action::Reuse {
@@ -90,18 +91,18 @@ fn red_with_an_existing_issue_reuses_it() {
 fn green_closes_our_issue_unless_a_pr_is_open() {
     let mut with_pr = open(9, SHA);
     with_pr.has_open_pr = true;
-    let actions = decide(&green(), &[open(7, SHA), with_pr], "main");
+    let actions = decide(&green(), &[open(7, SHA), with_pr], &[], "main");
     let [Action::Close { number, comment }] = actions.as_slice() else {
         panic!("expected one close: {actions:?}");
     };
     assert_eq!(*number, 7);
     assert!(comment.contains(NEWER), "{comment}");
-    assert!(decide(&green(), &[], "main").is_empty());
+    assert!(decide(&green(), &[], &[], "main").is_empty());
 }
 
 #[test]
 fn duplicates_keep_the_oldest() {
-    let actions = decide(&red(SHA), &[open(12, SHA), open(10, SHA), open(11, SHA)], "main");
+    let actions = decide(&red(SHA), &[open(12, SHA), open(10, SHA), open(11, SHA)], &[], "main");
     assert_eq!(
         actions,
         vec![
@@ -117,8 +118,8 @@ fn duplicates_keep_the_oldest() {
 
 #[test]
 fn unknown_does_nothing() {
-    assert!(decide(&Verdict::Unknown, &[open(7, SHA)], "main").is_empty());
-    assert!(decide(&Verdict::Unknown, &[], "main").is_empty());
+    assert!(decide(&Verdict::Unknown, &[open(7, SHA)], &[], "main").is_empty());
+    assert!(decide(&Verdict::Unknown, &[], &[], "main").is_empty());
 }
 
 #[test]
@@ -133,9 +134,9 @@ fn the_listing_keeps_only_issues_with_both_markers() {
         {"number": 5, "body": null},
     ])
     .to_string();
-    let listed = parse_listing(&json).unwrap();
+    let listed = parse_listing(&json, |_| true).unwrap();
     assert_eq!(listed.iter().map(|i| i.number).collect::<Vec<_>>(), vec![1]);
-    assert!(parse_listing("{}").is_none());
+    assert!(parse_listing("{}", |_| true).is_none());
 }
 
 #[test]
@@ -225,6 +226,7 @@ struct FakeForge {
     created: Vec<(String, Vec<String>)>,
     closed: Vec<(u32, bool)>,
     list_fails: bool,
+    recently_closed: Vec<ListedIssue>,
 }
 
 impl AutofileForge for FakeForge {
@@ -233,6 +235,9 @@ impl AutofileForge for FakeForge {
             return Err("boom".to_string());
         }
         Ok(self.open.clone())
+    }
+    fn recently_closed_auto(&mut self) -> Result<Vec<ListedIssue>, String> {
+        Ok(self.recently_closed.clone())
     }
     fn open_prs(&mut self, issues: &[u32]) -> HashSet<u32> {
         issues
@@ -247,6 +252,7 @@ impl AutofileForge for FakeForge {
         self.open.push(ListedIssue {
             number: self.next,
             body: body.to_string(),
+            building: false,
         });
         Ok(self.next)
     }
@@ -262,7 +268,10 @@ impl AutofileForge for FakeForge {
     }
     fn close(&mut self, issue: u32, not_planned: bool) -> Result<(), String> {
         self.closed.push((issue, not_planned));
-        self.open.retain(|i| i.number != issue);
+        if let Some(i) = self.open.iter().position(|i| i.number == issue) {
+            let gone = self.open.remove(i);
+            self.recently_closed.push(gone);
+        }
         Ok(())
     }
 }
@@ -310,6 +319,7 @@ fn reconcile_reports_a_found_issue_as_reused_once_per_host() {
         open: vec![ListedIssue {
             number: 7,
             body: auto_body(SHA),
+            building: false,
         }],
         ..FakeForge::default()
     };
@@ -334,10 +344,12 @@ fn reconcile_closes_the_newer_duplicate_and_keeps_a_pr_backed_issue_on_green() {
             ListedIssue {
                 number: 21,
                 body: auto_body(SHA),
+                building: false,
             },
             ListedIssue {
                 number: 20,
                 body: auto_body(SHA),
+                building: false,
             },
         ],
         ..FakeForge::default()
@@ -436,4 +448,149 @@ fn a_change_emits_one_main_red_autofile_span() {
     assert_eq!(attr("loom.main_red.sha"), Some(SHA));
     assert_eq!(attr("loom.main_red.action"), Some("created"));
     assert_eq!(attr("loom.main_red.source"), Some("ci"));
+}
+
+#[test]
+fn hosts_that_disagree_on_one_sha_do_not_churn_the_issue() {
+    // Host A's gate is red on SHA; host B's gate is green on the same SHA.
+    let mut forge = FakeForge::default();
+    let a_red = Verdict::Red(RedEvidence {
+        source: Source::Gate,
+        sha: Some(SHA.to_string()),
+        failing: Vec::new(),
+        run_url: None,
+        gate_tail: None,
+    });
+    let b_green = Verdict::Green {
+        source: Source::Gate,
+        sha: Some(SHA.to_string()),
+    };
+    let (mut a, mut b) = (Memory::default(), Memory::default());
+    for _ in 0..3 {
+        reconcile(&mut forge, &a_red, "main", &mut a).unwrap();
+        reconcile(&mut forge, &b_green, "main", &mut b).unwrap();
+    }
+    assert_eq!(forge.created.len(), 1, "filed once");
+    assert!(forge.closed.is_empty(), "green on the issue's own SHA never closes it");
+    // Main moves on and is green at a newer commit: now it closes.
+    reconcile(&mut forge, &green(), "main", &mut b).unwrap();
+    assert_eq!(forge.closed, vec![(1, false)]);
+    // A host still red on the old SHA does not file it again (cooldown)...
+    reconcile(&mut forge, &a_red, "main", &mut a).unwrap();
+    assert_eq!(forge.created.len(), 1);
+    // ...but a new red SHA does.
+    reconcile(&mut forge, &red(NEWER), "main", &mut a).unwrap();
+    assert_eq!(forge.created.len(), 2);
+}
+
+#[test]
+fn a_red_verdict_without_a_sha_files_nothing() {
+    let mut e = match red(SHA) {
+        Verdict::Red(e) => e,
+        _ => unreachable!(),
+    };
+    e.sha = None;
+    assert!(decide(&Verdict::Red(e), &[], &[], "main").is_empty());
+    let green_unknown = Verdict::Green {
+        source: Source::Gate,
+        sha: None,
+    };
+    assert!(decide(&green_unknown, &[open(7, SHA)], &[], "main").is_empty());
+}
+
+#[test]
+fn a_building_issue_is_never_closed() {
+    let mut held = open(7, SHA);
+    held.building = true;
+    assert!(decide(&green(), &[held.clone()], &[], "main").is_empty());
+    let mut dup = held;
+    dup.number = 8;
+    assert_eq!(
+        decide(&red(SHA), &[open(6, SHA), dup], &[], "main"),
+        vec![Action::Reuse {
+            number: 6,
+            newer_sha: None
+        }]
+    );
+}
+
+#[test]
+fn the_listing_reads_building_and_drops_untrusted_authors() {
+    let json = serde_json::json!([
+        {"number": 1, "body": auto_body(SHA), "user": {"login": "loom-fleet-dispatch[bot]"},
+         "labels": [{"name": "loom:building"}]},
+        {"number": 2, "body": auto_body(SHA), "user": {"login": "outsider"}},
+    ])
+    .to_string();
+    let listed = parse_listing(&json, |row| {
+        row.pointer("/user/login")
+            .and_then(serde_json::Value::as_str)
+            != Some("outsider")
+    })
+    .unwrap();
+    assert_eq!(listed.len(), 1);
+    assert!(listed[0].building);
+}
+
+#[test]
+fn only_push_runs_on_the_default_branch_count() {
+    let run = |event: &str, conclusion: &str| {
+        serde_json::json!({"headSha": SHA, "status": "completed", "conclusion": conclusion,
+            "workflowName": "CI", "url": "https://x/1", "event": event})
+    };
+    // A scheduled / workflow_run / dynamic / fork-PR failure is not main CI.
+    let noise = serde_json::json!([
+        run("schedule", "failure"),
+        run("workflow_run", "failure"),
+        run("dynamic", "failure"),
+        run("pull_request", "failure"),
+        run("push", "success"),
+    ]);
+    assert!(matches!(ci_verdict(&noise.to_string()), Verdict::Green { .. }));
+    assert!(!crate::work_finder::main_red_fix::latest_run_is_failure(&noise.to_string()));
+    let only_noise = serde_json::json!([run("pull_request", "failure")]);
+    assert_eq!(ci_verdict(&only_noise.to_string()), Verdict::Unknown);
+    let real = serde_json::json!([run("push", "failure")]);
+    assert!(matches!(ci_verdict(&real.to_string()), Verdict::Red(_)));
+}
+
+#[test]
+fn a_failing_close_posts_no_comment() {
+    struct NoClose(FakeForge);
+    impl AutofileForge for NoClose {
+        fn list_open_auto(&mut self) -> Result<Vec<ListedIssue>, String> {
+            self.0.list_open_auto()
+        }
+        fn recently_closed_auto(&mut self) -> Result<Vec<ListedIssue>, String> {
+            self.0.recently_closed_auto()
+        }
+        fn open_prs(&mut self, issues: &[u32]) -> HashSet<u32> {
+            self.0.open_prs(issues)
+        }
+        fn create(&mut self, t: &str, b: &str, l: &[String]) -> Result<u32, String> {
+            self.0.create(t, b, l)
+        }
+        fn comments(&mut self, issue: u32) -> Result<Vec<String>, String> {
+            self.0.comments(issue)
+        }
+        fn comment(&mut self, issue: u32, body: &str) -> Result<(), String> {
+            self.0.comment(issue, body)
+        }
+        fn close(&mut self, _issue: u32, _not_planned: bool) -> Result<(), String> {
+            Err("forbidden".to_string())
+        }
+    }
+    let mut forge = NoClose(FakeForge {
+        open: vec![ListedIssue {
+            number: 7,
+            body: auto_body(SHA),
+            building: false,
+        }],
+        ..FakeForge::default()
+    });
+    for _ in 0..3 {
+        let (applied, _) = reconcile(&mut forge, &green(), "main", &mut Memory::default()).unwrap();
+        assert!(applied.is_empty());
+    }
+    assert!(forge.0.comments.is_empty());
 }

@@ -20,7 +20,7 @@
 //! the host breaker and by the pre-flight / pool holds. None of those is a red
 //! `main`, so none of them opens the lane. A repo whose gate is disabled has
 //! no verified-red signal at all, so the latest default-branch CI conclusion
-//! stands in for it — one cached forge read per repo per tick, made only when
+//! (push runs only, #11766) stands in for it — one cached forge read per repo per tick, made only when
 //! the repo has a marker-bearing candidate.
 //!
 //! A marker on a green repo is inert: no halt or gate bypass.
@@ -451,8 +451,11 @@ pub fn lanes_per_root(
         .collect()
 }
 
-fn ci_cache() -> &'static Mutex<HashMap<PathBuf, (Instant, bool)>> {
-    static CACHE: OnceLock<Mutex<HashMap<PathBuf, (Instant, bool)>>> = OnceLock::new();
+/// One repo's cached `gh run list` payload (`None`: no answer).
+type CiEntry = (Instant, Option<String>);
+
+fn ci_cache() -> &'static Mutex<HashMap<PathBuf, CiEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, CiEntry>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -462,19 +465,32 @@ fn ci_cache() -> &'static Mutex<HashMap<PathBuf, (Instant, bool)>> {
 /// red": the fallback can only ever grant the boost on positive evidence.
 #[must_use]
 pub fn ci_main_red(root: &Path) -> bool {
+    ci_runs(root).is_some_and(|stdout| latest_run_is_failure(&stdout))
+}
+
+/// `root`'s default-branch **push** runs ([`CI_RUN_FIELDS`], newest first),
+/// read at most once per [`CI_FALLBACK_TTL`] and shared by the lane and the
+/// red-main autofiler (#11766). `None` when the forge did not answer.
+pub(super) fn ci_runs(root: &Path) -> Option<String> {
     let now = Instant::now();
-    if let Some((at, red)) = ci_cache().lock().ok().and_then(|c| c.get(root).copied()) {
+    if let Some((at, runs)) = ci_cache().lock().ok().and_then(|c| c.get(root).cloned()) {
         if now.saturating_duration_since(at) < CI_FALLBACK_TTL {
-            return red;
+            return runs;
         }
     }
-    let red =
-        !crate::rate_limit_breaker::global_skip_pass("work_finder") && probe_ci_main_red(root);
+    let runs = if crate::rate_limit_breaker::global_skip_pass("work_finder") {
+        None
+    } else {
+        probe_ci_runs(root)
+    };
     if let Ok(mut cache) = ci_cache().lock() {
-        cache.insert(root.to_path_buf(), (now, red));
+        cache.insert(root.to_path_buf(), (now, runs.clone()));
     }
-    red
+    runs
 }
+
+/// The fields every CI-fallback read asks for.
+pub const CI_RUN_FIELDS: &str = "headSha,status,conclusion,workflowName,url,event";
 
 /// The branch the CI fallback reads: the repo's default branch from
 /// `origin/HEAD`, else `main` when that symbolic ref is unset.
@@ -482,7 +498,11 @@ pub(super) fn default_branch_for(root: &Path) -> String {
     crate::worktree_ops::clean::default_branch(root).unwrap_or_else(|| "main".to_string())
 }
 
-fn probe_ci_main_red(root: &Path) -> bool {
+/// `--event push` (#11766 review): a branch filter alone also matches
+/// scheduled, `workflow_run` and dynamic (CodeQL, Dependabot) runs, and a
+/// fork PR whose head branch is named like the default branch — an
+/// outsider must not be able to make `main` read red.
+fn probe_ci_runs(root: &Path) -> Option<String> {
     let branch = default_branch_for(root);
     let probe = crate::gh_invocation::GhInvocation::new(
         crate::gh_invocation::Operation::new("run.list"),
@@ -491,17 +511,19 @@ fn probe_ci_main_red(root: &Path) -> bool {
         Duration::from_secs(30),
     )
     .forge_op(crate::forge_call_stats::ops::CI_WORKFLOW_RUNS_FOR_SHA)
-    .args(["run", "list", "--branch", &branch, "--limit", "30"])
-    .args(["--json", "headSha,status,conclusion,workflowName"])
+    .args([
+        "run", "list", "--branch", &branch, "--event", "push", "--limit", "30",
+    ])
+    .args(["--json", CI_RUN_FIELDS])
     .current_dir(root)
     .run();
     let unavailable = |why: &str| {
         log::debug!("work_finder: red-main CI fallback unavailable for {} ({why})", root.display());
-        false
+        None
     };
     match probe {
         CmdOutcome::Ran(out) if out.status.success() => {
-            latest_run_is_failure(&String::from_utf8_lossy(&out.stdout))
+            Some(String::from_utf8_lossy(&out.stdout).into_owned())
         }
         CmdOutcome::Ran(out) => {
             // Feed the rate-limit breaker like every other forge read, so an
@@ -515,13 +537,29 @@ fn probe_ci_main_red(root: &Path) -> bool {
     }
 }
 
+/// The runs in a `gh run list` payload that are CI on the default branch:
+/// `push` runs (a row with no `event` field is kept, for older payloads).
+#[must_use]
+pub fn push_runs(stdout: &str) -> Option<Vec<serde_json::Value>> {
+    let runs = serde_json::from_str::<Vec<serde_json::Value>>(stdout).ok()?;
+    Some(
+        runs.into_iter()
+            .filter(|r| {
+                r.get("event")
+                    .and_then(serde_json::Value::as_str)
+                    .is_none_or(|e| e == "push")
+            })
+            .collect(),
+    )
+}
+
 /// Whether the newest commit in a `gh run list --json headSha,…` payload
 /// (newest first) has a failed CI run: any run for that SHA concluded
 /// `failure`, `timed_out` or `startup_failure` — the same conclusions the
 /// main-health gate's forge-CI reducer treats as a failure verdict.
 #[must_use]
 pub fn latest_run_is_failure(stdout: &str) -> bool {
-    let Ok(runs) = serde_json::from_str::<Vec<serde_json::Value>>(stdout) else {
+    let Some(runs) = push_runs(stdout) else {
         return false;
     };
     let field = |r: &serde_json::Value, k: &str| {

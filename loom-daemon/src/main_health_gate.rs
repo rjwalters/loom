@@ -73,8 +73,9 @@
 //!
 //! A red `main` is surfaced by **loud logging** (daemon log): the offending
 //! command, its exit reason, and a tail of its captured output. Since #11766
-//! it is also surfaced on the forge: the work finder files one
-//! `loom:very-important` fix issue per red repo (and closes it once green;
+//! it can also be surfaced on the forge (opt-in, off by default): the work
+//! finder files one `loom:very-important` fix issue per red repo (and closes
+//! it once green;
 //! [`crate::work_finder::main_red_autofile`]). The gate loop feeds it each
 //! logged verdict, with the red output tail, through
 //! `log_transition_for_root`. Auto-revert of
