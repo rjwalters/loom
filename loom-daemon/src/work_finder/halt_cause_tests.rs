@@ -200,7 +200,6 @@ fn halted_row(halt_causes: Option<&[Option<HaltCause>]>) -> crate::types::ReadyQ
         usize::MAX,
         false,
         None,
-        None,
         &[],
     );
     assert_eq!(report.queue.len(), 1);
@@ -247,7 +246,6 @@ fn a_cause_at_a_not_held_index_never_halts_the_workspace() {
         Some(&[Some(HaltCause::MainRed)]),
         usize::MAX,
         false,
-        None,
         None,
         &[],
     );
@@ -318,7 +316,6 @@ fn pass_two_defers_a_heavy_repo_on_disk_and_admits_a_light_one() {
         None,
         usize::MAX,
         false,
-        None,
         (None, None, Some(disk_budget(14))),
         &[],
         &[],
@@ -352,7 +349,6 @@ fn pass_two_debits_each_disk_admission() {
         None,
         usize::MAX,
         false,
-        None,
         (None, None, Some(disk_budget(30))),
         &[],
         &[],
