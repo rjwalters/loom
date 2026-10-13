@@ -39,8 +39,8 @@ no priority side listing), and no priority exempts a candidate from any gate
 ## Selection: workspace first, then issue
 
 1. **Pick a workspace** among those with dispatchable work, at random, with
-   probability **P = w / Σw** (#11742; operator ruling 2026-10-13 on
-   2AMLogic/2am#4344). There are **no tiers**: nothing wins the draw outright.
+   probability **P = w / Σw** (#11742; operator ruling 2026-10-13). There are **no tiers**:
+   nothing wins the draw outright.
    - **Base weight.** A workspace's `weight` (the integer in `workspaces.json`,
      set from the fleet store's required `repos[].weight`; higher = more draws,
      `0` = never drawn) is its share of draws. N repos at weight 1 and loom at
