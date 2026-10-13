@@ -8,7 +8,7 @@
 //! `hyperparams_tests.rs`.
 
 use loom_daemon::hyperparams::{
-    lease_ttl_minutes_from_layer, resolved_global, startup_init, Source, HYPERPARAMS_ENV,
+    lease_ttl_minutes_from_layer, resolved_global, startup_init, Source,
 };
 use serial_test::serial;
 
@@ -91,23 +91,4 @@ fn hyperparams_validate_gate_mirrors_startup() {
     let problem = args.run().unwrap_err().to_string();
     assert!(problem.contains("dispatch.maxConcurrent"), "{problem}");
     assert!(problem.contains("dispatch.bogus"), "{problem}");
-}
-
-/// `$LOOM_HYPERPARAMS` is retired (#11107): set to garbage it only warns and
-/// neither startup nor `--validate` fails.
-#[test]
-#[serial]
-fn retired_env_vector_is_ignored_by_startup_and_validate() {
-    std::env::set_var(HYPERPARAMS_ENV, "not json");
-    let tmp = tempfile::tempdir().unwrap();
-    let started = startup_init(tmp.path());
-    let args = loom_daemon::hyperparams::HyperparamsArgs {
-        json: false,
-        validate: true,
-        workspace: tmp.path().to_path_buf(),
-    };
-    let validated = args.run();
-    std::env::remove_var(HYPERPARAMS_ENV);
-    started.expect("startup ignores the retired env var");
-    validated.expect("--validate ignores the retired env var");
 }
