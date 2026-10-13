@@ -537,6 +537,15 @@ pub fn materialize_with(payload: &Payload, dest: &Path) -> Result<PayloadDiff> {
         .map_err(|e| anyhow!("stage the extra surfaces: {e}"))?;
 
     let ownership = OwnershipBoundary::load(dest);
+    // A surface the repo pinned in `.loom/resync-ignore` is its own to keep,
+    // so a step's complaint about it is not ours to report (the script checks
+    // the pin first). Otherwise a repo that pins `.github/labels.yml` because
+    // its markers are non-standard would fail every run (#11033).
+    skipped_surfaces.retain(|skip| {
+        !surfaces::pin_names(&skip.path)
+            .iter()
+            .any(|name| ownership.is_declared_repo_owned(name))
+    });
     let mut diff = PayloadDiff {
         added: Vec::new(),
         changed: Vec::new(),

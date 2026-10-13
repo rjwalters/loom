@@ -217,3 +217,18 @@ fn a_pinned_labels_file_is_never_written() {
     resync_workspace_with(&payload, &ws).unwrap();
     assert_eq!(fs::read_to_string(ws.join(REL)).unwrap(), existing);
 }
+
+#[test]
+fn a_pinned_labels_file_with_malformed_markers_is_not_a_failed_run() {
+    let tmp = TempDir::new().unwrap();
+    let bad = format!("{STALE}\n{STALE}\n");
+    let (ws, payload) = workspace(&tmp, Some(&bad));
+    write(&ws.join(".loom/resync-ignore"), ".github/labels.yml\n");
+
+    for dry_run in [true, false] {
+        let report = run_with(&payload, &ws, dry_run).unwrap();
+        assert_eq!(report.exit_code(), EXIT_OK, "a pinned file is the repo's to keep");
+        assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+    }
+    assert_eq!(fs::read_to_string(ws.join(REL)).unwrap(), bad);
+}

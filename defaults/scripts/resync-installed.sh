@@ -818,10 +818,10 @@ resolve_defaults() {
 
 # requires-daemon: resync-payload optional   #8961 no source tree: resync from the daemon's embedded payload; an absent/older binary (no such verb) or a refusal (exit 1) keeps the failure below.
 if ! resolve_defaults; then
-    _rp="${LOOM_DAEMON_BIN:-$(command -v loom-daemon || echo "${LOOM_DAEMON_BIN_DIR:-$HOME/.local/bin}/loom-daemon")}"; _rpa=(--workspace "$REPO_ROOT"); [[ "$DRY_RUN" -eq 1 ]] && _rpa+=(--dry-run); _rpw="found no loom-daemon that has it (looked at $_rp: missing or too old)"
-    if [[ -z "$OUTPUT_DIR" ]] && "$_rp" resync-payload --help >/dev/null 2>&1; then "$_rp" resync-payload "${_rpa[@]}"; _rprc=$?; [[ "$_rprc" -eq 1 ]] || exit "$_rprc"; _rpw="$_rp refused or failed (see above)"; fi
+    _rp="${LOOM_DAEMON_BIN:-$(command -v loom-daemon || echo "${LOOM_DAEMON_BIN_DIR:-$HOME/.local/bin}/loom-daemon")}"; _rpa=(--workspace "$REPO_ROOT"); [[ "$DRY_RUN" -eq 1 ]] && _rpa+=(--dry-run); _rpw="found no loom-daemon that has it (looked at $_rp: missing or too old)"; _rpfix=" Install or update loom-daemon, or set .loom/loom-source-path to a local clone of the Loom source repo."
+    if [[ -z "$OUTPUT_DIR" ]] && "$_rp" resync-payload --help >/dev/null 2>&1; then "$_rp" resync-payload "${_rpa[@]}"; _rprc=$?; [[ "$_rprc" -eq 1 ]] || exit "$_rprc"; _rpw="$_rp refused or failed (see above; it also exits 1 when it applied everything but could not refresh a labels block with malformed markers)"; _rpfix=" Its own output above names the cause and the fix."; fi
     err "Could not locate a defaults/ source tree to sync from: no \$REPO_ROOT/defaults, no usable path in the gitignored .loom/loom-source-path sidecar (missing on a fresh clone), no loom_source in .loom/install-metadata.json."
-    err "Fallback \`loom-daemon resync-payload\` (the daemon's embedded payload, #8961): $_rpw. Install or update loom-daemon, or set .loom/loom-source-path to a local clone of the Loom source repo."; exit 1
+    err "Fallback \`loom-daemon resync-payload\` (the daemon's embedded payload, #8961): $_rpw.$_rpfix"; exit 1
 fi
 SOURCE_ROOT="$(dirname "$DEFAULTS_DIR")"
 
