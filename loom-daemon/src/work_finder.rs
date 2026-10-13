@@ -234,6 +234,7 @@ pub mod dispatch_plan;
 pub mod dispatch_plan_merge;
 pub mod halt_cause;
 mod labels;
+pub mod main_red_autofile;
 pub mod main_red_fix;
 pub mod open_pr_prefilter;
 pub mod operator_priority;
@@ -808,6 +809,10 @@ pub trait WorkDispatcher {
     /// The production dispatcher alerts the operator once per fix left
     /// unclaimed past the threshold. Defaults to a no-op.
     fn escalate_red_fix(&mut self, _red: bool, _waiting: &[u32]) {}
+
+    /// File, reuse or close this repo's auto-filed red-main fix issue
+    /// (#11766, [`main_red_autofile`]). Defaults to a no-op.
+    fn autofile_red_main(&mut self, _lane: RedMainLane) {}
 
     /// Count of in-flight sweeps that occupy the work-finder's concurrency
     /// budget (Issue #4003).

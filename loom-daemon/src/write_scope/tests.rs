@@ -445,6 +445,7 @@ fn daemon_write_paths_are_scoped() {
         ("intake_reconcile.rs", Gated),
         ("intake_reconcile/singleton.rs", Gated),
         ("stale_blocked/release_gh.rs", Gated),
+        ("work_finder/main_red_autofile.rs", Gated),
         (
             "sweep_registry/guards.rs",
             Via(DISPATCH, "claim flip + lease of a dispatched sweep"),
