@@ -370,7 +370,11 @@ refusal/rejection handling.
 
 **Reference implementation:** `defaults/scripts/lib/classify-error.sh`. It is
 **exit-code-first** (a clean `exit 0` is `SUCCESS` regardless of output content,
-the #3233 fix) and only inspects output on a genuine non-zero exit. Its category
+the #3233 fix) and only inspects output on a genuine non-zero exit. Since
+#11208 the same classifier also ships natively as `loom-daemon classify-error`;
+the shell library delegates when a daemon binary resolves and keeps its tables
+as the no-daemon fallback, with the two renderings pinned equal by
+`test-classify-error.sh`. Its category
 set:
 
 | Category | Meaning | Dispatcher action |

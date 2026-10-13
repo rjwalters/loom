@@ -1974,6 +1974,15 @@ jobs:
       - name: classify-dependency-block premise-false interaction (#7904)
         if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-classify-dependency-block-premise-false.sh
+      # #11208: the same suite shell-suite-tests runs (ci-wired.txt) as pure
+      # fallback evidence, re-run here with the build pinned via
+      # LOOM_DAEMON_SELF_BIN so it exercises the shell library's native
+      # delegation AND its shell-vs-native parity section on every vector.
+      # The suite passes in both modes by design; the pin only decides which
+      # half of the contract this job witnesses.
+      - name: classify-error native delegation + parity (#11208)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
+        run: LOOM_DAEMON_SELF_BIN="$PWD/target/debug/loom-daemon" bash defaults/scripts/tests/test-classify-error.sh
       - name: detect-dependency-cycle (#5671)
         if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-detect-dependency-cycle.sh

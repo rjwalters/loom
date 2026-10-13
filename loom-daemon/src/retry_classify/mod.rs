@@ -28,25 +28,38 @@
 //! [`Input::classification`] is `Some` in library mode and `None` in degraded
 //! mode, and the degraded arm carries the regexes verbatim.
 //!
-//! # Why the deny-list is NOT reimplemented here
+//! # The deny-list boundary, before and after #11208
 //!
-//! [`Input::classification_is_transient`] is supplied by the caller rather than
-//! recomputed. `classification_is_transient` lives in `lib/classify-error.sh`
-//! and is, per #4501, *the* single source of truth for every retry decision in
-//! the fleet — it is not one of the six functions being ported, and other
-//! scripts still source it. A second copy of that deny-list in Rust would
-//! recreate the precise defect #4501 fixed: two independent verdict systems
-//! that can disagree about the same failure, which on a live host printed
+//! [`Input::classification_is_transient`] is supplied by the caller rather
+//! than recomputed here. `classification_is_transient` lives in
+//! `lib/classify-error.sh` and is, per #4501, *the* single source of truth
+//! for every retry decision in the fleet. A second, independent copy of that
+//! deny-list in Rust recreated the precise defect #4501 fixed: two
+//! independent verdict systems that can disagree about the same failure,
+//! which on a live host printed
 //!
 //! ```text
 //! [ERROR] Non-transient error detected - not retrying
 //! [ERROR] exit_code=1 classification=RECOVERABLE
 //! ```
 //!
-//! So the boundary is: the shell says what category this failure is and whether
-//! that category is retryable; this module owns what the wrapper *does* with
-//! that answer — which is the part that was duplicated, untested, and only
-//! reachable through the script.
+//! Since #11208 the deny-list (and the classifier that feeds it) also ships
+//! natively — [`loom_daemon::classify_error`] — and the shell library
+//! delegates to that subcommand when a binary resolves, so the "one policy"
+//! invariant now holds across two pinned renderings of the SAME policy
+//! rather than by keeping one of them out of Rust. This module's boundary is
+//! unchanged on purpose: it still consumes the verdict rather than
+//! recomputing it, because the wrapper supplies category + verdict in one
+//! argv (and the degraded no-library path still has no classifier at all),
+//! and because `retry_classify` predates and outlives the daemon-resolvable
+//! case. The conformance suites (the shared `vectors.tsv`, the shell suite's
+//! parity section) are what keep the renderings from drifting.
+//!
+//! So the boundary is: something classifies the failure and whether that
+//! category is retryable (shell fallback, or the native classifier the shell
+//! delegates to); this module owns what the wrapper *does* with that answer —
+//! which is the part that was duplicated, untested, and only reachable
+//! through the script.
 
 pub mod cli;
 
@@ -148,9 +161,10 @@ pub fn is_transient(input: &Input<'_>) -> TransientVerdict {
 
 /// The degraded-path exhaustion regex, verbatim from `claude-wrapper.sh`.
 ///
-/// Kept in lockstep with `lib/classify-error.sh`'s `TOKEN_EXHAUSTED` +
-/// `MODEL_CREDITS_EXHAUSTED` patterns (#4501's per-model ceiling and #5687's
-/// credits family are both here).
+/// Kept in lockstep with the `TOKEN_EXHAUSTED` + `MODEL_CREDITS_EXHAUSTED`
+/// patterns of `lib/classify-error.sh` (since #11208 also
+/// [`loom_daemon::classify_error`]'s tables, same enforcement) — #4501's
+/// per-model ceiling and #5687's credits family are both here.
 static EXHAUSTION_FALLBACK: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(concat!(
         r"(?i)",
@@ -168,8 +182,10 @@ static EXHAUSTION_FALLBACK: LazyLock<Regex> = LazyLock::new(|| {
 
 /// The degraded-path auth-death regex, verbatim from `claude-wrapper.sh`.
 ///
-/// Kept in lockstep with `lib/classify-error.sh`'s `TOKEN_EXPIRED` pattern,
-/// including #6614's JSON-envelope and revoked-token phrasings.
+/// Kept in lockstep with `lib/classify-error.sh`'s `TOKEN_EXPIRED` pattern
+/// (since #11208 also [`loom_daemon::classify_error`]'s claude table, same
+/// enforcement), including #6614's JSON-envelope and revoked-token
+/// phrasings.
 static AUTH_DEAD_FALLBACK: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(concat!(
         r"(?i)",

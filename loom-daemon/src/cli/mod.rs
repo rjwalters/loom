@@ -31,6 +31,7 @@ mod check_guard_wiring;
 mod check_private_control_version;
 mod check_renovate_labels;
 pub(crate) mod ci_telemetry_cli;
+pub(crate) mod classify_error_cli;
 pub(crate) mod cleanup_ops;
 pub(crate) mod codex_hooks;
 pub(crate) mod codex_sandbox_noop_cli;

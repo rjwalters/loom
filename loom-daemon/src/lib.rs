@@ -149,6 +149,7 @@ pub mod capacity;
 pub mod cargo_target_guard;
 pub mod ci_telemetry;
 pub mod claim_reconciliation;
+pub mod classify_error;
 pub mod cmd_out;
 pub mod codex_sandbox_noop;
 pub mod codex_usage;

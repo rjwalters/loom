@@ -33,6 +33,12 @@ pub struct WorkFinderConfig {
     /// **uncapped** rather than "use a built-in default": a non-`None` default
     /// would silently throttle every fleet on upgrade. See [`repo_cap`].
     pub max_concurrent_per_repo: Option<usize>,
+    /// `hyperparameters.dispatch.drawTemperature` — the workspace draw's
+    /// softmax temperature (#11684). Hyperparameters-only: there is no
+    /// `autonomous.workFinder` home, so [`parse_effective`] leaves it `None`
+    /// and only [`apply_hyperparams`] fills it (an out-of-range value is
+    /// dropped). Read through [`resolve_draw_temperature`].
+    pub draw_temperature: Option<u32>,
     /// `autonomous.workFinder.extraSkipLabels` — additional label names
     /// (Issue #6685) beyond the hardcoded [`super::PARK_LABELS`] this workspace
     /// wants the work-finder to treat as a skip/park signal (e.g. a
@@ -116,6 +122,7 @@ pub fn parse_effective(effective: &serde_json::Value) -> WorkFinderConfig {
             .filter(|&n| n > 0)
             .and_then(|n| usize::try_from(n).ok()),
         max_concurrent_per_repo: repo_cap::parse_config(wf),
+        draw_temperature: None,
         extra_skip_labels: wf.and_then(|w| w.get("extraSkipLabels")).and_then(|v| {
             v.as_array().map(|arr| {
                 arr.iter()
@@ -168,6 +175,26 @@ fn apply_hyperparams(effective: &serde_json::Value, config: &mut WorkFinderConfi
     {
         config.max_admissions_per_tick = Some(max);
     }
+    let (lo, hi) = crate::priority_pick::DRAW_TEMPERATURE_RANGE;
+    if let Some(t) = dispatch
+        .get("drawTemperature")
+        .filter(|v| !v.is_null())
+        .and_then(serde_json::Value::as_u64)
+        .filter(|t| (lo..=hi).contains(t))
+        .and_then(|t| u32::try_from(t).ok())
+    {
+        config.draw_temperature = Some(t);
+    }
+}
+
+/// The workspace draw's temperature for `config` (#11684): the
+/// hyperparameters value, else
+/// [`crate::priority_pick::DEFAULT_DRAW_TEMPERATURE`].
+#[must_use]
+pub fn resolve_draw_temperature(config: &WorkFinderConfig) -> u32 {
+    config
+        .draw_temperature
+        .unwrap_or(crate::priority_pick::DEFAULT_DRAW_TEMPERATURE)
 }
 
 /// Retired `autonomous.*` config keys, accepted-but-ignored since #4512 (they
