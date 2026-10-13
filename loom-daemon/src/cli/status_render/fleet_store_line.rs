@@ -65,6 +65,7 @@ mod tests {
             workspaces: fleet_sync::workspace_resync::WorkspacePass::default(),
             checkouts: Vec::new(),
             checkouts_note: None,
+            repo_config: Default::default(),
         };
         let value = json(Some(&status));
         assert_eq!(value["repo"], serde_json::json!("acme/fleet"));
@@ -95,6 +96,7 @@ mod tests {
             workspaces: fleet_sync::workspace_resync::WorkspacePass::default(),
             checkouts: Vec::new(),
             checkouts_note: None,
+            repo_config: Default::default(),
         };
         let block = fleet_sync::render_line(Some(&status), chrono::Utc::now())
             .expect("a snapshot renders a block");

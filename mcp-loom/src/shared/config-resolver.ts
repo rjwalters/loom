@@ -10,7 +10,10 @@
  *      host until Epic #3835 Phase 3 ships.
  *   2. Legacy `.loom/config.json` — the sole tier every existing repo has.
  *   3. Tracked `.loom-project/project.json` — empty until a repo migrates.
- *   4. Ignored `.loom-local/local.json` — host-local override.
+ *   4. Per-repo fleet tier `.loom-local/fleet-repo.json` (#11738) — written
+ *      by the daemon's fleet sync from the fleet store's `repos[].config`;
+ *      beats the repo's committed config.
+ *   5. Ignored `.loom-local/local.json` — host-local override.
  *
  * The tier order, `deepMerge` semantics (objects merge recursively, arrays
  * replace, explicit `null` replaces), and soft-skip behavior (missing /
@@ -35,6 +38,13 @@ export const LEGACY_CONFIG_REL = ".loom/config.json";
 
 /** Repo-relative path to the tracked, project-specific config file. */
 export const PROJECT_CONFIG_REL = ".loom-project/project.json";
+
+/**
+ * Repo-relative path to the per-repo fleet tier (#11738), materialized by the
+ * daemon's fleet sync. Sits between {@link PROJECT_CONFIG_REL} and
+ * {@link LOCAL_CONFIG_REL}.
+ */
+export const FLEET_REPO_CONFIG_REL = ".loom-local/fleet-repo.json";
 
 /** Repo-relative path to the ignored, host-local config override file. */
 export const LOCAL_CONFIG_REL = ".loom-local/local.json";
@@ -134,6 +144,7 @@ export async function resolveEffectiveConfig(repoRoot: string): Promise<JsonObje
 
   effective = deepMerge(effective, await softReadJsonObject(join(repoRoot, LEGACY_CONFIG_REL))) as JsonObject;
   effective = deepMerge(effective, await softReadJsonObject(join(repoRoot, PROJECT_CONFIG_REL))) as JsonObject;
+  effective = deepMerge(effective, await softReadJsonObject(join(repoRoot, FLEET_REPO_CONFIG_REL))) as JsonObject;
   effective = deepMerge(effective, await softReadJsonObject(join(repoRoot, LOCAL_CONFIG_REL))) as JsonObject;
 
   return effective;
@@ -158,7 +169,8 @@ export function getPath(config: unknown, dotted: string): unknown {
 
 /**
  * True when a non-legacy tier (private defaults, `.loom-project/project.json`,
- * or `.loom-local/local.json`) contributes any content for `repoRoot`.
+ * the per-repo fleet tier `.loom-local/fleet-repo.json`, or
+ * `.loom-local/local.json`) contributes any content for `repoRoot`.
  *
  * This is the guard behind the #4064 write-policy decision (option 3): when a
  * non-legacy tier is present, `configure_terminal` must NOT write the merged
@@ -175,6 +187,9 @@ export async function hasNonLegacyTier(repoRoot: string): Promise<boolean> {
     }
   }
   if (Object.keys(await softReadJsonObject(join(repoRoot, PROJECT_CONFIG_REL))).length > 0) {
+    return true;
+  }
+  if (Object.keys(await softReadJsonObject(join(repoRoot, FLEET_REPO_CONFIG_REL))).length > 0) {
     return true;
   }
   if (Object.keys(await softReadJsonObject(join(repoRoot, LOCAL_CONFIG_REL))).length > 0) {

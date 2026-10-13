@@ -39,6 +39,10 @@
 //! - **Roster clones** ([`roster_clone`], #11218): with `fleet.autoApply` on, a
 //!   timer pass clones a desired repo that is not cloned under `root` yet
 //!   (HTTPS, bounded per pass) and registers it in the same pass.
+//! - **The per-repo fleet tier** ([`repo_config`], #11738): each desired,
+//!   cloned repo's `repos[].config` is written to its
+//!   `.loom-local/fleet-repo.json` (or that file removed), from the roster's
+//!   fail-closed snapshot, under the same [`Mode`] as the config tiers.
 //!
 //! # Invariants this module keeps
 //!
@@ -101,6 +105,7 @@ pub mod git_spawn_log;
 pub mod identity;
 mod loom_ui;
 pub mod offline_floor;
+pub mod repo_config;
 pub mod roster_clone;
 mod status_lines;
 pub mod workspace_resync;
@@ -431,8 +436,19 @@ pub fn roster_pass(
     now: DateTime<Utc>,
 ) -> Result<Plan> {
     let loaded = fetch::load(transport, cache_dir, location, Policy::FailClosed, now)?;
-    let parsed = roster::from_snapshot(&loaded.snapshot, home)?
-        .ok_or_else(|| anyhow!(roster::missing_message(&loaded.snapshot)))?;
+    plan_snapshot(&loaded.snapshot, home, registered, normalize, is_cloned)
+}
+
+/// [`roster_pass`] on an already-loaded fail-closed snapshot.
+fn plan_snapshot(
+    snapshot: &fetch::Snapshot,
+    home: &Path,
+    registered: &[Registered],
+    normalize: &dyn Fn(&Path) -> PathBuf,
+    is_cloned: &dyn Fn(&Path) -> bool,
+) -> Result<Plan> {
+    let parsed = roster::from_snapshot(snapshot, home)?
+        .ok_or_else(|| anyhow!(roster::missing_message(snapshot)))?;
     Ok(roster::plan(&parsed, registered, normalize, is_cloned))
 }
 
@@ -687,6 +703,9 @@ pub struct FleetSyncStatus {
     /// ([`checkout_ff::BUSY_NOTE`]); `checkouts` are then from before it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkouts_note: Option<String>,
+    /// Each desired repo's per-repo fleet tier (#11738); omitted when unset.
+    #[serde(default, skip_serializing_if = "repo_config::RepoConfigPass::is_unset")]
+    pub repo_config: repo_config::RepoConfigPass,
 }
 
 fn default_enforced() -> Enforcement {
@@ -697,7 +716,7 @@ impl FleetSyncStatus {
     /// Whether anything is out of sync with the store.
     #[must_use]
     pub fn drifted(&self) -> bool {
-        self.config.drifted() || self.roster.drifted()
+        self.config.drifted() || self.roster.drifted() || self.repo_config.drifted()
     }
 
     /// Whether either half of the pass failed, or the floor could not be read
@@ -705,7 +724,10 @@ impl FleetSyncStatus {
     /// [`DRIFT_TOPIC`] alert as every other fleet-sync failure.
     #[must_use]
     pub fn errored(&self) -> bool {
-        self.config.error.is_some() || self.roster.error.is_some() || self.floor.error.is_some()
+        self.config.error.is_some()
+            || self.roster.error.is_some()
+            || self.floor.error.is_some()
+            || self.repo_config.error.is_some()
     }
 }
 
@@ -926,6 +948,7 @@ pub fn render_line(status: Option<&FleetSyncStatus>, now: DateTime<Utc>) -> Opti
     if let Some(e) = &s.roster.error {
         lines.push(format!("  roster: ERROR (fail-closed) — {e}"));
     }
+    lines.extend(repo_config::lines(&s.repo_config));
     if !s.drifted() && !s.errored() {
         lines.push("  host matches the store".to_string());
     } else if !s.auto_apply && s.drifted() {
@@ -1000,7 +1023,7 @@ fn run_pass(inputs: &PassInputs, pass: &str, mode: Mode, now: DateTime<Utc>) -> 
     };
     // #11218: only a timer pass on a host free to dispatch clones.
     let clone = pass == "timer" && enforced == Enforcement::Proceed;
-    let roster = roster_half(inputs, &transport, &config, (mode, clone), now);
+    let (roster, repo_config) = roster_half(inputs, &transport, &config, (mode, clone), now);
     // #10711: the floor, from the snapshot the halves above just refreshed,
     // into the process-wide value — never the config tiers, whose
     // `autonomous.autoUpdate` changes need a restart.
@@ -1028,6 +1051,7 @@ fn run_pass(inputs: &PassInputs, pass: &str, mode: Mode, now: DateTime<Utc>) -> 
         // Likewise the last checkout pass's (#10869).
         checkouts: cached_status().map(|s| s.checkouts).unwrap_or_default(),
         checkouts_note: cached_status().and_then(|s| s.checkouts_note),
+        repo_config,
     }
 }
 
@@ -1041,7 +1065,8 @@ fn last_recorded_state() -> Option<crate::fleet_store::state::RunState> {
         .and_then(|s| s.state.desired)
 }
 
-/// The roster half of [`run_pass`]. Skipped outright when the config half was
+/// The roster half of [`run_pass`], and the per-repo fleet tier (#11738) from
+/// the same fail-closed snapshot. Skipped outright when the config half was
 /// served from the cache: the roster is fail-closed with no cached fallback, so
 /// a forge that could not confirm the config commit cannot confirm the roster
 /// either, and a second failing fetch would only turn a known-unreachable forge
@@ -1052,9 +1077,16 @@ fn roster_half(
     config: &ConfigPass,
     (mode, clone): (Mode, bool),
     now: DateTime<Utc>,
-) -> RosterPass {
+) -> (RosterPass, repo_config::RepoConfigPass) {
+    let failed = |error: String| {
+        let roster = RosterPass {
+            error: Some(error),
+            ..RosterPass::default()
+        };
+        (roster, repo_config::RepoConfigPass::default())
+    };
     if config.cached {
-        return RosterPass {
+        let roster = RosterPass {
             skipped: Some(
                 "the forge was unreachable this pass and the roster is fail-closed (no cached \
                  fallback)"
@@ -1062,24 +1094,15 @@ fn roster_half(
             ),
             ..RosterPass::default()
         };
+        return (roster, repo_config::RepoConfigPass::default());
     }
     let registry_path = match crate::workspace_registry::default_registry_path() {
         Ok(p) => p,
-        Err(e) => {
-            return RosterPass {
-                error: Some(format!("{e:#}")),
-                ..RosterPass::default()
-            }
-        }
+        Err(e) => return failed(format!("{e:#}")),
     };
     let registry = match crate::workspace_registry::WorkspaceRegistry::load(&registry_path) {
         Ok(r) => r,
-        Err(e) => {
-            return RosterPass {
-                error: Some(format!("reading {}: {e:#}", registry_path.display())),
-                ..RosterPass::default()
-            }
-        }
+        Err(e) => return failed(format!("reading {}: {e:#}", registry_path.display())),
     };
     let registered: Vec<Registered> = registry
         .workspaces
@@ -1091,21 +1114,19 @@ fn roster_half(
         })
         .collect();
     let Some(home) = dirs::home_dir() else {
-        return RosterPass {
-            error: Some("no home directory".to_string()),
-            ..RosterPass::default()
-        };
+        return failed("no home directory".to_string());
     };
-    let plan = roster_pass(
-        transport,
-        &inputs.cache,
-        &inputs.location,
-        &home,
-        &registered,
-        &crate::workspace_registry::normalize_path,
-        &|p: &Path| p.join(".git").exists(),
-        now,
-    );
+    let is_cloned = |p: &Path| p.join(".git").exists();
+    let loaded =
+        match fetch::load(transport, &inputs.cache, &inputs.location, Policy::FailClosed, now) {
+            Ok(l) => l,
+            Err(e) => return failed(format!("{e:#}")),
+        };
+    let normalize = crate::workspace_registry::normalize_path;
+    let plan = match plan_snapshot(&loaded.snapshot, &home, &registered, &normalize, &is_cloned) {
+        Ok(plan) => plan,
+        Err(e) => return failed(format!("{e:#}")),
+    };
     let clones = if clone {
         let memory = roster_clone::memory::global();
         roster_clone::Clones::on(&roster_clone::GitCloner, inputs.clones, memory, Instant::now())
@@ -1113,15 +1134,11 @@ fn roster_half(
         roster_clone::Clones::off()
     };
     let write = mode == Mode::Write && inputs.auto_apply;
-    match plan {
-        Ok(plan) => {
-            roster_clone::summarize(&plan, write, &clones, &mut |c| apply_change(&registry_path, c))
-        }
-        Err(e) => RosterPass {
-            error: Some(format!("{e:#}")),
-            ..RosterPass::default()
-        },
-    }
+    let roster =
+        roster_clone::summarize(&plan, write, &clones, &mut |c| apply_change(&registry_path, c));
+    // After the roster, so a repo cloned this pass gets its tier this pass.
+    let repos = repo_config::pass(&loaded.snapshot, &home, &is_cloned, mode, now);
+    (roster, repos)
 }
 
 /// Log one pass at the level its findings deserve, and publish a drift record

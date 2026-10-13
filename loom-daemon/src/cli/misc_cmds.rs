@@ -320,6 +320,12 @@ pub(crate) fn handle_validate_command(
     );
     searched_tiers.push(
         absolute_workspace
+            .join(config_resolver::FLEET_REPO_CONFIG_REL)
+            .display()
+            .to_string(),
+    );
+    searched_tiers.push(
+        absolute_workspace
             .join(config_resolver::LOCAL_CONFIG_REL)
             .display()
             .to_string(),

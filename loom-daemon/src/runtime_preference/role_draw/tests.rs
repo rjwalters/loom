@@ -306,3 +306,37 @@ fn a_draw_replays_from_its_record() {
     assert_eq!(json["layer"], "repo-config");
     assert!(json.get("passed_over").is_none());
 }
+
+/// #11738: the per-repo fleet tier sits between `.loom-project` and
+/// `.loom-local/local.json` in the draw's own tier list, exactly as in the
+/// config resolver, so a fleet-set `roleDraw` / `excludeProviders` beats the
+/// repo's committed value and a host-local override still beats it.
+#[test]
+fn the_per_repo_fleet_tier_beats_the_committed_config_and_loses_to_local() {
+    let dir = tempfile::tempdir().unwrap();
+    let write = |rel: &str, v: &Value| {
+        let p = dir.path().join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, v.to_string()).unwrap();
+    };
+    write(
+        LEGACY_CONFIG_REL,
+        &json!({"runtimes": {"excludeProviders": ["opencode"],
+            "roleDraw": {"judge": [{"attempt": 1, "draw": {"claude": 1}}]}}}),
+    );
+    write(
+        FLEET_REPO_CONFIG_REL,
+        &json!({"runtimes": {"excludeProviders": ["codex"],
+            "roleDraw": {"judge": [{"attempt": 1, "draw": {"codex": 1}}]}}}),
+    );
+    let cfg = DrawConfig::load(dir.path());
+    assert_eq!(cfg.roles["judge"][&1].layer, Layer::FleetRepo);
+    assert_eq!(cfg.exclude, vec!["codex".to_string()]);
+    assert_eq!(cfg.exclude_layer, Some(Layer::FleetRepo));
+
+    write(LOCAL_CONFIG_REL, &json!({"runtimes": {"excludeProviders": []}}));
+    let cfg = DrawConfig::load(dir.path());
+    assert_eq!(cfg.exclude_layer, Some(Layer::Local));
+    assert_eq!(cfg.roles["judge"][&1].layer, Layer::FleetRepo);
+    assert_eq!(Layer::FleetRepo.as_str(), "fleet-repo");
+}
