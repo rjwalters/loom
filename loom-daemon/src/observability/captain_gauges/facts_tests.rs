@@ -15,8 +15,8 @@ use crate::observability::queue_blocked::blocked_rows;
 use crate::telemetry::queue_snapshot::QueueRepoRef;
 use crate::telemetry::RepoVisibility;
 
-const STAR: &str = "loom:operator-priority";
-const HIGH: &str = "loom:operator-high-priority";
+const STAR: &str = "loom:important";
+const HIGH: &str = "loom:very-important";
 
 fn at(mins: i64) -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 10, 6, 12, 0, 0).unwrap() + Duration::minutes(mins)
@@ -36,6 +36,7 @@ fn item(number: u32, labels: &[&str]) -> RestIssue {
         author_association: None,
         is_pull_request: false,
         comments: 3,
+        open_sub_issues: None,
     }
 }
 
@@ -105,7 +106,7 @@ fn a_label_the_captain_did_not_list_means_nothing_is_believed() {
 #[test]
 fn rows_from_the_captains_facts_are_the_rows_of_the_listing() {
     let listing = vec![
-        item(5, &["loom:blocked", "tier:goal-advancing", STAR, "loom:operator"]),
+        item(5, &["loom:blocked", "points:3", STAR, "loom:operator"]),
         item(6, &["loom:blocked", "loom:issue"]),
         pull(7, &["loom:blocked"]),
         item(
@@ -147,10 +148,11 @@ fn published_facts_carry_label_names_and_nothing_else() {
         "vendor contract",
         "someone",
         "customer:acme-corp",
+        "tier:2",
     ] {
         assert!(!json.contains(leak), "{leak} must not be published: {json}");
     }
-    assert!(json.contains(r#"{"n":8,"c":"2026-09-01T00:00:00Z","l":["loom:blocked","tier:2"]}"#));
+    assert!(json.contains(r#"{"n":8,"c":"2026-09-01T00:00:00Z","l":["loom:blocked"]}"#));
 }
 
 #[test]

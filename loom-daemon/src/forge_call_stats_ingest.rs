@@ -269,6 +269,7 @@ fn validate(row: &SinkLine, source: Source, now: i64) -> Option<AgentCall> {
             Outcome::Ok => CallOutcome::Ok,
             Outcome::NotModified => CallOutcome::NotModified,
             Outcome::RateLimited => CallOutcome::RateLimited,
+            Outcome::SecondaryLimited => CallOutcome::SecondaryLimited,
             Outcome::Error => CallOutcome::Error,
             Outcome::Shed => CallOutcome::Shed,
         },

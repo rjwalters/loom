@@ -2,13 +2,12 @@
 use super::*;
 
 /// A resolved value is a literal launch argument (the historical low-level
-/// registry API). Requests still need policy resolution; autonomous callers
-/// with a cached issue body can supply complexity without another forge read.
+/// registry API). Requests still need policy resolution.
 #[derive(Clone, Copy)]
 pub(crate) enum DispatchModel<'a> {
     Resolved(Option<&'a str>),
     Request(Option<&'a str>),
-    Autonomous { complexity: Option<&'a str> },
+    Autonomous,
 }
 
 impl DispatchModel<'_> {
@@ -62,22 +61,9 @@ impl DispatchModel<'_> {
         // actually launched.
         let policy = admitted
             .map_or_else(|| DefaultModelPolicy::resolve(root), DefaultModelPolicy::for_runtime);
-        let gh_default = std::path::PathBuf::from(crate::gh_invocation::gh_bin());
         let resolved = match (self, kind) {
-            (Self::Request(None) | Self::Autonomous { .. }, SweepKind::Issue(issue)) => {
-                resolve_autonomous_model_for_runtime(
-                    root,
-                    *issue,
-                    || match self {
-                        Self::Autonomous { complexity } => complexity.map(str::to_owned),
-                        _ => fetch_issue_complexity(
-                            config.gh_bin.as_deref().unwrap_or(gh_default.as_path()),
-                            root,
-                            *issue,
-                        ),
-                    },
-                    policy,
-                )
+            (Self::Request(None) | Self::Autonomous, SweepKind::Issue(issue)) => {
+                resolve_autonomous_model_for_runtime(root, *issue, policy)
             }
             _ => {
                 let explicit = match self {
@@ -136,6 +122,33 @@ impl SweepRegistry {
     /// `feature/issue-<N>`. When `None`, no `--depends-on` text is emitted —
     /// byte-for-byte unchanged behavior. A single optional parent (not a
     /// list) makes diamonds unrepresentable.
+    ///
+    /// `origin` (issue #11444): who asked for this sweep, recorded on its
+    /// start facts as `loom.dispatch_origin`. Required, never defaulted, so a
+    /// new production caller cannot compile without naming its origin.
+    pub fn dispatch_from(
+        &mut self,
+        kind: &SweepKind,
+        idempotency_key: Option<String>,
+        model: Option<&str>,
+        effort: Option<&str>,
+        depends_on: Option<u32>,
+        origin: DispatchOrigin,
+    ) -> Result<DispatchOutcome> {
+        self.dispatch_with_model(
+            kind,
+            idempotency_key,
+            DispatchModel::Resolved(model),
+            effort,
+            depends_on,
+            origin,
+        )
+    }
+
+    /// [`Self::dispatch_from`] with an `unknown` origin, for unit tests that
+    /// exercise the dispatch core rather than a particular dispatch path.
+    /// Test-only (#11444) so no production path can skip naming its origin.
+    #[cfg(test)]
     pub fn dispatch(
         &mut self,
         kind: &SweepKind,
@@ -144,12 +157,13 @@ impl SweepRegistry {
         effort: Option<&str>,
         depends_on: Option<u32>,
     ) -> Result<DispatchOutcome> {
-        self.dispatch_with_model(
+        self.dispatch_from(
             kind,
             idempotency_key,
-            DispatchModel::Resolved(model),
+            model,
             effort,
             depends_on,
+            DispatchOrigin::Unknown,
         )
     }
 
@@ -160,11 +174,15 @@ impl SweepRegistry {
         model: DispatchModel<'_>,
         effort: Option<&str>,
         depends_on: Option<u32>,
+        origin: DispatchOrigin,
     ) -> Result<DispatchOutcome> {
-        self.dispatch_inner(kind, idempotency_key, model, effort, depends_on, None)
+        self.dispatch_inner(kind, idempotency_key, model, effort, depends_on, None, origin)
     }
 
-    /// Keep the low-level already-resolved API for recovery and registry users.
+    /// The low-level already-resolved begin step with an `unknown` origin,
+    /// for unit tests. Production recovery calls
+    /// [`Self::begin_issue_dispatch_with_model`] with its own origin.
+    #[cfg(test)]
     pub(crate) fn begin_issue_dispatch(
         &mut self,
         kind: &SweepKind,
@@ -181,6 +199,7 @@ impl SweepRegistry {
             effort,
             depends_on,
             resume_bypass_pr,
+            DispatchOrigin::Unknown,
         )
     }
 }
@@ -203,5 +222,6 @@ pub(crate) fn dispatch_issue_releasing_poll_lock(
         DispatchModel::Resolved(model),
         effort,
         depends_on,
+        DispatchOrigin::Unknown,
     )
 }

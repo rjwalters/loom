@@ -236,7 +236,10 @@ pub fn record_sweep_at(
         },
         crate::sweep_registry::is_pid_alive,
     );
-    save(path, &journal)
+    save(path, &journal)?;
+    // J1 shadow (#11346): after the legacy write, never instead of it.
+    crate::journal::execution::sweeps_upserted(path, repo, issue, pid, started_at);
+    Ok(())
 }
 
 /// Convenience: [`record_sweep_at`] the default (env-overridable) path.
@@ -250,6 +253,7 @@ pub fn remove_sweep_at(path: &Path, repo: &str, issue: u32) -> Result<()> {
     let mut journal = load(path);
     if remove(&mut journal, repo, issue) {
         save(path, &journal)?;
+        crate::journal::execution::sweeps_removed(path, repo, issue);
     }
     Ok(())
 }

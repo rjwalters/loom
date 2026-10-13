@@ -65,8 +65,7 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
                 // never parked in shared state — so the several pre-spawn
                 // bail-outs below release it simply by dropping it, and no
                 // concurrent role tick or sweep dispatch can collide with it.
-                let backstop;
-                match runtime_preflight::check(
+                let backstop = match runtime_preflight::check(
                     &self.workspace_root,
                     &self.logs_dir(),
                     role,
@@ -85,10 +84,10 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
                         if let Some(runtime) = chosen.admitted {
                             admission_result = Some(Ok(runtime));
                         }
-                        backstop = chosen.backstop;
+                        chosen.backstop
                     }
                     Err(outcome) => return outcome,
-                }
+                };
                 // Issue #5028 (follow-up to #5001 AC2/AC3): runtime admission now
                 // resolves BEFORE the model, because the runtime is a per-role INPUT
                 // to the model/runtime mismatch check just below — a Claude-shaped
@@ -149,7 +148,7 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
                     if let Some(reason) =
                         crate::sweep_registry::model_runtime_mismatch(&admitted.runtime, &model)
                     {
-                        MODEL_RUNTIME_MISMATCH_SKIP_COUNT.fetch_add(1, Ordering::Relaxed);
+                        MODEL_RUNTIME_MISMATCH_SKIP_COUNT.record();
                         let mismatch = ModelRuntimeMismatch {
                             role: role.to_string(),
                             runtime: admitted.runtime.clone(),

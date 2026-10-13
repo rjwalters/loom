@@ -30,6 +30,8 @@
 //! | Per-model-class exhaustion scoping, #8058's rule (#8424) | [`bad_marks::mark_bad_for_class`], [`bad_marks::is_bad_for_class`] |
 //! | Automatic `mark_bad` from a real failed spawn, post-hoc (#8424) | [`ingest`] |
 //! | Per-account concurrency cap, enforced at selection (#8424) | [`limits`], [`inflight`], [`select`] |
+//! | Reset-aligned cooldowns: provider-reported reset, else the configured plan window (#11286) | [`reset`], [`limits`] |
+//! | In-run exhaustion marking for a live daemon-dispatched sweep (#11286) | [`live_watch`] |
 //!
 //! Two rows stay open, both documented where they bite rather than hidden: no
 //! health probe exists for an opaque API key, so [`select`] leaves its ranking
@@ -42,8 +44,10 @@ pub mod classify;
 pub mod inflight;
 pub mod ingest;
 pub mod limits;
+pub mod live_watch;
 pub mod paths;
 pub mod registry;
+pub mod reset;
 pub mod select;
 pub mod sync;
 

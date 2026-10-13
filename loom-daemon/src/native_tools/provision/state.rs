@@ -362,6 +362,17 @@ impl State {
                 command.env(key, path);
             }
         } else {
+            // #11400: redirecting XDG_CONFIG_HOME also hides `gh`'s own
+            // `hosts.yml`, so a role tick whose daemon authenticates through
+            // the ambient `gh auth login` (no GitHub App, no GH_TOKEN) ran
+            // every forge call unauthenticated. Point `gh` back at the config
+            // it would have read before the redirect.
+            if let Some(dir) = ambient_gh_config_dir(
+                |key| std::env::var_os(key).filter(|value| !value.is_empty()),
+                dirs::home_dir().as_deref(),
+            ) {
+                command.env("GH_CONFIG_DIR", dir);
+            }
             for (key, leaf) in [
                 ("XDG_CONFIG_HOME", "config"),
                 ("XDG_DATA_HOME", "data"),
@@ -388,6 +399,29 @@ impl State {
         }
         Ok(())
     }
+}
+
+/// The `gh` configuration directory a guarded launch must keep pointing at
+/// once it redirects `XDG_CONFIG_HOME` (#11400), or `None` when `gh` is
+/// already told where its credential is: an inherited `GH_CONFIG_DIR` (the
+/// daemon's GitHub App token, or a per-owner one) or `GH_TOKEN` /
+/// `GITHUB_TOKEN`, all of which `gh` reads ahead of `XDG_CONFIG_HOME`. Only an
+/// existing directory is returned, so a host without `gh` login is unchanged.
+fn ambient_gh_config_dir(
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
+    if ["GH_CONFIG_DIR", "GH_TOKEN", "GITHUB_TOKEN"]
+        .iter()
+        .any(|key| env(key).is_some())
+    {
+        return None;
+    }
+    let dir = env("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home.map(|home| home.join(".config")))?
+        .join("gh");
+    dir.is_dir().then_some(dir)
 }
 
 #[cfg(test)]

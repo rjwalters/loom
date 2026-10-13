@@ -78,6 +78,8 @@ use crate::workspace_pool::WorkspacePool;
 use super::queue::QueueSink;
 mod correlation;
 mod identity;
+mod zai_accounts;
+use zai_accounts::sample_zai_accounts;
 pub(crate) type DispatchKey = (String, u32);
 
 /// Timeout on the `gh repo view` slug lookup — generous but bounded so a
@@ -306,7 +308,7 @@ async fn handle_event(
 /// - **this live event-bus path** (`terminal_records`, below): fires
 ///   synchronously off `Event::SweepExited`/`SweepCrashed`, with no
 ///   `pr_number`, empty `phase_durations`, and no `config`/`failure_class`/
-///   `judge_verdicts`/`doctor_cycles`/`complexity`;
+///   `judge_verdicts`/`doctor_cycles`;
 /// - **the reaper's outcome journal**
 ///   (`sweep_registry::outcome_journal::append_outcome_telemetry_journal`),
 ///   drained on a periodic cadence by `super::backfill` — the RICH record,
@@ -342,7 +344,7 @@ async fn handle_event(
 ///
 /// Enriching this live path to carry the same fields would duplicate the
 /// journal's own logic (a second source of truth for `config`/
-/// `judge_verdicts`/`complexity`/…) for the larger of the two diffs. This
+/// `judge_verdicts`/…) for the larger of the two diffs. This
 /// path already KNOWS, from its own correlation state, whether the journal
 /// will emit under the same id — that is exactly what a tracked
 /// [`DispatchState`] (dispatched here, or adopted via registry evidence, see
@@ -742,17 +744,23 @@ fn terminal_records(
     // and the classifier hands back the mandatory `failure_class` (a
     // synthesized `unclassified:*` label here, since nothing classified this
     // transition) together with the disposition.
-    let (disposition, failure_class) =
-        crate::telemetry::classify_disposition(&crate::telemetry::DispositionSignals {
-            result,
-            pr_number,
-            failure_class: None,
-            phase_durations: &[],
-            total_duration_sec,
-            judge_verdicts: None,
-            doctor_cycles: None,
-            issue_end_state: None,
-        });
+    // #11429: no Judge verdicts are read here, so a `landed` failure stays a
+    // `failure` (no proof it landed clean).
+    let signals = crate::telemetry::DispositionSignals {
+        result,
+        pr_number,
+        failure_class: None,
+        phase_durations: &[],
+        total_duration_sec,
+        judge_verdicts: None,
+        doctor_cycles: None,
+        issue_end_state: None,
+        // `result` already encodes the only exit fact this path has
+        // (`Success` ⇔ exit 0), so a `Failure` here is never a clean exit.
+        exit_code: None,
+    };
+    let (disposition, failure_class) = crate::telemetry::classify_disposition(&signals);
+    let outcome_result = crate::telemetry::result_for_disposition(&signals, disposition);
     vec![
         TelemetryRecord::SweepCompleted(crate::telemetry::SweepCompletedRecord {
             repo: repo.clone(),
@@ -779,7 +787,7 @@ fn terminal_records(
             config: std::collections::BTreeMap::new(),
             phase_durations: Vec::<PhaseDuration>::new(),
             total_duration_sec,
-            result,
+            result: outcome_result,
             disposition,
             pr_number,
             // Token fields (and `tokens_status`) are filled by
@@ -809,8 +817,7 @@ fn terminal_records(
             runtime: None,
             provider: None,
             profile: None,
-            complexity: None,
-            // Issue #9432: like `complexity`, the story-point size is a forge
+            // Issue #9432: the story-point size is a forge
             // read this pure, reactor-thread mapping never makes. Absent, never
             // `0` — the reaper-side journal path (`outcome_journal`) resolves it
             // from the label list its own single REST read already carries, and
@@ -820,11 +827,13 @@ fn terminal_records(
             tokens_status: None,
             tokens_status_reason: None,
             no_phase_cause: None,
+            phase_tap_usage: Vec::new(),
             // Issues #9444/#9465/#9466: terminal facts the reaper-side journal
             // (the real `sweep.outcome`) computes. Absent, never fabricated.
             attempt_index: None,
             previous_sweep_id: None,
             trigger: None,
+            dispatch_origin: None,
             rework_events: None,
             pr_numbers: None,
             hw_lines_added: None,
@@ -940,6 +949,12 @@ async fn sample_snapshots(
     token_record
         .accounts
         .extend(sample_registry_provider_accounts(workspace_root));
+    // The Z.ai api-keys seats (#11396): per-seat 5h/weekly burn from the
+    // read-only quota endpoint, cached between ticks; unknown, never 0, on any
+    // failure. Skipped entirely (no client, no request) with no zai seats.
+    token_record
+        .accounts
+        .extend(sample_zai_accounts(workspace_root).await);
     // Token burn + per-provider pool state (Issue #8857), through the
     // OTLP-only ops sink — a no-op (no reads at all) without an OTLP exporter.
     super::ops::quota::record(workspace_root, &token_record.accounts).await;
@@ -1221,6 +1236,9 @@ async fn sample_host_health(
         captainless_singleton_jobs: crate::fleet_captain::captainless_singleton_job_names(),
         exported_kinds,
         exporters,
+        otlp_export: Some(crate::observability::otlp_health::check_global(
+            &crate::observability::read_config(workspace_root),
+        )),
         // Memory/pressure slice ("deferred vs killed vs timed out"): the
         // whole object is omitted when nothing was measured — never a flat
         // zero — the same absence contract `protection`/`admission_brake`

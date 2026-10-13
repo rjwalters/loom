@@ -433,6 +433,9 @@ notes = "forge_merge_config derives the effective merge-method set from repo fla
 kind = "rust"
 path = "loom-daemon/src/forge_merge_config.rs"
 [[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/branch_update.rs"
+[[operation.callers]]
 kind = "script"
 path = "defaults/scripts/land-resync-commit.sh"
 

@@ -24,9 +24,6 @@ pub(crate) enum SweepExperimentAction {
         #[arg(long, value_name = "N")]
         issue: i64,
 
-        #[arg(long, value_name = "TIER")]
-        complexity: Option<String>,
-
         #[arg(long, default_value = "text", value_parser = ["text", "json"])]
         format: String,
 
@@ -43,9 +40,6 @@ pub(crate) enum SweepExperimentAction {
     Banner {
         #[arg(long, value_name = "N")]
         issue: i64,
-
-        #[arg(long, value_name = "TIER")]
-        complexity: Option<String>,
 
         #[arg(long, value_name = "PATH")]
         config: Option<String>,
@@ -74,8 +68,9 @@ pub(crate) enum SweepExperimentAction {
         #[arg(long, default_value_t = 1)]
         attempt: i64,
 
-        #[arg(long)]
-        complexity: Option<String>,
+        /// The issue's `points:*` label value; omit when unsized.
+        #[arg(long = "story-points", value_name = "N")]
+        story_points: Option<i64>,
 
         #[arg(long)]
         verdict: Option<String>,

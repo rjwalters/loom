@@ -5,7 +5,7 @@
 //!
 //! `loom:operator-only` is a **hard park**: every dispatch route refuses the
 //! item, unconditionally, keyed on the base label
-//! ([`crate::work_finder::PARK_LABELS`]). Its four sub-kind labels (#5671) are
+//! ([`crate::work_finder::PARK_LABELS`]). Its sub-kind labels (#5671) are
 //! additive metadata the skip logic never branched on, so a
 //! `loom:operator-mechanical` item — "needs a credential/host access, but **no
 //! judgement**" — was parked exactly like a genuine `loom:operator-decision`
@@ -61,14 +61,13 @@
 //! Two properties are reproduced exactly:
 //!
 //! 1. **Anchored to the full `<!-- ... -->` comment form**, never a bare
-//!    substring — the same anchoring `require-complexity-marker.sh` uses, for
-//!    the same reason (#4840): prose that merely *quotes* the marker syntax as
-//!    literal example text (as the convention doc itself does) must never be
-//!    mistaken for a live marker. A `<name>` placeholder breaks the `-->`
+//!    substring — the #4840 anchoring rule: prose that merely *quotes* the
+//!    marker syntax as literal example text (as the convention doc itself
+//!    does) must never be mistaken for a live marker. A `<name>` placeholder breaks the `-->`
 //!    anchor and is therefore skipped.
-//! 2. **Every match is collected, deduplicated** — unlike the complexity marker
-//!    (`tail -1`, last match wins, one tier per item), the whole declared set
-//!    matters because multiple markers are **ANDed**.
+//! 2. **Every match is collected, deduplicated** — the whole declared set
+//!    matters because multiple markers are **ANDed**, so there is no
+//!    last-match-wins.
 //!
 //! Matching is line-oriented, like `grep`: a marker split across a newline is
 //! recognized by neither implementation.
@@ -103,7 +102,7 @@ pub const KNOWN_CAPABILITY_LITERALS: &[&str] =
 /// is **not** a valid value — something must follow the colon.
 pub const KNOWN_CAPABILITY_PREFIXES: &[&str] = &["cloud-profile:"];
 
-/// The `loom:operator-only` base label — the hard park all four sub-kinds
+/// The `loom:operator-only` base label — the hard park all its sub-kinds
 /// inherit.
 pub const OPERATOR_ONLY_LABEL: &str = "loom:operator-only";
 
@@ -111,17 +110,13 @@ pub const OPERATOR_ONLY_LABEL: &str = "loom:operator-only";
 /// requiring access, not a ruling (#5671).
 pub const OPERATOR_MECHANICAL_LABEL: &str = "loom:operator-mechanical";
 
-/// The other three `loom:operator-only` sub-kinds. Each stays hard-skipped
+/// The other two `loom:operator-only` sub-kinds. Each stays hard-skipped
 /// **unconditionally**, regardless of any capability marker in its body — the
 /// convention doc is explicit that they ignore the marker entirely. Listed here
 /// so [`labels_eligible_for_capability_lane`] can refuse an item that carries
 /// one of them *alongside* `loom:operator-mechanical` (a contradictory
 /// labelling, resolved conservatively in favour of the judgement sub-kind).
-pub const JUDGEMENT_SUB_KIND_LABELS: &[&str] = &[
-    "loom:operator-decision",
-    "loom:operator-blocked",
-    "loom:operator-objective",
-];
+pub const JUDGEMENT_SUB_KIND_LABELS: &[&str] = &["loom:operator-decision", "loom:operator-blocked"];
 
 /// Labels that veto the capability lane outright even next to a well-formed
 /// mechanical declaration.
@@ -526,9 +521,9 @@ mod tests {
     }
 
     #[test]
-    fn collects_every_marker_deduplicated_unlike_the_complexity_marker() {
-        // The complexity marker takes `tail -1`; capability markers are ANDed,
-        // so all of them matter and repeats collapse.
+    fn collects_every_marker_deduplicated() {
+        // Capability markers are ANDed, so all of them matter and repeats
+        // collapse.
         let body = "<!-- loom:capability=host-sudo -->\n\
                     text\n\
                     <!-- loom:capability=cloud-profile:prod-aws -->\n\
@@ -638,7 +633,7 @@ mod tests {
     #[test]
     fn unrelated_html_comments_are_ignored() {
         let decl = extract_capability_markers(
-            "<!-- loom:complexity=complex -->\n<!-- just a note -->\n<!-- loom:capability=host-sudo -->",
+            "<!-- loom:points=3 -->\n<!-- just a note -->\n<!-- loom:capability=host-sudo -->",
         );
         assert_eq!(decl.required, held(&["host-sudo"]));
     }
@@ -681,7 +676,7 @@ mod tests {
             ("<!-- loom:capability=host_sudo -->", &[], &["host_sudo"]),
             ("<!-- loom:capability=host-sudo- -->", &[], &["host-sudo-"]),
             ("loom:capability=host-sudo", &[], &[]),
-            ("<!-- loom:complexity=complex -->", &[], &[]),
+            ("<!-- loom:points=3 -->", &[], &[]),
             (
                 "<!-- loom:capability=forge-admin-token --> and <!-- loom:capability=root -->",
                 &["forge-admin-token"],
@@ -866,7 +861,7 @@ mod tests {
 
     #[test]
     fn a_judgement_sub_kind_with_a_marker_and_a_capable_worker_still_parks() {
-        // The convention doc's explicit rule: the other three sub-kinds ignore
+        // The convention doc's explicit rule: the other sub-kinds ignore
         // the marker entirely.
         for sub_kind in JUDGEMENT_SUB_KIND_LABELS {
             let routing = route_mechanical(

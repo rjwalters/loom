@@ -129,9 +129,6 @@ kind = "rust"
 path = "loom-daemon/src/forge_cached_view.rs"
 [[operation.callers]]
 kind = "rust"
-path = "loom-daemon/src/star_liveness/forge.rs"
-[[operation.callers]]
-kind = "rust"
 path = "loom-daemon/src/sweep_registry/park_hold.rs"
 [[operation.callers]]
 kind = "rust"
@@ -171,6 +168,9 @@ unknowns = [
 [[operation.callers]]
 kind = "script"
 path = "defaults/scripts/check-duplicate.sh"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/cli/duplicate_closed_search.rs"
 
 # --- issue-mutation-lifecycle ------------------------------------------------
 

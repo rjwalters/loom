@@ -42,11 +42,13 @@
 //!    run is reproducible from the exact vector it ran under.
 //!
 //! Tranche 1 fields (each a real consumed tunable — see the field docs):
-//! `dispatch.{tickIntervalSecs,maxConcurrent,maxAdmissionsPerTick}`,
+//! `dispatch.{tickIntervalSecs,maxConcurrent,maxAdmissionsPerTick}` (plus
+//! `dispatch.drawTemperature`, #11684),
 //! `lifecycle.{leaseTtlMinutes,idleExitMinutes}`, and
 //! `rework.{buildBackoffHigh,buildBackoffLow}`. The `champion` group (#10753)
 //! carries Champion's promotion-throughput knobs
-//! (`prSlice,promotionSlice,tier2Cap,tier3Cap,tier3BacklogCap`). Later tranches migrate the
+//! (`prSlice,promotionSlice,tier2Cap,tier3Cap,tier3BacklogCap`; since #11512
+//! `tier2Cap` caps no-level promotions and the two `tier3*` caps are unused). Later tranches migrate the
 //! remaining knobs (host breaker, admission brake, merge-train bounds, role
 //! budgets) onto the same surface; the schema, validation and digest
 //! mechanics here are the whole point — adding a field is one struct entry,
@@ -62,6 +64,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use crate::config_resolver;
+use crate::priority_pick::{DEFAULT_DRAW_TEMPERATURE, DRAW_TEMPERATURE_RANGE};
 use crate::work_finder::{
     build_backoff::{BuildBackoffConfig, DEFAULT_HIGH, DEFAULT_LOW},
     DEFAULT_MAX_ADMISSIONS_PER_TICK, DEFAULT_WORK_FINDER_INTERVAL_SECS,
@@ -117,6 +120,14 @@ pub struct DispatchParams {
     /// `autonomous.workFinder.maxAdmissionsPerTick`; env:
     /// `LOOM_WORK_FINDER_MAX_ADMISSIONS_PER_TICK`. Range `[1, 64]`.
     pub max_admissions_per_tick: usize,
+    /// Temperature of the workspace draw's softmax over `fleet_priority`
+    /// (#11684), in priority units: small means nearly strict priority
+    /// order, large means nearly uniform. Source:
+    /// `priority_pick::DEFAULT_DRAW_TEMPERATURE` (80). No legacy config home
+    /// and no single-knob env. Range `[1, 100000]`; an integer because the
+    /// draw records derive `Eq`. Appended last: field order is the digest's
+    /// canonical serialization.
+    pub draw_temperature: u32,
 }
 
 /// Lifecycle timeout tunables — how long Loom waits before treating work or
@@ -166,14 +177,19 @@ pub struct ChampionParams {
     /// Fresh promotion verdicts per pause while PR rows remain. Env:
     /// `LOOM_CHAMPION_PROMOTION_SLICE`. Default 3. Range `[1, 100]`.
     pub promotion_slice: usize,
-    /// Tier 2 promotions per repository per pass. Env:
-    /// `LOOM_CHAMPION_TIER2_CAP`. Default 2. Range `[0, 100]` (`0` disables).
+    /// Promotions per repository per pass of proposals with no priority level
+    /// (the old Tier 2 cap, mapped by population in #11512; the name is kept
+    /// for config compatibility). Env: `LOOM_CHAMPION_TIER2_CAP`. Default 2.
+    /// Range `[0, 100]` (`0` disables).
     pub tier2_cap: usize,
-    /// Tier 3 promotions per repository per pass. Env:
-    /// `LOOM_CHAMPION_TIER3_CAP`. Default 1. Range `[0, 100]` (`0` disables).
+    /// The old Tier 3 per-pass cap. Unused since #11512: no priority level
+    /// maps onto Tier 3's population. Still parsed and digested so existing
+    /// config loads. Env: `LOOM_CHAMPION_TIER3_CAP`. Default 1. Range
+    /// `[0, 100]`.
     pub tier3_cap: usize,
-    /// Open unheld `tier:maintenance` `loom:issue`/`loom:building` issues
-    /// above which Tier 3 promotion is gated. Env:
+    /// The old Tier 3 backlog gate. Unused since #11512: keyed on no level it
+    /// counted 46 promoted issues against 5 and froze promotion. Still parsed
+    /// and digested so existing config loads. Env:
     /// `LOOM_CHAMPION_TIER3_BACKLOG_CAP`. Default 5. Range `[0, 1000]`.
     pub tier3_backlog_cap: usize,
 }
@@ -197,6 +213,7 @@ impl Default for Hyperparameters {
                 tick_interval_secs: DEFAULT_WORK_FINDER_INTERVAL_SECS,
                 max_concurrent: DEFAULT_WORK_FINDER_MAX_CONCURRENT,
                 max_admissions_per_tick: DEFAULT_MAX_ADMISSIONS_PER_TICK,
+                draw_temperature: DEFAULT_DRAW_TEMPERATURE,
             },
             lifecycle: LifecycleParams {
                 lease_ttl_minutes: crate::claim_reconciliation::DEFAULT_LEASE_TTL_MINUTES,
@@ -348,8 +365,8 @@ const IDLE_EXIT_MINUTES_RANGE: (u64, u64) = (1, 10080);
 const BUILD_BACKOFF_HIGH_RANGE: (u64, u64) = (1, 100_000);
 const BUILD_BACKOFF_LOW_RANGE: (u64, u64) = (0, 100_000);
 /// Champion knobs: `(key, single-knob env var, range)`. The three caps admit
-/// `0` because Champion's shell `_cap` honours it (`0` disables that tier /
-/// gates Tier 3 shut — promotion-throughput.md); the slices do not.
+/// `0` because Champion's shell `_cap` honours it (`0` disables that level /
+/// gates no-level promotion shut — promotion-throughput.md); the slices do not.
 const CHAMPION_KEYS: [(&str, &str, (u64, u64)); 5] = [
     ("prSlice", "LOOM_CHAMPION_PR_SLICE", (1, 1000)),
     ("promotionSlice", "LOOM_CHAMPION_PROMOTION_SLICE", (1, 100)),
@@ -431,7 +448,10 @@ fn validate_dispatch(group: &Value, violations: &mut Vec<Violation>) {
         return;
     }
     for (key, _) in group.as_object().into_iter().flatten() {
-        if !matches!(key.as_str(), "tickIntervalSecs" | "maxConcurrent" | "maxAdmissionsPerTick") {
+        if !matches!(
+            key.as_str(),
+            "tickIntervalSecs" | "maxConcurrent" | "maxAdmissionsPerTick" | "drawTemperature"
+        ) {
             violations.push(Violation::new(format!("dispatch.{key}"), "unknown key"));
         }
     }
@@ -444,6 +464,7 @@ fn validate_dispatch(group: &Value, violations: &mut Vec<Violation>) {
         MAX_ADMISSIONS_PER_TICK_RANGE,
         violations,
     );
+    check_u64(group, "dispatch", "drawTemperature", DRAW_TEMPERATURE_RANGE, violations);
 }
 
 fn validate_lifecycle(group: &Value, violations: &mut Vec<Violation>) {
@@ -685,6 +706,17 @@ pub fn resolve_effective(root: &Path) -> Resolved {
                 DEFAULT_MAX_ADMISSIONS_PER_TICK as u64,
                 &mut sources,
             ) as usize,
+            // No legacy tier: the key is new with #11684.
+            draw_temperature: u32::try_from(pick_u64(
+                vector.as_ref(),
+                &block,
+                "dispatch",
+                "drawTemperature",
+                None,
+                u64::from(DEFAULT_DRAW_TEMPERATURE),
+                &mut sources,
+            ))
+            .unwrap_or(DEFAULT_DRAW_TEMPERATURE),
         },
         lifecycle: LifecycleParams {
             lease_ttl_minutes: {
@@ -967,6 +999,11 @@ impl HyperparamsArgs {
             "dispatch.maxAdmissionsPerTick  = {:>6}  [{}]",
             resolved.params.dispatch.max_admissions_per_tick,
             resolved.sources["dispatch.maxAdmissionsPerTick"].as_str()
+        );
+        println!(
+            "dispatch.drawTemperature       = {:>6}  [{}]",
+            resolved.params.dispatch.draw_temperature,
+            resolved.sources["dispatch.drawTemperature"].as_str()
         );
         println!(
             "lifecycle.leaseTtlMinutes      = {:>6}  [{}]",

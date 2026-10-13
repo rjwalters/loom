@@ -533,7 +533,8 @@ fn apply_change_flips_maintain_only_in_place() {
 // The host-level snapshot and its `status` line
 // ------------------------------------------------------------------------
 
-fn sample_status() -> FleetSyncStatus {
+// `pub(crate)` so the sibling `applied` module's tests can build passes too.
+pub(crate) fn sample_status() -> FleetSyncStatus {
     FleetSyncStatus {
         repo: "acme/fleet".to_string(),
         reference: "main".to_string(),
@@ -1004,7 +1005,9 @@ fn no_floor_leaves_the_status_line_unchanged() {
 
 /// Run `f` with `LOOM_SOCKET_PATH` pointing into a fresh temp dir and both
 /// process-wide cells empty; restore the environment and empty them after.
-fn with_clean_process_state<T>(f: impl FnOnce(&Path) -> T) -> T {
+/// `pub(crate)` so the sibling `applied` module's tests reuse the same
+/// process-state hygiene (#11197).
+pub(crate) fn with_clean_process_state<T>(f: impl FnOnce(&Path) -> T) -> T {
     let dir = tempfile::tempdir().expect("dir");
     let prior = std::env::var("LOOM_SOCKET_PATH").ok();
     std::env::set_var("LOOM_SOCKET_PATH", dir.path().join("loom-daemon.sock"));

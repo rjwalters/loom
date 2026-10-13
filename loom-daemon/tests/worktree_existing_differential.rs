@@ -825,6 +825,6 @@ fn fallback_expression() -> String {
         .expect("worktree.sh's fallback no longer ends in a print_error");
     format!(
         "set -e\nWORKTREE_PATH=\"$1\"\n{}\nexit 1\n",
-        &rest[..end].replace("return 0", "exit 0")
+        rest[..end].replace("return 0", "exit 0")
     )
 }

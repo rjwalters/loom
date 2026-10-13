@@ -313,7 +313,12 @@ pub fn run_command(cmd: Command, timeout: Duration) -> CmdOutcome {
 }
 
 fn finish(cmd: Command, timeout: Duration) -> CmdOutcome {
-    match run_bounded(cmd, timeout) {
+    outcome_of(run_bounded(cmd, timeout), timeout)
+}
+
+/// Classify an already-run [`run_bounded`]-style result as [`finish`] does.
+pub fn outcome_of(result: Result<Completion, ExecError>, timeout: Duration) -> CmdOutcome {
+    match result {
         Ok(Completion::Exited(out)) => CmdOutcome::Ran(out),
         Ok(Completion::TimedOut { stdout, .. }) => CmdOutcome::Unavailable(Unavailable::TimedOut {
             after: timeout,

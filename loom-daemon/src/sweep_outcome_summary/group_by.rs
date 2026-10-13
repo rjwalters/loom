@@ -1,7 +1,6 @@
 //! The `--group-by` dimension enum and its wire/display spellings. Split out
 //! of `sweep_outcome_summary.rs` to stay under the file-size ratchet
-//! threshold (`scripts/check-file-size-budget.sh`, #7711) after Issue #8542
-//! added the `complexity` / `model-complexity` dimensions.
+//! threshold (`scripts/check-file-size-budget.sh`, #7711).
 
 use anyhow::{bail, Result};
 use serde::Serialize;
@@ -25,21 +24,6 @@ pub enum GroupBy {
     /// (Issue #8556). See [`super::resolve_tap`] for how a record with no
     /// explicit `config["tap"]` stamp is placed.
     Tap,
-    /// The Curator's complexity tier (Issue #8542): `mechanical` / `routine` /
-    /// `complex`, `unknown` for a record with no marker observed — see
-    /// [`crate::telemetry::SweepOutcomeRecord::complexity`]. This is the
-    /// routing-evaluation cut: each row's `first_pass_approval_rate` answers
-    /// "does this tier's dispatch hold the Judge first-pass rate?".
-    #[serde(rename = "complexity")]
-    Complexity,
-    /// The `model × complexity` cross-tab (Issue #8542): the compound key
-    /// `"<model>/<complexity>"`, each side defaulting exactly as its own
-    /// single-dimension grouping does (`default` / `unknown`). Answers
-    /// "within one tier, does a cheaper model hold the approval rate?" —
-    /// the question `--group-by model` and `--group-by complexity` can each
-    /// only approximate alone.
-    #[serde(rename = "model-complexity")]
-    ModelComplexity,
 }
 
 impl GroupBy {
@@ -52,11 +36,9 @@ impl GroupBy {
             "host" => Ok(Self::Host),
             "day" => Ok(Self::Day),
             "tap" => Ok(Self::Tap),
-            "complexity" => Ok(Self::Complexity),
-            "model-complexity" => Ok(Self::ModelComplexity),
             other => bail!(
                 "unknown --group-by value {other:?} (expected one of: arm, model, repo, host, \
-                 day, tap, complexity, model-complexity)"
+                 day, tap)"
             ),
         }
     }
@@ -70,8 +52,6 @@ impl GroupBy {
             Self::Host => "host",
             Self::Day => "day",
             Self::Tap => "tap",
-            Self::Complexity => "complexity",
-            Self::ModelComplexity => "model-complexity",
         }
     }
 }

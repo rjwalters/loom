@@ -12,31 +12,50 @@
 //! Dispatch is **workspace first, then issue**:
 //!
 //! 1. [`draw_workspace`] picks a workspace at random, weighted by workspace
-//!    priority ([`weight_for_priority`]). A workspace holding dispatchable
-//!    `loom:very-important` work wins: the draw is over just those
-//!    workspaces, else over every workspace with dispatchable work.
+//!    priority ([`softmax_weight`], a softmax with a temperature, #11684).
+//!    The pool is three-tier: workspaces
+//!    whose next issue is a verified red-main fix if any (#11547), else
+//!    workspaces holding dispatchable `loom:very-important` work if any,
+//!    else every workspace with dispatchable work.
 //! 2. [`order_in_workspace`] / [`next_in_workspace`] pick the issue inside
-//!    the workspace: level, then oldest `createdAt`, then issue number.
+//!    the workspace: verified red-main fix first, then level, then oldest
+//!    `createdAt`, then issue number.
 //!
-//! There is no inheritance, no starred-at time, no red-main key and no
-//! cross-workspace round-robin here. The module is pure: the RNG is a
+//! `loom:very-important` is capped per workspace ([`VERY_IMPORTANT_CAP`],
+//! #11509): [`very_important_holders`] names the oldest open one, which keeps
+//! the level; every other open one ranks as `loom:important`.
+//!
+//! A verified red-main fix is an issue carrying the `loom:main-red-fix`
+//! marker whose repo's `main` is verified red this tick; on a green `main`
+//! the marker grants nothing. It reorders only: no gate or [`Level`] effect.
+//!
+//! There is no inheritance, no starred-at time and no cross-workspace
+//! round-robin here. The module is pure: the RNG is a
 //! seedable [`PickRng`], so a fixed seed reproduces an exact pick sequence,
 //! and [`WorkspaceDraw`] is the record `pick.decision` carries.
 
 use std::cmp::Ordering;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// The "important" label.
 pub const IMPORTANT_LABEL: &str = "loom:important";
-/// The "very important" label (capped; see `daemon-reference.md`).
+/// The "very important" label (capped: [`VERY_IMPORTANT_CAP`]).
 pub const VERY_IMPORTANT_LABEL: &str = "loom:very-important";
 
+/// How many open `loom:very-important` issues one workspace holds at a time
+/// (#11509, operator ruling C on #11278). Every further one ranks as
+/// `loom:important`. A constant on purpose, not a config knob.
+pub const VERY_IMPORTANT_CAP: usize = 1;
+
 /// An issue's priority level. Declaration order is ascending importance.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+/// On the wire (status, queue snapshot, fleet state) it is `default` /
+/// `important` / `very-important`; an unknown value reads as `default`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Level {
     /// No priority label.
+    #[default]
     Default,
     /// `loom:important`.
     Important,
@@ -59,6 +78,46 @@ impl Level {
         }
         level
     }
+
+    /// The wire name: `default`, `important` or `very-important`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Important => "important",
+            Self::VeryImportant => "very-important",
+        }
+    }
+
+    /// The level named `wire` ([`Self::as_str`]); anything else is
+    /// [`Level::Default`].
+    #[must_use]
+    pub fn from_wire(wire: &str) -> Self {
+        match wire {
+            "important" => Self::Important,
+            "very-important" => Self::VeryImportant,
+            _ => Self::Default,
+        }
+    }
+
+    /// The integer form some wire surfaces use (`fleet-state/v1` `level`,
+    /// the plan's `level` key, the PR queue): 0 default, 1 important,
+    /// 2 very important.
+    #[must_use]
+    pub fn rank(self) -> u8 {
+        match self {
+            Self::Default => 0,
+            Self::Important => 1,
+            Self::VeryImportant => 2,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Level {
+    /// Lenient: an unknown name (a newer daemon's level) reads as `default`.
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(Self::from_wire(&String::deserialize(d)?))
+    }
 }
 
 /// One issue as the within-workspace order sees it.
@@ -70,15 +129,21 @@ pub struct IssueKey {
     pub created_at: Option<String>,
     /// Priority level.
     pub level: Level,
+    /// A verified red-main fix (marker + repo `main` verified red this tick,
+    /// #11547): sorts ahead of every level. Never an input to the
+    /// very-important cap.
+    pub main_red_fix: bool,
 }
 
-/// Total order inside one workspace: level (highest first), oldest
+/// Total order inside one workspace: verified red-main fix first (#11547),
+/// then level (highest first), oldest
 /// `createdAt` first (a dated issue before an undated one), issue number
 /// ascending.
 #[must_use]
 pub fn issue_cmp(a: &IssueKey, b: &IssueKey) -> Ordering {
-    b.level
-        .cmp(&a.level)
+    b.main_red_fix
+        .cmp(&a.main_red_fix)
+        .then_with(|| b.level.cmp(&a.level))
         .then_with(|| match (&a.created_at, &b.created_at) {
             (Some(x), Some(y)) => x.cmp(y),
             (Some(_), None) => Ordering::Less,
@@ -101,12 +166,79 @@ pub fn next_in_workspace(items: &[IssueKey]) -> Option<&IssueKey> {
     items.iter().min_by(|a, b| issue_cmp(a, b))
 }
 
-/// Draw weight of a workspace from its `fleet_priority` (lower number =
-/// higher priority, default 100): `1000 / (1 + priority)`, at least 1. So
-/// priority 0 weighs 1000, 10 weighs 90, 100 (the default) weighs 9.
+/// The open `loom:very-important` issues of one workspace that keep the
+/// level: the [`VERY_IMPORTANT_CAP`] oldest, by `createdAt` (a dated issue
+/// before an undated one) then issue number. `open` is every open
+/// very-important issue of the workspace, in any state; its `level` fields
+/// are ignored and a number listed twice counts once. Nothing about who
+/// applied the label is an input, so the cap is the same for every actor.
 #[must_use]
-pub fn weight_for_priority(priority: u32) -> u64 {
-    (1000 / (1 + u64::from(priority))).max(1)
+pub fn very_important_holders(open: &[IssueKey]) -> Vec<u32> {
+    let mut by_number: std::collections::BTreeMap<u32, IssueKey> =
+        std::collections::BTreeMap::new();
+    for k in open {
+        let entry = by_number.entry(k.number).or_insert_with(|| k.clone());
+        if entry.created_at.is_none() {
+            entry.created_at.clone_from(&k.created_at);
+        }
+    }
+    let mut keys: Vec<IssueKey> = by_number
+        .into_values()
+        .map(|k| IssueKey {
+            level: Level::VeryImportant,
+            main_red_fix: false,
+            ..k
+        })
+        .collect();
+    keys.sort_by(issue_cmp);
+    keys.into_iter()
+        .take(VERY_IMPORTANT_CAP)
+        .map(|k| k.number)
+        .collect()
+}
+
+/// The weight of the pool's top workspace (the one at `p_min`) in
+/// [`softmax_weight`]. Large enough that the curve keeps ~6 decimal digits of
+/// resolution before the floor of 1 bites; small enough that a sum over any
+/// realistic fleet stays far inside `u64` (and inside a JS `Number`'s exact
+/// integer range, which `pick.decision` readers rely on).
+pub const DRAW_WEIGHT_SCALE: u64 = 1_000_000;
+
+/// Default draw temperature, in `fleet_priority` units
+/// (`dispatch.drawTemperature`, #11684). At 80, priority 20 outweighs
+/// priority 200 about 9.5x — roughly the spread the pre-#11684
+/// `1000 / (1 + p)` curve gave across the fleet's priority range.
+pub const DEFAULT_DRAW_TEMPERATURE: u32 = 80;
+
+/// The accepted `dispatch.drawTemperature` range. An integer on purpose: the
+/// draw records derive `Eq`, and the hyperparams range check is integer-only.
+pub const DRAW_TEMPERATURE_RANGE: (u64, u64) = (1, 100_000);
+
+/// Draw weight of a workspace from its `fleet_priority` (lower number =
+/// higher priority, default 100): a softmax over priorities read as negative
+/// logits (#11684),
+///
+/// ```text
+/// w(p) = max(1, round(DRAW_WEIGHT_SCALE * exp(-(p - p_min) / T)))
+/// ```
+///
+/// `p_min` is the smallest priority in the pool being drawn over, so the top
+/// workspace always weighs exactly [`DRAW_WEIGHT_SCALE`] and only priority
+/// *differences* matter. `temperature` (`T`) is the one knob: small means
+/// nearly strict priority order, large means nearly uniform. A `p` below
+/// `p_min` is treated as `p_min`, and `T = 0` as `T = 1`, so the function is
+/// total. Never 0, never above [`DRAW_WEIGHT_SCALE`].
+#[must_use]
+pub fn softmax_weight(priority: u32, p_min: u32, temperature: u32) -> u64 {
+    let gap = f64::from(priority.saturating_sub(p_min));
+    let t = f64::from(temperature.max(1));
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
+    let w = ((DRAW_WEIGHT_SCALE as f64) * (-gap / t).exp()).round() as u64;
+    w.clamp(1, DRAW_WEIGHT_SCALE)
 }
 
 /// A workspace with dispatchable work, as the draw sees it.
@@ -118,6 +250,8 @@ pub struct WorkspaceEntry {
     pub priority: u32,
     /// Whether it has open, dispatchable `loom:very-important` work.
     pub has_very_important: bool,
+    /// Whether its next candidate is a verified red-main fix (#11547).
+    pub has_red_main_fix: bool,
 }
 
 /// A candidate in the draw, with its weight.
@@ -132,13 +266,21 @@ pub struct DrawCandidate {
 /// What `pick.decision` records for one workspace draw.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WorkspaceDraw {
-    /// `"very-important"` when only workspaces with very-important work were
-    /// drawn over, `"all"` otherwise.
+    /// `"red-main-fix"` when only workspaces whose next candidate is a
+    /// verified red-main fix were drawn over (#11547), else
+    /// `"very-important"` when only workspaces with very-important work were,
+    /// `"all"` otherwise.
     pub pool: &'static str,
     /// The candidates drawn over, sorted by workspace name, with weights.
     pub candidates: Vec<DrawCandidate>,
     /// Sum of the weights.
     pub total_weight: u64,
+    /// The draw temperature the weights were computed at
+    /// (`dispatch.drawTemperature`, #11684).
+    pub temperature: u32,
+    /// The smallest priority in the pool: the one weighing
+    /// [`DRAW_WEIGHT_SCALE`] (#11684).
+    pub p_min: u32,
     /// The RNG value in `0..total_weight`.
     pub roll: u64,
     /// The winning workspace.
@@ -174,22 +316,35 @@ impl PickRng {
 
 /// Draw the workspace to dispatch from. `None` when `entries` is empty.
 ///
-/// A workspace with very-important work wins: when any entry has it, the
-/// draw is over only those, else over all. Within the pool the draw is
-/// weighted by [`weight_for_priority`]. Entries are put in name order first,
-/// so the result depends only on the set and the RNG state.
-pub fn draw_workspace(entries: &[WorkspaceEntry], rng: &mut PickRng) -> Option<WorkspaceDraw> {
+/// The pool is three-tier (#11547): the entries whose next candidate is a
+/// verified red-main fix if any; else those with very-important work if any;
+/// else all. Within the pool the draw is weighted by [`softmax_weight`] at
+/// `temperature`, with `p_min` taken over the pool (not over every entry), so
+/// the pool's top workspace always weighs [`DRAW_WEIGHT_SCALE`]. Entries are
+/// put in name order first, so the result depends only on the set, the
+/// temperature and the RNG state.
+pub fn draw_workspace(
+    entries: &[WorkspaceEntry],
+    temperature: u32,
+    rng: &mut PickRng,
+) -> Option<WorkspaceDraw> {
+    let any_fix = entries.iter().any(|e| e.has_red_main_fix);
     let any_vi = entries.iter().any(|e| e.has_very_important);
-    let mut pool: Vec<&WorkspaceEntry> = entries
-        .iter()
-        .filter(|e| !any_vi || e.has_very_important)
-        .collect();
+    let (pool_name, in_pool): (&'static str, fn(&WorkspaceEntry) -> bool) = if any_fix {
+        ("red-main-fix", |e| e.has_red_main_fix)
+    } else if any_vi {
+        ("very-important", |e| e.has_very_important)
+    } else {
+        ("all", |_| true)
+    };
+    let mut pool: Vec<&WorkspaceEntry> = entries.iter().filter(|e| in_pool(e)).collect();
     pool.sort_by(|a, b| a.workspace.cmp(&b.workspace));
+    let p_min = pool.iter().map(|e| e.priority).min().unwrap_or(0);
     let candidates: Vec<DrawCandidate> = pool
         .iter()
         .map(|e| DrawCandidate {
             workspace: e.workspace.clone(),
-            weight: weight_for_priority(e.priority),
+            weight: softmax_weight(e.priority, p_min, temperature),
         })
         .collect();
     let total_weight: u64 = candidates.iter().map(|c| c.weight).sum();
@@ -207,9 +362,11 @@ pub fn draw_workspace(entries: &[WorkspaceEntry], rng: &mut PickRng) -> Option<W
         }
     }
     Some(WorkspaceDraw {
-        pool: if any_vi { "very-important" } else { "all" },
+        pool: pool_name,
         candidates,
         total_weight,
+        temperature,
+        p_min,
         roll,
         picked,
     })

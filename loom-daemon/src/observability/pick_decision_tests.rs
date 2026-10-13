@@ -95,6 +95,26 @@ fn work_finder_record_keeps_rank_order_and_classifies_each_row() {
 }
 
 #[test]
+fn a_file_overlap_deferral_carries_its_shared_paths_into_the_record() {
+    let mut s = summary(vec![
+        (1, QueueDisposition::Dispatched),
+        (2, QueueDisposition::DeferredFileOverlap),
+        (3, QueueDisposition::DispatchError),
+    ]);
+    s.queue[1].detail = Some("file overlap: src/a.rs, src/b.rs".to_string());
+    s.queue[2].detail = Some("free-form error text".to_string());
+    let r = work_finder_record(&s, "host-a", at(), at(), resolve);
+    let overlap = r.skipped.iter().find(|k| k.number == 2).unwrap();
+    assert_eq!(overlap.reason, PickSkipReason::OverlapChain);
+    assert_eq!(overlap.detail.as_deref(), Some("file overlap: src/a.rs, src/b.rs"));
+    let error = r.skipped.iter().find(|k| k.number == 3).unwrap();
+    assert_eq!(error.detail, None, "only the file-overlap detail is exported");
+    let json = serde_json::to_value(&r).unwrap();
+    assert_eq!(json["skipped"][0]["detail"], "file overlap: src/a.rs, src/b.rs");
+    assert!(json["skipped"][1].get("detail").is_none(), "absent, not null");
+}
+
+#[test]
 fn an_empty_work_finder_tick_still_yields_a_record() {
     let r = work_finder_record(&summary(vec![]), "host-a", at(), at(), resolve);
     assert_eq!(r.outcome, "idle");
@@ -220,9 +240,9 @@ fn act(number: u32, action: &str) -> JournalEntry {
 
 #[test]
 fn the_serving_queue_order_wins_over_the_gate_listing_order() {
-    // pr-queue put the starred #3 first, then #1; #2 is not in the queue.
+    // pr-queue put the important #3 first, then #1; #2 is not in the queue.
     let obs = journal(vec![queue(vec![
-        qrow(3, "loom:review-requested", &["loom:operator-priority"], "level=1"),
+        qrow(3, "loom:review-requested", &["loom:important"], "level=1"),
         qrow(1, "loom:review-requested", &[], "level=0"),
     ])]);
     let r = role_record(tick("judge"), RoleTickResult::Success, obs, "o/r", &[]);
@@ -278,7 +298,7 @@ fn a_successful_multi_candidate_tick_records_the_pick_and_why_the_rest_were_skip
 
 #[test]
 fn a_refresh_ranks_the_latest_snapshot_not_a_first_seen_union() {
-    // #3 arrives starred and #1 is gone: neither served queue ranked 1,2,3.
+    // #3 arrives important and #1 is gone: neither served queue ranked 1,2,3.
     let obs = journal(vec![
         queue(vec![
             qrow(1, "loom:review-requested", &[], "level=0"),
@@ -286,7 +306,7 @@ fn a_refresh_ranks_the_latest_snapshot_not_a_first_seen_union() {
         ]),
         act(1, "claimed"),
         queue(vec![
-            qrow(3, "loom:review-requested", &["loom:operator-priority"], "level=1"),
+            qrow(3, "loom:review-requested", &["loom:important"], "level=1"),
             qrow(2, "loom:review-requested", &[], "level=0"),
         ]),
     ]);
@@ -334,7 +354,7 @@ fn curator_candidates_come_from_its_listings() {
     let obs = RoleObservation {
         journal: Some(Journal {
             entries: vec![
-                listing(vec![qrow(11, "loom:operator-priority", &[], "1")]),
+                listing(vec![qrow(11, "loom:important", &[], "1")]),
                 listing(vec![
                     qrow(12, "loom:issue", &[], "1"),
                     qrow(11, "loom:issue", &[], "2"),
@@ -373,6 +393,7 @@ fn gate_stash_keeps_only_open_prs_and_drains_per_root() {
         author: None,
         author_association: None,
         is_pull_request: is_pr,
+        open_sub_issues: None,
     };
     let root = Path::new("/stash-test/a");
     record_gate_listing(
@@ -404,8 +425,9 @@ fn emit_record_routes_through_the_ops_sink_as_a_pick_decision() {
 }
 
 #[test]
-fn a_queue_past_the_row_cap_keeps_its_uncapped_total() {
-    // The journal kept 200 of 250 rows; the record lists 50 and says 250.
+fn a_queue_past_the_journal_row_cap_lists_every_kept_row() {
+    // The journal kept 200 of 250 rows; the record lists all 200 and says 250.
+    // The journal's own 200-row cap is upstream of the record and unchanged.
     let rows: Vec<JournalRow> = (1..=200)
         .map(|n| qrow(n, "loom:review-requested", &[], "k"))
         .collect();
@@ -417,8 +439,9 @@ fn a_queue_past_the_row_cap_keeps_its_uncapped_total() {
         rows,
     }]);
     let r = role_record(tick("judge"), RoleTickResult::Success, obs, "o/r", &[]);
-    assert_eq!(r.candidates.len(), 50);
+    assert_eq!(r.candidates.len(), 200);
     assert_eq!(r.candidates_total, 250);
+    assert_eq!(r.skipped.len(), 200, "every kept row's decision is carried");
 }
 
 #[test]
@@ -463,4 +486,96 @@ fn an_unread_journal_leaves_decisions_unobserved() {
         .skipped
         .iter()
         .all(|s| s.reason == PickSkipReason::NotSelected));
+}
+
+/// #11103: the work finder's record carries the tick's workspace draws —
+/// seed, every draw's candidates with weights, roll and pick — named by repo.
+#[test]
+fn work_finder_record_carries_the_workspace_draw() {
+    use crate::work_finder::workspace_draw::draw_order;
+    use crate::work_finder::{ready_queue, WorkItem};
+    let item = |n: u32| WorkItem::with_created_at(n, vec!["loom:issue".into()], None);
+    let candidates = vec![
+        ready_queue::key_of(0, 0, &item(1), false),
+        ready_queue::key_of(1, 100, &item(2), false),
+    ];
+    let (order, log) = draw_order(candidates, &[0, 100], 99, 80);
+    let log = log.unwrap();
+    let names = ["o/tool", "o/product"];
+    let draw = workspace_draw_record(&log, |idx| names[idx].to_string());
+    let r = work_finder_record(&summary(Vec::new()), "h", at(), at(), resolve)
+        .with_workspace_draw(Some(draw));
+
+    let json = serde_json::to_value(&r).unwrap();
+    let d = &json["workspace_draw"];
+    assert_eq!(d["seed"], "99");
+    assert_eq!(d["draws_total"], 2);
+    let first = &d["draws"][0];
+    assert_eq!(first["pool"], "all");
+    // #11684: softmax weights at T = 80, relative to the pool's p_min.
+    assert_eq!(d["temperature"], 80);
+    assert_eq!(first["p_min"], 0);
+    assert_eq!(
+        first["candidates"][0],
+        serde_json::json!({"repo": "o/tool", "weight": 1_000_000})
+    );
+    assert_eq!(
+        first["candidates"][1],
+        serde_json::json!({"repo": "o/product", "weight": 286_505})
+    );
+    assert_eq!(first["total_weight"], 1_286_505);
+    assert!(first["roll"].as_u64().unwrap() < 1_286_505);
+    assert_eq!(first["picked"], names[order[0].workspace_idx]);
+    assert_eq!(first["number"], order[0].number);
+    // The second draw is over the one workspace left.
+    assert_eq!(d["draws"][1]["candidates"].as_array().unwrap().len(), 1);
+    // It round-trips, and a role record (no draw) omits the field.
+    let back: PickDecisionRecord = serde_json::from_value(json.clone()).unwrap();
+    assert_eq!(back, r);
+    // A pre-#11684 record (no `temperature` / `p_min`) still parses.
+    let mut old = json;
+    old["workspace_draw"]
+        .as_object_mut()
+        .unwrap()
+        .remove("temperature");
+    for draw in old["workspace_draw"]["draws"].as_array_mut().unwrap() {
+        draw.as_object_mut().unwrap().remove("p_min");
+    }
+    let back: PickDecisionRecord = serde_json::from_value(old).unwrap();
+    let back_draw = back.workspace_draw.unwrap();
+    assert_eq!(back_draw.temperature, None);
+    assert!(back_draw.draws.iter().all(|d| d.p_min.is_none()));
+    let plain = work_finder_record(&summary(Vec::new()), "h", at(), at(), resolve);
+    assert!(serde_json::to_value(&plain)
+        .unwrap()
+        .get("workspace_draw")
+        .is_none());
+}
+
+/// #11509: the work finder's record carries the tick's `loom:very-important`
+/// flood-cap demotions, named by repo; a tick with none omits the field.
+#[test]
+fn work_finder_record_carries_the_very_important_demotions() {
+    use crate::work_finder::vi_cap::ViDemotion;
+    let demoted = [ViDemotion {
+        workspace_idx: 1,
+        number: 30,
+        holder: 20,
+    }];
+    let names = ["o/tool", "o/product"];
+    let records = vi_demotion_records(&demoted, |idx| names[idx].to_string());
+    let r = work_finder_record(&summary(Vec::new()), "h", at(), at(), resolve)
+        .with_very_important_demoted(records);
+    let json = serde_json::to_value(&r).unwrap();
+    assert_eq!(
+        json["very_important_demoted"],
+        serde_json::json!([{"repo": "o/product", "number": 30, "holder": 20}])
+    );
+    let back: PickDecisionRecord = serde_json::from_value(json).unwrap();
+    assert_eq!(back, r);
+    let plain = work_finder_record(&summary(Vec::new()), "h", at(), at(), resolve);
+    assert!(serde_json::to_value(&plain)
+        .unwrap()
+        .get("very_important_demoted")
+        .is_none());
 }

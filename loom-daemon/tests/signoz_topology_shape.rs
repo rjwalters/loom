@@ -35,7 +35,6 @@
 //! The day a Loom span becomes CLIENT-kind, or a second `service.name` appears,
 //! the documented answer stops being true — and these tests fail in ordinary CI
 //! instead of the `evidence.md` row quietly going stale.
-#![cfg(feature = "otlp")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::BTreeSet;
@@ -426,8 +425,10 @@ fn gateway_keep_keys(context: &str) -> BTreeSet<String> {
 /// Even if a future change started emitting a peer key, the neutral gateway
 /// drops it before SigNoz sees it: `transform/privacy` is an allowlist, so the
 /// assertion is that none of the topology keys has been *added* to it. The
-/// resource allowlist is additionally asserted to be exactly the four service
-/// identity keys — that is what makes "one service identity" a property of the
+/// resource allowlist is additionally asserted to be exactly the five service
+/// identity keys plus the two host-scoped daemon-provenance keys
+/// (`loom.daemon.revision`, `loom.fleet.config_sha`, #11197) — neither is a
+/// topology peer key, so "one service identity" stays a property of the
 /// pipeline and not only of today's exporter.
 #[test]
 fn the_gateway_allowlist_admits_no_topology_peer_attribute() {
@@ -451,6 +452,8 @@ fn the_gateway_allowlist_admits_no_topology_peer_attribute() {
         BTreeSet::from([
             "host.id".to_string(),
             "host.name".to_string(),
+            "loom.daemon.revision".to_string(),
+            "loom.fleet.config_sha".to_string(),
             "service.instance.id".to_string(),
             "service.name".to_string(),
             "service.version".to_string(),

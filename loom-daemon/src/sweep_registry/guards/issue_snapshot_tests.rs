@@ -33,7 +33,7 @@ impl Drop for StoreOn {
 /// ETag; exit 1 while `fail-view` exists), the open-PR listing as empty, the
 /// unconditional `--jq` reads as an open, label-less issue, and `repo view`.
 /// `views.log` records `view <n> sent=<If-None-Match>` per conditional read
-/// and `legacy` per unconditional one.
+/// and `legacy` per unconditional one (the no-op hold's own REST read, #10156, is not a guard read).
 fn snapshot_registry(ws: &Path) -> (SweepRegistry, PathBuf) {
     let views = ws.join("views.log");
     let fake_gh = ws.join("fake-gh.sh");
@@ -63,7 +63,7 @@ if [[ "$1" == "api" && "$2" == "--include" ]]; then
   exit 0
 fi
 if [[ "$1" == "api" && "$2" == repos/* ]]; then
-  if [[ "$*" == *is_pr* || "$*" == *labels* ]]; then echo legacy >> "{views}"; fi
+  if [[ "$*" != *"body: .body"* && ( "$*" == *is_pr* || "$*" == *labels* ) ]]; then echo legacy >> "{views}"; fi
   printf '%s\n' '{{"state":"open","is_pr":false}}'
   exit 0
 fi
@@ -124,6 +124,8 @@ fn parse_issue_view_reads_state_pr_ness_and_labels_like_the_unconditional_probes
         parse_issue_view(open),
         Some(IssueView {
             closed_or_pr: Some(false),
+            is_pr: false,
+            not_planned: false,
             labels: vec!["loom:issue".into(), "points:3".into()],
         })
     );
@@ -295,6 +297,40 @@ fn dispatch_runs_its_guards_on_the_conditional_reads() {
     if let Some(id) = running_issue_sweep_id(&reg, 9108) {
         let _ = reg.cancel(&id, Duration::from_secs(2));
     }
+}
+
+/// Issue #11429: on the conditional read, a closed issue is refused as
+/// `already_landed` and one closed as not planned as `already_closed`.
+#[test]
+#[serial]
+fn the_conditional_read_splits_a_landed_close_from_a_not_planned_close() {
+    std::env::remove_var("LOOM_REPO");
+    let dir = tempdir().unwrap();
+    let ws = dir.path();
+    let _on = StoreOn::new(ws);
+    let (mut reg, log) = snapshot_registry(ws);
+
+    set_issue(ws, 9111, "closed", &[], "c1");
+    let body = serde_json::json!({
+        "number": 9112, "state": "closed", "state_reason": "not_planned", "labels": [],
+    });
+    std::fs::write(ws.join("issue-9112.json"), body.to_string()).unwrap();
+    std::fs::write(ws.join("issue-9112.etag"), "\"c2\"").unwrap();
+
+    for (issue, evidence) in [
+        (9111, crate::sweep_registry::LandedEvidence::ForgeClosed),
+        (9112, crate::sweep_registry::LandedEvidence::ForgeClosedNotPlanned),
+    ] {
+        let err = reg
+            .dispatch(&SweepKind::Issue(issue), None, None, None, None)
+            .expect_err("a closed issue is refused at 2.5");
+        let refusal = err
+            .downcast_ref::<crate::sweep_registry::AlreadyLandedDispatchError>()
+            .expect("typed refusal");
+        assert_eq!(refusal.evidence, evidence, "#{issue}");
+    }
+    let seen = views(&log);
+    assert!(!seen.iter().any(|l| l == "legacy"), "no unconditional issue read: {seen:?}");
 }
 
 /// Attribution is unchanged (acceptance criterion): an issue that is parked

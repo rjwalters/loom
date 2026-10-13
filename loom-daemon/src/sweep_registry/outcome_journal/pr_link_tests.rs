@@ -73,10 +73,24 @@ fn seed_phase_history_with_prs(
                 phase: (*phase).to_string(),
                 at: started_at + chrono::Duration::seconds(60 * (i as i64 + 1)),
                 pr_number: *pr_number,
-                jev: None,
             })
             .collect(),
     );
+}
+
+impl SweepRegistry {
+    /// Test seam for sibling suites (#10156 no-op hold): record a sampled
+    /// Curator-only phase history for `sweep_id`.
+    pub(crate) fn seed_curator_only_history_for_test(&mut self, sweep_id: &str) {
+        self.phase_history.insert(
+            sweep_id.to_string(),
+            vec![PhaseObservation {
+                phase: "curator-done".to_string(),
+                at: Utc::now(),
+                pr_number: None,
+            }],
+        );
+    }
 }
 
 fn outcome_for(registry: &SweepRegistry, issue: u32) -> telemetry::SweepOutcomeRecord {
@@ -262,7 +276,7 @@ fn model_falls_back_to_the_dispatched_model_when_nothing_was_attributed() {
     std::env::remove_var("CLAUDE_CONFIG_DIR");
 
     let record = outcome_for(&registry, issue);
-    assert_eq!(record.model.as_deref(), Some("sonnet"));
+    assert_eq!(record.model.as_deref(), Some("claude-sonnet-5-5"));
     assert_eq!(record.config.get("arm").map(String::as_str), Some("B"));
     assert_eq!(record.models_used, None, "no attributable transcript: omitted, never []");
 }

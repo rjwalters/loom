@@ -4,7 +4,7 @@
 //!
 //! An agent CLI the daemon launches can export its own OTLP telemetry. With
 //! the relay on, the daemon runs a loopback OTLP/HTTP receiver
-//! (`otlp::relay`, behind the `otlp` Cargo feature), points each session it
+//! (`otlp::relay`), points each session it
 //! launches at that receiver, and — for every record received — binds the
 //! identity itself, applies the session-output redaction, and forwards to the
 //! configured `otlp` exporter. This module is the half that needs no OTLP

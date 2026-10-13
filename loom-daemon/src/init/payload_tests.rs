@@ -20,11 +20,11 @@ use crate::install_compat::{Compat, DaemonCompat, InstallMeta, Version, INSTALL_
 
 const META: &str = INSTALL_METADATA_PATH;
 
-fn v(s: &str) -> Version {
+pub(super) fn v(s: &str) -> Version {
     Version::parse(s).unwrap()
 }
 
-fn stamp(version: &str) -> Stamp {
+pub(super) fn stamp(version: &str) -> Stamp {
     Stamp {
         version: v(version),
         commit: Some("a".repeat(40)),
@@ -33,22 +33,22 @@ fn stamp(version: &str) -> Stamp {
     }
 }
 
-fn write(path: &Path, contents: &str) {
+pub(super) fn write(path: &Path, contents: &str) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, contents).unwrap();
 }
 
 #[cfg(unix)]
-fn set_exec(path: &Path) {
+pub(super) fn set_exec(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 #[cfg(not(unix))]
-fn set_exec(_path: &Path) {}
+pub(super) fn set_exec(_path: &Path) {}
 
 /// A small `defaults/` tree touching every surface the payload step writes.
-fn fake_defaults(root: &Path) -> PathBuf {
+pub(super) fn fake_defaults(root: &Path) -> PathBuf {
     let d = root.join("defaults");
     write(&d.join(".loom-README.md"), "readme\n");
     write(&d.join("pricing.json"), "{}\n");
@@ -70,7 +70,7 @@ fn fake_defaults(root: &Path) -> PathBuf {
 }
 
 /// A workspace with Loom installed from `defaults` at version `installed`.
-fn installed_workspace(root: &Path, defaults: &Path, installed: &str) -> PathBuf {
+pub(super) fn installed_workspace(root: &Path, defaults: &Path, installed: &str) -> PathBuf {
     let ws = root.join("ws");
     fs::create_dir_all(ws.join(".git")).unwrap();
     write(
@@ -92,7 +92,7 @@ fn installed_workspace(root: &Path, defaults: &Path, installed: &str) -> PathBuf
 
 /// Every file under `root` with its bytes and mtime, after pinning all
 /// mtimes to a fixed past instant so any write is visible.
-fn freeze(root: &Path) -> BTreeMap<PathBuf, (Vec<u8>, SystemTime)> {
+pub(super) fn freeze(root: &Path) -> BTreeMap<PathBuf, (Vec<u8>, SystemTime)> {
     let past = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
     let mut out = BTreeMap::new();
     walk(root, &mut |p| {
@@ -108,7 +108,7 @@ fn freeze(root: &Path) -> BTreeMap<PathBuf, (Vec<u8>, SystemTime)> {
     out
 }
 
-fn snapshot(root: &Path) -> BTreeMap<PathBuf, (Vec<u8>, SystemTime)> {
+pub(super) fn snapshot(root: &Path) -> BTreeMap<PathBuf, (Vec<u8>, SystemTime)> {
     let mut out = BTreeMap::new();
     walk(root, &mut |p| {
         out.insert(
@@ -131,7 +131,7 @@ fn walk(root: &Path, f: &mut dyn FnMut(&Path)) {
 }
 
 /// Repo-relative paths whose bytes or mtime differ, plus created/deleted ones.
-fn touched(
+pub(super) fn touched(
     ws: &Path,
     before: &BTreeMap<PathBuf, (Vec<u8>, SystemTime)>,
     after: &BTreeMap<PathBuf, (Vec<u8>, SystemTime)>,
@@ -147,7 +147,7 @@ fn touched(
     out
 }
 
-fn meta_json(ws: &Path) -> serde_json::Value {
+pub(super) fn meta_json(ws: &Path) -> serde_json::Value {
     serde_json::from_str(&fs::read_to_string(ws.join(META)).unwrap()).unwrap()
 }
 

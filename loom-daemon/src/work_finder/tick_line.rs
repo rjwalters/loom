@@ -39,7 +39,6 @@ pub fn worth_logging(report: &TickReport) -> bool {
         || report.skipped_peer_claim > 0
         || report.deferred_ramp_cap > 0
         || report.deferred_saturation > 0
-        || report.deferred_out_of_slice > 0
         || report.deferred_repo_cap > 0
 }
 
@@ -55,11 +54,11 @@ pub fn render(report: &TickReport, t: &TickLine<'_>) -> String {
          {} backoff-skip, {} pr-open-backoff, {} noop-cooldown-skip, \
          {} declined-skip, {} prless-retry-skip, \
          {} recheck-interval-skip, \
-         {} host-constraint-skip, {} host-class-skip, \
+         {} host-constraint-skip, \
          {} pr-open-skip, \
          {} peer-claim-skip, \
          {} deferred (capacity), {} deferred (ramp), \
-         {} deferred (host saturated), {} deferred (out-of-slice, #6243), \
+         {} deferred (host saturated), \
          {} deferred (repo cap, #9090), {} deferred (build back-off, #9410), \
          {} error(s), {} cross-host-collision(s)",
         t.max_concurrent,
@@ -85,13 +84,11 @@ pub fn render(report: &TickReport, t: &TickLine<'_>) -> String {
         report.skipped_prless_retry,
         report.skipped_recheck_interval,
         report.skipped_host_constraint,
-        report.skipped_host_class,
         report.skipped_pr_open,
         report.skipped_peer_claim,
         report.deferred_capacity,
         report.deferred_ramp_cap,
         report.deferred_saturation,
-        report.deferred_out_of_slice,
         report.deferred_repo_cap,
         report.deferred_build_backoff,
         report.errors,

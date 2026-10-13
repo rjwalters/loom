@@ -29,6 +29,10 @@
 # tracking issue per failing job (stable title `[ci-daily] <job name>`), and
 # closes it on the next run where that same job is green. See
 # .loom/docs/ci-principles.md ("The daily backstop and its tracking issues").
+# The same job also records each result on loom-ui, the fleet's alert hub
+# (2AMLogic/loom-ui#3319): incident `ext:rjwalters.loom:ci-daily:<job slug>`
+# opens alongside the issue and resolves alongside its close. Best-effort,
+# via the job's Actions OIDC token; it never changes the issue handling.
 #
 # SigNoz needs nothing here: `loom-daemon ci-telemetry` captures every run of
 # every workflow of the configured owners by auto-discovery, so this workflow
@@ -98,14 +102,9 @@ jobs:
         # The one place the full cross-test interaction surface exists. Under
         # ci.yml's `--partition count:k/3` two tests that collide can never
         # land in the same process tree, so the collision is unobservable.
+        # Since #10700 the OTLP exporter is compiled unconditionally, so this
+        # run already covers what a separate `--features otlp` run did.
         run: cargo nextest run --workspace --profile ci
-      - name: nextest, loom-daemon with --features otlp, UNPARTITIONED
-        if: ${{ !cancelled() }}
-        # `otlp` is not purely additive (three tests are `cfg(not(feature =
-        # "otlp"))`), so neither this nor the default-feature run subsumes the
-        # other. `--workspace --features otlp` is not a thing in a virtual
-        # workspace where only one member declares the feature.
-        run: cargo nextest run --package loom-daemon --features otlp --profile ci
       - name: nextest, whole workspace, --all-features
         if: ${{ !cancelled() }}
         run: cargo nextest run --workspace --all-features --profile ci
@@ -696,6 +695,7 @@ jobs:
       contents: read
       issues: write
       actions: read   # reading this run's own job list and completed-job logs
+      id-token: write # the loom-ui step's OIDC token (2AMLogic/loom-ui#3319)
     steps:
       - name: Open, update and close tracking issues
         env:
@@ -711,6 +711,13 @@ jobs:
 
           REPO="$GITHUB_REPOSITORY"
           RUN_URL="$GITHUB_SERVER_URL/$REPO/actions/runs/$GITHUB_RUN_ID"
+          # One line per tracked result, for the loom-ui step below: the same
+          # open/close decisions this loop makes, never a second opinion.
+          LOOMUI="$RUNNER_TEMP/loom-ui-alerts.jsonl"
+          : > "$LOOMUI"
+          loomui() { # state job_name link
+            jq -nc --arg s "$1" --arg n "$2" --arg l "$3" '{state: $s, job: $n, link: $l}' >> "$LOOMUI"
+          }
 
           # This run's jobs, base64'd one per line so names containing spaces
           # and parentheses survive the read loop intact.
@@ -773,6 +780,7 @@ jobs:
                     > /tmp/payload.json
                   gh api -X POST "repos/$REPO/issues/$number/comments" --input /tmp/payload.json >/dev/null
                   echo "updated #$number -- $title"
+                  loomui open "$job_name" "$GITHUB_SERVER_URL/$REPO/issues/$number"
                   updated=$((updated + 1))
                 else
                   jq -n --arg t "$title" --arg run "$RUN_URL" --arg job "$job_url" \
@@ -785,10 +793,15 @@ jobs:
                   # (the exact-title lookup above IS the dedup).
                   new="$(gh api -X POST "repos/$REPO/issues" --input /tmp/payload.json --jq '.number')"
                   echo "opened #$new -- $title"
+                  loomui open "$job_name" "$GITHUB_SERVER_URL/$REPO/issues/$new"
                   opened=$((opened + 1))
                 fi
                 ;;
               success)
+                # Resolved on every green result, not only when an issue was
+                # open: an incident whose issue someone closed by hand still
+                # resolves, and loom-ui answers `unknown` for one it never held.
+                loomui resolved "$job_name" "$RUN_URL"
                 if [ -n "$number" ]; then
                   jq -n --arg run "$RUN_URL" \
                     '{body: ("Green again -- closing.\n\n- Run: \($run)")}' > /tmp/payload.json
@@ -818,3 +831,62 @@ jobs:
             echo
             echo "Filed with label \`$TRACKING_LABEL\`; matched by title \`${TITLE_PREFIX}<job name>\`."
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # loom-ui, the fleet's alert hub (2AMLogic/loom-ui docs/alerts/external.md):
+      # one incident per tracked job, `open` exactly when the step above opened
+      # or updated its issue, `resolved` when that job was green. loom-ui takes
+      # Actions OIDC tokens from main/master only, so a dispatch on a branch
+      # posts nothing. Best-effort: continue-on-error, and the script only
+      # warns, so it can never fail the report or change an issue. The key is
+      # a slug of the job name (loom-ui's key charset has no spaces or
+      # parentheses); the title carries the name as the issue does.
+      - name: Record the results on loom-ui
+        if: ${{ !cancelled() && github.ref == 'refs/heads/main' }}
+        continue-on-error: true
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const fs = require('fs');
+            const file = `${process.env.RUNNER_TEMP}/loom-ui-alerts.jsonl`;
+            let rows = [];
+            try {
+              rows = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+            } catch (err) {
+              core.warning(`no loom-ui results to record: ${err.message}`);
+              return;
+            }
+            const [owner, repo] = process.env.GITHUB_REPOSITORY.split('/');
+            const runUrl = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}` +
+                           `/actions/runs/${process.env.GITHUB_RUN_ID}`;
+            const slug = (name) => name.toLowerCase().replace(/[^a-z0-9._@+-]+/g, '-')
+              .replace(/^[^a-z0-9]+|-+$/g, '').slice(0, 128) || 'job';
+            let token;
+            try {
+              token = await core.getIDToken('https://dashboard.2amlogic.com/alerts');
+            } catch (err) {
+              core.warning(`loom-ui: no OIDC token: ${err.message}`);
+              return;
+            }
+            for (const row of rows) {
+              try {
+                const response = await fetch('https://dashboard.2amlogic.com/api/alerts/external', {
+                  method: 'POST',
+                  headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+                  body: JSON.stringify({
+                    source: `${owner}.${repo}`,
+                    rule: 'ci-daily',
+                    key: slug(row.job),
+                    title: `[ci-daily] ${row.job}`.slice(0, 200),
+                    severity: 'warning',
+                    state: row.state,
+                    detail: `${row.state === 'open' ? 'Failed' : 'Green'} in run ${runUrl}`,
+                    link: row.link || runUrl,
+                  }),
+                });
+                // 4xx other than 429 is a contract refusal: give up quietly.
+                if (!response.ok) core.warning(`loom-ui answered ${response.status} for ${row.job}: ${await response.text()}`);
+                else core.info(`loom-ui ${row.job}: ${await response.text()}`);
+              } catch (err) {
+                core.warning(`loom-ui alert for ${row.job} not recorded: ${err.message}`);
+              }
+            }

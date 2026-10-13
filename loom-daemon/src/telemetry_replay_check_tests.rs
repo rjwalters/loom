@@ -17,6 +17,7 @@ fn params() -> CheckParams {
             as_of: Utc.with_ymd_and_hms(2026, 10, 4, 13, 0, 0).unwrap(),
             window_sec: crate::telemetry_replay::DEFAULT_WINDOW_SEC,
             repo: String::new(),
+            knowable_since: Some(Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()),
         },
         span_sec: DEFAULT_SPAN_SEC,
         step_sec: crate::telemetry_replay::DEFAULT_STEP_SEC,
@@ -92,6 +93,7 @@ fn telemetry_replay_check_params_bind_the_samples_and_the_threshold() {
             ("t".to_string(), "2026-10-04 13:00:00.000".to_string()),
             ("window".to_string(), "3900".to_string()),
             ("repo".to_string(), "rjwalters/loom".to_string()),
+            ("knowable_since".to_string(), "2026-01-01 00:00:00.000".to_string()),
             ("span".to_string(), "86400".to_string()),
             ("step".to_string(), "300".to_string()),
             ("threshold".to_string(), "600".to_string()),
@@ -249,6 +251,15 @@ fn telemetry_replay_check_vocabulary_matches_the_stage_enum_registry_and_webhook
             "stage {} is not mapped",
             stage.as_str()
         );
+    }
+    // The pre-ready stages (#11368) are `eta.stage_outcome` only: they carry
+    // wire names but are not `fleet.state` stages the SQL has to map.
+    for (stage, wire) in [
+        (FleetStage::TriageWait, "triage_wait"),
+        (FleetStage::ApprovalWait, "approval_wait"),
+    ] {
+        assert_eq!(stage.as_str(), wire);
+        assert_eq!(serde_json::from_value::<FleetStage>(wire.into()).unwrap(), stage);
     }
     let squash = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut holds: Vec<String> = crate::label_registry::embedded_set("merge_hold")

@@ -251,6 +251,9 @@ fn every_metric_name_serializes_to_its_as_str() {
         MetricName::PoolExhausted,
         MetricName::PoolExhaustions,
         MetricName::PoolExhaustedSeconds,
+        MetricName::PoolAccountState,
+        MetricName::PoolPlanTokenLimit,
+        MetricName::PoolPlanWindowSeconds,
         MetricName::PoolAccountMarks,
         MetricName::DispatchSlotTurnaround,
         MetricName::DispatchSlotTurnaroundSamples,
@@ -281,6 +284,10 @@ fn every_metric_name_serializes_to_its_as_str() {
         MetricName::CaptainGaugeAgeSeconds,
         MetricName::CaptainGaugeFallback,
         MetricName::AgentScopePeakMemoryBytes,
+        MetricName::EgressRequests,
+        MetricName::EgressTokens,
+        MetricName::EgressLatency,
+        MetricName::EgressTtft,
     ] {
         assert_eq!(serde_json::to_value(name).unwrap(), name.as_str());
     }
@@ -390,7 +397,7 @@ fn tick_points_emit_only_nonzero_reasons_plus_gauges() {
         seen: 6,
         dispatched: 2,
         skipped_peer_claim: 1,
-        skipped_host_class: 1,
+        skipped_host_constraint: 1,
         deferred_capacity: 2,
         ..TickReport::default()
     };
@@ -405,7 +412,7 @@ fn tick_points_emit_only_nonzero_reasons_plus_gauges() {
         [
             ("capacity".to_string(), MetricValue::Int(2)),
             ("dispatched".to_string(), MetricValue::Int(2)),
-            ("host_class".to_string(), MetricValue::Int(1)),
+            ("host_constraint".to_string(), MetricValue::Int(1)),
             ("peer_claim".to_string(), MetricValue::Int(1)),
         ]
         .into_iter()
@@ -556,11 +563,9 @@ fn queue_summary(
                 issue: u32::try_from(i).unwrap(),
                 workspace_priority: 100,
                 urgent: false,
-                operator_priority: false,
-                operator_priority_at: None,
+                level: Default::default(),
                 main_red_fix: false,
                 created_at: None,
-                tier: None,
                 story_points: None,
                 disposition: *d,
                 detail: None,

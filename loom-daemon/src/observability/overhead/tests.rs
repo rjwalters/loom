@@ -26,6 +26,8 @@ const ALLOWED_KEYS: &[&str] = &[
     "loom.no_phase.last_step",
     "loom.no_phase.reason",
     "loom.effort",
+    "loom.effort_source",
+    "loom.model_source",
     "loom.doctor_cycles",
     "loom.judge_verdict",
     "loom.recovered",

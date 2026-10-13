@@ -103,6 +103,9 @@ impl ReleaseForge for Extra {
         self.reads += 1;
         Ok(self.events.get(&number).cloned().unwrap_or_default())
     }
+    fn last_labeled_at(&mut self, _: u64, _: &str) -> Result<Option<String>, String> {
+        panic!("the release pass never dates a label")
+    }
     fn post_comment(&mut self, number: u64, _is_pr: bool, body: &str) -> Result<(), String> {
         self.posted.push((number, body.to_string()));
         // What the forge would now return: a comment by the fleet's own App.
@@ -515,11 +518,11 @@ fn superseded_pr_is_skipped() {
 }
 
 #[test]
-fn operator_labels_are_holds_but_the_star_is_not() {
+fn operator_labels_are_holds_but_a_priority_label_is_not() {
     let mut w = World::new();
     w.parked(10, false, &[1], &["loom:operator-only", "loom:operator-decision"]);
     w.parked(11, false, &[1], &["loom:operator"]);
-    w.parked(12, false, &[1], &["loom:operator-priority"]);
+    w.parked(12, false, &[1], &["loom:important"]);
     w.state(1, "CLOSED", false);
     let r = w.run();
     assert_eq!(skipped(&r, "operator-hold"), 2);
@@ -537,6 +540,26 @@ fn trusted_prless_hold_comment_is_skipped() {
         .insert(10, vec![trusted(&format!("{PRLESS_HOLD_COMMENT_MARKER}\nHeld."))]);
     let r = w.run();
     assert_eq!(skipped(&r, "daemon-hold"), 1);
+    assert!(w.no_writes());
+}
+
+/// #10161 / #10558: a body daemon-hold record is counted as `daemon-hold` via
+/// `is_daemon_hold` while it is the newest record; a released one left in the
+/// body (records are append-only) is just an unstated record, still skipped.
+#[test]
+fn a_current_body_daemon_hold_is_counted_structurally() {
+    use crate::sweep_registry::park_hold::{render_hold_record, PRLESS_HOLD_REASON};
+    let builder = render_park(&[1], Some("builder"), Some("2026-10-01T00:00:00Z"), None);
+    let mut w = World::new();
+    let newer = render_hold_record(PRLESS_HOLD_REASON, "2026-10-02T00:00:00Z");
+    w.with_body(10, false, &format!("x\n\n{builder}\n{newer}\n"), &[]);
+    let older = render_hold_record(PRLESS_HOLD_REASON, "2026-09-01T00:00:00Z");
+    w.with_body(11, false, &format!("x\n\n{older}\n{builder}\n"), &[]);
+    w.state(1, "CLOSED", false);
+    let r = w.run();
+    assert_eq!(skipped(&r, "daemon-hold"), 1);
+    assert_eq!(skipped(&r, "unstated"), 1);
+    assert!(r.released.is_empty());
     assert!(w.no_writes());
 }
 

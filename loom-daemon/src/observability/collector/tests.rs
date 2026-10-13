@@ -1170,6 +1170,7 @@ fn all_repos_failing_roles_is_not_green_anywhere_while_every_other_axis_is_healt
         captainless_singleton_jobs: Vec::new(),
         exported_kinds: Vec::new(),
         exporters: Vec::new(),
+        otlp_export: None,
         memory: None,
     };
     assert_eq!(

@@ -109,8 +109,9 @@ fn telemetry_outcome_records_crashed_terminal_as_failure() {
         .expect("sweep.outcome telemetry record must be journaled on a crash");
     assert_eq!(record.result, telemetry::SweepResult::Failure);
     assert_eq!(record.sweep_id, "sweep-issue-4704-0");
-    assert_eq!(record.model.as_deref(), Some("opus"));
+    assert_eq!(record.model.as_deref(), Some("claude-opus-5-5"));
     assert_eq!(record.effort.as_deref(), Some("high"));
+    assert_eq!(record.config.get("effort_source").map(String::as_str), Some("explicit"));
     assert_eq!(record.config.get("token_account").map(String::as_str), Some("agent-4"));
     // Issue #4809: an opus-family model is attributed to Arm A in the
     // free-form `config` map — additive, no schema-version bump.
@@ -163,7 +164,7 @@ fn telemetry_outcome_records_merged_lifecycle_as_success() {
         .find(|r| r.issue == issue)
         .expect("sweep.outcome telemetry record must be journaled on a merged lifecycle");
     assert_eq!(record.result, telemetry::SweepResult::Success);
-    assert_eq!(record.model.as_deref(), Some("sonnet"));
+    assert_eq!(record.model.as_deref(), Some("claude-sonnet-5-5"));
     // Issue #4809: sonnet-family attributes to Arm B.
     assert_eq!(record.config.get("arm").map(String::as_str), Some("B"));
     assert_eq!(
@@ -255,7 +256,7 @@ fn telemetry_outcome_records_cancel_as_cancelled() {
         .find(|r| r.issue == 4706)
         .expect("sweep.outcome telemetry record must be journaled on cancel");
     assert_eq!(record.result, telemetry::SweepResult::Cancelled);
-    assert_eq!(record.model.as_deref(), Some("opus"));
+    assert_eq!(record.model.as_deref(), Some("claude-opus-5-5"));
 }
 
 /// AC: the telemetry journal entry survives `reap_once`'s in-memory GC of

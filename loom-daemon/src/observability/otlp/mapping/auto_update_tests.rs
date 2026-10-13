@@ -30,6 +30,7 @@ fn record() -> AutoUpdateTickRecord {
             target: Some("artifact:0.19.731:feedface".to_string()),
         },
         floor_stall: None,
+        roll_held: None,
         consecutive_failures: 0,
         duration_ms: 4200,
         loom: Provenance {
@@ -148,6 +149,38 @@ fn an_unsatisfiable_floor_is_an_error_whatever_the_tick_decided() {
     // And absent, the field is not serialized at all (no-floor records are unchanged).
     let body = serde_json::to_string(&record()).unwrap();
     assert!(!body.contains("floor_stall"), "{body}");
+}
+
+/// #10880: a held roll is ERROR below the floor and WARN otherwise, whatever
+/// the tick decided, and rides in the body like `floor_stall`.
+#[test]
+fn a_held_roll_is_an_error_below_the_floor_and_a_warning_otherwise() {
+    use crate::telemetry::kinds::auto_update_tick::RollHeld;
+    for (floor, severity) in [
+        (Some("0.19.850".to_string()), SeverityNumber::Error),
+        (None, SeverityNumber::Warn),
+    ] {
+        let mut tick = record();
+        tick.decision = TickDecisionKind::Defer;
+        tick.roll_held = Some(RollHeld {
+            floor: floor.clone(),
+            running: "0.19.800".to_string(),
+            target: "artifact:0.19.900:abcd".to_string(),
+            cause: "failed_roll".to_string(),
+            attempts: 2,
+            last_failure: Some("came back on 0.19.800".to_string()),
+            next_retry: Some(Utc.with_ymd_and_hms(2026, 10, 5, 2, 0, 0).unwrap()),
+        });
+        let envelope = TelemetryEnvelope::new("host", TelemetryRecord::AutoUpdateTick(tick));
+        let log = log_record_for(&envelope).unwrap();
+        assert_eq!(log.severity_number, severity as i32, "{floor:?}");
+        let body = log.body.and_then(|b| b.value);
+        assert!(
+            matches!(body, Some(Value::StringValue(b)) if b.contains("\"roll_held\"") && b.contains("failed_roll"))
+        );
+    }
+    let body = serde_json::to_string(&record()).unwrap();
+    assert!(!body.contains("roll_held"), "{body}");
 }
 
 #[test]

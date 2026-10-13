@@ -563,9 +563,12 @@ or resource. No Docker, network, backend or credential was involved.
 
 There is also a second, independent enforcement downstream: the neutral gateway's
 `transform/privacy` is an allowlist, and its resource allowlist is exactly
-`service.name` / `service.instance.id` / `service.version` / `host.id` while its
-span and span-event allowlists contain no peer key. So even a future change that
-started emitting `peer.service` would be stripped before either backend saw it.
+`service.name` / `service.instance.id` / `service.version` / `host.id` /
+`host.name` plus the two host-scoped daemon-provenance keys
+`loom.daemon.revision` / `loom.fleet.config_sha` (#11197) — none of which is a
+topology peer key — while its span and span-event allowlists contain no peer key.
+So even a future change that started emitting `peer.service` would be stripped
+before either backend saw it.
 
 **Conclusion for the acceptance ledger.** An empty Service Map is attributable,
 and it is attributable to Loom: adding a topology connector to the render, or
@@ -1124,7 +1127,9 @@ could be trusted, and each was read out of the emitting code rather than assumed
 - **`loom.repo` is never on a usage span.** No caller of `model_usage_spans`
   puts it in `common` (checked across `runtime_usage.rs`, `runtime_usage/record.rs`
   and `role_tick_telemetry/usage.rs`), and the gateway's resource allowlist keeps
-  only `service.name` / `service.version` / `service.instance.id` / `host.id`.
+  only `service.name` / `service.version` / `service.instance.id` / `host.id` /
+  `host.name` and the two daemon-provenance keys `loom.daemon.revision` /
+  `loom.fleet.config_sha` (#11197) — not `loom.repo`.
   Repo attribution is a join across the trace, or it is nothing.
 - **Scope is not additive.** A daemon-dispatched sweep emits both an `execution`
   span and `attempt` spans over overlapping windows.

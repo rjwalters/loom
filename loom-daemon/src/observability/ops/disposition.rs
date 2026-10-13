@@ -346,7 +346,7 @@ fn open_pr_number(disposition: QueueDisposition, detail: Option<&str>) -> Option
 
 /// A row's composite priority weight (Issue #9669): its comparator keys as
 /// one compact JSON object in comparator order, e.g.
-/// `{"operator_priority":false,"workspace_priority":100,…}`. The dispatch
+/// `{"main_red_fix":false,"level":1,"created_at":"…","number":7}`. The dispatch
 /// comparator is lexicographic over named keys, so there is no numeric score
 /// to fabricate — the key tuple *is* the weight that placed the row, taken
 /// from the row's plan annotation (the same projection the dispatch plan

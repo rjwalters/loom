@@ -111,6 +111,65 @@ fn an_unfinished_review_walk_is_an_error_not_the_first_page() {
     assert!(format!("{err:#}").contains("HTTP 502"), "{err:#}");
 }
 
+/// A stub serving `loom:curated` issues: `cu1.json` on page 1, `cu2.json` on
+/// `&page=2`, anything else empty; `fail<N>` fails page N.
+fn curated_stub(dir: &Path) -> PathBuf {
+    let path = review_stub(dir);
+    let script = std::fs::read_to_string(&path)
+        .unwrap()
+        .replace("labels=loom:review-requested&'*'&page=2'", "labels=loom:curated&'*'&page=2'")
+        .replace("labels=loom:review-requested&'", "labels=loom:curated&'")
+        .replace("f=rr2.json", "f=cu2.json")
+        .replace("f=rr1.json", "f=cu1.json");
+    std::fs::write(&path, script).unwrap();
+    path
+}
+
+fn issue_page(numbers: std::ops::Range<u32>) -> String {
+    let rows: Vec<String> = numbers
+        .map(|n| {
+            format!(
+                r#"{{"number": {n}, "state": "open", "created_at": "2026-10-01T00:00:{:02}Z",
+                    "labels": [{{"name": "loom:curated"}}]}}"#,
+                n % 60
+            )
+        })
+        .collect();
+    format!("[{}]\n", rows.join(","))
+}
+
+/// The curated listing walks past page 1 and carries each creation instant;
+/// a pull request under the label is not an issue.
+#[test]
+fn the_curated_listing_is_paginated_and_dated() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = format!("test-owner/fleet-curated-{}", std::process::id());
+    std::fs::write(dir.path().join("cu1.json"), issue_page(1..101)).unwrap();
+    std::fs::write(dir.path().join("cu2.json"), issue_page(101..131)).unwrap();
+    let gh = curated_stub(dir.path());
+
+    let listing = super::curated_listing_with(&gh, dir.path(), Some(&repo)).unwrap();
+    assert_eq!(listing.keys().copied().collect::<Vec<_>>(), (1..131).collect::<Vec<_>>());
+    assert_eq!(listing[&7].unwrap().to_rfc3339(), "2026-10-01T00:00:07+00:00");
+    let calls = std::fs::read_to_string(dir.path().join("calls.log")).unwrap();
+    assert!(calls.contains("&page=2"), "{calls}");
+}
+
+/// A walk that cannot finish is an error: the repo has no curated listing
+/// this pass rather than the first page only.
+#[test]
+fn an_unfinished_curated_walk_is_an_error_not_the_first_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = format!("test-owner/fleet-curated-fail-{}", std::process::id());
+    std::fs::write(dir.path().join("cu1.json"), issue_page(1..101)).unwrap();
+    std::fs::write(dir.path().join("cu2.json"), issue_page(101..131)).unwrap();
+    std::fs::write(dir.path().join("fail2"), "").unwrap();
+    let gh = curated_stub(dir.path());
+
+    let err = super::curated_listing_with(&gh, dir.path(), Some(&repo)).unwrap_err();
+    assert!(format!("{err:#}").contains("HTTP 502"), "{err:#}");
+}
+
 fn row(repo: &str, issue: u32) -> ReadyQueueRow {
     serde_json::from_value(serde_json::json!({
         "rank": issue, "repo": repo, "issue": issue, "workspace_priority": 100,
@@ -280,10 +339,117 @@ fn an_anchor_taken_mid_sweep_carries_its_start_facts_on_the_running_row() {
     assert_eq!(row["stage"], FleetStage::SweepCurator.as_str());
     assert_eq!(row["host"], "host-a");
     assert_eq!(row["slot"], "regular");
-    assert_eq!(row["model"], "opus");
+    assert_eq!(row["model"], "claude-opus-5-5");
+    assert_eq!(row["effort_source"], "explicit");
     assert_eq!(row["effort"], "high");
     assert_eq!(row["model_source"], "explicit");
     assert_eq!(row["attempt_index"], 1);
     assert_eq!(row["trigger"], "first");
     assert!(row.get("previous_sweep_id").is_none());
+    // #11444: the test-only `dispatch` names no origin.
+    assert_eq!(row["dispatch_origin"], "unknown");
+}
+
+/// `tick_main_ci` over `root` under `slug`, read from the production store.
+fn tick_ci(root: &Path, slug: &str) -> crate::telemetry::kinds::fleet_state::MainCi {
+    let reused = super::Reused {
+        roots: vec![(root.to_path_buf(), slug.to_string())],
+        ..Default::default()
+    };
+    super::tick_main_ci(&reused)[slug]
+}
+
+/// #11565: the gate loop writes into `checkout_ff::health_states()` keyed by
+/// the registry's normalized root; `fleet.state` reads that same store keyed
+/// by the pool's root, which may be spelled differently (symlink, trailing
+/// slash). A green verdict reads green, a verified-red halt reads red, and a
+/// root the gate never evaluated reads unknown.
+#[test]
+fn test_tick_main_ci_reads_the_gate_verdict_across_path_forms() {
+    use crate::main_health_gate::{apply_gate_outcome, GateOutcome};
+    use crate::telemetry::kinds::fleet_state::MainCi;
+
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("repo");
+    std::fs::create_dir_all(&real).unwrap();
+    let canonical = std::fs::canonicalize(&real).unwrap();
+    let link = dir.path().join("link");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&canonical, &link).unwrap();
+    let trailing = PathBuf::from(format!("{}/", canonical.display()));
+
+    // Never seen by the gate.
+    assert_eq!(tick_ci(&canonical, "o/never"), MainCi::Unknown);
+
+    let state = crate::fleet_sync::checkout_ff::health_states().get_or_create(&canonical);
+    // Registered but no verdict yet.
+    assert_eq!(tick_ci(&canonical, "o/pending"), MainCi::Unknown);
+
+    let _ = apply_gate_outcome(
+        &state,
+        &GateOutcome::Green {
+            elapsed: std::time::Duration::ZERO,
+        },
+    );
+    for root in [&canonical, &link, &trailing] {
+        assert_eq!(tick_ci(root, "o/green"), MainCi::Green, "{}", root.display());
+    }
+
+    let _ = apply_gate_outcome(&state, &GateOutcome::red("boom"));
+    for root in [&canonical, &link, &trailing] {
+        assert_eq!(tick_ci(root, "o/red"), MainCi::Red, "{}", root.display());
+    }
+}
+
+/// (#11564) Each ready row carries the clock that holds it: a clocked hold
+/// with the expiry the work finder computed, the build back-off with none
+/// (it has no clock), and a row no clock holds neither field, even when a
+/// stray `held_until` rides on it.
+#[test]
+fn a_ready_row_carries_its_clock_and_only_a_clocked_hold_its_expiry() {
+    use crate::telemetry::kinds::fleet_state::FleetEligibleReason;
+    let at = "2026-10-11T12:30:00Z";
+    let tick_row = |issue: u32, disposition: &str, held_until: Option<&str>| -> ReadyQueueRow {
+        let mut v = serde_json::json!({
+            "rank": issue, "repo": "/src/app", "issue": issue, "workspace_priority": 100,
+            "urgent": false, "disposition": disposition
+        });
+        if let Some(until) = held_until {
+            v["held_until"] = serde_json::json!(until);
+        }
+        serde_json::from_value(v).unwrap()
+    };
+    let summary = WorkFinderTickSummary {
+        plan: Some(DispatchPlanContext::default()),
+        queue: vec![
+            tick_row(1, "dispatch_backoff", Some(at)),
+            tick_row(2, "deferred_build_backoff", None),
+            tick_row(3, "parked", Some(at)),
+            tick_row(4, "recheck_interval", Some(at)),
+            tick_row(5, "dispatch_backoff", None),
+        ],
+        ..WorkFinderTickSummary::default()
+    };
+    let managed: BTreeSet<String> = ["acme/app".to_string()].into();
+    let slug = |root: &str| root.strip_prefix("/src/").map(|r| format!("acme/{r}"));
+    let ready = super::ready_from_tick(&summary, slug, &managed);
+    let facts: Vec<(u32, Option<FleetEligibleReason>, Option<String>)> = ready
+        .items
+        .iter()
+        .map(|i| (i.issue, i.eligible_reason, i.eligible_at.map(|t| t.to_rfc3339())))
+        .collect();
+    let when = Some("2026-10-11T12:30:00+00:00".to_string());
+    assert_eq!(
+        facts,
+        vec![
+            (1, Some(FleetEligibleReason::DispatchBackoff), when.clone()),
+            (2, Some(FleetEligibleReason::BuildBackoff), None),
+            (3, None, None),
+            (4, Some(FleetEligibleReason::RecheckInterval), when),
+            // The reason is a fact even when this host cannot date the end.
+            (5, Some(FleetEligibleReason::DispatchBackoff), None),
+        ]
+    );
+    // The tick's own rows never carry a halt; those come from the clock.
+    assert!(ready.halts.is_empty());
 }

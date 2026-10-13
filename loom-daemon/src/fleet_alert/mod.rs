@@ -12,11 +12,15 @@
 //! - [`state::AlertState`] (pure, injected clock) turns condition snapshots
 //!   into `Started` / `Reminder` / `Cleared` transitions: debounced, one alert
 //!   per edge, at most one reminder per interval, persisted across restarts.
-//! - [`capacity`] (pure, #10214) adds the host-level capacity asks: disk or
-//!   RAM headroom holding the cap below `maxConcurrent`, and a starred
-//!   backlog more than 3x the cap.
+//! - [`capacity`] (pure, #10214) adds the host-level capacity ask: disk or
+//!   RAM headroom holding the cap below `maxConcurrent` (the starred-backlog
+//!   ask was retired by #11510).
 //! - [`task`] delivers each transition to its sinks: the event bus (relayed
-//!   to Matrix by Safehouse). Loom sends no inbox mail (#11087).
+//!   to Matrix by Safehouse) and, independently, loom-ui's Alerts page
+//!   ([`loom_ui`], #11295). Loom sends no inbox mail (#11087).
+//!
+//! The evaluator is off by default (`autonomous.fleetAlert.enabled`); the
+//! fleet defaults (fleet-gitops) are where it is turned on fleet-wide.
 //!
 //! **No forge calls anywhere in this path**: the whole point is that the alert
 //! still arrives while `gh` is rate-limited. `loom-daemon health` output and
@@ -32,6 +36,7 @@ use crate::types::DaemonStatusReport;
 
 pub mod capacity;
 pub mod causes;
+pub mod loom_ui;
 pub mod outputs;
 pub mod state;
 pub mod task;
@@ -139,7 +144,7 @@ pub fn classify(
         });
     }
 
-    // #10214: a resource-limited cap and an outgrown starred backlog.
+    // #10214: a resource-limited cap.
     if let Some(tick) = &status.last_work_finder_tick {
         out.extend(capacity::conditions(tick));
     }

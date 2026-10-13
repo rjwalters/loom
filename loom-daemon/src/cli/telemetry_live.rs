@@ -41,7 +41,6 @@ impl LiveArgs {
             );
             return Ok(());
         }
-        ensure!(cfg!(feature = "otlp"), "live canary requires an OTLP-enabled binary");
         ensure!(
             loom_daemon::observability::endpoint_policy::valid_otlp_endpoint(&self.endpoint),
             "invalid Collector endpoint"
