@@ -1,15 +1,13 @@
 //! `loom-daemon forge parent body|link` (#10012 §4): the logic behind
 //! `create-issue.sh --parent N`. The script only passes the flag; see
-//! [`loom_daemon::star_liveness::parent_link`].
+//! [`loom_daemon::parent_link`].
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
 use anyhow::{anyhow, Result};
 use clap::Subcommand;
-use loom_daemon::star_liveness::parent_link::{
-    child_body, fetch_parent_body, link_created, StarOutcome,
-};
+use loom_daemon::parent_link::{child_body, fetch_parent_body, link_created};
 
 #[derive(Subcommand, Debug)]
 pub enum ParentAction {
@@ -23,8 +21,7 @@ pub enum ParentAction {
         #[arg(long, value_name = "OWNER/REPO")]
         repo: Option<String>,
     },
-    /// After the create: star the child when the parent is starred, and link
-    /// it as a native sub-issue (both best effort).
+    /// After the create: link the child as a native sub-issue (best effort).
     Link {
         /// The parent issue number.
         #[arg(long)]
@@ -88,15 +85,7 @@ pub fn handle(action: ParentAction) -> Result<()> {
         } => {
             let (root, slug) = target(repo)?;
             let number = child_number(&child, &slug)?;
-            match link_created(&root, &slug, parent, number)? {
-                StarOutcome::Starred => {
-                    eprintln!(
-                        "loom-daemon forge parent: starred #{number} (parent #{parent} is starred)"
-                    );
-                }
-                StarOutcome::AlreadyStarred | StarOutcome::ParentNotStarred => {}
-            }
-            Ok(())
+            link_created(&root, &slug, parent, number)
         }
     }
 }

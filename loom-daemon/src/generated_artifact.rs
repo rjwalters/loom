@@ -27,6 +27,10 @@ use std::process::{Command, Stdio};
 /// marker discovery in shell.
 pub mod status;
 
+/// Name-independent build-tree discovery and the conservative "nothing but
+/// cargo output" proof the worktree reaper relies on (#11193).
+pub mod build_tree;
+
 /// Path components that are unambiguously machine-generated: a virtualenv, a
 /// dependency tree, or an interpreter/tool cache. These normally never reach
 /// a stash at all (they are gitignored, and `git stash push --include-untracked`

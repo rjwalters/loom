@@ -564,7 +564,7 @@ pub fn stage_points(samples: &[DwellSample], inputs: &[RepoInput]) -> Vec<Metric
 /// cross-owner repo uses its own owner's credential).
 pub struct GhStageFetcher;
 
-fn gh_json(root: &Path, path: &str) -> Option<serde_json::Value> {
+pub(in crate::observability) fn gh_json(root: &Path, path: &str) -> Option<serde_json::Value> {
     let CmdOutcome::Ran(output) = GhInvocation::new(
         Operation::new("api.rest"),
         AccessIntent::Read,

@@ -11,9 +11,8 @@ use super::WorkItem;
 impl WorkItem {
     /// The issue's self-declared minimum re-check interval (Issue #6685),
     /// extracted from a `<!-- loom:recheck-interval=<value> -->` marker in
-    /// [`Self::body`] — in the spirit of the Curator's
-    /// `<!-- loom:complexity=<tier> -->` marker (see [`Self::complexity`]),
-    /// but declaring a standing polling policy rather than a cost stratum.
+    /// [`Self::body`], declaring a standing polling
+    /// policy.
     ///
     /// `<value>` is a bare duration: an integer optionally followed by a
     /// single unit suffix — `s` (seconds, the default when no suffix is
@@ -78,25 +77,17 @@ impl WorkItem {
 }
 
 /// The marker key inside the `<!-- ... -->` comment declaring a tracker
-/// issue's self-declared minimum re-check interval (Issue #6685). Mirrors
-/// [`crate::script_helpers::sweep_experiment`]'s `loom:complexity=` marker
-/// convention but lives here (rather than in that module) since it is a
-/// work-finder-only concept, never read by dispatch-time complexity
-/// stratification.
+/// issue's self-declared minimum re-check interval (Issue #6685). A
+/// work-finder-only concept.
 const RECHECK_INTERVAL_MARKER_KEY: &str = "loom:recheck-interval=";
 
 /// Extract the LAST well-formed `<!-- loom:recheck-interval=<value> -->`
 /// value from `body`, if any (Issue #6685).
 ///
-/// Line-oriented and last-match-wins, mirroring
-/// [`crate::script_helpers::sweep_experiment::extract_complexity_marker`]'s
-/// contract — the canonical marker placement is at the end of the body, and a
-/// marker split across a newline is not recognized (grep-line semantics).
-/// Simpler than that function's non-overlapping multi-match-per-line scan:
-/// this marker is expected to appear at most once, so a single `find` per
-/// line is sufficient and avoids duplicating the general-purpose scanner for
-/// a syntax with a different value vocabulary (a duration, not a closed tier
-/// enum).
+/// Line-oriented and last-match-wins — the canonical marker placement is at
+/// the end of the body, and a marker split across a newline is not recognized
+/// (grep-line semantics). This marker is expected to appear at most once, so a single `find` per
+/// line is sufficient.
 fn extract_recheck_interval_marker(body: &str) -> Option<&str> {
     body.lines().rev().find_map(|line| {
         let idx = line.find(RECHECK_INTERVAL_MARKER_KEY)?;

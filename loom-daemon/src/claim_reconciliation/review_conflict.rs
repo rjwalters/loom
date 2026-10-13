@@ -244,6 +244,16 @@ fn gh_pr(gh_bin: &Path, root: &Path, args: &[&str]) -> Result<Vec<u8>> {
     Ok(out.stdout)
 }
 
+/// [`gh_pr`], re-run once after a forced per-owner re-mint when the write is
+/// refused as not accessible by the integration (#9247).
+fn gh_pr_retrying(gh_bin: &Path, root: &Path, args: &[&str]) -> Result<Vec<u8>> {
+    let op = match args.first().copied() {
+        Some("comment") => "review_conflict.pr_comment",
+        _ => "review_conflict.pr_edit",
+    };
+    crate::stale_token_retry::run(op, root, || gh_pr(gh_bin, root, args))
+}
+
 /// The PRs this pass decides on: those carrying `loom:review-requested` or
 /// `loom:merge-conflict`, keyed by number (a PR carrying both appears once).
 ///
@@ -290,8 +300,9 @@ pub fn conflict_candidates(
 fn flag(gh_bin: &Path, root: &Path, number: u32, head_sha: &str) -> Result<()> {
     let n = number.to_string();
     let body = flag_comment_body(head_sha);
-    gh_pr(gh_bin, root, &["comment", &n, "--body", &body])?;
-    gh_pr(
+    // Each write is its own retry (#9247): one refresh, one re-run, each.
+    gh_pr_retrying(gh_bin, root, &["comment", &n, "--body", &body])?;
+    gh_pr_retrying(
         gh_bin,
         root,
         &[
@@ -507,3 +518,7 @@ pub(super) fn reconcile_review_conflicts_sharing(
 #[cfg(test)]
 #[path = "review_conflict_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "review_conflict_stale_token_tests.rs"]
+mod stale_token_tests;

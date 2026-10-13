@@ -108,6 +108,7 @@ mod git;
 pub mod heads;
 mod hold;
 mod host;
+mod loom_ui;
 mod memory;
 mod w2;
 
@@ -735,8 +736,18 @@ fn classify(
     // A pass that has stopped asking (three remotes in a row did not answer)
     // classifies the rest from what their clones hold.
     let asked = if scan.online { asked } else { Asked::No };
+    let answered = matches!(asked, Asked::Forge { .. } | Asked::Remote(Ok(_)));
     match classify_head(env, root, gate, memory, scan, asked, &mut report) {
-        Ok(found) => (report, found.map(|(branch, commit)| (nwo, branch, commit))),
+        Ok(found) => {
+            // #11295: a repo the forge refused that answers again and needs
+            // no resync is no longer refused, so its `repo-access` run ends.
+            // One that goes on to W2 is judged by W2's own fetch: git may
+            // still be refused where the forge's query is not.
+            if answered && found.is_none() {
+                memory.clear_refused(root);
+            }
+            (report, found.map(|(branch, commit)| (nwo, branch, commit)))
+        }
         Err(e) => {
             if let Some(low) = e.downcast_ref::<git::LowDisk>() {
                 // Below the disk floor the fetch was skipped (#10995). The

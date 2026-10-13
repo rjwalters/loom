@@ -1,10 +1,13 @@
 //! In-session, bounded pre-PR gate (Issue #10476).
 //!
-//! `buildGate` already runs orchestrator-side *after* the Builder exits. That
-//! catches a broken PR but throws the failing output away: a fresh Builder
-//! restarts from scratch. This module is the same `buildGate.command`, run
-//! **inside the Builder's session, before the PR is opened**, so the Builder
-//! that wrote the change gets the failure tail back and can fix it.
+//! The Builder that wrote a change runs this **inside its session, before the
+//! PR is opened**, so a failure tail comes back to the session that can fix
+//! it. Since #11690 it runs the **fast tier** of `buildGate.command` (compile
+//! plus smoke: [`crate::main_health_gate::resolve_gate_fast_command`], i.e.
+//! `buildGate.fastCommand`, else `LOOM_BUILD_GATE_TIER=fast <command>`). The
+//! test suites run in CI, which is the test gate; the host only proves the
+//! change compiles. There is no load deferral: the fast tier is short, and
+//! `build-gate.sh`'s machine-wide build slot already serialises compiles.
 //!
 //! One definition of "the gate": the command, timeout and opt-in semantics come
 //! from [`crate::main_health_gate::read_build_gate_config`]; nothing here
@@ -18,16 +21,14 @@
 //! Opt-in: no (enabled) `buildGate` block means every entry point is a no-op
 //! that exits 0.
 //!
-//! Path-scoped suites (#10860): `buildGate.preflightPathScopes` lists suites
-//! that pre-flight drops (by exporting their `env` empty to the gate command)
-//! when the diff against `origin/main` touches none of their `runWhenChanged`
-//! globs. CI still runs them. Anything uncertain runs the full gate.
-//!
 //! A run that hits `timeoutSeconds` is [`Verdict::TimedOut`], not a check
 //! failure: it names the `[build-gate]` stage that was running, never counts
 //! toward the failure cap and never releases the claim. The whole gate
 //! process tree is torn down first ([`tree_kill`], #10955), and timeouts have
 //! a cap of their own, after which the episode runs the gate no more.
+//!
+//! Every run that executes the command emits one `build_gate.run` span
+//! ([`crate::observability::ops::build_gate`], #11690).
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -35,8 +36,10 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::observability::ops::build_gate;
+
 mod flaky;
-mod load_defer;
+pub mod skip_ci;
 mod tree_kill;
 
 /// Default `buildGate.preflightMaxAttempts`.
@@ -52,9 +55,8 @@ pub const EXIT_UNRESOLVED: i32 = 4;
 /// Exit code: the gate ran out of `timeoutSeconds` (#10860) — not a check
 /// failure, the claim is kept.
 pub const EXIT_TIMED_OUT: i32 = 5;
-/// Exit code: the host is above the load threshold, so the gate was not
-/// started (#10955) — neither a failure nor a timeout, the claim is kept.
-pub const EXIT_DEFERRED: i32 = 6;
+// Exit code 6 (`Deferred`, #10955) is retired (#11690): the fast tier never
+// defers on load. The number is not reused.
 /// Exit code from `check`: no passing receipt for the current `HEAD`.
 pub const EXIT_NOT_PASSED: i32 = 7;
 
@@ -93,15 +95,6 @@ pub enum Verdict {
         stage: Option<String>,
         tail: String,
     },
-    /// The host is above the load threshold, so the gate was not run
-    /// (#10955). Neither counter moves and the claim is kept; once deferrals
-    /// in this episode span `max_secs` the gate runs regardless.
-    Deferred {
-        load_per_cpu: String,
-        threshold: String,
-        waited_secs: u64,
-        max_secs: u64,
-    },
 }
 
 impl Verdict {
@@ -113,7 +106,19 @@ impl Verdict {
             Self::Failed { .. } => EXIT_FAILED,
             Self::Unresolved { .. } => EXIT_UNRESOLVED,
             Self::TimedOut { .. } => EXIT_TIMED_OUT,
-            Self::Deferred { .. } => EXIT_DEFERRED,
+        }
+    }
+
+    /// The `build_gate.run` span's `outcome` for a verdict that ran the
+    /// command (#11690).
+    fn span_outcome(&self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Pass => "pass",
+            Self::PassFlaky { .. } => "pass_flaky",
+            Self::Failed { .. } => "fail",
+            Self::Unresolved { .. } => "unresolved",
+            Self::TimedOut { .. } => "timeout",
         }
     }
 
@@ -139,10 +144,6 @@ struct State {
     timed_out_attempts: u32,
     #[serde(default)]
     passed_head: Option<String>,
-    /// Epoch seconds of this episode's first load deferral in the current
-    /// streak (#10955); cleared whenever the gate runs.
-    #[serde(default)]
-    deferred_since: Option<u64>,
 }
 
 /// Identifier of the current Builder dispatch episode: the sweep id the daemon
@@ -209,138 +210,6 @@ fn kill_gate_tree(child: &mut std::process::Child) {
     }
 }
 
-/// One `buildGate.preflightPathScopes` entry (#10860): a gate suite that
-/// pre-flight may drop when the diff touches none of `run_when_changed`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PathScope {
-    /// Variable exported empty to the gate command to drop the suite.
-    env: String,
-    /// Label for the skip line.
-    suite: String,
-    run_when_changed: Vec<String>,
-}
-
-/// `buildGate.preflightPathScopes`. Malformed entries are dropped (the
-/// soft-fail contract of `read_build_gate_config`): an entry with no usable
-/// `env` or no globs can never be skipped, so dropping it is fail-safe.
-fn path_scopes(worktree: &Path) -> Vec<PathScope> {
-    let eff = crate::config_resolver::resolve_effective_config(worktree);
-    let Some(scopes) = crate::config_resolver::get_path(&eff, "buildGate")
-        .and_then(|g| g.get("preflightPathScopes"))
-        .and_then(serde_json::Value::as_array)
-    else {
-        return Vec::new();
-    };
-    scopes
-        .iter()
-        .filter_map(|s| {
-            let env = s.get("env")?.as_str()?.trim();
-            if env.is_empty() || !env.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-                return None;
-            }
-            let run_when_changed: Vec<String> = s
-                .get("runWhenChanged")?
-                .as_array()?
-                .iter()
-                .filter_map(serde_json::Value::as_str)
-                .map(str::to_string)
-                .collect();
-            if run_when_changed.is_empty() {
-                return None;
-            }
-            let suite = s
-                .get("suite")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or(env);
-            Some(PathScope {
-                env: env.to_string(),
-                suite: suite.to_string(),
-                run_when_changed,
-            })
-        })
-        .collect()
-}
-
-/// Paths this worktree changes against `origin/main`: committed since the
-/// merge-base, tracked but uncommitted, and untracked (not ignored). `None`
-/// when any part cannot be computed or the set is empty.
-fn changed_paths(worktree: &Path) -> Option<Vec<String>> {
-    let base =
-        git_out(worktree, &["merge-base", "HEAD", "origin/main"]).filter(|b| !b.is_empty())?;
-    let mut paths = Vec::new();
-    for args in [
-        // `--no-renames`: a rename lists both its source and destination,
-        // so moving a file out of a scope's inputs still touches the scope.
-        &[
-            "diff",
-            "--no-renames",
-            "--name-only",
-            "-z",
-            base.as_str(),
-            "HEAD",
-        ][..],
-        &["diff", "--no-renames", "--name-only", "-z", "HEAD"],
-        &["ls-files", "--others", "--exclude-standard", "-z"],
-    ] {
-        let out = git_out(worktree, args)?;
-        paths.extend(
-            out.split('\0')
-                .filter(|p| !p.is_empty())
-                .map(str::to_string),
-        );
-    }
-    paths.sort();
-    paths.dedup();
-    (!paths.is_empty()).then_some(paths)
-}
-
-/// The variable `build-gate.sh` reads to drop its installer suite.
-const INSTALLER_SUITE_ENV: &str = "LOOM_BUILD_GATE_INSTALLER_SUITE";
-
-/// Environment for the gate command from the path scopes: `Some("")` drops a
-/// suite whose inputs the diff does not touch (announced on stderr); `None`
-/// removes the variable so the suite runs. Every scope runs when the changed
-/// set is unknown or empty (fail safe). `INSTALLER_SUITE_ENV` is always
-/// present, so a value inherited from the caller can never skip silently.
-fn scope_env(worktree: &Path) -> Vec<(String, Option<String>)> {
-    let mut env = scoped_env(worktree);
-    if !env.iter().any(|(k, _)| k == INSTALLER_SUITE_ENV) {
-        env.push((INSTALLER_SUITE_ENV.to_string(), None));
-    }
-    env
-}
-
-fn scoped_env(worktree: &Path) -> Vec<(String, Option<String>)> {
-    let scopes = path_scopes(worktree);
-    if scopes.is_empty() {
-        return Vec::new();
-    }
-    let changed = changed_paths(worktree);
-    if changed.is_none() {
-        eprintln!("preflight: no diff against origin/main could be computed — running every suite");
-    }
-    scopes
-        .into_iter()
-        .map(|s| {
-            let touched = changed.as_ref().is_none_or(|c| {
-                c.iter().any(|p| {
-                    s.run_when_changed
-                        .iter()
-                        .any(|g| crate::main_health_gate::glob_matches(g, p))
-                })
-            });
-            if touched {
-                return (s.env, None);
-            }
-            eprintln!(
-                "preflight: skipping {} — diff touches none of its inputs (CI still runs it)",
-                s.suite
-            );
-            (s.env, Some(String::new()))
-        })
-        .collect()
-}
-
 /// The last `[build-gate] <stage>` marker in the full gate log — the stage
 /// that was running when the budget ran out (#10860). `WARNING`/`note:` lines
 /// are not stages. `None` for a gate that prints no markers.
@@ -361,13 +230,8 @@ enum RunError {
     TimedOut { stage: Option<String>, tail: String },
 }
 
-/// Run `command` via `sh -c` with `env` applied (`None` removes a variable).
-fn run_command(
-    command: &str,
-    cwd: &Path,
-    timeout: Duration,
-    env: &[(String, Option<String>)],
-) -> Result<Vec<String>, RunError> {
+/// Run `command` via `sh -c`.
+fn run_command(command: &str, cwd: &Path, timeout: Duration) -> Result<Vec<String>, RunError> {
     let log = std::env::temp_dir().join(format!("loom-preflight-{}.log", uuid::Uuid::new_v4()));
     let out = std::fs::File::create(&log)
         .map_err(|e| RunError::Failed(format!("cannot create output file: {e}")))?;
@@ -381,12 +245,6 @@ fn run_command(
         .stdin(Stdio::null())
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err));
-    for (k, v) in env {
-        match v {
-            Some(v) => cmd.env(k, v),
-            None => cmd.env_remove(k),
-        };
-    }
     // Own session (hence own process group), so a timeout can find and kill
     // the whole gate tree, including stages in other process groups (#10955).
     tree_kill::own_session(&mut cmd);
@@ -440,19 +298,14 @@ fn run_command(
 /// Run the pre-flight gate in `worktree`, recording the outcome.
 #[must_use]
 pub fn run(worktree: &Path) -> Verdict {
-    run_with_load(worktree, &episode_id(), load_defer::HostLoad::sample(), load_defer::epoch_now())
+    run_in_episode(worktree, &episode_id())
 }
 
-/// [`run`] with an explicit dispatch episode and no load reading (so it never
-/// defers). Attempts are bounded within one episode; entering a new one
-/// resets the budget.
+/// [`run`] with an explicit dispatch episode. Attempts are bounded within one
+/// episode; entering a new one resets the budget. Never defers on host load
+/// (#11690): the fast tier is a compile, not the suite.
 #[must_use]
 pub fn run_in_episode(worktree: &Path, episode: &str) -> Verdict {
-    run_with_load(worktree, episode, load_defer::HostLoad::UNKNOWN, load_defer::epoch_now())
-}
-
-/// [`run_in_episode`] with a host-load reading taken at `now` (#10955).
-fn run_with_load(worktree: &Path, episode: &str, host: load_defer::HostLoad, now: u64) -> Verdict {
     let Some(cfg) = crate::main_health_gate::read_build_gate_config(worktree) else {
         return Verdict::Disabled;
     };
@@ -462,7 +315,6 @@ fn run_with_load(worktree: &Path, episode: &str, host: load_defer::HostLoad, now
         st.episode = episode.to_string();
         st.failed_attempts = 0;
         st.timed_out_attempts = 0;
-        st.deferred_since = None;
     }
     if st.failed_attempts >= max {
         // Already terminal: a further run must not reopen the loop.
@@ -483,29 +335,12 @@ fn run_with_load(worktree: &Path, episode: &str, host: load_defer::HostLoad, now
             tail: String::new(),
         };
     }
-    match load_defer::decide(worktree, host, now, &mut st.deferred_since) {
-        load_defer::Decision::Defer {
-            load_per_cpu,
-            threshold,
-            waited_secs,
-            max_secs,
-        } => {
-            save(worktree, &st);
-            return Verdict::Deferred {
-                load_per_cpu,
-                threshold,
-                waited_secs,
-                max_secs,
-            };
-        }
-        load_defer::Decision::Run { forced: true } => eprintln!(
-            "preflight: host still above the load threshold, but deferrals have reached \
-             buildGate.maxDeferSeconds — running the gate anyway"
-        ),
-        load_defer::Decision::Run { forced: false } => {}
-    }
-    let env = scope_env(worktree);
-    match run_command(&cfg.command, worktree, cfg.timeout, &env) {
+    // #11690: the fast tier only. CI runs the suites.
+    let command = crate::main_health_gate::resolve_gate_fast_command(worktree, &cfg.command);
+    let attempt = st.failed_attempts + st.timed_out_attempts + 1;
+    let started_at = chrono::Utc::now();
+    let result = run_command(&command, worktree, cfg.timeout);
+    let verdict = match result {
         Ok(flaky) => {
             st.failed_attempts = 0;
             st.timed_out_attempts = 0;
@@ -546,7 +381,16 @@ fn run_with_load(worktree: &Path, episode: &str, host: load_defer::HostLoad, now
                 }
             }
         }
-    }
+    };
+    build_gate::publish(&build_gate::GateRun {
+        stage: build_gate::STAGE_PREFLIGHT,
+        tier: crate::main_health_gate::GateTier::Fast.label(),
+        outcome: verdict.span_outcome(),
+        attempt,
+        started_at,
+        ended_at: chrono::Utc::now(),
+    });
+    verdict
 }
 
 /// Release the claim on `issue` if `verdict` calls for it
@@ -779,203 +623,67 @@ mod tests {
         assert_eq!(load(d.path()).failed_attempts, 1);
     }
 
-    fn loaded(per_cpu: f64) -> load_defer::HostLoad {
-        load_defer::HostLoad {
-            loadavg_1m: Some(per_cpu * 10.0),
-            cpus: 10,
-        }
-    }
-
-    /// #10955: above the load threshold the gate is not started; nothing is
-    /// counted; after the max-defer window it runs regardless.
+    /// #11690: pre-flight runs the fast tier — `LOOM_BUILD_GATE_TIER=fast`
+    /// in front of `buildGate.command`, or `buildGate.fastCommand` when set.
     #[test]
-    fn a_loaded_host_defers_without_running_and_the_deferral_is_bounded() {
-        let gate = serde_json::json!({
-            "enabled": true, "command": "echo ran >> runs",
-            "loadThreshold": 0.9, "maxDeferSeconds": 600,
-        });
-        let d = repo(Some(&gate.to_string()));
-        let runs = || {
-            std::fs::read_to_string(d.path().join("runs"))
-                .unwrap_or_default()
-                .lines()
-                .count()
-        };
-        let t0 = 1_000_000;
-        let v = run_with_load(d.path(), "e1", loaded(2.5), t0);
-        assert_eq!(
-            v,
-            Verdict::Deferred {
-                load_per_cpu: "2.50".into(),
-                threshold: "0.90".into(),
-                waited_secs: 0,
-                max_secs: 600,
-            }
-        );
-        assert_eq!(v.exit_code(), EXIT_DEFERRED);
-        assert!(!v.releases_claim());
-        let v = run_with_load(d.path(), "e1", loaded(2.5), t0 + 599);
-        assert!(
-            matches!(
-                v,
-                Verdict::Deferred {
-                    waited_secs: 599,
-                    ..
-                }
-            ),
-            "{v:?}"
-        );
-        assert_eq!(runs(), 0, "a deferral must not run the gate");
-        let st = load(d.path());
-        assert_eq!((st.failed_attempts, st.timed_out_attempts), (0, 0));
-        assert!(!check(d.path()));
-        // The window has run out: it runs although the host is still loaded.
-        assert_eq!(run_with_load(d.path(), "e1", loaded(2.5), t0 + 600), Verdict::Pass);
-        assert_eq!(runs(), 1);
-        // A fresh streak starts after a run …
-        assert!(matches!(
-            run_with_load(d.path(), "e1", loaded(2.5), t0 + 700),
-            Verdict::Deferred { waited_secs: 0, .. }
-        ));
-        // … and below the threshold, or with no reading, it simply runs.
-        assert_eq!(run_with_load(d.path(), "e1", loaded(0.5), t0 + 701), Verdict::Pass);
-        assert_eq!(
-            run_with_load(d.path(), "e1", load_defer::HostLoad::UNKNOWN, t0 + 702),
-            Verdict::Pass
-        );
-        assert_eq!(runs(), 3);
-    }
-
-    /// #10955: a terminal episode stays terminal under load (no deferral
-    /// masks it), and a disabled gate never defers.
-    #[test]
-    fn caps_and_disabled_win_over_a_deferral() {
+    fn preflight_runs_the_fast_tier_of_the_gate() {
         let d = repo(Some(
-            r#"{"enabled":true,"command":"exit 1","preflightMaxAttempts":1,"loadThreshold":0.9}"#,
+            r#"{"enabled":true,"command":"sh -c 'test \"$LOOM_BUILD_GATE_TIER\" = fast'"}"#,
         ));
-        assert!(matches!(run_in_episode(d.path(), "e1"), Verdict::Unresolved { .. }));
-        assert!(matches!(
-            run_with_load(d.path(), "e1", loaded(5.0), 1),
-            Verdict::Unresolved { .. }
-        ));
-        let d = repo(None);
-        assert_eq!(run_with_load(d.path(), "e1", loaded(5.0), 1), Verdict::Disabled);
-    }
-
-    fn git_in(p: &Path, a: &[&str]) {
-        let st = Command::new("git")
-            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
-            .args(a)
-            .current_dir(p)
-            .status()
-            .unwrap();
-        assert!(st.success(), "git {a:?}");
-    }
-
-    /// Gate passes iff the scope variable is exported empty (the suite was
-    /// skipped); scoped to `defaults/*`. Config is committed and
-    /// `origin/main` points at that commit, so the diff starts empty.
-    fn scoped_repo() -> tempfile::TempDir {
-        let d = repo(Some(
-            r#"{"enabled":true,"command":"test -z \"${LOOM_BUILD_GATE_INSTALLER_SUITE-x}\"","preflightMaxAttempts":9,"preflightPathScopes":[{"env":"LOOM_BUILD_GATE_INSTALLER_SUITE","suite":"test-installer","runWhenChanged":["defaults/*"]}]}"#,
-        ));
-        git_in(d.path(), &["add", "-A"]);
-        git_in(d.path(), &["commit", "-q", "-m", "cfg"]);
-        git_in(d.path(), &["update-ref", "refs/remotes/origin/main", "HEAD"]);
-        d
-    }
-
-    fn commit_file(p: &Path, rel: &str) {
-        let f = p.join(rel);
-        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
-        std::fs::write(&f, "x").unwrap();
-        git_in(p, &["add", rel]);
-        git_in(p, &["commit", "-q", "-m", rel]);
-    }
-
-    #[test]
-    fn scope_skipped_when_diff_misses_its_inputs() {
-        let d = scoped_repo();
-        commit_file(d.path(), "loom-daemon/src/foo.rs");
+        assert_eq!(run_in_episode(d.path(), "e1"), Verdict::Pass);
+        assert!(check(d.path()));
+        let d = repo(Some(r#"{"enabled":true,"command":"false","fastCommand":"true"}"#));
         assert_eq!(run_in_episode(d.path(), "e1"), Verdict::Pass);
     }
 
+    /// #11690: an old state file carrying the retired `deferred_since` field
+    /// (#10955) still parses and keeps its receipt.
     #[test]
-    fn scope_runs_when_diff_touches_its_inputs() {
-        let d = scoped_repo();
-        commit_file(d.path(), "loom-daemon/src/foo.rs");
-        commit_file(d.path(), "defaults/x");
-        assert!(matches!(run_in_episode(d.path(), "e1"), Verdict::Failed { .. }));
-    }
-
-    #[test]
-    fn rename_out_of_inputs_counts_as_changed() {
-        let d = scoped_repo();
-        commit_file(d.path(), "defaults/docs/x.md");
-        git_in(d.path(), &["update-ref", "refs/remotes/origin/main", "HEAD"]);
-        git_in(d.path(), &["mv", "defaults/docs/x.md", "x.md"]);
-        // Staged rename (the `diff HEAD` leg) …
-        assert!(matches!(run_in_episode(d.path(), "e1"), Verdict::Failed { .. }));
-        // … and committed (the merge-base leg).
-        git_in(d.path(), &["commit", "-q", "-m", "mv"]);
-        assert!(matches!(run_in_episode(d.path(), "e2"), Verdict::Failed { .. }));
-    }
-
-    #[test]
-    fn installer_suite_env_is_always_set_explicitly() {
-        let unset = (INSTALLER_SUITE_ENV.to_string(), None);
-        // No scopes configured, and only malformed scopes: removed, never inherited.
+    fn a_state_file_from_the_deferral_era_still_parses() {
         let d = repo(Some(r#"{"enabled":true,"command":"true"}"#));
-        assert_eq!(scope_env(d.path()), vec![unset.clone()]);
-        let d = repo(Some(
-            r#"{"enabled":true,"command":"true","preflightPathScopes":[{"env":"LOOM_BUILD_GATE_INSTALLER_SUITE"}]}"#,
-        ));
-        assert_eq!(scope_env(d.path()), vec![unset.clone()]);
-        // A configured scope that runs: removed exactly once.
-        let d = scoped_repo();
-        commit_file(d.path(), "defaults/x");
-        assert_eq!(scope_env(d.path()), vec![unset]);
+        let head = git_out(d.path(), &["rev-parse", "HEAD"]).unwrap();
+        let old = serde_json::json!({
+            "episode": "e1", "failed_attempts": 0, "timed_out_attempts": 0,
+            "passed_head": head, "deferred_since": 1_000_000,
+        });
+        std::fs::write(state_path(d.path()), old.to_string()).unwrap();
+        assert!(check(d.path()));
     }
 
+    /// #11690: every run that executes the command emits one
+    /// `build_gate.run` span; a run the caps stop emits none.
     #[test]
-    fn untracked_input_counts_as_changed() {
-        let d = scoped_repo();
-        commit_file(d.path(), "loom-daemon/src/foo.rs");
-        std::fs::create_dir_all(d.path().join("defaults")).unwrap();
-        std::fs::write(d.path().join("defaults/new"), "x").unwrap();
-        assert!(matches!(run_in_episode(d.path(), "e1"), Verdict::Failed { .. }));
-    }
-
-    #[test]
-    fn uncommitted_input_counts_as_changed() {
-        let d = scoped_repo();
-        commit_file(d.path(), "defaults/x");
-        git_in(d.path(), &["update-ref", "refs/remotes/origin/main", "HEAD"]);
-        std::fs::write(d.path().join("defaults/x"), "edited").unwrap();
-        assert!(matches!(run_in_episode(d.path(), "e1"), Verdict::Failed { .. }));
-    }
-
-    #[test]
-    fn scope_fails_safe_without_merge_base_or_diff() {
-        // Empty diff: HEAD == origin/main, nothing uncommitted.
-        let d = scoped_repo();
-        assert!(matches!(run_in_episode(d.path(), "e1"), Verdict::Failed { .. }));
-        // No origin/main ref: merge-base cannot be computed.
-        let d = scoped_repo();
-        git_in(d.path(), &["update-ref", "-d", "refs/remotes/origin/main"]);
-        commit_file(d.path(), "loom-daemon/src/foo.rs");
-        assert!(matches!(run_in_episode(d.path(), "e1"), Verdict::Failed { .. }));
-    }
-
-    #[test]
-    fn malformed_scopes_are_dropped() {
-        let d = repo(Some(
-            r#"{"enabled":true,"command":"true","preflightPathScopes":[{"env":"A B","runWhenChanged":["x"]},{"env":"OK"},{"env":"GOOD","runWhenChanged":["d/*"]}]}"#,
-        ));
-        let scopes = path_scopes(d.path());
-        assert_eq!(scopes.len(), 1, "{scopes:?}");
-        assert_eq!(scopes[0].env, "GOOD");
-        assert_eq!(scopes[0].suite, "GOOD");
+    fn each_run_emits_one_build_gate_span_with_its_outcome() {
+        use crate::observability::ops::capture::capture;
+        let outcome = |gate: &str| {
+            let d = repo(Some(gate));
+            let (_, captured) = capture(|| run_in_episode(d.path(), "e1"));
+            assert_eq!(captured.spans.len(), 1, "{gate}");
+            let span = &captured.spans[0];
+            assert_eq!(span.name.as_str(), "build_gate.run");
+            assert_eq!(span.attributes["loom.build_gate.stage"], "preflight");
+            assert_eq!(span.attributes["loom.build_gate.tier"], "fast");
+            assert_eq!(span.attributes["loom.build_gate.attempt"], "1");
+            span.attributes["loom.build_gate.outcome"].clone()
+        };
+        assert_eq!(outcome(r#"{"enabled":true,"command":"true"}"#), "pass");
+        assert_eq!(outcome(r#"{"enabled":true,"command":"exit 2"}"#), "fail");
+        assert_eq!(
+            outcome(r#"{"enabled":true,"command":"exit 2","preflightMaxAttempts":1}"#),
+            "unresolved"
+        );
+        assert_eq!(
+            outcome(r#"{"enabled":true,"command":"sleep 5","timeoutSeconds":1}"#),
+            "timeout"
+        );
+        let d = repo(Some(r#"{"enabled":true,"command":"exit 2","preflightMaxAttempts":1}"#));
+        let _ = run_in_episode(d.path(), "e1");
+        let (v, captured) = capture(|| run_in_episode(d.path(), "e1"));
+        assert!(matches!(v, Verdict::Unresolved { .. }));
+        assert!(captured.spans.is_empty(), "a capped run ran nothing");
+        let d = repo(None);
+        let (_, captured) = capture(|| run_in_episode(d.path(), "e1"));
+        assert!(captured.spans.is_empty(), "no gate, no span");
     }
 
     #[test]

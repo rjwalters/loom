@@ -8,8 +8,8 @@
 //! ```
 //!
 //! Anchored as the full `<!-- … -->` comment form with constrained values, the
-//! same way `require-complexity-marker.sh` and `classify-ac-verification.sh`
-//! anchor theirs (#4840): prose that merely *quotes* the syntax — this doc
+//! same way `classify-ac-verification.sh` anchors its own (the #4840
+//! anchoring rule): prose that merely *quotes* the syntax — this doc
 //! comment, the role prompts, `premise-gate.md` — can never be mistaken for a
 //! live record, because a placeholder like `<verdict>` is not an accepted
 //! value.

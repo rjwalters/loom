@@ -20,11 +20,16 @@
  */
 
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
+import { buildDispatchSweepPayload, type DispatchSweepArgs } from "./sweep-dispatch-payload.js";
 import {
   resolveDaemonIpcTimeoutMs,
   sendDaemonRequest,
   sendDaemonStreamRequest,
 } from "../shared/daemon.js";
+import {
+  DISPATCH_OPTION_PROPERTIES,
+  extractDispatchOptions,
+} from "./sweep-dispatch-options.js";
 
 // ============================================================================
 // Per-call IPC timeouts (issue #3945)
@@ -158,8 +163,8 @@ export interface SweepInfo {
   repo?: string;
   /**
    * True when the work finder admitted this sweep through the host's
-   * `loom:operator-priority` overflow slot (#9244): a starred issue run as the
-   * host's single sweep over the concurrency cap. Absent means false.
+   * overflow slot (#9244): a starred issue run as the host's single sweep
+   * over the concurrency cap. Inert since #11508; absent means false.
    */
   overflow?: boolean;
 }
@@ -496,48 +501,14 @@ export function parseDuration(input: string): number | null {
 // Tool implementations
 // ============================================================================
 
-async function dispatchSweep(args: {
-  kind: SweepKind;
-  idempotency_key?: string;
-  model?: string;
-  effort?: string;
-  depends_on?: number;
-  workspace_root?: string;
-  force?: boolean;
-}): Promise<
+async function dispatchSweep(args: DispatchSweepArgs): Promise<
   | { success: true; result: DispatchResponse["payload"] }
   | { success: false; error: string; runtime_rejection?: RuntimeRejection }
 > {
   try {
     const response = (await sendDaemonRequest({
       type: "DispatchSweep",
-      payload: {
-        kind: args.kind,
-        idempotency_key: args.idempotency_key ?? null,
-        // Issue #3477 (Phase 1): optional model override. `null` (the
-        // default) means the daemon emits NO --model flag and the spawned
-        // child inherits the session/CLI default.
-        model: args.model ?? null,
-        // Issue #3716: optional reasoning-effort override, mirroring `model`.
-        // `null` (the default) means the daemon emits NO --effort flag and
-        // the spawned child inherits the session-default effort.
-        effort: args.effort ?? null,
-        // Issue #3729 (stacked-PR v1): optional single parent issue. `null`
-        // (the default) means the daemon emits NO --depends-on flag and the
-        // child branches off the default branch as usual. When set, the child
-        // branches its worktree/PR off `feature/issue-<depends_on>`.
-        depends_on: args.depends_on ?? null,
-        // Issue #3929: optional target managed-workspace root. `null` (the
-        // default) dispatches into the daemon's default workspace, exactly as
-        // before; a value routes the sweep into that managed repo's registry.
-        workspace_root: args.workspace_root ?? null,
-        // Issue #4317: operator override for the host-distress circuit
-        // breaker (#4235/#4316). Unlike the other optional params above, the
-        // Rust-side field is a bare `bool` (not `Option<bool>`) — sending
-        // `null` here would fail serde deserialization on every dispatch, so
-        // this MUST default to `false`, never `null`/omitted.
-        force: args.force ?? false,
-      },
+      payload: buildDispatchSweepPayload(args),
     }, Math.max(DISPATCH_TIMEOUT_MS, resolveDaemonIpcTimeoutMs()))) as DaemonResponse;
 
     if (response.type === "SweepDispatched") {
@@ -907,18 +878,7 @@ export const sweepTools: Tool[] = [
             "root they intend to target, e.g. `$(git rev-parse " +
             "--show-toplevel)`, rather than relying on omission.",
         },
-        force: {
-          type: "boolean",
-          description:
-            "Optional operator override for the host-distress circuit " +
-            "breaker (issue #4235). A tripped breaker represents sustained, " +
-            "already-observed host distress, so it hard-blocks an explicit " +
-            "dispatch_sweep by default. Set to `true` to say \"I know the " +
-            "host is distressed, dispatch anyway\" and bypass that block. " +
-            "Omit (or pass `false`) to preserve the default refuse-when-" +
-            "tripped behavior — mirrors the CLI's `loom-daemon dispatch <N> " +
-            "--force`.",
-        },
+        ...DISPATCH_OPTION_PROPERTIES,
       },
       required: ["kind"],
     },
@@ -1359,9 +1319,8 @@ export async function handleSweepTool(
         args.depends_on > 0
           ? (args.depends_on as number)
           : undefined;
-      // Issue #4317: defensive extraction — only a literal boolean `true`
-      // forwards as `true` (e.g. the string `"true"` or `1` must NOT).
-      const force = args?.force === true;
+      // #4317 / #11284: defensive extraction of force + runtime/model_profile.
+      const dispatchOptions = extractDispatchOptions(args);
 
       const result = await dispatchSweep({
         kind: normalized,
@@ -1370,7 +1329,7 @@ export async function handleSweepTool(
         effort,
         depends_on: dependsOn,
         workspace_root: extractWorkspaceRoot(args),
-        force,
+        ...dispatchOptions,
       });
       if (!result.success) {
         // Issue #4494: a capability refusal renders the structured fields as

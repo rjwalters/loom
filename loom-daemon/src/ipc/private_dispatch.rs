@@ -12,6 +12,9 @@ pub(super) async fn dispatch_sweep_nonblocking(
     depends_on: Option<u32>,
     workspace_root: Option<String>,
     force: bool,
+    runtime: Option<String>,
+    model_profile: Option<String>,
+    origin: crate::sweep_registry::DispatchOrigin,
 ) -> Response {
     // Host-distress circuit breaker (#4235) — unchanged from the previous
     // synchronous arm; a pure, lock-free global snapshot read.
@@ -57,6 +60,36 @@ pub(super) async fn dispatch_sweep_nonblocking(
     ) {
         Ok(target) => target,
         Err(response) => return response,
+    };
+
+    // Per-dispatch runtime/modelProfile (#11284): validate with NO side
+    // effects; a refused tap never reaches the guards. The record is only
+    // saved/cleared once the dispatch has been accepted (see commit below), so
+    // a guard-rejected duplicate cannot disturb an in-flight sweep's record.
+    let (tap_root, tap_plan) = {
+        let repo_root = target
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .config()
+            .workspace_root
+            .clone();
+        let (runtime, model_profile) = (runtime.clone(), model_profile.clone());
+        let tap_kind = kind.clone();
+        let validate_root = repo_root.clone();
+        match tokio::task::spawn_blocking(move || {
+            crate::dispatch_tap::validate_request(
+                &validate_root,
+                &tap_kind,
+                runtime.as_deref(),
+                model_profile.as_deref(),
+            )
+        })
+        .await
+        {
+            Ok(Ok(plan)) => (repo_root, plan),
+            Ok(Err(response)) => return *response,
+            Err(error) => return dispatch_error_response(&kind, error.into()),
+        }
     };
 
     let prepare_target = target.clone();
@@ -121,13 +154,30 @@ pub(super) async fn dispatch_sweep_nonblocking(
             depends_on,
             None,
             prepared_launch,
+            origin,
         )
     };
 
     let prepared = match begin_outcome {
         Err(e) => return dispatch_error_response(&kind, e),
-        Ok(BeginIssueDispatch::Done(result)) => return dispatch_result_to_response(&kind, result),
+        Ok(BeginIssueDispatch::Done(result)) => {
+            // An idempotency hit (`was_new == false`) is the in-flight sweep
+            // itself: leave its record alone. A refusal or spawn failure is an
+            // `Err`: nothing is recorded.
+            if matches!(&result, Ok(outcome) if outcome.was_new) {
+                if let Err(response) = tap_plan.commit(&tap_root) {
+                    return *response;
+                }
+            }
+            return dispatch_result_to_response(&kind, result);
+        }
         Ok(BeginIssueDispatch::Spawned(prepared)) => prepared,
+    };
+    // Guards passed and the child is spawned: record (or clear) the tap now,
+    // before the worker's phase runner can read it.
+    let tap_rollback = match tap_plan.commit(&tap_root) {
+        Ok(rollback) => rollback,
+        Err(response) => return *response,
     };
 
     // Phase 2 (UNLOCKED): poll the child for its account-selection log line.
@@ -169,5 +219,10 @@ pub(super) async fn dispatch_sweep_nonblocking(
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         sr.finish_issue_dispatch(*prepared, token_name, runtime, immediate_preflight_death)
     };
+    if result.is_err() {
+        if let Some(rollback) = tap_rollback {
+            rollback.restore();
+        }
+    }
     dispatch_result_to_response(&kind, result)
 }

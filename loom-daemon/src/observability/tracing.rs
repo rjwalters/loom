@@ -7,9 +7,6 @@ use std::process::Command;
 
 #[must_use]
 pub fn enabled(root: &Path) -> bool {
-    if !cfg!(feature = "otlp") {
-        return false;
-    }
     let config = super::read_config(root);
     // Tracing rides the OTLP sink (#4858/#8756): enabled when at least one
     // CONFIGURED exporter is otlp and resolves a valid endpoint of its own.

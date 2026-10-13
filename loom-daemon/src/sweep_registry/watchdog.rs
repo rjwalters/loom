@@ -1120,12 +1120,13 @@ impl SweepRegistry {
                         continue;
                     }
 
-                    match self.dispatch(
+                    match self.dispatch_from(
                         &SweepKind::Issue(issue),
                         idempotency_key,
                         model.as_deref(),
                         effort.as_deref(),
                         depends_on,
+                        DispatchOrigin::Watchdog,
                     ) {
                         Ok(outcome) => {
                             restarts += 1;
@@ -1867,12 +1868,13 @@ impl SweepRegistry {
                     // it is released here rather than left to wedge dispatch.
                     let _ = self.release_lock_owned(issue, &watchdog_lock_id);
 
-                    match self.dispatch(
+                    match self.dispatch_from(
                         &SweepKind::Issue(issue),
                         None,
                         model.as_deref(),
                         effort.as_deref(),
                         depends_on,
+                        DispatchOrigin::Watchdog,
                     ) {
                         Ok(outcome) => {
                             recovered += 1;
@@ -2073,12 +2075,13 @@ impl SweepRegistry {
                         continue;
                     }
 
-                    match self.dispatch(
+                    match self.dispatch_from(
                         &SweepKind::Issue(issue),
                         idempotency_key,
                         model.as_deref(),
                         effort.as_deref(),
                         depends_on,
+                        DispatchOrigin::Watchdog,
                     ) {
                         Ok(outcome) => {
                             restarts += 1;
@@ -2130,7 +2133,7 @@ impl SweepRegistry {
                                      built PR reaches Judge/Doctor -> Merge instead of being \
                                      stranded (#7649)."
                                 );
-                                match self.dispatch(
+                                match self.dispatch_from(
                                     &SweepKind::PrSet(vec![pr]),
                                     // Deliberately NOT the captured Issue-kind
                                     // `idempotency_key`: `PrSet` is a distinct
@@ -2146,6 +2149,7 @@ impl SweepRegistry {
                                     // dispatch regardless; pass None for
                                     // clarity at the call site.
                                     None,
+                                    DispatchOrigin::Watchdog,
                                 ) {
                                     Ok(outcome) => {
                                         restarts += 1;

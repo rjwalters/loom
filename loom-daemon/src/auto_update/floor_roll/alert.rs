@@ -141,6 +141,43 @@ impl FloorState {
     }
 }
 
+/// The loom-ui incident for an unsatisfiable floor (#11295): `open` on every
+/// tick the ERROR line is logged (start, change, reminder; loom-ui treats a
+/// repeat as idempotent), `resolved` on the first tick after an alerted stall
+/// is gone. `None` when nothing changed.
+#[must_use]
+pub fn loom_ui_alert(
+    stall: Option<&FloorStallReport>,
+    alerted: bool,
+    was_alerted: bool,
+) -> Option<crate::loom_ui_alerts::Alert> {
+    use crate::loom_ui_alerts::{Alert, Severity, State};
+    const RULE: &str = "fleet.floor-unsatisfiable";
+    match stall {
+        Some(stall) if alerted => Some(
+            Alert::new(
+                RULE,
+                "loom_min_version",
+                format!(
+                    "Fleet floor {} is above every release (newest {}): this host cannot roll",
+                    stall.floor, stall.newest
+                ),
+                Severity::Warning,
+                State::Open,
+            )
+            .with_detail(stall.note()),
+        ),
+        None if was_alerted => Some(Alert::new(
+            RULE,
+            "loom_min_version",
+            "The fleet floor can be met again",
+            Severity::Warning,
+            State::Resolved,
+        )),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -298,5 +335,22 @@ mod tests {
             assert!(other.stall().is_none(), "{floor:?} {running}");
             assert_eq!(other.stall_state(), None, "{floor:?} {running}");
         }
+    }
+
+    #[test]
+    fn loom_ui_opens_when_alerted_and_resolves_when_the_stall_clears() {
+        use crate::loom_ui_alerts::State;
+        let mut state = stalled();
+        let was = state.stall_declared_at().is_some();
+        let alerted = state.alert_due(t0(), REMINDER);
+        let open = loom_ui_alert(state.stall(), alerted, was).unwrap();
+        assert_eq!((open.rule.as_str(), open.state), ("fleet.floor-unsatisfiable", State::Open));
+        // A standing stall between reminders posts nothing.
+        let was = state.stall_declared_at().is_some();
+        let alerted = state.alert_due(t0() + mins(15), REMINDER);
+        assert!(loom_ui_alert(state.stall(), alerted, was).is_none());
+        // Cleared after it was alerted: resolve once.
+        assert_eq!(loom_ui_alert(None, false, true).map(|a| a.state), Some(State::Resolved));
+        assert!(loom_ui_alert(None, false, false).is_none());
     }
 }

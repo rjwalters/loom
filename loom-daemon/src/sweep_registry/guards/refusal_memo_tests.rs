@@ -203,3 +203,51 @@ fn a_peer_backoff_does_not_refuse_a_resume() {
     }
     std::env::remove_var("LOOM_REPO");
 }
+
+/// #8865: the pre-filter's verified listing verdicts feed the memo. `Open`
+/// records or refreshes, `NoneOpen` removes, `ProbeFailed` changes nothing,
+/// and an entry verified after the listing read began is left alone.
+#[test]
+#[serial]
+fn listing_verdicts_fold_into_the_memo() {
+    std::env::remove_var(OPEN_PR_MEMO_ENABLE_ENV);
+    let dir = tempdir().unwrap();
+    let (reg, log) = open_pr_guard_registry(dir.path(), "", 0, true);
+    let read = Utc::now();
+    let earlier = read - chrono::Duration::hours(2);
+    let later = read + chrono::Duration::seconds(5);
+    let entry = |issue| reg.open_pr_memo_entry(issue).map(|m| (m.pr, m.verified_at));
+
+    reg.seed_open_pr_memo(2, 20, earlier); // refreshed, to a different PR
+    reg.seed_open_pr_memo(3, 30, earlier); // its PR is gone
+    reg.seed_open_pr_memo(4, 40, earlier); // no verdict
+    reg.seed_open_pr_memo(5, 50, later); // written after the read began
+    reg.seed_open_pr_memo(6, 60, later);
+    reg.fold_listing_verdicts(
+        read,
+        &[
+            (1, OpenPrProbe::Open(10)),
+            (2, OpenPrProbe::Open(21)),
+            (3, OpenPrProbe::NoneOpen),
+            (4, OpenPrProbe::ProbeFailed),
+            (5, OpenPrProbe::NoneOpen),
+            (6, OpenPrProbe::Open(61)),
+            (7, OpenPrProbe::NoneOpen),
+        ],
+    );
+    assert_eq!(entry(1), Some((10, read)));
+    assert_eq!(entry(2), Some((21, read)));
+    assert_eq!(entry(3), None);
+    assert_eq!(entry(4), Some((40, earlier)));
+    assert_eq!(entry(5), Some((50, later)), "newer evidence survives an older absence");
+    assert_eq!(entry(6), Some((60, later)));
+    assert_eq!(entry(7), None);
+    assert_eq!(gh_calls(&log), 0, "folding never calls the forge");
+
+    // The kill switch takes this writer out too.
+    std::env::set_var(OPEN_PR_MEMO_ENABLE_ENV, "0");
+    reg.fold_listing_verdicts(read, &[(8, OpenPrProbe::Open(80)), (1, OpenPrProbe::NoneOpen)]);
+    std::env::remove_var(OPEN_PR_MEMO_ENABLE_ENV);
+    assert_eq!(entry(8), None);
+    assert_eq!(entry(1), Some((10, read)));
+}

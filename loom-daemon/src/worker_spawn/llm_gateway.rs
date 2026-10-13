@@ -303,7 +303,9 @@ fn plan_with(
              the gateway",
         ));
     }
-    if selection.credential_proxy.is_some() {
+    // A declared credentialProxy is inert while the proxy switch is off
+    // (#11300): only an ARMED proxy re-points the endpoint and collides.
+    if selection.credential_proxy.is_some() && super::egress_proxy::enabled_with(config, env) {
         return Err(refuse(
             "it also declares credentialProxy, which re-points the same provider endpoint",
         ));

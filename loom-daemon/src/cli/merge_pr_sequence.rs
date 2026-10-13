@@ -136,10 +136,13 @@ impl SequencePlanArgs {
                 );
             }
         }
+        // #9771: `groups` holds only the edges the pass would write; the two
+        // counters are the disjoint sets it suppressed (never subtract them).
         println!(
-            "would apply {} edge(s); {} already satisfied",
-            report.groups.iter().map(|g| g.edges.len()).sum::<usize>() - report.already_planned,
-            report.already_planned
+            "would apply {} edge(s); {} already satisfied; {} skipped (held)",
+            report.groups.iter().map(|g| g.edges.len()).sum::<usize>(),
+            report.already_planned,
+            report.skipped_held
         );
         Ok(())
     }

@@ -108,9 +108,8 @@ struct LabelRef {
 }
 
 /// Enumerate `root`'s PRs (`repo`, else whatever `gh` resolves) and fetch
-/// each one's timeline, newest first. Shared by `pr-latency` itself and by
-/// `eta backfill` (#9325), which seeds the ETA stage-sample journal from the
-/// same forge-derived histories rather than re-deriving them.
+/// each one's timeline, newest first. Shared by `pr-latency` and its
+/// callers.
 pub(crate) fn fetch_histories(
     root: &Path,
     repo: Option<&str>,
@@ -123,7 +122,7 @@ pub(crate) fn fetch_histories(
 
 /// [`fetch_histories`], narrowed by a `gh pr list --search` expression.
 ///
-/// The incremental half of `eta fleet refresh` (#9343): with
+/// The incremental half of the former fleet refresh (#9343): with
 /// `search = "updated:>=<cursor>"` the enumeration covers only PRs that moved
 /// since the cached snapshot was built, so the per-PR timeline reads — the
 /// expensive part — are paid for a handful of PRs instead of the whole repo.

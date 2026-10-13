@@ -104,6 +104,13 @@ partially-migrated repo work correctly).
 | `safehouse.*` (`enabled`, `socket`, `room`, `persona`) | object | Project (policy) **or** Local (host socket) | Optional daemon-side fleet-comms narration (#3997). Whether a repo narrates at all (`enabled`/`persona`/`room`) is a project-shared policy; the `socket` path (and often `enabled`) is a natural `.loom-local` host override since `safehoused` runs per-host. Resolved by `loom-daemon/src/safehouse.rs` with **env > config > default(disabled)**; see [`.loom/docs/safehouse.md`](../../.loom/docs/safehouse.md). |
 | `observability.ingestKeyFile` | string | Local (`.loom-local/local.json`) | A per-host filesystem path to that host's telemetry ingest credential — inherently host-specific the same way `safehouse.socket` is. `observability.enabled`/`.endpoint`/`.batchSize`/`.flushIntervalSecs`/`.queueCapacity` describe whether/how the repo reports telemetry regardless of who runs it and stay Project. Resolved by `loom-daemon/src/observability/mod.rs` with **env > config > `$HOME`-relative default** — a host that never overrides it still resolves to `$HOME/.loom/observability/ingest.key`, so deleting a stray committed value (rather than routing it through `.loom-local/`) is often the correct fix; see #5354, #5464, #6499, #6504. |
 
+> **Amended by #11441:** the `autonomous.*`, `safehouse.*` and `observability.*`
+> rows above (other than `observability.ingestKeyFile`) are **fleet policy** and
+> are owned by fleet-gitops (tier 1), not by this repo tier. A tracked repo tier
+> may carry them only via a reasoned entry in `.loom/fleet-policy-allow.json`.
+> The authoritative classification is `.loom/docs/fleet-config-lifecycle.md`
+> section "Where each kind of key lives".
+
 `.loom-local/local.json` has no fixed schema in this issue beyond "same shape
 as `.loom-project/project.json`, host-scoped override" — the epic explicitly
 defers ".loom-local/ runtime-state relocation" to Phase 3+; this issue only

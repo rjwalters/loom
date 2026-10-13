@@ -123,59 +123,6 @@ pub const DEFAULT_APPLIES_FROM: usize = 1;
 const CONTROL_LOCK: &str = ".ceiling.lock";
 
 // ---------------------------------------------------------------------------
-// Complexity eligibility
-// ---------------------------------------------------------------------------
-
-/// The Curator's `<!-- loom:complexity=<tier> -->` strata, ordered.
-///
-/// The optional eligibility filter is what keeps *low-value* work off the
-/// metered tap entirely: a mechanical one-line fix is not worth paying
-/// per-token for when the free tiers are down, while a complex change may well
-/// be.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum ComplexityTier {
-    Mechanical,
-    Routine,
-    Complex,
-}
-
-impl ComplexityTier {
-    /// The vocabulary `require-complexity-marker.sh` enforces. Unknown text is
-    /// `None` — callers treat that as "unmarked", never as an error, because a
-    /// marker is a Curator convention and dispatch must not fail on its
-    /// absence.
-    #[must_use]
-    pub fn parse(raw: &str) -> Option<Self> {
-        match raw.trim() {
-            "mechanical" => Some(Self::Mechanical),
-            "routine" => Some(Self::Routine),
-            "complex" => Some(Self::Complex),
-            _ => None,
-        }
-    }
-
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Mechanical => "mechanical",
-            Self::Routine => "routine",
-            Self::Complex => "complex",
-        }
-    }
-
-    /// The tier an unmarked dispatch is treated as: `routine`, the same
-    /// default the rest of the daemon applies to a missing marker (see
-    /// `work_finder`'s `complexity.unwrap_or("routine")`). Deliberately *not*
-    /// the lowest tier — an unmarked issue is ordinary work, not proven
-    /// low-value, and treating it as `mechanical` would silently exclude most
-    /// of the queue from the backstop the moment a filter is configured.
-    #[must_use]
-    pub fn of(complexity: Option<&str>) -> Self {
-        complexity.and_then(Self::parse).unwrap_or(Self::Routine)
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
 
@@ -191,9 +138,6 @@ pub struct BackstopCeiling {
     /// subscription (a Codex seat) raises this so the ceiling starts at the
     /// tier that actually costs per token.
     pub applies_from: usize,
-    /// Least complexity tier allowed to reach a governed tap. `None` is "every
-    /// tier is eligible".
-    pub min_complexity: Option<ComplexityTier>,
 }
 
 impl BackstopCeiling {
@@ -201,7 +145,7 @@ impl BackstopCeiling {
     /// as absent so the no-ceiling fast path stays byte-identical.
     #[must_use]
     fn is_inert(&self) -> bool {
-        self.max_concurrent.is_none() && self.min_complexity.is_none()
+        self.max_concurrent.is_none()
     }
 
     /// Does this ceiling govern `tier`?
@@ -236,7 +180,6 @@ pub fn configured(config: &Value) -> Result<Option<BackstopCeiling>, String> {
         None | Some(Value::Null) => BackstopCeiling {
             max_concurrent: None,
             applies_from: DEFAULT_APPLIES_FROM,
-            min_complexity: None,
         },
         Some(value) => parse(value)?,
     };
@@ -247,7 +190,7 @@ pub fn configured(config: &Value) -> Result<Option<BackstopCeiling>, String> {
 }
 
 const PATH: &str = "runtimes.backstopCeiling";
-const KNOWN_KEYS: [&str; 3] = ["maxConcurrent", "appliesFrom", "minComplexity"];
+const KNOWN_KEYS: [&str; 2] = ["maxConcurrent", "appliesFrom"];
 
 fn parse(value: &Value) -> Result<BackstopCeiling, String> {
     let Some(map) = value.as_object() else {
@@ -298,23 +241,9 @@ fn parse(value: &Value) -> Result<BackstopCeiling, String> {
             tier
         }
     };
-    let min_complexity = match map.get("minComplexity") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(raw)) => Some(ComplexityTier::parse(raw).ok_or_else(|| {
-            format!(
-                "{PATH}.minComplexity must be one of mechanical, routine, complex (got {raw:?})"
-            )
-        })?),
-        Some(_) => {
-            return Err(format!(
-                "{PATH}.minComplexity must be a string (mechanical, routine, complex)"
-            ))
-        }
-    };
     Ok(BackstopCeiling {
         max_concurrent,
         applies_from,
-        min_complexity,
     })
 }
 
@@ -534,36 +463,13 @@ fn refuse(skip: CeilingSkip, detail: String) -> Verdict {
 
 /// Ask the ceiling whether this dispatch may take a governed (backstop) tap.
 ///
-/// `complexity` is the issue's `<!-- loom:complexity=<tier> -->` stratum, as
-/// dispatch already carries it; `None` is treated as `routine` (see
-/// [`ComplexityTier::of`]).
-///
 /// Counting and reserving happen under a `mkdir` control lock so two
 /// concurrent dispatches on the same host cannot both read `live == limit - 1`
 /// and both admit. An [`Intent::Probe`] counts **outside** the lock and never
 /// writes: it holds nothing, so there is nothing for a peer to race it for, and
 /// its answer is a snapshot by nature.
 #[must_use]
-pub fn admit(
-    ceiling: &BackstopCeiling,
-    role: &str,
-    tap: &Tap,
-    complexity: Option<&str>,
-    intent: Intent,
-) -> Verdict {
-    if let Some(minimum) = ceiling.min_complexity {
-        let tier = ComplexityTier::of(complexity);
-        if tier < minimum {
-            return refuse(
-                CeilingSkip::Ineligible,
-                format!(
-                    "{} work is below the metered tier's minimum complexity ({})",
-                    tier.as_str(),
-                    minimum.as_str()
-                ),
-            );
-        }
-    }
+pub fn admit(ceiling: &BackstopCeiling, role: &str, tap: &Tap, intent: Intent) -> Verdict {
     let Some(limit) = ceiling.max_concurrent else {
         return Verdict::Admitted(None);
     };

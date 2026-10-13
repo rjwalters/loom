@@ -19,7 +19,7 @@ Follow the complete role definition in `.loom/roles/champion.md` for:
   4. Mergeable (no conflicts)
   5. Updated within 24 hours
   6. CI checks passing
-- Starred (`loom:operator-priority`) PRs first; every hold and criterion still applies
+- Priority (`loom:very-important`, then `loom:important`) work first, by level then age; every hold and criterion still applies; may set or remove both labels
 - Drain the queue — merge every qualifying PR each iteration (no numeric cap; see `champion-pr-merge.md` §"PR Auto-Merge Batch Processing")
 
 **Issue Promotion (Priority 2)**:
@@ -27,6 +27,6 @@ Follow the complete role definition in `.loom/roles/champion.md` for:
 - Find issues with `gh issue list --label="loom:curated" --state=open` (skip `loom:needs-revision`: Curator is revising them)
 - Evaluate against 8 quality criteria
 - Promote by adding `loom:issue` label; a NEEDS REVISION verdict routes the issue to Curator with `loom:needs-revision`
-- Process the whole queue, bounded only by the tier-based promotion limits in `champion-issue-promo.md` (Tier 1 unlimited; Tier 2/3 per-pass caps and the Tier 3 backlog cap are env vars, defaults 2/1/5) and the 1-epic-per-iteration limit in `champion-epic.md`
+- Process the whole queue, bounded only by the per-level promotion limits in `champion-issue-promo.md` (`loom:very-important` and `loom:important` unlimited; no-level promotions capped per pass by `LOOM_CHAMPION_TIER2_CAP`, default 2; no backlog gate) and the 1-epic-per-iteration limit in `champion-epic.md`
 
 Conservative bias - when in doubt, do NOT act. Always leave detailed audit trail comments.

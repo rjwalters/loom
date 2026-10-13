@@ -23,6 +23,7 @@ fn item(number: u32, labels: &[&str]) -> RestIssue {
         author: Some("someone".into()),
         author_association: None,
         is_pull_request: false,
+        open_sub_issues: None,
     }
 }
 
@@ -36,14 +37,7 @@ fn repo(visibility: RepoVisibility) -> QueueRepoRef {
 #[test]
 fn a_blocked_issue_without_loom_issue_becomes_an_unranked_blocked_row() {
     let listing = vec![
-        item(
-            5,
-            &[
-                "loom:blocked",
-                "tier:goal-advancing",
-                "loom:operator-priority",
-            ],
-        ),
+        item(5, &["loom:blocked", "loom:important"]),
         // Already in the ready listing: the work finder has its row.
         item(6, &["loom:blocked", "loom:issue"]),
         // A PR in the REST issues listing.
@@ -62,9 +56,9 @@ fn a_blocked_issue_without_loom_issue_becomes_an_unranked_blocked_row() {
     assert_eq!(row.disposition, QueueDisposition::LabelledBlocked);
     assert_eq!(row.state, "blocked");
     assert_eq!(row.reason, "blocked: labelled loom:blocked");
-    // Starred is reported; `urgent` is always false since #9244.
-    assert!(row.operator_priority && !row.urgent);
-    assert_eq!(row.tier.as_deref(), Some("tier:goal-advancing"));
+    // The level is reported (#11510); `urgent` is always false since #9244.
+    assert_eq!(row.level, crate::priority_pick::Level::Important);
+    assert!(!row.urgent);
     assert_eq!(row.detail, None);
     let wire = serde_json::to_value(row).unwrap();
     assert_eq!(wire["disposition"], "labelled_blocked");
@@ -202,8 +196,8 @@ fn loom_repo_does_not_redirect_the_captains_listing() {
         &gh,
         checkout.path(),
         Some("acme/app"),
-        "loom:operator-priority",
-        "star_liveness",
+        "loom:blocked",
+        "queue_blocked",
     );
     std::env::remove_var("LOOM_REPO");
     result.unwrap();

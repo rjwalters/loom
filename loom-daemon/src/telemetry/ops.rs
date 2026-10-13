@@ -51,7 +51,6 @@ pub const OPS_METRIC_LABEL_KEYS: &[&str] = &[
     // `(account, owner)`, so it adds no series).
     "installation",
     "outcome",
-    "heuristic",
     "kind",
     "repo",
     // #10455: `loom.codex_session.state` (the session container's name).
@@ -72,6 +71,8 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.dispatch.dispatched",
     "loom.dispatch.errors",
     "loom.dispatch.max_concurrent",
+    // #11649: a held tick's distinct halt causes, comma-joined.
+    "loom.dispatch.halt_causes",
     // ---- Telemetry mega PR A (Issues #8908, #8931) ----------------------
     // `loom.runtime.usage` (#8908): one execution's exact token breakdown.
     "loom.tokens.input",
@@ -150,6 +151,29 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "forge.read.owner",
     "forge.read.resource",
     "forge.read.until",
+    // `loom.egress.request` spans (#11300): one proxied provider request.
+    // Counts, classified codes and ids only, never a body or credential.
+    "loom.egress.seat",
+    "loom.egress.tap",
+    "loom.egress.profile",
+    "loom.egress.launch_id",
+    "loom.egress.status",
+    "loom.egress.latency_ms",
+    "loom.egress.ttft_ms",
+    "loom.egress.error_code",
+    "loom.egress.stream",
+    // `guard.cargo_target_dir.denied` spans (#11582): the forbidden root by
+    // name (`/tmp`, `$TMPDIR`, `~/.cache`, `~`, `.loom/target-*`) and where the
+    // value came from. Never the path or the command.
+    "loom.guard.root",
+    "loom.guard.source",
+    // `build_gate.run` spans (#11690): one host-side run of
+    // `buildGate.command` — stage, tier, outcome, duration and attempt.
+    "loom.build_gate.stage",
+    "loom.build_gate.tier",
+    "loom.build_gate.outcome",
+    "loom.build_gate.duration_ms",
+    "loom.build_gate.attempt",
 ];
 
 /// Longest label value kept, in bytes.
@@ -258,6 +282,19 @@ pub enum MetricName {
     /// Seconds since the previous sample the pool read as exhausted.
     #[serde(rename = "loom.pool.exhausted_seconds")]
     PoolExhaustedSeconds,
+    /// One pool account's state (Issue #11286): `1` for the state it is in,
+    /// `0` otherwise, labelled `provider`, `account` and `state` =
+    /// `usable`/`exhausted`.
+    #[serde(rename = "loom.pool.account_state")]
+    PoolAccountState,
+    /// An API-key seat's declared plan token allowance per window (Issue
+    /// #11286), labelled `provider` + `account`. Only where declared.
+    #[serde(rename = "loom.pool.plan_token_limit")]
+    PoolPlanTokenLimit,
+    /// An API-key seat's declared plan window in seconds (Issue #11286),
+    /// labelled `provider` + `account`. Only where declared.
+    #[serde(rename = "loom.pool.plan_window_seconds")]
+    PoolPlanWindowSeconds,
     // ---- Reason-classified account marks (Issue #8931) -------------------
     /// Pool accounts marked out of selection since the previous point,
     /// labelled `provider` and `reason` (a closed set — see
@@ -333,6 +370,23 @@ pub enum MetricName {
     /// trailing window.
     #[serde(rename = "loom.merge.time_to_land_max")]
     MergeTimeToLandMax,
+    // ---- Egress proxy observe mode (Issue #11300) -------------------------
+    /// Provider requests the egress proxy observed since the previous point,
+    /// labelled `provider`, `account` (the seat), `model`, `role`, `outcome`
+    /// (`ok` / `error`) and `reason` (a classified code on an error).
+    #[serde(rename = "loom.egress.requests")]
+    EgressRequests,
+    /// Tokens the proxy read off provider responses, labelled as
+    /// `loom.egress.requests` plus `kind` = `input` / `output` / `cache_read`
+    /// / `cache_write`.
+    #[serde(rename = "loom.egress.tokens")]
+    EgressTokens,
+    /// Summed request latency (send to last byte), seconds.
+    #[serde(rename = "loom.egress.latency")]
+    EgressLatency,
+    /// Summed time to first response byte, seconds.
+    #[serde(rename = "loom.egress.ttft")]
+    EgressTtft,
     // ---- Long-running task liveness (Issue #10414) -----------------------
     /// 1 while a long-running daemon loop beat within its staleness window,
     /// 0 once it went silent or marked itself dead, labelled `task`
@@ -361,49 +415,6 @@ pub enum MetricName {
     /// ratio.
     #[serde(rename = "loom.daemon.ipc.status_builds")]
     DaemonIpcStatusBuilds,
-    // ---- ETA pipeline health (Issue #10391) ------------------------------
-    /// Live ETA items on this host, by kind, heuristic and answered/refusal reason.
-    #[serde(rename = "loom.eta.health.items")]
-    EtaHealthItems,
-    /// 1 when a fit coefficient file is loaded, 0 when none is.
-    #[serde(rename = "loom.eta.health.fit_loaded")]
-    EtaHealthFitLoaded,
-    /// Age of the loaded fit coefficient file's cutoff.
-    #[serde(rename = "loom.eta.health.fit_age_seconds")]
-    EtaHealthFitAgeSeconds,
-    /// Time since the last fit check, by its outcome or skip reason.
-    #[serde(rename = "loom.eta.health.fit_check_age_seconds")]
-    EtaHealthFitCheckAgeSeconds,
-    /// Age of each cached fleet snapshot, by repo.
-    #[serde(rename = "loom.eta.health.snapshot_age_seconds")]
-    EtaHealthSnapshotAgeSeconds,
-    /// 1 for the fleet refresh gate state this host is in.
-    #[serde(rename = "loom.eta.health.refresh_gate")]
-    EtaHealthRefreshGate,
-    /// Time since the last fleet refresh tick.
-    #[serde(rename = "loom.eta.health.refresh_last_cycle_age_seconds")]
-    EtaHealthRefreshLastCycleAgeSeconds,
-    /// Repos per stop reason in the last refreshing tick.
-    #[serde(rename = "loom.eta.health.refresh_repos")]
-    EtaHealthRefreshRepos,
-    /// Rows in the last built eta.snapshot.
-    #[serde(rename = "loom.eta.health.snapshot_rows")]
-    EtaHealthSnapshotRows,
-    /// Rows with non-empty alternates in the last built eta.snapshot.
-    #[serde(rename = "loom.eta.health.snapshot_alternates_rows")]
-    EtaHealthSnapshotAlternatesRows,
-    /// Rows the last built eta.snapshot dropped at its cap (#10928).
-    #[serde(rename = "loom.eta.health.snapshot_rows_truncated")]
-    EtaHealthSnapshotRowsTruncated,
-    /// Rows the last built eta.snapshot sent without their alternates (#10928).
-    #[serde(rename = "loom.eta.health.snapshot_alternates_truncated")]
-    EtaHealthSnapshotAlternatesTruncated,
-    /// Compact JSON size of the last built eta.snapshot (#10928).
-    #[serde(rename = "loom.eta.health.snapshot_bytes")]
-    EtaHealthSnapshotBytes,
-    /// Pending estimates evicted by the MAX_PENDING cap since process start.
-    #[serde(rename = "loom.eta.health.pending_over_cap")]
-    EtaHealthPendingOverCap,
     // ---- Codex session containers (Issue #10455) ---------------------------
     /// Per session-managed Codex account, one point per `state` ∈ `running`,
     /// `stopped`, `restarting`, `missing`, `stale_mounts`: 1 for the container's current
@@ -469,6 +480,9 @@ impl MetricName {
             Self::PoolExhausted => "loom.pool.exhausted",
             Self::PoolExhaustions => "loom.pool.exhaustions",
             Self::PoolExhaustedSeconds => "loom.pool.exhausted_seconds",
+            Self::PoolAccountState => "loom.pool.account_state",
+            Self::PoolPlanTokenLimit => "loom.pool.plan_token_limit",
+            Self::PoolPlanWindowSeconds => "loom.pool.plan_window_seconds",
             Self::PoolAccountMarks => "loom.pool.account_marks",
             Self::DispatchSlotTurnaround => "loom.dispatch.slot_turnaround",
             Self::DispatchSlotTurnaroundSamples => "loom.dispatch.slot_turnaround.samples",
@@ -487,30 +501,16 @@ impl MetricName {
             Self::MergeRedatePrs => "loom.merge.redate_prs",
             Self::MergeRedatesMax => "loom.merge.redates_max",
             Self::MergeTimeToLandMax => "loom.merge.time_to_land_max",
+            Self::EgressRequests => "loom.egress.requests",
+            Self::EgressTokens => "loom.egress.tokens",
+            Self::EgressLatency => "loom.egress.latency",
+            Self::EgressTtft => "loom.egress.ttft",
             Self::DaemonTaskAlive => "loom.daemon.task_alive",
             Self::DaemonTaskFaults => "loom.daemon.task_faults",
             Self::DaemonIpcLatencyMax => "loom.daemon.ipc.latency_max",
             Self::DaemonIpcLatency => "loom.daemon.ipc.latency",
             Self::DaemonIpcRequests => "loom.daemon.ipc.requests",
             Self::DaemonIpcStatusBuilds => "loom.daemon.ipc.status_builds",
-            Self::EtaHealthItems => "loom.eta.health.items",
-            Self::EtaHealthFitLoaded => "loom.eta.health.fit_loaded",
-            Self::EtaHealthFitAgeSeconds => "loom.eta.health.fit_age_seconds",
-            Self::EtaHealthFitCheckAgeSeconds => "loom.eta.health.fit_check_age_seconds",
-            Self::EtaHealthSnapshotAgeSeconds => "loom.eta.health.snapshot_age_seconds",
-            Self::EtaHealthRefreshGate => "loom.eta.health.refresh_gate",
-            Self::EtaHealthRefreshLastCycleAgeSeconds => {
-                "loom.eta.health.refresh_last_cycle_age_seconds"
-            }
-            Self::EtaHealthRefreshRepos => "loom.eta.health.refresh_repos",
-            Self::EtaHealthSnapshotRows => "loom.eta.health.snapshot_rows",
-            Self::EtaHealthSnapshotAlternatesRows => "loom.eta.health.snapshot_alternates_rows",
-            Self::EtaHealthSnapshotRowsTruncated => "loom.eta.health.snapshot_rows_truncated",
-            Self::EtaHealthSnapshotAlternatesTruncated => {
-                "loom.eta.health.snapshot_alternates_truncated"
-            }
-            Self::EtaHealthSnapshotBytes => "loom.eta.health.snapshot_bytes",
-            Self::EtaHealthPendingOverCap => "loom.eta.health.pending_over_cap",
             Self::CodexSessionState => "loom.codex_session.state",
             Self::CodexSessionRecord => "loom.codex_session.record",
             Self::CodexSessionMountDrift => "loom.codex_session.mount_drift",
@@ -544,6 +544,10 @@ impl MetricName {
             | Self::GithubRateLimitBreakerSkips
             | Self::ForgeCalls
             | Self::ForgeFacadeEvents
+            | Self::EgressRequests
+            | Self::EgressTokens
+            | Self::EgressLatency
+            | Self::EgressTtft
             | Self::DaemonTaskFaults
             | Self::DaemonIpcLatency
             | Self::DaemonIpcRequests
@@ -570,8 +574,9 @@ impl MetricName {
             | Self::LlmTokensCacheWrite => "{token}",
             Self::LlmRequests => "{request}",
             Self::PoolAccounts | Self::PoolExhaustions | Self::PoolAccountMarks => "{account}",
-            Self::PoolExhausted => "1",
-            Self::PoolExhaustedSeconds => "s",
+            Self::PoolExhausted | Self::PoolAccountState => "1",
+            Self::PoolExhaustedSeconds | Self::PoolPlanWindowSeconds => "s",
+            Self::PoolPlanTokenLimit => "{token}",
             Self::QueueOldestWait | Self::QueueDispatchWait => "s",
             Self::DispatchSlotTurnaround
             | Self::DispatchIdleSlotSeconds
@@ -587,25 +592,14 @@ impl MetricName {
             Self::MergeRedatePrs => "{pull_request}",
             Self::MergeRedatesMax => "{redate}",
             Self::MergeTimeToLandMax => "s",
+            Self::EgressRequests => "{request}",
+            Self::EgressTokens => "{token}",
+            Self::EgressLatency | Self::EgressTtft => "s",
             Self::DaemonTaskAlive => "1",
             Self::DaemonTaskFaults => "{fault}",
             Self::DaemonIpcLatencyMax | Self::DaemonIpcLatency => "s",
             Self::DaemonIpcRequests => "{request}",
             Self::DaemonIpcStatusBuilds => "{build}",
-            Self::EtaHealthItems => "{item}",
-            Self::EtaHealthFitLoaded => "1",
-            Self::EtaHealthFitAgeSeconds => "s",
-            Self::EtaHealthFitCheckAgeSeconds => "s",
-            Self::EtaHealthSnapshotAgeSeconds => "s",
-            Self::EtaHealthRefreshGate => "1",
-            Self::EtaHealthRefreshLastCycleAgeSeconds => "s",
-            Self::EtaHealthRefreshRepos => "{repository}",
-            Self::EtaHealthSnapshotRows => "{row}",
-            Self::EtaHealthSnapshotAlternatesRows => "{row}",
-            Self::EtaHealthSnapshotRowsTruncated => "{row}",
-            Self::EtaHealthSnapshotAlternatesTruncated => "{row}",
-            Self::EtaHealthSnapshotBytes => "By",
-            Self::EtaHealthPendingOverCap => "{estimate}",
             Self::CodexSessionState => "1",
             Self::CodexSessionRecord => "1",
             Self::CodexSessionMountDrift => "{path}",
@@ -647,6 +641,9 @@ impl MetricName {
             Self::PoolExhausted => "1 when no account in the provider's pool is usable.",
             Self::PoolExhaustions => "Accounts that became exhausted since the last sample.",
             Self::PoolExhaustedSeconds => "Seconds the provider's pool read as exhausted.",
+            Self::PoolAccountState => "1 for the state a pool account is in, else 0.",
+            Self::PoolPlanTokenLimit => "Declared plan token allowance per window.",
+            Self::PoolPlanWindowSeconds => "Declared plan quota window.",
             Self::PoolAccountMarks => {
                 "Pool accounts marked out of selection, by provider and reason."
             }
@@ -682,39 +679,15 @@ impl MetricName {
                 "Longest first-re-date-to-landing time of a PR landed in the window."
             }
             Self::DaemonTaskAlive => "1 while a long-running daemon loop is beating, by task.",
+            Self::EgressRequests => "Provider requests observed by the egress proxy, by seat.",
+            Self::EgressTokens => "Tokens read off provider responses by the egress proxy.",
+            Self::EgressLatency => "Summed egress-proxy request latency, by seat.",
+            Self::EgressTtft => "Summed egress-proxy time to first response byte, by seat.",
             Self::DaemonTaskFaults => "Faults of a long-running daemon loop, by task and reason.",
             Self::DaemonIpcLatencyMax => "Slowest IPC request answered in the interval, by kind.",
             Self::DaemonIpcLatency => "Summed IPC request latency, by request kind.",
             Self::DaemonIpcRequests => "IPC requests answered, by request kind.",
             Self::DaemonIpcStatusBuilds => "DaemonStatus builds finished, by outcome.",
-            Self::EtaHealthItems => {
-                "Live ETA items on this host, by kind, heuristic and answered/refusal reason."
-            }
-            Self::EtaHealthFitLoaded => "1 when a fit coefficient file is loaded, 0 when none is.",
-            Self::EtaHealthFitAgeSeconds => "Age of the loaded fit coefficient file's cutoff.",
-            Self::EtaHealthFitCheckAgeSeconds => {
-                "Time since the last fit check, by its outcome or skip reason."
-            }
-            Self::EtaHealthSnapshotAgeSeconds => "Age of each cached fleet snapshot, by repo.",
-            Self::EtaHealthRefreshGate => "1 for the fleet refresh gate state this host is in.",
-            Self::EtaHealthRefreshLastCycleAgeSeconds => "Time since the last fleet refresh tick.",
-            Self::EtaHealthRefreshRepos => "Repos per stop reason in the last refreshing tick.",
-            Self::EtaHealthSnapshotRows => "Rows in the last built eta.snapshot.",
-            Self::EtaHealthSnapshotAlternatesRows => {
-                "Rows with non-empty alternates in the last built eta.snapshot."
-            }
-            Self::EtaHealthSnapshotRowsTruncated => {
-                "Rows the last built eta.snapshot dropped at its row cap or byte budget; \
-                 above 0, the dashboard has no fresh ETA for them."
-            }
-            Self::EtaHealthSnapshotAlternatesTruncated => {
-                "Rows the last built eta.snapshot sent without their alternates (byte budget)."
-            }
-            Self::EtaHealthSnapshotBytes => "Compact JSON size of the last built eta.snapshot.",
-            Self::EtaHealthPendingOverCap => {
-                "Pending ETA estimates evicted by the MAX_PENDING cap since process start; \
-                 whole series only when distinct series exceed the cap."
-            }
             Self::CodexSessionState => {
                 "Codex session container state per account: 1 for the current state \
                  (running, stopped, restarting, missing, stale_mounts), 0 for the others."
@@ -764,6 +737,16 @@ impl MetricPoint {
         MetricPoint {
             name,
             value: MetricValue::Int(value),
+            labels: BTreeMap::new(),
+        }
+    }
+
+    /// An unlabelled floating-point point.
+    #[must_use]
+    pub fn double(name: MetricName, value: f64) -> Self {
+        MetricPoint {
+            name,
+            value: MetricValue::Double(value),
             labels: BTreeMap::new(),
         }
     }

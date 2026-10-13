@@ -392,6 +392,7 @@ fn registered(path: &str, priority: u32) -> Registered {
     Registered {
         root: PathBuf::from(path),
         priority,
+        maintain_only: false,
     }
 }
 
@@ -497,11 +498,43 @@ fn a_both_flags_record_is_a_hard_error_for_the_whole_roster() {
     assert!(msg.contains("refusing the whole roster"), "{msg}");
 }
 
+/// #11186: the timer's apply flips an existing workspace into maintain-only
+/// and back, in place: it is never removed, and keeps its priority.
+#[test]
+fn apply_change_flips_maintain_only_in_place() {
+    use crate::workspace_registry::{MaintainOnlySource, WorkspaceRegistry};
+    let dir = tempfile::tempdir().expect("dir");
+    let repo = dir.path().join("admin");
+    std::fs::create_dir_all(&repo).expect("repo");
+    let path = dir.path().join("workspaces.json");
+    let mut reg = WorkspaceRegistry::default();
+    reg.add_with_priority(&repo, None, 7).expect("add");
+    reg.save(&path).expect("save");
+    let flip = |to| Change::SetMaintainOnly {
+        name: "admin".into(),
+        path: repo.clone(),
+        to,
+    };
+
+    apply_change(&path, &flip(true)).expect("into");
+    let reg = WorkspaceRegistry::load(&path).expect("load");
+    assert_eq!(reg.workspaces.len(), 1);
+    assert_eq!(reg.workspaces[0].priority, 7);
+    let mark = reg.maintain_only_of(&repo).expect("maintain-only");
+    assert_eq!(mark.by, MaintainOnlySource::FleetStore);
+
+    apply_change(&path, &flip(false)).expect("out");
+    let reg = WorkspaceRegistry::load(&path).expect("load");
+    assert_eq!((reg.workspaces.len(), reg.workspaces[0].priority), (1, 7));
+    assert!(reg.maintain_only_of(&repo).is_none());
+}
+
 // ------------------------------------------------------------------------
 // The host-level snapshot and its `status` line
 // ------------------------------------------------------------------------
 
-fn sample_status() -> FleetSyncStatus {
+// `pub(crate)` so the sibling `applied` module's tests can build passes too.
+pub(crate) fn sample_status() -> FleetSyncStatus {
     FleetSyncStatus {
         repo: "acme/fleet".to_string(),
         reference: "main".to_string(),
@@ -972,7 +1005,9 @@ fn no_floor_leaves_the_status_line_unchanged() {
 
 /// Run `f` with `LOOM_SOCKET_PATH` pointing into a fresh temp dir and both
 /// process-wide cells empty; restore the environment and empty them after.
-fn with_clean_process_state<T>(f: impl FnOnce(&Path) -> T) -> T {
+/// `pub(crate)` so the sibling `applied` module's tests reuse the same
+/// process-state hygiene (#11197).
+pub(crate) fn with_clean_process_state<T>(f: impl FnOnce(&Path) -> T) -> T {
     let dir = tempfile::tempdir().expect("dir");
     let prior = std::env::var("LOOM_SOCKET_PATH").ok();
     std::env::set_var("LOOM_SOCKET_PATH", dir.path().join("loom-daemon.sock"));

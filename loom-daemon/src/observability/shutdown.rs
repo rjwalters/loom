@@ -213,9 +213,7 @@ mod tests {
                 issue: 18,
                 sweep_id: "shutdown".into(),
                 started_at: chrono::Utc::now(),
-                model: None,
-                effort: None,
-                runtime: None,
+                facts: Default::default(),
             }),
         ));
         let active = Arc::new(AtomicUsize::new(0));
@@ -263,9 +261,7 @@ mod tests {
                 issue: 18,
                 sweep_id: "fixture".into(),
                 started_at: chrono::Utc::now(),
-                model: None,
-                effort: None,
-                runtime: None,
+                facts: Default::default(),
             }),
         ));
         let status = ExportStatus::started("host", "http://localhost", "otlp", 30);

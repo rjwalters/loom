@@ -32,8 +32,7 @@
 //!   readers. A host with neither configured behaves byte-identically to
 //!   before: no readers, writes and reads on the one App.
 //!
-//! `LOOM_GITHUB_APP_SLUG` still overrides the writer's slug, as it did for
-//! `star_liveness::trust`.
+//! `LOOM_GITHUB_APP_SLUG` still overrides the writer's slug.
 //!
 //! # Delivery
 //!
@@ -80,7 +79,7 @@ pub use sidecar::{read_sidecar, Sidecar, SidecarRole, SIDECAR};
 pub mod route;
 pub use route::{route_read, ExhaustCause, Placement, ReadClass, RouteDecision, RouteRequest};
 
-/// The writer slug's env override (shared with `star_liveness::trust`).
+/// The writer slug's env override.
 pub const APP_SLUG_ENV: &str = "LOOM_GITHUB_APP_SLUG";
 
 /// A reader token must have at least this long left to be used for a read.
@@ -308,8 +307,7 @@ fn reconcile_writer(configured: Option<Identity>, declared: Option<Identity>) ->
     }
 }
 
-/// `{appId, privateKeyPath, slug?}` (slug falls back to `name`, as
-/// `star_liveness::trust` accepted).
+/// `{appId, privateKeyPath, slug?}` (slug falls back to `name`).
 fn identity_from_value(v: &Value) -> Option<Identity> {
     let app_id = match v.get("appId")? {
         Value::String(s) => s.trim().to_string(),

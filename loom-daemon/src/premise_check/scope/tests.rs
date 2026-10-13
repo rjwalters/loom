@@ -21,7 +21,7 @@ fn ordinary_labels_are_not() {
         trigger(
             "bug: the retry loop double-counts attempts",
             "## Steps to reproduce\n1. run it\n\n## Expected\nonce\n\n## Actual\ntwice\n",
-            &labels(&["loom:triage", "loom:curated", "tier:goal-supporting"]),
+            &labels(&["loom:triage", "loom:curated", "enhancement"]),
         ),
         None
     );
@@ -47,6 +47,69 @@ fn ordinary_bug_report_headings_do_not_fire() {
         let body = format!("## {heading}\n\nsomething happened in the parser.\n");
         assert_eq!(trigger("bug: parser", &body, &[]), None, "{heading}");
     }
+}
+
+/// #9549: a bare `## What happened` is the standard first section of a
+/// GitHub issue-form bug report — ordinary bug-report vocabulary, not an
+/// incident narrative. Trailing ASCII punctuation doesn't change that.
+#[test]
+fn bare_what_happened_headings_do_not_fire() {
+    for heading in [
+        "What happened",
+        "What happened?",
+        "What happened!",
+        "What happened.",
+        "What happened:",
+        "what happened",
+    ] {
+        let body = format!("## {heading}\n\nsomething happened in the parser.\n");
+        assert_eq!(trigger("bug: parser", &body, &[]), None, "{heading}");
+    }
+}
+
+/// The qualified form — the #7855 shape — still fires: the qualifier (date,
+/// host, context after the phrase) is what marks a narrated event rather
+/// than a form field.
+#[test]
+fn qualified_what_happened_still_fires() {
+    for heading in [
+        "What happened (2026-09-16, robb-pro, launchd, 0.19.59)",
+        "What happened on host-bed5b02c",
+        "What happened twice",
+    ] {
+        let body = format!("## {heading}\n\ntext\n");
+        assert!(
+            matches!(trigger("t", &body, &[]), Some(Trigger::IncidentReport(_))),
+            "{heading}"
+        );
+    }
+}
+
+/// Every other fragment keeps today's substring behaviour (#9549's scope
+/// note) — pinned one per fragment.
+#[test]
+fn remaining_incident_fragments_still_fire() {
+    for heading in [
+        "Incident (observed)",
+        "Postmortem",
+        "Post-mortem notes",
+        "Outage",
+        "Timeline",
+    ] {
+        let body = format!("## {heading}\n\ntext\n");
+        assert!(
+            matches!(trigger("t", &body, &[]), Some(Trigger::IncidentReport(_))),
+            "{heading}"
+        );
+    }
+}
+
+/// A bare `## What happened` does not opt the whole body out: any other
+/// incident heading still gates.
+#[test]
+fn bare_what_happened_with_another_incident_heading_still_fires() {
+    let body = "## What happened\n\nit broke\n\n## Timeline\n\n- 09:00 wedge\n";
+    assert!(matches!(trigger("t", body, &[]), Some(Trigger::IncidentReport(_))));
 }
 
 #[test]

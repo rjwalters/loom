@@ -102,6 +102,33 @@ pub struct DrainSnapshot {
     pub target: Option<String>,
 }
 
+/// #10880: a release roll the tick left held, as an alert. Present while the
+/// failed-roll guard holds the target, while the fetch backs off after three
+/// or more consecutive failures, or after a terminal fetch failure. ERROR when
+/// the host is below its fleet floor (`floor` is set), WARN otherwise.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RollHeld {
+    /// The fleet floor the host is below, when the roll is floor-driven.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub floor: Option<String>,
+    /// The running version.
+    pub running: String,
+    /// The held target: `artifact:<version>:<sha or tag>`.
+    pub target: String,
+    /// `failed_roll` (an armed roll did not take), `fetch_backoff` or
+    /// `fetch_terminal`.
+    pub cause: String,
+    /// Attempts at the target so far (arms, or fetch failures).
+    pub attempts: u32,
+    /// The last failure, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failure: Option<String>,
+    /// When it is next tried; absent when it is not retried until a new
+    /// release (a terminal failure on a target that is not the floor's).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_retry: Option<DateTime<Utc>>,
+}
+
 /// One self-update tick.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AutoUpdateTickRecord {
@@ -142,13 +169,17 @@ pub struct AutoUpdateTickRecord {
     pub in_flight: Option<u64>,
     /// The drain armed at tick start.
     pub drain: DrainSnapshot,
-    /// #10712: the fleet floor is above every published release, so this host
+    /// #10712: the fleet floor is above every release with this platform's assets, so this host
     /// cannot reach it (the alert text). Absent when the floor is unset,
     /// satisfied, or being rolled to. Raises the record's severity to ERROR.
     /// #10719: also carries the unsatisfiable repo-ahead demand (a workspace
     /// needs a daemon no release provides) when the floor has no stall.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub floor_stall: Option<String>,
+    /// #10880: the held-roll alert, when this tick left a release roll held.
+    /// Raises the record to ERROR when floor-driven, else WARN.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roll_held: Option<RollHeld>,
     /// Consecutive retryable failures for the tracked target.
     pub consecutive_failures: u32,
     /// Wall time the tick took, milliseconds.

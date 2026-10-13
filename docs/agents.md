@@ -220,7 +220,7 @@ Hermit creates ──→ loom:hermit ──→ (human approves) ──→ loom:i
 
 **Status Indicators**:
 - `loom:blocked` - Work blocked, needs help or clarification
-- `loom:operator-priority` - The operator's star: land ASAP (human-only, not a hold)
+- `loom:important` / `loom:very-important` - Priority: taken first (order only, not a hold)
 
 ## Autonomous Operation
 

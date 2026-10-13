@@ -61,7 +61,7 @@ fn actual_role_entrypoints_use_shared_preference_and_effective_config() {
         star["labels"]
             .as_array_mut()
             .unwrap()
-            .push(serde_json::json!({"name":"loom:operator-priority"}));
+            .push(serde_json::json!({"name":"loom:important"}));
         let data = root.join("pulls.json");
         std::fs::write(
             &data,

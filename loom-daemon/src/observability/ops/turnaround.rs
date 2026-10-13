@@ -33,7 +33,7 @@
 //! Each tick reports its end occupancy ([`TickReport::occupancy`]).
 //! `loom.dispatch.idle_slots` is `max_concurrent − occupancy`. When that tick
 //! also left ready work waiting (a capacity-style deferral: the admission
-//! ramp, the saturation brake or the repo slice), the interval until the next
+//! ramp, the saturation brake or the per-repo cap), the interval until the next
 //! tick is credited to `loom.dispatch.idle_slot_seconds` as
 //! `min(idle, waiting) × interval` (sample-and-hold, like
 //! `loom.pool.exhausted_seconds`). Gaps longer than [`MAX_HOLD_SECS`] (a
@@ -218,7 +218,6 @@ pub fn waiting_ready(report: &TickReport) -> usize {
         + report.deferred_ramp_cap
         + report.deferred_saturation
         + report.deferred_build_backoff
-        + report.deferred_out_of_slice
         + report.deferred_repo_cap
 }
 

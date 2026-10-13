@@ -15,6 +15,7 @@ use crate::telemetry::ops::{
 };
 use crate::telemetry::trace::{SpanName, SpanStatus, TraceContext};
 use crate::telemetry::{TelemetryEnvelope, TelemetryRecord};
+use crate::work_finder::halt_cause::HaltCause;
 use crate::work_finder::TickReport;
 
 #[derive(Default)]
@@ -251,6 +252,9 @@ fn every_metric_name_serializes_to_its_as_str() {
         MetricName::PoolExhausted,
         MetricName::PoolExhaustions,
         MetricName::PoolExhaustedSeconds,
+        MetricName::PoolAccountState,
+        MetricName::PoolPlanTokenLimit,
+        MetricName::PoolPlanWindowSeconds,
         MetricName::PoolAccountMarks,
         MetricName::DispatchSlotTurnaround,
         MetricName::DispatchSlotTurnaroundSamples,
@@ -275,26 +279,16 @@ fn every_metric_name_serializes_to_its_as_str() {
         MetricName::GithubRateLimitBreakerSkips,
         MetricName::ForgeCalls,
         MetricName::ForgeFacadeEvents,
-        MetricName::EtaHealthItems,
-        MetricName::EtaHealthFitLoaded,
-        MetricName::EtaHealthFitAgeSeconds,
-        MetricName::EtaHealthFitCheckAgeSeconds,
-        MetricName::EtaHealthSnapshotAgeSeconds,
-        MetricName::EtaHealthRefreshGate,
-        MetricName::EtaHealthRefreshLastCycleAgeSeconds,
-        MetricName::EtaHealthRefreshRepos,
-        MetricName::EtaHealthSnapshotRows,
-        MetricName::EtaHealthSnapshotAlternatesRows,
-        MetricName::EtaHealthSnapshotRowsTruncated,
-        MetricName::EtaHealthSnapshotAlternatesTruncated,
-        MetricName::EtaHealthSnapshotBytes,
-        MetricName::EtaHealthPendingOverCap,
         MetricName::CodexSessionState,
         MetricName::CodexSessionRecord,
         MetricName::CodexSessionMountDrift,
         MetricName::CaptainGaugeAgeSeconds,
         MetricName::CaptainGaugeFallback,
         MetricName::AgentScopePeakMemoryBytes,
+        MetricName::EgressRequests,
+        MetricName::EgressTokens,
+        MetricName::EgressLatency,
+        MetricName::EgressTtft,
     ] {
         assert_eq!(serde_json::to_value(name).unwrap(), name.as_str());
     }
@@ -343,19 +337,80 @@ fn tick_result_precedence() {
         }),
         "dispatched"
     );
-    assert_eq!(with(|r| r.halted = true), "halted_main_red");
-    // #10113: the same hold, attributed to a billing block, is its own result.
+    assert_eq!(
+        with(|r| {
+            r.halted = true;
+            r.halt_causes = vec![HaltCause::MainRed];
+        }),
+        "halted_main_red"
+    );
+    // #11649: a hold with no named cause no longer guesses `main_red`.
+    assert_eq!(with(|r| r.halted = true), "halted");
+    // #10113: a cause-less hold while an owner is billing-blocked keeps its
+    // own result.
     let held = TickReport {
         seen: 3,
         halted: true,
         ..TickReport::default()
     };
     assert_eq!(super::dispatch::tick_result_with(&held, true), "halted_ci_billing");
-    assert_eq!(super::dispatch::tick_result_with(&held, false), "halted_main_red");
+    assert_eq!(super::dispatch::tick_result_with(&held, false), "halted");
+    // The hold outranks saturation, as before.
+    assert_eq!(
+        with(|r| {
+            r.halted = true;
+            r.halt_causes = vec![HaltCause::Drain];
+            r.saturation_held = true;
+        }),
+        "halted_drain"
+    );
     assert_eq!(with(|r| r.saturation_held = true), "saturation_held");
     assert_eq!(with(|r| r.errors = 1), "error");
     assert_eq!(with(|r| r.deferred_ramp_cap = 2), "capacity_full");
     assert_eq!(with(|r| r.skipped_backoff = 3), "all_skipped");
+}
+
+/// #11649: a held tick's result names the hold its workspaces recorded — a
+/// disk-held tick is not a red `main` — and several causes read `halted`.
+#[test]
+fn halted_tick_result_names_the_recorded_cause() {
+    use super::dispatch::{halted_result, tick_result_with};
+    let held = |causes: Vec<HaltCause>, billing: bool| {
+        let report = TickReport {
+            seen: 3,
+            halted: true,
+            halt_causes: causes,
+            ..TickReport::default()
+        };
+        tick_result_with(&report, billing)
+    };
+    assert_eq!(held(vec![HaltCause::DiskReservation], false), "halted_disk_reservation");
+    assert_eq!(held(vec![HaltCause::TokenPool], false), "halted_token_pool");
+    assert_eq!(held(vec![HaltCause::CiBilling], false), "halted_ci_billing");
+    // A global billing block does not relabel another root's named cause.
+    assert_eq!(held(vec![HaltCause::DiskReservation], true), "halted_disk_reservation");
+    assert_eq!(held(vec![HaltCause::MainRed], true), "halted_main_red");
+    assert_eq!(held(vec![HaltCause::MainRed, HaltCause::DiskReservation], false), "halted");
+    // Every single cause maps to `halted_` + its wire token.
+    for cause in HaltCause::ALL {
+        assert_eq!(halted_result(&[cause], false), format!("halted_{}", cause.as_str()));
+    }
+}
+
+/// #11649: a held tick's span lists its causes; an unheld one omits the key.
+#[test]
+fn tick_span_lists_halt_causes_only_when_held() {
+    let held = TickReport {
+        seen: 2,
+        halted: true,
+        halt_causes: vec![HaltCause::Drain, HaltCause::DiskReservation],
+        ..TickReport::default()
+    };
+    let span = tick_span(&held, 3, at(0), at(1));
+    assert_eq!(span.attributes["loom.dispatch.result"], "halted");
+    assert_eq!(span.attributes["loom.dispatch.halt_causes"], "drain,disk_reservation");
+    let idle = tick_span(&TickReport::default(), 3, at(0), at(1));
+    assert!(!idle.attributes.contains_key("loom.dispatch.halt_causes"));
 }
 
 /// #10624: the build back-off result keys on an actual deferral, ranks after
@@ -404,7 +459,7 @@ fn tick_points_emit_only_nonzero_reasons_plus_gauges() {
         seen: 6,
         dispatched: 2,
         skipped_peer_claim: 1,
-        skipped_host_class: 1,
+        skipped_host_constraint: 1,
         deferred_capacity: 2,
         ..TickReport::default()
     };
@@ -419,7 +474,7 @@ fn tick_points_emit_only_nonzero_reasons_plus_gauges() {
         [
             ("capacity".to_string(), MetricValue::Int(2)),
             ("dispatched".to_string(), MetricValue::Int(2)),
-            ("host_class".to_string(), MetricValue::Int(1)),
+            ("host_constraint".to_string(), MetricValue::Int(1)),
             ("peer_claim".to_string(), MetricValue::Int(1)),
         ]
         .into_iter()
@@ -570,11 +625,9 @@ fn queue_summary(
                 issue: u32::try_from(i).unwrap(),
                 workspace_priority: 100,
                 urgent: false,
-                operator_priority: false,
-                operator_priority_at: None,
+                level: Default::default(),
                 main_red_fix: false,
                 created_at: None,
-                tier: None,
                 story_points: None,
                 disposition: *d,
                 detail: None,
