@@ -260,6 +260,24 @@ if [[ -n "$BODY_FILE" ]]; then
   fi
 fi
 
+# --- #11787: loom:curated is only ever set by `curation-complete` ------------
+# A bare creation-time loom:curated bypasses the estimate gate (no points:N,
+# no issue.estimate fact). Refuse it unless the body carries a points marker,
+# and with one, defer the label to `loom-daemon curation-complete` below.
+WANT_CURATED=false
+_kept=()
+for _l in "${LABELS[@]+"${LABELS[@]}"}"; do
+  if [[ "$_l" == "loom:curated" ]]; then WANT_CURATED=true; else _kept+=("$_l"); fi
+done
+if [[ "$WANT_CURATED" == "true" ]]; then
+  if ! grep -Eq '^[[:space:]]*<!-- loom:points=[0-9]+ -->[[:space:]]*$' <<< "$BODY"; then
+    echo "create-issue.sh: refusing --label loom:curated without a standalone '<!-- loom:points=N -->' marker in the body." >&2
+    echo "create-issue.sh: file without the label, then run: loom-daemon curation-complete (see .loom/roles/curator-estimate.md)." >&2
+    exit 2
+  fi
+  LABELS=("${_kept[@]+"${_kept[@]}"}" "loom:curating")
+fi
+
 forge_detect
 if [[ "$FORGE_TYPE" != "github" ]]; then
   echo "create-issue.sh: this GraphQL-exhaustion fallback is GitHub-specific; \
@@ -443,6 +461,17 @@ trap 'loom_filing_lock_release' EXIT INT TERM
 case " ${LABELS[*]-} " in *" loom:"*) ;; *) LABELS+=("loom:triage") ;; esac
 ISSUE_URL="$(forge_gh_create_issue_rl_safe "$REPO_NWO" "$TITLE" "$BODY" "${LABELS[@]+"${LABELS[@]}"}")" || exit 1
 echo "$ISSUE_URL"
+
+# --- #11787: curated-at-filing goes through the one producer ----------------
+if [[ "$WANT_CURATED" == "true" ]]; then
+  _cc_n="${ISSUE_URL##*/}"; _cc_repo="${ISSUE_URL#*://*/}"; _cc_repo="${_cc_repo%/issues/*}"
+  if ! loom-daemon curation-complete --repo "$_cc_repo" --issue "$_cc_n" \
+      --model "${LOOM_CURATION_MODEL:-unknown}" --runtime "${LOOM_CURATION_RUNTIME:-unknown}" \
+      --completion-id "$(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid)" \
+      --workspace-root "${LOOM_WORKSPACE_ROOT:-$PWD}" >&2; then
+    echo "create-issue.sh: issue filed but left in loom:curating: curation-complete failed; fix the marker and rerun it" >&2
+  fi
+fi
 
 # --- #10012: native sub-issue link, best effort -----------------------------
 [[ -z "${PARENT+x}" ]] \
