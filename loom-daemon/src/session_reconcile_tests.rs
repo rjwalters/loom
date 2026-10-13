@@ -30,6 +30,8 @@ mod hold_tests;
 mod removal_tests;
 #[path = "session_reconcile_safety_tests.rs"]
 mod safety_tests;
+#[path = "session_reconcile_skew_tests.rs"]
+mod skew_tests;
 
 /// Shared so a pass can snapshot it while the lifecycle owns it.
 #[derive(Default, Clone)]
@@ -73,6 +75,8 @@ struct FakeState {
     /// `(container, image, workspace)` per `create`.
     creates: Mutex<Vec<(String, String, PathBuf)>>,
     fail_create: Mutex<bool>,
+    /// `ensure_image` (inspect, then pull) cannot get the image.
+    fail_pull: Mutex<bool>,
     /// `docker inspect` fails with this error (Docker down / timed out).
     fail_inspect: Mutex<Option<String>>,
     /// A started/created container exits at once: `Some(true)` leaves it
@@ -97,6 +101,11 @@ struct FakeState {
     /// The next N `stop_and_remove` calls stop the container, then fail the
     /// `docker rm` (it stays present, stopped).
     rm_fails: Mutex<u32>,
+    /// What `loom-daemon --version` prints inside each container; a missing
+    /// entry makes the probe fail (exit 127).
+    daemon_versions: Mutex<HashMap<String, String>>,
+    /// The host daemon's version as the pass reads it (`None`: unreadable).
+    host_version: Mutex<Option<skew::DaemonVersion>>,
 }
 
 impl FakeState {
@@ -149,10 +158,10 @@ impl FakeState {
     }
     /// Calls that change a container (anything but `inspect`).
     fn mutations(&self) -> Vec<String> {
-        self.calls()
-            .into_iter()
-            .filter(|c| c != "inspect" && c != "has_active_exec")
-            .collect()
+        let reads = "inspect has_active_exec exec_capture version_probe ensure_image";
+        let mut calls = self.calls();
+        calls.retain(|c| !reads.split(' ').any(|r| r == c));
+        calls
     }
     fn log(&self, method: &str) {
         self.calls.lock().unwrap().push(method.into());
@@ -257,7 +266,11 @@ impl ContainerRunner for Fake {
             .clone()
             .unwrap_or(intended);
         self.mounts.lock().unwrap().insert(container.into(), mounts);
+        self.ship_daemon(container, image);
         Ok(())
+    }
+    fn ensure_image(&self, image: &str) -> Result<()> {
+        self.pull(image)
     }
     fn start_existing(&self, container: &str) -> Result<()> {
         self.log("start_existing");
@@ -323,8 +336,11 @@ impl ContainerRunner for Fake {
         self.log("attach_interactive");
         Ok(0)
     }
-    fn exec_capture(&self, _c: &str, _argv: &[&str], _t: Duration) -> Result<ExecOutput> {
+    fn exec_capture(&self, c: &str, argv: &[&str], _t: Duration) -> Result<ExecOutput> {
         self.log("exec_capture");
+        if argv == ["loom-daemon", "--version"] {
+            return Ok(self.version_probe(c));
+        }
         Ok(ExecOutput {
             success: true,
             unavailable: false,
@@ -430,6 +446,7 @@ fn fake_inputs<'a>(
         would_create_accept: &|_| Ok(()),
         dispatch_locks: Some(Box::leak(fake.lock_dir().into_boxed_path())),
         class: None,
+        host_version: None,
     }
 }
 
@@ -450,6 +467,7 @@ fn pass_named(
     let mut observe = PassSnapshot::new(&mut take);
     let inputs = fake_inputs(&fake, &index, private, fallback, &registered);
     let inputs = PassInputs {
+        host_version: fake.host_version.lock().unwrap().clone(),
         registered: (!*fake.registry_unreadable.lock().unwrap()).then_some(&registered[..]),
         denials_for: &|_| {
             if *fake.roster_unreadable.lock().unwrap() {

@@ -636,6 +636,15 @@ pub trait ContainerRunner {
         daemon_root: &Path,
     ) -> Result<()>;
 
+    /// Make sure `image` is available locally (`docker image inspect`, then
+    /// `docker pull`), so a caller can fail *before* tearing a container down
+    /// rather than after (#11727: the version-skew recreate must not delete a
+    /// seat it cannot recreate). The default is a no-op for runners that have
+    /// no image store.
+    fn ensure_image(&self, _image: &str) -> Result<()> {
+        Ok(())
+    }
+
     /// `docker start` for an existing, stopped-but-not-removed container.
     fn start_existing(&self, container: &str) -> Result<()>;
 
@@ -799,6 +808,18 @@ impl ContainerRunner for ProcessContainerRunner {
         let (success, _stdout, stderr) = Self::run_capture(&arg_refs)?;
         if !success {
             bail!("docker run {image} failed: {}", stderr.trim());
+        }
+        Ok(())
+    }
+
+    fn ensure_image(&self, image: &str) -> Result<()> {
+        let (present, _stdout, _stderr) = Self::run_capture(&["image", "inspect", image])?;
+        if present {
+            return Ok(());
+        }
+        let (success, _stdout, stderr) = Self::run_capture(&["pull", image])?;
+        if !success {
+            bail!("docker pull {image} failed: {}", stderr.trim());
         }
         Ok(())
     }
