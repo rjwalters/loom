@@ -25,7 +25,6 @@ const SOURCE_ALLOWLIST: &[(&str, &str)] = &[
     ("intake_reconcile.rs", "loom:"),
     ("intake_reconcile/singleton.rs", "loom:"),
     ("label_registry/mod.rs", "loom:"),
-    ("merge_pr/chain_lock.rs", "loom:chain-head-lock"),
     ("merge_pr/consolidate.rs", "loom:consolidation"),
     ("merge_pr/consolidate.rs", "loom:consolidation-abort"),
     ("merge_pr/sequence.rs", "loom:sequence"),
