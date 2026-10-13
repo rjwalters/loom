@@ -137,7 +137,7 @@ it, only a hold label names a reason; other candidates are undecided.
 | `pr_open_skip` | the item already has an open PR | `open_pr`, `open_pr_backoff` |
 | `operator_hold` | held for a human | `parked`, `hard_exclusion`, `declined`; roles: a merge-hold / park label on the PR |
 | `quota` | token pool or quota would not admit it | roles: `skipped_no_token_pool`, `skipped_pool_exhausted` ticks |
-| `cap` | a concurrency, ramp, per-repo, slice or saturation cap | `deferred_capacity`, `deferred_ramp_cap`, `deferred_saturation`, `deferred_out_of_slice`, `deferred_repo_cap` |
+| `cap` | a concurrency, ramp, per-repo or saturation cap | `deferred_capacity`, `deferred_ramp_cap`, `deferred_saturation`, `deferred_repo_cap` (`deferred_out_of_slice` mapped here until the dispatch slice was retired, #11682) |
 | `in_flight` | a live sweep or claim covers it | `in_flight`; roles: a claim label the agent did not write |
 | `backoff` | inside a back-off, cooldown, recheck or retry window | `deferred_build_backoff`, `recheck_interval`, `dispatch_backoff`, `noop_cooldown`, `prless_retry` |
 | `halted` | the repo's dispatch is halted (red main, gate, drain, breaker) | `workspace_halted` |

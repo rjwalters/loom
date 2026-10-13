@@ -88,8 +88,8 @@ pub struct QueueSnapshotRow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub halt_cause: Option<String>,
     /// The dispatch-plan fields (Issue #9288), flattened beside `rank`:
-    /// `position`, `plan_state`, `keys`, `gate`, `in_slice`, `hot`,
-    /// `owning_shard`, `repo_cap`. The `keys` names are the four
+    /// `position`, `plan_state`, `keys`, `gate`, `hot`, `owning_shard`,
+    /// `repo_cap` (`in_slice` is retired and absent since #11682). The `keys` names are the four
     /// `candidate_keys` (#11508, #11547): `main_red_fix` (bool, true only for
     /// a verified red-main fix while its repo's `main` is red), `level`
     /// (0 default, 1 `loom:important`, 2 `loom:very-important`),

@@ -463,16 +463,14 @@ fn tick_skips_a_tracking_parent_with_open_sub_issues() {
 }
 
 // ===================================================================
-// Repo-sharding slice preference (Issue #6243)
+// Repo-sharding slice preference (Issue #6243) — retired from dispatch
+// (Issue #11682). The no-slice regression tests live in `tests/no_slice.rs`.
 // ===================================================================
 
 /// `tick_multi_with_saturation_brake` (and therefore `tick_multi`/
 /// `tick_multi_with_admission_cap`) delegates to
-/// `tick_multi_with_sharding` with `preferred_slice: None` — the
-/// pre-#6243 candidate list must be byte-for-byte unaffected, so the
-/// existing `tick_multi_threads_per_issue_complexity_into_dispatch` test
-/// above (and every other pre-existing `tick_multi*` test) keeps passing
-/// unmodified. This test pins that delegation explicitly.
+/// `tick_multi_with_sharding`; every ready candidate across both workspaces
+/// dispatches when the cap allows.
 #[test]
 fn tick_multi_with_saturation_brake_is_a_sharding_noop() {
     let mut workspaces = vec![
@@ -488,92 +486,12 @@ fn tick_multi_with_saturation_brake_is_a_sharding_noop() {
         false,
     );
     assert_eq!(report.dispatched, 2);
-    assert_eq!(report.deferred_out_of_slice, 0);
     assert_eq!(workspaces[0].1.dispatched, vec![1]);
     assert_eq!(workspaces[1].1.dispatched, vec![2]);
 }
 
-/// The production mask in `spawn_multi_work_finder_task` is
-/// `role_shard::decide(root).owned` per root. This pins the load-bearing
-/// half of that contract for #6243: a root with NO sharding configuration
-/// resolves to `ShardPosture::Unsharded`, which owns every workspace — so
-/// the mask is all-`true`, every candidate is in-slice, and an unsharded
-/// daemon's dispatch order is byte-for-byte pre-#6243. (The sharded
-/// disjointness/coverage half is `role_shard`'s own property and is
-/// covered by its test module from #6374.)
-#[test]
-fn unconfigured_root_is_owned_so_the_production_slice_mask_is_all_true() {
-    let dir = tempfile::tempdir().unwrap();
-    let decision = crate::role_shard::decide(dir.path());
-    assert!(
-        !decision.posture.is_sharded(),
-        "an unconfigured root must resolve to Unsharded, got {:?}",
-        decision.posture
-    );
-    assert!(
-        decision.owned,
-        "Unsharded must own every workspace — otherwise an unconfigured \
-             host would silently defer its own repos (#6243)"
-    );
-}
-
-/// #6243 AC: a dispatcher prefers in-slice candidates — an out-of-slice
-/// workspace's ready issue must NOT dispatch while the in-slice
-/// workspace still has an eligible candidate, even though the
-/// out-of-slice workspace's priority tier would otherwise win.
-#[test]
-fn tick_multi_with_sharding_prefers_in_slice_over_higher_priority_out_of_slice() {
-    let mut workspaces = vec![
-        // Workspace 0: higher priority tier (0 < 100) but OUT of slice.
-        (FakeSource::once(vec![issue(1)]), RecordingDispatcher::default()),
-        // Workspace 1: lower priority tier but IN slice.
-        (FakeSource::once(vec![issue(2)]), RecordingDispatcher::default()),
-    ];
-    let preferred_slice = [false, true];
-    let report = tick_multi_with_sharding(
-        &mut workspaces,
-        &[0, 100],
-        10,
-        &[false, false],
-        usize::MAX,
-        false,
-        Some(&preferred_slice),
-    );
-    assert_eq!(report.dispatched, 1, "only the in-slice candidate dispatches this tick");
-    assert_eq!(report.deferred_out_of_slice, 1);
-    assert!(
-        workspaces[0].1.dispatched.is_empty(),
-        "out-of-slice workspace must not dispatch"
-    );
-    assert_eq!(workspaces[1].1.dispatched, vec![2], "in-slice workspace dispatches");
-}
-
+mod no_slice;
 mod roster_fence;
-
-/// A `preferred_slice` shorter than `workspaces` (a caller bug, or a
-/// workspace added between slice computation and dispatch) must not
-/// panic — a missing entry defaults to "in slice" (fail open toward the
-/// pre-#6243 behavior, never toward starving a real workspace).
-#[test]
-fn tick_multi_with_sharding_missing_slice_entry_defaults_to_in_slice() {
-    let mut workspaces = vec![
-        (FakeSource::once(vec![issue(1)]), RecordingDispatcher::default()),
-        (FakeSource::once(vec![issue(2)]), RecordingDispatcher::default()),
-    ];
-    let preferred_slice = [true]; // workspace 1 has no entry
-    let report = tick_multi_with_sharding(
-        &mut workspaces,
-        &[0, 0],
-        10,
-        &[false, false],
-        usize::MAX,
-        false,
-        Some(&preferred_slice),
-    );
-    assert_eq!(report.dispatched, 2);
-    assert_eq!(workspaces[0].1.dispatched, vec![1]);
-    assert_eq!(workspaces[1].1.dispatched, vec![2]);
-}
 
 // ===================================================================
 // RegistryDispatcher — production dispatch-path regression (Issue #3967)
