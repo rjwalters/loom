@@ -248,7 +248,9 @@ fn tick_multi_leaves_one_repo_free_to_take_the_whole_budget() {
         (OneShotSource::of(&[1, 2, 3]), CapDispatcher::default()),
         (OneShotSource::of(&[10]), CapDispatcher::default()),
     ];
-    let report = tick_multi(&mut workspaces, &[0, 100], 3, &[false, false]);
+    // A 1000-point priority gap: at the default draw temperature (#11684)
+    // repo 0 weighs ~250,000x repo 1, so the draw is priority order.
+    let report = tick_multi(&mut workspaces, &[0, 1000], 3, &[false, false]);
 
     assert_eq!(workspaces[0].1.dispatched, vec![1, 2, 3], "the whole budget, one repo");
     assert!(workspaces[1].1.dispatched.is_empty());
@@ -311,7 +313,8 @@ fn affinity_is_off_while_the_cap_is_unset() {
         (OneShotSource::of(&[1]), CapDispatcher::default()),
         (OneShotSource::of(&[10]), CapDispatcher::holding(1)),
     ];
-    let report = tick_capped(&mut workspaces, &[0, 100], 10, None);
+    // A 1000-point gap keeps the softmax draw (#11684) in priority order.
+    let report = tick_capped(&mut workspaces, &[0, 1000], 10, None);
 
     assert_eq!(
         report
@@ -396,7 +399,8 @@ fn an_open_pr_repo_yields_the_tick_to_another_repos_work() {
         (OneShotSource::of(&[10]), CapDispatcher::default()),
     ];
     // Priority puts the PR-blocked repo first; a single slot is available.
-    let report = tick_capped(&mut workspaces, &[0, 100], 1, None);
+    // (A 1000-point gap keeps the softmax draw, #11684, in priority order.)
+    let report = tick_capped(&mut workspaces, &[0, 1000], 1, None);
 
     assert_eq!(report.skipped_pr_open, 2, "both of repo A's issues are guard-refused");
     assert_eq!(rows_with(&report, Qd::OpenPr), 2);

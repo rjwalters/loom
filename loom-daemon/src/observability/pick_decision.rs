@@ -228,8 +228,12 @@ pub fn workspace_draw_record(
                 roll: step.draw.roll,
                 picked: resolve(step.workspace_idx),
                 number: step.issue,
+                p_min: Some(step.draw.p_min),
             })
             .collect(),
+        // One temperature per tick: every draw of a `draw_order` run weighs
+        // at the same one (#11684).
+        temperature: log.steps.first().map(|step| step.draw.temperature),
     }
 }
 
