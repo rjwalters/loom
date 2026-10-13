@@ -379,7 +379,7 @@ gh pr create --label "loom:review-requested"
 git clone https://github.com/rjwalters/loom
 cd loom
 
-# Run the daemon in dev mode
+# Run the daemon in dev mode (autonomy off; add --autonomy to opt in)
 ./scripts/dev-daemon.sh
 
 # Run tests
@@ -388,6 +388,13 @@ cargo test --workspace
 # Build release daemon
 cargo build --package loom-daemon --release
 ```
+
+> **A daemon in a Loom clone acts on `rjwalters/loom`.** `dev-daemon.sh`
+> therefore starts with autonomy off (work finder, role runner, claim
+> reconciliation and auto-update disabled); pass `--autonomy` to turn it on.
+> Autonomy belongs only in a repository you can push to: to try Loom, install
+> it into your own repository (see [Quick Start](#quick-start)). Elsewhere,
+> Loom's write-scope guard refuses its writes anyway.
 
 See [DEVELOPMENT.md](docs/guides/development.md) for complete guidelines.
 

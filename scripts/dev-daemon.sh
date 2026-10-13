@@ -1,8 +1,19 @@
 #!/usr/bin/env bash
 # Interactive daemon development mode
 # Starts daemon in background and monitors its activity
+#
+# Usage: scripts/dev-daemon.sh [--autonomy]
+#
+# Autonomy (work finder, role runner, claim reconciliation, auto-update) is OFF
+# by default (#9703): a daemon in a clone of rjwalters/loom acts on
+# rjwalters/loom. Pass --autonomy only on a checkout you maintain.
 
 set -e
+
+if [ "${1:-}" = "--autonomy" ]; then AUTONOMY="ON (--autonomy given)"; else
+  AUTONOMY="OFF (dev default; rerun with --autonomy to enable)"
+  export LOOM_WORK_FINDER=0 LOOM_ROLE_RUNNER=0 LOOM_STALE_CLAIM_RECONCILE=0 LOOM_AUTO_UPDATE=0
+fi
 
 DAEMON_PID_FILE=".loom/.daemon.pid"
 DAEMON_LOG_FILE=".loom/.daemon.log"
@@ -52,7 +63,7 @@ if [ -f "$DAEMON_PID_FILE" ]; then
 fi
 
 # Start daemon
-echo -e "${BLUE}🚀 Starting daemon...${NC}"
+echo -e "${BLUE}🚀 Starting daemon: autonomy ${AUTONOMY}${NC}"
 ./scripts/start-daemon.sh > /dev/null 2>&1
 
 if [ ! -f "$DAEMON_PID_FILE" ]; then
@@ -66,28 +77,17 @@ echo -e "${GRAY}  Socket: $DAEMON_SOCKET${NC}"
 echo -e "${GRAY}  Logs: $DAEMON_LOG_FILE${NC}"
 echo ""
 
-# Function to get connection count
-get_connection_count() {
-  # Count number of connections to the socket
-  lsof "$DAEMON_SOCKET" 2>/dev/null | grep -v COMMAND | wc -l | tr -d ' ' || echo "0"
-}
+# Function to get connection count (connections to the socket)
+get_connection_count() { lsof "$DAEMON_SOCKET" 2>/dev/null | grep -v COMMAND | wc -l | tr -d ' ' || echo "0"; }
 
 # Function to get terminal count from logs
 get_terminal_count() {
   grep -i "restored.*terminals" "$DAEMON_LOG_FILE" 2>/dev/null | tail -1 | sed -n 's/.*Restored \([0-9]*\) terminals.*/\1/p' || echo "0"
 }
 
-# Function to count recent errors
-get_recent_errors() {
-  # Count ERROR lines in last 50 lines
-  tail -50 "$DAEMON_LOG_FILE" 2>/dev/null | grep -c "ERROR" || echo "0"
-}
-
-# Function to count recent warnings
-get_recent_warnings() {
-  # Count WARN lines in last 50 lines
-  tail -50 "$DAEMON_LOG_FILE" 2>/dev/null | grep -c "WARN" || echo "0"
-}
+# Functions to count ERROR / WARN lines in the last 50 log lines
+get_recent_errors() { tail -50 "$DAEMON_LOG_FILE" 2>/dev/null | grep -c "ERROR" || echo "0"; }
+get_recent_warnings() { tail -50 "$DAEMON_LOG_FILE" 2>/dev/null | grep -c "WARN" || echo "0"; }
 
 # Show status bar
 show_status() {
