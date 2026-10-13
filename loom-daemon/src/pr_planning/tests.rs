@@ -231,3 +231,19 @@ fn every_role_drains_very_important_before_important_before_ordinary_work() {
         }
     }
 }
+
+/// #11743: a frozen PR is in no role's queue, whatever else it carries.
+#[test]
+fn a_frozen_pr_is_in_no_role_queue() {
+    for (role, label) in [
+        (PrRole::Judge, "loom:review-requested"),
+        (PrRole::Doctor, "loom:changes-requested"),
+        (PrRole::Champion, "loom:pr"),
+    ] {
+        let rows = vec![
+            pr(1, "interactive", &[label, "loom:frozen"]),
+            pr(2, "interactive", &[label]),
+        ];
+        assert_eq!(ids(&ordered_queue(rows, role, false, &policy())), vec![2], "{label}");
+    }
+}
