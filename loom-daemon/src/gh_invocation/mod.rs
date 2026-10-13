@@ -1,5 +1,4 @@
-//! The one `gh` spawn choke point (#9985, part of the forge egress policy
-//! epic #9983, 2am#1911 P3).
+//! The one `gh` spawn choke point (#9985).
 //!
 //! # Why
 //!
@@ -87,8 +86,8 @@ pub const TARGET_ATTR_MAX: usize = 100;
 
 /// Whether an invocation reads or mutates forge state.
 ///
-/// Carried so the egress policy (C1) and the managed launcher (C4) can apply
-/// different routing to writes, and so telemetry can separate them.
+/// Carried so routing can treat writes differently, and so telemetry can
+/// separate them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccessIntent {
     Read,

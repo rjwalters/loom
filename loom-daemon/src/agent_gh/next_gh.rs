@@ -4,14 +4,8 @@
 //! the agent's `PATH`, so "the next `gh`" must skip anything that resolves to
 //! this very binary. Order:
 //!
-//! 1. `LOOM_GH_BIN` — the existing override every Loom `gh` resolver honours
-//!    (and the composition point for the 2am managed launcher, #9987);
-//! 2. the first executable `gh` on `PATH` that is not this binary — which is
-//!    the managed launcher itself when it is installed as `gh`, so the shim
-//!    composes with it rather than replacing its policy/telemetry.
-//!
-//! #9983's policy launcher (resolver rung 1) is still a stub; when it lands it
-//! outranks `LOOM_GH_BIN` for the daemon's own reads, not for this ladder.
+//! 1. `LOOM_GH_BIN` — the existing override every Loom `gh` resolver honours;
+//! 2. the first executable `gh` on `PATH` that is not this binary.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};

@@ -139,9 +139,7 @@ pub(crate) fn run_init(args: InitArgs) -> Result<()> {
                 println!("\nTo use Loom orchestration:");
                 println!("  - Open Claude Code terminals with /loom:builder, /loom:judge, etc.");
                 println!("  - Or start the daemon: ./.loom/scripts/cli/loom-daemon-start.sh");
-
-                // #9984: installer / `loom update` forge egress doctor.
-                return super::forge_egress_cmd::post_install_doctor(&absolute_workspace);
+                return Ok(());
             }
 
             println!("\nLoom workspace initialized successfully!");
@@ -240,9 +238,7 @@ pub(crate) fn run_init(args: InitArgs) -> Result<()> {
             println!("     Daemon Mode (autonomous orchestration):");
             println!("       cd {workspace_str} && ./.loom/scripts/cli/loom-daemon-start.sh");
             println!("       Then in Claude Code: /loom:loom");
-            // #9984: installer / `loom update` forge egress doctor — silent
-            // with no policy; non-zero under `enforcement.api=required`.
-            super::forge_egress_cmd::post_install_doctor(&absolute_workspace)
+            Ok(())
         }
         Err(e) => {
             eprintln!("\nFailed to initialize workspace: {e}");

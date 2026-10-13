@@ -273,7 +273,7 @@ See [credential policy](.loom/docs/credential-storage.md); `.gitignore` is insuf
   `./.loom/scripts/create-issue.sh`, never a bare `gh issue create`** — that is
   GraphQL-backed and dies on GraphQL exhaustion while the independent REST pool
   sits idle; the script falls back to one REST POST with labels applied
-  atomically (#5047). See [github-authentication](.loom/docs/github-authentication.md); routing policy: [forge-egress](.loom/docs/forge-egress.md).
+  atomically (#5047). See [github-authentication](.loom/docs/github-authentication.md).
 - **Gitea** — set `GITEA_TOKEN` or `FORGE_TOKEN` (repository read/write). See
   [forge-authentication](.loom/docs/forge-authentication.md).
 - **Releasing** — **a PR must NEVER bump `VERSION`**: a post-merge workflow does

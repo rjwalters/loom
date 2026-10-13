@@ -13,12 +13,10 @@
 //! token, profile directory or endpoint ever crosses the socket, and no
 //! credential is published into or discovered from a checkout.
 //!
-//! - [`daemon`]: the handler (validates root, slug and issue; applies the
-//!   forge-egress admission gate; runs the read).
+//! - [`daemon`]: the handler (validates root, slug and issue; runs the read).
 //! - [`client`]: socket trust checks, the one-frame client, and
 //!   [`client::RoutedLookup`], which picks the route once per run.
-//! - [`standalone`]: the no-daemon path: the existing ambient facade read,
-//!   but behind the same admission gate.
+//! - [`standalone`]: the no-daemon path: the existing ambient facade read.
 //!
 //! Fail-closed throughout: every refusal, mismatch or failure is
 //! [`ReadOutcome::Unknown`], which `stash_retirement` never retires on.

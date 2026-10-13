@@ -13,10 +13,8 @@
 //! one).
 //!
 //! The prefix is [`super::session_path`], the same composition a worker gets:
-//! the managed launcher (#9987) first when a policy resolves one, then the
-//! front, then whatever `PATH` already had — so with no policy the front's own
-//! conditional reads go to the next `gh` (e.g. the 2am telemetry shim), which
-//! keeps seeing every forge call. `tests/agent_gh_front_path_order.rs`
+//! the front, then whatever `PATH` already had — so the front's own
+//! conditional reads go to the next `gh`, which keeps seeing every forge call. `tests/agent_gh_front_path_order.rs`
 //! pins this (#11176): with no `LOOM_GH_BIN`, both a passthrough and a served
 //! read's conditional request reach a stub `gh` placed second on `PATH`.
 //!
@@ -31,8 +29,6 @@
 use std::ffi::OsStr;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-
-use crate::forge_egress::worker_env::WorkerEgress;
 
 /// Trailing comment on the written line; its presence means "already done".
 pub const MARKER: &str = "# loom gh front (#10516)";
@@ -71,11 +67,7 @@ fn try_run() -> Result<(), String> {
     if crate::forge_cmd::detect_forge(Some(&root)) == crate::forge_cmd::ForgeType::Gitea {
         return Ok(());
     }
-    let egress = WorkerEgress::admit_process()
-        .map_err(|f| crate::forge_egress::worker_env::refusal_message(&f))?
-        .egress;
-    let prefix = super::session_path(None, egress.as_ref())
-        .ok_or("the gh shim directory could not be created")?;
+    let prefix = super::session_path(None).ok_or("the gh shim directory could not be created")?;
     let current = std::env::var_os("PATH");
     append_env(Path::new(&env_file), &prefix, current.as_deref())
         .map(|_| ())
@@ -162,19 +154,15 @@ pub fn is_loom_workspace(root: &Path) -> bool {
     root.join(".loom/config.json").is_file() || root.join(".loom-project/project.json").is_file()
 }
 
-/// `loom-daemon gh-shim status`: print `front|launcher|bypassed: <gh>` for
-/// the first `gh` on this process's `PATH`. Exit 1 only for `bypassed`.
+/// `loom-daemon gh-shim status`: print `front|bypassed: <gh>` for the first
+/// `gh` on this process's `PATH`. Exit 1 only for `bypassed`.
 #[must_use]
 pub fn status() -> i32 {
-    let launcher = WorkerEgress::admit_process()
-        .ok()
-        .and_then(|a| a.egress)
-        .map(|e| e.launcher);
     let Some(gh) = first_gh(std::env::var_os("PATH").as_deref()) else {
         println!("bypassed: no gh on PATH");
         return 1;
     };
-    let kind = classify_gh(&gh, launcher.as_deref());
+    let kind = classify_gh(&gh);
     println!("{kind}: {}", gh.display());
     i32::from(kind == "bypassed")
 }
@@ -189,17 +177,12 @@ pub fn first_gh(path: Option<&OsStr>) -> Option<PathBuf> {
         .find(|c| super::next_gh::is_executable(c))
 }
 
-/// `front` when `gh` resolves to a `loom-daemon`, `launcher` when it is the
-/// policy's managed launcher, else `bypassed`.
+/// `front` when `gh` resolves to a `loom-daemon`, else `bypassed`.
 #[must_use]
-pub fn classify_gh(gh: &Path, launcher: Option<&Path>) -> &'static str {
+pub fn classify_gh(gh: &Path) -> &'static str {
     let canon = gh.canonicalize().unwrap_or_else(|_| gh.to_path_buf());
     if canon.file_name() == Some(OsStr::new("loom-daemon")) {
         "front"
-    } else if launcher
-        .is_some_and(|l| l.canonicalize().unwrap_or_else(|_| l.to_path_buf()) == canon)
-    {
-        "launcher"
     } else {
         "bypassed"
     }
