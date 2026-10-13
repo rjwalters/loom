@@ -386,7 +386,9 @@ pub struct RedMainLane {
     /// The main-health gate has verified this repo's `main` red
     /// ([`WorkspaceHealthStates::is_halted`]).
     pub verified_red: bool,
-    /// This repo has no enabled `buildGate`, so the CI fallback decides red.
+    /// This repo's main-health gate loop is not running (no enabled
+    /// `buildGate`, or the loop is off), so the CI fallback decides red
+    /// (#11690: CI is the test gate).
     pub gate_disabled: bool,
     /// Any hold on this repo other than the verified-red halt: a gate run in
     /// flight, a drain, the host breaker, a pre-flight or token-pool hold.
@@ -419,7 +421,9 @@ pub fn lane_for(
 ) -> RedMainLane {
     RedMainLane {
         verified_red: health.is_halted(),
-        gate_disabled: crate::main_health_gate::read_build_gate_config(root).is_none(),
+        // #11690: a `buildGate` block alone produces no verified-red signal;
+        // only the running main-health loop does. Without it, CI decides.
+        gate_disabled: !crate::main_health_gate::effective_enabled(root),
         other_hold: other_hold || (suppress_dispatch_during_gate && health.is_gate_in_flight()),
     }
 }
@@ -602,5 +606,46 @@ mod alert_sink_tests {
     fn a_script_failure_is_reported_as_not_filed() {
         let (dir, _log) = root_with_stub("boom", 1);
         assert!(!file_alert(dir.path(), 9, Duration::from_secs(1800)));
+    }
+}
+
+/// #11690: CI is the test gate, so a repo whose main-health loop is off gets
+/// the CI fallback even when it carries a `buildGate` block (loom itself).
+#[cfg(test)]
+mod lane_tests {
+    use super::*;
+    use crate::main_health_gate::MAIN_HEALTH_GATE_ENABLE_ENV;
+
+    struct EnvPin(Option<std::ffi::OsString>);
+
+    impl Drop for EnvPin {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(v) => std::env::set_var(MAIN_HEALTH_GATE_ENABLE_ENV, v),
+                None => std::env::remove_var(MAIN_HEALTH_GATE_ENABLE_ENV),
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_build_gate_without_the_main_health_loop_falls_back_to_ci() {
+        let _pin = EnvPin(std::env::var_os(MAIN_HEALTH_GATE_ENABLE_ENV));
+        std::env::remove_var(MAIN_HEALTH_GATE_ENABLE_ENV);
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".loom")).unwrap();
+        let config = serde_json::json!({
+            "buildGate": {"enabled": true, "command": "true"},
+            "autonomous": {"mainHealthGate": {"enabled": false}},
+        });
+        std::fs::write(root.path().join(".loom/config.json"), config.to_string()).unwrap();
+        let health = MainHealthState::default();
+        assert!(lane_for(&health, root.path(), false, false).gate_disabled);
+        // The loop on: its verified-red signal decides, not CI.
+        std::env::set_var(MAIN_HEALTH_GATE_ENABLE_ENV, "1");
+        assert!(!lane_for(&health, root.path(), false, false).gate_disabled);
+        // No `buildGate` at all: CI decides, as before.
+        let bare = tempfile::tempdir().unwrap();
+        assert!(lane_for(&health, bare.path(), false, false).gate_disabled);
     }
 }

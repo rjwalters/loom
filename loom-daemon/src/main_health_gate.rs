@@ -2177,7 +2177,8 @@ pub(crate) fn run_gate_tick_with_fns(
     // is what makes an injected answer actually cover the whole tick.
     let mut runner = CommandGateRunner::new(run_config, repo_root.to_path_buf())
         .with_credential_freshness(Box::new(FnCredentialFreshness(credential_stale)));
-    let outcome = runner.run_gate();
+    // #11690: the run is one `build_gate.run` span (a no-op without an ops sink).
+    let outcome = crate::observability::ops::build_gate::main_health(tier, || runner.run_gate());
     match &outcome {
         GateOutcome::Green { .. } | GateOutcome::Red { .. } => {
             // Record which tier produced this verdict so the status/log tier

@@ -34,12 +34,14 @@
 //! `forge.reader.withdrawn` span per reader withdrawal, and [`reader_spill`]
 //! (W4-B) one `forge.reader.spill` span per read-pool spill-latch
 //! transition. [`ipc_latency`] (#10765) exports IPC request latency by
-//! request kind on its own ticker. A new emitter adds a `MetricName`/`SpanName`
+//! request kind on its own ticker. [`build_gate`] (#11690) one
+//! `build_gate.run` span per host-side run of `buildGate.command`. A new emitter adds a `MetricName`/`SpanName`
 //! variant and calls the same two functions.
 //!
 //! Tests observe what a seam emitted through the global functions with
 //! [`capture::capture`], a per-thread recorder (test builds only).
 
+pub mod build_gate;
 #[cfg(test)]
 pub mod capture;
 pub mod codex_session;
