@@ -111,6 +111,7 @@ fn context() -> ObserveContext {
         issue: Some(11300),
         pr: None,
         sweep_id: Some("sweep-issue-11300-1".into()),
+        journal_dir: None,
     }
 }
 
@@ -703,4 +704,155 @@ fn observe_attribution_follows_a_role_binding_over_an_inherited_runtime() {
     clear_runtime_env();
     assert_eq!(runtime, "opencode");
     assert_eq!(tap, "opencode:test-profile");
+}
+
+// ------------------------------------- launcher process: no ops sink (#11300)
+
+const TRACING_CONFIG: &str =
+    r#"{"observability":{"enabled":true,"exporter":"otlp","endpoint":"http://127.0.0.1:4318"}}"#;
+
+fn egress_journals(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut found: Vec<_> = entries
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension().is_some_and(|e| e == "jsonl")
+                && p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with("egress-"))
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+/// A workspace that does not export traces gets no journal: the daemon would
+/// never drain one, so writing it would only leak files.
+#[test]
+fn a_journal_is_named_only_when_the_workspace_exports_traces() {
+    let _g = super::super::tests::env_lock();
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".loom")).unwrap();
+    assert_eq!(context().with_journal(tmp.path()).journal_dir, None);
+    std::fs::write(tmp.path().join(".loom/config.json"), TRACING_CONFIG).unwrap();
+    let want = cfg!(feature = "otlp").then(|| journal_dir(tmp.path()));
+    assert_eq!(context().with_journal(tmp.path()).journal_dir, want);
+}
+
+/// The proxy runs in the `worker` launcher, which registers no ops sink. A
+/// request observed there must reach the daemon's backfill instead of being
+/// dropped: one completed span per request, in its own journal, with the tags
+/// and counts and never a body or the credential.
+#[test]
+fn without_an_ops_sink_each_request_is_journalled_for_the_daemon() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = journal_dir(tmp.path());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let reply = rt.block_on(async {
+        let events = sse(&[
+            &format!("{{\"model\":\"glm-4.6\",\"choices\":[{{\"delta\":{{\"content\":\"{SECRET_TEXT}\"}}}}]}}"),
+            "{\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":7}}",
+        ]);
+        let (addr, _) = upstream(Script {
+            status: 200,
+            content_type: "text/event-stream",
+            chunked: true,
+            pieces: vec![(0, events)],
+        })
+        .await;
+        let registry = Registry::new();
+        let placeholder = Placeholder::generate();
+        let mut ctx = context();
+        ctx.journal_dir = Some(dir.clone());
+        let record = Record::new(
+            "launch-journal",
+            "zai",
+            Upstream::parse(&format!("http://{addr}")).unwrap(),
+            HeaderStyle::AuthorizationBearer,
+            CREDENTIAL,
+        )
+        .with_observe(ctx);
+        registry.insert(&placeholder, record);
+        let bound = server::Bound::bind(std::net::Ipv4Addr::LOCALHOST.into()).unwrap();
+        let proxy = bound.addr();
+        tokio::spawn(server::serve(bound.into_tokio().unwrap(), registry));
+        let mut stream = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        stream
+            .write_all(chat_request(placeholder.as_str(), &proxy.to_string()).as_bytes())
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        stream.read_to_end(&mut out).await.unwrap();
+        String::from_utf8_lossy(&out).into_owned()
+    });
+    // Dropping the runtime waits for the blocking journal write.
+    drop(rt);
+    assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+    assert!(reply.contains(SECRET_TEXT), "the relay itself is untouched");
+
+    let journals = egress_journals(&dir);
+    assert_eq!(journals.len(), 1, "{journals:?}");
+    let raw = std::fs::read_to_string(&journals[0]).unwrap();
+    for forbidden in [SECRET_TEXT, CREDENTIAL, "loom-placeholder-"] {
+        assert!(!raw.contains(forbidden), "{forbidden} leaked into the journal: {raw}");
+    }
+    let journal = crate::telemetry::trace::journal::Journal::from_path(journals[0].clone());
+    let spans = journal.completed().unwrap();
+    assert_eq!(spans.len(), 1);
+    let span = &spans[0];
+    assert_eq!(span.name, SpanName::EgressRequest);
+    for (key, want) in [
+        ("loom.egress.seat", "seat-a"),
+        ("loom.egress.launch_id", "launch-journal"),
+        ("loom.egress.status", "200"),
+        ("loom.role", "builder"),
+        ("loom.issue", "11300"),
+        ("loom.model", "glm-4.6"),
+        ("loom.tokens.input", "12"),
+        ("loom.tokens.output", "7"),
+    ] {
+        assert_eq!(span.attributes[key], want, "{key}");
+    }
+}
+
+/// With no sink and no journal directory, publishing is a silent no-op.
+#[test]
+fn without_a_sink_or_journal_nothing_is_written() {
+    let tmp = tempfile::tempdir().unwrap();
+    let obs = Tap::new(Instant::now(), false).finish(200, None);
+    publish(&context(), "zai", "launch-none", &obs);
+    assert!(egress_journals(&journal_dir(tmp.path())).is_empty());
+}
+
+/// The journal is the one the daemon drains: its backfill pass moves the span
+/// into the export queue and retires the file.
+#[cfg(feature = "otlp")]
+#[test]
+fn the_daemon_backfill_drains_and_retires_an_egress_journal() {
+    use crate::observability::queue::DurableQueue;
+    use crate::telemetry::TelemetryRecord;
+    let _g = super::super::tests::env_lock();
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".loom")).unwrap();
+    std::fs::write(tmp.path().join(".loom/config.json"), TRACING_CONFIG).unwrap();
+    let ctx = context().with_journal(tmp.path());
+    let mut tap = Tap::new(Instant::now(), false);
+    tap.feed(b"{\"model\":\"glm-4.6\",\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":4}}");
+    publish(&ctx, "zai", "launch-backfill", &tap.finish(200, None));
+    assert_eq!(egress_journals(&journal_dir(tmp.path())).len(), 1);
+
+    let queue = DurableQueue::open(tmp.path().join("queue.jsonl"), 100);
+    assert_eq!(crate::observability::lifecycle::backfill(tmp.path(), &queue), 1);
+    let queued = queue.peek_batch(10);
+    assert_eq!(queued.len(), 1);
+    let TelemetryRecord::Span(span) = &queued[0].record else {
+        panic!("expected a span, got {:?}", queued[0].record);
+    };
+    assert_eq!(span.attributes["loom.tokens.output"], "4");
+    assert!(egress_journals(&journal_dir(tmp.path())).is_empty(), "journal retired");
 }

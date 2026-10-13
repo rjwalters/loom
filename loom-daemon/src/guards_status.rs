@@ -199,6 +199,15 @@ const CATEGORIES: &[Category] = &[
         tags: &["loom:cargo-target-dir"],
     },
     Category {
+        // Read by `loom-daemon guards remote-exec` (#11568) through the shared
+        // resolver, only once a fleet-host finding matched.
+        key: "remoteFleetExec",
+        env: "LOOM_GUARD_REMOTE_FLEET_EXEC",
+        kind: tiered_bool(true),
+        tiers: Tiers::All,
+        tags: &["loom:remote-fleet-exec"],
+    },
+    Category {
         // Read by the same verb (#10646), only once a shared-target ask is
         // about to fire.
         key: "cargoSharedTarget",

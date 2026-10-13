@@ -330,6 +330,22 @@ They all share one envelope, one writer and one cursor implementation.
 those cursors. T10 (the full-copy queue) and T11 (the timestamp cursor) become
 unnecessary.
 
+*Implemented in 2d (#11348), shadow only:* `telemetry::journal_shadow`
+appends T1-T6 after each legacy write succeeds. It is default-off: it runs only
+when `LOOM_TELEMETRY_JOURNAL` is truthy, and an absolute
+`LOOM_TELEMETRY_JOURNAL_ROOT` overrides the location above. A shadow failure is
+logged and never fails the legacy write. T1/T2/T5 `data` is the envelope
+verbatim; T3/T4/T6 `data` is the legacy line. T4 keys records by the legacy
+dedupe key, but the `seen` set stays authoritative. Deviations:
+(1) concern verify is `loom-daemon telemetry verify`, not
+`journal verify --concern`, so sibling slices do not conflict in `journal_cli`;
+(2) comparison happens on demand in `verify`, not per write
+(`persistence.shadowVerify` is not implemented);
+(3) divergence reports go to a separate journal,
+`…/telemetry-divergence/compare/`, not into the telemetry streams. They contain
+counts, kinds, keys and fingerprints only. `verify --rotate` acknowledges and
+rotates a stream only after it compares clean.
+
 ### 9.4 J3, the configuration-snapshot journal
 
 **Location:** `<ws>/.loom/state/journal/config/`.

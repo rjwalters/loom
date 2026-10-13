@@ -153,7 +153,7 @@ category=TOKEN_EXHAUSTED exit_code=1 model=none'\n\
     // AC2: the account is now the ONLY enabled codex account and it is held
     // — the very next tick must skip pre-spawn via the #8442 gate rather
     // than spawn again.
-    let before = pool_exhausted_skip_count();
+    let before = POOL_EXHAUSTED_SKIP_COUNT.on_this_thread();
     let outcome = judge_runner(workspace.path())
         .with_gh_bin(ws.gh.clone())
         .invoke("judge", "/loom:judge");
@@ -161,7 +161,7 @@ category=TOKEN_EXHAUSTED exit_code=1 model=none'\n\
         panic!("expected the #8442 gate to skip pre-spawn, got {outcome:?}");
     };
     assert_eq!(pool, CredentialPool::CodexAccounts);
-    assert_eq!(pool_exhausted_skip_count(), before + 1);
+    assert_eq!(POOL_EXHAUSTED_SKIP_COUNT.on_this_thread(), before + 1);
 }
 
 /// AC3: a `SUCCESS` terminal result from a role tick clears a pre-existing
