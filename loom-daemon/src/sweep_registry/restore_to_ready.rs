@@ -79,6 +79,13 @@ impl SweepRegistry {
         // no labels and no state, so the restore goes ahead.
         let signals = self.release_issue_signals(issue);
         let veto = crate::work_finder::restore_veto(&signals.labels, &[]);
+        if veto == Some(crate::work_finder::FROZEN_LABEL) {
+            log::info!(
+                "sweep_registry: #{issue} is `loom:frozen` — leaving every label as it is, \
+                 even the stale `loom:building` claim (#11743)"
+            );
+            return Ok(());
+        }
         // Only probe PR-ness when a veto doesn't already decide the outcome.
         let is_pr = veto.is_none() && self.issue_is_pull_request(issue).unwrap_or(false);
         let closed = if veto.is_some() || is_pr {
@@ -270,6 +277,22 @@ exit 0
         let calls = std::fs::read_to_string(&gh_log).unwrap();
         assert!(calls.contains("issue edit 11480 --remove-label loom:building"), "{calls}");
         assert!(!calls.contains("--add-label loom:issue"), "{calls}");
+    }
+
+    /// #11743: the reaper makes no label write at all to a frozen item, not
+    /// even removing the stale `loom:building` claim.
+    #[test]
+    #[serial_test::serial]
+    fn a_frozen_item_gets_no_label_write_on_claim_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let (fake_gh, gh_log) =
+            fake_gh_labels(dir.path(), "open", r#""loom:building","loom:frozen""#);
+        let registry = registry_with(&fake_gh, dir.path());
+
+        registry.restore_label_to_ready(11743).unwrap();
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap();
+        assert!(!calls.contains("issue edit"), "{calls}");
     }
 
     /// #9463 regression: merge closes the issue, then the sweep exits — the

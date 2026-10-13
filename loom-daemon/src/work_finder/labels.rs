@@ -132,6 +132,19 @@ pub const EPIC_LABEL: &str = "loom:epic";
 #[cfg_attr(not(test), allow(dead_code))]
 pub const OPERATOR_DECISION_LABEL: &str = "loom:operator-decision";
 
+/// "Not now, don't touch" (#11743): a human applies it and only a human
+/// removes it. It is a park, a skip and a hard exclusion in the registry, so
+/// every set-driven route refuses it; [`is_frozen`] is the one check for the
+/// daemon passes that must make **no** write to such an item at all (not even
+/// removing their own label).
+pub const FROZEN_LABEL: &str = "loom:frozen";
+
+/// Whether `labels` carries [`FROZEN_LABEL`] (exact match, #11366).
+#[must_use]
+pub fn is_frozen(labels: &[String]) -> bool {
+    labels.iter().any(|l| l == FROZEN_LABEL)
+}
+
 /// The one shared veto on handing an item back to the build queue (#11480):
 /// the first label in `labels` that forbids re-adding `loom:issue`, or `None`
 /// when the re-add may proceed.
@@ -155,6 +168,9 @@ pub const OPERATOR_DECISION_LABEL: &str = "loom:operator-decision";
 /// Pure: labels in, verdict out. Callers decide how to read the labels and
 /// fail open (no veto) when the read fails, as their existing probes do.
 pub fn restore_veto<'a>(labels: &'a [String], removing: &[&str]) -> Option<&'a str> {
+    if is_frozen(labels) {
+        return Some(FROZEN_LABEL);
+    }
     labels.iter().map(String::as_str).find(|l| {
         !removing.contains(l)
             && *l != BUILDING_LABEL

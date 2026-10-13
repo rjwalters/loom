@@ -28,9 +28,16 @@ impl SweepRegistry {
     /// #11517: nor onto a CLOSED issue, nor onto one that is claimed right now
     /// (`loom:building`): loom-ui#2980 gained `loom:issue` 40 s after a fresh
     /// claim, beside the live `loom:building`, from this release.
-    pub(crate) fn quarantine_release_restores_ready(&self, issue: u32) -> bool {
+    ///
+    /// `None` for a `loom:frozen` item (#11743): the release then makes no
+    /// write at all, not even removing its own `loom:blocked`.
+    pub(crate) fn quarantine_release_plan(&self, issue: u32) -> Option<bool> {
         let signals = self.release_issue_signals(issue);
         let labels = signals.labels;
+        if crate::work_finder::is_frozen(&labels) {
+            log::info!("sweep_registry: #{issue} is `loom:frozen` — quarantine release writes nothing (#11743)");
+            return None;
+        }
         let claimed = labels
             .iter()
             .any(|l| l == crate::work_finder::BUILDING_LABEL);
@@ -44,16 +51,16 @@ impl SweepRegistry {
                     "closed"
                 }
             );
-            return false;
+            return Some(false);
         }
         let Some(veto) = crate::work_finder::restore_veto(&labels, &["loom:blocked"]) else {
-            return true;
+            return Some(true);
         };
         log::info!(
             "sweep_registry: quarantine release for #{issue} found `{veto}` — removing the \
              quarantine's `loom:blocked` only, NOT re-adding `loom:issue` (#11480)"
         );
-        false
+        Some(false)
     }
 
     /// Whether the quarantine-release retry path should treat the shared

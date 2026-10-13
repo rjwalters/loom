@@ -248,7 +248,10 @@ mod tracking_parent;
 pub mod vi_cap;
 pub mod workspace_draw;
 use crate::types::QueueDisposition as Qd;
-pub use labels::{restore_veto, BUILDING_LABEL, OPERATOR_HOLD_LABEL, PARK_LABELS, SKIP_LABELS};
+pub use labels::{
+    is_frozen, restore_veto, BUILDING_LABEL, FROZEN_LABEL, OPERATOR_HOLD_LABEL, PARK_LABELS,
+    SKIP_LABELS,
+};
 pub use main_red_fix::RedMainLane;
 pub use operator_priority::{CapTerms, OverflowSlot};
 pub use ordering::{candidate_cmp, PriorityCandidate};

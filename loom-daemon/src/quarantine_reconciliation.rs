@@ -318,6 +318,10 @@ pub mod forge {
         let n = issue.to_string();
         // #11480: never hand the item back to the queue past another hold.
         let veto = crate::release_veto::quarantine_veto(gh_bin, root, issue);
+        if veto.as_deref() == Some(crate::work_finder::FROZEN_LABEL) {
+            log::info!("quarantine_reconciliation: #{issue} is `loom:frozen` — no write (#11743)");
+            return Ok(());
+        }
         let add: &[&str] = if let Some(label) = &veto {
             log::info!(
                 "quarantine_reconciliation: #{issue} carries `{label}` — removing the \

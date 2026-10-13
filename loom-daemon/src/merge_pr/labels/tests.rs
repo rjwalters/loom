@@ -206,3 +206,20 @@ fn the_sequencing_hold_line_is_stable() {
     assert_eq!(sequenced_hold_line("112", Some(111)), "LOOM-SEQUENCED-HOLD pr=112 after=111");
     assert_eq!(sequenced_hold_line("112", None), "LOOM-SEQUENCED-HOLD pr=112 after=unknown");
 }
+
+/// #11743: a frozen PR is refused with or without `loom:pr`, and the message
+/// says why; `loom:frozen-x` is not frozen.
+#[test]
+fn a_frozen_pr_is_refused_whatever_else_it_carries() {
+    for labels in [
+        "loom:frozen",
+        "loom:pr\nloom:frozen",
+        "loom:review-requested\nloom:frozen",
+    ] {
+        assert_eq!(contradiction(labels), Some("loom:frozen"), "{labels:?}");
+    }
+    assert_eq!(contradiction("loom:frozen-x"), None);
+    let msg = message("7", "loom:frozen", "loom:frozen", "abc");
+    assert!(msg.contains("is `loom:frozen`"), "{msg}");
+    assert!(!msg.contains("carries both"), "{msg}");
+}
