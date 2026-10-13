@@ -326,6 +326,9 @@ fn committed_run() -> (serde_json::Value, BTreeMap<String, Vec<f64>>, usize) {
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn the_committed_alert_query_returns_one_minute_series_per_ready_host() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
     let (_, by_host, buckets) = committed_run();
 
     assert_eq!(
@@ -363,6 +366,9 @@ fn the_committed_alert_query_returns_one_minute_series_per_ready_host() {
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn max_absorbs_the_duplicated_hour_row_that_sum_would_double() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
     let (rule, by_host, _) = committed_run();
     let starved = &by_host["host-starved"];
     assert_eq!(
@@ -405,6 +411,9 @@ fn max_absorbs_the_duplicated_hour_row_that_sum_would_double() {
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn the_committed_threshold_fires_only_on_sustained_starvation() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
     let (rule, by_host, _) = committed_run();
     let condition = &rule["condition"];
     let op = CompareOp::from_rule(condition["op"].as_str().expect("op must be a string"));
@@ -461,6 +470,9 @@ fn the_committed_threshold_fires_only_on_sustained_starvation() {
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn a_measured_zero_is_present_in_the_result_and_dropped_only_by_the_threshold() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
     let (rule, by_host, buckets) = committed_run();
     let healthy = &by_host["host-healthy"];
     assert_eq!(
@@ -494,6 +506,9 @@ fn a_measured_zero_is_present_in_the_result_and_dropped_only_by_the_threshold() 
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn match_type_changes_which_hosts_fire_on_identical_data() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
     let (rule, by_host, _) = committed_run();
     let op = CompareOp::from_rule(rule["condition"]["op"].as_str().unwrap());
     let target = rule["condition"]["target"].as_f64().unwrap();
@@ -539,6 +554,9 @@ fn match_type_changes_which_hosts_fire_on_identical_data() {
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn dropping_the_ready_state_filter_pages_on_blocked_work() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
     let (rule, by_host, _) = committed_run();
     assert!(
         !by_host.contains_key("host-blocked-only"),
@@ -574,6 +592,9 @@ fn dropping_the_ready_state_filter_pages_on_blocked_work() {
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn dropping_the_host_grouping_collapses_every_host_into_one_unattributable_series() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
     let (rule, by_host, buckets) = committed_run();
     assert!(
         by_host.contains_key("host-starved") && by_host.contains_key("host-healthy"),
@@ -626,6 +647,9 @@ fn dropping_the_host_grouping_collapses_every_host_into_one_unattributable_serie
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn a_series_without_host_id_fires_with_an_empty_host_label() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
     let (rule, by_host, buckets) = committed_run();
     let unlabelled = by_host
         .get("")

@@ -231,6 +231,9 @@ pub fn workspace_draw_record(
                 p_min: Some(step.draw.p_min),
             })
             .collect(),
+        seed_scheme: log.seed_inputs.as_ref().map(|i| i.scheme.to_string()),
+        seed_minute: log.seed_inputs.as_ref().map(|i| i.minute.to_string()),
+        seed_host: log.seed_inputs.as_ref().map(|i| i.host.clone()),
         // One temperature per tick: every draw of a `draw_order` run weighs
         // at the same one (#11684).
         temperature: log.steps.first().map(|step| step.draw.temperature),

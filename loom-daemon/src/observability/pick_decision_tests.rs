@@ -510,6 +510,8 @@ fn work_finder_record_carries_the_workspace_draw() {
     let d = &json["workspace_draw"];
     assert_eq!(d["seed"], "99");
     assert_eq!(d["draws_total"], 2);
+    // A draw with no derived seed (pinned / passed in) names no inputs.
+    assert!(d.get("seed_scheme").is_none());
     let first = &d["draws"][0];
     assert_eq!(first["pool"], "all");
     // #11684: softmax weights at T = 80, relative to the pool's p_min.
@@ -550,6 +552,35 @@ fn work_finder_record_carries_the_workspace_draw() {
         .unwrap()
         .get("workspace_draw")
         .is_none());
+}
+
+/// #11683: a clock-and-host-seeded draw exports its inputs beside the seed,
+/// and they recompute it.
+#[test]
+fn work_finder_record_carries_the_seed_inputs() {
+    use crate::work_finder::workspace_draw::{
+        draw_order, minute_seed, SeedInputs, DRAW_SEED_SCHEME,
+    };
+    use crate::work_finder::{ready_queue, WorkItem};
+    let item = |n: u32| WorkItem::with_created_at(n, vec!["loom:issue".into()], None);
+    let seed = minute_seed(29_000_000, "host-a");
+    let (_, log) = draw_order(vec![ready_queue::key_of(0, 0, &item(1), false)], &[0], seed, 80);
+    let mut log = log.unwrap();
+    log.seed_inputs = Some(SeedInputs {
+        scheme: DRAW_SEED_SCHEME,
+        minute: 29_000_000,
+        host: "host-a".into(),
+    });
+    let d = serde_json::to_value(workspace_draw_record(&log, |_| "o/r".into())).unwrap();
+    assert_eq!(d["seed"], "18365900956060715395");
+    assert_eq!(d["seed_scheme"], "loom-draw/v1");
+    assert_eq!(d["seed_minute"], "29000000");
+    assert_eq!(d["seed_host"], "host-a");
+    let minute: u64 = d["seed_minute"].as_str().unwrap().parse().unwrap();
+    assert_eq!(
+        minute_seed(minute, d["seed_host"].as_str().unwrap()).to_string(),
+        d["seed"].as_str().unwrap()
+    );
 }
 
 /// #11509: the work finder's record carries the tick's `loom:very-important`

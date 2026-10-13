@@ -346,6 +346,12 @@ fn render_fixture(template: &str, now: DateTime<Utc>) -> String {
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn committed_cycle_time_artifacts_answer_the_canonical_questions_on_real_exported_rows() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
+    if !hub_image::available(COLLECTOR_IMAGE) {
+        return;
+    }
     let observability = observability_dir();
     let extract =
         std::fs::read_to_string(observability.join("clickstack/cycle-time-extract.sql")).unwrap();
