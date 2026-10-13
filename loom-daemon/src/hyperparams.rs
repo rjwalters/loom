@@ -627,7 +627,6 @@ pub fn resolve_effective(root: &Path) -> Resolved {
             ) as usize,
             // No legacy tier: the key is new with #11684.
             draw_temperature: u32::try_from(pick_u64(
-                vector.as_ref(),
                 &block,
                 "dispatch",
                 "drawTemperature",
