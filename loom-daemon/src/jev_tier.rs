@@ -8,8 +8,8 @@
 //! p=0.51 and `complex` at p=0.98 look identical downstream, and repeat
 //! Curator passes can flip the tier. This subcommand asks Jev's `POST
 //! /v1/systemone` "System One" classifier the same three-way question — using
-//! the Curator's own tier criteria, copied verbatim from `curator.md`'s
-//! "Complexity routing marker" table — and prints one JSON object with a
+//! the tier criteria the Curator's retired "Complexity routing marker" table
+//! used (removed from `curator.md` by #11664) — and prints one JSON object with a
 //! calibrated probability per tier plus a confidence. It never reads or
 //! writes a label, never dispatches a Builder, and never resolves a model:
 //! shadow telemetry only, exactly like its sibling `jev-merge-risk` (#8545).
@@ -116,12 +116,9 @@ pub struct JevTierOutput {
 }
 
 // ---------------------------------------------------------------------------
-// Tier criteria, VERBATIM from curator.md's "Complexity routing marker" table
+// Tier criteria, as curator.md's retired "Complexity routing marker" table
+// stated them. That table is gone (#11664); Jev itself is deleted in #11665.
 // ---------------------------------------------------------------------------
-//
-// `tier_table_matches_curator_prompt` (below) re-reads that table out of
-// defaults/.claude/commands/loom/curator.md and fails if any cell here has
-// drifted from it.
 
 const MECHANICAL_CRITERIA: &str = "A mistake is obvious just reading the change — file splits, dead-code deletion, renames, hardcoded constants, ARIA attributes, mock fixes.";
 const ROUTINE_CRITERIA: &str = "The approach is clear once you've read the relevant code, and a mistake would surface in tests or review. Most bug fixes and small features. **Default stratum** — take this one when genuinely torn between it and `mechanical`.";
@@ -658,35 +655,6 @@ mod tests {
     fn tiers_cover_the_three_ids_in_curator_vocabulary_order() {
         let ids: Vec<&str> = TIERS.iter().map(|(id, _)| *id).collect();
         assert_eq!(ids, vec!["mechanical", "routine", "complex"]);
-    }
-
-    /// The criteria are only "copied verbatim from curator.md's Complexity
-    /// routing marker table" (#8543) for as long as nobody edits either side.
-    /// Re-read the table and compare, so drift fails here rather than
-    /// silently making Jev answer a different rubric than the Curator it is
-    /// shadowing.
-    #[test]
-    fn tier_table_matches_curator_prompt() {
-        let prompt = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("defaults/.claude/commands/loom/curator.md");
-        let text = std::fs::read_to_string(&prompt)
-            .unwrap_or_else(|e| panic!("cannot read {}: {e}", prompt.display()));
-
-        for (id, criteria) in TIERS.iter() {
-            let needle = format!("| `{id}` |");
-            let row = text
-                .lines()
-                .find(|l| l.starts_with(&needle))
-                .unwrap_or_else(|| panic!("no complexity-marker table row for '{id}'"));
-            let cells: Vec<&str> = row.trim().trim_matches('|').split(" | ").collect();
-            assert_eq!(cells.len(), 2, "unexpected row shape for '{id}'");
-            assert_eq!(
-                cells[1].trim(),
-                *criteria,
-                "criteria for '{id}' has drifted from curator.md"
-            );
-        }
     }
 
     #[test]

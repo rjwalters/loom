@@ -125,13 +125,8 @@
 //!
 //! # What it never does
 //!
-//! The only git write is the `merge --ff-only` of row 10 ([`git`]). A
-//! checkout that is not clean and strictly behind is left exactly as it is
-//! and reported. This is stricter than the main-health gate's own sync
-//! (`main_health_gate::prepare_workspace_to_origin_main`), which resets and
-//! may therefore ignore some dirt: this step discards nothing, so any tracked
-//! change is `dirty`. The gate's sync is unchanged; after a fast-forward its
-//! reset is a no-op.
+//! The only ordinary write is row 10's `merge --ff-only` ([`git`]). Anything
+//! else blocking it is reported, unless [`self_heal`] clears it (#11425).
 //!
 //! # The Loom source checkout
 //!
@@ -163,8 +158,10 @@
 //! row. A skipped checkout whose missing commits change an installed Loom
 //! file is reported at ERROR.
 
+pub(crate) mod external_change;
 mod git;
 mod host;
+mod self_heal;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -172,6 +169,8 @@ use std::time::Duration;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
+
+use crate::telemetry::kinds::checkout_external_change::CheckoutExternalChangeRecord;
 
 pub(crate) use host::hold_for_self_update;
 pub use host::BUSY_NOTE;
@@ -346,6 +345,9 @@ pub struct CheckoutPass {
     /// Fetches this pass did not run because the volume is below the
     /// free-space floor (#10995). Never counted in `fetches`.
     pub low_disk: u32,
+    /// Reflog entries Loom did not write, found in this pass (#11566). One
+    /// `checkout.external_change` record each; already logged and emitted.
+    pub external_changes: Vec<CheckoutExternalChangeRecord>,
 }
 
 impl CheckoutPass {
@@ -355,7 +357,7 @@ impl CheckoutPass {
     pub fn fast_forwarded(&self) -> Vec<PathBuf> {
         self.transitions
             .iter()
-            .filter(|t| t.report.state == CheckoutState::FastForwarded)
+            .filter(|t| t.kind == "fast-forwarded")
             .map(|t| t.report.root.clone())
             .collect()
     }
@@ -428,9 +430,12 @@ struct Seen {
 #[derive(Debug, Default)]
 pub struct Memory {
     seen: HashMap<PathBuf, Seen>,
+    /// The reflogs as the last pass saw them (#11566).
+    reflogs: HashMap<PathBuf, external_change::Marks>,
     /// Where the next pass starts, so a pass that ran out of time does not
     /// starve the workspaces at the end of the list.
     cursor: usize,
+    escalated: self_heal::Ledger,
 }
 
 impl Memory {
@@ -639,12 +644,14 @@ struct Net {
     misses: u32,
     /// The rate-limit breaker was found open: nothing more is asked.
     breaker_open: bool,
+    repairs: Vec<self_heal::Repair>,
 }
 
 /// Run one checkout pass over `roots`. Never fails: every failure is a state.
 pub fn run(env: &Env<'_>, roots: &[PathBuf], memory: &mut Memory) -> CheckoutPass {
     let mut pass = CheckoutPass::default();
     memory.seen.retain(|root, _| roots.contains(root));
+    memory.reflogs.retain(|root, _| roots.contains(root));
     let mut net = Net::default();
     let start = memory.cursor % roots.len().max(1);
     let mut reached = 0;
@@ -653,7 +660,10 @@ pub fn run(env: &Env<'_>, roots: &[PathBuf], memory: &mut Memory) -> CheckoutPas
             break;
         }
         let found = attempt(env, root, &mut net);
-        memory.record(root, found, (env.clock)(), &mut pass.transitions);
+        let now = (env.clock)();
+        let report = memory.record(root, found, now, &mut pass.transitions);
+        self_heal::after(env, memory, &mut net, &report, &mut pass.transitions);
+        watch_reflog(root, report.branch.as_deref(), now, memory, &mut pass);
         reached += 1;
     }
     pass.deferred = roots.len() - reached;
@@ -682,6 +692,36 @@ pub fn run(env: &Env<'_>, roots: &[PathBuf], memory: &mut Memory) -> CheckoutPas
         }
     }
     pass
+}
+
+/// Compare `root`'s reflogs with the last pass's and report every entry Loom
+/// did not write (#11566). Read-only; runs whatever state the attempt ended in.
+fn watch_reflog(
+    root: &Path,
+    branch: Option<&str>,
+    now: DateTime<Utc>,
+    memory: &mut Memory,
+    pass: &mut CheckoutPass,
+) {
+    let logs = external_change::read_logs(root, branch);
+    let scan = memory
+        .reflogs
+        .entry(root.to_path_buf())
+        .or_default()
+        .scan(&logs);
+    if scan.found.is_empty() {
+        return;
+    }
+    let ctx = external_change::Context {
+        root,
+        host: &external_change::host(),
+        now,
+        hold_active: crate::workspace_hold::hold_for(root).is_some(),
+    };
+    for record in external_change::records(&ctx, scan) {
+        external_change::publish(&record);
+        pass.external_changes.push(record);
+    }
 }
 
 /// Rule 5: make sure `origin/<branch>` is the remote's head. A head the
@@ -754,6 +794,7 @@ fn attempt(env: &Env<'_>, root: &Path, net: &mut Net) -> Decided {
         return found.end(S::NoDefaultBranch, why.to_string());
     };
     found.branch = Some(branch.clone());
+    self_heal::heal(env, root, &branch, net);
     found.head = git::head(root, local());
 
     // 2. HEAD is on it.

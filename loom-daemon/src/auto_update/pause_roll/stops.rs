@@ -32,7 +32,7 @@ use chrono::Utc;
 
 use super::host::{Candidate, PauseHost};
 use super::teardown::TeardownReport;
-use super::{PauseRollTuning, Run};
+use super::{roll_interruption, PauseRollTuning, RollDisposition, Run};
 use crate::auto_update::pause_manifest::ItemStatus;
 
 type Job = (usize, Candidate);
@@ -162,10 +162,20 @@ impl Run<'_> {
     /// Commit the pause (under the drain lock), then hand `idx`'s tree to the
     /// pool. `false` when the pause no longer owns the drain, so nothing was
     /// handed over.
-    pub(super) fn start_stop(&mut self, pool: &mut StopPool, idx: usize) -> bool {
+    ///
+    /// The stop is noted, before any signal, as `disposition` (#11263): the
+    /// run's own close then reads `interrupted_by_roll`, not `failure`.
+    pub(super) fn start_stop(
+        &mut self,
+        pool: &mut StopPool,
+        idx: usize,
+        disposition: RollDisposition,
+    ) -> bool {
         if !self.drain.pause_commit_stop(self.gen()) {
             return false;
         }
+        let cand = &self.work[idx].cand;
+        roll_interruption::note_stopped(cand.pid, &cand.id, disposition);
         pool.submit(idx, self.work[idx].cand.clone());
         true
     }

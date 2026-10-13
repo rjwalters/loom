@@ -81,6 +81,15 @@
 //! Exit codes: 0 and 1 are the answers above; 2 means "could not run"
 //! (unreadable stdin, bad arguments) — never a verdict. The script maps an
 //! unexpected 2 to "pool incomplete", and `create-issue.sh` fails open on it.
+//!
+//! # The closed pool can be fetched here (#9208)
+//!
+//! With `--closed-window-days N` (closed-issues pool only) stdin is not read:
+//! the pool is ONE time-bounded issue search built from the query's own
+//! keywords — see [`super::duplicate_closed_search`] — and is then scored by
+//! the same [`scan`]. Exit 3 with an empty stdout means the search could not
+//! answer; the script then fetches its recency list and calls again without
+//! the flag, so a failed search never costs a verdict.
 
 use std::io::Read;
 use std::path::PathBuf;
@@ -241,6 +250,17 @@ pub(crate) struct DuplicateScanArgs {
     /// changed.
     #[arg(long)]
     rest_fallback: bool,
+
+    /// Fetch the closed-issues pool here instead of reading it from stdin
+    /// (#9208): ONE issue-search request for issues closed in the last N days
+    /// that match the query's keywords, scored exactly as a stdin pool is.
+    /// `--pool closed-issues` only. Exits 3, printing nothing on stdout, when
+    /// the search cannot answer -- the caller then falls back to its recency
+    /// list. 0 skips the search (exit 3, no request, no warning). No default
+    /// here: check-duplicate.sh passes its own (90, a year-old closed issue
+    /// being a far weaker duplicate signal than a month-old one).
+    #[arg(long, value_name = "DAYS")]
+    closed_window_days: Option<u32>,
 }
 
 /// One candidate from the pool. Extra fields are ignored; `number` must be
@@ -506,39 +526,75 @@ pub(crate) fn scan(
     outcome
 }
 
-impl DuplicateScanArgs {
-    pub(crate) fn run(self) -> Result<()> {
-        let mut buf = String::new();
-        if std::io::stdin().read_to_string(&mut buf).is_err() {
-            eprintln!("duplicate-scan: could not read the candidate pool from stdin");
-            std::process::exit(2);
-        }
-
-        // Parse element-by-element, skipping entries that do not shape up:
-        // the shell's per-line `jq` loop silently skipped null-numbered
-        // entries, and a pool that is not valid JSON top-to-bottom behaved
-        // as empty (jq errored per line, the loop ran zero iterations) — an
-        // answer of "no matches", not a crash.
-        let mut candidates: Vec<Candidate> = Vec::new();
-        let mut unparsed = false;
-        if !buf.trim().is_empty() {
-            match serde_json::from_str::<Vec<serde_json::Value>>(&buf) {
-                Ok(values) => {
-                    for v in values {
-                        match serde_json::from_value::<Candidate>(v) {
-                            Ok(c) => candidates.push(c),
-                            Err(_) => unparsed = true,
-                        }
+/// The candidate pool from stdin.
+///
+/// Parsed element-by-element, skipping entries that do not shape up: the
+/// shell's per-line `jq` loop silently skipped null-numbered entries, and a
+/// pool that is not valid JSON top-to-bottom behaved as empty (jq errored per
+/// line, the loop ran zero iterations) — an answer of "no matches", not a
+/// crash.
+fn read_pool_from_stdin() -> Vec<Candidate> {
+    let mut buf = String::new();
+    if std::io::stdin().read_to_string(&mut buf).is_err() {
+        eprintln!("duplicate-scan: could not read the candidate pool from stdin");
+        std::process::exit(2);
+    }
+    let mut candidates: Vec<Candidate> = Vec::new();
+    let mut unparsed = false;
+    if !buf.trim().is_empty() {
+        match serde_json::from_str::<Vec<serde_json::Value>>(&buf) {
+            Ok(values) => {
+                for v in values {
+                    match serde_json::from_value::<Candidate>(v) {
+                        Ok(c) => candidates.push(c),
+                        Err(_) => unparsed = true,
                     }
                 }
-                Err(_) => unparsed = true,
+            }
+            Err(_) => unparsed = true,
+        }
+    }
+    if unparsed {
+        eprintln!(
+            "duplicate-scan: warning: part of the candidate pool was not valid JSON and was skipped"
+        );
+    }
+    candidates
+}
+
+impl DuplicateScanArgs {
+    /// The closed-issues pool from the windowed search (#9208). Exits rather
+    /// than returns when there is no pool to scan: 2 on a misuse, 3 when the
+    /// search could not answer (the caller's cue to fall back).
+    fn closed_window_pool(&self, days: u32) -> Vec<Candidate> {
+        use super::duplicate_closed_search::{fetch, ClosedSearch, EXIT_SEARCH_UNAVAILABLE};
+        if self.pool != Pool::ClosedIssues {
+            eprintln!("duplicate-scan: --closed-window-days applies to --pool closed-issues only");
+            std::process::exit(2);
+        }
+        if days == 0 {
+            std::process::exit(EXIT_SEARCH_UNAVAILABLE);
+        }
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        match fetch(&cwd, &self.title, &self.body, days, chrono::Utc::now()) {
+            ClosedSearch::Candidates(candidates) => candidates,
+            // No keywords: scan() bails on the same condition, with no pool.
+            ClosedSearch::NoKeywords => Vec::new(),
+            ClosedSearch::Unavailable(why) => {
+                eprintln!(
+                    "duplicate-scan: WARNING: the closed-issue search (last {days} days) could \
+                     not answer ({why}); falling back to the most recently created closed issues"
+                );
+                std::process::exit(EXIT_SEARCH_UNAVAILABLE);
             }
         }
-        if unparsed {
-            eprintln!(
-                "duplicate-scan: warning: part of the candidate pool was not valid JSON and was skipped"
-            );
-        }
+    }
+
+    pub(crate) fn run(self) -> Result<()> {
+        let candidates = match self.closed_window_days {
+            Some(days) => self.closed_window_pool(days),
+            None => read_pool_from_stdin(),
+        };
 
         let query_keywords = extract_keywords(&format!("{} {}", self.title, self.body));
         // The title alone is the corroborating signal (#8591) — scored

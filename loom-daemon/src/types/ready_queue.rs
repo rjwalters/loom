@@ -4,11 +4,10 @@
 //! backoff-skip, 2 deferred-capacity"); these rows say *which* issue got
 //! *which* outcome, in the order the work finder actually ranks them. The
 //! order is the daemon's own dispatch comparator,
-//! `crate::work_finder::candidate_cmp` (#9244): `loom:operator-priority`
-//! (starred) first, starred issues by starred-at, then red-main fixes (only
-//! while that repo's `main` is verified red), then workspace priority, then
-//! oldest `createdAt`, then issue number. `loom:urgent` and `tier:*` labels
-//! do not affect dispatch order.
+//! `crate::work_finder::candidate_cmp` (#11103, #11547): verified red-main
+//! fixes first (only while that repo's `main` is verified red), then
+//! priority level (`loom:very-important`, `loom:important`, none), then
+//! oldest `createdAt`, then issue number.
 
 use serde::{Deserialize, Serialize};
 
@@ -33,8 +32,8 @@ pub enum QueueDisposition {
     /// Waiting: the saturation admission brake held new admissions.
     DeferredSaturation,
     /// Waiting: the build back-off (#9410) held new issue builds because the
-    /// host's review + merge debt is high. Starred and red-main-fix issues
-    /// bypass it, so this row is always an unstarred issue.
+    /// host's review + merge debt is high. A verified red-main fix bypasses
+    /// it, so this row is never one.
     DeferredBuildBackoff,
     /// Waiting: outside this host's preferred repo slice while the slice still
     /// had work (repo sharding, #6243).
@@ -59,9 +58,6 @@ pub enum QueueDisposition {
     WorkspaceCommandsMissing,
     /// Not for this host: a host-affinity constraint names another host.
     HostConstraint,
-    /// Not for this host: it carries `loom:heavy` and this host is
-    /// classified `local-dev`, with no override set (Issue #9034).
-    HostClassRefused,
     /// Blocked: it carries a skip/park label (or lacks a required capability).
     Parked,
     /// Blocked: a hard-exclusion rule applies (e.g. the `external` label).
@@ -86,6 +82,11 @@ pub enum QueueDisposition {
     OpenPr,
     /// The dispatch attempt failed.
     DispatchError,
+    /// Skipped: its work already landed. The issue is closed, or this host
+    /// recorded a `landed` sweep for it moments ago (Issue #11429).
+    AlreadyLanded,
+    /// Skipped: the issue is closed as not planned (Issue #11429).
+    AlreadyClosed,
     /// Blocked on the forge: the issue carries `loom:blocked` without
     /// `loom:issue`, so the work finder never lists it (Issue #8957). Only in
     /// `queue.snapshot`, added by the collector from its own cached forge
@@ -101,7 +102,7 @@ impl QueueDisposition {
     /// ([`Self::LabelledBlocked`] and [`Self::Unknown`] excluded). The queue-depth metrics (Issue #8852, phase 2) emit one
     /// point per entry every tick, zeros included, so an empty queue reads as
     /// `0` rather than as a missing series.
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 26] = [
         Self::Dispatched,
         Self::InFlight,
         Self::DeferredCapacity,
@@ -114,7 +115,6 @@ impl QueueDisposition {
         Self::WorkspaceHalted,
         Self::WorkspaceCommandsMissing,
         Self::HostConstraint,
-        Self::HostClassRefused,
         Self::Parked,
         Self::HardExclusion,
         Self::RecheckInterval,
@@ -127,6 +127,8 @@ impl QueueDisposition {
         Self::PeerClaim,
         Self::OpenPr,
         Self::DispatchError,
+        Self::AlreadyLanded,
+        Self::AlreadyClosed,
     ];
 
     /// The snake_case wire name (identical to the serde form; pinned by a
@@ -146,7 +148,6 @@ impl QueueDisposition {
             Self::WorkspaceHalted => "workspace_halted",
             Self::WorkspaceCommandsMissing => "workspace_commands_missing",
             Self::HostConstraint => "host_constraint",
-            Self::HostClassRefused => "host_class_refused",
             Self::Parked => "parked",
             Self::HardExclusion => "hard_exclusion",
             Self::RecheckInterval => "recheck_interval",
@@ -159,6 +160,8 @@ impl QueueDisposition {
             Self::PeerClaim => "peer_claim",
             Self::OpenPr => "open_pr",
             Self::DispatchError => "dispatch_error",
+            Self::AlreadyLanded => "already_landed",
+            Self::AlreadyClosed => "already_closed",
             Self::LabelledBlocked => "labelled_blocked",
             Self::Unknown => "unknown",
         }
@@ -200,7 +203,6 @@ impl QueueDisposition {
             }
             Self::WorkspaceCommandsMissing => "blocked: workspace missing sweep command",
             Self::HostConstraint => "not for this host (host affinity)",
-            Self::HostClassRefused => "blocked: heavy sweep refused on local-dev host_class",
             Self::Parked => "blocked: skip/park label",
             Self::HardExclusion => "blocked: hard-exclusion rule",
             Self::RecheckInterval => "waiting: issue's recheck interval",
@@ -213,6 +215,8 @@ impl QueueDisposition {
             Self::PeerClaim => "held by a peer host",
             Self::OpenPr => "blocked: open linked PR",
             Self::DispatchError => "dispatch failed",
+            Self::AlreadyLanded => "skipped: work already landed",
+            Self::AlreadyClosed => "skipped: issue closed as not planned",
             Self::LabelledBlocked => "blocked: labelled loom:blocked",
             Self::Unknown => "unknown",
         }
@@ -230,27 +234,24 @@ pub struct ReadyQueueRow {
     pub issue: u32,
     /// The owning workspace's priority tier (lower dispatches first).
     pub workspace_priority: u32,
-    /// Deprecated (#9244): always `false`. `loom:urgent` no longer affects
-    /// dispatch order; the field stays on the wire for one release.
+    /// Deprecated (#9244): always `false`. Its label was deleted in #11105;
+    /// the field stays on the wire only for compatibility.
     pub urgent: bool,
-    /// Whether the issue is starred (`loom:operator-priority`, #9244).
+    /// The issue's priority level (#11103, #11510): `default`, `important`
+    /// or `very-important`, from its own `loom:important` /
+    /// `loom:very-important` label after the very-important cap (#11509).
+    /// Absent (an older daemon) reads as `default`.
     #[serde(default)]
-    pub operator_priority: bool,
-    /// When it was starred, when known (#9244). Absent for an unstarred
-    /// issue, or a starred one ordered by its `createdAt` fallback.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub operator_priority_at: Option<String>,
-    /// Whether it is a red-main fix boosted this tick: it carries
-    /// `<!-- loom:main-red-fix -->` and its repo's `main` is verified red.
+    pub level: crate::priority_pick::Level,
+    /// Whether it is a verified red-main fix this tick: it carries
+    /// `<!-- loom:main-red-fix -->` and its repo's `main` is verified red
+    /// (#9244). Since #11508 it is not an ordering key; it only bypasses the
+    /// build back-off, the file-overlap gate and the repo-sharding slice.
     #[serde(default)]
     pub main_red_fix: bool,
     /// The issue's `createdAt`, when the listing supplied it.
     #[serde(default)]
     pub created_at: Option<String>,
-    /// The issue's `tier:*` label, if any. Informational only: the work
-    /// finder does not order by it.
-    #[serde(default)]
-    pub tier: Option<String>,
     /// The issue's resolved story-point size (#9432, from its single
     /// `points:*` label), when the listing supplied a legal one (Issue
     /// #9674). `None` for an unsized issue, a stacked/out-of-vocabulary
@@ -340,11 +341,6 @@ mod tests {
         assert_eq!(QueueDisposition::Dispatched.state(), "running");
         assert_eq!(QueueDisposition::DeferredCapacity.state(), "ready");
         assert_eq!(QueueDisposition::OpenPr.state(), "blocked");
-        // #9034: a host-class refusal is `blocked`, not `ready` — it never
-        // self-resolves by waiting, the way a capacity/ramp/saturation defer
-        // does.
-        assert_eq!(QueueDisposition::HostClassRefused.state(), "blocked");
-        assert_eq!(QueueDisposition::HostClassRefused.as_str(), "host_class_refused");
     }
 
     /// Issue #9410: the build back-off disposition round-trips, is a
@@ -352,7 +348,7 @@ mod tests {
     #[test]
     fn build_backoff_disposition_round_trips_and_old_summaries_parse() {
         let d = QueueDisposition::DeferredBuildBackoff;
-        assert_eq!(QueueDisposition::ALL.len(), 25);
+        assert_eq!(QueueDisposition::ALL.len(), 26);
         assert!(QueueDisposition::ALL.contains(&d));
         let json = serde_json::to_value(d).unwrap();
         assert_eq!(json, serde_json::json!("deferred_build_backoff"));

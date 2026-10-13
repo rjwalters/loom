@@ -160,7 +160,7 @@ fn label_transition_is_exclusive() {
         ]
     );
     assert_eq!(
-        label_problems(VerdictKind::Approved, &labels(&["loom:operator-priority"])),
+        label_problems(VerdictKind::Approved, &labels(&["loom:important"])),
         vec!["missing loom:pr"]
     );
     assert!(label_problems(VerdictKind::Approved, &labels(&["loom:pr"])).is_empty());

@@ -1,4 +1,6 @@
-//! Dispatch **park-guard** test for the `loom:operator` hold (vibesql#6664).
+//! Dispatch **park-guard** tests for the skip labels that are deliberately
+//! not parks: the `loom:operator` hold (vibesql#6664) and the `loom:epic`
+//! tracking container (#11399).
 //!
 //! Split out as a sibling file rather than appended to `dispatch/tests.rs`:
 //! that module is over the 1000-line ratchet threshold and frozen at its
@@ -40,6 +42,39 @@ fn dispatch_park_guard_allows_operator_hold_alone() {
     );
     assert!(
         calls.contains("issue edit 6172"),
+        "dispatch proceeded to the label flip; got: {calls:?}"
+    );
+    std::env::remove_var("LOOM_REPO");
+}
+
+/// AC (#11399): `loom:epic` stops the work finder from listing an epic as a
+/// candidate (it is in SKIP_LABELS), but it is not a park. An operator's
+/// explicit `loom-daemon dispatch <N>` / `dispatch_sweep` on an epic is their
+/// call, so this guard must let it through even when the epic also carries
+/// `loom:issue`.
+#[test]
+#[serial]
+fn dispatch_park_guard_allows_an_explicit_dispatch_on_an_epic() {
+    assert!(crate::work_finder::SKIP_LABELS.contains(&"loom:epic"));
+    assert!(!crate::work_finder::PARK_LABELS.contains(&"loom:epic"));
+
+    let tmp = tempdir().unwrap();
+    let ws = tmp.path();
+    std::env::set_var("LOOM_REPO", "rjwalters/loom");
+    let (mut reg, gh_log) = park_guard_registry(ws, "loom:epic loom:issue", 0, "", false);
+
+    let out = reg
+        .dispatch(&SweepKind::Issue(11399), None, None, None, None)
+        .expect("`loom:epic` is a skip, not a park: an explicit dispatch must not be refused");
+    assert!(wait_until_dead(out.pid, FIXTURE_CHILD_WAIT_MS));
+
+    let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+    assert!(
+        calls.contains("api repos/rjwalters/loom/issues/11399 --jq .labels[].name"),
+        "the guard probed the labels and did not refuse; got: {calls:?}"
+    );
+    assert!(
+        calls.contains("issue edit 11399"),
         "dispatch proceeded to the label flip; got: {calls:?}"
     );
     std::env::remove_var("LOOM_REPO");

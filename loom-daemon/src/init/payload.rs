@@ -99,6 +99,7 @@ use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 use tempfile::TempDir;
 
+pub mod standalone;
 pub(crate) mod surfaces;
 
 use super::file_ops::force_merge_dir_with_report_filtered;
@@ -661,6 +662,22 @@ pub fn resync_workspace_with(payload: &Payload, dest: &Path) -> Result<ResyncOut
         return Ok(ResyncOutcome::Unchanged);
     }
     apply(dest, &diff)
+}
+
+/// What [`resync_workspace_with`] would do to `dest`, without touching it:
+/// the gate's refusal, or the diff [`apply`] would write (possibly empty).
+/// The dry-run entry point (#8961).
+///
+/// # Errors
+/// See [`materialize_with`].
+pub fn plan_workspace_with(
+    payload: &Payload,
+    dest: &Path,
+) -> Result<Result<PayloadDiff, ResyncRefusal>> {
+    if let Err(refusal) = gate_workspace(dest, payload.stamp()) {
+        return Ok(Err(refusal));
+    }
+    materialize_with(payload, dest).map(Ok)
 }
 
 /// [`resync_gate`] over a workspace's working-tree metadata, for a payload

@@ -5,7 +5,7 @@
 //!
 //! `loom:operator-only` is a **hard park**: every dispatch route refuses the
 //! item, unconditionally, keyed on the base label
-//! ([`crate::work_finder::PARK_LABELS`]). Its four sub-kind labels (#5671) are
+//! ([`crate::work_finder::PARK_LABELS`]). Its sub-kind labels (#5671) are
 //! additive metadata the skip logic never branched on, so a
 //! `loom:operator-mechanical` item — "needs a credential/host access, but **no
 //! judgement**" — was parked exactly like a genuine `loom:operator-decision`
@@ -103,7 +103,7 @@ pub const KNOWN_CAPABILITY_LITERALS: &[&str] =
 /// is **not** a valid value — something must follow the colon.
 pub const KNOWN_CAPABILITY_PREFIXES: &[&str] = &["cloud-profile:"];
 
-/// The `loom:operator-only` base label — the hard park all four sub-kinds
+/// The `loom:operator-only` base label — the hard park all its sub-kinds
 /// inherit.
 pub const OPERATOR_ONLY_LABEL: &str = "loom:operator-only";
 
@@ -111,17 +111,13 @@ pub const OPERATOR_ONLY_LABEL: &str = "loom:operator-only";
 /// requiring access, not a ruling (#5671).
 pub const OPERATOR_MECHANICAL_LABEL: &str = "loom:operator-mechanical";
 
-/// The other three `loom:operator-only` sub-kinds. Each stays hard-skipped
+/// The other two `loom:operator-only` sub-kinds. Each stays hard-skipped
 /// **unconditionally**, regardless of any capability marker in its body — the
 /// convention doc is explicit that they ignore the marker entirely. Listed here
 /// so [`labels_eligible_for_capability_lane`] can refuse an item that carries
 /// one of them *alongside* `loom:operator-mechanical` (a contradictory
 /// labelling, resolved conservatively in favour of the judgement sub-kind).
-pub const JUDGEMENT_SUB_KIND_LABELS: &[&str] = &[
-    "loom:operator-decision",
-    "loom:operator-blocked",
-    "loom:operator-objective",
-];
+pub const JUDGEMENT_SUB_KIND_LABELS: &[&str] = &["loom:operator-decision", "loom:operator-blocked"];
 
 /// Labels that veto the capability lane outright even next to a well-formed
 /// mechanical declaration.
@@ -866,7 +862,7 @@ mod tests {
 
     #[test]
     fn a_judgement_sub_kind_with_a_marker_and_a_capable_worker_still_parks() {
-        // The convention doc's explicit rule: the other three sub-kinds ignore
+        // The convention doc's explicit rule: the other sub-kinds ignore
         // the marker entirely.
         for sub_kind in JUDGEMENT_SUB_KIND_LABELS {
             let routing = route_mechanical(

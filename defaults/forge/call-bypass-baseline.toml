@@ -9,7 +9,7 @@
 # Eliminating these entries is the caller-migration issue's job, not this
 # ledger's — see `removal_epic` below and each entry's `removal_issue`.
 #
-# 80 file(s), 247 direct call site(s) at baseline.
+# 82 file(s), 252 direct call site(s) at baseline.
 
 removal_epic = 9769
 
@@ -134,12 +134,6 @@ owner = "role-scripts"
 removal_issue = 9799
 
 [[bypass]]
-path = "defaults/scripts/require-complexity-marker.sh"
-calls = 2
-owner = "role-scripts"
-removal_issue = 9799
-
-[[bypass]]
 path = "defaults/scripts/sweep-lease-fence.sh"
 calls = 1
 owner = "role-scripts"
@@ -231,6 +225,12 @@ removal_issue = 9799
 
 [[bypass]]
 path = "loom-daemon/src/cli/pr_latency_render.rs"
+calls = 2
+owner = "daemon-cli"
+removal_issue = 9799
+
+[[bypass]]
+path = "loom-daemon/src/cli/role_tool_policy.rs"
 calls = 2
 owner = "daemon-cli"
 removal_issue = 9799
@@ -392,20 +392,26 @@ owner = "daemon-other"
 removal_issue = 9799
 
 [[bypass]]
+path = "loom-daemon/src/role_tool_policy/command_match.rs"
+calls = 3
+owner = "daemon-other"
+removal_issue = 9799
+
+[[bypass]]
 path = "loom-daemon/src/script_helpers/validate_phase.rs"
 calls = 5
 owner = "daemon-other"
 removal_issue = 9799
 
 [[bypass]]
-path = "loom-daemon/src/star_liveness/forge.rs"
+path = "loom-daemon/src/sweep_registry/guards.rs"
 calls = 4
-owner = "daemon-other"
+owner = "daemon-sweep"
 removal_issue = 9799
 
 [[bypass]]
-path = "loom-daemon/src/sweep_registry/guards.rs"
-calls = 4
+path = "loom-daemon/src/sweep_registry/noop_cooldown/hold.rs"
+calls = 3
 owner = "daemon-sweep"
 removal_issue = 9799
 
@@ -417,12 +423,6 @@ removal_issue = 9799
 
 [[bypass]]
 path = "loom-daemon/src/sweep_registry/quarantine.rs"
-calls = 1
-owner = "daemon-sweep"
-removal_issue = 9799
-
-[[bypass]]
-path = "loom-daemon/src/work_finder/operator_priority.rs"
 calls = 1
 owner = "daemon-sweep"
 removal_issue = 9799

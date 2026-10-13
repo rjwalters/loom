@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use chrono::{TimeZone, Utc};
 
 use super::{build_record, is_new_tick};
+use crate::priority_pick::Level;
 use crate::telemetry::queue_snapshot::{QueueRepoRef, QueueSnapshotRow, MAX_ROWS};
 use crate::telemetry::{RepoVisibility, TelemetryEnvelope, TelemetryRecord};
 use crate::types::{QueueDisposition as Qd, ReadyQueueRow, WorkFinderTickSummary};
@@ -19,11 +20,9 @@ fn row(rank: usize, repo: &str, issue: u32, d: Qd, detail: Option<&str>) -> Read
         issue,
         workspace_priority: 100,
         urgent: false,
-        operator_priority: false,
-        operator_priority_at: None,
+        level: Level::Default,
         main_red_fix: false,
         created_at: Some("2026-09-01T00:00:00Z".into()),
-        tier: Some("tier:goal-advancing".into()),
         story_points: None,
         disposition: d,
         detail: detail.map(str::to_string),
@@ -80,7 +79,6 @@ fn rows_carry_slug_and_visibility_never_a_local_path() {
     assert_eq!(first.state, "running");
     assert_eq!(first.reason, "dispatched this tick");
     assert_eq!(record.rows[1].visibility, RepoVisibility::Private);
-    assert_eq!(record.rows[1].tier.as_deref(), Some("tier:goal-advancing"));
     // Counts cover every row, the unresolved one included.
     assert_eq!((record.counts.running, record.counts.ready, record.counts.blocked), (1, 1, 1));
     let json = serde_json::to_string(&record).unwrap();
@@ -189,27 +187,29 @@ fn a_row_without_visibility_decodes_private() {
 }
 
 #[test]
-fn rows_carry_operator_priority_and_urgent_is_always_false() {
-    // #9244: starred rows ship `operator_priority` / `operator_priority_at`;
-    // `urgent` stays on the wire for one release but is always false, even if
-    // a (stale) summary row still claims it.
-    let mut starred = row(1, PUBLIC_ROOT, 10, Qd::Dispatched, None);
-    starred.urgent = true;
-    starred.operator_priority = true;
-    starred.operator_priority_at = Some("2026-09-27T08:00:00Z".into());
+fn rows_carry_the_level_and_urgent_is_always_false() {
+    // #11510: the level is copied from the row (`default` / `important` /
+    // `very-important`); `urgent` stays on the wire but is always false, even
+    // if a (stale) summary row claims it.
+    let mut important = row(1, PUBLIC_ROOT, 10, Qd::Dispatched, None);
+    important.urgent = true;
+    important.level = Level::VeryImportant;
     let plain = row(2, PUBLIC_ROOT, 11, Qd::DeferredCapacity, None);
-    let record = build_record(&summary(vec![starred, plain]), &repos());
+    let record = build_record(&summary(vec![important, plain]), &repos());
     let wire = serde_json::to_value(&record.rows).unwrap();
     assert_eq!(wire[0]["urgent"], false);
-    assert_eq!(wire[0]["operator_priority"], true);
-    assert_eq!(wire[0]["operator_priority_at"], "2026-09-27T08:00:00Z");
-    assert_eq!(wire[1]["operator_priority"], false);
-    assert!(wire[1].get("operator_priority_at").is_none(), "{wire}");
-    // An older daemon's row (no new fields) still decodes.
+    assert_eq!(wire[0]["level"], "very-important");
+    assert_eq!(wire[1]["level"], "default");
+    assert!(wire[0].get("operator_priority").is_none(), "{wire}");
+    assert!(wire[0].get("tier").is_none(), "{wire}");
+    // An older daemon's row (a retired `operator_priority`, no `level`) still
+    // decodes, at the default level.
     let mut legacy = wire[1].clone();
-    legacy.as_object_mut().unwrap().remove("operator_priority");
+    let obj = legacy.as_object_mut().unwrap();
+    obj.remove("level");
+    obj.insert("operator_priority".into(), serde_json::json!(true));
     let decoded: QueueSnapshotRow = serde_json::from_value(legacy).unwrap();
-    assert!(!decoded.operator_priority);
+    assert_eq!(decoded.level, Level::Default);
 }
 
 /// Issue #9288: the plan's row fields and the per-tick block ride
@@ -300,4 +300,24 @@ fn deferred_file_overlap_row_exports_its_shared_paths_in_the_serialized_snapshot
         !json.to_string().contains("secret stderr"),
         "dispatch-error text stays excluded"
     );
+}
+
+#[test]
+fn workspace_halted_rows_carry_halt_cause_and_name_it_in_reason() {
+    let s = summary(vec![
+        row(1, PUBLIC_ROOT, 10, Qd::WorkspaceHalted, Some("main_red")),
+        row(2, PUBLIC_ROOT, 11, Qd::WorkspaceHalted, None),
+        row(3, PUBLIC_ROOT, 12, Qd::WorkspaceHalted, Some("free text")),
+        row(4, PUBLIC_ROOT, 13, Qd::DeferredCapacity, Some("main_red")),
+    ]);
+    let rows = build_record(&s, &repos()).rows;
+    assert_eq!(rows[0].halt_cause.as_deref(), Some("main_red"));
+    assert_eq!(rows[0].reason, "blocked: repo dispatch held — main red");
+    for r in &rows[1..3] {
+        assert_eq!(r.halt_cause, None);
+        assert_eq!(r.reason, Qd::WorkspaceHalted.reason());
+    }
+    assert_eq!(rows[3].halt_cause, None);
+    let json = serde_json::to_value(&rows[1]).unwrap();
+    assert!(json.get("halt_cause").is_none());
 }

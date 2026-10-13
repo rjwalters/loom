@@ -10,7 +10,7 @@ Three concepts remain separate:
 | --- | --- |
 | Origin | Historical fact: `interactive`, `autonomous`, or `unknown` |
 | Planning preference | Prefer interactive PRs through review, repair, re-review and merge |
-| Operator star | Explicit `loom:operator-priority` override, stronger than human preference; higher levels (`loom:operator-high-priority`, `loom:high-priority-inherited`, #10307) drain first, highest level first (`operatorPriorityLevel` on each row) |
+| Priority level | `loom:very-important`, then `loom:important` (#11103), stronger than human preference; drains highest level first (`priorityLevel` on each row: 2, 1, 0; `priorityReason` `priority`). The PR carries the closing issue's level label, copied at creation (#10518). The retired operator-star labels are not read (#11510) |
 
 Set the origin explicitly at session start with `LOOM_WORK_ORIGIN=interactive`,
 or at creation:
@@ -52,7 +52,7 @@ configuration layers (shared/private fleet defaults and repository overrides):
 ```
 
 Setting it to `false` restores ordinary PR ordering and fallback admission.
-Origin remains recorded and operator stars retain their existing behavior.
+Origin remains recorded and priority labels keep their ordering.
 `loom-daemon pr-queue --role judge|doctor|champion` supplies one shared ordered
 JSON queue with `origin`, `priorityReason` and `mode` explanations. Role prompts
 refresh the queue after each completed/skipped PR and take the next unvisited row.
@@ -60,12 +60,13 @@ Keep a per-pass visited set so a waiting preferred PR cannot loop or idle others
 This lets a human PR arriving during a fleet batch take the next free turn. They
 use that order, preserving their normal tie-breaks: Judge listing order,
 Doctor approved conflicts before review feedback, Champion oldest first.
-Stars lead; with preference enabled interactive PRs follow, then ordinary work.
+Priority PRs lead (`loom:very-important`, then `loom:important`); with preference
+enabled interactive PRs follow, then ordinary work.
 Existing emergency recovery of verified-red main remains a separate higher
 priority workflow; this policy changes neither issue/build planning nor recovery.
 
 Preference is non-preemptive. Finish work already running, use normal concurrency,
-and never interrupt agents, cancel CI, pause the fleet or borrow the star's
+and never interrupt agents, cancel CI, pause the fleet or take an
 extra slot just because a PR is interactive. Every role continues past candidates
 waiting for checks, dependencies, a live claim or a required human response.
 No quota or aging mechanism is added.
@@ -79,6 +80,15 @@ SHA dedup. Its fleet App exception already permits a trusted interactive agent.
 Fallback review is comment-only: it grants no workflow enrollment, approval,
 branch mutation or automated landing. Existing labeled PRs retain the normal
 review, ownership, hold and merge requirements.
+
+An unlabeled, non-draft PR whose head branch is `feature/issue-<N>` in the base
+repository also joins the Judge's queue and opens its gate, whatever the queue
+depth or `planning.preferHumanPrs` (#9389): a Builder PR that lost its
+`loom:review-requested` label is found, in the same comment-only mode, behind
+every labeled PR. Same-repository is the forge's head/base repository identity,
+never a branch name. Fork PRs and other branch shapes are a deliberate
+exclusion: unless interactive, they are still admitted only when no open PR
+carries `loom:review-requested`, and nothing here adds a label.
 
 Drafts and hard holds never gain authority from origin. Doctor's existing
 `loom:operator` plus `loom:changes-requested` stale-diff repair route remains

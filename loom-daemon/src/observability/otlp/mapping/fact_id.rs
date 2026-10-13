@@ -9,6 +9,7 @@
 //!
 //! Lives outside the ETA modules so it survives the ETA removal (#11098).
 
+use crate::telemetry::kinds::stage_outcome::EnteredAtSource;
 use crate::telemetry::trace::{derived_hex, instant};
 use crate::telemetry::TelemetryRecord;
 
@@ -20,13 +21,27 @@ pub(super) fn derive(kind: &str, key: &[&str]) -> String {
 }
 
 /// The fact id of an outcome record, or `None` for a kind that is not an
-/// outcome fact or a record with no forge instant to key on. Every key part
-/// is a forge-observed fact, identical on every host that saw it.
+/// outcome fact or a record with nothing stable to key on. No key part is a
+/// host or an emission time.
 ///
 /// - `pr.resolved`: `(repo, pr_number, state, closed_at)`
-/// - `eta.stage_outcome`: `(repo, issue, stage, next_stage,
-///   forge_transition_at)`; `next_stage` is empty when the item left the
-///   listings
+/// - `eta.stage_outcome`, first match (#11401):
+///   1. `(repo, issue, stage, next_stage, forge_transition_at)`: the forge's
+///      instant for the move, identical on every host. Unchanged since
+///      #11125, so no existing fact is re-keyed.
+///   2. `(repo, issue, stage, next_stage, "sweep", sweep_id, entered_at)`:
+///      a stage this host's sweep held. Only that host emits it; `entered_at`
+///      (when the sweep's checkpoint dates it) tells a re-entry within one
+///      sweep (`doctor` → `review_wait` → `doctor`) apart.
+///   3. `(repo, issue, stage, next_stage, "entry", entered_at)`: a
+///      forge-dated entry, when the exit's own forge read failed or no forge
+///      event dates it.
+///
+///   `next_stage` is empty when the item left the listings. With none of
+///   these the record carries `loom.fact_id_missing_reason` instead
+///   ([`StageOutcomeRecord::missing_fact_id_reason`]).
+///
+/// [`StageOutcomeRecord::missing_fact_id_reason`]: crate::telemetry::kinds::stage_outcome::StageOutcomeRecord::missing_fact_id_reason
 pub(super) fn of(record: &TelemetryRecord) -> Option<String> {
     match record {
         TelemetryRecord::PrResolved(r) => Some(derive(
@@ -38,14 +53,41 @@ pub(super) fn of(record: &TelemetryRecord) -> Option<String> {
                 &instant(r.closed_at?),
             ],
         )),
-        TelemetryRecord::StageOutcome(r) => Some(derive(
-            "eta.stage_outcome",
+        TelemetryRecord::StageOutcome(r) => {
+            let issue = r.issue.to_string();
+            let next = r.next_stage.map_or("", |s| s.as_str());
+            let head = [r.repo.as_str(), issue.as_str(), r.stage.as_str(), next];
+            let with = |tail: &[&str]| {
+                let mut key = head.to_vec();
+                key.extend_from_slice(tail);
+                derive("eta.stage_outcome", &key)
+            };
+            if let Some(at) = r.forge_transition_at {
+                return Some(with(&[&instant(at)]));
+            }
+            if let Some(sweep) = r.sweep_id.as_deref().filter(|id| !id.is_empty()) {
+                let checkpoint = r
+                    .entered_at
+                    .filter(|_| r.entered_at_source == Some(EnteredAtSource::Checkpoint));
+                return Some(with(&["sweep", sweep, &checkpoint.map(instant).unwrap_or_default()]));
+            }
+            r.forge_entered_at()
+                .map(|entered| with(&["entry", &instant(entered)]))
+        }
+        // #11641: one agent start. Only the emitting host emits it, so the id
+        // dedupes replays: `(repo, issue, pr_number, stage, role, sweep_id,
+        // stage_attempt, started_at)`.
+        TelemetryRecord::WorkStarted(r) => Some(derive(
+            "stage.work_started",
             &[
                 &r.repo,
-                &r.issue.to_string(),
+                &r.issue.map(|n| n.to_string()).unwrap_or_default(),
+                &r.pr_number.map(|n| n.to_string()).unwrap_or_default(),
                 r.stage.as_str(),
-                r.next_stage.map_or("", |s| s.as_str()),
-                &instant(r.forge_transition_at?),
+                &r.role,
+                &r.sweep_id,
+                &r.stage_attempt.to_string(),
+                &instant(r.started_at),
             ],
         )),
         _ => None,

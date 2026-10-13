@@ -375,6 +375,108 @@ fn the_pass_covers_every_repo_and_stops_while_the_breaker_is_open() {
     assert!(forge.calls.is_empty());
 }
 
+// ===== the completed-pass heartbeat (#10924) =====
+
+fn t(mins: i64) -> DateTime<Utc> {
+    now() + chrono::Duration::minutes(mins)
+}
+
+/// A pass that walks every repo and reads every listing stamps the success
+/// heartbeat even when it labels nothing: a quiet fleet is not a dead one.
+#[test]
+fn a_completed_quiet_pass_stamps_the_success_heartbeat() {
+    let repos = [repo("acme/a"), repo("acme/b")];
+    let mut forge = Fake {
+        listing: vec![row(1, &["loom:triage"])], // nothing to label
+        ..Fake::default()
+    };
+    let pass = run_pass(&mut forge, &repos, now(), 50, &|| false);
+    assert!(pass.completed_scan(repos.len()));
+    let hb = next_heartbeat(None, "cap", t(0), &pass, repos.len());
+    assert_eq!(hb.success_at(), Some(t(0)));
+    assert_eq!((hb.repos, hb.labelled), (2, 0));
+}
+
+/// The write-scope gate refusing a repo does not undo a completed scan:
+/// listing outcomes are the scan, labels retry next pass by design.
+#[test]
+fn a_denied_write_does_not_undo_a_completed_scan() {
+    let repos = [repo("acme/a")];
+    let mut forge = Fake {
+        listing: vec![row(1, &[])], // something to label
+        write_denied: true,
+        ..Fake::default()
+    };
+    let pass = run_pass(&mut forge, &repos, now(), 50, &|| false);
+    assert!(pass.completed_scan(repos.len()));
+    assert_eq!(next_heartbeat(None, "cap", t(0), &pass, repos.len()).success_at(), Some(t(0)));
+}
+
+/// A shed, failed or early-stopped pass cannot refresh the success stamp:
+/// the previous completed pass's timestamp is kept.
+#[test]
+fn shed_failed_and_stopped_early_passes_keep_the_previous_stamp() {
+    let repos = [repo("acme/a"), repo("acme/b")];
+    let stamped = next_heartbeat(
+        None,
+        "cap",
+        t(0),
+        &PassReport {
+            repos: 2,
+            ..PassReport::default()
+        },
+        2,
+    );
+    // Shed: every reader out of budget.
+    let mut forge = Fake {
+        listing_shed: true,
+        ..Fake::default()
+    };
+    let pass = run_pass(&mut forge, &repos, now(), 50, &|| false);
+    assert!((pass.listing_failed, pass.shed) == (2, 2));
+    assert_eq!(next_heartbeat(Some(&stamped), "cap", t(5), &pass, 2).success_at(), Some(t(0)));
+    // Failed listing.
+    let mut forge = Fake {
+        listing_fails: true,
+        ..Fake::default()
+    };
+    let pass = run_pass(&mut forge, &repos, now(), 50, &|| false);
+    assert_eq!(pass.listing_failed, 2);
+    assert_eq!(next_heartbeat(Some(&stamped), "cap", t(5), &pass, 2).success_at(), Some(t(0)));
+    // Stopped early by the breaker after the first repo.
+    let mut forge = Fake::default();
+    let seen = std::cell::Cell::new(0);
+    let tripped = || seen.replace(seen.get() + 1) >= 1;
+    let pass = run_pass(&mut forge, &repos, now(), 50, &tripped);
+    assert!(pass.stopped_early && pass.repos == 1);
+    assert_eq!(next_heartbeat(Some(&stamped), "cap", t(5), &pass, 2).success_at(), Some(t(0)));
+    // And with no previous stamp at all: never completed.
+    assert_eq!(next_heartbeat(None, "cap", t(5), &pass, 2).success_at(), None);
+}
+
+/// The heartbeat file: round trip, and a record of another schema proves
+/// nothing (a foreign file is not a success stamp).
+#[test]
+fn the_heartbeat_file_round_trips_and_rejects_other_schemas() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(read_heartbeat(dir.path()).is_none());
+    let hb = next_heartbeat(
+        None,
+        "cap",
+        t(0),
+        &PassReport {
+            repos: 1,
+            ..PassReport::default()
+        },
+        1,
+    );
+    write_heartbeat(dir.path(), &hb);
+    assert_eq!(read_heartbeat(dir.path()), Some(hb));
+    let foreign = br#"{"schema": "intake-reconcile/pass/v0", "host": "cap"}"#;
+    std::fs::write(heartbeat_path(dir.path()), foreign).unwrap();
+    assert!(read_heartbeat(dir.path()).is_none());
+}
+
 // ===== the live forge, against a stub =====
 
 #[test]

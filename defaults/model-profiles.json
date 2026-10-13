@@ -17,7 +17,11 @@
     "credentialTargets": {
       "pi": "ZAI_API_KEY",
       "opencode": "ZHIPU_API_KEY"
-    }
+    },
+    "excludedRoles": [
+      "judge",
+      "curator"
+    ]
   },
   "quick-cerebras": {
     "billing": "api",

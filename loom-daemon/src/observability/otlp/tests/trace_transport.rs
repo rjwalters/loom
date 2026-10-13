@@ -62,6 +62,75 @@ async fn successful_trace_prefix_is_not_retried_after_log_failure() {
         1
     );
 }
+
+#[tokio::test]
+async fn held_trace_batches_do_not_count_unmappable_envelopes_per_retry() {
+    use crate::observability::{
+        queue::DurableQueue, sender::try_flush, sender::FlushOutcome, ExportStatus,
+    };
+    // One sampled and one unsampled span: the unsampled envelope is
+    // unmappable, but while the batch is held (403) nothing is lost yet —
+    // counting before the retry decision would charge the same envelope on
+    // every retry attempt (#11588).
+    let sink = MockSink::with_responses(vec![
+        (403, "secret-key".to_string(), Duration::ZERO),
+        (403, "secret-key".to_string(), Duration::ZERO),
+    ]);
+    let exporter = OtlpExporter::new(sink.base_url(), "key".into()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let queue = DurableQueue::open(dir.path().join("q.jsonl"), 10);
+    queue.push(envelope(true));
+    queue.push(envelope(false));
+    let status = ExportStatus::started("host", &sink.base_url(), "otlp", 30);
+    assert_eq!(try_flush(&queue, &exporter, 10, &status).await, FlushOutcome::Failed);
+    assert_eq!(try_flush(&queue, &exporter, 10, &status).await, FlushOutcome::Failed);
+    assert_eq!(queue.len(), 2, "the held batch stays queued");
+    assert_eq!(queue.dropped_total(), 0, "a held batch's unmappable envelope is not a loss yet");
+    assert!(queue.dropped_by_reason().is_empty());
+    // The credential is fixed (the sink defaults to 200): the group is
+    // acknowledged, and only now is the unmappable envelope counted — once.
+    assert_eq!(try_flush(&queue, &exporter, 10, &status).await, FlushOutcome::Sent(2));
+    assert!(queue.is_empty());
+    assert_eq!(queue.dropped_total(), 1);
+    assert_eq!(
+        queue.dropped_by_reason(),
+        std::collections::BTreeMap::from([("trace_unmappable".to_string(), 1)])
+    );
+}
+
+#[tokio::test]
+async fn refused_trace_group_counts_unmappable_envelopes_once() {
+    use crate::observability::{
+        queue::DurableQueue, sender::try_flush, sender::FlushOutcome, ExportStatus,
+    };
+    // Five span envelopes, one unsampled (skipped by the mapping), permanently
+    // refused with a 400: the four sent envelopes land under `status_400`, the
+    // unmappable one under `trace_unmappable` — five envelopes lost, five
+    // counted, none twice (#11588).
+    let sink = MockSink::with_responses(vec![(400, "secret-key".to_string(), Duration::ZERO)]);
+    let exporter = OtlpExporter::new(sink.base_url(), "key".into()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let queue = DurableQueue::open(dir.path().join("q.jsonl"), 10);
+    for sampled in [true, true, false, true, true] {
+        queue.push(envelope(sampled));
+    }
+    let status = ExportStatus::started("host", &sink.base_url(), "otlp", 30);
+    assert_eq!(
+        try_flush(&queue, &exporter, 10, &status).await,
+        FlushOutcome::Sent(5),
+        "a poison request does not starve the queue"
+    );
+    assert!(queue.is_empty());
+    assert_eq!(queue.dropped_total(), 5);
+    assert_eq!(
+        queue.dropped_by_reason(),
+        std::collections::BTreeMap::from([
+            ("status_400".to_string(), 4),
+            ("trace_unmappable".to_string(), 1),
+        ])
+    );
+}
+
 #[tokio::test]
 async fn native_exporter_drops_trace_records_without_sending_or_counting_as_exported() {
     use crate::observability::exporter::HttpsExporter;

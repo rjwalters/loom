@@ -4,7 +4,7 @@
 //! # The memo serves refusals only, never a resume
 //!
 //! The #6788 memo ([`SweepRegistry::fresh_open_pr_memo`]) is in memory, fresh
-//! for [`OPEN_PR_MEMO_FRESH`] (900 s) and never renewed: past that, the next
+//! for [`OPEN_PR_MEMO_FRESH`] (900 s) from its last verified answer: past that, the next
 //! attempt runs the live probe, whose leg 0 (#10514) reads the ETag'd open-PR
 //! listing (a free `304` on an unchanged repo). For an ordinary dispatch a
 //! memo answer can only **refuse**: the 2.5 short circuit returns
@@ -27,6 +27,16 @@
 //! The other memo readers (the reaper's #4366 no-progress exemption, the
 //! PR-less retry tally and its `loom:blocked` hold veto) keep today's
 //! fresh-only memo: each answer there is at most 900 s old, as before.
+//!
+//! # Who writes the memo
+//!
+//! The live probe ([`SweepRegistry::live_open_pr_probe`]), the reaper's
+//! post-exit seed (#8355), and the work finder's batched pre-filter
+//! ([`SweepRegistry::fold_listing_verdicts`], #8865). The third exists because
+//! a pre-filtered candidate never reaches the 2.6 probe: its verified listing
+//! verdict is folded in instead, so the known-PR backstop still has a PR to
+//! recheck for it. Each write comes from a new verified answer; nothing
+//! extends an entry without one.
 //!
 //! # The ledger: distinct versus repeated refusals
 //!
@@ -85,6 +95,83 @@ impl SweepRegistry {
             }
         }
         verdict
+    }
+
+    /// Where the work finder's batched open-PR pre-filter (#8865) reads the
+    /// listing: this registry's `gh`, its workspace root, and the `owner/repo`
+    /// the 2.6 guard resolves ([`Self::resolve_owner_repo`], never `origin`'s)
+    /// — the same three inputs `probe_open_linked_pr_transports` hands leg 0,
+    /// so the pre-filter and the guard read one listing of one repo.
+    ///
+    /// `None` when the guards are off (`skip_label_flip`, mirroring 2.5/2.6) or
+    /// the repo cannot be resolved; the pre-filter then drops nothing.
+    ///
+    /// The caller takes this under the registry lock and reads the listing
+    /// after releasing it, so the listing read itself never runs under the
+    /// mutex. Resolving the repo is not free of forge calls, though:
+    /// `resolve_owner_repo` re-verifies the repo-facts record over `gh` when
+    /// it is past its verify interval, and runs `gh repo view` on a cold or
+    /// failed resolve (#9572 caches only a success). Either can run under the
+    /// registry mutex here. That is the existing #9573 class, the same call
+    /// every guard step already makes, bounded and at most once per workspace
+    /// per tick on this path.
+    pub(crate) fn open_pr_listing_target(&self) -> Option<(PathBuf, PathBuf, String)> {
+        if self.config.skip_label_flip {
+            return None;
+        }
+        let (owner, repo) = self.resolve_owner_repo()?;
+        Some((
+            self.resolved_gh(),
+            self.config.workspace_root.clone(),
+            format!("{owner}/{repo}"),
+        ))
+    }
+
+    /// Fold the pre-filter's verified listing verdicts into the #6788 memo
+    /// (#8865), as [`Self::live_open_pr_probe`] does for the one issue it
+    /// probes. The pre-filter resolves a PR-blocked candidate before
+    /// `dispatch()`, so the 2.6 probe no longer runs for it and would never
+    /// write its entry; without this the known-PR recheck backstop has no PR
+    /// to recheck on the tick every transport fails.
+    ///
+    /// `Open(pr)` records or refreshes the entry, dated `read_started`.
+    /// `NoneOpen` removes it, so a PR that closed frees its issue on this
+    /// tick instead of being refused at 2.5 for the rest of
+    /// [`OPEN_PR_MEMO_FRESH`]. Removing an entry is not a permit: 2.6 still
+    /// probes. An entry verified after `read_started` is newer evidence than
+    /// this read (the listing is read with the registry unlocked, so a reap
+    /// or another dispatch route can write one meanwhile) and is left alone.
+    /// No forge call; a no-op when the memo is disabled.
+    pub(crate) fn fold_listing_verdicts(
+        &self,
+        read_started: DateTime<Utc>,
+        verdicts: &[(u32, OpenPrProbe)],
+    ) {
+        if !open_pr_memo_enabled() {
+            return;
+        }
+        let mut memo = match self.open_pr_memo.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        for &(issue, verdict) in verdicts {
+            if memo
+                .get(&issue)
+                .is_some_and(|entry| entry.verified_at > read_started)
+            {
+                continue;
+            }
+            match verdict {
+                OpenPrProbe::Open(pr) => {
+                    let verified_at = read_started;
+                    memo.insert(issue, OpenPrMemoEntry { pr, verified_at });
+                }
+                OpenPrProbe::NoneOpen => {
+                    memo.remove(&issue);
+                }
+                OpenPrProbe::ProbeFailed => {}
+            }
+        }
     }
 
     fn note_open_pr_refusal(&self, issue: u32, pr: u32, source: &'static str) {
