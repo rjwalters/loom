@@ -242,15 +242,19 @@ pub struct PickSkip {
 pub struct PickDrawCandidate {
     /// Forge `owner/repo`, or `repo_unresolved`.
     pub repo: String,
-    /// Its draw weight (from the workspace's `fleet_priority`).
+    /// Its draw weight (from the workspace's `fleet_priority`). Relative:
+    /// only `weight / total_weight` is meaningful. Since #11684 it is a
+    /// softmax weight on a 1,000,000 scale, relative to the draw's `p_min`,
+    /// so one workspace's raw weight varies between draws.
     pub weight: u64,
 }
 
 /// One weighted workspace draw of the work finder (#11103).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PickDraw {
-    /// `very-important` when only workspaces with `loom:very-important` work
-    /// next were drawn over, `all` otherwise.
+    /// `red-main-fix` when only workspaces whose next candidate is a verified
+    /// red-main fix were drawn over (#11547), else `very-important` when only
+    /// workspaces with `loom:very-important` work next were, `all` otherwise.
     pub pool: String,
     /// The workspaces drawn over, with weights.
     pub candidates: Vec<PickDrawCandidate>,
@@ -262,6 +266,10 @@ pub struct PickDraw {
     pub picked: String,
     /// The issue the draw placed next in the dispatch order.
     pub number: u32,
+    /// The smallest `fleet_priority` in the pool: the workspace weighing the
+    /// full scale (#11684). Absent on records from before #11684.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p_min: Option<u32>,
 }
 
 /// The work finder's workspace draws for one tick (#11103): enough to replay
@@ -289,6 +297,11 @@ pub struct PickWorkspaceDraw {
     /// `host`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed_host: Option<String>,
+    /// The softmax temperature every draw of the tick weighed at
+    /// (`dispatch.drawTemperature`, #11684). Per tick, like `seed`, and
+    /// repeated on every chunk like it. Absent on records from before #11684.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<u32>,
 }
 
 /// A `loom:very-important` issue the flood cap ranked as `loom:important`
@@ -573,6 +586,7 @@ pub fn split_into_chunks(record: PickDecisionRecord, max_bytes: usize) -> Vec<Pi
                     seed_scheme: None,
                     seed_minute: None,
                     seed_host: None,
+                    temperature: None,
                 })
                 .draws
                 .push(d),

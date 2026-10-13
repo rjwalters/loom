@@ -2,6 +2,8 @@ use super::*;
 use crate::priority_pick::{IMPORTANT_LABEL, VERY_IMPORTANT_LABEL};
 use crate::work_finder::WorkItem;
 
+const T80: u32 = crate::priority_pick::DEFAULT_DRAW_TEMPERATURE;
+
 fn item(n: u32, created: Option<&str>, labels: &[&str]) -> WorkItem {
     let mut all = vec!["loom:issue".to_string()];
     all.extend(labels.iter().map(|l| (*l).to_string()));
@@ -84,7 +86,7 @@ fn a_workspace_with_very_important_work_always_wins_the_draw() {
             cand(1, 7, Some("2026-05-01T00:00:00Z"), &[]),
             cand(1, 8, Some("2026-06-01T00:00:00Z"), &[VERY_IMPORTANT_LABEL]),
         ];
-        let (order, log) = draw_order(candidates, &[0, 100], seed);
+        let (order, log) = draw_order(candidates, &[0, 100], seed, T80);
         assert_eq!(numbers(&order)[0], (1, 8), "seed {seed}");
         let first = &log.unwrap().steps[0].draw;
         assert_eq!(first.pool, "very-important");
@@ -106,13 +108,13 @@ fn a_red_main_fix_workspace_wins_the_draw_only_while_main_is_red() {
                 fix_cand(1, 9, Some("2026-09-01T00:00:00Z"), red),
             ]
         };
-        let (order, log) = draw_order(build(true), &[0, 100], seed);
+        let (order, log) = draw_order(build(true), &[0, 100], seed, T80);
         assert_eq!(numbers(&order)[0], (1, 9), "seed {seed}");
         let first = &log.unwrap().steps[0].draw;
         assert_eq!(first.pool, "red-main-fix");
         assert_eq!(first.candidates.len(), 1);
 
-        let (order, log) = draw_order(build(false), &[0, 100], seed);
+        let (order, log) = draw_order(build(false), &[0, 100], seed, T80);
         assert_eq!(numbers(&order)[0], (0, 1), "seed {seed}");
         assert_eq!(log.unwrap().steps[0].draw.pool, "very-important");
         // On green the marker grants nothing: the fix keeps its age place.
@@ -157,7 +159,7 @@ fn several_very_important_workspaces_are_drawn_among_by_weight() {
             cand(1, 2, None, &[VERY_IMPORTANT_LABEL]),
             cand(2, 3, None, &[]),
         ];
-        let (order, log) = draw_order(candidates, &[0, 100, 0], seed);
+        let (order, log) = draw_order(candidates, &[0, 100, 0], seed, T80);
         let log = log.unwrap();
         assert_eq!(log.steps[0].draw.pool, "very-important");
         assert_eq!(log.steps[0].draw.candidates.len(), 2, "only the very-important workspaces");
@@ -165,8 +167,10 @@ fn several_very_important_workspaces_are_drawn_among_by_weight() {
         assert_eq!(order[2].number, 3, "seed {seed}");
         *firsts.entry(order[0].workspace_idx).or_insert(0) += 1;
     }
-    // Weight 1000 vs 9: workspace 0 wins far more often, workspace 1 sometimes.
-    assert!(firsts[&0] > firsts.get(&1).copied().unwrap_or(0) * 10, "{firsts:?}");
+    // Priority 0 vs 100 at T = 80 is 1 : e^-1.25 (~3.5 : 1): workspace 0
+    // wins far more often, workspace 1 sometimes.
+    assert!(firsts[&0] > firsts.get(&1).copied().unwrap_or(0) * 2, "{firsts:?}");
+    assert!(firsts.get(&1).copied().unwrap_or(0) > 0, "{firsts:?}");
 }
 
 #[test]
@@ -174,12 +178,13 @@ fn without_very_important_work_the_draw_is_weighted_over_all() {
     let mut firsts = std::collections::BTreeMap::new();
     for seed in 0..2000 {
         let candidates = vec![cand(0, 1, None, &[]), cand(1, 2, None, &[IMPORTANT_LABEL])];
-        let (order, log) = draw_order(candidates, &[0, 100], seed);
+        let (order, log) = draw_order(candidates, &[0, 100], seed, T80);
         assert_eq!(log.unwrap().steps[0].draw.pool, "all");
         *firsts.entry(order[0].workspace_idx).or_insert(0u32) += 1;
     }
-    // Weights 1000 : 9 — the low-priority workspace still wins sometimes.
-    assert!(firsts[&0] > 1900, "{firsts:?}");
+    // 1 : e^-1.25 at T = 80 (~77.7%) — the low-priority workspace still
+    // wins sometimes.
+    assert!((1450..=1650).contains(&firsts[&0]), "{firsts:?}");
     assert!(firsts.get(&1).copied().unwrap_or(0) > 0, "{firsts:?}");
 }
 
@@ -194,8 +199,8 @@ fn a_fixed_seed_reproduces_the_exact_order_and_log() {
             cand(2, 20, Some("2026-01-01T00:00:00Z"), &[]),
         ]
     };
-    let (a, la) = draw_order(build(), &[10, 10, 50], 42);
-    let (b, lb) = draw_order(build(), &[10, 10, 50], 42);
+    let (a, la) = draw_order(build(), &[10, 10, 50], 42, T80);
+    let (b, lb) = draw_order(build(), &[10, 10, 50], 42, T80);
     assert_eq!(numbers(&a), numbers(&b));
     assert_eq!(la, lb);
     let log = la.unwrap();
@@ -223,7 +228,7 @@ fn a_fixed_seed_reproduces_the_exact_order_and_log() {
 #[test]
 fn the_draw_log_is_capped_but_counts_every_draw() {
     let candidates: Vec<PriorityCandidate> = (1..=80).map(|n| cand(0, n, None, &[])).collect();
-    let (order, log) = draw_order(candidates, &[], 1);
+    let (order, log) = draw_order(candidates, &[], 1, T80);
     let log = log.unwrap();
     assert_eq!(order.len(), 80);
     assert_eq!(log.draws_total, 80);
@@ -232,7 +237,7 @@ fn the_draw_log_is_capped_but_counts_every_draw() {
 
 #[test]
 fn nothing_to_draw_is_no_log() {
-    let (order, log) = draw_order(Vec::new(), &[0], 1);
+    let (order, log) = draw_order(Vec::new(), &[0], 1, T80);
     assert!(order.is_empty());
     assert!(log.is_none());
 }
@@ -274,9 +279,9 @@ fn a_logged_minute_and_host_replay_the_order() {
     };
     let priorities = [0, 10, 50, 100];
     let (minute, host) = (29_000_000, "host-a");
-    let (order, log) = draw_order(candidates(), &priorities, minute_seed(minute, host));
+    let (order, log) = draw_order(candidates(), &priorities, minute_seed(minute, host), T80);
     let log = log.unwrap();
-    let (replayed, relog) = draw_order(candidates(), &priorities, minute_seed(minute, host));
+    let (replayed, relog) = draw_order(candidates(), &priorities, minute_seed(minute, host), T80);
     let relog = relog.unwrap();
     assert_eq!(numbers(&order), numbers(&replayed));
     assert_eq!(log.steps, relog.steps);

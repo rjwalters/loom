@@ -97,6 +97,7 @@ mod tests {
                 roll: u64::from(d),
                 picked: format!("o/w{d}"),
                 number: d,
+                p_min: Some(12),
             })
             .collect();
         let record = PickDecisionRecord::build(tick(), Vec::new()).with_workspace_draw(Some(
@@ -107,6 +108,7 @@ mod tests {
                 seed_scheme: Some("loom-draw/v1".into()),
                 seed_minute: Some("29000000".into()),
                 seed_host: Some("host-a".into()),
+                temperature: Some(80),
             },
         ));
         for chunk in split_into_chunks(record, 2_000) {
@@ -125,6 +127,8 @@ mod tests {
             assert_eq!(body["workspace_draw"]["seed_scheme"], "loom-draw/v1");
             assert_eq!(body["workspace_draw"]["seed_minute"], "29000000");
             assert_eq!(body["workspace_draw"]["seed_host"], "host-a");
+            // #11684: the per-tick temperature repeats on every chunk, like the seed.
+            assert_eq!(body["workspace_draw"]["temperature"], 80);
         }
     }
 }

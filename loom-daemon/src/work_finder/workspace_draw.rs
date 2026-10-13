@@ -9,7 +9,8 @@
 //!    verified red-main fix first (#11547), then level, then oldest
 //!    `createdAt`, then issue number ([`crate::priority_pick::issue_cmp`]);
 //! 2. a workspace is drawn among those with candidates left, weighted by its
-//!    `fleet_priority` ([`crate::priority_pick::weight_for_priority`]); a
+//!    `fleet_priority` ([`crate::priority_pick::softmax_weight`], a softmax at
+//!    the tick's [`draw_temperature`], #11684); a
 //!    workspace whose next candidate is a verified red-main fix wins the
 //!    draw, else one whose next candidate is `loom:very-important` (the draw
 //!    is among just those when several qualify);
@@ -18,8 +19,8 @@
 //!
 //! The RNG is seeded once per tick ([`tick_seed`]) from the wall-clock
 //! minute and the host id ([`minute_seed`], #11683); the seed, its inputs and
-//! every draw (candidates, weights, roll, pick) are kept on the
-//! [`TickReport`] and exported in `pick.decision`, so the logged
+//! every draw (candidates, weights, temperature, `p_min`, roll, pick) are kept
+//! on the [`TickReport`] and exported in `pick.decision`, so the logged
 //! `(minute, host)` alone reproduces the exact order.
 //!
 //! The level is the issue's own `loom:important` / `loom:very-important`
@@ -27,6 +28,7 @@
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::AtomicU32;
 
 use super::{PriorityCandidate, TickReport};
 use crate::priority_pick::{self, IssueKey, Level, PickRng, WorkspaceDraw, WorkspaceEntry};
@@ -105,12 +107,14 @@ pub fn in_workspace_cmp(a: &PriorityCandidate, b: &PriorityCandidate) -> std::cm
 
 /// `candidates` in draw order (see the module docs), plus the draw log
 /// (`None` when there was nothing to draw). `priorities[i]` is workspace
-/// `i`'s `fleet_priority`; a missing entry is the default.
+/// `i`'s `fleet_priority`; a missing entry is the default. Every draw weighs
+/// at `temperature` (#11684).
 #[must_use]
 pub fn draw_order(
     candidates: Vec<PriorityCandidate>,
     priorities: &[u32],
     seed: u64,
+    temperature: u32,
 ) -> (Vec<PriorityCandidate>, Option<DrawLog>) {
     let mut queues: BTreeMap<usize, VecDeque<PriorityCandidate>> = BTreeMap::new();
     for c in candidates {
@@ -137,7 +141,7 @@ pub fn draw_order(
                 })
             })
             .collect();
-        let Some(draw) = priority_pick::draw_workspace(&entries, &mut rng) else {
+        let Some(draw) = priority_pick::draw_workspace(&entries, temperature, &mut rng) else {
             break;
         };
         let Some((idx, c)) = workspace_idx(&draw.picked).and_then(|idx| {
@@ -166,8 +170,9 @@ pub fn draw_order(
     (order, log)
 }
 
-/// Put the tick's candidates in draw order, seeded by [`tick_seed`], and
-/// keep the draw log on `report`. The multi-workspace tick's one call site.
+/// Put the tick's candidates in draw order, seeded by [`tick_seed`] and
+/// weighted at [`draw_temperature`], and keep the draw log on `report`. The
+/// multi-workspace tick's one call site.
 #[must_use]
 pub fn order(
     candidates: Vec<PriorityCandidate>,
@@ -175,12 +180,52 @@ pub fn order(
     report: &mut TickReport,
 ) -> Vec<PriorityCandidate> {
     let (seed, inputs) = tick_seed();
-    let (ordered, mut log) = draw_order(candidates, priorities, seed);
+    let (ordered, mut log) = draw_order(candidates, priorities, seed, draw_temperature());
     if let Some(log) = log.as_mut() {
         log.seed_inputs = inputs;
     }
     report.workspace_draw = log;
     ordered
+}
+
+/// The process's current draw temperature (`dispatch.drawTemperature`,
+/// #11684). Published once per tick by the work-finder loop's config reload
+/// ([`super::ConfiguredMaxReloader::refresh`]) so a committed-config or
+/// `LOOM_HYPERPARAMS` edit applies on the next tick without a restart, and
+/// read by [`order`]. A process global rather than a tick argument because
+/// the tick entry points live in the size-frozen `work_finder.rs`.
+#[cfg(not(test))]
+static DRAW_TEMPERATURE: AtomicU32 = AtomicU32::new(priority_pick::DEFAULT_DRAW_TEMPERATURE);
+
+#[cfg(test)]
+thread_local! {
+    /// Under `cfg(test)` the temperature is per thread, so a test that
+    /// publishes one cannot change the draws of a tick another test runs
+    /// concurrently (the same isolation [`with_seed`] gives the seed).
+    static DRAW_TEMPERATURE: AtomicU32 =
+        const { AtomicU32::new(priority_pick::DEFAULT_DRAW_TEMPERATURE) };
+}
+
+#[cfg(not(test))]
+fn temperature_cell<R>(f: impl FnOnce(&AtomicU32) -> R) -> R {
+    f(&DRAW_TEMPERATURE)
+}
+
+#[cfg(test)]
+fn temperature_cell<R>(f: impl FnOnce(&AtomicU32) -> R) -> R {
+    DRAW_TEMPERATURE.with(f)
+}
+
+/// The draw temperature the next tick uses.
+#[must_use]
+pub fn draw_temperature() -> u32 {
+    temperature_cell(|t| t.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Publish the draw temperature for the next tick; `0` is stored as `1`.
+/// Returns the previous value, so a caller can log a transition.
+pub fn set_draw_temperature(temperature: u32) -> u32 {
+    temperature_cell(|t| t.swap(temperature.max(1), std::sync::atomic::Ordering::Relaxed))
 }
 
 thread_local! {

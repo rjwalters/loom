@@ -159,9 +159,8 @@ fn an_unmarked_issue_omits_complexity() {
 }
 
 /// An issue body carrying an out-of-vocabulary tier (a Curator paraphrase of
-/// the closed enum) also omits `complexity` — unlike `resolve-tier-model.sh`'s
-/// own dispatch-time fold, this journal field never substitutes a default for
-/// an unobserved/invalid value.
+/// the closed enum) also omits `complexity` — this journal field never
+/// substitutes a default for an unobserved/invalid value.
 #[test]
 #[serial]
 fn an_invalid_tier_marker_omits_complexity() {

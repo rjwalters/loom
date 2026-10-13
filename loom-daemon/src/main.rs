@@ -867,17 +867,6 @@ enum Commands {
         pr: u64,
     },
 
-    /// Shadow-mode Jev (TypeSafe) complexity-tier classifier, run beside the
-    /// Curator's `<!-- loom:complexity=<tier> -->` marker (issue #8543) — a
-    /// calibrated second opinion, never a routing decision. Prints a JSON
-    /// object with a probability per tier (`mechanical`/`routine`/`complex`)
-    /// plus a confidence to stdout; exits non-zero with no stdout output on
-    /// any failure, including a missing `TYPESAFE_API_KEY`.
-    JevTier {
-        /// The issue number to classify.
-        issue: u64,
-    },
-
     // ---------------------------------------------------------------------
     // Script helpers (epic #4081 Phase 3 family 5, issue #4275) — native
     // replacements for the `loom_tools` modules that existed only to back a
@@ -900,7 +889,7 @@ enum Commands {
 
     /// Resolve a logical model tier/alias to the concrete model ID to dispatch
     /// on the wire (issue #3982; native port of `loom_tools.model_tiers`,
-    /// #4275). Backs `resolve-model.sh` and `resolve-tier-model.sh`.
+    /// #4275). Backs `resolve-model.sh`.
     ///
     /// Unknown aliases and pinned IDs pass through unchanged and the
     /// `model@effort` grammar is preserved. `--config` is an **explicit
@@ -909,14 +898,14 @@ enum Commands {
     /// Resolution never fails — outside a Loom repo the config is simply empty
     /// and the shipped default map applies.
     ///
-    /// Exit codes: `0` resolved, `2` usage error, `3` no mapping (both `--tier`
-    /// and `--task-alias`) so the caller falls through to its own precedence
-    /// chain.
+    /// Exit codes: `0` resolved, `2` usage error, `3` no mapping
+    /// (`--task-alias` / `--downgrade`) so the caller falls through to its own
+    /// precedence chain.
     ResolveModel {
         /// A logical tier/alias (`opus`, `sonnet`, `sonnet@xhigh`) or a pinned
         /// model ID.
         #[arg(value_name = "MODEL")]
-        model: Option<String>,
+        model: String,
 
         /// Path to a `.loom/config.json` to read verbatim (default: resolve
         /// the `./.loom` config tier chain).
@@ -942,16 +931,6 @@ enum Commands {
         /// mid-phase-death handling instead of guessing a model.
         #[arg(long)]
         downgrade: bool,
-
-        /// Complexity-tier mode (issue #4238): resolve
-        /// `sweep.tierModels[<runtime>][<tier>]`, falling back to the
-        /// `sweep.optimization` preset, instead of a bare alias.
-        #[arg(long, value_name = "TIER")]
-        tier: Option<String>,
-
-        /// Worker runtime for `--tier` resolution.
-        #[arg(long, default_value = "claude")]
-        runtime: String,
     },
 
     /// Token-cost telemetry: `usage` (live, from the Anthropic OAuth API) and
@@ -2319,16 +2298,12 @@ async fn handle_cli_command(command: Commands) -> Result<()> {
             generation,
             task_alias,
             downgrade,
-            tier,
-            runtime,
         } => handle_resolve_model_command(
-            model.as_deref(),
+            &model,
             config.as_deref(),
             generation,
             task_alias,
             downgrade,
-            tier.as_deref(),
-            &runtime,
         ),
         Commands::Telemetry(cmd) => cmd.run().await,
         Commands::Checkpoint { action } => handle_checkpoint_command(action),
@@ -2533,7 +2508,6 @@ async fn handle_cli_command(command: Commands) -> Result<()> {
         }
         // Async commands are dispatched by main before reaching this sync handler.
         Commands::JevMergeRisk { .. }
-        | Commands::JevTier { .. }
         | Commands::Hyperparams(..)
         | Commands::Quarantine { .. }
         | Commands::DispatchBackoff { .. }

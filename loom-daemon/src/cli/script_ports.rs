@@ -71,6 +71,16 @@ pub(crate) enum ScriptPortCommand {
     /// leaves the session classified as before.
     CodexSandboxNoop(super::codex_sandbox_noop_cli::CodexSandboxNoopArgs),
 
+    /// The error classifier behind `lib/classify-error.sh` (#11208): stdin
+    /// (or `--stdout-tail`/`--stderr-tail` files) plus `--exit-code` and an
+    /// optional `--provider` in, one uppercase category line out;
+    /// `--transient <CATEGORY>` answers the retry deny-list in its exit
+    /// code. Optional to its caller — the shell library falls back to its
+    /// in-file tables when no (new enough) binary resolves, and both sides
+    /// are pinned byte-equal by `test-classify-error.sh`'s parity section and
+    /// the shared `vectors.tsv` fixture.
+    ClassifyError(super::classify_error_cli::ClassifyErrorArgs),
+
     /// The daemon-roll pause hook and pause state (#10830). `hook` is inert
     /// unless LOOM_DAEMON_ITEM_ID is set; an older binary lacking it leaves
     /// every tool call unparked.
@@ -653,6 +663,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::ReleaseResolve(args) => args.run(),
             ScriptPortCommand::ReleaseExplain(args) => args.run(),
             ScriptPortCommand::CodexSandboxNoop(args) => args.run(),
+            ScriptPortCommand::ClassifyError(args) => args.run(),
             ScriptPortCommand::RollPause(cmd) => cmd.run(),
             ScriptPortCommand::AgentResume(cmd) => cmd.run(),
             ScriptPortCommand::InstallCompat(cmd) => cmd.run(),

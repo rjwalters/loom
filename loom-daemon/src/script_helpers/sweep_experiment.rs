@@ -229,8 +229,7 @@ const COMMENT_CLOSE: &str = "-->";
 /// body (issues #3702/#4238/#4448), so a dispatch-time caller can hand a REAL
 /// stratum to [`assign_arm`] instead of the `None` → `routine` default (#4827).
 ///
-/// Mirrors `resolve-tier-model.sh` / `require-complexity-marker.sh`'s extraction
-/// as of #4845:
+/// Mirrors the shell marker extraction as of #4845:
 /// `grep -oE '<!--[[:space:]]*loom:complexity=[a-z]*[[:space:]]*-->' | tail -1`.
 /// Two properties matter and are both reproduced here:
 ///
@@ -1135,7 +1134,6 @@ pub fn format_banner(
                 arm.unwrap_or("None"),
                 model.unwrap_or("None")
             ));
-            lines.push("  (tier-2.5 complexity bump SUPPRESSED for the forced arm)".to_string());
             let src = match canary_source {
                 Some("env") => "env var LOOM_MODEL_EXPERIMENT_CANARY".to_string(),
                 Some("sentinel") => format!("gitignored sentinel {CANARY_SENTINEL}"),
@@ -1319,8 +1317,7 @@ mod tests {
     }
 
     /// `tail -1` semantics (#4845): the LAST canonical marker wins, whether the
-    /// competing markers are on separate lines or share one — matching
-    /// `resolve-tier-model.sh`'s "last marker wins" test.
+    /// competing markers are on separate lines or share one.
     #[test]
     fn extracts_last_marker_when_several_present() {
         let body = "<!-- loom:complexity=complex -->\n<!-- loom:complexity=mechanical -->";
@@ -1921,11 +1918,10 @@ mod tests {
     // ===== banner + misc =====
 
     #[test]
-    fn banner_names_mode_arm_and_suppression() {
+    fn banner_names_mode_and_arm() {
         let out = format_banner("experiment", 100, Some("B"), Some("sonnet"), Some("env"));
         assert!(out.contains("mode=EXPERIMENT"));
         assert!(out.contains("ARM B"));
-        assert!(out.contains("SUPPRESSED"));
         assert!(out.contains("env var LOOM_MODEL_EXPERIMENT_CANARY"));
 
         let out = format_banner("observe", 100, None, None, Some("unconfirmed"));
