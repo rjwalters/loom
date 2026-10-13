@@ -104,6 +104,11 @@ pub enum SpanName {
     /// attempt only — never the command or its output.
     #[serde(rename = "build_gate.run")]
     BuildGateRun,
+    /// One change to a red `main`'s auto-filed fix issue (Issue #11766): an
+    /// instant span, its own root, naming the repo, the SHA, the action
+    /// (`created` / `reused` / `closed` / `closed_duplicate`) and the issue.
+    #[serde(rename = "main_red.autofile")]
+    MainRedAutofile,
 }
 
 impl SpanName {
@@ -134,6 +139,7 @@ impl SpanName {
             Self::EgressRequest => "loom.egress.request",
             Self::GuardCargoTargetDirDenied => "guard.cargo_target_dir.denied",
             Self::BuildGateRun => "build_gate.run",
+            Self::MainRedAutofile => "main_red.autofile",
         }
     }
 }

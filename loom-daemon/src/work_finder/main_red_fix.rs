@@ -166,6 +166,8 @@ pub fn evaluate<D: WorkDispatcher + ?Sized>(
         .map(|i| i.number)
         .collect();
     dispatcher.escalate_red_fix(red, &waiting);
+    // #11766: a verified-red `main` files its own fix issue.
+    dispatcher.autofile_red_main(lane);
     red
 }
 

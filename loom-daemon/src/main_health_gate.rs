@@ -72,7 +72,12 @@
 //! # Surfacing (scope-limited)
 //!
 //! A red `main` is surfaced by **loud logging** (daemon log): the offending
-//! command, its exit reason, and a tail of its captured output. Auto-revert of
+//! command, its exit reason, and a tail of its captured output. Since #11766
+//! it is also surfaced on the forge: the work finder files one
+//! `loom:very-important` fix issue per red repo (and closes it once green;
+//! [`crate::work_finder::main_red_autofile`]). The gate loop feeds it each
+//! logged verdict, with the red output tail, through
+//! `log_transition_for_root`. Auto-revert of
 //! the offending PR (via `merge-pr.sh` / the Auditor cron) is an explicit
 //! non-goal for this issue — halting + surfacing is the hard requirement.
 //! No new event-bus topic is introduced (the six-topic taxonomy is frozen and
@@ -3126,6 +3131,7 @@ fn log_transition_for_root(
     outcome: &GateOutcome,
     halted: bool,
 ) {
+    crate::work_finder::main_red_autofile::note_gate_outcome(root, outcome);
     let r = root.display();
     match transition {
         HealthTransition::EnteredHalt => log::error!(
