@@ -423,6 +423,11 @@ impl SweepRegistry {
             return;
         }
         // #11480: the shared veto, less the hold's own labels being lifted.
+        if crate::work_finder::is_frozen(&snapshot.labels) {
+            // #11743: frozen means no write; drop our record, touch nothing.
+            self.noop_cooldown.streaks.remove(&issue);
+            return;
+        }
         let other_hold = crate::work_finder::restore_veto(&snapshot.labels, ours);
         let claimed = snapshot.labels.iter().any(|l| l == "loom:building");
         let restore = other_hold.is_none() && !claimed;

@@ -186,4 +186,21 @@ fn quarantine_release_never_requeues_a_claimed_or_closed_issue() {
         assert!(calls.contains("issue edit 2980 --remove-label loom:blocked"), "{calls}");
         assert!(!calls.contains("--add-label loom:issue"), "{state}: {calls}");
     }
+/// #11743: a frozen item's quarantine release writes nothing, not even the
+/// removal of the quarantine's own `loom:blocked`; it still counts as done.
+#[test]
+fn quarantine_release_writes_nothing_to_a_frozen_item() {
+    let dir = tempdir().unwrap();
+    let gh_log = dir.path().join("gh.log");
+    let signals = r#"{"state":"open","closed_at":null,"labels":["loom:blocked","loom:frozen"]}"#;
+    let fake_gh = install_fake_gh(dir.path(), &gh_log, signals, 0);
+    let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+    config.gh_bin = Some(fake_gh);
+    config.skip_label_flip = false;
+    let registry = SweepRegistry::new(config);
+
+    assert!(registry.release_quarantine_label(11743));
+
+    let calls = std::fs::read_to_string(&gh_log).unwrap();
+    assert!(!calls.contains("issue edit"), "{calls}");
 }

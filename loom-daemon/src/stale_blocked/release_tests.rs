@@ -812,3 +812,33 @@ fn env_off_and_unowned_shard_read_nothing() {
     assert!(r.dry_run && w.no_writes());
     assert_eq!(r.released.len(), 1);
 }
+
+/// #11743: a frozen artifact gets no write of any kind, even when every
+/// declared blocker has closed.
+#[test]
+fn a_frozen_artifact_is_never_released_or_commented() {
+    for pr in [false, true] {
+        let mut w = World::new();
+        w.parked(10, pr, &[1], &["loom:frozen"]);
+        w.state(1, "CLOSED", false);
+        w.extra
+            .events
+            .insert(10, vec!["loom:issue".into(), "loom:blocked".into()]);
+        let r = w.run();
+        assert!(r.released.is_empty(), "pr={pr}: {}", r.summary());
+        assert!(w.no_writes(), "pr={pr}: {:?}", w.park.writes);
+    }
+}
+
+/// #11517: a release never adds `loom:issue` beside a live `loom:building`.
+#[test]
+fn a_claimed_issue_does_not_get_loom_issue_back_on_release() {
+    let mut w = World::new();
+    w.parked(10, false, &[1], &["loom:building"]);
+    w.state(1, "CLOSED", false);
+    w.extra.events.insert(10, vec!["loom:issue".into(), "loom:blocked".into()]);
+    let r = w.run();
+    assert_eq!(r.released.len(), 1, "{}", r.summary());
+    assert_eq!(r.released[0].restored, None);
+    assert!(!w.labels(10).contains("loom:issue"));
+}

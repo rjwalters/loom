@@ -41,7 +41,7 @@
 //!
 //! | Exit | Meaning | stdout | What the caller must do |
 //! |---|---|---|---|
-//! | `0` | BLOCKED — reason token: `OPEN_PR #X` / `TARGET_IS_PR #N` / `BUILDING` / `LEASE_ALREADY_HELD <host> <sweep-id>` / `BRANCH_EXISTS feature/issue-N` | the token | **Hard-abort the claim.** |
+//! | `0` | BLOCKED — reason token: `OPEN_PR #X` / `TARGET_IS_PR #N` / `FROZEN` / `BUILDING` / `LEASE_ALREADY_HELD <host> <sweep-id>` / `BRANCH_EXISTS feature/issue-N` | the token | **Hard-abort the claim.** |
 //! | [`EX_SAFE_TO_CLAIM`] (1) | verified safe to claim | empty | Claim. |
 //! | [`EX_PROBE_FAILED`] (5) | no verdict — any leg's read failed | empty | **Fail closed.** Treat as blocked; check by hand. |
 //! | [`EX_FORGE_DECLINED`] (3) | Gitea — legs 1–3 are GitHub-only | empty | Check by hand. |
@@ -51,6 +51,10 @@
 //! on. Every non-zero code other than exactly `1` means **the question was
 //! not answered**, which a caller must treat as blocked — never as an
 //! all-clear.
+//!
+//! `FROZEN` (#11743) is read off leg 2's label snapshot: the issue carries
+//! `loom:frozen`, which only a human removes. Like `OPEN_PR` it is never
+//! overridable.
 //!
 //! `--force-claim` overrides legs 2–4 ONLY. It must **never** override the
 //! `OPEN_PR` leg: an open linked PR is someone's *submitted work*, not a
@@ -120,6 +124,9 @@ pub(crate) enum LabelLeg {
     /// present — someone already took this issue. Carries the observed
     /// claim label(s) for the refusal text.
     Claimed(Vec<String>),
+    /// Read succeeded and the issue carries `loom:frozen` (#11743): a human
+    /// took it out of every lane. Never overridable.
+    Frozen,
     /// Read succeeded; no claim label present.
     Clean,
     /// The label read failed (gh missing/failed/unparseable) — NOT evidence
@@ -290,6 +297,15 @@ pub(crate) fn decide(issue: u32, evidence: &ClaimEvidence, force_claim: bool) ->
                          silently and the issue lifecycle would proceed on something that \
                          can never close (#9929). --force-claim never overrides this leg: \
                          there is no issue here to claim."
+                            .to_string(),
+                    );
+                }
+                LabelLeg::Frozen => {
+                    return blocked(
+                        issue,
+                        "FROZEN",
+                        "the issue is `loom:frozen` (#11743): not now, don't touch. Only a \
+                         human removes the label, and --force-claim never overrides it."
                             .to_string(),
                     );
                 }
@@ -467,6 +483,9 @@ pub(crate) fn read_claim_labels(gh_bin: &Path, root: &Path, issue: u32) -> Label
         .iter()
         .filter_map(|l| l.get("name").and_then(|n| n.as_str()).map(String::from))
         .collect();
+    if crate::work_finder::is_frozen(&labels) {
+        return LabelLeg::Frozen;
+    }
     let claims = claim_labels_in(&labels);
     if claims.is_empty() {
         LabelLeg::Clean
@@ -745,6 +764,18 @@ mod tests {
             assert_eq!(v.code, 0, "{label}");
             assert_eq!(v.stdout, "BUILDING", "{label}");
             assert!(v.stderr.contains(label), "{}", v.stderr);
+        }
+    }
+
+    #[test]
+    fn a_frozen_issue_is_blocked_with_the_frozen_token_even_when_forced() {
+        for force in [false, true] {
+            let v = decide(
+                11743,
+                &evidence(OpenPrProbe::NoneOpen, Some(LabelLeg::Frozen), None, None),
+                force,
+            );
+            assert_eq!((v.code, v.stdout.as_str()), (0, "FROZEN"), "force={force}");
         }
     }
 
@@ -1118,6 +1149,17 @@ mod tests {
             r#"echo '{"labels":[{"name":"loom:issue"},{"name":"loom:curated"}]}'"#,
         );
         assert_eq!(read_claim_labels(&clean, dir.path(), 42), LabelLeg::Clean);
+
+        // #11743: frozen wins over a claim label; `loom:frozen-x` is not frozen.
+        let frozen = write_exec(
+            dir.path(),
+            "gh-frozen.sh",
+            r#"echo '{"labels":[{"name":"loom:building"},{"name":"loom:frozen"}]}'"#,
+        );
+        assert_eq!(read_claim_labels(&frozen, dir.path(), 42), LabelLeg::Frozen);
+        let near =
+            write_exec(dir.path(), "gh-near.sh", r#"echo '{"labels":[{"name":"loom:frozen-x"}]}'"#);
+        assert_eq!(read_claim_labels(&near, dir.path(), 42), LabelLeg::Clean);
 
         let failing = write_exec(dir.path(), "gh-fail.sh", "echo 'gh blew up' >&2\nexit 1");
         assert_eq!(read_claim_labels(&failing, dir.path(), 42), LabelLeg::Unknown);

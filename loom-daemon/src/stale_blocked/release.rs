@@ -151,6 +151,8 @@ pub enum Skip {
     /// A PR whose own state supersedes the cleared park
     /// ([`super::park_self_block`]).
     Superseded,
+    /// `loom:frozen` (#11743): no write of any kind.
+    Frozen,
     /// An operator label is on the artifact.
     OperatorHold,
     /// `<!-- loom:permanent-block` in the body or any comment (#8742).
@@ -311,6 +313,9 @@ pub(super) fn has_operator_hold(labels: &[String]) -> bool {
 
 /// The pre-read vetoes visible in the body and labels alone.
 fn body_skip(body: &str, labels: &[String]) -> Option<Skip> {
+    if crate::work_finder::is_frozen(labels) {
+        return Some(Skip::Frozen);
+    }
     let records = parse(body);
     if records.iter().any(|r| r.blocker.is_none()) {
         // #10161: a current daemon hold is counted as one, structurally.
@@ -403,7 +408,8 @@ fn comment_body(plan: &Plan, restored: Option<&str>, vetoed: Option<&str>) -> St
             (Some(l), _) => format!(" Restored `{l}`."),
             (None, Artifact::Issue) if vetoed.is_some() => format!(
                 " `{ISSUE_LABEL}` was not restored: the issue carries `{}`, which keeps it out \
-                 of the build queue until that label is removed (#11480).",
+                 of the build queue. Once that label is removed, re-approve it with \
+                 `{ISSUE_LABEL}` (#11480).",
                 vetoed.unwrap_or_default()
             ),
             (None, Artifact::Issue) => format!(
@@ -837,7 +843,13 @@ fn issue_restore_veto(n: u64, label: &str, labels: &[String]) -> Option<String> 
     if label != ISSUE_LABEL {
         return None;
     }
-    let veto = crate::work_finder::restore_veto(labels, &[BLOCKED_LABEL])?;
+    // #11517: never beside a live claim either; this pass never removes it.
+    let building = crate::work_finder::BUILDING_LABEL;
+    let veto = if labels.iter().any(|l| l == building) {
+        building
+    } else {
+        crate::work_finder::restore_veto(labels, &[BLOCKED_LABEL])?
+    };
     log::info!(
         "stale_blocked: #{n}'s release will not restore `{ISSUE_LABEL}` — it carries `{veto}` \
          (#11480)"

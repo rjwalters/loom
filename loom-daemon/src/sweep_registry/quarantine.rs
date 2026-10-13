@@ -1120,6 +1120,9 @@ impl SweepRegistry {
         // Counted as `quarantine.release` (#10089). Bounded (Issue #3973):
         // expire_quarantine runs from `reap_once`, on the read path.
         let issue_arg = issue.to_string();
+        let Some(restore) = self.quarantine_release_plan(issue) else {
+            return true;
+        };
         let mut edit = vec![
             "issue",
             "edit",
@@ -1127,7 +1130,7 @@ impl SweepRegistry {
             "--remove-label",
             "loom:blocked",
         ];
-        if self.quarantine_release_restores_ready(issue) {
+        if restore {
             edit.extend(["--add-label", "loom:issue"]);
         }
         let repo_flag = crate::claim_reconciliation::gh_call::loom_repo_flag();

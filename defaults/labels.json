@@ -920,6 +920,37 @@
       ]
     },
     {
+      "name": "loom:frozen",
+      "description": "Not now, don't touch: no agent or daemon path acts on it. Humans apply and remove it.",
+      "color": "94A3B8",
+      "kind": "hold",
+      "applied_by": "humans only",
+      "removed_by": "humans only",
+      "park": true,
+      "skip": true,
+      "hold": false,
+      "operator_gate": false,
+      "blocked_colabel": false,
+      "hard_exclusion": true,
+      "champion_path": false,
+      "human_gated": false,
+      "merge_hold": false,
+      "operator_hold": false,
+      "contradicts_approval": null,
+      "stale_after_minutes": null,
+      "requires_base": null,
+      "remove_with": [],
+      "lifecycle": "active",
+      "color_note": "slate-400 - inert, not an action signal",
+      "yaml_preamble": [
+        "# loom:frozen (#11743) means \"not now, don't touch\": nothing is pending, so",
+        "# nothing re-evaluates it. Unlike loom:blocked (waiting on something, released",
+        "# automatically) no agent or daemon path reads it as work, comments on it,",
+        "# relabels it or dispatches it. A human applies it and only a human removes it.",
+        "# It is a park, a skip and a hard exclusion (hard-exclusion-labels.sh)."
+      ]
+    },
+    {
       "name": "loom:important",
       "description": "Priority 2 of 3: taken before unlabeled work, not a hold. Applied by: operator, Guide, Champion.",
       "color": "CA8A04",

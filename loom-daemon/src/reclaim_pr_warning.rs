@@ -58,6 +58,14 @@ pub(crate) fn reclaim_and_warn(gh_bin: &Path, root: &Path, issue: u32) -> Result
     // #11480: an item another hold took out of the queue loses only the stale
     // claim; `loom:issue` is not re-added.
     if let Some(label) = crate::release_veto::veto(gh_bin, root, issue, &[]) {
+        if label == crate::work_finder::FROZEN_LABEL {
+            log::warn!(
+                "claim_reconciliation: #{issue} in {} is `loom:frozen` — not reclaiming, no \
+                 label write (#11743)",
+                root.display()
+            );
+            return Ok(());
+        }
         log::warn!(
             "claim_reconciliation: #{issue} in {} carries `{label}` — removing the stale \
              `loom:building` claim only, NOT re-adding `loom:issue` (#11480)",
@@ -152,6 +160,8 @@ mod tests {
         for (labels, restores) in [
             (r#"["loom:building","loom:operator-only"]"#, false),
             (r#"["loom:building"]"#, true),
+            // #11743: frozen — no edit at all (checked below).
+            (r#"["loom:building","loom:frozen"]"#, false),
         ] {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path().join("repo");
@@ -172,6 +182,10 @@ mod tests {
             reclaim_and_warn(&ws.gh, &root, 42).unwrap();
 
             let calls = std::fs::read_to_string(&log).unwrap();
+            if labels.contains("loom:frozen") {
+                assert!(!calls.contains("issue edit"), "{labels}: {calls}");
+                continue;
+            }
             assert!(calls.contains("issue edit 42 --remove-label loom:building"), "{calls}");
             assert_eq!(calls.contains("--add-label loom:issue"), restores, "{labels}: {calls}");
         }
