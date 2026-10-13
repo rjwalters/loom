@@ -3,8 +3,8 @@
 #
 # `.loom/install-metadata.json` is a machine-local install stamp: every
 # host's `resync-installed.sh` re-writes loom_version, loom_commit, and
-# last_resync (plus loom_source, an absolute host-specific path) on every
-# run. Because the file is COMMITTED (it must stay tracked — it is the
+# last_resync (plus loom_source, an absolute host-specific path) whenever
+# its surfaces or version change (#11680). Because the file is COMMITTED (it must stay tracked — it is the
 # authoritative ownership manifest consumed by verify-install.sh and
 # uninstall-loom.sh), any two hosts that each commit a resync and then
 # `git merge`/`git pull` the other's commit collide on this file, every
