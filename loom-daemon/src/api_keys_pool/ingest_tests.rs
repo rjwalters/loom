@@ -119,10 +119,8 @@ fn proxy_mark(workspace: &Path, classification: Classification) -> BadMark {
 /// time, so the exit-code pass over a log that also reads "exhausted" finds a
 /// mark that already covers its horizon and leaves it alone.
 ///
-/// The clock is pinned (#10955): a mark's horizon is whole seconds, so
-/// without it the two writes sometimes land in different seconds and the
-/// existing mark is one second short of covering — the case the next test
-/// pins on purpose.
+/// The clock is pinned (#10955) so this is the same-second case; the next
+/// test pins the writes a second (and ~90s) apart on purpose (#9847).
 #[test]
 fn an_equally_strong_proxy_mark_is_not_rewritten_by_the_exit_code_path() {
     let _clock = bad_marks::test_clock::pin(T0);
@@ -138,26 +136,62 @@ fn an_equally_strong_proxy_mark_is_not_rewritten_by_the_exit_code_path() {
     assert!(active(tmp.path(), "beta", Some("glm-5.3-flash")).is_none());
 }
 
-/// The other side of the second boundary (#10955), and
-/// `escalate_bad_for_class`'s documented contract: an existing mark covers
-/// only when it resets at or after `now + cooldown`. One second later the
-/// proxy's equally long mark falls one second short, so it is replaced — by a
-/// mark whose horizon is later, never earlier.
+/// The other side of the second boundary (#10955 / #9847): an equally long
+/// proxy mark written an earlier second -- or, as in production, a minute or
+/// so earlier -- is still equally strong, so it is left alone rather than
+/// rewritten with a slid horizon.
 #[test]
-fn an_equally_long_proxy_mark_from_an_earlier_second_is_replaced_never_shortened() {
+fn an_equally_long_proxy_mark_from_an_earlier_second_is_left_alone() {
     let clock = bad_marks::test_clock::pin(T0);
     let tmp = workspace(&["alpha", "beta"]);
     let proxy = proxy_mark(tmp.path(), Classification::Exhausted);
     assert_eq!(proxy.marked_at, T0);
 
-    clock.set(T0 + 1);
+    // One second later, and again ~90s later (the realistic proxy -> exit-code gap).
+    for later in [T0 + 1, T0 + 90] {
+        clock.set(later);
+        let contents = log("pool", Some("alpha"), "glm-5.3-flash", "Error: insufficient balance");
+        let feedback = ingest_launch_log(tmp.path(), &contents, ANCHOR, Some(1)).unwrap();
+
+        assert_eq!(feedback.mark, Some(proxy.clone()));
+        assert!(feedback.detail.contains("already bad-marked"), "{}", feedback.detail);
+        assert_eq!(active(tmp.path(), "alpha", Some("glm-5.3-flash")).unwrap(), proxy);
+    }
+}
+
+/// The upgrade case still holds when the weaker mark is backdated: strength
+/// is compared, so a 60s `rate-limited` mark never covers a 6h exhaustion.
+#[test]
+fn a_backdated_rate_limited_mark_is_still_upgraded_to_exhausted() {
+    let clock = bad_marks::test_clock::pin(T0);
+    let tmp = workspace(&["alpha"]);
+    let weak = proxy_mark(tmp.path(), Classification::RateLimited);
+    clock.set(T0 + 30);
     let contents = log("pool", Some("alpha"), "glm-5.3-flash", "Error: insufficient balance");
     let feedback = ingest_launch_log(tmp.path(), &contents, ANCHOR, Some(1)).unwrap();
-
-    let mark = feedback.mark.clone().unwrap();
-    assert_eq!(mark.marked_at, T0 + 1);
-    assert_eq!(mark.resets_at, proxy.resets_at.map(|t| t + 1));
+    let mark = feedback.mark.unwrap();
+    assert_ne!(mark, weak);
+    assert_eq!(mark.marked_at, T0 + 30);
+    assert_eq!(mark.resets_at, Some(T0 + 30 + 6 * 3600));
     assert!(feedback.detail.contains("from the launch log"), "{}", feedback.detail);
+}
+
+/// The duplicate window is bounded (#9847): an equally strong mark that has
+/// mostly run out is not a duplicate of a fresh exhaustion signal, so the
+/// fresh signal re-arms the full horizon instead of letting the account back
+/// into rotation minutes later.
+#[test]
+fn a_mostly_elapsed_equally_strong_mark_is_re_armed_by_a_fresh_signal() {
+    let clock = bad_marks::test_clock::pin(T0);
+    let tmp = workspace(&["alpha"]);
+    let stale = proxy_mark(tmp.path(), Classification::Exhausted);
+    let later = T0 + 5 * 3600;
+    clock.set(later);
+    let contents = log("pool", Some("alpha"), "glm-5.3-flash", "Error: insufficient balance");
+    let feedback = ingest_launch_log(tmp.path(), &contents, ANCHOR, Some(1)).unwrap();
+    let mark = feedback.mark.unwrap();
+    assert_ne!(mark, stale);
+    assert_eq!(mark.resets_at, Some(later + 6 * 3600));
     assert_eq!(active(tmp.path(), "alpha", Some("glm-5.3-flash")).unwrap(), mark);
 }
 
