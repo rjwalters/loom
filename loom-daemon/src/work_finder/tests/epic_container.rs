@@ -71,7 +71,7 @@ fn a_tick_dispatches_the_phase_child_and_counts_the_epics_as_labeled_skips() {
 #[test]
 fn a_multi_workspace_tick_shows_the_epic_as_a_skipped_row_naming_the_label() {
     let mut multi = vec![(FakeSource::once(rows()), RecordingDispatcher::default())];
-    let report = tick_multi(&mut multi, &[100], 10, &[false]);
+    let report = tick_multi(&mut multi, &[1], 10, &[false]);
     assert_eq!(multi[0].1.dispatched, vec![3, 4]);
     assert_eq!(report.skipped_labeled, 2);
 

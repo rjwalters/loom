@@ -135,7 +135,7 @@
       ]
     },
     {
-      "name": "workspace_priority is never compared across hosts: host id decides, not the bigger number",
+      "name": "workspace_weight is never compared across hosts: host id decides, not the bigger number",
       "hosts": [
         {
           "host_id": "host-a",
@@ -147,7 +147,7 @@
               "position": 3,
               "plan_state": "queued",
               "gate": "capacity",
-              "keys": [{ "name": "workspace_priority", "value": 10 }]
+              "keys": [{ "name": "workspace_weight", "value": 10 }]
             }
           ]
         },
@@ -161,7 +161,7 @@
               "position": 3,
               "plan_state": "queued",
               "gate": "capacity",
-              "keys": [{ "name": "workspace_priority", "value": 900 }]
+              "keys": [{ "name": "workspace_weight", "value": 900 }]
             }
           ]
         }

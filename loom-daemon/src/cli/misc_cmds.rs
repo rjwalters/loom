@@ -282,7 +282,6 @@ pub(crate) fn handle_validate_command(
     format: &str,
     strict: bool,
     verbose: bool,
-    fleet_policy_only: bool,
 ) -> Result<()> {
     use loom_daemon::config_resolver;
     use role_validation::{format_validation_result, validate_from_config, ValidationMode};
@@ -300,21 +299,6 @@ pub(crate) fn handle_validate_command(
     // repo may configure `terminals` entirely from `.loom-project/project.json`
     // or `.loom-local/local.json`.
     let config = config_resolver::resolve_effective_config(&absolute_workspace);
-
-    // #11441: fleet-policy keys committed in a tracked repo tier shadow
-    // fleet-gitops. Reported on stderr so `--format json` stdout stays parseable;
-    // `--strict` turns any finding into exit 2 (below).
-    let fleet_findings = loom_daemon::fleet_policy::check(&absolute_workspace);
-    for f in &fleet_findings {
-        eprintln!("fleet-policy: {} ({})", f.message, f.file.display());
-    }
-    if fleet_policy_only {
-        if fleet_findings.is_empty() {
-            println!("No un-allowed fleet-policy keys in tracked config tiers.");
-            return Ok(());
-        }
-        std::process::exit(2);
-    }
 
     // The tiers searched, in precedence order — named in every "not found" error
     // (Finding 5: both text and json branches).
@@ -406,7 +390,7 @@ pub(crate) fn handle_validate_command(
 
     if !result.errors.is_empty() {
         std::process::exit(1);
-    } else if (!result.warnings.is_empty() || !fleet_findings.is_empty()) && strict {
+    } else if !result.warnings.is_empty() && strict {
         std::process::exit(2);
     }
 

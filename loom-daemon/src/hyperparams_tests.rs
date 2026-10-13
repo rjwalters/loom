@@ -441,60 +441,95 @@ fn champion_values_enter_the_digest() {
 
 #[test]
 #[serial]
-fn draw_temperature_defaults_and_reads_the_config_block() {
+fn weight_bonuses_default_and_read_the_config_block() {
     let tmp = empty_workspace();
     let resolved = resolve_effective(tmp.path());
-    assert_eq!(resolved.params.dispatch.draw_temperature, DEFAULT_DRAW_TEMPERATURE);
-    assert_eq!(resolved.sources["dispatch.drawTemperature"], Source::Default);
+    let d = &resolved.params.dispatch;
+    assert_eq!(
+        (
+            d.weight_bonus_red_main_fix,
+            d.weight_bonus_very_important,
+            d.weight_bonus_important
+        ),
+        (
+            DEFAULT_BONUS_RED_MAIN_FIX,
+            DEFAULT_BONUS_VERY_IMPORTANT,
+            DEFAULT_BONUS_IMPORTANT
+        )
+    );
+    assert_eq!(resolved.sources["dispatch.weightBonusRedMainFix"], Source::Default);
 
-    write_config(tmp.path(), r#"{"hyperparameters": {"dispatch": {"drawTemperature": 40}}}"#);
+    write_config(
+        tmp.path(),
+        r#"{"hyperparameters": {"dispatch": {"weightBonusRedMainFix": 40, "weightBonusImportant": 0}}}"#,
+    );
     let resolved = resolve_effective(tmp.path());
-    assert_eq!(resolved.params.dispatch.draw_temperature, 40);
-    assert_eq!(resolved.sources["dispatch.drawTemperature"], Source::Config);
-    // A new field changes the digest (once, when it lands) and its value enters it.
+    assert_eq!(resolved.params.dispatch.weight_bonus_red_main_fix, 40);
+    assert_eq!(resolved.params.dispatch.weight_bonus_important, 0);
+    assert_eq!(resolved.sources["dispatch.weightBonusRedMainFix"], Source::Config);
     assert_ne!(digest_of(&resolved.params), digest_of(&Hyperparameters::default()));
 }
 
 #[test]
-fn draw_temperature_is_validated_by_name() {
-    for bad in [
-        serde_json::json!(0),
-        serde_json::json!(100_001),
-        serde_json::json!(1.5),
+fn weight_bonuses_are_validated_by_name() {
+    for key in [
+        "weightBonusRedMainFix",
+        "weightBonusVeryImportant",
+        "weightBonusImportant",
     ] {
-        let violations = validate_layer(&serde_json::json!({"dispatch": {"drawTemperature": bad}}));
-        assert!(
-            violations
-                .iter()
-                .any(|v| v.path == "dispatch.drawTemperature"),
-            "{bad}: {violations:?}"
-        );
+        for bad in [
+            serde_json::json!(-1),
+            serde_json::json!(1_000_001),
+            serde_json::json!(1.5),
+        ] {
+            let violations = validate_layer(&serde_json::json!({"dispatch": {key: bad}}));
+            assert!(
+                violations
+                    .iter()
+                    .any(|v| v.path == format!("dispatch.{key}")),
+                "{key}={bad}: {violations:?}"
+            );
+        }
+        for good in [0, 20, 1_000_000] {
+            let violations = validate_layer(&serde_json::json!({"dispatch": {key: good}}));
+            assert!(violations.is_empty(), "{key}={good}: {violations:?}");
+        }
     }
-    for good in [1, 80, 100_000] {
-        let violations =
-            validate_layer(&serde_json::json!({"dispatch": {"drawTemperature": good}}));
-        assert!(violations.is_empty(), "{good}: {violations:?}");
-    }
+}
+
+/// #11742: the retired `drawTemperature` is still accepted (and ignored), so
+/// a host config that set it keeps starting.
+#[test]
+fn retired_draw_temperature_is_accepted_and_ignored() {
+    let violations = validate_layer(&serde_json::json!({"dispatch": {"drawTemperature": 80}}));
+    assert!(violations.is_empty(), "{violations:?}");
 }
 
 #[test]
 #[serial]
-fn work_finder_reader_hot_applies_the_draw_temperature() {
+fn work_finder_reader_hot_applies_the_weight_bonuses() {
+    use crate::priority_pick::WeightBonus;
     let tmp = empty_workspace();
     let config = crate::work_finder::read_work_finder_config(tmp.path());
-    assert_eq!(config.draw_temperature, None);
+    assert_eq!(config.weight_bonus, [None; 3]);
     assert_eq!(
-        crate::work_finder::config::resolve_draw_temperature(&config),
-        DEFAULT_DRAW_TEMPERATURE
+        crate::work_finder::config::resolve_weight_bonus(&config),
+        WeightBonus::default()
     );
-    write_config(tmp.path(), r#"{"hyperparameters": {"dispatch": {"drawTemperature": 120}}}"#);
+    write_config(
+        tmp.path(),
+        r#"{"hyperparameters": {"dispatch": {"weightBonusVeryImportant": 7}}}"#,
+    );
     let config = crate::work_finder::read_work_finder_config(tmp.path());
-    assert_eq!(config.draw_temperature, Some(120));
+    assert_eq!(config.weight_bonus, [None, Some(7), None]);
     // Out of range soft-ignores to the default per tick (startup names it).
-    write_config(tmp.path(), r#"{"hyperparameters": {"dispatch": {"drawTemperature": 0}}}"#);
+    write_config(
+        tmp.path(),
+        r#"{"hyperparameters": {"dispatch": {"weightBonusVeryImportant": 2000000}}}"#,
+    );
     let config = crate::work_finder::read_work_finder_config(tmp.path());
     assert_eq!(
-        crate::work_finder::config::resolve_draw_temperature(&config),
-        DEFAULT_DRAW_TEMPERATURE
+        crate::work_finder::config::resolve_weight_bonus(&config),
+        WeightBonus::default()
     );
 }

@@ -51,7 +51,7 @@ fn sample_compiled() -> Value {
         "dispatch": {},
         "hosts": [{"name": "build-1"}, {"name": "build-2"}],
         "repos": [
-            {"dir": "app", "fleet": true, "fleet_priority": 5, "name": "app"}
+            {"dir": "app", "fleet": true, "name": "app", "weight": 5}
         ],
         "root": "/srv/src",
         "state": {
@@ -137,13 +137,13 @@ fn unknown_host_is_refused_from_fleet_json_as_from_the_legacy_files() {
 #[test]
 fn present_fleet_json_wins_and_the_legacy_files_are_not_read() {
     let mut doc = sample_compiled();
-    doc["repos"][0]["fleet_priority"] = json!(7);
+    doc["repos"][0]["weight"] = json!(7);
     doc["state"]["fleet"]["state"] = json!("stopped");
     doc["config"]["defaults"]["forge"]["githubApp"]["appId"] = json!("2");
     let s = both(&doc.to_string());
 
     let r = read_roster(&s).unwrap().unwrap();
-    assert_eq!(r.records[0].fleet_priority, Some(7));
+    assert_eq!(r.records[0].weight, Some(7));
     assert_eq!(read_state(&s, "build-1").unwrap().unwrap().state, state::RunState::Stopped);
     let machine = &read_tiers(&s, "build-1").unwrap()[0];
     assert_eq!(machine.value["forge"]["githubApp"]["appId"], json!("2"));

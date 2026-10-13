@@ -123,7 +123,7 @@ fn a_ready_row_is_dated_by_its_issue_history() {
             issue: 7,
             rank: 1,
             level: 0,
-            fleet_priority: 100,
+            weight: 100,
             created_at: None,
             main_red_fix: false,
             eligible_reason: None,

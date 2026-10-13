@@ -285,7 +285,7 @@ fn sample_repo_status(root_missing: bool) -> RepoStatus {
     RepoStatus {
         root: PathBuf::from("/repos/gamma"),
         maintain_only: None,
-        priority: 100,
+        weight: 100,
         in_flight_count: 0,
         health_gate_halted: false,
         quarantined_issues: vec![],

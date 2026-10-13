@@ -2715,13 +2715,13 @@ pub struct RepoStatus {
     /// a normal workspace, and from a daemon that predates the mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub maintain_only: Option<crate::workspace_registry::MaintainOnly>,
-    /// This repo's cross-repo dispatch priority tier (Issue #3946): lower = higher
-    /// priority, default [`crate::workspace_registry::DEFAULT_WORKSPACE_PRIORITY`].
-    /// Surfaced so `loom-daemon status` shows which repos the autonomous loops
-    /// drain first. `#[serde(default)]` keeps pre-#3946 wire data compatible (an
-    /// absent field parses as the default tier).
-    #[serde(default = "crate::workspace_registry::default_priority")]
-    pub priority: u32,
+    /// This repo's cross-repo draw weight (#11742): higher = drawn more,
+    /// default [`crate::workspace_registry::DEFAULT_WORKSPACE_WEIGHT`].
+    /// Surfaced so `loom-daemon status` shows how the autonomous loops share
+    /// dispatch. `#[serde(default)]` keeps older wire data parsing (an absent
+    /// field parses as the default weight).
+    #[serde(default = "crate::workspace_registry::default_weight")]
+    pub weight: u32,
     /// Count of non-terminal (`Pending` / `Running`) sweeps live in this repo's
     /// own [`crate::sweep_registry::SweepRegistry`] at snapshot time.
     pub in_flight_count: usize,

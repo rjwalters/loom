@@ -453,6 +453,12 @@ pub(crate) enum ScriptPortCommand {
     #[command(subcommand)]
     RoleToolPolicy(super::role_tool_policy::RoleToolPolicyCommand),
 
+    /// Per-stage runtime selection views (#11726): `roles draw --explain`
+    /// prints each stage's effective weighted, per-attempt draw table on this
+    /// host and the config tier that set it.
+    #[command(subcommand)]
+    Roles(super::roles_draw_cmd::RolesCommand),
+
     /// Tier-3 "generic passthrough" launch-shape resolution (#8671): reads a
     /// runtime capability manifest's `launch` object and renders it as
     /// eval-ready shell defaults. Backs `spawn-generic-launch.sh`. Exit 0
@@ -710,6 +716,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::AffectedFiles(cmd) => cmd.run(),
             ScriptPortCommand::FleetCaptain(args) => args.run(),
             ScriptPortCommand::RoleToolPolicy(cmd) => cmd.run(),
+            ScriptPortCommand::Roles(cmd) => cmd.run(),
             ScriptPortCommand::RuntimeLaunchEnv(args) => args.run(),
             ScriptPortCommand::CheckStaleBlocked(args) => args.run(),
             ScriptPortCommand::GuardMcpTools(args) => args.run(),

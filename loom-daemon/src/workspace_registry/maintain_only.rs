@@ -120,7 +120,7 @@ mod tests {
         std::fs::create_dir_all(&repo).unwrap();
         let path = dir.path().join("workspaces.json");
         let mut reg = WorkspaceRegistry::default();
-        reg.add_with_priority(&repo, None, 7).unwrap();
+        reg.add_with_weight(&repo, None, 7).unwrap();
 
         let by = Some(MaintainOnlySource::Operator);
         assert_eq!(reg.set_maintain_only(&repo, by, t0()), Some(true));
@@ -142,7 +142,7 @@ mod tests {
         // Back to normal: same entry, same priority, never removed.
         assert_eq!(reg.set_maintain_only(&repo, None, later), Some(true));
         assert_eq!(reg.workspaces.len(), 1);
-        assert_eq!(reg.workspaces[0].priority, 7);
+        assert_eq!(reg.workspaces[0].weight, 7);
         assert!(reg.maintain_only_of(&repo).is_none());
         reg.save(&path).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();

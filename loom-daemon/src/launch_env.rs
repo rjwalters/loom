@@ -112,6 +112,8 @@ mod tests {
                      tap=opencode:zai-metered source=preference"
                 .into(),
             model_profile: Some("zai-metered".into()),
+            model: None,
+            draw: None,
         }
     }
 
@@ -125,6 +127,8 @@ mod tests {
                      source=preference"
                 .into(),
             model_profile: None,
+            model: None,
+            draw: None,
         }
     }
 

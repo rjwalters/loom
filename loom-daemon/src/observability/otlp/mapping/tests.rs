@@ -857,6 +857,7 @@ fn role_tick_outcome_envelope(
             // Issue #8599: no preference list decided this tick.
             preference_tier: None,
             preference_tap: None,
+            role_draw: None,
             // Issue #8507: a Claude tick writes no launch record.
             runtime: None,
             provider: None,

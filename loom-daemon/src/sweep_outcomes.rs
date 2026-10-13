@@ -1182,6 +1182,7 @@ mod tests {
                 gated_pool: None,
                 preference_tier: None,
                 preference_tap: None,
+                role_draw: None,
                 runtime: None,
                 provider: None,
                 profile: None,

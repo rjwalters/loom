@@ -140,6 +140,7 @@ pub fn halted_result(causes: &[HaltCause], billing_blocked: bool) -> &'static st
             HaltCause::DaemonTooOld => "halted_daemon_too_old",
             HaltCause::MaintainOnly => "halted_maintain_only",
             HaltCause::DiskReservation => "halted_disk_reservation",
+            HaltCause::WeightZero => "halted_weight_zero",
         },
         _ => "halted",
     }

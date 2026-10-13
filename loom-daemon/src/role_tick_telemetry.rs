@@ -117,6 +117,9 @@ pub struct RoleTickTelemetry {
     /// The chosen tap's `<runtime>[:<profile>]` identity (Issue #8599).
     /// Present exactly when [`Self::preference_tier`] is.
     pub preference_tap: Option<String>,
+    /// The role draw's decision record when `runtimes.roleDraw` chose the
+    /// tap (#11726).
+    pub role_draw: Option<crate::runtime_preference::role_draw::RoleDrawRecord>,
 }
 
 /// What one role invocation actually resolved before it spawned — the input
@@ -292,6 +295,9 @@ pub fn emit_for_tick_correlated(
     // launch the preference list did not decide has none either — absent, not
     // a fabricated `0`, which would read as "chose the top tap".
     let preference = resolved.and_then(|resolved| resolved.preference);
+    let role_draw = preference
+        .as_ref()
+        .and_then(|stamp| stamp.draw.as_deref().cloned());
     emit_correlated(
         &RoleTickTelemetry {
             root: root.to_path_buf(),
@@ -307,6 +313,7 @@ pub fn emit_for_tick_correlated(
                 .as_ref()
                 .and_then(|stamp| u32::try_from(stamp.tier).ok()),
             preference_tap: preference.map(|stamp| stamp.tap),
+            role_draw,
         },
         trace,
     );
@@ -608,6 +615,7 @@ pub fn build_record(
         gated_pool: tick.gated_pool.clone().filter(|p| !p.is_empty()),
         preference_tier: tick.preference_tier,
         preference_tap: tick.preference_tap.clone().filter(|t| !t.is_empty()),
+        role_draw: tick.role_draw.clone(),
         // Populated by `emit` via `apply_runtime_attribution` (Issue #8507):
         // that resolution needs a filesystem read this function deliberately
         // stays free of (see the doc comment above).
