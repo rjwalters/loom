@@ -8,29 +8,32 @@
 //! 1. each workspace's candidates are put in their in-workspace order —
 //!    verified red-main fix first (#11547), then level, then oldest
 //!    `createdAt`, then issue number ([`crate::priority_pick::issue_cmp`]);
-//! 2. a workspace is drawn among those with candidates left, weighted by its
-//!    `fleet_priority` ([`crate::priority_pick::softmax_weight`], a softmax at
-//!    the tick's [`draw_temperature`], #11684); a
-//!    workspace whose next candidate is a verified red-main fix wins the
-//!    draw, else one whose next candidate is `loom:very-important` (the draw
-//!    is among just those when several qualify);
+//! 2. a workspace is drawn among those with candidates left, with
+//!    probability w / Σw ([`crate::priority_pick::draw_workspace`], #11742):
+//!    w is its roster `weight` plus the tick's [`weight_bonus`] points while
+//!    its remaining candidates include a verified red-main fix,
+//!    `loom:very-important` work or `loom:important` work. No tier wins
+//!    outright;
 //! 3. the drawn workspace's next candidate is appended, and the draw repeats
 //!    until every candidate is placed.
 //!
-//! The RNG is seeded once per tick ([`tick_seed`]); the seed and every draw
-//! (candidates, weights, temperature, `p_min`, roll, pick) are kept on the [`TickReport`] and
-//! exported in `pick.decision`, so a fixed seed reproduces the exact order.
+//! The RNG is seeded once per tick ([`tick_seed`]) from the wall-clock
+//! minute and the host id ([`minute_seed`], #11683); the seed, its inputs and
+//! every draw (candidates, base weights, bonuses, roll, pick) are kept on the
+//! [`TickReport`] and exported in `pick.decision`, so the logged
+//! `(minute, host)` alone reproduces the exact order.
 //!
 //! The level is the issue's own `loom:important` / `loom:very-important`
 //! label ([`Level::of`]); there is no legacy bridge (#11508).
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::atomic::AtomicU32;
 
 use super::{PriorityCandidate, TickReport};
-use crate::priority_pick::{self, IssueKey, Level, PickRng, WorkspaceDraw, WorkspaceEntry};
-use crate::workspace_registry::DEFAULT_WORKSPACE_PRIORITY;
+use crate::priority_pick::{
+    self, IssueKey, Level, PickRng, WeightBonus, WorkspaceDraw, WorkspaceEntry,
+};
+use crate::workspace_registry::DEFAULT_WORKSPACE_WEIGHT;
 
 /// At most this many draws are kept per tick (the first ones, which decide
 /// the slots); [`DrawLog::draws_total`] carries the uncapped count.
@@ -57,6 +60,21 @@ pub struct DrawLog {
     pub draws_total: usize,
     /// The first [`MAX_RECORDED_DRAWS`] draws, in order.
     pub steps: Vec<DrawStep>,
+    /// What [`seed`](Self::seed) was derived from (#11683): `None` when it
+    /// was pinned ([`with_seed`]) or passed to [`draw_order`] directly.
+    pub seed_inputs: Option<SeedInputs>,
+}
+
+/// The inputs a tick's seed was derived from: enough to recompute it with
+/// [`minute_seed`] (#11683).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeedInputs {
+    /// The derivation scheme, [`DRAW_SEED_SCHEME`].
+    pub scheme: &'static str,
+    /// The wall-clock minute, `floor(unix_utc_secs / 60)`.
+    pub minute: u64,
+    /// The host id ([`crate::sweep_registry::host_identity`]).
+    pub host: String,
 }
 
 /// The name a workspace carries inside the draw: its index, zero-padded so
@@ -89,15 +107,16 @@ pub fn in_workspace_cmp(a: &PriorityCandidate, b: &PriorityCandidate) -> std::cm
 }
 
 /// `candidates` in draw order (see the module docs), plus the draw log
-/// (`None` when there was nothing to draw). `priorities[i]` is workspace
-/// `i`'s `fleet_priority`; a missing entry is the default. Every draw weighs
-/// at `temperature` (#11684).
+/// (`None` when there was nothing to draw). `weights[i]` is workspace `i`'s
+/// roster `weight`; a missing entry is [`DEFAULT_WORKSPACE_WEIGHT`]. Every
+/// draw adds `bonus` (#11742). A workspace of weight 0 is never drawn, so its
+/// candidates are left out of the order.
 #[must_use]
 pub fn draw_order(
     candidates: Vec<PriorityCandidate>,
-    priorities: &[u32],
+    weights: &[u32],
     seed: u64,
-    temperature: u32,
+    bonus: &WeightBonus,
 ) -> (Vec<PriorityCandidate>, Option<DrawLog>) {
     let mut queues: BTreeMap<usize, VecDeque<PriorityCandidate>> = BTreeMap::new();
     for c in candidates {
@@ -112,19 +131,19 @@ pub fn draw_order(
     loop {
         let entries: Vec<WorkspaceEntry> = queues
             .iter()
-            .filter_map(|(idx, q)| {
-                q.front().map(|next| WorkspaceEntry {
-                    workspace: workspace_key(*idx),
-                    priority: priorities
-                        .get(*idx)
-                        .copied()
-                        .unwrap_or(DEFAULT_WORKSPACE_PRIORITY),
-                    has_very_important: next.level == Level::VeryImportant,
-                    has_red_main_fix: next.main_red_fix,
-                })
+            .filter(|(_, q)| !q.is_empty())
+            .map(|(idx, q)| WorkspaceEntry {
+                workspace: workspace_key(*idx),
+                weight: weights
+                    .get(*idx)
+                    .copied()
+                    .unwrap_or(DEFAULT_WORKSPACE_WEIGHT),
+                has_red_main_fix: q.iter().any(|c| c.main_red_fix),
+                has_very_important: q.iter().any(|c| c.level == Level::VeryImportant),
+                has_important: q.iter().any(|c| c.level == Level::Important),
             })
             .collect();
-        let Some(draw) = priority_pick::draw_workspace(&entries, temperature, &mut rng) else {
+        let Some(draw) = priority_pick::draw_workspace(&entries, bonus, &mut rng) else {
             break;
         };
         let Some((idx, c)) = workspace_idx(&draw.picked).and_then(|idx| {
@@ -148,62 +167,81 @@ pub fn draw_order(
         seed,
         draws_total: order.len(),
         steps,
+        seed_inputs: None,
     });
     (order, log)
 }
 
-/// Put the tick's candidates in draw order, seeded by [`tick_seed`] and
-/// weighted at [`draw_temperature`], and keep the draw log on `report`. The
+/// Put the tick's candidates in draw order, seeded by [`tick_seed`] with the
+/// [`weight_bonus`] in force, and keep the draw log on `report`. The
 /// multi-workspace tick's one call site.
 #[must_use]
 pub fn order(
     candidates: Vec<PriorityCandidate>,
-    priorities: &[u32],
+    weights: &[u32],
     report: &mut TickReport,
 ) -> Vec<PriorityCandidate> {
-    let (ordered, log) = draw_order(candidates, priorities, tick_seed(), draw_temperature());
+    let (seed, inputs) = tick_seed();
+    let (ordered, mut log) = draw_order(candidates, weights, seed, &weight_bonus());
+    if let Some(log) = log.as_mut() {
+        log.seed_inputs = inputs;
+    }
     report.workspace_draw = log;
     ordered
 }
 
-/// The process's current draw temperature (`dispatch.drawTemperature`,
-/// #11684). Published once per tick by the work-finder loop's config reload
+/// The process's current weight bonuses (`dispatch.weightBonus*`, #11742).
+/// Published once per tick by the work-finder loop's config reload
 /// ([`super::ConfiguredMaxReloader::refresh`]) so a committed-config or
 /// `LOOM_HYPERPARAMS` edit applies on the next tick without a restart, and
 /// read by [`order`]. A process global rather than a tick argument because
 /// the tick entry points live in the size-frozen `work_finder.rs`.
 #[cfg(not(test))]
-static DRAW_TEMPERATURE: AtomicU32 = AtomicU32::new(priority_pick::DEFAULT_DRAW_TEMPERATURE);
+static WEIGHT_BONUS: std::sync::Mutex<WeightBonus> = std::sync::Mutex::new(WeightBonus {
+    red_main_fix: priority_pick::DEFAULT_BONUS_RED_MAIN_FIX,
+    very_important: priority_pick::DEFAULT_BONUS_VERY_IMPORTANT,
+    important: priority_pick::DEFAULT_BONUS_IMPORTANT,
+});
 
 #[cfg(test)]
 thread_local! {
-    /// Under `cfg(test)` the temperature is per thread, so a test that
-    /// publishes one cannot change the draws of a tick another test runs
+    /// Under `cfg(test)` the bonuses are per thread, so a test that
+    /// publishes some cannot change the draws of a tick another test runs
     /// concurrently (the same isolation [`with_seed`] gives the seed).
-    static DRAW_TEMPERATURE: AtomicU32 =
-        const { AtomicU32::new(priority_pick::DEFAULT_DRAW_TEMPERATURE) };
+    static WEIGHT_BONUS: Cell<WeightBonus> = Cell::new(WeightBonus::default());
 }
 
-#[cfg(not(test))]
-fn temperature_cell<R>(f: impl FnOnce(&AtomicU32) -> R) -> R {
-    f(&DRAW_TEMPERATURE)
-}
-
-#[cfg(test)]
-fn temperature_cell<R>(f: impl FnOnce(&AtomicU32) -> R) -> R {
-    DRAW_TEMPERATURE.with(f)
-}
-
-/// The draw temperature the next tick uses.
+/// The weight bonuses the next tick uses.
 #[must_use]
-pub fn draw_temperature() -> u32 {
-    temperature_cell(|t| t.load(std::sync::atomic::Ordering::Relaxed))
+pub fn weight_bonus() -> WeightBonus {
+    #[cfg(not(test))]
+    {
+        *WEIGHT_BONUS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    #[cfg(test)]
+    {
+        WEIGHT_BONUS.with(Cell::get)
+    }
 }
 
-/// Publish the draw temperature for the next tick; `0` is stored as `1`.
-/// Returns the previous value, so a caller can log a transition.
-pub fn set_draw_temperature(temperature: u32) -> u32 {
-    temperature_cell(|t| t.swap(temperature.max(1), std::sync::atomic::Ordering::Relaxed))
+/// Publish the weight bonuses for the next tick. Returns the previous value,
+/// so a caller can log a transition.
+pub fn set_weight_bonus(bonus: WeightBonus) -> WeightBonus {
+    #[cfg(not(test))]
+    {
+        std::mem::replace(
+            &mut *WEIGHT_BONUS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            bonus,
+        )
+    }
+    #[cfg(test)]
+    {
+        WEIGHT_BONUS.with(|c| c.replace(bonus))
+    }
 }
 
 thread_local! {
@@ -225,30 +263,62 @@ pub fn with_seed<R>(seed: u64, f: impl FnOnce() -> R) -> R {
 #[cfg(test)]
 pub const TEST_DEFAULT_SEED: u64 = 11103;
 
-/// This tick's draw seed: a [`with_seed`] pin, else fresh entropy (the wall
-/// clock mixed with a process counter; a fixed seed under `cfg(test)`).
+/// The seed-derivation scheme a [`SeedInputs`] names; also the hash
+/// input's prefix.
+pub const DRAW_SEED_SCHEME: &str = "loom-draw/v1";
+
+/// The draw seed for wall-clock `minute` (`floor(unix_utc_secs / 60)`) on
+/// `host`: the first 8 bytes, read big-endian, of
+/// `sha256("loom-draw/v1:" + minute + ":" + host)`, with `minute` in plain
+/// decimal and `host` verbatim (#11683).
+///
+/// Ticks on one host in the same minute draw the same order (harmless: the
+/// candidates differ between ticks, and leases dedupe); different hosts in
+/// the same minute draw different orders, so they do not all reach for the
+/// same issue first. Hosts that resolve no id share `unknown-host` and so
+/// share orders — also tolerated, since leases and in-flight checks still
+/// dedupe.
 #[must_use]
-pub fn tick_seed() -> u64 {
+pub fn minute_seed(minute: u64, host: &str) -> u64 {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("{DRAW_SEED_SCHEME}:{minute}:{host}").as_bytes());
+    let mut head = [0u8; 8];
+    head.copy_from_slice(&digest[..8]);
+    u64::from_be_bytes(head)
+}
+
+/// This tick's draw seed and what it was derived from: a [`with_seed`] pin
+/// (no inputs), else [`minute_seed`] of the current minute and this host's
+/// id. Under `cfg(test)` an unpinned tick gets [`TEST_DEFAULT_SEED`] instead,
+/// so no test sees a clock-dependent order.
+#[must_use]
+pub fn tick_seed() -> (u64, Option<SeedInputs>) {
     if let Some(seed) = SEED_OVERRIDE.with(Cell::get) {
-        return seed;
+        return (seed, None);
     }
     fresh_seed()
 }
 
 #[cfg(test)]
-fn fresh_seed() -> u64 {
-    TEST_DEFAULT_SEED
+fn fresh_seed() -> (u64, Option<SeedInputs>) {
+    (TEST_DEFAULT_SEED, None)
 }
 
 #[cfg(not(test))]
-fn fresh_seed() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let nanos = std::time::SystemTime::now()
+fn fresh_seed() -> (u64, Option<SeedInputs>) {
+    let minute = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos() as u64);
-    let n = COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
-    nanos ^ n.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .map_or(0, |d| d.as_secs() / 60);
+    let host = crate::sweep_registry::host_identity();
+    let seed = minute_seed(minute, &host);
+    (
+        seed,
+        Some(SeedInputs {
+            scheme: DRAW_SEED_SCHEME,
+            minute,
+            host,
+        }),
+    )
 }
 
 #[cfg(test)]

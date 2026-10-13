@@ -5,6 +5,7 @@
 mod auto_update;
 mod checkout_external_change;
 mod ci;
+mod executing_host;
 mod fact_id;
 mod fleet_state;
 mod host_export;
@@ -16,6 +17,7 @@ mod ops;
 mod outcome_facts;
 mod pass;
 mod pick_decision;
+mod role_draw;
 mod session_output;
 mod token_ranking;
 mod work_started;
@@ -368,6 +370,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             if let Some(gated_pool) = &r.gated_pool {
                 attributes.push(kv_string("loom.gated_pool", gated_pool.clone()));
             }
+            attributes.extend(role_draw::attributes(r.role_draw.as_ref()));
             if let Some(models) = metadata::models(r.models_used.as_deref()) {
                 attributes.push(models);
             }
@@ -678,6 +681,8 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
     if let Some(fact) = fact_id::of(&envelope.record) {
         attributes.insert(2, kv_string("loom.fact_id", fact));
     }
+    // Issue #11765: the stage-governing facts name the executing host's build.
+    attributes.extend(executing_host::attributes(envelope));
     Some(LogRecord {
         time_unix_nano,
         observed_time_unix_nano,

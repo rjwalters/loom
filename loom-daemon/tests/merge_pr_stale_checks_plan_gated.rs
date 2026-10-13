@@ -116,7 +116,6 @@ fn run(env: &[(&str, &str)]) -> Output {
     ])
     .current_dir(dir.path())
     .env("LOOM_GH_BIN", &gh)
-    .env("LOOM_GH_NO_POLICY_LAUNCHER", "1")
     // Hermetic: a private ETag store / hold file, and no request spacing.
     .env("LOOM_LISTING_CACHE_DIR", dir.path().join("store"))
     .env("LOOM_STALE_CHECKS_MIN_GAP_MS", "0")

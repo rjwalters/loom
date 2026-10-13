@@ -26,6 +26,9 @@
 //! They are `resync-installed.sh`'s own, so the script passes them through:
 //! [`EXIT_OK`] applied or already in sync, [`EXIT_FAILED`] refused or failed
 //! (nothing written on a refusal), [`EXIT_DRIFT`] `--dry-run` found changes.
+//! A surface left unrefreshed because its managed-block markers are
+//! malformed (#11033) also exits [`EXIT_FAILED`], after every other surface
+//! was applied: the script counts the same case as a failed file.
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -90,6 +93,9 @@ pub struct Report {
     pub version: String,
     /// Surfaces left as the workspace has them, with the reason.
     pub skipped: Vec<String>,
+    /// One of `skipped` needs a hand fix (malformed markers, #11033), so the
+    /// run is partial and exits [`EXIT_FAILED`].
+    pub partial: bool,
     /// Why this binary is not a release build, for that refusal.
     pub provenance: Option<String>,
 }
@@ -99,8 +105,9 @@ impl Report {
     #[must_use]
     pub fn exit_code(&self) -> i32 {
         match &self.verdict {
-            Verdict::InSync | Verdict::Applied(_) => EXIT_OK,
             Verdict::Refused(_) => EXIT_FAILED,
+            _ if self.partial => EXIT_FAILED,
+            Verdict::InSync | Verdict::Applied(_) => EXIT_OK,
             Verdict::WouldChange(_) => EXIT_DRIFT,
         }
     }
@@ -203,6 +210,7 @@ pub fn run_with(payload: &Payload, dest: &Path, dry_run: bool) -> Result<Report>
         verdict: Verdict::InSync,
         version: payload.stamp().version.to_string(),
         skipped: Vec::new(),
+        partial: false,
         provenance: None,
     };
     let diff = match plan_workspace_with(payload, dest)? {
@@ -221,8 +229,16 @@ pub fn run_with(payload: &Payload, dest: &Path, dry_run: bool) -> Result<Report>
                 "{} (records no install date, so it is not re-rendered; reinstall to refresh it)",
                 skip.path
             ),
+            SkipReason::MalformedMarkers(why) => format!(
+                "{} (NOT refreshed: {why}; fix its BEGIN/END markers by hand and resync again)",
+                skip.path
+            ),
         })
         .collect();
+    report.partial = diff
+        .skipped_surfaces
+        .iter()
+        .any(|skip| matches!(skip.why, SkipReason::MalformedMarkers(_)));
     if diff.is_empty() {
         return Ok(report);
     }

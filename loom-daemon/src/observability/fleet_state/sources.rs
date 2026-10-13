@@ -379,7 +379,7 @@ fn ready_from_tick(
                 issue: row.issue,
                 rank: small(row.rank),
                 level: level(row),
-                fleet_priority: row.workspace_priority,
+                weight: row.workspace_weight,
                 created_at: parse_instant(row.created_at.as_deref()),
                 main_red_fix: row.main_red_fix,
                 eligible_reason: FleetEligibleReason::from_disposition(row.disposition),

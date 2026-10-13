@@ -15,6 +15,7 @@ use crate::telemetry::ops::{
 };
 use crate::telemetry::trace::{SpanName, SpanStatus, TraceContext};
 use crate::telemetry::{TelemetryEnvelope, TelemetryRecord};
+use crate::work_finder::halt_cause::HaltCause;
 use crate::work_finder::TickReport;
 
 #[derive(Default)]
@@ -336,19 +337,80 @@ fn tick_result_precedence() {
         }),
         "dispatched"
     );
-    assert_eq!(with(|r| r.halted = true), "halted_main_red");
-    // #10113: the same hold, attributed to a billing block, is its own result.
+    assert_eq!(
+        with(|r| {
+            r.halted = true;
+            r.halt_causes = vec![HaltCause::MainRed];
+        }),
+        "halted_main_red"
+    );
+    // #11649: a hold with no named cause no longer guesses `main_red`.
+    assert_eq!(with(|r| r.halted = true), "halted");
+    // #10113: a cause-less hold while an owner is billing-blocked keeps its
+    // own result.
     let held = TickReport {
         seen: 3,
         halted: true,
         ..TickReport::default()
     };
     assert_eq!(super::dispatch::tick_result_with(&held, true), "halted_ci_billing");
-    assert_eq!(super::dispatch::tick_result_with(&held, false), "halted_main_red");
+    assert_eq!(super::dispatch::tick_result_with(&held, false), "halted");
+    // The hold outranks saturation, as before.
+    assert_eq!(
+        with(|r| {
+            r.halted = true;
+            r.halt_causes = vec![HaltCause::Drain];
+            r.saturation_held = true;
+        }),
+        "halted_drain"
+    );
     assert_eq!(with(|r| r.saturation_held = true), "saturation_held");
     assert_eq!(with(|r| r.errors = 1), "error");
     assert_eq!(with(|r| r.deferred_ramp_cap = 2), "capacity_full");
     assert_eq!(with(|r| r.skipped_backoff = 3), "all_skipped");
+}
+
+/// #11649: a held tick's result names the hold its workspaces recorded — a
+/// disk-held tick is not a red `main` — and several causes read `halted`.
+#[test]
+fn halted_tick_result_names_the_recorded_cause() {
+    use super::dispatch::{halted_result, tick_result_with};
+    let held = |causes: Vec<HaltCause>, billing: bool| {
+        let report = TickReport {
+            seen: 3,
+            halted: true,
+            halt_causes: causes,
+            ..TickReport::default()
+        };
+        tick_result_with(&report, billing)
+    };
+    assert_eq!(held(vec![HaltCause::DiskReservation], false), "halted_disk_reservation");
+    assert_eq!(held(vec![HaltCause::TokenPool], false), "halted_token_pool");
+    assert_eq!(held(vec![HaltCause::CiBilling], false), "halted_ci_billing");
+    // A global billing block does not relabel another root's named cause.
+    assert_eq!(held(vec![HaltCause::DiskReservation], true), "halted_disk_reservation");
+    assert_eq!(held(vec![HaltCause::MainRed], true), "halted_main_red");
+    assert_eq!(held(vec![HaltCause::MainRed, HaltCause::DiskReservation], false), "halted");
+    // Every single cause maps to `halted_` + its wire token.
+    for cause in HaltCause::ALL {
+        assert_eq!(halted_result(&[cause], false), format!("halted_{}", cause.as_str()));
+    }
+}
+
+/// #11649: a held tick's span lists its causes; an unheld one omits the key.
+#[test]
+fn tick_span_lists_halt_causes_only_when_held() {
+    let held = TickReport {
+        seen: 2,
+        halted: true,
+        halt_causes: vec![HaltCause::Drain, HaltCause::DiskReservation],
+        ..TickReport::default()
+    };
+    let span = tick_span(&held, 3, at(0), at(1));
+    assert_eq!(span.attributes["loom.dispatch.result"], "halted");
+    assert_eq!(span.attributes["loom.dispatch.halt_causes"], "drain,disk_reservation");
+    let idle = tick_span(&TickReport::default(), 3, at(0), at(1));
+    assert!(!idle.attributes.contains_key("loom.dispatch.halt_causes"));
 }
 
 /// #10624: the build back-off result keys on an actual deferral, ranks after
@@ -561,7 +623,7 @@ fn queue_summary(
                 rank: i + 1,
                 repo: "/r".into(),
                 issue: u32::try_from(i).unwrap(),
-                workspace_priority: 100,
+                workspace_weight: 100,
                 urgent: false,
                 level: Default::default(),
                 main_red_fix: false,

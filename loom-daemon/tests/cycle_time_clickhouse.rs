@@ -29,6 +29,9 @@
 //! incident is recorded in the template's own header.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "common/hub_image.rs"]
+mod hub_image;
+
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -134,7 +137,7 @@ impl Stack {
             &format!("CLICKHOUSE_PASSWORD={}", stack.password),
             "--ulimit",
             "nofile=262144:262144",
-            CLICKHOUSE_IMAGE,
+            &hub_image::resolve(CLICKHOUSE_IMAGE),
         ]));
         let deadline = Instant::now() + Duration::from_secs(120);
         while stack.try_query("SELECT 1").is_none() {
@@ -161,7 +164,7 @@ impl Stack {
                     .join("tests/fixtures/cycle_time/collector.yaml")
                     .display()
             ))
-            .arg(COLLECTOR_IMAGE));
+            .arg(hub_image::resolve(COLLECTOR_IMAGE)));
         stack
     }
 
@@ -343,6 +346,12 @@ fn render_fixture(template: &str, now: DateTime<Utc>) -> String {
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn committed_cycle_time_artifacts_answer_the_canonical_questions_on_real_exported_rows() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
+    if !hub_image::available(COLLECTOR_IMAGE) {
+        return;
+    }
     let observability = observability_dir();
     let extract =
         std::fs::read_to_string(observability.join("clickstack/cycle-time-extract.sql")).unwrap();

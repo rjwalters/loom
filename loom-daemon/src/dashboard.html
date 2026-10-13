@@ -380,7 +380,7 @@ function renderQueue(report) {
       el("td", { text: String(row.rank) }),
       issueCell,
       el("td", { text: String(row.repo).split("/").pop() }),
-      el("td", { text: String(row.workspace_priority) }),
+      el("td", { text: String(row.workspace_weight) }),
       el("td", {}, [el("span", { "class": "pill " + QUEUE_STATE_PILL[state], text: state })]),
       el("td", { text: (row.reason || row.disposition.replace(/_/g, " ")) + (row.detail ? " (" + row.detail + ")" : "") }),
       el("td", { text: flags.join(", ") || "-" }),

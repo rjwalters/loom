@@ -62,7 +62,7 @@ fn ready(repo: &str, issue: u32, rank: u32) -> ReadyItem {
         issue,
         rank,
         level: u8::from(rank == 1),
-        fleet_priority: 100,
+        weight: 100,
         created_at: Some(t0() - Duration::days(3)),
         main_red_fix: false,
         eligible_reason: None,
@@ -145,7 +145,7 @@ fn rows_come_from_the_registry_the_review_listings_and_the_ready_queue() {
     assert_eq!(five.stage, FleetStage::ReadyWait);
     assert_eq!(five.rank, Some(1));
     assert_eq!(five.level, 1);
-    assert_eq!(five.fleet_priority, Some(100));
+    assert_eq!(five.weight, Some(100));
     assert_eq!(five.created_at, Some(t0() - Duration::days(3)));
     assert_eq!(view.repos[OTHER].rows[&6].rank, Some(2));
     // A repo not listed this pass has an unknown census.
@@ -953,7 +953,7 @@ fn tick(rows: &[(u32, u32)]) -> crate::types::WorkFinderTickSummary {
         .map(|&(issue, rank)| {
             serde_json::from_value(serde_json::json!({
                 "rank": rank, "repo": "/src/anvil", "issue": issue,
-                "workspace_priority": 100, "urgent": false, "disposition": "queued"
+                "workspace_weight": 100, "urgent": false, "disposition": "queued"
             }))
             .unwrap()
         })

@@ -43,7 +43,6 @@ fn workspace(r: &Roster, owners: &[&str]) -> tempfile::TempDir {
 fn v2(cfg: &RoutingConfig) -> RouteEnv<'_> {
     RouteEnv {
         mode: RoutingMode::Scoped,
-        egress_forbidden: false,
         cfg,
     }
 }
@@ -189,33 +188,6 @@ fn an_empty_roster_a_foreign_host_or_no_owner_is_no_pool() {
     );
 }
 
-#[test]
-fn a_forbidden_egress_is_no_pool_in_v2_and_ignored_in_legacy() {
-    let r = roster(vec![reader("81041", None), reader("81042", None)]);
-    let ws = workspace(&r, &["acme"]);
-    let cfg = RoutingConfig::default();
-    let now = SystemTime::now();
-    let forbidden = RouteEnv {
-        mode: RoutingMode::Scoped,
-        egress_forbidden: true,
-        cfg: &cfg,
-    };
-    assert_eq!(
-        route_read_in(ws.path(), &r, &req("acme/egress", None), &forbidden, now),
-        RouteDecision::NoPool,
-        "NoPool, not Exhausted: nothing is shed"
-    );
-    // Legacy read_credential never checked egress: same answer as pre-change.
-    let legacy = RouteEnv {
-        mode: RoutingMode::Legacy,
-        egress_forbidden: true,
-        cfg: &cfg,
-    };
-    let home = forge_read_pool::assignment_index("acme/egress", 2).unwrap();
-    let d = route_read_in(ws.path(), &r, &req("acme/egress", None), &legacy, now);
-    assert_eq!(app_of(&d), r.readers[home].app_id);
-}
-
 // ---- owners filter -------------------------------------------------------------
 
 #[test]
@@ -315,7 +287,6 @@ fn split_falls_back_to_home_without_a_key_or_when_disabled() {
     }
     let legacy = RouteEnv {
         mode: RoutingMode::Legacy,
-        egress_forbidden: false,
         cfg: &cfg,
     };
     for url in urls("acme/hot2", 20) {

@@ -97,7 +97,7 @@ impl fmt::Display for NoOp {
     }
 }
 
-fn is_exec_result(line: &str, verb: &str) -> bool {
+pub(crate) fn is_exec_result(line: &str, verb: &str) -> bool {
     // ` succeeded in <dur>:` / ` exited <n> in <dur>:` — a leading space,
     // a duration with no `:` in it, and a trailing `:`.
     let Some(rest) = line.strip_prefix(' ') else {

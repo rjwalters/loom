@@ -1,0 +1,113 @@
+# Copy CI's pinned third-party test images into GHCR, by digest (#11755).
+#
+# WHY THIS EXISTS
+#
+# CI's telemetry, collector and session tests run third-party images
+# (ClickHouse, the OTel Collector, ubuntu). Anonymous Docker Hub pulls from
+# GitHub-hosted runners share egress IPs and hit `toomanyrequests`; #11232
+# routed them through mirror.gcr.io, which still depends on a third party
+# carrying exactly the digests we pin. This workflow puts a copy of each pinned
+# image under this repository's own packages, which CI pulls first
+# (loom-daemon/tests/common/hub_image.rs: GHCR, then mirror.gcr.io, then
+# Docker Hub).
+#
+# WHAT IT DOES
+#
+# For every entry in .github/ci-images.txt (`<repo>:<tag>@sha256:<digest>`),
+# copies that exact digest -- the whole multi-arch index -- to
+# ghcr.io/rjwalters/loom-ci-images/<repo>:<tag> with
+# `skopeo copy --all --preserve-digests` (preinstalled on ubuntu runners).
+# --preserve-digests refuses any copy that would change the digest, and the
+# job then reads the copy back by digest, so the GHCR reference hub_image.rs
+# pulls (`.../<repo>@sha256:<digest>`) is proven to exist when this job is
+# green. An entry already present by digest is skipped, so a re-run is cheap.
+#
+# Sources are tried mirror.gcr.io first, then Docker Hub: a digest names the
+# content, so the source host does not matter.
+#
+# AUTH
+#
+# GITHUB_TOKEN with `packages: write` -- no secret. It is handed to skopeo on
+# stdin (`--password-stdin`), never in argv.
+#
+# ONE-TIME OPERATOR STEP: GHCR creates these packages private. Fork-PR runs pull
+# without credentials, so each package (Settings -> Packages ->
+# loom-ci-images/... -> Change visibility) must be made public once. Until then
+# a GHCR pull falls back to mirror.gcr.io; nothing fails.
+
+name: CI Images
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/ci-images.txt
+      - .github/workflows/ci-images.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-images
+  cancel-in-progress: false
+
+jobs:
+  copy:
+    name: Copy pinned images to GHCR
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    env:
+      GHCR_PREFIX: ghcr.io/${{ github.repository_owner }}/loom-ci-images
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Log in to GHCR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: printf '%s' "$GH_TOKEN" | skopeo login ghcr.io --username "$ACTOR" --password-stdin
+      - name: Copy each pinned image by digest
+        run: |
+          set -euo pipefail
+          copied=0 present=0
+          {
+            echo "### CI images (GHCR)"
+            echo
+            echo "| Pinned reference | GHCR copy |"
+            echo "| --- | --- |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          while read -r ref; do
+            name="${ref%%@*}"; digest="${ref#*@}"
+            repo="${name%:*}"; tag="${name##*:}"
+            if [[ "$ref" != *@sha256:* || "$name" != *:* ]]; then
+              echo "::error::not a <repo>:<tag>@sha256:<digest> pin: $ref"; exit 1
+            fi
+            [[ "$repo" == */* ]] || repo="library/$repo"
+            target="$GHCR_PREFIX/$repo"
+            if skopeo inspect --raw "docker://$target@$digest" >/dev/null 2>&1; then
+              echo "already present: $target@$digest"
+              present=$((present + 1))
+            else
+              ok=""
+              for source in "mirror.gcr.io/$repo@$digest" "docker.io/$repo@$digest"; do
+                if skopeo copy --all --preserve-digests --retry-times 3 \
+                     "docker://$source" "docker://$target:$tag"; then
+                  ok=1; break
+                fi
+                echo "::warning::copy from $source failed; trying the next source"
+              done
+              [[ -n "$ok" ]] || { echo "::error::could not copy $ref from any source"; exit 1; }
+              copied=$((copied + 1))
+            fi
+            # Read the copy back by the digest hub_image.rs will pull.
+            got="sha256:$(skopeo inspect --raw "docker://$target@$digest" | sha256sum | cut -d' ' -f1)"
+            [[ "$got" == "$digest" ]] || { echo "::error::$target serves $got, pinned $digest"; exit 1; }
+            echo "| \`$ref\` | \`$target@$digest\` |" >> "$GITHUB_STEP_SUMMARY"
+          done < <(grep -Ev '^[[:space:]]*(#|$)' .github/ci-images.txt)
+          echo "copied=$copied already-present=$present"
+          printf '\n%s copied, %s already present.\n' "$copied" "$present" >> "$GITHUB_STEP_SUMMARY"

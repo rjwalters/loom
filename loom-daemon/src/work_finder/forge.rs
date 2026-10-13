@@ -645,6 +645,21 @@ impl WorkDispatcher for RegistryDispatcher {
         super::main_red_fix::escalate_global(&root, red, &waiting);
     }
 
+    /// The red-main auto-filed fix issue (#11766) for this workspace's repo.
+    fn autofile_red_main(&mut self, lane: super::RedMainLane) {
+        let target = match self.registry.lock() {
+            Ok(reg) => reg
+                .open_pr_listing_target()
+                .map(|(gh, root, nwo)| (root, (gh, nwo))),
+            Err(_) => return,
+        };
+        let Some((root, target)) = target else {
+            return;
+        };
+        let open_prs = |issues: &[u32]| self.open_pr_blocked(issues).into_keys().collect();
+        super::main_red_autofile::tick(&root, lane, Some(target), &open_prs);
+    }
+
     fn dispatch_with(&mut self, issue: u32, overflow: bool) -> Result<bool> {
         log::info!("work_finder: attempting issue #{issue}");
         // Resolve the model only after runtime admission. A Claude default must not become a native pin.

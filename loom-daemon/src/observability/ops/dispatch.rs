@@ -18,6 +18,7 @@ use chrono::{DateTime, Utc};
 use crate::telemetry::ops::{MetricName, MetricPoint};
 use crate::telemetry::queue_snapshot::QueueRepoRef;
 use crate::telemetry::trace::{SpanName, SpanRecord, SpanStatus, TraceAttributes, TraceContext};
+use crate::work_finder::halt_cause::HaltCause;
 use crate::work_finder::{Admission, TickReport};
 
 /// Every `reason` label value, paired with its [`TickReport`] counter. Zero
@@ -73,8 +74,9 @@ pub fn decision_counts(report: &TickReport) -> [(&'static str, usize); 26] {
 /// | value | when |
 /// |---|---|
 /// | `dispatched` | at least one sweep started |
-/// | `halted_main_red` | a main-health gate held a workspace |
-/// | `halted_ci_billing` | as above, but an owner's Actions jobs are billing-blocked (#10113) |
+/// | `halted_<cause>` | every held workspace names one cause, e.g. `halted_main_red`, `halted_disk_reservation` (#11649; see [`halted_result`]) |
+/// | `halted_ci_billing` | the `ci_billing` cause, or a cause-less hold while an owner's Actions jobs are billing-blocked (#10113) |
+/// | `halted` | held, but by several causes or by none named (`loom.dispatch.halt_causes` lists them) |
 /// | `saturation_held` | the saturation admission brake was engaged |
 /// | `error` | a dispatch or listing failed and nothing started |
 /// | `build_backoff_held` | the build back-off (#9410) deferred at least one candidate |
@@ -91,10 +93,8 @@ pub fn tick_result(report: &TickReport) -> &'static str {
 pub fn tick_result_with(report: &TickReport, billing_blocked: bool) -> &'static str {
     if report.dispatched > 0 {
         "dispatched"
-    } else if report.halted && billing_blocked {
-        "halted_ci_billing"
     } else if report.halted {
-        "halted_main_red"
+        halted_result(&report.halt_causes, billing_blocked)
     } else if report.saturation_held {
         "saturation_held"
     } else if report.errors > 0 {
@@ -111,6 +111,38 @@ pub fn tick_result_with(report: &TickReport, billing_blocked: bool) -> &'static 
         "capacity_full"
     } else {
         "all_skipped"
+    }
+}
+
+/// A held tick's result (#11649), from the distinct causes it recorded. Until
+/// #11649 every hold read `halted_main_red` (or `halted_ci_billing`), so a
+/// tick held only by a disk reservation or a drain was reported as a red
+/// `main`. Now one cause names itself, `halted_<cause token>` — so a red
+/// `main` still reads `halted_main_red` and a per-owner billing block
+/// `halted_ci_billing` — and several causes read the neutral `halted`, the
+/// causes themselves on `loom.dispatch.halt_causes`. A cause-less hold (a
+/// caller that attributes none) keeps the pre-#11649 billing fallback, else
+/// reads `halted`: it no longer guesses `main_red`.
+#[must_use]
+pub fn halted_result(causes: &[HaltCause], billing_blocked: bool) -> &'static str {
+    match causes {
+        [] if billing_blocked => "halted_ci_billing",
+        [cause] => match cause {
+            HaltCause::MainRed => "halted_main_red",
+            HaltCause::GatePending => "halted_gate_pending",
+            HaltCause::TokenPool => "halted_token_pool",
+            HaltCause::PreflightAdvisory => "halted_preflight_advisory",
+            HaltCause::Drain => "halted_drain",
+            HaltCause::Breaker => "halted_breaker",
+            HaltCause::WriteScope => "halted_write_scope",
+            HaltCause::CiBilling => "halted_ci_billing",
+            HaltCause::InstallIncompatible => "halted_install_incompatible",
+            HaltCause::DaemonTooOld => "halted_daemon_too_old",
+            HaltCause::MaintainOnly => "halted_maintain_only",
+            HaltCause::DiskReservation => "halted_disk_reservation",
+            HaltCause::WeightZero => "halted_weight_zero",
+        },
+        _ => "halted",
     }
 }
 
@@ -155,6 +187,12 @@ pub fn tick_span(
     .map(|(key, value)| (key.to_string(), value))
     .collect();
     let mut attributes = attributes;
+    if !report.halt_causes.is_empty() {
+        // #11649: every cause a held tick recorded, comma-joined in
+        // `HaltCause::ALL` order; absent on a tick nothing held.
+        let causes: Vec<&str> = report.halt_causes.iter().map(|c| c.as_str()).collect();
+        attributes.insert("loom.dispatch.halt_causes".to_string(), causes.join(","));
+    }
     crate::telemetry::trace::provenance::stamp(&mut attributes);
     SpanRecord {
         context: TraceContext::derived(

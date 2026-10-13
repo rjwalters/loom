@@ -230,7 +230,7 @@ mod tests {
         RepoStatus {
             root: PathBuf::new(),
             maintain_only: None,
-            priority: 0,
+            weight: 0,
             in_flight_count: 0,
             health_gate_halted: false,
             quarantined_issues: vec![],

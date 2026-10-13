@@ -14,7 +14,7 @@
 //!     dir: app            # clone directory under root (default: name)
 //!     remote: git@github.com:acme/app.git
 //!     fleet: true         # the daemon manages it (default false); `maintain`: see below
-//!     fleet_priority: 10  # dispatch tier, lower first (default 100)
+//!     weight: 10          # relative share of repo draws; required when fleet (0 = never drawn)
 //!     firewall: true      # must never be an unattended-agent target (default false)
 //! ```
 //!
@@ -24,7 +24,7 @@
 //! then in exactly the state `firewall` exists to prevent, and quietly
 //! dropping the repo would hide the drift a human needs to see. A `fleet`
 //! other than `true`/`false`/`maintain`, a non-boolean `firewall`, a
-//! non-integer priority, a duplicate name or dir, or an unsafe `dir` are hard
+//! `fleet` record with no `weight` or a non-integer one (#11742), a duplicate name or dir, or an unsafe `dir` are hard
 //! errors too.
 //!
 //! # `fleet: maintain` (#11186)
@@ -51,7 +51,7 @@
 //! [`Change::MissingClone`], which this module never clones: the daemon's
 //! `fleet.autoApply` timer pass does, `crate::fleet_sync::roster_clone`,
 //! #11218), **removes** (registered, and the store has a record for that path
-//! that is not desired), and **priority changes**. A registered workspace the
+//! that is not desired), and **weight changes**. A registered workspace the
 //! store has no record for is *unmanaged* and left alone — the store only
 //! governs the repos it names.
 
@@ -63,7 +63,6 @@ use serde::Serialize;
 use serde_json::Value;
 
 use super::fetch::Snapshot;
-use crate::workspace_registry::DEFAULT_WORKSPACE_PRIORITY;
 
 /// One `repos[]` record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -81,8 +80,10 @@ pub struct Record {
     pub maintain_only: bool,
     /// `firewall`.
     pub firewall: bool,
-    /// `fleet_priority`, when set.
-    pub fleet_priority: Option<u32>,
+    /// `weight` (#11742): the repo's relative share of draws. Required on a
+    /// `fleet: true` record; optional elsewhere, and a `fleet: maintain`
+    /// record without one is registered at 0 (it is never dispatched anyway).
+    pub weight: Option<u32>,
 }
 
 /// A parsed, validated roster.
@@ -101,8 +102,8 @@ pub struct Desired {
     pub name: String,
     /// `root/dir`.
     pub path: PathBuf,
-    /// Priority tier.
-    pub priority: u32,
+    /// Draw weight.
+    pub weight: u32,
     /// `fleet: maintain`.
     pub maintain_only: bool,
 }
@@ -119,7 +120,9 @@ impl Roster {
             .map(|r| Desired {
                 name: r.name.clone(),
                 path: self.root.join(&r.dir),
-                priority: r.fleet_priority.unwrap_or(DEFAULT_WORKSPACE_PRIORITY),
+                // Parse time refused a dispatched record without one; a
+                // maintain-only record without one registers at 0.
+                weight: r.weight.unwrap_or_default(),
                 maintain_only: r.maintain_only,
             })
             .collect()
@@ -257,16 +260,25 @@ fn record(item: &Value) -> Result<Record, String> {
         }
     };
     let firewall = flag("firewall")?;
-    let fleet_priority = match m.get("fleet_priority") {
+    // #11742: the draw weight replaces `fleet_priority` (now ignored like any
+    // other unknown key) and is required on every dispatched record, with no
+    // default: a missing weight is a roster error naming the repo. A
+    // `fleet: maintain` record is never dispatched, so it needs none.
+    let weight = match m.get("weight") {
         None | Some(Value::Null) => None,
         Some(v) => Some(
             v.as_u64()
                 .and_then(|n| u32::try_from(n).ok())
                 .ok_or_else(|| {
-                    format!("`{name}`: `fleet_priority` must be a non-negative integer (got {v})")
+                    format!("`{name}`: `weight` must be a non-negative integer (got {v})")
                 })?,
         ),
     };
+    if fleet && !maintain_only && !firewall && weight.is_none() {
+        return Err(format!(
+            "`{name}`: a `fleet` record needs a `weight` (its relative share of repo draws, #11742)"
+        ));
+    }
     let remote = m.get("remote").and_then(Value::as_str).map(str::to_string);
     Ok(Record {
         name,
@@ -275,7 +287,7 @@ fn record(item: &Value) -> Result<Record, String> {
         fleet,
         maintain_only,
         firewall,
-        fleet_priority,
+        weight,
     })
 }
 
@@ -284,8 +296,8 @@ fn record(item: &Value) -> Result<Record, String> {
 pub struct Registered {
     /// Normalized root.
     pub root: PathBuf,
-    /// Priority tier.
-    pub priority: u32,
+    /// Draw weight.
+    pub weight: u32,
     /// Whether the registry marks it maintain-only, by either source.
     pub maintain_only: bool,
 }
@@ -300,8 +312,8 @@ pub enum Change {
         name: String,
         /// Workspace root.
         path: PathBuf,
-        /// Priority tier.
-        priority: u32,
+        /// Draw weight.
+        weight: u32,
         /// Register it maintain-only (`fleet: maintain`), in the same write.
         #[serde(skip_serializing_if = "std::ops::Not::not")]
         maintain_only: bool,
@@ -317,8 +329,8 @@ pub enum Change {
         /// The record's `remote`, when it has one.
         #[serde(skip_serializing_if = "Option::is_none")]
         remote: Option<String>,
-        /// Priority tier it would be registered at.
-        priority: u32,
+        /// Draw weight it would be registered at.
+        weight: u32,
         /// It would be registered maintain-only (`fleet: maintain`).
         #[serde(skip_serializing_if = "std::ops::Not::not")]
         maintain_only: bool,
@@ -332,15 +344,15 @@ pub enum Change {
         /// `firewall` or `fleet: false`.
         reason: String,
     },
-    /// Change a registered workspace's priority.
-    SetPriority {
+    /// Change a registered workspace's draw weight.
+    SetWeight {
         /// Record name.
         name: String,
         /// Workspace root.
         path: PathBuf,
-        /// Current tier.
+        /// Current weight.
         from: u32,
-        /// Desired tier.
+        /// Desired weight.
         to: u32,
     },
     /// Make a registered workspace maintain-only (`to: true`) or a normal,
@@ -359,12 +371,12 @@ pub enum Change {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Plan {
     /// Changes, in apply order: removes, then mode changes (so a repo turning
-    /// maintain-only stops taking dispatch first), then adds, then priority
+    /// maintain-only stops taking dispatch first), then adds, then weight
     /// changes.
     pub changes: Vec<Change>,
     /// Registered workspaces the store has no record for (left alone).
     pub unmanaged: Vec<PathBuf>,
-    /// Desired workspaces already registered at the right priority.
+    /// Desired workspaces already registered at the right weight.
     pub in_sync: usize,
 }
 
@@ -424,7 +436,7 @@ pub fn plan(
             None if is_cloned(&path) => adds.push(Change::Add {
                 name: want.name,
                 path,
-                priority: want.priority,
+                weight: want.weight,
                 maintain_only: want.maintain_only,
             }),
             None => adds.push(Change::MissingClone {
@@ -435,11 +447,11 @@ pub fn plan(
                     .and_then(|r| r.remote.clone()),
                 name: want.name,
                 path,
-                priority: want.priority,
+                weight: want.weight,
                 maintain_only: want.maintain_only,
             }),
             Some(r) => {
-                let synced = r.priority == want.priority && r.maintain_only == want.maintain_only;
+                let synced = r.weight == want.weight && r.maintain_only == want.maintain_only;
                 if r.maintain_only != want.maintain_only {
                     modes.push(Change::SetMaintainOnly {
                         name: want.name.clone(),
@@ -447,12 +459,12 @@ pub fn plan(
                         to: want.maintain_only,
                     });
                 }
-                if r.priority != want.priority {
-                    reprioritize.push(Change::SetPriority {
+                if r.weight != want.weight {
+                    reprioritize.push(Change::SetWeight {
                         name: want.name,
                         path,
-                        from: r.priority,
-                        to: want.priority,
+                        from: r.weight,
+                        to: want.weight,
                     });
                 }
                 in_sync += usize::from(synced);
@@ -482,7 +494,7 @@ pub fn describe(change: &Change) -> String {
         Change::Add {
             name,
             path,
-            priority,
+            weight,
             maintain_only,
         } => {
             let mode = if *maintain_only {
@@ -490,7 +502,7 @@ pub fn describe(change: &Change) -> String {
             } else {
                 ""
             };
-            format!("+ add      {name:<24} {} (priority {priority}{mode})", path.display())
+            format!("+ add      {name:<24} {} (weight {weight}{mode})", path.display())
         }
         Change::MissingClone { name, path, .. } => format!(
             "! missing  {name:<24} {} — not cloned (a daemon timer pass with fleet.autoApply \
@@ -500,13 +512,13 @@ pub fn describe(change: &Change) -> String {
         Change::Remove { name, path, reason } => {
             format!("- remove   {name:<24} {} ({reason})", path.display())
         }
-        Change::SetPriority {
+        Change::SetWeight {
             name,
             path,
             from,
             to,
         } => {
-            format!("~ priority {name:<24} {} ({from} -> {to})", path.display())
+            format!("~ weight   {name:<24} {} ({from} -> {to})", path.display())
         }
         Change::SetMaintainOnly { name, path, to } => {
             let (from, to) = if *to {

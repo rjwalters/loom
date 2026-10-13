@@ -20,7 +20,7 @@
 //!   `gh-cached`.
 //! - Passthrough — and any ETag route the module declines at run time —
 //!   execs `next_gh` ([`next_gh::resolve`]: `LOOM_GH_BIN`, else the next `gh`
-//!   on `PATH`, e.g. the managed launcher #9987) with argv, streams and exit
+//!   on `PATH`) with argv, streams and exit
 //!   status byte-identical ([`crate::gh_invocation::transparent::exec`]).
 //! - Escape hatch: `LOOM_GH_NO_CACHE=1` (also `GH_CACHE_DISABLE=1`,
 //!   `LOOM_ETAG_LIST_DISABLE=1`). Env-only on purpose: plain `gh` rejects an
@@ -90,6 +90,9 @@ pub fn dispatch_if_front() {
 /// - `path`: create the shim directory and print it.
 /// - `session-env`: the SessionStart hook's half (#10516) — see [`session_env`].
 /// - `status`: which `gh` this shell actually resolves — see [`session_env`].
+/// - `container-mount`: the `docker run` arguments that mount this host's
+///   ledger sink into a contained worker (#10607), one per line; nothing when
+///   there is no mountable sink. `spawn-claude.sh` reads it.
 fn shim_command(args: &[OsString]) -> i32 {
     match args.first().and_then(|a| a.to_str()) {
         Some("path") if args.len() == 1 => match ensure_shim_dir() {
@@ -104,14 +107,21 @@ fn shim_command(args: &[OsString]) -> i32 {
         },
         Some("session-env") if args.len() == 1 => session_env::run(),
         Some("status") if args.len() == 1 => session_env::status(),
+        Some("container-mount") if args.len() == 1 => {
+            for arg in crate::forge_call_stats::agent::docker_mount_args(|k| std::env::var_os(k)) {
+                println!("{arg}");
+            }
+            0
+        }
         _ => {
             eprintln!(
-                "usage: loom-daemon gh-shim path|session-env|status\n  \
+                "usage: loom-daemon gh-shim path|session-env|status|container-mount\n  \
                  path         print a directory holding `gh` -> loom-daemon; put it first on PATH to \
                  route plain `gh` reads through the ETag cache (#10331)\n  \
                  session-env  (SessionStart hook) put that directory first on PATH via \
                  $CLAUDE_ENV_FILE (#10516)\n  \
-                 status       print `front|launcher|bypassed: <gh>` for this shell's PATH"
+                 status       print `front|bypassed: <gh>` for this shell's PATH\n  \
+                 container-mount  print the docker args mounting the ledger sink (#10607)"
             );
             2
         }
@@ -421,37 +431,12 @@ pub fn worker_path(current: Option<&OsStr>) -> Option<OsString> {
 }
 
 /// The one `gh` ordering shared by a dispatched worker and an interactive
-/// session (#10516): the managed launcher (#9987) first when a policy resolves
-/// one, then the front, then `current` — so with no policy the front's own
-/// reads still reach whatever `gh` came first before (e.g. the 2am telemetry
-/// shim) as their `next_gh`. `None` leaves `PATH` alone.
+/// session (#10516): the front, then `current` — so the front's own reads
+/// still reach whatever `gh` came first before as their `next_gh`. `None`
+/// leaves `PATH` alone.
 #[must_use]
-pub fn session_path(
-    current: Option<&OsStr>,
-    egress: Option<&crate::forge_egress::worker_env::WorkerEgress>,
-) -> Option<OsString> {
-    compose_path(
-        front_dir().as_deref(),
-        egress.and_then(crate::forge_egress::worker_env::WorkerEgress::launcher_dir),
-        current,
-    )
-}
-
-/// [`session_path`] with its inputs injected: `front` prepended to `current`,
-/// then `launcher` on top. `None` when neither applies.
-#[must_use]
-pub fn compose_path(
-    front: Option<&Path>,
-    launcher: Option<&Path>,
-    current: Option<&OsStr>,
-) -> Option<OsString> {
-    let mut path: Option<OsString> = None;
-    for dir in [front, launcher].into_iter().flatten() {
-        if let Some(next) = prepend_path(dir, path.as_deref().or(current)) {
-            path = Some(next);
-        }
-    }
-    path
+pub fn session_path(current: Option<&OsStr>) -> Option<OsString> {
+    worker_path(current)
 }
 
 /// `dir` first, then `current` minus any earlier copy of `dir`.

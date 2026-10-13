@@ -151,6 +151,8 @@ pub enum Skip {
     /// A PR whose own state supersedes the cleared park
     /// ([`super::park_self_block`]).
     Superseded,
+    /// `loom:frozen` (#11743): no write of any kind.
+    Frozen,
     /// An operator label is on the artifact.
     OperatorHold,
     /// `<!-- loom:permanent-block` in the body or any comment (#8742).
@@ -311,6 +313,9 @@ pub(super) fn has_operator_hold(labels: &[String]) -> bool {
 
 /// The pre-read vetoes visible in the body and labels alone.
 fn body_skip(body: &str, labels: &[String]) -> Option<Skip> {
+    if crate::work_finder::is_frozen(labels) {
+        return Some(Skip::Frozen);
+    }
     let records = parse(body);
     if records.iter().any(|r| r.blocker.is_none()) {
         // #10161: a current daemon hold is counted as one, structurally.
@@ -396,11 +401,17 @@ fn refs(ns: &[u64]) -> String {
 }
 
 /// The audit comment body.
-fn comment_body(plan: &Plan, restored: Option<&str>) -> String {
+fn comment_body(plan: &Plan, restored: Option<&str>, vetoed: Option<&str>) -> String {
     let mark = marker(plan.releases(), &plan.resolved);
     if plan.releases() {
         let restore = match (restored, plan.kind) {
             (Some(l), _) => format!(" Restored `{l}`."),
+            (None, Artifact::Issue) if vetoed.is_some() => format!(
+                " `{ISSUE_LABEL}` was not restored: the issue carries `{}`, which keeps it out \
+                 of the build queue. Once that label is removed, re-approve it with \
+                 `{ISSUE_LABEL}` (#11480).",
+                vetoed.unwrap_or_default()
+            ),
             (None, Artifact::Issue) => format!(
                 " `{ISSUE_LABEL}` was not restored: this issue never carried it before the \
                  block, so it re-enters triage/approval rather than the Builder queue."
@@ -765,6 +776,10 @@ fn execute(
     } else {
         None
     };
+    let vetoed = restored
+        .as_deref()
+        .and_then(|label| issue_restore_veto(n, label, &fresh.labels));
+    let restored = restored.filter(|_| vetoed.is_none());
     let mut acted = Acted {
         kind: plan.kind.label(),
         number: n,
@@ -775,7 +790,7 @@ fn execute(
         applied: false,
     };
     if !dry_run {
-        match write(park, extra, plan, &fresh, restored.as_deref(), already) {
+        match write(park, extra, plan, &fresh, restored.as_deref(), vetoed.as_deref(), already) {
             Ok(commented) => {
                 acted.commented = commented;
                 acted.applied = true;
@@ -819,6 +834,29 @@ fn restore_label(
     })
 }
 
+/// The label, if any, by which #11480's shared restore veto forbids handing `loom:issue` back:
+/// another label on the issue (for example `loom:needs-capability`, which
+/// `body_skip`'s operator-hold check does not cover) keeps it out of the
+/// queue. Only `loom:blocked`, the label this release removes, is ignored.
+/// A PR's review label is never vetoed.
+fn issue_restore_veto(n: u64, label: &str, labels: &[String]) -> Option<String> {
+    if label != ISSUE_LABEL {
+        return None;
+    }
+    // #11517: never beside a live claim either; this pass never removes it.
+    let building = crate::work_finder::BUILDING_LABEL;
+    let veto = if labels.iter().any(|l| l == building) {
+        building
+    } else {
+        crate::work_finder::restore_veto(labels, &[BLOCKED_LABEL])?
+    };
+    log::info!(
+        "stale_blocked: #{n}'s release will not restore `{ISSUE_LABEL}` — it carries `{veto}` \
+         (#11480)"
+    );
+    Some(veto.to_string())
+}
+
 /// The writes, in order: comment (unless already posted), then the edit.
 /// Returns whether a comment was posted.
 fn write(
@@ -827,12 +865,13 @@ fn write(
     plan: &Plan,
     fresh: &crate::operator_decision::cli::IssueState,
     restored: Option<&str>,
+    vetoed: Option<&str>,
     already: bool,
 ) -> Result<bool, String> {
     let n = u64::from(plan.row.number);
     if !already {
         extra
-            .post_comment(n, plan.kind == Artifact::Pr, &comment_body(plan, restored))
+            .post_comment(n, plan.kind == Artifact::Pr, &comment_body(plan, restored, vetoed))
             .map_err(|e| format!("audit comment failed, nothing edited: {e}"))?;
     }
     if plan.releases() {

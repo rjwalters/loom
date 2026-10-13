@@ -118,7 +118,7 @@ pub fn container_mount(sink: &std::path::Path) -> Option<(PathBuf, PathBuf)> {
 
 /// `-v <dir>/contained:<dir>` (read-write) for a `docker run` whose
 /// environment (`env`, injectable) names the daemon's own sink in
-/// [`SINK_DIR_ENV`] — what `forge egress container-args` adds for
+/// [`SINK_DIR_ENV`] — what `gh-shim container-mount` prints for
 /// `spawn-claude.sh`, whose `LOOM_*` by-name forwarding already carries the
 /// variable itself ([`container_mount`]).
 ///

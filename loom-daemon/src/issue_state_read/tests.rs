@@ -11,7 +11,6 @@ use super::client::{
 };
 use super::daemon::{serve, Backend, GhRead};
 use super::{standalone, valid_slug, IssueStateReply, ReadOutcome};
-use crate::forge_egress::policy::PolicySources;
 use crate::stash_retirement::IssueStateLookup;
 use crate::types::{Request, Response};
 use crate::workspace_registry::{normalize_path, Workspace, WorkspaceRegistry};
@@ -20,7 +19,6 @@ use crate::workspace_registry::{normalize_path, Workspace, WorkspaceRegistry};
 
 struct FakeBackend {
     slug: Option<&'static str>,
-    refusal: Option<&'static str>,
     stdout: Option<&'static str>,
     reads: RefCell<Vec<(PathBuf, String, u64)>>,
 }
@@ -29,7 +27,6 @@ impl FakeBackend {
     fn closed() -> Self {
         Self {
             slug: Some("acme/private"),
-            refusal: None,
             stdout: Some("CLOSED\n"),
             reads: RefCell::default(),
         }
@@ -40,16 +37,13 @@ impl Backend for FakeBackend {
     fn remote_slug(&self, _: &Path) -> Option<String> {
         self.slug.map(str::to_string)
     }
-    fn admission_refusal(&self, _: &Path) -> Option<String> {
-        self.refusal.map(str::to_string)
-    }
     fn read(&self, root: &Path, slug: &str, issue: u64) -> GhRead {
         self.reads
             .borrow_mut()
             .push((root.to_path_buf(), slug.to_string(), issue));
         GhRead {
             stdout: self.stdout.map(|s| s.as_bytes().to_vec()),
-            source: "policy",
+            source: "path",
         }
     }
 }
@@ -74,7 +68,7 @@ fn a_registered_root_reads_closed_through_the_daemon_route() {
     let backend = FakeBackend::closed();
     let reply = serve(&registry_with(dir.path()), &backend, &root_str(&dir), "acme/private", 969);
     assert_eq!(reply.outcome, ReadOutcome::Closed);
-    assert_eq!(reply.route, "daemon-gh/policy");
+    assert_eq!(reply.route, "daemon-gh/path");
     assert_eq!(backend.reads.borrow().len(), 1);
     assert_eq!(backend.reads.borrow()[0].1, "acme/private");
 }
@@ -123,19 +117,6 @@ fn a_wrong_forge_identity_is_unknown_and_never_reads() {
 }
 
 #[test]
-fn a_routing_refusal_is_unknown_and_never_reads() {
-    let dir = tempfile::tempdir().unwrap();
-    let backend = FakeBackend {
-        refusal: Some("toolchain.launcher-not-first"),
-        ..FakeBackend::closed()
-    };
-    let reply = serve(&registry_with(dir.path()), &backend, &root_str(&dir), "acme/private", 1);
-    assert_eq!(reply.outcome, ReadOutcome::Unknown);
-    assert!(reply.reason.unwrap().starts_with("routing-refused:"));
-    assert!(backend.reads.borrow().is_empty());
-}
-
-#[test]
 fn hostile_inputs_are_rejected_before_any_read() {
     let dir = tempfile::tempdir().unwrap();
     let registry = registry_with(dir.path());
@@ -166,10 +147,10 @@ fn slug_validation_is_strict() {
 
 #[test]
 fn the_reply_wire_form_carries_no_credential_field() {
-    let reply = IssueStateReply::new(ReadOutcome::Closed, "daemon-gh/policy");
+    let reply = IssueStateReply::new(ReadOutcome::Closed, "daemon-gh/path");
     assert_eq!(
         serde_json::to_string(&Response::IssueState(reply)).unwrap(),
-        r#"{"type":"IssueState","payload":{"outcome":"closed","route":"daemon-gh/policy"}}"#
+        r#"{"type":"IssueState","payload":{"outcome":"closed","route":"daemon-gh/path"}}"#
     );
     let frame = serde_json::to_string(&Request::ReadIssueState {
         workspace_root: "/r".into(),
@@ -272,7 +253,7 @@ fn fake_daemon(reply: Response) -> (tempfile::TempDir, PathBuf, std::thread::Joi
 fn the_client_sends_only_the_bounded_read_frame() {
     let (_d, sock, server) = fake_daemon(Response::IssueState(IssueStateReply::new(
         ReadOutcome::Closed,
-        "daemon-gh/policy",
+        "daemon-gh/path",
     )));
     let reply =
         ask_daemon(&sock, Path::new("/r"), "acme/private", 9, std::time::Duration::from_secs(5))
@@ -329,7 +310,7 @@ impl LocalSide for Local {
 }
 
 fn reply(outcome: ReadOutcome) -> Result<IssueStateReply, String> {
-    Ok(IssueStateReply::new(outcome, "daemon-gh/policy"))
+    Ok(IssueStateReply::new(outcome, "daemon-gh/path"))
 }
 
 #[test]
@@ -341,7 +322,7 @@ fn a_daemon_answer_is_final_and_ambient_auth_is_never_tried() {
     assert_eq!(lookup.is_closed(1), None);
     assert_eq!(lookup.is_closed(2), Some(true));
     assert_eq!(*local.1.borrow(), 0);
-    assert_eq!(lookup.route_description(), "daemon-gh/policy");
+    assert_eq!(lookup.route_description(), "daemon-gh/path");
 }
 
 #[test]
@@ -387,26 +368,14 @@ fn a_transport_failure_after_the_daemon_was_chosen_is_unknown_not_a_switch() {
     assert_eq!(*local.1.borrow(), 0);
 }
 
-// ---- standalone gate -------------------------------------------------------
+// ---- standalone read -------------------------------------------------------
 
 #[test]
-fn a_refusing_policy_makes_the_standalone_read_unknown_without_running_gh() {
+fn the_standalone_read_goes_through_the_ambient_facade() {
     let dir = tempfile::tempdir().unwrap();
-    let sources = PolicySources {
-        env_path: Some(dir.path().join("missing.json")),
-        ..PolicySources::default()
-    };
-    let read = standalone::read(dir.path(), &sources, 7);
-    assert_eq!(read.outcome, ReadOutcome::Unknown);
-    assert!(read.route.starts_with("standalone-refused:"), "{}", read.route);
-}
-
-#[test]
-fn an_unconfigured_host_still_reads_through_the_ambient_facade() {
-    let dir = tempfile::tempdir().unwrap();
-    let read = standalone::read(dir.path(), &PolicySources::default(), 7);
+    let read = standalone::read(dir.path(), 7);
     // The unit-test build routes `gh` to a loud-failing stub: unknown, but the
-    // route proves the ungoverned path was taken (and no refusal happened).
+    // route proves the ambient facade path was taken.
     assert_eq!(read.outcome, ReadOutcome::Unknown);
     assert!(read.route.starts_with("standalone-gh/"), "{}", read.route);
 }

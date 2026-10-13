@@ -179,7 +179,10 @@ fn generator_output_is_a_marker_block() {
 
 #[test]
 fn queries_answer_and_reject_unknowns() {
-    assert_eq!(reg().with_property("park").unwrap(), vec!["loom:blocked", "loom:operator-only"]);
+    assert_eq!(
+        reg().with_property("park").unwrap(),
+        vec!["loom:blocked", "loom:operator-only", "loom:frozen"]
+    );
     assert!(reg().with_property("nonsense").is_none());
     assert!(reg().get("loom:nope").is_none());
     assert_eq!(reg().get("loom:pr").unwrap().kind, "pr-lane");
@@ -196,7 +199,10 @@ fn queries_answer_and_reject_unknowns() {
 #[test]
 fn derived_park_labels_equal_the_previous_literal_in_order() {
     // Order matters: the park guards report the first match in this order.
-    assert_eq!(*crate::work_finder::PARK_LABELS, ["loom:blocked", "loom:operator-only"]);
+    assert_eq!(
+        *crate::work_finder::PARK_LABELS,
+        ["loom:blocked", "loom:operator-only", "loom:frozen"]
+    );
 }
 
 #[test]
@@ -207,6 +213,10 @@ fn derived_skip_labels_equal_the_previous_literal_in_order() {
             "loom:building",
             "loom:blocked",
             "loom:operator-only",
+            // #11743: "don't touch" is a park, so also a skip.
+            "loom:frozen",
+            // #11480: a bounced Decision issue is never build work.
+            "loom:decision-malformed",
             "loom:operator",
             // #11399: an epic is a tracking container, never build work. A
             // skip (the work finder never lists it as a candidate) but not a
@@ -219,7 +229,7 @@ fn derived_skip_labels_equal_the_previous_literal_in_order() {
 
 #[test]
 fn derived_hard_exclusion_labels_equal_the_previous_literal() {
-    assert_eq!(*crate::hard_exclusion::HARD_EXCLUSION_LABELS, ["external"]);
+    assert_eq!(*crate::hard_exclusion::HARD_EXCLUSION_LABELS, ["loom:frozen", "external"]);
 }
 
 #[test]
@@ -306,6 +316,8 @@ fn derived_pr_latency_hold_labels_equal_the_previous_set() {
             "loom:operator-blocked",
             "loom:operator-mechanical",
             "loom:operator-decision",
+            // #11743: a frozen PR is held, not waiting on a reviewer.
+            "loom:frozen",
         ])
     );
 }

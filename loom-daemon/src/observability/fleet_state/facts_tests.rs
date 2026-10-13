@@ -28,7 +28,7 @@ fn ready_item(
         issue,
         rank: issue,
         level: 0,
-        fleet_priority: 100,
+        weight: 100,
         created_at: None,
         main_red_fix: false,
         eligible_reason: eligible.map(|(reason, _)| reason),

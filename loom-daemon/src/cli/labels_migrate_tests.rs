@@ -507,3 +507,27 @@ fn json_events_are_tagged() {
     assert_eq!(v["events"][0]["item"], 2);
     assert_eq!(v["exit"], 3);
 }
+
+/// 2am#4345: writes are spaced by the configured interval; the first write
+/// never waits, and a write after a long gap doesn't either.
+#[test]
+fn writes_are_paced_by_the_interval() {
+    use std::time::{Duration, Instant};
+    let now = Instant::now();
+    let iv = Duration::from_millis(7500);
+    assert_eq!(pace_delay(None, now, iv), Duration::ZERO);
+    let just = now.checked_sub(Duration::from_millis(1500)).unwrap();
+    assert_eq!(pace_delay(Some(just), now, iv), Duration::from_millis(6000));
+    let long_ago = now.checked_sub(Duration::from_secs(60)).unwrap();
+    assert_eq!(pace_delay(Some(long_ago), now, iv), Duration::ZERO);
+}
+
+#[test]
+#[serial_test::serial]
+fn the_write_interval_defaults_to_under_500_an_hour_and_is_overridable() {
+    std::env::remove_var("LOOM_LABEL_WRITE_INTERVAL_MS");
+    assert!(3600.0 / write_interval().as_secs_f64() <= 500.0);
+    std::env::set_var("LOOM_LABEL_WRITE_INTERVAL_MS", "0");
+    assert_eq!(write_interval(), std::time::Duration::ZERO);
+    std::env::remove_var("LOOM_LABEL_WRITE_INTERVAL_MS");
+}

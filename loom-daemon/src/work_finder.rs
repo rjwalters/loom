@@ -234,6 +234,7 @@ pub mod dispatch_plan;
 pub mod dispatch_plan_merge;
 pub mod halt_cause;
 mod labels;
+pub mod main_red_autofile;
 pub mod main_red_fix;
 pub mod open_pr_prefilter;
 pub mod operator_priority;
@@ -247,7 +248,10 @@ mod tracking_parent;
 pub mod vi_cap;
 pub mod workspace_draw;
 use crate::types::QueueDisposition as Qd;
-pub use labels::{BUILDING_LABEL, OPERATOR_HOLD_LABEL, PARK_LABELS, SKIP_LABELS};
+pub use labels::{
+    is_frozen, restore_veto, BUILDING_LABEL, FROZEN_LABEL, OPERATOR_HOLD_LABEL, PARK_LABELS,
+    SKIP_LABELS,
+};
 pub use main_red_fix::RedMainLane;
 pub use operator_priority::{CapTerms, OverflowSlot};
 pub use ordering::{candidate_cmp, PriorityCandidate};
@@ -809,6 +813,10 @@ pub trait WorkDispatcher {
     /// unclaimed past the threshold. Defaults to a no-op.
     fn escalate_red_fix(&mut self, _red: bool, _waiting: &[u32]) {}
 
+    /// File, reuse or close this repo's auto-filed red-main fix issue
+    /// (#11766, [`main_red_autofile`]). Defaults to a no-op.
+    fn autofile_red_main(&mut self, _lane: RedMainLane) {}
+
     /// Count of in-flight sweeps that occupy the work-finder's concurrency
     /// budget (Issue #4003).
     ///
@@ -1326,8 +1334,8 @@ pub fn tick_with_lanes(
 /// # Cross-repo priority ordering (#3946)
 ///
 /// `priorities` is a slice **parallel to `workspaces`**: `priorities[i]` is
-/// workspace `i`'s dispatch tier (lower = higher priority; a missing entry
-/// defaults to [`crate::workspace_registry::DEFAULT_WORKSPACE_PRIORITY`]).
+/// workspace `i`'s draw weight (#11742; higher = drawn more, 0 = never; a
+/// missing entry defaults to [`crate::workspace_registry::DEFAULT_WORKSPACE_WEIGHT`]).
 /// Rather than dispatching each workspace's backlog in registration order, this
 /// gathers every eligible candidate across all workspaces and orders them by
 /// **weighted workspace draws** ([`workspace_draw`], #11103): each draw picks a
@@ -1572,7 +1580,7 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
     lanes: &[RedMainLane],
     build_backoff_held: &[bool],
 ) -> TickReport {
-    use crate::workspace_registry::DEFAULT_WORKSPACE_PRIORITY;
+    use crate::workspace_registry::DEFAULT_WORKSPACE_WEIGHT;
 
     let mut report = TickReport::for_tick(saturation_held, max_admissions_per_tick);
     report.build_backoff_held = build_backoff::any_held(build_backoff_held, workspaces.len());
@@ -1719,8 +1727,8 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
     // logged "main-health gate cleared — resuming dispatch" in the same window
     // the gate was logging "still RED". Reading the flags directly means the
     // two loops can never disagree: this is the same `WorkspaceHealthStates`
-    // the gate writes.
-    let any_halted = halted.iter().take(workspaces.len()).any(|&h| h);
+    // the gate writes. `TickReport::note_halts` (#11649), at the end of the
+    // tick, folds them together with their named causes.
 
     // Pass 1 (mutable source reads): gather every eligible candidate across all
     // workspaces, applying the per-workspace skip-label / in-flight filters and
@@ -1751,10 +1759,10 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
         // #11509: one `loom:very-important` per workspace; the rest rank important.
         vi_cap::enforce(idx, source, &mut ready, &mut report);
         report.seen += ready.len();
-        let workspace_priority = priorities
+        let workspace_weight = priorities
             .get(idx)
             .copied()
-            .unwrap_or(DEFAULT_WORKSPACE_PRIORITY);
+            .unwrap_or(DEFAULT_WORKSPACE_WEIGHT);
         let q = &mut report.queue;
 
         // Per-repo main-health gate (#3930): a red repo skips only its own
@@ -1765,7 +1773,11 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
         let repo_halted = halted.get(idx).copied().unwrap_or(false);
         if repo_halted && !lane.admits_fixes_while_halted() {
             // #9017: name WHICH hold tripped, not just that one did.
-            halt_cause::record_halted(q, &ready, idx, workspace_priority, red, halt_causes);
+            halt_cause::record_halted(q, &ready, idx, workspace_weight, red, halt_causes);
+            continue;
+        }
+        if workspace_weight == 0 {
+            halt_cause::record_weight_zero(q, &ready, idx, red); // #11742: after holds, which name their own cause
             continue;
         }
 
@@ -1777,7 +1789,7 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
         if commands_missing[idx] {
             report.skipped_workspace_commands_missing += ready.len();
             for item in &ready {
-                let key = ready_queue::key_of(idx, workspace_priority, item, red);
+                let key = ready_queue::key_of(idx, workspace_weight, item, red);
                 ready_queue::record_skip(q, key, item, Qd::WorkspaceCommandsMissing, None);
             }
             continue;
@@ -1788,7 +1800,7 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
 
         for item in ready {
             cap.note_surface(idx, &item, in_flight.contains(&item.number));
-            let key = ready_queue::key_of(idx, workspace_priority, &item, red);
+            let key = ready_queue::key_of(idx, workspace_weight, &item, red);
             // `held_until` (Issue #9311): `None` for every disposition but
             // the five time-boxed holds below, which pass their computed
             // expiry explicitly as the third argument.
@@ -2001,7 +2013,7 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
         }
     }
 
-    report.halted = any_halted;
+    report.note_halts(halted, halt_causes, workspaces.len()); // #11649
     report.occupancy = Some(occupancy);
     cap.finish(&mut report); // #11606
     report.overflow_free = Some(overflow.is_free());
@@ -2493,11 +2505,14 @@ where
             // `pool_preflight::preflight_held_per_root`. Re-derived from the
             // live pool every tick, so it self-heals within one tick of a
             // readmission.
-            let other_hold = crate::host_breaker::global_is_suppressed()
-                || pool_preflight::observe_root(&workspace_root, chrono::Utc::now());
-            let halted = health_state.is_halted()
-                || (suppress_dispatch_during_gate && health_state.is_gate_in_flight())
-                || other_hold;
+            let breaker = crate::host_breaker::global_is_suppressed();
+            let other_hold =
+                breaker || pool_preflight::observe_root(&workspace_root, chrono::Utc::now());
+            // #11649: name the hold, so the tick result says which one it is.
+            let gate = suppress_dispatch_during_gate && health_state.is_gate_in_flight();
+            let holds = (health_state.is_halted(), gate, other_hold, breaker);
+            let cause = halt_cause::single_root(&workspace_root, holds);
+            let halted = cause.is_some();
             // #9244: whether this halt still admits verified red-main fixes.
             let lane = main_red_fix::lane_for(
                 &health_state,
@@ -2567,9 +2582,10 @@ where
                 saturation_held,
                 lane,
             ) {
-                Ok(report) => {
-                    // Publish before any logging so `loom-daemon health` sees the
-                    // same tick the log line describes (#4761).
+                Ok(mut report) => {
+                    report.note_halts(&[report.halted], Some(&[cause]), 1); // #11649
+                                                                            // Publish before any logging so `loom-daemon health` sees the
+                                                                            // same tick the log line describes (#4761).
                     publish_tick(&report, max_concurrent, tick_started, &[], None);
                     if report.halted && !was_halted {
                         log::warn!(
@@ -2712,7 +2728,7 @@ where
 ///    roots. Re-reading each tick — and provisioning any new root — happens in
 ///    `registry_refresh::refresh_local_workspace_state`, called BEFORE the
 ///    rate-limit breaker
-///    check (#8121), so `loom-daemon workspace add|remove|set-priority` is
+///    check (#8121), so `loom-daemon workspace add|remove|set-weight` is
 ///    hot-applied without a daemon restart even while gh polling is
 ///    suppressed.
 /// 2. Builds one `(GhWorkSource, RegistryDispatcher)` pair per root — the source
@@ -2834,7 +2850,7 @@ pub fn spawn_multi_work_finder_task(
             // below — see `registry_refresh`'s module doc comment for
             // why this purely-local, no-GitHub-API work must never be gated
             // behind the breaker (`loom-daemon workspace add|remove
-            // |set-priority` must hot-apply even while gh polling is
+            // |set-weight` must hot-apply even while gh polling is
             // suppressed).
             let (registry, roots) = registry_refresh::refresh_local_workspace_state(
                 &pool,
@@ -2938,9 +2954,9 @@ pub fn spawn_multi_work_finder_task(
             let min_workspace_healthy =
                 min_available_tokens_across_roots(&roots).unwrap_or(token_limit);
 
-            // Per-repo priority tiers (#3946), parallel to `pairs`: lower = higher
-            // priority. The empty-registry cwd fallback resolves to the default.
-            let priorities: Vec<u32> = roots.iter().map(|r| registry.priority_of(r)).collect();
+            // Per-repo draw weights (#11742), parallel to `pairs`: higher = drawn
+            // more. The empty-registry cwd fallback resolves to the default.
+            let priorities: Vec<u32> = roots.iter().map(|r| registry.weight_of(r)).collect();
 
             // Shard verdicts, per root, for the dispatch plan's `owning_shard`
             // only (the fleet-merge primary rule, #9288). They no longer

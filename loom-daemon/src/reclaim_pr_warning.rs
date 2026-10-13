@@ -55,6 +55,24 @@ use anyhow::Result;
 /// the return value is that call's, unchanged, and the diagnostic runs only on
 /// success (a failed flip changed nothing worth explaining).
 pub(crate) fn reclaim_and_warn(gh_bin: &Path, root: &Path, issue: u32) -> Result<()> {
+    // #11480: an item another hold took out of the queue loses only the stale
+    // claim; `loom:issue` is not re-added.
+    if let Some(label) = crate::release_veto::veto(gh_bin, root, issue, &[]) {
+        if label == crate::work_finder::FROZEN_LABEL {
+            log::warn!(
+                "claim_reconciliation: #{issue} in {} is `loom:frozen` — not reclaiming, no \
+                 label write (#11743)",
+                root.display()
+            );
+            return Ok(());
+        }
+        log::warn!(
+            "claim_reconciliation: #{issue} in {} carries `{label}` — removing the stale \
+             `loom:building` claim only, NOT re-adding `loom:issue` (#11480)",
+            root.display()
+        );
+        return release_claim_only(gh_bin, root, issue);
+    }
     let result = crate::claim_reconciliation::forge::reclaim(gh_bin, root, issue);
     if result.is_ok() {
         if let Some(pr) = open_pr_on_issue_branch(gh_bin, root, issue) {
@@ -62,6 +80,24 @@ pub(crate) fn reclaim_and_warn(gh_bin: &Path, root: &Path, issue: u32) -> Result
         }
     }
     result
+}
+
+/// The vetoed reclaim (#11480): remove `loom:building`, add nothing.
+fn release_claim_only(gh_bin: &Path, root: &Path, issue: u32) -> Result<()> {
+    use crate::claim_reconciliation::gh_call;
+    let n = issue.to_string();
+    let out = gh_call::output(
+        gh_call::write("claim.issue_reclaim", gh_bin, root)
+            .args(["issue", "edit", &n, "--remove-label", "loom:building"])
+            .args(gh_call::loom_repo_flag()),
+    )?;
+    anyhow::ensure!(
+        out.status.success(),
+        "gh issue edit failed for #{issue} in {}: {}",
+        root.display(),
+        gh_call::stderr(&out)
+    );
+    Ok(())
 }
 
 /// The `feature/issue-<N>` branch convention `worktree.sh` establishes.
@@ -110,8 +146,50 @@ pub(crate) fn open_pr_on_issue_branch(gh_bin: &Path, root: &Path, issue: u32) ->
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::write_scope_test_support::WritableRoot;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// #11480: a reclaim on an item another hold took out of the queue
+    /// removes the stale claim only; a plain item is still reclaimed.
+    #[test]
+    #[serial_test::serial]
+    fn a_vetoed_reclaim_removes_the_claim_only() {
+        for (labels, restores) in [
+            (r#"["loom:building","loom:operator-only"]"#, false),
+            (r#"["loom:building"]"#, true),
+            // #11743: frozen — no edit at all (checked below).
+            (r#"["loom:building","loom:frozen"]"#, false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("repo");
+            std::fs::create_dir_all(&root).unwrap();
+            let log = dir.path().join("gh.log");
+            let gh = dir.path().join("gh");
+            let script = format!(
+                "#!/bin/bash\nprintf '%s\\n' \"$*\" >> \"{}\"\ncase \"$*\" in\n\
+                 *'/issues/42 --jq'*) echo '{labels}' ;;\n\
+                 'issue view'*) echo '{{\"labels\":[{{\"name\":\"loom:issue\"}}]}}' ;;\n\
+                 esac\nexit 0\n",
+                log.display()
+            );
+            std::fs::write(&gh, script).unwrap();
+            std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let ws = WritableRoot::register_with_gh(&root, &gh);
+
+            reclaim_and_warn(&ws.gh, &root, 42).unwrap();
+
+            let calls = std::fs::read_to_string(&log).unwrap();
+            if labels.contains("loom:frozen") {
+                assert!(!calls.contains("issue edit"), "{labels}: {calls}");
+                continue;
+            }
+            assert!(calls.contains("issue edit 42 --remove-label loom:building"), "{calls}");
+            assert_eq!(calls.contains("--add-label loom:issue"), restores, "{labels}: {calls}");
+        }
+    }
 
     #[test]
     fn warning_names_the_issue_the_pr_and_the_branch_convention() {

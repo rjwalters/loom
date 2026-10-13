@@ -274,7 +274,7 @@ pub struct ReadyItem {
     pub issue: u32,
     pub rank: u32,
     pub level: u8,
-    pub fleet_priority: u32,
+    pub weight: u32,
     pub created_at: Option<DateTime<Utc>>,
     pub main_red_fix: bool,
     /// The clock holding it back this tick, when one does (#11564).
@@ -565,7 +565,7 @@ pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Ut
             let row = FleetStateRow {
                 rank: Some(item.rank),
                 level: item.level,
-                fleet_priority: Some(item.fleet_priority),
+                weight: Some(item.weight),
                 created_at: item.created_at,
                 main_red_fix: item.main_red_fix,
                 eligible_reason: item.eligible_reason,

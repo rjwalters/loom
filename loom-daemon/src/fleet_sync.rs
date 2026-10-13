@@ -39,6 +39,10 @@
 //! - **Roster clones** ([`roster_clone`], #11218): with `fleet.autoApply` on, a
 //!   timer pass clones a desired repo that is not cloned under `root` yet
 //!   (HTTPS, bounded per pass) and registers it in the same pass.
+//! - **The per-repo fleet tier** ([`repo_config`], #11738): each desired,
+//!   cloned repo's `repos[].config` is written to its
+//!   `.loom-local/fleet-repo.json` (or that file removed), from the roster's
+//!   fail-closed snapshot, under the same [`Mode`] as the config tiers.
 //!
 //! # Invariants this module keeps
 //!
@@ -98,9 +102,12 @@ pub mod applied;
 pub mod checkout_ff;
 mod floor_knowledge;
 pub mod git_spawn_log;
+pub mod identity;
 mod loom_ui;
 pub mod offline_floor;
+pub mod repo_config;
 pub mod roster_clone;
+mod status_lines;
 pub mod workspace_resync;
 
 pub use floor_knowledge::{floor_knowledge, floor_wake, FloorKnowledge, FloorWake};
@@ -250,6 +257,10 @@ pub struct ConfigPass {
     pub tiers: Vec<TierReport>,
     /// Why the pass could not be completed, when it could not be.
     pub error: Option<String>,
+    /// The render failed because this host's id names no store host, so the
+    /// host is off fleet config (#11740). Omitted when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub host_not_in_store: bool,
 }
 
 impl ConfigPass {
@@ -303,6 +314,7 @@ pub fn config_pass(
                 cached,
                 tiers: Vec::new(),
                 error: Some(format!("{e:#}")),
+                host_not_in_store: identity::host_not_in_store(&loaded.snapshot, host),
             }
         }
     };
@@ -356,6 +368,7 @@ pub fn config_pass(
         cached,
         tiers,
         error,
+        host_not_in_store: false,
     }
 }
 
@@ -423,8 +436,19 @@ pub fn roster_pass(
     now: DateTime<Utc>,
 ) -> Result<Plan> {
     let loaded = fetch::load(transport, cache_dir, location, Policy::FailClosed, now)?;
-    let parsed = roster::from_snapshot(&loaded.snapshot, home)?
-        .ok_or_else(|| anyhow!(roster::missing_message(&loaded.snapshot)))?;
+    plan_snapshot(&loaded.snapshot, home, registered, normalize, is_cloned)
+}
+
+/// [`roster_pass`] on an already-loaded fail-closed snapshot.
+fn plan_snapshot(
+    snapshot: &fetch::Snapshot,
+    home: &Path,
+    registered: &[Registered],
+    normalize: &dyn Fn(&Path) -> PathBuf,
+    is_cloned: &dyn Fn(&Path) -> bool,
+) -> Result<Plan> {
+    let parsed = roster::from_snapshot(snapshot, home)?
+        .ok_or_else(|| anyhow!(roster::missing_message(snapshot)))?;
     Ok(roster::plan(&parsed, registered, normalize, is_cloned))
 }
 
@@ -443,7 +467,7 @@ pub fn summarize_roster(
 
 /// Apply one planned change to the machine-level workspace registry at
 /// `registry_path` — the same registry `loom-daemon workspace add/remove/
-/// set-priority` edits, through the same [`crate::workspace_registry`] methods
+/// set-weight` edits, through the same [`crate::workspace_registry`] methods
 /// those verbs use. Loads and saves per change so a mid-plan failure leaves the
 /// earlier changes durably applied, exactly as the CLI's per-verb loop does.
 pub fn apply_change(registry_path: &Path, change: &Change) -> Result<()> {
@@ -456,17 +480,17 @@ pub fn apply_change(registry_path: &Path, change: &Change) -> Result<()> {
     let changed = match change {
         Change::Add {
             path,
-            priority,
+            weight,
             maintain_only,
             ..
         } => {
             let claude_state = crate::terminal::claude_config_state_path();
-            registry.add_and_trust(path, None, *priority, &claude_state)?;
+            registry.add_and_trust(path, None, *weight, &claude_state)?;
             registry.set_maintain_only(path, mode(*maintain_only), Utc::now());
             true
         }
         Change::Remove { path, .. } => registry.remove(path),
-        Change::SetPriority { path, to, .. } => registry.set_priority(path, *to),
+        Change::SetWeight { path, to, .. } => registry.set_weight(path, *to),
         Change::SetMaintainOnly { path, to, .. } => registry
             .set_maintain_only(path, mode(*to), Utc::now())
             .unwrap_or(false),
@@ -679,6 +703,9 @@ pub struct FleetSyncStatus {
     /// ([`checkout_ff::BUSY_NOTE`]); `checkouts` are then from before it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkouts_note: Option<String>,
+    /// Each desired repo's per-repo fleet tier (#11738); omitted when unset.
+    #[serde(default, skip_serializing_if = "repo_config::RepoConfigPass::is_unset")]
+    pub repo_config: repo_config::RepoConfigPass,
 }
 
 fn default_enforced() -> Enforcement {
@@ -689,7 +716,7 @@ impl FleetSyncStatus {
     /// Whether anything is out of sync with the store.
     #[must_use]
     pub fn drifted(&self) -> bool {
-        self.config.drifted() || self.roster.drifted()
+        self.config.drifted() || self.roster.drifted() || self.repo_config.drifted()
     }
 
     /// Whether either half of the pass failed, or the floor could not be read
@@ -697,7 +724,10 @@ impl FleetSyncStatus {
     /// [`DRIFT_TOPIC`] alert as every other fleet-sync failure.
     #[must_use]
     pub fn errored(&self) -> bool {
-        self.config.error.is_some() || self.roster.error.is_some() || self.floor.error.is_some()
+        self.config.error.is_some()
+            || self.roster.error.is_some()
+            || self.floor.error.is_some()
+            || self.repo_config.error.is_some()
     }
 }
 
@@ -868,8 +898,16 @@ pub fn render_line(status: Option<&FleetSyncStatus>, now: DateTime<Utc>) -> Opti
     }
     head.push(')');
     let mut lines = vec![head];
-    lines.extend(state_lines(s));
-    lines.extend(floor_lines(&s.floor));
+    if s.config.host_not_in_store {
+        lines.push(format!(
+            "  {}: `{}` names no store host; this host runs on its last rendered config. Set \
+             LOOM_HOST_ID or fleet.hostId to its roster name (#11740)",
+            identity::NOT_IN_STORE.to_uppercase(),
+            s.host
+        ));
+    }
+    lines.extend(status_lines::state_lines(s));
+    lines.extend(status_lines::floor_lines(&s.floor));
     let interval = std::time::Duration::from_secs(s.interval_secs);
     lines.extend(s.workspaces.lines_at(Some((now, interval))));
     lines.extend(checkout_ff::lines(&s.checkouts));
@@ -910,6 +948,7 @@ pub fn render_line(status: Option<&FleetSyncStatus>, now: DateTime<Utc>) -> Opti
     if let Some(e) = &s.roster.error {
         lines.push(format!("  roster: ERROR (fail-closed) — {e}"));
     }
+    lines.extend(repo_config::lines(&s.repo_config));
     if !s.drifted() && !s.errored() {
         lines.push("  host matches the store".to_string());
     } else if !s.auto_apply && s.drifted() {
@@ -920,68 +959,6 @@ pub fn render_line(status: Option<&FleetSyncStatus>, now: DateTime<Utc>) -> Opti
         );
     }
     Some(lines.join("\n"))
-}
-
-/// The floor lines of the `Fleet store:` block (#10711). Empty when no floor
-/// is set and none was malformed, so `status` is unchanged for such a host.
-fn floor_lines(f: &FloorPass) -> Vec<String> {
-    let mut lines = Vec::new();
-    if let Some(floor) = &f.floor {
-        let from = match (&f.source, f.carried) {
-            (_, true) => " (LAST GOOD floor, carried over)".to_string(),
-            (Some(src), false) => format!(" (from {src})"),
-            (None, false) => String::new(),
-        };
-        lines.push(format!("  {}: {floor}{from}", floor::KEY));
-    }
-    if let Some(e) = &f.error {
-        lines.push(format!("  {}: ERROR — {e}", floor::KEY));
-    }
-    lines
-}
-
-/// The run-state lines of the `Fleet store:` block (#9598) — the *desired*
-/// state the store named, and the *actual* enforcement this host applied.
-///
-/// Empty when the pass resolved no state at all (a store with no
-/// `fleet/state.yml`, a first boot behind an unreachable forge), except that a
-/// read *error* is always reported: "the state could not be read" is the one
-/// thing an operator must not have to infer from silence.
-fn state_lines(s: &FleetSyncStatus) -> Vec<String> {
-    let mut lines = Vec::new();
-    if let Some(desired) = s.state.desired {
-        let from = match s.state.source.as_deref() {
-            Some("host") => "host entry",
-            Some(_) => "fleet default",
-            None => "unknown entry",
-        };
-        let how = if s.state.from_last_recorded {
-            ", from this host's LAST RECORDED state — no snapshot was readable"
-        } else if s.state.cached {
-            ", from a CACHED snapshot"
-        } else {
-            ""
-        };
-        let actual = match s.enforced {
-            Enforcement::Proceed => "dispatching normally",
-            Enforcement::Hold => "new dispatch HELD, in-flight work finishes",
-            Enforcement::Stop => "refusing to start / draining to exit",
-        };
-        lines.push(format!("  run state: desired {} ({from}{how}) -> {actual}", desired.as_str()));
-        for (k, v) in [
-            ("by", &s.state.by),
-            ("since", &s.state.since),
-            ("reason", &s.state.reason),
-        ] {
-            if let Some(v) = v {
-                lines.push(format!("    {k}: {v}"));
-            }
-        }
-    }
-    if let Some(e) = &s.state.error {
-        lines.push(format!("  run state: NOT ENFORCED — {e}"));
-    }
-    lines
 }
 
 // ============================================================================
@@ -1011,11 +988,13 @@ fn run_pass(inputs: &PassInputs, pass: &str, mode: Mode, now: DateTime<Utc>) -> 
     // make a `stopped` host look like it converged before it was told to stop.
     // The fallback is this host's *last recorded* state (see `state_pass`), so a
     // forge outage with a wiped cache still cannot resume a stopped host.
+    // #11740: a generated id the store does not know may adopt its roster name.
+    let host = identity::pass_host(&transport, &inputs.cache, &inputs.location, &inputs.host, now);
     let state = fleet_state::state_pass(
         &transport,
         &inputs.cache,
         &inputs.location,
-        &inputs.host,
+        &host,
         last_recorded_state(),
         now,
     );
@@ -1028,7 +1007,7 @@ fn run_pass(inputs: &PassInputs, pass: &str, mode: Mode, now: DateTime<Utc>) -> 
             &transport,
             &inputs.cache,
             &inputs.location,
-            &inputs.host,
+            &host,
             &machine_path,
             &local_path,
             mode,
@@ -1044,7 +1023,7 @@ fn run_pass(inputs: &PassInputs, pass: &str, mode: Mode, now: DateTime<Utc>) -> 
     };
     // #11218: only a timer pass on a host free to dispatch clones.
     let clone = pass == "timer" && enforced == Enforcement::Proceed;
-    let roster = roster_half(inputs, &transport, &config, (mode, clone), now);
+    let (roster, repo_config) = roster_half(inputs, &transport, &config, (mode, clone), now);
     // #10711: the floor, from the snapshot the halves above just refreshed,
     // into the process-wide value — never the config tiers, whose
     // `autonomous.autoUpdate` changes need a restart.
@@ -1057,7 +1036,7 @@ fn run_pass(inputs: &PassInputs, pass: &str, mode: Mode, now: DateTime<Utc>) -> 
     FleetSyncStatus {
         repo: inputs.location.repo.clone(),
         reference: inputs.location.reference.clone(),
-        host: inputs.host.clone(),
+        host,
         pass: pass.to_string(),
         at: now,
         interval_secs: inputs.interval.as_secs(),
@@ -1072,6 +1051,7 @@ fn run_pass(inputs: &PassInputs, pass: &str, mode: Mode, now: DateTime<Utc>) -> 
         // Likewise the last checkout pass's (#10869).
         checkouts: cached_status().map(|s| s.checkouts).unwrap_or_default(),
         checkouts_note: cached_status().and_then(|s| s.checkouts_note),
+        repo_config,
     }
 }
 
@@ -1085,7 +1065,8 @@ fn last_recorded_state() -> Option<crate::fleet_store::state::RunState> {
         .and_then(|s| s.state.desired)
 }
 
-/// The roster half of [`run_pass`]. Skipped outright when the config half was
+/// The roster half of [`run_pass`], and the per-repo fleet tier (#11738) from
+/// the same fail-closed snapshot. Skipped outright when the config half was
 /// served from the cache: the roster is fail-closed with no cached fallback, so
 /// a forge that could not confirm the config commit cannot confirm the roster
 /// either, and a second failing fetch would only turn a known-unreachable forge
@@ -1096,9 +1077,16 @@ fn roster_half(
     config: &ConfigPass,
     (mode, clone): (Mode, bool),
     now: DateTime<Utc>,
-) -> RosterPass {
+) -> (RosterPass, repo_config::RepoConfigPass) {
+    let failed = |error: String| {
+        let roster = RosterPass {
+            error: Some(error),
+            ..RosterPass::default()
+        };
+        (roster, repo_config::RepoConfigPass::default())
+    };
     if config.cached {
-        return RosterPass {
+        let roster = RosterPass {
             skipped: Some(
                 "the forge was unreachable this pass and the roster is fail-closed (no cached \
                  fallback)"
@@ -1106,50 +1094,39 @@ fn roster_half(
             ),
             ..RosterPass::default()
         };
+        return (roster, repo_config::RepoConfigPass::default());
     }
     let registry_path = match crate::workspace_registry::default_registry_path() {
         Ok(p) => p,
-        Err(e) => {
-            return RosterPass {
-                error: Some(format!("{e:#}")),
-                ..RosterPass::default()
-            }
-        }
+        Err(e) => return failed(format!("{e:#}")),
     };
     let registry = match crate::workspace_registry::WorkspaceRegistry::load(&registry_path) {
         Ok(r) => r,
-        Err(e) => {
-            return RosterPass {
-                error: Some(format!("reading {}: {e:#}", registry_path.display())),
-                ..RosterPass::default()
-            }
-        }
+        Err(e) => return failed(format!("reading {}: {e:#}", registry_path.display())),
     };
     let registered: Vec<Registered> = registry
         .workspaces
         .iter()
         .map(|w| Registered {
             root: w.root.clone(),
-            priority: w.priority,
+            weight: w.weight,
             maintain_only: w.maintain_only.is_some(),
         })
         .collect();
     let Some(home) = dirs::home_dir() else {
-        return RosterPass {
-            error: Some("no home directory".to_string()),
-            ..RosterPass::default()
-        };
+        return failed("no home directory".to_string());
     };
-    let plan = roster_pass(
-        transport,
-        &inputs.cache,
-        &inputs.location,
-        &home,
-        &registered,
-        &crate::workspace_registry::normalize_path,
-        &|p: &Path| p.join(".git").exists(),
-        now,
-    );
+    let is_cloned = |p: &Path| p.join(".git").exists();
+    let loaded =
+        match fetch::load(transport, &inputs.cache, &inputs.location, Policy::FailClosed, now) {
+            Ok(l) => l,
+            Err(e) => return failed(format!("{e:#}")),
+        };
+    let normalize = crate::workspace_registry::normalize_path;
+    let plan = match plan_snapshot(&loaded.snapshot, &home, &registered, &normalize, &is_cloned) {
+        Ok(plan) => plan,
+        Err(e) => return failed(format!("{e:#}")),
+    };
     let clones = if clone {
         let memory = roster_clone::memory::global();
         roster_clone::Clones::on(&roster_clone::GitCloner, inputs.clones, memory, Instant::now())
@@ -1157,22 +1134,20 @@ fn roster_half(
         roster_clone::Clones::off()
     };
     let write = mode == Mode::Write && inputs.auto_apply;
-    match plan {
-        Ok(plan) => {
-            roster_clone::summarize(&plan, write, &clones, &mut |c| apply_change(&registry_path, c))
-        }
-        Err(e) => RosterPass {
-            error: Some(format!("{e:#}")),
-            ..RosterPass::default()
-        },
-    }
+    let roster =
+        roster_clone::summarize(&plan, write, &clones, &mut |c| apply_change(&registry_path, c));
+    // After the roster, so a repo cloned this pass gets its tier this pass.
+    let repos = repo_config::pass(&loaded.snapshot, &home, &is_cloned, mode, now);
+    (roster, repos)
 }
 
 /// Log one pass at the level its findings deserve, and publish a drift record
 /// on the event bus when there is something to say.
 fn report(status: &FleetSyncStatus, bus: Option<&crate::event_bus::EventBus>) {
     let summary = render_line(Some(status), status.at).unwrap_or_default();
-    if status.errored() {
+    if status.config.host_not_in_store {
+        log::error!("fleet_sync: {summary}");
+    } else if status.errored() {
         log::warn!("fleet_sync: {summary}");
     } else if status.drifted() {
         log::info!("fleet_sync: {summary}");
@@ -1310,7 +1285,7 @@ pub async fn start(
     };
     // A repo that delegates daemon administration elsewhere must not have its
     // workspace registry rewritten from here either — the same refusal
-    // `loom-daemon workspace add/remove/set-priority` makes (#5345), applied to
+    // `loom-daemon workspace add/remove/set-weight` makes (#5345), applied to
     // the unattended path.
     let auto_apply = match crate::config_resolver::daemon_delegated_to(workspace) {
         Some(delegate) if config.auto_apply => {
@@ -1339,8 +1314,10 @@ pub async fn start(
         inputs.interval.as_secs()
     );
     workspace_resync::mark_boot();
+    let mut inputs = inputs;
     let state = startup_pass(&inputs, bus.as_deref()).await;
-    // Diverges on `stopped`: this host is not meant to be up at all.
+    inputs.host = identity::adopted().unwrap_or(inputs.host); // #11740
+                                                              // Diverges on `stopped`: this host is not meant to be up at all.
     let hold_note = fleet_state::enforce_at_boot(&state, &inputs.host, &inputs.location.repo).await;
     Some(Started {
         hold_note,

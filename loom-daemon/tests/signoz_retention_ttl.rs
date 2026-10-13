@@ -53,6 +53,9 @@
 //! breaks it run as a counterfactual rather than described.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "common/hub_image.rs"]
+mod hub_image;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::PathBuf;
@@ -412,7 +415,7 @@ fn local(script: &str, format: &str) -> String {
             "none",
             "--entrypoint",
             "clickhouse",
-            CLICKHOUSE_IMAGE,
+            &hub_image::resolve(CLICKHOUSE_IMAGE),
             "local",
             "--multiquery",
             &format!("--format={format}"),
@@ -500,7 +503,7 @@ impl Server {
                     "{}:/etc/clickhouse-server/config.d/trial.yaml:ro",
                     scratch.join("trial.yaml").display()
                 ),
-                CLICKHOUSE_IMAGE,
+                &hub_image::resolve(CLICKHOUSE_IMAGE),
             ])
             .output()
             .expect("docker is required for this test");
@@ -782,6 +785,9 @@ fn the_artifact_is_sixteen_modify_ttl_statements_and_nothing_else() {
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn committed_retention_applies_verbatim_under_the_rendered_cluster_name() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
     let plan = parse(RETENTION);
     let cluster = rendered_cluster_name();
     let server = Server::start(&cluster);
@@ -853,6 +859,9 @@ fn ttl_expression(r: &Retention) -> String {
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn a_renamed_cluster_aborts_the_file_before_anything_applies() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
     let plan = parse(RETENTION);
     let cluster = rendered_cluster_name();
     let server = Server::start(&cluster);
@@ -889,6 +898,9 @@ fn a_renamed_cluster_aborts_the_file_before_anything_applies() {
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn a_renamed_table_aborts_the_file_and_leaves_the_metric_statements_unapplied() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
     let plan = parse(RETENTION);
     let cluster = rendered_cluster_name();
     let server = Server::start(&cluster);
@@ -976,6 +988,9 @@ fn a_renamed_table_aborts_the_file_and_leaves_the_metric_statements_unapplied() 
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn the_committed_expressions_delete_over_age_rows_and_keep_in_window_rows() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
     let plan = parse(RETENTION);
     let mut script = create_databases(&plan);
     for r in &plan {
@@ -1035,6 +1050,9 @@ fn the_committed_expressions_delete_over_age_rows_and_keep_in_window_rows() {
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn dropping_the_millisecond_divisor_deletes_every_row_instead_of_none() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
     let plan = parse(RETENTION);
     let r = plan
         .iter()
@@ -1100,6 +1118,9 @@ fn dropping_the_millisecond_divisor_deletes_every_row_instead_of_none() {
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn restoring_thirty_days_restores_the_policy_not_the_data() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
     let plan = parse(RETENTION);
     let r = plan
         .iter()
@@ -1183,6 +1204,9 @@ fn restoring_thirty_days_restores_the_policy_not_the_data() {
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn modify_ttl_silently_drops_a_qualified_delete_predicate() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
     let plan = parse(RETENTION);
     let r = plan
         .iter()
@@ -1247,6 +1271,9 @@ fn modify_ttl_silently_drops_a_qualified_delete_predicate() {
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn ttl_only_drop_parts_keeps_an_over_age_row_in_a_mixed_part() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
     let plan = parse(RETENTION);
     let r = plan
         .iter()

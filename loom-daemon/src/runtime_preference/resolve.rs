@@ -262,6 +262,8 @@ impl<T> Resolution<T> {
             tap: chosen.tap.to_string(),
             marker,
             model_profile: chosen.tap.model_profile.clone(),
+            model: None,
+            draw: None,
         })
     }
 
@@ -325,6 +327,15 @@ pub struct PreferenceStamp {
     /// exactly, so a bare tap keeps pinning nothing at launch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_profile: Option<String>,
+    /// The model a role draw's pick pins (`claude/opus` ⇒ `opus`, #11726).
+    /// The role-tick launch passes it as `--model`; `None` keeps today's
+    /// model resolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The role draw's decision record, when `runtimes.roleDraw` chose this
+    /// tap (#11726).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draw: Option<Box<super::role_draw::RoleDrawRecord>>,
 }
 
 /// Walk `taps` in order and take the first that is both admitted for the role

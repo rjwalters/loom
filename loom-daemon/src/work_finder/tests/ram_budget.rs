@@ -33,7 +33,7 @@ fn run(multi: &mut [(FakeSource, RecordingDispatcher)], max: usize, ram: RamBudg
         multi,
         // `heavy` sorts first, so the small candidate is reached only if the
         // heavy one's deferral is work-conserving.
-        &[1, 100],
+        &[1000, 1],
         max.into(),
         &[false, false],
         None,

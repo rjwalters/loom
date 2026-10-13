@@ -52,6 +52,9 @@
 //!   reached into `attributes_number` would silently get 0.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "common/hub_image.rs"]
+mod hub_image;
+
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -83,7 +86,7 @@ fn clickhouse(script: &str, format: &str) -> String {
             "-i",
             "--entrypoint",
             "clickhouse",
-            CLICKHOUSE_IMAGE,
+            &hub_image::resolve(CLICKHOUSE_IMAGE),
             "local",
             "--multiquery",
             &format!("--format={format}"),
@@ -196,6 +199,9 @@ fn close(row: &Row, key: &str, expected: f64) {
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn committed_queue_dwell_queries_answer_the_starvation_questions_on_real_clickhouse() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
     // ---- the file runs verbatim, as one pass, exactly as the README says ---
     clickhouse(&format!("{FIXTURE}\n{QUEUE_DWELL}"), "TSV");
 
@@ -390,6 +396,9 @@ fn committed_queue_dwell_queries_answer_the_starvation_questions_on_real_clickho
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn committed_quota_utilization_queries_answer_the_saturation_questions_on_real_clickhouse() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
     // ---- the file runs verbatim, as one pass, exactly as the README says ---
     clickhouse(&format!("{FIXTURE}\n{QUOTA}"), "TSV");
 
@@ -520,6 +529,9 @@ fn committed_quota_utilization_queries_answer_the_saturation_questions_on_real_c
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn the_naive_fingerprint_join_doubles_query_4s_wait_seconds() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
     let committed = statements(QUEUE_DWELL);
     let query_4 = &committed[3];
     assert!(
@@ -596,6 +608,9 @@ fn the_naive_fingerprint_join_doubles_query_4s_wait_seconds() {
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn reading_a_dispatch_attribute_from_attributes_number_silently_returns_zero() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
     let probe = format!(
         "{FIXTURE}\n\
          SELECT count() AS disposition_spans,\n\

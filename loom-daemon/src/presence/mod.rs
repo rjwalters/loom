@@ -4,11 +4,13 @@
 //!
 //! - [`beat`]: producing the facts and the per-session throttle state.
 //! - [`journal`]: the append-only journal and its export.
+//! - [`flush`]: the daemon-less one-shot OTLP drain of that journal (#11713).
 //!
 //! The `loom-daemon presence` subcommand (`cli/presence.rs`) is the thin
 //! entry point a Claude Code hook calls.
 
 pub mod beat;
+pub mod flush;
 pub mod journal;
 
 #[cfg(test)]

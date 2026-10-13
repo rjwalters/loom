@@ -7,6 +7,7 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 
+use super::halt_cause::HaltCause;
 use super::ready_queue;
 use crate::sweep_registry::{
     AlreadyLandedDispatchError, ClaimLockDispatchError, CollisionDispatchError,
@@ -194,7 +195,17 @@ pub struct TickReport {
     /// [`WorkspaceHealthStates`](crate::main_health_gate::WorkspaceHealthStates)
     /// flags the gate writes (#3974 AC3), so this can never disagree with what
     /// the gate loop reports — including when a repo's forge query fails.
+    ///
+    /// Despite the history above, any hold sets it — a drain, an exhausted
+    /// token pool, a disk reservation (#9017, #11191); [`Self::halt_causes`]
+    /// says which.
     pub halted: bool,
+    /// The distinct causes of this tick's holds (#11649), in
+    /// [`HaltCause::ALL`] order. Empty when the tick was not held, or when the
+    /// caller attributed no cause (a legacy, cause-less tick). The
+    /// `loom.dispatch.tick` result is derived from it, so a disk-held tick no
+    /// longer reads `halted_main_red`.
+    pub halt_causes: Vec<HaltCause>,
     /// True when the saturation admission brake (#4903) was engaged for this
     /// tick. Reported separately from
     /// [`deferred_saturation`](Self::deferred_saturation) so "the host was
@@ -311,6 +322,25 @@ impl TickReport {
         idxs.sort_unstable();
         idxs.dedup();
         idxs
+    }
+
+    /// Record this tick's holds (#11649): [`Self::halted`] when any of the
+    /// first `n` workspaces is held, and [`Self::halt_causes`] as the distinct
+    /// causes `causes` (parallel to `halted`, optional) names at held indices.
+    /// A cause at a not-held index is ignored, as `record_halted` does.
+    pub fn note_halts(&mut self, halted: &[bool], causes: Option<&[Option<HaltCause>]>, n: usize) {
+        self.halted = halted.iter().take(n).any(|&h| h);
+        let held: Vec<HaltCause> = halted
+            .iter()
+            .take(n)
+            .enumerate()
+            .filter(|(_, &h)| h)
+            .filter_map(|(i, _)| causes.and_then(|c| c.get(i).copied()).flatten())
+            .collect();
+        self.halt_causes = HaltCause::ALL
+            .into_iter()
+            .filter(|cause| held.contains(cause))
+            .collect();
     }
 
     /// An empty report for a multi-workspace tick run under these admission
