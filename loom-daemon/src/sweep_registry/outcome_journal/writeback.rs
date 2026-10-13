@@ -7,7 +7,7 @@
 //! once the [`telemetry::SweepOutcomeRecord`] has been assembled AND durably
 //! appended — post ONE best-effort Markdown comment onto the sweep's originating GitHub
 //! **issue** (not just the PR) summarizing that record: the Curator's
-//! `loom:complexity` / `loom:points` estimate, actual token burn, wall-clock
+//! `points:*` estimate (label-sourced, off the record's `story_points`), actual token burn, wall-clock
 //! duration (total and per-phase), Doctor cycle count, and the first-pass
 //! Judge verdict. Deliberately excludes CI minutes — no join between sweep
 //! outcomes and `loom-daemon ci-telemetry`'s `ci.run`/`ci.job` records exists
@@ -155,17 +155,15 @@ fn format_duration_secs(secs: i64) -> String {
 
 /// Render the write-back Markdown body from an already-assembled
 /// [`telemetry::SweepOutcomeRecord`] (Issue #9056) — pure and
-/// forge-independent, so it is unit-testable without a fake `gh`. `points` is
-/// passed separately rather than as a record field: unlike `complexity`, it
-/// is not part of the persisted telemetry schema (see
-/// [`super::points_signal`]'s module doc for why).
+/// forge-independent, so it is unit-testable without a fake `gh`. The size is
+/// `record.story_points` (the issue's `points:*` label, #9432) — only an
+/// in-vocabulary label ever lands there, so an out-of-vocabulary value is
+/// never echoed as a size.
 #[must_use]
-pub(crate) fn format_sweep_outcome_comment(
-    record: &telemetry::SweepOutcomeRecord,
-    points: Option<&str>,
-) -> String {
-    let complexity = record.complexity.as_deref().unwrap_or("unmarked");
-    let points = points.unwrap_or("unmarked");
+pub(crate) fn format_sweep_outcome_comment(record: &telemetry::SweepOutcomeRecord) -> String {
+    let points = record
+        .story_points
+        .map_or_else(|| "unmarked".to_string(), |n| n.to_string());
 
     let tokens = match (record.tokens_in, record.tokens_out) {
         (Some(tin), Some(tout)) => format!("{tin} in / {tout} out"),
@@ -200,7 +198,7 @@ pub(crate) fn format_sweep_outcome_comment(
     format!(
         "{marker}\n\
          ### Sweep Outcome\n\n\
-         - **Estimate:** complexity `{complexity}`, points `{points}`\n\
+         - **Estimate:** points `{points}`\n\
          - **Tokens:** {tokens}\n\
          - **Wall-clock duration:** {duration}{phase_line}\n\
          - **Doctor cycles:** {doctor_cycles}\n\
@@ -254,8 +252,7 @@ impl SweepRegistry {
                 );
             }
             Some(false) => {
-                let points = self.fetch_points_signal(issue);
-                let body = format_sweep_outcome_comment(record, points.as_deref());
+                let body = format_sweep_outcome_comment(record);
                 self.post_sweep_outcome_writeback_comment(issue, &body);
             }
         }
@@ -357,7 +354,7 @@ mod tests {
 
     fn fixture_record() -> telemetry::SweepOutcomeRecord {
         telemetry::SweepOutcomeRecord {
-            story_points: None,
+            story_points: Some(8),
             repo: Some("rjwalters/loom".to_string()),
             repo_unresolved: false,
             visibility: telemetry::RepoVisibility::Private,
@@ -390,7 +387,6 @@ mod tests {
             runtime: None,
             provider: None,
             profile: None,
-            complexity: Some("complex".to_string()),
             tokens_status: None,
             tokens_status_reason: None,
             no_phase_cause: None,
@@ -413,7 +409,7 @@ mod tests {
 
     #[test]
     fn comment_carries_the_hidden_marker_first() {
-        let body = format_sweep_outcome_comment(&fixture_record(), Some("8"));
+        let body = format_sweep_outcome_comment(&fixture_record());
         assert!(
             body.starts_with("<!-- loom:sweep-outcome-writeback sweep=sweep-issue-9056-0 -->\n"),
             "{body}"
@@ -431,8 +427,8 @@ mod tests {
 
     #[test]
     fn comment_reports_estimate_tokens_duration_doctor_and_judge() {
-        let body = format_sweep_outcome_comment(&fixture_record(), Some("8"));
-        assert!(body.contains("complexity `complex`"), "{body}");
+        let body = format_sweep_outcome_comment(&fixture_record());
+        assert!(!body.contains("complexity"), "{body}");
         assert!(body.contains("points `8`"), "{body}");
         assert!(body.contains("200000 in / 15000 out"), "{body}");
         assert!(body.contains("1h 6m"), "{body}");
@@ -449,9 +445,8 @@ mod tests {
         record.tokens_out = None;
         record.doctor_cycles = None;
         record.judge_verdicts = None;
-        record.complexity = None;
-        let body = format_sweep_outcome_comment(&record, None);
-        assert!(body.contains("complexity `unmarked`"), "{body}");
+        record.story_points = None;
+        let body = format_sweep_outcome_comment(&record);
         assert!(body.contains("points `unmarked`"), "{body}");
         assert!(body.contains("Tokens:** unknown"), "{body}");
         assert!(body.contains("Doctor cycles:** unknown"), "{body}");
@@ -460,7 +455,7 @@ mod tests {
 
     #[test]
     fn never_mentions_ci_minutes_as_a_measured_field() {
-        let body = format_sweep_outcome_comment(&fixture_record(), Some("8"));
+        let body = format_sweep_outcome_comment(&fixture_record());
         // The one permitted mention is the deferred-follow-up sentence itself.
         assert_eq!(body.matches("CI minutes").count(), 1, "{body}");
         assert!(body.contains("not yet joined"), "{body}");

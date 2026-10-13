@@ -22,16 +22,15 @@
 //!
 //! The in/out-of-experiment decision ([`in_experiment`]) and the arm choice
 //! ([`ExperimentArms::assign`]) use **separately domain-separated** hashes of
-//! the same `(issue, complexity-stratum)` key. Changing the budget fraction
+//! the same issue-number key. Changing the budget fraction
 //! therefore re-partitions *who is in the experiment* without reshuffling
 //! *which arm* an in-experiment issue lands on — so a canary can be widened or
 //! narrowed mid-flight and the arm attribution of every already-recorded issue
 //! stays valid.
 //!
-//! Both hashes are pure functions of `(issue_number, stratum)`: assignment
-//! stays deterministic and resume-safe (a killed-and-resumed sweep re-lands the
-//! same arm) and stratified by the Curator complexity marker, exactly as the
-//! 2-arm original. The domain strings below are part of that contract —
+//! Both hashes are pure functions of the issue number alone (issue-sizing
+//! design §6.4): assignment stays deterministic and resume-safe (a
+//! killed-and-resumed sweep re-lands the same arm). The domain strings below are part of that contract —
 //! changing one reshuffles every future assignment.
 //!
 //! # Scope boundary (Phase 1)
@@ -201,28 +200,26 @@ impl ExperimentArms {
         self.configured
     }
 
-    /// Deterministically assign an arm for `issue_number` within its
-    /// complexity stratum.
+    /// Deterministically assign an arm for `issue_number`.
     ///
     /// * **Unconfigured roster** — delegates to
     ///   [`super::sweep_experiment::assign_arm`], so the A/B parity split (and
     ///   therefore every existing assertion about it) is preserved
     ///   byte-for-byte.
     /// * **Configured roster** — a weighted pick from the domain-separated
-    ///   [`ARM_DOMAIN`] hash of `(stratum, issue)`. Pure, so a resumed sweep
-    ///   re-lands the same arm; stratified, so `complex` and `routine` each
-    ///   converge to the configured weights independently.
+    ///   [`ARM_DOMAIN`] hash of the issue number. Pure, so a resumed sweep
+    ///   re-lands the same arm, and the arms converge to the configured
+    ///   weights.
     #[must_use]
-    pub fn assign(&self, issue_number: i64, complexity: Option<&str>) -> &ExperimentArm {
+    pub fn assign(&self, issue_number: i64) -> &ExperimentArm {
         if !self.configured {
-            let legacy = super::sweep_experiment::assign_arm(issue_number, complexity);
+            let legacy = super::sweep_experiment::assign_arm(issue_number);
             if let Some(arm) = self.arms.iter().find(|a| a.id == legacy) {
                 return arm;
             }
         }
-        let stratum = super::sweep_experiment::normalize_complexity(complexity);
         let total: f64 = self.arms.iter().map(|a| a.weight).sum();
-        let mut target = unit_hash(ARM_DOMAIN, issue_number, stratum) * total;
+        let mut target = unit_hash(ARM_DOMAIN, issue_number) * total;
         for arm in &self.arms {
             target -= arm.weight;
             if target < 0.0 {
@@ -363,15 +360,14 @@ pub fn resolve_budget_fraction(env_value: Option<&str>, config: &Value) -> (f64,
 /// to `true` WITHOUT hashing, so the default path is provably identical to the
 /// pre-#9122 "every eligible issue gets an arm" behavior.
 #[must_use]
-pub fn in_experiment(issue_number: i64, complexity: Option<&str>, fraction: f64) -> bool {
+pub fn in_experiment(issue_number: i64, fraction: f64) -> bool {
     if !fraction.is_finite() || fraction >= 1.0 {
         return true;
     }
     if fraction <= 0.0 {
         return false;
     }
-    let stratum = super::sweep_experiment::normalize_complexity(complexity);
-    unit_hash(BUDGET_DOMAIN, issue_number, stratum) < fraction
+    unit_hash(BUDGET_DOMAIN, issue_number) < fraction
 }
 
 /// The loud banner for an issue sampled OUT of the experiment by the budget
@@ -517,15 +513,15 @@ fn fmt_number(v: &Value) -> String {
 // Deterministic hashing
 // --------------------------------------------------------------------------
 
-/// A uniform `[0.0, 1.0)` draw keyed on `(domain, issue, stratum)`.
+/// A uniform `[0.0, 1.0)` draw keyed on `(domain, issue)`.
 ///
 /// FNV-1a for the byte fold, then a SplitMix64 finalizer for avalanche — FNV
 /// alone mixes short keys unevenly, which would bias a weighted pick over the
 /// small, dense integer domain issue numbers occupy. The top 53 bits become the
 /// mantissa of an exactly-representable double.
 #[allow(clippy::cast_precision_loss)]
-fn unit_hash(domain: &str, issue_number: i64, stratum: &str) -> f64 {
-    let key = format!("{domain}\u{1f}{stratum}\u{1f}{issue_number}");
+fn unit_hash(domain: &str, issue_number: i64) -> f64 {
+    let key = format!("{domain}\u{1f}{issue_number}");
     let h = mix64(fnv1a(key.as_bytes()));
     ((h >> 11) as f64) / ((1_u64 << 53) as f64)
 }
@@ -571,23 +567,20 @@ mod tests {
         assert!(!arms.is_configured());
         assert_eq!(arms.arms().len(), 2);
 
-        // Exactly the table `assign_arm` (and test-sweep-experiment.sh) assert.
+        // Exactly the parity split `assign_arm` (and test-sweep-experiment.sh) assert.
         for issue in 0..500_i64 {
-            for complexity in [None, Some("routine"), Some("complex")] {
-                let legacy = super::super::sweep_experiment::assign_arm(issue, complexity);
-                let arm = arms.assign(issue, complexity);
-                assert_eq!(arm.id, legacy, "issue {issue} {complexity:?}");
-                assert_eq!(
-                    arm.model,
-                    super::super::sweep_experiment::arm_model(legacy),
-                    "issue {issue}"
-                );
-            }
+            let legacy = super::super::sweep_experiment::assign_arm(issue);
+            let arm = arms.assign(issue);
+            assert_eq!(arm.id, legacy, "issue {issue}");
+            assert_eq!(
+                arm.model,
+                super::super::sweep_experiment::arm_model(legacy),
+                "issue {issue}"
+            );
         }
-        assert_eq!(arms.assign(100, Some("routine")).id, "A");
-        assert_eq!(arms.assign(100, Some("routine")).model, "opus");
-        assert_eq!(arms.assign(100, Some("complex")).id, "B");
-        assert_eq!(arms.assign(101, Some("routine")).id, "B");
+        assert_eq!(arms.assign(100).id, "A");
+        assert_eq!(arms.assign(100).model, "opus");
+        assert_eq!(arms.assign(101).id, "B");
     }
 
     #[test]
@@ -627,50 +620,36 @@ mod tests {
     fn assignment_is_deterministic_and_resume_safe() {
         let (arms, _) = ExperimentArms::load(&three_arms());
         for issue in [1_i64, 42, 9122, 1_000_003] {
-            let first = arms.assign(issue, Some("complex")).id.clone();
+            let first = arms.assign(issue).id.clone();
             for _ in 0..5 {
-                assert_eq!(arms.assign(issue, Some("complex")).id, first);
+                assert_eq!(arms.assign(issue).id, first);
             }
         }
     }
 
     /// Over a large synthetic sample each arm's observed frequency converges to
-    /// its configured weight ratio — independently within each stratum.
+    /// its configured weight ratio.
     #[test]
-    fn weighted_frequencies_converge_within_each_complexity_stratum() {
+    fn weighted_frequencies_converge_to_the_configured_weights() {
         let (arms, _) = ExperimentArms::load(&three_arms());
         let total_weight: f64 = arms.arms().iter().map(|a| a.weight).sum();
         const N: i64 = 2000;
         const TOLERANCE: f64 = 0.035;
 
-        for stratum in [Some("routine"), Some("complex")] {
-            let mut counts = std::collections::BTreeMap::<String, i64>::new();
-            for issue in 1..=N {
-                *counts
-                    .entry(arms.assign(issue, stratum).id.clone())
-                    .or_default() += 1;
-            }
-            assert_eq!(counts.len(), 3, "every arm must be drawn ({stratum:?})");
-            for arm in arms.arms() {
-                let observed = counts[&arm.id] as f64 / N as f64;
-                let expected = arm.weight / total_weight;
-                assert!(
-                    (observed - expected).abs() < TOLERANCE,
-                    "{stratum:?} arm {} observed {observed:.4} vs expected {expected:.4}",
-                    arm.id
-                );
-            }
+        let mut counts = std::collections::BTreeMap::<String, i64>::new();
+        for issue in 1..=N {
+            *counts.entry(arms.assign(issue).id.clone()).or_default() += 1;
         }
-    }
-
-    /// The strata must be independent, not a relabeling of one another.
-    #[test]
-    fn strata_are_assigned_independently() {
-        let (arms, _) = ExperimentArms::load(&three_arms());
-        let differing = (1..=500_i64)
-            .filter(|i| arms.assign(*i, Some("routine")).id != arms.assign(*i, Some("complex")).id)
-            .count();
-        assert!(differing > 50, "strata look correlated ({differing}/500 differ)");
+        assert_eq!(counts.len(), 3, "every arm must be drawn");
+        for arm in arms.arms() {
+            let observed = counts[&arm.id] as f64 / N as f64;
+            let expected = arm.weight / total_weight;
+            assert!(
+                (observed - expected).abs() < TOLERANCE,
+                "arm {} observed {observed:.4} vs expected {expected:.4}",
+                arm.id
+            );
+        }
     }
 
     // ===== rejection: fable, non-Claude runtimes, malformed rosters =====
@@ -818,15 +797,14 @@ mod tests {
     #[test]
     fn fraction_one_keeps_every_issue_in_the_experiment() {
         for issue in 0..1000_i64 {
-            assert!(in_experiment(issue, Some("routine"), 1.0));
-            assert!(in_experiment(issue, Some("complex"), 1.0));
+            assert!(in_experiment(issue, 1.0));
         }
     }
 
     #[test]
     fn fraction_zero_keeps_every_issue_out() {
         for issue in 0..1000_i64 {
-            assert!(!in_experiment(issue, None, 0.0));
+            assert!(!in_experiment(issue, 0.0));
         }
     }
 
@@ -834,16 +812,12 @@ mod tests {
     fn the_sampled_in_share_converges_to_the_fraction() {
         const N: i64 = 2000;
         for fraction in [0.1, 0.3, 0.75] {
-            for stratum in [Some("routine"), Some("complex")] {
-                let hits = (1..=N)
-                    .filter(|i| in_experiment(*i, stratum, fraction))
-                    .count();
-                let observed = hits as f64 / N as f64;
-                assert!(
-                    (observed - fraction).abs() < 0.035,
-                    "fraction {fraction} {stratum:?}: observed {observed:.4}"
-                );
-            }
+            let hits = (1..=N).filter(|i| in_experiment(*i, fraction)).count();
+            let observed = hits as f64 / N as f64;
+            assert!(
+                (observed - fraction).abs() < 0.035,
+                "fraction {fraction}: observed {observed:.4}"
+            );
         }
     }
 
@@ -854,10 +828,10 @@ mod tests {
     fn changing_the_fraction_never_reshuffles_arm_assignment() {
         let (arms, _) = ExperimentArms::load(&three_arms());
         for issue in 1..=500_i64 {
-            let baseline = arms.assign(issue, Some("routine")).id.clone();
+            let baseline = arms.assign(issue).id.clone();
             for fraction in [0.05, 0.3, 0.9, 1.0] {
-                if in_experiment(issue, Some("routine"), fraction) {
-                    assert_eq!(arms.assign(issue, Some("routine")).id, baseline);
+                if in_experiment(issue, fraction) {
+                    assert_eq!(arms.assign(issue).id, baseline);
                 }
             }
         }
@@ -866,9 +840,9 @@ mod tests {
     #[test]
     fn sampling_in_is_deterministic_and_resume_safe() {
         for issue in [7_i64, 9122, 55_555] {
-            let first = in_experiment(issue, Some("complex"), 0.3);
+            let first = in_experiment(issue, 0.3);
             for _ in 0..5 {
-                assert_eq!(in_experiment(issue, Some("complex"), 0.3), first);
+                assert_eq!(in_experiment(issue, 0.3), first);
             }
         }
     }

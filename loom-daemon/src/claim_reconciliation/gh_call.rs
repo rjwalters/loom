@@ -68,7 +68,7 @@ fn build(
 /// a name's mapping in exactly one place.
 ///
 /// `None` is deliberate, not debt, for: GraphQL issue views (`claim.labels`,
-/// `claim.issue_labels`, `claim.issue_state`, `model.issue_body*`) and
+/// `claim.issue_labels`, `claim.issue_state`) and
 /// PR-by-label listings (`claim.pr_list_claimed`, `verdict.pr_list`,
 /// `*.pr_list`, `snapshot.*`) — the inventory has no single-issue-view or
 /// PR-list-by-label row — plus `star.api` (a generic `gh api` passthrough).

@@ -63,7 +63,7 @@ impl WorkDispatcher for BrakeDispatcher {
     fn occupancy(&self) -> usize {
         self.dispatched.len()
     }
-    fn dispatch(&mut self, issue: u32, _complexity: Option<&str>) -> Result<bool> {
+    fn dispatch(&mut self, issue: u32) -> Result<bool> {
         self.dispatched.push(issue);
         Ok(true)
     }

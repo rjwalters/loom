@@ -129,7 +129,6 @@ mod tests {
             runtime: None,
             provider: None,
             profile: None,
-            complexity: None,
             repo_unresolved: false,
             disposition: crate::telemetry::SweepDisposition::Unknown,
             tokens_unattributed: None,

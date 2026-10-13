@@ -377,13 +377,14 @@ fn sweep_md_documents_model_experiment_mode() {
         );
     }
     // PROSE (structural): the assignment property is documented via a bold
-    // lead-in ("Deterministic, resume-safe, stratified assignment.") that gets
-    // edited. Anchor on the stable technical token `stratified` (matches
-    // "stratified"/"stratification") so a reword survives and a deletion fails.
+    // lead-in ("Deterministic, resume-safe assignment.") that gets edited.
+    // Anchor on the stable token `resume-safe`. The complexity stratum was
+    // retired in #11665: assignment keys on the issue number alone.
     assert!(
-        content.contains("stratified"),
-        "sweep.md must document the deterministic, resume-safe, stratified arm \
-         assignment (#3725) — anchored structurally on `stratified`"
+        content.contains("resume-safe") && !content.contains("stratified"),
+        "sweep.md must document the deterministic, resume-safe arm assignment \
+         (#3725) and must not describe the retired complexity stratification \
+         (#11665)"
     );
 
     // PROSE (structural presence): the subsection heading is anchored by its

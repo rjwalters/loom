@@ -336,16 +336,11 @@ impl WorkDispatcher for BeforePrefilter {
     fn workspace_commands_missing(&self) -> bool {
         self.0.workspace_commands_missing()
     }
-    fn dispatch(&mut self, issue: u32, complexity: Option<&str>) -> Result<bool> {
-        self.0.dispatch(issue, complexity)
+    fn dispatch(&mut self, issue: u32) -> Result<bool> {
+        self.0.dispatch(issue)
     }
-    fn dispatch_with(
-        &mut self,
-        issue: u32,
-        complexity: Option<&str>,
-        overflow: bool,
-    ) -> Result<bool> {
-        self.0.dispatch_with(issue, complexity, overflow)
+    fn dispatch_with(&mut self, issue: u32, overflow: bool) -> Result<bool> {
+        self.0.dispatch_with(issue, overflow)
     }
 }
 

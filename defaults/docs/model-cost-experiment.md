@@ -31,10 +31,11 @@ LOOM_MODEL_EXPERIMENT=experiment LOOM_MODEL_EXPERIMENT_CANARY=1 \
 **Two arms** map onto #3718's inequality: **Arm A = opus-first** (Builder→opus),
 **Arm B = sonnet-first + escalate-on-Judge-rejection** (Builder→sonnet, escalating
 via the `sweep.escalation` ladder). Arm assignment is a **deterministic,
-resume-safe** function of the issue number, **stratified by the Curator complexity
-marker** (#3702) so both arms see a comparable difficulty mix — a killed-and-resumed
-sweep re-lands the same arm. The marker is used only as the stratification key;
-it never picks a model.
+resume-safe** function of the issue number alone — a killed-and-resumed sweep
+re-lands the same arm. (The Curator complexity-marker stratum was retired in
+#11665: arm assignment no longer reads the issue body. `observe` and `experiment`
+records carry the issue's `story_points` instead, the `points:*` label value,
+absent when unsized.)
 
 ## N configurable arms (`sweep.modelExperimentArms`, #9122)
 
@@ -65,9 +66,9 @@ arm` are already arm-name-agnostic:
 - `weight` is a relative selection weight (> 0, default `1`); weights need not
   sum to anything. Above, `HAIKU` draws 8/10 of in-experiment issues.
 
-Assignment stays **deterministic, resume-safe, and stratified** exactly as the
-2-arm original: it is a pure function of `(issue number, complexity stratum)`,
-and each stratum converges to the configured weights independently.
+Assignment stays **deterministic and resume-safe** like the 2-arm original: it
+is a pure function of the issue number, and the arms converge to the configured
+weights.
 
 **Absent this key (or if it is rejected) behavior is byte-for-byte the
 pre-#9122 A/B pair.** Rejection is **loud on stderr and falls through** to the
@@ -152,7 +153,7 @@ are gitignored.
 ```
 
 The load-bearing signal is the **deterministic outcome-chain** (arm / model /
-attempt / Judge verdict / Doctor-cycle count / complexity) — that alone answers
+attempt / Judge verdict / Doctor-cycle count / story points) — that alone answers
 #3718's inequality (first-attempt Judge-pass rate + mean Doctor cycles × model
 price), and it is stamped into the durable store per phase.
 

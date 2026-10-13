@@ -285,10 +285,9 @@ pub struct WorkItem {
     /// The issue's markdown body, when the listing supplied it (#4827).
     ///
     /// The ETag-cached REST listing already returns it at zero extra cost, and
-    /// dispatch reads the Curator's `<!-- loom:complexity=<tier> -->` marker out
-    /// of it (see [`Self::complexity`]) to stratify the model-cost A/B
-    /// experiment's arm assignment per issue. `None` (a synthetic item, or a
-    /// listing without bodies) simply falls back to the `routine` stratum.
+    /// the self-declared re-check interval marker is read out of it (see
+    /// [`Self::recheck_interval`]). `None` (a synthetic item, or a listing
+    /// without bodies) simply carries no marker.
     pub body: Option<String>,
     /// The issue's RFC-3339 `updatedAt` timestamp, when the listing supplied
     /// it (Issue #6685) — the ETag-cached REST listing already returns it at
@@ -344,19 +343,6 @@ impl WorkItem {
     pub fn with_updated_at(mut self, updated_at: Option<String>) -> Self {
         self.updated_at = updated_at;
         self
-    }
-
-    /// The Curator's `<!-- loom:complexity=<tier> -->` stratum for this issue,
-    /// extracted from [`Self::body`] (#4827).
-    ///
-    /// `None` when no body was fetched or no marker is present — which
-    /// [`crate::script_helpers::sweep_experiment::assign_arm`] treats as the
-    /// `routine` stratum, exactly as before this field existed.
-    #[must_use]
-    pub fn complexity(&self) -> Option<&str> {
-        self.body
-            .as_deref()
-            .and_then(crate::script_helpers::sweep_experiment::extract_complexity_marker)
     }
 
     /// True when the issue carries any [`SKIP_LABELS`] entry.
@@ -771,17 +757,12 @@ pub trait WorkDispatcher {
     /// was started, `false` when the dispatch was an idempotency no-op (a sweep
     /// with the same key was already running).
     ///
-    /// `complexity` is the issue's `<!-- loom:complexity=<tier> -->` stratum
-    /// (#4827), already extracted from the listing's issue body by the caller —
-    /// the dispatcher never re-fetches it. Used ONLY to stratify the model-cost
-    /// A/B experiment's arm assignment; `None` (no marker / no body) keeps the
-    /// pre-#4827 `routine` stratum and is never an error.
     ///
     /// # Errors
     ///
     /// Returns an error when the dispatch fails (e.g. a claim-lock collision).
     /// The caller logs and counts it; it is never fatal.
-    fn dispatch(&mut self, issue: u32, complexity: Option<&str>) -> Result<bool>;
+    fn dispatch(&mut self, issue: u32) -> Result<bool>;
 
     /// [`dispatch`](Self::dispatch), additionally recording whether this is
     /// the host's overflow sweep (#9244, inert since #11508) on the sweep
@@ -791,14 +772,9 @@ pub trait WorkDispatcher {
     /// # Errors
     ///
     /// Same as [`dispatch`](Self::dispatch).
-    fn dispatch_with(
-        &mut self,
-        issue: u32,
-        complexity: Option<&str>,
-        overflow: bool,
-    ) -> Result<bool> {
+    fn dispatch_with(&mut self, issue: u32, overflow: bool) -> Result<bool> {
         let _ = overflow;
-        self.dispatch(issue, complexity)
+        self.dispatch(issue)
     }
 
     /// The batched open-PR pre-filter (#8865, [`open_pr_prefilter`]): the
@@ -1289,7 +1265,7 @@ pub fn tick_with_lanes(
         // 4. Dispatch. The registry's idempotency key + claim lock make a
         //    double-dispatch of an already-running issue a no-op / loud error.
         let started = chrono::Utc::now();
-        let outcome = dispatcher.dispatch_with(item.number, item.complexity(), false);
+        let outcome = dispatcher.dispatch_with(item.number, false);
         if record_dispatch_outcome(&mut report, item.number, 0, started, &outcome).0
             == Qd::Dispatched
         {
@@ -1945,10 +1921,7 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
             }
             // One key feeds both the view and dispatch, so they cannot drift.
             ready_queue::record_candidate(q, &key, &item);
-            candidates.push(PriorityCandidate {
-                complexity: item.complexity().map(str::to_owned),
-                ..key
-            });
+            candidates.push(key);
         }
     }
 

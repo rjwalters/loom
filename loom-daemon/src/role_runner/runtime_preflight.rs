@@ -148,7 +148,6 @@ pub(crate) fn check(
     // tap's own pre-spawn gate refusing — drops the reservation, and with it
     // releases the slot, so a tick that does not launch never holds one.
     let context = crate::runtime_preference::DispatchContext {
-        complexity: None,
         intent: crate::runtime_preference::Intent::Dispatch,
         // #11453: a role tick consults the per-workspace launch-failure hold,
         // so a tap that keeps failing deterministically falls through

@@ -2,13 +2,12 @@
 use super::*;
 
 /// A resolved value is a literal launch argument (the historical low-level
-/// registry API). Requests still need policy resolution; autonomous callers
-/// with a cached issue body can supply complexity without another forge read.
+/// registry API). Requests still need policy resolution.
 #[derive(Clone, Copy)]
 pub(crate) enum DispatchModel<'a> {
     Resolved(Option<&'a str>),
     Request(Option<&'a str>),
-    Autonomous { complexity: Option<&'a str> },
+    Autonomous,
 }
 
 impl DispatchModel<'_> {
@@ -62,22 +61,9 @@ impl DispatchModel<'_> {
         // actually launched.
         let policy = admitted
             .map_or_else(|| DefaultModelPolicy::resolve(root), DefaultModelPolicy::for_runtime);
-        let gh_default = std::path::PathBuf::from(crate::gh_invocation::gh_bin());
         let resolved = match (self, kind) {
-            (Self::Request(None) | Self::Autonomous { .. }, SweepKind::Issue(issue)) => {
-                resolve_autonomous_model_for_runtime(
-                    root,
-                    *issue,
-                    || match self {
-                        Self::Autonomous { complexity } => complexity.map(str::to_owned),
-                        _ => fetch_issue_complexity(
-                            config.gh_bin.as_deref().unwrap_or(gh_default.as_path()),
-                            root,
-                            *issue,
-                        ),
-                    },
-                    policy,
-                )
+            (Self::Request(None) | Self::Autonomous, SweepKind::Issue(issue)) => {
+                resolve_autonomous_model_for_runtime(root, *issue, policy)
             }
             _ => {
                 let explicit = match self {

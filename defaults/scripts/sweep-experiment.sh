@@ -25,9 +25,9 @@
 #
 # Usage:
 #   sweep-experiment.sh resolve-mode
-#   sweep-experiment.sh assign-arm --issue N [--complexity complex|routine] [--format json] [--config PATH] [--resolve]
-#   sweep-experiment.sh banner --issue N [--complexity ...] [--config PATH]
-#   sweep-experiment.sh record --issue N --phase P --role R [--model M --arm A ...]
+#   sweep-experiment.sh assign-arm --issue N [--format json] [--config PATH] [--resolve]
+#   sweep-experiment.sh banner --issue N [--config PATH]
+#   sweep-experiment.sh record --issue N --phase P --role R [--model M --arm A --story-points N ...]
 #   sweep-experiment.sh harvest [--archive-dir DIR] [--format text|json]
 #
 # The harvest subcommand is ALSO reachable via `agent-metrics.sh --model-experiment`

@@ -876,25 +876,6 @@ pub struct SweepOutcomeRecord {
     /// and same omission contract as `runtime`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
-    /// The Curator's `<!-- loom:complexity=<tier> -->` marker for this sweep's
-    /// issue (Issue #8542) — `"mechanical"`, `"routine"`, or `"complex"`.
-    ///
-    /// Read from the same forge marker
-    /// [`crate::script_helpers::sweep_experiment::extract_complexity_marker`]
-    /// parses, via one more best-effort REST read of the sweep's own
-    /// issue body at the SAME terminal transition that reads the PR label
-    /// timeline for [`doctor_cycles`](Self::doctor_cycles) — see
-    /// `sweep_registry::outcome_journal::complexity_signal` for the fetch and
-    /// its fail-open contract (breaker-gated, `skip_label_flip`-gated, never
-    /// blocks or fails the journal append).
-    ///
-    /// Omitted — never a fabricated `"routine"` — when the issue carried no
-    /// recognized marker, the fetch failed/timed out, or `skip_label_flip` is
-    /// set. This field must stay honest about "unobserved": a
-    /// classifier's evaluation needs the true absence rate, not a default
-    /// masquerading as data.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub complexity: Option<String>,
     /// The Curator's story-point size estimate for this sweep's issue (Issue
     /// #9432, epic #9429) — the numeric value of its single `points:*` label,
     /// one of `1`/`2`/`3`/`5`/`8`/`13`.
@@ -908,7 +889,7 @@ pub struct SweepOutcomeRecord {
     /// Resolved by [`crate::story_points::resolve_story_points`] from the label
     /// list the terminal transition's `fetch_issue_signals` read already
     /// carries — **no** extra forge round trip, the same single REST call that
-    /// sources [`complexity`](Self::complexity) and the disposition end state.
+    /// sources the disposition end state.
     ///
     /// **Absent, never zero.** The key is omitted when the issue carries no
     /// `points:*` label (a pre-epic or operator-filed issue), when its single

@@ -308,7 +308,7 @@ async fn handle_event(
 /// - **this live event-bus path** (`terminal_records`, below): fires
 ///   synchronously off `Event::SweepExited`/`SweepCrashed`, with no
 ///   `pr_number`, empty `phase_durations`, and no `config`/`failure_class`/
-///   `judge_verdicts`/`doctor_cycles`/`complexity`;
+///   `judge_verdicts`/`doctor_cycles`;
 /// - **the reaper's outcome journal**
 ///   (`sweep_registry::outcome_journal::append_outcome_telemetry_journal`),
 ///   drained on a periodic cadence by `super::backfill` — the RICH record,
@@ -344,7 +344,7 @@ async fn handle_event(
 ///
 /// Enriching this live path to carry the same fields would duplicate the
 /// journal's own logic (a second source of truth for `config`/
-/// `judge_verdicts`/`complexity`/…) for the larger of the two diffs. This
+/// `judge_verdicts`/…) for the larger of the two diffs. This
 /// path already KNOWS, from its own correlation state, whether the journal
 /// will emit under the same id — that is exactly what a tracked
 /// [`DispatchState`] (dispatched here, or adopted via registry evidence, see
@@ -817,8 +817,7 @@ fn terminal_records(
             runtime: None,
             provider: None,
             profile: None,
-            complexity: None,
-            // Issue #9432: like `complexity`, the story-point size is a forge
+            // Issue #9432: the story-point size is a forge
             // read this pure, reactor-thread mapping never makes. Absent, never
             // `0` — the reaper-side journal path (`outcome_journal`) resolves it
             // from the label list its own single REST read already carries, and

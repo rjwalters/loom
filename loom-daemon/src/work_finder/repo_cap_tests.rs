@@ -58,7 +58,7 @@ impl WorkDispatcher for CapDispatcher {
     fn occupancy(&self) -> usize {
         self.live + self.dispatched.len()
     }
-    fn dispatch(&mut self, issue: u32, _complexity: Option<&str>) -> Result<bool> {
+    fn dispatch(&mut self, issue: u32) -> Result<bool> {
         if self.pr_open.contains(&issue) {
             return Err(OpenPrDispatchError { issue, pr: 4242 }.into());
         }

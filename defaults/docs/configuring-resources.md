@@ -274,8 +274,7 @@ backlog through it, unnoticed, because falling through is what the resolver is
     "preference": ["claude", "codex", {"runtime": "opencode", "modelProfile": "zai-metered"}],
     "backstopCeiling": {
       "maxConcurrent": 2,          // most concurrent metered dispatches this HOST may hold
-      "appliesFrom": 2,            // first tier the ceiling governs (default 1)
-      "minComplexity": "complex"   // work below this stratum never reaches a governed tap
+      "appliesFrom": 2             // first tier the ceiling governs (default 1)
     }
   }
 }

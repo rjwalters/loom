@@ -164,7 +164,7 @@ fn the_work_finder_records_its_origin() {
     let (registry, _rec) = fixture_registry(dir.path());
     let registry = Arc::new(Mutex::new(registry));
     let mut dispatcher = crate::work_finder::RegistryDispatcher::new(registry.clone());
-    assert!(dispatcher.dispatch(1_144_430, None).unwrap());
+    assert!(dispatcher.dispatch(1_144_430).unwrap());
 
     let registry = registry.lock().unwrap();
     assert_eq!(recorded_for_issue(&registry, 1_144_430).0.as_deref(), Some("work_finder"));

@@ -38,7 +38,7 @@ impl WorkDispatcher for Disp {
     fn occupancy(&self) -> usize {
         self.dispatched.len()
     }
-    fn dispatch(&mut self, issue: u32, _complexity: Option<&str>) -> anyhow::Result<bool> {
+    fn dispatch(&mut self, issue: u32) -> anyhow::Result<bool> {
         self.dispatched.push(issue);
         Ok(true)
     }

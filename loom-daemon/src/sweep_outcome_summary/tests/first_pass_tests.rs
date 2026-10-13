@@ -1,14 +1,8 @@
-//! Issue #8542: `--group-by complexity` / `--group-by model-complexity`, and
-//! the first-pass Judge approval rate every grouping now carries. Extracted
+//! Issue #8542: the first-pass Judge approval rate every grouping carries. Extracted
 //! to a sibling of `tests.rs` to keep it under the file-size ratchet
 //! threshold (`scripts/check-file-size-budget.sh`, #7711).
 
 use super::*;
-
-fn with_complexity(mut r: SweepOutcomeRecord, tier: &str) -> SweepOutcomeRecord {
-    r.complexity = Some(tier.to_string());
-    r
-}
 
 fn with_judge_verdict(mut r: SweepOutcomeRecord, verdict: &str) -> SweepOutcomeRecord {
     r.judge_verdicts = Some(vec![crate::telemetry::JudgeVerdict {
@@ -16,74 +10,6 @@ fn with_judge_verdict(mut r: SweepOutcomeRecord, verdict: &str) -> SweepOutcomeR
         verdict: verdict.to_string(),
     }]);
     r
-}
-
-/// AC: `--group-by complexity` buckets by the Curator's tier, and a record
-/// with no observed marker lands in `unknown` rather than being dropped.
-#[test]
-fn group_by_complexity_buckets_by_the_curator_tier() {
-    let records = vec![
-        entry(
-            with_complexity(record("a", "o/r", None, SweepResult::Success, 100), "mechanical"),
-            day(10),
-            "h1",
-        ),
-        entry(
-            with_complexity(record("b", "o/r", None, SweepResult::Success, 200), "routine"),
-            day(10),
-            "h1",
-        ),
-        entry(record("c", "o/r", None, SweepResult::Success, 300), day(10), "h1"),
-    ];
-    let report = summarize(
-        &records,
-        &SpawnDeathIndex::default(),
-        opts(GroupBy::Complexity),
-        &mut NoneMerged,
-        vec!["/ws".into()],
-    );
-    assert_eq!(report.records_grouped, 3);
-    let groups: std::collections::BTreeSet<&str> =
-        report.rows.iter().map(|r| r.group.as_str()).collect();
-    assert!(groups.contains("mechanical"));
-    assert!(groups.contains("routine"));
-    assert!(groups.contains(UNKNOWN_GROUP));
-    assert!(report
-        .notes
-        .iter()
-        .any(|n| n.contains("no Curator complexity marker")));
-}
-
-/// AC: `--group-by model-complexity` forms the compound `<model>/<tier>` key,
-/// with each side folding exactly as its own single-dimension grouping does.
-#[test]
-fn group_by_model_complexity_forms_the_compound_key() {
-    let records = vec![
-        entry(
-            with_complexity(
-                record("a", "o/r", Some("sonnet"), SweepResult::Success, 100),
-                "routine",
-            ),
-            day(10),
-            "h1",
-        ),
-        entry(
-            with_complexity(record("b", "o/r", None, SweepResult::Success, 200), "routine"),
-            day(10),
-            "h1",
-        ),
-    ];
-    let report = summarize(
-        &records,
-        &SpawnDeathIndex::default(),
-        opts(GroupBy::ModelComplexity),
-        &mut NoneMerged,
-        vec!["/ws".into()],
-    );
-    let groups: std::collections::BTreeSet<&str> =
-        report.rows.iter().map(|r| r.group.as_str()).collect();
-    assert!(groups.contains("sonnet/routine"));
-    assert!(groups.contains("default/routine"));
 }
 
 /// AC: first-pass approval rate is `judge_verdicts[0].verdict == "pass"` over

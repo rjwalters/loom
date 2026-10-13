@@ -260,9 +260,8 @@ impl GhWorkSource {
             .into_iter()
             .filter(|r| !r.is_pull_request)
             // The REST listing already returns `body` (#4827) — carrying it
-            // onto the item costs no extra request and lets dispatch read
-            // the `<!-- loom:complexity=... -->` stratum without a
-            // per-issue `gh issue view`.
+            // onto the item costs no extra request and lets the re-check
+            // interval marker be read without a per-issue `gh issue view`.
             .map(|r| {
                 WorkItem::with_created_at(r.number, r.labels, r.created_at)
                     .with_body(r.body)
@@ -599,8 +598,8 @@ impl WorkDispatcher for RegistryDispatcher {
         crate::capability::held_capabilities()
     }
 
-    fn dispatch(&mut self, issue: u32, complexity: Option<&str>) -> Result<bool> {
-        self.dispatch_with(issue, complexity, false)
+    fn dispatch(&mut self, issue: u32) -> Result<bool> {
+        self.dispatch_with(issue, false)
     }
 
     /// One read of this workspace's ETag-cached open-PR listing, classified
@@ -646,15 +645,9 @@ impl WorkDispatcher for RegistryDispatcher {
         super::main_red_fix::escalate_global(&root, red, &waiting);
     }
 
-    fn dispatch_with(
-        &mut self,
-        issue: u32,
-        complexity: Option<&str>,
-        overflow: bool,
-    ) -> Result<bool> {
+    fn dispatch_with(&mut self, issue: u32, overflow: bool) -> Result<bool> {
         log::info!("work_finder: attempting issue #{issue}");
-        // Keep the cached complexity stratum, but resolve its model only after
-        // runtime admission. A Claude default must not become a native pin.
+        // Resolve the model only after runtime admission. A Claude default must not become a native pin.
         // Idempotency key + the registry's claim lock make a re-dispatch of
         // an already-running issue a no-op (`was_new = false`) or a loud
         // lock-collision error.
@@ -668,7 +661,7 @@ impl WorkDispatcher for RegistryDispatcher {
             &self.registry,
             &SweepKind::Issue(issue),
             Some(key),
-            crate::sweep_registry::DispatchModel::Autonomous { complexity },
+            crate::sweep_registry::DispatchModel::Autonomous,
             None,
             None,
             crate::sweep_registry::DispatchOrigin::WorkFinder,
