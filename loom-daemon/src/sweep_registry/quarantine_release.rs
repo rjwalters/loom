@@ -24,8 +24,28 @@ impl SweepRegistry {
     /// quarantine's TTL release re-armed `loom:issue` beside that veto, and the
     /// item was re-dispatched 31 times in 72 h. One REST read, fail-open (a
     /// failed read sees no labels and the release proceeds as before).
+    ///
+    /// #11517: nor onto a CLOSED issue, nor onto one that is claimed right now
+    /// (`loom:building`): loom-ui#2980 gained `loom:issue` 40 s after a fresh
+    /// claim, beside the live `loom:building`, from this release.
     pub(crate) fn quarantine_release_restores_ready(&self, issue: u32) -> bool {
-        let labels = self.release_issue_signals(issue).labels;
+        let signals = self.release_issue_signals(issue);
+        let labels = signals.labels;
+        let claimed = labels
+            .iter()
+            .any(|l| l == crate::work_finder::BUILDING_LABEL);
+        if signals.closed == Some(true) || claimed {
+            log::info!(
+                "sweep_registry: quarantine release for #{issue}: the issue is {} — removing \
+                 the quarantine's `loom:blocked` only, NOT re-adding `loom:issue` (#11517)",
+                if claimed {
+                    "claimed (`loom:building`)"
+                } else {
+                    "closed"
+                }
+            );
+            return false;
+        }
         let Some(veto) = crate::work_finder::restore_veto(&labels, &["loom:blocked"]) else {
             return true;
         };

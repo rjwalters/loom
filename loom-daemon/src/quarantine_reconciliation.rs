@@ -317,7 +317,7 @@ pub mod forge {
     fn release(gh_bin: &Path, root: &Path, issue: u32) -> Result<()> {
         let n = issue.to_string();
         // #11480: never hand the item back to the queue past another hold.
-        let veto = crate::release_veto::veto(gh_bin, root, issue, &["loom:blocked"]);
+        let veto = crate::release_veto::quarantine_veto(gh_bin, root, issue);
         let add: &[&str] = if let Some(label) = &veto {
             log::info!(
                 "quarantine_reconciliation: #{issue} carries `{label}` — removing the \
