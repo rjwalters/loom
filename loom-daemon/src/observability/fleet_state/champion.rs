@@ -24,11 +24,13 @@ fn champion_with_ticks(
             let tick = ticks
                 .iter()
                 .find(|t| t.root == *root && t.role == "champion");
+            // The exporter only READS the contract (#11674): `None` = no entry.
+            let policy = crate::merge_policy::declared(root, slug);
             Some((
                 slug.clone(),
                 crate::telemetry::kinds::fleet_state::ChampionState {
-                    approval: None,
-                    merge: None,
+                    approval: policy.approval.map(|a| a.as_str().to_string()),
+                    merge: policy.merge.map(|a| a.as_str().to_string()),
                     prompt_source: spec.prompt.to_string(),
                     prompt_hash: prompt_hash(root),
                     interval_enabled: role_runner::resolve_enabled(&config)
@@ -122,6 +124,26 @@ mod tests {
         assert_eq!(state["acme/second"].last_attempt_ok, None);
         assert_eq!(state["acme/first"].approval, None);
         assert_eq!(state["acme/second"].merge, None);
+    }
+    #[test]
+    fn declared_policy_populates_and_absent_stays_unknown() {
+        let declared = tempfile::tempdir().expect("declared");
+        let bare = tempfile::tempdir().expect("bare");
+        std::fs::create_dir_all(declared.path().join(".loom")).expect("dir");
+        std::fs::write(
+            declared.path().join(".loom/config.json"),
+            r#"{"repos":[{"repo":"acme/declared","policy":{"approval":"human","merge":"auto"}}]}"#,
+        )
+        .expect("config");
+        let roots = vec![
+            (declared.path().to_path_buf(), "acme/declared".into()),
+            (bare.path().to_path_buf(), "acme/bare".into()),
+        ];
+        let state = champion_with_ticks(&roots, &[]);
+        assert_eq!(state["acme/declared"].approval.as_deref(), Some("human"));
+        assert_eq!(state["acme/declared"].merge.as_deref(), Some("auto"));
+        assert_eq!(state["acme/bare"].approval, None);
+        assert_eq!(state["acme/bare"].merge, None);
     }
     #[test]
     fn effective_config_selects_champion_and_cadence() {

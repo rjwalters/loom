@@ -78,7 +78,7 @@ fn test_invoke_refuses_a_provable_model_runtime_mismatch_before_spawning() {
         r#","autonomous":{"roleRunner":{"roleModels":{"judge":"sonnet"}}}"#,
     );
 
-    let before = model_runtime_mismatch_skip_count();
+    let before = MODEL_RUNTIME_MISMATCH_SKIP_COUNT.on_this_thread();
     let mut runner =
         ScriptRoleInvocationRunner::new(root.to_path_buf()).with_timeout(Duration::from_secs(5));
     let outcome = runner.invoke("judge", "/loom:judge");
@@ -94,7 +94,7 @@ fn test_invoke_refuses_a_provable_model_runtime_mismatch_before_spawning() {
         "the refusal must name the tier that stated the wrong intent"
     );
     assert!(!marker.exists(), "a doomed launch must never actually spawn the adapter");
-    assert_eq!(model_runtime_mismatch_skip_count(), before + 1);
+    assert_eq!(MODEL_RUNTIME_MISMATCH_SKIP_COUNT.on_this_thread(), before + 1);
 }
 
 /// Issue #7894 (the bug #6565 hit in production): `runtimes.roles.judge =
@@ -113,7 +113,7 @@ fn test_invoke_admits_an_unpinned_codex_role_with_no_model_pin() {
     let root = dir.path();
     let marker = setup_codex_judge_fixture(root, "");
 
-    let before = model_runtime_mismatch_skip_count();
+    let before = MODEL_RUNTIME_MISMATCH_SKIP_COUNT.on_this_thread();
     let ws = crate::write_scope_test_support::WritableRoot::register(std::path::Path::new(&root));
     let mut runner = ScriptRoleInvocationRunner::new(root.to_path_buf())
         .with_gh_bin(ws.gh.clone())
@@ -126,7 +126,7 @@ fn test_invoke_admits_an_unpinned_codex_role_with_no_model_pin() {
         "an unpinned codex role must not skip (#7894)"
     );
     assert_eq!(
-        model_runtime_mismatch_skip_count(),
+        MODEL_RUNTIME_MISMATCH_SKIP_COUNT.on_this_thread(),
         before,
         "the unpinned case must not count as a mismatch skip at all"
     );

@@ -61,6 +61,8 @@ pub const CLASSIFICATION: &[(&str, KeyClass)] = &[
     ("observability", KeyClass::Fleet),
     ("offlineMode", KeyClass::Fleet),
     ("reflection", KeyClass::Repo),
+    // Per-repo approval/merge policy contract (#11674, `merge_policy.rs`).
+    ("repos", KeyClass::Fleet),
     ("runtimes", KeyClass::Fleet),
     ("safehouse", KeyClass::Fleet),
     ("sweep", KeyClass::Fleet),

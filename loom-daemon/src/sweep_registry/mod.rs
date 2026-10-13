@@ -152,6 +152,7 @@ mod start_facts;
 #[allow(unused_imports)]
 pub(crate) mod test_support;
 mod watchdog;
+mod work_started;
 
 // Re-exported at the same effective visibility each item already declares
 // (most are `pub(crate)`, a handful are genuinely `pub`), so every existing
