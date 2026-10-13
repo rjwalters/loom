@@ -18,6 +18,14 @@
 //! queue offer and the cursor save (the same posture as every other
 //! backfill); every CI record carries stable GitHub/trace identities, so a
 //! re-offered record is recognisable downstream.
+//!
+//! **Bounded admission (#11115).** Records are offered through
+//! [`QueueSink::offer_backfill`], which never evicts: when any exporter queue
+//! is at its backfill limit the pass stops at that line and leaves it (and
+//! everything after it) behind the cursor for the next pass. A fan-out offer
+//! accepted by one exporter but deferred by another is re-offered later, so
+//! the already-accepting exporter sees a duplicate (at-least-once), never a
+//! silent omission.
 
 use std::fs::File;
 use std::io;
@@ -30,7 +38,7 @@ use super::ledger::{complete_len, scan_lines};
 use super::rotation::{self, RotationPolicy};
 use super::state::CycleLock;
 use super::{journal_path, read_config, state_dir};
-use crate::observability::queue::QueueSink;
+use crate::observability::queue::{Admission, QueueSink};
 use crate::telemetry::TelemetryEnvelope;
 
 /// Persisted progress through the journal.
@@ -55,20 +63,56 @@ pub fn load_cursor(root: &Path) -> ExportCursor {
         .unwrap_or_default()
 }
 
-fn save_cursor(root: &Path, cursor: &ExportCursor) {
+/// One step of the durable cursor save, in the order they run. Exposed so
+/// tests can inject a failure at exactly one boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SaveStep {
+    CreateDir,
+    WriteTemp,
+    SyncFile,
+    Rename,
+    SyncDir,
+}
+
+/// Durably persist `cursor`: write a temporary file, fsync it, atomically
+/// rename it over the cursor, then fsync the parent directory. Every failure
+/// is returned; on error the previous cursor file (if any) is untouched and a
+/// leftover temporary is removed.
+fn save_cursor(root: &Path, cursor: &ExportCursor) -> io::Result<()> {
+    save_cursor_with(root, cursor, &|_| Ok(()))
+}
+
+/// [`save_cursor`] with a per-step fault hook (`fail(step)` returning `Err`
+/// aborts at that step, before the real operation runs).
+pub(crate) fn save_cursor_with(
+    root: &Path,
+    cursor: &ExportCursor,
+    fail: &dyn Fn(SaveStep) -> io::Result<()>,
+) -> io::Result<()> {
+    use std::io::Write;
+
     let path = cursor_path(root);
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let Ok(text) = serde_json::to_string(cursor) else {
-        return;
-    };
+    let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+    fail(SaveStep::CreateDir)?;
+    std::fs::create_dir_all(&dir)?;
+    let text = serde_json::to_string(cursor).map_err(io::Error::other)?;
     let temporary = path.with_extension(format!("json.tmp-{}", std::process::id()));
-    if std::fs::write(&temporary, text).is_ok() {
-        if let Err(error) = std::fs::rename(&temporary, &path) {
-            log::warn!("ci_telemetry: could not persist export cursor: {error}");
-        }
+    let staged = (|| {
+        fail(SaveStep::WriteTemp)?;
+        let mut file = File::create(&temporary)?;
+        file.write_all(text.as_bytes())?;
+        fail(SaveStep::SyncFile)?;
+        file.sync_all()?;
+        drop(file);
+        fail(SaveStep::Rename)?;
+        std::fs::rename(&temporary, &path)
+    })();
+    if let Err(error) = staged {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
     }
+    fail(SaveStep::SyncDir)?;
+    File::open(&dir)?.sync_all()
 }
 
 /// Where an export pass starts: the cursor, or `0` when the journal's
@@ -159,11 +203,24 @@ fn export_locked(root: &Path, path: &Path, queue: &dyn QueueSink) -> (usize, Exp
         }
         match serde_json::from_str::<TelemetryEnvelope>(text) {
             Ok(envelope) => {
-                if let Err(error) = queue.offer_durable(envelope) {
-                    log::warn!("ci_telemetry: export queue refused a record, will retry: {error}");
-                    return false;
+                match queue.offer_backfill(envelope) {
+                    Ok(Admission::Admitted) => offered += 1,
+                    Ok(Admission::Deferred) => {
+                        // #11115: stop at the first unadmitted record; it
+                        // stays behind the cursor and no work is spent on
+                        // the rest of the journal this pass.
+                        log::debug!(
+                            "ci_telemetry: export deferred — exporter queue at its backfill limit"
+                        );
+                        return false;
+                    }
+                    Err(error) => {
+                        log::warn!(
+                            "ci_telemetry: export queue refused a record, will retry: {error}"
+                        );
+                        return false;
+                    }
                 }
-                offered += 1;
             }
             Err(error) => log::warn!("ci_telemetry: skipping unparseable journal line: {error}"),
         }
@@ -177,9 +234,17 @@ fn export_locked(root: &Path, path: &Path, queue: &dyn QueueSink) -> (usize, Exp
         }
     };
     if offset != cursor.byte_offset {
-        cursor.byte_offset = offset;
-        cursor.exported += offered as u64;
-        save_cursor(root, &cursor);
+        let advanced = ExportCursor {
+            byte_offset: offset,
+            exported: cursor.exported + offered as u64,
+        };
+        if let Err(error) = save_cursor(root, &advanced) {
+            // Not durable: keep the old cursor (so nothing rotates on it) and
+            // re-offer next pass (at-least-once).
+            log::warn!("ci_telemetry: could not persist export cursor, will retry: {error}");
+            return (offered, cursor);
+        }
+        cursor = advanced;
     }
     (offered, cursor)
 }
@@ -194,6 +259,17 @@ pub fn rotate_if_due(
     cursor: &mut ExportCursor,
     policy: RotationPolicy,
 ) -> io::Result<bool> {
+    rotate_if_due_with(root, path, cursor, policy, &|_| Ok(()))
+}
+
+/// [`rotate_if_due`] with a fault hook for the pre-rotation cursor save.
+pub(crate) fn rotate_if_due_with(
+    root: &Path,
+    path: &Path,
+    cursor: &mut ExportCursor,
+    policy: RotationPolicy,
+    save_hook: &dyn Fn(SaveStep) -> io::Result<()>,
+) -> io::Result<bool> {
     if cursor.byte_offset < policy.threshold_bytes {
         return Ok(false);
     }
@@ -203,6 +279,16 @@ pub fn rotate_if_due(
         // remain; a later pass rotates once they are gone.
         return Ok(false);
     }
+    // Durably reset the cursor to 0 BEFORE the journal is renamed/deleted, so
+    // a crash anywhere afterwards can never leave the old offset trusted for a
+    // new generation. A crash before the rotation merely replays the old,
+    // already-offered generation (at-least-once). If the reset cannot be made
+    // durable, do not rotate.
+    let reset = ExportCursor {
+        byte_offset: 0,
+        exported: cursor.exported,
+    };
+    save_cursor_with(root, &reset, save_hook)?;
     rotation::rotate(path, policy.keep)?;
     log::info!(
         "ci_telemetry: rotated the {len}-byte journal (threshold {} bytes, keeping {} rotation(s))",
@@ -210,6 +296,5 @@ pub fn rotate_if_due(
         policy.keep
     );
     cursor.byte_offset = 0;
-    save_cursor(root, cursor);
     Ok(true)
 }

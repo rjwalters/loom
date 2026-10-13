@@ -276,40 +276,6 @@ const IMPLAUSIBLY_FAST_TICK: Duration = Duration::from_secs(10);
 /// not a config knob — the interval cadence is the tunable backstop.
 const IDLE_TRIGGER_DEBOUNCE: Duration = Duration::from_secs(60);
 
-/// Process-wide count of ticks skipped with [`RoleTickOutcome::NoTokenPool`]
-/// (#4642) — a distinct, independently-attributable tally, deliberately never
-/// folded into the generic [`RoleTickOutcome::Failure`] count a real
-/// invocation failure increments (mirrors the named per-reason skip counters
-/// in `sweep_registry.rs`, e.g. `OpenPrDispatchError`/`DispatchBackoffError`).
-static NO_TOKEN_POOL_SKIP_COUNT: AtomicU64 = AtomicU64::new(0);
-
-/// Total number of role-runner ticks skipped so far for having no available
-/// token pool (see [`RoleTickOutcome::NoTokenPool`]). Exposed for tests and
-/// future status surfacing; the daemon does not reset this across its
-/// lifetime.
-#[must_use]
-pub fn no_token_pool_skip_count() -> u64 {
-    NO_TOKEN_POOL_SKIP_COUNT.load(Ordering::Relaxed)
-}
-
-/// Process-wide count of ticks skipped with
-/// [`RoleTickOutcome::PoolExhausted`] (issue #7607) — a distinct,
-/// independently-attributable tally, deliberately never folded into the
-/// generic [`RoleTickOutcome::Failure`] count a real invocation failure
-/// increments, exactly like [`NO_TOKEN_POOL_SKIP_COUNT`]: a pool present but
-/// fully exhausted (every account bad-marked or `.ranking`-hard-excluded) is
-/// self-healing, not a code/config defect.
-static POOL_EXHAUSTED_SKIP_COUNT: AtomicU64 = AtomicU64::new(0);
-
-/// Total number of role-runner ticks skipped so far because the resolved
-/// token pool was present but had zero spawnable accounts (see
-/// [`RoleTickOutcome::PoolExhausted`]). Exposed for tests and future status
-/// surfacing; the daemon does not reset this across its lifetime.
-#[must_use]
-pub fn pool_exhausted_skip_count() -> u64 {
-    POOL_EXHAUSTED_SKIP_COUNT.load(Ordering::Relaxed)
-}
-
 /// Sink for the fleet-wide empty-pool advisory feed (issue #7607): the role
 /// runner calls this once per [`RoleTickOutcome::PoolExhausted`] tick so a
 /// pool discovered exhausted by a *role* trips the same #6614 cross-source
@@ -343,41 +309,6 @@ impl PoolExhaustedObserver for crate::workspace_pool::WorkspacePool {
                 .record_role_tick_pool_exhausted(role);
         }
     }
-}
-
-/// Process-wide count of ticks skipped with
-/// [`RoleTickOutcome::ModelRuntimeMismatch`] (#5028, follow-up to #5001 AC2/
-/// AC3) — a distinct, independently-attributable tally, deliberately never
-/// folded into the generic [`RoleTickOutcome::Failure`] count a real
-/// invocation failure increments, exactly like [`NO_TOKEN_POOL_SKIP_COUNT`]:
-/// this is a permanent config conflict, not a transient failure worth
-/// retrying identically forever.
-static MODEL_RUNTIME_MISMATCH_SKIP_COUNT: AtomicU64 = AtomicU64::new(0);
-
-/// Total number of role-runner ticks skipped so far for a provable
-/// model/runtime mismatch (see [`RoleTickOutcome::ModelRuntimeMismatch`]).
-/// Exposed for tests and future status surfacing; the daemon does not reset
-/// this across its lifetime.
-#[must_use]
-pub fn model_runtime_mismatch_skip_count() -> u64 {
-    MODEL_RUNTIME_MISMATCH_SKIP_COUNT.load(Ordering::Relaxed)
-}
-
-/// Process-wide count of ticks skipped with [`RoleTickOutcome::LoadSkipped`]
-/// (issue #6637) — a distinct, independently-attributable tally, deliberately
-/// never folded into the generic [`RoleTickOutcome::Failure`] count a real
-/// invocation failure increments, exactly like [`NO_TOKEN_POOL_SKIP_COUNT`]:
-/// the tick ceiling fired while the host was measurably saturated, which is
-/// evidence against (not for) the invocation itself being broken.
-static LOAD_SKIPPED_COUNT: AtomicU64 = AtomicU64::new(0);
-
-/// Total number of role-runner ticks skipped so far because the tick ceiling
-/// was reached under measured host saturation (see
-/// [`RoleTickOutcome::LoadSkipped`]). Exposed for tests and future status
-/// surfacing; the daemon does not reset this across its lifetime.
-#[must_use]
-pub fn load_skipped_count() -> u64 {
-    LOAD_SKIPPED_COUNT.load(Ordering::Relaxed)
 }
 
 /// One standalone support role this module knows how to dispatch: its name
@@ -528,32 +459,6 @@ pub const DEFAULT_ROLES: &[RoleSpec] = &[
         name: ARCHITECT_ROLE,
         prompt: "/loom:architect",
         default_interval_secs: 3600,
-        interval_default: false,
-    },
-    RoleSpec {
-        // The operator-agent persona (Issue #7947, Phase 3b of #4196).
-        //
-        // `interval_default: false` for a *stronger* reason than architect's.
-        // Architect is merely expensive to run everywhere; this role is an
-        // inbound control channel — it reads human prose out of a chat room and
-        // steers the daemon with it. A role like that must never arrive because
-        // a repo failed to pin `roles`, so it is excluded from the
-        // "unset `roles` ⇒ all defaults" fallback like architect, AND gated a
-        // second time on its own config resolving (see `role_is_config_gated`):
-        // naming it in `roles` is not enough, `safehouse.concierge` must also
-        // name at least one allowed sender. Two independent opt-ins, because
-        // one of them is a chat room.
-        //
-        // The 300s cadence is a *listening* cadence, not a work cadence: each
-        // tick is a short `concierge listen` window. Its cost bound is NOT
-        // carried in the prompt the way `architectMaxProposals` is — a daily
-        // turn budget spans sessions, so it lives in the ledger
-        // (`concierge::budget`) that `concierge budget --begin-turn` consults
-        // at the top of every session. See that module's doc for why a prompt
-        // cannot hold this particular number.
-        name: crate::concierge::CONCIERGE_ROLE,
-        prompt: "/loom:concierge",
-        default_interval_secs: 300,
         interval_default: false,
     },
 ];
@@ -1208,7 +1113,7 @@ fn terminate_timed_out(
     let tail = clean_and_cap_detail(&tail_of_file(log_path));
     match load_per_core {
         Some(lpc) if lpc.is_finite() && lpc >= ROLE_TIMEOUT_LOAD_SATURATION_THRESHOLD => {
-            LOAD_SKIPPED_COUNT.fetch_add(1, Ordering::Relaxed);
+            LOAD_SKIPPED_COUNT.record();
             RoleTickOutcome::LoadSkipped {
                 load_per_core: lpc,
                 detail: tail,
@@ -2201,34 +2106,6 @@ pub fn log_role_runner_disabled(repo_root: &Path, config: &RoleRunnerConfig) {
     log::info!("{}", disabled_role_runner_log_line(repo_root, config));
 }
 
-/// Whether `spec` is gated off for `root` by its **own** config block, beyond
-/// the role runner's own `enabled`/`roles` knobs — `Some(reason)` ⇒ do not
-/// tick (issue #7947).
-///
-/// Exactly one role has such a gate today: `concierge`, which requires
-/// `safehouse.concierge` to resolve (present, `enabled` not false, and at least
-/// one usable Matrix ID in `allowedSenders`). Naming it in
-/// `autonomous.roleRunner.roles` is deliberately **not** sufficient — an
-/// inbound control channel wired to a chat room should take two independent,
-/// explicit opt-ins, not one.
-///
-/// Written as a general predicate rather than an inline `if spec.name ==
-/// "concierge"` so that the next role with a config prerequisite has an obvious
-/// place to declare it, and so the "which roles are config-gated" question has
-/// one unit-testable answer.
-#[must_use]
-pub fn role_is_config_gated(spec: &RoleSpec, root: &Path) -> Option<&'static str> {
-    if spec.name == crate::concierge::CONCIERGE_ROLE
-        && crate::concierge::resolve_concierge_config(root).is_none()
-    {
-        return Some(
-            "safehouse.concierge does not resolve for this workspace (absent, disabled, or an \
-             empty allowedSenders); run `loom-daemon concierge check` there",
-        );
-    }
-    None
-}
-
 /// Resolve the **per-invocation architect proposal cap** (#5656) with
 /// precedence **env ([`ARCHITECT_MAX_PROPOSALS_ENV`]) > config
 /// (`autonomous.roleRunner.architectMaxProposals`, read from each root's own
@@ -3124,15 +3001,6 @@ fn decide_root_tick_detailed(
     // The root resolved enabled again — clear any stale disabled-warning so a
     // later disable re-warns (#4377).
     disabled_roots_warned.remove(root);
-    // Per-role config gate (#7947). A role whose own config block does not
-    // resolve never ticks, even when an explicit `roles` allowlist names it.
-    // Placed here — after the master switch, before sharding and the
-    // membership check — so a role that is structurally unable to do anything
-    // costs nothing further to decide about.
-    if let Some(reason) = role_is_config_gated(spec, root) {
-        log::debug!("role_runner: {} tick for {} skipped — {reason}", spec.name, root.display());
-        return concurrent_dispatch::RootTickDecision::Skip;
-    }
     // Host sharding (#6374): on a fleet, each workspace's role rotation must
     // run on exactly ONE host per interval — otherwise N dispatchers each
     // spawn the same role session over the same forge queue, which is both
@@ -4040,6 +3908,18 @@ use model_resolution::reconcile_unpinned_model_with_runtime;
 pub use model_resolution::{
     is_cli_default_model_sentinel, resolve_role_runner_effort, resolve_role_runner_model,
     ModelRuntimeMismatch, CLI_DEFAULT_MODEL_SENTINEL, UNSET_EFFORT_SOURCE,
+};
+
+// Per-reason skipped-tick tallies, with a race-free per-thread view for
+// tests (#9409) — see `role_runner/skip_counters.rs`.
+mod skip_counters;
+pub use skip_counters::{
+    load_skipped_count, model_runtime_mismatch_skip_count, no_token_pool_skip_count,
+    pool_exhausted_skip_count,
+};
+use skip_counters::{
+    LOAD_SKIPPED_COUNT, MODEL_RUNTIME_MISMATCH_SKIP_COUNT, NO_TOKEN_POOL_SKIP_COUNT,
+    POOL_EXHAUSTED_SKIP_COUNT,
 };
 
 #[cfg(test)]

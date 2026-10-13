@@ -169,9 +169,7 @@ fn work_finder_fallback_launch_uses_admitted_native_profile() {
     let (registry, record, _, _ws) = fixture(root, &config);
     // A one-slot backstop also catches accidentally admitting/reserving twice.
     let registry = Arc::new(Mutex::new(registry));
-    assert!(RegistryDispatcher::new(registry)
-        .dispatch(8715, Some("complex"))
-        .unwrap());
+    assert!(RegistryDispatcher::new(registry).dispatch(8715).unwrap());
     let options = captured_options(&record, "opencode");
     assert_native_profile(&options, &config);
     assert_eq!(options.model, None, "an implicit native model is left to its profile");
@@ -199,6 +197,7 @@ fn request_fallback_and_native_first_ignore_claude_experiment() {
                 DispatchModel::Request(None),
                 None,
                 None,
+                crate::sweep_registry::DispatchOrigin::Unknown,
             )
             .unwrap();
         let options = captured_options(&record, "opencode");
@@ -249,15 +248,13 @@ fn claude_launch_retains_cost_safe_defaults_aliases_and_experiment_body() {
         let expected = if experiment {
             std::env::set_var("LOOM_MODEL_EXPERIMENT", "experiment");
             std::env::set_var("LOOM_MODEL_EXPERIMENT_CANARY", "1");
-            let arm = crate::script_helpers::sweep_experiment::assign_arm(8715, Some("complex"));
+            let arm = crate::script_helpers::sweep_experiment::assign_arm(8715);
             crate::script_helpers::sweep_experiment::resolved_arm_model(arm, &config)
         } else {
             expected.into()
         };
         let registry = Arc::new(Mutex::new(registry));
-        assert!(RegistryDispatcher::new(registry)
-            .dispatch(8715, Some("complex"))
-            .unwrap());
+        assert!(RegistryDispatcher::new(registry).dispatch(8715).unwrap());
         assert_eq!(captured_options(&record, "claude").model.as_deref(), Some(expected.as_str()));
     }
 }
@@ -284,6 +281,7 @@ fn native_launch_keeps_config_and_explicit_pins_including_invalid_ones() {
                 DispatchModel::Request(explicit),
                 None,
                 None,
+                crate::sweep_registry::DispatchOrigin::Unknown,
             )
             .unwrap();
         let options = captured_options(&record, "opencode");
@@ -322,6 +320,7 @@ fn refused_preferences_and_explicit_runtime_never_claim_or_spawn() {
             DispatchModel::Request(None),
             None,
             None,
+            crate::sweep_registry::DispatchOrigin::Unknown,
         );
         // A pinned Claude runtime keeps the legacy static-admission behavior,
         // even with no pool; it must not silently fall through to OpenCode.
@@ -353,8 +352,7 @@ fn a_read_only_credential_refuses_the_dispatch() {
         Some(&root.join("fake-gh.sh")),
     );
     registry.config.gh_bin = Some(read_only.gh.clone());
-    let outcome =
-        RegistryDispatcher::new(Arc::new(Mutex::new(registry))).dispatch(8715, Some("complex"));
+    let outcome = RegistryDispatcher::new(Arc::new(Mutex::new(registry))).dispatch(8715);
     match outcome {
         Err(e) => assert!(format!("{e:#}").contains("#9548"), "{e:#}"),
         Ok(dispatched) => assert!(!dispatched, "a read-only root must not dispatch"),

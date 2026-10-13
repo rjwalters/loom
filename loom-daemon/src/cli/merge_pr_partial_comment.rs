@@ -48,9 +48,10 @@
 
 use anyhow::Result;
 use loom_daemon::merge_pr::partial_comment::{
-    now_timestamp, partial_merged_comment, premature_close_comment,
+    now_timestamp, partial_merged_comment, partial_merged_held_comment, premature_close_comment,
 };
-use std::io::Write;
+use loom_daemon::merge_pr::partial_reset::hold_from_json;
+use std::io::{Read, Write};
 
 /// Which of the pass's two comments to render.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -83,6 +84,12 @@ pub(crate) struct PartialCommentArgs {
     #[arg(long)]
     reopened: bool,
 
+    /// `partial-merged` only (#9264): the swap applied `loom:operator` for a
+    /// `loom:remainder-hold`. The reason is read from the issue JSON on stdin
+    /// (never argv); unreadable or absent stdin means "reason unstated".
+    #[arg(long)]
+    held: bool,
+
     /// Override the sign-off timestamp (`%Y-%m-%dT%H:%M:%SZ`). Defaults to
     /// now, which is what `merge-pr.sh` uses.
     #[arg(long)]
@@ -93,6 +100,12 @@ impl PartialCommentArgs {
     pub(crate) fn run(self) -> Result<()> {
         let timestamp = self.at.unwrap_or_else(now_timestamp);
         let body = match self.kind {
+            CommentKind::PartialMerged if self.held => {
+                let mut json = String::new();
+                let _ = std::io::stdin().read_to_string(&mut json);
+                let reason = hold_from_json(&json).unwrap_or_default();
+                partial_merged_held_comment(&self.pr, self.reopened, &reason, &timestamp)
+            }
             CommentKind::PartialMerged => {
                 partial_merged_comment(&self.pr, self.reopened, &timestamp)
             }

@@ -286,7 +286,8 @@ pub fn mark_bad_for_class(
     cooldown_secs: Option<u64>,
     model_class: Option<&str>,
 ) -> Result<BadMark, String> {
-    match write_mark(root, provider, name, reason, cooldown_secs, model_class, false)? {
+    let horizon = Horizon::Cooldown(cooldown_secs);
+    match write_mark(root, provider, name, reason, horizon, model_class, false)? {
         MarkWrite::Written(mark) | MarkWrite::AlreadyCovered(mark) => Ok(mark),
     }
 }
@@ -305,11 +306,14 @@ pub enum MarkWrite {
 /// launch-log ingest, #8699): it never shortens a horizon.
 ///
 /// Skips the write only when an active mark on the same account already
-/// covers the requested scope (account-wide, or the same class) with a reset
-/// at or after `now + cooldown_secs` (or no reset at all). A weaker existing
-/// mark — e.g. the proxy's 60s `rate-limited` from a bare 429 — is replaced by
-/// a stronger one (a 6h `exhausted`), and a weaker mark arriving after a
-/// stronger one never downgrades it. The check runs under the same lock as
+/// covers the requested scope (account-wide, or the same class) and either
+/// resets at or after `now + cooldown_secs` (or has no reset at all), or is a
+/// **duplicate** of the requested signal: written with a cooldown at least as
+/// long as `cooldown_secs`, and still holding at least three quarters of it
+/// (#9847, see `duplicate_covers`). A weaker existing mark — e.g. the
+/// proxy's 60s `rate-limited` from a bare 429 — is replaced by a stronger one
+/// (a 6h `exhausted`), and a weaker mark arriving after a stronger one never
+/// downgrades it. The check runs under the same lock as
 /// the write, so two concurrent launches cannot race past it.
 ///
 /// An operator's explicit `mark` keeps [`mark_bad_for_class`]'s plain
@@ -322,7 +326,56 @@ pub fn escalate_bad_for_class(
     cooldown_secs: Option<u64>,
     model_class: Option<&str>,
 ) -> Result<MarkWrite, String> {
-    write_mark(root, provider, name, reason, cooldown_secs, model_class, true)
+    let horizon = Horizon::Cooldown(cooldown_secs);
+    write_mark(root, provider, name, reason, horizon, model_class, true)
+}
+
+/// [`escalate_bad_for_class`] with an **absolute** reset instant (#11286).
+///
+/// For a caller that already resolved *when* the evidence it holds ends —
+/// the launch-log ingest anchors a relative horizon (configured window,
+/// default cooldown, provider `retry-after`) on the instant the evidence was
+/// first seen, so re-reading the same evidence later (the in-run watcher,
+/// then the exit-time pass) asks for the same deadline instead of pushing it
+/// out by however long the run took to exit. A deadline at or before `now`
+/// is refused: replaying lapsed evidence must not create a fresh hold.
+pub fn escalate_bad_until_for_class(
+    root: &Path,
+    provider: &str,
+    name: &str,
+    reason: &str,
+    resets_at: u64,
+    model_class: Option<&str>,
+) -> Result<MarkWrite, String> {
+    let horizon = Horizon::Until(resets_at);
+    write_mark(root, provider, name, reason, horizon, model_class, true)
+}
+
+/// How long a [`write_mark`] holds the seat.
+#[derive(Clone, Copy)]
+enum Horizon {
+    /// Seconds from the write's `now` (`None`: until an explicit unmark).
+    Cooldown(Option<u64>),
+    /// An absolute Unix-seconds reset instant.
+    Until(u64),
+}
+
+/// Whether an active mark resetting at `have` is a duplicate of a new
+/// automatic signal asking for `want_secs` at `now` (#9847).
+///
+/// Judging purely by horizon (`have >= now + want_secs`) made an equally
+/// strong mark "weaker than itself" as soon as one wall-clock second passed:
+/// the egress proxy marks at request time and the exit-code pass runs after
+/// the process exits, seconds to minutes later, so every exhausted launch was
+/// double-marked — the reason rewritten and the horizon slid. A mark written
+/// with at least the requested cooldown *strength* covers instead, provided it
+/// still holds at least three quarters of the requested cooldown. That bound
+/// keeps a fresh signal re-arming a same-strength mark that has mostly run
+/// out (an hours-old 6h `exhausted` mark must not let a just-re-exhausted
+/// account back into rotation minutes later).
+fn duplicate_covers(mark: &BadMark, have: u64, want_secs: u64, now: u64) -> bool {
+    let strength = have.saturating_sub(mark.marked_at);
+    strength >= want_secs && have >= now.saturating_add(want_secs - want_secs / 4)
 }
 
 fn write_mark(
@@ -330,13 +383,13 @@ fn write_mark(
     provider: &str,
     name: &str,
     reason: &str,
-    cooldown_secs: Option<u64>,
+    horizon: Horizon,
     model_class: Option<&str>,
     never_shorten: bool,
 ) -> Result<MarkWrite, String> {
     validate_provider(provider)?;
     validate_account(name)?;
-    if cooldown_secs == Some(0) {
+    if matches!(horizon, Horizon::Cooldown(Some(0))) {
         return Err(
             "cooldown_secs must be > 0 (use `api-keys unblock` to clear a mark immediately)"
                 .to_string(),
@@ -366,11 +419,19 @@ fn write_mark(
     let _lock = MkdirLock::acquire(&lock_path(root, provider))
         .map_err(|e| format!("cannot lock bad-marks file: {e}"))?;
     let now = epoch_now();
+    let wanted = match horizon {
+        Horizon::Cooldown(cooldown_secs) => cooldown_secs.map(|secs| now + secs),
+        Horizon::Until(at) if at > now => Some(at),
+        Horizon::Until(at) => {
+            return Err(format!(
+                "reset instant {at} is not after now ({now}); the evidence's hold has lapsed"
+            ));
+        }
+    };
     // `?`: refuse to rewrite an unusable file from an empty read, which would
     // permanently drop every other account's mark.
     let mut marks = read_marks(root, provider)?;
     if never_shorten {
-        let wanted = cooldown_secs.map(|secs| now + secs);
         let covering = marks
             .iter()
             .filter(|m| {
@@ -380,10 +441,12 @@ fn write_mark(
                     // same class covers (a class mark never covers an
                     // account-wide request).
                     && (m.model_class.is_none() || m.model_class == model_class)
-                    && match (m.resets_at, wanted) {
+                    && match (m.resets_at, wanted.map(|w| w - now)) {
                         (None, _) => true,
                         (Some(_), None) => false,
-                        (Some(have), Some(want)) => have >= want,
+                        (Some(have), Some(want)) => {
+                            have >= now.saturating_add(want) || duplicate_covers(m, have, want, now)
+                        }
                     }
             })
             .max_by_key(|m| m.resets_at.unwrap_or(u64::MAX));
@@ -398,7 +461,7 @@ fn write_mark(
         name: name.to_string(),
         reason: reason.replace(['\n', '\r'], " "),
         marked_at: now,
-        resets_at: cooldown_secs.map(|secs| now + secs),
+        resets_at: wanted,
         model_class,
     };
     marks.push(mark.clone());

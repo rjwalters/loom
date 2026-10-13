@@ -18,6 +18,7 @@ fn inputs(root: &Path) -> Inputs<'_> {
         build_time_repo: None,
         installed_bin: None,
         fetch_disabled: false,
+        min_version: None,
     }
 }
 
@@ -589,4 +590,90 @@ fn every_refusal_names_what_it_actually_tried() {
             "a bare generic reason tells an operator nothing: {why}"
         );
     }
+}
+
+// ---- walking back to the newest complete release (#11029) -------------
+
+fn listed(tag: &str, draft: bool, pre: bool) -> ListedRelease {
+    ListedRelease {
+        tag_name: tag.to_string(),
+        is_draft: draft,
+        is_prerelease: pre,
+    }
+}
+
+#[test]
+fn walk_candidates_sort_by_version_and_drop_drafts_prereleases_and_non_semver() {
+    let got = walk_candidates(vec![
+        listed("v0.19.9", false, false),
+        listed("v0.19.10", false, false),
+        listed("v0.19.11", true, false),
+        listed("v0.19.12", false, true),
+        listed("nightly", false, false),
+        listed("v0.20.0-rc1", false, false),
+    ]);
+    let tags: Vec<&str> = got.iter().map(|(t, _)| t.as_str()).collect();
+    // Numeric, not lexical: 10 sorts above 9.
+    assert_eq!(tags, ["v0.19.10", "v0.19.9"]);
+}
+
+#[test]
+fn latest_incomplete_rolls_to_the_older_complete_release() {
+    // Latest (v0.19.12) is hand-cut with no assets; v0.19.11 is complete and
+    // still at or above a floor of 0.19.10.
+    let cands = walk_candidates(vec![
+        listed("v0.19.12", false, false),
+        listed("v0.19.11", false, false),
+        listed("v0.19.9", false, false),
+    ]);
+    let mut asked = Vec::new();
+    let got = pick_complete(&cands, |tag| {
+        asked.push(tag.to_string());
+        tag != "v0.19.12"
+    });
+    assert_eq!(
+        got,
+        Some(Walk::Found {
+            tag: "v0.19.11".to_string(),
+            version: "0.19.11".to_string()
+        })
+    );
+    assert_eq!(asked, ["v0.19.12", "v0.19.11"], "stops at the first complete release");
+}
+
+#[test]
+fn a_newer_unpromoted_release_with_assets_beats_a_lower_latest() {
+    // Latest is v0.19.8, but v0.19.10 was never promoted and has assets.
+    let cands = walk_candidates(vec![
+        listed("v0.19.8", false, false),
+        listed("v0.19.10", false, false),
+    ]);
+    assert_eq!(
+        pick_complete(&cands, |_| true),
+        Some(Walk::Found {
+            tag: "v0.19.10".to_string(),
+            version: "0.19.10".to_string()
+        })
+    );
+}
+
+#[test]
+fn no_complete_release_names_the_newest_and_inspects_a_bounded_number() {
+    let many: Vec<ListedRelease> = (1..=20)
+        .map(|n| listed(&format!("v0.19.{n}"), false, false))
+        .collect();
+    let cands = walk_candidates(many);
+    let mut calls = 0;
+    let got = pick_complete(&cands, |_| {
+        calls += 1;
+        false
+    });
+    assert_eq!(
+        got,
+        Some(Walk::NoneComplete {
+            newest_tag: "v0.19.20".to_string()
+        })
+    );
+    assert_eq!(calls, WALK_MAX_RELEASES);
+    assert_eq!(pick_complete(&[], |_| true), None);
 }

@@ -1,6 +1,7 @@
 //! Per-issue claim-lock lifecycle (`.loom/locks/issue-<N>/owner.json`) and
 //! startup reconstruction of registry state from disk.
 
+use super::journal_shadow::LockNs;
 use super::*;
 
 /// Typed, matchable error returned by [`SweepRegistry::dispatch`] when the
@@ -186,8 +187,8 @@ pub(crate) struct LockOwner {
     /// default — which is a genuinely unknown level, never a fabricated one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) effort: Option<String>,
-    /// Whether this sweep took the host's single `loom:operator-priority`
-    /// overflow slot (#9244), stamped by [`SweepRegistry::mark_overflow`] the
+    /// Whether this sweep took the host's single overflow slot (#9244,
+    /// inert since #11508), stamped by [`SweepRegistry::mark_overflow`] the
     /// moment the work finder admits the over-limit dispatch (Issue #9314).
     ///
     /// Same schema-evolution contract and the same *reason* as
@@ -367,6 +368,7 @@ impl SweepRegistry {
                     serde_json::to_string_pretty(&owner).context("serialize lock owner")?;
                 std::fs::write(lock.join("owner.json"), owner_json)
                     .context("write lock owner.json")?;
+                self.shadow_owner_acquired(LockNs::Issue, issue, &owner, true);
                 Ok(())
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -422,6 +424,7 @@ impl SweepRegistry {
             .with_context(|| format!("read lock owner {}", owner_path.display()))?;
         let mut owner: LockOwner =
             serde_json::from_str(&existing).context("parse lock owner.json")?;
+        let before = serde_json::from_str(&existing).unwrap_or_default();
         owner.owner_pid = child_pid;
         if pgid.is_some() {
             owner.pgid = pgid;
@@ -435,6 +438,7 @@ impl SweepRegistry {
         let owner_json = serde_json::to_string_pretty(&owner).context("serialize lock owner")?;
         std::fs::write(&owner_path, owner_json)
             .with_context(|| format!("write lock owner {}", owner_path.display()))?;
+        self.shadow_owner_updated(LockNs::Issue, issue, &before, &owner);
         Ok(())
     }
 
@@ -459,10 +463,12 @@ impl SweepRegistry {
         if owner.overflow {
             return Ok(());
         }
+        let before = serde_json::from_str(&existing).unwrap_or_default();
         owner.overflow = true;
         let owner_json = serde_json::to_string_pretty(&owner).context("serialize lock owner")?;
         std::fs::write(&owner_path, owner_json)
             .with_context(|| format!("write lock owner {}", owner_path.display()))?;
+        self.shadow_owner_updated(LockNs::Issue, issue, &before, &owner);
         Ok(())
     }
 
@@ -509,6 +515,7 @@ impl SweepRegistry {
                     serde_json::to_string_pretty(&owner).context("serialize PR lock owner")?;
                 std::fs::write(lock.join("owner.json"), owner_json)
                     .context("write PR lock owner.json")?;
+                self.shadow_owner_acquired(LockNs::Pr, pr, &owner, true);
                 Ok(())
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(anyhow!(
@@ -535,6 +542,7 @@ impl SweepRegistry {
             .with_context(|| format!("read PR lock owner {}", owner_path.display()))?;
         let mut owner: LockOwner =
             serde_json::from_str(&existing).context("parse PR lock owner.json")?;
+        let before = serde_json::from_str(&existing).unwrap_or_default();
         owner.owner_pid = child_pid;
         if pgid.is_some() {
             owner.pgid = pgid;
@@ -542,6 +550,7 @@ impl SweepRegistry {
         let owner_json = serde_json::to_string_pretty(&owner).context("serialize PR lock owner")?;
         std::fs::write(&owner_path, owner_json)
             .with_context(|| format!("write PR lock owner {}", owner_path.display()))?;
+        self.shadow_owner_updated(LockNs::Pr, pr, &before, &owner);
         Ok(())
     }
 
@@ -586,8 +595,11 @@ impl SweepRegistry {
         if owned_by_other {
             return LockReleaseOutcome::Superseded;
         }
-        if let Err(e) = std::fs::remove_dir_all(&lock) {
-            log::warn!("release_pr_lock: failed to remove lock dir {}: {e}", lock.display());
+        match std::fs::remove_dir_all(&lock) {
+            Ok(()) => self.shadow_owner_released(LockNs::Pr, pr, Some(sweep_id)),
+            Err(e) => {
+                log::warn!("release_pr_lock: failed to remove lock dir {}: {e}", lock.display());
+            }
         }
         LockReleaseOutcome::Released
     }
@@ -604,6 +616,7 @@ impl SweepRegistry {
         if lock.exists() {
             std::fs::remove_dir_all(&lock)
                 .with_context(|| format!("failed to remove lock dir {}", lock.display()))?;
+            self.shadow_owner_released(LockNs::Issue, issue, None);
         }
         Ok(())
     }
@@ -651,8 +664,9 @@ impl SweepRegistry {
             );
             return LockReleaseOutcome::HolderAlive;
         }
-        if let Err(e) = std::fs::remove_dir_all(&lock) {
-            log::warn!("release_lock: failed to remove lock dir {}: {e}", lock.display());
+        match std::fs::remove_dir_all(&lock) {
+            Ok(()) => self.shadow_owner_released(LockNs::Issue, issue, Some(sweep_id)),
+            Err(e) => log::warn!("release_lock: failed to remove lock dir {}: {e}", lock.display()),
         }
         LockReleaseOutcome::Released
     }
@@ -791,7 +805,10 @@ impl SweepRegistry {
                 std::fs::write(lock.join("owner.json"), json).context("write lock owner.json")
             });
         match takeover {
-            Ok(()) => Some(watchdog_sweep_id),
+            Ok(()) => {
+                self.shadow_owner_acquired(LockNs::Issue, issue, &owner, false);
+                Some(watchdog_sweep_id)
+            }
             Err(e) => {
                 log::warn!(
                     "midbuild-watchdog: could not take over issue #{issue}'s stale claim lock at \
@@ -932,7 +949,9 @@ impl SweepRegistry {
                     .and_then(|s| serde_json::from_str(&s).ok());
                 let Some(owner) = owner else {
                     // No owner.json — treat as stale, remove.
-                    let _ = std::fs::remove_dir_all(&path);
+                    if std::fs::remove_dir_all(&path).is_ok() {
+                        self.shadow_owner_released(LockNs::Issue, issue, None);
+                    }
                     continue;
                 };
                 let alive =
@@ -951,7 +970,14 @@ impl SweepRegistry {
                     );
                     continue;
                 }
-                if !alive {
+                // #11076: a dead leader whose recorded group still has members
+                // (a wrapper retry) is not a dead sweep. Admit it as `Running`
+                // so the reaper's `await_group_drain` gate owns the release.
+                let orphaned_group = !alive
+                    && owner
+                        .pgid
+                        .is_some_and(|pgid| self.group_still_populated(&owner.sweep_id, pgid));
+                if !alive && !orphaned_group {
                     // Stale lock: the daemon-dispatched child's PID (recorded
                     // by `record_child_pid_in_lock`, #3808) is dead. This lock
                     // is the daemon's own crash-surviving evidence that it
@@ -984,7 +1010,9 @@ impl SweepRegistry {
                         self.reap_orphaned_group(&owner.sweep_id, Some(issue), pgid);
                     }
                     daemon_owned_dead.insert(issue);
-                    let _ = std::fs::remove_dir_all(&path);
+                    if std::fs::remove_dir_all(&path).is_ok() {
+                        self.shadow_owner_released(LockNs::Issue, issue, Some(&owner.sweep_id));
+                    }
                     continue;
                 }
                 let log_path = self.compute_log_path(issue);
@@ -1009,6 +1037,11 @@ impl SweepRegistry {
                 // group-killing a stranger's group is exactly the blast radius
                 // this must never have — drop to `None` and degrade.
                 let pgid = owner.pgid.filter(|&recorded| {
+                    if orphaned_group {
+                        // Dead leader: the OS cannot confirm; `group_still_populated`
+                        // already vetted the group (#11076).
+                        return true;
+                    }
                     let actual = process_group_of(owner.owner_pid);
                     if actual == Some(recorded) {
                         true

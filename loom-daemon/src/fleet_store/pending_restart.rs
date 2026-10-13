@@ -55,6 +55,10 @@ pub struct PendingRestart {
 /// Resolve `<loom_dir>` the same way [`crate::fleet_sync`] does: the parent
 /// of `LOOM_SOCKET_PATH` when set (so a test daemon pointed at a tempdir
 /// socket never writes into the operator's real `~/.loom`), else `~/.loom`.
+pub fn loom_dir() -> Option<PathBuf> {
+    resolve_loom_dir()
+}
+
 fn resolve_loom_dir() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("LOOM_SOCKET_PATH") {
         return PathBuf::from(path).parent().map(Path::to_path_buf);
@@ -82,7 +86,14 @@ pub fn record(paths: Vec<String>, observed_pid: u32, rendered_at: DateTime<Utc>)
     };
     let mut body = serde_json::to_vec_pretty(&marker)?;
     body.push(b'\n');
-    write_atomic(&path, &body).with_context(|| format!("writing {}", path.display()))
+    write_atomic(&path, &body).with_context(|| format!("writing {}", path.display()))?;
+    // J3 shadow record (#11349): after the legacy write, never fails it.
+    crate::config_journal::record_pending_restart(
+        &marker.paths,
+        marker.observed_pid,
+        marker.rendered_at,
+    );
+    Ok(())
 }
 
 /// The marker at `path`, `None` when absent/unreadable.
@@ -102,6 +113,7 @@ pub fn probe() -> Option<PendingRestart> {
 pub fn clear() {
     if let Some(path) = marker_path() {
         let _ = std::fs::remove_file(path);
+        crate::config_journal::record_pending_cleared();
     }
 }
 

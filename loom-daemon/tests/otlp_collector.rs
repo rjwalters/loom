@@ -1,5 +1,4 @@
 //! Explicit integration test: requires Docker, never converts missing Docker to a pass.
-#![cfg(feature = "otlp")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 #[path = "common/hub_image.rs"]
 mod hub_image;

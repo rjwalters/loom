@@ -199,6 +199,10 @@ fn verdict_sha_readers_go_through_the_trust_filter() {
         // Reads: `fetch_comment_bodies` returns trusted bodies only.
         ("claim_reconciliation.rs", "reader via forge::fetch_comment_bodies"),
         (
+            "claim_reconciliation/liveness.rs",
+            "reader via TrustPolicy::trusted_records (#10235)",
+        ),
+        (
             "claim_reconciliation/review_conflict.rs",
             "reader via forge::fetch_comment_bodies",
         ),
@@ -224,9 +228,16 @@ fn verdict_sha_readers_go_through_the_trust_filter() {
         ("claim_reconciliation/verdict_dedup_tests.rs", "test"),
         ("claim_reconciliation/auto_merge_disarm.rs", "test fixture"),
         ("claim_reconciliation/trusted_comments_tests.rs", "test"),
+        // #10235: in-memory `PrComment` fixtures for the liveness predicate; no forge read.
+        ("claim_reconciliation/liveness_tests.rs", "test fixture"),
         ("claim_reconciliation/read_cache_tests.rs", "test"),
         ("claim_reconciliation/read_cache_passes_tests.rs", "test"),
         ("claim_reconciliation/open_pr_listing_tests.rs", "test"),
+        // #9258: WRITES the anchor marker (moved here from claim_reconciliation.rs)
+        // and acts on `decide_anchor`; it reads no comment bodies itself.
+        ("claim_reconciliation/unanchored_verdict.rs", "writer, never a reader"),
+        ("claim_reconciliation/unanchored_verdict_tests.rs", "test"),
+        ("verdict_body.rs", "doc mention only; classifies a body, reads no comments"),
         // #9709: reads the RAW listing deliberately, but only to NAME the
         // author of a marker the policy dropped, in the stale-clear notice.
         // The decision is made upstream from trusted markers only and nothing
@@ -237,6 +248,10 @@ fn verdict_sha_readers_go_through_the_trust_filter() {
         // gh_lifecycle.rs`) filters through `TrustPolicy::for_root` before
         // `extract_latest_verdict_sha` sees a body.
         ("forge_merge_queue/lifecycle_tests.rs", "test fixture"),
+        // #10156: fixture only. Feeds a human comment carrying a verdict marker
+        // through the real `COMMENTS_JQ` to prove the hold's fingerprint filter
+        // excludes only its own marker; it reads no forge comments.
+        ("sweep_registry/noop_cooldown/hold/tests.rs", "test fixture"),
         // #10581: parses markers out of bodies `forge_verdict_cmd` already read
         // through `fetch_trusted_comments`; it fetches nothing itself.
         ("verdict_gate.rs", "parses already-filtered bodies"),

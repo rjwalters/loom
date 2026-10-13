@@ -56,6 +56,22 @@
       "credential_reference": "agent-5",
       "enabled": true,
       "email": null
+    },
+    {
+      "provider": "codex",
+      "name": "joseph-2am",
+      "credential_kind": "codex_home",
+      "credential_reference": "joseph-2am",
+      "enabled": true,
+      "email": null
+    },
+    {
+      "provider": "codex",
+      "name": "turian",
+      "credential_kind": "codex_home",
+      "credential_reference": "turian",
+      "enabled": true,
+      "email": null
     }
   ]
 }

@@ -27,7 +27,6 @@
 //! seven rows on insert to that same 168h TTL. That is the data loss this whole
 //! artifact set exists to survive, so the fixture is relative-time now and the
 //! incident is recorded in the template's own header.
-#![cfg(feature = "otlp")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 #[path = "common/hub_image.rs"]

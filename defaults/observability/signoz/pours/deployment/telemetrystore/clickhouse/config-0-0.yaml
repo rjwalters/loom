@@ -22,6 +22,8 @@ logger:
 macros:
   replica: "00"
   shard: "00"
+merge_tree:
+  allow_dimensions_outside_sorting_key: 1
 metric_log:
   flush_interval_milliseconds: 30000
   schema_type: transposed_with_wide_view

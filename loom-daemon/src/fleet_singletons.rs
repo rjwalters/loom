@@ -2,7 +2,7 @@
 //!
 //! A singleton job ([`crate::fleet_captain`], #8848) watches one shared thing
 //! and must run on exactly one fleet host. Most of them ride an existing loop
-//! (the ETA fleet refresh, the collector's captain gauges); the ones here have
+//! (the collector's captain gauges); the ones here have
 //! a loop of their own, and share one call site because they share one
 //! contract: each re-evaluates its captain gate on every tick, so a
 //! `fleet.captain` edit takes effect without a restart, and each is inert on a

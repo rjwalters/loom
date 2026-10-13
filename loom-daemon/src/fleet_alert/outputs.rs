@@ -2,8 +2,8 @@
 //!
 //! [`crate::fleet_outputs::evaluate`] is pure and judges output freshness; this
 //! maps its conditions onto [`Condition`]s so they ride the same debounce /
-//! reminder / clear state and the same sinks (event bus -> Matrix, loom-ui
-//! inbox) as the other fleet alerts. Output is judged, never job ownership.
+//! reminder / clear state and the same sinks (event bus -> Matrix) as the
+//! other fleet alerts. Output is judged, never job ownership.
 
 use chrono::{DateTime, Utc};
 

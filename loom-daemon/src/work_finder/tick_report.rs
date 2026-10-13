@@ -9,9 +9,10 @@ use chrono::{DateTime, Utc};
 
 use super::ready_queue;
 use crate::sweep_registry::{
-    ClaimLockDispatchError, CollisionDispatchError, DispatchBackoffError, LeaseOrderDispatchError,
-    LiveClaimDispatchError, OpenPrDispatchError, ParkedIssueDispatchError,
-    TokenSelectionDispatchError, WorkspaceCommandsMissingDispatchError,
+    AlreadyLandedDispatchError, ClaimLockDispatchError, CollisionDispatchError,
+    DispatchBackoffError, LandedEvidence, LeaseOrderDispatchError, LiveClaimDispatchError,
+    OpenPrDispatchError, ParkedIssueDispatchError, TokenSelectionDispatchError,
+    WorkspaceCommandsMissingDispatchError,
 };
 use crate::types::QueueDisposition as Qd;
 
@@ -80,6 +81,17 @@ pub struct TickReport {
     /// with the parent sweep, so without this guard an issue whose approved PR is
     /// still open would be re-dispatched the moment its sweep exits.
     pub skipped_pr_open: usize,
+    /// The subset of [`skipped_pr_open`](Self::skipped_pr_open) the batched
+    /// open-PR pre-filter (#8865, [`super::open_pr_prefilter`]) skipped from
+    /// the open-PR listing, with no `dispatch()` attempt and so no
+    /// [`Admission`] and no dispatch backoff. The remainder are refusals
+    /// `dispatch()`'s own guard still made (the listing could not be read).
+    ///
+    /// In-process only: it is not on the tick line and not exported in
+    /// `loom.dispatch.decisions`. Tests read it to tell the two paths apart;
+    /// an operator tells them apart by the admission span, which only an
+    /// in-dispatch refusal has.
+    pub pr_open_prefiltered: usize,
     /// Issues skipped because a **peer host** advertised a live soft claim over
     /// the safehouse room (Issue #4028, Phase 1). Counted under its **own**
     /// distinct reason — never folded into [`collisions`](Self::collisions)
@@ -143,6 +155,10 @@ pub struct TickReport {
     /// apparently-healthy sweep that produced nothing** and would otherwise be
     /// re-offered on the very next tick.
     pub skipped_prless_retry: usize,
+    /// Issues refused because their work already landed (Issue #11429).
+    pub skipped_already_landed: usize,
+    /// Issues refused because they are closed as not planned (Issue #11429).
+    pub skipped_already_closed: usize,
     /// Issues skipped because they self-declared a `<!-- loom:recheck-interval=
     /// <value> -->` marker (Issue #6685) and their own `updatedAt` is still
     /// within that interval — see [`WorkItem::is_within_recheck_interval`](super::WorkItem::is_within_recheck_interval).
@@ -160,13 +176,6 @@ pub struct TickReport {
     /// flip, no comment, no cooldown/backoff record — this candidate is not
     /// actionable on this host at all, so it is never even attempted.
     pub skipped_host_constraint: usize,
-    /// Issues skipped because they carry `loom:heavy` and this host is
-    /// classified `local-dev` (Issue #9034), with no override set — see
-    /// [`crate::work_finder::host_class`]. Checked immediately after
-    /// [`skipped_host_constraint`](Self::skipped_host_constraint), and carries
-    /// the same zero-side-effect contract: no claim flip, no comment, no
-    /// cooldown/backoff record.
-    pub skipped_host_class: usize,
     /// Dispatch attempts that returned an error (logged, non-fatal).
     pub errors: usize,
     /// Cumulative cross-host dispatch collisions observed (Issue #4085, Phase 0
@@ -199,16 +208,6 @@ pub struct TickReport {
     /// result keys on [`deferred_build_backoff`](Self::deferred_build_backoff)
     /// instead, so a repo that stays held cannot mask other outcomes.
     pub build_backoff_held: bool,
-    /// Candidates deferred THIS TICK because they fell outside this host's
-    /// preferred repo slice while the slice still had at least one eligible
-    /// in-slice candidate (Issue #6243, [`tick_multi_with_sharding`](super::tick_multi_with_sharding)).
-    /// Always `0` when sharding is not configured at the call site
-    /// (`preferred_slice: None`) — see `defaults/docs/dispatcher-repo-sharding.md`.
-    /// Purely observational (mirrors [`deferred_saturation`](Self::deferred_saturation)'s
-    /// shape): these candidates are NOT lost — they remain ready and are
-    /// re-evaluated (and, if still out-of-slice with the slice non-empty,
-    /// deferred again) on the next tick.
-    pub deferred_out_of_slice: usize,
     /// Candidates deferred THIS TICK because their own repo was already at
     /// `autonomous.workFinder.maxConcurrentPerRepo` (Issue #9090,
     /// [`repo_cap`](super::repo_cap)). Always `0` when the knob is absent (the
@@ -219,13 +218,13 @@ pub struct TickReport {
     /// reached, one repo's share of it was, so an operator reading
     /// `deferred_capacity` is never sent to raise a ceiling that is not binding.
     /// Purely observational (mirrors
-    /// [`deferred_out_of_slice`](Self::deferred_out_of_slice)'s shape): these
+    /// [`deferred_saturation`](Self::deferred_saturation)'s shape): these
     /// candidates are NOT lost — they stay ready and are re-evaluated next tick,
     /// and within THIS tick their deferral is handed straight to the next
     /// candidate, which is another repo's work.
     pub deferred_repo_cap: usize,
     /// The subset of [`dispatched`](Self::dispatched) admitted through the
-    /// `loom:operator-priority` overflow slot (#9244): a starred issue that
+    /// overflow slot (#9244, inert since #11508): an operator-starred issue that
     /// only the global and/or per-repo cap refused, dispatched as this host's
     /// single over-limit sweep. At most one per tick, and none while an
     /// earlier overflow sweep is still live. See
@@ -266,24 +265,28 @@ pub struct TickReport {
     pub occupancy: Option<usize>,
     /// The shaped candidate order pass 2 iterated, as `(workspace_idx,
     /// issue)` (Issue #9288): the global sort after `repo_cap::shape_queue`'s
-    /// slice and affinity partitions. Recorded before pass 2 runs, so it is
+    /// affinity partition. Recorded before pass 2 runs, so it is
     /// the order `dispatch()` was offered candidates in, including those a
     /// gate then deferred. The published plan's `position` is read from here
     /// and never re-derived. Empty for the single-workspace tick.
     pub plan_order: Vec<(usize, u32)>,
-    /// The preferred repo slice the tick shaped with (#6243), or `None` when
-    /// sharding was not configured at the call site.
-    pub in_slice: Option<Vec<bool>>,
     /// The per-repo cap and top-of-tick per-workspace occupancy (#9090) the
     /// tick shaped with. `None` for the single-workspace tick.
     pub repo_cap: Option<super::repo_cap::RepoCapSnapshot>,
     /// The per-tick admission ramp cap (#4234) the tick ran under, or `None`
     /// when the caller did not record it.
     pub max_admissions_per_tick: Option<usize>,
-    /// Whether the host's single `loom:operator-priority` overflow slot
-    /// (#9244) was still unused when the tick finished, or `None` when the
+    /// Whether the host's single overflow slot (#9244, inert since #11508)
+    /// was still unused when the tick finished, or `None` when the
     /// tick did not record it (Issue #9288).
     pub overflow_free: Option<bool>,
+    /// The tick's workspace draws (#11103): seed, and each draw's candidates,
+    /// weights, roll and pick, in order. `None` when nothing was drawn (an
+    /// idle tick, and the single-workspace tick).
+    pub workspace_draw: Option<super::workspace_draw::DrawLog>,
+    /// The `loom:very-important` issues the flood cap ranked as important
+    /// this tick (#11509), in listing order; exported in `pick.decision`.
+    pub vi_demotions: Vec<super::vi_cap::ViDemotion>,
 }
 
 impl TickReport {
@@ -332,9 +335,9 @@ impl TickReport {
         TickReport {
             occupancy: None,
             max_admissions_per_tick: None,
-            in_slice: None,
             repo_cap: None,
             overflow_free: None,
+            workspace_draw: None,
             ..self
         }
     }
@@ -464,6 +467,17 @@ fn classify(report: &mut TickReport, issue: u32, outcome: &Result<bool>) -> Outc
             parked.label
         );
         Outcome::new(Qd::Parked, Some(parked.label.to_string()), "refused", "labeled")
+    } else if let Some(landed) = e.downcast_ref::<AlreadyLandedDispatchError>() {
+        // #11429: the issue is closed, or this host just landed it.
+        log::info!("work_finder: skipping issue #{issue} — {e}");
+        if landed.evidence == LandedEvidence::ForgeClosedNotPlanned {
+            report.skipped_already_closed += 1;
+            Outcome::new(Qd::AlreadyClosed, None, "refused", "already_closed")
+        } else {
+            report.skipped_already_landed += 1;
+            let detail = Some(landed.detail().to_string());
+            Outcome::new(Qd::AlreadyLanded, detail, "refused", "already_landed")
+        }
     } else if e.downcast_ref::<DispatchBackoffError>().is_some() {
         // Dispatch backoff (#4485), possibly armed mid-tick by a reap.
         report.skipped_backoff += 1;

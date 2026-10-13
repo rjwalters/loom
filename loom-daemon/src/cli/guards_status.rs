@@ -16,6 +16,23 @@ pub(crate) enum GuardsCommand {
     /// ask/deny summary of the decision log, and warnings for known
     /// misconfigurations.
     Status(StatusArgs),
+    /// The `loom:remote-fleet-exec` hook classifier (#11568): exit 1 and print
+    /// `ASK [remote-fleet-exec]: …` when the command runs a destructive (or
+    /// unresolvable) remote payload on, or pushes files onto, a fleet host;
+    /// exit 0 otherwise, or when `guards.remoteFleetExec=false`.
+    RemoteExec(RemoteExecArgs),
+}
+
+#[derive(clap::Args)]
+pub(crate) struct RemoteExecArgs {
+    /// The Bash command to classify (as the hook masked it).
+    #[arg(long, value_name = "COMMAND")]
+    for_command: String,
+
+    /// The tool call's working directory: relative script paths resolve
+    /// here, and config is read from here. Defaults to the current directory.
+    #[arg(long, value_name = "PATH")]
+    cwd: Option<PathBuf>,
 }
 
 #[derive(clap::Args)]
@@ -37,6 +54,20 @@ impl GuardsCommand {
     pub(crate) fn run(self) -> Result<()> {
         match self {
             GuardsCommand::Status(args) => args.run(),
+            GuardsCommand::RemoteExec(args) => {
+                let cwd = args
+                    .cwd
+                    .filter(|p| p.is_dir())
+                    .or_else(|| std::env::current_dir().ok())
+                    .unwrap_or_else(|| PathBuf::from("."));
+                if let Some(reason) =
+                    loom_daemon::remote_fleet_exec::check_process(&args.for_command, &cwd)
+                {
+                    println!("{reason}");
+                    std::process::exit(1);
+                }
+                Ok(())
+            }
         }
     }
 }

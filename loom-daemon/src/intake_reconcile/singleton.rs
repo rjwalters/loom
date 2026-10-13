@@ -58,8 +58,9 @@
 //! managed by a dispatcher and not registered on the captain gets no intake.
 //! The covered slugs are logged once when this host becomes the captain and
 //! again whenever the set changes. A captain that is down means no intake
-//! anywhere; the only signal today is `intake-reconcile` missing from its
-//! `host.health.armed_singleton_jobs`.
+//! anywhere; the signals are `intake-reconcile` missing from its
+//! `host.health.armed_singleton_jobs` and, since #10924, the completed-pass
+//! heartbeat (below) going stale in the singleton-output watchdog.
 //!
 //! # Modes ([`Mode`], re-read every [`GATE_INTERVAL`], so an edit needs no restart)
 //!
@@ -75,6 +76,22 @@
 //! ETA fleet refresh (#10329): a duplicate label attempt costs budget, never
 //! correctness, and a single-host install must not lose intake for want of a
 //! captain.
+//!
+//! # The completed-pass heartbeat (#10924)
+//!
+//! A healthy pass that labels nothing emits no forge output, so a watcher
+//! could not tell a quiet fleet from a stopped reconciler. After every pass
+//! the captain folds the outcome into
+//! `<root>/.loom/state/intake-reconcile/last-pass.json`
+//! ([`PassHeartbeat`]): `last_completed_at` advances only when the pass
+//! completed its whole scan — every repo walked ([`PassReport::stopped_early`]
+//! false) and every listing read ([`PassReport::listing_failed`] zero). A
+//! shed, failed or early-stopped pass records its outcome but keeps the
+//! previous stamp. The `fleet_outputs::SINGLETON_OUTPUTS` row for this job
+//! (record kind [`PASS_HEARTBEAT_KIND`]) judges that stamp against twice the
+//! default pass cadence — a fixed 600 s; the
+//! `LOOM_INTAKE_RECONCILE_INTERVAL_SECS` override does not move the row's
+//! deadline.
 //!
 //! # Rate limits
 //!
@@ -98,6 +115,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{select_unlabeled, IntakeRow, TRIAGE_LABEL};
@@ -110,6 +128,11 @@ use crate::forge_etag_store as store;
 pub const SINGLETON_JOB_NAME: &str = "intake-reconcile";
 /// Config key: hand the pass to the declared fleet captain.
 pub const SINGLETON_KEY: &str = "fleet.intakeReconcile.singleton";
+/// Record kind of the completed-pass heartbeat (#10924): the durable output
+/// the `fleet_outputs::SINGLETON_OUTPUTS` row for this job judges.
+pub const PASS_HEARTBEAT_KIND: &str = "intake-reconcile.pass";
+/// The heartbeat's schema tag; a record carrying another is ignored on read.
+pub const HEARTBEAT_SCHEMA: &str = "intake-reconcile/pass/v1";
 /// How often the mode is re-read. The pass itself keeps the legacy cadence
 /// (`LOOM_INTAKE_RECONCILE_INTERVAL_SECS`).
 pub const GATE_INTERVAL: Duration = Duration::from_secs(60);
@@ -473,6 +496,22 @@ pub struct PassReport {
     pub reverted: usize,
     /// Repos whose listing was shed (readers out of budget).
     pub shed: usize,
+    /// Repos whose listing failed or was shed (`shed` is a subset).
+    pub listing_failed: usize,
+    /// The rate-limit breaker stopped the pass before the last repo(s).
+    pub stopped_early: bool,
+}
+
+impl PassReport {
+    /// Whether the pass completed its intended scan: every repo was walked
+    /// (not [`stopped_early`](Self::stopped_early)) and every listing was
+    /// read. Label outcomes — a denied write scope, races, reverts, cap
+    /// leftovers — do not count against it: the pass retries them next pass
+    /// by design.
+    #[must_use]
+    pub fn completed_scan(&self, repos: usize) -> bool {
+        !self.stopped_early && self.listing_failed == 0 && self.repos == repos
+    }
 }
 
 /// One pass over `repos`, stopping early while `suppressed` (the rate-limit
@@ -488,16 +527,126 @@ pub fn run_pass(
     for repo in repos {
         if suppressed() {
             log::debug!("intake_reconcile: rate-limit breaker open; pass stopped early");
+            pass.stopped_early = true;
             break;
         }
         let report = run_repo(forge, repo, now, cap);
         pass.repos += usize::from(!report.listing_failed);
+        pass.listing_failed += usize::from(report.listing_failed);
         pass.labelled += report.labelled;
         pass.raced += report.raced;
         pass.reverted += report.reverted;
         pass.shed += usize::from(report.listing_shed);
     }
     pass
+}
+
+// ---------------------------------------------------------------------------
+// The completed-pass heartbeat (#10924)
+// ---------------------------------------------------------------------------
+
+/// What the captain recorded about its latest pass, folded into
+/// [`heartbeat_path`] after every one. `last_completed_at` is the timestamp a
+/// watchdog ages; it advances only when a pass completed its whole scan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PassHeartbeat {
+    /// [`HEARTBEAT_SCHEMA`]; a mismatched tag is ignored on read.
+    pub schema: String,
+    /// The host that ran the pass.
+    pub host: String,
+    /// When this pass ran, completed or not.
+    pub pass_at: DateTime<Utc>,
+    /// When a pass last completed its whole scan; `None` = never. A shed,
+    /// failed or early-stopped pass keeps the previous value.
+    pub last_completed_at: Option<DateTime<Utc>>,
+    /// Repos whose listing was read this pass.
+    pub repos: usize,
+    /// Repos whose listing failed or was shed this pass.
+    pub listing_failed: usize,
+    /// Repos whose listing was shed (a subset of `listing_failed`).
+    pub shed: usize,
+    /// The breaker stopped this pass before every repo was walked.
+    pub stopped_early: bool,
+    /// Issues given [`TRIAGE_LABEL`] this pass.
+    pub labelled: usize,
+    /// Issues left alone: labelled, closed or gone at the re-read.
+    pub raced: usize,
+    /// Labels removed again after the write's answer showed another `loom:*`.
+    pub reverted: usize,
+}
+
+impl PassHeartbeat {
+    /// The timestamp a watchdog may treat as "the singleton produced": the
+    /// latest pass that completed its whole scan. Readers age it against
+    /// their own clock, so a stopped writer cannot keep itself fresh.
+    #[must_use]
+    pub fn success_at(&self) -> Option<DateTime<Utc>> {
+        self.last_completed_at
+    }
+}
+
+/// `<root>/.loom/state/intake-reconcile/last-pass.json`.
+#[must_use]
+pub fn heartbeat_path(root: &Path) -> PathBuf {
+    root.join(".loom")
+        .join("state")
+        .join("intake-reconcile")
+        .join("last-pass.json")
+}
+
+/// Fold one pass into the heartbeat: a pass that completed its intended scan
+/// (see [`PassReport::completed_scan`]) over `repos` of them stamps
+/// `last_completed_at = pass_at`; any other outcome keeps the previous stamp,
+/// so the success timestamp cannot be refreshed accidentally. Pure.
+#[must_use]
+pub fn next_heartbeat(
+    prev: Option<&PassHeartbeat>,
+    host: &str,
+    pass_at: DateTime<Utc>,
+    pass: &PassReport,
+    repos: usize,
+) -> PassHeartbeat {
+    PassHeartbeat {
+        schema: HEARTBEAT_SCHEMA.to_string(),
+        host: host.to_string(),
+        last_completed_at: if pass.completed_scan(repos) {
+            Some(pass_at)
+        } else {
+            prev.and_then(|p| p.last_completed_at)
+        },
+        pass_at,
+        repos: pass.repos,
+        listing_failed: pass.listing_failed,
+        shed: pass.shed,
+        stopped_early: pass.stopped_early,
+        labelled: pass.labelled,
+        raced: pass.raced,
+        reverted: pass.reverted,
+    }
+}
+
+/// The heartbeat on disk: `None` when absent, unreadable, or of another
+/// schema (a foreign record proves nothing either way).
+#[must_use]
+pub fn read_heartbeat(root: &Path) -> Option<PassHeartbeat> {
+    let bytes = std::fs::read(heartbeat_path(root)).ok()?;
+    let hb: PassHeartbeat = serde_json::from_slice(&bytes).ok()?;
+    (hb.schema == HEARTBEAT_SCHEMA).then_some(hb)
+}
+
+/// Persist `hb`. Health state never costs a pass: a failure is logged only.
+fn write_heartbeat(root: &Path, hb: &PassHeartbeat) {
+    let path = heartbeat_path(root);
+    let write = || -> Result<()> {
+        let text = serde_json::to_string_pretty(hb).context("encode the heartbeat")?;
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).context("create the state dir")?;
+        }
+        std::fs::write(&path, text + "\n").with_context(|| format!("write {}", path.display()))
+    };
+    if let Err(e) = write() {
+        log::warn!("intake_reconcile: could not write the pass heartbeat: {e:#}");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -653,13 +802,20 @@ fn run_production_pass(daemon_root: &Path) {
     }
     let mut forge = GhIntakeForge::new(PathBuf::from(crate::gh_invocation::gh_bin()));
     let cap = super::env_num("LOOM_INTAKE_RECONCILE_MAX_PER_PASS", super::DEFAULT_MAX_PER_PASS);
+    let ran_at = Utc::now();
     let pass = run_pass(
         &mut forge,
         &repos,
-        Utc::now(),
+        ran_at,
         cap,
         &crate::rate_limit_breaker::global_is_suppressed,
     );
+    // The completed-pass heartbeat (#10924): durable output for a pass that
+    // labelled nothing, refreshed only by a pass that completed its scan.
+    let host = crate::sweep_registry::host_identity();
+    let hb =
+        next_heartbeat(read_heartbeat(daemon_root).as_ref(), &host, ran_at, &pass, repos.len());
+    write_heartbeat(daemon_root, &hb);
     if pass.labelled > 0 || pass.raced > 0 || pass.reverted > 0 {
         log::info!(
             "intake_reconcile: applied {TRIAGE_LABEL} to {} unlabelled issue(s) across {} \

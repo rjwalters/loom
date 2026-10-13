@@ -35,42 +35,21 @@ pub(crate) fn handle_strip_ansi_command(file: Option<&str>) -> Result<()> {
     }
 }
 
-/// `loom-daemon resolve-model` — backs `resolve-model.sh` / `resolve-tier-model.sh`.
+/// `loom-daemon resolve-model` — backs `resolve-model.sh`.
 ///
-/// Exit codes mirror the retired Python CLI exactly: `0` on success, `2` when
-/// neither a model nor `--tier` was supplied, and `3` with NO output when
-/// `--tier` / `--task-alias` / `--downgrade` has no mapping so the caller keeps
-/// its own precedence chain.
+/// Exit codes: `0` on success, `2` (clap) when no model was supplied, and `3`
+/// with NO output when `--task-alias` / `--downgrade` has no mapping so the
+/// caller keeps its own precedence chain.
 pub(crate) fn handle_resolve_model_command(
-    model: Option<&str>,
+    model: &str,
     config: Option<&str>,
     generation: bool,
     task_alias: bool,
     downgrade: bool,
-    tier: Option<&str>,
-    runtime: &str,
 ) -> Result<()> {
     use script_helpers::model_tiers;
 
     let cfg = model_tiers::load_config(config.map(Path::new));
-
-    // Complexity-tier mode (#4238). Checked before the positional model, which
-    // the Python parser also treated as optional in this mode.
-    if let Some(tier) = tier {
-        let env_override = std::env::var("LOOM_SWEEP_OPTIMIZATION").ok();
-        let resolved =
-            model_tiers::resolve_tier_model(Some(tier), runtime, &cfg, env_override.as_deref());
-        if resolved.is_empty() {
-            std::process::exit(3);
-        }
-        println!("{resolved}");
-        return Ok(());
-    }
-
-    let Some(model) = model else {
-        eprintln!("loom-daemon resolve-model: error: a model argument or --tier is required");
-        std::process::exit(2);
-    };
 
     // Credit-exhaustion downgrade mode (#5687). Checked before --task-alias:
     // --downgrade already ends at a Task-passable alias, so passing both is a
@@ -251,7 +230,6 @@ pub(crate) fn handle_sweep_experiment_command(action: SweepExperimentAction) -> 
         }
         SweepExperimentAction::AssignArm {
             issue,
-            complexity,
             format,
             resolve,
             config,
@@ -262,8 +240,7 @@ pub(crate) fn handle_sweep_experiment_command(action: SweepExperimentAction) -> 
             // fraction 1.0, so the output is unchanged.
             let cfg = model_tiers::load_config(config.as_deref().map(Path::new));
             let (roster, fraction) = arm_plan(&cfg, env_fraction.as_deref());
-            let assigned = arms::in_experiment(issue, complexity.as_deref(), fraction)
-                .then(|| roster.assign(issue, complexity.as_deref()));
+            let assigned = arms::in_experiment(issue, fraction).then(|| roster.assign(issue));
             // The default prints the logical alias (Arm A -> `opus`), which the
             // arm identity and the shell test key off. `--resolve` prints the
             // concrete ID the #3982 tier map resolves that alias to.
@@ -280,7 +257,6 @@ pub(crate) fn handle_sweep_experiment_command(action: SweepExperimentAction) -> 
                     "{}",
                     serde_json::json!({
                         "issue": issue,
-                        "complexity": se::normalize_complexity(complexity.as_deref()),
                         "arm": arm,
                         "model": model,
                         "in_experiment": arm.is_some(),
@@ -288,17 +264,13 @@ pub(crate) fn handle_sweep_experiment_command(action: SweepExperimentAction) -> 
                 );
             } else {
                 // Sampled OUT of the experiment => `none -`: no arm, no forced
-                // model, caller proceeds with unmodified tier-2.5/tier-3
+                // model, caller proceeds with unmodified tier-3
                 // resolution (the `observe`-mode null-arm convention).
                 println!("{} {}", arm.unwrap_or("none"), model.as_deref().unwrap_or("-"));
             }
             Ok(())
         }
-        SweepExperimentAction::Banner {
-            issue,
-            complexity,
-            config,
-        } => {
+        SweepExperimentAction::Banner { issue, config } => {
             let cfg = model_tiers::load_config(config.as_deref().map(Path::new));
             let (raw_mode, _) = se::resolve_raw_mode(env_mode.as_deref(), &cfg);
             let (mode, warnings) = se::resolve_effective_mode_default(
@@ -317,7 +289,7 @@ pub(crate) fn handle_sweep_experiment_command(action: SweepExperimentAction) -> 
                 let (roster, fraction) = arm_plan(&cfg, env_fraction.as_deref());
                 let (_ok, source, _w) = se::evaluate_canary_default(env_canary.as_deref(), None);
                 canary_source = source.map(|s| s.label().to_string());
-                if !arms::in_experiment(issue, complexity.as_deref(), fraction) {
+                if !arms::in_experiment(issue, fraction) {
                     // Sampled out by the budget cap (#9122): no arm, no
                     // forcing, its own loud banner.
                     println!(
@@ -326,7 +298,7 @@ pub(crate) fn handle_sweep_experiment_command(action: SweepExperimentAction) -> 
                     );
                     return Ok(());
                 }
-                let assigned = roster.assign(issue, complexity.as_deref());
+                let assigned = roster.assign(issue);
                 arm = Some(assigned.id.clone());
                 model = assigned.model.clone();
             } else if raw_mode == "experiment" {
@@ -358,7 +330,7 @@ pub(crate) fn handle_sweep_experiment_command(action: SweepExperimentAction) -> 
             mode,
             arm,
             attempt,
-            complexity,
+            story_points,
             verdict,
             cycle_count,
             pr,
@@ -380,7 +352,7 @@ pub(crate) fn handle_sweep_experiment_command(action: SweepExperimentAction) -> 
                     mode: &mode,
                     arm: arm.as_deref(),
                     attempt,
-                    complexity: complexity.as_deref(),
+                    story_points,
                     judge_verdict: verdict.as_deref(),
                     cycle_count,
                     pr,
@@ -415,5 +387,60 @@ pub(crate) fn handle_sweep_experiment_command(action: SweepExperimentAction) -> 
             }
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::cli::whole_cli_parse::try_parse_cli;
+    use crate::Commands;
+
+    /// #11665: `resolve-model` keeps its alias / `--task-alias` /
+    /// `--downgrade` / `--generation` surface unchanged.
+    #[test]
+    fn resolve_model_keeps_its_alias_surface() {
+        for argv in [
+            &["loom-daemon", "resolve-model", "opus"][..],
+            &[
+                "loom-daemon",
+                "resolve-model",
+                "claude-opus-5",
+                "--task-alias",
+            ],
+            &["loom-daemon", "resolve-model", "opus", "--downgrade"],
+            &[
+                "loom-daemon",
+                "resolve-model",
+                "opus",
+                "--generation",
+                "--config",
+                "x.json",
+            ],
+        ] {
+            let cli = try_parse_cli(argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+            assert!(matches!(cli.command, Some(Commands::ResolveModel { .. })), "{argv:?}");
+        }
+    }
+
+    /// #11665: tier-2.5 routing and the Jev tier shadow are deleted, so their
+    /// entry points are unknown to clap rather than silently accepted.
+    #[test]
+    fn tier_routing_and_jev_tier_entry_points_are_rejected() {
+        for argv in [
+            &["loom-daemon", "resolve-model", "--tier", "routine"][..],
+            &[
+                "loom-daemon",
+                "resolve-model",
+                "opus",
+                "--runtime",
+                "claude",
+            ],
+            &["loom-daemon", "resolve-model"],
+            &["loom-daemon", "jev-tier", "1"],
+        ] {
+            assert!(try_parse_cli(argv).is_err(), "{argv:?} must be rejected");
+        }
+        // The separate Champion merge-risk shadow stays (#8545).
+        assert!(try_parse_cli(&["loom-daemon", "jev-merge-risk", "1"]).is_ok());
     }
 }

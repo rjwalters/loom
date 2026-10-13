@@ -68,6 +68,9 @@ const TABLE: &[(&str, Reloadability)] = &[
     // inside the tick loop body (`loom-daemon/src/role_runner.rs`), and
     // `loom-daemon status` already reports the live per-root value.
     ("autonomous.roleRunner", Reloadability::Live),
+    // Per-repo approval/merge policy (#11674): `merge_policy::declared` is
+    // read from the effective config on every `fleet.state` export.
+    ("repos", Reloadability::Live),
     // Re-read every multi-workspace work-finder tick since #9060 (the
     // operator ceiling) / #9090 (the per-repo cap) —
     // `ConfiguredMaxReloader::refresh()` in
@@ -85,8 +88,8 @@ const TABLE: &[(&str, Reloadability)] = &[
     ("autonomous.workFinder.redFixEscalateAfterSecs", Reloadability::Live),
     // Everything else under `autonomous.workFinder` — `enabled` (gates
     // whether the loop is spawned at all), `intervalSecs` (the ticker's
-    // fixed period), `maxAdmissionsPerTick`, `hostClass` /
-    // `allowHeavyLocal`, `saturationBrake.*` — is resolved once at daemon
+    // fixed period), `maxAdmissionsPerTick`, `saturationBrake.*` — is
+    // resolved once at daemon
     // bring-up in `daemon_service.rs`'s work-finder startup block, before
     // the loop is spawned.
     ("autonomous.workFinder", Reloadability::RestartRequired),

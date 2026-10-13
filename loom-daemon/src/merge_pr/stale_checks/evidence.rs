@@ -155,18 +155,6 @@ fn sha_matches(a: &str, b: &str) -> bool {
 
 // --- Validated version restamps ---------------------------------------------
 
-/// The files a post-merge release bump rewrites, and the ONLY paths a restamp
-/// may be discounted on. `scripts/version.sh list` names the same set.
-pub const RESTAMP_PATHS: &[&str] = &[
-    "VERSION",
-    "Cargo.toml",
-    "Cargo.lock",
-    "package.json",
-    "mcp-loom/package.json",
-    "mcp-loom/package-lock.json",
-    ".loom/install-metadata.json",
-];
-
 /// The one path whose *install-bookkeeping* fields a resync rewrites without
 /// touching `VERSION` — see [`strip_validated_restamps`].
 pub const INSTALL_METADATA: &str = ".loom/install-metadata.json";
@@ -184,7 +172,8 @@ pub const INSTALL_METADATA: &str = ".loom/install-metadata.json";
 ///
 /// - `VERSION` itself must be in the diff, and must **strictly increase**
 ///   (a decrease is not a restamp; it is somebody rewriting history).
-/// - Only the paths in [`RESTAMP_PATHS`] are candidates.
+/// - Only the paths in [`super::bump_tail::version_set`] (derived from
+///   `scripts/version.sh`, #11330) are candidates.
 /// - A candidate is discounted only if **every** changed line in its patch is a
 ///   version-value line: a removed line carrying `VERSION@B`, or an added line
 ///   carrying `VERSION@tip`.
@@ -239,7 +228,7 @@ fn is_discountable(f: &ChangedFile, pair: Option<&(String, String)>) -> bool {
 
 /// `(VERSION@B, VERSION@tip)` when the diff carries a single, strictly
 /// increasing `VERSION` edit; `None` otherwise (which disables all discounting).
-fn version_pair(files: &[ChangedFile]) -> Option<(String, String)> {
+pub(super) fn version_pair(files: &[ChangedFile]) -> Option<(String, String)> {
     let v = files.iter().find(|f| f.path == "VERSION")?;
     if v.status != "modified" {
         return None;
@@ -307,7 +296,7 @@ fn restamp_lines(f: &ChangedFile) -> Option<(Vec<String>, Vec<String>)> {
 /// Is every changed line of this file's patch a version-value line for the
 /// validated `old` → `new` pair?
 fn is_pure_restamp(f: &ChangedFile, old: &str, new: &str) -> bool {
-    if !RESTAMP_PATHS.contains(&f.path.as_str()) {
+    if !super::bump_tail::version_set().contains(&f.path) {
         return false;
     }
     let Some((removed, added)) = restamp_lines(f) else {

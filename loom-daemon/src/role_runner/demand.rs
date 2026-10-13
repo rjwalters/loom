@@ -512,6 +512,25 @@ pub fn count_axis_rows(axis: DebtAxis, rows: &[RestIssue]) -> usize {
         .count()
 }
 
+/// Whether a queue label's listing holds work its role would drain: the
+/// role runner's queue-gate decision (#9435). Pure over `(label, rows)`: it
+/// reads no config, so it does not depend on demand width being enabled.
+///
+/// A label whose axis has park labels ([`axis_park_labels`]) opens the gate
+/// only on an open PR its role will drain ([`count_axis_rows`]), so an
+/// all-parked `loom:changes-requested` queue no longer dispatches a Doctor
+/// run that finds nothing. Every other label keeps the plain "any row" rule:
+/// a label with no axis, and the review axis, whose park set is empty.
+/// Review deliberately does not go through [`count_axis_rows`], which also
+/// drops non-PR and non-open rows; Judge's gate is unchanged.
+#[must_use]
+pub fn listing_has_work(label: &str, rows: &[RestIssue]) -> bool {
+    match DebtAxis::for_label(label) {
+        Some(axis) if !axis_park_labels(axis).is_empty() => count_axis_rows(axis, rows) > 0,
+        _ => !rows.is_empty(),
+    }
+}
+
 /// Record a queue listing the role runner already made for `root`: a no-op
 /// for a label that feeds no axis, or when `root` has demand width disabled.
 /// Counts via [`count_axis_rows`], so parked / held PRs are left out per axis.

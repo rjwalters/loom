@@ -390,14 +390,17 @@ fn every_script_a_required_job_runs_is_a_global_input() {
             let refs = script_refs(lines);
             let spec = spec(component);
             pinned += 1;
-            // These three run only the built daemon, no script; their G set
+            // These run only the built daemon, no script; their G set
             // carries the subcommand's Rust surface instead, pinned by
             // `daemon_surface_tests.rs`.
             assert!(
                 !refs.is_empty()
                     || matches!(
                         *component,
-                        "Shell Budget Ratchet" | "Secret Scan" | "MCP Guard Wiring Contract"
+                        "Shell Budget Ratchet"
+                            | "Secret Scan"
+                            | "MCP Guard Wiring Contract"
+                            | "Fleet-Policy Shadow Guard"
                     ),
                 "{component}: no script references found — the parser probably broke"
             );

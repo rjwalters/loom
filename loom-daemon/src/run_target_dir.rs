@@ -25,10 +25,12 @@
 //!   the agent.
 //! * [`crate::worker_spawn`] (the seam every dispatch surface converges on)
 //!   decides with [`decide`], creates the dir with [`provision`] (which also
-//!   records the harness pid in [`OWNER_FILE`], since `exec()` keeps the pid),
-//!   and exports it. A spawn with no planned path (a daemon sweep, a manual
-//!   `spawn-worker.sh`) derives one; nothing waits on those, so
-//!   [`crate::target_orphan_reclaim`] collects them once the owner is gone.
+//!   records the harness pid in [`OWNER_FILE`], since `exec()` keeps the pid,
+//!   and its start identity, [`owner::OWNER_START_FILE`]), and exports it. A
+//!   spawn with no planned path (a daemon sweep, a manual `spawn-worker.sh`)
+//!   derives one. A daemon sweep's dir is removed when the registry sees the
+//!   sweep end ([`sweep_end`], #11031); anything left over is collected by
+//!   [`crate::target_orphan_reclaim`] a few minutes after its owner is gone.
 //!
 //! # Precedence (first match wins)
 //!
@@ -41,6 +43,9 @@
 //! Each of those exports nothing new. Otherwise the run gets its own dir.
 
 use std::path::{Path, PathBuf};
+
+pub mod owner;
+pub mod sweep_end;
 
 /// The child-environment variable carrying the path `role_runner` planned for
 /// this run, so the spawn creates exactly the directory the runner will remove.
@@ -174,7 +179,8 @@ pub fn decide(repo_root: &Path, inputs: &SpawnInputs<'_>) -> Option<PathBuf> {
     Some(planned_for(repo_root, inputs.role.unwrap_or("worker"), inputs.run_id))
 }
 
-/// Create `dir` and record `owner_pid` in it. `None` when either step fails:
+/// Create `dir` and record `owner_pid` (and, best-effort, its start identity)
+/// in it. `None` when creating the dir or writing the pid fails:
 /// a `CARGO_TARGET_DIR` cargo cannot write to fails every build, so a failed
 /// create exports nothing (the same rule as `spawn_target_dir`).
 #[must_use]
@@ -183,6 +189,7 @@ pub fn provision(dir: &Path, owner_pid: u32) -> Option<PathBuf> {
         return None;
     }
     std::fs::create_dir_all(dir).ok()?;
+    owner::record_start_token(dir, owner_pid);
     std::fs::write(dir.join(OWNER_FILE), format!("{owner_pid}\n")).ok()?;
     Some(dir.to_path_buf())
 }
@@ -356,9 +363,11 @@ impl Drop for RunDirGuard {
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         };
-        let _ = self.finish_with(&crate::live_claim::pid_is_live_process, &group_alive, &|p| {
-            std::fs::remove_dir_all(p)
-        });
+        let _ = self.finish_with(
+            &crate::live_claim::pid_is_live_process,
+            &group_alive,
+            &owner::remove_marker_last,
+        );
     }
 }
 

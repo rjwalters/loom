@@ -148,8 +148,12 @@ impl ConfiguredMaxReloader {
     ///
     /// The per-repo cap (#9090) is refreshed by the same read and read back
     /// with [`Self::per_repo`] — one config read per tick serves both knobs.
+    /// The same read also publishes the workspace draw's temperature
+    /// (`dispatch.drawTemperature`, #11684) for this tick's draw.
     pub fn refresh(&mut self) -> usize {
-        let next = ConfiguredMax::resolve(&read_work_finder_config(&self.root));
+        let config = read_work_finder_config(&self.root);
+        publish_draw_temperature(&config);
+        let next = ConfiguredMax::resolve(&config);
         if let Some(msg) = transition_message(self.current, next) {
             log::info!("work_finder: {msg}");
         }
@@ -165,6 +169,19 @@ impl ConfiguredMaxReloader {
     #[must_use]
     pub fn per_repo(&self) -> Option<usize> {
         self.current.per_repo
+    }
+}
+
+/// Publish `config`'s draw temperature (#11684) for the next tick's
+/// [`super::workspace_draw::order`], logging a change once.
+pub fn publish_draw_temperature(config: &WorkFinderConfig) {
+    let next = super::config::resolve_draw_temperature(config);
+    let prev = super::workspace_draw::set_draw_temperature(next);
+    if prev != next {
+        log::info!(
+            "work_finder: dispatch.drawTemperature {prev} -> {next} — hot-applied without a \
+             daemon restart (#11684); the next workspace draw weighs at the new temperature"
+        );
     }
 }
 
@@ -327,6 +344,29 @@ mod tests {
 
         write_config(dir.path(), &max_config(1));
         assert_eq!(reloader.refresh(), 1);
+    }
+
+    /// #11684: the per-tick reload publishes `dispatch.drawTemperature` for
+    /// the next draw, so a config edit hot-applies without a restart. (The
+    /// published value is per thread under `cfg(test)`.)
+    #[test]
+    #[serial]
+    fn reloader_publishes_the_draw_temperature() {
+        use crate::priority_pick::DEFAULT_DRAW_TEMPERATURE;
+        use crate::work_finder::workspace_draw::draw_temperature;
+        let dir = tempfile::tempdir().unwrap();
+        let initial = ConfiguredMax::resolve(&read_work_finder_config(dir.path()));
+        let mut reloader = ConfiguredMaxReloader::new(dir.path().to_path_buf(), initial);
+        reloader.refresh();
+        assert_eq!(draw_temperature(), DEFAULT_DRAW_TEMPERATURE);
+
+        write_config(dir.path(), r#"{"hyperparameters": {"dispatch": {"drawTemperature": 40}}}"#);
+        reloader.refresh();
+        assert_eq!(draw_temperature(), 40);
+
+        write_config(dir.path(), "{}");
+        reloader.refresh();
+        assert_eq!(draw_temperature(), DEFAULT_DRAW_TEMPERATURE);
     }
 
     #[test]

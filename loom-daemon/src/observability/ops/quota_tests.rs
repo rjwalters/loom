@@ -3,7 +3,7 @@
 
 use chrono::{DateTime, TimeZone, Utc};
 
-use super::{api_key_accounts_in, PoolAccount, QuotaState};
+use super::{api_key_accounts_in, merge_pool, PoolAccount, QuotaState};
 use crate::telemetry::ops::{MetricName, MetricPoint, MetricValue};
 
 fn at(secs: i64) -> DateTime<Utc> {
@@ -33,13 +33,16 @@ fn find<'a>(
 // ------------------------------------------------------------------ pool
 
 fn account(provider: &str, name: &str, usable: bool, exhausted: bool) -> PoolAccount {
-    PoolAccount {
-        provider: provider.into(),
-        account: name.into(),
-        usable,
-        exhausted,
-    }
+    PoolAccount::new(provider, name, usable, exhausted)
 }
+
+/// The per-provider aggregate families, which carry no account label.
+const AGGREGATES: &[MetricName] = &[
+    MetricName::PoolAccounts,
+    MetricName::PoolExhausted,
+    MetricName::PoolExhaustions,
+    MetricName::PoolExhaustedSeconds,
+];
 
 #[test]
 fn pool_gauges_count_usable_and_exhausted_per_provider() {
@@ -70,7 +73,65 @@ fn pool_gauges_count_usable_and_exhausted_per_provider() {
             && find(&points, MetricName::PoolExhaustedSeconds, &[]).is_none(),
         "the first sample emits no deltas"
     );
-    assert!(points.iter().all(|p| !p.labels.contains_key("account")));
+    assert!(points
+        .iter()
+        .filter(|p| AGGREGATES.contains(&p.name))
+        .all(|p| !p.labels.contains_key("account")));
+}
+
+/// Issue #11286: per-account pool state, one 0/1 series per account and
+/// state, beside (not instead of) the per-provider aggregates.
+#[test]
+fn per_account_state_gauges_carry_the_account_label() {
+    let mut state = QuotaState::default();
+    let accounts = [
+        account("zai", "z1", true, false),
+        account("zai", "z2", false, true),
+        // Seen twice (two pools): emitted once.
+        account("zai", "z2", false, true),
+    ];
+    let points = state.pool_points(&accounts, at(0));
+    let get = |labels: &[(&str, &str)]| {
+        value(find(&points, MetricName::PoolAccountState, labels).unwrap())
+    };
+    assert_eq!(get(&[("account", "z1"), ("state", "usable")]), 1);
+    assert_eq!(get(&[("account", "z1"), ("state", "exhausted")]), 0);
+    assert_eq!(get(&[("account", "z2"), ("state", "usable")]), 0);
+    assert_eq!(get(&[("account", "z2"), ("state", "exhausted")]), 1);
+    assert_eq!(
+        points
+            .iter()
+            .filter(|p| p.name == MetricName::PoolAccountState)
+            .count(),
+        4
+    );
+    assert!(points
+        .iter()
+        .filter(|p| p.name == MetricName::PoolAccountState)
+        .all(|p| p.labels.get("provider").map(String::as_str) == Some("zai")));
+    // The provider aggregate still counts the duplicate as it always did.
+    assert!(find(&points, MetricName::PoolAccounts, &[("provider", "zai")]).is_some());
+}
+
+/// Issue #11286: the declared plan facts are exported where declared, and
+/// absent — never zero — where not.
+#[test]
+fn plan_limit_gauges_appear_only_where_declared() {
+    let mut state = QuotaState::default();
+    let mut declared = account("zai", "z1", true, false);
+    declared.plan_token_limit = Some(50_000_000);
+    declared.plan_window_secs = Some(604_800);
+    let points = state.pool_points(&[declared, account("zai", "z2", true, false)], at(0));
+    assert_eq!(
+        value(find(&points, MetricName::PoolPlanTokenLimit, &[("account", "z1")]).unwrap()),
+        50_000_000
+    );
+    assert_eq!(
+        value(find(&points, MetricName::PoolPlanWindowSeconds, &[("account", "z1")]).unwrap()),
+        604_800
+    );
+    assert!(find(&points, MetricName::PoolPlanTokenLimit, &[("account", "z2")]).is_none());
+    assert!(find(&points, MetricName::PoolPlanWindowSeconds, &[("account", "z2")]).is_none());
 }
 
 #[test]
@@ -234,4 +295,18 @@ fn a_failed_api_key_pool_read_carries_the_previous_accounts_forward() {
     let carried = state.api_key_pool(None);
     let second = state.pool_points(&carried, at(300));
     assert!(find(&second, MetricName::PoolExhaustions, &[]).is_none());
+}
+
+#[test]
+fn merging_a_snapshot_seat_keeps_the_pool_eligibility_restriction() {
+    // The quota read succeeded (usable), but the pool could not verify the
+    // seat's eligibility state (malformed): the merged row must not be usable.
+    let mut accounts = vec![account("zai", "z1", true, false)];
+    let mut pooled = account("zai", "z1", false, false);
+    pooled.plan_token_limit = Some(100);
+    merge_pool(&mut accounts, vec![pooled, account("zai", "z2", true, false)]);
+    assert_eq!(accounts.len(), 2);
+    assert!(!accounts[0].usable);
+    assert!(!accounts[0].exhausted);
+    assert_eq!(accounts[0].plan_token_limit, Some(100));
 }

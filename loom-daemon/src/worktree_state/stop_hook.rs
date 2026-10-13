@@ -53,6 +53,10 @@ pub const TOGGLE_ENV_VAR: &str = "LOOM_GUARD_UNCOMMITTED_WORK";
 /// never to a parse error that a `Stop` hook has no channel to report.
 #[derive(Debug, Default, serde::Deserialize)]
 pub struct HookPayload {
+    /// Recorded (never interpreted) by the consumer canary's outcome log so a
+    /// block can be attributed to a session (#8372).
+    #[serde(default)]
+    pub session_id: Option<String>,
     #[serde(default)]
     pub transcript_path: Option<String>,
     #[serde(default)]
@@ -287,12 +291,47 @@ fn render_paths(state: &WorktreeState) -> String {
 /// every Loom worktree today).
 #[must_use]
 pub fn evaluate(payload: &HookPayload, base_ref: &str) -> Decision {
+    evaluate_detailed(payload, base_ref).decision
+}
+
+/// [`evaluate`] plus the evidence behind the decision, for a caller that has to
+/// record *why* (the consumer canary's outcome log, #8372). The decision is the
+/// same value [`evaluate`] returns — this only stops discarding the inputs.
+#[derive(Debug, Clone)]
+pub struct Evaluation {
+    pub decision: Decision,
+    /// The managed worktree this session owns, if ownership was established.
+    pub worktree: Option<PathBuf>,
+    /// `guards.uncommittedWork` as resolved for that worktree; `None` when no
+    /// worktree was owned (the toggle is never consulted then).
+    pub guard_enabled: Option<bool>,
+    /// The measured state; `None` unless the guard actually collected it.
+    pub state: Option<WorktreeState>,
+}
+
+#[must_use]
+pub fn evaluate_detailed(payload: &HookPayload, base_ref: &str) -> Evaluation {
     let Some(worktree) = owned_worktree(payload) else {
-        return Decision::Silent;
+        return Evaluation {
+            decision: Decision::Silent,
+            worktree: None,
+            guard_enabled: None,
+            state: None,
+        };
     };
     if !guard_enabled(&worktree) {
-        return Decision::Silent;
+        return Evaluation {
+            decision: Decision::Silent,
+            worktree: Some(worktree),
+            guard_enabled: Some(false),
+            state: None,
+        };
     }
     let state = collect(&worktree, base_ref);
-    decide(&state, payload.stop_hook_active)
+    Evaluation {
+        decision: decide(&state, payload.stop_hook_active),
+        worktree: Some(worktree),
+        guard_enabled: Some(true),
+        state: Some(state),
+    }
 }

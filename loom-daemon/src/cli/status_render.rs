@@ -18,7 +18,7 @@ mod holds;
 mod last_tick_line;
 mod model_class;
 mod observability_line;
-mod operator_priority_line;
+mod otlp_export_line;
 mod peer_claims_line;
 mod pending_restart_line;
 mod session_containers_line;
@@ -333,6 +333,10 @@ pub(crate) fn build_status_json_value_for(
         // `{}` when observability is off or from a pre-#8756 daemon (the
         // singular field above already distinguishes those states).
         "observability_exports": report.observability_exports,
+        // OTLP-export health (#11353): `no_exporter` | `failing` | `ok` |
+        // `exempt`, with an optional `detail` (the exemption reason).
+        //   loom-daemon status --json | jq -e '.otlp_export.state == "ok"'
+        "otlp_export": report.otlp_export,
         // Forge event-feed consumer state (ADR-0021, #8765). Non-null for any
         // daemon of this vintage and always carrying a `state`, so a watch
         // loop asserts rather than infers:
@@ -424,7 +428,6 @@ pub(crate) fn build_status_json_value_for(
         "work_finder": {
             "enabled": report.work_finder_enabled,
         },
-        "operator_priority_landing": report.operator_priority_landing,
         // Host-wide `LOOM_ROLE_RUNNER` env override state (#6470), resolved
         // once for the whole report — `null` when unset (each root's own
         // config decides independently).
@@ -2054,7 +2057,7 @@ pub(crate) fn print_status_human(
                 println!(
                     "  token-bound: NO healthy accounts — the concurrency cap is unaffected \
                      (#5270), but every spawn will fail account selection until capacity \
-                     returns. Add accounts (~/.claude-monitor/accounts.env + `loom-daemon tokens \
+                     returns. Add accounts (~/.llm-monitor/accounts.env + `loom-daemon tokens \
                      bootstrap`) or buy API credits, then `loom-daemon tokens check --ranking`."
                 );
             } else {
@@ -2243,6 +2246,8 @@ pub(crate) fn print_status_human(
         "{}",
         observability_line::render(report.observability_export.as_ref(), Utc::now())
     );
+    // OTLP-export health (#11353): `no_exporter` / `failing` / `ok` / `exempt`.
+    println!("{}", otlp_export_line::render(report.otlp_export.as_ref()));
 
     // The loud telemetry banner (#9950): the one-line render above is the
     // data; when telemetry is demonstrably broken the common-tool rule says
@@ -2260,8 +2265,6 @@ pub(crate) fn print_status_human(
     // "off", "never provisioned", "wrong key", "wrong host" and "quiet feed"
     // are five different answers that would otherwise all render as nothing.
     println!("{}", forge_events_line::render_block(report.forge_events.as_ref(), Utc::now()));
-    // Starred issues' landing states (#9244 C); nothing when nothing is starred.
-    operator_priority_line::print(report.operator_priority_landing.as_ref());
     // Fleet-store sync (#9596): what the last startup/timer pass found — the
     // drift the timer detects but deliberately does not write. Nothing at all
     // on a host with no `fleet.repo`.
@@ -2605,6 +2608,9 @@ pub(crate) fn print_status_human(
             // it on dispatch; this is the operator-facing pointer to clean it
             // up (or, if the root is only transiently unavailable, e.g. an
             // unmounted volume, to leave it registered).
+            if let Some(mark) = &r.maintain_only {
+                println!("        {}: kept current, never dispatched into (#11186)", mark.label());
+            }
             if r.root_missing {
                 println!(
                     "        root does not exist on disk — dispatch is skipped; \
@@ -4682,6 +4688,7 @@ mod stash_status_render_tests {
     ) -> loom_daemon::types::RepoStatus {
         loom_daemon::types::RepoStatus {
             root: std::path::PathBuf::from("/repos/loom"),
+            maintain_only: None,
             priority: 100,
             in_flight_count: 0,
             health_gate_halted: false,
@@ -4930,6 +4937,7 @@ mod role_runner_diagnostic_source_render_tests {
     pub(super) fn repo(enabled: bool, on_idle: &[&str], env_override: Option<bool>) -> RepoStatus {
         RepoStatus {
             root: std::path::PathBuf::from("/repos/loom"),
+            maintain_only: None,
             priority: 100,
             in_flight_count: 0,
             health_gate_halted: false,

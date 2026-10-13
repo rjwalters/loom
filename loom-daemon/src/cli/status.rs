@@ -495,6 +495,10 @@ pub(crate) async fn handle_status_command(args: sections::StatusArgs) -> Result<
         );
     }
 
+    // #11441: repo-tier overrides of fleet keys (human output only; JSON stays
+    // a single document).
+    sections::print_fleet_overrides(&report, json);
+
     // #5409 AC2: "autonomy-desired marker present + work finder off" is a
     // NON-OK state on the reachable path, not just a `WARNING:` line beneath
     // a `Protection: protected` header — before this, `handle_status_command`

@@ -110,7 +110,7 @@ Claude Code's own attribute names (`session.id`, `user.email`,
 `loom.*`-prefixed. The shared `transform/privacy` processor in `config.yaml`
 still applies unmodified to this path — it keeps only the resource keys
 (`service.name`, `service.version`, `service.instance.id`, `host.id`,
-`host.name`) and the
+`host.name`, `loom.fleet.config_sha`, `loom.daemon.revision`) and the
 explicit `loom.*` log/span allowlist, plus the small non-namespaced
 `metric_statements` datapoint keys listed under "Privacy and remote
 deployment" below. Anything else Claude Code sends — including
@@ -136,7 +136,8 @@ sessions only.
 
 ## Canary and rollback
 
-First check that your `loom-daemon` was built with the `otlp` feature. Set these
+First check that your `loom-daemon` can export OTLP (`loom-daemon
+telemetry-capabilities --require-otlp`; every build since #10700 can). Set these
 values in `.loom-local/local.json` or the equivalent `LOOM_OBSERVABILITY_*`
 environment variables for the intended canary daemon:
 

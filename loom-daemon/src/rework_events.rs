@@ -197,8 +197,9 @@ pub fn append(workspace_root: &Path, marker: &Marker<'_>) -> std::io::Result<Pat
     if let Some(duration_sec) = marker.duration_sec {
         line.insert("duration_sec".into(), duration_sec.into());
     }
+    let line = serde_json::Value::Object(line);
     // `to_string` on a Map cannot fail (no non-string keys, no NaN).
-    let record = format!("{}\n", serde_json::Value::Object(line));
+    let record = format!("{line}\n");
 
     let file_path = path(workspace_root);
     if let Some(parent) = file_path.parent() {
@@ -213,6 +214,19 @@ pub fn append(workspace_root: &Path, marker: &Marker<'_>) -> std::io::Result<Pat
     drop(file);
 
     prune_if_oversized(&file_path);
+    // #11348: the legacy marker is durable; shadow it into the J2 `rework`
+    // stream. Never fails this call.
+    crate::telemetry::journal_shadow::shadow_append(
+        workspace_root,
+        crate::telemetry::journal_shadow::TelemetryStream::Rework,
+        || {
+            Some(crate::telemetry::journal_shadow::ShadowRecord {
+                kind: format!("rework.{}", marker.kind),
+                key: None,
+                data: line,
+            })
+        },
+    );
     Ok(file_path)
 }
 

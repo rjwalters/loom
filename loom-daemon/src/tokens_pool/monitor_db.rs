@@ -25,8 +25,10 @@
 //! belongs to another tool) with a bounded busy timeout, and every failure mode
 //! is a clean typed [`MonitorImportError::DbUnavailable`] rather than a crash:
 //! claude-monitor absent, `usage.db` absent, or a schema without
-//! `oauth_credentials` (an older claude-monitor). `LOOM_CLAUDE_MONITOR_DIR`
-//! relocates the directory, so tests never touch a real `~/.claude-monitor`.
+//! `oauth_credentials` (an older claude-monitor). The directory comes from the
+//! shared resolver [`claude_monitor_dir`] (`LOOM_LLM_MONITOR_DIR`, the deprecated
+//! `LOOM_CLAUDE_MONITOR_DIR`, `~/.llm-monitor`, then `~/.claude-monitor`; #8849),
+//! so tests never touch a real monitor store.
 //!
 //! # Secrets
 //!
@@ -169,7 +171,8 @@ impl From<std::io::Error> for MonitorImportError {
 
 /// Return the path to claude-monitor's `usage.db`.
 ///
-/// Honors `LOOM_CLAUDE_MONITOR_DIR` via [`claude_monitor_dir`].
+/// Honors `LOOM_LLM_MONITOR_DIR` / `LOOM_CLAUDE_MONITOR_DIR` and the
+/// `~/.llm-monitor` → `~/.claude-monitor` fallback via [`claude_monitor_dir`].
 #[must_use]
 pub fn monitor_db_path(monitor_dir: Option<&Path>) -> PathBuf {
     let base = match monitor_dir {
@@ -285,8 +288,8 @@ fn read_monitor_credentials(
 ) -> Result<Vec<MonitorCredential>, MonitorImportError> {
     if !db_path.is_file() {
         return Err(MonitorImportError::DbUnavailable(format!(
-            "claude-monitor database not found at {}. Is claude-monitor installed on this \
-             host? (Set LOOM_CLAUDE_MONITOR_DIR to point elsewhere.)",
+            "llm-monitor database not found at {}. Is llm-monitor (formerly claude-monitor) \
+             installed on this host? (Set LOOM_LLM_MONITOR_DIR to point elsewhere.)",
             db_path.display()
         )));
     }

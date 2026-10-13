@@ -6,7 +6,13 @@
 //! |---|---|---|
 //! | clean | [`loom_daemon::merge_pr::labels::CLEAN`] | 0 |
 //! | contradictory | the refusal | 1 |
+//! | sequencing hold only, under `--sequenced-hold-repo` | `LOOM-SEQUENCED-HOLD pr=<N> after=<M>`, then the refusal | 7 |
 //! | could not answer | — | 2 |
+//!
+//! Exit 7 (#11330) is opt-in: `merge-pr.sh` sets `LOOM_SEQUENCED_HOLD_REPO`
+//! (an env var, so an older binary ignores it and keeps exit 1, and an older
+//! script never sees 7). `after` is read best-effort from the PR's trusted
+//! `loom:sequence` marker; the hold decision itself is still the label alone.
 //!
 //! Porting a *sourced shell function* into a *subprocess* introduces a failure
 //! mode the original could not have: the binary can be missing, unreadable, or
@@ -45,6 +51,11 @@ pub(crate) struct VerdictContradictionArgs {
     /// stream rather than in an argument vector.
     #[arg(long, value_name = "LABELS")]
     labels: Option<String>,
+
+    /// OWNER/REPO. When set, a contradiction that is ONLY the `loom:sequenced`
+    /// ordering hold exits 7 with a `LOOM-SEQUENCED-HOLD` line (#11330).
+    #[arg(long, value_name = "OWNER/REPO", env = "LOOM_SEQUENCED_HOLD_REPO")]
+    sequenced_hold_repo: Option<String>,
 }
 
 impl VerdictContradictionArgs {
@@ -65,6 +76,20 @@ impl VerdictContradictionArgs {
 
         match loom_daemon::merge_pr::labels::contradiction(&labels) {
             Some(blocker) => {
+                let hold = self
+                    .sequenced_hold_repo
+                    .as_deref()
+                    .filter(|r| !r.is_empty())
+                    .filter(|_| loom_daemon::merge_pr::labels::sequenced_hold_only(&labels));
+                if let Some(nwo) = hold {
+                    println!(
+                        "{}",
+                        loom_daemon::merge_pr::labels::sequenced_hold_line(
+                            &self.pr,
+                            sequenced_after(nwo, &self.pr)
+                        )
+                    );
+                }
                 print!(
                     "{}",
                     loom_daemon::merge_pr::labels::message(
@@ -75,7 +100,7 @@ impl VerdictContradictionArgs {
                     )
                 );
                 println!();
-                std::process::exit(1)
+                std::process::exit(if hold.is_some() { 7 } else { 1 })
             }
             None => {
                 println!("{}", loom_daemon::merge_pr::labels::CLEAN);
@@ -83,4 +108,15 @@ impl VerdictContradictionArgs {
             }
         }
     }
+}
+
+/// The predecessor named by the PR's live trusted `loom:sequence` marker, or
+/// `None` on any read/parse failure (display only — never changes the hold).
+fn sequenced_after(nwo: &str, pr: &str) -> Option<u32> {
+    use loom_daemon::merge_pr::sequence;
+    let pr: u32 = pr.parse().ok()?;
+    let root = std::env::current_dir().ok()?;
+    let bodies =
+        sequence::fetch_trusted_bodies(&loom_daemon::gh_invocation::gh_bin(), &root, nwo, pr)?;
+    sequence::parse_live(&bodies).map(|m| m.after)
 }

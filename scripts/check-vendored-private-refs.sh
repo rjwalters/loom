@@ -84,7 +84,9 @@ ALLOWED_HOST_SUFFIXES=(
   # `chatgpt.com` is OpenAI's public product host, cited verbatim in the
   # Codex usage-limit refusal captured for #8539 (token-pool.md and the
   # matching assert_classify row) — same category, folded onto this line.
-  openai.com opentelemetry.io kimi.com moonshot.ai chatgpt.com
+  # `ts.net` is Tailscale's public MagicDNS suffix, which the remote-fleet-exec
+  # guard docs name as a tailnet marker (#11568) — a vendor, not a deployment.
+  openai.com opentelemetry.io kimi.com moonshot.ai chatgpt.com ts.net
   apple.com
   npmjs.org crates.io
   biomejs.dev workers.dev
