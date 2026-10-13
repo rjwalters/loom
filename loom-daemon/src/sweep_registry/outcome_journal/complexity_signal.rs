@@ -150,7 +150,7 @@ impl IssueSignals {
 /// Parse the `gh api --jq` projection this module requests into
 /// [`IssueSignals`]. A malformed or unexpected payload yields the empty
 /// signals rather than an error — same fail-open contract as the fetch.
-fn parse_issue_signals(stdout: &str) -> IssueSignals {
+pub(crate) fn parse_issue_signals(stdout: &str) -> IssueSignals {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(stdout.trim()) else {
         return IssueSignals::default();
     };
@@ -181,6 +181,11 @@ fn parse_issue_signals(stdout: &str) -> IssueSignals {
     }
 }
 
+/// The issue-signals projection: state, close time and label names, nothing
+/// else. Shared with the claim-release read (#11480 follow-up).
+pub(crate) const ISSUE_SIGNALS_JQ: &str =
+    "{state: .state, closed_at: .closed_at, labels: [(.labels // [])[] | .name]}";
+
 impl SweepRegistry {
     /// Best-effort issue signals for `issue` — the issue's end state
     /// (Issue #9441) and its labels (Issue #9432) — read via ONE
@@ -208,8 +213,7 @@ impl SweepRegistry {
         // One projection, three signals. Kept to exactly the keys this module
         // consumes so the payload stays small and no unrelated issue content
         // (title, body, assignees, comments) is ever read into the daemon.
-        let jq = "{state: .state, closed_at: .closed_at, \
-                  labels: [(.labels // [])[] | .name]}";
+        let jq = ISSUE_SIGNALS_JQ;
         // Resolved against THIS registry's repo with its own GH_CONFIG_DIR and
         // `LOOM_REPO` as GH_REPO (#8263) — the same rationale as the
         // PR-timeline read; counted as `outcome.issue_signals` (#10089).

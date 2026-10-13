@@ -77,7 +77,7 @@ impl SweepRegistry {
         // replaces the #4206 (`loom:blocked`) and #4887 (`loom:operator-only`)
         // one-label GraphQL probes. Fail-open as before: a failed read yields
         // no labels and no state, so the restore goes ahead.
-        let signals = self.fetch_issue_signals(issue);
+        let signals = self.release_issue_signals(issue);
         let veto = crate::work_finder::restore_veto(&signals.labels, &[]);
         // Only probe PR-ness when a veto doesn't already decide the outcome.
         let is_pr = veto.is_none() && self.issue_is_pull_request(issue).unwrap_or(false);
@@ -127,6 +127,51 @@ impl SweepRegistry {
             args.extend(["--add-label".to_string(), "loom:issue".to_string()]);
         }
         self.run_claim_release_edit(issue, args)
+    }
+
+    /// The issue-signals read for a release path's restore veto (#11480).
+    ///
+    /// Unlike [`fetch_issue_signals`](Self::fetch_issue_signals) it is NOT
+    /// skipped while the rate-limit breaker suppresses polling: the one-label
+    /// probes it replaced always ran, and a skipped read would let a release
+    /// re-add `loom:issue` beside a veto label for the whole breaker window.
+    /// One REST call, counted as `restore.issue_signals`. Fail-open: a failed
+    /// read yields no labels and no state.
+    pub(crate) fn release_issue_signals(
+        &self,
+        issue: u32,
+    ) -> outcome_journal::complexity_signal::IssueSignals {
+        use outcome_journal::complexity_signal::{
+            parse_issue_signals, IssueSignals, ISSUE_SIGNALS_JQ,
+        };
+        if self.config.skip_label_flip {
+            return IssueSignals::default();
+        }
+        let path = format!("repos/{{owner}}/{{repo}}/issues/{issue}");
+        match self
+            .gh_read("restore.issue_signals", ["api", path.as_str(), "--jq", ISSUE_SIGNALS_JQ])
+        {
+            Ok(Some(o)) if o.status.success() => {
+                parse_issue_signals(&String::from_utf8_lossy(&o.stdout))
+            }
+            Ok(Some(o)) => {
+                let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                crate::rate_limit_breaker::global_observe_failure(&stderr, "restore_issue_signals");
+                log::warn!(
+                    "sweep_registry: release veto read for #{issue} failed ({}) — releasing \
+                     without it (fail-open, #11480): {stderr}",
+                    o.status
+                );
+                IssueSignals::default()
+            }
+            Ok(None) | Err(_) => {
+                log::warn!(
+                    "sweep_registry: release veto read for #{issue} timed out or could not \
+                     run — releasing without it (fail-open, #11480)"
+                );
+                IssueSignals::default()
+            }
+        }
     }
 
     /// Run one claim-release `gh issue edit` (`args`) for `issue`, bounded.
