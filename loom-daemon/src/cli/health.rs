@@ -443,6 +443,8 @@ async fn collect(window: Duration) -> HealthReport {
         tmpfs_visibility: tmpfs_visibility_status,
         // 11. CI-telemetry poller health (#9014) — local status.json read.
         ci_telemetry: Some(loom_daemon::ci_telemetry::collect_health(&transcript_ingest_repo_root)),
+        // 12. The last fleet-sync snapshot (#11740) — local file read.
+        fleet_sync: loom_daemon::fleet_sync::probe_status(),
     })
 }
 

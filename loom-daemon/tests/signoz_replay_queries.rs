@@ -24,6 +24,9 @@
 //! disagreement.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "common/hub_image.rs"]
+mod hub_image;
+
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -58,13 +61,14 @@ const AGREEMENT_END: &str = "-- <<< agreement-prefix";
 type Row = BTreeMap<String, serde_json::Value>;
 
 fn clickhouse(script: &str, params: &[(&str, &str)]) -> String {
+    let image = hub_image::resolve(CLICKHOUSE_IMAGE);
     let mut args: Vec<String> = [
         "run",
         "--rm",
         "-i",
         "--entrypoint",
         "clickhouse",
-        CLICKHOUSE_IMAGE,
+        image.as_str(),
         "local",
         "--multiquery",
         "--format=JSONEachRow",

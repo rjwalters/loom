@@ -708,6 +708,9 @@ async fn handle_health(
         // `tmpfs_visibility` section renders here.
         tmpfs_visibility: None,
         ci_telemetry: None,
+        // #11740: the in-process last fleet-sync pass, so the dashboard's
+        // health route raises `fleet_identity` too.
+        fleet_sync: crate::fleet_sync::cached_status(),
     });
 
     let mut body = serde_json::to_value(&health)?;
