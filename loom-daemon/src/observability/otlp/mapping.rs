@@ -5,6 +5,7 @@
 mod auto_update;
 mod checkout_external_change;
 mod ci;
+mod executing_host;
 mod fact_id;
 mod fleet_state;
 mod host_export;
@@ -678,6 +679,8 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
     if let Some(fact) = fact_id::of(&envelope.record) {
         attributes.insert(2, kv_string("loom.fact_id", fact));
     }
+    // Issue #11765: the stage-governing facts name the executing host's build.
+    attributes.extend(executing_host::attributes(envelope));
     Some(LogRecord {
         time_unix_nano,
         observed_time_unix_nano,
