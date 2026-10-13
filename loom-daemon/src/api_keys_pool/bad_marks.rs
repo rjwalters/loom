@@ -441,7 +441,7 @@ fn write_mark(
                     // same class covers (a class mark never covers an
                     // account-wide request).
                     && (m.model_class.is_none() || m.model_class == model_class)
-                    && match (m.resets_at, cooldown_secs) {
+                    && match (m.resets_at, wanted.map(|w| w - now)) {
                         (None, _) => true,
                         (Some(_), None) => false,
                         (Some(have), Some(want)) => {
