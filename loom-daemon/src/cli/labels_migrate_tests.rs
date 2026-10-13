@@ -531,3 +531,30 @@ fn the_write_interval_defaults_to_under_500_an_hour_and_is_overridable() {
     assert_eq!(write_interval(), std::time::Duration::ZERO);
     std::env::remove_var("LOOM_LABEL_WRITE_INTERVAL_MS");
 }
+
+/// 2am#4345 (operator 2026-10-13): `--keep-labels` migrates open items and
+/// never deletes the definition, so closed items keep the label; nothing is
+/// left over for the label afterwards.
+#[test]
+#[serial_test::serial]
+fn keep_labels_relabels_open_items_and_never_deletes() {
+    set_keep_labels(true);
+    let f = Fake::new(&[STAR, IMPORTANT]).item(7, &[STAR, "bug"]);
+    let r = run(&f, "o/r", &[retired(STAR, Some(IMPORTANT), true)], true);
+    set_keep_labels(false);
+    assert_eq!(f.writes(), vec![format!("add #7 {IMPORTANT}"), format!("remove #7 {STAR}")]);
+    assert_eq!(
+        (r.exit, r.summary.deleted, r.summary.relabeled, r.summary.remaining),
+        (0, 0, 1, 0)
+    );
+    assert!(text(&r).contains("RETAINED loom:operator-priority"), "{}", text(&r));
+
+    // Dry run: only the open-item relabel counts as remaining, never a delete.
+    set_keep_labels(true);
+    let f = Fake::new(&[STAR, IMPORTANT]).item(7, &[STAR]);
+    let r = run(&f, "o/r", &[retired(STAR, Some(IMPORTANT), true)], false);
+    set_keep_labels(false);
+    assert!(f.writes().is_empty());
+    assert!(!text(&r).contains("DELETE"), "{}", text(&r));
+    assert!(r.summary.remaining >= 1);
+}
