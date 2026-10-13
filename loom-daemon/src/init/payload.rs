@@ -99,6 +99,7 @@ use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 use tempfile::TempDir;
 
+pub(crate) mod labels_block;
 pub mod standalone;
 pub(crate) mod surfaces;
 
