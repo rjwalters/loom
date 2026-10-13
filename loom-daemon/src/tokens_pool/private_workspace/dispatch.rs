@@ -551,18 +551,10 @@ mod tests {
         // #10955: the child that failed to exec held fd 198 without
         // close-on-exec. On macOS such a child's `flock` can outlive its reap
         // by up to ~1 s under load (measured; a failed exec holding only
-        // close-on-exec descriptors never does), so the release is waited for,
-        // within a bound, rather than read once.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            match lease::Lease::acquire(dir.path()) {
-                Ok(_) => break,
-                Err(e) if std::time::Instant::now() >= deadline => {
-                    panic!("lease must be free after a failed spawn: {e}")
-                }
-                Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
-            }
-        }
+        // close-on-exec descriptors never does), and any other test's child
+        // forked while the lease was held keeps a copy until it execs (#9409),
+        // so the release is waited for, within a bound, rather than read once.
+        drop(super::super::tests::reacquire(dir.path()));
         assert!(!dir.path().join("job.json").exists());
     }
     #[test]
@@ -580,7 +572,9 @@ mod tests {
         assert!(lease::Lease::acquire(dir.path()).is_err());
         assert!(dir.path().join("job.json").exists());
         assert!(child.wait().unwrap().success());
-        lease::Lease::acquire(dir.path()).expect("lease must be free after the child exits");
+        // Free once the child exits — modulo another test's fork still holding
+        // a copy (#9409), which `reacquire` waits out within a bound.
+        drop(super::super::tests::reacquire(dir.path()));
         // Process exit releases the flock, not the durable uncertainty fence.
         assert!(dir.path().join("job.json").exists());
     }

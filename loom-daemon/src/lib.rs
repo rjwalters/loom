@@ -322,6 +322,7 @@ pub mod refname;
 pub mod release_fetch;
 pub mod release_provenance;
 pub mod release_resolve;
+pub mod remote_fleet_exec;
 pub mod renovate_labels;
 pub mod repo_root;
 pub mod restart_verify;
@@ -350,12 +351,6 @@ pub mod runtime_preference;
 #[cfg(test)]
 pub(crate) mod runtime_selection_test_support;
 pub mod safehouse;
-/// Inbound safehouse ChatOps steering (#7893, Phase 3a of #4196). A sibling
-/// module rather than a `safehouse::` submodule: `safehouse.rs` is an
-/// over-threshold file frozen by the file-size ratchet
-/// (`.loom/docs/file-size-policy.md`), and the whole point of the ratchet is
-/// that new code lands in a new module instead.
-pub mod safehouse_chatops;
 pub mod scratch_reclaim;
 pub mod script_helpers;
 /// Content scan for credential-shaped values before commit/push (#9133).

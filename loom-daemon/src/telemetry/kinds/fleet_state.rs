@@ -374,7 +374,6 @@ impl FleetEligibleReason {
             | Qd::DeferredCapacity
             | Qd::DeferredRampCap
             | Qd::DeferredSaturation
-            | Qd::DeferredOutOfSlice
             | Qd::DeferredRepoCap
             | Qd::DeferredFileOverlap
             | Qd::WorkspaceHalted

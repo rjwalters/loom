@@ -163,8 +163,21 @@ pub fn worktree_root_free_gb(repo_root: &Path) -> Option<u64> {
 /// Same "unknown != zero" contract as every other probe in this module (#4164):
 /// `None` means unmeasurable (`df` missing/errored, unparseable output), never a
 /// fabricated `0`.
+/// Test-only pin for [`path_free_gb`] so tests do not depend on live host disk (#11679).
+#[cfg(test)]
+static FREE_GB_OVERRIDE: std::sync::Mutex<Option<u64>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn set_free_gb_override(v: Option<u64>) {
+    *FREE_GB_OVERRIDE.lock().unwrap() = v;
+}
+
 #[must_use]
 pub fn path_free_gb(path: &Path) -> Option<u64> {
+    #[cfg(test)]
+    if let Some(v) = *FREE_GB_OVERRIDE.lock().unwrap() {
+        return Some(v);
+    }
     let probe = nearest_existing_ancestor(path);
     parse_df_available_gb(&df_probe_output(probe)?)
 }
