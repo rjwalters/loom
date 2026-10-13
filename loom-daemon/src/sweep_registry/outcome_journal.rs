@@ -1194,7 +1194,13 @@ impl SweepRegistry {
         );
         envelope.trace_context = trace_context;
         let path = self.config.resolve_outcome_telemetry_path();
-        if let Err(e) = sweep_outcomes::append_outcome_telemetry(&path, &envelope) {
+        // #11348: shadow into the J2 `sweep` stream only after this succeeds.
+        if let Err(e) = telemetry::journal_shadow::after_legacy(
+            &self.config.workspace_root,
+            telemetry::journal_shadow::TelemetryStream::Sweep,
+            || sweep_outcomes::append_outcome_telemetry(&path, &envelope),
+            |()| telemetry::journal_shadow::ShadowRecord::from_envelope(&envelope),
+        ) {
             log::warn!(
                 "sweep_outcomes: failed to append sweep.outcome telemetry record for issue \
                  #{issue} ({sweep_id}) at {}: {e} — best-effort, not blocking reap (#4704)",
@@ -1321,6 +1327,8 @@ impl SweepRegistry {
             pr_number,
             jev,
         });
+        let stage_attempt =
+            super::work_started::stage_attempt(&phase, history.iter().map(|o| o.phase.as_str()));
         // Genuine transition — publish it (see the "Bus emission" doc section
         // above). Ordered after the history push so the dedupe state is already
         // committed even if a subscriber panics on delivery.
@@ -1330,6 +1338,15 @@ impl SweepRegistry {
             pr_number: pr_number.and_then(|n| i32::try_from(n).ok()),
             repo: None, // stamped by emit_event (#3929)
         });
+        // #11641: the role this marker hands the item to began now.
+        self.emit_work_started(
+            sweep_id,
+            *issue,
+            Some(&phase),
+            super::work_started::read_checkpoint_timestamp(&checkpoint),
+            pr_number,
+            stage_attempt,
+        );
     }
 
     /// The most recent `pr_number` observed on this sweep's checkpoint (Issue
@@ -1632,3 +1649,9 @@ mod tokens_status_tests;
     unused_imports
 )]
 mod pr_link_tests;
+
+// #11348: the T1 call site shadows into the J2 `sweep` stream only after the
+// legacy `sweep.outcome` append succeeded, and never when disabled.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod shadow_tests;

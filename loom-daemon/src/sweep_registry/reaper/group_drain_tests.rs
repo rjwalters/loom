@@ -175,3 +175,71 @@ fn no_recorded_pgid_is_an_immediate_pass_through() {
     );
     assert!(registry.pending_group_reaps.is_empty());
 }
+
+/// Issue #11076, the daemon-restart path: `reconstruct` finds a lock whose
+/// leader is dead but whose process group still holds a live member (the
+/// wrapper's retry). It must admit the sweep as `Running` with the lock intact
+/// — not SIGTERM the group and drop the lock in the same pass — and the
+/// reaper's gate then releases only once the group has drained.
+#[test]
+#[serial]
+fn reconstruct_keeps_the_claim_of_a_dead_leader_whose_group_is_alive() {
+    let dir = tempdir().unwrap();
+    let (mut registry, _log) = fixture_registry(dir.path());
+    let (leader_pid, retry_pid, mut leader) =
+        dead_leader_with_survivor(dir.path(), "bash -c 'trap \"\" TERM; sleep 300'");
+    let _ = leader.wait();
+    let sweep_id = "sweep-issue-11079-restart";
+    let lock = registry.config.locks_dir().join("issue-11079");
+    std::fs::create_dir_all(&lock).unwrap();
+    let mut owner = LockOwner::new(11079, leader_pid, sweep_id);
+    owner.pgid = Some(leader_pid);
+    std::fs::write(lock.join("owner.json"), serde_json::to_string_pretty(&owner).unwrap()).unwrap();
+
+    registry.reconstruct().expect("reconstruct should succeed");
+    assert!(lock.exists(), "the claim must survive a restart during a wrapper retry");
+    assert!(is_running(&registry, sweep_id), "the entry is admitted as Running");
+    assert_eq!(registry.entries[sweep_id].pgid, Some(leader_pid));
+    assert!(is_pid_alive(retry_pid), "reconstruct itself must not have killed the retry");
+
+    // First reaper tick: gate takes over (SIGTERM ignored), still held.
+    registry.reap_once();
+    assert!(is_running(&registry, sweep_id));
+    assert!(lock.exists(), "claim held while the retry is alive");
+
+    // Escalate, drain, then release.
+    registry
+        .pending_group_reaps
+        .get_mut(sweep_id)
+        .unwrap()
+        .escalate_at = Instant::now();
+    registry.reap_once();
+    assert!(wait_until_dead(retry_pid, FIXTURE_CHILD_WAIT_MS), "SIGKILL must end the retry");
+    registry.reap_once();
+    assert!(!is_running(&registry, sweep_id), "an empty group ends the sweep");
+    assert!(!lock.exists(), "the claim is released once the group is empty");
+}
+
+/// Control: a dead leader whose group is empty (or recorded as zero) is still
+/// dropped at reconstruct, exactly as before.
+#[test]
+#[serial]
+fn reconstruct_still_drops_a_dead_leader_with_an_empty_group() {
+    let dir = tempdir().unwrap();
+    let (mut registry, _log) = fixture_registry(dir.path());
+    let mut cmd = Command::new("bash");
+    cmd.arg("-c").arg("exit 0");
+    cmd.process_group(0);
+    let mut leader = cmd.spawn().expect("spawn fixture leader");
+    let leader_pid = leader.id();
+    let _ = leader.wait();
+    let lock = registry.config.locks_dir().join("issue-11080");
+    std::fs::create_dir_all(&lock).unwrap();
+    let mut owner = LockOwner::new(11080, leader_pid, "sweep-issue-11080-empty");
+    owner.pgid = Some(leader_pid);
+    std::fs::write(lock.join("owner.json"), serde_json::to_string_pretty(&owner).unwrap()).unwrap();
+
+    registry.reconstruct().expect("reconstruct should succeed");
+    assert!(!lock.exists(), "an empty group leaves nothing to wait for");
+    assert!(registry.get("sweep-issue-11080-empty").is_none());
+}
