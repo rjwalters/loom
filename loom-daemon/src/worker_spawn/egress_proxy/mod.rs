@@ -301,7 +301,9 @@ pub fn prepare(
         let seat = pool_attribution
             .as_ref()
             .map_or("-", |attribution| attribution.account.as_str());
-        observe_context(runtime, selection, seat)
+        // The proxy runs in this launcher process, which has no ops sink:
+        // journal for the daemon's backfill instead (#11300).
+        observe_context(runtime, selection, seat).with_journal(root)
     });
     arm(
         secret,

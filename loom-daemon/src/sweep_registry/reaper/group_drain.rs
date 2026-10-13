@@ -125,6 +125,15 @@ impl SweepRegistry {
         true
     }
 
+    /// Whether a **dead** leader's recorded `pgid` still names a populated,
+    /// safely addressable group (#11076): non-zero, not our own, not recycled
+    /// onto a stranger (#7935/#4980), and with live members. `reconstruct`
+    /// uses it to admit such an entry as `Running` instead of dropping its
+    /// lock, so [`Self::await_group_drain`] owns the release.
+    pub(crate) fn group_still_populated(&self, sweep_id: &str, pgid: u32) -> bool {
+        group_addressable(sweep_id, pgid) && group_has_members(pgid)
+    }
+
     /// SIGKILL any orphaned group that survived its crash-path SIGTERM past
     /// [`ORPHAN_GROUP_REAP_GRACE`] (Issue #4980). Called at the top of every
     /// [`reap_once`](Self::reap_once) tick, mirroring how

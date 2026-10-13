@@ -1162,7 +1162,13 @@ impl SweepRegistry {
         );
         envelope.trace_context = trace_context;
         let path = self.config.resolve_outcome_telemetry_path();
-        if let Err(e) = sweep_outcomes::append_outcome_telemetry(&path, &envelope) {
+        // #11348: shadow into the J2 `sweep` stream only after this succeeds.
+        if let Err(e) = telemetry::journal_shadow::after_legacy(
+            &self.config.workspace_root,
+            telemetry::journal_shadow::TelemetryStream::Sweep,
+            || sweep_outcomes::append_outcome_telemetry(&path, &envelope),
+            |()| telemetry::journal_shadow::ShadowRecord::from_envelope(&envelope),
+        ) {
             log::warn!(
                 "sweep_outcomes: failed to append sweep.outcome telemetry record for issue \
                  #{issue} ({sweep_id}) at {}: {e} — best-effort, not blocking reap (#4704)",
@@ -1589,3 +1595,9 @@ mod tokens_status_tests;
     unused_imports
 )]
 mod pr_link_tests;
+
+// #11348: the T1 call site shadows into the J2 `sweep` stream only after the
+// legacy `sweep.outcome` append succeeded, and never when disabled.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod shadow_tests;

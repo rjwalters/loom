@@ -208,16 +208,6 @@ pub struct TickReport {
     /// result keys on [`deferred_build_backoff`](Self::deferred_build_backoff)
     /// instead, so a repo that stays held cannot mask other outcomes.
     pub build_backoff_held: bool,
-    /// Candidates deferred THIS TICK because they fell outside this host's
-    /// preferred repo slice while the slice still had at least one eligible
-    /// in-slice candidate (Issue #6243, [`tick_multi_with_sharding`](super::tick_multi_with_sharding)).
-    /// Always `0` when sharding is not configured at the call site
-    /// (`preferred_slice: None`) — see `defaults/docs/dispatcher-repo-sharding.md`.
-    /// Purely observational (mirrors [`deferred_saturation`](Self::deferred_saturation)'s
-    /// shape): these candidates are NOT lost — they remain ready and are
-    /// re-evaluated (and, if still out-of-slice with the slice non-empty,
-    /// deferred again) on the next tick.
-    pub deferred_out_of_slice: usize,
     /// Candidates deferred THIS TICK because their own repo was already at
     /// `autonomous.workFinder.maxConcurrentPerRepo` (Issue #9090,
     /// [`repo_cap`](super::repo_cap)). Always `0` when the knob is absent (the
@@ -228,7 +218,7 @@ pub struct TickReport {
     /// reached, one repo's share of it was, so an operator reading
     /// `deferred_capacity` is never sent to raise a ceiling that is not binding.
     /// Purely observational (mirrors
-    /// [`deferred_out_of_slice`](Self::deferred_out_of_slice)'s shape): these
+    /// [`deferred_saturation`](Self::deferred_saturation)'s shape): these
     /// candidates are NOT lost — they stay ready and are re-evaluated next tick,
     /// and within THIS tick their deferral is handed straight to the next
     /// candidate, which is another repo's work.
@@ -275,14 +265,11 @@ pub struct TickReport {
     pub occupancy: Option<usize>,
     /// The shaped candidate order pass 2 iterated, as `(workspace_idx,
     /// issue)` (Issue #9288): the global sort after `repo_cap::shape_queue`'s
-    /// slice and affinity partitions. Recorded before pass 2 runs, so it is
+    /// affinity partition. Recorded before pass 2 runs, so it is
     /// the order `dispatch()` was offered candidates in, including those a
     /// gate then deferred. The published plan's `position` is read from here
     /// and never re-derived. Empty for the single-workspace tick.
     pub plan_order: Vec<(usize, u32)>,
-    /// The preferred repo slice the tick shaped with (#6243), or `None` when
-    /// sharding was not configured at the call site.
-    pub in_slice: Option<Vec<bool>>,
     /// The per-repo cap and top-of-tick per-workspace occupancy (#9090) the
     /// tick shaped with. `None` for the single-workspace tick.
     pub repo_cap: Option<super::repo_cap::RepoCapSnapshot>,
@@ -348,7 +335,6 @@ impl TickReport {
         TickReport {
             occupancy: None,
             max_admissions_per_tick: None,
-            in_slice: None,
             repo_cap: None,
             overflow_free: None,
             workspace_draw: None,
