@@ -40,6 +40,8 @@ mod telemetry_export;
 mod telemetry_fixture;
 #[path = "telemetry_join.rs"]
 mod telemetry_join;
+#[path = "telemetry_journal_cli.rs"]
+mod telemetry_journal_cli;
 #[path = "telemetry_live.rs"]
 mod telemetry_live;
 #[path = "telemetry_overhead.rs"]
@@ -53,6 +55,10 @@ mod usage_record;
 pub(crate) enum TelemetryCommand {
     /// Journal one Curator completion before applying curated labels.
     CurationComplete(curation_complete::CurationCompleteArgs),
+    /// J2 telemetry journal shadow streams (#11348): `append` one record
+    /// after a legacy write, `verify` the concern against the legacy stores.
+    #[command(name = "telemetry")]
+    TelemetryJournal(telemetry_journal_cli::TelemetryJournalArgs),
     /// Plan or explicitly execute two bounded Pi/OpenCode GLM smoke runs.
     TelemetryLiveCanary(telemetry_live::LiveArgs),
     /// Write deterministic synthetic telemetry and an independent-query manifest.
@@ -197,6 +203,7 @@ impl TelemetryCommand {
     pub(crate) async fn run(self) -> Result<()> {
         match self {
             TelemetryCommand::CurationComplete(args) => args.run(),
+            TelemetryCommand::TelemetryJournal(args) => args.run(),
             TelemetryCommand::TelemetryLiveCanary(args) => args.run(),
             TelemetryCommand::TelemetryFixture(args) => args.run(),
             TelemetryCommand::TelemetryOverhead(args) => args.run(),

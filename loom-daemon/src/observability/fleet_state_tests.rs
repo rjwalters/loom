@@ -73,6 +73,7 @@ fn ready(repo: &str, issue: u32, rank: u32) -> ReadyItem {
 fn input() -> FleetInput {
     FleetInput {
         champion: BTreeMap::new(),
+        curator: BTreeMap::new(),
         host_id: "robb-studio".to_string(),
         managed: [REPO, OTHER].iter().map(|s| (*s).to_string()).collect(),
         held: vec![held(REPO, 10, FleetStage::SweepBuilder, false)],
@@ -96,6 +97,7 @@ fn input() -> FleetInput {
             halts: BTreeMap::new(),
             limits: Default::default(),
         }),
+        slots: None,
         capacity: None,
         main_ci: BTreeMap::new(),
     }
@@ -1109,4 +1111,57 @@ fn champion_metadata_alone_triggers_delta_and_old_payload_remains_unknown() {
             .champion,
         None
     );
+}
+
+/// #11643: `build_view` surfaces the directly-provided, locally-measured
+/// `slots` even before the work finder's first tick (`ready: None`), so
+/// `slots.max_concurrent` is present from the first pass of a process and
+/// after a roll — not gated on a dispatch plan.
+#[test]
+fn slots_present_before_first_tick_from_local_state() {
+    let input = FleetInput {
+        host_id: "robb-studio".to_string(),
+        ready: None,
+        slots: Some(FleetSlots {
+            max_concurrent: 6,
+            occupancy: Some(0),
+        }),
+        ..FleetInput::default()
+    };
+    let view = build_view(&input, None, t0());
+    assert_eq!(
+        view.slots,
+        Some(FleetSlots {
+            max_concurrent: 6,
+            occupancy: Some(0),
+        }),
+        "locally-measured slots must survive to the view without a work-finder tick"
+    );
+}
+
+/// #11643: the directly-provided local slots win over the work-finder plan's
+/// `ready.slots`; absent local slots fall back to the plan's.
+#[test]
+fn build_view_prefers_local_slots_over_plan_slots() {
+    let local = FleetSlots {
+        max_concurrent: 6,
+        occupancy: Some(2),
+    };
+    let plan = FleetSlots {
+        max_concurrent: 4,
+        occupancy: Some(1),
+    };
+    let with_ready = |slots: Option<FleetSlots>| FleetInput {
+        host_id: "robb-studio".to_string(),
+        slots,
+        ready: Some(ReadyQueue {
+            slots: Some(plan),
+            ..ReadyQueue::default()
+        }),
+        ..FleetInput::default()
+    };
+    // Local slots present → preferred.
+    assert_eq!(build_view(&with_ready(Some(local)), None, t0()).slots, Some(local));
+    // Local slots absent → fall back to the plan's.
+    assert_eq!(build_view(&with_ready(None), None, t0()).slots, Some(plan));
 }

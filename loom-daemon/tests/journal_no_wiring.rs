@@ -1,6 +1,7 @@
 //! Tree invariant for Epic #9908 Phase 2a (#11345): the shared journal core
-//! has **no production caller**. No runtime producer is migrated or wired,
-//! so no existing state or read path can change by this slice landing.
+//! has **no production caller** outside the reviewed seams in [`ALLOWED`].
+//! Phase 2d (#11348) wires the T1-T6 telemetry producers, default-off and
+//! shadow-only, through `telemetry::journal_shadow` alone.
 //!
 //! Every `src/` file other than the journal module itself and its CLI seam
 //! (`cli/journal_cli.rs`) must not name `crate::journal` /
@@ -29,6 +30,8 @@ use std::path::{Path, PathBuf};
 use regex::Regex;
 
 /// Paths (relative to the crate root) allowed to reference the core.
+/// Phase 2d (#11348): producers reach the core only through
+/// `telemetry::journal_shadow`.
 const ALLOWED: &[&str] = &[
     "src/journal/",
     "src/cli/journal_cli.rs",
@@ -50,6 +53,7 @@ const ALLOWED: &[&str] = &[
     "src/script_helpers/validate_phase.rs",
     // Daemon startup: one-shot shadow-store verification log.
     "src/daemon_service.rs",
+    "src/telemetry/journal_shadow/",
 ];
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {

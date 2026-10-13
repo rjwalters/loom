@@ -370,7 +370,11 @@ refusal/rejection handling.
 
 **Reference implementation:** `defaults/scripts/lib/classify-error.sh`. It is
 **exit-code-first** (a clean `exit 0` is `SUCCESS` regardless of output content,
-the #3233 fix) and only inspects output on a genuine non-zero exit. Its category
+the #3233 fix) and only inspects output on a genuine non-zero exit. Since
+#11208 the same classifier also ships natively as `loom-daemon classify-error`;
+the shell library delegates when a daemon binary resolves and keeps its tables
+as the no-daemon fallback, with the two renderings pinned equal by
+`test-classify-error.sh`. Its category
 set:
 
 | Category | Meaning | Dispatcher action |
@@ -2162,6 +2166,16 @@ ttft_ms,error_code,stream}` plus `loom.runtime`, `loom.role`, `loom.issue`,
 PR and sweep come from the launching environment (`LOOM_ROLE`,
 `LOOM_ISSUE_NUMBER` or the `sweep-issue-<N>-` sweep id, `LOOM_PR_NUMBER`,
 `LOOM_SWEEP_ID`).
+
+**Delivery from the launcher process.** A proxied launch runs the proxy inside
+the `loom-daemon worker …` launcher, not the daemon, and that process has no
+ops sink, so the metrics above exist only when the proxy runs in-daemon. In the
+launcher each request's `loom.egress.request` span (which carries every metric
+field) is written as the only entry of its own trace journal,
+`.loom/logs/trace-context/egress-<span-id>.jsonl`; the daemon's backfill pass
+drains it to the OTLP queue and retires the file. Journals are written only
+when the workspace exports traces (an `otlp` exporter is configured);
+otherwise observe records are dropped.
 
 Not in this slice (tracked on #11300): marking the pool from the live 429,
 loopback proxying of uncontained launches, and injecting the OpenCode base URL

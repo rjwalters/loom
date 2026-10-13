@@ -54,33 +54,85 @@ fn validation_rejects_bad_registries() {
     assert!(mutate(&park_only).is_err());
 }
 
-/// #11510: the labels the daemon no longer reads stay in the registry until
-/// their forge migration (#11511 / #11513), marked `retired`; no other label
-/// is.
 #[test]
-fn the_retired_priority_and_tier_labels_are_marked_retired() {
-    let retired: Vec<&str> = reg()
-        .labels
+fn validation_rejects_bad_retired_entries() {
+    let good: serde_json::Value = serde_json::from_str(REGISTRY_JSON).unwrap();
+    let mutate = |f: &dyn Fn(&mut serde_json::Value)| {
+        let mut v = good.clone();
+        f(&mut v);
+        Registry::parse(&v.to_string())
+    };
+    // A retired name that is still declared.
+    assert!(mutate(&|v| v["retired"][0]["name"] = "loom:pr".into()).is_err());
+    // A duplicate retired name.
+    assert!(mutate(&|v| v["retired"][1]["name"] = v["retired"][0]["name"].clone()).is_err());
+    // replaced_by naming an unknown label, and a paused (non-active) one.
+    assert!(mutate(&|v| v["retired"][0]["replaced_by"] = "loom:nope".into()).is_err());
+    assert!(mutate(&|v| {
+        let labels = v["labels"].as_array_mut().unwrap();
+        let paused = labels.iter_mut().find(|l| l["name"] == "points:1").unwrap();
+        paused["lifecycle"] = "paused".into();
+        v["retired"][0]["replaced_by"] = "points:1".into();
+    })
+    .is_err());
+    // A retired entry must name its retiring issue, and has a fixed shape.
+    assert!(mutate(&|v| v["retired"][0]["retired_in"] = "".into()).is_err());
+    assert!(mutate(&|v| v["retired"][0]["extra"] = true.into()).is_err());
+    // `lifecycle: retired` is gone: a retired label lives in `retired`.
+    assert!(mutate(&|v| v["labels"][0]["lifecycle"] = "retired".into()).is_err());
+    // An absent `retired` array is an empty one.
+    assert!(mutate(&|v| {
+        v.as_object_mut().unwrap().remove("retired");
+    })
+    .is_ok());
+}
+
+/// #11513: every label retired by the priority rollout (#11103) and the label
+/// cleanup (#11105) has a mapping entry (a replacement or an explicit none),
+/// with the agreed replacement, and none of them is still declared.
+#[test]
+fn every_retired_label_has_its_mapping_entry() {
+    let want: &[(&str, Option<&str>, bool, &str)] = &[
+        ("loom:operator-priority", Some("loom:important"), true, "#11103"),
+        ("loom:operator-high-priority", Some("loom:very-important"), true, "#11103"),
+        ("loom:high-priority-inherited", None, true, "#11103"),
+        ("tier:goal-advancing", None, true, "#11103"),
+        ("tier:goal-supporting", None, true, "#11103"),
+        ("tier:maintenance", None, true, "#11103"),
+        // Never declared by Loom (a consumer's label): add the replacement,
+        // never remove or delete it.
+        ("priority:high", Some("loom:important"), false, "#11103"),
+        ("loom:urgent", None, true, "#11105"),
+        ("loom:heavy", None, true, "#11105"),
+        ("loom:operator-objective", None, true, "#11105"),
+    ];
+    let got: Vec<(&str, Option<&str>, bool, &str)> = reg()
+        .retired
         .iter()
-        .filter(|l| l.lifecycle == "retired")
-        .map(|l| l.name.as_str())
+        .map(|r| (r.name.as_str(), r.replaced_by.as_deref(), r.owned, r.retired_in.as_str()))
         .collect();
-    assert_eq!(
-        retired,
-        vec![
-            "loom:operator-priority",
-            "loom:operator-high-priority",
-            "loom:high-priority-inherited",
-            "tier:goal-advancing",
-            "tier:goal-supporting",
-            "tier:maintenance",
-        ]
-    );
+    assert_eq!(got, want);
+    for (name, ..) in want {
+        assert!(reg().get(name).is_none(), "{name} is retired but still declared");
+        assert!(reg().get_retired(name).is_some(), "{name}");
+    }
+    assert!(reg().get_retired("loom:pr").is_none());
     for name in [
         crate::priority_pick::IMPORTANT_LABEL,
         crate::priority_pick::VERY_IMPORTANT_LABEL,
     ] {
         assert_eq!(reg().get(name).unwrap().lifecycle, "active", "{name}");
+    }
+}
+
+/// A retired label must never reach `labels.yml`: `sync-labels.sh` is
+/// additive and would re-create it on every sync.
+#[test]
+fn no_retired_label_is_rendered_into_labels_yml() {
+    let block = generate::loom_block(reg());
+    let names = generate::block_names(&block);
+    for r in &reg().retired {
+        assert!(!names.contains(&r.name), "{} rendered into labels.yml", r.name);
     }
 }
 

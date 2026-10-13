@@ -15,10 +15,9 @@
 //! every terminal transition even while
 //! `autonomous.sweepOutcomeWriteback.enabled` stays at its default `false`.
 //!
-//! The extraction regex and closed vocabulary themselves live in
-//! [`crate::points_marker`], shared with the `require-complexity-marker.sh`
-//! validation helper (`cli::points_marker_check`, the daemon's binary crate)
-//! so the two never drift apart.
+//! The marker parser and closed vocabulary live in [`crate::points_marker`],
+//! shared with the `curation-complete` points gate so the two never drift
+//! apart. This read is body-only and ignores a retired tier marker.
 //!
 //! # Fail-open contract
 //!
@@ -83,6 +82,6 @@ impl SweepRegistry {
             }
         };
         let body = String::from_utf8_lossy(&output.stdout);
-        extract_points_marker(&body).map(str::to_string)
+        extract_points_marker(&body).map(|points| points.to_string())
     }
 }

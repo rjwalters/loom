@@ -3195,6 +3195,26 @@ if [[ -f "$WRITE_ROOT/.github/labels.yml" && -x "$LABELS_SYNC_SCRIPT" ]]; then
     esac
 fi
 
+# ---------- retired forge label migration: PREVIEW ONLY (#11511) ----------
+#
+# Labels Loom retires (defaults/labels.json `retired`, #11513) stay on every
+# other repo's forge, on open items too, because the additive step above never
+# deletes or relabels. `loom-daemon labels migrate` is what moves open items
+# onto the replacements and deletes the retired labels -- an irreversible
+# forge write (a deleted label vanishes from closed items too), so resync only
+# ever runs its read-only dry run, never --apply (#10770: resync's forge
+# writes stay opt-in). When anything is pending it prints the report and the
+# exact command the operator runs to apply it. Reuses the daemon resolved for
+# the .gitignore refresh; an older daemon without the verb is skipped quietly.
+if [[ -n "$EGRESS_BIN" && -f "$WRITE_ROOT/.github/labels.yml" ]] && "$EGRESS_BIN" labels migrate --help >/dev/null 2>&1; then
+    migrate_rc=0; migrate_output="$(cd "$REPO_ROOT" && "$EGRESS_BIN" labels migrate 2>&1)" || migrate_rc=$?
+    if [[ "$migrate_rc" -ne 0 ]]; then
+        printf '%b\n' "${YELLOW}[resync] Retired forge labels pending migration (dry run, read-only -- nothing was changed):${NC}"
+        printf '%s\n' "$migrate_output" | sed 's/^/    /'
+        [[ "$migrate_rc" -ne 3 ]] || printf '%b\n' "  apply with: ${BOLD}(cd $REPO_ROOT && loom-daemon labels migrate --apply)${NC}  (or: .loom/scripts/sync-labels.sh --migrate-retired)"
+    fi
+fi
+
 # ---------- shared: classify this run's working-tree dirt (#9141) ----------
 #
 # ONE `git status --porcelain` walk of WRITE_ROOT, classified into three
@@ -3450,6 +3470,24 @@ fi
 # was finalized, above — this is just a defensive no-op re-assertion in case a
 # future refactor adds another early-return path between the two)
 clear_resync_marker
+
+# #10238: (re)provision the USER-SCOPE skill/agent links + dispatcher from the
+# source checkout this run synced from. Best-effort and NEVER fatal -- it must
+# not change this script's exit status. Skipped under --dry-run, when the
+# source is not a plain git checkout (e.g. a staging worktree), or with
+# LOOM_RESYNC_SKIP_USER_SCOPE=1.
+if [[ "$DRY_RUN" -eq 0 && "${LOOM_RESYNC_SKIP_USER_SCOPE:-0}" != "1" \
+      && -d "$SOURCE_ROOT/.git" && -r "$SOURCE_ROOT/scripts/install/provision-skills.sh" \
+      && -r "$SOURCE_ROOT/scripts/install/provision-dispatcher.sh" ]]; then
+    (
+        # shellcheck source=/dev/null
+        source "$SOURCE_ROOT/scripts/install/provision-dispatcher.sh"
+        # shellcheck source=/dev/null
+        source "$SOURCE_ROOT/scripts/install/provision-skills.sh"
+        provision_loom_dispatcher "$SOURCE_ROOT" >&2 || true
+        provision_loom_skills "${LOOM_HOME:-$HOME/.local/share/loom}" >&2 || true
+    ) || printf '%b\n' "${YELLOW}[resync] user-scope skill provisioning failed (non-fatal).${NC}" >&2
+fi
 
 # A check that did not run is stated in the summary line, not only in a
 # warning that scrolled past 400 lines ago (#7745).

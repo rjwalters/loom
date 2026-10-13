@@ -35,9 +35,11 @@
 -- one to 0/''/"unknown"), so every column the payload feeds is NULLable and
 -- stays NULL when the key is absent. The `disposition` (#9441),
 -- `tokens_status` (#9440), `hw_*`/`generated_lines`/`test_lines` (#9466),
--- `story_points` (#9432/#9433) and lineage (#9444) columns are NULL in bulk
--- until those emitters land and the backfill re-runs — that is the rollup
--- working, not failing.
+-- `story_points` (#9432/#9433), lineage (#9444) and `dispatch_origin`
+-- (#11444) columns are NULL in bulk until those emitters land and the backfill
+-- re-runs — that is the rollup working, not failing. `dispatch_origin` is
+-- absent on every row written before #11444 (a `sweep.outcome` payload that
+-- predates the field), where it reads NULL — never '' and never 'unknown'.
 --
 -- Upgrading an INSTALLED table (#9507). `IF NOT EXISTS` means a column added
 -- below never reaches a database that ran an earlier version of this file —
@@ -79,6 +81,7 @@ CREATE TABLE IF NOT EXISTS sweep_facts (
     attempt_index          INTEGER,
     previous_sweep_id      TEXT,
     trigger                TEXT,
+    dispatch_origin        TEXT,
     rework_substantive     INTEGER,
     rework_environmental   INTEGER,
     rework_substantive_sec INTEGER,
@@ -155,7 +158,7 @@ INSERT OR REPLACE INTO sweep_facts
      hw_lines_added, hw_lines_deleted, hw_files, generated_lines, test_lines,
      story_points,
      doctor_cycles, judge_verdicts,
-     attempt_index, previous_sweep_id, trigger,
+     attempt_index, previous_sweep_id, trigger, dispatch_origin,
      rework_substantive, rework_environmental,
      rework_substantive_sec, rework_environmental_sec,
      rework_substantive_open, rework_environmental_open,
@@ -192,6 +195,7 @@ SELECT
     json_extract(r.payload, '$.attempt_index')        AS attempt_index,
     json_extract(r.payload, '$.previous_sweep_id')    AS previous_sweep_id,
     json_extract(r.payload, '$.trigger')              AS trigger,
+    json_extract(r.payload, '$.dispatch_origin')      AS dispatch_origin,
     CASE
         WHEN json_extract(r.payload, '$.rework_events') IS NULL THEN NULL
         ELSE (SELECT count(*) FROM json_each(r.payload, '$.rework_events') je

@@ -12,11 +12,12 @@ invisible to `gh pr list`, the dashboard, or any label-filtered query. See
 prompted this (four Judge-approved PRs sat held-but-invisible for up to 126
 hours).
 
-Story-point estimation is paused. Curators leave existing `points:*` labels
-and `loom:points` body markers as historical data, without assigning or
-refreshing them on curation, re-curation or rescoping. Points do not gate
-`loom:curated`; the complexity routing marker remains required. The retained
-rubric is in `.loom/docs/story-points.md`.
+Story points gate `loom:curated`. The Curator writes one
+`<!-- loom:points=N -->` marker in the issue body or a curation comment, and
+`loom-daemon curation-complete` validates it (the newest trusted comment with
+a marker wins, else a trusted author's body), then applies `points:N` (removing
+any other `points:*` label) and `loom:curated`. A missing or invalid marker
+leaves the issue uncurated. The rubric is in `.loom/docs/story-points.md`.
 
 `loom:operator` moves that state onto the label substrate, where every other
 pipeline state already lives.
@@ -215,20 +216,22 @@ gh pr edit <N> --remove-label "loom:operator"
   the new head naming the kind, and anything short of a positive proof — including
   a re-added `loom:operator`, which is a human re-asserting the hold — re-arms.
   See `champion-critical-file-hold.md` and `critical-file-hold.md`.
-- **Merge-risk hold** (criterion #2): the release is scoped to the *concern* — the
-  label is not re-asserted while the freshly-derived concern reads byte-identical
-  to the one already on record (#7048). A genuinely new concern re-holds and says
-  what changed.
+- **Merge-risk hold** (criterion #2): your removal (an `unlabeled` event after the
+  hold) **releases** it (#11416, superseding #7048's "respected, still held").
+  Champion re-reads the PR and, unless it finds a concern the hold did not name,
+  merges it itself on its next tick (criteria #3-#6 still apply), posting the
+  reversal comment. A genuinely new concern re-holds with a fresh notice naming
+  it; removing the label again releases that one.
 
-Neither release makes Champion merge the PR itself, and neither weakens the #8112
+Releasing a critical-file hold never makes Champion merge the PR (criterion #3
+still fails), and neither release weakens the #8112
 guard for any other label: a `loom:changes-requested` or `loom:review-requested`
 standing next to `loom:pr` still blocks the merge outright.
 
-Two consequences of a released hold, both intended and both shared with #7048's
-merge-risk case: the PR drops out of the `loom:operator`-keyed **Held-PR Census**
-count (it is a *label* census, and the point is that the label stops tracking your
-decision — the hold's marker comment is never removed, so it stays findable by
-comment search), and it becomes visible again to Doctor's Priority-1
+Two consequences of a released hold, both intended: the PR drops out of the
+`loom:operator`-keyed **Held-PR Census** count, but is listed on the census's
+`Released holds, not yet merged` line until it merges (#11416 — keyed on the
+hold marker, which is never removed), and it becomes visible again to Doctor's Priority-1
 `CONFLICTING` queue, which excludes held PRs (#5978). If Doctor does rebase it,
 the head moves and a critical-file hold re-arms on the new head — which is the
 correct outcome, not a regression: your release was about the diff you read.
@@ -505,9 +508,8 @@ nothing, and (Part 2's concern, not this doc's) a worker's own declared
 holds must be checked against the same closed vocabulary.
 
 **Parser convention.** Anchor to the full `<!-- loom:capability=<value> -->`
-comment form, never a bare substring — the same anchoring
-`require-complexity-marker.sh` uses for `loom:complexity`, and for the same
-reason (#4840): prose that merely *quotes* the marker syntax as literal
+comment form, never a bare substring — the same anchoring the retired
+complexity-marker gate used, and for the same reason (#4840): prose that merely *quotes* the marker syntax as literal
 example text (exactly as this section does above, and as the issue that
 introduced this convention did in its own body) must never be mistaken for a
 live marker. The value grammar is `[a-z0-9][a-z0-9:_-]*` — lowercase
@@ -1016,9 +1018,10 @@ registry; dep_classify's operator-only names stay consts, lockstep-tested
 against `requires_base`/`remove_with` (#5671). Changes go in the registry.
 The `propagate` table (#10012) was removed (#11510) after #11104 removed
 the star-liveness pass that read it. `stale_after_minutes` and `lifecycle`
-are inert; `lifecycle: retired` marks a label the daemon no longer reads
-(the operator-star levels and `tier:*`, #11103), kept until its forge
-migration.
+are inert. A retired label leaves `labels` for the top-level `retired`
+array (#11513): `{name, replaced_by, owned, retired_in}`, the old -> new
+mapping the forge-side migration (#11511) applies. It is never rendered into
+`labels.yml`, so `sync-labels.sh` cannot re-create it.
 
 ## No-op hold (#10156)
 

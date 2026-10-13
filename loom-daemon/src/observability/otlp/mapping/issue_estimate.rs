@@ -51,11 +51,11 @@ mod tests {
             repo: "o/r".to_string(),
             issue: 42,
             estimate: Estimate {
-                difficulty: 4,
                 lines: 1500,
                 files: 8,
                 doctor_risk: 0.63,
             },
+            points: Some(8),
             model: Some("actual-curator".to_string()),
             runtime: Some("codex".to_string()),
             estimated_at: Utc::now(),

@@ -458,7 +458,9 @@ pub fn append_record(record: &Value, stats_file: Option<&str>) -> std::io::Resul
         opts.mode(0o600);
     }
     let mut f = opts.open(&path)?;
-    f.write_all(line.as_bytes())
+    f.write_all(line.as_bytes())?;
+    crate::telemetry::journal_shadow::shadow_experiment(&path, record); // #11348, after legacy
+    Ok(())
 }
 
 /// The fields of one outcome-chain record. The HARD deterministic fields

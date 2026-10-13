@@ -204,7 +204,7 @@ pub fn resolve_forge_config(cwd: Option<&Path>) -> Value {
 }
 
 /// Extract the hostname from a git remote URL (SSH or HTTPS form).
-fn parse_host(url: &str) -> Option<String> {
+pub(crate) fn parse_host(url: &str) -> Option<String> {
     // SSH: git@host:owner/repo.git
     if let Some(rest) = url.strip_prefix("git@") {
         if let Some((host, _)) = rest.split_once(':') {
@@ -226,7 +226,7 @@ fn parse_host(url: &str) -> Option<String> {
 }
 
 /// Get the `origin` remote URL from `cwd`, or `None`.
-fn get_remote_url(cwd: &Path) -> Option<String> {
+pub(crate) fn get_remote_url(cwd: &Path) -> Option<String> {
     let mut cmd = Command::new("git");
     cmd.args(["remote", "get-url", "origin"])
         .current_dir(cwd)

@@ -256,6 +256,10 @@ pub struct GhForge {
     repo: Option<String>,
     /// Memoized write-scope verdict: `Err(reason)` refuses every write.
     write_ok: Option<Result<(), String>>,
+    /// `Some(gh)`: vet writes under the workspace's own per-owner credential
+    /// with this `gh` (#11437), as the tick's gate does. `None` (the default,
+    /// CLI callers) vets under the process credential.
+    root_credential_gh: Option<PathBuf>,
 }
 
 const GH_TIMEOUT: Duration = Duration::from_secs(60);
@@ -276,6 +280,20 @@ fn encode_segment(s: &str) -> String {
     out
 }
 
+/// The write-scope verdict for `repo` (or the root's origin): under the
+/// root's own credential when `gh` is given (#11437), else the process's.
+fn scope_verdict(
+    root: &std::path::Path,
+    repo: Option<&str>,
+    gh: Option<&std::path::Path>,
+) -> crate::write_scope::Verdict {
+    match (gh, repo.map(str::trim).filter(|r| !r.is_empty())) {
+        (Some(gh), Some(r)) => crate::write_scope::repo_writable_with(root, r, gh),
+        (Some(gh), None) => crate::write_scope::root_writable_with(root, gh),
+        (None, _) => crate::write_scope::may_write_from(root, repo),
+    }
+}
+
 impl GhForge {
     #[must_use]
     pub fn new(repo_root: PathBuf, repo: Option<String>) -> Self {
@@ -283,14 +301,27 @@ impl GhForge {
             repo_root,
             repo,
             write_ok: None,
+            root_credential_gh: None,
+        }
+    }
+
+    /// Like [`Self::new`], but writes are vetted under the root's own
+    /// per-owner credential probed with `gh_bin` (#11437) — the credential
+    /// the tick's gate admitted the root under, and the one the write uses.
+    #[must_use]
+    pub fn for_root_credential(repo_root: PathBuf, repo: Option<String>, gh_bin: PathBuf) -> Self {
+        Self {
+            root_credential_gh: Some(gh_bin),
+            ..Self::new(repo_root, repo)
         }
     }
 
     /// Refuse a forge write the write scope denies (#9548).
     fn check_write(&mut self) -> Result<(), String> {
         let (root, repo) = (&self.repo_root, self.repo.as_deref());
+        let gh = self.root_credential_gh.as_deref();
         self.write_ok
-            .get_or_insert_with(|| match crate::write_scope::may_write_from(root, repo) {
+            .get_or_insert_with(|| match scope_verdict(root, repo, gh) {
                 crate::write_scope::Verdict::Allow(_) => Ok(()),
                 crate::write_scope::Verdict::Deny(why) => {
                     Err(format!("refusing the write (#9548): {why}"))

@@ -228,8 +228,12 @@ pub fn workspace_draw_record(
                 roll: step.draw.roll,
                 picked: resolve(step.workspace_idx),
                 number: step.issue,
+                p_min: Some(step.draw.p_min),
             })
             .collect(),
+        // One temperature per tick: every draw of a `draw_order` run weighs
+        // at the same one (#11684).
+        temperature: log.steps.first().map(|step| step.draw.temperature),
     }
 }
 
@@ -479,6 +483,15 @@ pub fn emit_role_tick(
         ended_at: Utc::now(),
         outcome: crate::role_tick_telemetry::result_label(result),
     };
+    // #11641: the PRs this tick's agent began working, from the same journal.
+    if let Some(journal) = &journal {
+        super::work_started::emit_role_tick(
+            role,
+            &repo_label(root),
+            &tick.tick_id,
+            &journal.entries,
+        );
+    }
     let holds: &[&str] = crate::role_runner::demand::DebtAxis::for_role(role)
         .map_or(&[], crate::role_runner::demand::axis_park_labels);
     let observed = RoleObservation { journal, gate };

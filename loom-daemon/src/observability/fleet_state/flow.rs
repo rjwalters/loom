@@ -100,6 +100,23 @@ impl QueueFlowTracker {
         expire(&mut flow.drains, cutoff);
     }
 
+    /// The size of the last set observed for `repo` (its queue depth as of
+    /// the last [`Self::observe`]), or `None` when it was never observed. Used
+    /// for a queue read only on some passes (e.g. the triage queue, #11642):
+    /// between reads the depth is the last observed set, never a stale guess.
+    #[must_use]
+    pub fn depth(&self, repo: &str) -> Option<u32> {
+        self.repos
+            .get(repo)
+            .map(|flow| u32::try_from(flow.last_set.len()).unwrap_or(u32::MAX))
+    }
+
+    /// Every repo this tracker has observed, so a pass with no fresh read can
+    /// re-stamp each from the last observed set (#11642).
+    pub fn observed_repos(&self) -> impl Iterator<Item = &str> {
+        self.repos.keys().map(String::as_str)
+    }
+
     /// The repo's flow at `now`, or `None` when it was never observed. Counts
     /// are filtered to the window on read, so a repo not observed this pass
     /// still reports correctly.

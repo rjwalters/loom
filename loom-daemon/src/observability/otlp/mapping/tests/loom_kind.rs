@@ -113,7 +113,7 @@ fn samples() -> Vec<TelemetryRecord> {
                     "event": "label.transition", "observed_at": AT, "open_estimates": 0,
                     "loom": p})),
         wire(json!({"kind": "issue.estimate", "repo": "rjwalters/loom", "issue": 1,
-                    "difficulty": 2, "lines": 12, "files": 1, "doctor_risk": 0.1,
+                    "lines": 12, "files": 1, "doctor_risk": 0.1, "points": 3,
                     "model": "curator-model", "runtime": "codex", "estimated_at": AT,
                     "completion_id": "91670540-172a-46f1-8278-3f12662fa371", "loom": p})),
         wire(json!({"kind": "session.output", "schema": 1, "runtime": "claude",
@@ -153,6 +153,10 @@ fn samples() -> Vec<TelemetryRecord> {
                     "workspace": "loom", "outcome": "success", "source": "probe",
                     "probed_count": 0, "api_key_probe_count": 0, "accounts": [],
                     "duration_ms": 0, "loom": p})),
+        wire(json!({"kind": "stage.work_started", "repo": "rjwalters/loom", "issue": 1,
+                    "stage": "doctor", "role": "doctor", "sweep_id": "s",
+                    "stage_attempt": 1, "started_at": AT, "source": "sweep_checkpoint",
+                    "observed_at": AT, "loom": p})),
     ]
 }
 

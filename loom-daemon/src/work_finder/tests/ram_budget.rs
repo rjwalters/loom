@@ -39,7 +39,6 @@ fn run(multi: &mut [(FakeSource, RecordingDispatcher)], max: usize, ram: RamBudg
         None,
         usize::MAX,
         false,
-        None,
         (None, Some(ram)),
         &[],
         &[],

@@ -45,17 +45,25 @@ no priority side listing), and no priority exempts a candidate from any gate
      (`"very-important"`); if several qualify at a tier, the draw is among
      just those. Otherwise it is over every workspace with dispatchable work
      (`"all"`).
-   - **Weight mapping.** A workspace's `fleet_priority` (the `priority`
-     integer in `workspaces.json`; lower = higher priority, default `100`) is
-     reinterpreted as a weight: `weight = max(1, 1000 / (1 + priority))`,
-     integer division. Priority `0` weighs 1000, `10` weighs 90, the default
-     `100` weighs 9. A tool repo pinned to `0` is therefore drawn about 110
-     times as often as a default-priority repo, but no workspace is ever
-     starved. `priority_pick::weight_for_priority` is the one implementation.
+   - **Weight mapping (softmax, #11684).** A workspace's `fleet_priority`
+     (the `priority` integer in `workspaces.json`; lower = higher priority,
+     default `100`) is read as a negative logit with one temperature `T`:
+     `weight = max(1, round(1_000_000 * exp(-(priority - p_min) / T)))`.
+     `p_min` is the smallest priority **in the pool being drawn over** (after
+     the tier selection above), so the pool's top workspace always weighs
+     1,000,000 and only priority *differences* matter. `T` is the
+     hyperparameter `dispatch.drawTemperature` (integer, 1–100000, default
+     `80`; see [`hyperparameters.md`](hyperparameters.md)), re-read every
+     tick: small `T` is nearly strict priority order, large `T` nearly
+     uniform. At `T = 80` the weight falls by `e` every 80 priority units:
+     priority 20 outweighs 200 about 9.5x, and a gap of 100 is about 3.5x.
+     The weight never reaches 0, so no workspace is ever starved.
+     `priority_pick::softmax_weight` is the one implementation. (Before
+     #11684 the weight was `max(1, 1000 / (1 + priority))`, a fixed curve.)
    - **Reproducibility.** The draw uses a seedable RNG (`PickRng`, SplitMix64).
      A fixed seed reproduces the exact pick sequence. The draw (pool,
-     candidates with weights, total weight, roll, pick) is `WorkspaceDraw`,
-     the record `pick.decision` carries.
+     candidates with weights, total weight, temperature, `p_min`, roll, pick)
+     is `WorkspaceDraw`, the record `pick.decision` carries.
 2. **Pick the issue within that workspace** by, in order: verified
    red-main fix first; level (`loom:very-important`, then `loom:important`,
    then none); oldest `createdAt` first; issue number ascending. The
@@ -113,8 +121,32 @@ operator ruling on #11278).
 | `loom:high-priority-inherited` | retired, no mapping (it was daemon-derived) |
 | `tier:goal-advancing` / `tier:goal-supporting` / `tier:maintenance` | retired, **no automatic mapping**; Guide applies `loom:important` where warranted |
 
-Label definitions live in `defaults/labels.json` (`loom-daemon labels generate
---write` regenerates both `labels.yml` copies). Relabeling live issues is a
-forge mutation done by an operator with `./.loom/scripts/sync-labels.sh` after
-the daemon stops reading the old labels; it is deliberately not part of the
-code change.
+This table is data: the top-level `retired` array of `defaults/labels.json`
+(#11513), one `{name, replaced_by, owned, retired_in}` entry per old label
+(`replaced_by: null` = remove, no replacement). It also lists the #11105
+retirements (`loom:urgent`, `loom:heavy`, `loom:operator-objective`). It is
+never rendered into `labels.yml`, so the additive `sync-labels.sh` cannot
+re-create a retired label. `owned: false` (`priority:high`, never declared by
+Loom) means the migration adds the replacement but never removes or deletes
+the old label. The registry change itself mutates no forge.
+
+### Running the forge-side migration (#11511)
+
+`loom-daemon labels migrate` reads this array and relabels each repo's **open**
+issues and PRs (closed items are never touched). It is a dry run unless
+`--apply` is passed:
+
+```bash
+loom-daemon labels migrate --all-workspaces          # preview every managed repo
+loom-daemon labels migrate --all-workspaces --apply  # then migrate
+loom-daemon labels migrate --repo OWNER/NAME [--apply]   # or one repo
+.loom/scripts/sync-labels.sh --migrate-retired [--dry-run]  # sync first, then migrate
+```
+
+Per open item it adds `replaced_by` before removing the old label. It then
+re-reads the label's open usage and deletes the label only when nothing open
+still carries it; a failed read keeps it (`KEPT`). An `owned: false` label is
+add-only: never removed from an item, never deleted. A replacement missing on
+the forge is `SKIPPED`, never created; run `sync-labels.sh` first. A second
+`--apply` makes no writes. `resync-installed.sh` only ever runs the dry run and
+prints the apply command when anything is pending.

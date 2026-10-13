@@ -115,6 +115,30 @@ fn loom_story_points_survives_the_gateway_log_allowlist() {
     );
 }
 
+#[test]
+fn loom_dispatch_origin_survives_the_gateway_log_allowlist() {
+    // #11444 emits `loom.dispatch_origin` on sweep.started/sweep.outcome and
+    // the sweep-facts extraction (#11479) reads it. The two generic tests
+    // below already cover any key the SQL reads; this names the key so a
+    // regression that drops it from the allowlist is loud and self-explaining
+    // — behind this gateway the dispatch_origin column would extract as a
+    // silent NULL, indistinguishable from a fleet that never recorded who
+    // asked for the sweep (the ETA driver signal).
+    let keys = allowlist("log");
+    assert!(
+        keys.contains("loom.dispatch_origin"),
+        "the gateway's log keep_keys strips `loom.dispatch_origin`: #11444 emits it and the \
+         sweep-facts extraction (#11479) reads it, so behind this gateway the dispatch_origin \
+         column extracts as a silent NULL, indistinguishable from a fleet that never recorded \
+         who asked for the sweep"
+    );
+    assert!(
+        emitted_keys().contains("loom.dispatch_origin"),
+        "the OTLP mapping no longer emits `loom.dispatch_origin` (#11444): the sweep-facts \
+         extraction reads a never-emitted key, a NULL column by another road (#9586)"
+    );
+}
+
 /// Every key the extraction reads must be EXPORTED by the daemon — a read of
 /// a never-emitted key is a NULL column by another road (#9586).
 #[test]

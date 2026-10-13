@@ -447,6 +447,10 @@ fn daemon_write_paths_are_scoped() {
             "sweep_registry/guards.rs",
             Via(DISPATCH, "claim flip + lease of a dispatched sweep"),
         ),
+        (
+            "sweep_registry/dispatch/claim_release.rs",
+            Via(DISPATCH, "releases the claim of a dispatched sweep found closed post-flip (#11304)"),
+        ),
         ("sweep_registry/watchdog.rs", Via(DISPATCH, "acts on dispatched sweeps")),
         ("sweep_registry/restore_to_ready.rs", Via(DISPATCH, "acts on dispatched sweeps")),
         (
@@ -535,6 +539,8 @@ fn daemon_write_paths_are_scoped() {
             NotAWrite("parses an agent's own gh argv for the claim it took (#10832), runs none"),
         ),
         ("operator_decision/cli.rs", Gated),
+        ("cli/labels_migrate.rs", Gated),
+        ("cli/curation_complete.rs", Gated),
         ("cli/labels_undeclared.rs", Gated),
         ("cli/pr_lease.rs", Gated),
         (
@@ -619,6 +625,10 @@ fn daemon_write_paths_are_scoped() {
             NotAWrite("read-only probe: its only calls are `api --method GET`"),
         ),
         ("tokens_pool/check.rs", NotAWrite("Anthropic API, not the forge")),
+        (
+            "remote_fleet_exec/mod.rs",
+            NotAWrite("scp's `-X` option in a guard's argv vocabulary, runs none"),
+        ),
         ("worker_spawn/egress_proxy/server.rs", NotAWrite("HTTP method check in a proxy")),
         (
             "observability/otlp/relay/server.rs",

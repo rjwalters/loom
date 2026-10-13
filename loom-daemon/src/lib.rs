@@ -149,6 +149,7 @@ pub mod capacity;
 pub mod cargo_target_guard;
 pub mod ci_telemetry;
 pub mod claim_reconciliation;
+pub mod classify_error;
 pub mod cmd_out;
 pub mod codex_sandbox_noop;
 pub mod codex_usage;
@@ -211,6 +212,7 @@ pub mod forge_disable_auto_merge;
 pub mod forge_egress;
 pub(crate) mod forge_etag_store;
 pub mod forge_events;
+pub mod forge_host;
 pub mod forge_identity;
 pub mod forge_inventory;
 pub mod forge_listing;
@@ -277,6 +279,7 @@ pub mod loom_ui_alerts;
 pub mod main_health_gate;
 pub mod mcp_tool_guard;
 pub mod merge_group_ci;
+pub mod merge_policy;
 pub mod merge_pr;
 pub mod metrics_collector;
 pub mod observability;
@@ -307,6 +310,7 @@ pub mod quarantine_stash_status;
 pub mod ram_headroom;
 pub mod ram_peaks;
 pub mod rate_limit_breaker;
+pub mod rebase_guard;
 pub mod reclaim_pr_warning;
 pub mod reconcile_stack;
 /// Ref-operand validation for forge-derived branch names (#9106). A sibling
@@ -318,6 +322,7 @@ pub mod refname;
 pub mod release_fetch;
 pub mod release_provenance;
 pub mod release_resolve;
+pub mod remote_fleet_exec;
 pub mod renovate_labels;
 pub mod repo_root;
 pub mod restart_verify;
@@ -346,12 +351,6 @@ pub mod runtime_preference;
 #[cfg(test)]
 pub(crate) mod runtime_selection_test_support;
 pub mod safehouse;
-/// Inbound safehouse ChatOps steering (#7893, Phase 3a of #4196). A sibling
-/// module rather than a `safehouse::` submodule: `safehouse.rs` is an
-/// over-threshold file frozen by the file-size ratchet
-/// (`.loom/docs/file-size-policy.md`), and the whole point of the ratchet is
-/// that new code lands in a new module instead.
-pub mod safehouse_chatops;
 pub mod scratch_reclaim;
 pub mod script_helpers;
 /// Content scan for credential-shaped values before commit/push (#9133).

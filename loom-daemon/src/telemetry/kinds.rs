@@ -191,6 +191,9 @@ pub mod issue_estimate;
 /// `token_ranking.refresh` (#10744) — one token-ranking refresh round.
 pub mod token_ranking_refresh;
 
+/// `stage.work_started` (#11641) — a role agent began working an item in a stage.
+pub mod work_started;
+
 /// The export-coverage pair `(exporters, exported_kinds)` for `host.health`
 /// (Issue #10196), derived from the per-exporter status map
 /// (`crate::observability::global_export_statuses()`, keyed by
@@ -441,10 +444,12 @@ macro_rules! telemetry_kind_table {
             /// An operator session's presence beat (Issue #11563): who is at the
             /// keyboard (`last_input_at`), when the session last did anything,
             /// and which issues and PRs it is driving. No prompt or transcript
-            /// content exists in the record. Journal-only until the transport of #11525
-            /// exists; `native: true` only so the registry names a carrier for it. See [`operator_presence`].
+            /// content exists in the record. Exported over OTLP (the `loom.presence.*`
+            /// scalars ride as attributes; the body is the record's JSON) now that
+            /// #11525 settled the transport — the same path as every other fact.
+            /// See [`operator_presence`].
             OperatorPresence = "operator.presence" => $crate::telemetry::kinds::operator_presence::OperatorPresenceRecord,
-                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: NotExported, native: true;
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
             /// A managed checkout's history was moved by something other than
             /// Loom (Issue #11566): the reflog entry, from/to sha and the commits
             /// it made unreachable. OTLP-only. See [`checkout_external_change`].
@@ -453,6 +458,11 @@ macro_rules! telemetry_kind_table {
 
             /// One curation completion's blind difficulty estimate (#11608).
             IssueEstimate = "issue.estimate" => $crate::telemetry::kinds::issue_estimate::IssueEstimateRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// A role agent began working an item in a stage (#11641): the
+            /// work-start that splits a stay into queue wait and work time.
+            WorkStarted = "stage.work_started" => $crate::telemetry::kinds::work_started::WorkStartedRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             // APPEND NEW KINDS ABOVE THIS LINE (one row; `gate:` stays

@@ -71,6 +71,16 @@ pub(crate) enum ScriptPortCommand {
     /// leaves the session classified as before.
     CodexSandboxNoop(super::codex_sandbox_noop_cli::CodexSandboxNoopArgs),
 
+    /// The error classifier behind `lib/classify-error.sh` (#11208): stdin
+    /// (or `--stdout-tail`/`--stderr-tail` files) plus `--exit-code` and an
+    /// optional `--provider` in, one uppercase category line out;
+    /// `--transient <CATEGORY>` answers the retry deny-list in its exit
+    /// code. Optional to its caller — the shell library falls back to its
+    /// in-file tables when no (new enough) binary resolves, and both sides
+    /// are pinned byte-equal by `test-classify-error.sh`'s parity section and
+    /// the shared `vectors.tsv` fixture.
+    ClassifyError(super::classify_error_cli::ClassifyErrorArgs),
+
     /// The daemon-roll pause hook and pause state (#10830). `hook` is inert
     /// unless LOOM_DAEMON_ITEM_ID is set; an older binary lacking it leaves
     /// every tool call unparked.
@@ -506,6 +516,7 @@ pub(crate) enum ScriptPortCommand {
     /// Guard configuration diagnostics (#10434): `guards status` shows each
     /// guard category's effective value and source, hook wiring, a decision-log
     /// summary, and misconfiguration warnings. Read-only; always exits 0.
+    /// `guards remote-exec` is the remote-fleet-exec hook classifier (#11568).
     #[command(subcommand)]
     Guards(super::guards_status::GuardsCommand),
 
@@ -527,14 +538,9 @@ pub(crate) enum ScriptPortCommand {
     #[command(subcommand)]
     ParkRecord(super::park_record::ParkRecordCommand),
 
-    /// Curator's `<!-- loom:points=<N> -->` estimate-marker validation
-    /// (#9056), backing `require-complexity-marker.sh`'s points-marker gate.
-    /// Reads the issue body on stdin — the same body the shell script's own
-    /// complexity-tier check already fetched, no second `gh` call. Not a
-    /// port of a whole script: the complexity-tier half of
-    /// `require-complexity-marker.sh` stays inline shell, unchanged; only the
-    /// new points check moved here, to keep the #7810 `shell-budget` gate a
-    /// non-event for this addition.
+    /// Validate the Curator's `<!-- loom:points=<N> -->` marker in one issue
+    /// body read from stdin (#9056). The gate itself, which also reads
+    /// trusted comments, is `loom-daemon curation-complete` (#11663).
     CheckPointsMarker(super::points_marker_check::CheckPointsMarkerArgs),
 
     /// Per-agent-scope `MemoryMax` (MiB) sized from the repo's observed
@@ -657,6 +663,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::ReleaseResolve(args) => args.run(),
             ScriptPortCommand::ReleaseExplain(args) => args.run(),
             ScriptPortCommand::CodexSandboxNoop(args) => args.run(),
+            ScriptPortCommand::ClassifyError(args) => args.run(),
             ScriptPortCommand::RollPause(cmd) => cmd.run(),
             ScriptPortCommand::AgentResume(cmd) => cmd.run(),
             ScriptPortCommand::InstallCompat(cmd) => cmd.run(),
@@ -1120,6 +1127,12 @@ pub(crate) enum MergePrCommand {
     /// / CLEAR + labels. The shell refuses on any other output — see
     /// `cli::merge_pr_revalidate_head`.
     RevalidateHead(super::merge_pr_revalidate_head::RevalidateHeadArgs),
+
+    /// The per-attempt route of the synchronous merge-retry loop (#8191
+    /// slice): stdin is the failed merge's response; prints `LOOM-MERGE-ROUTE
+    /// AWAIT|SYNC|FAIL` plus its narration, exit 0. The shell routes on the
+    /// classifier's kind itself on any fault — see `cli::merge_pr_merge_route`.
+    MergeRoute(super::merge_pr_merge_route::MergeRouteArgs),
 }
 
 impl MergePrCommand {
@@ -1175,6 +1188,7 @@ impl MergePrCommand {
             MergePrCommand::PrState(args) => args.run(),
             MergePrCommand::PollWait(args) => args.run(),
             MergePrCommand::RevalidateHead(args) => args.run(),
+            MergePrCommand::MergeRoute(args) => args.run(),
             MergePrCommand::CleanupPaths(args) => args.run(),
         }
     }

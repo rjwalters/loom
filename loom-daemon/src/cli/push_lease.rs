@@ -577,7 +577,11 @@ mod tests {
     fn strategy_path(mode: &str) -> (tempfile::TempDir, String) {
         let bin = tempfile::tempdir().expect("tempdir");
         let stub = bin.path().join("loom-daemon");
-        std::fs::write(&stub, format!("#!/bin/sh\necho {mode}\n")).expect("write stub");
+        std::fs::write(
+            &stub,
+            format!("#!/bin/sh\ncase \"$1\" in forge) exit 1;; esac\necho {mode}\n"),
+        )
+        .expect("write stub");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

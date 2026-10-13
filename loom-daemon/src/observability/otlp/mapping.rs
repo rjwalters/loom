@@ -11,12 +11,14 @@ mod host_export;
 mod host_resource;
 mod issue_estimate;
 mod metadata;
+mod operator_presence;
 mod ops;
 mod outcome_facts;
 mod pass;
 mod pick_decision;
 mod session_output;
 mod token_ranking;
+mod work_started;
 
 // The shared host `Resource` constructor; traces and the relay re-import it
 // from here, exactly as when it lived inline.
@@ -593,7 +595,8 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         | TelemetryRecord::PassSummary(_)
         | TelemetryRecord::PassVerdict(_)
         | TelemetryRecord::FleetState(_)
-        | TelemetryRecord::PickDecision(_) => {
+        | TelemetryRecord::PickDecision(_)
+        | TelemetryRecord::OperatorPresence(_) => {
             // One record, stamped at its own time; the body is the record's
             // JSON. Issue #10414: one self-update decision (the tick's start).
             // Issue #10744: one token-ranking refresh round (the round's
@@ -601,7 +604,9 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             // decided). Issue #10196: one fleet-state snapshot (rows +
             // census; anchor/delta scalars ride as `loom.fleet.*`
             // attributes). Issue #10212: one pick decision (the ranked
-            // candidates). Each `log_parts` is `None` for every other kind.
+            // candidates). Issue #11563: one operator presence beat (the
+            // `loom.presence.*` scalars ride as attributes; `driving[]` is in
+            // the body). Each `log_parts` is `None` for every other kind.
             let r = &envelope.record;
             let (event_name, severity, at, attributes, body) = auto_update::log_parts(r)
                 .or_else(|| token_ranking::log_parts(r))
@@ -609,13 +614,15 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 .or_else(|| checkout_external_change::log_parts(r))
                 .or_else(|| pass::log_parts(r))
                 .or_else(|| fleet_state::log_parts(r))
-                .or_else(|| pick_decision::log_parts(r))?;
+                .or_else(|| pick_decision::log_parts(r))
+                .or_else(|| operator_presence::log_parts(r))?;
             time_unix_nano = at;
             body_override = Some(body);
             (event_name, severity, String::new(), attributes)
         }
         TelemetryRecord::SessionOutput(_)
         | TelemetryRecord::IssueEstimate(_)
+        | TelemetryRecord::WorkStarted(_)
         | TelemetryRecord::PrResolved(_)
         | TelemetryRecord::StageOutcome(_) => {
             // Issue #9764: the body is the producer-redacted readable text,
@@ -628,7 +635,8 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             let r = &envelope.record;
             let parts = session_output::log_parts(r)
                 .or_else(|| outcome_facts::log_parts(r, &envelope.host_id))
-                .or_else(|| issue_estimate::log_parts(r))?;
+                .or_else(|| issue_estimate::log_parts(r))
+                .or_else(|| work_started::log_parts(r))?;
             time_unix_nano = parts.source_at;
             observed_time_unix_nano = parts.observed_at;
             body_override = Some(parts.body);
