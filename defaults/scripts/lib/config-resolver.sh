@@ -22,7 +22,10 @@
 #      until Epic #3835 Phase 3 ships (the file doesn't exist yet anywhere).
 #   2. Legacy    <repo_root>/.loom/config.json         — today's status quo.
 #   3. Tracked   <repo_root>/.loom-project/project.json — new in #4039.
-#   4. Ignored   <repo_root>/.loom-local/local.json     — new in #4039.
+#   4. Fleet     <repo_root>/.loom-local/fleet-repo.json — the per-repo fleet
+#                tier (#11738), written by the daemon's fleet sync from the
+#                fleet store's repos[].config; beats the committed config.
+#   5. Ignored   <repo_root>/.loom-local/local.json     — new in #4039.
 #
 # A missing/malformed file at ANY tier soft-fails to `{}` for that tier (it
 # contributes nothing to the merge) — this never aborts the calling script.
@@ -41,6 +44,7 @@
 
 LOOM_CONFIG_LEGACY_REL=".loom/config.json"
 LOOM_CONFIG_PROJECT_REL=".loom-project/project.json"
+LOOM_CONFIG_FLEET_REPO_REL=".loom-local/fleet-repo.json"
 LOOM_CONFIG_LOCAL_REL=".loom-local/local.json"
 _LOOM_CONFIG_DEFAULTS_DEFAULT_REL=".local/share/loom/config/defaults.json"
 
@@ -91,18 +95,20 @@ loom_resolve_config() {
     local defaults_path
     defaults_path=$(_loom_config_private_defaults_path)
 
-    local tier_defaults tier_legacy tier_project tier_local
+    local tier_defaults tier_legacy tier_project tier_fleet_repo tier_local
     tier_defaults=$(_loom_config_soft_read "$defaults_path")
     tier_legacy=$(_loom_config_soft_read "$repo_root/$LOOM_CONFIG_LEGACY_REL")
     tier_project=$(_loom_config_soft_read "$repo_root/$LOOM_CONFIG_PROJECT_REL")
+    tier_fleet_repo=$(_loom_config_soft_read "$repo_root/$LOOM_CONFIG_FLEET_REPO_REL")
     tier_local=$(_loom_config_soft_read "$repo_root/$LOOM_CONFIG_LOCAL_REL")
 
     jq -c -n \
         --argjson a "$tier_defaults" \
         --argjson b "$tier_legacy" \
         --argjson c "$tier_project" \
-        --argjson d "$tier_local" \
-        '$a * $b * $c * $d'
+        --argjson d "$tier_fleet_repo" \
+        --argjson e "$tier_local" \
+        '$a * $b * $c * $d * $e'
 }
 
 # loom_config_get <repo_root> <dotted.path> [default]

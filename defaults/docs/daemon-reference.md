@@ -11010,7 +11010,7 @@ The steps below are what turns a registered root into a *self-feeding* one.
 
 **1. Choose a config surface.** `autonomous.roleRunner.enabled` is read from the
 root's own **effective** config, which `config_resolver::resolve_effective_config`
-(`loom-daemon/src/config_resolver.rs:143-153`) deep-merges from four tiers,
+(`loom-daemon/src/config_resolver.rs`) deep-merges from five tiers,
 lowest → highest priority:
 
 | # | Tier | Path | Tracked? |
@@ -11018,7 +11018,8 @@ lowest → highest priority:
 | 1 | machine-level defaults | `~/.local/share/loom/config/defaults.json` (override: `LOOM_CONFIG_DEFAULTS_FILE`; set it empty to disable the tier) | no — outside every checkout |
 | 2 | legacy per-repo | `<root>/.loom/config.json` | yes |
 | 3 | project | `<root>/.loom-project/project.json` | yes (Epic #3835 Phase 6) |
-| 4 | host-local | `<root>/.loom-local/local.json` | no (git-ignored) |
+| 4 | per-repo fleet tier (#11738) | `<root>/.loom-local/fleet-repo.json`, written by the fleet sync from the fleet config's `repos[].config` | no (git-ignored) |
+| 5 | host-local | `<root>/.loom-local/local.json` | no (git-ignored) |
 
 Two valid ways to flip a root on, with very different blast radii:
 
@@ -11029,7 +11030,7 @@ Two valid ways to flip a root on, with very different blast radii:
   `enabled: false` in its own config and win. **Tier 1 is live code, not a
   future phase** — `resolve_effective_config` merges it on every read; what is
   absent by default is only the *file*. See the recipe immediately below.
-- **Per-repo (tier 2/3/4)** — one edit per *repo*, in that repo's own checkout.
+- **Per-repo (tier 2/3/5)** — one edit per *repo*, in that repo's own checkout.
   Use this when a root needs a different `roles`/`onIdle` set than the host
   default, or when the repo's maintainers should see the setting in review.
 

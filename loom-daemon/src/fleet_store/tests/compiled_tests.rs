@@ -262,3 +262,73 @@ fn fleet_json_is_a_fetched_contract_path() {
     // It survives into a snapshot built from a store listing.
     assert!(both("{}").files.contains_key(FLEET_JSON_PATH));
 }
+
+// ===== per-repo fleet tier: `repos[].config` (#11738) =====
+
+/// A compiled document whose roster exercises every per-repo-tier case.
+fn compiled_with_repo_configs() -> Value {
+    let mut doc = sample_compiled();
+    doc["repos"] = json!([
+        {"name": "app", "dir": "app", "fleet": true, "weight": 1, "config": {"autonomous": {"x": 1}, "guards": {}}},
+        {"name": "lib", "dir": "lib-dir", "fleet": "maintain", "weight": 1},
+        {"name": "vault", "dir": "vault", "fleet": false, "firewall": true, "config": {"a": 1}},
+        {"name": "side", "dir": "side", "fleet": false, "config": {"a": 1}},
+        {"name": "uncloned", "dir": "uncloned", "fleet": true, "weight": 1, "config": {"a": 1}}
+    ]);
+    doc
+}
+
+#[test]
+fn repo_config_accessor_finds_a_record_config_by_name() {
+    let doc = parse(&compiled_with_repo_configs().to_string()).unwrap();
+    assert_eq!(doc.repo_config("app"), Some(&json!({"autonomous": {"x": 1}, "guards": {}})));
+    assert_eq!(doc.repo_config("lib"), None, "a record without config");
+    assert_eq!(doc.repo_config("nope"), None, "no such record");
+}
+
+#[test]
+fn a_non_object_repo_config_fails_closed() {
+    let mut doc = sample_compiled();
+    doc["repos"][0]["config"] = json!(["not", "an", "object"]);
+    assert_fails_closed(&doc.to_string(), "`repos[0].config` must be an object");
+}
+
+#[test]
+fn repo_targets_cover_desired_cloned_repos_only() {
+    use crate::fleet_store::render::{repo_targets, RepoTarget};
+    let snap = compiled_only(&compiled_with_repo_configs());
+    let cloned = |p: &Path| !p.ends_with("uncloned");
+    let got = repo_targets(&snap, &home(), &cloned).unwrap();
+    assert_eq!(
+        got,
+        vec![
+            RepoTarget {
+                name: "app".into(),
+                path: PathBuf::from("/srv/src/app/.loom-local/fleet-repo.json"),
+                value: Some(json!({"autonomous": {"x": 1}, "guards": {}})),
+            },
+            // Desired with no config: the file must not exist.
+            RepoTarget {
+                name: "lib".into(),
+                path: PathBuf::from("/srv/src/lib-dir/.loom-local/fleet-repo.json"),
+                value: None,
+            },
+        ],
+        "firewall, unmanaged and uncloned records never get a target"
+    );
+}
+
+#[test]
+fn repo_targets_are_empty_for_a_legacy_store() {
+    let got = crate::fleet_store::render::repo_targets(&legacy_only(), &home(), &|_| true).unwrap();
+    assert!(got.is_empty(), "repos.yml has no per-repo config: {got:?}");
+}
+
+#[test]
+fn repo_targets_refuse_an_invalid_roster() {
+    let mut doc = compiled_with_repo_configs();
+    doc["repos"][0]["firewall"] = json!(true);
+    let err = crate::fleet_store::render::repo_targets(&compiled_only(&doc), &home(), &|_| true)
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("fleet: true AND firewall: true"), "{err:#}");
+}

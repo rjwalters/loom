@@ -108,6 +108,7 @@ _loom_status_config_tiers_present() {
     [[ -n "$dp" && -f "$dp" ]] && echo "$dp"
     [[ -f "$REPO_ROOT/$LOOM_CONFIG_LEGACY_REL" ]] && echo "$REPO_ROOT/$LOOM_CONFIG_LEGACY_REL"
     [[ -f "$REPO_ROOT/$LOOM_CONFIG_PROJECT_REL" ]] && echo "$REPO_ROOT/$LOOM_CONFIG_PROJECT_REL"
+    [[ -f "$REPO_ROOT/$LOOM_CONFIG_FLEET_REPO_REL" ]] && echo "$REPO_ROOT/$LOOM_CONFIG_FLEET_REPO_REL"
     [[ -f "$REPO_ROOT/$LOOM_CONFIG_LOCAL_REL" ]] && echo "$REPO_ROOT/$LOOM_CONFIG_LOCAL_REL"
     # Explicit trailing success: under `set -o pipefail`, this function's exit
     # status is whatever its last statement returned. The common case (no
@@ -603,7 +604,7 @@ emit_human() {
     if [[ -n "$config_tiers_present" ]]; then
         echo -e "  Config:    ${CYAN}$config_tiers_present${NC}"
     else
-        echo -e "  Config:    ${GRAY}(none found — checked .loom/config.json, .loom-project/project.json, .loom-local/local.json)${NC}"
+        echo -e "  Config:    ${GRAY}(none found — checked .loom/config.json, .loom-project/project.json, .loom-local/fleet-repo.json, .loom-local/local.json)${NC}"
     fi
     echo -e "  Socket:    ${CYAN}tmux -L $TMUX_SOCKET${NC}"
     echo ""

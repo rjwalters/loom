@@ -551,6 +551,7 @@ pub(crate) fn sample_status() -> FleetSyncStatus {
         workspaces: workspace_resync::WorkspacePass::default(),
         checkouts: Vec::new(),
         checkouts_note: None,
+        repo_config: Default::default(),
     }
 }
 
