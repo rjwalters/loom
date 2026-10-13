@@ -216,13 +216,13 @@ own discipline:
 Pick the right path before any `gh pr checkout` mutation:
 
 - **An existing builder worktree** (`.loom/worktrees/issue-N`, left behind by an active `/loom:sweep` that already ran Builder) — reuse it directly, no checkout needed (see "Worktree-Aware Code Access" below).
-- **No existing builder worktree (any PR shape — `feature/issue-N`, external-fork, ad-hoc)** — use the one supported review helper:
+- **No builder worktree (any PR shape)** — use the supported review helper:
   ```bash
   ./.loom/scripts/pr-worktree.sh <PR_NUMBER>
   cd .loom/worktrees/pr-<PR_NUMBER>
   # pr-worktree.sh already ran `gh pr checkout` inside the worktree
   ```
-  **Honor its result.** Exit `0` = ready (a previously created `pr-<N>` is reused). A non-zero exit — including the "branch already checked out in another worktree" collision, where the helper names the holder — is the answer: if the holder is a builder `issue-N` worktree, `cd` into that and run "Verify the Worktree Matches the PR" below; otherwise stop and report the failure (or fall back to `git merge-tree`/`gh pr diff` read-only review). **Never** invent a `judge-*`/`review-*` directory, pick another naming scheme, or run raw `git worktree add` / a bare `gh pr checkout` to get around a helper failure.
+  **Honor its result.** Exit `0`: ready, reusing `pr-<N>` if present. Non-zero: stop. On a branch collision, reuse the named builder `issue-N` holder after "Verify the Worktree Matches the PR" below; otherwise stop/report or use `git merge-tree`/`gh pr diff` read-only review. **Never** invent a `judge-*`/`review-*` directory or another naming scheme, run raw `git worktree add`, or use bare `gh pr checkout` to bypass failure.
 
 `pr-worktree.sh` writes a `.loom-managed` sentinel; `merge-pr.sh` auto-cleans it on merge. Every "no worktree exists" branch in this document routes through it, mirroring `doctor.md`.
 
