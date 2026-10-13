@@ -23,7 +23,7 @@
 # arrive at `docker run` time via volume mounts / env, never at build time.
 # See docker/worker/README.md for the full guarantee list and mount contract.
 
-FROM ubuntu:24.04
+FROM ubuntu:25.10
 
 # --- Build shell: bash with pipefail (#6409) -------------------------------
 # Docker's default RUN shell is `/bin/sh -c`, where a pipeline's exit status is
