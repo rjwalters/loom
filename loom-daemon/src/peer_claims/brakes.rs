@@ -327,6 +327,9 @@ impl PeerClaimView {
         if ad.host == self.self_host && !is_unresolved_identity {
             return false; // never back off on our own backoff
         }
+        // Issue #11930: the ladder's ad also carries the sender's fast-failure
+        // streak, which the fast-fail park sums across hosts.
+        self.observe_fast_fail_streak_at(ad, now);
         let key = (ad.repo.clone(), ad.issue);
         let remaining = ad.remaining_secs.unwrap_or(0);
         if remaining == 0 {
