@@ -1279,9 +1279,9 @@ impl SweepRegistry {
                                 exit_code,
                                 self.quarantine_config.insta_crash_secs,
                             ) {
-                                // #11854: a 2-minute window; the third in a
-                                // row parks.
-                                self.charge_fast_failure(&sweep_id, issue, &fast_class, true);
+                                // #11854: a 2-minute window; the third
+                                // issue-attributable one in a row parks.
+                                self.charge_fast_failure(&sweep_id, issue, &fast_class, false);
                             }
                             if checkpoint_progress {
                                 self.record_terminal_outcome(issue, false);
@@ -1988,10 +1988,15 @@ impl SweepRegistry {
                                     ),
                                 );
                             } else if fast_fail || no_progress || yielded_open_pr {
-                                // #11854: an open-PR yield climbs the ladder
-                                // but never parks — nothing failed.
-                                let parkable = fast_fail || no_progress;
-                                self.charge_fast_failure(&sweep_id, issue, &fast_class, parkable);
+                                // #11854: an open-PR yield backs off under the
+                                // open-PR cause (900 s cap) and never parks.
+                                let open_pr_yield = !(fast_fail || no_progress);
+                                self.charge_fast_failure(
+                                    &sweep_id,
+                                    issue,
+                                    &fast_class,
+                                    open_pr_yield,
+                                );
                             } else {
                                 self.clear_dispatch_backoff(issue);
                             }

@@ -18,9 +18,15 @@
 //! workspace tripwire and exempts the death from the quarantine, the PR-less
 //! hold and this park.
 //!
-//! The ladder already keeps a per-issue consecutive tally. When that tally
-//! reaches the quarantine threshold on an **issue-attributable** failure, the
-//! ladder parks the issue *through the quarantine itself*: the same in-memory
+//! Only an **issue-attributable** fast failure (no progress, not an
+//! environmental class, not an open-PR yield) is charged under
+//! `DispatchBackoffCause::FastFailure`. That cause alone climbs to the 6 h
+//! ceiling, and its streak is the park's counter: a streak only grows under
+//! the cause that started it (#8865), so a lost lease race, a token-pool
+//! death, an environmental death or an open-PR yield (each charged under a
+//! 900 s-capped cause instead) never counts toward a park, and interrupts the
+//! count. When that streak reaches the quarantine threshold (1 while on
+//! probation), the ladder parks the issue *through the quarantine itself*: the same in-memory
 //! entry (TTL, generation escalation, probation, `loom-daemon quarantine
 //! clear`), the same `insta-crash quarantine` body park record (#10161), the
 //! same `loom:blocked` edit and the same anchored comment marker — so the
@@ -42,8 +48,9 @@
 //!   `no-usable-account`, `self-kill:*`, `execution-error`; see
 //!   [`is_environmental_failure_class`]). The run broke, not
 //!   the issue: parking every issue a broken pool touched would empty the
-//!   queue. The ladder still backs those off, up to its 6 h ceiling.
-//! - A clean exit that yielded to a verified open PR (#6350). Nothing failed.
+//!   queue. They back off under the transient cause, capped at 900 s.
+//! - A clean exit that yielded to a verified open PR (#6350). Nothing failed;
+//!   it backs off under the open-PR guard's cause, also capped at 900 s.
 //! - Anything while the ladder or the quarantine is disabled.
 //! - A `loom:frozen` issue gets the in-memory pause but no forge write
 //!   (`record_daemon_hold` answers `Frozen`, #11743).
@@ -109,36 +116,63 @@ impl SweepRegistry {
         fast_fail_class(death_class, classification, noop_loop)
     }
 
-    /// Charge one fast failure to `issue`'s #4485 ladder and, when `parkable`
-    /// and the streak has reached the threshold, park it (Issue #11854).
+    /// Charge one fast or no-progress failure to `issue`'s #4485 ladder under
+    /// the right cause, and park it when its issue-attributable streak reaches
+    /// the threshold (Issue #11854).
     ///
-    /// `parkable` is the caller's "this failure says something about the
-    /// issue" verdict: `false` for an open-PR yield. A dispatch that
-    /// self-reported a no-op release (#8912) neither climbs the ladder nor
-    /// parks; its own cooldown already covers it.
+    /// - `open_pr_yield`: the open-PR guard's cause (900 s cap), never parks.
+    /// - an environmental `class`: the transient cause (900 s cap), never parks.
+    /// - otherwise: [`DispatchBackoffCause::FastFailure`] (up to `max`), and
+    ///   the park check.
+    ///
+    /// A dispatch that self-reported a no-op release (#8912) is charged
+    /// nothing; its own cooldown already covers it.
     pub(crate) fn charge_fast_failure(
         &mut self,
         sweep_id: &str,
         issue: u32,
         class: &str,
-        parkable: bool,
+        open_pr_yield: bool,
     ) {
-        let carved_out = self.noop_release_covers_dispatch(issue, sweep_id);
-        self.charge_dispatch_failure(sweep_id, issue);
-        if parkable && !carved_out {
+        if self.noop_release_covers_dispatch(issue, sweep_id)
+            || is_environmental_failure_class(class)
+        {
+            // Logs the #8912 carve-out and records nothing, or records the
+            // transient cause.
+            self.charge_dispatch_failure(sweep_id, issue);
+        } else if open_pr_yield {
+            self.record_open_pr_guard_backoff(issue);
+        } else {
+            self.record_fast_failure(issue);
             self.park_fast_failure(issue, class);
         }
     }
 
-    /// Park `issue` through the quarantine when its ladder streak has reached
-    /// the threshold (Issue #11854). Returns `true` when it parked. See the
-    /// module docs for the reconciliation with the quarantine's own tally.
+    /// The issue-attributable fast-failure streak the park counts: the ladder's
+    /// streak when [`DispatchBackoffCause::FastFailure`] armed it, else 0.
+    #[must_use]
+    pub(crate) fn fast_failure_streak(&self, issue: u32) -> u32 {
+        self.dispatch_backoff
+            .get(&issue)
+            .filter(|s| s.cause == DispatchBackoffCause::FastFailure)
+            .map_or(0, |s| s.consecutive)
+    }
+
+    /// Park `issue` through the quarantine when its fast-failure streak has
+    /// reached the threshold (Issue #11854). Returns `true` when it parked. See
+    /// the module docs for the reconciliation with the quarantine's own tally.
     pub(crate) fn park_fast_failure(&mut self, issue: u32, class: &str) -> bool {
         if !self.dispatch_backoff_config.enabled || !self.quarantine_config.enabled {
             return false;
         }
-        let consecutive = self.dispatch_failure_count(issue);
-        if !fast_fail_parks(consecutive, self.quarantine_config.threshold, class) {
+        let consecutive = self.fast_failure_streak(issue);
+        // Probation (vibesql#6639): a relapse after a release parks at once.
+        let threshold = if self.quarantine_generation(issue) > 0 {
+            1
+        } else {
+            self.quarantine_config.threshold
+        };
+        if !fast_fail_parks(consecutive, threshold, class) {
             return false;
         }
         if self.is_quarantined(issue)
@@ -174,7 +208,7 @@ impl SweepRegistry {
              clear {issue}`, or wait for the {ttl}s TTL — both release the in-memory pause AND \
              restore `loom:issue`.{escalation}",
             marker = QUARANTINE_COMMENT_MARKER,
-            secs = self.quarantine_config.insta_crash_secs,
+            secs = FAST_FAIL_WINDOW_SECS.max(self.quarantine_config.insta_crash_secs),
             ttl = self.effective_quarantine_ttl(issue).as_secs(),
             escalation = self.quarantine_escalation_note(issue),
         );

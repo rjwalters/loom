@@ -595,11 +595,10 @@ pub const DEFAULT_DISPATCH_BACKOFF_BASE_SECS: u64 = 60;
 
 /// Default maximum backoff delay: 6 h (#11854; 900 s under #4485). A 15-minute
 /// ceiling still let an issue that fails a minute in run around the clock
-/// (one issue: 20 failed sweeps in a day). An issue-attributable streak is
-/// parked at the quarantine threshold long before this (`fast_fail_park`); the
-/// ceiling bounds the streaks that are never parked (environmental classes,
-/// open-PR yields, quarantine disabled). The open-PR guard keeps its own
-/// 900 s cap (`backoff_cause::cap`).
+/// (one issue: 20 failed sweeps in a day). Only an issue-attributable fast
+/// failure climbs this far; every other cause keeps a 900 s cap
+/// (`backoff_cause::cap`), and such a streak is usually parked at the
+/// quarantine threshold first (`fast_fail_park`).
 pub const DEFAULT_DISPATCH_BACKOFF_MAX_SECS: u64 = 21_600;
 
 // ============================================================================
@@ -781,10 +780,16 @@ impl Default for DispatchBackoffConfig {
 /// `backoff-skip`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DispatchBackoffCause {
-    /// A dispatch attempt failed outright (spawn error, token-selection
-    /// death, a lost claim-then-verify-order lease race, etc.) — the sole
-    /// cause before #7606.
+    /// A dispatch attempt failed for a reason that is not the issue's own
+    /// (token-selection death, a lost lease race, an environmental reaper
+    /// class, etc.). Capped at 900 s whatever `max` says (#11854): the window
+    /// is broadcast fleet-wide, and a transient fault must not strand the
+    /// issue for hours.
     Generic,
+    /// An issue-attributable fast failure (#11854): no progress, not
+    /// environmental, inside the fast-fail window. The only cause that climbs
+    /// to `max`, and its streak is the one the fast-fail park counts.
+    FastFailure,
     /// The open-PR guard (#4123, step 2.5/2.6) refused dispatch because the
     /// issue already has a verified open linked PR (#7606).
     OpenPrGuard,
@@ -794,15 +799,15 @@ pub(crate) enum DispatchBackoffCause {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DispatchBackoffState {
     /// Consecutive failed dispatch outcomes for this issue.
-    consecutive: u32,
+    pub(super) consecutive: u32,
     /// When the most recent failure was recorded — used to decide whether the
     /// streak is still "consecutive" (see [`DispatchBackoffConfig::max`]).
     last_failure_at: DateTime<Utc>,
     /// The instant at which the next dispatch attempt becomes allowed.
-    until: DateTime<Utc>,
-    /// What most recently (re-)armed this window (Issue #7606). Purely
-    /// observational — see [`DispatchBackoffCause`].
-    cause: DispatchBackoffCause,
+    pub(super) until: DateTime<Utc>,
+    /// What most recently (re-)armed this window (Issue #7606) — see
+    /// [`DispatchBackoffCause`].
+    pub(super) cause: DispatchBackoffCause,
 }
 
 /// Compute the backoff delay for the `consecutive`-th consecutive failure
@@ -1188,6 +1193,12 @@ impl SweepRegistry {
     /// accretes toward a long backoff. A no-op when the backoff is disabled.
     pub(crate) fn record_dispatch_failure(&mut self, issue: u32) {
         self.record_dispatch_backoff(issue, DispatchBackoffCause::Generic);
+    }
+
+    /// Record an issue-attributable fast failure (#11854) — see
+    /// [`DispatchBackoffCause::FastFailure`].
+    pub(crate) fn record_fast_failure(&mut self, issue: u32) {
+        self.record_dispatch_backoff(issue, DispatchBackoffCause::FastFailure);
     }
 
     /// Arm `issue`'s #4485 backoff ladder because the **open-PR guard**

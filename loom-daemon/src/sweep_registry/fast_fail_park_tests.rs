@@ -44,25 +44,129 @@ fn the_ladder_climbs_to_a_six_hour_ceiling() {
     assert_eq!(backoff_delay(u32::MAX, base, max), max);
 }
 
-/// A live registry's streak reaches the 6 h ceiling (`record_dispatch_failure`
-/// alone never parks), and a refused open-PR guard stays at 900 s.
+const CAP: Duration = Duration::from_secs(900);
+
+/// Drive `n` events and return the window left at the end.
+fn remaining_after(
+    reg: &mut SweepRegistry,
+    issue: u32,
+    n: usize,
+    mut event: impl FnMut(&mut SweepRegistry),
+) -> Duration {
+    for _ in 0..n {
+        event(reg);
+    }
+    reg.dispatch_backoff_remaining(issue, Utc::now()).unwrap()
+}
+
+/// Only an issue-attributable fast failure climbs to the 6 h ceiling.
 #[test]
-fn a_registry_streak_reaches_six_hours_but_open_pr_refusals_stay_at_900s() {
+fn a_genuine_fast_failure_streak_reaches_six_hours() {
     let dir = tempdir().unwrap();
     let mut reg = registry(dir.path());
-    for _ in 0..12 {
-        reg.record_dispatch_failure(7);
-    }
-    let remaining = reg.dispatch_backoff_remaining(7, Utc::now()).unwrap();
-    assert!(remaining > Duration::from_secs(SIX_HOURS - 60), "{remaining:?}");
-    assert!(remaining <= Duration::from_secs(SIX_HOURS));
+    reg.set_quarantine_config(QuarantineConfig {
+        enabled: false,
+        ..QuarantineConfig::default()
+    });
+    let left = remaining_after(&mut reg, 7, 12, |r| r.charge_fast_failure("s", 7, "exit-1", false));
+    assert!(left > Duration::from_secs(SIX_HOURS - 60), "{left:?}");
+    assert!(left <= Duration::from_secs(SIX_HOURS));
+}
 
-    for _ in 0..12 {
-        reg.record_open_pr_guard_backoff(8);
+/// `record_dispatch_failure` — the lost lease race, the synchronous
+/// token-selection death and `dispatch-backoff record` — stays at 900 s.
+#[test]
+fn a_transient_dispatch_failure_stays_at_900s() {
+    let dir = tempdir().unwrap();
+    let mut reg = registry(dir.path());
+    let left = remaining_after(&mut reg, 8, 12, |r| r.record_dispatch_failure(8));
+    assert!(left <= CAP && left > CAP - Duration::from_secs(60), "{left:?}");
+}
+
+/// The open-PR guard's refusal stays at 900 s.
+#[test]
+fn an_open_pr_refusal_stays_at_900s() {
+    let dir = tempdir().unwrap();
+    let mut reg = registry(dir.path());
+    let left = remaining_after(&mut reg, 9, 12, |r| r.record_open_pr_guard_backoff(9));
+    assert!(left <= CAP && left > CAP - Duration::from_secs(60), "{left:?}");
+}
+
+/// The reaper's open-PR yield is charged under the open-PR cause: 900 s.
+#[test]
+fn a_reaper_open_pr_yield_stays_at_900s() {
+    let dir = tempdir().unwrap();
+    let mut reg = registry(dir.path());
+    let left =
+        remaining_after(&mut reg, 10, 12, |r| r.charge_fast_failure("s", 10, "exit-1", true));
+    assert!(left <= CAP && left > CAP - Duration::from_secs(60), "{left:?}");
+    assert!(reg.open_pr_backoff_issues(Utc::now()).contains(&10));
+    assert!(!reg.is_quarantined(10));
+}
+
+/// Every environmental reaper class stays at 900 s and never parks.
+#[test]
+fn environmental_reaper_classes_stay_at_900s() {
+    for (issue, class) in [
+        (11, "preflight-no-cli-start"),
+        (12, "account-exhausted:rate-limited"),
+        (13, "self-kill:bg-wait"),
+        (14, "execution-error"),
+        (15, "no-usable-account"),
+    ] {
+        let dir = tempdir().unwrap();
+        let mut reg = registry(dir.path());
+        let left = remaining_after(&mut reg, issue, 12, |r| {
+            r.charge_fast_failure("s", issue, class, false)
+        });
+        assert!(left <= CAP && left > CAP - Duration::from_secs(60), "{class}: {left:?}");
+        assert!(!reg.is_quarantined(issue), "{class} must not park");
     }
-    let remaining = reg.dispatch_backoff_remaining(8, Utc::now()).unwrap();
-    assert!(remaining <= Duration::from_secs(900), "open-PR cap: {remaining:?}");
-    assert!(remaining > Duration::from_secs(840), "{remaining:?}");
+}
+
+/// End to end: repeated lost lease-order races (dispatch.rs) stay at 900 s.
+#[test]
+#[serial_test::serial]
+fn repeated_lease_order_losses_stay_at_900s() {
+    let dir = tempdir().unwrap();
+    let (mut reg, _gh, _spawn, _comments) =
+        crate::sweep_registry::test_support::lease_order_dispatch_registry(
+            dir.path(),
+            &["<!-- loom:lease host=peer-host sweep=sweep-issue-9823-peer -->"],
+        );
+    for _ in 0..12 {
+        let _ = reg.dispatch(&SweepKind::Issue(9823), None, None, None, None);
+        expire_window(&mut reg, 9823);
+    }
+    assert_eq!(reg.dispatch_failure_count(9823), 12);
+    reg.record_dispatch_failure(9823);
+    let left = reg.dispatch_backoff_remaining(9823, Utc::now()).unwrap();
+    assert!(left <= CAP, "{left:?}");
+}
+
+/// End to end: repeated synchronous token-selection deaths stay at 900 s.
+#[test]
+#[serial_test::serial]
+fn repeated_token_selection_deaths_stay_at_900s() {
+    let dir = tempdir().unwrap();
+    std::env::remove_var("LOOM_REPO");
+    let (mut reg, _gh) =
+        crate::sweep_registry::test_support::token_selection_failure_registry(dir.path());
+    for _ in 0..12 {
+        let _ = reg.dispatch(&SweepKind::Issue(4690), None, None, None, None);
+        expire_window(&mut reg, 4690);
+    }
+    assert_eq!(reg.dispatch_failure_count(4690), 12);
+    reg.record_dispatch_failure(4690);
+    let left = reg.dispatch_backoff_remaining(4690, Utc::now()).unwrap();
+    assert!(left <= CAP, "{left:?}");
+}
+
+/// Let the next dispatch through without touching the streak.
+fn expire_window(reg: &mut SweepRegistry, issue: u32) {
+    if let Some(state) = reg.dispatch_backoff.get_mut(&issue) {
+        state.until = Utc::now() - chrono::Duration::seconds(1);
+    }
 }
 
 /// A sweep that dies 90 s in (outside the old 60 s window, inside 2 min) arms
@@ -123,10 +227,10 @@ fn only_issue_attributable_classes_park_at_the_threshold() {
 fn the_third_consecutive_fast_failure_parks() {
     let dir = tempdir().unwrap();
     let mut reg = registry(dir.path());
-    reg.charge_fast_failure("s1", 51, "exit-1", true);
-    reg.charge_fast_failure("s2", 51, "exit-1", true);
+    reg.charge_fast_failure("s1", 51, "exit-1", false);
+    reg.charge_fast_failure("s2", 51, "exit-1", false);
     assert!(!reg.is_quarantined(51));
-    reg.charge_fast_failure("s3", 51, "exit-1", true);
+    reg.charge_fast_failure("s3", 51, "exit-1", false);
     assert!(reg.is_quarantined(51), "parked on the third");
     assert_eq!(reg.quarantine_generation(51), 1);
     assert_eq!(reg.dispatch_failure_count(51), 3);
@@ -144,28 +248,56 @@ fn the_park_comment_names_the_failure_class() {
     reg.config.skip_label_flip = false;
     reg.config.gh_bin = Some(fake_gh);
     for sweep in ["a", "b", "c"] {
-        reg.charge_fast_failure(sweep, 52, "unclassified", true);
+        reg.charge_fast_failure(sweep, 52, UNCLASSIFIED_CLASS, false);
     }
     assert!(reg.is_quarantined(52));
     let log = std::fs::read_to_string(&gh_log).unwrap_or_default();
     assert!(log.contains("--add-label loom:blocked"), "{log}");
-    assert!(log.contains("failure class `unclassified`"), "{log}");
+    assert!(log.contains("failure class `unclassified:no-class`"), "{log}");
+    assert!(log.contains("within 120s of dispatch"), "the ladder window: {log}");
     assert!(log.contains(QUARANTINE_COMMENT_MARKER), "{log}");
 }
 
-/// Environmental failures and open-PR yields climb the ladder but never park.
+/// Park counting (Judge on #11872): only issue-attributable fast failures
+/// count. Transient events in front of one genuine failure never park.
 #[test]
-fn environmental_failures_and_open_pr_yields_never_park() {
+fn transient_events_before_one_genuine_failure_do_not_park() {
     let dir = tempdir().unwrap();
     let mut reg = registry(dir.path());
-    for sweep in ["a", "b", "c", "d"] {
-        reg.charge_fast_failure(sweep, 61, "preflight-no-cli-start", true);
-        reg.charge_fast_failure(sweep, 62, "exit-1", false);
+    // Two lost claims or token-selection deaths, then one unclassified.
+    reg.record_dispatch_failure(61);
+    reg.record_dispatch_failure(61);
+    reg.charge_fast_failure("c", 61, UNCLASSIFIED_CLASS, false);
+    // A pre-flight death and an exhausted account, then one unclassified.
+    reg.charge_fast_failure("a", 62, "preflight-no-cli-start", false);
+    reg.charge_fast_failure("b", 62, "account-exhausted:rate-limited", false);
+    reg.charge_fast_failure("c", 62, UNCLASSIFIED_CLASS, false);
+    // Two open-PR yields, then one unclassified.
+    reg.charge_fast_failure("a", 63, "exit-1", true);
+    reg.charge_fast_failure("b", 63, "exit-1", true);
+    reg.charge_fast_failure("c", 63, UNCLASSIFIED_CLASS, false);
+    for issue in [61, 62, 63] {
+        assert!(!reg.is_quarantined(issue), "#{issue} parked on a mixed streak");
+        assert_eq!(reg.fast_failure_streak(issue), 1, "#{issue}");
     }
-    assert_eq!(reg.dispatch_failure_count(61), 4);
-    assert_eq!(reg.dispatch_failure_count(62), 4);
-    assert!(!reg.is_quarantined(61));
-    assert!(!reg.is_quarantined(62));
+    // Three genuine ones park.
+    for sweep in ["a", "b", "c"] {
+        reg.charge_fast_failure(sweep, 64, UNCLASSIFIED_CLASS, false);
+    }
+    assert!(reg.is_quarantined(64));
+}
+
+/// On probation (released from a park, generation kept) the next genuine
+/// fast failure parks at once, like the quarantine's own threshold of 1.
+#[test]
+fn a_relapse_on_probation_parks_at_once() {
+    let dir = tempdir().unwrap();
+    let mut reg = registry(dir.path());
+    reg.enter_quarantine(65);
+    reg.quarantined.remove(&65);
+    reg.charge_fast_failure("a", 65, "exit-1", false);
+    assert!(reg.is_quarantined(65));
+    assert_eq!(reg.quarantine_generation(65), 2);
 }
 
 /// With quarantine disabled the ladder only backs off; it never parks.
@@ -178,7 +310,7 @@ fn a_disabled_quarantine_disables_the_park() {
         ..QuarantineConfig::default()
     });
     for sweep in ["a", "b", "c"] {
-        reg.charge_fast_failure(sweep, 63, "exit-1", true);
+        reg.charge_fast_failure(sweep, 63, "exit-1", false);
     }
     assert!(!reg.is_quarantined(63));
     assert!(reg.dispatch_backoff_remaining(63, Utc::now()).is_some());
@@ -196,7 +328,7 @@ fn the_ladder_does_not_re_park_a_quarantined_issue() {
     assert!(reg.is_quarantined(71));
     assert_eq!(reg.quarantine_generation(71), 1);
     for sweep in ["a", "b", "c", "d"] {
-        reg.charge_fast_failure(sweep, 71, "exit-1", true);
+        reg.charge_fast_failure(sweep, 71, "exit-1", false);
     }
     assert_eq!(reg.quarantine_generation(71), 1, "one park, not two");
 }
@@ -208,7 +340,7 @@ fn the_quarantine_does_not_re_park_a_ladder_parked_issue() {
     let dir = tempdir().unwrap();
     let mut reg = registry(dir.path());
     for sweep in ["a", "b", "c"] {
-        reg.charge_fast_failure(sweep, 72, "exit-1", true);
+        reg.charge_fast_failure(sweep, 72, "exit-1", false);
     }
     assert!(reg.is_quarantined(72));
     for _ in 0..3 {

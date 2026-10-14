@@ -473,6 +473,10 @@ fn daemon_write_paths_are_scoped() {
         ),
         ("sweep_registry/quarantine.rs", Via(DISPATCH, "acts on dispatched sweeps")),
         (
+            "sweep_registry/fast_fail_park.rs",
+            Via(DISPATCH, "parks dispatched sweeps' issues (#11854)"),
+        ),
+        (
             "sweep_registry/prless_retry/hold.rs",
             Via(DISPATCH, "acts on dispatched sweeps"),
         ),

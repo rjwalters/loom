@@ -110,7 +110,7 @@ pub const SPAWN_DEATH_CLASS: &str = "unclassified:spawn-death";
 
 /// The class a sweep `failure` carries when nothing else named one (Issue
 /// #11854) — a class in its own right, never an empty attribute.
-pub const UNCLASSIFIED_CLASS: &str = "unclassified";
+pub const UNCLASSIFIED_CLASS: &str = "unclassified:no-class";
 
 /// What a sweep actually did, independent of how its process ended (Issue
 /// #9441) — the axis [`SweepResult`] cannot express.

@@ -6380,7 +6380,7 @@ knobs not yet audited here.
 | `autonomous.workFinder.quarantine.maxReleaseAttempts` | `LOOM_WORK_FINDER_QUARANTINE_MAX_RELEASE_ATTEMPTS` | `20` | Consecutive failed `loom:blocked` → `loom:issue` **release** retries before the reaper gives up on one issue and logs a single `ERROR` for a human (#8953). Bounds the *release* retry, not insta-crash accrual. A retry skipped because the shared rate-limit breaker is suppressed does not count. Zero/invalid → default |
 | `autonomous.workFinder.dispatchBackoff.enabled` | `LOOM_DISPATCH_BACKOFF` | `true` | Per-issue dispatch backoff on/off (#4485). A safety backstop — defaults on. Env truthy (`1`/`true`/`yes`/`on`) enables, any other value disables; wins over config |
 | `autonomous.workFinder.dispatchBackoff.baseSecs` | `LOOM_DISPATCH_BACKOFF_BASE_SECS` | `60` | Backoff applied after the **first** failed dispatch of an issue; doubles per consecutive failure. Zero/invalid → default |
-| `autonomous.workFinder.dispatchBackoff.maxSecs` | `LOOM_DISPATCH_BACKOFF_MAX_SECS` | `21600` | Ceiling on the doubling (6 h since #11854; was 900) — also the idle window after which an issue's consecutive-failure tally restarts at zero. An open-PR guard refusal stays capped at 900 s whatever this says. Zero/invalid → default; clamped up to `baseSecs` |
+| `autonomous.workFinder.dispatchBackoff.maxSecs` | `LOOM_DISPATCH_BACKOFF_MAX_SECS` | `21600` | Ceiling on the doubling (6 h since #11854; was 900) — also the idle window after which an issue's consecutive-failure tally restarts at zero. Only an issue-attributable fast failure climbs to it; every other cause (lost lease race, token-pool death, environmental class, open-PR refusal or yield, `dispatch-backoff record`) stays capped at 900 s. Zero/invalid → default; clamped up to `baseSecs` |
 | `autonomous.workFinder.noopCooldown.enabled` | `LOOM_WORK_FINDER_NOOP_COOLDOWN` | `true` | No-op re-dispatch cooldown on/off (#6670). A safety backstop — defaults on. Env truthy (`1`/`true`/`yes`/`on`) enables, any other value disables; wins over config |
 | `autonomous.workFinder.noopCooldown.cooldownSecs` | `LOOM_WORK_FINDER_NOOP_COOLDOWN_SECS` | `3600` | How long a self-reported no-op release (`loom-daemon noop-cooldown record` / `RecordNoopRelease`) holds an issue out of dispatch. Flat, non-exponential — every record re-arms the same window. Zero/invalid → default. `/loom:sweep`'s Builder phase is the first in-repo caller via `defaults/scripts/record-noop-release.sh` (#6740) — see "No-op re-dispatch cooldown (#6670)" below |
 | `autonomous.workFinder.declineCooldown.enabled` | `LOOM_WORK_FINDER_DECLINE_COOLDOWN` | `true` | Hard-exclusion decline cooldown on/off (#7528). A safety backstop — defaults on. Env truthy (`1`/`true`/`yes`/`on`) enables, any other value disables; wins over config. The **label list itself** is deliberately not configurable — see "Hard-exclusion decline cooldown (#7528)" below |
@@ -6977,17 +6977,23 @@ by `maxSecs`, cleared by
 before every **bounded one-shot recovery** dispatch — the reaper-driven resume
 (#4256) and all three watchdogs (#3887/#3895/#3910) — so a refusal can never burn
 a single-attempt recovery those latches already rate-limit.
-**Fast-fail park (#11854).** When an issue's streak reaches the quarantine
-`threshold` (3) on a failure whose class is not environmental (`preflight-*`,
+**Fast-fail park (#11854).** Only an issue-attributable fast failure — no
+progress, inside a 2-minute window, class not environmental (`preflight-*`,
 `account-exhausted:*`, `no-usable-account`, `self-kill:*`, `execution-error`),
-the ladder parks it **through the quarantine**: the same in-memory entry, TTL,
+not an open-PR yield — climbs to `maxSecs`; those other causes keep a 900 s
+cap and are counted on their own streak. When the issue-attributable streak
+reaches the quarantine `threshold` (3; 1 on probation), the ladder parks it
+**through the quarantine**: the same in-memory entry, TTL,
 escalation and `loom-daemon quarantine clear`, the same park record,
 `loom:blocked` edit and comment marker, with the comment naming the failure
-class (`unclassified` when nothing classified it). It never parks twice: not
+class (`unclassified:no-class` when nothing classified it). It never parks twice: not
 an issue already quarantined, nor one held by the PR-less or no-op hold, and
 the quarantine's own tally does not re-park one the ladder parked. An open-PR
 yield never parks; a `loom:frozen` issue gets the in-memory pause and no forge
-write. Disabled with the quarantine.
+write. Disabled with the quarantine. **Note:** each armed window is broadcast
+once to peer hosts (#7477), and `loom-daemon quarantine clear <issue>` (there
+is no separate `dispatch-backoff clear`) clears only this host's window and
+park — a peer keeps skipping the issue until the window it received expires.
 Alongside it, the registry counts its **own** `loom:issue`/`loom:building` writes
 per issue and logs a loud `LABEL FLAPPING` warning at 6 writes in 5 minutes
 (a healthy dispatch writes exactly 2), so the pattern shows up in `daemon.log`
