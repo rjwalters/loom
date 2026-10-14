@@ -478,6 +478,62 @@ fn leaseless_yield_to_a_foreign_actor_keeps_the_label() {
     );
 }
 
+/// Sharing a forge actor does not make a peer's lease this dispatcher's own.
+#[test]
+#[serial]
+fn own_window_fleet_label_does_not_override_a_foreign_lease() {
+    let dir = tempdir().unwrap();
+    let (mut registry, gh_log, spawn_log, store) = lease_order_dispatch_registry(dir.path(), &[]);
+    set_claim_event_now(dir.path(), "loom-fleet-dispatch");
+    seed_renewed_lease(&store, "<!-- loom:lease host=peer-host sweep=peer-sweep -->", 1, 1);
+    let err = registry
+        .dispatch(&SweepKind::Issue(10348), None, None, None, None)
+        .expect_err("same-window fleet actor must not override the peer's earlier lease");
+    let lease_err = err.downcast_ref::<LeaseOrderDispatchError>().unwrap();
+    assert_eq!(lease_err.earliest_host, "peer-host");
+    assert!(!spawn_log.exists());
+    let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+    assert!(calls.contains("loom:lease-yield"));
+    assert!(!calls.contains("--remove-label loom:building"));
+}
+
+/// A later read must not waive the label guard on missing ownership evidence.
+#[test]
+#[serial]
+fn own_window_label_keeps_yield_when_fresh_lease_evidence_changes() {
+    for mode in ["foreign", "empty", "unreadable"] {
+        let dir = tempdir().unwrap();
+        let (mut registry, gh_log, spawn_log, store) =
+            lease_order_dispatch_registry(dir.path(), &[]);
+        set_claim_event_now(dir.path(), "loom-fleet-dispatch");
+        let peer = dir.path().join("late-peer.jsonl");
+        seed_renewed_lease(&peer, "<!-- loom:lease host=peer-host sweep=peer-sweep -->", 1, 1);
+        let flag = dir.path().join("attribution-started");
+        let action = match mode {
+            "foreign" => format!("cat '{}' >> '{}'", peer.display(), store.display()),
+            "empty" => format!(": > '{}'", store.display()),
+            _ => format!("touch '{}'", flag.display()),
+        };
+        let fake = dir.path().join("fake-gh.sh");
+        let script = std::fs::read_to_string(&fake).unwrap();
+        let hook = format!(
+            "#!/usr/bin/env bash\n\
+             if [[ \"$*\" == *\"/timeline\"* && \"$*\" == *max_by* ]]; then {action}; fi\n\
+             if [[ \"$*\" == *\"/comments\"* && -f '{}' ]]; then exit 1; fi\n",
+            flag.display(),
+        );
+        std::fs::write(&fake, script.replacen("#!/usr/bin/env bash\n", &hook, 1)).unwrap();
+        let err = registry
+            .dispatch(&SweepKind::Issue(10349), None, None, None, None)
+            .expect_err("own actor/time cannot override missing or foreign lease evidence");
+        assert!(err.downcast_ref::<LeaseOrderDispatchError>().is_some(), "{mode}: {err:#}");
+        assert!(!spawn_log.exists(), "{mode}: must not spawn");
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(calls.contains("loom:lease-yield"), "{mode}: must yield");
+        assert!(!calls.contains("--remove-label loom:building"), "{mode}: retain label");
+    }
+}
+
 /// The shared bot identity at an unrelated time is another lane's claim.
 #[test]
 #[serial]
