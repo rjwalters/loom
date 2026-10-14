@@ -101,6 +101,15 @@ impl PeerClaimView {
         true
     }
 
+    /// Drop every peer step cooldown on `item` in `repo` (#11900): a verdict
+    /// on this host changed the item's state. Returns how many were dropped.
+    pub fn clear_step_cooldowns(&mut self, repo: &str, item: u32) -> usize {
+        let before = self.step_cooldowns.len();
+        self.step_cooldowns
+            .retain(|(r, i, _), _| !(r == repo && *i == item));
+        before - self.step_cooldowns.len()
+    }
+
     /// Drop lapsed peer step cooldowns.
     pub fn prune_expired_step_cooldowns(&mut self, now: Instant) {
         self.step_cooldowns.retain(|_, expiry| *expiry > now);

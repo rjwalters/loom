@@ -5,10 +5,11 @@
 //!
 //! | Effect | Applied here as |
 //! |---|---|
-//! | `Advance` | the item's local history and cooldowns are dropped, and every peer is told to drop theirs (a zero-length `StepCooldownArmed`); a Champion verdict also removes the forge ladder |
+//! | `Advance` | the item's local history and cooldowns are dropped; so is every peer copy in this host's view, and every peer is told to drop its own (a zero-length `StepCooldownArmed` for **every** step of the item, whoever armed it); a Champion verdict also removes its step's forge ladder |
 //! | `Landed` | the same, plus the #11853 landed cooldown on the issue (fleet-wide, every consumer) and a 24 h Builder cooldown on `(item, builder)` |
 //! | `Cooldown` | the window, broadcast |
-//! | `FastFailLadder` | [`SweepRegistry::charge_fast_failure`] (the #11854 ladder and park), and the ladder's window mirrored onto `(item, step)` and broadcast |
+//! | `FastFailLadder` (issue steps) | [`SweepRegistry::charge_fast_failure`] (the #11854 ladder and park), and the ladder's window mirrored onto `(item, step)` and broadcast |
+//! | `FastFailWindow` (PR steps) | the ledger's own doubling window, broadcast; **no** forge write: the issue quarantine's park and release are issue-only |
 //! | `ForgeLadder` | the next rung written to the item's body ([`reeval_ladder::record`]), its due time mirrored locally (capped at 24 h) and broadcast |
 //! | `Redraw` | counted |
 //! | `Reclassify`, `Failed` | counted toward the repeat cap |
@@ -58,19 +59,19 @@ impl SweepRegistry {
         let rec = self
             .step_ledger
             .record(item, step, &run.outcome, run.ran_for, now);
-        for lifted in &rec.lifted {
-            self.publish_step_cooldown(item, *lifted, Duration::ZERO);
-        }
         let champion = step.role_name() == "champion";
+        if matches!(rec.effect, Effect::Advance | Effect::Landed) {
+            self.lift_item_step_cooldowns(item);
+            if champion {
+                if let Err(e) = reeval_ladder::clear(forge, item, step) {
+                    log::warn!("step_ledger: clearing the re-evaluation ladder on #{item}: {e}");
+                }
+            }
+        }
         match rec.effect {
             Effect::Landed => {
                 self.arm_landed_cooldown(item, LANDED_COOLDOWN);
                 self.broadcast_step_cooldown(item, StepRole::Builder, now);
-            }
-            Effect::Advance if champion => {
-                if let Err(e) = reeval_ladder::clear(forge, item) {
-                    log::warn!("step_ledger: clearing the re-evaluation ladder on #{item}: {e}");
-                }
             }
             Effect::FastFailLadder => {
                 let class = run
@@ -110,7 +111,11 @@ impl SweepRegistry {
                     self.step_ledger.counters().claim_lost
                 );
             }
-            Effect::Advance | Effect::Cooldown(_) | Effect::Reclassify | Effect::Failed => {}
+            Effect::Advance
+            | Effect::Cooldown(_)
+            | Effect::FastFailWindow
+            | Effect::Reclassify
+            | Effect::Failed => {}
         }
         self.broadcast_step_cooldown(item, step, now);
         let cooling_until = self.step_ledger.cooling_until(item, step, now);
@@ -149,6 +154,21 @@ impl SweepRegistry {
     /// Drop the ledger's lapsed entries (each reaper tick).
     pub fn prune_step_ledger(&mut self) {
         self.step_ledger.prune(Utc::now());
+    }
+
+    /// A verdict changed `item`'s state: drop every peer copy of its step
+    /// cooldowns from this host's view, and tell every peer to drop theirs,
+    /// for every step, whoever armed it (a zero-length ad lifts it).
+    fn lift_item_step_cooldowns(&self, item: u32) {
+        if let Some(view) = &self.peer_claims {
+            let repo = peer_claims::repo_slug(&self.config.workspace_root);
+            view.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear_step_cooldowns(&repo, item);
+        }
+        for step in StepRole::ALL {
+            self.publish_step_cooldown(item, step, Duration::ZERO);
+        }
     }
 
     /// Broadcast `(item, step)`'s local window in force at `now`, if any.

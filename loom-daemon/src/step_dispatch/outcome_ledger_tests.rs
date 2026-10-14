@@ -115,17 +115,27 @@ fn the_forge_post_state_decides_and_the_line_only_chooses() {
     };
     let unchanged = PostState::default();
 
-    assert_eq!(classify(Some(&verdict), moved), verdict);
+    assert_eq!(classify(Some(&verdict), Some(moved)), verdict);
     assert_eq!(
-        classify(Some(&verdict), unchanged),
+        classify(Some(&verdict), Some(unchanged)),
         out(OutcomeClass::Failed, UNCLASSIFIED),
         "a verdict the forge does not show is failed"
     );
-    assert_eq!(classify(Some(&noop), unchanged), noop);
-    assert_eq!(classify(None, unchanged), out(OutcomeClass::Failed, UNCLASSIFIED));
-    assert_eq!(classify(Some(&verdict), held).class, OutcomeClass::Failed, "claim left held");
-    assert_eq!(classify(None, closed), out(OutcomeClass::Verdict, "closed"));
-    assert_eq!(classify(None, moved), out(OutcomeClass::Verdict, UNCLASSIFIED));
+    assert_eq!(classify(Some(&noop), Some(unchanged)), noop);
+    assert_eq!(classify(None, Some(unchanged)), out(OutcomeClass::Failed, UNCLASSIFIED));
+    assert_eq!(
+        classify(Some(&verdict), Some(held)).class,
+        OutcomeClass::Failed,
+        "claim left held"
+    );
+    assert_eq!(classify(None, Some(closed)), out(OutcomeClass::Verdict, "closed"));
+    assert_eq!(classify(None, Some(moved)), out(OutcomeClass::Verdict, UNCLASSIFIED));
+    assert_eq!(
+        classify(Some(&noop), None),
+        out(OutcomeClass::Failed, PROBE_FAILED),
+        "a failed forge read never trusts the line"
+    );
+    assert_eq!(classify(Some(&verdict), None).class, OutcomeClass::Failed);
 }
 
 // -------------------------------------------------------- class → effect
@@ -200,6 +210,18 @@ fn each_class_maps_to_one_effect() {
             out(OutcomeClass::Verdict, "merged"),
             SLOW,
             Effect::Advance,
+        ),
+        (
+            StepRole::Judge,
+            out(OutcomeClass::Failed, "crashed"),
+            fast,
+            Effect::FastFailWindow,
+        ),
+        (
+            StepRole::ChampionMerge,
+            out(OutcomeClass::Failed, "failed"),
+            fast,
+            Effect::FastFailWindow,
         ),
     ];
     for (step, outcome, ran_for, want) in cases {
@@ -354,7 +376,7 @@ fn no_item_step_runs_more_than_three_times_in_24h_without_a_state_change() {
 fn the_repeat_cap_counts_noops_too_and_arms_until_the_oldest_leaves() {
     let mut l = OutcomeLedger::default();
     let now = t0();
-    let noop = out(OutcomeClass::Noop, "ci_pending");
+    let noop = out(OutcomeClass::Noop, "already_judged");
     l.record(5, StepRole::Judge, &noop, SLOW, now);
     l.record(5, StepRole::Judge, &noop, SLOW, now + mins(61));
     let rec = l.record(5, StepRole::Judge, &noop, SLOW, now + mins(122));
@@ -391,4 +413,70 @@ fn the_query_merges_extend_only() {
     assert!(q.is_cooling(3, StepRole::ChampionPromote, now + mins(9)));
     assert!(!q.is_cooling(3, StepRole::ChampionPromote, now + mins(10)));
     assert!(!q.is_cooling(3, StepRole::Builder, now));
+}
+
+/// Only steps that worked the item count toward the cap: refusals and a
+/// CI-queue wait never arm it, however many there are.
+#[test]
+fn refusals_and_ci_waits_are_not_runs() {
+    let mut l = OutcomeLedger::default();
+    let now = t0();
+    for (i, (class, reason)) in [
+        (OutcomeClass::Refused, "pool_gate"),
+        (OutcomeClass::Refused, "claimed"),
+        (OutcomeClass::Refused, "open_pr"),
+        (OutcomeClass::Noop, "ci_pending"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert!(!counts_as_run(&out(class, reason)), "{reason}");
+        for k in 0..5 {
+            let at = now + mins(i64::try_from(i * 100 + k * 61).unwrap());
+            let rec = l.record(
+                20 + u32::try_from(i).unwrap(),
+                StepRole::Judge,
+                &out(class, reason),
+                SLOW,
+                at,
+            );
+            assert!(!rec.repeat_capped, "{reason} #{k}");
+        }
+    }
+    assert_eq!(l.counters().repeat_capped, 0);
+    assert!(counts_as_run(&out(OutcomeClass::Noop, "already_judged")));
+    assert!(counts_as_run(&out(OutcomeClass::Failed, "crashed")));
+}
+
+/// A PR step's fast failures double a ledger-local window, capped at 24 h.
+#[test]
+fn a_pr_step_fast_failure_doubles_a_local_window_capped_at_24h() {
+    let mut l = OutcomeLedger::default();
+    let now = t0();
+    let fail = out(OutcomeClass::Failed, "crashed");
+    let quick = Duration::from_secs(20);
+    let mut lengths = Vec::new();
+    for k in 0..14 {
+        let at = now + chrono::Duration::days(k);
+        let rec = l.record(40, StepRole::Doctor, &fail, quick, at);
+        assert_eq!(rec.effect, Effect::FastFailWindow);
+        lengths.push((rec.cooling_until.unwrap() - at).num_seconds());
+    }
+    assert_eq!(&lengths[..3], &[60, 120, 240], "doubling from the #4485 base");
+    assert!(lengths.iter().all(|s| *s <= 24 * 3600), "{lengths:?}");
+    assert_eq!(l.cooling_cause(40, StepRole::Doctor, now), Some(CooldownCause::FastFail));
+    l.record(
+        40,
+        StepRole::Doctor,
+        &out(OutcomeClass::Verdict, "pr_opened"),
+        SLOW,
+        now + chrono::Duration::days(15),
+    );
+    let at = now + chrono::Duration::days(15);
+    let rec = l.record(40, StepRole::Doctor, &fail, quick, at);
+    assert_eq!(
+        (rec.cooling_until.unwrap() - at).num_seconds(),
+        60,
+        "a verdict resets the streak"
+    );
 }

@@ -169,7 +169,7 @@ A Builder restore with a verified open linked PR writes no label: the issue keep
 |---|---|
 | landed (`verdict:closed`) | Reclassify the item. No more Builder steps. |
 | `noop` | Cooldown per `(item, step)` |
-| fast `failed` | The #11872 ladder |
+| fast `failed` | Issue steps: the #11872 ladder. PR steps (Judge, Doctor, Champion merge): a ledger-local doubling window capped at 24 h, never the issue quarantine |
 | Champion re-evaluation left the item held or blocked | Ladder from 6 h to 7 d, **stored on the forge**: a `<!-- loom:reeval step=… rung=… next=… -->` line in the item's body, beside its park record or under its hold marker |
 | `refused`, `pool_gate` or `claimed` | A short cooldown per `(item, step)`, in force before the next tick |
 | `refused`, `claim_lost` | Redraw; counted |

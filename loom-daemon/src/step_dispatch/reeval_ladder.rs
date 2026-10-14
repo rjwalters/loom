@@ -125,20 +125,35 @@ pub fn render(r: &Reeval) -> String {
     )
 }
 
-/// `body` with every ladder marker removed (with its line when it stood
-/// alone), or `None` when it has none.
+/// `body` with `step`'s ladder markers removed (with their line when they
+/// stood alone), or `None` when it has none. Another step's marker, and a
+/// malformed one, are left alone: the same scope [`due`] reads.
 #[must_use]
-pub fn strip(body: &str) -> Option<String> {
-    if !marker_re().is_match(body) {
+pub fn strip(body: &str, step: StepRole) -> Option<String> {
+    let is_step = |c: &regex::Captures<'_>| {
+        c.get(1)
+            .and_then(|m| parse_inner(m.as_str()))
+            .is_some_and(|r| r.step == step)
+    };
+    if !marker_re().captures_iter(body).any(|c| is_step(&c)) {
         return None;
     }
+    let drop_markers = |text: &str| -> String {
+        marker_re()
+            .replace_all(text, |c: &regex::Captures<'_>| {
+                if is_step(c) {
+                    String::new()
+                } else {
+                    c.get(0).map_or(String::new(), |m| m.as_str().to_string())
+                }
+            })
+            .into_owned()
+    };
     let kept: Vec<&str> = body
         .split('\n')
-        .filter(|line| {
-            !(marker_re().is_match(line) && marker_re().replace_all(line, "").trim().is_empty())
-        })
+        .filter(|line| !(drop_markers(line) != *line && drop_markers(line).trim().is_empty()))
         .collect();
-    let out = marker_re().replace_all(&kept.join("\n"), "").into_owned();
+    let out = drop_markers(&kept.join("\n"));
     Some(out.trim_end_matches('\n').to_string())
 }
 
@@ -160,7 +175,7 @@ pub fn advance(body: &str, step: StepRole, now: DateTime<Utc>) -> (String, Reeva
         rung,
         next: now + delay,
     };
-    let base = strip(body).unwrap_or_else(|| body.to_string());
+    let base = strip(body, step).unwrap_or_else(|| body.to_string());
     let base = base.trim_end_matches('\n');
     let out = if base.is_empty() {
         render(&record)
@@ -204,15 +219,19 @@ pub fn record<F: BodyForge + ?Sized>(
     Ok(rec)
 }
 
-/// Remove the ladder from `item`'s body on the forge. Returns whether a marker
+/// Remove `step`'s ladder from `item`'s body on the forge. Returns whether a marker
 /// was there (no write when none was).
 ///
 /// # Errors
 ///
 /// A failed read or write, as the forge reported it.
-pub fn clear<F: BodyForge + ?Sized>(forge: &mut F, item: u32) -> Result<bool, String> {
+pub fn clear<F: BodyForge + ?Sized>(
+    forge: &mut F,
+    item: u32,
+    step: StepRole,
+) -> Result<bool, String> {
     let body = forge.body(u64::from(item))?;
-    match strip(&body) {
+    match strip(&body, step) {
         Some(new_body) => forge.set_body(u64::from(item), &new_body).map(|()| true),
         None => Ok(false),
     }
