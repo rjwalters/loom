@@ -384,6 +384,7 @@ pub mod status_budget;
 /// needs (#10787): one list for `--section` parsing, `--help`, the wire request
 /// and the renderer's key filter.
 pub mod status_section;
+pub mod step_dispatch;
 /// `points:*` story-point size labels (#9432, epic #9429) — the one parser both
 /// telemetry consumers (`sweep.started` at dispatch, `sweep.outcome` at the
 /// terminal transition) resolve points through, including the daemon-side

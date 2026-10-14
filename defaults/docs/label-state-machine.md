@@ -715,6 +715,8 @@ above. Nothing about the guard changes for any other blocking label.
 
 ## Label registry: the source of truth (#10013)
 
+> **Step dispatch (accepted design, #11894; not yet implemented).** Under `autonomous.workFinder.stepDispatch: on`, `stale_after_minutes` (described below as inert) becomes live claim liveness for the five claim labels; a `queued` item state marks a PR in GitHub's merge queue, never drawn for a merge step; and a dead step's claim is restored to its own role's ready stage. See [`docs/design/work-finder-step-dispatch.md`](https://github.com/rjwalters/loom/blob/main/docs/design/work-finder-step-dispatch.md) §12.
+
 `defaults/labels.json` is the single source of truth for label semantics: each
 label's name, description, color, `kind`, `applied_by`/`removed_by`, and the
 boolean properties the daemon's label tables encode (`park`, `skip`,

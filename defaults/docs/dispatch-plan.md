@@ -31,6 +31,8 @@ hosts by whichever happened to see more work.
 
 ## The rule
 
+> **Step dispatch (accepted design, #11894; not yet implemented).** Under `autonomous.workFinder.stepDispatch: on`, plan rows gain a `step` field (the role advancing the item), and the merge keys on `repo#item` + `step`. The shared fixture changes first. See [`docs/design/work-finder-step-dispatch.md`](https://github.com/rjwalters/loom/blob/main/docs/design/work-finder-step-dispatch.md) §12.
+
 ### 1. Fold by `repo#issue`
 
 Rows are grouped by `owner/repo` plus issue number — not the bare issue

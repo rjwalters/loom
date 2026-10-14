@@ -663,7 +663,7 @@ async fn mirror_listing(root: &Path, slug: &str, label: &'static str) -> Option<
             Caller::StageDwell,
             Some(&root),
             Some(&slug),
-            label,
+            Some(label),
             Pages::First,
         )
     })

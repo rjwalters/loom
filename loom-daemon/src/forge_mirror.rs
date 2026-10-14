@@ -85,6 +85,9 @@ pub mod wake;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod all_open_tests;
+
 /// The config block.
 pub const CONFIG_KEY: &str = "forge.mirror";
 

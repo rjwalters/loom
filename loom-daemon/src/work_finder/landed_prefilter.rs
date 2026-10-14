@@ -31,12 +31,15 @@
 //!
 //! A PR in the issue's GitHub closes-graph (`closedByPullRequestsReferences`,
 //! closed PRs included: a closing keyword such as `Closes #N`, or a
-//! Development-sidebar link) is `MERGED`, and merged after the issue was
-//! last reopened. A `Part of #N` / `Refs #N` PR is not in the closes-graph,
-//! so its merge never counts: that work is unfinished, and the issue keeps
-//! its stage (the no-op cooldown handles a dispatch that finds nothing to
-//! do). A merge older than the issue's last reopen is a person asking for
-//! more work, and does not count either.
+//! Development-sidebar link) is `MERGED`, merged after the issue was last
+//! reopened, and belongs to the issue's own repository. A `Part of #N` /
+//! `Refs #N` PR is not in the closes-graph, so its merge never counts: that
+//! work is unfinished, and the issue keeps its stage (the no-op cooldown
+//! handles a dispatch that finds nothing to do). A merge older than the
+//! issue's last reopen is a person asking for more work, and does not count
+//! either. Nor does a PR merged in another repository whose body says
+//! `Closes owner/repo#N` (#11899): it is in the closes-graph, but anyone can
+//! write that line in a repo of their own.
 //!
 //! # At most once
 //!
@@ -113,7 +116,8 @@ pub fn route_comment(pr: u32) -> String {
 // ---------------------------------------------------------------------------
 
 /// One aliased query: each issue's state, its last reopen, and its
-/// closes-graph with closed (and so merged) PRs included.
+/// closes-graph with closed (and so merged) PRs included, each PR naming its
+/// repository.
 #[must_use]
 pub fn landed_query(owner: &str, name: &str, issues: &[u32]) -> String {
     let fields: String = issues
@@ -123,7 +127,7 @@ pub fn landed_query(owner: &str, name: &str, issues: &[u32]) -> String {
                 " i{n}: issue(number: {n}) {{ state timelineItems(itemTypes: [REOPENED_EVENT], \
                  last: 1) {{ nodes {{ ... on ReopenedEvent {{ createdAt }} }} }} \
                  closedByPullRequestsReferences(first: {CLOSING_FIRST}, includeClosedPrs: true) \
-                 {{ totalCount nodes {{ number state mergedAt }} }} }}"
+                 {{ totalCount nodes {{ number state mergedAt repository {{ nameWithOwner }} }} }} }}"
             )
         })
         .collect();
@@ -136,12 +140,14 @@ fn ts(v: &Value) -> Option<DateTime<Utc>> {
         .map(|d| d.with_timezone(&Utc))
 }
 
-/// The verdict for one issue's alias: `Some(Some(pr))` landed by `pr` (the
-/// latest qualifying merge), `Some(None)` verified not landed, `None` no
-/// verdict (alias missing, malformed, or a truncated graph with no merge in
-/// it).
+/// The verdict for one issue's alias in repository `repo` (`owner/name`):
+/// `Some(Some(pr))` landed by `pr` (the latest qualifying merge), `Some(None)`
+/// verified not landed, `None` no verdict (alias missing, malformed, or a
+/// truncated graph with no merge in it). Only a PR of `repo` itself
+/// qualifies (#11899): a cross-repo `Closes owner/repo#N` is anyone's to
+/// write, and a PR naming no repository is not trusted to be this one.
 #[must_use]
-pub fn alias_verdict(issue: &Value) -> Option<Option<u32>> {
+pub fn alias_verdict(issue: &Value, repo: &str) -> Option<Option<u32>> {
     let state = issue.get("state")?.as_str()?;
     if !state.eq_ignore_ascii_case("open") {
         // A closed issue is the 2.5 guard's to refuse, not this pre-filter's.
@@ -155,6 +161,11 @@ pub fn alias_verdict(issue: &Value) -> Option<Option<u32>> {
     let landed = nodes
         .iter()
         .filter(|pr| pr["state"].as_str() == Some("MERGED"))
+        .filter(|pr| {
+            pr["repository"]["nameWithOwner"]
+                .as_str()
+                .is_some_and(|r| r.eq_ignore_ascii_case(repo))
+        })
         .filter_map(|pr| {
             let number = u32::try_from(pr["number"].as_u64()?).ok()?;
             let merged = ts(&pr["mergedAt"]);
@@ -175,10 +186,11 @@ pub fn alias_verdict(issue: &Value) -> Option<Option<u32>> {
     (usize::try_from(total).ok() == Some(nodes.len())).then_some(None)
 }
 
-/// Parse a [`landed_query`] answer: the verdict of each issue that has one.
-/// `None` when the answer carries no `data.repository` at all.
+/// Parse a [`landed_query`] answer for repository `repo` (`owner/name`): the
+/// verdict of each issue that has one. `None` when the answer carries no
+/// `data.repository` at all.
 #[must_use]
-pub fn parse_landed(body: &str, issues: &[u32]) -> Option<HashMap<u32, Option<u32>>> {
+pub fn parse_landed(body: &str, issues: &[u32], repo: &str) -> Option<HashMap<u32, Option<u32>>> {
     let json: Value = serde_json::from_str(body.trim()).ok()?;
     let repository = json.get("data")?.get("repository")?;
     if !repository.is_object() {
@@ -187,7 +199,7 @@ pub fn parse_landed(body: &str, issues: &[u32]) -> Option<HashMap<u32, Option<u3
     Some(
         issues
             .iter()
-            .filter_map(|n| Some((*n, alias_verdict(repository.get(format!("i{n}"))?)?)))
+            .filter_map(|n| Some((*n, alias_verdict(repository.get(format!("i{n}"))?, repo)?)))
             .collect(),
     )
 }
@@ -486,7 +498,7 @@ impl LandedForge for GhLandedForge {
         // `gh` exits non-zero when any alias errored but still prints the
         // partial `data`: parse first, judge per alias.
         let out = gh_call::output(inv).ok()?;
-        let parsed = parse_landed(&String::from_utf8_lossy(&out.stdout), issues);
+        let parsed = parse_landed(&String::from_utf8_lossy(&out.stdout), issues, &self.slug);
         if parsed.is_none() {
             let stderr = gh_call::stderr(&out);
             crate::rate_limit_breaker::global_observe_failure(&stderr, CALLER);

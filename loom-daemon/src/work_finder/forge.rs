@@ -316,7 +316,7 @@ fn mirror_rows(
         Caller::WorkFinder,
         cwd,
         repo,
-        label,
+        Some(label),
         pages,
     )
 }
