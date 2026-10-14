@@ -157,9 +157,14 @@ fn a_step_child_lists_its_leases_and_a_curator_names_its_launch() {
         )
     );
     assert_eq!(
-        env(&cmd, crate::host_identity::HOST_ID_ENV),
+        env(&cmd, crate::host_identity::LEASE_HOST_ID_ENV),
         Some(crate::host_identity::lease_host_identity()),
         "the daemon's lease host id, so a containered session owns its lease"
+    );
+    assert_eq!(
+        env(&cmd, crate::host_identity::HOST_ID_ENV),
+        None,
+        "the telemetry host id is left alone (#11530)"
     );
     assert_eq!(env(&cmd, "LOOM_CURATION_MODEL").as_deref(), Some("opus"));
     assert_eq!(env(&cmd, "LOOM_CURATION_RUNTIME").as_deref(), Some("unknown"));

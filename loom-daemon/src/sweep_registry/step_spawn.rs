@@ -533,7 +533,7 @@ impl SweepRegistry {
 /// The step-only environment of a step child (called from
 /// `spawn_child_process_for`): the lease file its won PR leases are listed
 /// in, so a timed-out step's leases are reaped (#11931); the daemon's lease
-/// host id (`LOOM_HOST_ID`), so its pre-taken lease is the session's own
+/// host id (`LOOM_LEASE_HOST_ID`), so its pre-taken lease is the session's own
 /// wherever the session runs; its pick journal
 /// (#11877's capture); and, for a Curator, the curation provenance the role
 /// runner gives its Curator (`role_runner/launch/curation.rs`).
@@ -551,8 +551,13 @@ pub(crate) fn apply_step_env(
     );
     // The lease's owner is role, host and sweep. A session in a container
     // (Codex) has its own hostname, so without the daemon's host id pinned
-    // it would read the daemon's pre-taken lease as a peer's (#11906).
-    cmd.env(crate::host_identity::HOST_ID_ENV, crate::host_identity::lease_host_identity());
+    // it would read the daemon's pre-taken lease as a peer's (#11906). The pin
+    // is lease-only: `LOOM_HOST_ID` is also the telemetry `host.id` tier, and
+    // setting it here would split the host's identity (#11530).
+    cmd.env(
+        crate::host_identity::LEASE_HOST_ID_ENV,
+        crate::host_identity::lease_host_identity(),
+    );
     crate::observability::pick_journal::attach_step(cmd, sweep_id);
     if role == StepRole::Curator {
         cmd.env("LOOM_CURATION_MODEL", model.filter(|m| !m.is_empty()).unwrap_or("unknown"))

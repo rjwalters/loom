@@ -73,20 +73,21 @@ impl Drop for EnvGuard {
 }
 
 /// A session in a Codex container has its own hostname. The step child
-/// carries the daemon's `LOOM_HOST_ID` (`apply_step_env`, forwarded by
+/// carries the daemon's `LOOM_LEASE_HOST_ID` (`apply_step_env`, forwarded by
 /// `spawn-codex.sh`), so the session's published host is the daemon's and
 /// it re-attaches to the pre-taken lease instead of reading it as a peer's.
 #[test]
 #[serial_test::serial]
 fn a_containered_session_with_the_daemons_host_id_re_attaches() {
-    let _env = EnvGuard::save(&["LOOM_HOST_ID", "HOSTNAME"]);
-    std::env::set_var("LOOM_HOST_ID", "fleet-host-7");
+    let _env = EnvGuard::save(&["LOOM_LEASE_HOST_ID", "LOOM_HOST_ID", "HOSTNAME"]);
+    std::env::remove_var("LOOM_HOST_ID");
+    std::env::set_var("LOOM_LEASE_HOST_ID", "fleet-host-7");
     std::env::set_var("HOSTNAME", "robb-pro.local");
     let daemon_host = published_host();
     std::env::set_var("HOSTNAME", "codex-session-9f2c");
     let session_host = published_host();
-    assert_eq!(session_host, daemon_host, "same LOOM_HOST_ID, same lease host");
-    std::env::remove_var("LOOM_HOST_ID");
+    assert_eq!(session_host, daemon_host, "same LOOM_LEASE_HOST_ID, same lease host");
+    std::env::remove_var("LOOM_LEASE_HOST_ID");
     assert_ne!(published_host(), daemon_host, "without it, the container is a peer");
 
     let dir = TempDir::new().unwrap();
