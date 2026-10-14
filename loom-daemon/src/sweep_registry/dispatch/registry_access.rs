@@ -21,8 +21,8 @@
 //!   `Command::spawn` of the local `spawn-worker.sh` child and the log header.
 //!
 //! Lock released (forge `gh` calls and sleeps), run on a [`forge_twin`]:
-//! - `refuse_closed_issue` (2.5), `dispatch_open_pr_probe` (2.6),
-//!   `refuse_recent_landing` (repo resolution), `guard_issue_labels` and
+//! - `closed_issue_refusal` (2.5), `dispatch_open_pr_probe` (2.6),
+//!   `recent_landing_refusal` (repo resolution), `guard_issue_labels` and
 //!   `first_park_label_in` (2.7), `classify_preflip_labels` (4a),
 //!   `flip_label_to_building` (4), `write_lease_comment` (4b),
 //!   `resolve_lease_order` incl. `confirm_sole_claim` and their sleeps (4c),

@@ -172,6 +172,7 @@ impl SweepRegistry {
     /// [`LANDED_REDISPATCH_WINDOW`] before `now`, and arm its landed cooldown
     /// for the rest of that window, fleet-wide (#11853). Fails open: an
     /// unresolved repo or an unreadable journal never refuses.
+    #[cfg(test)]
     pub(super) fn refuse_recent_landing(&mut self, issue: u32, now: DateTime<Utc>) -> Result<()> {
         let refusal = self.recent_landing_refusal(issue, now);
         self.apply_landed_refusal(issue, refusal)
@@ -213,12 +214,7 @@ impl SweepRegistry {
     /// Step 2.5: refuse a closed issue as `already_landed`, and a number that
     /// resolves to a pull request as before (#4088/#4504). A closed issue
     /// also arms its [`LANDED_COOLDOWN`], fleet-wide (#11853). Fails open.
-    pub(super) fn refuse_closed_issue(&mut self, issue: u32) -> Result<()> {
-        let refusal = self.closed_issue_refusal(issue);
-        self.apply_landed_refusal(issue, refusal)
-    }
-
-    /// The read-only half of [`Self::refuse_closed_issue`].
+    /// Read-only; the caller applies it with [`Self::apply_landed_refusal`].
     pub(super) fn closed_issue_refusal(&self, issue: u32) -> Option<LandedRefusal> {
         let evidence = match self.guard_issue_gate(issue) {
             Some(IssueGate::Closed) => LandedEvidence::ForgeClosed,
