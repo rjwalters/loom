@@ -467,17 +467,47 @@ fn resolve_repo(repo: &str) -> String {
 /// exporter). Called from the shared end-of-tick seam, so empty ticks count.
 /// `draw` is the tick's workspace-draw log (#11103) and `roots[i]` workspace
 /// `i`'s repo root, which names the draw's workspaces. `demoted` is the
-/// tick's `loom:very-important` flood-cap demotions (#11509).
+/// tick's `loom:very-important` flood-cap demotions (#11509). `dispatch_result`
+/// is the tick's canonical `loom.dispatch.result` (#11840), classified once by
+/// the caller from the tick's own report; it rides beside the legacy
+/// `outcome`, which is unchanged.
 pub fn emit_work_finder(
     summary: &WorkFinderTickSummary,
     started_at: DateTime<Utc>,
     ended_at: DateTime<Utc>,
     (draw, demoted, item_draw): (Option<&DrawLog>, &[ViDemotion], Option<&PickItemDraw>),
     roots: &[std::path::PathBuf],
+    dispatch_result: &str,
 ) {
     if !exporting() {
         return;
     }
+    emit(
+        completed_work_finder_record(
+            summary,
+            &crate::sweep_registry::host_identity(),
+            (started_at, ended_at),
+            (draw, demoted),
+            roots,
+            dispatch_result,
+        )
+        .with_item_draw(item_draw.cloned()),
+    );
+}
+
+/// The record [`emit_work_finder`] emits for a completed tick: the ranked
+/// rows, the draws, the demotions and the caller's canonical
+/// `dispatch_result` (#11840), decided by `host`. Reads only the cached repo
+/// slug of `roots`.
+#[must_use]
+pub fn completed_work_finder_record(
+    summary: &WorkFinderTickSummary,
+    host: &str,
+    (started_at, ended_at): (DateTime<Utc>, DateTime<Utc>),
+    (draw, demoted): (Option<&DrawLog>, &[ViDemotion]),
+    roots: &[std::path::PathBuf],
+    dispatch_result: &str,
+) -> PickDecisionRecord {
     let name = |idx: usize| {
         roots
             .get(idx)
@@ -485,18 +515,10 @@ pub fn emit_work_finder(
     };
     let draw = draw.map(|log| workspace_draw_record(log, name));
     let demoted = vi_demotion_records(demoted, name);
-    emit(
-        work_finder_record(
-            summary,
-            &crate::sweep_registry::host_identity(),
-            started_at,
-            ended_at,
-            resolve_repo,
-        )
+    work_finder_record(summary, host, started_at, ended_at, resolve_repo)
         .with_workspace_draw(draw)
         .with_very_important_demoted(demoted)
-        .with_item_draw(item_draw.cloned()),
-    )
+        .with_dispatch_result(Some(dispatch_result))
 }
 
 /// The reason every candidate of a tick that never ran the role was skipped.
@@ -713,3 +735,8 @@ pub fn emit_role_tick(
 #[allow(clippy::unwrap_used)]
 #[path = "pick_decision_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[path = "pick_decision_result_tests.rs"]
+mod result_tests;

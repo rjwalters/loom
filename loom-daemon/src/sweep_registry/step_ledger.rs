@@ -12,7 +12,8 @@
 //! | `FastFailWindow` (PR steps) | the ledger's own doubling window, broadcast; **no** forge write: the issue quarantine's park and release are issue-only |
 //! | `ForgeLadder` | the next rung written to the item's body ([`reeval_ladder::record`]), its due time mirrored locally (capped at 24 h) and broadcast |
 //! | `Redraw` | counted |
-//! | `Reclassify`, `Failed` | counted toward the repeat cap |
+//! | `Reclassify` | nothing for the first; a second identical state refusal in a row arms the ledger's doubling refusal cooldown, broadcast. Not a repeat-cap run |
+//! | `Failed` (slow) | counted toward the repeat cap |
 //!
 //! Whenever the repeat cap arms, its window is broadcast like any other.
 //! Nothing broadcast is longer than 24 h: the peer receiver caps it too.

@@ -216,6 +216,9 @@ pub fn publish_tick(
     let mut summary = tick_summary(report, max_concurrent, completed_at, roots, plan);
     summary.cap = last_cap().filter(|c| c.effective() == max_concurrent);
     crate::observability::ops::queue::record_queue(&summary);
+    // #11840: the tick's canonical `loom.dispatch.result`, classified once
+    // here from the report itself (not re-derived from the reduced summary).
+    let dispatch_result = crate::observability::ops::dispatch::tick_result(report);
     // #10212: the ranked candidates and what the tick did with each.
     crate::observability::pick_decision::emit_work_finder(
         &summary,
@@ -223,6 +226,7 @@ pub fn publish_tick(
         completed_at,
         (report.workspace_draw.as_ref(), &report.vi_demotions, report.item_draw.as_ref()),
         roots,
+        dispatch_result,
     );
     store_tick_summary(summary);
     // #11161: `fleet.state` samples every tick, after the summary is stored.
