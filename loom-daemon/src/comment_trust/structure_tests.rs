@@ -141,6 +141,12 @@ const FETCH_SITES: &[(&str, &str, &str)] = &[
         "TrustPolicy::for_root(root).trusted_bodies(",
     ),
     ("sweep_registry/guards.rs", "read_lease_comments", "policy.trusted_ndjson("),
+    // #11898: a dead step's role-keyed lease holder.
+    (
+        "sweep_registry/step_lease_owner.rs",
+        "read_role_lease_rows",
+        "policy.trusted_ndjson(",
+    ),
     // #9062: the PR timeline read carries base-conflict flag comments.
     (
         "sweep_registry/outcome_journal/label_timeline.rs",

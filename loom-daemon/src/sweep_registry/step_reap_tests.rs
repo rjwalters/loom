@@ -103,3 +103,56 @@ fn a_live_step_occupies_its_item_and_is_excluded_from_sweep_restarts() {
     assert_eq!(reg.watchdog_once(Duration::ZERO), 0);
     assert_eq!(reg.review_stall_watchdog_once(Duration::ZERO), 0);
 }
+
+/// M7: the step's own dispatch label, stamped up to a clock skew after the
+/// step's local start, is not another claimant's; a label well after it is.
+#[test]
+fn the_builder_label_check_tolerates_clock_skew() {
+    let start = Utc::now();
+    let own = start + chrono::Duration::seconds(45);
+    assert!(!label_reapplied_after(own, start));
+    assert!(!label_reapplied_after(start - chrono::Duration::seconds(3), start));
+    assert!(label_reapplied_after(start + chrono::Duration::minutes(5), start));
+}
+
+fn role_lease_row(id: u64, sweep: &str) -> String {
+    let at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    format!(
+        r#"{{"id":{id},"updated_at":"{at}","body":"<!-- loom:pr-lease role=judge host=h sweep={sweep} -->"}}"#
+    )
+}
+
+/// B1: a non-Builder step's claim is judged by the role-keyed lease's sweep
+/// identity, never by label time.
+#[test]
+fn a_judge_steps_claim_is_held_elsewhere_only_when_another_sweep_holds_the_lease() {
+    let dir = tempdir().unwrap();
+    let mine = "step-judge-21-1";
+    let reg = crate::sweep_registry::test_support::fixture_registry_with_lease_gh(
+        dir.path(),
+        &role_lease_row(5, mine),
+        0,
+    );
+    assert!(!reg.step_lease_held_elsewhere(21, StepRole::Judge, mine));
+    assert!(reg.step_lease_held_elsewhere(21, StepRole::Judge, "step-judge-21-0"));
+    // No live lease of the role on the item (a Doctor asking): not held.
+    assert!(!reg.step_lease_held_elsewhere(21, StepRole::Doctor, mine));
+
+    let dir = tempdir().unwrap();
+    let peer_first = format!("{}\n{}", role_lease_row(4, "peer"), role_lease_row(5, mine));
+    let reg = crate::sweep_registry::test_support::fixture_registry_with_lease_gh(
+        dir.path(),
+        &peer_first,
+        0,
+    );
+    assert!(
+        reg.step_lease_held_elsewhere(21, StepRole::Judge, mine),
+        "the earlier lease wins"
+    );
+
+    // Unreadable: fail-open, so the claim is restored.
+    let dir = tempdir().unwrap();
+    let reg =
+        crate::sweep_registry::test_support::fixture_registry_with_lease_gh(dir.path(), "", 1);
+    assert!(!reg.step_lease_held_elsewhere(21, StepRole::Judge, "anyone"));
+}

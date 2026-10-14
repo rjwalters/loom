@@ -18,10 +18,35 @@
 use super::*;
 use crate::step_role::StepRole;
 
+/// Slack between a Builder step's locally recorded start and the forge's
+/// `labeled` time. GitHub stamps whole seconds and host clocks drift, so the
+/// claim label this step's own dispatch applied just before the spawn can
+/// read as up to a clock-skew later than the start. Only a label applied
+/// beyond the slack is another claimant's. (Slack in the other direction,
+/// `started_at - 60s`, would read the step's own label as foreign and leave
+/// every dead Builder step's claim stranded.)
+pub(crate) const LABEL_CLOCK_SKEW_SECS: i64 = 60;
+
+/// Whether a claim label stamped `labeled_at` was re-applied by another
+/// claimant after a step that started at `started_at`. Pure.
+#[must_use]
+pub(crate) fn label_reapplied_after(labeled_at: DateTime<Utc>, started_at: DateTime<Utc>) -> bool {
+    labeled_at > started_at + chrono::Duration::seconds(LABEL_CLOCK_SKEW_SECS)
+}
+
 impl SweepRegistry {
     /// Release a finished step's claim. Returns `true` when the claim is held
-    /// elsewhere (a newer local lock owner, or a claim label re-applied on the
-    /// forge after this step started), in which case no label is written.
+    /// elsewhere, in which case no label is written:
+    ///
+    /// - a newer local owner of the step's claim lock;
+    /// - for a Builder step, `loom:building` re-applied on the forge more than
+    ///   [`LABEL_CLOCK_SKEW_SECS`] after the step started (the issue sweep's
+    ///   cross-host check, with slack for the forge's whole-second stamps and
+    ///   host drift);
+    /// - for every other step, the role's earliest live lease on the item
+    ///   held by another sweep ([`Self::step_lease_held_elsewhere`]). The
+    ///   label is no evidence there: the daemon pre-takes only the role-keyed
+    ///   lease, and the role prompt applies the label itself, later.
     pub(crate) fn release_dead_step(
         &mut self,
         sweep_id: &str,
@@ -36,10 +61,18 @@ impl SweepRegistry {
         };
         let held_elsewhere = retained
             || (!self.config.skip_label_flip
-                && role.claim_label().is_some_and(|label| {
-                    self.fetch_label_applied_at(item, label)
-                        .is_some_and(|at| at > started_at)
-                }));
+                && match role {
+                    StepRole::Builder => self
+                        .fetch_label_applied_at(item, "loom:building")
+                        .is_some_and(|at| label_reapplied_after(at, started_at)),
+                    StepRole::Curator
+                    | StepRole::ChampionPromote
+                    | StepRole::Judge
+                    | StepRole::Doctor
+                    | StepRole::ChampionMerge => {
+                        self.step_lease_held_elsewhere(item, role, sweep_id)
+                    }
+                });
         self.publish_step_claim(peer_claims::ClaimKind::Retract, item, role);
         if held_elsewhere {
             log::info!(

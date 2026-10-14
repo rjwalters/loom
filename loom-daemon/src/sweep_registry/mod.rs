@@ -151,6 +151,7 @@ pub(crate) mod roll_resume;
 mod spawn_process;
 mod stacking;
 mod start_facts;
+pub mod step_lease_owner;
 mod step_reap;
 #[cfg(test)]
 #[allow(unused_imports)]

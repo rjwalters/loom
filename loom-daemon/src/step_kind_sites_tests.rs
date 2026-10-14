@@ -26,11 +26,28 @@ fn rust_sources_under(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// The code lines of `text` before its first `#[cfg(test)]` (inline test
-/// modules construct and match kinds freely), with comment lines blanked.
+/// The code lines of `text` up to its inline test module (`#[cfg(test)]`
+/// then attributes then `mod … {`; a `#[cfg(test)] mod x;` declaration or a
+/// test-only item mid-file does not end it), with comment lines blanked.
 fn production_lines(text: &str) -> Vec<&str> {
-    text.lines()
-        .take_while(|l| l.trim() != "#[cfg(test)]")
+    // The first item after the attributes (a multi-line `#[allow(…)]` included).
+    const ITEM_STARTS: &[&str] = &["mod ", "fn ", "pub", "use ", "impl", "const ", "static "];
+    let lines: Vec<&str> = text.lines().collect();
+    let end = lines
+        .iter()
+        .enumerate()
+        .find(|(i, l)| {
+            l.trim() == "#[cfg(test)]"
+                && lines[i + 1..]
+                    .iter()
+                    .take(12)
+                    .map(|n| n.trim())
+                    .find(|n| ITEM_STARTS.iter().any(|k| n.starts_with(k)))
+                    .is_some_and(|n| n.starts_with("mod ") && n.ends_with('{'))
+        })
+        .map_or(lines.len(), |(i, _)| i);
+    lines[..end]
+        .iter()
         .map(|l| {
             let t = l.trim_start();
             if t.starts_with("//") || t.starts_with('*') {
@@ -48,14 +65,21 @@ fn silent_drops(lines: &[&str]) -> Vec<(usize, String)> {
     let mut found = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         let code = line.trim();
-        if !code.contains("SweepKind::Issue(") {
+        let names_issue = code.contains("SweepKind::Issue(");
+        let names_prset = code.contains("SweepKind::PrSet(");
+        if !names_issue && !names_prset {
             continue;
         }
-        let refutable_let = (code.starts_with("let ") && code.contains(" else"))
-            || code.starts_with("if let ")
-            || code.starts_with("while let ")
-            || code.contains("} else if let ");
-        let in_matches = code.contains("matches!(");
+        // A `PrSet`-only `if let` acts on a PR set and is not a drop; an
+        // `Issue`-only one drops `Step` (and `PrSet`) silently.
+        let refutable_let = names_issue
+            && ((code.starts_with("let ") && code.contains(" else"))
+                || code.starts_with("if let ")
+                || code.starts_with("while let ")
+                || code.contains("} else if let "));
+        let in_matches = names_issue && code.contains("matches!(");
+        // An `Issue` or `PrSet` arm followed by `_ =>` lets a new kind fall
+        // into the wildcard.
         let wildcard_after = code.contains("=>")
             && lines
                 .iter()
@@ -82,6 +106,10 @@ fn the_scan_recognises_each_silent_shape() {
     }
     let wildcard = ["SweepKind::Issue(n) => Some(n),", "_ => None,"];
     assert_eq!(silent_drops(&wildcard).len(), 1);
+    let prset_wildcard = ["SweepKind::PrSet(_) => None,", "_ => Some(1),"];
+    assert_eq!(silent_drops(&prset_wildcard).len(), 1);
+    // Acting on a PR set alone is not a drop.
+    assert!(silent_drops(&["if let SweepKind::PrSet(prs) = kind {"]).is_empty());
     let exhaustive = [
         "SweepKind::Issue(n) => Some(n),",
         "SweepKind::Step { .. } | SweepKind::PrSet(_) => None,",
@@ -121,39 +149,47 @@ fn no_production_site_drops_other_kinds_silently() {
     );
 }
 
-/// The consumers #11898 listed. Each must name `Step` (an arm) or ask the
-/// kind's item helpers.
-const KNOWN_SITES: &[&str] = &[
-    "sweep_registry/watchdog.rs",
-    "observability/ops/busy_slots.rs",
-    "observability/fleet_state/sources.rs",
-    "observability/collector/identity.rs",
-    "sweep_registry/outcome_journal.rs",
-    "auto_update/pause_roll/host.rs",
-    "auto_update/pause_resume/host.rs",
-    "sweep_registry/reaper.rs",
-    "cli/cancel.rs",
-    "dispatch_tap.rs",
-    "sweep_registry/roll_resume.rs",
-    "sweep_registry/model_dispatch.rs",
-    "work_finder/forge.rs",
+/// The consumers #11898 listed, each with the code that handles a step
+/// there. The needle is searched in production code only (comments blanked,
+/// inline tests cut), so a doc mention does not count. Most sites name the
+/// kind or ask its item helpers; the roll-resume host works from the
+/// manifest, so its handling is the manifest's `step`. `busy_slots.rs` reads
+/// the tick's occupancy, which `work_finder/forge.rs` computes (listed).
+const KNOWN_SITES: &[(&str, &[&str])] = &[
+    ("sweep_registry/watchdog.rs", KIND_NEEDLES),
+    ("observability/fleet_state/sources.rs", KIND_NEEDLES),
+    ("observability/collector/identity.rs", KIND_NEEDLES),
+    ("sweep_registry/outcome_journal.rs", KIND_NEEDLES),
+    ("auto_update/pause_roll/host.rs", KIND_NEEDLES),
+    ("auto_update/pause_resume/host.rs", &["item.step", "requeue_step("]),
+    ("sweep_registry/reaper.rs", KIND_NEEDLES),
+    ("cli/cancel.rs", KIND_NEEDLES),
+    ("dispatch_tap.rs", KIND_NEEDLES),
+    ("sweep_registry/roll_resume.rs", KIND_NEEDLES),
+    ("sweep_registry/model_dispatch.rs", KIND_NEEDLES),
+    ("work_finder/forge.rs", KIND_NEEDLES),
 ];
+
+/// A `Step` arm, or one of the kind's item helpers.
+const KIND_NEEDLES: &[&str] = &["SweepKind::Step", "item_number()", "issue_number()"];
 
 #[test]
 fn every_known_site_names_step() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    for site in KNOWN_SITES {
+    for (site, needles) in KNOWN_SITES {
         let text = std::fs::read_to_string(src.join(site))
             .unwrap_or_else(|e| panic!("cannot read {site}: {e}"));
-        let handles = [
-            "SweepKind::Step",
-            "item_number()",
-            "issue_number()",
-            "Step {",
-            "step",
-        ]
-        .iter()
-        .any(|needle| text.contains(needle));
-        assert!(handles, "{site} no longer handles `SweepKind::Step`");
+        let code = production_lines(&text).join("\n");
+        let handles = needles.iter().any(|needle| code.contains(needle));
+        assert!(handles, "{site} no longer handles `SweepKind::Step` in code ({needles:?})");
     }
+}
+
+/// The needles are not vacuous: a file that only mentions a step in prose,
+/// or says `step` in passing, does not pass.
+#[test]
+fn a_prose_mention_does_not_count_as_handling() {
+    let prose = "//! A `SweepKind::Step` is counted.\nfn f() { let step = 1; }";
+    let code = production_lines(prose).join("\n");
+    assert!(!KIND_NEEDLES.iter().any(|n| code.contains(n)));
 }

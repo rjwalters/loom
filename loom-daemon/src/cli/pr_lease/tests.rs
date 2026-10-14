@@ -758,3 +758,33 @@ fn a_labelless_claim_renews_without_a_label_check() {
         Step::Stop(_)
     ));
 }
+
+/// The daemon's lib-side reader of this family (a dead step's lease holder,
+/// #11898) agrees with this module's parser on every record shape.
+#[test]
+fn the_lib_role_lease_reader_agrees_with_parse_record() {
+    use loom_daemon::sweep_registry::step_lease_owner::{parse_role_lease, RoleLeaseKind};
+    let me = Identity::new(Role::Champion, "host-a".into(), "s1".into(), None).unwrap();
+    let peer = who(Role::Judge, "s2");
+    let bodies = [
+        me.lease_marker(),
+        me.yield_marker(&peer),
+        me.released_marker(),
+        peer.lease_marker(),
+        peer.released_marker_with(" head=abc verdict=none"),
+    ];
+    for body in bodies {
+        let (kind, holder) = match parse_record(&body).unwrap() {
+            Record::Lease(h) => (RoleLeaseKind::Lease, h),
+            Record::Yield(h) => (RoleLeaseKind::Yield, h),
+            Record::Released(h) => (RoleLeaseKind::Released, h),
+        };
+        let lib = parse_role_lease(&body).unwrap();
+        assert_eq!(lib.kind, kind, "{body}");
+        assert_eq!(
+            (lib.role.as_str(), lib.host.as_str(), lib.sweep.as_str()),
+            (holder.role.as_str(), holder.host.as_str(), holder.sweep.as_str()),
+            "{body}"
+        );
+    }
+}
