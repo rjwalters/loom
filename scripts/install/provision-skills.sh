@@ -52,7 +52,7 @@
 # not what the fleet observed (2AMLogic/2am#4345, 2026-10-14): on hosts whose
 # `~/.claude/commands/loom` linked into a month-old `~/.local/share/loom` clone,
 # every `/loom:<role>` session loaded the USER-scope file (the transcript's
-# prompt matched it byte for byte, not the repo's fresh copy), and agents
+# prompt matched it, not the repo's fresh copy), and agents
 # re-applied labels the repo's own docs had retired. So the checkout these
 # links point into is the role prompt every repo on the host runs, and it must
 # never be older than the source a caller just synced from: see
