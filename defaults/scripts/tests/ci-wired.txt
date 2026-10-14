@@ -176,6 +176,7 @@ test-repo-mismatch-fallback.sh
 test-require-daemon-bin.sh
 test-require-daemon-bin-provenance.sh
 test-resync-installed-agent-skills-guard.sh
+test-resync-installed-agents-hooks.sh
 test-resync-installed-gh-config-guard.sh
 test-resync-installed-guard-check.sh
 test-resync-installed-host-optout.sh

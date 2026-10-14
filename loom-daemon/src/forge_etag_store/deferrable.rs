@@ -154,6 +154,14 @@ pub(super) fn fetch(
             }
             return Ok(first);
         }
+        if super::is_gateway_outage(Some(&app_id), &first) {
+            // 2am#4367 P4: the relay is down, not the credential: withdraw
+            // it and go on to the readers, then the writer.
+            crate::forge_gateway::outage::withdraw_for_outage(site.caller);
+            tried.push(app_id);
+            last_failure = None;
+            continue;
+        }
         let Some(failure) = reader_failure(&first) else {
             // Not the credential's fault (a 5xx, a network error): neither
             // another reader nor the writer would help.

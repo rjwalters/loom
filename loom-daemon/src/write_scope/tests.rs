@@ -621,6 +621,13 @@ fn daemon_write_paths_are_scoped() {
         ),
         ("role_tick_telemetry/targets.rs", NotAWrite("classifies commands, runs none")),
         (
+            "agent_gh/read_route.rs",
+            NotAWrite(
+                "classifies an agent gh argv as a gateway read; the method/field flags it names \
+                 are what keep a call off the gateway, runs none (2am#4367 P4)",
+            ),
+        ),
+        (
             "observability/pick_journal.rs",
             NotAWrite("classifies an agent gh argv for pick.decision, runs none"),
         ),

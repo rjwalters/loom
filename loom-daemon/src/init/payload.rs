@@ -27,7 +27,8 @@
 //! `resync-installed.sh` refreshes more than the payload step writes. Those
 //! surfaces, and the one table that names them, are in [`surfaces`] (#10895):
 //! `.agents/skills/` (marker-gated), `.claude/README.md`,
-//! `.github/CONFIGURATION.md`, `.claude/biome.jsonc`, the Loom-managed block
+//! `.github/CONFIGURATION.md`, `.claude/biome.jsonc`, the files of an existing
+//! `.claude/agents/` directory (#11033), the Loom-managed block
 //! of `.gitignore`, the two template-substituted guides (`.loom/CLAUDE.md`,
 //! `.loom/AGENTS.md`, re-rendered with the install date they already carry)
 //! and the retired-payload sweep. Each is a step over the same staging tree,
