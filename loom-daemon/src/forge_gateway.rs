@@ -43,6 +43,11 @@
 //! - the agent `gh` front sends the reads it can classify to the gateway
 //!   profile ([`crate::agent_gh::read_route`]); everything else stays on the
 //!   session's credential (the writer);
+//! - a CLI subcommand that calls [`enable_cli`] (`labels undeclared`,
+//!   `labels migrate`) routes its facade reads like the daemon's when it runs
+//!   with [`DIR_ENV`] set to the daemon's published directory: how a host job
+//!   (the fleet captain's label-drift) reads through the gateway while
+//!   holding no GitHub credential of its own;
 //! - the writer profile is untouched: its token, no `api_host`.
 //!
 //! # Break-glass
@@ -277,12 +282,63 @@ pub fn active() -> Option<Active> {
 /// The front's half: honour [`DIR_ENV`] only when the `gh` this front execs
 /// (`next_gh`) is the one the daemon version-checked. Once per process.
 pub fn enable_front(next_gh: &Path) {
-    let base = std::env::var_os(DIR_ENV)
+    let _ = FRONT.set(front_base(std::env::var_os(DIR_ENV), next_gh, SystemTime::now()));
+}
+
+/// A CLI subcommand's half (2AMLogic/2am#4367 P4): a `loom-daemon
+/// <subcommand>` run by a host job (the fleet captain's label-drift job) is
+/// neither the daemon nor the agent front, so without this its reads never
+/// see the gateway and go to whatever `GH_CONFIG_DIR` it inherited. It
+/// honours [`DIR_ENV`] on the front's terms: only when the `gh` the facade
+/// will exec ([`crate::gh_invocation::resolver::resolve`]) is the one the
+/// daemon version-checked, and not during a front outage, from a checked base
+/// ([`publish::safe_base`]). The variable
+/// names a directory, never a key. A no-op in the daemon, whose own
+/// published set always wins ([`profile_for`]), and once per process (also a
+/// no-op after [`enable_front`] ran in the same process); unset,
+/// nothing changes. A CLI that makes forge reads calls it before the first.
+/// A gateway outage it hits is recorded beside the profiles
+/// ([`note_outage_from_front`]).
+pub fn enable_cli() {
+    if DAEMON.get().is_some() {
+        return;
+    }
+    let program = crate::gh_invocation::resolver::resolve().program;
+    let _ = FRONT.set(cli_base(std::env::var_os(DIR_ENV), &program, SystemTime::now()));
+}
+
+/// [`enable_cli`]'s decision: `program` is a path or a bare name looked up
+/// on `PATH`, as the facade will run it.
+fn cli_base(dir_env: Option<OsString>, program: &str, now: SystemTime) -> Option<PathBuf> {
+    let gh = publish::canonical_program(program)?;
+    front_base(dir_env, &gh, now)
+}
+
+/// The base directory a non-daemon process may route through: [`DIR_ENV`]'s
+/// value, when set, a [`publish::safe_base`], its marker names `gh` and no
+/// front outage holds.
+fn front_base(dir_env: Option<OsString>, gh: &Path, now: SystemTime) -> Option<PathBuf> {
+    dir_env
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
-        .filter(|base| publish::gh_marker_matches(base, next_gh))
-        .filter(|base| !outage::front_outage_active(base, SystemTime::now()));
-    let _ = FRONT.set(base);
+        .filter(|base| publish::safe_base(base))
+        .filter(|base| publish::gh_marker_matches(base, gh))
+        .filter(|base| !outage::front_outage_active(base, now))
+}
+
+/// After the facade withdrew the gateway for an outage in a non-daemon
+/// process (the agent front's facade reads, a CLI): record it beside the
+/// profiles, as the front's own passthrough does
+/// ([`outage::note_front_outage`]), so the next process (a timer's next
+/// `labels` run) skips the gateway for the window instead of retrying it
+/// once per owner. A no-op in the daemon and with no adopted base.
+pub(crate) fn note_outage_from_front() {
+    if DAEMON.get().is_some() {
+        return;
+    }
+    if let Some(Some(base)) = FRONT.get() {
+        outage::note_front_outage(base);
+    }
 }
 
 /// Whether any gateway profile can route in this process. `false` while
@@ -311,7 +367,12 @@ pub fn profile_for(owner: &str) -> Option<PathBuf> {
         FRONT.get()?.clone()?
     };
     let dir = base.join(&owner);
-    dir.join("hosts.yml").is_file().then_some(dir)
+    if !dir.join("hosts.yml").is_file() {
+        return None;
+    }
+    // A front or CLI takes the base from its environment: check the profile
+    // too. The daemon routes only what it published itself.
+    (DAEMON.get().is_some() || publish::safe_profile(&dir)).then_some(dir)
 }
 
 /// The variables an agent session gets: `GH_NO_UPDATE_NOTIFIER=1` always,

@@ -35,6 +35,10 @@
 //!   lease of this role?
 //! - **release** stops the renewer and rewrites the lease's marker to
 //!   `loom:pr-lease-released`, which frees the claim immediately.
+//! - **reap** (hidden) is `release` on a dead claimant's behalf: the role
+//!   runner runs it for every lease a run it terminated at the timeout
+//!   ceiling still held (#11931, `loom_daemon::pr_lease_reap`). A Judge's
+//!   reap records the no-verdict pass for the backstop whatever the CI state.
 //! - **check** reports [`ClaimState`] (`free`, `held-self`, `held-peer`,
 //!   `unknown`) — the PR-phase shape of #11118's proposed `claim_state(item)`.
 //!
@@ -695,6 +699,31 @@ pub(crate) enum PrLeaseAction {
     /// Internal: the detached renewal loop `claim` starts.
     #[command(hide = true)]
     RenewLoop(renew::RenewLoopArgs),
+    /// Internal: release a terminated claimant's lease on its behalf (#11931).
+    /// The role runner runs it for each lease a timed-out run still held.
+    /// Always 0.
+    #[command(hide = true)]
+    Reap(ReapArgs),
+}
+
+/// `reap`'s arguments: the dead claimant's exact identity, as its own
+/// `claim` listed it (`loom_daemon::pr_lease_reap::Held`).
+#[derive(clap::Args, Debug, Clone)]
+pub(crate) struct ReapArgs {
+    #[arg(value_name = "PR")]
+    pub(crate) pr: u64,
+    #[arg(long, value_enum)]
+    pub(crate) role: Role,
+    /// The published host id the lease marker carries.
+    #[arg(long)]
+    pub(crate) host: String,
+    #[arg(long)]
+    pub(crate) sweep_id: String,
+    /// Why the claimant could not release (the record's `reaped=` field).
+    #[arg(long, default_value = loom_daemon::pr_lease_reap::REASON_TIMEOUT)]
+    pub(crate) reason: String,
+    #[arg(long, default_value = ".")]
+    pub(crate) workspace: PathBuf,
 }
 
 impl PrLeaseAction {
@@ -710,6 +739,16 @@ impl PrLeaseAction {
             Self::Fence(c) => with_context(&c, EXIT_HELD, false, |ctx| ctx.fence()),
             Self::Release(c) => with_context(&c, EXIT_HELD, true, |ctx| ctx.release()),
             Self::Check(c) => with_context(&c, EXIT_UNVERIFIED, false, |ctx| ctx.check()),
+            Self::Reap(r) => {
+                let common = Common {
+                    pr: r.pr,
+                    role: r.role,
+                    watch_pid: None,
+                    sweep_id: Some(r.sweep_id.clone()),
+                    workspace: r.workspace.clone(),
+                };
+                with_context_as(&common, Some(&r.host), EXIT_HELD, true, |ctx| ctx.reap(&r.reason))
+            }
         };
         std::process::exit(code)
     }
@@ -726,10 +765,25 @@ pub(crate) struct Ctx {
     /// Whether `claim`/`release` start and stop the detached renewer (tests:
     /// no, so they never touch the host's renewer store).
     pub(crate) manage_renewer: bool,
+    /// The launching role run's lease file (`LOOM_ROLE_PR_LEASE_FILE`,
+    /// #11931): `claim` lists a won lease there, `release` drops it.
+    pub(crate) lease_file: Option<PathBuf>,
 }
 
 fn with_context(
     common: &Common,
+    no_checkout: i32,
+    writes: bool,
+    f: impl FnOnce(&Ctx) -> i32,
+) -> i32 {
+    with_context_as(common, None, no_checkout, writes, f)
+}
+
+/// [`with_context`] with an explicit published `host` (the reap of another
+/// claimant's lease) instead of this process's own.
+fn with_context_as(
+    common: &Common,
+    host: Option<&str>,
     no_checkout: i32,
     writes: bool,
     f: impl FnOnce(&Ctx) -> i32,
@@ -753,7 +807,7 @@ fn with_context(
     let ctx = Ctx {
         me: Identity {
             role: common.role,
-            host: published_host(),
+            host: host.map_or_else(published_host, str::to_string),
             sweep,
         },
         gh: Gh {
@@ -769,6 +823,7 @@ fn with_context(
         ttl: chrono::Duration::seconds((ttl_minutes * 60.0) as i64),
         now: Utc::now,
         manage_renewer: true,
+        lease_file: loom_daemon::pr_lease_reap::file_from_env(),
         common: common.clone(),
     };
     f(&ctx)
@@ -819,6 +874,7 @@ impl Ctx {
                     .map_or_else(self.now, |r| r.updated_at);
                 self.start_renewal(id, self.gh.story_issue(self.pr()), leased_at);
                 loom_daemon::observability::lifecycle::role_target::record_claim(self.pr());
+                self.list_held();
                 println!("{} {}", self.me.host, self.me.sweep);
                 return EXIT_HELD;
             }
@@ -870,9 +926,28 @@ impl Ctx {
                     self.me.role.claim_label()
                 ));
                 loom_daemon::observability::lifecycle::role_target::record_claim(self.pr());
+                self.list_held();
                 println!("{} {}", self.me.host, self.me.sweep);
                 EXIT_HELD
             }
+        }
+    }
+
+    /// List this claimant's won lease in the role run's lease file (#11931),
+    /// so the daemon can reap it if it terminates the run.
+    fn list_held(&self) {
+        if let Some(path) = &self.lease_file {
+            loom_daemon::pr_lease_reap::record_in(path, &self.held());
+        }
+    }
+
+    /// This claimant's lease as the role runner's lease file lists it.
+    pub(crate) fn held(&self) -> loom_daemon::pr_lease_reap::Held {
+        loom_daemon::pr_lease_reap::Held {
+            pr: self.pr(),
+            role: self.me.role.as_str().to_string(),
+            host: self.me.host.clone(),
+            sweep: self.me.sweep.clone(),
         }
     }
 
@@ -942,6 +1017,20 @@ impl Ctx {
     /// `release`: stop the renewer, then rewrite every live lease of this
     /// identity to the released marker. Best-effort; always 0.
     pub(crate) fn release(&self) -> i32 {
+        if let Some(path) = &self.lease_file {
+            loom_daemon::pr_lease_reap::forget_in(path, &self.held());
+        }
+        self.release_with(None)
+    }
+
+    /// `reap`: [`release`](Self::release) on behalf of a claimant the role
+    /// runner terminated (#11931). A Judge's reap records the no-verdict pass
+    /// whatever the head's CI is doing ([`backstop::reaped_release_fields`]).
+    pub(crate) fn reap(&self, reason: &str) -> i32 {
+        self.release_with(Some(reason))
+    }
+
+    fn release_with(&self, reaped: Option<&str>) -> i32 {
         let stopped = if self.manage_renewer {
             renew::stop(self)
         } else {
@@ -962,10 +1051,15 @@ impl Ctx {
             if parse_record(&row.body) != Some(Record::Lease(self.me.clone())) {
                 continue;
             }
-            let extra = extra.get_or_insert_with(|| {
-                backstop::release_fields(self.me.role, self.gh.pr_head(self.pr()), |sha| {
+            let extra = extra.get_or_insert_with(|| match reaped {
+                None => backstop::release_fields(self.me.role, self.gh.pr_head(self.pr()), |sha| {
                     self.gh.checks_pending(sha)
-                })
+                }),
+                Some(reason) => backstop::reaped_release_fields(
+                    self.me.role,
+                    self.gh.pr_head(self.pr()),
+                    reason,
+                ),
             });
             let mut lines = row.body.lines();
             lines.next();
@@ -975,7 +1069,12 @@ impl Ctx {
                 released += 1;
             }
         }
-        self.say(&format!("released {released} lease comment(s); stopped {stopped} renewer(s)"));
+        let verb = if reaped.is_some() {
+            "reaped"
+        } else {
+            "released"
+        };
+        self.say(&format!("{verb} {released} lease comment(s); stopped {stopped} renewer(s)"));
         EXIT_HELD
     }
 
