@@ -1078,13 +1078,12 @@ impl SweepRegistry {
         let host = host_identity();
         let pid = std::process::id();
         let ts = Utc::now().to_rfc3339();
-        let remaining_secs = remaining.as_secs();
         let ad = match kind {
             peer_claims::ClaimKind::NoopCooldownArmed => {
-                ClaimAd::noop_cooldown_armed(issue, repo, host, pid, ts, remaining_secs)
+                ClaimAd::noop_cooldown_armed(issue, repo, host, pid, ts, remaining.as_secs())
             }
             peer_claims::ClaimKind::DispatchBackoffArmed => {
-                ClaimAd::dispatch_backoff_armed(issue, repo, host, pid, ts, remaining_secs)
+                ClaimAd::dispatch_backoff_armed(issue, repo, host, pid, ts, remaining.as_secs())
             }
             // Unreachable: every call site below passes one of the two kinds
             // above.
@@ -1268,11 +1267,13 @@ impl SweepRegistry {
         // does not immediately re-attempt the same failing candidate this
         // host just backed off on — see `publish_peer_cooldown_claim`'s doc
         // comment for why this is one-shot rather than re-advertised.
-        self.publish_peer_cooldown_claim(
-            peer_claims::ClaimKind::DispatchBackoffArmed,
-            issue,
-            delay,
-        );
+        // #11930: and this host's fast-failure streak, which the park sums.
+        let streak = if cause == DispatchBackoffCause::FastFailure {
+            consecutive
+        } else {
+            0
+        };
+        self.publish_dispatch_backoff_claim(issue, delay, streak);
     }
 
     /// Clear `issue`'s dispatch-backoff record (Issue #4485) — called on any

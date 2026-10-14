@@ -59,20 +59,8 @@ impl SweepRegistry {
         } else {
             self.release_lock_owned(item, sweep_id).retained()
         };
-        let held_elsewhere = retained
-            || (!self.config.skip_label_flip
-                && match role {
-                    StepRole::Builder => self
-                        .fetch_label_applied_at(item, "loom:building")
-                        .is_some_and(|at| label_reapplied_after(at, started_at)),
-                    StepRole::Curator
-                    | StepRole::ChampionPromote
-                    | StepRole::Judge
-                    | StepRole::Doctor
-                    | StepRole::ChampionMerge => {
-                        self.step_lease_held_elsewhere(item, role, sweep_id)
-                    }
-                });
+        let held_elsewhere =
+            retained || self.step_claim_held_elsewhere(item, role, sweep_id, started_at);
         self.publish_step_claim(peer_claims::ClaimKind::Retract, item, role);
         if held_elsewhere {
             log::info!(
@@ -97,11 +85,49 @@ impl SweepRegistry {
         false
     }
 
+    /// Whether another claimant holds a step's item on the forge (#11898), the
+    /// forge half of every step release (the reaper's, startup's, a roll
+    /// requeue's):
+    ///
+    /// - Builder: `loom:building` re-applied more than
+    ///   [`LABEL_CLOCK_SKEW_SECS`] after the step started;
+    /// - every other role: the role's earliest live lease held by another
+    ///   sweep. Its label is no evidence: the daemon pre-takes only the lease,
+    ///   and the role prompt applies the label itself, later.
+    ///
+    /// Fail-open (`false`) when the forge cannot answer, and with forge
+    /// writes off.
+    pub(crate) fn step_claim_held_elsewhere(
+        &self,
+        item: u32,
+        role: StepRole,
+        sweep_id: &str,
+        started_at: DateTime<Utc>,
+    ) -> bool {
+        if self.config.skip_label_flip {
+            return false;
+        }
+        match role {
+            StepRole::Builder => self
+                .fetch_label_applied_at(item, "loom:building")
+                .is_some_and(|at| label_reapplied_after(at, started_at)),
+            StepRole::Curator
+            | StepRole::ChampionPromote
+            | StepRole::Judge
+            | StepRole::Doctor
+            | StepRole::ChampionMerge => self.step_lease_held_elsewhere(item, role, sweep_id),
+        }
+    }
+
     /// Whether a PR step's claim on `pr` is still the paused run `sweep_id`'s
     /// to give back after a roll (#11898): no other sweep holds the role's
-    /// earliest live lease, and the claim label was not re-applied after the
-    /// run started (`started_at`, with the clock-skew slack). A peer Judge or
-    /// Doctor that claimed the PR during the roll window keeps it.
+    /// earliest live lease. A peer Judge or Doctor that claimed the PR during
+    /// the roll window keeps it. Decided by lease identity, never label time:
+    /// the role prompt applies `loom:reviewing` / `loom:treating` itself,
+    /// after the daemon's lease, so a label time would strand a normal step.
+    /// Builder steps never come here (they hold an issue, not a PR), so the
+    /// label-time path of the shared check, which needs a start time, is
+    /// never taken; `now` stands in for it.
     ///
     /// # Errors
     /// Why the claim is no longer this run's.
@@ -110,21 +136,9 @@ impl SweepRegistry {
         pr: u32,
         role: StepRole,
         sweep_id: &str,
-        started_at: Option<DateTime<Utc>>,
     ) -> std::result::Result<(), String> {
-        if self.config.skip_label_flip {
-            return Ok(());
-        }
-        if self.step_lease_held_elsewhere(pr, role, sweep_id) {
-            return Err(format!("another sweep holds the live {role} lease"));
-        }
-        if let (Some(label), Some(started_at)) = (role.claim_label(), started_at) {
-            if self
-                .fetch_label_applied_at(pr, label)
-                .is_some_and(|at| label_reapplied_after(at, started_at))
-            {
-                return Err(format!("`{label}` was re-applied after this run started"));
-            }
+        if self.step_claim_held_elsewhere(pr, role, sweep_id, Utc::now()) {
+            return Err(format!("another sweep holds the live {role} claim"));
         }
         Ok(())
     }

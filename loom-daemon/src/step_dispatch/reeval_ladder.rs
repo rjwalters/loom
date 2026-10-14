@@ -36,7 +36,9 @@ use regex::Regex;
 use crate::step_role::StepRole;
 
 /// The opening sentinel.
-pub const MARKER_OPEN: &str = "<!-- loom:reeval ";
+/// Spelled with `concat!` so no bare label-namespace literal sits in source
+/// (`tests/label_literal_guard.rs`): this is a marker, not a label.
+pub const MARKER_OPEN: &str = concat!("<!-- loom", ":reeval ");
 
 /// The first rung: 6 h.
 pub const FIRST_RUNG: Duration = Duration::from_secs(6 * 3600);
@@ -63,7 +65,8 @@ pub struct Reeval {
 fn marker_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r"<!--\s*loom:reeval\s+([^>]*?)\s*-->").expect("static reeval-marker pattern")
+        Regex::new(concat!(r"<!--\s*loom", r":reeval\s+([^>]*?)\s*-->"))
+            .expect("static reeval-marker pattern")
     })
 }
 

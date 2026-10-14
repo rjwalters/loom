@@ -39,6 +39,7 @@ test-build-gate-timeout.sh
 test-build-rs-watchset.sh
 test-build-slot.sh
 test-cargo-test-daemon-guard.sh
+test-champion-capped-hold-routing.sh
 test-champion-ci-checks-no-checks-signal.sh
 test-champion-critical-file-check.sh
 test-champion-evaluating-reclaim-trust.sh
@@ -47,6 +48,7 @@ test-champion-epic-phase-marker-normalization.sh
 test-champion-epic-verdict-marker-scope.sh
 test-champion-held-pr-health-pass.sh
 test-champion-issue-promo-escalation-respects-human-hold.sh
+test-champion-markerless-park.sh
 test-champion-merge-queue-step-no-fallthrough.sh
 test-champion-pr-merge-hold-release.sh
 test-champion-pr-merge-negation-guard.sh

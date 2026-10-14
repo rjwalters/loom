@@ -34,6 +34,9 @@
 //! tooling all treat it exactly as a quarantine. The comment names the
 //! failure class.
 //!
+//! The streak is counted fleet-wide and the park survives a restart (Issue
+//! #11930): see `fast_fail_fleet`.
+//!
 //! One park, never two: the ladder parks only when the issue is not already
 //! quarantined, and the quarantine's own tally only parks when the issue is
 //! not already quarantined (`record_terminal_outcome`). The reaper charges the
@@ -158,14 +161,16 @@ impl SweepRegistry {
             .map_or(0, |s| s.consecutive)
     }
 
-    /// Park `issue` through the quarantine when its fast-failure streak has
-    /// reached the threshold (Issue #11854). Returns `true` when it parked. See
+    /// Park `issue` through the quarantine when its fleet-wide fast-failure
+    /// streak has reached the threshold (Issue #11854, #11930). Returns `true` when it parked. See
     /// the module docs for the reconciliation with the quarantine's own tally.
     pub(crate) fn park_fast_failure(&mut self, issue: u32, class: &str) -> bool {
         if !self.dispatch_backoff_config.enabled || !self.quarantine_config.enabled {
             return false;
         }
-        let consecutive = self.fast_failure_streak(issue);
+        // #11930: this host's streak plus every peer's, so three fast failures
+        // on three different hosts park as surely as three on one.
+        let consecutive = self.fleet_fast_failure_streak(issue);
         // Probation (vibesql#6639): a relapse after a release parks at once.
         let threshold = if self.quarantine_generation(issue) > 0 {
             1
@@ -188,7 +193,7 @@ impl SweepRegistry {
         self.enter_quarantine(issue);
         log::warn!(
             "sweep_registry: issue #{issue} PARKED (generation {}) after {consecutive} consecutive \
-             fast failures, failure_class={class} — pausing re-dispatch for {}s (#4485, #11854). \
+             fast failures across the fleet, failure_class={class} — pausing re-dispatch for {}s (#4485, #11854). \
              Clear with `loom-daemon quarantine clear {issue}` or wait for the TTL.",
             self.quarantine_generation(issue),
             self.effective_quarantine_ttl(issue).as_secs()
@@ -201,7 +206,8 @@ impl SweepRegistry {
     /// writes, with a comment that names the failure class.
     fn apply_fast_fail_park_label(&self, issue: u32, count: u32, class: &str) {
         let body = format!(
-            "{marker}: this issue's sweep failed fast {count} times in a row (failure class \
+            "{marker}: this issue's sweep failed fast {count} times in a row across the fleet \
+             (failure class \
              `{class}`) — each attempt ended within {secs}s of dispatch without doing any real \
              work, so the dispatch backoff (#4485) parked it instead of retrying it around the \
              clock (#11854). Once the cause is fixed, clear the park with `loom-daemon quarantine \
