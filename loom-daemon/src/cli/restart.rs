@@ -41,6 +41,18 @@ pub(crate) struct RestartArgs {
     /// wants a relaunch).
     #[arg(long)]
     pub(crate) then_exit: bool,
+    /// Host maintenance (#11812): with `--then-exit`, pause every in-flight
+    /// agent exactly as a version roll's H4 does (safe points, pause manifest,
+    /// lease refresh; `trigger = host-maintenance`), then exit and stay down.
+    /// The next start's H5 resumes the manifest. Takes over a drain or hold
+    /// already in progress without reopening dispatch. Prints the manifest id
+    /// and the deadline by which the host must be back to resume, not requeue.
+    #[arg(
+        long,
+        requires = "then_exit",
+        conflicts_with_all = ["drain", "abort_drain", "timeout", "force_after_timeout"]
+    )]
+    pub(crate) pause: bool,
     /// Boot the launchd job out and back in (bounded, EIO-aware bootstrap
     /// retry) so a hand-edited plist's `EnvironmentVariables` actually
     /// takes effect (Issue #6682) — see the command doc above. A local
@@ -114,6 +126,7 @@ pub(crate) async fn handle_restart_command(args: RestartArgs) -> Result<()> {
         force_after_timeout,
         abort_drain,
         then_exit,
+        pause,
         reload_supervisor,
         verify,
     } = args;
@@ -136,13 +149,21 @@ pub(crate) async fn handle_restart_command(args: RestartArgs) -> Result<()> {
     // its socket — so this branches out before any of the socket-based logic
     // below even resolves a socket path.
     if reload_supervisor {
-        return handle_reload_supervisor_command(drain, abort_drain, then_exit);
+        return handle_reload_supervisor_command(drain || pause, abort_drain, then_exit);
     }
 
     let socket_path = resolve_socket_path()?;
 
+    // #11812: `--pause --then-exit` is host maintenance (clap enforces the
+    // pairing and refuses it beside the drain flags).
+    if pause {
+        return pause::handle(&socket_path).await;
+    }
     if then_exit && !drain {
-        eprintln!("--then-exit requires --drain (there is nothing to drain-then-exit without it)");
+        eprintln!(
+            "--then-exit requires --drain or --pause (there is nothing to stop-and-stay-down \
+             after without one)"
+        );
         std::process::exit(1);
     }
 
@@ -507,6 +528,9 @@ async fn handle_drain_reply(
         }
     }
 }
+
+#[path = "restart_pause.rs"]
+mod pause;
 
 #[cfg(test)]
 mod drain_reply_render_tests {

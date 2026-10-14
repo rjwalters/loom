@@ -103,6 +103,7 @@ use crate::sweep_registry::roll_requeue::RollRequeueNotice;
 pub(crate) mod host;
 pub(crate) mod ledger;
 pub mod loom_ui;
+pub(crate) mod maintenance;
 mod refusal;
 mod stops;
 mod supervise;
@@ -158,6 +159,19 @@ pub struct RollTarget {
 }
 
 impl RollTarget {
+    /// A host-maintenance pause (#11812): no version is rolled to, so
+    /// `to_version` stays unknown and H5 records `resumed_on = target`
+    /// whatever binary the host comes back on.
+    #[must_use]
+    pub fn host_maintenance() -> Self {
+        Self {
+            source: TargetSource::HostMaintenance,
+            to_version: None,
+            to_artifact_sha256: None,
+            label: None,
+        }
+    }
+
     /// A source-rebuild roll: the checkout is ahead of the running binary.
     #[must_use]
     pub fn repo_ahead() -> Self {
@@ -508,6 +522,7 @@ impl Run<'_> {
             "from_version": self.plan.from_version,
             "to_version": self.plan.target.to_version,
             "target_source": self.plan.target.source.as_str(),
+            "trigger": self.plan.target.source.as_str(),
             "pause_budget_secs": tuning.pause_budget.as_secs(),
             "verify_probation_secs": tuning.verify_probation.as_secs(),
             "resume_budget_secs": tuning.resume_budget.as_secs(),
@@ -557,6 +572,7 @@ impl Run<'_> {
                 "manifest_id": self.manifest.manifest_id,
                 "promoted": promoted,
                 "items": self.work.len(),
+                "trigger": self.plan.target.source.as_str(),
             }),
         );
         H4Outcome::StoodDown { promoted }
@@ -734,23 +750,38 @@ pub(crate) fn run_h4_with(
     enter!(3);
     run.event(None, "pause_started", Some(format!("{items} item(s)")));
     if let Err(e) = run.save() {
-        let note =
-            format!(
+        let note = format!(
             "PAUSE FAILED (H7 pause-failed): the pause manifest {} could not be written ({e}), so \
-             the roll to {} was aborted before any agent was signalled. Dispatch resumed; this \
-             host stays on {} until the next roll attempt. Fix the state directory (disk full? \
-             permissions?).",
+             the {} pause was aborted before any agent was signalled. {} Fix the state \
+             directory (disk full? permissions?).",
             plan.manifest_path.display(),
-            plan.target.to_version.as_deref().unwrap_or("the rebuilt binary"),
-            plan.from_version
+            plan.target.source.as_str(),
+            if drain.then_exit() {
+                "Dispatch stays paused (then-exit).".to_string()
+            } else {
+                format!(
+                    "Dispatch resumed; this host stays on {} until the next roll attempt.",
+                    plan.from_version
+                )
+            }
         );
         log::error!("pause_roll: {note}");
         loom_ui::pause_failed(&plan.from_version, &note); // #11295
         run.host.emit(
             "daemon.roll.pause_failed",
-            serde_json::json!({ "manifest_id": manifest_id, "error": e.to_string(), "items": items }),
+            serde_json::json!({
+                "manifest_id": manifest_id, "error": e.to_string(), "items": items,
+                "trigger": plan.target.source.as_str(),
+            }),
         );
         return match drain.pause_ownership(plan.generation) {
+            // #11812: a then-exit pause (host maintenance) never reopens
+            // dispatch; it falls back to a held then-exit drain.
+            PauseOwnership::Ours
+                if drain.pause_fallback_to_operator_drain(plan.generation, note.clone()) =>
+            {
+                H4Outcome::StoodDown { promoted: true }
+            }
             PauseOwnership::Ours => {
                 drain.resolve_timeout(note.clone());
                 H4Outcome::Failed(note)
@@ -1060,6 +1091,7 @@ pub(crate) fn run_h4_with(
             "from_version": plan.from_version,
             "to_version": plan.target.to_version,
             "target_source": plan.target.source.as_str(),
+            "trigger": plan.target.source.as_str(),
             "pause_budget_secs": tuning.pause_budget.as_secs(),
             "settle_secs": settle_secs,
             "stop_secs": stop_secs,

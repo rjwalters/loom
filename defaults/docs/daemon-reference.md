@@ -239,19 +239,19 @@ issue** — the v0.10.0 set is intentionally frozen.
 | `daemon.drain.aborted`     | Daemon IPC (#4090)             | `{was_draining}` |
 | `daemon.drain.timeout`     | Drain supervisor (#4090)       | `{in_flight, forced, cancelled?, then_exit?, origin?, paused?, stragglers?}` |
 | `daemon.drain.superseded`  | Auto-update loop (#8514)       | `{from, to}` (artifact identities) |
-| `daemon.roll.pause_started` | Pause-and-roll (#10831)       | `{target_source, from_version, to_version, pause_budget_secs, verify_probation_secs, resume_budget_secs, min_resumable_age_secs}` |
-| `daemon.roll.item`         | Pause-and-roll (#10831)        | `{manifest_id, item_id, kind, runtime, disposition, status, reason, agent_age_secs, issue, role, from_version, to_version, target_source, pause_budget_secs, verify_probation_secs, resume_budget_secs, min_resumable_age_secs, safe_point_wait_ms, teardown_ms, forge}` (one per agent; `forge` is `none`, `done` or `deferred`) |
-| `daemon.roll.paused`       | Pause-and-roll (#10831)        | `{manifest_id, items, then_exit, from_version, to_version, target_source, pause_budget_secs, settle_secs, stop_secs, total_secs}` |
-| `daemon.roll.pause_failed` | Pause-and-roll (#10831)        | `{manifest_id, error, items?}` (the manifest could not be written, the pause task failed, or the H4 deadline passed, each before anything was stopped; dispatch resumed) |
-| `daemon.roll.forced`       | Pause-and-roll (#10831)        | `{manifest_id, reason, forced_items, h4_deadline_secs}` (a pause that had already stopped an agent could not finish; the rest were killed by process group and the daemon restarts) |
-| `daemon.roll.refused`      | Pause-and-roll (#10831)        | `{state, reason, target_source, to_version}` (`state`: `unsupervised`, `pause-failed`, `resume-pending`, `roll-attempt-backoff`; a standing refusal is published once, then at most every 5 minutes) |
-| `daemon.roll.stood_down`   | Pause-and-roll (#10831)        | `{manifest_id, promoted, items}` (aborted, superseded or promoted before anything was stopped) |
+| `daemon.roll.pause_started` | Pause-and-roll (#10831)       | `{target_source, trigger, took_over?, from_version, to_version, pause_budget_secs, verify_probation_secs, resume_budget_secs, min_resumable_age_secs}` |
+| `daemon.roll.item`         | Pause-and-roll (#10831)        | `{manifest_id, item_id, kind, runtime, disposition, status, reason, agent_age_secs, issue, role, from_version, to_version, target_source, trigger, pause_budget_secs, verify_probation_secs, resume_budget_secs, min_resumable_age_secs, safe_point_wait_ms, teardown_ms, forge}` (one per agent; `forge` is `none`, `done` or `deferred`) |
+| `daemon.roll.paused`       | Pause-and-roll (#10831)        | `{manifest_id, items, then_exit, from_version, to_version, target_source, trigger, pause_budget_secs, settle_secs, stop_secs, total_secs}` |
+| `daemon.roll.pause_failed` | Pause-and-roll (#10831)        | `{manifest_id, error, items?, trigger, fallback?}` (the manifest could not be written, the pause task failed, or the H4 deadline passed, each before anything was stopped; dispatch resumed) |
+| `daemon.roll.forced`       | Pause-and-roll (#10831)        | `{manifest_id, reason, forced_items, h4_deadline_secs, trigger}` (a pause that had already stopped an agent could not finish; the rest were killed by process group and the daemon restarts) |
+| `daemon.roll.refused`      | Pause-and-roll (#10831)        | `{state, reason, target_source, trigger, to_version}` (`state`: `unsupervised`, `pause-failed`, `resume-pending`, `roll-attempt-backoff`, `resume-in-progress`; a standing refusal is published once, then at most every 5 minutes) |
+| `daemon.roll.stood_down`   | Pause-and-roll (#10831)        | `{manifest_id, promoted, items, trigger}` (aborted, superseded or promoted before anything was stopped) |
 | `daemon.roll.config_rejected` | Pause-and-roll (#10831)     | `{reason}` (invalid `pauseRoll` budgets; defaults used) |
-| `daemon.roll.item` (`stage: "resume"`) | Pause-and-roll resume (#10832) | `{stage, manifest_id, item_id, new_item_id, kind, runtime, disposition, status, reason, agent_age_secs, issue, role, from_version, to_version, running_version, resumed_on, verify_probation_secs, resume_budget_secs, forge}` (one per agent H5 resumed, requeued, completed or handed to restart recovery) |
+| `daemon.roll.item` (`stage: "resume"`) | Pause-and-roll resume (#10832) | `{stage, manifest_id, item_id, new_item_id, kind, runtime, disposition, status, reason, agent_age_secs, issue, role, from_version, to_version, running_version, trigger, resumed_on, verify_probation_secs, resume_budget_secs, forge}` (one per agent H5 resumed, requeued, completed or handed to restart recovery) |
 | `daemon.roll.item.residue_reaped` | Pause-and-roll resume (#10832) | `{manifest_id, item_id, pids, survivors, scope_stopped}` (processes of a paused agent still alive at H5) |
 | `daemon.roll.manifest.unreadable` | Pause-and-roll resume (#10832) | `{path, outcome, detail, running_version}` (`outcome`: `corrupt`, `unknown-version`; nothing is resumed, restart recovery takes every item) |
 | `daemon.roll.health_failed` | Pause-and-roll resume (#10832) | `{manifest_id, reason, running_version, to_version, failures}` (health did not hold during probation; nothing is resumed until it does) |
-| `daemon.roll.paused.resumed` | Pause-and-roll resume (#10832) | `{manifest_id, phase, from_version, to_version, running_version, resumed_on, items, resumed, completed, requeued_by_reason, recovered, residue_reaped, health_failures, verify_probation_secs, resume_budget_secs, probation_secs, resume_secs, pause_to_resume_secs, max_age_secs}` (`resumed_on`: `target` or `rollback`) |
+| `daemon.roll.paused.resumed` | Pause-and-roll resume (#10832) | `{manifest_id, phase, from_version, to_version, trigger, running_version, resumed_on, items, resumed, completed, requeued_by_reason, recovered, residue_reaped, health_failures, verify_probation_secs, resume_budget_secs, probation_secs, resume_secs, pause_to_resume_secs, max_age_secs}` (`resumed_on`: `target` or `rollback`) |
 | `forge.event`               | `forge_events.rs` feed consumer (#8765) | `{source: "forge-event-feed", host_id, count, first_seq, last_seq, types}` |
 | `operator_priority.escalation` | Fleet alert (#10164; the star-liveness publisher, #9321, was removed by #11104) | `{slug, issue, key, kind, stage, text, url, host, inherited_from?, resolved}` |
 
@@ -13140,6 +13140,31 @@ loom-daemon restart --abort-drain                 # cancel an in-progress drain,
     agents, requeues by reason, and the observed `probation_secs`,
     `resume_secs` and `pause_to_resume_secs` (pause start to resume end, the
     window the lease TTL bounds). It stays readable after H5 has finished.
+  - **Host maintenance: `loom-daemon restart --pause --then-exit` (#11812).**
+    For an instance resize, rebuild or OS work: the same H4 as a roll (safe
+    points, manifest, lease refresh, the `daemon.roll.*` events with `trigger =
+    host-maintenance`), then the daemon exits `143` and **stays down** (the
+    operator stop is recorded, so the watchdog and a supervisor relaunch leave
+    it down). No supervisor is required. It takes over an operator drain (in
+    progress, or timed out and holding dispatch), an operator-stop startup hold
+    or a fleet `paused` hold **in place**: dispatch is never reopened, and the
+    wait-for-zero drain supervisor stands down without exiting. A pause roll
+    already in H4 is escalated to stay down instead (no second H4, and the
+    auto-updater can no longer supersede it). It is refused while H5 is
+    resuming or a previous manifest is still live. A pause that fails before it
+    stops anything falls back to a held then-exit drain; it never resumes
+    dispatch on its own. The CLI waits for the manifest and the exit, then
+    prints the items, the manifest id and the **resume deadline**: the
+    manifest's max age (the lease TTL, 15 min by default) from the pause start,
+    minus H5's probation and resume budgets (210s by default). Start the host
+    again with an explicit start (`loom-daemon-start.sh` / `daemon-start`, which
+    clears the operator-stop record) before that deadline and H5 resumes the
+    manifest exactly as it resumes a roll's; later, every paused item is
+    requeued (`manifest-stale`, claims released, checkpoints kept). H5 resumes
+    in the same workspace, so a rebuild that replaces the instance must reattach
+    the workspace volume, or the items are requeued. The budget is the lease
+    TTL because lease freshness is judged by the reading host against its own
+    TTL and nothing renews a lease while the host is down.
   - **A newer release supersedes an armed roll (#8514)** only until the pause
     has stopped an agent; after that it is too late and the roll completes.
   - **Floor rolls (#10712)** take this same path. They skip the settle gate,
