@@ -285,6 +285,14 @@ comment_as "$BOT" "merging
 tick
 tick PASS; check "LABEL-:loom:blocked;COMMENT:cleared" "$WRITES" "merge-risk already reversed: the label comes off"
 
+echo "--- #11861: an unreadable trust filter never clears (fail closed) ---"
+reset "$A"
+tick; touch "$T/trust_down"
+tick PASS; check "" "$WRITES" "trust filter down + PASS: no clear, no label write"
+check "present" "$(label)" "loom:blocked kept while the trusted read fails"
+rm -f "$T/trust_down"
+tick PASS; check "LABEL-:loom:blocked;COMMENT:cleared" "$WRITES" "trust filter back: the clear lands"
+
 echo
 echo "Results: $((TESTS_RUN - TESTS_FAILED))/$TESTS_RUN passed, $TESTS_FAILED failed"
 [[ $TESTS_FAILED -eq 0 ]]

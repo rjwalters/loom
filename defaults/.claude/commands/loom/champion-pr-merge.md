@@ -2921,20 +2921,23 @@ OP_HOLDS=$(loom-daemon labels list --property operator_gate --with-retired 2>/de
   --state open \
   --limit 500 \
   --json number,title,updatedAt,labels,comments \
-  --jq '($ENV.OP_HOLDS | split("\n")) as $o | .[] | select(any(.labels[]?.name; . == "loom:frozen" or IN($o[])) | not)
-    | select(any(.comments[].body; startswith("<!-- champion:merge-risk-hold -->") or startswith("<!-- champion:critical-file-hold -->")) | not) | "#\(.number) \(.title)"'
+  --jq '($ENV.OP_HOLDS | split("\n")) as $o | .[] | select(any(.labels[]?.name; . == "loom:frozen" or IN($o[])) | not) | "#\(.number) \(.title)"'
 ```
 
-A PR with a Champion hold marker is not a capped PR: it is Champion's own hold
-out at Doctor (#11861), which only a human releases. Never remove its
-`loom:blocked` here (this listing pre-filters it; re-check the trusted
-comments before any edit).
+**A Champion-held PR (a standing trusted hold marker, #11861) is the
+human's.** Its `loom:blocked` is Champion's merge-risk or critical-file hold,
+which only a human releases. If it also hit the Doctor-cycle cap (a trusted
+`<!-- loom:doctor-cycle-cap -->` comment, or a legacy `doctor cycle
+exhausted` line, after the hold), Doctor no longer works it: post **one**
+comment, guarded by `<!-- champion:capped-hold-recommendation -->`, asking a
+human to review it, close it, or remove the hold. Never remove
+`loom:blocked`, never grant a cycle; skip the steps below for it.
 
 **The query skips any PR that also carries an operator hold** — a previous pass (or a human) already routed it out to the operator; do not re-decide it. Process the remaining PRs oldest first.
 
 Two more entry guards, checked against the thread in Step 2 before any decision is made:
 
-- **Only PRs parked by the Doctor-cycle cap are in scope.** The label pair alone is not proof. If the history shows no cap block (no `doctor cycle exhausted` block line or equivalent, or fewer than two Judge rejections), this PR was blocked for some other reason — keep it parked and say so.
+- **Only PRs parked by the Doctor-cycle cap are in scope.** The label pair alone is not proof. If the history shows no cap block (no `<!-- loom:doctor-cycle-cap -->` comment or `doctor cycle exhausted` line, or fewer than two Judge rejections), this PR was blocked for some other reason — keep it parked and say so.
 - **A human hold is authoritative.** If a human comment holds the PR — instruction-shaped phrasing such as `hold until`, `wait until`, `defer`, `not before`, `do not start` (not a bare `hold`/`wait` substring, mirroring the sweep's explicit-hold convention) — never grant. Keep it parked, quoting the hold.
 
 ### Step 2: Read the full rejection history

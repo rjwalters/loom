@@ -148,14 +148,20 @@ pub fn judge_shape<L: AsRef<str>>(labels: &[L]) -> bool {
         && only_the_blocked_park(labels)
 }
 
-/// The sweep's Doctor-cycle-cap park writes this phrase in its comment
-/// (`sweep-wave-lifecycle.md`: "PR #P blocked: doctor cycle exhausted after
-/// <k> Doctor→Judge round(s)").
+/// The durable record the sweep's Doctor-cycle cap writes (#11861): one
+/// comment opening with this marker when it parks a PR
+/// (`sweep-wave-lifecycle.md`, `sweep-mode-c-lifecycle.md`).
+pub const DOCTOR_CYCLE_CAP_MARKER: &str = "<!-- loom:doctor-cycle-cap -->";
+
+/// The phrase older cap parks logged ("PR #P blocked: doctor cycle exhausted
+/// after <k> Doctor→Judge round(s)"), still recognised in a comment.
 pub const DOCTOR_CYCLE_CAP_PHRASE: &str = "doctor cycle exhausted";
 
 /// Whether the Doctor-cycle cap was hit after the latest hold notice: a
-/// trusted comment naming it, later than the newest hold marker. A capped
-/// held PR is the Capped-PR Recovery Pass's, not Doctor's (#11861 review).
+/// trusted comment carrying [`DOCTOR_CYCLE_CAP_MARKER`] (or the legacy
+/// phrase), later than the newest hold marker. Doctor stops working such a
+/// PR; the Capped-PR Recovery Pass posts one recommendation for a human and
+/// leaves `loom:blocked` on (#11861 review).
 #[must_use]
 pub fn doctor_cycle_capped<C: AsRef<str>>(trusted: &[C]) -> bool {
     let hold = trusted.iter().rposition(|c| {
@@ -163,10 +169,10 @@ pub fn doctor_cycle_capped<C: AsRef<str>>(trusted: &[C]) -> bool {
         c.starts_with(MERGE_RISK_HOLD_MARKER) || c.starts_with(CRITICAL_FILE_HOLD_MARKER)
     });
     trusted.iter().enumerate().any(|(i, c)| {
+        let c = c.as_ref();
         hold.is_none_or(|h| i > h)
-            && c.as_ref()
-                .to_ascii_lowercase()
-                .contains(DOCTOR_CYCLE_CAP_PHRASE)
+            && (c.starts_with(DOCTOR_CYCLE_CAP_MARKER)
+                || c.to_ascii_lowercase().contains(DOCTOR_CYCLE_CAP_PHRASE))
     })
 }
 
@@ -289,6 +295,9 @@ mod tests {
         assert!(!doctor_may_work(&shape, &[hold.as_str(), cap]));
         // A cap from before the current hold episode does not count.
         assert!(doctor_may_work(&shape, &[cap, hold.as_str()]));
+        // The durable marker is the cap record (#11861).
+        let marked = format!("{DOCTOR_CYCLE_CAP_MARKER}\nPR #7 parked");
+        assert!(!doctor_may_work(&shape, &[hold.as_str(), marked.as_str()]));
     }
 
     #[test]

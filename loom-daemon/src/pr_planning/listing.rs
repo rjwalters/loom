@@ -95,6 +95,34 @@ fn guard_admits(root: &Path, row: &Value) -> Result<bool> {
     }
 }
 
+/// Mark each Champion hold on its round trip that `role` may work (#11861):
+/// out at Doctor, or handed back to Judge, with a standing trusted hold
+/// marker. The one code path for `fetch_queue` and the Judge spawn gates, so
+/// the gate never drops a held PR the queue would serve. A comment read that
+/// fails is an error (never a guess either way).
+fn mark_champion_holds(root: &Path, gh: &Path, role: PrRole, rows: &mut [Value]) -> Result<()> {
+    if !matches!(role, PrRole::Doctor | PrRole::Judge) {
+        return Ok(());
+    }
+    let policy = TrustPolicy::for_root(root);
+    for row in rows.iter_mut() {
+        let labels = row_labels(row);
+        let shape = match role {
+            PrRole::Doctor => crate::champion_hold::doctor_shape(&labels),
+            _ => crate::champion_hold::judge_shape(&labels),
+        };
+        if shape {
+            let number = row["number"].as_u64().context("PR number missing")?;
+            let trusted = trusted_comment_bodies(root, gh, number, &policy)?;
+            row[super::CHAMPION_HOLD_FIELD] = Value::Bool(match role {
+                PrRole::Doctor => crate::champion_hold::doctor_may_work(&labels, &trusted),
+                _ => crate::champion_hold::judge_may_review(&labels, &trusted),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// `row`'s label names.
 fn row_labels(row: &Value) -> Vec<String> {
     row["labels"]
@@ -143,24 +171,7 @@ fn trusted_comment_bodies(
 /// Fallback review only; no workflow labels or branch mutations occur here.
 pub fn fetch_queue(root: &Path, gh: &Path, role: PrRole) -> Result<Vec<Value>> {
     let mut rows = list_open(root, gh)?;
-    if matches!(role, PrRole::Doctor | PrRole::Judge) {
-        let policy = TrustPolicy::for_root(root);
-        for row in &mut rows {
-            let labels = row_labels(row);
-            let shape = match role {
-                PrRole::Doctor => crate::champion_hold::doctor_shape(&labels),
-                _ => crate::champion_hold::judge_shape(&labels),
-            };
-            if shape {
-                let number = row["number"].as_u64().context("PR number missing")?;
-                let trusted = trusted_comment_bodies(root, gh, number, &policy)?;
-                row[super::CHAMPION_HOLD_FIELD] = Value::Bool(match role {
-                    PrRole::Doctor => crate::champion_hold::doctor_may_work(&labels, &trusted),
-                    _ => crate::champion_hold::judge_may_review(&labels, &trusted),
-                });
-            }
-        }
-    }
+    mark_champion_holds(root, gh, role, &mut rows)?;
     if role == PrRole::Doctor {
         for row in &mut rows {
             if has_label(row, "loom:pr")
@@ -270,7 +281,10 @@ fn backstop_holds(root: &Path, gh: &Path, row: &Value, trust: &TrustPolicy) -> b
 /// row's record read.
 pub fn has_judge_work(root: &Path, gh: &Path) -> Result<bool> {
     let (prefer, trust) = (prefer_human_prs(root), TrustPolicy::for_root(root));
-    for row in ordered_queue(list_open(root, gh)?, PrRole::Judge, prefer, &trust) {
+    let mut rows = list_open(root, gh)?;
+    // #11861: a Champion hold handed back by Doctor is Judge work.
+    mark_champion_holds(root, gh, PrRole::Judge, &mut rows)?;
+    for row in ordered_queue(rows, PrRole::Judge, prefer, &trust) {
         let served = if row["mode"] == "fallback" {
             guard_admits(root, &row)?
         } else {

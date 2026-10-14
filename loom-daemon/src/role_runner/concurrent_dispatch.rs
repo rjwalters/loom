@@ -502,6 +502,24 @@ pub fn forge_queue_probe() -> QueueProbe {
                 }
                 return Ok(true);
             }
+            // #11861: a Champion hold on its round trip is parked by label
+            // (`loom:blocked`) and the listing hint is the body's park record,
+            // which a human may have edited away. When a row has the shape,
+            // ask the role's own queue, which reads the trusted hold marker:
+            // one decision for the gate and the queue.
+            if let Some(role) = round_trip_role(label, &own_kind) {
+                let served = match role {
+                    crate::pr_planning::PrRole::Judge => {
+                        crate::pr_planning::has_judge_work(root, &gh_bin)
+                    }
+                    _ => {
+                        crate::pr_planning::fetch_queue(root, &gh_bin, role).map(|q| !q.is_empty())
+                    }
+                };
+                if served.map_err(|e| e.to_string())? {
+                    return Ok(true);
+                }
+            }
         }
         if labels.contains(&"loom:review-requested") {
             return crate::pr_planning::has_judge_fallback(root, &gh_bin)
@@ -509,6 +527,22 @@ pub fn forge_queue_probe() -> QueueProbe {
         }
         Ok(false)
     })
+}
+
+/// The PR role whose queue may serve a Champion hold on its round trip in
+/// `rows` of queue `label` (#11861), when any row has that shape.
+fn round_trip_role(
+    label: &str,
+    rows: &[crate::forge_listing::RestIssue],
+) -> Option<crate::pr_planning::PrRole> {
+    use crate::champion_hold::{doctor_shape, judge_shape};
+    use crate::pr_planning::PrRole;
+    let (role, shape): (PrRole, fn(&[String]) -> bool) = match label {
+        "loom:changes-requested" => (PrRole::Doctor, |l| doctor_shape(l)),
+        "loom:review-requested" => (PrRole::Judge, |l| judge_shape(l)),
+        _ => return None,
+    };
+    rows.iter().any(|r| shape(&r.labels)).then_some(role)
 }
 
 /// The `gh` binary the gate listings use: `LOOM_GH_BIN` when set, else the

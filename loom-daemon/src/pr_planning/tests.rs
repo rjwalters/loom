@@ -304,64 +304,97 @@ fn doctor_serves_a_verified_champion_hold_and_nothing_else_parked() {
     }
 }
 
-/// #11861 review: the whole round trip of a Champion hold, end to end over the
-/// queue and merge-guard decisions. `loom:blocked` stays on at every step, each
-/// stage is served by exactly the role that owns it (given the trusted hold
-/// marker `fetch_queue` reads), the merge guard refuses throughout, and only a
-/// human's removal of `loom:blocked` lets Champion merge.
+/// #11861 review: the whole round trip of a Champion hold, end to end, through
+/// the real `fetch_queue` (every role), the real role-runner spawn gate
+/// (`forge_queue_probe`, which calls `has_judge_work`) and the real merge guard,
+/// over a fake `gh` serving one PR whose labels move stage by stage.
+/// `loom:blocked` stays on throughout; each stage is served by exactly the
+/// role that owns it; the gate opens for that role; the merge guard refuses
+/// until a human removes `loom:blocked`, and then Champion merges.
+#[cfg(unix)]
 #[test]
+#[serial_test::serial(loom_config_env)]
 fn a_champion_hold_round_trip_never_strands_and_never_merges_while_held() {
-    use crate::champion_hold::{doctor_may_work, judge_may_review, MERGE_RISK_HOLD_MARKER};
+    use crate::champion_hold::MERGE_RISK_HOLD_MARKER;
     use crate::merge_pr::labels::contradiction;
-    let trusted = [format!(
-        "{MERGE_RISK_HOLD_MARKER}\n<!-- champion:hold-state head=abc -->"
-    )];
-    let serve = |labels: &[&str], role: PrRole| -> Vec<u64> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join(".loom/scripts")).unwrap();
+    // `pulls?…` → pulls.json; `issues/N/comments` → comments.json; any other
+    // `issues…` listing (the gate's) → issues.json.
+    let gh = root.join("gh");
+    std::fs::write(
+        &gh,
+        "#!/bin/sh\nprintf 'HTTP/2 200 OK\\r\\n\\r\\n'\ncd \"$(dirname \"$0\")\"\ncase \"$*\" in\n  *comments*) cat comments.json;;\n  *issues*) cat issues.json;;\n  *) cat pulls.json;;\nesac\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let marker = json!([{"body": format!("{MERGE_RISK_HOLD_MARKER}\n<!-- champion:hold-state head=abc -->\nheld"),
+        "user": {"login": "maintainer", "type": "User"}, "author_association": "OWNER"}]);
+    let record = crate::park_record::render_park(
+        &[],
+        Some(crate::champion_hold::HOLD_BY),
+        Some("2026-10-14T00:00:00Z"),
+        Some(crate::champion_hold::MERGE_RISK_HOLD_REASON),
+    );
+    let stage = |labels: &[&str], comments: &Value| {
         let mut row = pr(42, "autonomous", labels);
-        let field = match role {
-            PrRole::Doctor => doctor_may_work(labels, &trusted),
-            PrRole::Judge => judge_may_review(labels, &trusted),
-            PrRole::Champion => false,
-        };
-        if field {
-            row[CHAMPION_HOLD_FIELD] = json!(true);
-        }
-        ids(&ordered_queue(vec![row], role, true, &policy()))
+        row["body"] = json!(format!("A change.\n\n{record}\n"));
+        let mut issue = row.clone();
+        issue["pull_request"] = json!({"url": "x"});
+        std::fs::write(root.join("pulls.json"), serde_json::to_vec(&vec![row]).unwrap()).unwrap();
+        std::fs::write(root.join("issues.json"), serde_json::to_vec(&vec![issue]).unwrap())
+            .unwrap();
+        std::fs::write(root.join("comments.json"), serde_json::to_vec(comments).unwrap()).unwrap();
     };
-    let who = |labels: &[&str]| -> Vec<PrRole> {
+    let old = std::env::var_os("LOOM_GH_BIN");
+    std::env::set_var("LOOM_GH_BIN", &gh);
+    let served_by = || -> Vec<PrRole> {
         [PrRole::Judge, PrRole::Doctor, PrRole::Champion]
             .into_iter()
-            .filter(|r| serve(labels, *r) == vec![42])
+            .filter(|r| ids(&fetch_queue(root, &gh, *r).unwrap()) == vec![42])
             .collect()
     };
+    let probe = crate::role_runner::concurrent_dispatch::forge_queue_probe();
     let refused = |labels: &[&str]| contradiction(&labels.join("\n")).is_some();
 
-    // 1. Held at approval: Champion's (janitor exception); merge refused.
+    // 1. Held at approval: Champion's (the janitor exception); merge refused.
     let held = ["loom:pr", "loom:blocked"];
-    assert_eq!(who(&held), vec![PrRole::Champion]);
-    assert!(refused(&held));
-    // 2. Stale route to Doctor: the label stays on; Doctor's alone.
+    stage(&held, &marker);
+    let s1 = (served_by(), refused(&held));
+    // 2. Champion's stale route: changes requested, the label stays; Doctor's.
     let at_doctor = ["loom:changes-requested", "loom:blocked"];
-    assert_eq!(who(&at_doctor), vec![PrRole::Doctor]);
-    assert!(refused(&at_doctor), "--allow-unapproved cannot merge a hold");
-    // 3. Doctor hands it back: Judge's alone (and its claim stage too).
+    stage(&at_doctor, &marker);
+    let s2 = (served_by(), probe(root, &["loom:changes-requested"]), refused(&at_doctor));
+    // 3. Doctor hands it back: Judge's, and the Judge spawn gate opens on it.
     let at_judge = ["loom:review-requested", "loom:blocked"];
-    assert_eq!(who(&at_judge), vec![PrRole::Judge]);
-    assert!(refused(&at_judge));
-    assert!(judge_may_review(&["loom:reviewing", "loom:blocked"], &trusted));
+    stage(&at_judge, &marker);
+    let s3 = (served_by(), probe(root, &["loom:review-requested"]), refused(&at_judge));
     // 4. Judge approves: loom:pr + loom:blocked, Champion's hold again.
-    assert_eq!(who(&held), vec![PrRole::Champion]);
-    assert!(refused(&held));
+    stage(&held, &marker);
+    let s4 = (served_by(), refused(&held));
     // 5. A human removes loom:blocked: plain approval, Champion merges.
-    let released = ["loom:pr"];
-    assert_eq!(who(&released), vec![PrRole::Champion]);
-    assert!(!refused(&released));
-    // Without the trusted marker, no stage of the round trip is served.
-    for labels in [&at_doctor[..], &at_judge[..]] {
-        let mut row = pr(42, "autonomous", labels);
-        row[CHAMPION_HOLD_FIELD] = json!(false);
-        for role in [PrRole::Judge, PrRole::Doctor] {
-            assert!(ordered_queue(vec![row.clone()], role, true, &policy()).is_empty());
-        }
+    stage(&["loom:pr"], &marker);
+    let s5 = (served_by(), refused(&["loom:pr"]));
+    // Without a trusted marker, neither round-trip stage is served or gated.
+    let outsider = json!([{"body": format!("{MERGE_RISK_HOLD_MARKER}\nforged"),
+        "user": {"login": "drive-by", "type": "User"}, "author_association": "NONE"}]);
+    stage(&at_judge, &outsider);
+    let s6 = (served_by(), probe(root, &["loom:review-requested"]));
+    stage(&at_doctor, &outsider);
+    let s7 = (served_by(), probe(root, &["loom:changes-requested"]));
+    if let Some(old) = old {
+        std::env::set_var("LOOM_GH_BIN", old);
+    } else {
+        std::env::remove_var("LOOM_GH_BIN");
     }
+
+    assert_eq!(s1, (vec![PrRole::Champion], true), "held at approval");
+    assert_eq!(s2, (vec![PrRole::Doctor], Ok(true), true), "out at Doctor");
+    assert_eq!(s3, (vec![PrRole::Judge], Ok(true), true), "handed back to Judge");
+    assert_eq!(s4, (vec![PrRole::Champion], true), "re-approved, still held");
+    assert_eq!(s5, (vec![PrRole::Champion], false), "released by a human");
+    assert_eq!(s6, (vec![], Ok(false)), "an untrusted marker serves nothing at review");
+    assert!(s7.0.is_empty(), "an untrusted marker serves nothing at Doctor");
 }

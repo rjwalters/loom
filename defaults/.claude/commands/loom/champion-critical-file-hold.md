@@ -185,6 +185,8 @@ $CF_EQUIV_LINE
       echo "Critical-file release respected for #$PR_NUMBER at $HEAD_SHA (${CF_EQUIV_KIND:-same-head}) — not reapplying loom:blocked (#9016)"
       ;;
   esac
+elif [ "$CF_TRUST" != ok ] && { [ "$CF_STATE" = held ] || [ "$CF_STATE" = released ]; }; then
+  echo "#$PR_NUMBER: trusted comments unreadable — clear deferred, loom:blocked kept (#11861)"
 elif [ "$CF_STATE" = held ] || [ "$CF_STATE" = released ]; then
   # PASS with an episode open — a push narrowed the diff. Post a one-time
   # reversal notice, then continue as an ordinary PASS. The label is shared
