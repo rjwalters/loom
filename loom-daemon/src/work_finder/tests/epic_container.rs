@@ -123,11 +123,12 @@ fn the_epic_skip_is_not_a_park_and_the_registry_still_validates() {
 
 #[test]
 fn the_mechanical_capability_lane_cannot_dispatch_an_epic() {
-    // #6893: the lane may only cancel `loom:operator-only`. An epic is another
-    // skip reason, so the item stays skipped even with every capability held.
+    // #6893: the lane may only cancel `loom:blocked` (#11861). An epic is
+    // another skip reason, so the item stays skipped even with every
+    // capability held.
     let held: BTreeSet<String> = BTreeSet::from(["host-sudo".to_string()]);
     let item = |extra: &[&str]| {
-        let mut l = vec!["loom:operator-only", "loom:operator-mechanical"];
+        let mut l = vec!["loom:blocked"];
         l.extend_from_slice(extra);
         labelled(7, &l).with_body(Some("<!-- loom:capability=host-sudo -->".to_string()))
     };

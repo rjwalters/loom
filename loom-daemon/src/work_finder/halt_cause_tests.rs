@@ -438,3 +438,87 @@ fn a_hold_cause_wins_over_weight_zero() {
     assert_eq!(row(false).detail.as_deref(), Some("weight_zero"));
     assert_eq!(row(false).disposition, QueueDisposition::WorkspaceHalted);
 }
+
+// ---- a partial hold does not name the tick (#11857) ------------------------
+
+/// Run one multi-workspace tick over `backlogs` (one ready list per root) with
+/// `held[i]` holding root `i` as maintain-only, and return the report plus
+/// its `loom.dispatch.tick` result.
+fn held_tick(
+    backlogs: Vec<Vec<WorkItem>>,
+    held: &[bool],
+) -> (super::super::TickReport, &'static str) {
+    let mut multi: Vec<_> = backlogs
+        .into_iter()
+        .map(|ready| (OneShotSource(Some(ready)), Disp::default()))
+        .collect();
+    let causes: Vec<Option<HaltCause>> = held
+        .iter()
+        .map(|&h| h.then_some(HaltCause::MaintainOnly))
+        .collect();
+    let report = tick_multi_with_repo_cap(
+        &mut multi,
+        &[],
+        10.into(),
+        held,
+        Some(&causes),
+        usize::MAX,
+        false,
+        None,
+        &[],
+    );
+    let result = crate::observability::ops::dispatch::tick_result_with(&report, false);
+    (report, result)
+}
+
+/// **#11857 acceptance.** One maintain-only root beside healthy roots that
+/// have nothing dispatchable: the hold does not cover the tick's work, so the
+/// tick reads its per-candidate result, not `halted_maintain_only`. The cause
+/// and the held count stay on the report for the span.
+#[test]
+fn one_held_root_beside_healthy_idle_roots_does_not_name_the_tick() {
+    // The healthy roots' candidates are all skipped (parked), so nothing was
+    // dispatchable there: that, not the hold, is why nothing started.
+    let parked = |n| WorkItem::with_created_at(n, vec!["loom:blocked".to_string()], None);
+    let (report, result) = held_tick(
+        vec![vec![item(1), item(2)], vec![parked(3)], vec![parked(4)]],
+        &[true, false, false],
+    );
+    assert!(report.halted, "the hold is still recorded");
+    assert!(report.halt_partial);
+    assert_eq!(report.halt_causes, vec![HaltCause::MaintainOnly]);
+    assert_eq!(report.held_roots, 1);
+    assert_eq!(result, "all_skipped");
+
+    // Nothing ready anywhere, one root of three held: an idle tick.
+    let (report, result) = held_tick(vec![vec![], vec![], vec![]], &[true, false, false]);
+    assert_eq!((report.held_roots, report.halt_partial), (1, true));
+    assert_eq!(result, "no_eligible_work");
+    assert!(!report.halted_fully(), "a partial hold leaves tick-level reactions on");
+}
+
+/// #11857: the hold names the tick when it covers the work — every root with
+/// candidates held (a healthy empty root does not dilute it), or every root
+/// held when none has any.
+#[test]
+fn a_hold_covering_every_root_with_work_names_the_tick() {
+    let (report, result) = held_tick(vec![vec![item(1)], vec![item(2)]], &[true, true]);
+    assert_eq!((report.held_roots, report.halt_partial), (2, false));
+    assert_eq!(result, "halted_maintain_only");
+    assert!(report.halted_fully());
+
+    // The held root is the only one with work: the hold explains the tick.
+    let (report, result) = held_tick(vec![vec![item(1)], vec![]], &[true, false]);
+    assert_eq!((report.held_roots, report.halt_partial), (1, false));
+    assert_eq!(result, "halted_maintain_only");
+
+    // Nothing ready anywhere and every root held.
+    let (report, result) = held_tick(vec![vec![], vec![]], &[true, true]);
+    assert_eq!((report.held_roots, report.halt_partial), (2, false));
+    assert_eq!(result, "halted_maintain_only");
+
+    // No hold at all: nothing counted, nothing partial.
+    let (report, result) = held_tick(vec![vec![], vec![]], &[false, false]);
+    assert_eq!((report.halted, report.held_roots, report.halt_partial), (false, 0, false));
+    assert_eq!(result, "no_eligible_work");
+}

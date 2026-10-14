@@ -263,17 +263,23 @@ impl GhInvocation {
             if succeeded(&first) {
                 return Ok(first);
             }
-            if app_id == crate::forge_gateway::GATEWAY_APP_ID
-                && super::gateway_outage(&first, &self.args)
-            {
-                // 2am#4367 P4: the relay is down or unreachable, not the
-                // credential: take it out everywhere and go on to the
-                // readers, then the writer.
-                super::withdraw_gateway_outage(self.operation.as_str());
+            let fault = if app_id == crate::forge_gateway::GATEWAY_APP_ID {
+                super::gateway_fault(&first)
+            } else {
+                crate::forge_gateway::outage::Fault::None
+            };
+            if fault.reruns() {
+                // 2am#4367 P4: the gateway failed, not the credential: run
+                // the read once more on the readers, then the writer, and
+                // take the gateway out only when it signalled the fault.
+                if fault == crate::forge_gateway::outage::Fault::Withdraw {
+                    super::withdraw_gateway_outage(self.operation.as_str());
+                }
                 tried.insert(app_id.clone());
                 last_app = Some(app_id);
                 last_failure = None;
-                decision = match lookup(&request) {
+                decision = match crate::forge_gateway::past_gateway(lookup(&request), &request, now)
+                {
                     RouteDecision::NoPool => RouteDecision::Exhausted {
                         until: now + crate::forge_read_pool::DEFAULT_WITHDRAWAL,
                         cause: ExhaustCause::Unavailable,
@@ -308,7 +314,13 @@ impl GhInvocation {
             tried.insert(app_id.clone());
             last_app = Some(app_id);
             last_failure = Some(failure);
-            decision = match lookup(&request) {
+            let next = lookup(&request);
+            let next = if tried.contains(crate::forge_gateway::GATEWAY_APP_ID) {
+                crate::forge_gateway::past_gateway(next, &request, now)
+            } else {
+                next
+            };
+            decision = match next {
                 // The pool went away under us: nothing says budget, so the
                 // writer serves it (a fallback, since a reader was tried).
                 RouteDecision::NoPool => RouteDecision::Exhausted {

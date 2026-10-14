@@ -32,7 +32,7 @@ use anyhow::Result;
 
 use super::{GhPipelineSource, RepoPipelineSnapshot};
 use crate::forge_listing::{self, CachedListing, RestIssue};
-use crate::work_finder::PARK_LABELS;
+use crate::work_finder::{OPERATOR_HOLD_LABEL, PARK_LABELS};
 
 /// Whether a metric counts the issue rows or the PR rows of a REST listing
 /// (REST issue listings return both — [`RestIssue::is_pull_request`]).
@@ -92,18 +92,26 @@ struct Ctx<'a> {
     /// can never point every root's listing at one repo. `None` (not a git
     /// checkout) lets `gh` resolve the `{owner}/{repo}` placeholder from cwd.
     repo: Option<String>,
+    /// Listings already read this fetch, so two metrics over one label (the
+    /// `loom:operator` PR and issue counts, #11795) cost one read.
+    seen: std::cell::RefCell<std::collections::HashMap<String, CachedListing>>,
 }
 
 impl Ctx<'_> {
     /// The open rows carrying `label`, via the disk-persistent ETag cache.
     fn listing(&self, label: &str) -> Result<CachedListing> {
-        forge_listing::list_issues_cached_persistent(
+        if let Some(l) = self.seen.borrow().get(label) {
+            return Ok(l.clone());
+        }
+        let l = forge_listing::list_issues_cached_persistent(
             &self.src.gh_bin,
             Some(self.root),
             self.repo.as_deref(),
             label,
             "open",
-        )
+        )?;
+        self.seen.borrow_mut().insert(label.to_string(), l.clone());
+        Ok(l)
     }
 
     /// The pre-#9253 GraphQL count of open `side` rows labeled `label` — the
@@ -184,6 +192,7 @@ pub(super) fn fetch(src: &GhPipelineSource, root: &Path) -> RepoPipelineSnapshot
         src,
         root,
         repo: crate::credential_preflight::nwo_from_git_remote(root),
+        seen: std::cell::RefCell::default(),
     };
     let m = src.metrics;
     let mut rec = Recorder::default();
@@ -277,16 +286,34 @@ pub(super) fn fetch(src: &GhPipelineSource, root: &Path) -> RepoPipelineSnapshot
         fetch_operator_held(&ctx, &mut rec, &mut snap);
     }
     if m.operator_only_issues {
-        snap.operator_only_issues = rec.take(ctx.count(
-            "loom:operator-only",
-            Side::Issue,
-            |_| true,
-            || ctx.graphql_label_count(Side::Issue, "loom:operator-only"),
-        ));
+        snap.operator_only_issues = rec.take(operator_held_issues(&ctx));
     }
 
     snap.error = rec.first_err;
     snap
+}
+
+/// Open issues held for a human (#8091, #11795): `loom:operator` issues, plus
+/// issues still carrying the retired `loom:operator-only` without it (not yet
+/// migrated), so the count neither drops nor doubles across the migration.
+fn operator_held_issues(ctx: &Ctx<'_>) -> Result<usize> {
+    const LEGACY: &str = "loom:operator-only";
+    let held = ctx.count(
+        OPERATOR_HOLD_LABEL,
+        Side::Issue,
+        |_| true,
+        || ctx.graphql_label_count(Side::Issue, OPERATOR_HOLD_LABEL),
+    )?;
+    let legacy = ctx.count(
+        LEGACY,
+        Side::Issue,
+        |r| !has_any(r, &[OPERATOR_HOLD_LABEL]),
+        || {
+            let search = format!("is:open label:{LEGACY} -label:{OPERATOR_HOLD_LABEL}");
+            ctx.graphql_search_count(Side::Issue, &search)
+        },
+    )?;
+    Ok(held + legacy)
 }
 
 /// The three `loom:operator` metrics (Issue #8091). Count and age come from

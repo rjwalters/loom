@@ -455,6 +455,25 @@ pub fn fleet_captain_arm_ttl_secs(repo_root: &Path) -> u64 {
         .unwrap_or(DEFAULT_FLEET_CAPTAIN_ARM_TTL_SECS)
 }
 
+/// Dotted key read by [`curator_backlog_target`] (#11819).
+pub const CURATOR_BACKLOG_TARGET_KEY: &str = "curator.backlogTarget";
+
+/// Read `curator.backlogTarget` (#11819): the number of open issues this repo
+/// should hold, which sets how strict the Curator's admission step is.
+///
+/// Resolved through [`resolve_effective_config`], so every tier can set it
+/// (machine defaults < `.loom/config.json` < `.loom-project/project.json` <
+/// `.loom-local/fleet-repo.json` < `.loom-local/local.json`). There is **no
+/// built-in default**: `None` (the step is skipped, the Curator unchanged) on
+/// a missing key, a zero, a negative, a fractional or a non-number value.
+#[must_use]
+pub fn curator_backlog_target(repo_root: &Path) -> Option<u64> {
+    let effective = resolve_effective_config(repo_root);
+    get_path(&effective, CURATOR_BACKLOG_TARGET_KEY)
+        .and_then(Value::as_u64)
+        .filter(|v| *v > 0)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -1280,5 +1299,51 @@ mod tests {
         std::env::remove_var(PRIVATE_DEFAULTS_ENV);
         assert_eq!(got.len(), 1);
         assert!(got[0].0.ends_with(LEGACY_CONFIG_REL));
+    }
+
+    // ===== curator_backlog_target (#11819) =====
+
+    fn backlog(value: u64) -> String {
+        format!(r#"{{"curator": {{"backlogTarget": {value}}}}}"#)
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_curator_backlog_target_resolves_each_tier_and_a_higher_tier_wins() {
+        let dir = tempdir().unwrap();
+        let defaults = dir.path().join("machine-defaults.json");
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, &defaults);
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        assert_eq!(curator_backlog_target(&root), None, "unset at every tier");
+        // Lowest to highest precedence; each write must take over.
+        let tiers = [
+            defaults.clone(),
+            root.join(LEGACY_CONFIG_REL),
+            root.join(PROJECT_CONFIG_REL),
+            root.join(FLEET_REPO_CONFIG_REL),
+            root.join(LOCAL_CONFIG_REL),
+        ];
+        for (i, tier) in tiers.iter().enumerate() {
+            let value = 100 + i as u64;
+            write(tier, &backlog(value));
+            assert_eq!(curator_backlog_target(&root), Some(value), "{}", tier.display());
+        }
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_curator_backlog_target_zero_or_non_integer_is_unset() {
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        let dir = tempdir().unwrap();
+        for raw in ["0", "-5", "1.5", "\"140\"", "null", "true"] {
+            write(
+                &dir.path().join(LEGACY_CONFIG_REL),
+                &format!(r#"{{"curator": {{"backlogTarget": {raw}}}}}"#),
+            );
+            assert_eq!(curator_backlog_target(dir.path()), None, "{raw}");
+        }
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
     }
 }

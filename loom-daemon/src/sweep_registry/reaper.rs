@@ -1090,7 +1090,10 @@ impl SweepRegistry {
                             .join(format!("issue-{issue}.json"));
                         if checkpoint.exists() {
                             // #4463: never restore the label when a newer sweep
-                            // owns the lock — it is actively building.
+                            // owns the lock — it is actively building. #11852:
+                            // when this sweep already opened its PR, the issue
+                            // keeps `loom:building` while that PR is open (no
+                            // label write); the resume below re-claims it.
                             if !self.config.skip_label_flip && !superseded {
                                 let _ = self.restore_label_after_reap(issue, &sweep_id);
                                 self.note_label_flip(issue); // #4485 flap detection
@@ -1147,6 +1150,13 @@ impl SweepRegistry {
                             // POOL-level fault — see this branch's use below.
                             let pool_dead =
                                 classification.as_deref() == Some(NO_USABLE_ACCOUNT_CLASS);
+                            // #11854: the class a ladder park would name.
+                            let fast_class = self.fast_fail_class_for(
+                                issue,
+                                &sweep_id,
+                                death_class.as_deref(),
+                                classification.as_deref(),
+                            );
                             // Captured before `checkpoint_phase` moves into the
                             // `SweepCrashed` event below — needed for the
                             // reaper-driven resume check further down (#4256).
@@ -1267,8 +1277,14 @@ impl SweepRegistry {
                                         &self.config.workspace_root,
                                     ),
                                 );
-                            } else if insta_crash {
-                                self.charge_dispatch_failure(&sweep_id, issue);
+                            } else if is_fast_failure(
+                                duration_sec,
+                                exit_code,
+                                self.quarantine_config.insta_crash_secs,
+                            ) {
+                                // #11854: a 2-minute window; the third
+                                // issue-attributable one in a row parks.
+                                self.charge_fast_failure(&sweep_id, issue, &fast_class, false);
                             }
                             if checkpoint_progress {
                                 self.record_terminal_outcome(issue, false);
@@ -1424,14 +1440,15 @@ impl SweepRegistry {
                                     // attempt: a human-gated pause is not a failed
                                     // attempt, so clearing the hold leaves the
                                     // issue's full resume runway intact. Nor does
-                                    // it strand the work — `restore_label_to_ready`
-                                    // has already returned the issue to
-                                    // `loom:issue`, where the #4123 open-PR guard
-                                    // correctly refuses ordinary re-dispatch and
-                                    // the periodic Judge/Champion roles own the
-                                    // open PR. That is exactly the resting state
-                                    // `MAX_RESUME_ATTEMPTS` exhaustion already
-                                    // produces, reached without burning the
+                                    // it strand the work — the periodic
+                                    // Judge/Champion roles own the open PR, and
+                                    // the issue keeps `loom:building` while that
+                                    // PR is open (#11852: `loom:issue` beside an
+                                    // open PR is not a resting state, it is a
+                                    // candidate the #4123 guard must refuse
+                                    // every tick). That is the state
+                                    // `MAX_RESUME_ATTEMPTS` exhaustion also
+                                    // leaves, reached without burning the
                                     // attempts first.
                                     let clean_no_progress_exit =
                                         exit_code == Some(0) && !checkpoint_progress;
@@ -1461,10 +1478,9 @@ impl SweepRegistry {
                                              {resume_phase_check:?}, open PR #{pr}) — a deliberate \
                                              no-op, not a crash; NOT resuming (resuming would \
                                              re-run the same decision and flap \
-                                             loom:issue/loom:building, #5614). The issue is back \
-                                             at loom:issue with the #4123 open-PR guard in force; \
-                                             the open PR is the periodic Judge/Champion roles' \
-                                             remit."
+                                             loom:issue/loom:building, #5614). The issue keeps \
+                                             loom:building while the PR is open (#11852); the PR \
+                                             is the periodic Judge/Champion roles' remit."
                                         );
                                         true
                                     } else if attempts >= MAX_RESUME_ATTEMPTS {
@@ -1501,13 +1517,10 @@ impl SweepRegistry {
                                         // full #4256 runway survives for the
                                         // Champion-lifted resume the retained
                                         // `doctor-done` checkpoint exists to
-                                        // serve. `restore_label_to_ready` above
-                                        // already returned the issue to
-                                        // `loom:issue` (the park is on the PR,
-                                        // not the issue), where the #4123
-                                        // open-PR guard refuses ordinary
-                                        // re-dispatch and the periodic
-                                        // Judge/Champion roles own the PR.
+                                        // serve. The issue keeps `loom:building`
+                                        // while its PR is open (#11852), and the
+                                        // periodic Judge/Champion roles own the
+                                        // PR.
                                         self.linked_pr_parked(issue, pr, &resume_phase_check)
                                     };
                                     if skip_resume {
@@ -1885,6 +1898,17 @@ impl SweepRegistry {
                             // crashed branch above, so both need the carve-out.
                             let pool_dead =
                                 classification.as_deref() == Some(NO_USABLE_ACCOUNT_CLASS);
+                            let fast_class = self.fast_fail_class_for(
+                                issue,
+                                &sweep_id,
+                                death_class.as_deref(),
+                                classification.as_deref(),
+                            );
+                            let fast_fail = is_fast_failure(
+                                duration_sec,
+                                exit_code,
+                                self.quarantine_config.insta_crash_secs,
+                            );
                             // Telemetry `result` classification (#4704),
                             // strongest signal first:
                             //   1. An observed `merge-done` means the sweep
@@ -1963,8 +1987,16 @@ impl SweepRegistry {
                                         &self.config.workspace_root,
                                     ),
                                 );
-                            } else if insta_crash || no_progress || yielded_open_pr {
-                                self.charge_dispatch_failure(&sweep_id, issue);
+                            } else if fast_fail || no_progress || yielded_open_pr {
+                                // #11854: an open-PR yield backs off under the
+                                // open-PR cause (900 s cap) and never parks.
+                                let open_pr_yield = !(fast_fail || no_progress);
+                                self.charge_fast_failure(
+                                    &sweep_id,
+                                    issue,
+                                    &fast_class,
+                                    open_pr_yield,
+                                );
                             } else {
                                 self.clear_dispatch_backoff(issue);
                             }

@@ -183,6 +183,8 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
                 // report the chosen tier without re-resolving anything.
                 // 2am#4393: the draw that chose this tap rides the tick's
                 // exported `loom.role_attempt` span (`None` clears it).
+                // #11855: an assigned Judge/Doctor tick's PR rides its span.
+                crate::observability::lifecycle::role_target::note_prompt(role, prompt);
                 crate::observability::lifecycle::role_draw::note_role_draw(
                     admission
                         .as_ref()

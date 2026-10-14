@@ -284,7 +284,7 @@ pub fn emit_for_tick_correlated(
         role,
         started_at,
         outcome,
-        trace.as_ref().map(|t| t.execution.clone()),
+        trace.as_ref(),
     );
     let (result, detail) = classify(outcome);
     let (model, effort) = match &resolved {
@@ -798,6 +798,10 @@ fn emit_correlated(
             path.display()
         );
     }
+    // #11858: the record also goes to SigNoz, joined to the tick's trace, so
+    // a tick that never spawned (pool exhausted, runtime rejected, queue
+    // empty) is visible there. The journal above stays the local copy.
+    export(&envelope);
     // #9168: join the story of every issue/PR this tick wrote to — after the
     // durable record, so a slow forge lookup can never cost the tick record.
     if let (Some(trace), Some(rows)) = (&trace, &tokens_by_model) {
@@ -838,6 +842,30 @@ fn emit_correlated(
         };
         story::emit(&tick.root, &facts, &targets);
     }
+}
+
+/// Offer a `role_tick.outcome` envelope to the OTLP exporters (#11858). A
+/// no-op with no OTLP exporter; the record's mapping exports no free-form
+/// `detail`.
+fn export(envelope: &TelemetryEnvelope) {
+    if crate::observability::ops::records_exported() {
+        crate::observability::ops::emit_record_in(
+            exportable(envelope.record.clone()),
+            envelope.trace_context.clone(),
+        );
+    }
+}
+
+/// The exported copy of a record: a repo that is not a forge `owner/repo`
+/// (the local journal's path fallback) reads `repo_unresolved`, so no local
+/// path reaches the wire (#9442).
+fn exportable(mut record: TelemetryRecord) -> TelemetryRecord {
+    if let TelemetryRecord::RoleTickOutcome(r) = &mut record {
+        if !crate::agent_gh::classify::is_slug(&r.repo) {
+            r.repo = crate::observability::pick_decision::REPO_UNRESOLVED.to_string();
+        }
+    }
+    record
 }
 
 /// Whether the role log's last preference marker records a metered-backstop

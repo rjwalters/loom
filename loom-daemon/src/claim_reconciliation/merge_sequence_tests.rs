@@ -53,7 +53,7 @@ fn drafts_holds_and_in_flight_prs_are_ineligible() {
     let base = pr(1, "2026-01-01T00:00:00Z");
     assert!(base.eligible_for_ordering());
     assert!(!base.clone().draft().eligible_for_ordering());
-    for hold in super::super::VERDICT_HOLD_LABELS {
+    for hold in super::super::VERDICT_HOLD_LABELS.iter() {
         assert!(!base.clone().held(hold).eligible_for_ordering(), "{hold}");
     }
     assert!(!base.clone().held("loom:reviewing").eligible_for_ordering());

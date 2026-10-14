@@ -10,11 +10,22 @@
 //! Called from the work finder's per-root listing, i.e. only after the
 //! rate-limit breaker has passed. Idempotent: a labeled issue drops out of the
 //! next listing, and an already-lifecycle-labeled issue is never selected. Uses
-//! REST (`gh api`) only, batch-capped per pass, and never fails the tick.
+//! REST (`gh api`) only, batch-capped per pass, and never fails the tick. The
+//! listing is [`crate::forge_listing::list_open_issues_cached_all_as`], the
+//! shared ETag-cached walk of every open item (#11897), so a repo where nothing
+//! moved costs free `304`s instead of a full paginated read.
 //!
 //! Config (env; default ON): `LOOM_INTAKE_RECONCILE=0|false|off` disables,
 //! `LOOM_INTAKE_RECONCILE_INTERVAL_SECS` (default 300),
-//! `LOOM_INTAKE_RECONCILE_MAX_PER_PASS` (default 50).
+//! `LOOM_INTAKE_RECONCILE_MAX_PER_PASS` (default 50),
+//! `LOOM_INTAKE_RECONCILE_DEMOTE_WINDOW_SECS` (default 86400).
+//!
+//! # Issues opened past intake (#11820)
+//!
+//! Issues must enter at `loom:triage`. One opened already carrying
+//! `loom:issue` or `loom:curated` (by its author, at creation) is demoted to
+//! `loom:triage` with one comment, on both this inline path and the
+//! singleton's: see [`demote`]. A later promotion is never touched.
 //!
 //! # One pass per fleet (W7)
 //!
@@ -31,6 +42,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
 
+pub mod demote;
 pub mod singleton;
 
 /// The intake label applied.
@@ -39,7 +51,8 @@ pub const TRIAGE_LABEL: &str = "loom:triage";
 /// the singleton-output registry derives its deadline from it (#10924).
 pub const DEFAULT_INTERVAL_SECS: u64 = 300;
 const DEFAULT_MAX_PER_PASS: usize = 50;
-/// A filer commonly creates then labels; leave brand-new issues alone.
+/// A filer commonly creates then labels; leave brand-new issues alone. Also
+/// the demotion step's "at creation" grace (#11820).
 const MIN_AGE_SECS: i64 = 120;
 
 /// One open issue row as listed by the pass.
@@ -48,6 +61,15 @@ pub struct IntakeRow {
     pub number: u32,
     pub created_at: Option<DateTime<Utc>>,
     pub labels: Vec<String>,
+    /// The issue author's login, when the listing carries it: the demotion
+    /// step (#11820) tells "opened with" from a later promotion by it.
+    pub author: Option<String>,
+}
+
+/// Whether `label` is in the `loom:*` namespace.
+#[must_use]
+pub(super) fn is_loom_label(label: &str) -> bool {
+    label.starts_with("loom:")
 }
 
 /// Issue numbers that need `loom:triage`: no `loom:*` label, old enough, oldest
@@ -56,7 +78,7 @@ pub struct IntakeRow {
 pub fn select_unlabeled(rows: &[IntakeRow], now: DateTime<Utc>, cap: usize) -> Vec<u32> {
     let mut picked: Vec<&IntakeRow> = rows
         .iter()
-        .filter(|r| !r.labels.iter().any(|l| l.starts_with("loom:")))
+        .filter(|r| !r.labels.iter().any(|l| is_loom_label(l)))
         .filter(|r| {
             r.created_at
                 .is_none_or(|c| now - c >= Duration::seconds(MIN_AGE_SECS))
@@ -66,31 +88,21 @@ pub fn select_unlabeled(rows: &[IntakeRow], now: DateTime<Utc>, cap: usize) -> V
     picked.into_iter().take(cap).map(|r| r.number).collect()
 }
 
-/// Parse `number<TAB>created_at<TAB>label,label` lines.
+/// The intake rows of an open-items listing: issues only (pull requests are
+/// never touched), with their creation time, labels and author.
 #[must_use]
-pub fn parse_rows(stdout: &str) -> Vec<IntakeRow> {
-    stdout
-        .lines()
-        .filter_map(|line| {
-            let mut parts = line.split('\t');
-            let number = parts.next()?.trim().parse().ok()?;
-            let created_at = parts
-                .next()
-                .and_then(|s| DateTime::parse_from_rfc3339(s.trim()).ok())
-                .map(|d| d.with_timezone(&Utc));
-            let labels = parts
-                .next()
-                .unwrap_or("")
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned)
-                .collect();
-            Some(IntakeRow {
-                number,
-                created_at,
-                labels,
-            })
+pub fn rows_from_listing(rows: Vec<crate::forge_listing::RestIssue>) -> Vec<IntakeRow> {
+    crate::forge_listing::issues_only(rows)
+        .into_iter()
+        .map(|row| IntakeRow {
+            number: row.number,
+            created_at: row
+                .created_at
+                .as_deref()
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                .map(|d| d.with_timezone(&Utc)),
+            labels: row.labels,
+            author: row.author,
         })
         .collect()
 }
@@ -143,7 +155,8 @@ fn inline_pass_due(
     enabled && !stands_down() && due()
 }
 
-/// Run the pass for `root` if enabled and due. Returns issues labeled.
+/// Run the pass for `root` if enabled and due. Returns issues labeled or
+/// demoted.
 pub fn maybe_run(gh_bin: &Path, root: &Path) -> usize {
     // Unit tests of other modules drive GhWorkSource with real/fake `gh`; the
     // pass is exercised directly via `run_once` instead.
@@ -169,40 +182,57 @@ pub fn maybe_run(gh_bin: &Path, root: &Path) -> usize {
     )
 }
 
-/// One ungated pass (tests call this directly).
+/// One ungated pass (tests call this directly). Returns issues labeled or
+/// demoted.
 pub fn run_once(gh_bin: &Path, root: &Path, now: DateTime<Utc>, cap: usize) -> usize {
-    const JQ: &str = r#".[] | select(.pull_request|not) | [.number, .created_at, ([.labels[].name]|join(","))] | @tsv"#;
-    // W4-C: Hygiene — a shed listing is a skipped pass, retried on the next
-    // tick. The shed itself is logged (rate-limited) by the facade, so it is
-    // not reported here as a failure every tick.
-    let outcome = gh_call::read("intake.list_open", gh_bin, root)
-        .read_class(crate::gh_invocation::ReadClass::Hygiene)
-        .args([
-            "api",
-            "--paginate",
-            "repos/{owner}/{repo}/issues?state=open&per_page=100",
-            "--jq",
-            JQ,
-        ])
-        .run();
-    let stdout = match outcome {
-        crate::cmd_out::CmdOutcome::Ran(out) if out.status.success() => out.stdout,
-        crate::cmd_out::CmdOutcome::Unavailable(crate::cmd_out::Unavailable::Shed { until }) => {
+    // The shared ETag-cached walk of every open item (#11897), the one the
+    // singleton and the stage-queue gauge read: an idle repo costs only free
+    // `304`s. It is Hygiene-class: a shed walk is a skipped pass, retried on
+    // the next one, and so is an incomplete one (past its page cap, or moved
+    // mid-walk), since a missing issue must not read as absent.
+    let listed = crate::forge_listing::list_open_issues_cached_all_as(
+        "intake.list_open",
+        gh_bin,
+        Some(root),
+        None,
+    );
+    let listed = match listed {
+        Ok(listed) => listed,
+        Err(e)
+            if e.downcast_ref::<crate::forge_etag_store::ReadShed>()
+                .is_some() =>
+        {
             log::debug!(
-                "intake_reconcile: open-issue listing deferred in {} (reader budget low until \
-                 {until:?}); skipped this pass",
+                "intake_reconcile: open-issue listing deferred in {} ({e}); skipped this pass",
                 root.display()
             );
             return 0;
         }
-        _ => {
-            log::warn!("intake_reconcile: open-issue listing failed in {}", root.display());
+        Err(e) => {
+            log::warn!("intake_reconcile: open-issue listing failed in {}: {e:#}", root.display());
             return 0;
         }
     };
-    let rows = parse_rows(&String::from_utf8_lossy(&stdout));
+    let rows = rows_from_listing(listed);
+    // #11820: issues opened as `loom:issue`/`loom:curated` go back to intake.
+    // Its events reads count against the same cap; triage gets the rest.
+    let key = root.display().to_string();
+    let picked = demote::candidates(&key, &rows, now, cap);
+    let mut forge = demote::InlineForge {
+        gh_bin: gh_bin.to_path_buf(),
+    };
+    let demoted = demote::demote_step(&mut forge, root, &key, &key, &picked);
+    if demoted.demoted > 0 {
+        log::info!(
+            "intake_reconcile: demoted {} issue(s) opened past intake to {TRIAGE_LABEL} (#11820)",
+            demoted.demoted
+        );
+    }
+    if demoted.stopped {
+        return demoted.demoted; // likely rate limited / auth; retry next pass
+    }
     let mut labeled = 0;
-    for n in select_unlabeled(&rows, now, cap) {
+    for n in select_unlabeled(&rows, now, cap.saturating_sub(demoted.reads)) {
         let path = format!("repos/{{owner}}/{{repo}}/issues/{n}/labels");
         let label = format!("labels[]={TRIAGE_LABEL}");
         let ok = gh_call::output(
@@ -222,7 +252,7 @@ pub fn run_once(gh_bin: &Path, root: &Path, now: DateTime<Utc>, cap: usize) -> u
             "intake_reconcile: applied {TRIAGE_LABEL} to {labeled} unlabeled issue(s) (#10041)"
         );
     }
-    labeled
+    labeled + demoted.demoted
 }
 
 #[cfg(test)]

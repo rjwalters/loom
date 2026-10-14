@@ -10,13 +10,9 @@ use super::gh_call;
 /// [`super::VERDICT_HOLD_LABELS`] (defined here because `claim_reconciliation.rs`
 /// is size-frozen). #11743 adds `loom:frozen`: review-conflict flagging, stale-
 /// verdict clearing and anchoring, and merge-order planning must not write to
-/// a frozen PR.
-pub(crate) const VERDICT_HOLDS: [&str; 4] = [
-    "loom:blocked",
-    "loom:operator",
-    "loom:operator-only",
-    "loom:frozen",
-];
+/// a frozen PR. Derived (#11795): [`crate::work_finder::HOLD_NAMES`], so the
+/// retired hold names still count until open items are migrated.
+pub use crate::work_finder::HOLD_NAMES as VERDICT_HOLDS;
 
 /// The PR-side claim pass's listing less every `loom:frozen` PR (#11743):
 /// `reconcile_pr_claims` must not remove a stale `loom:reviewing` /

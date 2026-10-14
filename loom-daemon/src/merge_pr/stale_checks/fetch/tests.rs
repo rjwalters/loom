@@ -25,6 +25,25 @@ fn stub(dir: &Path, name: &str, with_flag: &str, without_flag: &str) -> PathBuf 
     path
 }
 
+/// `fetch_job_log` against a freshly written stub, waiting out ETXTBSY (#9614).
+///
+/// Under `cargo test` another test thread can fork while `stub()`'s write fd is
+/// open; the child keeps that fd until its own exec, and Linux refuses to exec
+/// the script meanwhile ("Text file busy (os error 26)"). Same bounded retry as
+/// `gh_invocation/outcome.rs::run_stub`.
+fn fetch_stub_log(gh: &Path) -> Result<String, String> {
+    let gh = gh.to_str().unwrap();
+    for _ in 0..100 {
+        match fetch_job_log(gh, "o/r", 7) {
+            Err(e) if e.contains("os error 26") => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            out => return out,
+        }
+    }
+    fetch_job_log(gh, "o/r", 7)
+}
+
 #[test]
 fn a_current_gh_is_asked_to_allow_the_logs_escape_sequences() {
     let dir = tempfile::tempdir().unwrap();
@@ -34,7 +53,7 @@ fn a_current_gh_is_asked_to_allow_the_logs_escape_sequences() {
         &format!("printf '\\033[36m%s\\033[0m\\n' '{LOG}'; exit 0"),
         "echo 'the response contains terminal escape sequences; pass --allow-escape-sequences to output it anyway' >&2; exit 1",
     );
-    let log = fetch_job_log(gh.to_str().unwrap(), "o/r", 7).unwrap();
+    let log = fetch_stub_log(&gh).unwrap();
     assert!(log.contains(LOG), "{log:?}");
 }
 
@@ -47,12 +66,7 @@ fn a_gh_without_the_flag_is_retried_plainly() {
         "echo 'unknown flag: --allow-escape-sequences' >&2; exit 1",
         &format!("echo '{LOG}'"),
     );
-    assert_eq!(
-        fetch_job_log(gh.to_str().unwrap(), "o/r", 7)
-            .unwrap()
-            .trim(),
-        LOG
-    );
+    assert_eq!(fetch_stub_log(&gh).unwrap().trim(), LOG);
 }
 
 #[test]
@@ -64,7 +78,7 @@ fn any_other_failure_is_reported_not_retried() {
         "echo 'HTTP 404: Not Found' >&2; exit 1",
         &format!("echo '{LOG}'"),
     );
-    let error = fetch_job_log(gh.to_str().unwrap(), "o/r", 7).unwrap_err();
+    let error = fetch_stub_log(&gh).unwrap_err();
     assert!(error.contains("404"), "{error}");
 }
 
@@ -111,7 +125,26 @@ fn pr_gh_stub(dir: &Path, entry: &str) -> PathBuf {
     )
     .unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    wait_until_execable(&path);
+    let _ = std::fs::remove_file(dir.join("argv"));
     path
+}
+
+/// Block until the freshly written stub at `path` can be exec'd (#9614).
+///
+/// `pr_ci_scope` folds an exec failure into `CiScope::Unscoped`, so the
+/// ETXTBSY race (see `fetch_stub_log`) cannot be retried at the call site;
+/// probe the stub directly instead. The probe's `argv` line is removed by the
+/// caller so the tests still see only their own `gh` calls.
+fn wait_until_execable(path: &Path) {
+    for _ in 0..100 {
+        match std::process::Command::new(path).output() {
+            Err(e) if e.raw_os_error() == Some(26) => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            _ => return,
+        }
+    }
 }
 
 /// The `{status, patch}` object `gh --jq` emits for a `ci.yml` entry that adds

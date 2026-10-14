@@ -118,6 +118,7 @@ pub use model::generate_sweep_id;
 mod config_paths;
 mod decline_cooldown;
 mod dispatch;
+mod fast_fail_park;
 mod frozen_write;
 mod guards;
 mod heartbeat_broadcast;
@@ -169,6 +170,9 @@ pub use crash_signals::*;
 pub use decline_cooldown::*;
 #[allow(unused_imports)]
 pub use dispatch::*;
+pub use fast_fail_park::{
+    fast_fail_class, fast_fail_parks, is_fast_failure, FAST_FAIL_WINDOW_SECS,
+};
 #[allow(unused_imports)]
 pub use guards::*;
 #[allow(unused_imports)]

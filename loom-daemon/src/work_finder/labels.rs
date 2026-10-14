@@ -9,7 +9,7 @@
 //! to the registry. The single-label constants are names, not sets; the
 //! registry tests check each one carries the properties its doc claims.
 
-use crate::label_registry::{embedded_set, LabelSet, Registry};
+use crate::label_registry::{embedded_set_with_retired, LabelSet, Registry};
 
 /// Labels marking a **deliberate park** — a human (or an agent acting on a
 /// human's behalf) has taken the issue out of the automation queue and it must
@@ -23,48 +23,94 @@ use crate::label_registry::{embedded_set, LabelSet, Registry};
 /// cancel-and-re-dispatch and the reaper's checkpoint-resume — both of which
 /// re-dispatch an issue the daemon itself already flipped to `loom:building`.
 ///
-/// **One narrow exemption exists (#6893).** `loom:operator-only`'s park is
-/// capability-aware for the `loom:operator-mechanical` sub-kind *only*: an item
-/// carrying both labels, declaring `<!-- loom:capability=<name> -->` markers
-/// (#6892) that this worker's own `LOOM_WORKER_CAPABILITIES` declaration fully
-/// covers, may be dispatched into a propose-mode lane instead of parked. See
+/// **One narrow exemption exists (#6893).** The [`BLOCKED_HOLD_LABEL`] park is
+/// capability-aware: an item whose only blocker is a capability — it declares
+/// `<!-- loom:capability=<name> -->` markers (#6892), names no blocker in a park
+/// record and carries no decision block — and whose markers this worker's own
+/// `LOOM_WORKER_CAPABILITIES` declaration fully covers may be dispatched into a
+/// propose-mode lane instead of parked (#11861: before, the lane read the
+/// operator hold, which no role acts on any more). See
 /// [`WorkItem::is_skipped_with_capabilities`] and [`crate::capability`]. The
-/// list here is unchanged and stays the authoritative *set* of park labels —
-/// the exemption is applied by the callers that opt into it, never by removing
-/// a label from this constant, and it is inert unless a host opts in.
+/// exemption is applied by the callers that opt into it, never by removing a
+/// label from this set, and it is inert unless a host opts in.
 ///
-/// **`loom:operator` deliberately does NOT belong here** — it is re-evaluable
-/// by design and must never refuse the routes that re-evaluate held work. See
-/// [`OPERATOR_HOLD_LABEL`] for the full vibesql#6664 rationale.
+/// **Issues and pull requests read the same set** (#11861). Before, the PR
+/// lane read a copy without [`OPERATOR_HOLD_LABEL`], because Champion's
+/// merge-risk and critical-file holds used it and had to stay re-evaluable.
+/// Those holds are `loom:blocked` now, so `loom:operator` parks a PR too: no
+/// role acts on it until a human removes it.
 ///
-/// Derived: the registry's `park` labels, in registry order (the order the
-/// park guards report a label in when an issue carries several).
-pub static PARK_LABELS: LabelSet = LabelSet::new(|| embedded_set("park"));
+/// Derived: the registry's `park` labels in registry order (the order the park
+/// guards report a label in when an issue carries several), then the retired
+/// names that fold into one of them (#11795), so an unmigrated
+/// `loom:operator-only` item stays parked.
+pub static PARK_LABELS: LabelSet = LabelSet::new(|| embedded_set_with_retired("park"));
 
 /// The daemon's own claim label. Disqualifies a *fresh* work-finder candidate
 /// (a `loom:building` row is already being worked), but is NOT a park — see
 /// [`PARK_LABELS`].
 pub const BUILDING_LABEL: &str = "loom:building";
 
-/// The generic operator hold — "the engine has stopped on this artifact and a
-/// human must act" (`defaults/docs/label-state-machine.md`). Disqualifies a
-/// *fresh work-finder candidate* exactly like [`BUILDING_LABEL`] does, but is
-/// **not** a park ([`PARK_LABELS`]) and must never become one: the hold is
-/// re-evaluable by design, and the park-guarded routes (watchdog re-dispatch,
-/// reaper checkpoint-resume, explicit `loom-daemon dispatch <N>`) must keep
-/// reaching held items.
+/// The operator hold (#11795): a human must act or decide now, and only a
+/// human removes it. It is a park ([`PARK_LABELS`]) on issues and pull
+/// requests alike (#11861), so no role and no dispatch route acts on it:
+/// before the fold `loom:operator-only` carried the park and this label was
+/// skip-only, and a hold applied after dispatch was overridden by watchdog
+/// re-dispatch, checkpoint resume or the epic supervisor (#4366). Champion's
+/// own merge-risk and critical-file holds are [`BLOCKED_HOLD_LABEL`] plus a
+/// hold marker, not this label.
 ///
-/// vibesql#6664: a sweep that concludes "a human is needed" releases its claim
-/// (restoring `loom:issue`) and applies this label in one motion. Without this
-/// constant in [`SKIP_LABELS`] the work finder immediately re-listed the issue
-/// and dispatched another `--claim-owned` builder onto the fresh hold —
-/// observed 3× in 13 minutes on vibesql#6172 (each new session noticed the
-/// hold in the comment trail and declined, which is luck, not a contract).
-/// Skipping the candidate here IS the contract; the human (or the re-evaluation
-/// lanes) takes it from there. This is the single home of the vibesql#6664
-/// rationale — [`PARK_LABELS`] and [`SKIP_LABELS`] point back here rather than
-/// repeating it.
+/// What the human must do is read from the body, not from a sub-label: a
+/// ```` ```decision ```` block (#10057) makes it a decision, a capability
+/// marker with no decision block makes it mechanical (#6893). Readers that
+/// must also see the retired names use [`is_operator_hold`].
 pub const OPERATOR_HOLD_LABEL: &str = "loom:operator";
+
+/// The blocked hold (#11795): waiting on something named — another change, a
+/// capability — and released automatically once it resolves. Folds the
+/// retired `loom:needs-capability` (with its capability marker in the body).
+///
+/// It also carries Champion's merge-risk and critical-file PR holds (#11861):
+/// `loom:blocked` beside `loom:pr`, a reason-only park record and Champion's
+/// hold-state marker comment. That is the one shape in which `loom:pr` and
+/// `loom:blocked` may coexist ([`crate::champion_hold`]); Champion releases it.
+pub const BLOCKED_HOLD_LABEL: &str = "loom:blocked";
+
+/// [`OPERATOR_HOLD_LABEL`] and the retired names that fold into it
+/// (`loom:operator-only`, `-decision`, `-mechanical`, `-blocked`), from the
+/// registry. `loom:operator-blocked` is a human hold (operator, 2026-10-14):
+/// a named blocker it waited on stays in the body text.
+pub static OPERATOR_HOLD_NAMES: LabelSet =
+    LabelSet::new(|| crate::label_registry::embedded_aliases(OPERATOR_HOLD_LABEL));
+
+/// [`BLOCKED_HOLD_LABEL`] and the retired names that fold into it
+/// (`loom:needs-capability`), from the registry.
+pub static BLOCKED_HOLD_NAMES: LabelSet =
+    LabelSet::new(|| crate::label_registry::embedded_aliases(BLOCKED_HOLD_LABEL));
+
+/// Every hold under any of its names (#11795): `loom:blocked`,
+/// `loom:operator`, `loom:frozen`, then the retired names that fold into one
+/// of them. Derived from the registry's `hold` property. The set a PR-side
+/// pass reads for "a human or a hold is involved: leave it alone".
+pub static HOLD_NAMES: LabelSet = LabelSet::new(|| embedded_set_with_retired("hold"));
+
+/// Whether `labels` carry the operator hold, under its name or a retired name
+/// that folds into it (#11795). Exact match.
+#[must_use]
+pub fn is_operator_hold<S: AsRef<str>>(labels: &[S]) -> bool {
+    labels
+        .iter()
+        .any(|l| OPERATOR_HOLD_NAMES.contains(&l.as_ref()))
+}
+
+/// Whether `labels` carry the blocked hold, under its name or a retired name
+/// that folds into it (#11795). Exact match.
+#[must_use]
+pub fn is_blocked_hold<S: AsRef<str>>(labels: &[S]) -> bool {
+    labels
+        .iter()
+        .any(|l| BLOCKED_HOLD_NAMES.contains(&l.as_ref()))
+}
 
 /// Labels that disqualify an issue from dispatch even if it still appears in
 /// the `loom:issue`-filtered listing.
@@ -73,24 +119,30 @@ pub const OPERATOR_HOLD_LABEL: &str = "loom:operator";
 /// exclusive states in the `.github/labels.yml` state machine), but `gh`'s
 /// label cache can be briefly stale, so the finder checks defensively.
 ///
-/// Derived from the registry's `skip` property, so it can never drift from
+/// Derived from the registry's `skip` property (plus the retired names that
+/// fold into a skip label, #11795), so it can never drift from
 /// [`PARK_LABELS`] (#4444: every park label is also a skip label, which
-/// `Registry::validate` enforces). Ordered as the claim ([`BUILDING_LABEL`]), the
-/// parks, the skip-only labels in registry order (the generic hold
-/// [`OPERATOR_HOLD_LABEL`], then [`EPIC_LABEL`]), then the sub-kinds that
-/// require a base label ([`OPERATOR_DECISION_LABEL`]). The operator hold sits
-/// in this list but NOT in [`PARK_LABELS`] — see [`OPERATOR_HOLD_LABEL`] for why.
+/// `Registry::validate` enforces). Ordered as the claim ([`BUILDING_LABEL`]),
+/// the parks, then the skip-only labels ([`EPIC_LABEL`],
+/// `loom:decision-malformed`); a retired name sorts as its replacement, after
+/// the active names of its group.
 ///
 /// **Not every member is a human hold.** [`BUILDING_LABEL`] is the daemon's
 /// own claim and [`EPIC_LABEL`] marks a tracking container; a reader that
-/// needs "a human must act" keys on the registry's `hold` / `operator_hold`
-/// properties (or [`PARK_LABELS`]), never on membership here.
+/// needs "a human must act" uses [`is_operator_hold`] or the registry's
+/// `hold` / `operator_hold` properties, never membership here.
 pub static SKIP_LABELS: LabelSet = LabelSet::new(|| {
     let reg = Registry::embedded();
-    let mut skip = embedded_set("skip");
+    let mut skip = embedded_set_with_retired("skip");
     skip.sort_by_key(|name| {
-        let l = reg.get(name).expect("with_property names a registry label");
-        (l.kind != "claim", !l.park, l.requires_base.is_some())
+        let retired = reg.get_retired(name);
+        let active = retired
+            .and_then(|r| r.replaced_by.as_deref())
+            .unwrap_or(name);
+        let l = reg
+            .get(active)
+            .expect("with_property names a registry label");
+        (l.kind != "claim", !l.park, retired.is_some())
     });
     skip
 });
@@ -116,21 +168,6 @@ pub static SKIP_LABELS: LabelSet = LabelSet::new(|| {
 /// (#10013), so outside tests this name is documentation only.
 #[cfg_attr(not(test), allow(dead_code))]
 pub const EPIC_LABEL: &str = "loom:epic";
-
-/// The `loom:operator-only` decision sub-kind (#5671): an owner has to rule.
-///
-/// It always accompanies `loom:operator-only`, so on a `loom:issue` row it was
-/// already skipped through that base label. #9244 made it a skip label in its
-/// own right: an operator-starred issue then reached the candidate list from
-/// outside `loom:issue` (no longer, #11508), and an item waiting on an
-/// owner's decision must never get a sweep dispatched onto it, even if the
-/// base label was dropped. Not a park ([`PARK_LABELS`]): the base
-/// label already is one wherever it matters.
-///
-/// Membership in [`SKIP_LABELS`] now comes from the registry's `skip`
-/// property (#10013), so outside tests this name is documentation only.
-#[cfg_attr(not(test), allow(dead_code))]
-pub const OPERATOR_DECISION_LABEL: &str = "loom:operator-decision";
 
 /// "Not now, don't touch" (#11743): a human applies it and only a human
 /// removes it. It is a park, a skip and a hard exclusion in the registry, so
@@ -158,8 +195,8 @@ pub fn is_frozen(labels: &[String]) -> bool {
 /// re-dispatched 31 times in 72 h.
 ///
 /// A veto is any [`SKIP_LABELS`] entry other than [`BUILDING_LABEL`] (the
-/// daemon's own claim, which every release removes) or any
-/// [`crate::capability::LANE_VETO_LABELS`] entry. `removing` names the
+/// daemon's own claim, which every release removes). The retired hold names
+/// are skip entries (#11795), so an unmigrated item stays vetoed. `removing` names the
 /// label(s) the caller is itself taking off in the same edit (the quarantine
 /// release removes its own `loom:blocked`), which never veto their own
 /// removal. Matching is exact (#11366). `loom:decision-malformed` is a skip
@@ -171,11 +208,10 @@ pub fn restore_veto<'a>(labels: &'a [String], removing: &[&str]) -> Option<&'a s
     if is_frozen(labels) {
         return Some(FROZEN_LABEL);
     }
-    labels.iter().map(String::as_str).find(|l| {
-        !removing.contains(l)
-            && *l != BUILDING_LABEL
-            && (SKIP_LABELS.contains(l) || crate::capability::LANE_VETO_LABELS.contains(l))
-    })
+    labels
+        .iter()
+        .map(String::as_str)
+        .find(|l| !removing.contains(l) && *l != BUILDING_LABEL && SKIP_LABELS.contains(l))
 }
 
 /// Log — at DEBUG, once per skipped candidate — that a candidate was dropped

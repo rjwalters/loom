@@ -92,7 +92,8 @@ pub struct AuthzFacts {
     pub verdict_current: Fact<bool>,
     /// A Judge or Doctor currently holds a reviewing/treating claim.
     pub reviewing_claim: Fact<bool>,
-    /// `loom:operator` / `loom:operator-only` / `loom:blocked` hold present.
+    /// A hold present (`loom:operator` / `loom:blocked` / `loom:frozen`, or a
+    /// retired name for one, #11795).
     pub human_hold: Fact<bool>,
     /// `loom:changes-requested` (or another contradiction) present.
     pub contradiction: Fact<bool>,

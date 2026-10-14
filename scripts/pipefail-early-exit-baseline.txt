@@ -30,7 +30,6 @@
 1 defaults/scripts/check-host-sleep.sh
 3 defaults/scripts/check-promotion-landed.sh
 1 defaults/scripts/classify-ac-verification.sh
-1 defaults/scripts/classify-capacity-defer.sh
 20 defaults/scripts/claude-wrapper.sh
 3 defaults/scripts/cli/loom-daemon-start.sh
 2 defaults/scripts/cli/loom-daemon-update.sh

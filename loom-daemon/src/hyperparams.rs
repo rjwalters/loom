@@ -65,6 +65,7 @@ use crate::priority_pick::{
     DEFAULT_BONUS_IMPORTANT, DEFAULT_BONUS_RED_MAIN_FIX, DEFAULT_BONUS_VERY_IMPORTANT,
     WEIGHT_BONUS_RANGE,
 };
+use crate::step_dispatch::item_draw;
 use crate::work_finder::{
     build_backoff::{BuildBackoffConfig, DEFAULT_HIGH, DEFAULT_LOW},
     DEFAULT_MAX_ADMISSIONS_PER_TICK, DEFAULT_WORK_FINDER_INTERVAL_SECS,
@@ -135,6 +136,22 @@ pub struct DispatchParams {
     /// Points added while the repo has dispatchable `loom:important` work
     /// (`dispatch.weightBonusImportant`, #11742). Default 20.
     pub weight_bonus_important: u32,
+    /// The step engine's item-draw priority factor for a red-main fix
+    /// (`dispatch.itemWeightRedMain`, #11896). Default 50. Range
+    /// `[1, 1000000]`. No legacy home, no single-knob env.
+    pub item_weight_red_main: u32,
+    /// Item-draw factor for `loom:very-important`
+    /// (`dispatch.itemWeightVeryImportant`, #11896). Default 8.
+    pub item_weight_very_important: u32,
+    /// Item-draw factor for `loom:important` (`dispatch.itemWeightImportant`,
+    /// #11896). Default 3.
+    pub item_weight_important: u32,
+    /// Days of stage age the item-draw age term counts at most
+    /// (`dispatch.itemAgeCapDays`, #11896). Default 90. Range `[0, 3650]`.
+    pub item_age_cap_days: u32,
+    /// Divisor of the item-draw age term, `1 + min(age, cap) / divisor`
+    /// (`dispatch.itemAgeDivisorDays`, #11896). Default 30. Range `[1, 3650]`.
+    pub item_age_divisor_days: u32,
 }
 
 /// Lifecycle timeout tunables — how long Loom waits before treating work or
@@ -222,6 +239,11 @@ impl Default for Hyperparameters {
                 weight_bonus_red_main_fix: DEFAULT_BONUS_RED_MAIN_FIX,
                 weight_bonus_very_important: DEFAULT_BONUS_VERY_IMPORTANT,
                 weight_bonus_important: DEFAULT_BONUS_IMPORTANT,
+                item_weight_red_main: item_draw::DEFAULT_WEIGHT_RED_MAIN,
+                item_weight_very_important: item_draw::DEFAULT_WEIGHT_VERY_IMPORTANT,
+                item_weight_important: item_draw::DEFAULT_WEIGHT_IMPORTANT,
+                item_age_cap_days: item_draw::DEFAULT_AGE_CAP_DAYS,
+                item_age_divisor_days: item_draw::DEFAULT_AGE_DIVISOR_DAYS,
             },
             lifecycle: LifecycleParams {
                 lease_ttl_minutes: crate::claim_reconciliation::DEFAULT_LEASE_TTL_MINUTES,
@@ -430,6 +452,11 @@ fn validate_dispatch(group: &Value, violations: &mut Vec<Violation>) {
                 | "weightBonusRedMainFix"
                 | "weightBonusVeryImportant"
                 | "weightBonusImportant"
+                | "itemWeightRedMain"
+                | "itemWeightVeryImportant"
+                | "itemWeightImportant"
+                | "itemAgeCapDays"
+                | "itemAgeDivisorDays"
                 // Retired with the softmax (#11742). Still accepted, and
                 // ignored, so a host config that set it keeps starting.
                 | "drawTemperature"
@@ -452,6 +479,9 @@ fn validate_dispatch(group: &Value, violations: &mut Vec<Violation>) {
         "weightBonusImportant",
     ] {
         check_u64(group, "dispatch", key, WEIGHT_BONUS_RANGE, violations);
+    }
+    for (key, range) in item_draw::HYPERPARAM_KEYS {
+        check_u64(group, "dispatch", key, range, violations);
     }
 }
 
@@ -622,6 +652,20 @@ pub fn resolve_effective(root: &Path) -> Resolved {
     let idle_legacy = crate::idle_exit::parse_effective(&effective);
 
     let mut sources = BTreeMap::new();
+    // The item draw's knobs (#11896): no legacy tier, like the bonuses.
+    let mut item_sources = BTreeMap::new();
+    let mut pick_item = |i: usize, default: u32| -> u32 {
+        let key = item_draw::HYPERPARAM_KEYS[i].0;
+        u32::try_from(pick_u64(
+            &block,
+            "dispatch",
+            key,
+            None,
+            u64::from(default),
+            &mut item_sources,
+        ))
+        .unwrap_or(default)
+    };
     let params = Hyperparameters {
         dispatch: DispatchParams {
             tick_interval_secs: pick_u64(
@@ -676,6 +720,11 @@ pub fn resolve_effective(root: &Path) -> Resolved {
                 &mut sources,
             ))
             .unwrap_or(DEFAULT_BONUS_IMPORTANT),
+            item_weight_red_main: pick_item(0, item_draw::DEFAULT_WEIGHT_RED_MAIN),
+            item_weight_very_important: pick_item(1, item_draw::DEFAULT_WEIGHT_VERY_IMPORTANT),
+            item_weight_important: pick_item(2, item_draw::DEFAULT_WEIGHT_IMPORTANT),
+            item_age_cap_days: pick_item(3, item_draw::DEFAULT_AGE_CAP_DAYS),
+            item_age_divisor_days: pick_item(4, item_draw::DEFAULT_AGE_DIVISOR_DAYS),
         },
         lifecycle: LifecycleParams {
             lease_ttl_minutes: {
@@ -749,6 +798,7 @@ pub fn resolve_effective(root: &Path) -> Resolved {
             }
         },
     };
+    sources.extend(item_sources);
     Resolved { params, sources }
 }
 
@@ -928,6 +978,19 @@ impl HyperparamsArgs {
             resolved.params.dispatch.weight_bonus_important,
             resolved.sources["dispatch.weightBonusImportant"].as_str()
         );
+        let d = &resolved.params.dispatch;
+        for (key, value) in [
+            ("itemWeightRedMain", d.item_weight_red_main),
+            ("itemWeightVeryImportant", d.item_weight_very_important),
+            ("itemWeightImportant", d.item_weight_important),
+            ("itemAgeCapDays", d.item_age_cap_days),
+            ("itemAgeDivisorDays", d.item_age_divisor_days),
+        ] {
+            println!(
+                "dispatch.{key:<24}= {value:>6}  [{}]",
+                resolved.sources[&format!("dispatch.{key}")].as_str()
+            );
+        }
         println!(
             "lifecycle.leaseTtlMinutes      = {:>6}  [{}]",
             resolved.params.lifecycle.lease_ttl_minutes,

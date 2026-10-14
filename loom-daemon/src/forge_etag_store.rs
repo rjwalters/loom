@@ -34,7 +34,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::ExitStatus;
 use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result};
@@ -396,9 +396,12 @@ pub(crate) fn fetch_conditional_via(
         |r: &FetchResult| {
             // 2am#4367 P4: the relay down or unreachable is not a credential
             // failure: withdraw it for the default window and use the writer.
-            if is_gateway_outage(reader.as_ref().map(|(_, a)| a.as_str()), r) {
+            let fault = gateway_fault(reader.as_ref().map(|(_, a)| a.as_str()), r);
+            if fault.reruns() {
                 gateway_down.set(true);
-                crate::forge_gateway::outage::withdraw_for_outage(site.caller);
+                if fault == crate::forge_gateway::outage::Fault::Withdraw {
+                    crate::forge_gateway::outage::withdraw_for_outage(site.caller);
+                }
                 return Some(crate::forge_identity::Failure::Credential);
             }
             let failure = reader_failure(r)?;
@@ -437,13 +440,16 @@ fn repo_of(target: &Target) -> &str {
 /// What a failed conditional read says about its credential. The parsed
 /// `--include` headers travel with it (W4-A), so a rate-limit refusal names
 /// its pool and its real `x-ratelimit-reset` rather than the flat default.
-/// Whether a failed conditional read on `app` was the gateway's outage. A
-/// conditional read always asks for headers, so no parsed response at all
-/// means no answer arrived.
-pub(crate) fn is_gateway_outage(app: Option<&str>, r: &FetchResult) -> bool {
-    app == Some(crate::forge_gateway::GATEWAY_APP_ID)
-        && !r.0.success()
-        && crate::forge_gateway::outage::is_outage(r.1.as_ref().map(|h| h.status), &r.2, true)
+/// What a failed conditional read on `app` calls for, when `app` is the
+/// gateway ([`crate::forge_gateway::outage::fault`]).
+pub(crate) fn gateway_fault(
+    app: Option<&str>,
+    r: &FetchResult,
+) -> crate::forge_gateway::outage::Fault {
+    if app != Some(crate::forge_gateway::GATEWAY_APP_ID) || r.0.success() {
+        return crate::forge_gateway::outage::Fault::None;
+    }
+    crate::forge_gateway::outage::fault(r.1.as_ref(), "", &r.2)
 }
 
 pub(crate) fn reader_failure(r: &FetchResult) -> Option<crate::forge_identity::Failure> {
@@ -579,16 +585,8 @@ pub(crate) fn remote_identity(cwd: &Path) -> Option<(String, String)> {
     if let Some(hit) = memo.lock().ok().and_then(|m| m.get(cwd).cloned()) {
         return Some(hit);
     }
-    let output = Command::new("git")
-        .args(["remote", "get-url", "origin"])
-        .current_dir(cwd)
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let resolved = parse_remote_url(&String::from_utf8_lossy(&output.stdout))?;
+    // Bounded (#9715): a hung `git` must not stall the caller.
+    let resolved = parse_remote_url(&crate::forge_cmd::get_remote_url(cwd)?)?;
     if let Ok(mut m) = memo.lock() {
         m.insert(cwd.to_path_buf(), resolved.clone());
     }

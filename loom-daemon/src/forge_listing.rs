@@ -34,7 +34,7 @@
 //! far outside normal operation). A full page logs a truncation warning
 //! rather than silently capping.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -85,6 +85,12 @@ pub struct RestIssue {
     /// forge omitted the summary or sent a malformed one (Gitea, older
     /// payloads), which keeps the pre-#11483 behaviour.
     pub open_sub_issues: Option<u32>,
+    /// When each current label was last applied (label name → RFC-3339), as
+    /// the GitHub state mirror serves it (`labels_at`, #11897): the first
+    /// source of an item's stage-entry time
+    /// ([`crate::step_dispatch::stage_entry`]). `None` on every REST row (the
+    /// listing carries no label times) and on a mirror row that sent none.
+    pub labels_at: Option<BTreeMap<String, String>>,
 }
 
 /// Keep only the real issues in a REST issues listing (Issue #9929).
@@ -699,6 +705,19 @@ pub struct HttpResponse {
     pub ratelimit: RateLimitHeaders,
     /// A `Link` header names a `rel="next"` page (#11139).
     pub next_page: bool,
+    /// The forge gateway's own marks (2am#4367 P4): `x-github-proxy-refusal`
+    /// (a response the gateway itself refused or failed), and whether
+    /// `x-github-proxy-version` says the gateway answered at all.
+    pub gateway: GatewayMark,
+}
+
+/// See [`HttpResponse::gateway`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GatewayMark {
+    /// `x-github-proxy-refusal`: the gateway's own refusal code.
+    pub refusal: Option<String>,
+    /// `x-github-proxy-version` was present.
+    pub answered: bool,
 }
 
 /// Parse `gh api --include` output. Returns `None` when the first line is not
@@ -717,6 +736,7 @@ pub fn parse_http_response(raw: &str) -> Option<HttpResponse> {
     let mut etag = None;
     let mut next_page = false;
     let mut ratelimit = RateLimitHeaders::default();
+    let mut gateway = GatewayMark::default();
     for line in lines {
         let trimmed = line.trim_end_matches('\r');
         if trimmed.is_empty() {
@@ -727,6 +747,10 @@ pub fn parse_http_response(raw: &str) -> Option<HttpResponse> {
                 etag = Some(value.trim().to_string());
             } else if name.eq_ignore_ascii_case("link") {
                 next_page = value.contains("rel=\"next\"");
+            } else if name.eq_ignore_ascii_case("x-github-proxy-refusal") {
+                gateway.refusal = Some(value.trim().to_string());
+            } else if name.eq_ignore_ascii_case("x-github-proxy-version") {
+                gateway.answered = true;
             } else {
                 ratelimit.absorb(name, value);
             }
@@ -752,6 +776,7 @@ pub fn parse_http_response(raw: &str) -> Option<HttpResponse> {
         body,
         ratelimit,
         next_page,
+        gateway,
     })
 }
 
@@ -812,6 +837,7 @@ pub fn parse_rest_issues(body: &str) -> Result<Vec<RestIssue>> {
             author_association: r.author_association,
             is_pull_request: r.pull_request.is_some(),
             open_sub_issues: r.sub_issues_summary.as_ref().and_then(open_sub_issues),
+            labels_at: None,
         })
         .collect())
 }

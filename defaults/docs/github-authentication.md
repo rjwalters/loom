@@ -551,7 +551,20 @@ silently, so it would send the key to GitHub instead.
   grant), so no key file sits on the host. It is always read with an
   explicit `--region`: `region`, else `AWS_REGION`, else
   `AWS_DEFAULT_REGION`. With none of these set, `ssm://` refs are refused
-  (logged once) and that owner keeps today's routing. `file:<path>` must be an
+  (logged once) and that owner keeps today's routing. The read runs as the
+  host's instance role: `AWS_PROFILE`, `AWS_DEFAULT_PROFILE`, the static key
+  variables, the web-identity and container-credential variables
+  (`AWS_ROLE_ARN`, `AWS_WEB_IDENTITY_TOKEN_FILE`, `AWS_CONTAINER_CREDENTIALS_*`)
+  are removed from the `aws` child, and `AWS_CONFIG_FILE` /
+  `AWS_SHARED_CREDENTIALS_FILE` are set to `/dev/null`, so neither a daemon
+  environment that names another identity (a build-cache profile, say) nor a
+  `default` profile in `~/.aws` can read as it. A host whose grant is a
+  named profile sets `awsProfile`, passed as `--profile=<name>`; the profile
+  must live in the daemon user's default `~/.aws/config` /
+  `~/.aws/credentials` (the environment's file overrides are removed). A
+  name must start with a letter or digit; an invalid `awsProfile` refuses
+  every `ssm://` ref of the block (logged) rather than reading with the
+  default credential chain. A failed read logs the exit code and the CLI's first stderr line. `file:<path>` must be an
   owner-only file outside every checkout. An owner with no ref keeps
   today's routing.
 
@@ -567,8 +580,14 @@ on:
 
 - **Daemon reads** (facade reads and conditional ETag reads) try the
   gateway profile before any reader App. A gateway refusal withdraws it like
-  a reader. A gateway **outage** (a timeout, a transport error, or a
-  `502`/`503`/`504`) withdraws it everywhere for five minutes. Either way the
+  a reader. Any gateway attempt that times out, gets a transport error, or
+  fails with a `5xx` is run once more on the readers, then the writer. That
+  includes a `5xx` GitHub relayed, which cannot always be told apart.
+  The gateway is **withdrawn** everywhere for five minutes only on its own
+  evidence: a transport error, a `5xx` it marked (`x-github-proxy-refusal`,
+  or its opaque `{error, request_id}` body), or one that never reached it
+  (no `x-github-proxy-version`, or an edge status `520`–`530`). A `gh` that
+  failed before sending is neither rerun nor an outage. Either way the
   read continues to the readers, then the writer. A page walk under a
   gateway profile follows next links only on its `api_host`.
 - **Agent `gh` calls**: the front sends a read to the gateway only when it
@@ -586,9 +605,11 @@ on:
     sources disagree the call stays direct.
   - Everything else stays on the session's credential: every mutation,
     `gh api -X …`, GraphQL, search, `gh release`, `gh auth git-credential`,
-    `--watch`, and any call on a TTY.
-  - If the gateway is down, the front runs the same call direct and skips
-    the gateway for five minutes.
+    `--watch`, `run view --log`, and any call on a TTY.
+  - If the gateway attempt fails with a `5xx` or a transport error, the
+    front runs the same call direct and books it as direct. On the
+    gateway's own evidence (as above) it also skips the gateway for five
+    minutes.
 - **Writes, git and releases** are unchanged: the writer App, no `api_host`.
 - **`GH_NO_UPDATE_NOTIFIER=1`** is set for the daemon and every agent,
   whether or not a gateway is configured.
@@ -604,6 +625,11 @@ to unset it.
 the writer), `direct` (writes and unclassified calls) or `none` (shed).
 The writer's read share is `route = direct_read` on the writer's `account`
 over all reads. A rise means a classifier gap, not an outage.
+
+Discovery listings can also skip GitHub, and the gateway, entirely: with a
+state mirror configured (`forge.mirror`), the work finder and the stage-dwell
+sampler read fresh listings from it and fall back to the paths above. See
+[`forge-events.md` §8](forge-events.md#8-the-state-mirror-forgemirror-discovery-reads-and-wakes).
 
 ### The cached-permission window: `403 … not accessible by integration` (#6074)
 

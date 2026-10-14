@@ -10,11 +10,16 @@
 //! [`LabelSet`]s derived from registry properties via [`embedded_set`].
 //!
 //! Slice 2b: `OPERATOR_GATE_LABELS`, pr_latency `hold_labels`, merge_pr
-//! `BLOCKING` and queue_blocked `HOLD_LABELS` are derived too; `tests.rs` pins each to its previous literal. dep_classify's
-//! operator-only labels are single named consts, kept in lockstep by a test.
+//! `BLOCKING` and queue_blocked `HOLD_LABELS` are derived too; `tests.rs`
+//! pins each to its literal.
 //!
 //! The `propagate` rule table (#10012) is gone (#11510): its only consumer,
 //! the star-liveness propagation pass, was removed by #11104.
+//!
+//! #11795 folded the hold family into three labels (`loom:blocked`,
+//! `loom:operator`, `loom:frozen`). Hold-shaped sets use
+//! [`embedded_set_with_retired`] so the retired names keep their
+//! replacement's meaning until open items are migrated.
 //!
 //! Retired labels (#11513) are not in `labels`: they are listed in the
 //! top-level `retired` array ([`RetiredLabel`]) with their old -> new
@@ -54,6 +59,56 @@ pub fn embedded_set(property: &str) -> Vec<&'static str> {
     Registry::embedded()
         .with_property(property)
         .unwrap_or_else(|| panic!("{property} is not a registry boolean property"))
+}
+
+/// [`embedded_set`] plus every retired label whose `replaced_by` carries
+/// `property` (#11795), in registry order then retired order.
+///
+/// A retired label is read as its replacement while open items still carry
+/// it: the daemon rolls before `labels migrate` relabels them, so a set that
+/// knew only the active names would drop a held item out of its hold for the
+/// length of that window. Use it for the hold-shaped sets (park, skip, hold,
+/// the operator gates); never for `contradicts_approval`, whose order is a
+/// report contract.
+///
+/// # Panics
+/// As [`embedded_set`].
+#[must_use]
+pub fn embedded_set_with_retired(property: &str) -> Vec<&'static str> {
+    let reg = Registry::embedded();
+    let mut set = embedded_set(property);
+    set.extend(
+        reg.retired
+            .iter()
+            .filter(|r| {
+                r.replaced_by
+                    .as_deref()
+                    .and_then(|to| reg.get(to))
+                    .and_then(|l| l.property(property))
+                    == Some(true)
+            })
+            .map(|r| r.name.as_str()),
+    );
+    set
+}
+
+/// `active` followed by every retired label whose `replaced_by` is `active`
+/// (#11795): the names an unmigrated item may still carry for it.
+///
+/// # Panics
+/// If `active` is not a declared label (a programming error).
+#[must_use]
+pub fn embedded_aliases(active: &'static str) -> Vec<&'static str> {
+    let reg = Registry::embedded();
+    assert!(reg.get(active).is_some(), "{active} is not a registry label");
+    let mut v = vec![active];
+    v.extend(
+        reg.retired
+            .iter()
+            .filter(|r| r.replaced_by.as_deref() == Some(active))
+            .map(|r| r.name.as_str()),
+    );
+    v
 }
 
 /// Boolean properties queryable through [`Registry::with_property`].
@@ -144,6 +199,12 @@ pub struct RetiredLabel {
     pub owned: bool,
     /// The issue that retired it, e.g. `#11103`.
     pub retired_in: String,
+    /// Active labels the migration also strips from an item it relabels
+    /// (#11860): a retired label whose meaning was a label *combination*
+    /// (the retired revise label rode on `loom:curated`) maps onto a state that
+    /// excludes part of it. Owned entries only; empty for a plain rename.
+    #[serde(default)]
+    pub also_remove: Vec<String>,
 }
 
 /// The parsed registry.
@@ -255,7 +316,8 @@ impl Registry {
     }
 
     /// `retired` invariants (#11513): a retired name is unique and not also
-    /// declared, and each `replaced_by` names an active declared label.
+    /// declared, each `replaced_by` names an active declared label, and each
+    /// `also_remove` (#11860) names another active label on an owned entry.
     fn validate_retired(&self) -> Result<()> {
         let mut seen = HashSet::new();
         for r in &self.retired {
@@ -273,6 +335,17 @@ impl Registry {
                     Some(l) if l.lifecycle == "active" => {}
                     Some(_) => bail!("{}: replaced_by {to} is not an active label", r.name),
                     None => bail!("{}: replaced_by unknown label {to}", r.name),
+                }
+            }
+            if !r.also_remove.is_empty() && !r.owned {
+                bail!("{}: also_remove needs owned: true (unowned is add-only)", r.name);
+            }
+            for x in &r.also_remove {
+                if r.replaced_by.as_deref() == Some(x.as_str()) {
+                    bail!("{}: also_remove {x} is its own replaced_by", r.name);
+                }
+                if self.get(x).is_none_or(|l| l.lifecycle != "active") {
+                    bail!("{}: also_remove {x} is not an active label", r.name);
                 }
             }
         }

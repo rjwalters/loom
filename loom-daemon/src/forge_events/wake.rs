@@ -372,13 +372,17 @@ pub fn resolve_min_spacing(config: &ConsumerConfig) -> Duration {
 /// `wanted` event types?
 ///
 /// Three checks, all on routing hints: the payload is from the feed consumer
-/// (`source`), the page was non-empty (`count`), and at least one of the
-/// page's event-type names is one this consumer acts on. Nothing here reads
-/// forge state, because the payload deliberately carries none (#8765): no
-/// repo, no issue or PR number, no labels, no actor.
+/// or the state mirror's change stream (`source`, 2am#4367 P5:
+/// [`crate::forge_mirror::wake::MIRROR_SOURCE`]), the page was non-empty
+/// (`count`), and at least one of the page's event-type names is one this
+/// consumer acts on. Nothing here reads forge state, because the payload
+/// deliberately carries none (#8765): no issue or PR number, no labels, no
+/// actor (at most the `repo` invalidation keys, which only choose what to
+/// re-query).
 #[must_use]
 pub fn payload_qualifies(payload: &serde_json::Value, wanted: &[&str]) -> bool {
-    if payload.get("source").and_then(serde_json::Value::as_str) != Some(PAYLOAD_SOURCE) {
+    let source = payload.get("source").and_then(serde_json::Value::as_str);
+    if source != Some(PAYLOAD_SOURCE) && source != Some(crate::forge_mirror::wake::MIRROR_SOURCE) {
         return false;
     }
     if payload

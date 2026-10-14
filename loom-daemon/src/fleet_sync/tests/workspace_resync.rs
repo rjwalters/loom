@@ -1169,6 +1169,7 @@ fn status_shows_each_workspace_and_an_old_snapshot_still_reads() {
 
 #[path = "workspace_resync_bounds.rs"]
 mod bounds;
+mod dogfood;
 #[path = "workspace_resync_heads.rs"]
 mod head_check;
 #[path = "workspace_resync_hold.rs"]

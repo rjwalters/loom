@@ -139,6 +139,9 @@ path = "loom-daemon/src/sweep_registry/park_hold.rs"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/intake_reconcile/singleton.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/intake_reconcile/demote.rs"
 
 [[operation]]
 id = "issue.search"
@@ -239,6 +242,9 @@ path = "loom-daemon/src/sweep_registry/park_hold.rs"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/intake_reconcile/singleton.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/intake_reconcile/demote.rs"
 
 [[operation]]
 id = "issue.edit-body"
@@ -418,6 +424,9 @@ path = "loom-daemon/src/fleet/drain_reset.rs"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/claim_reconciliation/unanchored_verdict.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/intake_reconcile/demote.rs"
 
 [[operation]]
 id = "comment.list"
@@ -544,7 +553,13 @@ kind = "rust"
 path = "loom-daemon/src/observability/ops/stage_dwell.rs"
 [[operation.callers]]
 kind = "rust"
+path = "loom-daemon/src/observability/ops/stage_events.rs"
+[[operation.callers]]
+kind = "rust"
 path = "loom-daemon/src/stale_blocked/release_gh.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/intake_reconcile/demote.rs"
 
 # --- epics-relationships -----------------------------------------------------
 

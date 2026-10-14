@@ -444,8 +444,18 @@ fn daemon_write_paths_are_scoped() {
         ("work_finder/pool_preflight.rs", Gated),
         ("intake_reconcile.rs", Gated),
         ("intake_reconcile/singleton.rs", Gated),
+        (
+            "intake_reconcile/demote.rs",
+            Via(
+                "intake_reconcile.rs",
+                "demotion step (#11820): the inline pass behind gate_root_with, and the \
+                 singleton's run_repo behind may_write (gate_repo_with)",
+            ),
+        ),
         ("stale_blocked/release_gh.rs", Gated),
         ("work_finder/main_red_autofile.rs", Gated),
+        // #11853: label swap + routing comment, each behind gate_repo_with.
+        ("work_finder/landed_prefilter.rs", Gated),
         (
             "sweep_registry/guards.rs",
             Via(DISPATCH, "claim flip + lease of a dispatched sweep"),
@@ -463,6 +473,7 @@ fn daemon_write_paths_are_scoped() {
             "sweep_registry/roll_requeue.rs",
             Via(DISPATCH, "requeues dispatched sweeps a roll could not pause (#10831)"),
         ),
+        ("sweep_registry/fast_fail_park.rs", Via(DISPATCH, "acts on dispatched sweeps")),
         ("sweep_registry/quarantine.rs", Via(DISPATCH, "acts on dispatched sweeps")),
         (
             "sweep_registry/prless_retry/hold.rs",
@@ -546,6 +557,10 @@ fn daemon_write_paths_are_scoped() {
         ),
         ("operator_decision/cli.rs", Gated),
         ("cli/labels_migrate.rs", Gated),
+        (
+            "cli/labels_migrate_holds.rs",
+            Via("cli/labels_migrate.rs", "labels migrate --holds, gated by its write_gate"),
+        ),
         ("cli/curation_complete.rs", Gated),
         ("cli/labels_undeclared.rs", Gated),
         ("cli/pr_lease.rs", Gated),
