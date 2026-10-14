@@ -47,21 +47,50 @@ pub fn http_status_in(stderr: &str) -> Option<u16> {
     })
 }
 
-/// Whether a failed gateway attempt is the gateway's outage. `status` is the
-/// parsed response status when the call printed headers (`--include`), and
-/// `expects_headers` says it did: then no status at all means no response
-/// arrived. Without headers, only a `502`/`503`/`504` or a transport error
-/// on stderr counts, so a GraphQL "not found" never withdraws the gateway.
+/// Whether a failed gateway attempt is the gateway's own outage, judged only
+/// from what the gateway itself signals, so a `5xx` GitHub returned through
+/// the relay never takes the gateway out (the reader and the writer would
+/// get the same answer).
+///
+/// - With headers (`--include`, `response`): a `5xx` the gateway marked as
+///   its own (`x-github-proxy-refusal`), or one that never came from the
+///   gateway (no `x-github-proxy-version`: the edge in front of a crashed
+///   Worker).
+/// - Without headers: a `5xx` on stderr whose body on stdout has the
+///   gateway's opaque `{error, request_id}` shape (GitHub's carry
+///   `message`), or a Cloudflare edge status (`520`–`530`), which GitHub
+///   never sends.
+/// - Neither: a transport error on stderr. A `gh` that failed before
+///   sending a request (a bad flag, a config error) shows none, so it is
+///   never an outage, headers or not.
+///
+/// A timeout is the caller's to judge (it has no output to read).
 #[must_use]
-pub fn is_outage(status: Option<u16>, stderr: &str, expects_headers: bool) -> bool {
-    match status.or_else(|| http_status_in(stderr)) {
-        Some(s) => matches!(s, 502..=504),
-        None if expects_headers => true,
-        None => {
-            let e = stderr.to_ascii_lowercase();
-            TRANSPORT_MARKERS.iter().any(|m| e.contains(m))
-        }
+pub fn is_outage(
+    response: Option<&crate::forge_listing::HttpResponse>,
+    stdout: &str,
+    stderr: &str,
+) -> bool {
+    if let Some(r) = response {
+        return r.status >= 500 && (r.gateway.refusal.is_some() || !r.gateway.answered);
     }
+    if let Some(s) = http_status_in(stderr) {
+        return s >= 500 && ((520..=530).contains(&s) || is_gateway_body(stdout));
+    }
+    let e = stderr.to_ascii_lowercase();
+    TRANSPORT_MARKERS.iter().any(|m| e.contains(m))
+}
+
+/// The gateway's opaque 5xx body: `{"error": <code>, "request_id": …}` and
+/// no `message` (errors.js, SECURITY.md rule 6 on the gateway side).
+fn is_gateway_body(stdout: &str) -> bool {
+    let Ok(serde_json::Value::Object(m)) = serde_json::from_str::<serde_json::Value>(stdout.trim())
+    else {
+        return false;
+    };
+    m.get("error").is_some_and(serde_json::Value::is_string)
+        && m.contains_key("request_id")
+        && !m.contains_key("message")
 }
 
 /// Withdraw the gateway App-wide for the default window. A test build

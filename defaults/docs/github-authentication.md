@@ -567,8 +567,11 @@ on:
 
 - **Daemon reads** (facade reads and conditional ETag reads) try the
   gateway profile before any reader App. A gateway refusal withdraws it like
-  a reader. A gateway **outage** (a timeout, a transport error, or a
-  `502`/`503`/`504`) withdraws it everywhere for five minutes. Either way the
+  a reader. A gateway **outage** withdraws it everywhere for five minutes.
+  An outage is a timeout, a transport error, or a `5xx` the gateway marks as
+  its own (`x-github-proxy-refusal`, or its opaque `{error, request_id}`
+  body), or that never reached it (an edge status). A `5xx` GitHub returns
+  through the relay, or a `gh` that failed before sending, is not one. Either way the
   read continues to the readers, then the writer. A page walk under a
   gateway profile follows next links only on its `api_host`.
 - **Agent `gh` calls**: the front sends a read to the gateway only when it
@@ -586,9 +589,9 @@ on:
     sources disagree the call stays direct.
   - Everything else stays on the session's credential: every mutation,
     `gh api -X …`, GraphQL, search, `gh release`, `gh auth git-credential`,
-    `--watch`, and any call on a TTY.
-  - If the gateway is down, the front runs the same call direct and skips
-    the gateway for five minutes.
+    `--watch`, `run view --log`, and any call on a TTY.
+  - If the gateway is down, the front runs the same call direct, books it
+    as direct, and skips the gateway for five minutes.
 - **Writes, git and releases** are unchanged: the writer App, no `api_host`.
 - **`GH_NO_UPDATE_NOTIFIER=1`** is set for the daemon and every agent,
   whether or not a gateway is configured.

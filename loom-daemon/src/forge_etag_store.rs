@@ -437,13 +437,12 @@ fn repo_of(target: &Target) -> &str {
 /// What a failed conditional read says about its credential. The parsed
 /// `--include` headers travel with it (W4-A), so a rate-limit refusal names
 /// its pool and its real `x-ratelimit-reset` rather than the flat default.
-/// Whether a failed conditional read on `app` was the gateway's outage. A
-/// conditional read always asks for headers, so no parsed response at all
-/// means no answer arrived.
+/// Whether a failed conditional read on `app` was the gateway's outage
+/// ([`crate::forge_gateway::outage::is_outage`]).
 pub(crate) fn is_gateway_outage(app: Option<&str>, r: &FetchResult) -> bool {
     app == Some(crate::forge_gateway::GATEWAY_APP_ID)
         && !r.0.success()
-        && crate::forge_gateway::outage::is_outage(r.1.as_ref().map(|h| h.status), &r.2, true)
+        && crate::forge_gateway::outage::is_outage(r.1.as_ref(), "", &r.2)
 }
 
 pub(crate) fn reader_failure(r: &FetchResult) -> Option<crate::forge_identity::Failure> {

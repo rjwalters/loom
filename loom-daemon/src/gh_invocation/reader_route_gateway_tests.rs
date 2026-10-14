@@ -13,7 +13,13 @@ use std::time::{Duration, SystemTime};
 
 const DOWN: &str =
     "echo 'Get \"https://gw.example.com/repos/acme/r\": dial tcp: connection refused' >&2; exit 1";
-const BAD_GATEWAY: &str = "echo 'gh: Bad Gateway (HTTP 502)' >&2; exit 1";
+const BAD_GATEWAY: &str =
+    "echo '{\"error\":\"upstream_error\",\"request_id\":\"r1\"}'; echo 'gh: HTTP 502' >&2; exit 1";
+/// A 502 GitHub itself returned through the relay: an answer, not an outage.
+const RELAYED_502: &str =
+    "echo '{\"message\":\"Server Error\"}'; echo 'gh: Server Error (HTTP 502)' >&2; exit 1";
+/// gh refused the argv before sending anything.
+const GH_REFUSED: &str = "echo 'unknown flag: --nope' >&2; exit 1";
 const NOT_FOUND: &str = "echo 'gh: Not Found (HTTP 404)' >&2; exit 1";
 const OK: &str = "echo '{}'; exit 0";
 
@@ -147,4 +153,15 @@ fn a_not_found_through_the_gateway_is_not_an_outage() {
     assert_eq!(s.calls(), ["gateway", "writer"]);
     assert!(crate::forge_gateway::outage::take_test_outages().is_empty());
     assert!(withdrawals.is_empty(), "{withdrawals:?}");
+}
+
+#[test]
+fn a_github_502_through_the_gateway_or_a_gh_usage_error_is_not_an_outage() {
+    for on_gw in [RELAYED_502, GH_REFUSED] {
+        let s = stub(on_gw, OK, OK);
+        let (out, _) = s.run(true);
+        assert!(!ok(&out), "{on_gw}: the gateway's answer stands");
+        assert_eq!(s.calls(), ["gateway"], "{on_gw}");
+        assert!(crate::forge_gateway::outage::take_test_outages().is_empty(), "{on_gw}");
+    }
 }
