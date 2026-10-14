@@ -8,6 +8,11 @@
 //! failed, which means the counts are incomplete rather than low. A third,
 //! `loom.queue.listing_incomplete_repos` (#11139), counts the repos whose
 //! listing came back partial: their rows are counted, but not all of them.
+//! A fourth, `loom.queue.already_landed` (#11858), splits the
+//! `already_landed` rows by the evidence the landed guard found (the row's
+//! `detail`: `forge_closed`, `forge_closed_not_planned` or `journal_landed`;
+//! `unknown` for a row with none of these), so the split is measurable without
+//! the native `queue.snapshot`.
 //!
 //! Every disposition is emitted every tick, **zeros included**, so an empty
 //! queue reads as `0` and not as a missing series. A missing series then
@@ -23,9 +28,18 @@ fn int(value: usize) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 
+/// The `already_landed` evidence tokens `loom.queue.already_landed` names
+/// (the landed guard's row details, #11429), plus [`UNKNOWN_EVIDENCE`].
+pub const LANDED_EVIDENCE: [&str; 3] =
+    ["forge_closed", "forge_closed_not_planned", "journal_landed"];
+
+/// The evidence label for an `already_landed` row whose detail names none.
+pub const UNKNOWN_EVIDENCE: &str = "unknown";
+
 /// The tick's queue gauges: one `loom.queue.issues{state,reason}` point per
-/// entry of [`QueueDisposition::ALL`], plus `loom.queue.listing_failed_repos`
-/// and `loom.queue.listing_incomplete_repos`.
+/// entry of [`QueueDisposition::ALL`], plus `loom.queue.listing_failed_repos`,
+/// `loom.queue.listing_incomplete_repos` and one
+/// `loom.queue.already_landed{reason}` point per evidence (#11858).
 #[must_use]
 pub fn queue_points(summary: &WorkFinderTickSummary) -> Vec<MetricPoint> {
     let mut points: Vec<MetricPoint> = QueueDisposition::ALL
@@ -46,7 +60,32 @@ pub fn queue_points(summary: &WorkFinderTickSummary) -> Vec<MetricPoint> {
         MetricName::QueueListingIncompleteRepos,
         int(summary.listing_incomplete.len()),
     ));
+    points.extend(already_landed_points(summary));
     points
+}
+
+/// One `loom.queue.already_landed{reason}` point per evidence, zeros
+/// included (#11858).
+fn already_landed_points(summary: &WorkFinderTickSummary) -> Vec<MetricPoint> {
+    let evidence = |detail: Option<&str>| {
+        detail
+            .and_then(|d| LANDED_EVIDENCE.iter().find(|e| **e == d))
+            .copied()
+            .unwrap_or(UNKNOWN_EVIDENCE)
+    };
+    LANDED_EVIDENCE
+        .iter()
+        .chain(std::iter::once(&UNKNOWN_EVIDENCE))
+        .map(|reason| {
+            let count = summary
+                .queue
+                .iter()
+                .filter(|r| r.disposition == QueueDisposition::AlreadyLanded)
+                .filter(|r| evidence(r.detail.as_deref()) == *reason)
+                .count();
+            MetricPoint::int(MetricName::QueueAlreadyLanded, int(count)).label("reason", *reason)
+        })
+        .collect()
 }
 
 /// Export one tick's queue gauges. Returns immediately when no ops sink is

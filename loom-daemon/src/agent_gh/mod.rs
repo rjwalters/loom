@@ -22,6 +22,8 @@
 //!   execs `next_gh` ([`next_gh::resolve`]: `LOOM_GH_BIN`, else the next `gh`
 //!   on `PATH`) with argv, streams and exit
 //!   status byte-identical ([`crate::gh_invocation::transparent::exec`]).
+//!   Inside a role tick, a `--json` listing runs captured instead, its output
+//!   replayed unchanged, so its rows are journaled ([`listing_capture`], #11858).
 //! - Escape hatch: `LOOM_GH_NO_CACHE=1` (also `GH_CACHE_DISABLE=1`,
 //!   `LOOM_ETAG_LIST_DISABLE=1`). Env-only on purpose: plain `gh` rejects an
 //!   unknown flag, so a `--fresh` would break every host without the front.
@@ -42,6 +44,7 @@
 pub mod classify;
 pub mod go_sort;
 pub mod ledger;
+pub mod listing_capture;
 pub mod next_gh;
 pub mod pr_checks;
 pub mod read_route;
@@ -238,6 +241,11 @@ pub fn run(raw: &[OsString]) -> i32 {
         } else {
             ledger::book(raw, cwd.as_deref(), &route);
         }
+        // #11858: a role tick's passed-through `--json` listing runs
+        // captured, so its rows reach the tick's `pick.decision`.
+        if let Some(code) = listing_capture::run(&next, raw, depth) {
+            return code;
+        }
     }
     let err = crate::gh_invocation::transparent::exec(
         &next,
@@ -347,6 +355,17 @@ fn run_on_gateway(next: &Path, raw: &[OsString], dir: &Path, depth: u32) -> Opti
     let _ = std::io::stdout().lock().write_all(&out.stdout);
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().lock().write_all(&out.stderr);
+    // #11858: a role tick's listing answered here is journaled too.
+    if out.status.success() {
+        let stage = raw
+            .iter()
+            .map(|a| a.to_str().map(str::to_string))
+            .collect::<Option<Vec<String>>>()
+            .and_then(|args| listing_capture::stage(&args));
+        if let Some(stage) = stage {
+            listing_capture::record(&stage, &out.stdout);
+        }
+    }
     Some(exit_code(out.status))
 }
 

@@ -76,6 +76,14 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.dispatch.max_concurrent",
     // #11649: a held tick's distinct halt causes, comma-joined.
     "loom.dispatch.halt_causes",
+    // #11858: the held repos with their causes, the cap's binding term and
+    // terms, and the open-PR pre-filter's skips (`ops::dispatch_facts`).
+    "loom.dispatch.halted_repos",
+    "loom.dispatch.cap_limiter",
+    "loom.dispatch.cap_configured",
+    "loom.dispatch.cap_disk",
+    "loom.dispatch.cap_ram",
+    "loom.dispatch.pr_open_prefiltered",
     // ---- Telemetry mega PR A (Issues #8908, #8931) ----------------------
     // `loom.runtime.usage` (#8908): one execution's exact token breakdown.
     "loom.tokens.input",
@@ -214,6 +222,15 @@ pub enum MetricName {
     /// The dynamic concurrency cap the tick ran under.
     #[serde(rename = "loom.dispatch.max_concurrent")]
     DispatchMaxConcurrent,
+    /// The terms the tick's cap is the minimum of, labelled `kind`
+    /// (`configured`, `disk`, `ram`; #11858). A headroom term that was not
+    /// measured is not emitted.
+    #[serde(rename = "loom.dispatch.cap_term")]
+    DispatchCapTerm,
+    /// The subset of `loom.dispatch.decisions{reason=pr_open}` the open-PR
+    /// pre-filter skipped with no `dispatch()` attempt (#11858).
+    #[serde(rename = "loom.dispatch.pr_open_prefiltered")]
+    DispatchPrOpenPrefiltered,
     /// Age of the oldest waiting ready-queue row, labelled `state` (#8856).
     #[serde(rename = "loom.queue.oldest_wait")]
     QueueOldestWait,
@@ -263,6 +280,11 @@ pub enum MetricName {
     /// backlog.
     #[serde(rename = "loom.queue.listing_incomplete_repos")]
     QueueListingIncompleteRepos,
+    /// `already_landed` rows on the last tick by evidence, labelled `reason`
+    /// (`forge_closed`, `forge_closed_not_planned`, `journal_landed`,
+    /// `unknown`; #11858).
+    #[serde(rename = "loom.queue.already_landed")]
+    QueueAlreadyLanded,
     // ---- Quota burn and pool state (Issue #8857) ------------------------
     /// Uncached input tokens consumed since the previous sample.
     #[serde(rename = "loom.llm.tokens.input")]
@@ -479,6 +501,8 @@ impl MetricName {
             Self::DispatchDecisions => "loom.dispatch.decisions",
             Self::DispatchCandidates => "loom.dispatch.candidates",
             Self::DispatchMaxConcurrent => "loom.dispatch.max_concurrent",
+            Self::DispatchCapTerm => "loom.dispatch.cap_term",
+            Self::DispatchPrOpenPrefiltered => "loom.dispatch.pr_open_prefiltered",
             Self::QueueOldestWait => "loom.queue.oldest_wait",
             Self::QueueStarved => "loom.queue.starved",
             Self::QueueStarvedByReason => "loom.queue.starved.by_reason",
@@ -493,6 +517,7 @@ impl MetricName {
             Self::QueueIssues => "loom.queue.issues",
             Self::QueueListingFailedRepos => "loom.queue.listing_failed_repos",
             Self::QueueListingIncompleteRepos => "loom.queue.listing_incomplete_repos",
+            Self::QueueAlreadyLanded => "loom.queue.already_landed",
             Self::LlmTokensInput => "loom.llm.tokens.input",
             Self::LlmTokensOutput => "loom.llm.tokens.output",
             Self::LlmTokensCacheRead => "loom.llm.tokens.cache_read",
@@ -550,6 +575,7 @@ impl MetricName {
     pub fn kind(self) -> MetricKind {
         match self {
             Self::DispatchDecisions
+            | Self::DispatchPrOpenPrefiltered
             | Self::LlmTokensInput
             | Self::LlmTokensOutput
             | Self::LlmTokensCacheRead
@@ -593,8 +619,10 @@ impl MetricName {
             | Self::QueueStarved
             | Self::QueueStarvedByReason
             | Self::QueueDispatchWaitSamples => "{issue}",
-            Self::DispatchMaxConcurrent => "{sweep}",
-            Self::QueueIssues => "{issue}",
+            Self::DispatchMaxConcurrent | Self::DispatchCapTerm => "{sweep}",
+            Self::QueueIssues | Self::QueueAlreadyLanded | Self::DispatchPrOpenPrefiltered => {
+                "{issue}"
+            }
             Self::QueueListingFailedRepos | Self::QueueListingIncompleteRepos => "{repository}",
             Self::LlmTokensInput
             | Self::LlmTokensOutput
@@ -647,6 +675,10 @@ impl MetricName {
             Self::DispatchDecisions => "Work-finder candidate outcomes per tick, by reason.",
             Self::DispatchCandidates => "Ready candidates seen by one work-finder tick.",
             Self::DispatchMaxConcurrent => "Dynamic concurrency cap for the work-finder tick.",
+            Self::DispatchCapTerm => "The configured, disk and RAM terms of the tick's cap.",
+            Self::DispatchPrOpenPrefiltered => {
+                "Open-PR skips the pre-filter made with no dispatch attempt."
+            }
             Self::QueueOldestWait => "Age of the oldest waiting ready-queue issue, by state.",
             Self::QueueStarved => "Waiting ready-queue issues past the starvation threshold.",
             Self::QueueStarvedByReason => "Starved ready-queue issues by queue disposition.",
@@ -663,6 +695,7 @@ impl MetricName {
             Self::QueueListingIncompleteRepos => {
                 "Repos whose ready-issue listing came back partial last tick."
             }
+            Self::QueueAlreadyLanded => "Already-landed ready issues last tick, by evidence.",
             Self::LlmTokensInput => "Uncached input tokens consumed, by provider and model.",
             Self::LlmTokensOutput => "Output tokens produced, by provider and model.",
             Self::LlmTokensCacheRead => "Cache-read input tokens, by provider and model.",

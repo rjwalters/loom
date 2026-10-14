@@ -655,7 +655,9 @@ fn queue_points_emit_every_disposition_with_zeros_and_no_issue_label() {
     summary.listing_failed = vec!["/r2".into()];
     summary.listing_incomplete = vec!["/r3".into(), "/r4".into()];
     let points = super::queue::queue_points(&summary);
-    assert_eq!(points.len(), Qd::ALL.len() + 2);
+    // + listing_failed, listing_incomplete and the four already_landed
+    // evidence points (#11858).
+    assert_eq!(points.len(), Qd::ALL.len() + 2 + 4);
     let value = |reason: &str| {
         points
             .iter()
@@ -690,6 +692,38 @@ fn queue_points_emit_every_disposition_with_zeros_and_no_issue_label() {
         assert_eq!(bounded_labels(&point.labels), point.labels);
         assert!(point.labels.keys().all(|k| k == "state" || k == "reason"));
     }
+}
+
+/// #11858: `already_landed` rows split by the landed guard's evidence, with
+/// a row naming none read as `unknown` and free text never a label.
+#[test]
+fn queue_points_split_already_landed_by_evidence() {
+    use crate::types::QueueDisposition as Qd;
+    let mut summary = queue_summary(&[Qd::AlreadyLanded; 4]);
+    let details = [
+        Some("forge_closed"),
+        Some("journal_landed"),
+        Some("journal_landed"),
+        Some("free text"),
+    ];
+    for (row, detail) in summary.queue.iter_mut().zip(details) {
+        row.detail = detail.map(str::to_string);
+    }
+    let points = super::queue::queue_points(&summary);
+    let landed = |reason: &str| {
+        points
+            .iter()
+            .find(|p| {
+                p.name == MetricName::QueueAlreadyLanded
+                    && p.labels.get("reason").map(String::as_str) == Some(reason)
+            })
+            .map(|p| p.value)
+    };
+    assert_eq!(landed("forge_closed"), Some(MetricValue::Int(1)));
+    assert_eq!(landed("journal_landed"), Some(MetricValue::Int(2)));
+    assert_eq!(landed("forge_closed_not_planned"), Some(MetricValue::Int(0)));
+    assert_eq!(landed("unknown"), Some(MetricValue::Int(1)));
+    assert_eq!(landed("free text"), None);
 }
 
 #[test]

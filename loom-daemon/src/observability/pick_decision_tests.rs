@@ -181,6 +181,22 @@ fn a_halted_skip_carries_only_a_closed_vocabulary_cause() {
         && k.disposition == Some(QueueDisposition::WorkspaceHalted)));
 }
 
+/// #11858: an already-landed skip names its evidence, closed vocabulary only.
+#[test]
+fn an_already_landed_skip_carries_only_its_evidence_token() {
+    let mut s = summary(vec![
+        (1, QueueDisposition::AlreadyLanded),
+        (2, QueueDisposition::AlreadyLanded),
+        (3, QueueDisposition::AlreadyLanded),
+    ]);
+    s.queue[0].detail = Some("journal_landed".to_string());
+    s.queue[1].detail = Some("forge_closed".to_string());
+    s.queue[2].detail = Some("landed by a free-text reason".to_string());
+    let r = work_finder_record(&s, "host-a", at(), at(), resolve);
+    let details: Vec<Option<&str>> = r.skipped.iter().map(|k| k.detail.as_deref()).collect();
+    assert_eq!(details, vec![Some("journal_landed"), Some("forge_closed"), None]);
+}
+
 /// Role ticks have no work-finder disposition: the fields stay absent.
 #[test]
 fn a_role_skip_carries_no_disposition() {
@@ -267,6 +283,8 @@ fn an_empty_role_tick_records_cadence_with_no_candidates() {
     assert_eq!(r.role, "curator");
     assert_eq!(r.candidate_source, "none", "nothing observed");
     assert!(!r.decisions_observed);
+    // #11858: an empty queue still names its repo.
+    assert_eq!(r.repo.as_deref(), Some("o/r"));
 }
 
 fn gate_only(gate: Vec<(String, Vec<GateRow>)>) -> RoleObservation {

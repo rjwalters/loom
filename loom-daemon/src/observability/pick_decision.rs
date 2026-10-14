@@ -147,11 +147,17 @@ fn repo_label(root: &Path) -> String {
 }
 
 fn emit(record: PickDecisionRecord) {
+    emit_in(record, None);
+}
+
+/// [`emit`] joined to a role tick's trace (#11858), so every chunk's log
+/// record carries the tick's trace id.
+fn emit_in(record: PickDecisionRecord, context: Option<&crate::telemetry::trace::TraceContext>) {
     if let Some(sink) = super::ops::global_ops_sink() {
         // A record over the byte budget is split, never truncated (#11567):
         // the chunks share `tick_id` and their union is the original.
         for chunk in split_into_chunks(record, CHUNK_BYTES) {
-            sink.emit_record(TelemetryRecord::PickDecision(chunk));
+            sink.emit_record_in(TelemetryRecord::PickDecision(chunk), context.cloned());
         }
     }
 }
@@ -175,7 +181,8 @@ fn exporting() -> bool {
 /// The part of a ready-queue row's `detail` a record may carry: a
 /// file-overlap deferral's shared paths (#9781, daemon-templated from parsed
 /// paths) and a halted row's cause token, only when it is in the closed
-/// [`HaltCause`] vocabulary (#11811). Every other detail (e.g. free-form
+/// [`HaltCause`] vocabulary (#11811), and an `already_landed` row's
+/// evidence token (#11858). Every other detail (e.g. free-form
 /// dispatch-error text) is dropped.
 fn exportable_detail(disposition: QueueDisposition, detail: Option<&str>) -> Option<String> {
     let detail = detail?;
@@ -184,6 +191,11 @@ fn exportable_detail(disposition: QueueDisposition, detail: Option<&str>) -> Opt
         QueueDisposition::WorkspaceHalted => {
             HaltCause::from_wire(detail).map(|c| c.as_str().to_string())
         }
+        // #11858: an already-landed row's evidence, closed vocabulary only.
+        QueueDisposition::AlreadyLanded => super::ops::queue::LANDED_EVIDENCE
+            .iter()
+            .find(|e| **e == detail)
+            .map(|e| (*e).to_string()),
         _ => None,
     }
 }
@@ -513,6 +525,8 @@ pub fn role_record(
         .collect();
     let mut record =
         PickDecisionRecord::build(tick, ranked).with_source(source, decisions_observed);
+    // #11858: the record names its repo even when no candidate does.
+    record.repo = Some(repo.to_string());
     record.raise_candidates_total(total);
     record.add_actions(acts.into_iter().map(|(number, action)| PickAction {
         repo: repo.to_string(),
@@ -523,13 +537,15 @@ pub fn role_record(
 }
 
 /// Emit one role tick's decision. Always drains this thread's stashed
-/// listings; builds and emits only with an OTLP exporter running.
+/// listings; builds and emits only with an OTLP exporter running. `trace` is
+/// the tick's root span when it launched: it names the tick and (#11858) the
+/// record joins its trace.
 pub fn emit_role_tick(
     root: &Path,
     role: &str,
     started_at: DateTime<Utc>,
     outcome: &RoleTickOutcome,
-    tick_id: Option<String>,
+    trace: Option<&super::lifecycle::RoleTrace>,
 ) {
     let gate = take_gate_listings(root);
     let journal = super::pick_journal::take(root);
@@ -541,7 +557,10 @@ pub fn emit_role_tick(
     let tick = PickTick {
         role: role.to_string(),
         host: crate::sweep_registry::host_identity(),
-        tick_id: tick_id.unwrap_or_else(|| super::lifecycle::role_execution_id(role, started_at)),
+        tick_id: trace.map_or_else(
+            || super::lifecycle::role_execution_id(role, started_at),
+            |t| t.execution.clone(),
+        ),
         started_at,
         ended_at: Utc::now(),
         outcome: crate::role_tick_telemetry::result_label(result),
@@ -560,7 +579,7 @@ pub fn emit_role_tick(
     let observed = RoleObservation { journal, gate };
     let mut record = role_record(tick, result, observed, &repo_label(root), holds);
     record.lanes = lane_plan;
-    emit(record);
+    emit_in(record, trace.map(|t| &t.context));
 }
 
 #[cfg(test)]
