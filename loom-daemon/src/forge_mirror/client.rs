@@ -75,7 +75,7 @@ pub enum Freshness {
     /// The mirror cannot vouch for the repo at all: never heard of it, it
     /// moved or was deleted, it has never completed a reconcile (its holdings
     /// may be only what webhooks happened to name), or the answer names a
-    /// different repo.
+    /// different repo (or names none).
     Unknown,
 }
 
@@ -98,7 +98,7 @@ impl Watermark {
     #[must_use]
     pub fn freshness(&self, repo: &str, bound: Duration, now: DateTime<Utc>) -> Freshness {
         let named = self.repo.as_deref().map(str::to_ascii_lowercase);
-        if !self.known || self.gone.is_some() || named.as_deref().is_some_and(|r| r != repo) {
+        if !self.known || self.gone.is_some() || named.as_deref() != Some(repo) {
             return Freshness::Unknown;
         }
         let Some(reconciled) = parse_time(self.last_reconciled_at.as_deref()) else {
@@ -319,10 +319,12 @@ pub fn decode<T: serde::de::DeserializeOwned>(value: Value) -> Result<T, MirrorE
 // The blocking bridge
 // ---------------------------------------------------------------------------
 
-/// The discovery listings run synchronously (inside the work finder's tick
-/// and the stage sampler's blocking task). Their requests run on this small
-/// runtime of their own, so a call is safe from any thread, inside a tokio
-/// runtime or not, and its client's connections live as long as the process.
+/// The discovery listings run synchronously, and some of their callers are
+/// async tasks (the work finder calls its source from its own task). Their
+/// requests run on this small runtime of their own, which is only ever
+/// *built* and spawned onto, never entered with `block_on`, so first use is
+/// safe from any thread, inside a tokio runtime or not; it is never dropped,
+/// and its client's connections live as long as the process.
 fn runtime() -> Option<&'static (tokio::runtime::Runtime, reqwest::Client)> {
     static RT: OnceLock<Option<(tokio::runtime::Runtime, reqwest::Client)>> = OnceLock::new();
     RT.get_or_init(|| {
@@ -333,13 +335,27 @@ fn runtime() -> Option<&'static (tokio::runtime::Runtime, reqwest::Client)> {
             .build()
             .map_err(|e| log::warn!("forge_mirror: no runtime for discovery reads ({e})"))
             .ok()?;
-        let http = rt
-            .block_on(async { build_http() })
+        // Building a reqwest client needs no runtime.
+        let http = build_http()
             .map_err(|e| log::warn!("forge_mirror: {e}"))
             .ok()?;
         Some((rt, http))
     })
     .as_ref()
+}
+
+/// Wait for `rx`, telling a multi-thread tokio runtime the current worker is
+/// about to block (so its other tasks move off it). A current-thread runtime
+/// cannot hand its only worker over; there the wait simply blocks, bounded by
+/// `deadline`, like the `gh` subprocesses the same callers already run.
+fn wait<T>(rx: &std::sync::mpsc::Receiver<T>, deadline: Duration) -> Option<T> {
+    let multi = tokio::runtime::Handle::try_current()
+        .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
+    if multi {
+        tokio::task::block_in_place(|| rx.recv_timeout(deadline).ok())
+    } else {
+        rx.recv_timeout(deadline).ok()
+    }
 }
 
 /// [`get_json`] from synchronous code, bounded by `deadline` whatever the
@@ -363,6 +379,5 @@ pub fn get_json_blocking(
     rt.spawn(async move {
         let _ = tx.send(get_json(&http, &active, &path, &query).await);
     });
-    rx.recv_timeout(deadline)
-        .unwrap_or_else(|_| Err(MirrorError::Transport("deadline".into())))
+    wait(&rx, deadline).unwrap_or_else(|| Err(MirrorError::Transport("deadline".into())))
 }

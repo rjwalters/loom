@@ -395,6 +395,9 @@ for two things, both off unless configured.
   `AWS_DEFAULT_REGION`) or `file:<path>`, as for `forge.gateway`
   ([`github-authentication.md`](github-authentication.md)). The key is held
   in memory and sent only as `Authorization: Bearer`.
+- **`awsProfile`** (optional): as for `forge.gateway`. Unset, an `ssm://`
+  read runs as the host's instance role; set, it names a profile in the
+  default `~/.aws` files; invalid, `ssm://` reads are refused.
 - **`maxStalenessSecs`** (default 600, clamped to 30-900): the discovery
   bound. 900 is this ADR's hard staleness cap.
 - **`changePollSecs`** (default 30, clamped to 10-300): the change-stream

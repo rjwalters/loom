@@ -200,7 +200,7 @@ fn break_glass_unset_is_todays_path() {
     let mut r = Refresher::default();
     let t0 = Instant::now();
     let reads = std::cell::Cell::new(0);
-    let read_key = |_: &KeyRef, _: Option<&str>| {
+    let read_key = |_: &KeyRef, _: &crate::aws_ssm::AwsAccess<'_>| {
         reads.set(reads.get() + 1);
         Ok("2ge_0123456789abcdef0123456789abcdef".to_string())
     };
@@ -231,7 +231,9 @@ fn break_glass_unset_is_todays_path() {
     assert!(super::active().is_none());
 
     // A key that cannot be read leaves nothing live.
-    let fail = |_: &KeyRef, _: Option<&str>| Err::<String, String>("no such file".into());
+    let fail = |_: &KeyRef, _: &crate::aws_ssm::AwsAccess<'_>| {
+        Err::<String, String>("no such file".into())
+    };
     assert!(matches!(r.pass_with(&on, t0, &fail), PassOutcome::KeyFailed(_)));
     assert!(!is_active());
     set_active(None);
@@ -460,6 +462,25 @@ fn only_the_discovery_listings_name_the_mirror() {
         users, expected,
         "a new forge_mirror user needs review against poll_gate invariant 3"
     );
+    // The call sites themselves, counted: one discovery listing each, behind
+    // one helper each (definition + its callers).
+    let count = |rel: &str, needle: &str| {
+        std::fs::read_to_string(src.join(rel))
+            .unwrap()
+            .matches(needle)
+            .count()
+    };
+    assert_eq!(count("work_finder/forge.rs", "mirror_rows("), 3, "the helper and its 2 callers");
+    assert_eq!(count("work_finder/forge.rs", "list_open("), 1);
+    assert_eq!(count("work_finder/forge.rs", "poll_gate::ReadKind::Discovery,"), 1);
+    assert_eq!(count("work_finder/forge.rs", "Caller::"), 1);
+    assert_eq!(
+        count("observability/ops/stage_dwell.rs", "mirror_listing("),
+        2,
+        "the helper and its caller"
+    );
+    assert_eq!(count("observability/ops/stage_dwell.rs", "poll_gate::ReadKind::Discovery,"), 1);
+    assert_eq!(count("observability/ops/stage_dwell.rs", "Caller::"), 1);
     // And of those, only the two listings call the listing.
     for rel in &users {
         let text = std::fs::read_to_string(src.join(rel)).unwrap();
@@ -712,13 +733,15 @@ async fn a_pass_baselines_new_repos_then_reads_and_publishes_changes() {
     let repos = vec![REPO.to_string()];
     let mut cursors = Cursors::new(&a.base_url);
 
-    let first = wake::pass(&http, &a, &repos, &mut cursors).await.unwrap();
+    let (first, r) = wake::pass(&http, &a, &repos, &mut cursors).await;
+    r.unwrap();
     assert!(!first.prompts(), "a baseline never prompts");
     assert_eq!(cursors.repos[REPO], 10);
 
     let bus = crate::event_bus::EventBus::new();
     let mut sub = bus.subscribe([crate::forge_events::BUS_TOPIC]);
-    let second = wake::pass(&http, &a, &repos, &mut cursors).await.unwrap();
+    let (second, r) = wake::pass(&http, &a, &repos, &mut cursors).await;
+    r.unwrap();
     assert_eq!(cursors.repos[REPO], 11);
     assert!(second.prompts());
     wake::publish(&bus, &second);
@@ -731,4 +754,208 @@ async fn a_pass_baselines_new_repos_then_reads_and_publishes_changes() {
     let seen = seen.lock().unwrap().clone();
     assert!(seen[0].0.contains("after=0") && seen[0].0.contains("limit=1"), "{}", seen[0].0);
     assert!(seen[1].0.contains("after=acme%2Fwidgets%3A10"), "{}", seen[1].0);
+}
+
+// ---------------------------------------------------------------- review fixes
+
+fn live_mark() -> Value {
+    let now = Utc::now();
+    let iso = |t: DateTime<Utc>| t.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    json!({
+        "repo": REPO, "known": true,
+        "last_event_at": iso(now - chrono::Duration::seconds(30)),
+        "last_reconciled_at": iso(now - chrono::Duration::hours(1)),
+        "latest_seq": 7, "served_at": iso(now), "archived": false, "gone": null
+    })
+}
+
+/// The first mirror read happens inside the work finder's async task. It must
+/// neither panic ("Cannot start a runtime from within a runtime") nor need a
+/// blocking-pool hop, on either runtime flavour.
+fn listing_from_inside_a_runtime() {
+    let body = page(vec![item(4, &["loom:issue"], "issue")], None, live_mark()).to_string();
+    let (addr, _) = serve(vec![(200, body)]);
+    set_active(Some(Arc::new(Active::for_test(&format!("http://{addr}"), BOUND))));
+    let rows = list_open(
+        ReadKind::Discovery,
+        Caller::WorkFinder,
+        None,
+        Some(REPO),
+        "loom:issue",
+        Pages::All,
+    );
+    set_active(None);
+    assert_eq!(rows.expect("served from the mirror")[0].number, 4);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_mirror_read_from_a_spawned_task_on_a_multi_thread_runtime_works() {
+    tokio::spawn(async { listing_from_inside_a_runtime() })
+        .await
+        .unwrap();
+    // And the bare blocking call, from a task too.
+    let (addr, _) = serve(vec![(200, "{\"ok\":1}".into())]);
+    let a = Active::for_test(&format!("http://{addr}"), BOUND);
+    let v = tokio::spawn(async move {
+        client::get_json_blocking(&a, "/v1/mirror/watermark", &[], Duration::from_secs(5))
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(v["ok"], 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn a_mirror_read_from_a_current_thread_runtime_works() {
+    listing_from_inside_a_runtime();
+}
+
+#[test]
+fn a_watermark_that_names_no_repo_is_unknown() {
+    let mut w = mark(
+        Some("2026-10-13T11:58:00Z"),
+        Some("2026-10-13T09:00:00Z"),
+        "2026-10-13T12:00:00Z",
+    );
+    w.repo = None;
+    assert_eq!(w.freshness(REPO, BOUND, now()), Freshness::Unknown);
+}
+
+#[test]
+fn labels_match_case_insensitively() {
+    let mut f = canned(vec![Ok(page(
+        vec![item(8, &["Loom:Issue"], "issue")],
+        None,
+        fresh_mark(),
+    ))]);
+    let rows = run(&mut f, Pages::All).0.unwrap();
+    assert_eq!(rows.iter().map(|r| r.number).collect::<Vec<_>>(), [8]);
+}
+
+#[test]
+#[serial]
+fn a_key_that_cannot_be_read_backs_off_exponentially_to_fifteen_minutes() {
+    assert_eq!(key_retry_delay(1), Duration::from_secs(60));
+    assert_eq!(key_retry_delay(2), Duration::from_secs(120));
+    assert_eq!(key_retry_delay(4), Duration::from_secs(480));
+    assert_eq!(key_retry_delay(5), KEY_RETRY_CAP);
+    assert_eq!(key_retry_delay(40), KEY_RETRY_CAP);
+
+    set_active(None);
+    let on = cfg(json!({"origin": "events.example.com", "keyRef": "file:/k"}));
+    let reads = std::cell::Cell::new(0);
+    let fail = |_: &KeyRef, _: &crate::aws_ssm::AwsAccess<'_>| {
+        reads.set(reads.get() + 1);
+        Err::<String, String>("no such file".into())
+    };
+    let mut r = Refresher::default();
+    let t0 = Instant::now();
+    assert!(matches!(r.pass_with(&on, t0, &fail), PassOutcome::KeyFailed(_)));
+    // Every-minute refreshes inside the backoff read nothing.
+    assert_eq!(r.pass_with(&on, t0 + Duration::from_secs(59), &fail), PassOutcome::Unchanged);
+    assert_eq!(reads.get(), 1);
+    assert!(matches!(
+        r.pass_with(&on, t0 + Duration::from_secs(60), &fail),
+        PassOutcome::KeyFailed(_)
+    ));
+    assert_eq!(r.pass_with(&on, t0 + Duration::from_secs(179), &fail), PassOutcome::Unchanged);
+    assert_eq!(reads.get(), 2);
+    // A config change retries at once.
+    let other = cfg(json!({"origin": "events.example.com", "keyRef": "file:/k2"}));
+    assert!(matches!(
+        r.pass_with(&other, t0 + Duration::from_secs(61), &fail),
+        PassOutcome::KeyFailed(_)
+    ));
+    assert_eq!(reads.get(), 3);
+    // An ssm:// ref with no region names this block, and reads nothing.
+    let ssm = cfg(json!({"origin": "events.example.com", "keyRef": "ssm:///k"}));
+    let old = (std::env::var_os("AWS_REGION"), std::env::var_os("AWS_DEFAULT_REGION"));
+    std::env::remove_var("AWS_REGION");
+    std::env::remove_var("AWS_DEFAULT_REGION");
+    let real = |k: &KeyRef, a: &crate::aws_ssm::AwsAccess<'_>| k.read(a, CONFIG_KEY);
+    let PassOutcome::KeyFailed(why) = r.pass_with(&ssm, t0, &real) else {
+        panic!("no region")
+    };
+    if let Some(v) = old.0 {
+        std::env::set_var("AWS_REGION", v)
+    }
+    if let Some(v) = old.1 {
+        std::env::set_var("AWS_DEFAULT_REGION", v)
+    }
+    assert!(why.contains("forge.mirror.region") && !why.contains("gateway"), "{why}");
+    assert_eq!(reads.get(), 3);
+    set_active(None);
+}
+
+#[test]
+fn a_missed_changes_prompt_wakes_every_consumer() {
+    use crate::forge_events::wake::{
+        payload_qualifies, CLAIM_RECONCILE_EVENT_TYPES, IN_FLIGHT_PR_EVENT_TYPES,
+        WORK_FINDER_EVENT_TYPES,
+    };
+    let mut cursors = Cursors::new("https://m");
+    cursors.repos.insert(REPO.into(), 50);
+    let mut nudge = Nudge::default();
+    wake::apply(
+        &mut cursors,
+        &[REPO.to_string()],
+        &changes_page(json!([]), json!({ REPO: rc(60, 100, true) }), false),
+        now(),
+        &mut nudge,
+    );
+    assert!(nudge.missed && nudge.count == 0);
+    let payload = nudge.payload();
+    for wanted in [
+        WORK_FINDER_EVENT_TYPES,
+        CLAIM_RECONCILE_EVENT_TYPES,
+        IN_FLIGHT_PR_EVENT_TYPES,
+    ] {
+        assert!(payload_qualifies(&payload, wanted), "{wanted:?}: {payload}");
+    }
+}
+
+#[test]
+fn a_repo_the_mirror_does_not_know_is_not_baselined() {
+    let mut cursors = Cursors::new("https://m");
+    let unknown =
+        json!({ "next_after": 0, "watermark": { "repo": REPO, "known": false, "latest_seq": 0 } });
+    wake::baseline(&mut cursors, &changes_page(json!([]), json!({ REPO: unknown }), false));
+    assert!(cursors.repos.is_empty(), "baselined again once the mirror knows it");
+}
+
+#[tokio::test]
+async fn a_pass_that_fails_part_way_still_returns_what_it_read() {
+    let first = json!({
+        "changes": [{"seq": 11, "repo": REPO, "kind": "issue", "number": 3, "at": "2026-10-13T11:59:00Z"}],
+        "cursor": "", "more": true, "repos": { REPO: rc(11, 12, false) }
+    })
+    .to_string();
+    let (addr, _) = serve(vec![(200, first), (500, "{}".into())]);
+    let a = Active::for_test(&format!("http://{addr}"), BOUND);
+    let http = client::build_http().unwrap();
+    let mut cursors = Cursors::new(&a.base_url);
+    cursors.repos.insert(REPO.into(), 10);
+    let (nudge, result) = wake::pass(&http, &a, &[REPO.to_string()], &mut cursors).await;
+    assert_eq!(result, Err(MirrorError::Status(500)));
+    assert_eq!(cursors.repos[REPO], 11, "the cursor moved past the change read");
+    assert!(nudge.prompts(), "so that change must still be published");
+}
+
+#[test]
+fn the_mirror_reads_aws_profile_like_the_gateway() {
+    let (c, w) = parse(&cfg(
+        json!({"origin": "events.example.com", "keyRef": "ssm:///k", "awsProfile": "relay-reader"}),
+    ));
+    assert!(w.is_empty());
+    assert_eq!(c.unwrap().aws_profile, crate::aws_ssm::AwsProfile::Named("relay-reader".into()));
+    let (c, w) = parse(&cfg(
+        json!({"origin": "events.example.com", "keyRef": "ssm:///k", "awsProfile": "-x"}),
+    ));
+    assert_eq!(c.unwrap().aws_profile, crate::aws_ssm::AwsProfile::Invalid);
+    assert!(w[0].contains("forge.mirror.awsProfile"), "{w:?}");
+    // The mirror's refusals name the mirror.
+    let (_, w) = parse(&cfg(json!({"origin": "github.com", "keyRef": "file:/k"})));
+    assert!(w[0].contains("the mirror, not GitHub"), "{w:?}");
 }

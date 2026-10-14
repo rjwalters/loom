@@ -306,7 +306,10 @@ fn rows_of(items: Vec<client::MirrorItem>, label: &str, pages: Pages) -> Vec<Res
     let mut rows: Vec<RestIssue> = items
         .iter()
         .filter_map(client::MirrorItem::to_rest)
-        .filter(|r| r.state.eq_ignore_ascii_case("open") && r.labels.iter().any(|l| l == label))
+        .filter(|r| {
+            r.state.eq_ignore_ascii_case("open")
+                && r.labels.iter().any(|l| l.eq_ignore_ascii_case(label))
+        })
         .collect();
     rows.sort_by_key(|r| std::cmp::Reverse(r.number));
     rows.dedup_by_key(|r| r.number);

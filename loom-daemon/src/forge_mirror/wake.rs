@@ -55,6 +55,10 @@ pub const CHANGE_LIMIT: u32 = 200;
 /// Most follow-up pages one chunk reads per pass; the rest wait one cadence.
 pub const MAX_PAGES_PER_PASS: usize = 5;
 
+/// The types a missed-changes prompt carries: every kind the change stream
+/// reports, so each armed consumer re-reads.
+pub const MISSED_TYPES: [&str; 3] = ["issues", "pull_request", "check_run"];
+
 /// The persisted cursors: one `seq` per repo, for one mirror origin.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cursors {
@@ -159,9 +163,14 @@ impl Nudge {
     }
 }
 
-/// Set every repo `page` names to its latest change, without a prompt.
+/// Set every repo `page` names, and the mirror knows, to its latest change,
+/// without a prompt. A repo the mirror has not heard of keeps no cursor, so
+/// it is baselined again once the mirror knows it.
 pub fn baseline(cursors: &mut Cursors, page: &ChangesPage) {
     for (repo, rc) in &page.repos {
+        if !rc.watermark.known {
+            continue;
+        }
         cursors
             .repos
             .insert(repo.to_ascii_lowercase(), rc.watermark.latest_seq);
@@ -209,6 +218,8 @@ pub fn apply(
             // Missed changes, or the log restarted: re-read once, from now on.
             cursors.repos.insert(repo.clone(), latest);
             nudge.missed = true;
+            // Anything may have changed: wake every consumer's loop.
+            nudge.types.extend(MISSED_TYPES);
             nudge.repos.insert(repo);
             continue;
         }
@@ -252,16 +263,27 @@ async fn changes(
 /// One pull of the change stream for `repos`: baseline the repos with no
 /// cursor, then read every other repo's new changes (bounded pages).
 ///
-/// # Errors
-///
-/// The first failed request; cursors already advanced stay advanced.
+/// Returns what was learned *and* the first failed request, if any: the pass
+/// stops at a failure, but cursors already advanced stay advanced, so the
+/// changes read before it are in the nudge and must still be published.
 pub async fn pass(
     http: &reqwest::Client,
     active: &Active,
     repos: &[String],
     cursors: &mut Cursors,
-) -> Result<Nudge, MirrorError> {
+) -> (Nudge, Result<(), MirrorError>) {
     let mut nudge = Nudge::default();
+    let result = pass_into(http, active, repos, cursors, &mut nudge).await;
+    (nudge, result)
+}
+
+async fn pass_into(
+    http: &reqwest::Client,
+    active: &Active,
+    repos: &[String],
+    cursors: &mut Cursors,
+    nudge: &mut Nudge,
+) -> Result<(), MirrorError> {
     let (known, new): (Vec<String>, Vec<String>) = repos
         .iter()
         .cloned()
@@ -273,13 +295,13 @@ pub async fn pass(
     for chunk in known.chunks(MAX_REPOS_PER_REQUEST) {
         for _ in 0..MAX_PAGES_PER_PASS {
             let page = changes(http, active, chunk, after_of(cursors, chunk), CHANGE_LIMIT).await?;
-            apply(cursors, chunk, &page, Utc::now(), &mut nudge);
+            apply(cursors, chunk, &page, Utc::now(), nudge);
             if !page.more {
                 break;
             }
         }
     }
-    Ok(nudge)
+    Ok(())
 }
 
 /// Publish a pass's prompt and invalidate the poll gate's holds for the repos
@@ -338,11 +360,15 @@ pub fn spawn(
     tokio::spawn(async move {
         let mut refresher = Refresher::default();
         let mut refreshed: Option<Instant> = None;
+        let mut pulled: Option<Instant> = None;
         let mut http: Option<reqwest::Client> = None;
         let mut cursors: Option<Cursors> = None;
         let mut last_error: Option<String> = None;
         let path = default_cursor_path();
         loop {
+            // The config is re-read every CHECK_INTERVAL whatever the pull
+            // cadence, so unsetting forge.mirror takes effect within a minute
+            // for discovery and wakes alike.
             if refreshed.is_none_or(|t| t.elapsed() >= CHECK_INTERVAL) {
                 let ws = workspace_root.clone();
                 refresher = tokio::task::spawn_blocking(move || {
@@ -355,9 +381,16 @@ pub fn spawn(
             }
             let Some(active) = super::active() else {
                 cursors = None;
+                pulled = None;
                 tokio::time::sleep(CHECK_INTERVAL).await;
                 continue;
             };
+            let tick = active.change_poll.min(CHECK_INTERVAL);
+            if pulled.is_some_and(|t| t.elapsed() < active.change_poll) {
+                tokio::time::sleep(tick).await;
+                continue;
+            }
+            pulled = Some(Instant::now());
             if http.is_none() {
                 http = client::build_http()
                     .map_err(|e| log::warn!("forge_mirror: {e}; no wakes"))
@@ -377,11 +410,12 @@ pub fn spawn(
                 .unwrap_or_default();
             c.repos.retain(|r, _| repos.contains(r));
             let before = c.clone();
-            match pass(h, &active, &repos, c).await {
-                Ok(nudge) => {
-                    last_error = None;
-                    publish(&bus, &nudge);
-                }
+            let (nudge, result) = pass(h, &active, &repos, c).await;
+            // Publish what was read even when a later request failed: the
+            // cursors already moved past those changes.
+            publish(&bus, &nudge);
+            match result {
+                Ok(()) => last_error = None,
                 Err(e) => {
                     let class = e.to_string();
                     if last_error.as_deref() != Some(class.as_str()) {
@@ -394,13 +428,16 @@ pub fn spawn(
                 }
             }
             if *c != before {
-                if let Some(p) = path.as_deref() {
-                    if let Err(e) = save_cursors(p, c) {
+                if let Some(p) = path.clone() {
+                    let snapshot = c.clone();
+                    let saved =
+                        tokio::task::spawn_blocking(move || save_cursors(&p, &snapshot)).await;
+                    if let Ok(Err(e)) = saved {
                         log::debug!("forge_mirror: cursors not persisted ({e})");
                     }
                 }
             }
-            tokio::time::sleep(active.change_poll).await;
+            tokio::time::sleep(tick).await;
         }
     })
 }
