@@ -262,12 +262,6 @@ tick; check "" "$WRITES" "trust filter down + genuine release + re-date: deferre
 rm -f "$T/trust_down"
 tick; check "COMMENT:released:tree" "$WRITES" "trust filter back: the genuine release carries to B"
 
-echo "--- #11861: a bot removal (Champion's Doctor round-trip) is not a release ---"
-reset "$A"
-tick; unlabel Bot "$BOT"
-tick; check "LABEL+:loom:blocked" "$WRITES" "label lifted by a bot: the hold stands and the label is restored"
-check "present" "$(label)" "label back on after a bot removal"
-
 echo "--- a released critical-file FAIL is never merged by the tick; PASS closes the episode ---"
 reset "$A"; tick; operator_release; tick; push "$B"; tick; tick
 grep -c "MERGE" "$T/writes" >/dev/null; check 1 "$?" "no merge-pr.sh call from any released tick"

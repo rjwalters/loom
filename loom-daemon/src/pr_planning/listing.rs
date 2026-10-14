@@ -95,12 +95,64 @@ fn guard_admits(root: &Path, row: &Value) -> Result<bool> {
     }
 }
 
+/// Whether `row`'s labels are a Champion hold sent to Doctor (#11861).
+fn champion_hold_shape(row: &Value) -> bool {
+    let labels: Vec<String> = row["labels"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|l| l["name"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    crate::champion_hold::doctor_shape(&labels)
+}
+
+/// The trusted comment bodies on PR `number`, oldest first (#9548): every
+/// page of the REST comment listing, filtered by `policy`.
+fn trusted_comment_bodies(
+    root: &Path,
+    gh: &Path,
+    number: u64,
+    policy: &TrustPolicy,
+) -> Result<Vec<String>> {
+    let mut bodies = Vec::new();
+    for page in 1.. {
+        let value = read(
+            root,
+            gh,
+            ops::COMMENT_LIST,
+            &format!("issues/{number}/comments?per_page=100&page={page}"),
+        )?;
+        let batch = value
+            .as_array()
+            .context("comment listing must be an array")?;
+        bodies.extend(
+            policy
+                .filter(batch.clone())
+                .into_iter()
+                .filter_map(|c| c["body"].as_str().map(str::to_string)),
+        );
+        if batch.len() < 100 {
+            break;
+        }
+    }
+    Ok(bodies)
+}
+
 /// Listing and fallback guard failures are errors, never an empty queue.
 /// Fallback review only; no workflow labels or branch mutations occur here.
 pub fn fetch_queue(root: &Path, gh: &Path, role: PrRole) -> Result<Vec<Value>> {
     let mut rows = list_open(root, gh)?;
     if role == PrRole::Doctor {
+        let policy = TrustPolicy::for_root(root);
         for row in &mut rows {
+            if champion_hold_shape(row) {
+                let number = row["number"].as_u64().context("PR number missing")?;
+                let trusted = trusted_comment_bodies(root, gh, number, &policy)?;
+                row[super::CHAMPION_HOLD_FIELD] =
+                    Value::Bool(crate::champion_hold::standing_hold(&trusted).is_some());
+            }
             if has_label(row, "loom:pr")
                 && !has_label(row, "loom:changes-requested")
                 && !crate::work_finder::PARK_LABELS

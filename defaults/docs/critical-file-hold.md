@@ -47,11 +47,10 @@ hand-removed hold label, while the episode is open and the change the PR
 makes has not moved, *is* the release signal. Champion records it, stands down on
 the label, and says so once.
 
-Since #11861 Champion itself also lifts the label, for a Doctor round-trip on a
-stale held PR, so "an open episode + the label absent" no longer proves a human
-removed it: the tick reads the PR's events and counts only a human `unlabeled`
-event after the hold notice, as criterion #2's release (e) does (#7048,
-#11416). A bot removal restores the label.
+That inference is sound because Champion never removes the hold label while
+an episode is open: since #11861 the label is `loom:blocked` and it stays on
+through a Doctor round-trip too, so "an open episode + the label absent" can
+only mean a human removed it.
 
 ### Two other shapes that were rejected
 

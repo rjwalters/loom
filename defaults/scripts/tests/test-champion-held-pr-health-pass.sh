@@ -378,12 +378,10 @@ champion_pr_pass() {
                 state_add "label:loom:changes-requested" "$state"
                 echo "LABEL_REMOVE:loom:pr"
                 echo "LABEL_ADD:loom:changes-requested"
-                # #11861: the hold label is loom:blocked, a park Doctor's
-                # queue skips, so the held route lifts it for the round-trip
-                # (the marker and park record keep the hold on record).
+                # #11861: the hold label (loom:blocked) stays on; Doctor
+                # serves a changes-requested PR with a trusted hold marker.
                 if [ "$MERGE_BLOCKED_BY_HOLD" = true ]; then
-                    state_remove "label:loom:blocked" "$state"
-                    echo "LABEL_REMOVE:loom:blocked"
+                    echo "LABEL_KEEP:loom:blocked"
                 fi
                 # The hold marker is NEVER touched on this path.
             fi
@@ -612,8 +610,8 @@ assert_contains "$OUT" "LABEL_ADD:loom:changes-requested" \
     "the held+stale+hold-plus-feedback PR REACHES DOCTOR via loom:changes-requested (AC #3, unchanged by #6852)"
 assert_lacks "$OUT" "COMMENT:champion:held-stale-suspended" \
     "a hold-plus-feedback PR is never suspended — only a hold-ONLY PR is (#6852)"
-assert_eq "loom:changes-requested" "$(state_labels "$S")" \
-    "final labels: loom:changes-requested only (loom:pr gone, loom:blocked lifted for Doctor, #11861)"
+assert_eq "loom:blocked,loom:changes-requested" "$(state_labels "$S")" \
+    "final labels: loom:changes-requested + loom:blocked (loom:pr gone; the hold stays on, #11861)"
 TESTS_RUN=$((TESTS_RUN + 1))
 if state_has "marker:champion:merge-risk-hold" "$S"; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
@@ -733,16 +731,15 @@ echo
 
 # ---------------------------------------------------------------------
 echo "Test 5: loom:blocked — kept on the held route, still cleared on the unheld route (#5802)"
-# Held, hold-plus-feedback (#11861): the hold label is loom:blocked, a park
-# Doctor's queue skips, so the route lifts it; the marker keeps the hold on
-# record. ci=fail keeps this the routed variant (#6852) — see Test 1B for the
-# hold-only variant, where loom:blocked is kept because nothing is touched.
+# Held, hold-plus-feedback (#11861): loom:blocked stays on through the
+# round-trip (Doctor serves a trusted-marker Champion hold), so the PR is never
+# a plain approval while held. ci=fail keeps this the routed variant (#6852).
 S=$(state_new)
 state_add "marker:champion:merge-risk-hold" "$S"
 state_add "label:loom:blocked" "$S"
 OUT=$(champion_pr_pass "$S" true "" false MERGEABLE 30 fail)
-assert_contains "$OUT" "LABEL_REMOVE:loom:blocked" "held+stale+hold-plus-feedback lifts loom:blocked for Doctor (#11861)"
-assert_lacks "$(state_labels "$S")" "loom:blocked" "Doctor can reach the routed PR: no park label left on it"
+assert_contains "$OUT" "LABEL_KEEP:loom:blocked" "held+stale+hold-plus-feedback keeps loom:blocked (#11861)"
+assert_contains "$(state_labels "$S")" "loom:blocked" "loom:blocked survives in the final label set"
 rm -f "$S"
 
 # Unheld: #5802's original behavior, unchanged. Unheld routing never depended
@@ -768,7 +765,7 @@ assert_contains "$OUT" "HOLD:fresh" "the fresh hold blocks the merge"
 assert_contains "$OUT" "EVAL:criterion-5" "criterion #5 still runs behind a fresh hold"
 assert_contains "$OUT" "COMMENT:champion:held-pr-conflict-notice" "a freshly-held conflicting PR is surfaced too"
 assert_contains "$OUT" "LABEL_ADD:loom:changes-requested" "a freshly-held, hold-plus-feedback stale PR reaches Doctor too"
-assert_contains "$OUT" "LABEL_REMOVE:loom:blocked" "the fresh hold's loom:blocked is lifted on the route (#11861)"
+assert_contains "$OUT" "LABEL_KEEP:loom:blocked" "the fresh hold's loom:blocked is kept on the route (#11861)"
 TESTS_RUN=$((TESTS_RUN + 1))
 if state_has "marker:champion:merge-risk-hold" "$S"; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
@@ -1178,8 +1175,12 @@ assert_doc_contains "$CHAMPION_MD" \
     "the conflict notice uses the startswith idempotency guard (#5371), not a substring match"
 
 assert_doc_contains "$CHAMPION_MD" \
-    'Lifted loom:blocked on #$PR_NUMBER for the Doctor round-trip' \
-    "the stale route lifts loom:blocked when a hold is in force, keeping the hold on record (#11861)"
+    'PR keeps loom:blocked (#11861): Doctor works it by its trusted marker.' \
+    "the stale route keeps loom:blocked on a held PR (#11861)"
+
+assert_doc_lacks "$CHAMPION_MD" \
+    'Lifted loom:blocked on #' \
+    "the stale route never lifts the hold label (#11861 review)"
 
 assert_doc_contains "$CHAMPION_MD" \
     "**Never delete or edit the \`champion:merge-risk-hold\` comment here**" \

@@ -1283,8 +1283,8 @@ echo "--- Doc pins: the Champion prose actually calls the gate ---"
         "champion-issue-promo.md invokes the classifier"
     assert_doc_contains "$CHAMPION_PROMO_MD" "--check-defer" \
         "Step 4's escalation path runs the dependency-timing gate"
-    assert_doc_contains "$CHAMPION_PROMO_MD" "--check-defer --apply" \
-        "a DEFER parks the proposal on loom:blocked with park records (#11861)"
+    assert_doc_contains "$CHAMPION_PROMO_MD" "loom-daemon park-record apply --issue" \
+        "a DEFER blocks the proposal on loom:blocked with park records (#11860)"
     assert_doc_contains "$CHAMPION_PROMO_MD" "Pass 0: Self-Healing Un-Escalation Re-Scan (#5664) — retired (#11861)" \
         "Pass 0 is marked retired, not silently dropped"
     assert_doc_lacks "$CHAMPION_PROMO_MD" "--check-unescalate --apply" \

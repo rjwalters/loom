@@ -281,3 +281,25 @@ fn a_frozen_pr_is_in_no_role_queue() {
         assert_eq!(ids(&ordered_queue(rows, role, false, &policy())), vec![2], "{label}");
     }
 }
+
+/// #11861: a Champion hold sent to Doctor keeps `loom:blocked`; Doctor's queue
+/// serves it only when `fetch_queue` verified a standing trusted hold marker
+/// (`championHold`). The same labels without it (a Doctor-cycle-cap park) stay
+/// out, and no other role's queue serves it.
+#[test]
+fn doctor_serves_a_verified_champion_hold_and_nothing_else_parked() {
+    let mut verified = pr(1, "autonomous", &["loom:changes-requested", "loom:blocked"]);
+    verified[CHAMPION_HOLD_FIELD] = json!(true);
+    let capped = pr(2, "autonomous", &["loom:changes-requested", "loom:blocked"]);
+    let mut operator =
+        pr(3, "autonomous", &["loom:changes-requested", "loom:blocked", "loom:operator"]);
+    operator[CHAMPION_HOLD_FIELD] = json!(true);
+    let rows = vec![verified.clone(), capped, operator];
+    assert_eq!(ids(&ordered_queue(rows, PrRole::Doctor, true, &policy())), vec![1]);
+    for role in [PrRole::Judge, PrRole::Champion] {
+        assert!(
+            ordered_queue(vec![verified.clone()], role, true, &policy()).is_empty(),
+            "{role:?}"
+        );
+    }
+}

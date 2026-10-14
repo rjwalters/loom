@@ -118,6 +118,20 @@ fn champion_reads_hold(role: PrRole, park: &str) -> bool {
     role == PrRole::Champion && crate::work_finder::BLOCKED_HOLD_NAMES.contains(&park)
 }
 
+/// The row field `fetch_queue` sets on a Champion-held PR that Champion sent
+/// to Doctor: `loom:changes-requested` + `loom:blocked` with a standing
+/// trusted hold marker (`crate::champion_hold::doctor_may_work`, #11861).
+pub const CHAMPION_HOLD_FIELD: &str = "championHold";
+
+/// Whether Doctor's queue keeps `park` on `row` (#11861): the blocked hold on
+/// a PR `fetch_queue` verified as Champion's own hold out for a Doctor
+/// round-trip. `loom:blocked` stays on; Doctor fixes and re-requests review.
+fn doctor_reads_hold(role: PrRole, row: &Value, park: &str) -> bool {
+    role == PrRole::Doctor
+        && row[CHAMPION_HOLD_FIELD] == true
+        && crate::work_finder::BLOCKED_HOLD_NAMES.contains(&park)
+}
+
 /// Stable role baseline followed by one shared preference. Inputs are REST
 /// pull objects, newest first, with `mergeable` resolved for Doctor conflicts.
 /// Deliberately retain `loom:reviewing` for Judge's existing stale-claim probe;
@@ -142,10 +156,11 @@ pub fn ordered_queue(
                 // `loom:frozen` (#11743), plus the retired names. One
                 // exception: Champion keeps a `loom:pr` + `loom:blocked` PR,
                 // the shape of its own merge-risk or critical-file hold, which
-                // it re-evaluates and releases (`crate::champion_hold`).
-                && !crate::work_finder::PARK_LABELS
-                    .iter()
-                    .any(|l| has_label(r, l) && !champion_reads_hold(role, l))
+                // it re-evaluates and releases (`crate::champion_hold`); and
+                // Doctor keeps a verified Champion hold sent back for fixes.
+                && !crate::work_finder::PARK_LABELS.iter().any(|l| {
+                    has_label(r, l) && !champion_reads_hold(role, l) && !doctor_reads_hold(role, r, l)
+                })
         })
         .collect();
     candidates.retain(|r| match role {

@@ -77,8 +77,8 @@ NOT used for it, #4966):
 
 > **`loom:operator` is excluded and never examined (#11861).** It is a no-op
 > for every role; only a human removes it. A dependency-only finding never
-> lands there: it is a `loom:blocked` park (`classify-dependency-block.sh
-> --check-defer --apply`), which the daemon's stale-blocked release pass lifts
+> lands there: it is a `loom:blocked` park (`park-record apply
+> --blocked-by`, #11860), which the daemon's stale-blocked release pass lifts
 > when the blocker closes, so the issue matches this query again. (Pass 0's
 > un-escalation of such holds is retired.) **Any hold you apply** follows
 > `.loom/docs/label-state-machine.md` → "Routing to a human" (#10001).

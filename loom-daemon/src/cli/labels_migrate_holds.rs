@@ -8,11 +8,15 @@
 //! 1. **Champion-held pull requests.** A PR whose trusted comments carry a
 //!    standing merge-risk or critical-file hold marker
 //!    ([`loom_daemon::champion_hold::standing_hold`]) gains a reason-only park
-//!    record and `loom:blocked`, then loses the operator hold under every
-//!    name. **`loom:pr` is never touched**: `loom:pr` + `loom:blocked` with a
-//!    standing hold marker is the one shape the verdict-label invariant
-//!    allows (the janitor exception), so the Judge's approval survives and a
-//!    released hold merges without a fresh review.
+//!    record and `loom:blocked`, then loses `loom:operator` itself (the only
+//!    name Champion ever wrote; the retired sub-kinds are a human's or another
+//!    role's and are left for the retired-name migration). This holds at
+//!    `loom:pr` and at `loom:changes-requested` (a hold out at Doctor, #6720):
+//!    Doctor works a `loom:changes-requested` + `loom:blocked` PR whose trusted
+//!    hold marker stands. **`loom:pr` is never touched**: `loom:pr` +
+//!    `loom:blocked` with a standing hold marker is the one shape the
+//!    verdict-label invariant allows (the janitor exception), so the Judge's
+//!    approval survives and a released hold merges without a fresh review.
 //! 2. **Dependency-only escalations.** A proposal (`loom:curated`,
 //!    `loom:architect`, `loom:hermit`, `loom:auditor`) Champion escalated for
 //!    a timing finding is handed to
@@ -26,10 +30,10 @@
 //! `loom:operator` parks a PR too, so the plain retired-label migration keeps
 //! it parked and the #11795 Q1 "+ `loom:blocked`" pre-pass is not needed.
 //!
-//! **Order.** Run this pass *before* `labels migrate --apply --keep-labels`:
-//! it reads the retired operator names too, so an escalation still labelled
-//! `loom:operator-only` is moved straight to `loom:blocked` instead of
-//! passing through `loom:operator`.
+//! **Order.** Run this pass *before* `labels migrate --apply --keep-labels`.
+//! It lists items under the retired operator names too, but removes only
+//! `loom:operator` itself; an item held under a retired name keeps it, and
+//! the retired-name migration then turns it into `loom:operator`.
 //!
 //! Safety is `labels migrate`'s: dry run by default, the write-scope gate
 //! before any call on `--apply`, open items only, add before remove, every
@@ -266,7 +270,11 @@ fn one(forge: &dyn HoldsForge, item: &HoldItem, apply: bool, r: &mut Report) -> 
     if item.is_pr {
         return pr_hold(forge, item, apply, r);
     }
-    if !ESCALATION_LABELS.iter().any(|l| has(l)) {
+    // An escalation is moved only off `loom:operator` itself; a retired name
+    // stays for the retired-name migration (#11861 review).
+    if !ESCALATION_LABELS.iter().any(|l| has(l))
+        || !has(loom_daemon::work_finder::OPERATOR_HOLD_LABEL)
+    {
         r.summary.untouched += 1;
         return Ok(());
     }
@@ -341,10 +349,14 @@ fn pr_hold(
         HoldKind::MergeRisk => "merge-risk",
         HoldKind::CriticalFile => "critical-file",
     };
+    // Only `loom:operator` itself, the one name Champion ever wrote for its
+    // hold (#5502). `loom:operator-only` / `-decision` / `-mechanical` were a
+    // human's or another role's: never removed here; the retired-name
+    // migration maps them to `loom:operator`, a park, beside the new hold.
     let removed: Vec<String> = item
         .labels
         .iter()
-        .filter(|l| loom_daemon::work_finder::OPERATOR_HOLD_NAMES.contains(&l.as_str()))
+        .filter(|l| l.as_str() == loom_daemon::work_finder::OPERATOR_HOLD_LABEL)
         .cloned()
         .collect();
     r.events.push(Event::Hold {
@@ -492,13 +504,17 @@ impl HoldsForge for GhHoldsForge {
     }
 
     fn migrate_escalation(&self, number: u64, apply: bool) -> EscalationMigration {
-        if apply {
-            for _ in 0..ESCALATION_WRITES {
-                pace_write();
-            }
-        }
         let n = i64::try_from(number).unwrap_or(0);
-        loom_daemon::dep_classify::cli::migrate_escalation(&self.root, &self.repo, n, apply)
+        let plan =
+            loom_daemon::dep_classify::cli::migrate_escalation(&self.root, &self.repo, n, false);
+        // Pace only an item that will write (the plan is a read).
+        if !apply || !matches!(plan, EscalationMigration::Release | EscalationMigration::Park(_)) {
+            return plan;
+        }
+        for _ in 0..ESCALATION_WRITES {
+            pace_write();
+        }
+        loom_daemon::dep_classify::cli::migrate_escalation(&self.root, &self.repo, n, true)
     }
 }
 

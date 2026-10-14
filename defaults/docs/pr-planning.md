@@ -93,7 +93,8 @@ carries `loom:review-requested`, and nothing here adds a label.
 Drafts and holds never gain authority from origin, and every queue drops every
 park, `loom:operator` included (#11861). The one exception is Champion's: it
 keeps a `loom:pr` + `loom:blocked` PR, its own merge-risk or critical-file hold,
-which it re-evaluates. Champion lifts `loom:blocked` when it routes a stale held
-PR to Doctor, so that repair route remains available. Pending/failing checks can
+which it re-evaluates; and Doctor's keeps `loom:changes-requested` +
+`loom:blocked` when a trusted Champion hold marker stands (`fetch_queue` reads
+the comments), so a held PR Champion routes for repair keeps its hold. Pending/failing checks can
 block a merge while still leaving actionable repair work. The queue is a plan;
 fresh claim, CI, dependency and merge guards remain mandatory before acting.

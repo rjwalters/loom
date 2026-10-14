@@ -331,7 +331,7 @@ Check for an argument passed via the slash command:
 ### PR Fix Mode
 
 If a number is provided (e.g., `/doctor 123`):
-1. Treat that number as the target **PR** to fix. `loom:frozen` or `loom:operator` on it (#11861): refuse, writing nothing
+1. Treat that number as the target **PR** to fix. `loom:frozen` or any `loom:operator*` label on it (#11861): refuse, writing nothing
 2. **Skip** the "Finding Work" section entirely
 3. Claim the PR exactly as in Work Process step 2 (a dispatched PR can
    already be claimed by a concurrent Doctor)
@@ -443,9 +443,10 @@ explicit hold (`loom:blocked` / `loom:operator` / `loom:frozen`).**
 > **Hold exclusion (both queues, #5272, #11861).** The shared queue drops
 > every park, `loom:operator` included: no role acts on an item a human must
 > decide, so autonomous Finding Work never claims, rebases or pushes to a held
-> PR. When Champion routes a stale held PR to Doctor it lifts `loom:blocked`
-> for the round-trip (`.loom/docs/label-state-machine.md`), so it still reaches
-> this queue. An explicit user instruction naming a PR is a human decision, but
+> PR. One exception (#11861): Champion's own hold sent back for fixes
+> (`loom:changes-requested` + `loom:blocked` with a standing trusted Champion
+> hold marker) is in the queue. Work it as any feedback PR and leave
+> `loom:blocked` on: only a human removes it. An explicit user instruction naming a PR is a human decision, but
 > never overrides `loom:frozen` or `loom:operator`.
 
 ### Routing to a human

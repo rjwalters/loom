@@ -749,7 +749,7 @@ else
   #     human removal of the pre-#11861 `loom:operator` counts too, so a hold
   #     released before the migration stays released. Proof is a human-identified
   #     `unlabeled` event after HOLD_AT, not bare absence (a failed add is no
-  #     release). Bot removals are Champion's own (Step 2, the Doctor route,
+  #     release). Bot removals are Champion's own (Step 2,
   #     critical-file "Hold Cleared") and never count, like (b). Computed even
   #     when (a)-(d) fired.
   HOLD_LABEL_NOW=$(jq -r '[.labels[].name] | any(. == "loom:blocked")' <<<"$PR_JSON")
@@ -772,8 +772,7 @@ fi
 if [ "$PRIOR_HOLD" = true ] && [ -z "$RELEASE_REASON" ]; then
   MERGE_BLOCKED_BY_HOLD=true
   # Label missing, no removal on record: restore it, so a sticky-held PR
-  # never reads as plain approved and stays in the census (#11416). Also how a
-  # hold comes back after Champion lifted the label for a Doctor round-trip.
+  # never reads as plain approved and stays in the census (#11416).
   [ "$LABEL_REPAIR" = true ] && loom-daemon park-record apply --pr "$PR_NUMBER" \
     --reason "champion merge-risk hold" --by champion >/dev/null 2>&1 || true
   echo "STICKY HOLD: #$PR_NUMBER was held at $HOLD_AT and nothing has changed since — not merging"
@@ -1179,8 +1178,8 @@ echo "PASS: Recently active ($HOURS_AGO hours ago)"
 stale route fires from a held state too — it is the *only* automated path from
 `loom:pr` to Doctor, so gating it behind the hold is what let held PRs rot for
 days (20 of 21 held PRs `CONFLICTING`, Doctor's queue empty). The stale-PR block
-below is hold-aware: it preserves the hold marker and the park record, and
-lifts `loom:blocked` for the Doctor round-trip (#11861).
+below is hold-aware: it preserves the hold marker, the park record and
+`loom:blocked` (#11861); Doctor works a held PR by its trusted marker.
 
 ### 6. CI Status Check
 - [ ] If CI checks exist, all checks must be passing
@@ -1376,7 +1375,8 @@ before (#5978) — so autonomous Finding Work never rebases and force-pushes a
 held PR. That exclusion is correct and this section does **not** reverse it: a
 held+conflicting PR is *surfaced* here, and only becomes Doctor's work through
 the recency route below, which lands it on `loom:changes-requested` (Doctor's
-*Priority 2* queue) **and lifts `loom:blocked`** so Doctor can see it.
+*Priority 2* queue, which serves `loom:changes-requested` + `loom:blocked` with
+a standing trusted Champion hold marker, #11861).
 Conflict alone is a report; conflict plus staleness is a route.
 
 ### #6 under a hold — report a broken build, and flag genuine feedback (#6852)
@@ -1454,17 +1454,17 @@ Two invariants apply on **both** branches, both load-bearing:
    silent. What must never happen is the *marker* disappearing.) On the
    hold-only branch this is automatic: nothing on that branch ever touches the
    marker.
-2. **`loom:blocked` is lifted for the Doctor round-trip, and only for it** —
-   see the decision below. On the hold-only branch nothing touches any label.
+2. **`loom:blocked` stays on** — see the decision below.
 
-### `loom:blocked` on the held-and-stale route: LIFT it, keep the record (#11861)
+### `loom:blocked` on the held-and-stale route: KEEP it (#11861)
 
-Doctor's queues skip every park, so the hold-plus-feedback route lifts
-`loom:blocked` (the hold-only route touches no label). The marker and park
-record stay: on return to `loom:pr` the precheck finds `PRIOR_HOLD=true`, the
-push is release (c), and a hold that still binds re-applies the label
-(`LABEL_REPAIR` if nothing was pushed). Champion's removal is a bot removal,
-never release (e); the census counts a PR out at Doctor by its marker.
+The route never removes `loom:blocked`, so the PR is never a plain approval
+while the hold stands and `merge-pr.sh` refuses it throughout. Doctor still
+reaches it: `pr-queue --role doctor` serves `loom:changes-requested` +
+`loom:blocked` when a trusted Champion hold marker stands
+(`champion_hold::doctor_may_work`). Judge's re-approval restores `loom:pr` +
+`loom:blocked`, the janitor exception, and the precheck re-judges the hold
+(the push is release (c)). Only a human removes the label.
 
 ### What this pass must never do
 
@@ -1506,11 +1506,11 @@ A sticky hold missing its label with no removal on record gets the label back
 ```bash
 # Cached ("$GH_READ") — an observation scan, never a merge gate.
 # `--label` ANDs: loom:pr + loom:blocked is Champion's hold (#11861). A held
-# PR out at Doctor has neither label (the route lifts loom:blocked), so it is
-# counted from the changes-requested queue by its standing marker instead.
+# PR out at Doctor keeps loom:blocked beside loom:changes-requested; it is
+# counted with its standing marker (a Doctor-cycle-cap park has none).
 HELD_JSON=$(for H in loom:blocked loom:operator; do "$GH_READ" pr list --label "loom:pr" --label "$H" --search "-label:loom:frozen" \
   --state open --limit 500 --json number,title,createdAt,updatedAt,mergeable,labels,mergeStateStatus,headRefOid,files; done | jq -s 'add | unique_by(.number)')
-HELD_AT_DOCTOR=$("$GH_READ" pr list --label "loom:changes-requested" --state open --limit 500 --json number,labels,comments \
+HELD_AT_DOCTOR=$("$GH_READ" pr list --label "loom:changes-requested" --label "loom:blocked" --state open --limit 500 --json number,labels,comments \
   --jq '[.[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | select(any(.comments[].body; startswith("<!-- champion:merge-risk-hold -->") or startswith("<!-- champion:critical-file-hold -->"))
     and (any(.comments[].body; contains("<!-- champion:merge-risk-hold-cleared -->") or startswith("<!-- champion:critical-file-hold-cleared -->")) | not))] | length')
 
@@ -2754,10 +2754,10 @@ A stale PR (>24h) will never clear on its own, and under the 10-minute cron a ba
 Held-PR Health Pass as well as from an ordinary criterion-#5 failure, and it is
 the *only* automated route from `loom:pr` to Doctor. Gating it behind a hold is
 what produced the 20-of-21-conflicting pile. The block below is hold-aware in
-exactly two places, both keyed on `MERGE_BLOCKED_BY_HOLD`: the notice text, and
-lifting `loom:blocked` (#11861). **The `champion:merge-risk-hold` marker comment
-and the park record are never touched on either variant** — the hold must
-survive the round-trip.
+one place, keyed on `MERGE_BLOCKED_BY_HOLD`: the notice text. **The
+`champion:merge-risk-hold` marker comment, the park record and `loom:blocked`
+are never touched on either variant** — the hold must survive the round-trip
+(#11861).
 
 **Not reached for a hold-only stale PR (#6852).** When `MERGE_BLOCKED_BY_HOLD=true`
 and `HELD_CI_FAILING` (set by the Held-PR Health Pass's #6 step, above) is not
@@ -2803,7 +2803,7 @@ if [ "$HELD" = true ]; then
 
 **This PR is on a merge-risk hold, and the hold is preserved.** Routing it to Doctor addresses staleness only — it is not a release signal and does not clear the hold. The \`champion:merge-risk-hold\` marker stays on this PR, so if a later tick merges it, Champion must still post the mandatory hold-reversal comment naming what changed (#4742). Rebasing a held PR does not make it an unheld one.
 
-\`loom:blocked\` is lifted for the round-trip only, so Doctor can see this PR (its queue skips every park). The hold marker and the park record stay; when the PR is approved again, Champion re-judges the hold and re-applies the label if it still binds (#11861)."
+\`loom:blocked\` stays on, so this PR cannot be merged while the hold stands; Doctor works it by the hold marker, and a human releases the hold by removing the label (#11861)."
 else
   STALE_HOLD_NOTE=""
 fi
@@ -2836,18 +2836,9 @@ $STALE_HOLD_NOTE
 ---
 *Automated by Champion role*"
   # Route to Doctor: leave the auto-merge queue. Identical on both variants —
-  # the hold changes what the PR carries, never whether it gets routed.
+  # the hold changes what the PR carries, never whether it gets routed. A held
+  # PR keeps loom:blocked (#11861): Doctor works it by its trusted marker.
   gh pr edit "$PR_NUMBER" --remove-label "loom:pr" --add-label "loom:changes-requested"
-
-  # loom:blocked (#11861): the hold label is a park, and Doctor's queues skip
-  # every park, so a held PR keeps it only while it stays on loom:pr. Lift it
-  # for the round-trip; the marker and the park record keep the hold on
-  # record, and the sticky-hold precheck re-applies it on return if it still
-  # binds. HELD=false: no Champion hold, nothing to lift.
-  if [ "$HELD" = true ]; then
-    gh pr edit "$PR_NUMBER" --remove-label "loom:blocked" 2>/dev/null || true
-    echo "Lifted loom:blocked on #$PR_NUMBER for the Doctor round-trip; the hold stays on record (#11861)"
-  fi
   echo "Routed stale PR #$PR_NUMBER to Doctor (loom:pr → loom:changes-requested)"
 fi
 ```
@@ -2929,9 +2920,15 @@ OP_HOLDS=$(loom-daemon labels list --property operator_gate --with-retired 2>/de
   --label "loom:changes-requested" \
   --state open \
   --limit 500 \
-  --json number,title,updatedAt,labels \
-  --jq '($ENV.OP_HOLDS | split("\n")) as $o | .[] | select(any(.labels[]?.name; . == "loom:frozen" or IN($o[])) | not) | "#\(.number) \(.title)"'
+  --json number,title,updatedAt,labels,comments \
+  --jq '($ENV.OP_HOLDS | split("\n")) as $o | .[] | select(any(.labels[]?.name; . == "loom:frozen" or IN($o[])) | not)
+    | select(any(.comments[].body; startswith("<!-- champion:merge-risk-hold -->") or startswith("<!-- champion:critical-file-hold -->")) | not) | "#\(.number) \(.title)"'
 ```
+
+A PR with a Champion hold marker is not a capped PR: it is Champion's own hold
+out at Doctor (#11861), which only a human releases. Never remove its
+`loom:blocked` here (this listing pre-filters it; re-check the trusted
+comments before any edit).
 
 **The query skips any PR that also carries an operator hold** — a previous pass (or a human) already routed it out to the operator; do not re-decide it. Process the remaining PRs oldest first.
 

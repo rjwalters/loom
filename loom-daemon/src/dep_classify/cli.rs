@@ -336,11 +336,18 @@ pub fn migrate_escalation(cwd: &Path, repo: &str, issue: i64, apply: bool) -> Es
         return EscalationMigration::Failed(format!("could not read {self_node}"));
     };
     let present = view.label_names();
-    let held = consts::held_label(&present);
-    let also = consts::other_hold_names(&present, held);
+    // Only `loom:operator` itself is ever removed (#11861 review): a retired
+    // name (`loom:operator-only`, `-decision`, `-mechanical`, `-blocked`) may
+    // be a human's, and the retired-name migration maps it to `loom:operator`.
+    if !present.iter().any(|l| l == consts::OPERATOR_LABEL) {
+        return EscalationMigration::Leave(
+            "no loom:operator (a retired name is the retired-name migration's)".to_string(),
+        );
+    }
+    let held = consts::OPERATOR_LABEL;
     let labels = apply::Labels {
         hold: held,
-        also: &also,
+        also: &[],
     };
     let markers = unescalate::Markers {
         operator_only_label: held,

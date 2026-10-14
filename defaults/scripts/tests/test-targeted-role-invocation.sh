@@ -83,7 +83,7 @@ check_judge() {
     local J="$1" where="$2"
     expect "$where judge: REST kind/state/label probe" "$J" "$PROBE"
     expect "$where judge: an issue number refuses"     "$J" "\`false\` (an issue number; Judge is a PR role)"
-    expect "$where judge: closed, frozen and operator refuse" "$J" "\`closed\`, \`loom:frozen\`, \`loom:operator\` (#11861), or a failed read"
+    expect "$where judge: closed, frozen and operator refuse" "$J" "\`closed\`, \`loom:frozen\`, any \`loom:operator*\` label (#11861; retired names too), or a failed read"
     expect "$where judge: fallback PRs stay review-only" "$J" "\"Fallback Queue\" rules (guard, review only, never claim or label)"
     expect "$where judge: a priority label alone is unlabelled" "$J" "Neither those nor a verdict label (e.g. only \`loom:important\`)"
     expect "$where judge: a judged PR is a no-op"      "$J" "A verdict label without \`loom:review-requested\` → no-op"
@@ -95,7 +95,7 @@ check_curator() {
     local C="$1" where="$2"
     expect "$where curator: pool gate runs first"      "$C" "FIRST, run the pool gate (above) and the kind probe, then claim"
     expect "$where curator: REST kind/state/label probe" "$C" "$PROBE"
-    expect "$where curator: closed/frozen/operator/hard-excluded refuse" "$C" "So do \`closed\`, \`loom:frozen\`, \`loom:operator\` (#11861) and a hard-exclusion label"
+    expect "$where curator: closed/frozen/operator/hard-excluded refuse" "$C" "So do \`closed\`, \`loom:frozen\`, any \`loom:operator*\` label (#11861) and a hard-exclusion label"
     expect "$where curator: outcome line"              "$C" "LOOM_STEP_OUTCOME role=curator"
     before "$where curator: probe precedes the claim"  "$C" "$PROBE" "labels[]=loom:curating"
 }

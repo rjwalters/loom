@@ -16,9 +16,10 @@ Rationale: `.loom/docs/critical-file-hold.md`.
 - A FAIL skips Steps 2-3 for this PR **in every state, `released` included**:
   releasing hands the merge to the operator, never back to Champion.
   `loom:auto-merge-ok` does not release it (criterion #2's override).
-- **The operator's release is a human's removal of the label** (#9016,
-  #11861): while this episode is open and the change has not moved, it IS the
-  release. A bot removal (Champion's Doctor round-trip) is not.
+- **The operator's release is the label's ABSENCE** (#9016): a hand-removed
+  `loom:blocked`, while this episode is open and the change has not moved, IS
+  the release: Champion never removes it mid-episode (#11861 keeps it on
+  through the Doctor round-trip).
 - The release is scoped to a **diff, not a commit id** (#9416): this verdict is a
   pure function of the file list, so the operator decided about that change.
 
@@ -45,7 +46,6 @@ matching row wins:
 |---|---|
 | `released`, recorded head == current head | nothing at all: no label, no comment |
 | either, label present (a human put it back) | hold stands, silently |
-| `held`, label absent, no human removal on record (#11861) | hold stands: label restored, silently |
 | `held`, label absent, recorded head == current head | **respect the release**: acknowledge once, do **not** re-add the label |
 | `none` | fresh hold: notice + `loom:blocked` |
 | either, head moved but the PR's own change provably did not (#9416) | **respect, re-recorded at the new head** with the equivalence kind |
@@ -88,12 +88,6 @@ esac
 STATE_HEAD=$(printf '%s' "$LAST_STATE" \
   | sed -n 's/.*champion:hold-state head=\([0-9a-f]*\).*/\1/p' | head -1)
 
-# A human (never a bot) removed the hold label after the hold notice (#11861).
-cf_human_removed() {
-  local at; at=$(jq -r --arg h "$HOLD_MARKER" '[.comments[] | select(.body | startswith($h))] | last | .createdAt // ""' <<<"$CF_JSON")
-  gh api "repos/{owner}/{repo}/issues/$PR_NUMBER/events" --paginate --jq ".[] | select(.event == \"unlabeled\" and (.label.name | IN(\"loom:blocked\",\"loom:operator\")) and .created_at > \"$at\" and .actor.type == \"User\" and (.actor.login | endswith(\"[bot]\") | not)) | 1" 2>/dev/null | grep -q .
-}
-
 # Head moved; did the PR's change? Sets CF_EQUIV_KIND (empty => re-arm), CF_EQUIV_WHY.
 # requires-daemon: forge optional   Without `forge verdict-equivalent` an equivalent head move re-arms (pre-#9416 behavior: one extra removal, never an unreviewed merge).
 cf_change_unmoved() {
@@ -112,8 +106,6 @@ if [ "$CRITERION3_RESULT" = "FAIL" ]; then
     CF_ACTION=none          # released at this head, already acknowledged
   elif [ "$HOLD_LABEL_NOW" = true ] && [ "$CF_STATE" != none ]; then
     CF_ACTION=stands        # label back on: a human re-asserted the hold
-  elif [ "$CF_STATE" = held ] && [ -n "$STATE_HEAD" ] && ! cf_human_removed; then
-    CF_ACTION=stands        # a bot lifted it (Doctor round-trip): restore
   elif [ "$CF_STATE" = held ] && [ -n "$STATE_HEAD" ] && [ "$STATE_HEAD" = "$HEAD_SHA" ]; then
     CF_ACTION=respect
   elif [ "$CF_STATE" = none ]; then

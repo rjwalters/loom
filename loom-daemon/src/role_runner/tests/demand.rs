@@ -295,6 +295,33 @@ fn queue_row(number: u32, label: &str, extra: &[&str]) -> RestIssue {
     }
 }
 
+/// #11861: a Champion hold sent to Doctor keeps `loom:blocked`, and is still
+/// Doctor work: the gate opens on it (its body carries the hold's park record).
+/// The Doctor-cycle-cap park, same labels without that record, does not.
+#[test]
+fn a_champion_hold_out_at_doctor_opens_the_changes_gate() {
+    let label = "loom:changes-requested";
+    let record = crate::park_record::render_park(
+        &[],
+        Some(crate::champion_hold::HOLD_BY),
+        Some("2026-10-14T00:00:00Z"),
+        Some(crate::champion_hold::MERGE_RISK_HOLD_REASON),
+    );
+    let held = RestIssue {
+        body: Some(format!("A change.\n\n{record}\n")),
+        ..queue_row(1, label, &["loom:blocked"])
+    };
+    assert!(listing_has_work(label, std::slice::from_ref(&held)));
+    assert_eq!(count_axis_rows(DebtAxis::Changes, std::slice::from_ref(&held)), 1);
+    let capped = queue_row(2, label, &["loom:blocked"]);
+    assert!(!listing_has_work(label, &[capped]));
+    let operator = RestIssue {
+        body: held.body.clone(),
+        ..queue_row(3, label, &["loom:blocked", "loom:operator"])
+    };
+    assert!(!listing_has_work(label, &[operator]), "a human hold beside it wins");
+}
+
 #[test]
 fn all_parked_changes_listing_does_not_open_the_gate() {
     // #9435: every open PR is one doctor.md Priority 2 skips, so a Doctor run

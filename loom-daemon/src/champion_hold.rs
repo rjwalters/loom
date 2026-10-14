@@ -108,6 +108,46 @@ pub fn is_champion_hold<L: AsRef<str>, C: AsRef<str>>(labels: &[L], comments: &[
         && standing_hold(comments).is_some()
 }
 
+/// The label shape of a Champion-held PR that Champion sent to Doctor
+/// (#11861): `loom:changes-requested` beside the blocked hold, and no other
+/// park (`loom:operator` under any name, `loom:frozen`). Doctor may work it
+/// **only** when a standing trusted hold marker confirms it
+/// ([`doctor_may_work`]); the same labels without one are a Doctor-cycle-cap
+/// park or another actor's, which Doctor skips. `loom:blocked` stays on
+/// throughout, so the PR is never a plain approval while the hold stands.
+#[must_use]
+pub fn doctor_shape<L: AsRef<str>>(labels: &[L]) -> bool {
+    let has = |n: &str| labels.iter().any(|l| l.as_ref() == n);
+    has("loom:changes-requested")
+        && crate::work_finder::is_blocked_hold(labels)
+        && !labels.iter().any(|l| {
+            let l = l.as_ref();
+            crate::work_finder::PARK_LABELS.contains(&l)
+                && !crate::work_finder::BLOCKED_HOLD_NAMES.contains(&l)
+        })
+}
+
+/// Whether Doctor may work a PR (#11861): [`doctor_shape`] labels and a
+/// Champion hold standing in its **trusted** comments.
+#[must_use]
+pub fn doctor_may_work<L: AsRef<str>, C: AsRef<str>>(labels: &[L], trusted: &[C]) -> bool {
+    doctor_shape(labels) && standing_hold(trusted).is_some()
+}
+
+/// Whether a PR body carries a Champion hold's park record (#11861). A cheap,
+/// listing-only hint (the body is author-editable), used only to decide that
+/// a Doctor run is worth launching; [`doctor_may_work`] on trusted comments
+/// decides what Doctor actually works.
+#[must_use]
+pub fn body_declares_hold(body: &str) -> bool {
+    crate::park_record::parse(body).iter().any(|r| {
+        r.blocker.is_none()
+            && r.reason
+                .as_deref()
+                .is_some_and(|x| x == MERGE_RISK_HOLD_REASON || x == CRITICAL_FILE_HOLD_REASON)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,6 +202,37 @@ mod tests {
         assert!(!is_champion_hold(&["loom:blocked"], &c), "no approval: not this shape");
         assert!(!is_champion_hold::<&str, &str>(&["loom:pr", "loom:blocked"], &[]));
         assert!(!is_champion_hold(&["loom:pr", "loom:operator"], &c), "the old label");
+    }
+
+    #[test]
+    fn doctor_works_a_champion_held_pr_only_with_a_trusted_marker() {
+        let hold = format!("{MERGE_RISK_HOLD_MARKER}\nx");
+        let shape = ["loom:changes-requested", "loom:blocked"];
+        assert!(doctor_may_work(&shape, &[hold.as_str()]));
+        // No standing marker: a Doctor-cycle-cap park, not Doctor's.
+        assert!(!doctor_may_work::<&str, &str>(&shape, &[]));
+        // Another park beside it, or no changes requested: never.
+        for extra in ["loom:operator", "loom:operator-only", "loom:frozen"] {
+            let l = ["loom:changes-requested", "loom:blocked", extra];
+            assert!(!doctor_may_work(&l, &[hold.as_str()]), "{extra}");
+        }
+        assert!(!doctor_may_work(&["loom:pr", "loom:blocked"], &[hold.as_str()]));
+    }
+
+    #[test]
+    fn a_body_hold_record_is_recognised_by_reason() {
+        let rec = |reason: &str| {
+            crate::park_record::render_park(
+                &[],
+                Some(HOLD_BY),
+                Some("2026-10-14T00:00:00Z"),
+                Some(reason),
+            )
+        };
+        assert!(body_declares_hold(&rec(MERGE_RISK_HOLD_REASON)));
+        assert!(body_declares_hold(&rec(CRITICAL_FILE_HOLD_REASON)));
+        assert!(!body_declares_hold(&rec("doctor cycle cap")));
+        assert!(!body_declares_hold("no record"));
     }
 
     #[test]

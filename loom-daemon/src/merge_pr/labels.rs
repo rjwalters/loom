@@ -91,14 +91,24 @@ pub static BLOCKING: crate::label_registry::LabelSet = crate::label_registry::La
 ///
 /// `labels` is newline-separated, as both forges' `labels[].name` renders.
 /// Returns `None` when `loom:pr` is absent — this guard is only ever about a
-/// PR claiming approval — with one exception: `loom:frozen` (#11743) refuses
-/// the merge whatever else the PR carries, because nothing may act on a
-/// frozen artifact and only a human removes the label.
+/// PR claiming approval — with two exceptions that refuse the merge whatever
+/// else the PR carries: `loom:frozen` (#11743: nothing may act on a frozen
+/// artifact), and `loom:blocked` (#11861). A blocked PR is waiting on
+/// something; in particular Champion's merge-risk and critical-file holds keep
+/// `loom:blocked` on through a Doctor round-trip, when the PR has no `loom:pr`,
+/// so `--allow-unapproved` (which bypasses only the missing approval) must not
+/// merge it either. A human releases the hold by removing the label.
 #[must_use]
 pub fn contradiction(labels: &str) -> Option<&'static str> {
     let present = |want: &str| labels.lines().any(|l| l.trim() == want);
     if present(crate::work_finder::FROZEN_LABEL) {
         return Some(crate::work_finder::FROZEN_LABEL);
+    }
+    if !present("loom:pr") {
+        return crate::work_finder::BLOCKED_HOLD_NAMES
+            .iter()
+            .copied()
+            .find(|b| present(b));
     }
     if !present("loom:pr") {
         return None;
@@ -143,6 +153,16 @@ pub fn message(pr: &str, blocker: &str, labels: &str, head_sha: &str) -> String 
     } else {
         labels.trim().to_string()
     };
+    if !labels.lines().any(|l| l.trim() == "loom:pr")
+        && crate::work_finder::BLOCKED_HOLD_NAMES.contains(&blocker)
+    {
+        return format!(
+            "Merge blocked: PR #{pr} is `{blocker}` (#11861): it is waiting on something, \
+             or it is on Champion's merge-risk / critical-file hold. --allow-unapproved does \
+             not bypass a hold. Release it by removing the label (a human's decision), then \
+             re-run this merge.\n\nCurrent labels: {shown}\nCurrent head SHA: {head_sha}"
+        );
+    }
     if blocker == crate::work_finder::FROZEN_LABEL {
         return format!(
             "Merge blocked: PR #{pr} is `loom:frozen` (#11743): not now, don't touch. Only a \

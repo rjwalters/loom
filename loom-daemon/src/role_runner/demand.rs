@@ -529,14 +529,29 @@ pub(crate) fn axis_park_labels(axis: DebtAxis) -> &'static [&'static str] {
 /// (#11743, #11861).
 /// Counting undrainable PRs would keep the work finder's build back-off
 /// (#9410) engaged on a host with many of them. Uses the labels already in
-/// the listing rows.
+/// the listing rows. One exception on the changes axis (#11861): a Champion
+/// hold sent to Doctor (`loom:changes-requested` + `loom:blocked`, its park
+/// record in the body) is Doctor work; Doctor's `pr-queue` confirms it from
+/// the trusted hold marker before acting.
 #[must_use]
 pub fn count_axis_rows(axis: DebtAxis, rows: &[RestIssue]) -> usize {
     let parks = axis_park_labels(axis);
     rows.iter()
         .filter(|r| r.is_pull_request && r.state.eq_ignore_ascii_case("open"))
-        .filter(|r| !r.labels.iter().any(|l| parks.contains(&l.as_str())))
+        .filter(|r| {
+            !r.labels.iter().any(|l| parks.contains(&l.as_str()))
+                || (axis == DebtAxis::Changes && champion_hold_for_doctor(r))
+        })
         .count()
+}
+
+/// The listing-only hint that a parked `loom:changes-requested` PR is a
+/// Champion hold out for a Doctor round-trip (#11861).
+fn champion_hold_for_doctor(r: &RestIssue) -> bool {
+    crate::champion_hold::doctor_shape(&r.labels)
+        && r.body
+            .as_deref()
+            .is_some_and(crate::champion_hold::body_declares_hold)
 }
 
 /// Whether a queue label's listing holds work its role would drain: the

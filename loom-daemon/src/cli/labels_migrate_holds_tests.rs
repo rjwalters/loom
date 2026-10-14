@@ -164,7 +164,7 @@ fn a_held_pr_keeps_loom_pr_through_the_migration() {
 }
 
 #[test]
-fn a_critical_file_hold_and_retired_names_move_too() {
+fn a_critical_file_hold_moves_and_retired_names_stay() {
     let cf = format!("{CRITICAL_FILE_HOLD_MARKER}\nheld");
     let fake =
         Fake::default().item(8, &["loom:pr", "loom:operator", "loom:operator-only"], true, &[&cf]);
@@ -175,7 +175,9 @@ fn a_critical_file_hold_and_retired_names_move_too() {
         .contains(&"park #8 champion critical-file hold".to_string()));
     let labels = fake.labels(8);
     assert!(labels.contains("loom:pr") && labels.contains("loom:blocked"));
-    assert!(!labels.contains("loom:operator") && !labels.contains("loom:operator-only"));
+    assert!(!labels.contains("loom:operator"));
+    // A retired name may be a human's: never removed here (#11861 review).
+    assert!(labels.contains("loom:operator-only"), "{labels:?}");
 }
 
 #[test]
@@ -202,7 +204,7 @@ fn a_human_hold_is_never_touched() {
 fn dependency_only_escalations_go_to_the_classifier() {
     let fake = Fake::default()
         .item(10, &["loom:curated", "loom:operator"], false, &[])
-        .item(11, &["loom:architect", "loom:operator-only"], false, &[])
+        .item(11, &["loom:architect", "loom:operator"], false, &[])
         .item(12, &["loom:hermit", "loom:operator"], false, &[])
         .item(13, &["loom:curated", "loom:operator"], false, &[])
         .escalation(10, EscalationMigration::Park(vec!["#3".into()]))
@@ -275,4 +277,75 @@ fn item_lines_parse_with_the_pr_flag() {
             }
         ]
     );
+}
+
+/// The Judge's live shape: a held PR out at Doctor (#6720 kept the label on the
+/// round-trip): `loom:changes-requested` + `loom:operator` + a standing marker.
+/// It gets the park record and `loom:blocked` too, which Doctor still works
+/// (`champion_hold::doctor_may_work`), so nothing strands.
+#[test]
+fn a_held_pr_out_at_doctor_is_parked_and_stays_doctor_work() {
+    let hold = mr_hold();
+    let fake =
+        Fake::default().item(9, &["loom:changes-requested", "loom:operator"], true, &[&hold]);
+    let r = run(&fake, "o/r", true);
+    assert_eq!(r.summary.holds, 1);
+    assert_eq!(
+        fake.writes(),
+        vec![
+            "park #9 champion merge-risk hold",
+            "remove #9 loom:operator"
+        ]
+    );
+    let labels: Vec<String> = fake.labels(9).into_iter().collect();
+    assert!(labels.iter().any(|l| l == "loom:changes-requested"));
+    assert!(loom_daemon::champion_hold::doctor_may_work(&labels, &[hold]));
+}
+
+/// The Judge's other live shape: `loom:operator-only` and
+/// `loom:operator-mechanical` beside a merge-risk marker. The hold is recorded
+/// and parked; the human-applied names are left for the retired-name
+/// migration (which maps them to `loom:operator`, a park).
+#[test]
+fn human_hold_names_beside_a_marker_are_never_removed() {
+    let hold = mr_hold();
+    let fake = Fake::default().item(
+        10,
+        &["loom:pr", "loom:operator-only", "loom:operator-mechanical"],
+        true,
+        &[&hold],
+    );
+    let r = run(&fake, "o/r", true);
+    assert_eq!(r.summary.holds, 1);
+    assert_eq!(fake.writes(), vec!["park #10 champion merge-risk hold"], "no removal at all");
+    let labels = fake.labels(10);
+    for kept in [
+        "loom:pr",
+        "loom:operator-only",
+        "loom:operator-mechanical",
+        "loom:blocked",
+    ] {
+        assert!(labels.contains(kept), "{kept}: {labels:?}");
+    }
+}
+
+/// An escalation still under a retired name is the retired-name migration's.
+#[test]
+fn an_escalation_without_loom_operator_itself_is_untouched() {
+    let fake = Fake::default()
+        .item(
+            20,
+            &[
+                "loom:curated",
+                "loom:operator-only",
+                "loom:operator-blocked",
+            ],
+            false,
+            &[],
+        )
+        .escalation(20, EscalationMigration::Park(vec!["#3".into()]));
+    let r = run(&fake, "o/r", true);
+    assert!(r.events.is_empty(), "{:?}", r.events);
+    assert_eq!(r.summary.untouched, 1);
+    assert!(fake.writes().is_empty());
 }

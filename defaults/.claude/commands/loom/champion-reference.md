@@ -226,8 +226,8 @@ the only automated path from `loom:pr` to Doctor, and gating it behind the hold
 left 20 of 21 held PRs conflicting with Doctor's queue empty. On the held
 **hold-plus-feedback** variant (a failing required check, unrelated to the
 hold) the `champion:merge-risk-hold` marker and park record are **preserved**
-and `loom:blocked` is **lifted** for the round-trip, so Doctor can reach it
-(#11861; the precheck re-applies it on return if the hold still binds). On the held
+and `loom:blocked` **stays on**: Doctor works a held PR by its trusted marker,
+and the PR cannot merge while the hold stands (#11861). On the held
 **hold-only** variant (no failing check, nothing else red) the PR is left in
 place instead — routing it would not resolve anything the hold isn't already
 the resolution for, and `main` moving again would just repeat the cycle (the

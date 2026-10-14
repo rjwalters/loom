@@ -255,14 +255,18 @@ untouched for 24h, so it reaches Doctor for a rebase; it fires from a **held**
 state too (#6720), but only when the PR also carries genuine feedback (a
 failing check, #6852; a hold-only stale PR stays on `loom:pr`, untouched).
 
-On that held route Champion **lifts `loom:blocked`** for the round-trip:
-Doctor's queues skip every park, so a kept label would strand the PR. The hold
-marker and the park record stay, so when the PR returns on `loom:pr` the
-sticky-hold precheck finds `PRIOR_HOLD=true`; the push is release signal (c), so
-the axes are re-judged, and a hold that still binds re-applies the label
-silently (a return with no push repairs it). A rebase never launders a held PR
-into an unheld one. Before #11861 the route kept `loom:operator`, which was not
-a park on a PR.
+On that held route **`loom:blocked` stays on** (#11861), so the PR is never a
+plain approval while the hold stands, and `merge-pr.sh` refuses it throughout
+(it refuses any `loom:blocked` PR, `--allow-unapproved` included). Doctor
+still reaches it: Doctor's queue (`pr-queue --role doctor`, the lanes, the
+targeted path) serves `loom:changes-requested` + `loom:blocked` when a trusted
+Champion hold marker stands (`champion_hold::doctor_may_work`), and Doctor
+returns it to review as usual. Judge's re-approval restores `loom:pr` +
+`loom:blocked` (the janitor exception) and the precheck re-judges the hold;
+the push is release signal (c). Champion never removes the label while the
+hold stands, so a removal is always a human's release. The Capped-PR Recovery
+Pass, which also reads `loom:blocked` + `loom:changes-requested`, skips a PR
+with a Champion hold marker.
 
 ### The out-of-band AC hold on an issue (#6883)
 
@@ -279,9 +283,8 @@ must observe something in the world" cannot be discharged by an engine re-read.
 
 - **Criterion #2 (merge-risk hold)** — `champion-pr-merge.md`: entry in
   "Hold behavior" (`park-record apply --pr`), exit in Step 2 (`gh pr edit
-  --remove-label loom:blocked`, gated on `$HOLD_REVERSAL_BLOCK`), the Doctor
-  round-trip lift in "PR Rejection Workflow → Stale PR", repair in the sticky
-  precheck (`LABEL_REPAIR`).
+  --remove-label loom:blocked`, gated on `$HOLD_REVERSAL_BLOCK`), repair in
+  the sticky precheck (`LABEL_REPAIR`).
 - **Criterion #3 (critical-file hold, #6879, #9016)** —
   `champion-critical-file-hold.md`, run after criterion #3's check-loop: add on
   FAIL, remove with the `champion:critical-file-hold-cleared` notice once a push
@@ -304,16 +307,27 @@ run unless `--apply`; writes are paced under the shared secondary write limit
 
 | Item | Moves to |
 |---|---|
-| A PR with `loom:operator` (or a retired name) and a **standing** Champion hold marker | A reason-only park record, `loom:blocked`, then the operator hold removed. **`loom:pr` is never touched**, so the approval survives |
-| A proposal (`loom:curated` / `loom:architect` / `loom:hermit` / `loom:auditor`) Champion escalated for a dependency-only finding (`<!-- champion:proposal-escalated -->`, every recurring finding a dependency with a reference) | Blockers still open: one park record per blocker, `loom:blocked`, the operator hold removed, a comment. Every blocker closed: the operator hold removed (the #5664 un-escalation, one last time). A cross-repo blocker: left on `loom:operator` |
-| Anything else carrying `loom:operator` | Untouched: a human's hold |
+| A PR carrying an operator-hold name and a **standing** trusted Champion hold marker, at `loom:pr` or out at Doctor (`loom:changes-requested`) | A reason-only park record and `loom:blocked`, then `loom:operator` itself removed. **`loom:pr` is never touched**, so the approval survives; a PR at `loom:changes-requested` stays Doctor work (Doctor serves a trusted-marker Champion hold) |
+| A proposal (`loom:curated` / `loom:architect` / `loom:hermit` / `loom:auditor`) carrying `loom:operator` that Champion escalated for a dependency-only finding (`<!-- champion:proposal-escalated -->`, every recurring finding a dependency with a reference) | Blockers still open: one park record per blocker, `loom:blocked`, `loom:operator` removed, a comment. Every blocker closed: `loom:operator` removed (the #5664 un-escalation, one last time). A cross-repo blocker: left on `loom:operator` |
+| Anything else, and every retired name (`loom:operator-only`, `-decision`, `-mechanical`, `-blocked`) | Untouched here. The retired names may be a human's: the retired-name migration maps them to `loom:operator`, a park |
 
-Run it **before** the retired-label migration (`labels migrate --apply
---keep-labels`): it reads the retired operator names too, so an escalation
-still labelled `loom:operator-only` goes straight to `loom:blocked`. A PR held
-only by the retired `loom:operator-only` needs no `loom:blocked` pre-pass (the
-#11795 Q1 plan): since #11861 `loom:operator` parks a PR, so the plain
-migration keeps it parked.
+Only `loom:operator` itself is ever removed, and only where a trusted Champion
+marker (or escalation record) says a role applied it.
+
+**Order and rollout gate.**
+
+1. Every dispatching host runs a daemon **and resynced prompts** that include
+   #11861. #11849 alone is not enough: a daemon with #11849 but not #11861
+   treats `loom:operator` on a PR as not a park, so a PR held by a migrated
+   `loom:operator` becomes workable there, and a pre-#11861 Champion prompt's
+   `LABEL_REPAIR` re-adds `loom:operator` to a migrated hold.
+2. `labels migrate --holds` (dry run, then `--apply`).
+3. `labels migrate --keep-labels` (dry run, then `--apply`), issues and PRs.
+
+Under that gate a PR held only by the retired `loom:operator-only` needs no
+`loom:blocked` pre-pass (the #11795 Q1 plan): `loom:operator` parks a PR on
+every host, so the retired-name migration keeps it parked. This departs from
+the #11795 Q1 ruling (option 2) and is recorded for the operator there.
 
 After the migration, Champion's Pass 0 un-escalation is retired from the
 prompts: Step 4 blocks a new dependency-only finding (#11860) on
