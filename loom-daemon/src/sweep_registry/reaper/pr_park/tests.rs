@@ -24,6 +24,8 @@ use tempfile::tempdir;
 /// - `api repos/<owner>/<repo>/issues/<pr> --jq .labels[].name` prints
 ///   `pr_labels` (whitespace-separated, one name per line);
 /// - the same endpoint for any OTHER number prints `issue_labels`;
+/// - the release's issue-signals read (`closed_at` in its `--jq`) reports
+///   the issue open, so the #11852 open-PR hold is asked;
 /// - the `--jq '{state, is_pr: …}'` form of that endpoint reports an open,
 ///   non-PR node so the 2.5 closed-issue guard passes;
 /// - `issue view` reports "not blocked" so `restore_label_to_ready` takes its
@@ -47,6 +49,10 @@ fn pr_park_registry(
              exit 0\n\
              fi\n\
              {gql}\
+             if [[ \"$1\" == \"api\" && \"$2\" == repos/* && \"$*\" == *closed_at* ]]; then\n\
+             printf '%s\\n' '{{\"state\":\"open\",\"closed_at\":null,\"labels\":[]}}'\n\
+             exit 0\n\
+             fi\n\
              if [[ \"$1\" == \"api\" && \"$2\" == repos/* && \"$*\" == *is_pr* ]]; then\n\
              printf '%s\\n' '{state}'\n\
              exit 0\n\

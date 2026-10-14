@@ -125,8 +125,10 @@ impl SweepRegistry {
         // Issue #11852: and, only when the re-add would STILL happen, is the
         // issue's PR open? Then the issue keeps `loom:building` while it is,
         // and nothing is written. A fresh memo is fine (here `Open` prevents a
-        // write); anything else releases as before (see `open_pr_veto`).
-        if !(veto.is_some() || is_pr || closed == Some(true) || never_ready) {
+        // write); anything else releases as before (see `open_pr_veto`). Asked
+        // only once the signals read verified the issue OPEN: a forge that
+        // could not answer that read (a wedged `gh`, #3973) is not asked more.
+        if veto.is_none() && !is_pr && closed == Some(false) && !never_ready {
             if let Some(pr) = self.release_open_linked_pr(issue) {
                 log::info!(
                     "sweep_registry: restore_label_to_ready for #{issue} found open linked PR \

@@ -30,7 +30,10 @@
 //! [`restore_label_to_ready_checked`](SweepRegistry::restore_label_to_ready_checked),
 //! so every release path gets it, and it is asked only when the re-add would
 //! otherwise happen: a veto label, a PR, a closed issue or a never-ready claim
-//! already decides the outcome without a probe.
+//! already decides the outcome without a probe. It also needs the issue
+//! verified OPEN by the release's own signals read: when that read failed
+//! (a wedged or rate-limited `gh`), the probe is skipped and the release goes
+//! ahead, so a dead forge costs no extra bounded calls (#3973).
 //!
 //! # When the PR closes
 //!

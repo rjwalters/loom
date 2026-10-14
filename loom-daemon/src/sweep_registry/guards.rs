@@ -2696,12 +2696,13 @@ exit 0
         let cwds: Vec<_> = recorded.lines().filter(|l| !l.is_empty()).collect();
         assert_eq!(
             cwds.len(),
-            7,
-            "expected the flip (1) + restore (#11480's issue-signals read, failing open on \
-             the empty fake; #4653's `is_pr` `resolve_owner_repo` lookup, which bails; \
-             #10955's label-history read; #11852's open-PR probe, whose repo lookup bails \
-             on each of its 2 attempts; then the edit — 6) to invoke gh 7 times; \
-             got cwds: {cwds:?}"
+            5,
+            "expected the flip (1 call) + restore (#11480's one issue-signals read for the \
+             shared veto and #9463's closed state — the fake `gh` prints nothing, so it fails \
+             open, and #11852's open-PR probe is skipped for an unverified state — Issue \
+             #4653's `is_pr` `resolve_owner_repo` lookup, which bails, Issue #10955's \
+             label-history read, then the edit — 4 calls) to invoke gh 5 times; got cwds: \
+             {cwds:?}"
         );
         for cwd in &cwds {
             let got = std::fs::canonicalize(cwd).unwrap();
