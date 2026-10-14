@@ -45,13 +45,18 @@
 # target no longer exists in the checkout are pruned so a renamed/removed role
 # does not leave a broken agent behind forever.
 #
-# ── Transition precedence (NOT a bug) ─────────────────────────────────────────
-# Until Phase 6 (#4254) strips the committed per-repo copies, an already-
-# installed consumer repo keeps its `.claude/commands/loom/*` files, and Claude
-# Code resolves a project-level definition over a user-level one when names
-# collide. Those repos therefore keep resolving their (possibly stale) copies
-# until migration; this provisioning only changes what FRESH installs and
-# POST-migration repos resolve. Coexistence is expected and does not error.
+# ── Precedence: the user-scope copy WINS (it is not a fallback) ──────────────
+# This header used to say Claude Code resolves a project-level definition over a
+# user-level one when names collide, so a repo's committed
+# `.claude/commands/loom/*` copies would keep winning until migration. That is
+# not what the fleet observed (2AMLogic/2am#4345, 2026-10-14): on hosts whose
+# `~/.claude/commands/loom` linked into a month-old `~/.local/share/loom` clone,
+# every `/loom:<role>` session loaded the USER-scope file (the transcript's
+# prompt matched it byte for byte, not the repo's fresh copy), and agents
+# re-applied labels the repo's own docs had retired. So the checkout these
+# links point into is the role prompt every repo on the host runs, and it must
+# never be older than the source a caller just synced from: see
+# `provision_loom_skills`'s [reference_root].
 
 # Emit a skills-provision status line (plain text so sourcing tests can assert).
 _pskill_ok()   { echo "  [loom-skills] $*"; }
@@ -67,13 +72,23 @@ PROVISIONED_SKILLS_LINK=""
 # shellcheck disable=SC2034
 PROVISIONED_AGENT_LINKS=""
 
-# provision_loom_skills [checkout_dir] [claude_dir]
+# provision_loom_skills [checkout_dir] [claude_dir] [reference_root]
+#
+# [reference_root] is the Loom source tree the caller just synced from (e.g.
+# resync-installed.sh's SOURCE_ROOT). When given, and <checkout_dir> is a
+# different tree whose VERSION is OLDER (or unreadable, or it lacks the skills
+# tree), the links point into <reference_root> instead, with a warning: a
+# stale machine checkout would otherwise shadow every repo's fresher
+# project-level role prompts (see "Precedence" above).
 #
 # Best-effort — never fatal. Returns 1 on a soft failure so the caller can note
 # it, but the installer must NOT abort on a non-zero return.
 provision_loom_skills() {
     local checkout_dir="${1:-${LOOM_HOME:-$HOME/.local/share/loom}}"
     local claude_dir="${2:-$HOME/.claude}"
+    local reference_root="${3:-}"
+
+    checkout_dir="$(_pskill_pick_checkout "$checkout_dir" "$reference_root")"
 
     local commands_src="$checkout_dir/defaults/.claude/commands/loom"
     local agents_src="$checkout_dir/defaults/.claude/agents"
@@ -185,6 +200,66 @@ deprovision_loom_skills() {
 }
 
 # ── internal helpers ─────────────────────────────────────────────────────────
+
+# _pskill_version <tree> — the tree's VERSION (first line, whitespace
+# stripped), or empty when unreadable.
+_pskill_version() {
+    local f="$1/VERSION" v=""
+    [[ -r "$f" ]] || return 0
+    IFS= read -r v < "$f" || true
+    printf '%s' "${v//[[:space:]]/}"
+}
+
+# _pskill_version_lt <a> <b> — true iff dotted-numeric <a> < <b>. Compares
+# numerically per component (0.19.27 < 0.19.1160), like
+# defaults/scripts/lib/locate-daemon-bin.sh's _loom_daemon_version_lt. A
+# non-numeric component returns "not less".
+_pskill_version_lt() {
+    local a="$1" b="$2" ap bp
+    for _ in 1 2 3 4; do
+        ap="${a%%.*}"; bp="${b%%.*}"
+        [[ "$ap" =~ ^[0-9]+$ && "$bp" =~ ^[0-9]+$ ]] || return 1
+        (( 10#$ap < 10#$bp )) && return 0
+        (( 10#$ap > 10#$bp )) && return 1
+        case "$a" in *.*) a="${a#*.}" ;; *) a="0" ;; esac
+        case "$b" in *.*) b="${b#*.}" ;; *) b="0" ;; esac
+    done
+    return 1
+}
+
+# _pskill_pick_checkout <checkout_dir> [reference_root] — print the tree the
+# user-scope links should point into: <checkout_dir>, unless <reference_root>
+# is given, carries the skills tree, is a different tree, and <checkout_dir>
+# is older than it (or has no readable VERSION, or no skills tree). The
+# fallback is warned on stderr so the operator can refresh the machine
+# checkout (`loom update` fast-forwards it).
+_pskill_pick_checkout() {
+    local checkout="$1" ref="${2:-}"
+    if [[ -z "$ref" || ! -d "$ref/defaults/.claude/commands/loom" ]]; then
+        printf '%s\n' "$checkout"; return 0
+    fi
+    local c_real r_real
+    c_real="$(cd "$checkout" 2>/dev/null && pwd -P || true)"
+    r_real="$(cd "$ref" 2>/dev/null && pwd -P || true)"
+    if [[ -n "$c_real" && "$c_real" == "$r_real" ]]; then
+        printf '%s\n' "$checkout"; return 0
+    fi
+    local cv rv why=""
+    cv="$(_pskill_version "$checkout")"
+    rv="$(_pskill_version "$ref")"
+    if [[ ! -d "$checkout/defaults/.claude/commands/loom" ]]; then
+        why="has no skills tree"
+    elif [[ -z "$cv" ]]; then
+        why="has no readable VERSION"
+    elif [[ -n "$rv" ]] && _pskill_version_lt "$cv" "$rv"; then
+        why="is at $cv, older than $rv"
+    fi
+    if [[ -n "$why" ]]; then
+        _pskill_warn "machine checkout $checkout $why in $ref; linking user-scope skills into $ref instead, because a stale user-scope /loom:* command shadows every repo's own copy. Refresh it with 'loom update'."
+        printf '%s\n' "$ref"; return 0
+    fi
+    printf '%s\n' "$checkout"
+}
 
 # Establish <dest> as a symlink -> <src> (whole directory). Preserves a real
 # file/dir; repoints a stale symlink; idempotent when already correct.
