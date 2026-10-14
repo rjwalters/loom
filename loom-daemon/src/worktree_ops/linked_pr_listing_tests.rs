@@ -109,3 +109,42 @@ fn a_non_open_row_never_links() {
     row.state = "closed".to_string();
     assert_eq!(verdict(&[row], 123), OpenPrProbe::NoneOpen);
 }
+
+/// The item join's [`linked_issues`] (#11895) answers exactly what
+/// [`classify_open_linked_pr_rows`] answers row by row, so the step engine and
+/// the open-PR guard agree on what links.
+#[test]
+fn linked_issues_agrees_with_the_per_issue_classifier() {
+    let mut branch_only = pr(20, "no phrase here");
+    branch_only.head_ref = Some("feature/issue-123".to_string());
+    let mut fork_branch = fork(pr(21, "unrelated"));
+    fork_branch.head_ref = Some("feature/issue-123".to_string());
+    let mut zero_padded = pr(22, "no phrase");
+    zero_padded.head_ref = Some("feature/issue-0123".to_string());
+    let mut plus_signed = pr(23, "no phrase");
+    plus_signed.head_ref = Some("feature/issue-+123".to_string());
+    let rows = [
+        zero_padded,
+        plus_signed,
+        pr(10, "Closes #123 and part of #124"),
+        pr(11, "Part of #1234"),
+        pr(12, "See #123"),
+        fork(pr(13, "Fixes #123")),
+        branch_only,
+        fork_branch,
+    ];
+    for row in &rows {
+        let (same, untrusted) = link_facts(row, REPO, &policy());
+        let linked = linked_issues(row.body.as_deref(), row.head_ref.as_deref(), same, untrusted);
+        for issue in [123, 124, 1234, 12] {
+            let one =
+                classify_open_linked_pr_rows(std::slice::from_ref(row), issue, REPO, &policy());
+            assert_eq!(
+                linked.contains_key(&issue),
+                one == OpenPrProbe::Open(row.number),
+                "PR #{} / issue #{issue}",
+                row.number
+            );
+        }
+    }
+}

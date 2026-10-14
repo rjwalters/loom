@@ -154,3 +154,29 @@ fn the_switch_reads_the_usual_falsy_values() {
         assert!(!enabled_from(Some(off)), "{off}");
     }
 }
+
+#[test]
+fn pending_check_runs_and_statuses_are_picked_out() {
+    let page = serde_json::json!({"total_count": 3, "check_runs": [
+        {"status": "completed", "started_at": "a"},
+        {"status": "queued"},
+        {"status": "in_progress", "started_at": "b"},
+    ]});
+    assert_eq!(pending_check_runs(&page), vec![String::new(), "b".to_string()]);
+    assert_eq!(check_runs_listed(&page), 3);
+    assert!(!more_check_runs(&page, 3), "a short page is the last");
+    let full: Vec<_> = (0..CI_PAGE)
+        .map(|_| serde_json::json!({"status": "completed"}))
+        .collect();
+    let full = serde_json::json!({"total_count": 101, "check_runs": full});
+    assert!(more_check_runs(&full, CI_PAGE));
+    assert!(!more_check_runs(&full, 101));
+    let combined = serde_json::json!({"state": "pending", "statuses": [
+        {"state": "success", "created_at": "x"},
+        {"state": "pending", "created_at": "y"},
+        {"state": "pending"},
+    ]});
+    assert_eq!(pending_statuses(&combined), vec!["y".to_string(), String::new()]);
+    assert!(pending_statuses(&serde_json::json!({"state": "pending", "statuses": []})).is_empty());
+    assert!(pending_check_runs(&serde_json::json!({})).is_empty());
+}

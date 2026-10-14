@@ -31,22 +31,40 @@
 //!
 //! A PR in the issue's GitHub closes-graph (`closedByPullRequestsReferences`,
 //! closed PRs included: a closing keyword such as `Closes #N`, or a
-//! Development-sidebar link) is `MERGED`, and merged after the issue was
-//! last reopened. A `Part of #N` / `Refs #N` PR is not in the closes-graph,
-//! so its merge never counts: that work is unfinished, and the issue keeps
-//! its stage (the no-op cooldown handles a dispatch that finds nothing to
-//! do). A merge older than the issue's last reopen is a person asking for
-//! more work, and does not count either.
+//! Development-sidebar link) is `MERGED`, merged after the issue was last
+//! reopened, and belongs to the issue's own repository. A `Part of #N` /
+//! `Refs #N` PR is not in the closes-graph, so its merge never counts: that
+//! work is unfinished, and the issue keeps its stage (the no-op cooldown
+//! handles a dispatch that finds nothing to do). A merge older than the
+//! issue's last reopen is a person asking for more work, and does not count
+//! either. Nor does a PR merged in another repository whose body says
+//! `Closes owner/repo#N` (#11899): it is in the closes-graph, but anyone can
+//! write that line in a repo of their own.
 //!
 //! # At most once
 //!
 //! Before routing, the issue's comments are read for [`route_marker`] naming
 //! the same PR. If it is there, Curator already saw this landing and put the
-//! issue back in the build queue: the verdict is *kept*, remembered for the
-//! life of the process, and the issue is dispatched as normal. The label
-//! swap also takes the issue out of every host's candidate listing. A
-//! `loom:frozen`, park-labelled or claimed issue is never relabelled; it
-//! still gets the cooldown.
+//! issue back in the build queue: the verdict is *kept*, and the issue is
+//! dispatched as normal. The label swap also takes the issue out of every
+//! host's candidate listing. A `loom:frozen`, park-labelled or claimed issue
+//! is never relabelled; it still gets the cooldown.
+//!
+//! The host also remembers which landing it handed to Curator for each issue
+//! (routed, or found kept), so an answer naming the same PR again is *kept*
+//! without a comment read. That record is what stops a route whose comment
+//! write failed from routing again every cooldown (#11901). A kept verdict is
+//! re-asked like any other, so a second closing PR that merges while the
+//! issue stays open is a new landing and is routed in its turn (#11901).
+//!
+//! # Lifting the cooldown
+//!
+//! A landed candidate under this host's landed cooldown that is listed again
+//! (Curator put it back, or someone relabelled it) is asked about at once
+//! when this host routed it, or after [`LANDED_RECHECK`] otherwise. If it was
+//! reopened after the merge, or the answer is *kept*, the cooldown is lifted
+//! here and on every peer and the issue dispatches this tick, rather than
+//! after six hours ([`lift_in`], #11901).
 //!
 //! # Cost
 //!
@@ -63,7 +81,7 @@
 //! or a truncated closes-graph is no verdict: the candidate goes to
 //! `dispatch()` as before. Only a verified merged closing PR removes it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -113,7 +131,8 @@ pub fn route_comment(pr: u32) -> String {
 // ---------------------------------------------------------------------------
 
 /// One aliased query: each issue's state, its last reopen, and its
-/// closes-graph with closed (and so merged) PRs included.
+/// closes-graph with closed (and so merged) PRs included, each PR naming its
+/// repository.
 #[must_use]
 pub fn landed_query(owner: &str, name: &str, issues: &[u32]) -> String {
     let fields: String = issues
@@ -123,7 +142,7 @@ pub fn landed_query(owner: &str, name: &str, issues: &[u32]) -> String {
                 " i{n}: issue(number: {n}) {{ state timelineItems(itemTypes: [REOPENED_EVENT], \
                  last: 1) {{ nodes {{ ... on ReopenedEvent {{ createdAt }} }} }} \
                  closedByPullRequestsReferences(first: {CLOSING_FIRST}, includeClosedPrs: true) \
-                 {{ totalCount nodes {{ number state mergedAt }} }} }}"
+                 {{ totalCount nodes {{ number state mergedAt repository {{ nameWithOwner }} }} }} }}"
             )
         })
         .collect();
@@ -136,12 +155,14 @@ fn ts(v: &Value) -> Option<DateTime<Utc>> {
         .map(|d| d.with_timezone(&Utc))
 }
 
-/// The verdict for one issue's alias: `Some(Some(pr))` landed by `pr` (the
-/// latest qualifying merge), `Some(None)` verified not landed, `None` no
-/// verdict (alias missing, malformed, or a truncated graph with no merge in
-/// it).
+/// The verdict for one issue's alias in repository `repo` (`owner/name`):
+/// `Some(Some(pr))` landed by `pr` (the latest qualifying merge), `Some(None)`
+/// verified not landed, `None` no verdict (alias missing, malformed, or a
+/// truncated graph with no merge in it). Only a PR of `repo` itself
+/// qualifies (#11899): a cross-repo `Closes owner/repo#N` is anyone's to
+/// write, and a PR naming no repository is not trusted to be this one.
 #[must_use]
-pub fn alias_verdict(issue: &Value) -> Option<Option<u32>> {
+pub fn alias_verdict(issue: &Value, repo: &str) -> Option<Option<u32>> {
     let state = issue.get("state")?.as_str()?;
     if !state.eq_ignore_ascii_case("open") {
         // A closed issue is the 2.5 guard's to refuse, not this pre-filter's.
@@ -155,6 +176,11 @@ pub fn alias_verdict(issue: &Value) -> Option<Option<u32>> {
     let landed = nodes
         .iter()
         .filter(|pr| pr["state"].as_str() == Some("MERGED"))
+        .filter(|pr| {
+            pr["repository"]["nameWithOwner"]
+                .as_str()
+                .is_some_and(|r| r.eq_ignore_ascii_case(repo))
+        })
         .filter_map(|pr| {
             let number = u32::try_from(pr["number"].as_u64()?).ok()?;
             let merged = ts(&pr["mergedAt"]);
@@ -175,10 +201,11 @@ pub fn alias_verdict(issue: &Value) -> Option<Option<u32>> {
     (usize::try_from(total).ok() == Some(nodes.len())).then_some(None)
 }
 
-/// Parse a [`landed_query`] answer: the verdict of each issue that has one.
-/// `None` when the answer carries no `data.repository` at all.
+/// Parse a [`landed_query`] answer for repository `repo` (`owner/name`): the
+/// verdict of each issue that has one. `None` when the answer carries no
+/// `data.repository` at all.
 #[must_use]
-pub fn parse_landed(body: &str, issues: &[u32]) -> Option<HashMap<u32, Option<u32>>> {
+pub fn parse_landed(body: &str, issues: &[u32], repo: &str) -> Option<HashMap<u32, Option<u32>>> {
     let json: Value = serde_json::from_str(body.trim()).ok()?;
     let repository = json.get("data")?.get("repository")?;
     if !repository.is_object() {
@@ -187,7 +214,7 @@ pub fn parse_landed(body: &str, issues: &[u32]) -> Option<HashMap<u32, Option<u3
     Some(
         issues
             .iter()
-            .filter_map(|n| Some((*n, alias_verdict(repository.get(format!("i{n}"))?)?)))
+            .filter_map(|n| Some((*n, alias_verdict(repository.get(format!("i{n}"))?, repo)?)))
             .collect(),
     )
 }
@@ -229,6 +256,10 @@ pub trait LandedForge {
 pub enum Route {
     /// `loom:issue` swapped for `loom:triage`, comment posted.
     Routed,
+    /// The labels were swapped but the comment failed, so no marker is on
+    /// the forge: only this host's own record of the route stops it being
+    /// routed again (#11901).
+    RoutedUnmarked,
     /// Curator already saw this landing and kept the issue: not landed.
     Kept,
     /// Left as it is (a veto label, no `loom:issue`, a failed read or write);
@@ -267,7 +298,11 @@ pub fn route_to_curator<F: LandedForge + ?Sized>(forge: &mut F, issue: u32, pr: 
         return Route::Unrouted("removing loom:issue failed");
     }
     if !forge.comment(issue, &route_comment(pr)) {
-        log::warn!("work_finder: routed issue #{issue} to Curator, but its comment failed");
+        log::warn!(
+            "work_finder: routed issue #{issue} to Curator, but its comment failed; this host \
+             records the route itself (#11901)"
+        );
+        return Route::RoutedUnmarked;
     }
     Route::Routed
 }
@@ -280,7 +315,8 @@ pub fn route_to_curator<F: LandedForge + ?Sized>(forge: &mut F, issue: u32, pr: 
 enum Verdict {
     NotLanded,
     Landed(u32),
-    /// Curator kept the issue after this landing: never asked again.
+    /// Curator already saw this landing and kept the issue: dispatchable.
+    /// Re-asked like any verdict, so a later landing is seen (#11901).
     Kept(u32),
 }
 
@@ -288,29 +324,91 @@ enum Verdict {
 #[derive(Debug, Default)]
 pub struct LandedCache {
     verdicts: HashMap<u32, (Instant, Verdict)>,
+    /// The landing this host handed to Curator for each issue: routed here,
+    /// or found kept. A later answer naming the same PR is kept without a
+    /// comment read, which also covers a route whose comment failed (#11901).
+    handed: HashMap<u32, u32>,
+    /// Issues this host routed whose return to the queue has not been asked
+    /// about yet: [`lift`] asks at once, not after [`LANDED_RECHECK`].
+    routed: HashSet<u32>,
 }
 
 impl LandedCache {
+    fn stale(&self, issue: u32, now: Instant) -> bool {
+        self.verdicts
+            .get(&issue)
+            .is_none_or(|(at, _)| now.saturating_duration_since(*at) >= LANDED_RECHECK)
+    }
+
     /// The candidates to ask about at `now`: no verdict, or one older than
     /// [`LANDED_RECHECK`], at most [`LANDED_BATCH`]. Forgets the verdict of
     /// every issue in `open_pr`, so the tick its PR merges asks again.
     fn due(&mut self, candidates: &[u32], open_pr: &[u32], now: Instant) -> Vec<u32> {
         for issue in open_pr {
-            if !matches!(self.verdicts.get(issue), Some((_, Verdict::Kept(_)))) {
-                self.verdicts.remove(issue);
-            }
+            self.verdicts.remove(issue);
         }
         candidates
             .iter()
             .copied()
-            .filter(|n| match self.verdicts.get(n) {
-                None => true,
-                Some((_, Verdict::Kept(_))) => false,
-                Some((at, _)) => now.saturating_duration_since(*at) >= LANDED_RECHECK,
-            })
+            .filter(|n| self.stale(*n, now))
             .take(LANDED_BATCH)
             .collect()
     }
+
+    fn landed(&self, issue: u32) -> Option<u32> {
+        match self.verdicts.get(&issue) {
+            Some((_, Verdict::Landed(pr))) => Some(*pr),
+            _ => None,
+        }
+    }
+}
+
+/// Ask about `ask` and record each answer, routing every new landing to
+/// Curator. Returns the issues the forge answered for.
+fn settle<F: LandedForge + ?Sized>(
+    forge: &mut F,
+    cache: &mut LandedCache,
+    ask: &[u32],
+    now: Instant,
+) -> Vec<u32> {
+    if ask.is_empty() {
+        return Vec::new();
+    }
+    let mut answered = Vec::new();
+    let mut fresh: Vec<(u32, u32)> = Vec::new();
+    for (issue, verdict) in forge.closing_verdicts(ask).unwrap_or_default() {
+        answered.push(issue);
+        let verdict = match verdict {
+            None => Verdict::NotLanded,
+            Some(pr) if cache.handed.get(&issue) == Some(&pr) => Verdict::Kept(pr),
+            Some(pr) => {
+                fresh.push((issue, pr));
+                Verdict::Landed(pr)
+            }
+        };
+        cache.verdicts.insert(issue, (now, verdict));
+    }
+    fresh.sort_unstable();
+    for (issue, pr) in fresh {
+        let route = route_to_curator(forge, issue, pr);
+        log::info!(
+            "work_finder: issue #{issue} is still open but its closing PR #{pr} has merged; \
+             not dispatching it ({route:?}, #11853)"
+        );
+        match route {
+            Route::Kept => {
+                cache.handed.insert(issue, pr);
+                cache.verdicts.insert(issue, (now, Verdict::Kept(pr)));
+            }
+            Route::Routed | Route::RoutedUnmarked => {
+                cache.handed.insert(issue, pr);
+                cache.routed.insert(issue);
+            }
+            Route::Unrouted(_) => {}
+        }
+    }
+    answered.sort_unstable();
+    answered
 }
 
 /// Every candidate in `candidates` verified landed, mapped to its merged
@@ -324,35 +422,38 @@ pub fn detect<F: LandedForge + ?Sized>(
     now: Instant,
 ) -> HashMap<u32, u32> {
     let ask = cache.due(candidates, open_pr, now);
-    let mut fresh: Vec<(u32, u32)> = Vec::new();
-    if !ask.is_empty() {
-        for (issue, verdict) in forge.closing_verdicts(&ask).unwrap_or_default() {
-            let verdict = match verdict {
-                None => Verdict::NotLanded,
-                Some(pr) => {
-                    fresh.push((issue, pr));
-                    Verdict::Landed(pr)
-                }
-            };
-            cache.verdicts.insert(issue, (now, verdict));
-        }
-    }
-    fresh.sort_unstable();
-    for (issue, pr) in fresh {
-        let route = route_to_curator(forge, issue, pr);
-        log::info!(
-            "work_finder: issue #{issue} is still open but its closing PR #{pr} has merged; \
-             not dispatching it ({route:?}, #11853)"
-        );
-        if route == Route::Kept {
-            cache.verdicts.insert(issue, (now, Verdict::Kept(pr)));
-        }
-    }
+    settle(forge, cache, &ask, now);
     candidates
         .iter()
-        .filter_map(|n| match cache.verdicts.get(n) {
-            Some((_, Verdict::Landed(pr))) => Some((*n, *pr)),
-            _ => None,
+        .filter_map(|n| cache.landed(*n).map(|pr| (*n, pr)))
+        .collect()
+}
+
+/// Of `held`, listed candidates under this host's landed cooldown, the ones
+/// whose cooldown has nothing left to protect (#11901): reopened after the
+/// merge, or kept by Curator. An issue this host routed is asked about the
+/// first time it is listed again; any other once its verdict is
+/// [`LANDED_RECHECK`] old. A new landing is routed like any other.
+pub fn lift<F: LandedForge + ?Sized>(
+    forge: &mut F,
+    cache: &mut LandedCache,
+    held: &[u32],
+    now: Instant,
+) -> Vec<u32> {
+    let ask: Vec<u32> = held
+        .iter()
+        .copied()
+        .filter(|n| cache.routed.contains(n) || cache.stale(*n, now))
+        .take(LANDED_BATCH)
+        .collect();
+    let answered = settle(forge, cache, &ask, now);
+    for n in &answered {
+        cache.routed.remove(n);
+    }
+    answered
+        .into_iter()
+        .filter(|n| {
+            matches!(cache.verdicts.get(n), Some((_, Verdict::NotLanded | Verdict::Kept(_))))
         })
         .collect()
 }
@@ -406,6 +507,50 @@ pub fn landed_in(
         }
     }
     landed
+}
+
+/// [`super::WorkDispatcher::lift_landed_cooldowns`] for the production
+/// dispatcher (#11901): [`lift`] over the `held` candidates under this host's
+/// own landed cooldown, then each lifted one's cooldown cleared here and on
+/// every peer. Empty whenever nothing can be verified. The registry lock is
+/// never held across a forge call.
+#[must_use]
+pub fn lift_in(registry: &Arc<Mutex<SweepRegistry>>, held: &[u32]) -> HashSet<u32> {
+    let (mine, target) = match registry.lock() {
+        Ok(reg) => {
+            let landed = reg.landed_cooldown_issues();
+            let mine: Vec<u32> = held
+                .iter()
+                .copied()
+                .filter(|n| landed.contains(n))
+                .collect();
+            (mine, reg.open_pr_listing_target())
+        }
+        Err(_) => return HashSet::new(),
+    };
+    let Some((gh_bin, root, slug)) = target.filter(|_| !mine.is_empty()) else {
+        return HashSet::new();
+    };
+    let mut forge = GhLandedForge {
+        gh_bin,
+        root: root.clone(),
+        slug,
+    };
+    let lifted = {
+        let mut all = caches()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cache = all.entry(root).or_default();
+        lift(&mut forge, cache, &mine, Instant::now())
+    };
+    if !lifted.is_empty() {
+        if let Ok(mut reg) = registry.lock() {
+            for issue in &lifted {
+                reg.clear_landed_cooldown(*issue);
+            }
+        }
+    }
+    lifted.into_iter().collect()
 }
 
 /// The live forge: `gh` against `slug` from the workspace `root`.
@@ -486,7 +631,7 @@ impl LandedForge for GhLandedForge {
         // `gh` exits non-zero when any alias errored but still prints the
         // partial `data`: parse first, judge per alias.
         let out = gh_call::output(inv).ok()?;
-        let parsed = parse_landed(&String::from_utf8_lossy(&out.stdout), issues);
+        let parsed = parse_landed(&String::from_utf8_lossy(&out.stdout), issues, &self.slug);
         if parsed.is_none() {
             let stderr = gh_call::stderr(&out);
             crate::rate_limit_breaker::global_observe_failure(&stderr, CALLER);
