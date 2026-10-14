@@ -210,6 +210,44 @@ pub(crate) fn classify_open_linked_pr_rows(
     linked.map_or(OpenPrProbe::NoneOpen, OpenPrProbe::Open)
 }
 
+/// Every issue one open PR links to under [`classify_open_linked_pr_rows`]'s
+/// rules, ascending: the issues its body names with a linking phrase
+/// ([`super::gh::linkage_refs`], the same phrase families as
+/// [`linkage_phrase_regex`]), plus the Builder branch's issue when the head is
+/// in this same repo. Nothing for a fork PR by a known-untrusted author
+/// (H14). The step engine's item join (#11895, design #11894) reads it, so
+/// the join and the open-PR guard cannot disagree on what links.
+#[must_use]
+pub(crate) fn linked_issues(
+    body: Option<&str>,
+    head_ref: Option<&str>,
+    same_repo: bool,
+    known_untrusted: bool,
+) -> std::collections::BTreeSet<u32> {
+    if !same_repo && known_untrusted {
+        return std::collections::BTreeSet::new();
+    }
+    let mut linked: std::collections::BTreeSet<u32> = body
+        .map(|b| {
+            super::gh::linkage_refs(b)
+                .into_iter()
+                .map(|(n, _)| n)
+                .collect()
+        })
+        .unwrap_or_default();
+    if same_repo {
+        linked.extend(head_ref.and_then(super::naming::issue_from_branch));
+    }
+    linked
+}
+
+/// The two trust facts [`linked_issues`] reads, from a listing row of
+/// `owner_repo`: `(same_repo, known_untrusted)`.
+#[must_use]
+pub(crate) fn link_facts(row: &RestPull, owner_repo: &str, policy: &TrustPolicy) -> (bool, bool) {
+    (is_same_repo(row, owner_repo), policy.known_untrusted(&author_json(row)))
+}
+
 /// The PR's head lives in `owner_repo` itself. An absent head repo (GitHub
 /// omits it for a deleted fork) is not known to be same-repo.
 fn is_same_repo(row: &RestPull, owner_repo: &str) -> bool {

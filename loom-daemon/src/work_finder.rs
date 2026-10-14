@@ -242,6 +242,7 @@ pub mod operator_priority;
 mod ordering;
 pub mod ready_queue;
 mod recheck_interval;
+pub mod step_item;
 mod tick_line;
 mod tick_report;
 mod tick_summary;
