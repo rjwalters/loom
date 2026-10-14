@@ -135,6 +135,18 @@ fn comments_are_read_by_their_updated_at() {
 }
 
 #[test]
+fn pending_checks_exempt_only_while_young() {
+    let at = |h: i64| t(h).to_rfc3339();
+    assert!(pending_exempts(&[at(0)], t(5)));
+    // A run stuck queued past the cutoff no longer exempts the pass.
+    assert!(!pending_exempts(&[at(0)], t(PENDING_EXEMPT_HOURS)));
+    assert!(pending_exempts(&[at(0), at(4)], t(7)));
+    // Missing or garbled stamps never exempt.
+    assert!(!pending_exempts(&[String::new(), "garbage".into()], t(0)));
+    assert!(!pending_exempts(&[], t(0)));
+}
+
+#[test]
 fn the_switch_reads_the_usual_falsy_values() {
     assert!(enabled_from(None));
     assert!(enabled_from(Some("1")));

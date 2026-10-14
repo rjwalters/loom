@@ -344,8 +344,9 @@ fn classic_from_branch(
 /// The contexts a `branches/{ref}` answer's `protection` summary requires
 /// (`contexts` plus `checks[].context`, de-duplicated). An unprotected branch
 /// requires none. A protected branch whose answer carries no `protection`
-/// object is an `Err`: the summary was withheld, not empty, and the caller
-/// fails closed on it.
+/// object, or a `protection` with no `required_status_checks` object (GitHub
+/// always sends one, `enforcement_level: "off"` when unused), is an `Err`:
+/// the summary was withheld, not empty, and the caller fails closed on it.
 pub(crate) fn branch_protection_contexts(body: &str) -> Result<Vec<String>, String> {
     let v: serde_json::Value = serde_json::from_str(body.trim())
         .map_err(|e| format!("branch response was not JSON: {e}"))?;
@@ -360,7 +361,12 @@ pub(crate) fn branch_protection_contexts(body: &str) -> Result<Vec<String>, Stri
             Ok(Vec::new())
         };
     };
-    let checks = protection.pointer("/required_status_checks");
+    let checks = Some(
+        protection
+            .get("required_status_checks")
+            .filter(|c| c.is_object())
+            .ok_or("branch protection summary has no `required_status_checks`")?,
+    );
     let named = checks
         .and_then(|c| c.get("contexts"))
         .and_then(serde_json::Value::as_array)

@@ -356,6 +356,19 @@ result=$(forge_get_required_status_check_contexts "owner/repo" "withheld" "$STUB
 assert_eq "1" "$rc" "#11855: withheld protection summary keeps failing closed"
 assert_eq "" "$result" "#11855: withheld protection summary -> empty stdout"
 
+# Subtest 1.8d (#11855): no `protected` flag, or a protection summary with no
+# `required_status_checks`, is UNKNOWN -> fail closed (matches Rust).
+for shape in noflag norsc; do
+  echo "HTTP 403: Resource not accessible by integration" > "$STUB_DIR/graphql-fail-$shape"
+done
+echo '{"name": "noflag"}' > "$STUB_DIR/branch-noflag.json"
+echo '{"name": "norsc", "protected": true, "protection": {"enabled": true}}' > "$STUB_DIR/branch-norsc.json"
+for shape in noflag norsc; do
+  rc=0
+  forge_get_required_status_check_contexts "owner/repo" "$shape" "$STUB_DIR/gh" >/dev/null 2>&1 || rc=$?
+  assert_eq "1" "$rc" "#11855: REST summary shape '$shape' is unknown -> fails closed"
+done
+
 # Subtest 1.9: BOTH sources error -> fail closed (nonzero exit, empty stdout),
 # matching the Gitea path and the callers' documented fail-closed contract.
 : > "$STUB_DIR/ruleset-fail-dead"

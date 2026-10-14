@@ -34,8 +34,13 @@
 //! ([`hold_until`]): one hour after the first, four after the second, and
 //! after the third until the oldest of the last three ages out of the window.
 //! An unchanged PR therefore gets at most [`MAX_PER_WINDOW`] Judge runs per
-//! window. A push (new head) or a label change (new digest) releases the hold
-//! at once, because the old records no longer match.
+//! window. A push (new head), or a change to the PR's `loom:*` label *set*
+//! (new digest), releases the hold at once, because the old records no longer
+//! match. Removing and re-adding the same label leaves the set — and the hold —
+//! unchanged: to force a re-review of an unchanged PR, push, or run the Judge
+//! with [`DISABLE_ENV`]`=0`. A pass whose head still has a check run in
+//! progress that started within [`PENDING_EXEMPT_HOURS`] is not recorded (CI
+//! settling changes neither head nor labels); a run stuck longer is.
 //!
 //! Only trusted authors' records count (the caller filters): a record
 //! suppresses review, so an outsider must not be able to post one.
@@ -63,6 +68,24 @@ pub const MAX_PER_WINDOW: usize = 3;
 
 /// The hold after the first and the second no-verdict record, in hours.
 const COOLDOWN_HOURS: [i64; MAX_PER_WINDOW - 1] = [1, 4];
+
+/// How long a pending check run exempts a no-verdict pass from the record
+/// (`lease pr release`): CI that is merely running should not hold the PR,
+/// but a run stuck queued forever (no runner) must not exempt every pass,
+/// or the loop this module bounds comes back.
+pub const PENDING_EXEMPT_HOURS: i64 = 6;
+
+/// Whether pending check runs, given their `started_at` stamps (empty when
+/// GitHub sent none), still exempt a pass: at least one started inside
+/// [`PENDING_EXEMPT_HOURS`]. A stamp that is missing or unparseable counts
+/// as stale, so the exemption stays bounded.
+#[must_use]
+pub fn pending_exempts(started: &[String], now: DateTime<Utc>) -> bool {
+    started.iter().any(|s| {
+        DateTime::parse_from_rfc3339(s.trim())
+            .is_ok_and(|t| now - t.with_timezone(&Utc) < Duration::hours(PENDING_EXEMPT_HOURS))
+    })
+}
 
 /// The label whose presence means "still waiting for a Judge".
 pub const REVIEW_LABEL: &str = "loom:review-requested";

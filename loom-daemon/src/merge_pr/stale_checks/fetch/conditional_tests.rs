@@ -287,6 +287,10 @@ fn the_branch_summary_parser_reads_ruleset_only_and_unprotected_branches_as_none
         .unwrap()
         .is_empty());
     assert!(branch_protection_contexts(r#"{"name":"main"}"#).is_err());
+    // A protection summary without `required_status_checks` is withheld,
+    // not "no checks": GitHub always sends that key.
+    let no_rsc = r#"{"protected":true,"protection":{"enabled":true}}"#;
+    assert!(branch_protection_contexts(no_rsc).is_err());
     assert!(branch_protection_contexts("not json").is_err());
 }
 

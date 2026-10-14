@@ -38,26 +38,22 @@ impl Gh {
         Some((open, head, labels))
     }
 
-    /// Whether any check run on `sha` has not completed. Unreadable counts as
-    /// not pending: the backstop stays a best-effort bound.
+    /// Whether `sha` has a check run still in progress that is young enough
+    /// to exempt this pass ([`backstop::pending_exempts`]). Unreadable counts
+    /// as not pending: the backstop stays a best-effort bound.
     pub(crate) fn checks_pending(&self, sha: &str) -> bool {
         let out = self
-            .inv("pr_lease.checks_pending", AccessIntent::Read, ops::PR_VIEW_STATE)
+            .inv("pr_lease.checks_pending", AccessIntent::Read, ops::CI_CHECK_RUNS_FOR_SHA)
             .args([
                 "api",
                 &format!("repos/{{owner}}/{{repo}}/commits/{sha}/check-runs?per_page=100"),
                 "--jq",
-                "[.check_runs[] | select(.status != \"completed\")] | length",
+                "[.check_runs[] | select(.status != \"completed\") | (.started_at // \"\")]",
             ])
             .run();
         out.ok_output()
-            .and_then(|o| {
-                String::from_utf8_lossy(&o.stdout)
-                    .trim()
-                    .parse::<u64>()
-                    .ok()
-            })
-            .is_some_and(|n| n > 0)
+            .and_then(|o| serde_json::from_slice::<Vec<String>>(&o.stdout).ok())
+            .is_some_and(|started| backstop::pending_exempts(&started, Utc::now()))
     }
 }
 
