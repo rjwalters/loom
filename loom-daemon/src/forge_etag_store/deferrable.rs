@@ -104,7 +104,16 @@ pub(super) fn fetch(
     let mut tried: Vec<String> = Vec::new();
     let mut last_failure: Option<Failure> = None;
     loop {
-        let (dir, app_id) = match route(&request) {
+        let offered = route(&request);
+        let offered = if tried
+            .iter()
+            .any(|a| a == crate::forge_gateway::GATEWAY_APP_ID)
+        {
+            crate::forge_gateway::past_gateway(offered, &request, SystemTime::now())
+        } else {
+            offered
+        };
+        let (dir, app_id) = match offered {
             RouteDecision::Reader { dir, app_id, .. }
                 if !tried.contains(&app_id) && tried.len() < MAX_READERS_TRIED =>
             {
@@ -154,10 +163,14 @@ pub(super) fn fetch(
             }
             return Ok(first);
         }
-        if super::is_gateway_outage(Some(&app_id), &first) {
-            // 2am#4367 P4: the relay is down, not the credential: withdraw
-            // it and go on to the readers, then the writer.
-            crate::forge_gateway::outage::withdraw_for_outage(site.caller);
+        let fault = super::gateway_fault(Some(&app_id), &first);
+        if fault.reruns() {
+            // 2am#4367 P4: the gateway failed, not the credential: go on to
+            // the readers, then the writer; withdraw it only when it
+            // signalled the fault itself.
+            if fault == crate::forge_gateway::outage::Fault::Withdraw {
+                crate::forge_gateway::outage::withdraw_for_outage(site.caller);
+            }
             tried.push(app_id);
             last_failure = None;
             continue;

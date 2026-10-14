@@ -137,10 +137,9 @@ fn spec(cmd: &str, verb: &str) -> Option<Spec> {
             ],
             &["-a", "--all"],
         ),
-        ("run", "view") => (
-            &["-j", "--job", "--attempt"],
-            &["--log", "--log-failed", "--exit-status", "-v", "--verbose"],
-        ),
+        // No `--log` / `--log-failed`: a log dump can be large, and the
+        // front buffers a gateway attempt, so it stays direct.
+        ("run", "view") => (&["-j", "--job", "--attempt"], &["--exit-status", "-v", "--verbose"]),
         ("workflow", "list") => (&["-L", "--limit"], &["-a", "--all"]),
         ("workflow", "view") => (&["-r", "--ref"], &["-y", "--yaml"]),
         ("label", "list") => (&["-L", "--limit", "-S", "--search", "--order", "--sort"], &[]),

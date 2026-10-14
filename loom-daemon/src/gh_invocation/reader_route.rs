@@ -42,6 +42,7 @@
 
 use super::{AccessIntent, GhCompletion, GhInvocation, OutputContract};
 use crate::forge_bucket_book::Resource;
+use crate::forge_gateway::outage::Fault;
 use crate::forge_identity::{self, Failure, IdentityRole, ReadClass, RouteDecision, RouteRequest};
 use crate::proc_exec::{Completion, ExecError};
 
@@ -118,12 +119,15 @@ impl GhInvocation {
                 // 2am#4367 P4: a gateway outage falls back to the writer
                 // (legacy routing has no reader spill) and withdraws the
                 // gateway for the default window, not as a credential.
-                if app_id == crate::forge_gateway::GATEWAY_APP_ID
-                    && gateway_outage(result, &self.args)
-                {
-                    outage.set(true);
-                    withdraw_gateway_outage(self.operation.as_str());
-                    return Some(Failure::Credential);
+                if app_id == crate::forge_gateway::GATEWAY_APP_ID {
+                    let fault = gateway_fault(result);
+                    if fault.reruns() {
+                        outage.set(true);
+                        if fault == Fault::Withdraw {
+                            withdraw_gateway_outage(self.operation.as_str());
+                        }
+                        return Some(Failure::Credential);
+                    }
                 }
                 failure_of(result, resource)
             },
@@ -138,20 +142,21 @@ impl GhInvocation {
     }
 }
 
-/// Whether a failed gateway attempt is the relay's outage (a timeout, a
-/// transport error, a `502`/`503`/`504`) rather than an answer
-/// ([`crate::forge_gateway::outage::is_outage`]).
-pub(super) fn gateway_outage(result: &GhCompletion, args: &[std::ffi::OsString]) -> bool {
+/// What a failed gateway attempt calls for
+/// ([`crate::forge_gateway::outage::fault`]); a timeout reruns.
+pub(super) fn gateway_fault(result: &GhCompletion) -> Fault {
     let out = match result {
-        GhCompletion::Captured(Completion::TimedOut { .. }) => return true,
+        GhCompletion::Captured(Completion::TimedOut { .. }) => return Fault::Rerun,
         GhCompletion::Captured(Completion::Exited(out)) if !out.status.success() => out,
-        _ => return false,
+        _ => return Fault::None,
     };
-    let headers = args.first().is_some_and(|a| a == "api")
-        && args.iter().any(|a| a == "-i" || a == "--include");
-    let status = crate::forge_listing::parse_http_response(&String::from_utf8_lossy(&out.stdout))
-        .map(|r| r.status);
-    crate::forge_gateway::outage::is_outage(status, &String::from_utf8_lossy(&out.stderr), headers)
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let response = crate::forge_listing::parse_http_response(&stdout);
+    crate::forge_gateway::outage::fault(
+        response.as_ref(),
+        &stdout,
+        &String::from_utf8_lossy(&out.stderr),
+    )
 }
 
 /// Withdraw the gateway after an outage

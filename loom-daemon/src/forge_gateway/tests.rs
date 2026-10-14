@@ -421,29 +421,82 @@ fn a_profile_path_is_never_committable() {
     assert_eq!(owner_of_profile_dir(&tmp.path().join(".loom/gh-config-by-owner/acme")), None);
 }
 
+/// `--include` stdout for `status` with `headers`.
+fn included(status: u16, headers: &[&str], body: &str) -> String {
+    let mut h = format!("HTTP/2.0 {status} X\r\n");
+    for line in headers {
+        h.push_str(line);
+        h.push_str("\r\n");
+    }
+    format!("{h}\r\n{body}")
+}
+
+/// Only an outage the gateway itself signals withdraws it: a 5xx GitHub
+/// returned through the relay, or a gh that failed before sending anything,
+/// never does.
 #[test]
-fn only_a_transport_error_a_timeout_or_a_bad_gateway_is_an_outage() {
+fn only_an_outage_the_gateway_signals_withdraws_it() {
+    use crate::forge_listing::parse_http_response;
     use outage::{http_status_in, is_outage};
     assert_eq!(http_status_in("gh: Bad Gateway (HTTP 502)"), Some(502));
-    for (status, stderr, headers) in [
-        (Some(502), "", true),
-        (Some(503), "", false),
-        (None, "HTTP 504: Gateway Timeout", false),
-        (None, "", true),
-        (None, "Post \"https://gw/graphql\": dial tcp: connection refused", false),
-        (None, "error connecting to gw.example.com: no such host", false),
+    let check = |stdout: String, stderr: &str| {
+        let r = parse_http_response(&stdout);
+        is_outage(r.as_ref(), &stdout, stderr)
+    };
+    let version = "x-github-proxy-version: 0.4.0";
+    // With headers.
+    let own = included(502, &[version, "x-github-proxy-refusal: upstream_error"], "{}");
+    assert!(check(own, "gh: HTTP 502"), "the gateway's own 502");
+    let edge = included(502, &[], "<html>bad gateway</html>");
+    assert!(check(edge, "gh: HTTP 502"), "no gateway header: the Worker was never reached");
+    let relayed = included(502, &[version], r#"{"message":"Server Error"}"#);
+    assert!(!check(relayed, "gh: HTTP 502"), "GitHub's 502 through the relay");
+    let refused = included(403, &[version, "x-github-proxy-refusal: write_not_permitted"], "{}");
+    assert!(!check(refused, "gh: HTTP 403"), "a refusal is an answer, not an outage");
+    // Without headers: the body on stdout says whose 5xx it is.
+    assert!(check(r#"{"error":"upstream_error","request_id":"abc"}"#.into(), "gh: HTTP 502"));
+    assert!(!check(
+        r#"{"message":"Server Error","documentation_url":"x"}"#.into(),
+        "gh: HTTP 502"
+    ));
+    assert!(
+        !check(String::new(), "gh: Bad Gateway (HTTP 502)"),
+        "unmarked: not the gateway's"
+    );
+    assert!(check(String::new(), "gh: HTTP 522"), "a Cloudflare edge status");
+    // No HTTP status at all: a transport error, or a gh that never sent.
+    for stderr in [
+        "Get \"https://gw/repos/a/b\": dial tcp: connection refused",
+        "error connecting to gw.example.com: no such host",
     ] {
-        assert!(is_outage(status, stderr, headers), "{status:?} {stderr} {headers}");
+        assert!(check(String::new(), stderr), "{stderr}");
     }
-    for (status, stderr, headers) in [
-        (Some(404), "", true),
-        (Some(500), "", true),
-        (None, "gh: Not Found (HTTP 404)", false),
-        (None, "GraphQL: Could not resolve to an Issue with the number of 9.", false),
-        (None, "", false),
+    for stderr in [
+        "unknown flag: --nope",
+        "accepts at most 1 arg(s), received 2",
+        "GraphQL: Could not resolve to an Issue with the number of 9.",
+        "",
     ] {
-        assert!(!is_outage(status, stderr, headers), "{status:?} {stderr} {headers}");
+        assert!(!check(String::new(), stderr), "{stderr}");
     }
+    assert!(!check(included(404, &[version], "{}"), "gh: Not Found (HTTP 404)"));
+
+    // Rerun vs withdraw: any 5xx reruns; only the gateway's own evidence
+    // withdraws.
+    use outage::{fault, Fault};
+    let f = |stdout: String, stderr: &str| {
+        let r = parse_http_response(&stdout);
+        fault(r.as_ref(), &stdout, stderr)
+    };
+    assert_eq!(f(String::new(), "HTTP 500 (https://gw/graphql)"), Fault::Rerun);
+    assert_eq!(f(included(502, &[version], "{}"), "gh: HTTP 502"), Fault::Rerun);
+    assert_eq!(
+        f(included(500, &[version, "x-github-proxy-refusal: misconfigured"], "{}"), ""),
+        Fault::Withdraw
+    );
+    assert_eq!(f(String::new(), "dial tcp: connection refused"), Fault::Withdraw);
+    assert_eq!(f(String::new(), "gh: Not Found (HTTP 404)"), Fault::None);
+    assert_eq!(f(String::new(), "unknown flag: --nope"), Fault::None);
 }
 
 #[test]
