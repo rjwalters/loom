@@ -27,8 +27,9 @@
 //! checks, every mutating entry point refuses with `EXECUTION_DORMANT` even
 //! when `champion.mergeMode=queue` — and under `direct` (the default) it
 //! refuses with `NOT_QUEUE_MODE` before any forge call. The daemon tick
-//! and the stale-verdict paths call the lifecycle (no-ops in direct mode); no
-//! role prompt or `merge-pr.sh` invokes the handoff yet (honest gap, #10256). The
+//! and the stale-verdict paths call the lifecycle (no-ops in direct mode).
+//! Champion's targeted `--pr` step calls `forge merge-queue step` before
+//! `merge-pr.sh` (#11871); `merge-pr.sh` itself does not invoke the handoff. The
 //! read-only `status`, `preflight`, and `mode` verbs are always available.
 //!
 //! # CLI exit codes

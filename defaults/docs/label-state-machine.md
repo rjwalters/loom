@@ -41,6 +41,8 @@ leaves the issue uncurated. The rubric is in `.loom/docs/story-points.md`.
 
 ## The three holds (#11795)
 
+> **Step dispatch (accepted design, #11894; not yet implemented).** Step dispatch adds a `queued` item state (a PR in GitHub's merge queue, never drawn for a merge step), makes `labels.json`'s `stale_after_minutes` live for the five claim labels, and restores each claim to its own role's ready stage when a step dies. See [`docs/design/work-finder-step-dispatch.md`](https://github.com/rjwalters/loom/blob/main/docs/design/work-finder-step-dispatch.md) §12.
+
 Loom has three hold labels, each with one meaning:
 
 | Label | Meaning | Release |
