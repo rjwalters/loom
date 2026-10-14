@@ -159,28 +159,6 @@ fn an_unreadable_list_is_unknown_never_free() {
 
 // ---- fence --------------------------------------------------------------
 
-/// Judge blocker 2: a lease claimed with `--step X` is the same holder's when
-/// it fences or reads its state with no `--step`; the step is an attribute.
-#[test]
-fn a_stepped_claim_is_owned_by_the_same_session_without_the_step() {
-    let plain = who(Role::Champion, "sweep-a");
-    let stepped = Identity::new(
-        Role::Champion,
-        plain.host.clone(),
-        "sweep-a".into(),
-        Some(StepRole::ChampionPromote),
-    )
-    .unwrap();
-    let rows = [lease(10, 0, &stepped)];
-    assert_eq!(fence(Some(&rows), &plain, now(), ttl()), Fence::Pass);
-    assert!(matches!(state(&rows, &plain), ClaimState::HeldBySelf { id: 10 }));
-    // Aged out: still recognised as its own (expired, not a peer's).
-    assert_eq!(fence(Some(&[lease(10, 30, &stepped)]), &plain, now(), ttl()), Fence::Expired);
-    // A different sweep is still a peer.
-    let other = who(Role::Champion, "sweep-b");
-    assert_eq!(fence(Some(&rows), &other, now(), ttl()), Fence::Superseded(stepped.clone()));
-}
-
 #[test]
 fn fence_passes_the_holder_and_stops_everyone_else() {
     let a = who(Role::Doctor, "sweep-a");
@@ -553,7 +531,7 @@ case " $* " in
     printf '{{"id":%s,"updated_at":"%s","body":"%s",%s}}\n' "$cid" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$first" '{AUTHOR}' >> "$D/rows.tmp"
     mv "$D/rows.tmp" "$D/rows" ;;
   *"/check-runs"*) [ -f "$D/checks" ] || exit 1; cat "$D/checks" ;;
-  *"/pulls/"*) cat "$D/pull" 2>/dev/null || echo "" ;;
+  *"/pulls/"*) echo "$*" >> "$D/pulled"; cat "$D/pull" 2>/dev/null || echo "" ;;
   *"/comments"*)
     n=$(cat "$D/reads" 2>/dev/null || echo 0); echo $((n + 1)) > "$D/reads"
     if [ "$n" -ge 1 ] && [ -f "$D/late" ]; then cat "$D/late" >> "$D/rows"; rm "$D/late"; fi
@@ -966,8 +944,9 @@ fn the_step_token_is_additive() {
     assert_eq!(parse_record(&old.lease_marker()), Some(Record::Lease(old.clone())));
     let stepped =
         Identity::new(Role::Judge, old.host.clone(), "s".into(), Some(StepRole::Judge)).unwrap();
-    assert_ne!(stepped, old);
-    assert!(stepped.same_holder(&old), "the step is not part of who holds the lease");
+    // Ownership is (role, host, sweep): the step is metadata (#11950 review).
+    assert_eq!(stepped, old);
+    assert_ne!(stepped.step, old.step);
     let marker = stepped.lease_marker();
     let tokens: Vec<&str> = marker.split_whitespace().collect();
     assert_eq!(tokens[2..5], ["role=judge", "host=host-a1b2c3d4", "sweep=s"]);
@@ -1022,3 +1001,92 @@ fn the_lib_role_lease_reader_agrees_with_parse_record() {
 
 #[path = "step_claim_tests.rs"]
 mod step_claim;
+/// #11950 review: a Champion that claimed with `--step champion_promote`
+/// fences and releases its own lease with plain `--role champion` (default
+/// step `champion_merge`) from the same host and sweep.
+#[test]
+fn a_step_less_fence_and_release_find_the_sessions_stepped_lease() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    let claimed = Identity::new(
+        Role::Champion,
+        "host-a".into(),
+        "run-1".into(),
+        Some(StepRole::ChampionPromote),
+    )
+    .unwrap();
+    assert_eq!(ctx(dir.path(), claimed.clone()).claim(), EXIT_HELD);
+    let plain = Identity::new(Role::Champion, "host-a".into(), "run-1".into(), None).unwrap();
+    assert_eq!(plain.step, Some(StepRole::ChampionMerge), "the default step differs");
+    assert_eq!(ctx(dir.path(), plain.clone()).fence(), EXIT_HELD, "own lease, not a peer's");
+    assert_eq!(ctx(dir.path(), plain.clone()).check(), EXIT_HELD);
+    assert_eq!(ctx(dir.path(), plain).release(), EXIT_HELD);
+    // The released marker keeps the lease's own step.
+    assert!(
+        patched(dir.path()).contains(&claimed.released_marker()),
+        "{}",
+        patched(dir.path())
+    );
+    // And the claim is free at once for a peer Champion.
+    let peer = Identity::new(Role::Champion, "host-b".into(), "run-2".into(), None).unwrap();
+    assert_eq!(ctx(dir.path(), peer).check(), EXIT_HELD);
+}
+
+/// #11950 review: a reap with no step (the role runner's) reaps a stepped lease.
+#[test]
+fn a_step_less_reap_reaps_a_stepped_lease() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    let stepped =
+        Identity::new(Role::Judge, "host-a".into(), "run-1".into(), Some(StepRole::Judge)).unwrap();
+    fs::write(dir.path().join("rows"), live_row(100, &stepped)).unwrap();
+    let plain = Identity::new(Role::Judge, "host-a".into(), "run-1".into(), None).unwrap();
+    assert_eq!(ctx(dir.path(), plain).reap("timeout"), EXIT_HELD);
+    let patch = patched(dir.path());
+    assert!(patch.contains("repos/acme/widgets/issues/comments/100"), "{patch}");
+    assert!(
+        patch.contains("loom:pr-lease-released role=judge host=host-a sweep=run-1 step=judge"),
+        "{patch}"
+    );
+}
+
+/// The issue-scoped leases never read a PR head on release (it would 404).
+#[test]
+fn an_issue_scoped_release_reads_no_pr_head() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    let curator = Identity::new(Role::Curator, "host-a".into(), "run-1".into(), None).unwrap();
+    fs::write(dir.path().join("rows"), live_row(100, &curator)).unwrap();
+    assert_eq!(ctx(dir.path(), curator.clone()).release(), EXIT_HELD);
+    assert!(patched(dir.path()).contains(&curator.released_marker()));
+    assert!(!dir.path().join("pulled").exists(), "no PR read for a Curator lease");
+}
+
+/// #11950 review: the lib-side holder reader (a dead step's restore) and this
+/// module agree that ownership ignores the step: a stepped lease yielded by a
+/// step-less record of the same session holds nothing on either side, and the
+/// next lease is the holder on both.
+#[test]
+fn the_lib_and_bin_lease_holders_agree_when_steps_differ() {
+    use loom_daemon::sweep_registry::step_lease_owner::{earliest_live_holder, RoleLeaseRow};
+    let stepped =
+        Identity::new(Role::Judge, "host-a".into(), "run-1".into(), Some(StepRole::Judge)).unwrap();
+    let plain = Identity::new(Role::Judge, "host-a".into(), "run-1".into(), None).unwrap();
+    let next = Identity::new(Role::Judge, "host-b".into(), "run-2".into(), None).unwrap();
+    let rows = vec![
+        row(1, 1, stepped.lease_marker()),
+        row(2, 1, next.lease_marker()),
+        row(3, 1, plain.yield_marker(&next)),
+    ];
+    let bin = live_leases(&rows, Role::Judge, now(), ttl());
+    assert_eq!(bin.first().map(|l| l.holder.sweep.as_str()), Some("run-2"));
+    let lib_rows: Vec<RoleLeaseRow> = rows
+        .iter()
+        .map(|r| RoleLeaseRow {
+            id: r.id,
+            updated_at: r.updated_at,
+            body: r.body.clone(),
+        })
+        .collect();
+    assert_eq!(earliest_live_holder(&lib_rows, "judge", now(), ttl()).as_deref(), Some("run-2"));
+}

@@ -276,7 +276,9 @@ hands: Doctor skips it and Judge and Champion never see it. The Capped-PR
 Recovery Pass, which also reads `loom:blocked` + `loom:changes-requested`,
 never grants it a cycle or removes `loom:blocked`; it posts one comment
 (`<!-- champion:capped-hold-recommendation -->`) asking a human to review it,
-close it or remove the hold. Find such PRs with
+close it or remove the hold, and adds `loom:operator` (the inbox, #11905). Only
+a human removes that label (`labels migrate --holds` leaves it); removing it
+releases nothing. Find such PRs with
 `gh pr list --label loom:blocked --label loom:changes-requested`.
 
 ### The out-of-band AC hold on an issue (#6883)

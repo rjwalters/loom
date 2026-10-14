@@ -369,3 +369,21 @@ fn a_held_pr_at_review_is_parked_and_stays_judge_work() {
     let labels: Vec<String> = fake.labels(11).into_iter().collect();
     assert!(loom_daemon::champion_hold::judge_may_review(&labels, &[hold]));
 }
+
+#[test]
+fn a_capped_hold_routed_to_a_human_keeps_its_operator_label() {
+    // #11905: the Capped-PR Recovery Pass adds loom:operator to a capped
+    // Champion hold so it reaches the operator inbox. That is a routing to a
+    // human, not the pre-#11861 hold label: the migration must not take it off.
+    let rec = format!(
+        "{}\nreview, close or release",
+        loom_daemon::champion_hold::CAPPED_HOLD_RECOMMENDATION_MARKER
+    );
+    let labels = ["loom:changes-requested", "loom:blocked", "loom:operator"];
+    let fake = Fake::default().item(9, &labels, true, &[&mr_hold(), &rec]);
+    let r = run(&fake, "o/r", true);
+    assert!(r.events.is_empty(), "{:?}", r.events);
+    assert_eq!(r.summary.untouched, 1);
+    assert!(fake.writes().is_empty(), "{:?}", fake.writes());
+    assert!(fake.labels(9).contains("loom:operator"));
+}

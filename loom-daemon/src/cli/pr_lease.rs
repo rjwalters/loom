@@ -158,7 +158,13 @@ use loom_daemon::step_role::StepRole;
 /// Who holds a lease: the role plus the same `(host, sweep)` pair issue
 /// leases use (`host` is the published, opaque-by-default id, #6322), and the
 /// step the lease claims for (#11898), when it names one.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// **Ownership is `(role, host, sweep)`.** `step` is metadata: equality
+/// ignores it, so one session's claim, fence, release and reap all find its
+/// own lease whether or not each call passed `--step`, and whichever step it
+/// named (a Champion that claimed `--step champion_promote` and releases with
+/// plain `--role champion` still releases its own lease).
+#[derive(Clone, Debug)]
 pub(crate) struct Identity {
     pub(crate) role: Role,
     pub(crate) host: String,
@@ -168,15 +174,15 @@ pub(crate) struct Identity {
     pub(crate) step: Option<StepRole>,
 }
 
-impl Identity {
-    /// Whether `other` is the same holder: `(role, host, sweep)`. The step is
-    /// an attribute of the lease, not part of who holds it, so a session that
-    /// claimed with `--step X` still owns its lease when it fences or releases
-    /// without `--step` (#11898). Every ownership test uses this, never `==`.
-    pub(crate) fn same_holder(&self, other: &Self) -> bool {
+impl PartialEq for Identity {
+    fn eq(&self, other: &Self) -> bool {
         self.role == other.role && self.host == other.host && self.sweep == other.sweep
     }
+}
 
+impl Eq for Identity {}
+
+impl Identity {
     /// An identity for `role`, with `step` (or the role's default step).
     ///
     /// # Errors
@@ -360,7 +366,7 @@ pub(crate) fn live_leases(
         .filter(|l| {
             !yields
                 .iter()
-                .any(|(yid, who)| *yid > l.id && who.same_holder(&l.holder))
+                .any(|(yid, who)| *yid > l.id && *who == l.holder)
         })
         .collect();
     live.sort_by_key(|l| l.id);
@@ -403,7 +409,7 @@ pub(crate) fn claim_state(
     };
     match live_leases(rows, me.role, now, ttl).into_iter().next() {
         None => ClaimState::Free,
-        Some(l) if l.holder.same_holder(me) => ClaimState::HeldBySelf { id: l.id },
+        Some(l) if l.holder == *me => ClaimState::HeldBySelf { id: l.id },
         Some(l) => ClaimState::HeldByPeer {
             id: l.id,
             holder: l.holder,
@@ -441,7 +447,7 @@ pub(crate) fn fence(
         ClaimState::Free | ClaimState::Unknown => {
             let leased = rows
                 .iter()
-                .any(|r| matches!(parse_record(&r.body), Some(Record::Lease(who)) if who.same_holder(me)));
+                .any(|r| parse_record(&r.body) == Some(Record::Lease(me.clone())));
             if leased {
                 Fence::Expired
             } else {
@@ -1139,24 +1145,32 @@ impl Ctx {
         // #11855: a Judge leaving the PR still waiting for review records it.
         let mut extra = None;
         for row in rows {
-            if !matches!(parse_record(&row.body), Some(Record::Lease(who)) if who.same_holder(&self.me))
-            {
-                continue;
-            }
-            let extra = extra.get_or_insert_with(|| match reaped {
-                None => backstop::release_fields(self.me.role, self.gh.pr_head(self.pr()), |sha| {
-                    self.gh.checks_pending(sha)
-                }),
-                Some(reason) => backstop::reaped_release_fields(
-                    self.me.role,
-                    self.gh.pr_head(self.pr()),
-                    reason,
-                ),
+            // Our own lease, whatever step it named (ownership ignores it).
+            let holder = match parse_record(&row.body) {
+                Some(Record::Lease(holder)) if holder == self.me => holder,
+                _ => continue,
+            };
+            let extra = extra.get_or_insert_with(|| {
+                // Only a Judge's release records anything from the PR head
+                // (#11855); an issue-scoped lease (Curator, Champion promote)
+                // has no PR to read.
+                let head = if self.me.role == Role::Judge {
+                    self.gh.pr_head(self.pr())
+                } else {
+                    None
+                };
+                match reaped {
+                    None => backstop::release_fields(self.me.role, head, |sha| {
+                        self.gh.checks_pending(sha)
+                    }),
+                    Some(reason) => backstop::reaped_release_fields(self.me.role, head, reason),
+                }
             });
             let mut lines = row.body.lines();
             lines.next();
             let rest: Vec<&str> = lines.collect();
-            let body = format!("{}\n{}", self.me.released_marker_with(extra), rest.join("\n"));
+            // The released marker keeps the lease's own step.
+            let body = format!("{}\n{}", holder.released_marker_with(extra), rest.join("\n"));
             if self.gh.patch(row.id, &body).is_ok() {
                 released += 1;
             }
