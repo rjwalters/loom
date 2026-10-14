@@ -92,6 +92,11 @@ structurally cannot.
 | A human action that waits on something named first | `loom:operator`, plus a literal `Blocked by #N` line in the body or comment |
 | Waiting on something automation will resolve: an issue, a PR, infrastructure, a missing capability | `loom:blocked` with a park record (`loom-daemon park-record apply`, [`park-record.md`](park-record.md)), or at least a literal `Blocked by #N` / `Depends on #N` / `Requires #N` line in the same comment (the phrasings `detect-dependency-cycle.sh` and `warn-operator-gated.sh` parse; a backtick-quoted reference does not count). A missing capability also gets its capability marker and a linked capability-request issue |
 
+**One hold per decision.** The operator's ruling (a dashboard vote, or a
+human removing the label) lifts `loom:operator`, so never add an unrelated
+`loom:operator` hold to an item that already carries a `decision` block: the
+ruling would lift both.
+
 **Unsure which applies means the analysis is incomplete, not that a hold is
 safe (#5826).** A decision is never a safe default: run the falsifiability
 test below and name the axis two well-informed people would still disagree
