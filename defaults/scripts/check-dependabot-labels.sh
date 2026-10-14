@@ -20,6 +20,8 @@
 # With no loom-daemon resolvable (or one predating the subcommand) the check
 # FAILS under GitHub Actions and is skipped with a note elsewhere.
 #
+# requires-daemon: check-dependabot-labels optional   probed with --help; absent → skip with a note (FAIL under GitHub Actions)
+#
 # Exit codes: 0 = ok (or nothing to check); 1 = a coverage/label problem.
 
 set -euo pipefail
