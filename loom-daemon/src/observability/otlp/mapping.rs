@@ -3,6 +3,7 @@
 //! this module is the field-by-field implementation plus its unit tests.
 
 mod auto_update;
+mod backlog_level;
 mod checkout_external_change;
 mod ci;
 mod executing_host;
@@ -25,7 +26,7 @@ mod work_started;
 // The shared host `Resource` constructor; traces and the relay re-import it
 // from here, exactly as when it lived inline.
 pub(super) use host_resource::resource_for_host;
-use metadata::visibility_str;
+use metadata::{role_tick_result_str, severity_for_role_tick, visibility_str};
 
 use std::collections::BTreeMap;
 
@@ -42,8 +43,7 @@ use opentelemetry_proto::tonic::metrics::v1::{
 };
 
 use crate::telemetry::{
-    AnomalyFlag, RepoVisibility, RoleTickResult, SweepResult, TelemetryEnvelope, TelemetryKindOtlp,
-    TelemetryRecord,
+    AnomalyFlag, RepoVisibility, SweepResult, TelemetryEnvelope, TelemetryKindOtlp, TelemetryRecord,
 };
 
 // ============================================================================
@@ -104,36 +104,6 @@ fn severity_for_result(result: SweepResult) -> SeverityNumber {
         SweepResult::Failure => SeverityNumber::Error,
         SweepResult::Blocked => SeverityNumber::Warn,
         SweepResult::Success | SweepResult::Cancelled => SeverityNumber::Info,
-    }
-}
-
-/// The wire string for a role-tick result (Issue #8056) — the serde
-/// `rename_all = "snake_case"` spelling, restated here so the OTLP attribute
-/// value matches the JSON one exactly.
-fn role_tick_result_str(result: RoleTickResult) -> &'static str {
-    match result {
-        RoleTickResult::Success => "success",
-        RoleTickResult::Failure => "failure",
-        RoleTickResult::RuntimeRejected => "runtime_rejected",
-        RoleTickResult::SkippedNoTokenPool => "skipped_no_token_pool",
-        RoleTickResult::SkippedPoolExhausted => "skipped_pool_exhausted",
-        RoleTickResult::SkippedModelRuntimeMismatch => "skipped_model_runtime_mismatch",
-        RoleTickResult::SkippedLoad => "skipped_load",
-        RoleTickResult::SkippedQueueEmpty => "skipped_queue_empty",
-    }
-}
-
-/// Only an outright `failure` is an error; every *skip* is `Info` (Issue
-/// #8056/#7607 — a fleet-wide exhausted pool's identical skips must not page
-/// as hundreds of broken roles), and a fail-closed runtime rejection is a
-/// `Warn` config signal.
-fn severity_for_role_tick(result: RoleTickResult) -> SeverityNumber {
-    match result {
-        RoleTickResult::Failure => SeverityNumber::Error,
-        RoleTickResult::RuntimeRejected | RoleTickResult::SkippedModelRuntimeMismatch => {
-            SeverityNumber::Warn
-        }
-        _ => SeverityNumber::Info,
     }
 }
 
@@ -626,6 +596,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         TelemetryRecord::SessionOutput(_)
         | TelemetryRecord::IssueEstimate(_)
         | TelemetryRecord::WorkStarted(_)
+        | TelemetryRecord::BacklogLevel(_)
         | TelemetryRecord::PrResolved(_)
         | TelemetryRecord::StageOutcome(_) => {
             // Issue #9764: the body is the producer-redacted readable text,
@@ -639,7 +610,8 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             let parts = session_output::log_parts(r)
                 .or_else(|| outcome_facts::log_parts(r, &envelope.host_id))
                 .or_else(|| issue_estimate::log_parts(r))
-                .or_else(|| work_started::log_parts(r))?;
+                .or_else(|| work_started::log_parts(r))
+                .or_else(|| backlog_level::log_parts(r))?;
             time_unix_nano = parts.source_at;
             observed_time_unix_nano = parts.observed_at;
             body_override = Some(parts.body);

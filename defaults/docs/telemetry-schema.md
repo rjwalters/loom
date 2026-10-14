@@ -2492,7 +2492,8 @@ One OTLP-only log record per role tick and per work-finder tick (Issue #10212),
 split into `chunk_count` records ordered by `chunk_index` when the JSON is
 large:
 the ranked candidate list (every candidate, chunked by `chunk_index`/`chunk_count` when large, with `candidates_total`), the items
-acted on, and a closed-set reason code per skipped candidate. Role ticks record
+acted on, and a closed-set reason code per skipped candidate (work-finder
+skips also carry the un-collapsed `disposition` and `held_until`, #11811). Role ticks record
 the queue the agent actually consumed (`pr-queue`, or Curator's listings) and
 the writes it issued, via a per-tick pick journal (#10432); `candidate_source`
 and `decisions_observed` say what was seen. Empty ticks still
@@ -3610,6 +3611,29 @@ empty), so a replayed record dedupes.
 
 It also carries the executing host's `loom.version`, `loom.revision` and `host.id`
 (#11765; see `sweep.phase`).
+
+### `backlog.level` — the backlog level the daemon handed one Curator dispatch
+
+One OTLP log per role-runner Curator dispatch on a repo that sets
+`curator.backlogTarget` (Issue #11819), emitted by the daemon on its direct
+OTLP exporter as it builds the dispatch. Nothing is written for a repo with no
+target. Envelopes carry `schema_version: 12`. **OTLP-only** (`native: false`).
+
+The JSON body contains `repo` (owner/repo, lowercased), `open` (open issues, PRs
+excluded, from one REST `search/issues` `total_count`; absent when the count
+failed), `target` (the resolved `curator.backlogTarget`), `level` (`lenient` /
+`normal` / `strict` from `r = open / target`: `< 0.5`, `0.5`–`1.0`, `> 1.0`;
+`normal` when the count failed), `dispatch_id` (`role-curator-<instant>`),
+`count_error` (present only when the count failed), `observed_at`, and standard
+`loom` build provenance; a record whose provenance does not validate is not
+exported. Both OTLP timestamps are `observed_at`.
+
+**OTLP.** Attributes: `loom.repo`, `loom.role` (`curator`), `loom.sweep_id`
+(the `dispatch_id`), and `loom.backlog.level` / `open` / `target` /
+`count_failed` (`BACKLOG_LEVEL_LOG_ATTRIBUTE_KEYS`, kept by the collector's
+`transform/privacy` `keep_keys`, contract-tested). The Curator's admission
+closes are not recorded here: they are GitHub `closed` events with the comment
+prefix `Closed at admission:`.
 
 
 ## Persistence & read surface (`sweep.outcome`, Issue #4704)

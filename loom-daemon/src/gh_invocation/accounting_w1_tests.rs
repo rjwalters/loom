@@ -491,10 +491,14 @@ fn recorded_calls_drain_once_as_forge_calls_points() {
             "outcome",
             "resource",
             "role",
+            "route",
             "target_owner"
         ]
     );
     assert_eq!(ok_point.labels["target_owner"], "acme");
+    // 2am#4367 P4: a read sent to GitHub directly (no gateway) is the
+    // writer-read share the gateway canary measures.
+    assert_eq!(ok_point.labels["route"], "direct_read");
     assert_eq!(ok_point.labels["agent"], "-", "the daemon's own row (#10607)");
     assert_eq!(ok_point.labels["resource"], "graphql");
     assert_eq!(ok_point.labels["role"], "writer");

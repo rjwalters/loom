@@ -80,7 +80,10 @@ fn a_session_gets_the_host_sink_beside_its_private_tmpdir() {
             "CLAUDE_CONFIG_DIR",
             "TMPDIR",
             "LOOM_FORGE_CALL_STATS_DIR",
-            "LOOM_GH_BOOKED"
+            "LOOM_GH_BOOKED",
+            // 2am#4367 P4: no gh update check; the gateway dir (blank: off).
+            "GH_NO_UPDATE_NOTIFIER",
+            "LOOM_GH_GATEWAY_DIR"
         ]
     );
     assert_eq!(all[1].1, "/repo/.loom/claude-config/b-1/tmp");
