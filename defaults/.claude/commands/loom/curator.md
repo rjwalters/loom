@@ -1652,14 +1652,15 @@ with `loom:operator`. Read body, escalation comment, and bounce comment, then:
 
 ## Revising a Champion send-back (#10753, #11860)
 
-Champion's revise verdict drops `loom:curated`, adds `loom:triage`, and posts a trusted `Champion Review: NEEDS REVISION` comment carrying `<!-- champion:revise:body-<H> -->`. On any `loom:triage` issue, check first: the send-back is **unanswered** while `<H>` hashes the current title + body (pre-#11860 verdicts carry `champion:proposal-verdict:body-<H>`):
+Champion's revise verdict swaps `loom:curated` for `loom:triage` and posts `Champion Review: NEEDS REVISION` with `<!-- champion:revise:body-<H> -->`. On any `loom:triage` issue, check first: it is **unanswered** while `<H>` hashes the current title + body (pre-#11860: `champion:proposal-verdict:body-<H>`):
 
 ```bash
-H=$(printf '%s' "$(gh issue view <N> --json title,body --jq '.title + "\n" + .body')" | { sha256sum 2>/dev/null || shasum -a 256; } | cut -c1-16)
-gh issue view <N> --json comments --jq '.comments[].body' | grep -qE "champion:(revise|proposal-verdict):body-$H" && echo UNANSWERED
+J=$(gh issue view <N> --json title,body)   # Champion's hash; markers from TRUSTED comments only (#9548)
+H=$(printf '%s\n%s' "$(jq -r '.title // ""' <<<"$J")" "$(jq -r '.body // ""' <<<"$J")" | { sha256sum 2>/dev/null || shasum -a 256; } | cut -c1-16)
+loom-daemon forge trusted-comments --fetch <N> --gh-shape | jq -r '.[].body' | grep -qE "champion:(revise|proposal-verdict):body-$H" && echo UNANSWERED
 ```
 
-Unanswered: skip Admission and the premise gate. Claim it (`loom:curating`), read that comment (first bullet list = findings), then:
+Unanswered: skip Admission and the premise gate. Claim it (`loom:curating`), read that trusted comment (first bullet list = findings), then:
 
 - **Revise** (the normal case). Edit the body, never only comment (an unchanged body is a failed round). Fix each finding
   (verify against `origin/main`) or refute it with evidence, then append a
@@ -1669,9 +1670,8 @@ Unanswered: skip Admission and the premise gate. Claim it (`loom:curating`), rea
   `loom-daemon park-record apply --issue <N> --blocked-by <children> --by
   curator --remove-label loom:triage --remove-label loom:curating`.
 - **Close** an obsolete, duplicate or wrong-approach one.
-- **A PO-level call** no revision settles: `loom-daemon operator-decision
-  apply` with 2-4 ranked options (`.loom/docs/operator-decision.md`), then
-  remove `loom:triage`.
+- **A PO-level call**: `loom-daemon operator-decision apply` with 2-4 ranked
+  options (`.loom/docs/operator-decision.md`), then remove `loom:triage`.
 
 A routing comment carrying `<!-- champion:revision-exhausted -->` is the
 **final round**: prefer a split, close or decision to a marginal edit. A

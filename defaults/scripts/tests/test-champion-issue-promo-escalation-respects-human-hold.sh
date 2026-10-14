@@ -402,6 +402,13 @@ STUB
 # $LOOM_TEST_OLD_DAEMON is set, so the guard's literal fallback is exercised.
 cat >"$RUN_DIR/bin/loom-daemon" <<'STUB'
 #!/usr/bin/env bash
+# The guard reads comments through `forge trusted-comments` (#9548, #11860);
+# every fixture comment here is trusted (the forged case is
+# test-champion-terminal-verdicts.sh's).
+if [ "${1:-} ${2:-}" = "forge trusted-comments" ]; then
+  if [[ " $* " == *" --gh-shape "* ]]; then exec jq '.comments' "$LOOM_TEST_FIX/issue.json"; fi
+  exec cat "$LOOM_TEST_FIX/rest-comments.json"
+fi
 [ -n "${LOOM_TEST_OLD_DAEMON:-}" ] && { echo "error: unexpected argument '--with-retired'" >&2; exit 2; }
 if [ "$1 $2 $3" = "labels list --property" ] && [ "${5:-}" = "--with-retired" ] && [ -f "$LOOM_TEST_RUN/registry-$4" ]; then
   exec cat "$LOOM_TEST_RUN/registry-$4"

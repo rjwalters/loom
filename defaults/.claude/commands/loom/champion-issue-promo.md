@@ -709,8 +709,10 @@ Compute a marker keyed to a **hash of the proposal's own text** (title + body), 
 ```bash
 ISSUE_NUMBER=<number>
 
-# Cached ("$GH_READ") — this is a content check, not claim arbitration.
-ISSUE_JSON=$("$GH_READ" issue view "$ISSUE_NUMBER" --json title,body,labels,comments)
+# Cached ("$GH_READ"): a content check. Comments: TRUSTED authors only (#9548):
+# every marker below is control, and an outsider can post a well-formed one.
+ISSUE_JSON=$("$GH_READ" issue view "$ISSUE_NUMBER" --json title,body,labels | jq --argjson c "$(loom-daemon forge trusted-comments --fetch "$ISSUE_NUMBER" --gh-shape)" '.comments = $c') \
+  || { echo "SKIP #$ISSUE_NUMBER: comments unauthenticated (no claim, no verdict)"; exit 0; }
 
 # Portable sha256 (sha256sum on Linux, shasum on macOS) — same fallback shape
 # the repo's own scripts use. 16 hex chars is plenty for change detection.
@@ -786,10 +788,10 @@ fi
 
 if [ "$FORCE_REEVALUATE" = "no" ] && printf '%s\n' "$ISSUE_JSON" | jq -e --arg m "$VERDICT_MARKER" \
      '.comments[] | select(.body | contains($m))' >/dev/null; then
-  # This exact revision was already evaluated. REST, not `gh issue view`: only
-  # the REST payload carries the verdict's `created_at` the un-park check needs.
-  VERDICT_COMMENT=$(gh api "repos/{owner}/{repo}/issues/$ISSUE_NUMBER/comments" --paginate \
-    --jq ".[] | select(.body | contains(\"$VERDICT_MARKER\"))" | jq -s 'last')
+  # This exact revision was already evaluated. The trusted REST listing carries
+  # the verdict's `created_at` the un-park check needs.
+  VERDICT_COMMENT=$(loom-daemon forge trusted-comments --fetch "$ISSUE_NUMBER" \
+    | jq --arg m "$VERDICT_MARKER" '[.[] | select(.body | contains($m))] | last')
   COMMENT_BODY=$(printf '%s\n' "$VERDICT_COMMENT" | jq -r '.body // ""')
   VERDICT_CREATED_AT=$(printf '%s\n' "$VERDICT_COMMENT" | jq -r '.created_at // ""')
 

@@ -245,7 +245,19 @@ A premise-false close (#7657) ends the issue instead. What this retired:
 Departures: `champion.md` Priority 2 no longer calls `loom:blocked` "outside
 Champion's promotion authority" (a block is Champion's own verdict), and
 `champion-issue-promo.md`'s "When NOT to Promote" ends each case in a verdict,
-never a skip.
+never a skip. A human un-park (`OPERATOR_RULED`, #8245) used to stand Champion
+down until the body changed; it now brings a fresh evaluation, which never
+re-escalates that body (a failure is a revise verdict).
+
+**Rollout.** Run `loom-daemon labels migrate --apply --keep-labels` in the same
+roll as the resync that ships this. Until then an open `loom:needs-revision`
+item without `loom:curated` is in no Curator queue, and one with it is drawn by
+Champion as unrevised and spends its final round early.
+
+The new markers are control signals, so both sides read them from trusted
+comments only (`loom-daemon forge trusted-comments`, #9548): an outsider's
+forged revise or verdict marker neither skips Curator's admission nor sends a
+proposal to Step 4, and its NEEDS REVISION text is not counted.
 
 ## Out of scope
 

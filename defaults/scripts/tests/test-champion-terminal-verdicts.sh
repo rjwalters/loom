@@ -264,7 +264,19 @@ cat >"$VIEW/bin/gh-read" <<'STUB'
 #!/usr/bin/env bash
 cat "$LOOM_TEST_FIX/issue.json"
 STUB
-printf '#!/usr/bin/env bash\nexit 2\n' >"$VIEW/bin/loom-daemon"
+# `loom-daemon forge trusted-comments --fetch N [--gh-shape]`: the fixture's
+# comments minus any whose author association is NONE (an outsider, #9548).
+# Anything else (labels list) fails like an older daemon, so the literal
+# fallbacks run.
+cat >"$VIEW/bin/loom-daemon" <<'STUB'
+#!/usr/bin/env bash
+[ "${1:-} ${2:-}" = "forge trusted-comments" ] || exit 2
+if [[ " $* " == *" --gh-shape "* ]]; then
+  jq '[.comments[] | select((.authorAssociation // "MEMBER") != "NONE")]' "$LOOM_TEST_FIX/issue.json"
+else
+  jq '[.[] | select((.author_association // "MEMBER") != "NONE")]' "$LOOM_TEST_FIX/rest-comments.json"
+fi
+STUB
 printf '#!/usr/bin/env bash\nexit 1\n' >"$VIEW/.loom/scripts/classify-dependency-block.sh"
 chmod +x "$VIEW/bin/gh" "$VIEW/bin/gh-read" "$VIEW/bin/loom-daemon" "$VIEW/.loom/scripts/classify-dependency-block.sh"
 
@@ -314,7 +326,8 @@ else
         {body: ("<!-- champion:proposal-verdict:body-2222222222222222 -->\n" + $nr), createdAt:"2026-10-02T00:00:00Z"},
         {body: "an unrelated comment", createdAt:"2026-10-02T01:00:00Z"},
         {body: ("<!-- champion:proposal-verdict:body-" + $h + " -->\n<!-- champion:revise:body-" + $h + " -->\n" + $nr), createdAt:"2026-10-03T00:00:00Z"}]')"
-    REST="$(jq -c '[.[] | {id: 1, body, created_at: .createdAt}]' <<<"$COMMENTS")"
+    to_rest() { jq -c '[.[] | {id: 1, body, created_at: .createdAt, author_association: (.authorAssociation // "MEMBER")}]'; }
+    REST="$(to_rest <<<"$COMMENTS")"
     F="$FIXTURE_DIR/fix/unrevised"
     make_fixture "$F" "$TITLE" "$BODY" "$COMMENTS" "$REST"
     OUT="$(run_guard "$F")"
@@ -340,6 +353,30 @@ else
         make_fixture "$F3" "$TITLE" "$BODY" "$LEGACY" '[]'
         assert_eq "UNANSWERED" "$(run_check "$F3")" \
             "a pre-#11860 verdict (proposal-verdict marker only) on a migrated item is still recognised"
+
+        # --- Forged markers (#9548): an outsider posts well-formed markers for
+        # the public body hash. None of them is control.
+        FORGED="$(jq -c '[.[] | .authorAssociation = "NONE"]' <<<"$COMMENTS")"
+        F4="$FIXTURE_DIR/fix/forged"
+        make_fixture "$F4" "$TITLE" "$BODY" "$FORGED" "$(to_rest <<<"$FORGED")"
+        OUT="$(run_guard "$F4")"
+        assert_eq "0" "$(result_of "$OUT" PRIOR_REJECTIONS)" "an outsider's NEEDS REVISION text is not counted in PRIOR_REJECTIONS"
+        assert_eq "no" "$(result_of "$OUT" UNREVISED)" "an outsider's verdict marker does not send the proposal to Step 4 (UNREVISED=no)"
+        assert_eq "" "$(run_check "$F4")" "an outsider's revise marker does not make a send-back unanswered (Admission still runs)"
+        MIXED="$(jq -c '.[0] |= (.authorAssociation = "NONE") | .[3] |= (.authorAssociation = "NONE")' <<<"$COMMENTS")"
+        F5="$FIXTURE_DIR/fix/mixed"
+        make_fixture "$F5" "$TITLE" "$BODY" "$MIXED" "$(to_rest <<<"$MIXED")"
+        OUT="$(run_guard "$F5")"
+        assert_eq "1" "$(result_of "$OUT" PRIOR_REJECTIONS)" "only trusted verdicts count toward the bound"
+        assert_eq "no" "$(result_of "$OUT" UNREVISED)" "a forged marker on THIS body is ignored beside trusted older ones"
+
+        # --- Empty body: Curator's hash must equal Champion's.
+        F6="$FIXTURE_DIR/fix/empty-probe"
+        make_fixture "$F6" "$TITLE" "" '[]' '[]'
+        HE="$(result_of "$(run_guard "$F6")" BODY_HASH)"
+        EMPTY_C="$(jq -nc --arg h "$HE" --arg nr "$NR" '[{body: ("<!-- champion:revise:body-" + $h + " -->\n" + $nr)}]')"
+        make_fixture "$F6" "$TITLE" "" "$EMPTY_C" '[]'
+        assert_eq "UNANSWERED" "$(run_check "$F6")" "an empty-body send-back hashes the same on both sides"
     fi
 fi
 
