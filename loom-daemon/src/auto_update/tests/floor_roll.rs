@@ -799,3 +799,7 @@ fn a_rolling_host_has_no_not_rolling_reason_and_a_refused_one_is_named() {
 
 #[path = "failed_roll.rs"]
 mod failed_roll;
+
+#[cfg(target_os = "linux")]
+#[path = "runtime_supervisor.rs"]
+mod runtime_supervisor;
