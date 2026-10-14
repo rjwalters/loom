@@ -171,7 +171,7 @@ fn a_pr_step_requeue_after_a_roll_checks_the_claim_is_still_its_own() {
     let reg =
         crate::sweep_registry::test_support::fixture_registry_with_lease_gh(dir.path(), &peer, 0);
     assert!(reg
-        .roll_pr_step_claim_still_ours(22, StepRole::Doctor, mine, Some(Utc::now()))
+        .roll_pr_step_claim_still_ours(22, StepRole::Doctor, mine)
         .is_err());
 
     let dir = tempdir().unwrap();
@@ -179,6 +179,67 @@ fn a_pr_step_requeue_after_a_roll_checks_the_claim_is_still_its_own() {
     let reg =
         crate::sweep_registry::test_support::fixture_registry_with_lease_gh(dir.path(), &own, 0);
     assert!(reg
-        .roll_pr_step_claim_still_ours(22, StepRole::Doctor, mine, Some(Utc::now()))
+        .roll_pr_step_claim_still_ours(22, StepRole::Doctor, mine)
+        .is_ok());
+}
+
+/// A registry whose fake `gh` serves `lease_rows` for comment reads and
+/// appends every other call's arguments to the returned write log.
+fn registry_logging_writes(dir: &std::path::Path, lease_rows: &str) -> (SweepRegistry, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let log = dir.join("gh-calls.log");
+    let fake_gh = dir.join("fake-gh-logging.sh");
+    let script = format!(
+        "#!/usr/bin/env bash\n\
+         if [[ \"$1\" == \"repo\" && \"$2\" == \"view\" ]]; then printf 'rjwalters/loom\\n'; exit 0; fi\n\
+         if [[ \"$1\" == \"api\" && \"$*\" == *\"/comments\"* ]]; then printf '%s' '{rows}'; exit 0; fi\n\
+         printf '%s\\n' \"$*\" >> '{log}'\n\
+         exit 1\n",
+        rows = crate::comment_trust::records::with_fleet_author(lease_rows)
+            .replace('\'', "'\\''"),
+        log = log.display(),
+    );
+    std::fs::write(&fake_gh, script).unwrap();
+    std::fs::set_permissions(&fake_gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut reg = crate::sweep_registry::test_support::fixture_registry_with_lease_gh(dir, "", 0);
+    reg.config.gh_bin = Some(fake_gh);
+    (reg, log)
+}
+
+/// Judge blocker 1: a dead step's claim restored at startup is subject to the
+/// same held-elsewhere check as the reaper's. A live peer lease means no
+/// forge write; without one the restore does write.
+#[test]
+fn a_startup_restore_leaves_a_peer_held_claim_alone() {
+    let mine = "step-judge-31-1";
+    let dir = tempdir().unwrap();
+    let (mut reg, log) = registry_logging_writes(dir.path(), &role_lease_row(3, "peer-judge"));
+    reg.restore_dead_step_at_startup(31, StepRole::Judge, mine, Utc::now());
+    assert!(
+        std::fs::read_to_string(&log).unwrap_or_default().is_empty(),
+        "a live peer lease means nothing is written"
+    );
+
+    let dir = tempdir().unwrap();
+    let (mut reg, log) = registry_logging_writes(dir.path(), &role_lease_row(5, mine));
+    reg.restore_dead_step_at_startup(31, StepRole::Judge, mine, Utc::now());
+    assert!(
+        !std::fs::read_to_string(&log).unwrap_or_default().is_empty(),
+        "its own lease (or none) lets the restore write"
+    );
+}
+
+/// Should-fix: a PR step's own claim label lands after its start (the role
+/// prompt applies it), so the roll requeue judges by the lease alone.
+#[test]
+fn a_pr_step_roll_requeue_ignores_label_time() {
+    let mine = "step-doctor-23-1";
+    let dir = tempdir().unwrap();
+    let own = role_lease_row(5, mine).replace("role=judge", "role=doctor");
+    let reg =
+        crate::sweep_registry::test_support::fixture_registry_with_lease_gh(dir.path(), &own, 0);
+    // No lease-independent label read exists any more: the lease alone decides.
+    assert!(reg
+        .roll_pr_step_claim_still_ours(23, StepRole::Doctor, mine)
         .is_ok());
 }

@@ -206,12 +206,14 @@ fn a_failed_rename_removes_the_temp_file() {
 /// binary is re-executed as the "running daemon" below.
 const SLEEPER_ENV: &str = "LOOM_PROVISION_TEST_SLEEPER";
 
-/// Not a real test: a no-op normally, and a 30s sleep when re-executed by
+/// Not a real test: a no-op normally, and a 300s sleep when re-executed by
 /// [`replaces_a_currently_executing_binary`] with [`SLEEPER_ENV`] set.
+/// The duration must comfortably outlast the keep-previous copy + sha256 step
+/// on slow CI; the test kill()s the child, so the length costs nothing.
 #[test]
 fn sleeper_helper() {
     if std::env::var_os(SLEEPER_ENV).is_some() {
-        std::thread::sleep(std::time::Duration::from_secs(30));
+        std::thread::sleep(std::time::Duration::from_secs(300));
     }
 }
 
