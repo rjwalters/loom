@@ -63,6 +63,11 @@ fn armed_line(
              {consecutive} in a row (a deliberate skip; nothing failed), next attempt allowed in \
              {secs}s (#4485, #7606; cause={cause:?})"
         ),
+        DispatchBackoffCause::Landed => format!(
+            "sweep_registry: issue #{issue} landed cooldown armed — its work already landed (a \
+             deliberate skip; nothing failed), next attempt allowed in {secs}s, fleet-wide \
+             (#11853; cause={cause:?})"
+        ),
     }
 }
 
@@ -74,6 +79,10 @@ fn refused_line(issue: u32, state: Option<&DispatchBackoffState>, remaining: Dur
             "sweep_registry: refusing to dispatch issue #{issue} — inside the window its open-PR \
              guard refusal(s) armed ({consecutive} in a row; nothing failed), {secs}s of backoff \
              remaining (#4485, #7606)"
+        ),
+        Some(DispatchBackoffCause::Landed) => format!(
+            "sweep_registry: refusing to dispatch issue #{issue} — its work already landed, \
+             {secs}s of landed cooldown remaining (#11853)"
         ),
         Some(DispatchBackoffCause::Generic) | None => format!(
             "sweep_registry: refusing to dispatch issue #{issue} — {consecutive} consecutive \

@@ -651,6 +651,12 @@ impl WorkDispatcher for RegistryDispatcher {
         super::open_pr_prefilter::blocked_in(&self.registry, candidates)
     }
 
+    /// Open candidates whose closing PR merged (#11853); see
+    /// [`super::landed_prefilter::landed_in`].
+    fn landed_closing_prs(&self, candidates: &[u32], open_pr: &[u32]) -> HashMap<u32, u32> {
+        super::landed_prefilter::landed_in(&self.registry, candidates, open_pr)
+    }
+
     /// Whether a live sweep in this registry is the host's overflow sweep
     /// (#9244). The multi-workspace tick ORs this across every root.
     fn overflow_in_flight(&self) -> bool {
