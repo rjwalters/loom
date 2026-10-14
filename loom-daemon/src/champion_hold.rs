@@ -27,8 +27,12 @@
 //! refuses to merge it (the hold is a hold); the exception only stops the
 //! janitor from stripping the approval, so a released hold merges without a
 //! fresh review.
+//! [`classify`] is that janitor rule in code (#11932): it tells this hold
+//! from another actor's `loom:blocked` park, which Champion skips silently.
 //!
 //! The marker strings are a wire format: they live in comments on open PRs.
+
+pub mod classify;
 
 /// The merge-risk hold notice's first line.
 pub const MERGE_RISK_HOLD_MARKER: &str = "<!-- champion:merge-risk-hold -->";

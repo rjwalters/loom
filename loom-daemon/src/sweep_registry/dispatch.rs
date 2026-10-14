@@ -1135,7 +1135,9 @@ impl SweepRegistry {
             .filter(|info| matches!(info.state, SweepState::Running | SweepState::Pending))
             .filter_map(|info| match info.kind {
                 SweepKind::Issue(issue) => Some(issue),
-                _ => None,
+                // A step's peer claim is the `(item, step)` shape (#11898),
+                // published by the step claim path, not this issue heartbeat.
+                SweepKind::Step { .. } | SweepKind::PrSet(_) => None,
             })
             .collect();
         for issue in &live {
@@ -1266,11 +1268,13 @@ impl SweepRegistry {
         // does not immediately re-attempt the same failing candidate this
         // host just backed off on — see `publish_peer_cooldown_claim`'s doc
         // comment for why this is one-shot rather than re-advertised.
-        self.publish_peer_cooldown_claim(
-            peer_claims::ClaimKind::DispatchBackoffArmed,
-            issue,
-            delay,
-        );
+        // #11930: and this host's fast-failure streak, which the park sums.
+        let streak = if cause == DispatchBackoffCause::FastFailure {
+            consecutive
+        } else {
+            0
+        };
+        self.publish_dispatch_backoff_claim(issue, delay, streak);
     }
 
     /// Clear `issue`'s dispatch-backoff record (Issue #4485) — called on any
@@ -1762,6 +1766,7 @@ impl SweepRegistry {
                 let log_path = match kind {
                     SweepKind::Issue(n) => self.compute_log_path(*n),
                     SweepKind::PrSet(prs) => self.compute_prset_log_path(prs),
+                    SweepKind::Step { item, role } => self.compute_step_log_path(*item, *role),
                 };
                 return Ok(BeginIssueDispatch::Done(Ok(DispatchOutcome {
                     sweep_id,
@@ -1832,6 +1837,15 @@ impl SweepRegistry {
         //    `dispatch_prset_inner` / `SweepRegistry::pr_lock_dir`).
         let issue_number = match kind {
             SweepKind::Issue(n) => *n,
+            // Nothing dispatches a step through the sweep path: the step
+            // engine's spawn (#11906) claims and launches it. Refuse loudly
+            // rather than run the issue guard chain on a PR or a Curator item.
+            SweepKind::Step { item, role } => {
+                anyhow::bail!(
+                    "dispatch refused: a {role} step on #{item} is not dispatched as a sweep \
+                     (the step engine spawns steps, #11906)"
+                );
+            }
             SweepKind::PrSet(prs) => {
                 // #11191: disk admission, as for an issue before step 3.
                 crate::disk_admission::admit_dispatch(&self.config.workspace_root, kind)?;
@@ -2751,8 +2765,12 @@ impl SweepRegistry {
         // `start` handshake runs on its own thread"), and nothing in this
         // dispatch depends on its result — it is best-effort in both
         // directions.
-        if matches!(kind, SweepKind::Issue(_)) {
-            drop(self.start_lease_renewal_loop(issue_number, &sweep_id, pid, &log_path));
+        match kind {
+            SweepKind::Issue(_) => {
+                drop(self.start_lease_renewal_loop(issue_number, &sweep_id, pid, &log_path));
+            }
+            // A step never reaches the sweep dispatch (refused at step 2).
+            SweepKind::Step { .. } | SweepKind::PrSet(_) => {}
         }
 
         // Retain the handle so the reaper can `try_wait()` it (Issue #3801).

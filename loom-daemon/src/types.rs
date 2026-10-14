@@ -942,6 +942,14 @@ pub enum AgentStatus {
 /// label and is tracked via a per-PR claim lock (`.loom/locks/pr-<N>/`,
 /// distinct from `Issue`'s `.loom/locks/issue-<N>/`) rather than the
 /// issue-keyed guard chain `Issue` dispatch uses.
+///
+/// `Step` (#11898, design #11894 §4.4) is one role session advancing one item
+/// by one stage: `claude -p "/loom:<role> <item>"`. `item` is the number the
+/// role is invoked on (the PR for a PR step, else the issue). It is additive on
+/// the wire: `{"type":"Step","value":{"item":N,"role":"builder"}}`, and the
+/// `Issue` / `PrSet` shapes are unchanged. Every consumer matches the kind
+/// exhaustively; `step_kind_sites` (in `step_kind_sites_tests.rs`) fails CI on
+/// a new `let`-`else` / `if let` that would drop it silently.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", content = "value")]
 pub enum SweepKind {
@@ -949,6 +957,46 @@ pub enum SweepKind {
     Issue(u32),
     /// PR-set sweep: `claude -p "/loom:sweep --prs <n1> <n2> ..."`.
     PrSet(Vec<u32>),
+    /// One step: `claude -p "/loom:<role> <item>"` (#11898).
+    Step {
+        item: u32,
+        role: crate::step_role::StepRole,
+    },
+}
+
+impl SweepKind {
+    /// The single item this sweep holds: the issue of an `Issue` sweep, the
+    /// item of a `Step` (an issue or a PR, see [`StepRole::acts_on_pr`]).
+    /// `None` for a `PrSet`, which holds several.
+    ///
+    /// [`StepRole::acts_on_pr`]: crate::step_role::StepRole::acts_on_pr
+    #[must_use]
+    pub fn item_number(&self) -> Option<u32> {
+        match self {
+            SweepKind::Issue(n) | SweepKind::Step { item: n, .. } => Some(*n),
+            SweepKind::PrSet(_) => None,
+        }
+    }
+
+    /// The step role, for a `Step`.
+    #[must_use]
+    pub fn role(&self) -> Option<crate::step_role::StepRole> {
+        match self {
+            SweepKind::Step { role, .. } => Some(*role),
+            SweepKind::Issue(_) | SweepKind::PrSet(_) => None,
+        }
+    }
+
+    /// The issue this sweep works on as an issue: an `Issue` sweep's, or an
+    /// issue step's item. `None` for a `PrSet` and for a PR step.
+    #[must_use]
+    pub fn issue_number(&self) -> Option<u32> {
+        match self {
+            SweepKind::Issue(n) => Some(*n),
+            SweepKind::Step { item, role } if !role.acts_on_pr() => Some(*item),
+            SweepKind::Step { .. } | SweepKind::PrSet(_) => None,
+        }
+    }
 }
 
 /// Lifecycle state of a tracked sweep.

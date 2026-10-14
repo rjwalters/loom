@@ -714,8 +714,9 @@ impl SweepRegistry {
         // both containerized dispatch shapes stamp `loom.sweep.issue=<N>` +
         // `loom.dispatch=container`, and no container / no docker / a docker
         // failure inside is a logged no-op.
-        if let SweepKind::Issue(issue) = &kind {
-            container_stop::begin_container_stop(sweep_id, *issue, grace);
+        // A step's container is labelled with its item (#11898).
+        if let Some(item) = kind.item_number() {
+            container_stop::begin_container_stop(sweep_id, item, grace);
         }
 
         let term_sent = self.signal_sweep(sweep_id, pid, 15);
@@ -780,8 +781,8 @@ impl SweepRegistry {
         // container teardown — `docker kill` whatever is still running for
         // this issue (a stop client that died before dockerd acted, a wedged
         // stop). Clean debug-level no-op when nothing is left.
-        if let SweepKind::Issue(issue) = kind {
-            container_stop::finish_container_stop(sweep_id, *issue, !exited_within_grace);
+        if let Some(item) = kind.item_number() {
+            container_stop::finish_container_stop(sweep_id, item, !exited_within_grace);
         }
 
         // Reap the retained handle so the killed leader does not linger as a
@@ -811,7 +812,16 @@ impl SweepRegistry {
                 at: now,
             };
         }
-        if let SweepKind::Issue(issue) = kind {
+        let issue = match kind {
+            SweepKind::Issue(issue) => Some(issue),
+            // A cancelled step releases its claim per role (#11898).
+            SweepKind::Step { item, role } => {
+                self.release_dead_step(sweep_id, *item, *role, started_at);
+                None
+            }
+            SweepKind::PrSet(_) => None,
+        };
+        if let Some(issue) = issue {
             // Ownership-checked release (#4463): if a newer sweep re-acquired
             // this issue's lock after the sweep being cancelled died, leave its
             // live lock intact and skip the label restore below — the newer
@@ -970,6 +980,8 @@ impl SweepRegistry {
         // Insta-crash quarantine TTL (#3939): release any issue whose quarantine
         // has aged past the configured window before this tick's work. Cheap
         // early-return when nothing is quarantined.
+        // #11930: first adopt any park the startup reconciliation kept.
+        self.adopt_restored_parks();
         self.expire_quarantine();
         // Retry any previously-failed quarantine label restores (Issue #4110)
         // and release no-op holds whose inputs changed (Issue #10156). Cheap
@@ -1039,11 +1051,14 @@ impl SweepRegistry {
                 // live until a later tick finds the group empty; one owner of
                 // the session's lifetime, never daemon-released + still running.
                 // Immediate when the group is already empty (the ordinary case).
-                let issue = match &kind {
-                    SweepKind::Issue(n) => Some(*n),
-                    SweepKind::PrSet(_) => None,
+                let (issue, step) = match &kind {
+                    SweepKind::Issue(n) => (Some(*n), None),
+                    SweepKind::Step { item, role } => (None, Some((*item, *role))),
+                    SweepKind::PrSet(_) => (None, None),
                 };
-                let exit_code = match self.await_group_drain(&sweep_id, issue, pgid, exit_code) {
+                let drain_item = issue.or(step.map(|(item, _)| item));
+                let exit_code = match self.await_group_drain(&sweep_id, drain_item, pgid, exit_code)
+                {
                     GroupDrain::Draining => continue,
                     GroupDrain::Drained(code) => code,
                 };
@@ -1052,6 +1067,13 @@ impl SweepRegistry {
                 // #4493: account health must be updated before any bounded
                 // re-dispatch path below asks the selector for another profile.
                 self.apply_provider_health_feedback(&sweep_id, exit_code);
+                // A step has its own terminal path (`step_reap.rs`, #11898).
+                if let Some((item, role)) = step {
+                    changes += 1;
+                    let event = self.finish_dead_step(&sweep_id, item, role, started_at, exit_code);
+                    events_to_emit.push(event);
+                    continue;
+                }
                 {
                     changes += 1;
                     let now = Utc::now();
@@ -1239,6 +1261,9 @@ impl SweepRegistry {
                             // single retry, and arming a window there would risk
                             // burning that one retry on a refusal.
                             if checkpoint_progress {
+                                // #11930: progress breaks the fleet's streak (first:
+                                // the local streak lives in the record cleared next).
+                                self.break_fleet_fast_fail_streak(issue);
                                 self.clear_dispatch_backoff(issue);
                                 // #6670: real progress is conclusive proof the
                                 // candidate is no longer a no-op — clear any

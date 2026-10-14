@@ -15,7 +15,6 @@
 //! Its own file: `sweep_registry/mod.rs` is frozen by the file-size ratchet.
 
 use super::SweepRegistry;
-use crate::types::SweepKind;
 
 impl SweepRegistry {
     /// Mark `sweep_id` as the host's overflow sweep. Returns `false` when no
@@ -40,10 +39,9 @@ impl SweepRegistry {
             return false;
         };
         info.overflow = true;
-        let issue = match info.kind {
-            SweepKind::Issue(n) => Some(n),
-            _ => None,
-        };
+        // The flag lives in the issue claim lock, which an issue step holds
+        // too (#11898).
+        let issue = info.kind.issue_number();
         if let Some(issue) = issue {
             if let Err(e) = self.stamp_overflow_in_lock(issue) {
                 log::warn!(

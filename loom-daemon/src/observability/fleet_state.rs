@@ -75,6 +75,8 @@ mod flow;
 pub mod history;
 pub mod outcomes;
 mod sources;
+mod step_rows;
+pub use step_rows::step_stage;
 
 use flow::{QueueFlowTracker, QUEUE_FLOW_WINDOW_SECS};
 
@@ -501,7 +503,7 @@ fn offer(candidates: &mut Candidates, repo: &str, source: Source, row: FleetStat
 #[must_use]
 pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Utc>) -> FleetView {
     let mut candidates = Candidates::new();
-    for sweep in &input.held {
+    for (sweep, issue) in input.held.iter().zip(step_rows::held_row_keys(input)) {
         let row = FleetStateRow {
             entered_at_lower_bound: sweep.entered_at_lower_bound,
             pr: sweep.pr,
@@ -513,7 +515,7 @@ pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Ut
             }),
             start: sweep.start.clone(),
             sweep_id: sweep.sweep_id.clone(),
-            ..FleetStateRow::new(sweep.issue, sweep.stage, sweep.entered_at)
+            ..FleetStateRow::new(issue, sweep.stage, sweep.entered_at)
         };
         offer(&mut candidates, &sweep.repo, Source::Held, row);
     }

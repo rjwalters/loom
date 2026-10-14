@@ -80,9 +80,13 @@ pub(crate) const SWEEP_ID_ENV: &str = "LOOM_SWEEP_ID";
 /// under a clean parent environment.
 pub(crate) fn apply_issue_scoped_markers(cmd: &mut Command, kind: &SweepKind) {
     match kind {
-        SweepKind::Issue(issue) => {
-            cmd.env(CLAIM_OWNED_ENV, issue.to_string());
-            cmd.env(LEASE_RENEW_STARTED_ENV, issue.to_string());
+        // A step the daemon pre-claimed exports the same marker
+        // (`targeted-role-invocation.md`: "a step engine that pre-claims ...
+        // must export the same `LOOM_SWEEP_CLAIM_OWNED=<N>`"), and the daemon
+        // renews the step's lease as it does a sweep's (#11898).
+        SweepKind::Issue(item) | SweepKind::Step { item, .. } => {
+            cmd.env(CLAIM_OWNED_ENV, item.to_string());
+            cmd.env(LEASE_RENEW_STARTED_ENV, item.to_string());
         }
         SweepKind::PrSet(_) => {
             cmd.env_remove(CLAIM_OWNED_ENV);
