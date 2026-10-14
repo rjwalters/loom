@@ -494,6 +494,7 @@ fn one_held_root_beside_healthy_idle_roots_does_not_name_the_tick() {
     let (report, result) = held_tick(vec![vec![], vec![], vec![]], &[true, false, false]);
     assert_eq!((report.held_roots, report.halt_partial), (1, true));
     assert_eq!(result, "no_eligible_work");
+    assert!(!report.halted_fully(), "a partial hold leaves tick-level reactions on");
 }
 
 /// #11857: the hold names the tick when it covers the work — every root with
@@ -504,6 +505,7 @@ fn a_hold_covering_every_root_with_work_names_the_tick() {
     let (report, result) = held_tick(vec![vec![item(1)], vec![item(2)]], &[true, true]);
     assert_eq!((report.held_roots, report.halt_partial), (2, false));
     assert_eq!(result, "halted_maintain_only");
+    assert!(report.halted_fully());
 
     // The held root is the only one with work: the hold explains the tick.
     let (report, result) = held_tick(vec![vec![item(1)], vec![]], &[true, false]);
