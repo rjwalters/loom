@@ -1320,6 +1320,11 @@ pub struct RoleRunnerConfig {
     /// fleet host where the roots disagree, the effective ceiling for a given
     /// tick is that root's own — the tighter root simply refuses sooner.
     pub max_concurrent: Option<usize>,
+    /// `autonomous.roleRunner.championMode` (#11859) — `"all"` (absent) or
+    /// `"non-item"`: whether an interval Champion tick works every queue or
+    /// only the non-item ones. Per root, config only; see
+    /// [`champion_mode`] and [`resolve_role_prompt`].
+    pub champion_mode: Option<champion_mode::ChampionMode>,
 }
 
 /// Hand-rolled duration-string parser for
@@ -1491,6 +1496,7 @@ pub fn read_role_runner_config(repo_root: &Path) -> RoleRunnerConfig {
             .and_then(serde_json::Value::as_u64)
             .filter(|&n| n > 0)
             .and_then(|n| usize::try_from(n).ok()),
+        champion_mode: champion_mode::parse_champion_mode(block),
     }
 }
 
@@ -2191,8 +2197,10 @@ pub fn resolve_max_concurrent_for(repo_root: &Path) -> usize {
 /// The prompt string actually passed to `claude -p` for one dispatch of
 /// `spec`.
 ///
-/// Every role but `architect` resolves to its static [`RoleSpec::prompt`]
-/// verbatim (byte-for-byte the pre-#5656 behavior). `architect` additionally
+/// Every role but `architect` (and `champion` under
+/// `championMode: "non-item"`, which appends `--non-item`, #11859) resolves
+/// to its static [`RoleSpec::prompt`] verbatim (byte-for-byte the pre-#5656
+/// behavior). `architect` additionally
 /// carries the resolved per-invocation proposal cap as a slash-command
 /// argument — `/loom:architect --max-proposals <n>` — which
 /// `architect.md`'s own "Argument Handling" section reads from `$ARGUMENTS`
@@ -2210,6 +2218,10 @@ pub fn resolve_role_prompt(spec: &RoleSpec, config: &RoleRunnerConfig) -> String
             spec.prompt,
             resolve_architect_max_proposals(config)
         );
+    }
+    // #11859: `championMode: "non-item"` dispatches `/loom:champion --non-item`.
+    if let Some(arg) = champion_mode::prompt_arg(spec.name, config.champion_mode) {
+        return format!("{} {arg}", spec.prompt);
     }
     spec.prompt.to_string()
 }
@@ -3908,6 +3920,10 @@ use skip_counters::{
     LOAD_SKIPPED_COUNT, MODEL_RUNTIME_MISMATCH_SKIP_COUNT, NO_TOKEN_POOL_SKIP_COUNT,
     POOL_EXHAUSTED_SKIP_COUNT,
 };
+
+// `autonomous.roleRunner.championMode` (#11859) — Champion's non-item-only
+// interval mode; see `role_runner/champion_mode.rs`.
+pub mod champion_mode;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]

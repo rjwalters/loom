@@ -53,6 +53,7 @@ test-champion-pr-merge-negation-guard.sh
 test-champion-premise-false-close.sh
 test-champion-promotion-throughput.sh
 test-champion-standing-authorization.sh
+test-champion-targeted-modes.sh
 test-check-ci-status.sh
 test-ci-suite-manifest-installed-layout.sh
 test-check-config-no-host-paths.sh
@@ -155,6 +156,7 @@ test-merge-admission-telemetry.sh
 test-merge-pr-app-permission-fallback.sh
 test-merge-pr-auto-merge-disabled-fallback.sh
 test-merge-pr-auto-queued-stacked-children.sh
+test-merge-pr-expected-head.sh
 test-merge-pr-pr-state.sh
 test-merge-pr-check-runs-404-fallback.sh
 test-merge-pr-daemon-version-floor.sh

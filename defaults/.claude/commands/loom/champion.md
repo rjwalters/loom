@@ -19,6 +19,14 @@ You are the human's avatar in the autonomous workflow - a trusted decision-maker
 
 ---
 
+## Argument Handling
+
+**Arguments**: `$ARGUMENTS`
+
+`--pr N`, `--issue N` or `--non-item`: follow `champion-targeted.md` instead of "Finding Work". No arguments: the batch pass below, unchanged.
+
+---
+
 ## Finding Work
 
 **Skip any item labelled `loom:frozen`**: don't read it as work, comment on it, or relabel it. Only a human removes it.
@@ -171,43 +179,7 @@ If no queues have work, report "No work for Champion" and stop.
 
 ## Follow-on Issue Creation
 
-After successfully merging a PR (Step 5.5 of the auto-merge workflow), Champion scans for follow-on work indicators and creates consolidated issues to track future work.
-
-### What Gets Captured
-
-1. **Code TODOs**: `TODO:`, `FIXME:`, `HACK:`, `XXX:`, `FUTURE:` patterns in added lines
-2. **Deferred Scope**: Sections titled "Follow-on Work", "Out of Scope", "Deferred", "Phase 2" in PR body
-3. **Review Suggestions**: Comments containing "not blocking", "consider for future", "technical debt", "would be nice"
-
-### Threshold Logic
-
-Follow-on issues are only created when meaningful work is identified:
-
-| Indicator | Threshold | Action |
-|-----------|-----------|--------|
-| Critical patterns (FIXME, HACK, XXX) | 1+ | Always create issue |
-| Explicit follow-on section | Any | Always create issue |
-| Standard TODOs (TODO, FUTURE) | 3+ | Create consolidated issue |
-| Below threshold | < 3 TODOs, no sections | Skip (avoid noise) |
-
-### Follow-on Issue Labeling
-
-Follow-on issues are created with the `loom:triage` label (Curator admission first, #11820).
-
-### Duplicate Prevention
-
-Before creating a follow-on issue, Champion searches for existing issues with "Follow-on from PR #N" in the title. If found, creation is skipped.
-
-### Issue Format
-
-Follow-on issues include:
-- Link to parent PR and original issue
-- File:line references for each TODO
-- Deferred scope items as checkboxes
-- Review notes as bullet points
-- Standard acceptance criteria
-
-See `.claude/commands/loom/champion-pr-merge.md` Step 5.5 for the complete implementation.
+After a merge, `champion-pr-merge.md` Step 5.5 turns added `TODO:`/`FIXME:`/`HACK:`/`XXX:`/`FUTURE:` lines, deferred-scope sections ("Follow-on Work", "Out of Scope", "Deferred", "Phase 2") and "not blocking" review notes into one `loom:triage` issue (Curator admission first, #11820): always for a critical pattern or a follow-on section, else at 3+ TODOs. It skips a duplicate "Follow-on from PR #N". Edge cases: `champion-reference.md` Edge Case 14.
 
 ---
 
@@ -220,6 +192,7 @@ Champion uses context-specific instruction files to keep token usage efficient:
 | `champion-pr-merge.md` | PR auto-merge workflow + capped-PR recovery pass | Priority 1 or 5 work found |
 | `champion-issue-promo.md` | Issue promotion workflow | Priority 2/3 work found |
 | `champion-epic.md` | Epic evaluation workflow | Priority 4 work found |
+| `champion-targeted.md` | `--pr`, `--issue`, `--non-item` modes | `$ARGUMENTS` given |
 | `champion-reference.md` | Edge cases and scripts | Complex situations |
 | `champion-common.md` | Shared utilities | Completion reporting |
 
