@@ -143,16 +143,25 @@ fn owned_and_closed(path: &Path, dir: bool) -> bool {
 
 /// Whether a consumer other than the daemon may trust `base` (the value of
 /// `LOOM_GH_GATEWAY_DIR`): the shape the daemon publishes ([`base_dir`]),
-/// and a base directory it alone could have written. The front and a CLI
-/// subcommand share this one check.
+/// and a base directory it alone could have written, whose `gh-ok` marker
+/// and outage file (when present) are private regular files, never symlinks:
+/// both are read by path, and a link would let another file answer for them.
+/// The front and a CLI subcommand share this one check.
 #[must_use]
 pub fn safe_base(base: &Path) -> bool {
+    let outage = base.join(super::outage::FRONT_OUTAGE);
+    let outage_ok = match std::fs::symlink_metadata(&outage) {
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+        Ok(_) => private_file(&outage),
+    };
     base.file_name().is_some_and(|n| n == super::DIR_NAME)
         && base
             .parent()
             .and_then(Path::file_name)
             .is_some_and(|n| n == ".loom")
         && private_dir(base)
+        && private_file(&base.join(GH_MARKER))
+        && outage_ok
 }
 
 /// Whether a consumer may trust the published profile `dir` (`<base>/<owner>`)

@@ -522,6 +522,46 @@ fn a_front_or_cli_refuses_an_untrusted_base_or_profile() {
     assert!(!publish::safe_profile(&profile));
 }
 
+/// The marker and the outage file are read by path: a symlink (to a copy
+/// of a valid marker, or to a long-expired outage) is refused, as is a
+/// writable marker, so no other file can answer for either.
+#[test]
+fn a_front_or_cli_refuses_a_linked_or_writable_marker_or_outage_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let gh = tmp.path().join("gh");
+    std::fs::write(&gh, "").unwrap();
+    let gh_s = gh.to_str().unwrap();
+    let now = SystemTime::now();
+    let adopt = |b: &std::path::Path| cli_base(Some(b.as_os_str().to_owned()), gh_s, now);
+
+    let marked = published(&tmp.path().join("ws1"), &gh);
+    assert_eq!(adopt(&marked), Some(marked.clone()));
+    let copy = tmp.path().join("marker-copy");
+    std::fs::copy(marked.join("gh-ok"), &copy).unwrap();
+    std::fs::remove_file(marked.join("gh-ok")).unwrap();
+    std::os::unix::fs::symlink(&copy, marked.join("gh-ok")).unwrap();
+    assert_eq!(adopt(&marked), None, "a symlinked marker");
+
+    let loose = published(&tmp.path().join("ws2"), &gh);
+    set_mode(&loose.join("gh-ok"), 0o666);
+    assert_eq!(adopt(&loose), None, "a 0666 marker");
+
+    let outaged = published(&tmp.path().join("ws3"), &gh);
+    let expired = tmp.path().join("long-ago");
+    std::fs::write(&expired, "0").unwrap();
+    std::os::unix::fs::symlink(&expired, outaged.join(outage::FRONT_OUTAGE)).unwrap();
+    assert_eq!(adopt(&outaged), None, "a symlinked outage file");
+    std::fs::remove_file(outaged.join(outage::FRONT_OUTAGE)).unwrap();
+    assert_eq!(adopt(&outaged), Some(outaged.clone()));
+    // An outage file the front itself writes (0600) is honoured, not refused.
+    outage::note_front_outage(&outaged);
+    assert_eq!(adopt(&outaged), None);
+    assert_eq!(
+        cli_base(Some(outaged.as_os_str().to_owned()), gh_s, now + Duration::from_secs(3600)),
+        Some(outaged)
+    );
+}
+
 /// #7818's leak class: a profile holds a live key, so its path must be
 /// ignored by the deployed `.gitignore` block AND refused by every stager's
 /// credential list, without either list naming it.

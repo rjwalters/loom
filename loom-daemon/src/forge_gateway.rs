@@ -297,6 +297,8 @@ pub fn enable_front(next_gh: &Path) {
 /// published set always wins ([`profile_for`]), and once per process (also a
 /// no-op after [`enable_front`] ran in the same process); unset,
 /// nothing changes. A CLI that makes forge reads calls it before the first.
+/// A gateway outage it hits is recorded beside the profiles
+/// ([`note_outage_from_front`]).
 pub fn enable_cli() {
     if DAEMON.get().is_some() {
         return;
@@ -322,6 +324,21 @@ fn front_base(dir_env: Option<OsString>, gh: &Path, now: SystemTime) -> Option<P
         .filter(|base| publish::safe_base(base))
         .filter(|base| publish::gh_marker_matches(base, gh))
         .filter(|base| !outage::front_outage_active(base, now))
+}
+
+/// After the facade withdrew the gateway for an outage in a non-daemon
+/// process (the agent front's facade reads, a CLI): record it beside the
+/// profiles, as the front's own passthrough does
+/// ([`outage::note_front_outage`]), so the next process (a timer's next
+/// `labels` run) skips the gateway for the window instead of retrying it
+/// once per owner. A no-op in the daemon and with no adopted base.
+pub(crate) fn note_outage_from_front() {
+    if DAEMON.get().is_some() {
+        return;
+    }
+    if let Some(Some(base)) = FRONT.get() {
+        outage::note_front_outage(base);
+    }
 }
 
 /// Whether any gateway profile can route in this process. `false` while
