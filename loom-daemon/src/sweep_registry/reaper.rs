@@ -1147,6 +1147,13 @@ impl SweepRegistry {
                             // POOL-level fault — see this branch's use below.
                             let pool_dead =
                                 classification.as_deref() == Some(NO_USABLE_ACCOUNT_CLASS);
+                            // #11854: the class a ladder park would name.
+                            let fast_class = self.fast_fail_class_for(
+                                issue,
+                                &sweep_id,
+                                death_class.as_deref(),
+                                classification.as_deref(),
+                            );
                             // Captured before `checkpoint_phase` moves into the
                             // `SweepCrashed` event below — needed for the
                             // reaper-driven resume check further down (#4256).
@@ -1267,8 +1274,14 @@ impl SweepRegistry {
                                         &self.config.workspace_root,
                                     ),
                                 );
-                            } else if insta_crash {
-                                self.charge_dispatch_failure(&sweep_id, issue);
+                            } else if is_fast_failure(
+                                duration_sec,
+                                exit_code,
+                                self.quarantine_config.insta_crash_secs,
+                            ) {
+                                // #11854: a 2-minute window; the third in a
+                                // row parks.
+                                self.charge_fast_failure(&sweep_id, issue, &fast_class, true);
                             }
                             if checkpoint_progress {
                                 self.record_terminal_outcome(issue, false);
@@ -1885,6 +1898,17 @@ impl SweepRegistry {
                             // crashed branch above, so both need the carve-out.
                             let pool_dead =
                                 classification.as_deref() == Some(NO_USABLE_ACCOUNT_CLASS);
+                            let fast_class = self.fast_fail_class_for(
+                                issue,
+                                &sweep_id,
+                                death_class.as_deref(),
+                                classification.as_deref(),
+                            );
+                            let fast_fail = is_fast_failure(
+                                duration_sec,
+                                exit_code,
+                                self.quarantine_config.insta_crash_secs,
+                            );
                             // Telemetry `result` classification (#4704),
                             // strongest signal first:
                             //   1. An observed `merge-done` means the sweep
@@ -1963,8 +1987,11 @@ impl SweepRegistry {
                                         &self.config.workspace_root,
                                     ),
                                 );
-                            } else if insta_crash || no_progress || yielded_open_pr {
-                                self.charge_dispatch_failure(&sweep_id, issue);
+                            } else if fast_fail || no_progress || yielded_open_pr {
+                                // #11854: an open-PR yield climbs the ladder
+                                // but never parks — nothing failed.
+                                let parkable = fast_fail || no_progress;
+                                self.charge_fast_failure(&sweep_id, issue, &fast_class, parkable);
                             } else {
                                 self.clear_dispatch_backoff(issue);
                             }

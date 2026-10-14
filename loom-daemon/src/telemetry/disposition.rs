@@ -108,6 +108,10 @@ pub const NO_PHASE_SIGNAL_CLASS: &str = "unclassified:no-phase-signal";
 /// (Issue #9441); a clean exit never earns it (Issue #11438).
 pub const SPAWN_DEATH_CLASS: &str = "unclassified:spawn-death";
 
+/// The class a sweep `failure` carries when nothing else named one (Issue
+/// #11854) — a class in its own right, never an empty attribute.
+pub const UNCLASSIFIED_CLASS: &str = "unclassified";
+
 /// What a sweep actually did, independent of how its process ended (Issue
 /// #9441) — the axis [`SweepResult`] cannot express.
 ///
@@ -352,6 +356,23 @@ pub fn result_for_disposition(
     } else {
         signals.result
     }
+}
+
+/// Every sweep `failure` carries a non-empty `failure_class` (Issue #11854).
+///
+/// [`classify_disposition`] only demands a class for the fault dispositions,
+/// so a `failure` that lands in `landed` (not clean), `curator_closed` or
+/// `curator_rescoped` went out with none, and `loom.failure_class` was absent
+/// from its span: the 20-a-day loop that filed #11854 was invisible to every
+/// query grouped by class. Such a failure gets [`UNCLASSIFIED_CLASS`]; a
+/// present class, and any non-`failure` result, pass through unchanged.
+#[must_use]
+pub fn ensure_failure_class(result: SweepResult, class: Option<String>) -> Option<String> {
+    let class = class.filter(|c| !c.trim().is_empty());
+    if result == SweepResult::Failure && class.is_none() {
+        return Some(UNCLASSIFIED_CLASS.to_string());
+    }
+    class
 }
 
 /// Whether `class` names an *environmental* fault — the run broke, rather than

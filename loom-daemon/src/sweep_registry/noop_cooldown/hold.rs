@@ -188,7 +188,6 @@ impl SweepRegistry {
     }
 
     /// Whether this daemon holds `issue` for a no-op loop.
-    #[cfg(test)]
     #[must_use]
     pub(crate) fn noop_hold_applied(&self, issue: u32) -> bool {
         self.noop_cooldown

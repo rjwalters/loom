@@ -593,12 +593,14 @@ pub const DISPATCH_BACKOFF_MAX_ENV: &str = "LOOM_DISPATCH_BACKOFF_MAX_SECS";
 /// flapping its label on every poll.
 pub const DEFAULT_DISPATCH_BACKOFF_BASE_SECS: u64 = 60;
 
-/// Default maximum backoff delay (#4485). Reached after 5 consecutive failures
-/// (60s → 120 → 240 → 480 → 900). Well under the quarantine TTL
-/// ([`DEFAULT_QUARANTINE_TTL_SECS`]), so on an issue that IS quarantine-eligible
-/// the quarantine remains the longer, louder, operator-visible brake and this
-/// only smooths the ramp toward it.
-pub const DEFAULT_DISPATCH_BACKOFF_MAX_SECS: u64 = 900;
+/// Default maximum backoff delay: 6 h (#11854; 900 s under #4485). A 15-minute
+/// ceiling still let an issue that fails a minute in run around the clock
+/// (one issue: 20 failed sweeps in a day). An issue-attributable streak is
+/// parked at the quarantine threshold long before this (`fast_fail_park`); the
+/// ceiling bounds the streaks that are never parked (environmental classes,
+/// open-PR yields, quarantine disabled). The open-PR guard keeps its own
+/// 900 s cap (`backoff_cause::cap`).
+pub const DEFAULT_DISPATCH_BACKOFF_MAX_SECS: u64 = 21_600;
 
 // ============================================================================
 // Cross-issue empty-pool dispatch brake (Issue #6614)
@@ -770,10 +772,10 @@ impl Default for DispatchBackoffConfig {
 }
 
 /// Why a per-issue dispatch-backoff window (Issue #4485) was most recently
-/// (re-)armed. Purely observational metadata riding alongside
-/// [`DispatchBackoffState`] — it does not change the doubling/expiry math at
-/// all, it only lets a reader distinguish "this issue's *dispatches* keep
-/// failing" from "this issue's open-PR guard keeps refusing it" (Issue
+/// (re-)armed. Metadata riding alongside [`DispatchBackoffState`] — beyond its
+/// ceiling (`backoff_cause::cap`, #11854) it does not change the
+/// doubling/expiry math, it only lets a reader distinguish "this issue's
+/// *dispatches* keep failing" from "this issue's open-PR guard keeps refusing it" (Issue
 /// #7606), so the work-finder can attribute a pre-filtered skip to its own
 /// `pr-open-backoff` tick-summary counter instead of the generic
 /// `backoff-skip`.
@@ -1200,11 +1202,11 @@ impl SweepRegistry {
     /// exponential growth (60s -> 120 -> 240 -> 480 -> 900), the same
     /// pre-`dispatch()` work-finder short-circuit
     /// ([`WorkDispatcher::backed_off`](crate::work_finder::WorkDispatcher::backed_off)),
-    /// and — because [`DispatchBackoffConfig::max`] defaults to 900s, the same
-    /// as [`super::guards::OPEN_PR_MEMO_FRESH`] — a cap that never outlives
-    /// the memo's own freshness window on default config.
+    /// and — because this cause is capped at [`super::guards::OPEN_PR_MEMO_FRESH`]
+    /// whatever [`DispatchBackoffConfig::max`] says (#11854) — a cap that
+    /// never outlives the memo's own freshness window.
     ///
-    /// Tagged [`DispatchBackoffCause::OpenPrGuard`] (purely observational) so
+    /// Tagged [`DispatchBackoffCause::OpenPrGuard`] (which sets the cap above) so
     /// the work-finder can attribute the pre-filtered skip this arms to its
     /// own `pr-open-backoff` tick-summary counter instead of the generic
     /// `backoff-skip`.
@@ -1221,8 +1223,8 @@ impl SweepRegistry {
             return;
         }
         let now = Utc::now();
-        let max_secs =
-            i64::try_from(self.dispatch_backoff_config.max.as_secs()).unwrap_or(i64::MAX);
+        let max = backoff_cause::cap(cause, self.dispatch_backoff_config.max);
+        let max_secs = i64::try_from(max.as_secs()).unwrap_or(i64::MAX);
         let consecutive = match self.dispatch_backoff.get(&issue) {
             Some(prev) if backoff_cause::continues(prev, cause, now, max_secs) => {
                 prev.consecutive.saturating_add(1)
@@ -1231,11 +1233,7 @@ impl SweepRegistry {
             // cause's streak (#8865) — start a fresh streak.
             _ => 1,
         };
-        let delay = backoff_delay(
-            consecutive,
-            self.dispatch_backoff_config.base,
-            self.dispatch_backoff_config.max,
-        );
+        let delay = backoff_delay(consecutive, self.dispatch_backoff_config.base, max);
         let until =
             now + chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::zero());
         self.dispatch_backoff.insert(
