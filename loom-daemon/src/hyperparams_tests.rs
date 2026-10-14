@@ -533,3 +533,46 @@ fn work_finder_reader_hot_applies_the_weight_bonuses() {
         WeightBonus::default()
     );
 }
+
+#[test]
+#[serial]
+fn item_draw_knobs_default_read_the_block_and_validate_by_name() {
+    let tmp = empty_workspace();
+    let d = resolve_effective(tmp.path()).params.dispatch;
+    assert_eq!(
+        (
+            d.item_weight_red_main,
+            d.item_weight_very_important,
+            d.item_weight_important,
+            d.item_age_cap_days,
+            d.item_age_divisor_days
+        ),
+        (50, 8, 3, 90, 30)
+    );
+    write_config(
+        tmp.path(),
+        r#"{"hyperparameters": {"dispatch": {"itemWeightRedMain": 20, "itemAgeDivisorDays": 15}}}"#,
+    );
+    let resolved = resolve_effective(tmp.path());
+    assert_eq!(resolved.params.dispatch.item_weight_red_main, 20);
+    assert_eq!(resolved.params.dispatch.item_age_divisor_days, 15);
+    assert_eq!(resolved.sources["dispatch.itemWeightRedMain"], Source::Config);
+    assert_eq!(resolved.sources["dispatch.itemAgeCapDays"], Source::Default);
+    assert_ne!(digest_of(&resolved.params), digest_of(&Hyperparameters::default()));
+    // The draw's own overlay reads the same block.
+    let w = crate::step_dispatch::item_draw::ItemWeights::for_root(tmp.path());
+    assert_eq!((w.red_main, w.age_divisor_days), (20, 15));
+
+    for (key, bad) in [
+        ("itemWeightRedMain", 0),
+        ("itemWeightVeryImportant", 1_000_001),
+        ("itemAgeCapDays", 3651),
+        ("itemAgeDivisorDays", 0),
+    ] {
+        let layer = serde_json::json!({"dispatch": {key: bad}});
+        let v = validate_layer(&layer);
+        assert_eq!(v.len(), 1, "{key}={bad}: {v:?}");
+        assert_eq!(v[0].path, format!("dispatch.{key}"));
+    }
+    assert!(validate_layer(&serde_json::json!({"dispatch": {"itemAgeCapDays": 0}})).is_empty());
+}

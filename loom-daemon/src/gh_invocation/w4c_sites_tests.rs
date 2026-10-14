@@ -65,7 +65,23 @@ fn every_deferrable_site_maps_a_shed_to_no_answer() {
         use crate::observability::ops::stage_dwell::{GhStageFetcher, StageFetcher};
         step(
             "stage_dwell.label_times",
-            GhStageFetcher.label_times(root, "acme/shed", 3).is_none(),
+            GhStageFetcher
+                .label_times(root, "acme/shed", 3, "loom:curated", 3)
+                .times
+                .is_none(),
+        );
+        step(
+            "stage_entry.events",
+            crate::step_dispatch::stage_entry::EventsSource::label_times(
+                &mut crate::step_dispatch::stage_entry::GhEventsReader,
+                root,
+                "acme/shed",
+                3,
+                "loom:issue",
+                3,
+            )
+            .times
+            .is_none(),
         );
         step(
             "stage_dwell.merged_at",
@@ -190,16 +206,6 @@ fn the_carry_over_reads_route_to_the_reader() {
             &["api", "repos/{owner}/{repo}/pulls?state=all&head=acme:b"],
         ),
         shape("clean.pr_by_number_rest", &["api", "repos/{owner}/{repo}/pulls/9"]),
-        shape(
-            "intake.list_open",
-            &[
-                "api",
-                "--paginate",
-                "repos/{owner}/{repo}/issues?state=open&per_page=100",
-                "--jq",
-                ".",
-            ],
-        ),
         shape(
             "guard.lease_comments",
             &["api", "repos/{owner}/{repo}/issues/7/comments?per_page=100"],

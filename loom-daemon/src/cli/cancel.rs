@@ -20,7 +20,7 @@ use anyhow::Result;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use loom_daemon::types::{Request, Response, SweepInfo, SweepKind, SweepState};
+use loom_daemon::types::{Request, Response, SweepInfo, SweepState};
 
 use super::common::{query_daemon_bounded, resolve_socket_path};
 use super::dispatch::resolve_cli_dispatch_workspace;
@@ -67,7 +67,8 @@ fn build_cancel_request(sweep_id: String, grace_secs: u64, workspace: Option<Str
 fn select_sweep_for_issue(sweeps: &[SweepInfo], issue: u32) -> Result<String, String> {
     let live: Vec<&SweepInfo> = sweeps
         .iter()
-        .filter(|info| matches!(info.kind, SweepKind::Issue(n) if n == issue))
+        // A step on the item is cancelled like its sweep would be (#11898).
+        .filter(|info| info.kind.item_number() == Some(issue))
         .filter(|info| matches!(info.state, SweepState::Running | SweepState::Pending))
         .collect();
     match live.as_slice() {
