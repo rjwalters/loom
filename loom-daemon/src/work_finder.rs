@@ -2864,11 +2864,6 @@ pub fn spawn_multi_work_finder_task(
         // currently missing so `filter_missing_roots` logs a warning once per
         // transition rather than once per tick.
         let mut missing_roots_warned: HashSet<PathBuf> = HashSet::new();
-        // Workspace-commands-missing tripwire (#6440): tracks which roots are
-        // currently missing .claude/commands/loom/sweep.md so the loud WARN
-        // below fires once per transition (into AND out of the condition),
-        // never every tick — mirroring `missing_roots_warned`.
-        let mut commands_missing_warned: HashSet<PathBuf> = HashSet::new();
         // Idle-edge role triggering (#4364): per-root idle level + per-(root,
         // role) debounce state. Fed one post-tick idle observation per root; on
         // the non-idle → idle edge it fire-and-forgets each configured on-idle
@@ -2876,6 +2871,7 @@ pub fn spawn_multi_work_finder_task(
         // fires.
         let mut idle_trigger = crate::role_runner::IdleTrigger::new();
         let mut was_rate_limited = false;
+        let mut step_driver = crate::step_dispatch::driver::StepDriver::default();
         loop {
             ticker.tick().await;
 
@@ -3149,36 +3145,6 @@ pub fn spawn_multi_work_finder_task(
                 draining || breaker_suppressed,
             );
 
-            let mut pairs = forge::dispatcher_pairs(&pool, &roots);
-
-            // Workspace-commands-missing tripwire (#6440): a loud, ONE-TIME
-            // WARN per root on the transition into (and recovery from) the
-            // condition — never every tick. `tick_multi_with_saturation_brake`
-            // below independently re-checks this per root to decide whether
-            // to skip its candidates; this is purely the log-once concern,
-            // mirroring `filter_missing_roots`' `missing_roots_warned` dedup.
-            for (root, (_src, dispatcher)) in roots.iter().zip(pairs.iter()) {
-                let missing = dispatcher.workspace_commands_missing();
-                if missing && commands_missing_warned.insert(root.clone()) {
-                    log::warn!(
-                        "work_finder: workspace {} is missing \
-                         .claude/commands/loom/sweep.md — every dispatch to it is refused \
-                         (#4027 guard). Its ready issues will be skipped in one batch per tick \
-                         rather than retried individually (#6440). Run `loom-daemon init {}` \
-                         there. `loom-daemon status` reports this repo's HEALTH-GATE as `no-sweep` \
-                         until fixed.",
-                        root.display(),
-                        root.display()
-                    );
-                } else if !missing && commands_missing_warned.remove(root) {
-                    log::info!(
-                        "work_finder: workspace {} now has .claude/commands/loom/sweep.md — \
-                         dispatch resuming (#6440)",
-                        root.display()
-                    );
-                }
-            }
-
             let axis_line = format!(
                 "work_finder: dynamic cap = {max_concurrent} (pool={pool_size}, \
                  healthy_tokens={token_limit} [informational only, not capacity-limiting \
@@ -3190,7 +3156,7 @@ pub fn spawn_multi_work_finder_task(
                  build_backoff_held={build_backoff_held} (#9410), \
                  observed_idle={}, workspaces={}, priorities={priorities:?})",
                 format_idle(idle),
-                pairs.len()
+                roots.len()
             );
             if was_max_concurrent != Some(max_concurrent) {
                 log::info!("{axis_line}");
@@ -3200,18 +3166,20 @@ pub fn spawn_multi_work_finder_task(
             }
 
             let tick_started = chrono::Utc::now();
-            let report = tick_multi_with_build_backoff(
-                &mut pairs,
-                &priorities,
-                CapTerms::observed(configured_max, disk, ram),
-                &halted,
-                Some(&halt_causes),
-                max_admissions_per_tick,
+            // #11909: the step tick is the only item dispatch path.
+            let report = step_driver.tick(&crate::step_dispatch::driver::TickInputs {
+                pool: &pool,
+                roots: &roots,
+                weights: &priorities,
+                halted: &halted,
+                halt_causes: &halt_causes,
+                lanes: &lanes,
+                build_backoff: &build_backoff_held.per_workspace,
+                max_concurrent,
+                max_admissions: max_admissions_per_tick,
                 saturation_held,
-                (max_concurrent_per_repo, ram_budget, disk_budget),
-                &lanes,
-                &build_backoff_held.per_workspace,
-            );
+                limits: (max_concurrent_per_repo, ram_budget, disk_budget).into(),
+            });
 
             // Publish before any logging so `loom-daemon health` sees the same
             // tick the log line describes (#4761).
@@ -3238,7 +3206,7 @@ pub fn spawn_multi_work_finder_task(
                 ram,
                 configured_max,
                 max_admissions_per_tick,
-                workspaces: pairs.len(),
+                workspaces: roots.len(),
                 disk_note: &disk_note,
             };
             tick_line::log(&report, &tick_line);
@@ -3270,8 +3238,11 @@ pub fn spawn_multi_work_finder_task(
             // on-idle role (never awaited here — the tick must not block on a
             // multi-minute role session). `draining` (#4090) suppresses firing;
             // per-root config gating (enabled + `onIdle`) is applied inside.
-            for (root, (_src, dispatcher)) in roots.iter().zip(pairs.iter()) {
-                let idle_now = dispatcher.in_flight().is_empty();
+            for root in &roots {
+                let idle_now = pool.get_or_provision(root).lock().map_or(true, |mut reg| {
+                    reg.reap_liveness();
+                    reg.occupied_issues().is_empty()
+                });
                 crate::role_runner::observe_and_fire_idle(
                     &mut idle_trigger,
                     &role_in_progress,

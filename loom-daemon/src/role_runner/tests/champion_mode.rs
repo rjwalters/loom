@@ -35,18 +35,18 @@ fn champion_mode_parses_only_the_two_spellings() {
 }
 
 #[test]
-fn champion_mode_block_parse_soft_fails_to_none() {
+fn champion_mode_block_parse_keeps_the_value_only_to_warn() {
     let block = |v: &str| serde_json::from_str::<serde_json::Value>(v).unwrap();
     assert_eq!(parse_champion_mode(&block(r"{}")), None, "absent");
     assert_eq!(
         parse_champion_mode(&block(r#"{"championMode":"non-item"}"#)),
         Some(ChampionMode::NonItem)
     );
+    // Retired: "all" parses (and warns) but changes nothing below.
     assert_eq!(
         parse_champion_mode(&block(r#"{"championMode":"all"}"#)),
         Some(ChampionMode::All)
     );
-    // Typo, wrong type, null: ignored (warned), so Champion runs every queue.
     for bad in [
         r#"{"championMode":"nonitem"}"#,
         r#"{"championMode":true}"#,
@@ -57,13 +57,10 @@ fn champion_mode_block_parse_soft_fails_to_none() {
 }
 
 #[test]
-fn champion_mode_argument_is_champion_and_non_item_only() {
-    assert_eq!(prompt_arg("champion", Some(ChampionMode::NonItem)), Some(NON_ITEM_ARG));
-    assert_eq!(prompt_arg("champion", Some(ChampionMode::All)), None);
-    assert_eq!(prompt_arg("champion", None), None);
-    // The knob names Champion; it never leaks onto another role's prompt.
+fn champion_always_runs_non_item_and_no_other_role_gets_the_argument() {
+    assert_eq!(prompt_arg("champion"), Some(NON_ITEM_ARG));
     for spec in DEFAULT_ROLES.iter().filter(|s| s.name != "champion") {
-        assert_eq!(prompt_arg(spec.name, Some(ChampionMode::NonItem)), None, "{}", spec.name);
+        assert_eq!(prompt_arg(spec.name), None, "{}", spec.name);
     }
 }
 
@@ -71,30 +68,38 @@ fn champion_mode_argument_is_champion_and_non_item_only() {
 #[serial]
 fn champion_mode_reaches_the_resolved_prompt_and_nothing_else() {
     std::env::remove_var(ARCHITECT_MAX_PROPOSALS_ENV);
-    let non_item = RoleRunnerConfig {
-        champion_mode: Some(ChampionMode::NonItem),
-        ..Default::default()
-    };
-    assert_eq!(resolve_role_prompt(&champion_spec(), &non_item), "/loom:champion --non-item");
-    // Batch mode is byte-for-byte unchanged: absent and explicit "all".
+    // Every configuration resolves Champion to its non-item run (#11909).
     for cfg in [
         RoleRunnerConfig::default(),
         RoleRunnerConfig {
             champion_mode: Some(ChampionMode::All),
             ..Default::default()
         },
+        RoleRunnerConfig {
+            champion_mode: Some(ChampionMode::NonItem),
+            ..Default::default()
+        },
     ] {
-        assert_eq!(resolve_role_prompt(&champion_spec(), &cfg), "/loom:champion");
+        assert_eq!(resolve_role_prompt(&champion_spec(), &cfg), "/loom:champion --non-item");
     }
-    // Every other role resolves exactly as it does with no championMode.
-    for spec in DEFAULT_ROLES.iter().filter(|s| s.name != "champion") {
-        assert_eq!(
-            resolve_role_prompt(spec, &non_item),
-            resolve_role_prompt(spec, &RoleRunnerConfig::default()),
-            "{}",
-            spec.name
-        );
+}
+
+/// The item roles never tick on the role runner (#11909): not by default, not
+/// when a config names them.
+#[test]
+fn item_roles_never_resolve_for_the_interval_or_the_idle_edge() {
+    let names = |specs: Vec<RoleSpec>| specs.iter().map(|s| s.name).collect::<Vec<_>>();
+    for role in crate::role_runner::champion_mode::STEP_ROLES {
+        assert!(!names(interval_default_roles()).contains(&role), "{role}");
+        let cfg = RoleRunnerConfig {
+            roles: Some(vec![role.to_string(), "guide".to_string()]),
+            on_idle: Some(vec![role.to_string()]),
+            ..Default::default()
+        };
+        assert_eq!(names(resolve_roles(&cfg)), vec!["guide"]);
+        assert!(resolve_on_idle_roles(&cfg).is_empty());
     }
+    assert!(names(interval_default_roles()).contains(&"champion"));
 }
 
 #[test]

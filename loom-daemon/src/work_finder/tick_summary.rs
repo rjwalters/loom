@@ -221,7 +221,7 @@ pub fn publish_tick(
         &summary,
         started_at,
         completed_at,
-        (report.workspace_draw.as_ref(), &report.vi_demotions),
+        (report.workspace_draw.as_ref(), &report.vi_demotions, report.item_draw.as_ref()),
         roots,
     );
     store_tick_summary(summary);

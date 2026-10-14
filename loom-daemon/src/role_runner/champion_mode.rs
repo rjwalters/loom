@@ -1,60 +1,51 @@
-//! `autonomous.roleRunner.championMode` (#11859): which of Champion's queues
-//! an interval (or idle-edge) Champion tick works.
+//! The role runner under step dispatch (#11909): Champion runs its non-item
+//! queues only, and the item roles do not run on intervals.
 //!
-//! The work-finder redesign moves Champion's **item** work (a merge decision
-//! on one `loom:pr` PR, a promotion verdict on one `loom:curated` issue) onto
-//! per-item steps (`/loom:champion --pr N`, `/loom:champion --issue N`).
-//! Champion's other queues (architect/hermit/auditor proposals, epics,
-//! Doctor-cap parked PRs, rollout checks, and the batch-wide Pass 0 / held-PR
-//! census) have no item to draw, so they stay on the role runner's interval.
-//! A root that hands its item work to steps therefore needs its interval
-//! Champion to run **only** those queues, or the two would double-act on the
-//! same PR or issue. That is this knob:
+//! The work finder draws every item at every stage and spawns the step its
+//! state calls for (`step_dispatch`, design #11894): a Curator, a Champion
+//! promotion or merge, a Judge, a Doctor, a Builder. The role runner must
+//! not act on the same items, or the two would double-act. So:
 //!
-//! | value | dispatched prompt | queues |
-//! |---|---|---|
-//! | `"all"` (default, or absent) | `/loom:champion` | every queue, byte-for-byte today's batch pass |
-//! | `"non-item"` | `/loom:champion --non-item` | the non-item queues only (`champion-targeted.md`) |
+//! - **Champion** is dispatched as `/loom:champion --non-item`
+//!   (`champion-targeted.md`): proposals, epics, Doctor-cap parked PRs,
+//!   rollout checks and the batch-wide census, which have no item to draw.
+//!   `autonomous.roleRunner.championMode` (#11859) is retired: `"non-item"`
+//!   is the only behaviour, and `"all"` (or any other value) is ignored with
+//!   a warning.
+//! - **Curator, Judge and Doctor** ([`STEP_ROLES`]) never tick on an
+//!   interval or on the idle edge. Naming one in `autonomous.roleRunner.roles`
+//!   or `onIdle` is ignored with a warning, once per name.
 //!
-//! # Why a per-role option rather than a `roles` spelling
-//!
-//! `autonomous.roleRunner.roles` entries are matched by exact name against
-//! [`super::DEFAULT_ROLES`] in half a dozen places (the resolved list, the
-//! stale-allowlist diagnostic, `onIdle`, `onIdleMaxWait`,
-//! `roleMaxConcurrent`, the lane rule). A `champion:non-item` spelling would
-//! have to be normalised at every one of them, and any it missed would
-//! silently treat Champion as unconfigured. A sibling key leaves the role's
-//! name alone everywhere and changes only the argument the launch carries,
-//! exactly as `architectMaxProposals` does for Architect.
-//!
-//! # Scope and fail direction
-//!
-//! Per root, read live on every tick from that root's own config (all tiers),
-//! like every other role-runner knob. There is deliberately **no environment
-//! override**: an env var is host-wide, and this knob exists to differ per
-//! root during a staged rollout.
-//!
-//! An unrecognised value warns and falls back to `"all"`: today's behaviour,
-//! and the soft-fail every other `autonomous.roleRunner` key uses. It never
-//! fails toward skipping work.
+//! Guide, Auditor, Hermit and Architect keep the interval: they have no item
+//! to draw.
 
-/// The one role this knob applies to.
+use std::collections::BTreeSet;
+use std::sync::{Mutex, OnceLock};
+
+use super::RoleSpec;
+
+/// The one role `championMode` applied to.
 pub const CHAMPION_ROLE: &str = "champion";
 
-/// The config key, under `autonomous.roleRunner`.
+/// The retired config key, under `autonomous.roleRunner`.
 pub const CHAMPION_MODE_KEY: &str = "championMode";
 
 /// The argument `/loom:champion` reads as "non-item queues only"
 /// (`champion.md` → "Argument Handling").
 pub const NON_ITEM_ARG: &str = "--non-item";
 
-/// Which of Champion's queues a role-runner Champion tick works.
+/// The roles whose item work the step engine runs, and which therefore never
+/// tick on the role runner.
+pub const STEP_ROLES: [&str; 3] = ["curator", "judge", "doctor"];
+
+/// The value `championMode` was configured to, kept only so its retirement
+/// can be warned about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ChampionMode {
-    /// Every queue: the batch pass, unchanged.
+    /// `"all"`: retired, ignored.
     #[default]
     All,
-    /// The non-item queues only; item work is left to targeted steps.
+    /// `"non-item"`: the only behaviour.
     NonItem,
 }
 
@@ -80,25 +71,64 @@ impl ChampionMode {
     }
 }
 
-/// Read `championMode` from an `autonomous.roleRunner` block. `None` when the
-/// key is absent; an unrecognised or non-string value warns and is `None`
-/// too, so it resolves to [`ChampionMode::All`].
+/// Read `championMode` from an `autonomous.roleRunner` block. Any value but
+/// `"non-item"` is ignored with a warning: Champion runs non-item only.
 #[must_use]
 pub fn parse_champion_mode(block: &serde_json::Value) -> Option<ChampionMode> {
     let raw = block.get(CHAMPION_MODE_KEY)?;
     let parsed = raw.as_str().and_then(ChampionMode::parse);
-    if parsed.is_none() {
+    if parsed != Some(ChampionMode::NonItem) {
         log::warn!(
-            "role_runner: autonomous.roleRunner.{CHAMPION_MODE_KEY} = {raw} is not one of \
-             \"all\" / \"non-item\" — ignored, Champion runs every queue (#11859)"
+            "role_runner: autonomous.roleRunner.{CHAMPION_MODE_KEY} = {raw} is retired and \
+             ignored: Champion runs its non-item queues only (#11909)"
         );
     }
     parsed
 }
 
-/// The argument to append to `role`'s slash command, if any. Only Champion
-/// in [`ChampionMode::NonItem`] carries one.
+/// The argument to append to `role`'s slash command, if any: Champion's
+/// `--non-item`.
 #[must_use]
-pub fn prompt_arg(role: &str, mode: Option<ChampionMode>) -> Option<&'static str> {
-    (role == CHAMPION_ROLE && mode == Some(ChampionMode::NonItem)).then_some(NON_ITEM_ARG)
+pub fn prompt_arg(role: &str) -> Option<&'static str> {
+    (role == CHAMPION_ROLE).then_some(NON_ITEM_ARG)
+}
+
+/// Whether `role` is one of [`STEP_ROLES`].
+#[must_use]
+pub fn is_step_role(role: &str) -> bool {
+    STEP_ROLES.contains(&role)
+}
+
+fn warned() -> &'static Mutex<BTreeSet<(String, String)>> {
+    static WARNED: OnceLock<Mutex<BTreeSet<(String, String)>>> = OnceLock::new();
+    WARNED.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+/// `specs` without the [`STEP_ROLES`]. `key` names the config list they came
+/// from (`roles`, `onIdle`), or is `None` for the built-in default, which
+/// needs no warning; a configured step role is warned about once per name.
+#[must_use]
+pub fn without_step_roles(specs: Vec<RoleSpec>, key: Option<&str>) -> Vec<RoleSpec> {
+    specs
+        .into_iter()
+        .filter(|s| {
+            if !is_step_role(s.name) {
+                return true;
+            }
+            if let Some(key) = key {
+                let first = warned()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert((key.to_string(), s.name.to_string()));
+                if first {
+                    log::warn!(
+                        "role_runner: autonomous.roleRunner.{key} names {:?}, which the work \
+                         finder now runs as steps; ignored (#11909)",
+                        s.name
+                    );
+                }
+            }
+            false
+        })
+        .collect()
 }

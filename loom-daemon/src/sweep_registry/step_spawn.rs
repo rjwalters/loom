@@ -48,6 +48,7 @@ use crate::step_role::StepRole;
 
 pub(crate) mod capture;
 pub(crate) mod lease;
+mod pool_state;
 pub(crate) mod timeout;
 
 pub use timeout::step_timeout;

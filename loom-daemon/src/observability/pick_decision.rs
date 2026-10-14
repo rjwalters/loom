@@ -130,7 +130,7 @@ fn take_gate_listings(root: &Path) -> Vec<(String, Vec<GateRow>)> {
 
 /// The forge slug for `root`, from its `origin` remote (a local git call,
 /// cached per root), or [`REPO_UNRESOLVED`].
-fn repo_label(root: &Path) -> String {
+pub(crate) fn repo_label(root: &Path) -> String {
     static CACHE: OnceLock<Mutex<HashMap<std::path::PathBuf, String>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(hit) = cache
@@ -232,7 +232,13 @@ pub fn work_finder_record(
                 rank: u32::try_from(row.rank).unwrap_or(u32::MAX),
                 repo: resolve(&row.repo),
                 number: row.issue,
-                stage: "loom:issue".to_string(),
+                // A step-tick row names its step (#11909); an issue-sweep
+                // row is a `loom:issue` build.
+                stage: row
+                    .plan
+                    .step
+                    .as_ref()
+                    .map_or_else(|| "loom:issue".to_string(), crate::types::PlanStep::name),
                 sort_key: Some(PickSortKey {
                     name: "candidate_cmp".to_string(),
                     value,
@@ -329,6 +335,8 @@ pub struct ItemDrawWorkspace<'a> {
     pub pool: &'a [Candidate],
     /// The draws taken, in order.
     pub draws: &'a [DrawRecord],
+    /// The draw stopped on a `WeightOverflow` (#11909).
+    pub overflow: bool,
 }
 
 /// The step engine's item draws for one tick (#11896) as `pick.decision`
@@ -413,6 +421,11 @@ pub fn item_draw_record(
         excluded,
         pools,
         draws,
+        weight_overflow: workspaces
+            .iter()
+            .filter(|w| w.overflow)
+            .map(|w| w.repo.to_string())
+            .collect(),
     })
 }
 
@@ -459,7 +472,7 @@ pub fn emit_work_finder(
     summary: &WorkFinderTickSummary,
     started_at: DateTime<Utc>,
     ended_at: DateTime<Utc>,
-    (draw, demoted): (Option<&DrawLog>, &[ViDemotion]),
+    (draw, demoted, item_draw): (Option<&DrawLog>, &[ViDemotion], Option<&PickItemDraw>),
     roots: &[std::path::PathBuf],
 ) {
     if !exporting() {
@@ -481,7 +494,8 @@ pub fn emit_work_finder(
             resolve_repo,
         )
         .with_workspace_draw(draw)
-        .with_very_important_demoted(demoted),
+        .with_very_important_demoted(demoted)
+        .with_item_draw(item_draw.cloned()),
     )
 }
 

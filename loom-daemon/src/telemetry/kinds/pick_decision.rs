@@ -382,6 +382,11 @@ pub struct PickItemDraw {
     pub pools: Vec<PickItemPoolEntry>,
     /// Every draw, in order (the chunk's in-order slice).
     pub draws: Vec<PickItemDrawStep>,
+    /// The workspaces whose draw stopped because their pool's total weight
+    /// overflowed `u64` (`DrawError::WeightOverflow`, #11909): no further
+    /// item was drawn from them this tick. Header: repeats on every chunk.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub weight_overflow: Vec<String>,
 }
 
 /// One item of a workspace's starting pool.
