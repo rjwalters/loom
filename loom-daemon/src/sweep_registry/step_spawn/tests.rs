@@ -155,6 +155,12 @@ fn a_step_child_lists_its_leases_and_a_curator_names_its_launch() {
                 .to_string()
         )
     );
+    // The session re-attaches by host: the child carries the daemon's own
+    // lease host id, whatever `$HOSTNAME` it later sees (e.g. a container's).
+    assert_eq!(
+        env(&cmd, crate::host_identity::HOST_ID_ENV),
+        Some(crate::host_identity::lease_host_identity())
+    );
     assert_eq!(env(&cmd, "LOOM_CURATION_MODEL").as_deref(), Some("opus"));
     assert_eq!(env(&cmd, "LOOM_CURATION_RUNTIME").as_deref(), Some("unknown"));
     let mut cmd = Command::new("true");

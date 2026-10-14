@@ -41,6 +41,9 @@ impl SweepRegistry {
         if self.config.skip_label_flip {
             return;
         }
+        // Leases are keyed by the step's own sweep id, so reaping them is safe
+        // even when a peer holds the item now (#11906).
+        self.reap_step_leases(sweep_id, "exited");
         if self.step_claim_held_elsewhere(item, role, sweep_id, started_at) {
             log::info!(
                 "reconstruct: {role} step {sweep_id} on #{item} died while no daemon ran, and \

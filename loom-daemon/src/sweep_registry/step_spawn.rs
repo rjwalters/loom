@@ -489,7 +489,7 @@ impl SweepRegistry {
 /// The step-only environment of a step child (called from
 /// `spawn_child_process_for`): the lease file its won PR leases are listed
 /// in, so a timed-out step's leases are reaped (#11931); its pick journal
-/// (#11877's capture); and, for a Curator, the curation provenance the role
+/// (#11877's capture); the daemon's lease host id; and, for a Curator, the curation provenance the role
 /// runner gives its Curator (`role_runner/launch/curation.rs`).
 pub(crate) fn apply_step_env(
     cmd: &mut Command,
@@ -504,6 +504,10 @@ pub(crate) fn apply_step_env(
         crate::pr_lease_reap::path_for(root, sweep_id),
     );
     crate::observability::pick_journal::attach_step(cmd, sweep_id);
+    // Pin the lease host to the daemon's own: the session re-attaches to the
+    // pre-claimed lease by `(role, host, sweep)`, and a session container's
+    // `$HOSTNAME` is its container id, not this host (#11906).
+    cmd.env(crate::host_identity::HOST_ID_ENV, crate::host_identity::lease_host_identity());
     if role == StepRole::Curator {
         cmd.env("LOOM_CURATION_MODEL", model.filter(|m| !m.is_empty()).unwrap_or("unknown"))
             .env("LOOM_CURATION_RUNTIME", runtime.unwrap_or("unknown"));
