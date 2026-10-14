@@ -19,6 +19,9 @@
 #     advisory `note:` only (scaffolds such as quickstarts/), never a failure
 #   - a repo with no .github/dependabot.yml is a clean no-op (exit 0)
 #   - a config whose `updates:` list cannot be parsed fails loudly
+#   - `directories:` lists and inline `labels: [...]` (the rendered fleet
+#     policy shape) are parsed, one row per directory
+#   - a lockfile-bearing manifest that declares no dependencies needs no entry
 #   - THIS repo's own .github/dependabot.yml passes (the #7577 regression guard)
 #
 # Hermetic: builds throwaway git trees under mktemp; no network, forge, or
@@ -222,6 +225,61 @@ if [[ "$RC" -ne 0 ]] && grep -q "parsed zero entries" <<< "$OUT"; then
     pass "non-zero exit with an explicit parse failure message"
 else
     fail "expected a loud parse failure (rc=$RC): $OUT"
+fi
+
+# --- Test 7b: the rendered fleet-policy shape is understood ----------------
+# 2AMLogic/2am scripts/dependabot-render.py writes `directories:` lists and
+# inline `labels: [...]` flow lists (both valid GitHub syntax).
+echo "Test 7b: directories: lists and inline labels are parsed"
+REPO="$(new_repo rendered-shape)"
+add_manifest "$REPO" "a" '{"left-pad":"1.0.0"}' "package-lock.json"
+add_manifest "$REPO" "b" '{"left-pad":"1.0.0"}' "pnpm-lock.yaml"
+write_config "$REPO" <<'EOF'
+  - package-ecosystem: "npm"
+    directories:
+      - "/a"
+      - "/b"
+    schedule:
+      interval: "weekly"
+    labels: ["dependencies", "loom:review-requested"]
+    groups:
+      npm-minor-patch:
+        patterns: ["*"]
+  - package-ecosystem: "github-actions"
+    directories: ["/"]
+    labels: ["dependencies", "loom:review-requested"]
+EOF
+OUT="$(run_check "$REPO")"; RC=$?
+if [[ "$RC" -eq 0 ]]; then
+    pass "exit 0 when every directory of a directories: list is covered"
+else
+    fail "expected exit 0, got $RC: $OUT"
+fi
+sed -i.bak 's/labels: \["dependencies", "loom:review-requested"\]$/labels: ["dependencies"]/' "$REPO/.github/dependabot.yml"
+OUT="$(run_check "$REPO")"; RC=$?
+if [[ "$RC" -ne 0 ]] && grep -q "'npm' (directory '/a')" <<< "$OUT" && grep -q "'npm' (directory '/b')" <<< "$OUT"; then
+    pass "an inline labels list without the review label fails for each directory"
+else
+    fail "expected failures naming /a and /b (rc=$RC): $OUT"
+fi
+
+# --- Test 7c: a dependency-free lockfile manifest needs no entry -------------
+echo "Test 7c: a lockfile-bearing manifest that declares no dependencies is a note"
+REPO="$(new_repo dependency-free)"
+add_manifest "$REPO" "." '{}' "pnpm-lock.yaml"
+add_manifest "$REPO" "pkg" '{"left-pad":"1.0.0"}' "package-lock.json"
+write_config "$REPO" <<EOF
+$(npm_entry "/pkg")
+EOF
+OUT="$(run_check "$REPO")"; RC=$?
+if command -v jq >/dev/null 2>&1; then
+    if [[ "$RC" -eq 0 ]] && grep -q "^note: package.json has a lockfile but declares no dependencies" <<< "$OUT"; then
+        pass "exit 0 with an advisory note for the dependency-free root"
+    else
+        fail "expected exit 0 and a note (rc=$RC): $OUT"
+    fi
+else
+    echo "  SKIP: jq not installed — dependency-free exemption needs jq"
 fi
 
 # --- Test 8: this repo's own config passes (#7577 regression guard) ---------

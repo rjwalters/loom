@@ -21,7 +21,10 @@
 # Checks performed:
 #   1. Every `updates:` entry lists `loom:review-requested` in its `labels:`.
 #   2. Every tracked npm manifest that has a committed lockfile beside it is
-#      covered by an npm entry for its directory.
+#      covered by an npm entry for its directory — unless it declares no
+#      dependencies at all (no dependencies / devDependencies /
+#      optionalDependencies / peerDependencies), in which case there is nothing
+#      for Dependabot to update and it is reported as a `note:` (needs jq).
 #   3. Every npm entry points at a directory that actually contains a tracked
 #      `package.json` (catches an entry left behind by a moved/deleted package).
 #   4. Advisory only (never fails): a tracked manifest that declares
@@ -64,42 +67,77 @@ REQUIRED_LABEL="loom:review-requested"
 FAILURES=0
 
 # --- Parse dependabot.yml into "<ecosystem>\t<directory>\t<label,label>" -----
-# The file is a flat, conventional block-style list; this parser deliberately
-# only understands that shape and fails loudly (via the field assertions below)
-# rather than silently mis-reading an exotic reformat.
+# One row per (entry, directory). The file is a flat, conventional block-style
+# list; this parser deliberately only understands that shape and fails loudly
+# (via the field assertions below) rather than silently mis-reading an exotic
+# reformat. It accepts both spellings GitHub documents for an entry's
+# location — `directory: "/x"` and a `directories:` list (block items, or an
+# inline `["/a", "/b"]` flow list) — and `labels:` as either a block list or an
+# inline flow list. The rendered fleet policy (2AMLogic/2am
+# scripts/dependabot-render.py, from fleet-gitops dependency-updates.json)
+# writes `directories:` + inline `labels: [...]`. Glob directories ("/**") are
+# not expanded: a glob npm entry fails check 3 loudly rather than being trusted.
 parse_entries() {
   awk '
     function strip(s) {
       gsub(/^[ \t]+|[ \t]+$/, "", s)
       gsub(/^"|"$/, "", s)
+      gsub(/^\047|\047$/, "", s)
       return s
+    }
+    # Append the items of an inline flow list "[a, "b"]" to a comma list.
+    function flow(s, acc,   n, parts, i, item) {
+      gsub(/^[ \t]*\[|\][ \t]*$/, "", s)
+      n = split(s, parts, ",")
+      for (i = 1; i <= n; i++) {
+        item = strip(parts[i])
+        if (item != "") acc = acc (acc == "" ? "" : ",") item
+      }
+      return acc
+    }
+    function value(line,   idx) {
+      idx = index(line, ":")
+      return substr(line, idx + 1)
+    }
+    function emit(   n, d, i) {
+      if (!seen) return
+      n = split(dirs, d, ",")
+      if (n == 0) { print eco "\t\t" labels; return }
+      for (i = 1; i <= n; i++) print eco "\t" d[i] "\t" labels
     }
     /^[ \t]*#/ { next }
     /^  - package-ecosystem:/ {
-      if (seen) print eco "\t" dir "\t" labels
+      emit()
       seen = 1
-      idx = index($0, ":")
-      eco = strip(substr($0, idx + 1))
-      dir = ""; labels = ""; inlabels = 0
+      eco = strip(value($0))
+      dirs = ""; labels = ""; inlist = ""
       next
     }
     /^    directory:/ {
-      idx = index($0, ":")
-      dir = strip(substr($0, idx + 1))
-      inlabels = 0
+      dirs = strip(value($0))
+      inlist = ""
       next
     }
-    /^    labels:[ \t]*$/ { inlabels = 1; next }
+    /^    directories:/ {
+      v = value($0)
+      if (v ~ /\[/) { dirs = flow(v, ""); inlist = "" } else { dirs = ""; inlist = "dirs" }
+      next
+    }
+    /^    labels:/ {
+      v = value($0)
+      if (v ~ /\[/) { labels = flow(v, ""); inlist = "" } else { labels = ""; inlist = "labels" }
+      next
+    }
     /^      - / {
-      if (inlabels) {
-        item = $0
-        sub(/^      - /, "", item)
-        labels = labels (labels == "" ? "" : ",") strip(item)
-      }
+      item = $0
+      sub(/^      - /, "", item)
+      item = strip(item)
+      if (inlist == "labels") labels = labels (labels == "" ? "" : ",") item
+      else if (inlist == "dirs") dirs = dirs (dirs == "" ? "" : ",") item
       next
     }
-    /^    [A-Za-z]/ { inlabels = 0; next }
-    END { if (seen) print eco "\t" dir "\t" labels }
+    /^    [A-Za-z]/ { inlist = ""; next }
+    END { emit() }
   ' "$CONFIG"
 }
 
@@ -163,6 +201,19 @@ while read -r manifest; do
 
   if has_npm_entry "$want"; then
     continue
+  fi
+
+  # A lockfile-bearing manifest that declares NO dependencies at all has no
+  # package for a Dependabot version or security update to bump, so it needs no
+  # entry. The rendered fleet policy omits the root entry for exactly this
+  # reason ("The root package.json declares no dependencies"). Needs jq to
+  # prove the zero; without jq it stays an error (fail closed).
+  if [[ "$has_lockfile" -eq 1 ]] && command -v jq >/dev/null 2>&1; then
+    declared="$(jq '[(.dependencies // {}), (.devDependencies // {}), (.optionalDependencies // {}), (.peerDependencies // {})] | map(length) | add' "$ROOT/$manifest" 2>/dev/null || echo error)"
+    if [[ "$declared" == "0" ]]; then
+      echo "note: $manifest has a lockfile but declares no dependencies — no Dependabot entry needed."
+      continue
+    fi
   fi
 
   if [[ "$has_lockfile" -eq 1 ]]; then
