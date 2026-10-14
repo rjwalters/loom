@@ -3839,9 +3839,9 @@ if [[ "$DRY_RUN" -eq 0 && "${LOOM_RESYNC_SKIP_USER_SCOPE:-0}" != "1" \
         # shellcheck source=/dev/null
         source "$SOURCE_ROOT/scripts/install/provision-skills.sh"
         provision_loom_dispatcher "$SOURCE_ROOT" >&2 || true
-        # SOURCE_ROOT is the reference: the machine checkout must not be
-        # older than the tree this run synced from, or its user-scope
-        # /loom:* commands shadow every repo's fresh copy (2AMLogic/2am#4345).
+        # SOURCE_ROOT is the reference: a machine checkout older than the
+        # tree this run synced from must not supply the user-scope /loom:*
+        # commands, which shadow every repo's own fresher copy.
         provision_loom_skills "${LOOM_HOME:-$HOME/.local/share/loom}" "" "$SOURCE_ROOT" >&2 || true
     ) || printf '%b\n' "${YELLOW}[resync] user-scope skill provisioning failed (non-fatal).${NC}" >&2
 fi

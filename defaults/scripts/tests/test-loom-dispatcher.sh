@@ -773,7 +773,7 @@ assert_contains "$out" "not main" "non-main: warning names the reason"
 assert_eq "$(git -C "$CK" rev-parse HEAD)" "$before_head" "non-main: HEAD unchanged"
 assert_eq "$(git -C "$CK" symbolic-ref --short HEAD)" "topic" "non-main: branch unchanged"
 
-echo "Test 27b: an untracked machine config tier does not block the fast-forward (2am#4345)"
+echo "Test 27b: an untracked machine config tier does not block the fast-forward"
 CK=$(make_synced_checkout); H=$(mktemp -d); advance_origin "$CK"
 mkdir -p "$CK/config"; echo '{}' > "$CK/config/defaults.json"
 out=$(HOME="$H" LOOM_HOME="$CK" PATH="$NODAEMON_PATH" bash "$CK/scripts/loom" update 2>&1)

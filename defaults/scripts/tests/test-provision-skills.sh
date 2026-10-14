@@ -309,11 +309,14 @@ else
 fi
 
 # ── Test 14: a stale machine checkout never wins over the synced source ───────
-# 2AMLogic/2am#4345: a worker's ~/.local/share/loom was a month-old real clone
-# (0.19.27) while resync synced from a fresh source (0.19.1159); the user-scope
-# /loom:* link pointed into the stale clone and shadowed every repo's copy, so
-# agents re-applied retired labels.
-echo "Test 14: [reference_root] replaces an older machine checkout (2am#4345)"
+# A host's ~/.local/share/loom was a month-old real clone (0.19.27) while
+# resync synced from a fresh source (0.19.1159); the user-scope /loom:* link
+# pointed into the stale clone and shadowed every repo's own copy, so agents
+# followed long-retired label rules.
+# Fixtures live under mktemp, which the temp-root refusal would reject; Tests
+# 14-18 and 20-21 treat no root as temporary, Test 19 restores the real list.
+export LOOM_SKILLS_TEMP_ROOTS=""
+echo "Test 14: [reference_root] replaces an older machine checkout"
 OLD=$(make_real_checkout); echo "0.19.27" > "$OLD/VERSION"
 NEW=$(make_real_checkout); echo "0.19.1160" > "$NEW/VERSION"
 HOME_T=$(mktemp -d)
@@ -372,6 +375,47 @@ if [[ -f "$RESYNC" ]]; then
 else
     echo "  SKIP: resync-installed.sh not found"
 fi
+
+echo "Test 19: the link never moves to an OLDER tree than it points into now"
+OLD=$(make_real_checkout); echo "0.19.27" > "$OLD/VERSION"
+REFA=$(make_real_checkout); echo "0.19.1160" > "$REFA/VERSION"
+REFB=$(make_real_checkout); echo "0.19.1100" > "$REFB/VERSION"
+HOME_T=$(mktemp -d)
+HOME="$HOME_T" provision_loom_skills "$OLD" "$HOME_T/.claude" "$REFA" >/dev/null 2>&1
+HOME="$HOME_T" provision_loom_skills "$OLD" "$HOME_T/.claude" "$REFB" >/dev/null 2>&1
+assert_eq "$(readlink "$HOME_T/.claude/commands/loom")" "$REFA/defaults/.claude/commands/loom" \
+    "a later resync from an older source keeps the newer current target"
+REFC=$(make_real_checkout); echo "0.19.1200" > "$REFC/VERSION"
+HOME="$HOME_T" provision_loom_skills "$OLD" "$HOME_T/.claude" "$REFC" >/dev/null 2>&1
+assert_eq "$(readlink "$HOME_T/.claude/commands/loom")" "$REFC/defaults/.claude/commands/loom" \
+    "a newer source still moves the link forward"
+
+echo "Test 20: a reference under a temporary directory is refused"
+TMPROOT=$(mktemp -d)
+REFT="$TMPROOT/clone"; mkdir -p "$REFT"; cp -R "$REFA/." "$REFT/"
+HOME_T=$(mktemp -d)
+out=$(LOOM_SKILLS_TEMP_ROOTS="$TMPROOT" HOME="$HOME_T" provision_loom_skills "$OLD" "$HOME_T/.claude" "$REFT" 2>&1)
+assert_eq "$(readlink "$HOME_T/.claude/commands/loom")" "$OLD/defaults/.claude/commands/loom" \
+    "a temp-dir reference is not linked (the checkout is kept)"
+assert_contains "$out" "temporary directory" "the refusal is warned"
+assert_eq "$(LOOM_SKILLS_TEMP_ROOTS="/tmp $TMPROOT" _pskill_is_temp "$REFT" && echo temp || echo stable)" "temp" "a path under a listed root is temporary"
+assert_eq "$(LOOM_SKILLS_TEMP_ROOTS="/nonexistent-root" _pskill_is_temp "$REFT" && echo temp || echo stable)" "stable" "a path under no listed root is stable"
+( unset LOOM_SKILLS_TEMP_ROOTS; _pskill_is_temp /tmp ) && pass "the default list treats /tmp as temporary" || fail "the default list does not cover /tmp"
+
+echo "Test 21: switching trees prunes agents only the old tree shipped; deprovision removes reference links"
+OLD2=$(make_real_checkout); echo "0.19.27" > "$OLD2/VERSION"
+echo "# loom-retired agent" > "$OLD2/defaults/.claude/agents/loom-retired.md"
+HOME_T=$(mktemp -d)
+HOME="$HOME_T" provision_loom_skills "$OLD2" "$HOME_T/.claude" >/dev/null 2>&1
+[[ -L "$HOME_T/.claude/agents/loom-retired.md" ]] && pass "precondition: the old-only agent is linked" || fail "precondition: old-only agent not linked"
+HOME="$HOME_T" provision_loom_skills "$OLD2" "$HOME_T/.claude" "$REFC" >/dev/null 2>&1
+[[ -e "$HOME_T/.claude/agents/loom-retired.md" || -L "$HOME_T/.claude/agents/loom-retired.md" ]] \
+    && fail "an agent only the old tree ships kept its link" || pass "an agent only the old tree ships is pruned on the switch"
+mkdir -p "$HOME_T/.claude/agents"; echo OPERATOR > "$HOME_T/.claude/agents/loom-mine.md"
+deprovision_loom_skills "$OLD2" "$HOME_T/.claude" >/dev/null 2>&1
+[[ -L "$HOME_T/.claude/commands/loom" ]] && fail "deprovision left a link into the reference tree" || pass "deprovision removes a commands link into the reference tree"
+[[ -L "$HOME_T/.claude/agents/loom-judge.md" ]] && fail "deprovision left an agent link into the reference tree" || pass "deprovision removes agent links into the reference tree"
+assert_eq "$(cat "$HOME_T/.claude/agents/loom-mine.md")" "OPERATOR" "deprovision still preserves a real operator file"
 
 echo ""
 echo "======================================"
