@@ -15,9 +15,11 @@
 //! its own dispatch header. The class rides the record's detail and the end
 //! log line; the outcome ledger (#11900) consumes it from
 //! [`read_outcome_line`]. The line is advisory: the ledger decides with the
-//! forge post-state, which this module does not read. Whoever reads it for
-//! the ledger passes `None` when that read fails, never a default (#11962),
-//! so a failed probe classifies as `failed`, not as the session's word.
+//! forge post-state, which this module does not read: the end queues the
+//! step ([`super::ended`]) and the work finder's step tick reads the
+//! post-state with the lock released (`step_dispatch::step_end`, #11909),
+//! passing `None` when that read fails, never a default (#11962), so a failed
+//! probe classifies as `failed`, not as the session's word.
 
 use super::*;
 use crate::role_runner::RoleTickOutcome;
@@ -190,6 +192,19 @@ impl SweepRegistry {
                 StepEnd::Exited(_) => "exited",
             };
             self.reap_step_leases(sweep_id, reason);
+        }
+        if !self.config.skip_label_flip {
+            super::ended::push(
+                &self.config.workspace_root,
+                super::ended::EndedStep {
+                    sweep_id: sweep_id.to_string(),
+                    item,
+                    role,
+                    log_path: log_path.clone(),
+                    ran_for: (Utc::now() - started_at).to_std().unwrap_or_default(),
+                    timed_out: end == StepEnd::TimedOut,
+                },
+            );
         }
         let capture = StepCapture {
             root: self.config.workspace_root.clone(),

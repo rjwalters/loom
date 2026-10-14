@@ -306,7 +306,7 @@ fn blocker_closed(slug: &str, root: &Path, repo: &str, number: u64) -> Option<bo
         crate::comment_trust::records::fetch_issue_object(repo, &number.to_string(), root, true)?;
     let closed = v.get("state").and_then(|s| s.as_str()) == Some("closed")
         && v.get("pull_request")
-            .map_or(true, |pr| pr.get("merged_at").is_some_and(|m| !m.is_null()));
+            .is_none_or(|pr| pr.get("merged_at").is_some_and(|m| !m.is_null()));
     blocker_cache()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)

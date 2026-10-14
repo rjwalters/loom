@@ -7,11 +7,11 @@ This is the design doc for the work-finder overhaul. It replaces "list `loom:iss
 
 Support roles stop running on fixed intervals for item work, and the daemon stops spawning `/loom:sweep`.
 
-**Status: Accepted (2026-10-14).** The operator accepted the design. Section 1 records the rulings, and section 9 records the items that stay open. This doc changes documentation only. The children listed in section 10 change the code.
+**Status: Live (2026-10-14).** The operator accepted the design, then ruled it ships with no flag, no shadow mode and no pilot: the step tick is the work finder's only item dispatch path since #11909, rolled out fleet-wide and fixed forward. Section 1 records the rulings, and section 9 the items that stay open. The children listed in section 10 changed the code.
 
 This is a repo-local design doc under `docs/design/`. It is never installed into consumer repos. The format follows [`persistence-inventory.md`](persistence-inventory.md).
 
-**Source SHA.** Every citation is against `7e6e346e1` (`main`, 2026-10-14). Paths without a prefix are under `loom-daemon/src/`. Paths under `defaults/`, `docs/` and `mcp-loom/` are written in full.
+**Source SHA.** Sections 2 and 3 describe the code before the cutover and cite `7e6e346e1` (`main`, 2026-10-14). Every other citation is against `24815f814` (`main`, 2026-10-14), or names a module and symbol, which do not drift. Paths without a prefix are under `loom-daemon/src/`. Paths under `defaults/`, `docs/` and `mcp-loom/` are written in full.
 
 **Contents**
 
@@ -21,7 +21,7 @@ This is a repo-local design doc under `docs/design/`. It is never installed into
 - [4. The model](#4-the-model)
 - [5. Claims, restore and the outcome ledger](#5-claims-restore-and-the-outcome-ledger)
 - [6. Champion: promotion and merge](#6-champion-promotion-and-merge)
-- [7. Telemetry and gates](#7-telemetry-and-gates)
+- [7. Telemetry and alerts](#7-telemetry-and-alerts)
 - [8. Rollout and rollback](#8-rollout-and-rollback)
 - [9. Open items](#9-open-items)
 - [10. Children](#10-children)
@@ -46,6 +46,8 @@ These were ruled 2026-10-13/14 and are not reopened here.
    - `loom:operator`.
 6. **`loom:operator` is a no-op for every role** (#11861). Champion's self-applied holds move to `loom:blocked` plus a park record and the hold marker.
 7. **GitHub's merge queue** is the end state for merges on org-owned repos (#9978, #10257). The known revocation gap is accepted. User-owned repos stay on direct merges with `--expected-head`.
+8. **No flag, no old code, no shadow mode, no smoke check** (2026-10-14). The cutover replaces the tick in one revertable merge and ships fleet-wide; problems are fixed forward. Rollback is reverting that merge.
+9. **The role runner runs non-item roles only.** Curator, Judge and Doctor no longer run on intervals; Champion runs `--non-item` only.
 
 ## 2. Problem
 
@@ -92,25 +94,41 @@ The design builds on these and must not duplicate them.
 
 An **item** is an open issue joined to its linked open PR, using the link rules of `worktree_ops/linked_pr_listing.rs`. A PR with no issue is its own item. A **step** is one role session that advances one item by one stage, in one slot, under one claim.
 
+The classifier (`work_finder/step_item.rs`, `classify`) checks these rows in order; the first that matches decides.
+
 | Item state | Step |
 |---|---|
-| unlabeled or `loom:triage` | Curator |
-| landed: a *closing* PR merged, issue still open (not `Part of`) | Curator keep-or-close |
-| `loom:curated` | Champion promote (terminal) |
-| `loom:curated` + `loom:blocked`, **dependency park only**, blocker closed | Champion re-evaluate |
-| `loom:issue`, no open PR | Builder |
-| linked PR `loom:review-requested` | Judge |
-| linked PR `loom:changes-requested` | Doctor |
-| linked PR `loom:pr` | Champion merge |
-| linked PR `loom:pr` + `loom:blocked` + Champion hold marker | Champion hold re-evaluation |
+| `loom:frozen`, `loom:operator`, `external`, or a claim label (on the PR or any open issue it links) | none |
 | PR in GitHub's merge queue (`queued`) | none |
-| `loom:operator`, `loom:frozen`, claimed, cooling down | none |
+| the issue's open PR is another item's (`shared_pr`) | none |
+| PR `loom:sequenced` | none |
+| linked PR `loom:pr` + `loom:blocked` + Champion hold marker | Champion hold re-evaluation |
+| linked PR `loom:changes-requested` + `loom:blocked` + hold marker, Doctor cycle not capped | Doctor |
+| linked PR `loom:review-requested` + `loom:blocked` + hold marker | Judge |
+| any other blocked PR | none |
+| linked PR `loom:changes-requested` | Doctor |
+| linked PR `loom:review-requested` | Judge |
+| linked PR `loom:pr` | Champion merge |
+| PR with no workflow label | none |
+| issue `loom:epic` | none (Champion's non-item run) |
+| `loom:architect` / `loom:hermit` / `loom:auditor` proposal, not curated or promoted | none (Champion's non-item run) |
+| `loom:issue` + `loom:blocked`, capability-only park, every capability held | Builder (capability lane) |
+| the same, a capability not held | none |
+| `loom:curated` + `loom:blocked`, **dependency park only**, blocker closed | Champion re-evaluate |
+| any other blocked issue | none |
+| landed: a *closing* PR merged, issue still open (not `Part of`) | Curator keep-or-close |
+| `loom:decision-malformed` | Curator |
+| `loom:issue`, no open PR | Builder |
+| `loom:curated` | Champion promote (terminal) |
+| unlabeled or `loom:triage` | Curator |
+
+Cooling down is not a row: the outcome ledger's cooldowns are draw state, applied as `actionable` = 0 (§4.2).
 
 Notes on the table:
 - Fast-fail and quarantine parks, and hold records, are not dependency parks.
 - Revise and verdict markers are read through `comment_trust`.
 - Red-main fixes keep their lane (`work_finder/main_red_fix.rs`).
-- A `loom:operator-mechanical` item has weight 0 on a host without the capability (`work_finder.rs:382-395`).
+- A capability-parked item has weight 0 on a host without the capability (`capability_missing`).
 
 ### 4.2 The tick
 
@@ -136,10 +154,14 @@ The stage-entry provider is a three-source adapter, tried in order:
 
 ### 4.4 Slots and spawn
 
-- **Slots.** Roots with `stepDispatch: on` draw steps from `workFinder.maxConcurrent`. Other roots keep the role-runner ceiling until the two budgets merge (§10, last phase).
-- **Resolvers.** A step uses the role runner's resolvers for its role (`role_runner/model_resolution.rs:71, :160`) and admits against the pool of the resolved runtime. Only Builder steps keep the per-issue experiment arm (`sweep_registry/model_dispatch.rs:64-66`).
+- **Slots.** Steps draw from `workFinder.maxConcurrent` on every root: the tick fills `maxConcurrent - occupancy` slots, at most `max_admissions_per_tick` of them, none while the saturation brake holds. The role runner keeps its own ceiling for the non-item roles until the two budgets merge (#11911).
+- **The tick** is `step_dispatch::driver::StepDriver::tick`, called from the work-finder loop in place of the `loom:issue` finder. Per root it lists and classifies (`step_dispatch::gather`), weighs with the registry's live state (`step_cooldowns`, the Champion ladder's due times, `pool_exhausted_roles`), and runs `step_dispatch::tick::run`. The seed's `workspace` input is the forge slug `pick.decision` names as `repo`.
+- **Resolvers.** A step uses the role runner's resolvers for its role (`role_runner/model_resolution.rs`, `resolve_role_runner_model` and `resolve_role_runner_effort`) and admits against the pool of the resolved runtime. Only Builder steps keep the per-issue experiment arm (`sweep_registry/model_dispatch.rs`).
+- **The lock.** The spawn (`SweepRegistry::spawn_step_unlocked`) releases the registry lock around the runtime admission's private-clone containment (#8787), a non-Builder step's pre-claim and the account-selection poll, as `private_dispatch::prepare` does for sweeps.
 - **Capture.** A step keeps the role-tick capture from #11877.
-- **Registry.** Steps run in the sweep registry as `SweepKind::Step { item, role }` (`types.rs:945-952`). Every consumer that matches on `SweepKind` becomes exhaustive. Today about twenty sites drop any non-`Issue` kind, including occupancy (`sweep_registry/watchdog.rs`), `busy_slots.rs:25-27`, roll pause and resume, the fleet-state feed and telemetry identity.
+- **Registry.** Steps run in the sweep registry as `SweepKind::Step { item, role }` (`types.rs`). Every consumer that matches on `SweepKind` is exhaustive (#11898).
+- **The end.** A step's end is queued (`sweep_registry/step_spawn/ended.rs`); the next tick reads the item's forge post-state with the lock released, classifies it with the session's outcome line and records it in the ledger (`step_dispatch::step_end`). A failed read is `failed` / `probe_failed`, never a default.
+- **The role runner** runs Guide, Auditor, Hermit, Architect and Champion `--non-item`. Curator, Judge and Doctor named in `roles` or `onIdle` are ignored with a warning; `championMode` is retired (`role_runner/champion_mode.rs`). Epic `BuildChildren` dispatches nothing: the children are Builder steps.
 
 ## 5. Claims, restore and the outcome ledger
 
@@ -185,46 +207,35 @@ No `(item, step)` runs more than 3 times in 24 h without a state change: the led
   - Until queue mode is on, serialisation within one host comes from the PR lease and a repo-keyed mesh advertisement. Across hosts it is best-effort.
   - The correctness guards are `--expected-head` and `_head_moved_or_resync`.
   - Once queue mode is on, GitHub serialises merges per repo, and a `queued` PR has weight 0.
-- **Non-item passes** (proposals, epics, Doctor-cap PRs, follow-ons, rollout checks) stay on the interval run under `championMode: "non-item"`.
+- **Non-item passes** (proposals, epics, Doctor-cap PRs, follow-ons, rollout checks) stay on the interval run, which is always `/loom:champion --non-item` (#11909).
 
-## 7. Telemetry and gates
+## 7. Telemetry and alerts
 
 **Signals.**
-- `loom.dispatch.step` span: repo, item, role, admission result, reason, draw attempt, `age_source`, resumed.
-- `pick.decision`: the item-draw weight terms, `tick_counter`, and zero-weight counts by reason.
-- `loom.draw.expected_wait_s`, by repo × stage.
+- `loom.dispatch.step` span: repo, item, role, admission result, reason, draw attempt, `age_source`, resumed (`observability/ops/dispatch_step.rs`). One per spawn attempt, spawned or refused.
+- `pick.decision`'s `item_draw`: the `loom-draw/v2` seed inputs, the weight-0 counts by reason, each drawn workspace's starting pool and every draw, enough to replay the tick (`item_draw::replay_record`), and the workspaces whose draw stopped on a `WeightOverflow`. Work-finder rows carry their step as `stage` and in the dispatch plan's `step` field.
 - The baseline: `loom.forge.stage_items{repo,state}` and `loom.dispatch.busy_slots{role}`.
 
-**Shadow comparison.** For each shadow `(item, step)`, did the live system act on it within N ticks? The comparison is bucketed by `loom.hyperparams.digest` and windowed in ticks, because mirror wakes make ticks early.
+**Alerts** (`defaults/observability/signoz/alerts/`, shipped with the cutover so a fix-forward rollout is watched from its first minute):
 
-**Gate: shadow to live** (24 h):
-- no unexplained live-only Builder, Judge or merge action;
-- zero stale picks;
-- expected wait under 2 h for review and merge items in every repo;
-- ≥ 95% stage-age coverage, or the creation-age ruling recorded.
-
-**Gate: pilot to fleet** (48 h):
-- slot use of at least 70% while eligible items exist;
-- fewer than 1 open-PR or landed refusal per 10 dispatches;
-- no `(item, step)` run more than 3 times in 24 h without a state change;
-- Judge runs per verdict ≤ 2.
+| Rule | Fires when |
+|---|---|
+| `step-dispatch-stalled.json` | a dispatching host has `loom.forge.stage_items` > 0 in a work state and no spawned `loom.dispatch.step` for 15 min |
+| `step-draw-pass-rate.json` | pool-gate plus claim refusals are above 80% of a host's `loom.dispatch.step` attempts for 30 min |
+| `step-slots-idle.json` | a host's busy slots stay below 50% of `maxConcurrent` for 30 min while stage depth stays > 0 |
 
 ## 8. Rollout and rollback
 
-- **Flag.** A per-root `autonomous.workFinder.stepDispatch: off | shadow | on`, capped per host by `LOOM_WORK_FINDER_STEP_DISPATCH`: `off` beats everything, and `shadow` caps `on`.
-- **Order:**
-  1. shadow on one host;
-  2. one pilot root `on` on one host, with its item roles off on every other host and Champion `non-item` there;
-  3. all roots on that host;
-  4. all hosts.
-- **Rollback** is host env `off`, plus re-enabling the pilot root's item roles. Forge-side parks stay where they are; `release-stale-blocked` owns them.
-- **Prerequisite (met).** #11861 made `loom:operator` an all-role no-op and removed the work finder's PR-lane carve-out, so no legacy path acts on held PRs that the engine passes.
+- **No flag, no shadow, no pilot** (ruling 8). The cutover merge replaces the tick; the release that carries it goes to every host.
+- **Fix forward.** The alerts in §7 are the watch.
+- **Rollback** is reverting the cutover merge, which restores the `loom:issue` finder and the item-role intervals. Forge-side parks stay where they are; `release-stale-blocked` owns them.
+- **Prerequisite (met).** #11861 made `loom:operator` an all-role no-op and removed the work finder's PR-lane carve-out, so no other path acts on held PRs that the engine passes.
 
 ## 9. Open items
 
-- **Stage term.** If shadow shows review and merge items starving even with stage-age, should a stage term be added? Decided on shadow data, by the operator.
+- **Stage term.** Ruled out (ruling 2): the weight is `actionable × priority × stage-age`. The `step-slots-idle` alert and `pick.decision` show whether a stage starves.
 - **Sessions.** Should Doctor resume the author's session or its own? What is the resume TTL? Both wait on the resume-vs-fresh experiment.
-- **Merge queue.** Phase C's live verification (#10257) runs after the pilot.
+- **Merge queue.** Phase C's live verification (#10257) runs on the live fleet.
 
 ## 10. Children
 
@@ -237,8 +248,8 @@ No `(item, step)` runs more than 3 times in 24 h without a state change: the led
 | #11898 | `SweepKind::Step`, step claims, per-role restore (§4.4, §5) |
 | #11900 | Step-outcome ledger (§5) |
 | #11906 | Step spawn (§4.4) |
-| #11908 | Shadow mode and comparison (§7) |
-| #11909 | Live dispatch per root (§8) |
+| #11908 | Shadow mode and comparison: closed, ruled out; its telemetry moved to #11909 |
+| #11909 | The cutover: the step tick as the only item dispatch path, the alerts (§4.4, §7, §8) |
 | #11910 | Dispatch-plan `step` field |
 | #11911 | Finish Sweep retirement and merge the budgets |
 | #11913 | Session ledger and soft host affinity |
@@ -257,15 +268,15 @@ The fleet rollout, the dashboard consumers and the resume experiment are tracked
 
 ## 12. Departures from owner docs
 
-Each owner doc carries a short pointer to this section. The behaviour changes only when the matching child ships behind `stepDispatch`.
+Each owner doc carries a short pointer to this section. Since #11909 every departure is the rule in force.
 
-| Owner doc | Departure under `stepDispatch: on` |
+| Owner doc | Departure |
 |---|---|
 | `defaults/docs/priority-model.md` | The within-workspace pick (`main_red_fix → level → created_at → number`) becomes the seeded weighted item draw (§4.2) |
 | `defaults/docs/promotion-throughput.md` | Promotion is per-item and terminal. `prSlice`, `promotionSlice` and `tier2Cap` don't apply. |
 | `defaults/docs/dispatch-plan.md` | Plan rows gain a `step` field, with the shared fixture changed first |
 | `defaults/docs/telemetry-kind-pick-decision.md` | Work-finder rows gain step, weight terms and `age_source`. The per-role cadence volume table no longer holds for item roles. |
-| `defaults/docs/daemon-reference.md` (role runner) | The item-role intervals and `demandWidth` don't apply to step roots. The two concurrency budgets merge in the last phase. |
+| `defaults/docs/daemon-reference.md` (role runner) | The item roles do not run on intervals and `demandWidth` doesn't apply to them; Champion runs `--non-item`. The two concurrency budgets merge in #11911. |
 | `defaults/docs/label-state-machine.md` | The `queued` item state. `stale_after_minutes` becomes live. Per-role restore. |
 | `defaults/labels.json` (header) | `stale_after_minutes` is no longer INERT. #11898 changes the header together with the values it makes live; until then the header stays accurate. |
 | `mcp-loom/src/tools/sweeps.ts` and `mcp-loom/README.md` | The sweep tools learn `SweepKind::Step` (its role and item). #11898 changes them together with the Rust type. |

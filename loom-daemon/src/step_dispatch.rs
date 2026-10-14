@@ -21,6 +21,8 @@
 //!   weigh, with the forge facts the classifier reads (#11909).
 //! - [`tick`]: the step tick: workspace draw, item draw, gates, claim and
 //!   spawn, redrawing on a pass (#11909).
+//! - [`step_end`]: a finished step's forge post-state, classified and
+//!   recorded in the outcome ledger (#11909).
 //! - [`driver`]: the production tick the work-finder loop calls, over the
 //!   live registries (#11909).
 //!
@@ -34,4 +36,5 @@ pub mod listing;
 pub mod outcome_ledger;
 pub mod reeval_ladder;
 pub mod stage_entry;
+pub mod step_end;
 pub mod tick;

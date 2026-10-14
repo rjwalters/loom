@@ -55,8 +55,9 @@ impl Default for StepDriver {
     }
 }
 
-/// The registries' step spawn: begin under the lock, poll the child's
-/// account selection with it released (#6592), finish under it again.
+/// The registries' step spawn, with the lock released around containment,
+/// the pre-claim and the account-selection poll
+/// ([`SweepRegistry::spawn_step_unlocked`]).
 struct RegistrySpawner {
     registries: Vec<Arc<Mutex<SweepRegistry>>>,
 }
@@ -71,24 +72,7 @@ impl StepSpawner for RegistrySpawner {
         let Some(registry) = self.registries.get(idx) else {
             return SpawnResult::Refused("spawn_failed".to_string());
         };
-        let begun = match registry.lock() {
-            Ok(mut reg) => reg.begin_step_spawn(request),
-            Err(_) => return SpawnResult::Refused("spawn_failed".to_string()),
-        };
-        let mut prepared = match begun {
-            Ok(p) => p,
-            Err(e) => return SpawnResult::Refused(refusal_reason(&e)),
-        };
-        let (token, runtime, death) = crate::sweep_registry::poll_and_classify_spawned_child(
-            &mut prepared.child,
-            &prepared.log_path,
-            &prepared.header_anchor,
-        );
-        let finished = match registry.lock() {
-            Ok(mut reg) => reg.finish_step_spawn(prepared, token, runtime, death),
-            Err(_) => return SpawnResult::Refused("spawn_failed".to_string()),
-        };
-        match finished {
+        match SweepRegistry::spawn_step_unlocked(registry, request) {
             Ok(_) => SpawnResult::Spawned,
             Err(e) => SpawnResult::Refused(refusal_reason(&e)),
         }
@@ -117,6 +101,9 @@ impl StepDriver {
         let mut workspaces = Vec::new();
         let mut listing_failed = Vec::new();
         for (idx, root) in input.roots.iter().enumerate() {
+            // Record the steps that ended since the last tick first, so the
+            // cooldowns they arm hold for this draw.
+            super::step_end::settle(root, &registries[idx]);
             let halted = input.halted.get(idx).copied().unwrap_or(false);
             let lane = input.lanes.get(idx).copied().unwrap_or_default();
             let fixes_only = halted && lane.admits_fixes_while_halted();

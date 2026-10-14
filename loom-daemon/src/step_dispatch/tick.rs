@@ -216,10 +216,12 @@ pub fn run(
 ) -> StepTick {
     let mut pass_counts: BTreeMap<String, usize> = BTreeMap::new();
     let mut draws_taken = 0usize;
-    let mut report = TickReport::default();
-    report.saturation_held = limits.saturation_held;
-    report.max_admissions_per_tick = Some(limits.max_admissions);
-    report.repo_cap = Some(repo_cap.snapshot());
+    let mut report = TickReport {
+        saturation_held: limits.saturation_held,
+        max_admissions_per_tick: Some(limits.max_admissions),
+        repo_cap: Some(repo_cap.snapshot()),
+        ..TickReport::default()
+    };
 
     let mut drawing: Vec<Drawing> = Vec::new();
     for ws in workspaces {
@@ -383,7 +385,7 @@ pub fn run(
     }
     report.plan_order = order;
     repo_cap.finish(&mut report);
-    report.workspace_draw = (draws_total > 0).then(|| DrawLog {
+    report.workspace_draw = (draws_total > 0).then_some(DrawLog {
         seed: workspace_seed,
         draws_total,
         steps,
