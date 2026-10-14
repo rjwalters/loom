@@ -12,7 +12,12 @@
 //!
 //! # Builder
 //!
-//! A Builder step's claim is the sweep's claim, so its release is the sweep's:
+//! First, as for every role: an unreadable issue, or one that no longer
+//! carries `loom:building`, gets no write ([`ClaimRelease::Untouched`]). For a
+//! Builder even the claim-only removal is skipped on a failed read, because
+//! dropping `loom:building` blind could drop the open-PR hold below.
+//! Otherwise a Builder step's claim is the sweep's claim, so its release is
+//! the sweep's:
 //! [`SweepRegistry::restore_label_to_ready_checked`], with every carve-out
 //! (frozen, park veto, PR, closed, never-ready, the #11438 no-op release) and
 //! the #11852 open-PR hold: an issue whose linked PR is open keeps
@@ -27,8 +32,13 @@
 //! # The other claims
 //!
 //! One REST read of the item (an issue or a PR, through the issues endpoint)
-//! decides, fail-open like every release path:
+//! decides. The reaper runs this on every step exit, a clean one included,
+//! so the claim must still be there before anything is restored:
 //!
+//! - the read failed: never a restore; at most the step's own claim label is
+//!   removed (`stale_after_minutes` is the backstop).
+//! - the claim label is gone: nothing is written. The step finished, or a
+//!   later role holds the item.
 //! - `loom:frozen`: no label write at all (#11743).
 //! - closed: the claim goes, nothing is added.
 //! - a release veto ([`crate::work_finder::restore_veto`], the claim itself
@@ -59,8 +69,8 @@ pub(crate) fn advanced_labels(role: StepRole) -> &'static [&'static str] {
     }
 }
 
-/// What a non-Builder release writes, decided from the item's labels and
-/// state. Pure.
+/// What a step release writes, decided from the item's labels and state.
+/// Pure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StepReleasePlan {
     /// Write nothing (frozen item, or no claim label to release).
@@ -72,7 +82,18 @@ pub(crate) enum StepReleasePlan {
 }
 
 /// [`StepReleasePlan`] for `role` on an item with `labels` and `closed`
-/// (`None`: the read failed, which releases as an open item would).
+/// (`None`: the read failed).
+///
+/// The reaper calls this on **every** step exit, a clean exit 0 included: a
+/// step has no completion signal like a sweep's checkpoint. So the plan first
+/// asks whether the claim is still there:
+///
+/// - read failed: never restore. At most the step's own claim label goes
+///   (a no-op when the step already removed it); `stale_after_minutes` is the
+///   backstop for anything left behind.
+/// - claim label absent: write nothing. The step released it (and moved the
+///   item on), or another role holds the item now: a Doctor that finished and
+///   a Judge that claimed since must not get `loom:changes-requested` back.
 #[must_use]
 pub(crate) fn plan_step_release(
     role: StepRole,
@@ -82,6 +103,12 @@ pub(crate) fn plan_step_release(
     let Some(claim) = role.claim_label() else {
         return StepReleasePlan::Nothing;
     };
+    if closed.is_none() {
+        return StepReleasePlan::RemoveClaim;
+    }
+    if !labels.iter().any(|l| l == claim) {
+        return StepReleasePlan::Nothing;
+    }
     let veto = crate::work_finder::restore_veto(labels, &[claim]);
     if veto == Some(crate::work_finder::FROZEN_LABEL) {
         return StepReleasePlan::Nothing;
@@ -117,6 +144,22 @@ impl SweepRegistry {
     }
 
     fn restore_builder_step(&self, issue: u32, sweep_id: &str) -> Result<ClaimRelease> {
+        // The same rule as `plan_step_release`, before the shared release
+        // (which fails open to a restore on a failed read, as a sweep's crash
+        // path wants): a Builder step that exited with `loom:building` gone
+        // is finished, and an unreadable issue is not touched at all, since
+        // removing `loom:building` blind could drop the open-PR hold (#11852).
+        let signals = self.release_issue_signals(issue);
+        if signals.closed.is_none() {
+            log::info!(
+                "sweep_registry: Builder step on #{issue} ended; the issue could not be read — \
+                 writing nothing, claim staleness is the backstop (#11898)"
+            );
+            return Ok(ClaimRelease::Untouched);
+        }
+        if !signals.labels.iter().any(|l| l == "loom:building") {
+            return Ok(ClaimRelease::Untouched);
+        }
         if !crate::release_veto::open_pr_veto_enabled() {
             if let OpenPrProbe::Open(pr) = self.probe_open_linked_pr(issue) {
                 log::info!(
@@ -153,7 +196,10 @@ impl SweepRegistry {
             claim.to_string(),
         ];
         match plan {
-            StepReleasePlan::Nothing => return Ok(ClaimRelease::Frozen),
+            StepReleasePlan::Nothing if crate::work_finder::is_frozen(&signals.labels) => {
+                return Ok(ClaimRelease::Frozen)
+            }
+            StepReleasePlan::Nothing => return Ok(ClaimRelease::Untouched),
             StepReleasePlan::RemoveClaim => {}
             StepReleasePlan::Restore => {
                 args.extend(["--add-label".to_string(), ready.to_string()]);
