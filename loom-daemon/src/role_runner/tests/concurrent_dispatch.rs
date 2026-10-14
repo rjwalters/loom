@@ -1043,14 +1043,14 @@ fn a_capped_pr_with_no_hold_record_skips_the_doctor_queue_read() {
     };
     let label = "loom:changes-requested";
     let capped = with_body(record("doctor cycle exhausted"));
-    assert_eq!(round_trip_role(label, &[capped.clone()]), None);
+    assert_eq!(round_trip_role(label, std::slice::from_ref(&capped)), None);
     assert_eq!(
         round_trip_role(label, &[with_body(format!("x\n{DOCTOR_CYCLE_CAP_MARKER}"))]),
         None
     );
     let held = with_body(record(CRITICAL_FILE_HOLD_REASON));
     assert_eq!(
-        round_trip_role(label, &[held.clone()]),
+        round_trip_role(label, std::slice::from_ref(&held)),
         Some(crate::pr_planning::PrRole::Doctor)
     );
     let both =
