@@ -36,7 +36,6 @@ const SOURCE_ALLOWLIST: &[(&str, &str)] = &[
     ("merge_pr/stale_checks/local_eval.rs", "loom:merge-tree-reverify"),
     ("observability/captain_gauges/facts.rs", "loom:"),
     ("observability/ops/stage_dwell.rs", "loom:"),
-    ("observability/ops/stage_queue.rs", "loom:"),
     ("observability/pick_journal.rs", "loom:"),
     ("pr_planning.rs", "loom:"),
     ("premise_check/cli.rs", "loom:premise-check"),
