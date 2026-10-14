@@ -223,6 +223,9 @@ fn host<'a>(rows: &'a [Row], emitter: &str) -> &'a Row {
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn replay_rebuilds_only_reconstructable_state_and_the_last_operation_wins() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
     let sections = run(&queries_1_to_3(QUERIES));
     let (state, spread, coverage) = (&sections[0], &sections[1], &sections[2]);
 
@@ -273,6 +276,9 @@ fn replay_rebuilds_only_reconstructable_state_and_the_last_operation_wins() {
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn without_the_completeness_gate_unreconstructable_rows_leak_into_the_state() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
     let gate = "WHERE (t, emitter, anchor_as_of) IN (SELECT t, emitter, base FROM status WHERE state = 'complete')";
     assert!(QUERIES.contains(gate), "the committed gate moved; update this counterfactual");
     let mutated = QUERIES.replace(
@@ -296,6 +302,9 @@ type ReportRow<'a> = (&'a str, &'a str, u64, u64, u64, u64, u64, u64, u64, u64);
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn the_agreement_report_has_one_row_per_host_and_only_covered_hosts_disagree() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
     let params = [
         ("t", T),
         ("window", WINDOW),
@@ -383,6 +392,9 @@ fn the_agreement_report_has_one_row_per_host_and_only_covered_hosts_disagree() {
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn an_instant_before_the_knowable_at_column_existed_is_no_knowable_at() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
     let early = [
         ("t", T),
         ("window", WINDOW),

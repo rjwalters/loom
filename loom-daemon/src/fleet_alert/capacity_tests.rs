@@ -24,7 +24,7 @@ fn waiting(rank: usize, issue: u32) -> ReadyQueueRow {
         rank,
         repo: "/w/loom-ui".into(),
         issue,
-        workspace_priority: 100,
+        workspace_weight: 100,
         urgent: false,
         level: crate::priority_pick::Level::Important,
         main_red_fix: false,

@@ -327,6 +327,27 @@ fn a_closed_dependency_releases_a_blocked_park() {
     assert!(lift.contains("--add-label loom:issue"), "{lift}");
 }
 
+/// #11480: lifting the hold's own park never re-arms `loom:issue` past a
+/// veto that is not a park (`loom:needs-capability`).
+#[test]
+#[serial]
+fn a_lift_beside_another_veto_does_not_restore_the_queue_label() {
+    let (mut reg, forge, _dir) = forge_registry(2);
+    let body = "## Dependencies\n- [ ] #77 the upstream\n";
+    forge.set_issue(ISSUE, "open", body, &["loom:issue"]);
+    forge.set_issue(77, "open", "", &[]);
+    reg.record_noop_release(ISSUE, None);
+    reg.record_noop_release(ISSUE, None);
+    assert!(reg.noop_hold_applied(ISSUE));
+    forge.set_issue(ISSUE, "open", body, &["loom:blocked", "loom:needs-capability"]);
+    forge.set_issue(77, "closed", "", &[]);
+    reg.reconcile_noop_holds(std::time::Instant::now() + RECONCILE_INTERVAL * 2);
+    assert!(!reg.noop_hold_applied(ISSUE));
+    let lift = forge.calls("issue edit").pop().unwrap();
+    assert!(lift.contains("--remove-label loom:blocked"), "{lift}");
+    assert!(!lift.contains("--add-label loom:issue"), "{lift}");
+}
+
 #[test]
 #[serial]
 fn an_operator_who_already_lifted_the_park_is_not_edited_again() {

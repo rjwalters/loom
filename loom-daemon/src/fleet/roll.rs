@@ -1053,7 +1053,7 @@ mod tests {
         registry.upsert(super::super::WorkerRecord {
             ssh_host: "worker-1".to_string(),
             repos: Vec::new(),
-            priority: 100,
+            weight: 100,
             bootstrapped_at: "2026-08-01T00:00:00Z".to_string(),
             last_verify: None,
             provider_instance_id: None,
@@ -1068,7 +1068,7 @@ mod tests {
         registry.upsert(super::super::WorkerRecord {
             ssh_host: "worker-2".to_string(),
             repos: Vec::new(),
-            priority: 100,
+            weight: 100,
             bootstrapped_at: "2026-08-01T00:00:00Z".to_string(),
             last_verify: None,
             provider_instance_id: None,
@@ -1118,7 +1118,7 @@ mod tests {
         registry.upsert(super::super::WorkerRecord {
             ssh_host: "worker-1".to_string(),
             repos: Vec::new(),
-            priority: 100,
+            weight: 100,
             bootstrapped_at: "2026-08-01T00:00:00Z".to_string(),
             last_verify: None,
             provider_instance_id: None,
@@ -1133,7 +1133,7 @@ mod tests {
         registry.upsert(super::super::WorkerRecord {
             ssh_host: "localhost".to_string(),
             repos: Vec::new(),
-            priority: 100,
+            weight: 100,
             bootstrapped_at: "2026-08-01T00:00:00Z".to_string(),
             last_verify: None,
             provider_instance_id: None,

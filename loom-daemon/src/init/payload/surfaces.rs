@@ -33,6 +33,7 @@ use std::sync::{Mutex, OnceLock, PoisonError};
 use super::super::scaffolding::install_agent_skills_where;
 use super::super::templates::{render_dotloom_guide, LoomMetadata};
 use super::super::{update_gitignore, InitReport};
+use super::labels_block;
 use crate::agent_skills;
 
 /// How the daemon resync refreshes one surface.
@@ -55,6 +56,12 @@ pub(crate) enum Rule {
     /// A template-substituted guide, re-rendered with the install date the
     /// existing file already carries. Only when the file exists.
     DatedGuide,
+    /// The Loom-managed block of `.github/labels.yml` (#11033), replaced
+    /// from the payload by [`super::labels_block`]; appended when the file
+    /// has no markers, the whole file written when it is absent. Malformed
+    /// markers leave the file as it is. Co-owned, so never recorded as
+    /// Loom-owned.
+    LabelsBlock,
 }
 
 /// One surface the daemon resync refreshes beyond the installer's payload
@@ -72,6 +79,8 @@ pub(crate) struct Surface {
 const SKILLS_DIR: &str = ".agents/skills";
 /// The repo's ignore file, whose Loom-managed block is merged.
 const GITIGNORE: &str = ".gitignore";
+/// The repo's label registry, whose Loom-managed block is replaced.
+const LABELS_YML: &str = ".github/labels.yml";
 
 /// Every surface the daemon resync covers beyond the installer's payload
 /// step. The staging seed, the diff and the default-branch export
@@ -97,6 +106,10 @@ pub(crate) const EXTRA_SURFACES: &[Surface] = &[
     Surface {
         path: GITIGNORE,
         rule: Rule::GitignoreBlock,
+    },
+    Surface {
+        path: LABELS_YML,
+        rule: Rule::LabelsBlock,
     },
     Surface {
         path: ".loom/CLAUDE.md",
@@ -184,7 +197,7 @@ pub(super) fn is_extra(path: &str) -> bool {
 pub(super) fn records_ownership(path: &str) -> bool {
     !EXTRA_SURFACES
         .iter()
-        .any(|s| s.rule == Rule::GitignoreBlock && s.path == path)
+        .any(|s| matches!(s.rule, Rule::GitignoreBlock | Rule::LabelsBlock) && s.path == path)
 }
 
 /// The names `path` can be pinned under in `.loom/resync-ignore`: itself, and
@@ -224,6 +237,10 @@ pub(crate) enum SkipReason {
     /// A guide with no `**Installation Date**:` line cannot be re-rendered
     /// exactly, so it stays at whatever template it was rendered from.
     NoInstallDate,
+    /// A managed block whose markers are malformed (#11033): a second BEGIN
+    /// or END, END before BEGIN, a lone or near-miss marker. Not guessed at;
+    /// the run is reported failed so someone fixes the markers.
+    MalformedMarkers(String),
 }
 
 /// Run every extra step over `stage`, which already holds the workspace's
@@ -277,6 +294,21 @@ pub(super) fn stage_extras(
             Rule::DatedGuide => {
                 present && stage_guide(&defaults.join(surface.path), &dst, surface.path, skipped)?
             }
+            Rule::LabelsBlock => match labels_block::stage(&defaults.join(surface.path), &dst)? {
+                labels_block::Staged::Wrote => true,
+                labels_block::Staged::NoSource => false,
+                labels_block::Staged::Unusable(why) => {
+                    skipped.push(Skipped::unusable(surface.path, &why));
+                    false
+                }
+                labels_block::Staged::Malformed(why) => {
+                    skipped.push(Skipped {
+                        path: surface.path.to_string(),
+                        why: SkipReason::MalformedMarkers(why),
+                    });
+                    false
+                }
+            },
         };
         if wrote {
             shipped.insert(surface.path.to_string());
@@ -344,6 +376,12 @@ pub(crate) fn log_skipped_once(repo: &Path, skipped: &[Skipped]) {
             SkipReason::NoInstallDate => log::info!(
                 "resync: {}: {} records no install date, so it is not re-rendered and stays \
                  at its current template; reinstall to refresh it",
+                repo.display(),
+                skip.path
+            ),
+            SkipReason::MalformedMarkers(why) => log::warn!(
+                "resync: {}: {} is not refreshed: {why}. Its Loom-managed block is left as \
+                 is until the BEGIN/END markers are fixed by hand",
                 repo.display(),
                 skip.path
             ),

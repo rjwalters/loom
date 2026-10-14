@@ -222,8 +222,11 @@ pub struct ReadyQueueRow {
     pub repo: String,
     /// The issue number.
     pub issue: u32,
-    /// The owning workspace's priority tier (lower dispatches first).
-    pub workspace_priority: u32,
+    /// The owning workspace's draw weight (#11742; higher is drawn more).
+    /// Absent from an older daemon's rows (which sent `workspace_priority`,
+    /// a tier in the opposite direction, deliberately not aliased): 0.
+    #[serde(default)]
+    pub workspace_weight: u32,
     /// Deprecated (#9244): always `false`. Its label was deleted in #11105;
     /// the field stays on the wire only for compatibility.
     pub urgent: bool,
@@ -280,7 +283,7 @@ mod tests {
     #[test]
     fn unknown_disposition_parses_instead_of_failing() {
         let row: ReadyQueueRow = serde_json::from_value(serde_json::json!({
-            "rank": 1, "repo": "/r", "issue": 7, "workspace_priority": 100,
+            "rank": 1, "repo": "/r", "issue": 7, "workspace_weight": 100,
             "urgent": false, "disposition": "some_future_reason"
         }))
         .unwrap();
@@ -303,7 +306,7 @@ mod tests {
     #[test]
     fn plan_fields_flatten_and_old_summaries_parse() {
         let row: ReadyQueueRow = serde_json::from_value(serde_json::json!({
-            "rank": 4, "repo": "/r", "issue": 7, "workspace_priority": 100,
+            "rank": 4, "repo": "/r", "issue": 7, "workspace_weight": 100,
             "urgent": false, "disposition": "deferred_capacity",
             "position": 2, "plan_state": "next", "gate": "capacity",
             "keys": [{"name": "number", "value": 7}]

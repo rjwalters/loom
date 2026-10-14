@@ -151,6 +151,7 @@ fn a_failed_read_reads_as_an_empty_unknown_state() {
                 is_pr: false,
                 state: String::new(),
                 building: false,
+                ready: false,
                 hold: None
             },
             "{body:?}"

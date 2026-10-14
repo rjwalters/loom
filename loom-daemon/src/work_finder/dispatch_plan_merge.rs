@@ -32,9 +32,9 @@
 //!
 //! # What is deliberately not compared
 //!
-//! `workspace_priority` is **per-host and unsynced** — it comes from each
-//! host's own `.loom/config.json`, so host A's `priority: 100` and host B's
-//! `priority: 100` are different repos' operators making unrelated
+//! `workspace_weight` is **per-host and unsynced** — it comes from each
+//! host's own `.loom/config.json`, so host A's `weight: 6` and host B's
+//! `weight: 6` are different repos' operators making unrelated
 //! statements. Comparing them across hosts would let one host's local
 //! numbering reorder another's queue. It is not a merge input, here or in the
 //! dashboard port. Within a host it already shaped `position`, which is what

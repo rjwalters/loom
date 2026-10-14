@@ -28,7 +28,6 @@
 //! | [`Invariant::McpBundleHealth`]  | #1 empty sdk dir / stale `dist/index.js` (#5016) | yes — `npm ci && npm run build` |
 //! | [`Invariant::RuntimesPresent`]  | #4 `.loom/runtimes/` absent in 7 clones (#5002) | yes — converge from `defaults/runtimes/` |
 //! | [`Invariant::TokenRankingFresh`]| #5 stale `.ranking` → wrong concurrency cap     | yes — re-probe via `tokens check --ranking` |
-//! | [`Invariant::ForgeEgressAligned`]| #9984 `gh` would not reach the mandated API origin | no — files/refreshes an issue naming the finding codes; closes it once aligned |
 //! | [`Invariant::GhFrontWired`]| #10516 interactive sessions do not reach the agent `gh` front | no — `loom update` re-provisions the SessionStart hook |
 //!
 //! The remaining six conditions (binary freshness, sidecar reachability,
@@ -72,7 +71,6 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
 use crate::workspace_registry::WorkspaceRegistry;
 
-mod forge_egress_invariant;
 pub mod gh_front_invariant;
 pub mod loom_ui;
 
@@ -143,14 +141,9 @@ pub enum Invariant {
     /// reflects live rate-limit state. Repairable: re-probe via `tokens check
     /// --ranking`.
     TokenRankingFresh,
-    /// #9984: when a forge egress policy is configured, `loom-daemon forge
-    /// egress assert` is aligned for this repo (routing exit 0). Not
-    /// auto-repairable: the issue names the finding codes and closes itself
-    /// once the routing verdict is aligned again.
-    ForgeEgressAligned,
     /// #10516: interactive sessions (and their Task subagents) reach the
     /// agent `gh` front — the SessionStart `gh-front-env.sh` hook is wired and
-    /// its prefix resolves `gh` to the front (or the managed launcher). Not
+    /// its prefix resolves `gh` to the front. Not
     /// auto-repairable: see [`gh_front_invariant`].
     GhFrontWired,
 }
@@ -162,7 +155,6 @@ impl Invariant {
         Self::McpBundleHealth,
         Self::RuntimesPresent,
         Self::TokenRankingFresh,
-        Self::ForgeEgressAligned,
         Self::GhFrontWired,
     ];
 
@@ -174,7 +166,6 @@ impl Invariant {
             Self::McpBundleHealth => "mcp-bundle-health",
             Self::RuntimesPresent => "runtimes-present",
             Self::TokenRankingFresh => "token-ranking-fresh",
-            Self::ForgeEgressAligned => "forge-egress-aligned",
             Self::GhFrontWired => "gh-front-wired",
         }
     }
@@ -186,7 +177,6 @@ impl Invariant {
             Self::McpBundleHealth => "mcp-loom bundle is not loadable",
             Self::RuntimesPresent => ".loom/runtimes/ is missing configured runtimes",
             Self::TokenRankingFresh => "token-pool .ranking is stale or missing",
-            Self::ForgeEgressAligned => "forge egress routing is not aligned with policy",
             Self::GhFrontWired => "interactive sessions do not reach the agent gh front",
         }
     }
@@ -200,7 +190,7 @@ impl Invariant {
     pub fn auto_repairable(self) -> bool {
         match self {
             Self::McpBundleHealth | Self::RuntimesPresent | Self::TokenRankingFresh => true,
-            Self::ForgeEgressAligned | Self::GhFrontWired => false,
+            Self::GhFrontWired => false,
         }
     }
 
@@ -275,28 +265,12 @@ impl SelfCheckReport {
 pub struct CheckOptions {
     /// Token `.ranking` is considered stale beyond this age.
     pub ranking_max_age: Duration,
-    /// Override the forge-egress policy sources (#9999). `None` (production)
-    /// means `PolicySources::from_process`.
-    pub forge_egress_sources: Option<crate::forge_egress::policy::PolicySources>,
-}
-
-impl CheckOptions {
-    /// Defaults with forge-egress sources pinned to "unconfigured", so a
-    /// test never consults the host's policy.
-    #[must_use]
-    pub fn hermetic() -> Self {
-        Self {
-            forge_egress_sources: Some(crate::forge_egress::policy::PolicySources::default()),
-            ..Self::default()
-        }
-    }
 }
 
 impl Default for CheckOptions {
     fn default() -> Self {
         Self {
             ranking_max_age: Duration::from_secs(DEFAULT_RANKING_MAX_AGE_SECS),
-            forge_egress_sources: None,
         }
     }
 }
@@ -325,10 +299,6 @@ pub fn check(invariant: Invariant, repo_root: &Path, opts: &CheckOptions) -> Inv
         Invariant::McpBundleHealth => check_mcp_bundle(repo_root),
         Invariant::RuntimesPresent => check_runtimes_present(repo_root),
         Invariant::TokenRankingFresh => check_token_ranking_fresh(repo_root, opts.ranking_max_age),
-        Invariant::ForgeEgressAligned => match opts.forge_egress_sources.as_ref() {
-            Some(sources) => forge_egress_invariant::check_with(sources, repo_root),
-            None => forge_egress_invariant::check(repo_root),
-        },
         Invariant::GhFrontWired => gh_front_invariant::check(repo_root),
     }
 }
@@ -549,7 +519,7 @@ pub fn repair(invariant: Invariant, repo_root: &Path, ctx: &RepairContext) -> Re
         Invariant::RuntimesPresent => repair_runtimes(repo_root),
         Invariant::TokenRankingFresh => repair_token_ranking(repo_root, ctx),
         Invariant::McpBundleHealth => repair_mcp_bundle(repo_root, ctx),
-        Invariant::ForgeEgressAligned | Invariant::GhFrontWired => unreachable_repair(),
+        Invariant::GhFrontWired => unreachable_repair(),
     }
 }
 
@@ -857,22 +827,6 @@ pub trait ViolationReporter {
 
     /// File a new issue. Returns the created issue number.
     fn file_issue(&self, title: &str, body: &str) -> Result<u64, String>;
-
-    /// The open issue carrying `marker`, as `(number, body)` — for the
-    /// refresh/close lifecycle (#9984). Default: none found.
-    fn find_open_issue(&self, _marker: &str) -> Result<Option<(u64, String)>, String> {
-        Ok(None)
-    }
-
-    /// Replace an open issue's body (refresh). Default: unsupported.
-    fn update_issue_body(&self, _number: u64, _body: &str) -> Result<(), String> {
-        Err("unsupported by this reporter".to_string())
-    }
-
-    /// Close a resolved issue with a comment. Default: unsupported.
-    fn close_issue(&self, _number: u64, _comment: &str) -> Result<(), String> {
-        Err("unsupported by this reporter".to_string())
-    }
 }
 
 /// What a `report_violation` call did — for logging and tests.
@@ -1018,26 +972,6 @@ impl ViolationReporter for GhIssueFiler {
             .unwrap_or(0);
         Ok(num)
     }
-
-    fn find_open_issue(&self, marker: &str) -> Result<Option<(u64, String)>, String> {
-        forge_egress_invariant::gh_find_open_issue(&self.repo_root, marker)
-    }
-
-    fn update_issue_body(&self, number: u64, body: &str) -> Result<(), String> {
-        forge_egress_invariant::gh_issue_op(
-            &self.repo_root,
-            "issue.edit",
-            &["edit", &number.to_string(), "--body", body],
-        )
-    }
-
-    fn close_issue(&self, number: u64, comment: &str) -> Result<(), String> {
-        forge_egress_invariant::gh_issue_op(
-            &self.repo_root,
-            "issue.close",
-            &["close", &number.to_string(), "--comment", comment],
-        )
-    }
 }
 
 // ============================================================================
@@ -1151,11 +1085,6 @@ pub fn run_pass<R: ViolationReporter>(
     let report = run_checks(repo_root, check_opts);
 
     for outcome in &report.outcomes {
-        if outcome.invariant == Invariant::ForgeEgressAligned {
-            // #9984: file/refresh on violation, close once aligned.
-            forge_egress_invariant::reconcile(repo_root, outcome, repair_mode, reporter);
-            continue;
-        }
         match &outcome.status {
             InvariantStatus::Ok => log::debug!(
                 "install_self_check: {} OK ({})",
@@ -1288,7 +1217,6 @@ pub fn spawn_multi_install_self_check_task(
                 let repair_mode = resolve_repair(&config);
                 let check_opts = CheckOptions {
                     ranking_max_age: resolve_ranking_max_age(&config),
-                    forge_egress_sources: None,
                 };
                 let root_for_task = root.clone();
                 let joined = tokio::task::spawn_blocking(move || {

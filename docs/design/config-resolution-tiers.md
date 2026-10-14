@@ -30,7 +30,7 @@ today. It does **not** migrate any of the ~40 call sites, create
 
 ## 2. Tier precedence
 
-Four file tiers, listed lowest to highest precedence (a higher tier overrides a
+Five file tiers, listed lowest to highest precedence (a higher tier overrides a
 lower one, key-by-key, via a recursive/deep JSON merge — object values merge
 recursively, any other value type replaces the lower tier's value outright,
 including an explicit `null` written to override a real value):
@@ -40,7 +40,20 @@ including an explicit `null` written to override a real value):
 | 1 | **Private/shared defaults** | `$LOOM_CONFIG_DEFAULTS_FILE`, else `~/.local/share/loom/config/defaults.json` | N/A (machine-level, outside any repo) | **Live** — merged by `config_resolver::resolve_effective_config` like every other tier; only the *file* is absent by default (see the note below) |
 | 2 | **Legacy config** | `.loom/config.json` | Tracked (today's status quo) | Pre-existing |
 | 3 | **Project config** | `.loom-project/project.json` | Tracked | This issue (schema only; no repo has this file yet) |
-| 4 | **Local config** | `.loom-local/local.json` | Ignored (gitignored) | This issue (schema only; no repo has this file yet) |
+| 4 | **Per-repo fleet tier** | `.loom-local/fleet-repo.json` | Ignored (gitignored); written only by the daemon's fleet sync | #11738 — the fleet config's `repos[].config` for this repo |
+| 5 | **Local config** | `.loom-local/local.json` | Ignored (gitignored) | This issue (schema only; no repo has this file yet) |
+
+**Tier 4, the per-repo fleet tier (#11738).** When the fleet store's compiled
+`fleet.json` gives a repo's `repos[]` record a `config` object, the daemon's
+fleet sync writes it verbatim to that repo's `.loom-local/fleet-repo.json`
+(and removes the file when the record has none). It sits **above** both
+committed tiers, so a fleet-wide or class-wide value reaches a repo even when
+the repo commits the same key, and **below** `.loom-local/local.json`, which
+stays the host-local escape hatch. There is no key classification: whatever
+the fleet sets for a repo wins, and anything it does not set falls through to
+the repo's own files. A repo with no such file resolves exactly as before. See
+[`defaults/docs/fleet-config-lifecycle.md`](../../defaults/docs/fleet-config-lifecycle.md)
+§ "The per-repo fleet tier".
 
 A missing file, an unreadable file, or malformed JSON at **any** tier
 soft-fails to "that tier contributes nothing" (an empty object) — it never
@@ -54,11 +67,11 @@ by `.loom/config.json` readers (e.g.
 env vars remain the highest-precedence override for every individual knob —
 that rule is unchanged. This resolver only replaces what "config" means in that
 chain: instead of "the parsed content of `.loom/config.json`", **"config" is
-now the merged result of tiers 1–4 above.** So the full effective precedence
+now the merged result of tiers 1–5 above.** So the full effective precedence
 for any given knob is:
 
 ```
-env var  >  (private defaults ⊕ legacy .loom/config.json ⊕ .loom-project/project.json ⊕ .loom-local/local.json)  >  built-in default
+env var  >  (private defaults ⊕ legacy .loom/config.json ⊕ .loom-project/project.json ⊕ .loom-local/fleet-repo.json ⊕ .loom-local/local.json)  >  built-in default
                                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
                                                      this is "config" — the resolver's output
 ```
@@ -69,7 +82,7 @@ resolver is byte-for-byte behavior-preserving for the status quo.
 
 > **Tier 1 is live, not a placeholder.** `resolve_effective_config`
 > (`loom-daemon/src/config_resolver.rs`) reads and deep-merges the
-> machine-level defaults file on every call, exactly as it does tiers 2–4. What
+> machine-level defaults file on every call, exactly as it does tiers 2–5. What
 > is absent by default is the **file**, not the tier: nothing creates
 > `~/.local/share/loom/config/defaults.json` (or whatever
 > `$LOOM_CONFIG_DEFAULTS_FILE` points at), so on a host that has not written one
@@ -102,12 +115,11 @@ partially-migrated repo work correctly).
 | `forge.*` (type, gitea url/token) | object | Project (type/url) / Local (token, if not using a repo secret) | `forge.type`/`forge.gitea.url` describe the repo; a raw token belongs host-local, never committed. |
 | `observability.ingestKeyFile` | string | Local (`.loom-local/local.json`) | A per-host filesystem path to that host's telemetry ingest credential — inherently host-specific. `observability.enabled`/`.endpoint`/`.batchSize`/`.flushIntervalSecs`/`.queueCapacity` describe whether/how the repo reports telemetry regardless of who runs it and stay Project. Resolved by `loom-daemon/src/observability/mod.rs` with **env > config > `$HOME`-relative default** — a host that never overrides it still resolves to `$HOME/.loom/observability/ingest.key`, so deleting a stray committed value (rather than routing it through `.loom-local/`) is often the correct fix; see #5354, #5464, #6499, #6504. |
 
-> **Amended by #11441:** the `autonomous.*` and `observability.*`
-> rows above (other than `observability.ingestKeyFile`) are **fleet policy** and
-> are owned by fleet-gitops (tier 1), not by this repo tier. A tracked repo tier
-> may carry them only via a reasoned entry in `.loom/fleet-policy-allow.json`.
-> The authoritative classification is `.loom/docs/fleet-config-lifecycle.md`
-> section "Where each kind of key lives".
+> **Note (#11739):** in a fleet, the `autonomous.*` and
+> `observability.*` rows above are normally set in the fleet tier (tier 1), and a
+> repo tier sets them only to override the fleet for that repo. Resolution is
+> plain tier order; no key is classified or rejected. See
+> `.loom/docs/fleet-config-lifecycle.md` section "Where fleet config lives".
 
 `.loom-local/local.json` has no fixed schema in this issue beyond "same shape
 as `.loom-project/project.json`, host-scoped override" — the epic explicitly
@@ -143,7 +155,8 @@ A cross-language conformance fixture lives at
 `defaults/scripts/tests/fixtures/config_resolver/` (relocated from
 `loom-tools/tests/fixtures/config_resolver/` by #4970 when `loom-tools` was
 retired) — a `repo_root`-shaped tree with a legacy `.loom/config.json`, a
-`.loom-project/project.json`, and a `.loom-local/local.json`, deliberately
+`.loom-project/project.json`, a `.loom-local/fleet-repo.json` (#11738), and a
+`.loom-local/local.json`, deliberately
 overlapping some keys across tiers — and is exercised from all three live
 languages:
 

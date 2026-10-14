@@ -91,6 +91,7 @@ fn marker(resolution: Resolution<ResolvedRuntime>) -> String {
         source: PreferenceSource::FleetPreference,
         resolution,
         backstop: None,
+        draw: None,
     }
     .marker_line()
     .unwrap()

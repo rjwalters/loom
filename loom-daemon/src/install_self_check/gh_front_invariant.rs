@@ -9,8 +9,7 @@
 //!    host whose user-scope settings carry no Loom hook at all was never
 //!    provisioned, which is not this check's business: `Skipped`.
 //! 2. **Effective** — the prefix `gh-shim session-env` would write resolves
-//!    `gh` to a `loom-daemon` front, or to the managed launcher under a
-//!    policy (#9987), exactly as a worker's `PATH` does.
+//!    `gh` to a `loom-daemon` front, exactly as a worker's `PATH` does.
 //!
 //! Not auto-repairable: re-provisioning rewrites the operator's user-scope
 //! settings, which stays a deliberate act (`loom update`).
@@ -47,27 +46,17 @@ pub(super) fn check(repo_root: &Path) -> InvariantStatus {
         .filter(|h| !h.is_empty())
         .and_then(|h| read(&Path::new(&h).join(".claude/settings.json")));
     let project = read(&repo_root.join(".claude/settings.json"));
-    let egress = crate::forge_egress::worker_env::WorkerEgress::admit_process()
-        .ok()
-        .and_then(|a| a.egress);
-    let prefix = crate::agent_gh::session_path(None, egress.as_ref());
-    check_with(
-        user.as_deref(),
-        project.as_deref(),
-        prefix,
-        egress.as_ref().map(|e| e.launcher.as_path()),
-    )
+    let prefix = crate::agent_gh::session_path(None);
+    check_with(user.as_deref(), project.as_deref(), prefix)
 }
 
 /// The pure decision: `user` / `project` are the settings files' contents,
-/// `prefix` what `gh-shim session-env` would prepend, `launcher` the policy's
-/// managed launcher.
+/// `prefix` what `gh-shim session-env` would prepend.
 #[must_use]
 pub fn check_with(
     user: Option<&str>,
     project: Option<&str>,
     prefix: Option<OsString>,
-    launcher: Option<&Path>,
 ) -> InvariantStatus {
     let has = |text: Option<&str>, marker: &str| text.is_some_and(|t| t.contains(marker));
     if !has(user, USER_MARKER) && !has(project, PROJECT_MARKER) {
@@ -90,10 +79,9 @@ pub fn check_with(
         );
     };
     match session_env::first_gh(Some(&prefix)) {
-        Some(gh) if session_env::classify_gh(&gh, launcher) != "bypassed" => InvariantStatus::Ok,
+        Some(gh) if session_env::classify_gh(&gh) != "bypassed" => InvariantStatus::Ok,
         other => InvariantStatus::Violation(format!(
-            "the session PATH prefix {} resolves gh to {} — not a loom-daemon front or the \
-             managed launcher",
+            "the session PATH prefix {} resolves gh to {} — not a loom-daemon front",
             prefix.to_string_lossy(),
             other.map_or_else(|| "nothing".to_string(), |p| p.display().to_string())
         )),

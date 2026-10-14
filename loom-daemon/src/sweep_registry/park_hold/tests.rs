@@ -120,6 +120,7 @@ struct FakeForge {
     view_err: Option<String>,
     set_body_err: Option<String>,
     timed_out: bool,
+    frozen: bool,
 }
 
 impl ParkForge for FakeForge {
@@ -129,7 +130,11 @@ impl ParkForge for FakeForge {
             Some(e) => Err(e.clone()),
             None => Ok(IssueState {
                 body: self.body.clone(),
-                labels: vec!["loom:issue".to_string()],
+                labels: if self.frozen {
+                    vec!["loom:issue".to_string(), "loom:frozen".to_string()]
+                } else {
+                    vec!["loom:issue".to_string()]
+                },
             }),
         }
     }
@@ -201,6 +206,18 @@ fn a_refused_read_or_write_is_rejected_not_timed_out() {
     };
     let out = record_hold(&mut forge, 7, QUARANTINE_HOLD_REASON, AT);
     assert!(matches!(out, HoldRecord::Rejected(ref e) if e.contains("HTTP 403")), "{out:?}");
+}
+
+/// #11743: the body read is the frozen check — a frozen issue gets no record.
+#[test]
+fn record_hold_writes_nothing_on_a_frozen_issue() {
+    let mut forge = FakeForge {
+        body: "Original.".to_string(),
+        frozen: true,
+        ..FakeForge::default()
+    };
+    assert_eq!(record_hold(&mut forge, 7, PRLESS_HOLD_REASON, AT), HoldRecord::Frozen);
+    assert_eq!(forge.calls, vec!["view 7"], "a read and nothing else");
 }
 
 #[test]
@@ -602,4 +619,37 @@ fn the_prless_hold_writes_on_a_cross_owner_root() {
     }
     drop(fixture);
     clear_owner_root_registry();
+}
+
+/// #11743: both writers make zero writes to a `loom:frozen` issue — no body
+/// record, no `loom:blocked`, no comment — and the PR-less tally stands.
+#[test]
+#[serial]
+fn neither_daemon_hold_writes_to_a_frozen_issue() {
+    std::env::remove_var("LOOM_REPO");
+    for issue in [9501u32, 7893] {
+        let dir = tempdir().unwrap();
+        let view = format!(
+            r#"{{"number":{issue},"body":"Original body.","labels":["loom:issue","loom:frozen"]}}"#
+        );
+        let (mut reg, log, payloads) = registry(
+            dir.path(),
+            &Script {
+                view: &view,
+                view_sleep: 0,
+                patch_exit: 0,
+            },
+        );
+        if issue == 9501 {
+            reg.apply_quarantine_label(issue, 3);
+        } else {
+            hold_at_threshold(&mut reg, issue);
+            assert!(reg.prless_retry_held(issue), "the freeze does not contradict the tally");
+        }
+        let calls = calls(&log);
+        assert!(patched_bodies(&payloads).is_empty(), "#{issue}: {calls:?}");
+        for write in ["api -X", "issue edit", "issue comment"] {
+            assert!(position(&calls, write).is_none(), "#{issue} `{write}`: {calls:?}");
+        }
+    }
 }

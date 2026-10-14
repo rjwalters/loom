@@ -70,13 +70,13 @@ fn points_of(item: &WorkItem) -> Option<u32> {
 #[must_use]
 pub fn key_of(
     idx: usize,
-    workspace_priority: u32,
+    workspace_weight: u32,
     item: &WorkItem,
     repo_red: bool,
 ) -> PriorityCandidate {
     PriorityCandidate {
         workspace_idx: idx,
-        workspace_priority,
+        workspace_weight,
         created_at: item.created_at.clone(),
         number: item.number,
         level: crate::priority_pick::Level::of(&item.labels),
@@ -244,7 +244,7 @@ pub fn finish(rows: &[TickQueueRow], roots: &[PathBuf]) -> Vec<ReadyQueueRow> {
                 rank: i + 1,
                 repo: repo_name(r.key.workspace_idx, roots),
                 issue: r.key.number,
-                workspace_priority: r.key.workspace_priority,
+                workspace_weight: r.key.workspace_weight,
                 // Deprecated by #9244 (its label deleted in #11105): always
                 // false, kept only for wire compatibility.
                 urgent: false,

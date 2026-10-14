@@ -5,7 +5,7 @@ pub(super) fn base_config() -> AddWorkerConfig {
     AddWorkerConfig {
         ssh_host: "worker-1".to_string(),
         repos: vec!["rjwalters/anvil".to_string()],
-        priority: 50,
+        weight: 50,
         dry_run: false,
         loom_repo_url: DEFAULT_LOOM_REPO_URL.to_string(),
         pat_file: None,
@@ -1299,9 +1299,9 @@ fn no_python_loom_tools_or_pip_step_anywhere() {
 }
 
 #[test]
-fn workspace_register_uses_the_priority() {
+fn workspace_register_uses_the_weight() {
     let mut config = base_config();
-    config.priority = 7;
+    config.weight = 7;
     config.repos = vec!["a/anvil".to_string(), "b/repo2".to_string()];
     let plan = build_plan(&config, &Secrets::default());
     let step = plan
@@ -1312,7 +1312,7 @@ fn workspace_register_uses_the_priority() {
             _ => None,
         })
         .unwrap();
-    assert!(step.apply.contains("--priority 7"));
+    assert!(step.apply.contains("--weight 7"));
     assert!(step.apply.contains("loom-workspaces/anvil"));
     assert!(step.apply.contains("loom-workspaces/repo2"));
 }

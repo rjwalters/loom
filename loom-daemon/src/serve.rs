@@ -2419,7 +2419,7 @@ mod tests {
         report.per_repo = vec![crate::types::RepoStatus {
             root: root.to_path_buf(),
             maintain_only: None,
-            priority: crate::workspace_registry::default_priority(),
+            weight: crate::workspace_registry::default_weight(),
             in_flight_count: 0,
             health_gate_halted: false,
             quarantined_issues: vec![],

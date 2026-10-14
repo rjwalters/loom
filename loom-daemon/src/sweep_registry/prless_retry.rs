@@ -668,6 +668,7 @@ impl SweepRegistry {
                 }
                 PrlessHoldOutcome::Applied
                 | PrlessHoldOutcome::VetoedClosed
+                | PrlessHoldOutcome::VetoedFrozen
                 | PrlessHoldOutcome::VetoedNoForge => {}
             }
         } else {

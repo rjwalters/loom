@@ -19,9 +19,9 @@ use crate::priority_pick::Level;
 pub struct PriorityCandidate {
     /// The owning workspace's index in the `workspaces` slice (dispatch routing).
     pub workspace_idx: usize,
-    /// The owning workspace's `fleet_priority` (lower = higher priority). It
+    /// The owning workspace's roster `weight` (#11742, higher = more draws). It
     /// weights the workspace draw; it is not one of [`candidate_cmp`]'s keys.
-    pub workspace_priority: u32,
+    pub workspace_weight: u32,
     /// The issue's creation timestamp for age ordering (oldest-first).
     pub created_at: Option<String>,
     /// The issue number (dispatch target + final deterministic tiebreak).

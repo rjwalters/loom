@@ -71,8 +71,8 @@ pub mod queue_snapshot;
 pub mod repo_identity;
 mod start_facts;
 pub use start_facts::{
-    effort_source, model_source, DispatchOrigin, SweepStartFacts,
-    SWEEP_START_FACT_LOG_ATTRIBUTE_KEYS,
+    effort_source, model_source, DispatchOrigin, SweepRoleDraw, SweepStartFacts,
+    SWEEP_ROLE_DRAW_LOG_ATTRIBUTE_KEYS, SWEEP_START_FACT_LOG_ATTRIBUTE_KEYS,
 };
 pub mod trace;
 pub mod visibility;
@@ -955,6 +955,12 @@ pub struct SweepOutcomeRecord {
     /// fabricated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_origin: Option<String>,
+    /// The weighted agent draw that chose this sweep's tap (#11726;
+    /// 2AMLogic/2am#4393), copied from the sweep's start facts. Absent when no
+    /// `roleDraw` table decided the sweep, on journal lines that predate it,
+    /// and on sweeps this daemon did not dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_draw: Option<SweepRoleDraw>,
     /// In-sweep rework events (Issue #9444) observed by the paths that
     /// performed them, in event order. Absent (never `[]`) when none were
     /// observed for this sweep.
@@ -1198,6 +1204,12 @@ pub struct RoleTickOutcomeRecord {
     /// [`Self::preference_tier`] is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preference_tap: Option<String>,
+    /// The weighted role draw that chose this tick's tap (#11726): role,
+    /// attempt, the table and the tier that set it, the seed and its inputs,
+    /// every roll, and the pick. Absent when no `runtimes.roleDraw` table
+    /// decided the launch — additive, no `schema_version` bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_draw: Option<crate::runtime_preference::role_draw::RoleDrawRecord>,
     /// Runtime adapter this tick actually launched on (Issue #8507), read off
     /// the tick's own `# LOOM_LAUNCH` record — same source and the same
     /// "absent, never a fabricated `claude` default" contract as
@@ -1757,12 +1769,12 @@ pub struct ManagedRepoEntry {
     /// `Private`, never `Public`.
     #[serde(default)]
     pub visibility: RepoVisibility,
-    /// The repo's cross-repo dispatch priority tier from the machine-level
-    /// workspace registry (`Workspace.priority`, lower dispatches first;
-    /// #9244, loom-ui#153). Absent for a root that is not a registered
-    /// workspace (the empty-registry cwd fallback) and on older daemons.
+    /// The repo's draw weight from the machine-level workspace registry
+    /// (`Workspace.weight`, higher draws more; #11742). Absent for a root that
+    /// is not a registered workspace (the empty-registry cwd fallback) and on
+    /// older daemons, which sent a `priority` tier instead (#9244).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub priority: Option<u32>,
+    pub weight: Option<u32>,
     /// This host's `loom:blocked` release-pass tallies for the repo since the
     /// daemon started (#10763). Absent before the pass's first tick for the
     /// repo on this host and on older daemons.

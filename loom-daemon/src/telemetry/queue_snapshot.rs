@@ -61,7 +61,7 @@ pub struct QueueSnapshotRow {
     #[serde(default)]
     pub visibility: RepoVisibility,
     pub issue: u32,
-    pub workspace_priority: u32,
+    pub workspace_weight: u32,
     /// Deprecated (#9244): always `false`. Its label was deleted in #11105;
     /// kept on the wire only for compatibility.
     pub urgent: bool,

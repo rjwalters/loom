@@ -598,6 +598,16 @@ pub enum Request {
     /// fires — even if the in-flight count subsequently reaches zero on its own.
     /// A no-op (idempotent) when no drain is in progress.
     AbortDrain,
+    /// Host maintenance (#11812, `loom-daemon restart --pause --then-exit`):
+    /// run the version roll's H4 pause (same safe points, manifest and lease
+    /// refresh, `trigger = host-maintenance`), then exit and **stay down**. The
+    /// next start's H5 resumes the manifest. Takes over an operator drain (in
+    /// progress or timed out), a startup hold or a fleet hold without
+    /// reopening dispatch; escalates a pause roll already in H4 to stay down;
+    /// refused while H5 is resuming or a live manifest exists. A new variant,
+    /// not a flag on [`Request::DrainAndRestartDaemon`]: an older daemon must
+    /// reject it, never silently run a wait-for-zero drain instead.
+    PauseThenExit,
     Shutdown,
 }
 
@@ -780,6 +790,24 @@ pub enum Response {
     DaemonRestart {
         scheduled: bool,
         supervisor: Option<String>,
+        message: String,
+    },
+    /// Reply to [`Request::PauseThenExit`] (#11812), sent before H4 finishes.
+    /// `manifest_id` is the pause's (`None` when an escalated roll has not
+    /// written one yet); `manifest_path` is where the CLI waits for it.
+    /// `max_age_secs` is the manifest's staleness bound (the lease TTL) and
+    /// `resume_window_secs` what H5 needs inside it (probation + resume).
+    HostMaintenancePause {
+        accepted: bool,
+        manifest_id: Option<String>,
+        manifest_path: Option<String>,
+        took_over: Option<String>,
+        escalated: bool,
+        in_flight: usize,
+        pause_budget_secs: u64,
+        h4_deadline_secs: u64,
+        max_age_secs: u64,
+        resume_window_secs: u64,
         message: String,
     },
     /// Result of a `DrainAndRestartDaemon` / `AbortDrain` request (Issue #4090).
@@ -2542,13 +2570,13 @@ pub struct RepoStatus {
     /// a normal workspace, and from a daemon that predates the mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub maintain_only: Option<crate::workspace_registry::MaintainOnly>,
-    /// This repo's cross-repo dispatch priority tier (Issue #3946): lower = higher
-    /// priority, default [`crate::workspace_registry::DEFAULT_WORKSPACE_PRIORITY`].
-    /// Surfaced so `loom-daemon status` shows which repos the autonomous loops
-    /// drain first. `#[serde(default)]` keeps pre-#3946 wire data compatible (an
-    /// absent field parses as the default tier).
-    #[serde(default = "crate::workspace_registry::default_priority")]
-    pub priority: u32,
+    /// This repo's cross-repo draw weight (#11742): higher = drawn more,
+    /// default [`crate::workspace_registry::DEFAULT_WORKSPACE_WEIGHT`].
+    /// Surfaced so `loom-daemon status` shows how the autonomous loops share
+    /// dispatch. `#[serde(default)]` keeps older wire data parsing (an absent
+    /// field parses as the default weight).
+    #[serde(default = "crate::workspace_registry::default_weight")]
+    pub weight: u32,
     /// Count of non-terminal (`Pending` / `Running`) sweeps live in this repo's
     /// own [`crate::sweep_registry::SweepRegistry`] at snapshot time.
     pub in_flight_count: usize,

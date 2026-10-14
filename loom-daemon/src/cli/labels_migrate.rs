@@ -136,6 +136,11 @@ pub(crate) enum Event {
         label: String,
         open: usize,
     },
+    /// `--keep-labels` (2am#4345): open items are migrated, the label
+    /// definition is kept so closed items keep it.
+    Retained {
+        label: String,
+    },
     Stopped {
         why: String,
     },
@@ -169,6 +174,9 @@ impl fmt::Display for Event {
                 "UNOWNED {label} (add-only: Loom never declared it, so it is never removed \
                  or deleted; open: {open})"
             ),
+            Event::Retained { label } => {
+                write!(f, "RETAINED {label} (definition kept: --keep-labels; closed items keep it)")
+            }
             Event::Stopped { why } => {
                 write!(f, "STOPPED ({why}); rerun later, every step is idempotent")
             }
@@ -265,6 +273,21 @@ pub(crate) fn list_open(forge: &dyn MigrateForge, label: &str) -> Result<Vec<Ite
     )))
 }
 
+/// `--keep-labels` (2am#4345, operator 2026-10-13: "we don't need to change
+/// labels on anything closed"): migrate open items, never delete a retired
+/// label's definition. GitHub strips a deleted label from every closed item
+/// that carried it, which can't be undone. A process-wide switch set once by
+/// [`dispatch`], read only by [`migrate_one`].
+static KEEP_LABELS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_keep_labels(keep: bool) {
+    KEEP_LABELS.store(keep, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn keep_labels() -> bool {
+    KEEP_LABELS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Migrate every `retired` entry, in order, on one repo.
 pub(crate) fn run(
     forge: &dyn MigrateForge,
@@ -350,6 +373,14 @@ fn migrate_one(
         r.events.push(Event::Unowned {
             label: name.clone(),
             open: items.len(),
+        });
+        return Ok(());
+    }
+    if keep_labels() {
+        // Open items are done (or counted as remaining above); the
+        // definition stays, so nothing is left for this label.
+        r.events.push(Event::Retained {
+            label: name.clone(),
         });
         return Ok(());
     }
@@ -537,6 +568,45 @@ pub(crate) struct GhMigrateForge {
 
 const GH_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Minimum spacing between this process's forge WRITES (2am#4345): a bulk
+/// triage of ~450 label writes in one hour from the operator account tripped
+/// GitHub's secondary write limit, which the whole fleet shares. GitHub's
+/// guidance is under 80 content-creating requests a minute and 500 an hour;
+/// the default 7.5 s keeps a run under 480 an hour. `LOOM_LABEL_WRITE_INTERVAL_MS`
+/// overrides it (0 disables pacing, e.g. for a handful of writes).
+const DEFAULT_WRITE_INTERVAL: Duration = Duration::from_millis(7500);
+
+/// The configured write interval.
+pub(crate) fn write_interval() -> Duration {
+    std::env::var("LOOM_LABEL_WRITE_INTERVAL_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map_or(DEFAULT_WRITE_INTERVAL, Duration::from_millis)
+}
+
+/// How long to wait before the next write, given the last one's time.
+pub(crate) fn pace_delay(
+    last: Option<std::time::Instant>,
+    now: std::time::Instant,
+    interval: Duration,
+) -> Duration {
+    last.map_or(Duration::ZERO, |t| interval.saturating_sub(now.saturating_duration_since(t)))
+}
+
+/// Block until the next write may go, process-wide (every target in an
+/// `--all-workspaces` run shares one pace: they share one write budget).
+fn pace_write() {
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    let mut last = LAST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let wait = pace_delay(*last, std::time::Instant::now(), write_interval());
+    if !wait.is_zero() {
+        std::thread::sleep(wait);
+    }
+    *last = Some(std::time::Instant::now());
+}
+
 /// Percent-encode one URL path/query component.
 pub(crate) fn enc(s: &str) -> String {
     s.bytes()
@@ -578,6 +648,7 @@ impl GhMigrateForge {
     }
 
     fn write(&self, args: &[&str]) -> Result<(), ForgeError> {
+        pace_write();
         self.gh(AccessIntent::Write, args).map(|_| ())
     }
 }
@@ -682,7 +753,14 @@ fn write_gate(t: &Target) -> Result<(), String> {
 }
 
 /// `labels migrate [--repo R | --all-workspaces] [--apply] [--json]`.
-pub(crate) fn dispatch(retired: &[RetiredLabel], scope: Scope, apply: bool, json: bool) -> i32 {
+pub(crate) fn dispatch(
+    retired: &[RetiredLabel],
+    scope: Scope,
+    apply: bool,
+    keep: bool,
+    json: bool,
+) -> i32 {
+    set_keep_labels(keep);
     let fleet = matches!(scope, Scope::AllWorkspaces);
     let (targets, unresolved) = match resolve_targets(scope) {
         Ok(t) => t,

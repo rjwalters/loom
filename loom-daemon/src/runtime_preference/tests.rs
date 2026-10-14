@@ -581,6 +581,7 @@ fn an_exhausted_claude_pool_falls_through_instead_of_holding() {
         source: PreferenceSource::FleetPreference,
         resolution,
         backstop: None,
+        draw: None,
     }
     .marker_line()
     .unwrap();

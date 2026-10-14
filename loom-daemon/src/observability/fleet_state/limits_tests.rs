@@ -54,7 +54,7 @@ fn item(repo: &str, issue: u32) -> ReadyItem {
         issue,
         rank: issue,
         level: 0,
-        fleet_priority: 200,
+        weight: 200,
         created_at: None,
         main_red_fix: false,
         eligible_reason: None,

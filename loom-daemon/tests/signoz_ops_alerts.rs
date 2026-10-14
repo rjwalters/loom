@@ -374,6 +374,9 @@ fn at(hh: i64, mm: i64) -> i64 {
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn replayed_free_gb_falling_to_zero_trips_warning_then_critical() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
     let f = disk_fixture();
     // Always firing on level alone, whatever the slope: worker-3 (20 GB, warning),
     // worker-11 (4 GB, both), worker-12 (9.1%, warning), host-e1d4c843 (2 GB, both).
@@ -424,6 +427,9 @@ fn replayed_free_gb_falling_to_zero_trips_warning_then_critical() {
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn replayed_mixed_readings_within_a_minute_do_not_page() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
     let mut m = Metrics::default();
     for min in 0..120 {
         let ts = T0 + min * 60;
@@ -454,6 +460,9 @@ fn heartbeat(m: &mut Metrics, name: &str, id: &str, ts: i64) {
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn replayed_work_finder_stall_on_a_live_host_pages_within_one_interval() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
     let mut m = Metrics::default();
     // 12:00Z to 16:00Z, one heartbeat per minute per live host.
     for min in -120..120 {

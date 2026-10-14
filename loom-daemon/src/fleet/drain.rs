@@ -897,7 +897,7 @@ mod tests {
         WorkerRecord {
             ssh_host: host.to_string(),
             repos: vec!["rjwalters/anvil".to_string()],
-            priority: 100,
+            weight: 100,
             bootstrapped_at: "2026-07-29T00:00:00Z".to_string(),
             last_verify: None,
             provider_instance_id: None,

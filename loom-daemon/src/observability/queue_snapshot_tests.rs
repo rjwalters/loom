@@ -18,7 +18,7 @@ fn row(rank: usize, repo: &str, issue: u32, d: Qd, detail: Option<&str>) -> Read
         rank,
         repo: repo.into(),
         issue,
-        workspace_priority: 100,
+        workspace_weight: 100,
         urgent: false,
         level: Level::Default,
         main_red_fix: false,
@@ -179,7 +179,7 @@ fn envelope_is_gated_at_version_11_and_reaches_native_ingest() {
 #[test]
 fn a_row_without_visibility_decodes_private() {
     let row: QueueSnapshotRow = serde_json::from_value(serde_json::json!({
-        "rank": 1, "repo": "a/b", "issue": 1, "workspace_priority": 100, "urgent": false,
+        "rank": 1, "repo": "a/b", "issue": 1, "workspace_weight": 100, "urgent": false,
         "disposition": "dispatched", "state": "running", "reason": "dispatched this tick"
     }))
     .unwrap();
@@ -225,7 +225,7 @@ fn plan_fields_ride_the_snapshot_at_version_11() {
         position: Some(3),
         plan_state: PlanState::Queued,
         keys: vec![PlanKey {
-            name: "workspace_priority".into(),
+            name: "workspace_weight".into(),
             value: serde_json::json!(100),
         }],
         gate: Some(PlanGate::RepoCap),
@@ -271,7 +271,7 @@ fn plan_fields_ride_the_snapshot_at_version_11() {
 #[test]
 fn a_row_without_plan_fields_decodes_with_defaults() {
     let row: QueueSnapshotRow = serde_json::from_value(serde_json::json!({
-        "rank": 1, "repo": "o/r", "issue": 1, "workspace_priority": 100,
+        "rank": 1, "repo": "o/r", "issue": 1, "workspace_weight": 100,
         "urgent": false, "disposition": "dispatched", "state": "running",
         "reason": "dispatched this tick"
     }))

@@ -623,7 +623,7 @@ fn queue_summary(
                 rank: i + 1,
                 repo: "/r".into(),
                 issue: u32::try_from(i).unwrap(),
-                workspace_priority: 100,
+                workspace_weight: 100,
                 urgent: false,
                 level: Default::default(),
                 main_red_fix: false,

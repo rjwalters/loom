@@ -63,8 +63,9 @@ pub enum Skip {
     /// failed, or the #4569 partial-increment revert just reopened it, which
     /// is why this pass runs after that one). A live claim is not stale.
     NotClosed,
-    /// No `.labels[]?.name` line was exactly `loom:building`. Idempotent
-    /// re-runs land here, as does an issue somebody already cleaned up.
+    /// No `.labels[]?.name` line was exactly `loom:building` or (#11517)
+    /// `loom:issue`. Idempotent re-runs land here, as does an issue somebody
+    /// already cleaned up.
     NotBuilding,
 }
 
@@ -85,6 +86,11 @@ impl Skip {
 pub enum Plan {
     /// Remove `loom:building` via `forge_gh_remove_label_rl_safe`.
     Strip,
+    /// Remove `loom:issue` only (#11517, operator ruling 2026-10-13: a closed
+    /// issue must not keep the queue label consumers read as "Ready").
+    StripReady,
+    /// Remove both `loom:building` and `loom:issue`.
+    StripBoth,
     /// Leave the issue untouched.
     Skip(Skip),
 }
@@ -104,14 +110,18 @@ pub fn plan(view: &IssueView) -> Plan {
     if view.state != "closed" {
         return Plan::Skip(Skip::NotClosed);
     }
-    if !view.building {
-        return Plan::Skip(Skip::NotBuilding);
+    match (view.building, view.ready) {
+        (false, false) => Plan::Skip(Skip::NotBuilding),
+        (true, false) => Plan::Strip,
+        (false, true) => Plan::StripReady,
+        (true, true) => Plan::StripBoth,
     }
-    Plan::Strip
 }
 
-/// Render the plan as the shell wrapper's one-line protocol: `STRIP`, or
-/// `SKIP<TAB><token>`.
+/// Render the plan as the shell wrapper's one-line protocol: `STRIP`
+/// (`loom:building`), `STRIP-READY` (`loom:issue`, #11517), `STRIP-BOTH`, or
+/// `SKIP<TAB><token>`. A wrapper predating #11517 does not know the two new
+/// verbs; it warns and leaves the issue alone (advisory, post-merge).
 ///
 /// Always exactly one line, always led by a token the wrapper recognises —
 /// so an empty read, a truncated read, or a binary predating this verb is
@@ -120,6 +130,8 @@ pub fn plan(view: &IssueView) -> Plan {
 pub fn render(plan: Plan) -> String {
     match plan {
         Plan::Strip => "STRIP\n".to_string(),
+        Plan::StripReady => "STRIP-READY\n".to_string(),
+        Plan::StripBoth => "STRIP-BOTH\n".to_string(),
         Plan::Skip(why) => format!("SKIP\t{}\n", why.token()),
     }
 }

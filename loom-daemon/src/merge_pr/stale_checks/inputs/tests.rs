@@ -397,10 +397,7 @@ fn every_script_a_required_job_runs_is_a_global_input() {
                 !refs.is_empty()
                     || matches!(
                         *component,
-                        "Shell Budget Ratchet"
-                            | "Secret Scan"
-                            | "MCP Guard Wiring Contract"
-                            | "Fleet-Policy Shadow Guard"
+                        "Shell Budget Ratchet" | "Secret Scan" | "MCP Guard Wiring Contract"
                     ),
                 "{component}: no script references found — the parser probably broke"
             );

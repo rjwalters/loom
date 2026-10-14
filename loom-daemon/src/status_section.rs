@@ -82,7 +82,6 @@ pub enum StatusSection {
     JournalAdoptedAtStartup,
     FleetStore,
     PendingRestart,
-    ForgeEgress,
 }
 
 impl StatusSection {
@@ -169,7 +168,6 @@ impl StatusSection {
             }
             S::FleetStore => ("fleet_store", &["fleet_store"]),
             S::PendingRestart => ("pending_restart", &["pending_restart"]),
-            S::ForgeEgress => ("forge_egress", &["forge_egress"]),
         }
     }
 }

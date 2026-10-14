@@ -12,21 +12,31 @@
 //! the hold is only ever read by that walk, so a static binding or an operator
 //! pin has nothing to fall through to and is left exactly as it was.
 //! `LOOM_LAUNCH_FAILURE_HOLD_SECS=0` feeds nothing at all.
+//!
+//! #11726: every launched tick with an admission also feeds the role draw's
+//! attempt counter (`runtime_preference::role_draw::attempts`): any failure —
+//! deterministic or not, including a blocked tick — makes the next tick the
+//! next attempt; a success resets it to attempt 1. That counter is independent
+//! of the hold and of `LOOM_LAUNCH_FAILURE_HOLD_SECS`.
 
 use super::failure_class;
 use crate::observability::lifecycle::{note_role_failure, RoleFailure};
 use crate::runtime_admission::ResolvedRuntime;
 use crate::runtime_preference::launch_failure_hold::{self, ClearReason, Key};
+use crate::runtime_preference::role_draw::attempts;
 use crate::runtime_preference::Tap;
 use std::path::{Path, PathBuf};
 
 /// The tick's hold key, when it has one.
 pub(super) struct HoldFeed {
     tracked: Option<(PathBuf, Key, Tap)>,
+    /// `(root, role)` for the role draw's attempt counter (#11726).
+    attempt: Option<(PathBuf, String)>,
 }
 
 impl HoldFeed {
     pub(super) fn new(root: &Path, role: &str, admission: Option<&ResolvedRuntime>) -> Self {
+        let attempt = admission.map(|_| (root.to_path_buf(), role.to_string()));
         let tracked = admission.and_then(|admitted| {
             let stamp = admitted.preference.as_ref()?;
             if launch_failure_hold::hold_secs() == 0 {
@@ -39,11 +49,18 @@ impl HoldFeed {
             let role = crate::runtime_admission::canonical_role(role).unwrap_or(role);
             Some((root.to_path_buf(), Key::new(root, role, &tap), tap))
         });
-        Self { tracked }
+        Self { tracked, attempt }
     }
 
     /// Note `failure` on the tick's span (unchanged) and count it.
     pub(super) fn failure(&self, failure: RoleFailure) {
+        if let Some((root, role)) = &self.attempt {
+            let next = attempts::record_failure(root, role);
+            log::info!(
+                "role_draw: {role} attempt failed ({}); the next tick is attempt {next} (#11726)",
+                failure.class()
+            );
+        }
         if let Some((root, key, tap)) = &self.tracked {
             let now = now();
             if failure_class::is_deterministic(failure.class()) {
@@ -59,6 +76,9 @@ impl HoldFeed {
 
     /// The tick succeeded: the streak (and any live hold) is cleared.
     pub(super) fn success(&self) {
+        if let Some((root, role)) = &self.attempt {
+            attempts::record_success(root, role);
+        }
         if let Some((_, key, _)) = &self.tracked {
             launch_failure_hold::record_reset(key, ClearReason::Success, now());
         }

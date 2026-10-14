@@ -114,7 +114,7 @@ fn queue_is_ranked_by_dispatch_order_and_reports_the_level() {
         ),
     ];
     // Workspace 1 has the higher priority (lower number).
-    let report = tick_multi(&mut multi, &[100, 0], 2, &[false, false]);
+    let report = tick_multi(&mut multi, &[1, 10], 2, &[false, false]);
     let roots = vec![PathBuf::from("/repo/a"), PathBuf::from("/repo/b")];
     let q = rows(&report, &roots);
 
@@ -373,13 +373,13 @@ fn candidate_domain() -> Vec<PriorityCandidate> {
         Some("2026-02-01T00:00:00Z"),
     ];
     let mut out = Vec::new();
-    for workspace_priority in [0, 100] {
+    for workspace_weight in [0, 100] {
         for main_red_fix in [false, true] {
             for level in [Level::Default, Level::Important, Level::VeryImportant] {
                 for created_at in times {
                     for number in [1, 2] {
                         out.push(PriorityCandidate {
-                            workspace_priority,
+                            workspace_weight,
                             main_red_fix,
                             level,
                             created_at: created_at.map(str::to_string),
@@ -419,7 +419,7 @@ fn candidate_keys_project_to_named_wire_keys() {
         vec!["main_red_fix", "level", "created_at", "number"]
     );
     let c = PriorityCandidate {
-        workspace_priority: 7,
+        workspace_weight: 7,
         level: crate::priority_pick::Level::VeryImportant,
         created_at: Some("2026-01-01T00:00:00Z".into()),
         number: 42,

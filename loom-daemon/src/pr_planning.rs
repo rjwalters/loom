@@ -131,6 +131,8 @@ pub fn ordered_queue(
                 && r["isDraft"] != true
                 && !has_label(r, "loom:blocked")
                 && !has_label(r, "loom:operator-only")
+                // #11743: no role reviews, treats or merges a frozen PR.
+                && !has_label(r, crate::work_finder::FROZEN_LABEL)
         })
         .collect();
     candidates.retain(|r| match role {

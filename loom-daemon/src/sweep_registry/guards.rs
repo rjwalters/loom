@@ -2437,15 +2437,13 @@ mod tests {
         let dir = tempdir().unwrap();
         let gh_log = dir.path().join("gh-invocations.log");
         let fake_gh = dir.path().join("fake-gh.sh");
-        // `gh issue view <n> --json labels --jq '...'` (the pre-check probe)
-        // reports the issue as currently `loom:blocked`; any `gh issue edit`
-        // call is recorded and always succeeds.
+        // The issue-signals read (#11480) reports the issue as currently
+        // `loom:blocked`; any `gh issue edit` call is recorded and succeeds.
         let script = format!(
             r#"#!/usr/bin/env bash
 printf '%s\n' "$*" >> "{log}"
-if [ "$1" = "issue" ] && [ "$2" = "view" ]; then
-  echo "true"
-  exit 0
+if [ "$1" = "api" ]; then
+  echo '{{"state":"open","closed_at":null,"labels":["loom:blocked","loom:building"]}}'
 fi
 exit 0
 "#,
@@ -2494,20 +2492,13 @@ exit 0
         let dir = tempdir().unwrap();
         let gh_log = dir.path().join("gh-invocations.log");
         let fake_gh = dir.path().join("fake-gh.sh");
-        // The `loom:blocked` pre-check (first `gh issue view --json labels`
-        // call) reports false; the `loom:operator-only` follow-up check
-        // (second `gh issue view --json labels` call) reports true. Any `gh
-        // issue edit` call is recorded and always succeeds.
+        // The issue-signals read (#11480) reports `loom:operator-only`. Any
+        // `gh issue edit` call is recorded and always succeeds.
         let script = format!(
             r#"#!/usr/bin/env bash
 printf '%s\n' "$*" >> "{log}"
-if [ "$1" = "issue" ] && [ "$2" = "view" ]; then
-  case "$*" in
-    *loom:blocked*) echo "false" ;;
-    *loom:operator-only*) echo "true" ;;
-    *) echo "false" ;;
-  esac
-  exit 0
+if [ "$1" = "api" ]; then
+  echo '{{"state":"open","closed_at":null,"labels":["loom:operator-only"]}}'
 fi
 exit 0
 "#,
@@ -2654,15 +2645,12 @@ exit 0
         let cwds: Vec<_> = recorded.lines().filter(|l| !l.is_empty()).collect();
         assert_eq!(
             cwds.len(),
-            7,
-            "expected the flip (1 call) + restore (Issue #4206's pre-check `loom:blocked` \
-             probe, Issue #4887's follow-up `loom:operator-only` probe — the fake `gh` prints \
-             nothing so both park probes read as absent, Issue #4653's `is_pr` probe's \
-             `resolve_owner_repo` lookup — which bails before the second `gh api` call since \
-             the fake `gh` prints nothing for `repo view` — Issue #9463's closed-state probe \
-             (an unverifiable state fails open to the restore) — Issue #10955's label-history \
-             read (an empty history fails open to the restore) — then the edit — 6 calls) to \
-             invoke gh seven times total; got cwds: {cwds:?}"
+            5,
+            "expected the flip (1 call) + restore (#11480's one issue-signals read for the \
+             shared veto and #9463's closed state — the fake `gh` prints nothing, so it fails \
+             open — Issue #4653's `is_pr` probe's `resolve_owner_repo` lookup, which bails \
+             before a second `gh api` call, Issue #10955's label-history read, then the \
+             edit — 4 calls) to invoke gh five times total; got cwds: {cwds:?}"
         );
         for cwd in &cwds {
             let got = std::fs::canonicalize(cwd).unwrap();

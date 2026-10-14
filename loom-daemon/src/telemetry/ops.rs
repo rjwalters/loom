@@ -174,6 +174,11 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.build_gate.outcome",
     "loom.build_gate.duration_ms",
     "loom.build_gate.attempt",
+    // `main_red.autofile` spans (#11766): one change to a red `main`'s
+    // auto-filed fix issue — the SHA, the action and the verdict's source.
+    "loom.main_red.sha",
+    "loom.main_red.action",
+    "loom.main_red.source",
 ];
 
 /// Longest label value kept, in bytes.

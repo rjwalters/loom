@@ -82,6 +82,13 @@ impl SweepRegistry {
                     // `operator_redispatch`; an unknown lineage stays absent.
                     trigger: lineage.map(|l| origin.apply_to_trigger(l.2).to_string()),
                     dispatch_origin: Some(origin.as_str().to_string()),
+                    // 2am#4393: the draw that chose this sweep's tap.
+                    role_draw: admission
+                        .admitted
+                        .as_ref()
+                        .and_then(|a| a.preference.as_ref())
+                        .and_then(|p| p.draw.as_deref())
+                        .map(crate::telemetry::SweepRoleDraw::from_draw),
                 };
                 self.start_facts.insert(sweep_id.clone(), facts.clone());
                 Some(Box::new(facts))

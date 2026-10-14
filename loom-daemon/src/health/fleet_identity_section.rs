@@ -66,6 +66,7 @@ mod tests {
             workspaces: Default::default(),
             checkouts: Vec::new(),
             checkouts_note: None,
+            repo_config: Default::default(),
         }
     }
 

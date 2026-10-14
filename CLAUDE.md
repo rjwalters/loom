@@ -95,6 +95,7 @@ label documents its own `Applied by:` owner). State transitions:
 - **Epic**: `loom:epic` → Champion creates phased `loom:architect` +
   `loom:epic-phase` issues.
 
+`loom:frozen` means not now: every agent and daemon path ignores it; only a human removes it (#11743).
 `loom:operator` means "a human is needed" (engine stops, re-evaluable, unlike
 `loom:operator-only`; set by Champion's merge-risk hold). `loom:very-important` /
 `loom:important` reorder (not holds, not approval); every stage takes them first. Your
@@ -103,7 +104,7 @@ queue: the pinned hold digest (#6877) and label queries in
 
 > **Note on label cleanup**: Loom intentionally does **not** remove labels from
 > closed issues or merged PRs (harmless — all agents filter by open state — and it
-> saves gh API calls). Do not implement label cleanup on merge/close (see #2838) — exception: `merge-pr.sh` strips `loom:building` from an issue its own merge closes, see [`troubleshooting.md`](.loom/docs/troubleshooting.md) (#6199).
+> saves gh API calls). Do not implement label cleanup on merge/close (see #2838) — exception: `merge-pr.sh` strips `loom:building` and (#11517, operator ruling 2026-10-13) `loom:issue` from an issue its own merge closes, see [`troubleshooting.md`](.loom/docs/troubleshooting.md) (#6199).
 
 ### Issues Are Suggestions (Role Autonomy)
 
@@ -224,8 +225,8 @@ copies (and re-stamps install metadata). Details:
 ## Configuration
 
 Configuration lives in `.loom/config.json` (committed): a `terminals` array
-(per-agent role/model), plus the optional blocks below. Fleet keys (`autonomous`,
-`runtimes`, …) belong in fleet-gitops; CI rejects un-allow-listed ones here: [fleet-config-lifecycle](.loom/docs/fleet-config-lifecycle.md).
+(per-agent role/model), plus the optional blocks below. Fleet-wide keys (`autonomous`,
+`runtimes`, …) are normally set in the fleet tier; a key committed here overrides it for this repo (plain tier order): [fleet-config-lifecycle](.loom/docs/fleet-config-lifecycle.md).
 
 - **Daemon configuration (Tier 2)** — start/stop wrappers, self-update, epic
   supervisor: [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md)
@@ -273,7 +274,7 @@ See [credential policy](.loom/docs/credential-storage.md); `.gitignore` is insuf
   `./.loom/scripts/create-issue.sh`, never a bare `gh issue create`** — that is
   GraphQL-backed and dies on GraphQL exhaustion while the independent REST pool
   sits idle; the script falls back to one REST POST with labels applied
-  atomically (#5047). See [github-authentication](.loom/docs/github-authentication.md); routing policy: [forge-egress](.loom/docs/forge-egress.md).
+  atomically (#5047). See [github-authentication](.loom/docs/github-authentication.md).
 - **Gitea** — set `GITEA_TOKEN` or `FORGE_TOKEN` (repository read/write). See
   [forge-authentication](.loom/docs/forge-authentication.md).
 - **Releasing** — **a PR must NEVER bump `VERSION`**: a post-merge workflow does

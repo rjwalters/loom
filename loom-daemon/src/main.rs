@@ -1048,11 +1048,6 @@ enum Commands {
         /// Show verbose output including configured roles
         #[arg(long, short)]
         verbose: bool,
-
-        /// Run only the fleet-policy shadow check (#11441) and exit 2 on any
-        /// finding; skips role validation. Used by the CI guard.
-        #[arg(long)]
-        fleet_policy_only: bool,
     },
 
     /// Inspect the durable `sweep.outcome` telemetry journal (Issue #4704,
@@ -1173,11 +1168,12 @@ enum WorkspaceAction {
         #[arg(value_name = "PATH")]
         path: String,
 
-        /// Cross-repo dispatch priority tier (#3946): lower = higher priority.
-        /// The autonomous work-finder and epic supervisor drain higher-priority
-        /// repos first. Defaults to 100 when omitted.
-        #[arg(long, value_name = "N", default_value_t = loom_daemon::workspace_registry::DEFAULT_WORKSPACE_PRIORITY)]
-        priority: u32,
+        /// Cross-repo draw weight (#11742): the work finder draws this repo
+        /// with probability (weight + bonuses) / Σ, so higher = more draws and
+        /// 0 = never. Defaults to 1 when omitted; on a fleet host the store's
+        /// `weight` replaces it at the next roster sync.
+        #[arg(long, value_name = "N", default_value_t = loom_daemon::workspace_registry::DEFAULT_WORKSPACE_WEIGHT)]
+        weight: u32,
 
         /// Optional per-repo config overrides as a JSON object string.
         #[arg(long, value_name = "JSON")]
@@ -1204,15 +1200,15 @@ enum WorkspaceAction {
     Hold(cli::workspace_fleet::WorkspaceRoot),
     /// Lift `workspace hold`: dispatch into the workspace resumes (#11186).
     Release(cli::workspace_fleet::WorkspaceRoot),
-    /// Set the dispatch priority tier of an already-registered workspace (#3946).
-    SetPriority {
+    /// Set the draw weight of an already-registered workspace (#11742).
+    SetWeight {
         /// Path to the repo root (normalized the same way as `add`).
         #[arg(value_name = "PATH")]
         path: String,
 
-        /// New priority tier: lower = higher priority.
+        /// New weight: higher = more draws, 0 = never drawn.
         #[arg(value_name = "N")]
-        priority: u32,
+        weight: u32,
     },
     /// Deregister a managed workspace by root.
     Remove {
@@ -1258,10 +1254,10 @@ enum FleetAction {
         #[arg(long, value_name = "OWNER/NAME", required = true)]
         repo: Vec<String>,
 
-        /// Cross-repo dispatch priority the workspaces are registered at (#3946;
-        /// lower = higher priority). Defaults to 100.
-        #[arg(long, value_name = "N", default_value_t = loom_daemon::workspace_registry::DEFAULT_WORKSPACE_PRIORITY)]
-        priority: u32,
+        /// Cross-repo draw weight the workspaces are registered at (#11742;
+        /// higher = more draws). Defaults to 1.
+        #[arg(long, value_name = "N", default_value_t = loom_daemon::workspace_registry::DEFAULT_WORKSPACE_WEIGHT)]
+        weight: u32,
 
         /// Local path to the operator's fine-grained forge PAT (Contents+Issues+PRs
         /// on the target repos). Read locally at preflight; transferred to the
@@ -2231,8 +2227,7 @@ async fn handle_cli_command(command: Commands) -> Result<()> {
             format,
             strict,
             verbose,
-            fleet_policy_only,
-        } => handle_validate_command(&workspace, &format, strict, verbose, fleet_policy_only),
+        } => handle_validate_command(&workspace, &format, strict, verbose),
         Commands::SweepOutcomes(args) => cli::sweep_outcomes_cli::dispatch(args),
         Commands::FleetConfig(args) => cli::fleet_config::dispatch(args),
         Commands::Journal(args) => cli::journal_cli::dispatch(args),

@@ -263,7 +263,7 @@ fn emit(prefix: &str, key_text: &str, value: &Value, col: usize) -> Result<Vec<S
     Ok(out)
 }
 
-/// A path for messages: `repos[name=app].fleet_priority`.
+/// A path for messages: `repos[name=app].weight`.
 fn label(path: &[Seg<'_>]) -> String {
     let mut out = String::new();
     for s in path {

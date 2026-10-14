@@ -243,3 +243,14 @@ fn git_out(dir: &Path, args: &[&str]) -> Vec<u8> {
         .unwrap()
         .stdout
 }
+
+#[test]
+fn redact_masks_tokens_and_authorization_but_not_references() {
+    let token = format!("ghp_{}", "A".repeat(36));
+    let pat = format!("github_pat_{}", "B".repeat(30));
+    let out = redact(&format!("token {token} / {pat} / Bearer abcdefghijklmnop"));
+    assert!(!out.contains(&token) && !out.contains(&pat), "{out}");
+    assert!(!out.contains("abcdefghijklmnop"), "{out}");
+    assert_eq!(redact("file:/etc/2am/cred.ref"), "file:/etc/2am/cred.ref");
+    assert_eq!(redact("github-proxy.2amlogic.com"), "github-proxy.2amlogic.com");
+}

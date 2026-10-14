@@ -177,16 +177,21 @@ mod tests {
             .parent()
             .expect("loom-daemon/ has a parent")
             .join("defaults/scripts/hard-exclusion-labels.sh");
+        // Hermetic: no `loom-daemon` on PATH and no LOOM_DAEMON_BIN, so the
+        // script renders its shipped fallback array, not whatever (possibly
+        // older) daemon a developer has installed.
         let out = std::process::Command::new("bash")
             .arg(&script)
             .arg("--jq-not")
+            .env_remove("LOOM_DAEMON_BIN")
+            .env("PATH", "/usr/bin:/bin")
             .output()
             .unwrap_or_else(|e| panic!("run {} --jq-not: {e}", script.display()));
         assert!(out.status.success(), "--jq-not exited non-zero");
         let rendered = String::from_utf8_lossy(&out.stdout);
         for label in HARD_EXCLUSION_LABELS.iter() {
             assert!(
-                rendered.contains(&format!("contains([\"{label}\"]) | not")),
+                rendered.contains(&format!("(any(.labels[].name; . == \"{label}\") | not)")),
                 "--jq-not output {rendered:?} does not exclude {label}"
             );
         }

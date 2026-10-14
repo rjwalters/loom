@@ -91,7 +91,7 @@ pub fn blocked_rows(repo: &QueueRepoRef, listing: &[RestIssue]) -> Vec<QueueSnap
                 repo: repo.repo.clone(),
                 visibility: repo.visibility,
                 issue: item.number,
-                workspace_priority: crate::workspace_registry::DEFAULT_WORKSPACE_PRIORITY,
+                workspace_weight: crate::workspace_registry::DEFAULT_WORKSPACE_WEIGHT,
                 // Deprecated by #9244: always false on the wire.
                 urgent: false,
                 level: crate::priority_pick::Level::of(&item.labels),

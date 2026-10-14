@@ -49,7 +49,7 @@ fn summary(rows: Vec<(u32, QueueDisposition)>) -> WorkFinderTickSummary {
         .map(|(i, (issue, disposition))| {
             serde_json::from_value::<ReadyQueueRow>(serde_json::json!({
                 "rank": i + 1, "repo": "/work/loom", "issue": issue,
-                "workspace_priority": 100, "urgent": false,
+                "workspace_weight": 100, "urgent": false,
                 "disposition": disposition,
             }))
             .unwrap()
@@ -497,9 +497,10 @@ fn work_finder_record_carries_the_workspace_draw() {
     let item = |n: u32| WorkItem::with_created_at(n, vec!["loom:issue".into()], None);
     let candidates = vec![
         ready_queue::key_of(0, 0, &item(1), false),
-        ready_queue::key_of(1, 100, &item(2), false),
+        ready_queue::key_of(1, 1, &item(2), false),
     ];
-    let (order, log) = draw_order(candidates, &[0, 100], 99, 80);
+    let (order, log) =
+        draw_order(candidates, &[3, 1], 99, &crate::priority_pick::WeightBonus::default());
     let log = log.unwrap();
     let names = ["o/tool", "o/product"];
     let draw = workspace_draw_record(&log, |idx| names[idx].to_string());
@@ -510,21 +511,22 @@ fn work_finder_record_carries_the_workspace_draw() {
     let d = &json["workspace_draw"];
     assert_eq!(d["seed"], "99");
     assert_eq!(d["draws_total"], 2);
+    // A draw with no derived seed (pinned / passed in) names no inputs.
+    assert!(d.get("seed_scheme").is_none());
     let first = &d["draws"][0];
-    assert_eq!(first["pool"], "all");
-    // #11684: softmax weights at T = 80, relative to the pool's p_min.
-    assert_eq!(d["temperature"], 80);
-    assert_eq!(first["p_min"], 0);
+    assert!(first.get("pool").is_none(), "no tiers since #11742");
+    assert!(d.get("temperature").is_none());
+    // #11742: linear weights, with each candidate's base weight and bonus.
     assert_eq!(
         first["candidates"][0],
-        serde_json::json!({"repo": "o/tool", "weight": 1_000_000})
+        serde_json::json!({"repo": "o/tool", "weight": 3, "base_weight": 3, "bonus": 0})
     );
     assert_eq!(
         first["candidates"][1],
-        serde_json::json!({"repo": "o/product", "weight": 286_505})
+        serde_json::json!({"repo": "o/product", "weight": 1, "base_weight": 1, "bonus": 0})
     );
-    assert_eq!(first["total_weight"], 1_286_505);
-    assert!(first["roll"].as_u64().unwrap() < 1_286_505);
+    assert_eq!(first["total_weight"], 4);
+    assert!(first["roll"].as_u64().unwrap() < 4);
     assert_eq!(first["picked"], names[order[0].workspace_idx]);
     assert_eq!(first["number"], order[0].number);
     // The second draw is over the one workspace left.
@@ -532,24 +534,64 @@ fn work_finder_record_carries_the_workspace_draw() {
     // It round-trips, and a role record (no draw) omits the field.
     let back: PickDecisionRecord = serde_json::from_value(json.clone()).unwrap();
     assert_eq!(back, r);
-    // A pre-#11684 record (no `temperature` / `p_min`) still parses.
+    // A pre-#11742 record (tier `pool`, softmax `temperature` / `p_min`, no
+    // `base_weight` / `bonus`) still parses.
     let mut old = json;
-    old["workspace_draw"]
-        .as_object_mut()
-        .unwrap()
-        .remove("temperature");
+    old["workspace_draw"]["temperature"] = serde_json::json!(80);
     for draw in old["workspace_draw"]["draws"].as_array_mut().unwrap() {
-        draw.as_object_mut().unwrap().remove("p_min");
+        draw["pool"] = serde_json::json!("all");
+        draw["p_min"] = serde_json::json!(0);
+        for c in draw["candidates"].as_array_mut().unwrap() {
+            let c = c.as_object_mut().unwrap();
+            c.remove("base_weight");
+            c.remove("bonus");
+        }
     }
     let back: PickDecisionRecord = serde_json::from_value(old).unwrap();
     let back_draw = back.workspace_draw.unwrap();
-    assert_eq!(back_draw.temperature, None);
-    assert!(back_draw.draws.iter().all(|d| d.p_min.is_none()));
+    assert!(back_draw
+        .draws
+        .iter()
+        .all(|d| d.candidates.iter().all(|c| c.bonus.is_none())));
     let plain = work_finder_record(&summary(Vec::new()), "h", at(), at(), resolve);
     assert!(serde_json::to_value(&plain)
         .unwrap()
         .get("workspace_draw")
         .is_none());
+}
+
+/// #11683: a clock-and-host-seeded draw exports its inputs beside the seed,
+/// and they recompute it.
+#[test]
+fn work_finder_record_carries_the_seed_inputs() {
+    use crate::work_finder::workspace_draw::{
+        draw_order, minute_seed, SeedInputs, DRAW_SEED_SCHEME,
+    };
+    use crate::work_finder::{ready_queue, WorkItem};
+    let item = |n: u32| WorkItem::with_created_at(n, vec!["loom:issue".into()], None);
+    let seed = minute_seed(29_000_000, "host-a");
+    let (_, log) = draw_order(
+        vec![ready_queue::key_of(0, 0, &item(1), false)],
+        &[1],
+        seed,
+        &crate::priority_pick::WeightBonus::default(),
+    );
+    let mut log = log.unwrap();
+    log.seed_inputs = Some(SeedInputs {
+        scheme: DRAW_SEED_SCHEME,
+        minute: 29_000_000,
+        host: "host-a".into(),
+    });
+    let d = serde_json::to_value(workspace_draw_record(&log, |_| "o/r".into())).unwrap();
+    assert_eq!(d["seed"], "18365900956060715395");
+    assert_eq!(d["seed_scheme"], "loom-draw/v1");
+    assert_eq!(d["seed_minute"], "29000000");
+    assert_eq!(d["seed_host"], "host-a");
+    let minute: u64 = d["seed_minute"].as_str().unwrap().parse().unwrap();
+    assert_eq!(
+        minute_seed(minute, d["seed_host"].as_str().unwrap()).to_string(),
+        d["seed"].as_str().unwrap()
+    );
 }
 
 /// #11509: the work finder's record carries the tick's `loom:very-important`

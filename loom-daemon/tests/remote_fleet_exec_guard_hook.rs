@@ -62,7 +62,6 @@ impl Fixture {
             .env("LOOM_FLEET_PATH", self.root.path().join("fleet.json"))
             .env("LOOM_GUARD_TAILSCALE_STATUS_FILE", self.root.path().join("tailscale.json"))
             .env_remove("LOOM_GUARD_REMOTE_FLEET_EXEC")
-            .env_remove("LOOM_FORGE_EGRESS_POLICY")
             .env_remove("LOOM_ROLE")
             .env_remove("LOOM_WORKTREE_PATH")
             .stdin(Stdio::piped())
