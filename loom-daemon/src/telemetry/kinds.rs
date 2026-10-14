@@ -161,6 +161,8 @@ pub struct TelemetryKindMeta {
 /// `auto_update.tick` (#10414).
 pub mod auto_update_tick;
 
+pub mod backlog_level;
+
 /// `checkout.external_change` (#11566) — a managed checkout moved by non-Loom git.
 pub mod checkout_external_change;
 
@@ -463,6 +465,12 @@ macro_rules! telemetry_kind_table {
             /// A role agent began working an item in a stage (#11641): the
             /// work-start that splits a stay into queue wait and work time.
             WorkStarted = "stage.work_started" => $crate::telemetry::kinds::work_started::WorkStartedRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// The backlog level the daemon handed one Curator dispatch
+            /// (#11819): open count, target, level. OTLP-only. See
+            /// [`backlog_level`].
+            BacklogLevel = "backlog.level" => $crate::telemetry::kinds::backlog_level::BacklogLevelRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             // APPEND NEW KINDS ABOVE THIS LINE (one row; `gate:` stays
