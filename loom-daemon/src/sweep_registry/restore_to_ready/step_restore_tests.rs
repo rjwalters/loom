@@ -141,7 +141,11 @@ fn plan_holds_a_frozen_item_and_keeps_vetoes_and_advanced_items_forward() {
     use StepReleasePlan::{Nothing, RemoveClaim, Restore};
     let judge = StepRole::Judge;
     assert_eq!(plan_step_release(judge, &labels(&["loom:reviewing"]), Some(false)), Restore);
-    assert_eq!(plan_step_release(judge, &labels(&["loom:reviewing"]), None), Restore);
+    // A failed read never restores (#11921 review): at most the claim goes.
+    assert_eq!(plan_step_release(judge, &labels(&["loom:reviewing"]), None), RemoveClaim);
+    assert_eq!(plan_step_release(judge, &[], None), RemoveClaim);
+    // The claim is gone: the step finished, or a later role holds the item.
+    assert_eq!(plan_step_release(judge, &labels(&["loom:pr"]), Some(false)), Nothing);
     assert_eq!(
         plan_step_release(judge, &labels(&["loom:reviewing", "loom:frozen"]), Some(false)),
         Nothing
@@ -165,4 +169,103 @@ fn plan_holds_a_frozen_item_and_keeps_vetoes_and_advanced_items_forward() {
         RemoveClaim
     );
     assert_eq!(plan_step_release(StepRole::ChampionMerge, &[], Some(false)), Nothing);
+}
+
+/// A fake `gh` whose issue-signals read fails (rate-limited), recording calls.
+fn fake_gh_unreadable(dir: &Path) -> (PathBuf, PathBuf) {
+    let fake = dir.join("fake-gh.sh");
+    let log = dir.join("gh-calls.log");
+    let script = format!(
+        r#"#!/usr/bin/env bash
+printf '%s\n' "$*" >> "{log}"
+if [ "$1" = "api" ]; then
+  echo "HTTP 403: API rate limit exceeded" >&2
+  exit 1
+fi
+exit 0
+"#,
+        log = log.display(),
+    );
+    std::fs::write(&fake, script).unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (fake, log)
+}
+
+/// Run `role`'s release on `item` whose live labels are `labels` (`None`: the
+/// read fails), returning the release and the edits it made.
+fn release_with(role: StepRole, item: u32, labels: Option<&str>) -> (ClaimRelease, Vec<String>) {
+    let dir = tempfile::tempdir().unwrap();
+    let (gh, log) = match labels {
+        Some(l) => fake_gh(dir.path(), "open", l),
+        None => fake_gh_unreadable(dir.path()),
+    };
+    let registry = registry_with(&gh, dir.path());
+    let release = registry.restore_step_claim(item, role, "step-x").unwrap();
+    let edits = std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| l.contains(" edit "))
+        .map(str::to_string)
+        .collect();
+    (release, edits)
+}
+
+/// #11921 review: a Judge that exited 0 having written `loom:pr` must not get
+/// `loom:review-requested` back when the release read is rate-limited.
+#[test]
+#[serial_test::serial]
+fn a_finished_judge_with_a_failed_read_only_drops_its_own_claim() {
+    let (_, edits) = release_with(StepRole::Judge, 601, None);
+    assert_eq!(edits, vec!["pr edit 601 --remove-label loom:reviewing".to_string()]);
+}
+
+/// A Doctor that finished, then a Judge claimed: the Doctor's release writes
+/// nothing (no `loom:changes-requested` on a PR under review).
+#[test]
+#[serial_test::serial]
+fn a_doctor_release_after_a_judge_claimed_writes_nothing() {
+    let (release, edits) =
+        release_with(StepRole::Doctor, 602, Some(r#""loom:review-requested","loom:reviewing""#));
+    assert_eq!(release, ClaimRelease::Untouched);
+    assert!(edits.is_empty(), "{edits:?}");
+}
+
+/// A Judge that requested changes, then a Doctor claimed: nothing written.
+#[test]
+#[serial_test::serial]
+fn a_judge_release_after_a_doctor_claimed_writes_nothing() {
+    let (release, edits) =
+        release_with(StepRole::Judge, 603, Some(r#""loom:changes-requested","loom:treating""#));
+    assert_eq!(release, ClaimRelease::Untouched);
+    assert!(edits.is_empty(), "{edits:?}");
+}
+
+/// A Curator that finished, the issue promoted and a Builder claimed: no
+/// `loom:triage` beside `loom:building`.
+#[test]
+#[serial_test::serial]
+fn a_curator_release_after_a_builder_claimed_writes_nothing() {
+    let (release, edits) = release_with(StepRole::Curator, 604, Some(r#""loom:building""#));
+    assert_eq!(release, ClaimRelease::Untouched);
+    assert!(edits.is_empty(), "{edits:?}");
+}
+
+/// A Builder step that exited 0 (its PR opened, `loom:building` already moved
+/// on by the merge path or released): nothing written.
+#[test]
+#[serial_test::serial]
+fn a_finished_builder_step_writes_nothing() {
+    let (release, edits) = release_with(StepRole::Builder, 605, Some(r#""loom:curated""#));
+    assert_eq!(release, ClaimRelease::Untouched);
+    assert!(edits.is_empty(), "{edits:?}");
+}
+
+/// A Builder step whose issue cannot be read: no write at all, not even the
+/// claim (it may be the open-PR hold).
+#[test]
+#[serial_test::serial]
+fn a_builder_step_with_a_failed_read_writes_nothing() {
+    let (release, edits) = release_with(StepRole::Builder, 606, None);
+    assert_eq!(release, ClaimRelease::Untouched);
+    assert!(edits.is_empty(), "{edits:?}");
 }
