@@ -766,15 +766,26 @@ impl Drop for TraceEnvGuard {
 /// never drain one, so writing it would only leak files. The OTLP exporter is
 /// compiled unconditionally (#10700), so an exporting workspace always gets
 /// one, whatever `--features` the test binary was built with.
+///
+/// It writes two env groups, so it holds both locks the same way
+/// `host_identity_tests`' `env_test!` does: `loom_config_env` (outer, for
+/// `LOOM_CONFIG_DEFAULTS_FILE`) then the crate-default group (inner, for the
+/// observability overrides), then this module's own `env_lock`.
 #[test]
+#[serial_test::serial(loom_config_env)]
 fn a_journal_is_named_only_when_the_workspace_exports_traces() {
-    let _g = super::super::tests::env_lock();
-    let _env = TraceEnvGuard::hermetic();
-    let tmp = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(tmp.path().join(".loom")).unwrap();
-    assert_eq!(context().with_journal(tmp.path()).journal_dir, None);
-    std::fs::write(tmp.path().join(".loom/config.json"), TRACING_CONFIG).unwrap();
-    assert_eq!(context().with_journal(tmp.path()).journal_dir, Some(journal_dir(tmp.path())));
+    #[serial_test::serial]
+    fn inner() {
+        let _g = super::super::tests::env_lock();
+        let _env = TraceEnvGuard::hermetic();
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".loom")).unwrap();
+        assert_eq!(context().with_journal(tmp.path()).journal_dir, None);
+        std::fs::write(tmp.path().join(".loom/config.json"), TRACING_CONFIG).unwrap();
+        let want = Some(journal_dir(tmp.path()));
+        assert_eq!(context().with_journal(tmp.path()).journal_dir, want);
+    }
+    inner();
 }
 
 /// The proxy runs in the `worker` launcher, which registers no ops sink. A
