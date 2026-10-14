@@ -76,6 +76,8 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.dispatch.max_concurrent",
     // #11649: a held tick's distinct halt causes, comma-joined.
     "loom.dispatch.halt_causes",
+    // #11857: how many workspaces a hold gated this tick (`0` when none).
+    "loom.dispatch.held_roots",
     // ---- Telemetry mega PR A (Issues #8908, #8931) ----------------------
     // `loom.runtime.usage` (#8908): one execution's exact token breakdown.
     "loom.tokens.input",
