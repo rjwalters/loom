@@ -302,7 +302,8 @@ impl SweepRegistry {
 
             // #11429: a closed issue is refused as `already_landed`.
             // Lock-free (#9573): a forge REST read.
-            acc.unlocked(|r| r.refuse_closed_issue(issue_number))?;
+            let refusal = acc.unlocked(|r| r.closed_issue_refusal(issue_number));
+            acc.reg().apply_landed_refusal(issue_number, refusal)?;
         }
 
         // 2.6 Open-PR guard (Issue #4123). Every in-memory dedup signal — the
@@ -381,7 +382,8 @@ impl SweepRegistry {
         //     crash resume of the issue's own sweep is exempt.
         if resume_bypass_pr.is_none() {
             // Lock-free (#9573): `journal_repo_slug` may resolve the repo over `gh`.
-            acc.unlocked(|r| r.refuse_recent_landing(issue_number, Utc::now()))?;
+            let refusal = acc.unlocked(|r| r.recent_landing_refusal(issue_number, Utc::now()));
+            acc.reg().apply_landed_refusal(issue_number, refusal)?;
         }
 
         // 2.7 Park-label guard (Issue #4444). The work-finder's `SKIP_LABELS`
