@@ -2001,6 +2001,8 @@ mod pass_loop;
 /// sibling file per the file-size ratchet, attributed to `claim_reconciliation`
 /// in the #9251 forge-call accounting.
 mod building_listing;
+/// Keep `loom:building` on an issue whose PR is open (#11852).
+pub(crate) mod open_pr_hold;
 /// The ETag-cached REST open-PR listing the PR-side passes share (#10349).
 pub(crate) mod open_pr_listing;
 
@@ -2451,6 +2453,13 @@ pub mod forge {
             match crate::reclaim_pr_warning::reclaim_and_warn(gh_bin, root, issue_number) {
                 // #11743: a frozen skip wrote nothing — not a reclaim.
                 Ok(crate::reclaim_pr_warning::Reclaim::Frozen) => {}
+                // #11852: the claim stays while its PR is open; a later pass
+                // reclaims once the PR has closed unmerged.
+                Ok(crate::reclaim_pr_warning::Reclaim::HeldByOpenPr(pr)) => log::info!(
+                    "claim_reconciliation: keeping loom:building on #{issue_number} in {} — \
+                     its PR #{pr} is open ({reason:?}, {lease_evidence}) (#11852)",
+                    root.display(),
+                ),
                 Ok(crate::reclaim_pr_warning::Reclaim::Released) => {
                     reclaimed += 1;
                     // #4348 acceptance criterion: WARN-level, with the
