@@ -635,7 +635,7 @@ fn prompt_lease_gates_proceed_only_on_exit_0_or_2() {
         (
             "judge.md",
             include_str!("../../../../defaults/.claude/commands/loom/judge.md"),
-            9,
+            8,
         ),
         (
             "loom-doctor/SKILL.md",
@@ -645,7 +645,7 @@ fn prompt_lease_gates_proceed_only_on_exit_0_or_2() {
         (
             "loom-judge/SKILL.md",
             include_str!("../../../../defaults/.agents/skills/loom-judge/SKILL.md"),
-            9,
+            8,
         ),
     ];
     for (name, text, gates) in prompts {
