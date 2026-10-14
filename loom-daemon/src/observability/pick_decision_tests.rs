@@ -181,6 +181,32 @@ fn a_halted_skip_carries_only_a_closed_vocabulary_cause() {
         && k.disposition == Some(QueueDisposition::WorkspaceHalted)));
 }
 
+/// #11857: the outcome agrees with the tick result. A hold that covered the
+/// tick's work reads `halted`; one held root beside a healthy repo with
+/// candidates is a partial hold and the outcome follows the rows.
+#[test]
+fn a_partial_hold_is_not_a_halted_outcome() {
+    let mut s = summary(vec![
+        (1, QueueDisposition::WorkspaceHalted),
+        (2, QueueDisposition::OpenPr),
+    ]);
+    s.halted = true;
+    s.held_roots = 1;
+    s.halt_partial = true;
+    let r = work_finder_record(&s, "host-a", at(), at(), resolve);
+    assert_eq!(r.outcome, "none_dispatched");
+
+    s.queue.clear();
+    let r = work_finder_record(&s, "host-a", at(), at(), resolve);
+    assert_eq!(r.outcome, "idle");
+
+    // A full hold still reads `halted`, as does a pre-#11857 summary that
+    // carries no `halt_partial` (the old meaning of `halted`).
+    s.halt_partial = false;
+    let r = work_finder_record(&s, "host-a", at(), at(), resolve);
+    assert_eq!(r.outcome, "halted");
+}
+
 /// Role ticks have no work-finder disposition: the fields stay absent.
 #[test]
 fn a_role_skip_carries_no_disposition() {
