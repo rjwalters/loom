@@ -39,8 +39,10 @@
 //! match. Removing and re-adding the same label leaves the set — and the hold —
 //! unchanged: to force a re-review of an unchanged PR, push, or run the Judge
 //! with [`DISABLE_ENV`]`=0`. A pass whose head still has a check run in
-//! progress that started within [`PENDING_EXEMPT_HOURS`] is not recorded (CI
-//! settling changes neither head nor labels); a run stuck longer is.
+//! progress that started within [`PENDING_EXEMPT_HOURS`], or a legacy commit
+//! status pending that long, is not recorded (CI settling changes neither
+//! head nor labels); one stuck longer is. Every page of the head's check
+//! runs counts, up to [`MAX_CHECK_RUN_PAGES`] (#11903).
 //!
 //! Only trusted authors' records count (the caller filters): a record
 //! suppresses review, so an outsider must not be able to post one.
@@ -85,6 +87,66 @@ pub fn pending_exempts(started: &[String], now: DateTime<Utc>) -> bool {
         DateTime::parse_from_rfc3339(s.trim())
             .is_ok_and(|t| now - t.with_timezone(&Utc) < Duration::hours(PENDING_EXEMPT_HOURS))
     })
+}
+
+/// The page size of the check-run and commit-status reads (GitHub's max).
+pub const CI_PAGE: usize = 100;
+
+/// The most check-run pages one `checks_pending` reads (#11903). A head with
+/// more runs than this is read only this far; what is left unread counts as
+/// not pending, the same best-effort answer as an unreadable page.
+pub const MAX_CHECK_RUN_PAGES: usize = 5;
+
+/// The `started_at` stamps (empty when absent) of the check runs in one
+/// `commits/{sha}/check-runs` page that are not `completed`.
+#[must_use]
+pub fn pending_check_runs(page: &Value) -> Vec<String> {
+    page.get("check_runs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|r| r.get("status").and_then(Value::as_str) != Some("completed"))
+        .map(|r| stamp(r, "started_at"))
+        .collect()
+}
+
+/// The `created_at` stamps of the `pending` legacy statuses in a
+/// `commits/{sha}/status` (combined status) document. The combined `state`
+/// alone cannot be used: GitHub reports `pending` for a commit with no
+/// statuses at all, and it carries no age to bound the exemption by.
+#[must_use]
+pub fn pending_statuses(combined: &Value) -> Vec<String> {
+    combined
+        .get("statuses")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|s| s.get("state").and_then(Value::as_str) == Some("pending"))
+        .map(|s| stamp(s, "created_at"))
+        .collect()
+}
+
+fn stamp(v: &Value, key: &str) -> String {
+    v.get(key)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// How many check runs one page lists.
+#[must_use]
+pub fn check_runs_listed(page: &Value) -> usize {
+    page.get("check_runs")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len)
+}
+
+/// Whether another check-run page follows `page`, given `read` runs read so
+/// far: this page was full and its `total_count` says more remain.
+#[must_use]
+pub fn more_check_runs(page: &Value, read: usize) -> bool {
+    let total = page.get("total_count").and_then(Value::as_u64).unwrap_or(0);
+    check_runs_listed(page) == CI_PAGE && (read as u64) < total
 }
 
 /// The label whose presence means "still waiting for a Judge".
