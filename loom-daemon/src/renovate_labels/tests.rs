@@ -107,8 +107,8 @@ fn no_config_is_a_no_op_and_the_file_is_found_when_present() {
 }
 
 /// The regression guard on this repository. Renovate was retired here
-/// (#11792, Dependabot rendered from 2AMLogic/fleet-gitops
-/// dependency-updates.json, #11788), so the check finds no config and is a
+/// (#11792; Dependabot now renders from an org-wide policy file,
+/// #11788), so the check finds no config and is a
 /// clean no-op — and if a Renovate config is ever reintroduced, it must pass.
 /// The former `dependencyDashboard: false` guard (#9418 finding 1) applied to
 /// `renovate.json5` only and went with it.
