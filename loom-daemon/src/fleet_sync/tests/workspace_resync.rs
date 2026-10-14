@@ -1022,75 +1022,6 @@ fn the_source_repo_a_non_github_remote_and_an_uninstalled_repo_are_skipped() {
 }
 
 #[test]
-fn the_source_repo_gets_its_missing_dogfood_symlinks_and_stays_clean() {
-    let fx = Fixture::new(STALE);
-    let host = Host::new(&fx, "host-a");
-    let source = fx.clone_as("loom-source");
-    write(&source.join(".loom-source"), "");
-    write(&source.join("defaults/.claude/commands/loom/builder.md"), "x");
-    write(&source.join("defaults/.claude/agents/a.md"), "x");
-    // In the real source repo the dogfood paths are untracked (gitignored).
-    let _ = fs::remove_dir_all(source.join(".claude"));
-    for args in [
-        vec!["add", "-A", ".claude"],
-        vec![
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "commit",
-            "-qm",
-            "untrack",
-        ],
-    ] {
-        let st = Command::new("git")
-            .args(&args)
-            .current_dir(&source)
-            .status()
-            .unwrap();
-        assert!(st.success());
-    }
-    let exclude = source.join(".git/info/exclude");
-    let mut ex = fs::read_to_string(&exclude).unwrap_or_default();
-    ex.push_str(".loom-source\ndefaults/\n.claude/\n");
-    fs::write(&exclude, ex).unwrap();
-    let roots = [source.clone()];
-    for _ in 0..2 {
-        let pass = host.pass_over(&roots, Mode::Write, &|| Ok(()), None);
-        let w = &pass.workspaces[0];
-        assert_eq!(w.state, WState::Skipped);
-        assert_eq!(reason(w), "the Loom source repo installs from its own tree");
-        for link in [".claude/commands/loom", ".claude/agents"] {
-            let m = fs::symlink_metadata(source.join(link)).unwrap();
-            assert!(m.file_type().is_symlink(), "{link}");
-            assert!(source.join(link).is_dir(), "{link} resolves");
-        }
-    }
-    let status = Command::new("git")
-        .args(["status", "--porcelain"])
-        .current_dir(&source)
-        .output()
-        .unwrap();
-    let out = String::from_utf8_lossy(&status.stdout);
-    assert!(out.trim().is_empty(), "dirty: {out}");
-}
-
-#[test]
-fn the_source_repo_keeps_a_real_commands_dir_it_cannot_safely_replace() {
-    let fx = Fixture::new(STALE);
-    let host = Host::new(&fx, "host-a");
-    let source = fx.clone_as("loom-source");
-    write(&source.join(".loom-source"), "");
-    write(&source.join("defaults/.claude/commands/loom/builder.md"), "x");
-    write(&source.join(".claude/commands/loom/local-only.md"), "mine");
-    let roots = [source.clone()];
-    host.pass_over(&roots, Mode::Write, &|| Ok(()), None);
-    let dir = source.join(".claude/commands/loom");
-    assert!(!fs::symlink_metadata(&dir).unwrap().file_type().is_symlink());
-    assert_eq!(fs::read_to_string(dir.join("local-only.md")).unwrap(), "mine");
-}
-
-#[test]
 fn a_repo_this_host_may_not_write_is_reported_and_not_claimed() {
     let fx = Fixture::new(STALE);
     let host = Host::new(&fx, "host-a");
@@ -1238,6 +1169,7 @@ fn status_shows_each_workspace_and_an_old_snapshot_still_reads() {
 
 #[path = "workspace_resync_bounds.rs"]
 mod bounds;
+mod dogfood;
 #[path = "workspace_resync_heads.rs"]
 mod head_check;
 #[path = "workspace_resync_hold.rs"]
