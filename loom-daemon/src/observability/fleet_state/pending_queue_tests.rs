@@ -4,11 +4,12 @@ use std::collections::BTreeMap;
 
 use chrono::{TimeZone, Utc};
 
-use super::sources::is_eligible;
-use super::{
-    annotate_pending, decide, operator_held, Emitted, FleetHoldKind, FleetPrCensus,
-    FleetQueueDepth, FleetStage, FleetStateRow, FleetView, PlannerStamps, RepoView,
+use super::super::sources::is_eligible;
+use super::super::{
+    decide, Emitted, FleetHoldKind, FleetPrCensus, FleetQueueDepth, FleetStage, FleetStateRow,
+    FleetView, PlannerStamps, RepoView,
 };
+use super::{annotate_pending, operator_held};
 
 const REPO: &str = "acme/a";
 

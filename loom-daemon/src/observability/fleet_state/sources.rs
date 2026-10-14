@@ -265,22 +265,12 @@ fn curated_listing_with(
     root: &Path,
     repo: Option<&str>,
 ) -> anyhow::Result<BTreeMap<u32, Option<DateTime<Utc>>>> {
-    label_listing_with(gh, root, repo, super::outcomes::CURATED_LABEL)
+    label_listing_counted_with(gh, root, repo, super::outcomes::CURATED_LABEL)
+        .map(|(listing, _)| listing)
 }
 
-/// [`curated_listing_with`] for any issue label (`loom:triage`, #11398).
-///
-/// # Errors
-///
-/// As [`curated_listing_with`].
-fn label_listing_with(
-    gh: &Path,
-    root: &Path,
-    repo: Option<&str>,
-    label: &str,
-) -> anyhow::Result<BTreeMap<u32, Option<DateTime<Utc>>>> {
-    label_listing_counted_with(gh, root, repo, label).map(|(listing, _)| listing)
-}
+/// One repo's open `label` issues: number to creation instant.
+type LabelListing = BTreeMap<u32, Option<DateTime<Utc>>>;
 
 /// Labels that take an open issue out of the eligible pending queue (#11955):
 /// the skip/park holds and the proposal labels.
@@ -300,14 +290,19 @@ pub(super) fn is_eligible<S: AsRef<str>>(labels: &[S]) -> bool {
         .any(|l| INELIGIBLE_LABELS.contains(&l.as_ref()))
 }
 
-/// [`label_listing_with`] plus the count of listed issues that are eligible
-/// ([`is_eligible`]) for the pending queue depth (#11955).
+/// [`curated_listing_with`] for any issue label (`loom:triage`, #11398), plus
+/// the count of listed issues that are eligible ([`is_eligible`]) for the
+/// pending queue depth (#11955).
+///
+/// # Errors
+///
+/// As [`curated_listing_with`].
 fn label_listing_counted_with(
     gh: &Path,
     root: &Path,
     repo: Option<&str>,
     label: &str,
-) -> anyhow::Result<(BTreeMap<u32, Option<DateTime<Utc>>>, u32)> {
+) -> anyhow::Result<(LabelListing, u32)> {
     let items = crate::forge_listing::list_issues_cached_all_as(
         CALLER,
         gh,
