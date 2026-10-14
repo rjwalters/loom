@@ -42,6 +42,7 @@
 //! [`capture::capture`], a per-thread recorder (test builds only).
 
 pub mod build_gate;
+pub mod busy_slots;
 #[cfg(test)]
 pub mod capture;
 pub mod codex_session;
@@ -63,6 +64,7 @@ pub mod reader_spill;
 pub mod reader_withdrawal;
 pub mod redate_chain;
 pub mod stage_dwell;
+pub mod stage_queue;
 pub mod turnaround;
 
 use std::sync::{Arc, OnceLock};

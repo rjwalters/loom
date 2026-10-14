@@ -67,6 +67,7 @@ fn repo(listings: &[(&'static str, Vec<StageItem>)]) -> RepoInput {
         slug: "acme/app".into(),
         root: PathBuf::from("/w/app"),
         listings: STAGE_LABELS.iter().map(|l| (*l, Vec::new())).collect(),
+        queue: None,
     };
     for (label, items) in listings {
         input.listings.insert(label, items.clone());
@@ -271,7 +272,7 @@ fn a_captain_that_lost_a_repo_past_the_bound_baselines_it_instead_of_replaying()
 }
 
 #[test]
-fn points_are_delta_pairs_and_gauges_labelled_by_state_only() {
+fn points_are_delta_pairs_and_gauges_labelled_by_state_and_repo() {
     let samples = [
         DwellSample {
             stage: "created_to_curated",
@@ -291,15 +292,21 @@ fn points_are_delta_pairs_and_gauges_labelled_by_state_only() {
         &MetricPoint::int(MetricName::ForgeStageDwellSamples, 2)
             .label("state", "created_to_curated")
     ));
-    assert!(points
-        .contains(&MetricPoint::int(MetricName::ForgeStageItems, 2).label("state", "curated")));
-    assert!(points.contains(
-        &MetricPoint::int(MetricName::ForgeStageItems, 0).label("state", "review_requested")
-    ));
+    let items = |n, state: &str| {
+        MetricPoint::int(MetricName::ForgeStageItems, n)
+            .label("state", state)
+            .label("repo", "acme/app")
+    };
+    assert!(points.contains(&items(2, "curated")));
+    assert!(points.contains(&items(0, "review_requested")));
     for point in &points {
         assert_eq!(bounded_labels(&point.labels), point.labels);
-        assert!(point.labels.keys().all(|k| k == "state"));
+        assert!(point.labels.keys().all(|k| k == "state" || k == "repo"));
     }
+    // No completed open-items walk: the queue states are absent, not 0.
+    assert!(!points
+        .iter()
+        .any(|p| p.labels.get("state").is_some_and(|s| s == "triage")));
     assert!(stage_points(&[], &[]).is_empty(), "no repos listed: no gauges");
 }
 

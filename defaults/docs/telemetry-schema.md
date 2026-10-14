@@ -1719,7 +1719,8 @@ Every other name is a **`Gauge`**:
 | `loom.queue.listing_failed_repos` | count | every work-finder tick |
 | `loom.queue.listing_incomplete_repos` | count | every work-finder tick |
 | `loom.dispatch.idle_slots` | count | every work-finder tick with an occupancy reading |
-| `loom.forge.stage_items` (`state` = `curated`, `issue`, `building`, `review_requested`, `changes_requested`, `pr`) | count | `host.health` interval |
+| `loom.dispatch.busy_slots` (`role`), `loom.dispatch.role_max_concurrent`, `loom.dispatch.role_idle_slots` | count | every work-finder tick |
+| `loom.forge.stage_items` (`state`, `repo`; see below for the states) | count | `host.health` interval |
 
 `loom.queue.issues` (Issue #8852, phase 2) is the ready-queue depth. It has
 one point per queue disposition, labelled `state` (`running`, `ready`,
@@ -1775,15 +1776,19 @@ burn includes every guarded per-launch store under the native-tools state dir
 sweeps write (#11286). Delta counters start from the second sample.
 
 Worker turnaround and forge stage dwell (Issue #8929), per host (the
-resource `host.id`), never labelled by issue or repo:
+resource `host.id`), never labelled by issue; only `loom.forge.stage_items`
+carries a `repo` (#11847):
 
 | Metric | Kind | Unit | Labels | Meaning |
 |---|---|---|---|---|
 | `loom.dispatch.slot_turnaround`, `.samples` | delta `Sum` | `s`, `{slot}` | — | seconds from an issue sweep finishing (`sweep.global.completed`) to the next issue-sweep dispatch refilling the slot, FIFO; mean = ratio. Includes time with no work; the first dispatches after a restart have no freed slot to pair with and are not sampled |
 | `loom.dispatch.idle_slots` | `Gauge` | `{slot}` | — | `max_concurrent − occupancy` at the end of a tick |
 | `loom.dispatch.idle_slot_seconds` | delta `Sum` | `s` | — | `min(idle, waiting) × interval` for a tick that left ready work waiting (ramp cap, saturation brake, per-repo cap) with slots idle, held until the next tick and capped at 15 min |
+| `loom.dispatch.busy_slots` | `Gauge` | `{slot}` | `role` ∈ `sweep`, or a role-runner role (`champion`, `curator`, `judge`, `doctor`, `auditor`, `hermit`, `guide`, `architect`, or a configured role) | busy agent slots at the end of a tick (#11847). `sweep` is the tick's issue-sweep occupancy, the reading `idle_slots` comes from, so `busy_slots{role="sweep"} + idle_slots = max_concurrent` (more only while occupancy is over the cap). Each role is the role-runner agents in flight for it, all repos and lanes; every built-in role reports, `0` included |
+| `loom.dispatch.role_max_concurrent` | `Gauge` | `{slot}` | — | the role-runner agent ceiling: the largest `autonomous.roleRunner.maxConcurrent` (env tier first) among the tick's repos with the role runner enabled, `0` when none is |
+| `loom.dispatch.role_idle_slots` | `Gauge` | `{slot}` | — | `role_max_concurrent − Σ busy_slots{role≠"sweep"}`, floored at `0`. The host's agent capacity is `max_concurrent + role_max_concurrent` = `Σ busy_slots + idle_slots + role_idle_slots` |
 | `loom.forge.stage_dwell`, `.samples` | delta `Sum` | `s`, `{item}` | `state` ∈ `created_to_curated`, `curated_to_issue`, `building_to_review_requested`, `review_requested_to_merged` | time spent in a forge label stage the work finder never lists; mean = ratio |
-| `loom.forge.stage_items` | `Gauge` | `{item}` | `state` (the stage label) | open items under each stage label, over this host's repos |
+| `loom.forge.stage_items` | `Gauge` | `{item}` | `state`, `repo` (lowercase `owner/name`) | open items per repo, by state. The label states (`curated`, `issue`, `building`, `review_requested`, `changes_requested`, `pr`) count each stage label's first listing page. The queue states (#11847) come from one complete walk of the repo's open issues and PRs: `triage` (`loom:triage`), `unlabeled` (no `loom:` label), `curated_not_promoted` (`loom:curated` without `loom:issue` or `loom:building`), `issue_open_pr` / `issue_no_pr` (`loom:issue`, split by whether an open PR's body closes it), `parked` (a registry `park` label) and `pr_held` (**PRs** with a registry `hold` label, e.g. `loom:pr` under `loom:operator`). States overlap; they are not a partition, so summing across `state` double-counts. Since `repo` was added (#11847) a per-state host total is `sum by (state)` |
 
 The stage dwell reads the stage labels' listings with the ETag-cached REST
 listing (a `304` costs no rate limit) every 5 minutes, plus at most 8 per-item
@@ -1806,6 +1811,22 @@ samples it: sums scale with the host count, means do not. With
 while its published data is fresh, and a dispatcher samples it again only when
 that data goes stale (see "Fleet gauges produced by the captain" below).
 Completed sweeps' own phase durations remain the cycle-time rollup's (#8692).
+
+The queue states of `loom.forge.stage_items` (#11847,
+`observability/ops/stage_queue.rs`) cost one unfiltered open-items walk per
+repo per sample, through the same per-page ETag cache as the intake pass (an
+unchanged page is a free `304`). The walk is a deferrable read: when the
+readers are out of budget it is shed, not retried. A shed, failed or
+unfinished walk emits none of the queue states for that repo and sample, so a
+`0` is always a measured `0`; an absent series means "not measured". The
+issue/PR split reads only same-repo closing keywords (`Closes #N`, `Fixes #N`,
+`Resolves #N`) in open PR bodies. The busy-slot gauges count no PR-set sweep
+(`/loom:sweep --prs`, hand-dispatched), which is in neither pool. The role
+ceiling is re-read from the repos' configs at most every 5 minutes; it is the
+largest enabled repo's, while `loom-daemon status` shows the primary
+workspace's, so on a host whose repos disagree the two can differ. The sample's
+points are sent in records of at most 256 (`MAX_POINTS_PER_RECORD`), dwell
+pairs first, so a many-repo sample is never truncated.
 
 Merge-chain re-date pressure (Issue #10163, `observability/ops/redate_chain.rs`).
 These are `Gauge`s over a trailing 24 h window, sampled on the `host.health`
