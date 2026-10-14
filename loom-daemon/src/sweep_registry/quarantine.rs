@@ -56,7 +56,8 @@ pub const DEFAULT_QUARANTINE_TTL_SECS: u64 = 3600;
 /// within this many seconds of dispatch counts toward the insta-crash tally. A
 /// real build that reaches even the Curator checkpoint, or a slow death past this
 /// window, is a *different* failure mode (handled by the mid-build watchdog) and
-/// never counts here.
+/// never counts here. The #4485 ladder arms on a wider window
+/// ([`FAST_FAIL_WINDOW_SECS`](crate::sweep_registry::FAST_FAIL_WINDOW_SECS), #11854).
 pub const DEFAULT_QUARANTINE_INSTA_CRASH_SECS: i64 = 60;
 
 /// Env var overriding the quarantine-*release* retry ceiling (Issue #8953): the
@@ -154,10 +155,9 @@ pub const PREFLIGHT_PROBE_COOLDOWN_ENV: &str = "LOOM_PREFLIGHT_PROBE_COOLDOWN_SE
 /// new dispatch to the broken workspace but lets exactly one probe dispatch
 /// through per cooldown to test recovery (half-open) — since the advisory only
 /// clears after a dispatch *succeeds*, an unconditional hold would prevent the
-/// very dispatch needed to prove the break is fixed. 15 minutes matches
-/// [`DEFAULT_DISPATCH_BACKOFF_MAX_SECS`](crate::sweep_registry::DEFAULT_DISPATCH_BACKOFF_MAX_SECS),
-/// the ceiling of the per-issue backoff, so a still-broken workspace burns at
-/// most one ~1s pre-flight death per 15 minutes instead of one every tick.
+/// very dispatch needed to prove the break is fixed. 15 minutes (the per-issue
+/// backoff's ceiling until #11854 raised it), so a still-broken workspace burns
+/// at most one ~1s pre-flight death per 15 minutes instead of one every tick.
 pub const DEFAULT_PREFLIGHT_PROBE_COOLDOWN_SECS: u64 = 900;
 
 /// The recovery-probe gate decision for one workspace's dispatch admission
@@ -883,11 +883,13 @@ impl SweepRegistry {
         }
         if !insta_crash {
             // Progress or a clean/slow exit breaks the consecutive run. Leave any
-            // existing quarantine entry untouched — a quarantined issue is never
-            // dispatched, so it cannot reach here; this only clears the runway for
+            // existing quarantine entry untouched — this only clears the runway for
             // an issue that has NOT yet been quarantined. vibesql#6639: it also
-            // ends any probation — the breakage proved transient.
-            self.reset_insta_crash_run(issue);
+            // ends any probation — the breakage proved transient. #11854: the
+            // ladder can park on this same death, so keep its generation.
+            if !self.quarantined.contains_key(&issue) {
+                self.reset_insta_crash_run(issue);
+            }
             return;
         }
         // vibesql#6639: `threshold` is 1 while on probation (see
@@ -1040,35 +1042,6 @@ impl SweepRegistry {
     /// Every step is best-effort: a `gh` failure is logged at debug and never
     /// affects the load-bearing in-memory quarantine.
     pub(crate) fn apply_quarantine_label(&self, issue: u32, count: u32) {
-        if self.config.skip_label_flip {
-            return;
-        }
-        // Body park record first (#10161); a timeout stops here (park_hold.rs),
-        // and so does a `loom:frozen` issue (#11743).
-        if self.record_daemon_hold(issue, park_hold::QUARANTINE_HOLD_REASON)
-            != Ok(park_hold::HoldGate::Proceed)
-        {
-            return;
-        }
-        // Counted as `quarantine.*` (#10089); the facade scopes each call to
-        // the registry's workspace (#5401 GH_CONFIG_DIR). Bounded (Issue
-        // #3973): quarantine runs from `reap_once`, on the `ListSweeps` /
-        // `GetSweepStatus` read path.
-        let repo_flag = crate::claim_reconciliation::gh_call::loom_repo_flag();
-        let issue_arg = issue.to_string();
-        let mut edit = vec!["issue", "edit", &issue_arg, "--add-label", "loom:blocked"];
-        edit.extend(["--remove-label", "loom:issue"]);
-        edit.extend(repo_flag.iter().map(String::as_str));
-        let timeout = reap_gh_timeout();
-        match self.gh_write("quarantine.label", edit) {
-            Ok(Some(_)) => {}
-            Ok(None) => log::debug!(
-                "sweep_registry: quarantine label edit for #{issue} exceeded {}s, killed (#3973)",
-                timeout.as_secs()
-            ),
-            Err(e) => log::debug!("sweep_registry: quarantine label edit for #{issue} failed: {e}"),
-        }
-
         let body = format!(
             "{marker}: this issue's sweep insta-crashed {count} \
              times in a row — each child died within {secs}s of dispatch without writing a phase \
@@ -1086,16 +1059,8 @@ impl SweepRegistry {
             ttl = self.effective_quarantine_ttl(issue).as_secs(),
             escalation = self.quarantine_escalation_note(issue),
         );
-        let mut comment = vec!["issue", "comment", &issue_arg, "--body", &body];
-        comment.extend(repo_flag.iter().map(String::as_str));
-        match self.gh_write("quarantine.comment", comment) {
-            Ok(Some(_)) => {}
-            Ok(None) => log::debug!(
-                "sweep_registry: quarantine comment for #{issue} exceeded {}s, killed (#3973)",
-                timeout.as_secs()
-            ),
-            Err(e) => log::debug!("sweep_registry: quarantine comment for #{issue} failed: {e}"),
-        }
+        // The forge writes are shared with the #11854 fast-fail park.
+        self.write_quarantine_park(issue, &body);
     }
 
     /// Best-effort forge mutation on quarantine expiry/clear (#3939): remove

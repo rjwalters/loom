@@ -25,9 +25,11 @@ fn a_landed_cooldown_is_long_fleet_wide_and_suppresses_redispatch() {
     assert!(registry.dispatch_backoff_issues(now).contains(&11853));
     let remaining = registry.dispatch_backoff_remaining(11853, now).unwrap();
     assert!(remaining > Duration::from_secs(5 * 3600), "{remaining:?}");
+    // #11854: the ladder's `max` is now 6 h too, but every cause except a
+    // genuine fast failure stays at 900 s; the landed window is far longer.
     assert!(
-        remaining > registry.dispatch_backoff_config.max,
-        "longer than the #4485 ladder's ceiling"
+        remaining > super::super::backoff_cause::TRANSIENT_BACKOFF_CAP,
+        "longer than the #4485 ladder's transient cap"
     );
 
     let ad = rx.try_recv().expect("the window is broadcast");

@@ -840,7 +840,7 @@ by `sweep_id`, or could not be answered at all.
 
 | Field | Type | Source | Notes |
 |---|---|---|---|
-| `failure_class` | string | The paired `sweep_outcomes::OutcomeRecord`'s own classification for the same terminal transition: `death_class` when the pre-flight classifier derived one (`preflight-token-selection-failed`, `preflight-no-cli-start`, …), otherwise `crash_classification` (`account-exhausted:model-credits-exhausted`, `no-usable-account`, …). | Copied at emit time in the same function that writes the sibling record — never a post-hoc joiner. Lets a consumer separate real build failures from sub-60s spawn deaths from this journal alone. The sibling record still carries both classifier fields separately; this is the single most canonical label, not a replacement. Omitted entirely when nothing classified the transition — including on every success. |
+| `failure_class` | string | The paired `sweep_outcomes::OutcomeRecord`'s own classification for the same terminal transition: `death_class` when the pre-flight classifier derived one (`preflight-token-selection-failed`, `preflight-no-cli-start`, …), otherwise `crash_classification` (`account-exhausted:model-credits-exhausted`, `no-usable-account`, …). | Copied at emit time in the same function that writes the sibling record — never a post-hoc joiner. Lets a consumer separate real build failures from sub-60s spawn deaths from this journal alone. The sibling record still carries both classifier fields separately; this is the single most canonical label, not a replacement. When nothing classified the transition it is omitted on a success, and on a reported `failure` it is `unclassified:no-class` (#11854) — a `failure` never goes out without one. |
 | `no_phase_cause` | object `{ "exit": string, "last_step": string, "reason": string }` | Issue #10642. Present **only** when `failure_class` is the synthesized `unclassified:no-phase-signal`. `exit` is the orchestrator's exit code as a decimal string, or `none_observed`; `last_step` is the last checkpoint phase (`curator`…`merge`, else `other`), or — with none — `cli_started` / `pre_cli` from this dispatch's log, or `none` when the log could not be read; `reason` is one of `killed_or_exit_unobserved`, `clean_exit_without_checkpoint`, `nonzero_exit_without_checkpoint`, `died_before_cli_start`, `log_unreadable`. | Closed vocabularies, so each field can be grouped on. Also emitted as `loom.no_phase.exit` / `loom.no_phase.last_step` / `loom.no_phase.reason` on the `loom.sweep` span and the `sweep.outcome` OTLP log record. Additive; no `schema_version` bump. The same class is counted toward the PR-less retry hold from this journal (see `daemon-reference.md`, "Phaseless deaths have a durable floor"). |
 | `models_used` | string array | The distinct `model` ids in `tokens_by_model`, sorted and deduped. | The top-level "did this sweep run more than one model?" signal. Since #9465 `model` names the **dominant** model that actually ran (the largest input+output row in `tokens_by_model`, dispatched model as fallback), so a sweep that escalated to `claude-opus-5` through the Doctor ladder reports `model: "claude-opus-5"` with `config["arm"]` still carrying the dispatch-time arm — `models_used` is what shows that the *earlier* phases ran something else. Inherits `tokens_by_model`'s contract exactly: omitted (never `[]`) when no attributable transcript was found. |
 | `doctor_cycles` | integer | **The forge label timeline** of the PR named by this record's own `pr_number` (Issue #8222 — re-sourced; the #8056 shipment counted sampled checkpoint markers instead): one cycle per `loom:changes-requested` arrival that a later `loom:review-requested` arrival closed the loop on. | A rejection nobody handed back (the sweep hit the Doctor-cycle cap, or died) is **not** a cycle. Because the label events are durable forge state rather than a ~30s sample, a cycle that opens and closes between two reaper ticks is still counted: this is a certified count, **not** the lower-bound proxy it was under #8056. `0` means "the timeline was read and no Doctor cycle completed"; an **absent** key means the timeline was not read at all. |
@@ -983,7 +983,9 @@ the signal space) and on assembled records in
    overwritten by a synthesized one, and the `unclassified:` prefix is what
    keeps the two tellable apart. Phase names in a synthesized label are folded
    to the closed `curator|builder|judge|doctor|merge|other` vocabulary, so the
-   cardinality stays bounded.
+   cardinality stays bounded. Since #11854 every reported `failure` carries a
+   class whatever its disposition (`landed`, `curator_closed`, …): one no
+   classifier labelled gets `unclassified:no-class`.
 
 **Derived, not newly instrumented.** The classifier is a pure function of
 signals this record already carries — `result`, `pr_number`, `phase_durations`,
@@ -3784,7 +3786,10 @@ Doctor fixed, keeps `failure`, so `landed` + `failure` still names the PRs
 that needed rework or did not make it. The collector's live path reads no
 Judge verdicts, so its `landed` failures stay `failure`. `failure_class` keeps
 what the classifier saw, the paired `sweep.completed` keeps the process
-result, and the opt-in issue write-back still keys on the process result.
+result, and the opt-in issue write-back still keys on the process result. A
+`landed` failure no classifier labelled carries `unclassified:no-class`
+(#11854); it is added after this decision, so it never turns a clean landing
+into a `failure`.
 
 An *unobservable* exit status (a reconstructed entry reaped via `kill(pid, 0)`,
 which yields no code) is deliberately a `failure`, not a `success`: absence of

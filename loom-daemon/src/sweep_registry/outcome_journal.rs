@@ -977,6 +977,8 @@ impl SweepRegistry {
                 .map(ParkKind::failure_class),
             exit_code == Some(0),
         );
+        // Issue #11854: a reported `failure` never goes out without a class.
+        let failure_class = telemetry::ensure_failure_class(reported_result, failure_class);
         let process_result = result;
         let result = reported_result;
 
