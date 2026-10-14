@@ -1471,11 +1471,16 @@ fn render_in_flight_table(report: &DaemonStatusReport) -> String {
         let _ = writeln!(out, "  {:-<100}", "");
         for s in &report.in_flight {
             let issue = match &s.kind {
-                SweepKind::Issue(n) => format!("#{n}"),
+                SweepKind::Issue(n) | SweepKind::Step { item: n, .. } => format!("#{n}"),
                 SweepKind::PrSet(_) => "prs".to_string(),
             };
             let repo = format_repo_column(s.repo.as_deref());
-            let mut phase = s.latest_phase.as_deref().unwrap_or("-").to_string();
+            // A step has no sweep phases; its role is its phase (#11898).
+            let fallback = s
+                .kind
+                .role()
+                .map_or("-", loom_daemon::step_role::StepRole::as_str);
+            let mut phase = s.latest_phase.as_deref().unwrap_or(fallback).to_string();
             if s.overflow {
                 // #9244: the host's single over-limit starred sweep.
                 phase.push_str(" [overflow]");

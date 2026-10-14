@@ -57,10 +57,18 @@ pub const MAX_FREED: usize = 64;
 pub const MAX_HOLD_SECS: i64 = 15 * 60;
 
 /// Whether `sweep_id` names an issue sweep (`sweep-issue-<N>-…`, including
-/// the `-recovered-` form), the kind that occupies work-finder slots.
+/// the `-recovered-` form).
 #[must_use]
 pub fn is_issue_sweep(sweep_id: &str) -> bool {
     sweep_id.starts_with("sweep-issue-")
+}
+
+/// Whether `sweep_id` occupies a work-finder slot: an issue sweep, or a step
+/// (`step-<role>-<N>-…`, #11898), which draws from the same
+/// `workFinder.maxConcurrent` (design #11894 §4.4).
+#[must_use]
+pub fn occupies_work_finder_slot(sweep_id: &str) -> bool {
+    is_issue_sweep(sweep_id) || sweep_id.starts_with("step-")
 }
 
 /// FIFO of freed issue-sweep slots.
@@ -74,7 +82,7 @@ impl SlotLedger {
     /// seconds when the event refilled a freed slot.
     pub fn observe(&mut self, event: &Event, now: DateTime<Utc>) -> Option<i64> {
         match event {
-            Event::SweepGlobalCompleted { sweep_id, .. } if is_issue_sweep(sweep_id) => {
+            Event::SweepGlobalCompleted { sweep_id, .. } if occupies_work_finder_slot(sweep_id) => {
                 if self.freed.len() == MAX_FREED {
                     self.freed.pop_front();
                 }
@@ -82,7 +90,7 @@ impl SlotLedger {
                 None
             }
             Event::SweepGlobalDispatch {
-                kind: SweepKind::Issue(_),
+                kind: SweepKind::Issue(_) | SweepKind::Step { .. },
                 ..
             } => self
                 .freed
@@ -134,6 +142,9 @@ impl TurnoverLedger {
     /// event freed a slot and the pool stayed busy since the previous one.
     pub fn observe(&mut self, event: &Event, now: DateTime<Utc>) -> Option<Turnover> {
         match event {
+            // ETA's `ready_wait` is the Builder queue's: an issue sweep's slot.
+            // A step's slot is not (#11898); the step engine's own wait is the
+            // shadow comparison's (`loom.draw.expected_wait_s`, C15g).
             Event::SweepGlobalDispatch {
                 sweep_id,
                 kind: SweepKind::Issue(_),
