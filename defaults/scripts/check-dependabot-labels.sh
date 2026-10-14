@@ -21,6 +21,8 @@
 # FAILS under GitHub Actions and is skipped with a note elsewhere.
 #
 # Exit codes: 0 = ok (or nothing to check); 1 = a coverage/label problem.
+#
+# requires-daemon: check-dependabot-labels >= 0.19.1154   #11816/#11828 — the native checker; a binary predating it fails this check under GitHub Actions and is skipped with a note elsewhere.
 
 set -euo pipefail
 
