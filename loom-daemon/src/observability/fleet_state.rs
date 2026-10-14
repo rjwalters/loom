@@ -983,20 +983,30 @@ static STATE: Mutex<PassState> = Mutex::new(PassState {
     },
 });
 
+/// The workspace handles `record_outcomes` reads the forge and journal through.
+struct OutcomeContext<'a> {
+    workspace_root: &'a Path,
+    workspace_pool: &'a crate::workspace_pool::WorkspacePool,
+    slug_cache: &'a mut std::collections::HashMap<String, String>,
+}
+
 /// Date `view`'s rows from the forge (#11391), emit this pass's outcome
 /// facts and remember the pass for the next diff, and return the enriched
 /// view. The forge reads run off the event loop; `view` comes back as given
 /// when they fail.
 async fn record_outcomes(
-    workspace_root: &Path,
+    ctx: OutcomeContext<'_>,
     sink: &FleetStateSink,
     input: &FleetInput,
     (curated, triage): (outcomes::Curated, outcomes::Curated),
     view: FleetView,
     now: DateTime<Utc>,
-    workspace_pool: &crate::workspace_pool::WorkspacePool,
-    slug_cache: &mut std::collections::HashMap<String, String>,
 ) -> FleetView {
+    let OutcomeContext {
+        workspace_root,
+        workspace_pool,
+        slug_cache,
+    } = ctx;
     let (mut memory, mut enrich_memory) = {
         let state = STATE
             .lock()
@@ -1006,7 +1016,8 @@ async fn record_outcomes(
     // #11954: reload the persisted `pre_ready_done` once per process, before
     // the first diff, so a restart does not re-emit already-emitted exits.
     let journal = pre_ready_journal::path(workspace_root);
-    if !JOURNAL_LOADED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+    let loaded_now = !JOURNAL_LOADED.swap(true, std::sync::atomic::Ordering::SeqCst);
+    if loaded_now {
         let loaded = pre_ready_journal::load(&journal, now);
         memory.pre_ready_done.extend(loaded);
     }
@@ -1047,6 +1058,10 @@ async fn record_outcomes(
         Ok(done) => done,
         Err(join_error) => {
             log::warn!("fleet.state: outcome diff panicked: {join_error}");
+            // The loaded entries never reached STATE; reload on the next pass.
+            if loaded_now {
+                JOURNAL_LOADED.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
             return original;
         }
     };
@@ -1126,14 +1141,16 @@ pub(super) async fn record(
         .clone();
     let view = build_view(&input, state.prev.as_ref(), now);
     let mut view = record_outcomes(
-        workspace_root,
+        OutcomeContext {
+            workspace_root,
+            workspace_pool,
+            slug_cache,
+        },
         sink,
         &input,
         (curated, triage),
         view,
         now,
-        workspace_pool,
-        slug_cache,
     )
     .await;
     {
