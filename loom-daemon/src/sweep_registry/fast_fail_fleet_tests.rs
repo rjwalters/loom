@@ -99,8 +99,111 @@ fn progress_clears_the_fleet_streak() {
     let dir = tempdir().unwrap();
     let (reg, view) = fleet_registry(dir.path());
     peer_backoff(&reg, &view, "host-a", 76, 2);
-    reg.clear_peer_fast_fail_streaks(76);
+    reg.break_fleet_fast_fail_streak(76);
     assert_eq!(reg.peer_fast_failure_streak(76), 0);
+}
+
+/// Carry every ad the channel holds into `to`'s view, as the room would,
+/// under the sender name `as_host` and the receiving repo's slug (the two test
+/// registries have distinct temp roots).
+fn relay_as_repo(
+    rx: &mut tokio::sync::mpsc::Receiver<ClaimAd>,
+    to: &Mutex<PeerClaimView>,
+    as_host: &str,
+    repo: &str,
+) {
+    while let Ok(mut ad) = rx.try_recv() {
+        ad.host = as_host.into();
+        ad.repo = repo.into();
+        to.lock()
+            .unwrap()
+            .observe_dispatch_backoff_at(&ad, Instant::now());
+    }
+}
+
+/// Host A fast-fails twice, then makes real progress; its break reaches B, so
+/// one fast failure on B is the first of a new streak, not the third.
+#[test]
+fn progress_on_one_host_stops_a_peer_parking_on_stale_counts() {
+    let dir_a = tempdir().unwrap();
+    let dir_b = tempdir().unwrap();
+    let mut a = registry(dir_a.path());
+    let (mut b, b_view) = fleet_registry(dir_b.path());
+    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+    a.set_peer_claim_publisher(tx);
+    let repo_b = peer_claims::repo_slug(&b.config().workspace_root);
+
+    a.charge_fast_failure("s", 80, "exit-1", false);
+    a.charge_fast_failure("t", 80, "exit-1", false);
+    relay_as_repo(&mut rx, &b_view, "host-a", &repo_b);
+    assert_eq!(b.peer_fast_failure_streak(80), 2);
+
+    // A's dispatch makes real progress.
+    a.break_fleet_fast_fail_streak(80);
+    relay_as_repo(&mut rx, &b_view, "host-a", &repo_b);
+    assert_eq!(b.peer_fast_failure_streak(80), 0);
+
+    b.charge_fast_failure("u", 80, "exit-1", false);
+    assert!(!b.is_quarantined(80), "1 failure since the break is not 3 in a row");
+}
+
+/// The break clears every peer's entry, not only the sender's: `A:2, C:1` on B
+/// is nothing after A's progress.
+#[test]
+fn a_break_clears_every_hosts_count() {
+    let dir = tempdir().unwrap();
+    let (b, view) = fleet_registry(dir.path());
+    let repo = peer_claims::repo_slug(&b.config().workspace_root);
+    peer_backoff(&b, &view, "host-a", 81, 2);
+    peer_backoff(&b, &view, "host-c", 81, 1);
+    assert_eq!(b.peer_fast_failure_streak(81), 3);
+    let brk = ClaimAd::dispatch_backoff_armed(81, repo, "host-a".into(), 1, "ts".into(), 0)
+        .with_fast_fail_streak(0);
+    view.lock()
+        .unwrap()
+        .observe_dispatch_backoff_at(&brk, Instant::now());
+    assert_eq!(b.peer_fast_failure_streak(81), 0);
+}
+
+/// A zero streak on a positive window (a transient cause) still breaks only
+/// the sender's own entry.
+#[test]
+fn a_transient_zero_breaks_only_the_senders_count() {
+    let dir = tempdir().unwrap();
+    let (b, view) = fleet_registry(dir.path());
+    peer_backoff(&b, &view, "host-a", 82, 2);
+    peer_backoff(&b, &view, "host-c", 82, 1);
+    peer_backoff(&b, &view, "host-a", 82, 0);
+    assert_eq!(b.peer_fast_failure_streak(82), 1);
+}
+
+/// An operator's `quarantine clear` resets the tally on the clearing host and
+/// its peers, so the cleared issue gets a full three strikes, not one.
+#[test]
+fn quarantine_clear_resets_the_fleet_streak() {
+    let dir_a = tempdir().unwrap();
+    let dir_b = tempdir().unwrap();
+    let (mut a, a_view) = fleet_registry(dir_a.path());
+    let (mut b, b_view) = fleet_registry(dir_b.path());
+    let (tx, mut rx_b) = tokio::sync::mpsc::channel(16);
+    b.set_peer_claim_publisher(tx);
+    let repo_a = peer_claims::repo_slug(&a.config().workspace_root);
+    // Park from B:1 + peers A:1, C:1, seen on B.
+    peer_backoff(&b, &b_view, "host-a", 83, 1);
+    peer_backoff(&b, &b_view, "host-c", 83, 1);
+    b.charge_fast_failure("s", 83, "exit-1", false);
+    assert!(b.is_quarantined(83));
+    // A saw B's streak too.
+    peer_backoff(&a, &a_view, "host-b", 83, 1);
+
+    assert!(b.clear_quarantine(83));
+    assert_eq!(b.peer_fast_failure_streak(83), 0, "the clearing host forgets the peers");
+    relay_as_repo(&mut rx_b, &a_view, "host-b", &repo_a);
+    assert_eq!(a.peer_fast_failure_streak(83), 0, "and the peers forget it");
+
+    b.charge_fast_failure("t", 83, "exit-1", false);
+    assert!(!b.is_quarantined(83), "the first failure after a clear is one strike");
+    let _ = &mut a;
 }
 
 /// The forge's view of a park `reg` just set, as the startup pass reads it.

@@ -81,17 +81,32 @@ impl SweepRegistry {
             .saturating_add(self.peer_fast_failure_streak(issue))
     }
 
-    /// Forget the peers' fast-failure streaks on `issue` (Issue #11930): it
-    /// just made real progress here, which breaks the fleet's streak too.
-    pub(crate) fn clear_peer_fast_fail_streaks(&self, issue: u32) {
+    /// Break the fleet's fast-failure streak on `issue` (Issue #11930): it
+    /// just made real progress, or an operator cleared its park. Forgets every
+    /// peer's count here and, when there was anything to break, tells the
+    /// peers to do the same by publishing a zero window with a zero streak
+    /// (`peer_claims::fast_fail_tally` reads that as a break of **every**
+    /// host's entry). Call it *before* the local backoff record is cleared,
+    /// since that record is where this host's own streak lives.
+    pub(crate) fn break_fleet_fast_fail_streak(&self, issue: u32) {
+        let had_local = self.fast_failure_streak(issue) > 0;
+        let had_peers = self.clear_peer_fast_fail_streaks(issue);
+        if had_local || had_peers {
+            self.publish_dispatch_backoff_claim(issue, Duration::ZERO, 0);
+        }
+    }
+
+    /// Forget the peers' fast-failure streaks on `issue`. Returns whether any
+    /// existed.
+    fn clear_peer_fast_fail_streaks(&self, issue: u32) -> bool {
         let Some(view) = &self.peer_claims else {
-            return;
+            return false;
         };
         let repo = peer_claims::repo_slug(&self.config.workspace_root);
         match view.lock() {
             Ok(mut v) => v.clear_fast_fail_streaks(&repo, issue),
             Err(poisoned) => poisoned.into_inner().clear_fast_fail_streaks(&repo, issue),
-        };
+        }
     }
 
     /// Rebuild the in-memory quarantine for every park the startup

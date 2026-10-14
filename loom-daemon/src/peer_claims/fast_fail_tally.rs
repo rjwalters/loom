@@ -27,6 +27,19 @@
 //! - an ad without a count (an older peer, or the landed cooldown's window)
 //!   leaves the tally alone.
 //!
+//! # Breaking the streak
+//!
+//! The streak is *consecutive across the fleet*, so anything that breaks it on
+//! one host must break it on all of them. Real progress on an issue, and an
+//! operator's `quarantine clear`, therefore publish a **break**: a
+//! `DispatchBackoffArmed` ad with a zero window and a zero streak
+//! (`SweepRegistry::break_fleet_fast_fail_streak`). A receiver drops **every**
+//! host's entry for the issue, not only the sender's, so a peer holding
+//! `A:2, C:1` is left with nothing after A's progress. A zero streak on a
+//! positive window is a different thing (a transient cause) and still breaks
+//! only the sender's own entry. An older receiver reads the zero window as a
+//! window clear, which is also right after progress.
+//!
 //! # The streak's clock
 //!
 //! A peer's count is read against the reader's own ladder `max`, measured
@@ -72,12 +85,16 @@ impl PeerClaimView {
         let Some(streak) = ad.consecutive else {
             return false;
         };
+        let unresolved = ad.host == crate::sweep_registry::UNKNOWN_HOST;
+        // A break (see the module docs): a zero streak on a zero window can only
+        // come from `break_fleet_fast_fail_streak`, since a ladder window is
+        // always positive. Drop every host's entry, not just the sender's. An
+        // unresolved sender may be our own echo, so it never breaks anything.
+        if streak == 0 && ad.remaining_secs.unwrap_or(0) == 0 && !unresolved {
+            return self.clear_fast_fail_streaks(&ad.repo, ad.issue);
+        }
         // An unresolved sender may be our own echo: count it as nothing (#9518).
-        let streak = if ad.host == crate::sweep_registry::UNKNOWN_HOST {
-            0
-        } else {
-            streak
-        };
+        let streak = if unresolved { 0 } else { streak };
         let key = (ad.repo.clone(), ad.issue, ad.host.clone());
         if streak == 0 {
             return self.fast_fail_streaks.remove(&key).is_some();

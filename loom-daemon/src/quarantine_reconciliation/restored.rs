@@ -27,6 +27,13 @@
 //! The TTL used is the workspace's base quarantine TTL. The forge does not
 //! record an escalated generation (vibesql#6639), so a restarted host serves
 //! a relapse park for the base TTL, never for less.
+//!
+//! Every host that restarted inside the TTL holds its own in-memory gate. A
+//! manual `loom:blocked` flip, or a `quarantine clear` on one host, does not
+//! lift the others' gates: they skip the issue until the base TTL, and each
+//! writes its own `quarantine.release` then. That is bounded by the base TTL
+//! and matches the documented "a manual flip does not release the in-memory
+//! quarantine" behaviour.
 
 use super::{decide, BlockedIssue, ReconcileAction};
 use chrono::{DateTime, Utc};

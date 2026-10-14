@@ -1241,9 +1241,10 @@ impl SweepRegistry {
                             // single retry, and arming a window there would risk
                             // burning that one retry on a refusal.
                             if checkpoint_progress {
+                                // #11930: progress breaks the fleet's streak (first:
+                                // the local streak lives in the record cleared next).
+                                self.break_fleet_fast_fail_streak(issue);
                                 self.clear_dispatch_backoff(issue);
-                                // #11930: progress breaks the fleet's streak.
-                                self.clear_peer_fast_fail_streaks(issue);
                                 // #6670: real progress is conclusive proof the
                                 // candidate is no longer a no-op — clear any
                                 // armed cooldown so a since-cleared window
