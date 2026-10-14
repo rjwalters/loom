@@ -11,7 +11,7 @@ Support roles stop running on fixed intervals for item work, and the daemon stop
 
 This is a repo-local design doc under `docs/design/`. It is never installed into consumer repos. The format follows [`persistence-inventory.md`](persistence-inventory.md).
 
-**Source SHA.** Every citation is against `f7db31796` (`main`, 2026-10-14). Paths without a prefix are under `loom-daemon/src/`.
+**Source SHA.** Every citation is against `7e6e346e1` (`main`, 2026-10-14). Paths without a prefix are under `loom-daemon/src/`. Paths under `defaults/`, `docs/` and `mcp-loom/` are written in full.
 
 **Contents**
 
@@ -49,7 +49,7 @@ These were ruled 2026-10-13/14 and are not reopened here.
 
 ## 2. Problem
 
-The finder lists only `loom:issue` (`work_finder/forge.rs:167-174`) and spawns `/loom:sweep` (`sweep_registry/spawn_process.rs:122-136`). Support roles run on fixed role-runner intervals, under their own ceiling.
+The finder lists only `loom:issue` (`work_finder/forge.rs:183`) and spawns `/loom:sweep` (`sweep_registry/spawn_process.rs:122-136`). Support roles run on fixed role-runner intervals, under their own ceiling.
 
 Measured on a multi-host fleet on 2026-10-13/14:
 
@@ -78,13 +78,13 @@ The design builds on these and must not duplicate them.
 | Workspace draw | `work_finder/workspace_draw.rs` (#11103) | v1 is seeded `(minute, host)` (`:268-275`) |
 | Targeted roles and outcome classes | #11868, `defaults/docs/targeted-role-invocation.md:85-137` | `verdict \| noop \| refused \| failed` plus reason tokens; `LOOM_STEP_OUTCOME` is unread (`:169-171`) |
 | Targeted Champion, non-item mode | #11871, `defaults/docs/champion-targeted.md`, `role_runner/champion_mode.rs` | `autonomous.roleRunner.championMode: "non-item"` |
-| Queue-depth and slot gauges | #11874 | `loom.forge.stage_items{repo,state}` (`observability/ops/stage_queue.rs:26-55`), `loom.dispatch.busy_slots{role}` (`busy_slots.rs`) |
+| Queue-depth and slot gauges | #11874 | `loom.forge.stage_items{repo,state}` (`observability/ops/stage_queue.rs:26-55`), `loom.dispatch.busy_slots{role}` (`observability/ops/busy_slots.rs`) |
 | Role telemetry | #11877 | `loom.repo` and trace on role rows, Curator listing journal, `role_tick.outcome` |
-| Landed cooldown, fast-fail ladder | #11875, #11872 | `sweep_registry/dispatch/landed_cooldown.rs`; `fast_fail_park.rs` |
-| Release veto | #11876 | Default off: `LOOM_RELEASE_OPEN_PR_VETO` (`restore_to_ready.rs:36-38`) |
+| Landed cooldown, fast-fail ladder | #11875, #11872 | `sweep_registry/dispatch/landed_cooldown.rs`; `sweep_registry/fast_fail_park.rs` |
+| Open-PR release hold | #11876, `4809ef7ed` | **On by default.** On a verified open linked PR a release writes no label, so the issue keeps `loom:building` while its PR is open (`ClaimRelease::HeldByOpenPr`, `sweep_registry/restore_to_ready.rs`). `LOOM_RELEASE_OPEN_PR_VETO=0` switches it off. |
 | Discovery mirror seam | #11845 | `forge_mirror/discovery.rs:36-42, :215-247`: single-label listings for `WorkFinder` and `StageDwell`, with REST fallback |
-| Shared ETag all-open walk | `forge_listing::list_open_issues_cached_all_as` (`:248`) | Used by `stage_queue.rs:111` and the intake singleton |
-| Merge-queue handoff | #9978 A/B, `forge_merge_queue/` | `QUEUE_EXECUTION_ENABLED = false` (`mod.rs:69`); Champion `--pr` calls `forge merge-queue step` first |
+| Shared ETag all-open walk | `forge_listing::list_open_issues_cached_all_as` (`:248`) | Used by `observability/ops/stage_queue.rs:115` and the intake singleton |
+| Merge-queue handoff | #9978 A/B, `forge_merge_queue/` | `QUEUE_EXECUTION_ENABLED = false` (`forge_merge_queue/mod.rs:69`). Champion calls `forge merge-queue step` before every merge (#10256 B3) |
 
 ## 4. The model
 
@@ -118,7 +118,7 @@ Notes on the table:
 2. **Draw a workspace** with the existing workspace draw. Workspace holds, including maintain-only, keep the root out.
 3. **Draw an item** with weight `actionable × priority × age`:
    - **`actionable` ∈ {0, 1}.** Set to 0 for each "none" row in §4.1, and for a Builder step in a repo whose build backoff is engaged. Red-main fixes are exempt (`work_finder/build_backoff.rs:594`).
-   - **`priority`:** red-main ×50, `loom:very-important` ×8, `loom:important` ×3. The `vi_cap` demotion (`vi_cap.rs:1-24`) runs over the whole item list first.
+   - **`priority`:** red-main ×50, `loom:very-important` ×8, `loom:important` ×3. The `vi_cap` demotion (`work_finder/vi_cap.rs:1-24`) runs over the whole item list first.
    - **`age`** = `1 + min(stage_age_days, 90) / 30`.
    - **Seed:** `loom-draw/v2` = `sha256("loom-draw/v2:"+minute+":"+host+":"+tick_counter+":"+workspace+":"+draw_index)`. Draws are without replacement and replayable from `pick.decision`.
    - The weights are numeric hyperparameters in the strict block.
@@ -128,7 +128,7 @@ Notes on the table:
 ### 4.3 Stage-entry time
 
 The stage-entry provider is a three-source adapter, tried in order:
-1. the mirror's per-item `labels_at`, carried through `MirrorItem` (`forge_mirror/client.rs:127-152`);
+1. the mirror's per-item `labels_at`. The github-events mirror serves it, but `MirrorItem` (`forge_mirror/client.rs:127-152`) does not carry it yet; #11897 adds it;
 2. REST `issues/{n}/events`, with its own budget and a persisted cache;
 3. `created_at`.
 
@@ -137,7 +137,7 @@ The stage-entry provider is a three-source adapter, tried in order:
 ### 4.4 Slots and spawn
 
 - **Slots.** Roots with `stepDispatch: on` draw steps from `workFinder.maxConcurrent`. Other roots keep the role-runner ceiling until the two budgets merge (§10, last phase).
-- **Resolvers.** A step uses the role runner's resolvers for its role (`role_runner/model_resolution.rs:71, :160`) and admits against the pool of the resolved runtime. Only Builder steps keep the per-issue experiment arm (`sweep_registry/model_dispatch.rs:77-95`).
+- **Resolvers.** A step uses the role runner's resolvers for its role (`role_runner/model_resolution.rs:71, :160`) and admits against the pool of the resolved runtime. Only Builder steps keep the per-issue experiment arm (`sweep_registry/model_dispatch.rs:64-66`).
 - **Capture.** A step keeps the role-tick capture from #11877.
 - **Registry.** Steps run in the sweep registry as `SweepKind::Step { item, role }` (`types.rs:945-952`). Every consumer that matches on `SweepKind` becomes exhaustive. Today about twenty sites drop any non-`Issue` kind, including occupancy (`sweep_registry/watchdog.rs`), `busy_slots.rs:25-27`, roll pause and resume, the fleet-state feed and telemetry identity.
 
@@ -161,7 +161,7 @@ The stage-entry provider is a three-source adapter, tried in order:
 | `loom:reviewing` | `loom:review-requested` |
 | `loom:treating` | `loom:changes-requested` |
 
-The Builder restore checks the item join for an open PR. It does not depend on the default-off release veto.
+A Builder restore with a verified open linked PR writes no label: the issue keeps `loom:building` while its PR is open, through the existing open-PR release hold (`ClaimRelease::HeldByOpenPr`). The item join then classifies the item by its PR.
 
 **Outcome ledger.** The ledger consumes #11868's classes.
 
@@ -172,12 +172,12 @@ The Builder restore checks the item join for an open PR. It does not depend on t
 | fast `failed` | The #11872 ladder |
 | Champion re-evaluation left the item held or blocked | Ladder from 6 h to 7 d, **stored on the forge** in the park record or hold marker |
 
-Short cooldowns are local and broadcast, bounded at 24 h (`dispatch/landed_cooldown.rs:34`).
+Short cooldowns are local and broadcast, bounded at 24 h (`sweep_registry/dispatch/landed_cooldown.rs:32`).
 
 ## 6. Champion: promotion and merge
 
-- **Promotion** is one terminal verdict per step (#11885). Promotion volume is whatever the draw selects. `tier2Cap`, the promotion slices and the capacity deferral do not apply in step mode.
-- **Merge** is one PR per step. Champion runs `champion-pr-merge.md`'s criteria and then tries the merge-queue handoff. When the handoff answers `LOOM-MERGE-QUEUE-DIRECT`, Champion uses `merge-pr.sh --expected-head`. The daemon never merges by itself.
+- **Promotion** is one terminal verdict per step (#11885). Promotion volume is whatever the draw selects. `tier2Cap` and the promotion slices do not apply in step mode. The capacity deferral is already gone in every mode (#11860).
+- **Merge** is one PR per step. Champion runs `champion-pr-merge.md`'s criteria and then tries the merge-queue handoff. Its Step 3 calls `forge merge-queue step` before every Champion merge, batch or targeted, as of #10256 Phase B3 (`defaults/.claude/commands/loom/champion-pr-merge.md:1879`). When the handoff answers `LOOM-MERGE-QUEUE-DIRECT`, Champion uses `merge-pr.sh --expected-head`. The daemon never merges by itself.
 - **Merge serialisation**:
   - Until queue mode is on, serialisation within one host comes from the PR lease and a repo-keyed mesh advertisement. Across hosts it is best-effort.
   - The correctness guards are `--expected-head` and `_head_moved_or_resync`.
@@ -215,7 +215,7 @@ Short cooldowns are local and broadcast, bounded at 24 h (`dispatch/landed_coold
   3. all roots on that host;
   4. all hosts.
 - **Rollback** is host env `off`, plus re-enabling the pilot root's item roles. Forge-side parks stay where they are; `release-stale-blocked` owns them.
-- **Prerequisite:** live mode does not ship before #11861. Until its `PR_LANE_PARK_LABELS` carve-out (`work_finder/labels.rs:50-60`) is gone, legacy paths act on held PRs that the engine passes.
+- **Prerequisite (met).** #11861 made `loom:operator` an all-role no-op and removed the work finder's PR-lane carve-out, so no legacy path acts on held PRs that the engine passes.
 
 ## 9. Open items
 
@@ -259,10 +259,11 @@ Each owner doc carries a short pointer to this section. The behaviour changes on
 | Owner doc | Departure under `stepDispatch: on` |
 |---|---|
 | `defaults/docs/priority-model.md` | The within-workspace pick (`main_red_fix → level → created_at → number`) becomes the seeded weighted item draw (§4.2) |
-| `defaults/docs/promotion-throughput.md` | Promotion is per-item and terminal. Slices, `tier2Cap` and the capacity deferral don't apply. |
+| `defaults/docs/promotion-throughput.md` | Promotion is per-item and terminal. `prSlice`, `promotionSlice` and `tier2Cap` don't apply. |
 | `defaults/docs/dispatch-plan.md` | Plan rows gain a `step` field, with the shared fixture changed first |
 | `defaults/docs/telemetry-kind-pick-decision.md` | Work-finder rows gain step, weight terms and `age_source`. The per-role cadence volume table no longer holds for item roles. |
 | `defaults/docs/daemon-reference.md` (role runner) | The item-role intervals and `demandWidth` don't apply to step roots. The two concurrency budgets merge in the last phase. |
 | `defaults/docs/label-state-machine.md` | The `queued` item state. `stale_after_minutes` becomes live. Per-role restore. |
-| `defaults/labels.json` (header) | `stale_after_minutes` is no longer INERT once #11898 lands |
-| `loom-daemon/src/forge_merge_queue/mod.rs:31-32` | The comment saying no prompt invokes the handoff is stale. Champion `--pr` does (#11871). |
+| `defaults/labels.json` (header) | `stale_after_minutes` is no longer INERT. #11898 changes the header together with the values it makes live; until then the header stays accurate. |
+| `mcp-loom/src/tools/sweeps.ts` and `mcp-loom/README.md` | The sweep tools learn `SweepKind::Step` (its role and item). #11898 changes them together with the Rust type. |
+| `loom-daemon/src/forge_merge_queue/mod.rs:30-32` | The comment saying no prompt invokes the handoff is stale. Champion's merge step has called it since #10256 Phase B3. Corrected in this change. |

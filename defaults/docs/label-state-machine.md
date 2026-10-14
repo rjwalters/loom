@@ -41,8 +41,6 @@ leaves the issue uncurated. The rubric is in `.loom/docs/story-points.md`.
 
 ## The three holds (#11795)
 
-> **Step dispatch (accepted design, #11894; not yet implemented).** Step dispatch adds a `queued` item state (a PR in GitHub's merge queue, never drawn for a merge step), makes `labels.json`'s `stale_after_minutes` live for the five claim labels, and restores each claim to its own role's ready stage when a step dies. See [`docs/design/work-finder-step-dispatch.md`](https://github.com/rjwalters/loom/blob/main/docs/design/work-finder-step-dispatch.md) §12.
-
 Loom has three hold labels, each with one meaning:
 
 | Label | Meaning | Release |
@@ -716,6 +714,8 @@ above. Nothing about the guard changes for any other blocking label.
   #11795 kept the label.
 
 ## Label registry: the source of truth (#10013)
+
+> **Step dispatch (accepted design, #11894; not yet implemented).** Under `autonomous.workFinder.stepDispatch: on`, `stale_after_minutes` (described below as inert) becomes live claim liveness for the five claim labels; a `queued` item state marks a PR in GitHub's merge queue, never drawn for a merge step; and a dead step's claim is restored to its own role's ready stage. See [`docs/design/work-finder-step-dispatch.md`](https://github.com/rjwalters/loom/blob/main/docs/design/work-finder-step-dispatch.md) §12.
 
 `defaults/labels.json` is the single source of truth for label semantics: each
 label's name, description, color, `kind`, `applied_by`/`removed_by`, and the

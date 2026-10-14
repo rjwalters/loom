@@ -28,8 +28,9 @@
 //! when `champion.mergeMode=queue` — and under `direct` (the default) it
 //! refuses with `NOT_QUEUE_MODE` before any forge call. The daemon tick
 //! and the stale-verdict paths call the lifecycle (no-ops in direct mode).
-//! Champion's targeted `--pr` step calls `forge merge-queue step` before
-//! `merge-pr.sh` (#11871); `merge-pr.sh` itself does not invoke the handoff. The
+//! Champion's merge step (batch and targeted `--pr`) calls `forge merge-queue
+//! step` before `merge-pr.sh` (#10256 Phase B3); `merge-pr.sh` itself does not
+//! invoke the handoff. The
 //! read-only `status`, `preflight`, and `mode` verbs are always available.
 //!
 //! # CLI exit codes
