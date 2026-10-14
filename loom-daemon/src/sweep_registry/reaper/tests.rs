@@ -2684,8 +2684,11 @@ async fn reaper_does_not_resume_pre_builder_checkpoint() {
         "no resume dispatch means no fresh Running entry for the issue"
     );
     let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
-    assert!(
-        !calls.contains("api graphql"),
+    // One closes-graph read is the #11852 release veto's (the claim release
+    // asks about an open PR on every path); the resume check adds none.
+    assert_eq!(
+        calls.matches("api graphql").count(),
+        1,
         "resume-eligibility check must not even probe the closes-graph for a \
              pre-Builder checkpoint phase; got: {calls:?}"
     );

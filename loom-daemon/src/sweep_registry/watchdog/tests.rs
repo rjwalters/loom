@@ -2155,16 +2155,17 @@ fn review_stall_watchdog_converts_open_pr_recovery_to_prset() {
         "the PrSet conversion must never touch the issue's worktree"
     );
 
-    // The issue's claim was restored by `cancel()` (loom:building ->
-    // loom:issue) exactly as an ordinary recovery would, but no SECOND
+    // The issue's claim was released by `cancel()` (loom:building removed;
+    // the open PR keeps loom:issue off, #11852), but no SECOND
     // claim flip (loom:issue -> loom:building) happened for 9100 — the
     // guard refused before any label mutation, so the original claim
     // (at the initial `dispatch()` above) is the ONLY claim flip issue
     // 9100 ever sees.
     let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
     assert!(
-        calls.contains("issue edit 9100 --remove-label loom:building --add-label loom:issue"),
-        "cancel() must restore the issue's claim; got: {calls:?}"
+        calls.contains("issue edit 9100 --remove-label loom:building")
+            && !calls.contains("issue edit 9100 --remove-label loom:building --add-label"),
+        "cancel() must release the claim without re-queueing beside PR #9200; got: {calls:?}"
     );
     let claim_count = calls
         .lines()
