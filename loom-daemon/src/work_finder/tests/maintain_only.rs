@@ -43,7 +43,7 @@ async fn a_tick_dispatches_only_into_the_normal_workspace() {
         (FakeSource::once(vec![issue(1)]), RecordingDispatcher::default()),
         (FakeSource::once(vec![issue(2)]), RecordingDispatcher::default()),
     ];
-    let report = tick_multi(&mut workspaces, &[0, 0], 10, &halted);
+    let report = tick_multi(&mut workspaces, &[1, 1], 10, &halted);
     assert_eq!(report.dispatched, 1);
     assert!(
         workspaces[0].1.dispatched.is_empty(),

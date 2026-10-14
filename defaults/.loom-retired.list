@@ -120,3 +120,11 @@ scripts/tests/test-resolve-tier-model.sh
 # #11707 (PR #11724, 2026-10-13) — the chain-head merge lock (#10428/#10478)
 # removed from merge-pr.sh; its dedicated shell suite goes with it.
 scripts/tests/test-merge-pr-chain-lock.sh
+
+# #11790 (2026-10-13) — the forge egress policy
+# (forge_egress/: reader, guard, doctor, managed-launcher wiring) removed; its
+# doc and the shell suites that pinned its shell halves go with it.
+docs/forge-egress.md
+scripts/tests/test-resync-installed-egress-doctor.sh
+scripts/tests/test-spawn-claude-managed-gh.sh
+hooks/tests/test-guard-forge-egress.sh

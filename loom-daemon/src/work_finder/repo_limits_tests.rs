@@ -80,7 +80,7 @@ fn tick(cap: Option<usize>, a_live: usize) -> (TickReport, crate::types::WorkFin
     ];
     let report = tick_multi_with_repo_cap(
         &mut workspaces,
-        &[100, 100, 100],
+        &[1, 1, 1],
         20usize.into(),
         &[false; 3],
         None,

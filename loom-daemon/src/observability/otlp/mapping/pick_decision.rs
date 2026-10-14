@@ -88,16 +88,16 @@ mod tests {
     fn a_chunked_record_keeps_the_chunk_fields_and_tick_id_in_its_body() {
         let draws = (0u32..200)
             .map(|d| PickDraw {
-                pool: "all".into(),
                 candidates: vec![PickDrawCandidate {
                     repo: format!("o/w{d}"),
                     weight: u64::from(10 + d),
+                    base_weight: None,
+                    bonus: None,
                 }],
                 total_weight: u64::from(10 + d),
                 roll: u64::from(d),
                 picked: format!("o/w{d}"),
                 number: d,
-                p_min: Some(12),
             })
             .collect();
         let record = PickDecisionRecord::build(tick(), Vec::new()).with_workspace_draw(Some(
@@ -105,7 +105,9 @@ mod tests {
                 seed: "42".into(),
                 draws_total: 200,
                 draws,
-                temperature: Some(80),
+                seed_scheme: Some("loom-draw/v1".into()),
+                seed_minute: Some("29000000".into()),
+                seed_host: Some("host-a".into()),
             },
         ));
         for chunk in split_into_chunks(record, 2_000) {
@@ -121,8 +123,9 @@ mod tests {
             assert_eq!(body["tick_id"], "t");
             assert_eq!(body["workspace_draw"]["seed"], "42");
             assert_eq!(body["workspace_draw"]["draws_total"], 200);
-            // #11684: the per-tick temperature repeats on every chunk, like the seed.
-            assert_eq!(body["workspace_draw"]["temperature"], 80);
+            assert_eq!(body["workspace_draw"]["seed_scheme"], "loom-draw/v1");
+            assert_eq!(body["workspace_draw"]["seed_minute"], "29000000");
+            assert_eq!(body["workspace_draw"]["seed_host"], "host-a");
         }
     }
 }

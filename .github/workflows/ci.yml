@@ -1343,17 +1343,6 @@ jobs:
         if: ${{ !cancelled() && needs.changes.outputs.daemon != 'false' }}
         run: ./target/debug/loom-daemon shell-budget --check
 
-      # component: Fleet-Policy Shadow Guard
-      # (#11441) A fleet-policy key (runtimes, autonomous, ...) committed in a tracked
-      # repo tier (.loom/config.json, .loom-project/project.json) silently
-      # overrides fleet-gitops. Fails (exit 2) unless the key has an entry with
-      # a reason in .loom/fleet-policy-allow.json. Classification lives in
-      # loom-daemon/src/fleet_policy.rs; same `daemon != 'false'` reach as the
-      # shell budget above (not a path filter).
-      - name: Check tracked config carries no un-allowed fleet-policy keys (#11441)
-        if: ${{ !cancelled() && needs.changes.outputs.daemon != 'false' }}
-        run: LOOM_CONFIG_DEFAULTS_FILE="" ./target/debug/loom-daemon validate . --fleet-policy-only
-
       # component: .gitignore Convergence Check
       # Not gated on backend changes — a drifted .gitignore is detectable
       # regardless of which file group a PR touches. It runs under
@@ -2688,6 +2677,10 @@ jobs:
         run: bash defaults/scripts/check-cas-recheck-consistency.sh
       - name: Check every package manifest has a labeled dependabot entry (#7577)
         run: bash defaults/scripts/check-dependabot-labels.sh
+      # The script is a thin wrapper over `loom-daemon check-dependabot-labels`
+      # (#11828), so its fixture suite needs the build downloaded above.
+      - name: Test the dependabot label check (#7577, #11828)
+        run: bash defaults/scripts/tests/test-check-dependabot-labels.sh
       # #9418: the Renovate-side counterpart — every `labels` array in
       # renovate.json5 (top-level and every packageRules / vulnerabilityAlerts /
       # lockFileMaintenance override, which REPLACE rather than merge) carries
@@ -2784,10 +2777,11 @@ jobs:
       - name: Run the mocked Codex adapter test suite
         run: bash defaults/scripts/tests/test-spawn-codex.sh
       - name: Verify persistent-session cancellation with fake workers
-        # #11232: no `docker pull` here. The test pulls ubuntu:24.04 through
-        # tests/common/hub_image.rs (mirror first, Docker Hub with bounded
-        # retry as the fallback) and tags it `ubuntu:24.04`, which the fixture
-        # build in the next step also consumes.
+        # #11232 / #11755: no `docker pull` here. The test pulls ubuntu:24.04
+        # through tests/common/hub_image.rs at the digest .github/ci-images.txt
+        # pins (GHCR copy first, then mirror.gcr.io, Docker Hub with bounded
+        # retry last) and tags it `ubuntu:24.04`, which the fixture build in
+        # the next step also consumes.
         env:
           LOOM_TEST_SESSION_IMAGE: ubuntu:24.04
         run: cargo test -p loom-daemon --test session_exec_docker -- --ignored --nocapture

@@ -124,6 +124,8 @@ fn resolve_for_dispatch_tap_in(
             super::resolve::PREFERENCE_LOG_MARKER
         ),
         model_profile: tap.model_profile.clone(),
+        model: None,
+        draw: None,
     });
     Ok(DispatchAdmission {
         admitted: Some(admitted),

@@ -34,7 +34,7 @@ fn run(
 ) -> TickReport {
     tick_multi_with_build_backoff(
         multi,
-        &[100; 4][..multi.len()],
+        &[1; 4][..multi.len()],
         max.into(),
         &[false; 4][..multi.len()],
         None,
@@ -155,7 +155,7 @@ fn not_held_is_the_repo_cap_tick_exactly() {
     let via_backoff = run(&mut a, 2, Some(1), &[RED], &[false]);
     let via_repo_cap = tick_multi_with_repo_cap(
         &mut b,
-        &[100],
+        &[1],
         2.into(),
         &[false],
         None,
@@ -187,7 +187,7 @@ fn the_saturation_brake_outranks_the_backoff() {
     let mut multi = vec![(FakeSource::once(vec![issue(1)]), RecordingDispatcher::default())];
     let report = tick_multi_with_build_backoff(
         &mut multi,
-        &[100],
+        &[1],
         10.into(),
         &[false],
         None,

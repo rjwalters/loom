@@ -879,7 +879,8 @@ fn payload_surface_covers_everything_the_installer_writes() {
     let missed: Vec<&String> = written.iter().filter(|p| !diff.added.contains(p)).collect();
     assert!(missed.is_empty(), "installer writes outside the resync surface: {missed:?}");
     // Beyond that step: the slash commands `init` copies with `.claude/`, and
-    // the two extra surfaces a resync backfills (#10895). The surfaces it only
+    // the extra surfaces a resync backfills (#10895, and `.github/labels.yml`
+    // whole when a repo has none, #11033). The surfaces it only
     // refreshes when present are not created in a repo that lacks them.
     let extra: Vec<&String> = diff
         .added
@@ -887,9 +888,9 @@ fn payload_surface_covers_everything_the_installer_writes() {
         .filter(|p| !written.contains(p) && !p.starts_with(".claude/commands/loom/"))
         .collect();
     assert!(
-        extra
-            .iter()
-            .all(|p| p.starts_with(".agents/skills/loom-") || *p == ".claude/biome.jsonc"),
+        extra.iter().all(|p| p.starts_with(".agents/skills/loom-")
+            || *p == ".claude/biome.jsonc"
+            || *p == ".github/labels.yml"),
         "{extra:?}"
     );
     assert!(extra.len() > 10, "the real payload backfills its generated skills: {extra:?}");

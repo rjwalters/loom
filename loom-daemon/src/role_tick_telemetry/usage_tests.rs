@@ -181,3 +181,13 @@ fn a_plain_claude_tick_is_subscription_and_a_launch_record_wins() {
     assert_eq!(zai.billing, "subscription");
     assert_eq!(zai.profile.as_deref(), Some("zai-flash"));
 }
+
+#[test]
+fn a_transcript_sourced_tick_reads_as_claude_and_a_named_runtime_wins() {
+    use crate::usage_source::UsageSource;
+    assert_eq!(span_runtime(None, UsageSource::ClaudeTranscripts), Some("claude"));
+    assert_eq!(span_runtime(Some(""), UsageSource::ClaudeTranscripts), Some("claude"));
+    assert_eq!(span_runtime(Some("codex"), UsageSource::CodexSessionRollouts), Some("codex"));
+    assert_eq!(span_runtime(Some("opencode"), UsageSource::OpenCodeSessionDb), Some("opencode"));
+    assert_eq!(span_runtime(None, UsageSource::PiLaunchStream), None, "never guessed");
+}

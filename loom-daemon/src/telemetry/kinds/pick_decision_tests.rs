@@ -182,21 +182,23 @@ fn a_busy_tick_splits_into_bounded_chunks_and_reassembles_exactly() {
         draws_total: 400,
         draws: (0..400)
             .map(|d| PickDraw {
-                pool: "all".to_string(),
                 candidates: (0..60)
                     .map(|w| PickDrawCandidate {
                         repo: format!("org-{w}/workspace-{w}"),
                         weight: 1000 + w,
+                        base_weight: None,
+                        bonus: None,
                     })
                     .collect(),
                 total_weight: 60 * 1000,
                 roll: d,
                 picked: "org-0/workspace-0".to_string(),
                 number: u32::try_from(100_000 + d).unwrap(),
-                p_min: Some(12),
             })
             .collect(),
-        temperature: Some(80),
+        seed_scheme: None,
+        seed_minute: None,
+        seed_host: None,
     });
     let whole_len = serde_json::to_string(&record).unwrap().len();
     assert!(whole_len > CHUNK_BYTES, "a busy tick is {whole_len} bytes");
@@ -276,22 +278,24 @@ fn draws_split_in_order_with_their_totals_on_every_chunk() {
             draws_total: 7,
             draws: (0u32..7)
                 .map(|d| PickDraw {
-                    pool: "all".to_string(),
                     candidates: vec![PickDrawCandidate {
                         repo: format!("o/w{d}"),
                         weight: u64::from(10 + d),
+                        base_weight: None,
+                        bonus: None,
                     }],
                     total_weight: u64::from(10 + d),
                     roll: u64::from(d),
                     picked: format!("o/w{d}"),
                     number: d,
-                    p_min: None,
                 })
                 .collect(),
-            temperature: None,
+            seed_scheme: Some("loom-draw/v1".to_string()),
+            seed_minute: Some("29000000".to_string()),
+            seed_host: Some("host-a".to_string()),
         }),
     );
-    let chunks = split_into_chunks(record.clone(), 700);
+    let chunks = split_into_chunks(record.clone(), 900);
     assert!(chunks.len() > 1);
     assert_eq!(reassemble(&chunks), record);
     assert_eq!(draws_in_order(&chunks), (0..7).collect::<Vec<_>>());
@@ -299,6 +303,10 @@ fn draws_split_in_order_with_their_totals_on_every_chunk() {
         let wd = chunk.workspace_draw.as_ref().unwrap();
         assert_eq!(wd.seed, "42");
         assert_eq!(wd.draws_total, 7, "totals repeat on every chunk");
+        // #11683: the seed's inputs repeat like the seed.
+        assert_eq!(wd.seed_scheme.as_deref(), Some("loom-draw/v1"));
+        assert_eq!(wd.seed_minute.as_deref(), Some("29000000"));
+        assert_eq!(wd.seed_host.as_deref(), Some("host-a"));
     }
 }
 
@@ -358,4 +366,16 @@ fn role_actions_are_unique_wire_names() {
         assert!(seen.insert(action), "duplicate {action}");
     }
     assert!(!seen.contains("dispatched"), "the work finder's action is separate");
+}
+
+/// #11683: a record written before the seed inputs existed still parses,
+/// and a draw without them serializes none of the three fields.
+#[test]
+fn workspace_draw_without_seed_inputs_round_trips() {
+    let old = serde_json::json!({"seed": "42", "draws_total": 0, "draws": []});
+    let draw: PickWorkspaceDraw = serde_json::from_value(old.clone()).unwrap();
+    assert_eq!(draw.seed_scheme, None);
+    assert_eq!(draw.seed_minute, None);
+    assert_eq!(draw.seed_host, None);
+    assert_eq!(serde_json::to_value(&draw).unwrap(), old);
 }

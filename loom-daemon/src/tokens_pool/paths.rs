@@ -676,7 +676,7 @@ mod tests {
                 .iter()
                 .map(|r| Workspace {
                     root: normalize_path(r),
-                    priority: 100,
+                    weight: 100,
                     config_overrides: None,
                     maintain_only: None,
                 })

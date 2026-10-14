@@ -452,13 +452,13 @@ fn as_add(change: &Change) -> Change {
         Change::MissingClone {
             name,
             path,
-            priority,
+            weight,
             maintain_only,
             ..
         } => Change::Add {
             name,
             path,
-            priority,
+            weight,
             maintain_only,
         },
         other => other,

@@ -18,17 +18,6 @@ fn write_config(dir: &std::path::Path, body: &str) {
     std::fs::write(loom_dir.join("config.json"), body).unwrap();
 }
 
-#[test]
-#[serial]
-fn startup_init_captures_the_resolved_vector() {
-    let tmp = tempfile::tempdir().unwrap();
-    write_config(tmp.path(), r#"{"hyperparameters": {"lifecycle": {"leaseTtlMinutes": 42}}}"#);
-    startup_init(tmp.path()).unwrap();
-    let resolved = resolved_global().expect("startup_init captured the vector");
-    assert_eq!(resolved.params.lifecycle.lease_ttl_minutes, 42.0);
-    assert_eq!(resolved.sources["lifecycle.leaseTtlMinutes"], Source::Config);
-}
-
 // NOTE: this binary has exactly ONE startup_init success-path test. The
 // startup globals (RESOLVED / ROOT) are OnceLocks — first call
 // wins, later calls silently keep them — so every assertion that depends on
@@ -41,10 +30,13 @@ fn startup_init_captures_the_resolved_vector() {
 // committed-block edit lands WITHOUT a daemon restart.
 #[test]
 #[serial]
-fn lease_ttl_hot_applies_from_a_config_edit_without_a_restart() {
+fn startup_capture_and_lease_ttl_hot_apply_without_a_restart() {
     let tmp = tempfile::tempdir().unwrap();
     write_config(tmp.path(), r#"{"hyperparameters": {"lifecycle": {"leaseTtlMinutes": 42}}}"#);
     startup_init(tmp.path()).unwrap();
+    let resolved = resolved_global().expect("startup_init captured the vector");
+    assert_eq!(resolved.params.lifecycle.lease_ttl_minutes, 42.0);
+    assert_eq!(resolved.sources["lifecycle.leaseTtlMinutes"], Source::Config);
     assert_eq!(lease_ttl_minutes_from_layer(), Some(42.0));
     assert_eq!(loom_daemon::claim_reconciliation::resolve_lease_ttl_minutes(), 42.0);
 

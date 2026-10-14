@@ -1743,6 +1743,9 @@ fn config_tier_label(repo_root: &Path, dotted: &str, absent_label: &str) -> Stri
         Some(path) if path == repo_root.join(crate::config_resolver::LOCAL_CONFIG_REL) => {
             format!("local ({})", path.display())
         }
+        Some(path) if path == repo_root.join(crate::config_resolver::FLEET_REPO_CONFIG_REL) => {
+            format!("per-repo fleet tier ({})", path.display())
+        }
         Some(path) if path == repo_root.join(crate::config_resolver::PROJECT_CONFIG_REL) => {
             format!("project ({})", path.display())
         }

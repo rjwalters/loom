@@ -815,15 +815,6 @@ pub(crate) enum ForgeAction {
         patch_created: Option<String>,
     },
 
-    /// `forge egress assert|doctor|policy` (#9984) — will this process's `gh`
-    /// reach the mandated API origin? Exit 0 aligned / 1 findings / 2
-    /// verification incomplete; no policy configured ⇒ 0. Never a `gh`
-    /// passthrough. See `defaults/docs/forge-egress.md`.
-    Egress {
-        #[command(subcommand)]
-        action: super::forge_egress_cmd::EgressAction,
-    },
-
     /// `forge parent body|link` (#10012 §4) — the logic behind
     /// `create-issue.sh --parent N`: the `loom:parent` marker, the parent's
     /// red-main marker, the native sub-issue link.
@@ -882,7 +873,6 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             access,
             force,
         } => return super::forge_identity_cmd::token(&repo, &access, force),
-        ForgeAction::Egress { action } => return super::forge_egress_cmd::handle(action),
         ForgeAction::MergeQueue { action } => super::forge_merge_queue_cmd::run(action.0),
         ForgeAction::Parent { action } => return super::forge_parent_cmd::handle(action),
         ForgeAction::IsFleet { login } => return super::forge_identity_cmd::is_fleet(&login),

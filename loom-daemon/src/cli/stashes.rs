@@ -5,11 +5,10 @@
 //! forge, so it runs on the sync `handle_cli_command` path and works with the
 //! daemon down. A live daemon is used only for the issue-state read of a
 //! managed repo (#8876, `issue_state_read`); without one the read is the
-//! policy-gated standalone path.
+//! standalone path.
 
 use anyhow::Result;
 
-use loom_daemon::forge_egress::policy::PolicySources;
 use loom_daemon::issue_state_read::client::{DaemonLink, LocalRead, RoutedLookup, SocketLink};
 use loom_daemon::quarantine_stash_status::StashOrigin;
 use loom_daemon::repo_root::resolve_repo_root;
@@ -104,12 +103,11 @@ fn run(
         json,
     };
     // #8876: the route is chosen once per run (daemon-assisted read, else the
-    // policy-gated standalone read). Its description goes to stderr so
+    // standalone read). Its description goes to stderr so
     // `--json` stdout stays machine-readable.
     let link = daemon_link(&repo_root);
     let local = LocalRead {
         root: repo_root.clone(),
-        sources: PolicySources::from_process(Some(&repo_root)),
     };
     let mut lookup = RoutedLookup::new(link.as_ref().map(|l| l as &dyn DaemonLink), &local);
     let result = run_with(&repo_root, &opts, &mut lookup);

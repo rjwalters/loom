@@ -808,7 +808,8 @@ if [ "$1" = "issue" ] && [ "$2" = "edit" ]; then echo "boom" >&2; exit {edit_rc}
 if [ "$1" = "api" ]; then
   case "$*" in
     *".pull_request != null"*) echo false ;;
-    *".state"*) printf '{{"body":"","state":"{state}","closed_at":null,"labels":[]}}' ;;
+    *".state"*) if [ "{labels}" = "true" ]; then l='"loom:blocked"'; else l=''; fi
+      printf '{{"body":"","state":"{state}","closed_at":null,"labels":[%s]}}' "$l" ;;
     *) echo "" ;;
   esac
   exit 0

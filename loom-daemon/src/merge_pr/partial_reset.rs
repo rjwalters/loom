@@ -55,6 +55,9 @@ pub struct IssueView {
     /// Some line of `.labels[]?.name` is exactly `loom:building` (the shell's
     /// `grep -qx`).
     pub building: bool,
+    /// Some line of `.labels[]?.name` is exactly `loom:issue` (#11517: the
+    /// queue label a closed issue must not keep).
+    pub ready: bool,
     /// The body carries a `loom:remainder-hold` marker (#9264): `Some(reason)`
     /// (`""` = unstated). Absent for a missing/null/non-string `body`.
     pub hold: Option<String>,
@@ -148,6 +151,7 @@ impl IssueView {
             is_pr: captured(&has) == "true",
             state: captured(&state),
             building: captured(&labels).split('\n').any(|l| l == "loom:building"),
+            ready: captured(&labels).split('\n').any(|l| l == "loom:issue"),
             hold: hold_from_json(body),
         }
     }

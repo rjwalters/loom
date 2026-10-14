@@ -51,7 +51,7 @@ fn the_marker_leads_the_order_only_on_a_red_main() {
     let mut multi = vec![(FakeSource::once(items()), RecordingDispatcher::default())];
     let report = tick_multi_with_repo_cap(
         &mut multi,
-        &[100],
+        &[1],
         1.into(),
         &[false],
         None,
@@ -79,7 +79,7 @@ fn the_marker_leads_the_order_only_on_a_red_main() {
         ]
     };
     let mut multi = vec![(FakeSource::once(labelled()), RecordingDispatcher::default())];
-    tick_multi(&mut multi, &[100], 1, &[false]);
+    tick_multi(&mut multi, &[1], 1, &[false]);
     assert_eq!(multi[0].1.dispatched, vec![9]);
 }
 
@@ -91,7 +91,7 @@ fn a_labelled_red_main_fix_outranks_an_important_issue_without_overflow() {
     let mut multi = vec![(FakeSource::once(items), RecordingDispatcher::default())];
     tick_multi_with_repo_cap(
         &mut multi,
-        &[100],
+        &[1],
         1.into(),
         &[false],
         None,
@@ -111,7 +111,7 @@ fn a_halted_red_repo_admits_its_fixes_and_nothing_else() {
     let mut multi = vec![(FakeSource::once(items()), RecordingDispatcher::default())];
     let report = tick_multi_with_repo_cap(
         &mut multi,
-        &[100],
+        &[1],
         10.into(),
         &[true],
         None,
@@ -155,7 +155,7 @@ fn a_hold_that_is_not_a_verified_red_main_admits_nothing() {
         let mut multi = vec![(FakeSource::once(vec![fix(9)]), RecordingDispatcher::default())];
         let report = tick_multi_with_repo_cap(
             &mut multi,
-            &[100],
+            &[1],
             10.into(),
             &[true],
             None,
@@ -185,7 +185,7 @@ fn a_red_main_fix_does_not_get_the_overflow_slot() {
     )];
     let report = tick_multi_with_repo_cap(
         &mut multi,
-        &[100],
+        &[1],
         2.into(),
         &[false],
         None,
@@ -312,7 +312,7 @@ fn multi_tick(
     let mut multi = vec![(FakeSource::once(items), dispatcher)];
     let report = tick_multi_with_repo_cap(
         &mut multi,
-        &[100],
+        &[1],
         1.into(),
         &[halted],
         None,
@@ -569,7 +569,7 @@ fn the_tick_feeds_the_escalation_with_the_fixes_waiting_on_a_red_main() {
         let mut multi = vec![(FakeSource::once(items()), EscalationRecorder::default())];
         tick_multi_with_repo_cap(
             &mut multi,
-            &[100],
+            &[1],
             0.into(),
             &[halted],
             None,

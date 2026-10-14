@@ -83,6 +83,8 @@ pub enum Skip {
     DaemonHold,
     /// `<!-- loom:permanent-block` in the body or any comment (#8742).
     Permanent,
+    /// `loom:frozen` (#11743): no write of any kind.
+    Frozen,
     /// A human-hold label is on the issue (#10001's lane).
     OperatorHold,
     /// `loom:curating` or `loom:building`.
@@ -175,7 +177,9 @@ fn has_label(labels: &[String], wanted: &str) -> bool {
 
 /// The vetoes visible in the labels and body alone.
 fn label_skip(body: &str, labels: &[String]) -> Option<Skip> {
-    if has_operator_hold(labels) {
+    if crate::work_finder::is_frozen(labels) {
+        Some(Skip::Frozen)
+    } else if has_operator_hold(labels) {
         Some(Skip::OperatorHold)
     } else if labels.iter().any(|l| CLAIM_LABELS.contains(&l.as_str())) {
         Some(Skip::ActiveClaim)

@@ -422,6 +422,8 @@ fn daemon_write_paths_are_scoped() {
             Via(PASS, "verdict pass; shell guard vets its own call"),
         ),
         ("quarantine_reconciliation.rs", Gated),
+        // #11480: the vetoed reclaim; reached only from the reclaim pass.
+        ("reclaim_pr_warning.rs", Via(PASS, "reclaim pass (#11480 claim-only release)")),
         ("fleet_sync/workspace_resync/host.rs", Gated),
         (
             "fleet_store/resync_claim.rs",
@@ -443,6 +445,7 @@ fn daemon_write_paths_are_scoped() {
         ("intake_reconcile.rs", Gated),
         ("intake_reconcile/singleton.rs", Gated),
         ("stale_blocked/release_gh.rs", Gated),
+        ("work_finder/main_red_autofile.rs", Gated),
         (
             "sweep_registry/guards.rs",
             Via(DISPATCH, "claim flip + lease of a dispatched sweep"),
@@ -451,7 +454,10 @@ fn daemon_write_paths_are_scoped() {
             "sweep_registry/dispatch/claim_release.rs",
             Via(DISPATCH, "releases the claim of a dispatched sweep found closed post-flip (#11304)"),
         ),
-        ("sweep_registry/watchdog.rs", Via(DISPATCH, "acts on dispatched sweeps")),
+        (
+            "sweep_registry/watchdog/forge_comments.rs",
+            Via(DISPATCH, "acts on dispatched sweeps (moved from watchdog.rs, #11743)"),
+        ),
         ("sweep_registry/restore_to_ready.rs", Via(DISPATCH, "acts on dispatched sweeps")),
         (
             "sweep_registry/roll_requeue.rs",

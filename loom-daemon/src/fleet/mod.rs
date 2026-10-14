@@ -602,9 +602,9 @@ pub struct WorkerRecord {
     /// The workspace repos registered on the worker (as passed to `--repo`).
     #[serde(default)]
     pub repos: Vec<String>,
-    /// The dispatch priority the workspaces were registered at.
-    #[serde(default = "crate::workspace_registry::default_priority")]
-    pub priority: u32,
+    /// The draw weight the workspaces were registered at (#11742).
+    #[serde(default = "crate::workspace_registry::default_weight")]
+    pub weight: u32,
     /// RFC3339 timestamp of the most recent successful bootstrap. Doubles as
     /// the roster's "added date" (#4342's operator scope-clarification).
     pub bootstrapped_at: String,
@@ -1165,7 +1165,7 @@ mod tests {
         WorkerRecord {
             ssh_host: host.to_string(),
             repos: vec!["rjwalters/anvil".to_string()],
-            priority: 50,
+            weight: 50,
             bootstrapped_at: "2026-07-28T00:00:00Z".to_string(),
             last_verify: None,
             provider_instance_id: None,
@@ -1212,7 +1212,7 @@ mod tests {
         let mut reg = FleetRegistry::default();
         reg.upsert(record("worker-1"));
         let mut updated = record("worker-1");
-        updated.priority = 3;
+        updated.weight = 3;
         updated.last_verify = Some(VerifyResult {
             ok: true,
             at: "2026-07-28T01:00:00Z".to_string(),
@@ -1221,7 +1221,7 @@ mod tests {
         reg.upsert(updated);
         assert_eq!(reg.workers.len(), 1);
         let got = reg.get("worker-1").unwrap();
-        assert_eq!(got.priority, 3);
+        assert_eq!(got.weight, 3);
         assert!(got.last_verify.as_ref().unwrap().ok);
     }
 
@@ -1390,7 +1390,7 @@ mod tests {
         .unwrap();
         let reg = FleetRegistry::load(&path).unwrap();
         assert_eq!(reg.workers.len(), 1);
-        assert_eq!(reg.workers[0].priority, crate::workspace_registry::DEFAULT_WORKSPACE_PRIORITY);
+        assert_eq!(reg.workers[0].weight, crate::workspace_registry::DEFAULT_WORKSPACE_WEIGHT);
         assert!(reg.workers[0].repos.is_empty());
         // #4342's extended fields must also be absent-tolerant on a
         // pre-#4342 record.

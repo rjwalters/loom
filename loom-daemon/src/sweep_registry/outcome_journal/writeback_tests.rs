@@ -417,6 +417,28 @@ fn an_unreadable_comments_check_fails_closed_and_never_posts() {
     );
 }
 
+/// #11743: an issue the outcome read shows as `loom:frozen` gets no
+/// write-back — no comments read, no post — while the durable record is still
+/// written.
+#[test]
+#[serial]
+fn a_frozen_issue_gets_no_writeback() {
+    let dir = tempdir().unwrap();
+    let ws = dir.path();
+    enable_writeback(ws);
+    let gh_log = ws.join("gh-invocations.log");
+    let posted_marker = ws.join("posted.marker");
+    let mut registry =
+        writeback_registry(ws, &fake_gh_script("loom:frozen", &gh_log, &posted_marker));
+    let issue = 11743;
+    let sweep_id = insert_dead_running_with_log(&mut registry, issue, 0, "agent-wb-f", "log\n");
+
+    run_success(&mut registry, issue, &sweep_id);
+
+    assert_eq!(count_comment_posts(&gh_log), 0, "no write to a frozen issue");
+    assert!(telemetry_journal(ws).contains(&sweep_id), "the record is written regardless");
+}
+
 /// Judge #9216 item 1: the forge post runs strictly AFTER the durable
 /// `sweep.outcome` telemetry append, and a failing post never loses it.
 #[test]

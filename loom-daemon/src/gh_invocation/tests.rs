@@ -20,14 +20,11 @@ fn read_op(target: GhTarget) -> GhInvocation {
 }
 
 #[test]
-fn resolver_precedence_is_policy_then_env_then_path() {
-    let r = resolve_from(Some("/opt/launcher".into()), Some("/stub/gh".into()));
-    assert_eq!((r.program.as_str(), r.source), ("/opt/launcher", GhBinSource::Policy));
-
-    let r = resolve_from(None, Some("/stub/gh".into()));
+fn resolver_precedence_is_env_then_path() {
+    let r = resolve_from(Some("/stub/gh".into()));
     assert_eq!((r.program.as_str(), r.source), ("/stub/gh", GhBinSource::EnvOverride));
 
-    let r = resolve_from(None, None);
+    let r = resolve_from(None);
     assert_eq!((r.program.as_str(), r.source), ("gh", GhBinSource::Path));
 }
 
@@ -35,7 +32,7 @@ fn resolver_precedence_is_policy_then_env_then_path() {
 fn resolver_keeps_the_legacy_set_but_empty_semantics() {
     // Byte-identical to the hand-rolled `std::env::var(..).unwrap_or("gh")`
     // copies: a set-but-empty LOOM_GH_BIN is returned, not skipped.
-    let r = resolve_from(None, Some(String::new()));
+    let r = resolve_from(Some(String::new()));
     assert_eq!((r.program.as_str(), r.source), ("", GhBinSource::EnvOverride));
 }
 

@@ -122,6 +122,7 @@ fn status_text_flags_a_host_not_in_the_store() {
         workspaces: workspace_resync::WorkspacePass::default(),
         checkouts: Vec::new(),
         checkouts_note: None,
+        repo_config: Default::default(),
     };
     let text = render_line(Some(&status), status.at).unwrap();
     assert!(text.contains(&NOT_IN_STORE.to_uppercase()), "{text}");

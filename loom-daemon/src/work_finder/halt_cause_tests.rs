@@ -310,7 +310,7 @@ fn pass_two_defers_a_heavy_repo_on_disk_and_admits_a_light_one() {
     ];
     let report = super::super::tick_multi_with_build_backoff(
         &mut multi,
-        &[1, 100],
+        &[1000, 1],
         10.into(),
         &[false, false],
         None,
@@ -343,7 +343,7 @@ fn pass_two_debits_each_disk_admission() {
     ];
     let report = super::super::tick_multi_with_build_backoff(
         &mut multi,
-        &[1, 100],
+        &[1000, 1],
         10.into(),
         &[false, false],
         None,
@@ -411,4 +411,30 @@ fn single_root_names_the_highest_precedence_hold() {
     assert_eq!(cause((false, true, true, true)), Some(HaltCause::GatePending));
     assert_eq!(cause((false, false, true, true)), Some(HaltCause::Breaker));
     assert_eq!(cause((false, false, true, false)), Some(HaltCause::TokenPool));
+}
+
+/// #11742: a held workspace keeps its own hold's cause even at weight 0 (a
+/// weightless `fleet: maintain` repo reads `maintain_only`, not
+/// `weight_zero`); an unheld weight-0 workspace reads `weight_zero`.
+#[test]
+fn a_hold_cause_wins_over_weight_zero() {
+    let row = |held: bool| {
+        let mut multi = vec![(OneShotSource(Some(vec![item(9)])), Disp::default())];
+        let report = tick_multi_with_repo_cap(
+            &mut multi,
+            &[0],
+            10.into(),
+            &[held],
+            Some(&[held.then_some(HaltCause::MaintainOnly)]),
+            usize::MAX,
+            false,
+            None,
+            &[],
+        );
+        let rows = super::super::ready_queue::finish(&report.queue, &[]);
+        rows.into_iter().next().unwrap()
+    };
+    assert_eq!(row(true).detail.as_deref(), Some("maintain_only"));
+    assert_eq!(row(false).detail.as_deref(), Some("weight_zero"));
+    assert_eq!(row(false).disposition, QueueDisposition::WorkspaceHalted);
 }

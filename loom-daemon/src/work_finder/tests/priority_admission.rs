@@ -41,7 +41,7 @@ fn levels_order_the_queue_on_both_tick_paths_and_the_star_is_ignored() {
     assert_eq!(dispatcher.dispatched, vec![4]);
 
     let mut multi = vec![(FakeSource::once(items()), full(0))];
-    tick_multi(&mut multi, &[100], 1, &[false]);
+    tick_multi(&mut multi, &[1], 1, &[false]);
     assert_eq!(multi[0].1.dispatched, vec![4]);
 
     // Room for all: level, then number (no createdAt); the star is plain.
@@ -56,7 +56,7 @@ fn no_priority_overflows_the_global_cap() {
     // the star used to take stays unused.
     let items = || vec![vi(1), important(2), starred(3), issue(4)];
     let mut multi = vec![(FakeSource::once(items()), full(2))];
-    let report = tick_multi(&mut multi, &[100], 2, &[false]);
+    let report = tick_multi(&mut multi, &[1], 2, &[false]);
     assert_eq!((report.dispatched, report.dispatched_overflow), (0, 0));
     assert_eq!(report.deferred_capacity, 4);
     assert!(multi[0].1.dispatched_overflow.is_empty());
@@ -75,7 +75,7 @@ fn no_priority_overflows_the_global_cap() {
     let mut multi = vec![(FakeSource::once(items()), full(2))];
     let report = tick_multi_with_repo_cap(
         &mut multi,
-        &[100],
+        &[1],
         terms,
         &[false],
         None,
@@ -93,7 +93,7 @@ fn a_very_important_candidate_is_deferred_by_the_per_repo_cap() {
     let mut multi = vec![(FakeSource::once(vec![vi(1), issue(2)]), full(1))];
     let report = tick_multi_with_repo_cap(
         &mut multi,
-        &[100],
+        &[1],
         4.into(),
         &[false],
         None,
@@ -109,7 +109,7 @@ fn a_very_important_candidate_is_deferred_by_the_per_repo_cap() {
 #[test]
 fn the_published_row_keys_are_main_red_fix_level_created_at_number() {
     let mut multi = vec![(FakeSource::once(vec![issue(1), vi(2)]), full(0))];
-    let report = tick_multi(&mut multi, &[100], 10, &[false]);
+    let report = tick_multi(&mut multi, &[1], 10, &[false]);
     let rows = ready_queue::finish(&report.queue, &[]);
     assert_eq!(rows[0].issue, 2, "rank 1 is the very-important issue");
     assert_eq!(rows[0].level, crate::priority_pick::Level::VeryImportant, "#11510");

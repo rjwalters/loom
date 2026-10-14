@@ -453,6 +453,12 @@ pub(crate) enum ScriptPortCommand {
     #[command(subcommand)]
     RoleToolPolicy(super::role_tool_policy::RoleToolPolicyCommand),
 
+    /// Per-stage runtime selection views (#11726): `roles draw --explain`
+    /// prints each stage's effective weighted, per-attempt draw table on this
+    /// host and the config tier that set it.
+    #[command(subcommand)]
+    Roles(super::roles_draw_cmd::RolesCommand),
+
     /// Tier-3 "generic passthrough" launch-shape resolution (#8671): reads a
     /// runtime capability manifest's `launch` object and renders it as
     /// eval-ready shell defaults. Backs `spawn-generic-launch.sh`. Exit 0
@@ -512,6 +518,12 @@ pub(crate) enum ScriptPortCommand {
     /// any violation; no Renovate config is a clean no-op. Counterpart of
     /// `check-dependabot-labels.sh` (#7577), in Rust per the shell policy.
     CheckRenovateLabels(super::check_renovate_labels::CheckRenovateLabelsArgs),
+
+    /// The Dependabot-side routing contract (#7577): every
+    /// `.github/dependabot.yml` entry carries `loom:review-requested` and every
+    /// lockfile-bearing npm manifest is covered. The logic behind
+    /// `check-dependabot-labels.sh`. Exit 1 on any problem; no config is a no-op.
+    CheckDependabotLabels(super::check_dependabot_labels::CheckDependabotLabelsArgs),
 
     /// Guard configuration diagnostics (#10434): `guards status` shows each
     /// guard category's effective value and source, hook wiring, a decision-log
@@ -710,12 +722,14 @@ impl ScriptPortCommand {
             ScriptPortCommand::AffectedFiles(cmd) => cmd.run(),
             ScriptPortCommand::FleetCaptain(args) => args.run(),
             ScriptPortCommand::RoleToolPolicy(cmd) => cmd.run(),
+            ScriptPortCommand::Roles(cmd) => cmd.run(),
             ScriptPortCommand::RuntimeLaunchEnv(args) => args.run(),
             ScriptPortCommand::CheckStaleBlocked(args) => args.run(),
             ScriptPortCommand::GuardMcpTools(args) => args.run(),
             ScriptPortCommand::CheckGuardWiring(args) => args.run(),
             ScriptPortCommand::CheckPrivateControlVersion(args) => args.run(),
             ScriptPortCommand::CheckRenovateLabels(args) => args.run(),
+            ScriptPortCommand::CheckDependabotLabels(args) => args.run(),
             ScriptPortCommand::Guards(cmd) => cmd.run(),
             ScriptPortCommand::PrLatency(args) => args.run(),
             ScriptPortCommand::ParkRecord(cmd) => cmd.run(),
