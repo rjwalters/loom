@@ -83,7 +83,7 @@ const CLAIM_LABEL: &str = "loom:building";
 pub const CURATED_LABEL: &str = "loom:curated";
 
 /// How long a pre-ready exit stays remembered as emitted.
-const PRE_READY_MEMORY_DAYS: i64 = 14;
+pub(super) const PRE_READY_MEMORY_DAYS: i64 = 14;
 
 /// Passes a departed `ready_wait` row waits for its forge departure before
 /// it is emitted as `unknown` (about an hour at the collector's cadence).
