@@ -173,6 +173,7 @@ pub mod daemon_update;
 pub mod deep_clean;
 pub mod dep_classify;
 pub mod dep_recheck;
+pub mod dependabot_labels;
 pub mod disk_admission;
 pub mod disk_footprint;
 pub mod disk_full_halt;
