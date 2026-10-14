@@ -30,6 +30,25 @@ pub(super) fn continues(
     prev.cause == cause && (now - prev.last_failure_at).num_seconds() <= max_secs
 }
 
+/// The ceiling for every cause but [`DispatchBackoffCause::FastFailure`]: the
+/// 900 s `max` default from before #11854.
+pub(crate) const TRANSIENT_BACKOFF_CAP: Duration = Duration::from_secs(900);
+
+/// The ceiling a `cause` streak doubles up to (Issue #11854). Only an
+/// issue-attributable fast failure climbs to the configured `max` (6 h by
+/// default). Every other cause is transient and the window is broadcast to
+/// every peer, so it stays at 900 s: a lost lease race, a token-pool death or
+/// an environmental class says nothing about the issue, and an open-PR
+/// refusal must not outlive the open-PR memo (`OPEN_PR_MEMO_FRESH`).
+pub(super) fn cap(cause: DispatchBackoffCause, max: Duration) -> Duration {
+    match cause {
+        // The landed cooldown (#11853) bypasses the ladder; never capped here.
+        DispatchBackoffCause::FastFailure | DispatchBackoffCause::Landed => max,
+        DispatchBackoffCause::Generic => max.min(TRANSIENT_BACKOFF_CAP),
+        DispatchBackoffCause::OpenPrGuard => max.min(super::super::guards::OPEN_PR_MEMO_FRESH),
+    }
+}
+
 /// The INFO line for a window just armed for `issue`.
 pub(super) fn log_armed(
     issue: u32,
@@ -54,7 +73,7 @@ fn armed_line(
 ) -> String {
     let secs = delay.as_secs();
     match cause {
-        DispatchBackoffCause::Generic => format!(
+        DispatchBackoffCause::Generic | DispatchBackoffCause::FastFailure => format!(
             "sweep_registry: issue #{issue} dispatch backoff armed — {consecutive} consecutive \
              failed dispatch(es), next attempt allowed in {secs}s (#4485; cause={cause:?})"
         ),
@@ -84,7 +103,7 @@ fn refused_line(issue: u32, state: Option<&DispatchBackoffState>, remaining: Dur
             "sweep_registry: refusing to dispatch issue #{issue} — its work already landed, \
              {secs}s of landed cooldown remaining (#11853)"
         ),
-        Some(DispatchBackoffCause::Generic) | None => format!(
+        Some(DispatchBackoffCause::Generic | DispatchBackoffCause::FastFailure) | None => format!(
             "sweep_registry: refusing to dispatch issue #{issue} — {consecutive} consecutive \
              failed dispatch(es), {secs}s of backoff remaining (#4485)"
         ),
