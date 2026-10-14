@@ -30,20 +30,30 @@ outcome vocabulary for each mode is the table in its section. Never invent one.
 
 ## `--pr N`: one merge decision
 
-1. **Kind probe and eligibility.** One plain (uncached) read:
+1. **Kind probe, eligibility and the pin file.** One plain (uncached) read:
 
    ```bash
    PR_NUMBER=N
    PR_JSON=$(gh pr view "$PR_NUMBER" --json url,state,headRefOid,labels) || PR_JSON=""
-   EVALUATED_SHA=$(printf '%s' "$PR_JSON" | jq -r '.headRefOid // empty')
+   EVALUATED_SHA=$(printf '%s' "$PR_JSON" | jq -r 'select((.url | test("/pull/")) and .state == "OPEN" and any(.labels[]; .name == "loom:pr")) | .headRefOid // empty')
+   PIN_FILE="$(git rev-parse --git-common-dir)/loom-champion-pin-pr-$PR_NUMBER"; rm -f "$PIN_FILE"
+   [ -n "$EVALUATED_SHA" ] && printf '%s\n' "$EVALUATED_SHA" > "$PIN_FILE"
+   echo "EVALUATED_SHA=${EVALUATED_SHA:-none}"
    ```
 
-   Not a `/pull/` URL, not `OPEN`, or no `loom:pr` label: outcome `not-eligible`,
-   no writes. (A Doctor-capped PR is the non-item pass's Priority 5, not a merge.)
-2. **Pin the head you evaluate.** `EVALUATED_SHA` is the head every criterion
-   below is judged against. `export EXPECTED_HEAD="$EVALUATED_SHA"`: Step 3 of
-   `champion-pr-merge.md` reads it, using it as the merge-queue `--approved-sha`
-   and passing `merge-pr.sh --expected-head "$EXPECTED_HEAD"`.
+   `none` (not a `/pull/` URL, not `OPEN`, already merged, or no `loom:pr`):
+   outcome `not-eligible`, no writes. (A Doctor-capped PR is the non-item pass's
+   Priority 5, not a merge.)
+2. **Pin the head you evaluate.** The printed `EVALUATED_SHA` is the head every
+   criterion below is judged against. **Shell variables do not survive between
+   tool calls**, so when you run Step 3 of `champion-pr-merge.md`, its block's
+   first line must be `EXPECTED_HEAD=<that SHA, written out literally>`. Step 3
+   then uses it as the merge-queue `--approved-sha` and passes
+   `merge-pr.sh --expected-head`. The pin file from step 1 is the fail-closed
+   backstop: while it is under 60 minutes old, a Step 3 run whose
+   `EXPECTED_HEAD` is missing or different prints `CHAMPION-PIN-MISSING` and
+   merges nothing. **Remove the pin file (`rm -f`) as the step's last action,
+   whatever the outcome.**
 3. **Run `champion-pr-merge.md` for this one PR, as one batch row.** The
    Verdict-State Janitor (Parts 1 and 2), all 6 Safety Criteria with the merge-risk
    axes and sticky holds, the critical-file hold and, when a hold binds, the
@@ -59,7 +69,7 @@ outcome vocabulary for each mode is the table in its section. Never invent one.
 | `rejected` | A criterion failed and the PR Rejection Workflow ran (Janitor, stale route, CI) |
 | `requeued` | `merge-pr.sh` exit 3, 4, 5 or 7: not merged, still approved |
 | `head-moved` | `merge-pr.sh` exit **8**: the head is no longer `EVALUATED_SHA`. Not a failure: post no "Merge Failed", leave the labels; the next step evaluates the new head |
-| `failed` | Exit 1 (Error Handling's "Merge Failed" comment), or no `CHAMPION-MERGE-OUTCOME` line (its "No exit code at all") |
+| `failed` | Exit 1 (Error Handling's "Merge Failed" comment), or no `CHAMPION-MERGE-OUTCOME` line (its "No exit code at all"). Also `CHAMPION-PIN-MISSING`: nothing merged, and no "Merge Failed" comment (the pin was lost, not the merge) |
 | `not-eligible` | Step 1 |
 
 **Never re-read the head and retry the merge** inside the step: the retry is

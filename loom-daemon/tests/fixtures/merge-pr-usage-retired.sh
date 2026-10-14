@@ -100,8 +100,9 @@ Options:
   --cleanup-primary      (no-op, primary-checkout cleanup is the default)
   --expected-head <sha>  Fail-closed head pin (#11859): refuse with exit 8 unless
                          the PR head is exactly this full commit SHA, and gate
-                         the forge merge call on it. A targeted Champion passes
-                         the head it evaluated.
+                         the forge merge call on it. Any later head move exits
+                         3 (the #8164 self-sync retry is declined under the
+                         pin). A targeted Champion passes the head it evaluated.
   -h, --help             Show this help and exit
 
 By default, the local worktree AND the local branch it held are cleaned up

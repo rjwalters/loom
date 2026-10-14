@@ -57,7 +57,13 @@ awk '/^```bash$/{buf="";inb=1;next} /^```$/{if(inb&&buf~/merge-queue step/){prin
 [[ -s "$TMP/step3.sh" ]] || { echo "FAIL: could not extract Step 3 block"; exit 1; }
 bash -n "$TMP/step3.sh" || { echo "FAIL: Step 3 block is not valid bash"; exit 1; }
 
-printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP/bin/git"
+# git: only `rev-parse --git-common-dir` answers (where the --pr pin file lives).
+mkdir -p "$TMP/gitdir"
+cat > "$TMP/bin/git" <<S
+#!/usr/bin/env bash
+[ "\$*" = "rev-parse --git-common-dir" ] && echo "$TMP/gitdir"
+exit 0
+S
 cat > "$TMP/bin/gh" <<S
 #!/usr/bin/env bash
 case "\$*" in
@@ -108,11 +114,30 @@ run_step3 "$EVAL_SHA"
 check "exit 1 is still a failure under --pr N" eval 'has "Merge failed for PR #42"'
 unset MERGE_STUB_RC
 
+echo "--- 1b. the --pr pin file: fail closed when the pin does not reach Step 3 ---"
+PIN_FILE="$TMP/gitdir/loom-champion-pin-pr-42"
+printf '%s\n' "$EVAL_SHA" > "$PIN_FILE"
+run_step3
+check "pin file + NO EXPECTED_HEAD (the env var was lost between calls): no merge, no queue call" \
+  eval '[[ ! -e "$TMP/merge-argv" && ! -e "$TMP/queue-argv" ]]'
+check "pin file + no EXPECTED_HEAD: CHAMPION-PIN-MISSING names the SHA to write, outcome rc=1 (failed)" \
+  eval 'has "CHAMPION-PIN-MISSING pr=42: set EXPECTED_HEAD=$EVAL_SHA" && has "CHAMPION-MERGE-OUTCOME pr=42 rc=1"'
+run_step3 1111111111111111111111111111111111111111
+check "pin file + a DIFFERENT EXPECTED_HEAD: no merge" eval '[[ ! -e "$TMP/merge-argv" ]] && has CHAMPION-PIN-MISSING'
+run_step3 "$EVAL_SHA"
+check "pin file + the literal pinned SHA: merges pinned" \
+  eval '[[ "$MARGV" == "42 --auto --redate-stale-checks --expected-head $EVAL_SHA" ]] && hasnt CHAMPION-PIN-MISSING'
+touch -t 202001010000 "$PIN_FILE"
+run_step3
+check "a pin file over 60 minutes old (a crashed step) no longer blocks the batch merge" \
+  eval '[[ "$MARGV" == "42 --auto --redate-stale-checks" ]] && hasnt CHAMPION-PIN-MISSING'
+rm -f "$PIN_FILE"
+
 # ---------------------------------------------------------------------------
 echo "--- 2. champion.md routing ---"
 check "champion.md reads \$ARGUMENTS" doc_has "$CHAMPION_MD" '**Arguments**: `$ARGUMENTS`'
 check "the three arguments route to champion-targeted.md" \
-  doc_has "$CHAMPION_MD" '`--pr N`, `--issue N` or `--non-item`: follow [`champion-targeted.md`](champion-targeted.md) instead of "Finding Work"'
+  doc_has "$CHAMPION_MD" '`--pr N`, `--issue N` or `--non-item`: follow `champion-targeted.md` instead of "Finding Work"'
 check "no arguments: the batch pass, unchanged" doc_has "$CHAMPION_MD" 'No arguments: the batch pass below, unchanged.'
 check "champion-targeted.md is load-gated (not charged to every Champion session)" \
   doc_has "$CHAMPION_MD" '| `champion-targeted.md` | `--pr`, `--issue`, `--non-item` modes | `$ARGUMENTS` given |'
@@ -128,7 +153,13 @@ check "every mode ends with one CHAMPION-STEP line" \
 check "an unknown or doubled argument refuses and touches nothing" \
   doc_has "$TARGETED_MD" 'Error: /loom:champion takes --pr N, --issue N or --non-item'
 # --pr N
-check "--pr: pins the evaluated head into Step 3" doc_has "$TARGETED_MD" 'export EXPECTED_HEAD="$EVALUATED_SHA"'
+check "--pr: writes the pin file only for an eligible PR" doc_has "$TARGETED_MD" '[ -n "$EVALUATED_SHA" ] && printf'
+check "--pr: Step 3 must carry the SHA literally (env does not survive tool calls)" \
+  doc_has "$TARGETED_MD" 'first line must be `EXPECTED_HEAD=<that SHA, written out literally>`'
+check "--pr: a lost pin is outcome failed, never merged" doc_has "$TARGETED_MD" 'Also `CHAMPION-PIN-MISSING`: nothing merged'
+check "--pr: the pin file is removed at the end of every step" doc_has "$TARGETED_MD" '**Remove the pin file (`rm -f`) as the step'\''s last action'
+check "batch Step 3 never reads a pin it was not given: the guard is a no-op without a pin file" \
+  doc_has "$PR_MERGE_MD" 'if [ -n "$PIN" ] && [ "${EXPECTED_HEAD:-}" != "$PIN" ]; then MERGE_RC=1'
 check "--pr: full criteria, sticky holds, merge-risk axes, health pass" \
   doc_has "$TARGETED_MD" 'all 6 Safety Criteria with the merge-risk'
 check "--pr: exit 8 is outcome head-moved, not a failure" \

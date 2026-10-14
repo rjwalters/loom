@@ -78,7 +78,10 @@
 #                          targeted Champion (`/loom:champion --pr N`) passes
 #                          the head it evaluated, so a push after its
 #                          evaluation can never be merged under its verdict.
-#                          Later head moves keep the #5579 / #8164 handling.
+#                          Any later head move exits 3: under the pin the #8164
+#                          self-sync retry is declined (its check reads only the
+#                          merge commit's parents, never its tree), so a fresh
+#                          evaluation of the new head always comes first.
 #
 # By default, the local worktree AND the local branch it held are cleaned up
 # after a successful merge (#4100). Pass --no-cleanup-worktree to skip both
@@ -253,6 +256,9 @@ _mr_say() { local l="${_MR#*$'\n'"$1"$'\t'}"; [[ "$l" != "$_MR" ]] || l="PR #$PR
 # (a rebase-style update, a commit pushed on top, a merge of some other
 # branch) stays the #5579 hard stop.
 #
+# Under --expected-head (#11859) the retry is declined (--retry-used): the
+# check reads parents, not the tree, and a pinned caller re-evaluates instead.
+#
 # Fails safe by construction: only exit 0 PLUS the sentinel retries, so a
 # missing/old/substituted binary, a forge read failure, or any silent failure
 # lands on the pre-#8164 behaviour — exit 3, re-queue — which is why this
@@ -260,7 +266,7 @@ _mr_say() { local l="${_MR#*$'\n'"$1"$'\t'}"; [[ "$l" != "$_MR" ]] || l="PR #$PR
 # would otherwise have been re-queued; it can never remove a refusal.
 _head_moved_or_resync() {
   local _CURRENT_HEAD_SHA="" _CHR_JSON _HMR_OUT _HMR_RC=0 _HMR_FLAGS=(); _CHR_JSON="$(forge_get_pr_nocache "$REPO_NWO" "$PR_NUMBER" "$GH" 2>/dev/null || echo '{}')"; _CURRENT_HEAD_SHA="$(echo "$_CHR_JSON" | jq -r '.head.sha // empty' 2>/dev/null || echo '')"; unset _CHR_JSON
-  [[ "${_HEAD_SELF_SYNCED:-}" == "true" ]] && _HMR_FLAGS+=(--self-synced); [[ "${_HEAD_RESYNC_USED:-}" == "true" || "${MERGE_ATTEMPT:-1}" -ge "${MAX_MERGE_RETRIES:-3}" ]] && _HMR_FLAGS+=(--retry-used); [[ "${2:-}" == "exit-code" ]] && _HMR_FLAGS+=(--mismatch-confirmed)
+  [[ "${_HEAD_SELF_SYNCED:-}" == "true" ]] && _HMR_FLAGS+=(--self-synced); [[ -n "${EXPECTED_HEAD_SHA:-}" || "${_HEAD_RESYNC_USED:-}" == "true" || "${MERGE_ATTEMPT:-1}" -ge "${MAX_MERGE_RETRIES:-3}" ]] && _HMR_FLAGS+=(--retry-used); [[ "${2:-}" == "exit-code" ]] && _HMR_FLAGS+=(--mismatch-confirmed)
   _HMR_OUT="$(printf '%s' "$1" | "${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr head-sync-retry --pr "$PR_NUMBER" --repo "$REPO_NWO" --precondition-sha "$MERGE_PRECONDITION_SHA" "${_HMR_FLAGS[@]+"${_HMR_FLAGS[@]}"}" 2>/dev/null)" || _HMR_RC=$?
   if [[ $_HMR_RC -eq 0 && "$_HMR_OUT" == "LOOM-HEAD-SELF-SYNC-RETRY "* ]]; then _HEAD_RESYNC_USED=true; MERGE_PRECONDITION_SHA="${_HMR_OUT##* }"; info "PR #$PR_NUMBER: head-SHA mismatch attributed to this run's own base-sync; retrying once against ${MERGE_PRECONDITION_SHA:0:8} (#8164)"; return 0; fi
   [[ -n "$_HMR_OUT" ]] && warning "$_HMR_OUT"; error_head_moved "PR #$PR_NUMBER: $1" "$MERGE_PRECONDITION_SHA" "$_CURRENT_HEAD_SHA"

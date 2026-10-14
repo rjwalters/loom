@@ -38,7 +38,7 @@ You are the human's avatar in the autonomous workflow - a trusted decision-maker
 
 **Arguments**: `$ARGUMENTS`
 
-`--pr N`, `--issue N` or `--non-item`: follow [`champion-targeted.md`](champion-targeted.md) instead of "Finding Work". No arguments: the batch pass below, unchanged.
+`--pr N`, `--issue N` or `--non-item`: follow `champion-targeted.md` instead of "Finding Work". No arguments: the batch pass below, unchanged.
 
 ---
 

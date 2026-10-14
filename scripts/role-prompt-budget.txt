@@ -19,7 +19,7 @@
 architect      14916        -
 auditor        20505        -
 builder        29538        -
-champion       14054        -
+champion       14048        -
 curator        44691    30000
 doctor         32548    30000
 driver         10763        -
