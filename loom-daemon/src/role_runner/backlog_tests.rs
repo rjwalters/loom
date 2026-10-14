@@ -104,25 +104,112 @@ fn args_carry_level_open_and_target() {
     assert_eq!(d.args(), " --backlog-level strict --backlog-open 412 --backlog-target 140");
 }
 
+/// A runner double: records the prompt it was given and reports `trace` as
+/// the launched run's identity (`None` = the tick never launched).
+struct FakeRunner {
+    prompt: Option<String>,
+    trace: Option<crate::observability::lifecycle::RoleTrace>,
+}
+
+impl crate::role_runner::RoleInvocationRunner for FakeRunner {
+    fn invoke(&mut self, _role: &str, prompt: &str) -> crate::role_runner::RoleTickOutcome {
+        self.prompt = Some(prompt.to_string());
+        crate::role_runner::RoleTickOutcome::Success
+    }
+    fn trace_context(&self) -> Option<crate::observability::lifecycle::RoleTrace> {
+        self.trace.clone()
+    }
+}
+
+fn launched(execution: &str) -> crate::observability::lifecycle::RoleTrace {
+    crate::observability::lifecycle::RoleTrace {
+        context: crate::telemetry::trace::TraceContext {
+            trace_id: crate::telemetry::trace::TraceContext::root(true).trace_id,
+            span_id: crate::telemetry::trace::TraceContext::root(true).span_id,
+            flags: 1,
+        },
+        execution: execution.to_string(),
+        started_at: chrono::Utc::now(),
+        failure: None,
+    }
+}
+
 #[test]
 #[serial(loom_config_env)]
 fn without_a_target_the_prompt_is_byte_identical_and_nothing_is_recorded() {
     let dir = tempdir().unwrap();
-    let (prompt, captured) =
-        capture(|| no_defaults(|| with_backlog_args(dir.path(), CURATOR_ROLE, "/loom:curator")));
-    assert_eq!(prompt, "/loom:curator");
+    let mut runner = FakeRunner {
+        prompt: None,
+        trace: Some(launched("role-curator-x")),
+    };
+    let (_, captured) = capture(|| {
+        no_defaults(|| {
+            invoke_with_backlog(&mut runner, dir.path(), CURATOR_ROLE, "/loom:curator", |_| {
+                panic!("no target means no count")
+            })
+        })
+    });
+    assert_eq!(runner.prompt.as_deref(), Some("/loom:curator"));
+    assert!(captured.records.is_empty());
+}
+
+#[test]
+#[serial(loom_config_env)]
+fn the_record_carries_the_launched_runs_id() {
+    let dir = tempdir().unwrap();
+    with_target(dir.path(), 140);
+    let mut runner = FakeRunner {
+        prompt: None,
+        trace: Some(launched("role-curator-launched")),
+    };
+    let (_, captured) = capture(|| {
+        no_defaults(|| {
+            invoke_with_backlog(&mut runner, dir.path(), CURATOR_ROLE, "/loom:curator", |_| Ok(412))
+        })
+    });
+    assert_eq!(
+        runner.prompt.as_deref(),
+        Some("/loom:curator --backlog-level strict --backlog-open 412 --backlog-target 140")
+    );
+    let ids: Vec<_> = captured
+        .records
+        .iter()
+        .filter_map(|r| match r {
+            TelemetryRecord::BacklogLevel(b) => Some(b.dispatch_id.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids, ["role-curator-launched"]);
+}
+
+#[test]
+#[serial(loom_config_env)]
+fn a_tick_that_never_launches_writes_no_record_but_still_gets_the_flags() {
+    let dir = tempdir().unwrap();
+    with_target(dir.path(), 140);
+    let mut runner = FakeRunner {
+        prompt: None,
+        trace: None,
+    };
+    let (_, captured) = capture(|| {
+        no_defaults(|| {
+            invoke_with_backlog(&mut runner, dir.path(), CURATOR_ROLE, "/loom:curator", |_| Ok(412))
+        })
+    });
+    assert!(runner.prompt.unwrap().contains("--backlog-level strict"));
     assert!(captured.records.is_empty());
 }
 
 #[test]
 fn the_record_names_repo_level_and_dispatch() {
     let at = chrono::Utc::now();
-    let r = BacklogDispatch::from_count(140, Ok(412)).record("RJWalters/Loom", at);
+    let id = "role-curator-2026-10-13T00:00:00.000000001Z".to_string();
+    let r = BacklogDispatch::from_count(140, Ok(412)).record("RJWalters/Loom", id.clone(), at);
     assert_eq!(r.repo, "rjwalters/loom");
     assert_eq!(r.open, Some(412));
     assert_eq!(r.target, 140);
     assert_eq!(r.level, BacklogLevel::Strict);
-    assert!(r.dispatch_id.starts_with("role-curator-"), "{}", r.dispatch_id);
+    assert_eq!(r.dispatch_id, id);
     assert_eq!(r.observed_at, at);
     // Round-trips as the registered kind.
     let record = TelemetryRecord::BacklogLevel(r);

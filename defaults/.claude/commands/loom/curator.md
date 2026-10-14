@@ -1849,8 +1849,8 @@ distinct signal called for by this issue's acceptance criteria: grep issue
 comments for that literal phrase (or for the `curator:operator-premise-recheck:`
 marker) to rank operator-parked issues with a stale premise separately from
 ones still genuinely waiting — deliberately a report-line convention rather
-than a new label, consistent with this file's "Never invent new labels" rule
-under "Maintenance" above.
+than a new label, consistent with this file's no-invented-labels rule
+under "Organization" above.
 
 **If every referenced number is still open** → no comment this pass. "Still
 parked, checked" is not newsworthy, exactly as an unchanged `blocked`

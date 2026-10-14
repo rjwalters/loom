@@ -2903,8 +2903,8 @@ fn invoke_with_collision_probe<R: RoleInvocationRunner + ?Sized>(
     crate::role_collision::record_run_started(root, role, chrono::Utc::now());
     // #11819: a Curator on a repo with `curator.backlogTarget` carries the
     // daemon-computed backlog level; every other dispatch is unchanged.
-    let prompt = backlog::with_backlog_args(root, role, prompt);
-    let outcome = runner.invoke(role, &prompt);
+    let outcome =
+        backlog::invoke_with_backlog(runner, root, role, prompt, backlog::count_open_issues);
     crate::role_collision::record_run_finished(root, role, chrono::Utc::now());
     outcome
 }

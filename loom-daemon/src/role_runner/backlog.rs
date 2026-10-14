@@ -10,8 +10,10 @@
 //! ([`BacklogLevel::for_counts`]), appends it to the slash command the same
 //! way `--max-proposals` reaches the Architect
 //! (`/loom:curator --backlog-level strict --backlog-open 412
-//! --backlog-target 140`), and exports one `backlog.level` record.
+//! --backlog-target 140`), and exports one `backlog.level` record for the run that launches.
 //!
+//! - **Only a launch records**: the record's id is the launched run's, so a
+//!   tick that never launches exports none.
 //! - **No target ⇒ nothing**: no forge call, no flags, no record; the prompt
 //!   is byte-identical to a pre-#11819 dispatch.
 //! - **The count fails ⇒ `normal`** plus a warning, and `--backlog-open` is
@@ -83,15 +85,17 @@ impl BacklogDispatch {
         )
     }
 
-    /// The `backlog.level` record for this dispatch.
+    /// The `backlog.level` record for this dispatch. `dispatch_id` is the
+    /// launched run's execution id (`RoleTrace.execution`, the root span's
+    /// `loom.sweep_id`), never one minted here.
     #[must_use]
-    pub fn record(&self, repo: &str, at: DateTime<Utc>) -> BacklogLevelRecord {
+    pub fn record(&self, repo: &str, dispatch_id: String, at: DateTime<Utc>) -> BacklogLevelRecord {
         BacklogLevelRecord {
             repo: repo.to_ascii_lowercase(),
             open: self.open,
             target: self.target,
             level: self.level,
-            dispatch_id: crate::observability::lifecycle::role_execution_id(CURATOR_ROLE, at),
+            dispatch_id,
             count_error: self.count_error.clone(),
             observed_at: at,
             loom: Provenance::current(),
@@ -123,19 +127,31 @@ pub fn resolve_with(
     Some(dispatch)
 }
 
-/// `prompt` plus the backlog flags for a Curator dispatch on a repo with a
-/// target, exporting one `backlog.level` record; `prompt` unchanged otherwise.
-/// **Blocking**: may make one forge call.
-#[must_use]
-pub fn with_backlog_args(root: &Path, role: &str, prompt: &str) -> String {
-    let Some(dispatch) = resolve_with(root, role, count_open_issues) else {
-        return prompt.to_string();
+/// Invoke `role` once on `runner`. A Curator on a repo with a target gets the
+/// backlog flags appended to `prompt`, and one `backlog.level` record is
+/// exported **only if the tick launched**, keyed by the launched run's own
+/// execution id (`RoleTrace.execution`, as `pick_decision` takes its
+/// `tick_id`); a tick that never launches records nothing. Any other dispatch
+/// is `runner.invoke(role, prompt)` unchanged. **Blocking**: may make one
+/// forge call.
+pub fn invoke_with_backlog<R: super::RoleInvocationRunner + ?Sized>(
+    runner: &mut R,
+    root: &Path,
+    role: &str,
+    prompt: &str,
+    count: impl FnOnce(&Path) -> Result<u64, String>,
+) -> super::RoleTickOutcome {
+    let Some(dispatch) = resolve_with(root, role, count) else {
+        return runner.invoke(role, prompt);
     };
-    let repo = crate::release_resolve::host::repo_slug(root).unwrap_or_default();
-    crate::observability::ops::emit_record(crate::telemetry::TelemetryRecord::BacklogLevel(
-        dispatch.record(&repo, Utc::now()),
-    ));
-    format!("{prompt}{}", dispatch.args())
+    let outcome = runner.invoke(role, &format!("{prompt}{}", dispatch.args()));
+    if let Some(trace) = runner.trace_context() {
+        let repo = crate::release_resolve::host::repo_slug(root).unwrap_or_default();
+        crate::observability::ops::emit_record(crate::telemetry::TelemetryRecord::BacklogLevel(
+            dispatch.record(&repo, trace.execution, trace.started_at),
+        ));
+    }
+    outcome
 }
 
 /// The REST path counting `slug`'s open issues: first page of one item, so
@@ -162,7 +178,7 @@ pub fn parse_total_count(body: &str) -> Result<u64, String> {
 }
 
 /// Count `root`'s open issues (PRs excluded) with one REST search.
-fn count_open_issues(root: &Path) -> Result<u64, String> {
+pub(super) fn count_open_issues(root: &Path) -> Result<u64, String> {
     use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
     let slug = crate::release_resolve::host::repo_slug(root)
         .ok_or_else(|| "no owner/repo from the origin remote".to_string())?;
