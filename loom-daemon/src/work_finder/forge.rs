@@ -126,6 +126,15 @@ impl WorkSource for GhWorkSource {
     fn list_open_very_important(&mut self) -> Option<Vec<WorkItem>> {
         let (gh, cwd, repo) = (&self.gh_bin, self.cwd.as_deref(), self.repo.as_deref());
         let label = crate::priority_pick::VERY_IMPORTANT_LABEL;
+        // 2am#4367 P5: a discovery listing, so the mirror may serve it.
+        if let Some(rows) = mirror_rows(cwd, repo, label, true) {
+            return Some(
+                rows.into_iter()
+                    .filter(|r| !r.is_pull_request)
+                    .map(|r| WorkItem::with_created_at(r.number, r.labels, r.created_at))
+                    .collect(),
+            );
+        }
         match crate::forge_listing::list_issues_cached_paged_as(
             "work_finder",
             gh,
@@ -224,7 +233,15 @@ impl GhWorkSource {
     /// 1 failing is an error. Without `all_pages`, page 1 alone.
     fn list_label(&mut self, label: &str, all_pages: bool) -> Result<Vec<WorkItem>> {
         let (gh, cwd, repo) = (&self.gh_bin, self.cwd.as_deref(), self.repo.as_deref());
-        let listing = if all_pages {
+        // 2am#4367 P5: the candidate listing from the state mirror when the
+        // repo's watermark is within its bound; else today's REST path. The
+        // claim itself (`dispatch`) re-reads the forge and never the mirror.
+        let listing = if let Some(rows) = mirror_rows(cwd, repo, label, all_pages) {
+            crate::forge_listing::PagedListing {
+                rows,
+                incomplete: None,
+            }
+        } else if all_pages {
             crate::forge_listing::list_issues_cached_paged_as(
                 "work_finder",
                 gh,
@@ -276,6 +293,32 @@ impl GhWorkSource {
             })
             .collect())
     }
+}
+
+/// A candidate listing from the GitHub state mirror (2am#4367 P5), or `None`
+/// (read the forge as today): no mirror live, the repo stale or unknown to
+/// it, or any error. Always a [`ReadKind::Discovery`] read.
+///
+/// [`ReadKind::Discovery`]: crate::forge_events::poll_gate::ReadKind::Discovery
+fn mirror_rows(
+    cwd: Option<&Path>,
+    repo: Option<&str>,
+    label: &str,
+    all_pages: bool,
+) -> Option<Vec<crate::forge_listing::RestIssue>> {
+    use crate::forge_mirror::discovery::{list_open, Caller, Pages};
+    if !crate::forge_mirror::is_active() {
+        return None;
+    }
+    let pages = if all_pages { Pages::All } else { Pages::First };
+    list_open(
+        crate::forge_events::poll_gate::ReadKind::Discovery,
+        Caller::WorkFinder,
+        cwd,
+        repo,
+        label,
+        pages,
+    )
 }
 
 /// A concrete [`WorkDispatcher`] backed by the daemon [`SweepRegistry`].

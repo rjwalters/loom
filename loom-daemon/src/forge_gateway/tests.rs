@@ -155,12 +155,12 @@ fn a_file_key_must_be_owner_only_and_never_appears_in_the_error() {
     std::fs::write(&path, format!("{KEY}\n")).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
     let r = KeyRef::File(path.clone());
-    let err = r.read(&AwsAccess::default()).unwrap_err();
+    let err = r.read(&AwsAccess::default(), CONFIG_KEY).unwrap_err();
     assert!(!err.contains(KEY), "{err}");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-    assert_eq!(r.read(&AwsAccess::default()).unwrap(), KEY);
+    assert_eq!(r.read(&AwsAccess::default(), CONFIG_KEY).unwrap(), KEY);
     std::fs::write(&path, "not a key at all\nsecond line").unwrap();
-    let err = r.read(&AwsAccess::default()).unwrap_err();
+    let err = r.read(&AwsAccess::default(), CONFIG_KEY).unwrap_err();
     assert!(!err.contains("not a key"), "{err}");
 }
 
@@ -554,7 +554,7 @@ fn ssm_refs_parse_and_are_read_in_an_explicit_region() {
 
     // No region anywhere: refused before any AWS call, saying how to fix it.
     let err = KeyRef::Ssm("/p/k".into())
-        .read(&AwsAccess::default())
+        .read(&AwsAccess::default(), CONFIG_KEY)
         .unwrap_err();
     assert!(err.contains("forge.gateway.region") && err.contains("AWS_REGION"), "{err}");
 
@@ -578,22 +578,32 @@ fn ssm_reads_use_the_instance_role_unless_a_profile_is_configured() {
         .map(|(k, _)| k.to_string_lossy().into_owned())
         .collect();
     for key in AWS_IDENTITY_ENV {
+        if crate::aws_ssm::AWS_FILE_ENV.contains(key) {
+            continue; // set to /dev/null, below
+        }
         assert!(removed.iter().any(|r| r == key), "{key} reaches the aws child: {removed:?}");
     }
-    assert!(cmd.get_envs().all(|(_, v)| v.is_none()), "nothing is set, only removed");
+    // With no profile the shared files are /dev/null: no `default` profile
+    // in ~/.aws can stand in for the instance role.
+    for key in crate::aws_ssm::AWS_FILE_ENV {
+        assert!(
+            cmd.get_envs()
+                .any(|(k, v)| k == *key && v == Some(std::ffi::OsStr::new("/dev/null"))),
+            "{key}"
+        );
+    }
     let args: Vec<String> = cmd
         .get_args()
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
-    assert!(!args.contains(&"--profile".to_string()), "{args:?}");
+    assert!(!args.iter().any(|a| a.starts_with("--profile")), "{args:?}");
 
     let named = ssm_command("/p/k", "us-east-1", Some("relay-reader"));
     let args: Vec<String> = named
         .get_args()
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
-    let at = args.iter().position(|a| a == "--profile").unwrap();
-    assert_eq!(args[at + 1], "relay-reader");
+    assert!(args.contains(&"--profile=relay-reader".to_string()), "{args:?}");
     // The profile is named on the command line, so the environment can't
     // move it either.
     assert!(named
@@ -602,11 +612,11 @@ fn ssm_reads_use_the_instance_role_unless_a_profile_is_configured() {
 
     let v = json!({"forge": {"gateway": {"origin": "gw.example.com", "awsProfile": "relay-reader",
         "keyRefs": {"acme": "ssm:///p"}}}});
-    assert_eq!(parse(&v).0.unwrap().aws_profile.as_deref(), Some("relay-reader"));
+    assert_eq!(parse(&v).0.unwrap().aws_profile.name(), Some("relay-reader"));
     let bad = json!({"forge": {"gateway": {"origin": "gw.example.com", "awsProfile": "a b",
         "keyRefs": {"acme": "ssm:///p"}}}});
     let (c, w) = parse(&bad);
-    assert_eq!((c.unwrap().aws_profile, w.len()), (None, 1));
+    assert_eq!((c.unwrap().aws_profile, w.len()), (AwsProfile::Invalid, 1));
 }
 
 #[test]

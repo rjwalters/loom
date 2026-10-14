@@ -94,7 +94,7 @@ impl Deps for RealDeps {
     }
 
     fn read_key(&self, r: &KeyRef, aws: &super::AwsAccess<'_>) -> Result<String, String> {
-        r.read(aws)
+        r.read(aws, super::CONFIG_KEY)
     }
 }
 
@@ -236,7 +236,7 @@ impl Refresher {
         });
         let aws = super::AwsAccess {
             region: region.as_deref(),
-            profile: cfg.aws_profile.as_deref(),
+            profile: &cfg.aws_profile,
         };
         for (owner, r) in &cfg.key_refs {
             let dir = base.join(owner);

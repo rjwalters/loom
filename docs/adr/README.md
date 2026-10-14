@@ -54,7 +54,7 @@ An Architecture Decision Record captures an important architectural decision mad
   - **Key Decision**: Merge commits first (full commit/author/timestamp history preserved for blame and audit), rebase second, squash only when it is a repo's sole allowed strategy; the stacked-PR machinery (`reconcile-stack.sh`, the #3747 pre-merge ordering guard, the #3752 amend rebase) is merge-method-agnostic and unchanged
 
 - [ADR-0024: Dedupe Read-Only Forge Pollers Across Hosts With One Captain-Published Snapshot per Repo](0024-cross-host-read-poller-dedupe.md)
-  - **Status**: Proposed
+  - **Status**: Superseded (pending rollout) by the GitHub state mirror (`forge.mirror`, 2AMLogic/2am#4367 P5)
   - **Summary**: Design note for the cross-host slice of #10512: the `fleet.captain` host (or the loom-ui mirror) publishes one snapshot per repo of the `star_liveness`, `stage_dwell` and `work_finder` listings; other hosts read it when fresh and fall back to their own conditional reads otherwise
   - **Key Decision**: Additive over an unchanged polling floor, observability/discovery reads only (gate reads stay local); projected fleet total about 8.4k to about 2.7k billable calls/h
 

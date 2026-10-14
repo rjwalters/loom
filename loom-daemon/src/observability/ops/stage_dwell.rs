@@ -625,6 +625,29 @@ impl StageFetcher for GhStageFetcher {
 
 static SAMPLER: Mutex<Option<Sampler>> = Mutex::new(None);
 
+/// One stage listing from the GitHub state mirror, or `None` (read the forge
+/// as today). No thread hop while no mirror is live.
+async fn mirror_listing(root: &Path, slug: &str, label: &'static str) -> Option<Vec<RestIssue>> {
+    use crate::forge_mirror::discovery::{list_open, Caller, Pages};
+    if !crate::forge_mirror::is_active() {
+        return None;
+    }
+    let (root, slug) = (root.to_path_buf(), slug.to_string());
+    tokio::task::spawn_blocking(move || {
+        list_open(
+            crate::forge_events::poll_gate::ReadKind::Discovery,
+            Caller::StageDwell,
+            Some(&root),
+            Some(&slug),
+            label,
+            Pages::First,
+        )
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 /// Sample every managed repo's stage listings and export the dwell points.
 /// A no-op (no forge reads at all) without the OTLP ops sink.
 pub(in crate::observability) async fn record(
@@ -659,9 +682,21 @@ pub(in crate::observability) async fn record(
         };
         let mut complete = true;
         for label in STAGE_LABELS {
-            match crate::observability::queue_blocked::list_open(root.clone(), label, "stage_dwell")
-                .await
-            {
+            // 2am#4367 P5: the state mirror first (a discovery read, first
+            // page like the REST listing), today's listing otherwise.
+            let mirrored = mirror_listing(&root, &input.slug, label).await;
+            let listing = match mirrored {
+                Some(rows) => Some(rows),
+                None => {
+                    crate::observability::queue_blocked::list_open(
+                        root.clone(),
+                        label,
+                        "stage_dwell",
+                    )
+                    .await
+                }
+            };
+            match listing {
                 Some(listing) => {
                     let items = listing.iter().map(StageItem::from_rest).collect();
                     input.listings.insert(label, items);
