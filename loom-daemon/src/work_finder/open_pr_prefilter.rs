@@ -23,7 +23,10 @@
 //! [`blocked_in`]). A candidate in that answer is resolved exactly as the
 //! in-`dispatch()` refusal resolves it — `QueueDisposition::OpenPr`, detail
 //! `open PR #X`, counted in `skipped_pr_open` — without `dispatch_with` being
-//! called. Every other candidate goes to `dispatch_with` as before.
+//! called. Every other candidate goes to `dispatch_with` as before, unless
+//! the landed pre-filter (#11853, [`super::landed_prefilter`], asked once per
+//! workspace per tick about the candidates without an open PR) finds its
+//! closing PR already merged: that one is resolved `AlreadyLanded`.
 //!
 //! # What it cannot do
 //!
@@ -102,6 +105,9 @@ pub struct OpenPrPrefilter {
     candidates: HashMap<usize, Vec<u32>>,
     /// Per workspace already asked this tick: issue to its open linked PR.
     blocked: HashMap<usize, HashMap<u32, u32>>,
+    /// Per workspace already asked this tick: open issue to its merged
+    /// closing PR (#11853, [`super::landed_prefilter`]).
+    landed: HashMap<usize, HashMap<u32, u32>>,
 }
 
 impl OpenPrPrefilter {
@@ -118,6 +124,7 @@ impl OpenPrPrefilter {
         Self {
             candidates: by_workspace,
             blocked: HashMap::new(),
+            landed: HashMap::new(),
         }
     }
 
@@ -137,6 +144,10 @@ impl OpenPrPrefilter {
             report.pr_open_prefiltered += 1;
             return (Qd::OpenPr, Some(format!("open PR #{pr}")));
         }
+        if let Some(pr) = self.landed_pr(dispatcher, cand) {
+            report.skipped_already_landed += 1;
+            return (Qd::AlreadyLanded, Some(format!("merged closing PR #{pr}")));
+        }
         let started = chrono::Utc::now();
         let outcome = dispatcher.dispatch_with(cand.number, overflow);
         record_dispatch_outcome(report, cand.number, cand.workspace_idx, started, &outcome)
@@ -155,6 +166,26 @@ impl OpenPrPrefilter {
             self.blocked.insert(idx, dispatcher.open_pr_blocked(asked));
         }
         self.blocked.get(&idx)?.get(&cand.number).copied()
+    }
+
+    /// `cand`'s merged closing PR while it stays open (#11853), asking its
+    /// workspace's dispatcher once per tick about every candidate without an
+    /// open linked PR. Called only after [`Self::open_pr`] answered.
+    fn landed_pr<D: WorkDispatcher>(
+        &mut self,
+        dispatcher: &D,
+        cand: &PriorityCandidate,
+    ) -> Option<u32> {
+        let idx = cand.workspace_idx;
+        if !self.landed.contains_key(&idx) {
+            let blocked = self.blocked.get(&idx);
+            let is_blocked = |n: &u32| blocked.is_some_and(|b| b.contains_key(n));
+            let all = self.candidates.get(&idx).map_or(&[][..], Vec::as_slice);
+            let (open_pr, asked): (Vec<u32>, Vec<u32>) = all.iter().partition(|n| is_blocked(n));
+            let answer = dispatcher.landed_closing_prs(&asked, &open_pr);
+            self.landed.insert(idx, answer);
+        }
+        self.landed.get(&idx)?.get(&cand.number).copied()
     }
 }
 
