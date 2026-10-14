@@ -416,6 +416,17 @@ struct GhLandedForge {
 }
 
 impl GhLandedForge {
+    /// The #9548 write gate: every label and comment write of this
+    /// pre-filter targets `slug`, vetted from `root` (cached by write_scope).
+    fn may_write(&self) -> bool {
+        crate::write_scope::gate_repo_with(
+            &self.root,
+            &self.slug,
+            &self.gh_bin,
+            "landed routing to Curator (#11853)",
+        )
+    }
+
     fn issue_path(&self, issue: u32) -> String {
         format!("repos/{}/issues/{issue}", self.slug)
     }
@@ -427,6 +438,20 @@ impl GhLandedForge {
         }
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
+}
+
+/// Whether a TRUSTED comment on `issue` carries [`route_marker`]`(pr)`. Only
+/// a trusted comment counts (#9548): an outsider's forged marker must not
+/// suppress routing.
+fn read_route_marked(forge: &GhLandedForge, issue: u32, pr: u32) -> Result<bool> {
+    let url = format!("{}/comments?per_page=100", forge.issue_path(issue));
+    let read = gh_call::read("landed.route_marker", &forge.gh_bin, &forge.root);
+    let listing = forge.run(read.args(["api", "--paginate", url.as_str()]))?;
+    let bodies = crate::comment_trust::TrustPolicy::for_root(&forge.root)
+        .trusted_bodies(listing.as_bytes())
+        .ok_or_else(|| anyhow!("unparseable comment listing for issue #{issue}"))?;
+    let marker = route_marker(pr);
+    Ok(bodies.iter().any(|b| b.contains(&marker)))
 }
 
 /// `owner` and `name` of `slug`, each safe inside a GraphQL string literal.
@@ -493,14 +518,13 @@ impl LandedForge for GhLandedForge {
     }
 
     fn route_marked(&mut self, issue: u32, pr: u32) -> Result<bool> {
-        let url = format!("{}/comments?per_page=100", self.issue_path(issue));
-        let jq = format!(".[].body | select(contains(\"{}\"))", route_marker(pr));
-        let read = gh_call::read("landed.route_marker", &self.gh_bin, &self.root);
-        let out = self.run(read.args(["api", "--paginate", url.as_str(), "--jq", jq.as_str()]))?;
-        Ok(!out.trim().is_empty())
+        read_route_marked(self, issue, pr)
     }
 
     fn add_label(&mut self, issue: u32, label: &str) -> bool {
+        if !self.may_write() {
+            return false;
+        }
         let path = format!("{}/labels", self.issue_path(issue));
         let field = format!("labels[]={label}");
         let w = gh_call::write("landed.add_triage", &self.gh_bin, &self.root);
@@ -509,6 +533,9 @@ impl LandedForge for GhLandedForge {
     }
 
     fn remove_label(&mut self, issue: u32, label: &str) -> bool {
+        if !self.may_write() {
+            return false;
+        }
         let path = format!("{}/labels/{}", self.issue_path(issue), label.replace(':', "%3A"));
         let w = gh_call::write("landed.remove_issue", &self.gh_bin, &self.root);
         match self.run(w.args(["api", "-X", "DELETE", path.as_str()])) {
@@ -518,6 +545,9 @@ impl LandedForge for GhLandedForge {
     }
 
     fn comment(&mut self, issue: u32, body: &str) -> bool {
+        if !self.may_write() {
+            return false;
+        }
         let path = format!("{}/comments", self.issue_path(issue));
         let field = format!("body={body}");
         let w = gh_call::write("landed.comment", &self.gh_bin, &self.root);

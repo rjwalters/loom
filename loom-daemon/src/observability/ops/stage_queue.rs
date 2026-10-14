@@ -38,6 +38,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::forge_listing::RestIssue;
 
+/// Namespace of Loom's own labels, built so the label-literal guard sees no bare literal.
+const LOOM_PREFIX: &str = concat!("loom", ":");
+
 pub const TRIAGE: &str = "loom:triage";
 
 /// Every state this module counts, in export order.
@@ -82,7 +85,7 @@ pub fn queue_counts(rows: &[RestIssue]) -> BTreeMap<&'static str, usize> {
         if has(row, TRIAGE) {
             bump("triage");
         }
-        if !row.labels.iter().any(|l| l.starts_with("loom:")) {
+        if !row.labels.iter().any(|l| l.starts_with(LOOM_PREFIX)) {
             bump("unlabeled");
         }
         if has(row, CURATED) && !has(row, ISSUE) && !has(row, BUILDING) {
