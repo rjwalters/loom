@@ -67,6 +67,10 @@ path = "loom-daemon/src/forge_identity.rs"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/credential_preflight.rs"
+# The bootstrap step probes identity with gh auth status before login/setup-git.
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/fleet/add_worker/forge_auth.rs"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/credential_preflight/pool.rs"

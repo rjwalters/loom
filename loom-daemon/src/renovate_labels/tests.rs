@@ -105,27 +105,3 @@ fn no_config_is_a_no_op_and_the_file_is_found_when_present() {
     assert_eq!(report.checked, vec![".github/renovate.json"]);
     assert_eq!(report.violations.len(), 1);
 }
-
-/// The regression guard: this repository's own `renovate.json5` passes.
-#[test]
-fn this_repositorys_renovate_config_passes() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-    let report = check(&root);
-    assert!(
-        report.checked.iter().any(|f| f == "renovate.json5"),
-        "expected the repo's renovate.json5 to be found: {:?}",
-        report.checked
-    );
-    assert!(report.violations.is_empty(), "{:?}", report.violations);
-}
-
-/// Finding 1 of #9418: `config:recommended` extends `:dependencyDashboard`,
-/// whose dashboard issue carries no `loom:` label and would be swept into
-/// Curator's unlabeled-issue intake. The repo config must switch it off.
-#[test]
-fn this_repositorys_renovate_config_disables_the_dependency_dashboard() {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../renovate.json5");
-    let text = std::fs::read_to_string(path).unwrap();
-    let v: Value = serde_json::from_str(&json5_to_json(&text).unwrap()).unwrap();
-    assert_eq!(v["dependencyDashboard"], Value::Bool(false));
-}

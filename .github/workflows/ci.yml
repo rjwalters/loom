@@ -2677,6 +2677,8 @@ jobs:
         run: bash defaults/scripts/check-cas-recheck-consistency.sh
       - name: Check every package manifest has a labeled dependabot entry (#7577)
         run: bash defaults/scripts/check-dependabot-labels.sh
+      - name: Test Dependabot label and manifest coverage (#11816)
+        run: bash defaults/scripts/tests/test-check-dependabot-labels.sh
       # #9418: the Renovate-side counterpart — every `labels` array in
       # renovate.json5 (top-level and every packageRules / vulnerabilityAlerts /
       # lockFileMaintenance override, which REPLACE rather than merge) carries

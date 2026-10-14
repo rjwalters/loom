@@ -32,6 +32,9 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HELPERS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 SCRIPT="$HELPERS_DIR/check-dependabot-labels.sh"
+# shellcheck source=lib/require-daemon-bin.sh
+source "$SCRIPT_DIR/lib/require-daemon-bin.sh"
+loom_test_require_daemon_bin "$HELPERS_DIR" check-dependabot-labels
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -236,6 +239,65 @@ if [[ -n "$REPO_ROOT" && -f "$REPO_ROOT/.github/dependabot.yml" ]]; then
     fi
 else
     echo "  SKIP: no live .github/dependabot.yml to check"
+fi
+
+# --- Generated config forms and dependency-free root (#11816) ---------------
+echo "Test 9: plural directories and inline labels cover multiple packages"
+REPO="$(new_repo generated)"
+add_manifest "$REPO" "." '{}' "pnpm-lock.yaml"
+add_manifest "$REPO" "pkg" '{"left-pad":"1.0.0"}' "package-lock.json"
+add_manifest "$REPO" "a space" '{"left-pad":"1.0.0"}' "package-lock.json"
+write_config "$REPO" <<'EOF'
+  - package-ecosystem: "npm"
+    directories:
+      - "/pkg"
+      - "/a space"
+    labels: ["dependencies", "loom:review-requested"]
+EOF
+OUT="$(run_check "$REPO")"; RC=$?
+if [[ "$RC" -eq 0 ]]; then
+    pass "generated form covers each directory; dependency-free locked root is exempt"
+else
+    fail "expected generated form to pass (rc=$RC): $OUT"
+fi
+
+# Same config must fail if a root dependency appears; exemption is not by path.
+printf '{"dependencies":{"left-pad":"1.0.0"}}\n' > "$REPO/package.json"
+OUT="$(run_check "$REPO")"; RC=$?
+if [[ "$RC" -ne 0 ]] && grep -q 'package.json' <<< "$OUT"; then
+    pass "dependency-bearing locked root still requires coverage"
+else
+    fail "expected uncovered root to fail (rc=$RC): $OUT"
+fi
+printf '{broken\n' > "$REPO/package.json"
+OUT="$(run_check "$REPO")"; RC=$?
+if [[ "$RC" -ne 0 ]] && grep -q 'package.json' <<< "$OUT"; then
+    pass "malformed manifest cannot claim dependency-free exemption"
+else
+    fail "expected malformed manifest to fail (rc=$RC): $OUT"
+fi
+printf '{}\n' > "$REPO/package.json"
+write_config "$REPO" <<'EOF'
+  - package-ecosystem: npm
+    directories: ["/pkg", "/a space"]
+    labels: [dependencies]
+EOF
+OUT="$(run_check "$REPO")"; RC=$?
+if [[ "$RC" -ne 0 ]] && grep -q 'loom:review-requested' <<< "$OUT"; then
+    pass "inline labels must include the review label"
+else
+    fail "expected missing inline review label to fail (rc=$RC): $OUT"
+fi
+write_config "$REPO" <<'EOF'
+  - package-ecosystem: npm
+    directories: ["/pkg"]
+    labels: ["loom:review-requested"]
+EOF
+OUT="$(run_check "$REPO")"; RC=$?
+if [[ "$RC" -ne 0 ]] && grep -q 'a space/package.json' <<< "$OUT"; then
+    pass "plural directories do not cover omitted nested packages"
+else
+    fail "expected omitted directory to fail (rc=$RC): $OUT"
 fi
 
 # --- Summary ----------------------------------------------------------------

@@ -519,6 +519,9 @@ pub(crate) enum ScriptPortCommand {
     /// `check-dependabot-labels.sh` (#7577), in Rust per the shell policy.
     CheckRenovateLabels(super::check_renovate_labels::CheckRenovateLabelsArgs),
 
+    /// Check Dependabot routing labels and npm manifest coverage (#11816).
+    CheckDependabotLabels(super::check_dependabot_labels::CheckDependabotLabelsArgs),
+
     /// Guard configuration diagnostics (#10434): `guards status` shows each
     /// guard category's effective value and source, hook wiring, a decision-log
     /// summary, and misconfiguration warnings. Read-only; always exits 0.
@@ -723,6 +726,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::CheckGuardWiring(args) => args.run(),
             ScriptPortCommand::CheckPrivateControlVersion(args) => args.run(),
             ScriptPortCommand::CheckRenovateLabels(args) => args.run(),
+            ScriptPortCommand::CheckDependabotLabels(args) => args.run(),
             ScriptPortCommand::Guards(cmd) => cmd.run(),
             ScriptPortCommand::PrLatency(args) => args.run(),
             ScriptPortCommand::ParkRecord(cmd) => cmd.run(),
