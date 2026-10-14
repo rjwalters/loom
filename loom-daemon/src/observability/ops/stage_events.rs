@@ -17,7 +17,9 @@
 //! full stop. Page 1's times are kept only when the walk reached page 2, so
 //! no skipped middle page can hide a newer application. A label whose
 //! latest event lies before the pages read has no time (not found), never
-//! an earlier one.
+//! an earlier one. A walk the caller's budget cut short of page 2 without
+//! the label is unanswered instead (`times: None`): only the [`MAX_PAGES`]
+//! cap, not the budget, makes a label "not found".
 //!
 //! Each reader passes its own `caller` (the facade operation), so
 //! `loom.forge.calls` tells stage-dwell's reads from the provider's.
@@ -102,6 +104,12 @@ pub fn walk(
         // The budget allowed page 1 alone: on a multi-page item that answers
         // nothing (its times may all be superseded), so it is unanswered,
         // not "not found".
+        return LabelTimes { times: None, pages };
+    }
+    if lowest > 2 && max_pages < MAX_PAGES && !has(&tail, label) {
+        // The caller's budget (not the cap) stopped the walk short of page 2
+        // without the label: it may sit on a page never read, so it is
+        // unanswered, not "not found".
         return LabelTimes { times: None, pages };
     }
     if lowest == 2 {

@@ -347,6 +347,9 @@ impl StageEntryProvider {
             .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case(label))
             .map(|(_, at)| *at);
+        // A contiguous walk ending at the last page that misses the label
+        // leaves the cached time as its latest application.
+        let found = found.or(stale_time);
         self.cache.insert(
             wanted,
             Cached {

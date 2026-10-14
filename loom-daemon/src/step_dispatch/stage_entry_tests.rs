@@ -351,3 +351,29 @@ fn an_item_updated_since_the_read_is_re_read_once_its_window_passes() {
     at(&mut p, &mut f, &moved, past + Duration::days(1));
     assert_eq!(f.reads, [13, 13]);
 }
+
+#[test]
+fn a_re_read_that_misses_the_label_keeps_the_time_already_known() {
+    let row = updated(
+        item(14, &["loom:review-requested"], Some("2026-10-01T00:00:00Z")),
+        "2026-10-10T00:00:00Z",
+    );
+    let mut f = FakeEvents::default().with(14, "loom:review-requested", "2026-10-09T00:00:00Z");
+    let mut p = provider(8);
+    let at = |p: &mut StageEntryProvider, f: &mut FakeEvents, row: &RestIssue, when| {
+        p.entry(f, Path::new("/x"), REPO, row, "loom:review-requested", when)
+            .unwrap()
+    };
+    assert_eq!(at(&mut p, &mut f, &row, now()).at, t("2026-10-09T00:00:00Z"));
+
+    // Updated since, and the capped re-read no longer shows the label.
+    let moved = updated(row, "2026-10-14T11:00:00Z");
+    f.times.clear();
+    let past = now() + Duration::seconds(REVALIDATE_SECS);
+    let e = at(&mut p, &mut f, &moved, past);
+    assert_eq!((e.source, e.at), (Source::Events, t("2026-10-09T00:00:00Z")));
+    assert_eq!(f.reads, [14, 14]);
+    // The kept time is re-keyed to the new `updated_at`: no further read.
+    at(&mut p, &mut f, &moved, past + Duration::days(1));
+    assert_eq!(f.reads, [14, 14]);
+}

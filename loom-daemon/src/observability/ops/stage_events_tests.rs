@@ -147,7 +147,21 @@ fn the_budget_bounds_the_walk_and_one_page_cannot_answer_a_long_item() {
     let read = item.walk("x", 2);
     assert_eq!(item.reads, [1, 3]);
     assert_eq!(read.pages, 2);
-    assert!(read.times.unwrap().is_empty());
+    assert_eq!(read.times, None, "a budget-truncated walk is unanswered, not not-found");
+}
+
+#[test]
+fn a_label_on_a_page_the_budget_skipped_is_unanswered_not_missing() {
+    let mut item = Item::new(vec![
+        filler(100),
+        vec![labeled("x", "2026-09-01T00:00:00Z")],
+        filler(100),
+    ]);
+    let read = item.walk("x", 2);
+    assert_eq!(item.reads, [1, 3]);
+    assert_eq!((read.pages, read.times), (2, None));
+    let full = item.walk("x", MAX_PAGES);
+    assert!(full.times.unwrap().contains_key("x"));
 }
 
 #[test]
