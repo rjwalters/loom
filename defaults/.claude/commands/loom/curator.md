@@ -103,19 +103,18 @@ not `cat`.
 
 ## Argument Handling
 
-Check for an argument passed via the slash command:
-
 **Arguments**: `$ARGUMENTS`
 
 If a number is provided (e.g., `/curator 42`):
 1. **FIRST, run the pool gate (above) and the kind probe, then claim immediately**:
    ```bash
-   gh issue view <number> --json url --jq .url   # /pull/<n>: a PR, not an issue
+   gh api "repos/{owner}/{repo}/issues/<number>" --jq '[(.pull_request != null), .state, ([.labels[].name] | join(","))] | @tsv'   # live; true = a PR
    gh api repos/{owner}/{repo}/issues/<number>/labels -f 'labels[]=loom:curating'
    ```
 2. **Skip** "Finding Work" and curate directly
+3. End with `LOOM_STEP_OUTCOME role=curator target=<n> class=<verdict|noop|refused|failed> reason=<token>` (`.loom/docs/targeted-role-invocation.md`)
 
-**CRITICAL**: pool gate, kind probe, then claim, BEFORE any other work; `loom:curating` is the claim. Gate fails: no claim, report it deferred. **Kind probe: a `/pull/` URL or a failed read means refuse** (no label or body write, #9929); `gh issue edit`/the labels API accept a PR number silently. Applies to every claim path (supplied, resumed, discovered).
+**CRITICAL**: pool gate, kind probe, then claim, BEFORE any other work; `loom:curating` is the claim. Gate fails: no claim, report it deferred. **Kind probe: `true` (a PR) or a failed read means refuse** (no label or body write, #9929); the labels API accepts a PR number silently. So do `closed`, `loom:frozen` and a hard-exclusion label (#11863). Applies to every claim path (supplied, resumed, discovered).
 
 **Already `loom:curating`?** Run the "Stale `loom:curating` Claim Check" (under "Claiming Work") first.
 
@@ -553,10 +552,6 @@ as a review; raise it for long measurement passes) and
 **No daemon-side backstop**: `claim_reconciliation` does **not** reconcile
 `loom:curating` (`defaults/docs/daemon-reference.md` § "Stale-claim
 reconciliation & the sweep journal"); only this agent-side check does.
-
-**Applies everywhere a Curator claims an issue** — Priority 1/2 discovery
-above, the re-curation playbook, and an explicit `/curator <number>`
-invocation naming an issue that turns out to already carry `loom:curating`.
 
 ## Before Starting Curation
 
