@@ -25,7 +25,6 @@ const SOURCE_ALLOWLIST: &[(&str, &str)] = &[
     ("intake_reconcile.rs", "loom:"),
     ("intake_reconcile/singleton.rs", "loom:"),
     ("label_registry/mod.rs", "loom:"),
-    ("merge_pr/chain_lock.rs", "loom:chain-head-lock"),
     ("merge_pr/consolidate.rs", "loom:consolidation"),
     ("merge_pr/consolidate.rs", "loom:consolidation-abort"),
     ("merge_pr/sequence.rs", "loom:sequence"),
@@ -129,7 +128,7 @@ fn strip_inline_test_mods(text: &str) -> String {
 }
 
 /// `guards_status.rs` lists each guard category's decision-log rule tags in
-/// `tags: &[..]` fields (e.g. `loom:forge-egress`, `loom:cargo-target-dir`).
+/// `tags: &[..]` fields (e.g. `loom:cargo-target-dir`).
 /// Those are hook rule identifiers matched against the decision log, never
 /// GitHub labels, so those lines are structurally exempt: only a line whose
 /// trimmed text starts with `tags: &[` in that one file is dropped.

@@ -175,7 +175,6 @@ fn a_lock_is_always_on_the_file_at_its_path() {
     second.release();
 }
 
-#[cfg(feature = "otlp")]
 #[test]
 fn a_failed_spawn_leaves_no_probe_lock() {
     let scratch = Scratch::new("spawn-fails");

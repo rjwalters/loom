@@ -46,14 +46,15 @@ fn record(
         runtime: None,
         provider: None,
         profile: None,
-        complexity: None,
         tokens_status: None,
         tokens_status_reason: None,
         no_phase_cause: None,
+        phase_tap_usage: Vec::new(),
         attempt_index: None,
         previous_sweep_id: None,
         trigger: None,
         dispatch_origin: None,
+        role_draw: None,
         rework_events: None,
         pr_numbers: None,
         hw_lines_added: None,
@@ -116,7 +117,7 @@ impl MergeLookup for ForgeDown {
 }
 
 #[test]
-fn group_by_parses_the_eight_documented_dimensions() {
+fn group_by_parses_the_six_documented_dimensions() {
     for (spec, expected) in [
         ("arm", GroupBy::Arm),
         ("MODEL", GroupBy::Model),
@@ -124,12 +125,13 @@ fn group_by_parses_the_eight_documented_dimensions() {
         ("host", GroupBy::Host),
         ("Day", GroupBy::Day),
         ("tap", GroupBy::Tap),
-        ("complexity", GroupBy::Complexity),
-        ("Model-Complexity", GroupBy::ModelComplexity),
     ] {
         assert_eq!(GroupBy::parse(spec).unwrap(), expected);
     }
     assert!(GroupBy::parse("phase").is_err());
+    // Retired in #11665.
+    assert!(GroupBy::parse("complexity").is_err());
+    assert!(GroupBy::parse("model-complexity").is_err());
 }
 
 /// Issue #8556: the tap stamp a post-#8556 native spawn writes is authoritative
@@ -430,8 +432,6 @@ fn spawn_death_detection_covers_class_and_duration() {
             crash_classification: None,
             token_name: "acct".into(),
             credential: None,
-            jev_tier: None,
-            jev_confidence: None,
             tap_usage: None,
             tap_usage_all: Vec::new(),
             phase_tap_usage: Vec::new(),
@@ -448,8 +448,6 @@ fn spawn_death_detection_covers_class_and_duration() {
             crash_classification: Some("execution-error".into()),
             token_name: "acct".into(),
             credential: None,
-            jev_tier: None,
-            jev_confidence: None,
             tap_usage: None,
             tap_usage_all: Vec::new(),
             phase_tap_usage: Vec::new(),
@@ -478,8 +476,6 @@ fn spawn_death_detection_covers_class_and_duration() {
         crash_classification: Some("account-exhausted:rate-limited".into()),
         token_name: "acct".into(),
         credential: None,
-        jev_tier: None,
-        jev_confidence: None,
         tap_usage: None,
         tap_usage_all: Vec::new(),
         phase_tap_usage: Vec::new(),
@@ -990,8 +986,6 @@ fn two_workspace_fixture_aggregates_across_both_journals() {
             crash_classification: None,
             token_name: "acct".into(),
             credential: None,
-            jev_tier: None,
-            jev_confidence: None,
             tap_usage: None,
             tap_usage_all: Vec::new(),
             phase_tap_usage: Vec::new(),
@@ -1096,7 +1090,4 @@ fn rendered_text_names_the_card_and_the_relationship_to_the_old_summary() {
 }
 
 #[cfg(test)]
-mod complexity_tests;
-
-#[cfg(test)]
-mod agreement_tests;
+mod first_pass_tests;

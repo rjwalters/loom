@@ -99,6 +99,17 @@ pub(crate) enum ForgeAction {
     #[command(name = "priority-labels")]
     PriorityLabels(PriorityLabelsCli),
 
+    /// `forge rebase-guard --base <ref> [--old <ref>] [--new <ref>]` (#9282):
+    /// would force-pushing `<new>` over `<old>` discard work? Reads local git
+    /// objects only; no forge call, no fetch, no write.
+    ///
+    /// Exit 0 is BLOCKED and prints `EMPTIED` (the rebase left the PR with no
+    /// content) or `RESOLUTION_DISCARDED <merge-sha>` (a hand-made conflict
+    /// resolution is not carried by `<new>`); exit 1 is verified safe; any
+    /// other exit is unanswered. See `loom_daemon::rebase_guard`.
+    #[command(name = "rebase-guard")]
+    RebaseGuard(loom_daemon::rebase_guard::Args),
+
     /// `forge pr-congestion [--json] [--max-open N] [--max-points N]` — the
     /// #9063 **Phase 1** congestion signal, report-only: approved-queue
     /// depth (`loom:pr`), story points awaiting merge, and a path-disjoint
@@ -804,15 +815,6 @@ pub(crate) enum ForgeAction {
         patch_created: Option<String>,
     },
 
-    /// `forge egress assert|doctor|policy` (#9984) — will this process's `gh`
-    /// reach the mandated API origin? Exit 0 aligned / 1 findings / 2
-    /// verification incomplete; no policy configured ⇒ 0. Never a `gh`
-    /// passthrough. See `defaults/docs/forge-egress.md`.
-    Egress {
-        #[command(subcommand)]
-        action: super::forge_egress_cmd::EgressAction,
-    },
-
     /// `forge parent body|link` (#10012 §4) — the logic behind
     /// `create-issue.sh --parent N`: the `loom:parent` marker, the parent's
     /// red-main marker, the native sub-issue link.
@@ -871,7 +873,6 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             access,
             force,
         } => return super::forge_identity_cmd::token(&repo, &access, force),
-        ForgeAction::Egress { action } => return super::forge_egress_cmd::handle(action),
         ForgeAction::MergeQueue { action } => super::forge_merge_queue_cmd::run(action.0),
         ForgeAction::Parent { action } => return super::forge_parent_cmd::handle(action),
         ForgeAction::IsFleet { login } => return super::forge_identity_cmd::is_fleet(&login),
@@ -1013,6 +1014,7 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
                 },
             );
         }
+        ForgeAction::RebaseGuard(args) => loom_daemon::rebase_guard::cli_entrypoint(&args),
         ForgeAction::Issue { args } => ForgeCmd::Issue(args),
         ForgeAction::Pr { args } => ForgeCmd::Pr(args),
         ForgeAction::Auth { args } => ForgeCmd::Auth(args),

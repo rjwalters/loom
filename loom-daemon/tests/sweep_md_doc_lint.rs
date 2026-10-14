@@ -23,7 +23,7 @@
 //!   red-mained on pinned prose titles.)
 //! - **CONTRACT** — a stable identifier that MUST NOT drift: event topic
 //!   strings, IPC variant names, wire-payload field names, config keys, env
-//!   vars, CLI flags, file paths, schema ids, the complexity marker syntax,
+//!   vars, CLI flags, file paths, schema ids,
 //!   and the escalation-ladder ordering. These stay EXACT — their exactness is
 //!   the value.
 //!
@@ -189,11 +189,10 @@ fn sweep_md_includes_sample_wire_payloads() {
 }
 
 // ---------------------------------------------------------------------------
-// Issue #3702 — model-assignment strategy: rung grammar, complexity marker,
-// refusal fallback, and the no-Fable-Judge invariant.
+// Issue #3702 — model-assignment strategy: rung grammar, refusal fallback,
+// and the no-Fable-Judge invariant.
 //
-// The ladder, precedence chain, `model@effort` grammar, and tier-2.5 marker
-// are behavioral contracts the sweep orchestrator (an LLM subagent) interprets
+// The ladder, precedence chain, and `model@effort` grammar are behavioral contracts the sweep orchestrator (an LLM subagent) interprets
 // at dispatch time — there is no parser to unit-test. Per #3877 these are split
 // into CONTRACT identifiers (grammar tokens, ladders, env vars, flags, markers,
 // class names — pinned EXACT) and PROSE sentences (pinned structurally: a
@@ -241,67 +240,6 @@ fn sweep_md_documents_effort_rung_grammar_and_fable() {
         "sweep.md must document the Task-tool effort graceful-degradation \
          fallback (#3705) — anchored on the section-local fragment `degrades \
          cleanly to bare`, unique to that paragraph (#3879)"
-    );
-}
-
-/// #3702/#4238: the Curator complexity marker is documented as precedence
-/// tier 2.5, resolved through the `sweep.tierModels[<runtime>][<tier>]`
-/// tier→model map (PR #4278 replaced the earlier `sonnet → opus` one-tier
-/// bump with this map plus an `Exit 3` unconfigured fall-through), with its
-/// never-`fable` ceiling bound.
-#[test]
-fn sweep_md_documents_complexity_marker_tier() {
-    let content = read_sweep_md();
-    // CONTRACT: the templated marker syntax, the tier-value list, the
-    // tier-model map identifier, and the resolver script name are stable
-    // identifiers. Keep EXACT. (No concrete model ID is asserted here — the
-    // doc-lint stays runtime-neutral per #4278's intent.)
-    assert!(
-        content.contains("<!-- loom:complexity=<tier> -->"),
-        "sweep.md must document the `<!-- loom:complexity=<tier> -->` marker \
-         syntax (#3702/#4238 tier 2.5)"
-    );
-    assert!(
-        content.contains("`mechanical` | `routine` | `complex`"),
-        "sweep.md must document the three complexity-marker values \
-         `mechanical` | `routine` | `complex` (#3702/#4238 tier 2.5)"
-    );
-    assert!(
-        content.contains("sweep.tierModels"),
-        "sweep.md must document the `sweep.tierModels` tier→model map that \
-         resolves the Tier 2.5 complexity marker (#4238, replacing the old \
-         `sonnet → opus` bump)"
-    );
-    assert!(
-        content.contains("resolve-tier-model.sh"),
-        "sweep.md must reference `resolve-tier-model.sh` as the resolver for \
-         the Tier 2.5 complexity marker (#4238)"
-    );
-    // CONTRACT (fall-through bound): `Exit 3` is the unconfigured-map
-    // fall-through that replaced the one-tier bump as the tier-2.5
-    // resolution semantics (#4238) — keep EXACT.
-    assert!(
-        content.contains("Exit 3"),
-        "sweep.md must document the `Exit 3` unconfigured tier/runtime \
-         fall-through for the Tier 2.5 complexity marker (#4238)"
-    );
-    // PROSE (structural): the tier is anchored by its NUMBER (`Tier 2.5`); the
-    // "— Curator complexity marker" title text is prose that can be reworded.
-    assert!(
-        content.contains("Tier 2.5"),
-        "sweep.md must document the complexity marker as precedence `Tier 2.5` \
-         (#3702) — asserted by tier number, not by exact title wording"
-    );
-    // CONTRACT (bound): the never-`fable` ceiling is a hard bound. Pin the
-    // unique `` Never resolves to `fable` `` bullet lead-in (not a bare
-    // `fable` stem — the separate No-Fable-Judge paragraph also contains
-    // `fable` and would keep this assertion passing even if the tier-2.5
-    // ceiling bullet were deleted).
-    assert!(
-        content.contains("Never resolves to `fable`"),
-        "sweep.md must document the marker's `Never resolves to `fable`` \
-         ceiling (#3702/#4238) — the marker can lift one tier and never reach \
-         the top rung"
     );
 }
 
@@ -407,8 +345,7 @@ fn sweep_md_asserts_no_fable_judge_invariant() {
 
 // ---------------------------------------------------------------------------
 // Issue #3725 — model-cost experiment mode. The tri-state setting, the two-arm
-// A/B, the resume-safe stratified assignment, the tier-2.5 suppression, the
-// durable store, the exact-cost harvest, and the canary guardrail are behavioral
+// A/B, the resume-safe stratified assignment, the durable store, the exact-cost harvest, and the canary guardrail are behavioral
 // contracts the sweep orchestrator interprets. Per #3877, config keys / env
 // vars / flags / paths / schema ids / field names are pinned EXACT (CONTRACT),
 // while bold lead-ins and wording are pinned structurally (PROSE).
@@ -440,13 +377,14 @@ fn sweep_md_documents_model_experiment_mode() {
         );
     }
     // PROSE (structural): the assignment property is documented via a bold
-    // lead-in ("Deterministic, resume-safe, stratified assignment.") that gets
-    // edited. Anchor on the stable technical token `stratified` (matches
-    // "stratified"/"stratification") so a reword survives and a deletion fails.
+    // lead-in ("Deterministic, resume-safe assignment.") that gets edited.
+    // Anchor on the stable token `resume-safe`. The complexity stratum was
+    // retired in #11665: assignment keys on the issue number alone.
     assert!(
-        content.contains("stratified"),
-        "sweep.md must document the deterministic, resume-safe, stratified arm \
-         assignment (#3725) — anchored structurally on `stratified`"
+        content.contains("resume-safe") && !content.contains("stratified"),
+        "sweep.md must document the deterministic, resume-safe arm assignment \
+         (#3725) and must not describe the retired complexity stratification \
+         (#11665)"
     );
 
     // PROSE (structural presence): the subsection heading is anchored by its
@@ -456,39 +394,6 @@ fn sweep_md_documents_model_experiment_mode() {
         content.contains("### Model-cost experiment mode"),
         "sweep.md must retain the `### Model-cost experiment mode` subsection \
          (#3725) — asserted by heading prefix, tolerating the appended ref suffix"
-    );
-}
-
-/// #3725 (hard AC): in `experiment` mode the forced arm SUPPRESSES the tier-2.5
-/// complexity bump so Arm B stays sonnet on `complex`-marked issues.
-#[test]
-fn sweep_md_documents_experiment_tier_2_5_suppression() {
-    let content = read_sweep_md();
-    // CONTRACT (prefix-tolerant): the suppression note is anchored by its
-    // `Experiment-mode suppression (issue #3725` title + issue ref. The prefix
-    // match (no closing paren) tolerates appended issue refs — e.g. a future
-    // edit turning `(issue #3725)` into `(issue #3725, #NNNN)`. See #3833/#3837
-    // for why exact-paren literals red main on doc edits.
-    assert!(
-        content.contains("Experiment-mode suppression (issue #3725"),
-        "sweep.md must document the tier-2.5 suppression note (#3725 hard AC; \
-         tolerates appended issue refs)"
-    );
-    // CONTRACT: the caps `SUPPRESSES` verb and the `tier-2.5` target are the
-    // load-bearing tokens of the suppression semantic. Assert both present
-    // (structural two-token check) rather than the exact "SUPPRESSES this
-    // tier-2.5 bump" phrase whose connective wording can drift.
-    assert!(
-        content.contains("SUPPRESSES") && content.contains("tier-2.5"),
-        "sweep.md must state the forced arm SUPPRESSES the tier-2.5 bump (#3725)"
-    );
-    // PROSE (structural): the "marker used only as the stratification key while
-    // an arm is forced" semantic is wording; anchor on the stable noun phrase
-    // `stratification key` (drop the brittle "only as the" lead-in).
-    assert!(
-        content.contains("stratification key"),
-        "sweep.md must state the marker is used as the stratification key while \
-         an arm is forced (#3725) — anchored on the `stratification key` phrase"
     );
 }
 

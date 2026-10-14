@@ -23,12 +23,13 @@ seedable, unit-tested). Rollout status is tracked on #11103.
 candidates by repeated draws (`work_finder/workspace_draw.rs`): each draw
 picks a workspace as below and places that workspace's next issue; the
 shared concurrency budget is filled in that order. The RNG is seeded once
-per tick, and the seed plus every draw are exported as
+per tick from the minute and the host id (#11683), and the seed, its inputs
+and every draw are exported as
 `pick.decision.workspace_draw` (and the published plan's `position` is the
 draw order). The single-workspace tick uses the in-workspace order alone.
 Since #11508 the level comes only from the two labels: there is no legacy
-bridge, so `loom:operator-priority` / `loom:operator-high-priority` carry no
-dispatch weight until they are migrated (table below).
+bridge, so the retired star labels carry no dispatch weight until they are
+migrated (table below).
 
 **Priority changes order, never eligibility or admission** (operator ruling,
 #11508). A priority issue is dispatched only once it is `loom:issue` (there is
@@ -37,25 +38,34 @@ no priority side listing), and no priority exempts a candidate from any gate
 
 ## Selection: workspace first, then issue
 
-1. **Pick a workspace** among those with dispatchable work, at random,
-   weighted by workspace priority.
-   - The pool is three-tier (#11547). A workspace whose next candidate is a
-     verified red-main fix wins the draw (`pool: "red-main-fix"`); else a
-     workspace holding any open, dispatchable `loom:very-important` work wins
-     (`"very-important"`); if several qualify at a tier, the draw is among
-     just those. Otherwise it is over every workspace with dispatchable work
-     (`"all"`).
-   - **Weight mapping.** A workspace's `fleet_priority` (the `priority`
-     integer in `workspaces.json`; lower = higher priority, default `100`) is
-     reinterpreted as a weight: `weight = max(1, 1000 / (1 + priority))`,
-     integer division. Priority `0` weighs 1000, `10` weighs 90, the default
-     `100` weighs 9. A tool repo pinned to `0` is therefore drawn about 110
-     times as often as a default-priority repo, but no workspace is ever
-     starved. `priority_pick::weight_for_priority` is the one implementation.
+1. **Pick a workspace** among those with dispatchable work, at random, with
+   probability **P = w / Σw** (#11742; operator ruling 2026-10-13). There are **no tiers**:
+   nothing wins the draw outright.
+   - **Base weight.** A workspace's `weight` (the integer in `workspaces.json`,
+     set from the fleet store's required `repos[].weight`; higher = more draws,
+     `0` = never drawn) is its share of draws. N repos at weight 1 and loom at
+     weight N give loom about half the draws while every repo has work.
+   - **Bonuses.** While a workspace's remaining candidates include a verified
+     red-main fix, `loom:very-important` work or `loom:important` work, the
+     matching bonus is added to its weight; bonuses stack:
+     `w = weight + redMainFix? + veryImportant? + important?`. The points are
+     hyperparameters `dispatch.weightBonusRedMainFix` (default `400`),
+     `dispatch.weightBonusVeryImportant` (`100`) and
+     `dispatch.weightBonusImportant` (`20`), re-read every tick (see
+     [`hyperparameters.md`](hyperparameters.md)). A workspace of weight `0`
+     earns no bonus: it stays off. `priority_pick::draw_workspace` is the one
+     implementation.
    - **Reproducibility.** The draw uses a seedable RNG (`PickRng`, SplitMix64).
-     A fixed seed reproduces the exact pick sequence. The draw (pool,
-     candidates with weights, total weight, roll, pick) is `WorkspaceDraw`,
-     the record `pick.decision` carries.
+     A fixed seed reproduces the exact pick sequence. The draw (candidates
+     with base weight, bonus and effective weight, total weight, roll, pick)
+     is `WorkspaceDraw`, the record `pick.decision` carries. The dispatch
+     tick's seed is derived
+     from the wall-clock minute and the host id (scheme `loom-draw/v1`, #11683:
+     first 8 bytes, big-endian, of
+     `sha256("loom-draw/v1:" + floor(unix_utc_secs/60) + ":" + host)`), and
+     the record carries both inputs, so a logged `(minute, host)` replays the
+     order. See [`daemon-reference.md`](daemon-reference.md) §"Dispatch order
+     and the red-main-fix lane".
 2. **Pick the issue within that workspace** by, in order: verified
    red-main fix first; level (`loom:very-important`, then `loom:important`,
    then none); oldest `createdAt` first; issue number ascending. The
@@ -64,15 +74,20 @@ no priority side listing), and no priority exempts a candidate from any gate
 **The red-main-fix lane** (#11547, operator ruling on #11278). A verified
 red-main fix is an issue carrying `<!-- loom:main-red-fix -->` whose repo's
 `main` is verified red this tick. While `main` is red nothing in that repo can
-merge, so the fix leads: first in its workspace and its workspace first in the
-draw. It is not a level and changes no gate: it keeps only its existing bypass
+merge, so the fix leads its workspace and adds the red-main bonus to the
+workspace's weight in the draw. It is not a level and changes no gate: it keeps only its existing bypass
 of the build back-off, the file-overlap gate and the repo-sharding slice,
 which a red `main` would otherwise deadlock. On a green `main` the marker
-grants nothing.
+grants nothing. With `autonomous.workFinder.redMainAutofile.enabled` on (off
+by default), the daemon files that issue itself when `main` turns red, and
+closes it when `main` is green again (#11766; daemon-reference.md,
+"Auto-filed red-main fix issue").
 
 **Removed ordering keys** (gone from dispatch since #11508): the star, the
 starred-at time and its restart store, the inherited-level key, and the
-cross-workspace tier and round-robin interleave.
+cross-workspace tier and round-robin interleave; and (#11742) the draw's
+red-main-fix and very-important pool tiers, the `fleet_priority` softmax and
+`dispatch.drawTemperature`.
 
 ## The very-important cap (#11509)
 
@@ -109,12 +124,37 @@ operator ruling on #11278).
 |---|---|
 | `loom:operator-priority` | `loom:important` |
 | `loom:operator-high-priority` | `loom:very-important` |
-| `priority:high` (undeclared) | `loom:important` |
+| `priority:high` | `loom:important` |
 | `loom:high-priority-inherited` | retired, no mapping (it was daemon-derived) |
 | `tier:goal-advancing` / `tier:goal-supporting` / `tier:maintenance` | retired, **no automatic mapping**; Guide applies `loom:important` where warranted |
 
-Label definitions live in `defaults/labels.json` (`loom-daemon labels generate
---write` regenerates both `labels.yml` copies). Relabeling live issues is a
-forge mutation done by an operator with `./.loom/scripts/sync-labels.sh` after
-the daemon stops reading the old labels; it is deliberately not part of the
-code change.
+This table is data: the top-level `retired` array of `defaults/labels.json`
+(#11513), one `{name, replaced_by, owned, retired_in}` entry per old label
+(`replaced_by: null` = remove, no replacement). It also lists the #11105
+retirements (`loom:urgent`, `loom:heavy`, `loom:operator-objective`). It is
+never rendered into `labels.yml`, so the additive `sync-labels.sh` cannot
+re-create a retired label. `owned: false` (a label Loom never declared)
+means the migration adds the replacement but never removes or deletes the old
+label; `priority:high` is `owned: true` (#11675). The registry change itself
+mutates no forge.
+
+### Running the forge-side migration (#11511)
+
+`loom-daemon labels migrate` reads this array and relabels each repo's **open**
+issues and PRs (closed items are never touched). It is a dry run unless
+`--apply` is passed:
+
+```bash
+loom-daemon labels migrate --all-workspaces          # preview every managed repo
+loom-daemon labels migrate --all-workspaces --apply  # then migrate
+loom-daemon labels migrate --repo OWNER/NAME [--apply]   # or one repo
+.loom/scripts/sync-labels.sh --migrate-retired [--dry-run]  # sync first, then migrate
+```
+
+Per open item it adds `replaced_by` before removing the old label. It then
+re-reads the label's open usage and deletes the label only when nothing open
+still carries it; a failed read keeps it (`KEPT`). An `owned: false` label is
+add-only: never removed from an item, never deleted. A replacement missing on
+the forge is `SKIPPED`, never created; run `sync-labels.sh` first. A second
+`--apply` makes no writes. `resync-installed.sh` only ever runs the dry run and
+prints the apply command when anything is pending.

@@ -99,6 +99,16 @@ pub enum SpanName {
     /// from — never the command or the path.
     #[serde(rename = "guard.cargo_target_dir.denied")]
     GuardCargoTargetDirDenied,
+    /// One host-side run of `buildGate.command` (Issue #11690): pre-flight's
+    /// fast tier or the main-health gate. Stage, tier, outcome, duration and
+    /// attempt only — never the command or its output.
+    #[serde(rename = "build_gate.run")]
+    BuildGateRun,
+    /// One change to a red `main`'s auto-filed fix issue (Issue #11766): an
+    /// instant span, its own root, naming the repo, the SHA, the action
+    /// (`created` / `reused` / `closed` / `closed_duplicate`) and the issue.
+    #[serde(rename = "main_red.autofile")]
+    MainRedAutofile,
 }
 
 impl SpanName {
@@ -128,6 +138,8 @@ impl SpanName {
             Self::ForgeReadShed => "forge.read.shed",
             Self::EgressRequest => "loom.egress.request",
             Self::GuardCargoTargetDirDenied => "guard.cargo_target_dir.denied",
+            Self::BuildGateRun => "build_gate.run",
+            Self::MainRedAutofile => "main_red.autofile",
         }
     }
 }
@@ -237,6 +249,7 @@ pub fn bounded_attributes(attributes: &TraceAttributes) -> TraceAttributes {
                 || crate::gh_invocation::telemetry::SPAN_ATTRIBUTE_KEYS.contains(&key.as_str())
                 || crate::observability::llm_billing::KEYS.contains(&key.as_str())
                 || crate::observability::lifecycle::roll_interruption::KEYS.contains(&key.as_str())
+                || crate::observability::lifecycle::role_draw::KEYS.contains(&key.as_str())
                 || super::provenance::KEYS.contains(&key.as_str()))
                 && value.len() <= 256
                 && !value.chars().any(char::is_control)

@@ -134,12 +134,6 @@ owner = "role-scripts"
 removal_issue = 9799
 
 [[bypass]]
-path = "defaults/scripts/require-complexity-marker.sh"
-calls = 2
-owner = "role-scripts"
-removal_issue = 9799
-
-[[bypass]]
 path = "defaults/scripts/sweep-lease-fence.sh"
 calls = 1
 owner = "role-scripts"
@@ -278,7 +272,7 @@ owner = "daemon-other"
 removal_issue = 9799
 
 [[bypass]]
-path = "loom-daemon/src/fleet/add_worker/egress.rs"
+path = "loom-daemon/src/fleet/add_worker/forge_auth.rs"
 calls = 3
 owner = "daemon-fleet"
 removal_issue = 9799
@@ -322,12 +316,6 @@ removal_issue = 9799
 [[bypass]]
 path = "loom-daemon/src/jev_merge_risk.rs"
 calls = 2
-owner = "daemon-other"
-removal_issue = 9799
-
-[[bypass]]
-path = "loom-daemon/src/jev_tier.rs"
-calls = 1
 owner = "daemon-other"
 removal_issue = 9799
 

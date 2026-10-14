@@ -11,11 +11,12 @@
 //!
 //! Dispatch is **workspace first, then issue**:
 //!
-//! 1. [`draw_workspace`] picks a workspace at random, weighted by workspace
-//!    priority ([`weight_for_priority`]). The pool is three-tier: workspaces
-//!    whose next issue is a verified red-main fix if any (#11547), else
-//!    workspaces holding dispatchable `loom:very-important` work if any,
-//!    else every workspace with dispatchable work.
+//! 1. [`draw_workspace`] picks a workspace at random with probability
+//!    P = w / Σw (#11742), where w is the workspace's base `weight` from the
+//!    fleet roster plus [`WeightBonus`] points while it holds a verified
+//!    red-main fix (#11547), `loom:very-important` work or `loom:important`
+//!    work. There are no pool tiers: urgent work makes a workspace more
+//!    likely to be drawn, never certain.
 //! 2. [`order_in_workspace`] / [`next_in_workspace`] pick the issue inside
 //!    the workspace: verified red-main fix first, then level, then oldest
 //!    `createdAt`, then issue number.
@@ -35,7 +36,7 @@
 
 use std::cmp::Ordering;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// The "important" label.
 pub const IMPORTANT_LABEL: &str = "loom:important";
@@ -48,6 +49,8 @@ pub const VERY_IMPORTANT_LABEL: &str = "loom:very-important";
 pub const VERY_IMPORTANT_CAP: usize = 1;
 
 /// An issue's priority level. Declaration order is ascending importance.
+/// On the wire (status, queue snapshot, fleet state) it is `default` /
+/// `important` / `very-important`; an unknown value reads as `default`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Level {
@@ -74,6 +77,46 @@ impl Level {
             }
         }
         level
+    }
+
+    /// The wire name: `default`, `important` or `very-important`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Important => "important",
+            Self::VeryImportant => "very-important",
+        }
+    }
+
+    /// The level named `wire` ([`Self::as_str`]); anything else is
+    /// [`Level::Default`].
+    #[must_use]
+    pub fn from_wire(wire: &str) -> Self {
+        match wire {
+            "important" => Self::Important,
+            "very-important" => Self::VeryImportant,
+            _ => Self::Default,
+        }
+    }
+
+    /// The integer form some wire surfaces use (`fleet-state/v1` `level`,
+    /// the plan's `level` key, the PR queue): 0 default, 1 important,
+    /// 2 very important.
+    #[must_use]
+    pub fn rank(self) -> u8 {
+        match self {
+            Self::Default => 0,
+            Self::Important => 1,
+            Self::VeryImportant => 2,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Level {
+    /// Lenient: an unknown name (a newer daemon's level) reads as `default`.
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(Self::from_wire(&String::deserialize(d)?))
     }
 }
 
@@ -154,12 +197,55 @@ pub fn very_important_holders(open: &[IssueKey]) -> Vec<u32> {
         .collect()
 }
 
-/// Draw weight of a workspace from its `fleet_priority` (lower number =
-/// higher priority, default 100): `1000 / (1 + priority)`, at least 1. So
-/// priority 0 weighs 1000, 10 weighs 90, 100 (the default) weighs 9.
-#[must_use]
-pub fn weight_for_priority(priority: u32) -> u64 {
-    (1000 / (1 + u64::from(priority))).max(1)
+/// Default bonus a workspace's weight gains while its next candidate is a
+/// verified red-main fix (`dispatch.weightBonusRedMainFix`, #11742). Large
+/// on purpose: a red `main` blocks every merge in that repo, so against a
+/// fleet whose base weights sum to a few hundred a lone red repo takes about
+/// half the draws. An initial value, retuned from measurement.
+pub const DEFAULT_BONUS_RED_MAIN_FIX: u32 = 400;
+/// Default bonus while the workspace has dispatchable `loom:very-important`
+/// work (`dispatch.weightBonusVeryImportant`, #11742).
+pub const DEFAULT_BONUS_VERY_IMPORTANT: u32 = 100;
+/// Default bonus while the workspace has dispatchable `loom:important` work
+/// (`dispatch.weightBonusImportant`, #11742).
+pub const DEFAULT_BONUS_IMPORTANT: u32 = 20;
+/// The accepted range of each weight bonus. An integer on purpose: the draw
+/// records derive `Eq`, and the hyperparams range check is integer-only.
+pub const WEIGHT_BONUS_RANGE: (u64, u64) = (0, 1_000_000);
+
+/// The bonus points a workspace's weight gains while it holds each kind of
+/// prioritised work (#11742, operator ruling 2026-10-13 on 2AMLogic/2am#4344).
+/// They replace the old hard pool tiers: nothing wins the draw outright, a
+/// workspace with urgent work is just more likely to be drawn. Bonuses stack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct WeightBonus {
+    /// Added while the workspace's next candidate is a verified red-main fix.
+    pub red_main_fix: u32,
+    /// Added while it has dispatchable `loom:very-important` work.
+    pub very_important: u32,
+    /// Added while it has dispatchable `loom:important` work.
+    pub important: u32,
+}
+
+impl Default for WeightBonus {
+    fn default() -> Self {
+        Self {
+            red_main_fix: DEFAULT_BONUS_RED_MAIN_FIX,
+            very_important: DEFAULT_BONUS_VERY_IMPORTANT,
+            important: DEFAULT_BONUS_IMPORTANT,
+        }
+    }
+}
+
+impl WeightBonus {
+    /// The bonus `entry` earns: the sum of every bonus whose condition holds.
+    #[must_use]
+    pub fn for_entry(&self, entry: &WorkspaceEntry) -> u64 {
+        let on = |cond: bool, points: u32| if cond { u64::from(points) } else { 0 };
+        on(entry.has_red_main_fix, self.red_main_fix)
+            + on(entry.has_very_important, self.very_important)
+            + on(entry.has_important, self.important)
+    }
 }
 
 /// A workspace with dispatchable work, as the draw sees it.
@@ -167,12 +253,15 @@ pub fn weight_for_priority(priority: u32) -> u64 {
 pub struct WorkspaceEntry {
     /// Workspace name (`owner/repo`); also the final deterministic order.
     pub workspace: String,
-    /// The workspace's `fleet_priority` (lower = higher priority).
-    pub priority: u32,
-    /// Whether it has open, dispatchable `loom:very-important` work.
-    pub has_very_important: bool,
+    /// The workspace's base draw `weight` from the fleet roster. 0 means the
+    /// workspace is never drawn, whatever bonuses it would earn.
+    pub weight: u32,
     /// Whether its next candidate is a verified red-main fix (#11547).
     pub has_red_main_fix: bool,
+    /// Whether it has dispatchable `loom:very-important` work.
+    pub has_very_important: bool,
+    /// Whether it has dispatchable `loom:important` work.
+    pub has_important: bool,
 }
 
 /// A candidate in the draw, with its weight.
@@ -180,21 +269,21 @@ pub struct WorkspaceEntry {
 pub struct DrawCandidate {
     /// Workspace name.
     pub workspace: String,
-    /// Its draw weight.
+    /// Its base `weight` from the roster.
+    pub base_weight: u32,
+    /// The bonus points it earned this draw ([`WeightBonus::for_entry`]).
+    pub bonus: u64,
+    /// Its effective draw weight: `base_weight + bonus`.
     pub weight: u64,
 }
 
 /// What `pick.decision` records for one workspace draw.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WorkspaceDraw {
-    /// `"red-main-fix"` when only workspaces whose next candidate is a
-    /// verified red-main fix were drawn over (#11547), else
-    /// `"very-important"` when only workspaces with very-important work were,
-    /// `"all"` otherwise.
-    pub pool: &'static str,
-    /// The candidates drawn over, sorted by workspace name, with weights.
+    /// The candidates drawn over (every entry with a non-zero base weight),
+    /// sorted by workspace name, with weights.
     pub candidates: Vec<DrawCandidate>,
-    /// Sum of the weights.
+    /// Sum of the effective weights.
     pub total_weight: u64,
     /// The RNG value in `0..total_weight`.
     pub roll: u64,
@@ -229,35 +318,35 @@ impl PickRng {
     }
 }
 
-/// Draw the workspace to dispatch from. `None` when `entries` is empty.
-///
-/// The pool is three-tier (#11547): the entries whose next candidate is a
-/// verified red-main fix if any; else those with very-important work if any;
-/// else all. Within the pool the draw is weighted by [`weight_for_priority`]. Entries are put in name order first,
-/// so the result depends only on the set and the RNG state.
-pub fn draw_workspace(entries: &[WorkspaceEntry], rng: &mut PickRng) -> Option<WorkspaceDraw> {
-    let any_fix = entries.iter().any(|e| e.has_red_main_fix);
-    let any_vi = entries.iter().any(|e| e.has_very_important);
-    let (pool_name, in_pool): (&'static str, fn(&WorkspaceEntry) -> bool) = if any_fix {
-        ("red-main-fix", |e| e.has_red_main_fix)
-    } else if any_vi {
-        ("very-important", |e| e.has_very_important)
-    } else {
-        ("all", |_| true)
-    };
-    let mut pool: Vec<&WorkspaceEntry> = entries.iter().filter(|e| in_pool(e)).collect();
+/// Draw the workspace to dispatch from: P(w) = effective weight / Σ effective
+/// weights (#11742), where a workspace's effective weight is its base
+/// `weight` plus the [`WeightBonus`] points it earns. There are no pool
+/// tiers. A workspace with base weight 0 is never drawn. `None` when no entry
+/// has a non-zero weight. Entries are put in name order first, so the result
+/// depends only on the set, the bonuses and the RNG state.
+pub fn draw_workspace(
+    entries: &[WorkspaceEntry],
+    bonus: &WeightBonus,
+    rng: &mut PickRng,
+) -> Option<WorkspaceDraw> {
+    let mut pool: Vec<&WorkspaceEntry> = entries.iter().filter(|e| e.weight > 0).collect();
     pool.sort_by(|a, b| a.workspace.cmp(&b.workspace));
     let candidates: Vec<DrawCandidate> = pool
         .iter()
-        .map(|e| DrawCandidate {
-            workspace: e.workspace.clone(),
-            weight: weight_for_priority(e.priority),
+        .map(|e| {
+            let extra = bonus.for_entry(e);
+            DrawCandidate {
+                workspace: e.workspace.clone(),
+                base_weight: e.weight,
+                bonus: extra,
+                weight: u64::from(e.weight) + extra,
+            }
         })
         .collect();
-    let total_weight: u64 = candidates.iter().map(|c| c.weight).sum();
     if candidates.is_empty() {
         return None;
     }
+    let total_weight: u64 = candidates.iter().map(|c| c.weight).sum();
     let roll = rng.below(total_weight);
     let mut acc = 0;
     let mut picked = candidates[0].workspace.clone();
@@ -269,7 +358,6 @@ pub fn draw_workspace(entries: &[WorkspaceEntry], rng: &mut PickRng) -> Option<W
         }
     }
     Some(WorkspaceDraw {
-        pool: pool_name,
         candidates,
         total_weight,
         roll,

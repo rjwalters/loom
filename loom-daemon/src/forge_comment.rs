@@ -528,7 +528,7 @@ const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 ///
 /// Error strings carry a `{what}` placeholder the caller fills in, so each
 /// public entry point keeps its existing error wording.
-fn gh_api_write_json(
+pub(crate) fn gh_api_write_json(
     gh_bin: &OsStr,
     root: Option<&Path>,
     op: &'static str,

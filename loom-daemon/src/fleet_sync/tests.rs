@@ -388,10 +388,10 @@ fn steady_state_is_one_conditional_request_per_pass() {
 // The roster pass (fail-closed)
 // ------------------------------------------------------------------------
 
-fn registered(path: &str, priority: u32) -> Registered {
+fn registered(path: &str, weight: u32) -> Registered {
     Registered {
         root: PathBuf::from(path),
-        priority,
+        weight,
         maintain_only: false,
     }
 }
@@ -433,7 +433,7 @@ fn roster_drift_is_reported_without_applying_by_default() {
 fn auto_apply_applies_every_appliable_change() {
     let forge = FakeForge::new(sample_files());
     let cache = tempfile::tempdir().expect("cache");
-    // Registered at the wrong priority -> one SetPriority change.
+    // Registered at the wrong weight -> one SetWeight change.
     let plan = plan_from(&forge, cache.path(), &[registered("/srv/src/app", 100)]).expect("plan");
     let mut applied: Vec<String> = Vec::new();
     let pass = summarize_roster(&plan, true, &mut |c| {
@@ -443,7 +443,7 @@ fn auto_apply_applies_every_appliable_change() {
     assert_eq!(pass.applied, 1);
     assert_eq!(pass.unapplied, 0);
     assert_eq!(applied.len(), 1);
-    assert!(applied[0].contains("priority"), "{applied:?}");
+    assert!(applied[0].contains("weight"), "{applied:?}");
 }
 
 #[test]
@@ -508,7 +508,7 @@ fn apply_change_flips_maintain_only_in_place() {
     std::fs::create_dir_all(&repo).expect("repo");
     let path = dir.path().join("workspaces.json");
     let mut reg = WorkspaceRegistry::default();
-    reg.add_with_priority(&repo, None, 7).expect("add");
+    reg.add_with_weight(&repo, None, 7).expect("add");
     reg.save(&path).expect("save");
     let flip = |to| Change::SetMaintainOnly {
         name: "admin".into(),
@@ -519,13 +519,13 @@ fn apply_change_flips_maintain_only_in_place() {
     apply_change(&path, &flip(true)).expect("into");
     let reg = WorkspaceRegistry::load(&path).expect("load");
     assert_eq!(reg.workspaces.len(), 1);
-    assert_eq!(reg.workspaces[0].priority, 7);
+    assert_eq!(reg.workspaces[0].weight, 7);
     let mark = reg.maintain_only_of(&repo).expect("maintain-only");
     assert_eq!(mark.by, MaintainOnlySource::FleetStore);
 
     apply_change(&path, &flip(false)).expect("out");
     let reg = WorkspaceRegistry::load(&path).expect("load");
-    assert_eq!((reg.workspaces.len(), reg.workspaces[0].priority), (1, 7));
+    assert_eq!((reg.workspaces.len(), reg.workspaces[0].weight), (1, 7));
     assert!(reg.maintain_only_of(&repo).is_none());
 }
 
@@ -533,7 +533,8 @@ fn apply_change_flips_maintain_only_in_place() {
 // The host-level snapshot and its `status` line
 // ------------------------------------------------------------------------
 
-fn sample_status() -> FleetSyncStatus {
+// `pub(crate)` so the sibling `applied` module's tests can build passes too.
+pub(crate) fn sample_status() -> FleetSyncStatus {
     FleetSyncStatus {
         repo: "acme/fleet".to_string(),
         reference: "main".to_string(),
@@ -550,6 +551,7 @@ fn sample_status() -> FleetSyncStatus {
         workspaces: workspace_resync::WorkspacePass::default(),
         checkouts: Vec::new(),
         checkouts_note: None,
+        repo_config: Default::default(),
     }
 }
 
@@ -1004,7 +1006,9 @@ fn no_floor_leaves_the_status_line_unchanged() {
 
 /// Run `f` with `LOOM_SOCKET_PATH` pointing into a fresh temp dir and both
 /// process-wide cells empty; restore the environment and empty them after.
-fn with_clean_process_state<T>(f: impl FnOnce(&Path) -> T) -> T {
+/// `pub(crate)` so the sibling `applied` module's tests reuse the same
+/// process-state hygiene (#11197).
+pub(crate) fn with_clean_process_state<T>(f: impl FnOnce(&Path) -> T) -> T {
     let dir = tempfile::tempdir().expect("dir");
     let prior = std::env::var("LOOM_SOCKET_PATH").ok();
     std::env::set_var("LOOM_SOCKET_PATH", dir.path().join("loom-daemon.sock"));

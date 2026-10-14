@@ -334,6 +334,7 @@ fn exported_facts_contract_kinds_are_registered_and_retired_tags_stay_gone() {
         ("fleet.state", true, false),
         ("host.health", true, true),
         ("host.export", true, false),
+        ("operator.presence", true, false),
         ("pr.resolved", true, false),
         ("eta.stage_outcome", true, false),
     ] {

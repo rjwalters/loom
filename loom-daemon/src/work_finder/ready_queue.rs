@@ -25,8 +25,6 @@ use super::{candidate_cmp, PriorityCandidate, WorkItem};
 pub struct TickQueueRow {
     /// The ordering keys, exactly as dispatch uses them.
     pub key: PriorityCandidate,
-    /// The issue's `tier:*` label, if any (information only).
-    pub tier: Option<String>,
     /// What the tick did with it. `None` only while a candidate is waiting
     /// for pass 2; [`finish`] treats a still-`None` row as a capacity deferral.
     pub disposition: Option<QueueDisposition>,
@@ -59,10 +57,6 @@ fn points_of(item: &WorkItem) -> Option<u32> {
     crate::story_points::classify_points_labels(&item.labels).value()
 }
 
-fn tier_of(item: &WorkItem) -> Option<String> {
-    item.labels.iter().find(|l| l.starts_with("tier:")).cloned()
-}
-
 /// The ordering keys for `item` in workspace `idx`. Every candidate key —
 /// the view's and dispatch's — is built here, so the two cannot drift. The
 /// level comes only from the item's own `loom:important` /
@@ -76,18 +70,17 @@ fn tier_of(item: &WorkItem) -> Option<String> {
 #[must_use]
 pub fn key_of(
     idx: usize,
-    workspace_priority: u32,
+    workspace_weight: u32,
     item: &WorkItem,
     repo_red: bool,
 ) -> PriorityCandidate {
     PriorityCandidate {
         workspace_idx: idx,
-        workspace_priority,
+        workspace_weight,
         created_at: item.created_at.clone(),
         number: item.number,
         level: crate::priority_pick::Level::of(&item.labels),
         main_red_fix: repo_red && item.is_main_red_fix(),
-        complexity: None,
     }
 }
 
@@ -158,7 +151,6 @@ pub fn record_skip_held(
 ) {
     rows.push(TickQueueRow {
         key,
-        tier: tier_of(item),
         disposition: Some(disposition),
         detail,
         updated_at: item.updated_at.clone(),
@@ -173,11 +165,7 @@ pub fn record_skip_held(
 /// time-boxed hold.
 pub fn record_candidate(rows: &mut Vec<TickQueueRow>, key: &PriorityCandidate, item: &WorkItem) {
     rows.push(TickQueueRow {
-        key: PriorityCandidate {
-            complexity: None,
-            ..key.clone()
-        },
-        tier: tier_of(item),
+        key: key.clone(),
         disposition: None,
         detail: None,
         updated_at: item.updated_at.clone(),
@@ -256,18 +244,16 @@ pub fn finish(rows: &[TickQueueRow], roots: &[PathBuf]) -> Vec<ReadyQueueRow> {
                 rank: i + 1,
                 repo: repo_name(r.key.workspace_idx, roots),
                 issue: r.key.number,
-                workspace_priority: r.key.workspace_priority,
+                workspace_weight: r.key.workspace_weight,
                 // Deprecated by #9244 (its label deleted in #11105): always
                 // false, kept only for wire compatibility.
                 urgent: false,
-                // Deprecated by #11508 (no star ordering key): always false,
-                // kept only for wire compatibility.
-                operator_priority: false,
+                // The level dispatch ordered it by (after the cap, #11509).
+                level: r.key.level,
                 // The verified red-main fix (#9244): a gate bypass since
                 // #11508, not an ordering key.
                 main_red_fix: r.key.main_red_fix,
                 created_at: r.key.created_at.clone(),
-                tier: r.tier.clone(),
                 story_points: r.story_points,
                 disposition,
                 detail: r.detail.clone(),

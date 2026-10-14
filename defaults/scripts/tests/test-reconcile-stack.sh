@@ -58,45 +58,8 @@ WS_STUB_DIR="$(mktemp -d)"
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/write-scope-stub.sh"
 write_scope_allow_all "$WS_STUB_DIR"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-NC='\033[0m'
-
-TESTS_RUN=0
-TESTS_PASSED=0
-TESTS_FAILED=0
-
-assert_eq() {
-    local expected="$1" actual="$2" msg="$3"
-    TESTS_RUN=$((TESTS_RUN + 1))
-    if [[ "$expected" == "$actual" ]]; then
-        TESTS_PASSED=$((TESTS_PASSED + 1))
-        echo -e "  ${GREEN}PASS${NC}: $msg"
-    else
-        TESTS_FAILED=$((TESTS_FAILED + 1))
-        echo -e "  ${RED}FAIL${NC}: $msg"
-        echo "    Expected: '$expected'"
-        echo "    Actual:   '$actual'"
-    fi
-}
-
-# assert_contains/assert_not_contains use a pure-bash substring match (no
-# forked printf|grep pipeline) so a transient fork/exec failure under
-# run-ci-suites.sh's parallel suite pool can never masquerade as a genuine
-# content mismatch (#7819, #7874).
-assert_contains() {
-    local haystack="$1" needle="$2" msg="$3"
-    TESTS_RUN=$((TESTS_RUN + 1))
-    if [[ "$haystack" == *"$needle"* ]]; then
-        TESTS_PASSED=$((TESTS_PASSED + 1))
-        echo -e "  ${GREEN}PASS${NC}: $msg"
-    else
-        TESTS_FAILED=$((TESTS_FAILED + 1))
-        echo -e "  ${RED}FAIL${NC}: $msg"
-        echo "    Expected substring: '$needle'"
-        echo "    In: '$haystack'"
-    fi
-}
+# shellcheck source=lib/assert.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
 
 assert_not_contains() {
     local haystack="$1" needle="$2" msg="$3"
@@ -287,7 +250,6 @@ run_reconcile() {
         PATH="$GIT_STUB_DIR:$GH_STUB_DIR:$PATH" \
         LOOM_DEFAULT_BRANCH="main" \
         LOOM_BRANCH_UPDATE_STRATEGY="${LOOM_BRANCH_UPDATE_STRATEGY-rebase}" \
-        LOOM_GH_NO_POLICY_LAUNCHER=1 \
         LOOM_TEST_FAKE_REJECT="${LOOM_TEST_FAKE_REJECT:-0}" \
         LOOM_TEST_PUSH_RACE_SCRIPT="${LOOM_TEST_PUSH_RACE_SCRIPT:-}" \
         LOOM_VERSION_CHECK_SCRIPT="${LOOM_VERSION_CHECK_SCRIPT:-}" \
@@ -573,6 +535,44 @@ LOOM_VERSION_CHECK_SCRIPT="$STUB_MISMATCH" run_reconcile "$MAIN" --dry-run
 assert_eq "0" "$RUN_RC" "F: --dry-run exits 0 even with a mismatching gate stub (no real rebase happened)"
 assert_not_contains "$RUN_OUT" "BLOCKER" "F: the gate never runs under --dry-run"
 assert_contains "$RUN_OUT" "Dry run complete" "F: dry-run still reports its own completion message"
+
+teardown_sandbox
+
+# ─────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "Scenario L: the child's remote head carries a hand-resolved merge the rebase flattens (#9282)"
+setup_sandbox
+
+# The child merged a side branch and, IN THE MERGE COMMIT, hand-edited
+# child.txt (the shape of a reasoned conflict resolution). `rebase --onto`
+# replays the side branch's commit but flattens the merge, so that hand edit
+# is silently gone: the rebase exits 0 and the tree is clean. Real git and the
+# real `loom-daemon forge rebase-guard` (the binary pinned above), no stub.
+git_q -C "$MAIN" checkout -q -b side-8002 main~1
+echo "side" > "$MAIN/side.txt"
+git_q -C "$MAIN" add side.txt
+git_q -C "$MAIN" commit -q -m "side work"
+git_q -C "$MAIN" checkout -q "$CHILD_BR"
+git_q -C "$MAIN" merge -q --no-ff --no-commit side-8002
+echo "child, moved off the colliding coordinate" > "$MAIN/child.txt"
+git_q -C "$MAIN" add child.txt
+git_q -C "$MAIN" commit -q -m "Merge side-8002: resolve by hand"
+MERGE_SHA_L="$(git_q -C "$MAIN" rev-parse HEAD)"
+git_q -C "$MAIN" push -q origin "$CHILD_BR"
+git_q -C "$MAIN" checkout -q main
+
+REMOTE_CHILD_SHA_BEFORE_L="$(git_q -C "$REMOTE" rev-parse "$CHILD_BR")"
+run_reconcile "$MAIN"
+
+assert_eq "2" "$RUN_RC" "L: a discarded hand resolution aborts with exit 2"
+assert_contains "$RUN_OUT" "RESOLUTION_DISCARDED $MERGE_SHA_L" \
+  "L: the verb names the merge commit whose resolution the rebase dropped"
+assert_contains "$RUN_OUT" "child.txt" "L: the BLOCKER names the path the resolution touched"
+assert_contains "$RUN_OUT" "Not pushing '$CHILD_BR'" "L: reconcile-stack.sh's own abort message names the child"
+assert_not_contains "$RUN_OUT" "Step 2/3" "L: the push step never started"
+assert_eq "$REMOTE_CHILD_SHA_BEFORE_L" "$(git_q -C "$REMOTE" rev-parse "$CHILD_BR")" \
+  "L: origin/$CHILD_BR still holds the hand-resolved merge -- nothing was pushed"
+assert_eq "" "$(cat "$GH_EDIT_LOG")" "L: the child PR base was never retargeted"
 
 teardown_sandbox
 

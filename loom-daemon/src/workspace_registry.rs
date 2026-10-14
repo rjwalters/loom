@@ -45,16 +45,18 @@ pub const REGISTRY_PATH_ENV: &str = "LOOM_WORKSPACES_PATH";
 /// loader tolerates a missing/older `version` for forward compatibility.
 pub const REGISTRY_VERSION: u32 = 1;
 
-/// Default per-workspace dispatch priority (Issue #3946). Lower = higher
-/// priority. An entry with no explicit `priority` — including every pre-#3946
-/// registry file — parses as this value, so existing registries are unaffected
-/// (all repos share one tier and ordering reduces to the pre-#3946 behavior).
-pub const DEFAULT_WORKSPACE_PRIORITY: u32 = 100;
+/// Default per-workspace draw weight (#11742). An entry with no `weight` —
+/// including every registry file written before #11742, whose old `priority`
+/// key is now ignored — parses as this value, and so does a workspace
+/// registered by hand without `--weight`. On a fleet host the roster sync
+/// then sets the store's `weight` (which the store requires), so the default
+/// only lasts until the next sync.
+pub const DEFAULT_WORKSPACE_WEIGHT: u32 = 1;
 
-/// serde `default` provider for [`Workspace::priority`] / [`crate::types::RepoStatus`].
+/// serde `default` provider for [`Workspace::weight`] / [`crate::types::RepoStatus`].
 #[must_use]
-pub fn default_priority() -> u32 {
-    DEFAULT_WORKSPACE_PRIORITY
+pub fn default_weight() -> u32 {
+    DEFAULT_WORKSPACE_WEIGHT
 }
 
 /// A single managed workspace (repo) entry.
@@ -63,15 +65,12 @@ pub struct Workspace {
     /// Absolute, normalized repo root. This is the canonical key — two entries
     /// with the same `root` are deduplicated on `add`.
     pub root: PathBuf,
-    /// Cross-repo dispatch priority tier (Issue #3946): **lower = higher
-    /// priority**, default [`DEFAULT_WORKSPACE_PRIORITY`] (100). The autonomous
-    /// work-finder and epic supervisor order candidates by this ascending, so a
-    /// tool repo pinned to `0` outranks a product repo left at the default. A
-    /// missing `priority` — including every pre-#3946 registry file — parses as
-    /// the default via `#[serde(default)]`, keeping old registries byte-for-byte
-    /// compatible.
-    #[serde(default = "default_priority")]
-    pub priority: u32,
+    /// Cross-repo draw weight (#11742): the work finder draws this workspace
+    /// with probability (weight + bonuses) / Σ over workspaces with work, so
+    /// **higher = more draws**, and 0 = never drawn. Default
+    /// [`DEFAULT_WORKSPACE_WEIGHT`] when missing.
+    #[serde(default = "default_weight")]
+    pub weight: u32,
     /// Optional per-repo config overrides, stored verbatim as opaque JSON.
     /// Phase 1 persists and round-trips these but does not interpret them;
     /// later phases layer them over the repo's `.loom/config.json`.
@@ -257,33 +256,31 @@ impl WorkspaceRegistry {
         self.workspaces.iter().any(|w| w.root == canonical)
     }
 
-    /// Register a workspace at the default priority
-    /// ([`DEFAULT_WORKSPACE_PRIORITY`]). Thin wrapper over
-    /// [`add_with_priority`](Self::add_with_priority) preserving the pre-#3946
-    /// signature for existing callers.
+    /// Register a workspace at the default weight
+    /// ([`DEFAULT_WORKSPACE_WEIGHT`]). Thin wrapper over
+    /// [`add_with_weight`](Self::add_with_weight).
     pub fn add(
         &mut self,
         root: &Path,
         config_overrides: Option<serde_json::Value>,
     ) -> Result<AddOutcome> {
-        self.add_with_priority(root, config_overrides, DEFAULT_WORKSPACE_PRIORITY)
+        self.add_with_weight(root, config_overrides, DEFAULT_WORKSPACE_WEIGHT)
     }
 
-    /// Register a workspace with an explicit dispatch `priority` (Issue #3946;
-    /// lower = higher priority). Normalizes `root`, validates it exists and is a
+    /// Register a workspace with an explicit draw `weight` (#11742). Normalizes `root`, validates it exists and is a
     /// directory, and deduplicates on the normalized path. Idempotent: a
     /// re-register returns [`AddOutcome::AlreadyPresent`] without mutating (use
-    /// [`set_priority`](Self::set_priority) to change an already-registered
-    /// repo's tier).
+    /// [`set_weight`](Self::set_weight) to change an already-registered
+    /// repo's weight).
     ///
     /// `config_overrides` is stored verbatim (only applied on a genuine insert;
     /// a re-register does not overwrite existing overrides — remove then re-add
     /// to change them).
-    pub fn add_with_priority(
+    pub fn add_with_weight(
         &mut self,
         root: &Path,
         config_overrides: Option<serde_json::Value>,
-        priority: u32,
+        weight: u32,
     ) -> Result<AddOutcome> {
         let canonical = normalize_path(root);
 
@@ -300,7 +297,7 @@ impl WorkspaceRegistry {
         let looks_like = looks_like_workspace(&canonical);
         self.workspaces.push(Workspace {
             root: canonical.clone(),
-            priority,
+            weight,
             config_overrides,
             maintain_only: None,
         });
@@ -310,7 +307,7 @@ impl WorkspaceRegistry {
         })
     }
 
-    /// Register a workspace ([`add_with_priority`](Self::add_with_priority))
+    /// Register a workspace ([`add_with_weight`](Self::add_with_weight))
     /// and mark its canonical root trusted in the given Claude Code state
     /// file (issue #5314), so a headless spawn into a freshly-registered
     /// workspace never silently drops its `permissions.allow` list waiting on
@@ -326,7 +323,7 @@ impl WorkspaceRegistry {
     /// — trust-marking is idempotent (see
     /// [`claude_config_trust_at`](crate::terminal::claude_config_trust_at)) and
     /// self-heals a workspace that was registered before this fix existed,
-    /// without re-registering it or touching its stored priority/overrides.
+    /// without re-registering it or touching its stored weight/overrides.
     ///
     /// `claude_state_path` is caller-resolved (normally
     /// [`crate::terminal::claude_config_state_path`]) rather than resolved
@@ -336,10 +333,10 @@ impl WorkspaceRegistry {
         &mut self,
         root: &Path,
         config_overrides: Option<serde_json::Value>,
-        priority: u32,
+        weight: u32,
         claude_state_path: &Path,
     ) -> Result<AddOutcome> {
-        let outcome = self.add_with_priority(root, config_overrides, priority)?;
+        let outcome = self.add_with_weight(root, config_overrides, weight)?;
         let canonical = match &outcome {
             AddOutcome::Added { canonical, .. } | AddOutcome::AlreadyPresent { canonical } => {
                 canonical
@@ -349,31 +346,31 @@ impl WorkspaceRegistry {
         Ok(outcome)
     }
 
-    /// Set the dispatch priority of an already-registered workspace (Issue
-    /// #3946). Normalizes `root` and updates the matching entry's `priority`,
+    /// Set the draw weight of an already-registered workspace (#11742).
+    /// Normalizes `root` and updates the matching entry's `weight`,
     /// returning `true` when an entry was updated, `false` when no matching
     /// workspace is registered (a no-op — the caller reports it).
-    pub fn set_priority(&mut self, root: &Path, priority: u32) -> bool {
+    pub fn set_weight(&mut self, root: &Path, weight: u32) -> bool {
         let canonical = normalize_path(root);
         if let Some(ws) = self.workspaces.iter_mut().find(|w| w.root == canonical) {
-            ws.priority = priority;
+            ws.weight = weight;
             true
         } else {
             false
         }
     }
 
-    /// The dispatch priority of the workspace whose normalized root is exactly
-    /// `root` (Issue #3946). `root` is expected to already be normalized — the
+    /// The draw weight of the workspace whose normalized root is exactly
+    /// `root` (#11742). `root` is expected to already be normalized — the
     /// roots returned by [`effective_roots`](Self::effective_roots) /
     /// [`roots`](Self::roots) are. A root not present in the registry (e.g. the
-    /// empty-registry cwd fallback) resolves to [`DEFAULT_WORKSPACE_PRIORITY`].
+    /// empty-registry cwd fallback) resolves to [`DEFAULT_WORKSPACE_WEIGHT`].
     #[must_use]
-    pub fn priority_of(&self, root: &Path) -> u32 {
+    pub fn weight_of(&self, root: &Path) -> u32 {
         self.workspaces
             .iter()
             .find(|w| w.root == root)
-            .map_or(DEFAULT_WORKSPACE_PRIORITY, |w| w.priority)
+            .map_or(DEFAULT_WORKSPACE_WEIGHT, |w| w.weight)
     }
 
     /// Deregister a workspace by root. Normalizes `root` and removes the
@@ -665,7 +662,7 @@ mod tests {
 
         let mut reg = WorkspaceRegistry::default();
         let outcome = reg
-            .add_and_trust(&repo, None, DEFAULT_WORKSPACE_PRIORITY, &claude_state_path)
+            .add_and_trust(&repo, None, DEFAULT_WORKSPACE_WEIGHT, &claude_state_path)
             .unwrap();
         let canonical = match outcome {
             AddOutcome::Added { canonical, .. } => canonical,
@@ -708,7 +705,7 @@ mod tests {
         .unwrap();
 
         let mut reg = WorkspaceRegistry::default();
-        reg.add_and_trust(&repo, None, DEFAULT_WORKSPACE_PRIORITY, &claude_state_path)
+        reg.add_and_trust(&repo, None, DEFAULT_WORKSPACE_WEIGHT, &claude_state_path)
             .unwrap();
 
         let contents = std::fs::read_to_string(&claude_state_path).unwrap();
@@ -735,7 +732,7 @@ mod tests {
         assert!(!claude_state_path.exists());
 
         let mut reg = WorkspaceRegistry::default();
-        reg.add_and_trust(&repo, None, DEFAULT_WORKSPACE_PRIORITY, &claude_state_path)
+        reg.add_and_trust(&repo, None, DEFAULT_WORKSPACE_WEIGHT, &claude_state_path)
             .unwrap();
 
         assert!(claude_state_path.exists());
@@ -764,7 +761,7 @@ mod tests {
         // Re-running `workspace add` (the self-heal path) must not
         // re-register or error, and must still seed the trust bit.
         let outcome = reg
-            .add_and_trust(&repo, None, DEFAULT_WORKSPACE_PRIORITY, &claude_state_path)
+            .add_and_trust(&repo, None, DEFAULT_WORKSPACE_WEIGHT, &claude_state_path)
             .unwrap();
         assert!(matches!(outcome, AddOutcome::AlreadyPresent { .. }));
         assert_eq!(reg.workspaces.len(), 1);
@@ -803,7 +800,7 @@ mod tests {
         let mut reg = WorkspaceRegistry::default();
         reg.workspaces.push(Workspace {
             root: canonical.clone(),
-            priority: DEFAULT_WORKSPACE_PRIORITY,
+            weight: DEFAULT_WORKSPACE_WEIGHT,
             config_overrides: None,
             maintain_only: None,
         });
@@ -907,7 +904,7 @@ mod tests {
 
         let mut reg = WorkspaceRegistry::default();
         reg.add(&repo, None).unwrap();
-        assert_eq!(reg.workspaces[0].priority, DEFAULT_WORKSPACE_PRIORITY);
+        assert_eq!(reg.workspaces[0].weight, DEFAULT_WORKSPACE_WEIGHT);
     }
 
     #[test]
@@ -918,15 +915,15 @@ mod tests {
         let canonical = std::fs::canonicalize(&repo).unwrap();
 
         let mut reg = WorkspaceRegistry::default();
-        reg.add_with_priority(&repo, None, 0).unwrap();
-        assert_eq!(reg.workspaces[0].priority, 0);
-        assert_eq!(reg.priority_of(&canonical), 0);
+        reg.add_with_weight(&repo, None, 0).unwrap();
+        assert_eq!(reg.workspaces[0].weight, 0);
+        assert_eq!(reg.weight_of(&canonical), 0);
     }
 
     #[test]
     fn priority_of_unregistered_root_is_default() {
         let reg = WorkspaceRegistry::default();
-        assert_eq!(reg.priority_of(Path::new("/not/registered")), DEFAULT_WORKSPACE_PRIORITY);
+        assert_eq!(reg.weight_of(Path::new("/not/registered")), DEFAULT_WORKSPACE_WEIGHT);
     }
 
     #[test]
@@ -938,11 +935,11 @@ mod tests {
 
         let mut reg = WorkspaceRegistry::default();
         reg.add(&repo, None).unwrap();
-        assert!(reg.set_priority(&repo, 1), "updating a present entry returns true");
-        assert_eq!(reg.priority_of(&canonical), 1);
+        assert!(reg.set_weight(&repo, 1), "updating a present entry returns true");
+        assert_eq!(reg.weight_of(&canonical), 1);
 
         assert!(
-            !reg.set_priority(Path::new("/absent"), 5),
+            !reg.set_weight(Path::new("/absent"), 5),
             "updating an absent entry returns false"
         );
     }
@@ -955,11 +952,11 @@ mod tests {
         let path = dir.path().join("workspaces.json");
 
         let mut reg = WorkspaceRegistry::default();
-        reg.add_with_priority(&repo, None, 3).unwrap();
+        reg.add_with_weight(&repo, None, 3).unwrap();
         reg.save(&path).unwrap();
 
         let loaded = WorkspaceRegistry::load(&path).unwrap();
-        assert_eq!(loaded.workspaces[0].priority, 3);
+        assert_eq!(loaded.workspaces[0].weight, 3);
         assert_eq!(loaded, reg);
     }
 
@@ -982,7 +979,7 @@ mod tests {
         let reg = WorkspaceRegistry::load(&path).unwrap();
         assert_eq!(reg.workspaces.len(), 1);
         assert_eq!(
-            reg.workspaces[0].priority, DEFAULT_WORKSPACE_PRIORITY,
+            reg.workspaces[0].weight, DEFAULT_WORKSPACE_WEIGHT,
             "an entry with no `priority` parses as the default (backward compat)"
         );
     }

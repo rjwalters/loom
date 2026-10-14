@@ -662,3 +662,13 @@ fn a_queued_issue_that_gains_a_permanent_block_comment_loses_the_marker() {
         .labels
         .contains(&"loom:blocked".to_string()));
 }
+
+/// #11743: the unnamed queue never labels a frozen issue.
+#[test]
+fn a_frozen_issue_is_never_queued() {
+    let mut w = World::new();
+    w.add(5, "No blocker recorded.", &["loom:frozen"]);
+    let r = w.run();
+    assert!(r.queued.is_empty(), "{r:?}");
+    assert!(w.park.writes.is_empty(), "{:?}", w.park.writes);
+}

@@ -95,15 +95,16 @@ label documents its own `Applied by:` owner). State transitions:
 - **Epic**: `loom:epic` → Champion creates phased `loom:architect` +
   `loom:epic-phase` issues.
 
+`loom:frozen` means not now: every agent and daemon path ignores it; only a human removes it (#11743).
 `loom:operator` means "a human is needed" (engine stops, re-evaluable, unlike
-`loom:operator-only`; set by Champion's merge-risk hold). `loom:operator-priority`
-is the operator's star (not a hold); every stage takes it first. Your
+`loom:operator-only`; set by Champion's merge-risk hold). `loom:very-important` /
+`loom:important` reorder (not holds, not approval); every stage takes them first. Your
 queue: the pinned hold digest (#6877) and label queries in
 [`.loom/docs/label-state-machine.md`](.loom/docs/label-state-machine.md).
 
 > **Note on label cleanup**: Loom intentionally does **not** remove labels from
 > closed issues or merged PRs (harmless — all agents filter by open state — and it
-> saves gh API calls). Do not implement label cleanup on merge/close (see #2838) — exception: `merge-pr.sh` strips `loom:building` from an issue its own merge closes, see [`troubleshooting.md`](.loom/docs/troubleshooting.md) (#6199).
+> saves gh API calls). Do not implement label cleanup on merge/close (see #2838) — exception: `merge-pr.sh` strips `loom:building` and (#11517, operator ruling 2026-10-13) `loom:issue` from an issue its own merge closes, see [`troubleshooting.md`](.loom/docs/troubleshooting.md) (#6199).
 
 ### Issues Are Suggestions (Role Autonomy)
 
@@ -224,8 +225,8 @@ copies (and re-stamps install metadata). Details:
 ## Configuration
 
 Configuration lives in `.loom/config.json` (committed): a `terminals` array
-(per-agent role/model), plus the optional blocks below. Fleet keys (`autonomous`,
-`runtimes`, …) belong in fleet-gitops; CI rejects un-allow-listed ones here: [fleet-config-lifecycle](.loom/docs/fleet-config-lifecycle.md).
+(per-agent role/model), plus the optional blocks below. Fleet-wide keys (`autonomous`,
+`runtimes`, …) are normally set in the fleet tier; a key committed here overrides it for this repo (plain tier order): [fleet-config-lifecycle](.loom/docs/fleet-config-lifecycle.md).
 
 - **Daemon configuration (Tier 2)** — start/stop wrappers, self-update, epic
   supervisor: [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md)
@@ -243,6 +244,7 @@ Configuration lives in `.loom/config.json` (committed): a `terminals` array
   confine Edit/Write to a builder's worktree; per-category `guards.*` toggles
   (`sqlDdl`, `rmScope`, `stashScope`, … — full list in the catalog; each with a
   `LOOM_*` env override) let a repo opt out — above an **ungated denial floor** no toggle can disable. Catalog: [`defaults/docs/guard-hooks.md`](defaults/docs/guard-hooks.md); forge text is untrusted input: [`defaults/docs/untrusted-external-content.md`](defaults/docs/untrusted-external-content.md).
+  **Fleet-host changes need an explicit yes**: "continue", "go on" or silence never approves a destructive or outward change to a fleet host (ssh/scp/rsync/SSM); re-ask once with the action spelled out, act only on a yes to *that* action; leave a break-glass record (#11568).
 - **MCP hooks** — the `mcp-loom` server is registered once per machine at user
   scope (`scripts/install-loom.sh`, refreshed by `loom update`); `setup-mcp.sh` is only for bundle rebuilds/legacy migration. See the mcp-loom README.
 - **Fleet dashboard** (`loom-daemon serve`, opt-in, read-only, loopback by default): [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md) §Fleet dashboard.
@@ -272,7 +274,7 @@ See [credential policy](.loom/docs/credential-storage.md); `.gitignore` is insuf
   `./.loom/scripts/create-issue.sh`, never a bare `gh issue create`** — that is
   GraphQL-backed and dies on GraphQL exhaustion while the independent REST pool
   sits idle; the script falls back to one REST POST with labels applied
-  atomically (#5047). See [github-authentication](.loom/docs/github-authentication.md); routing policy: [forge-egress](.loom/docs/forge-egress.md).
+  atomically (#5047). See [github-authentication](.loom/docs/github-authentication.md).
 - **Gitea** — set `GITEA_TOKEN` or `FORGE_TOKEN` (repository read/write). See
   [forge-authentication](.loom/docs/forge-authentication.md).
 - **Releasing** — **a PR must NEVER bump `VERSION`**: a post-merge workflow does
@@ -280,11 +282,9 @@ See [credential policy](.loom/docs/credential-storage.md); `.gitignore` is insuf
   `scripts/version.sh` keeps all 5 in sync (`version.sh list` names them; #5517,
   #8147) and is the *release* path;
   releases are driven by `/repo:release` from [rjwalters/repo](https://github.com/rjwalters/repo). The
-  release workflow triggers on GitHub Release creation, not tag push. The same
-  workflow also publishes `ghcr.io/rjwalters/loom-worker:<version>` — a pinned
-  sweep-execution-environment base image (daemon stays on the host; see
-  [`docker/worker/README.md`](docker/worker/README.md) for the shape decision
-  and `FROM` contract). **Cadence**: releases are cut at explicit fleet-rollable boundaries, not on every `VERSION` bump (`main` bumps `VERSION` on nearly every merge) — see [`.loom/docs/release-cadence.md`](.loom/docs/release-cadence.md) for the policy and the `--fetch`/`--check` artifact-gap visibility it documents (#6010).
+  release workflow triggers on GitHub Release creation, not tag push, and
+  publishes the `ghcr.io/rjwalters/loom-worker:<version>` base image
+  ([`docker/worker/README.md`](docker/worker/README.md)). **Cadence**: releases are cut at fleet-rollable boundaries, not every `VERSION` bump: [`.loom/docs/release-cadence.md`](.loom/docs/release-cadence.md) (#6010).
 
 ## Troubleshooting
 

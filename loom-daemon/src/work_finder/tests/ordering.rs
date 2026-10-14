@@ -43,7 +43,7 @@ fn test_tick_multi_higher_priority_repo_dispatches_first_under_cap() {
             RecordingDispatcher::default(),
         ),
     ];
-    let report = tick_multi(&mut multi, &[100, 0], 2, &[false, false]);
+    let report = tick_multi(&mut multi, &[1, 10], 2, &[false, false]);
 
     assert_eq!(report.dispatched, 2, "the global cap of 2 is filled");
     assert_eq!(report.deferred_capacity, 4, "the low-priority repo's 4 are deferred");
@@ -68,7 +68,7 @@ fn very_important_in_a_priority_100_repo_beats_a_priority_0_repo() {
             RecordingDispatcher::default(),
         ),
     ];
-    let report = tick_multi(&mut multi, &[100, 0], 1, &[false, false]);
+    let report = tick_multi(&mut multi, &[1, 10], 1, &[false, false]);
     assert_eq!(report.dispatched, 1);
     assert_eq!(multi[0].1.dispatched, vec![7], "the very-important issue dispatches first");
     assert!(multi[1].1.dispatched.is_empty());
@@ -76,18 +76,18 @@ fn very_important_in_a_priority_100_repo_beats_a_priority_0_repo() {
 
 #[test]
 fn two_important_issues_order_by_age() {
-    // Two issues at the same level order oldest `createdAt` first; a legacy
-    // star on the newest changes nothing (#11508).
+    // Issues at the same level order oldest `createdAt` first; an older
+    // issue with no level still goes after them.
     let mut multi = vec![(
         FakeSource::once(vec![
             labelled_at(2, "loom:important", "2026-01-01T00:00:00Z"),
             labelled_at(1, "loom:important", "2020-01-01T00:00:00Z"),
             labelled_at(3, "loom:important", "2019-08-01T00:00:00Z"),
-            labelled_at(4, OPERATOR_PRIORITY_LABEL, "2010-01-01T00:00:00Z"),
+            issue_at(4, "2010-01-01T00:00:00Z"),
         ]),
         RecordingDispatcher::default(),
     )];
-    let report = tick_multi(&mut multi, &[100], 1, &[false]);
+    let report = tick_multi(&mut multi, &[1], 1, &[false]);
     assert_eq!(report.dispatched, 1);
     assert_eq!(multi[0].1.dispatched, vec![3], "the oldest lands first");
 }
@@ -103,7 +103,7 @@ fn test_tick_multi_oldest_first_within_same_tier() {
         ]),
         RecordingDispatcher::default(),
     )];
-    let report = tick_multi(&mut multi, &[100], 1, &[false]);
+    let report = tick_multi(&mut multi, &[1], 1, &[false]);
     assert_eq!(report.dispatched, 1);
     assert_eq!(multi[0].1.dispatched, vec![7], "the older issue dispatches first");
 }
@@ -126,12 +126,12 @@ fn test_tick_multi_missing_priority_entry_defaults() {
 fn single_workspace_tick_moves_important_first_then_oldest_first() {
     // #11103: the single-workspace tick uses the in-workspace order — level,
     // oldest `createdAt`, number — not the listing order (newest-first
-    // here). The legacy star (#8) is a plain issue since #11508.
+    // here).
     let mut source = FakeSource::once(vec![
         issue_at(3, "2026-03-01T00:00:00Z"),
         issue_at(1, "2026-01-01T00:00:00Z"),
         labelled_at(9, "loom:important", "2026-09-01T00:00:00Z"),
-        labelled_at(8, OPERATOR_PRIORITY_LABEL, "2026-08-01T00:00:00Z"),
+        issue_at(8, "2026-08-01T00:00:00Z"),
         issue_at(2, "2026-02-01T00:00:00Z"),
     ]);
     let mut dispatcher = RecordingDispatcher::default();
@@ -217,11 +217,11 @@ fn test_candidate_cmp_ordering() {
     // 4. Workspace priority is not a key: two candidates differing only in it
     //    compare equal.
     let a = PriorityCandidate {
-        workspace_priority: 0,
+        workspace_weight: 0,
         ..mk(Level::Important, None, 4)
     };
     let b = PriorityCandidate {
-        workspace_priority: 100,
+        workspace_weight: 100,
         ..mk(Level::Important, None, 4)
     };
     assert_eq!(candidate_cmp(&a, &b), Ordering::Equal);

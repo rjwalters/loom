@@ -172,7 +172,7 @@ fn an_unfinished_curated_walk_is_an_error_not_the_first_page() {
 
 fn row(repo: &str, issue: u32) -> ReadyQueueRow {
     serde_json::from_value(serde_json::json!({
-        "rank": issue, "repo": repo, "issue": issue, "workspace_priority": 100,
+        "rank": issue, "repo": repo, "issue": issue, "workspace_weight": 100,
         "urgent": false, "disposition": "queued"
     }))
     .unwrap()
@@ -411,7 +411,7 @@ fn a_ready_row_carries_its_clock_and_only_a_clocked_hold_its_expiry() {
     let at = "2026-10-11T12:30:00Z";
     let tick_row = |issue: u32, disposition: &str, held_until: Option<&str>| -> ReadyQueueRow {
         let mut v = serde_json::json!({
-            "rank": issue, "repo": "/src/app", "issue": issue, "workspace_priority": 100,
+            "rank": issue, "repo": "/src/app", "issue": issue, "workspace_weight": 100,
             "urgent": false, "disposition": disposition
         });
         if let Some(until) = held_until {

@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 /// Every request the mock sink saw, as `(path, body)` — shared between the
 /// accept-loop thread and the asserting test. Aliased rather than written
 /// inline so `clippy::type_complexity` stays satisfied under
-/// `--all-targets --features otlp`.
+/// `--all-targets`.
 type RecordedRequests = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
 
 /// A minimal two-path mock sink: records every request's path + body so

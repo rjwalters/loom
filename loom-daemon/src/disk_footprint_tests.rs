@@ -44,6 +44,29 @@ fn history_is_a_rolling_window() {
 }
 
 #[test]
+fn the_charge_basis_is_a_nearest_rank_p90() {
+    assert_eq!(charge_basis_bytes(&[]), None);
+    assert_eq!(charge_basis_bytes(&[0]), None);
+    // Up to 9 runs, nearest-rank p90 is the max: a short history stays
+    // conservative.
+    assert_eq!(charge_basis_bytes(&[1, 9, 2, 3, 4, 5, 6, 7, 8]), Some(9));
+    // 10 runs: the 9th smallest, so one outlier no longer sets the charge.
+    assert_eq!(charge_basis_bytes(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 100]), Some(9));
+    // A full window drops its top two.
+    let full: Vec<u64> = (1..=20).collect();
+    assert_eq!(charge_basis_bytes(&full), Some(18));
+}
+
+#[test]
+fn a_role_runs_mark_is_the_same_percentile() {
+    let mut store = Store::default();
+    let mut hist = vec![GIB; 9];
+    hist.push(40 * GIB);
+    store.role_runs.insert(role_key("loom", "judge"), hist);
+    assert_eq!(store.role_high_water_bytes("loom", "judge"), Some(GIB));
+}
+
+#[test]
 fn a_pending_unit_survives_its_grace_then_drops_without_history() {
     let mut store = Store::default();
     record_pending(&mut store, "loom#7", "loom", Some(7), 1_000);

@@ -82,18 +82,14 @@ impl fmt::Display for Tap {
 
 /// Which form of backstop-ceiling refusal passed a tap over (#8555).
 ///
-/// Three kinds rather than one, because they call for three different operator
+/// Two kinds rather than one, because they call for two different operator
 /// responses: "the host is at its metered ceiling" is working as designed,
-/// "this work is below the eligibility tier" is a policy verdict on *this*
-/// dispatch, and "the ceiling state could not be read" is a host fault that
-/// must be repaired before the metered tier can be used again.
+/// and "the ceiling state could not be read" is a host fault that must be
+/// repaired before the metered tier can be used again.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CeilingSkip {
     /// The configured per-host concurrency ceiling is already held.
     AtCapacity { live: u32, limit: u32 },
-    /// The work is below the configured eligibility tier, so it never reaches
-    /// the metered tap at all.
-    Ineligible,
     /// The ceiling is configured but its live count could not be established
     /// (no resolvable lease directory, an unwritable store, an unreadable
     /// one). Fail closed: an unknown count must never read as "there is room".
@@ -132,7 +128,6 @@ impl SkipReason {
             Self::Unavailable { .. } => "unavailable",
             Self::Ceiling { skip, .. } => match skip {
                 CeilingSkip::AtCapacity { .. } => "ceiling-at-capacity",
-                CeilingSkip::Ineligible => "ceiling-ineligible",
                 CeilingSkip::Unknown => "ceiling-unknown",
             },
         }
@@ -267,6 +262,8 @@ impl<T> Resolution<T> {
             tap: chosen.tap.to_string(),
             marker,
             model_profile: chosen.tap.model_profile.clone(),
+            model: None,
+            draw: None,
         })
     }
 
@@ -330,6 +327,15 @@ pub struct PreferenceStamp {
     /// exactly, so a bare tap keeps pinning nothing at launch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_profile: Option<String>,
+    /// The model a role draw's pick pins (`claude/opus` ⇒ `opus`, #11726).
+    /// The role-tick launch passes it as `--model`; `None` keeps today's
+    /// model resolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The role draw's decision record, when `runtimes.roleDraw` chose this
+    /// tap (#11726).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draw: Option<Box<super::role_draw::RoleDrawRecord>>,
 }
 
 /// Walk `taps` in order and take the first that is both admitted for the role

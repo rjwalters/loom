@@ -31,6 +31,9 @@
 //! `(trace_id, span_id)`, and no section may count it twice.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "common/hub_image.rs"]
+mod hub_image;
+
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -60,7 +63,7 @@ fn clickhouse(script: &str, format: &str) -> String {
             "-i",
             "--entrypoint",
             "clickhouse",
-            CLICKHOUSE_IMAGE,
+            &hub_image::resolve(CLICKHOUSE_IMAGE),
             "local",
             "--multiquery",
             &format!("--param_since={SINCE}"),
@@ -165,6 +168,9 @@ fn by<'a>(rows: &'a [Row], key: &str, value: &str) -> &'a Row {
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn committed_usage_queries_answer_the_measured_usage_questions_on_real_clickhouse() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
     // ---- the file runs verbatim, as one pass, exactly as documented --------
     let verbatim = format!("{FIXTURE}\n{QUERIES}");
     clickhouse(&verbatim, "TSV");
@@ -307,6 +313,9 @@ fn committed_usage_queries_answer_the_measured_usage_questions_on_real_clickhous
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn reading_a_token_counter_from_attributes_number_silently_returns_zero() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
     let probe = format!(
         "{FIXTURE}\n\
          SELECT count() AS usage_spans,\n\

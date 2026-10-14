@@ -106,6 +106,7 @@ fn every_mapped_claim_name_is_an_inventoried_op() {
         "outcome.writeback_comment",
         "prless.comment",
         "park_hold.issue_view",
+        "release_veto.issue_labels",
         "park_hold.issue_body",
         "park_hold.issue_labels",
     ];
@@ -169,7 +170,7 @@ fn gh_json_is_one_counted_read_under_its_operation() {
     let mut got = None;
     let (rows, _) = report_after(|| {
         got = Some(gh_json::<serde_json::Value, _>(
-            "jev.tier_issue_view",
+            "test.gh_json_issue_view",
             &gh,
             &["issue", "view", "3", "--json", "number"],
             tmp.path(),
@@ -178,7 +179,7 @@ fn gh_json_is_one_counted_read_under_its_operation() {
         ));
     });
     assert!(matches!(got, Some(Query::Populated(_))), "{got:?}");
-    assert_eq!(calls(&rows, "jev.tier_issue_view"), 1, "{rows:?}");
+    assert_eq!(calls(&rows, "test.gh_json_issue_view"), 1, "{rows:?}");
 }
 
 /// The write-scope probe runs under the credential it is testing: the

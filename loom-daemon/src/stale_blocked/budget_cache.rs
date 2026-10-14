@@ -23,10 +23,7 @@
 //!   reader-1 / reader-2 split never shares a reading. When the credential
 //!   cannot be named that way, the key is the root itself, which is the
 //!   pre-#11301 granularity. That happens when an env token reaches `gh` (it
-//!   outranks any directory), when no `GH_CONFIG_DIR` resolves at all, or when
-//!   a forge-egress launcher is configured (it picks a per-owner credential
-//!   from the request's repository or the checkout's remote, not from the
-//!   directory).
+//!   outranks any directory), or when no `GH_CONFIG_DIR` resolves at all.
 //! - **Freshness**: a reading younger than the TTL answers with no forge call,
 //!   so it emits no `invoke github` span, and `budget_before` reports it
 //!   `cached: true`. A probe that did not answer is not stored.
@@ -86,8 +83,6 @@ pub struct CredentialFacts {
     pub config_dir: Option<PathBuf>,
     /// A `GH_TOKEN`-style variable reaches the child.
     pub env_token: bool,
-    /// A forge-egress launcher is configured on this host.
-    pub launcher: bool,
 }
 
 impl CredentialKey {
@@ -96,7 +91,7 @@ impl CredentialKey {
     pub fn from_facts(root: &Path, program: Option<&str>, facts: CredentialFacts) -> Self {
         let program = program.map(str::to_string);
         match facts.config_dir {
-            Some(dir) if !facts.env_token && !facts.launcher => Self::ConfigDir { dir, program },
+            Some(dir) if !facts.env_token => Self::ConfigDir { dir, program },
             _ => Self::Root {
                 root: root.to_path_buf(),
                 program,
@@ -112,10 +107,6 @@ impl CredentialKey {
             env_token: crate::gh_invocation::TOKEN_ENV_VARS
                 .iter()
                 .any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty())),
-            launcher: crate::gh_invocation::resolver::launcher_from_sources(
-                &crate::forge_egress::policy::PolicySources::from_process(None),
-            )
-            .is_some(),
         };
         let root = ctx.root.clone().unwrap_or_default();
         Self::from_facts(&root, ctx.program.as_deref(), facts)

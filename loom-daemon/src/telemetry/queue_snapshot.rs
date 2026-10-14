@@ -61,20 +61,17 @@ pub struct QueueSnapshotRow {
     #[serde(default)]
     pub visibility: RepoVisibility,
     pub issue: u32,
-    pub workspace_priority: u32,
+    pub workspace_weight: u32,
     /// Deprecated (#9244): always `false`. Its label was deleted in #11105;
     /// kept on the wire only for compatibility.
     pub urgent: bool,
-    /// Deprecated (#11508): always `false`. The star is no longer an
-    /// ordering key; the row's level is its `keys` entry `level`.
+    /// The issue's priority level (#11510): `default`, `important` or
+    /// `very-important` (the ready-queue row's `level`; a blocked row reads
+    /// its own labels). Absent (an older daemon) reads as `default`.
     #[serde(default)]
-    pub operator_priority: bool,
+    pub level: crate::priority_pick::Level,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
-    /// The `tier:*` label, which is informational only and does not affect
-    /// dispatch order.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tier: Option<String>,
     pub disposition: QueueDisposition,
     /// `running` / `ready` / `blocked`.
     pub state: String,
@@ -91,8 +88,8 @@ pub struct QueueSnapshotRow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub halt_cause: Option<String>,
     /// The dispatch-plan fields (Issue #9288), flattened beside `rank`:
-    /// `position`, `plan_state`, `keys`, `gate`, `in_slice`, `hot`,
-    /// `owning_shard`, `repo_cap`. The `keys` names are the four
+    /// `position`, `plan_state`, `keys`, `gate`, `hot`, `owning_shard`,
+    /// `repo_cap` (`in_slice` is retired and absent since #11682). The `keys` names are the four
     /// `candidate_keys` (#11508, #11547): `main_red_fix` (bool, true only for
     /// a verified red-main fix while its repo's `main` is red), `level`
     /// (0 default, 1 `loom:important`, 2 `loom:very-important`),

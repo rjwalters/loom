@@ -72,7 +72,13 @@
 //! # Surfacing (scope-limited)
 //!
 //! A red `main` is surfaced by **loud logging** (daemon log): the offending
-//! command, its exit reason, and a tail of its captured output. Auto-revert of
+//! command, its exit reason, and a tail of its captured output. Since #11766
+//! it can also be surfaced on the forge (opt-in, off by default): the work
+//! finder files one `loom:very-important` fix issue per red repo (and closes
+//! it once green;
+//! [`crate::work_finder::main_red_autofile`]). The gate loop feeds it each
+//! logged verdict, with the red output tail, through
+//! `log_transition_for_root`. Auto-revert of
 //! the offending PR (via `merge-pr.sh` / the Auditor cron) is an explicit
 //! non-goal for this issue — halting + surfacing is the hard requirement.
 //! No new event-bus topic is introduced (the six-topic taxonomy is frozen and
@@ -2177,7 +2183,8 @@ pub(crate) fn run_gate_tick_with_fns(
     // is what makes an injected answer actually cover the whole tick.
     let mut runner = CommandGateRunner::new(run_config, repo_root.to_path_buf())
         .with_credential_freshness(Box::new(FnCredentialFreshness(credential_stale)));
-    let outcome = runner.run_gate();
+    // #11690: the run is one `build_gate.run` span (a no-op without an ops sink).
+    let outcome = crate::observability::ops::build_gate::main_health(tier, || runner.run_gate());
     match &outcome {
         GateOutcome::Green { .. } | GateOutcome::Red { .. } => {
             // Record which tier produced this verdict so the status/log tier
@@ -3125,6 +3132,7 @@ fn log_transition_for_root(
     outcome: &GateOutcome,
     halted: bool,
 ) {
+    crate::work_finder::main_red_autofile::note_gate_outcome(root, outcome);
     let r = root.display();
     match transition {
         HealthTransition::EnteredHalt => log::error!(

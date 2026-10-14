@@ -2401,14 +2401,14 @@ mod tests {
         )
         .unwrap();
 
-        let star = vec!["loom:operator-priority".to_string()];
+        let star = vec!["loom:important".to_string()];
         let r = create_recovery_pr(dir.path(), "feature/issue-1", "fix: t", "Closes #1", &star);
         assert!(r.succeeded());
         assert_eq!(r.stdout_trimmed(), "https://github.test/o/r/pull/9");
         let argv = std::fs::read_to_string(scripts.join("argv")).unwrap();
         assert!(argv.contains("--head feature/issue-1"), "argv: {argv}");
         assert!(argv.contains("--label loom:review-requested"), "argv: {argv}");
-        assert!(argv.contains("--label loom:operator-priority"), "#10518: argv: {argv}");
+        assert!(argv.contains("--label loom:important"), "#10518: argv: {argv}");
     }
 
     /// Test-only helper mirroring the Python's "lowercase the first character"

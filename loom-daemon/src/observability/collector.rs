@@ -308,7 +308,7 @@ async fn handle_event(
 /// - **this live event-bus path** (`terminal_records`, below): fires
 ///   synchronously off `Event::SweepExited`/`SweepCrashed`, with no
 ///   `pr_number`, empty `phase_durations`, and no `config`/`failure_class`/
-///   `judge_verdicts`/`doctor_cycles`/`complexity`;
+///   `judge_verdicts`/`doctor_cycles`;
 /// - **the reaper's outcome journal**
 ///   (`sweep_registry::outcome_journal::append_outcome_telemetry_journal`),
 ///   drained on a periodic cadence by `super::backfill` — the RICH record,
@@ -344,7 +344,7 @@ async fn handle_event(
 ///
 /// Enriching this live path to carry the same fields would duplicate the
 /// journal's own logic (a second source of truth for `config`/
-/// `judge_verdicts`/`complexity`/…) for the larger of the two diffs. This
+/// `judge_verdicts`/…) for the larger of the two diffs. This
 /// path already KNOWS, from its own correlation state, whether the journal
 /// will emit under the same id — that is exactly what a tracked
 /// [`DispatchState`] (dispatched here, or adopted via registry evidence, see
@@ -817,8 +817,7 @@ fn terminal_records(
             runtime: None,
             provider: None,
             profile: None,
-            complexity: None,
-            // Issue #9432: like `complexity`, the story-point size is a forge
+            // Issue #9432: the story-point size is a forge
             // read this pure, reactor-thread mapping never makes. Absent, never
             // `0` — the reaper-side journal path (`outcome_journal`) resolves it
             // from the label list its own single REST read already carries, and
@@ -828,12 +827,14 @@ fn terminal_records(
             tokens_status: None,
             tokens_status_reason: None,
             no_phase_cause: None,
+            phase_tap_usage: Vec::new(),
             // Issues #9444/#9465/#9466: terminal facts the reaper-side journal
             // (the real `sweep.outcome`) computes. Absent, never fabricated.
             attempt_index: None,
             previous_sweep_id: None,
             trigger: None,
             dispatch_origin: None,
+            role_draw: None,
             rework_events: None,
             pr_numbers: None,
             hw_lines_added: None,
@@ -1535,29 +1536,30 @@ async fn collect_managed_repos(
     workspace_pool: &WorkspacePool,
     slug_cache: &mut HashMap<String, String>,
 ) -> Vec<ManagedRepoEntry> {
-    // Each registered workspace's dispatch priority (#9244, loom-ui#153).
-    // Best-effort: an unreadable registry just omits `priority`.
+    // Each registered workspace's draw weight (#11742; was the priority tier,
+    // #9244, loom-ui#153). Best-effort: an unreadable registry just omits
+    // `weight`.
     //
     // Deliberately re-read per collection rather than cached (Issue #9314).
     // This runs once per `snapshot_interval` (5 minutes by default), from the
     // collector task, and reads ONE small local JSON file
     // (`~/.loom/workspaces.json`) — the same read a dozen other daemon paths
     // make per tick. Freshness is the point: an operator's `loom-daemon
-    // workspace priority` edit must show up in the next `host.health` sample
+    // workspace set-weight` edit must show up in the next `host.health` sample
     // without a daemon restart, and `managed_repos` is how the dashboard
     // renders it. Caching it would trade that for no measurable saving and add
-    // a staleness class (a cached priority outliving the edit) to a field whose
+    // a staleness class (a cached weight outliving the edit) to a field whose
     // whole job is to report current configuration.
-    let priorities: HashMap<PathBuf, u32> =
+    let weights: HashMap<PathBuf, u32> =
         crate::workspace_registry::WorkspaceRegistry::load_default()
             .map(|r| {
                 r.workspaces
                     .into_iter()
-                    .map(|w| (w.root, w.priority))
+                    .map(|w| (w.root, w.weight))
                     .collect()
             })
             .unwrap_or_default();
-    collect_managed_repos_with(workspace_pool, slug_cache, derive_visibility, &priorities).await
+    collect_managed_repos_with(workspace_pool, slug_cache, derive_visibility, &weights).await
 }
 
 /// Testable core of [`collect_managed_repos`]: `resolve_visibility` (a plain
@@ -1571,7 +1573,7 @@ async fn collect_managed_repos_with<F>(
     workspace_pool: &WorkspacePool,
     slug_cache: &mut HashMap<String, String>,
     resolve_visibility: F,
-    priorities: &HashMap<PathBuf, u32>,
+    weights: &HashMap<PathBuf, u32>,
 ) -> Vec<ManagedRepoEntry>
 where
     F: Fn(&str) -> RepoVisibility + Copy + Send + Sync + 'static,
@@ -1604,14 +1606,14 @@ where
                 RepoVisibility::Private
             }
         };
-        let priority = priorities.get(&root).copied();
+        let weight = weights.get(&root).copied();
         // #10763: this host's release-pass tallies for the repo, if it ticked.
         let stale_blocked_release =
             crate::stale_blocked::release_outcome::counters(&root).map(|c| c.to_telemetry());
         entries.push(ManagedRepoEntry {
             slug,
             visibility,
-            priority,
+            weight,
             stale_blocked_release,
         });
     }

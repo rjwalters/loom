@@ -120,6 +120,7 @@ struct FakeForge {
     view_err: Option<String>,
     set_body_err: Option<String>,
     timed_out: bool,
+    frozen: bool,
 }
 
 impl ParkForge for FakeForge {
@@ -129,7 +130,11 @@ impl ParkForge for FakeForge {
             Some(e) => Err(e.clone()),
             None => Ok(IssueState {
                 body: self.body.clone(),
-                labels: vec!["loom:issue".to_string()],
+                labels: if self.frozen {
+                    vec!["loom:issue".to_string(), "loom:frozen".to_string()]
+                } else {
+                    vec!["loom:issue".to_string()]
+                },
             }),
         }
     }
@@ -203,6 +208,18 @@ fn a_refused_read_or_write_is_rejected_not_timed_out() {
     assert!(matches!(out, HoldRecord::Rejected(ref e) if e.contains("HTTP 403")), "{out:?}");
 }
 
+/// #11743: the body read is the frozen check — a frozen issue gets no record.
+#[test]
+fn record_hold_writes_nothing_on_a_frozen_issue() {
+    let mut forge = FakeForge {
+        body: "Original.".to_string(),
+        frozen: true,
+        ..FakeForge::default()
+    };
+    assert_eq!(record_hold(&mut forge, 7, PRLESS_HOLD_REASON, AT), HoldRecord::Frozen);
+    assert_eq!(forge.calls, vec!["view 7"], "a read and nothing else");
+}
+
 #[test]
 fn a_timed_out_call_is_reported_as_a_timeout() {
     let mut forge = FakeForge {
@@ -243,7 +260,8 @@ struct Script<'a> {
 }
 
 /// A registry with forge writes enabled, driven by a fake `gh` that logs every
-/// argv to `gh.log` and every `PATCH` payload to `payloads.log`.
+/// argv to `gh.log`, every `PATCH` payload to `payloads.log`, and each call's
+/// `GH_CONFIG_DIR` with its argv (`<dir>|<argv>`) to `gh-creds.log`.
 fn registry(ws: &Path, s: &Script) -> (SweepRegistry, PathBuf, PathBuf) {
     let log = ws.join("gh.log");
     let payloads = ws.join("payloads.log");
@@ -251,6 +269,7 @@ fn registry(ws: &Path, s: &Script) -> (SweepRegistry, PathBuf, PathBuf) {
     let script = format!(
         "#!/usr/bin/env bash\n\
          printf '%s\\n' \"$*\" >> \"{log}\"\n\
+         printf '%s|%s\\n' \"${{GH_CONFIG_DIR:-}}\" \"$*\" >> \"{creds}\"\n\
          if [[ \"$1\" == \"api\" && \"$2\" == \"-X\" && \"$3\" == \"PATCH\" ]]; then\n\
          cat \"$6\" >> \"{payloads}\"; printf '\\n' >> \"{payloads}\"\n\
          if [[ {patch} -ne 0 ]]; then printf 'HTTP 403: body write refused\\n' >&2; fi\n\
@@ -273,6 +292,7 @@ fn registry(ws: &Path, s: &Script) -> (SweepRegistry, PathBuf, PathBuf) {
          fi\n\
          exit 0\n",
         log = log.display(),
+        creds = ws.join("gh-creds.log").display(),
         payloads = payloads.display(),
         patch = s.patch_exit,
         sleep = s.view_sleep,
@@ -534,4 +554,102 @@ fn a_wedged_gh_fails_the_prless_hold_closed_without_a_label_edit() {
     );
     let calls = calls(&log);
     assert!(position(&calls, "issue edit").is_none(), "no second timeout: {calls:?}");
+}
+
+/// #11437: the no-op hold writes its record and label on a cross-owner
+/// (2AMLogic-style) workspace whose only write credential is its own
+/// per-owner one; the process credential there is read-only. The hold goes
+/// through the registry facade and never re-vets with the process credential.
+#[test]
+#[serial]
+fn the_prless_hold_writes_on_a_cross_owner_root() {
+    use crate::credential_preflight::{clear_owner_root_registry, register_root_gh_config_dir};
+    use crate::write_scope_test_support::WritableRoot;
+
+    std::env::remove_var("LOOM_REPO");
+    clear_owner_root_registry();
+    let dir = tempdir().unwrap();
+    let base = std::fs::canonicalize(dir.path()).unwrap();
+    let root = base.join("2amlogic-root");
+    // Process credential: pull only. The owner's credential is registered.
+    let fixture = WritableRoot::read_only(&root, None);
+    let owner_dir = base.join("gh-config-2amlogic");
+    std::fs::create_dir_all(&owner_dir).unwrap();
+    register_root_gh_config_dir(&root, &owner_dir);
+
+    let view = view_answer(121);
+    let (mut reg, log, payloads) = registry(
+        &root,
+        &Script {
+            view: &view,
+            view_sleep: 0,
+            patch_exit: 0,
+        },
+    );
+    hold_at_threshold(&mut reg, 121);
+
+    assert!(reg.prless_retry_held(121));
+    let calls = calls(&log);
+    assert!(
+        position(&calls, "api -X PATCH repos/").is_some(),
+        "no body write on the cross-owner root: {calls:?}"
+    );
+    assert!(
+        position(&calls, "issue edit 121 --add-label loom:blocked --remove-label loom:issue")
+            .is_some(),
+        "no label edit on the cross-owner root: {calls:?}"
+    );
+    assert_eq!(patched_bodies(&payloads).len(), 1);
+    // Both writes carried the owner's credential, not the process's.
+    let creds = std::fs::read_to_string(root.join("gh-creds.log")).unwrap_or_default();
+    let owner = owner_dir.display().to_string();
+    for write in [
+        "api -X PATCH repos/",
+        "issue edit 121 --add-label loom:blocked",
+    ] {
+        let lines: Vec<&str> = creds.lines().filter(|l| l.contains(write)).collect();
+        assert!(!lines.is_empty(), "no `{write}` call logged: {creds}");
+        for line in lines {
+            assert_eq!(
+                line.split('|').next(),
+                Some(owner.as_str()),
+                "`{write}` not under the owner's GH_CONFIG_DIR: {line}"
+            );
+        }
+    }
+    drop(fixture);
+    clear_owner_root_registry();
+}
+
+/// #11743: both writers make zero writes to a `loom:frozen` issue — no body
+/// record, no `loom:blocked`, no comment — and the PR-less tally stands.
+#[test]
+#[serial]
+fn neither_daemon_hold_writes_to_a_frozen_issue() {
+    std::env::remove_var("LOOM_REPO");
+    for issue in [9501u32, 7893] {
+        let dir = tempdir().unwrap();
+        let view = format!(
+            r#"{{"number":{issue},"body":"Original body.","labels":["loom:issue","loom:frozen"]}}"#
+        );
+        let (mut reg, log, payloads) = registry(
+            dir.path(),
+            &Script {
+                view: &view,
+                view_sleep: 0,
+                patch_exit: 0,
+            },
+        );
+        if issue == 9501 {
+            reg.apply_quarantine_label(issue, 3);
+        } else {
+            hold_at_threshold(&mut reg, issue);
+            assert!(reg.prless_retry_held(issue), "the freeze does not contradict the tally");
+        }
+        let calls = calls(&log);
+        assert!(patched_bodies(&payloads).is_empty(), "#{issue}: {calls:?}");
+        for write in ["api -X", "issue edit", "issue comment"] {
+            assert!(position(&calls, write).is_none(), "#{issue} `{write}`: {calls:?}");
+        }
+    }
 }

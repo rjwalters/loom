@@ -51,13 +51,12 @@ fn the_marker_leads_the_order_only_on_a_red_main() {
     let mut multi = vec![(FakeSource::once(items()), RecordingDispatcher::default())];
     let report = tick_multi_with_repo_cap(
         &mut multi,
-        &[100],
+        &[1],
         1.into(),
         &[false],
         None,
         usize::MAX,
         false,
-        None,
         None,
         &[RED],
     );
@@ -80,26 +79,24 @@ fn the_marker_leads_the_order_only_on_a_red_main() {
         ]
     };
     let mut multi = vec![(FakeSource::once(labelled()), RecordingDispatcher::default())];
-    tick_multi(&mut multi, &[100], 1, &[false]);
+    tick_multi(&mut multi, &[1], 1, &[false]);
     assert_eq!(multi[0].1.dispatched, vec![9]);
 }
 
 #[test]
-fn a_labelled_red_main_fix_outranks_a_starred_issue_without_overflow() {
-    // The legacy star carries no level (#11508); the very-important fix goes
-    // first and nothing goes over the cap of 1.
-    let starred = WorkItem::new(5, vec![OPERATOR_PRIORITY_LABEL.into()]);
-    let items = vec![very_important(fix(9)), starred];
+fn a_labelled_red_main_fix_outranks_an_important_issue_without_overflow() {
+    // The very-important fix goes first and nothing goes over the cap of 1.
+    let important = WorkItem::new(5, vec!["loom:important".into()]);
+    let items = vec![very_important(fix(9)), important];
     let mut multi = vec![(FakeSource::once(items), RecordingDispatcher::default())];
     tick_multi_with_repo_cap(
         &mut multi,
-        &[100],
+        &[1],
         1.into(),
         &[false],
         None,
         usize::MAX,
         false,
-        None,
         None,
         &[RED],
     );
@@ -108,19 +105,18 @@ fn a_labelled_red_main_fix_outranks_a_starred_issue_without_overflow() {
 
 #[test]
 fn a_halted_red_repo_admits_its_fixes_and_nothing_else() {
-    let starred = WorkItem::new(5, vec![OPERATOR_PRIORITY_LABEL.into()]);
-    let items = || vec![issue(1), starred.clone(), fix(9)];
+    let important = WorkItem::new(5, vec!["loom:important".into()]);
+    let items = || vec![issue(1), important.clone(), fix(9)];
 
     let mut multi = vec![(FakeSource::once(items()), RecordingDispatcher::default())];
     let report = tick_multi_with_repo_cap(
         &mut multi,
-        &[100],
+        &[1],
         10.into(),
         &[true],
         None,
         usize::MAX,
         false,
-        None,
         None,
         &[RED],
     );
@@ -132,7 +128,7 @@ fn a_halted_red_repo_admits_its_fixes_and_nothing_else() {
         .filter(|r| r.disposition == Qd::WorkspaceHalted)
         .map(|r| r.issue)
         .collect();
-    assert_eq!(halted, vec![1, 5], "the starred issue waits with the rest");
+    assert_eq!(halted, vec![5, 1], "the important issue waits with the rest (ranked first)");
     assert!(rows
         .iter()
         .any(|r| r.issue == 9 && r.disposition == Qd::Dispatched));
@@ -159,13 +155,12 @@ fn a_hold_that_is_not_a_verified_red_main_admits_nothing() {
         let mut multi = vec![(FakeSource::once(vec![fix(9)]), RecordingDispatcher::default())];
         let report = tick_multi_with_repo_cap(
             &mut multi,
-            &[100],
+            &[1],
             10.into(),
             &[true],
             None,
             usize::MAX,
             false,
-            None,
             None,
             &[lane],
         );
@@ -190,13 +185,12 @@ fn a_red_main_fix_does_not_get_the_overflow_slot() {
     )];
     let report = tick_multi_with_repo_cap(
         &mut multi,
-        &[100],
+        &[1],
         2.into(),
         &[false],
         None,
         usize::MAX,
         false,
-        None,
         None,
         &[RED],
     );
@@ -318,13 +312,12 @@ fn multi_tick(
     let mut multi = vec![(FakeSource::once(items), dispatcher)];
     let report = tick_multi_with_repo_cap(
         &mut multi,
-        &[100],
+        &[1],
         1.into(),
         &[halted],
         None,
         usize::MAX,
         false,
-        None,
         None,
         &[lane],
     );
@@ -433,7 +426,7 @@ fn the_unpromoted_listing_keeps_only_unclaimed_marker_rows() {
     // A promoted fix is not "unpromoted": it is a candidate anyway. A
     // priority label does not promote it (#11508): it still needs a red main.
     assert!(!fix(1).is_unpromoted_red_fix());
-    for label in [OPERATOR_PRIORITY_LABEL, "loom:very-important"] {
+    for label in ["loom:important", "loom:very-important"] {
         let mut prioritised = unpromoted(2, "loom:triage");
         prioritised.labels.push(label.into());
         assert!(prioritised.is_unpromoted_red_fix(), "{label}");
@@ -557,8 +550,8 @@ impl WorkDispatcher for EscalationRecorder {
     fn in_flight(&self) -> HashSet<u32> {
         self.inner.in_flight()
     }
-    fn dispatch(&mut self, issue: u32, complexity: Option<&str>) -> Result<bool> {
-        self.inner.dispatch(issue, complexity)
+    fn dispatch(&mut self, issue: u32) -> Result<bool> {
+        self.inner.dispatch(issue)
     }
     fn escalate_red_fix(&mut self, red: bool, waiting: &[u32]) {
         self.calls.push((red, waiting.to_vec()));
@@ -576,13 +569,12 @@ fn the_tick_feeds_the_escalation_with_the_fixes_waiting_on_a_red_main() {
         let mut multi = vec![(FakeSource::once(items()), EscalationRecorder::default())];
         tick_multi_with_repo_cap(
             &mut multi,
-            &[100],
+            &[1],
             0.into(),
             &[halted],
             None,
             usize::MAX,
             false,
-            None,
             None,
             &[lane],
         );

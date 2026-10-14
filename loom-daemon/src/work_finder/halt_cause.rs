@@ -74,11 +74,14 @@ pub enum HaltCause {
     /// after the halt floor and the in-flight sweeps' expected growth
     /// (#11191). Host-local; clears as sweeps finish or space is reclaimed.
     DiskReservation,
+    /// The root's draw weight is 0 (#11742): it is never drawn, so its ready
+    /// issues wait. An operator's choice; clears when the weight is raised.
+    WeightZero,
 }
 
 impl HaltCause {
     /// Every halt cause, in [`Self::as_str`] wire-token order.
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::MainRed,
         Self::GatePending,
         Self::TokenPool,
@@ -91,6 +94,7 @@ impl HaltCause {
         Self::DaemonTooOld,
         Self::MaintainOnly,
         Self::DiskReservation,
+        Self::WeightZero,
     ];
 
     /// The cause whose [`Self::as_str`] is `raw`, or `None` when `raw` is not
@@ -122,6 +126,7 @@ impl HaltCause {
             Self::DaemonTooOld => "daemon_too_old",
             Self::MaintainOnly => "maintain_only",
             Self::DiskReservation => "disk_reservation",
+            Self::WeightZero => "weight_zero",
         }
     }
 
@@ -142,6 +147,7 @@ impl HaltCause {
             Self::DaemonTooOld => "daemon too old for installed Loom",
             Self::MaintainOnly => "maintain-only workspace",
             Self::DiskReservation => "disk reservation does not fit",
+            Self::WeightZero => "draw weight 0",
         }
     }
 
@@ -228,6 +234,29 @@ pub fn causes_per_root(
         .collect()
 }
 
+/// The single-workspace loop's cause (#11649): the [`causes_per_root`]
+/// precedence over the holds that loop folds, given as `(main_red,
+/// gate_pending, other_hold, breaker)`. `other_hold` is the breaker OR the
+/// root's token-pool hold, so with the breaker off it names the pool. `None`
+/// exactly when no hold is in force — the loop's `halted` bool.
+#[must_use]
+pub fn single_root(
+    root: &std::path::Path,
+    (main_red, gate_pending, other_hold, breaker): (bool, bool, bool, bool),
+) -> Option<HaltCause> {
+    if main_red {
+        Some(main_red_or_billing(root))
+    } else if gate_pending {
+        Some(HaltCause::GatePending)
+    } else if !other_hold {
+        None
+    } else if breaker {
+        Some(HaltCause::Breaker)
+    } else {
+        Some(HaltCause::TokenPool)
+    }
+}
+
 /// Fold the disk budget's holds (#11191) into the per-root causes: a root no
 /// other hold names, whose disk charge does not fit at the top of the tick,
 /// is held as [`HaltCause::DiskReservation`]. Lowest precedence, so a root
@@ -272,15 +301,32 @@ pub fn record_halted(
     rows: &mut Vec<TickQueueRow>,
     ready: &[WorkItem],
     idx: usize,
-    workspace_priority: u32,
+    workspace_weight: u32,
     red: bool,
     causes: Option<&[Option<HaltCause>]>,
 ) {
     let cause = causes.and_then(|c| c.get(idx).copied()).flatten();
     for item in ready {
-        let key = ready_queue::key_of(idx, workspace_priority, item, red);
+        let key = ready_queue::key_of(idx, workspace_weight, item, red);
         let detail = cause.map(|c| c.as_str().to_string());
         ready_queue::record_skip(rows, key, item, QueueDisposition::WorkspaceHalted, detail);
+    }
+}
+
+/// Record every ready item of a weight-0 root (#11742) as
+/// [`QueueDisposition::WorkspaceHalted`] with the [`HaltCause::WeightZero`]
+/// cause: the draw never picks the root, so no row may stay unresolved.
+pub fn record_weight_zero(rows: &mut Vec<TickQueueRow>, ready: &[WorkItem], idx: usize, red: bool) {
+    let detail = Some(HaltCause::WeightZero.as_str().to_string());
+    for item in ready {
+        let key = ready_queue::key_of(idx, 0, item, red);
+        ready_queue::record_skip(
+            rows,
+            key,
+            item,
+            QueueDisposition::WorkspaceHalted,
+            detail.clone(),
+        );
     }
 }
 

@@ -44,7 +44,7 @@ no journal is created, when no OTLP exporter runs.
 | `skipped[]` | array | one `{repo, number, reason}` per skipped candidate listed in `candidates`, plus an optional `detail`: today only a work-finder `deferred_file_overlap` row sets it, to the shared `## Affected Files` paths (`file overlap: a, b`, one line, truncated at 160 chars, #9781). Additive (absent otherwise and on older daemons), so `schema_version` stays `2`; no other disposition's detail (e.g. dispatch-error text) is carried |
 | `candidate_source` | string | `ready_queue` (work finder), `serving_queue` (the role's `pr-queue` result), `listing` (the issue/PR listings the role read, e.g. Curator), `gate_listing` (fallback: the daemon's gate listing), `none` (nothing observed) |
 | `decisions_observed` | boolean | `true` when the agent's writes were observed, so every candidate without an action is a real skip; `false` when only a ranking was seen, and an unexplained candidate is then in neither `acted` nor `skipped` |
-| `workspace_draw` | object, optional | work finder only (#11103), absent when nothing was drawn: `seed` (decimal string), `draws_total`, and `draws[]` (every draw, in order; `seed` and `draws_total` repeat on each chunk), each `{pool, candidates[{repo, weight}], total_weight, roll, picked, number}`; `pool` is `"red-main-fix"`, `"very-important"` or `"all"` (#11547). Replaying the draws from `seed` reproduces the dispatch order; see [`priority-model.md`](priority-model.md) |
+| `workspace_draw` | object, optional | work finder only (#11103), absent when nothing was drawn: `seed` (decimal string), `draws_total`, optional `seed_scheme` / `seed_minute` / `seed_host` (#11683; absent when the seed was pinned: `seed` = first 8 bytes, big-endian, of `sha256(seed_scheme + ":" + seed_minute + ":" + seed_host)` for `seed_scheme` `"loom-draw/v1"`, `seed_minute` a decimal string of `floor(unix_utc_secs/60)`), and `draws[]` (every draw, in order; `seed`, `draws_total` and the three `seed_*` fields repeat on each chunk), each `{candidates[{repo, weight, base_weight, bonus}], total_weight, roll, picked, number}`. Since #11742 `weight` = `base_weight` (the repo's roster weight) + `bonus` (points for a verified red-main fix, very-important or important work), and the draw picked the repo with probability `weight / total_weight`. Records from before #11742 also carry a per-tick `temperature` and per-draw `pool` / `p_min`, with softmax weights on a 1,000,000 scale and no `base_weight` / `bonus`; readers must tolerate both, so `schema_version` stays `2`. Replaying the draws from `seed` and the logged weights reproduces the dispatch order; see [`priority-model.md`](priority-model.md) |
 | `very_important_demoted` | array, optional | work finder only (#11509), absent when empty: one `{repo, number, holder}` per `loom:very-important` issue the per-workspace cap ranked as important this tick (`holder` keeps the slot; every one, uncapped). Additive, so `schema_version` is unchanged; see [`priority-model.md`](priority-model.md) |
 
 ## What "ranking" means per source
@@ -57,16 +57,18 @@ no journal is created, when no OTLP exporter runs.
   with a reason mapped from its `QueueDisposition`.
 - **Judge, Doctor, Champion** (`candidate_source = serving_queue`). The rows of
   the **latest** `loom-daemon pr-queue --role <role>` call the agent made during
-  the tick, in `pr_planning::ordered_queue` order (operator priority level,
+  the tick, in `pr_planning::ordered_queue` order (priority level,
   interactive preference, fallback admission and each role's tie-breaks
   applied), so a fallback-only Judge queue is recorded even though the gate
   listing was empty. Earlier snapshots are not merged in: a refresh that
-  adds a starred item or drops one is ranked as the queue the role last served,
+  adds a priority item or drops one is ranked as the queue the role last served,
   and an item acted on from an earlier snapshot stays in `acted` (actions are
   recorded independently of the ranking). `stage` is the row's workflow
   label (`loom:review-requested`, `loom:changes-requested`, `loom:pr`) or
   `fallback`; `sort_key` is `pr_queue`, valued
-  `level=<operatorPriorityLevel>,reason=<priorityReason>,origin=<origin>,mode=<mode>`.
+  `level=<priorityLevel>,reason=<priorityReason>,origin=<origin>,mode=<mode>`
+  (`priorityLevel` 0 default, 1 `loom:important`, 2 `loom:very-important`;
+  named `operatorPriorityLevel`, over the retired star levels, before #11510).
 - **Curator** and any role that reads its queue with `gh issue|pr list`
   (`candidate_source = listing`). The rows the agent `gh` front served, in the
   order the agent read its listings (Curator's priority queries run in priority
@@ -135,7 +137,7 @@ it, only a hold label names a reason; other candidates are undecided.
 | `pr_open_skip` | the item already has an open PR | `open_pr`, `open_pr_backoff` |
 | `operator_hold` | held for a human | `parked`, `hard_exclusion`, `declined`; roles: a merge-hold / park label on the PR |
 | `quota` | token pool or quota would not admit it | roles: `skipped_no_token_pool`, `skipped_pool_exhausted` ticks |
-| `cap` | a concurrency, ramp, per-repo, slice or saturation cap | `deferred_capacity`, `deferred_ramp_cap`, `deferred_saturation`, `deferred_out_of_slice`, `deferred_repo_cap` |
+| `cap` | a concurrency, ramp, per-repo or saturation cap | `deferred_capacity`, `deferred_ramp_cap`, `deferred_saturation`, `deferred_repo_cap` (`deferred_out_of_slice` mapped here until the dispatch slice was retired, #11682) |
 | `in_flight` | a live sweep or claim covers it | `in_flight`; roles: a claim label the agent did not write |
 | `backoff` | inside a back-off, cooldown, recheck or retry window | `deferred_build_backoff`, `recheck_interval`, `dispatch_backoff`, `noop_cooldown`, `prless_retry` |
 | `halted` | the repo's dispatch is halted (red main, gate, drain, breaker) | `workspace_halted` |
@@ -229,7 +231,8 @@ if volume proves unacceptable.
 stays `2`). Chunks of one
 tick share `tick_id` and repeat the header (`role`, `host`, timestamps,
 `outcome`, `candidates_total`, `candidate_source`, `decisions_observed`,
-`workspace_draw.seed` / `draws_total`); the list entries are packed in order, so
+`workspace_draw.seed` / `draws_total` / `seed_scheme` /
+`seed_minute` / `seed_host`); the list entries are packed in order, so
 concatenating the chunks' lists in `chunk_index` order reproduces the original.
 A candidate's `skipped` / `acted` entry may land in a different chunk than its
 `candidates` entry, so reassemble before reading per-candidate verdicts. Role

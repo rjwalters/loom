@@ -61,14 +61,13 @@
 //! Two properties are reproduced exactly:
 //!
 //! 1. **Anchored to the full `<!-- ... -->` comment form**, never a bare
-//!    substring — the same anchoring `require-complexity-marker.sh` uses, for
-//!    the same reason (#4840): prose that merely *quotes* the marker syntax as
-//!    literal example text (as the convention doc itself does) must never be
-//!    mistaken for a live marker. A `<name>` placeholder breaks the `-->`
+//!    substring — the #4840 anchoring rule: prose that merely *quotes* the
+//!    marker syntax as literal example text (as the convention doc itself
+//!    does) must never be mistaken for a live marker. A `<name>` placeholder breaks the `-->`
 //!    anchor and is therefore skipped.
-//! 2. **Every match is collected, deduplicated** — unlike the complexity marker
-//!    (`tail -1`, last match wins, one tier per item), the whole declared set
-//!    matters because multiple markers are **ANDed**.
+//! 2. **Every match is collected, deduplicated** — the whole declared set
+//!    matters because multiple markers are **ANDed**, so there is no
+//!    last-match-wins.
 //!
 //! Matching is line-oriented, like `grep`: a marker split across a newline is
 //! recognized by neither implementation.
@@ -128,7 +127,13 @@ pub const JUDGEMENT_SUB_KIND_LABELS: &[&str] = &["loom:operator-decision", "loom
 ///   it asserts the capability *does not exist yet*, which no worker can hold.
 /// - `loom:operator` means "the engine has stopped on this artifact and a human
 ///   must act"; un-parking past it would defeat the hold.
-const LANE_VETO_LABELS: &[&str] = &["loom:blocked", "loom:needs-capability", "loom:operator"];
+/// - `loom:frozen` (#11743) means "don't touch"; nothing may relax it.
+pub(crate) const LANE_VETO_LABELS: &[&str] = &[
+    "loom:blocked",
+    "loom:needs-capability",
+    "loom:operator",
+    "loom:frozen",
+];
 
 /// True when `value` is in the closed vocabulary above.
 ///
@@ -522,9 +527,9 @@ mod tests {
     }
 
     #[test]
-    fn collects_every_marker_deduplicated_unlike_the_complexity_marker() {
-        // The complexity marker takes `tail -1`; capability markers are ANDed,
-        // so all of them matter and repeats collapse.
+    fn collects_every_marker_deduplicated() {
+        // Capability markers are ANDed, so all of them matter and repeats
+        // collapse.
         let body = "<!-- loom:capability=host-sudo -->\n\
                     text\n\
                     <!-- loom:capability=cloud-profile:prod-aws -->\n\
@@ -634,7 +639,7 @@ mod tests {
     #[test]
     fn unrelated_html_comments_are_ignored() {
         let decl = extract_capability_markers(
-            "<!-- loom:complexity=complex -->\n<!-- just a note -->\n<!-- loom:capability=host-sudo -->",
+            "<!-- loom:points=3 -->\n<!-- just a note -->\n<!-- loom:capability=host-sudo -->",
         );
         assert_eq!(decl.required, held(&["host-sudo"]));
     }
@@ -677,7 +682,7 @@ mod tests {
             ("<!-- loom:capability=host_sudo -->", &[], &["host_sudo"]),
             ("<!-- loom:capability=host-sudo- -->", &[], &["host-sudo-"]),
             ("loom:capability=host-sudo", &[], &[]),
-            ("<!-- loom:complexity=complex -->", &[], &[]),
+            ("<!-- loom:points=3 -->", &[], &[]),
             (
                 "<!-- loom:capability=forge-admin-token --> and <!-- loom:capability=root -->",
                 &["forge-admin-token"],

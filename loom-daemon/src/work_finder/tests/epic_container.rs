@@ -71,7 +71,7 @@ fn a_tick_dispatches_the_phase_child_and_counts_the_epics_as_labeled_skips() {
 #[test]
 fn a_multi_workspace_tick_shows_the_epic_as_a_skipped_row_naming_the_label() {
     let mut multi = vec![(FakeSource::once(rows()), RecordingDispatcher::default())];
-    let report = tick_multi(&mut multi, &[100], 10, &[false]);
+    let report = tick_multi(&mut multi, &[1], 10, &[false]);
     assert_eq!(multi[0].1.dispatched, vec![3, 4]);
     assert_eq!(report.skipped_labeled, 2);
 
@@ -139,9 +139,9 @@ fn the_mechanical_capability_lane_cannot_dispatch_an_epic() {
 }
 
 #[test]
-fn a_starred_epic_is_still_dropped_from_the_side_listing() {
-    let starred_epic = WorkItem::new(20, vec![OPERATOR_PRIORITY_LABEL.to_string(), EPIC.into()]);
-    assert!(excluded_from_side_listing(&starred_epic));
+fn a_priority_epic_is_still_dropped_from_the_side_listing() {
+    let important_epic = WorkItem::new(20, vec!["loom:very-important".to_string(), EPIC.into()]);
+    assert!(excluded_from_side_listing(&important_epic));
 }
 
 #[test]

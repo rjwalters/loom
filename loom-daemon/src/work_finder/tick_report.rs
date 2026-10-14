@@ -7,6 +7,7 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 
+use super::halt_cause::HaltCause;
 use super::ready_queue;
 use crate::sweep_registry::{
     AlreadyLandedDispatchError, ClaimLockDispatchError, CollisionDispatchError,
@@ -194,7 +195,17 @@ pub struct TickReport {
     /// [`WorkspaceHealthStates`](crate::main_health_gate::WorkspaceHealthStates)
     /// flags the gate writes (#3974 AC3), so this can never disagree with what
     /// the gate loop reports — including when a repo's forge query fails.
+    ///
+    /// Despite the history above, any hold sets it — a drain, an exhausted
+    /// token pool, a disk reservation (#9017, #11191); [`Self::halt_causes`]
+    /// says which.
     pub halted: bool,
+    /// The distinct causes of this tick's holds (#11649), in
+    /// [`HaltCause::ALL`] order. Empty when the tick was not held, or when the
+    /// caller attributed no cause (a legacy, cause-less tick). The
+    /// `loom.dispatch.tick` result is derived from it, so a disk-held tick no
+    /// longer reads `halted_main_red`.
+    pub halt_causes: Vec<HaltCause>,
     /// True when the saturation admission brake (#4903) was engaged for this
     /// tick. Reported separately from
     /// [`deferred_saturation`](Self::deferred_saturation) so "the host was
@@ -208,16 +219,6 @@ pub struct TickReport {
     /// result keys on [`deferred_build_backoff`](Self::deferred_build_backoff)
     /// instead, so a repo that stays held cannot mask other outcomes.
     pub build_backoff_held: bool,
-    /// Candidates deferred THIS TICK because they fell outside this host's
-    /// preferred repo slice while the slice still had at least one eligible
-    /// in-slice candidate (Issue #6243, [`tick_multi_with_sharding`](super::tick_multi_with_sharding)).
-    /// Always `0` when sharding is not configured at the call site
-    /// (`preferred_slice: None`) — see `defaults/docs/dispatcher-repo-sharding.md`.
-    /// Purely observational (mirrors [`deferred_saturation`](Self::deferred_saturation)'s
-    /// shape): these candidates are NOT lost — they remain ready and are
-    /// re-evaluated (and, if still out-of-slice with the slice non-empty,
-    /// deferred again) on the next tick.
-    pub deferred_out_of_slice: usize,
     /// Candidates deferred THIS TICK because their own repo was already at
     /// `autonomous.workFinder.maxConcurrentPerRepo` (Issue #9090,
     /// [`repo_cap`](super::repo_cap)). Always `0` when the knob is absent (the
@@ -228,13 +229,13 @@ pub struct TickReport {
     /// reached, one repo's share of it was, so an operator reading
     /// `deferred_capacity` is never sent to raise a ceiling that is not binding.
     /// Purely observational (mirrors
-    /// [`deferred_out_of_slice`](Self::deferred_out_of_slice)'s shape): these
+    /// [`deferred_saturation`](Self::deferred_saturation)'s shape): these
     /// candidates are NOT lost — they stay ready and are re-evaluated next tick,
     /// and within THIS tick their deferral is handed straight to the next
     /// candidate, which is another repo's work.
     pub deferred_repo_cap: usize,
     /// The subset of [`dispatched`](Self::dispatched) admitted through the
-    /// `loom:operator-priority` overflow slot (#9244): a starred issue that
+    /// overflow slot (#9244, inert since #11508): an operator-starred issue that
     /// only the global and/or per-repo cap refused, dispatched as this host's
     /// single over-limit sweep. At most one per tick, and none while an
     /// earlier overflow sweep is still live. See
@@ -275,22 +276,19 @@ pub struct TickReport {
     pub occupancy: Option<usize>,
     /// The shaped candidate order pass 2 iterated, as `(workspace_idx,
     /// issue)` (Issue #9288): the global sort after `repo_cap::shape_queue`'s
-    /// slice and affinity partitions. Recorded before pass 2 runs, so it is
+    /// affinity partition. Recorded before pass 2 runs, so it is
     /// the order `dispatch()` was offered candidates in, including those a
     /// gate then deferred. The published plan's `position` is read from here
     /// and never re-derived. Empty for the single-workspace tick.
     pub plan_order: Vec<(usize, u32)>,
-    /// The preferred repo slice the tick shaped with (#6243), or `None` when
-    /// sharding was not configured at the call site.
-    pub in_slice: Option<Vec<bool>>,
     /// The per-repo cap and top-of-tick per-workspace occupancy (#9090) the
     /// tick shaped with. `None` for the single-workspace tick.
     pub repo_cap: Option<super::repo_cap::RepoCapSnapshot>,
     /// The per-tick admission ramp cap (#4234) the tick ran under, or `None`
     /// when the caller did not record it.
     pub max_admissions_per_tick: Option<usize>,
-    /// Whether the host's single `loom:operator-priority` overflow slot
-    /// (#9244) was still unused when the tick finished, or `None` when the
+    /// Whether the host's single overflow slot (#9244, inert since #11508)
+    /// was still unused when the tick finished, or `None` when the
     /// tick did not record it (Issue #9288).
     pub overflow_free: Option<bool>,
     /// The tick's workspace draws (#11103): seed, and each draw's candidates,
@@ -326,6 +324,25 @@ impl TickReport {
         idxs
     }
 
+    /// Record this tick's holds (#11649): [`Self::halted`] when any of the
+    /// first `n` workspaces is held, and [`Self::halt_causes`] as the distinct
+    /// causes `causes` (parallel to `halted`, optional) names at held indices.
+    /// A cause at a not-held index is ignored, as `record_halted` does.
+    pub fn note_halts(&mut self, halted: &[bool], causes: Option<&[Option<HaltCause>]>, n: usize) {
+        self.halted = halted.iter().take(n).any(|&h| h);
+        let held: Vec<HaltCause> = halted
+            .iter()
+            .take(n)
+            .enumerate()
+            .filter(|(_, &h)| h)
+            .filter_map(|(i, _)| causes.and_then(|c| c.get(i).copied()).flatten())
+            .collect();
+        self.halt_causes = HaltCause::ALL
+            .into_iter()
+            .filter(|cause| held.contains(cause))
+            .collect();
+    }
+
     /// An empty report for a multi-workspace tick run under these admission
     /// knobs.
     #[must_use]
@@ -348,7 +365,6 @@ impl TickReport {
         TickReport {
             occupancy: None,
             max_admissions_per_tick: None,
-            in_slice: None,
             repo_cap: None,
             overflow_free: None,
             workspace_draw: None,

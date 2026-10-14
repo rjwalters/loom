@@ -77,7 +77,7 @@ impl WorkDispatcher for Disp {
     fn occupancy(&self) -> usize {
         self.dispatched.len()
     }
-    fn dispatch(&mut self, issue: u32, _complexity: Option<&str>) -> Result<bool> {
+    fn dispatch(&mut self, issue: u32) -> Result<bool> {
         if self.fail.contains(&issue) {
             return Err(anyhow::anyhow!("spawn failed\nsecond line"));
         }
@@ -98,16 +98,16 @@ fn order(rows: &[ReadyQueueRow]) -> Vec<(u32, QueueDisposition)> {
 }
 
 /// The queue follows the daemon's own comparator (#11508): level first, then
-/// oldest first, then number. Neither a `tier:*` label nor the legacy star
-/// moves the issue, and workspace priority is not a rank key.
+/// oldest first, then number. Workspace priority is not a rank key, and each
+/// row reports its level (#11510).
 #[test]
-fn queue_is_ranked_by_dispatch_order_not_tier() {
+fn queue_is_ranked_by_dispatch_order_and_reports_the_level() {
     let mut multi = vec![
         (
             OneShotSource(Some(vec![
-                item(5, &["loom:issue", "tier:goal-advancing"], "2026-09-03T00:00:00Z"),
+                item(5, &["loom:issue"], "2026-09-03T00:00:00Z"),
                 item(6, &["loom:issue", "loom:important"], "2026-09-04T00:00:00Z"),
-                item(8, &["loom:issue", "loom:operator-priority"], "2026-09-05T00:00:00Z"),
+                item(8, &["loom:issue"], "2026-09-05T00:00:00Z"),
                 item(7, &["loom:issue"], "2026-09-01T00:00:00Z"),
             ])),
             Disp::default(),
@@ -118,7 +118,7 @@ fn queue_is_ranked_by_dispatch_order_not_tier() {
         ),
     ];
     // Workspace 1 has the higher priority (lower number).
-    let report = tick_multi(&mut multi, &[100, 0], 2, &[false, false]);
+    let report = tick_multi(&mut multi, &[1, 10], 2, &[false, false]);
     let roots = vec![PathBuf::from("/repo/a"), PathBuf::from("/repo/b")];
     let q = rows(&report, &roots);
 
@@ -134,11 +134,12 @@ fn queue_is_ranked_by_dispatch_order_not_tier() {
     );
     assert_eq!(q[4].repo, "/repo/b");
     assert_eq!(q[0].rank, 1);
-    assert_eq!(q[2].tier.as_deref(), Some("tier:goal-advancing"));
-    assert!(
-        !q[3].operator_priority && !q[0].urgent,
-        "the star is no longer reported (#11508), urgent is always false"
-    );
+    assert_eq!(q[0].level, crate::priority_pick::Level::Important);
+    assert_eq!(q[1].level, crate::priority_pick::Level::Default);
+    assert!(!q[0].urgent, "urgent is always false");
+    let wire = serde_json::to_value(&q[0]).unwrap();
+    assert_eq!(wire["level"], "important");
+    assert!(wire.get("operator_priority").is_none() && wire.get("tier").is_none(), "{wire}");
 }
 
 /// Every seen issue gets exactly one row, and the row names the same reason
@@ -253,8 +254,9 @@ fn short_detail_keeps_one_bounded_line() {
     assert_eq!(ready_queue::short_detail(&long).chars().count(), 161);
 }
 
-/// Pass-2 limits resolve to their own dispositions: the ramp cap, the
-/// saturation brake, and the repo-sharding slice.
+/// Pass-2 limits resolve to their own dispositions: the ramp cap and the
+/// saturation brake. (No repo-sharding slice since #11682: two workspaces'
+/// candidates both dispatch.)
 #[test]
 fn pass_two_limits_resolve_to_their_own_dispositions() {
     let src = |ns: &[u32]| {
@@ -265,7 +267,7 @@ fn pass_two_limits_resolve_to_their_own_dispositions() {
         ))
     };
     let mut multi = vec![(src(&[1, 2]), Disp::default())];
-    let r = tick_multi_with_sharding(&mut multi, &[], 10, &[false], 1, false, None);
+    let r = tick_multi_with_sharding(&mut multi, &[], 10, &[false], 1, false);
     assert_eq!(
         order(&rows(&r, &[])),
         vec![
@@ -275,23 +277,15 @@ fn pass_two_limits_resolve_to_their_own_dispositions() {
     );
 
     let mut multi = vec![(src(&[3]), Disp::default())];
-    let r = tick_multi_with_sharding(&mut multi, &[], 10, &[false], 10, true, None);
+    let r = tick_multi_with_sharding(&mut multi, &[], 10, &[false], 10, true);
     assert_eq!(order(&rows(&r, &[])), vec![(3, QueueDisposition::DeferredSaturation)]);
 
     let mut multi = vec![(src(&[4]), Disp::default()), (src(&[5]), Disp::default())];
-    let r = tick_multi_with_sharding(
-        &mut multi,
-        &[],
-        10,
-        &[false, false],
-        10,
-        false,
-        Some(&[false, true]),
-    );
+    let r = tick_multi_with_sharding(&mut multi, &[], 10, &[false, false], 10, false);
     assert_eq!(
         order(&rows(&r, &[])),
         vec![
-            (4, QueueDisposition::DeferredOutOfSlice),
+            (4, QueueDisposition::Dispatched),
             (5, QueueDisposition::Dispatched)
         ]
     );
@@ -383,13 +377,13 @@ fn candidate_domain() -> Vec<PriorityCandidate> {
         Some("2026-02-01T00:00:00Z"),
     ];
     let mut out = Vec::new();
-    for workspace_priority in [0, 100] {
+    for workspace_weight in [0, 100] {
         for main_red_fix in [false, true] {
             for level in [Level::Default, Level::Important, Level::VeryImportant] {
                 for created_at in times {
                     for number in [1, 2] {
                         out.push(PriorityCandidate {
-                            workspace_priority,
+                            workspace_weight,
                             main_red_fix,
                             level,
                             created_at: created_at.map(str::to_string),
@@ -429,7 +423,7 @@ fn candidate_keys_project_to_named_wire_keys() {
         vec!["main_red_fix", "level", "created_at", "number"]
     );
     let c = PriorityCandidate {
-        workspace_priority: 7,
+        workspace_weight: 7,
         level: crate::priority_pick::Level::VeryImportant,
         created_at: Some("2026-01-01T00:00:00Z".into()),
         number: 42,

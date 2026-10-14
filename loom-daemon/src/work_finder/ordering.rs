@@ -19,9 +19,9 @@ use crate::priority_pick::Level;
 pub struct PriorityCandidate {
     /// The owning workspace's index in the `workspaces` slice (dispatch routing).
     pub workspace_idx: usize,
-    /// The owning workspace's `fleet_priority` (lower = higher priority). It
+    /// The owning workspace's roster `weight` (#11742, higher = more draws). It
     /// weights the workspace draw; it is not one of [`candidate_cmp`]'s keys.
-    pub workspace_priority: u32,
+    pub workspace_weight: u32,
     /// The issue's creation timestamp for age ordering (oldest-first).
     pub created_at: Option<String>,
     /// The issue number (dispatch target + final deterministic tiebreak).
@@ -39,11 +39,6 @@ pub struct PriorityCandidate {
     /// (#11508): the build back-off, the file-overlap gate and the
     /// repo-sharding slice.
     pub main_red_fix: bool,
-    /// The issue's `<!-- loom:complexity=<tier> -->` stratum (#4827), carried
-    /// from its work item so pass 2's `dispatch()` can stratify the
-    /// model-cost A/B arm assignment without re-fetching the body. Not part of
-    /// the ordering keys; [`candidate_cmp`] ignores it.
-    pub complexity: Option<String>,
 }
 
 /// Total ordering over dispatch candidates (#11103, #11508, #11547):
@@ -143,11 +138,7 @@ pub struct CandidateKey<'a> {
 /// 2 very important.
 #[must_use]
 pub fn level_rank(level: Level) -> u64 {
-    match level {
-        Level::Default => 0,
-        Level::Important => 1,
-        Level::VeryImportant => 2,
-    }
+    u64::from(level.rank())
 }
 
 /// The dispatch ordering keys of `c`, in comparator order (Issue #9288):

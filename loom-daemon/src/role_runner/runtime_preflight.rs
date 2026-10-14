@@ -148,7 +148,6 @@ pub(crate) fn check(
     // tap's own pre-spawn gate refusing — drops the reservation, and with it
     // releases the slot, so a tick that does not launch never holds one.
     let context = crate::runtime_preference::DispatchContext {
-        complexity: None,
         intent: crate::runtime_preference::Intent::Dispatch,
         // #11453: a role tick consults the per-workspace launch-failure hold,
         // so a tap that keeps failing deterministically falls through
@@ -159,6 +158,7 @@ pub(crate) fn check(
         source,
         resolution,
         backstop,
+        draw,
     }) = crate::runtime_preference::resolve_runtime_contained(
         root,
         role,
@@ -174,12 +174,21 @@ pub(crate) fn check(
         gate(admission)?;
         return Ok(crate::runtime_preference::DispatchAdmission::none());
     };
-    let marker = resolution.marker_line();
-    let exhausted = resolution.exhausted_diagnostic(role);
+    // #11726: a role draw's record rides on the marker, the diagnostic and
+    // the stamp, so the decision (seed, table, rolls, pick) is replayable.
+    let mut marker = resolution.marker_line();
+    if let Some(draw) = &draw {
+        marker.push_str(&format!(" {}", draw.marker_fragment()));
+    }
+    let exhausted =
+        crate::runtime_preference::exhausted_with_draw(&resolution, draw.as_deref(), role);
     // #8599: the stamp the chosen admission carries to the launch surfaces —
     // computed before `resolution.chosen` is moved out below. `None` in the
     // fail-closed case, which has no chosen tier to report.
-    let stamp = resolution.stamp(source.as_str());
+    let stamp = crate::runtime_preference::role_draw_stamp(
+        resolution.stamp(source.as_str()),
+        draw.as_deref(),
+    );
     let Some(chosen) = resolution.chosen else {
         // Every listed tap was skipped. Fail closed, reporting the
         // statically-admitted runtime's own gate outcome when it has one, so
@@ -253,7 +262,7 @@ pub(crate) fn static_check(
 /// counters are byte-identical to the pre-#8408 preflight.
 fn claude_gate(root: &Path, logs: &Path, role: &str) -> Option<RoleTickOutcome> {
     if crate::tokens::token_pool_size(root) == 0 {
-        NO_TOKEN_POOL_SKIP_COUNT.fetch_add(1, Ordering::Relaxed);
+        NO_TOKEN_POOL_SKIP_COUNT.record();
         note_pre_spawn_skip(
             logs,
             role,
@@ -265,7 +274,7 @@ fn claude_gate(root: &Path, logs: &Path, role: &str) -> Option<RoleTickOutcome> 
     // Do not launch a known exhausted Claude pool (#7607).
     let pool = crate::tokens_pool::select::spawnable_pool_state(root);
     if pool.total > 0 && pool.usable == 0 {
-        POOL_EXHAUSTED_SKIP_COUNT.fetch_add(1, Ordering::Relaxed);
+        POOL_EXHAUSTED_SKIP_COUNT.record();
         let next_clear_at = crate::tokens_pool::select::pool_clear_estimate(&pool.dir);
         note_pre_spawn_skip(
             logs,
@@ -500,7 +509,7 @@ fn codex_gate(
     if state.spawnable > 0 {
         return None;
     }
-    POOL_EXHAUSTED_SKIP_COUNT.fetch_add(1, Ordering::Relaxed);
+    POOL_EXHAUSTED_SKIP_COUNT.record();
     let cap = now + chrono::Duration::seconds(CODEX_CLEAR_ESTIMATE_CAP_SECS);
     let next_clear_at = state
         .earliest_clear

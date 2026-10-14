@@ -68,7 +68,7 @@ fn build(
 /// a name's mapping in exactly one place.
 ///
 /// `None` is deliberate, not debt, for: GraphQL issue views (`claim.labels`,
-/// `claim.issue_labels`, `claim.issue_state`, `model.issue_body*`) and
+/// `claim.issue_labels`, `claim.issue_state`) and
 /// PR-by-label listings (`claim.pr_list_claimed`, `verdict.pr_list`,
 /// `*.pr_list`, `snapshot.*`) — the inventory has no single-issue-view or
 /// PR-list-by-label row — plus `star.api` (a generic `gh api` passthrough).
@@ -91,10 +91,9 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "verdict.pr_comments"
         | "quarantine.issue_comments"
         | "sequence.trusted_bodies"
-        | "chain_lock.comments"
         | "roster.comments" => ops::COMMENT_LIST,
-        "claim.pr_labels" | "sequence.predecessor" | "chain_lock.pr_base" => ops::PR_VIEW_STATE,
-        "park_hold.issue_view" => ops::ISSUE_VIEW_STATE,
+        "claim.pr_labels" | "sequence.predecessor" => ops::PR_VIEW_STATE,
+        "park_hold.issue_view" | "release_veto.issue_labels" => ops::ISSUE_VIEW_STATE,
         "park_hold.issue_body" => ops::ISSUE_EDIT_BODY,
         "intake.list_open" | "quarantine.issue_list" => ops::ISSUE_LIST,
         "claim.issue_reclaim"

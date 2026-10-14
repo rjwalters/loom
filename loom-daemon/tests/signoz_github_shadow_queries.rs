@@ -25,6 +25,9 @@
 //!   served/passthrough.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "common/hub_image.rs"]
+mod hub_image;
+
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -45,7 +48,7 @@ fn clickhouse(script: &str, format: &str) -> String {
             "-i",
             "--entrypoint",
             "clickhouse",
-            CLICKHOUSE_IMAGE,
+            &hub_image::resolve(CLICKHOUSE_IMAGE),
             "local",
             "--multiquery",
             &format!("--format={format}"),
@@ -131,6 +134,9 @@ fn by_bucket(rows: &[Row], account: &str, column: &str) -> Vec<f64> {
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn committed_github_shadow_queries_charge_each_quota_window_once() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
     // The file runs verbatim, comments included, as the README says.
     clickhouse(&format!("{FIXTURE}\n{SHADOW}"), "TSV");
 

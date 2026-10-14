@@ -125,11 +125,10 @@ pub fn build_record(
             repo: repo.repo.clone(),
             visibility: repo.visibility,
             issue: row.issue,
-            workspace_priority: row.workspace_priority,
+            workspace_weight: row.workspace_weight,
             urgent: false,
-            operator_priority: row.operator_priority,
+            level: row.level,
             created_at: row.created_at.clone(),
-            tier: row.tier.clone(),
             disposition: row.disposition,
             state: row.disposition.state().to_string(),
             reason: cause

@@ -12,11 +12,12 @@ invisible to `gh pr list`, the dashboard, or any label-filtered query. See
 prompted this (four Judge-approved PRs sat held-but-invisible for up to 126
 hours).
 
-Story-point estimation is paused. Curators leave existing `points:*` labels
-and `loom:points` body markers as historical data, without assigning or
-refreshing them on curation, re-curation or rescoping. Points do not gate
-`loom:curated`; the complexity routing marker remains required. The retained
-rubric is in `.loom/docs/story-points.md`.
+Story points gate `loom:curated`. The Curator writes one
+`<!-- loom:points=N -->` marker in the issue body or a curation comment, and
+`loom-daemon curation-complete` validates it (the newest trusted comment with
+a marker wins, else a trusted author's body), then applies `points:N` (removing
+any other `points:*` label) and `loom:curated`. A missing or invalid marker
+leaves the issue uncurated. The rubric is in `.loom/docs/story-points.md`.
 
 `loom:operator` moves that state onto the label substrate, where every other
 pipeline state already lives.
@@ -27,7 +28,7 @@ pipeline state already lives.
 - [Two ways to reach a human (#10000)](#two-ways-to-reach-a-human-10000)
 - [Definition](#definition)
 - [Relationship to `loom:blocked`, `loom:operator-only`, and `loom:needs-capability`](#relationship-to-loomblocked-loomoperator-only-and-loomneeds-capability)
-- [`loom:operator-priority` is not a hold (#9244)](#loomoperator-priority-is-not-a-hold-9244)
+- [Priority labels are not holds (#11103)](#priority-labels-are-not-holds-11103)
 - [Entry points](#entry-points)
 - [Exit rule](#exit-rule)
 - [Current implementation](#current-implementation)
@@ -83,6 +84,7 @@ each definition, for the terse version of this same table):
 | `loom:blocked-unnamed` | A queue marker, **not** a park label: the daemon tick applies it to an open `loom:blocked` *issue* naming no blocker and stating no reason (`check-stale-blocked`'s Undocumented), skipping operator holds, claims, permanent blocks and daemon holds; Curator drains it (`unnamed-block-review.md`) and removes it. Coexists with `loom:blocked`; the tick also clears it once the issue is named, reasoned or unblocked (#10558) | No (`loom:blocked` already skips) |
 | `loom:operator-only` | Requires human action or ruling *outside* automation entirely (credentials, infra, hardware, an owner-gated decision) | **Yes** — sweep/shepherd skip it, except the narrow capability-matched `loom:operator-mechanical` case (#6893, see "Dispatch path" below) |
 | `loom:needs-capability` | Blocked on a missing tool/agent capability — not an operator-by-right decision, but automation genuinely cannot proceed without the capability existing first (#5817) | **Yes** — sweep/shepherd skip it, identically to `loom:operator-only` today |
+| `loom:frozen` | Not now: don't touch, nothing is pending (#11743) | **Yes, and so does everything else**: no agent or daemon path reads it as work, comments on it or relabels it. A human applies it and only a human removes it; there is no automatic release. Unlike `loom:blocked`, nothing re-evaluates it |
 | `loom:operator` | The engine has stopped on this specific artifact and a human must act, but the item stays live in its normal queue so the engine's own release conditions can still fire | **New-builder skip only** — the work finder does not *start* a fresh `--claim-owned` build on it (vibesql#6664); re-evaluation lanes (Champion/role ticks, watchdog re-dispatch, reaper resume, explicit `loom-daemon dispatch <N>`) still reach it |
 
 The distinguishing property of `loom:operator` is that it is **re-evaluable**:
@@ -103,40 +105,37 @@ already-claimed one (it will not *start* work), while every route that
 refuses dispatch by itself — it is not in the park set the dispatch-time
 guard consults.
 
-## `loom:operator-priority` is not a hold (#9244)
+## Priority labels are not holds (#11103)
 
-`loom:operator-priority` (the operator's "star"; being replaced by `loom:important` / `loom:very-important`, see [`priority-model.md`](priority-model.md)) shares a prefix with
-`loom:operator` but means the opposite: not "the engine stopped, a human must
-act" but "a human wants this landed ASAP, act now". It is the one "land this
-ASAP" signal; the older urgent label was retired (#9244) and deleted (#11105).
+Priority is three levels with two labels, `loom:very-important` and
+`loom:important` (no label is the default); the model and the dispatch rules
+are in [`priority-model.md`](priority-model.md). Neither label is a hold, and
+neither is an approval: priority changes the order work is taken, never
+whether it is eligible or which gates apply. The operator's star, its
+levels and the tier labels are retired (#11103); the old-to-new mapping is
+the migration table in `priority-model.md`.
 
-- **Operator-derived only (#10012).** No role stars on its own judgment.
-  Builder copies it onto the PR it opens. Nothing propagates it any more: the
-  star-liveness pass that relayed loom-ui star intents and wrote inherited
-  stars on children was removed (#11104), and `create-issue.sh --parent N` no
-  longer stars a child of a starred N. The registry's `propagate` field is
-  inert.
-- **Starred first, every stage.** Curator curates starred issues first (a
-  starred issue with no workflow label counts as `loom:triage`) and promotes
-  them straight to `loom:issue`, because the star is the Tier-3 approval. A
-  starred `loom:epic` instead leads Champion's epic queue. Judge, Doctor and Champion drain starred PRs before their oldest-first pass.
-  Builder takes starred `loom:issue` work first.
+- **Who sets them.** The operator, Guide and Champion add and remove both.
+  Builder copies the closing issue's level onto the PR it opens
+  (`create-pr.sh`). Nothing propagates priority: the daemon never inherits
+  it, and `create-issue.sh --parent N` does not copy it, so whoever sets a
+  priority labels a blocker too.
+- **Higher level first, every stage.** Curator curates priority issues first
+  (no workflow label counts as `loom:triage`) and stops at `loom:curated`
+  like any issue. Champion evaluates proposals and epics by level, then age.
+  Judge, Doctor and Champion drain priority PRs before their oldest-first
+  pass. Builder takes priority `loom:issue` work first.
+- **One very-important per workspace.** Only the oldest eligible
+  `loom:very-important` issue counts; extras rank as `loom:important`
+  (enforced at dispatch, `priority-model.md`).
 - **Guards unchanged.** `loom:blocked`, `loom:operator-only`,
   `loom:operator-decision`, Champion's merge-risk and critical-file holds and
-  Judge's bar all still apply. A starred PR on a hold stays
-  held and is listed first (marked ⭐) in the pinned hold digest (#6877).
-- **Levels (#10307).** Operator priority has levels, mapped in one table
-  (`loom-daemon/src/operator_levels.rs`): level 1 is the star; level 2 is
-  `loom:operator-high-priority` (human-only, like the star; capped at 5 open
-  issues fleet-wide by loom-ui, never refused). Levels nest: level ≥ 2 counts
-  as starred everywhere, and every starred-first pass drains by effective
-  level, highest first. `loom:high-priority-inherited` was written by the
-  star-liveness pass on an open blocker of a level-2 issue; that pass is gone
-  (#11104), so nothing writes or removes it any more.
+  Judge's bar all still apply. A priority PR on a hold stays held and is
+  listed first (marked ⭐⭐ / ⭐) in the pinned hold digest (#6877).
 - **Red-main fixes** are a body marker, not a label: an issue that fixes a red
   `main` carries `<!-- loom:main-red-fix -->` (Doctor adds it when filing a
   pre-existing failure confirmed on `origin/main`). Curator takes these next,
-  after starred work, and never promotes them: while that repo's `main` is
+  after priority work, and never promotes them: while that repo's `main` is
   verified red the work finder admits them from `loom:triage`/`loom:curated`
   itself (only when a trusted identity filed them, #9548), and alerts the operator if one stays unclaimed (#10118).
 
@@ -218,20 +217,22 @@ gh pr edit <N> --remove-label "loom:operator"
   the new head naming the kind, and anything short of a positive proof — including
   a re-added `loom:operator`, which is a human re-asserting the hold — re-arms.
   See `champion-critical-file-hold.md` and `critical-file-hold.md`.
-- **Merge-risk hold** (criterion #2): the release is scoped to the *concern* — the
-  label is not re-asserted while the freshly-derived concern reads byte-identical
-  to the one already on record (#7048). A genuinely new concern re-holds and says
-  what changed.
+- **Merge-risk hold** (criterion #2): your removal (an `unlabeled` event after the
+  hold) **releases** it (#11416, superseding #7048's "respected, still held").
+  Champion re-reads the PR and, unless it finds a concern the hold did not name,
+  merges it itself on its next tick (criteria #3-#6 still apply), posting the
+  reversal comment. A genuinely new concern re-holds with a fresh notice naming
+  it; removing the label again releases that one.
 
-Neither release makes Champion merge the PR itself, and neither weakens the #8112
+Releasing a critical-file hold never makes Champion merge the PR (criterion #3
+still fails), and neither release weakens the #8112
 guard for any other label: a `loom:changes-requested` or `loom:review-requested`
 standing next to `loom:pr` still blocks the merge outright.
 
-Two consequences of a released hold, both intended and both shared with #7048's
-merge-risk case: the PR drops out of the `loom:operator`-keyed **Held-PR Census**
-count (it is a *label* census, and the point is that the label stops tracking your
-decision — the hold's marker comment is never removed, so it stays findable by
-comment search), and it becomes visible again to Doctor's Priority-1
+Two consequences of a released hold, both intended: the PR drops out of the
+`loom:operator`-keyed **Held-PR Census** count, but is listed on the census's
+`Released holds, not yet merged` line until it merges (#11416 — keyed on the
+hold marker, which is never removed), and it becomes visible again to Doctor's Priority-1
 `CONFLICTING` queue, which excludes held PRs (#5978). If Doctor does rebase it,
 the head moves and a critical-file hold re-arms on the new head — which is the
 correct outcome, not a regression: your release was about the diff you read.
@@ -508,9 +509,8 @@ nothing, and (Part 2's concern, not this doc's) a worker's own declared
 holds must be checked against the same closed vocabulary.
 
 **Parser convention.** Anchor to the full `<!-- loom:capability=<value> -->`
-comment form, never a bare substring — the same anchoring
-`require-complexity-marker.sh` uses for `loom:complexity`, and for the same
-reason (#4840): prose that merely *quotes* the marker syntax as literal
+comment form, never a bare substring — the same anchoring the retired
+complexity-marker gate used, and for the same reason (#4840): prose that merely *quotes* the marker syntax as literal
 example text (exactly as this section does above, and as the issue that
 introduced this convention did in its own body) must never be mistaken for a
 live marker. The value grammar is `[a-z0-9][a-z0-9:_-]*` — lowercase
@@ -733,7 +733,11 @@ rationale: [`premise-gate.md`](premise-gate.md).
 **`loom:decision-malformed` (#10057)**: the operator UI bounces a
 `loom:operator-decision` issue without a valid `decision` block into this label.
 Curator repairs it (back to `loom:operator-decision`) or, if no operator call
-exists, removes it and re-routes; a repeat bounce is left alone.
+exists, removes it and re-routes; a repeat bounce is left alone. It is a
+work-finder skip label (#11480), so a bounced Decision issue is never build
+work. No daemon release path (claim release, quarantine release, no-op hold
+lift, reclaim) re-adds `loom:issue` beside it or beside any other skip or
+lane-veto label (#11480's shared `restore_veto`).
 
 **`loom:needs-revision` (#10753)**: Champion adds it with a `NEEDS REVISION`
 verdict, routing the issue to Curator instead of waiting for someone to edit
@@ -1017,13 +1021,16 @@ registry.
 Every daemon table named by a boolean property above is derived from the
 registry; dep_classify's operator-only names stay consts, lockstep-tested
 against `requires_base`/`remove_with` (#5671). Changes go in the registry.
-`propagate` holds #10012's propagation table (`null` = never propagates);
-it is inert since #11104 removed the star-liveness pass that read it.
-`stale_after_minutes` and `lifecycle` are inert.
+The `propagate` table (#10012) was removed (#11510) after #11104 removed
+the star-liveness pass that read it. `stale_after_minutes` and `lifecycle`
+are inert. A retired label leaves `labels` for the top-level `retired`
+array (#11513): `{name, replaced_by, owned, retired_in}`, the old -> new
+mapping the forge-side migration (#11511) applies. It is never rendered into
+`labels.yml`, so `sync-labels.sh` cannot re-create it.
 
 ## No-op hold (#10156)
 
-A sweep that ends as a no-op (the `noop-cooldown record` IPC, or a Curator-only stop the reaper classifies) is counted per issue. After `autonomous.workFinder.noopCooldown.holdThreshold` consecutive no-ops (default 3, env `LOOM_WORK_FINDER_NOOP_HOLD_THRESHOLD`, `0` disables) with an unchanged fingerprint (labels minus claim churn, non-bot comments, linked-PR state, `## Dependencies` state), the daemon parks the issue: `loom:blocked` when dependencies are named, otherwise `loom:operator-only` + `loom:operator-decision`, with one `<!-- loom:noop-hold (#10156) -->` comment. `loom:operator-priority` does not exempt an issue and is never touched. To unpark, remove the park labels and re-add `loom:issue`; any new comment, label change, linked-PR change or dependency change also restarts the count.
+A sweep that ends as a no-op (the `noop-cooldown record` IPC, or a Curator-only stop the reaper classifies) is counted per issue. After `autonomous.workFinder.noopCooldown.holdThreshold` consecutive no-ops (default 3, env `LOOM_WORK_FINDER_NOOP_HOLD_THRESHOLD`, `0` disables) with an unchanged fingerprint (labels minus claim churn, non-bot comments, linked-PR state, `## Dependencies` state), the daemon parks the issue: `loom:blocked` when dependencies are named, otherwise `loom:operator-only` + `loom:operator-decision`, with one `<!-- loom:noop-hold (#10156) -->` comment. A priority label does not exempt an issue and is never touched. To unpark, remove the park labels and re-add `loom:issue`; any new comment, label change, linked-PR change or dependency change also restarts the count.
 
 ## Partial-increment remainder hold (#9264)
 

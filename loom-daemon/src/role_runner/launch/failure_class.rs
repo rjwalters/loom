@@ -16,6 +16,7 @@
 //! | `killed-by-signal` | the child was ended by a signal it did not send itself |
 //! | `toolless-launch` | exit 0, but the native launch never offered the `loom_*` tools (#8448) |
 //! | `sandbox-unavailable` | exit 0, but the runtime sandbox refused every tool call (#10003) |
+//! | `hook-denied` | exit 0, but a guard hook denied every tool call (#11727) |
 //! | `preflight-auth-failed` | the wrapper's auth pre-flight refused the session |
 //! | `session-down`, `session-mount-stale` | a `session-exec` refusal (#10455, #10364): the account's session container was down, or did not mount the workdir |
 //! | `preflight-mcp-failed`, `preflight-token-selection-failed`, `preflight-no-cli-start` | the sweep's pre-flight classifier: the adapter died before its CLI started |
@@ -66,6 +67,7 @@ pub(crate) fn is_deterministic(class: &str) -> bool {
         class,
         "launch-failed"
             | "toolless-launch"
+            | "hook-denied"
             | "preflight-auth-failed"
             | "credential-expired"
             | "preflight-no-cli-start"
@@ -122,6 +124,15 @@ pub(super) fn sandbox_unavailable() -> RoleFailure {
         "sandbox-unavailable",
         Some(0),
         "role child exited 0 but the runtime sandbox refused every tool call",
+    )
+}
+
+/// Exit 0 from a session whose every tool call a guard hook denied (#11727).
+pub(super) fn hook_denied() -> RoleFailure {
+    RoleFailure::new(
+        super::hook_denied::CLASS,
+        Some(0),
+        "role child exited 0 but a guard hook denied every tool call",
     )
 }
 

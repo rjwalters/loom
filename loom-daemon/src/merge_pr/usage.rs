@@ -18,7 +18,7 @@
 //! # Why the exit-code table matters most
 //!
 //! Role prompts and `champion-pr-merge.md` branch on `merge-pr.sh`'s exit
-//! codes (0 / 1 / 3 / 4 / 5 / 6). This text is where an operator reads what
+//! codes (0 / 1 / 3 / 4 / 5 / 6 / 7). This text is where an operator reads what
 //! each one means, so it is byte-frozen against the retired heredoc by
 //! `tests/merge_pr_usage_differential.rs` rather than paraphrased.
 //!
@@ -89,7 +89,7 @@ mod tests {
             "0 = merged (or --help) · 1 = failed",
             "3 = PR head moved past the SHA",
             "4 = stale required checks",
-            "6 = deferred behind another PR's chain-head merge lock",
+            "7 = held by a sequencing order",
         ] {
             assert!(USAGE.contains(needle), "usage text lost {needle:?}");
         }

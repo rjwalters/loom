@@ -20,7 +20,7 @@
 //! the host breaker and by the pre-flight / pool holds. None of those is a red
 //! `main`, so none of them opens the lane. A repo whose gate is disabled has
 //! no verified-red signal at all, so the latest default-branch CI conclusion
-//! stands in for it — one cached forge read per repo per tick, made only when
+//! (push runs only, #11766) stands in for it — one cached forge read per repo per tick, made only when
 //! the repo has a marker-bearing candidate.
 //!
 //! A marker on a green repo is inert: no halt or gate bypass.
@@ -94,8 +94,8 @@ impl WorkItem {
     }
 
     /// True when [`Self::body`] carries [`MAIN_RED_FIX_MARKER`] at the start
-    /// of a line (the same line-anchored style as the complexity and
-    /// recheck-interval markers, so prose quoting the marker mid-sentence does
+    /// of a line (the same line-anchored style as the
+    /// recheck-interval marker, so prose quoting the marker mid-sentence does
     /// not fire).
     #[must_use]
     pub fn is_main_red_fix(&self) -> bool {
@@ -166,6 +166,8 @@ pub fn evaluate<D: WorkDispatcher + ?Sized>(
         .map(|i| i.number)
         .collect();
     dispatcher.escalate_red_fix(red, &waiting);
+    // #11766: a verified-red `main` files its own fix issue.
+    dispatcher.autofile_red_main(lane);
     red
 }
 
@@ -386,7 +388,9 @@ pub struct RedMainLane {
     /// The main-health gate has verified this repo's `main` red
     /// ([`WorkspaceHealthStates::is_halted`]).
     pub verified_red: bool,
-    /// This repo has no enabled `buildGate`, so the CI fallback decides red.
+    /// This repo's main-health gate loop is not running (no enabled
+    /// `buildGate`, or the loop is off), so the CI fallback decides red
+    /// (#11690: CI is the test gate).
     pub gate_disabled: bool,
     /// Any hold on this repo other than the verified-red halt: a gate run in
     /// flight, a drain, the host breaker, a pre-flight or token-pool hold.
@@ -417,9 +421,13 @@ pub fn lane_for(
     suppress_dispatch_during_gate: bool,
     other_hold: bool,
 ) -> RedMainLane {
+    // #11766: the autofiler names the commit the gate tested.
+    super::main_red_autofile::note_evaluated_sha(root, health.gate_last_evaluated_sha());
     RedMainLane {
         verified_red: health.is_halted(),
-        gate_disabled: crate::main_health_gate::read_build_gate_config(root).is_none(),
+        // #11690: a `buildGate` block alone produces no verified-red signal;
+        // only the running main-health loop does. Without it, CI decides.
+        gate_disabled: !crate::main_health_gate::effective_enabled(root),
         other_hold: other_hold || (suppress_dispatch_during_gate && health.is_gate_in_flight()),
     }
 }
@@ -445,8 +453,11 @@ pub fn lanes_per_root(
         .collect()
 }
 
-fn ci_cache() -> &'static Mutex<HashMap<PathBuf, (Instant, bool)>> {
-    static CACHE: OnceLock<Mutex<HashMap<PathBuf, (Instant, bool)>>> = OnceLock::new();
+/// One repo's cached `gh run list` payload (`None`: no answer).
+type CiEntry = (Instant, Option<String>);
+
+fn ci_cache() -> &'static Mutex<HashMap<PathBuf, CiEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, CiEntry>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -456,19 +467,32 @@ fn ci_cache() -> &'static Mutex<HashMap<PathBuf, (Instant, bool)>> {
 /// red": the fallback can only ever grant the boost on positive evidence.
 #[must_use]
 pub fn ci_main_red(root: &Path) -> bool {
+    ci_runs(root).is_some_and(|stdout| latest_run_is_failure(&stdout))
+}
+
+/// `root`'s default-branch **push** runs ([`CI_RUN_FIELDS`], newest first),
+/// read at most once per [`CI_FALLBACK_TTL`] and shared by the lane and the
+/// red-main autofiler (#11766). `None` when the forge did not answer.
+pub(super) fn ci_runs(root: &Path) -> Option<String> {
     let now = Instant::now();
-    if let Some((at, red)) = ci_cache().lock().ok().and_then(|c| c.get(root).copied()) {
+    if let Some((at, runs)) = ci_cache().lock().ok().and_then(|c| c.get(root).cloned()) {
         if now.saturating_duration_since(at) < CI_FALLBACK_TTL {
-            return red;
+            return runs;
         }
     }
-    let red =
-        !crate::rate_limit_breaker::global_skip_pass("work_finder") && probe_ci_main_red(root);
+    let runs = if crate::rate_limit_breaker::global_skip_pass("work_finder") {
+        None
+    } else {
+        probe_ci_runs(root)
+    };
     if let Ok(mut cache) = ci_cache().lock() {
-        cache.insert(root.to_path_buf(), (now, red));
+        cache.insert(root.to_path_buf(), (now, runs.clone()));
     }
-    red
+    runs
 }
+
+/// The fields every CI-fallback read asks for.
+pub const CI_RUN_FIELDS: &str = "headSha,status,conclusion,workflowName,url,event";
 
 /// The branch the CI fallback reads: the repo's default branch from
 /// `origin/HEAD`, else `main` when that symbolic ref is unset.
@@ -476,7 +500,11 @@ pub(super) fn default_branch_for(root: &Path) -> String {
     crate::worktree_ops::clean::default_branch(root).unwrap_or_else(|| "main".to_string())
 }
 
-fn probe_ci_main_red(root: &Path) -> bool {
+/// `--event push` (#11766 review): a branch filter alone also matches
+/// scheduled, `workflow_run` and dynamic (CodeQL, Dependabot) runs, and a
+/// fork PR whose head branch is named like the default branch — an
+/// outsider must not be able to make `main` read red.
+fn probe_ci_runs(root: &Path) -> Option<String> {
     let branch = default_branch_for(root);
     let probe = crate::gh_invocation::GhInvocation::new(
         crate::gh_invocation::Operation::new("run.list"),
@@ -485,17 +513,19 @@ fn probe_ci_main_red(root: &Path) -> bool {
         Duration::from_secs(30),
     )
     .forge_op(crate::forge_call_stats::ops::CI_WORKFLOW_RUNS_FOR_SHA)
-    .args(["run", "list", "--branch", &branch, "--limit", "30"])
-    .args(["--json", "headSha,status,conclusion,workflowName"])
+    .args([
+        "run", "list", "--branch", &branch, "--event", "push", "--limit", "30",
+    ])
+    .args(["--json", CI_RUN_FIELDS])
     .current_dir(root)
     .run();
     let unavailable = |why: &str| {
         log::debug!("work_finder: red-main CI fallback unavailable for {} ({why})", root.display());
-        false
+        None
     };
     match probe {
         CmdOutcome::Ran(out) if out.status.success() => {
-            latest_run_is_failure(&String::from_utf8_lossy(&out.stdout))
+            Some(String::from_utf8_lossy(&out.stdout).into_owned())
         }
         CmdOutcome::Ran(out) => {
             // Feed the rate-limit breaker like every other forge read, so an
@@ -509,13 +539,29 @@ fn probe_ci_main_red(root: &Path) -> bool {
     }
 }
 
+/// The runs in a `gh run list` payload that are CI on the default branch:
+/// `push` runs (a row with no `event` field is kept, for older payloads).
+#[must_use]
+pub fn push_runs(stdout: &str) -> Option<Vec<serde_json::Value>> {
+    let runs = serde_json::from_str::<Vec<serde_json::Value>>(stdout).ok()?;
+    Some(
+        runs.into_iter()
+            .filter(|r| {
+                r.get("event")
+                    .and_then(serde_json::Value::as_str)
+                    .is_none_or(|e| e == "push")
+            })
+            .collect(),
+    )
+}
+
 /// Whether the newest commit in a `gh run list --json headSha,…` payload
 /// (newest first) has a failed CI run: any run for that SHA concluded
 /// `failure`, `timed_out` or `startup_failure` — the same conclusions the
 /// main-health gate's forge-CI reducer treats as a failure verdict.
 #[must_use]
 pub fn latest_run_is_failure(stdout: &str) -> bool {
-    let Ok(runs) = serde_json::from_str::<Vec<serde_json::Value>>(stdout) else {
+    let Some(runs) = push_runs(stdout) else {
         return false;
     };
     let field = |r: &serde_json::Value, k: &str| {
@@ -602,5 +648,46 @@ mod alert_sink_tests {
     fn a_script_failure_is_reported_as_not_filed() {
         let (dir, _log) = root_with_stub("boom", 1);
         assert!(!file_alert(dir.path(), 9, Duration::from_secs(1800)));
+    }
+}
+
+/// #11690: CI is the test gate, so a repo whose main-health loop is off gets
+/// the CI fallback even when it carries a `buildGate` block (loom itself).
+#[cfg(test)]
+mod lane_tests {
+    use super::*;
+    use crate::main_health_gate::MAIN_HEALTH_GATE_ENABLE_ENV;
+
+    struct EnvPin(Option<std::ffi::OsString>);
+
+    impl Drop for EnvPin {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(v) => std::env::set_var(MAIN_HEALTH_GATE_ENABLE_ENV, v),
+                None => std::env::remove_var(MAIN_HEALTH_GATE_ENABLE_ENV),
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_build_gate_without_the_main_health_loop_falls_back_to_ci() {
+        let _pin = EnvPin(std::env::var_os(MAIN_HEALTH_GATE_ENABLE_ENV));
+        std::env::remove_var(MAIN_HEALTH_GATE_ENABLE_ENV);
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".loom")).unwrap();
+        let config = serde_json::json!({
+            "buildGate": {"enabled": true, "command": "true"},
+            "autonomous": {"mainHealthGate": {"enabled": false}},
+        });
+        std::fs::write(root.path().join(".loom/config.json"), config.to_string()).unwrap();
+        let health = MainHealthState::default();
+        assert!(lane_for(&health, root.path(), false, false).gate_disabled);
+        // The loop on: its verified-red signal decides, not CI.
+        std::env::set_var(MAIN_HEALTH_GATE_ENABLE_ENV, "1");
+        assert!(!lane_for(&health, root.path(), false, false).gate_disabled);
+        // No `buildGate` at all: CI decides, as before.
+        let bare = tempfile::tempdir().unwrap();
+        assert!(lane_for(&health, bare.path(), false, false).gate_disabled);
     }
 }

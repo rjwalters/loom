@@ -33,6 +33,13 @@ pub struct WorkFinderConfig {
     /// **uncapped** rather than "use a built-in default": a non-`None` default
     /// would silently throttle every fleet on upgrade. See [`repo_cap`].
     pub max_concurrent_per_repo: Option<usize>,
+    /// `hyperparameters.dispatch.weightBonus{RedMainFix,VeryImportant,Important}`
+    /// — the workspace draw's weight bonuses (#11742), each `None` when unset.
+    /// Hyperparameters-only: there is no `autonomous.workFinder` home, so
+    /// [`parse_effective`] leaves them `None` and only [`apply_hyperparams`]
+    /// fills them (an out-of-range value is dropped). Read through
+    /// [`resolve_weight_bonus`].
+    pub weight_bonus: [Option<u32>; 3],
     /// `autonomous.workFinder.extraSkipLabels` — additional label names
     /// (Issue #6685) beyond the hardcoded [`super::PARK_LABELS`] this workspace
     /// wants the work-finder to treat as a skip/park signal (e.g. a
@@ -116,6 +123,7 @@ pub fn parse_effective(effective: &serde_json::Value) -> WorkFinderConfig {
             .filter(|&n| n > 0)
             .and_then(|n| usize::try_from(n).ok()),
         max_concurrent_per_repo: repo_cap::parse_config(wf),
+        weight_bonus: [None; 3],
         extra_skip_labels: wf.and_then(|w| w.get("extraSkipLabels")).and_then(|v| {
             v.as_array().map(|arr| {
                 arr.iter()
@@ -167,6 +175,40 @@ fn apply_hyperparams(effective: &serde_json::Value, config: &mut WorkFinderConfi
         .and_then(|n| usize::try_from(n).ok())
     {
         config.max_admissions_per_tick = Some(max);
+    }
+    let (lo, hi) = crate::priority_pick::WEIGHT_BONUS_RANGE;
+    for (slot, key) in config.weight_bonus.iter_mut().zip(WEIGHT_BONUS_KEYS) {
+        if let Some(points) = dispatch
+            .get(key)
+            .filter(|v| !v.is_null())
+            .and_then(serde_json::Value::as_u64)
+            .filter(|p| (lo..=hi).contains(p))
+            .and_then(|p| u32::try_from(p).ok())
+        {
+            *slot = Some(points);
+        }
+    }
+}
+
+/// The `hyperparameters.dispatch` keys of [`WorkFinderConfig::weight_bonus`],
+/// in its slot order.
+const WEIGHT_BONUS_KEYS: [&str; 3] = [
+    "weightBonusRedMainFix",
+    "weightBonusVeryImportant",
+    "weightBonusImportant",
+];
+
+/// The workspace draw's weight bonuses for `config` (#11742): each
+/// hyperparameters value, else its [`crate::priority_pick::WeightBonus`]
+/// default.
+#[must_use]
+pub fn resolve_weight_bonus(config: &WorkFinderConfig) -> crate::priority_pick::WeightBonus {
+    let d = crate::priority_pick::WeightBonus::default();
+    let [red, vi, imp] = config.weight_bonus;
+    crate::priority_pick::WeightBonus {
+        red_main_fix: red.unwrap_or(d.red_main_fix),
+        very_important: vi.unwrap_or(d.very_important),
+        important: imp.unwrap_or(d.important),
     }
 }
 

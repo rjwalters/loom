@@ -13,6 +13,7 @@ fn ctx() -> Context {
         worktree: Some(PathBuf::from(WT)),
         main_root: Some(PathBuf::from("/work/repo")),
         owned: Vec::new(),
+        configured: None,
     }
 }
 

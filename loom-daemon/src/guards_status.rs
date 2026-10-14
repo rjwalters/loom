@@ -181,15 +181,6 @@ const CATEGORIES: &[Category] = &[
         tags: &[],
     },
     Category {
-        // Read by `loom-daemon forge egress guard` (#9989) through the shared
-        // resolver, only once a typed bypass matched under an enforcing policy.
-        key: "forgeEgress",
-        env: "LOOM_GUARD_FORGE_EGRESS",
-        kind: tiered_bool(true),
-        tiers: Tiers::All,
-        tags: &["loom:forge-egress"],
-    },
-    Category {
         // Read by `loom-daemon cargo-target-dir guard` (#11582) through the
         // shared resolver, only once a deny is about to fire.
         key: "cargoTargetDir",
@@ -197,6 +188,24 @@ const CATEGORIES: &[Category] = &[
         kind: tiered_bool(true),
         tiers: Tiers::All,
         tags: &["loom:cargo-target-dir"],
+    },
+    Category {
+        // Read by `loom-daemon guards remote-exec` (#11568) through the shared
+        // resolver, only once a fleet-host finding matched.
+        key: "remoteFleetExec",
+        env: "LOOM_GUARD_REMOTE_FLEET_EXEC",
+        kind: tiered_bool(true),
+        tiers: Tiers::All,
+        tags: &["loom:remote-fleet-exec"],
+    },
+    Category {
+        // Read by the same verb (#10646), only once a shared-target ask is
+        // about to fire.
+        key: "cargoSharedTarget",
+        env: "LOOM_GUARD_CARGO_SHARED_TARGET",
+        kind: tiered_bool(true),
+        tiers: Tiers::All,
+        tags: &["loom:cargo-shared-target"],
     },
     Category {
         key: "rmScope",
@@ -1123,7 +1132,6 @@ mod tests {
         assert_eq!(category_for_tag("cloud-cli:aws"), Some("cloudCli"));
         assert_eq!(category_for_tag("force-op:detached"), Some("forceScope"));
         assert_eq!(category_for_tag("stash-scope:main-checkout"), Some("stashScope"));
-        assert_eq!(category_for_tag("loom:forge-egress"), Some("forgeEgress"));
         assert_eq!(category_for_tag("rm-protected-path"), None);
         assert_eq!(category_for_tag("catastrophic:x"), None);
     }

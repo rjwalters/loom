@@ -27,8 +27,9 @@
 //! [`NoopCooldownConfig::hold_threshold`] the issue is parked with a forge
 //! label — `loom:blocked` for dependencies, `loom:operator-only` +
 //! `loom:operator-decision` for a human gate or when the kind is unclear — and
-//! one marked comment says why and what unparks it. `loom:operator-priority`
-//! never exempts an issue and is never touched; the park labels are already in
+//! one marked comment says why and what unparks it. A priority label
+//! (`loom:important` / `loom:very-important`) never exempts an issue and is
+//! never touched; the park labels are already in
 //! [`crate::work_finder::SKIP_LABELS`], which every candidate path applies.
 //!
 //! The label write is the deliverable, the comment is commentary (the #9239
@@ -421,13 +422,15 @@ impl SweepRegistry {
         if snapshot.fingerprint_ignoring(ours) == announced {
             return;
         }
-        let other_hold = snapshot.labels.iter().any(|l| {
-            !ours.contains(&l.as_str())
-                && (crate::work_finder::PARK_LABELS.contains(&l.as_str())
-                    || l == crate::work_finder::OPERATOR_HOLD_LABEL)
-        });
+        // #11480: the shared veto, less the hold's own labels being lifted.
+        if crate::work_finder::is_frozen(&snapshot.labels) {
+            // #11743: frozen means no write; drop our record, touch nothing.
+            self.noop_cooldown.streaks.remove(&issue);
+            return;
+        }
+        let other_hold = crate::work_finder::restore_veto(&snapshot.labels, ours);
         let claimed = snapshot.labels.iter().any(|l| l == "loom:building");
-        let restore = !other_hold && !claimed;
+        let restore = other_hold.is_none() && !claimed;
         if let Err(cause) = self.lift_park_labels(issue, ours, restore) {
             log::warn!(
                 "sweep_registry: no-op hold for #{issue} saw changed inputs but could not lift                  {ours:?}; retrying next interval (#10156): {cause}"
@@ -464,8 +467,8 @@ impl SweepRegistry {
             .map_err(|(_, detail)| detail)
     }
 
-    /// Park `issue` and say why. Never touches `loom:building` or
-    /// `loom:operator-priority`.
+    /// Park `issue` and say why. Never touches `loom:building` or a priority
+    /// label.
     fn apply_noop_hold(
         &self,
         issue: u32,
@@ -526,8 +529,8 @@ impl SweepRegistry {
              **Held after {count} consecutive no-op sweeps.** Each of the last {count} sweeps \
              concluded there was nothing to do, and nothing this issue depends on changed in \
              between — {needs}. It now carries {} instead of being offered again \
-             (Issue #10156). A `loom:operator-priority` star does not exempt an issue from this \
-             hold and has been left in place.\n\n{why}Fingerprint compared: `{announced}`\n\n\
+             (Issue #10156). A priority label (`loom:important` / `loom:very-important`) does \
+             not exempt an issue from this hold and has been left in place.\n\n{why}Fingerprint compared: `{announced}`\n\n\
              **What unparks it**: {unparks}. Any new comment, label change, linked-PR change or \
              dependency state change also restarts the count from zero.",
             labels.join(" + "),

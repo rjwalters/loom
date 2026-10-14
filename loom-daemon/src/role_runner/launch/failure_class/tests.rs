@@ -239,6 +239,7 @@ fn only_the_allowlisted_classes_are_deterministic() {
     let deterministic = [
         "launch-failed",
         "toolless-launch",
+        "hook-denied",
         "preflight-auth-failed",
         "credential-expired",
         "preflight-no-cli-start",
@@ -284,6 +285,9 @@ fn only_the_allowlisted_classes_are_deterministic() {
     let spawn_error = std::io::Error::from(std::io::ErrorKind::ArgumentListTooLong);
     assert!(is_deterministic(launch_failed(&spawn_error).class()));
     assert!(is_deterministic(toolless_launch().class()));
+    assert_eq!(hook_denied().class(), "hook-denied");
+    assert_eq!(hook_denied().exit_code(), Some(0));
+    assert!(is_deterministic(hook_denied().class()));
     assert!(!is_deterministic(sandbox_unavailable().class()));
     assert!(!is_deterministic(timed_out(Duration::from_secs(1)).class()));
     assert!(!is_deterministic(wait_failed(&spawn_error).class()));

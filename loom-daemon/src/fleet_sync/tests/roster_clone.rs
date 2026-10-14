@@ -70,7 +70,7 @@ fn missing(root: &Path, name: &str, remote: Option<&str>) -> Change {
         name: name.to_string(),
         path: root.join(name),
         remote: remote.map(str::to_string),
-        priority: 73,
+        weight: 73,
         maintain_only: false,
     }
 }
@@ -176,7 +176,7 @@ fn a_missing_clone_is_cloned_over_https_then_registered_as_an_add() {
         vec![Change::Add {
             name: "wiki".into(),
             path: dest.clone(),
-            priority: 73,
+            weight: 73,
             maintain_only: true,
         }]
     );

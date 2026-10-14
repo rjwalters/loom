@@ -214,7 +214,6 @@ pub fn workspace_draw_record(
             .steps
             .iter()
             .map(|step| PickDraw {
-                pool: step.draw.pool.to_string(),
                 candidates: step
                     .draw
                     .candidates
@@ -222,6 +221,8 @@ pub fn workspace_draw_record(
                     .map(|c| PickDrawCandidate {
                         repo: name(&c.workspace),
                         weight: c.weight,
+                        base_weight: Some(c.base_weight),
+                        bonus: Some(c.bonus),
                     })
                     .collect(),
                 total_weight: step.draw.total_weight,
@@ -230,6 +231,9 @@ pub fn workspace_draw_record(
                 number: step.issue,
             })
             .collect(),
+        seed_scheme: log.seed_inputs.as_ref().map(|i| i.scheme.to_string()),
+        seed_minute: log.seed_inputs.as_ref().map(|i| i.minute.to_string()),
+        seed_host: log.seed_inputs.as_ref().map(|i| i.host.clone()),
     }
 }
 
@@ -479,6 +483,15 @@ pub fn emit_role_tick(
         ended_at: Utc::now(),
         outcome: crate::role_tick_telemetry::result_label(result),
     };
+    // #11641: the PRs this tick's agent began working, from the same journal.
+    if let Some(journal) = &journal {
+        super::work_started::emit_role_tick(
+            role,
+            &repo_label(root),
+            &tick.tick_id,
+            &journal.entries,
+        );
+    }
     let holds: &[&str] = crate::role_runner::demand::DebtAxis::for_role(role)
         .map_or(&[], crate::role_runner::demand::axis_park_labels);
     let observed = RoleObservation { journal, gate };

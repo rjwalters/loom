@@ -37,7 +37,7 @@ impl WorkDispatcher for Disp {
     fn occupancy(&self) -> usize {
         self.dispatched.len()
     }
-    fn dispatch(&mut self, issue: u32, _complexity: Option<&str>) -> Result<bool> {
+    fn dispatch(&mut self, issue: u32) -> Result<bool> {
         self.dispatched.push(issue);
         Ok(true)
     }
@@ -53,8 +53,8 @@ fn item(n: u32, body: Option<String>, extra_label: Option<&str>) -> WorkItem {
 
 fn run(workspaces: &mut [(Src, Disp)]) -> TickReport {
     let halted = vec![false; workspaces.len()];
-    let prios = vec![0; workspaces.len()];
-    tick_multi_with_sharding(workspaces, &prios, 10, &halted, usize::MAX, false, None)
+    let prios = vec![1; workspaces.len()];
+    tick_multi_with_sharding(workspaces, &prios, 10, &halted, usize::MAX, false)
 }
 
 fn row(report: &TickReport, n: u32) -> Option<(Qd, Option<String>)> {
@@ -205,12 +205,11 @@ fn a_very_important_candidate_is_deferred_by_the_overlap_gate_like_any_other() {
 fn cand(number: u32, level: crate::priority_pick::Level) -> PriorityCandidate {
     PriorityCandidate {
         workspace_idx: 0,
-        workspace_priority: 0,
+        workspace_weight: 0,
         created_at: None,
         number,
         level,
         main_red_fix: false,
-        complexity: None,
     }
 }
 
@@ -236,13 +235,12 @@ fn red_fix(n: u32, paths: &[&str]) -> WorkItem {
 fn run_lane(workspaces: &mut [(Src, Disp)], halted: bool, lane: RedMainLane) -> TickReport {
     tick_multi_with_repo_cap(
         workspaces,
-        &[0],
+        &[1],
         10.into(),
         &[halted],
         None,
         usize::MAX,
         false,
-        None,
         None,
         &[lane],
     )

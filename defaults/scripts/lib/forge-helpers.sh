@@ -648,7 +648,7 @@ forge_get_check_runs() {
     out_file=$(mktemp); err_file=$(mktemp)
     gh api "repos/$nwo/commits/$commit/check-runs?per_page=100" --paginate \
       --header "Accept: application/vnd.github+json" \
-      --jq '{total_count: (.total_count // 0), check_runs: [(.check_runs // [])[] | {name: .name, status: .status, conclusion: .conclusion, html_url: .html_url}]}' \
+      --jq '{total_count: (.total_count // 0), check_runs: [(.check_runs // [])[] | {name: .name, status: .status, conclusion: .conclusion, html_url: .html_url, check_suite_id: .check_suite.id}]}' \
       >"$out_file" 2>"$err_file" || rc=$?
 
     if [[ $rc -ne 0 ]]; then
@@ -666,7 +666,7 @@ forge_get_check_runs() {
     # short-read check below). An empty stdout from a `gh` that exited 0 is not
     # an authoritative "this commit has no checks": treat it as a transient
     # failure, the same way a nonzero exit is treated.
-    local merged=""; [[ -s "$out_file" ]] && merged=$(jq -cs '{total_count: ([.[].total_count // 0] | max // 0), check_runs: [.[] | (.check_runs // [])[]]}' "$out_file" 2>/dev/null)
+    local merged=""; [[ -s "$out_file" ]] && merged=$(jq -cs --arg nwo "$nwo" --arg sha "$commit" '{total_count: ([.[].total_count // 0] | max // 0), check_runs: [.[] | (.check_runs // [])[]], repository: $nwo, head_sha: $sha}' "$out_file" 2>/dev/null)
     rm -f "$out_file" "$err_file"
     [[ -n "$merged" ]] || return 1
 
@@ -1159,7 +1159,6 @@ _forge_cmd_attempt() {
       # credential in-process. GH_TOKEN/GITHUB_TOKEN are dropped so they
       # cannot outrank the directory's own stored credential the same way
       # personal-token/personal-ambient already drop them for their swaps.
-      # loom:egress-allowlisted (#9988): per-token credential dir, selects a credential not a host.
       env -u GH_TOKEN -u GITHUB_TOKEN GH_CONFIG_DIR="$token" gh "$@" >"$out_file" 2>"$err_file" || rc=$?
       ;;
   esac
@@ -1255,10 +1254,7 @@ forge_gh_perm_safe() {
 # missing a scope, it is scoped to the wrong repository entirely, so rung 1
 # (ambient) 404s/GraphQL-fails outright and #6074's ladder never fires (its
 # classifier doesn't match either signature above). `sweep-lease-renew.sh`'s
-# renewal loop failed on every cycle as a direct result, and
-# `resolve-tier-model.sh` (which does not source this file at all before this
-# fix) silently fell through to its tier-3 default with a misleading "likely
-# API quota" diagnosis.
+# renewal loop failed on every cycle as a direct result.
 #
 # The fix borrows the SAME mechanism FLEET.md's "Private-repo clones over ssh"
 # contract already documents for a human ssh session on a locked keychain: a

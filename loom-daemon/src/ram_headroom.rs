@@ -97,10 +97,30 @@ pub fn parse_meminfo_available_kb(contents: &str) -> Option<u64> {
     line.split_whitespace().nth(1)?.parse().ok()
 }
 
+/// Current available RAM (GB), or `None` when unmeasurable. Under
+/// `cfg(test)` a [`set_available_ram_gb_override`] value wins (#11679).
+#[must_use]
+pub fn available_ram_gb() -> Option<u64> {
+    #[cfg(test)]
+    if let Some(v) = *AVAILABLE_RAM_GB_OVERRIDE.lock().unwrap() {
+        return Some(v);
+    }
+    probe_available_ram_gb()
+}
+
+/// Test-only pin for [`available_ram_gb`] so tests do not depend on live host RAM.
+#[cfg(test)]
+static AVAILABLE_RAM_GB_OVERRIDE: std::sync::Mutex<Option<u64>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn set_available_ram_gb_override(v: Option<u64>) {
+    *AVAILABLE_RAM_GB_OVERRIDE.lock().unwrap() = v;
+}
+
 /// Read the current `MemAvailable` (GB) on Linux via `/proc/meminfo`.
 #[cfg(target_os = "linux")]
 #[must_use]
-pub fn available_ram_gb() -> Option<u64> {
+fn probe_available_ram_gb() -> Option<u64> {
     let contents = std::fs::read_to_string("/proc/meminfo").ok()?;
     parse_meminfo_available_kb(&contents).map(|kb| kb / 1024 / 1024)
 }
@@ -142,7 +162,7 @@ fn read_macos_page_size() -> Option<u64> {
 /// pages) × the host page size.
 #[cfg(target_os = "macos")]
 #[must_use]
-pub fn available_ram_gb() -> Option<u64> {
+fn probe_available_ram_gb() -> Option<u64> {
     let output = Command::new("vm_stat")
         .stderr(Stdio::null())
         .output()
@@ -160,7 +180,7 @@ pub fn available_ram_gb() -> Option<u64> {
 /// "no source" fallback).
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 #[must_use]
-pub fn available_ram_gb() -> Option<u64> {
+fn probe_available_ram_gb() -> Option<u64> {
     None
 }
 

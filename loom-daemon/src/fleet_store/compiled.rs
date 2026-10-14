@@ -13,6 +13,7 @@
 //! | `config.defaults` | `fleet/defaults.json` | [`super::render`] |
 //! | `config.hosts.<host>.defaults` | `fleet/hosts/<host>/defaults.json` | [`super::render`] |
 //! | `config.hosts.<host>.local` | `fleet/hosts/<host>/local.json` | [`super::render`] |
+//! | `repos[].config` | (none — compiled-only, #11738) | [`super::render::repo_targets`] |
 //!
 //! # Transition rules
 //!
@@ -76,8 +77,16 @@ pub fn parse(text: &str) -> Result<Compiled> {
     if !doc.get("root").is_some_and(Value::is_string) {
         bail!("`root` must be a string");
     }
-    if !doc.get("repos").is_some_and(Value::is_array) {
+    let Some(repos) = doc.get("repos").and_then(Value::as_array) else {
         bail!("`repos` must be a list");
+    };
+    // #11738: the per-repo fleet tier. Optional (absent when empty); when
+    // present it is a config fragment, so anything but an object is a broken
+    // store, never a silently-dropped tier.
+    for (i, record) in repos.iter().enumerate() {
+        if record.get("config").is_some_and(|c| !c.is_object()) {
+            bail!("`repos[{i}].config` must be an object");
+        }
     }
     if !doc.get("state").is_some_and(Value::is_object) {
         bail!("`state` must be an object");
@@ -135,10 +144,40 @@ impl Compiled {
         self.host_tier(host, "defaults")
     }
 
+    /// Every host with a `config.hosts.<host>.defaults` overlay (#11740).
+    #[must_use]
+    pub fn host_names(&self) -> Vec<String> {
+        self.doc["config"]["hosts"]
+            .as_object()
+            .map(|hosts| {
+                hosts
+                    .keys()
+                    .filter(|h| self.host_defaults(h).is_some())
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// `config.hosts.<host>.local`: `host`'s host-local tier.
     #[must_use]
     pub fn host_local(&self, host: &str) -> Option<&Value> {
         self.host_tier(host, "local")
+    }
+
+    /// `repos[].config` of the record named `name` (#11738): that repo's
+    /// per-repo fleet tier, already resolved by the store's compiler. `None`
+    /// when no record has that name or the record carries no `config`.
+    /// Records are matched by `name`, as [`super::roster::Desired::name`]
+    /// carries it.
+    #[must_use]
+    pub fn repo_config(&self, name: &str) -> Option<&Value> {
+        self.doc["repos"]
+            .as_array()?
+            .iter()
+            .find(|r| r.get("name").and_then(Value::as_str) == Some(name))?
+            .get("config")
+            .filter(|c| c.is_object())
     }
 
     fn host_tier(&self, host: &str, tier: &str) -> Option<&Value> {

@@ -491,3 +491,93 @@ fn story_points_are_exported_numerically_and_absent_when_unsized() {
         );
     }
 }
+
+#[test]
+fn phase_tap_usage_is_a_nested_array_with_only_the_counters_that_were_reported() {
+    let mut record = outcome_record();
+    assert!(
+        attribute(&map(TelemetryRecord::SweepOutcome(record.clone())), "loom.phase_tap_usage")
+            .is_none()
+    );
+    let row = |role: &str, events: Option<u64>| PhaseTapUsageRow {
+        role: role.into(),
+        tap: "opencode:zai-flash@api_keys:zai-coding-plan".into(),
+        runtime: "opencode".into(),
+        model_profile: Some("zai-flash".into()),
+        model: Some("glm-5.3-flash".into()),
+        input: events.map(|_| 1200),
+        output: events.map(|_| 300),
+        reasoning: None,
+        cache_read: events.map(|_| 5),
+        cache_write: None,
+        cost_estimate: events.map(|_| 0.25),
+        usage_events: events,
+    };
+    record.phase_tap_usage = vec![row("builder", Some(4)), row("doctor", None)];
+    let log = map(TelemetryRecord::SweepOutcome(record));
+    let Some(any_value::Value::ArrayValue(rows)) = attribute(&log, "loom.phase_tap_usage") else {
+        panic!("loom.phase_tap_usage must be an ArrayValue")
+    };
+    assert_eq!(rows.values.len(), 2);
+    let fields = |i: usize| -> Vec<(String, any_value::Value)> {
+        let Some(any_value::Value::KvlistValue(list)) = &rows.values[i].value else {
+            panic!("row {i} is not a kvlist")
+        };
+        list.values
+            .iter()
+            .filter_map(|kv| Some((kv.key.clone(), kv.value.as_ref()?.value.clone()?)))
+            .collect()
+    };
+    let get = |i: usize, key: &str| {
+        fields(i)
+            .into_iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v)
+    };
+    assert_eq!(get(0, "role"), Some(any_value::Value::StringValue("builder".into())));
+    assert_eq!(
+        get(0, "tap"),
+        Some(any_value::Value::StringValue(
+            "opencode:zai-flash@api_keys:zai-coding-plan".into()
+        ))
+    );
+    assert_eq!(get(0, "model"), Some(any_value::Value::StringValue("glm-5.3-flash".into())));
+    assert_eq!(get(0, "input"), Some(any_value::Value::IntValue(1200)));
+    assert_eq!(get(0, "output"), Some(any_value::Value::IntValue(300)));
+    assert_eq!(get(0, "cost_estimate"), Some(any_value::Value::DoubleValue(0.25)));
+    for absent in ["reasoning", "cache_write"] {
+        assert!(get(0, absent).is_none(), "{absent} was not reported");
+    }
+    // The unmeasured row keeps role and tap and carries no counter at all.
+    assert_eq!(get(1, "role"), Some(any_value::Value::StringValue("doctor".into())));
+    assert!(get(1, "tap").is_some());
+    for counter in [
+        "input",
+        "output",
+        "cache_read",
+        "cost_estimate",
+        "usage_events",
+    ] {
+        assert!(get(1, counter).is_none(), "unmeasured row must omit {counter}");
+    }
+}
+#[test]
+fn a_drawn_sweep_outcome_carries_the_pick_and_model_pinned() {
+    let mut record = outcome_record();
+    let undrawn = map(TelemetryRecord::SweepOutcome(record.clone()));
+    assert_eq!(attribute(&undrawn, "loom.role_draw.pick"), None);
+    assert_eq!(attribute(&undrawn, "loom.role_draw.model_pinned"), None);
+    record.role_draw = Some(crate::telemetry::SweepRoleDraw {
+        pick: "codex".into(),
+        model_pinned: false,
+    });
+    let drawn = map(TelemetryRecord::SweepOutcome(record));
+    assert_eq!(
+        attribute(&drawn, "loom.role_draw.pick"),
+        Some(any_value::Value::StringValue("codex".into()))
+    );
+    assert_eq!(
+        attribute(&drawn, "loom.role_draw.model_pinned"),
+        Some(any_value::Value::BoolValue(false))
+    );
+}

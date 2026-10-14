@@ -79,3 +79,42 @@ fn dispatch_park_guard_allows_an_explicit_dispatch_on_an_epic() {
     );
     std::env::remove_var("LOOM_REPO");
 }
+
+/// #11743: `loom:frozen` is a park, so the dispatch-time park guard — the one
+/// check every route goes through (work finder, watchdog re-dispatch,
+/// checkpoint-resume, explicit `loom-daemon dispatch <N>`, the epic
+/// supervisor's child dispatch) — refuses it with no label write, alone or
+/// beside `loom:issue`. `loom:frozen-x` is not frozen (exact match, #11366).
+#[test]
+#[serial]
+fn dispatch_refuses_a_frozen_issue_on_the_shared_park_guard() {
+    for labels in ["loom:frozen", "loom:issue loom:frozen"] {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::set_var("LOOM_REPO", "rjwalters/loom");
+        let (mut reg, gh_log) = park_guard_registry(ws, labels, 0, "", false);
+
+        let err = reg
+            .dispatch(&SweepKind::Issue(11743), None, None, None, None)
+            .expect_err("a frozen issue must be refused");
+        let typed = err
+            .downcast_ref::<ParkedIssueDispatchError>()
+            .expect("refusal must carry the typed ParkedIssueDispatchError");
+        assert_eq!(typed.label, "loom:frozen", "{labels}");
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(!calls.contains("issue edit"), "{labels}: {calls}");
+        std::env::remove_var("LOOM_REPO");
+    }
+    let tmp = tempdir().unwrap();
+    std::env::set_var("LOOM_REPO", "rjwalters/loom");
+    let (mut reg, _) = park_guard_registry(tmp.path(), "loom:issue loom:frozen-x", 0, "", false);
+    let refused = reg
+        .dispatch(&SweepKind::Issue(11744), None, None, None, None)
+        .err()
+        .and_then(|e| {
+            e.downcast_ref::<ParkedIssueDispatchError>()
+                .map(|t| t.label.clone())
+        });
+    assert_eq!(refused, None, "loom:frozen-x is not a park");
+    std::env::remove_var("LOOM_REPO");
+}

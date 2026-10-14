@@ -155,8 +155,8 @@ enum Commands {
     },
 
     /// Show the work finder's ready queue in its real dispatch order
-    /// (starred `loom:operator-priority` first, then red-main fixes, workspace
-    /// priority, oldest first — #9244) with what the last
+    /// (verified red-main fixes first, then priority level, oldest first —
+    /// #11103, #11547) with what the last
     /// tick did with each issue and why, plus a freshness line (Issue #8852).
     Queue {
         /// Emit machine-readable JSON instead of the human-readable table.
@@ -867,17 +867,6 @@ enum Commands {
         pr: u64,
     },
 
-    /// Shadow-mode Jev (TypeSafe) complexity-tier classifier, run beside the
-    /// Curator's `<!-- loom:complexity=<tier> -->` marker (issue #8543) — a
-    /// calibrated second opinion, never a routing decision. Prints a JSON
-    /// object with a probability per tier (`mechanical`/`routine`/`complex`)
-    /// plus a confidence to stdout; exits non-zero with no stdout output on
-    /// any failure, including a missing `TYPESAFE_API_KEY`.
-    JevTier {
-        /// The issue number to classify.
-        issue: u64,
-    },
-
     // ---------------------------------------------------------------------
     // Script helpers (epic #4081 Phase 3 family 5, issue #4275) — native
     // replacements for the `loom_tools` modules that existed only to back a
@@ -900,7 +889,7 @@ enum Commands {
 
     /// Resolve a logical model tier/alias to the concrete model ID to dispatch
     /// on the wire (issue #3982; native port of `loom_tools.model_tiers`,
-    /// #4275). Backs `resolve-model.sh` and `resolve-tier-model.sh`.
+    /// #4275). Backs `resolve-model.sh`.
     ///
     /// Unknown aliases and pinned IDs pass through unchanged and the
     /// `model@effort` grammar is preserved. `--config` is an **explicit
@@ -909,14 +898,14 @@ enum Commands {
     /// Resolution never fails — outside a Loom repo the config is simply empty
     /// and the shipped default map applies.
     ///
-    /// Exit codes: `0` resolved, `2` usage error, `3` no mapping (both `--tier`
-    /// and `--task-alias`) so the caller falls through to its own precedence
-    /// chain.
+    /// Exit codes: `0` resolved, `2` usage error, `3` no mapping
+    /// (`--task-alias` / `--downgrade`) so the caller falls through to its own
+    /// precedence chain.
     ResolveModel {
         /// A logical tier/alias (`opus`, `sonnet`, `sonnet@xhigh`) or a pinned
         /// model ID.
         #[arg(value_name = "MODEL")]
-        model: Option<String>,
+        model: String,
 
         /// Path to a `.loom/config.json` to read verbatim (default: resolve
         /// the `./.loom` config tier chain).
@@ -942,16 +931,6 @@ enum Commands {
         /// mid-phase-death handling instead of guessing a model.
         #[arg(long)]
         downgrade: bool,
-
-        /// Complexity-tier mode (issue #4238): resolve
-        /// `sweep.tierModels[<runtime>][<tier>]`, falling back to the
-        /// `sweep.optimization` preset, instead of a bare alias.
-        #[arg(long, value_name = "TIER")]
-        tier: Option<String>,
-
-        /// Worker runtime for `--tier` resolution.
-        #[arg(long, default_value = "claude")]
-        runtime: String,
     },
 
     /// Token-cost telemetry: `usage` (live, from the Anthropic OAuth API) and
@@ -1008,6 +987,7 @@ enum Commands {
     #[command(flatten)]
     ScriptPorts(cli::script_ports::ScriptPortCommand),
     Labels(cli::labels_cmd::LabelsArgs),
+    Presence(cli::presence::PresenceArgs),
 
     /// Historical replay of scheduling predictions vs eventual PRs (#9785):
     /// `overlap-replay validate | outcomes | score`. Nested (not flattened)
@@ -1083,11 +1063,6 @@ enum Commands {
         /// Show verbose output including configured roles
         #[arg(long, short)]
         verbose: bool,
-
-        /// Run only the fleet-policy shadow check (#11441) and exit 2 on any
-        /// finding; skips role validation. Used by the CI guard.
-        #[arg(long)]
-        fleet_policy_only: bool,
     },
 
     /// Inspect the durable `sweep.outcome` telemetry journal (Issue #4704,
@@ -1208,11 +1183,12 @@ enum WorkspaceAction {
         #[arg(value_name = "PATH")]
         path: String,
 
-        /// Cross-repo dispatch priority tier (#3946): lower = higher priority.
-        /// The autonomous work-finder and epic supervisor drain higher-priority
-        /// repos first. Defaults to 100 when omitted.
-        #[arg(long, value_name = "N", default_value_t = loom_daemon::workspace_registry::DEFAULT_WORKSPACE_PRIORITY)]
-        priority: u32,
+        /// Cross-repo draw weight (#11742): the work finder draws this repo
+        /// with probability (weight + bonuses) / Σ, so higher = more draws and
+        /// 0 = never. Defaults to 1 when omitted; on a fleet host the store's
+        /// `weight` replaces it at the next roster sync.
+        #[arg(long, value_name = "N", default_value_t = loom_daemon::workspace_registry::DEFAULT_WORKSPACE_WEIGHT)]
+        weight: u32,
 
         /// Optional per-repo config overrides as a JSON object string.
         #[arg(long, value_name = "JSON")]
@@ -1239,15 +1215,15 @@ enum WorkspaceAction {
     Hold(cli::workspace_fleet::WorkspaceRoot),
     /// Lift `workspace hold`: dispatch into the workspace resumes (#11186).
     Release(cli::workspace_fleet::WorkspaceRoot),
-    /// Set the dispatch priority tier of an already-registered workspace (#3946).
-    SetPriority {
+    /// Set the draw weight of an already-registered workspace (#11742).
+    SetWeight {
         /// Path to the repo root (normalized the same way as `add`).
         #[arg(value_name = "PATH")]
         path: String,
 
-        /// New priority tier: lower = higher priority.
+        /// New weight: higher = more draws, 0 = never drawn.
         #[arg(value_name = "N")]
-        priority: u32,
+        weight: u32,
     },
     /// Deregister a managed workspace by root.
     Remove {
@@ -1293,10 +1269,10 @@ enum FleetAction {
         #[arg(long, value_name = "OWNER/NAME", required = true)]
         repo: Vec<String>,
 
-        /// Cross-repo dispatch priority the workspaces are registered at (#3946;
-        /// lower = higher priority). Defaults to 100.
-        #[arg(long, value_name = "N", default_value_t = loom_daemon::workspace_registry::DEFAULT_WORKSPACE_PRIORITY)]
-        priority: u32,
+        /// Cross-repo draw weight the workspaces are registered at (#11742;
+        /// higher = more draws). Defaults to 1.
+        #[arg(long, value_name = "N", default_value_t = loom_daemon::workspace_registry::DEFAULT_WORKSPACE_WEIGHT)]
+        weight: u32,
 
         /// Local path to the operator's fine-grained forge PAT (Contents+Issues+PRs
         /// on the target repos). Read locally at preflight; transferred to the
@@ -2318,16 +2294,12 @@ async fn handle_cli_command(command: Commands) -> Result<()> {
             generation,
             task_alias,
             downgrade,
-            tier,
-            runtime,
         } => handle_resolve_model_command(
-            model.as_deref(),
+            &model,
             config.as_deref(),
             generation,
             task_alias,
             downgrade,
-            tier.as_deref(),
-            &runtime,
         ),
         Commands::Telemetry(cmd) => cmd.run().await,
         Commands::Checkpoint { action } => handle_checkpoint_command(action),
@@ -2338,6 +2310,7 @@ async fn handle_cli_command(command: Commands) -> Result<()> {
         Commands::ScriptPorts(cmd) => cmd.run(),
         Commands::OverlapReplay { action } => action.run(),
         Commands::Lease { action } => action.run(),
+        Commands::Presence(cmd) => cmd.run(),
         Commands::Inflight { action } => action.run(),
         Commands::SweepExperiment { action } => handle_sweep_experiment_command(action),
         Commands::ValidatePhase {
@@ -2368,8 +2341,7 @@ async fn handle_cli_command(command: Commands) -> Result<()> {
             format,
             strict,
             verbose,
-            fleet_policy_only,
-        } => handle_validate_command(&workspace, &format, strict, verbose, fleet_policy_only),
+        } => handle_validate_command(&workspace, &format, strict, verbose),
         Commands::SweepOutcomes(args) => cli::sweep_outcomes_cli::dispatch(args),
         Commands::FleetConfig(args) => cli::fleet_config::dispatch(args),
         Commands::Journal(args) => cli::journal_cli::dispatch(args),
@@ -2531,7 +2503,6 @@ async fn handle_cli_command(command: Commands) -> Result<()> {
         }
         // Async commands are dispatched by main before reaching this sync handler.
         Commands::JevMergeRisk { .. }
-        | Commands::JevTier { .. }
         | Commands::Hyperparams(..)
         | Commands::Quarantine { .. }
         | Commands::DispatchBackoff { .. }

@@ -27,8 +27,8 @@ use super::ops::{
     DequeueAck, EnqueueAck, PrQueueStatus, PrState, QueueApi, QueueEntry, QueueError,
 };
 use crate::cmd_out::CmdOutcome;
-use crate::forge_egress::report::redact;
 use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+use crate::secret_scan::redact;
 
 /// Per-call deadline.
 const QUEUE_CALL_TIMEOUT: Duration = Duration::from_secs(60);

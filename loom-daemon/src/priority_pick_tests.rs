@@ -16,21 +16,36 @@ fn fix(number: u32, created: Option<&str>) -> IssueKey {
     }
 }
 
-fn ws(name: &str, priority: u32, vi: bool) -> WorkspaceEntry {
+fn ws(name: &str, weight: u32) -> WorkspaceEntry {
     WorkspaceEntry {
         workspace: name.to_string(),
-        priority,
-        has_very_important: vi,
+        weight,
         has_red_main_fix: false,
+        has_very_important: false,
+        has_important: false,
     }
 }
 
-fn ws_fix(name: &str, priority: u32) -> WorkspaceEntry {
+fn ws_vi(name: &str, weight: u32) -> WorkspaceEntry {
     WorkspaceEntry {
-        has_red_main_fix: true,
-        ..ws(name, priority, false)
+        has_very_important: true,
+        ..ws(name, weight)
     }
 }
+
+fn ws_fix(name: &str, weight: u32) -> WorkspaceEntry {
+    WorkspaceEntry {
+        has_red_main_fix: true,
+        ..ws(name, weight)
+    }
+}
+
+/// No bonuses: the draw is over base weights alone.
+const FLAT: WeightBonus = WeightBonus {
+    red_main_fix: 0,
+    very_important: 0,
+    important: 0,
+};
 
 #[test]
 fn level_is_the_highest_priority_label() {
@@ -66,85 +81,152 @@ fn within_workspace_is_level_then_oldest_then_number() {
 }
 
 #[test]
-fn weights_fall_with_priority_number() {
-    assert_eq!(weight_for_priority(0), 1000);
-    assert_eq!(weight_for_priority(10), 90);
-    assert_eq!(weight_for_priority(100), 9);
-    assert_eq!(weight_for_priority(u32::MAX), 1);
+fn bonus_for_entry_stacks_every_condition_that_holds() {
+    let b = WeightBonus::default();
+    assert_eq!(b.for_entry(&ws("a", 5)), 0);
+    assert_eq!(b.for_entry(&ws_vi("a", 5)), u64::from(DEFAULT_BONUS_VERY_IMPORTANT));
+    let all = WorkspaceEntry {
+        has_red_main_fix: true,
+        has_very_important: true,
+        has_important: true,
+        ..ws("a", 5)
+    };
+    assert_eq!(
+        b.for_entry(&all),
+        u64::from(
+            DEFAULT_BONUS_RED_MAIN_FIX + DEFAULT_BONUS_VERY_IMPORTANT + DEFAULT_BONUS_IMPORTANT
+        )
+    );
+}
+
+/// ACCEPTANCE (#11742): weights mean exactly what they say. With N repos at
+/// weight 1 and loom at weight N, all holding work, loom's share over a
+/// seeded run is about N / (2N - 1).
+#[test]
+fn draw_share_is_weight_over_total_weight() {
+    let n = 10u32;
+    let mut entries: Vec<WorkspaceEntry> = (0..n - 1).map(|i| ws(&format!("r{i:02}"), 1)).collect();
+    entries.push(ws("loom", n));
+    let mut rng = PickRng::from_seed(11742);
+    let draws = 20_000;
+    let loom_wins = (0..draws)
+        .filter(|_| draw_workspace(&entries, &FLAT, &mut rng).unwrap().picked == "loom")
+        .count();
+    let expected = f64::from(n) / f64::from(2 * n - 1);
+    let observed = loom_wins as f64 / f64::from(draws);
+    assert!(
+        (observed - expected).abs() < 0.015,
+        "observed {observed:.4}, expected {expected:.4}"
+    );
 }
 
 #[test]
-fn very_important_workspace_always_wins() {
-    let entries = vec![ws("a/tool", 0, false), ws("b/prod", 100, true)];
+fn draw_frequencies_match_effective_weights_with_bonuses() {
+    let bonus = WeightBonus {
+        red_main_fix: 30,
+        very_important: 10,
+        important: 5,
+    };
+    let entries = vec![
+        ws("plain", 10),
+        ws_vi("vi", 6),
+        ws_fix("red", 1),
+        WorkspaceEntry {
+            has_important: true,
+            ..ws("imp", 3)
+        },
+    ];
+    // Effective weights: 10, 16, 31, 8 (total 65).
+    let expected = [("imp", 8.0), ("plain", 10.0), ("red", 31.0), ("vi", 16.0)];
+    let mut rng = PickRng::from_seed(7);
+    let n = 20_000;
+    let mut wins = std::collections::BTreeMap::<String, usize>::new();
+    for _ in 0..n {
+        let d = draw_workspace(&entries, &bonus, &mut rng).unwrap();
+        assert_eq!(d.total_weight, 65);
+        *wins.entry(d.picked).or_default() += 1;
+    }
+    for (name, w) in expected {
+        let observed = wins.get(name).copied().unwrap_or(0) as f64 / f64::from(n);
+        assert!((observed - w / 65.0).abs() < 0.015, "{name}: observed {observed:.4}");
+    }
+}
+
+#[test]
+fn no_tier_wins_outright() {
+    // A red-main fix or very-important work makes a workspace likelier, never
+    // certain: the plain workspace still gets drawn.
+    let entries = vec![ws("a/plain", 10), ws_vi("b/vi", 1), ws_fix("c/red", 1)];
+    let mut rng = PickRng::from_seed(3);
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..2_000 {
+        seen.insert(
+            draw_workspace(&entries, &WeightBonus::default(), &mut rng)
+                .unwrap()
+                .picked,
+        );
+    }
+    assert_eq!(seen.len(), 3, "{seen:?}");
+}
+
+#[test]
+fn weight_zero_is_never_drawn_even_with_bonuses() {
+    let entries = vec![ws("a", 1), ws_fix("b", 0)];
     for seed in 0..200 {
-        let d = draw_workspace(&entries, &mut PickRng::from_seed(seed)).unwrap();
-        assert_eq!(d.picked, "b/prod");
-        assert_eq!(d.pool, "very-important");
+        let d = draw_workspace(&entries, &WeightBonus::default(), &mut PickRng::from_seed(seed))
+            .unwrap();
+        assert_eq!(d.picked, "a");
         assert_eq!(d.candidates.len(), 1);
     }
-}
-
-#[test]
-fn several_very_important_workspaces_are_drawn_among_themselves() {
-    let entries = vec![ws("a", 0, true), ws("b", 100, true), ws("c", 0, false)];
-    let mut rng = PickRng::from_seed(7);
-    let mut seen = std::collections::HashSet::new();
-    for _ in 0..500 {
-        let d = draw_workspace(&entries, &mut rng).unwrap();
-        assert_ne!(d.picked, "c");
-        seen.insert(d.picked);
-    }
-    assert_eq!(seen.len(), 2);
+    assert!(draw_workspace(&[ws("z", 0)], &FLAT, &mut PickRng::from_seed(1)).is_none());
 }
 
 #[test]
 fn fixed_seed_reproduces_the_exact_pick_sequence() {
-    let entries = vec![
-        ws("a", 100, false),
-        ws("b", 100, false),
-        ws("c", 100, false),
-    ];
+    let entries = vec![ws("a", 1), ws("b", 1), ws("c", 1)];
     let run = |seed| {
         let mut rng = PickRng::from_seed(seed);
         (0..12)
-            .map(|_| draw_workspace(&entries, &mut rng).unwrap().picked)
+            .map(|_| draw_workspace(&entries, &FLAT, &mut rng).unwrap().picked)
             .collect::<Vec<_>>()
     };
     assert_eq!(run(42), run(42));
-    // Pinned sequence: a change here means the draw or the RNG changed.
-    assert_eq!(run(42).join(""), "cccacbccbbca");
     assert_ne!(run(42), run(43));
 }
 
 #[test]
-fn draw_is_weighted_and_input_order_independent() {
-    let a = vec![ws("a", 0, false), ws("b", 100, false)];
-    let b = vec![ws("b", 100, false), ws("a", 0, false)];
+fn draw_is_input_order_independent() {
+    let a = vec![ws("a", 3), ws_vi("b", 1)];
+    let b = vec![ws_vi("b", 1), ws("a", 3)];
     let mut ra = PickRng::from_seed(1);
     let mut rb = PickRng::from_seed(1);
-    let mut a_wins = 0;
-    for _ in 0..2000 {
-        let da = draw_workspace(&a, &mut ra).unwrap();
-        assert_eq!(da, draw_workspace(&b, &mut rb).unwrap());
-        if da.picked == "a" {
-            a_wins += 1;
-        }
+    for _ in 0..500 {
+        assert_eq!(
+            draw_workspace(&a, &WeightBonus::default(), &mut ra),
+            draw_workspace(&b, &WeightBonus::default(), &mut rb)
+        );
     }
-    // Expected share 1000/1009 ~ 99%.
-    assert!(a_wins > 1900, "a won {a_wins}/2000");
 }
 
 #[test]
-fn draw_records_candidates_weights_and_pick() {
-    let entries = vec![ws("a", 0, false), ws("b", 100, false)];
-    let d = draw_workspace(&entries, &mut PickRng::from_seed(5)).unwrap();
-    assert_eq!(d.pool, "all");
-    assert_eq!(d.total_weight, 1009);
-    assert_eq!(d.candidates[0].weight, 1000);
+fn draw_records_base_weights_bonuses_and_pick() {
+    let entries = vec![ws("a", 2), ws_vi("b", 1)];
+    let d = draw_workspace(&entries, &WeightBonus::default(), &mut PickRng::from_seed(5)).unwrap();
+    assert_eq!(d.candidates[0].workspace, "a");
+    assert_eq!(
+        (d.candidates[0].base_weight, d.candidates[0].bonus, d.candidates[0].weight),
+        (2, 0, 2)
+    );
+    let vi = u64::from(DEFAULT_BONUS_VERY_IMPORTANT);
+    assert_eq!(
+        (d.candidates[1].base_weight, d.candidates[1].bonus, d.candidates[1].weight),
+        (1, vi, 1 + vi)
+    );
+    assert_eq!(d.total_weight, 3 + vi);
     assert!(d.roll < d.total_weight);
     let v = serde_json::to_value(&d).unwrap();
     assert_eq!(v["picked"], d.picked);
-    assert!(draw_workspace(&[], &mut PickRng::from_seed(1)).is_none());
+    assert!(draw_workspace(&[], &FLAT, &mut PickRng::from_seed(1)).is_none());
 }
 
 /// ACCEPTANCE (#11509): with N+2 open very-important issues in a workspace
@@ -200,34 +282,6 @@ fn red_main_fix_leads_the_workspace_order() {
         .collect();
     assert_eq!(order, vec![77, 30, 2, 9]);
     assert_eq!(next_in_workspace(&items).unwrap().number, 77);
-}
-
-#[test]
-fn red_main_fix_workspace_wins_the_draw_over_very_important() {
-    let entries = vec![
-        ws("a/tool", 0, false),
-        ws("b/prod", 0, true),
-        ws_fix("c/red", 100),
-    ];
-    for seed in 0..200 {
-        let d = draw_workspace(&entries, &mut PickRng::from_seed(seed)).unwrap();
-        assert_eq!(d.picked, "c/red");
-        assert_eq!(d.pool, "red-main-fix");
-        assert_eq!(d.candidates.len(), 1);
-    }
-}
-
-#[test]
-fn without_a_red_main_fix_the_draw_pools_are_unchanged() {
-    let vi = vec![ws("a/tool", 0, false), ws("b/prod", 100, true)];
-    let all = vec![ws("a/tool", 0, false), ws("b/prod", 100, false)];
-    for seed in 0..200 {
-        let d = draw_workspace(&vi, &mut PickRng::from_seed(seed)).unwrap();
-        assert_eq!((d.pool, d.picked.as_str()), ("very-important", "b/prod"));
-        let d = draw_workspace(&all, &mut PickRng::from_seed(seed)).unwrap();
-        assert_eq!(d.pool, "all");
-        assert_eq!(d.candidates.len(), 2);
-    }
 }
 
 #[test]

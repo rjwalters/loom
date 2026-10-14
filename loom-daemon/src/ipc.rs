@@ -2,7 +2,6 @@ use crate::activity::{ActivityDb, AgentInput, AgentOutput, InputContext, InputTy
 use crate::config_resolver;
 use crate::errors::DaemonError;
 use crate::event_bus::EventBus;
-use crate::forge_parser::parse_forge_events;
 use crate::git_parser;
 use crate::git_utils;
 use crate::issue_state_read;
@@ -259,7 +258,7 @@ pub use drain_status::{DrainRollStatus, PauseRollStatus, MAX_DRAIN_PENDING_BUDGE
 pub mod drain_state;
 pub use drain_state::{
     evaluate_drain_tick, AbortOutcome, DrainBegin, DrainDescriptor, DrainOrigin, DrainState,
-    DrainTick, PauseOwnership, ResumeHold,
+    DrainTick, MaintenanceBegin, PauseOwnership, ResumeHold, TookOver,
 };
 /// `DrainAndRestartDaemon` handling and the drain supervisor — see the module doc.
 pub mod drain_supervisor;
@@ -777,6 +776,22 @@ async fn handle_client(
             );
             let response_json = serde_json::to_string(&response)?;
             writer.write_all(response_json.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+            writer.flush().await?;
+            continue;
+        }
+
+        // #11812: host maintenance. Acked at once; H4 runs on its supervisor.
+        if let Request::PauseThenExit = request {
+            let response = crate::auto_update::pause_roll::maintenance::handle_request(
+                &drain_state,
+                &workspace_pool,
+                &fallback_root,
+                &event_bus,
+            );
+            writer
+                .write_all(serde_json::to_string(&response)?.as_bytes())
+                .await?;
             writer.write_all(b"\n").await?;
             writer.flush().await?;
             continue;
@@ -1388,7 +1403,7 @@ pub fn build_daemon_status_for(
         per_repo.push(crate::types::RepoStatus {
             root: root.clone(),
             maintain_only: workspace_registry.maintain_only_of(root),
-            priority: workspace_registry.priority_of(root),
+            weight: workspace_registry.weight_of(root),
             in_flight_count,
             health_gate_halted: health_states.is_halted(root),
             quarantined_issues,
@@ -1444,14 +1459,10 @@ pub fn build_daemon_status_for(
         + phase_stash_git_shellout
         + phase_sweep_command_check;
 
-    // Present the per-repo breakdown in dispatch-priority order (#3946) — the
-    // same order the autonomous loops drain — so the highest-priority repos are
-    // listed first. Stable within a tier (tiebreak on root path) for determinism.
-    per_repo.sort_by(|a, b| {
-        a.priority
-            .cmp(&b.priority)
-            .then_with(|| a.root.cmp(&b.root))
-    });
+    // Present the per-repo breakdown heaviest draw weight first (#11742), so
+    // the repos drawn most are listed first. Ties break on root path for
+    // determinism.
+    per_repo.sort_by(|a, b| b.weight.cmp(&a.weight).then_with(|| a.root.cmp(&b.root)));
     // #7513: everything from here to the report literal is machine-level
     // (computed once, not per root) — timed as one "tail" phase so the
     // slow-build log below can rule it in or out as a contributor distinct
@@ -2360,6 +2371,8 @@ fn handle_request(
                     .expect("Terminal manager mutex poisoned");
                 tm.list_terminals().into_iter().find(|t| t.id == id)
             };
+            // Resolved outside both locks; cached per workspace (#11486).
+            let forge_host = crate::forge_host::host_for_terminal(terminal_info.as_ref());
 
             let tm = terminal_manager
                 .lock()
@@ -2398,24 +2411,13 @@ fn handle_request(
                                 log::warn!("Failed to record output to activity database: {e}");
                             }
 
-                            // Parse terminal output for forge events and record them
-                            // TODO: Read forge_host from configuration once #3135 lands
-                            let forge_host = "github.com";
-                            let forge_events = parse_forge_events(&output_str, forge_host);
-                            for parsed_event in forge_events {
-                                let prompt_event =
-                                    parsed_event.to_prompt_forge_event(correlated_input_id);
-                                if let Err(e) = db.record_prompt_forge_event(&prompt_event) {
-                                    log::warn!("Failed to record forge event: {e}");
-                                } else {
-                                    log::debug!(
-                                        "Recorded forge event: {:?} (issue: {:?}, pr: {:?})",
-                                        prompt_event.event_type,
-                                        prompt_event.issue_number,
-                                        prompt_event.pr_number
-                                    );
-                                }
-                            }
+                            // Forge events, matched on this terminal's forge host (#11486).
+                            crate::forge_host::record_forge_events(
+                                &db,
+                                &output_str,
+                                forge_host.as_deref(),
+                                correlated_input_id,
+                            );
 
                             // Parse terminal output for resource usage (token counts, costs)
                             match db.record_resource_usage_from_output(
@@ -3400,7 +3402,7 @@ fn handle_request(
         Request::ReadIssueState { .. } => Response::Error {
             message: "internal: ReadIssueState is handled by handle_client".to_string(),
         },
-        Request::DrainAndRestartDaemon { .. } | Request::AbortDrain => {
+        Request::DrainAndRestartDaemon { .. } | Request::AbortDrain | Request::PauseThenExit => {
             // Structurally unreachable: `handle_client` intercepts both drain
             // requests (#4090) before dispatching here, because a drain must ack
             // immediately and exit from a background supervisor task minutes

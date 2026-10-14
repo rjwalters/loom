@@ -131,6 +131,56 @@ fn interrupted(version: &str, requires: Option<&str>, pending: &str) -> String {
     )
 }
 
+/// A checkout whose resync to a release at or below the daemon was
+/// interrupted still shows an old, compatible stamp plus `resync_pending`.
+/// It must be held, not cleared by the behind-but-compatible shortcut
+/// (#11109).
+#[test]
+fn a_checkout_with_resync_pending_is_held_whatever_its_versions_say() {
+    let fx = Fixture::new(Seed {
+        version: RUNNING,
+        current: true,
+        ..STALE
+    });
+    let host = Host::new(&fx, "host-a");
+    let mut holds = Holds::default();
+    assert_eq!(verdicts(&hold_pass(&host, None, &mut holds)), (Verdict::Clear, Verdict::Clear));
+
+    write(
+        &host.root.join(INSTALL_METADATA_PATH),
+        &interrupted("0.19.801", Some("0.19.772"), "0.19.802"),
+    );
+    host.advance(INTERVAL);
+    let seen = hold_pass(&host, Some("0.19.800"), &mut holds);
+    assert_eq!(verdicts(&seen).1, Verdict::Hold(HoldKind::InstallIncompatible));
+    assert_eq!(seen[0].checkout.demand, None);
+}
+
+/// The same interrupted checkout, but its stamp is already above this
+/// daemon: `RepoAheadOfDaemon` is refused before the pending key is read, and
+/// that refusal alone would clear it. It is held too, with no roll demand
+/// (#11109).
+#[test]
+fn a_repo_ahead_checkout_with_resync_pending_is_held() {
+    let fx = Fixture::new(Seed {
+        version: RUNNING,
+        current: true,
+        ..STALE
+    });
+    let host = Host::new(&fx, "host-a");
+    let mut holds = Holds::default();
+    assert_eq!(verdicts(&hold_pass(&host, None, &mut holds)), (Verdict::Clear, Verdict::Clear));
+
+    write(
+        &host.root.join(INSTALL_METADATA_PATH),
+        &interrupted("0.19.900", Some("0.19.772"), "0.19.901"),
+    );
+    host.advance(INTERVAL);
+    let seen = hold_pass(&host, None, &mut holds);
+    assert_eq!(verdicts(&seen).1, Verdict::Hold(HoldKind::InstallIncompatible));
+    assert_eq!(seen[0].checkout.demand, None);
+}
+
 /// A newer daemon started a resync on the default branch and did not finish
 /// it. The files are a mix of two releases, so dispatch is held; the hold
 /// asks for no roll, and this host never completes the run from its own

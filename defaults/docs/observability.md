@@ -190,6 +190,8 @@ resource per emitting host with exactly these attributes:
 | `host.id` | the envelope's `host_id` |
 | `host.name` | the envelope's `host_id` (#10977) |
 | `service.version` | the reporting daemon's version (a `host.health` record's `daemon_version`, else the exporting build's) |
+| `loom.daemon.revision` | the exporting build's full git SHA (`unknown` for a tarball build) — the same value every span carries (#11197) |
+| `loom.fleet.config_sha` | the fleet-gitops commit whose rendered config tiers are **on disk on this host right now**: a 40-hex SHA, `unknown` (a fleet host where no applied commit is established yet, e.g. during a startup-pass timeout), or `none` (no fleet store, `fleet.repo` unset). Never empty, never omitted (#11197) |
 
 `host.name` has one source, the same string as `host.id`: the daemon's host
 identity, which is the operator-assigned `$LOOM_HOST_ID` when it is set and
@@ -198,6 +200,31 @@ otherwise the OS hostname (`$HOSTNAME`, then the `hostname` binary). Set
 you chose (a cloud instance's is derived from its address). The daemon sets
 `host.name` itself, so a receiver reached without a collector gets it too; the
 bundled collector's resource allowlist forwards it unchanged.
+
+**Fleet-roll visibility (#11197).** The two provenance keys are read at export
+time — the resource is rebuilt for every batch, never memoized — so a
+fleet-sync pass that applies a new commit shows up on the next batch with no
+restart. Two caveats: "applied" means *on disk*, not *live in this process*
+(restart-only keys take effect on the next start), and a record queued before a
+roll and exported after it carries the **new** SHA, describing the exporting
+daemon rather than the moment the record was made (the same accepted behaviour
+as the `service.version` fallback). Which hosts are on which store commit:
+
+```sql
+SELECT DISTINCT
+  resources_string['host.id']               AS host_id,
+  resources_string['loom.fleet.config_sha'] AS config_sha
+FROM signoz_logs.distributed_logs_v2
+WHERE resources_string['loom.fleet.config_sha'] != ''
+  AND timestamp >= toUnixTimestamp64Nano(now64() - INTERVAL 24 HOUR)
+```
+
+A roster host stuck on `unknown`, or showing `none`, is the roll's laggard —
+query `= 'unknown'` / `= 'none'` directly; the empty-count check holds by
+construction because the attribute is never absent or empty. One
+`daemon.start` log record (topic `daemon.start`, see
+[telemetry-schema.md](telemetry-schema.md) §`daemon.event`) marks each
+process's exporter coming up.
 
 ### Multi-exporter fan-out (#8756)
 
@@ -238,11 +265,11 @@ Back-compat and upgrade rules:
 - Entries dedupe by kind (first wins; queues and status are keyed by kind
   name, so `"https"` can appear once). An unrecognized kind is logged and
   skipped, never a hard error.
-- A policy failure on one entry (bad endpoint, placeholder host, missing
-  `otlp` Cargo feature in this build) degrades **that entry** to its own
+- A policy failure on one entry (bad endpoint, placeholder host, refused
+  `headers_file`, or a missing/unreadable ingest key when this entry needs
+  one — #11555) degrades **that entry** to its own
   `misconfigured` status while the other exporters run; only when *no*
-  exporter survives — or the shared ingest key is unusable — is export off
-  entirely.
+  exporter survives is export off entirely.
 
 ### Extra request headers from an owner-only file (`headers_file`, #10961)
 
@@ -291,9 +318,14 @@ X-Client-Secret: <client secret>
   is one over 64 KiB.
 - **`Authorization` in the file replaces the default Bearer header** — the
   ingest key is then not sent to this sink at all. Without it, the Bearer
-  header is sent exactly as before, alongside the file's headers.
-  `observability.ingestKeyFile` must still resolve to a readable key either
-  way: it is shared by every exporter and checked before any sink starts.
+  header is sent exactly as before, alongside the file's headers — but only
+  when an ingest key was resolved at all (#11555): a `headers_file` entry
+  carries its own credentials, so it starts with no
+  `observability.ingestKeyFile` configured and sends **no** Bearer header.
+  The key is read only when some surviving entry needs it — every `https`
+  entry, and an `otlp` entry without `headers_file`; such entries are the
+  only ones a missing or unreadable key degrades to `misconfigured`
+  (#7815's read-only-when-needed rule, now per entry).
 
 What gets the entry refused — it degrades to its own `misconfigured` status,
 like any other per-entry policy failure, and other exporters keep running:
@@ -318,15 +350,55 @@ holds them has a redacting `Debug`. The path, the header count and whether the
 file sets `Authorization` are logged once when the exporter starts.
 
 The file is read each time the exporter is built — at daemon start, and when
-the attended live-output tailer builds its own — so **rotating a credential is
-a file write plus a daemon restart**, with no config change and no rebuild.
-It is not watched: a running exporter keeps the headers it started with.
+the attended live-output tailer builds its own — and a **running** exporter
+re-reads it whenever it changes (#11555): before every post the daemon stats
+the file (mtime, length and, on Unix, inode — inode because an atomic
+`rename` rotation keeps the path but swaps the file) and re-reads it on a
+stamp change, so **rotating a credential is just a file write** — no
+restart, no config change, no rebuild. A rotation whose replacement file is
+refused (loose permissions, a malformed line) keeps the **last good
+headers** — the sender never stops — and logs one `WARN` per distinct broken
+state, naming the path and line but never a value. An in-place `chmod` of
+the live file changes none of the stamp's components and so is not
+re-read.
 
 `headers_file` belongs to an `observability.exporters` entry, so it has no
 env override, and `$LOOM_OBSERVABILITY_EXPORTER` — which replaces the whole
 list with a single bare kind — drops it along with any per-entry `endpoint`.
 `loom-daemon telemetry-export` (the one-shot fixture replay) does not read
 it.
+
+**Provisioning and proving a host: `loom-daemon telemetry-join --host <roster-id>`
+(#11528).** Resolves this host's identity first and refuses a mismatched
+`--host` before credential fetch, write or send. The default source is
+`ssm-access:///2am/cloudflare/otlp-host/<host>`: fetch the existing
+`client_id`/`client_secret` pair and write `CF-Access-Client-Id` and
+`CF-Access-Client-Secret`. It neither mints a token nor changes Access policy.
+`headers-file:<path>` accepts an existing owner-only header file, including
+using the already provisioned destination as the source. Explicit legacy
+`ssm://<parameter>`, `file:<path>` and `age-file:<path>` sources still mean a
+scalar bearer token. Plaintext sources must be owner-only regular files;
+credential paths must stay outside every repository/worktree and contain no
+parent-directory traversal. New credential directories are 0700; existing
+destination parents must be private and owned by the invoking user (the
+command refuses a shared parent rather than chmodding it).
+
+The destination (`--headers-path`, default `~/.config/loom/otlp-headers`) is
+written atomically at 0600. Fresh content is parsed before replacement;
+malformed headers, partial Access pairs and nonregular/symlink destinations
+are refused without truncating existing credentials. Values never appear in
+errors or Debug. Only after provisioning does the live sender load the file,
+with no ambient or empty ingest-key Bearer header. OTLP is always compiled in.
+
+The command sends one `host.export` probe to the compiled-in `DEFAULT_ENDPOINT`
+(or `--endpoint`) and polls the reader (`--reader-url`) for
+`host.id == harness.ingest.principal == <roster-id>` within `--timeout`
+(default 60 s). The principal is a **resource** attribute stamped by ingress;
+`--probe-sql` can override the query for another schema. Credential fetch,
+401/403 refusal, other transport/status failures, identity mismatch, missing
+probe and reader outage remain distinct errors. CI uses fake credentials and
+loopback receivers; actual host provisioning/probe and the 2am onboarding-doc
+acceptance remain separate, explicitly unverified work under #11528.
 
 
 See [OTLP transport and artifact verification](otlp-transport.md) for response
@@ -493,7 +565,7 @@ condition is a first-class health check with four states, shown on the
 
 | State | Meaning |
 |---|---|
-| `no_exporter` | The resolved `observability.exporters` has no usable `otlp` entry (or observability is off), or the binary was built without the `otlp` feature (#10700). |
+| `no_exporter` | The resolved `observability.exporters` has no usable `otlp` entry (or observability is off). Every build compiles the OTLP exporter in (#10700), so a binary can no longer lack it. |
 | `failing` | An `otlp` exporter is configured, but no batch was acked within the window, or the OTLP queue's `dropped_total` grew within the window. |
 | `ok` | The last successful export is recent (a fresh exporter gets the window as startup grace). |
 | `exempt` | The host opted out; the reason is shown. |
@@ -501,6 +573,17 @@ condition is a first-class health check with four states, shown on the
 Precedence is `exempt`, `no_exporter`, `failing`, `ok`. A line is logged at
 daemon start and on each change of state, never per tick: WARN for `no_exporter`
 and `failing`, INFO for recovery to `ok` and entry into `exempt`.
+
+Since #11557 an attention state carries `since` (when the host first became
+`failing` / `no_exporter`; cleared on `ok` / `exempt`, kept across failure-detail
+changes, in memory so "since start" after a restart) and reads
+`otlp: failing since <T> (<reason>)` on the `status` line, in the WARN, and in
+`host.health`'s `otlp_export`. A `failing` reason includes the exporter's last
+failure (e.g. `OTLP HTTP 403 (credential refused …)`); a `misconfigured` OTLP
+entry counts as `no_exporter`. A degraded start — no OTLP entry starts and the
+host is not exempt — logs one ERROR line, `observability: DEGRADED — this
+daemon's facts are not reaching SigNoz: <detail>`, and the daemon still starts
+(`otlp_health::startup_verdict`; the start policy itself is #11526).
 
 ```json
 { "observability": {
@@ -545,7 +628,7 @@ labels are listed in
 `loom.queue.*` from the same per-issue ready-queue rows that `loom-daemon queue`
 shows (#8852). A row is *waiting* in one of two states. `ready` means only
 capacity is holding it: the concurrency cap, the admission ramp, the saturation
-brake, or the repo slice. `blocked` means an automatic hold: a halted repo,
+brake, or the per-repo cap. `blocked` means an automatic hold: a halted repo,
 missing sweep command, quarantine, dispatch backoff, no-op cooldown, PR-less
 retry, or a dispatch error. Running rows are not waiting. Neither are rows held
 deliberately or elsewhere: a park or hard-exclusion label, a decline, another
@@ -557,9 +640,7 @@ over-reports. The clock is dropped when the issue leaves the listing, is
 dispatched, or stops waiting. It is kept across a failed listing, and it
 re-seeds after a daemon restart. A re-seed reads `updatedAt` again, so it can
 include time the issue spent in a non-waiting hold that did not touch it (for
-example a peer claim). On a sharded fleet, `out_of_slice` rows count as `ready`
-on every host that lists them, so `starved{state="ready"}` can fire on a host
-that is not the slice owner. Read the host label with that in mind. The
+example a peer claim). The
 signals are `loom.queue.oldest_wait{state}`, `loom.queue.starved{state}` (waiting longer than `LOOM_QUEUE_STARVATION_SECS`,
 default 21600 = 6 h), `loom.queue.starved.by_reason{reason}`, and the
 dispatch-wait delta pair `loom.queue.dispatch_wait` / `.samples`. Queue
@@ -648,7 +729,7 @@ vocabulary (`loom.queue.disposition`'s wire values):
 | "admission brake" | `deferred_saturation` (decisions reason `saturation`, tick result `saturation_held`) |
 | "build back-off" / "WIP limit" (PR debt high) | `deferred_build_backoff` (decisions reason `build_backoff`, tick result `build_backoff_held`, #9410) |
 | "dependency blocked" | Loom has no issue-dependency gate. Nearest: `parked` (a `PARK_LABELS`/`SKIP_LABELS` entry, e.g. `loom:blocked`, alongside `loom:issue`) or `labelled_blocked` (`loom:blocked` without `loom:issue` — forge-side only, from `queue.snapshot`, never a tick outcome so it never appears on a `loom.dispatch.disposition` span) |
-| "lower tier" (ranked behind others) | `deferred_capacity` (machine concurrency cap full), `deferred_ramp_cap` (per-tick admission cap), `deferred_repo_cap` (per-repo cap), or `deferred_out_of_slice` (repo sharding) — `tier:*` labels do not affect dispatch order, only `loom.queue.rank` does |
+| "lower tier" (ranked behind others) | `deferred_capacity` (machine concurrency cap full), `deferred_ramp_cap` (per-tick admission cap), or `deferred_repo_cap` (per-repo cap); `deferred_out_of_slice` (repo sharding) is retired, #11682 — `tier:*` labels do not affect dispatch order, only `loom.queue.rank` does |
 | "waiting on overlapping work" (same files) | `deferred_file_overlap` (#9781): its `## Affected Files` share a path with same-repo work admitted earlier this tick or already in flight; the row's `detail` (and the `pick.decision` skip's `detail`) names the shared paths. A one-tick scheduling deferral, never a label or hold — see `daemon-reference.md` §"Same-repo file-overlap deferral" |
 | "repo locked by an open PR" | `open_pr` (the #4123 guard's `pr-open-skip`). Since #9674 the repo's `open_pr` rows carry the repo-level `lockout.frozen_candidates_count` / `lockout.frozen_points_sum` / `lockout.duration_seconds` attributes, so rank which repo's lockout is starving the most ready work by grouping those spans on `loom.repo` |
 
@@ -967,7 +1048,6 @@ could read. A machine with no daemon running has no receiver at all.
 
 The same switch is read again at each launch against the launched session's
 own workspace, so one repository of a multi-workspace daemon can opt out.
-Requires a daemon built with the `otlp` Cargo feature (release builds are).
 
 **What a wired session is given.** `CLAUDE_CODE_ENABLE_TELEMETRY=1`,
 `CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1`, `OTEL_{METRICS,LOGS,TRACES}_EXPORTER=otlp`,
@@ -1015,6 +1095,7 @@ hash of it, and it is never logged or forwarded.
 |---|---|
 | `service.name` | the harness — `claude-code` |
 | `service.instance.id`, `host.id`, `host.name` (whatever host attributes the daemon's own telemetry carries) | this daemon's host identity |
+| `loom.daemon.revision`, `loom.fleet.config_sha` | the relaying build's revision and the host's applied fleet-config SHA (#11197), with the daemon's value — sender-supplied copies are scrubbed with every other `loom.*` key |
 | `loom.runtime`, `loom.session.kind` (`sweep`/`role`), `loom.session.launch` (`daemon`) | from the launch |
 | `loom.repo` | the workspace's forge `owner/name`; absent until resolved, never a directory name |
 | `loom.issue`, `loom.role`, `loom.sweep_id` | the issue, role and sweep (or role-tick execution) id the session was launched for, when it has one |
@@ -1125,7 +1206,7 @@ and dropped).
 
 | Rule | From | Open / resolved |
 |---|---|---|
-| `fleet.<condition>` (`dispatch-halted`, `roles-persistent`, `capacity-limited`, `star-backlog`, `output-missing`) | `fleet_alert` | condition started (and each reminder) / cleared |
+| `fleet.<condition>` (`dispatch-halted`, `roles-persistent`, `capacity-limited`, `output-missing`; `star-backlog` retired by #11510) | `fleet_alert` | condition started (and each reminder) / cleared |
 | `daemon.down` (critical) | the watchdog, a separate process | recovery exhausted / any tick ending the outage |
 | `watchdog.peer-coord-degraded` (critical) | the watchdog | coordination degraded / green |
 | `safehouse.unreachable` (critical) | narration sink state | unreachable over 5 minutes / reconnected |

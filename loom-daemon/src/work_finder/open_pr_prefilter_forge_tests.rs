@@ -311,7 +311,7 @@ fn closing(repo: &str, number: u32, issue: u32) -> Row {
 
 fn tick_one<D: WorkDispatcher>(disp: D, numbers: &[u32], cap: usize) -> (TickReport, D) {
     let mut multi = vec![(source(numbers), disp)];
-    let report = tick_multi(&mut multi, &[100], cap, &[false]);
+    let report = tick_multi(&mut multi, &[1], cap, &[false]);
     let (_, disp) = multi.remove(0);
     (report, disp)
 }
@@ -336,16 +336,11 @@ impl WorkDispatcher for BeforePrefilter {
     fn workspace_commands_missing(&self) -> bool {
         self.0.workspace_commands_missing()
     }
-    fn dispatch(&mut self, issue: u32, complexity: Option<&str>) -> Result<bool> {
-        self.0.dispatch(issue, complexity)
+    fn dispatch(&mut self, issue: u32) -> Result<bool> {
+        self.0.dispatch(issue)
     }
-    fn dispatch_with(
-        &mut self,
-        issue: u32,
-        complexity: Option<&str>,
-        overflow: bool,
-    ) -> Result<bool> {
-        self.0.dispatch_with(issue, complexity, overflow)
+    fn dispatch_with(&mut self, issue: u32, overflow: bool) -> Result<bool> {
+        self.0.dispatch_with(issue, overflow)
     }
 }
 

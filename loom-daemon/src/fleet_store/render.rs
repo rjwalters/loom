@@ -16,6 +16,17 @@
 //! "host overlay required, local tier optional" rules; the legacy files are
 //! read only when `fleet.json` is absent.
 //!
+//! - **Per-repo fleet tier** (#11738) = `repos[].config` of each **desired**
+//!   roster record (`fleet: true` or `maintain`, never `firewall`) whose clone
+//!   exists, written verbatim to that repo's `.loom-local/fleet-repo.json`
+//!   ([`crate::config_resolver::FLEET_REPO_CONFIG_REL`]) by [`repo_targets`].
+//!   Compiled-store only: the legacy `repos.yml` has no per-repo config, so a
+//!   store without `fleet.json` yields no per-repo targets at all. Unlike the
+//!   host-local tier, a record with **no** `config` means the file must not
+//!   exist ([`RepoTarget::value`] is `None`, removed by [`remove`]): the file
+//!   is owned by the fleet sync, so taking a value out of the fleet config has
+//!   to take effect.
+//!
 //! Drift is **semantic**: a target whose parsed JSON equals the rendered value
 //! is in sync regardless of formatting, and is not rewritten (so a no-op render
 //! never churns backups). A write keeps exactly one timestamped backup of the
@@ -39,6 +50,8 @@ pub enum Tier {
     Machine,
     /// The workspace's host-local tier.
     Local,
+    /// A desired repo's per-repo fleet tier (#11738).
+    Repo,
 }
 
 impl Tier {
@@ -48,6 +61,7 @@ impl Tier {
         match self {
             Tier::Machine => "machine tier",
             Tier::Local => "host-local tier",
+            Tier::Repo => "per-repo fleet tier",
         }
     }
 }
@@ -123,6 +137,96 @@ pub fn render(
         });
     }
     Ok(out)
+}
+
+/// One desired repo's per-repo fleet tier (#11738): where it goes, and what
+/// the store says it holds.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RepoTarget {
+    /// The roster record's `name`.
+    pub name: String,
+    /// `<root>/<dir>/.loom-local/fleet-repo.json`.
+    pub path: PathBuf,
+    /// The record's `config`; `None` when it has none, which means the file
+    /// must not exist.
+    pub value: Option<Value>,
+}
+
+impl RepoTarget {
+    /// This tier as a plain [`Target`], when the store gives it a value — so
+    /// drift, write and backups are exactly the other tiers'.
+    #[must_use]
+    pub fn target(&self) -> Option<Target> {
+        self.value.as_ref().map(|value| Target {
+            tier: Tier::Repo,
+            path: self.path.clone(),
+            value: value.clone(),
+        })
+    }
+}
+
+/// The per-repo fleet tier for every desired, cloned repo in the store
+/// (#11738), in roster order.
+///
+/// Only `fleet.json` carries per-repo config, so a store without it yields an
+/// empty list (the legacy `repos.yml` path does nothing here). The repo set is
+/// [`super::roster::Roster::desired`] — so a `firewall: true` record, or one
+/// the roster does not manage, never gets a target — narrowed to the repos
+/// `is_cloned` (a seam: production checks `<path>/.git`). A repo that is not
+/// cloned is skipped, never created.
+pub fn repo_targets(
+    snapshot: &Snapshot,
+    home: &Path,
+    is_cloned: &dyn Fn(&Path) -> bool,
+) -> Result<Vec<RepoTarget>> {
+    let Some(doc) = super::compiled::from_snapshot(snapshot)? else {
+        return Ok(Vec::new());
+    };
+    let roster = super::roster::from_compiled(doc.roster(), home)?;
+    Ok(roster
+        .desired()
+        .into_iter()
+        .filter(|d| is_cloned(&d.path))
+        .map(|d| RepoTarget {
+            path: d.path.join(crate::config_resolver::FLEET_REPO_CONFIG_REL),
+            value: doc.repo_config(&d.name).cloned(),
+            name: d.name,
+        })
+        .collect())
+}
+
+/// [`drift`] for a per-repo target. With no value, a file on disk is drift
+/// (it is due for removal) and an absent one is in sync.
+#[must_use]
+pub fn repo_drift(target: &RepoTarget) -> Drift {
+    if let Some(t) = target.target() {
+        return drift(&t);
+    }
+    match std::fs::symlink_metadata(&target.path) {
+        Ok(_) => Drift::Differs(vec![
+            "- (file): the store has no per-repo config for this repo".to_string()
+        ]),
+        Err(_) => Drift::InSync,
+    }
+}
+
+/// Remove `path`, keeping it as the one timestamped backup (the same
+/// `<file>.fleet-store-bak-<UTC>` a [`write`] keeps). Returns whether anything
+/// was removed, and the backup. A missing file is a no-op.
+pub fn remove(path: &Path, stamp: &str) -> Result<(bool, Option<PathBuf>)> {
+    if std::fs::symlink_metadata(path).is_err() {
+        return Ok((false, None));
+    }
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("{} has no file name", path.display()))?
+        .to_string_lossy()
+        .to_string();
+    let backup = path.with_file_name(format!("{name}{BACKUP_MARKER}{stamp}"));
+    std::fs::rename(path, &backup)
+        .with_context(|| format!("moving {} to {}", path.display(), backup.display()))?;
+    prune_backups(path, &name, &backup);
+    Ok((true, Some(backup)))
 }
 
 /// A store file parsed as a JSON object; `Ok(None)` when absent. Unlike the

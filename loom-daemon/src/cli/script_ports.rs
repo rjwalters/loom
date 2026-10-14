@@ -71,6 +71,16 @@ pub(crate) enum ScriptPortCommand {
     /// leaves the session classified as before.
     CodexSandboxNoop(super::codex_sandbox_noop_cli::CodexSandboxNoopArgs),
 
+    /// The error classifier behind `lib/classify-error.sh` (#11208): stdin
+    /// (or `--stdout-tail`/`--stderr-tail` files) plus `--exit-code` and an
+    /// optional `--provider` in, one uppercase category line out;
+    /// `--transient <CATEGORY>` answers the retry deny-list in its exit
+    /// code. Optional to its caller — the shell library falls back to its
+    /// in-file tables when no (new enough) binary resolves, and both sides
+    /// are pinned byte-equal by `test-classify-error.sh`'s parity section and
+    /// the shared `vectors.tsv` fixture.
+    ClassifyError(super::classify_error_cli::ClassifyErrorArgs),
+
     /// The daemon-roll pause hook and pause state (#10830). `hook` is inert
     /// unless LOOM_DAEMON_ITEM_ID is set; an older binary lacking it leaves
     /// every tool call unparked.
@@ -443,6 +453,12 @@ pub(crate) enum ScriptPortCommand {
     #[command(subcommand)]
     RoleToolPolicy(super::role_tool_policy::RoleToolPolicyCommand),
 
+    /// Per-stage runtime selection views (#11726): `roles draw --explain`
+    /// prints each stage's effective weighted, per-attempt draw table on this
+    /// host and the config tier that set it.
+    #[command(subcommand)]
+    Roles(super::roles_draw_cmd::RolesCommand),
+
     /// Tier-3 "generic passthrough" launch-shape resolution (#8671): reads a
     /// runtime capability manifest's `launch` object and renders it as
     /// eval-ready shell defaults. Backs `spawn-generic-launch.sh`. Exit 0
@@ -506,6 +522,7 @@ pub(crate) enum ScriptPortCommand {
     /// Guard configuration diagnostics (#10434): `guards status` shows each
     /// guard category's effective value and source, hook wiring, a decision-log
     /// summary, and misconfiguration warnings. Read-only; always exits 0.
+    /// `guards remote-exec` is the remote-fleet-exec hook classifier (#11568).
     #[command(subcommand)]
     Guards(super::guards_status::GuardsCommand),
 
@@ -527,14 +544,9 @@ pub(crate) enum ScriptPortCommand {
     #[command(subcommand)]
     ParkRecord(super::park_record::ParkRecordCommand),
 
-    /// Curator's `<!-- loom:points=<N> -->` estimate-marker validation
-    /// (#9056), backing `require-complexity-marker.sh`'s points-marker gate.
-    /// Reads the issue body on stdin — the same body the shell script's own
-    /// complexity-tier check already fetched, no second `gh` call. Not a
-    /// port of a whole script: the complexity-tier half of
-    /// `require-complexity-marker.sh` stays inline shell, unchanged; only the
-    /// new points check moved here, to keep the #7810 `shell-budget` gate a
-    /// non-event for this addition.
+    /// Validate the Curator's `<!-- loom:points=<N> -->` marker in one issue
+    /// body read from stdin (#9056). The gate itself, which also reads
+    /// trusted comments, is `loom-daemon curation-complete` (#11663).
     CheckPointsMarker(super::points_marker_check::CheckPointsMarkerArgs),
 
     /// Per-agent-scope `MemoryMax` (MiB) sized from the repo's observed
@@ -657,6 +669,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::ReleaseResolve(args) => args.run(),
             ScriptPortCommand::ReleaseExplain(args) => args.run(),
             ScriptPortCommand::CodexSandboxNoop(args) => args.run(),
+            ScriptPortCommand::ClassifyError(args) => args.run(),
             ScriptPortCommand::RollPause(cmd) => cmd.run(),
             ScriptPortCommand::AgentResume(cmd) => cmd.run(),
             ScriptPortCommand::InstallCompat(cmd) => cmd.run(),
@@ -703,6 +716,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::AffectedFiles(cmd) => cmd.run(),
             ScriptPortCommand::FleetCaptain(args) => args.run(),
             ScriptPortCommand::RoleToolPolicy(cmd) => cmd.run(),
+            ScriptPortCommand::Roles(cmd) => cmd.run(),
             ScriptPortCommand::RuntimeLaunchEnv(args) => args.run(),
             ScriptPortCommand::CheckStaleBlocked(args) => args.run(),
             ScriptPortCommand::GuardMcpTools(args) => args.run(),
@@ -747,12 +761,6 @@ pub(crate) enum MergePrCommand {
     /// BYPASSED under --allow-red-tree), 1 = a check failed (comment posted),
     /// 2 = could not run (must also refuse).
     TreeChecks(super::merge_pr_tree_checks::TreeChecksArgs),
-
-    /// The chain-head merge lock (#10167): defer this merge while another
-    /// PR on the same base is a re-dating chain head whose required checks
-    /// have not reported. Exit 0 = proceed (CLEAR / OVERRIDDEN / FAIL-OPEN),
-    /// 6 = deferred (HELD / UNREADABLE). Never writes to the forge.
-    ChainLock(super::merge_pr_chain_lock::ChainLockArgs),
 
     /// Refuse a merge whose head's latest `CI` workflow run did not conclude
     /// `success` (#10444), naming the cancelled/failed jobs. Exit 0+CLEAN =
@@ -1103,6 +1111,12 @@ pub(crate) enum MergePrCommand {
     /// `cli::merge_pr_retries_used`.
     RetriesUsed(super::merge_pr_retries_used::RetriesUsedArgs),
 
+    /// The already-merged / closed-unmerged terminal-state gate at the top of
+    /// `merge-pr.sh` (#8191 slice). One line `LOOM-PR-STATE MERGED|CLOSED|OPEN`,
+    /// exit 0; the shell acts only on MERGED/CLOSED and proceeds otherwise —
+    /// see `cli::merge_pr_pr_state`.
+    PrState(super::merge_pr_pr_state::PrStateArgs),
+
     /// The wait-or-timeout decision for `--auto`'s unfetchable-check-runs and
     /// pending-checks poll arms (#8191 slice): one `LOOM-POLL-WAIT
     /// <WAIT|TIMEOUT> <level> <message>` line, exit 0; the shell keeps the
@@ -1114,6 +1128,12 @@ pub(crate) enum MergePrCommand {
     /// / CLEAR + labels. The shell refuses on any other output — see
     /// `cli::merge_pr_revalidate_head`.
     RevalidateHead(super::merge_pr_revalidate_head::RevalidateHeadArgs),
+
+    /// The per-attempt route of the synchronous merge-retry loop (#8191
+    /// slice): stdin is the failed merge's response; prints `LOOM-MERGE-ROUTE
+    /// AWAIT|SYNC|FAIL` plus its narration, exit 0. The shell routes on the
+    /// classifier's kind itself on any fault — see `cli::merge_pr_merge_route`.
+    MergeRoute(super::merge_pr_merge_route::MergeRouteArgs),
 }
 
 impl MergePrCommand {
@@ -1123,7 +1143,6 @@ impl MergePrCommand {
             MergePrCommand::MergeableRecheck(args) => args.run(),
             MergePrCommand::StaleChecks(args) => args.run(),
             MergePrCommand::TreeChecks(args) => args.run(),
-            MergePrCommand::ChainLock(args) => args.run(),
             MergePrCommand::CiResult(args) => args.run(),
             MergePrCommand::RequiredChecks(args) => args.run(),
             MergePrCommand::HeadSyncRetry(args) => args.run(),
@@ -1166,8 +1185,10 @@ impl MergePrCommand {
             MergePrCommand::RemoveGate(args) => args.run(),
             MergePrCommand::DiscoveredWorktree(args) => args.run(),
             MergePrCommand::RetriesUsed(args) => args.run(),
+            MergePrCommand::PrState(args) => args.run(),
             MergePrCommand::PollWait(args) => args.run(),
             MergePrCommand::RevalidateHead(args) => args.run(),
+            MergePrCommand::MergeRoute(args) => args.run(),
             MergePrCommand::CleanupPaths(args) => args.run(),
         }
     }

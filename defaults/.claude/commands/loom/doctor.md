@@ -53,7 +53,7 @@ silently wedges the whole sweep — the harness cannot kill a hung `Task` from
 outside, so the only defense is your own discipline:
 
 - **Never wait indefinitely on a single tool call.** Give long-running commands
-  (`buildGate.command`, `gh pr checks --watch`) an explicit `timeout <secs> …` /
+  (a scoped test run, `gh pr checks --watch`) an explicit `timeout <secs> …` /
   one-shot snapshot rather than an unbounded wait; if a command does not return,
   treat it as inconclusive and move on rather than blocking.
 - **Emit progress as you go.** Print a short line at each step. Continuous output
@@ -407,12 +407,14 @@ Full convention and rationale: `.loom/docs/untrusted-external-content.md`. A mar
 
 ## Finding Work
 
+**Skip any item labelled `loom:frozen`**: don't read it as work, comment on it, or relabel it. Only a human removes it.
+
 Use the shared queue and walk its rows in order:
 ```bash
 QUEUE=$(loom-daemon pr-queue --role doctor) || exit 1
 printf '%s\n' "$QUEUE" | jq -r '.[] | [.number, .origin, .priorityReason] | @tsv'
 ```
-Follow `.loom/docs/pr-planning.md`. Stars precede interactive work; the classes
+Follow `.loom/docs/pr-planning.md`. Priority PRs precede interactive work; the classes
 below describe the baseline tie-break, not separate passes ahead of the queue.
 After each completed/skipped PR, refresh the queue and take the next unvisited
 row; keep a per-pass visited set. Preserve PR origin during repairs.
@@ -555,14 +557,14 @@ claims from. Still excludes `loom:operator` here too, so a Doctor skimming this
 list doesn't hand-pick a held PR (#5978).
 ```bash
 gh pr list --state=open --json number,title,labels,mergeable \
-  | jq -r '.[] | select(.mergeable == "CONFLICTING") | select(.labels | all(.name != "loom:operator")) | "#\(.number): \(.title)"'
+  | jq -r '.[] | select(.mergeable == "CONFLICTING") | select(.labels | all(.name != "loom:operator" and .name != "loom:frozen")) | "#\(.number): \(.title)"'
 ```
 
 **Find all open PRs:**
 ```bash
 # Check primary queues first
-PRIORITY_1=$(gh pr list --label="loom:pr" --state=open --json number,mergeable | jq '[.[] | select(.mergeable == "CONFLICTING")] | length')
-PRIORITY_2=$(gh pr list --search "is:open is:pr label:loom:changes-requested -label:loom:blocked -label:loom:operator-only" --json number | jq 'length')
+PRIORITY_1=$(gh pr list --label="loom:pr" --state=open --json number,mergeable,labels | jq '[.[] | select(.mergeable == "CONFLICTING") | select(any(.labels[]?.name; . == "loom:frozen") | not)] | length')
+PRIORITY_2=$(gh pr list --search "is:open is:pr label:loom:changes-requested -label:loom:blocked -label:loom:operator-only -label:loom:frozen" --json number | jq 'length')
 
 if [ "$PRIORITY_1" -eq 0 ] && [ "$PRIORITY_2" -eq 0 ]; then
   echo "No labeled work, checking fallback queue..."
@@ -694,9 +696,7 @@ gh pr edit 588 --remove-label "loom:treating" --add-label "loom:review-requested
    - Fix review comments
    - Resolve merge conflicts
    - Update tests or documentation
-8. **Verify ALL checks pass locally**: Run the project's check command (see `buildGate.command` in `.loom/config.json`, or the repo's documented CI command, e.g. `pnpm check:ci`)
-   - Do NOT push until all local checks pass
-   - This prevents multiple fix-push-fail cycles
+8. **Verify what the fix touched** (#11690: CI is the test gate): it compiles, plus the tests for the code you changed and the failing ones from step 6. Never the full suite or `buildGate.command`; remote CI (step 10) is the verdict.
 9. **Commit and push**: Push your fixes to the PR branch
    - **Pre-push head-SHA recheck (MANDATORY)**: before the push, re-compare the PR's `headRefOid` against the `CLAIM_HEAD_SHA` you captured in step 2 — see "Pre-Push Head-SHA Recheck" below. If the head moved, another agent pushed while you were working; re-verify the blocker is still unaddressed and stand down rather than duplicating (or clobbering) their fix.
    - **Then run "Pin the lease" below, top to bottom**: the pre-open update from `origin/main` (MANDATORY, #7668, as `builder-pr.md` § "Pre-Push Rebase"; a merge unless `loom-daemon branch-update strategy` says rebase, #10771) and the push (#9487). Never update before it. On a conflict resolve in place (`git add`, then `git commit --no-edit` or `git rebase --continue`), resume at its version gate, not "PR Has Merge Conflicts". No-op if `main` hasn't moved.
@@ -951,6 +951,10 @@ if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-che
   echo "Aborting: version-bearing files out of sync after update (see BLOCKER:/Fix:)." >&2
   exit 1
 fi
+# Discard guard (#9282): rc 0 = BLOCKED, do NOT push; report its BLOCKER:/Fix:.
+RG=0; loom-daemon forge rebase-guard --base origin/main || RG=$?
+[ "$RG" = 0 ] && exit 1
+[ "$RG" = 1 ] || echo "WARNING: rebase-guard gave no answer (rc=$RG) - pushing UNCHECKED (#9282)" >&2
 loom-daemon lease pr fence "$N" --role doctor --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"
 [[ $? =~ ^[02]$ ]] || exit 1  # lease lost: stand down
 if [ "$BRANCH_UPDATE" = rebase ]; then git push --force-with-lease="$BRANCH:$PUSH_LEASE_SHA"; else git push origin "HEAD:$BRANCH"; fi &&
@@ -966,9 +970,8 @@ Never hand-bump `VERSION` & co. here (#7743; `bef3e07a`, #7341): if the gate fir
 gh pr edit $N --remove-label "loom:treating"
 ```
 
-Do **not** add `loom:review-requested` when standing down — the Doctor who
-actually pushed owns that transition. Leave the PR's state labels alone and
-exit; your only label action is removing your own claim.
+Do **not** add `loom:review-requested` when standing down (the Doctor who pushed owns
+it). Leave state labels alone and exit; only remove your own claim.
 
 **Note on new-PR creation (#6277):** Doctor normally pushes fixes to an
 *existing* PR, so the recheck above is the relevant freshness guard. If a fix
@@ -1089,13 +1092,9 @@ CI Failures Found:
 - All shellcheck warnings together
 - All type errors together
 
-**Verify locally before pushing**:
+**Verify what you touched before pushing** (CI runs the full suite, #11690):
 ```bash
-# Run ALL checks locally
-pnpm check:ci   # your repo's check command — see buildGate.command in .loom/config.json
-
-# Or run specific checks
-pnpm test              # Frontend tests
+pnpm test -- <touched specs>   # the failing / touched tests only
 pnpm lint              # Linting
 pnpm exec tsc --noEmit # TypeScript
 shellcheck scripts/*.sh # Shell scripts (if applicable)
@@ -1124,7 +1123,7 @@ loom-daemon forge wait-checks <PR_NUMBER> --timeout 1200
 
 The "Time budget — do not hang" rule above forbids waiting *too long*. This rule forbids the opposite-looking failure that costs just as much: **pretending to wait** by arming a watcher and ending the turn.
 
-**Every result you are waiting on — remote CI after the push above, a long local check run (`buildGate.command`, `pnpm check:ci`), a slow test suite during conflict resolution — must be resolved inside the same turn that started it. It must NEVER be resolved by starting a background monitor (a `Monitor`/`ScheduleWakeup` timer, a `run_in_background` Bash watcher, a `gh pr checks --watch` you walk away from) and ending your turn narrating *"the monitor will re-invoke me when CI concludes."***
+**Every result you are waiting on — remote CI after the push above, a long local build or targeted test run — must be resolved inside the same turn that started it. It must NEVER be resolved by starting a background monitor (a `Monitor`/`ScheduleWakeup` timer, a `run_in_background` Bash watcher, a `gh pr checks --watch` you walk away from) and ending your turn narrating *"the monitor will re-invoke me when CI concludes."***
 
 This is the Doctor-side counterpart of the orchestrator guardrail in `sweep.md` ("ending your turn IS the kill signal", issue #4257) and of the identical rule in `judge.md`. **One rule, both dispatch surfaces:**
 
@@ -1251,15 +1250,14 @@ Comment on the PR when pushing fixes ("Addressed: formatting, added tests for ed
 
 ### Quality Checks
 ```bash
-# Full CI; Rust lint = each CI `cargo clippy` line verbatim, apart from tests; no clippy = unvalidated.
+# Targeted only (CI is the test gate, #11690); Rust lint = each CI `cargo clippy` line verbatim, apart from tests; no clippy = unvalidated.
 # Production shell changed + CI runs shell-budget --check? After the final commit, before re-review:
 # `loom-daemon shell-budget --check --base <PR base, default origin/main>`; nonzero = this branch's
 # growth (never pre-existing): cut counted shell or move it to the daemon, rerun to exit 0.
 # Comments, follow-up issues or arbitrary trailers are not permission.
-pnpm check:ci   # repo check: buildGate.command in .loom/config.json
 
-# If review mentioned tests / style / types:
-pnpm test
+# If review mentioned tests / style / types (scope to what you touched):
+pnpm test -- <touched specs>
 pnpm lint
 pnpm exec tsc --noEmit
 ```
@@ -1315,8 +1313,7 @@ gh api repos/{owner}/{repo}/pulls/42/comments \
 # Make your changes...
 # (edit files, add tests, fix bugs, resolve conflicts)
 
-# Verify everything works
-pnpm check:ci   # your repo's check command — see buildGate.command in .loom/config.json
+# Verify what you touched (targeted tests; CI runs the suite, #11690)
 
 # Commit and push
 git add .
@@ -1375,11 +1372,16 @@ git fetch origin main
 if [ "$BRANCH_UPDATE" = rebase ]; then git rebase origin/main; else git merge --no-ff -m "Merge origin/main into $BRANCH (Doctor: resolve conflicts)" origin/main; fi
 # Conflict: resolve each file, `git add` it, then `git commit --no-edit` (merge) or `git rebase --continue`.
 
-# Version-bearing-file sync gate (#7168): if it fires, stop and report; never hand-bump.
+# Version-gate: if it fires, stop and report; never hand-bump.
 if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-check-gate.sh --fix-hint "then push."; then
-  echo "Aborting: version-bearing files are out of sync after update (see BLOCKER:/Fix: above) -- unexpected under #7743; report, do not hand-bump." >&2
+  echo "Aborting: version-bearing files out of sync (see BLOCKER:/Fix:); report, do not hand-bump." >&2
   exit 1
 fi
+
+# Discard guard (#9282): rc 0 = BLOCKED, do NOT push; report its BLOCKER:/Fix:.
+RG=0; loom-daemon forge rebase-guard --base origin/main || RG=$?
+[ "$RG" = 0 ] && exit 1
+[ "$RG" = 1 ] || echo "WARNING: rebase-guard gave no answer (rc=$RG) - pushing UNCHECKED (#9282)" >&2
 
 # Merge: plain push (rejected: Head-SHA Recheck, never force). Rebase: PINNED lease.
 loom-daemon lease pr fence 42 --role doctor --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"
@@ -1418,11 +1420,9 @@ states Doctor exists to clear:
 | `loom:merge-conflict` | PR has merge conflicts requiring resolution | **Remove it once you have rebased and the conflicts are resolved** (the PR is no longer conflicting). Apply it if you triage a conflicted PR you cannot immediately fix. |
 | `loom:ci-failure` | PR has failing CI checks | **Remove it once CI is green again** after your fix. Apply it if you are flagging a PR whose CI is red and leaving it for a follow-up. |
 
-These are informational status flags, not queue gates — the primary Doctor queues
-are still `loom:pr` (conflicts) and `loom:changes-requested` (feedback). Keep them
-accurate: they should reflect the PR's **current** state, so clear them the moment
-the underlying problem is gone, and never leave a stale `loom:merge-conflict` /
-`loom:ci-failure` on a PR you have just made mergeable.
+These are informational flags, not queue gates (the queues are `loom:pr` for conflicts and
+`loom:changes-requested` for feedback). Keep them current: clear each the moment its
+problem is gone; never leave a stale one on a PR you just made mergeable.
 
 ### Signaling Conflict-Only Resolution (Fast-Track Review)
 
@@ -1449,9 +1449,9 @@ When you **only** resolve merge conflicts without making substantive code change
 
 <!-- loom:conflict-only -->
 
-Changes:
-- Resolved conflicts in `src/foo.ts` (accepted upstream changes)
-- Resolved conflicts in `package-lock.json` (regenerated)
+Head before resolution: `<sha>`. Per conflicted file, the side kept and why:
+- `src/foo.ts`: kept main's side, because <reason>
+- `package-lock.json`: regenerated, because <reason>
 
 No substantive code changes made - only conflict resolution.
 EOF
@@ -1474,15 +1474,12 @@ EOF
 # First: Check ALL CI failures, not just tests
 loom-daemon forge wait-checks <PR_NUMBER> --timeout 20
 
-# Then fix ALL issues locally
-pnpm test              # Run tests
+# Then fix ALL issues locally, verifying only what you touched
+pnpm test -- <touched specs>
 pnpm lint              # Check linting
 pnpm exec tsc --noEmit # Check types
 
-# Verify full CI suite passes
-pnpm check:ci   # your repo's check command — see buildGate.command in .loom/config.json
-
-# Only push when ALL checks pass
+# Push; remote CI is the verdict (#11690)
 git push
 ```
 

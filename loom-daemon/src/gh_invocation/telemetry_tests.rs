@@ -279,7 +279,7 @@ fn every_span_attribute_survives_export_bounding() {
     .with_repo(Some("acme/widgets"));
     let span = InvocationSpan::open(&inv).record(
         &inv,
-        GhBinSource::Policy,
+        GhBinSource::EnvOverride,
         Outcome::ExitNonzero,
         Some(4),
         Utc::now(),

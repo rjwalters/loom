@@ -6,18 +6,13 @@ use super::*;
 /// #8222) — the source of the record's `judge_verdicts` and `doctor_cycles`.
 pub(crate) mod label_timeline;
 
-/// The Curator complexity-tier signal read off the sweep's issue body (Issue
-/// #8542) — the source of the record's `complexity`.
+/// The single terminal-transition issue read (end state #9441, `points:*`
+/// labels #9432) — the source of the record's `disposition` end state and
+/// `story_points`.
 pub(crate) mod complexity_signal;
 
-/// The Curator points-estimate signal read off the sweep's issue body (Issue
-/// #9056), consumed only by [`writeback`] — see its own module doc for why
-/// this is a separate, conditionally-fetched read rather than a permanent
-/// `SweepOutcomeRecord` field like `complexity`.
-pub(crate) mod points_signal;
-
 /// The opt-in, post-`Success` issue write-back comment (Issue #9056): renders
-/// [`telemetry::SweepOutcomeRecord`] + [`points_signal`]'s estimate to
+/// [`telemetry::SweepOutcomeRecord`] + the record's `story_points` to
 /// Markdown and posts it, once, to the sweep's originating issue.
 pub(crate) mod writeback;
 
@@ -57,13 +52,6 @@ pub(crate) struct PhaseObservation {
     /// name its PR without a forge round trip — the checkpoint itself is
     /// deleted on success, before the record is written.
     pr_number: Option<u32>,
-    /// The checkpoint's `(jev_tier, jev_confidence)` pair, when the sweep
-    /// skill's Tier-2.5 dispatch step wrote one (Issue #8543) — a shadow-mode
-    /// Jev complexity classification, present only when `TYPESAFE_API_KEY`
-    /// was set for the run. Captured the same opportunistic, per-tick way as
-    /// `pr_number` (see [`SweepRegistry::sample_phase_transition`]), since it
-    /// too must survive the checkpoint's deletion on success.
-    jev: Option<(String, f64)>,
 }
 
 /// Cap on retained [`PhaseObservation`]s per sweep (Issue #4704). A normal
@@ -115,22 +103,6 @@ pub(crate) fn models_used_from(
     models.sort_unstable();
     models.dedup();
     (!models.is_empty()).then_some(models)
-}
-
-/// Best-effort extraction of the `jev_tier`/`jev_confidence` pair from a
-/// sweep checkpoint JSON file (Issue #8543), mirroring
-/// [`read_checkpoint_pr_number`]'s opaque-file, one-shot-read discipline.
-/// `None` unless BOTH fields are present and well-typed — a checkpoint
-/// carrying a tier with no confidence (or vice versa) is not one this reads,
-/// since the pair is always written together by the sweep skill's Tier-2.5
-/// step.
-#[must_use]
-fn read_checkpoint_jev(path: &Path) -> Option<(String, f64)> {
-    let s = std::fs::read_to_string(path).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&s).ok()?;
-    let tier = v.get("jev_tier")?.as_str()?.to_string();
-    let confidence = v.get("jev_confidence")?.as_f64()?;
-    Some((tier, confidence))
 }
 
 impl SweepRegistry {
@@ -218,13 +190,6 @@ impl SweepRegistry {
             .clone()
             .or_else(|| crash_classification.clone())
             .filter(|class| !class.is_empty());
-        // Issue #8543: whatever Tier-2.5 sampled for this sweep, or `(None,
-        // None)` when `TYPESAFE_API_KEY` was never set / the call never
-        // completed — the keyless case this keeps byte-identical to before
-        // #8543 (no fields serialized; see `OutcomeRecord::jev_tier`).
-        let (jev_tier, jev_confidence) = self
-            .sampled_jev(sweep_id)
-            .map_or((None, None), |(tier, confidence)| (Some(tier), Some(confidence)));
         let record = sweep_outcomes::OutcomeRecord {
             timestamp: Utc::now(),
             repo: self.config.workspace_root.display().to_string(),
@@ -236,8 +201,6 @@ impl SweepRegistry {
             crash_classification,
             token_name,
             credential: credential.clone(),
-            jev_tier,
-            jev_confidence,
             tap_usage: tap_region.outcome().cloned(),
             // Empty — and so absent from the line entirely — whenever
             // `tap_usage` above already accounts for the whole region, which is
@@ -613,9 +576,8 @@ impl SweepRegistry {
         // identically without needing a separate stored "explicit arm" field.
         // Kept in the free-form `config` map (not a new top-level schema field)
         // so this is additive per #4703 with no schema-version bump. Inference
-        // stays faithful under #4827's per-issue complexity stratification: the
-        // stratum only shifts WHICH arm an issue lands in, never the arm →
-        // model mapping this reads back.
+        // stays faithful because it reads back the arm → model mapping
+        // itself, whichever arm an issue was assigned.
         if let Some(arm) =
             crate::script_helpers::sweep_experiment::infer_arm_from_model(model.as_deref())
         {
@@ -680,7 +642,7 @@ impl SweepRegistry {
         //
         // The two branches differ ONLY in how far resolution may reach:
         // `skip_label_flip` gates every forge read at this site (timeline,
-        // complexity), so it keeps that property and resolves from the local
+        // issue signals), so it keeps that property and resolves from the local
         // `LOOM_REPO` override alone; the normal branch also asks `gh repo
         // view` (breaker-gated, fail-open). Visibility stays Private under
         // `skip_label_flip`, exactly as before.
@@ -807,6 +769,11 @@ impl SweepRegistry {
             .start_facts
             .get(sweep_id)
             .and_then(|facts| facts.dispatch_origin.clone());
+        // 2am#4393: the draw that chose this sweep's tap, from the same facts.
+        let role_draw = self
+            .start_facts
+            .get(sweep_id)
+            .and_then(|facts| facts.role_draw.clone());
         let (attempt_index, previous_sweep_id, trigger) =
             if let Some(facts) = self.start_facts.get(sweep_id) {
                 (facts.attempt_index, facts.previous_sweep_id.clone(), facts.trigger.clone())
@@ -954,19 +921,18 @@ impl SweepRegistry {
             (Some(signals.doctor_cycles), Some(signals.judge_verdicts))
         });
 
-        // Curator complexity tier (Issue #8542) plus the issue's own end state
-        // (Issue #9441), read off the sweep's own issue in ONE REST call — see
+        // The issue's own end state (Issue #9441) and `points:*` labels (Issue
+        // #9432), read off the sweep's own issue in ONE REST call — see
         // `complexity_signal`'s module doc for why this is a separate forge
         // read from the PR timeline above rather than a dispatch-time plumb,
         // why the two signals share one call, and their identical fail-open
         // contract.
         let issue_signals = self.fetch_issue_signals(issue);
-        let complexity = issue_signals.complexity.clone();
         let issue_end_state = issue_signals.end_state(started_at);
         // The Curator's story-point size (Issue #9432, epic #9429), folded out
         // of the SAME read's label list — no extra forge round trip, and the
-        // estimate can never describe a different issue than `complexity` and
-        // the end state do. Pure label folding with the one-label-per-issue
+        // estimate can never describe a different issue than the
+        // end state does. Pure label folding with the one-label-per-issue
         // guard: absent, out-of-vocabulary and stacked points labels all yield
         // `None` (the last two logged loudly), never a guessed or zero size.
         let story_points = issue_signals.story_points(issue);
@@ -1043,13 +1009,13 @@ impl SweepRegistry {
                 .as_ref()
                 .and_then(|r| r.provider.clone()),
             profile: runtime_attribution.as_ref().and_then(|r| r.profile.clone()),
-            complexity,
             story_points,
             tokens_status: Some(tokens_status),
             attempt_index,
             previous_sweep_id,
             trigger,
             dispatch_origin,
+            role_draw,
             rework_events,
             pr_numbers,
             hw_lines_added: landing_size.as_ref().map(|size| size.hw_lines_added),
@@ -1059,6 +1025,9 @@ impl SweepRegistry {
             test_lines: landing_size.as_ref().map(|size| size.test_lines),
             tokens_status_reason,
             no_phase_cause,
+            phase_tap_usage: crate::telemetry::phase_tap_usage::rows_from(
+                &tap_region.phase_workers,
+            ),
         };
         // Issue #9441: both disposition invariants hold on every record this
         // daemon writes. A debug assertion rather than a runtime guard — the
@@ -1076,13 +1045,15 @@ impl SweepRegistry {
         // Issue #9056: opt-in, post-`Success`-only issue write-back comment.
         // Only a clone of the assembled record is taken HERE (`outcome_record`
         // itself moves into the telemetry envelope below); every forge call —
-        // the idempotency read, the points read, and the post — runs strictly
+        // the idempotency read and the post — runs strictly
         // AFTER the durable local writes at the end of this function, so a
         // slow or hung `gh` can never delay (or, via a daemon restart in that
         // window, lose) the `sweep.outcome` record. See `writeback`'s module
         // doc for the full fail-open contract.
-        let writeback_record =
-            (process_result == telemetry::SweepResult::Success).then(|| outcome_record.clone());
+        // #11743: and only on an issue the same read shows is not frozen.
+        let writeback_record = (process_result == telemetry::SweepResult::Success
+            && writeback::writeback_admitted(issue, &issue_signals))
+        .then(|| outcome_record.clone());
         let result_name = serde_json::to_value(result)
             .ok()
             .and_then(|v| v.as_str().map(str::to_owned))
@@ -1191,7 +1162,13 @@ impl SweepRegistry {
         );
         envelope.trace_context = trace_context;
         let path = self.config.resolve_outcome_telemetry_path();
-        if let Err(e) = sweep_outcomes::append_outcome_telemetry(&path, &envelope) {
+        // #11348: shadow into the J2 `sweep` stream only after this succeeds.
+        if let Err(e) = telemetry::journal_shadow::after_legacy(
+            &self.config.workspace_root,
+            telemetry::journal_shadow::TelemetryStream::Sweep,
+            || sweep_outcomes::append_outcome_telemetry(&path, &envelope),
+            |()| telemetry::journal_shadow::ShadowRecord::from_envelope(&envelope),
+        ) {
             log::warn!(
                 "sweep_outcomes: failed to append sweep.outcome telemetry record for issue \
                  #{issue} ({sweep_id}) at {}: {e} — best-effort, not blocking reap (#4704)",
@@ -1282,22 +1259,14 @@ impl SweepRegistry {
         }
 
         let pr_number = read_checkpoint_pr_number(&checkpoint);
-        // Issue #8543: sampled on the same per-tick read as `pr_number`, for
-        // the identical reason — the checkpoint is gone by the time a
-        // successful sweep's terminal record is written.
-        let jev = read_checkpoint_jev(&checkpoint);
         let history = self.phase_history.entry(sweep_id.to_string()).or_default();
         if history.last().map(|o| o.phase.as_str()) == Some(phase.as_str()) {
             // Unchanged phase since the previous tick — the common case. Still
-            // absorb a `pr_number`/`jev` pair that appeared after the
-            // transition was first observed, so a PR opened (or a Tier-2.5
-            // Jev call completed) mid-phase is not lost.
+            // absorb a `pr_number` that appeared after the transition was
+            // first observed, so a PR opened mid-phase is not lost.
             if let Some(last) = history.last_mut() {
                 if last.pr_number.is_none() {
                     last.pr_number = pr_number;
-                }
-                if last.jev.is_none() {
-                    last.jev = jev;
                 }
             }
             return;
@@ -1316,8 +1285,9 @@ impl SweepRegistry {
             phase: phase.clone(),
             at: Utc::now(),
             pr_number,
-            jev,
         });
+        let stage_attempt =
+            super::work_started::stage_attempt(&phase, history.iter().map(|o| o.phase.as_str()));
         // Genuine transition — publish it (see the "Bus emission" doc section
         // above). Ordered after the history push so the dedupe state is already
         // committed even if a subscriber panics on delivery.
@@ -1327,6 +1297,15 @@ impl SweepRegistry {
             pr_number: pr_number.and_then(|n| i32::try_from(n).ok()),
             repo: None, // stamped by emit_event (#3929)
         });
+        // #11641: the role this marker hands the item to began now.
+        self.emit_work_started(
+            sweep_id,
+            *issue,
+            Some(&phase),
+            super::work_started::read_checkpoint_timestamp(&checkpoint),
+            pr_number,
+            stage_attempt,
+        );
     }
 
     /// The most recent `pr_number` observed on this sweep's checkpoint (Issue
@@ -1355,19 +1334,6 @@ impl SweepRegistry {
             }
         }
         (!seen.is_empty()).then_some(seen)
-    }
-
-    /// The most recent `(jev_tier, jev_confidence)` pair observed on this
-    /// sweep's checkpoint (Issue #8543), or `None` when no Tier-2.5 Jev call
-    /// was ever sampled (no `TYPESAFE_API_KEY`, or the call failed/never
-    /// completed). Free (no forge/network call), mirrors
-    /// [`Self::sampled_pr_number`] exactly.
-    pub(crate) fn sampled_jev(&self, sweep_id: &str) -> Option<(String, f64)> {
-        self.phase_history
-            .get(sweep_id)?
-            .iter()
-            .rev()
-            .find_map(|o| o.jev.clone())
     }
 
     /// The most recently opportunistically-sampled `(lines_added,
@@ -1569,7 +1535,7 @@ mod phase_usage_tests;
 )]
 mod tap_usage_tests;
 
-// End-to-end tests for the #8542 complexity-marker sourcing, in their own
+// End-to-end tests for the issue-signal sourcing (`story_points`), in their own
 // sibling file for the same file-size reason as `timeline_tests` above.
 #[cfg(test)]
 #[allow(
@@ -1582,7 +1548,7 @@ mod complexity_tests;
 
 // End-to-end tests for the #9056 issue write-back (posting, idempotency, the
 // `Success`-only gate), in their own sibling file for the same file-size
-// reason as `timeline_tests` above. `points_signal` and `writeback`'s own
+// reason as `timeline_tests` above. `writeback`'s own
 // pure/unit tests live inline in those modules instead.
 #[cfg(test)]
 #[allow(
@@ -1629,3 +1595,9 @@ mod tokens_status_tests;
     unused_imports
 )]
 mod pr_link_tests;
+
+// #11348: the T1 call site shadows into the J2 `sweep` stream only after the
+// legacy `sweep.outcome` append succeeded, and never when disabled.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod shadow_tests;

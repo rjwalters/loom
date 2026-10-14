@@ -1,5 +1,7 @@
 //! Issue #10977: the OTLP resource carries `host.name` on every signal.
 
+use opentelemetry_proto::tonic::resource::v1::Resource;
+
 use super::*;
 use crate::telemetry::trace::{SpanName, SpanRecord, SpanStatus, TraceAttributes, TraceContext};
 
@@ -61,7 +63,9 @@ fn host_name_is_the_host_id_on_logs_metrics_and_traces() {
                 "service.instance.id",
                 "host.id",
                 "host.name",
-                "service.version"
+                "service.version",
+                "loom.daemon.revision",
+                "loom.fleet.config_sha"
             ],
             "{signal}: resource key set"
         );

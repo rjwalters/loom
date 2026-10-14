@@ -118,7 +118,7 @@ This role is designed for **autonomous operation** with a recommended interval o
 
 ### Autonomous Behavior
 
-When running autonomously, follow `champion.md` → "Autonomous Operation": the PR queue is drained every pass (no numeric cap on merges), but it pauses after its slice so promotion runs every pass even while PRs remain (#10753). Promotion stays within `champion-issue-promo.md`'s tier caps (Tier 1 unlimited; Tier 2/3 per-pass caps and the Tier 3 backlog cap are env vars, defaults 2/1/5). The capped-PR recovery pass (Priority 5, `champion-pr-merge.md` §"Capped-PR Recovery Pass") runs once no promotion work remains. Then report results and stop.
+When running autonomously, follow `champion.md` → "Autonomous Operation": the PR queue is drained every pass (no numeric cap on merges), but it pauses after its slice so promotion runs every pass even while PRs remain (#10753). Promotion stays within `champion-issue-promo.md`'s per-level caps (`loom:very-important` and `loom:important` unlimited; no-level promotions capped per pass by `LOOM_CHAMPION_TIER2_CAP`, default 2; no backlog gate). The capped-PR recovery pass (Priority 5, `champion-pr-merge.md` §"Capped-PR Recovery Pass") runs once no promotion work remains. Then report results and stop.
 
 ### Quality Over Quantity
 
@@ -258,7 +258,8 @@ discover_epic_children() {
   # (a) phase-marker children — the historical source (champion-epic.md Step 3).
   local a
   # `gh --jq` takes only an expression (no `--arg`), so the marker — digits and
-  # literals only — is interpolated into the program directly.
+  # literals only — is interpolated into the program directly. Includes
+  # loom:frozen children (discovery, not work).
   a=$(${GH_READ:-gh} issue list --repo "$repo" --label="loom:epic-phase" --state=all --limit=500 \
     --json number,state,body \
     --jq "[.[] | select(.body | contains(\"$marker\")) | {number, state}]" 2>/dev/null || echo '[]')

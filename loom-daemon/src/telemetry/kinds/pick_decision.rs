@@ -166,7 +166,6 @@ impl PickSkipReason {
             Qd::DeferredCapacity
             | Qd::DeferredRampCap
             | Qd::DeferredSaturation
-            | Qd::DeferredOutOfSlice
             | Qd::DeferredRepoCap => Self::Cap,
             Qd::DeferredFileOverlap => Self::OverlapChain,
             Qd::DeferredBuildBackoff
@@ -243,17 +242,26 @@ pub struct PickSkip {
 pub struct PickDrawCandidate {
     /// Forge `owner/repo`, or `repo_unresolved`.
     pub repo: String,
-    /// Its draw weight (from the workspace's `fleet_priority`).
+    /// Its effective draw weight: `base_weight + bonus` (#11742). The draw
+    /// picked it with probability `weight / total_weight`. (Records from
+    /// before #11742 carry a softmax weight here, on a 1,000,000 scale.)
     pub weight: u64,
+    /// The workspace's roster `weight` (#11742). Absent on older records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_weight: Option<u32>,
+    /// The bonus points it earned for a verified red-main fix,
+    /// `loom:very-important` or `loom:important` work (#11742). Absent on
+    /// older records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bonus: Option<u64>,
 }
 
 /// One weighted workspace draw of the work finder (#11103).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PickDraw {
-    /// `very-important` when only workspaces with `loom:very-important` work
-    /// next were drawn over, `all` otherwise.
-    pub pool: String,
-    /// The workspaces drawn over, with weights.
+    /// The workspaces drawn over, with weights. (Records from before #11742
+    /// also carry a `pool` tier and a `p_min`; both are retired and ignored
+    /// when read.)
     pub candidates: Vec<PickDrawCandidate>,
     /// Sum of the weights.
     pub total_weight: u64,
@@ -276,6 +284,20 @@ pub struct PickWorkspaceDraw {
     pub draws_total: usize,
     /// Every draw, in order.
     pub draws: Vec<PickDraw>,
+    /// How `seed` was derived (#11683): `loom-draw/v1` when it is
+    /// [`minute_seed`](crate::work_finder::workspace_draw::minute_seed) of
+    /// `seed_minute` and `seed_host`. Absent when the seed was pinned (tests)
+    /// or the record predates #11683.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_scheme: Option<String>,
+    /// The wall-clock minute (`floor(unix_utc_secs / 60)`) the seed was
+    /// derived from, as decimal text like `seed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_minute: Option<String>,
+    /// The host id the seed was derived from (the same value as the record's
+    /// `host`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_host: Option<String>,
 }
 
 /// A `loom:very-important` issue the flood cap ranked as `loom:important`
@@ -484,7 +506,8 @@ enum PickChunkEntry {
 /// chunk, unchanged but for `chunk_index: 0, chunk_count: 1`, when it fits).
 /// Every chunk repeats the header (`role`, `host`, `tick_id`, the tick
 /// bounds, `outcome`, `candidates_total`, `candidate_source`,
-/// `decisions_observed`, and `workspace_draw.seed` / `draws_total`); the
+/// `decisions_observed`, and `workspace_draw.seed` / `draws_total` /
+/// `seed_scheme` / `seed_minute` / `seed_host`); the
 /// `candidates`, `skipped`, `acted`, `workspace_draw.draws` and
 /// `very_important_demoted` entries are packed in order, so concatenating the
 /// chunks' lists in `chunk_index` order reproduces `record` exactly: nothing
@@ -556,6 +579,9 @@ pub fn split_into_chunks(record: PickDecisionRecord, max_bytes: usize) -> Vec<Pi
                     seed: String::new(),
                     draws_total: 0,
                     draws: Vec::new(),
+                    seed_scheme: None,
+                    seed_minute: None,
+                    seed_host: None,
                 })
                 .draws
                 .push(d),

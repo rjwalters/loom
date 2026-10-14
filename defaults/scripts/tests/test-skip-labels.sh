@@ -169,7 +169,7 @@ missing=""
 while IFS= read -r label; do
     [[ -z "$label" ]] && continue
     [[ "$json_out" == *"\"$label\""* ]] || missing+=" json:$label"
-    [[ "$jqnot_out" == *"contains([\"$label\"])"* ]] || missing+=" jq-not:$label"
+    [[ "$jqnot_out" == *"== \"$label\")"* ]] || missing+=" jq-not:$label"
     [[ "$search_out" == *"-label:\"$label\""* ]] || missing+=" search:$label"
 done <<< "$journal_out"
 
@@ -183,16 +183,17 @@ fi
 if command -v jq >/dev/null 2>&1; then
     payload='[
       {"number":1,"labels":[{"name":"loom:triage"}]},
-      {"number":582,"labels":[{"name":"journal"}]}
+      {"number":582,"labels":[{"name":"journal"}]},
+      {"number":11366,"labels":[{"name":"journal-archive"}]}
     ]'
     kept="$(printf '%s' "$payload" | jq -r ".[] | select($jqnot_out) | .number" 2>&1)"
     jq_rc=$?
     if [[ "$jq_rc" -ne 0 ]]; then
         fail "--jq-not is not a valid jq expression: $jqnot_out ($kept)"
-    elif [[ "$kept" == "1" ]]; then
-        pass "--jq-not keeps the ordinary issue and drops the journal one (2am#625 case)"
+    elif [[ "$kept" == $'1\n11366' ]]; then
+        pass "--jq-not drops the journal issue (2am#625) and keeps journal-archive (#11366: exact, not substring)"
     else
-        fail "expected only #1 to survive the --jq-not filter, got: $kept"
+        fail "expected #1 and #11366 to survive the --jq-not filter, got: $kept"
     fi
 else
     echo "note: jq not installed — skipping the fragment-validity check" >&2
@@ -217,7 +218,7 @@ fi
 
 # --- 7. #8911: EVERY builder.md find-work tier applies the skip set -----
 # #8255 wired the filter into the fallback tier only, so an issue carrying a
-# configured skip label AND a higher-priority label (the star, loom:curated)
+# configured skip label AND a higher-priority label (a priority level, loom:curated)
 # was still offered — from the HIGHEST tier. Each tier's fenced block is run
 # verbatim here (cwd = fixture repo, the real skip-labels.sh behind the
 # `./.loom/scripts/` path the block names, a fake `gh` that ANDs `--label`
@@ -306,7 +307,7 @@ EOF
     }
     sorted() { printf '%s\n' "$@" | sort -n | tr '\n' ' '; }
 
-    if [[ "$(wc -w <<<"$levels")" -ge 3 ]]; then
+    if [[ "$(wc -w <<<"$levels")" -ge 2 ]]; then
         pass "Step 1 iterates $(wc -w <<<"$levels" | tr -d ' ') priority-level labels"
     else
         fail "could not read Step 1's priority-level list from builder.md: '$levels'"
@@ -315,7 +316,7 @@ EOF
     {
         # Configured repo: the skip-labeled twin never survives, in ANY tier.
         expect_tier 1 "$JOURNAL_REPO" "$(sorted $star_plain)" \
-            "tier 1: a starred issue with a configured skip label is dropped, at every level (AC2)"
+            "tier 1: a priority issue with a configured skip label is dropped, at every level (AC2)"
         expect_tier 2 "$JOURNAL_REPO" "$(sorted ${cur}1)" \
             "tier 2: a curated issue with a configured skip label is dropped (AC3)"
         expect_tier 3 "$JOURNAL_REPO" "$(sorted $star_plain ${bare}1)" \

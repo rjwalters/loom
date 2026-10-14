@@ -32,9 +32,33 @@ fn t2_an_open_issue_keeps_its_live_claim() {
 #[test]
 fn t3_closed_without_the_label_is_idempotent() {
     assert_eq!(
-        plan_for(r#"{"state":"closed","labels":[{"name":"loom:issue"}]}"#),
+        plan_for(r#"{"state":"closed","labels":[{"name":"enhancement"}]}"#),
         Plan::Skip(Skip::NotBuilding)
     );
+}
+
+/// #11517 (operator ruling 2026-10-13, option a): a closed issue also loses
+/// `loom:issue`; an open one keeps both; a PR is never touched.
+#[test]
+fn a_closed_issue_loses_loom_issue_too() {
+    assert_eq!(
+        plan_for(r#"{"state":"closed","labels":[{"name":"loom:issue"}]}"#),
+        Plan::StripReady
+    );
+    assert_eq!(
+        plan_for(r#"{"state":"closed","labels":[{"name":"loom:issue"},{"name":"loom:building"}]}"#),
+        Plan::StripBoth
+    );
+    assert_eq!(
+        plan_for(r#"{"state":"open","labels":[{"name":"loom:issue"}]}"#),
+        Plan::Skip(Skip::NotClosed)
+    );
+    assert_eq!(
+        plan_for(r#"{"state":"closed","pull_request":{},"labels":[{"name":"loom:issue"}]}"#),
+        Plan::Skip(Skip::IsPullRequest)
+    );
+    assert_eq!(render(Plan::StripReady), "STRIP-READY\n");
+    assert_eq!(render(Plan::StripBoth), "STRIP-BOTH\n");
 }
 
 #[test]
@@ -55,7 +79,7 @@ fn t5_other_labels_do_not_change_the_decision() {
     // decision is all this side owns: it must still be Strip.
     assert_eq!(
         plan_for(
-            r#"{"state":"closed","labels":[{"name":"loom:building"},{"name":"tier:maintenance"}]}"#
+            r#"{"state":"closed","labels":[{"name":"loom:building"},{"name":"enhancement"}]}"#
         ),
         Plan::Strip
     );

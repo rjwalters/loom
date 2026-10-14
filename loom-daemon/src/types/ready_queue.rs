@@ -4,11 +4,10 @@
 //! backoff-skip, 2 deferred-capacity"); these rows say *which* issue got
 //! *which* outcome, in the order the work finder actually ranks them. The
 //! order is the daemon's own dispatch comparator,
-//! `crate::work_finder::candidate_cmp` (#9244): `loom:operator-priority`
-//! (starred) first, starred issues by starred-at, then red-main fixes (only
-//! while that repo's `main` is verified red), then workspace priority, then
-//! oldest `createdAt`, then issue number. `tier:*` labels do not affect
-//! dispatch order.
+//! `crate::work_finder::candidate_cmp` (#11103, #11547): verified red-main
+//! fixes first (only while that repo's `main` is verified red), then
+//! priority level (`loom:very-important`, `loom:important`, none), then
+//! oldest `createdAt`, then issue number.
 
 use serde::{Deserialize, Serialize};
 
@@ -33,12 +32,9 @@ pub enum QueueDisposition {
     /// Waiting: the saturation admission brake held new admissions.
     DeferredSaturation,
     /// Waiting: the build back-off (#9410) held new issue builds because the
-    /// host's review + merge debt is high. Starred and red-main-fix issues
-    /// bypass it, so this row is always an unstarred issue.
+    /// host's review + merge debt is high. A verified red-main fix bypasses
+    /// it, so this row is never one.
     DeferredBuildBackoff,
-    /// Waiting: outside this host's preferred repo slice while the slice still
-    /// had work (repo sharding, #6243).
-    DeferredOutOfSlice,
     /// Waiting: its own repo already held `maxConcurrentPerRepo` of the shared
     /// concurrency budget's slots (#9090). The machine-level cap was NOT full;
     /// the slot went to another repo's candidate in the same tick.
@@ -93,7 +89,9 @@ pub enum QueueDisposition {
     /// `queue.snapshot`, added by the collector from its own cached forge
     /// read; never a tick outcome, so it is not in [`Self::ALL`].
     LabelledBlocked,
-    /// A disposition this client does not know (forward compatibility).
+    /// A disposition this client does not know (forward compatibility). This
+    /// includes `deferred_out_of_slice`, retired with the dispatch slice
+    /// (#11682) and never emitted since.
     #[serde(other)]
     Unknown,
 }
@@ -103,14 +101,13 @@ impl QueueDisposition {
     /// ([`Self::LabelledBlocked`] and [`Self::Unknown`] excluded). The queue-depth metrics (Issue #8852, phase 2) emit one
     /// point per entry every tick, zeros included, so an empty queue reads as
     /// `0` rather than as a missing series.
-    pub const ALL: [Self; 26] = [
+    pub const ALL: [Self; 25] = [
         Self::Dispatched,
         Self::InFlight,
         Self::DeferredCapacity,
         Self::DeferredRampCap,
         Self::DeferredSaturation,
         Self::DeferredBuildBackoff,
-        Self::DeferredOutOfSlice,
         Self::DeferredRepoCap,
         Self::DeferredFileOverlap,
         Self::WorkspaceHalted,
@@ -143,7 +140,6 @@ impl QueueDisposition {
             Self::DeferredRampCap => "deferred_ramp_cap",
             Self::DeferredSaturation => "deferred_saturation",
             Self::DeferredBuildBackoff => "deferred_build_backoff",
-            Self::DeferredOutOfSlice => "deferred_out_of_slice",
             Self::DeferredRepoCap => "deferred_repo_cap",
             Self::DeferredFileOverlap => "deferred_file_overlap",
             Self::WorkspaceHalted => "workspace_halted",
@@ -179,7 +175,6 @@ impl QueueDisposition {
             | Self::DeferredRampCap
             | Self::DeferredSaturation
             | Self::DeferredBuildBackoff
-            | Self::DeferredOutOfSlice
             | Self::DeferredRepoCap
             | Self::DeferredFileOverlap => "ready",
             _ => "blocked",
@@ -196,7 +191,6 @@ impl QueueDisposition {
             Self::DeferredRampCap => "waiting: per-tick admission cap reached",
             Self::DeferredSaturation => "waiting: host saturated (admission brake)",
             Self::DeferredBuildBackoff => "waiting: build back-off (review/merge debt high)",
-            Self::DeferredOutOfSlice => "waiting: outside this host's repo slice",
             Self::DeferredRepoCap => "waiting: this repo is at its per-repo cap",
             Self::DeferredFileOverlap => "waiting: affected files overlap in-flight work",
             Self::WorkspaceHalted => {
@@ -233,29 +227,29 @@ pub struct ReadyQueueRow {
     pub repo: String,
     /// The issue number.
     pub issue: u32,
-    /// The owning workspace's priority tier (lower dispatches first).
-    pub workspace_priority: u32,
+    /// The owning workspace's draw weight (#11742; higher is drawn more).
+    /// Absent from an older daemon's rows (which sent `workspace_priority`,
+    /// a tier in the opposite direction, deliberately not aliased): 0.
+    #[serde(default)]
+    pub workspace_weight: u32,
     /// Deprecated (#9244): always `false`. Its label was deleted in #11105;
     /// the field stays on the wire only for compatibility.
     pub urgent: bool,
-    /// Deprecated (#11508): always `false`. The star (#9244) is no longer an
-    /// ordering key; the row's level is its plan `keys` entry `level`. The
-    /// field stays on the wire only for compatibility.
+    /// The issue's priority level (#11103, #11510): `default`, `important`
+    /// or `very-important`, from its own `loom:important` /
+    /// `loom:very-important` label after the very-important cap (#11509).
+    /// Absent (an older daemon) reads as `default`.
     #[serde(default)]
-    pub operator_priority: bool,
+    pub level: crate::priority_pick::Level,
     /// Whether it is a verified red-main fix this tick: it carries
     /// `<!-- loom:main-red-fix -->` and its repo's `main` is verified red
     /// (#9244). Since #11508 it is not an ordering key; it only bypasses the
-    /// build back-off, the file-overlap gate and the repo-sharding slice.
+    /// build back-off and the file-overlap gate.
     #[serde(default)]
     pub main_red_fix: bool,
     /// The issue's `createdAt`, when the listing supplied it.
     #[serde(default)]
     pub created_at: Option<String>,
-    /// The issue's `tier:*` label, if any. Informational only: the work
-    /// finder does not order by it.
-    #[serde(default)]
-    pub tier: Option<String>,
     /// The issue's resolved story-point size (#9432, from its single
     /// `points:*` label), when the listing supplied a legal one (Issue
     /// #9674). `None` for an unsized issue, a stacked/out-of-vocabulary
@@ -278,7 +272,8 @@ pub struct ReadyQueueRow {
     #[serde(default)]
     pub reason: String,
     /// The dispatch-plan fields (Issue #9288): `position`, `plan_state`,
-    /// `keys`, `gate`, `in_slice`, `hot`, `owning_shard`, `repo_cap`.
+    /// `keys`, `gate`, `hot`, `owning_shard`, `repo_cap` (`in_slice` is
+    /// retired and absent since #11682).
     /// Flattened, so they sit beside `rank` on the wire; all default when
     /// absent.
     #[serde(flatten, default)]
@@ -293,11 +288,15 @@ mod tests {
     #[test]
     fn unknown_disposition_parses_instead_of_failing() {
         let row: ReadyQueueRow = serde_json::from_value(serde_json::json!({
-            "rank": 1, "repo": "/r", "issue": 7, "workspace_priority": 100,
+            "rank": 1, "repo": "/r", "issue": 7, "workspace_weight": 100,
             "urgent": false, "disposition": "some_future_reason"
         }))
         .unwrap();
         assert_eq!(row.disposition, QueueDisposition::Unknown);
+        // Retired with the dispatch slice (#11682): a historical record still parses.
+        let retired: QueueDisposition =
+            serde_json::from_value(serde_json::json!("deferred_out_of_slice")).unwrap();
+        assert_eq!(retired, QueueDisposition::Unknown);
         assert_eq!(row.created_at, None);
         // A pre-phase-2 payload has no `state`/`reason`: they default empty.
         assert!(row.state.is_empty() && row.reason.is_empty());
@@ -312,7 +311,7 @@ mod tests {
     #[test]
     fn plan_fields_flatten_and_old_summaries_parse() {
         let row: ReadyQueueRow = serde_json::from_value(serde_json::json!({
-            "rank": 4, "repo": "/r", "issue": 7, "workspace_priority": 100,
+            "rank": 4, "repo": "/r", "issue": 7, "workspace_weight": 100,
             "urgent": false, "disposition": "deferred_capacity",
             "position": 2, "plan_state": "next", "gate": "capacity",
             "keys": [{"name": "number", "value": 7}]
@@ -352,7 +351,7 @@ mod tests {
     #[test]
     fn build_backoff_disposition_round_trips_and_old_summaries_parse() {
         let d = QueueDisposition::DeferredBuildBackoff;
-        assert_eq!(QueueDisposition::ALL.len(), 26);
+        assert_eq!(QueueDisposition::ALL.len(), 25);
         assert!(QueueDisposition::ALL.contains(&d));
         let json = serde_json::to_value(d).unwrap();
         assert_eq!(json, serde_json::json!("deferred_build_backoff"));

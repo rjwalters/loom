@@ -167,6 +167,9 @@ pub mod checkout_external_change;
 /// `host.export` (#11124).
 pub mod host_export;
 
+/// `operator.presence` (#11563) — an operator session's keyboard presence.
+pub mod operator_presence;
+
 /// `pass.summary` / `pass.verdict` (#10752) — what a pass over artifacts did.
 pub mod pass;
 
@@ -184,8 +187,12 @@ pub mod session_output;
 
 /// `fleet.state` (#10196) — in-flight items and open-PR census over OTLP.
 pub mod fleet_state;
+pub mod issue_estimate;
 /// `token_ranking.refresh` (#10744) — one token-ranking refresh round.
 pub mod token_ranking_refresh;
+
+/// `stage.work_started` (#11641) — a role agent began working an item in a stage.
+pub mod work_started;
 
 /// The export-coverage pair `(exporters, exported_kinds)` for `host.health`
 /// (Issue #10196), derived from the per-exporter status map
@@ -434,10 +441,28 @@ macro_rules! telemetry_kind_table {
             HostExport = "host.export" => $crate::telemetry::kinds::host_export::HostExportRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
+            /// An operator session's presence beat (Issue #11563): who is at the
+            /// keyboard (`last_input_at`), when the session last did anything,
+            /// and which issues and PRs it is driving. No prompt or transcript
+            /// content exists in the record. Exported over OTLP (the `loom.presence.*`
+            /// scalars ride as attributes; the body is the record's JSON) now that
+            /// #11525 settled the transport — the same path as every other fact.
+            /// See [`operator_presence`].
+            OperatorPresence = "operator.presence" => $crate::telemetry::kinds::operator_presence::OperatorPresenceRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
             /// A managed checkout's history was moved by something other than
             /// Loom (Issue #11566): the reflog entry, from/to sha and the commits
             /// it made unreachable. OTLP-only. See [`checkout_external_change`].
             CheckoutExternalChange = "checkout.external_change" => $crate::telemetry::kinds::checkout_external_change::CheckoutExternalChangeRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// One curation completion's blind difficulty estimate (#11608).
+            IssueEstimate = "issue.estimate" => $crate::telemetry::kinds::issue_estimate::IssueEstimateRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// A role agent began working an item in a stage (#11641): the
+            /// work-start that splits a stay into queue wait and work time.
+            WorkStarted = "stage.work_started" => $crate::telemetry::kinds::work_started::WorkStartedRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             // APPEND NEW KINDS ABOVE THIS LINE (one row; `gate:` stays

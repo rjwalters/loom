@@ -61,18 +61,17 @@ fn bound(max: Option<u32>) -> BackstopCeiling {
     BackstopCeiling {
         max_concurrent: max,
         applies_from: DEFAULT_APPLIES_FROM,
-        min_complexity: None,
     }
 }
 
 fn admit_one(ceiling: &BackstopCeiling) -> Verdict {
-    admit(ceiling, "builder", &Tap::runtime("opencode"), Some("complex"), Intent::Dispatch)
+    admit(ceiling, "builder", &Tap::runtime("opencode"), Intent::Dispatch)
 }
 
 /// The same question asked the way `work_finder::pool_preflight` asks it every
 /// tick: decide, but take nothing.
 fn probe_one(ceiling: &BackstopCeiling) -> Verdict {
-    admit(ceiling, "builder", &Tap::runtime("opencode"), Some("complex"), Intent::Probe)
+    admit(ceiling, "builder", &Tap::runtime("opencode"), Intent::Probe)
 }
 
 // ---------------------------------------------------------------------------
@@ -111,7 +110,7 @@ fn a_configured_ceiling_parses_every_key() {
     std::env::remove_var(MAX_CONCURRENT_ENV);
     let config = serde_json::json!({
         "runtimes": {
-            "backstopCeiling": {"maxConcurrent": 3, "appliesFrom": 2, "minComplexity": "complex"}
+            "backstopCeiling": {"maxConcurrent": 3, "appliesFrom": 2}
         }
     });
     assert_eq!(
@@ -119,7 +118,6 @@ fn a_configured_ceiling_parses_every_key() {
         Some(BackstopCeiling {
             max_concurrent: Some(3),
             applies_from: 2,
-            min_complexity: Some(ComplexityTier::Complex),
         })
     );
     // `appliesFrom` is what keeps a flat-rate tier 1 (a Codex seat) out of the
@@ -147,7 +145,6 @@ fn the_env_override_outranks_the_configured_count_and_can_create_one() {
         BackstopCeiling {
             max_concurrent: Some(1),
             applies_from: DEFAULT_APPLIES_FROM,
-            min_complexity: None,
         }
     );
     // Junk is ignored in favour of the configured value rather than silently
@@ -167,7 +164,7 @@ fn the_env_override_outranks_the_configured_count_and_can_create_one() {
 fn malformed_ceiling_config_fails_closed() {
     let prior = std::env::var_os(MAX_CONCURRENT_ENV);
     std::env::remove_var(MAX_CONCURRENT_ENV);
-    let cases: [(serde_json::Value, &str); 6] = [
+    let cases: [(serde_json::Value, &str); 5] = [
         (serde_json::json!({"runtimes": {"backstopCeiling": 2}}), "must be an object"),
         (
             serde_json::json!({"runtimes": {"backstopCeiling": {"maxConcurent": 2}}}),
@@ -182,12 +179,9 @@ fn malformed_ceiling_config_fails_closed() {
             "must be >= 1",
         ),
         (
-            serde_json::json!({"runtimes": {"backstopCeiling": {"minComplexity": "hard"}}}),
-            "one of mechanical, routine, complex",
-        ),
-        (
-            serde_json::json!({"runtimes": {"backstopCeiling": {"minComplexity": 3}}}),
-            "must be a string",
+            // #11665: the retired key is unknown, so it fails closed naming itself.
+            serde_json::json!({"runtimes": {"backstopCeiling": {"minComplexity": "complex"}}}),
+            "minComplexity",
         ),
     ];
     for (config, expected) in cases {
@@ -327,66 +321,6 @@ fn a_zero_ceiling_refuses_everything_without_touching_the_store() {
     assert_eq!(reason.kind(), "ceiling-at-capacity");
     assert!(reason.summary().contains("switched off"), "{}", reason.summary());
     assert!(!store.path().exists(), "a zero ceiling must not create the store");
-}
-
-/// An eligibility filter, not a count: low-value work never reaches the
-/// metered tap at all, and an unmarked issue counts as `routine` (the same
-/// default the rest of the daemon applies).
-#[test]
-#[serial_test::serial]
-fn the_complexity_filter_excludes_work_below_the_configured_tier() {
-    let _store = Store::new();
-    let ceiling = BackstopCeiling {
-        max_concurrent: Some(4),
-        applies_from: DEFAULT_APPLIES_FROM,
-        min_complexity: Some(ComplexityTier::Complex),
-    };
-    let tap = Tap::runtime("opencode");
-    for low in [Some("routine"), Some("mechanical"), None, Some("bogus")] {
-        let Verdict::Refused(reason) = admit(&ceiling, "builder", &tap, low, Intent::Dispatch)
-        else {
-            panic!("{low:?} must not reach the metered tap under minComplexity=complex");
-        };
-        assert_eq!(reason.kind(), "ceiling-ineligible");
-        assert!(reason.summary().contains("complex"), "{}", reason.summary());
-    }
-    assert!(matches!(
-        admit(&ceiling, "builder", &tap, Some("complex"), Intent::Dispatch),
-        Verdict::Admitted(Some(_))
-    ));
-    // An unmarked dispatch is `routine`, which a `routine` minimum admits.
-    let routine_minimum = BackstopCeiling {
-        min_complexity: Some(ComplexityTier::Routine),
-        ..ceiling
-    };
-    assert!(matches!(
-        admit(&routine_minimum, "builder", &tap, None, Intent::Dispatch),
-        Verdict::Admitted(Some(_))
-    ));
-}
-
-/// A filter with no count bounds eligibility only — no slot is taken and the
-/// store is never created.
-#[test]
-#[serial_test::serial]
-fn an_eligibility_only_ceiling_takes_no_slot() {
-    let store = Store::new();
-    let ceiling = BackstopCeiling {
-        max_concurrent: None,
-        applies_from: DEFAULT_APPLIES_FROM,
-        min_complexity: Some(ComplexityTier::Routine),
-    };
-    assert!(matches!(
-        admit(
-            &ceiling,
-            "builder",
-            &Tap::runtime("opencode"),
-            Some("complex"),
-            Intent::Dispatch
-        ),
-        Verdict::Admitted(None)
-    ));
-    assert!(!store.path().exists());
 }
 
 /// `work_finder::pool_preflight` re-resolves every tick for every workspace to

@@ -146,6 +146,13 @@ SELECT
        attributes_string['loom.previous_sweep_id'], NULL)          AS previous_sweep_id,
     if(mapContains(attributes_string, 'loom.trigger'),
        attributes_string['loom.trigger'], NULL)                    AS trigger,
+    -- Who asked for the sweep (#11444): operator | work_finder |
+    -- epic_supervisor | watchdog | reaper_retry | unknown. NULL on rows
+    -- written before #11444 (absent from both maps) — never '' and never
+    -- 'unknown'. The ETA driver signal: it splits operator re-dispatches from
+    -- automated ones (`trigger=operator_redispatch` iff dispatch_origin=operator).
+    if(mapContains(attributes_string, 'loom.dispatch_origin'),
+       attributes_string['loom.dispatch_origin'], NULL)            AS dispatch_origin,
     if(mapContains(attributes_string, 'loom.rework_events'),
        length(arrayFilter(t -> t.classification = 'substantive', rework_events)),
        NULL)                                                       AS rework_substantive,

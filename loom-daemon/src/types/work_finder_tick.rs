@@ -149,6 +149,28 @@ pub struct WorkFinderTickSummary {
     /// pre-#10214 payload and before the first tick.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cap: Option<CapView>,
+    /// Each workspace's per-repo limits as this tick resolved them (Issue
+    /// #11606), one entry per workspace the multi-workspace tick ran over.
+    /// Empty for a single-workspace tick and a pre-#11606 payload: that means
+    /// unknown, never "no repo is capped".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repo_limits: Vec<RepoLimitView>,
+}
+
+/// One workspace's per-repo dispatch limits, from the tick's own
+/// [`RepoCap`](crate::work_finder::RepoCap) state (Issue #11606).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RepoLimitView {
+    /// The workspace's repo root, as `listing_failed` names it.
+    pub repo: String,
+    /// The workspace's occupancy when the tick finished: the same
+    /// `WorkDispatcher::occupancy` count the per-repo cap gates on, plus this
+    /// tick's admissions.
+    pub in_flight: usize,
+    /// The resolved `maxConcurrentPerRepo`; `None` when uncapped.
+    pub cap: Option<usize>,
+    /// Ready candidates of this repo the tick deferred for the cap.
+    pub deferred_repo_cap: usize,
 }
 
 /// What holds a tick's effective concurrency cap where it is (Issue #10214).
@@ -246,7 +268,8 @@ impl CapView {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapacityWait {
     /// The work finder's gate: `capacity`, `ramp`, `saturation`,
-    /// `build-backoff`, `repo-cap`, `repo-slice` or `host-affinity`.
+    /// `build-backoff`, `repo-cap` or `host-affinity` (`repo-slice` is
+    /// retired with the dispatch slice, #11682, and only read back).
     pub gate: String,
     /// For the `capacity` gate: which cap term binds, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]

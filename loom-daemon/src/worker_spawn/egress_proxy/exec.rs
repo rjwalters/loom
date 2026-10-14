@@ -151,6 +151,7 @@ pub(crate) fn build(
         header: args.header,
         base_url_env: args.base_url_env.clone(),
         observe: false,
+        base_url_config: None,
     };
     let upstream = declared.validate()?;
     let (program, rest) = args
@@ -205,6 +206,7 @@ pub(crate) fn build(
         Vec::new(),
         None,
         None,
+        super::Scope::Contained,
     )?;
 
     if let Some(workspace) = &args.docker_workspace {

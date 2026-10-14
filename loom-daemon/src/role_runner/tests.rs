@@ -787,6 +787,20 @@ fn test_roles_source_label_names_the_project_tier_over_legacy() {
 }
 
 #[test]
+fn test_roles_source_label_names_the_per_repo_fleet_tier_over_project() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_project_config(tmp.path(), r#"{"autonomous": {"roleRunner": {"roles": ["curator"]}}}"#);
+    let fleet = tmp
+        .path()
+        .join(crate::config_resolver::FLEET_REPO_CONFIG_REL);
+    std::fs::create_dir_all(fleet.parent().unwrap()).unwrap();
+    std::fs::write(&fleet, r#"{"autonomous": {"roleRunner": {"roles": ["judge"]}}}"#).unwrap();
+    let label = roles_source_label(tmp.path());
+    assert!(label.starts_with("per-repo fleet tier ("), "{label}");
+    assert!(label.contains("fleet-repo.json"), "{label}");
+}
+
+#[test]
 fn test_missing_defaults_for_loom_repos_own_pinned_list_names_only_auditor_and_hermit() {
     // The exact pinned list from this repo's own `.loom/config.json`
     // (`["curator","champion","judge","doctor","guide"]`) — missing only

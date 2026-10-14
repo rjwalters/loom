@@ -27,10 +27,8 @@ fn ready_item(
         repo: repo.to_string(),
         issue,
         rank: issue,
-        star: false,
-        star_at: None,
         level: 0,
-        fleet_priority: 100,
+        weight: 100,
         created_at: None,
         main_red_fix: false,
         eligible_reason: eligible.map(|(reason, _)| reason),
@@ -53,6 +51,7 @@ fn input(items: Vec<ReadyItem>, halts: BTreeMap<String, FleetRepoHalt>) -> Fleet
             complete: repos,
             slots: None,
             halts,
+            limits: Default::default(),
         }),
         ..FleetInput::default()
     }

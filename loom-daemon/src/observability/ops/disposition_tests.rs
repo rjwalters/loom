@@ -138,12 +138,11 @@ fn summary_row(
         rank,
         repo: repo.to_string(),
         issue,
-        workspace_priority: 100,
+        workspace_weight: 100,
         urgent: false,
-        operator_priority: false,
+        level: Default::default(),
         main_red_fix: false,
         created_at: None,
-        tier: None,
         story_points: None,
         disposition,
         detail: detail.map(str::to_string),
@@ -233,7 +232,7 @@ fn build_rows_extracts_queue_position_metadata() {
     planned.plan.keys = vec![
         key("operator_priority", serde_json::Value::Bool(false)),
         key("main_red_fix", serde_json::Value::Bool(false)),
-        key("workspace_priority", serde_json::json!(100)),
+        key("workspace_weight", serde_json::json!(100)),
     ];
     // Issue 9 is blocked (no plan position): its rank is the fallback.
     let mut blocked = summary_row("/repo", 9, 1, Qd::Parked, Some("loom:blocked"));
@@ -252,7 +251,7 @@ fn build_rows_extracts_queue_position_metadata() {
     // The blocked row has no plan position: the comparator rank stands in.
     assert_eq!(rows[1].candidate_rank, 1);
     // priority_score is the comparator keys, compact JSON in key order.
-    let expected = r#"{"operator_priority":false,"main_red_fix":false,"workspace_priority":100}"#;
+    let expected = r#"{"operator_priority":false,"main_red_fix":false,"workspace_weight":100}"#;
     assert_eq!(rows[0].priority_score.as_deref(), Some(expected));
     assert_eq!(rows[1].priority_score.as_deref(), Some(expected));
 }
@@ -532,7 +531,7 @@ fn changed_emission() -> Emission {
         candidate_rank: Some(2),
         total_candidates: Some(7),
         priority_score: Some(
-            r#"{"operator_priority":false,"main_red_fix":false,"workspace_priority":100}"#
+            r#"{"operator_priority":false,"main_red_fix":false,"workspace_weight":100}"#
                 .to_string(),
         ),
         halt_cause: None,
@@ -555,7 +554,7 @@ fn every_attribute_survives_the_export_time_allowlist() {
     assert_eq!(span.attributes["loom.queue.total_candidates"], "7");
     assert_eq!(
         span.attributes["loom.queue.priority_score"],
-        r#"{"operator_priority":false,"main_red_fix":false,"workspace_priority":100}"#
+        r#"{"operator_priority":false,"main_red_fix":false,"workspace_weight":100}"#
     );
     assert_eq!(span.attributes["loom.queue.transition"], "changed");
     assert_eq!(span.attributes["loom.queue.previous_disposition"], "deferred_capacity");

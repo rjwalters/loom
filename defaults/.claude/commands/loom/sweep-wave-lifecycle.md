@@ -647,7 +647,7 @@ LOOM_AUTO_MERGE_TIMEOUT=420 ./.loom/scripts/merge-pr.sh <PR_NUMBER> --auto
 
 **Give that call a 600000 ms Bash-tool timeout (#9395)**: the 420s pin must stay strictly under its caller's, or the tool kills the script and no exit code reaches the branches below. Raise neither alone. Why the pin but no `CHAMPION-MERGE-OUTCOME` sentinel (#9096): [exit codes](../../../.loom/docs/merge-pr-exit-code-exceptions.md).
 
-It merges via the forge API and cleans the worktree. `--auto` waits for the head's check-runs to settle, re-validates `loom:pr` and the head SHA, then merges **in this process** — never via the server-side queue, gated on REQUIRED checks alone and re-reading neither once armed (#8410). An already-settled head merges at once, so `--auto` is always safe to pass (#3820); CI outlasting the wait exits non-zero (retry next pass, not a failure).
+It merges via the forge API and cleans the worktree. `--auto` waits for the head's check-runs to settle, re-validates `loom:pr` and the head SHA, then merges **in this process** — never via the server-side queue, which re-reads neither once armed (#8410). An already-settled head merges at once, so `--auto` is always safe to pass (#3820).
 
 **If a previous Merge attempt for this PR died mid-flight without deleting the checkpoint** (rate limit, crash between `merge-pr.sh` success and the delete call), re-verify forge state first: if the PR is already **merged**, just delete the stale checkpoint — do **not** re-run the merge. See "Mid-phase-death recovery" above.
 
@@ -656,11 +656,13 @@ It merges via the forge API and cleans the worktree. `--auto` waits for the head
 ./.loom/scripts/sweep-checkpoint.sh delete N
 ```
 
-This is the terminal state. The checkpoint must go, so a later `/loom:sweep` referencing the same issue number cannot take a `merge-done` short-circuit on stale state. Step 1's stale-checkpoint cleanup is the backstop if this delete is missed (sweep killed between `merge-pr.sh` success and the delete call): the next sweep touching the issue detects the closed-issue + checkpoint mismatch and removes it.
+This is the terminal state. The checkpoint must go, so a later `/loom:sweep` of the same issue cannot take a stale `merge-done` short-circuit. Step 1's stale-checkpoint cleanup is the backstop if this delete is missed: the next sweep touching the issue detects the closed-issue + checkpoint mismatch and removes it.
 
 **Approved but conflicting (#9265).** If `merge-pr.sh` refuses an approved `#X` for merge conflicts and `gh pr view X --json mergeable` confirms `CONFLICTING` (`main` moved outside this wave), do not consult the Doctor-cycle cap: take the `DIRTY` route above — rebase pass → re-Judge → merge.
 
-If `merge-pr.sh` fails otherwise (e.g. a required check failed, or the bounded wait expired before CI settled), do **not** delete the checkpoint — leave it at `judge-done` so the next sweep retries the merge from a clean state. **Before logging why it failed, classify the failure text through "Forge write failure diagnosis (#6425)"** (Mode B, above) — a forge 5xx/outage signature or an unconfirmed permission-scope 403 must be logged as forge-transient / "will retry", never as a "needs operator attention" credential diagnosis without the positive-evidence check.
+**Exits 3-7 are re-queues, not failures** (nothing merged; 7 = `LOOM-SEQUENCED-HOLD`; table: "exit codes" above): keep the checkpoint, log "not merged this pass", no diagnosis. After 3/4 (head moved) step 5's `judge-done` guard re-Judges.
+
+If `merge-pr.sh` fails otherwise (e.g. a required check failed), do **not** delete the checkpoint — leave it at `judge-done` so the next sweep retries the merge from a clean state. **Before logging why it failed, classify the failure text through "Forge write failure diagnosis (#6425)"** (Mode B, above) — a forge 5xx/outage signature or an unconfirmed permission-scope 403 must be logged as forge-transient / "will retry", never as a "needs operator attention" credential diagnosis without the positive-evidence check.
 
 ### 8. Wave settled → post-wave integration gate → advance to next wave
 
@@ -668,7 +670,7 @@ Once every PR in the wave has reached a terminal state (merged, blocked, or buil
 
 **Post-wave integration gate (#3647).** The step 7 overlap probe is file-path-granular: it catches two PRs that edit the **same** file, but it **cannot** see cross-file semantic coupling. That is exactly the shape of the #3647 incident — PR A changed a `to_dict()` in a *source* file and PR B added an exact-dict assertion in a *test* file. Their changed-file sets are **disjoint**, so step 7 took the fast path for both, yet `main` went red once both landed. File-path overlap alone therefore cannot protect the original incident; this gate is the load-bearing backstop for it:
 
-- **If a build/test command is configured** (`buildGate.command`, honoring `buildGate.enabled`, in `.loom/config.json`), run it once against the post-wave `main` — pull/refresh `main` to its just-merged state and run the command there. On failure, **halt the sweep**: do not start the next wave, log the failing command and its output, and surface the red `main` (e.g. leave a clear error in the summary and/or open a recovery issue). A red `main` must stop the run rather than compound across subsequent waves.
+- **If a build/test command is configured** (`buildGate.command`, honoring `buildGate.enabled`, in `.loom/config.json`), run its fast tier (`buildGate.fastCommand`, else `LOOM_BUILD_GATE_TIER=fast <command>`; never the full suite, #11690) on the refreshed post-wave `main`. On failure, **halt the sweep**: do not start the next wave, log the failing command and its output, and surface the red `main` (e.g. leave a clear error in the summary and/or open a recovery issue). A red `main` must stop the run rather than compound across subsequent waves.
 - **If no such command is configured**, the step 7 overlap revalidation is the only intra-wave protection — same-file collisions are caught, but cross-file semantic coupling (source-vs-test) is **not**. Log a one-line advisory recommending a `buildGate.command` for waves that cluster on one subsystem, and — per the issue's mitigation #3 — prefer placing issues likely to touch a shared serialization/schema surface in **separate size-1 waves** rather than parallelizing them.
 
 Under `--dry-run` the gate does not run (no checkout, no command execution); the plan may note that a post-wave integration check would run if `buildGate.command` is configured.

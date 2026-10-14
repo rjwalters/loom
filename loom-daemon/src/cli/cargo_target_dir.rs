@@ -61,7 +61,9 @@
 //! * `guard --for-command <text> [--cwd <dir>]` — the `loom:cargo-target-dir`
 //!   `PreToolUse` rule [`loom_daemon::cargo_target_guard`]: exit 1 with a
 //!   `BLOCKED [cargo-target-dir]` denial for a cargo build into a target dir
-//!   nothing owns, exit 0 otherwise.
+//!   nothing owns, exit 0 otherwise — printing an `ASK [cargo-shared-target]`
+//!   line when a worktree build would fall through to a shared
+//!   `build.target-dir` (#10646).
 
 use std::path::PathBuf;
 
@@ -105,7 +107,11 @@ pub(crate) enum CargoTargetDirCommand {
     /// rule (#11582): a cargo build whose target dir resolves under `/tmp`,
     /// `$TMPDIR`, `~/.cache`, `~` or `.loom/target-*` prints the denial
     /// (`BLOCKED [cargo-target-dir]: …`) and exits 1. Silent exit 0
-    /// otherwise, including with `guards.cargoTargetDir=false`.
+    /// otherwise, including with `guards.cargoTargetDir=false` — except that a
+    /// build with no explicit target dir, in a Loom-managed worktree, whose
+    /// cargo config resolves `build.target-dir` outside it prints an
+    /// `ASK [cargo-shared-target]: …` line (exit 0; #10646,
+    /// `guards.cargoSharedTarget`).
     Guard(GuardArgs),
 }
 
@@ -331,13 +337,18 @@ impl ReclaimArgs {
 impl GuardArgs {
     fn run(self) -> Result<()> {
         let cwd = repo_root_or_cwd(self.cwd);
-        if let Some(denial) =
-            loom_daemon::cargo_target_guard::check_process(&self.for_command, &cwd)
-        {
-            loom_daemon::cargo_target_guard::publish(&denial);
-            println!("{}", loom_daemon::cargo_target_guard::deny_reason(&denial));
-            // The exit code is the verdict the hook branches on.
-            std::process::exit(1);
+        use loom_daemon::cargo_target_guard::{self as guard, Verdict};
+        match guard::check_process(&self.for_command, &cwd) {
+            Some(Verdict::Deny(denial)) => {
+                guard::publish(&denial);
+                println!("{}", guard::deny_reason(&denial));
+                // The exit code is the verdict the hook branches on.
+                std::process::exit(1);
+            }
+            // #10646: exit 0 with the `ASK [cargo-shared-target]` prefix, so a
+            // hook older than the ask still reads it as an allow.
+            Some(Verdict::Ask(ask)) => println!("{}", guard::shared::ask_reason(&ask)),
+            None => {}
         }
         Ok(())
     }

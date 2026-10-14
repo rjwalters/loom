@@ -111,10 +111,11 @@ pub mod explicit_tap;
 pub mod handoff;
 pub mod launch_failure_hold;
 pub mod resolve;
+pub mod role_draw;
 pub mod sandbox_hold;
 
 pub use availability::{availability, availability_in, Availability, BinaryEnv, CredentialSource};
-pub use ceiling::{BackstopCeiling, ComplexityTier, Intent, Reservation};
+pub use ceiling::{BackstopCeiling, Intent, Reservation};
 pub use resolve::{
     CeilingSkip, ChosenTap, PreferenceStamp, Resolution, SkipReason, SkippedTap, Tap,
     PREFERENCE_LOG_MARKER,
@@ -131,6 +132,8 @@ pub enum PreferenceSource {
     RolePreference,
     /// `runtimes.preference` — the fleet-wide default order.
     FleetPreference,
+    /// `runtimes.roleDraw.<role>` — the weighted per-attempt draw (#11726).
+    RoleDraw,
 }
 
 impl PreferenceSource {
@@ -139,6 +142,7 @@ impl PreferenceSource {
         match self {
             Self::RolePreference => "role-preference",
             Self::FleetPreference => "preference",
+            Self::RoleDraw => "role-draw",
         }
     }
 }
@@ -177,6 +181,9 @@ pub enum Decision {
         /// caller that launches without attaching runs uncounted rather than
         /// pinning a slot forever.
         backstop: Option<ceiling::Reservation>,
+        /// The weighted draw's decision record when `roleDraw` decided
+        /// (#11726): the walk ran over the drawn order.
+        draw: Option<Box<role_draw::RoleDrawRecord>>,
     },
 }
 
@@ -212,8 +219,12 @@ impl Decision {
                 source,
                 resolution,
                 backstop,
+                draw,
             } => {
                 let mut line = format!("{} source={}", resolution.marker_line(), source.as_str());
+                if let Some(draw) = draw {
+                    line.push_str(&format!(" {}", draw.marker_fragment()));
+                }
                 // How much of the metered ceiling this launch consumed, so
                 // "the fleet is pinned at its backstop ceiling" is greppable
                 // from the same marker that records the fall-through itself.
@@ -239,12 +250,15 @@ impl Decision {
     #[must_use]
     pub fn stamp(&self) -> Option<PreferenceStamp> {
         let Self::Preference {
-            source, resolution, ..
+            source,
+            resolution,
+            draw,
+            ..
         } = self
         else {
             return None;
         };
-        let mut stamp = resolution.stamp(source.as_str())?;
+        let mut stamp = role_draw_stamp(resolution.stamp(source.as_str()), draw.as_deref())?;
         if let Some(line) = self.marker_line() {
             stamp.marker = line;
         }
@@ -272,18 +286,53 @@ impl Decision {
     pub fn into_admission(self, role: &str) -> Result<ResolvedRuntime, RuntimeRejection> {
         match self {
             Self::Static { result, .. } => result,
-            Self::Preference { resolution, .. } => match resolution.chosen {
+            Self::Preference {
+                resolution, draw, ..
+            } => match resolution.chosen {
                 Some(chosen) => Ok(chosen.admitted),
                 None => Err(RuntimeRejection {
                     role: role.to_string(),
                     runtime: String::new(),
                     source: RuntimeSource::Preference,
                     unmet_capabilities: vec![],
-                    reason: resolution.exhausted_diagnostic(role),
+                    reason: exhausted_with_draw(&resolution, draw.as_deref(), role),
                 }),
             },
         }
     }
+}
+
+/// Attach a role draw's record (and the model its pick pins) to `stamp`
+/// (#11726). Identity when `draw` is `None`.
+#[must_use]
+pub fn role_draw_stamp(
+    stamp: Option<PreferenceStamp>,
+    draw: Option<&role_draw::RoleDrawRecord>,
+) -> Option<PreferenceStamp> {
+    let mut stamp = stamp?;
+    if let Some(draw) = draw {
+        stamp.model.clone_from(&draw.model);
+        stamp
+            .marker
+            .push_str(&format!(" {}", draw.marker_fragment()));
+        stamp.draw = Some(Box::new(draw.clone()));
+    }
+    Some(stamp)
+}
+
+/// [`Resolution::exhausted_diagnostic`] plus the role draw's table, when a
+/// draw decided (#11726) — so an empty-after-exclusions stage says so.
+#[must_use]
+pub fn exhausted_with_draw<T>(
+    resolution: &Resolution<T>,
+    draw: Option<&role_draw::RoleDrawRecord>,
+    role: &str,
+) -> String {
+    let mut out = resolution.exhausted_diagnostic(role);
+    if let Some(draw) = draw {
+        out.push_str(&draw.diagnostic_suffix());
+    }
+    out
 }
 
 /// One resolution's answer to "what does this launch run on, and what did
@@ -382,7 +431,6 @@ pub fn resolve_for_dispatch_with(
     // A sweep dispatch, not a role tick: the launch-failure hold (#11453)
     // never applies here.
     let context = DispatchContext {
-        complexity: None,
         intent: Intent::Dispatch,
         role_tick: false,
     };
@@ -558,16 +606,10 @@ pub fn check_runtimes_preference_config(config: &Value) -> Vec<String> {
 /// What dispatch knows about the *work* being launched, as opposed to the role
 /// launching it.
 ///
-/// Only the backstop ceiling's optional eligibility filter reads this today
-/// (#8555): "low-value work never reaches the metered tap" is a property of the
-/// issue, not of the role. It is a struct rather than a bare argument so a
-/// later admission question can be added without re-churning every call site.
+/// It is a struct rather than a bare argument so a later admission question
+/// can be added without re-churning every call site.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct DispatchContext<'a> {
-    /// The issue's `<!-- loom:complexity=<tier> -->` stratum, as the work
-    /// finder already carries it through `dispatch(issue, complexity)`.
-    /// `None` ⇒ treated as `routine`.
-    pub complexity: Option<&'a str>,
+pub struct DispatchContext {
     /// Whether this resolution precedes a real launch (and so may take a
     /// metered slot) or is a read-only probe. Defaults to
     /// [`Intent::Probe`] — `work_finder::pool_preflight` re-resolves on every
@@ -638,7 +680,7 @@ pub fn resolve_runtime_for(
     role: &str,
     explicit: Option<&str>,
     now: u64,
-    context: DispatchContext<'_>,
+    context: DispatchContext,
 ) -> Result<Decision, RuntimeRejection> {
     resolve_runtime_contained(root, role, explicit, now, context, &mut NoContainment)
 }
@@ -722,7 +764,7 @@ pub fn resolve_runtime_contained(
     role: &str,
     explicit: Option<&str>,
     now: u64,
-    context: DispatchContext<'_>,
+    context: DispatchContext,
     preparer: &mut dyn ContainmentPreparer,
 ) -> Result<Decision, RuntimeRejection> {
     let binary_env = availability::BinaryEnv::from_process();
@@ -737,7 +779,7 @@ fn resolve_runtime_in(
     role: &str,
     explicit: Option<&str>,
     now: u64,
-    context: DispatchContext<'_>,
+    context: DispatchContext,
     preparer: &mut dyn ContainmentPreparer,
     binary_env: &availability::BinaryEnv,
 ) -> Result<Decision, RuntimeRejection> {
@@ -759,18 +801,27 @@ fn resolve_runtime_in(
         });
     }
     let config = crate::config_resolver::resolve_effective_config(root);
-    let listed = preference_for(&config, canonical).map_err(|reason| RuntimeRejection {
-        role: canonical.to_string(),
-        runtime: String::new(),
-        source: RuntimeSource::Preference,
-        unmet_capabilities: vec![],
-        reason,
-    })?;
-    let Some((source, taps)) = listed else {
-        return Ok(Decision::Static {
-            reason: StaticReason::NoPreferenceConfigured,
-            result: admit_static(root, role, None, None, preparer),
-        });
+    // #11726: a `runtimes.roleDraw` table for this role and attempt replaces
+    // the ordered list — the walk below runs over the seeded, weighted order
+    // instead. With no table, `rolePreference` decides exactly as before.
+    let draw_plan = role_draw::prepare(root, canonical, now, context.role_tick);
+    let (source, taps) = if let Some(plan) = &draw_plan {
+        (PreferenceSource::RoleDraw, plan.taps())
+    } else {
+        let listed = preference_for(&config, canonical).map_err(|reason| RuntimeRejection {
+            role: canonical.to_string(),
+            runtime: String::new(),
+            source: RuntimeSource::Preference,
+            unmet_capabilities: vec![],
+            reason,
+        })?;
+        let Some(listed) = listed else {
+            return Ok(Decision::Static {
+                reason: StaticReason::NoPreferenceConfigured,
+                result: admit_static(root, role, None, None, preparer),
+            });
+        };
+        listed
     };
     let backstop_ceiling = ceiling::configured(&config).map_err(|reason| RuntimeRejection {
         role: canonical.to_string(),
@@ -849,7 +900,7 @@ fn resolve_runtime_in(
             let Some(bound) = backstop_ceiling.as_ref().filter(|c| c.governs(tier)) else {
                 return Ok(());
             };
-            match ceiling::admit(bound, canonical, tap, context.complexity, context.intent) {
+            match ceiling::admit(bound, canonical, tap, context.intent) {
                 ceiling::Verdict::Admitted(slot) => {
                     reservation = slot;
                     Ok(())
@@ -869,10 +920,12 @@ fn resolve_runtime_in(
     {
         preparer.borrow_mut().release();
     }
+    let draw = draw_plan.map(|plan| Box::new(plan.finish(&resolution)));
     Ok(Decision::Preference {
         source,
         resolution,
         backstop: reservation,
+        draw,
     })
 }
 
@@ -891,6 +944,9 @@ mod gateway_tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod launch_failure_hold_tests;
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod role_draw_resolve_tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod sandbox_hold_tests;

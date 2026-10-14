@@ -118,6 +118,7 @@ pub use model::generate_sweep_id;
 mod config_paths;
 mod decline_cooldown;
 mod dispatch;
+mod frozen_write;
 mod guards;
 mod heartbeat_broadcast;
 mod journal_shadow;
@@ -152,6 +153,7 @@ mod start_facts;
 #[allow(unused_imports)]
 pub(crate) mod test_support;
 mod watchdog;
+mod work_started;
 
 // Re-exported at the same effective visibility each item already declares
 // (most are `pub(crate)`, a handful are genuinely `pub`), so every existing
@@ -256,10 +258,6 @@ pub struct SweepRegistryConfig {
     /// [`outcomes_journal_path`](Self::outcomes_journal_path) — see the
     /// `sweep_outcomes` module doc for why the two are kept separate.
     pub outcome_telemetry_path: Option<PathBuf>,
-    /// Forge-egress policy sources for the dispatch gate (#9999). `None`
-    /// means `PolicySources::from_process`; `new` pins the unconfigured
-    /// default under `cfg(test)` so tests never read the host policy.
-    pub forge_egress_sources: Option<crate::forge_egress::policy::PolicySources>,
     /// The rate-limit breaker the dispatch path's forge writes (label flip,
     /// lease comment) report failures to (Issue #8997). `None` ⇒ the
     /// process-global breaker; tests inject their own.
@@ -278,11 +276,6 @@ impl SweepRegistryConfig {
             journal_path: None,
             outcomes_journal_path: None,
             outcome_telemetry_path: None,
-            forge_egress_sources: if cfg!(test) {
-                Some(crate::forge_egress::policy::PolicySources::default())
-            } else {
-                None
-            },
             rate_limit: None,
         }
     }

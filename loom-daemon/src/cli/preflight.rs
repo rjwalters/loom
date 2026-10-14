@@ -4,10 +4,11 @@
 //! Exit codes: `0` pass / gate not configured; `1` failed, attempts remain
 //! (output tail printed — fix and re-run); `4` attempts exhausted
 //! (`preflight_unresolved`, claim released, open NO PR); `5` timed out
-//! (#10860: not a failure, claim kept); `6` deferred, the host is above the
-//! load threshold (#10955: nothing ran, claim kept); `7` (`--check`) no
-//! passing receipt for the current `HEAD`; `8` (`--check`) a commit carries a
-//! GitHub skip-CI marker (#11389, every repo, `buildGate` or not).
+//! (#10860: not a failure, claim kept); `7` (`--check`) no passing receipt
+//! for the current `HEAD`; `8` (`--check`) a commit carries a GitHub skip-CI
+//! marker (#11389, every repo, `buildGate` or not). The gate run is the fast
+//! tier (compile + smoke) and never defers on load, so exit `6` (#10955) is
+//! retired (#11690); CI runs the suites.
 
 use std::path::PathBuf;
 
@@ -56,20 +57,10 @@ impl PreflightArgs {
         let verdict = preflight::run(&wt);
         match &verdict {
             Verdict::Disabled => eprintln!("preflight: no enabled buildGate — skipped"),
-            Verdict::Pass => eprintln!("preflight: PASS"),
+            Verdict::Pass => eprintln!("preflight: PASS (fast tier: it compiles; CI runs the tests)"),
             Verdict::PassFlaky { tests } => eprintln!(
                 "preflight: PASS (flaky, passed on retry: {}) — CI does not retry; consider filing the flake",
                 tests.join(", ")
-            ),
-            Verdict::Deferred {
-                load_per_cpu,
-                threshold,
-                waited_secs,
-                max_secs,
-            } => println!(
-                "preflight: DEFERRED — host load {load_per_cpu} per CPU is above the gate threshold {threshold}; \
-                 the gate was NOT run (not a failure, not a timeout; claim kept). Re-run in a few minutes. \
-                 Deferred {waited_secs}s so far; after {max_secs}s of deferral it runs regardless."
             ),
             Verdict::Failed { attempt, max, tail } => {
                 println!("preflight: FAILED (attempt {attempt}/{max}) — fix the cause, commit, re-run.\n{tail}");

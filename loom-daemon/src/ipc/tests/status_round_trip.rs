@@ -57,7 +57,7 @@ fn test_daemon_status_request_response_round_trip() {
         per_repo: vec![crate::types::RepoStatus {
             root: std::path::PathBuf::from("/repo/a"),
             maintain_only: None,
-            priority: 100,
+            weight: 100,
             in_flight_count: 0,
             health_gate_halted: true,
             quarantined_issues: vec![101, 202],
@@ -199,6 +199,7 @@ fn test_daemon_status_request_response_round_trip() {
         otlp_export: Some(crate::observability::otlp_health::OtlpExportHealth {
             state: crate::observability::otlp_health::OtlpExportState::Exempt,
             detail: Some("robb-studio per 2am#3649".to_string()),
+            since: None,
         }),
         forge_events: Some(crate::types::ForgeEventsStatus {
             state: crate::types::ForgeEventsState::Backoff,

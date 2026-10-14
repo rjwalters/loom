@@ -13,9 +13,12 @@ use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
 
+use super::champion::champion_by_slug;
+use super::curator::curator_by_slug;
 use super::outcomes::Curated;
 use super::{
-    held_stage, FleetInput, HeldSweep, ListedPr, ReadyItem, ReadyQueue, RepoListing, REVIEW_LABELS,
+    held_stage, FleetInput, HeldSweep, ListedPr, ReadyItem, ReadyQueue, RepoLimits, RepoListing,
+    REVIEW_LABELS,
 };
 use crate::sweep_registry::SweepRegistry;
 use crate::telemetry::kinds::fleet_state::{
@@ -23,7 +26,7 @@ use crate::telemetry::kinds::fleet_state::{
     PlannerStamps,
 };
 use crate::telemetry::RepoVisibility;
-use crate::types::{ReadyQueueRow, SweepKind, WorkFinderTickSummary};
+use crate::types::{ReadyQueueRow, RepoLimitView, SweepKind, WorkFinderTickSummary};
 use crate::workspace_pool::WorkspacePool;
 use crate::worktree_ops::gh::{linkage_refs, LinkageKind};
 
@@ -305,8 +308,9 @@ async fn label_listings(roots: &[(PathBuf, String)], label: &'static str) -> Cur
     out
 }
 
-/// The effective operator priority level the planner ranked `row` on: its
-/// `operator_priority_level` comparator key, else the bare star.
+/// The priority level the planner ranked `row` on (0 default, 1
+/// `loom:important`, 2 `loom:very-important`): its `level` comparator key,
+/// else the row's own `level` (#11510).
 fn level(row: &ReadyQueueRow) -> u8 {
     row.plan
         .keys
@@ -314,7 +318,7 @@ fn level(row: &ReadyQueueRow) -> u8 {
         .find(|k| k.name == "level")
         .and_then(|k| k.value.as_u64())
         .and_then(|n| u8::try_from(n).ok())
-        .unwrap_or(u8::from(row.operator_priority))
+        .unwrap_or_else(|| row.level.rank())
 }
 
 /// The work finder's last tick: every row not running, with its rank and
@@ -374,10 +378,8 @@ fn ready_from_tick(
                 repo: slug(&row.repo)?,
                 issue: row.issue,
                 rank: small(row.rank),
-                star: row.operator_priority,
-                star_at: None,
                 level: level(row),
-                fleet_priority: row.workspace_priority,
+                weight: row.workspace_weight,
                 created_at: parse_instant(row.created_at.as_deref()),
                 main_red_fix: row.main_red_fix,
                 eligible_reason: FleetEligibleReason::from_disposition(row.disposition),
@@ -413,7 +415,29 @@ fn ready_from_tick(
         complete,
         slots,
         halts: BTreeMap::new(),
+        limits: limits_by_slug(&summary.repo_limits, slug),
     }
+}
+
+/// The tick's per-repo dispatch limits (#11606) by lowercased slug. Every
+/// entry is kept (no cap); a root `slug` cannot name is left out, as its
+/// ready rows are. Pure.
+pub(super) fn limits_by_slug(
+    limits: &[RepoLimitView],
+    slug: impl Fn(&str) -> Option<String>,
+) -> BTreeMap<String, RepoLimits> {
+    let mut out = BTreeMap::new();
+    for limit in limits {
+        let Some(repo) = slug(&limit.repo) else {
+            continue;
+        };
+        out.entry(repo).or_insert_with(|| RepoLimits {
+            in_flight: small(limit.in_flight),
+            cap: limit.cap.map(small),
+            deferred_repo_cap: small(limit.deferred_repo_cap),
+        });
+    }
+    out
 }
 
 /// Available and exhausted token accounts in the rotation ranking at
@@ -460,6 +484,26 @@ fn capacity(workspace_root: &Path, live_workers: usize) -> FleetCapacity {
         admission_brake_held: crate::admission_brake::global_snapshot()
             .filter(|b| b.enabled)
             .map(|b| b.held),
+    }
+}
+
+/// This host's slots, measured from local state (#11643): `max_concurrent`
+/// from the work-finder config (precedence env > config > default, via
+/// [`resolve_max_concurrent_with_source`]) and `occupancy` from the
+/// already-computed live-sweep count. Independent of the work-finder plan, so
+/// it is present from the first pass of a process and after a roll/restart —
+/// the plan, and thus `ready.slots`, is absent until the first tick.
+///
+/// `occupancy` stays an `Option` (absent = unknown, never a synthetic `0`);
+/// here it is always `Some`, because every pass re-measures the live count, so
+/// a genuinely idle host emits `occupancy: 0`, distinct from "not yet
+/// measured".
+fn local_slots(workspace_root: &Path, live_workers: usize) -> FleetSlots {
+    let config = crate::work_finder::read_work_finder_config(workspace_root);
+    let max_concurrent = crate::work_finder::resolve_max_concurrent_with_source(&config).0;
+    FleetSlots {
+        max_concurrent: small(max_concurrent),
+        occupancy: Some(small(live_workers)),
     }
 }
 
@@ -555,10 +599,9 @@ pub(super) async fn gather(
             .iter()
             .map(|(root, slug)| (root.as_path(), slug.as_str())),
     );
-    let capacity = Some(capacity(
-        workspace_root,
-        live_sweep_count(&workspace_pool.provisioned_registries()),
-    ));
+    let live_workers = live_sweep_count(&workspace_pool.provisioned_registries());
+    let capacity = Some(capacity(workspace_root, live_workers));
+    let slots = Some(local_slots(workspace_root, live_workers));
     let listed_at = (!listings.is_empty()).then_some(now);
     let reused = Reused {
         managed: managed.clone(),
@@ -571,8 +614,13 @@ pub(super) async fn gather(
             .collect(),
         visibility: BTreeMap::new(),
     };
+    let champion = champion_by_slug(&reused.roots);
+    let curator = curator_by_slug(&reused.roots);
     let input = FleetInput {
+        champion,
+        curator,
         capacity,
+        slots,
         main_ci,
         host_id: host_id.to_string(),
         managed,
@@ -593,11 +641,12 @@ pub(super) fn tick_input(
     host_id: &str,
     reused: &Reused,
 ) -> FleetInput {
+    let live_workers = live_sweep_count(&workspace_pool.provisioned_registries());
     FleetInput {
-        capacity: Some(capacity(
-            workspace_root,
-            live_sweep_count(&workspace_pool.provisioned_registries()),
-        )),
+        champion: champion_by_slug(&reused.roots),
+        curator: curator_by_slug(&reused.roots),
+        capacity: Some(capacity(workspace_root, live_workers)),
+        slots: Some(local_slots(workspace_root, live_workers)),
         main_ci: tick_main_ci(reused),
         held: held_sweeps(&workspace_pool.provisioned_registries(), |root| reused.slug(root)),
         ready: crate::work_finder::last_tick_summary().map(|summary| ready_input(&summary, reused)),
@@ -625,7 +674,10 @@ pub(super) fn reused_input(host_id: &str, reused: &Reused) -> FleetInput {
         listings: reused.listings.clone(),
         listed_at: reused.listed_at,
         ready: None,
+        slots: None,
         capacity: None,
+        champion: BTreeMap::new(),
+        curator: BTreeMap::new(),
         main_ci: BTreeMap::new(),
     }
 }

@@ -26,7 +26,7 @@
 //!     "stage-dwell": { "as_of": "<rfc3339>", "repos": ["owner/repo", ...] },
 //!     "star-facts": {
 //!       "as_of": "<rfc3339>", "repos": ["owner/repo", ...],
-//!       "labels": ["loom:operator-priority", ...],
+//!       "labels": ["loom:important", ...],
 //!       "counts": { "owner/repo": 2 }
 //!     },
 //!     "queue-blocked": {

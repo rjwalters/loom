@@ -234,12 +234,6 @@ fn a_credential_that_cannot_be_named_keys_by_root() {
         ..facts(Some(WRITER))
     };
     assert_ne!(by_root("/w/a", token.clone()), by_root("/w/b", token));
-    // A forge-egress launcher picks its own per-owner credential.
-    let launcher = CredentialFacts {
-        launcher: true,
-        ..facts(Some(WRITER))
-    };
-    assert_ne!(by_root("/w/a", launcher.clone()), by_root("/w/b", launcher));
 }
 
 #[test]

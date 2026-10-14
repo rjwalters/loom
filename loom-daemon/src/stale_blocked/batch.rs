@@ -288,6 +288,9 @@ pub fn gather_filtered(
             .filter(|r| r.is_pull_request == want_pr)
             // Champion's digest is not a parked artifact (#9397).
             .filter(|r| !super::digest::excluded(kind, r))
+            // #11743: a frozen artifact is not read as work by any pass —
+            // not the release pass, the unnamed queue or the notifier.
+            .filter(|r| !crate::work_finder::is_frozen(&r.labels))
             .take(limit);
         selected.extend(rows.map(|row| (kind, row.clone())));
     }

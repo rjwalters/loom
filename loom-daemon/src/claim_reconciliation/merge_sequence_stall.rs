@@ -77,11 +77,11 @@ pub fn stall_hours() -> f64 {
         .unwrap_or(DEFAULT_STALL_HOURS)
 }
 
-/// Is this PR starred (`loom:operator-priority`, or any higher level,
-/// #10307)?
+/// The PR's priority level (`loom:important` / `loom:very-important`,
+/// #11103), from its own labels.
 #[must_use]
-pub fn starred(pr: &SequencePr) -> bool {
-    crate::operator_levels::is_starred(&pr.labels)
+pub fn level(pr: &SequencePr) -> crate::priority_pick::Level {
+    crate::priority_pick::Level::of(&pr.labels)
 }
 
 /// Why a chain head is stalled.
@@ -105,7 +105,10 @@ pub fn quiet_hours(pr: &SequencePr, now: DateTime<Utc>) -> Option<f64> {
 /// The stall cause for `pr` at `now`, or `None` when it is not stalled.
 #[must_use]
 pub fn stall_cause(pr: &SequencePr, now: DateTime<Utc>, bound_hours: f64) -> Option<StallCause> {
-    if !quiet_hours(pr, now).is_some_and(|q| q > bound_hours) {
+    // #11743: a frozen PR is not stalled; nothing may comment on it.
+    if !quiet_hours(pr, now).is_some_and(|q| q > bound_hours)
+        || pr.has(crate::work_finder::FROZEN_LABEL)
+    {
         return None;
     }
     if let Some(label) = super::super::VERDICT_HOLD_LABELS.iter().find(|l| pr.has(l)) {

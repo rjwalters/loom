@@ -251,6 +251,34 @@ fn all_declared_blockers_closed_releases_and_restores_prior_approval() {
     assert!(w.labels(10).contains("loom:issue") && !w.labels(10).contains("loom:blocked"));
 }
 
+/// #11480 follow-up: a closed dependency releases the park, but an issue that
+/// also carries a restore veto (`loom:needs-capability`, the sky130-comparator
+/// #127 shape) does not get `loom:issue` back.
+#[test]
+fn a_veto_label_keeps_loom_issue_off_on_release() {
+    let mut w = World::new();
+    w.parked(10, false, &[1], &[]);
+    w.park
+        .items
+        .get_mut(&10)
+        .unwrap()
+        .labels
+        .push("loom:needs-capability".into());
+    w.state(1, "CLOSED", false);
+    w.extra
+        .events
+        .insert(10, vec!["loom:issue".into(), "loom:blocked".into()]);
+    let r = w.run();
+    assert_eq!(r.released.len(), 1, "{}", r.summary());
+    assert_eq!(r.released[0].restored, None);
+    assert_eq!(w.park.writes, vec!["remove #10 loom:blocked"]);
+    assert!(!w.labels(10).contains("loom:issue"));
+    // The audit comment names the veto, never "it never carried loom:issue".
+    let comment = &w.extra.posted[0].1;
+    assert!(comment.contains("carries `loom:needs-capability`"), "{comment}");
+    assert!(!comment.contains("never carried"), "{comment}");
+}
+
 #[test]
 fn never_approved_issue_is_released_without_loom_issue() {
     let mut w = World::new();
@@ -490,11 +518,11 @@ fn superseded_pr_is_skipped() {
 }
 
 #[test]
-fn operator_labels_are_holds_but_the_star_is_not() {
+fn operator_labels_are_holds_but_a_priority_label_is_not() {
     let mut w = World::new();
     w.parked(10, false, &[1], &["loom:operator-only", "loom:operator-decision"]);
     w.parked(11, false, &[1], &["loom:operator"]);
-    w.parked(12, false, &[1], &["loom:operator-priority"]);
+    w.parked(12, false, &[1], &["loom:important"]);
     w.state(1, "CLOSED", false);
     let r = w.run();
     assert_eq!(skipped(&r, "operator-hold"), 2);
@@ -785,4 +813,36 @@ fn env_off_and_unowned_shard_read_nothing() {
     let r = gated(Mode::DryRun, true, |dry_run| w.run_with(Config { dry_run, ..cfg() })).unwrap();
     assert!(r.dry_run && w.no_writes());
     assert_eq!(r.released.len(), 1);
+}
+
+/// #11743: a frozen artifact gets no write of any kind, even when every
+/// declared blocker has closed.
+#[test]
+fn a_frozen_artifact_is_never_released_or_commented() {
+    for pr in [false, true] {
+        let mut w = World::new();
+        w.parked(10, pr, &[1], &["loom:frozen"]);
+        w.state(1, "CLOSED", false);
+        w.extra
+            .events
+            .insert(10, vec!["loom:issue".into(), "loom:blocked".into()]);
+        let r = w.run();
+        assert!(r.released.is_empty(), "pr={pr}: {}", r.summary());
+        assert!(w.no_writes(), "pr={pr}: {:?}", w.park.writes);
+    }
+}
+
+/// #11517: a release never adds `loom:issue` beside a live `loom:building`.
+#[test]
+fn a_claimed_issue_does_not_get_loom_issue_back_on_release() {
+    let mut w = World::new();
+    w.parked(10, false, &[1], &["loom:building"]);
+    w.state(1, "CLOSED", false);
+    w.extra
+        .events
+        .insert(10, vec!["loom:issue".into(), "loom:blocked".into()]);
+    let r = w.run();
+    assert_eq!(r.released.len(), 1, "{}", r.summary());
+    assert_eq!(r.released[0].restored, None);
+    assert!(!w.labels(10).contains("loom:issue"));
 }

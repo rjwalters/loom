@@ -277,7 +277,7 @@ pub struct SafehouseConfig {
     pub rooms: Option<RoomMap>,
     /// Persona to authenticate as; must be in safehoused's allowlist.
     pub persona: String,
-    /// Who an operator-priority escalation (#9321) pings in the room: a Matrix
+    /// Who an `operator_priority.escalation` (#9321) pings in the room: a Matrix
     /// display name or user id (`@operator:example.org`). `None` ⇒ the escalation
     /// line is still posted, just without a mention — the ask is never dropped
     /// over a missing handle. This is a **handle, not a credential**: nothing
@@ -506,11 +506,6 @@ fn parse_by_repo_env(raw: &str) -> std::collections::BTreeMap<String, String> {
 /// `safehouse.socket` (#5457). No built-in `$HOME`-relative default: unlike
 /// `ingestKeyFile`, safehouse is opt-in per-host, so an unconfigured socket
 /// degrades to `None` (warn + skip) rather than guessing a path.
-///
-/// `pub` since #7893: the inbound-steering task in
-/// [`crate::safehouse_chatops::runtime`] resolves the same socket through this
-/// one function rather than re-deriving the env/config precedence, so the two
-/// safehouse consumers can never disagree about which socket they dialed.
 #[must_use]
 pub fn resolve_socket(cfg: &SafehouseConfig) -> Option<PathBuf> {
     env_nonempty(SOCKET_ENV)
@@ -1516,8 +1511,8 @@ fn decode_exit_code_annotation(code: i32) -> &'static str {
 // Event → envelope mapping
 // ============================================================================
 //
-// Both renderers — the frozen-taxonomy mapping and the operator-priority
-// escalation line (#9321) — live in the `envelopes` sibling module. Re-exported
+// Both renderers — the frozen-taxonomy mapping and the
+// `operator_priority.escalation` line (#9321) — live in the `envelopes` sibling module. Re-exported
 // here so every existing caller and `use super::*` test keeps its path.
 
 mod envelopes;

@@ -235,14 +235,12 @@ fn render_row(row: &ReadyQueueRow) -> String {
         .file_name()
         .map_or_else(|| row.repo.clone(), |n| n.to_string_lossy().into_owned());
     let mut flags = Vec::new();
-    if row.operator_priority {
-        flags.push("starred".to_string());
+    // The priority level (#11510), when it is not the default.
+    if row.level != loom_daemon::priority_pick::Level::Default {
+        flags.push(row.level.as_str().to_string());
     }
     if row.main_red_fix {
         flags.push("red-main-fix".to_string());
-    }
-    if let Some(tier) = &row.tier {
-        flags.push(tier.clone());
     }
     let flags = if flags.is_empty() {
         String::new()
@@ -255,10 +253,10 @@ fn render_row(row: &ReadyQueueRow) -> String {
         .map(|d| format!(" ({d})"))
         .unwrap_or_default();
     format!(
-        "  {:>3}. {repo}#{:<6} p{:<3} {:<20} {}{detail}{flags}\n",
+        "  {:>3}. {repo}#{:<6} w{:<3} {:<20} {}{detail}{flags}\n",
         row.rank,
         row.issue,
-        row.workspace_priority,
+        row.workspace_weight,
         plan_column(row),
         row.disposition.reason(),
     )
@@ -289,12 +287,15 @@ mod tests {
             rank,
             repo: "/src/loom".into(),
             issue,
-            workspace_priority: 100,
+            workspace_weight: 100,
             urgent: false,
-            operator_priority: rank == 1,
+            level: if rank == 1 {
+                loom_daemon::priority_pick::Level::VeryImportant
+            } else {
+                loom_daemon::priority_pick::Level::Default
+            },
             main_red_fix: false,
             created_at: None,
-            tier: None,
             story_points: None,
             disposition: d,
             detail: None,
@@ -318,7 +319,8 @@ mod tests {
         let first = text.find("loom#10").unwrap();
         assert!(first < text.find("loom#11").unwrap());
         assert!(text.contains("waiting: concurrency cap full"));
-        assert!(text.contains("[starred]"));
+        assert!(text.contains("[very-important]"), "{text}");
+        assert!(!text.contains("[default]"), "the default level is no flag: {text}");
         assert!(!text.contains("[urgent]"), "urgent is no longer a row flag (#9244)");
         assert!(!text.contains("STALE"));
     }
@@ -420,7 +422,7 @@ mod tests {
             position: Some(1),
             plan_state: PlanState::Running,
             keys: vec![PlanKey {
-                name: "workspace_priority".into(),
+                name: "workspace_weight".into(),
                 value: serde_json::json!(100),
             }],
             ..RowPlan::default()
@@ -432,7 +434,7 @@ mod tests {
             ..RowPlan::default()
         };
         // Row keys alone are enough to name the ordering.
-        assert_eq!(queue_json(&r, now)["ordering"], serde_json::json!(["workspace_priority"]));
+        assert_eq!(queue_json(&r, now)["ordering"], serde_json::json!(["workspace_weight"]));
 
         let tick = r.last_work_finder_tick.as_mut().unwrap();
         tick.plan = Some(DispatchPlanContext {
@@ -444,17 +446,17 @@ mod tests {
                 ..PlanSlots::default()
             },
             tick_interval_secs: Some(60),
-            ordering: vec!["workspace_priority".into(), "operator_priority".into()],
+            ordering: vec!["level".into(), "created_at".into()],
             ..DispatchPlanContext::default()
         });
         let j = queue_json(&r, now);
-        assert_eq!(j["ordering"], serde_json::json!(["workspace_priority", "operator_priority"]));
+        assert_eq!(j["ordering"], serde_json::json!(["level", "created_at"]));
         assert_eq!(j["plan"]["slots"]["max_concurrent"], 2);
         assert_eq!(j["queue"][1]["plan_state"], "next");
         assert_eq!(j["queue"][1]["gate"], "ramp");
         assert_eq!(j["queue"][1]["position"], 2);
         let text = render_queue(&r, now);
-        assert!(text.contains("Order: workspace_priority, then operator_priority"), "{text}");
+        assert!(text.contains("Order: level, then created_at"), "{text}");
         assert!(
             text.contains("Plan: 0 free of 2 slot(s), 1 admission(s)/tick, every 60s"),
             "{text}"
