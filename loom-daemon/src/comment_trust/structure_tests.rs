@@ -100,6 +100,10 @@ const MARKER_FILES: &[(&str, &str)] = &[
         "writer + reader of loom:landed-route in read_route_marked; closes-graph counts MERGED PRs \
          only, which an outsider cannot produce (FETCH_SITES, #11853)",
     ),
+    (
+        "work_finder/step_item.rs",
+        "pure parsers over TrustedComments, built only by TrustPolicy::filter (#11895)",
+    ),
 ];
 
 /// Per reviewed file: every function that fetches comments (or linked PRs),

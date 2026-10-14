@@ -37,6 +37,7 @@ fn item(number: u32, labels: &[&str]) -> RestIssue {
         is_pull_request: false,
         comments: 3,
         open_sub_issues: None,
+        labels_at: None,
     }
 }
 

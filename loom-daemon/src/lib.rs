@@ -386,6 +386,7 @@ pub mod status_budget;
 /// needs (#10787): one list for `--section` parsing, `--help`, the wire request
 /// and the renderer's key filter.
 pub mod status_section;
+pub mod step_dispatch;
 /// The role a step runs and the claim it holds (#11898): `SweepKind::Step`'s
 /// role, its claim label and its restore stage.
 pub mod step_role;

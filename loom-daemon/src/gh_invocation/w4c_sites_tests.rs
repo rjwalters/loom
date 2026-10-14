@@ -58,10 +58,9 @@ fn every_deferrable_site_maps_a_shed_to_no_answer() {
         "clean.pr_status_rest",
         clean::check_pr_status_for_branch_rest(root, "acme", "feature/x") == PrStatus::Unknown,
     );
-    step(
-        "intake.list_open",
-        crate::intake_reconcile::run_once(Path::new("gh"), root, chrono::Utc::now(), 5) == 0,
-    );
+    // `intake.list_open` left this list in #11897: the inline pass now reads
+    // the shared ETag walk, whose shed is the store's (`ReadShed`), proven
+    // by `forge_listing_open_pages_tests` and `intake_reconcile::tests`.
     {
         use crate::observability::ops::stage_dwell::{GhStageFetcher, StageFetcher};
         step(
