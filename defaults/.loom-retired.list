@@ -134,3 +134,7 @@ hooks/tests/test-guard-forge-egress.sh
 scripts/tests/test-guide-operator-only-exclude.sh
 scripts/tests/test-guide-work-plan-operator-only-exclude.sh
 scripts/tests/test-operator-only-subkind.sh
+
+# #11860 (2026-10-14) — terminal promotion verdicts retire loom:needs-revision;
+# its routing suite was renamed for what it now covers.
+scripts/tests/test-champion-needs-revision-routing.sh
