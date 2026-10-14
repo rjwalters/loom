@@ -54,6 +54,11 @@ case "$*" in
     printf '[{"number": 7, "title": "seven", "state": "open", "labels": [{"name": "loom:issue"}], "created_at": "2026-10-01T00:00:00Z", "updated_at": "2026-10-02T00:00:00Z", "closed_at": null, "body": null, "user": {"login": "x"}}]\n'
     exit 0
     ;;
+  'issue list --label loom:triage --json number,labels -R o/r')
+    printf '[{"labels":[{"id":"LA_1","name":"loom:triage","description":"","color":"fff"}],"number":12},{"labels":[],"number":9}]\n'
+    echo 'listing stderr' 1>&2
+    exit 0
+    ;;
   'wait-for-signal')
     trap 'echo TERM >> "$STUB_LOG.sig"; exit 42' TERM
     : > "$STUB_LOG.ready"
@@ -135,6 +140,7 @@ impl Sandbox {
             "GH_CONFIG_DIR",
             "GH_TOKEN",
             "GITHUB_TOKEN",
+            "LOOM_PICK_JOURNAL",
         ] {
             cmd.env_remove(k);
         }
@@ -1050,4 +1056,48 @@ fn the_daemon_ingests_a_passthrough_pr_create_and_a_served_issue_view() {
     let outcomes: Vec<_> = views.iter().map(|c| c.labels.outcome).collect();
     assert_eq!(outcomes, [CallOutcome::Ok, CallOutcome::NotModified]);
     assert!(drain(&sink, &mut cursors, now()).calls.is_empty(), "each row once");
+}
+
+/// #11858: inside a role tick (a pick journal attached), a `--json …labels`
+/// listing the front cannot serve passes through captured: stdout, stderr and
+/// exit status are `gh`'s, and its rows are journaled for `pick.decision`.
+/// Outside a role tick the same call journals nothing.
+#[test]
+fn a_role_ticks_passthrough_listing_is_journaled() {
+    let s = Sandbox::new();
+    let args = [
+        "issue",
+        "list",
+        "--label",
+        "loom:triage",
+        "--json",
+        "number,labels",
+        "-R",
+        "o/r",
+    ];
+    let listing = "[{\"labels\":[{\"id\":\"LA_1\",\"name\":\"loom:triage\",\"description\":\"\",\
+                   \"color\":\"fff\"}],\"number\":12},{\"labels\":[],\"number\":9}]\n";
+    let plain = s.gh(&args, &[]);
+    assert!(plain.status.success(), "{plain:?}");
+    assert_eq!(stdout(&plain), listing);
+
+    let journal = s.p("tmp/pick-journal.jsonl");
+    let out = s.gh(&args, &[("LOOM_PICK_JOURNAL", journal.to_str().unwrap())]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(stdout(&out), listing, "output replayed unchanged");
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "listing stderr\n");
+    let lines: Vec<serde_json::Value> = std::fs::read_to_string(&journal)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let rows = lines
+        .iter()
+        .find(|l| l["kind"] == "listing")
+        .map(|l| l["rows"].as_array().unwrap().clone())
+        .expect("a listing line");
+    let numbers: Vec<u64> = rows.iter().map(|r| r["number"].as_u64().unwrap()).collect();
+    assert_eq!(numbers, [12, 9]);
+    assert_eq!(rows[0]["stage"], "loom:triage");
+    assert_eq!(rows[0]["labels"][0], "loom:triage");
 }

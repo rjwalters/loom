@@ -359,7 +359,9 @@ fn resolved_repo_refs(
         let Some(root) = roots.get(idx) else {
             continue;
         };
+        // #11858: before the collector's first pass, the checkout's origin.
         if let Some(repo_ref) = super::super::repo_ref::cached_repo_ref(&root.display().to_string())
+            .or_else(|| super::dispatch_facts::fallback_repo_ref(root))
         {
             resolved.insert(idx, repo_ref);
         }
@@ -434,7 +436,13 @@ pub fn record_tick(
         &failed,
         completed_at,
     );
-    let tick = tick_span(report, max_concurrent, started_at, completed_at);
+    let mut tick = tick_span(report, max_concurrent, started_at, completed_at);
+    // #11858: the cap's terms, pre-filtered skips and held repos.
+    let cap = super::dispatch_facts::published_cap().filter(|c| c.effective() == max_concurrent);
+    let held = super::dispatch_facts::current_halted_repos();
+    tick.attributes
+        .extend(super::dispatch_facts::tick_attributes(report, cap, held));
+    sink.emit_metrics_since(super::dispatch_facts::tick_points(report, cap), Some(started_at));
     for span in admission_spans(report, &tick, &repo_refs, &lockouts) {
         sink.emit_span(span);
     }

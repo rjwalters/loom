@@ -47,6 +47,7 @@ pub mod busy_slots;
 pub mod capture;
 pub mod codex_session;
 pub mod dispatch;
+pub mod dispatch_facts;
 pub mod disposition;
 pub mod dwell;
 pub mod forge_calls;
@@ -152,6 +153,19 @@ impl OpsSink {
             .offer(TelemetryEnvelope::new(self.host_id.clone(), record));
     }
 
+    /// [`Self::emit_record`] joined to the trace `context` (#11858): the log
+    /// record then carries that trace's ids, so it joins the span it belongs
+    /// to. `None` is exactly [`Self::emit_record`].
+    pub fn emit_record_in(
+        &self,
+        record: TelemetryRecord,
+        context: Option<crate::telemetry::trace::TraceContext>,
+    ) {
+        let mut envelope = TelemetryEnvelope::new(self.host_id.clone(), record);
+        envelope.trace_context = context;
+        self.queue.offer(envelope);
+    }
+
     /// Enqueue one completed span, carrying its own context so logs can join
     /// it. Unsampled or invalid spans are not enqueued.
     pub fn emit_span(&self, span: SpanRecord) {
@@ -221,6 +235,21 @@ pub fn emit_record(record: TelemetryRecord) {
     };
     if let Some(sink) = global_ops_sink() {
         sink.emit_record(record);
+    }
+}
+
+/// [`emit_record`] joined to the trace `context` (#11858); a test capture
+/// records the record alone.
+pub fn emit_record_in(
+    record: TelemetryRecord,
+    context: Option<crate::telemetry::trace::TraceContext>,
+) {
+    #[cfg(test)]
+    let Some(record) = capture::record(record) else {
+        return;
+    };
+    if let Some(sink) = global_ops_sink() {
+        sink.emit_record_in(record, context);
     }
 }
 
