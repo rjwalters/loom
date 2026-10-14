@@ -180,6 +180,59 @@ pub fn doctor_cycle_capped<C: AsRef<str>>(trusted: &[C]) -> bool {
     })
 }
 
+/// The Capped-PR Recovery Pass's one recommendation on a Champion-held PR
+/// whose Doctor cycle is capped (`champion-pr-merge.md`). Posted once, with
+/// `loom:operator`, which routes the PR to the operator inbox (#11905).
+pub const CAPPED_HOLD_RECOMMENDATION_MARKER: &str = "<!-- champion:capped-hold-recommendation -->";
+
+/// Whether the capped-hold recommendation stands on a held PR (#11905): a
+/// trusted comment opening with [`CAPPED_HOLD_RECOMMENDATION_MARKER`] after
+/// the newest hold marker. Its `loom:operator` is a routing to a human, not
+/// the pre-#11861 hold label, so `labels migrate --holds` leaves it on.
+#[must_use]
+pub fn capped_hold_routed<C: AsRef<str>>(trusted: &[C]) -> bool {
+    let hold = trusted.iter().rposition(|c| {
+        let c = c.as_ref();
+        c.starts_with(MERGE_RISK_HOLD_MARKER) || c.starts_with(CRITICAL_FILE_HOLD_MARKER)
+    });
+    trusted.iter().enumerate().any(|(i, c)| {
+        hold.is_none_or(|h| i > h) && c.as_ref().starts_with(CAPPED_HOLD_RECOMMENDATION_MARKER)
+    })
+}
+
+/// The park record reasons the sweep's Doctor-cycle cap writes
+/// (`sweep-*-lifecycle.md`: `doctor cycle exhausted`;
+/// `sweep-execution-model.md`: `doctor cap`), compared lowercased.
+const DOCTOR_CAP_REASONS: [&str; 2] = [DOCTOR_CYCLE_CAP_PHRASE, "doctor cap"];
+
+/// Whether a PR body declares a Doctor-cycle-cap park (#11905): a park
+/// record whose reason opens with a cap reason, or the cap marker itself. A
+/// listing-only hint, like [`body_declares_hold`], used only to skip a gate
+/// read that could not serve the PR.
+#[must_use]
+pub fn body_declares_doctor_cap(body: &str) -> bool {
+    body.contains(DOCTOR_CYCLE_CAP_MARKER)
+        || crate::park_record::parse(body).iter().any(|r| {
+            r.reason.as_deref().is_some_and(|x| {
+                let x = x.to_ascii_lowercase();
+                DOCTOR_CAP_REASONS.iter().any(|c| x.starts_with(c))
+            })
+        })
+}
+
+/// The label shape of a Champion hold at `loom:pr` (#11905): the approval
+/// beside the blocked hold and no operator hold, so a count of it never
+/// overlaps a `loom:operator` count. This is the label shape only: no code
+/// strips `loom:pr` from the pair, so a markerless pair (another actor's park
+/// at approval, #11932) is counted too. Telling them apart needs the trusted
+/// hold marker ([`is_champion_hold`]), a per-PR comment read.
+#[must_use]
+pub fn held_approval_shape<L: AsRef<str>>(labels: &[L]) -> bool {
+    labels.iter().any(|l| l.as_ref() == "loom:pr")
+        && crate::work_finder::is_blocked_hold(labels)
+        && !crate::work_finder::is_operator_hold(labels)
+}
+
 /// Whether Doctor may work a PR (#11861): [`doctor_shape`] labels, a Champion
 /// hold standing in its **trusted** comments, and the Doctor-cycle cap not hit
 /// since the hold.
@@ -302,6 +355,46 @@ mod tests {
         // The durable marker is the cap record (#11861).
         let marked = format!("{DOCTOR_CYCLE_CAP_MARKER}\nPR #7 parked");
         assert!(!doctor_may_work(&shape, &[hold.as_str(), marked.as_str()]));
+    }
+
+    #[test]
+    fn a_capped_hold_recommendation_counts_only_after_the_current_hold() {
+        let hold = format!("{MERGE_RISK_HOLD_MARKER}\nx");
+        let rec = format!("{CAPPED_HOLD_RECOMMENDATION_MARKER}\nreview, close or release");
+        assert!(capped_hold_routed(&[hold.as_str(), rec.as_str()]));
+        assert!(!capped_hold_routed(&[rec.as_str(), hold.as_str()]), "a new hold episode");
+        assert!(!capped_hold_routed(&[hold.as_str()]));
+        let quoted = format!("see {CAPPED_HOLD_RECOMMENDATION_MARKER}");
+        assert!(!capped_hold_routed(&[hold.as_str(), quoted.as_str()]), "quoted");
+    }
+
+    #[test]
+    fn a_body_doctor_cap_is_recognised_by_reason_or_marker() {
+        let rec = |reason: &str| {
+            crate::park_record::render_park(
+                &[],
+                Some("sweep"),
+                Some("2026-10-14T00:00:00Z"),
+                Some(reason),
+            )
+        };
+        assert!(body_declares_doctor_cap(&rec("doctor cycle exhausted")));
+        assert!(body_declares_doctor_cap(&rec("doctor cap")));
+        assert!(body_declares_doctor_cap(&format!("body\n{DOCTOR_CYCLE_CAP_MARKER}")));
+        assert!(!body_declares_doctor_cap(&rec(MERGE_RISK_HOLD_REASON)));
+        assert!(!body_declares_doctor_cap(&rec("rebase budget exhausted")));
+        assert!(!body_declares_doctor_cap("no record"));
+    }
+
+    #[test]
+    fn the_held_approval_shape_excludes_operator_holds() {
+        assert!(held_approval_shape(&["loom:pr", "loom:blocked"]));
+        assert!(held_approval_shape(&["loom:pr", "loom:needs-capability"]), "retired name");
+        assert!(!held_approval_shape(&["loom:pr"]));
+        assert!(!held_approval_shape(&["loom:blocked", "loom:changes-requested"]));
+        for op in ["loom:operator", "loom:operator-only"] {
+            assert!(!held_approval_shape(&["loom:pr", "loom:blocked", op]), "{op}");
+        }
     }
 
     #[test]

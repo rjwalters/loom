@@ -237,8 +237,10 @@ _pskill_version_lt() {
 # /tmp, /private/tmp, /var/folders, /private/var/folders or $TMPDIR.
 # LOOM_SKILLS_TEMP_ROOTS (space-separated) replaces that list; the test suite
 # sets it because its fixtures live under mktemp.
+# LOOM_PROVISION_ALLOW_TMP_REFERENCE=1 turns the check off.
 _pskill_is_temp() {
     local real root roots
+    [[ "${LOOM_PROVISION_ALLOW_TMP_REFERENCE:-0}" == "1" ]] && return 1
     real="$(cd "$1" 2>/dev/null && pwd -P)" || return 1
     roots="${LOOM_SKILLS_TEMP_ROOTS-/tmp /private/tmp /var/folders /private/var/folders ${TMPDIR:-}}"
     for root in $roots; do
