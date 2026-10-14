@@ -75,8 +75,8 @@ look for a live process whose cwd is inside it and is not your own session (an
 in-session Doctor may hold it with no lease). Any line printed = occupied:
 
 ```bash
-WT="$(cd .loom/worktrees/<issue-N|pr-N> 2>/dev/null && pwd -P)" && S="${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"
-for p in $(pgrep -u "$(id -u)"); do
+WT="$(cd .loom/worktrees/<issue-N|pr-N> 2>/dev/null && pwd -P)"; S="${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"
+for p in $([ -n "$WT" ] && pgrep -u "$(id -u)"); do
   c=$(readlink "/proc/$p/cwd" 2>/dev/null || lsof -a -p "$p" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p')
   case "$c" in "$WT"|"$WT"/*) q=$p; while [ "${q:-1}" -gt 1 ] && [ "$q" != "$S" ]; do q=$(ps -o ppid= -p "$q" | tr -d ' '); done
     [ "$q" = "$S" ] || ps -o pid=,command= -p "$p";; esac

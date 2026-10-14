@@ -121,6 +121,31 @@ else
     fail "occupied-worktree check precedes worktree selection/checkout (occ=$occ_line pick=$pick_line)"
 fi
 
+# Behavioral: run the documented probe verbatim. A missing worktree must print
+# nothing (not every process); a reparented process inside one must be reported.
+probe_dir=$(mktemp -d)
+awk -v h="### Occupied worktree" 'index($0,h)==1{f=1} f&&/^```bash$/{g=1;next} g&&/^```$/{exit} g' "$DOCTOR_MD" > "$probe_dir/probe.txt"
+if [[ -s "$probe_dir/probe.txt" ]]; then
+    run_probe() { (cd "$probe_dir" && mkdir -p .loom/worktrees && sed "s#\.loom/worktrees/<issue-N|pr-N>#.loom/worktrees/$1#" probe.txt | bash 2>/dev/null); }
+    if [[ -z "$(run_probe nonexistent-1)" ]]; then
+        pass "occupied-worktree probe prints nothing for a nonexistent worktree"
+    else
+        fail "occupied-worktree probe prints processes for a nonexistent worktree"
+    fi
+    mkdir -p "$probe_dir/.loom/worktrees/pr-1"
+    (cd "$probe_dir/.loom/worktrees/pr-1" && setsid sleep 30 >/dev/null 2>&1 &)
+    sleep 0.3
+    if run_probe pr-1 | grep -q "sleep 30"; then
+        pass "occupied-worktree probe reports a live process inside an existing worktree"
+    else
+        fail "occupied-worktree probe misses a live process inside an existing worktree"
+    fi
+    pkill -u "$(id -u)" -f "^sleep 30$" 2>/dev/null || true
+else
+    fail "could not extract the occupied-worktree probe snippet from doctor.md"
+fi
+rm -rf "$probe_dir"
+
 # --- Test 4: branch-to-worktree classification (in-script regex simulation) ---
 echo ""
 echo "Test 4: branch classification regex (simulated)"
