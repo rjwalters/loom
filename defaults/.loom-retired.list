@@ -138,3 +138,8 @@ scripts/tests/test-operator-only-subkind.sh
 # #11860 (2026-10-14) — terminal promotion verdicts retire the revise label;
 # its routing suite was renamed for what it now covers.
 scripts/tests/test-champion-needs-revision-routing.sh
+
+# #11904 (2026-10-14) — Champion's capacity deferral was removed in #11885, so
+# its idempotency classifier has no caller; the script and its suite go.
+scripts/classify-capacity-defer.sh
+scripts/tests/test-classify-capacity-defer.sh

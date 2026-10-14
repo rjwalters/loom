@@ -56,7 +56,7 @@
 //!
 //! **Replay.** `pick.decision`'s `item_draw` carries the seed inputs, each
 //! workspace's **starting pool** in pool order with every item's weight
-//! (`pool[]`), and every draw's roll and picked index. [`replay_record`]
+//! (`pools[]`), and every draw's roll and picked index. [`replay_record`]
 //! re-derives each seed and roll from the header and re-runs the selection
 //! over the logged pool minus earlier picks, so the whole sequence replays
 //! from the record alone.
@@ -640,7 +640,7 @@ pub struct ReplayedPick {
 }
 
 /// Replay `record`'s draws from what it logged alone: for each workspace,
-/// start from its logged `pool[]` (in `index` order), and for each of its
+/// start from its logged `pools[]` (in `index` order), and for each of its
 /// draws, re-derive the seed from the header, check the logged seed, total
 /// and roll against it, select by the roll over the pool minus earlier picks,
 /// and check the logged picked index and item. Returns the picks in draw
@@ -659,7 +659,7 @@ pub fn replay_record(
     let tick_counter = num(&record.tick_counter, "tick_counter")?;
     let mut pools: BTreeMap<&str, Vec<&crate::telemetry::kinds::pick_decision::PickItemPoolEntry>> =
         BTreeMap::new();
-    for row in &record.pool {
+    for row in &record.pools {
         pools.entry(row.repo.as_str()).or_default().push(row);
     }
     for rows in pools.values_mut() {

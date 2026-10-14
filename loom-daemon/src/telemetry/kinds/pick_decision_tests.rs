@@ -360,10 +360,10 @@ fn reassemble(chunks: &[PickDecisionRecord]) -> PickDecisionRecord {
         .iter()
         .find_map(|c| c.item_draw.clone())
         .map(|mut d| {
-            d.pool = sorted
+            d.pools = sorted
                 .iter()
                 .filter_map(|c| c.item_draw.as_ref())
-                .flat_map(|d| d.pool.iter().cloned())
+                .flat_map(|d| d.pools.iter().cloned())
                 .collect();
             d.draws = sorted
                 .iter()
@@ -458,7 +458,7 @@ fn item_draws_split_in_order_with_their_header_on_every_chunk() {
                 skip_reason: PickSkipReason::Quota,
                 count: 4,
             }],
-            pool: Vec::new(),
+            pools: Vec::new(),
             draws,
         },
     ));
@@ -487,6 +487,7 @@ fn a_large_item_pool_splits_into_bounded_chunks_and_reassembles() {
         .map(|i| PickItemPoolEntry {
             repo: "o/r".to_string(),
             index: i,
+            number: 1000 + i,
             issue: Some(1000 + i),
             pr: (i % 4 == 0).then_some(5000 + i),
             step: "judge".to_string(),
@@ -504,7 +505,7 @@ fn a_large_item_pool_splits_into_bounded_chunks_and_reassembles() {
             tick_counter: "2".to_string(),
             draws_total: 0,
             excluded: Vec::new(),
-            pool,
+            pools: pool,
             draws: Vec::new(),
         },
     ));
@@ -519,7 +520,7 @@ fn a_large_item_pool_splits_into_bounded_chunks_and_reassembles() {
     let indices: Vec<u32> = back
         .item_draw
         .unwrap()
-        .pool
+        .pools
         .iter()
         .map(|p| p.index)
         .collect();

@@ -387,12 +387,13 @@ pub fn item_draw_record(
             })
         })
         .collect();
-    let pool = workspaces
+    let pools = workspaces
         .iter()
         .flat_map(|w| {
             w.pool.iter().enumerate().map(|(i, c)| PickItemPoolEntry {
                 repo: w.repo.to_string(),
                 index: u32::try_from(i).unwrap_or(u32::MAX),
+                number: c.target(),
                 issue: c.item.issue,
                 pr: c.item.pr,
                 step: c.step.as_str().to_string(),
@@ -410,7 +411,7 @@ pub fn item_draw_record(
         tick_counter: tick_counter.to_string(),
         draws_total: draws.len(),
         excluded,
-        pool,
+        pools,
         draws,
     })
 }

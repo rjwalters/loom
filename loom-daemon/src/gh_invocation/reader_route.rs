@@ -163,6 +163,8 @@ pub(super) fn gateway_fault(result: &GhCompletion) -> Fault {
 /// ([`crate::forge_gateway::outage::withdraw_for_outage`]).
 pub(super) fn withdraw_gateway_outage(why: &str) {
     crate::forge_gateway::outage::withdraw_for_outage(why);
+    // A CLI or front process: let the next one skip the gateway too.
+    crate::forge_gateway::note_outage_from_front();
 }
 
 /// A captured run that exited 0.

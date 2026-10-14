@@ -9,10 +9,10 @@
 //! While `main` is verified red it also leads the dispatch order (#11547:
 //! `candidate_cmp`'s leading key, first in its workspace and its workspace
 //! first in the draw). It is not a level: it keeps its bypass of the build
-//! back-off,
-//! the file-overlap gate and the repo-sharding slice
+//! back-off and the file-overlap gate
 //! ([`super::ordering::PriorityCandidate::main_red_fix`]), which a red `main`
-//! would otherwise deadlock.
+//! would otherwise deadlock. (Repo sharding left dispatch in #11682, so there
+//! is no sharding slice to bypass.)
 //!
 //! "Verified red" is [`WorkspaceHealthStates::is_halted`], never the
 //! work finder's per-root `halted` hold, which is also set while a gate run is

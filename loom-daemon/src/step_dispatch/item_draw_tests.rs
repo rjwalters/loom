@@ -269,7 +269,7 @@ fn replay_from_the_pick_decision_record_gives_the_same_picks() {
     bad.draws[3].picked_index += 1;
     assert!(replay_record(&bad).is_err());
     let mut bad = parsed;
-    bad.pool[0].weight += 1;
+    bad.pools[0].weight += 1;
     assert!(replay_record(&bad).is_err());
 }
 

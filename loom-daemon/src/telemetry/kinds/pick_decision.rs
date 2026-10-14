@@ -379,7 +379,7 @@ pub struct PickItemDraw {
     /// Each drawn workspace's pool before its first draw, in pool order
     /// (the chunk's in-order slice). Empty only when nothing was drawn.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub pool: Vec<PickItemPoolEntry>,
+    pub pools: Vec<PickItemPoolEntry>,
     /// Every draw, in order (the chunk's in-order slice).
     pub draws: Vec<PickItemDrawStep>,
 }
@@ -391,6 +391,8 @@ pub struct PickItemPoolEntry {
     pub repo: String,
     /// 0-based position in the workspace's pool.
     pub index: u32,
+    /// The number the step acts on (the PR for a PR step).
+    pub number: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub issue: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -438,7 +440,7 @@ pub struct PickItemDrawStep {
     /// The roll in `0..total_weight`.
     pub roll: u64,
     /// The drawn item's index in the pool as it stood: the workspace's
-    /// `pool[]` minus its earlier picks, in pool order.
+    /// `pools[]` entries minus its earlier picks, in pool order.
     pub picked_index: usize,
     /// The number the step acts on (the PR for a PR step).
     pub number: u32,
@@ -762,7 +764,7 @@ pub fn split_into_chunks(record: PickDecisionRecord, max_bytes: usize) -> Vec<Pi
             header
                 .item_draw
                 .as_mut()
-                .map(|d| std::mem::take(&mut d.pool))
+                .map(|d| std::mem::take(&mut d.pools))
                 .unwrap_or_default()
                 .into_iter()
                 .map(PickChunkEntry::ItemPool),
@@ -819,7 +821,7 @@ pub fn split_into_chunks(record: PickDecisionRecord, max_bytes: usize) -> Vec<Pi
             // chunk, so the draw lands in it.
             PickChunkEntry::ItemPool(p) => {
                 if let Some(item_draw) = chunk.item_draw.as_mut() {
-                    item_draw.pool.push(p);
+                    item_draw.pools.push(p);
                 }
             }
             PickChunkEntry::ItemDraw(d) => {
