@@ -571,6 +571,19 @@ pub fn stage_points(samples: &[DwellSample], inputs: &[RepoInput]) -> Vec<Metric
     points
 }
 
+/// [`stage_points`] split into records of at most
+/// [`crate::telemetry::ops::MAX_POINTS_PER_RECORD`] points. One record would
+/// be truncated by `bounded_points` past that bound, and with per-repo states
+/// a host sampling a few dozen repos (the fleet captain) crosses it. The
+/// dwell delta pairs come first, so they always ride in the first batch.
+#[must_use]
+pub fn stage_batches(samples: &[DwellSample], inputs: &[RepoInput]) -> Vec<Vec<MetricPoint>> {
+    stage_points(samples, inputs)
+        .chunks(crate::telemetry::ops::MAX_POINTS_PER_RECORD)
+        .map(<[MetricPoint]>::to_vec)
+        .collect()
+}
+
 /// The live forge reads, through `gh api` in the repo's own checkout (so a
 /// cross-owner repo uses its own owner's credential).
 pub struct GhStageFetcher;
@@ -743,7 +756,9 @@ pub(in crate::observability) async fn record(
         let previous = sampler.last_at();
         let samples = sampler.sample(&inputs, Utc::now(), &mut GhStageFetcher);
         drop(guard);
-        sink.emit_metrics_since(stage_points(&samples, &inputs), previous);
+        for batch in stage_batches(&samples, &inputs) {
+            sink.emit_metrics_since(batch, previous);
+        }
         let sampled = inputs.iter().map(|input| input.slug.clone());
         crate::observability::captain_gauges::note_produced(STAGE_JOB, sampled, Utc::now());
     }));

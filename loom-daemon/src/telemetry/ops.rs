@@ -708,7 +708,9 @@ impl MetricName {
             Self::DispatchRoleIdleSlots => "Role-runner agent slots idle under the ceiling.",
             Self::ForgeStageDwell => "Seconds items spent in a forge label stage, by state.",
             Self::ForgeStageDwellSamples => "Stage transitions counted in loom.forge.stage_dwell.",
-            Self::ForgeStageItems => "Open items carrying a stage label, by state.",
+            Self::ForgeStageItems => {
+                "Open items per repo by state: stage labels and queue states (overlapping)."
+            }
             Self::QueueDispositionRowsDropped => {
                 "Ready-queue rows dropped from a disposition export pass, by reason."
             }

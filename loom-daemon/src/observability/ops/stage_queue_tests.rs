@@ -6,8 +6,10 @@ use std::path::PathBuf;
 
 use super::{queue_counts, QUEUE_STATES};
 use crate::forge_listing::{parse_rest_issues, RestIssue};
-use crate::observability::ops::stage_dwell::{stage_points, RepoInput};
-use crate::telemetry::ops::{bounded_labels, MetricName, MetricPoint};
+use crate::observability::ops::stage_dwell::{stage_batches, stage_points, DwellSample, RepoInput};
+use crate::telemetry::ops::{
+    bounded_labels, MetricName, MetricPoint, MetricPointsRecord, MAX_POINTS_PER_RECORD,
+};
 
 fn row(number: u32, labels: &[&str], pr_body: Option<&str>) -> RestIssue {
     let labels: Vec<_> = labels
@@ -130,4 +132,52 @@ fn queue_states_export_per_repo_only_when_the_walk_completed() {
     for point in &points {
         assert_eq!(bounded_labels(&point.labels), point.labels);
     }
+}
+
+/// The fleet captain samples dozens of repos: one record would be cut at
+/// `MAX_POINTS_PER_RECORD` by `bounded_points`, silently dropping every repo
+/// past the cut. Batched, every repo's every state survives the bound.
+#[test]
+fn a_many_repo_sample_survives_the_per_record_bound() {
+    let repos = 62;
+    let inputs: Vec<RepoInput> = (0..repos)
+        .map(|n| RepoInput {
+            slug: format!("acme/r{n}"),
+            root: PathBuf::from("/w"),
+            listings: BTreeMap::new(),
+            queue: Some(counts(&[])),
+        })
+        .collect();
+    let samples = [DwellSample {
+        stage: "created_to_curated",
+        seconds: 5,
+    }];
+    let batches = stage_batches(&samples, &inputs);
+    assert!(batches.len() > 1, "{repos} repos must not fit one record");
+    let mut kept = Vec::new();
+    for batch in batches {
+        assert!(batch.len() <= MAX_POINTS_PER_RECORD);
+        let record = MetricPointsRecord {
+            captured_at: chrono::Utc::now(),
+            interval_start: None,
+            points: batch,
+        };
+        kept.extend(record.bounded_points());
+    }
+    assert_eq!(kept.len(), stage_points(&samples, &inputs).len(), "nothing truncated");
+    for n in 0..repos {
+        let repo = format!("acme/r{n}");
+        let states = kept
+            .iter()
+            .filter(|p| p.name == MetricName::ForgeStageItems)
+            .filter(|p| p.labels.get("repo") == Some(&repo))
+            .count();
+        assert_eq!(states, 6 + QUEUE_STATES.len(), "{repo} lost states");
+    }
+    assert!(
+        kept.iter()
+            .take(2)
+            .all(|p| p.name != MetricName::ForgeStageItems),
+        "dwell pairs lead the first batch"
+    );
 }

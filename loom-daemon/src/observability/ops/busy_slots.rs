@@ -17,6 +17,11 @@
 //! it, so `Σ busy_slots{role≠"sweep"} + role_idle_slots = role_max_concurrent`.
 //! The host's whole agent capacity is the sum of the two ceilings.
 //!
+//! The role ceiling is the largest among the tick's repos with the role
+//! runner enabled (admission resolves it per repo), re-read at most every
+//! [`CEILING_TTL`]. `loom-daemon status` resolves it from the primary
+//! workspace only, so on a host whose repos disagree the two can differ.
+//!
 //! Absent, never a guessed zero: no occupancy reading, no `sweep` point; no
 //! role-runner guard in the process, no role points. A PR-set sweep
 //! (`/loom:sweep --prs`, dispatched only by hand) is in neither pool and is
@@ -24,6 +29,8 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use crate::telemetry::ops::{MetricName, MetricPoint};
 use crate::work_finder::TickReport;
@@ -88,19 +95,55 @@ pub fn busy_points(
     points
 }
 
+/// How long a resolved role ceiling is reused before the roots' configs are
+/// read again. The ceiling is a config value, not load: re-reading every
+/// root's `.loom/config.json` on every tick buys nothing, while this bound
+/// still picks up an operator's `maxConcurrent` edit within minutes.
+pub const CEILING_TTL: Duration = Duration::from_secs(300);
+
+/// The last resolved ceiling, with the roots it was resolved for.
+struct CeilingCache {
+    roots: Vec<PathBuf>,
+    at: Instant,
+    ceiling: usize,
+}
+
+static CEILING: Mutex<Option<CeilingCache>> = Mutex::new(None);
+
+/// [`role_ceiling`] of `roots`' configs, cached for [`CEILING_TTL`] and
+/// re-resolved at once when the root set changes.
+fn cached_role_ceiling(roots: &[PathBuf]) -> usize {
+    let mut cache = CEILING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(hit) = cache
+        .as_ref()
+        .filter(|c| c.roots == roots && c.at.elapsed() < CEILING_TTL)
+    {
+        return hit.ceiling;
+    }
+    let configs: Vec<_> = roots
+        .iter()
+        .map(|root| crate::role_runner::read_role_runner_config(root))
+        .collect();
+    let ceiling = role_ceiling(&configs);
+    *cache = Some(CeilingCache {
+        roots: roots.to_vec(),
+        at: Instant::now(),
+        ceiling,
+    });
+    ceiling
+}
+
 /// Export the tick's busy slots. A no-op without an ops sink.
 pub fn record_tick(report: &TickReport, roots: &[PathBuf]) {
     if super::global_ops_sink().is_none() {
         return;
     }
     let running = crate::role_runner::global_active_runs_by_role();
-    let roles = running.as_ref().map(|running| {
-        let configs: Vec<_> = roots
-            .iter()
-            .map(|root| crate::role_runner::read_role_runner_config(root))
-            .collect();
-        (running, role_ceiling(&configs))
-    });
+    let roles = running
+        .as_ref()
+        .map(|running| (running, cached_role_ceiling(roots)));
     super::emit_metrics(busy_points(report.occupancy, roles));
 }
 
