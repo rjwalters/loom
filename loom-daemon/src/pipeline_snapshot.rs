@@ -108,6 +108,17 @@ pub struct RepoPipelineSnapshot {
     /// `createdAt`. `None` when there are no held PRs (not a failure — see
     /// [`Self::operator_held`]) or the read failed.
     pub operator_held_oldest_days: Option<i64>,
+    /// Open PRs Champion holds at `loom:pr` (#11905): the approval beside
+    /// `loom:blocked`, and no operator hold
+    /// ([`crate::champion_hold::held_approval_shape`]), so it never overlaps
+    /// [`Self::operator_held`]. The sibling count that keeps Champion's
+    /// merge-risk and critical-file holds visible once `labels migrate
+    /// --holds` moves them off `loom:operator`: the two together are the held
+    /// approvals. Read from the `loom:pr` listing (no extra call when
+    /// [`Self::approved`] is fetched too) and fetched with
+    /// [`PipelineMetrics::operator_held`]; `None` when that read failed.
+    /// Additive: absent from consumers that predate it.
+    pub champion_held: Option<usize>,
     /// Open issues held for a human (Issue #8091): labeled `loom:operator`, or
     /// still carrying the retired `loom:operator-only` it replaced (#11795;
     /// the field keeps its name, a wire contract). The park every dispatch
@@ -191,7 +202,9 @@ pub struct PipelineMetrics {
     /// PRs merged inside the configured window.
     pub merged: bool,
     /// Open PRs labeled `loom:operator`, plus their `mergeable`/age
-    /// breakdown — see [`RepoPipelineSnapshot::operator_held`] (Issue #8091).
+    /// breakdown — see [`RepoPipelineSnapshot::operator_held`] (Issue #8091)
+    /// — and the Champion-held sibling count,
+    /// [`RepoPipelineSnapshot::champion_held`] (#11905).
     pub operator_held: bool,
     /// Open issues held by `loom:operator` — see
     /// [`RepoPipelineSnapshot::operator_only_issues`] (Issue #8091).

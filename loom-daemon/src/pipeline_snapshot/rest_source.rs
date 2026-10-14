@@ -19,7 +19,8 @@
 //!   `gh pr list --label loom:operator` call runs **only when the REST
 //!   `loom:operator` count is non-zero**, which is usually not the case.
 //!
-//! So an unchanged root costs at most ~2 *billable* (non-`304`) calls.
+//! So an unchanged root costs at most ~2 *billable* (non-`304`) calls. The
+//! Champion-held count (#11905) reads the `loom:pr` listing `approved` uses.
 //!
 //! **Truncation:** the REST listing is a single 100-row page. When a label's
 //! page comes back full it may be truncated, and a capped `100` would be read
@@ -32,7 +33,7 @@ use anyhow::Result;
 
 use super::{GhPipelineSource, RepoPipelineSnapshot};
 use crate::forge_listing::{self, CachedListing, RestIssue};
-use crate::work_finder::{OPERATOR_HOLD_LABEL, PARK_LABELS};
+use crate::work_finder::{BLOCKED_HOLD_LABEL, OPERATOR_HOLD_LABEL, PARK_LABELS};
 
 /// Whether a metric counts the issue rows or the PR rows of a REST listing
 /// (REST issue listings return both — [`RestIssue::is_pull_request`]).
@@ -284,6 +285,7 @@ pub(super) fn fetch(src: &GhPipelineSource, root: &Path) -> RepoPipelineSnapshot
     }
     if m.operator_held {
         fetch_operator_held(&ctx, &mut rec, &mut snap);
+        snap.champion_held = rec.take(champion_held(&ctx));
     }
     if m.operator_only_issues {
         snap.operator_only_issues = rec.take(operator_held_issues(&ctx));
@@ -314,6 +316,27 @@ fn operator_held_issues(ctx: &Ctx<'_>) -> Result<usize> {
         },
     )?;
     Ok(held + legacy)
+}
+
+/// Open PRs Champion holds at `loom:pr` (#11905): `loom:pr` + `loom:blocked`
+/// without an operator hold. The `loom:pr` listing is shared with `approved`.
+fn champion_held(ctx: &Ctx<'_>) -> Result<usize> {
+    ctx.count(
+        "loom:pr",
+        Side::Pr,
+        |r| crate::champion_hold::held_approval_shape(&r.labels),
+        || ctx.graphql_search_count(Side::Pr, &champion_held_search_query()),
+    )
+}
+
+/// The GraphQL fallback search for [`champion_held`] on a full REST page:
+/// every operator-hold name excluded, as the REST filter does.
+fn champion_held_search_query() -> String {
+    let mut q = format!("is:open label:loom:pr label:{BLOCKED_HOLD_LABEL}");
+    for name in crate::work_finder::OPERATOR_HOLD_NAMES.iter() {
+        q.push_str(&format!(" -label:{name}"));
+    }
+    q
 }
 
 /// The three `loom:operator` metrics (Issue #8091). Count and age come from

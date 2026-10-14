@@ -33,6 +33,7 @@
 //! | `issue_no_pr` | `loom:issue` with no open PR closing it |
 //! | `parked` | issues carrying a park label (registry `park` property) |
 //! | `pr_held` | **PRs** carrying a hold label (registry `hold` property), e.g. an approved `loom:pr` under `loom:operator` |
+//! | `pr_champion_held` | **PRs** Champion holds at `loom:pr`: `loom:pr` + `loom:blocked`, no operator hold (#11905), a subset of `pr_held` |
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -44,7 +45,7 @@ const LOOM_PREFIX: &str = concat!("loom", ":");
 pub const TRIAGE: &str = "loom:triage";
 
 /// Every state this module counts, in export order.
-pub const QUEUE_STATES: [&str; 7] = [
+pub const QUEUE_STATES: [&str; 8] = [
     "triage",
     "unlabeled",
     "curated_not_promoted",
@@ -52,6 +53,7 @@ pub const QUEUE_STATES: [&str; 7] = [
     "issue_no_pr",
     "parked",
     "pr_held",
+    "pr_champion_held",
 ];
 
 fn has(item: &RestIssue, label: &str) -> bool {
@@ -79,6 +81,9 @@ pub fn queue_counts(rows: &[RestIssue]) -> BTreeMap<&'static str, usize> {
         if row.is_pull_request {
             if has_any(row, &crate::work_finder::HOLD_NAMES) {
                 bump("pr_held");
+            }
+            if crate::champion_hold::held_approval_shape(&row.labels) {
+                bump("pr_champion_held");
             }
             continue;
         }

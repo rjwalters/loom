@@ -2483,6 +2483,7 @@ mod tests {
                 operator_held_conflicting: Some(1),
                 operator_held_oldest_days: Some(4),
                 operator_only_issues: Some(6),
+                champion_held: Some(7),
                 error: None,
             },
         )]);
@@ -2505,6 +2506,8 @@ mod tests {
         assert_eq!(value[0]["operator_held_conflicting"], serde_json::json!(1));
         assert_eq!(value[0]["operator_held_oldest_days"], serde_json::json!(4));
         assert_eq!(value[0]["operator_only_issues"], serde_json::json!(6));
+        // #11905: the Champion-held sibling count rides the same row.
+        assert_eq!(value[0]["champion_held"], serde_json::json!(7));
         // `/repos/loom` is not a real git checkout, so the URL derivation is
         // expected to fail gracefully rather than fabricate a link.
         assert_eq!(value[0]["forge_url"], serde_json::Value::Null);
