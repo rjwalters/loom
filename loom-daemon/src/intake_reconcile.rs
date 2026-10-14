@@ -14,7 +14,15 @@
 //!
 //! Config (env; default ON): `LOOM_INTAKE_RECONCILE=0|false|off` disables,
 //! `LOOM_INTAKE_RECONCILE_INTERVAL_SECS` (default 300),
-//! `LOOM_INTAKE_RECONCILE_MAX_PER_PASS` (default 50).
+//! `LOOM_INTAKE_RECONCILE_MAX_PER_PASS` (default 50),
+//! `LOOM_INTAKE_RECONCILE_DEMOTE_WINDOW_SECS` (default 86400).
+//!
+//! # Issues opened past intake (#11820)
+//!
+//! Issues must enter at `loom:triage`. One opened already carrying
+//! `loom:issue` or `loom:curated` (by its author, at creation) is demoted to
+//! `loom:triage` with one comment, on both this inline path and the
+//! singleton's: see [`demote`]. A later promotion is never touched.
 //!
 //! # One pass per fleet (W7)
 //!
@@ -31,6 +39,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
 
+pub mod demote;
 pub mod singleton;
 
 /// The intake label applied.
@@ -39,7 +48,8 @@ pub const TRIAGE_LABEL: &str = "loom:triage";
 /// the singleton-output registry derives its deadline from it (#10924).
 pub const DEFAULT_INTERVAL_SECS: u64 = 300;
 const DEFAULT_MAX_PER_PASS: usize = 50;
-/// A filer commonly creates then labels; leave brand-new issues alone.
+/// A filer commonly creates then labels; leave brand-new issues alone. Also
+/// the demotion step's "at creation" grace (#11820).
 const MIN_AGE_SECS: i64 = 120;
 
 /// One open issue row as listed by the pass.
@@ -48,6 +58,9 @@ pub struct IntakeRow {
     pub number: u32,
     pub created_at: Option<DateTime<Utc>>,
     pub labels: Vec<String>,
+    /// The issue author's login, when the listing carries it: the demotion
+    /// step (#11820) tells "opened with" from a later promotion by it.
+    pub author: Option<String>,
 }
 
 /// Issue numbers that need `loom:triage`: no `loom:*` label, old enough, oldest
@@ -66,7 +79,7 @@ pub fn select_unlabeled(rows: &[IntakeRow], now: DateTime<Utc>, cap: usize) -> V
     picked.into_iter().take(cap).map(|r| r.number).collect()
 }
 
-/// Parse `number<TAB>created_at<TAB>label,label` lines.
+/// Parse `number<TAB>created_at<TAB>label,label[<TAB>author]` lines.
 #[must_use]
 pub fn parse_rows(stdout: &str) -> Vec<IntakeRow> {
     stdout
@@ -86,10 +99,16 @@ pub fn parse_rows(stdout: &str) -> Vec<IntakeRow> {
                 .filter(|s| !s.is_empty())
                 .map(str::to_owned)
                 .collect();
+            let author = parts
+                .next()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
             Some(IntakeRow {
                 number,
                 created_at,
                 labels,
+                author,
             })
         })
         .collect()
@@ -143,7 +162,8 @@ fn inline_pass_due(
     enabled && !stands_down() && due()
 }
 
-/// Run the pass for `root` if enabled and due. Returns issues labeled.
+/// Run the pass for `root` if enabled and due. Returns issues labeled or
+/// demoted.
 pub fn maybe_run(gh_bin: &Path, root: &Path) -> usize {
     // Unit tests of other modules drive GhWorkSource with real/fake `gh`; the
     // pass is exercised directly via `run_once` instead.
@@ -169,9 +189,10 @@ pub fn maybe_run(gh_bin: &Path, root: &Path) -> usize {
     )
 }
 
-/// One ungated pass (tests call this directly).
+/// One ungated pass (tests call this directly). Returns issues labeled or
+/// demoted.
 pub fn run_once(gh_bin: &Path, root: &Path, now: DateTime<Utc>, cap: usize) -> usize {
-    const JQ: &str = r#".[] | select(.pull_request|not) | [.number, .created_at, ([.labels[].name]|join(","))] | @tsv"#;
+    const JQ: &str = r#".[] | select(.pull_request|not) | [.number, .created_at, ([.labels[].name]|join(",")), (.user.login // "")] | @tsv"#;
     // W4-C: Hygiene — a shed listing is a skipped pass, retried on the next
     // tick. The shed itself is logged (rate-limited) by the facade, so it is
     // not reported here as a failure every tick.
@@ -201,8 +222,25 @@ pub fn run_once(gh_bin: &Path, root: &Path, now: DateTime<Utc>, cap: usize) -> u
         }
     };
     let rows = parse_rows(&String::from_utf8_lossy(&stdout));
+    // #11820: issues opened as `loom:issue`/`loom:curated` go back to intake.
+    // Its events reads count against the same cap; triage gets the rest.
+    let key = root.display().to_string();
+    let picked = demote::candidates(&key, &rows, now, cap);
+    let mut forge = demote::InlineForge {
+        gh_bin: gh_bin.to_path_buf(),
+    };
+    let demoted = demote::demote_step(&mut forge, root, &key, &key, &picked);
+    if demoted.demoted > 0 {
+        log::info!(
+            "intake_reconcile: demoted {} issue(s) opened past intake to {TRIAGE_LABEL} (#11820)",
+            demoted.demoted
+        );
+    }
+    if demoted.stopped {
+        return demoted.demoted; // likely rate limited / auth; retry next pass
+    }
     let mut labeled = 0;
-    for n in select_unlabeled(&rows, now, cap) {
+    for n in select_unlabeled(&rows, now, cap.saturating_sub(demoted.reads)) {
         let path = format!("repos/{{owner}}/{{repo}}/issues/{n}/labels");
         let label = format!("labels[]={TRIAGE_LABEL}");
         let ok = gh_call::output(
@@ -222,7 +260,7 @@ pub fn run_once(gh_bin: &Path, root: &Path, now: DateTime<Utc>, cap: usize) -> u
             "intake_reconcile: applied {TRIAGE_LABEL} to {labeled} unlabeled issue(s) (#10041)"
         );
     }
-    labeled
+    labeled + demoted.demoted
 }
 
 #[cfg(test)]
