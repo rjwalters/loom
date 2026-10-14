@@ -390,6 +390,178 @@ fn a_front_routes_only_when_its_gh_is_the_checked_one() {
     assert!(!publish::gh_marker_matches(&tmp.path().join("none"), &gh));
 }
 
+/// 2AMLogic/2am#4367: a CLI run by a host job routes through the daemon's
+/// published profiles only on the front's terms: the variable is set, its
+/// marker names the `gh` the facade will exec, and no front outage holds.
+#[test]
+fn a_cli_routes_only_through_a_checked_gh_and_outside_an_outage() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join(".loom").join(DIR_NAME);
+    std::fs::create_dir_all(&base).unwrap();
+    set_mode(&base, 0o700);
+    let gh = tmp.path().join("gh");
+    std::fs::write(&gh, "").unwrap();
+    let other = tmp.path().join("gh-other");
+    std::fs::write(&other, "").unwrap();
+    std::fs::write(
+        base.join("gh-ok"),
+        std::fs::canonicalize(&gh)
+            .unwrap()
+            .to_string_lossy()
+            .as_bytes(),
+    )
+    .unwrap();
+    let env = Some(base.clone().into_os_string());
+    let now = SystemTime::now();
+    let gh_s = gh.to_str().unwrap();
+
+    assert_eq!(cli_base(env.clone(), gh_s, now), Some(base.clone()));
+    // Unset or empty: today's routing.
+    assert_eq!(cli_base(None, gh_s, now), None);
+    assert_eq!(cli_base(Some(OsString::new()), gh_s, now), None);
+    // A different gh than the daemon checked: it might ignore api_host.
+    assert_eq!(cli_base(env.clone(), other.to_str().unwrap(), now), None);
+    // A gh that does not resolve (a bare name on no PATH entry).
+    assert_eq!(cli_base(env.clone(), "loom-test-no-such-gh-binary", now), None);
+    // A directory the daemon never published into.
+    let empty = tmp.path().join(".loom").join("empty");
+    std::fs::create_dir(&empty).unwrap();
+    assert_eq!(cli_base(Some(empty.into_os_string()), gh_s, now), None);
+    // A front outage the daemon or a front recorded holds for its window.
+    outage::note_front_outage(&base);
+    assert_eq!(cli_base(env.clone(), gh_s, now), None);
+    assert_eq!(cli_base(env, gh_s, now + Duration::from_secs(3600)), Some(base));
+}
+
+fn set_mode(path: &std::path::Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// A published base the way the daemon leaves it, with a `gh-ok` for `gh`.
+fn published(root: &std::path::Path, gh: &std::path::Path) -> PathBuf {
+    let base = root.join(".loom").join(DIR_NAME);
+    let profile = base.join("acme");
+    std::fs::create_dir_all(&profile).unwrap();
+    set_mode(&base, 0o700);
+    set_mode(&profile, 0o700);
+    std::fs::write(profile.join("hosts.yml"), "github.com: {}").unwrap();
+    set_mode(&profile.join("hosts.yml"), 0o600);
+    std::fs::write(
+        base.join("gh-ok"),
+        std::fs::canonicalize(gh)
+            .unwrap()
+            .to_string_lossy()
+            .as_bytes(),
+    )
+    .unwrap();
+    base
+}
+
+/// A consumer's base comes from its environment, so the directory itself is
+/// checked: the shape the daemon publishes, ours, closed to others, no links.
+#[test]
+fn a_front_or_cli_refuses_an_untrusted_base_or_profile() {
+    let tmp = tempfile::tempdir().unwrap();
+    let gh = tmp.path().join("gh");
+    std::fs::write(&gh, "").unwrap();
+    let now = SystemTime::now();
+    let base = published(tmp.path(), &gh);
+    let env = |b: &std::path::Path| Some(b.to_path_buf().into_os_string());
+    assert_eq!(front_base(env(&base), &gh, now), Some(base.clone()));
+    assert!(publish::safe_profile(&base.join("acme")));
+
+    // A symlink to a valid published dir.
+    let link_root = tmp.path().join("link");
+    std::fs::create_dir_all(link_root.join(".loom")).unwrap();
+    let link = link_root.join(".loom").join(DIR_NAME);
+    std::os::unix::fs::symlink(&base, &link).unwrap();
+    assert_eq!(front_base(env(&link), &gh, now), None);
+
+    // Not named `.loom/gh-config-gateway`.
+    let odd = tmp.path().join("elsewhere");
+    let odd_gw = odd.join(".loom").join("gateway");
+    std::fs::create_dir_all(&odd_gw).unwrap();
+    set_mode(&odd_gw, 0o700);
+    std::fs::copy(base.join("gh-ok"), odd_gw.join("gh-ok")).unwrap();
+    assert_eq!(front_base(env(&odd_gw), &gh, now), None);
+    let tmp_x = tmp.path().join("x").join(DIR_NAME);
+    std::fs::create_dir_all(&tmp_x).unwrap();
+    set_mode(&tmp_x, 0o700);
+    std::fs::copy(base.join("gh-ok"), tmp_x.join("gh-ok")).unwrap();
+    assert_eq!(front_base(env(&tmp_x), &gh, now), None);
+
+    // Group- or world-writable base, profile dir or hosts.yml.
+    for mode in [0o770, 0o777] {
+        set_mode(&base, mode);
+        assert_eq!(front_base(env(&base), &gh, now), None, "base {mode:o}");
+        set_mode(&base, 0o700);
+    }
+    let profile = base.join("acme");
+    let hosts = profile.join("hosts.yml");
+    set_mode(&hosts, 0o666);
+    assert!(!publish::safe_profile(&profile), "hosts.yml 666");
+    set_mode(&hosts, 0o600);
+    set_mode(&profile, 0o770);
+    assert!(!publish::safe_profile(&profile), "profile 770");
+    set_mode(&profile, 0o700);
+    assert!(publish::safe_profile(&profile));
+
+    // `hosts.yml` (or the owner dir) a symlink.
+    let real = tmp.path().join("real-hosts.yml");
+    std::fs::write(&real, "github.com: {}").unwrap();
+    set_mode(&real, 0o600);
+    std::fs::remove_file(&hosts).unwrap();
+    std::os::unix::fs::symlink(&real, &hosts).unwrap();
+    assert!(!publish::safe_profile(&profile));
+    std::fs::remove_file(&hosts).unwrap();
+    std::fs::rename(&real, &hosts).unwrap();
+    let real_dir = tmp.path().join("real-acme");
+    std::fs::rename(&profile, &real_dir).unwrap();
+    std::os::unix::fs::symlink(&real_dir, &profile).unwrap();
+    assert!(!publish::safe_profile(&profile));
+}
+
+/// The marker and the outage file are read by path: a symlink (to a copy
+/// of a valid marker, or to a long-expired outage) is refused, as is a
+/// writable marker, so no other file can answer for either.
+#[test]
+fn a_front_or_cli_refuses_a_linked_or_writable_marker_or_outage_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let gh = tmp.path().join("gh");
+    std::fs::write(&gh, "").unwrap();
+    let gh_s = gh.to_str().unwrap();
+    let now = SystemTime::now();
+    let adopt = |b: &std::path::Path| cli_base(Some(b.as_os_str().to_owned()), gh_s, now);
+
+    let marked = published(&tmp.path().join("ws1"), &gh);
+    assert_eq!(adopt(&marked), Some(marked.clone()));
+    let copy = tmp.path().join("marker-copy");
+    std::fs::copy(marked.join("gh-ok"), &copy).unwrap();
+    std::fs::remove_file(marked.join("gh-ok")).unwrap();
+    std::os::unix::fs::symlink(&copy, marked.join("gh-ok")).unwrap();
+    assert_eq!(adopt(&marked), None, "a symlinked marker");
+
+    let loose = published(&tmp.path().join("ws2"), &gh);
+    set_mode(&loose.join("gh-ok"), 0o666);
+    assert_eq!(adopt(&loose), None, "a 0666 marker");
+
+    let outaged = published(&tmp.path().join("ws3"), &gh);
+    let expired = tmp.path().join("long-ago");
+    std::fs::write(&expired, "0").unwrap();
+    std::os::unix::fs::symlink(&expired, outaged.join(outage::FRONT_OUTAGE)).unwrap();
+    assert_eq!(adopt(&outaged), None, "a symlinked outage file");
+    std::fs::remove_file(outaged.join(outage::FRONT_OUTAGE)).unwrap();
+    assert_eq!(adopt(&outaged), Some(outaged.clone()));
+    // An outage file the front itself writes (0600) is honoured, not refused.
+    outage::note_front_outage(&outaged);
+    assert_eq!(adopt(&outaged), None);
+    assert_eq!(
+        cli_base(Some(outaged.as_os_str().to_owned()), gh_s, now + Duration::from_secs(3600)),
+        Some(outaged)
+    );
+}
+
 /// #7818's leak class: a profile holds a live key, so its path must be
 /// ignored by the deployed `.gitignore` block AND refused by every stager's
 /// credential list, without either list naming it.

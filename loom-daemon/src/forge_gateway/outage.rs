@@ -42,7 +42,7 @@ const TRANSPORT_MARKERS: &[&str] = &[
 
 /// The marker the agent front leaves beside the profiles: no front routes
 /// through the gateway until the epoch second it holds.
-const FRONT_OUTAGE: &str = "outage-until";
+pub(super) const FRONT_OUTAGE: &str = "outage-until";
 
 /// The status `gh` printed as `HTTP <nnn>` on stderr, if any.
 #[must_use]
