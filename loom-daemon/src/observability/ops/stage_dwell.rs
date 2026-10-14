@@ -9,16 +9,20 @@
 //! ([`crate::forge_listing::list_issues_cached`]). An unchanged listing is a
 //! free `304`. Per-item reads are rare and bounded:
 //!
-//! - one `issues/{n}/events` read gives an item's `labeled` times, and each
-//!   found time is cached for the life of the process;
+//! - one `issues/{n}/events` read gives an item's latest `labeled` times
+//!   ([`super::stage_events`]: page 1, then back from the last page, each
+//!   page one read), and each found time is cached for the life of the
+//!   process;
 //! - one `pulls/{n}` read tells whether a PR that left review merged.
 //!
 //! Both come out of one shared budget of [`FETCH_BUDGET`] reads per sample
 //! across all repos; sampling reads come first, cache warm-up only spends
 //! what is left. Work over the budget waits for the next sample, and nothing
-//! is ever read per tick or per issue per tick. Only the first events page
-//! (100 events) is read, so an item whose label event is further back has no
-//! time and is not sampled. The reads run on a detached task, so a slow forge
+//! is ever read per tick or per issue per tick. At most
+//! [`super::stage_events::MAX_PAGES`] events pages are read per item, so an
+//! item whose latest label event lies further back than that has no time
+//! and is not sampled; an earlier application is never taken for it
+//! (#11924). The reads run on a detached task, so a slow forge
 //! never stalls the collector; a sample still running when the next is due
 //! makes that next one a no-op.
 //!
@@ -58,6 +62,7 @@ use crate::cmd_out::CmdOutcome;
 use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
 use chrono::{DateTime, Utc};
 
+use super::stage_events::LabelTimes;
 use crate::forge_listing::RestIssue;
 use crate::telemetry::ops::{MetricName, MetricPoint};
 use crate::workspace_pool::WorkspacePool;
@@ -82,7 +87,8 @@ pub const STAGE_LABELS: [&str; 6] = [
 /// The labels a PR is "in review" under.
 pub const REVIEW_LABELS: [&str; 3] = [REVIEW_REQUESTED, CHANGES_REQUESTED, PR_APPROVED];
 
-/// Per-item forge reads allowed per sample, across all repos.
+/// Per-item forge reads allowed per sample, across all repos (each events
+/// page is one).
 pub const FETCH_BUDGET: usize = 8;
 
 /// Samples a pending PR lookup is retried before it is dropped.
@@ -198,14 +204,17 @@ impl RepoInput {
 
 /// The per-item forge reads, injected so the sampler is testable offline.
 pub trait StageFetcher {
-    /// The latest `labeled` time of every label on issue/PR `number`, or
-    /// `None` when the read failed.
+    /// The latest `labeled` time of `label` on issue/PR `number`, and of
+    /// every other label the pages read vouch for, in at most `max_pages`
+    /// page reads ([`super::stage_events::walk`]).
     fn label_times(
         &mut self,
         root: &Path,
         slug: &str,
         number: u32,
-    ) -> Option<BTreeMap<String, DateTime<Utc>>>;
+        label: &str,
+        max_pages: usize,
+    ) -> LabelTimes;
     /// When PR `number` merged (`Some(None)`: not merged), or `None` when the
     /// read failed.
     fn merged_at(&mut self, root: &Path, slug: &str, number: u32) -> Option<Option<DateTime<Utc>>>;
@@ -275,8 +284,9 @@ impl Sampler {
         if *budget == 0 {
             return None;
         }
-        *budget -= 1;
-        let times = fetcher.label_times(&input.root, &input.slug, number)?;
+        let read = fetcher.label_times(&input.root, &input.slug, number, label, *budget);
+        *budget = budget.saturating_sub(read.pages.max(1));
+        let times = read.times?;
         for (name, at) in &times {
             self.label_times
                 .insert((input.slug.clone(), number, name.clone()), Some(*at));
@@ -588,6 +598,10 @@ pub fn stage_batches(samples: &[DwellSample], inputs: &[RepoInput]) -> Vec<Vec<M
 /// cross-owner repo uses its own owner's credential).
 pub struct GhStageFetcher;
 
+/// The `caller` stage-dwell's events reads are counted under in
+/// `loom.forge.calls` (the step engine's provider has its own).
+pub const EVENTS_CALLER: &str = "stage_dwell.events";
+
 pub(in crate::observability) fn gh_json(root: &Path, path: &str) -> Option<serde_json::Value> {
     let CmdOutcome::Ran(output) = GhInvocation::new(
         Operation::new("api.rest"),
@@ -608,7 +622,7 @@ pub(in crate::observability) fn gh_json(root: &Path, path: &str) -> Option<serde
     serde_json::from_slice(&output.stdout).ok()
 }
 
-/// The latest `labeled` time per label in an issue's events page.
+/// The latest `labeled` time per label in one events page.
 #[must_use]
 pub fn parse_label_times(events: &serde_json::Value) -> BTreeMap<String, DateTime<Utc>> {
     let mut times = BTreeMap::new();
@@ -636,9 +650,10 @@ impl StageFetcher for GhStageFetcher {
         root: &Path,
         slug: &str,
         number: u32,
-    ) -> Option<BTreeMap<String, DateTime<Utc>>> {
-        let events = gh_json(root, &format!("repos/{slug}/issues/{number}/events?per_page=100"))?;
-        Some(parse_label_times(&events))
+        label: &str,
+        max_pages: usize,
+    ) -> LabelTimes {
+        super::stage_events::read(EVENTS_CALLER, root, slug, number, label, max_pages)
     }
 
     fn merged_at(&mut self, root: &Path, slug: &str, number: u32) -> Option<Option<DateTime<Utc>>> {

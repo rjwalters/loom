@@ -137,6 +137,51 @@ fn only_the_step_engine_may_list_every_open_item() {
 }
 
 #[test]
+fn a_wrongly_shaped_labels_at_is_none_for_that_item_only() {
+    for bad in [
+        json!(["loom:issue", "2026-10-10T00:00:00.000Z"]),
+        json!("2026-10-10T00:00:00.000Z"),
+        json!(17),
+        json!(null),
+    ] {
+        let parsed: MirrorItem = serde_json::from_value(json!({
+            "number": 3, "state": "open", "labels": ["loom:issue"], "labels_at": bad
+        }))
+        .unwrap_or_else(|e| panic!("labels_at {bad}: the item must still parse: {e}"));
+        assert_eq!(parsed.labels_at, None, "{bad}");
+        assert_eq!(parsed.to_rest().unwrap().labels_at, None, "{bad}");
+    }
+
+    // One bad item neither fails the page nor costs its neighbours theirs.
+    let mut bad = item(5, &["loom:curated"], "issue");
+    bad["labels_at"] = json!(["loom:curated"]);
+    let mut good = item(6, &["loom:curated"], "issue");
+    good["labels_at"] = json!({ "loom:curated": "2026-10-11T08:00:00.000Z" });
+    let mut f = Canned {
+        answers: vec![Ok(page(vec![bad, good], None))],
+        ..Canned::default()
+    };
+    let rows = list_open_via(
+        ReadKind::Discovery,
+        &active(),
+        &mut f,
+        REPO,
+        Some("loom:curated"),
+        Pages::First,
+        now(),
+    )
+    .0
+    .unwrap();
+    assert_eq!(rows.len(), 2);
+    let by = |n: u32| rows.iter().find(|r| r.number == n).unwrap();
+    assert_eq!(by(5).labels_at, None);
+    assert!(by(6)
+        .labels_at
+        .as_ref()
+        .is_some_and(|m| m.contains_key("loom:curated")));
+}
+
+#[test]
 fn labels_at_is_carried_to_the_rest_row_and_stays_optional() {
     let with: MirrorItem = serde_json::from_value(json!({
         "number": 3, "state": "open", "labels": ["loom:issue"],
