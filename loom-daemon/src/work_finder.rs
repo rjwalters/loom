@@ -385,7 +385,7 @@ impl WorkItem {
     /// A thin adapter over [`crate::capability::route_mechanical`] — the labels
     /// and body already fetched by the listing, no extra forge read. Returns
     /// [`MechanicalRouting::NotApplicable`](crate::capability::MechanicalRouting::NotApplicable)
-    /// for every item that is not an operator hold without a decision block,
+    /// for every item that is not a capability-only `loom:blocked` park (#11861),
     /// which is all but a handful.
     #[must_use]
     pub fn mechanical_routing(
@@ -408,20 +408,23 @@ impl WorkItem {
         crate::host_affinity::host_constraint(&self.labels, self.body.as_deref())
     }
 
-    /// True when the issue is skipped, with the `loom:operator` park made
-    /// **capability-aware for mechanical holds only** (#6893, AC1; #11795).
+    /// True when the issue is skipped, with the `loom:blocked` park made
+    /// **capability-aware for capability-only parks** (#6893, AC1; #11795;
+    /// re-keyed from `loom:operator` by #11861).
     ///
     /// Identical to [`Self::is_skipped_with_extra`] except for one narrow
-    /// exemption: an operator hold whose body declares capabilities (the
+    /// exemption: a blocked hold whose body declares capabilities (the
     /// `<!-- loom:capability=<name> -->` markers from #6892) that
-    /// `held_capabilities` fully covers, and carries no decision block, is
-    /// **not** skipped — it is dispatchable into the propose-mode lane:
+    /// `held_capabilities` fully covers, names no blocker in a park record and
+    /// carries no decision block, is **not** skipped — it is dispatchable into
+    /// the propose-mode lane:
     ///
-    /// - A decision (a body decision block, or the retired decision label)
-    ///   stays hard-skipped unconditionally, marker or no marker.
-    /// - `loom:blocked` (under any name), `loom:frozen`, [`BUILDING_LABEL`] and
-    ///   any `extra_skip_labels` entry veto the exemption outright — it only
-    ///   ever relaxes the operator hold, never any other reason to skip.
+    /// - A decision (a body decision block) or a named blocker stays
+    ///   hard-skipped unconditionally, marker or no marker.
+    /// - `loom:operator` (under any name: no role acts on it), `loom:frozen`,
+    ///   [`BUILDING_LABEL`] and any `extra_skip_labels` entry veto the
+    ///   exemption outright — it only ever relaxes the blocked hold, never any
+    ///   other reason to skip.
     /// - No declaration, an unrecognized value, or a capability this worker does
     ///   not hold all leave the item skipped (fail-closed).
     ///
@@ -441,11 +444,10 @@ impl WorkItem {
             // Fast path: nothing to relax, or no worker declaration at all.
             return skipped;
         }
-        // The exemption may only cancel the operator hold (any of its names).
+        // The exemption may only cancel the blocked hold (any of its names).
         // If any OTHER skip reason applies, the item stays skipped.
         let other_skip_reason = self.labels.iter().any(|l| {
-            (SKIP_LABELS.contains(&l.as_str())
-                && !labels::OPERATOR_HOLD_NAMES.contains(&l.as_str()))
+            (SKIP_LABELS.contains(&l.as_str()) && !labels::BLOCKED_HOLD_NAMES.contains(&l.as_str()))
                 || extra_skip_labels.iter().any(|e| e == l)
         });
         if other_skip_reason {
@@ -862,7 +864,7 @@ pub trait WorkDispatcher {
 /// dedup-state mechanism to avoid it.
 ///
 /// Costs nothing on the overwhelmingly common path: [`MechanicalRouting::NotApplicable`]
-/// for every item that is not an operator hold without a decision block, and
+/// for every item that is not a capability-only `loom:blocked` park, and
 /// the routing is short-circuited entirely when this host declared no
 /// capabilities.
 ///
@@ -875,13 +877,17 @@ fn log_capability_gap(item: &WorkItem, held_capabilities: &BTreeSet<String>) {
     match item.mechanical_routing(held_capabilities) {
         MechanicalRouting::MissingCapabilities { missing } => {
             log::info!(
-            "work_finder: issue #{} is a mechanical operator hold but this worker does not hold \
+                "work_finder: issue #{} is a capability-only park but this worker does not hold \
              the capability it declares: {} (held: {}). It stays parked — file/comment a \
              capability request naming the gap rather than waiting (#6893)",
-            item.number,
-            missing.join(", "),
-            held_capabilities.iter().cloned().collect::<Vec<_>>().join(", ")
-        )
+                item.number,
+                missing.join(", "),
+                held_capabilities
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
         }
         MechanicalRouting::NoDeclaration { unknown } if !unknown.is_empty() => log::info!(
             "work_finder: issue #{} declares capability value(s) outside the closed vocabulary \

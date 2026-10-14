@@ -504,46 +504,60 @@ pub fn count_pr_rows(rows: &[RestIssue]) -> usize {
 /// `loom:operator-only` PR is still held.
 pub use crate::work_finder::HOLD_NAMES as MERGE_HOLD_LABELS;
 
-/// The review axis's park set (#11743): only `loom:frozen`, which the Judge's
-/// `pr-queue` drops since #11793. `judge.md`'s queue has no other exclusions.
-const REVIEW_HOLD_LABELS: [&str; 1] = [crate::work_finder::FROZEN_LABEL];
-
 /// Labels whose presence means `axis`'s owning role will not drain the PR.
 /// Each set is defined once, where its role's skip rule lives:
 ///
 /// - Merge: [`MERGE_HOLD_LABELS`] (`champion-pr-merge.md`).
-/// - Changes: [`crate::work_finder::PR_LANE_PARK_LABELS`] (`loom:blocked`,
-///   `loom:frozen` and the retired `loom:operator-only`, all from the label
-///   registry), the set `doctor.md` Priority 2 skips (#9421).
-///   `loom:operator` is deliberately *not* in it: Champion routes stale held
-///   PRs to Doctor with that label still on, and Doctor drains them (#7660).
-///   The Doctor-cycle-cap park (`loom:blocked` + `loom:changes-requested`)
-///   falls in this set. `loom:treating` is a live Doctor claim, not a park,
-///   so it stays counted.
-/// - Review: `loom:frozen` only ([`REVIEW_HOLD_LABELS`], #11743).
+/// - Changes and review: [`crate::work_finder::PARK_LABELS`] (`loom:blocked`,
+///   `loom:operator`, `loom:frozen` and the retired names that fold into
+///   them, all from the label registry), the set `pr-queue` drops for Judge
+///   and Doctor (#9421, #11743). Since #11861 `loom:operator` is in it on a PR
+///   too: no role acts on an item a human must decide. The Doctor-cycle-cap
+///   park (`loom:blocked` + `loom:changes-requested`) falls in this set.
+///   `loom:treating` is a live Doctor claim, not a park, so it stays counted.
 pub(crate) fn axis_park_labels(axis: DebtAxis) -> &'static [&'static str] {
     match axis {
         DebtAxis::Merge => &MERGE_HOLD_LABELS,
-        DebtAxis::Changes => &crate::work_finder::PR_LANE_PARK_LABELS,
-        DebtAxis::Review => &REVIEW_HOLD_LABELS,
+        DebtAxis::Changes | DebtAxis::Review => &crate::work_finder::PARK_LABELS,
     }
 }
 
 /// Open PR rows that count as debt on `axis`. PRs the axis's owning role will
 /// not drain are left out ([`axis_park_labels`]): merge debt skips PRs held
 /// for a human ([`MERGE_HOLD_LABELS`]), changes debt skips parked PRs
-/// ([`crate::work_finder::PR_LANE_PARK_LABELS`], #9421), review debt skips frozen
-/// PRs (#11743).
+/// ([`crate::work_finder::PARK_LABELS`], #9421), and so does review debt
+/// (#11743, #11861).
 /// Counting undrainable PRs would keep the work finder's build back-off
 /// (#9410) engaged on a host with many of them. Uses the labels already in
-/// the listing rows.
+/// the listing rows. One exception on the changes axis (#11861): a Champion
+/// hold sent to Doctor (`loom:changes-requested` + `loom:blocked`, its park
+/// record in the body) is Doctor work; Doctor's `pr-queue` confirms it from
+/// the trusted hold marker before acting.
 #[must_use]
 pub fn count_axis_rows(axis: DebtAxis, rows: &[RestIssue]) -> usize {
     let parks = axis_park_labels(axis);
     rows.iter()
         .filter(|r| r.is_pull_request && r.state.eq_ignore_ascii_case("open"))
-        .filter(|r| !r.labels.iter().any(|l| parks.contains(&l.as_str())))
+        .filter(|r| {
+            !r.labels.iter().any(|l| parks.contains(&l.as_str())) || champion_round_trip(axis, r)
+        })
         .count()
+}
+
+/// The listing-only hint that a parked PR is a Champion hold on its round
+/// trip (#11861): out at Doctor on the changes axis, handed back to Judge on
+/// the review axis. The body's park record is the hint; the role's
+/// `pr-queue` confirms it from the trusted hold marker before acting.
+fn champion_round_trip(axis: DebtAxis, r: &RestIssue) -> bool {
+    let shape = match axis {
+        DebtAxis::Changes => crate::champion_hold::doctor_shape(&r.labels),
+        DebtAxis::Review => crate::champion_hold::judge_shape(&r.labels),
+        DebtAxis::Merge => false,
+    };
+    shape
+        && r.body
+            .as_deref()
+            .is_some_and(crate::champion_hold::body_declares_hold)
 }
 
 /// Whether a queue label's listing holds work its role would drain: the
@@ -555,14 +569,19 @@ pub fn count_axis_rows(axis: DebtAxis, rows: &[RestIssue]) -> usize {
 /// queue no longer dispatches a Doctor run that finds nothing. A label with no
 /// axis keeps the plain "any row" rule. Review deliberately does not go
 /// through [`count_axis_rows`], which also drops non-PR and non-open rows: it
-/// keeps "any row", less `loom:frozen` rows (#11743), so an all-frozen review
-/// queue no longer dispatches a Judge whose `pr-queue` would serve nothing.
+/// keeps "any row", less parked rows (`loom:frozen` since #11743, every park
+/// since #11861, which is the set Judge's `pr-queue` drops), so an all-parked
+/// review queue no longer dispatches a Judge whose `pr-queue` would serve
+/// nothing.
 #[must_use]
 pub fn listing_has_work(label: &str, rows: &[RestIssue]) -> bool {
     match DebtAxis::for_label(label) {
-        Some(DebtAxis::Review) => rows
-            .iter()
-            .any(|r| !crate::work_finder::is_frozen(&r.labels)),
+        Some(DebtAxis::Review) => rows.iter().any(|r| {
+            !r.labels
+                .iter()
+                .any(|l| crate::work_finder::PARK_LABELS.contains(&l.as_str()))
+                || champion_round_trip(DebtAxis::Review, r)
+        }),
         Some(axis) => count_axis_rows(axis, rows) > 0,
         None => !rows.is_empty(),
     }

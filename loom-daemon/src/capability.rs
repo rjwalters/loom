@@ -1,14 +1,20 @@
-//! Capability declarations for the mechanical operator-hold dispatch lane
-//! (#6885 Part 2, issue #6893; re-keyed on the body by #11795).
+//! Capability declarations for the capability dispatch lane (#6885 Part 2,
+//! issue #6893; re-keyed on the body by #11795, onto `loom:blocked` by #11861).
 //!
 //! # What this module is for
 //!
-//! `loom:operator` is a **park** on an issue: every dispatch route refuses the
-//! item ([`crate::work_finder::PARK_LABELS`]). Some operator holds need no
-//! judgement, only access a human holds — a credential, root on a host. Since
-//! #11795 such an item is told apart by its body, not a sub-label: it declares
-//! the access it needs in `<!-- loom:capability=<name> -->` markers and carries
-//! **no** ```` ```decision ```` block (a decision is a ruling, never mechanical).
+//! `loom:blocked` is a **park**: every dispatch route refuses the item
+//! ([`crate::work_finder::PARK_LABELS`]). Some blocked items wait on no other
+//! change, only on access a host may hold — a credential, root on a host.
+//! Such an item is told apart by its body, not a sub-label: it declares the
+//! access it needs in `<!-- loom:capability=<name> -->` markers, names **no**
+//! blocker in a park record (#8925) and carries **no** ```` ```decision ````
+//! block (a decision is a ruling, never mechanical). It is what the retired
+//! `loom:needs-capability` folded into (#11795).
+//!
+//! Before #11861 the lane read `loom:operator` + a marker. `loom:operator` is
+//! now a no-op for every role and only a human removes it, so an operator
+//! hold never enters the lane: it vetoes it, like `loom:frozen`.
 //!
 //! This module supplies the two halves of the check that lets a worker which
 //! actually holds the needed access attempt such an item instead:
@@ -101,28 +107,27 @@ pub const KNOWN_CAPABILITY_LITERALS: &[&str] =
 pub const KNOWN_CAPABILITY_PREFIXES: &[&str] = &["cloud-profile:"];
 
 /// The retired judgement sub-labels (#11795). An unmigrated item carrying one
-/// is a decision (or a wait on something named) by label, which vetoes the
-/// lane exactly as a decision block does, as it did before the fold. Read only
-/// for the migration window; `labels migrate` replaces them with
-/// `loom:operator` on open items.
+/// is a decision (or a wait on a human) by label, which vetoes the lane. Since
+/// #11861 every operator-hold name vetoes it anyway (they are skip labels);
+/// kept explicit for the migration window.
 const LEGACY_JUDGEMENT_LABELS: [&str; 2] = ["loom:operator-decision", "loom:operator-blocked"];
 
 /// Whether `label` vetoes the capability lane outright, even next to a
-/// well-formed declaration (#11795): any skip label other than the operator
-/// hold itself (under any of its names) and the daemon's own claim, plus the
-/// legacy judgement sub-labels.
+/// well-formed declaration: any skip label other than the blocked hold itself
+/// (under any of its names) and the daemon's own claim, plus the legacy
+/// judgement sub-labels.
 ///
 /// Derived from [`crate::work_finder::SKIP_LABELS`], so it covers
-/// `loom:blocked` and its retired names (an independent hold with its own
-/// release), `loom:frozen` ("don't touch"), `loom:decision-malformed` (a
+/// `loom:operator` and its retired names (#11861: a human must act, so no role
+/// does), `loom:frozen` ("don't touch"), `loom:decision-malformed` (a
 /// decision under repair) and `loom:epic`. `loom:building` is not a veto: the
 /// dispatch guard sees it on the daemon's own re-dispatch of a lane item.
 fn is_lane_veto(label: &str) -> bool {
-    use crate::work_finder::{BUILDING_LABEL, OPERATOR_HOLD_NAMES, SKIP_LABELS};
+    use crate::work_finder::{BLOCKED_HOLD_NAMES, BUILDING_LABEL, SKIP_LABELS};
     LEGACY_JUDGEMENT_LABELS.contains(&label)
         || (SKIP_LABELS.contains(&label)
             && label != BUILDING_LABEL
-            && !OPERATOR_HOLD_NAMES.contains(&label))
+            && !BLOCKED_HOLD_NAMES.contains(&label))
 }
 
 /// True when `value` is in the closed vocabulary above.
@@ -359,17 +364,18 @@ pub fn parse_held_capabilities(raw: &str) -> BTreeSet<String> {
 
 /// True when `labels` describe an item the capability lane may even *consider*.
 ///
-/// Requires the operator hold ([`crate::work_finder::is_operator_hold`], so an
-/// unmigrated `loom:operator-only` item qualifies) and refuses the item outright
-/// if any label is a lane veto (see `is_lane_veto`). The body is checked
-/// separately by [`route_mechanical`]: a capability marker is required and a
-/// decision block refuses, so an alert issue or a Champion merge-risk hold,
-/// which carry no marker, can never enter the lane.
+/// Requires the blocked hold ([`crate::work_finder::is_blocked_hold`], so an
+/// unmigrated `loom:needs-capability` item qualifies) and refuses the item
+/// outright if any label is a lane veto (see `is_lane_veto`), which includes
+/// the operator hold under every name (#11861). The body is checked separately
+/// by [`route_mechanical`]: a capability marker is required, and a decision
+/// block or a park record naming a blocker refuses, so a dependency park or a
+/// Champion merge-risk hold, which carry no marker, can never enter the lane.
 ///
 /// This is a pure predicate over label names: no forge I/O, no body read.
 #[must_use]
 pub fn labels_eligible_for_capability_lane<S: AsRef<str>>(labels: &[S]) -> bool {
-    crate::work_finder::is_operator_hold(labels) && !labels.iter().any(|l| is_lane_veto(l.as_ref()))
+    crate::work_finder::is_blocked_hold(labels) && !labels.iter().any(|l| is_lane_veto(l.as_ref()))
 }
 
 // ============================================================================
@@ -388,11 +394,12 @@ pub fn labels_eligible_for_capability_lane<S: AsRef<str>>(labels: &[S]) -> bool 
 /// fail to compile until that decision is made consciously.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MechanicalRouting {
-    /// Not a capability-lane item at all — the labels do not describe an
-    /// operator hold the lane may consider (see
+    /// Not a capability-lane item at all — the labels do not describe a
+    /// blocked hold the lane may consider (see
     /// [`labels_eligible_for_capability_lane`]), or the body carries a
-    /// decision block. The item's normal skip/park behavior applies,
-    /// completely unchanged.
+    /// decision block or a park record naming a blocker (it waits on another
+    /// change, which no capability satisfies). The item's normal skip/park
+    /// behavior applies, completely unchanged.
     NotApplicable,
     /// Eligible labels, but the body declares no resolvable capability — either
     /// no marker at all, or at least one value outside the closed vocabulary.
@@ -420,7 +427,7 @@ pub enum MechanicalRouting {
 
 impl MechanicalRouting {
     /// True only for [`ProposeDispatch`](Self::ProposeDispatch) — i.e. "this
-    /// item is exempt from the `loom:operator` park". Every other variant
+    /// item is exempt from the `loom:blocked` park". Every other variant
     /// leaves the park in force.
     #[must_use]
     pub fn is_dispatchable(&self) -> bool {
@@ -441,7 +448,10 @@ pub fn route_mechanical<S: AsRef<str>>(
     held: &BTreeSet<String>,
 ) -> MechanicalRouting {
     if !labels_eligible_for_capability_lane(labels)
-        || body.is_some_and(crate::operator_decision::render::has_decision_block)
+        || body.is_some_and(|b| {
+            crate::operator_decision::render::has_decision_block(b)
+                || !crate::park_record::blockers(b).is_empty()
+        })
     {
         return MechanicalRouting::NotApplicable;
     }
@@ -720,54 +730,81 @@ mod tests {
     // ---- label eligibility -----------------------------------------------
 
     #[test]
-    fn lane_requires_the_operator_hold_under_any_of_its_names() {
-        assert!(labels_eligible_for_capability_lane(&labels(&["loom:issue", "loom:operator"])));
-        // Unmigrated items (#11795): the retired names fold into loom:operator.
+    fn lane_requires_the_blocked_hold_under_any_of_its_names() {
+        assert!(labels_eligible_for_capability_lane(&labels(&["loom:issue", "loom:blocked"])));
+        // Unmigrated items (#11795): needs-capability folds into loom:blocked.
+        assert!(labels_eligible_for_capability_lane(&labels(&["loom:needs-capability"])));
         assert!(labels_eligible_for_capability_lane(&labels(&[
+            "loom:blocked",
+            "loom:needs-capability",
+        ])));
+        // No blocked hold: not the shape this lane un-parks.
+        assert!(!labels_eligible_for_capability_lane(&labels(&["loom:issue"])));
+    }
+
+    /// #11861: `loom:operator` is a no-op for every role, so an operator hold
+    /// never enters the lane, under any of its names and beside any label.
+    #[test]
+    fn the_operator_hold_never_enters_the_lane() {
+        for hold in [
+            "loom:operator",
             "loom:operator-only",
             "loom:operator-mechanical",
-        ])));
-        assert!(labels_eligible_for_capability_lane(&labels(&["loom:operator-only"])));
-        // No operator hold: not the shape this lane un-parks.
-        assert!(!labels_eligible_for_capability_lane(&labels(&["loom:issue"])));
-        assert!(!labels_eligible_for_capability_lane(&labels(&["loom:blocked"])));
+            "loom:operator-decision",
+            "loom:operator-blocked",
+        ] {
+            assert!(!labels_eligible_for_capability_lane(&labels(&[hold])), "{hold}");
+            assert!(
+                !labels_eligible_for_capability_lane(&labels(&["loom:blocked", hold])),
+                "{hold} beside loom:blocked"
+            );
+        }
+        let routing = route_mechanical(
+            &labels(&["loom:issue", "loom:operator"]),
+            Some("<!-- loom:capability=host-sudo -->"),
+            &held(&["host-sudo"]),
+        );
+        assert_eq!(routing, MechanicalRouting::NotApplicable);
     }
 
     #[test]
     fn a_decision_by_label_is_never_eligible() {
         assert!(!labels_eligible_for_capability_lane(&labels(&[
-            "loom:operator-only",
-            "loom:operator-mechanical",
-            "loom:operator-decision",
-        ])));
-        assert!(!labels_eligible_for_capability_lane(&labels(&[
-            "loom:operator",
+            "loom:blocked",
             "loom:decision-malformed",
         ])));
     }
 
     #[test]
     fn veto_labels_refuse_the_lane() {
-        for veto in [
-            "loom:blocked",
-            "loom:operator-blocked",
-            "loom:needs-capability",
-            "loom:frozen",
-            "loom:epic",
-        ] {
+        for veto in ["loom:operator", "loom:frozen", "loom:epic"] {
             assert!(
-                !labels_eligible_for_capability_lane(&labels(&["loom:operator", veto])),
+                !labels_eligible_for_capability_lane(&labels(&["loom:blocked", veto])),
                 "{veto} must veto the capability lane"
             );
         }
         // The daemon's own claim is not a veto (its re-dispatch of a lane item).
-        assert!(labels_eligible_for_capability_lane(&labels(&[
-            "loom:operator",
-            "loom:building"
-        ])));
+        assert!(labels_eligible_for_capability_lane(&labels(&["loom:blocked", "loom:building"])));
     }
 
-    const MECHANICAL: &[&str] = &["loom:issue", "loom:operator"];
+    /// A park record naming a blocker means the item waits on another change,
+    /// which no capability satisfies (#11861): only a capability-only park
+    /// (no record, or a reason-only one) enters the lane.
+    #[test]
+    fn a_named_blocker_keeps_the_item_out_of_the_lane() {
+        let marker = "<!-- loom:capability=host-sudo -->";
+        let named = format!("{marker}\n<!-- loom:park Blocked by: #12 by=curator -->");
+        let routing = route_mechanical(&labels(MECHANICAL), Some(&named), &held(&["host-sudo"]));
+        assert_eq!(routing, MechanicalRouting::NotApplicable);
+        let reason_only = format!(
+            "{marker}\n<!-- loom:park Blocked by: (unstated) by=curator reason=\"needs root\" -->"
+        );
+        let routing =
+            route_mechanical(&labels(MECHANICAL), Some(&reason_only), &held(&["host-sudo"]));
+        assert_eq!(routing, MechanicalRouting::ProposeDispatch);
+    }
+
+    const MECHANICAL: &[&str] = &["loom:issue", "loom:blocked"];
 
     #[test]
     fn routes_to_propose_when_every_capability_is_held() {
@@ -855,9 +892,9 @@ mod tests {
     }
 
     #[test]
-    fn an_unmigrated_mechanical_item_still_routes() {
+    fn an_unmigrated_needs_capability_item_routes() {
         let routing = route_mechanical(
-            &labels(&["loom:operator-only", "loom:operator-mechanical"]),
+            &labels(&["loom:needs-capability"]),
             Some("<!-- loom:capability=host-sudo -->"),
             &held(&["host-sudo"]),
         );

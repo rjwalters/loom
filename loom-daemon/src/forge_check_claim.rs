@@ -41,7 +41,7 @@
 //!
 //! | Exit | Meaning | stdout | What the caller must do |
 //! |---|---|---|---|
-//! | `0` | BLOCKED — reason token: `OPEN_PR #X` / `TARGET_IS_PR #N` / `CLOSED` / `FROZEN` / `BUILDING` / `LEASE_ALREADY_HELD <host> <sweep-id>` / `BRANCH_EXISTS feature/issue-N` | the token | **Hard-abort the claim.** |
+//! | `0` | BLOCKED — reason token: `OPEN_PR #X` / `TARGET_IS_PR #N` / `CLOSED` / `FROZEN` / `OPERATOR` / `BUILDING` / `LEASE_ALREADY_HELD <host> <sweep-id>` / `BRANCH_EXISTS feature/issue-N` | the token | **Hard-abort the claim.** |
 //! | [`EX_SAFE_TO_CLAIM`] (1) | verified safe to claim | empty | Claim. |
 //! | [`EX_PROBE_FAILED`] (5) | no verdict — any leg's read failed | empty | **Fail closed.** Treat as blocked; check by hand. |
 //! | [`EX_FORGE_DECLINED`] (3) | Gitea — legs 1–3 are GitHub-only | empty | Check by hand. |
@@ -55,6 +55,11 @@
 //! `FROZEN` (#11743) is read off leg 2's label snapshot: the issue carries
 //! `loom:frozen`, which only a human removes. Like `OPEN_PR` it is never
 //! overridable.
+//!
+//! `OPERATOR` (#11861) is read off the same snapshot: the issue carries the
+//! operator hold (`loom:operator`, or a retired name that folds into it). It
+//! is a no-op for every role and only a human removes it, so like `FROZEN` it
+//! is never overridable. `FROZEN` wins when both are present.
 //!
 //! `CLOSED` (#11863) comes off the same read (`state` rides beside `labels`
 //! and `url`, zero extra calls): a closed issue has no work left to claim,
@@ -136,6 +141,9 @@ pub(crate) enum LabelLeg {
     /// Read succeeded and the issue carries `loom:frozen` (#11743): a human
     /// took it out of every lane. Never overridable.
     Frozen,
+    /// Read succeeded and the issue carries the operator hold (#11861): a
+    /// human must act, and no role does. Never overridable.
+    OperatorHold,
     /// Read succeeded; no claim label present.
     Clean,
     /// The label read failed (gh missing/failed/unparseable) — NOT evidence
@@ -327,6 +335,16 @@ pub(crate) fn decide(issue: u32, evidence: &ClaimEvidence, force_claim: bool) ->
                             .to_string(),
                     );
                 }
+                LabelLeg::OperatorHold => {
+                    return blocked(
+                        issue,
+                        "OPERATOR",
+                        "the issue carries `loom:operator` (#11861): a human must act or decide, \
+                         and no role acts on it. Only a human removes the label, and \
+                         --force-claim never overrides it."
+                            .to_string(),
+                    );
+                }
                 LabelLeg::Claimed(claims) => {
                     stop = overridable(
                         format!(
@@ -514,6 +532,9 @@ pub(crate) fn read_claim_labels(gh_bin: &Path, root: &Path, issue: u32) -> Label
         .collect();
     if crate::work_finder::is_frozen(&labels) {
         return LabelLeg::Frozen;
+    }
+    if crate::work_finder::is_operator_hold(&labels) {
+        return LabelLeg::OperatorHold;
     }
     let claims = claim_labels_in(&labels);
     if claims.is_empty() {
@@ -805,6 +826,20 @@ mod tests {
                 force,
             );
             assert_eq!((v.code, v.stdout.as_str()), (0, "FROZEN"), "force={force}");
+        }
+    }
+
+    /// #11861: `loom:operator` is a no-op for every role, so the Builder's
+    /// claim probe refuses it, and `--force-claim` never overrides it.
+    #[test]
+    fn an_operator_held_issue_is_blocked_with_the_operator_token_even_when_forced() {
+        for force in [false, true] {
+            let v = decide(
+                11861,
+                &evidence(OpenPrProbe::NoneOpen, Some(LabelLeg::OperatorHold), None, None),
+                force,
+            );
+            assert_eq!((v.code, v.stdout.as_str()), (0, "OPERATOR"), "force={force}");
         }
     }
 
@@ -1202,6 +1237,21 @@ mod tests {
         let near =
             write_exec(dir.path(), "gh-near.sh", r#"echo '{"labels":[{"name":"loom:frozen-x"}]}'"#);
         assert_eq!(read_claim_labels(&near, dir.path(), 42), LabelLeg::Clean);
+
+        // #11861: the operator hold, under its name or a retired one, is
+        // OperatorHold; frozen still wins beside it.
+        for (i, hold) in ["loom:operator", "loom:operator-only"].iter().enumerate() {
+            let script =
+                format!(r#"echo '{{"labels":[{{"name":"loom:issue"}},{{"name":"{hold}"}}]}}'"#);
+            let held = write_exec(dir.path(), &format!("gh-operator-{i}.sh"), &script);
+            assert_eq!(read_claim_labels(&held, dir.path(), 42), LabelLeg::OperatorHold, "{hold}");
+        }
+        let both = write_exec(
+            dir.path(),
+            "gh-both.sh",
+            r#"echo '{"labels":[{"name":"loom:operator"},{"name":"loom:frozen"}]}'"#,
+        );
+        assert_eq!(read_claim_labels(&both, dir.path(), 42), LabelLeg::Frozen);
 
         // #11863: a closed issue is CLOSED whatever its labels; an open one
         // (or a stub with no `state`) is classified by its labels as before.

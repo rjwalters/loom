@@ -148,6 +148,7 @@ pub mod capability;
 pub mod capacity;
 /// The `loom:cargo-target-dir` guard: deny a cargo build into an unowned target dir (#11582).
 pub mod cargo_target_guard;
+pub mod champion_hold;
 pub mod ci_telemetry;
 pub mod claim_reconciliation;
 pub mod classify_error;

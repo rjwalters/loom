@@ -37,6 +37,10 @@ pub(crate) enum LabelsCommand {
         #[arg(long)]
         kind: Option<String>,
     },
+    /// Print a label and the retired names that fold into it (#11861), one
+    /// per line: the set a script counts while `labels migrate` has not
+    /// relabelled open items. Exit 1 for an unknown label.
+    Aliases { name: String },
     /// Print one label as JSON, or a single field with `--field`.
     Get {
         name: String,
@@ -90,6 +94,13 @@ pub(crate) enum LabelsCommand {
         /// definition (deleting strips it from every closed item).
         #[arg(long)]
         keep_labels: bool,
+        /// Instead of the retired labels, move the `loom:operator` holds a
+        /// role applied to `loom:blocked` (#11861): Champion-held PRs (a
+        /// reason-only park record; `loom:pr` kept) and dependency-only
+        /// escalations (a park record per open blocker, or released when they
+        /// all closed). Run it BEFORE the retired-label migration.
+        #[arg(long, conflicts_with = "keep_labels")]
+        holds: bool,
         /// Print the report as JSON.
         #[arg(long)]
         json: bool,
@@ -167,6 +178,17 @@ fn run(cmd: LabelsCommand) -> Result<i32> {
             }
             Ok(0)
         }
+        LabelsCommand::Aliases { name } => {
+            let reg = Registry::embedded();
+            let Some(label) = reg.get(&name) else {
+                eprintln!("unknown label '{name}'");
+                return Ok(1);
+            };
+            for n in loom_daemon::label_registry::embedded_aliases(label.name.as_str()) {
+                println!("{n}");
+            }
+            Ok(0)
+        }
         LabelsCommand::Get { name, field } => {
             let Some(label) = Registry::embedded().get(&name) else {
                 eprintln!("unknown label '{name}'");
@@ -211,15 +233,19 @@ fn run(cmd: LabelsCommand) -> Result<i32> {
             all_workspaces,
             apply,
             keep_labels,
+            holds,
             json,
         } => {
-            use super::labels_migrate::{dispatch, Scope};
+            use super::labels_migrate::{dispatch, dispatch_holds, Scope};
             let root = root_of(None);
             let scope = match (repo, all_workspaces) {
                 (Some(r), _) => Scope::Repo(r),
                 (None, true) => Scope::AllWorkspaces,
                 (None, false) => Scope::Here(root.clone()),
             };
+            if holds {
+                return Ok(dispatch_holds(scope, apply, json));
+            }
             Ok(dispatch(&load(&root)?.retired, scope, apply, keep_labels, json))
         }
         LabelsCommand::Check { root } => {

@@ -27,16 +27,13 @@
 //! a park label. A cap-exhausted block parks the **PR**, which that guard
 //! never looks at — so the resume dispatch clears every existing guard.
 //!
-//! # Why [`PR_LANE_PARK_LABELS`](crate::work_finder::PR_LANE_PARK_LABELS), and
-//! why not `loom:operator`
+//! # Why [`PARK_LABELS`](crate::work_finder::PARK_LABELS)
 //!
-//! It is step 2.7's [`PARK_LABELS`](crate::work_finder::PARK_LABELS) minus
-//! `loom:operator`, derived from the same registry so the two sides of the
-//! decision cannot drift. `loom:operator` parks an *issue* (#11795) but not a
-//! PR: the merge-risk hold is re-evaluable by design and the routes that
-//! re-evaluate held work — the watchdogs and this resume path — must keep
-//! reaching it. A `loom:operator` PR whose sweep genuinely crashed still
-//! resumes.
+//! It is step 2.7's own set, so the two sides of the decision cannot drift.
+//! Since #11861 that includes `loom:operator` on a PR: no role acts on an
+//! item a human must decide, so a sweep for an issue whose PR carries it does
+//! not resume. Champion's merge-risk and critical-file holds are
+//! `loom:blocked` now, which this set already contained.
 
 use crate::sweep_registry::SweepRegistry;
 
@@ -58,10 +55,10 @@ impl SweepRegistry {
         true
     }
 
-    /// The first [`PR_LANE_PARK_LABELS`](crate::work_finder::PR_LANE_PARK_LABELS)
+    /// The first [`PARK_LABELS`](crate::work_finder::PARK_LABELS)
     /// entry carried by pull request `pr`, or `None` when it carries none — or
-    /// when the labels could not be read. `loom:operator` is not a park on a
-    /// PR (#11795): Champion's holds re-evaluate themselves.
+    /// when the labels could not be read. Since #11861 `loom:operator` is a
+    /// park on a PR too, and Champion's holds are `loom:blocked`.
     ///
     /// **Fails open**, mirroring the dispatch-side park guard (#4444) and the
     /// surrounding reaper probes: a `gh` error, timeout or unresolvable repo
@@ -76,7 +73,7 @@ impl SweepRegistry {
         let labels = self.current_labels_via_rest(pr)?;
         // Registry order, not forge order, so a PR carrying both yields a
         // deterministic answer (matching `first_park_label_in`).
-        crate::work_finder::PR_LANE_PARK_LABELS
+        crate::work_finder::PARK_LABELS
             .iter()
             .find(|park| labels.iter().any(|l| l == *park))
             .map(|park| (*park).to_string())

@@ -97,16 +97,15 @@ pub fn is_operator_gated<S: AsRef<str>>(labels: &[S]) -> bool {
 }
 
 /// True when any label in `labels` takes the PR out of the automation queue
-/// entirely ([`crate::work_finder::PR_LANE_PARK_LABELS`]).
+/// entirely ([`crate::work_finder::PARK_LABELS`]).
 ///
 /// Reused rather than re-listed: a park set that drifts from the PR lane's
-/// own would report a PR as reachable when nothing can reach it. The PR-lane
-/// set, not the issue-dispatch one: `loom:operator` parks an issue but a held
-/// PR is still re-evaluated (#11795).
+/// own would report a PR as reachable when nothing can reach it. Since #11861
+/// issues and PRs share one park set, so `loom:operator` parks a PR too.
 pub fn is_parked<S: AsRef<str>>(labels: &[S]) -> bool {
     labels
         .iter()
-        .any(|l| crate::work_finder::PR_LANE_PARK_LABELS.contains(&l.as_ref()))
+        .any(|l| crate::work_finder::PARK_LABELS.contains(&l.as_ref()))
 }
 
 static HOLD_SET: crate::label_registry::LabelSet = crate::label_registry::LabelSet::new(|| {
@@ -146,8 +145,8 @@ mod tests {
     fn park_set_is_the_pr_lanes_own() {
         assert!(is_parked(&["loom:blocked"]));
         assert!(is_parked(&["loom:operator-only"]));
-        // On a PR the operator hold is NOT a park (#11795, #7660).
-        assert!(!is_parked(&["loom:operator"]));
+        // #11861: the operator hold parks a PR too; no role acts on it.
+        assert!(is_parked(&["loom:operator"]));
     }
 
     #[test]
