@@ -963,7 +963,9 @@ impl Ctx {
                 continue;
             }
             let extra = extra.get_or_insert_with(|| {
-                backstop::release_fields(self.me.role, self.gh.pr_head(self.pr()))
+                backstop::release_fields(self.me.role, self.gh.pr_head(self.pr()), |sha| {
+                    self.gh.checks_pending(sha)
+                })
             });
             let mut lines = row.body.lines();
             lines.next();

@@ -37,15 +37,47 @@ impl Gh {
             .collect();
         Some((open, head, labels))
     }
+
+    /// Whether any check run on `sha` has not completed. Unreadable counts as
+    /// not pending: the backstop stays a best-effort bound.
+    pub(crate) fn checks_pending(&self, sha: &str) -> bool {
+        let out = self
+            .inv("pr_lease.checks_pending", AccessIntent::Read, ops::PR_VIEW_STATE)
+            .args([
+                "api",
+                &format!("repos/{{owner}}/{{repo}}/commits/{sha}/check-runs?per_page=100"),
+                "--jq",
+                "[.check_runs[] | select(.status != \"completed\")] | length",
+            ])
+            .run();
+        out.ok_output()
+            .and_then(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .trim()
+                    .parse::<u64>()
+                    .ok()
+            })
+            .is_some_and(|n| n > 0)
+    }
 }
 
 /// The fields a Judge release appends to its marker: the no-verdict record
 /// when the PR is still waiting for review with no verdict, else nothing (a
-/// verdict landed, the PR closed, or its state could not be read).
-pub(crate) fn release_fields(role: Role, state: Option<(bool, String, Vec<String>)>) -> String {
+/// verdict landed, the PR closed, or its state could not be read). A pass that
+/// deferred because the head's checks are still running (`checks_pending`,
+/// asked only once a record is otherwise due) is not a blocked pass: CI
+/// settling changes neither the head nor the labels, so a record would hold
+/// the PR from Judge long after CI went green.
+pub(crate) fn release_fields(
+    role: Role,
+    state: Option<(bool, String, Vec<String>)>,
+    checks_pending: impl FnOnce(&str) -> bool,
+) -> String {
     match state {
         Some((open, head, labels))
-            if role == Role::Judge && backstop::ended_without_verdict(open, &labels) =>
+            if role == Role::Judge
+                && backstop::ended_without_verdict(open, &labels)
+                && !checks_pending(&head) =>
         {
             backstop::released_fields(&head, &labels)
         }
@@ -112,17 +144,32 @@ mod tests {
     #[test]
     fn only_a_judge_release_without_a_verdict_is_stamped() {
         let waiting = ["loom:review-requested", "loom:reviewing"];
-        let stamped = release_fields(Role::Judge, state(&waiting));
+        let stamped = release_fields(Role::Judge, state(&waiting), |_| false);
         assert_eq!(stamped, format!(" head={HEAD} verdict=none labels=review-requested"));
-        assert_eq!(release_fields(Role::Doctor, state(&waiting)), "");
-        assert_eq!(release_fields(Role::Judge, state(&["loom:pr"])), "");
-        assert_eq!(release_fields(Role::Judge, None), "");
+        assert_eq!(release_fields(Role::Doctor, state(&waiting), |_| false), "");
+        assert_eq!(release_fields(Role::Judge, state(&["loom:pr"]), |_| false), "");
+        assert_eq!(release_fields(Role::Judge, None, |_| false), "");
+    }
+
+    #[test]
+    fn a_pass_deferred_on_pending_checks_is_not_stamped() {
+        let waiting = ["loom:review-requested", "loom:reviewing"];
+        let mut asked = None;
+        let fields = release_fields(Role::Judge, state(&waiting), |head| {
+            asked = Some(head.to_string());
+            true
+        });
+        assert_eq!(fields, "");
+        assert_eq!(asked.as_deref(), Some(HEAD));
+        // Never asked when no record would be written anyway.
+        let fields = release_fields(Role::Judge, state(&["loom:pr"]), |_| panic!("asked"));
+        assert_eq!(fields, "");
     }
 
     #[test]
     fn stamped_releases_hold_the_pr_and_plain_ones_do_not() {
         let now = Utc.with_ymd_and_hms(2026, 10, 14, 6, 0, 0).unwrap();
-        let fields = release_fields(Role::Judge, state(&["loom:review-requested"]));
+        let fields = release_fields(Role::Judge, state(&["loom:review-requested"]), |_| false);
         let earlier = now - chrono::Duration::minutes(10);
         let plain = [row(1, earlier, "")];
         assert_eq!(hold(&plain, state(&["loom:review-requested"]), now), None);
