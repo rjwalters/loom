@@ -203,11 +203,6 @@ fn within(path: &str, root: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
-/// Is `path` one of the extra surfaces (as opposed to the installer's)?
-pub(super) fn is_extra(path: &str) -> bool {
-    EXTRA_SURFACES.iter().any(|s| within(path, s.path))
-}
-
 /// May a resync record `path` in `installed_files`? That list is deletion
 /// evidence (a later release, or an uninstall, may remove what it names), so
 /// a file the repo owns and Loom only merges a block into is never listed.

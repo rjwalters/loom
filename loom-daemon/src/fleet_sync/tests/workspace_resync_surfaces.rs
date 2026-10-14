@@ -101,3 +101,39 @@ fn a_release_that_changes_no_surface_makes_no_claim_and_no_commit() {
     assert!(fx.forge.calls.borrow().is_empty(), "no claim was asked for");
     assert!(host.resync_worktrees().is_empty());
 }
+
+/// A repo that commits `.claude/commands` and `.claude/skills` as symlinks
+/// into `.agents/` (#11426): the roots behind those links are the repo's to
+/// keep, so the resync neither writes through them nor fails staging them.
+#[test]
+fn a_repo_with_symlinked_claude_commands_and_skills_resyncs_once() {
+    let fx = Fixture::new(Seed {
+        current: false,
+        ..CURRENT
+    });
+    let defaults = skilled_defaults(&fx);
+    fx.push_from_seed("link the claude surfaces into .agents", |seed| {
+        let _ = fs::remove_dir_all(seed.join(".claude/commands"));
+        let _ = fs::remove_dir_all(seed.join(".claude/skills"));
+        write(&seed.join(".agents/commands/keep.md"), "theirs\n");
+        write(&seed.join(".agents/skills/keep.md"), "theirs\n");
+        std::os::unix::fs::symlink("../.agents/commands", seed.join(".claude/commands")).unwrap();
+        std::os::unix::fs::symlink("../.agents/skills", seed.join(".claude/skills")).unwrap();
+    });
+    let commits = fx.origin_commits();
+
+    let host = Host::running(&fx, "host-a", RUNNING, defaults);
+    let pass = host.pass();
+    let report = only(&pass);
+    assert_eq!(report.state, WState::W0, "{report:?}");
+    assert_eq!(fx.origin_commits(), commits + 1, "one resync commit");
+    // Nothing was written behind the commands link (`.agents/skills` is a
+    // real extra-surface root of its own, so it is resynced as usual).
+    let tree = git(&fx.origin, &["ls-tree", "-r", "--name-only", "refs/heads/main"]);
+    assert!(!tree.contains(".agents/commands/loom"), "{tree}");
+
+    // The second resync is a no-op.
+    host.advance(INTERVAL);
+    assert_eq!(only(&host.pass()).state, WState::W0);
+    assert_eq!(fx.origin_commits(), commits + 1);
+}

@@ -520,10 +520,11 @@ pub fn materialize_with(payload: &Payload, dest: &Path) -> Result<PayloadDiff> {
         .map(String::as_str)
         .chain([INSTALL_METADATA_PATH, RESYNC_IGNORE_PATH])
     {
-        // An extra surface reached through a symlinked parent (`.agents` or
-        // `.github` linked elsewhere) is the workspace's to keep, like a
-        // symlinked file.
-        if surfaces::is_extra(rel) && under_symlink(dest, rel) {
+        // Any root reached through a symlinked parent (`.agents` or `.github`
+        // linked elsewhere, `.claude/commands` linked into `.agents/`) is the
+        // workspace's to keep, like a symlinked file. Writing through it
+        // would also make `git add` fail ("beyond a symbolic link").
+        if under_symlink(dest, rel) {
             skipped.push(rel.to_string());
             continue;
         }
