@@ -1321,31 +1321,31 @@
       "name": "loom:ready",
       "replaced_by": null,
       "owned": true,
-      "retired_in": "2AMLogic/2am#4345"
+      "retired_in": "#11818"
     },
     {
       "name": "loom:approved",
       "replaced_by": null,
       "owned": true,
-      "retired_in": "2AMLogic/2am#4345"
+      "retired_in": "#11818"
     },
     {
       "name": "loom:in-progress",
       "replaced_by": null,
       "owned": true,
-      "retired_in": "2AMLogic/2am#4345"
+      "retired_in": "#11818"
     },
     {
       "name": "loom:pr-feedback",
       "replaced_by": null,
       "owned": true,
-      "retired_in": "2AMLogic/2am#4345"
+      "retired_in": "#11818"
     },
     {
       "name": "loom:worked-example",
       "replaced_by": null,
       "owned": true,
-      "retired_in": "2AMLogic/2am#4345"
+      "retired_in": "#11818"
     }
   ]
 }
