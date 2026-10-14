@@ -74,6 +74,7 @@ pub mod enrich;
 mod flow;
 pub mod history;
 pub mod outcomes;
+mod pre_ready_journal;
 mod sources;
 mod step_rows;
 pub use step_rows::step_stage;
@@ -987,20 +988,26 @@ static STATE: Mutex<PassState> = Mutex::new(PassState {
 /// view. The forge reads run off the event loop; `view` comes back as given
 /// when they fail.
 async fn record_outcomes(
+    ctx: pre_ready_journal::OutcomeContext<'_>,
     sink: &FleetStateSink,
     input: &FleetInput,
     (curated, triage): (outcomes::Curated, outcomes::Curated),
     view: FleetView,
     now: DateTime<Utc>,
-    workspace_pool: &crate::workspace_pool::WorkspacePool,
-    slug_cache: &mut std::collections::HashMap<String, String>,
 ) -> FleetView {
+    let pre_ready_journal::OutcomeContext {
+        workspace_root,
+        workspace_pool,
+        slug_cache,
+    } = ctx;
     let (mut memory, mut enrich_memory) = {
         let state = STATE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         (state.outcomes.clone(), state.enrich.clone())
     };
+    let journal = pre_ready_journal::Journal::open(workspace_root, &mut memory.pre_ready_done, now);
+    let done_before = memory.pre_ready_done.clone();
     memory.curated_now = Some(curated);
     memory.triage_now = Some(triage);
     let roots = sources::managed_roots(workspace_pool, slug_cache)
@@ -1037,9 +1044,11 @@ async fn record_outcomes(
         Ok(done) => done,
         Err(join_error) => {
             log::warn!("fleet.state: outcome diff panicked: {join_error}");
+            journal.reload_next_pass();
             return original;
         }
     };
+    let done_after = memory.pre_ready_done.clone();
     {
         let mut state = STATE
             .lock()
@@ -1047,6 +1056,7 @@ async fn record_outcomes(
         state.outcomes = memory;
         state.enrich = enrich_memory;
     }
+    journal.save_if_changed(&done_before, &done_after);
     outcomes::offer(records, sink);
     view
 }
@@ -1108,9 +1118,19 @@ pub(super) async fn record(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
     let view = build_view(&input, state.prev.as_ref(), now);
-    let mut view =
-        record_outcomes(sink, &input, (curated, triage), view, now, workspace_pool, slug_cache)
-            .await;
+    let mut view = record_outcomes(
+        pre_ready_journal::OutcomeContext {
+            workspace_root,
+            workspace_pool,
+            slug_cache,
+        },
+        sink,
+        &input,
+        (curated, triage),
+        view,
+        now,
+    )
+    .await;
     {
         let mut live = STATE
             .lock()
