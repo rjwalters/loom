@@ -31,8 +31,10 @@
 //! The arithmetic is integer, so a draw replays bit for bit: ages are whole
 //! minutes, and the pooled weight is `priority × (divisor_min +
 //! min(age_min, cap_min))`, which is `priority × age` scaled by the common
-//! factor `divisor_min`. The draw probabilities are therefore exactly
-//! `w / Σw` of the documented weight.
+//! factor `divisor_min`. The roll is drawn without modulo bias
+//! ([`roll_for`], rejection sampling), so the draw probabilities are exactly
+//! `w / Σw` of the documented weight. A Σw that would overflow `u64` is an
+//! error ([`DrawError`]), never a silently saturated total.
 //!
 //! # The very-important cap
 //!
@@ -50,8 +52,19 @@
 //! draw's `loom-draw/v1` is keyed `(minute, host)` only, so two ticks in one
 //! minute repeat it; the tick counter and workspace end that. Draws are
 //! without replacement: a drawn item leaves the pool, and the next draw uses
-//! the next `draw_index`. `pick.decision` carries the seed inputs and every
-//! draw's weight terms, so the sequence replays from the record.
+//! the next `draw_index`.
+//!
+//! **Replay.** `pick.decision`'s `item_draw` carries the seed inputs, each
+//! workspace's **starting pool** in pool order with every item's weight
+//! (`pool[]`), and every draw's roll and picked index. [`replay_record`]
+//! re-derives each seed and roll from the header and re-runs the selection
+//! over the logged pool minus earlier picks, so the whole sequence replays
+//! from the record alone.
+//!
+//! The tick counter is per process: a daemon restarted within the same
+//! minute starts it again at 0 and reuses that minute's seeds. That is
+//! harmless (the pools differ, leases dedupe, and replay reads the logged
+//! inputs, not a clock), the same tolerance the v1 workspace seed has.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -445,25 +458,77 @@ pub fn item_seed(key: &SeedKey, draw_index: u32) -> u64 {
     u64::from_be_bytes(head)
 }
 
-/// The index `pool` draws with `seed`, the pool's total weight and the roll
-/// in `0..total`; `None` when the pool weighs nothing. P(i) = `w_i / Σw`.
-#[must_use]
-pub fn pick_index(pool: &[Candidate], seed: u64) -> Option<(usize, u64, u64)> {
-    let total = pool
-        .iter()
-        .fold(0u64, |acc, c| acc.saturating_add(c.terms.weight));
-    if total == 0 {
-        return None;
+/// A draw that cannot be made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrawError {
+    /// Σw does not fit a `u64`. Unreachable at the documented ranges (the
+    /// largest weight is about 2^43, so it needs millions of items), but an
+    /// error rather than a saturated total that would skew the draw.
+    WeightOverflow,
+}
+
+impl std::fmt::Display for DrawError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WeightOverflow => f.write_str("item draw: total weight overflows u64"),
+        }
     }
-    let roll = PickRng::from_seed(seed).below(total);
+}
+
+impl std::error::Error for DrawError {}
+
+/// Σ `weights`, or [`DrawError::WeightOverflow`].
+///
+/// # Errors
+/// When the sum does not fit a `u64`.
+pub fn total_weight(weights: impl IntoIterator<Item = u64>) -> Result<u64, DrawError> {
+    weights
+        .into_iter()
+        .try_fold(0u64, |acc, w| acc.checked_add(w).ok_or(DrawError::WeightOverflow))
+}
+
+/// The roll in `0..total` (`total` > 0) for `seed`: [`PickRng`] values,
+/// rejecting the low `2^64 mod total` ones so every roll is equally likely
+/// (no modulo bias).
+#[must_use]
+pub fn roll_for(seed: u64, total: u64) -> u64 {
+    let total = total.max(1);
+    let reject_below = total.wrapping_neg() % total;
+    let mut rng = PickRng::from_seed(seed);
+    loop {
+        let x = rng.next_u64();
+        if x >= reject_below {
+            return x % total;
+        }
+    }
+}
+
+/// The index of the item `roll` selects among `weights`, in order: the first
+/// whose cumulative weight exceeds `roll`. `None` when `roll` is past Σw.
+#[must_use]
+pub fn pick_by_roll(weights: impl IntoIterator<Item = u64>, roll: u64) -> Option<usize> {
     let mut acc = 0u64;
-    for (i, c) in pool.iter().enumerate() {
-        acc = acc.saturating_add(c.terms.weight);
+    for (i, w) in weights.into_iter().enumerate() {
+        acc = acc.checked_add(w)?;
         if roll < acc {
-            return Some((i, total, roll));
+            return Some(i);
         }
     }
     None
+}
+
+/// The index `pool` draws with `seed`, the pool's total weight and the roll
+/// in `0..total`; `Ok(None)` when the pool weighs nothing. P(i) = `w_i / Σw`.
+///
+/// # Errors
+/// [`DrawError::WeightOverflow`] when Σw does not fit a `u64`.
+pub fn pick_index(pool: &[Candidate], seed: u64) -> Result<Option<(usize, u64, u64)>, DrawError> {
+    let total = total_weight(pool.iter().map(|c| c.terms.weight))?;
+    if total == 0 {
+        return Ok(None);
+    }
+    let roll = roll_for(seed, total);
+    Ok(pick_by_roll(pool.iter().map(|c| c.terms.weight), roll).map(|i| (i, total, roll)))
 }
 
 /// One draw, as `pick.decision` records it.
@@ -479,6 +544,9 @@ pub struct DrawRecord {
     pub total_weight: u64,
     /// The roll in `0..total_weight`.
     pub roll: u64,
+    /// The drawn item's index in the pool as it stood (the starting pool
+    /// minus earlier picks, in pool order).
+    pub picked_index: usize,
     /// The drawn item.
     pub picked: Candidate,
 }
@@ -487,6 +555,7 @@ pub struct DrawRecord {
 /// cutover takes one draw per slot and draws again on a gate or claim pass.
 #[derive(Debug, Clone)]
 pub struct ItemDraw {
+    start: Vec<Candidate>,
     pool: Vec<Candidate>,
     key: SeedKey,
     next_index: u32,
@@ -496,10 +565,41 @@ impl ItemDraw {
     #[must_use]
     pub fn new(pool: Vec<Candidate>, key: SeedKey) -> Self {
         Self {
+            start: pool.clone(),
             pool,
             key,
             next_index: 0,
         }
+    }
+
+    /// The pool before any draw, in pool order: what `pick.decision` logs
+    /// once per workspace so the draws replay.
+    #[must_use]
+    pub fn starting_pool(&self) -> &[Candidate] {
+        &self.start
+    }
+
+    /// The next draw, `Ok(None)` once the pool is empty.
+    ///
+    /// # Errors
+    /// [`DrawError::WeightOverflow`] when the pool's Σw does not fit a `u64`.
+    pub fn try_next(&mut self) -> Result<Option<DrawRecord>, DrawError> {
+        let seed = item_seed(&self.key, self.next_index);
+        let pool_size = self.pool.len();
+        let Some((i, total_weight, roll)) = pick_index(&self.pool, seed)? else {
+            return Ok(None);
+        };
+        let record = DrawRecord {
+            draw_index: self.next_index,
+            seed,
+            pool_size,
+            total_weight,
+            roll,
+            picked_index: i,
+            picked: self.pool.remove(i),
+        };
+        self.next_index += 1;
+        Ok(Some(record))
     }
 
     /// The items not drawn yet.
@@ -518,21 +618,91 @@ impl ItemDraw {
 impl Iterator for ItemDraw {
     type Item = DrawRecord;
 
+    /// [`ItemDraw::try_next`]; an overflow is logged and ends the draws.
     fn next(&mut self) -> Option<DrawRecord> {
-        let seed = item_seed(&self.key, self.next_index);
-        let pool_size = self.pool.len();
-        let (i, total_weight, roll) = pick_index(&self.pool, seed)?;
-        let record = DrawRecord {
-            draw_index: self.next_index,
-            seed,
-            pool_size,
-            total_weight,
-            roll,
-            picked: self.pool.remove(i),
-        };
-        self.next_index += 1;
-        Some(record)
+        match self.try_next() {
+            Ok(draw) => draw,
+            Err(e) => {
+                log::error!("{e} ({} items in the pool)", self.pool.len());
+                None
+            }
+        }
     }
+}
+
+/// One replayed pick: the pool row it selected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayedPick {
+    pub repo: String,
+    pub draw_index: u32,
+    pub issue: Option<u32>,
+    pub pr: Option<u32>,
+}
+
+/// Replay `record`'s draws from what it logged alone: for each workspace,
+/// start from its logged `pool[]` (in `index` order), and for each of its
+/// draws, re-derive the seed from the header, check the logged seed, total
+/// and roll against it, select by the roll over the pool minus earlier picks,
+/// and check the logged picked index and item. Returns the picks in draw
+/// order. Reassemble a chunked record first.
+///
+/// # Errors
+/// A description of the first draw that does not replay.
+pub fn replay_record(
+    record: &crate::telemetry::kinds::pick_decision::PickItemDraw,
+) -> Result<Vec<ReplayedPick>, String> {
+    let num = |s: &str, what: &str| -> Result<u64, String> {
+        s.parse()
+            .map_err(|_| format!("{what} {s:?} is not a number"))
+    };
+    let minute = num(&record.seed_minute, "seed_minute")?;
+    let tick_counter = num(&record.tick_counter, "tick_counter")?;
+    let mut pools: BTreeMap<&str, Vec<&crate::telemetry::kinds::pick_decision::PickItemPoolEntry>> =
+        BTreeMap::new();
+    for row in &record.pool {
+        pools.entry(row.repo.as_str()).or_default().push(row);
+    }
+    for rows in pools.values_mut() {
+        rows.sort_by_key(|r| r.index);
+    }
+    let mut picks = Vec::new();
+    for d in &record.draws {
+        let pool = pools
+            .get_mut(d.repo.as_str())
+            .ok_or_else(|| format!("draw {} of {}: no logged pool", d.draw_index, d.repo))?;
+        let key = SeedKey {
+            minute,
+            host: record.seed_host.clone(),
+            tick_counter,
+            workspace: d.repo.clone(),
+        };
+        let seed = item_seed(&key, d.draw_index);
+        let total = total_weight(pool.iter().map(|r| r.weight)).map_err(|e| e.to_string())?;
+        let at = format!("draw {} of {}", d.draw_index, d.repo);
+        if d.seed != seed.to_string() || d.total_weight != total || total == 0 {
+            return Err(format!("{at}: seed or total does not match the logged pool"));
+        }
+        let roll = roll_for(seed, total);
+        if roll != d.roll {
+            return Err(format!("{at}: roll {roll} != logged {}", d.roll));
+        }
+        let i = pick_by_roll(pool.iter().map(|r| r.weight), roll)
+            .ok_or_else(|| format!("{at}: roll past the pool"))?;
+        let row = pool.remove(i);
+        if i != d.picked_index || row.issue != d.issue || row.pr != d.pr {
+            return Err(format!(
+                "{at}: replay picked index {i}, the record names {}",
+                d.picked_index
+            ));
+        }
+        picks.push(ReplayedPick {
+            repo: d.repo.clone(),
+            draw_index: d.draw_index,
+            issue: row.issue,
+            pr: row.pr,
+        });
+    }
+    Ok(picks)
 }
 
 #[cfg(test)]

@@ -800,7 +800,8 @@ fn item_draw_record_carries_terms_age_source_and_exclusion_counts() {
         pool_size: 3,
         total_weight: 1_000_000,
         roll: 5,
-        picked,
+        picked_index: 0,
+        picked: picked.clone(),
     }];
     let excluded = std::collections::BTreeMap::from([
         (Exclusion::Pass(PassReason::Claimed), 2),
@@ -813,12 +814,14 @@ fn item_draw_record_carries_terms_age_source_and_exclusion_counts() {
         &[ItemDrawWorkspace {
             repo: "o/r",
             excluded: &excluded,
+            pool: std::slice::from_ref(&picked),
             draws: &draws,
         }],
     )
     .unwrap();
     assert_eq!(d.seed_scheme, "loom-draw/v2");
     assert_eq!(d.tick_counter, "17");
+    assert_eq!((d.pool.len(), d.pool[0].pr, d.pool[0].weight), (1, Some(8), d.draws[0].weight));
     let step = &d.draws[0];
     assert_eq!(step.number, 8, "a Judge step acts on the PR");
     assert_eq!((step.priority, step.age_permille), (3, 2000));

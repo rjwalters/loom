@@ -199,34 +199,87 @@ fn the_seed_is_the_documented_sha256_prefix() {
     assert_ne!(item_seed(&key(7), 3), item_seed(&key(7), 4), "draw index is an input");
 }
 
+/// Stage ages (days) inside and past the 90-day cap, so the age term varies.
+const AGES: [i64; 8] = [0, 3, 12, 30, 55, 80, 89, 120];
+
 fn pool_of(n: u32) -> Vec<Candidate> {
     let inputs: Vec<DrawInput> = (1..=n)
         .map(|i| {
             let labels: &[&str] = if i % 3 == 0 { &["loom:important"] } else { &[] };
-            step_input(i, Step::Judge, labels, &format!("2026-{:02}-01T00:00:00Z", 1 + i % 9))
+            let mut input = step_input(i, Step::Judge, labels, "2025-01-01T00:00:00Z");
+            input.item.pr = Some(1000 + i);
+            input.stage_entry = Some(StageEntry {
+                at: now() - chrono::Duration::days(AGES[(i as usize) % AGES.len()]),
+                source: Source::Mirror,
+            });
+            input
         })
         .collect();
     weigh(&inputs, &ctx(), &ItemWeights::default()).pool
 }
 
 #[test]
-fn replay_from_the_seed_gives_an_identical_draw_without_replacement() {
-    let order = |k: SeedKey| -> Vec<(u32, u64, u64)> {
-        ItemDraw::new(pool_of(12), k)
-            .map(|d| (d.picked.item.issue.unwrap(), d.seed, d.roll))
-            .collect()
-    };
-    let first = order(key(42));
-    assert_eq!(first, order(key(42)));
-    assert_eq!(first.len(), 12, "every item drawn once");
-    let mut numbers: Vec<u32> = first.iter().map(|d| d.0).collect();
+fn the_pool_spans_the_age_term() {
+    let ages: BTreeSet<u64> = pool_of(8).iter().map(|c| c.terms.age_permille).collect();
+    assert_eq!(
+        ages.into_iter().collect::<Vec<_>>(),
+        vec![1000, 1100, 1400, 2000, 2833, 3666, 3966, 4000]
+    );
+}
+
+#[test]
+fn replay_from_the_pick_decision_record_gives_the_same_picks() {
+    use crate::observability::pick_decision::{item_draw_record, ItemDrawWorkspace};
+    use crate::telemetry::kinds::pick_decision::PickItemDraw;
+    let k = key(42);
+    let mut draw = ItemDraw::new(pool_of(40), k.clone());
+    let start = draw.starting_pool().to_vec();
+    let draws: Vec<DrawRecord> = draw.by_ref().take(25).collect();
+    assert_eq!(draws.len(), 25);
+    let excluded = BTreeMap::new();
+    let record = item_draw_record(
+        k.minute,
+        &k.host,
+        k.tick_counter,
+        &[ItemDrawWorkspace {
+            repo: &k.workspace,
+            excluded: &excluded,
+            pool: &start,
+            draws: &draws,
+        }],
+    )
+    .unwrap();
+    // Through the wire: only what the record carries.
+    let parsed: PickItemDraw =
+        serde_json::from_str(&serde_json::to_string(&record).unwrap()).unwrap();
+    let replayed = replay_record(&parsed).unwrap();
+    let expected: Vec<(Option<u32>, Option<u32>)> = draws
+        .iter()
+        .map(|d| (d.picked.item.issue, d.picked.item.pr))
+        .collect();
+    let got: Vec<(Option<u32>, Option<u32>)> = replayed.iter().map(|p| (p.issue, p.pr)).collect();
+    assert_eq!(got, expected);
+    // Same inputs, same sequence; another tick counter, another one.
+    let again: Vec<DrawRecord> = ItemDraw::new(pool_of(40), k.clone()).take(25).collect();
+    assert_eq!(again, draws);
+    let other: Vec<DrawRecord> = ItemDraw::new(pool_of(40), key(43)).take(25).collect();
+    assert_ne!(other, draws);
+    // A tampered record does not replay.
+    let mut bad = parsed.clone();
+    bad.draws[3].picked_index += 1;
+    assert!(replay_record(&bad).is_err());
+    let mut bad = parsed;
+    bad.pool[0].weight += 1;
+    assert!(replay_record(&bad).is_err());
+}
+
+#[test]
+fn every_item_is_drawn_once() {
+    let mut numbers: Vec<u32> = ItemDraw::new(pool_of(12), key(7))
+        .map(|d| d.picked.item.issue.unwrap())
+        .collect();
     numbers.sort_unstable();
     assert_eq!(numbers, (1..=12).collect::<Vec<_>>());
-    assert_ne!(first, order(key(43)));
-    // The logged roll re-picks the same item from the logged pool.
-    let pool = pool_of(12);
-    let (i, _, roll) = pick_index(&pool, first[0].1).unwrap();
-    assert_eq!((pool[i].item.issue.unwrap(), roll), (first[0].0, first[0].2));
 }
 
 #[test]
@@ -235,13 +288,30 @@ fn an_empty_pool_draws_nothing() {
 }
 
 #[test]
+fn the_roll_is_in_range_and_the_total_never_saturates() {
+    for seed in 0..2000u64 {
+        for total in [1u64, 2, 3, 7, 1 << 40, u64::MAX / 3 * 2] {
+            assert!(roll_for(seed, total) < total);
+        }
+    }
+    assert_eq!(roll_for(5, 1), 0);
+    assert_eq!(total_weight([u64::MAX, 1]), Err(DrawError::WeightOverflow));
+    assert_eq!(total_weight([2, 3]), Ok(5));
+    assert_eq!(pick_by_roll([2, 0, 3], 1), Some(0));
+    assert_eq!(pick_by_roll([2, 0, 3], 2), Some(2), "a weight-0 row is never picked");
+    assert_eq!(pick_by_roll([2, 3], 5), None);
+}
+
+#[test]
 fn first_draw_frequencies_match_the_weights() {
-    let pool = pool_of(6);
+    let pool = pool_of(8);
     let total: u64 = pool.iter().map(|c| c.terms.weight).sum();
     let trials = 40_000u64;
     let mut hits = vec![0u64; pool.len()];
     for tick in 0..trials {
-        let (i, _, _) = pick_index(&pool, item_seed(&key(tick), 0)).unwrap();
+        let (i, _, _) = pick_index(&pool, item_seed(&key(tick), 0))
+            .unwrap()
+            .unwrap();
         hits[i] += 1;
     }
     for (c, h) in pool.iter().zip(&hits) {

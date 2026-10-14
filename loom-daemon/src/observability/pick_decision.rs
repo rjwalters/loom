@@ -32,12 +32,12 @@ use super::pick_journal::{
 };
 use crate::forge_listing::RestIssue;
 use crate::role_runner::RoleTickOutcome;
-use crate::step_dispatch::item_draw::{DrawRecord, Exclusion, ITEM_DRAW_SEED_SCHEME};
+use crate::step_dispatch::item_draw::{Candidate, DrawRecord, Exclusion, ITEM_DRAW_SEED_SCHEME};
 use crate::telemetry::kinds::pick_decision::{
     source, split_into_chunks, PickAction, PickCandidate, PickDecisionRecord, PickDraw,
-    PickDrawCandidate, PickItemDraw, PickItemDrawStep, PickItemExclusion, PickLane, PickQueueSkip,
-    PickSkipReason, PickSortKey, PickTick, PickVerdict, PickViDemotion, PickWorkspaceDraw,
-    CHUNK_BYTES, WORK_FINDER_ROLE,
+    PickDrawCandidate, PickItemDraw, PickItemDrawStep, PickItemExclusion, PickItemPoolEntry,
+    PickLane, PickQueueSkip, PickSkipReason, PickSortKey, PickTick, PickVerdict, PickViDemotion,
+    PickWorkspaceDraw, CHUNK_BYTES, WORK_FINDER_ROLE,
 };
 use crate::telemetry::{RoleTickResult, TelemetryRecord};
 use crate::types::{QueueDisposition, WorkFinderTickSummary};
@@ -325,6 +325,8 @@ pub struct ItemDrawWorkspace<'a> {
     pub repo: &'a str,
     /// [`Weighing::excluded`](crate::step_dispatch::item_draw::Weighing::excluded).
     pub excluded: &'a std::collections::BTreeMap<Exclusion, usize>,
+    /// The pool before the first draw ([`crate::step_dispatch::item_draw::ItemDraw::starting_pool`]).
+    pub pool: &'a [Candidate],
     /// The draws taken, in order.
     pub draws: &'a [DrawRecord],
 }
@@ -368,6 +370,7 @@ pub fn item_draw_record(
                     pool_size: d.pool_size,
                     total_weight: d.total_weight,
                     roll: d.roll,
+                    picked_index: d.picked_index,
                     number: c.target(),
                     issue: c.item.issue,
                     pr: c.item.pr,
@@ -384,6 +387,22 @@ pub fn item_draw_record(
             })
         })
         .collect();
+    let pool = workspaces
+        .iter()
+        .flat_map(|w| {
+            w.pool.iter().enumerate().map(|(i, c)| PickItemPoolEntry {
+                repo: w.repo.to_string(),
+                index: u32::try_from(i).unwrap_or(u32::MAX),
+                issue: c.item.issue,
+                pr: c.item.pr,
+                step: c.step.as_str().to_string(),
+                weight: c.terms.weight,
+                priority: c.terms.priority,
+                age_permille: c.terms.age_permille,
+                age_source: c.terms.age_source.as_str().to_string(),
+            })
+        })
+        .collect();
     Some(PickItemDraw {
         seed_scheme: ITEM_DRAW_SEED_SCHEME.to_string(),
         seed_minute: minute.to_string(),
@@ -391,6 +410,7 @@ pub fn item_draw_record(
         tick_counter: tick_counter.to_string(),
         draws_total: draws.len(),
         excluded,
+        pool,
         draws,
     })
 }

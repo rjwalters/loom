@@ -357,7 +357,9 @@ pub struct PickWorkspaceDraw {
 }
 
 /// The step engine's item draws for one tick (#11896): the seed inputs, the
-/// weight-0 exclusion counts and every draw, enough to replay the sequence.
+/// weight-0 exclusion counts, each workspace's starting pool and every draw:
+/// enough to replay the sequence
+/// ([`crate::step_dispatch::item_draw::replay_record`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PickItemDraw {
     /// `loom-draw/v2`.
@@ -374,8 +376,35 @@ pub struct PickItemDraw {
     /// chunk, so read it from one chunk only.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub excluded: Vec<PickItemExclusion>,
+    /// Each drawn workspace's pool before its first draw, in pool order
+    /// (the chunk's in-order slice). Empty only when nothing was drawn.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pool: Vec<PickItemPoolEntry>,
     /// Every draw, in order (the chunk's in-order slice).
     pub draws: Vec<PickItemDrawStep>,
+}
+
+/// One item of a workspace's starting pool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PickItemPoolEntry {
+    /// Forge `owner/repo`.
+    pub repo: String,
+    /// 0-based position in the workspace's pool.
+    pub index: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr: Option<u32>,
+    /// The step (`builder`, `judge`, ...).
+    pub step: String,
+    /// The draw weight.
+    pub weight: u64,
+    /// The priority factor.
+    pub priority: u32,
+    /// The age term × 1000.
+    pub age_permille: u64,
+    /// `mirror`, `events`, `created` or `none`.
+    pub age_source: String,
 }
 
 /// How many items of one workspace a reason kept out of the item draw.
@@ -408,6 +437,9 @@ pub struct PickItemDrawStep {
     pub total_weight: u64,
     /// The roll in `0..total_weight`.
     pub roll: u64,
+    /// The drawn item's index in the pool as it stood: the workspace's
+    /// `pool[]` minus its earlier picks, in pool order.
+    pub picked_index: usize,
     /// The number the step acts on (the PR for a PR step).
     pub number: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -675,6 +707,7 @@ enum PickChunkEntry {
     Act(PickAction),
     Draw(PickDraw),
     Demoted(PickViDemotion),
+    ItemPool(PickItemPoolEntry),
     ItemDraw(PickItemDrawStep),
 }
 
@@ -729,6 +762,15 @@ pub fn split_into_chunks(record: PickDecisionRecord, max_bytes: usize) -> Vec<Pi
             header
                 .item_draw
                 .as_mut()
+                .map(|d| std::mem::take(&mut d.pool))
+                .unwrap_or_default()
+                .into_iter()
+                .map(PickChunkEntry::ItemPool),
+        )
+        .chain(
+            header
+                .item_draw
+                .as_mut()
                 .map(|d| std::mem::take(&mut d.draws))
                 .unwrap_or_default()
                 .into_iter()
@@ -747,6 +789,7 @@ pub fn split_into_chunks(record: PickDecisionRecord, max_bytes: usize) -> Vec<Pi
             PickChunkEntry::Act(a) => json_len(a),
             PickChunkEntry::Draw(d) => json_len(d),
             PickChunkEntry::Demoted(d) => json_len(d),
+            PickChunkEntry::ItemPool(p) => json_len(p),
             PickChunkEntry::ItemDraw(d) => json_len(d),
         } + 1; // the separating comma
                // Cut between entries; a lone oversized entry still goes out whole.
@@ -774,6 +817,11 @@ pub fn split_into_chunks(record: PickDecisionRecord, max_bytes: usize) -> Vec<Pi
             PickChunkEntry::Demoted(d) => chunk.very_important_demoted.push(d),
             // The header's `item_draw` (with emptied `draws`) is on every
             // chunk, so the draw lands in it.
+            PickChunkEntry::ItemPool(p) => {
+                if let Some(item_draw) = chunk.item_draw.as_mut() {
+                    item_draw.pool.push(p);
+                }
+            }
             PickChunkEntry::ItemDraw(d) => {
                 if let Some(item_draw) = chunk.item_draw.as_mut() {
                     item_draw.draws.push(d);

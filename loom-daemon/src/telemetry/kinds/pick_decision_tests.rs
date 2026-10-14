@@ -360,6 +360,11 @@ fn reassemble(chunks: &[PickDecisionRecord]) -> PickDecisionRecord {
         .iter()
         .find_map(|c| c.item_draw.clone())
         .map(|mut d| {
+            d.pool = sorted
+                .iter()
+                .filter_map(|c| c.item_draw.as_ref())
+                .flat_map(|d| d.pool.iter().cloned())
+                .collect();
             d.draws = sorted
                 .iter()
                 .filter_map(|c| c.item_draw.as_ref())
@@ -425,6 +430,7 @@ fn item_draws_split_in_order_with_their_header_on_every_chunk() {
             pool_size: 9 - i as usize,
             total_weight: 500,
             roll: u64::from(i),
+            picked_index: 0,
             number: 100 + i,
             issue: Some(100 + i),
             pr: None,
@@ -452,6 +458,7 @@ fn item_draws_split_in_order_with_their_header_on_every_chunk() {
                 skip_reason: PickSkipReason::Quota,
                 count: 4,
             }],
+            pool: Vec::new(),
             draws,
         },
     ));
@@ -472,4 +479,49 @@ fn item_draws_split_in_order_with_their_header_on_every_chunk() {
     old.as_object_mut().unwrap().remove("item_draw");
     let back: PickDecisionRecord = serde_json::from_value(old).unwrap();
     assert!(back.item_draw.is_none());
+}
+
+#[test]
+fn a_large_item_pool_splits_into_bounded_chunks_and_reassembles() {
+    let pool: Vec<PickItemPoolEntry> = (0u32..600)
+        .map(|i| PickItemPoolEntry {
+            repo: "o/r".to_string(),
+            index: i,
+            issue: Some(1000 + i),
+            pr: (i % 4 == 0).then_some(5000 + i),
+            step: "judge".to_string(),
+            weight: 43_200 + u64::from(i),
+            priority: 1,
+            age_permille: 1000,
+            age_source: "events".to_string(),
+        })
+        .collect();
+    let record = PickDecisionRecord::build(tick("work_finder"), Vec::new()).with_item_draw(Some(
+        PickItemDraw {
+            seed_scheme: "loom-draw/v2".to_string(),
+            seed_minute: "1".to_string(),
+            seed_host: "h".to_string(),
+            tick_counter: "2".to_string(),
+            draws_total: 0,
+            excluded: Vec::new(),
+            pool,
+            draws: Vec::new(),
+        },
+    ));
+    let budget = 8_000;
+    let chunks = split_into_chunks(record.clone(), budget);
+    assert!(chunks.len() > 5, "{} chunks", chunks.len());
+    for chunk in &chunks {
+        assert!(serde_json::to_vec(chunk).unwrap().len() <= budget);
+    }
+    let back = reassemble(&chunks);
+    assert_eq!(back, record);
+    let indices: Vec<u32> = back
+        .item_draw
+        .unwrap()
+        .pool
+        .iter()
+        .map(|p| p.index)
+        .collect();
+    assert_eq!(indices, (0..600).collect::<Vec<_>>());
 }
