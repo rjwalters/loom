@@ -1090,7 +1090,10 @@ impl SweepRegistry {
                             .join(format!("issue-{issue}.json"));
                         if checkpoint.exists() {
                             // #4463: never restore the label when a newer sweep
-                            // owns the lock — it is actively building.
+                            // owns the lock — it is actively building. #11852:
+                            // when this sweep already opened its PR, the issue
+                            // keeps `loom:building` while that PR is open (no
+                            // label write); the resume below re-claims it.
                             if !self.config.skip_label_flip && !superseded {
                                 let _ = self.restore_label_after_reap(issue, &sweep_id);
                                 self.note_label_flip(issue); // #4485 flap detection
@@ -1437,14 +1440,15 @@ impl SweepRegistry {
                                     // attempt: a human-gated pause is not a failed
                                     // attempt, so clearing the hold leaves the
                                     // issue's full resume runway intact. Nor does
-                                    // it strand the work — `restore_label_to_ready`
-                                    // has already returned the issue to
-                                    // `loom:issue`, where the #4123 open-PR guard
-                                    // correctly refuses ordinary re-dispatch and
-                                    // the periodic Judge/Champion roles own the
-                                    // open PR. That is exactly the resting state
-                                    // `MAX_RESUME_ATTEMPTS` exhaustion already
-                                    // produces, reached without burning the
+                                    // it strand the work — the periodic
+                                    // Judge/Champion roles own the open PR, and
+                                    // the issue keeps `loom:building` while that
+                                    // PR is open (#11852: `loom:issue` beside an
+                                    // open PR is not a resting state, it is a
+                                    // candidate the #4123 guard must refuse
+                                    // every tick). That is the state
+                                    // `MAX_RESUME_ATTEMPTS` exhaustion also
+                                    // leaves, reached without burning the
                                     // attempts first.
                                     let clean_no_progress_exit =
                                         exit_code == Some(0) && !checkpoint_progress;
@@ -1474,10 +1478,9 @@ impl SweepRegistry {
                                              {resume_phase_check:?}, open PR #{pr}) — a deliberate \
                                              no-op, not a crash; NOT resuming (resuming would \
                                              re-run the same decision and flap \
-                                             loom:issue/loom:building, #5614). The issue is back \
-                                             at loom:issue with the #4123 open-PR guard in force; \
-                                             the open PR is the periodic Judge/Champion roles' \
-                                             remit."
+                                             loom:issue/loom:building, #5614). The issue keeps \
+                                             loom:building while the PR is open (#11852); the PR \
+                                             is the periodic Judge/Champion roles' remit."
                                         );
                                         true
                                     } else if attempts >= MAX_RESUME_ATTEMPTS {
@@ -1514,13 +1517,10 @@ impl SweepRegistry {
                                         // full #4256 runway survives for the
                                         // Champion-lifted resume the retained
                                         // `doctor-done` checkpoint exists to
-                                        // serve. `restore_label_to_ready` above
-                                        // already returned the issue to
-                                        // `loom:issue` (the park is on the PR,
-                                        // not the issue), where the #4123
-                                        // open-PR guard refuses ordinary
-                                        // re-dispatch and the periodic
-                                        // Judge/Champion roles own the PR.
+                                        // serve. The issue keeps `loom:building`
+                                        // while its PR is open (#11852), and the
+                                        // periodic Judge/Champion roles own the
+                                        // PR.
                                         self.linked_pr_parked(issue, pr, &resume_phase_check)
                                     };
                                     if skip_resume {

@@ -766,16 +766,14 @@ fn cancel_prset_does_not_restore_label() {
     );
 }
 
-/// Issue #11852 (veto enabled): a sweep that opened its PR and then died holding a
-/// checkpoint gets its stale `loom:building` claim removed, but NOT
-/// `loom:issue` re-added — the open PR is the review lane's, and a queue label
-/// beside it is one every dispatch tick must refuse. The crash resume (#4256)
-/// still runs: its dispatch re-claims with `loom:building` and never needed
-/// `loom:issue` (#7873's `NotYetApproved` pre-flip verdict proceeds).
+/// Issue #11852: a sweep that opened its PR and then died holding a
+/// checkpoint keeps `loom:building` (no release write at all) — an issue
+/// carries it while its PR is open — and never regains `loom:issue`. The crash
+/// resume (#4256) still runs: it re-claims the issue's own kept label (the
+/// pre-flip collision and leaseless-label yields exempt a resume).
 #[test]
 #[serial]
-fn reap_with_checkpoint_and_open_pr_does_not_requeue_but_still_resumes() {
-    let _veto = crate::sweep_registry::restore_to_ready::open_pr_veto::VetoEnabled::new();
+fn reap_with_checkpoint_and_open_pr_keeps_the_claim_and_still_resumes() {
     let tmp = tempdir().unwrap();
     let ws = tmp.path();
     std::env::set_var("LOOM_REPO", "rjwalters/loom");
@@ -789,8 +787,8 @@ fn reap_with_checkpoint_and_open_pr_does_not_requeue_but_still_resumes() {
 
     let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
     assert!(
-        calls.contains("issue edit 11852 --remove-label loom:building"),
-        "the dead sweep's claim is still released; got: {calls:?}"
+        !calls.contains("issue edit 11852 --remove-label loom:building"),
+        "the issue keeps `loom:building` while its PR is open; got: {calls:?}"
     );
     assert!(
         !calls.contains("--add-label loom:issue"),
@@ -807,7 +805,6 @@ fn reap_with_checkpoint_and_open_pr_does_not_requeue_but_still_resumes() {
 #[test]
 #[serial]
 fn reap_with_checkpoint_and_no_open_pr_still_requeues() {
-    let _veto = crate::sweep_registry::restore_to_ready::open_pr_veto::VetoEnabled::new();
     let tmp = tempdir().unwrap();
     let ws = tmp.path();
     std::env::set_var("LOOM_REPO", "rjwalters/loom");

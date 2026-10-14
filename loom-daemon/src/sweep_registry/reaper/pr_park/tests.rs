@@ -200,11 +200,12 @@ async fn reaper_does_not_resume_when_the_linked_pr_is_blocked() {
         calls.contains("api repos/rjwalters/loom/issues/8682 --jq .labels[].name"),
         "the refusal must come from reading the PR's OWN labels; got: {calls:?}"
     );
-    // The park is on the PR, not the issue, so the issue is restored to the
-    // ready state on this very first reap (AC1's second half).
+    // The park is on the PR, not the issue, and the PR is open: the issue
+    // keeps `loom:building` while it is (#11852) — no release write at all.
     assert!(
-        calls.contains("issue edit 8668 --remove-label loom:building --add-label loom:issue"),
-        "the issue itself is unparked and must be restored to loom:issue; got: {calls:?}"
+        !calls.contains("issue edit 8668 --remove-label loom:building")
+            && !calls.contains("--add-label loom:issue"),
+        "the issue keeps its claim label beside the open PR; got: {calls:?}"
     );
     // Sanity: the fixture really produced the cap-exhausted shape — a clean
     // exit whose surviving checkpoint still classifies the entry as Crashed.
