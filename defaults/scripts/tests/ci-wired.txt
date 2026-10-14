@@ -326,3 +326,6 @@ test-spawn-claude-oom-policy.sh
 # ram-scope-limit`. Hermetic: daemon/systemd-run/systemctl/claude stubs under
 # mktemp -d; no real daemon, forge or network.
 test-spawn-claude-memory-max.sh
+# #11863: prompt-lint that targeted Judge/Curator/Builder invocations repeat
+# discovery gates before the first write. Hermetic: reads files only.
+test-targeted-role-invocation.sh
