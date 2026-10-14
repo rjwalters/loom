@@ -1,6 +1,6 @@
 {
   "_comment": [
-    "Issue #11895: the step engine's state -> step classifier (design #11894, \u00a74.1),",
+    "Issue #11895: the step engine's state -> step classifier (design #11894, §4.1),",
     "pinned once for loom-daemon's work_finder::step_item::classify",
     "(loom-daemon/src/work_finder/step_item_tests.rs) and for a TypeScript twin to come.",
     "Each case's `inputs` deserialize directly into step_item::Inputs; `expected` is the",
@@ -307,6 +307,31 @@
           "state": "curated",
           "verdict": {
             "step": "champion_promote"
+          }
+        }
+      ]
+    },
+    {
+      "name": "a proposal already promoted to loom:issue (legacy label left on) is ready work: Builder",
+      "inputs": {
+        "issues": [
+          {
+            "number": 30,
+            "labels": [
+              "loom:auditor",
+              "loom:issue"
+            ]
+          }
+        ],
+        "pulls": []
+      },
+      "expected": [
+        {
+          "issue": 30,
+          "pr": null,
+          "state": "ready",
+          "verdict": {
+            "step": "builder"
           }
         }
       ]

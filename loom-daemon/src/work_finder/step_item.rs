@@ -57,7 +57,7 @@
 //! | PR `loom:pr` | Champion merge |
 //! | PR with none of those | pass `no_stage` |
 //! | issue `loom:epic` | pass `epic` |
-//! | a proposal label (`loom:architect`, `loom:hermit`, `loom:auditor`) without `loom:curated` | pass `proposal` |
+//! | a proposal label (`loom:architect`, `loom:hermit`, `loom:auditor`) without `loom:curated` or `loom:issue` | pass `proposal` |
 //! | issue `loom:issue` + `loom:blocked`, capability-only park, every capability held | Builder (capability lane) |
 //! | the same, a capability not held | pass `capability_missing` |
 //! | `loom:curated` + `loom:blocked`, **dependency park**, every blocker closed | Champion re-evaluate |
@@ -662,7 +662,10 @@ fn decide_issue(issue: &IssueInput, labels: &[String], host: &HostInput) -> (Ite
     if has(labels, super::EPIC_LABEL) {
         return pass(ItemState::Epic, PassReason::Epic);
     }
-    if is_proposal(labels) && !has(labels, CURATED) {
+    // A proposal that is already promoted (`loom:issue`) or curated is item
+    // work; Champion's own proposal query skips those too (`champion.md`
+    // Priority 3 excludes `loom:issue` / `loom:building`).
+    if is_proposal(labels) && !has(labels, CURATED) && !has(labels, READY) {
         return pass(ItemState::Proposal, PassReason::Proposal);
     }
     if super::is_blocked_hold(labels) {
