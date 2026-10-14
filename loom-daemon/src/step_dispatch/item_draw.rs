@@ -17,8 +17,12 @@
 //!   debt. Also 0 for a step whose role's token pool is exhausted (the
 //!   role-tick state `record_role_tick_pool_exhausted` keeps, #7607): the
 //!   spawn would be refused, so drawing the step only burns the redraw
-//!   budget and leaves the slot empty. A weight-0 item never enters the
-//!   pool; it is counted by its [`Exclusion`] instead.
+//!   budget and leaves the slot empty. Also 0 for an `(item, step)` the
+//!   outcome ledger has cooling down at the tick's clock
+//!   ([`WeighContext::cooldowns`], #11900): a no-op, a pool or claim
+//!   refusal, a fast failure, the repeat cap, a landed item's Builder step,
+//!   or a Champion re-evaluation ladder rung that is not due. A weight-0 item
+//!   never enters the pool; it is counted by its [`Exclusion`] instead.
 //! - **`priority`**: [`ItemWeights::red_main`] for a red-main fix, else
 //!   [`ItemWeights::very_important`] / [`ItemWeights::important`] by the
 //!   item's level, else 1. One factor, not a product: a red-main fix that is
@@ -72,8 +76,10 @@ use std::path::Path;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::Value;
 
+use super::outcome_ledger::StepCooldowns;
 use super::stage_entry::{Source, StageEntry};
 use crate::priority_pick::{Level, PickRng};
+use crate::step_role::StepRole;
 use crate::work_finder::step_item::{Item, Lane, PassReason, Step, Verdict};
 use crate::work_finder::vi_cap::{self, ViDemotion};
 use crate::work_finder::WorkItem;
@@ -255,6 +261,8 @@ pub enum Exclusion {
     PoolExhausted,
     /// A Builder step in a repo whose build back-off is engaged.
     BuildBackoff,
+    /// The outcome ledger has the `(item, step)` cooling down (#11900).
+    CoolingDown,
 }
 
 impl Exclusion {
@@ -265,6 +273,7 @@ impl Exclusion {
             Self::Pass(reason) => reason.as_str(),
             Self::PoolExhausted => "pool_exhausted",
             Self::BuildBackoff => "build_backoff",
+            Self::CoolingDown => "cooling_down",
         }
     }
 }
@@ -284,6 +293,10 @@ pub struct WeighContext {
     pub pool_exhausted_roles: BTreeSet<String>,
     /// The workspace's index in the tick (recorded on the cap's demotions).
     pub workspace_idx: usize,
+    /// The outcome ledger's query (#11900): every `(item, step)` cooling down,
+    /// from this host's ledger, the peers' broadcasts and the forge ladder.
+    /// Read at [`Self::now`].
+    pub cooldowns: StepCooldowns,
 }
 
 /// One item's weight and its terms.
@@ -402,6 +415,14 @@ pub fn weigh(inputs: &[DrawInput], ctx: &WeighContext, weights: &ItemWeights) ->
         }
         if step == Step::Builder && ctx.build_backoff_engaged && input.item.lane != Lane::RedMain {
             *excluded.entry(Exclusion::BuildBackoff).or_default() += 1;
+            continue;
+        }
+        let target = input.item.target().unwrap_or_default();
+        if ctx
+            .cooldowns
+            .is_cooling(target, StepRole::from(step), ctx.now)
+        {
+            *excluded.entry(Exclusion::CoolingDown).or_default() += 1;
             continue;
         }
         let (age_minutes, age_source) = stage_age(input, ctx.now);

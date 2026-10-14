@@ -1034,6 +1034,7 @@ impl SweepRegistry {
             | peer_claims::ClaimKind::PrlessReleaseArmed
             | peer_claims::ClaimKind::PoolHoldArmed
             | peer_claims::ClaimKind::PoolHoldCleared
+            | peer_claims::ClaimKind::StepCooldownArmed
             | peer_claims::ClaimKind::Heartbeat => return,
         };
         if let Err(e) = tx.try_send(ad) {

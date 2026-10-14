@@ -12,9 +12,16 @@
 //!   classified items, `actionable × priority × age` (#11894 §4.2 step 3,
 //!   #11896).
 //!
+//! - [`outcome_ledger`]: what a finished step's outcome class does next, per
+//!   `(item, step)`, and the cooldown query the draw reads (#11900).
+//! - [`reeval_ladder`]: the Champion re-evaluation ladder, 6 h → 7 d, kept
+//!   in the item's body on the forge (#11900).
+//!
 //! Nothing dispatches from here yet: the finder cutover (#11909) calls the
 //! draw.
 
 pub mod item_draw;
 pub mod listing;
+pub mod outcome_ledger;
+pub mod reeval_ladder;
 pub mod stage_entry;

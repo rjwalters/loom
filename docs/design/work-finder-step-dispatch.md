@@ -170,9 +170,12 @@ A Builder restore with a verified open linked PR writes no label: the issue keep
 | landed (`verdict:closed`) | Reclassify the item. No more Builder steps. |
 | `noop` | Cooldown per `(item, step)` |
 | fast `failed` | The #11872 ladder |
-| Champion re-evaluation left the item held or blocked | Ladder from 6 h to 7 d, **stored on the forge** in the park record or hold marker |
+| Champion re-evaluation left the item held or blocked | Ladder from 6 h to 7 d, **stored on the forge**: a `<!-- loom:reeval step=… rung=… next=… -->` line in the item's body, beside its park record or under its hold marker |
+| `refused`, `pool_gate` or `claimed` | A short cooldown per `(item, step)`, in force before the next tick |
+| `refused`, `claim_lost` | Redraw; counted |
+| any other `refused` | Reclassify the item |
 
-Short cooldowns are local and broadcast, bounded at 24 h (`sweep_registry/dispatch/landed_cooldown.rs:32`).
+No `(item, step)` runs more than 3 times in 24 h without a state change: the ledger's repeat cap. Short cooldowns are local and broadcast (`step_cooldown_armed`), bounded at 24 h on both ends (`step_dispatch/outcome_ledger.rs` `MAX_SHORT_COOLDOWN`, which the landed cooldown shares). The draw reads them, and the forge ladder's due times, as part of `actionable` (#11900).
 
 ## 6. Champion: promotion and merge
 
