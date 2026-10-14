@@ -25,14 +25,27 @@ use crate::step_role::StepRole;
 
 impl SweepRegistry {
     /// Release the claim of a step whose lock outlived its process across a
-    /// restart. Best-effort: a failed write only logs.
+    /// restart, unless another claimant holds the item now
+    /// ([`Self::step_claim_held_elsewhere`], the reaper's own check): after
+    /// downtime longer than the claim's staleness window a peer may have
+    /// reclaimed it, and its claim must not be stripped. Best-effort: a
+    /// failed write only logs.
     pub(crate) fn restore_dead_step_at_startup(
         &mut self,
         item: u32,
         role: StepRole,
         sweep_id: &str,
+        started_at: DateTime<Utc>,
     ) {
+        self.publish_step_claim(peer_claims::ClaimKind::Retract, item, role);
         if self.config.skip_label_flip {
+            return;
+        }
+        if self.step_claim_held_elsewhere(item, role, sweep_id, started_at) {
+            log::info!(
+                "reconstruct: {role} step {sweep_id} on #{item} died while no daemon ran, and \
+                 another claimant holds the item now — leaving its labels alone (#11898)"
+            );
             return;
         }
         match self.restore_step_claim(item, role, sweep_id) {
@@ -44,7 +57,12 @@ impl SweepRegistry {
                 "reconstruct: {role} step {sweep_id} on #{item}: claim release failed: {e:#}"
             ),
         }
-        self.publish_step_claim(peer_claims::ClaimKind::Retract, item, role);
+    }
+
+    /// When the lock owner says its run started (its `acquired_at`), else now.
+    pub(crate) fn lock_started_at(owner: &LockOwner) -> DateTime<Utc> {
+        chrono::DateTime::parse_from_rfc3339(&owner.acquired_at)
+            .map_or_else(|_| Utc::now(), |t| t.with_timezone(&Utc))
     }
 
     /// Adopt every live PR step from its `pr-<N>` lock, and release every dead
@@ -108,7 +126,8 @@ impl SweepRegistry {
                 if std::fs::remove_dir_all(&path).is_ok() {
                     self.shadow_owner_released(LockNs::Pr, pr, Some(&owner.sweep_id));
                 }
-                self.restore_dead_step_at_startup(item, role, &owner.sweep_id);
+                let started_at = Self::lock_started_at(&owner);
+                self.restore_dead_step_at_startup(item, role, &owner.sweep_id, started_at);
                 continue;
             }
             let pgid = owner.pgid.filter(|&recorded| {
@@ -227,5 +246,69 @@ mod tests {
         );
         assert_eq!(StepRole::parse_sweep_id("sweep-issue-12-1700000000"), None);
         assert_eq!(StepRole::parse_sweep_id("step-nobody-12-1"), None);
+    }
+
+    /// A fake `gh` that logs every call, answers the comments read with
+    /// `comments` (fleet-authored) and the label timeline with `labeled_at`.
+    fn logging_gh(dir: &std::path::Path, comments: &str, labeled_at: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let gh = dir.join("fake-gh.sh");
+        let log = dir.join("gh.log");
+        let comments = crate::comment_trust::records::with_fleet_author(comments);
+        let script = format!(
+            "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> '{log}'\n\
+             if [[ \"$1\" == repo ]]; then echo o/r; exit 0; fi\n\
+             if [[ \"$*\" == *timeline* ]]; then echo '\"{labeled_at}\"'; exit 0; fi\n\
+             if [[ \"$*\" == *.state* ]]; then echo '{{\"body\":\"\",\"state\":\"open\",\"closed_at\":null,\"labels\":[\"loom:building\",\"loom:reviewing\"]}}'; exit 0; fi\n\
+             if [[ \"$*\" == */comments* ]]; then printf '%s' '{comments}'; exit 0; fi\n\
+             exit 0\n",
+            log = log.display(),
+        );
+        std::fs::write(&gh, script).unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        gh
+    }
+
+    fn forge_registry(dir: &std::path::Path, gh: std::path::PathBuf) -> SweepRegistry {
+        let mut config = SweepRegistryConfig::new(dir.to_path_buf());
+        config.gh_bin = Some(gh);
+        config.skip_label_flip = false;
+        config.journal_path = Some(dir.join("journal.json"));
+        SweepRegistry::new(config)
+    }
+
+    fn dead_pid() -> u32 {
+        let mut c = std::process::Command::new("true").spawn().unwrap();
+        let pid = c.id();
+        c.wait().unwrap();
+        pid
+    }
+
+    /// #11950 review, blocker 1: a step that died while no daemon ran, whose
+    /// item a peer reclaimed meanwhile, gets no label write at startup.
+    #[test]
+    fn a_dead_steps_restore_at_startup_leaves_a_peers_reclaim_alone() {
+        // A Judge step: a peer's live lease is the earliest.
+        let dir = tempfile::tempdir().unwrap();
+        let at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let peer = format!(
+            r#"{{"id":9,"updated_at":"{at}","body":"<!-- loom:pr-lease role=judge host=h sweep=peer -->"}}"#
+        );
+        let mut reg = forge_registry(dir.path(), logging_gh(dir.path(), &peer, &at));
+        write_owner(&reg, "pr-60", 60, "step-judge-60-1700000000", dead_pid());
+        assert_eq!(reg.reconstruct().unwrap(), 0);
+        let calls = std::fs::read_to_string(dir.path().join("gh.log")).unwrap_or_default();
+        assert!(!calls.contains(" edit "), "{calls}");
+
+        // A Builder step: `loom:building` re-applied long after it started.
+        let dir = tempfile::tempdir().unwrap();
+        let later = (Utc::now() + chrono::Duration::hours(2))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let mut reg = forge_registry(dir.path(), logging_gh(dir.path(), "", &later));
+        write_owner(&reg, "issue-61", 61, "step-builder-61-1700000000", dead_pid());
+        assert_eq!(reg.reconstruct().unwrap(), 0);
+        let calls = std::fs::read_to_string(dir.path().join("gh.log")).unwrap_or_default();
+        assert!(!calls.contains(" edit "), "{calls}");
+        assert!(!reg.config.locks_dir().join("issue-61").exists(), "the dead lock still goes");
     }
 }

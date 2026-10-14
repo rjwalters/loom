@@ -26,6 +26,19 @@ fn rust_sources_under(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// A test-only source file: `*_tests.rs`, `tests.rs`, anything under a
+/// `tests/` directory, or the registry's `test_support.rs`. Not any path that
+/// merely contains "test" (`test_parser.rs` is production code).
+fn is_test_file(rel: &str) -> bool {
+    let rel = rel.replace('\\', "/");
+    rel.ends_with("_tests.rs")
+        || rel == "tests.rs"
+        || rel.ends_with("/tests.rs")
+        || rel.starts_with("tests/")
+        || rel.contains("/tests/")
+        || rel.ends_with("test_support.rs")
+}
+
 /// The code lines of `text` up to its inline test module (`#[cfg(test)]`
 /// then attributes then `mod … {`; a `#[cfg(test)] mod x;` declaration or a
 /// test-only item mid-file does not end it), with comment lines blanked.
@@ -132,7 +145,7 @@ fn no_production_site_drops_other_kinds_silently() {
             .unwrap_or(&path)
             .display()
             .to_string();
-        if rel.contains("test") {
+        if is_test_file(&rel) {
             continue;
         }
         let text = std::fs::read_to_string(&path)
@@ -242,7 +255,7 @@ fn every_issue_kind_field_is_reviewed() {
             .unwrap_or(&path)
             .display()
             .to_string();
-        if rel.contains("test") {
+        if is_test_file(&rel) {
             continue;
         }
         let text = std::fs::read_to_string(&path).unwrap();

@@ -1023,7 +1023,8 @@ impl SweepRegistry {
                         self.shadow_owner_released(LockNs::Issue, issue, Some(&owner.sweep_id));
                     }
                     if let Some((role, item)) = step {
-                        self.restore_dead_step_at_startup(item, role, &owner.sweep_id);
+                        let started_at = Self::lock_started_at(&owner);
+                        self.restore_dead_step_at_startup(item, role, &owner.sweep_id, started_at);
                     }
                     continue;
                 }
