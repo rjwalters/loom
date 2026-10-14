@@ -258,7 +258,13 @@ loom_sync_checkout() {
         _warn "checkout sync skipped: $c is on '${branch:-detached HEAD}', not main (left untouched)."
         return 0
     fi
-    if [[ -n "$(git -C "$c" status --porcelain 2>/dev/null)" ]]; then
+    # Untracked files do not block: the machine-level config tier lives at
+    # <checkout>/config/defaults.json (config_resolver), untracked, so counting
+    # it as dirt froze every host that has one. Two fleet workers sat a month
+    # behind and served stale /loom:* prompts (2AMLogic/2am#4345). A
+    # fast-forward that would overwrite an untracked file still fails safely
+    # in `git merge --ff-only` below.
+    if [[ -n "$(git -C "$c" status --porcelain --untracked-files=no 2>/dev/null)" ]]; then
         _warn "checkout sync skipped: $c has uncommitted changes (left untouched)."
         return 0
     fi
