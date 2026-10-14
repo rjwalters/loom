@@ -61,7 +61,8 @@ impl SweepRegistry {
             })
             .filter_map(|info| match &info.kind {
                 SweepKind::Issue(n) => Some(*n),
-                SweepKind::PrSet(_) => None,
+                // Only an issue sweep stacks (`--depends-on`).
+                SweepKind::Step { .. } | SweepKind::PrSet(_) => None,
             })
             .collect()
     }

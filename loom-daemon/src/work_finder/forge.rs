@@ -367,7 +367,8 @@ impl WorkDispatcher for RegistryDispatcher {
         let mut set = HashSet::new();
         for state in [SweepState::Running, SweepState::Pending] {
             for info in reg.list(Some(&state)) {
-                if let SweepKind::Issue(n) = info.kind {
+                // A step holds its item's slot like a sweep (#11898).
+                if let Some(n) = info.kind.item_number() {
                     set.insert(n);
                 }
             }

@@ -470,6 +470,10 @@ fn daemon_write_paths_are_scoped() {
         ),
         ("sweep_registry/restore_to_ready.rs", Via(DISPATCH, "acts on dispatched sweeps")),
         (
+            "sweep_registry/restore_to_ready/step_restore.rs",
+            Via(DISPATCH, "releases the claim of a dispatched step sweep via run_claim_release_edit"),
+        ),
+        (
             "sweep_registry/roll_requeue.rs",
             Via(DISPATCH, "requeues dispatched sweeps a roll could not pause (#10831)"),
         ),

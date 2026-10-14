@@ -90,9 +90,31 @@ pub(crate) struct RollResumeSpec {
     pub(crate) effort: Option<String>,
     /// `None` when the sweep had not created its worktree yet.
     pub(crate) worktree: Option<WorktreeExpectation>,
+    /// Set when the paused run was an issue step, not a sweep (#11898). Only
+    /// an issue step resumes: it holds the same `issue-<N>` claim lock and
+    /// lease a sweep does. A PR step is requeued instead.
+    pub(crate) step: Option<crate::step_role::StepRole>,
 }
 
 impl RollResumeSpec {
+    /// The registry kind the resumed run is tracked as.
+    pub(crate) fn kind(&self) -> SweepKind {
+        match self.step {
+            Some(role) => SweepKind::Step {
+                item: self.issue,
+                role,
+            },
+            None => SweepKind::Issue(self.issue),
+        }
+    }
+
+    /// The label whose presence says the claim is still held.
+    fn claim_label(&self) -> &'static str {
+        self.step
+            .and_then(crate::step_role::StepRole::claim_label)
+            .unwrap_or("loom:building")
+    }
+
     /// The sweep id the claim's lease record is published under.
     pub(crate) fn lease_sweep_id(&self) -> &str {
         self.launch
@@ -109,6 +131,7 @@ pub(crate) struct PreparedRollResume {
     pub(crate) header_anchor: String,
     pub(crate) log_path: PathBuf,
     pub(crate) issue: u32,
+    pub(crate) kind: SweepKind,
     /// The resumed run's own sweep id.
     pub(crate) sweep_id: SweepId,
     pub(crate) lease_sweep_id: String,
@@ -321,10 +344,11 @@ impl SweepRegistry {
                     format!("#{issue} gained `{label}` while its agent was paused"),
                 ));
             }
-            if !labels.iter().any(|l| l == "loom:building") {
+            let claim = spec.claim_label();
+            if !labels.iter().any(|l| l == claim) {
                 return Err(RollResumeRefusal::guard(
                     "claim-label",
-                    format!("#{issue} no longer carries `loom:building`"),
+                    format!("#{issue} no longer carries `{claim}`"),
                 ));
             }
         }
@@ -384,7 +408,7 @@ impl SweepRegistry {
         spec: &RollResumeSpec,
     ) -> std::result::Result<PreparedRollResume, RollResumeRefusal> {
         let issue = spec.issue;
-        let kind = SweepKind::Issue(issue);
+        let kind = spec.kind();
         let Some(owner) = self
             .roll_lock_owner(issue)
             .filter(|o| Self::owner_is_run(o, &spec.old_sweep_id))
@@ -447,7 +471,10 @@ impl SweepRegistry {
             ));
         }
         self.apply_dispatch_stagger();
-        let log_path = self.compute_log_path(issue);
+        let log_path = match spec.step {
+            Some(role) => self.compute_step_log_path(issue, role),
+            None => self.compute_log_path(issue),
+        };
         let model = spec.model.as_deref().filter(|m| !m.is_empty());
         let effort = spec.effort.as_deref().filter(|e| !e.is_empty());
         let spawned = self.spawn_child_process_for(
@@ -467,6 +494,7 @@ impl SweepRegistry {
                 header_anchor,
                 log_path,
                 issue,
+                kind: kind.clone(),
                 sweep_id,
                 lease_sweep_id: spec.lease_sweep_id().to_string(),
                 model: model.map(str::to_string),
@@ -503,6 +531,7 @@ impl SweepRegistry {
             header_anchor,
             log_path,
             issue,
+            kind,
             sweep_id,
             lease_sweep_id,
             model,
@@ -534,7 +563,7 @@ impl SweepRegistry {
             sweep_id.clone(),
             SweepInfo {
                 sweep_id: sweep_id.clone(),
-                kind: SweepKind::Issue(issue),
+                kind: kind.clone(),
                 pid,
                 pgid,
                 token_name,
@@ -553,8 +582,15 @@ impl SweepRegistry {
                 overflow: false,
             },
         );
-        match self.config.resolve_journal_path() {
-            Ok(journal_path) => {
+        // The machine journal reconstructs issue sweeps after a restart; a step
+        // is not one, so it is not journalled (#11898).
+        let journal = match kind {
+            SweepKind::Issue(_) => Some(self.config.resolve_journal_path()),
+            SweepKind::Step { .. } | SweepKind::PrSet(_) => None,
+        };
+        match journal {
+            None => {}
+            Some(Ok(journal_path)) => {
                 if let Err(e) = sweep_journal::record_sweep_at(
                     &journal_path,
                     &self.config.workspace_root.display().to_string(),
@@ -565,7 +601,7 @@ impl SweepRegistry {
                     log::warn!("sweep_journal: failed to record the resume of #{issue}: {e}");
                 }
             }
-            Err(e) => log::warn!("sweep_journal: cannot resolve the journal path: {e}"),
+            Some(Err(e)) => log::warn!("sweep_journal: cannot resolve the journal path: {e}"),
         }
         Ok(ResumedSweep {
             sweep_id,

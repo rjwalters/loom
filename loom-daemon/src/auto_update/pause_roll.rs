@@ -422,7 +422,7 @@ fn manifest_item(c: &Candidate, now: DateTime<Utc>, min_age: u64) -> ManifestIte
         status: ItemStatus::Planned,
         reason: verdict.reason,
         issue: c.issue,
-        pr: None,
+        pr: c.pr,
         pid: c.pid,
         // The observed process start when the snapshot has one (it is the
         // identity the teardown checks), else the registry's record.
@@ -438,10 +438,17 @@ fn manifest_item(c: &Candidate, now: DateTime<Utc>, min_age: u64) -> ManifestIte
         worktree: c.worktree.clone(),
         // A sweep's claim is its issue's `loom:building`; a role run's is
         // whatever its claim breadcrumb recorded (#10832), if anything.
-        claim: c.issue.map_or_else(
-            || c.role_claim().map(|claim| claim.manifest_value()),
-            |_| Some(serde_json::json!({ "label": "loom:building", "on": "issue" })),
-        ),
+        claim: match (c.step, c.issue) {
+            // A step's claim is its role's (#11898): the claim label on its
+            // item, or, for the merge step, the PR lease alone.
+            (Some(step), _) => Some(serde_json::json!({
+                "label": step.claim_label(),
+                "on": if step.acts_on_pr() { "pr" } else { "issue" },
+                "step": step.as_str(),
+            })),
+            (None, Some(_)) => Some(serde_json::json!({ "label": "loom:building", "on": "issue" })),
+            (None, None) => c.role_claim().map(|claim| claim.manifest_value()),
+        },
         lease_comment_id: None,
         lease_refreshed_at: None,
         log_path: c.log_path.clone(),
@@ -450,6 +457,7 @@ fn manifest_item(c: &Candidate, now: DateTime<Utc>, min_age: u64) -> ManifestIte
         timeout_remaining_secs: c.timeout_remaining_secs,
         holds_issue_creation_mutex: c.holds_issue_creation_mutex,
         stopped_at: None,
+        step: c.step,
     }
 }
 

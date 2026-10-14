@@ -768,3 +768,77 @@ fn lane_plan_is_stashed_converted_and_drained_once() {
     let json = serde_json::to_value(&lanes).unwrap();
     assert_eq!(json[0]["debt"], 60);
 }
+
+#[test]
+fn item_draw_record_carries_terms_age_source_and_exclusion_counts() {
+    use crate::step_dispatch::item_draw::{
+        weight_terms, AgeSource, Candidate, DrawRecord, Exclusion, ItemWeights,
+    };
+    use crate::work_finder::step_item::{Item, ItemState, Lane, PassReason, Step, Verdict};
+    assert!(item_draw_record(1, "h", 2, &[]).is_none());
+    let picked = Candidate {
+        item: Item {
+            issue: Some(7),
+            pr: Some(8),
+            state: ItemState::ReviewRequested,
+            verdict: Verdict::Step(Step::Judge),
+            lane: Lane::Normal,
+            send_back: false,
+        },
+        step: Step::Judge,
+        terms: weight_terms(
+            &ItemWeights::default(),
+            Lane::Normal,
+            crate::priority_pick::Level::Important,
+            30 * 1440,
+            AgeSource::Mirror,
+        ),
+    };
+    let draws = [DrawRecord {
+        draw_index: 0,
+        seed: 99,
+        pool_size: 3,
+        total_weight: 1_000_000,
+        roll: 5,
+        picked_index: 0,
+        picked: picked.clone(),
+    }];
+    let excluded = std::collections::BTreeMap::from([
+        (Exclusion::Pass(PassReason::Claimed), 2),
+        (Exclusion::PoolExhausted, 1),
+    ]);
+    let d = item_draw_record(
+        29_000_000,
+        "host-a",
+        17,
+        &[ItemDrawWorkspace {
+            repo: "o/r",
+            excluded: &excluded,
+            pool: std::slice::from_ref(&picked),
+            draws: &draws,
+        }],
+    )
+    .unwrap();
+    assert_eq!(d.seed_scheme, "loom-draw/v2");
+    assert_eq!(d.tick_counter, "17");
+    assert_eq!(
+        (d.pools.len(), d.pools[0].pr, d.pools[0].weight),
+        (1, Some(8), d.draws[0].weight)
+    );
+    let step = &d.draws[0];
+    assert_eq!(step.number, 8, "a Judge step acts on the PR");
+    assert_eq!((step.priority, step.age_permille), (3, 2000));
+    assert_eq!((step.age_source.as_str(), step.step.as_str()), ("mirror", "judge"));
+    let counts: Vec<(&str, PickSkipReason, usize)> = d
+        .excluded
+        .iter()
+        .map(|e| (e.reason.as_str(), e.skip_reason, e.count))
+        .collect();
+    assert_eq!(
+        counts,
+        vec![
+            ("claimed", PickSkipReason::InFlight, 2),
+            ("pool_exhausted", PickSkipReason::Quota, 1)
+        ]
+    );
+}

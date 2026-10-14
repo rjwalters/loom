@@ -1370,7 +1370,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // an operator env var still overrides for a single run (precedence env >
     // config > default). An absent `autonomous` block is byte-for-byte the
     // env-only behavior shipped in Phases A/B.
-    let work_finder_config = work_finder::read_work_finder_config(&sweep_workspace);
+    let work_finder_config = loom_daemon::work_finder_guard::read_and_check(&sweep_workspace);
 
     let _work_finder_handle = if work_finder::resolve_enabled(&work_finder_config) {
         let interval = work_finder::resolve_interval_with_config(&work_finder_config);

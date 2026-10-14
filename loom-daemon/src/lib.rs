@@ -385,6 +385,9 @@ pub mod status_budget;
 /// and the renderer's key filter.
 pub mod status_section;
 pub mod step_dispatch;
+/// The role a step runs and the claim it holds (#11898): `SweepKind::Step`'s
+/// role, its claim label and its restore stage.
+pub mod step_role;
 /// `points:*` story-point size labels (#9432, epic #9429) — the one parser both
 /// telemetry consumers (`sweep.started` at dispatch, `sweep.outcome` at the
 /// terminal transition) resolve points through, including the daemon-side
@@ -446,6 +449,7 @@ pub mod watchdog;
 pub mod watchdog_provisioning_guard;
 pub mod weighted_draw;
 pub mod work_finder;
+pub mod work_finder_guard;
 pub mod worker_spawn;
 pub mod workspace_hold;
 pub mod workspace_pool;

@@ -1235,8 +1235,11 @@ impl SweepRegistry {
         kind: &SweepKind,
         started_at: DateTime<Utc>,
     ) {
-        let SweepKind::Issue(issue) = kind else {
-            return;
+        let issue = match kind {
+            SweepKind::Issue(issue) => issue,
+            // A step writes no sweep checkpoint, so it has no phase to sample;
+            // its role is its phase (#11898).
+            SweepKind::Step { .. } | SweepKind::PrSet(_) => return,
         };
         let checkpoint = self
             .config

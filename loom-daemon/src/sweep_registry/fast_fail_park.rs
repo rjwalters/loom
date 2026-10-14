@@ -34,6 +34,8 @@
 //! tooling all treat it exactly as a quarantine. The comment names the
 //! failure class.
 //!
+//! The park survives a restart (Issue #11930): see `fast_fail_fleet`.
+//!
 //! One park, never two: the ladder parks only when the issue is not already
 //! quarantined, and the quarantine's own tally only parks when the issue is
 //! not already quarantined (`record_terminal_outcome`). The reaper charges the
