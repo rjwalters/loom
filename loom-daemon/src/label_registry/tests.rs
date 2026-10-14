@@ -80,6 +80,21 @@ fn validation_rejects_bad_retired_entries() {
     assert!(mutate(&|v| v["retired"][0]["extra"] = true.into()).is_err());
     // `lifecycle: retired` is gone: a retired label lives in `retired`.
     assert!(mutate(&|v| v["labels"][0]["lifecycle"] = "retired".into()).is_err());
+    // `also_remove` (#11860) names another active label, on an owned entry.
+    assert!(mutate(&|v| v["retired"][0]["also_remove"] = serde_json::json!(["loom:nope"])).is_err());
+    assert!(mutate(&|v| {
+        v["retired"][0]["also_remove"] =
+            serde_json::json!([v["retired"][0]["replaced_by"].clone()]);
+    })
+    .is_err());
+    assert!(mutate(&|v| {
+        v["retired"][0]["also_remove"] = serde_json::json!(["loom:curated"]);
+        v["retired"][0]["owned"] = false.into();
+    })
+    .is_err());
+    assert!(
+        mutate(&|v| v["retired"][0]["also_remove"] = serde_json::json!(["loom:curated"])).is_ok()
+    );
     // An absent `retired` array is an empty one.
     assert!(mutate(&|v| {
         v.as_object_mut().unwrap().remove("retired");
@@ -119,6 +134,9 @@ fn every_retired_label_has_its_mapping_entry() {
         ("loom:operator-mechanical", Some("loom:operator"), true, "#11795"),
         ("loom:operator-blocked", Some("loom:operator"), true, "#11795"),
         ("loom:needs-capability", Some("loom:blocked"), true, "#11795"),
+        // #11860: Champion's revise verdict sets loom:triage (and drops
+        // loom:curated, the entry's `also_remove`).
+        ("loom:needs-revision", Some("loom:triage"), true, "#11860"),
     ];
     let got: Vec<(&str, Option<&str>, bool, &str)> = reg()
         .retired
