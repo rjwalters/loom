@@ -403,6 +403,30 @@ pub struct PickDecisionRecord {
     /// nothing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub very_important_demoted: Vec<PickViDemotion>,
+    /// The per-repository lane computation behind a judge or doctor run
+    /// (#10630): one entry per observed repository, so "why only one Doctor?"
+    /// is one query. Empty for every other record.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lanes: Vec<PickLane>,
+    /// The repository a role tick ran for (#11858): forge `owner/repo`, or
+    /// `repo_unresolved`. Present on every role record, so a tick with an
+    /// empty queue still names its repo; absent on work-finder records (their
+    /// candidates name their own repos) and on an older daemon's records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+}
+
+/// One repository's lane computation (#10630): `lanes = clamp(ceil(debt / k),
+/// 1, cap)` before (`wanted`) and after (`lanes`) the host-capacity trim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PickLane {
+    pub repo: String,
+    /// The debt the formula read (last-known PRs on the role's axis).
+    pub debt: usize,
+    /// Lanes the formula wanted.
+    pub wanted: usize,
+    /// Lanes after the trim to the host capacity.
+    pub lanes: usize,
 }
 
 /// Identity of the tick a record describes.
@@ -474,6 +498,8 @@ impl PickDecisionRecord {
             decisions_observed: false,
             workspace_draw: None,
             very_important_demoted: Vec::new(),
+            lanes: Vec::new(),
+            repo: None,
         }
     }
 

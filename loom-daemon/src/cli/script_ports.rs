@@ -364,7 +364,7 @@ pub(crate) enum ScriptPortCommand {
     /// The premise gate (#8396), one stage before Curator: is this issue in
     /// the gated population, and does a consistent premise record exist for
     /// it? Backs `premise-check.sh`. Exit 0 proceed, 10 record required, 11
-    /// route to `loom:operator-decision`, 12 record malformed, 13 premise
+    /// route to an operator decision, 12 record malformed, 13 premise
     /// false, 1 could not run — and 1 must be treated as 10, never as 0. Not
     /// a port either: same frozen-`main.rs` reason as `shell-budget` above.
     PremiseCheck(super::premise_check::PremiseCheckArgs),
@@ -372,7 +372,7 @@ pub(crate) enum ScriptPortCommand {
     /// The operator-decision helper (#9344): validate a ranked-options
     /// decision (2-4 options best -> worst, each with a why, recommended
     /// first) and write it onto an issue as a fenced `decision` block before
-    /// labelling it `loom:operator-decision`. Refuses, touching nothing, on
+    /// labelling it `loom:operator` (#11795). Refuses, touching nothing, on
     /// any contract failure. Same frozen-`main.rs` reason as `shell-budget`.
     #[command(subcommand)]
     OperatorDecision(super::operator_decision::OperatorDecisionCommand),

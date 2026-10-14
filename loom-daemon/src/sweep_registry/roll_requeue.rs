@@ -166,7 +166,9 @@ impl SweepRegistry {
     /// retried at the next start.
     pub(crate) fn requeue_for_roll(&self, issue: u32, notice: &RollRequeueNotice) -> Result<()> {
         let released = self.restore_label_to_ready_checked(issue)?;
-        if self.config.skip_label_flip || released == restore_to_ready::ClaimRelease::Frozen {
+        // #11852: an issue held at `loom:building` by its open PR is not
+        // requeued either, so it gets no requeue comment.
+        if self.config.skip_label_flip || released != restore_to_ready::ClaimRelease::Released {
             return Ok(());
         }
         let body = notice.comment_body();

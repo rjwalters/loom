@@ -107,9 +107,9 @@ impl Artifact {
 /// The PR-side transposition of `guide.md`'s `has_superseding_block` (#4634,
 /// extended #7267), and the transposition is where the care is:
 ///
-/// - `loom:operator` / `loom:operator-only` belong here. A human decision is
-///   pending on this exact artifact, so reporting it as ready to unpark invites
-///   an agent to walk over that decision.
+/// - `loom:operator` (and the retired names that fold into it, #11795) belong
+///   here. A human decision is pending on this exact artifact, so reporting it
+///   as ready to unpark invites an agent to walk over that decision.
 /// - `loom:changes-requested`, `loom:review-requested`, `loom:ci-failure`
 ///   deliberately do **not**. On an *issue*, an open linked PR carrying
 ///   `loom:changes-requested` is a superseding block because it means the
@@ -120,7 +120,7 @@ impl Artifact {
 ///   re-create the stall this check exists to surface.
 /// - `loom:blocked` itself is obviously excluded — it is the label under
 ///   evaluation.
-const PR_SELF_BLOCK_LABELS: [&str; 2] = ["loom:operator", "loom:operator-only"];
+use crate::work_finder::OPERATOR_HOLD_NAMES as PR_SELF_BLOCK_LABELS;
 
 /// What one issue's three re-checks found, in `dep_recheck`'s own types.
 ///

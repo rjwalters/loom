@@ -53,7 +53,7 @@ impl Deps for Fake {
     fn gh(&self, _: &Path) -> Option<(PathBuf, GhVersion)> {
         self.gh.map(|v| (PathBuf::from("/opt/gh/bin/gh"), v))
     }
-    fn read_key(&self, r: &KeyRef, _region: Option<&str>) -> Result<String, String> {
+    fn read_key(&self, r: &KeyRef, _aws: &AwsAccess<'_>) -> Result<String, String> {
         *self.reads.borrow_mut() += 1;
         let KeyRef::File(p) = r else {
             return Err("ssm not faked".into());
@@ -155,12 +155,12 @@ fn a_file_key_must_be_owner_only_and_never_appears_in_the_error() {
     std::fs::write(&path, format!("{KEY}\n")).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
     let r = KeyRef::File(path.clone());
-    let err = r.read(None).unwrap_err();
+    let err = r.read(&AwsAccess::default(), CONFIG_KEY).unwrap_err();
     assert!(!err.contains(KEY), "{err}");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-    assert_eq!(r.read(None).unwrap(), KEY);
+    assert_eq!(r.read(&AwsAccess::default(), CONFIG_KEY).unwrap(), KEY);
     std::fs::write(&path, "not a key at all\nsecond line").unwrap();
-    let err = r.read(None).unwrap_err();
+    let err = r.read(&AwsAccess::default(), CONFIG_KEY).unwrap_err();
     assert!(!err.contains("not a key"), "{err}");
 }
 
@@ -390,6 +390,178 @@ fn a_front_routes_only_when_its_gh_is_the_checked_one() {
     assert!(!publish::gh_marker_matches(&tmp.path().join("none"), &gh));
 }
 
+/// 2AMLogic/2am#4367: a CLI run by a host job routes through the daemon's
+/// published profiles only on the front's terms: the variable is set, its
+/// marker names the `gh` the facade will exec, and no front outage holds.
+#[test]
+fn a_cli_routes_only_through_a_checked_gh_and_outside_an_outage() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join(".loom").join(DIR_NAME);
+    std::fs::create_dir_all(&base).unwrap();
+    set_mode(&base, 0o700);
+    let gh = tmp.path().join("gh");
+    std::fs::write(&gh, "").unwrap();
+    let other = tmp.path().join("gh-other");
+    std::fs::write(&other, "").unwrap();
+    std::fs::write(
+        base.join("gh-ok"),
+        std::fs::canonicalize(&gh)
+            .unwrap()
+            .to_string_lossy()
+            .as_bytes(),
+    )
+    .unwrap();
+    let env = Some(base.clone().into_os_string());
+    let now = SystemTime::now();
+    let gh_s = gh.to_str().unwrap();
+
+    assert_eq!(cli_base(env.clone(), gh_s, now), Some(base.clone()));
+    // Unset or empty: today's routing.
+    assert_eq!(cli_base(None, gh_s, now), None);
+    assert_eq!(cli_base(Some(OsString::new()), gh_s, now), None);
+    // A different gh than the daemon checked: it might ignore api_host.
+    assert_eq!(cli_base(env.clone(), other.to_str().unwrap(), now), None);
+    // A gh that does not resolve (a bare name on no PATH entry).
+    assert_eq!(cli_base(env.clone(), "loom-test-no-such-gh-binary", now), None);
+    // A directory the daemon never published into.
+    let empty = tmp.path().join(".loom").join("empty");
+    std::fs::create_dir(&empty).unwrap();
+    assert_eq!(cli_base(Some(empty.into_os_string()), gh_s, now), None);
+    // A front outage the daemon or a front recorded holds for its window.
+    outage::note_front_outage(&base);
+    assert_eq!(cli_base(env.clone(), gh_s, now), None);
+    assert_eq!(cli_base(env, gh_s, now + Duration::from_secs(3600)), Some(base));
+}
+
+fn set_mode(path: &std::path::Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// A published base the way the daemon leaves it, with a `gh-ok` for `gh`.
+fn published(root: &std::path::Path, gh: &std::path::Path) -> PathBuf {
+    let base = root.join(".loom").join(DIR_NAME);
+    let profile = base.join("acme");
+    std::fs::create_dir_all(&profile).unwrap();
+    set_mode(&base, 0o700);
+    set_mode(&profile, 0o700);
+    std::fs::write(profile.join("hosts.yml"), "github.com: {}").unwrap();
+    set_mode(&profile.join("hosts.yml"), 0o600);
+    std::fs::write(
+        base.join("gh-ok"),
+        std::fs::canonicalize(gh)
+            .unwrap()
+            .to_string_lossy()
+            .as_bytes(),
+    )
+    .unwrap();
+    base
+}
+
+/// A consumer's base comes from its environment, so the directory itself is
+/// checked: the shape the daemon publishes, ours, closed to others, no links.
+#[test]
+fn a_front_or_cli_refuses_an_untrusted_base_or_profile() {
+    let tmp = tempfile::tempdir().unwrap();
+    let gh = tmp.path().join("gh");
+    std::fs::write(&gh, "").unwrap();
+    let now = SystemTime::now();
+    let base = published(tmp.path(), &gh);
+    let env = |b: &std::path::Path| Some(b.to_path_buf().into_os_string());
+    assert_eq!(front_base(env(&base), &gh, now), Some(base.clone()));
+    assert!(publish::safe_profile(&base.join("acme")));
+
+    // A symlink to a valid published dir.
+    let link_root = tmp.path().join("link");
+    std::fs::create_dir_all(link_root.join(".loom")).unwrap();
+    let link = link_root.join(".loom").join(DIR_NAME);
+    std::os::unix::fs::symlink(&base, &link).unwrap();
+    assert_eq!(front_base(env(&link), &gh, now), None);
+
+    // Not named `.loom/gh-config-gateway`.
+    let odd = tmp.path().join("elsewhere");
+    let odd_gw = odd.join(".loom").join("gateway");
+    std::fs::create_dir_all(&odd_gw).unwrap();
+    set_mode(&odd_gw, 0o700);
+    std::fs::copy(base.join("gh-ok"), odd_gw.join("gh-ok")).unwrap();
+    assert_eq!(front_base(env(&odd_gw), &gh, now), None);
+    let tmp_x = tmp.path().join("x").join(DIR_NAME);
+    std::fs::create_dir_all(&tmp_x).unwrap();
+    set_mode(&tmp_x, 0o700);
+    std::fs::copy(base.join("gh-ok"), tmp_x.join("gh-ok")).unwrap();
+    assert_eq!(front_base(env(&tmp_x), &gh, now), None);
+
+    // Group- or world-writable base, profile dir or hosts.yml.
+    for mode in [0o770, 0o777] {
+        set_mode(&base, mode);
+        assert_eq!(front_base(env(&base), &gh, now), None, "base {mode:o}");
+        set_mode(&base, 0o700);
+    }
+    let profile = base.join("acme");
+    let hosts = profile.join("hosts.yml");
+    set_mode(&hosts, 0o666);
+    assert!(!publish::safe_profile(&profile), "hosts.yml 666");
+    set_mode(&hosts, 0o600);
+    set_mode(&profile, 0o770);
+    assert!(!publish::safe_profile(&profile), "profile 770");
+    set_mode(&profile, 0o700);
+    assert!(publish::safe_profile(&profile));
+
+    // `hosts.yml` (or the owner dir) a symlink.
+    let real = tmp.path().join("real-hosts.yml");
+    std::fs::write(&real, "github.com: {}").unwrap();
+    set_mode(&real, 0o600);
+    std::fs::remove_file(&hosts).unwrap();
+    std::os::unix::fs::symlink(&real, &hosts).unwrap();
+    assert!(!publish::safe_profile(&profile));
+    std::fs::remove_file(&hosts).unwrap();
+    std::fs::rename(&real, &hosts).unwrap();
+    let real_dir = tmp.path().join("real-acme");
+    std::fs::rename(&profile, &real_dir).unwrap();
+    std::os::unix::fs::symlink(&real_dir, &profile).unwrap();
+    assert!(!publish::safe_profile(&profile));
+}
+
+/// The marker and the outage file are read by path: a symlink (to a copy
+/// of a valid marker, or to a long-expired outage) is refused, as is a
+/// writable marker, so no other file can answer for either.
+#[test]
+fn a_front_or_cli_refuses_a_linked_or_writable_marker_or_outage_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let gh = tmp.path().join("gh");
+    std::fs::write(&gh, "").unwrap();
+    let gh_s = gh.to_str().unwrap();
+    let now = SystemTime::now();
+    let adopt = |b: &std::path::Path| cli_base(Some(b.as_os_str().to_owned()), gh_s, now);
+
+    let marked = published(&tmp.path().join("ws1"), &gh);
+    assert_eq!(adopt(&marked), Some(marked.clone()));
+    let copy = tmp.path().join("marker-copy");
+    std::fs::copy(marked.join("gh-ok"), &copy).unwrap();
+    std::fs::remove_file(marked.join("gh-ok")).unwrap();
+    std::os::unix::fs::symlink(&copy, marked.join("gh-ok")).unwrap();
+    assert_eq!(adopt(&marked), None, "a symlinked marker");
+
+    let loose = published(&tmp.path().join("ws2"), &gh);
+    set_mode(&loose.join("gh-ok"), 0o666);
+    assert_eq!(adopt(&loose), None, "a 0666 marker");
+
+    let outaged = published(&tmp.path().join("ws3"), &gh);
+    let expired = tmp.path().join("long-ago");
+    std::fs::write(&expired, "0").unwrap();
+    std::os::unix::fs::symlink(&expired, outaged.join(outage::FRONT_OUTAGE)).unwrap();
+    assert_eq!(adopt(&outaged), None, "a symlinked outage file");
+    std::fs::remove_file(outaged.join(outage::FRONT_OUTAGE)).unwrap();
+    assert_eq!(adopt(&outaged), Some(outaged.clone()));
+    // An outage file the front itself writes (0600) is honoured, not refused.
+    outage::note_front_outage(&outaged);
+    assert_eq!(adopt(&outaged), None);
+    assert_eq!(
+        cli_base(Some(outaged.as_os_str().to_owned()), gh_s, now + Duration::from_secs(3600)),
+        Some(outaged)
+    );
+}
+
 /// #7818's leak class: a profile holds a live key, so its path must be
 /// ignored by the deployed `.gitignore` block AND refused by every stager's
 /// credential list, without either list naming it.
@@ -547,13 +719,15 @@ fn ssm_refs_parse_and_are_read_in_an_explicit_region() {
     assert_eq!(resolve_region(None, &dflt).as_deref(), Some("us-west-2"));
     assert_eq!(resolve_region(None, &none), None);
 
-    let args = ssm_args("/p/k", "us-east-1");
+    let args = ssm_args("/p/k", "us-east-1", None);
     let at = args.iter().position(|a| a == "--region").unwrap();
     assert_eq!(args[at + 1], "us-east-1");
     assert!(args.contains(&"--with-decryption".to_string()));
 
     // No region anywhere: refused before any AWS call, saying how to fix it.
-    let err = KeyRef::Ssm("/p/k".into()).read(None).unwrap_err();
+    let err = KeyRef::Ssm("/p/k".into())
+        .read(&AwsAccess::default(), CONFIG_KEY)
+        .unwrap_err();
     assert!(err.contains("forge.gateway.region") && err.contains("AWS_REGION"), "{err}");
 
     let bad = json!({"forge": {"gateway": {"origin": "gw.example.com", "region": "US East",
@@ -561,4 +735,68 @@ fn ssm_refs_parse_and_are_read_in_an_explicit_region() {
     let (c, w) = parse(&bad);
     assert_eq!(c.unwrap().region, None);
     assert_eq!(w.len(), 1, "{w:?}");
+}
+
+/// An `ssm://` read runs as the host's instance role: every AWS identity
+/// selector in the daemon's environment (a worker's `AWS_PROFILE=sccache`)
+/// is removed from the child. `forge.gateway.awsProfile` is the one way to
+/// name another profile, and it is passed as `--profile`.
+#[test]
+fn ssm_reads_use_the_instance_role_unless_a_profile_is_configured() {
+    let cmd = ssm_command("/p/k", "us-east-1", None);
+    let removed: Vec<String> = cmd
+        .get_envs()
+        .filter(|(_, v)| v.is_none())
+        .map(|(k, _)| k.to_string_lossy().into_owned())
+        .collect();
+    for key in AWS_IDENTITY_ENV {
+        if crate::aws_ssm::AWS_FILE_ENV.contains(key) {
+            continue; // set to /dev/null, below
+        }
+        assert!(removed.iter().any(|r| r == key), "{key} reaches the aws child: {removed:?}");
+    }
+    // With no profile the shared files are /dev/null: no `default` profile
+    // in ~/.aws can stand in for the instance role.
+    for key in crate::aws_ssm::AWS_FILE_ENV {
+        assert!(
+            cmd.get_envs()
+                .any(|(k, v)| k == *key && v == Some(std::ffi::OsStr::new("/dev/null"))),
+            "{key}"
+        );
+    }
+    let args: Vec<String> = cmd
+        .get_args()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    assert!(!args.iter().any(|a| a.starts_with("--profile")), "{args:?}");
+
+    let named = ssm_command("/p/k", "us-east-1", Some("relay-reader"));
+    let args: Vec<String> = named
+        .get_args()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    assert!(args.contains(&"--profile=relay-reader".to_string()), "{args:?}");
+    // The profile is named on the command line, so the environment can't
+    // move it either.
+    assert!(named
+        .get_envs()
+        .any(|(k, v)| k == "AWS_PROFILE" && v.is_none()));
+
+    let v = json!({"forge": {"gateway": {"origin": "gw.example.com", "awsProfile": "relay-reader",
+        "keyRefs": {"acme": "ssm:///p"}}}});
+    assert_eq!(parse(&v).0.unwrap().aws_profile.name(), Some("relay-reader"));
+    let bad = json!({"forge": {"gateway": {"origin": "gw.example.com", "awsProfile": "a b",
+        "keyRefs": {"acme": "ssm:///p"}}}});
+    let (c, w) = parse(&bad);
+    assert_eq!((c.unwrap().aws_profile, w.len()), (AwsProfile::Invalid, 1));
+}
+
+#[test]
+fn an_ssm_failure_names_the_exit_and_the_first_stderr_line() {
+    assert_eq!(
+        first_line("\n  An error occurred (AccessDeniedException) when calling the GetParameter operation: User: arn:x is not authorized\nmore"),
+        "An error occurred (AccessDeniedException) when calling the GetParameter operation: User: arn:x is not authorized"
+    );
+    assert_eq!(first_line(""), "(no stderr)");
+    assert_eq!(first_line(&"x".repeat(1000)).len(), 240);
 }

@@ -1045,6 +1045,24 @@ fn dispatch_flags_a_halted_gate() {
     assert!(section.summary.contains("HALTED"));
 }
 
+/// #11857: the tick line says HALTED only for a hold that covered the tick's
+/// work; a partial hold reads as a count of held roots.
+#[test]
+fn tick_line_names_a_partial_hold_by_its_held_roots() {
+    let mut tick = crate::types::WorkFinderTickSummary {
+        seen: 5,
+        halted: true,
+        held_roots: 1,
+        halt_partial: true,
+        ..Default::default()
+    };
+    let line = tick.reason_summary();
+    assert!(line.ends_with("1 root(s) held"), "{line}");
+    assert!(!line.contains("HALTED"), "{line}");
+    tick.halt_partial = false;
+    assert!(tick.reason_summary().ends_with("HALTED"));
+}
+
 #[test]
 fn dispatch_flags_tick_errors() {
     let mut inputs = healthy_inputs();

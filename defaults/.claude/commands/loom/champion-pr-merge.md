@@ -187,6 +187,13 @@ though the janitor just removed `loom:pr`, a fresh Judge pass on the
 corrected state (which re-adds `loom:pr` if it approves) is what makes the PR
 eligible again, not this loop continuing on to the 6 criteria below.
 
+**The one exception (#11861): `loom:pr` + `loom:blocked` with a standing
+Champion hold marker** (`<!-- champion:merge-risk-hold -->` /
+`<!-- champion:critical-file-hold -->`) is Champion's own hold. Never strip
+`loom:pr` from it; criteria #2/#3 decide whether it still binds. Without a
+standing marker it is another actor's park: skip the PR (`continue`), no
+comment, no label change.
+
 ### Part 2: Stale approval — the verdict predates the current head (#5686)
 
 Part 1 catches a **contradictory** verdict. This part catches an
@@ -224,7 +231,7 @@ failure in the completion summary, and do not re-add `loom:pr` yourself. A
 fresh Judge pass on the current head is the only thing that makes it eligible
 again.
 
-`loom:blocked` / `loom:operator` / `loom:operator-only` PRs are reported STALE
+`loom:blocked` / `loom:operator` / `loom:frozen` PRs are reported STALE
 but deliberately **not** cleared by the guard (it will not un-park a PR a human
 or the capped-PR recovery pass deliberately held). They are still not merge-
 eligible: exit 12 means do not merge, cleared or not.
@@ -737,16 +744,19 @@ else
     fi
   fi
 
-  # (e) A human removed `loom:operator` after the hold (#11416; was #7048's
-  #     "respected, still held"). Proof is a human-identified `unlabeled` event after
-  #     HOLD_AT, not bare absence (a failed `--add-label` is no release). Bot
-  #     removals are Champion's own (Step 2, critical-file "Hold Cleared") and
-  #     never count, like (b). Computed even when (a)-(d) fired.
-  OPERATOR_LABEL_NOW=$(jq -r '[.labels[].name] | any(. == "loom:operator")' <<<"$PR_JSON")
+  # (e) A human removed the hold label after the hold (#11416; was #7048's
+  #     "respected, still held"). The label is `loom:blocked` since #11861; a
+  #     human removal of the pre-#11861 `loom:operator` counts too, so a hold
+  #     released before the migration stays released. Proof is a human-identified
+  #     `unlabeled` event after HOLD_AT, not bare absence (a failed add is no
+  #     release). Bot removals are Champion's own (Step 2,
+  #     critical-file "Hold Cleared") and never count, like (b). Computed even
+  #     when (a)-(d) fired.
+  HOLD_LABEL_NOW=$(jq -r '[.labels[].name] | any(. == "loom:blocked")' <<<"$PR_JSON")
   MANUAL_RELEASE_SINCE_HOLD=false; LABEL_REPAIR=false
-  if [ "$OPERATOR_LABEL_NOW" = false ]; then
+  if [ "$HOLD_LABEL_NOW" = false ]; then
     if REMOVED_BY=$(gh api "repos/{owner}/{repo}/issues/$PR_NUMBER/events" --paginate --jq \
-      ".[] | select(.event == \"unlabeled\" and .label.name == \"loom:operator\" and .created_at > \"$HOLD_AT\" and .actor.type == \"User\" and ((.actor.login // \"\") | length > 0 and (endswith(\"[bot]\") | not))) | \"\(.actor.login) at \(.created_at)\"" 2>/dev/null); then
+      ".[] | select(.event == \"unlabeled\" and (.label.name == \"loom:blocked\" or .label.name == \"loom:operator\") and .created_at > \"$HOLD_AT\" and .actor.type == \"User\" and ((.actor.login // \"\") | length > 0 and (endswith(\"[bot]\") | not))) | \"\(.actor.login) at \(.created_at)\"" 2>/dev/null); then
       REMOVED_BY=$(tail -n 1 <<<"$REMOVED_BY")
       [ -z "$REMOVED_BY" ] && LABEL_REPAIR=true   # read OK, no removal on record
     else
@@ -754,7 +764,7 @@ else
     fi
     if [ -n "$REMOVED_BY" ]; then
       MANUAL_RELEASE_SINCE_HOLD=true
-      [ -z "$RELEASE_REASON" ] && RELEASE_REASON="\`loom:operator\` removed by $REMOVED_BY"
+      [ -z "$RELEASE_REASON" ] && RELEASE_REASON="the hold label removed by $REMOVED_BY"
     fi
   fi
 fi
@@ -763,7 +773,8 @@ if [ "$PRIOR_HOLD" = true ] && [ -z "$RELEASE_REASON" ]; then
   MERGE_BLOCKED_BY_HOLD=true
   # Label missing, no removal on record: restore it, so a sticky-held PR
   # never reads as plain approved and stays in the census (#11416).
-  [ "$LABEL_REPAIR" = true ] && gh pr edit "$PR_NUMBER" --add-label "loom:operator" 2>/dev/null || true
+  [ "$LABEL_REPAIR" = true ] && loom-daemon park-record apply --pr "$PR_NUMBER" \
+    --reason "champion merge-risk hold" --by champion >/dev/null 2>&1 || true
   echo "STICKY HOLD: #$PR_NUMBER was held at $HOLD_AT and nothing has changed since — not merging"
   # Post NOTHING (the hold notice is already on the PR — see Hold behavior's
   # idempotency guard) and do NOT merge this PR this pass, whatever the axes say.
@@ -814,7 +825,7 @@ tripping release path (b) or (d).
   question lead-in (which must precede the phrase) fails the anchor. The
   conservative direction is preserved: an unrecognized phrasing leaves the hold in
   force, which costs one human merge; a false release costs a bad auto-merge.
-- **A human `--remove-label loom:operator` IS release (e) (#11416)** — before,
+- **A human `--remove-label loom:blocked` IS release (e) (#11416, #11861)** — before,
   #7048 only stopped the label being reasserted while the precheck still
   refused the PR, so it sat as plain `loom:pr`, unmerged and out of the census
   (#10280). Only a positively identified human counts (`actor.type == "User"`, non-empty login, no `[bot]` suffix); type `Bot`, a `[bot]` login, or a null/missing actor or login is
@@ -837,7 +848,7 @@ if [ "$PRIOR_HOLD" = true ]; then
 **Reversing a prior merge-risk hold** (held $HOLD_AT):
 
 - **What released it**: $RELEASE_REASON
-- **Axis that flipped**: <NAME_THE_PREVIOUSLY_RED_AXIS and the concrete, falsifiable reason it is now green — same bar as the hold comment itself. Write 'n/a — loom:auto-merge-ok override honored, axes not re-scored' ONLY when the release was that label, or 'none — a human removed loom:operator for this same concern' ONLY for that (e) outcome.>
+- **Axis that flipped**: <NAME_THE_PREVIOUSLY_RED_AXIS and the concrete, falsifiable reason it is now green — same bar as the hold comment itself. Write 'n/a — loom:auto-merge-ok override honored, axes not re-scored' ONLY when the release was that label, or 'none — a human removed the hold label for this same concern' ONLY for that (e) outcome.>
 - **Original hold concern**: <QUOTE_THE_AXIS_AND_CONCERN_FROM_THE_HOLD_COMMENT>
 "
 else
@@ -846,7 +857,7 @@ fi
 ```
 
 `$HOLD_REVERSAL_BLOCK` non-empty is also the exact signal that gates the
-`loom:operator` label removal (#5502) — this precheck already distinguishes
+`loom:blocked` label removal (#5502, #11861) — this precheck already distinguishes
 "never held", "held and still bound" (which bails out at the STICKY HOLD
 branch above and never reaches here with a merge decision), and "held and
 genuinely released", so the label reuses that same computation instead of a
@@ -875,7 +886,7 @@ CONCERN_BULLET="- **<AXIS>**: <SPECIFIC_CONCERN — name the file/function and w
 PRIOR_CONCERN_BULLET=$(printf '%s\n' "$HOLD_BODY" | grep -m1 -E '^- \*\*.+\*\*:')
 
 if [ "$MANUAL_RELEASE_SINCE_HOLD" = true ] && [ "$CONCERN_BULLET" = "$PRIOR_CONCERN_BULLET" ]; then
-  # Not a hold (#11416): a human removed `loom:operator` for exactly this
+  # Not a hold (#11416): a human removed the hold label for exactly this
   # concern. PASS — continue to #3; Step 2's reversal block is mandatory.
   echo "PASS: #$PR_NUMBER — human released this same concern ($RELEASE_REASON)"
 else
@@ -899,7 +910,7 @@ auto-merging:
 $CONCERN_BULLET
 
 **Next steps** — this hold stays in force until one of these happens; Champion re-reading the same diff will **not** clear it:
-- A human releases it: \`gh pr edit $PR_NUMBER --remove-label \"loom:operator\"\`. Champion merges on its next tick unless it finds a concern this notice does not name; or run \`./.loom/scripts/merge-pr.sh $PR_NUMBER\` yourself after removing it (\`merge-pr.sh\` refuses \`loom:pr\` + \`loom:operator\` together, #8112)
+- A human releases it: \`gh pr edit $PR_NUMBER --remove-label \"loom:blocked\"\`. Champion merges on its next tick unless it finds a concern this notice does not name; or run \`./.loom/scripts/merge-pr.sh $PR_NUMBER\` yourself after removing it (\`merge-pr.sh\` refuses \`loom:pr\` + \`loom:blocked\` together, #8112)
 - Or applies \`loom:auto-merge-ok\` to override the hold; Champion merges on the next tick
 - Or comments here to clear it explicitly — **start the comment with the instruction**: \`clear the hold — <why>\`, \`cleared: <why>\`, \`override: <why>\`, \`merge anyway, <why>\`, \`ok to merge — <why>\`. Phrasing that only mentions those words later in a sentence, negates them (\`do not merge anyway\`), or asks about them (\`is it ok to merge?\`) deliberately does **not** release the hold, and neither does a bare 'looks fine'
 - Or the situation actually changes: a new push that narrows the concern, or a deeper Judge re-review
@@ -912,13 +923,15 @@ Keeping \`loom:pr\`. This PR stays in the queue and is re-checked each tick agai
 *Automated by Champion role*"
   fi
 
-  # loom:operator (#5502): the first-class "engine will not act further, a
-  # human is the only transition out" pipeline state, applied alongside the
-  # marker above (`--add-label` is idempotent, safe to reassert every tick the
-  # hold binds). UNLIKE loom:operator-only, this must NOT make sweep/shepherd
-  # skip the PR — loom:pr is kept and the PR stays in the re-evaluation queue
-  # so the release precheck can still fire. Never applied in place of loom:pr.
-  gh pr edit "$PR_NUMBER" --add-label "loom:operator" 2>/dev/null || true
+  # loom:blocked + a reason-only park record (#11861, was loom:operator #5502),
+  # applied alongside the marker above. Idempotent (the record is written once
+  # per reason, the label only when missing), so safe every tick the hold
+  # binds. Beside loom:pr with the marker it is Champion's own hold: the one
+  # exception to the verdict-label invariant, served by `pr-queue --role
+  # champion`, so the release precheck still fires each tick. The stale-blocked
+  # release pass skips a reason-only record. Never applied in place of loom:pr.
+  loom-daemon park-record apply --pr "$PR_NUMBER" --reason "champion merge-risk hold" \
+    --by champion >/dev/null 2>&1 || true
 
   # Do NOT merge this PR this pass. But do NOT drop it from the pass either
   # (#6720): a hold blocks the merge, it does not suspend the mechanical health
@@ -1071,7 +1084,7 @@ This criterion is deliberately kept **in addition to** the merge-risk judgment i
 
 **Durable hold on FAIL, not a transient retry (#6879, #9016)**: a critical-file FAIL is a **one-way terminal state** — nothing about a diff's critical-file-ness changes without a human decision or a later push that narrows the diff — so it gets its own durable hold, never the shared "Transient failures" template in "PR Rejection Workflow" (`critical-file` is not one of that section's `CRITERION_KEY` values).
 
-Run [`champion-critical-file-hold.md`](champion-critical-file-hold.md)'s tick immediately after the check-loop above, passing its verdict as `$CRITERION3_RESULT` (`"FAIL"` if it printed `FAIL: Critical file modified: ...` and would have exited 1; `"PASS"` otherwise). That file owns the whole state machine: the `loom:operator` label, the hold / release-respected / cleared markers, the head-scoped operator release (#9016 — a hand-removed `loom:operator` at the held head is a durable release Champion does not override on the next tick, which is what makes the documented `./.loom/scripts/merge-pr.sh <N>` human-merge path actually work against the #8112 contradiction guard), and the automatic clear when a later push narrows the diff.
+Run [`champion-critical-file-hold.md`](champion-critical-file-hold.md)'s tick immediately after the check-loop above, passing its verdict as `$CRITERION3_RESULT` (`"FAIL"` if it printed `FAIL: Critical file modified: ...` and would have exited 1; `"PASS"` otherwise). That file owns the whole state machine: the `loom:blocked` label and its reason-only park record (#11861, was `loom:operator`), the hold / release-respected / cleared markers, the head-scoped operator release (#9016 — a hand-removed `loom:blocked` at the held head is a durable release Champion does not override on the next tick, which is what makes the documented `./.loom/scripts/merge-pr.sh <N>` human-merge path actually work against the #8112 contradiction guard), and the automatic clear when a later push narrows the diff.
 
 A FAIL skips Steps 2-3 for this PR this pass in **every** one of those states, including a released one — releasing the hold hands the merge to the operator, never back to Champion — and `loom:auto-merge-ok` does not release it (that override is scoped to criterion #2).
 
@@ -1112,25 +1125,17 @@ produce. Never let a hold be the reason a conflict goes unreported.
 ```bash
 # Get PR activity data. Plain `gh` — NOT "$GH_READ": merge-gating.
 #
-# #6843: do NOT use `updatedAt` here. GitHub bumps `updatedAt` on ANY write to
-# the PR, including a comment — and the Held-PR Health Pass below posts
-# comments on this very PR every tick a hold still binds (conflict notices,
-# `loom:operator` label reasserts). That means a held+conflicting PR nobody
-# but Champion ever touches has its own staleness clock reset by Champion's
-# own writes roughly every 10 minutes, so it never accumulates 24 real hours
-# of staleness and this criterion — the *only* automated route from `loom:pr`
-# to Doctor — never fires. Verified live: 21 open PRs carrying `loom:pr` +
-# `loom:operator`, all `CONFLICTING`, oldest 8 days, `updatedAt` exactly
-# matching Champion's own most recent comment timestamp.
+# #6843: do NOT use `updatedAt` here. GitHub bumps it on ANY write, and the
+# Held-PR Health Pass below comments on a held PR every tick, so Champion's
+# own writes would keep resetting it and this criterion — the *only*
+# automated route from `loom:pr` to Doctor — would never fire.
 #
 # "Real activity" instead means either of two things actually changing the
 # PR: a new commit, or a TRUSTED comment (#9548) other than Champion's own.
 # Commits are always real (a bot cannot push code on your behalf).
-# Comments are filtered with the same exclusion test the sticky-hold precheck
-# already uses for release signals above (`champion:|Automated by Champion
-# role` — matches the marker HTML comments and the `*Automated by Champion
-# role*` footer every Champion post carries), so a human/Judge comment still
-# counts as activity but Champion's own hold/conflict/stale notices never do.
+# Comments are filtered with the sticky-hold precheck's exclusion test
+# (`champion:|Automated by Champion role`: Champion's markers and footer), so
+# a human/Judge comment counts as activity but Champion's own notices never do.
 # `createdAt` is the floor, so a PR with no commits and no non-Champion
 # comments still ages from when it was opened rather than reading as
 # eternally fresh.
@@ -1173,7 +1178,8 @@ echo "PASS: Recently active ($HOURS_AGO hours ago)"
 stale route fires from a held state too — it is the *only* automated path from
 `loom:pr` to Doctor, so gating it behind the hold is what let held PRs rot for
 days (20 of 21 held PRs `CONFLICTING`, Doctor's queue empty). The stale-PR block
-below is hold-aware: it preserves the hold marker and keeps `loom:operator`.
+below is hold-aware: it preserves the hold marker, the park record and
+`loom:blocked` (#11861); Doctor works a held PR by its trusted marker.
 
 ### 6. CI Status Check
 - [ ] If CI checks exist, all checks must be passing
@@ -1289,18 +1295,9 @@ echo "PASS: All CI checks passing"
 ## Held-PR Health Pass (#6720)
 
 **A merge-risk hold governs *merging*. It does not suspend *health reporting*.**
-
-Before this section existed, a hold was a one-way door: criterion #2's
-sticky-hold bail-out dropped the PR from the pass entirely, so criteria #4
-(conflict), #5 (recency) and #6 (CI) were **never evaluated on a held PR**.
-Because criterion #5's stale route is the *only* automated path from `loom:pr`
-to `loom:changes-requested` — i.e. the only way a `loom:pr` PR ever reaches
-Doctor — a held PR could not self-heal and nothing ever said so. Measured on
-`rjwalters/loom` (2026-08-22): **21 open PRs carried `loom:pr` + `loom:operator`
-and 20 of the 21 were `CONFLICTING`**, two of them untouched for 63 hours, while
-Doctor's `loom:changes-requested` queue was **empty**. Every one of those holds
-was *correct*; what was wrong is that a correct hold also disabled the unrelated
-machinery that keeps a PR healthy while it waits.
+Before #6720 the sticky-hold bail-out skipped criteria #4/#5/#6 on a held PR,
+and #5's stale route is the only path from `loom:pr` to Doctor: 20 of 21 held
+PRs sat `CONFLICTING` with Doctor's queue empty (2026-08-22).
 
 ### When this pass runs
 
@@ -1372,14 +1369,15 @@ fi
 ```
 
 **Why a notice and not an immediate route to Doctor.** Doctor's *Priority 1*
-queue is exactly "`loom:pr` + `CONFLICTING`", and it deliberately excludes
-`loom:operator` (#5978) so autonomous Finding Work never rebases and force-pushes
-a PR a human is holding. That exclusion is correct and this section does **not**
-reverse it: a held+conflicting PR is *surfaced* here, and only becomes Doctor's
-work through the recency route below (which lands it on `loom:changes-requested`
-— Doctor's *Priority 2* queue, which excludes only `loom:blocked` /
-`loom:operator-only`, **not** `loom:operator`). Conflict alone is a report;
-conflict plus staleness is a route.
+queue is exactly "`loom:pr` + `CONFLICTING`", and it excludes every park —
+`loom:blocked` (the hold's label since #11861) included, as `loom:operator` was
+before (#5978) — so autonomous Finding Work never rebases and force-pushes a
+held PR. That exclusion is correct and this section does **not** reverse it: a
+held+conflicting PR is *surfaced* here, and only becomes Doctor's work through
+the recency route below, which lands it on `loom:changes-requested` (Doctor's
+*Priority 2* queue, which serves `loom:changes-requested` + `loom:blocked` with
+a standing trusted Champion hold marker, #11861).
+Conflict alone is a report; conflict plus staleness is a route.
 
 ### #6 under a hold — report a broken build, and flag genuine feedback (#6852)
 
@@ -1456,40 +1454,17 @@ Two invariants apply on **both** branches, both load-bearing:
    silent. What must never happen is the *marker* disappearing.) On the
    hold-only branch this is automatic: nothing on that branch ever touches the
    marker.
-2. **`loom:operator` is kept** — see the decision below. On the hold-only branch
-   this is also automatic: nothing on that branch touches any label.
+2. **`loom:blocked` stays on** — see the decision below.
 
-### `loom:operator` on the held-and-stale route: KEEP it (#6720)
+### `loom:blocked` on the held-and-stale route: KEEP it (#11861)
 
-The unheld stale path clears `loom:operator` (#5802). That reversal is **not**
-extended to the held path, and the difference is deliberate:
-
-| Departure to Doctor | `loom:operator` | Why |
-|---|---|---|
-| Stale, **no** hold in force (#5802) | **Removed** | The PR leaves the auto-merge queue with no outstanding human decision attached to it. Removing a label the hold never applied is a harmless no-op. |
-| Stale, **hold-plus-feedback** (#6720) | **Kept** | The hold is unresolved. The PR is expected to come back still needing a human merge decision, so asserting "no human is needed" for the duration of the Doctor round-trip would be false. |
-| Stale, **hold-only** — no departure at all (#6852) | **Kept** (never touched) | There is no round-trip to reason about: the PR never leaves `loom:pr`, so no label is ever removed or re-added. |
-
-`loom:operator` is safe to keep here because it is, by definition, the
-**re-evaluable** human-needed state: "applying it must never cause
-sweep/shepherd to skip the item" (`.loom/docs/label-state-machine.md`). Verified
-mechanically against the consumers, not assumed:
-
-- **Doctor Priority 2** (`loom:changes-requested`) excludes `loom:blocked` and
-  `loom:operator-only` — **not** `loom:operator`. The routed PR is visible to
-  Doctor with the label kept. (Doctor Priority 1 *does* exclude it, but that
-  queue is `loom:pr`-scoped and the PR has just left it.)
-- **Judge** does not filter on `loom:operator`, so the re-review after Doctor's
-  fix proceeds normally.
-- **Sweep C1c** skips routing a `loom:pr` + `loom:operator` PR to *Merge*
-  (#6398) — a merge-route skip, which is precisely the behavior the hold wants.
-- **`verdict-staleness-guard.sh`** already declines to un-park a `loom:operator`
-  PR (#5686), so the round-trip cannot silently re-queue it for review either.
-
-Keeping the label also makes the held-PR census below a single label query
-rather than N comment reads, including the PRs currently out at Doctor **and**
-the ones sitting in a hold-only suspension (#6852) — both still carry
-`loom:operator`, so both are still counted.
+The route never removes `loom:blocked`, so the PR is never a plain approval
+while the hold stands and `merge-pr.sh` refuses it throughout. Doctor and then
+Judge still reach it: `pr-queue` serves `loom:changes-requested` (Doctor) and
+then `loom:review-requested` (Judge) beside `loom:blocked` when a trusted
+Champion hold marker stands. Judge's re-approval restores `loom:pr` +
+`loom:blocked`, the janitor exception, and the precheck re-judges the hold
+(the push is release (c)). Only a human removes the label.
 
 ### What this pass must never do
 
@@ -1511,17 +1486,15 @@ only because an operator inspected PR labels by hand. Run this once per Champion
 pass — one `gh pr list` call — and put its output in the completion summary
 (`champion-common.md` → "Completion Report").
 
-**Counts both hold kinds (#6879).** The query keys on `loom:operator`, not on
-the `champion:merge-risk-hold` marker, so a critical-file hold (criterion #3,
-[`champion-critical-file-hold.md`](champion-critical-file-hold.md)) is counted
-too with no separate query. The
-"Merge-risk holds: N open PR(s)" label below predates that hold kind and is
-kept as-is for continuity with existing dashboards and transcripts; read it as
-"Champion-held PRs" (any `loom:operator` hold Champion itself applied), not
-literally "held on criterion #2 alone".
+**Counts both hold kinds (#6879).** The query keys on the label pair `loom:pr` +
+`loom:blocked` (#11861), not on a marker, so critical-file holds
+([`champion-critical-file-hold.md`](champion-critical-file-hold.md)) count too;
+read "Merge-risk holds" (kept for dashboard continuity) as "Champion-held PRs".
+A pre-#11861 hold still on `loom:operator` (not yet migrated by `labels migrate
+--holds`) is counted by the second query.
 
 **A hand-released hold is listed, not dropped (#11416).** A merge-risk hold
-whose `loom:operator` a human removed is released (precheck (e)) and merges
+whose `loom:blocked` a human removed is released (precheck (e)) and merges
 next tick unless criteria #3-#6 block it; a critical-file one waits for the
 operator's own merge (`champion-critical-file-hold.md`, #9016). Either way the
 PR no longer carries the label, so `RELEASED` below lists every open `loom:pr`
@@ -1532,16 +1505,17 @@ A sticky hold missing its label with no removal on record gets the label back
 
 ```bash
 # Cached ("$GH_READ") — an observation scan, never a merge gate.
-# Champion's hold label is preserved across the Doctor round-trip (see above),
-# so this one query covers both the PRs sitting in the merge queue AND the ones
-# currently out for a rebase.
-HELD_JSON=$("$GH_READ" pr list --label "loom:operator" --state open --limit 500 \
-  --json number,title,createdAt,updatedAt,mergeable,labels,mergeStateStatus,headRefOid,files \
-  --jq '[.[] | select(any(.labels[]?.name; . == "loom:frozen") | not)]')
+# `--label` ANDs: loom:pr + loom:blocked is Champion's hold (#11861). A held
+# PR out at Doctor keeps loom:blocked beside loom:changes-requested; it is
+# counted with its standing marker (a Doctor-cycle-cap park has none).
+HELD_JSON=$(for H in loom:blocked loom:operator; do "$GH_READ" pr list --label "loom:pr" --label "$H" --search "-label:loom:frozen" \
+  --state open --limit 500 --json number,title,createdAt,updatedAt,mergeable,labels,mergeStateStatus,headRefOid,files; done | jq -s 'add | unique_by(.number)')
+HELD_AT_DOCTOR=$("$GH_READ" pr list --label "loom:changes-requested" --label "loom:blocked" --state open --limit 500 --json number,labels,comments \
+  --jq '[.[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | select(any(.comments[].body; startswith("<!-- champion:merge-risk-hold -->") or startswith("<!-- champion:critical-file-hold -->"))
+    and (any(.comments[].body; contains("<!-- champion:merge-risk-hold-cleared -->") or startswith("<!-- champion:critical-file-hold-cleared -->")) | not))] | length')
 
-HELD_COUNT=$(printf '%s\n' "$HELD_JSON" | jq 'length')
+HELD_COUNT=$(( $(printf '%s\n' "$HELD_JSON" | jq 'length') + HELD_AT_DOCTOR ))
 HELD_CONFLICTING=$(printf '%s\n' "$HELD_JSON" | jq '[.[] | select(.mergeable == "CONFLICTING")] | length')
-HELD_AT_DOCTOR=$(printf '%s\n' "$HELD_JSON" | jq '[.[] | select([.labels[].name] | index("loom:changes-requested"))] | length')
 # Oldest by PR creation — the age of the head of the pile.
 OLDEST_CREATED=$(printf '%s\n' "$HELD_JSON" | jq -r 'min_by(.createdAt) | .createdAt // empty')
 if [ -n "$OLDEST_CREATED" ]; then
@@ -1553,7 +1527,7 @@ else
 fi
 
 echo "Merge-risk holds: $HELD_COUNT open PR(s) — $HELD_CONFLICTING conflicting, $HELD_AT_DOCTOR out at Doctor, oldest ${OLDEST_DAYS}d"
-RELEASED=$("$GH_READ" pr list --label "loom:pr" --search "-label:loom:operator -label:loom:frozen" --state open --limit 500 --json number,comments \
+RELEASED=$("$GH_READ" pr list --label "loom:pr" --search "-label:loom:blocked -label:loom:operator -label:loom:frozen" --state open --limit 500 --json number,comments \
   --jq '"<!-- champion:critical-file-hold" as $cf | [.[] | select(any(.comments[].body; startswith("<!-- champion:merge-risk-hold -->"))
     or ([.comments[].body | select(startswith($cf))] | last // "" | startswith($cf + " -->"))) | "#\(.number)"] | join(" ")')
 echo "Released holds, not yet merged: ${RELEASED:-none}"
@@ -1865,11 +1839,13 @@ EOF
   exit 1
 }
 
-# loom:operator removal (#5502), the reversal companion to criterion #2's hold
-# label add. Gated on the SAME $HOLD_REVERSAL_BLOCK just posted (non-empty only
-# on a genuine release), so it fires exactly in the reversal-comment pass.
+# loom:blocked removal (#5502, #11861), the reversal companion to criterion
+# #2's hold label add. Gated on the SAME $HOLD_REVERSAL_BLOCK just posted
+# (non-empty only on a genuine release), so it fires exactly in the
+# reversal-comment pass. merge-pr.sh refuses loom:pr + loom:blocked (#8112),
+# so the label must be off before Step 3. The park record stays in the body.
 if [ -n "$HOLD_REVERSAL_BLOCK" ]; then
-  gh pr edit "$PR_NUMBER" --remove-label "loom:operator" 2>/dev/null || true
+  gh pr edit "$PR_NUMBER" --remove-label "loom:blocked" 2>/dev/null || true
 fi
 "$GH_READ" --clear-cache   # your own write must not be masked by your own cache
 ```
@@ -1878,7 +1854,7 @@ fi
 
 **Ordering invariant**: Step 2's comment is on the PR before this runs.
 `merge-pr.sh` names no actor, so a merge without Step 2 looks like a human ran
-it (#4742's unattributable hold reversal).
+it (#4742).
 
 **Timeout invariant (#9096)**: run this block under a **600000 ms** Bash-tool
 timeout, with `LOOM_AUTO_MERGE_TIMEOUT` (420s below) **strictly under** it, so
@@ -1891,12 +1867,15 @@ PR_NUMBER=$1
 
 echo "Attempting to merge PR #$PR_NUMBER..."
 
-# Ensure we're on main so .loom/scripts exists (issue #2289)
-# merge-pr.sh may not exist on PR branches checked out via gh pr checkout
+# On main, so .loom/scripts/merge-pr.sh exists (#2289)
 git checkout main 2>/dev/null || true
 
+# `--pr N` (#11859): a live pin means this block MUST set EXPECTED_HEAD=<sha>. Live: <60 min old, or <24h while its step's agent runs (#11902).
+PF="$(git rev-parse --git-common-dir)/loom-champion-pin-pr-$PR_NUMBER"; PIN=; PIN_PID=; { read -r PIN PIN_PID < "$PF"; } 2>/dev/null
+{ [ -n "$(find "$PF" -mmin -60)" ] || { [ "${PIN_PID:-0}" -gt 1 ] && kill -0 "$PIN_PID" && [ -n "$(find "$PF" -mmin -1440)" ]; } || PIN=; } 2>/dev/null
+if [ -n "$PIN" ] && [ "${EXPECTED_HEAD:-}" != "$PIN" ]; then MERGE_RC=9; echo "CHAMPION-PIN-MISSING pr=$PR_NUMBER: set EXPECTED_HEAD=$PIN in this block; not merging"; else
 # Queue mode (#10256): only a DIRECT first stdout line + rc 0 falls through.
-HEAD_SHA=$(gh pr view "$PR_NUMBER" --json headRefOid -q .headRefOid)
+HEAD_SHA=${EXPECTED_HEAD:-$(gh pr view "$PR_NUMBER" --json headRefOid -q .headRefOid)}
 QE=$(mktemp); QOUT=$(loom-daemon forge merge-queue step "$PR_NUMBER" \
   --approved-sha "$HEAD_SHA" 2>"$QE"); QRC=$?; QWHY=$(head -n1 "$QE"); rm -f "$QE"
 MERGE_RC=0; QCOMPAT=
@@ -1919,14 +1898,16 @@ case "$MERGE_RC ${QOUT%%$'\n'*}" in "0 "*) ;; # direct: merge-pr.sh below
 
 $QM" >/dev/null ;;
 esac
+fi
 
 # Forge-API merge: --auto merges HERE (#8410), head-SHA precondition (#5579),
 # --redate-stale-checks = #8248's remedy (#8508). 420s < 600000 ms (above).
 [ "$MERGE_RC" -eq 0 ] && { LOOM_AUTO_MERGE_TIMEOUT=420 \
-  ./.loom/scripts/merge-pr.sh "$PR_NUMBER" --auto --redate-stale-checks || MERGE_RC=$?; }
+  ./.loom/scripts/merge-pr.sh "$PR_NUMBER" --auto --redate-stale-checks ${EXPECTED_HEAD:+--expected-head "$EXPECTED_HEAD"} || MERGE_RC=$?; }
 
-if [ "$MERGE_RC" -eq 7 ] || [ "$MERGE_RC" -eq 3 ] || [ "$MERGE_RC" -eq 4 ] || [ "$MERGE_RC" -eq 5 ]; then
-  # Not failures: nothing merged, PR stays approved. See "exit codes 3-7" below.
+if [ "$MERGE_RC" -eq 7 ] || [ "$MERGE_RC" -eq 3 ] || [ "$MERGE_RC" -eq 4 ] || [ "$MERGE_RC" -eq 5 ] || [ "$MERGE_RC" -eq 8 ] || [ "$MERGE_RC" -eq 9 ]; then
+  # Not failures: nothing merged, PR stays approved, no "Merge Failed" comment.
+  # See "exit codes 3-7" below; 9 is CHAMPION-PIN-MISSING (the pin was lost).
   echo "PR #$PR_NUMBER not merged this pass (exit $MERGE_RC) — re-queuing instead of failing"
 elif [ "$MERGE_RC" -ne 0 ]; then
   echo "Merge failed for PR #$PR_NUMBER"
@@ -1949,9 +1930,8 @@ After merge, verify linked issues were auto-closed by GitHub.
 
 **Before confirming (or forcing) any linked issue's close, run the Out-of-Band
 Acceptance-Criteria Gate for that issue** (defined just below). Merging proves
-only what CI can check — nothing about a criterion naming a live external
-source, a scheduled run, or an observation over time. This is where "PR
-merged" becomes "issue done", the only place that inference can be checked.
+only what CI can check (not a live external source, a scheduled run, or an
+observation over time), so this is where "PR merged" becomes "issue done".
 
 ```bash
 PR_NUMBER=$1
@@ -2334,14 +2314,15 @@ for blocked in $BLOCKED_ISSUES; do
     # human's to break, and re-walking it every pass buys nothing. One cached
     # label read (backlog observation, not arbitration) replaces up to
     # --max-nodes forge reads. Cached("$GH_READ") — see "Cached forge reads".
+    OP_HOLDS=$(loom-daemon labels list --property operator_gate --with-retired 2>/dev/null || echo loom:operator); export OP_HOLDS  # champion-common.md "Hold set"
     ALREADY_ROUTED=$("$GH_READ" issue view "$blocked" --json labels \
-      --jq '[.labels[].name] | index("loom:operator-only") // empty')
+      --jq '($ENV.OP_HOLDS | split("\n")) as $o | [.labels[].name | select(IN($o[]))] | first // empty')
 
     if [ -z "$ALREADY_ROUTED" ]; then
       CYCLE_RC=0
       ./.loom/scripts/detect-dependency-cycle.sh --issue "$blocked" --report || CYCLE_RC=$?
       if [ "$CYCLE_RC" -eq 1 ]; then
-        echo "  Dependency CYCLE on #$blocked — surfaced and routed to loom:operator-only; not re-deriving 'still blocked'"
+        echo "  Dependency CYCLE on #$blocked — surfaced and routed to loom:operator; not re-deriving 'still blocked'"
       fi
     fi
   fi
@@ -2380,13 +2361,13 @@ than re-deriving anything yourself.
 | Property | How the script guarantees it |
 |---|---|
 | **Bounded cost** | Hard caps on hops (`--max-depth`, default 4), distinct issues fetched (`--max-nodes`, default 25) and edges examined (`--max-steps`, default 500); each issue is fetched at most once per run; reads go through `gh-cached`. A fired bound prints `SEARCH_TRUNCATED:`. |
-| **Not on every pass** | Two gates precede it. (1) It is invoked **only** on the `ALL_RESOLVED=false` branch above — i.e. only once the cheap single-hop check has already concluded "still blocked",. (2) An issue already carrying `loom:operator-only` is skipped outright — a human already owns it. |
-| **Surfaced, not silent** | `--report` posts **one** comment naming every node in the cycle and adds `loom:operator-only`. Breaking a cycle means deciding which declared edge is wrong or which side ships a partial first — a human decision Champion is not entitled to make. |
+| **Not on every pass** | Two gates precede it. (1) It is invoked **only** on the `ALL_RESOLVED=false` branch above — i.e. only once the cheap single-hop check has already concluded "still blocked",. (2) An issue already carrying `loom:operator` is skipped outright — a human already owns it. |
+| **Surfaced, not silent** | `--report` posts **one** comment naming every node in the cycle and adds `loom:operator`. Breaking a cycle means deciding which declared edge is wrong or which side ships a partial first — a human decision Champion is not entitled to make. |
 | **Idempotent** | The comment carries `<!-- champion:dep-cycle:<fingerprint> -->`, fingerprinted on the cycle's **node set** (sorted), so the same cycle discovered from either side collapses to one identity and is commented once; a genuinely different cycle still gets its own comment. |
 | **Fail-safe** | A `CLOSED` node ends that branch of the walk (a resolved edge cannot deadlock anyone), an unreadable cross-repo issue is reported as `UNREADABLE:` rather than crashing, and without `--report` the script is strictly read-only. |
 
 Do **not** remove `loom:blocked` when a cycle is found — the issue genuinely is
-blocked. The change is that a human now owns it (`loom:operator-only`) instead of
+blocked. The change is that a human now owns it (`loom:operator`) instead of
 Champion re-deriving the same dead conclusion on the next pass.
 
 **A cycle is not the same finding as a completed-but-unpromoted epic.** If an
@@ -2670,9 +2651,9 @@ fi
 
 If ANY safety criterion fails, do NOT merge. How the failure is handled depends on whether it is **transient** (clears on its own or on the next push — pending CI, conflicts being resolved, `UNKNOWN` mergeability), **terminal** (the PR has gone stale and cannot clear without a rebase), a **merge-risk hold** (criterion #2 judged the PR to need a human merge), or a **critical-file hold** (criterion #3 matched a critical-file pattern).
 
-**Merge-risk holds** keep `loom:pr` like a transient failure, but comment **once** behind the `<!-- champion:merge-risk-hold -->` idempotency marker because the condition does not clear on its own, and additionally carry `loom:operator` (#5502) — the first-class "engine will not act further, a human is the only transition out" state, added alongside the marker and removed alongside its reversal, kept **filterable** without making sweep/shepherd skip the PR (see [`.loom/docs/label-state-machine.md`](../../../.loom/docs/label-state-machine.md)). Unlike a transient failure, the hold is **sticky**: later ticks re-check it against the release conditions (`loom:auto-merge-ok`, an explicit operator clearing comment, a new push, a new Judge review) rather than re-deriving it from a fresh axis read, and any merge that reverses one carries a mandatory reversal comment (#4742). The exact commands live with the criterion itself — see "Safety Criteria → 2. Merge-Risk Judgment → Sticky holds / Hold behavior"; do not duplicate them here.
+**Merge-risk holds** keep `loom:pr` like a transient failure, but comment **once** behind the `<!-- champion:merge-risk-hold -->` idempotency marker because the condition does not clear on its own, and additionally carry `loom:blocked` with a reason-only park record (#11861; `loom:operator` before, #5502), added alongside the marker and removed alongside its reversal. Beside `loom:pr` with the marker it is the one allowed approval + park pair, which `pr-queue --role champion` keeps serving so the hold is re-evaluated (see [`.loom/docs/label-state-machine.md`](../../../.loom/docs/label-state-machine.md)). Unlike a transient failure, the hold is **sticky**: later ticks re-check it against the release conditions (`loom:auto-merge-ok`, an explicit operator clearing comment, a new push, a new Judge review) rather than re-deriving it from a fresh axis read, and any merge that reverses one carries a mandatory reversal comment (#4742). The exact commands live with the criterion itself — see "Safety Criteria → 2. Merge-Risk Judgment → Sticky holds / Hold behavior"; do not duplicate them here.
 
-**Critical-file holds** work the same way (#6879): a FAIL keeps `loom:pr`, comments once behind `<!-- champion:critical-file-hold -->` (distinct from `champion:merge-risk-hold`), and carries `loom:operator`. No sticky-hold precheck (the file-pattern match is deterministic); it releases when the diff leaves every critical-file pattern, or (#9016) the operator hand-removes `loom:operator` at the held head — durable, which is what lets the `merge-pr.sh` human-merge path pass the #8112 guard. `loom:auto-merge-ok` does **not** release it (criterion #2 only). Commands: [`champion-critical-file-hold.md`](champion-critical-file-hold.md); do not duplicate them here.
+**Critical-file holds** work the same way (#6879): a FAIL keeps `loom:pr`, comments once behind `<!-- champion:critical-file-hold -->` (distinct from `champion:merge-risk-hold`), and carries `loom:blocked` with a reason-only park record (#11861). No sticky-hold precheck (the file-pattern match is deterministic); it releases when the diff leaves every critical-file pattern, or (#9016) the operator hand-removes `loom:blocked` at the held head — durable, which is what lets the `merge-pr.sh` human-merge path pass the #8112 guard. `loom:auto-merge-ok` does **not** release it (criterion #2 only). Commands: [`champion-critical-file-hold.md`](champion-critical-file-hold.md); do not duplicate them here.
 
 ### Transient failures — keep `loom:pr`, retry next tick
 
@@ -2772,9 +2753,10 @@ A stale PR (>24h) will never clear on its own, and under the 10-minute cron a ba
 Held-PR Health Pass as well as from an ordinary criterion-#5 failure, and it is
 the *only* automated route from `loom:pr` to Doctor. Gating it behind a hold is
 what produced the 20-of-21-conflicting pile. The block below is hold-aware in
-exactly two places, both keyed on `MERGE_BLOCKED_BY_HOLD`: the notice text, and
-the `loom:operator` reversal. **The `champion:merge-risk-hold` marker comment is
-never touched on either variant** — the hold must survive the round-trip.
+one place, keyed on `MERGE_BLOCKED_BY_HOLD`: the notice text. **The
+`champion:merge-risk-hold` marker comment, the park record and `loom:blocked`
+are never touched on either variant** — the hold must survive the round-trip
+(#11861).
 
 **Not reached for a hold-only stale PR (#6852).** When `MERGE_BLOCKED_BY_HOLD=true`
 and `HELD_CI_FAILING` (set by the Held-PR Health Pass's #6 step, above) is not
@@ -2820,7 +2802,7 @@ if [ "$HELD" = true ]; then
 
 **This PR is on a merge-risk hold, and the hold is preserved.** Routing it to Doctor addresses staleness only — it is not a release signal and does not clear the hold. The \`champion:merge-risk-hold\` marker stays on this PR, so if a later tick merges it, Champion must still post the mandatory hold-reversal comment naming what changed (#4742). Rebasing a held PR does not make it an unheld one.
 
-\`loom:operator\` is **kept** for the same reason: the human merge decision this PR is waiting on is still outstanding. It does not block Doctor — Doctor's \`loom:changes-requested\` queue excludes \`loom:blocked\` / \`loom:operator-only\`, not \`loom:operator\` (#6720)."
+\`loom:blocked\` stays on, so this PR cannot be merged while the hold stands; Doctor works it by the hold marker, and a human releases the hold by removing the label (#11861)."
 else
   STALE_HOLD_NOTE=""
 fi
@@ -2853,30 +2835,9 @@ $STALE_HOLD_NOTE
 ---
 *Automated by Champion role*"
   # Route to Doctor: leave the auto-merge queue. Identical on both variants —
-  # the hold changes what the PR carries, never whether it gets routed.
+  # the hold changes what the PR carries, never whether it gets routed. A held
+  # PR keeps loom:blocked (#11861): Doctor works it by its trusted marker.
   gh pr edit "$PR_NUMBER" --remove-label "loom:pr" --add-label "loom:changes-requested"
-
-  # loom:operator: the reversal is now conditional on whether a hold is still
-  # in force (#6720, narrowing #5802).
-  #
-  #   HELD=false — #5802's original case, unchanged. The premise "this path
-  #     unconditionally exits the merge-risk hold" holds: no hold binds, so
-  #     nothing outstanding needs a human, and clearing a label the hold never
-  #     applied is a no-op (`2>/dev/null || true`).
-  #
-  #   HELD=true — #5802's premise is FALSE here. The hold is unresolved and the
-  #     PR is expected to return still needing a human merge decision, so
-  #     asserting "no human is needed" for the whole Doctor round-trip would be
-  #     a lie. Keep the label. It does not strand the PR: `loom:operator` is
-  #     the re-evaluable human-needed state and must never make sweep/shepherd
-  #     skip an item (.loom/docs/label-state-machine.md), and Doctor's
-  #     `loom:changes-requested` queue filters `loom:blocked` /
-  #     `loom:operator-only`, NOT `loom:operator`.
-  if [ "$HELD" = true ]; then
-    echo "Kept loom:operator on #$PR_NUMBER — the merge-risk hold is unresolved (#6720)"
-  else
-    gh pr edit "$PR_NUMBER" --remove-label "loom:operator" 2>/dev/null || true
-  fi
   echo "Routed stale PR #$PR_NUMBER to Doctor (loom:pr → loom:changes-requested)"
 fi
 ```
@@ -2897,10 +2858,10 @@ faster than the pending human merge decision, not because of any problem the PR
 itself has. Routing it to Doctor would not resolve anything the hold isn't
 already the resolution for, and `main` would keep moving in the meantime — the
 "rebase treadmill" (#6848/#6852). So **this block changes no label at all**:
-`loom:pr` stays, `loom:operator` stays (never touched, so trivially preserved),
+`loom:pr` stays, `loom:blocked` stays (never touched, so trivially preserved),
 and the `champion:merge-risk-hold` marker stays (also never touched). The PR
-remains fully visible — it is still counted by the Held-PR Census below, exactly
-like a PR that did route to Doctor, because both carry `loom:operator`.
+remains fully visible — it is still counted by the Held-PR Census below, like a
+PR that did route to Doctor (counted there by its marker).
 
 ```bash
 PR_NUMBER=<number>
@@ -2918,7 +2879,7 @@ else
 
 This PR is on a merge-risk hold and \`main\` has moved past the recency window (24h) — but this PR carries no other blocker: CI is passing (or has no checks configured) and no other safety criterion is red. Its only outstanding blocker is the standing hold itself.
 
-Routing a hold-only PR to Doctor for a rebase would not resolve anything the hold isn't already the resolution for: the human merge decision is still outstanding, and \`main\` will keep moving in the meantime, producing the same conflict/stale cycle again next round (the \"rebase treadmill\", #6852). So this PR is **not** being routed to Doctor this tick. It stays on \`loom:pr\`, still held, and is still counted in every Held-PR Census (\`loom:operator\` is unaffected).
+Routing a hold-only PR to Doctor for a rebase would not resolve anything the hold isn't already the resolution for: the human merge decision is still outstanding, and \`main\` will keep moving in the meantime, producing the same conflict/stale cycle again next round (the \"rebase treadmill\", #6852). So this PR is **not** being routed to Doctor this tick. It stays on \`loom:pr\`, still held, and is still counted in every Held-PR Census (\`loom:blocked\` is unaffected).
 
 **What happens next:**
 - If \`main\`'s drift ever produces a real problem on this PR — a failing required check — the next Champion pass routes it to Doctor exactly as before (#6720's hold-plus-feedback path, unchanged).
@@ -2951,21 +2912,31 @@ This pass **never merges anything and never closes anything**. For each parked P
 
 ```bash
 # Cached ("$GH_READ") — queue discovery; each parked PR is re-read live
-# before any action is taken on it.
+# before any action is taken on it. Operator holds: champion-common.md "Hold set".
+OP_HOLDS=$(loom-daemon labels list --property operator_gate --with-retired 2>/dev/null || echo loom:operator); export OP_HOLDS
 "$GH_READ" pr list \
   --label "loom:blocked" \
   --label "loom:changes-requested" \
   --state open \
   --limit 500 \
-  --json number,title,updatedAt,labels \
-  --jq '.[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | "#\(.number) \(.title)"'
+  --json number,title,updatedAt,labels,comments \
+  --jq '($ENV.OP_HOLDS | split("\n")) as $o | .[] | select(any(.labels[]?.name; . == "loom:frozen" or IN($o[])) | not) | "#\(.number) \(.title)"'
 ```
 
-**Skip any PR that also carries `loom:operator-only`** — a previous pass (or a human) already routed it out to the operator; do not re-decide it. Process the remaining PRs oldest first.
+**A Champion-held PR (a standing trusted hold marker, #11861) is the
+human's.** Its `loom:blocked` is Champion's merge-risk or critical-file hold,
+which only a human releases. If it also hit the Doctor-cycle cap (a trusted
+`<!-- loom:doctor-cycle-cap -->` comment, or a legacy `doctor cycle
+exhausted` line, after the hold), Doctor no longer works it: post **one**
+comment, guarded by `<!-- champion:capped-hold-recommendation -->`, asking a
+human to review it, close it, or remove the hold. Never remove
+`loom:blocked`, never grant a cycle; skip the steps below for it.
+
+**The query skips any PR that also carries an operator hold** — a previous pass (or a human) already routed it out to the operator; do not re-decide it. Process the remaining PRs oldest first.
 
 Two more entry guards, checked against the thread in Step 2 before any decision is made:
 
-- **Only PRs parked by the Doctor-cycle cap are in scope.** The label pair alone is not proof. If the history shows no cap block (no `doctor cycle exhausted` block line or equivalent, or fewer than two Judge rejections), this PR was blocked for some other reason — keep it parked and say so.
+- **Only PRs parked by the Doctor-cycle cap are in scope.** The label pair alone is not proof. If the history shows no cap block (no `<!-- loom:doctor-cycle-cap -->` comment or `doctor cycle exhausted` line, or fewer than two Judge rejections), this PR was blocked for some other reason — keep it parked and say so.
 - **A human hold is authoritative.** If a human comment holds the PR — instruction-shaped phrasing such as `hold until`, `wait until`, `defer`, `not before`, `do not start` (not a bare `hold`/`wait` substring, mirroring the sweep's explicit-hold convention) — never grant. Keep it parked, quoting the hold.
 
 ### Step 2: Read the full rejection history
@@ -3090,7 +3061,7 @@ fi
 
 ### Step 4c: Outcome — recommend closing (route to the operator)
 
-Use this when the history shows the **approach itself** is not viable — repeated rejections on the design, a superseded change, or a PR whose premise a merged change invalidated. **Champion is the router here, not the closer**: do not close the PR. Add `loom:operator-only` plus its `loom:operator-decision` sub-kind (#5671 — a genuine human ruling is needed here, not a self-clearing wait; see `.loom/docs/label-state-machine.md` "operator-only sub-kinds") (keeping `loom:blocked` + `loom:changes-requested`) so the PR leaves the automation queue for good — Mode C pre-flight hard-skips `loom:operator-only` PRs — and state the recommendation plainly for the human.
+Use this when the history shows the **approach itself** is not viable — repeated rejections on the design, a superseded change, or a PR whose premise a merged change invalidated. **Champion is the router here, not the closer**: do not close the PR. Add `loom:operator` (a genuine human ruling is needed here, not a self-clearing wait; see `.loom/docs/label-state-machine.md` → "Routing to a human"), keeping `loom:blocked` + `loom:changes-requested` so the PR leaves the automation queue for good — Mode C pre-flight skips `loom:blocked` PRs and Doctor's queue excludes them — and state the recommendation plainly for the human.
 
 ```bash
 PR_NUMBER=<number>
@@ -3112,11 +3083,11 @@ Parked at the Doctor-cycle cap; the rejection history indicates the approach is 
 - **Why more Doctor cycles will not help**: <WHY_THE_APPROACH_NOT_THE_IMPLEMENTATION_IS_THE_PROBLEM>
 - **Recommendation**: close this PR<AND_OPTIONALLY_WHAT_TO_FILE_INSTEAD>
 
-Added \`loom:operator-only\` so automation stops re-evaluating this PR. A human should close it, or remove \`loom:operator-only\` to return it to the Champion recovery pass.
+Added \`loom:operator\` so automation stops re-evaluating this PR. A human should close it, or remove \`loom:operator\` to return it to the Champion recovery pass.
 
 ---
 *Automated by Champion role*"
-  gh pr edit "$PR_NUMBER" --add-label "loom:operator-only,loom:operator-decision"
+  gh pr edit "$PR_NUMBER" --add-label "loom:operator"
   echo "Routed #$PR_NUMBER to the operator with a close recommendation"
 fi
 ```
@@ -3141,7 +3112,7 @@ Full policy: `.loom/docs/pr-congestion-signal.md`.
 **Priority PRs first (`loom:very-important`, then `loom:important`, #11103).** The shared queue puts them
 ahead of interactive work, then ordinary work (oldest first within each class). Priority changes order only: all 6
 Safety Criteria, the Verdict-State Janitor, and every hold (merge-risk,
-critical-file, `loom:operator-only`, `loom:blocked`) apply unchanged. A priority
+critical-file, `loom:operator`, `loom:blocked`, `loom:frozen`) apply unchanged. A priority
 PR that passes is merged this pass. A priority PR on a hold stays held and is
 never merged — it is listed first in the hold digest (Step 1 sorts it to the
 top, marked ⭐). A failed merge (exit 1, not the 3-7 re-queues below) on a
@@ -3197,6 +3168,9 @@ Never the failure exit **1**; each means "the merge did not happen":
   MERGED is the queue working; anything else (UNDETERMINED, REFUSED, bad mode,
   a too-old `loom-daemon`) is a **stall** Step 3 already surfaced
   (`CHAMPION-MERGE-QUEUE-STALL`, #10628): name it in the summary, no error.
+- **9** — Step 3's `CHAMPION-PIN-MISSING` (`--pr N`, #11859, #11861): the block
+  lacked the `EXPECTED_HEAD` its live pin names, so nothing ran. The pin was
+  lost, not the merge.
 
 **Do not follow the 5 failure steps above for any of these outcomes:**
 

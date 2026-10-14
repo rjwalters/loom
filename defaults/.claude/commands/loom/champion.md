@@ -19,6 +19,14 @@ You are the human's avatar in the autonomous workflow - a trusted decision-maker
 
 ---
 
+## Argument Handling
+
+**Arguments**: `$ARGUMENTS`
+
+`--pr N`, `--issue N` or `--non-item`: follow `champion-targeted.md` instead of "Finding Work". No arguments: the batch pass below, unchanged.
+
+---
+
 ## Finding Work
 
 **Skip any item labelled `loom:frozen`**: don't read it as work, comment on it, or relabel it. Only a human removes it.
@@ -41,34 +49,24 @@ Safety Criteria still apply (see its "Batch Processing").
 
 Runs every pass, whether or not PRs remain ("Autonomous Operation" below,
 #10753). Check for curated issues. Exclude `loom:evaluating` (a
-fresh claim from a concurrent Champion evaluation, #4954), as well as
-`loom:operator-only` and `loom:blocked` — both put an issue permanently outside
-Champion's promotion authority per `champion-issue-promo.md`'s "When NOT to
-Promote", so there is no reason to hand them into the evaluation pass at all
-(#5163). Also exclude `loom:issue` and `loom:building` (why: the note below
-the query, #5285). Exclude `loom:needs-revision` too: Curator holds the issue until it
-revises the body (#10753). Excluding them here, not just in the evaluation step, so a batch
-doesn't re-discover work another pass already claimed or that is already
-terminal — `title`/`body` feed `champion-issue-promo.md`'s body-hash
-idempotency check (the issue's aggregate `updatedAt` is deliberately NOT used
-for it, #4966):
+fresh claim from a concurrent Champion evaluation, #4954), and the holds
+`loom:operator`, `loom:blocked` and `loom:frozen` — each is already a terminal
+state (#5163). `loom:blocked` is no longer "outside Champion's promotion
+authority": it is Champion's own block verdict, re-evaluated once
+`release-stale-blocked` lifts it (#11860). Also exclude `loom:issue` and
+`loom:building` (why: the note below the query, #5285). Every evaluation ends in
+a verdict (promote, revise to `loom:triage`, block, escalate), so nothing
+evaluated is re-discovered here. `title`/`body` feed `champion-issue-promo.md`'s
+body-hash idempotency check (the issue's aggregate `updatedAt` is deliberately
+NOT used for it, #4966):
 
-> **`loom:operator-only` is excluded here, but not unexamined (#5664).**
-> `champion-issue-promo.md` → "Pass 0: Self-Healing Un-Escalation Re-Scan" runs
-> one bounded scan of `loom:operator-only` proposals *before* this discovery
-> query and removes the label from any whose escalation was Champion's own,
-> dependency-only, and whose recorded blocker has since closed. Those issues then
-> match the query below in the same pass. Without that scan, an escalation for an
-> open dependency — a condition that clears itself — would be permanent, because
-> the only actor that could notice the blocker closed is the one this exclusion
-> tells to ignore it.
->
-> **A `loom:operator-only` proposal you read that is really blocked on
-> missing capability** is relabeled `loom:needs-capability` per
-> `.loom/docs/label-state-machine.md` → "Bidirectional routing" (#5818), an
-> opportunistic per-occurrence call. **Any operator label you apply** is for a
-> PO-level decision (ranked options) or a human-hands step only (#10001):
-> `curator.md` → "Applying `loom:operator-only`".
+> **`loom:operator` is excluded and never examined (#11861).** It is a no-op
+> for every role; only a human removes it. A dependency-only finding never
+> lands there: it is a `loom:blocked` park (`park-record apply
+> --blocked-by`, #11860), which the daemon's stale-blocked release pass lifts
+> when the blocker closes, so the issue matches this query again. (Pass 0's
+> un-escalation of such holds is retired.) **Any hold you apply** follows
+> `.loom/docs/label-state-machine.md` → "Routing to a human" (#10001).
 
 > **`loom:evaluating` is excluded here too, but not unexamined (#6828).**
 > `champion-issue-promo.md` → "Pass 0b: Stale `loom:evaluating` Claim Re-Scan"
@@ -82,17 +80,18 @@ for it, #4966):
 > "Claim (staleness-aware...)" reconciliation for this exact case never runs,
 > because it only fires on an issue *after* discovery has already selected it.
 > A `loom:evaluating` claim that keeps going stale on the SAME issue routes to
-> `loom:operator-only,loom:operator-mechanical` after repeated reclaims rather
+> `loom:operator` after repeated reclaims rather
 > than looping forever — see Pass 0b for the bound.
 
 ```bash
-# Level, then oldest first (#11103)
+# Level, then oldest first (#11103); holds: champion-common.md "Hold set"
+HOLDS=$(loom-daemon labels list --property hold --with-retired 2>/dev/null || printf 'loom:blocked\nloom:operator\nloom:frozen'); export HOLDS
 gh issue list \
   --label="loom:curated" \
   --state=open \
   --limit=500 \
   --json number,title,body,labels,comments,createdAt \
-  --jq 'sort_by([([.labels[].name] | if index("loom:very-important") then 0 elif index("loom:important") then 1 else 2 end), .createdAt]) | .[] | select([.labels[].name] | any(IN("loom:evaluating","loom:operator-only","loom:blocked","loom:issue","loom:building","loom:needs-revision","loom:frozen")) | not) |
+  --jq '($ENV.HOLDS | split("\n")) as $h | sort_by([([.labels[].name] | if index("loom:very-important") then 0 elif index("loom:important") then 1 else 2 end), .createdAt]) | .[] | select([.labels[].name] | any(IN("loom:evaluating","loom:issue","loom:building") or IN($h[])) | not) |
   "#\(.number) \(.title)"'
 ```
 
@@ -111,13 +110,14 @@ required) and `title`/`body` fetch:
 
 ```bash
 # Architect proposals, Hermit proposals, Auditor bug reports
+HOLDS=$(loom-daemon labels list --property hold --with-retired 2>/dev/null || printf 'loom:blocked\nloom:operator\nloom:frozen'); export HOLDS
 for P in architect hermit auditor; do
 gh issue list \
   --label="loom:$P" \
   --state=open \
   --limit=500 \
   --json number,title,body,labels,comments,createdAt \
-  --jq 'sort_by([([.labels[].name] | if index("loom:very-important") then 0 elif index("loom:important") then 1 else 2 end), .createdAt]) | .[] | select([.labels[].name] | any(IN("loom:evaluating","loom:operator-only","loom:blocked","loom:issue","loom:building","loom:needs-revision","loom:frozen")) | not) |
+  --jq '($ENV.HOLDS | split("\n")) as $h | sort_by([([.labels[].name] | if index("loom:very-important") then 0 elif index("loom:important") then 1 else 2 end), .createdAt]) | .[] | select([.labels[].name] | any(IN("loom:evaluating","loom:issue","loom:building") or IN($h[])) | not) |
   "#\(.number) \(.title) ['"$P"']"'
 done
 ```
@@ -157,7 +157,7 @@ gh pr list \
   --jq '.[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | "#\(.number) \(.title)"'
 ```
 
-Ignore any that also carry `loom:operator-only` (already routed to a human). If found, **read and follow instructions in `.claude/commands/loom/champion-pr-merge.md` → "Capped-PR Recovery Pass"**: read the full rejection history, apply the forward-progress test, and either grant one more Doctor→Judge cycle (remove `loom:blocked` only), keep the PR parked, or recommend closure to the operator — always with a rationale comment. This pass never merges or closes (Champion's only close authority is the proposal "premise-false close gate", `champion-issue-promo.md` Step 4, #7657 — never a PR).
+Ignore any that also carry `loom:operator` (already routed to a human). If found, **read and follow instructions in `.claude/commands/loom/champion-pr-merge.md` → "Capped-PR Recovery Pass"**: read the full rejection history, apply the forward-progress test, and either grant one more Doctor→Judge cycle (remove `loom:blocked` only), keep the PR parked, or recommend closure to the operator — always with a rationale comment. This pass never merges or closes (Champion's only close authority is the proposal "premise-false close gate", `champion-issue-promo.md` Step 4, #7657 — never a PR).
 
 ### Rollout Check Pass (every pass, max 3 items)
 
@@ -171,43 +171,7 @@ If no queues have work, report "No work for Champion" and stop.
 
 ## Follow-on Issue Creation
 
-After successfully merging a PR (Step 5.5 of the auto-merge workflow), Champion scans for follow-on work indicators and creates consolidated issues to track future work.
-
-### What Gets Captured
-
-1. **Code TODOs**: `TODO:`, `FIXME:`, `HACK:`, `XXX:`, `FUTURE:` patterns in added lines
-2. **Deferred Scope**: Sections titled "Follow-on Work", "Out of Scope", "Deferred", "Phase 2" in PR body
-3. **Review Suggestions**: Comments containing "not blocking", "consider for future", "technical debt", "would be nice"
-
-### Threshold Logic
-
-Follow-on issues are only created when meaningful work is identified:
-
-| Indicator | Threshold | Action |
-|-----------|-----------|--------|
-| Critical patterns (FIXME, HACK, XXX) | 1+ | Always create issue |
-| Explicit follow-on section | Any | Always create issue |
-| Standard TODOs (TODO, FUTURE) | 3+ | Create consolidated issue |
-| Below threshold | < 3 TODOs, no sections | Skip (avoid noise) |
-
-### Follow-on Issue Labeling
-
-Follow-on issues are created with the `loom:triage` label (Curator admission first, #11820).
-
-### Duplicate Prevention
-
-Before creating a follow-on issue, Champion searches for existing issues with "Follow-on from PR #N" in the title. If found, creation is skipped.
-
-### Issue Format
-
-Follow-on issues include:
-- Link to parent PR and original issue
-- File:line references for each TODO
-- Deferred scope items as checkboxes
-- Review notes as bullet points
-- Standard acceptance criteria
-
-See `.claude/commands/loom/champion-pr-merge.md` Step 5.5 for the complete implementation.
+After a merge, `champion-pr-merge.md` Step 5.5 turns added `TODO:`/`FIXME:`/`HACK:`/`XXX:`/`FUTURE:` lines, deferred-scope sections ("Follow-on Work", "Out of Scope", "Deferred", "Phase 2") and "not blocking" review notes into one `loom:triage` issue (Curator admission first, #11820): always for a critical pattern or a follow-on section, else at 3+ TODOs. It skips a duplicate "Follow-on from PR #N". Edge cases: `champion-reference.md` Edge Case 14.
 
 ---
 
@@ -220,6 +184,7 @@ Champion uses context-specific instruction files to keep token usage efficient:
 | `champion-pr-merge.md` | PR auto-merge workflow + capped-PR recovery pass | Priority 1 or 5 work found |
 | `champion-issue-promo.md` | Issue promotion workflow | Priority 2/3 work found |
 | `champion-epic.md` | Epic evaluation workflow | Priority 4 work found |
+| `champion-targeted.md` | `--pr`, `--issue`, `--non-item` modes | `$ARGUMENTS` given |
 | `champion-reference.md` | Edge cases and scripts | Complex situations |
 | `champion-common.md` | Shared utilities | Completion reporting |
 
@@ -255,7 +220,7 @@ This role is designed for **autonomous operation** with a recommended interval o
 
 When running autonomously:
 1. Work `loom:pr` PRs (Priority 1) in shared PR queue order, merging safe ones
-2. **Merges never starve promotion (#10753).** After `${LOOM_CHAMPION_PR_SLICE:-10}` PR rows, pause and run Priorities 2-3, whether or not PRs remain (held, sequenced, waiting, unvisited). While unvisited rows remain, stop promotion after `${LOOM_CHAMPION_PROMOTION_SLICE:-3}` fresh verdicts (silent skips are free)
+2. **Merges never starve promotion (#10753).** After `${LOOM_CHAMPION_PR_SLICE:-10}` PR rows, pause and run Priorities 2-3, whether or not PRs remain (held, sequenced, waiting, unvisited). While unvisited rows remain, stop promotion after `${LOOM_CHAMPION_PROMOTION_SLICE:-3}` fresh verdicts
 3. Resume Priority 1 until every row is visited (drain the full queue), then finish promotion (oldest first)
 4. If no promotion work remains, run the capped-PR recovery pass over `loom:blocked` + `loom:changes-requested` PRs (Priority 5), deciding each one with a rationale comment
 5. Report results and stop

@@ -34,7 +34,7 @@ use crate::forge_listing::RestIssue;
 use crate::role_runner::RoleTickOutcome;
 use crate::telemetry::kinds::pick_decision::{
     source, split_into_chunks, PickAction, PickCandidate, PickDecisionRecord, PickDraw,
-    PickDrawCandidate, PickQueueSkip, PickSkipReason, PickSortKey, PickTick, PickVerdict,
+    PickDrawCandidate, PickLane, PickQueueSkip, PickSkipReason, PickSortKey, PickTick, PickVerdict,
     PickViDemotion, PickWorkspaceDraw, CHUNK_BYTES, WORK_FINDER_ROLE,
 };
 use crate::telemetry::{RoleTickResult, TelemetryRecord};
@@ -59,6 +59,39 @@ thread_local! {
         const { RefCell::new(Vec::new()) };
 }
 
+thread_local! {
+    /// The lane plan the admission of this thread's run computed (#10630).
+    static LANE_PLAN: RefCell<Vec<crate::role_runner::concurrent_dispatch::lane_rule::RepoLane>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// Stash the per-repository lane plan the admission computed, for the run's
+/// end-of-tick record (#10630).
+pub fn stash_lane_plan(
+    _root: &Path,
+    plan: Vec<crate::role_runner::concurrent_dispatch::lane_rule::RepoLane>,
+) {
+    LANE_PLAN.with(|s| *s.borrow_mut() = plan);
+}
+
+fn take_lane_plan() -> Vec<PickLane> {
+    LANE_PLAN.with(|s| {
+        std::mem::take(&mut *s.borrow_mut())
+            .into_iter()
+            .take(MAX_PICK_LANES)
+            .map(|r| PickLane {
+                repo: repo_label(&r.root),
+                debt: r.debt,
+                wanted: r.wanted,
+                lanes: r.lanes,
+            })
+            .collect()
+    })
+}
+
+/// Most repositories one record lists lanes for.
+const MAX_PICK_LANES: usize = 32;
+
 /// Stash the open PR rows of a gate listing the role runner already made.
 pub fn record_gate_listing(root: &Path, label: &str, rows: &[RestIssue]) {
     let rows: Vec<GateRow> = rows
@@ -78,6 +111,7 @@ pub fn record_gate_listing(root: &Path, label: &str, rows: &[RestIssue]) {
 /// Drop anything stashed by an earlier tick on this (reused) blocking thread.
 pub fn clear_gate_listings() {
     GATE_LISTINGS.with(|s| s.borrow_mut().clear());
+    LANE_PLAN.with(|s| s.borrow_mut().clear());
     super::pick_journal::discard();
 }
 
@@ -113,12 +147,30 @@ fn repo_label(root: &Path) -> String {
 }
 
 fn emit(record: PickDecisionRecord) {
+    emit_in(record, None);
+}
+
+/// [`emit`] joined to a role tick's trace (#11858), so every chunk's log
+/// record carries the tick's trace id.
+fn emit_in(record: PickDecisionRecord, context: Option<&crate::telemetry::trace::TraceContext>) {
     if let Some(sink) = super::ops::global_ops_sink() {
         // A record over the byte budget is split, never truncated (#11567):
         // the chunks share `tick_id` and their union is the original.
         for chunk in split_into_chunks(record, CHUNK_BYTES) {
-            sink.emit_record(TelemetryRecord::PickDecision(chunk));
+            sink.emit_record_in(TelemetryRecord::PickDecision(chunk), context.cloned());
         }
+    }
+}
+
+/// Always drains the stash (it must not leak into the next tick on this
+/// thread); converts it (a cached local `git` read per repository) only with an
+/// exporter running.
+fn take_lane_plan_if_exporting() -> Vec<PickLane> {
+    if exporting() {
+        take_lane_plan()
+    } else {
+        LANE_PLAN.with(|s| s.borrow_mut().clear());
+        Vec::new()
     }
 }
 
@@ -129,7 +181,8 @@ fn exporting() -> bool {
 /// The part of a ready-queue row's `detail` a record may carry: a
 /// file-overlap deferral's shared paths (#9781, daemon-templated from parsed
 /// paths) and a halted row's cause token, only when it is in the closed
-/// [`HaltCause`] vocabulary (#11811). Every other detail (e.g. free-form
+/// [`HaltCause`] vocabulary (#11811), and an `already_landed` row's
+/// evidence token (#11858). Every other detail (e.g. free-form
 /// dispatch-error text) is dropped.
 fn exportable_detail(disposition: QueueDisposition, detail: Option<&str>) -> Option<String> {
     let detail = detail?;
@@ -138,6 +191,11 @@ fn exportable_detail(disposition: QueueDisposition, detail: Option<&str>) -> Opt
         QueueDisposition::WorkspaceHalted => {
             HaltCause::from_wire(detail).map(|c| c.as_str().to_string())
         }
+        // #11858: an already-landed row's evidence, closed vocabulary only.
+        QueueDisposition::AlreadyLanded => super::ops::queue::LANDED_EVIDENCE
+            .iter()
+            .find(|e| **e == detail)
+            .map(|e| (*e).to_string()),
         _ => None,
     }
 }
@@ -193,7 +251,10 @@ pub fn work_finder_record(
         .collect();
     let outcome = if summary.dispatched > 0 {
         "dispatched"
-    } else if summary.halted {
+    } else if summary.halted_fully() {
+        // #11857: a partial hold (one held root among healthy ones with
+        // candidates) is not a halt; the outcome follows the rows, as the
+        // `loom.dispatch.tick` result does.
         "halted"
     } else if summary.queue.is_empty() {
         "idle"
@@ -467,6 +528,8 @@ pub fn role_record(
         .collect();
     let mut record =
         PickDecisionRecord::build(tick, ranked).with_source(source, decisions_observed);
+    // #11858: the record names its repo even when no candidate does.
+    record.repo = Some(repo.to_string());
     record.raise_candidates_total(total);
     record.add_actions(acts.into_iter().map(|(number, action)| PickAction {
         repo: repo.to_string(),
@@ -477,16 +540,19 @@ pub fn role_record(
 }
 
 /// Emit one role tick's decision. Always drains this thread's stashed
-/// listings; builds and emits only with an OTLP exporter running.
+/// listings; builds and emits only with an OTLP exporter running. `trace` is
+/// the tick's root span when it launched: it names the tick and (#11858) the
+/// record joins its trace.
 pub fn emit_role_tick(
     root: &Path,
     role: &str,
     started_at: DateTime<Utc>,
     outcome: &RoleTickOutcome,
-    tick_id: Option<String>,
+    trace: Option<&super::lifecycle::RoleTrace>,
 ) {
     let gate = take_gate_listings(root);
     let journal = super::pick_journal::take(root);
+    let lane_plan = take_lane_plan_if_exporting();
     if !exporting() {
         return;
     }
@@ -494,7 +560,10 @@ pub fn emit_role_tick(
     let tick = PickTick {
         role: role.to_string(),
         host: crate::sweep_registry::host_identity(),
-        tick_id: tick_id.unwrap_or_else(|| super::lifecycle::role_execution_id(role, started_at)),
+        tick_id: trace.map_or_else(
+            || super::lifecycle::role_execution_id(role, started_at),
+            |t| t.execution.clone(),
+        ),
         started_at,
         ended_at: Utc::now(),
         outcome: crate::role_tick_telemetry::result_label(result),
@@ -511,7 +580,9 @@ pub fn emit_role_tick(
     let holds: &[&str] = crate::role_runner::demand::DebtAxis::for_role(role)
         .map_or(&[], crate::role_runner::demand::axis_park_labels);
     let observed = RoleObservation { journal, gate };
-    emit(role_record(tick, result, observed, &repo_label(root), holds));
+    let mut record = role_record(tick, result, observed, &repo_label(root), holds);
+    record.lanes = lane_plan;
+    emit_in(record, trace.map(|t| &t.context));
 }
 
 #[cfg(test)]

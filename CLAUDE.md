@@ -95,9 +95,9 @@ label documents its own `Applied by:` owner). State transitions:
 - **Epic**: `loom:epic` → Champion creates phased `loom:architect` +
   `loom:epic-phase` issues.
 
-`loom:frozen` means not now: every agent and daemon path ignores it; only a human removes it (#11743).
-`loom:operator` means "a human is needed" (engine stops, re-evaluable, unlike
-`loom:operator-only`; set by Champion's merge-risk hold). `loom:very-important` /
+Holds (#11795): `loom:blocked` (waiting; self-releases), `loom:operator` (a human must act or decide),
+`loom:frozen` (not now; only a human removes it).
+`loom:very-important` /
 `loom:important` reorder (not holds, not approval); every stage takes them first. Your
 queue: the pinned hold digest (#6877) and label queries in
 [`.loom/docs/label-state-machine.md`](.loom/docs/label-state-machine.md).
@@ -108,8 +108,8 @@ queue: the pinned hold digest (#6877) and label queries in
 
 ### Issues Are Suggestions (Role Autonomy)
 
-Filed issues are the *input queue*, not mandates. In autonomous mode **Curator, Builder, and Judge** may **close** (rationale commented first, then `--reason "not planned"`) or **rescope** (relabel back to `loom:triage`/`loom:curated` if the scope no longer matches) an issue rather than build it as filed, when it is obsolete, duplicate, low value, or the wrong approach. **Never** close an issue that encodes a still-pending human decision — use `loom:blocked`/`loom:operator-only` instead. Guardrails: each role prompt's "Issues Are Suggestions" section (`.loom/roles/curator.md`, `builder.md`, `judge.md`).
-**Champion** gets one narrow addition (#7657): it may close a Hermit/Architect/Auditor proposal for the `premise-false` kind only — every recurring finding across its N=2 unrevised evaluations re-verified false on current `main` — `--reason "not planned"` after a rationale comment; any mixed finding set still escalates to `loom:operator-only` as before.
+Filed issues are the *input queue*, not mandates. In autonomous mode **Curator, Builder, and Judge** may **close** (rationale commented first, then `--reason "not planned"`) or **rescope** (relabel back to `loom:triage`/`loom:curated` if the scope no longer matches) an issue rather than build it as filed, when it is obsolete, duplicate, low value, or the wrong approach. **Never** close an issue that encodes a still-pending human decision — use `loom:blocked`/`loom:operator` instead. Guardrails: each role prompt's "Issues Are Suggestions" section (`.loom/roles/curator.md`, `builder.md`, `judge.md`).
+**Champion** gets one narrow addition (#7657): it may close a Hermit/Architect/Auditor proposal for the `premise-false` kind only — every recurring finding across its N=2 unrevised evaluations re-verified false on current `main` — `--reason "not planned"` after a rationale comment; any mixed finding set still escalates to `loom:operator` as before.
 
 ## Git Worktree Workflow
 

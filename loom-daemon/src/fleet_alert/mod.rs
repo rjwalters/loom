@@ -32,7 +32,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 
 use crate::health::summarize_role_ticks;
-use crate::types::DaemonStatusReport;
+use crate::types::{DaemonStatusReport, WorkFinderTickSummary};
 
 pub mod capacity;
 pub mod causes;
@@ -98,7 +98,9 @@ pub fn classify(
     let tick_halted = status
         .last_work_finder_tick
         .as_ref()
-        .is_some_and(|t| t.halted);
+        // #11857: only a hold that covered the tick's work. One held root
+        // (say a maintain-only repo) beside healthy ones is not a halt.
+        .is_some_and(WorkFinderTickSummary::halted_fully);
     if status.main_health_gate_halted {
         out.push(Condition {
             key: KEY_DISPATCH.to_string(),

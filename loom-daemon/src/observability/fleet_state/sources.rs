@@ -536,6 +536,29 @@ fn main_ci_by_slug<'a>(
         .collect()
 }
 
+/// Fold the work finder's red holds into `main_ci` (#11858): a managed repo
+/// its last tick holds `main_red` (or `ci_billing`, a red `main` the owner's
+/// billing explains) reads red, whatever the gate state found for the
+/// collector's root said. The collector keeps one root per slug, which need
+/// not be the root the gate halted, so a held repo could read `unknown` for
+/// the whole hold. `slug` resolves a hold's root. Pure.
+pub(super) fn with_red_holds(
+    mut main_ci: BTreeMap<String, MainCi>,
+    halts: &Option<Vec<crate::work_finder::halt_cause::since::RootHalt>>,
+    slug: impl Fn(&str) -> Option<String>,
+) -> BTreeMap<String, MainCi> {
+    use crate::work_finder::halt_cause::HaltCause;
+    for halt in halts.iter().flatten() {
+        if !matches!(halt.cause, Some(HaltCause::MainRed | HaltCause::CiBilling)) {
+            continue;
+        }
+        if let Some(status) = slug(&halt.root.to_string_lossy()).and_then(|r| main_ci.get_mut(&r)) {
+            *status = MainCi::Red;
+        }
+    }
+    main_ci
+}
+
 /// What the last collector pass read from the forge, which every tick pass
 /// reuses as is (#11161): a tick pass makes no forge call.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -594,10 +617,14 @@ pub(super) async fn gather(
     let curated = label_listings(&roots, super::outcomes::CURATED_LABEL).await;
     let triage = label_listings(&roots, super::outcomes::close::TRIAGE_LABEL).await;
     let ready = ready_queue(&managed, slug_cache).await;
-    let main_ci = main_ci_by_slug(
-        roots
-            .iter()
-            .map(|(root, slug)| (root.as_path(), slug.as_str())),
+    let main_ci = with_red_holds(
+        main_ci_by_slug(
+            roots
+                .iter()
+                .map(|(root, slug)| (root.as_path(), slug.as_str())),
+        ),
+        &crate::work_finder::halt_cause::since::current(),
+        |root| slug_cache.get(root).map(|s| s.to_ascii_lowercase()),
     );
     let live_workers = live_sweep_count(&workspace_pool.provisioned_registries());
     let capacity = Some(capacity(workspace_root, live_workers));
@@ -657,11 +684,15 @@ pub(super) fn tick_input(
 /// A tick pass's `main` CI: the managed roots only, as the collector pass
 /// reads it, so the two passes never disagree about a repo.
 pub(super) fn tick_main_ci(reused: &Reused) -> BTreeMap<String, MainCi> {
-    main_ci_by_slug(
-        reused
-            .roots
-            .iter()
-            .map(|(root, slug)| (root.as_path(), slug.as_str())),
+    with_red_holds(
+        main_ci_by_slug(
+            reused
+                .roots
+                .iter()
+                .map(|(root, slug)| (root.as_path(), slug.as_str())),
+        ),
+        &crate::work_finder::halt_cause::since::current(),
+        |root| reused.slug(root),
     )
 }
 

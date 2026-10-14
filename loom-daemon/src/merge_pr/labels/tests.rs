@@ -29,9 +29,31 @@ fn without_an_approval_there_is_nothing_to_contradict() {
     // blocking it here would refuse merges that the missing-`loom:pr` guard
     // already handles with its own message and its own override.
     for b in BLOCKING.iter() {
+        if crate::work_finder::BLOCKED_HOLD_NAMES.contains(b) {
+            continue; // #11861: a hold refuses on its own, see below.
+        }
         assert_eq!(contradiction(b), None, "{b} alone is not a contradiction");
     }
     assert_eq!(contradiction(""), None);
+}
+
+/// #11861: Champion's merge-risk and critical-file holds keep `loom:blocked`
+/// on while Doctor works the PR (no `loom:pr`), so the guard refuses a blocked
+/// PR whatever else it carries: `--allow-unapproved` must not merge a hold.
+#[test]
+fn a_blocked_pr_is_refused_even_without_an_approval() {
+    for labels in [
+        "loom:blocked",
+        "loom:changes-requested\nloom:blocked",
+        "loom:review-requested\nloom:blocked",
+        "loom:needs-capability",
+    ] {
+        let b = contradiction(labels);
+        assert!(b.is_some(), "{labels:?}");
+        assert!(message("7", b.unwrap(), labels, "abc")
+            .contains("--allow-unapproved does not bypass a hold"));
+    }
+    assert_eq!(contradiction("loom:pr\nloom:blocked"), Some("loom:blocked"));
 }
 
 #[test]

@@ -720,20 +720,7 @@ impl IntakeForge for GhIntakeForge {
             Some(&repo.root),
             None,
         )?;
-        Ok(rows
-            .into_iter()
-            .filter(|row| !row.is_pull_request)
-            .map(|row| IntakeRow {
-                number: row.number,
-                created_at: row
-                    .created_at
-                    .as_deref()
-                    .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                    .map(|d| d.with_timezone(&Utc)),
-                labels: row.labels,
-                author: row.author,
-            })
-            .collect())
+        Ok(super::rows_from_listing(rows))
     }
 
     fn may_write(&mut self, repo: &Repo) -> bool {

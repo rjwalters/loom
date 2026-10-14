@@ -2,6 +2,7 @@
 //! Unix exec keeps PID, signal semantics and streaming intact; the daemon remains
 //! responsible for deadlines/process-group teardown. Models are profiles, not adapters.
 pub mod cargo_debuginfo;
+mod claim_owned;
 pub mod containment;
 // `pub(crate)` rather than private since #8436: `runtime_preference::
 // availability` mirrors `credential::resolve`'s ladder to decide whether a

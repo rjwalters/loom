@@ -34,7 +34,7 @@
 //! far outside normal operation). A full page logs a truncation warning
 //! rather than silently capping.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -85,6 +85,12 @@ pub struct RestIssue {
     /// forge omitted the summary or sent a malformed one (Gitea, older
     /// payloads), which keeps the pre-#11483 behaviour.
     pub open_sub_issues: Option<u32>,
+    /// When each current label was last applied (label name → RFC-3339), as
+    /// the GitHub state mirror serves it (`labels_at`, #11897): the first
+    /// source of an item's stage-entry time
+    /// ([`crate::step_dispatch::stage_entry`]). `None` on every REST row (the
+    /// listing carries no label times) and on a mirror row that sent none.
+    pub labels_at: Option<BTreeMap<String, String>>,
 }
 
 /// Keep only the real issues in a REST issues listing (Issue #9929).
@@ -831,6 +837,7 @@ pub fn parse_rest_issues(body: &str) -> Result<Vec<RestIssue>> {
             author_association: r.author_association,
             is_pull_request: r.pull_request.is_some(),
             open_sub_issues: r.sub_issues_summary.as_ref().and_then(open_sub_issues),
+            labels_at: None,
         })
         .collect())
 }

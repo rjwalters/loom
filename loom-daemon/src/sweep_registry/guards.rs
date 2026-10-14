@@ -993,12 +993,12 @@ impl SweepRegistry {
     /// [`PARK_LABELS`]: crate::work_finder::PARK_LABELS
     pub(crate) fn first_park_label_in(&self, issue: u32, labels: &[String]) -> Option<String> {
         // `PARK_LABELS` order, not forge order, so the refusal is deterministic
-        // when an issue carries both. `loom:blocked` sorts first, so an item
-        // carrying it never reaches the exemption below.
+        // when an issue carries both. The exemption itself vetoes every park
+        // other than `loom:blocked` (#11861: `loom:operator` included).
         let park = crate::work_finder::PARK_LABELS
             .iter()
             .find(|park| labels.iter().any(|l| l == *park))?;
-        if **park == *crate::capability::OPERATOR_ONLY_LABEL
+        if crate::work_finder::BLOCKED_HOLD_NAMES.contains(park)
             && self.mechanical_capability_exempt(issue, labels)
         {
             return None;
@@ -1006,10 +1006,12 @@ impl SweepRegistry {
         Some((*park).to_string())
     }
 
-    /// True when `issue` is a `loom:operator-mechanical` item whose declared
+    /// True when `issue` is a capability-only `loom:blocked` park whose declared
     /// `<!-- loom:capability=<name> -->` requirements (#6892) are **fully** held
-    /// by this host, and it may therefore be dispatched into the propose-mode
-    /// lane instead of parked by `loom:operator-only` (#6893, AC1).
+    /// by this host, whose body names no blocker in a park record and carries
+    /// no decision block, so it may be dispatched into the propose-mode lane
+    /// instead of parked (#6893, AC1; re-keyed on the body by #11795 and onto
+    /// `loom:blocked` by #11861).
     ///
     /// Fails closed at every step, in this order — each `false` leaves the park
     /// in force:
@@ -1017,24 +1019,25 @@ impl SweepRegistry {
     /// 1. **This host declared no capabilities** (the default: no
     ///    `LOOM_WORKER_CAPABILITIES`). Checked first and cheapest, so the common
     ///    path costs one `BTreeSet::is_empty` and **zero extra forge calls**.
-    /// 2. **The labels are not the mechanical shape** — the other three
-    ///    `loom:operator-only` sub-kinds, `loom:blocked`, `loom:needs-capability`
-    ///    and `loom:operator` are all refused here, from the labels this guard
-    ///    already fetched. Still no extra forge call.
+    /// 2. **The labels are not the lane's shape** — no blocked hold, or a
+    ///    veto beside it (`loom:operator` under any name, `loom:frozen`),
+    ///    refused from the labels this guard already fetched. Still no extra
+    ///    forge call.
     /// 3. **The body could not be read** — a `gh` failure/timeout means we could
     ///    not see the declaration, and an unreadable declaration is treated
     ///    exactly like an absent one. Note this is the *opposite* of the
     ///    surrounding guard's fail-**open** convention, and deliberately so: for
     ///    the guard, failing open means "dispatch normally"; here, failing open
     ///    would mean "override a human's park on a hunch."
-    /// 4. **The declaration is empty, unrecognized, or not fully held** — see
+    /// 4. **The body carries a decision block, or the declaration is empty,
+    ///    unrecognized, or not fully held** — see
     ///    [`crate::capability::route_mechanical`].
     ///
     /// The body read (step 3) is a second REST call on the same endpoint as
     /// [`current_labels_via_rest`](Self::current_labels_via_rest), reached only
     /// by items that already passed steps 1 and 2 — i.e. essentially never,
-    /// unless a host has opted into the lane *and* is looking at a mechanical
-    /// item.
+    /// unless a host has opted into the lane *and* is looking at a blocked
+    /// hold.
     fn mechanical_capability_exempt(&self, issue: u32, labels: &[String]) -> bool {
         let held = crate::capability::held_capabilities();
         if held.is_empty() || !crate::capability::labels_eligible_for_capability_lane(labels) {
@@ -1043,14 +1046,14 @@ impl SweepRegistry {
         let Some(body) = self.issue_body_via_rest(issue) else {
             log::info!(
                 "issue #{issue}: could not read the body to check its capability declaration; \
-                 keeping the `loom:operator-only` park (#6893 fails closed)"
+                 keeping the `loom:blocked` park (#6893 fails closed)"
             );
             return false;
         };
         let routing = crate::capability::route_mechanical(labels, Some(&body), &held);
         if routing.is_dispatchable() {
             log::info!(
-                "issue #{issue}: `loom:operator-mechanical` capability declaration is satisfied by \
+                "issue #{issue}: the blocked hold's capability declaration is satisfied by \
                  this host; dispatching into the PROPOSE-ONLY lane (#6893 AC4 — the worker \
                  produces commands/a PR for an operator to approve, never live execution)"
             );
@@ -1058,8 +1061,8 @@ impl SweepRegistry {
         }
         if let crate::capability::MechanicalRouting::MissingCapabilities { missing } = &routing {
             log::info!(
-                "issue #{issue}: `loom:operator-mechanical` declares capability/ies this host does \
-                 not hold ({}); keeping the `loom:operator-only` park (#6893)",
+                "issue #{issue}: the blocked hold declares capability/ies this host does \
+                 not hold ({}); keeping the `loom:blocked` park (#6893)",
                 missing.join(", ")
             );
         }
@@ -2607,7 +2610,10 @@ exit 0
     /// global cwd would race). The `current_dir` fix makes the recorded cwd
     /// equal to `workspace_root` regardless of where the process itself sits,
     /// which is exactly the invariant under test.
+    // Serial: a concurrent test that sets `LOOM_REPO` would let the repo
+    // lookups resolve and change the call count.
     #[test]
+    #[serial_test::serial]
     fn label_flips_run_in_registry_workspace_root() {
         // `recorder` stands in for the daemon process's cwd repo; the flips
         // must NOT resolve here. `registry_root` is the non-default workspace.
@@ -2648,9 +2654,10 @@ exit 0
             5,
             "expected the flip (1 call) + restore (#11480's one issue-signals read for the \
              shared veto and #9463's closed state — the fake `gh` prints nothing, so it fails \
-             open — Issue #4653's `is_pr` probe's `resolve_owner_repo` lookup, which bails \
-             before a second `gh api` call, Issue #10955's label-history read, then the \
-             edit — 4 calls) to invoke gh five times total; got cwds: {cwds:?}"
+             open, and #11852's open-PR probe is skipped for an unverified state — Issue \
+             #4653's `is_pr` `resolve_owner_repo` lookup, which bails, Issue #10955's \
+             label-history read, then the edit — 4 calls) to invoke gh 5 times; got cwds: \
+             {cwds:?}"
         );
         for cwd in &cwds {
             let got = std::fs::canonicalize(cwd).unwrap();

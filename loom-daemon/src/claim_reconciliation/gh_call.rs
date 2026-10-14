@@ -92,13 +92,15 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "verdict.pr_comments"
         | "quarantine.issue_comments"
         | "sequence.trusted_bodies"
-        | "roster.comments" => ops::COMMENT_LIST,
+        | "roster.comments"
+        | "landed.route_marker" => ops::COMMENT_LIST,
         "claim.pr_labels" | "sequence.predecessor" => ops::PR_VIEW_STATE,
-        "park_hold.issue_view" | "release_veto.issue_labels" | "intake.recheck" => {
-            ops::ISSUE_VIEW_STATE
-        }
+        "park_hold.issue_view"
+        | "release_veto.issue_labels"
+        | "intake.recheck"
+        | "landed.issue_labels" => ops::ISSUE_VIEW_STATE,
         "park_hold.issue_body" => ops::ISSUE_EDIT_BODY,
-        "intake.list_open" | "quarantine.issue_list" => ops::ISSUE_LIST,
+        "quarantine.issue_list" => ops::ISSUE_LIST,
         "claim.issue_reclaim"
         | "claim.pr_add_label"
         | "claim.pr_reclaim"
@@ -107,6 +109,8 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "intake.add_triage"
         | "intake.remove_triage"
         | "intake.remove_label"
+        | "landed.add_triage"
+        | "landed.remove_issue"
         | "verdict.clear_labels"
         | "verdict.requeue_unanchored"
         | "sequence.pr_edit"
@@ -130,7 +134,8 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "watchdog.stale_comment"
         | "outcome.writeback_comment"
         | "prless.comment"
-        | "intake.demote_comment" => ops::COMMENT_CREATE,
+        | "intake.demote_comment"
+        | "landed.comment" => ops::COMMENT_CREATE,
         "roster.delete" | "roster.patch" | "sequence.comment_patch" | "sequence.comment_delete" => {
             ops::COMMENT_EDIT_DELETE
         }

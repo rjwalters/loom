@@ -163,11 +163,14 @@ pub enum FleetSlot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FleetHoldKind {
-    /// `loom:operator`.
+    /// `loom:operator` (since #11795 also the folded operator holds, when the
+    /// body is not read).
     Operator,
-    /// `loom:operator-only` (or `-mechanical`).
+    /// The retired `loom:operator-only` (or `-mechanical`): unmigrated items
+    /// and history (#11795).
     OperatorOnly,
-    /// `loom:operator-decision`.
+    /// A decision: the retired `loom:operator-decision`, or `loom:operator`
+    /// with a decision block where the body is read (#11795).
     OperatorDecision,
     /// Champion's merge-risk hold.
     MergeRisk,

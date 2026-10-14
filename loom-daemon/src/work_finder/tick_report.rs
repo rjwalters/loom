@@ -198,6 +198,15 @@ pub struct TickReport {
     /// `loom.dispatch.tick` result is derived from it, so a disk-held tick no
     /// longer reads `halted_main_red`.
     pub halt_causes: Vec<HaltCause>,
+    /// How many workspaces a hold gated this tick (#11857), exported as
+    /// `loom.dispatch.held_roots` so the held share of a host stays visible
+    /// once a partial hold no longer names the tick's result.
+    pub held_roots: usize,
+    /// True when [`Self::halted`] is set but the hold did not cover the tick's
+    /// work (#11857): some workspace with ready candidates was not held, so
+    /// the tick's outcome is the per-candidate one, not `halted_<cause>`. See
+    /// [`Self::note_halts`] for the rule.
+    pub halt_partial: bool,
     /// True when the saturation admission brake (#4903) was engaged for this
     /// tick. Reported separately from
     /// [`deferred_saturation`](Self::deferred_saturation) so "the host was
@@ -320,8 +329,20 @@ impl TickReport {
     /// first `n` workspaces is held, and [`Self::halt_causes`] as the distinct
     /// causes `causes` (parallel to `halted`, optional) names at held indices.
     /// A cause at a not-held index is ignored, as `record_halted` does.
+    ///
+    /// #11857: also [`Self::held_roots`] (the held count) and
+    /// [`Self::halt_partial`]. The hold explains the tick only when it covered
+    /// the tick's work: every workspace that listed ready candidates (a row in
+    /// [`Self::queue`]) was held (or weight 0) or, when none listed any, every
+    /// workspace was held. Otherwise one held repo (say a maintain-only one)
+    /// would name every idle tick on the host and hide why the healthy repos
+    /// dispatched nothing. Keying on candidates rather than on every workspace keeps the
+    /// hold visible when the held repo is the only one with work — a healthy
+    /// but empty repo does not turn a held backlog into `all_skipped`.
     pub fn note_halts(&mut self, halted: &[bool], causes: Option<&[Option<HaltCause>]>, n: usize) {
+        let is_held = |i: usize| i < n && halted.get(i).copied().unwrap_or(false);
         self.halted = halted.iter().take(n).any(|&h| h);
+        self.held_roots = halted.iter().take(n).filter(|&&h| h).count();
         let held: Vec<HaltCause> = halted
             .iter()
             .take(n)
@@ -333,6 +354,24 @@ impl TickReport {
             .into_iter()
             .filter(|cause| held.contains(cause))
             .collect();
+        // A weight-0 root's rows (#11742) read `WorkspaceHalted` though no
+        // hold flag is set: it is configured off, so it counts as held here.
+        let covered = if self.queue.is_empty() {
+            self.held_roots == n
+        } else {
+            self.queue.iter().all(|row| {
+                is_held(row.key.workspace_idx) || row.disposition == Some(Qd::WorkspaceHalted)
+            })
+        };
+        self.halt_partial = self.halted && !covered;
+    }
+
+    /// The hold covered this tick's work (#11857): [`Self::halted`] without
+    /// [`Self::halt_partial`]. Gate tick-level reactions on this, not on
+    /// `halted`, or one held repo silences them for its healthy neighbours.
+    #[must_use]
+    pub fn halted_fully(&self) -> bool {
+        self.halted && !self.halt_partial
     }
 
     /// An empty report for a multi-workspace tick run under these admission

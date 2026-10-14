@@ -148,13 +148,13 @@ fn installation_graphql_reset_selected_over_healthy_ambient_user() {
 #[test]
 fn healthy_ambient_reading_cannot_pass_as_healthy_quota() {
     // No context → the probe reads the ambient user's healthy budget. That
-    // contradicts a primary failure: fallback cooldown, and status must not
-    // cache the healthy numbers.
+    // contradicts a primary failure: minimum cooldown (#10375), and status
+    // must not cache the healthy numbers.
     let b = breaker(true);
     let probe = FixtureProbe::new(None, Some(snapshot(HEALTHY.0, HEALTHY.1)));
     let h = handle(&b, probe.clone(), ProbeMode::Inline);
     let r = report_failure(&h, PRIMARY_GQL, "work_finder", FailureContext::default(), t(0));
-    assert_eq!(until_of(r), t(900));
+    assert_eq!(until_of(r), t(super::MIN_COOLDOWN_SECS));
     let snap = b.snapshot(t(1));
     assert!(snap.suppressed);
     assert_eq!(snap.core_remaining, None, "untrusted reading not shown as the budget");
@@ -185,13 +185,49 @@ fn failure_headers_beat_contradictory_full_rate_limit_body() {
 }
 
 #[test]
-fn false_full_probe_without_headers_takes_the_fallback() {
+fn false_full_probe_without_headers_takes_the_minimum_cooldown() {
     let b = breaker(true);
     let probe = FixtureProbe::new(Some(snapshot(HEALTHY.0, HEALTHY.1)), None);
     let h = handle(&b, probe, ProbeMode::Inline);
     let r = report_failure(&h, PRIMARY_REST, "claim_reconciliation", installation_ctx(), t(0));
-    assert_eq!(until_of(r), t(900));
+    assert_eq!(until_of(r), t(super::MIN_COOLDOWN_SECS));
     assert_eq!(b.snapshot(t(1)).core_remaining, None);
+}
+
+#[test]
+fn a_contradicted_trip_retrips_after_its_short_window() {
+    // #10375: if the bucket really is dry, the next failing call re-trips
+    // once the minimum window ends — and that window starts after the first.
+    let min = super::MIN_COOLDOWN_SECS;
+    let b = breaker(true);
+    let probe = FixtureProbe::new(None, Some(snapshot(HEALTHY.0, HEALTHY.1)));
+    let h = handle(&b, probe.clone(), ProbeMode::Inline);
+    let first = until_of(report_failure(&h, PRIMARY_GQL, "a", FailureContext::default(), t(0)));
+    assert_eq!(first, t(min));
+    assert!(report_failure(&h, PRIMARY_GQL, "b", FailureContext::default(), t(min - 1)).is_none());
+    assert!(b.observe_tick(t(min)).is_some(), "short window released");
+    let second = until_of(report_failure(&h, PRIMARY_GQL, "c", FailureContext::default(), t(min)));
+    assert!(second > first);
+    assert_eq!(second, t(2 * min));
+    assert_eq!(b.snapshot(t(min + 1)).trips_total, 2);
+    assert_eq!(probe.calls(), 2);
+}
+
+#[test]
+fn contradicted_evidence_ignores_the_configured_fallback() {
+    let (ev, shown) =
+        evidence::from_probe(PRIMARY_GQL, Some(&snapshot(HEALTHY.0, HEALTHY.1)), t(0));
+    assert_eq!(ev, ResetEvidence::Contradicted);
+    assert!(!ev.is_trusted() && !shown, "reading still hidden from status");
+    assert!(ev.describe().contains("non-exhausted budget"));
+    let min = t(super::MIN_COOLDOWN_SECS);
+    for fallback in [5, 59, 60, 900, 86_400] {
+        assert_eq!(ev.cooldown_until(t(0), fallback), min, "fallback {fallback}");
+    }
+    // A sub-minimum configured fallback is still clamped up for real fallbacks.
+    let (none, _) = evidence::from_probe(PRIMARY_GQL, None, t(0));
+    assert_eq!(none.cooldown_until(t(0), 5), min);
+    assert_eq!(none.cooldown_until(t(0), 900), t(900), "other fallbacks unchanged");
 }
 
 #[test]

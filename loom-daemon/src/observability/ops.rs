@@ -42,13 +42,16 @@
 //! [`capture::capture`], a per-thread recorder (test builds only).
 
 pub mod build_gate;
+pub mod busy_slots;
 #[cfg(test)]
 pub mod capture;
 pub mod codex_session;
 pub mod dispatch;
+pub mod dispatch_facts;
 pub mod disposition;
 pub mod dwell;
 pub mod forge_calls;
+pub mod forge_mirror;
 pub mod host;
 pub mod ipc_latency;
 pub mod liveness;
@@ -62,6 +65,9 @@ pub mod reader_spill;
 pub mod reader_withdrawal;
 pub mod redate_chain;
 pub mod stage_dwell;
+pub mod stage_entry;
+pub mod stage_events;
+pub mod stage_queue;
 pub mod turnaround;
 
 use std::sync::{Arc, OnceLock};
@@ -149,6 +155,19 @@ impl OpsSink {
             .offer(TelemetryEnvelope::new(self.host_id.clone(), record));
     }
 
+    /// [`Self::emit_record`] joined to the trace `context` (#11858): the log
+    /// record then carries that trace's ids, so it joins the span it belongs
+    /// to. `None` is exactly [`Self::emit_record`].
+    pub fn emit_record_in(
+        &self,
+        record: TelemetryRecord,
+        context: Option<crate::telemetry::trace::TraceContext>,
+    ) {
+        let mut envelope = TelemetryEnvelope::new(self.host_id.clone(), record);
+        envelope.trace_context = context;
+        self.queue.offer(envelope);
+    }
+
     /// Enqueue one completed span, carrying its own context so logs can join
     /// it. Unsampled or invalid spans are not enqueued.
     pub fn emit_span(&self, span: SpanRecord) {
@@ -195,6 +214,10 @@ pub fn register_global_ops_sink(sink: OpsSink) {
 /// The registered sink, or `None` when ops signals are not exported.
 #[must_use]
 pub fn global_ops_sink() -> Option<&'static OpsSink> {
+    #[cfg(test)]
+    if capture::sinkless() {
+        return None;
+    }
     GLOBAL_OPS_SINK.get()
 }
 
@@ -218,6 +241,21 @@ pub fn emit_record(record: TelemetryRecord) {
     };
     if let Some(sink) = global_ops_sink() {
         sink.emit_record(record);
+    }
+}
+
+/// [`emit_record`] joined to the trace `context` (#11858); a test capture
+/// records the record alone.
+pub fn emit_record_in(
+    record: TelemetryRecord,
+    context: Option<crate::telemetry::trace::TraceContext>,
+) {
+    #[cfg(test)]
+    let Some(record) = capture::record(record) else {
+        return;
+    };
+    if let Some(sink) = global_ops_sink() {
+        sink.emit_record_in(record, context);
     }
 }
 
