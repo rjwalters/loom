@@ -110,9 +110,6 @@ pub fn contradiction(labels: &str) -> Option<&'static str> {
             .copied()
             .find(|b| present(b));
     }
-    if !present("loom:pr") {
-        return None;
-    }
     BLOCKING.iter().copied().find(|b| present(b))
 }
 

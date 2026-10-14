@@ -303,3 +303,65 @@ fn doctor_serves_a_verified_champion_hold_and_nothing_else_parked() {
         );
     }
 }
+
+/// #11861 review: the whole round trip of a Champion hold, end to end over the
+/// queue and merge-guard decisions. `loom:blocked` stays on at every step, each
+/// stage is served by exactly the role that owns it (given the trusted hold
+/// marker `fetch_queue` reads), the merge guard refuses throughout, and only a
+/// human's removal of `loom:blocked` lets Champion merge.
+#[test]
+fn a_champion_hold_round_trip_never_strands_and_never_merges_while_held() {
+    use crate::champion_hold::{doctor_may_work, judge_may_review, MERGE_RISK_HOLD_MARKER};
+    use crate::merge_pr::labels::contradiction;
+    let trusted = [format!(
+        "{MERGE_RISK_HOLD_MARKER}\n<!-- champion:hold-state head=abc -->"
+    )];
+    let serve = |labels: &[&str], role: PrRole| -> Vec<u64> {
+        let mut row = pr(42, "autonomous", labels);
+        let field = match role {
+            PrRole::Doctor => doctor_may_work(labels, &trusted),
+            PrRole::Judge => judge_may_review(labels, &trusted),
+            PrRole::Champion => false,
+        };
+        if field {
+            row[CHAMPION_HOLD_FIELD] = json!(true);
+        }
+        ids(&ordered_queue(vec![row], role, true, &policy()))
+    };
+    let who = |labels: &[&str]| -> Vec<PrRole> {
+        [PrRole::Judge, PrRole::Doctor, PrRole::Champion]
+            .into_iter()
+            .filter(|r| serve(labels, *r) == vec![42])
+            .collect()
+    };
+    let refused = |labels: &[&str]| contradiction(&labels.join("\n")).is_some();
+
+    // 1. Held at approval: Champion's (janitor exception); merge refused.
+    let held = ["loom:pr", "loom:blocked"];
+    assert_eq!(who(&held), vec![PrRole::Champion]);
+    assert!(refused(&held));
+    // 2. Stale route to Doctor: the label stays on; Doctor's alone.
+    let at_doctor = ["loom:changes-requested", "loom:blocked"];
+    assert_eq!(who(&at_doctor), vec![PrRole::Doctor]);
+    assert!(refused(&at_doctor), "--allow-unapproved cannot merge a hold");
+    // 3. Doctor hands it back: Judge's alone (and its claim stage too).
+    let at_judge = ["loom:review-requested", "loom:blocked"];
+    assert_eq!(who(&at_judge), vec![PrRole::Judge]);
+    assert!(refused(&at_judge));
+    assert!(judge_may_review(&["loom:reviewing", "loom:blocked"], &trusted));
+    // 4. Judge approves: loom:pr + loom:blocked, Champion's hold again.
+    assert_eq!(who(&held), vec![PrRole::Champion]);
+    assert!(refused(&held));
+    // 5. A human removes loom:blocked: plain approval, Champion merges.
+    let released = ["loom:pr"];
+    assert_eq!(who(&released), vec![PrRole::Champion]);
+    assert!(!refused(&released));
+    // Without the trusted marker, no stage of the round trip is served.
+    for labels in [&at_doctor[..], &at_judge[..]] {
+        let mut row = pr(42, "autonomous", labels);
+        row[CHAMPION_HOLD_FIELD] = json!(false);
+        for role in [PrRole::Judge, PrRole::Doctor] {
+            assert!(ordered_queue(vec![row.clone()], role, true, &policy()).is_empty());
+        }
+    }
+}

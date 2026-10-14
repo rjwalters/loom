@@ -322,6 +322,26 @@ fn a_champion_hold_out_at_doctor_opens_the_changes_gate() {
     assert!(!listing_has_work(label, &[operator]), "a human hold beside it wins");
 }
 
+/// #11861 review: Doctor hands the held PR back to review with `loom:blocked`
+/// still on; the review gate opens on it, so Judge's re-approval happens.
+#[test]
+fn a_champion_hold_handed_back_opens_the_review_gate() {
+    let label = "loom:review-requested";
+    let record = crate::park_record::render_park(
+        &[],
+        Some(crate::champion_hold::HOLD_BY),
+        Some("2026-10-14T00:00:00Z"),
+        Some(crate::champion_hold::CRITICAL_FILE_HOLD_REASON),
+    );
+    let held = RestIssue {
+        body: Some(format!("A change.\n\n{record}\n")),
+        ..queue_row(1, label, &["loom:blocked"])
+    };
+    assert!(listing_has_work(label, std::slice::from_ref(&held)));
+    assert_eq!(count_axis_rows(DebtAxis::Review, std::slice::from_ref(&held)), 1);
+    assert!(!listing_has_work(label, &[queue_row(2, label, &["loom:blocked"])]));
+}
+
 #[test]
 fn all_parked_changes_listing_does_not_open_the_gate() {
     // #9435: every open PR is one doctor.md Priority 2 skips, so a Doctor run

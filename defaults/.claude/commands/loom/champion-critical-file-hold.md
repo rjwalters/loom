@@ -186,9 +186,13 @@ $CF_EQUIV_LINE
       ;;
   esac
 elif [ "$CF_STATE" = held ] || [ "$CF_STATE" = released ]; then
-  # PASS with an episode open — a push narrowed the diff. Clear the label, post
-  # a one-time reversal notice, then continue as an ordinary PASS.
-  gh pr edit "$PR_NUMBER" --remove-label "loom:blocked" 2>/dev/null || true
+  # PASS with an episode open — a push narrowed the diff. Post a one-time
+  # reversal notice, then continue as an ordinary PASS. The label is shared
+  # with the merge-risk hold: remove it only if no merge-risk hold stands
+  # (#11861), or criterion #2 would read Champion's removal as a human release.
+  MR_STANDS=$(jq -r '[.comments[].body] | (map(startswith("<!-- champion:merge-risk-hold -->")) | rindex(true)) as $h
+    | (map(contains("<!-- champion:merge-risk-hold-cleared -->")) | rindex(true)) as $c | $h != null and ($c == null or $h > $c)' <<<"$CF_JSON")
+  [ "$MR_STANDS" = true ] || gh pr edit "$PR_NUMBER" --remove-label "loom:blocked" 2>/dev/null || true
   ./.loom/scripts/post-comment.sh "$PR_NUMBER" --pr --body "$CLEARED_MARKER
 **Champion: Critical-File Hold Cleared**
 

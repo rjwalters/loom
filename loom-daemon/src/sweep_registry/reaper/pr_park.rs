@@ -57,8 +57,8 @@ impl SweepRegistry {
 
     /// The first [`PARK_LABELS`](crate::work_finder::PARK_LABELS)
     /// entry carried by pull request `pr`, or `None` when it carries none — or
-    /// when the labels could not be read. `loom:operator` is not a park on a
-    /// PR (#11795): Champion's holds re-evaluate themselves.
+    /// when the labels could not be read. Since #11861 `loom:operator` is a
+    /// park on a PR too, and Champion's holds are `loom:blocked`.
     ///
     /// **Fails open**, mirroring the dispatch-side park guard (#4444) and the
     /// surrounding reaper probes: a `gh` error, timeout or unresolvable repo

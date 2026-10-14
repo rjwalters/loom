@@ -95,17 +95,16 @@ fn guard_admits(root: &Path, row: &Value) -> Result<bool> {
     }
 }
 
-/// Whether `row`'s labels are a Champion hold sent to Doctor (#11861).
-fn champion_hold_shape(row: &Value) -> bool {
-    let labels: Vec<String> = row["labels"]
+/// `row`'s label names.
+fn row_labels(row: &Value) -> Vec<String> {
+    row["labels"]
         .as_array()
         .map(|a| {
             a.iter()
                 .filter_map(|l| l["name"].as_str().map(str::to_string))
                 .collect()
         })
-        .unwrap_or_default();
-    crate::champion_hold::doctor_shape(&labels)
+        .unwrap_or_default()
 }
 
 /// The trusted comment bodies on PR `number`, oldest first (#9548): every
@@ -144,15 +143,26 @@ fn trusted_comment_bodies(
 /// Fallback review only; no workflow labels or branch mutations occur here.
 pub fn fetch_queue(root: &Path, gh: &Path, role: PrRole) -> Result<Vec<Value>> {
     let mut rows = list_open(root, gh)?;
-    if role == PrRole::Doctor {
+    if matches!(role, PrRole::Doctor | PrRole::Judge) {
         let policy = TrustPolicy::for_root(root);
         for row in &mut rows {
-            if champion_hold_shape(row) {
+            let labels = row_labels(row);
+            let shape = match role {
+                PrRole::Doctor => crate::champion_hold::doctor_shape(&labels),
+                _ => crate::champion_hold::judge_shape(&labels),
+            };
+            if shape {
                 let number = row["number"].as_u64().context("PR number missing")?;
                 let trusted = trusted_comment_bodies(root, gh, number, &policy)?;
-                row[super::CHAMPION_HOLD_FIELD] =
-                    Value::Bool(crate::champion_hold::standing_hold(&trusted).is_some());
+                row[super::CHAMPION_HOLD_FIELD] = Value::Bool(match role {
+                    PrRole::Doctor => crate::champion_hold::doctor_may_work(&labels, &trusted),
+                    _ => crate::champion_hold::judge_may_review(&labels, &trusted),
+                });
             }
+        }
+    }
+    if role == PrRole::Doctor {
+        for row in &mut rows {
             if has_label(row, "loom:pr")
                 && !has_label(row, "loom:changes-requested")
                 && !crate::work_finder::PARK_LABELS

@@ -349,3 +349,23 @@ fn an_escalation_without_loom_operator_itself_is_untouched() {
     assert_eq!(r.summary.untouched, 1);
     assert!(fake.writes().is_empty());
 }
+
+/// #11861 review: a marker PR already back at review (`loom:review-requested`
+/// + `loom:operator`) is parked too, and stays Judge's work after the move.
+#[test]
+fn a_held_pr_at_review_is_parked_and_stays_judge_work() {
+    let hold = mr_hold();
+    let fake =
+        Fake::default().item(11, &["loom:review-requested", "loom:operator"], true, &[&hold]);
+    let r = run(&fake, "o/r", true);
+    assert_eq!(r.summary.holds, 1);
+    assert_eq!(
+        fake.writes(),
+        vec![
+            "park #11 champion merge-risk hold",
+            "remove #11 loom:operator"
+        ]
+    );
+    let labels: Vec<String> = fake.labels(11).into_iter().collect();
+    assert!(loom_daemon::champion_hold::judge_may_review(&labels, &[hold]));
+}

@@ -261,7 +261,7 @@ If no argument is provided, use the normal finding work workflow below.
 
 ## Label Workflow
 
-**Skip any item labelled `loom:frozen` or `loom:operator`** (#11861): don't read it as work, comment on it, or relabel it. Only a human removes them.
+**Skip any item labelled `loom:frozen` or `loom:operator`** (#11861): don't read it as work, comment on it, or relabel it. Only a human removes them. A `loom:blocked` PR `pr-queue` serves you is Champion's hold back from Doctor: review it normally and leave `loom:blocked` on; either verdict keeps it.
 
 **Find PRs ready for evaluation (green badges):**
 ```bash

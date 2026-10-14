@@ -1459,10 +1459,10 @@ Two invariants apply on **both** branches, both load-bearing:
 ### `loom:blocked` on the held-and-stale route: KEEP it (#11861)
 
 The route never removes `loom:blocked`, so the PR is never a plain approval
-while the hold stands and `merge-pr.sh` refuses it throughout. Doctor still
-reaches it: `pr-queue --role doctor` serves `loom:changes-requested` +
-`loom:blocked` when a trusted Champion hold marker stands
-(`champion_hold::doctor_may_work`). Judge's re-approval restores `loom:pr` +
+while the hold stands and `merge-pr.sh` refuses it throughout. Doctor and then
+Judge still reach it: `pr-queue` serves `loom:changes-requested` (Doctor) and
+then `loom:review-requested` (Judge) beside `loom:blocked` when a trusted
+Champion hold marker stands. Judge's re-approval restores `loom:pr` +
 `loom:blocked`, the janitor exception, and the precheck re-judges the hold
 (the push is release (c)). Only a human removes the label.
 

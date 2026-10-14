@@ -260,9 +260,11 @@ plain approval while the hold stands, and `merge-pr.sh` refuses it throughout
 (it refuses any `loom:blocked` PR, `--allow-unapproved` included). Doctor
 still reaches it: Doctor's queue (`pr-queue --role doctor`, the lanes, the
 targeted path) serves `loom:changes-requested` + `loom:blocked` when a trusted
-Champion hold marker stands (`champion_hold::doctor_may_work`), and Doctor
-returns it to review as usual. Judge's re-approval restores `loom:pr` +
-`loom:blocked` (the janitor exception) and the precheck re-judges the hold;
+Champion hold marker stands (`champion_hold::doctor_may_work`, not after the
+Doctor-cycle cap), and Doctor returns it to review as usual. Judge's queue and
+review gate serve `loom:review-requested` + `loom:blocked` the same way
+(`judge_may_review`); both verdicts leave the label on, and the re-approval
+restores `loom:pr` + `loom:blocked` (the janitor exception) and the precheck re-judges the hold;
 the push is release signal (c). Champion never removes the label while the
 hold stands, so a removal is always a human's release. The Capped-PR Recovery
 Pass, which also reads `loom:blocked` + `loom:changes-requested`, skips a PR

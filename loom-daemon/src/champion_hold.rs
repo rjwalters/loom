@@ -108,18 +108,10 @@ pub fn is_champion_hold<L: AsRef<str>, C: AsRef<str>>(labels: &[L], comments: &[
         && standing_hold(comments).is_some()
 }
 
-/// The label shape of a Champion-held PR that Champion sent to Doctor
-/// (#11861): `loom:changes-requested` beside the blocked hold, and no other
-/// park (`loom:operator` under any name, `loom:frozen`). Doctor may work it
-/// **only** when a standing trusted hold marker confirms it
-/// ([`doctor_may_work`]); the same labels without one are a Doctor-cycle-cap
-/// park or another actor's, which Doctor skips. `loom:blocked` stays on
-/// throughout, so the PR is never a plain approval while the hold stands.
-#[must_use]
-pub fn doctor_shape<L: AsRef<str>>(labels: &[L]) -> bool {
-    let has = |n: &str| labels.iter().any(|l| l.as_ref() == n);
-    has("loom:changes-requested")
-        && crate::work_finder::is_blocked_hold(labels)
+/// The blocked hold and no other park (`loom:operator` under any name,
+/// `loom:frozen`).
+fn only_the_blocked_park<L: AsRef<str>>(labels: &[L]) -> bool {
+    crate::work_finder::is_blocked_hold(labels)
         && !labels.iter().any(|l| {
             let l = l.as_ref();
             crate::work_finder::PARK_LABELS.contains(&l)
@@ -127,11 +119,70 @@ pub fn doctor_shape<L: AsRef<str>>(labels: &[L]) -> bool {
         })
 }
 
-/// Whether Doctor may work a PR (#11861): [`doctor_shape`] labels and a
-/// Champion hold standing in its **trusted** comments.
+/// The label shape of a Champion-held PR that Champion sent to Doctor
+/// (#11861): `loom:changes-requested` beside the blocked hold, and no other
+/// park. Doctor may work it **only** when a standing trusted hold marker
+/// confirms it ([`doctor_may_work`]); the same labels without one are a
+/// Doctor-cycle-cap park or another actor's, which Doctor skips.
+/// `loom:blocked` stays on throughout the round trip (Doctor, then Judge), so
+/// the PR is never a plain approval while the hold stands.
+#[must_use]
+pub fn doctor_shape<L: AsRef<str>>(labels: &[L]) -> bool {
+    labels
+        .iter()
+        .any(|l| l.as_ref() == "loom:changes-requested")
+        && only_the_blocked_park(labels)
+}
+
+/// The label shape of a Champion-held PR that Doctor handed back for review
+/// (#11861): `loom:review-requested` (or Judge's `loom:reviewing` claim)
+/// beside the blocked hold, and no other park. Judge reviews it only when a
+/// standing trusted hold marker confirms it ([`judge_may_review`]); both
+/// verdicts leave `loom:blocked` on, so an approval lands as `loom:pr` +
+/// `loom:blocked`, Champion's hold again.
+#[must_use]
+pub fn judge_shape<L: AsRef<str>>(labels: &[L]) -> bool {
+    labels
+        .iter()
+        .any(|l| matches!(l.as_ref(), "loom:review-requested" | "loom:reviewing"))
+        && only_the_blocked_park(labels)
+}
+
+/// The sweep's Doctor-cycle-cap park writes this phrase in its comment
+/// (`sweep-wave-lifecycle.md`: "PR #P blocked: doctor cycle exhausted after
+/// <k> Doctor→Judge round(s)").
+pub const DOCTOR_CYCLE_CAP_PHRASE: &str = "doctor cycle exhausted";
+
+/// Whether the Doctor-cycle cap was hit after the latest hold notice: a
+/// trusted comment naming it, later than the newest hold marker. A capped
+/// held PR is the Capped-PR Recovery Pass's, not Doctor's (#11861 review).
+#[must_use]
+pub fn doctor_cycle_capped<C: AsRef<str>>(trusted: &[C]) -> bool {
+    let hold = trusted.iter().rposition(|c| {
+        let c = c.as_ref();
+        c.starts_with(MERGE_RISK_HOLD_MARKER) || c.starts_with(CRITICAL_FILE_HOLD_MARKER)
+    });
+    trusted.iter().enumerate().any(|(i, c)| {
+        hold.is_none_or(|h| i > h)
+            && c.as_ref()
+                .to_ascii_lowercase()
+                .contains(DOCTOR_CYCLE_CAP_PHRASE)
+    })
+}
+
+/// Whether Doctor may work a PR (#11861): [`doctor_shape`] labels, a Champion
+/// hold standing in its **trusted** comments, and the Doctor-cycle cap not hit
+/// since the hold.
 #[must_use]
 pub fn doctor_may_work<L: AsRef<str>, C: AsRef<str>>(labels: &[L], trusted: &[C]) -> bool {
-    doctor_shape(labels) && standing_hold(trusted).is_some()
+    doctor_shape(labels) && standing_hold(trusted).is_some() && !doctor_cycle_capped(trusted)
+}
+
+/// Whether Judge may review a PR (#11861): [`judge_shape`] labels and a
+/// Champion hold standing in its **trusted** comments.
+#[must_use]
+pub fn judge_may_review<L: AsRef<str>, C: AsRef<str>>(labels: &[L], trusted: &[C]) -> bool {
+    judge_shape(labels) && standing_hold(trusted).is_some()
 }
 
 /// Whether a PR body carries a Champion hold's park record (#11861). A cheap,
@@ -217,6 +268,27 @@ mod tests {
             assert!(!doctor_may_work(&l, &[hold.as_str()]), "{extra}");
         }
         assert!(!doctor_may_work(&["loom:pr", "loom:blocked"], &[hold.as_str()]));
+    }
+
+    #[test]
+    fn judge_reviews_a_champion_hold_handed_back_only_with_a_trusted_marker() {
+        let hold = format!("{MERGE_RISK_HOLD_MARKER}\nx");
+        for stage in ["loom:review-requested", "loom:reviewing"] {
+            assert!(judge_may_review(&[stage, "loom:blocked"], &[hold.as_str()]), "{stage}");
+            assert!(!judge_may_review::<&str, &str>(&[stage, "loom:blocked"], &[]), "{stage}");
+            assert!(!judge_may_review(&[stage, "loom:blocked", "loom:operator"], &[hold.as_str()]));
+        }
+        assert!(!judge_may_review(&["loom:changes-requested", "loom:blocked"], &[hold.as_str()]));
+    }
+
+    #[test]
+    fn a_capped_held_pr_is_not_doctor_work() {
+        let hold = format!("{MERGE_RISK_HOLD_MARKER}\nx");
+        let cap = "PR #7 blocked: doctor cycle exhausted after 3 Doctor→Judge round(s)";
+        let shape = ["loom:changes-requested", "loom:blocked"];
+        assert!(!doctor_may_work(&shape, &[hold.as_str(), cap]));
+        // A cap from before the current hold episode does not count.
+        assert!(doctor_may_work(&shape, &[cap, hold.as_str()]));
     }
 
     #[test]

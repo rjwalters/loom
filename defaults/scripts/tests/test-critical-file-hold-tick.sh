@@ -269,6 +269,22 @@ grep -qE '^(pr merge|api .*merge)' "$T/gh.argv"; check 1 "$?" "no gh merge call 
 tick PASS; check "LABEL-:loom:blocked;COMMENT:cleared" "$WRITES" "PASS with an open episode: cleared notice"
 tick PASS; check "" "$WRITES" "repeat PASS: no writes"
 
+echo "--- #11861: the shared loom:blocked stays while a merge-risk hold stands ---"
+reset "$A"
+comment_as "$BOT" "<!-- champion:merge-risk-hold -->
+<!-- champion:hold-state head=$A -->
+held on blast radius"
+tick
+tick PASS; check "COMMENT:cleared" "$WRITES" "critical-file clears, merge-risk still held: label NOT removed"
+check "present" "$(label)" "loom:blocked stays for the standing merge-risk hold"
+reset "$A"
+comment_as "$BOT" "<!-- champion:merge-risk-hold -->
+held"
+comment_as "$BOT" "merging
+<!-- champion:merge-risk-hold-cleared -->"
+tick
+tick PASS; check "LABEL-:loom:blocked;COMMENT:cleared" "$WRITES" "merge-risk already reversed: the label comes off"
+
 echo
 echo "Results: $((TESTS_RUN - TESTS_FAILED))/$TESTS_RUN passed, $TESTS_FAILED failed"
 [[ $TESTS_FAILED -eq 0 ]]

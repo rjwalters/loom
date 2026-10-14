@@ -539,16 +539,22 @@ pub fn count_axis_rows(axis: DebtAxis, rows: &[RestIssue]) -> usize {
     rows.iter()
         .filter(|r| r.is_pull_request && r.state.eq_ignore_ascii_case("open"))
         .filter(|r| {
-            !r.labels.iter().any(|l| parks.contains(&l.as_str()))
-                || (axis == DebtAxis::Changes && champion_hold_for_doctor(r))
+            !r.labels.iter().any(|l| parks.contains(&l.as_str())) || champion_round_trip(axis, r)
         })
         .count()
 }
 
-/// The listing-only hint that a parked `loom:changes-requested` PR is a
-/// Champion hold out for a Doctor round-trip (#11861).
-fn champion_hold_for_doctor(r: &RestIssue) -> bool {
-    crate::champion_hold::doctor_shape(&r.labels)
+/// The listing-only hint that a parked PR is a Champion hold on its round
+/// trip (#11861): out at Doctor on the changes axis, handed back to Judge on
+/// the review axis. The body's park record is the hint; the role's
+/// `pr-queue` confirms it from the trusted hold marker before acting.
+fn champion_round_trip(axis: DebtAxis, r: &RestIssue) -> bool {
+    let shape = match axis {
+        DebtAxis::Changes => crate::champion_hold::doctor_shape(&r.labels),
+        DebtAxis::Review => crate::champion_hold::judge_shape(&r.labels),
+        DebtAxis::Merge => false,
+    };
+    shape
         && r.body
             .as_deref()
             .is_some_and(crate::champion_hold::body_declares_hold)
@@ -574,6 +580,7 @@ pub fn listing_has_work(label: &str, rows: &[RestIssue]) -> bool {
             !r.labels
                 .iter()
                 .any(|l| crate::work_finder::PARK_LABELS.contains(&l.as_str()))
+                || champion_round_trip(DebtAxis::Review, r)
         }),
         Some(axis) => count_axis_rows(axis, rows) > 0,
         None => !rows.is_empty(),
