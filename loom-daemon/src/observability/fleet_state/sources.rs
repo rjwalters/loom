@@ -279,6 +279,35 @@ fn label_listing_with(
     repo: Option<&str>,
     label: &str,
 ) -> anyhow::Result<BTreeMap<u32, Option<DateTime<Utc>>>> {
+    label_listing_counted_with(gh, root, repo, label).map(|(listing, _)| listing)
+}
+
+/// Labels that take an open issue out of the eligible pending queue (#11955):
+/// the skip/park holds and the proposal labels.
+const INELIGIBLE_LABELS: [&str; 5] = [
+    "loom:skip",
+    "loom:park",
+    "loom:architect",
+    "loom:hermit",
+    "loom:auditor",
+];
+
+/// Whether an issue bearing `labels` counts toward the eligible pending
+/// queue depth (#11955). Pure.
+pub(super) fn is_eligible<S: AsRef<str>>(labels: &[S]) -> bool {
+    !labels
+        .iter()
+        .any(|l| INELIGIBLE_LABELS.contains(&l.as_ref()))
+}
+
+/// [`label_listing_with`] plus the count of listed issues that are eligible
+/// ([`is_eligible`]) for the pending queue depth (#11955).
+fn label_listing_counted_with(
+    gh: &Path,
+    root: &Path,
+    repo: Option<&str>,
+    label: &str,
+) -> anyhow::Result<(BTreeMap<u32, Option<DateTime<Utc>>>, u32)> {
     let items = crate::forge_listing::list_issues_cached_all_as(
         CALLER,
         gh,
@@ -287,28 +316,37 @@ fn label_listing_with(
         label,
         "open",
     )?;
-    Ok(items
-        .into_iter()
-        .filter(|item| !item.is_pull_request)
-        .map(|item| (item.number, parse_instant(item.created_at.as_deref())))
-        .collect())
+    let mut eligible = 0u32;
+    let mut listing = BTreeMap::new();
+    for item in items.into_iter().filter(|item| !item.is_pull_request) {
+        if is_eligible(&item.labels) {
+            eligible += 1;
+        }
+        listing.insert(item.number, parse_instant(item.created_at.as_deref()));
+    }
+    Ok((listing, eligible))
 }
 
-/// Each managed repo's listing of open `label` issues; an incomplete one
-/// leaves the repo out (a partial listing would read as issues arriving or
-/// leaving).
-async fn label_listings(roots: &[(PathBuf, String)], label: &'static str) -> Curated {
+/// Each managed repo's listing of open `label` issues, with its eligible
+/// count; an incomplete one leaves the repo out (a partial listing would read
+/// as issues arriving or leaving).
+async fn label_listings(
+    roots: &[(PathBuf, String)],
+    label: &'static str,
+) -> (Curated, BTreeMap<String, u32>) {
     let mut out = Curated::new();
+    let mut eligible = BTreeMap::new();
     for (root, slug) in roots {
         let root = root.clone();
         let result = tokio::task::spawn_blocking(move || {
             let gh = PathBuf::from(crate::gh_invocation::gh_bin());
-            label_listing_with(&gh, &root, None, label)
+            label_listing_counted_with(&gh, &root, None, label)
         })
         .await;
         match result {
-            Ok(Ok(listing)) => {
+            Ok(Ok((listing, count))) => {
                 out.insert(slug.clone(), listing);
+                eligible.insert(slug.clone(), count);
             }
             Ok(Err(error)) => {
                 log::debug!("fleet.state: {label} listing of {slug} incomplete: {error:#}");
@@ -318,7 +356,7 @@ async fn label_listings(roots: &[(PathBuf, String)], label: &'static str) -> Cur
             }
         }
     }
-    out
+    (out, eligible)
 }
 
 /// The priority level the planner ranked `row` on (0 default, 1
@@ -619,7 +657,7 @@ pub(super) async fn gather(
     slug_cache: &mut HashMap<String, String>,
     host_id: &str,
     now: DateTime<Utc>,
-) -> (FleetInput, Reused, Curated, Curated) {
+) -> (FleetInput, Reused, Curated, Curated, BTreeMap<String, (u32, u32)>) {
     // Resolves every provisioned root, so the registries' roots are cached.
     let roots = managed_roots(workspace_pool, slug_cache).await;
     let managed: BTreeSet<String> = roots.iter().map(|(_, slug)| slug.clone()).collect();
@@ -627,8 +665,15 @@ pub(super) async fn gather(
         slug_cache.get(root).map(|s| s.to_ascii_lowercase())
     });
     let listings = review_listings(&roots).await;
-    let curated = label_listings(&roots, super::outcomes::CURATED_LABEL).await;
-    let triage = label_listings(&roots, super::outcomes::close::TRIAGE_LABEL).await;
+    let (curated, curated_eligible) = label_listings(&roots, super::outcomes::CURATED_LABEL).await;
+    let (triage, triage_eligible) =
+        label_listings(&roots, super::outcomes::close::TRIAGE_LABEL).await;
+    // `(awaiting_curation, awaiting_approval)` for each repo whose triage AND
+    // curated listings were both read whole (#11955).
+    let eligible: BTreeMap<String, (u32, u32)> = triage_eligible
+        .into_iter()
+        .filter_map(|(repo, t)| curated_eligible.get(&repo).map(|c| (repo, (t, *c))))
+        .collect();
     let ready = ready_queue(&managed, slug_cache).await;
     let main_ci = with_red_holds(
         main_ci_by_slug(
@@ -669,7 +714,7 @@ pub(super) async fn gather(
         listings,
         ready,
     };
-    (input, reused, curated, triage)
+    (input, reused, curated, triage, eligible)
 }
 
 /// A tick pass's input (#11161): the registries and the work finder's last

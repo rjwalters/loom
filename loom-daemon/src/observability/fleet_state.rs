@@ -64,9 +64,9 @@ use serde_json::Value;
 use super::queue::{DurableQueue, FanoutQueue, QueueSink};
 use crate::telemetry::kinds::fleet_state::{
     split_into_chunks, CuratorState, FleetCapacity, FleetEligibleReason, FleetHoldKind,
-    FleetPrCensus, FleetQueueFlow, FleetRepoHalt, FleetSlot, FleetSlots, FleetStage,
-    FleetStateRecord, FleetStateRepo, FleetStateRow, MainCi, MergeBlockedReason, PlannerStamps,
-    ANCHOR_INTERVAL_SECS, CHUNK_BYTES, FLEET_STATE_SCHEMA,
+    FleetPrCensus, FleetQueueDepth, FleetQueueFlow, FleetRepoHalt, FleetSlot, FleetSlots,
+    FleetStage, FleetStateRecord, FleetStateRepo, FleetStateRow, MainCi, MergeBlockedReason,
+    PlannerStamps, ANCHOR_INTERVAL_SECS, CHUNK_BYTES, FLEET_STATE_SCHEMA,
 };
 use crate::telemetry::{RepoVisibility, SweepStartFacts, TelemetryEnvelope, TelemetryRecord};
 
@@ -384,6 +384,9 @@ pub struct RepoView {
     pub triage_flow: Option<FleetQueueFlow>,
     /// The Curator role-runner's cadence and last run for the repo (#11642).
     pub curator: Option<CuratorState>,
+    /// The repo's pending-human queue depth (#11955). Absent = unknown, never
+    /// zero.
+    pub pending_queue: Option<FleetQueueDepth>,
 }
 
 /// The full state at one pass, before visibility tagging.
@@ -759,6 +762,7 @@ fn repo_entry(view: &FleetView, repo: &str, census: Option<FleetPrCensus>) -> Fl
         triage_depth: state.and_then(|r| r.triage_depth),
         triage_flow: state.and_then(|r| r.triage_flow),
         curator: state.and_then(|r| r.curator.clone()),
+        pending_queue: state.and_then(|r| r.pending_queue),
         census,
         ready_complete,
         ready_replace: !ready_complete,
@@ -862,6 +866,7 @@ pub fn decide(
             && now_state.triage_depth == was.triage_depth
             && now_state.triage_flow == was.triage_flow
             && now_state.curator == was.curator
+            && now_state.pending_queue == was.pending_queue
             && view.ready_complete(repo) == last.view.ready_complete(repo)
         {
             continue;
@@ -954,6 +959,9 @@ struct PassState {
     flow: QueueFlowTracker,
     /// Per-repo `loom:triage` arrival/drain history (#11642).
     triage_flow: QueueFlowTracker,
+    /// Per-repo `(awaiting_curation, awaiting_approval)` eligible counts of the
+    /// last collector pass that read both listings whole (#11955).
+    eligible: BTreeMap<String, (u32, u32)>,
 }
 
 static STATE: Mutex<PassState> = Mutex::new(PassState {
@@ -962,6 +970,7 @@ static STATE: Mutex<PassState> = Mutex::new(PassState {
     enrich: enrich::EnrichMemory::new(),
     flow: QueueFlowTracker::new(QUEUE_FLOW_WINDOW_SECS),
     triage_flow: QueueFlowTracker::new(QUEUE_FLOW_WINDOW_SECS),
+    eligible: BTreeMap::new(),
     outcomes: outcomes::Memory {
         listed: BTreeMap::new(),
         unread: BTreeMap::new(),
@@ -1105,7 +1114,7 @@ pub(super) async fn record(
     };
     let _pass = pass_lock().lock().await;
     let now = Utc::now();
-    let (input, mut reused, curated, triage) =
+    let (input, mut reused, curated, triage, eligible) =
         sources::gather(workspace_root, workspace_pool, slug_cache, &sink.host_id, now).await;
     // The complete `loom:triage` sets this pass read, before `triage` is moved
     // into the outcome diff (#11642). Every repo present was read whole.
@@ -1137,6 +1146,9 @@ pub(super) async fn record(
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         annotate_flow(&mut view, &mut live.flow, input.ready.as_ref(), now);
         annotate_triage(&mut view, &mut live.triage_flow, Some(&triage_sets), now);
+        // A repo whose listing was incomplete this pass drops out: unknown.
+        live.eligible = eligible;
+        annotate_pending(&mut view, &live.eligible);
     }
     for repo in view.repos.keys().chain(&input.managed) {
         if !reused.visibility.contains_key(repo) {
@@ -1172,6 +1184,7 @@ async fn record_tick(workspace_root: &Path, workspace_pool: &crate::workspace_po
         // No forge read on a tick pass: re-stamp triage from the tracker's
         // last collector-pass observation (#11642).
         annotate_triage(&mut view, &mut live.triage_flow, None, now);
+        annotate_pending(&mut view, &live.eligible);
     }
     send(sink, workspace_root, view, state, now, &reused);
 }
@@ -1237,6 +1250,58 @@ fn annotate_triage(
         let state = view.repos.entry(repo.to_string()).or_default();
         state.triage_depth = Some(depth);
         state.triage_flow = tracker.flow(repo, now);
+    }
+}
+
+/// Distinct items under an operator hold in `repo` (#11955): hold rows of an
+/// operator kind plus `merge_hold` rows, and any `merge_hold` PRs the census
+/// counts that have no issue row (so a PR seen both ways counts once). `None`
+/// when the repo's PR census was not read whole. Pure.
+fn operator_held(repo: &RepoView) -> Option<u32> {
+    let census = repo.census.as_ref()?;
+    let is_operator = |kind: Option<FleetHoldKind>| {
+        matches!(
+            kind,
+            Some(
+                FleetHoldKind::Operator
+                    | FleetHoldKind::OperatorOnly
+                    | FleetHoldKind::OperatorDecision
+            )
+        )
+    };
+    let merge_hold_rows = repo
+        .rows
+        .values()
+        .filter(|row| row.stage == FleetStage::MergeHold)
+        .count();
+    let held_rows = repo
+        .rows
+        .values()
+        .filter(|row| row.stage == FleetStage::MergeHold || is_operator(row.hold_kind))
+        .count();
+    let census_merge_hold = census
+        .by_stage
+        .get(FleetStage::MergeHold.as_str())
+        .copied()
+        .unwrap_or(0);
+    let unrowed = usize::try_from(census_merge_hold)
+        .unwrap_or(usize::MAX)
+        .saturating_sub(merge_hold_rows);
+    Some(u32::try_from(held_rows + unrowed).unwrap_or(u32::MAX))
+}
+
+/// Stamp each repo with its pending-human queue depth (#11955) from the last
+/// complete collector-pass eligible counts; a repo with no entry in
+/// `eligible` (an incomplete or unread listing) is left `None`, never zero.
+/// Both passes call this so the fact is stable between forge reads.
+fn annotate_pending(view: &mut FleetView, eligible: &BTreeMap<String, (u32, u32)>) {
+    for (repo, (curation, approval)) in eligible {
+        let state = view.repos.entry(repo.clone()).or_default();
+        state.pending_queue = Some(FleetQueueDepth {
+            awaiting_curation: *curation,
+            awaiting_approval: *approval,
+            operator_held: operator_held(state),
+        });
     }
 }
 
@@ -1328,3 +1393,8 @@ mod queue_flow_tests;
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[path = "fleet_state/triage_flow_tests.rs"]
 mod triage_flow_tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[path = "fleet_state/pending_queue_tests.rs"]
+mod pending_queue_tests;
