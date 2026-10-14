@@ -83,7 +83,6 @@ pub fn tick_summary(
         skipped_quarantined: report.skipped_quarantined,
         skipped_workspace_commands_missing: report.skipped_workspace_commands_missing,
         skipped_pr_open: report.skipped_pr_open,
-        skipped_peer_claim: report.skipped_peer_claim,
         skipped_backoff: report.skipped_backoff,
         skipped_pr_open_backoff: report.skipped_pr_open_backoff,
         skipped_noop_cooldown: report.skipped_noop_cooldown,

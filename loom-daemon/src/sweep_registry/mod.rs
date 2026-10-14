@@ -78,7 +78,6 @@
 
 use crate::capacity;
 use crate::event_bus::EventBus;
-use crate::peer_claims::{self, ClaimAd, PeerClaimView};
 use crate::telemetry;
 #[cfg(test)]
 use crate::tokens_pool::bad_tokens;
@@ -122,7 +121,6 @@ mod fast_fail_fleet;
 mod fast_fail_park;
 mod frozen_write;
 mod guards;
-mod heartbeat_broadcast;
 mod journal_shadow;
 mod landed_guard;
 mod lease_episode;
@@ -136,7 +134,6 @@ mod resolved_facts;
 // `pub`: the daemon-hold record contract (`is_daemon_hold`, #10161) is read
 // by the stale-blocked readers (#10556, #10558).
 pub mod park_hold;
-mod pool_hold_broadcast;
 mod prepared_dispatch;
 pub use prepared_dispatch::PreparedIssueDispatch;
 pub(crate) mod private_dispatch;
@@ -543,37 +540,21 @@ pub struct SweepRegistry {
     /// enabled (Issue #4085, Phase 0 of #4028; upgraded from detection-only
     /// into enforcement by #5789). When `true`, [`dispatch`](Self::dispatch)
     /// issues a pre-flip `gh issue view --json labels` read, and a confirmed
-    /// collision now backs off the dispatch (reverting the claim lock and any
-    /// peer-claim advertisement already published) instead of proceeding
-    /// unchanged. Off by default (the probe adds one extra API round-trip);
+    /// collision now backs off the dispatch (reverting the claim lock)
+    /// instead of proceeding unchanged. Off by default (the probe adds one extra API round-trip);
     /// `main.rs` / [`WorkspacePool`] set the resolved env > config > default
     /// value.
     ///
     /// [`WorkspacePool`]: crate::workspace_pool::WorkspacePool
     detect_collisions: bool,
     /// Cumulative count of cross-host dispatch collisions this registry has
-    /// observed — both from the opt-in pre-flip forge-label read (Issue #4085:
+    /// observed from the opt-in pre-flip forge-label read (Issue #4085:
     /// `loom:issue` already gone, or `loom:building` already present, before
-    /// this host's own flip) and from the always-on in-memory peer-claim guard
-    /// (Issue #4028/#5789: a peer host's soft-claim advertisement was already
-    /// live). Every increment corresponds to a dispatch this host backed off
-    /// rather than duplicated (#5789 upgraded both signals from detection-only
-    /// into enforcement). Surfaced to operators via the work-finder's per-tick
+    /// this host's own flip). Every increment corresponds to a dispatch this
+    /// host backed off rather than duplicated (#5789 upgraded the signal from
+    /// detection-only into enforcement). Surfaced to operators via the work-finder's per-tick
     /// summary line. Monotonic for the life of the process.
     collision_count: u64,
-    /// Outbound peer-claim advertiser (Issue #4028). When present, [`dispatch`](Self::dispatch)
-    /// publishes an `advertise` ad **before** the (non-atomic) label flip and
-    /// [`emit_event`](Self::emit_event) publishes a `retract` ad on a terminal
-    /// sweep outcome, both over the shared safehouse room via a bounded
-    /// non-blocking `try_send`. `None` (the default) is a **byte-for-byte no-op**:
-    /// no channel, no ad, no syscalls — set only when `safehouse.enabled` is true.
-    peer_claim_publisher: Option<tokio::sync::mpsc::Sender<ClaimAd>>,
-    /// Inbound peer-claim view (Issue #4028), shared with the safehouse
-    /// coordination task that feeds it. When present, [`peer_claimed_issues`](Self::peer_claimed_issues)
-    /// returns the issues a peer host has advertised as in-flight (TTL-bounded),
-    /// which the work-finder skips. `None` (default) ⇒ the work-finder sees an
-    /// empty set (no behavior change).
-    peer_claims: Option<Arc<Mutex<PeerClaimView>>>,
     /// Workspace-level claude-wrapper pre-flight-death tripwire parameters
     /// (Issue #4386). `main.rs` / [`crate::workspace_pool::WorkspacePool`] set
     /// the resolved env > config > default value at provision time, mirroring
@@ -865,7 +846,7 @@ pub struct SweepRegistry {
 /// `yes`/`on` (case-insensitive) restores raw publishing; anything else,
 /// including unset, keeps the opaque default. This ONLY changes what gets
 /// PUBLISHED to the forge — [`host_identity()`], and every other
-/// consumer of it (peer-claim advertisements, collision-detection log lines,
+/// consumer of it (collision-detection log lines,
 /// the fleet dashboard, telemetry), is unaffected: those channels are not a
 /// public issue-tracker comment. See `defaults/docs/lease-record.md` for the
 /// resolution recipe an operator uses to map a published `host-XXXXXXXX` id
@@ -1038,8 +1019,6 @@ impl SweepRegistry {
             test_force_rate_limited: false,
             detect_collisions: false,
             collision_count: 0,
-            peer_claim_publisher: None,
-            peer_claims: None,
             preflight_tripwire_config: PreflightTripwireConfig::default(),
             preflight_death_streak: 0,
             preflight_death_last_marker: None,
@@ -1405,17 +1384,6 @@ impl SweepRegistry {
     /// repos' issue #N — the topic string is unchanged; `repo` lives in the
     /// payload only.
     pub(crate) fn emit_event(&self, mut event: Event) {
-        // Peer-claim early retraction (Issue #4028): a terminal outcome for one
-        // of THIS host's sweeps retracts its soft claim over the room so peers
-        // free the issue before its TTL would lapse. Centralized here so every
-        // Exited/Crashed emit site is covered by one insertion. Best-effort /
-        // non-blocking / fail-open (a no-op when no publisher is attached).
-        match &event {
-            Event::SweepExited { issue, .. } | Event::SweepCrashed { issue, .. } => {
-                self.publish_peer_claim(peer_claims::ClaimKind::Retract, *issue);
-            }
-            _ => {}
-        }
         event.set_repo_if_absent(&self.config.workspace_root.display().to_string());
         if let Some(ref bus) = self.bus {
             let topic = event.topic();
@@ -1661,10 +1629,8 @@ mod tests {
         inner();
     }
 
-    /// The `UNKNOWN_HOST` constant peer-claim self-recognition special-cases
-    /// (Issue #5063) must be the literal string `host_identity()` falls back
-    /// to — a drift between the two would silently reopen the self-match
-    /// hole `peer_claims::observe_at` closes.
+    /// The `UNKNOWN_HOST` constant (Issue #5063) must be the literal string
+    /// `host_identity()` falls back to.
     #[test]
     fn unknown_host_constant_matches_the_final_fallback() {
         assert_eq!(UNKNOWN_HOST, "unknown-host");

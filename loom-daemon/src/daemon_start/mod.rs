@@ -43,7 +43,7 @@
 //! | [`unescape`] | what `printf '%b'` did to the harvested values |
 //! | [`marker`] | `write_intent_marker` |
 //! | [`watchdog_job`] | the three `provision_watchdog_job_*` tiers + the #5343 heal |
-//! | [`advisories`] | `print_safehouse_status`, `print_calibrate_hint`, the host-sleep check |
+//! | [`advisories`] | `print_calibrate_hint`, the host-sleep check |
 //! | [`launch`] | the launchd / systemd / nohup start paths |
 //! | [`platform`] | the label/domain/unit resolvers the lifecycle scripts share |
 //! | [`supervision_dropin`] | none: the daemon's startup systemd drop-in (#11111) |

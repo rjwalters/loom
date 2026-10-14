@@ -36,7 +36,6 @@ pub fn worth_logging(report: &TickReport) -> bool {
         || report.skipped_recheck_interval > 0
         || report.skipped_host_constraint > 0
         || report.skipped_pr_open > 0
-        || report.skipped_peer_claim > 0
         || report.deferred_ramp_cap > 0
         || report.deferred_saturation > 0
         || report.deferred_repo_cap > 0
@@ -56,7 +55,6 @@ pub fn render(report: &TickReport, t: &TickLine<'_>) -> String {
          {} recheck-interval-skip, \
          {} host-constraint-skip, \
          {} pr-open-skip, \
-         {} peer-claim-skip, \
          {} deferred (capacity), {} deferred (ramp), \
          {} deferred (host saturated), \
          {} deferred (repo cap, #9090), {} deferred (build back-off, #9410), \
@@ -85,7 +83,6 @@ pub fn render(report: &TickReport, t: &TickLine<'_>) -> String {
         report.skipped_recheck_interval,
         report.skipped_host_constraint,
         report.skipped_pr_open,
-        report.skipped_peer_claim,
         report.deferred_capacity,
         report.deferred_ramp_cap,
         report.deferred_saturation,

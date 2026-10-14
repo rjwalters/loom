@@ -598,10 +598,6 @@ fn daemon_write_paths_are_scoped() {
             OperatorOnly("library half of `consolidate-reconcile`, reached only via the CLI verb above"),
         ),
         (
-            "watchdog/peer_coord.rs",
-            NotAWrite("follow-up on the issue this watchdog filed"),
-        ),
-        (
             "forge_probe.rs",
             NotAWrite(
                 "the hosted-trial probe writes to the candidate instance's disposable \

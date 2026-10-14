@@ -191,7 +191,7 @@ There is no key classification and no allow-list: `loom-daemon validate` and
 them (the classification layer added in #11441 was removed in #11739).
 
 The install template (`defaults/config.json`) seeds no fleet-wide keys
-(`autonomous`, `runtimes`, `safehouse`, `offlineMode`, ...), so a fresh install
+(`autonomous`, `runtimes`, `offlineMode`, ...), so a fresh install
 resolves them from tier 1. An older install may still carry template-seeded
 copies in its `.loom/config.json`; the reinstall merge keeps them (existing
 values win). To let the fleet value apply to such a repo, delete the key from
@@ -216,14 +216,14 @@ attempted here.
 A related, distinct failure shape: `.loom/config.json` is **tracked and
 shared**, but some keys are inherently true of exactly one host — a
 filesystem path, a socket, an on/off switch that depends on how that
-specific machine is provisioned (`safehouse.socket`, `observability.ingestKeyFile`,
+specific machine is provisioned (`observability.ingestKeyFile`,
 `worktree.root`). Committing one of these bakes one host's local truth into
 every other host's `git pull`, and it has recurred repeatedly: #5354 and
 #5464 each fixed one committed instance reactively, and #6499 showed the
 sharpest failure mode — an abandoned `git stash pop` left live conflict
 markers straddling a host's local patch and the tracked file, which then got
 **committed**, making `.loom/config.json` invalid JSON and silently dropping
-`observability`/`safehouse`/`autonomous.roleRunner` config to built-in
+`observability`/`autonomous.roleRunner` config to built-in
 defaults for ~70 minutes.
 
 **The fix is structural, not a one-time cleanup:**

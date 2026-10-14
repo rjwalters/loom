@@ -1308,24 +1308,24 @@ else
 fi
 
 # #11323: the mirror image of #5991 -- a binary built BEFORE a pattern was
-# REMOVED from source still emits it (febfc4335 re-added `.loom/concierge/`).
+# REMOVED from source still emits it (febfc4335 re-added a removed pattern).
 # The guard must drop it so the result is byte-identical to a fresh binary's.
 echo "Test group 12p: gitignore refresh DROPS an extra pattern a stale binary re-adds after source removed it (#11323)"
 REPO="$(make_fixture)"; write_fake_post_init "$REPO"
-run_with_stale_bin "$REPO" ".loom-in-use" ".loom/concierge/" ".fake-newly-added-pattern/"
+run_with_stale_bin "$REPO" ".loom-in-use" ".loom/retired-dir/" ".fake-newly-added-pattern/"
 cp "$REPO/.gitignore" "$WORKDIR/gi-stale-11323"; STALE_OUT="$OUT"; STALE_RC=$RC
 REPO="$(make_fixture)"; write_fake_post_init "$REPO"
 run_with_stale_bin "$REPO" ".loom-in-use" ".fake-newly-added-pattern/"
 if [[ $STALE_RC -eq 0 ]] && cmp -s "$WORKDIR/gi-stale-11323" "$REPO/.gitignore" && \
-      grep -qi "WITH 1 extra pattern" <<<"$STALE_OUT" && grep -qF "    .loom/concierge/" <<<"$STALE_OUT"; then
+      grep -qi "WITH 1 extra pattern" <<<"$STALE_OUT" && grep -qF "    .loom/retired-dir/" <<<"$STALE_OUT"; then
     pass "(#11323) the extra pattern was named in a warning and dropped: .gitignore is byte-identical to the source-generated one"
 else
     fail "(#11323) a stale binary's re-added pattern was not warned about and dropped (rc=$STALE_RC)"
 fi
 # No source pattern list (stripped install source) = cannot verify: hands off.
 REPO="$(make_fixture)"
-run_with_stale_bin "$REPO" ".loom-in-use" ".loom/concierge/"
-if grep -qxF ".loom/concierge/" "$REPO/.gitignore"; then
+run_with_stale_bin "$REPO" ".loom-in-use" ".loom/retired-dir/"
+if grep -qxF ".loom/retired-dir/" "$REPO/.gitignore"; then
     pass "(#11323) without a source post_init.rs the managed block is left untouched"
 else
     fail "(#11323) the guard rewrote the block although no source pattern list was available"

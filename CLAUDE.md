@@ -309,7 +309,6 @@ Completed-migration history lives in
 
 - **Roles**: `.loom/roles/*.md` · **Labels**: `.github/labels.yml` · **Scripts**: `.loom/scripts/`
 - **Docs**: [daemon-reference](.loom/docs/daemon-reference.md) · [token-pool](.loom/docs/token-pool.md) · [troubleshooting](.loom/docs/troubleshooting.md) ·
-  [safehouse](.loom/docs/safehouse.md) ·
   [forge-auth](.loom/docs/forge-authentication.md) / [github-auth](.loom/docs/github-authentication.md) ·
   [blame-issue](.loom/docs/blame-issue.md) · [fleet-config-lifecycle](.loom/docs/fleet-config-lifecycle.md) · [verification-recipes](.loom/docs/verification-recipes.md)
 

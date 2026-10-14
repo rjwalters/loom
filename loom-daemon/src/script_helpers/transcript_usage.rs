@@ -5,8 +5,7 @@
 //! drift apart about what a record cost:
 //!
 //! - [`super::sweep_experiment::sum_transcript_usage_by_model`] folds them into
-//!   per-`(model, speed, service_tier)` totals for the safehouse completion
-//!   feed and `sweep.outcome` (#5740).
+//!   per-`(model, speed, service_tier)` totals for `sweep.outcome` (#5740).
 //! - [`crate::activity::transcript_ingest`] folds them — deduped on
 //!   `message.id` — into `activity.db`'s `resource_usage` rows (#8059).
 //!

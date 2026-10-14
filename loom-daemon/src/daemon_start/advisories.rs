@@ -1,9 +1,4 @@
-//! The two advisory lines a successful start prints, plus the config resolver
-//! they share.
-//!
-//! Neither can fail a start. `print_safehouse_status` is a purely **static**,
-//! pre-connect check — "would the daemon even try?" — because proving a live
-//! connection needs the daemon's own socket, which `loom-daemon status` covers.
+//! The advisory line a successful start prints. It cannot fail a start:
 //! `print_calibrate_hint` is bounded and silent on every error.
 
 use std::path::Path;
@@ -19,10 +14,7 @@ use super::platform;
 /// drop, and both are observable:
 ///
 /// * **No `jq` ⇒ the default.** The shell resolver short-circuits before
-///   reading anything. On a host without `jq`, `safehouse.enabled` therefore
-///   resolved to `false` and the start printed "not configured" no matter what
-///   the file said. Resolving it natively here would make this line say
-///   something new on exactly the hosts least able to explain why.
+///   reading anything.
 /// * **An empty value ⇒ the default.** `[[ -z "$value" ]]` cannot tell an
 ///   explicit `""` from a missing key.
 fn config_get(repo_root: &Path, dotted: &str, default: &str) -> String {
@@ -40,98 +32,6 @@ fn config_get(repo_root: &Path, dotted: &str, default: &str) -> String {
         default.to_string()
     } else {
         rendered
-    }
-}
-
-/// `_loom_mcp_truthy` — lower-cased, whitespace-stripped, then `1|true|yes|on`.
-fn mcp_truthy(raw: &str) -> bool {
-    let normalised: String = raw
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .flat_map(char::to_lowercase)
-        .collect();
-    matches!(normalised.as_str(), "1" | "true" | "yes" | "on")
-}
-
-fn safehouse_enabled(repo_root: &Path) -> bool {
-    // `${VAR+set}` — an explicitly EMPTY value disables, matching the daemon's
-    // own `env_bool`. `var_os().is_some()` is the same test.
-    if let Some(v) = std::env::var_os("LOOM_SAFEHOUSE_ENABLED") {
-        return mcp_truthy(&v.to_string_lossy());
-    }
-    mcp_truthy(&config_get(repo_root, "safehouse.enabled", "false"))
-}
-
-fn safehouse_socket(repo_root: &Path) -> String {
-    for name in ["LOOM_SAFEHOUSE_SOCKET", "SAFEHOUSED_SOCKET"] {
-        if let Ok(v) = std::env::var(name) {
-            if !v.is_empty() {
-                return v;
-            }
-        }
-    }
-    let cfg = config_get(repo_root, "safehouse.socket", "");
-    if !cfg.is_empty() && cfg != "null" {
-        return cfg;
-    }
-    String::new()
-}
-
-/// `print_safehouse_status()` (#4345, caveat #4464/#4225).
-pub fn print_safehouse_status(repo_root: &Path) {
-    if !safehouse_enabled(repo_root) {
-        out::say("Safehouse:     not configured (safehouse.enabled is false/absent)");
-        return;
-    }
-    let socket = safehouse_socket(repo_root);
-    if socket.is_empty() {
-        out::warn(
-            "Safehouse:     configured, unreachable (enabled but no socket path resolved -- set safehouse.socket, $LOOM_SAFEHOUSE_SOCKET, or $SAFEHOUSED_SOCKET)",
-        );
-        return;
-    }
-    if is_socket(&socket) {
-        out::ok(&format!(
-            "Safehouse:     configured (socket present at {socket}) -- see 'loom-daemon status' for live connection state"
-        ));
-        // #4464: omitting `safehouse.room` is only valid when safehoused joined
-        // exactly ONE room. #4225: attention-class routing can supply the room
-        // instead via `safehouse.rooms.signal`, so the caveat must not fire for
-        // a host that set only that.
-        let room = env_or_config(repo_root, "LOOM_SAFEHOUSE_ROOM", "safehouse.room");
-        let signal =
-            env_or_config(repo_root, "LOOM_SAFEHOUSE_ROOM_SIGNAL", "safehouse.rooms.signal");
-        if room.is_empty() && signal.is_empty() {
-            out::say(
-                "               note: safehouse.room is unset (and so is safehouse.rooms.signal) -- valid only if safehoused joined exactly one room; a multi-room host needs an explicit room id or every send is rejected",
-            );
-        }
-    } else {
-        out::warn(&format!(
-            "Safehouse:     configured, unreachable (socket {socket} does not exist -- is safehoused running?)"
-        ));
-    }
-}
-
-/// `${ENV:-$(loom_config_get …)}` — an empty env value falls through to config.
-fn env_or_config(repo_root: &Path, env_name: &str, dotted: &str) -> String {
-    match std::env::var(env_name) {
-        Ok(v) if !v.is_empty() => v,
-        _ => config_get(repo_root, dotted, ""),
-    }
-}
-
-/// `[[ -S "$socket" ]]`.
-fn is_socket(path: &str) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::FileTypeExt;
-        std::fs::metadata(path).is_ok_and(|m| m.file_type().is_socket())
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        false
     }
 }
 
@@ -317,25 +217,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn truthy_matches_the_shells_normalisation() {
-        for v in ["1", "TRUE", " yes ", "On"] {
-            assert!(mcp_truthy(v), "{v}");
-        }
-        for v in ["", "0", "false", "enabled", "y"] {
-            assert!(!mcp_truthy(v), "{v}");
-        }
-    }
-
-    #[test]
     fn an_empty_config_value_falls_back_to_the_default() {
-        // `[[ -z "$value" ]]` could not tell `""` from a missing key, and the
-        // safehouse socket resolution depends on that.
+        // `[[ -z "$value" ]]` could not tell `""` from a missing key.
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(dir.path().join(".loom")).expect("mkdir");
-        std::fs::write(dir.path().join(".loom/config.json"), r#"{"safehouse": {"socket": ""}}"#)
+        std::fs::write(dir.path().join(".loom/config.json"), r#"{"host": {"preventSleep": ""}}"#)
             .expect("write");
         if platform::have("jq") {
-            assert_eq!(config_get(dir.path(), "safehouse.socket", "fallback"), "fallback");
+            assert_eq!(config_get(dir.path(), "host.preventSleep", "fallback"), "fallback");
         }
     }
 }

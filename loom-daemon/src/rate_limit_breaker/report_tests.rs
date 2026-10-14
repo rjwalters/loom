@@ -140,7 +140,7 @@ fn installation_graphql_reset_selected_over_healthy_ambient_user() {
         Some(snapshot(HEALTHY.0, HEALTHY.1)),
     );
     let h = handle(&b, probe.clone(), ProbeMode::Inline);
-    let r = report_failure(&h, PRIMARY_GQL, "safehouse", installation_ctx(), t(0));
+    let r = report_failure(&h, PRIMARY_GQL, "fleet_alert", installation_ctx(), t(0));
     assert_eq!(until_of(r), t(1500));
     assert_eq!(b.snapshot(t(1)).graphql_remaining, Some(0));
 }
@@ -399,7 +399,7 @@ fn background_mode_trips_immediately_and_refines_off_thread() {
     });
     let h = handle(&b, probe.clone(), ProbeMode::Background);
     let started = std::time::Instant::now();
-    let r = report_failure(&h, PRIMARY_GQL, "safehouse", installation_ctx(), t(0)).unwrap();
+    let r = report_failure(&h, PRIMARY_GQL, "fleet_alert", installation_ctx(), t(0)).unwrap();
     assert!(
         started.elapsed() < std::time::Duration::from_millis(300),
         "caller never waits on the probe"

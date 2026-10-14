@@ -121,7 +121,6 @@ fn no_plan_step_runs_a_full_daemon_start() {
     let secrets = Secrets {
         pat: Some("pat".to_string()),
         accounts_env: Some("ACCOUNT_EMAIL_1=a@b.c".to_string()),
-        ..Secrets::default()
     };
     let plan = build_plan(&tests::base_config(), &secrets);
     for entry in &plan.entries {

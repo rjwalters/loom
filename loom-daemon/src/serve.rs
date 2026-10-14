@@ -2666,7 +2666,6 @@ mod tests {
                 "queues",
                 "throughput",
                 "operator_attention",
-                "peer_coordination",
                 "stale_sweeps",
                 "auto_update",
                 "worktree_reaper",

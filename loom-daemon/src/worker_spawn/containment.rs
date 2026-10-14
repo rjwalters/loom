@@ -329,7 +329,6 @@ fn forwarded_by_name(name: &str) -> bool {
         return false;
     }
     name.starts_with("LOOM_")
-        || name.starts_with("SAFEHOUSE")
         || matches!(
             name,
             "GH_TOKEN"

@@ -613,11 +613,8 @@ pub struct SweepCompletedRecord {
     /// Terminal result.
     pub result: SweepResult,
     /// Per-`(model, speed, service_tier)` token totals for this sweep
-    /// (Issue #6384), matching the shape the safehouse `completion-v1`
-    /// envelope's `tokens_by_model` already carries (see
-    /// [`crate::safehouse::fetch_transcript_tokens_by_model`] /
-    /// [`crate::transcript_tokens::sum_sweep_tokens_by_model`]) so the two
-    /// paths report identical per-sweep token data. Additive: omitted
+    /// (Issue #6384), as summed by
+    /// [`crate::transcript_tokens::sum_sweep_tokens_by_model`]. Additive: omitted
     /// (never an empty vec, never a fabricated zero) when no attributable
     /// transcript was found for this sweep, same "unknown != zero"
     /// contract [`SweepOutcomeRecord::tokens_in`]/`tokens_out` already use.

@@ -133,33 +133,9 @@ impl HostState {
     }
 }
 
-/// Cheap best-effort probe for a `safehoused` process on a host.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SafehousedProbe {
-    /// The probe positively found a running `safehoused`.
-    Present,
-    /// The probe ran and found none.
-    Absent,
-    /// The probe could not run conclusively (host unreachable, timed out, or
-    /// not attempted) — degrade to "unknown" rather than erroring the row.
-    Unknown,
-}
-
-impl SafehousedProbe {
-    #[must_use]
-    pub fn label(self) -> &'static str {
-        match self {
-            SafehousedProbe::Present => "present",
-            SafehousedProbe::Absent => "absent",
-            SafehousedProbe::Unknown => "unknown",
-        }
-    }
-}
-
-/// The local host's own tailnet self-check result (#4952). Mirrors
-/// [`SafehousedProbe`]'s three-way shape — a cheap best-effort probe that
-/// must never fail the whole report — but is explicitly **local-only**: run
+/// The local host's own tailnet self-check result (#4952): a cheap
+/// best-effort, three-way probe that must never fail the whole report, and
+/// explicitly **local-only**: run
 /// once, in-process (never over SSH), only when
 /// [`all_tailnet_hosts_unreachable`] flags every tailnet-addressed remote
 /// roster host as [`HostState::Unreachable`]. That pattern (every tailnet
@@ -230,8 +206,6 @@ pub struct HostReport {
     /// message, parse error, …).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
-    /// Cheap `safehoused` presence probe.
-    pub safehoused: SafehousedProbe,
 }
 
 impl HostReport {
@@ -250,7 +224,6 @@ impl HostReport {
             workspaces: Vec::new(),
             status: Some(status),
             detail: None,
-            safehoused: SafehousedProbe::Unknown,
         }
     }
 
@@ -269,7 +242,6 @@ impl HostReport {
             workspaces: Vec::new(),
             status: None,
             detail: Some(detail),
-            safehoused: SafehousedProbe::Unknown,
         }
     }
 
@@ -289,7 +261,6 @@ impl HostReport {
             detail: Some(
                 "drain in progress (fleet drain) — host stays visible until removed".to_string(),
             ),
-            safehoused: SafehousedProbe::Unknown,
         }
     }
 }
@@ -299,7 +270,7 @@ impl HostReport {
 // ===========================================================================
 
 /// The seam between per-host collection and the network: fetch a remote
-/// worker's `status --json`, and cheaply probe for `safehoused`. The real impl
+/// worker's `status --json`. The real impl
 /// ([`SshStatusSource`]) shells out to `ssh`; tests supply a scripted mock so
 /// the whole merge/render/exit-code path is exercised without a live box.
 ///
@@ -310,10 +281,6 @@ pub trait HostStatusSource: Send + Sync {
     /// Run `loom-daemon status --json` on `ssh_host` and return its captured
     /// output.
     fn fetch_status(&self, ssh_host: &str) -> Result<CommandOutput>;
-
-    /// Best-effort `safehoused` presence probe on `ssh_host`. Never errors —
-    /// an inconclusive probe returns [`SafehousedProbe::Unknown`].
-    fn probe_safehoused(&self, ssh_host: &str) -> SafehousedProbe;
 }
 
 /// The production [`HostStatusSource`]: `ssh -o BatchMode=yes -o
@@ -342,32 +309,9 @@ impl Default for SshStatusSource {
     }
 }
 
-/// Shell probe for `safehoused`: prefers the socket check `resolve_config`
-/// documents (`$SAFEHOUSED_SOCKET`, else the XDG-ish default), falls back to
-/// `pgrep -x safehoused`.
-const SAFEHOUSED_PROBE_SHELL: &str = r#"
-if [ -n "${SAFEHOUSED_SOCKET:-}" ] && [ -S "$SAFEHOUSED_SOCKET" ]; then
-  echo present
-elif [ -S "$HOME/.safehouse/safehoused.sock" ]; then
-  echo present
-elif pgrep -x safehoused >/dev/null 2>&1; then
-  echo present
-else
-  echo absent
-fi
-"#;
-
 impl HostStatusSource for SshStatusSource {
     fn fetch_status(&self, ssh_host: &str) -> Result<CommandOutput> {
         run_ssh(ssh_host, "loom-daemon status --json", self.connect_timeout_secs)
-    }
-
-    fn probe_safehoused(&self, ssh_host: &str) -> SafehousedProbe {
-        match run_ssh(ssh_host, SAFEHOUSED_PROBE_SHELL, self.connect_timeout_secs) {
-            Ok(out) if out.ok() && out.stdout.trim() == "present" => SafehousedProbe::Present,
-            Ok(out) if out.ok() => SafehousedProbe::Absent,
-            _ => SafehousedProbe::Unknown,
-        }
     }
 }
 
@@ -383,8 +327,8 @@ impl HostStatusSource for SshStatusSource {
 /// the shell's non-interactive startup file) happens to include
 /// `$HOME/.local/bin`. Rather than depend on that, every remote command this
 /// module runs is prefixed with the same canonical PATH export line
-/// [`super::add_worker`]'s provisioning steps use, so `loom-daemon` (and, for
-/// the safehouse probe, `pgrep`) resolve deterministically regardless of the
+/// [`super::add_worker`]'s provisioning steps use, so `loom-daemon` resolves
+/// deterministically regardless of the
 /// remote shell's non-interactive PATH.
 fn run_ssh(host: &str, shell: &str, connect_timeout_secs: u64) -> Result<CommandOutput> {
     let remote_command = format!("{}{shell}", path_bootstrap::canonical_path_export_line());
@@ -552,16 +496,6 @@ pub async fn collect_remote_host(
         (state, detail)
     };
 
-    let safehoused = {
-        let src = source.clone();
-        let host = alias.clone();
-        let probe = tokio::task::spawn_blocking(move || src.probe_safehoused(&host));
-        match tokio::time::timeout(timeout, probe).await {
-            Ok(Ok(p)) => p,
-            _ => SafehousedProbe::Unknown,
-        }
-    };
-
     HostReport {
         alias,
         tailnet_name: worker.tailnet_name,
@@ -572,7 +506,6 @@ pub async fn collect_remote_host(
         workspaces: worker.repos,
         status,
         detail,
-        safehoused,
     }
 }
 
@@ -683,7 +616,6 @@ pub async fn collect_fleet_report(
                 workspaces: Vec::new(),
                 status: None,
                 detail: Some(format!("collection task panicked: {join_err}")),
-                safehoused: SafehousedProbe::Unknown,
             }),
         }
     }
@@ -842,8 +774,8 @@ impl FleetStatusReport {
             ));
         }
         out.push_str(&format!(
-            "  {:<20} {:<12} {:<16} {:<8} {:<10} {:<8}\n",
-            "HOST", "STATE", "TAILNET", "IN-FLT", "CAP", "SAFEHSD"
+            "  {:<20} {:<12} {:<16} {:<8} {:<10}\n",
+            "HOST", "STATE", "TAILNET", "IN-FLT", "CAP"
         ));
         out.push_str(&format!("  {:-<80}\n", ""));
         for host in &self.hosts {
@@ -851,13 +783,12 @@ impl FleetStatusReport {
             let in_flight = field_str(&host.status, &["in_flight_count"]);
             let cap = field_str(&host.status, &["dynamic_cap", "effective"]);
             out.push_str(&format!(
-                "  {:<20} {:<12} {:<16} {:<8} {:<10} {:<8}\n",
+                "  {:<20} {:<12} {:<16} {:<8} {:<10}\n",
                 host.alias,
                 host.state.label(),
                 tailnet,
                 in_flight,
                 cap,
-                host.safehoused.label(),
             ));
             if let Some(detail) = &host.detail {
                 out.push_str(&format!("      -> {detail}\n"));
@@ -975,10 +906,6 @@ mod tests {
                     })
                 }
             }
-        }
-
-        fn probe_safehoused(&self, _ssh_host: &str) -> SafehousedProbe {
-            SafehousedProbe::Unknown
         }
     }
 
@@ -1126,7 +1053,6 @@ mod tests {
                     workspaces: Vec::new(),
                     status: None,
                     detail: None,
-                    safehoused: SafehousedProbe::Unknown,
                 },
                 HostReport {
                     alias: "down-host".to_string(),
@@ -1138,7 +1064,6 @@ mod tests {
                     workspaces: Vec::new(),
                     status: None,
                     detail: None,
-                    safehoused: SafehousedProbe::Unknown,
                 },
             ],
             summary: summarize(&[], false),
@@ -1267,7 +1192,6 @@ mod tests {
             workspaces: Vec::new(),
             status: None,
             detail: None,
-            safehoused: SafehousedProbe::Unknown,
         }
     }
 

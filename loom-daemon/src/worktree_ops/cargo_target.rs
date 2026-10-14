@@ -1315,7 +1315,7 @@ mod tests {
         let live = vec![f.worktree.clone()];
         let live_worktrees = || Some(live.clone());
         let resolve = |_: &Path| Some(PathBuf::from("/nowhere/else"));
-        let holders = |_: &Path| vec!["pid 4242 → /vol/cargo-target/debug/safehoused".to_string()];
+        let holders = |_: &Path| vec!["pid 4242 → /vol/cargo-target/debug/svcd".to_string()];
         let removed: RefCell<Vec<PathBuf>> = RefCell::new(Vec::new());
         let remove = |p: &Path| {
             removed.borrow_mut().push(p.to_path_buf());

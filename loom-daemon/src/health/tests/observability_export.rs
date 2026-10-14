@@ -46,11 +46,10 @@ fn a_healthy_exporter_still_renders_no_observability_section() {
     let report = assess(&inputs);
     assert!(report.section("observability").is_none());
     assert_eq!(report.overall, Verdict::Green);
-    // 13 always-present sections: + `peer_coordination` (#6157),
-    // `role_liveness` (#6201), `stale_sweeps` (#7529), `auto_update`
+    // 12 always-present sections: + `role_liveness` (#6201), `stale_sweeps` (#7529), `auto_update`
     // (#7584), `worktree_reaper` (#7590), `pool_hold` (#7990), and
     // `operator_attention` (#8091).
-    assert_eq!(report.sections.len(), 13);
+    assert_eq!(report.sections.len(), 12);
 }
 
 #[test]

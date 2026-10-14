@@ -102,7 +102,6 @@ test-docs-worktree.sh
 test-epic-label-preserved-on-escalation.sh
 test-extract-capability-markers.sh
 test-filing-lock.sh
-test-fleet-check.sh
 test-forge-helpers.sh
 test-forge-helpers-rate-limit-fallback.sh
 test-forge-transient-classification.sh
@@ -205,7 +204,6 @@ test-run-ci-suites-shard.sh
 test-run-ci-suites-timings.sh
 test-run-job.sh
 test-safe-stash-pop.sh
-test-safehoused-service.sh
 test-script-helper-version-floor.sh
 test-session-mode.sh
 test-spawn-codex-sandbox-noop.sh

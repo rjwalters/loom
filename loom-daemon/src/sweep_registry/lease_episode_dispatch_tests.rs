@@ -10,7 +10,7 @@
 //! predicate alone cannot express: that the yield happens **before** any
 //! builder spawn or worktree access, that the winning claimant's
 //! `loom:building` label is left intact, and that this host's own local
-//! side effects (claim lock, peer-claim advertisement) are unwound.
+//! side effects (the claim lock) are unwound.
 //!
 //! Issue #9453 Phase 3.1 extends the same dispatch path with a second signal —
 //! a young `loom:building` label carrying NO lease record at all, the shape an

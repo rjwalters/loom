@@ -37,8 +37,7 @@ picking the same issue in the same tick rarer.
 - **The forge lease** (#11112) is the single cross-host claim. A host that
   loses the lease race is refused at dispatch (`lease_order_lost`), so two
   hosts cannot both run the same issue.
-- The peer-claim mesh (#4028) and the collision counters (#4085,
-  `same_issue_collisions_24h`) still detect any race that gets through.
+- The collision counter (#4085) still detects any race that gets through.
 
 ## What changed on the wire
 

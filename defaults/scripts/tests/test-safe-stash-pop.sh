@@ -203,7 +203,7 @@ echo "Test 10: THE INCIDENT SHAPE (#6499/#6502) — a conflicting pop must never
 echo "         leave conflict markers in a tracked .loom/config.json"
 mk_repo
 mkdir -p "$REPO/.loom"
-printf '{\n  "safehouse": {"socket": "/committed/loom.sock"}\n}\n' > "$REPO/.loom/config.json"
+printf '{\n  "observability": {"endpoint": "/committed/loom.sock"}\n}\n' > "$REPO/.loom/config.json"
 git -C "$REPO" add .loom/config.json
 git -C "$REPO" commit -q -m "add config"
 
@@ -211,9 +211,9 @@ git -C "$REPO" commit -q -m "add config"
 control="$WORKDIR/control"
 rm -rf "$control"
 cp -R "$REPO" "$control"
-printf '{\n  "safehouse": {"socket": "/host/patched.sock"}\n}\n' > "$control/.loom/config.json"
+printf '{\n  "observability": {"endpoint": "/host/patched.sock"}\n}\n' > "$control/.loom/config.json"
 git -C "$control" stash push -q -m wip
-printf '{\n  "safehouse": {"socket": "/upstream/new.sock"}\n}\n' > "$control/.loom/config.json"
+printf '{\n  "observability": {"endpoint": "/upstream/new.sock"}\n}\n' > "$control/.loom/config.json"
 git -C "$control" add .loom/config.json
 git -C "$control" commit -q -m upstream
 git -C "$control" stash pop >/dev/null 2>&1 || true
@@ -226,11 +226,11 @@ fi
 # Now the same situation through the wrapper.
 stage_conflict ".loom/config.json" \
     '{
-  "safehouse": {"socket": "/host/patched.sock"}
+  "observability": {"endpoint": "/host/patched.sock"}
 }
 ' \
     '{
-  "safehouse": {"socket": "/upstream/new.sock"}
+  "observability": {"endpoint": "/upstream/new.sock"}
 }
 '
 run_script --repo "$REPO"

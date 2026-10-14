@@ -173,7 +173,7 @@ carries no forge state to read.
 | Consumer | Flag | Wakes on | Loop it ticks early | Cadence | Max early-tick multiplier |
 |---|---|---|---|---|---|
 | Work-finder tick | `events.workFinderTick` | `issues`, `issue_comment` | the multi-workspace work-finder dispatch loop — the one that lists claimable issues, re-derives the ready queue and dispatches its head | 60s | 2x |
-| Claim-reconcile wake | `events.claimReconcileWake` | `issue_comment`, `pull_request` | the periodic **claim-reconciliation** pass — a `loom:building` claim whose sweep is gone is what *holds* the queue head, and this is the loop that releases it | 600s (1800s on a safehouse host) | **20x** (**60x**) |
+| Claim-reconcile wake | `events.claimReconcileWake` | `issue_comment`, `pull_request` | the periodic **claim-reconciliation** pass — a `loom:building` claim whose sweep is gone is what *holds* the queue head, and this is the loop that releases it | 600s | **20x** |
 | In-flight PR watch | `events.inFlightPrWatch` | `pull_request`, `check_run`, `check_suite` | the durable **watch monitor** — the daemon's only standing "has this in-flight issue/PR reached terminal state yet" poller | 120s | 4x |
 
 #8766 named the second and third loops as if each were its own module

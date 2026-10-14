@@ -113,13 +113,6 @@ pub(crate) async fn run_daemon() -> Result<()> {
             Commands::Health { since, json } => {
                 cli::health::handle_health_command(since, json).await
             }
-            // `peer-claims` connects to the running daemon over its Unix
-            // socket for the same `DaemonStatus` round-trip `status` performs
-            // (Issue #5921), so it needs the async runtime for the same
-            // reason.
-            Commands::PeerClaims { json } => {
-                cli::peer_claims_cmd::handle_peer_claims_command(json).await
-            }
             // `queue` (#8852) reads the same `DaemonStatus` round-trip.
             Commands::Queue { json } => cli::ready_queue_cmd::handle_queue_command(json).await,
             // `jev-merge-risk` POSTs to an external HTTP endpoint (Jev,
@@ -337,20 +330,20 @@ pub(crate) async fn run_daemon() -> Result<()> {
 
     // #6499: a loud, top-of-boot-block diagnosis of the legacy
     // `.loom/config.json` tier — every existing repo's sole populated config
-    // tier, and the one a host-local patch (safehouse/observability paths,
+    // tier, and the one a host-local patch (observability paths,
     // `daemon.delegatedTo`, …) lives in ahead of #5457's durable fix. A parse
     // failure here (most commonly an abandoned `git stash pop` conflict
     // leaving live `<<<<<<<`/`=======`/`>>>>>>>` markers in the tracked file)
     // makes `resolve_effective_config` silently fall back to `{}` for this
     // tier on every one of its dozens of call sites, each logging only a
     // `WARN` — easy to miss in normal boot volume, and the exact failure mode
-    // that left observability/safehouse/roleRunner silently disabled on two
+    // that left observability/roleRunner silently disabled on two
     // fleet hosts for ~70 minutes before anyone noticed. This check runs once
     // at boot (not once per resolve) and names the consequence explicitly.
     if let Some(diagnosis) = config_resolver::diagnose_legacy_config(&sweep_workspace) {
         log::error!(
             "config_resolver: {} is unreadable/malformed ({diagnosis}) — \
-             observability/safehouse/roleRunner config lost, running on defaults for the \
+             observability/roleRunner config lost, running on defaults for the \
              remainder of this process's life. Run `jq . {}` to see the parse error; if it \
              shows literal conflict markers, resolve them manually (keep this host's own \
              paths) and restart the daemon. See .loom/docs/troubleshooting.md for the full \
@@ -1172,38 +1165,9 @@ pub(crate) async fn run_daemon() -> Result<()> {
         Arc::new(WorkspacePool::new(event_bus.clone(), tokio::runtime::Handle::current()));
     workspace_pool.seed(sweep_workspace.clone(), sweep_registry.clone());
 
-    // Optional cross-host soft-claim coordination (#4028): a dedicated safehouse
-    // connection that advertises this daemon's dispatch claims and consumes peer
-    // advertisements into a shared TTL-bounded view, so peer daemons back off
-    // before the non-atomic `loom:building` label flip would let them race.
-    // Byte-for-byte no-op when `safehouse.enabled` is false/absent. Injected into
-    // the seeded default registry here (the IPC `DispatchSweep` path); every other
-    // provisioned registry is injected in `get_or_provision`.
-    //
-    // Deliberately started **before** `start_safehouse_narration` below (Issue
-    // #6352): the narration sink reads back this call's publisher + view
-    // synchronously (`WorkspacePool::start_safehouse_narration` locks
-    // `peer_coord`) to build its fleet-wide completion-dedup handle, so peer
-    // coordination must already be established by the time narration starts
-    // — reversing this order would silently leave completion dedup
-    // per-host-only even with `safehouse.enabled` true.
-    workspace_pool.start_peer_coordination(&sweep_workspace);
-    {
-        let mut reg = sweep_registry
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        workspace_pool.inject_peer_coordination(&mut reg);
-    }
-
-    // Optional safehouse fleet-comms narration (#3997): subscribe the shared
-    // event bus and narrate sweep-lifecycle transitions into an E2E Matrix room.
-    // Byte-for-byte no-op when `safehouse.enabled` is false/absent. The activity
-    // DB handle (#4497) is the same `Arc` the IPC server gets, shared so the
-    // public-feed `completion` envelope can carry a best-effort per-issue token
-    // total; the sink only ever reads, on the blocking pool. Started after peer
-    // coordination above (Issue #6352) so it can pick up the fleet-wide
-    // completion-dedup handle.
-    workspace_pool.start_safehouse_narration(&sweep_workspace, Some(activity_db.clone()));
+    // #11112: the Matrix integration is gone; a leftover config block or env
+    // var is ignored with one boot-time warning rather than failing startup.
+    loom_daemon::retired_config::warn_once(&sweep_workspace);
 
     // Restart-survivorship capacity seed (Issue #6262). A daemon restart leaves
     // in-flight sweeps running but rebuilds capacity accounting from scratch, so

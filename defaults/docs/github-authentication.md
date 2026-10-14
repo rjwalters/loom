@@ -800,7 +800,6 @@ shells to join.
 | Rate-limit circuit breaker (#4429 → #4440) | `loom-daemon/src/rate_limit_breaker.rs` | Governs the **daemon's own** forge polls (work finder, claim/quarantine reconciliation, role runner, epic supervisor) — pauses them until the window resets | **None** |
 | ETag-cached REST listings (#4428 → #4443) | `loom-daemon/src/forge_listing.rs` | Same scope — the daemon's hot polls; an unchanged poll returns 304 and costs no quota | **None** |
 | GitHub App installation tokens (#4430 → #4454, #4578) | daemon credential preflight + daemon-owned `GH_CONFIG_DIR` | Reaches spawned children too: they inherit the daemon's `GH_CONFIG_DIR`, so their `gh` calls draw on the **per-installation** bucket instead of the operator's personal 5,000/hr | **None** — every session uses whatever ambient `gh auth` / `GH_TOKEN` the operator's shell carries, i.e. one shared personal budget |
-| Claim/peer coordination off label polling (#4431) | safehouse ([`safehouse.md`](safehouse.md)) | Removes a whole class of repeated label reads from the poll path | **None** |
 
 **Read the middle column precisely.** The breaker and the ETag cache bound the
 daemon's *own* polling loops; they do **not** govern the `gh` calls a spawned

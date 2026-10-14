@@ -25,14 +25,9 @@
 //! [`forge::reconcile_workspace`] (see "Lease-record freshness" further down
 //! this file). A fresh lease refuses the reclaim regardless of what the
 //! host-scoped rules below concluded. This is the SOLE fleet-scoped gate as
-//! of Epic #6165 Phase 4 (#6317) — an earlier, now-removed gate additionally
-//! consulted whether the peer-claim/safehouse advertisement channel itself
-//! looked healthy (Issue #6157); that channel is fleet-scoped in principle
-//! but only *eventually consistent* (`peer_claims.rs`'s own "soft claim, not
-//! a mutex" framing), so treating its silence — degraded or otherwise — as
-//! reclamation-relevant evidence was itself the drift Epic #6165 set out to
-//! fix. The lease's forge-assigned `updated_at` needs no receipt at all,
-//! which is strictly stronger.
+//! of Epic #6165 Phase 4 (#6317), and the only cross-host claim signal since
+//! the Matrix peer-claim channel was removed (#11112, ADR-0025). The lease's
+//! forge-assigned `updated_at` needs no receipt at all.
 //!
 //! ## Decision rule (host-scoped evidence only — see the lease gate above)
 //!
@@ -332,25 +327,11 @@ pub const DEFAULT_RECONCILE_INTERVAL_SECS: u64 = 600;
 /// (e.g. `5` meaning "5 minutes") cannot turn this into a `gh`-API busy loop.
 pub const MIN_RECONCILE_INTERVAL_SECS: u64 = 60;
 
-/// Default periodic reconciliation interval when safehouse peer-claims are
-/// live (Issue #4431): 30 minutes. With claims advertised at dispatch and
-/// re-advertised every reaper tick (`sweep_registry::readvertise_peer_claims`),
-/// the fleet room — not the `loom:building` label — is the fast in-flight
-/// claim signal, and this pass demotes to a slow *healing* sweep for the
-/// divergence cases safehouse cannot see (a host that crashed without
-/// retracting, a stranded label from a pre-safehouse dispatch). Hosts without
-/// `safehouse.enabled` keep [`DEFAULT_RECONCILE_INTERVAL_SECS`] unchanged.
-pub const DEFAULT_SAFEHOUSE_RECONCILE_INTERVAL_SECS: u64 = 1800;
-
 /// Resolve the periodic reconciliation interval from
 /// [`RECONCILE_INTERVAL_ENV`], falling back to
 /// [`DEFAULT_RECONCILE_INTERVAL_SECS`] for an absent, unparseable, or
 /// non-positive value, and always clamped up to
 /// [`MIN_RECONCILE_INTERVAL_SECS`] regardless of source.
-///
-/// Env-only resolution — the safehouse-aware default lives in
-/// [`resolve_reconcile_interval_for`], which callers with a workspace root
-/// should prefer.
 #[must_use]
 pub fn resolve_reconcile_interval() -> Duration {
     let secs = std::env::var(RECONCILE_INTERVAL_ENV)
@@ -358,44 +339,6 @@ pub fn resolve_reconcile_interval() -> Duration {
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|&v| v > 0)
         .unwrap_or(DEFAULT_RECONCILE_INTERVAL_SECS);
-    Duration::from_secs(secs.max(MIN_RECONCILE_INTERVAL_SECS))
-}
-
-/// Resolve the periodic reconciliation interval for a workspace, safehouse-
-/// aware (Issue #4431). Precedence, first match wins:
-///
-/// 1. [`RECONCILE_INTERVAL_ENV`] — the operator's explicit choice, any host.
-/// 2. `.loom/config.json → safehouse.claimReconcileIntervalSecs` — a per-repo
-///    override of the safehouse-mode cadence (zero/invalid ignored).
-/// 3. [`DEFAULT_SAFEHOUSE_RECONCILE_INTERVAL_SECS`] when `safehouse.enabled`
-///    resolves true for `root` — peer-claims carry the fast signal, labels
-///    demote to a healing cadence.
-/// 4. [`DEFAULT_RECONCILE_INTERVAL_SECS`] otherwise — byte-for-byte the
-///    pre-#4431 behavior for hosts without safehouse (e.g. robb-pro).
-///
-/// Always clamped up to [`MIN_RECONCILE_INTERVAL_SECS`] regardless of source.
-#[must_use]
-pub fn resolve_reconcile_interval_for(root: &Path) -> Duration {
-    if let Some(secs) = std::env::var(RECONCILE_INTERVAL_ENV)
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|&v| v > 0)
-    {
-        return Duration::from_secs(secs.max(MIN_RECONCILE_INTERVAL_SECS));
-    }
-    let safehouse_enabled = crate::safehouse::resolve_config(root).enabled;
-    let config_override = crate::config_resolver::get_path(
-        &crate::config_resolver::resolve_effective_config(root),
-        "safehouse",
-    )
-    .and_then(|block| block.get("claimReconcileIntervalSecs"))
-    .and_then(serde_json::Value::as_u64)
-    .filter(|&v| v > 0);
-    let secs = config_override.unwrap_or(if safehouse_enabled {
-        DEFAULT_SAFEHOUSE_RECONCILE_INTERVAL_SECS
-    } else {
-        DEFAULT_RECONCILE_INTERVAL_SECS
-    });
     Duration::from_secs(secs.max(MIN_RECONCILE_INTERVAL_SECS))
 }
 
@@ -1912,10 +1855,7 @@ pub fn spawn_periodic_reconciliation_task(
     fallback_root: std::path::PathBuf,
     event_bus: std::sync::Arc<crate::event_bus::EventBus>,
 ) -> tokio::task::JoinHandle<()> {
-    // Safehouse-aware cadence (#4431): with live peer-claims carrying the
-    // fast in-flight signal (re-advertised each reaper tick), a
-    // safehouse-enabled host demotes this pass to a slow healing sweep.
-    let interval = resolve_reconcile_interval_for(&fallback_root);
+    let interval = resolve_reconcile_interval();
     log::info!(
         "claim_reconciliation: periodic pass enabled (interval={}s, #4348/#4431)",
         interval.as_secs()
@@ -2238,18 +2178,8 @@ pub mod forge {
     /// site, `false` for the periodic one — see [`plan`]'s doc comment for
     /// what it changes.
     ///
-    /// **Epic #6165 Phase 4 (#6317):** this reclamation decision no longer
-    /// consults the peer-claim/safehouse advertisement channel at all — the
-    /// lease-freshness gate below (Issue #6286) is the sole fleet-scoped
-    /// authority. An earlier gate (Issue #6157) additionally froze reclaim
-    /// while peer coordination looked DEGRADED (sustained advertising with
-    /// no receive); that gate has been removed, because a healthy-vs-
-    /// degraded *advertisement channel* was never meant to be load-bearing
-    /// for correctness in the first place (`peer_claims.rs`'s own "soft
-    /// claim, not a mutex" framing, and this epic's own root-cause finding).
-    /// The peer-claim channel keeps its #4028 fast-backoff role at dispatch
-    /// time ([`crate::sweep_registry::SweepRegistry::dispatch`]'s
-    /// `peer_claimed_issues` check) — advisory only, never consulted here.
+    /// **Epic #6165 Phase 4 (#6317):** the lease-freshness gate below
+    /// (Issue #6286) is the sole fleet-scoped authority for this decision.
     pub fn reconcile_workspace(gh_bin: &Path, root: &Path, is_startup: bool) -> (usize, usize) {
         let repo = root.display().to_string();
 
@@ -2355,10 +2285,8 @@ pub mod forge {
             // run-registry join, label-age grace period; see this module's
             // top doc comment). A fresh lease is positive, fleet-scoped
             // evidence the claim's holder is alive, so the reclaim is
-            // refused regardless of what the (possibly down, or simply
-            // unconfigured) peer-claim/safehouse channel reports — that
-            // channel is no longer consulted here at all (Epic #6165 Phase
-            // 4, #6317): this lease check is the sole fleet-scoped gate.
+            // refused: this lease check is the sole fleet-scoped gate (Epic
+            // #6165 Phase 4, #6317).
             //
             // Issue #7591: a lease-probe READ FAILURE (rate limit, timeout, a
             // `gh` hiccup — plausible during exactly the kind of forge-call

@@ -9,11 +9,10 @@
 # in defaults/docs/ and being installed as a symlink, the pattern the other
 # entries in .loom/docs/ already follow) looks fine in-repo — it renders, it
 # resolves, sibling links to it work — but it never ships. Every consumer
-# install silently carries a dead link. This happened twice (`safehouse.md`,
-# `token-pool.md`) before anything caught it; three shipped docs
-# (fleet-comms.md, github-authentication.md, daemon-reference.md) link
-# `safehouse.md` as a sibling and broke in every downstream install for as
-# long as those files existed. This script is the guard against the class,
+# install silently carries a dead link. This happened twice (a since-retired
+# fleet-comms doc, `token-pool.md`) before anything caught it; three shipped
+# docs linked the first one as a sibling and broke in every downstream install
+# for as long as those files existed. This script is the guard against the class,
 # not just the instance (the instance fix is #4796).
 #
 # What it checks:
@@ -43,8 +42,8 @@
 #      empty; add an entry only with a recorded reason a real copy must stay
 #      real despite having a defaults/docs/ counterpart.
 #   2. Link resolution — every same-directory sibling markdown link in
-#      defaults/docs/*.md (e.g. `[x](safehouse.md)` or
-#      `[x](safehouse.md#anchor)`) must resolve to a real file in
+#      defaults/docs/*.md (e.g. `[x](token-pool.md)` or
+#      `[x](token-pool.md#anchor)`) must resolve to a real file in
 #      defaults/docs/. Absolute URLs are out of scope (never vendored, always
 #      resolvable as-is).
 #   3. Escaping-link resolution (#4935) — every `../`-relative link in
@@ -68,7 +67,7 @@
 #
 #   check-docs-defaults-parity.sh --self-test
 #     Runs an isolated, synthetic-fixture regression test of the checks above
-#     (the "safehouse.md case": a defaults/docs/ file linking a sibling that
+#     (the "orphan-sibling case": a defaults/docs/ file linking a sibling that
 #     exists only in .loom/docs/; the "#7752 case": a .loom/docs/ real file
 #     that has a defaults/docs/ counterpart and should be a symlink, plus its
 #     allowlist exception; and the "#4935 case": a defaults/docs/ file with a
@@ -316,7 +315,7 @@ check_escaping_links() {
 }
 
 # --- Self-test -----------------------------------------------------------------
-# Builds an isolated synthetic fixture reproducing the safehouse.md case and
+# Builds an isolated synthetic fixture reproducing the orphan-sibling case and
 # the #7752 should-be-symlink case, asserts the checks fail on them, "fixes"
 # them the same way #4796/#7752 fix the real instances, and asserts the
 # checks then pass.

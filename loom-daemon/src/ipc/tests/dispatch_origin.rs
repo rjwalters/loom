@@ -1,6 +1,6 @@
 //! Issue #11444: the IPC `DispatchSweep` request carries who is asking.
 //! Operator surfaces (the `loom-daemon dispatch` CLI, the `dispatch_sweep`
-//! MCP tool, Safehouse ChatOps) send `operator`; a request without the field
+//! MCP tool) send `operator`; a request without the field
 //! (a legacy client, or any IPC client that does not say) records `unknown`,
 //! never `operator`. In its own sibling module because `ipc/tests.rs` is over
 //! the file-size ratchet (`.loom/docs/file-size-policy.md`).

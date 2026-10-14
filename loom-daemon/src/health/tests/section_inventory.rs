@@ -22,7 +22,6 @@ fn report_always_has_every_unconditional_section() {
             "queues",
             "throughput",
             "operator_attention",
-            "peer_coordination",
             "stale_sweeps",
             "auto_update",
             "worktree_reaper",
@@ -36,13 +35,12 @@ fn the_observability_section_is_appended_last_and_only_when_present() {
     let with_mismatch = assess(&mismatched_inputs(60));
     let keys: Vec<&str> = with_mismatch.sections.iter().map(|s| s.key).collect();
     assert_eq!(keys.last(), Some(&"observability"));
-    // 13 always-present sections (#6157 added `peer_coordination`; #6201
-    // added `role_liveness`; #7529 added `stale_sweeps`; #7584 added
+    // 12 always-present sections (#6201 added `role_liveness`; #7529 added `stale_sweeps`; #7584 added
     // `auto_update`; #7590 added `worktree_reaper`; #7990 added `pool_hold`;
     // #8091 added `operator_attention`)
     // + the conditional trailing `observability` note.
-    assert_eq!(keys.len(), 14);
-    assert_eq!(assess(&healthy_inputs()).sections.len(), 13);
+    assert_eq!(keys.len(), 13);
+    assert_eq!(assess(&healthy_inputs()).sections.len(), 12);
 }
 
 #[test]
@@ -51,11 +49,10 @@ fn render_human_is_one_line_per_section_plus_overall() {
     let rendered = report.render_human();
     let lines: Vec<&str> = rendered.lines().collect();
     // liveness, dispatch, tokens, roles, role_liveness (#6201), queues,
-    // throughput, operator_attention (#8091), peer_coordination (#6157),
-    // stale_sweeps (#7529), auto_update (#7584), worktree_reaper (#7590),
+    // throughput, operator_attention (#8091), stale_sweeps (#7529), auto_update (#7584), worktree_reaper (#7590),
     // pool_hold (#7990), + overall.
-    assert_eq!(lines.len(), 14);
-    assert!(lines[13].starts_with("overall"));
+    assert_eq!(lines.len(), 13);
+    assert!(lines[12].starts_with("overall"));
 }
 
 #[test]
@@ -63,11 +60,10 @@ fn json_serialization_round_trips() {
     let report = assess(&healthy_inputs());
     let value = serde_json::to_value(&report).unwrap();
     assert_eq!(value["overall"], "green");
-    // 13 always-present sections: + `peer_coordination` (#6157),
-    // `role_liveness` (#6201), `stale_sweeps` (#7529), `auto_update`
+    // 12 always-present sections: + `role_liveness` (#6201), `stale_sweeps` (#7529), `auto_update`
     // (#7584), `worktree_reaper` (#7590), `pool_hold` (#7990), and
     // `operator_attention` (#8091).
-    assert_eq!(value["sections"].as_array().unwrap().len(), 13);
+    assert_eq!(value["sections"].as_array().unwrap().len(), 12);
 }
 
 /// The `pool_hold` bucket is present and GREEN on a host holding nothing —

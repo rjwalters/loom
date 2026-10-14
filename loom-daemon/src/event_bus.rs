@@ -110,9 +110,8 @@
 //! #9268 failure mode: four agents commented for seven hours). Its original
 //! publisher, the star-liveness pass, was removed by #11104; the remaining
 //! publisher is `fleet_alert` (#10164)
-//! ([`crate::types::Event::OperatorPriorityEscalation`]); consumer: the
-//! Safehouse narration sink, which renders it as a `handoff` envelope into the
-//! `Signal` attention room.
+//! ([`crate::types::Event::OperatorPriorityEscalation`]); consumers are
+//! event-bus subscribers (`subscribe_to_events`).
 //!
 //! It is emitted on a **state change**, the same dedup discipline as the three
 //! `*.advisory` topics above, but keyed rather than boolean: exactly once per

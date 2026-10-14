@@ -4,8 +4,7 @@ use std::path::PathBuf;
 
 impl SweepRegistry {
     /// Delegates to [`crate::launch_record::sweep_log_path`] (Issue #8507) so
-    /// this registry method and safehouse's registry-free completion path can
-    /// never disagree about where a sweep's log lives.
+    /// this registry method and any registry-free caller can never disagree about where a sweep's log lives.
     pub(crate) fn compute_log_path(&self, issue: u32) -> PathBuf {
         crate::launch_record::sweep_log_path(&self.config.workspace_root, issue)
     }

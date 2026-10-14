@@ -174,8 +174,8 @@ WORKDIR="$(mktemp -d)"
 # bg_proc_reap kills the `sleep 30 &` decoys tracked via bg_proc_track below
 # (their argv never references $WORKDIR, so a path-pattern pkill would miss
 # them); the pkill backstop catches any real nohup'd fake-daemon process this
-# suite starts (BG_FAKE_BIN / SH_BG_FAKE_BIN both live under $WORKDIR, so
-# their argv always matches). EXIT/INT/TERM (not just EXIT, #4773) so a hard
+# suite starts (BG_FAKE_BIN lives under $WORKDIR, so
+# its argv always matches). EXIT/INT/TERM (not just EXIT, #4773) so a hard
 # interruption of this suite still reaps every tracked/backstopped process.
 # NOTE: a bare `trap CMD EXIT INT TERM` runs CMD on INT/TERM but does NOT stop
 # the script (only an EXIT-trap firing auto-exits) -- the explicit `exit`
@@ -851,171 +851,13 @@ out=$( LOOM_LAUNCHD_DOMAIN="gui/${UID_NOW}" PATH="$DOMAIN_STUB_DIR/nogui:$PATH" 
     bash -c "source '$LAUNCHD_DOMAIN_LIB'; resolve_launchd_domain" )
 assert_eq "gui/${UID_NOW}" "$out" "override to a non-resolving domain is honored verbatim (no silent fallback)"
 
-# ---------- safehouse fleet-comms status surfacing (#4345) ----------
-# One-line static visibility check at start time: `loom-daemon-start.sh` can
-# only tell "configured" from "not configured" (a live connection needs the
-# daemon's own socket -- `loom-daemon status` covers that, see
-# .loom/docs/safehouse.md "New-host onboarding"). Uses the nohup fallback path
-# (--no-launchd --no-systemd) so this never touches real launchd/systemd, and a
-# background daemon fake bin that stays alive long enough for the "started"
-# banner (which the safehouse line is printed alongside) to run.
-SH_BG_FAKE_BIN="$WORKDIR/fake-loom-daemon-safehouse-bg"
-cat > "$SH_BG_FAKE_BIN" <<'EOF'
-#!/usr/bin/env bash
-sleep 5
-EOF
-chmod +x "$SH_BG_FAKE_BIN"
-
-# SH1. No `safehouse` block at all -> "not configured".
-SH1_HOME="$(mktemp -d)"
-mkdir -p "$SH1_HOME/.loom"
-sh1_out=$( ( cd "$SH1_HOME" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
-    -u LOOM_SAFEHOUSE_ENABLED -u LOOM_SAFEHOUSE_SOCKET -u SAFEHOUSED_SOCKET \
-    LOOM_DAEMON_BIN="$SH_BG_FAKE_BIN" \
-    LOOM_SOCKET_PATH="$SH1_HOME/.loom/loom-daemon.sock" \
-    LOOM_AUTONOMY_MARKER="$SH1_HOME/.loom/autonomy-desired" \
-    LOOM_WATCHDOG_LABEL="com.example.loom-sandbox-$$-sh1-watchdog" \
-    bash "$START_SCRIPT" --no-launchd --no-systemd 2>&1 ) )
-TESTS_RUN=$((TESTS_RUN + 1))
-if grep -q '^Safehouse:.*not configured' <<<"$sh1_out"; then
-    TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "${GREEN}✓${NC} safehouse: no config block -> 'not configured' (#4345)"
-else
-    TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "${RED}✗${NC} safehouse: no config block -> 'not configured' (#4345)"
-    echo "  output: $sh1_out"
-fi
-if [[ -f "$SH1_HOME/.loom/.daemon.pid" ]]; then
-    kill "$(cat "$SH1_HOME/.loom/.daemon.pid" 2>/dev/null)" 2>/dev/null || true
-fi
-rm -rf "$SH1_HOME"
-
-# SH2. safehouse.enabled=true + socket configured but the path does not exist
-#      -> "configured, unreachable" (stderr warn -- captured via 2>&1).
-SH2_HOME="$(mktemp -d)"
-mkdir -p "$SH2_HOME/.loom"
-cat > "$SH2_HOME/.loom/config.json" <<EOF
-{"safehouse": {"enabled": true, "socket": "$SH2_HOME/.loom/does-not-exist.sock"}}
-EOF
-sh2_out=$( ( cd "$SH2_HOME" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
-    -u LOOM_SAFEHOUSE_ENABLED -u LOOM_SAFEHOUSE_SOCKET -u SAFEHOUSED_SOCKET \
-    LOOM_DAEMON_BIN="$SH_BG_FAKE_BIN" \
-    LOOM_SOCKET_PATH="$SH2_HOME/.loom/loom-daemon.sock" \
-    LOOM_AUTONOMY_MARKER="$SH2_HOME/.loom/autonomy-desired" \
-    LOOM_WATCHDOG_LABEL="com.example.loom-sandbox-$$-sh2-watchdog" \
-    bash "$START_SCRIPT" --no-launchd --no-systemd 2>&1 ) )
-TESTS_RUN=$((TESTS_RUN + 1))
-if grep -q '^Safehouse:.*configured, unreachable' <<<"$sh2_out" \
-    && grep -q 'does-not-exist.sock' <<<"$sh2_out"; then
-    TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "${GREEN}✓${NC} safehouse: enabled + missing socket -> 'configured, unreachable' with the resolved path (#4345)"
-else
-    TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "${RED}✗${NC} safehouse: enabled + missing socket -> 'configured, unreachable' with the resolved path (#4345)"
-    echo "  output: $sh2_out"
-fi
-if [[ -f "$SH2_HOME/.loom/.daemon.pid" ]]; then
-    kill "$(cat "$SH2_HOME/.loom/.daemon.pid" 2>/dev/null)" 2>/dev/null || true
-fi
-rm -rf "$SH2_HOME"
-
-# SH3. safehouse.enabled=true + socket path IS a real bound AF_UNIX socket file
-#      -> "configured (socket present ...)". Only `bind()`s (no accept loop
-#      needed -- the start wrapper only stat()s the path, it never connects).
-SH3_HOME="$(mktemp -d)"
-mkdir -p "$SH3_HOME/.loom"
-SH3_SOCK="$SH3_HOME/.loom/safehoused.sock"
-if command -v python3 >/dev/null 2>&1 \
-    && python3 -c "
-import socket
-s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-s.bind('$SH3_SOCK')
-" 2>/dev/null; then
-    cat > "$SH3_HOME/.loom/config.json" <<EOF
-{"safehouse": {"enabled": true, "socket": "$SH3_SOCK"}}
-EOF
-    sh3_out=$( ( cd "$SH3_HOME" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
-        -u LOOM_SAFEHOUSE_ENABLED -u LOOM_SAFEHOUSE_SOCKET -u SAFEHOUSED_SOCKET \
-        -u LOOM_SAFEHOUSE_ROOM -u LOOM_SAFEHOUSE_ROOM_SIGNAL \
-        LOOM_DAEMON_BIN="$SH_BG_FAKE_BIN" \
-        LOOM_SOCKET_PATH="$SH3_HOME/.loom/loom-daemon.sock" \
-        LOOM_AUTONOMY_MARKER="$SH3_HOME/.loom/autonomy-desired" \
-        LOOM_WATCHDOG_LABEL="com.example.loom-sandbox-$$-sh3-watchdog" \
-        bash "$START_SCRIPT" --no-launchd --no-systemd 2>&1 ) )
-    TESTS_RUN=$((TESTS_RUN + 1))
-    if grep -q '^Safehouse:.*configured (socket present' <<<"$sh3_out"; then
-        TESTS_PASSED=$((TESTS_PASSED + 1))
-        echo -e "${GREEN}✓${NC} safehouse: enabled + socket file present -> 'configured (socket present ...)' (#4345)"
-    else
-        TESTS_FAILED=$((TESTS_FAILED + 1))
-        echo -e "${RED}✗${NC} safehouse: enabled + socket file present -> 'configured (socket present ...)' (#4345)"
-        echo "  output: $sh3_out"
-    fi
-    # #4464: SH3's config has no `safehouse.room`, so the room-unset caveat MUST
-    # be surfaced (omitting room is valid only for a single-room safehoused).
-    TESTS_RUN=$((TESTS_RUN + 1))
-    if grep -q 'safehouse.room is unset' <<<"$sh3_out"; then
-        TESTS_PASSED=$((TESTS_PASSED + 1))
-        echo -e "${GREEN}✓${NC} safehouse: room unset -> room caveat surfaced (#4464)"
-    else
-        TESTS_FAILED=$((TESTS_FAILED + 1))
-        echo -e "${RED}✗${NC} safehouse: room unset -> room caveat surfaced (#4464)"
-        echo "  output: $sh3_out"
-    fi
-    if [[ -f "$SH3_HOME/.loom/.daemon.pid" ]]; then
-        kill "$(cat "$SH3_HOME/.loom/.daemon.pid" 2>/dev/null)" 2>/dev/null || true
-    fi
-else
-    loom_test_skip "SH3: python3 AF_UNIX bind unavailable on this host"
-fi
-rm -rf "$SH3_HOME"
-
-# SH4. #4464: same as SH3 but WITH an explicit safehouse.room set -> the caveat
-#      must NOT appear (the single-room contract is satisfied by an explicit room).
-SH4_HOME="$(mktemp -d)"
-mkdir -p "$SH4_HOME/.loom"
-SH4_SOCK="$SH4_HOME/.loom/safehoused.sock"
-if command -v python3 >/dev/null 2>&1 \
-    && python3 -c "
-import socket
-s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-s.bind('$SH4_SOCK')
-" 2>/dev/null; then
-    cat > "$SH4_HOME/.loom/config.json" <<EOF
-{"safehouse": {"enabled": true, "socket": "$SH4_SOCK", "room": "loom-fleet"}}
-EOF
-    sh4_out=$( ( cd "$SH4_HOME" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
-        -u LOOM_SAFEHOUSE_ENABLED -u LOOM_SAFEHOUSE_SOCKET -u SAFEHOUSED_SOCKET \
-        -u LOOM_SAFEHOUSE_ROOM -u LOOM_SAFEHOUSE_ROOM_SIGNAL \
-        LOOM_DAEMON_BIN="$SH_BG_FAKE_BIN" \
-        LOOM_SOCKET_PATH="$SH4_HOME/.loom/loom-daemon.sock" \
-        LOOM_AUTONOMY_MARKER="$SH4_HOME/.loom/autonomy-desired" \
-        LOOM_WATCHDOG_LABEL="com.example.loom-sandbox-$$-sh4-watchdog" \
-        bash "$START_SCRIPT" --no-launchd --no-systemd 2>&1 ) )
-    TESTS_RUN=$((TESTS_RUN + 1))
-    if grep -q 'safehouse.room is unset' <<<"$sh4_out"; then
-        TESTS_FAILED=$((TESTS_FAILED + 1))
-        echo -e "${RED}✗${NC} safehouse: room set -> no room caveat (#4464)"
-        echo "  output: $sh4_out"
-    else
-        TESTS_PASSED=$((TESTS_PASSED + 1))
-        echo -e "${GREEN}✓${NC} safehouse: room set -> no room caveat (#4464)"
-    fi
-    if [[ -f "$SH4_HOME/.loom/.daemon.pid" ]]; then
-        kill "$(cat "$SH4_HOME/.loom/.daemon.pid" 2>/dev/null)" 2>/dev/null || true
-    fi
-else
-    loom_test_skip "SH4: python3 AF_UNIX bind unavailable on this host"
-fi
-rm -rf "$SH4_HOME"
-
 # ---------- dropped-env-key detection on re-render (#4522, preserve-by-default #5344) ----------
 # Root cause under test: render_launchd_plist / render_systemd_unit render the
 # EnvironmentVariables dict / Environment= lines strictly from whatever THIS
 # invocation has exported -- so a re-render from a context missing the
 # operator's exports (a watchdog, a bare re-run, another tool shelling out to
 # this script) used to silently replace a richer installed plist/unit with a
-# narrower one (every LOOM_SAFEHOUSE_* key + LOOM_WORK_FINDER gone, no trace).
+# narrower one (every operator-exported key + LOOM_WORK_FINDER gone, no trace).
 # warn_dropped_env_keys() diffs the KEY sets (not values) between the
 # installed file and the freshly-rendered replacement, warns, AND (#5344, by
 # default) carries each dropped key's installed VALUE forward into the
@@ -1032,7 +874,7 @@ DEK_LABEL="com.rjwalters.loom-daemon-dek-test"
 DEK_LIVE_PLIST="$DEK_HOME/Library/LaunchAgents/${DEK_LABEL}.plist"
 
 # DEK1. First-ever install (no existing plist) must NOT warn.
-dek1_out=$( env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE -u LOOM_SAFEHOUSE_ENABLED \
+dek1_out=$( env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE -u LOOM_DEK_PROBE \
     HOME="$DEK_HOME" LOOM_MACHINE_CHECKOUT="$DEK_HOME" LOOM_LAUNCHD_LABEL="$DEK_LABEL" LOOM_DAEMON_BIN="$FAKE_BIN" \
     bash "$START_SCRIPT" --print-plist 2>&1 >/dev/null )
 TESTS_RUN=$((TESTS_RUN + 1))
@@ -1045,18 +887,18 @@ else
     echo "  output: $dek1_out"
 fi
 
-# Install the "rich" plist (LOOM_SAFEHOUSE_ENABLED + LOOM_WORK_FINDER present).
+# Install the "rich" plist (LOOM_DEK_PROBE + LOOM_WORK_FINDER present).
 env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE HOME="$DEK_HOME" LOOM_MACHINE_CHECKOUT="$DEK_HOME" LOOM_LAUNCHD_LABEL="$DEK_LABEL" \
-    LOOM_SAFEHOUSE_ENABLED=1 LOOM_WORK_FINDER=1 LOOM_DAEMON_BIN="$FAKE_BIN" \
+    LOOM_DEK_PROBE=1 LOOM_WORK_FINDER=1 LOOM_DAEMON_BIN="$FAKE_BIN" \
     bash "$START_SCRIPT" --print-plist > "$DEK_LIVE_PLIST" 2>/dev/null
 
-# DEK2. Re-rendering with LOOM_SAFEHOUSE_ENABLED no longer exported warns and
-#       names the dropped key, with the LOOM_SAFEHOUSE_* migration hint.
-dek2_out=$( env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE -u LOOM_SAFEHOUSE_ENABLED \
+# DEK2. Re-rendering with LOOM_DEK_PROBE no longer exported warns and
+#       names the dropped key.
+dek2_out=$( env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE -u LOOM_DEK_PROBE \
     HOME="$DEK_HOME" LOOM_MACHINE_CHECKOUT="$DEK_HOME" LOOM_LAUNCHD_LABEL="$DEK_LABEL" LOOM_DAEMON_BIN="$FAKE_BIN" \
     bash "$START_SCRIPT" --print-plist 2>&1 >/dev/null )
 TESTS_RUN=$((TESTS_RUN + 1))
-if grep -qi 'drops 1 env key' <<<"$dek2_out" && grep -q 'LOOM_SAFEHOUSE_ENABLED' <<<"$dek2_out"; then
+if grep -qi 'drops 1 env key' <<<"$dek2_out" && grep -q 'LOOM_DEK_PROBE' <<<"$dek2_out"; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "${GREEN}✓${NC} dropped-env-key (plist): re-render missing an exported key warns and names it (#4522)"
 else
@@ -1064,23 +906,13 @@ else
     echo -e "${RED}✗${NC} dropped-env-key (plist): re-render missing an exported key warns and names it"
     echo "  output: $dek2_out"
 fi
-TESTS_RUN=$((TESTS_RUN + 1))
-if grep -q 'safehouse.*block.*--from-config' <<<"$dek2_out"; then
-    TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "${GREEN}✓${NC} dropped-env-key (plist): LOOM_SAFEHOUSE_* drop prints the config-tier migration hint (#4353)"
-else
-    TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "${RED}✗${NC} dropped-env-key (plist): LOOM_SAFEHOUSE_* drop prints the config-tier migration hint"
-    echo "  output: $dek2_out"
-fi
-
 # DEK2b (#5344): the previewed plist itself -- not just the warning -- carries
 # the dropped key's INSTALLED value forward by default.
-dek2b_out=$( env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE -u LOOM_SAFEHOUSE_ENABLED \
+dek2b_out=$( env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE -u LOOM_DEK_PROBE \
     HOME="$DEK_HOME" LOOM_MACHINE_CHECKOUT="$DEK_HOME" LOOM_LAUNCHD_LABEL="$DEK_LABEL" LOOM_DAEMON_BIN="$FAKE_BIN" \
     bash "$START_SCRIPT" --print-plist 2>/dev/null )
 TESTS_RUN=$((TESTS_RUN + 1))
-if echo "$dek2b_out" | grep -A1 '<key>LOOM_SAFEHOUSE_ENABLED</key>' | grep -q '<string>1</string>'; then
+if echo "$dek2b_out" | grep -A1 '<key>LOOM_DEK_PROBE</key>' | grep -q '<string>1</string>'; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "${GREEN}✓${NC} dropped-env-key (plist): a re-render missing an exported key still carries its installed value forward by default (#5344)"
 else
@@ -1091,7 +923,7 @@ fi
 
 # DEK3. Re-rendering with the SAME (or a superset of) keys does not warn.
 dek3_out=$( env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE HOME="$DEK_HOME" LOOM_MACHINE_CHECKOUT="$DEK_HOME" LOOM_LAUNCHD_LABEL="$DEK_LABEL" \
-    LOOM_SAFEHOUSE_ENABLED=1 LOOM_WORK_FINDER=1 LOOM_DAEMON_PATH_EXTRA=/extra/bin LOOM_DAEMON_BIN="$FAKE_BIN" \
+    LOOM_DEK_PROBE=1 LOOM_WORK_FINDER=1 LOOM_DAEMON_PATH_EXTRA=/extra/bin LOOM_DAEMON_BIN="$FAKE_BIN" \
     bash "$START_SCRIPT" --print-plist 2>&1 >/dev/null )
 TESTS_RUN=$((TESTS_RUN + 1))
 if ! grep -qi 'drops.*env key' <<<"$dek3_out"; then
@@ -1104,7 +936,7 @@ else
 fi
 
 # DEK4. --force-env suppresses the warning for an intentional narrowing.
-dek4_out=$( env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE -u LOOM_SAFEHOUSE_ENABLED \
+dek4_out=$( env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE -u LOOM_DEK_PROBE \
     HOME="$DEK_HOME" LOOM_MACHINE_CHECKOUT="$DEK_HOME" LOOM_LAUNCHD_LABEL="$DEK_LABEL" LOOM_DAEMON_BIN="$FAKE_BIN" \
     bash "$START_SCRIPT" --print-plist --force-env 2>&1 >/dev/null )
 TESTS_RUN=$((TESTS_RUN + 1))
@@ -1120,11 +952,11 @@ fi
 # DEK4b (#5344): --force-env doesn't just suppress the warning -- it actually
 # lets the key stay dropped from the previewed plist (inverted semantics: the
 # flag now means "narrow for real", not merely "quiet about it").
-dek4b_out=$( env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE -u LOOM_SAFEHOUSE_ENABLED \
+dek4b_out=$( env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE -u LOOM_DEK_PROBE \
     HOME="$DEK_HOME" LOOM_MACHINE_CHECKOUT="$DEK_HOME" LOOM_LAUNCHD_LABEL="$DEK_LABEL" LOOM_DAEMON_BIN="$FAKE_BIN" \
     bash "$START_SCRIPT" --print-plist --force-env 2>/dev/null )
 TESTS_RUN=$((TESTS_RUN + 1))
-if ! grep -q '<key>LOOM_SAFEHOUSE_ENABLED</key>' <<<"$dek4b_out"; then
+if ! grep -q '<key>LOOM_DEK_PROBE</key>' <<<"$dek4b_out"; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "${GREEN}✓${NC} dropped-env-key (plist): --force-env actually drops the key from the render, not just the warning (#5344)"
 else
@@ -1168,7 +1000,7 @@ DEK_SD_UNIT_PATH="$DEK_SD_HOME/.config/systemd/user/$DEK_SD_UNIT"
 DEK_SD_PID_FILE="$WORKDIR/.loom/.daemon.pid"
 
 # DEK5. First-ever install (no existing unit) must NOT warn.
-dek5_out=$( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE -u LOOM_SAFEHOUSE_ENABLED \
+dek5_out=$( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE -u LOOM_DEK_PROBE \
     PATH="$DEK_SD_BIN:$PATH" HOME="$DEK_SD_HOME" \
     LOOM_SYSTEMD_FORCE=1 LOOM_SYSTEMD_UNIT="$DEK_SD_UNIT" \
     LOOM_DAEMON_BIN="$FAKE_BIN" \
@@ -1194,7 +1026,7 @@ else
     echo -e "${RED}✗${NC} dropped-env-key (systemd): first-ever install still writes the unit file"
 fi
 
-# DEK6. Re-render with fewer keys (LOOM_SAFEHOUSE_ENABLED dropped from the
+# DEK6. Re-render with fewer keys (LOOM_DEK_PROBE dropped from the
 #       invoking env) warns and names the dropped key, before the unit is
 #       overwritten. Re-run with the rich env first so the installed unit
 #       actually carries the key.
@@ -1204,7 +1036,7 @@ bg_proc_track "$DEK_SD_PID1"
 ( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
     PATH="$DEK_SD_BIN:$PATH" HOME="$DEK_SD_HOME" \
     LOOM_SYSTEMD_FORCE=1 LOOM_SYSTEMD_UNIT="$DEK_SD_UNIT" \
-    LOOM_SAFEHOUSE_ENABLED=1 LOOM_WORK_FINDER=1 \
+    LOOM_DEK_PROBE=1 LOOM_WORK_FINDER=1 \
     LOOM_DAEMON_BIN="$FAKE_BIN" \
     LOOM_SOCKET_PATH="$DEK_SD_HOME/.loom/loom-daemon.sock" \
     LOOM_AUTONOMY_MARKER="$DEK_SD_HOME/.loom/autonomy-desired" \
@@ -1213,12 +1045,12 @@ kill "$DEK_SD_PID1" 2>/dev/null || true
 wait "$DEK_SD_PID1" 2>/dev/null || true
 wait_for_pid_file_gone "$DEK_SD_PID_FILE"
 TESTS_RUN=$((TESTS_RUN + 1))
-if [[ -f "$DEK_SD_UNIT_PATH" ]] && grep -q 'LOOM_SAFEHOUSE_ENABLED' "$DEK_SD_UNIT_PATH"; then
+if [[ -f "$DEK_SD_UNIT_PATH" ]] && grep -q 'LOOM_DEK_PROBE' "$DEK_SD_UNIT_PATH"; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "${GREEN}✓${NC} dropped-env-key (systemd): fixture install carries LOOM_SAFEHOUSE_ENABLED (setup for DEK6b)"
+    echo -e "${GREEN}✓${NC} dropped-env-key (systemd): fixture install carries LOOM_DEK_PROBE (setup for DEK6b)"
 else
     TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "${RED}✗${NC} dropped-env-key (systemd): fixture install carries LOOM_SAFEHOUSE_ENABLED"
+    echo -e "${RED}✗${NC} dropped-env-key (systemd): fixture install carries LOOM_DEK_PROBE"
     cat "$DEK_SD_UNIT_PATH" 2>/dev/null | sed 's/^/    /'
 fi
 
@@ -1227,10 +1059,10 @@ bg_proc_track "$DEK_SD_PID2"
 # #5409: the fixture install above had LOOM_WORK_FINDER=1, and this re-render
 # leaves it unexported (default-off) -- exactly the AC1 detected-downgrade
 # shape (covered on its own by the "autonomy downgrade (systemd)" tests
-# above). This test is about the UNRELATED LOOM_SAFEHOUSE_ENABLED drop, so
+# above). This test is about the UNRELATED LOOM_DEK_PROBE drop, so
 # pass --no-work-finder explicitly to state that transition on purpose and
 # reach the dropped-env-key code path instead of being refused before it.
-dek6_out=$( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE -u LOOM_SAFEHOUSE_ENABLED \
+dek6_out=$( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE -u LOOM_DEK_PROBE \
     PATH="$DEK_SD_BIN:$PATH" HOME="$DEK_SD_HOME" \
     LOOM_SYSTEMD_FORCE=1 LOOM_SYSTEMD_UNIT="$DEK_SD_UNIT" \
     LOOM_DAEMON_BIN="$FAKE_BIN" \
@@ -1241,17 +1073,16 @@ kill "$DEK_SD_PID2" 2>/dev/null || true
 wait "$DEK_SD_PID2" 2>/dev/null || true
 wait_for_pid_file_gone "$DEK_SD_PID_FILE"
 TESTS_RUN=$((TESTS_RUN + 1))
-if grep -qi 'drops 1 env key' <<<"$dek6_out" && grep -q 'LOOM_SAFEHOUSE_ENABLED' <<<"$dek6_out" \
-    && grep -q 'safehouse.*block.*--from-config' <<<"$dek6_out"; then
+if grep -qi 'drops 1 env key' <<<"$dek6_out" && grep -q 'LOOM_DEK_PROBE' <<<"$dek6_out"; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "${GREEN}✓${NC} dropped-env-key (systemd): real re-render missing a key warns, names it, and prints the migration hint (#4522)"
+    echo -e "${GREEN}✓${NC} dropped-env-key (systemd): real re-render missing a key warns and names it (#4522)"
 else
     TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "${RED}✗${NC} dropped-env-key (systemd): real re-render missing a key warns, names it, and prints the migration hint"
+    echo -e "${RED}✗${NC} dropped-env-key (systemd): real re-render missing a key warns and names it"
     echo "  output: $dek6_out"
 fi
 TESTS_RUN=$((TESTS_RUN + 1))
-if [[ -f "$DEK_SD_UNIT_PATH" ]] && grep -q 'LOOM_SAFEHOUSE_ENABLED=1' "$DEK_SD_UNIT_PATH"; then
+if [[ -f "$DEK_SD_UNIT_PATH" ]] && grep -q 'LOOM_DEK_PROBE=1' "$DEK_SD_UNIT_PATH"; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "${GREEN}✓${NC} dropped-env-key (systemd): the WARNED key is carried forward by default, not dropped (#5344)"
 else
@@ -1266,7 +1097,7 @@ bg_proc_track "$DEK_SD_PID3"
 ( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
     PATH="$DEK_SD_BIN:$PATH" HOME="$DEK_SD_HOME" \
     LOOM_SYSTEMD_FORCE=1 LOOM_SYSTEMD_UNIT="$DEK_SD_UNIT" \
-    LOOM_SAFEHOUSE_ENABLED=1 LOOM_WORK_FINDER=1 \
+    LOOM_DEK_PROBE=1 LOOM_WORK_FINDER=1 \
     LOOM_DAEMON_BIN="$FAKE_BIN" \
     LOOM_SOCKET_PATH="$DEK_SD_HOME/.loom/loom-daemon.sock" \
     LOOM_AUTONOMY_MARKER="$DEK_SD_HOME/.loom/autonomy-desired" \
@@ -1279,7 +1110,7 @@ bg_proc_track "$DEK_SD_PID4"
 # #5409: same rationale as DEK6 above -- --no-work-finder states the
 # LOOM_WORK_FINDER 1->0 transition explicitly so this stays a pure --force-env
 # test, not entangled with the unrelated AC1 detected-downgrade refusal.
-dek7_out=$( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE -u LOOM_SAFEHOUSE_ENABLED \
+dek7_out=$( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE -u LOOM_DEK_PROBE \
     PATH="$DEK_SD_BIN:$PATH" HOME="$DEK_SD_HOME" \
     LOOM_SYSTEMD_FORCE=1 LOOM_SYSTEMD_UNIT="$DEK_SD_UNIT" \
     LOOM_DAEMON_BIN="$FAKE_BIN" \
@@ -1310,7 +1141,7 @@ else
     echo -e "${GREEN}✓${NC} dropped-env-key (systemd): --force-env is excluded from the persisted .daemon.flags file"
 fi
 TESTS_RUN=$((TESTS_RUN + 1))
-if [[ -f "$DEK_SD_UNIT_PATH" ]] && ! grep -q 'LOOM_SAFEHOUSE_ENABLED' "$DEK_SD_UNIT_PATH"; then
+if [[ -f "$DEK_SD_UNIT_PATH" ]] && ! grep -q 'LOOM_DEK_PROBE' "$DEK_SD_UNIT_PATH"; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "${GREEN}✓${NC} dropped-env-key (systemd): --force-env actually drops the key from the installed unit, not just the warning (#5344)"
 else
@@ -1319,48 +1150,6 @@ else
     cat "$DEK_SD_UNIT_PATH" 2>/dev/null | sed 's/^/    /'
 fi
 rm -rf "$DEK_SD_HOME"
-
-# SH5. #4225: attention-class routing supplies the room via
-#      safehouse.rooms.signal instead of the scalar safehouse.room -> the
-#      room-unset caveat must NOT appear (the resolver falls back from
-#      rooms.signal to room, so a host with either one is satisfied).
-SH5_HOME="$(mktemp -d)"
-mkdir -p "$SH5_HOME/.loom"
-SH5_SOCK="$SH5_HOME/.loom/safehoused.sock"
-if command -v python3 >/dev/null 2>&1 \
-    && python3 -c "
-import socket
-s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-s.bind('$SH5_SOCK')
-" 2>/dev/null; then
-    cat > "$SH5_HOME/.loom/config.json" <<EOF
-{"safehouse": {"enabled": true, "socket": "$SH5_SOCK",
-  "rooms": {"signal": "!signal:example.org", "byRepo": {"loom": "!fleet-loom:example.org"}}}}
-EOF
-    sh5_out=$( ( cd "$SH5_HOME" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
-        -u LOOM_SAFEHOUSE_ENABLED -u LOOM_SAFEHOUSE_SOCKET -u SAFEHOUSED_SOCKET \
-        -u LOOM_SAFEHOUSE_ROOM -u LOOM_SAFEHOUSE_ROOM_SIGNAL \
-        LOOM_DAEMON_BIN="$SH_BG_FAKE_BIN" \
-        LOOM_SOCKET_PATH="$SH5_HOME/.loom/loom-daemon.sock" \
-        LOOM_AUTONOMY_MARKER="$SH5_HOME/.loom/autonomy-desired" \
-        LOOM_WATCHDOG_LABEL="com.example.loom-sandbox-$$-sh5-watchdog" \
-        bash "$START_SCRIPT" --no-launchd --no-systemd 2>&1 ) )
-    TESTS_RUN=$((TESTS_RUN + 1))
-    if grep -q 'safehouse.room is unset' <<<"$sh5_out"; then
-        TESTS_FAILED=$((TESTS_FAILED + 1))
-        echo -e "${RED}✗${NC} safehouse: rooms.signal set -> no room caveat (#4225)"
-        echo "  output: $sh5_out"
-    else
-        TESTS_PASSED=$((TESTS_PASSED + 1))
-        echo -e "${GREEN}✓${NC} safehouse: rooms.signal set -> no room caveat (#4225)"
-    fi
-    if [[ -f "$SH5_HOME/.loom/.daemon.pid" ]]; then
-        kill "$(cat "$SH5_HOME/.loom/.daemon.pid" 2>/dev/null)" 2>/dev/null || true
-    fi
-else
-    loom_test_skip "SH5: python3 AF_UNIX bind unavailable on this host"
-fi
-rm -rf "$SH5_HOME"
 
 # ---------- silent autonomy-downgrade detection (#4693) ----------
 # Incident 2026-07-30: a plain `loom-daemon-start.sh` run silently re-rendered

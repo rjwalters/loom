@@ -92,13 +92,13 @@ impl TraceStore {
 
     /// `$LOOM_REPO`, else the checkout's GitHub `owner/repo` (so a PR-set
     /// sweep groups with the same repo's issue sweeps), else the workspace
-    /// basename ([`crate::peer_claims::repo_slug`]), spelled as written there.
+    /// basename ([`crate::gh_repo_env::repo_slug`]), spelled as written there.
     fn repo_name(workspace: &Path) -> String {
         let explicit = std::env::var("LOOM_REPO").is_ok_and(|v| !v.trim().is_empty());
         (!explicit)
             .then(|| crate::release_resolve::host::repo_slug(workspace))
             .flatten()
-            .unwrap_or_else(|| crate::peer_claims::repo_slug(workspace))
+            .unwrap_or_else(|| crate::gh_repo_env::repo_slug(workspace))
     }
 
     /// `loom.repo` for a span keyed on [`Self::fallback_repo`] (#10637): the

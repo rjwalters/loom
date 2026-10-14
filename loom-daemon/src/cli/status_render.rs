@@ -18,7 +18,6 @@ mod last_tick_line;
 mod model_class;
 mod observability_line;
 mod otlp_export_line;
-mod peer_claims_line;
 mod pending_restart_line;
 mod session_containers_line;
 mod task_liveness_line;
@@ -717,39 +716,6 @@ pub(crate) fn build_status_json_value_for(
         })),
         // Per-caller forge call accounting (#9251); `null` from an older daemon.
         "forge_calls": report.forge_calls,
-        // Live safehouse fleet-comms connection state (#4345) — `null` only
-        // from a pre-#4345 daemon binary that never computed one. `state` is
-        // one of "not_configured" / "unreachable" / "connected" /
-        // "send_rejected" (#4464, carries `reason`).
-        "safehouse": report.safehouse.as_ref().map(|s| serde_json::json!({
-            "state": s.state,
-            "socket": s.socket,
-            "room": s.room,
-            "reason": s.reason,
-        })),
-        // Peer-claim view + transport counters (Issue #5921) — `null` when no
-        // safehouse peer-claim coordination has been established (mirrors
-        // `safehouse`'s `None`-vs-empty-view contract). Non-null carries the
-        // full set `loom-daemon peer-claims` also renders, so a scripted
-        // consumer never needs the standalone subcommand just to get JSON.
-        "peer_claims": report.peer_claims.as_ref().map(|p| serde_json::json!({
-            "self_host": p.self_host,
-            "ttl_secs": p.ttl_secs,
-            "entries": p.entries.iter().map(|e| serde_json::json!({
-                "repo": e.repo,
-                "issue": e.issue,
-                "host": e.host,
-                "remaining_ttl_secs": e.remaining_ttl_secs,
-            })).collect::<Vec<_>>(),
-            "advertised": p.advertised,
-            "received": p.received,
-            "expired": p.expired,
-            "dispatch_skipped": p.dispatch_skipped,
-            // Resolved claims-room identity (Issue #6242) — `null` when
-            // peer-claim coordination was never established (safehouse
-            // disabled, or no socket ever resolved), never an empty string.
-            "claims_room": p.claims_room,
-        })),
         // Watchdog protection state (#4354) — client-side, host-local, read-only.
         // `state` is one of "protected" / "no-marker" /
         // "watchdog-not-provisioned" / "unknown". `marker_present` and
@@ -2115,111 +2081,11 @@ pub(crate) fn print_status_human(
         }
     }
 
-    // Live safehouse fleet-comms connection state (#4345): before this,
-    // "not configured", "configured but unreachable", and "connected" all
-    // looked identical — silence. See `.loom/docs/safehouse.md`.
-    match &report.safehouse {
-        Some(s) if s.state == "connected" => {
-            println!(
-                "Safehouse:     connected (room: {}, socket: {})",
-                s.room.as_deref().unwrap_or("(default — sole joined room)"),
-                s.socket
-                    .as_ref()
-                    .map_or_else(|| "?".to_string(), |p| p.display().to_string())
-            );
-        }
-        Some(s) if s.state == "unreachable" => {
-            println!(
-                "Safehouse:     configured, unreachable (socket: {})",
-                s.socket
-                    .as_ref()
-                    .map_or_else(|| "unresolved".to_string(), |p| p.display().to_string())
-            );
-        }
-        // #4464: handshake succeeds but every send is rejected — the socket is
-        // reachable, so "unreachable" would point the operator at the wrong
-        // fix. Surface the rejection reason directly (canonically a missing
-        // `safehouse.room` on a multi-room host).
-        Some(s) if s.state == "send_rejected" => {
-            println!(
-                "Safehouse:     connected, sends rejected: {} (socket: {})",
-                s.reason.as_deref().unwrap_or("unknown reason"),
-                s.socket
-                    .as_ref()
-                    .map_or_else(|| "?".to_string(), |p| p.display().to_string())
-            );
-        }
-        Some(s) if s.state == "not_configured" => println!("Safehouse:     not configured"),
-        // #4464: an unknown state string (version skew with a newer daemon)
-        // degrades legibly — print the raw state rather than mislabeling it
-        // "not configured" (the old fallthrough, which hid real states).
-        Some(s) => println!("Safehouse:     {} (socket: {})", s.state, {
-            s.socket
-                .as_ref()
-                .map_or_else(|| "?".to_string(), |p| p.display().to_string())
-        }),
-        None => {
-            println!("Safehouse:     unknown (older daemon binary — restart to pick up #4345)")
-        }
-    }
-
-    // Peer-claim view + transport counters (Issue #5921): before this, the
-    // ONLY signal an operator had for #4028/#4431's soft cross-host claim
-    // mechanism was a `debug!`-only re-advertisement log line — a duplicate
-    // dispatch (e.g. #5789) could not be root-caused without attaching a
-    // debugger. `None` when no safehouse peer-claim coordination has been
-    // established (mirrors the Safehouse block's `None` case above).
-    match &report.peer_claims {
-        Some(pc) if pc.entries.is_empty() => {
-            println!(
-                "Peer claims:   none live (self_host: {}, ttl: {}s, room: {}, advertised={} \
-                 rejected={} received={} expired={} dispatch_skipped={})",
-                pc.self_host,
-                pc.ttl_secs,
-                pc.claims_room.as_deref().unwrap_or("none"),
-                pc.advertised,
-                pc.advertise_rejected,
-                pc.received,
-                pc.expired,
-                pc.dispatch_skipped
-            );
-            peer_claims_line::print_coordination_verdict(&pc.coordination);
-        }
-        Some(pc) => {
-            println!(
-                "Peer claims:   {} live (self_host: {}, ttl: {}s, room: {}, advertised={} \
-                 rejected={} received={} expired={} dispatch_skipped={})",
-                pc.entries.len(),
-                pc.self_host,
-                pc.ttl_secs,
-                pc.claims_room.as_deref().unwrap_or("none"),
-                pc.advertised,
-                pc.advertise_rejected,
-                pc.received,
-                pc.expired,
-                pc.dispatch_skipped
-            );
-            peer_claims_line::print_coordination_verdict(&pc.coordination);
-            for e in &pc.entries {
-                println!(
-                    "               issue #{} ({}) claimed by {} — {}s remaining",
-                    e.issue, e.repo, e.host, e.remaining_ttl_secs
-                );
-            }
-        }
-        None => {
-            println!(
-                "Peer claims:   not configured (safehouse.enabled false, or older daemon \
-                 binary — restart to pick up #5921)"
-            );
-        }
-    }
-
     // Running-vs-disk build staleness (#5341): the answering daemon PROCESS's
     // own build, sourced over IPC, compared against THIS CLI invocation's own
     // compile-time build (which — because `status` always execs the on-disk
     // binary fresh — IS the disk build). Unflagged, in the same block as
-    // Safehouse/Observability/Protection, so a stale-but-still-answering
+    // Observability/Protection, so a stale-but-still-answering
     // daemon is visible without an operator having to compare process start
     // time against binary mtime by hand.
     println!(
@@ -2237,7 +2103,6 @@ pub(crate) fn print_status_human(
     // fine", "observability disabled", and "configured but silently never
     // exported" were all rendered as the same thing — nothing — and telling
     // them apart meant grepping `daemon.log` for the *absence* of a warning.
-    // Same shape as the Safehouse block above, for the same reason.
     println!(
         "{}",
         observability_line::render(report.observability_export.as_ref(), Utc::now())

@@ -1,4 +1,4 @@
-//! On-disk transcript token accounting for the safehouse completion feed (#4699).
+//! On-disk transcript token accounting for daemon-dispatched sweeps (#4699).
 //!
 //! # Why this module exists
 //!
@@ -54,7 +54,7 @@
 //! cost, so an input+output-only figure would under-report actual spend by well
 //! over an order of magnitude and do so unevenly between sweeps. This differs
 //! from the activity-DB rollup's narrower `input + output`; the difference is
-//! documented in `.loom/docs/safehouse.md` and the DB path is left untouched.
+//! deliberate, and the DB path is left untouched.
 //!
 //! Re-dispatched sweeps produce several sessions for one issue; all matching
 //! sessions are summed, since the feed reports what the issue cost in total.
@@ -287,13 +287,8 @@ pub fn sum_sweep_tokens(
     issue: u32,
     window: Option<(DateTime<Utc>, DateTime<Utc>)>,
 ) -> Option<u64> {
-    let files = sweep_transcript_files(
-        projects_dir,
-        workspace_root,
-        issue,
-        window,
-        "safehouse token total",
-    )?;
+    let files =
+        sweep_transcript_files(projects_dir, workspace_root, issue, window, "sweep token total")?;
     let mut total: u64 = 0;
     for row in fold_files(&files).rows() {
         let sum = row
@@ -378,7 +373,7 @@ pub fn sum_sweep_tokens_by_model(
         workspace_root,
         issue,
         window,
-        "safehouse per-model token total",
+        "sweep per-model token total",
     )?;
     let rows: Vec<ModelUsageTotals> = fold_files(&files).rows();
     (!rows.is_empty()).then_some(rows)

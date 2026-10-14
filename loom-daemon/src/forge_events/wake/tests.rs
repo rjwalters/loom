@@ -840,7 +840,6 @@ fn the_documented_per_loop_multipliers_match_the_wired_cadences() {
         (crate::work_finder::DEFAULT_WORK_FINDER_INTERVAL_SECS, 2),
         (crate::watch_registry::DEFAULT_WATCH_MONITOR_INTERVAL_SECS, 4),
         (crate::claim_reconciliation::DEFAULT_RECONCILE_INTERVAL_SECS, 20),
-        (crate::claim_reconciliation::DEFAULT_SAFEHOUSE_RECONCILE_INTERVAL_SECS, 60),
     ];
     for (cadence, expected) in cases {
         assert_eq!(

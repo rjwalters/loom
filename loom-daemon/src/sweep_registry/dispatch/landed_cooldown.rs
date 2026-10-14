@@ -1,13 +1,13 @@
-//! The landed cooldown (Issue #11853): a long, fleet-wide dispatch window for
-//! an issue whose work already landed.
+//! The landed cooldown (Issue #11853): a long dispatch window for an issue
+//! whose work already landed.
 //!
 //! An issue that stays open after its closing PR merged used to be refused
-//! on every tick for 30 minutes on the host that landed it, and dispatched
-//! for real on every other host. This window rides the #4485 backoff map and
-//! the #7477 `DispatchBackoffArmed` broadcast, so every consumer of
-//! [`SweepRegistry::dispatch_backoff_issues`] (the work finder's pre-dispatch
-//! skip, step 2.8 inside `dispatch()`) honours it here and on every peer
-//! without a new lane or wire kind. What differs from the ladder:
+//! on every tick for 30 minutes. This window rides the #4485 backoff map, so
+//! every consumer of [`SweepRegistry::dispatch_backoff_issues`] (the work
+//! finder's pre-dispatch skip, step 2.8 inside `dispatch()`) honours it
+//! without a new lane. The peer-claim broadcast that once carried it to other
+//! hosts is retired (#11112); the window is per host. What differs from the
+//! ladder:
 //!
 //! - its length is the caller's, not `backoff_delay(..)`'s: hours, where the
 //!   ladder stops at 900 s;
@@ -16,14 +16,8 @@
 //! - it is tagged [`DispatchBackoffCause::Landed`], so its log lines say it is
 //!   a deliberate skip rather than a failed dispatch.
 //!
-//! A peer receiving the broadcast installs `now + remaining` without a cap
-//! (`PeerClaimView::observe_dispatch_backoff_at`), so the length carries, and
-//! never lets a later, shorter window for the same issue shorten it (#11901).
-//!
-//! The window is lifted early, here and on every peer, when the issue is
-//! reopened after its landing or Curator keeps it
-//! ([`SweepRegistry::clear_landed_cooldown`], #11901): a zero-length
-//! broadcast, which the receiver reads as a clear.
+//! The window is lifted early when the issue is reopened after its landing or
+//! Curator keeps it ([`SweepRegistry::clear_landed_cooldown`], #11901).
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -31,7 +25,6 @@ use std::time::Duration;
 use chrono::Utc;
 
 use super::{backoff_cause, DispatchBackoffCause, DispatchBackoffState};
-use crate::peer_claims;
 use crate::sweep_registry::SweepRegistry;
 
 /// Ceiling on one landed cooldown: a caller's mistake costs a day, not an
@@ -39,8 +32,7 @@ use crate::sweep_registry::SweepRegistry;
 const MAX_LANDED_COOLDOWN: Duration = Duration::from_secs(24 * 3600);
 
 impl SweepRegistry {
-    /// Arm `issue`'s landed cooldown for `window` here and on every peer
-    /// (#11853). A no-op when the dispatch backoff is disabled or `window` is
+    /// Arm `issue`'s landed cooldown for `window` (#11853). A no-op when the dispatch backoff is disabled or `window` is
     /// zero; a longer window already in force is kept.
     pub(crate) fn arm_landed_cooldown(&mut self, issue: u32, window: Duration) {
         if !self.dispatch_backoff_config.enabled || window.is_zero() {
@@ -65,11 +57,6 @@ impl SweepRegistry {
         );
         let remaining = (until - now).to_std().unwrap_or(window);
         backoff_cause::log_armed(issue, 0, remaining, DispatchBackoffCause::Landed);
-        self.publish_peer_cooldown_claim(
-            peer_claims::ClaimKind::DispatchBackoffArmed,
-            issue,
-            remaining,
-        );
     }
 
     /// Every issue whose local dispatch-backoff window in force now is a
@@ -85,15 +72,11 @@ impl SweepRegistry {
             .collect()
     }
 
-    /// Lift `issue`'s landed cooldown here and on every peer (#11901): the
-    /// issue was reopened after its landing, or Curator kept it, so the
-    /// window has nothing left to protect. Only a local window of the
-    /// `Landed` cause is removed; a failure-ladder window stays. Every peer
-    /// gets a zero-length `DispatchBackoffArmed`, which its extend-only
-    /// receiver reads as a clear, and this host's own copy of a peer's window
-    /// for the issue is dropped too, since it cannot tell a peer's landed
-    /// window from another one and the forge just said the landing is moot.
-    /// Returns whether a local landed window was removed.
+    /// Lift `issue`'s landed cooldown (#11901): the issue was reopened after
+    /// its landing, or Curator kept it, so the window has nothing left to
+    /// protect. Only a window of the `Landed` cause is removed; a
+    /// failure-ladder window stays. Returns whether a landed window was
+    /// removed.
     pub(crate) fn clear_landed_cooldown(&mut self, issue: u32) -> bool {
         let removed = self
             .dispatch_backoff
@@ -102,18 +85,7 @@ impl SweepRegistry {
         if removed {
             self.dispatch_backoff.remove(&issue);
         }
-        if let Some(view) = &self.peer_claims {
-            let repo = peer_claims::repo_slug(&self.config.workspace_root);
-            view.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clear_dispatch_backoff(&repo, issue);
-        }
         log::info!("sweep_registry: landed cooldown on issue #{issue} lifted (#11901)");
-        self.publish_peer_cooldown_claim(
-            peer_claims::ClaimKind::DispatchBackoffArmed,
-            issue,
-            Duration::ZERO,
-        );
         removed
     }
 

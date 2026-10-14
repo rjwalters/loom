@@ -42,8 +42,6 @@ pub struct WorkFinderTickSummary {
     pub skipped_workspace_commands_missing: usize,
     /// Issues skipped because they already have an open linked PR.
     pub skipped_pr_open: usize,
-    /// Issues skipped because a peer host advertised a live soft claim.
-    pub skipped_peer_claim: usize,
     /// Issues skipped inside a per-issue dispatch-backoff window.
     pub skipped_backoff: usize,
     /// The subset of [`Self::skipped_backoff`] whose window was armed
@@ -384,7 +382,6 @@ impl WorkFinderTickSummary {
             (self.skipped_quarantined, "quarantine-skip"),
             (self.skipped_workspace_commands_missing, "workspace-commands-missing-skip"),
             (self.skipped_pr_open, "pr-open-skip"),
-            (self.skipped_peer_claim, "peer-claim-skip"),
             (self.skipped_backoff, "backoff-skip"),
             (self.skipped_pr_open_backoff, "pr-open-backoff"),
             (self.skipped_declined, "declined-skip"),

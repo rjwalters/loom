@@ -131,8 +131,8 @@ is already the "lightweight remote view of running agents" surface the issue des
 documented `--peers` flag for multihost fan-out; and (2) the codecast evaluation
 (`docs/research/codecast-evaluation.md`, Question 4) already worked through the same
 "mobile visibility on a phone" idea in more depth than this issue asks for, and its
-recommendation — build it on top of the safehouse comms layer (already rolled out and now the
-PRIMARY Loom interface, per this repo's project memory) rather than a bespoke native app — is
+recommendation — build it on top of an operator comms layer (since #11112 that lives outside
+Loom, in 2am) rather than a bespoke native app — is
 the answer to Orca's mobile idea too, since both point at the same underlying gap (no live push
 view). This survey deliberately does not re-litigate that prior evaluation or file a redundant
 issue; anyone extending the dashboard's field set should read the codecast evaluation's borrow

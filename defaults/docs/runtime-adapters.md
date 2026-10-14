@@ -2284,7 +2284,7 @@ kernel already sees as niced.
   per-repo-per-host cache `post-worktree.sh`'s binary-reuse fast path
   already assumes, consistent with the #6013/#6014 rebuild-storm constraint
   the mount contract's §4 documents. **Every `LOOM_*`/`CLAUDE_*`/
-  `SAFEHOUSE*`/`CODEX_*` env var already present in the invoking process's
+  `CODEX_*` env var already present in the invoking process's
   environment is forwarded by name** (`-e VAR`, no value — docker reads it
   live from the client's own env), covering `LOOM_SWEEP_CLAIM_OWNED`,
   `LOOM_ROLE`, `LOOM_RUNTIME`, `LOOM_MODEL`/`LOOM_EFFORT`, and anything

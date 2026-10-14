@@ -931,9 +931,9 @@ drifted. The session reconciler recreates idle ones itself (busy ones on a
 later pass; see `daemon-reference.md`), so the manual recreate it prints is an
 override for a stopped daemon or an opted-out reconciler.
 
-**Uncovered `gh` callers (#10343, tracked in #10618).** Spend from `safehouse.rs`,
-`auto_update`/`release_resolve`, `credential_preflight`, `sweep-lease-renew.sh`,
-`peer_coord.rs` and `main_health_gate` bypasses the `invoke github` span, so it
+**Uncovered `gh` callers (#10343, tracked in #10618).** Spend from
+`auto_update`/`release_resolve`, `credential_preflight`, `sweep-lease-renew.sh`
+and `main_health_gate` bypasses the `invoke github` span, so it
 reads as shadow spend. The span-vs-`/rate_limit` hourly reconciliation is an
 operational check on a fleet host (shadow recipe above), not a CI check.
 
@@ -1225,8 +1225,6 @@ and dropped).
 |---|---|---|
 | `fleet.<condition>` (`dispatch-halted`, `roles-persistent`, `capacity-limited`, `output-missing`; `star-backlog` retired by #11510) | `fleet_alert` | condition started (and each reminder) / cleared |
 | `daemon.down` (critical) | the watchdog, a separate process | recovery exhausted / any tick ending the outage |
-| `watchdog.peer-coord-degraded` (critical) | the watchdog | coordination degraded / green |
-| `safehouse.unreachable` (critical) | narration sink state | unreachable over 5 minutes / reconnected |
 | `fleet.floor-unsatisfiable` | `auto_update` | the floor ERROR line / floor met |
 | `fleet.floor-malformed` | fleet-sync pass | `loom_min_version` malformed / a valid (or no) floor |
 | `fleet.sync-error` | fleet-sync pass | 3 erroring passes in a row / a clean pass |
@@ -1251,7 +1249,7 @@ Level-triggered sources keep the incidents they hold open in
 the previous process opened once it finds the condition gone, and keeps one
 open while its failure count (process memory) builds up again; a daemon
 that finds the output off removes those files. The single-key
-watches (safehouse, breaker, llm-monitor) send one `resolved` on their first
+watches (breaker, llm-monitor) send one `resolved` on their first
 healthy sample instead. Alerts raised before the output starts (credential
 preflight, the fleet-sync startup pass) wait in the outbox. llm-monitor's
 quota step-change alert is not in `ranking.json` yet, so it is not sent.

@@ -2,7 +2,7 @@
 //! handlers (Issue #4712 — split out of `main.rs`). `fleet status` lives in
 //! `cli::status` (it needs the async runtime for the local-host round-trip).
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -76,19 +76,6 @@ pub(crate) fn handle_fleet_command(action: FleetAction) -> Result<()> {
             pat_file,
             accounts_env,
             loom_repo,
-            safehouse,
-            safehouse_tailnet_auth_key_file,
-            safehouse_secrets_file,
-            safehouse_repo_url,
-            safehouse_homeserver_url,
-            safehouse_room,
-            safehouse_personas,
-            safehouse_invite_exec,
-            feed_egress,
-            feed_egress_ingest_key_file,
-            feed_egress_sink_url,
-            feed_egress_deny_patterns,
-            feed_egress_delay_seconds,
             idle_shutdown_minutes,
             dry_run,
         } => {
@@ -100,20 +87,7 @@ pub(crate) fn handle_fleet_command(action: FleetAction) -> Result<()> {
                 loom_repo_url: loom_repo,
                 pat_file: pat_file.map(PathBuf::from),
                 accounts_env_file: accounts_env.map(PathBuf::from),
-                safehouse_enabled: safehouse,
                 idle_shutdown_minutes,
-                safehouse_tailnet_auth_key_file: safehouse_tailnet_auth_key_file.map(PathBuf::from),
-                safehouse_secrets_file: safehouse_secrets_file.map(PathBuf::from),
-                safehouse_repo_url,
-                safehouse_homeserver_url,
-                safehouse_room,
-                safehouse_personas,
-                safehouse_invite_exec,
-                feed_egress_enabled: feed_egress,
-                feed_egress_ingest_key_file: feed_egress_ingest_key_file.map(PathBuf::from),
-                feed_egress_sink_url,
-                feed_egress_deny_patterns,
-                feed_egress_delay_seconds,
             };
             add_worker::run(&config)
         }
@@ -171,14 +145,6 @@ pub(crate) fn handle_fleet_command(action: FleetAction) -> Result<()> {
             force_after_timeout,
             json,
         } => {
-            // Resolved once, from the operator's own cwd (mirrors
-            // `WorkspacePool::start_safehouse_narration`'s
-            // `safehouse::resolve_config(repo_root)` call shape) — see
-            // `fleet::drain::flush_safehouse`'s doc comment for the real
-            // supervised-stop flush check this now gates on (#3998).
-            let cwd = std::env::current_dir().context("resolving cwd for safehouse config")?;
-            let safehouse_enabled = loom_daemon::safehouse::resolve_config(&cwd).enabled;
-
             let poll_interval = Duration::from_secs(drain::DEFAULT_POLL_INTERVAL_SECS);
             let max_polls = ((timeout / drain::DEFAULT_POLL_INTERVAL_SECS.max(1)) + 12) as u32;
             let config = DrainConfig {
@@ -187,7 +153,6 @@ pub(crate) fn handle_fleet_command(action: FleetAction) -> Result<()> {
                 force_after_timeout,
                 poll_interval,
                 max_polls,
-                safehouse_enabled,
                 json,
             };
             let report = drain::run(&config)?;

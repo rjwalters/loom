@@ -180,8 +180,6 @@ struct RecordingDispatcher {
     backoff_refuse_issues: HashSet<u32>,
     /// Cumulative cross-host collision count this dispatcher reports (#4085).
     collisions: u64,
-    /// Issue numbers a peer host has soft-claimed over safehouse (#4028).
-    peer_claimed: HashSet<u32>,
     /// Issue numbers whose dispatch should be refused by the live-claim
     /// guard (#4556) — the dispatcher returns the typed
     /// [`LiveClaimDispatchError`], as `SweepRegistry::dispatch` step 2.9 does
@@ -252,9 +250,6 @@ impl WorkDispatcher for RecordingDispatcher {
     }
     fn collisions(&self) -> u64 {
         self.collisions
-    }
-    fn peer_claimed(&self) -> HashSet<u32> {
-        self.peer_claimed.clone()
     }
     fn extra_skip_labels(&self) -> Vec<String> {
         self.extra_skip_labels.clone()
@@ -1590,39 +1585,6 @@ fn test_tick_multi_backoff_refusal_counts_as_backoff_skip() {
     assert_eq!(report.skipped_backoff, 1);
     assert_eq!(report.errors, 0);
     assert_eq!(multi[0].1.dispatched, vec![6]);
-}
-
-#[test]
-fn test_tick_peer_claim_skipped_under_distinct_counter() {
-    // A peer host's live soft claim (#4028) skips the issue under its OWN
-    // distinct counter — never folded into labeled/in-flight/quarantine — and
-    // does not consume a capacity slot (checked before the cap gate), so the
-    // healthy sibling issue takes the slot.
-    let mut source = FakeSource::once(vec![issue(1), issue(2)]);
-    let mut disp = RecordingDispatcher {
-        peer_claimed: HashSet::from([1]),
-        ..Default::default()
-    };
-    let report = tick(&mut source, &mut disp, 1, false).unwrap();
-
-    assert_eq!(report.skipped_peer_claim, 1, "#1 is peer-claimed");
-    assert_eq!(report.skipped_labeled, 0, "peer-claim is NOT a label skip");
-    assert_eq!(report.skipped_in_flight, 0, "peer-claim is NOT an in-flight skip");
-    assert_eq!(report.dispatched, 1);
-    assert_eq!(disp.dispatched, vec![2], "the slot goes to the un-claimed #2");
-}
-
-#[test]
-fn test_tick_stops_skipping_once_peer_claim_clears() {
-    // Once the peer claim lapses (empty peer_claimed set, mirroring a TTL
-    // expiry / retraction), the previously-skipped issue dispatches normally.
-    let mut source = FakeSource::once(vec![issue(1)]);
-    let mut disp = RecordingDispatcher::default(); // no peer claims now
-    let report = tick(&mut source, &mut disp, 5, false).unwrap();
-
-    assert_eq!(report.skipped_peer_claim, 0);
-    assert_eq!(report.dispatched, 1);
-    assert_eq!(disp.dispatched, vec![1]);
 }
 
 #[test]

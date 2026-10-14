@@ -3,7 +3,7 @@
 Every `gh issue create` in Loom goes through **one machine-wide lock**, so two
 issue-creating agents can never interleave their filing bursts.
 
-This document is the reference for the mechanism, its two tiers, its knobs, and
+This document is the reference for the mechanism, its scope, its knobs, and
 the one boundary it deliberately does not pretend to cross.
 
 ## Why a lock, and not a rule
@@ -53,64 +53,40 @@ Two halves implement the identical on-disk protocol, exactly like the
 | Half | Path | Used by |
 |---|---|---|
 | Bash | `defaults/scripts/lib/filing-lock.sh` | `create-issue.sh`, i.e. every agent |
-| Rust | `loom-daemon/src/filing_lock.rs` | the daemon, incl. the peer-hold mirror |
+| Rust | `loom-daemon/src/filing_lock.rs` | the daemon |
 
-## Two tiers, and an honest boundary
+## Scope: one host
 
-| Tier | Scope | Strength |
-|---|---|---|
-| **Host** | every workspace + every agent process on one machine | **hard** mutual exclusion (POSIX-atomic `mkdir`) |
-| **Fleet** | other hosts | **soft**, TTL-bounded backoff |
+The lock is **hard** mutual exclusion (POSIX-atomic `mkdir`) across every
+workspace and every agent process on one machine. That is what closes the
+2026-08-08 hazard: two processes can only overwrite each other's *body text*
+through shared memory or a shared filesystem, which means one machine. Note
+that "host-wide" is already strictly stronger than what failed — the gap
+#3707's mitigation left was *cross-workspace*, not cross-machine.
 
-The host tier is what actually closes the 2026-08-08 hazard: two processes can
-only overwrite each other's *body text* through shared memory or a shared
-filesystem, which means one machine. Note that "host-wide" is already strictly
-stronger than what failed — the gap #3707's mitigation left was
-*cross-workspace*, not cross-machine.
+A soft cross-host tier (a filing hold advertised over a Matrix side channel)
+existed until #11112 removed that channel; the weaker cross-host
+hazard it covered — a burst binding the wrong freshly-minted issue **number**
+into a `Part of #N` cross-reference — is accepted.
 
-The fleet tier covers the weaker, genuinely cross-host hazard #3707 also named:
-a burst binding the wrong freshly-minted issue **number** into a `Part of #N`
-cross-reference. It rides the existing peer-claims transport (#4028):
-
-1. A filer that takes the host lock publishes a `filing_lock` claim ad over the
-   safehouse claims room, via `fleet-send.sh`. (Published by the filer itself,
-   not by a daemon tick — a burst lasts seconds, and the reaper's 30s
-   re-advertisement cadence would miss almost all of them.)
-2. Every peer daemon's `safehouse::PeerClaimSink` folds it into
-   `PeerClaimView`'s filing-hold map **and mirrors it to disk** at
-   `<store>/peers/<host>`.
-3. That mirror is what the *other host's* `filing-lock.sh` reads — the daemon is
-   the bridge between the cross-host transport and the cross-process lock.
-4. Release publishes `filing_unlock`, which clears both.
-
-One consequence of keying the host tier on `$HOME`: agents running in separate
+One consequence of keying the store on `$HOME`: agents running in separate
 containers (the `loom-worker` image) each get their own store, so they serialize
 within a container, not across containers on the same physical host. Mount a
 shared `LOOM_FILING_LOCK_DIR` if you run several worker containers per host and
-want them to serialize; otherwise they fall back to the fleet tier, exactly like
-two separate machines.
-
-**This tier is soft on purpose, and that is not a shortcut.** `peer_claims.rs`'s
-own module documentation states the contract: *"A room broadcast is eventually
-consistent, so this is a fast backoff, not a lock."* A true cross-host mutex
-needs an atomic authority — the peer-claims Phase 2 CAS that has never been
-built — not a broadcast. A host with safehouse disabled simply degrades to
-host-only serialization, with no error anywhere.
+want them to serialize.
 
 ## Safety properties
 
 All four are load-bearing; each is covered by a test in
 `defaults/scripts/tests/test-filing-lock.sh` and `filing_lock.rs`'s test module.
 
-1. **A crashed holder cannot wedge fleet-wide issue creation.** Three
-   independent reap legs:
+1. **A crashed holder cannot wedge issue creation.** Two independent reap
+   legs:
    - the holder directory aging past `LOOM_FILING_LOCK_STALE_SECS`;
    - an owner recorded on *this* host whose PID is not running — reaped
      immediately (the same `live_claim` discipline the `loom:building` lease
      uses). A PID number from *another* machine says nothing about a process
-     here, so it is never used for liveness;
-   - a peer hold aging past its own (shorter) TTL, so a peer that dies mid-burst
-     and never sends `filing_unlock` frees within a minute.
+     here, so it is never used for liveness.
 2. **Bounded and fail-SAFE.** The wait is bounded; on expiry the filer
    **defers** — exit code `75` (`EX_TEMPFAIL`), nothing filed, a log line saying
    so, retry on the next tick. This is the one place the filing lock
@@ -132,15 +108,11 @@ All four are load-bearing; each is covered by a test in
 <store>/                  # ~/.loom/locks/issue-filing by default
   holder/                 # the lock itself — mkdir-atomic
     owner.json            # {"host","pid","label","acquired_at"}
-  peers/
-    <host>                # a peer's advertised hold; mtime = LOCAL receipt time
 ```
 
 `flock` is deliberately avoided (unavailable on stock macOS), matching the
-token-pool lock, the per-issue claim lock and the build slot. Peer-hold TTLs are
-measured against **local receipt**, never the advertiser's wall clock — clock
-skew makes cross-host timestamps incomparable, the same rule `peer_claims.rs`
-applies to its own TTLs.
+token-pool lock, the per-issue claim lock and the build slot. A leftover
+`peers/` directory from the removed cross-host tier is ignored.
 
 ## Knobs
 
@@ -153,15 +125,9 @@ silently ignoring it on the other — the `LOOM_PER_WORKTREE_GB` precedent).
 | `LOOM_FILING_LOCK` | `1` | `0`/`false`/`off`/`no` disables serialization entirely |
 | `LOOM_FILING_LOCK_WAIT_SECS` | `120` | bounded wait before deferring |
 | `LOOM_FILING_LOCK_STALE_SECS` | `300` | age at which a holder is reaped |
-| `LOOM_FILING_LOCK_PEER_TTL_SECS` | `60` | age at which a mirrored peer hold expires |
 | `LOOM_FILING_LOCK_DIR` | `~/.loom/locks/issue-filing` | store location |
 | `LOOM_FILING_LOCK_LABEL` | `create-issue` | label recorded in `owner.json` |
 | `LOOM_FILING_LOCK_HELD` | unset | re-entrancy sentinel (set by the holder) |
-
-The daemon-side peer-hold TTL additionally honors
-`LOOM_PEER_FILING_LOCK_TTL_SECS` / `safehouse.peerFilingLockTtlSecs` for the
-in-memory `PeerClaimView` copy; keep it in lock-step with
-`LOOM_FILING_LOCK_PEER_TTL_SECS`.
 
 ## What a role should do on exit code 75
 

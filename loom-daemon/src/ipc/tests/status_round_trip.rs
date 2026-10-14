@@ -124,12 +124,6 @@ fn test_daemon_status_request_response_round_trip() {
         admission_brake: None,
         rate_limit_breaker: None,
         forge_calls: None,
-        safehouse: Some(crate::types::SafehouseStatus {
-            state: "connected".to_string(),
-            socket: Some(std::path::PathBuf::from("/tmp/safehoused.sock")),
-            room: Some("fleet".to_string()),
-            reason: None,
-        }),
         work_finder_enabled: Some(true),
         last_work_finder_tick: Some(crate::types::WorkFinderTickSummary {
             at: chrono::Utc::now(),
@@ -225,7 +219,6 @@ fn test_daemon_status_request_response_round_trip() {
             }],
             ..Default::default()
         }),
-        peer_claims: None,
         deep_clean: Vec::new(),
         idle_exit: Some(crate::types::IdleExitStatus {
             enabled: true,

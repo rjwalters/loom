@@ -195,12 +195,12 @@ fn write_mode_refuses_a_lossy_reduction_and_surfaces_it() {
     let cache = tempfile::tempdir().expect("cache");
     let out = tempfile::tempdir().expect("out");
     let (machine, local) = tier_paths(out.path());
-    // `safehouse` is a top-level block the store's render for build-1 never
+    // `retiredBlock` is a top-level block the store's render for build-1 never
     // had (sample_files() only ever renders `autonomous`/`forge` there) — the
     // store never had it, so this is the exact clobber 2am#1653 hit.
     std::fs::write(
         &machine,
-        r#"{"autonomous":{"workFinder":{"maxConcurrent":1}},"safehouse":{"enabled":true}}"#,
+        r#"{"autonomous":{"workFinder":{"maxConcurrent":1}},"retiredBlock":{"enabled":true}}"#,
     )
     .expect("seed a file with a block the store doesn't have");
 
@@ -218,14 +218,14 @@ fn write_mode_refuses_a_lossy_reduction_and_surfaces_it() {
     assert!(pass.drifted(), "the seeded file differs from the store's render");
     assert_eq!(
         std::fs::read_to_string(&machine).expect("machine tier"),
-        r#"{"autonomous":{"workFinder":{"maxConcurrent":1}},"safehouse":{"enabled":true}}"#,
+        r#"{"autonomous":{"workFinder":{"maxConcurrent":1}},"retiredBlock":{"enabled":true}}"#,
         "the on-disk file must be untouched when the write is refused"
     );
     let err = pass
         .error
         .as_deref()
         .expect("the loss must be surfaced as an error");
-    assert!(err.contains("safehouse"), "error names the dropped block: {err}");
+    assert!(err.contains("retiredBlock"), "error names the dropped block: {err}");
     let machine_report = pass
         .tiers
         .iter()
@@ -236,7 +236,7 @@ fn write_mode_refuses_a_lossy_reduction_and_surfaces_it() {
         .detail
         .as_deref()
         .expect("detail")
-        .contains("safehouse"));
+        .contains("retiredBlock"));
 }
 
 #[test]

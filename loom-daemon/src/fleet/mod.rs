@@ -53,7 +53,7 @@
 //! toolchain (ngspice + Xyce, built from source) plus the gf180mcu and sky130
 //! open PDKs onto a reachable SSH host. It is a **sibling**, not an
 //! extension, of `add_worker`: a sim runner is not a loom worker, so it never
-//! touches the fleet registry, forge auth, the token pool, or safehouse — see
+//! touches the fleet registry, forge auth, or the token pool — see
 //! [`spice_runner`]'s own doc comment for the full scope boundary.
 
 pub mod add_worker;
@@ -195,8 +195,8 @@ impl Step {
 }
 
 /// An entry in the ordered plan: either an executable [`Step`] or a
-/// deliberately-skipped step (config-gated, e.g. safehouse when it is not
-/// enabled or its prerequisite has not landed).
+/// deliberately-skipped step (config-gated, e.g. the idle-shutdown guard when
+/// it was not requested, or a step whose prerequisite has not landed).
 #[derive(Debug, Clone)]
 pub enum PlanEntry {
     /// A step to execute (check → apply → verify).
@@ -209,7 +209,7 @@ pub enum PlanEntry {
         name: String,
         /// One-line human summary.
         summary: String,
-        /// Why the step is skipped (e.g. `"safehouse.enabled is false"`).
+        /// Why the step is skipped (e.g. `"no --accounts-env supplied"`).
         reason: String,
     },
 }
@@ -1027,13 +1027,13 @@ mod tests {
     fn skip_entries_report_skipped_and_do_not_run() {
         let mut plan = Plan::new();
         plan.push_step(Step::new("real", "do it", None, "a".into()));
-        plan.push_skip("safehouse", "wire safehouse", "safehouse.enabled is false");
+        plan.push_skip("idle-shutdown", "install idle guard", "not requested");
         let runner = MockRunner::new(vec![ok()]);
         let reports = execute_plan(&runner, &plan);
         assert_eq!(reports.len(), 2);
         assert_eq!(reports[0].status, StepStatus::Changed);
         match &reports[1].status {
-            StepStatus::Skipped(reason) => assert_eq!(reason, "safehouse.enabled is false"),
+            StepStatus::Skipped(reason) => assert_eq!(reason, "not requested"),
             other => panic!("expected Skipped, got {other:?}"),
         }
         // Only the one real step ran on the host.
@@ -1053,7 +1053,7 @@ mod tests {
                 },
             ),
         );
-        plan.push_skip("safehouse", "wire safehouse", "requires #3998");
+        plan.push_skip("idle-shutdown", "install idle guard", "requires #3998");
         let rendered = plan.render_dry_run("fleet add-worker", "worker-1");
         assert!(rendered.contains("worker-1"));
         assert!(rendered.contains("token-accounts"));

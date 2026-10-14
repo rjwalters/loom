@@ -234,12 +234,8 @@ mc_read_manifest() {
 # per-host scratch-disk path). Team-shared *policy* — what this repo does no
 # matter who runs it — does not, even when it lives in the same JSON object.
 #
-# Routing is therefore per-SUB-KEY, never per-object: `safehouse.enabled` and
-# `safehouse.socket` are host-local (whether safehoused is provisioned on this
-# box, and where its socket lives), while `safehouse.room` / `.rooms` /
-# `.persona` describe the fleet room the repo narrates to and stay tracked in
-# project.json. Likewise `observability.ingestKeyFile` (#5354, #5464, #6499,
-# #6504) is host-local — a per-host filesystem path to that host's ingest
+# Routing is therefore per-SUB-KEY, never per-object: `observability.ingestKeyFile`
+# (#5354, #5464, #6499, #6504) is host-local — a per-host filesystem path to that host's ingest
 # credential — while `observability.enabled` / `.endpoint` / `.batchSize` /
 # `.flushIntervalSecs` / `.queueCapacity` describe whether/how this repo
 # reports telemetry regardless of who runs it, and stay tracked. Adding a
@@ -249,16 +245,20 @@ mc_read_manifest() {
 # Bash 3.2: a plain indexed array (no associative arrays anywhere in this file).
 MC_HOST_LOCAL_KEYS=(
     "worktree.root"
-    "safehouse.enabled"
-    "safehouse.socket"
     "observability.ingestKeyFile"
+)
+
+# Top-level blocks of subsystems Loom no longer ships. Dropped from BOTH tiers
+# on extraction (the daemon ignores them with one warning anyway, #11112).
+MC_RETIRED_KEYS=(
+    "safehouse"
 )
 
 # mc_json_path_value <file> <dotted.path> — echo the value at <dotted.path> as
 # compact JSON (so `false` and `""` survive as themselves), or nothing at all
-# when the path is absent or null. Deliberately NOT `// empty`: `safehouse.enabled
-# = false` is exactly the value this routing exists to preserve, and `false //
-# empty` would silently drop it.
+# when the path is absent or null. Deliberately NOT `// empty`: a host-local
+# `false` is exactly the kind of value this routing exists to preserve, and
+# `false // empty` would silently drop it.
 mc_json_path_value() {
     local file="$1" path="$2"
     jq -c --arg p "$path" \
@@ -281,8 +281,7 @@ mc_json_display() {
 # Routing host-local keys OUT of the tracked tier is load-bearing: since this same
 # pass `git rm --cached`s the legacy .loom/config.json, project.json becomes the
 # highest tier every fresh clone / CI run picks up — copying one host's
-# worktree.root (or its `safehouse.enabled=false`, or its safehoused socket path)
-# there would silently propagate that host's provisioning to the whole team.
+# worktree.root (or its ingest-key path) there would silently propagate that host's provisioning to the whole team.
 # Idempotent: an existing project.json short-circuits (leaves both tiers untouched).
 mc_extract_config() {
     local repo="$1" dry_run="$2"
@@ -317,6 +316,10 @@ mc_extract_config() {
         mc_report surfaced ".loom/config.json" \
             "$key=$(mc_json_display "$val") is host-local → .loom-local/local.json (NOT the tracked project.json)"
     done
+    for key in "${MC_RETIRED_KEYS[@]}"; do
+        jq -e --arg k "$key" 'has($k)' "$legacy" >/dev/null 2>&1 || continue
+        mc_report surfaced ".loom/config.json" "$key is a retired block (#11112) → dropped from both tiers"
+    done
     if jq -e '.sweep.modelAliases' "$legacy" >/dev/null 2>&1; then
         mc_report surfaced "sweep.modelAliases" "EXCLUDED from project.json (Rust/Python resolver divergence — scope guard 1)"
     fi
@@ -331,7 +334,7 @@ mc_extract_config() {
     # Host-local tier first. Never clobber an existing local override; only fill in
     # keys that are unset there, so a re-run converges without losing operator
     # edits. "Unset" = absent, null, or empty string (an explicit `false` counts as
-    # set — that is the whole point of routing safehouse.enabled here).
+    # set — a host-local `false` must survive).
     if [[ "$have_local" == "1" ]]; then
         mkdir -p "$local_dir" || { mc_err "could not create $local_dir"; return 1; }
         local existed=0 staged staged_next entry
@@ -380,7 +383,7 @@ mc_extract_config() {
     # touched roots on purpose: an unrelated empty object the operator wrote into
     # the legacy config is left exactly as it was.
     local del_paths prune_roots
-    del_paths="$(printf '%s\n' "${MC_HOST_LOCAL_KEYS[@]}" | jq -R 'split(".")' | jq -sc '.')"
+    del_paths="$(printf '%s\n' "${MC_HOST_LOCAL_KEYS[@]}" "${MC_RETIRED_KEYS[@]}" | jq -R 'split(".")' | jq -sc '.')"
     prune_roots="$(printf '%s\n' "${MC_HOST_LOCAL_KEYS[@]}" | jq -R 'split(".")[0]' | jq -sc '. + ["sweep"] | unique')"
     if ! jq --argjson dels "$del_paths" --argjson roots "$prune_roots" \
              'delpaths($dels)
@@ -682,7 +685,7 @@ mc_update_claude_md() {
 # every daemon-dispatched child at the claude-wrapper MCP pre-flight (a fleet-wide
 # spawn outage with no surfaced error). This step therefore:
 #   1. strips any repo-scoped `loom` entry from .mcp.json (deleting the file if
-#      `loom` was its only server; other servers such as `safehouse` are kept),
+#      `loom` was its only server; other servers are kept),
 #      matching setup-mcp.sh's #4230 migration;
 #   2. verifies the user-scope `loom` registration exists and points at the machine
 #      checkout's mcp-loom/dist/index.js, (re)adding it if absent or mis-pointed.

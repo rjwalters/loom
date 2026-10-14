@@ -690,18 +690,6 @@ pub trait WorkDispatcher {
         0
     }
 
-    /// The set of issue numbers a **peer host** has advertised as in-flight over
-    /// the shared safehouse room and not yet expired (Issue #4028, Phase 1 soft
-    /// claim). The finder skips these — treating a peer's soft claim as an
-    /// additional TTL-bounded skip reason alongside [`SKIP_LABELS`] — so two
-    /// daemons on a shared backlog collide far less than the non-atomic forge
-    /// label flip alone permits. Defaults to empty so a dispatcher that does not
-    /// model peer claims (a test fake, or a registry with `safehouse.enabled`
-    /// false) opts out with zero boilerplate and **zero behavior change**.
-    fn peer_claimed(&self) -> HashSet<u32> {
-        HashSet::new()
-    }
-
     /// Additional label names — beyond the hardcoded [`PARK_LABELS`] —
     /// this dispatcher's workspace wants treated as a skip/park signal
     /// (Issue #6685), resolved once per workspace via
@@ -747,8 +735,8 @@ pub trait WorkDispatcher {
     ///
     /// Defaults to [`crate::sweep_registry::host_identity`] — the same
     /// `fleet.hostId` / `$LOOM_HOST_ID` / persisted-id resolution every
-    /// other host-identity consumer in the daemon (peer-claim
-    /// self-recognition, observability) already uses, so this feature can
+    /// other host-identity consumer in the daemon (lease self-recognition,
+    /// observability) already uses, so this feature can
     /// never disagree with them about what "this host" means. A test fake
     /// overrides this to a fixed string rather than mutating process-global
     /// env vars.
@@ -1091,7 +1079,6 @@ pub fn tick_with_lanes(
     // `noop_cooldown` / `declined` above. Empty until a dispatch actually
     // releases an issue without leaving a PR behind.
     let prless_retry = dispatcher.prless_retry();
-    let peer_claimed = dispatcher.peer_claimed();
     // Per-workspace additional skip-label list (#6685) — resolved once per
     // tick, mirroring every other dispatcher-supplied set above.
     let extra_skip_labels = dispatcher.extra_skip_labels();
@@ -1253,18 +1240,6 @@ pub fn tick_with_lanes(
         //      and cleared the dispatch backoff while producing nothing.
         if prless_retry.contains(&item.number) {
             report.skipped_prless_retry += 1;
-            continue;
-        }
-        // 2c. Peer soft claim (#4028): a peer host advertised a live claim over
-        //     the safehouse room. Back off — treated like a skip label, before
-        //     the capacity gate so a peer-claimed issue never reserves a slot.
-        if peer_claimed.contains(&item.number) {
-            report.skipped_peer_claim += 1;
-            log::info!(
-                "work_finder: skipping issue #{} — a peer host advertised a soft claim \
-                 over safehouse (#4028)",
-                item.number
-            );
             continue;
         }
         // 2d. Saturation admission brake (#4903) — the host is already at/over
@@ -1691,15 +1666,8 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
         .map(|(_, d)| d.prless_retry_expiry())
         .collect();
 
-    // Snapshot each workspace's peer-claim set (#4028) alongside its quarantined
-    // set. A peer's live soft claim drops the candidate in pass 1, before the
-    // global sort and slot fill, so a peer-claimed issue never reserves a shared
-    // dispatch slot.
-    let peer_claimed_sets: Vec<HashSet<u32>> =
-        workspaces.iter().map(|(_, d)| d.peer_claimed()).collect();
-
-    // Snapshot each workspace's additional skip-label list (#6685) alongside
-    // the peer-claim set — a per-workspace/per-repo configured list of extra
+    // Snapshot each workspace's additional skip-label list (#6685) — a
+    // per-workspace/per-repo configured list of extra
     // label names, beyond the hardcoded `PARK_LABELS`, this workspace wants
     // treated as a skip/park signal.
     let extra_skip_label_sets: Vec<Vec<String>> = workspaces
@@ -1951,18 +1919,6 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
             if prless_retry_sets[idx].contains(&item.number) {
                 report.skipped_prless_retry += 1;
                 skip(Qd::PrlessRetry, None, prless_retry_until[idx].get(&item.number).copied());
-                continue;
-            }
-            // Peer soft claim (#4028): a peer host is already building it — drop
-            // before the global queue so it consumes no shared slot.
-            if peer_claimed_sets[idx].contains(&item.number) {
-                report.skipped_peer_claim += 1;
-                skip(Qd::PeerClaim, None, None);
-                log::info!(
-                    "work_finder: skipping issue #{} — a peer host advertised a soft claim \
-                     over safehouse (#4028)",
-                    item.number
-                );
                 continue;
             }
             // One key feeds both the view and dispatch, so they cannot drift.
@@ -2669,7 +2625,6 @@ where
                         || report.skipped_recheck_interval > 0
                         || report.skipped_host_constraint > 0
                         || report.skipped_pr_open > 0
-                        || report.skipped_peer_claim > 0
                         || report.deferred_ramp_cap > 0
                         || report.deferred_saturation > 0
                     {
@@ -2684,7 +2639,6 @@ where
                              {} recheck-interval-skip, \
                              {} host-constraint-skip, \
                              {} pr-open-skip, \
-                             {} peer-claim-skip, \
                              {} deferred (capacity), {} deferred (ramp), \
                              {} deferred (host saturated), {} error(s), \
                              {} cross-host-collision(s)",
@@ -2702,7 +2656,6 @@ where
                             report.skipped_recheck_interval,
                             report.skipped_host_constraint,
                             report.skipped_pr_open,
-                            report.skipped_peer_claim,
                             report.deferred_capacity,
                             report.deferred_ramp_cap,
                             report.deferred_saturation,

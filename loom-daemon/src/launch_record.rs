@@ -250,10 +250,10 @@ pub fn last_resolved_runtime(contents: &str) -> Option<String> {
 /// A sweep's per-issue log path, derived from the workspace root alone
 /// (Issue #8507).
 ///
-/// `SweepRegistry::compute_log_path` delegates here, and safehouse's
-/// completion narration — which holds a workspace root and an issue number but
-/// no registry handle — calls it directly, so the two can never disagree about
-/// where a sweep's log (and therefore its `# LOOM_LAUNCH` record) lives.
+/// `SweepRegistry::compute_log_path` delegates here, and a registry-free
+/// caller holding only a workspace root and an issue number can call it
+/// directly, so the two can never disagree about where a sweep's log (and
+/// therefore its `# LOOM_LAUNCH` record) lives.
 #[must_use]
 pub fn sweep_log_path(workspace_root: &std::path::Path, issue: u32) -> std::path::PathBuf {
     workspace_root

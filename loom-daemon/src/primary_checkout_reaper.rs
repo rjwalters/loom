@@ -361,8 +361,8 @@ const UNMERGED_XY: [&str; 7] = ["DD", "AU", "UD", "UA", "DU", "AA", "UU"];
 /// cherry-pick) hit a conflict and was walked away from instead of resolved
 /// or aborted — exactly the shape behind the #6499 incident (live
 /// `<<<<<<<`/`=======`/`>>>>>>>` markers left in the tracked, load-bearing
-/// `.loom/config.json`, silently disabling observability/safehouse/
-/// roleRunner on the next daemon boot) and the earlier #6162 incident this
+/// `.loom/config.json`, silently disabling observability/roleRunner on the
+/// next daemon boot) and the earlier #6162 incident this
 /// mirrors (`check-main-clean.sh`'s own AC3 detection, which this is the
 /// periodic/primary-checkout-reaper-side counterpart of — that script is
 /// Builder-workflow-invoked, not periodic, so it never sees contamination
@@ -410,7 +410,7 @@ fn log_abandoned_conflict(repo_root: &Path, unmerged: &[String]) {
          #6162). Affected path(s): {}. These paths likely still contain literal '<<<<<<<' / \
          '=======' / '>>>>>>>' conflict markers and will NOT parse or behave as valid source — \
          if `.loom/config.json` is among them, the daemon is running with observability/\
-         safehouse/roleRunner config lost. Run `jq . .loom/config.json` to confirm, then resolve \
+         roleRunner config lost. Run `jq . .loom/config.json` to confirm, then resolve \
          manually (see .loom/docs/troubleshooting.md): restore a known-good version with `git \
          checkout <good-ref> -- <path>`, or discard the conflicted operation entirely with `git \
          reset --merge`. This checkout will NOT be auto-restored or switched while this persists.",

@@ -13,8 +13,8 @@
 //!   epic #4340's boundary — this consumes "a reachable box + an SSH alias",
 //!   exactly like [`super::add_worker`]).
 //! - Call the Tailscale API or touch forge/token credentials — a sim runner
-//!   is not a loom worker, so none of `add_worker`'s safehouse/forge-auth/
-//!   token-pool machinery applies here. Every clone below is an anonymous
+//!   is not a loom worker, so none of `add_worker`'s forge-auth/token-pool
+//!   machinery applies here. Every clone below is an anonymous
 //!   HTTPS clone of a public repo; nothing on this path reads `gh` auth,
 //!   `~/.loom/accounts.env`, or the token pool.
 //! - Wire a `spice-run` dispatch wrapper, result caching, or autoscaling —

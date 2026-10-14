@@ -1544,7 +1544,7 @@ repeat provisioning passes cannot re-enter this path on a tuned host.
 
 `.loom/config.json` is **tracked**, and every existing repo carries at least
 one host-specific field patched locally in the working tree (e.g.
-`safehouse.socket`, `observability.ingestKeyFile`, a stale `room` value —
+`observability.ingestKeyFile`, `worktree.root` —
 #5457 is the durable fix that will stop this). Because that patch sits
 uncommitted on top of a tracked file, a `git stash push`/`git stash pop`
 cycle against the primary checkout (whether run by a human or an agent) can
@@ -1552,7 +1552,7 @@ conflict on it — and if that conflict is left unresolved, `.loom/config.json`
 ends up on disk with literal `<<<<<<<` / `=======` / `>>>>>>>` markers
 embedded in it. That is invalid JSON: `config_resolver::resolve_effective_config`
 silently falls back to `{}` for this tier, and the daemon runs on **built-in
-defaults** for every value that file carried — `observability`, `safehouse`,
+defaults** for every value that file carried — `observability`,
 `autonomous.roleRunner`, and any other block your host's config tuned,
 disabled or reconfigured without you doing anything.
 
@@ -2462,14 +2462,10 @@ coordination problems, not a general-purpose external-mutex library):
   scheduled" half of the pattern above, which is exactly why a resource nobody
   else ever tries to (re-)claim can stay stale-held indefinitely under this
   model alone.
-- `PeerClaimView` (`loom-daemon/src/peer_claims.rs`) is the scheduled-reaper
-  half: it expires a peer's soft claim once local receipt time exceeds a fixed
-  TTL since the *last* observed heartbeat ad (`is_claimed_at` /
-  `claimed_issues_at`), and a periodic re-advertisement
-  (`sweep_registry::readvertise_peer_claims`) refreshes that clock well inside
-  the TTL for a still-live holder — see the module doc comment's "TTL is
-  measured against LOCAL receipt, never the advertiser's clock" section for why
-  wall-clock skew across hosts rules out comparing timestamps directly.
+- The lease record (`<!-- loom:lease … -->`, renewed by
+  `sweep-lease-renew.sh`) is the scheduled half: its forge-assigned
+  `updated_at` is the liveness clock every host reads identically, so no
+  cross-host clock comparison is ever needed ([`lease-record.md`](lease-record.md)).
 
 **Prior art establishing this as Loom's actual mitigation pattern** (both
 resolved without a kill-time hook, because none is available):

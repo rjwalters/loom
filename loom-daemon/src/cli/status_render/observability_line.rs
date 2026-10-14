@@ -108,8 +108,7 @@ fn render_state(status: Option<&ObservabilityExportStatus>, now: DateTime<Utc>) 
         ),
         // Only reachable from a NEWER daemon reporting a state this build does
         // not know. Say so plainly rather than collapsing it into one of the
-        // known states — the same "degrade legibly, never mislabel" posture the
-        // Safehouse block takes for an unknown state string (#4464).
+        // known states — "degrade legibly, never mislabel" (#4464).
         State::Unrecognized => format!(
             "Observability: unrecognized state from a newer daemon binary (host_id={host}) — \
              upgrade this client to read it"

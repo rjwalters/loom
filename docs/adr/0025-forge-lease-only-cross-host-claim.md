@@ -4,8 +4,10 @@
 
 Accepted (2026-10-10). Recorded by slice 1 of #11112, the removal of the
 safehouse (Matrix) integration. The code that this ADR retires (the
-peer-claim channel and the #7477 cooldown broadcast) is deleted in a later
-slice of the same issue. This ADR stands on its own and does not depend on any
+peer-claim channel and the #7477 cooldown broadcast) was deleted by the final
+slice of the same issue (2026-10-13), together with the pool-hold, heartbeat,
+PR-less-retry (#9292) and filing-lock cross-host lanes, which rode the same
+channel. This ADR stands on its own and does not depend on any
 safehouse document, since those are being deleted too.
 
 Partly supersedes [ADR-0014](0014-forge-coordination-decoupling.md)
@@ -64,8 +66,8 @@ fail-open cases where it does not (see "Retained fail-open limitation").
    host reaching builder spawn. That is the visible case. It is not a test of
    concurrent publication. The same file
    also asserts the fail-open cases below, where both hosts proceed.
-2. **No-op cooldown (#7477): per-host only.** The cooldown broadcast is
-   removed with the peer-claim code in a later slice of #11112. Each host keeps
+2. **No-op cooldown (#7477): per-host only.** The cooldown broadcast was
+   removed with the peer-claim code (#11112). Each host keeps
    its own local cooldown. No forge marker replaces the broadcast.
 3. **Quarantine broadcast (#9936): dropped.** It was never built, so nothing
    is removed. #9936 is closed as not planned and points here.
@@ -118,6 +120,9 @@ in these cases, and the tests above assert that they do:
   itself earliest, and proceeds too. Pinned by
   `staggered_visibility_both_proceed_inside_the_invisible_window` and
   `dispatch_with_a_peer_lease_never_visible_spawns_on_both_hosts`.
+  The composed dispatch-and-reclaim race on the lease alone is pinned by
+  `combined_dispatch_and_reclaim_race_produces_no_duplicate_build_on_the_lease_alone`
+  (`sweep_registry/dispatch/tests.rs`).
 
 So the forge lease alone gives exclusion **only when each dispatcher can read
 the forge and sees the competing lease inside its window**. It does not give

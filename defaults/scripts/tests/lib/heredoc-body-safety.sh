@@ -15,7 +15,7 @@
 # Why this file exists (#7834): the scan started life inline in
 # test-loom-daemon-watchdog.sh, where it sliced the body with an awk pattern
 # that only matched openers ENDING in `<<EOF`. The #7508 fix had already moved
-# escalate_peer_coordination_degraded() to `IFS= read -r -d '' body <<EOF ||
+# the watchdog's escalation body to `IFS= read -r -d '' body <<EOF ||
 # true` — the line ends in `|| true`, the pattern never fired, the slice came
 # back EMPTY, and both of that function's assertions passed VACUOUSLY. Two
 # properties here are the structural fix for that whole class:
@@ -180,14 +180,14 @@ read_d_with_triggers() {
     # A comment quoting body="$(cat <<EOF ... EOF)" must not be mistaken
     # for the opener.
     IFS= read -r -d '' body <<EOF || true
-This host's peer-claim path (Safehouse, #6157)
+This host's claim path (Lease, #6157)
 See \`advertised\` (#1270) for the suspected cause.
 EOF
 }
 
 cmdsubst_with_triggers() {
     body="$(cat <<EOF
-This host's peer-claim path (Safehouse, #6157)
+This host's claim path (Lease, #6157)
 See \`advertised\` (#1270) for the suspected cause.
 EOF
 )"
@@ -195,7 +195,7 @@ EOF
 
 cmdsubst_clean() {
     body="$(cat <<EOF
-This host has a peer-claim path (Safehouse, see 6157)
+This host has a claim path (Lease, see 6157)
 See the advertised counter for the suspected cause.
 EOF
 )"

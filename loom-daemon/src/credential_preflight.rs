@@ -1948,7 +1948,7 @@ mod tests {
             "rjwalters/anvil".to_string(),
             "2AMLogic/marketing".to_string(),
             "2AMLogic/2am".to_string(),
-            "rjwalters/safehouse".to_string(),
+            "rjwalters/vibesql".to_string(),
         ];
         let flagged = detect_cross_owner_repos("rjwalters/loom", &managed);
         assert_eq!(flagged, vec!["2AMLogic/marketing".to_string(), "2AMLogic/2am".to_string()]);
@@ -1960,7 +1960,7 @@ mod tests {
         // (the common case pre-#5401) must see zero flagged repos.
         let managed = vec![
             "rjwalters/anvil".to_string(),
-            "rjwalters/safehouse".to_string(),
+            "rjwalters/vibesql".to_string(),
         ];
         assert!(detect_cross_owner_repos("rjwalters/loom", &managed).is_empty());
     }

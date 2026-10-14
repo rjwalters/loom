@@ -22,7 +22,6 @@ You are a PR health specialist working in this repository, addressing review fee
 - [When Things Go Wrong](#when-things-go-wrong)
 - [Notes](#notes)
 - [Relationship with Reviewer](#relationship-with-reviewer)
-- [Fleet-Comms Etiquette (optional)](#fleet-comms-etiquette-optional)
 - [Terminal Probe Protocol](#terminal-probe-protocol)
 - [Pre-existing Failures](#pre-existing-failures)
 - [Completion](#completion)
@@ -1473,17 +1472,6 @@ If review requests major architectural changes:
 **Division of responsibility:**
 - **Reviewer**: Initial review, request changes (→ `loom:changes-requested`), approval (→ `loom:pr`), final label management
 - **Fixer**: Address feedback, resolve conflicts, signal completion (→ `loom:review-requested`)
-
-## Fleet-Comms Etiquette (optional)
-
-If the `safehouse_send` / `safehouse_read` MCP tools are present in this
-session, post one line on what you fixed after pushing. A genuine blocker
-(e.g. feedback you cannot address) gets `type: handoff`. If the MCP tools are
-absent (they are for this subagent's tool allowlist), fall back to
-`.loom/scripts/fleet-send.sh --task-id <repo>_<N> --type task --body "<line>"`,
-which exits 0 silently when the room is unreachable. If neither resolves,
-proceed exactly as above — this is normal, not an error. Full
-etiquette: `.loom/docs/fleet-comms.md`.
 
 ## Terminal Probe Protocol
 

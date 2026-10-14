@@ -240,7 +240,6 @@ pub fn start_launchd(ctx: &Ctx) -> ! {
     out::ok(&format!("loom-daemon started under launchd (pid {daemon_pid}, label {label})."));
     out::say(&format!("PID file: {}", ctx.pid_file.display()));
     out::say(&format!("Intent marker: {}", ctx.intent_marker.display()));
-    advisories::print_safehouse_status(&ctx.repo_root);
     if let Some(bin) = &ctx.daemon_bin {
         advisories::print_calibrate_hint(bin, &ctx.repo_root);
     }
@@ -386,7 +385,6 @@ pub fn start_systemd(ctx: &Ctx) -> ! {
     out::ok(&format!("loom-daemon started under systemd (pid {main_pid}, unit {unit})."));
     out::say(&format!("PID file: {}", ctx.pid_file.display()));
     out::say(&format!("Intent marker: {}", ctx.intent_marker.display()));
-    advisories::print_safehouse_status(&ctx.repo_root);
     if let Some(bin) = &ctx.daemon_bin {
         advisories::print_calibrate_hint(bin, &ctx.repo_root);
     }
@@ -468,7 +466,6 @@ pub fn start_nohup(ctx: &Ctx) -> ! {
         ctx.pid_file.display()
     ));
     out::say(&format!("Intent marker: {}", ctx.intent_marker.display()));
-    advisories::print_safehouse_status(&ctx.repo_root);
     advisories::print_calibrate_hint(&bin, &ctx.repo_root);
     stop_hint(ctx.machine_mode);
     std::process::exit(0);

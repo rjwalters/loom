@@ -110,8 +110,7 @@ walk up from `process.cwd()` to a `.loom/`/`.git` root). See
 for the full registration model and why per-repo `.mcp.json` generation was
 demoted (project-scope entries outrank and silently shadow the user-scope
 server). `scripts/setup-mcp.sh` is now only a bundle-rebuild/legacy-migration
-tool, with a safehouse-only residual role emitting a per-repo `.mcp.json`
-containing just the `safehouse` server.
+tool.
 
 ### Building MCP Server
 

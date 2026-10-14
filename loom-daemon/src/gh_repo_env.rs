@@ -34,7 +34,7 @@
 //! # Crate-wide test-isolation invariant for `LOOM_REPO` (#8496)
 //!
 //! `LOOM_REPO` is process-global, and roughly a dozen test modules mutate it
-//! (`gh_repo_env`, `peer_claims::repo_slug_tests`,
+//! (`gh_repo_env`,
 //! `claim_reconciliation::repo_env_tests`, `quarantine_reconciliation`, and the
 //! `sweep_registry` guards / dispatch / reaper / watchdog / outcome-journal test
 //! modules). **Every one of those tests MUST use the crate-default, unnamed
@@ -60,7 +60,28 @@
 //! name the default group (its key is the empty string; attribute keys are
 //! parsed as identifiers). See that test's own doc comment for the lock order.
 
+use std::path::Path;
 use std::process::Command;
+
+/// The cross-host-stable repo identity for a workspace: `$LOOM_REPO` when set
+/// (trimmed, non-empty), else the workspace directory's basename, else the
+/// full path. Two hosts with the same repo checked out at different paths
+/// agree on the key, which is what keyed per-repo records (traces, token
+/// selection) need.
+#[must_use]
+pub fn repo_slug(workspace_root: &Path) -> String {
+    if let Ok(v) = std::env::var("LOOM_REPO") {
+        let t = v.trim();
+        if !t.is_empty() {
+            return t.to_owned();
+        }
+    }
+    workspace_root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| workspace_root.display().to_string())
+}
 
 /// Apply a machine-global `LOOM_REPO` override to a **`gh api`** command as
 /// the `GH_REPO` environment variable.
@@ -138,5 +159,17 @@ mod tests {
             envs(&cmd)
         );
         assert!(!args(&cmd).iter().any(|a| a == "--repo"), "{:?}", args(&cmd));
+    }
+
+    /// `$LOOM_REPO` wins when set; otherwise the workspace directory basename
+    /// is the (cross-host-stable) fallback key.
+    #[test]
+    #[serial]
+    fn repo_slug_prefers_env_then_basename() {
+        std::env::set_var("LOOM_REPO", "rjwalters/loom");
+        assert_eq!(repo_slug(Path::new("/anything/here")), "rjwalters/loom");
+        std::env::remove_var("LOOM_REPO");
+        assert_eq!(repo_slug(Path::new("/Users/a/loom")), "loom");
+        assert_eq!(repo_slug(Path::new("/home/b/loom")), "loom");
     }
 }

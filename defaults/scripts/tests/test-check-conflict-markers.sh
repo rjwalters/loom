@@ -4,7 +4,7 @@
 # Exercises the tracked-file conflict-marker gate added for #6499 (an
 # abandoned `git stash pop` conflict left live markers in the tracked
 # `.loom/config.json`, was then COMMITTED by a resync pass, and silently
-# disabled observability/safehouse/roleRunner on the next daemon boot —
+# disabled observability/roleRunner on the next daemon boot —
 # every working-tree-state detector is blind once the corruption is
 # committed, and check-shell-syntax.sh only covers `*.sh`).
 #
@@ -68,18 +68,18 @@ cleanup() { rm -rf "$WORKDIR" 2>/dev/null || true; }
 trap cleanup EXIT
 
 # Writes the exact #6499 corruption shape into $1: a `git stash pop` conflict
-# on `safehouse.room` inside an otherwise-valid config object. Constructed via
+# on `observability.endpoint` inside an otherwise-valid config object. Constructed via
 # printf so this test file's own source stays marker-free.
 write_conflicted_config() {
     {
-        printf '{\n  "safehouse": {\n    "enabled": false,\n'
+        printf '{\n  "observability": {\n    "enabled": false,\n'
         printf '<<<<<<< Updated upstream\n'
-        printf '    "room": "!MQP2aSTA5uDu7czxYZ:safehouse.example.com"\n'
+        printf '    "endpoint": "https://otel.example.com"\n'
         printf '=======\n'
-        printf '    "socket": "/home/ubuntu/.loom/safehoused/state/safehoused.sock",\n'
-        printf '    "room": "loom-fleet",\n'
+        printf '    "ingestKeyFile": "/home/ubuntu/.loom/keys/ingest.key",\n'
+        printf '    "endpoint": "https://otel.internal.example.com",\n'
         printf '>>>>>>> Stashed changes\n'
-        printf '    "persona": "loom_daemon"\n  }\n}\n'
+        printf '    "service": "loom_daemon"\n  }\n}\n'
     } > "$1"
 }
 
@@ -124,7 +124,7 @@ fi
 # -------- Test 6: clean directory exits 0 --------
 echo "Test 6: clean directory"
 mkdir -p "$WORKDIR/clean"
-printf '{\n  "safehouse": { "room": "loom-fleet" }\n}\n' > "$WORKDIR/clean/config.json"
+printf '{\n  "observability": { "endpoint": "loom-fleet" }\n}\n' > "$WORKDIR/clean/config.json"
 printf '#!/usr/bin/env bash\necho hello\n' > "$WORKDIR/clean/a.sh"
 out=$("$SCRIPT" --dir "$WORKDIR/clean" 2>&1); RC=$?
 if [[ "$RC" -eq 0 && "$out" == *"no conflict markers found"* ]]; then

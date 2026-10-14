@@ -25,7 +25,7 @@
 # Consequence of missing it, for the file that triggered #6499: an
 # unparseable `.loom/config.json` makes the daemon's `config_resolver` fall
 # back to `{}` for that tier, silently running on built-in defaults for every
-# block the file carried — observability, safehouse, `autonomous.roleRunner`.
+# block the file carried — observability, `autonomous.roleRunner`.
 # On the original incident the fleet dashboard showed a host stale for ~70
 # minutes while its probe still reported UP.
 #
@@ -142,12 +142,12 @@ if [[ "$SELF_TEST" -eq 1 ]]; then
     # 1. The #6499 shape: a stash-pop conflict inside a JSON object.
     mkdir -p "$st_dir/positive"
     {
-        printf '{\n  "safehouse": {\n'
+        printf '{\n  "observability": {\n'
         printf '<<<<<<< Updated upstream\n'
-        printf '    "room": "!abc:example.com"\n'
+        printf '    "endpoint": "https://otel.example.com"\n'
         printf '=======\n'
-        printf '    "socket": "/home/ubuntu/.loom/safehoused/state/safehoused.sock",\n'
-        printf '    "room": "loom-fleet"\n'
+        printf '    "ingestKeyFile": "/home/ubuntu/.loom/keys/ingest.key",\n'
+        printf '    "endpoint": "loom-fleet"\n'
         printf '>>>>>>> Stashed changes\n'
         printf '  }\n}\n'
     } > "$st_dir/positive/config.json"
@@ -156,7 +156,7 @@ if [[ "$SELF_TEST" -eq 1 ]]; then
 
     # 2. Clean tree.
     mkdir -p "$st_dir/clean"
-    printf '{\n  "safehouse": { "room": "loom-fleet" }\n}\n' > "$st_dir/clean/config.json"
+    printf '{\n  "observability": { "endpoint": "loom-fleet" }\n}\n' > "$st_dir/clean/config.json"
     "$0" --dir "$st_dir/clean" --quiet >/dev/null 2>&1
     st_assert "clean json passes" "$EXIT_OK" "$?"
 

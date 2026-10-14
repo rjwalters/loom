@@ -11,9 +11,8 @@
 //! on the public fleet feed, which is what #8507 reported for the GLM-5.3
 //! trial's 46 merged PRs.
 //!
-//! Three call sites need the same decision — the sweep outcome journal, the
-//! role-tick journal, and safehouse's `completion-v1` narration — so the
-//! decision lives here once rather than as three copies of a
+//! Two call sites need the same decision — the sweep outcome journal and the
+//! role-tick journal — so the decision lives here once rather than as copies of a
 //! `runtime == "opencode"` test that could drift apart.
 //!
 //! # The contract every source keeps

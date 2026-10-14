@@ -290,7 +290,7 @@ fn held_until_is_none_for_every_other_disposition() {
             qrow(0, 4, Qd::Dispatched),
             qrow(0, 5, Qd::InFlight),
             qrow(0, 6, Qd::Quarantined),
-            qrow(0, 7, Qd::PeerClaim),
+            qrow(0, 7, Qd::OpenPr),
             qrow(0, 8, Qd::Parked),
         ],
         plan_order: vec![(0, 4), (0, 1), (0, 2), (0, 3)],

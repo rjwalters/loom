@@ -37,7 +37,6 @@ impl SweepRegistry {
         sweep_id: &str,
         started_at: DateTime<Utc>,
     ) {
-        self.publish_step_claim(peer_claims::ClaimKind::Retract, item, role);
         if self.config.skip_label_flip {
             return;
         }

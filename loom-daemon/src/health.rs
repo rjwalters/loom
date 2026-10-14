@@ -28,7 +28,6 @@
 //! | queues | [`crate::pipeline_snapshot`] (`queued`) |
 //! | throughput | [`crate::pipeline_snapshot`] (`merged_24h`, over the requested window) |
 //! | operator_attention | [`crate::pipeline_snapshot`] (`operator_held`, `operator_held_conflicting`, `operator_held_oldest_days`, `operator_only_issues`) — **always [`Verdict::Green`]**, deliberately (Issue #8091, see [`assess_operator_attention`]) |
-//! | peer_coordination | [`crate::types::DaemonStatusReport::safehouse`] (RPC socket reachability) + [`crate::types::DaemonStatusReport::peer_claims`]`.coordination` (published by [`crate::peer_claims::PeerClaimView::evaluate_coordination`], Issue #6157) |
 //! | auto_update | [`crate::types::DaemonStatusReport::auto_update_*`] (the daemon-side rebuild loop's own state, Issue #4055) + [`crate::self_update::check`] (this CLI process's own source-vs-built-commit staleness magnitude, Issue #6261) — unconditional, mirroring `liveness`/`dispatch` (Issue #7584) |
 //! | worktree_reaper | [`crate::types::DaemonStatusReport::stuck_worktree_reclaims`] (published by [`crate::worktree_reaper::stuck_worktree_removals`], Issue #7590) |
 //! | pool_hold | [`crate::types::DaemonStatusReport::pool_exhaustion_holds`] (published by [`crate::work_finder::pool_preflight::active_hold_statuses`], Issues #7708/#7990) — its own bucket, deliberately NOT folded into `tokens` |
@@ -2296,166 +2295,6 @@ pub mod operator_attention;
 pub use operator_attention::assess_operator_attention;
 
 // ============================================================================
-// Peer-coordination section (Issue #6157)
-// ============================================================================
-
-/// Assess the peer-coordination section: whether this host's safehouse RPC
-/// socket is reachable, and whether the peer-claim RECEIVE path looks
-/// alive — DEGRADED when either invariant from the 2026-08-13 incident
-/// fires:
-///
-/// 1. The socket itself is unreachable/rejected
-///    ([`crate::types::SafehouseStatus::state`]) — coordination cannot even
-///    be attempted.
-/// 2. This host has been advertising sustained peer claims with no receive
-///    in return
-///    ([`crate::peer_claims::PeerClaimView::evaluate_coordination`], surfaced
-///    via [`crate::types::PeerClaimStatus::coordination`]).
-///
-/// This section is diagnostic-only as of Epic #6165 Phase 4 (#6317):
-/// [`crate::claim_reconciliation::forge::reconcile_workspace`] used to
-/// refuse stale-claim reclamation while DEGRADED (Issue #6157), on the
-/// theory that a one-way channel's silence could not be trusted as evidence
-/// of anything. That gate has been removed — the lease record (Epic #6165
-/// Phase 2, Issue #6286) is the sole fleet-scoped reclamation gate now, and
-/// it needs no receipt from this channel at all — so a DEGRADED verdict
-/// here reports a real transport problem worth an operator's attention, but
-/// no longer changes reclamation behavior.
-///
-/// Green (not Unknown) when safehouse is not configured at all — there is
-/// nothing broken about a host that was never asked to coordinate with
-/// peers, and reporting `Unknown` there would make every non-fleet
-/// single-host repo look perpetually "could not determine".
-#[must_use]
-pub fn assess_peer_coordination(inputs: &HealthInputs) -> HealthSection {
-    let Some(status) = &inputs.status else {
-        return unknown_section("peer_coordination", &no_status_reason(inputs));
-    };
-
-    if let Some(safehouse) = &status.safehouse {
-        if matches!(safehouse.state.as_str(), "unreachable" | "send_rejected") {
-            let detail = safehouse
-                .reason
-                .clone()
-                .or_else(|| safehouse.socket.as_ref().map(|p| p.display().to_string()));
-            return HealthSection::new(
-                "peer_coordination",
-                Verdict::Degraded,
-                format!(
-                    "safehouse RPC socket {}{} — peer-coordination liveness is unknowable \
-                     (#6157)",
-                    safehouse.state,
-                    detail
-                        .as_ref()
-                        .map(|d| format!(": {d}"))
-                        .unwrap_or_default()
-                ),
-                serde_json::json!({
-                    "safehouse_state": safehouse.state,
-                    "detail": detail,
-                }),
-            );
-        }
-    }
-
-    let Some(peer_claims) = &status.peer_claims else {
-        return HealthSection::new(
-            "peer_coordination",
-            Verdict::Green,
-            "safehouse not configured — nothing to report".to_string(),
-            serde_json::json!({ "configured": false }),
-        );
-    };
-    let c = &peer_claims.coordination;
-    // Issue #6242: the resolved claims-room identity, so comparing two
-    // hosts' `health`/`status` output makes a `rooms.claims` /
-    // `LOOM_SAFEHOUSE_ROOM_CLAIMS` mismatch a one-line diff. Visibility
-    // only — no cross-host comparison is performed here.
-    let room = peer_claims.claims_room.as_deref().unwrap_or("none");
-    // Issue #6243: the repo-sharding verification AC ("zero cross-host claims
-    // on the SAME issue over a 24h window") is read by an operator off this
-    // section. Append it to the human-readable summary only when it is
-    // NON-zero, so the healthy/default rendering — and every pre-#6243
-    // assertion on that wording — is byte-for-byte unchanged, while a fleet
-    // that IS colliding says so without needing `--json`.
-    let collisions_note = if peer_claims.same_issue_collisions > 0 {
-        format!(
-            ", {} same-issue cross-host claim(s) in 24h (#6243)",
-            peer_claims.same_issue_collisions
-        )
-    } else {
-        String::new()
-    };
-    // Issue #9294: the verdict's own `reason`, appended so this section says WHY
-    // it is degraded. Without it, "N received / M advertised" reads identically
-    // whether peers are idle or the homeserver is refusing every single send —
-    // the measured 2026-09-23 outage was the latter and presented as the former.
-    // Appended (not interpolated) so every pre-#9294 assertion on this sentence's
-    // existing prefix is unchanged.
-    let reason_note = c
-        .reason
-        .as_deref()
-        .map_or_else(String::new, |r| format!(" — {r}"));
-    if c.degraded {
-        return HealthSection::new(
-            "peer_coordination",
-            Verdict::Degraded,
-            format!(
-                "peer-claim receive path DEGRADED ({} received / {} advertised, {} rejected, \
-                 room: {room}), degraded for {} — {}/{} sustained receive(s) toward recovery \
-                 (#6157){collisions_note}{reason_note}",
-                peer_claims.received,
-                peer_claims.advertised,
-                peer_claims.advertise_rejected,
-                c.degraded_for_secs
-                    .map(|s| format_age(i64::try_from(s).unwrap_or(i64::MAX)))
-                    .unwrap_or_else(|| "?".to_string()),
-                c.consecutive_receives_toward_recovery,
-                c.recovery_threshold,
-            ),
-            serde_json::json!({
-                "advertised": peer_claims.advertised,
-                "advertise_rejected": peer_claims.advertise_rejected,
-                "reason": c.reason,
-                "received": peer_claims.received,
-                "claims_room": peer_claims.claims_room,
-                "degraded_for_secs": c.degraded_for_secs,
-                "consecutive_receives_toward_recovery": c.consecutive_receives_toward_recovery,
-                "recovery_threshold": c.recovery_threshold,
-                // Issue #6243: surfaced here as a plain counter — this
-                // section's DEGRADED/Green verdict above is #6157's mesh-
-                // liveness question ("is the receive path alive"), a
-                // different question from "did repo-sharding actually keep
-                // cross-host claims on the same issue rare" this counter
-                // answers. Not folded into the verdict (that is #6242's
-                // scope, tracked separately) — visibility only.
-                "same_issue_collisions_24h": peer_claims.same_issue_collisions,
-            }),
-        );
-    }
-    HealthSection::new(
-        "peer_coordination",
-        Verdict::Green,
-        format!(
-            "peer-claim receive path healthy ({} received / {} advertised, room: {room})\
-             {collisions_note}",
-            peer_claims.received, peer_claims.advertised
-        ),
-        serde_json::json!({
-            "advertised": peer_claims.advertised,
-            // Issue #9294: surfaced on the healthy path too, so a fleet script
-            // diffing two hosts sees the publish-side counter without having to
-            // wait for a degraded verdict to expose it.
-            "advertise_rejected": peer_claims.advertise_rejected,
-            "received": peer_claims.received,
-            "claims_room": peer_claims.claims_room,
-            // Issue #6243: see the DEGRADED branch's comment above.
-            "same_issue_collisions_24h": peer_claims.same_issue_collisions,
-        }),
-    )
-}
-
-// ============================================================================
 // Stale-untracked-sweep section (Issue #7529)
 // ============================================================================
 
@@ -2786,7 +2625,6 @@ pub fn assess(inputs: &HealthInputs) -> HealthReport {
         assess_queues(inputs),
         assess_throughput(inputs),
         assess_operator_attention(inputs),
-        assess_peer_coordination(inputs),
         assess_stale_sweeps(inputs),
         assess_auto_update(inputs),
         assess_worktree_reaper(inputs),

@@ -4,8 +4,8 @@
 //! `POST {loom-ui}/api/alerts/external` (2AMLogic/loom-ui
 //! `docs/alerts/external.md`), and once per notify window claude-bot picks one
 //! for the banner and Matrix. Before this module most loom-daemon alerting
-//! (fleet_alert, star escalations, the watchdog's outage issue, a dead
-//! safehoused) never reached loom-ui at all.
+//! (fleet_alert, star escalations, the watchdog's outage issue) never reached
+//! loom-ui at all.
 //!
 //! # Contract
 //!

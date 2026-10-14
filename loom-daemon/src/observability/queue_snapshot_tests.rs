@@ -66,7 +66,7 @@ fn rows_carry_slug_and_visibility_never_a_local_path() {
     let s = summary(vec![
         row(1, PUBLIC_ROOT, 10, Qd::Dispatched, None),
         row(2, ROOT, 11, Qd::DeferredCapacity, None),
-        row(3, "workspace #2", 12, Qd::PeerClaim, None),
+        row(3, "workspace #2", 12, Qd::OpenPr, None),
     ]);
     let record = build_record(&s, &repos());
     assert_eq!(record.tick_at, s.at);

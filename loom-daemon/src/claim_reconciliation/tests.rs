@@ -661,81 +661,6 @@ fn resolve_no_progress_grace_minutes_defaults_and_overrides() {
 // Periodic-interval resolution (Issue #4348)
 // ------------------------------------------------------------------
 
-/// Write a `.loom/config.json` with the given `safehouse` block into a
-/// fresh tempdir root (Issue #4431 interval tests).
-fn root_with_safehouse_config(dir: &std::path::Path, safehouse_json: &str) -> std::path::PathBuf {
-    let root = dir.join("repo");
-    std::fs::create_dir_all(root.join(".loom")).unwrap();
-    std::fs::write(
-        root.join(".loom").join("config.json"),
-        format!(r#"{{"safehouse": {safehouse_json}}}"#),
-    )
-    .unwrap();
-    root
-}
-
-/// #4431: precedence env > config override > safehouse-mode default >
-/// legacy default, floor always enforced.
-#[test]
-#[serial]
-fn resolve_reconcile_interval_for_is_safehouse_aware() {
-    std::env::remove_var(RECONCILE_INTERVAL_ENV);
-    // The safehouse env toggle would shadow the config file — clear it so
-    // the test exercises the config layer (hosts like loom-worker-1 set
-    // it in the daemon unit, but tests must not depend on that).
-    std::env::remove_var("LOOM_SAFEHOUSE_ENABLED");
-    let dir = tempdir().unwrap();
-
-    // Safehouse enabled → the slow healing cadence.
-    let root = root_with_safehouse_config(dir.path(), r#"{"enabled": true}"#);
-    assert_eq!(
-        resolve_reconcile_interval_for(&root),
-        std::time::Duration::from_secs(DEFAULT_SAFEHOUSE_RECONCILE_INTERVAL_SECS)
-    );
-
-    // Safehouse disabled (or absent) → byte-for-byte the pre-#4431 default.
-    let root = root_with_safehouse_config(dir.path(), r#"{"enabled": false}"#);
-    assert_eq!(
-        resolve_reconcile_interval_for(&root),
-        std::time::Duration::from_secs(DEFAULT_RECONCILE_INTERVAL_SECS)
-    );
-    assert_eq!(
-        resolve_reconcile_interval_for(dir.path()),
-        std::time::Duration::from_secs(DEFAULT_RECONCILE_INTERVAL_SECS),
-        "no config file at all must resolve to the legacy default"
-    );
-
-    // Per-repo config override wins over the safehouse-mode default…
-    let root = root_with_safehouse_config(
-        dir.path(),
-        r#"{"enabled": true, "claimReconcileIntervalSecs": 900}"#,
-    );
-    assert_eq!(resolve_reconcile_interval_for(&root), std::time::Duration::from_secs(900));
-    // …but a zero/invalid override is ignored, and the floor still holds.
-    let root = root_with_safehouse_config(
-        dir.path(),
-        r#"{"enabled": true, "claimReconcileIntervalSecs": 0}"#,
-    );
-    assert_eq!(
-        resolve_reconcile_interval_for(&root),
-        std::time::Duration::from_secs(DEFAULT_SAFEHOUSE_RECONCILE_INTERVAL_SECS)
-    );
-    let root = root_with_safehouse_config(
-        dir.path(),
-        r#"{"enabled": true, "claimReconcileIntervalSecs": 5}"#,
-    );
-    assert_eq!(
-        resolve_reconcile_interval_for(&root),
-        std::time::Duration::from_secs(MIN_RECONCILE_INTERVAL_SECS)
-    );
-
-    // The operator env var beats everything, on any host.
-    std::env::set_var(RECONCILE_INTERVAL_ENV, "300");
-    let root = root_with_safehouse_config(dir.path(), r#"{"enabled": true}"#);
-    assert_eq!(resolve_reconcile_interval_for(&root), std::time::Duration::from_secs(300));
-    std::env::remove_var(RECONCILE_INTERVAL_ENV);
-}
-
 #[test]
 #[serial]
 fn resolve_reconcile_interval_defaults_and_overrides() {
@@ -1265,8 +1190,8 @@ fn reconcile_workspace_does_not_loop_forever_when_reclaim_never_repairs() {
 /// nothing left to freeze reclaim on peer-channel health, by
 /// construction, so this test simply confirms the ordinary dead-PID
 /// reclaim (mirroring the #3975 fixture) still fires with no such
-/// signal available at all — the peer-claim/safehouse channel plays no
-/// role whatsoever in this decision now, healthy or not.
+/// signal available at all — no side channel plays any role in this
+/// decision now.
 #[test]
 #[serial]
 fn reconcile_workspace_reclaims_dead_pid_with_no_peer_coordination_signal_consulted() {
@@ -1279,10 +1204,7 @@ fn reconcile_workspace_reclaims_dead_pid_with_no_peer_coordination_signal_consul
     std::env::set_var(sweep_journal::JOURNAL_PATH_ENV, &journal_path);
 
     // Same dead-PID fixture as #3975's regression test: an
-    // unconditional, immediate reclaim, with the peer-coordination
-    // global view never registered at all (the default state for every
-    // test in this binary — see `peer_claims::GLOBAL_VIEW`'s removal in
-    // #6317).
+    // unconditional, immediate reclaim.
     let mut journal = SweepJournal::default();
     journal.entries.push(journal_entry(&repo_str, 99, 0));
     sweep_journal::save(&journal_path, &journal).unwrap();
@@ -1601,13 +1523,9 @@ exit 0
 /// Issue #6286 acceptance criterion — the core regression test: a live
 /// peer sweep whose lease is being renewed, but whose local liveness
 /// evidence (dead-PID journal entry -- the #3975 fixture that normally
-/// fires an IMMEDIATE, unconditional reclaim) looks dead, with the
-/// peer-claim/safehouse channel simply absent (no `PeerClaimView` ever
-/// registered — the reading a host with no safehouse configured
-/// produces, and per Epic #6165 Phase 4/#6317 now the ONLY reading that
-/// exists, since the peer-claim channel is no longer consulted by this
-/// decision at all). Reclamation must NOT fire while the lease is
-/// fresh, regardless of what the host-scoped evidence says.
+/// fires an IMMEDIATE, unconditional reclaim) looks dead. Reclamation must
+/// NOT fire while the lease is fresh, regardless of what the host-scoped
+/// evidence says.
 #[test]
 #[serial]
 fn reconcile_workspace_keeps_claim_when_lease_is_fresh_even_with_channel_absent() {
@@ -1644,8 +1562,7 @@ fn reconcile_workspace_keeps_claim_when_lease_is_fresh_even_with_channel_absent(
     assert_eq!(
         reclaimed, 0,
         "a fresh lease record must block reclaim even though the dead-PID evidence alone \
-             would normally reclaim immediately, and even with no peer-claim/safehouse signal \
-             at all (#6286)"
+             would normally reclaim immediately (#6286)"
     );
 
     let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
@@ -1869,10 +1786,7 @@ fn reconcile_workspace_keeps_claim_when_lease_probe_read_fails() {
 ///
 /// This is the total-absence-of-evidence case, on EVERY axis this
 /// module and Epic #6165 collectively consult: no journal entry, no
-/// run-registry/checkpoint join, no lease comment, AND (implicitly,
-/// since the peer-coordination global view is never registered in this
-/// test binary — see `peer_claims::GLOBAL_VIEW`) no peer-claim
-/// advertisement either. With the `loom:building` label itself freshly
+/// run-registry/checkpoint join, no lease comment. With the `loom:building` label itself freshly
 /// applied (well under [`DEFAULT_STALE_BUILDING_HOURS`]), the claim
 /// must be `Keep`, not reclaimed — a total absence of information is
 /// never, by itself, proof of death; only *aged* absence is (the

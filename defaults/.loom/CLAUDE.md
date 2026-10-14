@@ -366,7 +366,7 @@ concurrency errors are covered in
 - **Role Definitions**: `.loom/roles/*.md`
 - **Configuration**: `.loom/config.json` (committed, team-shared) ·
   `.loom-local/local.json` (gitignored — settings true of THIS host only, e.g.
-  `worktree.root`, `safehouse.enabled`/`socket`)
+  `worktree.root`, `observability.ingestKeyFile`)
 - **Scripts**: `.loom/scripts/` (worktree, merge, daemon, token-pool helpers)
 - **GitHub Labels**: `.github/labels.yml`
 - **Issue Template Workflow**: [`.github/CONFIGURATION.md`](.github/CONFIGURATION.md)

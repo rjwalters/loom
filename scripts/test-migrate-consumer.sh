@@ -143,8 +143,8 @@ JSON
   echo 'ckpt'      > "$repo/.loom/sweep-checkpoint/issue-1.json"
 
   # A historical repo-scoped .mcp.json whose `loom` entry points into a long-dead
-  # worktree bundle (#4386 spawn-outage signature) alongside a per-repo safehouse
-  # server that must survive the strip. Untracked (generated artifact).
+  # worktree bundle (#4386 spawn-outage signature) alongside an unrelated
+  # per-repo server that must survive the strip. Untracked (generated artifact).
   cat > "$repo/.mcp.json" <<JSON
 {
   "mcpServers": {
@@ -152,10 +152,10 @@ JSON
       "command": "node",
       "args": [ "$repo/.loom/worktrees/issue-4188/mcp-loom/dist/index.js" ]
     },
-    "safehouse": {
-      "command": "safehoused-client",
+    "other": {
+      "command": "other-mcp-client",
       "args": [],
-      "env": { "SAFEHOUSED_SOCKET": "/tmp/sh.sock" }
+      "env": { "OTHER_SOCKET": "/tmp/other.sock" }
     }
   }
 }
@@ -335,14 +335,14 @@ else
     || fail "missing-daemon path not handled"
 fi
 
-# 3l. stale repo-scoped `loom` .mcp.json entry stripped, safehouse preserved (#4386).
+# 3l. stale repo-scoped `loom` .mcp.json entry stripped, other servers preserved (#4386).
 if command -v jq >/dev/null 2>&1; then
   if [[ -f "$A/.mcp.json" ]] \
      && ! jq -e '.mcpServers.loom' "$A/.mcp.json" >/dev/null 2>&1 \
-     && jq -e '.mcpServers.safehouse' "$A/.mcp.json" >/dev/null 2>&1; then
-    pass "stale repo-scoped loom .mcp.json entry stripped, safehouse kept"
+     && jq -e '.mcpServers.other' "$A/.mcp.json" >/dev/null 2>&1; then
+    pass "stale repo-scoped loom .mcp.json entry stripped, other server kept"
   else
-    fail "repo-scoped loom .mcp.json entry not stripped (or safehouse lost)"
+    fail "repo-scoped loom .mcp.json entry not stripped (or other server lost)"
   fi
   grep -q "#4386 spawn-outage signature" "$TEST_DIR/apply.out" \
     && pass "dead-worktree .mcp.json entry surfaced (#4386 note)" \
@@ -389,11 +389,10 @@ echo ""
 # ==========================================================================
 # 6. Host-local key routing beyond worktree.root (#6008)
 #
-# The loom-worker-2 incident: a tracked config carrying `safehouse.enabled=false`
-# plus a per-host safehoused socket path. Both are true of ONE host and false of
-# every other, so both must land in the gitignored .loom-local/local.json — while
-# their siblings in the same object (`room`/`rooms`/`persona`, which describe the
-# fleet room the repo narrates to) stay in the tracked project.json.
+# The loom-worker-2 incident: a tracked config carrying per-host values (a
+# scratch path, an ingest-key path). Those are true of ONE host and false of
+# every other, so they must land in the gitignored .loom-local/local.json —
+# while their siblings in the same object stay in the tracked project.json.
 # ==========================================================================
 echo "--- host-local key routing (#6008) ---"
 
@@ -409,101 +408,29 @@ set_legacy_config() {
 if ! command -v jq >/dev/null 2>&1; then
   warn "jq unavailable — skipping host-local routing assertions (#6008)"
 else
-  # ---- 6a. mixed safehouse block: host-local sub-keys split from team-shared ----
-  SH="$TEST_DIR/safehouse-mixed"; make_fixture "$SH"
-  set_legacy_config "$SH" <<'JSON'
+  # ---- 6a. a retired block (#11112) is dropped from both tiers ----
+  RT="$TEST_DIR/retired-block"; make_fixture "$RT"
+  set_legacy_config "$RT" <<'JSON'
 {
   "guards": { "sqlDdl": true },
   "worktree": { "root": "/mnt/scratch" },
-  "safehouse": {
-    "enabled": false,
-    "socket": "/home/ubuntu/.loom/safehoused/state/safehoused.sock",
-    "room": "loom-fleet",
-    "rooms": ["loom-fleet", "ops"],
-    "persona": "worker-2"
-  },
-  "sweep": { "maxParallel": 3 }
+  "safehouse": { "enabled": false, "socket": "/run/user/1000/svc.sock", "room": "loom-fleet" }
 }
 JSON
-
-  # Dry run first: the plan must name .loom-local/local.json and write nothing.
-  before="$(git -C "$SH" status --porcelain)"
-  run_migrate "$SH" --dry-run > "$TEST_DIR/sh-dry.out" 2>&1
-  grep -q "safehouse.enabled=false is host-local" "$TEST_DIR/sh-dry.out" \
-    && pass "--dry-run surfaces safehouse.enabled=false as host-local" \
-    || { fail "--dry-run did not surface safehouse.enabled"; cat "$TEST_DIR/sh-dry.out"; }
-  grep -q "safehouse.socket=/home/ubuntu/.loom/safehoused/state/safehoused.sock is host-local" "$TEST_DIR/sh-dry.out" \
-    && pass "--dry-run surfaces safehouse.socket as host-local" \
-    || fail "--dry-run did not surface safehouse.socket"
-  [[ ! -e "$SH/.loom-local" ]] && pass "--dry-run writes no .loom-local/" || fail "--dry-run created .loom-local/"
-  [[ "$before" == "$(git -C "$SH" status --porcelain)" ]] \
-    && pass "--dry-run (host-local fixture) makes zero changes" || fail "--dry-run mutated the tree"
-
-  run_migrate "$SH" > "$TEST_DIR/sh.out" 2>&1 && rc=0 || rc=$?
-  [[ "$rc" -eq 0 ]] && pass "apply (mixed safehouse) exits 0" \
-    || { fail "apply (mixed safehouse) rc=$rc"; cat "$TEST_DIR/sh.out"; }
-
-  # Host-local sub-keys land in the gitignored local tier, values (incl. `false`)
-  # preserved exactly — `false` is the value a `// empty` read would silently drop.
-  if jq -e '.safehouse.enabled == false
-            and .safehouse.socket == "/home/ubuntu/.loom/safehoused/state/safehoused.sock"
-            and .worktree.root == "/mnt/scratch"' \
-       "$SH/.loom-local/local.json" >/dev/null 2>&1; then
-    pass "safehouse.enabled/socket + worktree.root routed to .loom-local/local.json"
-  else
-    fail "host-local safehouse keys not in local.json"
-    cat "$SH/.loom-local/local.json" 2>/dev/null
-  fi
-  # …and are gone from the tracked, team-shared tier.
-  if jq -e '(.safehouse | has("enabled")) or (.safehouse | has("socket")) or has("worktree")' \
-       "$SH/.loom-project/project.json" >/dev/null 2>&1; then
-    fail "project.json still carries host-local safehouse.enabled/socket (leaked to tracked tier)"
-    cat "$SH/.loom-project/project.json"
-  else
-    pass "project.json excludes host-local safehouse.enabled/socket"
-  fi
-  # Team-shared safehouse policy stays tracked (NOT moved to the host-local tier).
-  if jq -e '.safehouse.room == "loom-fleet"
-            and (.safehouse.rooms | length) == 2
-            and .safehouse.persona == "worker-2"' \
-       "$SH/.loom-project/project.json" >/dev/null 2>&1; then
-    pass "project.json keeps team-shared safehouse.room/rooms/persona"
-  else
-    fail "project.json lost team-shared safehouse keys"
-  fi
-  jq -e '.safehouse | has("room") or has("rooms") or has("persona")' \
-     "$SH/.loom-local/local.json" >/dev/null 2>&1 \
-     && fail "team-shared safehouse keys leaked into local.json" \
-     || pass "local.json carries only host-local safehouse sub-keys"
-  [[ -z "$(git -C "$SH" ls-files -- .loom-local/local.json)" ]] \
-    && pass "local.json (safehouse) stays untracked" || fail "local.json was tracked"
-
-  # ---- 6b. all-host-local safehouse block: emptied object pruned from project ----
-  SH2="$TEST_DIR/safehouse-only"; make_fixture "$SH2"
-  set_legacy_config "$SH2" <<'JSON'
-{
-  "guards": { "sqlDdl": true },
-  "safehouse": { "enabled": true, "socket": "/run/user/1000/safehoused.sock" }
-}
-JSON
-  run_migrate "$SH2" > "$TEST_DIR/sh2.out" 2>&1
-  jq -e 'has("safehouse")' "$SH2/.loom-project/project.json" >/dev/null 2>&1 \
-    && fail "project.json kept an emptied safehouse object" \
-    || pass "project.json prunes the safehouse object emptied by routing"
-  jq -e '.safehouse.enabled == true and .safehouse.socket == "/run/user/1000/safehoused.sock"' \
-     "$SH2/.loom-local/local.json" >/dev/null 2>&1 \
-     && pass "all-host-local safehouse block routed to local.json" \
-     || fail "all-host-local safehouse block not routed"
-  jq -e '.guards.sqlDdl == true' "$SH2/.loom-project/project.json" >/dev/null 2>&1 \
-     && pass "unrelated project keys survive host-local routing" \
+  run_migrate "$RT" > "$TEST_DIR/rt.out" 2>&1 && rc=0 || rc=$?
+  [[ "$rc" -eq 0 ]] && pass "apply (retired block) exits 0" \
+    || { fail "apply (retired block) rc=$rc"; cat "$TEST_DIR/rt.out"; }
+  jq -e 'has("safehouse")' "$RT/.loom-project/project.json" >/dev/null 2>&1 \
+    && fail "project.json kept the retired block" \
+    || pass "project.json drops the retired block"
+  jq -e 'has("safehouse")' "$RT/.loom-local/local.json" >/dev/null 2>&1 \
+    && fail "local.json grew the retired block" \
+    || pass "local.json never receives the retired block"
+  jq -e '.guards.sqlDdl == true' "$RT/.loom-project/project.json" >/dev/null 2>&1 \
+     && pass "unrelated project keys survive the retired-block drop" \
      || fail "unrelated project keys lost"
-
-  # ---- 6c. edge: only worktree.root host-local (existing behavior unchanged) ----
-  # The section-3 fixture ($A) has exactly this shape; assert no phantom safehouse
-  # key was invented in either tier.
-  jq -e 'has("safehouse")' "$A/.loom-local/local.json" >/dev/null 2>&1 \
-    && fail "worktree.root-only repo grew a safehouse key in local.json" \
-    || pass "worktree.root-only repo: local.json unchanged (no safehouse key)"
+  grep -q "retired block (#11112)" "$TEST_DIR/rt.out" \
+    && pass "the drop is reported" || fail "no report line for the dropped retired block"
 
   # ---- 6d. edge: no host-local key at all → no .loom-local/ written ----
   NL="$TEST_DIR/no-host-local"; make_fixture "$NL"
@@ -528,25 +455,25 @@ JSON
   set_legacy_config "$OV" <<'JSON'
 {
   "worktree": { "root": "/mnt/scratch" },
-  "safehouse": { "enabled": false, "socket": "/legacy/config/path.sock", "room": "loom-fleet" }
+  "observability": { "ingestKeyFile": "/legacy/config/ingest.key", "endpoint": "https://otel.example" }
 }
 JSON
   mkdir -p "$OV/.loom-local"
   cat > "$OV/.loom-local/local.json" <<'JSON'
 {
-  "safehouse": { "socket": "/operator/chosen/path.sock" }
+  "observability": { "ingestKeyFile": "/operator/chosen/ingest.key" }
 }
 JSON
   run_migrate "$OV" > "$TEST_DIR/ov.out" 2>&1 && rc=0 || rc=$?
   [[ "$rc" -eq 0 ]] && pass "apply (pre-existing local override) exits 0" || fail "override apply rc=$rc"
-  if jq -e '.safehouse.socket == "/operator/chosen/path.sock"' \
+  if jq -e '.observability.ingestKeyFile == "/operator/chosen/ingest.key"' \
        "$OV/.loom-local/local.json" >/dev/null 2>&1; then
-    pass "existing safehouse.socket override preserved (fill-only-if-unset)"
+    pass "existing observability.ingestKeyFile override preserved (fill-only-if-unset)"
   else
-    fail "existing safehouse.socket override was overwritten"
+    fail "existing observability.ingestKeyFile override was overwritten"
     cat "$OV/.loom-local/local.json"
   fi
-  jq -e '.safehouse.enabled == false and .worktree.root == "/mnt/scratch"' \
+  jq -e '.worktree.root == "/mnt/scratch"' \
      "$OV/.loom-local/local.json" >/dev/null 2>&1 \
      && pass "unset host-local keys still filled alongside the preserved override" \
      || fail "unset host-local keys not filled into existing local.json"

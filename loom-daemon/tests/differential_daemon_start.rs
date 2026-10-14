@@ -1134,12 +1134,12 @@ fn build_corpus() -> Vec<Case> {
     let rich_plist =
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\">\n<dict>\n\
          \x20   <key>EnvironmentVariables</key>\n    <dict>\n\
-         \x20       <key>LOOM_SAFEHOUSE_ROOM</key>\n        <string>!room:example</string>\n\
+         \x20       <key>LOOM_SAFEHAVEN_ROOM</key>\n        <string>!room:example</string>\n\
          \x20       <key>LOOM_WORK_FINDER</key>\n        <string>1</string>\n\
          \x20       <key>LOOM_TERMINAL_ID</key>\n        <string>poisoned</string>\n\
          \x20       <key>LOOM_SWEEP_CLAIM_OWNED</key>\n        <string>6388</string>\n\
          \x20   </dict>\n</dict>\n</plist>\n";
-    let rich_unit = "[Service]\nEnvironment=LOOM_SAFEHOUSE_ROOM=!room:example\n\
+    let rich_unit = "[Service]\nEnvironment=LOOM_SAFEHAVEN_ROOM=!room:example\n\
          Environment=LOOM_WORK_FINDER=1\nEnvironment=LOOM_ROLE=poisoned\n\
          Environment=LOOM_SWEEP_CLAIM_OWNED=6388\n";
     for mode in modes {

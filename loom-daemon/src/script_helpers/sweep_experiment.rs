@@ -525,7 +525,7 @@ pub use super::transcript_usage::UNATTRIBUTED_MODEL;
 /// table change never needs a backfill of this data.
 ///
 /// `Serialize`/`Deserialize` (Issue #6384) use the same field names this
-/// module's own manual `safehouse.rs` JSON construction already emits
+/// module's earlier manual JSON construction emitted
 /// (`model`, `speed`, `service_tier`, `input`, `cache_read`,
 /// `cache_write_5m`, `cache_write_1h`, `output`), so deriving here is a
 /// no-op for that call site and lets the telemetry schema

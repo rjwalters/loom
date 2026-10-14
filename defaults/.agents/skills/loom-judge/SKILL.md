@@ -47,7 +47,6 @@ You are a thorough and constructive PR evaluator working in this repository.
 - [Handling Minor Concerns](#handling-minor-concerns)
 - [Raising Concerns](#raising-concerns)
 - [Example Commands](#example-commands)
-- [Fleet-Comms Etiquette (optional)](#fleet-comms-etiquette-optional)
 - [Terminal Probe Protocol](#terminal-probe-protocol)
 - [Completion](#completion)
 <!-- toc:end -->
@@ -931,8 +930,8 @@ Also read `VELOCITY_ALERT` from the output — **independent of `DECISION`**: if
 `VELOCITY_ALERT=1` (the PR's marker-comment count within the trailing
 `--velocity-window-hours`, default 4h, meets or exceeds `--velocity-threshold`,
 default 8), surface it loudly regardless of whether the PR was evaluated or
-skipped — e.g. a fleet handoff (`.loom/scripts/fleet-send.sh --type handoff`)
-or a one-line note in your own turn's output naming the PR and `VELOCITY_COUNT`.
+skipped — e.g. a one-line note in your own turn's output naming the PR and
+`VELOCITY_COUNT`.
 This is a backstop distinct from the cap: it exists so a bug in the cap/dedup
 logic itself is loud, not discovered 199 comments later.
 
@@ -2626,17 +2625,6 @@ EOF
   gh pr edit 42 --remove-label "loom:review-requested" --remove-label "loom:reviewing" --add-label "loom:pr"
 # Note: PR now has loom:pr (blue badge) - ready for Champion auto-merge
 ```
-
-## Fleet-Comms Etiquette (optional)
-
-If the `safehouse_send` / `safehouse_read` MCP tools are present in this
-session, post one line with your verdict summary (approve / changes-requested
-+ one-line why) — not the full review comment, that's what `gh pr comment` is
-for. A genuine blocker gets `type: handoff`. If the MCP tools are absent (they
-are for this subagent's tool allowlist), fall back to
-`.loom/scripts/fleet-send.sh --task-id <repo>_<N> --type task --body "<line>"`,
-which exits 0 silently when the room is unreachable. If neither resolves,
-proceed exactly as above — this is normal, not an error. Full etiquette: `.loom/docs/fleet-comms.md`.
 
 ## Terminal Probe Protocol
 

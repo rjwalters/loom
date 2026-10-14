@@ -1084,16 +1084,16 @@ else
     git init --quiet "$G7_T4"
     git -C "$G7_T4" checkout -q -b main
     mkdir -p "$G7_T4/.loom"
-    printf '{\n  "safehouse": {"socket": "/committed/loom.sock"}\n}\n' > "$G7_T4/.loom/config.json"
+    printf '{\n  "observability": {"endpoint": "/committed/loom.sock"}\n}\n' > "$G7_T4/.loom/config.json"
     git -C "$G7_T4" add .loom/config.json
     git -C "$G7_T4" commit -q -m "add config"
     # Stash a host-specific edit, then have the "upstream reinstall" rewrite
     # the same lines -- the same shape as the real incident (a
     # `loom-daemon init` rewrite landing on top of a host-specific stashed
     # edit).
-    printf '{\n  "safehouse": {"socket": "/host/patched.sock"}\n}\n' > "$G7_T4/.loom/config.json"
+    printf '{\n  "observability": {"endpoint": "/host/patched.sock"}\n}\n' > "$G7_T4/.loom/config.json"
     git -C "$G7_T4" stash push -q -m wip
-    printf '{\n  "safehouse": {"socket": "/upstream/new.sock"}\n}\n' > "$G7_T4/.loom/config.json"
+    printf '{\n  "observability": {"endpoint": "/upstream/new.sock"}\n}\n' > "$G7_T4/.loom/config.json"
     git -C "$G7_T4" add .loom/config.json
     git -C "$G7_T4" commit -q -m upstream
 

@@ -3,7 +3,7 @@
 This convention covers **task credentials** — cloud provider tokens, SSH
 identities, service API keys, per-host env files — that an agent needs for
 work *outside* Loom's own plumbing (issue tracking, worktrees, the sweep
-lifecycle). Loom's own credentials (`forge.*`, `safehouse.*`,
+lifecycle). Loom's own credentials (`forge.*`,
 `observability.ingestKeyFile`) are covered by the config-resolution tiers and
 by [`credential-storage.md`](credential-storage.md), which states the general
 "secrets never live in a repo or worktree" policy this document assumes

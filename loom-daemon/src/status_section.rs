@@ -78,8 +78,6 @@ pub enum StatusSection {
     AdmissionBrake,
     RateLimitBreaker,
     ForgeCalls,
-    Safehouse,
-    PeerClaims,
     Protection,
     JournalAdoptedAtStartup,
     FleetStore,
@@ -164,8 +162,6 @@ impl StatusSection {
             S::AdmissionBrake => ("admission_brake", &["admission_brake"]),
             S::RateLimitBreaker => ("rate_limit_breaker", &["rate_limit_breaker"]),
             S::ForgeCalls => ("forge_calls", &["forge_calls"]),
-            S::Safehouse => ("safehouse", &["safehouse"]),
-            S::PeerClaims => ("peer_claims", &["peer_claims"]),
             S::Protection => ("protection", &["protection"]),
             S::JournalAdoptedAtStartup => {
                 ("journal_adopted_at_startup", &["journal_adopted_at_startup"])

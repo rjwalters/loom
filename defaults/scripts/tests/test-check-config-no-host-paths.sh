@@ -87,12 +87,12 @@ echo "Test 2: a committed /Users/<user>/... path in .loom-project/project.json -
 repo=$(new_repo)
 mkdir -p "$repo/.loom-project"
 cat > "$repo/.loom-project/project.json" <<'EOF'
-{"safehouse": {"socket": "/Users/alice/.loom/safehoused/state/safehoused.sock"}}
+{"observability": {"ingestKeyFile": "/Users/alice/.loom/keys/ingest.key"}}
 EOF
 out=$(cd "$repo" && "$CHECK_SCRIPT" 2>&1)
 code=$?
 assert_eq "$code" "2" "the project tier is scanned too, not just the legacy tier"
-assert_contains "safehouse.socket" "$out" "output names the offending key"
+assert_contains "observability.ingestKeyFile" "$out" "output names the offending key"
 rm -rf "$repo"
 
 # --- Test 3: no home-directory paths anywhere -> exit 0 --------------------

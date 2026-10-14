@@ -347,7 +347,7 @@ fi
 # exec. Wrapping only the terminal exec — rather than re-invoking this whole
 # script under a wrapper, the way the niceness block re-execs itself — avoids
 # having to explicitly re-plumb every already-exported env var (the OAuth
-# token, LOOM_MODEL/LOOM_EFFORT flags, the safehouse MCP injection, etc.)
+# token, LOOM_MODEL/LOOM_EFFORT flags, etc.)
 # through a `systemd-run` invocation that does not automatically inherit an
 # arbitrary parent shell environment the way a plain `exec` does.
 #
@@ -851,8 +851,9 @@ if [[ "$CONTAINMENT_ENABLED" == "1" ]]; then
     # line holding a non-UTF-8 byte, silently un-forwarding that variable.
 
     # --- Env passthrough ---
-    # Every LOOM_*/CLAUDE_*/SAFEHOUSE*/CODEX_* var (GH_TOKEN/GITHUB_TOKEN
-    # come from the forge auth block above) already present in THIS process's environment (exported by the daemon
+    # Every LOOM_*/CLAUDE_*/CODEX_* var (GH_TOKEN/GITHUB_TOKEN
+    # come from the forge auth block above) already present in THIS process's
+    # environment (exported by the daemon
     # before it spawned this script — LOOM_SWEEP_CLAIM_OWNED, LOOM_ROLE,
     # LOOM_RUNTIME, LOOM_MODEL/LOOM_EFFORT when set, etc. — or already
     # resolved above, e.g. CLAUDE_CODE_OAUTH_TOKEN when
@@ -870,7 +871,7 @@ if [[ "$CONTAINMENT_ENABLED" == "1" ]]; then
     # same host's bare-metal dispatch worked.
     while IFS='=' read -r _containment_var _; do
         case "$_containment_var" in
-            LOOM_* | CLAUDE_* | SAFEHOUSE* | CODEX_* | TRACEPARENT | OTEL_* | CARGO_PROFILE_DEV_DEBUG | CARGO_PROFILE_TEST_DEBUG)
+            LOOM_* | CLAUDE_* | CODEX_* | TRACEPARENT | OTEL_* | CARGO_PROFILE_DEV_DEBUG | CARGO_PROFILE_TEST_DEBUG)
                 _containment_env+=(-e "$_containment_var")
                 ;;
         esac
@@ -1303,95 +1304,6 @@ fi
 # it. The proxied host half keeps
 # them: its in-container copy receives them by name and drops them itself.
 [[ "$_CONTAINMENT_CRED_PROXY" == "1" ]] || unset LOOM_AGENT_SCOPE_UNIT LOOM_RESUME_SESSION_ID LOOM_RESUME_PROMPT LOOM_RESUME_HANDLE_FILE
-
-# --- Optional safehouse MCP server injection (issue #3999) ---
-# When the `safehouse` config block is enabled and a socket + launch command
-# resolve, inject a session-scoped MCP config that adds the `safehouse` stdio
-# server alongside `loom`, with a PER-WORKER persona so two concurrent workers
-# in the same workspace get distinct `SAFEHOUSE_PERSONA` values. The persona is
-# drawn from a bounded, operator-pre-registered pool (`safehouse.workerPersonas`)
-# round-robined by this worker's issue slot (`LOOM_SWEEP_CLAIM_OWNED`), because
-# safehoused's allowlist is a static boot-time TOML array with no runtime/prefix
-# registration — literal per-issue names cannot be minted at dispatch time.
-#
-# Delivery shape: a session-scoped `--mcp-config <file>` (not a rewrite of the
-# workspace `.mcp.json`). Concurrent sweeps SHARE the workspace root, so a
-# per-worker persona cannot live in the shared file; a session-scoped config is
-# the only correct per-worker surface. The file lists `loom` FIRST so it is
-# self-contained even if the session's cwd has no project `.mcp.json`.
-#
-# Degradation contract (mirrors #3997): disabled/absent ⇒ byte-for-byte no-op
-# (no --mcp-config appended). Enabled but the launch command is missing, or no
-# socket resolves ⇒ log a warning and SKIP injection — the `loom` MCP server is
-# never affected and the worker always starts. Only the socket path (no token or
-# key) is ever written into the injected config.
-_mcp_config_lib="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/mcp-config.sh"
-# Skipped on the host half of a proxied containment launch (#8697): the
-# in-container copy injects it, exactly as for a plain containerized launch.
-if [[ "$_CONTAINMENT_CRED_PROXY" != "1" && -f "$_mcp_config_lib" ]]; then
-    # shellcheck source=./lib/mcp-config.sh
-    source "$_mcp_config_lib"
-
-    # Respect an explicit operator-supplied --mcp-config (do not clobber).
-    _has_mcp_config_arg=false
-    for _arg in ${PASSTHROUGH_ARGS[@]+"${PASSTHROUGH_ARGS[@]}"}; do
-        case "$_arg" in
-            --mcp-config | --mcp-config=*) _has_mcp_config_arg=true; break ;;
-        esac
-    done
-
-    if [[ "$_has_mcp_config_arg" == "false" \
-        && "$(loom_mcp_safehouse_enabled "$WORKSPACE")" == "true" ]]; then
-        _sh_socket="$(loom_mcp_safehouse_socket "$WORKSPACE")"
-        _sh_command="$(loom_mcp_safehouse_command "$WORKSPACE")"
-        _sh_pool="$(loom_mcp_worker_personas "$WORKSPACE")"
-        _sh_fallback="$(loom_mcp_safehouse_persona_fallback "$WORKSPACE")"
-        _sh_persona="$(loom_mcp_pick_persona \
-            "${LOOM_SWEEP_CLAIM_OWNED:-}" "$_sh_pool" "$_sh_fallback")"
-
-        # Export persona + socket into the SESSION process environment — not
-        # only into the injected MCP config file's server env — so Bash-tool
-        # helpers can reach safehoused. Lifecycle role subagents (loom-builder /
-        # loom-judge / loom-doctor) pin their tool allowlists to Read/Glob/Grep/
-        # Bash(/Write/Edit) with no MCP tools, so the injected `safehouse_send`
-        # tool is invisible to them; `fleet-send.sh` (Bash) is their path to the
-        # room and it resolves the socket/persona from these env vars (#4199).
-        # Only the socket path is exported (no token or key). Guard on a
-        # resolvable socket — with none there is nothing to connect to, and this
-        # is independent of whether the safehouse-mcp launch command is present.
-        if [[ -n "$_sh_socket" ]]; then
-            export SAFEHOUSE_PERSONA="$_sh_persona"
-            export SAFEHOUSED_SOCKET="$_sh_socket"
-        fi
-
-        if [[ -z "$_sh_socket" ]]; then
-            # Loud on purpose (issue #5523): before this, the message named
-            # only the mechanism ("skipping safehouse MCP injection"), buried
-            # in a per-role sweep log nobody was tailing — every sweep on an
-            # affected host silently stopped narrating to safehouse for 11
-            # hours, unnoticed, because the ONLY consequence anyone could see
-            # from outside was the public fleet pulse going
-            # stale. Name that consequence here, and point at the standalone,
-            # on-demand check (independent of a daemon restart) that answers
-            # "is this drifted?" without reading any sweep log.
-            log_warn "spawn-claude: SAFEHOUSE DRIFT — safehouse.enabled is true but no socket resolves (safehouse.socket / \$LOOM_SAFEHOUSE_SOCKET / \$SAFEHOUSED_SOCKET); no safehouse narration will be recorded for this sweep — the public fleet pulse is fed exclusively from safehouse narration, so this host's activity will not appear there until the socket resolves. Run '.loom/scripts/check-safehouse-socket.sh' to check every managed repo on this host without reading sweep logs. Skipping safehouse MCP injection (loom MCP unaffected)."
-        elif ! command -v "$_sh_command" >/dev/null 2>&1; then
-            log_warn "spawn-claude: safehouse launch command '$_sh_command' not found in PATH; skipping safehouse MCP injection (loom MCP unaffected)."
-        else
-            if [[ ! -S "$_sh_socket" && ! -e "$_sh_socket" ]]; then
-                log_warn "spawn-claude: safehouse socket '$_sh_socket' not present at spawn; injecting anyway (best-effort — safehouse-mcp connects lazily and never blocks the worker)."
-            fi
-            _mcp_session_config="$(mktemp -t loom-mcp-config.XXXXXX 2>/dev/null || mktemp)"
-            if loom_mcp_emit_config "$WORKSPACE" "$_sh_socket" "$_sh_persona" "$_sh_command" >"$_mcp_session_config" 2>/dev/null; then
-                PASSTHROUGH_ARGS+=(--mcp-config "$_mcp_session_config")
-                log_info "spawn-claude: injected safehouse MCP server (persona=$_sh_persona, socket=$_sh_socket, config=$_mcp_session_config)"
-            else
-                rm -f "$_mcp_session_config"
-                log_warn "spawn-claude: failed to generate safehouse MCP config; skipping injection (loom MCP unaffected)."
-            fi
-        fi
-    fi
-fi
 
 # --- Per-role tool restriction at spawn (#8256) ---
 # Defense in depth for the guard hooks: the role JSON's

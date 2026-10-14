@@ -3942,15 +3942,6 @@ fn test_build_daemon_status_reports_halt_and_in_flight() {
             .min(expected_configured_max),
         "dynamic cap is min(disk, ram, configured_max) regardless of the empty token pool"
     );
-    // #4345: a pool that never called start_safehouse_narration /
-    // start_peer_coordination still reports a live safehouse state — the
-    // cell's own default, not a missing/`None` field.
-    let safehouse = report
-        .safehouse
-        .as_ref()
-        .expect("safehouse status always present");
-    assert_eq!(safehouse.state, "not_configured");
-    assert!(safehouse.socket.is_none());
     // Per-repo breakdown: exactly one entry for the single workspace.
     assert_eq!(report.per_repo.len(), 1);
     assert_eq!(report.per_repo[0].root, root);

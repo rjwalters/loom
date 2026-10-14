@@ -8,7 +8,7 @@
 //!
 //! It is deliberately not [`SweepRegistry::dispatch`]. That path decides
 //! whether an issue may be *claimed*: the open-PR, backoff, live-claim,
-//! peer-claim and lease-order guards, the claim lock, the label flip, a new
+//! and lease-order guards, the claim lock, the label flip, a new
 //! lease record. A resume claims nothing. The claim is already this host's, so
 //! it checks that the claim is **still** this host's and otherwise leaves the
 //! forge alone:
