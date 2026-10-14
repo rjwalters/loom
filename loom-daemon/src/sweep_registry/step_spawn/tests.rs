@@ -57,7 +57,8 @@ fn a_step_launches_its_roles_prompt_and_is_tracked_as_a_step() {
     assert!(outcome.sweep_id.starts_with("step-judge-9100-"), "{}", outcome.sweep_id);
     let recorded = assert_child_wrote(&record, &format!("LOOM_SWEEP_ID={}", outcome.sweep_id));
     assert!(recorded.contains("arg: /loom:judge 9100"), "{recorded}");
-    assert!(recorded.contains("LOOM_SWEEP_CLAIM_OWNED=9100"), "{recorded}");
+    // A PR step's item is a PR, never an issue claim (`build-gate.sh`).
+    assert!(recorded.contains("LOOM_SWEEP_CLAIM_OWNED=unset"), "{recorded}");
     let info = &reg.entries[&outcome.sweep_id];
     assert_eq!(
         info.kind,
@@ -155,6 +156,11 @@ fn a_step_child_lists_its_leases_and_a_curator_names_its_launch() {
                 .to_string()
         )
     );
+    assert_eq!(
+        env(&cmd, crate::host_identity::HOST_ID_ENV),
+        Some(crate::host_identity::lease_host_identity()),
+        "the daemon's lease host id, so a containered session owns its lease"
+    );
     assert_eq!(env(&cmd, "LOOM_CURATION_MODEL").as_deref(), Some("opus"));
     assert_eq!(env(&cmd, "LOOM_CURATION_RUNTIME").as_deref(), Some("unknown"));
     let mut cmd = Command::new("true");
@@ -182,6 +188,7 @@ fn the_pre_claim_is_the_role_keyed_lease_with_the_step() {
          step-champion_promote-42-1 --workspace /ws"
     );
     let renew = claim_args(root, 42, StepRole::Judge, "step-judge-42-1", Some(777));
+    assert!(renew.join(" ").starts_with("lease pr attach 42 "), "renew-only");
     assert!(renew.join(" ").contains("--watch-pid 777"));
 }
 
@@ -197,15 +204,22 @@ fn a_lost_or_unreadable_pre_claim_refuses_the_step() {
 // ---- B3: the timeout ------------------------------------------------------
 
 #[test]
+#[serial]
 fn each_role_has_its_timeout_and_builder_the_sweeps() {
-    assert_eq!(step_timeout(StepRole::Judge), crate::role_runner::DEFAULT_ROLE_TIMEOUT);
-    assert_eq!(step_timeout(StepRole::Curator), crate::role_runner::DEFAULT_ROLE_TIMEOUT);
-    assert!(step_timeout(StepRole::Builder) > step_timeout(StepRole::Judge));
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let role_timeout = crate::role_runner::DEFAULT_ROLE_TIMEOUT;
+    assert_eq!(step_timeout(root, StepRole::Judge), role_timeout);
+    assert_eq!(step_timeout(root, StepRole::Curator), role_timeout);
+    std::env::remove_var(super::super::watchdog::STALE_SWEEP_AGE_ENV);
+    assert!(step_timeout(root, StepRole::Builder) > role_timeout);
+    std::env::set_var(super::super::watchdog::STALE_SWEEP_AGE_ENV, "7200");
+    assert_eq!(step_timeout(root, StepRole::Builder), Duration::from_secs(7200));
+    std::env::remove_var(super::super::watchdog::STALE_SWEEP_AGE_ENV);
     let now = Utc::now();
-    let judge = step_timeout(StepRole::Judge).as_secs() as i64;
-    assert!(!timed_out(StepRole::Judge, now - chrono::Duration::seconds(judge - 5), now));
-    assert!(timed_out(StepRole::Judge, now - chrono::Duration::seconds(judge + 5), now));
-    assert!(!timed_out(StepRole::Builder, now - chrono::Duration::seconds(judge + 5), now));
+    let secs = role_timeout.as_secs() as i64;
+    assert!(!timed_out(role_timeout, now - chrono::Duration::seconds(secs - 5), now));
+    assert!(timed_out(role_timeout, now - chrono::Duration::seconds(secs + 5), now));
 }
 
 /// A fake `gh` answering the issue read with `labels` on an open item, and
@@ -289,7 +303,7 @@ fn a_step_past_its_timeout_is_reaped_and_its_claim_restored() {
         );
         (id, pid)
     };
-    let past = step_timeout(StepRole::Judge) + Duration::from_secs(60);
+    let past = step_timeout(dir.path(), StepRole::Judge) + Duration::from_secs(60);
     let (late, late_pid) = insert(&mut reg, 9_200, past);
     let (fresh, fresh_pid) = insert(&mut reg, 9_201, Duration::from_secs(60));
 
@@ -394,4 +408,38 @@ fn a_steps_end_writes_the_role_ticks_outcome_record() {
     assert_eq!(records.len(), 1, "{journal:?}");
     assert_eq!(records[0].role, "champion");
     assert_eq!(records[0].model.as_deref(), Some("opus"));
+}
+
+/// Review item 4: a step found dead at startup runs the step end too, so the
+/// leases it listed are reaped and its lease file is not left behind.
+#[test]
+#[serial]
+fn a_step_found_dead_at_startup_runs_its_end() {
+    let dir = tempdir().unwrap();
+    let mut reg =
+        crate::sweep_registry::test_support::fixture_registry_with_lease_gh(dir.path(), "", 0);
+    let id = "step-judge-31-1";
+    let file = crate::pr_lease_reap::path_for(dir.path(), id);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, format!("31 judge host-a {id}\n")).unwrap();
+    reg.restore_dead_step_at_startup(31, StepRole::Judge, id, Utc::now());
+    assert!(
+        crate::sweep_registry::test_support::wait_for_condition(30_000, || !file.exists()),
+        "the dead step's lease file is reaped and removed"
+    );
+}
+
+/// An issue step's child is told the claim is its invoker's; a PR step's is
+/// not (its item is a PR, never an issue claim).
+#[test]
+#[serial]
+fn only_an_issue_step_names_its_item_as_the_owned_claim() {
+    let dir = tempdir().unwrap();
+    let (mut reg, record) = fixture_registry(dir.path());
+    let out = reg
+        .spawn_step(&StepSpawnRequest::new(9_105, StepRole::Curator))
+        .unwrap();
+    let recorded = assert_child_wrote(&record, &format!("LOOM_SWEEP_ID={}", out.sweep_id));
+    assert!(recorded.contains("LOOM_SWEEP_CLAIM_OWNED=9105"), "{recorded}");
+    cancel_all(&mut reg);
 }

@@ -14,7 +14,10 @@
 //! (`targeted-role-invocation.md`, #11868), read from the step's log after
 //! its own dispatch header. The class rides the record's detail and the end
 //! log line; the outcome ledger (#11900) consumes it from
-//! [`read_outcome_line`].
+//! [`read_outcome_line`]. The line is advisory: the ledger decides with the
+//! forge post-state, which this module does not read. Whoever reads it for
+//! the ledger passes `None` when that read fails, never a default (#11962),
+//! so a failed probe classifies as `failed`, not as the session's word.
 
 use super::*;
 use crate::role_runner::RoleTickOutcome;
@@ -152,11 +155,13 @@ pub(crate) fn emit_step_capture(capture: &StepCapture) {
 }
 
 impl SweepRegistry {
-    /// A step ended (`release_dead_step`): reap the leases it still listed,
-    /// then emit its capture off the lock. Returns its outcome line.
+    /// A step ended (`release_dead_step`, or found dead at startup with no
+    /// entry): reap the leases it still listed, then emit its capture off the
+    /// lock. Returns its outcome line.
     pub(crate) fn end_step(
         &self,
         sweep_id: &str,
+        item: u32,
         role: StepRole,
         started_at: DateTime<Utc>,
         end: StepEnd,
@@ -167,7 +172,9 @@ impl SweepRegistry {
             end
         };
         let info = self.entries.get(sweep_id);
-        let line = info.and_then(|i| read_outcome_line(&i.log_path, sweep_id));
+        let log_path =
+            info.map_or_else(|| self.compute_step_log_path(item, role), |i| i.log_path.clone());
+        let line = read_outcome_line(&log_path, sweep_id);
         log::info!(
             "sweep_registry: {role} step {sweep_id} ended ({end:?}), outcome {} (#11906)",
             line.as_ref().map_or("none".to_string(), |l| format!(

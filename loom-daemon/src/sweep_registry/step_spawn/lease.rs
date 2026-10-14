@@ -9,10 +9,11 @@
 //! - **Pre-claim**, before the spawn, with no `--watch-pid` (no session to
 //!   watch yet): claim-then-verify-order, a yield on loss. The won lease is
 //!   listed in the step's lease file (`pr_lease_reap`).
-//! - **Renewal**, once the child exists: the same `claim` again with
-//!   `--watch-pid <child>`. It re-attaches (`already held by this
-//!   claimant`) and starts the detached renewer, which lives as long as the
-//!   step's session, never the daemon (#6129). The issue path's renewal ran
+//! - **Renewal**, once the child exists: `lease pr attach --watch-pid
+//!   <child>`, renew-only. It re-attaches to the step's own live lease and
+//!   starts the detached renewer, which lives as long as the step's session,
+//!   never the daemon (#6129). A lease already released or reaped stays
+//!   gone: `attach` never posts one. The issue path's renewal ran
 //!   only for issue sweeps (`dispatch.rs`), while `child_env_markers` told
 //!   every step it was renewed; a Builder step now takes that path, every
 //!   other step this one.
@@ -32,8 +33,9 @@ const EXIT_BACKSTOP: i32 = 6;
 /// with its own `gh` deadline (as `pr_lease_reap::REAP_TIMEOUT`).
 const CLAIM_TIMEOUT: Duration = pr_lease_reap::REAP_TIMEOUT;
 
-/// The `lease pr claim` argv (after the binary) for a step's lease: the
-/// pre-claim without `watch_pid`, the renewal start with it. Pure.
+/// The `lease pr` argv (after the binary) for a step's lease: the pre-claim
+/// (`claim`, no `watch_pid`), or the renewal start (`attach --watch-pid`,
+/// renew-only: it never posts a lease). Pure.
 #[must_use]
 pub(crate) fn claim_args(
     root: &Path,
@@ -42,10 +44,15 @@ pub(crate) fn claim_args(
     sweep_id: &str,
     watch_pid: Option<u32>,
 ) -> Vec<String> {
+    let verb = if watch_pid.is_some() {
+        "attach"
+    } else {
+        "claim"
+    };
     let mut args = vec![
         "lease".to_string(),
         "pr".to_string(),
-        "claim".to_string(),
+        verb.to_string(),
         item.to_string(),
         "--role".to_string(),
         role.role_name().to_string(),

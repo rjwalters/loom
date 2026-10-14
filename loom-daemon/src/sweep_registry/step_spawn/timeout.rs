@@ -19,18 +19,21 @@ use std::sync::Mutex;
 /// SIGTERM-to-SIGKILL grace for a timed-out step (the role runner's).
 pub(crate) const STEP_TIMEOUT_GRACE: Duration = Duration::from_secs(5);
 
-/// How long a step of `role` may run before the reaper kills it.
+/// How long a step of `role` in the workspace at `root` may run before the
+/// reaper kills it.
 ///
 /// Every role the role runner runs has its timeout,
 /// `role_runner::DEFAULT_ROLE_TIMEOUT` (one Curator, Judge, Doctor or Champion
 /// session). The role runner never runs Builder: a Builder step is one build,
-/// so it gets the ceiling the sweep path already applies to a whole issue
-/// sweep (`watchdog::DEFAULT_STALE_SWEEP_AGE_SECS`).
+/// so it gets the ceiling the sweep path applies to a whole issue sweep, with
+/// that ceiling's own overrides (`LOOM_SWEEP_STALE_AGE_SECS`, then
+/// `autonomous.watchdog.staleSweepAgeSecs`, `watchdog::resolve_stale_sweep_age`).
 #[must_use]
-pub fn step_timeout(role: StepRole) -> Duration {
+pub fn step_timeout(root: &Path, role: StepRole) -> Duration {
     match role {
         StepRole::Builder => {
-            Duration::from_secs(super::super::watchdog::DEFAULT_STALE_SWEEP_AGE_SECS)
+            let config = super::super::watchdog::read_startup_race_config(root);
+            super::super::watchdog::resolve_stale_sweep_age(&config)
         }
         StepRole::Curator
         | StepRole::ChampionPromote
@@ -40,13 +43,13 @@ pub fn step_timeout(role: StepRole) -> Duration {
     }
 }
 
-/// Whether a step of `role` that started at `started_at` is past its timeout
-/// at `now`. Pure.
+/// Whether a step that started at `started_at` is past `timeout` at `now`.
+/// Pure.
 #[must_use]
-pub(crate) fn timed_out(role: StepRole, started_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+pub(crate) fn timed_out(timeout: Duration, started_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
     (now - started_at)
         .to_std()
-        .is_ok_and(|elapsed| elapsed > step_timeout(role))
+        .is_ok_and(|elapsed| elapsed > timeout)
 }
 
 /// Steps the reaper is killing for their timeout, so the cancel path's step
@@ -76,6 +79,7 @@ impl SweepRegistry {
     /// pause holds is left alone, as the death path leaves it.
     pub fn reap_step_timeouts(&mut self) -> usize {
         let now = Utc::now();
+        let root = &self.config.workspace_root;
         let due: Vec<(SweepId, StepRole, DateTime<Utc>)> = self
             .entries
             .iter()
@@ -84,7 +88,9 @@ impl SweepRegistry {
                     && !crate::roll_pause::hold::is_held(id)
             })
             .filter_map(|(id, info)| match info.kind {
-                SweepKind::Step { role, .. } if timed_out(role, info.started_at, now) => {
+                SweepKind::Step { role, .. }
+                    if timed_out(step_timeout(root, role), info.started_at, now) =>
+                {
                     Some((id.clone(), role, info.started_at))
                 }
                 SweepKind::Step { .. } | SweepKind::Issue(_) | SweepKind::PrSet(_) => None,
@@ -95,7 +101,7 @@ impl SweepRegistry {
             log::warn!(
                 "sweep_registry: {role} step {sweep_id} exceeded its {}s timeout (started {}) — \
                  killing it and releasing its claim (#11906)",
-                step_timeout(role).as_secs(),
+                step_timeout(&self.config.workspace_root, role).as_secs(),
                 started_at.to_rfc3339()
             );
             mark_timed_out(&sweep_id);

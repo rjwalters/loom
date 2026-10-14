@@ -51,3 +51,67 @@ fn a_timed_out_steps_lease_is_reaped_by_its_sweep_identity() {
     let fresh = daemon(Role::Curator, "step-curator-77-2", StepRole::Curator);
     assert_eq!(ctx(dir.path(), fresh).claim(), EXIT_HELD, "the claim is free again");
 }
+
+/// Restores the named env vars on drop.
+struct EnvGuard(Vec<(&'static str, Option<String>)>);
+
+impl EnvGuard {
+    fn save(names: &[&'static str]) -> Self {
+        Self(names.iter().map(|n| (*n, std::env::var(n).ok())).collect())
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (name, value) in &self.0 {
+            match value {
+                Some(v) => std::env::set_var(name, v),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+}
+
+/// A session in a Codex container has its own hostname. The step child
+/// carries the daemon's `LOOM_HOST_ID` (`apply_step_env`, forwarded by
+/// `spawn-codex.sh`), so the session's published host is the daemon's and
+/// it re-attaches to the pre-taken lease instead of reading it as a peer's.
+#[test]
+#[serial_test::serial]
+fn a_containered_session_with_the_daemons_host_id_re_attaches() {
+    let _env = EnvGuard::save(&["LOOM_HOST_ID", "HOSTNAME"]);
+    std::env::set_var("LOOM_HOST_ID", "fleet-host-7");
+    std::env::set_var("HOSTNAME", "robb-pro.local");
+    let daemon_host = published_host();
+    std::env::set_var("HOSTNAME", "codex-session-9f2c");
+    let session_host = published_host();
+    assert_eq!(session_host, daemon_host, "same LOOM_HOST_ID, same lease host");
+    std::env::remove_var("LOOM_HOST_ID");
+    assert_ne!(published_host(), daemon_host, "without it, the container is a peer");
+
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    let pre = Identity::new(Role::Judge, daemon_host, SWEEP.into(), Some(StepRole::Judge)).unwrap();
+    assert_eq!(ctx(dir.path(), pre.clone()).claim(), EXIT_HELD);
+    let session = Identity::new(Role::Judge, session_host, SWEEP.into(), None).unwrap();
+    assert_eq!(ctx(dir.path(), session).claim(), EXIT_HELD);
+    assert_eq!(posted(dir.path()), vec![pre.lease_marker()], "re-attached, never re-posted");
+}
+
+/// The step's renewal start is renew-only: it re-attaches to the step's own
+/// live lease, and once that lease is released it posts nothing.
+#[test]
+fn attach_renews_only_a_live_own_lease_and_never_posts() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    let pre = daemon(Role::Doctor, "step-doctor-77-1", StepRole::Doctor);
+    assert_eq!(ctx(dir.path(), pre.clone()).attach(), EXIT_EXPIRED, "nothing to renew yet");
+    assert!(posted(dir.path()).is_empty(), "attach never posts");
+    assert_eq!(ctx(dir.path(), pre.clone()).claim(), EXIT_HELD);
+    assert_eq!(ctx(dir.path(), pre.clone()).attach(), EXIT_HELD);
+    let peer = daemon(Role::Doctor, "step-doctor-77-2", StepRole::Doctor);
+    assert_eq!(ctx(dir.path(), peer).attach(), EXIT_PEER);
+    assert_eq!(ctx(dir.path(), pre.clone()).release(), EXIT_HELD);
+    assert_eq!(ctx(dir.path(), pre).attach(), EXIT_EXPIRED, "a released lease stays gone");
+    assert_eq!(posted(dir.path()).len(), 1, "only the pre-claim ever posted");
+}
