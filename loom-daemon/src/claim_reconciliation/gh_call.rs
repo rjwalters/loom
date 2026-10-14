@@ -100,7 +100,7 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "intake.recheck"
         | "landed.issue_labels" => ops::ISSUE_VIEW_STATE,
         "park_hold.issue_body" => ops::ISSUE_EDIT_BODY,
-        "intake.list_open" | "quarantine.issue_list" => ops::ISSUE_LIST,
+        "quarantine.issue_list" => ops::ISSUE_LIST,
         "claim.issue_reclaim"
         | "claim.pr_add_label"
         | "claim.pr_reclaim"

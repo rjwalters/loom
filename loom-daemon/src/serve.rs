@@ -442,15 +442,8 @@ pub struct PipelineRow {
 /// shape is unrecognized.
 #[must_use]
 fn derive_forge_url(root: &Path) -> Option<String> {
-    let out = std::process::Command::new("git")
-        .args(["remote", "get-url", "origin"])
-        .current_dir(root)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    // Bounded (#9715): a hung `git` must not stall the dashboard.
+    let raw = crate::forge_cmd::get_remote_url(root)?;
     normalize_forge_url(&raw)
 }
 

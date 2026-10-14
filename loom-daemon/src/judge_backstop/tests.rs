@@ -180,3 +180,36 @@ fn pending_check_runs_and_statuses_are_picked_out() {
     assert!(pending_statuses(&serde_json::json!({"state": "pending", "statuses": []})).is_empty());
     assert!(pending_check_runs(&serde_json::json!({})).is_empty());
 }
+
+/// #11931: a timed-out Judge's reaped record is a no-verdict record like any
+/// other, so three of them at one head hold the PR for the rest of the window.
+#[test]
+fn reaped_timeout_records_count_toward_the_window() {
+    let labels = ["loom:review-requested", "loom:reviewing"];
+    let fields = reaped_fields(HEAD, &labels, "timeout");
+    assert_eq!(
+        fields,
+        format!(" head={HEAD} verdict=none labels=review-requested reaped=timeout")
+    );
+    let body = format!("{RELEASED_JUDGE_PREFIX}host=h sweep=s{fields} -->\nprose");
+    assert_eq!(parse(&body), Some(rec(HEAD, "review-requested")));
+    let comment = |at: &str| serde_json::json!({"body": body, "updated_at": at});
+    // One timeout: held an hour. Two: four hours. Three: until the first
+    // ages out of the 24 h window.
+    let one = [comment("2026-10-13T00:00:00Z")];
+    assert_eq!(hold_from_comments(&one, HEAD, &labels, t(0)), Some(t(1)));
+    let two = [
+        comment("2026-10-13T00:00:00Z"),
+        comment("2026-10-13T01:00:00Z"),
+    ];
+    assert_eq!(hold_from_comments(&two, HEAD, &labels, t(1)), Some(t(5)));
+    let three = [
+        comment("2026-10-13T00:00:00Z"),
+        comment("2026-10-13T01:00:00Z"),
+        comment("2026-10-13T05:00:00Z"),
+    ];
+    assert_eq!(hold_from_comments(&three, HEAD, &labels, t(5)), Some(t(24)));
+    // The reason can never break the marker.
+    assert!(reaped_fields(HEAD, &labels, "time out -->").ends_with(" reaped=timeout"));
+    assert!(reaped_fields(HEAD, &labels, "  ").ends_with(" reaped=unknown"));
+}

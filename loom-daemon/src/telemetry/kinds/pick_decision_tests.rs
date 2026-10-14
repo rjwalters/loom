@@ -356,6 +356,22 @@ fn reassemble(chunks: &[PickDecisionRecord]) -> PickDecisionRecord {
                 .collect();
             wd
         });
+    out.item_draw = sorted
+        .iter()
+        .find_map(|c| c.item_draw.clone())
+        .map(|mut d| {
+            d.pools = sorted
+                .iter()
+                .filter_map(|c| c.item_draw.as_ref())
+                .flat_map(|d| d.pools.iter().cloned())
+                .collect();
+            d.draws = sorted
+                .iter()
+                .filter_map(|c| c.item_draw.as_ref())
+                .flat_map(|d| d.draws.iter().cloned())
+                .collect();
+            d
+        });
     out
 }
 
@@ -378,4 +394,135 @@ fn workspace_draw_without_seed_inputs_round_trips() {
     assert_eq!(draw.seed_minute, None);
     assert_eq!(draw.seed_host, None);
     assert_eq!(serde_json::to_value(&draw).unwrap(), old);
+}
+
+#[test]
+fn every_exclusion_maps_to_a_skip_reason() {
+    use crate::step_dispatch::item_draw::Exclusion;
+    use crate::work_finder::step_item::PassReason as P;
+    let map = PickSkipReason::from_exclusion;
+    assert_eq!(map(Exclusion::PoolExhausted), PickSkipReason::Quota);
+    assert_eq!(map(Exclusion::BuildBackoff), PickSkipReason::Backoff);
+    assert_eq!(map(Exclusion::Pass(P::Claimed)), PickSkipReason::InFlight);
+    assert_eq!(map(Exclusion::Pass(P::Operator)), PickSkipReason::OperatorHold);
+    assert_eq!(map(Exclusion::Pass(P::CapabilityMissing)), PickSkipReason::HostConstraint);
+    for r in [P::Epic, P::Proposal, P::NoStage] {
+        assert_eq!(map(Exclusion::Pass(r)), PickSkipReason::NoStep);
+    }
+    // Pass-reason wire names match their serde form.
+    for r in [
+        P::HardExclusion,
+        P::SharedPr,
+        P::NoStage,
+        P::CapabilityMissing,
+    ] {
+        assert_eq!(serde_json::to_value(r).unwrap(), serde_json::json!(r.as_str()));
+    }
+}
+
+#[test]
+fn item_draws_split_in_order_with_their_header_on_every_chunk() {
+    let draws: Vec<PickItemDrawStep> = (0u32..9)
+        .map(|i| PickItemDrawStep {
+            repo: "o/r".to_string(),
+            draw_index: i,
+            seed: (1000 + i).to_string(),
+            pool_size: 9 - i as usize,
+            total_weight: 500,
+            roll: u64::from(i),
+            picked_index: 0,
+            number: 100 + i,
+            issue: Some(100 + i),
+            pr: None,
+            step: "builder".to_string(),
+            weight: 43_200,
+            actionable: 1,
+            priority: 1,
+            level: "default".to_string(),
+            lane: "normal".to_string(),
+            age_permille: 1000,
+            age_minutes: 0,
+            age_source: "created".to_string(),
+        })
+        .collect();
+    let record = PickDecisionRecord::build(tick("work_finder"), Vec::new()).with_item_draw(Some(
+        PickItemDraw {
+            seed_scheme: "loom-draw/v2".to_string(),
+            seed_minute: "29000000".to_string(),
+            seed_host: "host-a".to_string(),
+            tick_counter: "17".to_string(),
+            draws_total: 9,
+            excluded: vec![PickItemExclusion {
+                repo: "o/r".to_string(),
+                reason: "pool_exhausted".to_string(),
+                skip_reason: PickSkipReason::Quota,
+                count: 4,
+            }],
+            pools: Vec::new(),
+            draws,
+        },
+    ));
+    let json = serde_json::to_value(&record).unwrap();
+    assert_eq!(json["item_draw"]["draws"][0]["age_source"], "created");
+    assert_eq!(json["item_draw"]["excluded"][0]["skip_reason"], "quota");
+    let chunks = split_into_chunks(record.clone(), 1500);
+    assert!(chunks.len() > 1);
+    assert_eq!(reassemble(&chunks), record);
+    for chunk in &chunks {
+        let d = chunk.item_draw.as_ref().unwrap();
+        assert_eq!((d.tick_counter.as_str(), d.draws_total), ("17", 9));
+    }
+    // An older record without the field still reads.
+    let mut old =
+        serde_json::to_value(PickDecisionRecord::build(tick("judge"), Vec::new())).unwrap();
+    assert!(old.get("item_draw").is_none());
+    old.as_object_mut().unwrap().remove("item_draw");
+    let back: PickDecisionRecord = serde_json::from_value(old).unwrap();
+    assert!(back.item_draw.is_none());
+}
+
+#[test]
+fn a_large_item_pool_splits_into_bounded_chunks_and_reassembles() {
+    let pool: Vec<PickItemPoolEntry> = (0u32..600)
+        .map(|i| PickItemPoolEntry {
+            repo: "o/r".to_string(),
+            index: i,
+            number: 1000 + i,
+            issue: Some(1000 + i),
+            pr: (i % 4 == 0).then_some(5000 + i),
+            step: "judge".to_string(),
+            weight: 43_200 + u64::from(i),
+            priority: 1,
+            age_permille: 1000,
+            age_source: "events".to_string(),
+        })
+        .collect();
+    let record = PickDecisionRecord::build(tick("work_finder"), Vec::new()).with_item_draw(Some(
+        PickItemDraw {
+            seed_scheme: "loom-draw/v2".to_string(),
+            seed_minute: "1".to_string(),
+            seed_host: "h".to_string(),
+            tick_counter: "2".to_string(),
+            draws_total: 0,
+            excluded: Vec::new(),
+            pools: pool,
+            draws: Vec::new(),
+        },
+    ));
+    let budget = 8_000;
+    let chunks = split_into_chunks(record.clone(), budget);
+    assert!(chunks.len() > 5, "{} chunks", chunks.len());
+    for chunk in &chunks {
+        assert!(serde_json::to_vec(chunk).unwrap().len() <= budget);
+    }
+    let back = reassemble(&chunks);
+    assert_eq!(back, record);
+    let indices: Vec<u32> = back
+        .item_draw
+        .unwrap()
+        .pools
+        .iter()
+        .map(|p| p.index)
+        .collect();
+    assert_eq!(indices, (0..600).collect::<Vec<_>>());
 }

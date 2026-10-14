@@ -155,9 +155,23 @@ pub struct MirrorItem {
     /// When each current label was last applied (label name → RFC-3339
     /// time), the mirror's per-item `labels_at` (#11897). Values are kept as
     /// sent, so one malformed entry drops only itself ([`Self::to_rest`]),
-    /// never the page.
-    #[serde(default)]
+    /// never the page; a field that is not an object at all (an array, a
+    /// string, a number) reads as `None` for this item alone (#11924).
+    #[serde(default, deserialize_with = "lenient_labels_at")]
     pub labels_at: Option<BTreeMap<String, Value>>,
+}
+
+/// `labels_at` as an object of label → value, or `None` for any other shape:
+/// a wrong shape must not fail the item, which would fail the whole page
+/// and start the mirror backoff for every caller (#11924).
+fn lenient_labels_at<'de, D>(de: D) -> Result<Option<BTreeMap<String, Value>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match Value::deserialize(de)? {
+        Value::Object(map) => Some(map.into_iter().collect()),
+        _ => None,
+    })
 }
 
 impl MirrorItem {
