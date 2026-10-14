@@ -6,7 +6,8 @@
 #![allow(clippy::unwrap_used)]
 
 use super::{
-    budget, compare_memoised, fetch_base_tip, fetch_check_runs, fetch_required, tested_base,
+    branch_protection_contexts, budget, compare_memoised, fetch_base_tip, fetch_check_runs,
+    fetch_required, tested_base,
 };
 use crate::forge_wait_checks::reads::GhReads;
 use std::os::unix::fs::PermissionsExt;
@@ -239,6 +240,58 @@ fn a_plan_gated_rulesets_403_still_reads_as_no_rules() {
     let (required, notices) = fetch_required(f.gh(), "o/r", "main", Some(f.store())).unwrap();
     assert!(required.is_empty());
     assert!(notices[0].contains("#8844"), "{notices:?}");
+}
+
+const NOT_ACCESSIBLE: &str = r#"{"message":"Resource not accessible by integration"}"#;
+
+/// #11855: a read-only App token is refused the GraphQL `branchProtectionRule`
+/// field (it needs `Administration: read`); the REST branch summary answers
+/// the same question, so the lookup succeeds instead of failing closed on
+/// every Judge pass.
+#[test]
+fn a_refused_graphql_classic_read_falls_back_to_the_rest_branch_summary() {
+    let f = Forge::new();
+    f.serve("repos/o/r/rules/branches/main", "[]");
+    f.refuse("graphql", 403, "", NOT_ACCESSIBLE);
+    f.serve(
+        "repos/o/r/branches/main",
+        r#"{"name":"main","protected":true,"protection":{"enabled":true,"required_status_checks":{"enforcement_level":"non_admins","contexts":["Rust (ubuntu-latest)","Docs"],"checks":[{"context":"Docs","app_id":1},{"context":"Package","app_id":1}]}}}"#,
+    );
+    let (required, notices) = fetch_required(f.gh(), "o/r", "main", Some(f.store())).unwrap();
+    assert_eq!(required, ["Rust (ubuntu-latest)", "Docs", "Package"]);
+    assert!(notices.is_empty(), "{notices:?}");
+}
+
+#[test]
+fn a_refused_graphql_read_still_fails_closed_when_rest_cannot_answer() {
+    let f = Forge::new();
+    f.serve("repos/o/r/rules/branches/main", "[]");
+    f.refuse("graphql", 403, "", NOT_ACCESSIBLE);
+    // Protected, but the summary is withheld: unknown, never "nothing".
+    f.serve("repos/o/r/branches/main", r#"{"name":"main","protected":true}"#);
+    let err = fetch_required(f.gh(), "o/r", "main", Some(f.store())).unwrap_err();
+    assert!(err.contains("classic branch-protection lookup failed"), "{err}");
+    assert!(err.contains("withheld"), "{err}");
+    // And a REST read that fails outright is no answer either.
+    std::fs::remove_file(f.file("repos/o/r/branches/main", "body")).unwrap();
+    let err = fetch_required(f.gh(), "o/r", "main", Some(f.store())).unwrap_err();
+    assert!(err.contains("REST branch fallback"), "{err}");
+}
+
+#[test]
+fn the_branch_summary_parser_reads_ruleset_only_and_unprotected_branches_as_none() {
+    // A ruleset-only branch: protected, classic protection disabled.
+    let ruleset_only = r#"{"protected":true,"protection":{"enabled":false,"required_status_checks":{"enforcement_level":"off","contexts":[],"checks":[]}}}"#;
+    assert!(branch_protection_contexts(ruleset_only).unwrap().is_empty());
+    assert!(branch_protection_contexts(r#"{"protected":false}"#)
+        .unwrap()
+        .is_empty());
+    assert!(branch_protection_contexts(r#"{"name":"main"}"#).is_err());
+    // A protection summary without `required_status_checks` is withheld,
+    // not "no checks": GitHub always sends that key.
+    let no_rsc = r#"{"protected":true,"protection":{"enabled":true}}"#;
+    assert!(branch_protection_contexts(no_rsc).is_err());
+    assert!(branch_protection_contexts("not json").is_err());
 }
 
 // ---- memos ----------------------------------------------------------------

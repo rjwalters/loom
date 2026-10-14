@@ -39,6 +39,10 @@ pub(super) fn apply_role_observability(
 ) -> Option<crate::observability::agent_relay::SessionLease> {
     use crate::telemetry::trace::store::{TRACEPARENT_ENV, W3C_TRACEPARENT_ENV};
     let execution = crate::observability::lifecycle::role_command(cmd);
+    if let Some(execution) = &execution {
+        // #11855: where a won PR claim names this tick's PR.
+        crate::observability::lifecycle::role_target::export(cmd, workspace_root, execution);
+    }
     let context = cmd
         .get_envs()
         .find(|(name, _)| *name == TRACEPARENT_ENV)

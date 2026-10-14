@@ -28,6 +28,7 @@ const SOURCE_ALLOWLIST: &[(&str, &str)] = &[
     ("host_affinity.rs", "loom:host:"),
     ("intake_reconcile.rs", "loom:"),
     ("intake_reconcile/singleton.rs", "loom:"),
+    ("judge_backstop.rs", "loom:"),
     ("label_registry/mod.rs", "loom:"),
     ("merge_pr/consolidate.rs", "loom:consolidation"),
     ("merge_pr/consolidate.rs", "loom:consolidation-abort"),

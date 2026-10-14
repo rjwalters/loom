@@ -1165,6 +1165,7 @@ pub fn role_invocation(
     let execution = role_execution_id(role, started_at);
     role_failure::clear();
     role_draw::clear();
+    role_target::clear();
     ROLE_CONTEXT.with(|slot| {
         *slot.borrow_mut() = Some(RoleSlot::Pending {
             root: root.to_path_buf(),
@@ -1177,6 +1178,7 @@ pub fn role_invocation(
     let noted = role_failure::take();
     let drawn = role_draw::take();
     let resumed_from = roll_interruption::take_resumed_from();
+    let pr = role_target::take().or_else(|| role_target::take_handoff(root, &execution));
     let Some(RoleSlot::Open(span)) = ROLE_CONTEXT.with(|slot| slot.borrow_mut().take()) else {
         return (outcome, None);
     };
@@ -1205,6 +1207,9 @@ pub fn role_invocation(
     if let Some(drawn) = drawn {
         close.extend(drawn);
     }
+    if let Some(pr) = pr {
+        close.insert(role_target::PR_NUMBER.into(), pr.to_string());
+    }
     let result = roll.map_or(result, |roll| {
         roll.apply(&mut close);
         roll_interruption::RESULT.to_owned()
@@ -1215,6 +1220,7 @@ pub fn role_invocation(
 
 pub mod role_draw;
 mod role_failure;
+pub mod role_target;
 pub mod roll_interruption;
 pub use role_failure::{
     note_role_failure, RoleFailure, EXIT_CODE, FAILURE_CLASS, ROLE_FAILURE_ATTRIBUTE_KEYS,
