@@ -65,6 +65,7 @@ pub mod reader_spill;
 pub mod reader_withdrawal;
 pub mod redate_chain;
 pub mod stage_dwell;
+pub mod stage_entry;
 pub mod stage_queue;
 pub mod turnaround;
 

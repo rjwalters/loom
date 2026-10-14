@@ -610,6 +610,8 @@ pub async fn record(workspace_root: &Path) {
     sink.emit_metrics_since(super::forge_calls::drain_event_points(), since);
     // 2am#4367 P5: mirror reads, delivered changes and wake latency.
     sink.emit_metrics_since(super::forge_mirror::drain_points(), since);
+    // #11897: stage-entry answers by source (the step engine's age coverage).
+    sink.emit_metrics_since(super::stage_entry::drain_points(), since);
     let root = workspace_root.to_path_buf();
     let sampled = tokio::task::spawn_blocking(move || {
         let host = probe_host(&root);

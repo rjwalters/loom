@@ -503,6 +503,10 @@ pub enum MetricName {
     /// by `repo` (mean = this / `loom.forge.mirror.changes`).
     #[serde(rename = "loom.forge.mirror.wake_latency")]
     ForgeMirrorWakeLatency,
+    /// Stage-entry answers by `repo` and `kind`, the answering source
+    /// (`mirror`, `events`, `created`, `none`), #11897: the step engine's stage-age coverage.
+    #[serde(rename = "loom.stage_entry.lookups")]
+    StageEntryLookups,
 }
 
 impl MetricName {
@@ -582,6 +586,7 @@ impl MetricName {
             Self::ForgeMirrorReads => "loom.forge.mirror.reads",
             Self::ForgeMirrorChanges => "loom.forge.mirror.changes",
             Self::ForgeMirrorWakeLatency => "loom.forge.mirror.wake_latency",
+            Self::StageEntryLookups => "loom.stage_entry.lookups",
         }
     }
 
@@ -620,7 +625,8 @@ impl MetricName {
             | Self::DaemonIpcStatusBuilds
             | Self::ForgeMirrorReads
             | Self::ForgeMirrorChanges
-            | Self::ForgeMirrorWakeLatency => MetricKind::DeltaCounter,
+            | Self::ForgeMirrorWakeLatency
+            | Self::StageEntryLookups => MetricKind::DeltaCounter,
             _ => MetricKind::Gauge,
         }
     }
@@ -683,6 +689,7 @@ impl MetricName {
             Self::ForgeMirrorReads => "{request}",
             Self::ForgeMirrorChanges => "{change}",
             Self::ForgeMirrorWakeLatency => "s",
+            Self::StageEntryLookups => "{lookup}",
             _ => "By",
         }
     }
@@ -803,6 +810,9 @@ impl MetricName {
             Self::ForgeMirrorChanges => "Changes the state mirror's change stream delivered.",
             Self::ForgeMirrorWakeLatency => {
                 "Summed seconds from a change at the state mirror to the pull that saw it."
+            }
+            Self::StageEntryLookups => {
+                "Stage-entry times the step engine looked up, by repo and answering source (kind)."
             }
         }
     }

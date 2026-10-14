@@ -152,6 +152,12 @@ pub struct MirrorItem {
     pub sub_issues_total: Option<u64>,
     #[serde(default)]
     pub sub_issues_completed: Option<u64>,
+    /// When each current label was last applied (label name → RFC-3339
+    /// time), the mirror's per-item `labels_at` (#11897). Values are kept as
+    /// sent, so one malformed entry drops only itself ([`Self::to_rest`]),
+    /// never the page.
+    #[serde(default)]
+    pub labels_at: Option<BTreeMap<String, Value>>,
 }
 
 impl MirrorItem {
@@ -182,6 +188,12 @@ impl MirrorItem {
                 .and_then(|c| u32::try_from(c).ok())
                 .unwrap_or(0),
             open_sub_issues,
+            labels_at: self.labels_at.as_ref().map(|times| {
+                times
+                    .iter()
+                    .filter_map(|(label, at)| Some((label.clone(), at.as_str()?.to_string())))
+                    .collect()
+            }),
         })
     }
 }

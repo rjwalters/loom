@@ -28,6 +28,7 @@ fn row(number: u32, is_pull_request: bool) -> RestIssue {
         author_association: None,
         is_pull_request,
         open_sub_issues: None,
+        labels_at: None,
     }
 }
 

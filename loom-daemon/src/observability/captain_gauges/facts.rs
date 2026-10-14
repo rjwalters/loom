@@ -125,6 +125,7 @@ pub fn as_listing(facts: &[BlockedFact]) -> Vec<RestIssue> {
             is_pull_request: false,
             comments: 0,
             open_sub_issues: None,
+            labels_at: None,
         })
         .collect()
 }

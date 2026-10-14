@@ -102,7 +102,7 @@ fn run(
     fetch: &mut Canned,
     pages: Pages,
 ) -> (Option<Vec<crate::forge_listing::RestIssue>>, Outcome) {
-    list_open_via(ReadKind::Discovery, &active(), fetch, REPO, "loom:issue", pages, now())
+    list_open_via(ReadKind::Discovery, &active(), fetch, REPO, Some("loom:issue"), pages, now())
 }
 
 // ---------------------------------------------------------------- config
@@ -208,8 +208,15 @@ fn break_glass_unset_is_todays_path() {
     assert!(!is_active());
     assert_eq!(reads.get(), 0, "no key is read while unset");
     for kind in [ReadKind::Discovery, ReadKind::Claim] {
-        assert!(list_open(kind, Caller::WorkFinder, None, Some(REPO), "loom:issue", Pages::All)
-            .is_none());
+        assert!(list_open(
+            kind,
+            Caller::WorkFinder,
+            None,
+            Some(REPO),
+            Some("loom:issue"),
+            Pages::All
+        )
+        .is_none());
     }
 
     let on = cfg(json!({"origin": "events.example.com", "keyRef": "file:/k"}));
@@ -330,7 +337,7 @@ fn the_first_page_mode_keeps_the_rest_first_page_only() {
         &active(),
         &mut f,
         REPO,
-        "loom:triage",
+        Some("loom:triage"),
         Pages::First,
         now(),
     );
@@ -398,7 +405,7 @@ fn a_decision_read_never_consults_the_mirror() {
             fresh_mark(),
         ))]);
         let (rows, _) =
-            list_open_via(kind, &active(), &mut f, REPO, "loom:issue", Pages::All, now());
+            list_open_via(kind, &active(), &mut f, REPO, Some("loom:issue"), Pages::All, now());
         assert!(rows.is_none(), "{kind:?}");
         assert!(f.calls.is_empty(), "{kind:?} made {} mirror request(s)", f.calls.len());
     }
@@ -447,9 +454,11 @@ fn only_the_discovery_listings_name_the_mirror() {
         }
     }
     let expected: std::collections::BTreeSet<String> = [
-        // The two discovery listings (2am#4367 P5).
+        // The two discovery listings (2am#4367 P5), and the step engine's
+        // all-open listing (#11897).
         "work_finder/forge.rs",
         "observability/ops/stage_dwell.rs",
+        "step_dispatch/listing.rs",
         // The task spawn, the wake seam's source check, and the telemetry drain.
         "daemon_service/observer_tasks.rs",
         "forge_events/wake.rs",
@@ -481,11 +490,26 @@ fn only_the_discovery_listings_name_the_mirror() {
     );
     assert_eq!(count("observability/ops/stage_dwell.rs", "poll_gate::ReadKind::Discovery,"), 1);
     assert_eq!(count("observability/ops/stage_dwell.rs", "Caller::"), 1);
-    // And of those, only the two listings call the listing.
+    assert_eq!(
+        count("step_dispatch/listing.rs", "mirror_rows"),
+        2,
+        "the helper and its one use"
+    );
+    assert_eq!(count("step_dispatch/listing.rs", "list_open("), 1);
+    assert_eq!(count("step_dispatch/listing.rs", "poll_gate::ReadKind::Discovery,"), 1);
+    assert_eq!(count("step_dispatch/listing.rs", "Caller::StepEngine,"), 1);
+    assert_eq!(count("step_dispatch/listing.rs", "Caller::"), 1);
+    // Only the step engine lists with no label.
+    for rel in ["work_finder/forge.rs", "observability/ops/stage_dwell.rs"] {
+        assert_eq!(count(rel, "Some(label),"), 1, "{rel} lists one label");
+    }
+    // And of those, only the three listings call the listing.
     for rel in &users {
         let text = std::fs::read_to_string(src.join(rel)).unwrap();
         let lists = text.contains("list_open(") && text.contains("forge_mirror::discovery");
-        let allowed = rel == "work_finder/forge.rs" || rel == "observability/ops/stage_dwell.rs";
+        let allowed = rel == "work_finder/forge.rs"
+            || rel == "observability/ops/stage_dwell.rs"
+            || rel == "step_dispatch/listing.rs";
         assert!(!lists || allowed, "{rel} calls the mirror listing");
         if allowed {
             assert!(text.contains("ReadKind::Discovery"), "{rel} must ask as a discovery read");
@@ -781,7 +805,7 @@ fn listing_from_inside_a_runtime() {
         Caller::WorkFinder,
         None,
         Some(REPO),
-        "loom:issue",
+        Some("loom:issue"),
         Pages::All,
     );
     set_active(None);
