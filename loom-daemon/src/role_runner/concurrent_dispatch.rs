@@ -493,6 +493,13 @@ pub fn forge_queue_probe() -> QueueProbe {
                 .cloned()
                 .collect();
             if demand::listing_has_work(label, &own_kind) {
+                // #11855: a review listing whose every PR the Judge
+                // no-verdict backstop holds is no work — dispatching would
+                // only start a Judge whose `pr-queue` serves nothing.
+                if *label == "loom:review-requested" {
+                    return crate::pr_planning::has_judge_work(root, &gh_bin)
+                        .map_err(|e| e.to_string());
+                }
                 return Ok(true);
             }
         }

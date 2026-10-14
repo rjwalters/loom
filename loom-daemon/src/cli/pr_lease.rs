@@ -73,6 +73,7 @@ use loom_daemon::comment_trust::{records::AUTHOR_JQ, TrustPolicy};
 use loom_daemon::forge_call_stats::{ops, ForgeOp};
 use loom_daemon::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
 
+pub(crate) mod backstop;
 pub(crate) mod renew;
 
 /// First-line prefix of a live PR lease record.
@@ -157,8 +158,16 @@ impl Identity {
         format!("{LEASE_PREFIX}{} -->", self.fields())
     }
 
+    #[cfg(test)]
     pub(crate) fn released_marker(&self) -> String {
-        format!("{RELEASED_PREFIX}{} -->", self.fields())
+        self.released_marker_with("")
+    }
+
+    /// The released marker with `extra` fields (leading space) after the
+    /// identity — the Judge no-verdict record, #11855. Readers of the
+    /// identity read only the first three tokens.
+    pub(crate) fn released_marker_with(&self, extra: &str) -> String {
+        format!("{RELEASED_PREFIX}{}{extra} -->", self.fields())
     }
 
     pub(crate) fn yield_marker(&self, winner: &Identity) -> String {
@@ -672,7 +681,8 @@ pub(crate) enum PrLeaseAction {
     /// Publish this role's lease on a PR and run claim-then-verify-order.
     /// Exit 0 = held (add the claim label now); 4 = a peer holds it (a yield
     /// record is posted if this call had written a lease); 5 = the lease list
-    /// was unreadable, nothing written. Stand down on 4 or 5.
+    /// was unreadable, nothing written; 6 = a Judge held by the no-verdict
+    /// backstop (#11855), nothing written. Stand down on 4, 5 or 6.
     Claim(Common),
     /// Pre-push / pre-verdict fence. Exit 0 = proceed; 3 = this claimant's
     /// lease is no longer live; 4 = a peer holds this role's lease.
@@ -808,10 +818,14 @@ impl Ctx {
                     .find(|r| r.id == id)
                     .map_or_else(self.now, |r| r.updated_at);
                 self.start_renewal(id, self.gh.story_issue(self.pr()), leased_at);
+                loom_daemon::observability::lifecycle::role_target::record_claim(self.pr());
                 println!("{} {}", self.me.host, self.me.sweep);
                 return EXIT_HELD;
             }
             ClaimState::Free => {}
+        }
+        if let Some(code) = rows.as_deref().and_then(|r| self.backstop_refusal(r)) {
+            return code;
         }
         let story = self.gh.story_issue(self.pr());
         let provenance = provenance_line(&self.gh.root, &self.me, story);
@@ -855,6 +869,7 @@ impl Ctx {
                     self.me.sweep,
                     self.me.role.claim_label()
                 ));
+                loom_daemon::observability::lifecycle::role_target::record_claim(self.pr());
                 println!("{} {}", self.me.host, self.me.sweep);
                 EXIT_HELD
             }
@@ -941,14 +956,21 @@ impl Ctx {
             return EXIT_HELD;
         };
         let mut released = 0;
+        // #11855: a Judge leaving the PR still waiting for review records it.
+        let mut extra = None;
         for row in rows {
             if parse_record(&row.body) != Some(Record::Lease(self.me.clone())) {
                 continue;
             }
+            let extra = extra.get_or_insert_with(|| {
+                backstop::release_fields(self.me.role, self.gh.pr_head(self.pr()), |sha| {
+                    self.gh.checks_pending(sha)
+                })
+            });
             let mut lines = row.body.lines();
             lines.next();
             let rest: Vec<&str> = lines.collect();
-            let body = format!("{}\n{}", self.me.released_marker(), rest.join("\n"));
+            let body = format!("{}\n{}", self.me.released_marker_with(extra), rest.join("\n"));
             if self.gh.patch(row.id, &body).is_ok() {
                 released += 1;
             }
