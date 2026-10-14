@@ -456,6 +456,19 @@ pub enum MetricName {
     /// (#11094).
     #[serde(rename = "loom.agent_scope.peak_memory_bytes")]
     AgentScopePeakMemoryBytes,
+    // ---- The GitHub state mirror (2am#4367 P5) ----------------------------
+    /// Discovery listings and change-stream pulls that asked the mirror, by
+    /// `caller`, `repo` and `outcome` (`hit`, `stale`, `unknown`, `error`,
+    /// `skipped`; every non-`hit` listing fell back to the forge).
+    #[serde(rename = "loom.forge.mirror.reads")]
+    ForgeMirrorReads,
+    /// Changes the mirror's change stream delivered, by `repo` and `kind`.
+    #[serde(rename = "loom.forge.mirror.changes")]
+    ForgeMirrorChanges,
+    /// Summed seconds from a change at the mirror to the pull that saw it,
+    /// by `repo` (mean = this / `loom.forge.mirror.changes`).
+    #[serde(rename = "loom.forge.mirror.wake_latency")]
+    ForgeMirrorWakeLatency,
 }
 
 impl MetricName {
@@ -526,6 +539,9 @@ impl MetricName {
             Self::CaptainGaugeAgeSeconds => "loom.captain.gauge_age_seconds",
             Self::CaptainGaugeFallback => "loom.captain.gauge_fallback",
             Self::AgentScopePeakMemoryBytes => "loom.agent_scope.peak_memory_bytes",
+            Self::ForgeMirrorReads => "loom.forge.mirror.reads",
+            Self::ForgeMirrorChanges => "loom.forge.mirror.changes",
+            Self::ForgeMirrorWakeLatency => "loom.forge.mirror.wake_latency",
         }
     }
 
@@ -560,7 +576,10 @@ impl MetricName {
             | Self::DaemonTaskFaults
             | Self::DaemonIpcLatency
             | Self::DaemonIpcRequests
-            | Self::DaemonIpcStatusBuilds => MetricKind::DeltaCounter,
+            | Self::DaemonIpcStatusBuilds
+            | Self::ForgeMirrorReads
+            | Self::ForgeMirrorChanges
+            | Self::ForgeMirrorWakeLatency => MetricKind::DeltaCounter,
             _ => MetricKind::Gauge,
         }
     }
@@ -614,6 +633,9 @@ impl MetricName {
             Self::CodexSessionMountDrift => "{path}",
             Self::CaptainGaugeAgeSeconds => "s",
             Self::CaptainGaugeFallback => "1",
+            Self::ForgeMirrorReads => "{request}",
+            Self::ForgeMirrorChanges => "{change}",
+            Self::ForgeMirrorWakeLatency => "s",
             _ => "By",
         }
     }
@@ -717,6 +739,13 @@ impl MetricName {
             }
             Self::AgentScopePeakMemoryBytes => {
                 "Peak memory (cgroup memory.peak) of one finished agent scope, by repo."
+            }
+            Self::ForgeMirrorReads => {
+                "Reads that asked the GitHub state mirror, by caller, repo and outcome."
+            }
+            Self::ForgeMirrorChanges => "Changes the state mirror's change stream delivered.",
+            Self::ForgeMirrorWakeLatency => {
+                "Summed seconds from a change at the state mirror to the pull that saw it."
             }
         }
     }

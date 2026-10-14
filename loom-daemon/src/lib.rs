@@ -219,6 +219,7 @@ pub mod forge_listing;
 pub mod forge_merge_config;
 pub mod forge_merge_method;
 pub mod forge_merge_queue;
+pub mod forge_mirror;
 pub mod forge_parser;
 pub mod forge_pr_congestion;
 pub mod forge_priority_labels;
