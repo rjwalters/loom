@@ -1323,7 +1323,7 @@ impl SweepRegistry {
     /// the slug resolves like every forge mutation here (`resolve_owner_repo`
     /// honors `LOOM_REPO`), and an unresolvable one leaves the body unlinked
     /// rather than linking to nowhere.
-    fn dashboard_comment_body(&self, issue: u32, body: &str) -> String {
+    pub(super) fn dashboard_comment_body(&self, issue: u32, body: &str) -> String {
         let nwo = self.resolve_owner_repo().map(|(o, r)| format!("{o}/{r}"));
         crate::forge_comment::footer_or_body(nwo.as_deref(), issue, false, body)
     }
@@ -1347,57 +1347,7 @@ impl SweepRegistry {
     /// `warn`) and never propagates — posting a lease record must never fail
     /// dispatch or undo the claim it documents.
     pub(crate) fn write_lease_comment(&self, issue: u32, sweep_id: &str) {
-        if self.config.skip_label_flip {
-            return;
-        }
-        let gh = self.resolved_gh();
-        let host = self.published_host_id();
-        let body = format!(
-            "{prefix}{host} sweep={sweep_id} -->\n\
-             This issue's `loom:building` claim was acquired by sweep `{sweep_id}` on host \
-             `{host}` at {ts}. This comment is a **lease record** (Issue #6179, Epic #6165) — \
-             its liveness signal is this comment's own forge-assigned `updated_at`, never a \
-             timestamp embedded in this text. See `defaults/docs/lease-record.md` for the \
-             format contract this establishes, and `defaults/docs/lease-renewal.md` for how \
-             the owning sweep keeps it fresh for the lifetime of its claim. Nothing reads this \
-             record yet (write-only, Phase 1) — a future phase will use it to decide \
-             reclamation of an abandoned claim.",
-            prefix = LEASE_MARKER_PREFIX,
-            host = host,
-            sweep_id = sweep_id,
-            ts = Utc::now().to_rfc3339(),
-        );
-        let mut comment = self.gh_inv("guard.lease_comment", AccessIntent::Write, &gh);
-        comment = comment
-            .arg("issue")
-            .arg("comment")
-            .arg(issue.to_string())
-            .arg("--body")
-            .arg(self.dashboard_comment_body(issue, &body));
-        // Run in the registry's own workspace so the issue number resolves
-        // against *this* repo in a multi-workspace daemon (#3928/#3937),
-        // mirroring every other forge mutation in this file.
-        comment = comment.args(crate::claim_reconciliation::gh_call::loom_repo_flag());
-        // Bounded so a wedged `gh` can never block the dispatch path (#3973),
-        // exactly like the label flip this immediately follows.
-        let timeout = reap_gh_timeout();
-        match self.run_counted(comment) {
-            Ok(Some(output)) if output.status.success() => {}
-            Ok(Some(output)) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                self.report_forge_failure(&stderr, "sweep_dispatch (lease comment)");
-                log::warn!(
-                    "lease comment for #{issue} exited {:?}: {}",
-                    output.status.code(),
-                    stderr.trim()
-                );
-            }
-            Ok(None) => log::warn!(
-                "lease comment for #{issue} exceeded {}s, killed (#3973)",
-                timeout.as_secs()
-            ),
-            Err(e) => log::warn!("lease comment for #{issue} failed: {e}"),
-        }
+        self.write_lease_comment_for(issue, sweep_id, None);
     }
 
     // ------------------------------------------------------------------------

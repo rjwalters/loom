@@ -125,6 +125,7 @@ mod heartbeat_broadcast;
 mod journal_shadow;
 mod landed_guard;
 mod lease_episode;
+pub mod lease_step;
 mod locks;
 mod model;
 mod noop_cooldown;

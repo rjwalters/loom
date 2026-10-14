@@ -108,11 +108,15 @@ const CONFIRM_DELAY: Duration = Duration::from_millis(500);
 /// Per-call deadline for every `gh` call here.
 const GH_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// The PR-phase role a lease is keyed by.
+/// The role a lease is keyed by: the PR-phase roles (#9401), and the step
+/// claims that have no issue-path lease (#11898): Curator on an issue, and
+/// Champion (promotion on an issue, merge on a PR).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub(crate) enum Role {
     Doctor,
     Judge,
+    Curator,
+    Champion,
 }
 
 impl Role {
@@ -120,14 +124,8 @@ impl Role {
         match self {
             Self::Doctor => "doctor",
             Self::Judge => "judge",
-        }
-    }
-
-    /// The claim label this role's lease backs.
-    pub(crate) fn claim_label(self) -> &'static str {
-        match self {
-            Self::Doctor => "loom:treating",
-            Self::Judge => "loom:reviewing",
+            Self::Curator => "curator",
+            Self::Champion => "champion",
         }
     }
 
@@ -135,23 +133,82 @@ impl Role {
         match s {
             "doctor" => Some(Self::Doctor),
             "judge" => Some(Self::Judge),
+            "curator" => Some(Self::Curator),
+            "champion" => Some(Self::Champion),
             _ => None,
+        }
+    }
+
+    /// The step a lease of this role names when the caller gave none:
+    /// Champion's default is the merge step (`lease pr` on a PR, #11898).
+    fn default_step(self) -> Option<StepRole> {
+        match self {
+            Self::Champion => Some(StepRole::ChampionMerge),
+            Self::Doctor | Self::Judge | Self::Curator => None,
         }
     }
 }
 
+use loom_daemon::step_role::StepRole;
+
 /// Who holds a lease: the role plus the same `(host, sweep)` pair issue
-/// leases use (`host` is the published, opaque-by-default id, #6322).
+/// leases use (`host` is the published, opaque-by-default id, #6322), and the
+/// step the lease claims for (#11898), when it names one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Identity {
     pub(crate) role: Role,
     pub(crate) host: String,
     pub(crate) sweep: String,
+    /// Additive `step=<step>` token after `sweep=` (#11898). Older readers
+    /// read the first three tokens only.
+    pub(crate) step: Option<StepRole>,
 }
 
 impl Identity {
+    /// An identity for `role`, with `step` (or the role's default step).
+    ///
+    /// # Errors
+    /// `step` belongs to another role (`--role judge --step curator`).
+    pub(crate) fn new(
+        role: Role,
+        host: String,
+        sweep: String,
+        step: Option<StepRole>,
+    ) -> Result<Self, String> {
+        let step = step.or(role.default_step());
+        if let Some(step) = step {
+            if step.role_name() != role.as_str() {
+                return Err(format!("step `{step}` is not a `{}` step", role.as_str()));
+            }
+        }
+        Ok(Self {
+            role,
+            host,
+            sweep,
+            step,
+        })
+    }
+
+    /// The claim label this lease backs: the role's, or for Champion the
+    /// step's (`loom:evaluating` for a promotion, none for a merge).
+    pub(crate) fn claim_label(&self) -> Option<&'static str> {
+        match self.role {
+            Role::Doctor => Some("loom:treating"),
+            Role::Judge => Some("loom:reviewing"),
+            Role::Curator => Some("loom:curating"),
+            Role::Champion => self.step.and_then(StepRole::claim_label),
+        }
+    }
+
+    /// [`Self::claim_label`] for prose.
+    pub(crate) fn claim_label_text(&self) -> &'static str {
+        self.claim_label()
+            .unwrap_or("(no label: the lease is the claim)")
+    }
+
     fn fields(&self) -> String {
-        format!("{} host={} sweep={}", self.role.as_str(), self.host, self.sweep)
+        let step = self.step.map(|s| format!(" step={s}")).unwrap_or_default();
+        format!("{} host={} sweep={}{step}", self.role.as_str(), self.host, self.sweep)
     }
 
     pub(crate) fn lease_marker(&self) -> String {
@@ -191,10 +248,17 @@ fn parse_fields(rest: &str) -> Option<Identity> {
     if host.is_empty() || sweep.is_empty() {
         return None;
     }
+    // #11898: an optional `step=` fourth token. Anything else there (a
+    // yield's `earliest_host=`, a release's backstop fields) is not a step.
+    let step = tokens
+        .next()
+        .and_then(|t| t.strip_prefix("step="))
+        .and_then(|s| s.parse().ok());
     Some(Identity {
         role,
         host: host.to_string(),
         sweep: sweep.to_string(),
+        step,
     })
 }
 
@@ -617,7 +681,7 @@ pub(crate) fn lease_body(
          done. Another {role} that finds this lease live stands down before touching a worktree. \
          See `defaults/docs/lease-record.md` § \"PR-phase leases\".",
         marker = me.lease_marker(),
-        label = me.role.claim_label(),
+        label = me.claim_label_text(),
         role = me.role.as_str(),
         sweep = me.sweep,
         host = me.host,
@@ -659,10 +723,18 @@ pub(crate) struct Common {
     /// The pull request.
     #[arg(value_name = "PR")]
     pub(crate) pr: u64,
-    /// Which PR-phase claim: `doctor` (`loom:treating`) or `judge`
-    /// (`loom:reviewing`).
+    /// Which claim: `doctor` (`loom:treating`), `judge` (`loom:reviewing`),
+    /// `curator` (`loom:curating`, on an issue) or `champion` (a merge on a
+    /// PR, no label; or with `--step champion_promote`, `loom:evaluating` on
+    /// an issue), #11898.
     #[arg(long, value_enum)]
     pub(crate) role: Role,
+    /// The step this lease claims for (#11898), recorded as `step=<step>` on
+    /// the marker: `curator`, `champion_promote`, `champion_merge`, `judge`,
+    /// `doctor`. Must belong to `--role`. Champion defaults to
+    /// `champion_merge`.
+    #[arg(long, value_name = "STEP")]
+    pub(crate) step: Option<StepRole>,
     /// The durable session pid, computed by the caller as
     /// `${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}` (never `$$`). It
     /// derives the lease identity, and `claim` hands it to the renewer.
@@ -750,12 +822,15 @@ fn with_context(
     let sweep =
         resolve_sweep(common.sweep_id.as_deref(), common.watch_pid, |k| std::env::var(k).ok());
     let ttl_minutes = loom_daemon::claim_reconciliation::resolve_lease_ttl_minutes();
+    let me = match Identity::new(common.role, published_host(), sweep, common.step) {
+        Ok(me) => me,
+        Err(why) => {
+            eprintln!("lease pr: {why}; nothing written");
+            return EXIT_UNVERIFIED;
+        }
+    };
     let ctx = Ctx {
-        me: Identity {
-            role: common.role,
-            host: published_host(),
-            sweep,
-        },
+        me,
         gh: Gh {
             bin: PathBuf::from(std::env::var("LOOM_GH_BIN").unwrap_or_else(|_| "gh".into())),
             root: root.clone(),
@@ -850,7 +925,7 @@ impl Ctx {
                     host = self.me.host,
                     ws = winner.sweep,
                     wh = winner.host,
-                    label = self.me.role.claim_label(),
+                    label = self.me.claim_label_text(),
                 );
                 if self.gh.post(self.pr(), &yield_body).is_none() {
                     self.say("yield record could not be posted (best-effort)");
@@ -867,7 +942,7 @@ impl Ctx {
                     "lease {own_id} held (host={} sweep={}); add `{}` now",
                     self.me.host,
                     self.me.sweep,
-                    self.me.role.claim_label()
+                    self.me.claim_label_text()
                 ));
                 loom_daemon::observability::lifecycle::role_target::record_claim(self.pr());
                 println!("{} {}", self.me.host, self.me.sweep);

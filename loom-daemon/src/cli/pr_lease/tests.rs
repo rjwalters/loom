@@ -31,6 +31,7 @@ fn who(role: Role, sweep: &str) -> Identity {
         role,
         host: "host-a1b2c3d4".into(),
         sweep: sweep.into(),
+        step: None,
     }
 }
 
@@ -233,41 +234,44 @@ fn the_renewer_stops_and_skips_on_the_right_signals() {
     let ok = lease_renewer_exit_renew();
     let mut m = 0;
     assert_eq!(
-        decide(true, fresh(10, 100), ok, Some(&open), "loom:treating", &mut m),
+        decide(true, fresh(10, 100), ok, Some(&open), Some("loom:treating"), &mut m),
         Step::Renew
     );
     assert!(matches!(
-        decide(false, fresh(10, 100), ok, Some(&open), "loom:treating", &mut m),
+        decide(false, fresh(10, 100), ok, Some(&open), Some("loom:treating"), &mut m),
         Step::Stop(_)
     ));
     assert!(matches!(
-        decide(true, fresh(100, 100), ok, Some(&open), "loom:treating", &mut m),
+        decide(true, fresh(100, 100), ok, Some(&open), Some("loom:treating"), &mut m),
         Step::Stop(_)
     ));
     assert!(matches!(
-        decide(true, fresh(10, 100), 3, Some(&open), "loom:treating", &mut m),
+        decide(true, fresh(10, 100), 3, Some(&open), Some("loom:treating"), &mut m),
         Step::Stop(_)
     ));
     assert!(matches!(
-        decide(true, fresh(10, 100), ok, Some(&closed), "loom:treating", &mut m),
+        decide(true, fresh(10, 100), ok, Some(&closed), Some("loom:treating"), &mut m),
         Step::Stop(_)
     ));
-    assert_eq!(decide(true, fresh(10, 100), ok, None, "loom:treating", &mut m), Step::Skip);
+    assert_eq!(
+        decide(true, fresh(10, 100), ok, None, Some("loom:treating"), &mut m),
+        Step::Skip
+    );
     // The label must be gone for LABEL_MISS_LIMIT consecutive cycles.
     m = 0;
     for _ in 1..LABEL_MISS_LIMIT {
         assert_eq!(
-            decide(true, fresh(10, 100), ok, Some(&bare), "loom:treating", &mut m),
+            decide(true, fresh(10, 100), ok, Some(&bare), Some("loom:treating"), &mut m),
             Step::Skip
         );
     }
     assert!(matches!(
-        decide(true, fresh(10, 100), ok, Some(&bare), "loom:treating", &mut m),
+        decide(true, fresh(10, 100), ok, Some(&bare), Some("loom:treating"), &mut m),
         Step::Stop(_)
     ));
     m = 1;
     assert_eq!(
-        decide(true, fresh(10, 100), ok, Some(&open), "loom:treating", &mut m),
+        decide(true, fresh(10, 100), ok, Some(&open), Some("loom:treating"), &mut m),
         Step::Renew
     );
     assert_eq!(m, 0, "a present label resets the streak");
@@ -295,18 +299,21 @@ fn the_renewer_stops_once_its_last_renewal_is_a_ttl_old_by_the_wall_clock() {
     // Inside the TTL less the margin: renew.
     let limit = i64::try_from(900 - RENEW_MARGIN_SECS).unwrap();
     assert_eq!(
-        decide(true, at(limit - 1), ok, Some(&open), "loom:treating", &mut m),
+        decide(true, at(limit - 1), ok, Some(&open), Some("loom:treating"), &mut m),
         Step::Renew
     );
     // At or past it, even with the PR open and labelled and the forge
     // unreadable: stop, never renew.
     for since in [limit, 900, 20 * 60, 3 * 3600] {
         assert!(
-            matches!(decide(true, at(since), ok, None, "loom:treating", &mut m), Step::Stop(_)),
+            matches!(
+                decide(true, at(since), ok, None, Some("loom:treating"), &mut m),
+                Step::Stop(_)
+            ),
             "{since}"
         );
         assert!(matches!(
-            decide(true, at(since), ok, Some(&open), "loom:treating", &mut m),
+            decide(true, at(since), ok, Some(&open), Some("loom:treating"), &mut m),
             Step::Stop(_)
         ));
     }
@@ -316,13 +323,13 @@ fn the_renewer_stops_once_its_last_renewal_is_a_ttl_old_by_the_wall_clock() {
         ttl_secs: 60,
         ..fresh(10, 14_400)
     };
-    assert_eq!(decide(true, short, ok, Some(&open), "loom:treating", &mut m), Step::Renew);
+    assert_eq!(decide(true, short, ok, Some(&open), Some("loom:treating"), &mut m), Step::Renew);
     let short = Clocks {
         since_renewal_secs: 45,
         ..short
     };
     assert!(matches!(
-        decide(true, short, ok, Some(&open), "loom:treating", &mut m),
+        decide(true, short, ok, Some(&open), Some("loom:treating"), &mut m),
         Step::Stop(_)
     ));
 }
@@ -342,7 +349,14 @@ fn the_age_cap_and_the_renewal_age_are_wall_clock() {
     let open = (true, vec!["loom:reviewing".to_string()]);
     let mut m = 0;
     assert_eq!(
-        decide(true, clocks, lease_renewer_exit_renew(), Some(&open), "loom:reviewing", &mut m),
+        decide(
+            true,
+            clocks,
+            lease_renewer_exit_renew(),
+            Some(&open),
+            Some("loom:reviewing"),
+            &mut m
+        ),
         Step::Stop("the age cap passed")
     );
     assert_eq!(wall_secs(woke, started), 5 * 3600);
@@ -364,7 +378,14 @@ fn a_woken_renewer_never_revives_an_expired_lease_a_peer_has_since_claimed() {
     };
     let mut m = 0;
     assert!(matches!(
-        decide(true, woke, lease_renewer_exit_renew(), Some(&open), "loom:treating", &mut m),
+        decide(
+            true,
+            woke,
+            lease_renewer_exit_renew(),
+            Some(&open),
+            Some("loom:treating"),
+            &mut m
+        ),
         Step::Stop(_)
     ));
     // …and the forge guard stops it independently: B holds the claim.
@@ -412,7 +433,14 @@ fn the_wall_clock_is_rechecked_immediately_before_the_patch() {
     };
     let mut m = 0;
     assert_eq!(
-        decide(true, checked, lease_renewer_exit_renew(), Some(&open), "loom:treating", &mut m),
+        decide(
+            true,
+            checked,
+            lease_renewer_exit_renew(),
+            Some(&open),
+            Some("loom:treating"),
+            &mut m
+        ),
         Step::Renew
     );
     assert_eq!(pre_patch_guard(now(), last_renewed, 900), Step::Renew);
@@ -514,6 +542,7 @@ fn ctx(dir: &Path, me: Identity) -> Ctx {
         common: Common {
             pr: 77,
             role: me.role,
+            step: me.step,
             watch_pid: None,
             sweep_id: Some(me.sweep.clone()),
             workspace: dir.to_path_buf(),
@@ -671,4 +700,61 @@ fn prompt_lease_gates_proceed_only_on_exit_0_or_2() {
         }
         assert_eq!(text.matches(GATE).count(), gates, "{name}: gate count");
     }
+}
+
+// ---- step claims (#11898) -------------------------------------------------
+
+#[test]
+fn a_champion_lease_defaults_to_the_merge_step_and_carries_no_label() {
+    let me = Identity::new(Role::Champion, "host-a".into(), "s".into(), None).unwrap();
+    assert_eq!(me.step, Some(StepRole::ChampionMerge));
+    assert_eq!(me.claim_label(), None);
+    let marker = me.lease_marker();
+    assert!(marker.ends_with("step=champion_merge -->"), "{marker}");
+    assert_eq!(parse_record(&marker), Some(Record::Lease(me.clone())));
+    // The yield record keeps the step inside the identity's fields.
+    assert_eq!(parse_record(&me.yield_marker(&me)), Some(Record::Yield(me)));
+}
+
+#[test]
+fn step_leases_name_their_claim_label() {
+    let promote =
+        Identity::new(Role::Champion, "h".into(), "s".into(), Some(StepRole::ChampionPromote))
+            .unwrap();
+    assert_eq!(promote.claim_label(), Some("loom:evaluating"));
+    let curator = Identity::new(Role::Curator, "h".into(), "s".into(), None).unwrap();
+    assert_eq!(curator.claim_label(), Some("loom:curating"));
+    assert!(curator
+        .lease_marker()
+        .starts_with("<!-- loom:pr-lease role=curator host=h"));
+    assert!(Identity::new(Role::Judge, "h".into(), "s".into(), Some(StepRole::Curator)).is_err());
+}
+
+/// An older binary's three-token marker still parses (no step), and a step
+/// lease keys apart from a stepless one of the same identity.
+#[test]
+fn the_step_token_is_additive() {
+    let old = who(Role::Judge, "s");
+    assert_eq!(parse_record(&old.lease_marker()), Some(Record::Lease(old.clone())));
+    let stepped =
+        Identity::new(Role::Judge, old.host.clone(), "s".into(), Some(StepRole::Judge)).unwrap();
+    assert_ne!(stepped, old);
+    let marker = stepped.lease_marker();
+    let tokens: Vec<&str> = marker.split_whitespace().collect();
+    assert_eq!(tokens[2..5], ["role=judge", "host=host-a1b2c3d4", "sweep=s"]);
+}
+
+#[test]
+fn a_labelless_claim_renews_without_a_label_check() {
+    let open = (true, Vec::<String>::new());
+    let mut m = 0;
+    assert_eq!(
+        decide(true, fresh(10, 100), lease_renewer_exit_renew(), Some(&open), None, &mut m),
+        Step::Renew
+    );
+    let closed = (false, Vec::<String>::new());
+    assert!(matches!(
+        decide(true, fresh(10, 100), lease_renewer_exit_renew(), Some(&closed), None, &mut m),
+        Step::Stop(_)
+    ));
 }

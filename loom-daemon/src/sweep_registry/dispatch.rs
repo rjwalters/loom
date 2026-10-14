@@ -1135,15 +1135,14 @@ impl SweepRegistry {
             .filter(|info| matches!(info.state, SweepState::Running | SweepState::Pending))
             .filter_map(|info| match info.kind {
                 SweepKind::Issue(issue) => Some(issue),
-                // A step's peer claim is the `(item, step)` shape (#11898),
-                // published by the step claim path, not this issue heartbeat.
+                // A step re-advertises its `(item, step)` shape below (#11898).
                 SweepKind::Step { .. } | SweepKind::PrSet(_) => None,
             })
             .collect();
         for issue in &live {
             self.publish_peer_claim(peer_claims::ClaimKind::Advertise, *issue);
         }
-        live.len()
+        live.len() + self.readvertise_step_claims()
     }
 
     /// Evaluate this host's peer-coordination health at the current instant
