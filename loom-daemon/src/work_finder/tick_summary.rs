@@ -102,6 +102,8 @@ pub fn tick_summary(
         deferred_build_backoff: report.deferred_build_backoff,
         errors: report.errors,
         halted: report.halted,
+        held_roots: report.held_roots,
+        halt_partial: report.halt_partial,
         saturation_held: report.saturation_held,
         build_backoff_held: report.build_backoff_held,
         collisions: report.collisions,

@@ -96,8 +96,23 @@ pub struct WorkFinderTickSummary {
     pub deferred_build_backoff: usize,
     /// Dispatch attempts that returned an error.
     pub errors: usize,
-    /// Whether any workspace was gated by the main-health halt this tick.
+    /// Whether any workspace was gated by a hold this tick (main red, drain,
+    /// token pool, disk, ...). Any hold sets it, even one that covered a
+    /// single root: read [`Self::halt_partial`] before calling the tick
+    /// halted.
     pub halted: bool,
+    /// How many workspaces a hold gated this tick (#11857). `#[serde(default)]`
+    /// keeps pre-#11857 wire data compatible (an absent field parses as `0`).
+    #[serde(default)]
+    pub held_roots: usize,
+    /// True when [`Self::halted`] is set but the hold did not cover the tick's
+    /// work (#11857): some workspace with ready candidates was not held, so the
+    /// tick was not halted and its result is the per-candidate one. Mirrors
+    /// [`crate::work_finder::TickReport::halt_partial`]. `#[serde(default)]`
+    /// keeps pre-#11857 wire data compatible (an absent field reads as a full
+    /// halt whenever `halted` is set, the old meaning).
+    #[serde(default)]
+    pub halt_partial: bool,
     /// Whether the saturation admission brake was engaged for this tick (Issue
     /// #4903). `true` even when nothing was deferred (an empty backlog on a
     /// saturated host), so a consumer can tell "held, nothing waiting" from
@@ -345,6 +360,15 @@ impl WorkFinderTickSummary {
         self.listing_failed.iter().chain(&self.listing_incomplete)
     }
 
+    /// Whether the hold covered this tick's work, so the tick was halted
+    /// (#11857): [`Self::halted`] without [`Self::halt_partial`]. The same
+    /// rule that names the `loom.dispatch.tick` result `halted_<cause>`; one
+    /// held root among healthy ones with candidates is not a halt.
+    #[must_use]
+    pub fn halted_fully(&self) -> bool {
+        self.halted && !self.halt_partial
+    }
+
     /// The single-line skip-reason summary `loom-daemon health` renders —
     /// only the non-zero terms, so a clean tick reads `12 seen, 2 dispatched`
     /// rather than a wall of zeros.
@@ -381,8 +405,10 @@ impl WorkFinderTickSummary {
         if self.collisions > 0 {
             parts.push(format!("{} cross-host-collision(s)", self.collisions));
         }
-        if self.halted {
+        if self.halted_fully() {
             parts.push("HALTED".to_string());
+        } else if self.halted {
+            parts.push(format!("{} root(s) held", self.held_roots));
         }
         if self.saturation_held {
             parts.push("SATURATION-HELD".to_string());
