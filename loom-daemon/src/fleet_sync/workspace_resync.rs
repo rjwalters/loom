@@ -704,6 +704,17 @@ fn classify(
         (report, None)
     };
     if crate::init::is_loom_source_repo(root) {
+        // Self-heal the gitignored dogfood symlinks (#11681): a source-repo
+        // checkout cloned without `loom-daemon init` would otherwise never get
+        // them. Idempotent; refuses to clobber local-only files.
+        let lines = crate::init::link_dogfood_symlinks(root);
+        if lines.iter().any(|l| !l.is_empty()) {
+            log::info!(
+                "workspace_resync: {}: dogfood symlinks: {}",
+                root.display(),
+                lines.join("; ")
+            );
+        }
         return skip(report, "the Loom source repo installs from its own tree");
     }
     let Some(nwo) = nwo else {

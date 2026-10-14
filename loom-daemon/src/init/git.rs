@@ -407,9 +407,9 @@ fn ensure_dir_symlink(link_path: &Path, relative_target: &str, source_abs: &Path
 /// (symlink creation, and — in the local-only-files-absent case — removal of
 /// a real `.claude/commands/loom/` or `.claude/agents/` directory) that would
 /// silently corrupt a CONSUMER repo's tracked, real `.claude/commands/loom/`
-/// files if ever invoked outside the dogfood case. It is therefore `pub(super)`
-/// (visible only to [`super::initialize_workspace`]'s own `is_loom_source_repo`
-/// branch), never re-exported past the `init` module, and every caller MUST
+/// files if ever invoked outside the dogfood case. It is therefore `pub(crate)`
+/// (callers: [`super::initialize_workspace`]'s `is_loom_source_repo` branch and
+/// the fleet-sync workspace resync's source-repo branch), and every caller MUST
 /// gate it behind [`is_loom_source_repo`] first — mirroring the shell
 /// installer's own `--dogfood` / `is_loom_source_repo` gating in
 /// `scripts/install-loom.sh` and `scripts/install/dogfood-commands.sh`.
@@ -418,7 +418,7 @@ fn ensure_dir_symlink(link_path: &Path, relative_target: &str, source_abs: &Path
 /// at the call site and direct test assertions — never an error the caller
 /// must propagate; every failure mode inside [`ensure_dir_symlink`] is
 /// advisory-only.
-pub(super) fn link_dogfood_symlinks(workspace_path: &Path) -> Vec<String> {
+pub(crate) fn link_dogfood_symlinks(workspace_path: &Path) -> Vec<String> {
     let mut lines = Vec::new();
 
     // `.claude/commands/` itself must stay a REAL directory (issue #3682): a
