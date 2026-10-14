@@ -236,4 +236,6 @@ pub fn publish_tick(
     crate::observability::ops::dwell::record_tick(report, roots, started_at);
     // #8929: idle slots, and idle slot-seconds while ready work waited.
     crate::observability::ops::turnaround::record_tick(report, max_concurrent);
+    // #11847: busy slots by role (sweep occupancy and role-runner agents).
+    crate::observability::ops::busy_slots::record_tick(report, roots);
 }

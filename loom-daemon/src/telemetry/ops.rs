@@ -323,6 +323,16 @@ pub enum MetricName {
     /// Slot-seconds left idle while dispatchable ready work waited.
     #[serde(rename = "loom.dispatch.idle_slot_seconds")]
     DispatchIdleSlotSeconds,
+    /// Busy agent slots, labelled `role` (#11847): `sweep` for the work
+    /// finder's issue sweeps, the role name for role-runner agents.
+    #[serde(rename = "loom.dispatch.busy_slots")]
+    DispatchBusySlots,
+    /// The role-runner agent ceiling (`autonomous.roleRunner.maxConcurrent`).
+    #[serde(rename = "loom.dispatch.role_max_concurrent")]
+    DispatchRoleMaxConcurrent,
+    /// Role-runner agent slots idle: the ceiling minus agents in flight.
+    #[serde(rename = "loom.dispatch.role_idle_slots")]
+    DispatchRoleIdleSlots,
     /// Seconds items spent in a forge label stage, summed, labelled `state`.
     #[serde(rename = "loom.forge.stage_dwell")]
     ForgeStageDwell,
@@ -510,6 +520,9 @@ impl MetricName {
             Self::DispatchSlotTurnaroundSamples => "loom.dispatch.slot_turnaround.samples",
             Self::DispatchIdleSlots => "loom.dispatch.idle_slots",
             Self::DispatchIdleSlotSeconds => "loom.dispatch.idle_slot_seconds",
+            Self::DispatchBusySlots => "loom.dispatch.busy_slots",
+            Self::DispatchRoleMaxConcurrent => "loom.dispatch.role_max_concurrent",
+            Self::DispatchRoleIdleSlots => "loom.dispatch.role_idle_slots",
             Self::ForgeStageDwell => "loom.forge.stage_dwell",
             Self::ForgeStageDwellSamples => "loom.forge.stage_dwell.samples",
             Self::ForgeStageItems => "loom.forge.stage_items",
@@ -609,7 +622,11 @@ impl MetricName {
             Self::DispatchSlotTurnaround
             | Self::DispatchIdleSlotSeconds
             | Self::ForgeStageDwell => "s",
-            Self::DispatchSlotTurnaroundSamples | Self::DispatchIdleSlots => "{slot}",
+            Self::DispatchSlotTurnaroundSamples
+            | Self::DispatchIdleSlots
+            | Self::DispatchBusySlots
+            | Self::DispatchRoleMaxConcurrent
+            | Self::DispatchRoleIdleSlots => "{slot}",
             Self::ForgeStageDwellSamples | Self::ForgeStageItems => "{item}",
             Self::QueueDispositionRowsDropped => "{issue}",
             Self::GithubRateLimitRemaining | Self::GithubRateLimitUsed => "{request}",
@@ -686,6 +703,9 @@ impl MetricName {
             }
             Self::DispatchIdleSlots => "Concurrency slots idle at the end of a work-finder tick.",
             Self::DispatchIdleSlotSeconds => "Slot-seconds left idle while ready work waited.",
+            Self::DispatchBusySlots => "Busy agent slots, by role (sweep or role-runner role).",
+            Self::DispatchRoleMaxConcurrent => "The role-runner concurrent agent ceiling.",
+            Self::DispatchRoleIdleSlots => "Role-runner agent slots idle under the ceiling.",
             Self::ForgeStageDwell => "Seconds items spent in a forge label stage, by state.",
             Self::ForgeStageDwellSamples => "Stage transitions counted in loom.forge.stage_dwell.",
             Self::ForgeStageItems => "Open items carrying a stage label, by state.",

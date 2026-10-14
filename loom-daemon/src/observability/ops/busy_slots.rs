@@ -1,0 +1,110 @@
+//! Busy agent slots by role, per host (Issue #11847).
+//!
+//! A daemon runs two agent pools, each under its own ceiling:
+//!
+//! - the **sweep pool**: the work finder's issue sweeps, bounded by
+//!   `autonomous.workFinder.maxConcurrent` (`loom.dispatch.max_concurrent`);
+//! - the **role pool**: role-runner agents (Curator, Champion, Judge, Doctor,
+//!   …), bounded by `autonomous.roleRunner.maxConcurrent`.
+//!
+//! `loom.dispatch.busy_slots{role}` reports both, sampled on every work-finder
+//! tick: `role="sweep"` is the tick's own occupancy reading, the same one
+//! `loom.dispatch.idle_slots` is computed from, so for one tick
+//! `busy_slots{role="sweep"} + idle_slots = max_concurrent` (more only while
+//! occupancy is over the cap). Each role-runner role has its own series, `0`
+//! included for every built-in role, with `loom.dispatch.role_max_concurrent`
+//! the pool's ceiling and `loom.dispatch.role_idle_slots` what is left under
+//! it, so `Σ busy_slots{role≠"sweep"} + role_idle_slots = role_max_concurrent`.
+//! The host's whole agent capacity is the sum of the two ceilings.
+//!
+//! Absent, never a guessed zero: no occupancy reading, no `sweep` point; no
+//! role-runner guard in the process, no role points. A PR-set sweep
+//! (`/loom:sweep --prs`, dispatched only by hand) is in neither pool and is
+//! not counted.
+
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+
+use crate::telemetry::ops::{MetricName, MetricPoint};
+use crate::work_finder::TickReport;
+
+/// The `role` label value of the work finder's issue-sweep slots. No
+/// role-runner role has this name.
+pub const SWEEP_ROLE: &str = "sweep";
+
+fn int(count: usize) -> i64 {
+    i64::try_from(count).unwrap_or(i64::MAX)
+}
+
+/// The role-runner pool's ceiling for this host: the largest
+/// `autonomous.roleRunner.maxConcurrent` among `roots` whose role runner is
+/// enabled (admission resolves the ceiling per root, so the largest is the
+/// most any root admits to), `0` when none is. Pure given the configs.
+#[must_use]
+pub fn role_ceiling(configs: &[crate::role_runner::RoleRunnerConfig]) -> usize {
+    configs
+        .iter()
+        .filter(|config| crate::role_runner::resolve_enabled(config))
+        .map(crate::role_runner::resolve_max_concurrent)
+        .max()
+        .unwrap_or(0)
+}
+
+/// The tick's busy-slot points. `occupancy` is the tick's sweep occupancy;
+/// `roles` the role-runner agents in flight per role with the pool's
+/// ceiling, `None` when this process runs no role runner. Pure.
+#[must_use]
+pub fn busy_points(
+    occupancy: Option<usize>,
+    roles: Option<(&BTreeMap<&'static str, usize>, usize)>,
+) -> Vec<MetricPoint> {
+    let mut points = Vec::new();
+    if let Some(occupancy) = occupancy {
+        points.push(
+            MetricPoint::int(MetricName::DispatchBusySlots, int(occupancy))
+                .label("role", SWEEP_ROLE),
+        );
+    }
+    let Some((running, ceiling)) = roles else {
+        return points;
+    };
+    let mut by_role: BTreeMap<&str, usize> = crate::role_runner::DEFAULT_ROLES
+        .iter()
+        .map(|spec| (spec.name, 0))
+        .collect();
+    for (role, count) in running {
+        *by_role.entry(role).or_insert(0) += count;
+    }
+    let busy: usize = by_role.values().sum();
+    for (role, count) in by_role {
+        points
+            .push(MetricPoint::int(MetricName::DispatchBusySlots, int(count)).label("role", role));
+    }
+    points.push(MetricPoint::int(MetricName::DispatchRoleMaxConcurrent, int(ceiling)));
+    points.push(MetricPoint::int(
+        MetricName::DispatchRoleIdleSlots,
+        int(ceiling.saturating_sub(busy)),
+    ));
+    points
+}
+
+/// Export the tick's busy slots. A no-op without an ops sink.
+pub fn record_tick(report: &TickReport, roots: &[PathBuf]) {
+    if super::global_ops_sink().is_none() {
+        return;
+    }
+    let running = crate::role_runner::global_active_runs_by_role();
+    let roles = running.as_ref().map(|running| {
+        let configs: Vec<_> = roots
+            .iter()
+            .map(|root| crate::role_runner::read_role_runner_config(root))
+            .collect();
+        (running, role_ceiling(&configs))
+    });
+    super::emit_metrics(busy_points(report.occupancy, roles));
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[path = "busy_slots_tests.rs"]
+mod tests;

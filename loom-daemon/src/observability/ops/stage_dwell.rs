@@ -35,8 +35,9 @@
 //! after start only records a baseline, so a restart never replays history
 //! as new entries. Every host that manages a repo samples it independently:
 //! sums scale with the host count, the mean (`dwell / samples`) does not.
-//! `loom.forge.stage_items{state}` counts the open items under each stage
-//! label, summed over this host's repos.
+//! `loom.forge.stage_items{state, repo}` counts the open items under each
+//! stage label per repo, plus the queue states of [`super::stage_queue`]
+//! (`triage`, `unlabeled`, …) from one open-items walk per repo (#11847).
 //!
 //! # One sampler per fleet (W12)
 //!
@@ -164,6 +165,9 @@ pub struct RepoInput {
     pub slug: String,
     pub root: PathBuf,
     pub listings: BTreeMap<&'static str, Vec<StageItem>>,
+    /// The [`super::stage_queue`] state counts from this sample's open-items
+    /// walk; `None` when the walk did not complete (those states are absent).
+    pub queue: Option<BTreeMap<&'static str, usize>>,
 }
 
 impl RepoInput {
@@ -527,7 +531,9 @@ impl Sampler {
 }
 
 /// The metric points for one sample: the dwell delta pair per stage with a
-/// sample, plus the item gauges per stage label.
+/// sample, plus the item gauges per repo (`repo`, lowercase `owner/name`,
+/// #11847): one per stage label, then the [`super::stage_queue`] states when
+/// that repo's walk completed.
 #[must_use]
 pub fn stage_points(samples: &[DwellSample], inputs: &[RepoInput]) -> Vec<MetricPoint> {
     let mut sums: BTreeMap<&'static str, (i64, i64)> = BTreeMap::new();
@@ -546,16 +552,21 @@ pub fn stage_points(samples: &[DwellSample], inputs: &[RepoInput]) -> Vec<Metric
     if inputs.is_empty() {
         return points;
     }
-    for label in STAGE_LABELS {
-        let count: usize = inputs
-            .iter()
-            .map(|input| input.listings.get(label).map_or(0, Vec::len))
-            .sum();
-        let state = label.trim_start_matches("loom:").replace('-', "_");
-        points.push(
-            MetricPoint::int(MetricName::ForgeStageItems, i64::try_from(count).unwrap_or(i64::MAX))
-                .label("state", state),
-        );
+    let item = |count: usize, state: String, repo: &str| {
+        MetricPoint::int(MetricName::ForgeStageItems, i64::try_from(count).unwrap_or(i64::MAX))
+            .label("state", state)
+            .label("repo", repo)
+    };
+    for input in inputs {
+        let repo = input.slug.to_ascii_lowercase();
+        for label in STAGE_LABELS {
+            let count = input.listings.get(label).map_or(0, Vec::len);
+            let state = label.trim_start_matches("loom:").replace('-', "_");
+            points.push(item(count, state, &repo));
+        }
+        for (state, count) in input.queue.iter().flatten() {
+            points.push(item(*count, (*state).to_string(), &repo));
+        }
     }
     points
 }
@@ -679,6 +690,7 @@ pub(in crate::observability) async fn record(
             slug,
             root: root.clone(),
             listings: BTreeMap::new(),
+            queue: None,
         };
         let mut complete = true;
         for label in STAGE_LABELS {
@@ -709,6 +721,8 @@ pub(in crate::observability) async fn record(
         }
         // A partial listing would read as mass exits; skip the repo instead.
         if complete {
+            // #11847: the states no label listing answers, from one walk.
+            input.queue = super::stage_queue::walk_counts(root.clone()).await;
             inputs.push(input);
         }
     }
