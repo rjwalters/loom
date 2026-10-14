@@ -21,6 +21,8 @@
 # FAILS under GitHub Actions and is skipped with a note elsewhere.
 #
 # Exit codes: 0 = ok (or nothing to check); 1 = a coverage/label problem.
+#
+# requires-daemon: check-dependabot-labels optional   a daemon without the subcommand (or none) is skipped with a note outside CI; under GitHub Actions it FAILS instead (#11828)
 
 set -euo pipefail
 
