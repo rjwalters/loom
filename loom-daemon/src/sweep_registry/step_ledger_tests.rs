@@ -115,9 +115,9 @@ fn landed_arms_the_landed_cooldown_and_a_24h_builder_cooldown() {
         .any(|a| a.kind == ClaimKind::DispatchBackoffArmed && a.issue == 12));
     let builder: Vec<_> = step_ads(&ads)
         .into_iter()
-        .filter(|a| a.1 == Some(StepRole::Builder))
+        .filter(|a| a.1 == Some(StepRole::Builder) && a.2 > 0)
         .collect();
-    assert_eq!(builder.len(), 1);
+    assert_eq!(builder.len(), 1, "one arm (the verdict's clears are zero-length)");
     assert!(builder[0].2 <= DAY && builder[0].2 > DAY - 10, "{builder:?}");
 }
 
@@ -149,11 +149,9 @@ fn a_verdict_lifts_peer_copies_and_a_champion_verdict_clears_the_ladder() {
     assert!(!reg
         .step_cooldowns(now)
         .is_cooling(30, StepRole::ChampionMerge, now));
-    assert_eq!(
-        step_ads(&drain(&mut rx)),
-        vec![(30, Some(StepRole::ChampionMerge), 0)],
-        "a clear"
-    );
+    let clears = step_ads(&drain(&mut rx));
+    assert_eq!(clears.len(), StepRole::ALL.len(), "a clear per step: {clears:?}");
+    assert!(clears.iter().all(|a| a.0 == 30 && a.2 == 0), "{clears:?}");
 }
 
 /// The ladder goes on the forge; locally and on the wire only up to 24 h,
@@ -192,14 +190,74 @@ fn a_fast_failure_charges_the_ladder_and_mirrors_its_window() {
     let dir = tempdir().unwrap();
     let (mut reg, _rx) = registry(dir.path());
     reg.record_step_outcome(
-        &run(21, StepRole::Judge, OutcomeClass::Failed, "crashed", 30),
+        &run(21, StepRole::Builder, OutcomeClass::Failed, "crashed", 30),
         &mut FakeForge::default(),
     );
     let now = Utc::now();
     let ladder = reg
         .dispatch_backoff_until(21, now)
         .expect("the #11854 ladder armed");
-    assert_eq!(reg.step_cooldowns(now).until(21, StepRole::Judge), Some(ladder));
+    assert_eq!(reg.step_cooldowns(now).until(21, StepRole::Builder), Some(ladder));
+}
+
+#[test]
+fn a_pr_step_fast_failure_never_enters_the_issue_quarantine() {
+    let dir = tempdir().unwrap();
+    let (mut reg, mut rx) = registry(dir.path());
+    let mut forge = FakeForge::default();
+    let mut windows = Vec::new();
+    for _ in 0..6 {
+        reg.record_step_outcome(
+            &run(31, StepRole::Judge, OutcomeClass::Failed, "crashed", 30),
+            &mut forge,
+        );
+        let now = Utc::now();
+        windows.push(reg.step_cooldowns(now).until(31, StepRole::Judge).unwrap() - now);
+    }
+    assert!(!reg.is_quarantined(31), "a PR is never parked as an issue");
+    assert_eq!(reg.dispatch_failure_count(31), 0, "the issue ladder is untouched");
+    assert_eq!(forge.writes, 0, "no body or label write for a PR step");
+    // The ledger's own doubling; the third failure hits the repeat cap, which
+    // arms the 24 h ceiling.
+    let ratio = windows[1].num_milliseconds() as f64 / windows[0].num_milliseconds() as f64;
+    assert!((1.9..2.1).contains(&ratio), "{windows:?}");
+    assert!(windows[2] > windows[1], "{windows:?}");
+    assert!(windows.iter().all(|w| *w <= chrono::Duration::hours(24)), "{windows:?}");
+    assert!(!step_ads(&drain(&mut rx)).is_empty(), "the window is broadcast");
+}
+
+#[test]
+fn a_verdict_lifts_every_step_cooldown_including_a_peers() {
+    let dir = tempdir().unwrap();
+    let (mut reg, mut rx) = registry(dir.path());
+    let view =
+        Arc::new(Mutex::new(PeerClaimView::new("this-host".into(), Duration::from_secs(60))));
+    let repo = peer_claims::repo_slug(&reg.config.workspace_root);
+    let ad =
+        ClaimAd::step_cooldown_armed(52, StepRole::Judge, repo, "peer".into(), 1, "t".into(), DAY);
+    view.lock()
+        .unwrap()
+        .observe_step_cooldown_at(&ad, Instant::now());
+    reg.set_peer_claims(view);
+    assert!(reg
+        .step_cooldowns(Utc::now())
+        .until(52, StepRole::Judge)
+        .is_some());
+    reg.record_step_outcome(
+        &run(52, StepRole::Doctor, OutcomeClass::Verdict, "fixed", 60),
+        &mut FakeForge::default(),
+    );
+    assert_eq!(
+        reg.step_cooldowns(Utc::now()).until(52, StepRole::Judge),
+        None,
+        "the peer's copy is gone from this host's view"
+    );
+    let zeroed: Vec<_> = step_ads(&drain(&mut rx))
+        .into_iter()
+        .filter(|(i, _, secs)| *i == 52 && *secs == 0)
+        .filter_map(|(_, s, _)| s)
+        .collect();
+    assert_eq!(zeroed.len(), StepRole::ALL.len(), "a zero ad per step: {zeroed:?}");
 }
 
 #[test]

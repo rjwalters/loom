@@ -5,10 +5,10 @@
 //!
 //! | Effect | Applied here as |
 //! |---|---|
-//! | `Advance` | the item's local history and cooldowns are dropped, and every peer is told to drop theirs (a zero-length `StepCooldownArmed`); a Champion verdict also removes the forge ladder |
+//! | `Advance` | the item's local history and cooldowns, and the peer view's, are dropped, and every peer is told to drop theirs (a zero-length `StepCooldownArmed` per step); a Champion verdict also removes the forge ladder |
 //! | `Landed` | the same, plus the #11853 landed cooldown on the issue (fleet-wide, every consumer) and a 24 h Builder cooldown on `(item, builder)` |
 //! | `Cooldown` | the window, broadcast |
-//! | `FastFailLadder` | [`SweepRegistry::charge_fast_failure`] (the #11854 ladder and park), and the ladder's window mirrored onto `(item, step)` and broadcast |
+//! | `FastFailLadder` | an issue step: [`SweepRegistry::charge_fast_failure`] (the #11854 ladder and park), and the ladder's window mirrored onto `(item, step)` and broadcast; a PR step: a doubling window in the ledger alone, never the issue quarantine |
 //! | `ForgeLadder` | the next rung written to the item's body ([`reeval_ladder::record`]), its due time mirrored locally (capped at 24 h) and broadcast |
 //! | `Redraw` | counted |
 //! | `Reclassify`, `Failed` | counted toward the repeat cap |
@@ -58,8 +58,11 @@ impl SweepRegistry {
         let rec = self
             .step_ledger
             .record(item, step, &run.outcome, run.ran_for, now);
-        for lifted in &rec.lifted {
-            self.publish_step_cooldown(item, *lifted, Duration::ZERO);
+        if matches!(rec.effect, Effect::Advance | Effect::Landed) {
+            // A verdict ends every step's cooldown on the item, including a
+            // peer's: drop the peer copies here and tell the fleet to drop
+            // theirs, not just the ones this host armed.
+            self.lift_item_cooldowns(item);
         }
         let champion = step.role_name() == "champion";
         match rec.effect {
@@ -70,6 +73,17 @@ impl SweepRegistry {
             Effect::Advance if champion => {
                 if let Err(e) = reeval_ladder::clear(forge, item) {
                     log::warn!("step_ledger: clearing the re-evaluation ladder on #{item}: {e}");
+                }
+            }
+            Effect::FastFailLadder if step.acts_on_pr() => {
+                // The issue quarantine's park and release are issue-shaped
+                // (it would park the PR with `loom:blocked` and release it
+                // with `loom:issue`), so a PR step keeps its own doubling
+                // window in the ledger.
+                if self.dispatch_backoff_config.enabled {
+                    let (base, max) =
+                        (self.dispatch_backoff_config.base, self.dispatch_backoff_config.max);
+                    self.step_ledger.arm_fast_fail(item, step, base, max, now);
                 }
             }
             Effect::FastFailLadder => {
@@ -149,6 +163,20 @@ impl SweepRegistry {
     /// Drop the ledger's lapsed entries (each reaper tick).
     pub fn prune_step_ledger(&mut self) {
         self.step_ledger.prune(Utc::now());
+    }
+
+    /// Lift every step's cooldown on `item` locally, in the peer view, and on
+    /// every peer (a zero-length ad per step).
+    fn lift_item_cooldowns(&self, item: u32) {
+        if let Some(view) = &self.peer_claims {
+            let repo = peer_claims::repo_slug(&self.config.workspace_root);
+            view.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear_step_cooldowns_for(&repo, item);
+        }
+        for step in StepRole::ALL {
+            self.publish_step_cooldown(item, step, Duration::ZERO);
+        }
     }
 
     /// Broadcast `(item, step)`'s local window in force at `now`, if any.

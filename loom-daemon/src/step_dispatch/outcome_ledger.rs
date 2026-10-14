@@ -350,6 +350,8 @@ struct Entry {
     runs: Vec<DateTime<Utc>>,
     /// The cooldown in force, if any.
     until: Option<(DateTime<Utc>, CooldownCause)>,
+    /// Consecutive fast failures charged through [`OutcomeLedger::arm_fast_fail`].
+    fast_fails: u32,
 }
 
 /// What [`OutcomeLedger::record`] did.
@@ -496,6 +498,29 @@ impl OutcomeLedger {
                 until
             }
         }
+    }
+
+    /// Charge one fast failure to `(item, step)` and arm its doubling window:
+    /// `base`, then twice that per consecutive failure, up to `max` (itself
+    /// capped at [`MAX_SHORT_COOLDOWN`]). A PR step uses this instead of the
+    /// issue quarantine, whose park and release are issue-shaped (#11900).
+    /// Returns the window in force.
+    pub fn arm_fast_fail(
+        &mut self,
+        item: u32,
+        step: StepRole,
+        base: Duration,
+        max: Duration,
+        now: DateTime<Utc>,
+    ) -> DateTime<Utc> {
+        let entry = self.entries.entry((item, step)).or_default();
+        entry.fast_fails = entry.fast_fails.saturating_add(1);
+        let doublings = entry.fast_fails.saturating_sub(1).min(16);
+        let window = base
+            .saturating_mul(1 << doublings)
+            .min(max)
+            .min(MAX_SHORT_COOLDOWN);
+        self.arm(item, step, add(now, window), CooldownCause::FastFail, now)
     }
 
     /// When `(item, step)`'s local cooldown ends, if it is cooling at `at`.
