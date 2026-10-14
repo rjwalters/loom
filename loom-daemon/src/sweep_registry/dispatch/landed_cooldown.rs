@@ -17,8 +17,15 @@
 //!   a deliberate skip rather than a failed dispatch.
 //!
 //! A peer receiving the broadcast installs `now + remaining` without a cap
-//! (`PeerClaimView::observe_dispatch_backoff_at`), so the length carries.
+//! (`PeerClaimView::observe_dispatch_backoff_at`), so the length carries, and
+//! never lets a later, shorter window for the same issue shorten it (#11901).
+//!
+//! The window is lifted early, here and on every peer, when the issue is
+//! reopened after its landing or Curator keeps it
+//! ([`SweepRegistry::clear_landed_cooldown`], #11901): a zero-length
+//! broadcast, which the receiver reads as a clear.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -63,6 +70,51 @@ impl SweepRegistry {
             issue,
             remaining,
         );
+    }
+
+    /// Every issue whose local dispatch-backoff window in force now is a
+    /// landed cooldown armed by this host (#11901): the ones the work finder
+    /// may lift early.
+    #[must_use]
+    pub(crate) fn landed_cooldown_issues(&self) -> HashSet<u32> {
+        let now = Utc::now();
+        self.dispatch_backoff
+            .iter()
+            .filter(|(_, s)| s.cause == DispatchBackoffCause::Landed && s.until > now)
+            .map(|(issue, _)| *issue)
+            .collect()
+    }
+
+    /// Lift `issue`'s landed cooldown here and on every peer (#11901): the
+    /// issue was reopened after its landing, or Curator kept it, so the
+    /// window has nothing left to protect. Only a local window of the
+    /// `Landed` cause is removed; a failure-ladder window stays. Every peer
+    /// gets a zero-length `DispatchBackoffArmed`, which its extend-only
+    /// receiver reads as a clear, and this host's own copy of a peer's window
+    /// for the issue is dropped too, since it cannot tell a peer's landed
+    /// window from another one and the forge just said the landing is moot.
+    /// Returns whether a local landed window was removed.
+    pub(crate) fn clear_landed_cooldown(&mut self, issue: u32) -> bool {
+        let removed = self
+            .dispatch_backoff
+            .get(&issue)
+            .is_some_and(|s| s.cause == DispatchBackoffCause::Landed);
+        if removed {
+            self.dispatch_backoff.remove(&issue);
+        }
+        if let Some(view) = &self.peer_claims {
+            let repo = peer_claims::repo_slug(&self.config.workspace_root);
+            view.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear_dispatch_backoff(&repo, issue);
+        }
+        log::info!("sweep_registry: landed cooldown on issue #{issue} lifted (#11901)");
+        self.publish_peer_cooldown_claim(
+            peer_claims::ClaimKind::DispatchBackoffArmed,
+            issue,
+            Duration::ZERO,
+        );
+        removed
     }
 
     /// Whether `issue`'s local dispatch-backoff window in force now is a

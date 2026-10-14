@@ -800,6 +800,15 @@ pub trait WorkDispatcher {
         HashMap::new()
     }
 
+    /// The landed-cooldown lift (#11901, [`landed_prefilter::lift_in`]): of
+    /// `held`, this workspace's listed candidates inside a dispatch-backoff
+    /// window, the ones whose landed cooldown was just lifted because the
+    /// issue was reopened after its landing or Curator kept it. The tick then
+    /// treats them as not backed off. Defaults to empty.
+    fn lift_landed_cooldowns(&self, _held: &[u32]) -> HashSet<u32> {
+        HashSet::new()
+    }
+
     /// Whether a live sweep on this host is already marked `overflow`
     /// (#9244): the [`OverflowSlot`] is then taken for the whole tick.
     /// Defaults to `false`.
@@ -1622,7 +1631,7 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
     // Snapshot each workspace's dispatch-backoff set (#4485) alongside its
     // quarantined set — dropped in pass 1 for the same reason: a backed-off
     // candidate must not reserve a shared slot it cannot use.
-    let backed_off_sets: Vec<HashSet<u32>> =
+    let mut backed_off_sets: Vec<HashSet<u32>> =
         workspaces.iter().map(|(_, d)| d.backed_off()).collect();
 
     // Sibling snapshot of `backed_off_sets`' absolute expiry (Issue #9311),
@@ -1807,6 +1816,18 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
             continue;
         }
 
+        // #11901: a listed candidate whose landed cooldown no longer holds
+        // (reopened, or kept by Curator) is lifted before the backoff skip.
+        let held: Vec<u32> = ready
+            .iter()
+            .map(|i| i.number)
+            .filter(|n| backed_off_sets[idx].contains(n))
+            .collect();
+        if !held.is_empty() {
+            for n in dispatcher.lift_landed_cooldowns(&held) {
+                backed_off_sets[idx].remove(&n);
+            }
+        }
         let in_flight = &in_flights[idx];
         let now = chrono::Utc::now();
 
