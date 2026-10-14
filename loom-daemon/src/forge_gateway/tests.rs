@@ -53,7 +53,7 @@ impl Deps for Fake {
     fn gh(&self, _: &Path) -> Option<(PathBuf, GhVersion)> {
         self.gh.map(|v| (PathBuf::from("/opt/gh/bin/gh"), v))
     }
-    fn read_key(&self, r: &KeyRef, _region: Option<&str>) -> Result<String, String> {
+    fn read_key(&self, r: &KeyRef, _aws: &AwsAccess<'_>) -> Result<String, String> {
         *self.reads.borrow_mut() += 1;
         let KeyRef::File(p) = r else {
             return Err("ssm not faked".into());
@@ -155,12 +155,12 @@ fn a_file_key_must_be_owner_only_and_never_appears_in_the_error() {
     std::fs::write(&path, format!("{KEY}\n")).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
     let r = KeyRef::File(path.clone());
-    let err = r.read(None).unwrap_err();
+    let err = r.read(&AwsAccess::default()).unwrap_err();
     assert!(!err.contains(KEY), "{err}");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-    assert_eq!(r.read(None).unwrap(), KEY);
+    assert_eq!(r.read(&AwsAccess::default()).unwrap(), KEY);
     std::fs::write(&path, "not a key at all\nsecond line").unwrap();
-    let err = r.read(None).unwrap_err();
+    let err = r.read(&AwsAccess::default()).unwrap_err();
     assert!(!err.contains("not a key"), "{err}");
 }
 
@@ -547,13 +547,15 @@ fn ssm_refs_parse_and_are_read_in_an_explicit_region() {
     assert_eq!(resolve_region(None, &dflt).as_deref(), Some("us-west-2"));
     assert_eq!(resolve_region(None, &none), None);
 
-    let args = ssm_args("/p/k", "us-east-1");
+    let args = ssm_args("/p/k", "us-east-1", None);
     let at = args.iter().position(|a| a == "--region").unwrap();
     assert_eq!(args[at + 1], "us-east-1");
     assert!(args.contains(&"--with-decryption".to_string()));
 
     // No region anywhere: refused before any AWS call, saying how to fix it.
-    let err = KeyRef::Ssm("/p/k".into()).read(None).unwrap_err();
+    let err = KeyRef::Ssm("/p/k".into())
+        .read(&AwsAccess::default())
+        .unwrap_err();
     assert!(err.contains("forge.gateway.region") && err.contains("AWS_REGION"), "{err}");
 
     let bad = json!({"forge": {"gateway": {"origin": "gw.example.com", "region": "US East",
@@ -561,4 +563,58 @@ fn ssm_refs_parse_and_are_read_in_an_explicit_region() {
     let (c, w) = parse(&bad);
     assert_eq!(c.unwrap().region, None);
     assert_eq!(w.len(), 1, "{w:?}");
+}
+
+/// An `ssm://` read runs as the host's instance role: every AWS identity
+/// selector in the daemon's environment (a worker's `AWS_PROFILE=sccache`)
+/// is removed from the child. `forge.gateway.awsProfile` is the one way to
+/// name another profile, and it is passed as `--profile`.
+#[test]
+fn ssm_reads_use_the_instance_role_unless_a_profile_is_configured() {
+    let cmd = ssm_command("/p/k", "us-east-1", None);
+    let removed: Vec<String> = cmd
+        .get_envs()
+        .filter(|(_, v)| v.is_none())
+        .map(|(k, _)| k.to_string_lossy().into_owned())
+        .collect();
+    for key in AWS_IDENTITY_ENV {
+        assert!(removed.iter().any(|r| r == key), "{key} reaches the aws child: {removed:?}");
+    }
+    assert!(cmd.get_envs().all(|(_, v)| v.is_none()), "nothing is set, only removed");
+    let args: Vec<String> = cmd
+        .get_args()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    assert!(!args.contains(&"--profile".to_string()), "{args:?}");
+
+    let named = ssm_command("/p/k", "us-east-1", Some("relay-reader"));
+    let args: Vec<String> = named
+        .get_args()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let at = args.iter().position(|a| a == "--profile").unwrap();
+    assert_eq!(args[at + 1], "relay-reader");
+    // The profile is named on the command line, so the environment can't
+    // move it either.
+    assert!(named
+        .get_envs()
+        .any(|(k, v)| k == "AWS_PROFILE" && v.is_none()));
+
+    let v = json!({"forge": {"gateway": {"origin": "gw.example.com", "awsProfile": "relay-reader",
+        "keyRefs": {"acme": "ssm:///p"}}}});
+    assert_eq!(parse(&v).0.unwrap().aws_profile.as_deref(), Some("relay-reader"));
+    let bad = json!({"forge": {"gateway": {"origin": "gw.example.com", "awsProfile": "a b",
+        "keyRefs": {"acme": "ssm:///p"}}}});
+    let (c, w) = parse(&bad);
+    assert_eq!((c.unwrap().aws_profile, w.len()), (None, 1));
+}
+
+#[test]
+fn an_ssm_failure_names_the_exit_and_the_first_stderr_line() {
+    assert_eq!(
+        first_line("\n  An error occurred (AccessDeniedException) when calling the GetParameter operation: User: arn:x is not authorized\nmore"),
+        "An error occurred (AccessDeniedException) when calling the GetParameter operation: User: arn:x is not authorized"
+    );
+    assert_eq!(first_line(""), "(no stderr)");
+    assert_eq!(first_line(&"x".repeat(1000)).len(), 240);
 }
