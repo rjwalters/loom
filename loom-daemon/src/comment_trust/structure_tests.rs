@@ -93,6 +93,10 @@ const MARKER_FILES: &[(&str, &str)] = &[
         "#9062 timeline flag rows, trusted via policy.trusts_json in parse_label_events",
     ),
     ("worktree_ops/gh.rs", "linked-PR probe (FETCH_SITES)"),
+    (
+        "work_finder/landed_prefilter.rs",
+        "#11882: route-marker reader in trusted_route_marked (FETCH_SITES); closes-graph of MERGED PRs only",
+    ),
 ];
 
 /// Per reviewed file: every function that fetches comments (or linked PRs),
@@ -202,6 +206,19 @@ const FETCH_SITES: &[(&str, &str, &str)] = &[
     // trusts each comment through `policy.trusts_json` before reading a hold
     // or idempotency marker from it.
     ("stale_blocked/release_gh.rs", "comments", ""),
+    // #11853/#11882: the landed pre-filter. The route marker decides "Curator
+    // already kept this issue", so its reader filters through the policy.
+    (
+        "work_finder/landed_prefilter.rs",
+        "trusted_route_marked",
+        "TrustPolicy::for_root(&self.root)",
+    ),
+    // The routing comment is a write.
+    ("work_finder/landed_prefilter.rs", "comment", ""),
+    // The closes-graph query/parser read only MERGED PRs (merged by a
+    // maintainer), never comment text, and a PR counts only when it merged.
+    ("work_finder/landed_prefilter.rs", "landed_query", ""),
+    ("work_finder/landed_prefilter.rs", "alias_verdict", ""),
 ];
 
 /// Production code of a source file: inline test modules cut off, comment

@@ -73,6 +73,7 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use crate::claim_reconciliation::gh_call;
+use crate::comment_trust::{records, TrustPolicy};
 use crate::sweep_registry::{SweepRegistry, LANDED_COOLDOWN};
 
 /// The conditional-read caller / breaker name of this pre-filter.
@@ -420,6 +421,22 @@ impl GhLandedForge {
         format!("repos/{}/issues/{issue}", self.slug)
     }
 
+    fn trusted_route_marked(&self, issue: u32, pr: u32) -> Result<bool> {
+        // The marker decides whether Curator already saw this landing, so only
+        // a trusted author's comment may carry it (#9548): read the whole
+        // listing, not a `--jq` projection, and filter it through the policy.
+        let url = format!("{}/comments?per_page=100", self.issue_path(issue));
+        let read = gh_call::read("landed.route_marker", &self.gh_bin, &self.root);
+        let out = self.run(read.args(["api", "--paginate", url.as_str()]))?;
+        let trusted = TrustPolicy::for_root(&self.root)
+            .trusted_listing(out.as_bytes())
+            .ok_or_else(|| anyhow!("the comment listing did not parse"))?;
+        let marker = route_marker(pr);
+        Ok(records::bodies(&trusted)
+            .iter()
+            .any(|body| body.contains(&marker)))
+    }
+
     fn run(&self, inv: crate::gh_invocation::GhInvocation) -> Result<String> {
         let out = gh_call::output(inv)?;
         if !out.status.success() {
@@ -493,11 +510,7 @@ impl LandedForge for GhLandedForge {
     }
 
     fn route_marked(&mut self, issue: u32, pr: u32) -> Result<bool> {
-        let url = format!("{}/comments?per_page=100", self.issue_path(issue));
-        let jq = format!(".[].body | select(contains(\"{}\"))", route_marker(pr));
-        let read = gh_call::read("landed.route_marker", &self.gh_bin, &self.root);
-        let out = self.run(read.args(["api", "--paginate", url.as_str(), "--jq", jq.as_str()]))?;
-        Ok(!out.trim().is_empty())
+        self.trusted_route_marked(issue, pr)
     }
 
     fn add_label(&mut self, issue: u32, label: &str) -> bool {
