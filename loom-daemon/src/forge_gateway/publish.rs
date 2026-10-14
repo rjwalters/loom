@@ -99,7 +99,7 @@ impl Deps for RealDeps {
 }
 
 /// `program` (a path, or a bare name looked up on `PATH`), canonicalized.
-fn canonical_program(program: &str) -> Option<PathBuf> {
+pub(super) fn canonical_program(program: &str) -> Option<PathBuf> {
     let p = Path::new(program);
     let found = if p.components().count() > 1 {
         Some(p.to_path_buf())

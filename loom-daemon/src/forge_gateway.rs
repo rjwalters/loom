@@ -43,6 +43,11 @@
 //! - the agent `gh` front sends the reads it can classify to the gateway
 //!   profile ([`crate::agent_gh::read_route`]); everything else stays on the
 //!   session's credential (the writer);
+//! - a CLI subcommand that calls [`enable_cli`] (`labels undeclared`,
+//!   `labels migrate`) routes its facade reads like the daemon's when it runs
+//!   with [`DIR_ENV`] set to the daemon's published directory: how a host job
+//!   (the fleet captain's label-drift) reads through the gateway while
+//!   holding no GitHub credential of its own;
 //! - the writer profile is untouched: its token, no `api_host`.
 //!
 //! # Break-glass
@@ -277,12 +282,42 @@ pub fn active() -> Option<Active> {
 /// The front's half: honour [`DIR_ENV`] only when the `gh` this front execs
 /// (`next_gh`) is the one the daemon version-checked. Once per process.
 pub fn enable_front(next_gh: &Path) {
-    let base = std::env::var_os(DIR_ENV)
+    let _ = FRONT.set(front_base(std::env::var_os(DIR_ENV), next_gh, SystemTime::now()));
+}
+
+/// A CLI subcommand's half (2AMLogic/2am#4367 P4): a `loom-daemon
+/// <subcommand>` run by a host job (the fleet captain's label-drift job) is
+/// neither the daemon nor the agent front, so without this its reads never
+/// see the gateway and go to whatever `GH_CONFIG_DIR` it inherited. It
+/// honours [`DIR_ENV`] on the front's terms: only when the `gh` the facade
+/// will exec ([`crate::gh_invocation::resolver::resolve`]) is the one the
+/// daemon version-checked, and not during a front outage. The variable
+/// names a directory, never a key. A no-op in the daemon, whose own
+/// published set always wins ([`profile_for`]), and once per process; unset,
+/// nothing changes. A CLI that makes forge reads calls it before the first.
+pub fn enable_cli() {
+    if DAEMON.get().is_some() {
+        return;
+    }
+    let program = crate::gh_invocation::resolver::resolve().program;
+    let _ = FRONT.set(cli_base(std::env::var_os(DIR_ENV), &program, SystemTime::now()));
+}
+
+/// [`enable_cli`]'s decision: `program` is a path or a bare name looked up
+/// on `PATH`, as the facade will run it.
+fn cli_base(dir_env: Option<OsString>, program: &str, now: SystemTime) -> Option<PathBuf> {
+    let gh = publish::canonical_program(program)?;
+    front_base(dir_env, &gh, now)
+}
+
+/// The base directory a non-daemon process may route through: [`DIR_ENV`]'s
+/// value, when set, its marker names `gh` and no front outage holds.
+fn front_base(dir_env: Option<OsString>, gh: &Path, now: SystemTime) -> Option<PathBuf> {
+    dir_env
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
-        .filter(|base| publish::gh_marker_matches(base, next_gh))
-        .filter(|base| !outage::front_outage_active(base, SystemTime::now()));
-    let _ = FRONT.set(base);
+        .filter(|base| publish::gh_marker_matches(base, gh))
+        .filter(|base| !outage::front_outage_active(base, now))
 }
 
 /// Whether any gateway profile can route in this process. `false` while

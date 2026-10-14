@@ -390,6 +390,48 @@ fn a_front_routes_only_when_its_gh_is_the_checked_one() {
     assert!(!publish::gh_marker_matches(&tmp.path().join("none"), &gh));
 }
 
+/// 2AMLogic/2am#4367: a CLI run by a host job routes through the daemon's
+/// published profiles only on the front's terms: the variable is set, its
+/// marker names the `gh` the facade will exec, and no front outage holds.
+#[test]
+fn a_cli_routes_only_through_a_checked_gh_and_outside_an_outage() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("gh-config-gateway");
+    std::fs::create_dir(&base).unwrap();
+    let gh = tmp.path().join("gh");
+    std::fs::write(&gh, "").unwrap();
+    let other = tmp.path().join("gh-other");
+    std::fs::write(&other, "").unwrap();
+    std::fs::write(
+        base.join("gh-ok"),
+        std::fs::canonicalize(&gh)
+            .unwrap()
+            .to_string_lossy()
+            .as_bytes(),
+    )
+    .unwrap();
+    let env = Some(base.clone().into_os_string());
+    let now = SystemTime::now();
+    let gh_s = gh.to_str().unwrap();
+
+    assert_eq!(cli_base(env.clone(), gh_s, now), Some(base.clone()));
+    // Unset or empty: today's routing.
+    assert_eq!(cli_base(None, gh_s, now), None);
+    assert_eq!(cli_base(Some(OsString::new()), gh_s, now), None);
+    // A different gh than the daemon checked: it might ignore api_host.
+    assert_eq!(cli_base(env.clone(), other.to_str().unwrap(), now), None);
+    // A gh that does not resolve (a bare name on no PATH entry).
+    assert_eq!(cli_base(env.clone(), "loom-test-no-such-gh-binary", now), None);
+    // A directory the daemon never published into.
+    let empty = tmp.path().join("empty");
+    std::fs::create_dir(&empty).unwrap();
+    assert_eq!(cli_base(Some(empty.into_os_string()), gh_s, now), None);
+    // A front outage the daemon or a front recorded holds for its window.
+    outage::note_front_outage(&base);
+    assert_eq!(cli_base(env.clone(), gh_s, now), None);
+    assert_eq!(cli_base(env, gh_s, now + Duration::from_secs(3600)), Some(base));
+}
+
 /// #7818's leak class: a profile holds a live key, so its path must be
 /// ignored by the deployed `.gitignore` block AND refused by every stager's
 /// credential list, without either list naming it.
