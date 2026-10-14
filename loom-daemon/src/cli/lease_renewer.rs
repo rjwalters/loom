@@ -52,6 +52,7 @@
 //! lets a peer reclaim work that is still being done.
 
 use anyhow::{Context, Result};
+use loom_daemon::telemetry::SweepResult;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -118,6 +119,21 @@ pub(crate) enum RenewerAction {
         #[command(flatten)]
         key: KeyArgs,
     },
+    /// Mark every inherited fd above 2 close-on-exec, then exec `CMD` (#10203).
+    ///
+    /// `sweep-lease-renew.sh start` re-enters itself through this so its
+    /// detached loop holds no descriptor of the caller's (fd 3's saved stdout,
+    /// an fd 10+ pipe, ...), which would otherwise keep a `worktree.sh N | tail`
+    /// pipe open for the loop's whole lifetime. `--check` only proves this
+    /// binary has the subcommand (exit 0), so an older daemon stays fail-open.
+    SanitizeExec {
+        /// Exit 0 without exec'ing anything.
+        #[arg(long)]
+        check: bool,
+        /// The command to exec, after `--`.
+        #[arg(last = true, value_name = "CMD")]
+        cmd: Vec<String>,
+    },
 }
 
 /// One renewer's ownership record.
@@ -162,7 +178,7 @@ pub(crate) struct Store {
 }
 
 impl Store {
-    fn from_env() -> Self {
+    pub(crate) fn from_env() -> Self {
         let dir = std::env::var(STATE_DIR_ENV)
             .ok()
             .filter(|v| !v.trim().is_empty())
@@ -392,13 +408,26 @@ pub(crate) fn start_identity(pid: u32) -> Option<String> {
     (!s.is_empty()).then(|| format!("lstart:{s}"))
 }
 
-fn owner_is_live(pid: u32, ident: &str) -> bool {
+pub(crate) fn owner_is_live(pid: u32, ident: &str) -> bool {
     loom_daemon::live_claim::pid_is_live_process(pid)
         && (ident.is_empty() || start_identity(pid).as_deref() == Some(ident))
 }
 
 impl RenewerAction {
     pub(crate) fn run(self) -> Result<()> {
+        if let Self::SanitizeExec { check, cmd } = &self {
+            if *check {
+                return Ok(());
+            }
+            let Some((program, rest)) = cmd.split_first() else {
+                anyhow::bail!("sanitize-exec: no command given after `--`");
+            };
+            super::lease_ensure::mark_inherited_fds_cloexec();
+            let err = std::os::unix::process::CommandExt::exec(
+                std::process::Command::new(program).args(rest),
+            );
+            anyhow::bail!("sanitize-exec: cannot exec {program}: {err}");
+        }
         let store = Store::from_env();
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let repo = repo_identity(std::env::var("LOOM_REPO").ok().as_deref(), &cwd);
@@ -428,11 +457,19 @@ impl RenewerAction {
                 issue_state,
             } => {
                 let (code, why) = check(&store, &key_of(&key), &token, issue_state.as_deref());
+                // #11563: the issue closed under an in-session sweep's loop.
+                if code == EXIT_STOP
+                    && issue_state.as_deref().and_then(parse_state) == Some("closed")
+                {
+                    let ws = cwd.to_string_lossy();
+                    super::presence::on_sweep_finished(&ws, key.issue, SweepResult::Success, None);
+                }
                 if let Some(why) = why {
                     eprintln!("sweep-lease-renew: renewal loop for issue #{}: {why}", key.issue);
                 }
                 std::process::exit(code)
             }
+            Self::SanitizeExec { .. } => unreachable!("handled before the store is opened"),
             Self::Release { key } => {
                 let sweep = key.sweep_id.clone().unwrap_or_else(|| {
                     std::env::var("LOOM_TERMINAL_ID")
@@ -456,6 +493,10 @@ impl RenewerAction {
                     &signal,
                 )?;
                 eprintln!("released renewal for issue #{} ({n} renewer(s))", key.issue);
+                // #11563: released while still driven = ended without the
+                // merge's checkpoint delete, which finishes a landed sweep first.
+                let ws = cwd.to_string_lossy();
+                super::presence::on_sweep_finished(&ws, key.issue, SweepResult::Failure, None);
                 Ok(())
             }
         }

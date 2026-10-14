@@ -17,12 +17,28 @@ use std::path::Path;
 use chrono::{DateTime, Utc};
 
 use crate::observability::lifecycle::RoleTrace;
+use crate::observability::llm_billing::LlmBilling;
 use crate::observability::runtime_usage::cost::Pricing;
 use crate::observability::runtime_usage::spans::{append_new, model_usage_spans, UsageScope};
 use crate::script_helpers::sweep_experiment::ModelUsageTotals;
 use crate::telemetry::trace::journal::Journal;
 use crate::telemetry::trace::store::TraceStore;
 use crate::telemetry::trace::{SpanRecord, TraceAttributes};
+
+/// The `loom.runtime` a tick's usage spans carry (2am#4393): the resolved
+/// runtime when one is known, else `claude` when the tokens came from Claude
+/// Code's own transcripts. Every non-Claude source is selected BY a named
+/// runtime, so a transcript-sourced tick with no name is a Claude tick; before
+/// this its usage spans left `loom.runtime` empty and read as model-only.
+#[must_use]
+pub fn span_runtime(
+    runtime: Option<&str>,
+    source: crate::usage_source::UsageSource,
+) -> Option<&str> {
+    runtime.filter(|r| !r.trim().is_empty()).or_else(|| {
+        (source == crate::usage_source::UsageSource::ClaudeTranscripts).then_some("claude")
+    })
+}
 
 /// Journal the tick's execution-scoped usage. Best-effort: logs, never fails.
 pub fn journal_execution(
@@ -31,9 +47,10 @@ pub fn journal_execution(
     role: &str,
     ended_at: DateTime<Utc>,
     runtime: Option<&str>,
+    billing: Option<&LlmBilling>,
     rows: &[ModelUsageTotals],
 ) {
-    let spans = execution_usage(trace, role, ended_at, runtime, rows, &Pricing::active());
+    let spans = execution_usage(trace, role, ended_at, runtime, billing, rows, &Pricing::active());
     let store = TraceStore::new(root);
     let journal = Journal::for_context(&store.path(root, &trace.execution));
     if let Err(error) = append_new(&journal, spans) {
@@ -48,6 +65,7 @@ pub fn execution_usage(
     role: &str,
     ended_at: DateTime<Utc>,
     runtime: Option<&str>,
+    billing: Option<&LlmBilling>,
     rows: &[ModelUsageTotals],
     pricing: &Pricing<'_>,
 ) -> Vec<SpanRecord> {
@@ -56,6 +74,9 @@ pub fn execution_usage(
     common.insert("loom.sweep_id".into(), trace.execution.clone());
     if let Some(runtime) = runtime {
         common.insert("loom.runtime".into(), runtime.to_string());
+    }
+    if let Some(billing) = billing {
+        billing.stamp(&mut common);
     }
     model_usage_spans(
         &trace.context,
@@ -84,6 +105,9 @@ pub fn attempt_usage(
         "loom.pr_number",
         "loom.sweep_id",
         "loom.runtime",
+        crate::observability::llm_billing::BILLING_KEY,
+        crate::observability::llm_billing::CREDENTIAL_KIND_KEY,
+        crate::observability::llm_billing::PROFILE_KEY,
     ]
     .into_iter()
     .filter_map(|key| {

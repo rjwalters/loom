@@ -876,6 +876,10 @@ cmd_renew_once() {
 # --- start ---------------------------------------------------------------
 
 cmd_start() {
+    # Issue #10203: re-enter once through the daemon, which marks every fd the
+    # caller leaked (above 2) close-on-exec before exec'ing us again. Skipped
+    # when the binary predates `sanitize-exec` (--check) so `start` stays fail-open.
+    [[ -n "${LOOM_RENEW_FDS_CLEAN:-}" ]] || ! "${LOOM_DAEMON_BIN:-loom-daemon}" lease renewer sanitize-exec --check > /dev/null 2>&1 || LOOM_RENEW_FDS_CLEAN=1 exec "${LOOM_DAEMON_BIN:-loom-daemon}" lease renewer sanitize-exec -- "$SELF" start "$@"
     local issue="${1:-}"
     shift || true
     [[ "$issue" =~ ^[0-9]+$ ]] || {
@@ -1030,6 +1034,13 @@ cmd_start() {
     local loop_started_at lease_cache_re='lease-cache=([0-9]+@[0-9TZ:-]+)'
     loop_started_at="$(date -u +%s)"
     #
+    # Issue #10203: the loop (and its `sleep` children) must hold no fd it
+    # inherited from the caller except its own log (fd 9), so the closing
+    # redirect below also closes 3-8. An inherited fd 3 -- worktree.sh's saved
+    # stdout, i.e. a `worktree.sh N | tail` pipe -- otherwise kept that pipe
+    # open for the loop's whole 4h lifetime. `cmd_start` re-enters itself
+    # through `loom-daemon lease renewer sanitize-exec` so fds 10+ are
+    # closed too; `loom-daemon lease ensure` does the same marking before `start`.
     # Issue #10229: one renewer per (repo, host, sweep, issue), and a cycle
     # that ends the loop once the issue is closed, even while the watched
     # interactive parent lives on. The decisions live in `loom-daemon lease
@@ -1047,6 +1058,13 @@ cmd_start() {
     # lease is published before `start` on every path, so two consecutive
     # misses (one interval apart, any success in between resets the count) mean
     # there is nothing this loop can ever renew: it stops.
+    # Issue #10348: keep the per-cycle budget at 2 requests (24/h) where the
+    # state read buys nothing. have_renewer: probed ONCE per start; a daemon
+    # without `lease renewer` cannot act on the state, so skip read/check/claim
+    # entirely. Dispatch source: the watched pid is the sweep child, which already
+    # bounds the loop, so skip the read and assert "open" to `check` (it still
+    # enforces release / supersede). In-session starts keep the read.
+    local have_renewer=1; "${LOOM_DAEMON_BIN:-loom-daemon}" lease renewer --help > /dev/null 2>&1 || have_renewer=0
     local cap_msg="sweep-lease-renew: renewal loop for issue #${issue} exiting: reached the ${max_age}s absolute lifetime cap (SWEEP_LEASE_RENEW_MAX_AGE_SECS / --max-age, #7825). The lease now ages out and the claim becomes reclaimable; set the cap to 0 to disable it."
     (
         cached_lease="" misses=0
@@ -1055,9 +1073,8 @@ cmd_start() {
             sleep "$interval"
             pid_is_live "$watch_pid" "$watch_ident" || break
             ! max_age_exceeded "$loop_started_at" "$max_age" || { echo "$cap_msg" >&9; break; }
-            gate_rc=0
-            issue_state="$(export LOOM_ROLE=sweep-lease-renew; [[ -z "$sweep_id" ]] || export LOOM_SWEEP_ID="$sweep_id"; lease_gh read api "repos/$(gh_repo_path)/issues/${issue}" --jq .state 2>&9)" || issue_state=""
-            "${LOOM_DAEMON_BIN:-loom-daemon}" lease renewer check "${owner_args[@]}" --issue-state "$issue_state" 2>&9 || gate_rc=$?
+            gate_rc=0; issue_state="$( ((have_renewer)) && [[ "${LOOM_SWEEP_LEASE_RENEW_SOURCE:-}" != "dispatch" ]] || { echo open; exit 0; }; export LOOM_ROLE=sweep-lease-renew; [[ -z "$sweep_id" ]] || export LOOM_SWEEP_ID="$sweep_id"; lease_gh read api "repos/$(gh_repo_path)/issues/${issue}" --jq .state 2>&9)" || issue_state=""
+            ((have_renewer == 0)) || "${LOOM_DAEMON_BIN:-loom-daemon}" lease renewer check "${owner_args[@]}" --issue-state "$issue_state" 2>&9 || gate_rc=$?
             ((gate_rc != 3)) || break
             ((gate_rc != 4)) || continue
             renew_rc=0
@@ -1082,11 +1099,11 @@ cmd_start() {
             case "$renew_rc" in 0) misses=0 ;; 2) misses=$((misses + 1)) ;; esac
             ((misses < 2)) || { echo "sweep-lease-renew: renewal loop for issue #${issue} exiting: no lease comment to renew on two consecutive cycles (#10229)" >&9; break; }
         done
-    ) < /dev/null > /dev/null 2>&1 &
+    ) < /dev/null > /dev/null 2>&1 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- &
     local loop_pid=$! owner_pid=""
     # A live renewer already owns this key: drop the loop just forked (still in
     # its first sleep, no forge call made) and report the owner's pid instead.
-    owner_pid="$("${LOOM_DAEMON_BIN:-loom-daemon}" lease renewer claim "${owner_args[@]}" --pid "$loop_pid" 2>&9)" || owner_pid=""
+    ((have_renewer == 0)) || owner_pid="$("${LOOM_DAEMON_BIN:-loom-daemon}" lease renewer claim "${owner_args[@]}" --pid "$loop_pid" 2>&9)" || owner_pid=""
     [[ ! "$owner_pid" =~ ^[0-9]+$ || "$owner_pid" == "$loop_pid" ]] || { kill "$loop_pid" 2> /dev/null || true; loop_pid="$owner_pid"; }
     exec 9>&-
     disown "$loop_pid" 2> /dev/null || true

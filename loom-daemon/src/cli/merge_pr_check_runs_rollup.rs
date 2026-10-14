@@ -23,9 +23,21 @@
 //! "still pending": the loop re-polls, and ends at its own deadline with
 //! exit 5 (not merged, re-queue) if the rollup never becomes readable. It
 //! never reads an unclassified rollup as settled.
+//!
+//! # Superseded twin runs (#11097)
+//!
+//! When the payload names its `repository` and `head_sha` (as
+//! `forge_get_check_runs` does) and could hold a superseded twin workflow
+//! run's residue — see [`loom_daemon::merge_pr::superseded_runs`] — this verb
+//! reads the head's workflow runs and drops that twin's check-runs before
+//! classifying. Any doubt (no names, a failed read, a doubtful runs payload)
+//! classifies the payload unchanged, i.e. exactly as before.
 
 use anyhow::Result;
 use loom_daemon::merge_pr::check_runs_rollup::classify;
+use loom_daemon::merge_pr::stale_checks::fetch::fetch_workflow_runs;
+use loom_daemon::merge_pr::superseded_runs as twins;
+use serde_json::Value;
 use std::io::{Read, Write};
 
 #[derive(clap::Args)]
@@ -42,6 +54,7 @@ impl CheckRunsRollupArgs {
         let Ok(text) = String::from_utf8(raw) else {
             refuse("stdin is not valid UTF-8");
         };
+        let text = without_superseded_twins(text);
         match classify(&text) {
             Ok(r) => {
                 let frame = format!(
@@ -54,6 +67,42 @@ impl CheckRunsRollupArgs {
                 Ok(())
             }
             Err(why) => refuse(&why.to_string()),
+        }
+    }
+}
+
+/// The payload with a superseded twin run's check-runs dropped, or `text`
+/// unchanged whenever that cannot be done with certainty (module docs).
+fn without_superseded_twins(text: String) -> String {
+    let Ok(mut doc) = serde_json::from_str::<Value>(&text) else {
+        return text; // classify() owns the refusal story
+    };
+    let field = |k: &str| doc.get(k).and_then(Value::as_str).map(String::from);
+    let (Some(nwo), Some(sha)) = (field("repository"), field("head_sha")) else {
+        return text;
+    };
+    let suspect = doc
+        .get("check_runs")
+        .and_then(Value::as_array)
+        .is_some_and(|rows| twins::needs_runs(rows));
+    if !suspect {
+        return text;
+    }
+    let gh = loom_daemon::gh_invocation::gh_bin();
+    match fetch_workflow_runs(&gh, &nwo, &sha).and_then(|p| twins::superseded_suites(&p, &sha)) {
+        Ok(superseded) => {
+            let n = twins::drop_superseded(&mut doc, &superseded);
+            if n > 0 {
+                eprintln!(
+                    "merge-pr check-runs-rollup: dropped {n} check-run(s) of a superseded twin workflow run on {sha} (#11097)"
+                );
+                return doc.to_string();
+            }
+            text
+        }
+        Err(why) => {
+            eprintln!("merge-pr check-runs-rollup: kept every check-run (twin-run lookup: {why})");
+            text
         }
     }
 }

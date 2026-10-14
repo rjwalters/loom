@@ -86,6 +86,7 @@ const RESPAWN_SOCKET_WAIT: Duration = Duration::from_secs(30);
 #[tokio::test]
 #[serial]
 async fn test_drain_exit0_then_watchdog_systemd_kickstart_recovers() {
+    let _real_record = common::RealFallbackRecordGuard::arm();
     let temp_dir = tempfile::TempDir::new().expect("temp dir");
     let socket_path = temp_dir.path().join("daemon.sock");
     let workspace_root = temp_dir.path().join("workspace");
@@ -309,7 +310,8 @@ esac
 
     let path_var = format!("{}:{}", stub_dir.display(), std::env::var("PATH").unwrap_or_default());
 
-    let watchdog_output = Command::new("bash")
+    let mut watchdog_cmd = Command::new("bash");
+    watchdog_cmd
         .arg(&watchdog_script)
         .env("PATH", path_var)
         // #8086: the watchdog script is now a thin stub over `loom-daemon
@@ -333,6 +335,15 @@ esac
             "LOOM_WATCH_RESULTS_LOG",
             temp_dir.path().join("watch-results.log"),
         )
+        // #10661: the daemon this watchdog relaunches gets THIS env, not
+        // `isolate_daemon_state`'s, so the session reconcile loop and its
+        // fallback-root record must be pinned here too (else the relaunched
+        // daemon writes the real `~/.loom/session-reconcile-fallback-root.json`).
+        .env("LOOM_SESSION_RECONCILE", "0")
+        .env(
+            "LOOM_SESSION_FALLBACK_ROOT_FILE",
+            temp_dir.path().join("session-reconcile-fallback-root.json"),
+        )
         .env("LOOM_ROLE_RUNNER", "0")
         .env("LOOM_WORK_FINDER", "0")
         .env("LOOM_EPIC_SUPERVISOR", "0")
@@ -352,9 +363,13 @@ esac
         .env("LOOM_WATCHDOG_LOG", &watchdog_log)
         .env("LOOM_DAEMON_LAUNCHD", "0")
         .env("LOOM_WATCHDOG_KICKSTART_RECHECK_ATTEMPTS", "40")
-        .env("LOOM_WATCHDOG_KICKSTART_RECHECK_INTERVAL", "0.25")
-        .output()
-        .expect("run watchdog script");
+        .env("LOOM_WATCHDOG_KICKSTART_RECHECK_INTERVAL", "0.25");
+    // #11024: the daemon the stub relaunches inherits THIS env, so it must get
+    // the fixture build-slot dir too — else its reaper tick falls back to the
+    // host's `~/.loom/locks/build-slot`. Assert it so a regression fails loudly.
+    common::isolate_build_slot(&mut watchdog_cmd, temp_dir.path());
+    common::assert_build_slot_isolated(&watchdog_cmd, temp_dir.path());
+    let watchdog_output = watchdog_cmd.output().expect("run watchdog script");
 
     let watchdog_stdout = String::from_utf8_lossy(&watchdog_output.stdout).to_string();
     let watchdog_stderr = String::from_utf8_lossy(&watchdog_output.stderr).to_string();

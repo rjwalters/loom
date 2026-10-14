@@ -33,7 +33,7 @@
 //!   for the rate derivation that forces the split.
 //! - **No forge call on the tick path beyond the cached one.** The repo slug
 //!   comes from a local `git remote get-url origin`; the visibility tag comes
-//!   from [`crate::telemetry::visibility::derive_visibility`]'s 300s-TTL
+//!   from [`crate::telemetry::visibility::derive_visibility`]'s 1h-TTL
 //!   memo, which is the same one every `sweep.outcome` already pays.
 //! - **Runtime-dispatched token source (Issue #8507).** The Claude-transcript
 //!   scan above is the DEFAULT source, used whenever this tick's own
@@ -117,6 +117,9 @@ pub struct RoleTickTelemetry {
     /// The chosen tap's `<runtime>[:<profile>]` identity (Issue #8599).
     /// Present exactly when [`Self::preference_tier`] is.
     pub preference_tap: Option<String>,
+    /// The role draw's decision record when `runtimes.roleDraw` chose the
+    /// tap (#11726).
+    pub role_draw: Option<crate::runtime_preference::role_draw::RoleDrawRecord>,
 }
 
 /// What one role invocation actually resolved before it spawned — the input
@@ -160,6 +163,27 @@ impl ResolvedLaunch {
         self.preference = preference;
         self
     }
+}
+
+/// Stable prefix of a `RoleTickOutcome::Failure` reason for a tick refused
+/// because the account's Codex session container was down (#10455).
+pub const SESSION_DOWN_REASON_PREFIX: &str = "session-down";
+
+/// Whether a failure reason carries [`SESSION_DOWN_REASON_PREFIX`].
+#[must_use]
+pub fn is_session_down_reason(reason: &str) -> bool {
+    reason.starts_with(SESSION_DOWN_REASON_PREFIX)
+}
+
+/// Stable prefix of a `RoleTickOutcome::Failure` reason for a tick refused
+/// because the account's Codex session container did not mount its working
+/// directory (#10364).
+pub const SESSION_MOUNT_STALE_REASON_PREFIX: &str = "session-mount-stale";
+
+/// Whether a failure reason carries [`SESSION_MOUNT_STALE_REASON_PREFIX`].
+#[must_use]
+pub fn is_session_mount_stale_reason(reason: &str) -> bool {
+    reason.starts_with(SESSION_MOUNT_STALE_REASON_PREFIX)
 }
 
 /// Project one [`crate::role_runner::RoleTickOutcome`] onto the
@@ -254,6 +278,14 @@ pub fn emit_for_tick_correlated(
     resolved: Option<ResolvedLaunch>,
     trace: Option<crate::observability::lifecycle::RoleTrace>,
 ) {
+    // #10212: the gate listing this tick read, as a ranked `pick.decision`.
+    crate::observability::pick_decision::emit_role_tick(
+        root,
+        role,
+        started_at,
+        outcome,
+        trace.as_ref().map(|t| t.execution.clone()),
+    );
     let (result, detail) = classify(outcome);
     let (model, effort) = match &resolved {
         Some(resolved) => (Some(resolved.model.clone()), Some(resolved.effort.clone())),
@@ -263,6 +295,9 @@ pub fn emit_for_tick_correlated(
     // launch the preference list did not decide has none either — absent, not
     // a fabricated `0`, which would read as "chose the top tap".
     let preference = resolved.and_then(|resolved| resolved.preference);
+    let role_draw = preference
+        .as_ref()
+        .and_then(|stamp| stamp.draw.as_deref().cloned());
     emit_correlated(
         &RoleTickTelemetry {
             root: root.to_path_buf(),
@@ -278,6 +313,7 @@ pub fn emit_for_tick_correlated(
                 .as_ref()
                 .and_then(|stamp| u32::try_from(stamp.tier).ok()),
             preference_tap: preference.map(|stamp| stamp.tap),
+            role_draw,
         },
         trace,
     );
@@ -521,8 +557,9 @@ fn models_used_from(rows: &[ModelUsageTotals]) -> Option<Vec<String>> {
 /// The slug comes from the checkout's own `origin` remote — a local `git`
 /// call, never a forge round trip — falling back to the root's path exactly
 /// the way `sweep.outcome`'s own construction site falls back. The visibility
-/// tag is the 300s-TTL memoized probe, so a busy host pays at most one `gh`
-/// call per repo per five minutes for it regardless of tick rate, and any
+/// tag is the 1h-TTL memoized probe, so a busy host pays at most one `gh`
+/// call (a conditional read, usually a free `304`) per repo per hour for it
+/// regardless of tick rate, and any
 /// probe failure resolves to [`RepoVisibility::Private`].
 #[must_use]
 fn resolve_repo(root: &Path) -> (String, RepoVisibility) {
@@ -578,6 +615,7 @@ pub fn build_record(
         gated_pool: tick.gated_pool.clone().filter(|p| !p.is_empty()),
         preference_tier: tick.preference_tier,
         preference_tap: tick.preference_tap.clone().filter(|t| !t.is_empty()),
+        role_draw: tick.role_draw.clone(),
         // Populated by `emit` via `apply_runtime_attribution` (Issue #8507):
         // that resolution needs a filesystem read this function deliberately
         // stays free of (see the doc comment above).
@@ -721,6 +759,17 @@ fn emit_correlated(
     // The launch record's runtime, else the resolved-runtime marker (#8594);
     // absent (unknown, never guessed) for a Claude tick with neither.
     let story_runtime = usage_runtime.clone().flatten();
+    // #10749: how the tick was billed — read once, stamped on the usage spans
+    // and the story copies. A launch record's own class wins; otherwise a
+    // Claude/Codex tick is classified by runtime (and a metered backstop tap).
+    let llm_billing = tick.result.spawned().then(|| {
+        tick_llm_billing(
+            runtime_attribution.as_ref(),
+            story_runtime.as_deref(),
+            tick.preference_tap.as_deref(),
+            &role_log,
+        )
+    });
     // #9303: the tick's per-model usage, kept for its usage spans below.
     let tokens_by_model = scan
         .as_ref()
@@ -734,7 +783,13 @@ fn emit_correlated(
         TelemetryRecord::RoleTickOutcome(record),
     );
     envelope.trace_context = trace.as_ref().map(|t| t.context.clone());
-    if let Err(e) = crate::sweep_outcomes::append_role_tick_telemetry(&path, &envelope) {
+    // #11348: shadow into the J2 `role_tick` stream only after this succeeds.
+    if let Err(e) = crate::telemetry::journal_shadow::after_legacy(
+        &tick.root,
+        crate::telemetry::journal_shadow::TelemetryStream::RoleTick,
+        || crate::sweep_outcomes::append_role_tick_telemetry(&path, &envelope),
+        |()| crate::telemetry::journal_shadow::ShadowRecord::from_envelope(&envelope),
+    ) {
         log::warn!(
             "role_tick_telemetry: failed to append {} tick record for {} at {}: {e} — \
              best-effort, never fatal to the tick (#8056)",
@@ -751,7 +806,8 @@ fn emit_correlated(
             trace,
             &tick.role,
             tick.ended_at,
-            story_runtime.as_deref(),
+            usage::span_runtime(story_runtime.as_deref(), source),
+            llm_billing.as_ref(),
             rows,
         );
     }
@@ -778,9 +834,55 @@ fn emit_correlated(
             runtime: story_runtime,
             model: tick.model.clone(),
             tokens_by_model,
+            llm_billing,
         };
         story::emit(&tick.root, &facts, &targets);
     }
+}
+
+/// Whether the role log's last preference marker records a metered-backstop
+/// slot (`backstop=`, #8555) — the tick fell through to a governed metered tap.
+fn log_records_metered_backstop(log: &str) -> bool {
+    log.lines()
+        .rev()
+        .find(|line| line.contains("LOOM_RUNTIME_PREFERENCE"))
+        .is_some_and(|line| line.contains(" backstop="))
+}
+
+/// The billing class of one spawned role tick (#10749). Never a guess: a
+/// runtime this cannot classify is reported `unknown`.
+fn tick_llm_billing(
+    attribution: Option<&crate::launch_record::RuntimeAttribution>,
+    usage_runtime: Option<&str>,
+    preference_tap: Option<&str>,
+    role_log: &Path,
+) -> crate::observability::llm_billing::LlmBilling {
+    use crate::observability::llm_billing::LlmBilling;
+    if let Some(attribution) = attribution {
+        if let Some(billing) = attribution.llm_billing.as_deref().and_then(|b| {
+            LlmBilling::parse(
+                b,
+                attribution.llm_credential_kind.as_deref(),
+                attribution.profile.as_deref(),
+            )
+        }) {
+            return billing;
+        }
+    }
+    let profile = attribution.and_then(|a| a.profile.clone()).or_else(|| {
+        preference_tap
+            .and_then(|tap| tap.split_once(':'))
+            .map(|(_, p)| p.to_string())
+    });
+    let metered = std::fs::read_to_string(role_log)
+        .map(|log| log_records_metered_backstop(&log))
+        .unwrap_or(false);
+    // No launch record and no resolved-runtime marker is a Claude tick.
+    let runtime = attribution
+        .map(|a| a.runtime.as_str())
+        .or(usage_runtime)
+        .unwrap_or("claude");
+    LlmBilling::for_runtime(runtime, profile.as_deref(), metered)
 }
 
 /// A [`RoleTickResult`]'s serialized name (`success`, `failure`, …) — the

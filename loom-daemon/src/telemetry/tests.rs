@@ -6,12 +6,14 @@
 use super::*;
 
 mod admission_brake;
-mod complexity;
 mod daemon_event;
 mod export_coverage;
 mod fleet_captain;
+mod host_health;
 mod host_health_omissions;
 mod kind_registry;
+mod retired_complexity;
+mod role_draw;
 mod role_tick;
 mod session_analysis;
 mod session_summary;
@@ -39,9 +41,12 @@ fn sweep_started() -> TelemetryRecord {
         issue: 4703,
         sweep_id: "sweep-issue-4703-0".to_string(),
         started_at: ts(),
-        model: Some("opus".to_string()),
-        effort: Some("high".to_string()),
-        runtime: Some("claude".to_string()),
+        facts: crate::telemetry::SweepStartFacts {
+            model: Some("opus".to_string()),
+            effort: Some("high".to_string()),
+            runtime: Some("claude".to_string()),
+            ..Default::default()
+        },
     })
 }
 
@@ -123,12 +128,15 @@ pub(super) fn sweep_outcome() -> TelemetryRecord {
         runtime: Some("opencode".to_string()),
         provider: Some("friendli".to_string()),
         profile: Some("zai-flash".to_string()),
-        complexity: Some("routine".to_string()),
         tokens_status: None,
         tokens_status_reason: None,
+        no_phase_cause: None,
+        phase_tap_usage: Vec::new(),
         attempt_index: None,
         previous_sweep_id: None,
         trigger: None,
+        dispatch_origin: None,
+        role_draw: None,
         rework_events: None,
         pr_numbers: None,
         hw_lines_added: None,
@@ -158,12 +166,14 @@ fn host_health() -> TelemetryRecord {
             ManagedRepoEntry {
                 slug: "rjwalters/loom".to_string(),
                 visibility: RepoVisibility::Public,
-                priority: Some(0),
+                weight: Some(0),
+                stale_blocked_release: None,
             },
             ManagedRepoEntry {
                 slug: "2AMLogic/gf180-pll".to_string(),
                 visibility: RepoVisibility::Private,
-                priority: None,
+                weight: None,
+                stale_blocked_release: None,
             },
         ],
         roles: RoleTickHealth {
@@ -187,6 +197,7 @@ fn host_health() -> TelemetryRecord {
         captainless_singleton_jobs: Vec::new(),
         exported_kinds: Vec::new(),
         exporters: Vec::new(),
+        otlp_export: None,
         memory: None,
     })
 }
@@ -276,12 +287,15 @@ fn sweep_outcome_omits_work_output_fields_when_unavailable() {
         runtime: None,
         provider: None,
         profile: None,
-        complexity: None,
         tokens_status: None,
         tokens_status_reason: None,
+        no_phase_cause: None,
+        phase_tap_usage: Vec::new(),
         attempt_index: None,
         previous_sweep_id: None,
         trigger: None,
+        dispatch_origin: None,
+        role_draw: None,
         rework_events: None,
         pr_numbers: None,
         hw_lines_added: None,
@@ -301,7 +315,6 @@ fn sweep_outcome_omits_work_output_fields_when_unavailable() {
         "runtime",
         "provider",
         "profile",
-        "complexity",
     ] {
         assert!(
             value.get(field).is_none(),
@@ -411,12 +424,15 @@ fn sweep_outcome_round_trips_the_completeness_fields() {
         runtime: None,
         provider: None,
         profile: None,
-        complexity: Some("complex".to_string()),
         tokens_status: None,
         tokens_status_reason: None,
+        no_phase_cause: None,
+        phase_tap_usage: Vec::new(),
         attempt_index: None,
         previous_sweep_id: None,
         trigger: None,
+        dispatch_origin: None,
+        role_draw: None,
         rework_events: None,
         pr_numbers: None,
         hw_lines_added: None,
@@ -426,7 +442,6 @@ fn sweep_outcome_round_trips_the_completeness_fields() {
         test_lines: None,
     };
     let value = serde_json::to_value(&record).unwrap();
-    assert_eq!(value["complexity"], "complex");
     assert_eq!(value["failure_class"], "account-exhausted:model-credits-exhausted");
     assert_eq!(value["models_used"][1], "claude-sonnet-5");
     assert_eq!(value["doctor_cycles"], 2);
@@ -475,12 +490,15 @@ fn sweep_outcome_distinguishes_an_omitted_doctor_cycles_from_zero() {
         runtime: None,
         provider: None,
         profile: None,
-        complexity: None,
         tokens_status: None,
         tokens_status_reason: None,
+        no_phase_cause: None,
+        phase_tap_usage: Vec::new(),
         attempt_index: None,
         previous_sweep_id: None,
         trigger: None,
+        dispatch_origin: None,
+        role_draw: None,
         rework_events: None,
         pr_numbers: None,
         hw_lines_added: None,
@@ -496,7 +514,6 @@ fn sweep_outcome_distinguishes_an_omitted_doctor_cycles_from_zero() {
         "models_used",
         "doctor_cycles",
         "judge_verdicts",
-        "complexity",
         // Issue #9432: an unsized issue carries NO `story_points` key — a `0`
         // would claim the Curator sized it at nothing.
         "story_points",
@@ -557,7 +574,6 @@ fn sweep_outcome_from_a_pre_8056_daemon_still_decodes() {
             assert_eq!(r.models_used, None);
             assert_eq!(r.doctor_cycles, None);
             assert_eq!(r.judge_verdicts, None);
-            assert_eq!(r.complexity, None);
             // Issue #9432: a pre-story-points record decodes with no size,
             // which reads as "nobody sized this issue" — not as size 0.
             assert_eq!(r.story_points, None);
@@ -566,9 +582,8 @@ fn sweep_outcome_from_a_pre_8056_daemon_still_decodes() {
     }
 }
 
-// sweep.outcome Curator complexity tier (Issue #8542): see
-// `tests/complexity.rs` — extracted to a sibling module to stay inside the
-// file-size ratchet.
+// Back-compat for the retired sweep.outcome `complexity` field: see
+// `tests/retired_complexity.rs`.
 
 // ------------------------------------------------------------------
 // sweep.completed per-model token usage (Issue #6384): additive,
@@ -760,294 +775,6 @@ fn record_with_unknown_visibility_defaults_to_private() {
     }
 }
 
-// ------------------------------------------------------------------
-// host.health build identity (#4956).
-// ------------------------------------------------------------------
-
-#[test]
-fn host_health_serializes_build_identity_alongside_version() {
-    let value = serde_json::to_value(host_health()).unwrap();
-    assert_eq!(
-        value
-            .get("daemon_version")
-            .and_then(serde_json::Value::as_str),
-        Some("0.16.0")
-    );
-    // The whole point of #4956: two builds sharing `daemon_version` are
-    // told apart by the commit, so it must be on the wire.
-    assert_eq!(
-        value
-            .get("build_commit")
-            .and_then(serde_json::Value::as_str),
-        Some("8c16fb5b")
-    );
-    assert_eq!(
-        value.get("built_at").and_then(serde_json::Value::as_str),
-        Some("2026-07-30T12:00:00Z")
-    );
-}
-
-#[test]
-fn host_health_round_trips_build_identity() {
-    let json = serde_json::to_string(&host_health()).unwrap();
-    let decoded: TelemetryRecord = serde_json::from_str(&json).unwrap();
-    match decoded {
-        TelemetryRecord::HostHealth(r) => {
-            assert_eq!(r.build_commit, "8c16fb5b");
-            assert_eq!(r.built_at, Some(ts()));
-        }
-        other => panic!("expected HostHealth, got {other:?}"),
-    }
-}
-
-#[test]
-fn host_health_from_a_pre_4956_daemon_still_decodes() {
-    // Backward compatibility: a record emitted by a daemon that predates
-    // the build-identity fields must decode, not poison the batch.
-    let json = r#"{
-        "kind": "host.health",
-        "captured_at": "2026-07-30T12:00:00Z",
-        "daemon_version": "0.16.0",
-        "uptime_sec": 86400,
-        "logical_cpus": 28
-    }"#;
-    let decoded: TelemetryRecord = serde_json::from_str(json).unwrap();
-    match decoded {
-        TelemetryRecord::HostHealth(r) => {
-            assert_eq!(r.daemon_version, "0.16.0");
-            assert_eq!(r.build_commit, "");
-            assert_eq!(r.built_at, None);
-        }
-        other => panic!("expected HostHealth, got {other:?}"),
-    }
-}
-
-// ------------------------------------------------------------------
-// host.health managed_repos roster (#4976).
-// ------------------------------------------------------------------
-
-#[test]
-fn host_health_serializes_managed_repos_with_slug_and_visibility() {
-    let value = serde_json::to_value(host_health()).unwrap();
-    let repos = value
-        .get("managed_repos")
-        .and_then(serde_json::Value::as_array)
-        .unwrap();
-    assert_eq!(repos.len(), 2);
-    assert_eq!(repos[0].get("slug").and_then(serde_json::Value::as_str), Some("rjwalters/loom"));
-    assert_eq!(
-        repos[0]
-            .get("visibility")
-            .and_then(serde_json::Value::as_str),
-        Some("public")
-    );
-    assert_eq!(
-        repos[1].get("slug").and_then(serde_json::Value::as_str),
-        Some("2AMLogic/gf180-pll")
-    );
-    assert_eq!(
-        repos[1]
-            .get("visibility")
-            .and_then(serde_json::Value::as_str),
-        Some("private")
-    );
-    // #9244: a registered repo's dispatch priority ships; an unknown one is
-    // omitted.
-    assert_eq!(repos[0]["priority"], 0);
-    assert!(repos[1].get("priority").is_none());
-}
-
-#[test]
-fn host_health_from_a_pre_4976_daemon_still_decodes() {
-    // Backward compatibility: a record emitted by a daemon that predates
-    // the managed-repo roster must decode with an empty roster, not fail
-    // the whole envelope.
-    let json = r#"{
-        "kind": "host.health",
-        "captured_at": "2026-07-30T12:00:00Z",
-        "daemon_version": "0.16.0",
-        "uptime_sec": 86400,
-        "logical_cpus": 28
-    }"#;
-    let decoded: TelemetryRecord = serde_json::from_str(json).unwrap();
-    match decoded {
-        TelemetryRecord::HostHealth(r) => {
-            assert!(r.managed_repos.is_empty());
-        }
-        other => panic!("expected HostHealth, got {other:?}"),
-    }
-}
-
-#[test]
-fn managed_repo_entry_with_missing_visibility_defaults_to_private() {
-    // A repo entry with no `visibility` tag at all must decode Private —
-    // the same private-safe-default every other visibility field holds.
-    let json = r#"{"slug": "owner/repo"}"#;
-    let decoded: ManagedRepoEntry = serde_json::from_str(json).unwrap();
-    assert_eq!(decoded.visibility, RepoVisibility::Private);
-    assert_eq!(decoded.slug, "owner/repo");
-    // No `priority` either (an older daemon): it decodes as absent.
-    assert_eq!(decoded.priority, None);
-}
-
-#[test]
-fn managed_repo_entry_priority_is_on_the_wire_only_when_known() {
-    // #9244 / loom-ui#153: `priority` ships for a registered workspace and is
-    // omitted (never a fabricated default) for one that is not.
-    let known = ManagedRepoEntry {
-        slug: "rjwalters/loom".to_string(),
-        visibility: RepoVisibility::Public,
-        priority: Some(0),
-    };
-    let wire = serde_json::to_value(&known).unwrap();
-    assert_eq!(wire["priority"], 0);
-    let unknown = ManagedRepoEntry {
-        priority: None,
-        ..known
-    };
-    let wire = serde_json::to_value(&unknown).unwrap();
-    assert!(wire.get("priority").is_none(), "{wire}");
-}
-
-// ------------------------------------------------------------------
-// host.health role-tick health (#5022).
-// ------------------------------------------------------------------
-
-#[test]
-fn host_health_serializes_role_tick_health_persistent_failures() {
-    let value = serde_json::to_value(host_health()).unwrap();
-    let roles = value.get("roles").unwrap();
-    assert_eq!(roles.get("total").and_then(serde_json::Value::as_u64), Some(12));
-    assert_eq!(roles.get("ok").and_then(serde_json::Value::as_u64), Some(10));
-    let persistent = roles
-        .get("persistent")
-        .and_then(serde_json::Value::as_array)
-        .unwrap();
-    assert_eq!(persistent.len(), 1);
-    assert_eq!(
-        persistent[0]
-            .get("role")
-            .and_then(serde_json::Value::as_str),
-        Some("judge")
-    );
-    assert_eq!(
-        persistent[0]
-            .get("detail")
-            .and_then(serde_json::Value::as_str),
-        Some("no-token-pool")
-    );
-}
-
-#[test]
-fn host_health_from_a_pre_5022_daemon_decodes_with_a_zero_value_roles_summary() {
-    // Backward compatibility: a record emitted by a daemon that predates
-    // role-tick health must decode with the zero-value ("nothing sampled")
-    // summary, never fail the whole envelope.
-    let json = r#"{
-        "kind": "host.health",
-        "captured_at": "2026-07-30T12:00:00Z",
-        "daemon_version": "0.16.0",
-        "uptime_sec": 86400,
-        "logical_cpus": 28
-    }"#;
-    let decoded: TelemetryRecord = serde_json::from_str(json).unwrap();
-    match decoded {
-        TelemetryRecord::HostHealth(r) => {
-            assert_eq!(r.roles, RoleTickHealth::default());
-            assert_eq!(r.roles.total, 0);
-            assert!(r.roles.persistent.is_empty());
-        }
-        other => panic!("expected HostHealth, got {other:?}"),
-    }
-}
-
-// ------------------------------------------------------------------
-// host.health worktree_root_total_gb (#5356).
-// ------------------------------------------------------------------
-
-#[test]
-fn host_health_serializes_worktree_root_total_gb_when_measurable() {
-    let value = serde_json::to_value(host_health()).unwrap();
-    assert_eq!(
-        value
-            .get("worktree_root_free_gb")
-            .and_then(serde_json::Value::as_u64),
-        Some(200)
-    );
-    assert_eq!(
-        value
-            .get("worktree_root_total_gb")
-            .and_then(serde_json::Value::as_u64),
-        Some(1000)
-    );
-}
-
-// ------------------------------------------------------------------
-// host.health watchdog/crash-protection state (#5352).
-// ------------------------------------------------------------------
-
-#[test]
-fn host_health_serializes_protection_state_and_watchdog_provisioned() {
-    let value = serde_json::to_value(host_health()).unwrap();
-    let protection = value.get("protection").unwrap();
-    assert_eq!(protection.get("state").and_then(serde_json::Value::as_str), Some("protected"));
-    assert_eq!(
-        protection
-            .get("watchdog_provisioned")
-            .and_then(serde_json::Value::as_bool),
-        Some(true)
-    );
-}
-
-#[test]
-fn host_health_from_a_pre_5356_daemon_still_decodes() {
-    // Backward compatibility: a record emitted by a daemon that predates
-    // worktree_root_total_gb (this includes a record that DOES carry
-    // worktree_root_free_gb, since that field existed first) must decode
-    // with an absent total, not fail the whole envelope.
-    let json = r#"{
-        "kind": "host.health",
-        "captured_at": "2026-07-30T12:00:00Z",
-        "daemon_version": "0.16.0",
-        "uptime_sec": 86400,
-        "logical_cpus": 28,
-        "worktree_root_free_gb": 200
-    }"#;
-    let decoded: TelemetryRecord = serde_json::from_str(json).unwrap();
-    match decoded {
-        TelemetryRecord::HostHealth(r) => {
-            assert_eq!(r.worktree_root_free_gb, Some(200));
-            assert_eq!(
-                r.worktree_root_total_gb, None,
-                "a pre-#5356 record has no total key at all, which must decode as None, not 0"
-            );
-        }
-        other => panic!("expected HostHealth, got {other:?}"),
-    }
-}
-
-#[test]
-fn host_health_from_a_pre_5352_daemon_decodes_with_protection_absent() {
-    // Backward compatibility: a record emitted by a daemon that predates
-    // watchdog/crash-protection telemetry must decode with `protection:
-    // None`, never fail the whole envelope — and never a false
-    // "unprotected" negative synthesized from its absence.
-    let json = r#"{
-        "kind": "host.health",
-        "captured_at": "2026-07-30T12:00:00Z",
-        "daemon_version": "0.16.0",
-        "uptime_sec": 86400,
-        "logical_cpus": 28
-    }"#;
-    let decoded: TelemetryRecord = serde_json::from_str(json).unwrap();
-    match decoded {
-        TelemetryRecord::HostHealth(r) => {
-            assert!(r.protection.is_none());
-        }
-        other => panic!("expected HostHealth, got {other:?}"),
-    }
-}
-
 #[test]
 fn sweep_outcome_repo_is_a_slug_or_absent_and_repo_unresolved_marks_the_gap() {
     // Issue #9442: `repo` is ALWAYS an `owner/name` forge slug, never a local
@@ -1085,12 +812,15 @@ fn sweep_outcome_repo_is_a_slug_or_absent_and_repo_unresolved_marks_the_gap() {
         runtime: None,
         provider: None,
         profile: None,
-        complexity: None,
         tokens_status: None,
         tokens_status_reason: None,
+        no_phase_cause: None,
+        phase_tap_usage: Vec::new(),
         attempt_index: None,
         previous_sweep_id: None,
         trigger: None,
+        dispatch_origin: None,
+        role_draw: None,
         rework_events: None,
         pr_numbers: None,
         hw_lines_added: None,

@@ -61,6 +61,16 @@ impl SweepRegistry {
             .unwrap_or_else(|| PathBuf::from(crate::gh_invocation::gh_bin()))
     }
 
+    /// The workspace's repo-facts answer under `gh repo view` semantics (W3a),
+    /// read with this registry's own `gh`.
+    pub(in crate::sweep_registry) fn owner_repo_fact(&self) -> crate::forge_repo_facts::Lookup {
+        crate::forge_repo_facts::canonical_with(
+            &self.configured_gh(),
+            &self.config.workspace_root,
+            crate::forge_repo_facts::GhRepoEnv::Ignore,
+        )
+    }
+
     /// The configured `gh` binary, else bare `gh` — which the facade resolves
     /// through its own ladder (so the span records the real source).
     fn configured_gh(&self) -> PathBuf {
@@ -82,6 +92,26 @@ impl SweepRegistry {
     {
         let gh = self.configured_gh();
         self.run_counted(self.gh_inv(op, AccessIntent::Read, &gh).args(args))
+    }
+
+    /// [`Self::gh_read`] pinned to the writer: for a read-back of a forge fact
+    /// this daemon just wrote itself (its own label flip, lease, claim), where
+    /// a reader App could still lag the write. Never derives a reader route.
+    pub(in crate::sweep_registry) fn gh_read_own_write<I, S>(
+        &self,
+        op: &'static str,
+        args: I,
+    ) -> std::io::Result<Option<Output>>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        let gh = self.configured_gh();
+        self.run_counted(
+            self.gh_inv(op, AccessIntent::Read, &gh)
+                .writer_identity()
+                .args(args),
+        )
     }
 
     /// [`Self::gh_read`] for a write.

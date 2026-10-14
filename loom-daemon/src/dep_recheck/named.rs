@@ -174,6 +174,42 @@ pub fn dependencies_section(body: &str) -> String {
     out.join("\n")
 }
 
+/// `- [ ]` / `* [ ]`: an unchecked task-list box, whatever follows it.
+#[must_use]
+pub fn is_unchecked_box(line: &str) -> bool {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^[ \t]*[-*][ \t]*\[ \]").expect("static unchecked-box pattern"))
+        .is_match(line)
+}
+
+/// `body` with every `## Dependencies` checklist line the checklist itself
+/// accounts for blanked out: each unchecked box line (parseable or not) and
+/// each ticked line [`parse_entries`] reads.
+///
+/// For `check-stale-blocked`'s prose read only (#9274): `item_re` accepts a
+/// dependency phrase after the box (`- [ ] Blocked by #187: ...`), so without
+/// this the same line is read both as a checklist entry and as a prose
+/// reference, and the prose rule ("any cited blocker no longer open") would
+/// override the checklist's stricter "an unchecked box is unmet". A ticked line
+/// no parser reads is kept, so its reference is not lost. Lines outside an
+/// active section are untouched. Curator's extractor and `CONCLUSION_HASH`
+/// never call this.
+#[must_use]
+pub fn mask_checklist_lines(body: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    let mut inside = false;
+    for line in body.lines() {
+        if is_dependencies_heading(line) {
+            inside = true;
+        } else if inside && is_heading_up_to_h3(line) {
+            inside = false;
+        }
+        let accounted = inside && (is_unchecked_box(line) || item_re().is_match(line));
+        out.push(if accounted { "" } else { line });
+    }
+    out.join("\n")
+}
+
 /// Heading annotations that deliberately mark a `## Dependencies` section
 /// **inactive**, and are therefore the *only* suffixes that suppress it.
 ///

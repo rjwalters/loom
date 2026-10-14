@@ -33,7 +33,31 @@ use std::collections::BTreeMap;
 /// construction — never an issue number, sha, sweep id or path. The gateway
 /// collector's datapoint `keep_keys` must include every key (contract-tested).
 pub const OPS_METRIC_LABEL_KEYS: &[&str] = &[
-    "reason", "provider", "account", "model", "state", "resource", "task",
+    "reason",
+    "provider",
+    "account",
+    "model",
+    "state",
+    "resource",
+    "task",
+    // W1: per-bucket rate-limit gauges and `loom.forge.calls`.
+    "owner",
+    "caller",
+    "op",
+    "role",
+    "cred_owner",
+    "target_owner",
+    // #10571: the App installation a bucket was minted under (one per
+    // `(account, owner)`, so it adds no series).
+    "installation",
+    "outcome",
+    "kind",
+    "repo",
+    // #10455: `loom.codex_session.state` (the session container's name).
+    "container",
+    // #10607: `loom.forge.calls` ingested from agent `gh` fronts — the agent
+    // role (closed vocabulary), `-` on the daemon's own rows.
+    "agent",
 ];
 
 /// Span attribute keys the ops span names (`loom.dispatch.tick`,
@@ -47,6 +71,8 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.dispatch.dispatched",
     "loom.dispatch.errors",
     "loom.dispatch.max_concurrent",
+    // #11649: a held tick's distinct halt causes, comma-joined.
+    "loom.dispatch.halt_causes",
     // ---- Telemetry mega PR A (Issues #8908, #8931) ----------------------
     // `loom.runtime.usage` (#8908): one execution's exact token breakdown.
     "loom.tokens.input",
@@ -101,12 +127,64 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "github.ratelimit.graphql.used",
     "github.ratelimit.graphql.own",
     "github.ratelimit.graphql.external",
+    // `forge.reader.withdrawn` spans (W4-A): which reader App left which
+    // (owner, resource) bucket, until when, and where that end came from.
+    "forge.reader.app",
+    "forge.reader.owner",
+    "forge.reader.resource",
+    "forge.reader.until",
+    "forge.reader.source",
+    "forge.reader.secondary",
+    // `forge.reader.spill` spans (W4-B): one read-pool spill-latch
+    // transition — repo, resource, home and target reader, mode, release.
+    "forge.spill.owner_repo",
+    "forge.spill.resource",
+    "forge.spill.from",
+    "forge.spill.to",
+    "forge.spill.mode",
+    "forge.spill.until",
+    // `forge.read.shed` spans (W4-C): which deferred read, of which class,
+    // for which (owner, resource) bucket, until when.
+    "forge.read.op",
+    "forge.read.class",
+    "forge.read.app",
+    "forge.read.owner",
+    "forge.read.resource",
+    "forge.read.until",
+    // `loom.egress.request` spans (#11300): one proxied provider request.
+    // Counts, classified codes and ids only, never a body or credential.
+    "loom.egress.seat",
+    "loom.egress.tap",
+    "loom.egress.profile",
+    "loom.egress.launch_id",
+    "loom.egress.status",
+    "loom.egress.latency_ms",
+    "loom.egress.ttft_ms",
+    "loom.egress.error_code",
+    "loom.egress.stream",
+    // `guard.cargo_target_dir.denied` spans (#11582): the forbidden root by
+    // name (`/tmp`, `$TMPDIR`, `~/.cache`, `~`, `.loom/target-*`) and where the
+    // value came from. Never the path or the command.
+    "loom.guard.root",
+    "loom.guard.source",
+    // `build_gate.run` spans (#11690): one host-side run of
+    // `buildGate.command` — stage, tier, outcome, duration and attempt.
+    "loom.build_gate.stage",
+    "loom.build_gate.tier",
+    "loom.build_gate.outcome",
+    "loom.build_gate.duration_ms",
+    "loom.build_gate.attempt",
+    // `main_red.autofile` spans (#11766): one change to a red `main`'s
+    // auto-filed fix issue — the SHA, the action and the verdict's source.
+    "loom.main_red.sha",
+    "loom.main_red.action",
+    "loom.main_red.source",
 ];
 
 /// Longest label value kept, in bytes.
 pub const MAX_LABEL_VALUE_BYTES: usize = 128;
-/// Most labels kept on one point.
-pub const MAX_LABELS_PER_POINT: usize = 8;
+/// Most labels kept on one point (`loom.forge.calls` carries ten, #10607).
+pub const MAX_LABELS_PER_POINT: usize = 10;
 /// Most points kept in one record.
 pub const MAX_POINTS_PER_RECORD: usize = 256;
 
@@ -175,6 +253,12 @@ pub enum MetricName {
     /// value means `loom.queue.issues` is missing their backlog.
     #[serde(rename = "loom.queue.listing_failed_repos")]
     QueueListingFailedRepos,
+    /// Repos whose ready-issue listing came back partial on the last tick
+    /// (#11139: a later page failed, the page cap, a mid-walk change): a
+    /// non-zero value means `loom.queue.issues` holds only part of their
+    /// backlog.
+    #[serde(rename = "loom.queue.listing_incomplete_repos")]
+    QueueListingIncompleteRepos,
     // ---- Quota burn and pool state (Issue #8857) ------------------------
     /// Uncached input tokens consumed since the previous sample.
     #[serde(rename = "loom.llm.tokens.input")]
@@ -203,6 +287,19 @@ pub enum MetricName {
     /// Seconds since the previous sample the pool read as exhausted.
     #[serde(rename = "loom.pool.exhausted_seconds")]
     PoolExhaustedSeconds,
+    /// One pool account's state (Issue #11286): `1` for the state it is in,
+    /// `0` otherwise, labelled `provider`, `account` and `state` =
+    /// `usable`/`exhausted`.
+    #[serde(rename = "loom.pool.account_state")]
+    PoolAccountState,
+    /// An API-key seat's declared plan token allowance per window (Issue
+    /// #11286), labelled `provider` + `account`. Only where declared.
+    #[serde(rename = "loom.pool.plan_token_limit")]
+    PoolPlanTokenLimit,
+    /// An API-key seat's declared plan window in seconds (Issue #11286),
+    /// labelled `provider` + `account`. Only where declared.
+    #[serde(rename = "loom.pool.plan_window_seconds")]
+    PoolPlanWindowSeconds,
     // ---- Reason-classified account marks (Issue #8931) -------------------
     /// Pool accounts marked out of selection since the previous point,
     /// labelled `provider` and `reason` (a closed set — see
@@ -252,6 +349,18 @@ pub enum MetricName {
     /// `observability::ops::ratelimit::Job`).
     #[serde(rename = "github.ratelimit.breaker_skips")]
     GithubRateLimitBreakerSkips,
+    /// Requests the `gh` facade spent since the previous point (W1),
+    /// labelled `caller`, `op`, `role`, `account`, `cred_owner`,
+    /// `target_owner`, `resource` and `outcome`; a paginated call counts its
+    /// pages when known.
+    #[serde(rename = "loom.forge.calls")]
+    ForgeCalls,
+    /// The `gh` facade's named event counters since the previous point
+    /// (`crate::forge_call_stats::counters`), labelled `reason` = the
+    /// counter (`facade.cwd_route.disagree`, `repo_facts.redirected`,
+    /// `repo_facts.resolver_disagree`): signals that are not forge calls.
+    #[serde(rename = "loom.forge.facade.events")]
+    ForgeFacadeEvents,
     // ---- Merge-chain re-date pressure (Issue #10163) ----------------------
     /// PRs with at least one #8508 re-date commit in the trailing window,
     /// labelled `state` = `landed` / `pending` / `stuck` (pending with at
@@ -266,6 +375,23 @@ pub enum MetricName {
     /// trailing window.
     #[serde(rename = "loom.merge.time_to_land_max")]
     MergeTimeToLandMax,
+    // ---- Egress proxy observe mode (Issue #11300) -------------------------
+    /// Provider requests the egress proxy observed since the previous point,
+    /// labelled `provider`, `account` (the seat), `model`, `role`, `outcome`
+    /// (`ok` / `error`) and `reason` (a classified code on an error).
+    #[serde(rename = "loom.egress.requests")]
+    EgressRequests,
+    /// Tokens the proxy read off provider responses, labelled as
+    /// `loom.egress.requests` plus `kind` = `input` / `output` / `cache_read`
+    /// / `cache_write`.
+    #[serde(rename = "loom.egress.tokens")]
+    EgressTokens,
+    /// Summed request latency (send to last byte), seconds.
+    #[serde(rename = "loom.egress.latency")]
+    EgressLatency,
+    /// Summed time to first response byte, seconds.
+    #[serde(rename = "loom.egress.ttft")]
+    EgressTtft,
     // ---- Long-running task liveness (Issue #10414) -----------------------
     /// 1 while a long-running daemon loop beat within its staleness window,
     /// 0 once it went silent or marked itself dead, labelled `task`
@@ -276,6 +402,56 @@ pub enum MetricName {
     /// point, labelled `task` and `reason` = `panic` / `overrun` / `exit`.
     #[serde(rename = "loom.daemon.task_faults")]
     DaemonTaskFaults,
+    // ---- IPC request latency (Issue #10765) -------------------------------
+    /// Slowest IPC request answered in the interval, seconds from the request
+    /// line being read to the response written, labelled `kind` (the
+    /// request's wire `type` tag, or `invalid`).
+    #[serde(rename = "loom.daemon.ipc.latency_max")]
+    DaemonIpcLatencyMax,
+    /// Summed IPC request latency since the previous point, by `kind`.
+    #[serde(rename = "loom.daemon.ipc.latency")]
+    DaemonIpcLatency,
+    /// IPC requests answered since the previous point, by `kind`.
+    #[serde(rename = "loom.daemon.ipc.requests")]
+    DaemonIpcRequests,
+    /// `DaemonStatus` builds finished since the previous point, by `outcome`
+    /// (`ok` / `panic` / `join_error`). Concurrent status requests share one
+    /// build (Issue #10861), so `requests / status_builds` is the coalescing
+    /// ratio.
+    #[serde(rename = "loom.daemon.ipc.status_builds")]
+    DaemonIpcStatusBuilds,
+    // ---- Codex session containers (Issue #10455) ---------------------------
+    /// Per session-managed Codex account, one point per `state` ∈ `running`,
+    /// `stopped`, `restarting`, `missing`, `stale_mounts`: 1 for the container's current
+    /// state, 0 for the rest. Labelled `account` and `container`.
+    #[serde(rename = "loom.codex_session.state")]
+    CodexSessionState,
+    /// Per session-managed Codex account, one point per `kind` ∈ `hold`,
+    /// `drift_removal`: 1 while that on-disk record stands (an operator
+    /// `stop`; the reconciler's fail-closed removal for a denied mount),
+    /// else 0. Labelled `account` and `container` (#10600).
+    #[serde(rename = "loom.codex_session.record")]
+    CodexSessionRecord,
+    /// Per session-managed Codex account with a drift verdict, one point per
+    /// `kind` ∈ `missing`, `extra`, `denied`: how many workspace paths drift
+    /// that way (`extra` excludes `denied`). Labelled `account` and
+    /// `container` (#10600).
+    #[serde(rename = "loom.codex_session.mount_drift")]
+    CodexSessionMountDrift,
+    // ---- Fleet gauges produced by the captain (W12) ----------------------
+    /// Age of the captain's last production of a fleet gauge job, labelled
+    /// `task` = the job (`observability::captain_gauges::Config::jobs`): on the captain its own,
+    /// on a dispatcher the published `as_of` it last read.
+    #[serde(rename = "loom.captain.gauge_age_seconds")]
+    CaptainGaugeAgeSeconds,
+    /// 1 while a dispatcher produces a fleet gauge job locally because the
+    /// captain's data is stale or absent, 0 while it stands down; by `task` (the job).
+    #[serde(rename = "loom.captain.gauge_fallback")]
+    CaptainGaugeFallback,
+    /// Peak memory (`memory.peak`) of one finished agent scope, by `repo`
+    /// (#11094).
+    #[serde(rename = "loom.agent_scope.peak_memory_bytes")]
+    AgentScopePeakMemoryBytes,
 }
 
 impl MetricName {
@@ -299,6 +475,7 @@ impl MetricName {
             Self::HostWorktreeVolumeTotalBytes => "loom.host.worktree_volume.total_bytes",
             Self::QueueIssues => "loom.queue.issues",
             Self::QueueListingFailedRepos => "loom.queue.listing_failed_repos",
+            Self::QueueListingIncompleteRepos => "loom.queue.listing_incomplete_repos",
             Self::LlmTokensInput => "loom.llm.tokens.input",
             Self::LlmTokensOutput => "loom.llm.tokens.output",
             Self::LlmTokensCacheRead => "loom.llm.tokens.cache_read",
@@ -308,6 +485,9 @@ impl MetricName {
             Self::PoolExhausted => "loom.pool.exhausted",
             Self::PoolExhaustions => "loom.pool.exhaustions",
             Self::PoolExhaustedSeconds => "loom.pool.exhausted_seconds",
+            Self::PoolAccountState => "loom.pool.account_state",
+            Self::PoolPlanTokenLimit => "loom.pool.plan_token_limit",
+            Self::PoolPlanWindowSeconds => "loom.pool.plan_window_seconds",
             Self::PoolAccountMarks => "loom.pool.account_marks",
             Self::DispatchSlotTurnaround => "loom.dispatch.slot_turnaround",
             Self::DispatchSlotTurnaroundSamples => "loom.dispatch.slot_turnaround.samples",
@@ -321,11 +501,27 @@ impl MetricName {
             Self::GithubRateLimitUsed => "github.ratelimit.used",
             Self::GithubRateLimitReset => "github.ratelimit.reset",
             Self::GithubRateLimitBreakerSkips => "github.ratelimit.breaker_skips",
+            Self::ForgeCalls => "loom.forge.calls",
+            Self::ForgeFacadeEvents => "loom.forge.facade.events",
             Self::MergeRedatePrs => "loom.merge.redate_prs",
             Self::MergeRedatesMax => "loom.merge.redates_max",
             Self::MergeTimeToLandMax => "loom.merge.time_to_land_max",
+            Self::EgressRequests => "loom.egress.requests",
+            Self::EgressTokens => "loom.egress.tokens",
+            Self::EgressLatency => "loom.egress.latency",
+            Self::EgressTtft => "loom.egress.ttft",
             Self::DaemonTaskAlive => "loom.daemon.task_alive",
             Self::DaemonTaskFaults => "loom.daemon.task_faults",
+            Self::DaemonIpcLatencyMax => "loom.daemon.ipc.latency_max",
+            Self::DaemonIpcLatency => "loom.daemon.ipc.latency",
+            Self::DaemonIpcRequests => "loom.daemon.ipc.requests",
+            Self::DaemonIpcStatusBuilds => "loom.daemon.ipc.status_builds",
+            Self::CodexSessionState => "loom.codex_session.state",
+            Self::CodexSessionRecord => "loom.codex_session.record",
+            Self::CodexSessionMountDrift => "loom.codex_session.mount_drift",
+            Self::CaptainGaugeAgeSeconds => "loom.captain.gauge_age_seconds",
+            Self::CaptainGaugeFallback => "loom.captain.gauge_fallback",
+            Self::AgentScopePeakMemoryBytes => "loom.agent_scope.peak_memory_bytes",
         }
     }
 
@@ -351,7 +547,16 @@ impl MetricName {
             | Self::ForgeStageDwellSamples
             | Self::QueueDispositionRowsDropped
             | Self::GithubRateLimitBreakerSkips
-            | Self::DaemonTaskFaults => MetricKind::DeltaCounter,
+            | Self::ForgeCalls
+            | Self::ForgeFacadeEvents
+            | Self::EgressRequests
+            | Self::EgressTokens
+            | Self::EgressLatency
+            | Self::EgressTtft
+            | Self::DaemonTaskFaults
+            | Self::DaemonIpcLatency
+            | Self::DaemonIpcRequests
+            | Self::DaemonIpcStatusBuilds => MetricKind::DeltaCounter,
             _ => MetricKind::Gauge,
         }
     }
@@ -367,15 +572,16 @@ impl MetricName {
             | Self::QueueDispatchWaitSamples => "{issue}",
             Self::DispatchMaxConcurrent => "{sweep}",
             Self::QueueIssues => "{issue}",
-            Self::QueueListingFailedRepos => "{repository}",
+            Self::QueueListingFailedRepos | Self::QueueListingIncompleteRepos => "{repository}",
             Self::LlmTokensInput
             | Self::LlmTokensOutput
             | Self::LlmTokensCacheRead
             | Self::LlmTokensCacheWrite => "{token}",
             Self::LlmRequests => "{request}",
             Self::PoolAccounts | Self::PoolExhaustions | Self::PoolAccountMarks => "{account}",
-            Self::PoolExhausted => "1",
-            Self::PoolExhaustedSeconds => "s",
+            Self::PoolExhausted | Self::PoolAccountState => "1",
+            Self::PoolExhaustedSeconds | Self::PoolPlanWindowSeconds => "s",
+            Self::PoolPlanTokenLimit => "{token}",
             Self::QueueOldestWait | Self::QueueDispatchWait => "s",
             Self::DispatchSlotTurnaround
             | Self::DispatchIdleSlotSeconds
@@ -386,11 +592,24 @@ impl MetricName {
             Self::GithubRateLimitRemaining | Self::GithubRateLimitUsed => "{request}",
             Self::GithubRateLimitReset => "s",
             Self::GithubRateLimitBreakerSkips => "{pass}",
+            Self::ForgeCalls => "{request}",
+            Self::ForgeFacadeEvents => "{event}",
             Self::MergeRedatePrs => "{pull_request}",
             Self::MergeRedatesMax => "{redate}",
             Self::MergeTimeToLandMax => "s",
+            Self::EgressRequests => "{request}",
+            Self::EgressTokens => "{token}",
+            Self::EgressLatency | Self::EgressTtft => "s",
             Self::DaemonTaskAlive => "1",
             Self::DaemonTaskFaults => "{fault}",
+            Self::DaemonIpcLatencyMax | Self::DaemonIpcLatency => "s",
+            Self::DaemonIpcRequests => "{request}",
+            Self::DaemonIpcStatusBuilds => "{build}",
+            Self::CodexSessionState => "1",
+            Self::CodexSessionRecord => "1",
+            Self::CodexSessionMountDrift => "{path}",
+            Self::CaptainGaugeAgeSeconds => "s",
+            Self::CaptainGaugeFallback => "1",
             _ => "By",
         }
     }
@@ -415,6 +634,9 @@ impl MetricName {
             Self::HostWorktreeVolumeTotalBytes => "Capacity of the worktree-root volume.",
             Self::QueueIssues => "Ready issues on the last work-finder tick, by state and reason.",
             Self::QueueListingFailedRepos => "Repos whose ready-issue listing failed last tick.",
+            Self::QueueListingIncompleteRepos => {
+                "Repos whose ready-issue listing came back partial last tick."
+            }
             Self::LlmTokensInput => "Uncached input tokens consumed, by provider and model.",
             Self::LlmTokensOutput => "Output tokens produced, by provider and model.",
             Self::LlmTokensCacheRead => "Cache-read input tokens, by provider and model.",
@@ -424,6 +646,9 @@ impl MetricName {
             Self::PoolExhausted => "1 when no account in the provider's pool is usable.",
             Self::PoolExhaustions => "Accounts that became exhausted since the last sample.",
             Self::PoolExhaustedSeconds => "Seconds the provider's pool read as exhausted.",
+            Self::PoolAccountState => "1 for the state a pool account is in, else 0.",
+            Self::PoolPlanTokenLimit => "Declared plan token allowance per window.",
+            Self::PoolPlanWindowSeconds => "Declared plan quota window.",
             Self::PoolAccountMarks => {
                 "Pool accounts marked out of selection, by provider and reason."
             }
@@ -441,11 +666,17 @@ impl MetricName {
             Self::QueueDispositionRowsDropped => {
                 "Ready-queue rows dropped from a disposition export pass, by reason."
             }
-            Self::GithubRateLimitRemaining => "GitHub API requests left, by resource and account.",
-            Self::GithubRateLimitUsed => "GitHub API requests spent this window, by resource.",
+            Self::GithubRateLimitRemaining => "GitHub API requests left, per bucket.",
+            Self::GithubRateLimitUsed => "GitHub API requests spent this window, per bucket.",
             Self::GithubRateLimitReset => "GitHub rate-limit window reset, Unix epoch seconds.",
             Self::GithubRateLimitBreakerSkips => {
                 "Job passes skipped by the rate-limit breaker, by job."
+            }
+            Self::ForgeCalls => {
+                "GitHub requests sent by the gh facade, by caller, bucket and outcome."
+            }
+            Self::ForgeFacadeEvents => {
+                "Named gh-facade events that are not forge calls, by reason (counter name)."
             }
             Self::MergeRedatePrs => "PRs re-dated in the trailing window, by landing state.",
             Self::MergeRedatesMax => "Most re-dates on one PR in the trailing window, by state.",
@@ -453,7 +684,36 @@ impl MetricName {
                 "Longest first-re-date-to-landing time of a PR landed in the window."
             }
             Self::DaemonTaskAlive => "1 while a long-running daemon loop is beating, by task.",
+            Self::EgressRequests => "Provider requests observed by the egress proxy, by seat.",
+            Self::EgressTokens => "Tokens read off provider responses by the egress proxy.",
+            Self::EgressLatency => "Summed egress-proxy request latency, by seat.",
+            Self::EgressTtft => "Summed egress-proxy time to first response byte, by seat.",
             Self::DaemonTaskFaults => "Faults of a long-running daemon loop, by task and reason.",
+            Self::DaemonIpcLatencyMax => "Slowest IPC request answered in the interval, by kind.",
+            Self::DaemonIpcLatency => "Summed IPC request latency, by request kind.",
+            Self::DaemonIpcRequests => "IPC requests answered, by request kind.",
+            Self::DaemonIpcStatusBuilds => "DaemonStatus builds finished, by outcome.",
+            Self::CodexSessionState => {
+                "Codex session container state per account: 1 for the current state \
+                 (running, stopped, restarting, missing, stale_mounts), 0 for the others."
+            }
+            Self::CodexSessionRecord => {
+                "1 while an operator hold or a drift-removal record stands for a Codex \
+                 session account, by kind."
+            }
+            Self::CodexSessionMountDrift => {
+                "Workspace paths a Codex session container is missing, mounts extra, or \
+                 mounts though denied, by kind."
+            }
+            Self::CaptainGaugeAgeSeconds => {
+                "Age of the fleet captain's last run of a fleet gauge job, by task."
+            }
+            Self::CaptainGaugeFallback => {
+                "1 while a dispatcher produces a fleet gauge job locally (captain stale)."
+            }
+            Self::AgentScopePeakMemoryBytes => {
+                "Peak memory (cgroup memory.peak) of one finished agent scope, by repo."
+            }
         }
     }
 }
@@ -482,6 +742,16 @@ impl MetricPoint {
         MetricPoint {
             name,
             value: MetricValue::Int(value),
+            labels: BTreeMap::new(),
+        }
+    }
+
+    /// An unlabelled floating-point point.
+    #[must_use]
+    pub fn double(name: MetricName, value: f64) -> Self {
+        MetricPoint {
+            name,
+            value: MetricValue::Double(value),
             labels: BTreeMap::new(),
         }
     }

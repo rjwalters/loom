@@ -1001,99 +1001,6 @@ impl PrClaimKind {
     }
 }
 
-/// Marker (Issue #4636/#4618) tagging a Judge/Doctor "standing down, not
-/// stomping" comment — evidence of *no* progress (a later pass declining to
-/// reclaim), not genuine activity. A comment containing this substring is
-/// excluded from [`ClaimedPr::most_recent_claim_activity_at`] (Issue #4638),
-/// mirroring `defaults/scripts/claim-staleness.sh`'s own stand-down exclusion
-/// (a substring match, not an exact marker+claim-timestamp match, so any
-/// stand-down comment for any claim generation is excluded).
-pub const STANDDOWN_MARKER_PREFIX: &str = "<!-- loom:standdown claim=";
-
-/// Marker (Issue #6514, adopted daemon-side by #6523) a **claimant** appends to
-/// its own progress comments to prove it is still alive:
-///
-/// ```text
-/// <!-- loom:claim-activity claim=<CLAIMED_AT> -->
-/// ```
-///
-/// This is the single shared definition on the Rust side, and it must stay
-/// byte-identical to `ACTIVITY_PREFIX` in `defaults/scripts/claim-staleness.sh`
-/// — the agent-side evaluator judge.md / doctor.md / curator.md drive, whose
-/// `marker` subcommand prints exactly the string [`claim_activity_marker`]
-/// builds. Both sides match on the claim's **own** `labeled`-event timestamp,
-/// so a marker left behind by an earlier claim generation can never refresh a
-/// later one.
-///
-/// Distinct from [`STANDDOWN_MARKER_PREFIX`] (a *later* pass declining to
-/// reclaim — evidence of no progress) and from [`VERDICT_MARKER_PREFIX`]
-/// (which tree a verdict describes).
-pub const CLAIM_ACTIVITY_MARKER_PREFIX: &str = "<!-- loom:claim-activity claim=";
-
-/// Render the full claim-activity marker for a claim labeled at `claimed_at` —
-/// the exact string `claim-staleness.sh marker` prints, and the substring
-/// [`most_recent_claim_activity_at`] requires a comment to contain before it
-/// counts as claimant liveness.
-///
-/// The timestamp is rendered RFC-3339 with second precision and a `Z` suffix,
-/// which is how the forge emits a timeline event's `created_at` and therefore
-/// how `claim-staleness.sh` (which interpolates that field verbatim, having
-/// validated it against `^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$`) renders it.
-#[must_use]
-pub fn claim_activity_marker(claimed_at: DateTime<Utc>) -> String {
-    format!(
-        "{CLAIM_ACTIVITY_MARKER_PREFIX}{} -->",
-        claimed_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-    )
-}
-
-/// One comment on a claimed PR, trimmed to the two fields the claim-activity
-/// scan needs. Constructed by [`forge::fetch_most_recent_claim_activity_at`]
-/// from `gh pr view --json comments`, and directly by the unit tests — the
-/// predicate itself ([`most_recent_claim_activity_at`]) is pure.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PrComment {
-    pub created_at: DateTime<Utc>,
-    pub body: String,
-}
-
-/// The timestamp of the most recent **claimant activity** comment posted after
-/// `claimed_at` — the pure predicate behind
-/// [`ClaimedPr::most_recent_claim_activity_at`] (Issue #6523).
-///
-/// A comment counts iff all three hold, mirroring
-/// `defaults/scripts/claim-staleness.sh` exactly:
-///
-/// 1. it was posted strictly after `claimed_at` (the claim's own `labeled`
-///    event — anything at or before it belongs to a previous claim
-///    generation);
-/// 2. it carries [`claim_activity_marker`]`(claimed_at)` — the claim-activity
-///    marker for **this** claim, not merely some claim;
-/// 3. it is not a stand-down comment ([`STANDDOWN_MARKER_PREFIX`]).
-///
-/// Condition 3 is redundant against a well-formed stand-down comment (which
-/// carries no activity marker) and is kept deliberately: it is the #4618
-/// regression guard, and a belt-and-braces exclusion costs nothing if a future
-/// stand-down body ever quotes an activity marker verbatim.
-///
-/// `None` when nothing qualifies — callers then anchor on `claim_labeled_at` /
-/// `updated_at` alone, i.e. an unrelated comment does not postpone reclamation
-/// at all.
-#[must_use]
-pub fn most_recent_claim_activity_at(
-    comments: &[PrComment],
-    claimed_at: DateTime<Utc>,
-) -> Option<DateTime<Utc>> {
-    let marker = claim_activity_marker(claimed_at);
-    comments
-        .iter()
-        .filter(|c| c.created_at > claimed_at)
-        .filter(|c| !c.body.contains(STANDDOWN_MARKER_PREFIX))
-        .filter(|c| c.body.contains(&marker))
-        .map(|c| c.created_at)
-        .max()
-}
-
 /// An open PR carrying a `loom:reviewing`/`loom:treating` claim label,
 /// trimmed to the fields the reconciliation decision needs.
 #[derive(Debug, Clone, PartialEq)]
@@ -1134,6 +1041,14 @@ pub struct ClaimedPr {
     /// preserving the #4618 regression guard: a claim with no claimant
     /// heartbeat since must still be reclaimed once stale.
     pub most_recent_claim_activity_at: Option<DateTime<Utc>>,
+    /// Newest trusted Judge-progress comment since the claim (Issue #10235,
+    /// `loom:reviewing` only), per [`most_recent_judge_activity_at`]. `None`
+    /// on fetch failure or no such comment (fail-open to the old rule).
+    pub most_recent_judge_activity_at: Option<DateTime<Utc>>,
+    /// Newest force-push of the head by the claimant since the claim
+    /// (Issue #10235), per [`most_recent_head_push_at`]. `None` on fetch
+    /// failure or no such push.
+    pub most_recent_head_push_at: Option<DateTime<Utc>>,
     /// The PR's head branch name, when available — the only join key to an
     /// issue number this pass has (see [`parse_issue_from_branch`]).
     pub head_ref_name: Option<String>,
@@ -1280,20 +1195,35 @@ pub fn decide_pr(
     // back to updated_at when BOTH are unavailable (timeline fetch
     // failure/partial response, or no comment evidence at all), matching the
     // pre-#4618 fail-open posture.
-    let anchor = match (pr.claim_labeled_at, pr.most_recent_claim_activity_at) {
-        (Some(a), Some(b)) => Some(a.max(b)),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => pr.updated_at,
-    };
+    // Issue #10235: also folds in Judge-progress comments and claimant head
+    // force-pushes; `pr_liveness` names which signal supplied the anchor.
+    let (anchor, signal) = pr_liveness(pr);
     match anchor {
         Some(freshness_at) => {
             let age_minutes = (now - freshness_at).num_seconds() as f64 / 60.0;
             if age_minutes >= stale_minutes {
+                log::warn!(
+                    "claim_reconciliation: PR #{} claim stale: deciding liveness signal \
+                     {signal:?} aged {age_minutes:.1}m >= {stale_minutes}m (#10235)",
+                    pr.number
+                );
                 PrReconcileAction::Reclaim(
                     dead_pid_reason.unwrap_or(PrReclaimReason::Aged { age_minutes }),
                 )
             } else {
+                if !matches!(signal, LivenessSignal::LabelAge | LivenessSignal::UpdatedAt) {
+                    let label_age = pr
+                        .claim_labeled_at
+                        .map(|l| (now - l).num_seconds() as f64 / 60.0);
+                    if label_age.is_some_and(|m| m >= stale_minutes) {
+                        log::info!(
+                            "claim_reconciliation: PR #{} claim kept past {stale_minutes}m by \
+                             liveness signal {signal:?} ({age_minutes:.1}m old; claim label \
+                             {label_age:?}m) (#10235)",
+                            pr.number
+                        );
+                    }
+                }
                 PrReconcileAction::Keep
             }
         }
@@ -1435,7 +1365,7 @@ impl VerdictKind {
 /// still stale, but clearing it would silently un-park the PR, so this pass
 /// leaves it alone (mirrors `verdict-staleness-guard.sh`'s `--clear`
 /// suppression and doctor.md's Priority-2 `PARK_LABELS` exclusion).
-pub const VERDICT_HOLD_LABELS: [&str; 3] = ["loom:blocked", "loom:operator", "loom:operator-only"];
+pub const VERDICT_HOLD_LABELS: [&str; 4] = pr_label_info::VERDICT_HOLDS;
 
 /// An open PR carrying a terminal verdict label, trimmed to the fields the
 /// staleness decision needs.
@@ -1533,6 +1463,12 @@ pub enum AnchorAction {
     /// marker comment. **Writes no labels**: the verdict is neither granted,
     /// revoked, nor re-queued — it merely becomes invalidatable from here on.
     Anchor { head_sha: String },
+    /// An unmarked **approval** (#9258): never anchored, re-queued instead —
+    /// `loom:pr` off, `loom:review-requested` on. Since #6382 `post-verdict.sh`
+    /// marks every verdict, so a markerless approval bypassed the mechanism
+    /// and approves no known tree; anchoring it would stamp an unreviewed head
+    /// as approved. Done by [`unanchored_verdict::handle_unverifiable`].
+    RequeueApproval,
     /// Leave it alone.
     Skip(AnchorSkipReason),
 }
@@ -1556,6 +1492,11 @@ pub enum AnchorAction {
 /// recover a head move that happened *before* the anchor — a verdict anchored
 /// late is anchored to a tree that may never have been reviewed, which is why
 /// this is a backstop for judge.md's marker rather than a replacement.
+///
+/// That residual is why an **approval** is never anchored (#9258): it would
+/// launder an approval posted at SHA A into a FRESH one at SHA B, so an
+/// unmarked `loom:pr` gets [`AnchorAction::RequeueApproval`] instead. A
+/// `loom:changes-requested` verdict cannot merge anything and still anchors.
 #[must_use]
 pub fn decide_anchor(pr: &VerdictPr) -> AnchorAction {
     if pr.marker_sha.as_deref().is_some_and(|s| !s.is_empty()) {
@@ -1566,6 +1507,9 @@ pub fn decide_anchor(pr: &VerdictPr) -> AnchorAction {
     }
     if !pr.marker_scan_ok {
         return AnchorAction::Skip(AnchorSkipReason::MarkerScanFailed);
+    }
+    if pr.kind == VerdictKind::Approved {
+        return AnchorAction::RequeueApproval;
     }
     match pr.head_sha.as_deref() {
         Some(head_sha) if !head_sha.is_empty() => AnchorAction::Anchor {
@@ -1609,6 +1553,8 @@ pub struct VerdictReconcileStats {
     /// (`pr_latency::segments::PrSegments::approval_invalidations`); the
     /// `redundant_comments_skipped` counter above does not.
     pub tree_identical_reanchors: usize,
+    /// Unmarked approvals re-queued instead of anchored (#9258).
+    pub unanchored_approvals_requeued: usize,
 }
 
 impl VerdictReconcileStats {
@@ -1616,7 +1562,8 @@ impl VerdictReconcileStats {
     /// exposure an operator needs to see.
     #[must_use]
     pub fn residual_unverifiable(&self) -> usize {
-        self.unverifiable.saturating_sub(self.anchored)
+        self.unverifiable
+            .saturating_sub(self.anchored + self.unanchored_approvals_requeued)
     }
 
     /// Fold another workspace's counters in.
@@ -1627,6 +1574,7 @@ impl VerdictReconcileStats {
         self.anchored += other.anchored;
         self.redundant_comments_skipped += other.redundant_comments_skipped;
         self.tree_identical_reanchors += other.tree_identical_reanchors;
+        self.unanchored_approvals_requeued += other.unanchored_approvals_requeued;
     }
 }
 
@@ -1907,11 +1855,12 @@ pub fn run_reconciliation_pass(fallback_root: &Path, is_startup: bool) {
     if verdict_stats.unverifiable > 0 {
         log::warn!(
             "claim_reconciliation: verdict-staleness pass found {} verdict(s) with no \
-             verdict-sha marker across {} workspace(s) — anchored {} to their current head, {} \
-             still UNVERIFIABLE (a verdict nothing can invalidate; see #6319)",
+             verdict-sha marker across {} workspace(s) — anchored {} to their current head, \
+             re-queued {} unmarked approval(s) (#9258), {} still UNVERIFIABLE (see #6319)",
             verdict_stats.unverifiable,
             roots.len(),
             verdict_stats.anchored,
+            verdict_stats.unanchored_approvals_requeued,
             verdict_stats.residual_unverifiable()
         );
     }
@@ -2004,6 +1953,14 @@ pub fn spawn_periodic_reconciliation_task(
 /// decide whether its `loom:review-requested` safety net may fire — split
 /// into its own file per the file-size ratchet (`.loom/docs/file-size-policy.md`)
 /// rather than growing `forge` inline.
+mod liveness;
+pub use liveness::{
+    claim_activity_marker, extra_liveness_at, most_recent_claim_activity_at,
+    most_recent_head_push_at, most_recent_judge_activity_at, pr_liveness, LivenessSignal,
+    PrComment, TimelineEvent, CLAIM_ACTIVITY_MARKER_PREFIX, JUDGE_ACTIVITY_MARKER_PREFIXES,
+    STANDDOWN_MARKER_PREFIX,
+};
+
 mod pr_label_info;
 
 /// The #8900 auto-merge disarm hook
@@ -2023,6 +1980,11 @@ mod verdict_stale_comment;
 /// #5686 clear it falls through to — a sibling file per the file-size ratchet,
 /// leaving a single dispatch call in the match arm here.
 mod verdict_invalidation;
+
+/// The `Keep(Unverifiable)` arm of [`forge::reconcile_pr_verdicts`]: anchor an
+/// unmarked rejection (#6319), re-queue an unmarked approval (#9258) — a
+/// sibling file per the file-size ratchet.
+mod unanchored_verdict;
 
 pub mod merge_sequence;
 /// The #8922 base-conflict pass for `loom:review-requested` PRs — a sibling
@@ -2053,12 +2015,15 @@ pub(crate) mod read_cache;
 /// best-effort `Command` wrapper.
 pub mod forge {
     use super::gh_call;
+    pub(super) use super::liveness::{
+        fetch_most_recent_claim_activity_at, fetch_most_recent_head_push_at,
+        fetch_most_recent_judge_activity_at,
+    };
     use super::{
-        apply_live_claim_veto, classify_lease_evidence, decide_anchor, decide_verdict,
-        extract_latest_verdict_sha, most_recent_claim_activity_at, plan, plan_pr,
-        resolve_lease_ttl_minutes, resolve_no_progress_grace_minutes, resolve_stale_hours,
-        verdict_anchoring_enabled, verdict_staleness_enabled, AnchorAction, ClaimedPr,
-        LeaseEvidence, NoProgressEvidence, PrClaimKind, PrClaimOutcome, PrComment, PrReclaimReason,
+        apply_live_claim_veto, classify_lease_evidence, decide_verdict, extract_latest_verdict_sha,
+        plan, plan_pr, resolve_lease_ttl_minutes, resolve_no_progress_grace_minutes,
+        resolve_stale_hours, verdict_anchoring_enabled, verdict_staleness_enabled, ClaimedPr,
+        LeaseEvidence, NoProgressEvidence, PrClaimKind, PrClaimOutcome, PrReclaimReason,
         PrReconcileAction, ReclaimReason, ReconcileAction, VerdictAction, VerdictKeepReason,
         VerdictKind, VerdictPr, VerdictReconcileStats, LEASE_MARKER_PREFIX, VERDICT_HOLD_LABELS,
     };
@@ -2082,24 +2047,10 @@ pub mod forge {
     /// where by construction the Builder never completed — so a
     /// branch-name match is sufficient; there is no earlier-attempt PR to miss.
     fn first_open_linked_pr(gh_bin: &Path, root: &Path, issue: u32) -> Option<bool> {
-        let head = format!("feature/issue-{issue}");
-        let stdout =
-            gh_call::ok_stdout(gh_call::read("claim.pr_list_by_head", gh_bin, root).args([
-                "pr",
-                "list",
-                "--state",
-                "open",
-                "--head",
-                &head,
-                "--json",
-                "number",
-                "--jq",
-                ".[].number",
-            ]))?;
-        let has_open = String::from_utf8_lossy(&stdout)
-            .lines()
-            .any(|l| l.trim().parse::<u32>().is_ok());
-        Some(has_open)
+        // #10382: REST `pulls?head=` (was GraphQL `gh pr list --head`).
+        let caller = "claim.pr_list_by_head";
+        let prs = crate::reclaim_pr_warning::open_prs_on_issue_branch(caller, gh_bin, root, issue);
+        prs.ok().map(|v| !v.is_empty())
     }
 
     /// Flip an issue's claim label from `loom:building` back to
@@ -2168,7 +2119,7 @@ pub mod forge {
         }
         let n = issue.to_string();
         let out = gh_call::output(
-            gh_call::read("claim.issue_labels", gh_bin, root)
+            gh_call::read_own_write("claim.issue_labels", gh_bin, root)
                 .args(["issue", "view", &n, "--json", "labels"])
                 .args(gh_call::loom_repo_flag()),
         )?;
@@ -2498,7 +2449,9 @@ pub mod forge {
                 continue;
             }
             match crate::reclaim_pr_warning::reclaim_and_warn(gh_bin, root, issue_number) {
-                Ok(()) => {
+                // #11743: a frozen skip wrote nothing — not a reclaim.
+                Ok(crate::reclaim_pr_warning::Reclaim::Frozen) => {}
+                Ok(crate::reclaim_pr_warning::Reclaim::Released) => {
                     reclaimed += 1;
                     // #4348 acceptance criterion: WARN-level, with the
                     // issue number, last-known pid, and (when the evidence
@@ -2549,7 +2502,8 @@ pub mod forge {
     fn list_prs_with_label(gh_bin: &Path, root: &Path, label: &str) -> Result<Vec<ClaimedPr>> {
         // #10349: the ETag'd REST listing, filtered here (was GraphQL `gh pr list`).
         let rows = super::open_pr_listing::list_with_label(gh_bin, root, label)?;
-        Ok(rows
+        // #11743: a frozen PR is neither planned nor reclaimed.
+        Ok(super::pr_label_info::drop_frozen_claims(rows, label)
             .into_iter()
             .map(|r| {
                 // Issue #4638: activity is only worth fetching when there is a
@@ -2561,11 +2515,43 @@ pub mod forge {
                 let key = super::read_cache::key(root, r.number, label, r.updated_at.as_deref());
                 let claim_labeled_at = super::read_cache::CLAIM_LABELED
                     .get_or(key.clone(), || fetch_claim_labeled_at(gh_bin, root, r.number, label));
+                let key2 = key.clone();
                 let most_recent_claim_activity_at = claim_labeled_at.and_then(|since| {
                     super::read_cache::CLAIM_ACTIVITY.get_or(key, || {
                         fetch_most_recent_claim_activity_at(gh_bin, root, r.number, since)
                     })
                 });
+                let is_reviewing = label == "loom:reviewing";
+                // The extra signals only matter once the claim label itself has
+                // aged past the TTL, so don't spend API reads on younger claims.
+                let stale_after = if is_reviewing {
+                    PrClaimKind::Reviewing.stale_minutes()
+                } else {
+                    PrClaimKind::Treating.stale_minutes()
+                };
+                let aged = |since: DateTime<Utc>| {
+                    (chrono::Utc::now() - since).num_seconds() as f64 / 60.0 >= stale_after
+                };
+                let (most_recent_judge_activity_at, most_recent_head_push_at) =
+                    match claim_labeled_at.filter(|s| aged(*s)) {
+                        Some(since) => (
+                            if is_reviewing {
+                                super::read_cache::JUDGE_ACTIVITY.get_or(key2.clone(), || {
+                                    fetch_most_recent_judge_activity_at(
+                                        gh_bin, root, r.number, since, None,
+                                    )
+                                })
+                            } else {
+                                None
+                            },
+                            super::read_cache::HEAD_PUSH.get_or(key2, || {
+                                fetch_most_recent_head_push_at(
+                                    gh_bin, root, r.number, label, since, None,
+                                )
+                            }),
+                        ),
+                        None => (None, None),
+                    };
                 ClaimedPr {
                     number: r.number,
                     updated_at: r
@@ -2575,6 +2561,8 @@ pub mod forge {
                         .map(|dt| dt.with_timezone(&chrono::Utc)),
                     claim_labeled_at,
                     most_recent_claim_activity_at,
+                    most_recent_judge_activity_at,
+                    most_recent_head_push_at,
                     head_ref_name: r.head_ref,
                 }
             })
@@ -2742,72 +2730,6 @@ pub mod forge {
             Some(leases) => crate::comment_trust::records::max_timestamp(&leases, "updated_at")
                 .map_or(LeaseProbe::NotFound, LeaseProbe::Found),
         }
-    }
-
-    /// Best-effort fetch of the most recent **claimant activity** comment
-    /// posted on `pr_number` after `since` (Issue #4638, narrowed by #6523) —
-    /// [`ClaimedPr::most_recent_claim_activity_at`], the evidence
-    /// [`decide_pr`]'s age gate uses alongside `claim_labeled_at` to avoid
-    /// reclaiming a genuinely live, non-pid-joinable claimant.
-    ///
-    /// The `gh` call only *narrows* (comments posted after `since`, to bound
-    /// the payload); the decision itself is the pure
-    /// [`most_recent_claim_activity_at`], so the exact rule that ships is the
-    /// one the unit tests exercise. Returns `None` on any
-    /// failure/timeout/unparseable-output, or when no comment since `since`
-    /// carried this claim's [`super::claim_activity_marker`] — callers then
-    /// fall back to `claim_labeled_at`/`updated_at` alone, preserving the
-    /// #4618 regression guard (a claim with no claimant heartbeat since must
-    /// still age out and be reclaimed).
-    ///
-    /// #9548: the REST listing (not `gh pr view --json comments`, which cannot
-    /// name an App author), and only trusted authors' comments count: an
-    /// outsider's activity marker cannot keep a dead claim alive.
-    pub(super) fn fetch_most_recent_claim_activity_at(
-        gh_bin: &Path,
-        root: &Path,
-        pr_number: u32,
-        since: DateTime<Utc>,
-    ) -> Option<DateTime<Utc>> {
-        // Render `since` in exactly the shape the forge emits for `created_at`
-        // (`...Z`, second precision) so the jq `>` comparison — which is a raw
-        // *string* comparison — orders correctly. `to_rfc3339()` would render
-        // the same instant with a `+00:00` offset suffix, which sorts *before*
-        // a `Z`-suffixed timestamp of the identical second and so would
-        // misclassify a comment posted in the same second as the claim label.
-        // (This is also the exact rendering `claim_activity_marker` embeds.)
-        let since_iso = since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        // `since=` lets the forge skip older comments (it filters on
-        // `updated_at`, a superset of the `created_at` filter below).
-        let path = format!(
-            "repos/{{owner}}/{{repo}}/issues/{pr_number}/comments?per_page=100&since={since_iso}"
-        );
-        let jq = format!(
-            r#".[] | select(.created_at > "{since_iso}") | {{created_at, body, {}}}"#,
-            crate::comment_trust::records::AUTHOR_JQ
-        );
-        let out =
-            gh_call::ok_stdout(gh_call::read("claim.pr_activity_comments", gh_bin, root).args([
-                "api",
-                &path,
-                "--paginate",
-                "--jq",
-                &jq,
-            ]))?;
-        let rows = crate::comment_trust::TrustPolicy::for_root(root).trusted_records(&out)?;
-        let comments: Vec<PrComment> = rows
-            .iter()
-            .filter_map(|r| {
-                Some(PrComment {
-                    created_at: crate::comment_trust::records::max_timestamp(
-                        std::slice::from_ref(r),
-                        "created_at",
-                    )?,
-                    body: r.get("body")?.as_str().unwrap_or_default().to_string(),
-                })
-            })
-            .collect();
-        most_recent_claim_activity_at(&comments, since)
     }
 
     fn add_label(gh_bin: &Path, root: &Path, pr_number: u32, label: &str) -> Result<()> {
@@ -3086,53 +3008,6 @@ pub mod forge {
             .collect())
     }
 
-    /// Anchor one unmarked verdict to the PR's current head (Issue #6319):
-    /// post a comment carrying the `<!-- loom:verdict-sha ... -->` marker
-    /// judge.md was supposed to write, so the verdict becomes invalidatable
-    /// by the ordinary staleness path from here on.
-    ///
-    /// **No label is touched.** This is the whole safety argument: the
-    /// verdict label was already there and stays exactly as it was, so
-    /// anchoring cannot approve, reject, or un-park anything. The only state
-    /// it changes is "this verdict can now be checked".
-    ///
-    /// Idempotent by construction — the marker it posts is precisely what
-    /// [`extract_latest_verdict_sha`] scans for, so the next pass reads the
-    /// verdict as `Fresh` and never anchors it twice.
-    fn anchor_verdict(gh_bin: &Path, root: &Path, pr: &VerdictPr, head_sha: &str) -> Result<()> {
-        let label = pr.kind.label();
-        let token = pr.kind.marker_token();
-        let body = format!(
-            "<!-- loom:verdict-sha sha={head_sha} verdict={token} -->\n\
-             **Verdict anchored to the current head — no marker had been recorded**\n\n\
-             This PR carries `{label}`, but no verdict-SHA marker was ever written for that \
-             verdict, so it was **unverifiable**: nothing could tell whether it still described \
-             the tree in front of it, and it would have survived a force-push undetected — the \
-             exact pre-#5686 hazard.\n\n\
-             This comment records the head SHA as of now, `{head_sha}`. It is **not** a review \
-             and implies no judgment about this tree: the `{label}` label is unchanged. From \
-             here on the verdict is invalidatable — if the head moves off `{head_sha}`, the \
-             stale-verdict pass clears `{label}` and returns the PR to `loom:review-requested`.\n\n\
-             Anchoring bounds future exposure; it cannot reconstruct which tree was actually \
-             reviewed. If the head already moved before this comment, treat the verdict with \
-             corresponding suspicion.\n\n\
-             ---\n\
-             *Automated by loom-daemon claim reconciliation (#6319)*"
-        );
-
-        let n = pr.number.to_string();
-        let out = gh_call::output(
-            gh_call::write("verdict.anchor_comment", gh_bin, root)
-                .args(["pr", "comment", &n, "--body", &body])
-                .args(gh_call::loom_repo_flag()),
-        )?;
-        if !out.status.success() {
-            let (root, err) = (root.display(), gh_call::stderr(&out));
-            return Err(anyhow!("gh pr comment (anchor {label}) failed for #{n} in {root}: {err}"));
-        }
-        Ok(())
-    }
-
     /// Reconcile stale `loom:pr` / `loom:changes-requested` verdicts for one
     /// registered workspace `root` (Issue #5686) — the always-on daemon
     /// backstop behind judge.md's Stale-Verdict Sweep, doctor.md's
@@ -3147,8 +3022,9 @@ pub mod forge {
     ///
     /// An unmarked verdict is additionally **counted and anchored** (Issue
     /// #6319) rather than silently kept: see [`decide_anchor`] /
-    /// [`anchor_verdict`]. Anchoring writes no labels, so the staleness
-    /// behavior of every already-marked verdict is untouched.
+    /// [`super::unanchored_verdict`]. Anchoring writes no labels, so the
+    /// staleness behavior of every already-marked verdict is untouched; an
+    /// unmarked APPROVAL is re-queued instead of anchored (#9258).
     ///
     /// # Held PRs are NOT covered by this pass (pre-existing, #8900 scope note)
     ///
@@ -3225,51 +3101,9 @@ pub mod forge {
                         &mut stats,
                     ),
                     VerdictAction::Keep(VerdictKeepReason::Unverifiable) => {
-                        // Count only what we POSITIVELY know is unanchored. A
-                        // held PR's comments are never fetched and a failed
-                        // fetch looks identical to "no marker" — folding
-                        // either into the counter would turn an API outage
-                        // into a fake integrity alarm.
-                        if !pr.marker_scan_ok {
-                            continue;
-                        }
-                        stats.unverifiable += 1;
-                        log::warn!(
-                            "claim_reconciliation: PR #{} in {} carries {} with NO verdict-sha \
-                             marker — the verdict is UNVERIFIABLE and would survive a \
-                             force-push undetected (#6319)",
-                            pr.number,
-                            root.display(),
-                            pr.kind.label(),
+                        super::unanchored_verdict::handle_unverifiable(
+                            gh_bin, root, &pr, anchoring, &mut stats,
                         );
-                        if !anchoring {
-                            continue;
-                        }
-                        let AnchorAction::Anchor { head_sha } = decide_anchor(&pr) else {
-                            continue;
-                        };
-                        match anchor_verdict(gh_bin, root, &pr, &head_sha) {
-                            Ok(()) => {
-                                stats.anchored += 1;
-                                log::info!(
-                                    "claim_reconciliation: anchored PR #{}'s {} verdict to \
-                                     {head_sha} in {} — it is now invalidatable by the ordinary \
-                                     staleness pass (#6319)",
-                                    pr.number,
-                                    pr.kind.label(),
-                                    root.display(),
-                                );
-                            }
-                            Err(e) => {
-                                log::warn!(
-                                    "claim_reconciliation: failed to anchor PR #{}'s {} verdict \
-                                     in {}: {e} — it stays UNVERIFIABLE until the next tick",
-                                    pr.number,
-                                    pr.kind.label(),
-                                    root.display()
-                                );
-                            }
-                        }
                     }
                     VerdictAction::Keep(_) => {}
                 }
@@ -3294,6 +3128,17 @@ mod repo_env_tests;
 #[cfg(test)]
 mod verdict_dedup_tests;
 
+#[cfg(test)]
+mod liveness_tests;
+
 // #9548: only trusted authors' verdict markers count.
 #[cfg(test)]
 mod trusted_comments_tests;
+
+// #10382: the pass family's files / by-head reads are REST-only.
+#[cfg(test)]
+mod rest_only_tests;
+
+// #9258: an unmarked approval is re-queued, never anchored.
+#[cfg(test)]
+mod unanchored_verdict_tests;

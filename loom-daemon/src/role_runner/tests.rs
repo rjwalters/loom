@@ -150,42 +150,16 @@ fn had_ever_succeeded_is_independent_per_role_and_root() {
     assert!(!had_ever_succeeded("judge", &root_b));
 }
 
-/// RAII guard that clears the ambient `LOOM_RUNTIME` env var for the
-/// scope of a test and restores whatever value (if any) it previously
-/// had — including across a mid-test assertion panic, since Rust
-/// unwinds through `Drop`. Some host/dev-container shells export
-/// `LOOM_RUNTIME` (as the `spawn-worker.sh` runtime selector), and
-/// without this guard that ambient value silently outranks the
-/// `runtimes.roles` config precedence this test exercises (#4739).
-///
-/// It also points `LOOM_CODEX_PROFILE_ROOT` at an empty tempdir (#9964): a
-/// codex-admitted role resolves the profile root, and these tests must never
-/// read the host's real `~/.loom/codex-profiles`.
-struct ClearedLoomRuntimeEnv(
-    Option<String>,
-    #[allow(dead_code)] crate::tokens_pool::profile_root_env::ProfileRootEnv,
-    #[allow(dead_code)] tempfile::TempDir,
-);
-
-impl ClearedLoomRuntimeEnv {
-    fn new() -> Self {
-        let prior = std::env::var("LOOM_RUNTIME").ok();
-        std::env::remove_var("LOOM_RUNTIME");
-        let profiles = tempfile::tempdir().unwrap();
-        let profile_root =
-            crate::tokens_pool::profile_root_env::ProfileRootEnv::set(profiles.path());
-        Self(prior, profile_root, profiles)
-    }
-}
-
-impl Drop for ClearedLoomRuntimeEnv {
-    fn drop(&mut self) {
-        match self.0.take() {
-            Some(v) => std::env::set_var("LOOM_RUNTIME", v),
-            None => std::env::remove_var("LOOM_RUNTIME"),
-        }
-    }
-}
+// RAII guard that clears the ambient runtime-selection env vars for the scope
+// of a test and restores them on drop. Some host/dev-container shells export
+// `LOOM_RUNTIME` (the `spawn-worker.sh` runtime selector) and every Loom agent
+// session is spawned with it pinned, where that ambient value silently outranks
+// the `runtimes.roles` config precedence these tests exercise (#4739) — or
+// erases the `--model` pin they assert, by classifying the default-model branch
+// as a native runtime (#9360). The local copy this alias replaced cleared only
+// the global var; see the shared module for why the per-role
+// `LOOM_RUNTIME_<ROLE>` pins must go too.
+use crate::runtime_selection_test_support::ClearedRuntimeSelectionEnv as ClearedLoomRuntimeEnv;
 
 /// As [`ClearedLoomRuntimeEnv`] but for `GH_CONFIG_DIR` (#5508): the test
 /// process may itself be running under a `GH_CONFIG_DIR` (a developer
@@ -813,6 +787,20 @@ fn test_roles_source_label_names_the_project_tier_over_legacy() {
 }
 
 #[test]
+fn test_roles_source_label_names_the_per_repo_fleet_tier_over_project() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_project_config(tmp.path(), r#"{"autonomous": {"roleRunner": {"roles": ["curator"]}}}"#);
+    let fleet = tmp
+        .path()
+        .join(crate::config_resolver::FLEET_REPO_CONFIG_REL);
+    std::fs::create_dir_all(fleet.parent().unwrap()).unwrap();
+    std::fs::write(&fleet, r#"{"autonomous": {"roleRunner": {"roles": ["judge"]}}}"#).unwrap();
+    let label = roles_source_label(tmp.path());
+    assert!(label.starts_with("per-repo fleet tier ("), "{label}");
+    assert!(label.contains("fleet-repo.json"), "{label}");
+}
+
+#[test]
 fn test_missing_defaults_for_loom_repos_own_pinned_list_names_only_auditor_and_hermit() {
     // The exact pinned list from this repo's own `.loom/config.json`
     // (`["curator","champion","judge","doctor","guide"]`) — missing only
@@ -1254,10 +1242,6 @@ fn test_builtin_intervals_are_per_role_not_uniform() {
             ("hermit", 600),
             ("guide", 900),
             ("architect", 3600),
-            // #7947: a *listening* cadence, not a work cadence — each tick is
-            // a short `concierge listen` window, so it sits below the 5–15 min
-            // band's intent without violating it.
-            ("concierge", 300),
         ],
         "built-in per-role intervals drifted — update defaults/docs/daemon-reference.md's \
              role-runner table in the same change (#6204)"
@@ -1797,16 +1781,17 @@ fn test_default_roles_includes_architect_as_idle_only() {
         "#5656: architect must be idle-addressable ONLY — an interval-default architect \
              floods every unpinned repo's backlog with speculative proposals"
     );
-    // Two shipped roles are excluded from the "unset `roles` ⇒ all defaults"
-    // fallback: architect (#5656, floods the backlog) and concierge (#7947, an
-    // inbound control channel wired to a chat room). Every other role is an
-    // interval default. `concierge_gate.rs` pins WHICH two, by name.
+    // Exactly one shipped role is excluded from the "unset `roles` ⇒ all
+    // defaults" fallback: architect (#5656, floods the backlog). Every other
+    // role is an interval default.
+    let carve_outs: Vec<&str> = DEFAULT_ROLES
+        .iter()
+        .filter(|s| !s.is_interval_default())
+        .map(|s| s.name)
+        .collect();
     assert_eq!(
-        DEFAULT_ROLES
-            .iter()
-            .filter(|s| !s.is_interval_default())
-            .count(),
-        2,
+        carve_outs,
+        vec!["architect"],
         "a new non-interval-default role needs its own docs/table update \
          (see daemon-reference.md)"
     );
@@ -2846,6 +2831,39 @@ fn test_plan_idle_runs_fires_on_edge_when_enabled() {
 
 #[test]
 #[serial]
+fn test_plan_idle_runs_held_workspace_suppresses() {
+    use crate::workspace_hold::{set_for_test, HeldCopy, HoldKind, WorkspaceHold};
+    std::env::remove_var(ROLE_RUNNER_ENABLE_ENV);
+    let mut t = IdleTrigger::new();
+    let set = new_in_progress_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let cfg = on_idle_config(Some(true), vec!["champion"]);
+    let now = Instant::now();
+    set_for_test(
+        root,
+        Some(WorkspaceHold {
+            kind: HoldKind::DaemonTooOld,
+            copy: HeldCopy::Checkout,
+            since: chrono::Utc::now(),
+            detail: "test".to_string(),
+            verdict_at: chrono::Utc::now(),
+        }),
+    );
+    // Busy, then the drain's idle edge: the hold must not launch the role.
+    assert!(plan_idle_runs(&mut t, &set, root, &cfg, false, false, now).is_empty());
+    assert!(plan_idle_runs(&mut t, &set, root, &cfg, true, false, now).is_empty());
+    // The edge was consumed, so lifting the hold does not replay it ...
+    set_for_test(root, None);
+    assert!(plan_idle_runs(&mut t, &set, root, &cfg, true, false, now).is_empty());
+    // ... but the next real busy -> idle edge fires again.
+    assert!(plan_idle_runs(&mut t, &set, root, &cfg, false, false, now).is_empty());
+    let plan = plan_idle_runs(&mut t, &set, root, &cfg, true, false, now);
+    assert_eq!(plan.iter().map(|(s, _)| s.name).collect::<Vec<_>>(), vec!["champion"]);
+}
+
+#[test]
+#[serial]
 fn test_plan_idle_runs_drain_suppresses() {
     std::env::remove_var(ROLE_RUNNER_ENABLE_ENV);
     let mut t = IdleTrigger::new();
@@ -3207,7 +3225,7 @@ async fn test_interval_loop_skips_while_guard_held() {
     in_progress
         .lock()
         .unwrap()
-        .insert((root.clone(), "champion"));
+        .insert((root.clone(), "champion", 0));
     let drain = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let handle = spawn_role_task(
         runner,
@@ -3227,7 +3245,7 @@ async fn test_interval_loop_skips_while_guard_held() {
     );
 
     // Release the guard — dispatch resumes, proving the gate (not a dead loop).
-    in_progress.lock().unwrap().remove(&(root, "champion"));
+    in_progress.lock().unwrap().remove(&(root, "champion", 0));
     wait_for_calls(&calls, 1, Duration::from_secs(2)).await;
 
     handle.abort();
@@ -4268,10 +4286,15 @@ fn tick_admitted(root: &Path) -> bool {
     decision.is_some()
 }
 
-mod concierge_gate;
+mod archived_gate;
 mod invoke;
+mod llm_gateway;
 mod model_resolution;
+mod pipeline_idle_gate;
 mod prompt_cache_prefix;
 mod roster_fence;
+mod run_target_dir;
 mod shard_dispatch;
 mod tick_ring;
+mod triggers;
+mod workspace_hold;

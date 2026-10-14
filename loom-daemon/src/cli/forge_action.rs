@@ -6,8 +6,30 @@
 //! nothing: they are added here, beside the verbs they sit with.
 
 use anyhow::Result;
-use clap::Subcommand;
+use clap::{Args, Subcommand};
 use std::path::PathBuf;
+
+/// `forge priority-labels` flags. A separate `Args` struct (not inline variant
+/// fields) so clap's derived `ForgeAction` parser keeps its stack frame small:
+/// inline fields pushed the full-`Cli` parse tests past the 2 MiB test-thread
+/// stack (`fatal runtime error: stack overflow`, #10546).
+#[derive(Args, Debug)]
+pub(crate) struct PriorityLabelsCli {
+    /// Read the PR body from PATH (`-` = stdin); its closing refs and
+    /// this repo's `Loom-Issue:` trailers name the issues.
+    #[arg(long, value_name = "PATH")]
+    body_file: Option<PathBuf>,
+    /// An issue to copy from (repeatable), besides the body's.
+    #[arg(long = "issue", value_name = "N")]
+    issues: Vec<u32>,
+    /// The PR's `owner/repo` (default: the checkout's).
+    #[arg(long, value_name = "OWNER/REPO")]
+    repo: Option<String>,
+    /// Accepted and ignored since #11104 (it posted the retired
+    /// inherited-star audit comment).
+    #[arg(long, value_name = "URL|OWNER/REPO#N|N")]
+    audit_pr: Option<String>,
+}
 
 /// Sub-actions for `loom-daemon forge`.
 ///
@@ -67,6 +89,27 @@ pub(crate) enum ForgeAction {
         issue: u32,
     },
 
+    /// `forge priority-labels [--body-file PATH] [--issue N]... [--repo NWO]
+    /// [--audit-pr URL]` (#10518) — the priority labels (the operator star and
+    /// its levels) a new PR copies from every issue its body closes; one per
+    /// line. `Part of #N` copies nothing. A failed lookup warns on stderr,
+    /// naming the issue, and still exits 0 (fail open). `--audit-pr` is
+    /// accepted and does nothing (#11104). See
+    /// `loom_daemon::forge_priority_labels`.
+    #[command(name = "priority-labels")]
+    PriorityLabels(PriorityLabelsCli),
+
+    /// `forge rebase-guard --base <ref> [--old <ref>] [--new <ref>]` (#9282):
+    /// would force-pushing `<new>` over `<old>` discard work? Reads local git
+    /// objects only; no forge call, no fetch, no write.
+    ///
+    /// Exit 0 is BLOCKED and prints `EMPTIED` (the rebase left the PR with no
+    /// content) or `RESOLUTION_DISCARDED <merge-sha>` (a hand-made conflict
+    /// resolution is not carried by `<new>`); exit 1 is verified safe; any
+    /// other exit is unanswered. See `loom_daemon::rebase_guard`.
+    #[command(name = "rebase-guard")]
+    RebaseGuard(loom_daemon::rebase_guard::Args),
+
     /// `forge pr-congestion [--json] [--max-open N] [--max-points N]` — the
     /// #9063 **Phase 1** congestion signal, report-only: approved-queue
     /// depth (`loom:pr`), story points awaiting merge, and a path-disjoint
@@ -100,9 +143,10 @@ pub(crate) enum ForgeAction {
     ///
     /// Prints exactly one sentinel on stdout — `LOOM-CHECKS-GREEN <sha>`,
     /// `-NONE <sha>`, `-RED <sha> <names>`, `-TIMEOUT <sha> <pending>`,
-    /// `-ERROR <reason>`, `-HEAD-MOVED <old> <new>` — and, on RED, one
+    /// `-ERROR <reason>`, `-HEAD-MOVED <old> <new>`, `-NO-RUN <sha>` (no
+    /// GitHub Actions run for the head, #11389) — and, on RED, one
     /// `<name>\t<url>\t<run_id>` line per failing check on stderr. Branch
-    /// on the sentinel, not the exit code (0/1/2/3/4). `--timeout 0` takes
+    /// on the sentinel, not the exit code (0/1/2/3/4/5). `--timeout 0` takes
     /// one snapshot. See `loom_daemon::forge_wait_checks`.
     #[command(name = "wait-checks")]
     WaitChecks {
@@ -134,6 +178,35 @@ pub(crate) enum ForgeAction {
         /// Poll interval cap, seconds (env `LOOM_WAIT_CHECKS_MAX`, default 120).
         #[arg(long, value_name = "SECS")]
         max_interval: Option<u64>,
+    },
+
+    /// `forge rerun <RUN_ID> [--failed]` / `forge rerun --job <JOB_ID>`
+    /// (#10633) — re-run a workflow run, its failed jobs, or one job in
+    /// place, on the writer credential.
+    ///
+    /// Prints exactly one sentinel on stdout — `LOOM-RERUN-OK <run|job> <id>`
+    /// (0), `LOOM-RERUN-DENIED <class> <detail>` (1 for `permission` /
+    /// `credential` / `forbidden`, 2 for `secondary-rate-limit` /
+    /// `rate-limit`), `LOOM-RERUN-ERROR <reason>` (3). A `permission`
+    /// detail names the App permission to grant. See
+    /// `loom_daemon::forge_rerun`.
+    #[command(name = "rerun")]
+    Rerun {
+        /// The workflow run id (omit with `--job`).
+        #[arg(value_name = "RUN_ID", required_unless_present = "job")]
+        run_id: Option<u64>,
+
+        /// Re-run only the run's failed and cancelled jobs.
+        #[arg(long, conflicts_with = "job")]
+        failed: bool,
+
+        /// Re-run one job by id instead of a run.
+        #[arg(long, value_name = "JOB_ID", conflicts_with = "run_id")]
+        job: Option<u64>,
+
+        /// `owner/repo` (default: `LOOM_REPO`, else the `origin` remote).
+        #[arg(long)]
+        repo: Option<String>,
     },
 
     /// `forge check-claim <issue> [--force-claim]` — the aggregated
@@ -361,6 +434,34 @@ pub(crate) enum ForgeAction {
         head: String,
     },
 
+    /// `forge version-only-diff <pr> <file> [--repo OWNER/REPO]` (#9611) —
+    /// is `<file>`'s diff in PR `<pr>` nothing but a version-string change?
+    /// Champion criterion #3's version-only carve-out (#6147).
+    ///
+    /// Exits 0 (`VERSION_ONLY=1`) ONLY when `<file>` is exactly one of the six
+    /// version-bearing files (`package.json`, `mcp-loom/package.json`,
+    /// `mcp-loom/package-lock.json`, `loom-daemon/Cargo.toml`,
+    /// `loom-api/Cargo.toml`, `Cargo.lock`), the paginated
+    /// `pulls/<pr>/files` read succeeded, the file carries a non-empty
+    /// `patch`, and every changed line is the version line. Every other
+    /// outcome — a forge error, unparseable JSON, the file absent, no
+    /// `patch`, no changed line, any other change — exits 1 with the reason
+    /// on stderr. Callers treat any non-zero exit as "not eligible".
+    #[command(name = "version-only-diff")]
+    VersionOnlyDiff {
+        /// Pull request number.
+        #[arg(value_name = "PR")]
+        pr_number: u32,
+
+        /// Repo-relative path of the changed file.
+        #[arg(value_name = "FILE")]
+        file: String,
+
+        /// `OWNER/REPO` (default: resolved by `gh` from the current repo).
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+    },
+
     /// `forge merge-method --repo <nwo> [--requested squash|merge|rebase]`
     /// (#8845) — resolve/validate the merge method `merge-pr.sh` should use,
     /// replacing its old unconditional `forge_detect_merge_method` call.
@@ -410,6 +511,18 @@ pub(crate) enum ForgeAction {
         /// Also print a one-line OK summary when there is nothing to report.
         #[arg(long)]
         verbose: bool,
+    },
+
+    /// `forge merge-queue <mode|preflight|status|enqueue|dequeue>` (#10255)
+    /// — dormant merge-queue controls (`champion.mergeMode`, default
+    /// `direct`). Exit: 0 ok, 1 failed, 2 invalid config, 3 undetermined,
+    /// 4 refused before any forge call.
+    #[command(name = "merge-queue")]
+    MergeQueue {
+        // Deferred (#10256): built only when `merge-queue` is, so its verbs
+        // never sit in the debug-build `Commands` augment frame (see the type).
+        #[command(subcommand)]
+        action: super::forge_merge_queue_cmd::DeferredMergeQueue,
     },
 
     /// `forge token --repo <nwo> [--access read|write] [--force]` (#9537) —
@@ -477,6 +590,27 @@ pub(crate) enum ForgeAction {
         gh_shape: bool,
     },
 
+    /// `forge claim-liveness --number N --label L --claimed-at TS` (#10235) —
+    /// print the newest liveness evidence the claim reconciler honors beyond the
+    /// claim-activity marker (trusted Judge-progress comment for
+    /// `loom:reviewing`, claimant head force-push), as an RFC3339 `...Z`
+    /// timestamp after `TS`; prints nothing when there is none or a read
+    /// failed. `claim-staleness.sh` folds it into its idle clock so the
+    /// in-session evaluator agrees with the daemon.
+    #[command(name = "claim-liveness")]
+    ClaimLiveness {
+        #[arg(long, value_name = "N")]
+        number: u32,
+        #[arg(long, value_name = "LABEL")]
+        label: String,
+        /// The claim's own `labeled` event time (RFC3339, `...Z`).
+        #[arg(long, value_name = "TS")]
+        claimed_at: String,
+        /// `OWNER/REPO` the claim lives in; default is `gh`'s own resolution.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+    },
+
     /// `forge verdict-stale-notice --label L --marker-sha M --head-sha H
     /// [--source S]` (#9709) — print the stale-verdict audit comment for a
     /// `M -> H` invalidation, rendered by the SAME template the daemon's pass
@@ -501,6 +635,116 @@ pub(crate) enum ForgeAction {
         source: String,
     },
 
+    /// `forge verdict-body-check` (#9258) — is the verdict body on stdin a
+    /// rationale at all? Prints `LOOM-VERDICT-BODY OK` (exit 0) or
+    /// `LOOM-VERDICT-BODY REJECT <why>` (exit 1) for an empty body, a lone `-`,
+    /// a lone `@`-token (`@-`, `@path`) or one under 20 non-whitespace
+    /// characters. `post-verdict.sh` calls it before posting. See
+    /// `loom_daemon::verdict_body`.
+    #[command(name = "verdict-body-check")]
+    VerdictBodyCheck,
+
+    /// `forge verdict-gate <pr> --repo R --verdict V --sha S` (#10581) — may
+    /// this verdict be posted? Reads the PR's trusted comments and labels.
+    /// Prints `LOOM-VERDICT-GATE PROCEED|DEDUPE|REFUSE <why>`; exits 0, 10
+    /// (same verdict at the same head just landed: post nothing, still apply
+    /// labels) or 3. An approval is refused over `loom:ci-failure`, over a
+    /// same-head changes-requested marker without `--overrules-prior`, and
+    /// whenever either read fails. See `loom_daemon::verdict_gate`.
+    #[command(name = "verdict-gate")]
+    VerdictGate {
+        /// The PR number.
+        pr: u64,
+        /// `owner/name` (the caller has already vetted it with `may-write`).
+        #[arg(long)]
+        repo: String,
+        /// `approved` or `changes-requested`.
+        #[arg(long)]
+        verdict: String,
+        /// The head SHA the verdict is rendered against.
+        #[arg(long)]
+        sha: String,
+        /// Why each point of a same-head changes-requested verdict no longer
+        /// blocks (approvals only; at least 40 chars).
+        #[arg(long, default_value = "")]
+        overrules_prior: String,
+        /// How recent a same-verdict marker must be to dedupe against.
+        #[arg(long, default_value_t = loom_daemon::verdict_gate::DEFAULT_WINDOW_SECS)]
+        window_secs: i64,
+    },
+
+    /// `forge verdict-labels <pr> --repo R --verdict V` (#10581) — apply the
+    /// verdict's label transition (add first, then remove, then re-read and
+    /// verify): approve leaves `loom:pr` and none of `loom:changes-requested`,
+    /// `loom:ci-failure`, `loom:reviewing`, `loom:review-requested`;
+    /// changes-requested leaves `loom:changes-requested` and not `loom:pr`.
+    /// Exits 1 with a one-line repair command when the result does not hold.
+    #[command(name = "verdict-labels")]
+    VerdictLabels {
+        /// The PR number.
+        pr: u64,
+        /// `owner/name` (the caller has already vetted it with `may-write`).
+        #[arg(long)]
+        repo: String,
+        /// `approved` or `changes-requested`.
+        #[arg(long)]
+        verdict: String,
+    },
+
+    /// `forge verdict-reconcile <pr> --repo R --verdict V --sha S
+    /// --seen-opposite N` (#10581) — read-only post-write arbitration. The host
+    /// lock cannot order two hosts, so after posting and labelling each caller
+    /// re-reads: if more opposite-verdict same-head markers exist than its gate
+    /// saw (`seen-opposite=N` on the gate line), a rival landed concurrently.
+    /// Changes-requested wins. Prints `LOOM-VERDICT-RECONCILE
+    /// STABLE|PREVAILS|SUPERSEDED|DUPLICATE|UNREAD`; exits 0, 0, 11 (an approval
+    /// that lost: post a superseding marker, flip the labels), 12 (an identical
+    /// concurrent verdict with a lower comment id exists: this caller's own
+    /// comment was withdrawn, apply no labels) or 1.
+    #[command(name = "verdict-reconcile")]
+    VerdictReconcile {
+        /// The PR number.
+        pr: u64,
+        /// `owner/name`.
+        #[arg(long)]
+        repo: String,
+        /// `approved` or `changes-requested`.
+        #[arg(long)]
+        verdict: String,
+        /// The head SHA the verdict was rendered against.
+        #[arg(long)]
+        sha: String,
+        /// Opposite-verdict same-head markers the gate read saw.
+        #[arg(long, default_value_t = 0)]
+        seen_opposite: usize,
+        /// Newest same-verdict same-head marker comment id the gate read saw.
+        #[arg(long, default_value_t = 0)]
+        seen_same_max_id: u64,
+        /// The token this caller put in its own comment (empty: it posted
+        /// nothing). Lets an identical concurrent verdict be arbitrated: the
+        /// lowest comment id stands, the other withdraws (exit 12).
+        #[arg(long, default_value = "")]
+        nonce: String,
+    },
+
+    /// `forge verdict-lock acquire|release <pr> --repo R` (#10581) — the
+    /// per-PR host lock `post-verdict.sh` holds across its gate read, comment
+    /// post and label transition, so a rival verdict cannot land in between
+    /// and two identical callers cannot both pass the dedupe read. `acquire`
+    /// waits up to `LOOM_VERDICT_LOCK_WAIT_SECS` (90) and exits 9 on timeout
+    /// (fail closed); a lock older than 5 minutes is reaped. Host-local only:
+    /// independent hosts share no lock; `verdict-reconcile` arbitrates cross-host.
+    #[command(name = "verdict-lock")]
+    VerdictLock {
+        /// `acquire` or `release`.
+        action: String,
+        /// The PR number.
+        pr: u64,
+        /// `owner/name`.
+        #[arg(long)]
+        repo: String,
+    },
+
     /// `forge may-write [--repo OWNER/REPO]` (#9548) — may this installation
     /// write (comment, label, merge, lease) to the repository? Yes only when
     /// it is managed here (origin of a registered workspace or of this Loom
@@ -515,6 +759,11 @@ pub(crate) enum ForgeAction {
         #[arg(long, value_name = "OWNER/REPO")]
         repo: Option<String>,
     },
+
+    /// `forge calls [--since 1h|3h] [--by bucket|caller|role|repo]` (W1) —
+    /// this host's forge-call sink per billed GitHub bucket (or caller, role,
+    /// repo) beside the bucket book's readings. Reads local files only.
+    Calls(super::forge_calls_cmd::CallsArgs),
 
     /// `forge identities [--json]` (#9537) — the resolved roster (writer,
     /// readers, legacy logins) and, per reader, each published token's owner
@@ -566,13 +815,12 @@ pub(crate) enum ForgeAction {
         patch_created: Option<String>,
     },
 
-    /// `forge egress assert|doctor|policy` (#9984) — will this process's `gh`
-    /// reach the mandated API origin? Exit 0 aligned / 1 findings / 2
-    /// verification incomplete; no policy configured ⇒ 0. Never a `gh`
-    /// passthrough. See `defaults/docs/forge-egress.md`.
-    Egress {
+    /// `forge parent body|link` (#10012 §4) — the logic behind
+    /// `create-issue.sh --parent N`: the `loom:parent` marker, the parent's
+    /// red-main marker, the native sub-issue link.
+    Parent {
         #[command(subcommand)]
-        action: super::forge_egress_cmd::EgressAction,
+        action: super::forge_parent_cmd::ParentAction,
     },
 
     /// `forge dashboard-link <owner/repo> <number> [--pr]` — print the exact
@@ -625,9 +873,11 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             access,
             force,
         } => return super::forge_identity_cmd::token(&repo, &access, force),
-        ForgeAction::Egress { action } => return super::forge_egress_cmd::handle(action),
+        ForgeAction::MergeQueue { action } => super::forge_merge_queue_cmd::run(action.0),
+        ForgeAction::Parent { action } => return super::forge_parent_cmd::handle(action),
         ForgeAction::IsFleet { login } => return super::forge_identity_cmd::is_fleet(&login),
         ForgeAction::Identities { json } => return super::forge_identity_cmd::identities(json),
+        ForgeAction::Calls(args) => return super::forge_calls_cmd::handle(args),
         ForgeAction::MayWrite { repo } => return super::forge_identity_cmd::may_write(repo),
         ForgeAction::DashboardLink {
             repo,
@@ -680,6 +930,62 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             let fetch = fetch.map(|n| (n, repo, with_body));
             return super::forge_identity_cmd::trusted_comments(self_login, fetch, gh_shape);
         }
+        ForgeAction::VerdictBodyCheck => return super::forge_verdict_cmd::verdict_body_check(),
+        ForgeAction::VerdictGate {
+            pr,
+            repo,
+            verdict,
+            sha,
+            overrules_prior,
+            window_secs,
+        } => {
+            return super::forge_verdict_cmd::verdict_gate(
+                pr,
+                &repo,
+                &verdict,
+                &sha,
+                &overrules_prior,
+                window_secs,
+            );
+        }
+        ForgeAction::VerdictLock { action, pr, repo } => {
+            return super::forge_verdict_cmd::verdict_lock(&action, pr, &repo);
+        }
+        ForgeAction::VerdictReconcile {
+            pr,
+            repo,
+            verdict,
+            sha,
+            seen_opposite,
+            seen_same_max_id,
+            nonce,
+        } => {
+            return super::forge_verdict_cmd::verdict_reconcile(
+                pr,
+                &repo,
+                &verdict,
+                &sha,
+                seen_opposite,
+                seen_same_max_id,
+                &nonce,
+            );
+        }
+        ForgeAction::VerdictLabels { pr, repo, verdict } => {
+            return super::forge_verdict_cmd::verdict_labels(pr, &repo, &verdict);
+        }
+        ForgeAction::ClaimLiveness {
+            number,
+            label,
+            claimed_at,
+            repo,
+        } => {
+            return super::forge_identity_cmd::claim_liveness(
+                number,
+                &label,
+                &claimed_at,
+                repo.as_deref(),
+            );
+        }
         ForgeAction::VerdictStaleNotice {
             label,
             marker_sha,
@@ -693,6 +999,22 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
                 &source,
             );
         }
+        ForgeAction::PriorityLabels(PriorityLabelsCli {
+            body_file,
+            issues,
+            repo,
+            audit_pr,
+        }) => {
+            return loom_daemon::forge_priority_labels::cli_entrypoint(
+                loom_daemon::forge_priority_labels::PriorityLabelsArgs {
+                    issues,
+                    body_file,
+                    repo,
+                    audit_pr,
+                },
+            );
+        }
+        ForgeAction::RebaseGuard(args) => loom_daemon::rebase_guard::cli_entrypoint(&args),
         ForgeAction::Issue { args } => ForgeCmd::Issue(args),
         ForgeAction::Pr { args } => ForgeCmd::Pr(args),
         ForgeAction::Auth { args } => ForgeCmd::Auth(args),
@@ -715,6 +1037,17 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
                 max_interval,
             },
         ),
+        ForgeAction::Rerun {
+            run_id,
+            failed,
+            job,
+            repo,
+        } => loom_daemon::forge_rerun::cli_entrypoint(&loom_daemon::forge_rerun::RerunArgs {
+            run_id,
+            failed,
+            job,
+            repo,
+        }),
         ForgeAction::CheckOpenPr { issue } => ForgeCmd::CheckOpenPr { issue },
         ForgeAction::PrCongestion {
             json,
@@ -766,6 +1099,15 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             reviewed,
             head,
         },
+        ForgeAction::VersionOnlyDiff {
+            pr_number,
+            file,
+            repo,
+        } => ForgeCmd::VersionOnlyDiff(loom_daemon::forge_version_only_diff::Args {
+            pr: pr_number,
+            file,
+            repo,
+        }),
         ForgeAction::MergeMethod { repo, requested } => ForgeCmd::MergeMethod { repo, requested },
         ForgeAction::MergeConfig {
             repo,
@@ -800,6 +1142,32 @@ fn write_target(action: &ForgeAction) -> Option<Option<String>> {
         // write verbs — its `--repo` is exactly the `Option<String>` shape
         // `may_write_from` wants.
         ForgeAction::Comment { repo, .. } => Some(repo.clone()),
+        // `priority-labels` never writes (its `--audit-pr` post was retired
+        // by #11104).
+        // #10255: the queue mutations write (dormant today, vetted anyway).
+        ForgeAction::MergeQueue { action } => match &action.0 {
+            super::forge_merge_queue_cmd::MergeQueueAction::Enqueue { repo, .. }
+            | super::forge_merge_queue_cmd::MergeQueueAction::Dequeue { repo, .. }
+            // #10256: these comment, relabel, enqueue or dequeue.
+            // `reconcile` is vetted inside its queue-mode branch instead:
+            // in direct mode (every `merge-pr.sh` run) it writes nothing.
+            | super::forge_merge_queue_cmd::MergeQueueAction::Handoff { repo, .. }
+            | super::forge_merge_queue_cmd::MergeQueueAction::Revoke { repo, .. } => {
+                Some(repo.clone())
+            }
+            _ => None,
+        },
+        // #10012: `parent link` stars and links, so it is vetted too.
+        ForgeAction::Parent {
+            action: super::forge_parent_cmd::ParentAction::Link { repo, .. },
+        } => Some(repo.clone()),
+        // #10581: `verdict-labels` POSTs and DELETEs labels on the supplied
+        // `--repo`, so a direct call (the repair command the script prints)
+        // is vetted like every other write verb. `verdict-gate` only reads.
+        ForgeAction::VerdictLabels { repo, .. } => Some(Some(repo.clone())),
+        // #10581: `verdict-reconcile` DELETEs the caller's duplicate verdict
+        // comment on the supplied `--repo`, so a direct call is vetted too.
+        ForgeAction::VerdictReconcile { repo, .. } => Some(Some(repo.clone())),
         _ => None,
     }
 }
@@ -854,5 +1222,119 @@ mod write_target_tests {
         };
         assert_eq!(write_target(&disarm), Some(None));
         assert_eq!(write_target(&ForgeAction::IsFleet { login: "x".into() }), None);
+    }
+
+    #[test]
+    fn deferred_merge_queue_writes_are_still_vetted() {
+        use super::super::forge_merge_queue_cmd::MergeQueueAction as Mq;
+        let mq = |action: Mq| ForgeAction::MergeQueue {
+            action: super::super::forge_merge_queue_cmd::DeferredMergeQueue(action),
+        };
+        let handoff = mq(Mq::Handoff {
+            pr: 7,
+            approved_sha: "a".repeat(40),
+            repo: Some("acme/w".into()),
+        });
+        assert_eq!(write_target(&handoff), Some(Some("acme/w".into())));
+        let revoke = mq(Mq::Revoke {
+            pr: 7,
+            reason: "transition".into(),
+            repo: None,
+        });
+        assert_eq!(write_target(&revoke), Some(None));
+        assert_eq!(write_target(&mq(Mq::Mode)), None, "mode is a read");
+    }
+
+    /// #10256: the deferred slot still parses every verb, and a full build
+    /// (what `--help` walks) still registers them.
+    #[test]
+    fn merge_queue_verbs_parse_through_the_deferred_slot() {
+        use super::super::forge_merge_queue_cmd::MergeQueueAction as Mq;
+        use clap::CommandFactory;
+        let sha = "a".repeat(40);
+        let argv = [
+            "loom-daemon",
+            "forge",
+            "merge-queue",
+            "step",
+            "7",
+            "--approved-sha",
+            &sha,
+        ];
+        // #10616: whole-`Cli` parses run on the binary's 8 MiB main-thread
+        // stack, never libtest's 2 MiB worker (the #10581 verdict verbs pushed
+        // the debug-build `ForgeAction` frames past it).
+        let cli = super::super::whole_cli_parse::try_parse_cli(&argv).expect("parse");
+        let Some(crate::Commands::Forge {
+            action: ForgeAction::MergeQueue { action },
+        }) = cli.command
+        else {
+            panic!("expected `forge merge-queue`");
+        };
+        match action.0 {
+            Mq::Step {
+                pr,
+                approved_sha,
+                repo,
+            } => {
+                assert_eq!((pr, approved_sha.as_str(), repo), (7, sha.as_str(), None));
+            }
+            _ => panic!("expected `step`"),
+        }
+        let missing = super::super::whole_cli_parse::on_stack(
+            "merge-queue-verbs-8MiB",
+            super::super::whole_cli_parse::MAIN_THREAD_STACK,
+            || {
+                let mut cmd = crate::Cli::command();
+                cmd.build();
+                let mq = cmd
+                    .find_subcommand("forge")
+                    .and_then(|f| f.find_subcommand("merge-queue"))
+                    .expect("forge merge-queue is registered");
+                ["mode", "reconcile", "handoff", "step", "revoke"]
+                    .into_iter()
+                    .filter(|verb| mq.find_subcommand(verb).is_none())
+                    .collect::<Vec<_>>()
+            },
+        );
+        assert!(missing.is_empty(), "unregistered merge-queue verbs: {missing:?}");
+    }
+
+    /// #10581: a direct `verdict-labels --repo unmanaged/repo` is vetted
+    /// (`may_write_from` runs before the handler's first gh call); the gate
+    /// verb only reads.
+    #[test]
+    fn verdict_labels_is_vetted_against_its_repo_and_the_gate_is_not() {
+        let labels = ForgeAction::VerdictLabels {
+            pr: 7,
+            repo: "unmanaged/repo".into(),
+            verdict: "approved".into(),
+        };
+        assert_eq!(write_target(&labels), Some(Some("unmanaged/repo".into())));
+        let gate = ForgeAction::VerdictGate {
+            pr: 7,
+            repo: "unmanaged/repo".into(),
+            verdict: "approved".into(),
+            sha: "a".repeat(40),
+            overrules_prior: String::new(),
+            window_secs: 600,
+        };
+        assert_eq!(write_target(&gate), None);
+    }
+
+    /// #10581: `verdict-reconcile` can DELETE a comment, so a direct call
+    /// against an unmanaged repository is vetted before the handler runs.
+    #[test]
+    fn verdict_reconcile_is_vetted_against_its_repo() {
+        let reconcile = ForgeAction::VerdictReconcile {
+            pr: 7,
+            repo: "unmanaged/repo".into(),
+            verdict: "approved".into(),
+            sha: "a".repeat(40),
+            seen_opposite: 0,
+            seen_same_max_id: 0,
+            nonce: String::new(),
+        };
+        assert_eq!(write_target(&reconcile), Some(Some("unmanaged/repo".into())));
     }
 }

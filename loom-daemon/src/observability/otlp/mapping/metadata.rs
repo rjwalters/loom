@@ -2,9 +2,17 @@
 //! token-price estimates, or provider billing guesses enter this mapping.
 use super::{
     any_string, any_value, kv, kv_int, kv_string, AnyValue, ArrayValue, KeyValue, KeyValueList,
+    RepoVisibility,
 };
 use crate::script_helpers::sweep_experiment::ModelUsageTotals;
-use crate::telemetry::{PhaseDuration, SweepOutcomeRecord};
+use crate::telemetry::{PhaseDuration, PhaseTapUsageRow, SweepOutcomeRecord, SweepStartFacts};
+pub(super) fn visibility_str(visibility: RepoVisibility) -> &'static str {
+    match visibility {
+        RepoVisibility::Public => "public",
+        RepoVisibility::Private => "private",
+    }
+}
+
 const MAX_GROUPS: usize = 64;
 const MAX_STRING_BYTES: usize = 256;
 
@@ -23,6 +31,36 @@ fn row(values: Vec<KeyValue>) -> AnyValue {
     AnyValue {
         value: Some(any_value::Value::KvlistValue(KeyValueList { values })),
     }
+}
+
+/// `sweep.started`'s dispatch facts (#11280), under `sweep.outcome`'s key
+/// names. An absent fact is an absent attribute.
+pub(super) fn start_facts(facts: &SweepStartFacts) -> Vec<KeyValue> {
+    let mut attrs = Vec::new();
+    for (key, value) in [
+        ("loom.model", &facts.model),
+        ("loom.effort", &facts.effort),
+        ("loom.effort_source", &facts.effort_source),
+        ("loom.model_source", &facts.model_source),
+        ("loom.runtime", &facts.runtime),
+    ] {
+        if let Some(value) = value.as_ref().filter(|v| text(v)) {
+            attrs.push(kv_string(key, value.clone()));
+        }
+    }
+    if let Some(value) = facts.attempt_index {
+        attrs.push(kv_int("loom.attempt_index", i64::from(value)));
+    }
+    for (key, value) in [
+        ("loom.trigger", &facts.trigger),
+        ("loom.previous_sweep_id", &facts.previous_sweep_id),
+        ("loom.dispatch_origin", &facts.dispatch_origin),
+    ] {
+        if let Some(value) = value.as_ref().filter(|v| text(v)) {
+            attrs.push(kv_string(key, value.clone()));
+        }
+    }
+    attrs
 }
 
 pub(super) fn usage(rows: Option<&[ModelUsageTotals]>) -> Option<KeyValue> {
@@ -113,6 +151,68 @@ pub(super) fn phase_durations(entries: &[PhaseDuration]) -> Option<KeyValue> {
     ))
 }
 
+/// `loom.phase_tap_usage` (Issue #11488): one kvlist per `(role, tap, model)`
+/// for out-of-process phases. An unreported counter is an absent key, never `0`.
+pub(super) fn phase_tap_usage(rows: &[PhaseTapUsageRow]) -> Option<KeyValue> {
+    if rows.is_empty() {
+        return None;
+    }
+    let valid = |r: &PhaseTapUsageRow| {
+        [
+            Some(&r.role),
+            Some(&r.tap),
+            Some(&r.runtime),
+            r.model_profile.as_ref(),
+            r.model.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .all(|v| text(v))
+    };
+    if rows.len() > MAX_GROUPS || !rows.iter().all(valid) {
+        log::warn!("observability: invalid or oversized phase tap usage omitted");
+        return None;
+    }
+    Some(array(
+        "loom.phase_tap_usage",
+        rows.iter()
+            .map(|r| {
+                let mut values = vec![
+                    kv_string("role", r.role.clone()),
+                    kv_string("tap", r.tap.clone()),
+                    kv_string("runtime", r.runtime.clone()),
+                ];
+                for (key, value) in [("model_profile", &r.model_profile), ("model", &r.model)] {
+                    if let Some(value) = value {
+                        values.push(kv_string(key, value.clone()));
+                    }
+                }
+                for (key, value) in [
+                    ("input", r.input),
+                    ("output", r.output),
+                    ("reasoning", r.reasoning),
+                    ("cache_read", r.cache_read),
+                    ("cache_write", r.cache_write),
+                    ("usage_events", r.usage_events),
+                ] {
+                    if let Some(value) = value.and_then(|v| i64::try_from(v).ok()) {
+                        values.push(kv_int(key, value));
+                    }
+                }
+                if let Some(cost) = r.cost_estimate.filter(|c| c.is_finite()) {
+                    values.push(kv(
+                        "cost_estimate",
+                        AnyValue {
+                            value: Some(any_value::Value::DoubleValue(cost)),
+                        },
+                    ));
+                }
+                row(values)
+            })
+            .collect(),
+    ))
+}
+
 pub(super) fn models(values: Option<&[String]>) -> Option<KeyValue> {
     let values = values.filter(|rows| !rows.is_empty() && rows.len() <= MAX_GROUPS)?;
     values
@@ -125,6 +225,11 @@ pub(super) fn outcome(record: &SweepOutcomeRecord) -> Vec<KeyValue> {
     let mut attrs = Vec::new();
     // Config is otherwise a free-form map (including token_account). Export
     // only known execution settings, retaining legacy config.runtime queries.
+    for key in ["effort_source", "model_source"] {
+        if let Some(value) = record.config.get(key).filter(|value| text(value)) {
+            attrs.push(kv_string(&format!("loom.{key}"), value.clone()));
+        }
+    }
     for key in ["runtime", "provider", "configured_model", "arm"] {
         if let Some(value) = record.config.get(key).filter(|value| text(value)) {
             attrs.push(kv_string(&format!("loom.config.{key}"), value.clone()));
@@ -135,6 +240,19 @@ pub(super) fn outcome(record: &SweepOutcomeRecord) -> Vec<KeyValue> {
     }
     if let Some(value) = record.failure_class.as_ref().filter(|v| text(v)) {
         attrs.push(kv_string("loom.failure_class", value.clone()));
+    }
+    // Issue #10642: why a `no-phase-signal` sweep ended. Closed vocabularies
+    // (and a decimal exit code), so groupable like `loom.failure_class`.
+    if let Some(cause) = &record.no_phase_cause {
+        for (key, value) in [
+            ("loom.no_phase.exit", &cause.exit),
+            ("loom.no_phase.last_step", &cause.last_step),
+            ("loom.no_phase.reason", &cause.reason),
+        ] {
+            if text(value) {
+                attrs.push(kv_string(key, value.clone()));
+            }
+        }
     }
     if let Some(value) = record.doctor_cycles {
         attrs.push(kv_int("loom.doctor_cycles", i64::from(value)));
@@ -244,6 +362,20 @@ pub(super) fn outcome(record: &SweepOutcomeRecord) -> Vec<KeyValue> {
     }
     if let Some(value) = record.trigger.as_ref().filter(|v| text(v)) {
         attrs.push(kv_string("loom.trigger", value.clone()));
+    }
+    // Issue #11444: who asked for this sweep, equal to `sweep.started`'s.
+    if let Some(value) = record.dispatch_origin.as_ref().filter(|v| text(v)) {
+        attrs.push(kv_string("loom.dispatch_origin", value.clone()));
+    }
+    // 2AMLogic/2am#4393: the weighted agent draw's pick (#11726).
+    if let Some(draw) = &record.role_draw {
+        attrs.push(kv_string("loom.role_draw.pick", draw.pick.clone()));
+        attrs.push(kv(
+            "loom.role_draw.model_pinned",
+            AnyValue {
+                value: Some(any_value::Value::BoolValue(draw.model_pinned)),
+            },
+        ));
     }
     if let Some(numbers) = &record.pr_numbers {
         if !numbers.is_empty() && numbers.len() <= MAX_GROUPS {

@@ -8,23 +8,25 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use std::path::Path;
 
+mod capacity_line;
 mod drain_render;
 mod fleet_store_line;
 mod forge_calls_render;
-mod forge_egress_line;
 mod forge_events_line;
 mod holds;
+mod last_tick_line;
 mod model_class;
 mod observability_line;
-mod operator_priority_line;
+mod otlp_export_line;
 mod peer_claims_line;
 mod pending_restart_line;
-mod roll_window_line;
+mod session_containers_line;
 mod task_liveness_line;
 mod telemetry_banner;
 
 use loom_daemon::daemon_install_state;
 use loom_daemon::self_update;
+use loom_daemon::status_section::{SectionSet, StatusSection as Section};
 use loom_daemon::types::{DaemonStatusReport, SweepKind};
 use loom_daemon::worktree_disk_status::{self, WorktreeDiskSummary};
 
@@ -218,6 +220,31 @@ pub(crate) fn build_status_json_value(
     protection: Option<&daemon_install_state::ProtectionReport>,
     worktree_disk: Option<&[WorktreeDiskSummary]>,
 ) -> serde_json::Value {
+    let all = SectionSet::all();
+    build_status_json_value_for(
+        report,
+        token_usage,
+        update,
+        pipeline,
+        protection,
+        worktree_disk,
+        &all,
+    )
+}
+
+/// [`build_status_json_value`] keeping only the top-level keys of `sections`
+/// (`status --json --section`, #10787). The host-local blocks after the
+/// literal are not even probed unless selected; the full set keeps every key,
+/// so the default payload is exactly [`build_status_json_value`]'s.
+pub(crate) fn build_status_json_value_for(
+    report: &DaemonStatusReport,
+    token_usage: Option<&serde_json::Value>,
+    update: &self_update::SelfUpdateStatus,
+    pipeline: Option<&[loom_daemon::pipeline_snapshot::RepoPipelineSnapshot]>,
+    protection: Option<&daemon_install_state::ProtectionReport>,
+    worktree_disk: Option<&[WorktreeDiskSummary]>,
+    sections: &SectionSet,
+) -> serde_json::Value {
     let rc = resolve_capacity(report, token_usage);
     let mut value = serde_json::json!({
         "in_flight_count": report.in_flight.len(),
@@ -305,6 +332,10 @@ pub(crate) fn build_status_json_value(
         // `{}` when observability is off or from a pre-#8756 daemon (the
         // singular field above already distinguishes those states).
         "observability_exports": report.observability_exports,
+        // OTLP-export health (#11353): `no_exporter` | `failing` | `ok` |
+        // `exempt`, with an optional `detail` (the exemption reason).
+        //   loom-daemon status --json | jq -e '.otlp_export.state == "ok"'
+        "otlp_export": report.otlp_export,
         // Forge event-feed consumer state (ADR-0021, #8765). Non-null for any
         // daemon of this vintage and always carrying a `state`, so a watch
         // loop asserts rather than infers:
@@ -396,7 +427,6 @@ pub(crate) fn build_status_json_value(
         "work_finder": {
             "enabled": report.work_finder_enabled,
         },
-        "operator_priority_landing": report.operator_priority_landing,
         // Host-wide `LOOM_ROLE_RUNNER` env override state (#6470), resolved
         // once for the whole report — `null` when unset (each root's own
         // config decides independently).
@@ -453,7 +483,7 @@ pub(crate) fn build_status_json_value(
         // Per-repo breakdown across every registered managed workspace (#3930).
         "per_repo": report.per_repo.iter().map(|r| serde_json::json!({
             "root": r.root,
-            "priority": r.priority,
+            "weight": r.weight,
             "in_flight_count": r.in_flight_count,
             "health_gate_halted": r.health_gate_halted,
             "health_gate_not_evaluated": r.health_gate_not_evaluated,
@@ -580,15 +610,17 @@ pub(crate) fn build_status_json_value(
         // (distinct from the client-side `self_update` staleness read above).
         // Long-running task liveness (#10414): one entry per registered loop.
         "task_liveness": report.task_liveness,
+        // Codex session containers (#10600); `null` without a session seat.
+        "session_containers": report.session_containers,
         "auto_update": {
             "enabled": report.auto_update_enabled,
+            "mode": report.auto_update_mode, // #10954
             "last_check": report.auto_update_last_check,
             "last_roll": report.auto_update_last_roll,
             "consecutive_failures": report.auto_update_consecutive_failures,
             "backoff_secs": report.auto_update_backoff_secs,
             "terminal_reason": report.auto_update_terminal_reason,
             "note": report.auto_update_note,
-            "roll_window": report.auto_update_roll_window,
             // Issue #7609: the release artifact the loop resolved for this
             // host's platform, next to the installed version above. `null`
             // when no artifact resolved (no Releases yet, an unreachable API,
@@ -758,23 +790,23 @@ pub(crate) fn build_status_json_value(
     // Fleet-store sync (#9596) — client-side and host-local, like `protection`
     // above, and inserted only when this host actually has a snapshot, so a
     // host with no `fleet.repo` emits exactly the payload it always did.
-    if let Some(s) = loom_daemon::fleet_sync::probe_status() {
+    let fleet_store = sections
+        .has(Section::FleetStore)
+        .then(loom_daemon::fleet_sync::probe_status);
+    if let Some(s) = fleet_store.flatten() {
         value["fleet_store"] = fleet_store_line::json(Some(&s));
     }
     // Pending-restart marker (#9597) — a restart-required `fleet-config
     // render` change this daemon's pid has not yet picked up. Same
     // client-side/host-local shape as the fleet-store block above, inserted
     // only when there is one to report.
-    let pending_restart = pending_restart_line::json(report.daemon_pid);
-    if !pending_restart.is_null() {
-        value["pending_restart"] = pending_restart;
+    if sections.has(Section::PendingRestart) {
+        let pending_restart = pending_restart_line::json(report.daemon_pid);
+        if !pending_restart.is_null() {
+            value["pending_restart"] = pending_restart;
+        }
     }
-    // Forge egress routing (#9984): fresh assert + the daemon's last doctor;
-    // inserted only when a policy resolves or a cached report exists.
-    let forge_egress = forge_egress_line::json();
-    if !forge_egress.is_null() {
-        value["forge_egress"] = forge_egress;
-    }
+    sections.retain_keys(&mut value);
     value
 }
 
@@ -786,9 +818,17 @@ pub(crate) fn print_status_json(
     pipeline: Option<&[loom_daemon::pipeline_snapshot::RepoPipelineSnapshot]>,
     protection: Option<&daemon_install_state::ProtectionReport>,
     worktree_disk: Option<&[WorktreeDiskSummary]>,
+    sections: &SectionSet,
 ) -> Result<()> {
-    let combined =
-        build_status_json_value(report, token_usage, update, pipeline, protection, worktree_disk);
+    let combined = build_status_json_value_for(
+        report,
+        token_usage,
+        update,
+        pipeline,
+        protection,
+        worktree_disk,
+        sections,
+    );
     println!("{}", serde_json::to_string_pretty(&combined)?);
     Ok(())
 }
@@ -1931,14 +1971,6 @@ pub(crate) fn print_status_human(
     // surfacing on `loom-daemon health`, this is the `status`-side
     // counterpart.
     let dispatch_starved_but_disagrees = ranking_diverges_from_starvation(report, &rc);
-    // #4903: while the saturation admission brake is holding, "the limiter is
-    // work availability" is flatly wrong and is the exact misread the issue was
-    // filed on — a worker at 12× overcommit rendered as an idle host with nine
-    // free slots. The limiter is the HOST. Print the brake's diagnosis in place
-    // of the generic line (the same suppression shape #4386 uses for the
-    // pre-flight tripwire), so an operator reading the capacity block top-to-
-    // bottom cannot miss it.
-    let saturation_note: Option<String> = saturation_hold_note(report, dispatch_cap);
     if rc.ranking_present {
         let src = if rc.source == "probe" {
             "live probe: loom-daemon tokens check --json"
@@ -1998,28 +2030,14 @@ pub(crate) fn print_status_human(
         // underneath it would contradict it.
         if !dispatch_starved_but_disagrees {
             if !capacity_bound {
-                // In-flight is below the cap: nothing is binding. Naming tokens
-                // (or any resource) as "the bottleneck" here is the #4031
-                // defect — at, say, 1 in-flight against a cap of 7 the limiter
-                // is simply how much ready work exists. Suppress the
-                // token-bound diagnosis.
-                //
-                // #4386: while the pre-flight tripwire is active, this bare
-                // "work availability" line is actively misleading — every
-                // dispatch IS starting, it just dies within ~1s at
-                // claude-wrapper pre-flight, which reads as "no work" rather
-                // than "everything is crashing." The warning printed above
-                // already names the real cause, so suppress this line rather
-                // than let it stand uncontested.
-                if let Some(note) = &saturation_note {
-                    // #4903: the host, not work availability, is the limiter.
-                    println!("{note}");
-                } else if !report.preflight_advisory_active {
-                    println!(
-                        "  not capacity-bound ({} in flight, cap {dispatch_cap} — the limiter is \
-                         work availability, not disk/RAM/CPU)",
-                        report.in_flight.len(),
-                    );
+                // #4031: below the cap nothing is binding, so never name a
+                // resource. #9131: `below_cap_line` names any active dispatch
+                // hold (drain, breaker, brake, red main, pool) before blaming
+                // work availability; #4386 pre-flight suppression lives there too.
+                if let Some(line) =
+                    capacity_line::below_cap_line(report, dispatch_cap, "disk/RAM/CPU")
+                {
+                    println!("{line}");
                 }
             } else if rc.token_bound {
                 // #5305: `token_bound` means genuine starvation (zero healthy
@@ -2030,7 +2048,7 @@ pub(crate) fn print_status_human(
                 println!(
                     "  token-bound: NO healthy accounts — the concurrency cap is unaffected \
                      (#5270), but every spawn will fail account selection until capacity \
-                     returns. Add accounts (~/.claude-monitor/accounts.env + `loom-daemon tokens \
+                     returns. Add accounts (~/.llm-monitor/accounts.env + `loom-daemon tokens \
                      bootstrap`) or buy API credits, then `loom-daemon tokens check --ranking`."
                 );
             } else {
@@ -2044,18 +2062,11 @@ pub(crate) fn print_status_human(
             report.token_pool_size
         );
         if !capacity_bound {
-            if let Some(note) = &saturation_note {
-                // #4903: same substitution as the ranking-present branch above.
-                println!("{note}");
-            } else if !report.preflight_advisory_active {
-                // #4386: same suppression as the ranking-present branch above —
-                // the warning printed at the top of `status` already names the
-                // real cause while the tripwire is active.
-                println!(
-                    "  not capacity-bound ({} in flight, cap {dispatch_cap} — the limiter is work \
-                     availability, not tokens/disk/CPU)",
-                    report.in_flight.len(),
-                );
+            // #9131: same line choice as the ranking-present branch above.
+            if let Some(line) =
+                capacity_line::below_cap_line(report, dispatch_cap, "tokens/disk/CPU")
+            {
+                println!("{line}");
             }
         }
     }
@@ -2226,6 +2237,8 @@ pub(crate) fn print_status_human(
         "{}",
         observability_line::render(report.observability_export.as_ref(), Utc::now())
     );
+    // OTLP-export health (#11353): `no_exporter` / `failing` / `ok` / `exempt`.
+    println!("{}", otlp_export_line::render(report.otlp_export.as_ref()));
 
     // The loud telemetry banner (#9950): the one-line render above is the
     // data; when telemetry is demonstrably broken the common-tool rule says
@@ -2243,8 +2256,6 @@ pub(crate) fn print_status_human(
     // "off", "never provisioned", "wrong key", "wrong host" and "quiet feed"
     // are five different answers that would otherwise all render as nothing.
     println!("{}", forge_events_line::render_block(report.forge_events.as_ref(), Utc::now()));
-    // Starred issues' landing states (#9244 C); nothing when nothing is starred.
-    operator_priority_line::print(report.operator_priority_landing.as_ref());
     // Fleet-store sync (#9596): what the last startup/timer pass found — the
     // drift the timer detects but deliberately does not write. Nothing at all
     // on a host with no `fleet.repo`.
@@ -2253,8 +2264,6 @@ pub(crate) fn print_status_human(
     // render` change this daemon's pid has not yet picked up. Nothing at all
     // once the daemon that saw the drift has restarted (or if none ever did).
     pending_restart_line::print(report.daemon_pid);
-    // Forge egress routing (#9984): nothing at all when no policy is configured.
-    forge_egress_line::print();
 
     // Watchdog protection state (#4354): this daemon is answering, so it is
     // alive — but is anything positioned to notice when it *stops* being? Before
@@ -2534,7 +2543,7 @@ pub(crate) fn print_status_human(
     // workspace; with `loom-daemon workspace add <path>` it lists every managed
     // repo, its in-flight count, and its own gate state.
     println!(
-        "\nManaged repos: {} (priority: lower = higher dispatch priority)",
+        "\nManaged repos: {} (weight: relative share of repo draws, higher = more)",
         report.per_repo.len()
     );
     if report.per_repo.is_empty() {
@@ -2549,7 +2558,7 @@ pub(crate) fn print_status_human(
         // the separator below) is unchanged.
         println!(
             "  {:>4}  {:>9}  {:<13}  {:<5}  REPO",
-            "PRIO", "IN-FLIGHT", "HEALTH-GATE", "ROLES"
+            "WGHT", "IN-FLIGHT", "HEALTH-GATE", "ROLES"
         );
         println!("  {:-<68}", "");
         for r in &report.per_repo {
@@ -2572,7 +2581,7 @@ pub(crate) fn print_status_human(
             let roles = if r.role_runner_enabled { "on" } else { "off" };
             println!(
                 "  {:>4}  {:>9}  {:<13}  {:<5}  {}{}",
-                r.priority,
+                r.weight,
                 r.in_flight_count,
                 gate,
                 roles,
@@ -2588,6 +2597,9 @@ pub(crate) fn print_status_human(
             // it on dispatch; this is the operator-facing pointer to clean it
             // up (or, if the root is only transiently unavailable, e.g. an
             // unmounted volume, to leave it registered).
+            if let Some(mark) = &r.maintain_only {
+                println!("        {}: kept current, never dispatched into (#11186)", mark.label());
+            }
             if r.root_missing {
                 println!(
                     "        root does not exist on disk — dispatch is skipped; \
@@ -2762,7 +2774,8 @@ pub(crate) fn print_status_human(
     // Autonomous self-update loop (#4055) — the daemon-side loop that acts on the
     // staleness above. Only rendered when enabled (opt-in); otherwise silent.
     if report.auto_update_enabled {
-        print!("Auto-update loop: enabled");
+        // #10954: the mode says why the loop runs (e.g. for the fleet floor alone).
+        print!("Auto-update loop: {}", report.auto_update_mode.as_deref().unwrap_or("enabled"));
         match &report.auto_update_last_check {
             Some(ts) => print!(" (last check {})", ts.format("%Y-%m-%dT%H:%M:%SZ")),
             None => print!(" (no check yet)"),
@@ -2788,9 +2801,10 @@ pub(crate) fn print_status_human(
             );
         }
         println!();
-        roll_window_line::print_tail(report);
+        last_tick_line::print(report);
     }
     task_liveness_line::print(&report.task_liveness);
+    session_containers_line::print(report.session_containers.as_ref());
 
     println!();
 }
@@ -3159,7 +3173,7 @@ mod status_render_tests {
         // row is `2 + 4 + 2 + 9 + 2 + 13 + 2 + 5 + 2` of fixed columns before
         // the variable-width REPO column, and the separator is `2 + 68`.
         let header_row =
-            format!("  {:>4}  {:>9}  {:<13}  {:<5}  REPO", "PRIO", "IN-FLIGHT", HEADER, "ROLES");
+            format!("  {:>4}  {:>9}  {:<13}  {:<5}  REPO", "WGHT", "IN-FLIGHT", HEADER, "ROLES");
         let separator = format!("  {:-<68}", "");
         assert!(
             header_row.len() <= separator.len(),
@@ -4663,7 +4677,8 @@ mod stash_status_render_tests {
     ) -> loom_daemon::types::RepoStatus {
         loom_daemon::types::RepoStatus {
             root: std::path::PathBuf::from("/repos/loom"),
-            priority: 100,
+            maintain_only: None,
+            weight: 100,
             in_flight_count: 0,
             health_gate_halted: false,
             quarantined_issues: vec![],
@@ -4911,7 +4926,8 @@ mod role_runner_diagnostic_source_render_tests {
     pub(super) fn repo(enabled: bool, on_idle: &[&str], env_override: Option<bool>) -> RepoStatus {
         RepoStatus {
             root: std::path::PathBuf::from("/repos/loom"),
-            priority: 100,
+            maintain_only: None,
+            weight: 100,
             in_flight_count: 0,
             health_gate_halted: false,
             quarantined_issues: vec![],

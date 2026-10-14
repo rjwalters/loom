@@ -479,8 +479,15 @@ fn gate_outcome(role: &'static str, probe: QueueProbe) -> (RoleTickOutcome, usiz
     let root = workspace(ENABLED);
     let calls = Arc::new(AtomicUsize::new(0));
     let mut runner = FixedRunner(RoleTickOutcome::Success, Arc::clone(&calls));
-    let outcome =
-        run_gated(&mut runner, &probe, root.path(), role, "/loom:x", Duration::from_secs(300));
+    let outcome = run_gated(
+        &mut runner,
+        &probe,
+        root.path(),
+        role,
+        "/loom:x",
+        Duration::from_secs(300),
+        None,
+    );
     (outcome, calls.load(Ordering::SeqCst))
 }
 
@@ -514,6 +521,79 @@ fn ac6_ungated_roles_ignore_the_queue_probe() {
         let (outcome, invoked) = gate_outcome(role, Arc::new(|_, _| Ok(false)));
         assert_eq!((outcome, invoked), (RoleTickOutcome::Success, 1), "{role} dispatched");
     }
+}
+
+// -- queue kind: a REST issues listing returns PRs too (#9929) -------------
+
+/// A listing row, PR or issue, carrying `labels`.
+fn row(number: u32, is_pr: bool, labels: &[&str]) -> crate::forge_listing::RestIssue {
+    crate::forge_listing::RestIssue {
+        number,
+        title: None,
+        labels: labels.iter().map(|l| (*l).to_string()).collect(),
+        created_at: None,
+        updated_at: None,
+        closed_at: None,
+        state: "open".to_string(),
+        body: None,
+        author: None,
+        author_association: None,
+        is_pull_request: is_pr,
+        comments: 0,
+        open_sub_issues: None,
+    }
+}
+
+#[test]
+fn queue_label_kinds_follow_the_pr_lifecycle_labels() {
+    for label in ["loom:review-requested", "loom:changes-requested", "loom:pr"] {
+        assert!(queue_label_holds_prs(label), "{label} is a PR queue");
+    }
+    for label in [
+        "loom:issue",
+        "loom:triage",
+        "loom:curated",
+        "loom:curating",
+        "loom:building",
+        "loom:blocked",
+    ] {
+        assert!(!queue_label_holds_prs(label), "{label} is an issue queue");
+    }
+}
+
+/// Regression for #9929: the queue gate reads the REST issues listing, which
+/// returns pull requests alongside issues. A row of the WRONG lifecycle must
+/// never satisfy the gate — the same issue/PR conflation that let a pull
+/// request be picked up as a curation candidate and labeled `loom:curating` /
+/// `loom:curated`.
+#[test]
+fn queue_work_is_decided_on_rows_of_the_queues_own_kind() {
+    // Judge's queue is PRs: a PR row counts, an ISSUE row carrying the same
+    // label does not.
+    assert!(queue_rows_have_work(
+        "loom:review-requested",
+        &[row(306, true, &["loom:review-requested"])]
+    ));
+    assert!(!queue_rows_have_work(
+        "loom:review-requested",
+        &[row(42, false, &["loom:review-requested"])]
+    ));
+
+    // An issue queue is the mirror: a PR row must not stand in for issue work.
+    assert!(!queue_rows_have_work("loom:issue", &[row(306, true, &["loom:issue"])]));
+    assert!(queue_rows_have_work("loom:issue", &[row(42, false, &["loom:issue"])]));
+
+    // A mixed listing is satisfied by the row of the right kind, either way.
+    let mixed = [
+        row(42, false, &["loom:issue"]),
+        row(306, true, &["loom:pr"]),
+    ];
+    assert!(queue_rows_have_work("loom:review-requested", &mixed));
+    assert!(queue_rows_have_work("loom:issue", &mixed));
+
+    // An empty listing is empty for every queue.
+    assert!(!queue_rows_have_work("loom:review-requested", &[]));
+    assert!(!queue_rows_have_work("loom:issue", &[]));
 }
 
 /// AC6: `QueueEmpty` never enters the #4349 fail/recover edge — a root that
@@ -904,4 +984,43 @@ fn fairness_a_real_run_does_not_resume_and_a_new_tick_replaces_pending() {
     assert!(d.resume_after_queue_empty(&in_progress).is_none());
     assert_eq!(d.dispatch_tick(roots, &in_progress).spawned, vec![b.path().to_path_buf()]);
     let _ = join_one(&rt, &mut d);
+}
+
+// -- curator untriaged-count ordering (#9000) -------------------------------
+
+fn curator_order(ledger: &'static triggers::TriggerLedger, paths: &[PathBuf]) -> Vec<PathBuf> {
+    let factory: RunnerFactory = Arc::new(|_| {
+        Box::new(FixedRunner(RoleTickOutcome::Success, Arc::new(AtomicUsize::new(0))))
+    });
+    let d = dispatcher("curator", factory, admit_only("curator"))
+        .with_triggers(triggers::no_trigger_probe(), ledger);
+    let mut order: VecDeque<(usize, PathBuf)> = paths.iter().cloned().enumerate().collect();
+    d.order_by_untriaged(&mut order);
+    order.into_iter().map(|(_, p)| p).collect()
+}
+
+#[test]
+fn curator_visits_the_largest_untriaged_backlog_first() {
+    let ledger: &'static triggers::TriggerLedger =
+        Box::leak(Box::new(triggers::TriggerLedger::default()));
+    let (a, b, c) = (PathBuf::from("/a"), PathBuf::from("/b"), PathBuf::from("/c"));
+    let paths = vec![b.clone(), a.clone(), c.clone()];
+    // Nothing observed: round-robin order is untouched.
+    assert_eq!(curator_order(ledger, &paths), paths);
+    ledger.record_untriaged(&a, 40);
+    ledger.record_untriaged(&b, 0);
+    // `c` is unobserved and keeps its slot; A (40) outranks B (0).
+    assert_eq!(curator_order(ledger, &paths), vec![a, b, c]);
+}
+
+#[test]
+fn curator_keeps_round_robin_for_unobserved_roots() {
+    let ledger: &'static triggers::TriggerLedger =
+        Box::leak(Box::new(triggers::TriggerLedger::default()));
+    let (a, b) = (PathBuf::from("/a"), PathBuf::from("/b"));
+    let paths = vec![a.clone(), b.clone()];
+    // Only B is observed: unobserved A keeps its round-robin slot ahead of
+    // B's backlog rather than being pushed behind it.
+    ledger.record_untriaged(&b, 40);
+    assert_eq!(curator_order(ledger, &paths), vec![a, b]);
 }

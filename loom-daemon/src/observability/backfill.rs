@@ -305,7 +305,10 @@ pub fn run_backfill_pass_all(
         .map(|root| {
             run_backfill_pass(root, queue)
                 + super::lifecycle::backfill(root, queue)
+                + crate::telemetry::kinds::issue_estimate::completion::backfill(root, queue)
                 // Issue #8824: the CI telemetry journal rides the same pass.
+                // #11045: it streams from its cursor under `poll.lock`, so it
+                // never overlaps a ci_telemetry poll cycle.
                 + crate::ci_telemetry::export::backfill(root, queue)
         })
         .sum()
@@ -352,12 +355,15 @@ mod tests {
                 runtime: None,
                 provider: None,
                 profile: None,
-                complexity: None,
                 tokens_status: None,
                 tokens_status_reason: None,
+                no_phase_cause: None,
+                phase_tap_usage: Vec::new(),
                 attempt_index: None,
                 previous_sweep_id: None,
                 trigger: None,
+                dispatch_origin: None,
+                role_draw: None,
                 rework_events: None,
                 pr_numbers: None,
                 hw_lines_added: None,
@@ -412,12 +418,15 @@ mod tests {
             runtime: None,
             provider: None,
             profile: None,
-            complexity: None,
             tokens_status: None,
             tokens_status_reason: None,
+            no_phase_cause: None,
+            phase_tap_usage: Vec::new(),
             attempt_index: None,
             previous_sweep_id: None,
             trigger: None,
+            dispatch_origin: None,
+            role_draw: None,
             rework_events: None,
             pr_numbers: None,
             hw_lines_added: None,
@@ -474,12 +483,15 @@ mod tests {
             runtime: None,
             provider: None,
             profile: None,
-            complexity: None,
             tokens_status: None,
             tokens_status_reason: None,
+            no_phase_cause: None,
+            phase_tap_usage: Vec::new(),
             attempt_index: None,
             previous_sweep_id: None,
             trigger: None,
+            dispatch_origin: None,
+            role_draw: None,
             rework_events: None,
             pr_numbers: None,
             hw_lines_added: None,

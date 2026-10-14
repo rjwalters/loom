@@ -222,7 +222,7 @@ fn update_script_invocation(flag: &str) -> String {
     format!(
         "{export_line}. \"$HOME/.cargo/env\" 2>/dev/null || true\n\
          LOOM_SRC=\"{MACHINE_LOOM_SRC}\"\n\
-         \"$LOOM_SRC/defaults/scripts/cli/loom-daemon-update.sh\"{flag_suffix}\n"
+         LOOM_DAEMON_UPDATE_INVOKER=fleet-roll \"$LOOM_SRC/defaults/scripts/cli/loom-daemon-update.sh\"{flag_suffix}\n"
     )
 }
 
@@ -639,6 +639,19 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
+    /// #11044: `fleet roll` runs the script over SSH with no terminal, so it
+    /// is marked and the fleet floor confirmation never refuses it.
+    #[test]
+    fn every_update_script_invocation_is_marked_as_fleet_roll() {
+        for flag in ["--check", "--force", ""] {
+            let rendered = update_script_invocation(flag);
+            assert!(
+                rendered.contains("LOOM_DAEMON_UPDATE_INVOKER=fleet-roll \"$LOOM_SRC/defaults/scripts/cli/loom-daemon-update.sh\""),
+                "{rendered}"
+            );
+        }
+    }
+
     // ---- compare_process_and_build_time / parse_verdict_probe -------------
 
     #[test]
@@ -1040,7 +1053,7 @@ mod tests {
         registry.upsert(super::super::WorkerRecord {
             ssh_host: "worker-1".to_string(),
             repos: Vec::new(),
-            priority: 100,
+            weight: 100,
             bootstrapped_at: "2026-08-01T00:00:00Z".to_string(),
             last_verify: None,
             provider_instance_id: None,
@@ -1055,7 +1068,7 @@ mod tests {
         registry.upsert(super::super::WorkerRecord {
             ssh_host: "worker-2".to_string(),
             repos: Vec::new(),
-            priority: 100,
+            weight: 100,
             bootstrapped_at: "2026-08-01T00:00:00Z".to_string(),
             last_verify: None,
             provider_instance_id: None,
@@ -1105,7 +1118,7 @@ mod tests {
         registry.upsert(super::super::WorkerRecord {
             ssh_host: "worker-1".to_string(),
             repos: Vec::new(),
-            priority: 100,
+            weight: 100,
             bootstrapped_at: "2026-08-01T00:00:00Z".to_string(),
             last_verify: None,
             provider_instance_id: None,
@@ -1120,7 +1133,7 @@ mod tests {
         registry.upsert(super::super::WorkerRecord {
             ssh_host: "localhost".to_string(),
             repos: Vec::new(),
-            priority: 100,
+            weight: 100,
             bootstrapped_at: "2026-08-01T00:00:00Z".to_string(),
             last_verify: None,
             provider_instance_id: None,

@@ -183,7 +183,7 @@ pub struct OutcomeRecord {
     /// plan/quota exhaustion (`TOKEN_EXHAUSTED`-family) from a per-model-tier
     /// credit exhaustion (`MODEL_CREDITS_EXHAUSTED`, issue #5687) here without
     /// reading log prose — two conditions with different operator remedies
-    /// (add accounts vs. lower `sweep.tierModels` / `sweep.optimization`).
+    /// (add accounts vs. pin a cheaper model).
     /// Deliberately a SEPARATE field from `death_class` above: the two
     /// classifiers answer different questions (pre-flight workspace tripwire
     /// vs. best-effort crash cause) and are populated independently. This
@@ -222,23 +222,6 @@ pub struct OutcomeRecord {
     /// deserialize.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential: Option<crate::launch_record::CredentialAttribution>,
-    /// Shadow-mode Jev (TypeSafe) complexity classification, sampled from the
-    /// sweep's checkpoint at Builder dispatch (issue #8543) — a calibrated
-    /// second opinion beside the Curator's own `<!-- loom:complexity=<tier>
-    /// -->` marker, never a routing input itself. One of `mechanical` /
-    /// `routine` / `complex`. `None` when `TYPESAFE_API_KEY` was unset for
-    /// this sweep (the common case today — a keyless dispatch is
-    /// byte-identical to one from before #8543) or when the Jev call failed;
-    /// either way a missing key here never blocks the sweep.
-    /// `#[serde(default)]` so a journal line written before this field
-    /// existed still parses — see [`Self::crash_classification`]'s doc for
-    /// why every reader here needs that.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub jev_tier: Option<String>,
-    /// Jev's confidence in [`Self::jev_tier`] (0.0-1.0), paired with it and
-    /// under the same `None` conditions.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub jev_confidence: Option<f64>,
     /// Tap-attributed usage accounting for a **native harness** spawn (Issue
     /// #8556): the `(runtime, credential source)` tap this sweep ran on, plus
     /// whatever its native event stream reported consuming.
@@ -298,6 +281,16 @@ pub struct OutcomeRecord {
     /// any line that fails to deserialize.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tap_usage_all: Vec<crate::tap_usage::TapAccounting>,
+    /// Out-of-process phase launches (`worker run --role builder|doctor`,
+    /// Issue #11360) that named this sweep, one row per `(role, tap, model)`,
+    /// read from their own phase logs. Never folded into
+    /// [`Self::tap_usage`] /
+    /// [`Self::tap_usage_all`], which stay the parent orchestrator's own region:
+    /// the sweep's whole per-tap spend is the fold of both
+    /// ([`crate::tap_usage::RegionAccounting::sweep_totals_by_tap`]). Empty, and
+    /// absent from the line, when no phase ran out of process.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub phase_tap_usage: Vec<crate::tap_usage::PhaseTapAccounting>,
     /// Elapsed wall-clock seconds from dispatch to this terminal outcome.
     pub duration_sec: i64,
 }
@@ -340,6 +333,8 @@ pub fn append_outcome(path: &Path, record: &OutcomeRecord) -> Result<()> {
         .with_context(|| format!("opening outcomes journal {}", path.display()))?;
     writeln!(file, "{line}")
         .with_context(|| format!("appending to outcomes journal {}", path.display()))?;
+    // J1 shadow (#11346): after the legacy append, never instead of it.
+    crate::journal::execution::outcome_appended(path, record);
     Ok(())
 }
 
@@ -530,6 +525,29 @@ pub fn read_all_outcome_telemetry(path: &Path) -> Vec<telemetry::TelemetryEnvelo
         .lines()
         .filter_map(|line| serde_json::from_str(line).ok())
         .collect()
+}
+
+/// Like [`read_all_sweep_outcomes`], but `None` when the journal exists and
+/// could not be read (a directory at the path, invalid UTF-8, permissions). A
+/// missing file is a genuinely new journal and yields `Some(vec![])`, so a
+/// caller that must not fabricate "first attempt" from an unreadable journal
+/// (Issue #11280) can tell the two apart.
+#[must_use]
+pub fn try_read_all_sweep_outcomes(path: &Path) -> Option<Vec<telemetry::SweepOutcomeRecord>> {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => Some(
+            contents
+                .lines()
+                .filter_map(|line| serde_json::from_str::<telemetry::TelemetryEnvelope>(line).ok())
+                .filter_map(|envelope| match envelope.record {
+                    telemetry::TelemetryRecord::SweepOutcome(record) => Some(record),
+                    _ => None,
+                })
+                .collect(),
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(Vec::new()),
+        Err(_) => None,
+    }
 }
 
 /// Read every [`crate::telemetry::SweepOutcomeRecord`] from `path` (unwrapping
@@ -723,10 +741,9 @@ mod tests {
             crash_classification: None,
             token_name: "agent-1".to_string(),
             credential: None,
-            jev_tier: None,
-            jev_confidence: None,
             tap_usage: None,
             tap_usage_all: Vec::new(),
+            phase_tap_usage: Vec::new(),
             duration_sec: 1,
         }
     }
@@ -781,37 +798,24 @@ mod tests {
         assert_ne!(records[0].crash_classification, records[1].crash_classification);
     }
 
-    /// Issue #8543: `jev_tier`/`jev_confidence` round-trip through the
-    /// journal, and are omitted (not written as `null`) when absent — the
-    /// keyless-dispatch byte-identity requirement from the issue's AC.
+    /// Issue #11665: a journal line written while the Jev tier shadow (#8543)
+    /// existed still carries `jev_tier`/`jev_confidence`. The fields are gone,
+    /// so those keys are unknown, and an unknown key must be ignored, not make
+    /// [`read_all`] drop the line.
     #[test]
-    fn jev_tier_and_confidence_round_trip_and_are_omitted_when_absent() {
+    fn read_all_ignores_retired_jev_tier_keys_on_old_lines() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("sweep-outcomes.jsonl");
-
-        let mut with_jev = record(1, "exited");
-        with_jev.jev_tier = Some("routine".to_string());
-        with_jev.jev_confidence = Some(0.62);
-        let without_jev = record(2, "exited");
-
-        append_outcome(&path, &with_jev).unwrap();
-        append_outcome(&path, &without_jev).unwrap();
-
-        let raw = std::fs::read_to_string(&path).unwrap();
-        let lines: Vec<&str> = raw.lines().collect();
-        assert!(lines[0].contains("\"jev_tier\":\"routine\""));
-        assert!(lines[0].contains("\"jev_confidence\":0.62"));
-        assert!(
-            !lines[1].contains("jev_tier"),
-            "a record with no Jev classification must omit the key, not emit null: {}",
-            lines[1]
-        );
+        std::fs::write(
+            &path,
+            r#"{"timestamp":"2026-01-01T00:00:00Z","repo":"/repo/a","issue":1,"sweep_id":"sweep-issue-1-0","outcome":"exited","token_name":"agent-1","jev_tier":"routine","jev_confidence":0.62,"duration_sec":5}"#,
+        )
+        .unwrap();
 
         let records = read_all(&path);
-        assert_eq!(records[0].jev_tier.as_deref(), Some("routine"));
-        assert!((records[0].jev_confidence.unwrap() - 0.62).abs() < 1e-12);
-        assert_eq!(records[1].jev_tier, None);
-        assert_eq!(records[1].jev_confidence, None);
+        assert_eq!(records.len(), 1, "an old line with jev_tier must still parse");
+        assert_eq!(records[0].issue, 1);
+        assert_eq!(records[0].outcome, "exited");
     }
 
     /// Issue #5697: a journal line written before `crash_classification`
@@ -959,12 +963,15 @@ mod tests {
                 runtime: None,
                 provider: None,
                 profile: None,
-                complexity: None,
                 tokens_status: None,
                 tokens_status_reason: None,
+                no_phase_cause: None,
+                phase_tap_usage: Vec::new(),
                 attempt_index: None,
                 previous_sweep_id: None,
                 trigger: None,
+                dispatch_origin: None,
+                role_draw: None,
                 rework_events: None,
                 pr_numbers: None,
                 hw_lines_added: None,
@@ -1176,6 +1183,7 @@ mod tests {
                 gated_pool: None,
                 preference_tier: None,
                 preference_tap: None,
+                role_draw: None,
                 runtime: None,
                 provider: None,
                 profile: None,

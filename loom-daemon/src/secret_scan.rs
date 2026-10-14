@@ -314,6 +314,8 @@ fn git(repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
     Ok(out.stdout)
 }
 
+// Sibling of `shell_budget::callout::EVIDENCE_DIFF_FLAGS`; see there for why
+// the two are not shared.
 const DIFF_FLAGS: &[&str] = &[
     "-U0",
     "--no-color",
@@ -414,6 +416,28 @@ pub fn scan(scanner: &Scanner, repo: &Path, mode: &Mode) -> Result<Vec<Finding>>
         }
     }
     Ok(out)
+}
+
+/// Replace anything GitHub-token-shaped (token prefixes, `Bearer`/`token`
+/// Authorization values) with a fixed marker, for forge text that reaches a
+/// log line or a journal (moved from the retired `forge_egress::report`).
+#[must_use]
+pub fn redact(value: &str) -> String {
+    static TOKEN: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static BEARER: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    #[allow(clippy::expect_used)]
+    let token = TOKEN.get_or_init(|| {
+        Regex::new(r"\b(gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,})")
+            .expect("static token regex compiles")
+    });
+    #[allow(clippy::expect_used)]
+    let bearer = BEARER.get_or_init(|| {
+        Regex::new(r"(?i)\b(bearer|token)\s+\S{12,}").expect("static bearer regex compiles")
+    });
+    let once = token.replace_all(value, "<redacted-token>");
+    bearer
+        .replace_all(&once, "<redacted-authorization>")
+        .into_owned()
 }
 
 #[cfg(test)]

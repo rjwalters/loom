@@ -151,8 +151,19 @@ fn judge_is_refused_at_width_while_the_phase1_budget_has_room() {
 /// `demandWidth.enabled: false` is Phase 1: the ledger is never read, judge
 /// runs to its Phase 1 budget however little debt the ledger shows, and an
 /// admitted champion run makes no `loom:pr` listing.
+///
+/// Runs hold their slots until each tick has returned (gated runners): an
+/// immediately-returning runner can finish mid-walk on the 2-worker runtime
+/// and free a slot, letting the 4th root in over the budget of 3 (#9737).
+/// The body repeats so a regression of that race shows up here, not in CI.
 #[test]
 fn disabled_is_phase1_admission_with_no_ledger_read_or_listing() {
+    for _ in 0..20 {
+        disabled_is_phase1_admission_once();
+    }
+}
+
+fn disabled_is_phase1_admission_once() {
     let rt = runtime();
     let _enter = rt.enter();
     let cfg = r#"{"autonomous":{"roleRunner":{"enabled":true,"demandWidth":{"enabled":false}}}}"#;
@@ -162,17 +173,22 @@ fn disabled_is_phase1_admission_with_no_ledger_read_or_listing() {
     record_all(ledger, &roots, DebtAxis::Merge, 50);
     let reads_before = ledger.reads();
     let in_progress = new_in_progress_guard();
-    let (factory, _) = counting_factory();
+    let gate = Rounds::default();
     let mut judge = RoleDispatcher::with_decide(
         spec("judge"),
         Duration::from_secs(300),
-        Arc::clone(&factory),
+        gate.factory(),
         Arc::new(|_, _| Ok(true)),
         None,
         admit_with("judge", ledger),
     )
     .with_demand(ledger, demand::no_merge_probe());
     let tick = judge.dispatch_tick(roots.clone(), &in_progress);
+    // The tick has returned, so its count and refusal are fixed: release
+    // exactly its runs (tickets 1..=spawned) before asserting, so a failure
+    // does not leave them blocked on the gate, while champion's runs below
+    // (later tickets) stay gated until champion's tick returns.
+    gate.release(tick.spawned.len());
     assert_eq!(tick.spawned.len(), 3, "Phase 1 budget, not width 1");
     assert_eq!(
         tick.refusal,
@@ -187,13 +203,22 @@ fn disabled_is_phase1_admission_with_no_ledger_read_or_listing() {
     let mut champion = RoleDispatcher::with_decide(
         spec("champion"),
         Duration::from_secs(300),
-        factory,
+        gate.factory(),
         Arc::new(|_, _| Ok(true)),
         None,
         admit_with("champion", ledger),
     )
     .with_demand(ledger, probe);
-    assert_eq!(champion.dispatch_tick(roots, &in_progress).spawned.len(), 3);
+    let tick = champion.dispatch_tick(roots, &in_progress);
+    gate.release(usize::MAX);
+    assert_eq!(tick.spawned.len(), 3, "Phase 1 budget");
+    assert_eq!(
+        tick.refusal,
+        Some(LimitRefusal::RoleBudget {
+            active: 3,
+            budget: 3
+        })
+    );
     drain(&rt, &mut champion);
     assert_eq!(calls.load(Ordering::SeqCst), 0, "no champion listing");
     assert_eq!(ledger.reads(), reads_before, "no ledger read");

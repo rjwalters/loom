@@ -70,3 +70,43 @@ fn loom_gh_shim_0_leaves_worker_path_alone() {
     assert_eq!(child_path(&out), "/usr/bin:/bin");
     assert!(!base.exists());
 }
+
+/// #10607: the worker's agent `gh` front books into this host's (the
+/// spawner's) sink — named explicitly, as every tmux session's is (W5,
+/// `agent_session::isolation`), so a TMPDIR the runtime pins cannot send its
+/// rows somewhere the daemon never reads — and an `off` sink stays off.
+#[test]
+fn the_worker_env_names_the_spawners_sink_dir() {
+    let d = tempfile::tempdir().unwrap();
+    let host_tmp = d.path().join("host-tmp");
+    std::fs::create_dir_all(&host_tmp).unwrap();
+    let env_of = |extra: &[(&str, &str)]| {
+        let mut c = worker(d.path(), &d.path().join("shim-base"));
+        let out = c
+            .env("TMPDIR", &host_tmp)
+            .env_remove("LOOM_FORGE_CALL_STATS_DIR")
+            .env("LOOM_GH_BOOKED", "1")
+            .env("FIXTURE_PRINT_ENV", "PATH,LOOM_FORGE_CALL_STATS_DIR,LOOM_GH_BOOKED")
+            .envs(extra.iter().copied())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let get = |name: &str| {
+            let prefix = format!("child_env {name}=");
+            stdout
+                .lines()
+                .find_map(|l| l.strip_prefix(prefix.as_str()))
+                .unwrap()
+                .to_string()
+        };
+        (get("LOOM_FORGE_CALL_STATS_DIR"), get("LOOM_GH_BOOKED"))
+    };
+    let sink = host_tmp.join("loom-forge-call-stats");
+    let (named, booked) = env_of(&[]);
+    assert_eq!(named, sink.display().to_string());
+    assert_eq!(booked, "", "a worker never inherits the facade's booked marker");
+    assert!(sink.is_dir(), "created owner-only up front");
+    let (named, _) = env_of(&[("LOOM_FORGE_CALL_STATS_DIR", "off")]);
+    assert_eq!(named, "off", "an off host sink is exported as off, never a fallback");
+}

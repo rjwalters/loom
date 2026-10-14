@@ -13,7 +13,7 @@ use crate::types::{PlanGate, PlanShard, PlanState, QueueDisposition as Qd, RepoC
 fn key(ws: usize, prio: u32, number: u32) -> PriorityCandidate {
     PriorityCandidate {
         workspace_idx: ws,
-        workspace_priority: prio,
+        workspace_weight: prio,
         number,
         ..PriorityCandidate::default()
     }
@@ -33,7 +33,6 @@ fn qrow_held(
     ready_queue::TickQueueRow {
         // One priority per workspace, so rank order is (ws, number).
         key: key(ws, u32::try_from(ws).unwrap() * 10, number),
-        tier: None,
         disposition: Some(d),
         detail: None,
         updated_at: None,
@@ -138,22 +137,24 @@ fn saturation_held_leaves_next_empty() {
     assert_eq!(ctx.slots.free, Some(3));
 }
 
-/// Out-of-slice rows follow the plan, in comparator order; the slice and
-/// cap inputs are reported per row; `owning_shard` comes from the inputs.
+/// Deferred rows take their position from the shaped plan order (no slice
+/// rows trail it since #11682); the cap inputs are reported per row; and
+/// `owning_shard` still comes from the inputs — the fleet-merge primary rule
+/// reads it even though dispatch no longer shards.
 #[test]
-fn out_of_slice_rows_follow_the_plan_with_shaping_inputs() {
+fn deferred_rows_follow_the_plan_with_shaping_inputs() {
     let report = TickReport {
         queue: vec![
-            qrow(0, 1, Qd::DeferredOutOfSlice),
-            qrow(0, 2, Qd::DeferredOutOfSlice),
+            qrow(0, 1, Qd::DeferredRepoCap),
+            qrow(0, 2, Qd::DeferredRepoCap),
             qrow(1, 3, Qd::Dispatched),
             qrow(1, 4, Qd::DeferredCapacity),
         ],
-        plan_order: vec![(1, 3), (1, 4)],
-        in_slice: Some(vec![false, true]),
+        plan_order: vec![(1, 3), (1, 4), (0, 1), (0, 2)],
         repo_cap: Some(RepoCapSnapshot {
             cap: Some(2),
             occupancy: vec![0, 1],
+            occupancy_end: Vec::new(),
         }),
         max_admissions_per_tick: Some(1),
         ..TickReport::default()
@@ -171,8 +172,8 @@ fn out_of_slice_rows_follow_the_plan_with_shaping_inputs() {
     let (one, two) = (&by_issue(&rows, 1).plan, &by_issue(&rows, 2).plan);
     assert_eq!((one.position, one.plan_state), (Some(3), PlanState::Queued));
     assert_eq!(two.position, Some(4));
-    assert_eq!(one.gate, Some(PlanGate::OutOfSlice));
-    assert_eq!((one.in_slice, one.hot, one.owning_shard), (Some(false), Some(false), Some(0)));
+    assert_eq!(one.gate, Some(PlanGate::RepoCap));
+    assert_eq!((one.hot, one.owning_shard), (Some(false), Some(0)));
     assert_eq!(
         one.repo_cap,
         Some(RepoCapView {
@@ -182,23 +183,25 @@ fn out_of_slice_rows_follow_the_plan_with_shaping_inputs() {
     );
     let four = &by_issue(&rows, 4).plan;
     assert_eq!((four.position, four.plan_state), (Some(2), PlanState::Next));
-    assert_eq!((four.in_slice, four.hot, four.owning_shard), (Some(true), Some(true), Some(1)));
+    assert_eq!((four.hot, four.owning_shard), (Some(true), Some(1)));
     assert_eq!(ctx.shard.host_shard, Some(1));
     // No occupancy reading ⇒ no free-slot figure, never a guessed one.
     assert_eq!(ctx.slots.free, None);
 }
 
-/// Unsharded: the slice owns every workspace, so every row is in-slice.
+/// `in_slice` is retired (#11682): no row carries it, sharded or not.
 #[test]
-fn unsharded_marks_every_row_in_slice() {
+fn no_row_carries_the_retired_in_slice_field() {
     let report = TickReport {
         queue: vec![qrow(0, 1, Qd::Dispatched), qrow(1, 2, Qd::DeferredCapacity)],
         plan_order: vec![(0, 1), (1, 2)],
-        in_slice: Some(vec![true, true]),
         ..TickReport::default()
     };
     let (rows, ctx) = plan(&report, &inputs());
-    assert!(rows.iter().all(|r| r.plan.in_slice == Some(true)));
+    for row in &rows {
+        let wire = serde_json::to_value(row).unwrap();
+        assert!(wire.get("in_slice").is_none(), "{wire}");
+    }
     assert!(!ctx.shard.configured);
 }
 
@@ -240,7 +243,7 @@ fn mismatched_rows_are_left_unannotated() {
 
 #[test]
 fn gates_map_only_deferrals() {
-    assert_eq!(gate_of(Qd::DeferredOutOfSlice), Some(PlanGate::OutOfSlice));
+    assert_eq!(gate_of(Qd::DeferredRepoCap), Some(PlanGate::RepoCap));
     assert_eq!(gate_of(Qd::DeferredSaturation), Some(PlanGate::Saturation));
     for d in Qd::ALL {
         assert_eq!(gate_of(d).is_some(), d.state() == "ready", "{d:?}");
@@ -283,7 +286,7 @@ fn held_until_is_none_for_every_other_disposition() {
         queue: vec![
             qrow(0, 1, Qd::DeferredCapacity),
             qrow(0, 2, Qd::DeferredRampCap),
-            qrow(0, 3, Qd::DeferredOutOfSlice),
+            qrow(0, 3, Qd::DeferredRepoCap),
             qrow(0, 4, Qd::Dispatched),
             qrow(0, 5, Qd::InFlight),
             qrow(0, 6, Qd::Quarantined),

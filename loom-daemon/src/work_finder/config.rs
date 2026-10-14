@@ -3,13 +3,11 @@
 //!
 //! Split out of `work_finder.rs` (Issue #9034) for the same file-size-ratchet
 //! reason as [`super::repo_cap`] / [`super::configured_max`]: `work_finder.rs`
-//! is frozen at its current size (`.loom/docs/file-size-policy.md`), and this
-//! issue's `hostClass` / `allowHeavyLocal` fields needed room to land. Pure
-//! move plus two new fields — no other behavior change.
+//! is frozen at its current size (`.loom/docs/file-size-policy.md`).
 
 use std::path::Path;
 
-use super::{host_class, repo_cap};
+use super::repo_cap;
 
 /// The subset of `.loom/config.json → autonomous.workFinder` this module
 /// consumes. Each field is `Option` so an absent key falls through to the
@@ -35,6 +33,13 @@ pub struct WorkFinderConfig {
     /// **uncapped** rather than "use a built-in default": a non-`None` default
     /// would silently throttle every fleet on upgrade. See [`repo_cap`].
     pub max_concurrent_per_repo: Option<usize>,
+    /// `hyperparameters.dispatch.weightBonus{RedMainFix,VeryImportant,Important}`
+    /// — the workspace draw's weight bonuses (#11742), each `None` when unset.
+    /// Hyperparameters-only: there is no `autonomous.workFinder` home, so
+    /// [`parse_effective`] leaves them `None` and only [`apply_hyperparams`]
+    /// fills them (an out-of-range value is dropped). Read through
+    /// [`resolve_weight_bonus`].
+    pub weight_bonus: [Option<u32>; 3],
     /// `autonomous.workFinder.extraSkipLabels` — additional label names
     /// (Issue #6685) beyond the hardcoded [`super::PARK_LABELS`] this workspace
     /// wants the work-finder to treat as a skip/park signal (e.g. a
@@ -42,15 +47,6 @@ pub struct WorkFinderConfig {
     /// distinct from `Some(vec![])`, which an explicit `[]` in config would
     /// produce, though both resolve to the same empty-list default behavior.
     pub extra_skip_labels: Option<Vec<String>>,
-    /// `autonomous.workFinder.hostClass` — this host's declared class (Issue
-    /// #9034): `"local-dev"` | `"remote-worker"`; any other value, or the key
-    /// absent, is `None` here (unclassified). See [`host_class`].
-    pub host_class: Option<host_class::HostClass>,
-    /// `autonomous.workFinder.allowHeavyLocal` — an operator override (Issue
-    /// #9034) that suppresses the `host_class`/`loom:heavy` gate for this
-    /// workspace's autonomous loop. `None` when the key is absent (falls
-    /// through to the env var, then to `false`). See [`host_class`].
-    pub allow_heavy_local: Option<bool>,
     /// Names of **retired** config keys found in `autonomous` — currently
     /// `cpuUtilizationTarget` / `estCoresPerSweep` ([`DEPRECATED_CPU_CONFIG_KEYS`]),
     /// whose CPU-headroom admission term #4512 deleted.
@@ -127,6 +123,7 @@ pub fn parse_effective(effective: &serde_json::Value) -> WorkFinderConfig {
             .filter(|&n| n > 0)
             .and_then(|n| usize::try_from(n).ok()),
         max_concurrent_per_repo: repo_cap::parse_config(wf),
+        weight_bonus: [None; 3],
         extra_skip_labels: wf.and_then(|w| w.get("extraSkipLabels")).and_then(|v| {
             v.as_array().map(|arr| {
                 arr.iter()
@@ -137,8 +134,6 @@ pub fn parse_effective(effective: &serde_json::Value) -> WorkFinderConfig {
                     .collect()
             })
         }),
-        host_class: host_class::parse_config(wf),
-        allow_heavy_local: host_class::parse_config_allow_heavy_local(wf),
         deprecated_cpu_keys,
     }
 }
@@ -180,6 +175,40 @@ fn apply_hyperparams(effective: &serde_json::Value, config: &mut WorkFinderConfi
         .and_then(|n| usize::try_from(n).ok())
     {
         config.max_admissions_per_tick = Some(max);
+    }
+    let (lo, hi) = crate::priority_pick::WEIGHT_BONUS_RANGE;
+    for (slot, key) in config.weight_bonus.iter_mut().zip(WEIGHT_BONUS_KEYS) {
+        if let Some(points) = dispatch
+            .get(key)
+            .filter(|v| !v.is_null())
+            .and_then(serde_json::Value::as_u64)
+            .filter(|p| (lo..=hi).contains(p))
+            .and_then(|p| u32::try_from(p).ok())
+        {
+            *slot = Some(points);
+        }
+    }
+}
+
+/// The `hyperparameters.dispatch` keys of [`WorkFinderConfig::weight_bonus`],
+/// in its slot order.
+const WEIGHT_BONUS_KEYS: [&str; 3] = [
+    "weightBonusRedMainFix",
+    "weightBonusVeryImportant",
+    "weightBonusImportant",
+];
+
+/// The workspace draw's weight bonuses for `config` (#11742): each
+/// hyperparameters value, else its [`crate::priority_pick::WeightBonus`]
+/// default.
+#[must_use]
+pub fn resolve_weight_bonus(config: &WorkFinderConfig) -> crate::priority_pick::WeightBonus {
+    let d = crate::priority_pick::WeightBonus::default();
+    let [red, vi, imp] = config.weight_bonus;
+    crate::priority_pick::WeightBonus {
+        red_main_fix: red.unwrap_or(d.red_main_fix),
+        very_important: vi.unwrap_or(d.very_important),
+        important: imp.unwrap_or(d.important),
     }
 }
 
@@ -253,7 +282,3 @@ pub fn warn_deprecated_cpu_knobs(config: &WorkFinderConfig) {
         log::warn!("work_finder: {notice}");
     });
 }
-
-#[cfg(test)]
-#[path = "config_tests.rs"]
-mod tests;

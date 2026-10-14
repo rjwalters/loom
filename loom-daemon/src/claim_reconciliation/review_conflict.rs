@@ -229,7 +229,6 @@ pub fn flag_comment_body(head_sha: &str) -> String {
 /// applied, returning stdout on success.
 fn gh_pr(gh_bin: &Path, root: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let inv = match args.first().copied() {
-        Some("view") => gh_call::read("review_conflict.pr_view", gh_bin, root),
         Some("comment") => gh_call::write("review_conflict.pr_comment", gh_bin, root),
         _ => gh_call::write("review_conflict.pr_edit", gh_bin, root),
     };
@@ -245,6 +244,16 @@ fn gh_pr(gh_bin: &Path, root: &Path, args: &[&str]) -> Result<Vec<u8>> {
     Ok(out.stdout)
 }
 
+/// [`gh_pr`], re-run once after a forced per-owner re-mint when the write is
+/// refused as not accessible by the integration (#9247).
+fn gh_pr_retrying(gh_bin: &Path, root: &Path, args: &[&str]) -> Result<Vec<u8>> {
+    let op = match args.first().copied() {
+        Some("comment") => "review_conflict.pr_comment",
+        _ => "review_conflict.pr_edit",
+    };
+    crate::stale_token_retry::run(op, root, || gh_pr(gh_bin, root, args))
+}
+
 /// The PRs this pass decides on: those carrying `loom:review-requested` or
 /// `loom:merge-conflict`, keyed by number (a PR carrying both appears once).
 ///
@@ -252,9 +261,14 @@ fn gh_pr(gh_bin: &Path, root: &Path, args: &[&str]) -> Result<Vec<u8>> {
 /// candidate — but only for one whose decision it can change: a held or
 /// in-flight PR is kept whatever GitHub says, so it is never read and stays
 /// [`Mergeable::Unknown`].
+///
+/// The per-PR read answers `(mergeable, head_sha)` from one response, and a
+/// read PR's `head_sha` is that one, never the listing row's (#10382): the
+/// flag comment must name the head GitHub computed `mergeable` for. A read
+/// with no head is [`Mergeable::Unknown`].
 pub fn conflict_candidates(
     rows: &[RestPull],
-    mut mergeable: impl FnMut(u32) -> Mergeable,
+    mut mergeable: impl FnMut(u32) -> (Mergeable, Option<String>),
 ) -> BTreeMap<u32, ConflictPr> {
     rows.iter()
         .filter(|r| r.has_label(REVIEW_REQUESTED) || r.has_label(MERGE_CONFLICT))
@@ -270,7 +284,11 @@ pub fn conflict_candidates(
                 decide_review_conflict(&pr),
                 ConflictAction::Keep(ConflictKeepReason::Held | ConflictKeepReason::InFlight)
             ) {
-                pr.mergeable = mergeable(r.number);
+                let (m, head_sha) = mergeable(r.number);
+                if head_sha.is_some() {
+                    pr.mergeable = m;
+                }
+                pr.head_sha = head_sha;
             }
             (r.number, pr)
         })
@@ -282,8 +300,9 @@ pub fn conflict_candidates(
 fn flag(gh_bin: &Path, root: &Path, number: u32, head_sha: &str) -> Result<()> {
     let n = number.to_string();
     let body = flag_comment_body(head_sha);
-    gh_pr(gh_bin, root, &["comment", &n, "--body", &body])?;
-    gh_pr(
+    // Each write is its own retry (#9247): one refresh, one re-run, each.
+    gh_pr_retrying(gh_bin, root, &["comment", &n, "--body", &body])?;
+    gh_pr_retrying(
         gh_bin,
         root,
         &[
@@ -499,3 +518,7 @@ pub(super) fn reconcile_review_conflicts_sharing(
 #[cfg(test)]
 #[path = "review_conflict_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "review_conflict_stale_token_tests.rs"]
+mod stale_token_tests;

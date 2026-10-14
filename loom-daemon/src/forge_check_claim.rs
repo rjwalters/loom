@@ -22,7 +22,9 @@
 //!   registry dispatch guard, and orphan recovery use (#4123/#8551/#8940).
 //! - Leg 2 (claim label) is the same `gh issue view --json labels` read the
 //!   dispatch-side collision guard takes, classified by
-//!   [`crate::sweep_registry::preflip_labels`]'s `CLAIM_LABELS` (#4085/#7873).
+//!   [`crate::sweep_registry::preflip_labels`]'s `CLAIM_LABELS` (#4085/#7873)
+//!   — with `url` requested alongside `labels`, which costs no extra call and
+//!   is what answers the target-kind question below (#9929).
 //! - Leg 3 (fresh lease) reads the same `<!-- loom:lease … -->` comments
 //!   [`crate::claim_reconciliation::forge::fetch_freshest_lease_updated_at`]
 //!   reads, against the same `LOOM_LEASE_TTL_MINUTES` TTL (#6179/#6286), with
@@ -39,7 +41,7 @@
 //!
 //! | Exit | Meaning | stdout | What the caller must do |
 //! |---|---|---|---|
-//! | `0` | BLOCKED — reason token: `OPEN_PR #X` / `BUILDING` / `LEASE_ALREADY_HELD <host> <sweep-id>` / `BRANCH_EXISTS feature/issue-N` | the token | **Hard-abort the claim.** |
+//! | `0` | BLOCKED — reason token: `OPEN_PR #X` / `TARGET_IS_PR #N` / `FROZEN` / `BUILDING` / `LEASE_ALREADY_HELD <host> <sweep-id>` / `BRANCH_EXISTS feature/issue-N` | the token | **Hard-abort the claim.** |
 //! | [`EX_SAFE_TO_CLAIM`] (1) | verified safe to claim | empty | Claim. |
 //! | [`EX_PROBE_FAILED`] (5) | no verdict — any leg's read failed | empty | **Fail closed.** Treat as blocked; check by hand. |
 //! | [`EX_FORGE_DECLINED`] (3) | Gitea — legs 1–3 are GitHub-only | empty | Check by hand. |
@@ -50,12 +52,31 @@
 //! not answered**, which a caller must treat as blocked — never as an
 //! all-clear.
 //!
+//! `FROZEN` (#11743) is read off leg 2's label snapshot: the issue carries
+//! `loom:frozen`, which only a human removes. Like `OPEN_PR` it is never
+//! overridable.
+//!
 //! `--force-claim` overrides legs 2–4 ONLY. It must **never** override the
 //! `OPEN_PR` leg: an open linked PR is someone's *submitted work*, not a
 //! claim race — and a leg-1 read failure under `--force-claim` still exits
 //! [`EX_PROBE_FAILED`], because the one leg that cannot be overridden was
 //! never verified. Overridden blockers (and overridden read failures) are
 //! reported on stderr as warnings while the probe still answers "safe".
+//!
+//! `TARGET_IS_PR` is the second never-overridable blocker (Issue #9929). It
+//! is not a claim race at all but a **category error**: the target number is
+//! a pull request, so there is no issue here to claim and `--force-claim`
+//! cannot make one exist. It falls out of leg 2 for free — `gh issue view
+//! <n> --json labels,url` serves a PR as happily as an issue (issues and PRs
+//! share one number namespace and the `/issues/{n}` resource), and the `url`
+//! it returns is the only thing in the whole claim walk that says which kind
+//! the target actually is. Without this leg, every downstream step accepts a
+//! PR number silently: `gh issue edit <pr> --add-label loom:building`
+//! succeeds, and the issue lifecycle proceeds on something that can never
+//! close. That matches the #9929 incident's signature — a pull request
+//! carrying `loom:curating` → `loom:curated` — but the route by which it got
+//! there is unconfirmed; this leg guards Builder-style `check-claim` callers,
+//! and Curator is covered separately by its own kind probe in `curator.md`.
 //!
 //! # Cost
 //!
@@ -90,13 +111,22 @@ const YIELD_MARKER_PREFIX: &str = "<!-- loom:lease-yield host=";
 
 /// Leg 2's reading: the issue's current label snapshot, classified by the
 /// same `CLAIM_LABELS` predicate (`loom:building`/`loom:reviewing`/
-/// `loom:treating`) the dispatch collision guard uses (#4085/#7873).
+/// `loom:treating`) the dispatch collision guard uses (#4085/#7873) — plus
+/// the one answer only this leg's read can give: whether the target number
+/// is an **issue at all** ([`Self::IsPullRequest`], #9929).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LabelLeg {
+    /// The target number is a **pull request**, not an issue — the `url` the
+    /// same read returns points at `/pull/<n>`. A category error, not a
+    /// claim race: never overridable by `--force-claim` (#9929).
+    IsPullRequest,
     /// A claim label (`loom:building`/`loom:reviewing`/`loom:treating`) is
     /// present — someone already took this issue. Carries the observed
     /// claim label(s) for the refusal text.
     Claimed(Vec<String>),
+    /// Read succeeded and the issue carries `loom:frozen` (#11743): a human
+    /// took it out of every lane. Never overridable.
+    Frozen,
     /// Read succeeded; no claim label present.
     Clean,
     /// The label read failed (gh missing/failed/unparseable) — NOT evidence
@@ -254,6 +284,31 @@ pub(crate) fn decide(issue: u32, evidence: &ClaimEvidence, force_claim: bool) ->
     if stop.is_none() {
         if let Some(labels) = &evidence.labels {
             match labels {
+                // Never overridable (#9929): a PR number is not a claimable
+                // issue under any flag. Returned directly rather than through
+                // `overridable`, which is reserved for legs --force-claim may
+                // buy past.
+                LabelLeg::IsPullRequest => {
+                    return blocked(
+                        issue,
+                        &format!("TARGET_IS_PR #{issue}"),
+                        "that number is a pull request, not an issue — issues and PRs share one \
+                         number namespace, so `gh issue view`/`gh issue edit` accept it \
+                         silently and the issue lifecycle would proceed on something that \
+                         can never close (#9929). --force-claim never overrides this leg: \
+                         there is no issue here to claim."
+                            .to_string(),
+                    );
+                }
+                LabelLeg::Frozen => {
+                    return blocked(
+                        issue,
+                        "FROZEN",
+                        "the issue is `loom:frozen` (#11743): not now, don't touch. Only a \
+                         human removes the label, and --force-claim never overrides it."
+                            .to_string(),
+                    );
+                }
                 LabelLeg::Claimed(claims) => {
                     stop = overridable(
                         format!(
@@ -354,6 +409,26 @@ pub(crate) fn decide(issue: u32, evidence: &ClaimEvidence, force_claim: bool) ->
     }
 }
 
+/// Does a forge item URL name a **pull request** rather than an issue (#9929)?
+///
+/// Matches GitHub web (`…/owner/repo/pull/306`), GitHub REST
+/// (`…/repos/owner/repo/pulls/306`) and Gitea (`…/owner/repo/pulls/306`), by
+/// requiring the *path segment immediately before the number* to be
+/// `pull`/`pulls` — not a bare substring search, which would misread a
+/// repository literally named `pull` (`…/me/pull/issues/5`) as a PR.
+#[must_use]
+pub(crate) fn url_is_pull_request(url: &str) -> bool {
+    let path = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let mut segments = path.split('/').filter(|s| !s.is_empty()).rev();
+    let Some(number) = segments.next() else {
+        return false;
+    };
+    if number.is_empty() || !number.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    matches!(segments.next(), Some("pull" | "pulls"))
+}
+
 // ---------------------------------------------------------------------------
 // Leg readers (all I/O; every decision above them is pure)
 // ---------------------------------------------------------------------------
@@ -362,12 +437,22 @@ pub(crate) fn decide(issue: u32, evidence: &ClaimEvidence, force_claim: bool) ->
 /// [`CLAIM_LABELS`] predicate the dispatch collision guard uses
 /// (`SweepRegistry::classify_preflip_labels` — same `gh issue view --json
 /// labels` call, same fail-closed `Unknown` on any unreadable answer).
+///
+/// Also answers leg 2's second question (#9929): `url` is requested alongside
+/// `labels` — one field on the read that was already being made, zero extra
+/// forge calls — and a `/pull/` path means the target is a pull request, not
+/// an issue ([`LabelLeg::IsPullRequest`]). `gh issue view` serves a PR number
+/// without complaint, so this is the only point in the claim walk where the
+/// target's *kind* is observable at all.
 pub(crate) fn read_claim_labels(gh_bin: &Path, root: &Path, issue: u32) -> LabelLeg {
     // #10089: counted via the facade (`claim.labels`); it supplies the #5401
     // cross-owner GH_CONFIG_DIR from `root`. `gh issue view` takes --repo
     // (unlike `gh api`, #8263).
+    // W4-C: a claim check reads labels its own caller may just have
+    // written: the writer answers.
     let inv = crate::claim_reconciliation::gh_call::read("claim.labels", gh_bin, root)
-        .args(["issue", "view", &issue.to_string(), "--json", "labels"])
+        .writer_identity()
+        .args(["issue", "view", &issue.to_string(), "--json", "labels,url"])
         .args(crate::claim_reconciliation::gh_call::loom_repo_flag());
     let Ok(out) = crate::claim_reconciliation::gh_call::output(inv) else {
         return LabelLeg::Unknown;
@@ -375,10 +460,22 @@ pub(crate) fn read_claim_labels(gh_bin: &Path, root: &Path, issue: u32) -> Label
     if !out.status.success() {
         return LabelLeg::Unknown;
     }
-    // `gh issue view --json labels` emits `{"labels":[{"name":"..."},…]}`.
+    // `gh issue view --json labels,url` emits
+    // `{"labels":[{"name":"..."},…],"url":"https://…/issues/42"}`.
     let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
         return LabelLeg::Unknown;
     };
+    // Kind before claim state (#9929): on a PR, the label snapshot is a true
+    // read of the wrong object, so there is nothing to classify.
+    if let Some(url) = parsed.get("url").and_then(|u| u.as_str()) {
+        if url_is_pull_request(url) {
+            return LabelLeg::IsPullRequest;
+        }
+    }
+    // An absent/non-string `url` is NOT evidence of a PR, and does not make
+    // the *label* question unanswerable either — `gh` always returns a
+    // requested field, so this only arises against a stub, where the
+    // pre-#9929 label-only behavior is the right fallback.
     let Some(arr) = parsed.get("labels").and_then(|l| l.as_array()) else {
         return LabelLeg::Unknown;
     };
@@ -386,6 +483,9 @@ pub(crate) fn read_claim_labels(gh_bin: &Path, root: &Path, issue: u32) -> Label
         .iter()
         .filter_map(|l| l.get("name").and_then(|n| n.as_str()).map(String::from))
         .collect();
+    if crate::work_finder::is_frozen(&labels) {
+        return LabelLeg::Frozen;
+    }
     let claims = claim_labels_in(&labels);
     if claims.is_empty() {
         LabelLeg::Clean
@@ -477,7 +577,9 @@ pub(crate) fn read_freshest_live_lease(
     let jq = format!(
         r#".[] | select(.body != null and ((.body | startswith("{LEASE_MARKER_PREFIX}")) or (.body | startswith("{YIELD_MARKER_PREFIX}")))) | {{updated_at: .updated_at, body: .body, {AUTHOR_JQ}}}"#
     );
+    // W4-C: the lease being checked may be the caller's own, just written.
     let inv = crate::claim_reconciliation::gh_call::read("claim.lease_comments", gh_bin, root)
+        .writer_identity()
         .args([
             "api",
             &format!("repos/{{owner}}/{{repo}}/issues/{issue}/comments"),
@@ -662,6 +764,18 @@ mod tests {
             assert_eq!(v.code, 0, "{label}");
             assert_eq!(v.stdout, "BUILDING", "{label}");
             assert!(v.stderr.contains(label), "{}", v.stderr);
+        }
+    }
+
+    #[test]
+    fn a_frozen_issue_is_blocked_with_the_frozen_token_even_when_forced() {
+        for force in [false, true] {
+            let v = decide(
+                11743,
+                &evidence(OpenPrProbe::NoneOpen, Some(LabelLeg::Frozen), None, None),
+                force,
+            );
+            assert_eq!((v.code, v.stdout.as_str()), (0, "FROZEN"), "force={force}");
         }
     }
 
@@ -936,6 +1050,85 @@ mod tests {
         path
     }
 
+    // --- Target kind: a PR number is not a claimable issue (#9929) ----------
+
+    #[test]
+    fn url_is_pull_request_reads_the_segment_before_the_number() {
+        for pr in [
+            "https://github.com/rjwalters/loom/pull/9932",
+            "https://api.github.com/repos/rjwalters/loom/pulls/9932",
+            "https://gitea.example.com/owner/repo/pulls/306",
+            "github.com/o/r/pull/1",
+        ] {
+            assert!(url_is_pull_request(pr), "{pr} is a PR URL");
+        }
+        for issue in [
+            "https://github.com/rjwalters/loom/issues/9929",
+            "https://api.github.com/repos/rjwalters/loom/issues/9929",
+            // A repository literally named `pull` must not read as a PR —
+            // the reason this is a segment test, not a substring search.
+            "https://github.com/me/pull/issues/5",
+            "https://github.com/me/pulls/issues/5",
+            // No trailing number at all.
+            "https://github.com/rjwalters/loom/pull",
+            "",
+        ] {
+            assert!(!url_is_pull_request(issue), "{issue} is not a PR URL");
+        }
+    }
+
+    /// The #9929 refusal: a pull-request target is blocked with its own token
+    /// and, like `OPEN_PR`, cannot be bought past — there is no issue to
+    /// claim, so forcing is meaningless rather than merely risky.
+    #[test]
+    fn pull_request_target_is_blocked_and_never_overridable() {
+        for force in [false, true] {
+            let v = decide(
+                306,
+                &evidence(OpenPrProbe::NoneOpen, Some(LabelLeg::IsPullRequest), None, None),
+                force,
+            );
+            assert_eq!(v.code, 0, "force={force}: a PR target must block");
+            assert_eq!(v.stdout, "TARGET_IS_PR #306");
+            assert!(v.stderr.contains("a pull request, not an issue"), "{}", v.stderr);
+            assert!(v.stderr.contains("Hard-abort"), "{}", v.stderr);
+        }
+    }
+
+    /// The whole point of leg 2 carrying the kind question: the read that
+    /// already happens is the one that can answer it. A PR payload resolves
+    /// to `IsPullRequest` even when its labels look perfectly claimable —
+    /// which is exactly the #9929 shape (a PR wearing issue-lifecycle
+    /// labels), and `gh issue view` serves it without complaint.
+    #[test]
+    fn read_claim_labels_detects_a_pull_request_target() {
+        let dir = tempdir().unwrap();
+
+        let pr = write_exec(
+            dir.path(),
+            "gh-pr.sh",
+            r#"echo '{"labels":[{"name":"loom:curated"}],"url":"https://github.com/o/r/pull/306"}'"#,
+        );
+        assert_eq!(read_claim_labels(&pr, dir.path(), 306), LabelLeg::IsPullRequest);
+
+        // A PR whose labels would otherwise read as a claim: still the kind
+        // refusal, not BUILDING — the claim question does not apply.
+        let claimed_pr = write_exec(
+            dir.path(),
+            "gh-claimed-pr.sh",
+            r#"echo '{"labels":[{"name":"loom:building"}],"url":"https://github.com/o/r/pull/306"}'"#,
+        );
+        assert_eq!(read_claim_labels(&claimed_pr, dir.path(), 306), LabelLeg::IsPullRequest);
+
+        // A real issue URL is unaffected.
+        let real_issue = write_exec(
+            dir.path(),
+            "gh-issue.sh",
+            r#"echo '{"labels":[{"name":"loom:issue"}],"url":"https://github.com/o/r/issues/42"}'"#,
+        );
+        assert_eq!(read_claim_labels(&real_issue, dir.path(), 42), LabelLeg::Clean);
+    }
+
     #[test]
     fn read_claim_labels_distinguishes_claimed_clean_and_unknown() {
         let dir = tempdir().unwrap();
@@ -956,6 +1149,17 @@ mod tests {
             r#"echo '{"labels":[{"name":"loom:issue"},{"name":"loom:curated"}]}'"#,
         );
         assert_eq!(read_claim_labels(&clean, dir.path(), 42), LabelLeg::Clean);
+
+        // #11743: frozen wins over a claim label; `loom:frozen-x` is not frozen.
+        let frozen = write_exec(
+            dir.path(),
+            "gh-frozen.sh",
+            r#"echo '{"labels":[{"name":"loom:building"},{"name":"loom:frozen"}]}'"#,
+        );
+        assert_eq!(read_claim_labels(&frozen, dir.path(), 42), LabelLeg::Frozen);
+        let near =
+            write_exec(dir.path(), "gh-near.sh", r#"echo '{"labels":[{"name":"loom:frozen-x"}]}'"#);
+        assert_eq!(read_claim_labels(&near, dir.path(), 42), LabelLeg::Clean);
 
         let failing = write_exec(dir.path(), "gh-fail.sh", "echo 'gh blew up' >&2\nexit 1");
         assert_eq!(read_claim_labels(&failing, dir.path(), 42), LabelLeg::Unknown);

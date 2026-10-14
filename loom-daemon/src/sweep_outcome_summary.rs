@@ -76,8 +76,7 @@ use crate::runtime_preference::CredentialSource;
 use crate::sweep_outcomes;
 use crate::telemetry::{SweepOutcomeRecord, SweepResult, TelemetryRecord};
 
-mod agreement;
-mod complexity;
+mod first_pass;
 mod group_by;
 
 pub use group_by::GroupBy;
@@ -327,8 +326,6 @@ pub fn collect_records(workspace_root: &Path) -> Vec<SummaryRecord> {
 #[derive(Debug, Clone, Default)]
 pub struct SpawnDeathIndex {
     classes: BTreeMap<String, Vec<String>>,
-    /// `sweep_id` -> Jev's shadow tier, for the #8608 agreement join.
-    jev_tiers: BTreeMap<String, String>,
 }
 
 impl SpawnDeathIndex {
@@ -345,9 +342,6 @@ impl SpawnDeathIndex {
     /// Merge another workspace's sibling-journal records into this index.
     pub fn absorb(&mut self, records: &[sweep_outcomes::OutcomeRecord]) {
         for record in records {
-            if let Some(tier) = &record.jev_tier {
-                self.jev_tiers.insert(record.sweep_id.clone(), tier.clone());
-            }
             let entry = self.classes.entry(record.sweep_id.clone()).or_default();
             for class in [
                 record.death_class.as_deref(),
@@ -848,9 +842,6 @@ pub struct GroupRow {
     /// judged sweeps, never a fabricated `0.0`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub first_pass_approval_rate: Option<f64>,
-    /// Curator-vs-Jev agreement split (#8608); complexity groupings only.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub agreement: Option<agreement::AgreementSplit>,
 }
 
 /// The whole report.
@@ -883,9 +874,6 @@ pub struct SummaryReport {
     pub merge_join: MergeJoinStatus,
     /// One row per group, ordered by `sweeps` descending then group name.
     pub rows: Vec<GroupRow>,
-    /// Every row's agreement split summed (#8608); complexity groupings only.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub agreement_totals: Option<agreement::AgreementSplit>,
     /// Caveats that apply to this particular report (degenerate host
     /// grouping, inferred arms, an unavailable merge join, ...).
     pub notes: Vec<String>,
@@ -992,7 +980,6 @@ struct Accum {
     /// Of `first_pass_judged`, how many had `judge_verdicts[0].verdict ==
     /// "pass"`.
     first_pass_approved: usize,
-    agreement: agreement::AgreementSplit,
 }
 
 /// Aggregate `records` into a [`SummaryReport`].
@@ -1039,13 +1026,7 @@ pub fn summarize(
                 }
                 (arm, Some(source))
             }
-            GroupBy::Model => (complexity::resolve_model_label(record), None),
-            GroupBy::Complexity => (complexity::resolve_complexity(record), None),
-            GroupBy::ModelComplexity => {
-                let model = complexity::resolve_model_label(record);
-                let tier = complexity::resolve_complexity(record);
-                (format!("{model}/{tier}"), None)
-            }
+            GroupBy::Model => (first_pass::resolve_model_label(record), None),
             GroupBy::Repo => {
                 // Issue #9442: an unresolved repo groups under UNKNOWN_GROUP —
                 // records never carry a path to trim.
@@ -1094,8 +1075,7 @@ pub fn summarize(
         if doctor_engaged(record) {
             acc.doctor += 1;
         }
-        complexity::accumulate_first_pass(acc, record);
-        acc.agreement.accumulate(record, index);
+        first_pass::accumulate_first_pass(acc, record);
         if let Some(usd) = weighted_tokens_usd(record) {
             acc.weighted_usd += usd;
             acc.weighted_records += 1;
@@ -1209,7 +1189,6 @@ pub fn summarize(
                 #[allow(clippy::cast_precision_loss)]
                 first_pass_approval_rate: (acc.first_pass_judged > 0)
                     .then(|| acc.first_pass_approved as f64 / acc.first_pass_judged as f64),
-                agreement: agreement::finish(&acc.agreement, opts.group_by),
             }
         })
         .collect();
@@ -1255,11 +1234,6 @@ pub fn summarize(
             ));
         }
     }
-    if let Some(note) = complexity::unknown_group_note(opts.group_by, &rows) {
-        notes.push(note);
-    }
-    notes.extend(agreement::unknown_agreement_note(&rows));
-    let agreement_totals = agreement::totals(&rows, opts.group_by);
     if !opts.merge_join_attempted {
         notes.push(
             "merge join skipped (--no-merge-join): merged_prs is unavailable, NOT zero."
@@ -1297,7 +1271,6 @@ pub fn summarize(
             cache_path: None,
         },
         rows,
-        agreement_totals,
         notes,
     }
 }
@@ -1395,7 +1368,7 @@ pub fn render_text(report: &SummaryReport) -> String {
         let merged = row
             .merged_prs
             .map_or_else(|| "n/a".to_string(), |m| m.to_string());
-        let (first_pass, first_pass_judged) = complexity::render_first_pass_tail(row);
+        let (first_pass, first_pass_judged) = first_pass::render_first_pass_tail(row);
         let tail = format!(
             "{:>6} {:>5} {:>5} {:>5} {:>5} {:>8.1}% {:>7} {:>7} {:>7.1}% {:>7} {:>9} {:>9} {:>8} {:>8} {:>7} {:>6}",
             row.sweeps,
@@ -1426,14 +1399,13 @@ pub fn render_text(report: &SummaryReport) -> String {
         }
     }
 
-    out.push_str(&agreement::render_text(report));
     out.push('\n');
     out.push_str(&format!("Rate card: {}\n", report.rate_card.caveat));
     out.push_str(
         "Doctor% is approximate: derived from sampled phase_durations until doctor_cycles lands \
          (#8056).\n",
     );
-    out.push_str(complexity::FIRST_PASS_NOTE);
+    out.push_str(first_pass::FIRST_PASS_NOTE);
     for note in &report.notes {
         out.push_str(&format!("Note: {note}\n"));
     }

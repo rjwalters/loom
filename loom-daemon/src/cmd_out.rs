@@ -98,6 +98,16 @@ pub enum Unavailable {
         after: Duration,
         partial_stdout: Vec<u8>,
     },
+    /// The managed `gh` launcher exited `78`: routing is blocked (#9987).
+    /// Not an answer from GitHub, so never retried nor read as "no results".
+    RoutingBlocked(String),
+    /// The managed `gh` launcher exited `69`: its adapter is down (#9987).
+    AdapterUnavailable(String),
+    /// Not run (W4-C): a deferrable forge read whose reader budget is
+    /// exhausted until `until`. Nothing was sent. Its text deliberately
+    /// matches no rate-limit signature, so feeding it to the rate-limit
+    /// breaker can never trip it.
+    Shed { until: std::time::SystemTime },
 }
 
 impl std::fmt::Display for Unavailable {
@@ -106,6 +116,14 @@ impl std::fmt::Display for Unavailable {
             Unavailable::Spawn(e) => write!(f, "could not start: {e}"),
             Unavailable::Collect(e) => write!(f, "could not collect output: {e}"),
             Unavailable::TimedOut { after, .. } => write!(f, "timed out after {after:?}"),
+            Unavailable::RoutingBlocked(e) => write!(f, "routing_blocked: {e}"),
+            Unavailable::AdapterUnavailable(e) => write!(f, "adapter_unavailable: {e}"),
+            Unavailable::Shed { until } => write!(
+                f,
+                "deferred: reader budget low until {} (loom-shed)",
+                chrono::DateTime::<chrono::Utc>::from(*until)
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            ),
         }
     }
 }
@@ -295,7 +313,12 @@ pub fn run_command(cmd: Command, timeout: Duration) -> CmdOutcome {
 }
 
 fn finish(cmd: Command, timeout: Duration) -> CmdOutcome {
-    match run_bounded(cmd, timeout) {
+    outcome_of(run_bounded(cmd, timeout), timeout)
+}
+
+/// Classify an already-run [`run_bounded`]-style result as [`finish`] does.
+pub fn outcome_of(result: Result<Completion, ExecError>, timeout: Duration) -> CmdOutcome {
+    match result {
         Ok(Completion::Exited(out)) => CmdOutcome::Ran(out),
         Ok(Completion::TimedOut { stdout, .. }) => CmdOutcome::Unavailable(Unavailable::TimedOut {
             after: timeout,

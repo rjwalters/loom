@@ -15,7 +15,6 @@
 //! abnormal ending occurred, must never see a `loom.runtime.run` span for a
 //! model run that was never launched, and must never see an `Ok` one whose exit
 //! nobody observed.
-#![cfg(feature = "otlp")]
 #![allow(clippy::unwrap_used)]
 use loom_daemon::{
     observability::{lifecycle, queue::DurableQueue},

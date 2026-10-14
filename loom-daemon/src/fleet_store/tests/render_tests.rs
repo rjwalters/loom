@@ -109,6 +109,47 @@ fn check_reports_each_differing_path() {
 }
 
 #[test]
+fn lost_top_level_keys_names_what_a_write_would_drop() {
+    // 2am#1653's shape: the on-disk machine tier is rich, the store render
+    // carries one of its blocks — the write would drop the rest.
+    let p = paths();
+    std::fs::create_dir_all(p.machine.parent().unwrap()).unwrap();
+    std::fs::write(
+        &p.machine,
+        r#"{"runtimes":{"judge":"claude"},"autonomous":{"roleRunner":{}},"safehouse":{},"forge":{"githubApp":{"appId":"1"}}}"#,
+    )
+    .unwrap();
+    let store = snapshot_of(&sample_files()); // renders autonomous + forge only
+    let targets = render(&store, "build-1", &p.machine, &p.local).unwrap();
+    let machine = targets.iter().find(|t| t.tier == Tier::Machine).unwrap();
+    let mut lost = lost_top_level_keys(machine);
+    lost.sort();
+    assert_eq!(lost, vec!["runtimes", "safehouse"]);
+}
+
+#[test]
+fn lost_top_level_keys_is_empty_when_nothing_is_lost_or_unreadable() {
+    let p = paths();
+    std::fs::create_dir_all(p.machine.parent().unwrap()).unwrap();
+    // target ⊇ disk: nothing lost
+    std::fs::write(&p.machine, r#"{"forge":{}}"#).unwrap();
+    let store = snapshot_of(&sample_files());
+    let targets = render(&store, "build-1", &p.machine, &p.local).unwrap();
+    let machine = targets.iter().find(|t| t.tier == Tier::Machine).unwrap();
+    assert!(lost_top_level_keys(machine).is_empty());
+    // unparseable disk: the separate error class, not a lossy reduction
+    std::fs::write(&p.machine, "not json").unwrap();
+    let targets = render(&store, "build-1", &p.machine, &p.local).unwrap();
+    let machine = targets.iter().find(|t| t.tier == Tier::Machine).unwrap();
+    assert!(lost_top_level_keys(machine).is_empty());
+    // missing disk: nothing to lose
+    std::fs::remove_file(&p.machine).unwrap();
+    let targets = render(&store, "build-1", &p.machine, &p.local).unwrap();
+    let machine = targets.iter().find(|t| t.tier == Tier::Machine).unwrap();
+    assert!(lost_top_level_keys(machine).is_empty());
+}
+
+#[test]
 fn unparseable_target_is_drift() {
     let p = paths();
     let targets = render(&snapshot_of(&sample_files()), "build-1", &p.machine, &p.local).unwrap();
@@ -205,4 +246,59 @@ fn drifted_paths_is_empty_for_a_missing_or_unparseable_file() {
     std::fs::create_dir_all(p.machine.parent().unwrap()).unwrap();
     std::fs::write(&p.machine, "{ <<<<<<< HEAD").unwrap();
     assert!(drifted_paths(&targets[0]).is_empty(), "unparseable file");
+}
+
+// ===== per-repo fleet tier (#11738) =====
+
+fn repo_target(dir: &Path, value: Option<Value>) -> RepoTarget {
+    RepoTarget {
+        name: "app".into(),
+        path: dir.join(crate::config_resolver::FLEET_REPO_CONFIG_REL),
+        value,
+    }
+}
+
+#[test]
+fn repo_target_with_a_value_drifts_and_writes_like_any_tier() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = repo_target(dir.path(), Some(json!({"a": {"b": 1}})));
+    assert_eq!(repo_drift(&t), Drift::Missing);
+    let target = t.target().unwrap();
+    assert_eq!(target.tier, Tier::Repo);
+    assert_eq!(write(&target, "20260101T000000Z").unwrap(), (true, None));
+    assert_eq!(repo_drift(&t), Drift::InSync);
+    // Semantic, not textual.
+    std::fs::write(&t.path, r#"{"a":{"b":1}}"#).unwrap();
+    assert_eq!(repo_drift(&t), Drift::InSync);
+    std::fs::write(&t.path, r#"{"a":{"b":2}}"#).unwrap();
+    assert_eq!(repo_drift(&t), Drift::Differs(vec!["~ a.b: 2 -> 1".to_string()]));
+}
+
+#[test]
+fn repo_target_without_a_value_is_drift_only_when_the_file_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = repo_target(dir.path(), None);
+    assert!(t.target().is_none());
+    assert_eq!(repo_drift(&t), Drift::InSync);
+    std::fs::create_dir_all(t.path.parent().unwrap()).unwrap();
+    std::fs::write(&t.path, "{}").unwrap();
+    assert!(matches!(repo_drift(&t), Drift::Differs(_)));
+}
+
+#[test]
+fn remove_keeps_the_file_as_the_one_backup() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fleet-repo.json");
+    assert_eq!(remove(&path, "20260101T000000Z").unwrap(), (false, None));
+    std::fs::write(&path, r#"{"a": 1}"#).unwrap();
+    let old = dir
+        .path()
+        .join("fleet-repo.json.fleet-store-bak-20250101T000000Z");
+    std::fs::write(&old, "{}").unwrap();
+    let (removed, backup) = remove(&path, "20260101T000000Z").unwrap();
+    assert!(removed);
+    let backup = backup.unwrap();
+    assert!(!path.exists());
+    assert_eq!(std::fs::read_to_string(&backup).unwrap(), r#"{"a": 1}"#);
+    assert!(!old.exists(), "older backups of this file are pruned to one");
 }

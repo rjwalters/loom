@@ -242,11 +242,23 @@ fn repo_ci_yml_is_merge_group_qualified_for_its_required_checks() {
     assert!(ci.relied_on && ci.merge_group_trigger);
 }
 
+/// The image jobs, the ONE operator-approved push-time path filter (#10825):
+/// on push they run only when `changes-push` says so, so their push state is
+/// undecidable statically. They must still run unconditionally on merge_group.
+const PUSH_FILTERED_IMAGE_JOBS: [&str; 4] = [
+    "worker-base-image",
+    "worker-image-smoke",
+    "session-image-smoke",
+    "native-image-smoke",
+];
+
 #[test]
 fn repo_ci_yml_preserves_pull_request_and_push_coverage() {
     // Adding merge_group must not take anything away from PR or push runs:
     // every job except the PR-only path filter still runs on push, and every
-    // job may still run on a PR.
+    // job may still run on a PR. Exceptions, each named explicitly: the
+    // push-only image detector `changes-push`, the image jobs it gates, and
+    // the main-push-only cache writer `worker-buildcache` (#10846).
     let src = std::fs::read_to_string(repo_root().join(".github/workflows/ci.yml")).unwrap();
     let w = wf("ci.yml", &src);
     for t in ["push", "pull_request", "merge_group"] {
@@ -255,12 +267,37 @@ fn repo_ci_yml_preserves_pull_request_and_push_coverage() {
     assert!(!w.trigger("pull_request").unwrap().path_filtered);
     let r = run(&w, &[]);
     for j in &r.jobs {
-        if j.id == "changes" {
+        if j.id == "changes" || j.id == "changes-images" {
             assert!(j.pr_only_marker.is_some());
             assert_eq!(j.states[&Event::PullRequest], RunState::Runs);
             continue;
         }
-        assert_eq!(j.states[&Event::Push], RunState::Runs, "{} no longer runs on push", j.id);
+        if j.id == "changes-push" {
+            assert_eq!(j.states[&Event::Push], RunState::Runs);
+            assert_eq!(j.states[&Event::PullRequest], RunState::Skipped);
+            assert_eq!(j.states[&Event::MergeGroup], RunState::Skipped);
+            assert!(!j.relied_on, "changes-push must not be a relied-on suite");
+            continue;
+        }
+        if j.id == "worker-buildcache" {
+            // The one `packages: write` job: never on pull_request or
+            // merge_group, so it is not a relied-on suite. Its push state is
+            // decided by `github.repository`/`changes-push`, not asserted here.
+            assert_eq!(j.states[&Event::PullRequest], RunState::Skipped);
+            assert_eq!(j.states[&Event::MergeGroup], RunState::Skipped);
+            assert!(!j.relied_on, "worker-buildcache must not be a relied-on suite");
+            continue;
+        }
+        if PUSH_FILTERED_IMAGE_JOBS.contains(&j.id.as_str()) {
+            assert_ne!(
+                j.states[&Event::Push],
+                RunState::Skipped,
+                "{} can no longer run on push",
+                j.id
+            );
+        } else {
+            assert_eq!(j.states[&Event::Push], RunState::Runs, "{} no longer runs on push", j.id);
+        }
         assert_ne!(
             j.states[&Event::PullRequest],
             RunState::Skipped,
@@ -297,6 +334,20 @@ fn audit_flags_the_pre_10257_ci_yml_shape() {
         .filter(|f| f.code == Code::PrOnlyCondition)
         .count();
     assert!(skipped >= 10, "expected the path-filtered suites to be flagged, got {skipped}");
+
+    // The image jobs' gate (#10825) short-circuits on merge_group first; drop
+    // that and each one must be flagged as skipped on the combined tree.
+    let image_gate =
+        "always() && (github.event_name == 'merge_group' ||\n      (github.event_name == 'push'";
+    assert_eq!(src.matches(image_gate).count(), PUSH_FILTERED_IMAGE_JOBS.len());
+    let no_mg_images = src.replace(image_gate, "always() && (\n      (github.event_name == 'push'");
+    let r = run(&wf("ci.yml", &no_mg_images), &req);
+    for job in PUSH_FILTERED_IMAGE_JOBS {
+        assert!(
+            codes_for(&r, Some(job)).contains(&Code::PrOnlyCondition),
+            "{job} not flagged when its merge_group short-circuit is removed"
+        );
+    }
 
     let pr_only_step = src.replace(
         "(github.event_name == 'pull_request' || github.event_name == 'merge_group') }}",

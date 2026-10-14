@@ -1,5 +1,4 @@
 //! Explicit one-shot fixture replay for testing installed OTLP artifacts.
-#[cfg(feature = "otlp")]
 use anyhow::Context;
 use anyhow::Result;
 use std::path::PathBuf;
@@ -17,12 +16,6 @@ pub(crate) struct TelemetryExportArgs {
     key_file: PathBuf,
 }
 impl TelemetryExportArgs {
-    #[cfg(not(feature = "otlp"))]
-    pub(crate) async fn run(self) -> Result<()> {
-        anyhow::bail!("this binary was built without the otlp feature")
-    }
-
-    #[cfg(feature = "otlp")]
     pub(crate) async fn run(self) -> Result<()> {
         use loom_daemon::observability::{endpoint_policy, exporter::Exporter, otlp::OtlpExporter};
         use std::io::Read;

@@ -1043,6 +1043,13 @@ impl SweepRegistry {
         if self.config.skip_label_flip {
             return;
         }
+        // Body park record first (#10161); a timeout stops here (park_hold.rs),
+        // and so does a `loom:frozen` issue (#11743).
+        if self.record_daemon_hold(issue, park_hold::QUARANTINE_HOLD_REASON)
+            != Ok(park_hold::HoldGate::Proceed)
+        {
+            return;
+        }
         // Counted as `quarantine.*` (#10089); the facade scopes each call to
         // the registry's workspace (#5401 GH_CONFIG_DIR). Bounded (Issue
         // #3973): quarantine runs from `reap_once`, on the `ListSweeps` /
@@ -1113,6 +1120,9 @@ impl SweepRegistry {
         // Counted as `quarantine.release` (#10089). Bounded (Issue #3973):
         // expire_quarantine runs from `reap_once`, on the read path.
         let issue_arg = issue.to_string();
+        let Some(restore) = self.quarantine_release_plan(issue) else {
+            return true;
+        };
         let mut edit = vec![
             "issue",
             "edit",
@@ -1120,7 +1130,9 @@ impl SweepRegistry {
             "--remove-label",
             "loom:blocked",
         ];
-        edit.extend(["--add-label", "loom:issue"]);
+        if restore {
+            edit.extend(["--add-label", "loom:issue"]);
+        }
         let repo_flag = crate::claim_reconciliation::gh_call::loom_repo_flag();
         edit.extend(repo_flag.iter().map(String::as_str));
         let timeout = reap_gh_timeout();
@@ -2250,11 +2262,12 @@ exit 0
     /// retry it — reproducing the exact reported end state (`quarantine
     /// clear` -> "was not quarantined", forge still `loom:blocked`).
     ///
-    /// The fake `gh` fails its first three invocations (a counter file
+    /// The fake `gh` fails its first five invocations (a counter file
     /// tracks remaining failures) — enough to survive the Issue #4206
     /// manual-repark probe `expire_quarantine` now runs first, the
     /// `expire_quarantine` release attempt itself, AND the same-tick
-    /// `retry_pending_quarantine_releases` pass — so the first `reap_once`
+    /// `retry_pending_quarantine_releases` pass, each attempt being the #11480
+    /// veto's label read plus the edit — so the first `reap_once`
     /// tick genuinely ends with the issue still pending, and only the second
     /// tick's retry succeeds. The probe call fails open (a failed/unparsable
     /// read is never treated as a manual repark), so it does not change the
@@ -2265,7 +2278,7 @@ exit 0
         let dir = tempdir().unwrap();
         let gh_log = dir.path().join("gh-invocations.log");
         let fail_counter = dir.path().join("fails-remaining");
-        std::fs::write(&fail_counter, "3").unwrap();
+        std::fs::write(&fail_counter, "5").unwrap();
         let fake_gh = dir.path().join("fake-gh.sh");
         let script = format!(
             "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{log}\"\ncount=$(cat \"{counter}\" \
@@ -2458,8 +2471,9 @@ exit 0
         );
     }
 
-    /// Issue #5431: `apply_quarantine_label`'s two forge mutations (the
-    /// `loom:blocked`/`loom:issue` edit and the explanatory comment) must
+    /// Issue #5431: `apply_quarantine_label`'s forge calls (the
+    /// `loom:blocked`/`loom:issue` edit, the explanatory comment, and the
+    /// #10161 park-record read/write) must
     /// thread a registered cross-owner workspace's installation-token
     /// `GH_CONFIG_DIR` through to the real `gh` children, mirroring
     /// `guards::classify_preflip_labels_applies_registered_gh_config_dir`.
@@ -2486,14 +2500,19 @@ exit 0
         registry.apply_quarantine_label(9501, 3);
 
         let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
-        let occurrences = gh_calls
-            .matches(&format!("GH_CONFIG_DIR={}", owner_dir.display()))
-            .count();
-        assert_eq!(
-            occurrences, 2,
-            "expected BOTH the label edit and the comment to carry the registered \
-             GH_CONFIG_DIR; got: {gh_calls:?}"
+        // Every child carries it: the label edit, the comment, and (#10161) the
+        // park-record calls that now precede them.
+        let expected = format!("GH_CONFIG_DIR={}", owner_dir.display());
+        let dirs: Vec<&str> = gh_calls
+            .lines()
+            .filter(|l| l.starts_with("GH_CONFIG_DIR="))
+            .collect();
+        assert!(
+            dirs.len() >= 2 && dirs.iter().all(|l| *l == expected),
+            "expected every gh child to carry the registered GH_CONFIG_DIR; got: {gh_calls:?}"
         );
+        assert!(gh_calls.contains("issue edit 9501 --add-label loom:blocked"), "{gh_calls:?}");
+        assert!(gh_calls.contains("issue comment 9501 --body"), "{gh_calls:?}");
 
         crate::credential_preflight::clear_owner_root_registry();
     }

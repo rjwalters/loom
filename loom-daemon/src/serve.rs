@@ -284,6 +284,8 @@ pub fn build_snapshot(report: DaemonStatusReport) -> StatusSnapshot {
     }
 }
 
+#[cfg(test)]
+mod dashboard_queue_tests;
 /// The `DaemonStatus` round-trip and its root-scaled budget (Issue #8224),
 /// extracted to a sibling module because this file is frozen by the file-size
 /// ratchet (`scripts/check-file-size-budget.sh`; see
@@ -706,6 +708,9 @@ async fn handle_health(
         // `tmpfs_visibility` section renders here.
         tmpfs_visibility: None,
         ci_telemetry: None,
+        // #11740: the in-process last fleet-sync pass, so the dashboard's
+        // health route raises `fleet_identity` too.
+        fleet_sync: crate::fleet_sync::cached_status(),
     });
 
     let mut body = serde_json::to_value(&health)?;
@@ -1556,6 +1561,7 @@ mod tests {
                 kind: SweepKind::Issue(4392),
                 runtime: None,
                 runtime_source: None,
+                start: None,
                 repo: None,
             },
             Event::SweepGlobalCompleted {
@@ -1675,6 +1681,7 @@ mod tests {
             kind: SweepKind::Issue(4392),
             runtime: None,
             runtime_source: None,
+            start: None,
             repo: Some("/repos/loom".to_string()),
         });
         let data = frame.trim_start_matches("data: ").trim_end_matches("\n\n");
@@ -1982,6 +1989,7 @@ mod tests {
                 kind: SweepKind::Issue(4392),
                 runtime: None,
                 runtime_source: None,
+                start: None,
                 repo: None,
             })
             .expect("publish");
@@ -2410,7 +2418,8 @@ mod tests {
         let mut report = empty_report();
         report.per_repo = vec![crate::types::RepoStatus {
             root: root.to_path_buf(),
-            priority: crate::workspace_registry::default_priority(),
+            maintain_only: None,
+            weight: crate::workspace_registry::default_weight(),
             in_flight_count: 0,
             health_gate_halted: false,
             quarantined_issues: vec![],

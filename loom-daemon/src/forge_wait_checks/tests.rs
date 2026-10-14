@@ -48,6 +48,12 @@ for a in "$@"; do
   prev="$a"
 done
 k=$(printf '%s' "$url" | tr -c 'A-Za-z0-9' '_')
+if [ -f '{d}'/"$k.raw" ]; then
+  echo "RAW - $url" >> '{d}/calls.log'
+  cat '{d}'/"$k.raw"
+  cat '{d}'/"$k.err" 1>&2
+  exit 1
+fi
 if [ -f '{d}'/"$k.out" ]; then
   echo "OUT - $url" >> '{d}/calls.log'
   cat '{d}'/"$k.out"
@@ -94,6 +100,23 @@ cat '{d}'/"$k.body"
         std::fs::write(self.dir.path().join(format!("{}.etag", key(url))), etag).unwrap();
     }
 
+    /// Refuse `url` with `status` (a raw `--include` response and gh's
+    /// stderr line), until [`Forge::serve`] is called for it again.
+    fn refuse(&self, url: &str, status: u16, headers: &str, body: &str) {
+        let raw = format!("HTTP/2.0 {status} Forbidden\r\n{headers}\r\n{body}");
+        let msg = crate::forge_denial::body_message(body).unwrap_or_default();
+        std::fs::write(self.dir.path().join(format!("{}.raw", key(url))), raw).unwrap();
+        std::fs::write(
+            self.dir.path().join(format!("{}.err", key(url))),
+            format!("gh: {msg} (HTTP {status})\n"),
+        )
+        .unwrap();
+    }
+
+    fn unrefuse(&self, url: &str) {
+        let _ = std::fs::remove_file(self.dir.path().join(format!("{}.raw", key(url))));
+    }
+
     fn pull(&self, sha: &str) {
         self.serve(
             "repos/o/r/pulls/42",
@@ -105,17 +128,15 @@ cat '{d}'/"$k.body"
         self.serve(&runs_url(sha), &json!({"total_count": rows.len(), "check_runs": rows}));
     }
 
-    /// The required-context lookup's two `--jq` reads (rulesets, classic).
+    /// The required-context lookup's two reads: the conditional rulesets
+    /// read (#11418) and the classic GraphQL `--jq` read.
     fn required(&self, contexts: &[&str]) {
-        let out = contexts
-            .iter()
-            .map(|c| format!("{c}\n"))
-            .collect::<String>();
-        let rules = self
-            .dir
-            .path()
-            .join(format!("{}.out", key("repos/o/r/rules/branches/main")));
-        std::fs::write(rules, out).unwrap();
+        let checks: Vec<Value> = contexts.iter().map(|c| json!({"context": c})).collect();
+        self.serve(
+            "repos/o/r/rules/branches/main",
+            &json!([{"type": "required_status_checks",
+                     "parameters": {"required_status_checks": checks}}]),
+        );
         std::fs::write(self.dir.path().join("graphql.out"), "").unwrap();
     }
 
@@ -198,6 +219,7 @@ fn opts(timeout: u64) -> Opts {
         max_interval: DEFAULT_MAX_INTERVAL,
         settle_polls: zero_checks::DEFAULT_SETTLE_POLLS,
         settle_interval: zero_checks::DEFAULT_SETTLE_INTERVAL,
+        no_run_grace: Duration::from_secs(no_run::DEFAULT_GRACE),
     }
 }
 
@@ -325,7 +347,11 @@ fn zero_rows_with_a_required_context_times_out_never_none() {
             pending: vec!["Backend".into()]
         }
     );
-    let lookups = f.calls().iter().filter(|c| c.starts_with("OUT")).count();
+    let lookups = f
+        .calls()
+        .iter()
+        .filter(|c| c.ends_with("rules/branches/main") || c.ends_with(" graphql"))
+        .count();
     assert_eq!(lookups, 2, "the required lookup runs once per wait (two sources)");
 }
 
@@ -540,14 +566,19 @@ fn a_second_snapshot_process_revalidates_and_records_under_its_caller() {
     let f = Forge::new();
     f.runs(SHA, &[run("build", "completed", Some("success"))]);
     let before = counts();
-    for _ in 0..2 {
+    let mut first_run = 0;
+    for i in 0..2 {
         let o = go(&f, Selector::Pr(42), &opts(0), &mut FakeClock::new());
         assert_eq!(o, Outcome::Green { sha: SHA.into() });
+        if i == 0 {
+            first_run = f.calls().len();
+        }
     }
+    // The GraphQL leg of the required lookup has no ETag (`OUT`).
     let second: Vec<String> = f
         .calls()
         .into_iter()
-        .skip(3)
+        .skip(first_run)
         .filter(|c| !c.starts_with("OUT"))
         .collect();
     assert!(second.iter().all(|c| c.starts_with("304 inm")), "{second:#?}");
@@ -562,7 +593,7 @@ impl Forge {
     /// (not plan-gated), as a GraphQL-exhausted classic leg would.
     fn required_fails(&self) {
         let rules = key("repos/o/r/rules/branches/main");
-        let _ = std::fs::remove_file(self.dir.path().join(format!("{rules}.out")));
+        let _ = std::fs::remove_file(self.dir.path().join(format!("{rules}.body")));
     }
 
     fn lookups(&self) -> usize {
@@ -679,4 +710,228 @@ fn required_only_waits_for_a_required_check_that_has_not_been_created() {
     o.required_only = true;
     assert_eq!(go(&f, Selector::Pr(42), &o, &mut clock), Outcome::Green { sha: SHA.into() });
     assert_eq!(f.polls(), 3);
+}
+
+// ---------------------------------------------------------------------------
+// #10633: 403s are classified; a statuses permission refusal degrades
+// ---------------------------------------------------------------------------
+
+const NOT_ACCESSIBLE: &str =
+    r#"{"message":"Resource not accessible by integration","status":"403"}"#;
+const SECONDARY: &str = r#"{"message":"You have exceeded a secondary rate limit. Please wait a few minutes before you try again."}"#;
+
+#[test]
+fn a_statuses_permission_refusal_degrades_to_check_runs_only_with_a_note() {
+    let f = Forge::new();
+    f.runs(SHA, &[run("build", "completed", Some("success"))]);
+    f.refuse(&status_url(SHA), 403, "", NOT_ACCESSIBLE);
+    let (o, notes) = wait(&mut f.reads(), &Selector::Pr(42), &opts(1800), &mut FakeClock::new());
+    assert_eq!(o.sentinel(), format!("LOOM-CHECKS-GREEN {SHA}"));
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(notes[0].contains("permission (needs statuses:read)"), "{notes:?}");
+    assert!(notes[0].contains("Resource not accessible by integration"), "{notes:?}");
+    assert!(notes[0].contains("Commit statuses: Read"), "{notes:?}");
+}
+
+#[test]
+fn a_degraded_wait_stops_asking_for_statuses_and_still_waits_for_a_required_status() {
+    let f = Forge::new();
+    f.runs(SHA, &[run("build", "completed", Some("success"))]);
+    // `ci/jenkins` is required and reported only as a legacy status we cannot
+    // read: the verdict must never be GREEN.
+    f.required(&["ci/jenkins"]);
+    f.refuse(&status_url(SHA), 403, "", NOT_ACCESSIBLE);
+    let o = go(&f, Selector::Pr(42), &opts(600), &mut FakeClock::new());
+    assert_eq!(o.sentinel(), format!("LOOM-CHECKS-TIMEOUT {SHA} ci/jenkins"));
+    let status_reads = f.calls().iter().filter(|c| c.contains("/status?")).count();
+    assert_eq!(status_reads, 1, "{:?}", f.calls());
+}
+
+#[test]
+fn an_empty_rollup_with_unreadable_statuses_is_error_never_none() {
+    let f = Forge::new();
+    f.runs(SHA, &[]);
+    f.refuse(&status_url(SHA), 403, "", NOT_ACCESSIBLE);
+    let o = go(&f, Selector::Pr(42), &opts(1800), &mut FakeClock::new());
+    match &o {
+        Outcome::Error(w) => {
+            assert!(w.starts_with("statuses-unreadable: HTTP 403"), "{w}");
+            assert!(w.contains("permission (needs statuses:read)"), "{w}");
+        }
+        other => panic!("expected ERROR, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_check_runs_permission_refusal_is_error_naming_the_permission() {
+    let f = Forge::new();
+    f.refuse(&runs_url(SHA), 403, "", NOT_ACCESSIBLE);
+    let o = go(&f, Selector::Pr(42), &opts(1800), &mut FakeClock::new());
+    match &o {
+        Outcome::Error(w) => {
+            assert!(w.starts_with("HTTP 403 for repos/o/r/commits/"), "{w}");
+            assert!(w.contains("permission (needs checks:read)"), "{w}");
+        }
+        other => panic!("expected ERROR, got {other:?}"),
+    }
+    assert_eq!(f.polls(), 1, "a permission refusal is not retried");
+}
+
+#[test]
+fn a_secondary_rate_limit_403_is_retried_not_reported_as_permission() {
+    let f = Forge::new();
+    f.runs(SHA, &[run("build", "completed", Some("success"))]);
+    f.refuse(&status_url(SHA), 403, "Retry-After: 60\r\n", SECONDARY);
+    let url = status_url(SHA);
+    let mut clock = FakeClock::new().at(30, || f.unrefuse(&url));
+    let (o, notes) = wait(&mut f.reads(), &Selector::Pr(42), &opts(1800), &mut clock);
+    assert_eq!(o.sentinel(), format!("LOOM-CHECKS-GREEN {SHA}"));
+    assert!(notes.is_empty(), "a rate limit never degrades: {notes:?}");
+}
+
+#[test]
+fn a_persistent_secondary_rate_limit_ends_as_read_failed_naming_the_class() {
+    let f = Forge::new();
+    f.runs(SHA, &[run("build", "completed", Some("success"))]);
+    f.refuse(&status_url(SHA), 403, "Retry-After: 60\r\n", SECONDARY);
+    let o = go(&f, Selector::Pr(42), &opts(1800), &mut FakeClock::new());
+    match &o {
+        Outcome::Error(w) => {
+            assert!(w.starts_with("read-failed: HTTP 403"), "{w}");
+            assert!(w.contains("secondary-rate-limit"), "{w}");
+            assert!(!w.contains("permission"), "{w}");
+        }
+        other => panic!("expected ERROR, got {other:?}"),
+    }
+}
+
+fn suites_url(sha: &str) -> String {
+    format!("repos/o/r/commits/{sha}/check-suites?app_id=15368&per_page=100")
+}
+
+fn suite_reads(f: &Forge) -> usize {
+    f.calls()
+        .iter()
+        .filter(|c| c.contains("/check-suites"))
+        .count()
+}
+
+/// #11389: a skip-CI head has no Actions suite. Past the grace period, with
+/// only an unregistered required context to wait for, that is `NO-RUN` with
+/// a hint naming the skip marker — not a 30-minute `TIMEOUT`.
+#[test]
+fn zero_actions_suites_past_the_grace_period_is_no_run() {
+    let f = Forge::new();
+    f.runs(SHA, &[]);
+    f.required(&["Backend"]);
+    f.serve(&suites_url(SHA), &json!({"total_count": 0, "check_suites": []}));
+    let mut clock = FakeClock::new();
+    let (o, notes) = wait(&mut f.reads(), &Selector::Pr(42), &opts(1800), &mut clock);
+    assert_eq!(o, Outcome::NoRun { sha: SHA.into() });
+    assert_eq!(o.sentinel(), format!("LOOM-CHECKS-NO-RUN {SHA}"));
+    assert_eq!(o.exit_code(), 5);
+    assert!(clock.now >= Duration::from_secs(no_run::DEFAULT_GRACE), "{:?}", clock.now);
+    assert!(clock.now < Duration::from_secs(300), "ended early: {:?}", clock.now);
+    assert!(notes.iter().any(|n| n.contains("skip-CI marker")), "{notes:?}");
+
+    // Other apps' finished checks do not hide it.
+    let f = Forge::new();
+    f.runs(SHA, &[run("labeler", "completed", Some("success"))]);
+    f.required(&["Backend"]);
+    f.serve(
+        &suites_url(SHA),
+        &json!({"total_count": 1, "check_suites": [{"app": {"slug": "codecov", "id": 254}}]}),
+    );
+    let o = go(&f, Selector::Pr(42), &opts(1800), &mut FakeClock::new());
+    assert_eq!(o, Outcome::NoRun { sha: SHA.into() });
+}
+
+/// A queued Actions suite is a run that has not started: keep waiting, and
+/// stop asking once a suite has been seen.
+#[test]
+fn a_queued_actions_suite_still_waits() {
+    let f = Forge::new();
+    f.runs(SHA, &[]);
+    f.required(&["Backend"]);
+    f.serve(
+        &suites_url(SHA),
+        &json!({"total_count": 1, "check_suites": [
+            {"app": {"slug": "github-actions", "id": 15368}, "status": "queued"}]}),
+    );
+    let o = go(&f, Selector::Pr(42), &opts(600), &mut FakeClock::new());
+    assert_eq!(
+        o,
+        Outcome::Timeout {
+            sha: SHA.into(),
+            pending: vec!["Backend".into()]
+        }
+    );
+    assert_eq!(suite_reads(&f), 1);
+}
+
+/// Never probed before the grace period, nor while an observed check runs;
+/// a failed lookup is never `NO-RUN`.
+#[test]
+fn no_run_is_not_probed_early_or_while_a_check_runs_and_fails_toward_timeout() {
+    let f = Forge::new();
+    f.runs(SHA, &[]);
+    f.required(&["Backend"]);
+    f.serve(&suites_url(SHA), &json!({"total_count": 0, "check_suites": []}));
+    let o = go(&f, Selector::Pr(42), &opts(100), &mut FakeClock::new());
+    assert!(matches!(o, Outcome::Timeout { .. }), "{o:?}");
+    assert_eq!(suite_reads(&f), 0);
+
+    let f = Forge::new();
+    f.runs(SHA, &[run("build", "in_progress", None)]);
+    f.serve(&suites_url(SHA), &json!({"total_count": 0, "check_suites": []}));
+    let o = go(&f, Selector::Pr(42), &opts(600), &mut FakeClock::new());
+    assert!(matches!(o, Outcome::Timeout { .. }), "{o:?}");
+    assert_eq!(suite_reads(&f), 0);
+
+    // No fixture: the lookup 404s, once, and the wait times out as before.
+    let f = Forge::new();
+    f.runs(SHA, &[]);
+    f.required(&["Backend"]);
+    let (o, notes) = wait(&mut f.reads(), &Selector::Pr(42), &opts(600), &mut FakeClock::new());
+    assert!(matches!(o, Outcome::Timeout { .. }), "{o:?}");
+    assert_eq!(suite_reads(&f), 1);
+    assert!(notes.iter().any(|n| n.contains("suite lookup failed")), "{notes:?}");
+}
+
+/// #11097: one push fired two runs of one workflow on the head. The older
+/// twin's red residue is dropped once the newer twin concluded green; with no
+/// workflow-runs answer, nothing is dropped and the wait stays RED.
+#[test]
+fn superseded_twin_run_residue_is_dropped() {
+    let twin = |suite: u64, conclusion: &str| {
+        let mut r = run("Daemon Checks", "completed", Some(conclusion));
+        r["check_suite"] = json!({"id": suite});
+        r
+    };
+    let wrun = |id: u64, suite: u64, conclusion: &str| {
+        json!({"id": id, "workflow_id": 7, "check_suite_id": suite, "event": "pull_request",
+               "head_sha": SHA, "created_at": "2026-10-05T13:32:00Z", "status": "completed",
+               "conclusion": conclusion, "pull_requests": [{"number": 42}]})
+    };
+    let runs_url = format!("repos/o/r/actions/runs?head_sha={SHA}&per_page=100");
+
+    let f = Forge::new();
+    f.runs(SHA, &[twin(1, "failure"), twin(2, "success")]);
+    let o = go(&f, Selector::Pr(42), &opts(0), &mut FakeClock::new());
+    assert!(matches!(o, Outcome::Red { .. }), "{o:?}");
+
+    let f = Forge::new();
+    f.runs(SHA, &[twin(1, "failure"), twin(2, "success")]);
+    f.serve(
+        &runs_url,
+        &json!({"total_count": 2, "workflow_runs": [wrun(100, 1, "failure"), wrun(101, 2, "success")]}),
+    );
+    let o = go(&f, Selector::Pr(42), &opts(0), &mut FakeClock::new());
+    assert_eq!(o, Outcome::Green { sha: SHA.into() });
+
+    // A single suite never pays for the extra read.
+    let f = Forge::new();
+    f.runs(SHA, &[twin(1, "failure")]);
+    go(&f, Selector::Pr(42), &opts(0), &mut FakeClock::new());
+    assert!(!f.calls().iter().any(|c| c.contains("actions/runs")), "{:?}", f.calls());
 }

@@ -113,29 +113,19 @@ pub(crate) fn queue_json(report: &DaemonStatusReport, now: DateTime<Utc>) -> ser
         "errors": tick.map(|t| t.errors),
         // Non-empty => the queue is incomplete: these repos' backlogs are missing.
         "listing_failed": tick.map(|t| t.listing_failed.as_slice()).unwrap_or_default(),
-        "complete": tick.is_some_and(|t| t.listing_failed.is_empty()),
+        // Non-empty => these repos' listings came back partial (#11139): some
+        // rows are present, but not all of them.
+        "listing_incomplete": tick.map(|t| t.listing_incomplete.as_slice()).unwrap_or_default(),
+        // `false` when any repo's listing failed OR came back partial.
+        "complete": tick.is_some_and(|t| t.listing_not_whole().next().is_none()),
         "ordering": tick.and_then(ordering),
         "plan": tick.and_then(|t| t.plan.as_ref()),
         "queue": tick.map(|t| t.queue.as_slice()).unwrap_or_default(),
-        // Every starred issue's landing state (#9244 C), including the ones
-        // not in the ready listing (building, in review, parked).
-        "operator_priority_landing": report.operator_priority_landing,
     })
 }
 
-/// The human-readable table, then the starred issues' landing states
-/// (#9244 C).
+/// The human-readable table.
 pub(crate) fn render_queue(report: &DaemonStatusReport, now: DateTime<Utc>) -> String {
-    let mut out = render_ready(report, now);
-    for line in loom_daemon::star_liveness::render::lines(report.operator_priority_landing.as_ref())
-    {
-        out.push_str(&line);
-        out.push('\n');
-    }
-    out
-}
-
-fn render_ready(report: &DaemonStatusReport, now: DateTime<Utc>) -> String {
     let (state, age) = freshness(report, now);
     let mut out = String::new();
     let Some(tick) = &report.last_work_finder_tick else {
@@ -168,8 +158,16 @@ fn render_ready(report: &DaemonStatusReport, now: DateTime<Utc>) -> String {
             tick.listing_failed.join(", ")
         ));
     }
+    if !tick.listing_incomplete.is_empty() {
+        out.push_str(&format!(
+            "  INCOMPLETE: listing ready issues came back partial for {} — only part of their backlog is below\n",
+            tick.listing_incomplete.join(", ")
+        ));
+    }
     if tick.queue.is_empty() {
-        if !tick.listing_failed.is_empty() {
+        // A failed or partial listing makes an empty table "unknown", never
+        // "no ready work" (#11139).
+        if tick.listing_not_whole().next().is_some() {
             return out;
         }
         out.push_str(if tick.seen == 0 {
@@ -237,14 +235,12 @@ fn render_row(row: &ReadyQueueRow) -> String {
         .file_name()
         .map_or_else(|| row.repo.clone(), |n| n.to_string_lossy().into_owned());
     let mut flags = Vec::new();
-    if row.operator_priority {
-        flags.push("starred".to_string());
+    // The priority level (#11510), when it is not the default.
+    if row.level != loom_daemon::priority_pick::Level::Default {
+        flags.push(row.level.as_str().to_string());
     }
     if row.main_red_fix {
         flags.push("red-main-fix".to_string());
-    }
-    if let Some(tier) = &row.tier {
-        flags.push(tier.clone());
     }
     let flags = if flags.is_empty() {
         String::new()
@@ -257,10 +253,10 @@ fn render_row(row: &ReadyQueueRow) -> String {
         .map(|d| format!(" ({d})"))
         .unwrap_or_default();
     format!(
-        "  {:>3}. {repo}#{:<6} p{:<3} {:<20} {}{detail}{flags}\n",
+        "  {:>3}. {repo}#{:<6} w{:<3} {:<20} {}{detail}{flags}\n",
         row.rank,
         row.issue,
-        row.workspace_priority,
+        row.workspace_weight,
         plan_column(row),
         row.disposition.reason(),
     )
@@ -291,13 +287,15 @@ mod tests {
             rank,
             repo: "/src/loom".into(),
             issue,
-            workspace_priority: 100,
+            workspace_weight: 100,
             urgent: false,
-            operator_priority: rank == 1,
-            operator_priority_at: None,
+            level: if rank == 1 {
+                loom_daemon::priority_pick::Level::VeryImportant
+            } else {
+                loom_daemon::priority_pick::Level::Default
+            },
             main_red_fix: false,
             created_at: None,
-            tier: None,
             story_points: None,
             disposition: d,
             detail: None,
@@ -321,8 +319,9 @@ mod tests {
         let first = text.find("loom#10").unwrap();
         assert!(first < text.find("loom#11").unwrap());
         assert!(text.contains("waiting: concurrency cap full"));
-        assert!(text.contains("[starred]"));
-        assert!(!text.contains("[urgent]"), "loom:urgent is no longer a row flag");
+        assert!(text.contains("[very-important]"), "{text}");
+        assert!(!text.contains("[default]"), "the default level is no flag: {text}");
+        assert!(!text.contains("[urgent]"), "urgent is no longer a row flag (#9244)");
         assert!(!text.contains("STALE"));
     }
 
@@ -372,6 +371,39 @@ mod tests {
     }
 
     #[test]
+    fn a_partial_listing_is_incomplete_not_whole() {
+        // #11139: a later page failed / the page cap / a mid-walk change. The
+        // rows read are kept, but neither the JSON nor the human view may
+        // present them as the whole queue.
+        let now = Utc::now();
+        let mut r = report_with(vec![], now);
+        if let Some(t) = r.last_work_finder_tick.as_mut() {
+            t.listing_incomplete = vec!["/src/loom".into()];
+        }
+        let text = render_queue(&r, now);
+        assert!(text.contains("INCOMPLETE"), "{text}");
+        assert!(text.contains("partial for /src/loom"), "{text}");
+        assert!(!text.contains("no ready loom:issue work"), "{text}");
+        let j = queue_json(&r, now);
+        assert_eq!(j["complete"], false);
+        assert_eq!(j["listing_incomplete"][0], "/src/loom");
+        assert_eq!(j["listing_failed"].as_array().map(Vec::len), Some(0));
+
+        // With rows present the view still flags the partial listing.
+        let mut r = report_with(vec![row(1, 10, QueueDisposition::DeferredCapacity)], now);
+        if let Some(t) = r.last_work_finder_tick.as_mut() {
+            t.listing_incomplete = vec!["/src/loom".into()];
+        }
+        assert!(render_queue(&r, now).contains("INCOMPLETE"));
+        assert_eq!(queue_json(&r, now)["complete"], false);
+
+        // A whole listing stays complete.
+        let whole = report_with(vec![row(1, 10, QueueDisposition::DeferredCapacity)], now);
+        assert_eq!(queue_json(&whole, now)["complete"], true);
+        assert!(!render_queue(&whole, now).contains("INCOMPLETE"));
+    }
+
+    #[test]
     fn plan_fields_render_and_ordering_comes_from_the_daemon() {
         let now = Utc::now();
         let mut r = report_with(
@@ -390,7 +422,7 @@ mod tests {
             position: Some(1),
             plan_state: PlanState::Running,
             keys: vec![PlanKey {
-                name: "workspace_priority".into(),
+                name: "workspace_weight".into(),
                 value: serde_json::json!(100),
             }],
             ..RowPlan::default()
@@ -402,7 +434,7 @@ mod tests {
             ..RowPlan::default()
         };
         // Row keys alone are enough to name the ordering.
-        assert_eq!(queue_json(&r, now)["ordering"], serde_json::json!(["workspace_priority"]));
+        assert_eq!(queue_json(&r, now)["ordering"], serde_json::json!(["workspace_weight"]));
 
         let tick = r.last_work_finder_tick.as_mut().unwrap();
         tick.plan = Some(DispatchPlanContext {
@@ -414,17 +446,17 @@ mod tests {
                 ..PlanSlots::default()
             },
             tick_interval_secs: Some(60),
-            ordering: vec!["workspace_priority".into(), "operator_priority".into()],
+            ordering: vec!["level".into(), "created_at".into()],
             ..DispatchPlanContext::default()
         });
         let j = queue_json(&r, now);
-        assert_eq!(j["ordering"], serde_json::json!(["workspace_priority", "operator_priority"]));
+        assert_eq!(j["ordering"], serde_json::json!(["level", "created_at"]));
         assert_eq!(j["plan"]["slots"]["max_concurrent"], 2);
         assert_eq!(j["queue"][1]["plan_state"], "next");
         assert_eq!(j["queue"][1]["gate"], "ramp");
         assert_eq!(j["queue"][1]["position"], 2);
         let text = render_queue(&r, now);
-        assert!(text.contains("Order: workspace_priority, then operator_priority"), "{text}");
+        assert!(text.contains("Order: level, then created_at"), "{text}");
         assert!(
             text.contains("Plan: 0 free of 2 slot(s), 1 admission(s)/tick, every 60s"),
             "{text}"

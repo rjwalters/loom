@@ -23,9 +23,18 @@ pub(crate) mod claim_label;
 
 /// The registry's facade `gh` helpers, shared by every `sweep_registry` module.
 mod gh_exec;
+/// Conditional 2.5/2.7 issue reads (W9), a child module because this file is
+/// frozen by `scripts/file-size-baseline.txt`.
+pub(crate) mod issue_snapshot;
+pub(crate) use issue_snapshot::IssueGate;
 mod rate_limit_report;
 #[cfg(test)]
 mod rate_limit_report_tests;
+/// The dispatch path's memo gating (resume reads live) and refusal ledger (W9).
+pub(crate) mod refusal_memo;
+/// #9247: the claim flip's one re-mint-and-retry.
+#[cfg(test)]
+mod stale_token_tests;
 
 /// Three-state result of the open-linked-PR probe (Issue #4452).
 ///
@@ -483,45 +492,7 @@ impl SweepRegistry {
     /// merged PR as `state: "closed"`, but an Issue-shaped node reporting `MERGED`
     /// must never fall through to the fail-open arm again.
     pub(crate) fn issue_is_closed_or_pr(&self, issue: u32) -> Option<bool> {
-        // `gh api` cannot infer the repo from the working directory; this helper
-        // prefers the process-global LOOM_REPO override and falls back to
-        // `gh repo view` in the workspace root, so the override keeps working
-        // exactly as it did with `gh issue view --repo`. Returns `None` (fail
-        // open) when the repo cannot be resolved.
-        let (owner, repo) = self.resolve_owner_repo()?;
-        let gh = self.resolved_gh();
-        let mut cmd = self.gh_inv("guard.issue_state", AccessIntent::Read, &gh);
-        cmd = cmd
-            .arg("api")
-            .arg(format!("repos/{owner}/{repo}/issues/{issue}"))
-            .arg("--jq")
-            .arg("{state, is_pr: (.pull_request != null)}");
-        // Resolve against this registry's own workspace, matching the label-flip
-        // helpers and the other dispatch-path probes (#3937).
-        let output = self.run_counted(cmd).ok()??;
-        if !output.status.success() {
-            return None;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).ok()?;
-        // A PR is terminal for dispatch purposes in EVERY state — an open PR is
-        // still not an issue anyone can build.
-        if parsed.get("is_pr")?.as_bool()? {
-            return Some(true);
-        }
-        match parsed
-            .get("state")?
-            .as_str()?
-            .trim()
-            .to_ascii_uppercase()
-            .as_str()
-        {
-            "CLOSED" | "MERGED" => Some(true),
-            "OPEN" => Some(false),
-            // Reserved for genuine lookup failures only: an unrecognized state
-            // string is an unparseable answer, not a verdict.
-            _ => None,
-        }
+        self.issue_gate_via_rest(issue).map(IssueGate::closed_or_pr)
     }
 
     /// Best-effort probe for an **open** pull request linked to `issue` via
@@ -541,6 +512,16 @@ impl SweepRegistry {
     /// probe failure never manufactures quarantine pressure. Bounded by
     /// [`reap_gh_timeout`] exactly like the label flips so it cannot block the
     /// dispatch path.
+    ///
+    /// **Leg 0: the cached open-PR listing (#10514).** Each round first reads
+    /// the ETag'd REST open-PR listing the claim-reconciliation passes already
+    /// keep warm (an unchanged repo is a free `304`) and classifies it with
+    /// [`crate::worktree_ops::linked_pr_listing`]: a `Closes`/`Part of #N`
+    /// body or a same-repo `feature/issue-N` head links, under the same H14
+    /// fork-trust rule. A read listing is the verdict; the GraphQL/timeline
+    /// union below runs only when it could not be read, and a failed read is
+    /// never "no PR" (#7863). The listing does not see sidebar links or
+    /// cross-repo / URL-form closing references (see that module).
     ///
     /// The query itself
     /// ([`crate::worktree_ops::gh::open_linked_pr_args`]) and its
@@ -621,7 +602,14 @@ impl SweepRegistry {
             );
             return OpenPrProbe::Open(memo.pr);
         }
+        self.live_open_pr_probe(issue)
+    }
 
+    /// [`Self::probe_open_linked_pr`] without the fresh-memo short circuit:
+    /// the forge answers (with the #6058 retry and the #6788 known-PR recheck
+    /// backstop). Every decision that a memo answer would *permit* rather
+    /// than refuse, the #4256 resume, calls this (W9, see `refusal_memo`).
+    pub(crate) fn live_open_pr_probe(&self, issue: u32) -> OpenPrProbe {
         for attempt in 1..=OPEN_PR_PROBE_MAX_ATTEMPTS {
             let verdict = self.probe_open_linked_pr_transports(issue);
             if verdict != OpenPrProbe::ProbeFailed {
@@ -833,11 +821,27 @@ impl SweepRegistry {
         guard.insert(issue, OpenPrMemoEntry { pr, verified_at });
     }
 
-    /// One GraphQL/REST union round of [`probe_open_linked_pr`]. A closing PR
-    /// is decisive; an empty closes-graph still needs the timeline (#7757).
-    /// Extracted so the #6058 retry loop above can invoke it more than once
-    /// without duplicating the transport-selection logic.
+    /// One round of [`probe_open_linked_pr`]. Leg 0 (#10514): the cached REST
+    /// open-PR listing of the repo resolved here (never `origin`'s, which a
+    /// fork clone points elsewhere) — when it reads, its verdict is final. Only a listing that could not be
+    /// read falls back to the GraphQL/REST union: a closing PR is decisive; an
+    /// empty closes-graph still needs the timeline (#7757). Extracted so the
+    /// #6058 retry loop above can invoke it more than once.
     fn probe_open_linked_pr_transports(&self, issue: u32) -> OpenPrProbe {
+        // Every leg needs the repo, and each answers `ProbeFailed` without it
+        // (#4452): resolve once, so an unresolvable repo costs one call, not three.
+        let Some((owner, repo)) = self.resolve_owner_repo() else {
+            return OpenPrProbe::ProbeFailed;
+        };
+        let (root, gh, nwo) =
+            (&self.config.workspace_root, self.resolved_gh(), format!("{owner}/{repo}"));
+        let (caller, bound) = ("guard.open_pr_listing", Some(reap_gh_timeout()));
+        let target = (nwo.as_str(), issue);
+        let listed =
+            crate::worktree_ops::linked_pr_listing::probe(caller, &gh, root, target, bound);
+        if let Some(verdict) = listed {
+            return verdict;
+        }
         let graphql = self.probe_open_linked_pr_graphql(issue);
         if matches!(graphql, OpenPrProbe::Open(_)) {
             return graphql;
@@ -1104,8 +1108,11 @@ impl SweepRegistry {
     pub(crate) fn current_labels_via_rest(&self, issue: u32) -> Option<Vec<String>> {
         let (owner, repo) = self.resolve_owner_repo()?;
         let gh = self.resolved_gh();
+        // W4-C: read back after this daemon's own flip, so the writer that
+        // made it answers (a reader may lag the write).
         let mut cmd = self.gh_inv("guard.issue_labels", AccessIntent::Read, &gh);
         cmd = cmd
+            .writer_identity()
             .arg("api")
             .arg(format!("repos/{owner}/{repo}/issues/{issue}"))
             .arg("--jq")
@@ -1151,6 +1158,26 @@ impl SweepRegistry {
                 }
             }
         }
+        // W3a: the repo-facts record (fingerprint-invalidated, `gh repo view`
+        // semantics) answers without a forge call, and each answer also
+        // refreshes the in-process cache. `Legacy` AND `Unavailable` fall
+        // through to that cache + `gh repo view` below: every guard
+        // downstream fails OPEN on `None`, so a failed record verify (a
+        // blip, the breaker, the 300 s suspect backoff that follows it)
+        // must never cost a repo answer the process already had or that
+        // the pre-facts path would still produce.
+        match self.owner_repo_fact() {
+            crate::forge_repo_facts::Lookup::Fact(f) => {
+                let pair = (f.owner, f.name);
+                *self
+                    .owner_repo_cache
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(pair.clone());
+                return Some(pair);
+            }
+            crate::forge_repo_facts::Lookup::Unavailable
+            | crate::forge_repo_facts::Lookup::Legacy => {}
+        }
         if let Some(cached) = self
             .owner_repo_cache
             .lock()
@@ -1189,7 +1216,16 @@ impl SweepRegistry {
         resolved
     }
 
+    /// The claim flip, re-run once after a forced per-owner re-mint when it is
+    /// refused as not accessible by the integration (#9247).
     pub(crate) fn flip_label_to_building(&self, issue: u32) -> Result<()> {
+        let root = &self.config.workspace_root;
+        crate::stale_token_retry::run("guard.flip_building", root, || {
+            self.flip_building_once(issue)
+        })
+    }
+
+    fn flip_building_once(&self, issue: u32) -> Result<()> {
         let gh = self.resolved_gh();
         let mut cmd = self.gh_inv("guard.flip_building", AccessIntent::Write, &gh);
         cmd = cmd
@@ -1227,7 +1263,7 @@ impl SweepRegistry {
     }
 
     /// Whether the lease publishers below should publish this host's RAW
-    /// [`host_identity()`] value rather than [`opaque_host_id`] (Issue
+    /// [`lease_host_identity()`] value rather than [`opaque_host_id`] (Issue
     /// #6322). Reads [`LEASE_PUBLISH_HOSTNAME_ENV`] only — there is
     /// deliberately no per-repo config key for this: a shell counterpart
     /// (`defaults/scripts/sweep-lease-fence.sh`) must derive the exact same
@@ -1243,7 +1279,7 @@ impl SweepRegistry {
 
     /// The host identity to PUBLISH in a `loom:lease`/`loom:lease-yield`
     /// forge comment (Issue #6322) — [`opaque_host_id`] of
-    /// [`host_identity()`] by default, or the raw value when
+    /// [`lease_host_identity()`] by default, or the raw value when
     /// [`lease_publish_raw_hostname`](Self::lease_publish_raw_hostname) opts
     /// in via [`LEASE_PUBLISH_HOSTNAME_ENV`].
     ///
@@ -1252,7 +1288,7 @@ impl SweepRegistry {
     /// [`post_lease_yield_comment`](Self::post_lease_yield_comment)) AND the
     /// one reconciliation reader that must recognize "this dispatcher's own
     /// comment" ([`resolve_lease_order`](Self::resolve_lease_order)) call
-    /// this method rather than `host_identity()` directly — centralizing the
+    /// this method rather than `lease_host_identity()` directly — centralizing the
     /// transform here means a future publisher can never forget it, and
     /// `resolve_lease_order`'s own-claim recognition can never drift out of
     /// sync with what was actually published.
@@ -1262,7 +1298,7 @@ impl SweepRegistry {
     /// pointer back to the raw hostname — see `defaults/docs/lease-record.md`
     /// for the full resolution recipe.
     pub(crate) fn published_host_id(&self) -> String {
-        let host = host_identity();
+        let host = lease_host_identity();
         if self.lease_publish_raw_hostname() {
             return host;
         }
@@ -1498,8 +1534,10 @@ impl SweepRegistry {
     pub(crate) fn read_lease_comments(&self, issue: u32) -> Option<Vec<LeaseComment>> {
         let (owner, repo) = self.resolve_owner_repo()?;
         let gh = self.resolved_gh();
+        // W4-C: verifies this daemon's own just-written lease (and its
+        // callers fail open after a few retries), so the writer reads it.
         let mut cmd = self.gh_inv("guard.lease_comments", AccessIntent::Read, &gh);
-        cmd = cmd.arg("api")
+        cmd = cmd.writer_identity().arg("api")
             .arg(format!("repos/{owner}/{repo}/issues/{issue}/comments"))
             .arg("--paginate")
             .arg("--jq")
@@ -1625,8 +1663,8 @@ impl SweepRegistry {
         episode_start: DateTime<Utc>,
     ) -> LeaseOrderDecision {
         // Must match exactly what `write_lease_comment` PUBLISHED for this
-        // host (Issue #6322) — comparing against raw `host_identity()` here
-        // while the publisher writes `opaque_host_id(host_identity())` would
+        // host (Issue #6322) — comparing against raw `lease_host_identity()` here
+        // while the publisher writes `opaque_host_id(lease_host_identity())` would
         // silently break "recognize my own claim" for every dispatch once
         // publishing goes opaque.
         let host = self.published_host_id();
@@ -2445,15 +2483,13 @@ mod tests {
         let dir = tempdir().unwrap();
         let gh_log = dir.path().join("gh-invocations.log");
         let fake_gh = dir.path().join("fake-gh.sh");
-        // `gh issue view <n> --json labels --jq '...'` (the pre-check probe)
-        // reports the issue as currently `loom:blocked`; any `gh issue edit`
-        // call is recorded and always succeeds.
+        // The issue-signals read (#11480) reports the issue as currently
+        // `loom:blocked`; any `gh issue edit` call is recorded and succeeds.
         let script = format!(
             r#"#!/usr/bin/env bash
 printf '%s\n' "$*" >> "{log}"
-if [ "$1" = "issue" ] && [ "$2" = "view" ]; then
-  echo "true"
-  exit 0
+if [ "$1" = "api" ]; then
+  echo '{{"state":"open","closed_at":null,"labels":["loom:blocked","loom:building"]}}'
 fi
 exit 0
 "#,
@@ -2502,20 +2538,13 @@ exit 0
         let dir = tempdir().unwrap();
         let gh_log = dir.path().join("gh-invocations.log");
         let fake_gh = dir.path().join("fake-gh.sh");
-        // The `loom:blocked` pre-check (first `gh issue view --json labels`
-        // call) reports false; the `loom:operator-only` follow-up check
-        // (second `gh issue view --json labels` call) reports true. Any `gh
-        // issue edit` call is recorded and always succeeds.
+        // The issue-signals read (#11480) reports `loom:operator-only`. Any
+        // `gh issue edit` call is recorded and always succeeds.
         let script = format!(
             r#"#!/usr/bin/env bash
 printf '%s\n' "$*" >> "{log}"
-if [ "$1" = "issue" ] && [ "$2" = "view" ]; then
-  case "$*" in
-    *loom:blocked*) echo "false" ;;
-    *loom:operator-only*) echo "true" ;;
-    *) echo "false" ;;
-  esac
-  exit 0
+if [ "$1" = "api" ]; then
+  echo '{{"state":"open","closed_at":null,"labels":["loom:operator-only"]}}'
 fi
 exit 0
 "#,
@@ -2662,14 +2691,12 @@ exit 0
         let cwds: Vec<_> = recorded.lines().filter(|l| !l.is_empty()).collect();
         assert_eq!(
             cwds.len(),
-            6,
-            "expected the flip (1 call) + restore (Issue #4206's pre-check `loom:blocked` \
-             probe, Issue #4887's follow-up `loom:operator-only` probe — the fake `gh` prints \
-             nothing so both park probes read as absent, Issue #4653's `is_pr` probe's \
-             `resolve_owner_repo` lookup — which bails before the second `gh api` call since \
-             the fake `gh` prints nothing for `repo view` — Issue #9463's closed-state probe \
-             (an unverifiable state fails open to the restore) — then the edit — 5 calls) to \
-             invoke gh six times total; got cwds: {cwds:?}"
+            5,
+            "expected the flip (1 call) + restore (#11480's one issue-signals read for the \
+             shared veto and #9463's closed state — the fake `gh` prints nothing, so it fails \
+             open — Issue #4653's `is_pr` probe's `resolve_owner_repo` lookup, which bails \
+             before a second `gh api` call, Issue #10955's label-history read, then the \
+             edit — 4 calls) to invoke gh five times total; got cwds: {cwds:?}"
         );
         for cwd in &cwds {
             let got = std::fs::canonicalize(cwd).unwrap();
@@ -2806,7 +2833,7 @@ exit 0
         // Issue #6322: the marker's `host=` must be the opaque published id,
         // never the raw hostname (unless this test process happened to opt
         // into raw publishing, which it did not).
-        let raw_host = host_identity();
+        let raw_host = lease_host_identity();
         if raw_host != published {
             assert!(
                 !gh_calls.contains(&format!(
@@ -2893,14 +2920,14 @@ exit 0
     }
 
     /// Default (env unset): `published_host_id` returns the opaque form, not
-    /// the raw `host_identity()` value.
+    /// the raw `lease_host_identity()` value.
     #[test]
     #[serial]
     fn published_host_id_defaults_to_opaque() {
         std::env::remove_var(LEASE_PUBLISH_HOSTNAME_ENV);
         let dir = tempdir().unwrap();
         let registry = SweepRegistry::new(SweepRegistryConfig::new(dir.path().to_path_buf()));
-        let raw = host_identity();
+        let raw = lease_host_identity();
         assert_eq!(
             registry.published_host_id(),
             opaque_host_id(&raw),
@@ -2919,7 +2946,7 @@ exit 0
         let registry = SweepRegistry::new(SweepRegistryConfig::new(dir.path().to_path_buf()));
         assert_eq!(
             registry.published_host_id(),
-            host_identity(),
+            lease_host_identity(),
             "LOOM_LEASE_PUBLISH_HOSTNAME=1 must restore raw hostname publishing"
         );
     }
@@ -2934,7 +2961,7 @@ exit 0
         let registry = SweepRegistry::new(SweepRegistryConfig::new(dir.path().to_path_buf()));
         assert_eq!(
             registry.published_host_id(),
-            opaque_host_id(&host_identity()),
+            opaque_host_id(&lease_host_identity()),
             "an unrecognized/falsy value must not opt into raw publishing"
         );
     }
@@ -2961,7 +2988,7 @@ exit 0
             gh_calls.contains(&format!(
                 "{prefix}{host} sweep=sweep-test-6322 -->",
                 prefix = LEASE_MARKER_PREFIX,
-                host = host_identity(),
+                host = lease_host_identity(),
             )),
             "the opt-in must restore the raw hostname in the actual posted marker; got: \
              {gh_calls:?}"
@@ -3721,6 +3748,10 @@ mod union_tests;
 #[cfg(test)]
 #[path = "guards_preflip_tests.rs"]
 mod preflip_tests;
+
+#[cfg(test)]
+#[path = "guards_listing_tests.rs"]
+mod listing_tests;
 
 // Issue #8263's `gh api` GH_REPO regression coverage. A plain child module
 // (guards/repo_env_tests.rs) rather than another `#[path]` sibling: this file

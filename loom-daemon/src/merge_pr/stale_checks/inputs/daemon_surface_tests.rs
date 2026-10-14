@@ -1,4 +1,4 @@
-//! Pins the four daemon-implemented gates' `G` sets to the Rust source their
+//! Pins the daemon-implemented gates' `G` sets to the Rust source their
 //! verdicts can actually reach (see "Gates implemented inside the daemon
 //! binary" in the `inputs` module docs).
 //!

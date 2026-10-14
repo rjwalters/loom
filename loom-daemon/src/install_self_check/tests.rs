@@ -1,5 +1,5 @@
 //! Unit tests for `install_self_check` — a sibling file so the frozen parent
-//! (file-size ratchet) has room for the `ForgeEgressAligned` invariant (#9984).
+//! stays under its file-size ratchet.
 
 #![allow(clippy::unwrap_used)]
 
@@ -572,7 +572,7 @@ fn test_run_pass_report_only_does_not_repair_or_file() {
     let report = run_pass(
         tmp.path(),
         false, // report-only
-        CheckOptions::hermetic(),
+        CheckOptions::default(),
         &RepairContext::default(),
         &reporter,
     );
@@ -600,7 +600,7 @@ fn test_run_pass_repair_mode_converges_runtimes() {
         file_calls: Arc::new(AtomicUsize::new(0)),
         next_issue: 1,
     };
-    run_pass(tmp.path(), true, CheckOptions::hermetic(), &RepairContext::default(), &reporter);
+    run_pass(tmp.path(), true, CheckOptions::default(), &RepairContext::default(), &reporter);
     std::env::remove_var("LOOM_SHARED_TOKENS_DIR");
     // repair mode converged the runtimes file.
     assert!(tmp
@@ -649,4 +649,40 @@ fn test_resolve_tool_path_resolves_a_real_tool_via_the_process_env() {
     let sh = resolve_tool_path("sh").expect("`sh` resolves on any supported host");
     assert!(sh.ends_with("sh"), "resolved an unexpected path: {}", sh.display());
     assert!(is_executable(&sh), "resolved a non-executable path: {}", sh.display());
+}
+
+// ===================================================================
+// #10516 — interactive sessions reach the agent gh front
+// ===================================================================
+
+#[cfg(unix)]
+#[test]
+fn test_gh_front_wired_check_with() {
+    use gh_front_invariant::check_with;
+    let tmp = tempfile::tempdir().unwrap();
+    let daemon = write_fake_bin(&tmp.path().join("bin"), "loom-daemon", "exit 0");
+    let front = tmp.path().join("front");
+    fs::create_dir_all(&front).unwrap();
+    std::os::unix::fs::symlink(&daemon, front.join("gh")).unwrap();
+    let plain = write_fake_bin(&tmp.path().join("plain"), "gh", "exit 0");
+    let dir = |p: &Path| Some(p.parent().unwrap().as_os_str().to_os_string());
+    let wired = Some(r#"{"command": "… $HOME/.local/share/loom/defaults/hooks/gh-front-env.sh"}"#);
+    let loom_only =
+        Some(r#"{"command": "… $HOME/.local/share/loom/defaults/hooks/guard-destructive.sh"}"#);
+    let project = Some(r#"{"command": "\"${CLAUDE_PROJECT_DIR}/.loom/hooks/gh-front-env.sh\""}"#);
+    let skipped = |s: &InvariantStatus| matches!(s, InvariantStatus::Skipped(_));
+
+    // Never provisioned: not this check's business.
+    assert!(skipped(&check_with(None, None, None)));
+    assert!(skipped(&check_with(Some("{}"), Some("{}"), None)));
+    // Provisioned but stale (no SessionStart entry): the one actionable miss.
+    assert!(check_with(loom_only, None, dir(&front.join("gh"))).is_violation());
+    // Wired (either scope) and the prefix resolves gh to the front.
+    assert_eq!(check_with(wired, None, dir(&front.join("gh"))), InvariantStatus::Ok);
+    assert_eq!(check_with(loom_only, project, dir(&front.join("gh"))), InvariantStatus::Ok);
+    // Wired but ineffective: no shim dir, or a prefix whose gh is not the front.
+    assert!(check_with(wired, None, None).is_violation());
+    assert!(check_with(wired, None, dir(&plain)).is_violation());
+    // The live check never reads this host's ~/.claude in a unit-test build.
+    assert!(skipped(&check(Invariant::GhFrontWired, tmp.path(), &CheckOptions::default())));
 }

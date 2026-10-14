@@ -59,22 +59,36 @@ pub mod ci;
 pub mod disposition;
 mod envelope;
 pub mod kinds;
+pub mod no_phase_cause;
+pub mod phase_tap_usage;
 mod sweep_identity;
 pub use sweep_identity::SweepIdentityRecord;
 pub mod fixture;
+pub mod journal_shadow;
 pub mod ops;
+pub mod provenance;
 pub mod queue_snapshot;
 pub mod repo_identity;
+mod start_facts;
+pub use start_facts::{
+    effort_source, model_source, DispatchOrigin, SweepRoleDraw, SweepStartFacts,
+    SWEEP_ROLE_DRAW_LOG_ATTRIBUTE_KEYS, SWEEP_START_FACT_LOG_ATTRIBUTE_KEYS,
+};
 pub mod trace;
 pub mod visibility;
 pub use ci::{CiDurationRecord, CiJobLogRecord, CiJobRecord, CiRunRecord};
-pub use disposition::{classify_disposition, DispositionSignals, IssueEndState, SweepDisposition};
+pub use disposition::{
+    apply_noop_loop_class, classify_disposition, result_for_disposition, DispositionSignals,
+    IssueEndState, SweepDisposition, NO_PHASE_SIGNAL_CLASS, SPAWN_DEATH_CLASS,
+};
 pub use envelope::TelemetryEnvelope;
 pub use kinds::{
     export_coverage, exported_kinds_for, TelemetryKindMeta, TelemetryKindOtlp,
     NEW_KIND_SCHEMA_VERSION, TELEMETRY_KINDS,
 };
+pub use no_phase_cause::NoPhaseCause;
 pub use ops::MetricPointsRecord;
+pub use phase_tap_usage::PhaseTapUsageRow;
 pub use queue_snapshot::QueueSnapshotRecord;
 
 /// Current telemetry wire-schema version. Bump on any breaking change to the
@@ -357,7 +371,14 @@ pub mod trigger {
     pub const STALE_BASE_REJUDGE: &str = "stale_base_rejudge";
     /// Dispatched to fix a CI failure.
     pub const CI_FAILURE_FIX: &str = "ci_failure_fix";
-    /// A human or external tool asked for this sweep.
+    /// Re-dispatch after the previous attempt succeeded: it landed, found the
+    /// work already done, or the Curator closed or rescoped the issue (Issue
+    /// #11429). Inferred from the journal; says nothing about who dispatched.
+    pub const REDISPATCH_AFTER_SUCCESS: &str = "redispatch_after_success";
+    /// An operator re-dispatched an issue that already had an attempt on this
+    /// host. Set only from the recorded `dispatch_origin=operator` (Issue
+    /// #11444, `DispatchOrigin::apply_to_trigger`); the journal inference
+    /// never sets it.
     pub const OPERATOR_REDISPATCH: &str = "operator_redispatch";
     /// The dispatch reason was not observable. Counted, never silently merged.
     pub const UNKNOWN: &str = "unknown";
@@ -529,19 +550,11 @@ pub struct SweepStartedRecord {
     pub sweep_id: String,
     /// When the sweep started.
     pub started_at: DateTime<Utc>,
-    /// Selected Claude model, when one was chosen (mirrors `SweepInfo::model`'s
-    /// empty-means-unset contract).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    /// Selected reasoning-effort level, when one was chosen.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub effort: Option<String>,
-    /// Runtime adapter the sweep was dispatched on (`claude`, `codex`, …),
-    /// when the dispatch event carried one — the same value
-    /// `SweepInfo::runtime` records. Absent for a legacy dispatch that did
-    /// not name its runtime; never fabricated as `"claude"`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub runtime: Option<String>,
+    /// Model, effort, runtime and attempt lineage as the dispatch knew them
+    /// (#11280), flattened so the existing `model` / `effort` / `runtime`
+    /// keys keep their wire names.
+    #[serde(flatten)]
+    pub facts: SweepStartFacts,
     /// The Curator's story-point size estimate for this sweep's issue (Issue
     /// #9432, epic #9429) — the numeric value of its single `points:*` label,
     /// carried on the `sweep.global.dispatch` event from the label read the
@@ -863,32 +876,6 @@ pub struct SweepOutcomeRecord {
     /// and same omission contract as `runtime`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
-    /// The Curator's `<!-- loom:complexity=<tier> -->` marker for this sweep's
-    /// issue (Issue #8542) — `"mechanical"`, `"routine"`, or `"complex"`. This
-    /// is what makes a model-routing decision (`sweep.tierModels` /
-    /// `sweep.optimization`, or a future classifier-driven router) evaluable
-    /// against a labeled outcome: without it, `model` alone cannot separate
-    /// "sonnet chosen by an operator override" from "sonnet chosen because the
-    /// Curator marked this issue `routine`".
-    ///
-    /// Read from the same forge marker `resolve-tier-model.sh` /
-    /// [`crate::script_helpers::sweep_experiment::extract_complexity_marker`]
-    /// already parse, via one more best-effort REST read of the sweep's own
-    /// issue body at the SAME terminal transition that reads the PR label
-    /// timeline for [`doctor_cycles`](Self::doctor_cycles) — see
-    /// `sweep_registry::outcome_journal::complexity_signal` for the fetch and
-    /// its fail-open contract (breaker-gated, `skip_label_flip`-gated, never
-    /// blocks or fails the journal append).
-    ///
-    /// Omitted — never a fabricated `"routine"` — when the issue carried no
-    /// recognized marker, the fetch failed/timed out, or `skip_label_flip` is
-    /// set. Unlike `resolve-tier-model.sh`'s own dispatch-time fold (an absent
-    /// or unrecognized marker there is a **safe default** for model
-    /// selection), this field must stay honest about "unobserved": a
-    /// classifier's evaluation needs the true absence rate, not a default
-    /// masquerading as data.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub complexity: Option<String>,
     /// The Curator's story-point size estimate for this sweep's issue (Issue
     /// #9432, epic #9429) — the numeric value of its single `points:*` label,
     /// one of `1`/`2`/`3`/`5`/`8`/`13`.
@@ -902,7 +889,7 @@ pub struct SweepOutcomeRecord {
     /// Resolved by [`crate::story_points::resolve_story_points`] from the label
     /// list the terminal transition's `fetch_issue_signals` read already
     /// carries — **no** extra forge round trip, the same single REST call that
-    /// sources [`complexity`](Self::complexity) and the disposition end state.
+    /// sources the disposition end state.
     ///
     /// **Absent, never zero.** The key is omitted when the issue carries no
     /// `points:*` label (a pre-epic or operator-filed issue), when its single
@@ -937,6 +924,18 @@ pub struct SweepOutcomeRecord {
     /// BY`, which is the whole point of separating the absence cases.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokens_status_reason: Option<String>,
+    /// Why a `failure_class = unclassified:no-phase-signal` sweep ended
+    /// (Issue #10642): exit code (or `none_observed`), last step reached, and
+    /// a bounded reason. Present only on records of that class.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_phase_cause: Option<NoPhaseCause>,
+    /// Usage of out-of-process phases (`worker run`, Issues #11360/#11488),
+    /// one row per `(role, tap, model)`, built from the same rows the
+    /// host-local outcome journal carries. Absent (never an empty array) when
+    /// no phase ran out of process, so such a record serializes as it did
+    /// before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub phase_tap_usage: Vec<PhaseTapUsageRow>,
     /// 1-based count of terminal sweeps for this repo#issue in this host's
     /// durable outcome journal (Issue #9444) — the attempt this sweep was.
     /// Absent when the journal could not be read.
@@ -952,6 +951,19 @@ pub struct SweepOutcomeRecord {
     /// `unknown` is counted, never silently merged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trigger: Option<String>,
+    /// Who asked for this sweep (Issue #11444) — a [`DispatchOrigin`] wire
+    /// value, copied from the sweep's start facts so `sweep.outcome` agrees
+    /// with `sweep.started`. Absent on journal lines that predate it and on
+    /// sweeps this daemon did not dispatch (adopted, PR-set); never
+    /// fabricated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_origin: Option<String>,
+    /// The weighted agent draw that chose this sweep's tap (#11726;
+    /// 2AMLogic/2am#4393), copied from the sweep's start facts. Absent when no
+    /// `roleDraw` table decided the sweep, on journal lines that predate it,
+    /// and on sweeps this daemon did not dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_draw: Option<SweepRoleDraw>,
     /// In-sweep rework events (Issue #9444) observed by the paths that
     /// performed them, in event order. Absent (never `[]`) when none were
     /// observed for this sweep.
@@ -1195,6 +1207,12 @@ pub struct RoleTickOutcomeRecord {
     /// [`Self::preference_tier`] is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preference_tap: Option<String>,
+    /// The weighted role draw that chose this tick's tap (#11726): role,
+    /// attempt, the table and the tier that set it, the seed and its inputs,
+    /// every roll, and the pick. Absent when no `runtimes.roleDraw` table
+    /// decided the launch — additive, no `schema_version` bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_draw: Option<crate::runtime_preference::role_draw::RoleDrawRecord>,
     /// Runtime adapter this tick actually launched on (Issue #8507), read off
     /// the tick's own `# LOOM_LAUNCH` record — same source and the same
     /// "absent, never a fabricated `claude` default" contract as
@@ -1645,6 +1663,11 @@ pub struct HostHealthRecord {
     /// empty-is-unknown and `#[serde(default)]` contract as `exported_kinds`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exporters: Vec<String>,
+    /// Whether this daemon exports OTLP (Issue #11353):
+    /// `no_exporter` / `failing` / `ok` / `exempt` (+ detail). `None` means
+    /// "not reported" (a pre-#11353 daemon), never "ok".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub otlp_export: Option<crate::observability::otlp_health::OtlpExportHealth>,
     /// This host's memory/pressure readings at the sampling moment — the
     /// "deferred vs killed vs timed out" slice (RAM, compressed memory,
     /// swap and its rates, PSI class, kernel OOM counter) — see
@@ -1749,12 +1772,38 @@ pub struct ManagedRepoEntry {
     /// `Private`, never `Public`.
     #[serde(default)]
     pub visibility: RepoVisibility,
-    /// The repo's cross-repo dispatch priority tier from the machine-level
-    /// workspace registry (`Workspace.priority`, lower dispatches first;
-    /// #9244, loom-ui#153). Absent for a root that is not a registered
-    /// workspace (the empty-registry cwd fallback) and on older daemons.
+    /// The repo's draw weight from the machine-level workspace registry
+    /// (`Workspace.weight`, higher draws more; #11742). Absent for a root that
+    /// is not a registered workspace (the empty-registry cwd fallback) and on
+    /// older daemons, which sent a `priority` tier instead (#9244).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub priority: Option<u32>,
+    pub weight: Option<u32>,
+    /// This host's `loom:blocked` release-pass tallies for the repo since the
+    /// daemon started (#10763). Absent before the pass's first tick for the
+    /// repo on this host and on older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_blocked_release: Option<StaleBlockedReleaseCounters>,
+}
+
+/// One repo's `loom:blocked` release-pass tallies on one host (#10763),
+/// carried on [`ManagedRepoEntry`] so a fleet where the pass never acts is
+/// diagnosable without host logs: `ticks` counts every per-repo tick by
+/// outcome (`ran`, `not_due`, `skipped_shard`, `denied_scope`, `not_served`,
+/// `rate_limited`, `skipped_off`, `dry_run`, `archived`, `enumerate_error`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StaleBlockedReleaseCounters {
+    /// Artifacts released (applied writes only).
+    #[serde(default)]
+    pub released: u64,
+    /// Artifacts re-parked (applied writes only).
+    #[serde(default)]
+    pub reparked: u64,
+    /// The most recent tick's outcome key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_outcome: Option<String>,
+    /// Ticks per outcome key.
+    #[serde(default)]
+    pub ticks: std::collections::BTreeMap<String, u64>,
 }
 
 /// One entry of a [`SessionSummaryRecord`]'s tool-call histogram: how many

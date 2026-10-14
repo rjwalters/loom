@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
 use super::{dispatch_plan, ready_queue, TickReport};
-use crate::types::WorkFinderTickSummary;
+use crate::types::{QueueDisposition, RepoLimitView, WorkFinderTickSummary};
 
 /// Process-global slot holding the most recent completed tick's summary.
 ///
@@ -73,6 +73,7 @@ pub fn tick_summary(
         queue,
         plan,
         listing_failed: ready_queue::repo_names(&report.listing_failed, roots),
+        listing_incomplete: ready_queue::repo_names(&report.listing_incomplete, roots),
         at,
         max_concurrent,
         seen: report.seen,
@@ -105,7 +106,42 @@ pub fn tick_summary(
         build_backoff_held: report.build_backoff_held,
         collisions: report.collisions,
         cap: None,
+        repo_limits: repo_limits(report, roots),
     }
+}
+
+/// Each workspace's limits as the tick resolved them (Issue #11606): the
+/// cap and occupancy of `report.repo_cap` and the per-workspace count of
+/// [`Qd::DeferredRepoCap`] rows. Empty when the tick did not shape with a cap
+/// state (a single-workspace tick) or `roots` is unknown. Reads no state the
+/// tick did not already hold.
+fn repo_limits(report: &TickReport, roots: &[PathBuf]) -> Vec<RepoLimitView> {
+    let Some(snapshot) = report.repo_cap.as_ref() else {
+        return Vec::new();
+    };
+    // Occupancy when pass 2 finished; the top-of-tick count if it never ran.
+    let occupancy = if snapshot.occupancy_end.is_empty() {
+        &snapshot.occupancy
+    } else {
+        &snapshot.occupancy_end
+    };
+    roots
+        .iter()
+        .enumerate()
+        .map(|(idx, root)| RepoLimitView {
+            repo: root.display().to_string(),
+            in_flight: occupancy.get(idx).copied().unwrap_or(0),
+            cap: snapshot.cap,
+            deferred_repo_cap: report
+                .queue
+                .iter()
+                .filter(|row| {
+                    row.key.workspace_idx == idx
+                        && row.disposition == Some(QueueDisposition::DeferredRepoCap)
+                })
+                .count(),
+        })
+        .collect()
 }
 
 /// The latest cap terms the work-finder loop observed (Issue #10214), set by
@@ -178,7 +214,17 @@ pub fn publish_tick(
     let mut summary = tick_summary(report, max_concurrent, completed_at, roots, plan);
     summary.cap = last_cap().filter(|c| c.effective() == max_concurrent);
     crate::observability::ops::queue::record_queue(&summary);
+    // #10212: the ranked candidates and what the tick did with each.
+    crate::observability::pick_decision::emit_work_finder(
+        &summary,
+        started_at,
+        completed_at,
+        (report.workspace_draw.as_ref(), &report.vi_demotions),
+        roots,
+    );
     store_tick_summary(summary);
+    // #11161: `fleet.state` samples every tick, after the summary is stored.
+    crate::observability::fleet_state::tick_completed();
     crate::observability::ops::dispatch::record_tick(
         report,
         max_concurrent,

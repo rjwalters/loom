@@ -3,10 +3,10 @@ use opentelemetry_proto::tonic::common::v1::any_value::Value;
 use opentelemetry_proto::tonic::logs::v1::SeverityNumber;
 
 use super::super::log_record_for;
-use crate::eta::Provenance;
 use crate::telemetry::kinds::auto_update_tick::{
     AutoUpdateTickRecord, DrainSnapshot, TickDecisionKind, AUTO_UPDATE_LOG_ATTRIBUTE_KEYS,
 };
+use crate::telemetry::provenance::Provenance;
 use crate::telemetry::{TelemetryEnvelope, TelemetryRecord};
 
 fn record() -> AutoUpdateTickRecord {
@@ -29,6 +29,8 @@ fn record() -> AutoUpdateTickRecord {
             refusals: 1,
             target: Some("artifact:0.19.731:feedface".to_string()),
         },
+        floor_stall: None,
+        roll_held: None,
         consecutive_failures: 0,
         duration_ms: 4200,
         loom: Provenance {
@@ -58,7 +60,8 @@ fn a_full_tick_emits_every_key_and_only_allowlisted_ones() {
     assert_eq!(log.severity_number, SeverityNumber::Info as i32);
     for kv in &log.attributes {
         assert!(
-            AUTO_UPDATE_LOG_ATTRIBUTE_KEYS.contains(&kv.key.as_str()) || kv.key == "loom.record_id",
+            AUTO_UPDATE_LOG_ATTRIBUTE_KEYS.contains(&kv.key.as_str())
+                || ["loom.record_id", "loom.kind"].contains(&kv.key.as_str()),
             "{} is not allowlisted",
             kv.key
         );
@@ -111,7 +114,6 @@ fn optional_fields_are_omitted_not_fabricated() {
 fn severity_tracks_whether_the_host_is_converging() {
     let cases = [
         (TickDecisionKind::Panic, None, SeverityNumber::Error),
-        (TickDecisionKind::RollStall, None, SeverityNumber::Warn),
         (TickDecisionKind::StaleRepo, None, SeverityNumber::Warn),
         (TickDecisionKind::Fetch, Some("retryable"), SeverityNumber::Warn),
         (TickDecisionKind::Fetch, Some("success"), SeverityNumber::Info),
@@ -128,6 +130,60 @@ fn severity_tracks_whether_the_host_is_converging() {
 }
 
 #[test]
+fn an_unsatisfiable_floor_is_an_error_whatever_the_tick_decided() {
+    // #10712: the floor alert rides on any decision, including a healthy fetch.
+    for decision in [
+        TickDecisionKind::Skip,
+        TickDecisionKind::Defer,
+        TickDecisionKind::Fetch,
+    ] {
+        let mut tick = record();
+        tick.decision = decision;
+        tick.floor_stall = Some("FLEET FLOOR UNSATISFIABLE: ...".to_string());
+        let envelope = TelemetryEnvelope::new("host", TelemetryRecord::AutoUpdateTick(tick));
+        let log = log_record_for(&envelope).unwrap();
+        assert_eq!(log.severity_number, SeverityNumber::Error as i32, "{decision:?}");
+        let body = log.body.and_then(|b| b.value);
+        assert!(matches!(body, Some(Value::StringValue(b)) if b.contains("floor_stall")));
+    }
+    // And absent, the field is not serialized at all (no-floor records are unchanged).
+    let body = serde_json::to_string(&record()).unwrap();
+    assert!(!body.contains("floor_stall"), "{body}");
+}
+
+/// #10880: a held roll is ERROR below the floor and WARN otherwise, whatever
+/// the tick decided, and rides in the body like `floor_stall`.
+#[test]
+fn a_held_roll_is_an_error_below_the_floor_and_a_warning_otherwise() {
+    use crate::telemetry::kinds::auto_update_tick::RollHeld;
+    for (floor, severity) in [
+        (Some("0.19.850".to_string()), SeverityNumber::Error),
+        (None, SeverityNumber::Warn),
+    ] {
+        let mut tick = record();
+        tick.decision = TickDecisionKind::Defer;
+        tick.roll_held = Some(RollHeld {
+            floor: floor.clone(),
+            running: "0.19.800".to_string(),
+            target: "artifact:0.19.900:abcd".to_string(),
+            cause: "failed_roll".to_string(),
+            attempts: 2,
+            last_failure: Some("came back on 0.19.800".to_string()),
+            next_retry: Some(Utc.with_ymd_and_hms(2026, 10, 5, 2, 0, 0).unwrap()),
+        });
+        let envelope = TelemetryEnvelope::new("host", TelemetryRecord::AutoUpdateTick(tick));
+        let log = log_record_for(&envelope).unwrap();
+        assert_eq!(log.severity_number, severity as i32, "{floor:?}");
+        let body = log.body.and_then(|b| b.value);
+        assert!(
+            matches!(body, Some(Value::StringValue(b)) if b.contains("\"roll_held\"") && b.contains("failed_roll"))
+        );
+    }
+    let body = serde_json::to_string(&record()).unwrap();
+    assert!(!body.contains("roll_held"), "{body}");
+}
+
+#[test]
 fn collector_keeps_every_auto_update_log_attribute() {
     const CONFIG: &str =
         include_str!("../../../../../defaults/observability/collector/config.yaml");
@@ -136,7 +192,7 @@ fn collector_keeps_every_auto_update_log_attribute() {
         .find(|l| {
             l.contains("keep_keys(attributes, [")
                 && l.contains("loom.ci.chunk_index")
-                && l.contains("loom.eta.estimate_id")
+                && l.contains("loom.eta.pr.state")
         })
         .expect("the transform/privacy log keep_keys line");
     for key in AUTO_UPDATE_LOG_ATTRIBUTE_KEYS {

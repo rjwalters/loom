@@ -20,14 +20,11 @@ fn read_op(target: GhTarget) -> GhInvocation {
 }
 
 #[test]
-fn resolver_precedence_is_policy_then_env_then_path() {
-    let r = resolve_from(Some("/opt/launcher".into()), Some("/stub/gh".into()));
-    assert_eq!((r.program.as_str(), r.source), ("/opt/launcher", GhBinSource::Policy));
-
-    let r = resolve_from(None, Some("/stub/gh".into()));
+fn resolver_precedence_is_env_then_path() {
+    let r = resolve_from(Some("/stub/gh".into()));
     assert_eq!((r.program.as_str(), r.source), ("/stub/gh", GhBinSource::EnvOverride));
 
-    let r = resolve_from(None, None);
+    let r = resolve_from(None);
     assert_eq!((r.program.as_str(), r.source), ("gh", GhBinSource::Path));
 }
 
@@ -35,7 +32,7 @@ fn resolver_precedence_is_policy_then_env_then_path() {
 fn resolver_keeps_the_legacy_set_but_empty_semantics() {
     // Byte-identical to the hand-rolled `std::env::var(..).unwrap_or("gh")`
     // copies: a set-but-empty LOOM_GH_BIN is returned, not skipped.
-    let r = resolve_from(None, Some(String::new()));
+    let r = resolve_from(Some(String::new()));
     assert_eq!((r.program.as_str(), r.source), ("", GhBinSource::EnvOverride));
 }
 
@@ -112,6 +109,20 @@ fn env_plan_gh_repo_prefers_the_typed_target_over_loom_repo() {
 
     let ambient = read_op(GhTarget::None).env_plan_with(Some("other/repo".into()), None);
     assert_eq!(env_of(&ambient, "GH_REPO"), Some(Some("other/repo".into())));
+}
+
+/// `strip_env` is applied after the `LOOM_REPO` mapping, so the child of a
+/// `gh repo view` cross-check never sees a `GH_REPO` (W3a).
+#[test]
+fn env_plan_strip_env_wins_over_the_loom_repo_mapping() {
+    let stripped = read_op(GhTarget::None)
+        .strip_env("GH_REPO")
+        .env_plan_with(Some("other/repo".into()), None);
+    let last = stripped.iter().rev().find(|e| e.key == "GH_REPO").unwrap();
+    assert_eq!(last.value, None, "the removal is applied last: {stripped:?}");
+    let set_at = stripped.iter().position(|e| e.key == "GH_REPO").unwrap();
+    let removed_at = stripped.iter().rposition(|e| e.key == "GH_REPO").unwrap();
+    assert!(set_at < removed_at);
 }
 
 #[test]

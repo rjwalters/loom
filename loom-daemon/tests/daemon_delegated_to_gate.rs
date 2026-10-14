@@ -1,5 +1,5 @@
 //! Issue #5345 — `daemon.delegatedTo` gates `loom-daemon workspace
-//! add|set-priority|remove` and `loom-daemon tokens bootstrap` when the
+//! add|set-weight|remove` and `loom-daemon tokens bootstrap` when the
 //! invoking (workspace, resp. target) repo declares delegation, while
 //! leaving `workspace list` and `tokens select` (read-only / hot-path
 //! client actions) unaffected.
@@ -50,12 +50,15 @@ fn run_daemon_with_shared_pool(
         // (issue #4039's private/shared defaults file) or a real
         // ~/.loom/tokens shared pool leaking into `tokens select`.
         .env("LOOM_CONFIG_DEFAULTS_FILE", "")
+        // No Codex profile root: `workspace add`/`remove` must not ask the
+        // host's real docker about session containers (#10364).
+        .env("LOOM_CODEX_PROFILE_ROOT", "")
         .env("LOOM_SHARED_TOKENS_DIR", shared_tokens_dir)
         .output()
         .unwrap()
 }
 
-// ===== workspace add/set-priority/remove: gated =====
+// ===== workspace add/set-weight/remove: gated =====
 
 #[test]
 fn workspace_add_refuses_when_invoking_repo_is_delegated() {
@@ -83,18 +86,18 @@ fn workspace_add_refuses_when_invoking_repo_is_delegated() {
 }
 
 #[test]
-fn workspace_set_priority_refuses_when_invoking_repo_is_delegated() {
+fn workspace_set_weight_refuses_when_invoking_repo_is_delegated() {
     let fixture = write_fixture_repo(DELEGATED_CONFIG);
     let registry = fixture.path().join("workspaces.json");
     let target = fixture.path().join("some-other-repo");
 
     let output = run_daemon(
-        &["workspace", "set-priority", target.to_str().unwrap(), "5"],
+        &["workspace", "set-weight", target.to_str().unwrap(), "5"],
         fixture.path(),
         &registry,
     );
 
-    assert!(!output.status.success(), "workspace set-priority must refuse under delegation");
+    assert!(!output.status.success(), "workspace set-weight must refuse under delegation");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("/Users/alice/GitHub/other-repo"),

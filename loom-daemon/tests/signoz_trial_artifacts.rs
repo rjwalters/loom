@@ -41,8 +41,6 @@ const SIGNOZ_README: &str = include_str!("../../defaults/observability/signoz/RE
 /// The standing build/CI retro queries (#8826). Governed by the CI record
 /// family's own vocabulary, not the shared fixture manifest's.
 const CI_QUERIES: &str = include_str!("../../defaults/observability/signoz/ci-queries.sql");
-/// The ETA accuracy queries (#9289).
-const ETA_QUERIES: &str = include_str!("../../defaults/observability/signoz/eta-queries.sql");
 /// The measured token/cost usage queries (#8528 scope item 4). Governed by the
 /// `loom.runtime.usage` span's own emitted vocabulary, not the shared fixture
 /// manifest's — the fixture generator emits no usage spans, so these read real
@@ -57,6 +55,10 @@ const QUEUE_DWELL: &str = include_str!("../../defaults/observability/signoz/queu
 /// `tokens_metric_names`), which are not a `MetricName` variant.
 const QUOTA_UTILIZATION: &str =
     include_str!("../../defaults/observability/signoz/quota-utilization.sql");
+/// The GitHub shadow-spend reconciliation queries (#10343). Governed by the
+/// `github.ratelimit.used` / `loom.forge.calls` `MetricName`s and the
+/// `invoke github` span's attribute keys.
+const GITHUB_SHADOW: &str = include_str!("../../defaults/observability/signoz/github-shadow.sql");
 /// The queue-starvation alert rule (#8856): a saved SigNoz alert definition,
 /// not a `.sql` file, but its embedded `query` field is real ClickHouse SQL
 /// subject to the same drift.
@@ -266,13 +268,14 @@ fn saved_queries_only_reference_forwarded_attribute_and_resource_keys() {
         ("fixture-queries.sql", FIXTURE_QUERIES),
         ("queries.sql", ADHOC_QUERIES),
         ("ci-queries.sql", CI_QUERIES),
-        ("eta-queries.sql", ETA_QUERIES),
         ("usage-queries.sql", USAGE_QUERIES),
         // Only query 5 (the dispatch disposition/admission span read) uses
         // these containers; queries 1-4 read `signoz_metrics` exclusively —
         // see `queue_dwell_queries_match_the_ops_metric_vocabulary` below for
         // those.
         ("queue-dwell.sql", QUEUE_DWELL),
+        // Query 4 reads `invoke github` span attributes (#10343).
+        ("github-shadow.sql", GITHUB_SHADOW),
     ] {
         for container in ["attributes_string", "attributes_number", "attributes_bool"] {
             for key in referenced_attribute_keys(sql, container) {
@@ -456,6 +459,7 @@ fn daemon_ci_log_attribute_containers() -> BTreeMap<String, &'static str> {
         duration_ms: 0,
         queued_ms: Some(0),
         trigger_reason: Some("new_commit".into()),
+        observed_at: Some(at),
     };
     let job = CiJobRecord {
         repo: "2amlogic/example".into(),
@@ -477,6 +481,7 @@ fn daemon_ci_log_attribute_containers() -> BTreeMap<String, &'static str> {
         shard_index: Some(1),
         shard_total: Some(3),
         shard_kind: "nextest-partition".into(),
+        observed_at: Some(at),
     };
     let chunk = CiJobLogRecord {
         repo: "2amlogic/example".into(),
@@ -905,47 +910,6 @@ fn usage_queries_documented_invocation_binds_exactly_the_parameters_used() {
     );
 }
 
-/// The same coupling for `eta-queries.sql` (#9289, executed against the pinned
-/// engine by `signoz_eta_queries.rs` in #8528). Its sections are `0` plus
-/// `Q1`-`Q7` (Q4-Q7 since #10233), so the citation is matched on those tokens rather than on bare
-/// digits — and section 0 is cited here, unlike `usage-queries.sql`'s, because
-/// the ETA preflight is the thing that says whether Q1-Q3 rest on anything and
-/// a reader must be sent to it from the table itself.
-#[test]
-fn every_eta_query_section_is_cited_by_a_readme_saved_view() {
-    let citation = Regex::new(r"`eta-queries\.sql`([^)]*)\)").unwrap();
-    let cited: Vec<String> = SIGNOZ_README
-        .lines()
-        .filter(|line| line.starts_with("| "))
-        .flat_map(|line| {
-            citation
-                .captures_iter(line)
-                .map(|capture| capture.get(1).unwrap().as_str().to_string())
-                .collect::<Vec<String>>()
-        })
-        .collect();
-    assert!(
-        !cited.is_empty(),
-        "the SigNoz README's Saved views table cites no `eta-queries.sql` section at all"
-    );
-    let all = cited.join(" ");
-    for section in ["0", "Q1", "Q2", "Q3", "Q4", "Q5", "Q6", "Q7"] {
-        assert!(
-            Regex::new(&format!(r"(?m)^-- {}\. ", regex::escape(section)))
-                .unwrap()
-                .is_match(ETA_QUERIES),
-            "eta-queries.sql is missing section {section}"
-        );
-        assert!(
-            Regex::new(&format!(r"\b{}\b", regex::escape(section)))
-                .unwrap()
-                .is_match(&all),
-            "the SigNoz README's Saved views table has no row citing `eta-queries.sql` \
-             {section}; its citations are {cited:?}"
-        );
-    }
-}
-
 /// Sections 1-6 are the reproducible views; section 0 is the arrival preflight
 /// the subsection prose describes rather than a saved view of its own.
 #[test]
@@ -1167,5 +1131,65 @@ fn queue_starvation_alert_matches_the_ops_metric_vocabulary() {
         QUEUE_STARVATION_ALERT.contains("= 'ready'"),
         "alerts/queue-starvation.json must filter state = 'ready', matching its \"Loom ready \
          queue starved\" name"
+    );
+}
+
+// ============================================================================
+// github-shadow.sql (#10343): the GitHub bucket reconciliation drift guard
+// ============================================================================
+
+#[test]
+fn github_shadow_queries_match_the_ratelimit_and_forge_calls_vocabulary() {
+    let datapoint_keys = &keep_keys_by_context()["datapoint"];
+    let expected: BTreeSet<String> = [
+        MetricName::GithubRateLimitUsed,
+        MetricName::GithubRateLimitReset,
+        MetricName::ForgeCalls,
+    ]
+    .iter()
+    .map(|name| name.as_str().to_owned())
+    .collect();
+    assert_eq!(
+        all_metric_name_literals(GITHUB_SHADOW),
+        expected,
+        "github-shadow.sql must read exactly github.ratelimit.{{used,reset}} and loom.forge.calls"
+    );
+
+    let labels = metric_label_keys(GITHUB_SHADOW);
+    for label in [
+        "account",
+        "owner",
+        "resource",
+        "cred_owner",
+        "outcome",
+        "op",
+        "installation",
+        "agent",
+        "caller",
+    ] {
+        assert!(labels.contains(label), "github-shadow.sql no longer reads label '{label}'");
+    }
+    for label in &labels {
+        assert_ops_metric_label_is_forwarded("github-shadow.sql", label, datapoint_keys);
+    }
+
+    let span_keys = referenced_attribute_keys(GITHUB_SHADOW, "attributes_string");
+    for key in [
+        "github.account",
+        "github.cred_owner",
+        "github.resource",
+        "github.billing",
+        "github.http.requests",
+    ] {
+        assert!(span_keys.contains(key), "github-shadow.sql query 4 no longer reads {key}");
+    }
+    let span_name = SpanName::GithubInvoke.as_str();
+    assert!(
+        GITHUB_SHADOW.contains(&format!("name = '{span_name}'")),
+        "github-shadow.sql query 4 must filter the `{span_name}` span"
+    );
+    assert!(
+        SIGNOZ_README.contains("github-shadow.sql"),
+        "the SigNoz README no longer documents github-shadow.sql"
     );
 }

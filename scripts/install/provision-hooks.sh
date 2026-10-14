@@ -4,7 +4,8 @@
 #
 # Sibling of provision-skills.sh / provision-dispatcher.sh. Where those establish
 # the machine-level `loom` dispatcher and the user-scope `/loom:*` skills, this
-# wires the Loom PreToolUse / UserPromptSubmit / Stop guard HOOKS into the
+# wires the Loom PreToolUse / UserPromptSubmit / Stop / SubagentStop guard HOOKS (plus the
+# SessionStart gh front, #10516) into the
 # operator's user-scope `~/.claude/settings.json`, pointing at hook scripts that
 # execute from the SINGLE machine-level checkout instead of a per-repo
 # `.loom/hooks/` copy that drifts stale (the recurring resync-installed.sh pain).
@@ -177,8 +178,26 @@ PROJECT_HOOKS_WIRED=0
 # it, MCP tool calls were the one tool class outside every PreToolUse matcher,
 # while `get_agent_metrics` turned its raw arguments into a shell command line
 # (fixed server-side in #9107; this matcher is the second, independent layer).
-_PHOOK_TYPES=(PreToolUse PreToolUse PreToolUse PreToolUse UserPromptSubmit UserPromptSubmit Stop)
-_PHOOK_MATCHERS=(Bash Bash "Edit|Write" "mcp__loom__.*" "" "" "")
+#
+# `SessionStart` / `gh-front-env.sh` (#10516) is not a guard: it puts the agent
+# `gh` front first on an interactive session's PATH via `$CLAUDE_ENV_FILE`
+# (inherited by Task subagents). Matcher "" covers startup/resume/clear/compact;
+# the hook is fail-open and stdout-silent, and `LOOM_GH_SHIM=0` opts out.
+#
+# `roll-pause.sh` (#10830) is wired three times, match-all: PreToolUse parks a
+# daemon-dispatched agent's tool calls at a roll's safe point, and PostToolUse /
+# PostToolUseFailure close its in-flight ledger. It exits at once unless
+# LOOM_DAEMON_ITEM_ID is set, so attended sessions pay one `bash` start per call.
+#
+# `guard-uncommitted-work.sh` (#8372) is wired twice, Stop AND SubagentStop,
+# match-all: a Builder that runs as a Task subagent ends on SubagentStop, and
+# that is the session that owns a worktree. It is an opt-in CANARY — the daemon
+# behind the stub is silent unless the workspace sets
+# `guards.uncommittedWorkConsumerCanary: true` — so wiring it everywhere enables
+# nothing by itself. Each (type, name) pair dedups independently on the
+# `defaults/hooks/<name>` marker, so the two entries never collapse or duplicate.
+_PHOOK_TYPES=(PreToolUse PreToolUse PreToolUse PreToolUse UserPromptSubmit UserPromptSubmit Stop SessionStart PreToolUse PostToolUse PostToolUseFailure Stop SubagentStop)
+_PHOOK_MATCHERS=(Bash Bash "Edit|Write" "mcp__loom__.*" "" "" "" "" "*" "*" "*" "" "")
 _PHOOK_NAMES=(
     guard-destructive.sh
     guard-loom-workflow.sh
@@ -187,6 +206,12 @@ _PHOOK_NAMES=(
     skill-router.sh
     methodology-inject.sh
     guard-background-subagents.sh
+    gh-front-env.sh
+    roll-pause.sh
+    roll-pause.sh
+    roll-pause.sh
+    guard-uncommitted-work.sh
+    guard-uncommitted-work.sh
 )
 
 # Emit the fail-open, workspace-gated, transition-deferring command wrapper for a
@@ -209,6 +234,88 @@ _phook_cmd() {
     local name="$1"
     # shellcheck disable=SC2016  # literal $-expansions are intentional (per-user, at hook time)
     printf '%s' "bash -c 'ROOT=\$(cd \"\$(git rev-parse --git-common-dir 2>/dev/null)/..\" 2>/dev/null && pwd); [ -n \"\$ROOT\" ] || exit 0; { [ -f \"\$ROOT/.loom-project/project.json\" ] || [ -f \"\$ROOT/.loom/config.json\" ]; } || exit 0; [ -x \"\$ROOT/.loom/hooks/${name}\" ] && [ -f \"\$ROOT/.claude/settings.json\" ] && case \"\$(<\"\$ROOT/.claude/settings.json\")\" in *\".loom/hooks/${name}\"*) exit 0 ;; esac; H=\"\${LOOM_HOME:-\$HOME/.local/share/loom}/defaults/hooks/${name}\"; [ -x \"\$H\" ] && LOOM_PROJECT_ROOT=\"\$ROOT\" exec \"\$H\" || exit 0'"
+}
+
+# ── Operator presence (#11563, #11713) ────────────────────────────────────────
+# _phook_presence_mode -> echoes `on`, `off` or `unset`. First match wins:
+#   LOOM_OPERATOR_PRESENCE=0         per-run / per-shell force-off
+#   ~/.loom/operator-presence.optout per-operator local opt-out (beats fleet policy)
+#   operatorPresence.enabled=false   fleet key (machine-level defaults.json, tier 1)
+#   LOOM_OPERATOR_PRESENCE=1 / enabled=true: on (=1 is below the opt-outs; the installer writes it)
+_phook_presence_mode() {
+    [[ "${LOOM_OPERATOR_PRESENCE:-}" == 0 || -e "${LOOM_PRESENCE_OPTOUT_FILE:-$HOME/.loom/operator-presence.optout}" ]] && { echo off; return; }
+    local cfg="${LOOM_CONFIG_DEFAULTS_FILE-$HOME/.local/share/loom/config/defaults.json}" v=""
+    [[ -n "$cfg" && -r "$cfg" ]] && command -v jq >/dev/null 2>&1 \
+        && v="$(jq -r '.operatorPresence.enabled | if type == "boolean" then tostring else empty end' "$cfg" 2>/dev/null)"
+    [[ "$v" == false ]] && { echo off; return; }
+    if [[ "$v" == true || "${LOOM_OPERATOR_PRESENCE:-}" == 1 ]]; then echo on; else echo unset; fi
+}
+
+# _phook_presence_apply <settings_file>: merge (on) or strip (off) the three
+# presence-beat.sh hook entries and the LOOM_OPERATOR_PRESENCE=1 env entry,
+# touching nothing else. Idempotent; a no-op when already in the wanted state.
+_phook_presence_apply() {
+    local settings="$1" mode pevent rc=0
+    mode="$(_phook_presence_mode)"
+    [[ "$mode" == unset ]] && return 0
+    if [[ "$mode" == on ]]; then
+        for pevent in UserPromptSubmit PostToolUse Stop; do
+            if _phook_merge_one "$settings" "$pevent" "" "defaults/hooks/presence-beat.sh" \
+                "$(_phook_cmd presence-beat.sh)" "" "$_PHOOK_WRAPPER_MARKER"; then
+                _phook_ok "wired $pevent/<all> -> presence-beat.sh (operator presence)"
+            else
+                _phook_warn "failed to wire presence-beat.sh ($pevent) into $settings"
+                rc=1
+            fi
+        done
+        _phook_presence_edit "$settings" '.env = ((.env // {}) + {"LOOM_OPERATOR_PRESENCE": "1"})' || rc=1
+    else
+        _phook_presence_edit "$settings" '
+            (if .hooks then .hooks |= (to_entries | map(.value |= (map(.hooks |= map(select((.command // "") | contains("defaults/hooks/presence-beat.sh") | not))) | map(select((.hooks | length) > 0)))) | map(select((.value | length) > 0)) | from_entries) else . end)
+            | if (.hooks // {}) == {} then del(.hooks) else . end
+            | if (.env.LOOM_OPERATOR_PRESENCE // "") == "1" then del(.env.LOOM_OPERATOR_PRESENCE) else . end
+            | if (.env // {}) == {} then del(.env) else . end' || rc=1
+    fi
+    return "$rc"
+}
+
+# _phook_presence_edit <settings_file> <jq filter>: apply the filter only when it
+# changes the file (back up first), so a converged host is byte-stable.
+_phook_presence_edit() {
+    local settings="$1" filter="$2" tmp
+    [[ -s "$settings" ]] || return 0
+    tmp="$(mktemp 2>/dev/null)" || return 1
+    if jq "$filter" "$settings" >"$tmp" 2>/dev/null; then
+        if [[ "$(jq -S . "$tmp")" == "$(jq -S . "$settings")" ]]; then rm -f "$tmp"; return 0; fi
+        _phook_backup_settings "$settings" >/dev/null
+        mv "$tmp" "$settings" 2>/dev/null || { rm -f "$tmp"; return 1; }
+        _phook_ok "updated operator presence settings in $settings"
+        return 0
+    fi
+    rm -f "$tmp"
+    return 1
+}
+
+# provision_operator_presence [claude_dir]
+#
+# Standalone presence-only pass for resync-installed.sh (#11713): applies
+# `_phook_presence_mode` to the user-scope settings without re-running the full
+# guard-hook wiring. Best-effort, never fatal; a no-op when mode is `unset`.
+provision_operator_presence() {
+    local claude_dir="${1:-$HOME/.claude}" settings mode
+    settings="$claude_dir/settings.json"
+    mode="$(_phook_presence_mode)"
+    [[ "$mode" == unset ]] && return 0
+    command -v jq >/dev/null 2>&1 || { _phook_warn "jq not available; cannot apply operator presence."; return 1; }
+    if [[ -s "$settings" ]] && ! jq empty "$settings" >/dev/null 2>&1; then
+        _phook_warn "$settings is not valid JSON; leaving it untouched."
+        return 1
+    fi
+    if [[ ! -s "$settings" ]]; then
+        [[ "$mode" == on ]] || return 0
+        mkdir -p "$claude_dir" 2>/dev/null && printf '{}\n' >"$settings" 2>/dev/null || return 1
+    fi
+    _phook_presence_apply "$settings"
 }
 
 # provision_loom_hooks [claude_dir]
@@ -292,6 +399,10 @@ provision_loom_hooks() {
             soft_fail=1
         fi
     done
+
+    # Operator presence heartbeat (#11563/#11713): wired, or removed, per
+    # _phook_presence_mode. Unset leaves any existing wiring untouched.
+    _phook_presence_apply "$settings" || soft_fail=1
 
     return "$soft_fail"
 }

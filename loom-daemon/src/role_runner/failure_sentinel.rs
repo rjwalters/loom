@@ -93,7 +93,7 @@ pub(super) fn describe_role_failure(full_log: &str, log_path: &Path, tick_anchor
 /// This tick's slice of the append-only role log: from the last occurrence of
 /// `tick_anchor` onward, or the whole log when the anchor is empty or absent
 /// (#9980).
-fn tick_region<'a>(full_log: &'a str, tick_anchor: &str) -> &'a str {
+pub(super) fn tick_region<'a>(full_log: &'a str, tick_anchor: &str) -> &'a str {
     if tick_anchor.is_empty() {
         return full_log;
     }

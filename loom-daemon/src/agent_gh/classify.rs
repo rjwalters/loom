@@ -11,10 +11,12 @@
 //! serve them ([`crate::forge_cached_view::parse_query`],
 //! [`crate::forge_cached_list::parse_query`]), narrowed further for `list`,
 //! whose projection is not `gh`-identical for every field (see
-//! [`LIST_PARITY_FIELDS`]). A module that still declines at run time (a
+//! [`LIST_PARITY_FIELDS`]), and of [`super::pr_checks::parse`] for
+//! `pr checks` (#10516). A module that still declines at run time (a
 //! number that is really a PR, a truncated page, a non-200/304 answer) sends
 //! the call down the passthrough path too.
 
+use super::pr_checks;
 use crate::{forge_cached_list, forge_cached_view};
 
 /// `gh issue …` or `gh pr …`.
@@ -44,6 +46,8 @@ pub enum Route {
     /// argv to serve with: `gh`'s implicit `--limit 30` made explicit, since
     /// the listing module applies no default limit.
     EtagList(Entity, Vec<String>),
+    /// `pr checks <N> [--json …]` through [`super::pr_checks`].
+    EtagChecks,
     /// Exec the next `gh` with the argv byte-identical.
     Passthrough,
 }
@@ -82,6 +86,9 @@ pub fn classify(args: &[String]) -> Route {
             Route::EtagView(entity)
         }
         "list" => classify_list(entity, rest),
+        "checks" if entity == Entity::Pr && pr_checks::parse(&rest[1..]).is_some() => {
+            Route::EtagChecks
+        }
         _ => Route::Passthrough,
     }
 }

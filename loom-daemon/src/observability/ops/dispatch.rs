@@ -18,6 +18,7 @@ use chrono::{DateTime, Utc};
 use crate::telemetry::ops::{MetricName, MetricPoint};
 use crate::telemetry::queue_snapshot::QueueRepoRef;
 use crate::telemetry::trace::{SpanName, SpanRecord, SpanStatus, TraceAttributes, TraceContext};
+use crate::work_finder::halt_cause::HaltCause;
 use crate::work_finder::{Admission, TickReport};
 
 /// Every `reason` label value, paired with its [`TickReport`] counter. Zero
@@ -50,14 +51,14 @@ pub fn decision_counts(report: &TickReport) -> [(&'static str, usize); 26] {
         ("noop_cooldown", report.skipped_noop_cooldown),
         ("declined", report.skipped_declined),
         ("prless_retry", report.skipped_prless_retry),
+        ("already_landed", report.skipped_already_landed),
+        ("already_closed", report.skipped_already_closed),
         ("recheck_interval", report.skipped_recheck_interval),
         ("host_constraint", report.skipped_host_constraint),
-        ("host_class", report.skipped_host_class),
         ("capacity", report.deferred_capacity),
         ("ramp_cap", report.deferred_ramp_cap),
         ("saturation", report.deferred_saturation),
         ("build_backoff", report.deferred_build_backoff),
-        ("out_of_slice", report.deferred_out_of_slice),
         ("repo_cap", report.deferred_repo_cap),
         ("error", report.errors.saturating_sub(classified_errors)),
         // Typed dispatch refusals (Issue #8907) — one contiguous block.
@@ -73,11 +74,12 @@ pub fn decision_counts(report: &TickReport) -> [(&'static str, usize); 26] {
 /// | value | when |
 /// |---|---|
 /// | `dispatched` | at least one sweep started |
-/// | `halted_main_red` | a main-health gate held a workspace |
-/// | `halted_ci_billing` | as above, but an owner's Actions jobs are billing-blocked (#10113) |
+/// | `halted_<cause>` | every held workspace names one cause, e.g. `halted_main_red`, `halted_disk_reservation` (#11649; see [`halted_result`]) |
+/// | `halted_ci_billing` | the `ci_billing` cause, or a cause-less hold while an owner's Actions jobs are billing-blocked (#10113) |
+/// | `halted` | held, but by several causes or by none named (`loom.dispatch.halt_causes` lists them) |
 /// | `saturation_held` | the saturation admission brake was engaged |
-/// | `build_backoff_held` | the build back-off (#9410) was engaged |
 /// | `error` | a dispatch or listing failed and nothing started |
+/// | `build_backoff_held` | the build back-off (#9410) deferred at least one candidate |
 /// | `no_eligible_work` | no ready candidates at all |
 /// | `capacity_full` | candidates deferred by the concurrency or ramp cap |
 /// | `all_skipped` | every candidate was skipped for a per-issue reason |
@@ -91,22 +93,56 @@ pub fn tick_result(report: &TickReport) -> &'static str {
 pub fn tick_result_with(report: &TickReport, billing_blocked: bool) -> &'static str {
     if report.dispatched > 0 {
         "dispatched"
-    } else if report.halted && billing_blocked {
-        "halted_ci_billing"
     } else if report.halted {
-        "halted_main_red"
+        halted_result(&report.halt_causes, billing_blocked)
     } else if report.saturation_held {
         "saturation_held"
-    } else if report.build_backoff_held {
-        "build_backoff_held"
     } else if report.errors > 0 {
         "error"
+    } else if report.deferred_build_backoff > 0 {
+        // Keyed on an actual deferral, not on `build_backoff_held` (#10624):
+        // since the hold is per repo, one repo can stay engaged for days, and
+        // "any repo held" would mask every idle, capacity-full or failed tick
+        // as a back-off hold.
+        "build_backoff_held"
     } else if report.seen == 0 {
         "no_eligible_work"
     } else if report.deferred_capacity + report.deferred_ramp_cap > 0 {
         "capacity_full"
     } else {
         "all_skipped"
+    }
+}
+
+/// A held tick's result (#11649), from the distinct causes it recorded. Until
+/// #11649 every hold read `halted_main_red` (or `halted_ci_billing`), so a
+/// tick held only by a disk reservation or a drain was reported as a red
+/// `main`. Now one cause names itself, `halted_<cause token>` — so a red
+/// `main` still reads `halted_main_red` and a per-owner billing block
+/// `halted_ci_billing` — and several causes read the neutral `halted`, the
+/// causes themselves on `loom.dispatch.halt_causes`. A cause-less hold (a
+/// caller that attributes none) keeps the pre-#11649 billing fallback, else
+/// reads `halted`: it no longer guesses `main_red`.
+#[must_use]
+pub fn halted_result(causes: &[HaltCause], billing_blocked: bool) -> &'static str {
+    match causes {
+        [] if billing_blocked => "halted_ci_billing",
+        [cause] => match cause {
+            HaltCause::MainRed => "halted_main_red",
+            HaltCause::GatePending => "halted_gate_pending",
+            HaltCause::TokenPool => "halted_token_pool",
+            HaltCause::PreflightAdvisory => "halted_preflight_advisory",
+            HaltCause::Drain => "halted_drain",
+            HaltCause::Breaker => "halted_breaker",
+            HaltCause::WriteScope => "halted_write_scope",
+            HaltCause::CiBilling => "halted_ci_billing",
+            HaltCause::InstallIncompatible => "halted_install_incompatible",
+            HaltCause::DaemonTooOld => "halted_daemon_too_old",
+            HaltCause::MaintainOnly => "halted_maintain_only",
+            HaltCause::DiskReservation => "halted_disk_reservation",
+            HaltCause::WeightZero => "halted_weight_zero",
+        },
+        _ => "halted",
     }
 }
 
@@ -151,6 +187,12 @@ pub fn tick_span(
     .map(|(key, value)| (key.to_string(), value))
     .collect();
     let mut attributes = attributes;
+    if !report.halt_causes.is_empty() {
+        // #11649: every cause a held tick recorded, comma-joined in
+        // `HaltCause::ALL` order; absent on a tick nothing held.
+        let causes: Vec<&str> = report.halt_causes.iter().map(|c| c.as_str()).collect();
+        attributes.insert("loom.dispatch.halt_causes".to_string(), causes.join(","));
+    }
     crate::telemetry::trace::provenance::stamp(&mut attributes);
     SpanRecord {
         context: TraceContext::derived(
@@ -371,8 +413,9 @@ pub fn record_tick(
     // failed-repo discipline (unresolvable roots are dropped, the same
     // accepted edge case its own `failed_slugs` documents).
     let repo_refs = resolved_repo_refs(&report.admissions, &report.queue, roots);
+    // #11139: a partial listing is no evidence of a cleared lock either.
     let failed: Vec<String> = report
-        .listing_failed
+        .listing_not_whole()
         .iter()
         .filter_map(|idx| repo_refs.get(idx).map(|r| r.repo.clone()))
         .collect();

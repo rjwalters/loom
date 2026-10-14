@@ -33,6 +33,15 @@
 //!   by the proactive probe the selector runs (#6927), so it is not counted as
 //!   blocking either. The probe shells out to `docker`; it is deliberately NOT
 //!   run here, on the role loop's synchronous decision phase.
+//! - **A session-managed account whose container is down** (`SessionDown`,
+//!   #10454) IS counted as blocking: spawn-codex.sh refuses it with exit 78,
+//!   so counting it would select a tap only to kill it. This starts no
+//!   process: it reads the snapshot the daemon's session watch last published
+//!   (`session_lifecycle::liveness::published`, #10660), and it fails open —
+//!   with no fresh snapshot, or one in which Docker could not be queried, no
+//!   account is marked down. A running container with stale mounts is not
+//!   down. An account the operator stopped (`accounts session stop`) is
+//!   reported as held, with no hint to start it.
 //!
 //! An inventory or health-state read error is the one fail-closed case: the
 //! selector reads the same files and fails the same way (exit `78`).
@@ -139,13 +148,17 @@ pub(crate) fn check(
     // tap's own pre-spawn gate refusing — drops the reservation, and with it
     // releases the slot, so a tick that does not launch never holds one.
     let context = crate::runtime_preference::DispatchContext {
-        complexity: None,
         intent: crate::runtime_preference::Intent::Dispatch,
+        // #11453: a role tick consults the per-workspace launch-failure hold,
+        // so a tap that keeps failing deterministically falls through
+        // `rolePreference` instead of being relaunched every interval.
+        role_tick: true,
     };
     let Ok(crate::runtime_preference::Decision::Preference {
         source,
         resolution,
         backstop,
+        draw,
     }) = crate::runtime_preference::resolve_runtime_contained(
         root,
         role,
@@ -161,12 +174,21 @@ pub(crate) fn check(
         gate(admission)?;
         return Ok(crate::runtime_preference::DispatchAdmission::none());
     };
-    let marker = resolution.marker_line();
-    let exhausted = resolution.exhausted_diagnostic(role);
+    // #11726: a role draw's record rides on the marker, the diagnostic and
+    // the stamp, so the decision (seed, table, rolls, pick) is replayable.
+    let mut marker = resolution.marker_line();
+    if let Some(draw) = &draw {
+        marker.push_str(&format!(" {}", draw.marker_fragment()));
+    }
+    let exhausted =
+        crate::runtime_preference::exhausted_with_draw(&resolution, draw.as_deref(), role);
     // #8599: the stamp the chosen admission carries to the launch surfaces —
     // computed before `resolution.chosen` is moved out below. `None` in the
     // fail-closed case, which has no chosen tier to report.
-    let stamp = resolution.stamp(source.as_str());
+    let stamp = crate::runtime_preference::role_draw_stamp(
+        resolution.stamp(source.as_str()),
+        draw.as_deref(),
+    );
     let Some(chosen) = resolution.chosen else {
         // Every listed tap was skipped. Fail closed, reporting the
         // statically-admitted runtime's own gate outcome when it has one, so
@@ -240,7 +262,7 @@ pub(crate) fn static_check(
 /// counters are byte-identical to the pre-#8408 preflight.
 fn claude_gate(root: &Path, logs: &Path, role: &str) -> Option<RoleTickOutcome> {
     if crate::tokens::token_pool_size(root) == 0 {
-        NO_TOKEN_POOL_SKIP_COUNT.fetch_add(1, Ordering::Relaxed);
+        NO_TOKEN_POOL_SKIP_COUNT.record();
         note_pre_spawn_skip(
             logs,
             role,
@@ -252,7 +274,7 @@ fn claude_gate(root: &Path, logs: &Path, role: &str) -> Option<RoleTickOutcome> 
     // Do not launch a known exhausted Claude pool (#7607).
     let pool = crate::tokens_pool::select::spawnable_pool_state(root);
     if pool.total > 0 && pool.usable == 0 {
-        POOL_EXHAUSTED_SKIP_COUNT.fetch_add(1, Ordering::Relaxed);
+        POOL_EXHAUSTED_SKIP_COUNT.record();
         let next_clear_at = crate::tokens_pool::select::pool_clear_estimate(&pool.dir);
         note_pre_spawn_skip(
             logs,
@@ -293,6 +315,16 @@ pub(crate) struct CodexPoolState {
     /// release — see the module doc for why class-scoped holds and
     /// session-managed re-auth holds are not counted as blocking.
     pub spawnable: usize,
+    /// Enabled session-managed accounts whose `loom-codex-session-<name>`
+    /// container the published session snapshot shows as down — stopped,
+    /// restarting or missing (#10454, reason `SessionDown`). Never counted
+    /// spawnable: spawn-codex.sh refuses a down session with exit 78. Always 0
+    /// when there is no fresh snapshot or Docker could not be queried (fail
+    /// open), or when no account is session-managed.
+    pub session_down: usize,
+    /// How many of `session_down` the operator holds down (`accounts session
+    /// stop`, #10453). Only changes the skip text (#10660).
+    pub session_held: usize,
     /// Earliest account-wide cooldown deadline (epoch seconds) among the
     /// blocked accounts, when any has one.
     pub earliest_clear: Option<u64>,
@@ -314,6 +346,8 @@ pub(crate) fn codex_pool_state(root: &Path, now: u64) -> CodexPoolState {
     let mut state = CodexPoolState {
         enabled: 0,
         spawnable: 0,
+        session_down: 0,
+        session_held: 0,
         earliest_clear: None,
         read_error: None,
     };
@@ -338,8 +372,22 @@ pub(crate) fn codex_pool_state(root: &Path, now: u64) -> CodexPoolState {
             return state;
         }
     };
+    // #10454/#10660: the session watch's published snapshot — a mutex read,
+    // never a `docker` process on this per-tick path. Fail open on `None`.
+    let liveness = crate::tokens_pool::session_lifecycle::liveness::published();
     for account in inventory.iter().filter(|account| account.enabled) {
         state.enabled += 1;
+        // Before the no-health-entry `continue` below: an account the health
+        // file has never heard of is still unspawnable if its container is down.
+        if crate::tokens_pool::session_lifecycle::liveness::is_session_down(
+            account,
+            liveness.as_ref(),
+        ) {
+            state.session_down += 1;
+            state.session_held +=
+                usize::from(crate::tokens_pool::session_lifecycle::liveness::is_held(account));
+            continue;
+        }
         let Some(health) = health_state.get(&account.id) else {
             state.spawnable += 1;
             continue;
@@ -361,6 +409,35 @@ pub(crate) fn codex_pool_state(root: &Path, now: u64) -> CodexPoolState {
         state.spawnable += 1;
     }
     state
+}
+
+/// Why an enabled, readable codex pool has nothing spawnable — shared by the
+/// pre-spawn skip and `runtime_preference::availability`'s Exhausted detail so
+/// both name `SessionDown` (#10454) the same way.
+pub(crate) fn codex_exhausted_reason(state: &CodexPoolState) -> String {
+    use crate::tokens_pool::session_hold::HOLD_REASON_OPERATOR_STOP;
+    if state.session_down == 0 {
+        return "every enabled account is cooling down or needs re-auth".to_string();
+    }
+    // #10660: never tell the operator to start a container they stopped.
+    let (down, held) = (state.session_down, state.session_held);
+    let remedy = if held == 0 {
+        " — `loom-daemon accounts session start <name>`".to_string()
+    } else if held >= down {
+        format!(": held ({HOLD_REASON_OPERATOR_STOP})")
+    } else {
+        format!(
+            ": {held} held ({HOLD_REASON_OPERATOR_STOP}) — `loom-daemon accounts session start \
+             <name>` for the {} not held",
+            down - held
+        )
+    };
+    format!(
+        "every enabled account is cooling down, needs re-auth, or is {} ({down}/{} session \
+         container(s) not running{remedy}; #10454)",
+        crate::tokens_pool::session_lifecycle::liveness::SESSION_DOWN,
+        state.enabled
+    )
 }
 
 /// The account provider `spawn-codex.sh` will select from for `admitted`'s
@@ -432,7 +509,7 @@ fn codex_gate(
     if state.spawnable > 0 {
         return None;
     }
-    POOL_EXHAUSTED_SKIP_COUNT.fetch_add(1, Ordering::Relaxed);
+    POOL_EXHAUSTED_SKIP_COUNT.record();
     let cap = now + chrono::Duration::seconds(CODEX_CLEAR_ESTIMATE_CAP_SECS);
     let next_clear_at = state
         .earliest_clear
@@ -451,10 +528,7 @@ fn codex_gate(
         None if state.enabled == 0 => {
             (PoolHold::Unprovisioned, "no enabled codex account is provisioned".to_string())
         }
-        None => (
-            PoolHold::SelfHealing,
-            "every enabled account is cooling down or needs re-auth".to_string(),
-        ),
+        None => (PoolHold::SelfHealing, codex_exhausted_reason(&state)),
     };
     note_pre_spawn_skip(
         logs,

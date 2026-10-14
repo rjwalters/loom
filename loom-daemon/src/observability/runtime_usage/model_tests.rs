@@ -109,6 +109,36 @@ fn an_unknown_model_gets_its_tokens_but_no_fabricated_cost() {
         }
     }
 }
+#[test]
+fn codex_models_are_priced_on_both_cards() {
+    let shipped = PricingCard::load(&shipped_asset_path()).unwrap();
+    for pricing in [Pricing::with(None), Pricing::with(Some(&shipped))] {
+        let spans = spans_for(
+            &[
+                model("gpt-6.1-sol", 1_000_000, 100_000, 500_000, 0, 0),
+                model("gpt-6-astra", 1000, 1000, 0, 0, 0),
+            ],
+            &pricing,
+        );
+        assert_eq!(spans.len(), 2);
+        for span in &spans {
+            for key in [
+                "gen_ai.cost.usd_estimate",
+                "loom.pricing.verified_on",
+                "loom.pricing.source",
+            ] {
+                assert!(span.attributes.contains_key(key), "{key} missing");
+            }
+        }
+        let sol = spans
+            .iter()
+            .find(|s| s.attributes["loom.model"] == "gpt-6.1-sol")
+            .unwrap();
+        // 1M in @ $2 + 0.1M out @ $10 + 0.5M cached @ $0.10 = 2 + 1 + 0.05
+        assert!((usd(sol) - 3.05).abs() < 1e-6, "{}", usd(sol));
+    }
+}
+
 const UNATTRIBUTED: &str = crate::script_helpers::sweep_experiment::UNATTRIBUTED_MODEL;
 
 #[test]

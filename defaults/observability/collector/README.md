@@ -109,7 +109,8 @@ Claude Code's own attribute names (`session.id`, `user.email`,
 `organization.id`, per-metric `model`, tool/event names, etc.) are **not**
 `loom.*`-prefixed. The shared `transform/privacy` processor in `config.yaml`
 still applies unmodified to this path — it keeps only the resource keys
-(`service.name`, `service.version`, `service.instance.id`, `host.id`) and the
+(`service.name`, `service.version`, `service.instance.id`, `host.id`,
+`host.name`, `loom.fleet.config_sha`, `loom.daemon.revision`) and the
 explicit `loom.*` log/span allowlist, plus the small non-namespaced
 `metric_statements` datapoint keys listed under "Privacy and remote
 deployment" below. Anything else Claude Code sends — including
@@ -135,7 +136,8 @@ sessions only.
 
 ## Canary and rollback
 
-First check that your `loom-daemon` was built with the `otlp` feature. Set these
+First check that your `loom-daemon` can export OTLP (`loom-daemon
+telemetry-capabilities --require-otlp`; every build since #10700 can). Set these
 values in `.loom-local/local.json` or the equivalent `LOOM_OBSERVABILITY_*`
 environment variables for the intended canary daemon:
 
@@ -356,7 +358,8 @@ metrics); `repo`, `workflow`, `job`, `runner`, `conclusion` (the
 `provider`, `account`, `model`, `state`). A contract test in
 `loom-daemon/src/observability/ops/tests.rs` fails if `OPS_METRIC_LABEL_KEYS`
 gains a key this list lacks. `metric.points` values are additionally bounded
-at the source: at most 8 labels per point, values ≤128 bytes with no control
+at the source: at most 10 labels per point (`MAX_LABELS_PER_POINT` — the ten
+`loom.forge.calls` labels, #10607), values ≤128 bytes with no control
 characters, finite numbers only — enforced when the daemon enqueues the point
 and again when it exports it (#8857). The #8857 quota metrics
 (`loom.llm.tokens.*`, `loom.llm.requests`, `loom.pool.*`) carry only

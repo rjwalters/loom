@@ -26,6 +26,7 @@
 //!   `loom-daemon tokens select --export` runs for `spawn-claude.sh` — rather
 //!   than the removed Python `loom_tools.tokens.select`.
 
+pub mod isolation;
 pub mod spawn;
 pub mod wait;
 

@@ -14,18 +14,17 @@
 //! - `running` — `dispatched` / `in_flight`.
 //! - `next` — the first `max_admissions_per_tick` rows, in plan order, among
 //!   rows deferred by the concurrency or ramp cap: what the next tick admits
-//!   once slots free. Saturation-held, repo-capped and out-of-slice rows are
-//!   never `next` (the saturation brake holds every admission; the other two
-//!   need something besides a free slot).
+//!   once slots free. Saturation-held and repo-capped rows are never `next`
+//!   (the saturation brake holds every admission; a repo-capped row needs
+//!   something besides a free slot).
 //! - `queued` — every other deferred row.
 //! - `blocked` — everything else.
 //!
 //! # `position`
 //!
-//! The 1-based index in [`TickReport::plan_order`]. Out-of-slice rows, which
-//! the slice partition removed from pass 2's list, follow it in comparator
-//! order (the order they would be offered in once the slice runs dry).
-//! `blocked` rows, and rows dropped before the sort (`in_flight` included),
+//! The 1-based index in [`TickReport::plan_order`]. (Before #11682,
+//! out-of-slice rows followed it; the dispatch slice is retired, so every
+//! deferred row is in `plan_order`.) `blocked` rows, and rows dropped before the sort (`in_flight` included),
 //! have none. `rank` is unchanged: the bare comparator rank over every row.
 
 use std::collections::HashMap;
@@ -90,7 +89,7 @@ pub fn gate_of(disposition: Qd) -> Option<PlanGate> {
         Qd::DeferredSaturation => Some(PlanGate::Saturation),
         Qd::DeferredBuildBackoff => Some(PlanGate::BuildBackoff),
         Qd::DeferredRepoCap => Some(PlanGate::RepoCap),
-        Qd::DeferredOutOfSlice => Some(PlanGate::OutOfSlice),
+        Qd::DeferredFileOverlap => Some(PlanGate::FileOverlap),
         _ => None,
     }
 }
@@ -140,7 +139,7 @@ pub fn annotate(
         shard: inputs.shard,
         scope: PLAN_SCOPE.iter().map(|s| (*s).to_string()).collect(),
         ordering: ready_queue::ordering_names(),
-        complete: report.listing_failed.is_empty(),
+        complete: report.listing_not_whole().is_empty(),
     }
 }
 
@@ -156,9 +155,6 @@ fn annotate_rows(
         .zip(1u32..)
         .map(|(key, pos)| (*key, pos))
         .collect();
-    let mut next_position = u32::try_from(in_plan.len())
-        .unwrap_or(u32::MAX)
-        .saturating_add(1);
     for (tick_row, row) in ranked.iter().zip(rows.iter_mut()) {
         let idx = tick_row.key.workspace_idx;
         let gate = gate_of(row.disposition);
@@ -169,11 +165,6 @@ fn annotate_rows(
         };
         let position = match plan_state {
             PlanState::Blocked => None,
-            _ if gate == Some(PlanGate::OutOfSlice) => {
-                let pos = next_position;
-                next_position = next_position.saturating_add(1);
-                Some(pos)
-            }
             _ => in_plan.get(&(idx, tick_row.key.number)).copied(),
         };
         let cap = report.repo_cap.as_ref();
@@ -183,11 +174,6 @@ fn annotate_rows(
         plan.plan_state = plan_state;
         plan.keys = ready_queue::plan_keys(&tick_row.key);
         plan.gate = gate;
-        // Same fail-open default `apply_slice` uses for a missing entry.
-        plan.in_slice = report
-            .in_slice
-            .as_ref()
-            .map(|s| s.get(idx).copied().unwrap_or(true));
         plan.hot = occupancy.map(|o| o > 0);
         plan.owning_shard = inputs
             .owning_shard

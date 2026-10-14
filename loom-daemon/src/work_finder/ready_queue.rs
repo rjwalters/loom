@@ -25,8 +25,6 @@ use super::{candidate_cmp, PriorityCandidate, WorkItem};
 pub struct TickQueueRow {
     /// The ordering keys, exactly as dispatch uses them.
     pub key: PriorityCandidate,
-    /// The issue's `tier:*` label, if any (information only).
-    pub tier: Option<String>,
     /// What the tick did with it. `None` only while a candidate is waiting
     /// for pass 2; [`finish`] treats a still-`None` row as a capacity deferral.
     pub disposition: Option<QueueDisposition>,
@@ -59,43 +57,45 @@ fn points_of(item: &WorkItem) -> Option<u32> {
     crate::story_points::classify_points_labels(&item.labels).value()
 }
 
-fn tier_of(item: &WorkItem) -> Option<String> {
-    item.labels.iter().find(|l| l.starts_with("tier:")).cloned()
-}
-
-/// The ordering keys for `item` in workspace `idx`. `repo_red` is whether
-/// that repo's `main` is verified red this tick (#9244): the red-main-fix key
-/// is set only then, so a marker on a green repo gets no boost. Every
-/// candidate key — the view's and dispatch's — is built here, so the two
-/// cannot drift.
+/// The ordering keys for `item` in workspace `idx`. Every candidate key —
+/// the view's and dispatch's — is built here, so the two cannot drift. The
+/// level comes only from the item's own `loom:important` /
+/// `loom:very-important` label (#11508): no star, inheritance or red-main
+/// bridge.
+///
+/// `repo_red` is whether that repo's `main` is verified red this tick
+/// (#9244): [`PriorityCandidate::main_red_fix`] is set only then, so a marker
+/// on a green repo is inert. It is the leading ordering key (#11547) and the
+/// three red-main gate bypasses; on a green repo it is neither.
 #[must_use]
 pub fn key_of(
     idx: usize,
-    workspace_priority: u32,
+    workspace_weight: u32,
     item: &WorkItem,
     repo_red: bool,
 ) -> PriorityCandidate {
     PriorityCandidate {
         workspace_idx: idx,
-        workspace_priority,
-        operator_level: item.operator_level(),
-        operator_priority: item.is_operator_priority(),
-        operator_priority_at: item.operator_priority_at.clone(),
-        main_red_fix: repo_red && item.is_main_red_fix(),
+        workspace_weight,
         created_at: item.created_at.clone(),
         number: item.number,
-        complexity: None,
+        level: crate::priority_pick::Level::of(&item.labels),
+        main_red_fix: repo_red && item.is_main_red_fix(),
     }
 }
 
-/// Stable-sort one workspace's ready items by the #9244 lane keys alone
-/// (starred, starred-at, red-main fix): starred and fix issues move to the
-/// front, and every other item keeps its listing order. The single-workspace
-/// tick's ordering; the multi-workspace tick sorts by the full
-/// [`candidate_cmp`].
+/// Sort one workspace's ready items into the in-workspace order (#11103):
+/// verified red-main fix first (#11547), level, oldest `createdAt`, issue
+/// number. The single-workspace tick's ordering; the multi-workspace tick
+/// applies the same order inside each drawn workspace. `repo_red` is whether
+/// the repo's `main` is verified red this tick (`main_red_fix::evaluate`'s
+/// return): on a green repo the marker has no effect on the order.
 pub fn sort_lanes(items: &mut [WorkItem], repo_red: bool) {
     items.sort_by(|a, b| {
-        super::ordering::lane_cmp(&key_of(0, 0, a, repo_red), &key_of(0, 0, b, repo_red))
+        super::workspace_draw::in_workspace_cmp(
+            &key_of(0, 0, a, repo_red),
+            &key_of(0, 0, b, repo_red),
+        )
     });
 }
 
@@ -151,7 +151,6 @@ pub fn record_skip_held(
 ) {
     rows.push(TickQueueRow {
         key,
-        tier: tier_of(item),
         disposition: Some(disposition),
         detail,
         updated_at: item.updated_at.clone(),
@@ -166,11 +165,7 @@ pub fn record_skip_held(
 /// time-boxed hold.
 pub fn record_candidate(rows: &mut Vec<TickQueueRow>, key: &PriorityCandidate, item: &WorkItem) {
     rows.push(TickQueueRow {
-        key: PriorityCandidate {
-            complexity: None,
-            ..key.clone()
-        },
-        tier: tier_of(item),
+        key: key.clone(),
         disposition: None,
         detail: None,
         updated_at: item.updated_at.clone(),
@@ -249,15 +244,16 @@ pub fn finish(rows: &[TickQueueRow], roots: &[PathBuf]) -> Vec<ReadyQueueRow> {
                 rank: i + 1,
                 repo: repo_name(r.key.workspace_idx, roots),
                 issue: r.key.number,
-                workspace_priority: r.key.workspace_priority,
-                // Deprecated by #9244: `loom:urgent` no longer orders anything.
-                // Kept on the wire, always false, for one release.
+                workspace_weight: r.key.workspace_weight,
+                // Deprecated by #9244 (its label deleted in #11105): always
+                // false, kept only for wire compatibility.
                 urgent: false,
-                operator_priority: r.key.operator_priority,
-                operator_priority_at: r.key.operator_priority_at.clone(),
+                // The level dispatch ordered it by (after the cap, #11509).
+                level: r.key.level,
+                // The verified red-main fix (#9244): a gate bypass since
+                // #11508, not an ordering key.
                 main_red_fix: r.key.main_red_fix,
                 created_at: r.key.created_at.clone(),
-                tier: r.tier.clone(),
                 story_points: r.story_points,
                 disposition,
                 detail: r.detail.clone(),

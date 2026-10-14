@@ -575,13 +575,15 @@ _pmd_verify_binary_loadable() {
   return 1
 }
 
-# _pmd_quarantine_unloadable <dest_bin>
+# _pmd_quarantine_unloadable <bad_bin> [dest_bin]
 #
-# Issue #8837 AC2: move an installed-but-unloadable <dest_bin> aside as
-# <dest_bin>.badglibc-<YYYYMMDD> instead of leaving a bricked binary at the
-# path every consumer (loom-daemon-start.sh, and the self-repair scripts
-# themselves, per the 2026-09-24 incident) resolves via `command -v
-# loom-daemon`. The naming matches the operator's own manual remediation
+# Issue #8837 AC2: move an unloadable <bad_bin> aside as
+# <dest_bin>.badglibc-<YYYYMMDD> (default <dest_bin>: <bad_bin> itself)
+# instead of leaving a bricked binary at the path every consumer
+# (loom-daemon-start.sh, and the self-repair scripts themselves, per the
+# 2026-09-24 incident) resolves via `command -v loom-daemon`. Since #10983
+# <bad_bin> is the STAGED candidate, checked before it is published, so the
+# installed binary is never the one moved. The naming matches the operator's own manual remediation
 # that day (`~/.local/bin/loom-daemon.badglibc-20260924`) — an auditable
 # trail of what happened and when, not a silent `rm`.
 #
@@ -589,17 +591,17 @@ _pmd_verify_binary_loadable() {
 # gets a numeric suffix rather than clobbering the first one, so evidence
 # from an earlier failed attempt is never silently lost.
 _pmd_quarantine_unloadable() {
-  local dest_bin="$1"
+  local bad_bin="$1" dest_bin="${2:-$1}"
   local quarantine_path="${dest_bin}.badglibc-$(date +%Y%m%d)"
   local n=2
   while [[ -e "$quarantine_path" ]]; do
     quarantine_path="${dest_bin}.badglibc-$(date +%Y%m%d)-$n"
     n=$((n + 1))
   done
-  if mv -f "$dest_bin" "$quarantine_path" 2>/dev/null; then
-    _pmd_warn "quarantined unloadable binary: $dest_bin -> $quarantine_path"
+  if mv -f "$bad_bin" "$quarantine_path" 2>/dev/null; then
+    _pmd_warn "quarantined unloadable binary: $bad_bin -> $quarantine_path"
   else
-    _pmd_warn "could not quarantine unloadable binary at $dest_bin (mv failed) — remove it manually before the next install"
+    _pmd_warn "could not quarantine unloadable binary at $bad_bin (mv failed) — remove it manually before the next install"
   fi
 }
 
@@ -693,14 +695,25 @@ _pmd_provision_defaults_payload() {
 # non-zero return (a repo can still run the daemon via an explicit
 # LOOM_DAEMON_BIN or an in-repo build).
 #
+# Issue #10983: <dest_bin> is never written in place. The candidate is
+# copied to a temp file beside it, checked and signed THERE, and only then
+# renamed over the path, by `loom-daemon install-binary stage|publish`
+# (`loom-daemon/src/daemon_update/provision.rs`; see that file for why the
+# write is Rust). `publish` first keeps the binary being replaced as
+# <dest_bin>.previous and records the install in
+# <dest_bin>.install-state.json, and REFUSES when it cannot keep that copy
+# (a first-ever install has nothing to keep). The helper that runs those two
+# steps is the first of $LOOM_DAEMON_INSTALL_HELPER (the updater's own
+# running binary), <src_bin> and the installed <dest_bin> that can stage;
+# with none, nothing is installed.
+#
 # Issue #8837 AC2: a copy that lands but does not LOAD (e.g. a binary built
 # against a newer GLIBC than this host provides) is also a soft failure, not
-# a success — the copied bytes are verified with `<dest_bin> --version`
-# after every install/upgrade, and an unloadable result is quarantined to
-# `<dest_bin>.badglibc-<date>` rather than left in place. When a previous
-# working binary existed at <dest_bin>, it is restored so the host is never
-# left with nothing runnable at that path; see `_pmd_verify_binary_loadable`
-# and `_pmd_quarantine_unloadable` above.
+# a success — the staged bytes are verified with `--version` before they are
+# published, and an unloadable candidate is quarantined to
+# `<dest_bin>.badglibc-<date>`. <dest_bin> itself is untouched, so a host
+# with a working binary keeps it; see `_pmd_verify_binary_loadable` and
+# `_pmd_quarantine_unloadable` above.
 #
 # When <defaults_src_dir> is given and exists, it is ALSO mirrored to a
 # machine-level location (`_pmd_defaults_dest_dir`) so `loom-daemon init`
@@ -776,61 +789,62 @@ provision_machine_daemon() {
     return 1
   fi
 
-  # Issue #8837 AC2: back up whatever binary is CURRENTLY at $dest_bin
-  # (before it is overwritten below) so that a post-copy loadability failure
-  # can restore it rather than leave the host with nothing at all. Only
-  # meaningful for an upgrade — a fresh install has no prior binary to save.
-  local preupdate_backup=""
-  if [[ -x "$dest_bin" ]]; then
-    preupdate_backup="$(mktemp "${TMPDIR:-/tmp}/loom-daemon-preupdate.XXXXXX" 2>/dev/null || true)"
-    if [[ -n "$preupdate_backup" ]] && ! cp -f "$dest_bin" "$preupdate_backup" 2>/dev/null; then
-      preupdate_backup=""
-    fi
+  # Stage beside the destination (#10983). Each candidate helper is tried in
+  # turn; one that is not a loom-daemon carrying `install-binary` (an older
+  # release, a test fixture) prints no staged path and is skipped.
+  local helper staged="" stage_out="" nl=$'\n'
+  for helper in "${LOOM_DAEMON_INSTALL_HELPER:-}" "$src_bin" "$dest_bin"; do
+    [[ -n "$helper" && -x "$helper" ]] || continue
+    stage_out="$("$helper" install-binary stage "$src_bin" "$dest_bin" 2>&1)" || continue
+    staged="${stage_out##*"$nl"}"
+    [[ "$staged" == "$dest_dir"/.loom-daemon.loom-install.* && -f "$staged" ]] && break
+    staged=""
+  done
+  if [[ -z "$staged" ]]; then
+    _pmd_verify_binary_loadable "$src_bin" || true
+    _pmd_warn "could not stage loom-daemon beside $dest_bin; it was left untouched${stage_out:+ (last helper said: ${stage_out##*"$nl"})}"
+    _pmd_warn "staging needs a loom-daemon with the 'install-binary' subcommand (#10983): set LOOM_DAEMON_INSTALL_HELPER to one, or set LOOM_DAEMON_BIN=$src_bin in the consumer env to run the daemon"
+    return 1
   fi
 
-  # Prefer install(1) for the atomic mode-set; fall back to cp + chmod.
-  if install -m 755 "$src_bin" "$dest_bin" 2>/dev/null || \
-     { cp -f "$src_bin" "$dest_bin" 2>/dev/null && chmod 755 "$dest_bin" 2>/dev/null; }; then
-    _pmd_ok "installed loom-daemon → $dest_bin ($src_ver)"
-
-    # Issue #8837 AC2: the bytes landed, but do they actually LOAD on this
-    # host? Defense-in-depth alongside AC1's fetch-time GLIBC gate
-    # (loom-daemon/src/release_fetch/glibc.rs) — this is the layer that also
-    # catches a host-native `cargo build` artifact, which never goes through
-    # AC1's check at all, and any bug in it.
-    if ! _pmd_verify_binary_loadable "$dest_bin"; then
-      _pmd_quarantine_unloadable "$dest_bin"
-      if [[ -n "$preupdate_backup" ]]; then
-        if cp -f "$preupdate_backup" "$dest_bin" 2>/dev/null && chmod 755 "$dest_bin" 2>/dev/null; then
-          _pmd_warn "restored the previous working binary at $dest_bin"
-        else
-          _pmd_warn "could not restore the previous working binary — $dest_bin is now ABSENT; re-run install/self-update once a compatible build is available"
-        fi
-      else
-        _pmd_warn "no previous working binary to restore — $dest_bin is now ABSENT (fresh install); set LOOM_DAEMON_BIN=$src_bin or re-run install once a compatible build is available"
-      fi
-      rm -f "$preupdate_backup" 2>/dev/null
-      return 1
+  # Issue #8837 AC2: the bytes landed, but do they actually LOAD on this
+  # host? Defense-in-depth alongside AC1's fetch-time GLIBC gate
+  # (loom-daemon/src/release_fetch/glibc.rs) — this is the layer that also
+  # catches a host-native `cargo build` artifact, which never goes through
+  # AC1's check at all, and any bug in it. Checked on the STAGED file, so an
+  # unloadable candidate never reaches $dest_bin and there is nothing to
+  # restore.
+  if ! _pmd_verify_binary_loadable "$staged"; then
+    _pmd_quarantine_unloadable "$staged" "$dest_bin"
+    if [[ -x "$dest_bin" ]]; then
+      _pmd_warn "the previous working binary at $dest_bin was left untouched"
+    else
+      _pmd_warn "no previous working binary to restore — $dest_bin is ABSENT (fresh install); set LOOM_DAEMON_BIN=$src_bin or re-run install once a compatible build is available"
     fi
-    rm -f "$preupdate_backup" 2>/dev/null
+    return 1
+  fi
 
-    # Belt-and-braces (#4016): the source binary passed to this function is
-    # signed by loom-daemon-update.sh's own signing step before it gets here,
-    # but this covers the installer-only path (install.sh / install-loom.sh),
-    # which never goes through loom-daemon-update.sh. Never fatal.
-    sign_daemon_binary "$dest_bin"
-    _pmd_install_shim "loom-clean" "clean" "$dest_dir"
-    _pmd_install_shim "loom-recover-orphans" "recover-orphans" "$dest_dir"
-    _pmd_install_shim "loom-claim" "claim" "$dest_dir"
-    _pmd_install_shim "codex-agent" "accounts session shell" "$dest_dir"
-    _pmd_cleanup_retired_shims "$dest_dir"
-    _pmd_provision_defaults_payload "$defaults_src_dir"
-  else
-    rm -f "$preupdate_backup" 2>/dev/null
-    _pmd_warn "failed to install loom-daemon to $dest_bin"
+  # Belt-and-braces (#4016): the source binary passed to this function is
+  # signed by loom-daemon-update.sh's own signing step before it gets here,
+  # but this covers the installer-only path (install.sh / install-loom.sh),
+  # which never goes through loom-daemon-update.sh. Never fatal. Signed
+  # BEFORE the publish, so the installed file is not rewritten afterwards.
+  sign_daemon_binary "$staged"
+
+  # Keeps $dest_bin as $dest_bin.previous, then renames $staged over it. On
+  # failure the helper has removed $staged and said why.
+  if ! "$helper" install-binary publish "$staged" "$dest_bin"; then
+    _pmd_warn "failed to install loom-daemon to $dest_bin (it was left untouched)"
     _pmd_warn "set LOOM_DAEMON_BIN=$src_bin in the consumer env to run the daemon"
     return 1
   fi
+  _pmd_ok "installed loom-daemon → $dest_bin ($src_ver)"
+  _pmd_install_shim "loom-clean" "clean" "$dest_dir"
+  _pmd_install_shim "loom-recover-orphans" "recover-orphans" "$dest_dir"
+  _pmd_install_shim "loom-claim" "claim" "$dest_dir"
+  _pmd_install_shim "codex-agent" "accounts session shell" "$dest_dir"
+  _pmd_cleanup_retired_shims "$dest_dir"
+  _pmd_provision_defaults_payload "$defaults_src_dir"
 
   _pmd_check_path "$dest_dir"
   return 0

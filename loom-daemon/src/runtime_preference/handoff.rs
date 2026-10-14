@@ -133,15 +133,10 @@ mod tests {
         let ceiling = BackstopCeiling {
             max_concurrent: Some(limit),
             applies_from: DEFAULT_APPLIES_FROM,
-            min_complexity: None,
         };
-        let Verdict::Admitted(Some(slot)) = admit(
-            &ceiling,
-            "builder",
-            &Tap::runtime("opencode"),
-            Some("complex"),
-            Intent::Dispatch,
-        ) else {
+        let Verdict::Admitted(Some(slot)) =
+            admit(&ceiling, "builder", &Tap::runtime("opencode"), Intent::Dispatch)
+        else {
             panic!("expected an admitted reservation");
         };
         slot

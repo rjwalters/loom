@@ -1086,6 +1086,52 @@ fn reconcile_workspace_skips_reclaim_when_issue_closed_concurrently() {
     std::env::remove_var(sweep_journal::JOURNAL_PATH_ENV);
 }
 
+/// #11743: an issue frozen after this pass listed it (so the listing still
+/// shows a plain claim) reaches `reclaim_and_warn`'s frozen veto, which writes
+/// nothing. That skip must not be counted as a reclaim, and the journal entry
+/// stays.
+#[test]
+#[serial]
+fn reconcile_workspace_does_not_count_a_frozen_skip_as_a_reclaim() {
+    let dir = tempdir().unwrap();
+    let repo_root = dir.path().join("repo");
+    std::fs::create_dir_all(&repo_root).unwrap();
+    let repo_str = repo_root.display().to_string();
+    let journal_path = dir.path().join("sweeps.json");
+    std::env::set_var(sweep_journal::JOURNAL_PATH_ENV, &journal_path);
+    let mut journal = SweepJournal::default();
+    journal.entries.push(journal_entry(&repo_str, 99, 0));
+    sweep_journal::save(&journal_path, &journal).unwrap();
+    let gh_log = dir.path().join("gh-invocations.log");
+    let fake_gh = dir.path().join("fake-gh-frozen-race.sh");
+    let script = format!(
+        r#"#!/usr/bin/env bash
+printf '%s\n' "$*" >> "{log}"
+case "$*" in
+  api*--include*) printf 'HTTP/2.0 200 OK\r\n\r\n'
+    echo '[{{"number":99,"state":"open","labels":[{{"name":"loom:building"}}],"updated_at":"{now}"}}]' ;;
+  *"issues/99 --jq .state"*) echo open ;;
+  *"issues/99 --jq"*) echo '["loom:building","loom:frozen"]' ;;
+esac
+exit 0
+"#,
+        log = gh_log.display(),
+        now = Utc::now().to_rfc3339(),
+    );
+    std::fs::write(&fake_gh, &script).unwrap();
+    std::fs::set_permissions(&fake_gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let (checked, reclaimed) = forge::reconcile_workspace(&fake_gh, &repo_root, false);
+
+    std::env::remove_var(sweep_journal::JOURNAL_PATH_ENV);
+    assert_eq!((checked, reclaimed), (1, 0), "a frozen skip is not a reclaim");
+    let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+    assert!(!gh_calls.contains("issue edit"), "{gh_calls}");
+    assert!(gh_calls.contains("issues/99 --jq [(.labels"), "the veto read ran: {gh_calls}");
+    let after = sweep_journal::load(&journal_path);
+    assert!(sweep_journal::find(&after, &repo_str, 99).is_some());
+}
+
 /// #6263 regression: a single `gh issue edit --remove-label
 /// loom:building --add-label loom:issue` invocation can exit 0 while
 /// only *partially* applying the swap — root cause: `gh` implements
@@ -1289,14 +1335,14 @@ fn write_fake_gh(
     let script = format!(
         r#"#!/usr/bin/env bash
 printf '%s\n' "$*" >> "{log}"
+if [[ "$*" == *'pulls?head='* ]]; then
+  # REST by-head read (#10382): no open linked PR by default (the
+  # Issue #4462 no-progress path treats `[]` as "no PR").
+  printf 'HTTP/2.0 200 OK\r\n\r\n'; echo '[]'; exit 0
+fi
 if [ "$1" = "api" ] && [[ "$*" != */comments* ]]; then
   printf 'HTTP/2.0 200 OK\r\n\r\n'
   echo '[{{"number":{issue_number},"state":"open","labels":[{{"name":"loom:building"}}],"updated_at":"{updated_at}"}}]'
-  exit 0
-fi
-if [ "$1" = "pr" ]; then
-  # `pr list --head feature/issue-N ...`: no open linked PR by default
-  # (the Issue #4462 no-progress path treats empty stdout as "no PR").
   exit 0
 fi
 exit 0
@@ -2201,20 +2247,20 @@ fn reconcile_workspace_no_fast_reclaim_when_open_pr_exists() {
 
     seed_checkpoint_phase(&repo_root, 82, "curator-done");
 
-    // Fake gh that reports an OPEN PR for `pr list` (so no_progress=false).
+    // Fake gh that reports an OPEN PR for the by-head read (so no_progress=false).
     let gh_log = dir.path().join("gh-invocations.log");
     let now = Utc::now().to_rfc3339();
     let fake_gh = dir.path().join("fake-gh-with-pr.sh");
     let script = format!(
         r#"#!/usr/bin/env bash
 printf '%s\n' "$*" >> "{log}"
+if [[ "$*" == *'pulls?head='* ]]; then
+  printf 'HTTP/2.0 200 OK\r\n\r\n'; echo '[{{"number":4242,"state":"open","head":{{"ref":"feature/issue-82"}}}}]'
+  exit 0
+fi
 if [ "$1" = "api" ] && [[ "$*" != */comments* ]]; then
   printf 'HTTP/2.0 200 OK\r\n\r\n'
   echo '[{{"number":82,"state":"open","labels":[{{"name":"loom:building"}}],"updated_at":"{now}"}}]'
-  exit 0
-fi
-if [ "$1" = "pr" ]; then
-  echo 4242
   exit 0
 fi
 exit 0
@@ -2258,6 +2304,8 @@ fn claimed_pr(
         updated_at,
         claim_labeled_at: None,
         most_recent_claim_activity_at: None,
+        most_recent_judge_activity_at: None,
+        most_recent_head_push_at: None,
         head_ref_name: head_ref_name.map(ToString::to_string),
     }
 }
@@ -2395,6 +2443,8 @@ fn decide_pr_reclaims_via_claim_labeled_at_despite_standdown_inflated_updated_at
         updated_at: Some(standdown_inflated),
         claim_labeled_at: Some(claimed_at),
         most_recent_claim_activity_at: None,
+        most_recent_judge_activity_at: None,
+        most_recent_head_push_at: None,
         head_ref_name: Some("some-doctor-branch".to_string()),
     };
     let action = decide_pr(&pr, None, None, &|_| true, 30.0, now);
@@ -2427,6 +2477,8 @@ fn decide_pr_keeps_when_claim_labeled_at_is_fresh_even_if_updated_at_is_old() {
         updated_at: Some(stale_updated_at),
         claim_labeled_at: Some(recent_claim),
         most_recent_claim_activity_at: None,
+        most_recent_judge_activity_at: None,
+        most_recent_head_push_at: None,
         head_ref_name: None,
     };
     let action = decide_pr(&pr, None, None, &|_| true, 30.0, now);
@@ -2474,6 +2526,8 @@ fn decide_pr_keeps_when_old_claim_labeled_at_but_recent_genuine_comment() {
         updated_at: Some(claimed_at),
         claim_labeled_at: Some(claimed_at),
         most_recent_claim_activity_at: Some(recent_genuine_comment),
+        most_recent_judge_activity_at: None,
+        most_recent_head_push_at: None,
         head_ref_name: Some("pr-worktree-review-branch".to_string()),
     };
     let action = decide_pr(&pr, None, None, &|_| true, 30.0, now);
@@ -2500,6 +2554,8 @@ fn decide_pr_reclaims_when_old_claim_labeled_at_and_only_standdown_comments_sinc
         updated_at: Some(now - Duration::seconds(5)),
         claim_labeled_at: Some(claimed_at),
         most_recent_claim_activity_at: None,
+        most_recent_judge_activity_at: None,
+        most_recent_head_push_at: None,
         head_ref_name: Some("some-doctor-branch".to_string()),
     };
     let action = decide_pr(&pr, None, None, &|_| true, 30.0, now);
@@ -2519,124 +2575,11 @@ fn decide_pr_reclaims_when_old_claim_labeled_at_and_only_standdown_comments_sinc
 // defaults/scripts/claim-staleness.sh)
 // ------------------------------------------------------------------
 
-/// The claim timestamp used by the marker fixtures below, rendered exactly
-/// as the forge emits a `labeled` event's `created_at`.
-fn fixture_claimed_at() -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339("2026-08-19T08:00:00Z")
-        .unwrap()
-        .with_timezone(&Utc)
-}
-
 fn comment(created_at: DateTime<Utc>, body: &str) -> PrComment {
     PrComment {
         created_at,
         body: body.to_string(),
     }
-}
-
-#[test]
-fn claim_activity_marker_matches_claim_staleness_sh() {
-    // The marker MUST be byte-identical to what
-    // `defaults/scripts/claim-staleness.sh marker` prints:
-    //   ACTIVITY_PREFIX='<!-- loom:claim-activity claim=' + CLAIMED_AT + ' -->'
-    // with CLAIMED_AT the timeline `created_at` verbatim (which that
-    // script validates as ^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$).
-    assert_eq!(CLAIM_ACTIVITY_MARKER_PREFIX, "<!-- loom:claim-activity claim=");
-    assert_eq!(
-        claim_activity_marker(fixture_claimed_at()),
-        "<!-- loom:claim-activity claim=2026-08-19T08:00:00Z -->"
-    );
-}
-
-#[test]
-fn most_recent_claim_activity_at_ignores_an_unrelated_comment() {
-    // AC (a) / the #6513 shape reconstructed daemon-side: a routine
-    // Builder post-push status note is not claimant liveness. Before
-    // #6523 this comment WAS counted (it is not a stand-down note), which
-    // is exactly the conflation #6514 removed on the agent side.
-    let claimed_at = fixture_claimed_at();
-    let comments = vec![
-        comment(claimed_at + Duration::minutes(2), "Pushed the fix, CI running."),
-        comment(claimed_at + Duration::minutes(9), "Champion: capped-PR notice."),
-    ];
-    assert_eq!(
-        most_recent_claim_activity_at(&comments, claimed_at),
-        None,
-        "an unrelated comment must not count as claimant activity"
-    );
-}
-
-#[test]
-fn most_recent_claim_activity_at_counts_a_marked_claimant_heartbeat() {
-    // AC (b): a comment carrying THIS claim's marker is claimant liveness.
-    let claimed_at = fixture_claimed_at();
-    let heartbeat_at = claimed_at + Duration::minutes(12);
-    let comments = vec![
-        comment(claimed_at + Duration::minutes(2), "Pushed the fix, CI running."),
-        comment(
-            heartbeat_at,
-            &format!(
-                "Doctor: still working the failing test.\n{}",
-                claim_activity_marker(claimed_at)
-            ),
-        ),
-    ];
-    assert_eq!(most_recent_claim_activity_at(&comments, claimed_at), Some(heartbeat_at));
-}
-
-#[test]
-fn most_recent_claim_activity_at_takes_the_newest_marked_heartbeat() {
-    let claimed_at = fixture_claimed_at();
-    let marker = claim_activity_marker(claimed_at);
-    let newest = claimed_at + Duration::minutes(20);
-    let comments = vec![
-        comment(claimed_at + Duration::minutes(5), &marker),
-        comment(newest, &marker),
-        comment(claimed_at + Duration::minutes(12), &marker),
-    ];
-    assert_eq!(most_recent_claim_activity_at(&comments, claimed_at), Some(newest));
-}
-
-#[test]
-fn most_recent_claim_activity_at_ignores_a_marker_for_a_different_claim() {
-    // Mirrors claim-staleness.sh: the marker is matched against the
-    // claim's OWN labeled-at timestamp, so a heartbeat left behind by an
-    // earlier claim generation (before a reclaim + re-claim) cannot keep
-    // the new claim alive.
-    let claimed_at = fixture_claimed_at();
-    let older_claim = claimed_at - Duration::minutes(45);
-    let comments = vec![comment(
-        claimed_at + Duration::minutes(3),
-        &format!("Judge: reviewing.\n{}", claim_activity_marker(older_claim)),
-    )];
-    assert_eq!(most_recent_claim_activity_at(&comments, claimed_at), None);
-}
-
-#[test]
-fn most_recent_claim_activity_at_ignores_comments_at_or_before_the_claim() {
-    let claimed_at = fixture_claimed_at();
-    let marker = claim_activity_marker(claimed_at);
-    let comments = vec![
-        comment(claimed_at - Duration::minutes(1), &marker),
-        comment(claimed_at, &marker),
-    ];
-    assert_eq!(most_recent_claim_activity_at(&comments, claimed_at), None);
-}
-
-#[test]
-fn most_recent_claim_activity_at_still_excludes_standdown_comments() {
-    // #4618 regression guard, preserved: a stand-down comment is evidence
-    // a LATER pass declined to reclaim, never claimant activity — even in
-    // the pathological case where its body quotes an activity marker.
-    let claimed_at = fixture_claimed_at();
-    let comments = vec![comment(
-            claimed_at + Duration::minutes(7),
-            &format!(
-                "Judge pass: standing down, not stomping.\n{}\n{STANDDOWN_MARKER_PREFIX}2026-08-19T08:00:00Z seq=2 -->",
-                claim_activity_marker(claimed_at)
-            ),
-        )];
-    assert_eq!(most_recent_claim_activity_at(&comments, claimed_at), None);
 }
 
 #[test]
@@ -2662,6 +2605,8 @@ fn decide_pr_reclaims_when_only_unrelated_comments_since_the_claim() {
         updated_at: Some(now - Duration::minutes(2)),
         claim_labeled_at: Some(claimed_at),
         most_recent_claim_activity_at: scanned,
+        most_recent_judge_activity_at: None,
+        most_recent_head_push_at: None,
         head_ref_name: Some("some-judge-branch".to_string()),
     };
     match decide_pr(&pr, None, None, &|_| true, DEFAULT_STALE_REVIEWING_MINUTES, now) {
@@ -2695,6 +2640,8 @@ fn decide_pr_keeps_when_a_marked_claimant_heartbeat_is_recent() {
         updated_at: Some(heartbeat_at),
         claim_labeled_at: Some(claimed_at),
         most_recent_claim_activity_at: scanned,
+        most_recent_judge_activity_at: None,
+        most_recent_head_push_at: None,
         head_ref_name: Some("some-judge-branch".to_string()),
     };
     assert_eq!(
@@ -2722,6 +2669,8 @@ fn decide_pr_marked_heartbeat_extends_by_exactly_one_window_not_indefinitely() {
         updated_at: Some(heartbeat_at),
         claim_labeled_at: Some(claimed_at),
         most_recent_claim_activity_at: scanned,
+        most_recent_judge_activity_at: None,
+        most_recent_head_push_at: None,
         head_ref_name: None,
     };
 
@@ -2792,6 +2741,8 @@ fn decide_pr_age_floor_vetoes_reclaim_regardless_of_comment_activity() {
             updated_at: Some(now - Duration::seconds(5)),
             claim_labeled_at: Some(claimed_at),
             most_recent_claim_activity_at: None,
+            most_recent_judge_activity_at: None,
+            most_recent_head_push_at: None,
             head_ref_name: Some("feature/issue-6523".to_string()),
         };
         assert_eq!(
@@ -2931,7 +2882,7 @@ fn resolve_stale_treating_minutes_defaults_and_overrides() {
 /// Write a fake `gh` script (tests only) that logs every invocation to
 /// `gh_log`, reports exactly one PR carrying the requested claim label
 /// for `pr list`, and reports `extra_labels` (plus nothing else) for
-/// `pr view --json labels` -- letting a test control whether the
+/// the REST `pulls/{n}` read (#10507) -- letting a test control whether the
 /// safety-net `loom:review-requested` backfill should fire.
 fn write_fake_gh_pr(
     dir: &std::path::Path,
@@ -2950,7 +2901,7 @@ fn write_fake_gh_pr(
     let script = format!(
         r#"#!/usr/bin/env bash
 printf '%s\n' "$*" >> "{log}"
-{pulls}if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+{pulls}if [ "$*" = "api repos/{{owner}}/{{repo}}/pulls/{pr_number}" ]; then
   echo '{{"labels":[{labels_json}]}}'
   exit 0
 fi
@@ -3012,6 +2963,38 @@ fn reconcile_pr_claims_reclaims_stale_reviewing_and_backfills_state_label() {
     std::env::remove_var(sweep_journal::JOURNAL_PATH_ENV);
     std::env::remove_var(STALE_REVIEWING_MINUTES_ENV);
     std::env::remove_var(STALE_TREATING_MINUTES_ENV);
+}
+
+/// #11743: a stale claim on a `loom:frozen` PR is never reclaimed — no
+/// `pr edit` at all, and nothing counted as checked or reclaimed.
+#[test]
+#[serial]
+fn reconcile_pr_claims_leaves_a_frozen_pr_alone() {
+    let dir = tempdir().unwrap();
+    let repo_root = dir.path().join("repo");
+    std::fs::create_dir_all(&repo_root).unwrap();
+    std::env::set_var(sweep_journal::JOURNAL_PATH_ENV, dir.path().join("sweeps.json"));
+    std::env::set_var(STALE_REVIEWING_MINUTES_ENV, "30");
+    let gh_log = dir.path().join("gh-invocations.log");
+    let old = (Utc::now() - Duration::minutes(90)).to_rfc3339();
+    let fake_gh = dir.path().join("fake-gh-frozen-pr.sh");
+    let script = format!(
+        "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{log}\"\n{pulls}exit 0\n",
+        log = gh_log.display(),
+        pulls = pulls_arm(&[row(502, &["loom:reviewing", "loom:frozen"])
+            .head("some-random-branch")
+            .updated(&old)]),
+    );
+    std::fs::write(&fake_gh, &script).unwrap();
+    std::fs::set_permissions(&fake_gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let (checked, reclaimed) = forge::reconcile_pr_claims(&fake_gh, &repo_root);
+
+    std::env::remove_var(sweep_journal::JOURNAL_PATH_ENV);
+    std::env::remove_var(STALE_REVIEWING_MINUTES_ENV);
+    assert_eq!((checked, reclaimed), (0, 0));
+    let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+    assert!(!gh_calls.contains("pr edit"), "{gh_calls}");
 }
 
 #[test]
@@ -3335,12 +3318,10 @@ fn verdict_hold_labels_cover_every_parking_label() {
 
 #[test]
 fn decide_anchor_stamps_the_current_head_for_a_confirmed_unmarked_verdict() {
-    // The observed production case: an approving verdict with no marker.
+    // #9258: an unmarked APPROVAL is re-queued, never anchored to this head.
     assert_eq!(
         decide_anchor(&verdict_pr(VerdictKind::Approved, Some(SHA_B), None)),
-        AnchorAction::Anchor {
-            head_sha: SHA_B.to_string()
-        }
+        AnchorAction::RequeueApproval
     );
     assert_eq!(
         decide_anchor(&verdict_pr(VerdictKind::ChangesRequested, Some(SHA_A), None)),
@@ -3355,7 +3336,7 @@ fn decide_anchor_treats_an_empty_marker_as_unmarked() {
     // decide_verdict folds `Some("")` into Unverifiable; the anchoring
     // pass must agree, or an empty marker would be permanently stuck.
     assert_eq!(
-        decide_anchor(&verdict_pr(VerdictKind::Approved, Some(SHA_B), Some(""))),
+        decide_anchor(&verdict_pr(VerdictKind::ChangesRequested, Some(SHA_B), Some(""))),
         AnchorAction::Anchor {
             head_sha: SHA_B.to_string()
         }
@@ -3400,11 +3381,11 @@ fn decide_anchor_skips_when_the_comment_scan_failed() {
 #[test]
 fn decide_anchor_skips_without_a_resolvable_head_sha() {
     assert_eq!(
-        decide_anchor(&verdict_pr(VerdictKind::Approved, None, None)),
+        decide_anchor(&verdict_pr(VerdictKind::ChangesRequested, None, None)),
         AnchorAction::Skip(AnchorSkipReason::NoHeadSha)
     );
     assert_eq!(
-        decide_anchor(&verdict_pr(VerdictKind::Approved, Some(""), None)),
+        decide_anchor(&verdict_pr(VerdictKind::ChangesRequested, Some(""), None)),
         AnchorAction::Skip(AnchorSkipReason::NoHeadSha)
     );
 }

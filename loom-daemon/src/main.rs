@@ -134,34 +134,10 @@ enum Commands {
     /// (Issue #3891 — follow-up to #3813 Phase D). Note: dispatch does not
     /// consider token-pool capacity — the token axis only affects spawn-time
     /// account *selection*, not this concurrency ceiling.
-    Status {
-        /// Emit machine-readable JSON instead of the human-readable table.
-        #[arg(long)]
-        json: bool,
-
-        /// Also show the forge-side pipeline snapshot per managed repo (Issue
-        /// #3977): open, dispatchable `loom:issue` (queued — park-labeled
-        /// rows excluded, #4825), open `loom:building`
-        /// (claimed), open PRs by `loom:review-requested` /
-        /// `loom:changes-requested` / `loom:pr`, and PRs merged in the last
-        /// 24h. Opt-in because it makes several `gh` calls per managed repo
-        /// (client-side, after the fast IPC round-trip) rather than being
-        /// bundled into the default view.
-        #[arg(long)]
-        pipeline: bool,
-
-        /// Override the status IPC round-trip budget in seconds (Issue
-        /// #6011). Without this, the timeout defaults to 5s on an unloaded
-        /// host and scales up automatically with observed 1-minute load
-        /// average (capped at 30s) — a saturated host that is merely slow to
-        /// answer, not actually wedged, would otherwise be misclassified as
-        /// unreachable before it ever got a chance to respond. Also
-        /// overridable via `LOOM_DAEMON_IPC_TIMEOUT_MS` (shared with
-        /// `dispatch`'s ack budget) as a raise-only floor; this flag takes
-        /// precedence over both when set.
-        #[arg(long)]
-        timeout_secs: Option<u64>,
-    },
+    ///
+    /// `--json --section <a,b,...>` (#10787) returns only those top-level
+    /// sections, and the daemon builds only what they need.
+    Status(cli::status::sections::StatusArgs),
 
     /// Show the peer-claim view: which issues this host currently sees a
     /// peer host claiming, by which host and with what remaining TTL, plus
@@ -179,8 +155,8 @@ enum Commands {
     },
 
     /// Show the work finder's ready queue in its real dispatch order
-    /// (starred `loom:operator-priority` first, then red-main fixes, workspace
-    /// priority, oldest first — #9244) with what the last
+    /// (verified red-main fixes first, then priority level, oldest first —
+    /// #11103, #11547) with what the last
     /// tick did with each issue and why, plus a freshness line (Issue #8852).
     Queue {
         /// Emit machine-readable JSON instead of the human-readable table.
@@ -268,22 +244,6 @@ enum Commands {
         #[command(subcommand)]
         action: FleetAction,
     },
-
-    /// The operator-agent persona's I/O surface (Issue #7947, Phase 3b of
-    /// #4196): read room intent, vet a typed command, relay it to the daemon.
-    ///
-    /// `concierge relay` is the ONLY sanctioned path from a natural-language
-    /// read of a room message to a daemon command, and it refuses `--verb
-    /// confirm` unconditionally — a confirmation nonce is answered by the human
-    /// it was shown to, never by the persona. Off unless
-    /// `safehouse.concierge` names at least one allowed sender; `concierge
-    /// check` reports which.
-    ///
-    /// A one-line tuple variant wrapping `ConciergeArgs` (which carries the
-    /// `#[command(subcommand)]`), for the same reason `Telemetry` above is:
-    /// this file is frozen by the file-size ratchet, so the subcommand's shape
-    /// and docs live in `cli::concierge` and only the dispatch arm is here.
-    Concierge(cli::concierge::ConciergeArgs),
 
     /// Manage insta-crash quarantines (Issue #3939): the in-memory pauses the
     /// daemon applies to issues whose sweeps insta-crash repeatedly. Connects to
@@ -387,14 +347,8 @@ enum Commands {
         #[arg(long)]
         ignore_host_constraint: bool,
 
-        /// Override the host-class gate (Issue #9034): by default, dispatching a
-        /// `loom:heavy` issue on a host classified `host_class: local-dev`
-        /// (`autonomous.workFinder.hostClass` / `LOOM_HOST_CLASS`) refuses with a
-        /// clear message. Pass `--allow-local` to dispatch anyway — an operator
-        /// hand-dispatching a known-heavy issue on their own machine on purpose is
-        /// not the case this gate exists to stop.
-        #[arg(long)]
-        allow_local: bool,
+        #[command(flatten)]
+        tap: cli::dispatch::DispatchTapArgs,
     },
 
     /// Cancel a running sweep via the running daemon (Issue #4980): the `dispatch`
@@ -913,17 +867,6 @@ enum Commands {
         pr: u64,
     },
 
-    /// Shadow-mode Jev (TypeSafe) complexity-tier classifier, run beside the
-    /// Curator's `<!-- loom:complexity=<tier> -->` marker (issue #8543) — a
-    /// calibrated second opinion, never a routing decision. Prints a JSON
-    /// object with a probability per tier (`mechanical`/`routine`/`complex`)
-    /// plus a confidence to stdout; exits non-zero with no stdout output on
-    /// any failure, including a missing `TYPESAFE_API_KEY`.
-    JevTier {
-        /// The issue number to classify.
-        issue: u64,
-    },
-
     // ---------------------------------------------------------------------
     // Script helpers (epic #4081 Phase 3 family 5, issue #4275) — native
     // replacements for the `loom_tools` modules that existed only to back a
@@ -946,7 +889,7 @@ enum Commands {
 
     /// Resolve a logical model tier/alias to the concrete model ID to dispatch
     /// on the wire (issue #3982; native port of `loom_tools.model_tiers`,
-    /// #4275). Backs `resolve-model.sh` and `resolve-tier-model.sh`.
+    /// #4275). Backs `resolve-model.sh`.
     ///
     /// Unknown aliases and pinned IDs pass through unchanged and the
     /// `model@effort` grammar is preserved. `--config` is an **explicit
@@ -955,14 +898,14 @@ enum Commands {
     /// Resolution never fails — outside a Loom repo the config is simply empty
     /// and the shipped default map applies.
     ///
-    /// Exit codes: `0` resolved, `2` usage error, `3` no mapping (both `--tier`
-    /// and `--task-alias`) so the caller falls through to its own precedence
-    /// chain.
+    /// Exit codes: `0` resolved, `2` usage error, `3` no mapping
+    /// (`--task-alias` / `--downgrade`) so the caller falls through to its own
+    /// precedence chain.
     ResolveModel {
         /// A logical tier/alias (`opus`, `sonnet`, `sonnet@xhigh`) or a pinned
         /// model ID.
         #[arg(value_name = "MODEL")]
-        model: Option<String>,
+        model: String,
 
         /// Path to a `.loom/config.json` to read verbatim (default: resolve
         /// the `./.loom` config tier chain).
@@ -988,16 +931,6 @@ enum Commands {
         /// mid-phase-death handling instead of guessing a model.
         #[arg(long)]
         downgrade: bool,
-
-        /// Complexity-tier mode (issue #4238): resolve
-        /// `sweep.tierModels[<runtime>][<tier>]`, falling back to the
-        /// `sweep.optimization` preset, instead of a bare alias.
-        #[arg(long, value_name = "TIER")]
-        tier: Option<String>,
-
-        /// Worker runtime for `--tier` resolution.
-        #[arg(long, default_value = "claude")]
-        runtime: String,
     },
 
     /// Token-cost telemetry: `usage` (live, from the Anthropic OAuth API) and
@@ -1054,6 +987,7 @@ enum Commands {
     #[command(flatten)]
     ScriptPorts(cli::script_ports::ScriptPortCommand),
     Labels(cli::labels_cmd::LabelsArgs),
+    Presence(cli::presence::PresenceArgs),
 
     /// Historical replay of scheduling predictions vs eventual PRs (#9785):
     /// `overlap-replay validate | outcomes | score`. Nested (not flattened)
@@ -1156,6 +1090,9 @@ enum Commands {
     /// = drift detector), diff/apply the `roster`, and report the desired run
     /// `state`. Args live in `cli::fleet_config` (main.rs is size-frozen).
     FleetConfig(cli::fleet_config::FleetConfigArgs),
+
+    /// The shared bounded journal core (#11345): `verify` a journal root.
+    Journal(cli::journal_cli::JournalArgs),
 }
 
 /// Sub-actions for `loom-daemon checkpoint` (issue #4275).
@@ -1246,11 +1183,12 @@ enum WorkspaceAction {
         #[arg(value_name = "PATH")]
         path: String,
 
-        /// Cross-repo dispatch priority tier (#3946): lower = higher priority.
-        /// The autonomous work-finder and epic supervisor drain higher-priority
-        /// repos first. Defaults to 100 when omitted.
-        #[arg(long, value_name = "N", default_value_t = loom_daemon::workspace_registry::DEFAULT_WORKSPACE_PRIORITY)]
-        priority: u32,
+        /// Cross-repo draw weight (#11742): the work finder draws this repo
+        /// with probability (weight + bonuses) / Σ, so higher = more draws and
+        /// 0 = never. Defaults to 1 when omitted; on a fleet host the store's
+        /// `weight` replaces it at the next roster sync.
+        #[arg(long, value_name = "N", default_value_t = loom_daemon::workspace_registry::DEFAULT_WORKSPACE_WEIGHT)]
+        weight: u32,
 
         /// Optional per-repo config overrides as a JSON object string.
         #[arg(long, value_name = "JSON")]
@@ -1264,16 +1202,28 @@ enum WorkspaceAction {
         /// first-time consumer install layered on top, clobbering that work.
         #[arg(long)]
         no_init: bool,
+
+        /// Register it maintain-only (#11186): kept current, never dispatched
+        /// into. Same as `workspace hold` right after, in one write.
+        #[arg(long)]
+        maintain_only: bool,
     },
-    /// Set the dispatch priority tier of an already-registered workspace (#3946).
-    SetPriority {
+    /// Make a registered workspace maintain-only (#11186): the daemon keeps
+    /// its Loom install current (resync, checkout fast-forward, floor checks)
+    /// but starts no sweep, role or epic dispatch there. Hot-applies. On a
+    /// host a fleet store drives, the roster (`fleet: maintain`) wins.
+    Hold(cli::workspace_fleet::WorkspaceRoot),
+    /// Lift `workspace hold`: dispatch into the workspace resumes (#11186).
+    Release(cli::workspace_fleet::WorkspaceRoot),
+    /// Set the draw weight of an already-registered workspace (#11742).
+    SetWeight {
         /// Path to the repo root (normalized the same way as `add`).
         #[arg(value_name = "PATH")]
         path: String,
 
-        /// New priority tier: lower = higher priority.
+        /// New weight: higher = more draws, 0 = never drawn.
         #[arg(value_name = "N")]
-        priority: u32,
+        weight: u32,
     },
     /// Deregister a managed workspace by root.
     Remove {
@@ -1319,10 +1269,10 @@ enum FleetAction {
         #[arg(long, value_name = "OWNER/NAME", required = true)]
         repo: Vec<String>,
 
-        /// Cross-repo dispatch priority the workspaces are registered at (#3946;
-        /// lower = higher priority). Defaults to 100.
-        #[arg(long, value_name = "N", default_value_t = loom_daemon::workspace_registry::DEFAULT_WORKSPACE_PRIORITY)]
-        priority: u32,
+        /// Cross-repo draw weight the workspaces are registered at (#11742;
+        /// higher = more draws). Defaults to 1.
+        #[arg(long, value_name = "N", default_value_t = loom_daemon::workspace_registry::DEFAULT_WORKSPACE_WEIGHT)]
+        weight: u32,
 
         /// Local path to the operator's fine-grained forge PAT (Contents+Issues+PRs
         /// on the target repos). Read locally at preflight; transferred to the
@@ -1843,6 +1793,15 @@ enum StashesAction {
         #[arg(long)]
         json: bool,
     },
+
+    /// Print the cargo build-tree directories (content-verified
+    /// `CACHEDIR.TAG` / `.rustc_info.json`, any name, ignored or not) that a
+    /// quarantine stash of a worktree must exclude, or (`--filter-status`)
+    /// drop build-tree lines from `git status --porcelain` text on stdin
+    /// (#11075). `check-main-clean.sh --quarantine` calls this; exits non-zero
+    /// when the worktree cannot be resolved, which the script treats as
+    /// "could not check", never as "no build trees".
+    BuildTrees(cli::stashes::BuildTreesArgs),
 }
 
 /// Sub-actions for `loom-daemon tokens`.
@@ -1919,10 +1878,10 @@ enum TokensAction {
     },
 
     /// Materialize `.loom/tokens/` from `ACCOUNT_*_N` triples, merging by email
-    /// with precedence claude-monitor (`~/.claude-monitor/accounts.env`,
-    /// primary) > repo-local. The home master (`~/.loom/accounts.env`) is
-    /// opt-in only: read solely when `$LOOM_ACCOUNTS_ENV` (or `--home-env`)
-    /// points at it. `ACCOUNT_TOKEN_FILE_N` is optional — auto-derived from
+    /// with precedence llm-monitor (`~/.llm-monitor/accounts.env`, or a 1.x
+    /// host's `~/.claude-monitor`; primary) > repo-local. The home master
+    /// (`~/.loom/accounts.env`) is opt-in only: read solely when
+    /// `$LOOM_ACCOUNTS_ENV` (or `--home-env`) points at it. `ACCOUNT_TOKEN_FILE_N` is optional — auto-derived from
     /// `ACCOUNT_EMAIL_N` when omitted. Native Rust port of the historical Python
     /// `loom-tokens bootstrap` CLI (issue #4105, epic #4081). That Python CLI no
     /// longer exists — the package was deleted in Phase 4 (#4557) — so this name
@@ -1970,8 +1929,9 @@ enum TokensAction {
         json: bool,
     },
 
-    /// Materialize `.loom/tokens/` from claude-monitor's LIVE credential store
-    /// (`~/.claude-monitor/usage.db`) instead of the `accounts.env` snapshot.
+    /// Materialize `.loom/tokens/` from llm-monitor's LIVE credential store
+    /// (`~/.llm-monitor/usage.db`, or a 1.x host's `~/.claude-monitor`) instead
+    /// of the `accounts.env` snapshot.
     /// Use this after rolling accounts: the snapshot keeps the old (now
     /// revoked) tokens, so `bootstrap --force` would rewrite them unchanged.
     /// Native Rust port of the historical Python `loom-tokens
@@ -1989,8 +1949,9 @@ enum TokensAction {
         #[arg(long)]
         shared: bool,
 
-        /// Path to claude-monitor's `usage.db` (default: `<claude-monitor
-        /// dir>/usage.db`, honoring `$LOOM_CLAUDE_MONITOR_DIR`).
+        /// Path to llm-monitor's `usage.db` (default: `<monitor dir>/usage.db`,
+        /// honoring `$LOOM_LLM_MONITOR_DIR`, then `$LOOM_CLAUDE_MONITOR_DIR`,
+        /// then `~/.llm-monitor`, then `~/.claude-monitor`).
         #[arg(long, value_name = "PATH")]
         db: Option<String>,
 
@@ -2333,16 +2294,12 @@ async fn handle_cli_command(command: Commands) -> Result<()> {
             generation,
             task_alias,
             downgrade,
-            tier,
-            runtime,
         } => handle_resolve_model_command(
-            model.as_deref(),
+            &model,
             config.as_deref(),
             generation,
             task_alias,
             downgrade,
-            tier.as_deref(),
-            &runtime,
         ),
         Commands::Telemetry(cmd) => cmd.run().await,
         Commands::Checkpoint { action } => handle_checkpoint_command(action),
@@ -2353,6 +2310,7 @@ async fn handle_cli_command(command: Commands) -> Result<()> {
         Commands::ScriptPorts(cmd) => cmd.run(),
         Commands::OverlapReplay { action } => action.run(),
         Commands::Lease { action } => action.run(),
+        Commands::Presence(cmd) => cmd.run(),
         Commands::Inflight { action } => action.run(),
         Commands::SweepExperiment { action } => handle_sweep_experiment_command(action),
         Commands::ValidatePhase {
@@ -2386,6 +2344,7 @@ async fn handle_cli_command(command: Commands) -> Result<()> {
         } => handle_validate_command(&workspace, &format, strict, verbose),
         Commands::SweepOutcomes(args) => cli::sweep_outcomes_cli::dispatch(args),
         Commands::FleetConfig(args) => cli::fleet_config::dispatch(args),
+        Commands::Journal(args) => cli::journal_cli::dispatch(args),
         Commands::Stats {
             command,
             role,
@@ -2526,7 +2485,7 @@ async fn handle_cli_command(command: Commands) -> Result<()> {
             verbose,
         } => handle_recover_orphans_command(&workspace, recover, json, verbose),
         Commands::Forge { action } => handle_forge_command(action),
-        Commands::Status { .. } => {
+        Commands::Status(_) => {
             // Routed directly in `main()` (it needs the async runtime for the
             // socket round-trip), never dispatched through this sync handler.
             unreachable!("Status is handled in main() before handle_cli_command")
@@ -2544,8 +2503,6 @@ async fn handle_cli_command(command: Commands) -> Result<()> {
         }
         // Async commands are dispatched by main before reaching this sync handler.
         Commands::JevMergeRisk { .. }
-        | Commands::JevTier { .. }
-        | Commands::Concierge(..)
         | Commands::Hyperparams(..)
         | Commands::Quarantine { .. }
         | Commands::DispatchBackoff { .. }

@@ -23,6 +23,19 @@ use crate::telemetry::trace::TraceAttributes;
 /// cards are themselves held in agreement.
 pub const COMPILED_VERIFIED_ON: &str = "2026-09-18";
 
+/// `true` the first time this process sees `model` unpriced, so the WARN fires
+/// once per model rather than once per usage span (#10750).
+fn first_unpriced_sighting(model: &str) -> bool {
+    static SEEN: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+        std::sync::Mutex::new(None);
+    let mut guard = SEEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard
+        .get_or_insert_with(std::collections::HashSet::new)
+        .insert(model.to_string())
+}
+
 /// The rate card an estimate is computed from, and its reproducible identity.
 #[derive(Debug, Clone, Copy)]
 pub struct Pricing<'a> {
@@ -93,6 +106,18 @@ impl<'a> Pricing<'a> {
     #[must_use]
     pub fn attributes(&self, row: &ModelUsageTotals) -> TraceAttributes {
         let Some(usd) = self.usd(row) else {
+            let has_tokens = row.input != 0
+                || row.output != 0
+                || row.cache_read != 0
+                || row.cache_write_5m != 0
+                || row.cache_write_1h != 0;
+            if has_tokens && first_unpriced_sighting(&row.model) {
+                log::warn!(
+                    "loom.runtime.usage exported without a USD estimate: model '{}' is not on \
+                     the pricing card (add a row to defaults/pricing.json and the compiled card)",
+                    row.model
+                );
+            }
             return TraceAttributes::new();
         };
         let usd = format!("{usd:.6}");
@@ -105,5 +130,17 @@ impl<'a> Pricing<'a> {
         .into_iter()
         .map(|(k, v)| (k.to_string(), v))
         .collect()
+    }
+}
+
+#[cfg(test)]
+mod unpriced_tests {
+    use super::first_unpriced_sighting;
+
+    #[test]
+    fn unpriced_warning_is_deduplicated_per_model() {
+        assert!(first_unpriced_sighting("unit-test-unpriced-a"));
+        assert!(!first_unpriced_sighting("unit-test-unpriced-a"));
+        assert!(first_unpriced_sighting("unit-test-unpriced-b"));
     }
 }

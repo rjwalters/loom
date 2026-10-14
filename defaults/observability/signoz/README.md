@@ -36,13 +36,23 @@ After any render, run `cargo test --test signoz_deployment_contract`: it re-read
 the committed `pours/` output and fails if a regenerated deployment stops matching
 what this README promises — see [Rendered-deployment contract](#rendered-deployment-contract).
 All component images pin multi-platform index digests in the casting: SigNoz
-**v0.142.1**, its collector **v0.144.10**, ClickHouse **25.12.11**, Keeper **25.12.5**,
+**v0.143.0**, its collector **v0.144.12**, ClickHouse **26.9.5**, Keeper **26.9.5**,
 and PostgreSQL **16**. Each index includes Linux amd64 and arm64. The upstream
 histogram helper **v0.0.1** init command is patched declaratively to verify SHA-256
 before extraction and reject unsupported architectures. Independent downloads
 matched the [upstream checksum manifest](https://github.com/SigNoz/signoz/releases/download/histogram-quantile%2Fv0.0.1/histogram-quantile_0.0.1_checksums.txt):
 Linux arm64 `e5605ebffa82a450ebbcdf6cf19dad546e1e40d52dbf3e03cfd2d2d5b7394211`,
 Linux amd64 `33997073eb6d82b7be4f27f9fc8ec9e28a395e0f20674d5d54bb2fa28a75488d`.
+
+ClickHouse and Keeper move in lockstep. The pinned SigNoz release is tested
+upstream on 25.12, not 26.x. ClickHouse 26.7 started rejecting an
+`AggregatingMergeTree` that has a column outside both the sorting key and the
+aggregate states, and SigNoz's schema migrator creates such tables
+(`signoz_metrics.metadata`). A casting patch therefore sets the server's
+`merge_tree.allow_dimensions_outside_sorting_key: 1`, which restores the 25.12
+behaviour. Without it, the migration on a fresh volume fails. The upgrade from
+25.12 is one-way: 26.x parts are not guaranteed to be readable by 25.12, so back
+up the volumes before rolling an existing deployment.
 
 ## Start and trust boundary
 
@@ -321,6 +331,110 @@ the file's absent-is-not-zero claims as observations:
 
 Not yet executed against a live SigNoz over real canary data.
 
+### GitHub shadow-spend reconciliation
+
+`github-shadow.sql` (#10343) answers "how much of what GitHub billed each App
+installation's bucket did Loom attribute?": (0) a preflight that the two
+metric families exist and how SigNoz stored `loom.forge.calls` (its `sumIf`
+is only right while `temporality` reads Delta); (1) GitHub's own bill per
+`(account, owner, resource)` hour — Σ positive increments of
+`github.ratelimit.used` readings keyed by their quota window (the paired
+`github.ratelimit.reset`, resets within 2 s merged), each window charged its
+high-water mark once — a stale reading from another host or (on a
+pre-#10571 daemon's data) an interleaved second bucket never re-charges; (2) the requests `loom.forge.calls` attributed to that bucket, `ok`
+(surely charged) and `ok`+`error` (an upper bound), with 304s and the free
+probe excluded; (3) the shadow band `shadow_low`/`shadow_high` per
+bucket-hour, NULL when GitHub reported no spend, plus `agent_share`; (4) the `invoke github` span
+cross-check by `github.account`, `github.cred_owner`, `github.resource` and
+`github.billing`; (5) the agent slice (#10607): agent sessions' `gh` calls
+(`agent != '-'`) by role and served/passthrough. Run it like the queries above:
+
+```console
+docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml exec -T loom-signoz-telemetrystore-clickhouse-0-0 clickhouse-client --multiquery < github-shadow.sql
+```
+
+Its metric names, metric labels and span attributes are guarded by
+`signoz_trial_artifacts.rs`, and all five queries are **executed verbatim**
+against the pinned ClickHouse by `signoz_github_shadow_queries.rs` (stale
+host readings, a genuine reset, 1 s reset jitter, two interleaved windows, an
+owner-less legacy point). Queries 0–4 have also been run read-only against the
+live store (PR #10565); the one-hour 10 % reconciliation is #10343's Slice 3.
+
+### Export coverage and drops
+
+`host-export-queries.sql` (#11124) answers "which hosts are losing telemetry,
+or not reporting their export view?" from the `host.export` logs: (1) hosts
+whose cumulative `dropped_total` grew in the last 2 h (a decrease is read as a
+daemon restart), and (2) hosts with other Loom logs but no `host.export` in
+that window. Drops are host-level: the log attributes carry only the sum
+across exporters, and the per-exporter split lives in the JSON body. A
+host's latest sample in the 24 h before the window is the baseline, so drops
+between the window start and the first in-window sample are counted; a host
+with no earlier sample has an unknown baseline and its first value counts as
+0. Queries 1-3 run verbatim against the pinned ClickHouse in CI
+(`signoz_host_export_queries.rs`, fixtures for increment, no-increase, reset
+and no-baseline).
+
+Query 4 (#11639, reset regression #11146) reads each exporter's JSON body and
+sums observed positive counter steps, including increments before and after a
+ledger decrease. The latest sample in the bounded 24 h pre-window lookback is
+the baseline. Without it, the first value contributes zero and `baseline_known`
+is false. `delta` and `reason_delta` are observed lower bounds: `reset_count`
+flags decreases, and no query reconstructs loss between observations or proves
+journal recovery. Zero observed loss with incomplete coverage produces a
+`coverage_unknown` row; known flat counters produce no row. Empty output is
+never proof that historical loss was recovered.
+
+A present `dropped_by_reason` map omits zero keys; a missing legacy map is
+unknown. Reasons are compared at consecutive exporter samples; resets use the
+current map. Missing, decreasing or inconsistent reason breakdowns leave the
+step `unattributed`, while `unknown_reason_steps` exposes incomplete attribution.
+The attributed reasons plus unexplained remainder equal the observed total.
+Duplicate `(host, exporter, timestamp, exporter JSON)` delivery collapses;
+conflicting same-time bodies select lexical maximum deterministically and set
+`conflicting_samples`, which makes coverage incomplete. Steps touching a conflict contribute zero,
+so conflicting observations cannot invent a loss lower bound. Peak in-window queue
+depth and observed versions remain context, not evidence of recovery. Durable
+loss-ledger counts only: admission deferrals are not exporter drops.
+
+The existing pinned ClickHouse CI harness now executes query 4 with a fixed
+clock, including the captain's 16:14 reset and later 851/1584 queue-overflow
+samples, missing baselines/maps, reason resets, duplicate delivery and separate
+exporters. Authoritative journal recovery remains separate incident work (#11639).
+
+Query 3 (#11198) finds roster hosts silent by absence, which queries 1-2
+cannot (they anchor on logs a host sent). The roster sits between
+`/* loom:roster:begin */` and `/* loom:roster:end */`: one `(host, telemetry)`
+row per fleet-gitops `hosts.yml` host with `services.loom-daemon.expected:
+running`, `telemetry` being `always` (silent after 900 s) or `when_awake`
+(86400 s). Render it by pasting those rows between the markers, in both
+`host-export-queries.sql` and `alerts/host-export-silent.json`; re-render on
+every `hosts.yml` change. The committed rows are `example-*` placeholders, so
+an unrendered import fires loudly instead of staying silently healthy. A host
+that never exported in the 48 h lookback is silent; `state` is
+`exporter_silent` (other Loom logs within its threshold) or `host_silent`.
+
+### Pass activity
+
+`pass-queries.sql` (#10752) answers "what did the daemon's hold-cleanup pass
+do?" from the `pass.summary` / `pass.verdict` logs and the `invoke github`
+spans stamped with `github.caller`: (1) per mechanism and repo over 24 h, the
+passes run and refused, blocks released and re-parked, skips by reason, write
+cap hits and the GitHub calls by operation, in one statement; (2) the newest
+verdict per artifact, which says why each one is still held; (3) every
+`loom:blocked` removal the loom-ui webhook export saw, matched to the pass
+verdict that made it (empty when no pass did). Run it like the queries above:
+
+```console
+docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml exec -T loom-signoz-telemetrystore-clickhouse-0-0 clickhouse-client --multiquery < pass-queries.sql
+```
+
+Its keys are guarded by `telemetry/kinds/pass_tests.rs`, and the OTLP mapping
+tests check each key is read from the attribute map its type lands in. All
+three statements were run read-only against the live store on 2026-10-07,
+before any daemon shipped the records: (1) and (2) returned no rows, and (3) matched 109 removals in 24 h,
+none of them attributed yet.
+
 ### Measured usage queries
 
 `usage-queries.sql` (#8528) is the SigNoz half of ClickStack's "Loom measured
@@ -398,69 +512,6 @@ the type it names, so a subscript into `attributes_number` there would silently
 return 0 on every row instead of erroring. Policy and pipeline:
 [CI observability](../../docs/ci-observability.md).
 
-### ETA accuracy queries
-
-`eta-queries.sql` (#9289) scores the ETA heuristics against what actually
-happened, from the `eta.estimate` / `eta.outcome` **log** records. Section 0 is
-the preflight; Q1 is MAE / 25–75 coverage / bias; Q2 is the mean pinball loss
-that decides a promotion; Q3 ranks the recorded features by how well each
-tracks the error; Q4-Q7 (#10233) are the late-surprise rate on the common
-decidable subset, the stability of the predicted landing instant, interval
-convergence by actual lead, and the time-weighted answer rate (proven by
-`loom-daemon/tests/signoz_eta_accuracy_views.rs`). The model is [`eta.md`](../../docs/eta.md). Bind both
-parameters:
-
-```console
-docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml exec -T loom-signoz-telemetrystore-clickhouse-0-0 clickhouse-client --multiquery --param_since='2026-09-01 00:00:00' --param_repo='' < eta-queries.sql
-```
-
-`loom-daemon/tests/signoz_eta_queries.rs` executes the committed file verbatim
-against the same pinned ClickHouse (25.12.5) the telemetry store runs, and runs
-the mutation of the committed SQL that breaks each claim below as a
-counterfactual rather than describing it. **Read section 0 first**, then these
-five, in this order:
-
-- **Absent is never zero.** An `abandoned` outcome (the issue closed as not
-  planned) and a refusal carry no `loom.eta.error_sec` key at all. Dropping the
-  `mapContains` presence filter does not error — `attributes_number` answers the
-  Float64 default — it scores the abandonment as a *flawless* prediction, which
-  **lowers** the MAE. Measured: 1048 → 1000 on the test fixture. A promotion
-  metric that improves when data goes missing is the worst shape of silent
-  defect, which is why section 0 reports `outcomes` and `scored` separately and
-  they must reconcile to `abandoned`.
-- **`refusals` is a subset of `estimates`**, not a disjoint population — a
-  refusal still carries `loom.eta.trigger`. Adding the two columns double-counts.
-- **Q2's subtotals need `rolled_up`.** `ROLLUP` blanks an aggregated column to
-  the type's default, `''` for these Strings — exactly what
-  `attributes_string['loom.eta.heuristic']` answers for a record that lacks the
-  key. The query therefore can and does emit **two rows with the identical key
-  `('', '', '')`**: the grand total (`rolled_up` = 3) and an unlabelled
-  heuristic's own total (`rolled_up` = 2). Without the column they are one
-  unreadable pair.
-- **Q3: an unvarying feature is not scored as uncorrelated.** `rankCorr`
-  average-ranks ties, so a feature that took one value across the window comes
-  out at exactly **`rank_corr` = 0.5** — above any genuine correlation weaker
-  than that, under this section's own `ORDER BY abs(rank_corr) DESC` — while
-  `pearson_corr` reads NaN. `distinct_values` = 1 is the tell. Do not read a
-  0.5 without it. The NaN's **spelling** is architecture-dependent (`nan` on
-  arm64, `-nan` on amd64 Linux), so never string-match it.
-- **Q3 cannot see an estimate older than the window.** Its estimate sub-select
-  carries the same `since` bound as the outcome one, so an outcome whose
-  estimate predates `since` is scored by Q1/Q2 and contributes no features here.
-  Widen `since` past the longest lead time you care about.
-
-`HAVING n >= 20` means a short window makes Q3 return **nothing**, which reads
-like "no feature tracks the error" rather than "not enough data" — check section
-0's counts before concluding either. `eta_artifacts.rs` additionally fails in
-ordinary CI if any attribute drifts from what the ETA mapping emits and the
-gateway forwards, or if either disambiguating column is dropped.
-
-Executed against the pinned ClickHouse with a synthetic fixture, and executed
-verbatim against the **live trial deployment** (ClickHouse 25.12.5.44,
-2026-10-01) where it returned all four sections' documented columns over zero
-rows — no ETA record has been ingested there yet. Not yet run over real canary
-data.
-
 ### Saved views
 
 | Saved view | Procedure |
@@ -471,8 +522,12 @@ data.
 | Correlated logs | Logs Explorer: exact trace ID and span ID; follow the trace link and inspect related logs from the selected span (`fixture-queries.sql` 6) |
 | Host/token gauges | Metrics Explorer: the actual emitted names and units — the shared fixture emits `loom.tokens.usage_fraction` and `loom.tokens.exhausted` only, labelled by `account`. An absent series is not a measured zero: the fixture's `synthetic-unknown` account intentionally has no `usage_fraction` point while `synthetic-zero` has `0.0` (`fixture-queries.sql` 7) |
 | Subscription quota utilization | Dashboards → New dashboard `Loom quota` → Time series panel. Metric `loom.tokens.usage_fraction` (5-hour window) and a second query on `loom.tokens.usage_fraction_weekly` (rolling 7-day window, #9005), aggregation **Max**, group by `provider`, `account`; time range 7 days. Providers with no utilization source (Codex, OpenCode/Z.ai, Kimi) have no series at all — a gap, never a `0`. Last week's used fraction per provider and the idle headroom thrown away at each weekly reset need window functions, so they live in SQL only (`quota-utilization.sql` 1–3) |
+| GitHub bucket shadow spend | Dashboards → `Loom quota` → Time series panel. Metric `github.ratelimit.used`, aggregation **Max**, group by `account`, `owner`, `resource` (`owner = '-'` is an operator's ambient login; a pre-#10571 daemon's label set can carry two interleaved windows, so the panel is a browsing surface). The per-hour increments, the attributed `loom.forge.calls` and the shadow band need window functions and a join, so they live in SQL only (`github-shadow.sql` 1–5) |
 | Ready-queue dwell | Dashboards → New dashboard `Loom queue` → Time series panel. Metric `loom.queue.oldest_wait`, aggregation **Max**, group by `host.id`, `state`; time range 7 days. A second panel on `loom.queue.starved` (Max, group by `host.id`, `state`) is the alert's own signal. Disposition reasons, mean dispatch wait and one issue's admission trail need `JSONExtractString`/span reads and stay SQL-only (`queue-dwell.sql` 1–5) |
 | Queue starvation alert | Alerts → Import `alerts/queue-starvation.json`. Fires when `loom.queue.starved` for `state = 'ready'` stays above threshold for the 15-minute eval window on any one host; the alert's own query is `queue-dwell.sql` 1 narrowed to that state, minus its `HAVING starved > 0` so SigNoz can still see the series recover. The embedded query plus the committed threshold are executed against the pinned ClickHouse by `signoz_queue_starvation_alert.rs` (see "Queue dwell and starvation queries" above); no rule evaluator or notification has run ([#9006](https://github.com/rjwalters/loom/issues/9006)) |
+| Host disk alerts | Alerts → Import `alerts/host-disk-low.json` (warning) and `alerts/host-disk-critical.json` (critical). Both read the direct OTLP gauges `loom.host.worktree_root_free_gb` and `loom.host.worktree_volume.{free,total}_bytes` (no loom-ui d1-export hop), one row per host labelled `host.name`, falling back to `host.id` for series whose `host.name` is empty, over a 60-minute window. Level arm: every free-GB reading in the last 10 minutes breaches (the window's `max` is under the threshold, so one healthy reading clears it). Warning: < 30 GB or < 10% of the volume, or a least-squares slope of free GB over the hour (at least 4 readings spanning 30 minutes, the latest within 10) projecting the volume full in < 6 h; critical: < 5 GB (so 0 included) or < 3%, or full in < 1 h. The percent arm needs the byte gauges; a host without them is judged on GB alone, and a host with no free-space gauge is unknown, never 0 GB. Executed against the pinned ClickHouse over a replay of free GB falling to 0, a 20 GB/h drain (warning only), a recovering host and a host alternating 0 GB and recovered readings within each minute (must not page), by `signoz_ops_alerts.rs`; no rule evaluator or notification has run (#10973) |
+| Host export silent alert | Alerts → Import `alerts/host-export-silent.json` after rendering its roster (see "Export coverage and drops"). Fires per roster host with no `host.export` past 900 s (`always`) or 86400 s (`when_awake`) in a 48 h window; the `state` label separates `exporter_silent` from `host_silent`. Replay-tested by `signoz_host_export_queries.rs`; no rule evaluator or notification has run (#11198) |
+| Work finder stale alert | Alerts → Import `alerts/work-finder-stale.json`. Fires for a host still heartbeating (`loom.host.uptime_seconds` within 10 minutes) whose last `loom.queue.issues` sample (exported once per work-finder tick, zeros included) is older than 2x that host's own tick interval, learned as the median gap between its ticks in the 24 h window (60 s with fewer than 3), floored at 300 s. A host whose finder never ticked in the window (disabled) or that stopped heartbeating (dead, not stalled) is not judged. Replay-tested by `signoz_ops_alerts.rs`: the 2026-10-08 stall at 14:04Z pages at 14:10Z (#10973) |
 | Loom measured usage | Trace Explorer: filter `name = 'loom.runtime.usage'`, group by `loom.model` with **Sum** over the token counters, and separately by `loom.role` / `loom.runtime`. The UI reads these attributes as STRINGS (they are exported as strings, like every span attribute), so a numeric aggregation of them belongs in SQL — and the scope resolution a correct total needs cannot be expressed as an Explorer filter at all. Treat the panel as a browsing surface and the SQL as the figures (`usage-queries.sql` 1 and 2) |
 | Usage coverage | Trace Explorer: filter `name = 'loom.role_attempt'` and compare against the usage spans beneath each. An attempt with **no** `loom.runtime.usage` child has usage UNKNOWN; one whose child reports `loom.tokens.total = '0'` is a measured zero. Never impute one from the other — the split is SQL-only (`usage-queries.sql` 3) |
 | Unpriced models and rate-card provenance | Trace Explorer: filter `name = 'loom.runtime.usage'` and add `loom.cost.usd_estimate`, `loom.pricing.source`, `loom.pricing.verified_on` as columns. A blank estimate is a model the rate card does not know, never a $0 model: it must be excluded from spend explicitly, and fixing it is a rate-card change, not a query change. Two `verified_on` values in one window mean the fleet rolled a card mid-window (`usage-queries.sql` 4 and 5) |
@@ -491,9 +546,6 @@ data.
 | CI slowest suites | Trace Explorer: filter `name = 'loom.ci.suite'`, group by `loom.ci.job`, `loom.ci.suite` with **Sum** (and a second query with **P90**), time range 7 days, sorted descending. Add `loom.ci.suite.outcome` / `loom.ci.suite.retried` as filters to separate "slow because it runs twice" from "slow". A suite that did not run in a leg has no span at all, so it never appears here as a fast suite (`ci-queries.sql` 12) |
 | CI suite rebalance | Same filter grouped by `loom.ci.run_id`, `loom.ci.shard.index` with **Sum** — one bar per leg of a run, which is the per-leg suite time a `LOOM_CI_SHARD` split should equalize. `argMax(suite, duration)` per leg (the named suite to move) is SQL-only (`ci-queries.sql` 13). Expect the summed suite time to be **less** than the leg's job wall time (checkout and toolchain setup are steps, not suites) and **more** than the wall time of the step that ran them (suites run concurrently); the comparison that matters is between legs of the same run |
 | CI critical path | Logs Explorer: filter `body = 'ci.job' AND loom.ci.run_id = <id>`, add columns `loom.ci.job`, `loom.ci.dependency_wait_ms`, `loom.ci.queued_ms`, `loom.ci.duration_ms`, and sort by `loom.ci.duration_ms` descending — the leg with the largest dependency + queue + running sum is the run's critical path, and the three columns say which of the three set it. The `unexplained_s` residual (run wall time minus the run's own queue and that leg's total) requires a run↔job join and is SQL-only (`ci-queries.sql` 14) |
-| ETA accuracy | Logs Explorer: filter `body = 'eta.outcome' AND loom.eta.error_sec EXISTS`, add columns `loom.eta.heuristic`, `loom.eta.revision`, `loom.eta.kind`, `loom.eta.horizon_bucket`, `loom.eta.error_sec`, `loom.eta.covered`; group by `loom.eta.heuristic`, `loom.eta.revision` — **both**, never heuristic alone, or a daemon roll mid-window averages two builds into one number. The `EXISTS` clause is not optional: an abandoned sweep has no error field, and without it the panel scores the abandonment as a perfect prediction. Coverage, bias and the pinball loss that decides a promotion need `avg()`/`median()` over these and stay SQL-only (`eta-queries.sql` 0, Q1, Q2) |
-| ETA feature ranking | SQL-only (`eta-queries.sql` Q3): it expands the estimate's explanation body with `JSONExtractKeysAndValuesRaw` and correlates each numeric feature with the error, neither of which is an Explorer operation. Read `distinct_values` beside `rank_corr` — a feature that never varied scores 0.5, not 0 — and `n` beside both: the section's `HAVING n >= 20` makes a short window return nothing at all |
-| ETA late surprise, stability, convergence, answer rate | SQL-only (`eta-queries.sql` Q4, Q5, Q6, Q7): Q4 keeps an instant only when every heuristic's late surprise there is decided (an Explorer `avg(loom.eta.above_p90)` would let a heuristic that refuses the hard cases read as better), Q5 needs a window over consecutive emissions, Q6 buckets the actual lead, and Q7 weights each emitted state by how long it stood — counting rows overstates the answer rate because a refusal is never refreshed |
 | CI dependency wait | Logs Explorer: filter `body = 'ci.job' AND loom.ci.dependency_wait_ms EXISTS`, add columns `loom.repo`, `loom.ci.workflow`, `loom.ci.job`, `loom.ci.dependency_wait_ms`, `loom.ci.queued_ms`; group by `loom.ci.job` with **P50**/**P90**, time range 7 days. **Alert when a family's p90 dependency wait exceeds its own p90 queue wait**: it is gated by `needs:`, not capacity-starved, and more runners will not move it. An ungated job measures ~0 by construction — treat sub-2s values as job-creation lag, not a serialized edge (`ci-queries.sql` 15) |
 | CI slowest tests | Trace Explorer: filter `name = 'loom.ci.test'`, group by `loom.ci.test.binary`, `loom.ci.test` with **Sum** (and a second query with **P90**), time range 7 days, sorted descending. Add `loom.ci.test.outcome` as a filter to separate `flaky` (failed then passed — the #7789 signal) from `fail`/`error` from a clean `pass` (`ci-queries.sql` 16). **Only each leg's slow tail is emitted** — tests at or above the 250 ms floor, capped at `MAX_TEST_SPANS_PER_JOB` (512) per leg — so this panel is a ranking, never a test inventory: a test missing from it is fast or outside the cap, not unrun |
 | CI test rebalance | Same filter grouped by `loom.ci.run_id`, `loom.ci.job` with **Sum** — one bar per nextest leg of a run, which is the slow-tail time a `--partition count:k/N` split should equalize. Group by `loom.ci.job` and not by `loom.ci.shard.index` alone: both nextest families shard `1..3`, so index alone merges two unrelated partitions. `argMax(test, duration)` per leg (the named test to move) is SQL-only (`ci-queries.sql` 17). The summed tail time is far **less** than the leg's test-step wall time by design (every sub-floor test is excluded), so compare legs of the same run and the same family, never a leg against its own job span |
@@ -515,13 +567,6 @@ acceptance surface until someone with the trial org's login creates the saved
 views and records it. The seven #9089 rows are additionally **unexecuted**:
 sections 9–15 read attributes and spans that work introduces, so no run
 predating it can have produced a row for them.
-
-The two **ETA** rows are in the same category and for the same reason: written,
-not created in the trial org, and additionally unexecuted over real data — no
-`eta.estimate` or `eta.outcome` record has reached the trial deployment (a
-verbatim run of `eta-queries.sql` against it on 2026-10-01 returned every
-documented column over zero rows). The verified form is
-`loom-daemon/tests/signoz_eta_queries.rs` against the pinned engine.
 
 Save these searches/dashboards through the installed UI and retain sanitized
 exports where supported. These precise steps avoid asserting that mutable
@@ -592,6 +637,26 @@ real-canary comparison still needs.
 > harness-ops store keeps logs 3650 days and traces/metrics 10 years
 > ([#10195](https://github.com/rjwalters/loom/issues/10195)); never apply
 > `retention.sql` there (#8946 item 2 stays held).
+
+`fleet.state` volume (#11161): a full anchor every 5 minutes is 288 a day, so
+at Loom's own ~300 KB anchor (~3000 rows) that is ~90 MB of log body per host
+per day before ClickHouse compression (~33 GB per host per year), plus the
+60-second deltas, which carry only changed rows.
+
+Check it against your store's budget before raising the cadence on a long
+retention:
+
+- **Raw upper bound:** hosts × ~90 MB/day × retention days. At a 10-year
+  retention, 5 hosts is ~1.6 TB before compression, so a long-retention store
+  depends on ClickHouse compression to hold it. Compare with free disk, after
+  the store's existing ingest × retention.
+- **Short retention:** at 90 days the same 5 hosts are ~40 GB raw.
+- **Compression is an assumption until measured.** After 24 h, read the stored
+  bytes per `fleet.state` anchor and per host per day from ClickHouse
+  `system.parts` for the logs table (filtered by `loom.kind`), and replace the
+  300 KB estimate with that figure.
+- **Watch it:** alert on projected days-to-full and on a 24 h ingest jump
+  against the 7-day rate. The response is more disk or less ingest.
 
 Set **seven days for logs and traces and 30 days for metrics** in General
 Settings → Retention (#8826). Metrics outlive raw logs/traces on purpose: the
@@ -674,8 +739,11 @@ them, which ClickHouse applies only during merges. The casting switches
 `system.metric_log` to ClickHouse's `transposed_with_wide_view` schema
 because the default 1,552-column table's merge memory grows with input parts
 times columns. Under the 2 GiB cap, its TTL-applying merge failed thousands of
-times an hour, and parts outlived their TTL. `system.metric_log` stays
-queryable as a view with the same columns.
+times an hour, and parts outlived their TTL. ClickHouse 26.1 removed the wide
+view, so on the pinned 26.x the same setting makes `system.metric_log` itself
+the narrow `metric`/`value` table, still with the 1-day TTL. A volume upgraded
+from 25.12 keeps its old `system.transposed_metric_log`, which ClickHouse no
+longer writes and which its own 1-day TTL empties.
 
 A deployment first started from an older render keeps its wide table. Its
 rendered files live in the deployment's own state directory, **not** in this

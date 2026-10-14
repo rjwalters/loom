@@ -234,11 +234,17 @@ fn the_auth_dead_fallback_covers_every_pinned_phrase() {
         "401 authentication_error",
         r#""type": "authentication_error""#,
         "token has been revoked",
+        "Failed to authenticate: OAuth token revoked. Please log in again or contact your administrator.",
         "invalid bearer token",
         "OAuth token has expired",
     ] {
         assert!(is_account_auth_dead(&degraded(phrase, 1)), "'{phrase}' must be auth-death");
     }
+    assert!(
+        !is_account_auth_dead(&degraded("OAuth token revoked", 0)),
+        "zero exit never rotates"
+    );
+    assert!(!is_account_auth_dead(&degraded("The reviewer revoked their approval", 1)));
     // Exhaustion is NOT auth-death: one recovers with time, the other needs a
     // human. Marking an exhausted account dead shrinks the pool permanently.
     assert!(!is_account_auth_dead(&degraded("You have hit your weekly limit", 1)));

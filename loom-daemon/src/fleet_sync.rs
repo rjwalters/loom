@@ -17,6 +17,32 @@
 //!   published on the event bus, and recorded in the host-level snapshot
 //!   `loom-daemon status` renders — **without writing anything**, unless
 //!   `fleet.autoApply` is on.
+//! - **The fleet version floor** (`loom_min_version`, #10711): every pass reads
+//!   it from the snapshot into a process-wide value ([`loom_min_version`]),
+//!   not into the config tiers, so a change takes effect on the next tick with
+//!   no restart. A malformed value keeps the last good floor and alerts. The
+//!   self-update loop rolls a host below it (`auto_update::floor_roll`, #10712),
+//!   reads it as three values ([`floor_knowledge`]) and is woken when a pass
+//!   resolves a different floor ([`floor_wake`], #10885).
+//! - **The workspace resync** ([`workspace_resync`], #10718): after each timer
+//!   pass, and once at startup, every registered repo's installed Loom is
+//!   compared with this daemon's own payload and, on a host in H0 with
+//!   `fleet.autoApply` on, resynced under a per-repo claim. It runs on its
+//!   own task, one pass at a time, and the timer never waits for it.
+//! - **The checkout fast-forward** ([`checkout_ff`], #10869): each registered
+//!   workspace's main checkout is fast-forwarded to its default branch when it
+//!   is clean and strictly behind, so a resync that landed on the forge is the
+//!   one this host dispatches from. It runs inside the startup pass (before
+//!   any dispatch producer exists), and then on the workspace resync's own
+//!   task, right after each resync pass, so the timer never waits for it
+//!   either. It writes only with `fleet.autoApply` on.
+//! - **Roster clones** ([`roster_clone`], #11218): with `fleet.autoApply` on, a
+//!   timer pass clones a desired repo that is not cloned under `root` yet
+//!   (HTTPS, bounded per pass) and registers it in the same pass.
+//! - **The per-repo fleet tier** ([`repo_config`], #11738): each desired,
+//!   cloned repo's `repos[].config` is written to its
+//!   `.loom-local/fleet-repo.json` (or that file removed), from the roster's
+//!   fail-closed snapshot, under the same [`Mode`] as the config tiers.
 //!
 //! # Invariants this module keeps
 //!
@@ -54,7 +80,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
@@ -63,9 +89,28 @@ use serde_json::Value;
 
 use crate::fleet_state::{self, Enforcement, Enforcer, StatePass};
 use crate::fleet_store::fetch::{self, Freshness, Policy, Transport};
+use crate::fleet_store::floor::{self, FloorRead};
 use crate::fleet_store::render::{self, Drift};
 use crate::fleet_store::roster::{self, Change, Plan, Registered};
 use crate::fleet_store::{self as store, StoreLocation};
+
+// `applied` is `pub` so the OTLP resource code and its tests reach
+// `applied_config_sha` / `AppliedSha` / `FLEET_CONFIG_SHA` via
+// `fleet_sync::applied::…` directly, without a top-level re-export, and so
+// the otlp-only consumers do not leave them dead in a non-otlp build (#11197).
+pub mod applied;
+pub mod checkout_ff;
+mod floor_knowledge;
+pub mod git_spawn_log;
+pub mod identity;
+mod loom_ui;
+pub mod offline_floor;
+pub mod repo_config;
+pub mod roster_clone;
+mod status_lines;
+pub mod workspace_resync;
+
+pub use floor_knowledge::{floor_knowledge, floor_wake, FloorKnowledge, FloorWake};
 
 /// Config key for the timer cadence.
 pub const SYNC_INTERVAL_KEY: &str = "fleet.syncIntervalSecs";
@@ -212,6 +257,10 @@ pub struct ConfigPass {
     pub tiers: Vec<TierReport>,
     /// Why the pass could not be completed, when it could not be.
     pub error: Option<String>,
+    /// The render failed because this host's id names no store host, so the
+    /// host is off fleet config (#11740). Omitted when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub host_not_in_store: bool,
 }
 
 impl ConfigPass {
@@ -265,6 +314,7 @@ pub fn config_pass(
                 cached,
                 tiers: Vec::new(),
                 error: Some(format!("{e:#}")),
+                host_not_in_store: identity::host_not_in_store(&loaded.snapshot, host),
             }
         }
     };
@@ -275,12 +325,34 @@ pub fn config_pass(
         let drift = render::drift(target);
         let drifted = drift != Drift::InSync;
         let mut wrote = false;
+        let mut detail = describe_drift(&drift);
+        let keys = crate::config_journal::restart_keys(target, mode == Mode::Write && drifted);
         if mode == Mode::Write && drifted {
-            match render::write(target, &stamp) {
-                Ok((w, _backup)) => wrote = w,
-                Err(e) => {
-                    error = Some(format!("writing {}: {e:#}", target.path.display()));
+            let lost = render::lost_top_level_keys(target);
+            if lost.is_empty() {
+                match render::write(target, &stamp) {
+                    Ok((w, backup)) => {
+                        wrote = w;
+                        crate::config_journal::record_rendered(w, target, backup, &commit, &keys);
+                    }
+                    Err(e) => {
+                        error = Some(format!("writing {}: {e:#}", target.path.display()));
+                    }
                 }
+            } else {
+                // Lossy-reduction guard (2am#1653), automated-path half: no
+                // operator is present on this path to answer an
+                // `--allow-reduce` prompt, so the write is simply skipped and
+                // the loss surfaced via `error`/`detail` instead.
+                let msg = format!(
+                    "{} would DROP top-level block(s) the file on disk carries: {} — \
+                     refusing to write; the store never had them (`fleet-config propose \
+                     adopt` proposes adding them to the store first)",
+                    target.tier.name(),
+                    lost.join(", ")
+                );
+                error = Some(msg.clone());
+                detail = Some(msg);
             }
         }
         tiers.push(TierReport {
@@ -288,7 +360,7 @@ pub fn config_pass(
             path: target.path.clone(),
             drifted,
             wrote,
-            detail: describe_drift(&drift),
+            detail,
         });
     }
     ConfigPass {
@@ -296,6 +368,7 @@ pub fn config_pass(
         cached,
         tiers,
         error,
+        host_not_in_store: false,
     }
 }
 
@@ -324,6 +397,9 @@ pub struct RosterPass {
     pub applied: usize,
     /// Desired repos that could not be applied (not cloned under `root`).
     pub unapplied: usize,
+    /// Missing clones this pass cloned or tried to (#11218).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub clones: Vec<roster_clone::CloneAttempt>,
     /// Why the pass could not be completed, when it could not be.
     pub error: Option<String>,
     /// Why the roster was not consulted at all this pass — set when the
@@ -360,73 +436,66 @@ pub fn roster_pass(
     now: DateTime<Utc>,
 ) -> Result<Plan> {
     let loaded = fetch::load(transport, cache_dir, location, Policy::FailClosed, now)?;
-    let text = loaded.snapshot.text(store::ROSTER_PATH)?.ok_or_else(|| {
-        anyhow!(
-            "the store has no {} (commit {})",
-            store::ROSTER_PATH,
-            loaded.snapshot.short_commit()
-        )
-    })?;
-    let parsed = roster::parse(&text, home)?;
+    plan_snapshot(&loaded.snapshot, home, registered, normalize, is_cloned)
+}
+
+/// [`roster_pass`] on an already-loaded fail-closed snapshot.
+fn plan_snapshot(
+    snapshot: &fetch::Snapshot,
+    home: &Path,
+    registered: &[Registered],
+    normalize: &dyn Fn(&Path) -> PathBuf,
+    is_cloned: &dyn Fn(&Path) -> bool,
+) -> Result<Plan> {
+    let parsed = roster::from_snapshot(snapshot, home)?
+        .ok_or_else(|| anyhow!(roster::missing_message(snapshot)))?;
     Ok(roster::plan(&parsed, registered, normalize, is_cloned))
 }
 
 /// Turn a [`Plan`] into a [`RosterPass`], applying it through `apply` when
-/// `auto_apply` is set. `apply` is a seam so tests never touch a real registry;
-/// production passes [`apply_change`].
+/// `auto_apply` is set, and never cloning: a missing clone is counted
+/// unapplied. `apply` is a seam so tests never touch a real registry;
+/// production passes [`apply_change`]. The timer clones through
+/// [`roster_clone::summarize`] instead (#11218).
 pub fn summarize_roster(
     plan: &Plan,
     auto_apply: bool,
     apply: &mut dyn FnMut(&Change) -> Result<()>,
 ) -> RosterPass {
-    let drift: Vec<String> = plan.changes.iter().map(roster::describe).collect();
-    let mut out = RosterPass {
-        drift,
-        ..RosterPass::default()
-    };
-    if !auto_apply {
-        return out;
-    }
-    for change in &plan.changes {
-        if matches!(change, Change::MissingClone { .. }) {
-            out.unapplied += 1;
-            continue;
-        }
-        match apply(change) {
-            Ok(()) => out.applied += 1,
-            Err(e) => {
-                out.unapplied += 1;
-                let detail = format!("{}: {e:#}", roster::describe(change));
-                out.error = Some(match out.error.take() {
-                    Some(prev) => format!("{prev}; {detail}"),
-                    None => detail,
-                });
-            }
-        }
-    }
-    out
+    roster_clone::summarize(plan, auto_apply, &roster_clone::Clones::off(), apply)
 }
 
 /// Apply one planned change to the machine-level workspace registry at
 /// `registry_path` — the same registry `loom-daemon workspace add/remove/
-/// set-priority` edits, through the same [`crate::workspace_registry`] methods
+/// set-weight` edits, through the same [`crate::workspace_registry`] methods
 /// those verbs use. Loads and saves per change so a mid-plan failure leaves the
 /// earlier changes durably applied, exactly as the CLI's per-verb loop does.
 pub fn apply_change(registry_path: &Path, change: &Change) -> Result<()> {
-    use crate::workspace_registry::WorkspaceRegistry;
+    use crate::workspace_registry::{MaintainOnlySource, WorkspaceRegistry};
     let mut registry = WorkspaceRegistry::load(registry_path)
         .with_context(|| format!("reading {}", registry_path.display()))?;
+    // #11186: the store's maintain-only mark. An add carries it in the same
+    // write, so the workspace is never registered dispatchable first.
+    let mode = |on: bool| on.then_some(MaintainOnlySource::FleetStore);
     let changed = match change {
-        Change::Add { path, priority, .. } => {
+        Change::Add {
+            path,
+            weight,
+            maintain_only,
+            ..
+        } => {
             let claude_state = crate::terminal::claude_config_state_path();
-            registry.add_and_trust(path, None, *priority, &claude_state)?;
+            registry.add_and_trust(path, None, *weight, &claude_state)?;
+            registry.set_maintain_only(path, mode(*maintain_only), Utc::now());
             true
         }
         Change::Remove { path, .. } => registry.remove(path),
-        Change::SetPriority { path, to, .. } => registry.set_priority(path, *to),
-        // Never reachable: `summarize_roster` counts these as unapplied
-        // without calling here — a desired repo that is not cloned is
-        // reported, never cloned (the roster's own contract).
+        Change::SetWeight { path, to, .. } => registry.set_weight(path, *to),
+        Change::SetMaintainOnly { path, to, .. } => registry
+            .set_maintain_only(path, mode(*to), Utc::now())
+            .unwrap_or(false),
+        // Never reachable: a missing clone is counted unapplied, or cloned
+        // and then applied as an `Add` (`roster_clone`, #11218).
         Change::MissingClone { .. } => false,
     };
     if changed {
@@ -435,6 +504,133 @@ pub fn apply_change(registry_path: &Path, change: &Change) -> Result<()> {
             .with_context(|| format!("saving {}", registry_path.display()))?;
     }
     Ok(())
+}
+
+// ============================================================================
+// The fleet version floor (#10711)
+// ============================================================================
+
+/// What one pass resolved for the fleet-wide minimum Loom version
+/// (`loom_min_version`, [`crate::fleet_store::floor`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FloorPass {
+    /// The floor in force after this pass, `X.Y.Z`; `None` when unset.
+    pub floor: Option<String>,
+    /// The store path the floor was read from this pass (`fleet.json` /
+    /// `repos.yml`); `None` when unset or carried over.
+    pub source: Option<String>,
+    /// Whether [`FloorPass::floor`] is the last good floor carried over
+    /// because this pass could not read a valid one (see `error`).
+    pub carried: bool,
+    /// Why this pass could not read a valid floor, when it could not. Raised
+    /// as an alert: a malformed floor is never read as "no floor".
+    pub error: Option<String>,
+}
+
+impl FloorPass {
+    /// Nothing to report: no floor and no error. A snapshot in this state
+    /// omits the field entirely, so a host with no floor writes the same
+    /// `fleet-sync-status.json` it did before #10711.
+    #[must_use]
+    pub fn is_unset(&self) -> bool {
+        self.floor.is_none() && self.error.is_none()
+    }
+}
+
+/// Decide the floor in force from this pass's `read` and the `last_good` floor.
+///
+/// - absent: unset (the operator removed it);
+/// - valid: that floor;
+/// - malformed, or the snapshot could not be read at all (`Err`): keep
+///   `last_good` (unset on a first-ever bad read) and report why.
+#[must_use]
+pub fn resolve_floor(read: Result<FloorRead, String>, last_good: Option<&str>) -> FloorPass {
+    let keep = |why: String| FloorPass {
+        floor: last_good.map(str::to_string),
+        source: None,
+        carried: last_good.is_some(),
+        error: Some(match last_good {
+            Some(f) => format!("{why} — keeping the last good floor {f}"),
+            None => format!("{why} — no previous floor, so none is in force"),
+        }),
+    };
+    match read {
+        Ok(FloorRead::Absent) => FloorPass::default(),
+        Ok(FloorRead::Valid { version, source }) => FloorPass {
+            floor: Some(version),
+            source: Some(source.to_string()),
+            ..FloorPass::default()
+        },
+        Ok(FloorRead::Malformed { source, detail }) => {
+            keep(format!("{source}: malformed `{}`: {detail}", floor::KEY))
+        }
+        Err(e) => keep(format!("could not read `{}`: {e}", floor::KEY)),
+    }
+}
+
+/// Read the floor from the cached snapshot the config half of this pass just
+/// refreshed. [`Policy::Offline`]: no extra forge request — the state and
+/// config halves already revalidated the cache (or fell back to it).
+fn floor_half(
+    cache_dir: &Path,
+    location: &StoreLocation,
+    last_good: Option<&str>,
+    now: DateTime<Utc>,
+) -> FloorPass {
+    let read = fetch::load(&NoTransport, cache_dir, location, Policy::Offline, now)
+        .map(|loaded| floor::read(&loaded.snapshot))
+        .map_err(|e| format!("{e:#}"));
+    resolve_floor(read, last_good)
+}
+
+/// The transport [`Policy::Offline`] never calls.
+struct NoTransport;
+
+impl Transport for NoTransport {
+    fn get(&self, api_path: &str, _: Option<&str>, _: Option<&str>) -> Result<fetch::Reply> {
+        Err(anyhow!("offline read attempted a forge request ({api_path})"))
+    }
+}
+
+/// The process-wide floor: `None` until a pass has resolved one.
+fn floor_cell() -> &'static Mutex<Option<Option<String>>> {
+    static CELL: OnceLock<Mutex<Option<Option<String>>>> = OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn set_floor(floor: Option<String>) {
+    if let Ok(mut guard) = floor_cell().lock() {
+        *guard = Some(floor);
+    }
+}
+
+/// The fleet-wide minimum Loom version (`loom_min_version`, `X.Y.Z`) in force
+/// on this host, as of the last fleet-sync pass; `None` when the store sets
+/// none, when no pass has run, or when `fleet.repo` is unset. Updated every
+/// tick without a restart. The self-update loop reads it every tick to drive
+/// floor rolls ([`crate::auto_update::floor_roll`], #10712).
+#[must_use]
+pub fn loom_min_version() -> Option<String> {
+    floor_cell().lock().ok().and_then(|g| g.clone().flatten())
+}
+
+/// #10719: the `repo_ahead_target` roll demand, beside the floor. The highest
+/// daemon version a registered workspace NEEDS and this host does not run.
+pub use crate::workspace_hold::repo_ahead_min;
+
+/// The last good floor for this pass to fall back on: this process's value
+/// once a pass has resolved one, else what the previous process recorded in
+/// its snapshot — so a malformed value right after a restart still cannot
+/// silently drop a floor.
+fn last_good_floor() -> Option<String> {
+    if let Some(resolved) = floor_cell().lock().ok().and_then(|g| g.clone()) {
+        return resolved;
+    }
+    cached_status()
+        .or_else(probe_status)
+        .and_then(|s| s.floor.floor)
 }
 
 // ============================================================================
@@ -485,6 +681,31 @@ pub struct FleetSyncStatus {
     /// drain-and-exit was refused and it merely held dispatch instead.
     #[serde(default = "default_enforced")]
     pub enforced: Enforcement,
+    /// The fleet version floor this pass resolved (#10711). `#[serde(default)]`
+    /// so a pre-#10711 snapshot still reads back, and omitted when unset so a
+    /// host with no floor writes the same snapshot it did before.
+    #[serde(default, skip_serializing_if = "FloorPass::is_unset")]
+    pub floor: FloorPass,
+    /// Each registered workspace's installed-Loom state (#10718). Filled by
+    /// the timer after each pass ([`run_pass`] carries the previous findings
+    /// forward); omitted until a workspace pass has run.
+    #[serde(
+        default,
+        skip_serializing_if = "workspace_resync::WorkspacePass::is_unset"
+    )]
+    pub workspaces: workspace_resync::WorkspacePass,
+    /// Each registered workspace's main checkout, as the last checkout pass
+    /// found it (#10869). `#[serde(default)]` so an older snapshot still reads
+    /// back, and omitted until a checkout pass has run.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checkouts: Vec<checkout_ff::CheckoutReport>,
+    /// Why the last checkout step checked nothing, when it did not
+    /// ([`checkout_ff::BUSY_NOTE`]); `checkouts` are then from before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkouts_note: Option<String>,
+    /// Each desired repo's per-repo fleet tier (#11738); omitted when unset.
+    #[serde(default, skip_serializing_if = "repo_config::RepoConfigPass::is_unset")]
+    pub repo_config: repo_config::RepoConfigPass,
 }
 
 fn default_enforced() -> Enforcement {
@@ -495,13 +716,18 @@ impl FleetSyncStatus {
     /// Whether anything is out of sync with the store.
     #[must_use]
     pub fn drifted(&self) -> bool {
-        self.config.drifted() || self.roster.drifted()
+        self.config.drifted() || self.roster.drifted() || self.repo_config.drifted()
     }
 
-    /// Whether either half of the pass failed.
+    /// Whether either half of the pass failed, or the floor could not be read
+    /// (#10711) — which routes a malformed floor through the same warn log and
+    /// [`DRIFT_TOPIC`] alert as every other fleet-sync failure.
     #[must_use]
     pub fn errored(&self) -> bool {
-        self.config.error.is_some() || self.roster.error.is_some()
+        self.config.error.is_some()
+            || self.roster.error.is_some()
+            || self.floor.error.is_some()
+            || self.repo_config.error.is_some()
     }
 }
 
@@ -534,6 +760,7 @@ pub fn publish(status: &FleetSyncStatus) {
     if let Ok(mut guard) = cell().lock() {
         *guard = Some(status.clone());
     }
+    applied::record_pass(status);
     let Some(path) = status_path() else {
         return;
     };
@@ -542,10 +769,49 @@ pub fn publish(status: &FleetSyncStatus) {
     }
 }
 
+/// Put a finished workspace pass (#10718) on the current snapshot. Before the
+/// first snapshot exists there is nothing to update; the timer's next publish
+/// carries it.
+fn publish_workspaces(found: &workspace_resync::WorkspacePass) {
+    let updated = cell().lock().ok().and_then(|mut guard| {
+        let status = guard.as_mut()?;
+        status.workspaces.clone_from(found);
+        Some(status.clone())
+    });
+    let (Some(status), Some(path)) = (updated, status_path()) else {
+        return;
+    };
+    if let Err(e) = write_status(&path, &status) {
+        log::warn!("fleet_sync: could not write {}: {e:#}", path.display());
+    }
+}
+
+/// Put a finished checkout step (#10869) on the current snapshot, as
+/// [`publish_workspaces`] does for the workspace pass: its reports, or (with
+/// `found` `None`) only the note saying why it checked nothing.
+fn publish_checkouts(found: Option<&[checkout_ff::CheckoutReport]>, note: Option<&str>) {
+    let updated = cell().lock().ok().and_then(|mut guard| {
+        let status = guard.as_mut()?;
+        if let Some(found) = found {
+            status.checkouts = found.to_vec();
+        }
+        status.checkouts_note = note.map(str::to_string);
+        Some(status.clone())
+    });
+    let (Some(status), Some(path)) = (updated, status_path()) else {
+        return;
+    };
+    if let Err(e) = write_status(&path, &status) {
+        log::warn!("fleet_sync: could not write {}: {e:#}", path.display());
+    }
+}
+
 fn write_status(path: &Path, status: &FleetSyncStatus) -> Result<()> {
     let mut body = serde_json::to_vec_pretty(status)?;
     body.push(b'\n');
-    fetch::write_atomic(path, &body)
+    fetch::write_atomic(path, &body)?;
+    crate::config_journal::record_sync(status); // J3 shadow, after the legacy write
+    Ok(())
 }
 
 /// The last pass this process recorded, if any.
@@ -577,15 +843,33 @@ pub fn probe_status() -> Option<FleetSyncStatus> {
 /// Remove a snapshot left behind by an earlier, configured run. Called when
 /// `fleet.repo` is no longer set, so `loom-daemon status` never reports a store
 /// this host has stopped reading.
+///
+/// Also forgets the process-wide floor (#10792): with no store there is no
+/// floor, so [`loom_min_version`] returns `None` and [`last_good_floor`] finds
+/// neither a cell value nor a file. The cell goes back to "no pass has run",
+/// not `Some(None)`. A config *error* (`Err` from `resolve_config`) does not
+/// come through here: keeping the last good floor is the safe failure.
 pub fn clear_status() {
+    if let Ok(mut guard) = floor_cell().lock() {
+        *guard = None;
+    }
+    // The in-memory snapshot also carries the floor ([`last_good_floor`] reads
+    // it), so it goes too; otherwise the "forgotten" floor would come back.
+    if let Ok(mut guard) = cell().lock() {
+        *guard = None;
+    }
+    applied::clear();
     let Some(path) = status_path() else {
         return;
     };
     match std::fs::remove_file(&path) {
-        Ok(()) => log::info!(
-            "fleet_sync: no fleet store configured — removed the stale snapshot {}",
-            path.display()
-        ),
+        Ok(()) => {
+            log::info!(
+                "fleet_sync: no fleet store configured — removed the stale snapshot {}",
+                path.display()
+            );
+            crate::config_journal::record_sync_cleared();
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => log::debug!("fleet_sync: could not remove {}: {e:#}", path.display()),
     }
@@ -614,7 +898,24 @@ pub fn render_line(status: Option<&FleetSyncStatus>, now: DateTime<Utc>) -> Opti
     }
     head.push(')');
     let mut lines = vec![head];
-    lines.extend(state_lines(s));
+    if s.config.host_not_in_store {
+        lines.push(format!(
+            "  {}: `{}` names no store host; this host runs on its last rendered config. Set \
+             LOOM_HOST_ID or fleet.hostId to its roster name (#11740)",
+            identity::NOT_IN_STORE.to_uppercase(),
+            s.host
+        ));
+    }
+    lines.extend(status_lines::state_lines(s));
+    lines.extend(status_lines::floor_lines(&s.floor));
+    let interval = std::time::Duration::from_secs(s.interval_secs);
+    lines.extend(s.workspaces.lines_at(Some((now, interval))));
+    lines.extend(checkout_ff::lines(&s.checkouts));
+    lines.extend(
+        s.checkouts_note
+            .iter()
+            .map(|note| format!("  checkouts: {note}")),
+    );
     for tier in &s.config.tiers {
         let detail = tier.detail.as_deref().unwrap_or("in sync");
         let verb = if tier.wrote {
@@ -637,6 +938,7 @@ pub fn render_line(status: Option<&FleetSyncStatus>, now: DateTime<Utc>) -> Opti
     for d in &s.roster.drift {
         lines.push(format!("  roster: DRIFT — {d}"));
     }
+    lines.extend(roster_clone::lines(&s.roster.clones));
     if s.roster.applied > 0 || s.roster.unapplied > 0 {
         lines.push(format!(
             "  roster: {} applied, {} unapplied",
@@ -646,6 +948,7 @@ pub fn render_line(status: Option<&FleetSyncStatus>, now: DateTime<Utc>) -> Opti
     if let Some(e) = &s.roster.error {
         lines.push(format!("  roster: ERROR (fail-closed) — {e}"));
     }
+    lines.extend(repo_config::lines(&s.repo_config));
     if !s.drifted() && !s.errored() {
         lines.push("  host matches the store".to_string());
     } else if !s.auto_apply && s.drifted() {
@@ -656,50 +959,6 @@ pub fn render_line(status: Option<&FleetSyncStatus>, now: DateTime<Utc>) -> Opti
         );
     }
     Some(lines.join("\n"))
-}
-
-/// The run-state lines of the `Fleet store:` block (#9598) — the *desired*
-/// state the store named, and the *actual* enforcement this host applied.
-///
-/// Empty when the pass resolved no state at all (a store with no
-/// `fleet/state.yml`, a first boot behind an unreachable forge), except that a
-/// read *error* is always reported: "the state could not be read" is the one
-/// thing an operator must not have to infer from silence.
-fn state_lines(s: &FleetSyncStatus) -> Vec<String> {
-    let mut lines = Vec::new();
-    if let Some(desired) = s.state.desired {
-        let from = match s.state.source.as_deref() {
-            Some("host") => "host entry",
-            Some(_) => "fleet default",
-            None => "unknown entry",
-        };
-        let how = if s.state.from_last_recorded {
-            ", from this host's LAST RECORDED state — no snapshot was readable"
-        } else if s.state.cached {
-            ", from a CACHED snapshot"
-        } else {
-            ""
-        };
-        let actual = match s.enforced {
-            Enforcement::Proceed => "dispatching normally",
-            Enforcement::Hold => "new dispatch HELD, in-flight work finishes",
-            Enforcement::Stop => "refusing to start / draining to exit",
-        };
-        lines.push(format!("  run state: desired {} ({from}{how}) -> {actual}", desired.as_str()));
-        for (k, v) in [
-            ("by", &s.state.by),
-            ("since", &s.state.since),
-            ("reason", &s.state.reason),
-        ] {
-            if let Some(v) = v {
-                lines.push(format!("    {k}: {v}"));
-            }
-        }
-    }
-    if let Some(e) = &s.state.error {
-        lines.push(format!("  run state: NOT ENFORCED — {e}"));
-    }
-    lines
 }
 
 // ============================================================================
@@ -715,6 +974,7 @@ struct PassInputs {
     cache: PathBuf,
     interval: Duration,
     auto_apply: bool,
+    clones: roster_clone::CloneConfig,
 }
 
 /// Run one complete pass (config tiers + roster) against the real forge. Pure
@@ -728,11 +988,13 @@ fn run_pass(inputs: &PassInputs, pass: &str, mode: Mode, now: DateTime<Utc>) -> 
     // make a `stopped` host look like it converged before it was told to stop.
     // The fallback is this host's *last recorded* state (see `state_pass`), so a
     // forge outage with a wiped cache still cannot resume a stopped host.
+    // #11740: a generated id the store does not know may adopt its roster name.
+    let host = identity::pass_host(&transport, &inputs.cache, &inputs.location, &inputs.host, now);
     let state = fleet_state::state_pass(
         &transport,
         &inputs.cache,
         &inputs.location,
-        &inputs.host,
+        &host,
         last_recorded_state(),
         now,
     );
@@ -745,7 +1007,7 @@ fn run_pass(inputs: &PassInputs, pass: &str, mode: Mode, now: DateTime<Utc>) -> 
             &transport,
             &inputs.cache,
             &inputs.location,
-            &inputs.host,
+            &host,
             &machine_path,
             &local_path,
             mode,
@@ -759,11 +1021,22 @@ fn run_pass(inputs: &PassInputs, pass: &str, mode: Mode, now: DateTime<Utc>) -> 
             ..ConfigPass::default()
         },
     };
-    let roster = roster_half(inputs, &transport, &config, mode, now);
+    // #11218: only a timer pass on a host free to dispatch clones.
+    let clone = pass == "timer" && enforced == Enforcement::Proceed;
+    let (roster, repo_config) = roster_half(inputs, &transport, &config, (mode, clone), now);
+    // #10711: the floor, from the snapshot the halves above just refreshed,
+    // into the process-wide value — never the config tiers, whose
+    // `autonomous.autoUpdate` changes need a restart.
+    let floor = floor_half(&inputs.cache, &inputs.location, last_good_floor().as_deref(), now);
+    // #10885: a floor that differs from the previous pass's wakes the
+    // self-update loop, so it acts now and not at its next interval.
+    floor_knowledge::record_floor(&floor);
+    // J3 shadow (#11349): config as resolved after this pass (deduplicated).
+    crate::config_journal::record_resolved(&inputs.workspace);
     FleetSyncStatus {
         repo: inputs.location.repo.clone(),
         reference: inputs.location.reference.clone(),
-        host: inputs.host.clone(),
+        host,
         pass: pass.to_string(),
         at: now,
         interval_secs: inputs.interval.as_secs(),
@@ -772,6 +1045,13 @@ fn run_pass(inputs: &PassInputs, pass: &str, mode: Mode, now: DateTime<Utc>) -> 
         roster,
         state,
         enforced,
+        floor,
+        // The last workspace pass's findings, until this tick's replace them.
+        workspaces: cached_status().map(|s| s.workspaces).unwrap_or_default(),
+        // Likewise the last checkout pass's (#10869).
+        checkouts: cached_status().map(|s| s.checkouts).unwrap_or_default(),
+        checkouts_note: cached_status().and_then(|s| s.checkouts_note),
+        repo_config,
     }
 }
 
@@ -785,7 +1065,8 @@ fn last_recorded_state() -> Option<crate::fleet_store::state::RunState> {
         .and_then(|s| s.state.desired)
 }
 
-/// The roster half of [`run_pass`]. Skipped outright when the config half was
+/// The roster half of [`run_pass`], and the per-repo fleet tier (#11738) from
+/// the same fail-closed snapshot. Skipped outright when the config half was
 /// served from the cache: the roster is fail-closed with no cached fallback, so
 /// a forge that could not confirm the config commit cannot confirm the roster
 /// either, and a second failing fetch would only turn a known-unreachable forge
@@ -794,11 +1075,18 @@ fn roster_half(
     inputs: &PassInputs,
     transport: &dyn Transport,
     config: &ConfigPass,
-    mode: Mode,
+    (mode, clone): (Mode, bool),
     now: DateTime<Utc>,
-) -> RosterPass {
+) -> (RosterPass, repo_config::RepoConfigPass) {
+    let failed = |error: String| {
+        let roster = RosterPass {
+            error: Some(error),
+            ..RosterPass::default()
+        };
+        (roster, repo_config::RepoConfigPass::default())
+    };
     if config.cached {
-        return RosterPass {
+        let roster = RosterPass {
             skipped: Some(
                 "the forge was unreachable this pass and the roster is fail-closed (no cached \
                  fallback)"
@@ -806,71 +1094,68 @@ fn roster_half(
             ),
             ..RosterPass::default()
         };
+        return (roster, repo_config::RepoConfigPass::default());
     }
     let registry_path = match crate::workspace_registry::default_registry_path() {
         Ok(p) => p,
-        Err(e) => {
-            return RosterPass {
-                error: Some(format!("{e:#}")),
-                ..RosterPass::default()
-            }
-        }
+        Err(e) => return failed(format!("{e:#}")),
     };
     let registry = match crate::workspace_registry::WorkspaceRegistry::load(&registry_path) {
         Ok(r) => r,
-        Err(e) => {
-            return RosterPass {
-                error: Some(format!("reading {}: {e:#}", registry_path.display())),
-                ..RosterPass::default()
-            }
-        }
+        Err(e) => return failed(format!("reading {}: {e:#}", registry_path.display())),
     };
     let registered: Vec<Registered> = registry
         .workspaces
         .iter()
         .map(|w| Registered {
             root: w.root.clone(),
-            priority: w.priority,
+            weight: w.weight,
+            maintain_only: w.maintain_only.is_some(),
         })
         .collect();
     let Some(home) = dirs::home_dir() else {
-        return RosterPass {
-            error: Some("no home directory".to_string()),
-            ..RosterPass::default()
-        };
+        return failed("no home directory".to_string());
     };
-    let plan = roster_pass(
-        transport,
-        &inputs.cache,
-        &inputs.location,
-        &home,
-        &registered,
-        &crate::workspace_registry::normalize_path,
-        &|p: &Path| p.join(".git").exists(),
-        now,
-    );
-    match plan {
-        Ok(plan) => summarize_roster(&plan, mode == Mode::Write && inputs.auto_apply, &mut |c| {
-            apply_change(&registry_path, c)
-        }),
-        Err(e) => RosterPass {
-            error: Some(format!("{e:#}")),
-            ..RosterPass::default()
-        },
-    }
+    let is_cloned = |p: &Path| p.join(".git").exists();
+    let loaded =
+        match fetch::load(transport, &inputs.cache, &inputs.location, Policy::FailClosed, now) {
+            Ok(l) => l,
+            Err(e) => return failed(format!("{e:#}")),
+        };
+    let normalize = crate::workspace_registry::normalize_path;
+    let plan = match plan_snapshot(&loaded.snapshot, &home, &registered, &normalize, &is_cloned) {
+        Ok(plan) => plan,
+        Err(e) => return failed(format!("{e:#}")),
+    };
+    let clones = if clone {
+        let memory = roster_clone::memory::global();
+        roster_clone::Clones::on(&roster_clone::GitCloner, inputs.clones, memory, Instant::now())
+    } else {
+        roster_clone::Clones::off()
+    };
+    let write = mode == Mode::Write && inputs.auto_apply;
+    let roster =
+        roster_clone::summarize(&plan, write, &clones, &mut |c| apply_change(&registry_path, c));
+    // After the roster, so a repo cloned this pass gets its tier this pass.
+    let repos = repo_config::pass(&loaded.snapshot, &home, &is_cloned, mode, now);
+    (roster, repos)
 }
 
 /// Log one pass at the level its findings deserve, and publish a drift record
 /// on the event bus when there is something to say.
 fn report(status: &FleetSyncStatus, bus: Option<&crate::event_bus::EventBus>) {
     let summary = render_line(Some(status), status.at).unwrap_or_default();
-    if status.errored() {
+    if status.config.host_not_in_store {
+        log::error!("fleet_sync: {summary}");
+    } else if status.errored() {
         log::warn!("fleet_sync: {summary}");
     } else if status.drifted() {
         log::info!("fleet_sync: {summary}");
     } else {
         log::debug!("fleet_sync: {summary}");
     }
+    roster_clone::announce(status, bus);
+    loom_ui::report(status); // #11295
     let (Some(bus), true) = (bus, status.drifted() || status.errored()) else {
         return;
     };
@@ -956,13 +1241,36 @@ pub async fn start(
                 workspace.display()
             );
             clear_status();
+            // #11029: "unset" is only trustworthy when every config tier was
+            // readable. A tier that failed to read may be the one carrying
+            // `fleet.repo`; running as `NoStore` would chase the latest
+            // release. Treat that as a fleet host with an unknown floor.
+            let dead = crate::config_resolver::unreadable_tiers(workspace);
+            if let Some((path, why)) = dead.first() {
+                let why = format!(
+                    "config tier {} is unreadable ({why}), so whether this host reads a fleet \
+                     store is not known",
+                    path.display()
+                );
+                log::warn!("fleet_sync: {why} — treating the fleet floor as unknown");
+                floor_knowledge::set_unreadable_config(why);
+                return None;
+            }
+            // #10885: not a fleet host, so it has no floor by definition.
+            floor_knowledge::set_store_mode(floor_knowledge::StoreMode::Absent);
             return None;
         }
         Err(e) => {
+            // #10885: a store is named but unusable. Still a fleet host: its
+            // floor is unknown, never absent.
+            floor_knowledge::set_store_mode(floor_knowledge::StoreMode::Configured);
             log::warn!("fleet_sync: disabled — {e:#}");
             return None;
         }
     };
+    // #10885: from here on this is a fleet host, whether or not syncing can
+    // start. Until a pass resolves a floor it is unknown, never absent.
+    floor_knowledge::set_store_mode(floor_knowledge::StoreMode::Configured);
     let host = crate::sweep_registry::host_identity();
     if let Err(e) = store::validate_host(&host) {
         log::warn!("fleet_sync: disabled — {e:#}");
@@ -977,7 +1285,7 @@ pub async fn start(
     };
     // A repo that delegates daemon administration elsewhere must not have its
     // workspace registry rewritten from here either — the same refusal
-    // `loom-daemon workspace add/remove/set-priority` makes (#5345), applied to
+    // `loom-daemon workspace add/remove/set-weight` makes (#5345), applied to
     // the unattended path.
     let auto_apply = match crate::config_resolver::daemon_delegated_to(workspace) {
         Some(delegate) if config.auto_apply => {
@@ -996,6 +1304,7 @@ pub async fn start(
         cache,
         interval: config.interval,
         auto_apply,
+        clones: roster_clone::resolve_config(&effective, &|k| std::env::var(k).ok()),
     };
     log::info!(
         "fleet_sync: enabled — store {} @ {}, host {}, every {}s, autoApply={auto_apply}",
@@ -1004,8 +1313,11 @@ pub async fn start(
         inputs.host,
         inputs.interval.as_secs()
     );
+    workspace_resync::mark_boot();
+    let mut inputs = inputs;
     let state = startup_pass(&inputs, bus.as_deref()).await;
-    // Diverges on `stopped`: this host is not meant to be up at all.
+    inputs.host = identity::adopted().unwrap_or(inputs.host); // #11740
+                                                              // Diverges on `stopped`: this host is not meant to be up at all.
     let hold_note = fleet_state::enforce_at_boot(&state, &inputs.host, &inputs.location.repo).await;
     Some(Started {
         hold_note,
@@ -1028,16 +1340,23 @@ pub async fn start(
 /// `fleet.syncIntervalSecs` and enforces then.
 async fn startup_pass(inputs: &PassInputs, bus: Option<&crate::event_bus::EventBus>) -> StatePass {
     let owned = inputs.clone();
-    let join =
-        tokio::task::spawn_blocking(move || run_pass(&owned, "startup", Mode::Write, Utc::now()));
+    let join = tokio::task::spawn_blocking(move || {
+        let mut status = run_pass(&owned, "startup", Mode::Write, Utc::now());
+        // #10869: inside the startup pass, so a daemon that just rolled
+        // dispatches from the checkout its new installed files are in.
+        let moved = checkout_ff::startup(&owned, &mut status);
+        (status, moved)
+    });
     let capped = match resolve_startup_timeout(&|k| std::env::var(k).ok()) {
         Some(cap) => tokio::time::timeout(cap, join).await.map_err(|_| cap),
         None => Ok(join.await),
     };
     match capped {
-        Ok(Ok(status)) => {
+        Ok(Ok((status, moved))) => {
+            workspace_resync::mark_verified();
             publish(&status);
             report(&status, bus);
+            checkout_ff::announce(&moved, bus);
             status.state
         }
         Ok(Err(e)) => {
@@ -1077,6 +1396,16 @@ fn spawn_timer(
         } else {
             Mode::Check
         };
+        // #10718: the workspace resync also runs once at startup, now that the
+        // startup pass is done and the drain state exists. It runs on its own
+        // task (one at a time), so nothing here ever waits for git.
+        //
+        // #10869: the checkout half runs on that same task, right after the
+        // resync pass, so a resync this host just pushed is fast-forwarded to
+        // in the same pass and the two never run at once.
+        let then = || checkout_ff::after_resync(&inputs, &enforcer, &bus);
+        let (step, after) = then();
+        workspace_resync::spawn_pass(&inputs, mode, &enforcer, &bus, step, after);
         loop {
             tokio::time::sleep(inputs.interval).await;
             let owned = inputs.clone();
@@ -1091,8 +1420,15 @@ fn spawn_timer(
                     if let Some(e) = enforcer.as_deref() {
                         enforce(&mut status, e, bus.as_deref());
                     }
+                    status.workspaces = workspace_resync::latest();
                     publish(&status);
                     report(&status, bus.as_deref());
+                    // #10718: last, so the floor is current and a hold this
+                    // pass just placed is already in the drain flag. Not
+                    // awaited: see `workspace_resync::host`.
+                    workspace_resync::mark_verified();
+                    let (step, after) = then();
+                    workspace_resync::spawn_pass(&inputs, mode, &enforcer, &bus, step, after);
                 }
                 Err(e) => log::warn!("fleet_sync: a timer pass panicked: {e}"),
             }

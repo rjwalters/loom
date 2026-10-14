@@ -65,7 +65,6 @@ fn every_mapped_claim_name_is_an_inventoried_op() {
         "roster.comments",
         "claim.pr_labels",
         "sequence.predecessor",
-        "claim.pr_list_by_head",
         "intake.list_open",
         "quarantine.issue_list",
         "claim.issue_reclaim",
@@ -74,16 +73,21 @@ fn every_mapped_claim_name_is_an_inventoried_op() {
         "quarantine.issue_release",
         "heal.issue_add_label",
         "intake.add_triage",
+        "intake.remove_triage",
         "verdict.clear_labels",
+        "verdict.requeue_unanchored",
         "sequence.pr_edit",
         "review_conflict.pr_edit",
         "verdict.anchor_comment",
         "verdict.reanchor_comment",
         "verdict.stale_comment",
+        "verdict.requeue_unanchored_comment",
         "sequence.pr_comment",
         "review_conflict.pr_comment",
         "roster.delete",
         "roster.patch",
+        "sequence.comment_patch",
+        "sequence.comment_delete",
         "guard.open_pr_timeline",
         "outcome.label_timeline",
         "guard.open_pr_graphql",
@@ -92,6 +96,7 @@ fn every_mapped_claim_name_is_an_inventoried_op() {
         "quarantine.label",
         "quarantine.release",
         "restore.label",
+        "restore.label_timeline",
         "prless.hold_label",
         "guard.lease_comment",
         "guard.lease_yield_comment",
@@ -100,17 +105,16 @@ fn every_mapped_claim_name_is_an_inventoried_op() {
         "watchdog.stale_comment",
         "outcome.writeback_comment",
         "prless.comment",
+        "park_hold.issue_view",
+        "release_veto.issue_labels",
+        "park_hold.issue_body",
+        "park_hold.issue_labels",
     ];
     for name in mapped {
         let op = gh_call::forge_op_for(name).unwrap_or_else(|| panic!("{name} is unmapped"));
         assert!(ops::ALL_INVENTORIED.contains(&op), "{name} -> {op:?} not inventoried");
     }
-    for deliberate in [
-        "claim.issue_state",
-        "claim.issue_labels",
-        "star.api",
-        "sequence.pr_view",
-    ] {
+    for deliberate in ["claim.issue_state", "claim.issue_labels", "star.api"] {
         assert_eq!(gh_call::forge_op_for(deliberate), None, "{deliberate}");
     }
 }
@@ -166,7 +170,7 @@ fn gh_json_is_one_counted_read_under_its_operation() {
     let mut got = None;
     let (rows, _) = report_after(|| {
         got = Some(gh_json::<serde_json::Value, _>(
-            "jev.tier_issue_view",
+            "test.gh_json_issue_view",
             &gh,
             &["issue", "view", "3", "--json", "number"],
             tmp.path(),
@@ -175,7 +179,7 @@ fn gh_json_is_one_counted_read_under_its_operation() {
         ));
     });
     assert!(matches!(got, Some(Query::Populated(_))), "{got:?}");
-    assert_eq!(calls(&rows, "jev.tier_issue_view"), 1, "{rows:?}");
+    assert_eq!(calls(&rows, "test.gh_json_issue_view"), 1, "{rows:?}");
 }
 
 /// The write-scope probe runs under the credential it is testing: the

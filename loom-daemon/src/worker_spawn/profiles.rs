@@ -70,6 +70,18 @@ pub struct ModelProfile {
     pub provider_definition: BTreeMap<String, Value>,
     #[serde(default)]
     pub allowed_efforts: Vec<String>,
+    /// How this profile is billed (#10749): `subscription` (a flat-rate plan,
+    /// e.g. the z.ai coding plan), `api` (metered) or `local`. Absent: a
+    /// profile that reads a provider credential is treated as metered.
+    pub billing: Option<String>,
+    /// Roles this profile must never be admitted for (#11400), e.g.
+    /// `["judge", "curator"]` on `zai-flash`: review and triage stay off the
+    /// model. Enforced at runtime admission for every selection source — a
+    /// preference entry is skipped as `not-admitted(excludedRole)`, an
+    /// explicit pin / role binding / env pin is refused with the reason. Names
+    /// must be known roles (`loom-daemon validate` rejects anything else).
+    #[serde(default)]
+    pub excluded_roles: Vec<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -147,6 +159,86 @@ pub fn lookup(name: Option<&str>, config: &Value) -> Result<(String, ModelProfil
         return Err(LaunchError::config("model profile has an empty model or effort"));
     }
     Ok((name, profile))
+}
+
+/// Unit name of the admission refusal a profile's `excludedRoles` produces,
+/// rendered in a preference walk as `not-admitted(excludedRole)` (#11400).
+pub const EXCLUDED_ROLE: &str = "excludedRole";
+
+/// The model profile a native launch of `runtime` would resolve, when that
+/// profile lists `role` (canonical name) in its `excludedRoles` (#11400).
+///
+/// `profile` is the explicitly chosen profile (a preference tap's
+/// `modelProfile`); `None` falls back exactly as [`lookup`] does for a launch —
+/// `LOOM_MODEL_PROFILE`, then `runtimes.defaultModelProfile`, then the bundled
+/// `zai-flash` default — so a bare `opencode` binding is judged against the
+/// profile it would actually run. Returns `None` (no objection) for a
+/// non-native runtime, an unknown profile (the launch itself fails closed on
+/// that), or a profile with no provider for this harness (it cannot be the
+/// model that harness runs).
+#[must_use]
+pub fn excluded_role(
+    runtime: &str,
+    profile: Option<&str>,
+    role: &str,
+    config: &Value,
+) -> Option<String> {
+    if !super::is_native(runtime) {
+        return None;
+    }
+    let env_profile = super::nonempty_env("LOOM_MODEL_PROFILE");
+    let requested = profile
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .or(env_profile.as_deref());
+    let (name, resolved) = lookup(requested, config).ok()?;
+    if !resolved.providers.contains_key(runtime) {
+        return None;
+    }
+    resolved
+        .excluded_roles
+        .iter()
+        .any(|listed| crate::runtime_admission::canonical_role(listed) == Some(role))
+        .then_some(name)
+}
+
+/// `loom-daemon validate` findings for `excludedRoles` (#11400): every entry,
+/// in configured `runtimes.modelProfiles` and in the bundled set, must name a
+/// known role. An unknown name would silently exclude nothing.
+#[must_use]
+pub fn check_excluded_roles_config(config: &Value) -> Vec<String> {
+    fn unknown_roles(origin: &str, name: &str, roles: &[String]) -> Option<String> {
+        let unknown: Vec<&str> = roles
+            .iter()
+            .map(String::as_str)
+            .filter(|role| crate::runtime_admission::canonical_role(role).is_none())
+            .collect();
+        (!unknown.is_empty()).then(|| {
+            format!("{origin}.{name}.excludedRoles: unknown role name(s): {}", unknown.join(", "))
+        })
+    }
+    let mut findings = Vec::new();
+    if let Some(Value::Object(map)) = config.pointer("/runtimes/modelProfiles") {
+        for (name, profile) in map {
+            match profile.get("excludedRoles") {
+                None | Some(Value::Null) => {}
+                Some(Value::Array(entries)) => {
+                    let roles: Vec<String> = entries
+                        .iter()
+                        .map(|e| e.as_str().map_or_else(|| e.to_string(), str::to_string))
+                        .collect();
+                    findings.extend(unknown_roles("runtimes.modelProfiles", name, &roles));
+                }
+                Some(_) => findings.push(format!(
+                    "runtimes.modelProfiles.{name}.excludedRoles must be an array of role names"
+                )),
+            }
+        }
+    }
+    for (name, profile) in bundled() {
+        findings.extend(unknown_roles("model-profiles.json", &name, &profile.excluded_roles));
+    }
+    findings
 }
 
 /// One harness's credential mapping: (source variable, child variable) pairs,
@@ -271,6 +363,33 @@ pub fn resolve(
     name: &str,
     profile: &ModelProfile,
 ) -> Result<Selection, LaunchError> {
+    let (selection, required) = resolve_shape(runtime, name, profile)?;
+    require_set(name, &required)?;
+    Ok(selection)
+}
+
+/// Fail closed (78) when a required credential variable is unset or empty.
+pub fn require_set(name: &str, required: &[String]) -> Result<(), LaunchError> {
+    let unset = missing(required);
+    if !unset.is_empty() {
+        return Err(LaunchError::config(format!(
+            "model profile '{name}' requires environment variables that are unset: {}",
+            unset.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+/// [`resolve`] minus its "required variables are set" check, returning the
+/// set it would have checked (#9473). A launch routed through the LLM gateway
+/// never reads those variables — the gateway's virtual key replaces them — so
+/// [`select`] and `worker profile-check` apply [`require_set`] only when the
+/// profile is not routed.
+pub fn resolve_shape(
+    runtime: &str,
+    name: &str,
+    profile: &ModelProfile,
+) -> Result<(Selection, Vec<String>), LaunchError> {
     let provider = profile
         .providers
         .get(runtime)
@@ -292,11 +411,22 @@ pub fn resolve(
             ));
         }
     }
-    if let Some(proxy) = &profile.credential_proxy {
+    let mut credential_proxy = profile.credential_proxy.clone();
+    if let Some(proxy) = &mut credential_proxy {
         // Fail at selection, not at dispatch: a malformed upstream is a
         // misconfiguration that must never reach a launch that then decides
         // what to do about it.
         proxy.validate()?;
+        // The config-side base URL override writes OpenCode's provider
+        // configuration; no other harness has a config contract this module
+        // writes. INERT on any other runtime rather than refused: a profile
+        // like the bundled `zai-flash` binds BOTH `opencode` (which needs it)
+        // and `pi` (which must keep launching with the proxy flag off,
+        // #11714). When the flag is on and the armed runtime is left with no
+        // usable redirection, `egress_proxy::prepare_scoped` fails closed.
+        if runtime != "opencode" {
+            proxy.base_url_config = None;
+        }
         // Both counts must be 1, not just `pairs`: an array-form
         // `credentialEnv` with a `credentialTargets` map that only covers
         // one of its declared names still produces `pairs.len() == 1`, but
@@ -318,13 +448,6 @@ pub fn resolve(
             ));
         }
     }
-    let unset = missing(&mapping.required);
-    if !unset.is_empty() {
-        return Err(LaunchError::config(format!(
-            "model profile '{name}' requires environment variables that are unset: {}",
-            unset.join(", ")
-        )));
-    }
     let provider_options = provider_block(&profile.provider_options, runtime, "providerOptions")?;
     let provider_definition =
         provider_block(&profile.provider_definition, runtime, "providerDefinition")?;
@@ -338,7 +461,7 @@ pub fn resolve(
         .map(CredentialEnv::names)
         .unwrap_or_default();
     reject_literal_secrets(&blocks, &declared)?;
-    Ok(Selection {
+    let selection = Selection {
         provider,
         model: profile.model.clone(),
         effort: profile.effort.clone(),
@@ -348,8 +471,9 @@ pub fn resolve(
         provider_options,
         provider_definition,
         credential_pool: profile.credential_pool.clone(),
-        credential_proxy: profile.credential_proxy.clone(),
-    })
+        credential_proxy,
+    };
+    Ok((selection, mapping.required))
 }
 
 pub fn select(runtime: &str, options: &Options, config: &Value) -> Result<Selection, LaunchError> {
@@ -374,7 +498,13 @@ pub fn select(runtime: &str, options: &Options, config: &Value) -> Result<Select
         }
     }
     let (name, profile) = lookup(options.profile.as_deref(), config)?;
-    let mut selection = resolve(runtime, &name, &profile)?;
+    let (mut selection, required) = resolve_shape(runtime, &name, &profile)?;
+    // #9473: a routed launch takes its key from the LLM gateway, so its
+    // provider variables need not be set. An opted-in profile the gateway
+    // refuses is left to `spawn-worker`'s own `plan` call, which reports it.
+    if matches!(super::llm_gateway::plan(runtime, &selection, config), Ok(None)) {
+        require_set(&name, &required)?;
+    }
     if let Some(model) = options.model.clone() {
         if model != profile.model {
             return Err(LaunchError::config("bare model differs from the selected profile; use provider/model or define a model profile"));
@@ -420,6 +550,8 @@ mod tests {
             provider_options: BTreeMap::new(),
             provider_definition: BTreeMap::new(),
             allowed_efforts: Vec::new(),
+            billing: None,
+            excluded_roles: Vec::new(),
         }
     }
 
@@ -505,6 +637,58 @@ mod tests {
         );
     }
 
+    /// #9473: `resolve_shape` reports the required set instead of failing on
+    /// it (a gateway-routed launch never reads those variables), while
+    /// `resolve` — every unrouted caller — still fails closed exactly as before.
+    #[test]
+    fn resolve_shape_defers_the_required_check_that_resolve_still_enforces() {
+        let credential_targets = BTreeMap::from([(
+            "test-runtime".to_string(),
+            CredentialTargets::Map(BTreeMap::from([(
+                "LOOM_TEST_9473_NEVER_SET".to_string(),
+                "CHILD_KEY".to_string(),
+            )])),
+        )]);
+        let profile = profile_with_credentials(
+            CredentialEnv::Many(vec!["LOOM_TEST_9473_NEVER_SET".to_string()]),
+            credential_targets,
+        );
+        let (selection, required) = resolve_shape("test-runtime", "gw", &profile).unwrap();
+        assert_eq!(required, vec!["LOOM_TEST_9473_NEVER_SET"]);
+        assert_eq!(
+            selection.credentials,
+            vec![("LOOM_TEST_9473_NEVER_SET".to_string(), "CHILD_KEY".to_string())]
+        );
+        let error = resolve("test-runtime", "gw", &profile).unwrap_err();
+        assert!(error.message.contains("LOOM_TEST_9473_NEVER_SET"), "{}", error.message);
+    }
+
+    /// #11714: the bundled `zai-flash` profile binds BOTH `pi` and `opencode`,
+    /// and its `credentialProxy` block declares `baseUrlConfig` — an OpenCode
+    /// config contract. Selection must not refuse the `pi` binding for that:
+    /// an ordinary launch runs with the proxy flag off, so a hard refusal here
+    /// broke every default `pi` launch. `baseUrlConfig` is simply dropped from
+    /// a non-opencode selection (inert); the opencode selection keeps it.
+    #[test]
+    fn the_bundled_zai_flash_profile_resolves_for_both_runtimes_it_binds() {
+        let profile = bundled()
+            .get("zai-flash")
+            .cloned()
+            .expect("bundled zai-flash");
+        for runtime in ["pi", "opencode"] {
+            let (selection, _) = resolve_shape(runtime, "zai-flash", &profile)
+                .expect("every bound runtime resolves");
+            let proxy = selection
+                .credential_proxy
+                .expect("the proxy block survives selection");
+            assert_eq!(
+                proxy.base_url_config.as_deref(),
+                (runtime == "opencode").then_some("baseURL"),
+                "{runtime}: baseUrlConfig must be kept only for opencode"
+            );
+        }
+    }
+
     /// Regression for the Judge's blocking finding on #8701: an array-form
     /// `credentialEnv` with a `credentialTargets` map that only covers ONE
     /// of its declared names produces exactly one `credentials` pair — the
@@ -537,6 +721,8 @@ mod tests {
             upstream: "https://api.anthropic.com".to_string(),
             header: super::super::egress_proxy::HeaderStyle::AuthorizationBearer,
             base_url_env: vec!["ANTHROPIC_BASE_URL".to_string()],
+            observe: false,
+            base_url_config: None,
         });
 
         let error = resolve("test-runtime", "test-profile", &profile);

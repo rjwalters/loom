@@ -83,3 +83,18 @@ loom_source_remote_url() {
   [[ -n "$path" && -d "$path" ]] || return 0
   git -C "$path" remote get-url origin 2>/dev/null || true
 }
+
+# The install-metadata.json `requires_daemon` line for the source tree at
+# <path> (#10716): a leading newline, the indented `"requires_daemon": "X.Y.Z",`
+# pair, ready to splice after another field. Read from the tree's own
+# `loom-daemon/src/install_compat.rs` because the tree being installed can be
+# newer than any loom-daemon binary on this machine. Empty output when the tree
+# predates the contract; the field is then simply absent, which the daemon
+# reads as "compatible, resync owed".
+loom_source_requires_daemon_field() {
+  local path="$1" version
+  version="$(sed -n 's/^pub const REQUIRES_DAEMON: &str = "\([0-9][0-9.]*\)";$/\1/p' \
+    "$path/loom-daemon/src/install_compat.rs" 2>/dev/null)" || return 0
+  [[ -n "$version" ]] || return 0
+  printf '\n  "requires_daemon": "%s",' "$version"
+}

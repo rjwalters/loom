@@ -104,9 +104,11 @@ pub struct WorkFinderTickSummary {
     /// "not held". `#[serde(default)]` keeps pre-#4903 wire data compatible.
     #[serde(default)]
     pub saturation_held: bool,
-    /// Whether the build back-off (Issue #9410) was engaged for this tick,
-    /// even with nothing deferred. `#[serde(default)]` keeps pre-#9410 wire
-    /// data compatible.
+    /// Whether the build back-off (Issue #9410) was engaged for any repo this
+    /// tick (#10624: the hold is per repo), even with nothing deferred. The
+    /// `BUILD-BACKOFF-HELD` tag and the `build_backoff_held` tick result key on
+    /// [`deferred_build_backoff`](Self::deferred_build_backoff) instead.
+    /// `#[serde(default)]` keeps pre-#9410 wire data compatible.
     #[serde(default)]
     pub build_backoff_held: bool,
     /// Cumulative cross-host dispatch collisions observed by this tick's
@@ -129,6 +131,12 @@ pub struct WorkFinderTickSummary {
     /// missing from [`Self::queue`], which is then incomplete, not empty.
     #[serde(default)]
     pub listing_failed: Vec<String>,
+    /// Repos whose ready-issue listing returned only part of its queue on
+    /// this tick (#11139: a later page failed, the page cap, a mid-walk
+    /// change). Their rows are in [`Self::queue`], but not all of them: a
+    /// consumer must not read a missing row as "left the queue".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub listing_incomplete: Vec<String>,
     /// The dispatch plan this tick's rows were annotated with (Issue #9288):
     /// slots, tick interval, shard posture, scope and key ordering. `None`
     /// for a single-workspace tick (which records no rows) and for a
@@ -141,6 +149,28 @@ pub struct WorkFinderTickSummary {
     /// pre-#10214 payload and before the first tick.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cap: Option<CapView>,
+    /// Each workspace's per-repo limits as this tick resolved them (Issue
+    /// #11606), one entry per workspace the multi-workspace tick ran over.
+    /// Empty for a single-workspace tick and a pre-#11606 payload: that means
+    /// unknown, never "no repo is capped".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repo_limits: Vec<RepoLimitView>,
+}
+
+/// One workspace's per-repo dispatch limits, from the tick's own
+/// [`RepoCap`](crate::work_finder::RepoCap) state (Issue #11606).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RepoLimitView {
+    /// The workspace's repo root, as `listing_failed` names it.
+    pub repo: String,
+    /// The workspace's occupancy when the tick finished: the same
+    /// `WorkDispatcher::occupancy` count the per-repo cap gates on, plus this
+    /// tick's admissions.
+    pub in_flight: usize,
+    /// The resolved `maxConcurrentPerRepo`; `None` when uncapped.
+    pub cap: Option<usize>,
+    /// Ready candidates of this repo the tick deferred for the cap.
+    pub deferred_repo_cap: usize,
 }
 
 /// What holds a tick's effective concurrency cap where it is (Issue #10214).
@@ -238,8 +268,8 @@ impl CapView {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapacityWait {
     /// The work finder's gate: `capacity`, `ramp`, `saturation`,
-    /// `build-backoff`, `repo-cap`, `repo-slice`, `host-affinity` or
-    /// `host-class`.
+    /// `build-backoff`, `repo-cap` or `host-affinity` (`repo-slice` is
+    /// retired with the dispatch slice, #11682, and only read back).
     pub gate: String,
     /// For the `capacity` gate: which cap term binds, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -260,11 +290,11 @@ pub struct CapacityWait {
 
 impl CapacityWait {
     /// Whether this is a queue wait (a capacity-style gate that frees up as
-    /// work ahead completes), as opposed to a host refusal (`host-affinity`,
-    /// `host-class`), which no amount of waiting on this host resolves.
+    /// work ahead completes), as opposed to a host refusal (`host-affinity`),
+    /// which no amount of waiting on this host resolves.
     #[must_use]
     pub fn queued(&self) -> bool {
-        !matches!(self.gate.as_str(), "host-affinity" | "host-class")
+        self.gate != "host-affinity"
     }
 
     /// The short phrase naming what limits it, e.g. `disk-limited`.
@@ -281,7 +311,6 @@ impl CapacityWait {
             ("repo-cap", _) => "per-repo cap",
             ("repo-slice", _) => "outside this host's repo slice",
             ("host-affinity", _) => "host affinity names another host",
-            ("host-class", _) => "heavy sweep refused on this host class",
             _ => "deferred",
         }
     }
@@ -308,6 +337,14 @@ impl CapacityWait {
 }
 
 impl WorkFinderTickSummary {
+    /// Repos whose backlog this tick does not hold whole: those in
+    /// [`Self::listing_failed`] and those in [`Self::listing_incomplete`]
+    /// (#11139). A consumer that reads a missing row as "left the queue" or
+    /// "not held" uses this, not `listing_failed` alone.
+    pub fn listing_not_whole(&self) -> impl Iterator<Item = &String> {
+        self.listing_failed.iter().chain(&self.listing_incomplete)
+    }
+
     /// The single-line skip-reason summary `loom-daemon health` renders —
     /// only the non-zero terms, so a clean tick reads `12 seen, 2 dispatched`
     /// rather than a wall of zeros.
@@ -338,6 +375,9 @@ impl WorkFinderTickSummary {
                 parts.push(format!("{n} {label}"));
             }
         }
+        if !self.listing_incomplete.is_empty() {
+            parts.push(format!("{} listing-incomplete", self.listing_incomplete.len()));
+        }
         if self.collisions > 0 {
             parts.push(format!("{} cross-host-collision(s)", self.collisions));
         }
@@ -347,7 +387,10 @@ impl WorkFinderTickSummary {
         if self.saturation_held {
             parts.push("SATURATION-HELD".to_string());
         }
-        if self.build_backoff_held {
+        // Only when the back-off actually deferred something (#10624): with a
+        // per-repo hold some repo is often engaged, and the bare flag would
+        // tag nearly every tick.
+        if self.build_backoff_held && self.deferred_build_backoff > 0 {
             parts.push("BUILD-BACKOFF-HELD".to_string());
         }
         parts.join(", ")

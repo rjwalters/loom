@@ -2,8 +2,8 @@
 
 Loom's opt-in OTLP exporter carries completed spans alongside lifecycle logs and
 metrics. Trace IDs and span IDs are native OTLP fields, so a backend can join a
-log to its exact execution span. Enable the `otlp` Cargo feature and configure
-`observability.enabled`, `exporter: "otlp"`, an endpoint, and an ingest key file
+log to its exact execution span. Every build includes the exporter (#10700);
+configure `observability.enabled`, `exporter: "otlp"`, an endpoint, and an ingest key file
 as described in [observability](observability.md).
 
 ## Identity and process boundaries
@@ -13,7 +13,8 @@ carries are policy: [trace identity](trace-identity.md). An issue
 number never identifies an execution: retries and restarts of one issue are
 distinct executions, each with a root span ID derived from its sweep id. An
 issue sweep's trace ID, however, is its issue's **story trace** (#9037), keyed
-per harness-ops D32 v1 (#9068): trace ID and story root span ID are
+per story key v1 (#9068; owner doc: 2AMLogic/2am
+`infra/signoz/docs/story-trace.md`): trace ID and story root span ID are
 SHA-256-derived from `loom-story/v1:github:<repo_id>:<issue>`, where `repo_id`
 is GitHub's numeric id for the checkout's `origin` (resolved once per repo and
 cached), so every sweep of the issue, on any host and across renames, lands in
@@ -37,7 +38,7 @@ it rejects malformed, uppercase, and zero IDs.
 The story's GitHub-shaped **phase spans** are emitted by the 2AMLogic/2am
 storyline reconciler, not by Loom; Loom only derives and accepts their IDs
 (`story_span_id`, `sha256(input:span:<kind>:<source_event_id>)[0..8]`) over
-D32's closed kind list `STORY_SPAN_KINDS`, kept byte-for-byte in parity with
+the story key's closed kind list `STORY_SPAN_KINDS`, kept byte-for-byte in parity with
 2am's `vectors.json` (`loom-daemon/tests/fixtures/story_vectors_d32_v1.json`):
 `story.intake`, `story.queue_dwell`, `story.ci`, `story.ci.queue`,
 `story.ci.run`, `story.review_wait`, `story.rework`, `story.merge`,
@@ -159,15 +160,53 @@ Containerized dispatch forwards `TRACEPARENT` and `OTEL_*` by name into the
 container (`spawn-claude.sh`'s containment allowlist); before #9215 it dropped
 both silently while bare-metal dispatch on the same host worked.
 
-Phase timing has two explicit forms. An explicitly launched role has an observed
-start; its checkpoint completes that attempt. A role performed inside one
-third-party CLI session has only an observed checkpoint completion, represented
-as a zero-duration phase/role span. `loom.timing_source` distinguishes these from
-legacy polling observations. Checkpoint writes preserve repeated Judge rejections,
+The same opt-in covers the daemon's **scheduled** Claude sessions, not just
+sweeps (#10743): every role-runner tick (its launch carries the tick's
+`loom.role_attempt` context as `TRACEPARENT`, applied first) and every
+epic-supervisor role dispatch (no trace context of its own, so its spans are
+roots). With the opt-in on, those sessions' `OTEL_RESOURCE_ATTRIBUTES` is
+extended (never replaced) with `loom.role=<role>` and `loom.sweep_id=<tick or
+dispatch id>`, so per-request records group by role and tick.
+
+That opt-in points a session's exporter **directly** at an endpoint. To have
+launched sessions export **through the daemon** instead — identity bound and
+secrets scrubbed by the daemon, no separate collector — see the agent telemetry
+relay in [`observability.md` §3d](observability.md#3d-agent-telemetry-relay-issue-10964)
+(#10964); when both are on, the relay's endpoint wins.
+
+Phase timing has three explicit forms, distinguished by `loom.timing_source`
+(and from legacy polling observations):
+
+- **Explicitly launched role** (`owned_boundary`): a standalone worker process
+  has an observed start; its checkpoint completes that attempt.
+- **Begun sweep phase** (`checkpoint_begin_observed`, #9935): a role performed
+  as a subagent inside one orchestrator CLI session — every `/loom:sweep`
+  curator, builder, judge, doctor and merge phase — is opened at its dispatch
+  instant by `sweep-checkpoint begin ISSUE ROLE [--attempt N] [--model M]`.
+  That call is telemetry only: it never reads or writes the checkpoint file, so
+  resume (which keys on the file's `phase`) is unaffected. The phase's later
+  `*-done`/`judge-rejected` write completes the same attempt, which closes as
+  `owned_start_checkpoint_completion` with `loom.attempt.worked="true"` and a
+  duration equal to dispatch → checkpoint. Begun attempts carry `loom.issue`,
+  so parallel builders in one wave each complete their own. A re-dispatch of
+  the same phase closes the earlier still-open begin as `loom.result=superseded`
+  (`worked` absent); a begin never followed by its checkpoint is closed at
+  execution end as `exit_unobserved` / `terminal_observed` (`worked` absent).
+- **Completion only** (`checkpoint_write_observed` / `checkpoint_poll_observed`):
+  a checkpoint with no observed start — an older orchestrator prompt or binary
+  without `begin`, a phase skipped without a dispatch (e.g. an already-curated
+  issue), or a legacy poll — is represented as a zero-duration phase/role span
+  with `worked="false"`. That is the only legitimate zero-duration attempt. Checkpoint writes preserve repeated Judge rejections,
 Doctor completions, and subsequent Judge approvals even between daemon polls.
 The terminal checkpoint helper journals after its atomic write succeeds. It does
 not infer an earlier start or a missing verdict. A caller that bypasses that
 helper can provide only the phases that the daemon actually observes.
+Every checkpoint-observed phase and role span, and an owned attempt its
+checkpoint completes, also carries its execution root's `loom.repo` and
+`loom.sweep_id` (#10637), so it names the repository and sweep, not only the
+issue. `loom.repo` is GitHub's own `owner/name` spelling on every Loom span,
+the value `loom.dispatch.*` carries; where a repo keys a trace ID, the key is
+its ASCII lowercase ([trace identity](trace-identity.md)).
 
 `loom.attempt.worked` (#9420) is the companion a **duration** query needs:
 `"true"` when the span's interval measures an attempt that ran its stage's
@@ -179,8 +218,7 @@ synthetic zero-duration completion, the two `loom.timing_source` values in
 nothing either way, and guessing would publish a measurement that was never
 taken. Any percentile/dwell aggregate over `loom.role_attempt` must filter
 `loom.attempt.worked = "true"` — unconditioned, the `false` population
-dominates and the median collapses to milliseconds (see
-[`eta.md`](eta.md) § "Role-attempt stages: which percentile to read").
+dominates and the median collapses to milliseconds.
 
 Since #9438 the role runner removes most of that population at the source: a
 role-runner tick opens its `loom.role_attempt` root only at the launch (the
@@ -261,9 +299,10 @@ Linux exposes no compression figure) is absent, never zero — the "unknown !=
 zero" contract the telemetry schema states for every measured field.
 
 Role-attempt completion attributes close the same gap on the *why*: a fixed
-`loom.admission.reason` literal — `failure`, `runtime-rejected`,
-`no-token-pool`, `pool-exhausted`, `model-runtime-mismatch`, `load-ceiling`,
-plus `preflight-rejected` (stamped on the runtime-preflight span itself, not a
+`loom.admission.reason` literal — `session-down` (#10455),
+`session-mount-stale` (#10364), `runtime-rejected`, `no-token-pool`,
+`pool-exhausted`, `model-runtime-mismatch`, `load-ceiling`, plus
+`preflight-rejected` (stamped on the runtime-preflight span itself, not a
 role-attempt finish) — plus the measured context that distinguishes them: the
 actual load against the ceiling on a load deferral, which pool gated and its
 total size, and the runtime's missing capabilities. The free-form text these
@@ -272,6 +311,50 @@ attributes stay allowlisted, 256-byte bounded, and free of untrusted content.
 Together the two boundaries' host state and the admission reason let an
 operator separate an attempt deferred for memory pressure from one the kernel
 killed from one that simply timed out, directly in the trace.
+
+A role-runner attempt that launched and then failed (`loom.result=failure`)
+was admitted, so since #10640 it carries **no** `loom.admission.reason` (the
+earlier `failure` literal only repeated `loom.result`). It says why it failed
+instead, from what the launch site observed:
+
+- `loom.failure_class` — a closed, kebab-case vocabulary that is the sweep
+  `failure_class`'s wherever the two describe the same shape, because the
+  same classifiers read the tick's own region of `role-<role>.log`;
+- `loom.exit_code` — present only when the child exited with a code;
+- the span's **status message** — one line built from a fixed template plus
+  a code, signal number, timeout, `io::ErrorKind` or adapter category. It is
+  journalled as `loom.status_message` and exported as the OTLP status
+  description of the `Error` span, not as an attribute. It never carries log
+  text, argv, environment or a path.
+
+| `loom.failure_class` | Meaning |
+|---|---|
+| `launch-failed` | the launcher could not be spawned; no child ran |
+| `wait-failed` | polling the child for its exit failed |
+| `timeout-ceiling` | the role timeout fired and the child was terminated (a load-saturated ceiling is `skipped_load` instead) |
+| `killed-by-signal` | the child was ended by a signal; the message names it |
+| `toolless-launch`, `sandbox-unavailable` | exit 0, but the launch offered no `loom_*` tools (#8448) or the sandbox refused every tool call (#10003) |
+| `session-down`, `session-mount-stale` | a `session-exec` refusal (#10455, #10364) named in the adapter's terminal record; it outranks `preflight-no-cli-start` and matches `loom.admission.reason` |
+| `preflight-auth-failed`, `preflight-mcp-failed`, `preflight-token-selection-failed`, `preflight-no-cli-start` | the adapter died before its CLI started (`# LOOM_CLI_START` never written) |
+| `account-pool-exhausted` | the wrapper's account rotation ran out mid-run |
+| `credential-expired`, `account-exhausted:<category>`, `session-limit`, `runtime-timeout`, `runtime-fatal`, `cwd-deleted`, `model-refusal` | the runtime adapter's own `# LOOM_TERMINAL_RESULT` category |
+| `no-usable-account`, `account-exhausted:<signature>`, `execution-error`, `self-kill:background-wait`, `exit-<code>` | the sweep crash classifier; `exit-<code>` is its last resort |
+| `unclassified:after-launch` | explicit fallback: the tick failed after launch and no site recorded why |
+
+The adapter's `RECOVERABLE` category is its catch-all for an exit it did not
+recognize, so it yields no class of its own; the status message still quotes
+it (`role child exited with code 1; runtime adapter reported RECOVERABLE`).
+The tick's story copies (`loom.timing_source=tick`) carry the same class,
+code and message. A recovered `process_lost` close carries
+`loom.failure_class=supervisor-lost` — the child and its supervisor both
+exited before either recorded a close — and keeps an unset status.
+A run a planned roll ended (#11263) instead closes as
+`loom.result=interrupted_by_roll`, unset status, no failure class, with
+`loom.roll.disposition` (`paused`|`requeued`|`budget-missed`) and
+`loom.roll.item_id`; recovery keys strictly on pause-manifest membership, so an
+unplanned crash stays `process_lost`. A resumed role run carries
+`loom.resumed_from` = that item id. Failure-rate queries and the role-failures
+watch should exclude `interrupted_by_roll`.
 
 ## Journals and recovery
 

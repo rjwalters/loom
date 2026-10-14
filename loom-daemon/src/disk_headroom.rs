@@ -37,8 +37,16 @@ use crate::worktree_root::worktree_root;
 /// (GB). Mirrors bash `LOOM_PER_WORKTREE_GB`.
 pub const PER_WORKTREE_GB_ENV: &str = "LOOM_PER_WORKTREE_GB";
 
-/// Default per-worktree disk estimate (GB). Matches the bash default of 2.
-pub const DEFAULT_PER_WORKTREE_GB: u64 = 2;
+/// Default per-worktree disk estimate (GB). Matches the bash default of 8.
+///
+/// Calibrated in #8370 from measured cargo target dirs, the dominant term in a
+/// worktree's footprint: a full `--all-targets` build of this workspace left
+/// 3.0, 8.2, 8.8 and 13 GB per worktree (median 8.2 GB) on the host that ran
+/// out of disk at 145 GB, and 28 agent target dirs on another host averaged
+/// 3 GB with a maximum of 22 GB. The old value of 2 let the disk term admit
+/// four times the worktrees a full build actually needs room for. Hosts that
+/// build less can lower it with `LOOM_PER_WORKTREE_GB`.
+pub const DEFAULT_PER_WORKTREE_GB: u64 = 8;
 
 /// Resolve the per-worktree GB estimate from [`PER_WORKTREE_GB_ENV`], flooring to
 /// a minimum of 1 (a zero or unparseable value would make the disk term diverge).
@@ -155,8 +163,21 @@ pub fn worktree_root_free_gb(repo_root: &Path) -> Option<u64> {
 /// Same "unknown != zero" contract as every other probe in this module (#4164):
 /// `None` means unmeasurable (`df` missing/errored, unparseable output), never a
 /// fabricated `0`.
+/// Test-only pin for [`path_free_gb`] so tests do not depend on live host disk (#11679).
+#[cfg(test)]
+static FREE_GB_OVERRIDE: std::sync::Mutex<Option<u64>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn set_free_gb_override(v: Option<u64>) {
+    *FREE_GB_OVERRIDE.lock().unwrap() = v;
+}
+
 #[must_use]
 pub fn path_free_gb(path: &Path) -> Option<u64> {
+    #[cfg(test)]
+    if let Some(v) = *FREE_GB_OVERRIDE.lock().unwrap() {
+        return Some(v);
+    }
     let probe = nearest_existing_ancestor(path);
     parse_df_available_gb(&df_probe_output(probe)?)
 }

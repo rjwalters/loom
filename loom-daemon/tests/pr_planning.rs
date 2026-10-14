@@ -61,7 +61,7 @@ fn actual_role_entrypoints_use_shared_preference_and_effective_config() {
         star["labels"]
             .as_array_mut()
             .unwrap()
-            .push(serde_json::json!({"name":"loom:operator-priority"}));
+            .push(serde_json::json!({"name":"loom:important"}));
         let data = root.join("pulls.json");
         std::fs::write(
             &data,
@@ -225,7 +225,6 @@ case "$*" in *page=2*) cat page2;; *) cat page1;; esac
         let mut cmd = cli(root);
         cmd.args(["pr-queue", "--role", "judge"])
             .env("LOOM_GH_BIN", root.join("gh"))
-            .env("LOOM_GH_NO_POLICY_LAUNCHER", "1")
             .env("GUARD_EXIT", guard);
         output(cmd)
     };
@@ -291,7 +290,6 @@ esac
         cmd.current_dir(root)
             .env("PATH", format!("{}:{}", root.display(), std::env::var("PATH").unwrap()))
             .env("LOOM_GH_BIN", root.join("gh"))
-            .env("LOOM_GH_NO_POLICY_LAUNCHER", "1")
             // The guard authenticates marker authors through
             // `loom-daemon forge trusted-comments` (#9548/#9716); without a
             // reachable daemon it reads every marker as absent.

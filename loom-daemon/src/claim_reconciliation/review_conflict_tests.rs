@@ -164,6 +164,7 @@ fn fake_gh(dir: &Path, log: &Path, rr_json: &str, mc_json: &str, comments: &str)
         .iter()
         .map(|r| {
             let number = r["number"].as_u64().unwrap();
+            let sha = r["headRefOid"].as_str().unwrap_or_default();
             let m = match r["mergeable"].as_str() {
                 Some("MERGEABLE") => "true",
                 Some("CONFLICTING") => "false",
@@ -171,7 +172,7 @@ fn fake_gh(dir: &Path, log: &Path, rr_json: &str, mc_json: &str, comments: &str)
             };
             mergeable_arms.push_str(&format!(
                 "case \"$*\" in api*'/pulls/{number}') printf 'HTTP/2.0 200 OK\\r\\n\\r\\n'; \
-                 echo '{{\"mergeable\":{m}}}'; exit 0 ;; esac\n"
+                 echo '{{\"mergeable\":{m},\"head\":{{\"sha\":\"{sha}\"}}}}'; exit 0 ;; esac\n"
             ));
             serde_json::json!({
                 "number": number,
@@ -346,13 +347,40 @@ fn conflict_candidates_keeps_only_the_two_labels() {
     let mut read = Vec::new();
     let got = conflict_candidates(&rows, |n| {
         read.push(n);
-        Mergeable::Conflicting
+        (Mergeable::Conflicting, Some(format!("{n:040x}")))
     });
     assert_eq!(got.keys().copied().collect::<Vec<_>>(), vec![2, 3, 5, 6]);
     assert_eq!(read, vec![2, 3], "held / in-flight PRs are never read");
     assert_eq!(got[&2].mergeable, Mergeable::Conflicting);
     assert_eq!(got[&5].mergeable, Mergeable::Unknown);
     assert_eq!(got[&2].head_sha.as_deref(), Some(format!("{:040x}", 2).as_str()));
+}
+
+/// #10382: `mergeable` and the head it was computed for come from ONE
+/// response. When the listing's head differs (a push between the two reads),
+/// the flag names the per-PR head; a per-PR read without a head is Unknown.
+#[test]
+fn the_flag_names_the_head_the_mergeable_read_was_computed_for() {
+    use super::open_pr_listing::test_support::{listing, row};
+    let rows = crate::forge_pull_listing::parse_rest_pulls(&listing(&[
+        row(1, &[REVIEW_REQUESTED]).sha("listinghead"),
+        row(2, &[REVIEW_REQUESTED]).sha("listinghead"),
+    ]))
+    .unwrap();
+    let got = conflict_candidates(&rows, |n| match n {
+        1 => (Mergeable::Conflicting, Some("perprhead".to_string())),
+        _ => (Mergeable::Conflicting, None),
+    });
+    assert_eq!(
+        decide_review_conflict(&got[&1]),
+        ConflictAction::Flag {
+            head_sha: "perprhead".to_string()
+        }
+    );
+    assert_eq!(
+        decide_review_conflict(&got[&2]),
+        ConflictAction::Keep(ConflictKeepReason::Unknown)
+    );
 }
 
 fn run_sharing(rr_json: &str) -> (ReviewConflictStats, Option<Vec<RestPull>>, String) {

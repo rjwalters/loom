@@ -171,12 +171,16 @@ fn unchanged_claimed_prs_read_their_label_timeline_once() {
             assert_eq!(checked, 1);
         }
     });
-    assert_eq!(calls_matching(&log, "issues/7/timeline"), 1, "3 unchanged passes, 1 walk");
+    // 1 cached label walk + 3 uncached head-push scans (#10235: the claim is
+    // past its TTL here, and a not-found push is never cached for the same
+    // reason as the activity read below).
+    assert_eq!(calls_matching(&log, "issues/7/timeline"), 4, "1 label walk + 3 push scans");
     // No activity was found, so that read is never cached (a failed read
     // looks the same and must not hide a heartbeat) — but it is bounded to
     // comments since the claim label.
-    assert_eq!(calls_matching(&log, "issues/7/comments"), 3);
-    assert_eq!(calls_matching(&log, "since=2026-10-03T09:30:00Z"), 3);
+    // Two uncached scans per pass on an aged claim: claim-activity + (#10235) Judge-progress.
+    assert_eq!(calls_matching(&log, "issues/7/comments"), 6);
+    assert_eq!(calls_matching(&log, "since=2026-10-03T09:30:00Z"), 6);
 }
 
 #[test]
@@ -192,7 +196,7 @@ fn unchanged_open_prs_read_their_changed_files_once() {
             .updated("2026-10-03T00:00:00Z")
     };
     let body = format!(
-        r#"{}if [ "$1" = "pr" ] && [ "$2" = "view" ]; then echo '{{"files":[{{"path":"src/a.rs"}}]}}'; fi"#,
+        r#"{}case "$*" in *'/files?'*) printf 'HTTP/2.0 200 OK\r\n\r\n'; echo '[{{"filename":"src/a.rs"}}]' ;; esac"#,
         pulls_arm(&[seq_row(3), seq_row(2), seq_row(1)])
     );
     let (gh, log) = fake_gh(dir.path(), &body);
@@ -202,7 +206,8 @@ fn unchanged_open_prs_read_their_changed_files_once() {
             assert_eq!(report.open_prs, 3);
         }
     });
-    assert_eq!(calls_matching(&log, "--json files"), 3, "one view per PR, not per pass");
+    assert_eq!(calls_matching(&log, "/files?"), 3, "one files read per PR, not per pass");
+    assert_eq!(calls_matching(&log, "--json files"), 0, "no GraphQL files read (#10382)");
 }
 
 #[test]

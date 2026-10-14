@@ -44,6 +44,9 @@ pub const CLEAN: &str = "LOOM-TREE-CHECKS-CLEAN";
 pub const BYPASSED: &str = "LOOM-TREE-CHECKS-BYPASSED";
 /// Default per-check timeout.
 pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
+/// Ends the `Failed` output of a check that was killed on timeout; see
+/// [`is_timeout`].
+const TIMED_OUT_SUFFIX: &str = " and was killed)";
 /// Output kept (tail) for the refusal and the PR comment.
 const OUTPUT_TAIL_BYTES: usize = 6000;
 
@@ -96,7 +99,7 @@ pub enum Outcome {
     Unknown(String),
 }
 
-fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
+pub(crate) fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
     let out = Command::new("git")
         .current_dir(dir)
         .args(args)
@@ -113,34 +116,52 @@ fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
     }
 }
 
-/// Build the merge tree of `origin/<base_ref>` and the PR head and extract it
-/// into a fresh temp dir. `remote` is the git remote to fetch from.
-pub fn build_tree(
+/// The merge of the fetched base tip and the PR head, as git objects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeTree {
+    /// The base tip that was actually fetched (and merged onto).
+    pub base_sha: String,
+    /// `git merge-tree --write-tree`'s result.
+    pub tree_sha: String,
+}
+
+/// Fetch `<remote>/<base_ref>` and PR `pr`'s head, verify the head is
+/// `head_sha`, and write their merge tree. Shared by [`build_tree`] and
+/// the stale-check local evaluation. Any conflict is an error (fail closed).
+pub fn merge_tree(
     repo_root: &Path,
     remote: &str,
     pr: &str,
     base_ref: &str,
     head_sha: &str,
-) -> Result<tempfile::TempDir, String> {
+) -> Result<MergeTree, String> {
+    merge_tree_with(repo_root, remote, pr, base_ref, head_sha, true)
+}
+
+/// [`merge_tree`], optionally without touching `FETCH_HEAD`
+/// (`--no-write-fetch-head`, git >= 2.29; an older git fails the fetch, which
+/// is an error, i.e. fail closed).
+pub fn merge_tree_with(
+    repo_root: &Path,
+    remote: &str,
+    pr: &str,
+    base_ref: &str,
+    head_sha: &str,
+    write_fetch_head: bool,
+) -> Result<MergeTree, String> {
     // Fetch both tips into private refs and resolve them from what was actually
     // fetched (no second `ls-remote` round trip that could see a newer base).
     let base_local = format!("refs/loom/tree-checks/{pr}/base");
     let pr_local = format!("refs/loom/tree-checks/{pr}/head");
     let base_spec = format!("+refs/heads/{base_ref}:{base_local}");
     let pr_spec = format!("+refs/pull/{pr}/head:{pr_local}");
-    let fetched = git(
-        repo_root,
-        &[
-            "fetch",
-            "--quiet",
-            "--no-tags",
-            remote,
-            "--",
-            &base_spec,
-            &pr_spec,
-        ],
-    )
-    .map_err(|e| format!("could not fetch the base and PR head: {e}"));
+    let mut fetch = vec!["fetch", "--quiet", "--no-tags"];
+    if !write_fetch_head {
+        fetch.push("--no-write-fetch-head");
+    }
+    fetch.extend([remote, "--", base_spec.as_str(), pr_spec.as_str()]);
+    let fetched =
+        git(repo_root, &fetch).map_err(|e| format!("could not fetch the base and PR head: {e}"));
     let resolve = |r: &str| {
         git(
             repo_root,
@@ -179,6 +200,22 @@ pub fn build_tree(
     if tree.len() < 40 {
         return Err("git merge-tree printed no tree id".to_string());
     }
+    Ok(MergeTree {
+        base_sha,
+        tree_sha: tree,
+    })
+}
+
+/// Build the merge tree of `origin/<base_ref>` and the PR head and extract it
+/// into a fresh temp dir. `remote` is the git remote to fetch from.
+pub fn build_tree(
+    repo_root: &Path,
+    remote: &str,
+    pr: &str,
+    base_ref: &str,
+    head_sha: &str,
+) -> Result<tempfile::TempDir, String> {
+    let tree = merge_tree(repo_root, remote, pr, base_ref, head_sha)?.tree_sha;
     let dir = tempfile::Builder::new()
         .prefix("loom-tree-checks-")
         .tempdir()
@@ -314,7 +351,7 @@ pub fn run_checks(tree: &Path, cfg: &Config) -> Outcome {
                 return Outcome::Failed {
                     check: check.clone(),
                     output: format!(
-                        "{}\n(timed out after {}s and was killed)",
+                        "{}\n(timed out after {}s{TIMED_OUT_SUFFIX}",
                         tail(&text),
                         cfg.timeout.as_secs()
                     ),
@@ -323,6 +360,14 @@ pub fn run_checks(tree: &Path, cfg: &Config) -> Outcome {
         }
     }
     Outcome::Clean
+}
+
+/// Was this [`Outcome::Failed`] output produced by a timeout rather than a
+/// check's own verdict? The #10388 local evaluation treats a timeout as
+/// "no verdict" (fail closed to the CI remedy), not as a failing check.
+#[must_use]
+pub fn is_timeout(output: &str) -> bool {
+    output.trim_end().ends_with(TIMED_OUT_SUFFIX) && output.contains("\n(timed out after ")
 }
 
 /// Whole gate: no checks means no git, no network, no temp dir.

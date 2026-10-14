@@ -301,8 +301,10 @@ if [[ -z "$CLAIM_STATE" ]]; then
     # Claimant activity: ONLY comments carrying this claim's activity marker.
     ACTIVITY_COUNT="$(jq --arg m "${ACTIVITY_PREFIX}${CLAIMED_AT} -->" \
         '[.[] | select(.body | contains($m))] | length' <<<"$AFTER_JSON")"
+    # requires-daemon: forge optional   Without `claim-liveness` (absent or older binary) only the marker counts: the daemon's Judge-progress / claimant force-push signals (#10235) are then not folded in.
     LAST_ACTIVITY_AT="$(jq -r --arg m "${ACTIVITY_PREFIX}${CLAIMED_AT} -->" --arg c "$CLAIMED_AT" \
-        '([.[] | select(.body | contains($m)) | .created_at] + [$c]) | max' <<<"$AFTER_JSON")"
+        --arg x "$("${LOOM_DAEMON_BIN:-loom-daemon}" forge claim-liveness --number "$NUMBER" --label "$LABEL" --claimed-at "$CLAIMED_AT" ${REPO_ARG:+--repo "$REPO_ARG"} 2>/dev/null || true)" \
+        '([.[] | select(.body | contains($m)) | .created_at] + [$c] + ([$x | select(test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))])) | max' <<<"$AFTER_JSON")"
 
     # Stand-down comments for THIS claim (prefix match covers both the legacy
     # `claim=<ts> -->` form and the `claim=<ts> seq=N -->` form).
@@ -414,7 +416,7 @@ fi
 NEXT_SEQ=$((STANDDOWN_COUNT + 1))
 BODY="$ROLE pass: still carries a fresh \`$LABEL\` claim (claimed $CLAIMED_AT, idle ${IDLE_MINUTES}m) — standing down without reclaiming. Not stomping.
 
-Stand-down passes against this claim: $NEXT_SEQ of $MAX_STREAK before the bounded fallback force-reclaims it. This comment is edited in place on each pass rather than reposted (#5123, #6514).
+Stand-down passes against this claim: $NEXT_SEQ of $MAX_STREAK (streak cap $( ((NEXT_SEQ >= MAX_STREAK)) && echo met || echo "NOT met")); claim age ${CLAIM_AGE_MINUTES}m of ${STALE_MINUTES}m (age floor $( ((CLAIM_AGE_MINUTES >= STALE_MINUTES)) && echo met || echo "NOT met")). The bounded fallback force-reclaims only once BOTH are met (#9927). This comment is edited in place on each pass rather than reposted (#5123, #6514).
 ${STANDDOWN_PREFIX}${CLAIMED_AT} seq=${NEXT_SEQ} -->"
 
 if [[ "$DRY_RUN" == true ]]; then

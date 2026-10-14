@@ -168,7 +168,7 @@ fn codex_pinned_role_spawns_despite_an_exhausted_claude_pool_body() {
     let claude = crate::tokens_pool::select::spawnable_pool_state(workspace.path());
     assert_eq!((claude.total, claude.usable), (1, 0));
 
-    let before = pool_exhausted_skip_count();
+    let before = POOL_EXHAUSTED_SKIP_COUNT.on_this_thread();
     let ws = crate::write_scope_test_support::WritableRoot::register(workspace.path());
     let outcome = judge_runner(workspace.path())
         .with_gh_bin(ws.gh.clone())
@@ -176,7 +176,11 @@ fn codex_pinned_role_spawns_despite_an_exhausted_claude_pool_body() {
 
     assert_eq!(outcome, RoleTickOutcome::Success, "{outcome:?}");
     assert!(marker.exists(), "the codex-pinned tick must actually reach the spawn");
-    assert_eq!(pool_exhausted_skip_count(), before, "no pool skip may be counted");
+    assert_eq!(
+        POOL_EXHAUSTED_SKIP_COUNT.on_this_thread(),
+        before,
+        "no pool skip may be counted"
+    );
     assert!(
         !judge_log(workspace.path()).contains("SKIPPED BEFORE SPAWN"),
         "no pre-spawn skip marker may be written: {}",
@@ -202,7 +206,7 @@ fn codex_pinned_role_with_no_codex_account_skips_naming_the_codex_pool_body() {
     let _env = EnvGuard::new(profiles.path());
     let (marker, _pool) = codex_judge_workspace(workspace.path(), CODEX_MANIFEST, false);
 
-    let before = pool_exhausted_skip_count();
+    let before = POOL_EXHAUSTED_SKIP_COUNT.on_this_thread();
     let outcome = judge_runner(workspace.path()).invoke("judge", "/loom:judge");
 
     let RoleTickOutcome::PoolExhausted {
@@ -217,7 +221,7 @@ fn codex_pinned_role_with_no_codex_account_skips_naming_the_codex_pool_body() {
     // be reported as the self-healing hold.
     assert_eq!(hold, PoolHold::Unprovisioned);
     assert!(!marker.exists(), "the doomed spawn must never run");
-    assert_eq!(pool_exhausted_skip_count(), before + 1);
+    assert_eq!(POOL_EXHAUSTED_SKIP_COUNT.on_this_thread(), before + 1);
 
     let log = judge_log(workspace.path());
     assert!(
@@ -413,7 +417,7 @@ fn codex_pinned_role_fails_closed_on_a_malformed_account_inventory_body() {
     assert_eq!(file, PoolStateFile::Inventory);
     assert_eq!((state.enabled, state.spawnable), (0, 0), "{state:?}");
 
-    let before = pool_exhausted_skip_count();
+    let before = POOL_EXHAUSTED_SKIP_COUNT.on_this_thread();
     let outcome = judge_runner(workspace.path()).invoke("judge", "/loom:judge");
 
     let RoleTickOutcome::PoolExhausted { pool, hold, .. } = outcome else {
@@ -422,7 +426,7 @@ fn codex_pinned_role_fails_closed_on_a_malformed_account_inventory_body() {
     assert_eq!(pool, CredentialPool::CodexAccounts, "#8444: gated_pool stays the codex pool");
     assert_eq!(hold, PoolHold::Unreadable(PoolStateFile::Inventory));
     assert!(!marker.exists(), "a launch the selector would kill must never run");
-    assert_eq!(pool_exhausted_skip_count(), before + 1);
+    assert_eq!(POOL_EXHAUSTED_SKIP_COUNT.on_this_thread(), before + 1);
 
     let log = judge_log(workspace.path());
     assert!(
@@ -682,7 +686,7 @@ fn claude_runtime_pool_exhausted_skip_is_byte_identical() {
         &format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display()),
     );
 
-    let before = pool_exhausted_skip_count();
+    let before = POOL_EXHAUSTED_SKIP_COUNT.on_this_thread();
     let outcome = ScriptRoleInvocationRunner::new(root.to_path_buf()).invoke("curator", "/x");
     let RoleTickOutcome::PoolExhausted {
         total,
@@ -696,7 +700,7 @@ fn claude_runtime_pool_exhausted_skip_is_byte_identical() {
     assert_eq!((total, pool), (1, CredentialPool::ClaudeTokens));
     assert_eq!(hold, PoolHold::SelfHealing, "#8444: the Claude arm is only ever self-healing");
     assert!(!marker.exists());
-    assert_eq!(pool_exhausted_skip_count(), before + 1);
+    assert_eq!(POOL_EXHAUSTED_SKIP_COUNT.on_this_thread(), before + 1);
 
     let pool_dir = crate::tokens_pool::select::spawnable_pool_state(root).dir;
     let expected_reason = format!(
@@ -947,7 +951,7 @@ fn an_exhausted_claude_pool_falls_through_via_role_preference_instead_of_skippin
         true,
     );
 
-    let before = pool_exhausted_skip_count();
+    let before = POOL_EXHAUSTED_SKIP_COUNT.on_this_thread();
     let ws = crate::write_scope_test_support::WritableRoot::register(workspace.path());
     let outcome = judge_runner(workspace.path())
         .with_gh_bin(ws.gh.clone())
@@ -959,7 +963,11 @@ fn an_exhausted_claude_pool_falls_through_via_role_preference_instead_of_skippin
         "codex",
         "the tick must fall through to codex and actually spawn"
     );
-    assert_eq!(pool_exhausted_skip_count(), before, "no pool skip may be counted");
+    assert_eq!(
+        POOL_EXHAUSTED_SKIP_COUNT.on_this_thread(),
+        before,
+        "no pool skip may be counted"
+    );
     let log = judge_log(workspace.path());
     assert!(!log.contains("SKIPPED BEFORE SPAWN"), "{log}");
 }
@@ -1191,3 +1199,107 @@ fn an_operator_pin_disables_preference_fall_through_at_the_pre_spawn_gate_body()
     assert_eq!(pool, CredentialPool::ClaudeTokens, "the pin must keep the tick on claude");
     assert!(!marker.exists(), "a pinned-but-dry launch must still skip, never fall through");
 }
+
+// ---- #10454: a session-managed account whose container is down -------------
+
+fn mark_session_managed(profiles: &Path, name: &str) {
+    let dir = profiles.join(name);
+    fs::create_dir_all(&dir).unwrap();
+    let marker = dir.join(crate::tokens_pool::session_lifecycle::SESSION_MARKER_FILE);
+    fs::write(marker, "{}").unwrap();
+}
+
+/// The count: a down session is not spawnable even with NO health entry (the
+/// check runs before the no-health `continue`); a live session and a bare-metal
+/// account are unaffected; and an unobservable Docker marks nothing down.
+#[test]
+#[serial]
+fn codex_pool_state_counts_a_down_session_as_not_spawnable() {
+    use crate::tokens_pool::session_lifecycle::liveness::test_support::{running, set};
+    let workspace = tempfile::tempdir().unwrap();
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = EnvGuard::new(profiles.path());
+    mark_session_managed(profiles.path(), "down");
+    mark_session_managed(profiles.path(), "live");
+    fs::create_dir(profiles.path().join("bare-metal")).unwrap();
+    fs::create_dir_all(workspace.path().join(".loom")).unwrap();
+    let now = epoch_now();
+
+    let live = set(running(&["live"]));
+    let state = codex_pool_state(workspace.path(), now);
+    assert_eq!((state.enabled, state.spawnable, state.session_down), (3, 2, 1), "{state:?}");
+    assert!(codex_exhausted_reason(&state).contains("SessionDown"));
+    drop(live);
+
+    let _unobservable = set(None);
+    let state = codex_pool_state(workspace.path(), now);
+    assert_eq!((state.spawnable, state.session_down), (3, 0), "fail open: {state:?}");
+}
+
+/// The pinned-runtime skip names `SessionDown` when every session is down.
+#[test]
+#[serial(loom_shared_tokens_dir_env)]
+fn codex_pinned_role_skip_names_session_down_when_every_container_is_stopped() {
+    codex_pinned_role_skip_names_session_down_when_every_container_is_stopped_body();
+}
+
+#[serial]
+fn codex_pinned_role_skip_names_session_down_when_every_container_is_stopped_body() {
+    use crate::tokens_pool::session_lifecycle::liveness::test_support::{running, set};
+    let workspace = tempfile::tempdir().unwrap();
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = EnvGuard::new(profiles.path());
+    mark_session_managed(profiles.path(), "agent-4");
+    let (marker, _pool) = codex_judge_workspace(workspace.path(), CODEX_MANIFEST, false);
+    let _down = set(running(&[]));
+
+    let outcome = judge_runner(workspace.path()).invoke("judge", "/loom:judge");
+
+    let RoleTickOutcome::PoolExhausted { hold, total, .. } = outcome else {
+        panic!("expected PoolExhausted, got {outcome:?}");
+    };
+    assert_eq!((hold, total), (PoolHold::SelfHealing, 1));
+    assert!(!marker.exists(), "the doomed spawn must never run");
+    let log = judge_log(workspace.path());
+    assert!(log.contains("SessionDown") && log.contains("1/1 session"), "{log}");
+}
+
+/// AC1, end to end: `rolePreference.judge = [codex, claude]` with every session
+/// container stopped runs the tick on Claude, the Codex skip naming
+/// `SessionDown` — instead of selecting Codex and exiting 78 in spawn-codex.sh.
+#[test]
+#[serial(loom_shared_tokens_dir_env)]
+fn every_session_down_sends_judge_to_the_next_tap() {
+    every_session_down_sends_judge_to_the_next_tap_body();
+}
+
+#[serial]
+fn every_session_down_sends_judge_to_the_next_tap_body() {
+    use crate::tokens_pool::session_lifecycle::liveness::test_support::{running, set};
+    let workspace = tempfile::tempdir().unwrap();
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = EnvGuard::new(profiles.path());
+    mark_session_managed(profiles.path(), "agent-4");
+    let config =
+        serde_json::json!({"runtimes": {"rolePreference": {"judge": ["codex", "claude"]}}});
+    let (marker, _pool) = preference_judge_workspace(workspace.path(), &config, false);
+    let _down = set(running(&[]));
+
+    let decision = crate::runtime_preference::resolve_runtime(workspace.path(), "judge", None, 0);
+    let Ok(crate::runtime_preference::Decision::Preference { resolution, .. }) = decision else {
+        panic!("expected the preference path");
+    };
+    let skipped: Vec<String> = resolution.skipped.iter().map(ToString::to_string).collect();
+    assert!(skipped.first().is_some_and(|s| s.contains("SessionDown")), "{skipped:?}");
+
+    let ws = crate::write_scope_test_support::WritableRoot::register(workspace.path());
+    let outcome = judge_runner(workspace.path())
+        .with_gh_bin(ws.gh.clone())
+        .invoke("judge", "/loom:judge");
+    assert_eq!(outcome, RoleTickOutcome::Success, "{outcome:?}");
+    assert_eq!(fs::read_to_string(&marker).unwrap_or_default(), "claude");
+}
+
+// #10660: the same gate read from the shared session snapshot.
+#[path = "session_snapshot_tests.rs"]
+mod session_snapshot;

@@ -47,27 +47,8 @@ TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HELPERS_DIR="$(cd "$TEST_DIR/.." && pwd)"
 MERGE_PR_SRC="$HELPERS_DIR/merge-pr.sh"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-NC='\033[0m'
-
-TESTS_RUN=0
-TESTS_PASSED=0
-TESTS_FAILED=0
-
-assert_eq() {
-    local expected="$1" actual="$2" msg="$3"
-    TESTS_RUN=$((TESTS_RUN + 1))
-    if [[ "$expected" == "$actual" ]]; then
-        TESTS_PASSED=$((TESTS_PASSED + 1))
-        echo -e "  ${GREEN}PASS${NC}: $msg"
-    else
-        TESTS_FAILED=$((TESTS_FAILED + 1))
-        echo -e "  ${RED}FAIL${NC}: $msg"
-        echo "    Expected: '$expected'"
-        echo "    Actual:   '$actual'"
-    fi
-}
+# shellcheck source=lib/assert.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
 
 assert_contains() {
     local haystack="$1" needle="$2" msg="$3"
@@ -309,7 +290,7 @@ unset REDATE_STALE_CHECKS
 # T11: the flag is accepted by the argument parser and advertised in --help.
 HELP_OUT="$(bash "$MERGE_PR_SRC" --help 2>&1)"
 assert_contains "$HELP_OUT" "--redate-stale-checks" "--help advertises the flag"
-assert_contains "$HELP_OUT" "4 = stale required checks re-running in place" "--help documents exit 4"
+assert_contains "$HELP_OUT" "4 = stale required checks re-dated by a no-op push" "--help documents exit 4"
 assert_contains "$(grep -c -- '--redate-stale-checks) REDATE_STALE_CHECKS=true' "$MERGE_PR_SRC")" "1" \
     "the argument parser has exactly one arm for the flag"
 
@@ -343,7 +324,7 @@ done
 # silently disable the remedy; a stub loom-daemon cannot catch that.
 FAIL_GH="$STUB_DIR/gh-fails"; printf '#!/usr/bin/env bash\nexit 1\n' > "$FAIL_GH"; chmod +x "$FAIL_GH"
 set +e
-OPTIN_OUT="$(LOOM_REDATE_ALLOW_PROCEED=1 LOOM_GH_BIN="$FAIL_GH" LOOM_GH_NO_POLICY_LAUNCHER=1 "$REAL_DAEMON_BIN" merge-pr redate-checks --pr 1 --repo o/r --branch b --expected-head-sha abc --rerun-wait-secs 0 2>&1)"
+OPTIN_OUT="$(LOOM_REDATE_ALLOW_PROCEED=1 LOOM_GH_BIN="$FAIL_GH" "$REAL_DAEMON_BIN" merge-pr redate-checks --pr 1 --repo o/r --branch b --expected-head-sha abc --rerun-wait-secs 0 2>&1)"
 OPTIN_RC=$?
 set -e
 assert_eq "1" "$OPTIN_RC" "real binary + LOOM_REDATE_ALLOW_PROCEED=1 parses and reaches the remedy (a failing gh -> exit 1, not a clap exit 2)"

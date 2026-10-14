@@ -26,10 +26,11 @@
 //!
 //! `<family>` is [`job_family_slug`] of the leg's display name with its
 //! `(k/N)` suffix removed (`Rust Unit Tests (1/3)` → `rust-unit-tests`). It is
-//! load-bearing rather than cosmetic: `ci.yml` has **two** nextest-partition
-//! families sharding `1..3` (`Rust Unit Tests` and `Rust OTLP Feature Tests`),
-//! so `(kind, k, N)` alone matches two jobs and would be
-//! [`RejectReason::NoUniqueJob`] for every record. Renaming a leg without
+//! load-bearing rather than cosmetic: the family keeps the key unambiguous
+//! (`ci.yml` has one nextest-partition family, `Rust Unit Tests`, since
+//! #10823; a second family sharding `1..3` would otherwise make `(kind, k, N)`
+//! match two jobs, [`RejectReason::NoUniqueJob`] for every record). Renaming a
+//! leg without
 //! renaming its artifact is the same rejection — counted and logged, never
 //! guessed.
 //!
@@ -39,7 +40,7 @@
 //! (measured: `cargo nextest list --workspace --profile ci --partition
 //! count:1/3` on `main`, 2026-10-02 — 12,659 workspace tests over three
 //! partitions). So "one span per test" is not an option: it would be ~25,400
-//! spans per CI run across the six nextest legs, two orders of magnitude more
+//! spans per CI run across the nextest legs, two orders of magnitude more
 //! trace volume than every other CI span combined. These spans exist to answer
 //! "what should move between partitions" and "which test regressed", and both
 //! questions live entirely in the slow tail — a 3 ms test is not a rebalancing
@@ -113,8 +114,8 @@ pub const MAX_JUNIT_BYTES: u64 = 8 * 1024 * 1024;
 /// otherwise force.
 pub const MAX_TESTCASES_PARSED: usize = 50_000;
 
-/// Upper bound on test artifacts downloaded for one run — `ci.yml` has six
-/// nextest legs (two families x three partitions), with headroom.
+/// Upper bound on test artifacts downloaded for one run — `ci.yml` has three
+/// nextest legs (one family x three partitions since #10823), with headroom.
 pub const MAX_ARTIFACTS_PER_RUN: usize = 8;
 
 /// Upper bound on `loom.ci.test` spans emitted for one job — a **backstop**,
@@ -307,9 +308,8 @@ pub fn parse_artifact_name(name: &str) -> Option<ArtifactIdentity> {
 /// shard group [`super::records::parse_shard`] reads removed, lowercased, and
 /// every run of non-alphanumeric characters collapsed to a single `-`.
 ///
-/// `Rust Unit Tests (1/3)` → `rust-unit-tests`; `Rust OTLP Feature Tests
-/// (2/3)` → `rust-otlp-feature-tests`. This is what `ci.yml` writes into the
-/// artifact name, and what distinguishes the two families that both shard
+/// `Rust Unit Tests (1/3)` → `rust-unit-tests`. This is what `ci.yml` writes
+/// into the artifact name, and what distinguishes families that both shard
 /// `1..3`.
 #[must_use]
 pub fn job_family_slug(job_name: &str) -> String {

@@ -41,27 +41,72 @@
 //!
 //! # Cost
 //!
-//! One `gh pr list --head feature/issue-<N>` per **successful reclaim** — not
-//! per candidate. A healthy pass, which reclaims nothing, pays nothing.
+//! One REST `pulls?head=owner:feature/issue-<N>` read per **successful
+//! reclaim** — not per candidate. A healthy pass, which reclaims nothing, pays nothing.
 
 use std::path::Path;
 
 use anyhow::Result;
 
+/// What [`reclaim_and_warn`] did on success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Reclaim {
+    /// The claim was released (fully, or the claim only under a veto).
+    Released,
+    /// The issue is `loom:frozen` (#11743): nothing was written, so the
+    /// caller must not count or log it as a reclaim.
+    Frozen,
+}
+
 /// Reclaim `issue`'s `loom:building` label, then warn if the forge says
 /// somebody had already opened a PR from its worktree branch.
 ///
-/// A drop-in wrapper around [`crate::claim_reconciliation::forge::reclaim`]:
-/// the return value is that call's, unchanged, and the diagnostic runs only on
-/// success (a failed flip changed nothing worth explaining).
-pub(crate) fn reclaim_and_warn(gh_bin: &Path, root: &Path, issue: u32) -> Result<()> {
-    let result = crate::claim_reconciliation::forge::reclaim(gh_bin, root, issue);
-    if result.is_ok() {
-        if let Some(pr) = open_pr_on_issue_branch(gh_bin, root, issue) {
-            log::warn!("{}", open_pr_warning(issue, pr, root));
+/// A wrapper around [`crate::claim_reconciliation::forge::reclaim`]: an error
+/// is that call's, unchanged, and the diagnostic runs only on success (a
+/// failed flip changed nothing worth explaining). `Ok(Reclaim::Frozen)` is the
+/// frozen skip, which wrote nothing.
+pub(crate) fn reclaim_and_warn(gh_bin: &Path, root: &Path, issue: u32) -> Result<Reclaim> {
+    // #11480: an item another hold took out of the queue loses only the stale
+    // claim; `loom:issue` is not re-added.
+    if let Some(label) = crate::release_veto::veto(gh_bin, root, issue, &[]) {
+        if label == crate::work_finder::FROZEN_LABEL {
+            log::warn!(
+                "claim_reconciliation: #{issue} in {} is `loom:frozen` — not reclaiming, no \
+                 label write (#11743)",
+                root.display()
+            );
+            return Ok(Reclaim::Frozen);
         }
+        log::warn!(
+            "claim_reconciliation: #{issue} in {} carries `{label}` — removing the stale \
+             `loom:building` claim only, NOT re-adding `loom:issue` (#11480)",
+            root.display()
+        );
+        return release_claim_only(gh_bin, root, issue).map(|()| Reclaim::Released);
     }
-    result
+    crate::claim_reconciliation::forge::reclaim(gh_bin, root, issue)?;
+    if let Some(pr) = open_pr_on_issue_branch(gh_bin, root, issue) {
+        log::warn!("{}", open_pr_warning(issue, pr, root));
+    }
+    Ok(Reclaim::Released)
+}
+
+/// The vetoed reclaim (#11480): remove `loom:building`, add nothing.
+fn release_claim_only(gh_bin: &Path, root: &Path, issue: u32) -> Result<()> {
+    use crate::claim_reconciliation::gh_call;
+    let n = issue.to_string();
+    let out = gh_call::output(
+        gh_call::write("claim.issue_reclaim", gh_bin, root)
+            .args(["issue", "edit", &n, "--remove-label", "loom:building"])
+            .args(gh_call::loom_repo_flag()),
+    )?;
+    anyhow::ensure!(
+        out.status.success(),
+        "gh issue edit failed for #{issue} in {}: {}",
+        root.display(),
+        gh_call::stderr(&out)
+    );
+    Ok(())
 }
 
 /// The `feature/issue-<N>` branch convention `worktree.sh` establishes.
@@ -83,54 +128,80 @@ pub fn open_pr_warning(issue: u32, pr: u32, root: &Path) -> String {
     )
 }
 
-/// `gh pr list --head feature/issue-<N> --state open`, reduced to the first PR
-/// number.
+/// The open PRs whose head is issue `issue`'s worktree branch, via the REST
+/// by-head lookup [`crate::forge_pull_listing::open_pulls_for_head_as`]
+/// (#10382: was the GraphQL `gh pr list --head`). Recorded against `caller`.
+///
+/// # Errors
+/// An inconclusive read — never collapsed into "no open PR" (#7863).
+pub(crate) fn open_prs_on_issue_branch(
+    caller: &'static str,
+    gh_bin: &Path,
+    root: &Path,
+    issue: u32,
+) -> Result<Vec<u32>> {
+    let branch = issue_branch(issue);
+    crate::forge_pull_listing::open_pulls_for_head_as(caller, gh_bin, Some(root), None, &branch)
+}
+
+/// The first open PR on issue `issue`'s worktree branch.
 ///
 /// `None` covers BOTH "no such PR" and every failure (missing/failed `gh`,
 /// unparseable output) — this is a diagnostic, so an unanswerable probe simply
 /// produces no warning and never affects the reclaim that already happened.
 pub(crate) fn open_pr_on_issue_branch(gh_bin: &Path, root: &Path, issue: u32) -> Option<u32> {
-    // #5401: the facade applies the cross-owner GH_CONFIG_DIR for `root`.
-    let mut inv = crate::gh_invocation::GhInvocation::new(
-        crate::gh_invocation::Operation::new("reclaim.open_pr_probe"),
-        crate::gh_invocation::AccessIntent::Read,
-        crate::gh_invocation::GhTarget::None,
-        std::time::Duration::from_secs(60),
-    )
-    .forge_op(crate::forge_call_stats::ops::PR_LIST_BY_HEAD)
-    .program(gh_bin)
-    .current_dir(root)
-    .args(["pr", "list", "--head"])
-    .arg(issue_branch(issue))
-    .args(["--state", "open", "--json", "number", "--limit", "1"]);
-    if let Ok(repo) = std::env::var("LOOM_REPO") {
-        inv = inv.arg("--repo").arg(repo);
-    }
-    let crate::cmd_out::CmdOutcome::Ran(output) = inv.run() else {
-        return None;
-    };
-    if !output.status.success() {
-        return None;
-    }
-    parse_first_pr_number(&String::from_utf8_lossy(&output.stdout))
-}
-
-/// First `number` in a `gh pr list --json number` payload, or `None` for an
-/// empty list or anything unparseable.
-#[must_use]
-pub fn parse_first_pr_number(stdout: &str) -> Option<u32> {
-    let value: serde_json::Value = serde_json::from_str(stdout.trim()).ok()?;
-    value
-        .as_array()?
-        .first()?
-        .get("number")?
-        .as_u64()
-        .and_then(|n| u32::try_from(n).ok())
+    let prs = open_prs_on_issue_branch("reclaim.open_pr_probe", gh_bin, root, issue).ok()?;
+    prs.first().copied()
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::write_scope_test_support::WritableRoot;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// #11480: a reclaim on an item another hold took out of the queue
+    /// removes the stale claim only; a plain item is still reclaimed.
+    #[test]
+    #[serial_test::serial]
+    fn a_vetoed_reclaim_removes_the_claim_only() {
+        for (labels, restores) in [
+            (r#"["loom:building","loom:operator-only"]"#, false),
+            (r#"["loom:building"]"#, true),
+            // #11743: frozen — no edit at all (checked below).
+            (r#"["loom:building","loom:frozen"]"#, false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("repo");
+            std::fs::create_dir_all(&root).unwrap();
+            let log = dir.path().join("gh.log");
+            let gh = dir.path().join("gh");
+            let script = format!(
+                "#!/bin/bash\nprintf '%s\\n' \"$*\" >> \"{}\"\ncase \"$*\" in\n\
+                 *'/issues/42 --jq'*) echo '{labels}' ;;\n\
+                 'issue view'*) echo '{{\"labels\":[{{\"name\":\"loom:issue\"}}]}}' ;;\n\
+                 esac\nexit 0\n",
+                log.display()
+            );
+            std::fs::write(&gh, script).unwrap();
+            std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let ws = WritableRoot::register_with_gh(&root, &gh);
+
+            let done = reclaim_and_warn(&ws.gh, &root, 42).unwrap();
+
+            let calls = std::fs::read_to_string(&log).unwrap();
+            if labels.contains("loom:frozen") {
+                assert!(!calls.contains("issue edit"), "{labels}: {calls}");
+                // #11743: distinguishable, so the caller does not count it.
+                assert_eq!(done, Reclaim::Frozen);
+                continue;
+            }
+            assert_eq!(done, Reclaim::Released, "{labels}");
+            assert!(calls.contains("issue edit 42 --remove-label loom:building"), "{calls}");
+            assert_eq!(calls.contains("--add-label loom:issue"), restores, "{labels}: {calls}");
+        }
+    }
 
     #[test]
     fn warning_names_the_issue_the_pr_and_the_branch_convention() {
@@ -147,26 +218,5 @@ mod tests {
     #[test]
     fn issue_branch_matches_the_worktree_naming_convention() {
         assert_eq!(issue_branch(8116), "feature/issue-8116");
-    }
-
-    #[test]
-    fn parses_the_first_pr_number_from_a_gh_listing() {
-        assert_eq!(parse_first_pr_number(r#"[{"number":8081},{"number":8082}]"#), Some(8081));
-    }
-
-    #[test]
-    fn an_empty_listing_yields_no_warning() {
-        assert_eq!(parse_first_pr_number("[]"), None);
-        assert_eq!(parse_first_pr_number("[]\n"), None);
-    }
-
-    /// A diagnostic must never manufacture a verdict out of garbage — an
-    /// unparseable payload simply produces no warning.
-    #[test]
-    fn unparseable_output_yields_no_warning() {
-        assert_eq!(parse_first_pr_number(""), None);
-        assert_eq!(parse_first_pr_number("gh: rate limit exceeded"), None);
-        assert_eq!(parse_first_pr_number(r#"[{"number":"eight"}]"#), None);
-        assert_eq!(parse_first_pr_number(r#"[{}]"#), None);
     }
 }

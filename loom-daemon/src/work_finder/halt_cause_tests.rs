@@ -38,7 +38,7 @@ impl WorkDispatcher for Disp {
     fn occupancy(&self) -> usize {
         self.dispatched.len()
     }
-    fn dispatch(&mut self, issue: u32, _complexity: Option<&str>) -> anyhow::Result<bool> {
+    fn dispatch(&mut self, issue: u32) -> anyhow::Result<bool> {
         self.dispatched.push(issue);
         Ok(true)
     }
@@ -200,7 +200,6 @@ fn halted_row(halt_causes: Option<&[Option<HaltCause>]>) -> crate::types::ReadyQ
         usize::MAX,
         false,
         None,
-        None,
         &[],
     );
     assert_eq!(report.queue.len(), 1);
@@ -248,7 +247,6 @@ fn a_cause_at_a_not_held_index_never_halts_the_workspace() {
         usize::MAX,
         false,
         None,
-        None,
         &[],
     );
     assert_eq!(report.dispatched, 1);
@@ -267,4 +265,176 @@ fn exportable_detail_passes_the_cause_through() {
     assert_eq!(exportable_detail(QueueDisposition::WorkspaceHalted, None), None);
     // Free-form dispositions stay redacted.
     assert_eq!(exportable_detail(QueueDisposition::DispatchError, Some("boom")), None);
+}
+
+// ---- disk admission (#11191) ------------------------------------------------
+
+/// `heavy` (28 GB observed charge) and `light` (1 GB), `remaining_gb` left.
+fn disk_budget(remaining_gb: u64) -> crate::disk_admission::DiskBudget {
+    use crate::disk_admission::{ChargeSource, RepoCharge};
+    let c = |repo: &str, gb| RepoCharge {
+        repo: repo.into(),
+        gb,
+        source: ChargeSource::Observed,
+    };
+    crate::disk_admission::DiskBudget {
+        free_gb: remaining_gb + 3,
+        floor_gb: 3,
+        reserved_gb: 0,
+        remaining_gb,
+        sweeps_in_flight: 0,
+        charges: vec![c("heavy", 28), c("light", 1)],
+    }
+}
+
+#[test]
+fn disk_reservation_is_a_pinned_lowest_precedence_cause() {
+    assert_eq!(HaltCause::DiskReservation.as_str(), "disk_reservation");
+    assert_eq!(HaltCause::from_wire("disk_reservation"), Some(HaltCause::DiskReservation));
+    let b = disk_budget(14);
+    // Not otherwise held: the heavy root is held for disk, the light one not.
+    let folded = super::with_disk_holds(vec![None, None], Some(&b));
+    assert_eq!(folded, vec![Some(HaltCause::DiskReservation), None]);
+    // A root another hold already names keeps that cause.
+    let folded = super::with_disk_holds(vec![Some(HaltCause::MainRed), None], Some(&b));
+    assert_eq!(folded[0], Some(HaltCause::MainRed));
+    // No budget (admission off or unmeasured): unchanged.
+    assert_eq!(super::with_disk_holds(vec![None, None], None), vec![None, None]);
+}
+
+#[test]
+fn pass_two_defers_a_heavy_repo_on_disk_and_admits_a_light_one() {
+    let mut multi = vec![
+        (OneShotSource(Some(vec![item(1)])), Disp::default()),
+        (OneShotSource(Some(vec![item(2), item(3)])), Disp::default()),
+    ];
+    let report = super::super::tick_multi_with_build_backoff(
+        &mut multi,
+        &[1000, 1],
+        10.into(),
+        &[false, false],
+        None,
+        usize::MAX,
+        false,
+        (None, None, Some(disk_budget(14))),
+        &[],
+        &[],
+    );
+    assert!(multi[0].1.dispatched.is_empty(), "28 GB does not fit 14 GB");
+    assert_eq!(multi[1].1.dispatched, vec![2, 3], "a light repo still admits");
+    assert_eq!((report.dispatched, report.deferred_capacity), (2, 1));
+    let rows = super::super::ready_queue::finish(&report.queue, &[]);
+    let heavy = rows.iter().find(|r| r.issue == 1).unwrap();
+    assert_eq!(heavy.disposition, QueueDisposition::DeferredCapacity);
+    let detail = heavy.detail.as_deref().unwrap_or_default();
+    assert!(
+        detail.contains("disk: heavy charge 28GB (observed) exceeds remaining 14GB"),
+        "{detail}"
+    );
+}
+
+#[test]
+fn pass_two_debits_each_disk_admission() {
+    // 30 GB: one heavy sweep fits (28), the second does not, and the 2 GB
+    // left then admits two light sweeps but not a third.
+    let mut multi = vec![
+        (OneShotSource(Some(vec![item(1), item(2)])), Disp::default()),
+        (OneShotSource(Some(vec![item(3), item(4), item(5)])), Disp::default()),
+    ];
+    let report = super::super::tick_multi_with_build_backoff(
+        &mut multi,
+        &[1000, 1],
+        10.into(),
+        &[false, false],
+        None,
+        usize::MAX,
+        false,
+        (None, None, Some(disk_budget(30))),
+        &[],
+        &[],
+    );
+    assert_eq!(multi[0].1.dispatched, vec![1]);
+    assert_eq!(multi[1].1.dispatched, vec![3, 4]);
+    assert_eq!(report.deferred_capacity, 2);
+}
+
+// ---- the tick's own result (#11649) ----------------------------------------
+
+/// **#11649.** The tick report carries the distinct causes of the workspaces
+/// it held — not just "something was halted" — so the `loom.dispatch.tick`
+/// result can say `halted_disk_reservation` instead of `halted_main_red`.
+/// Duplicates fold, the order is `HaltCause::ALL`, and a cause at a not-held
+/// index is ignored.
+#[test]
+fn tick_report_carries_the_held_workspaces_distinct_causes() {
+    let mut multi: Vec<_> = (0..4)
+        .map(|n| (OneShotSource(Some(vec![item(n + 1)])), Disp::default()))
+        .collect();
+    let report = tick_multi_with_repo_cap(
+        &mut multi,
+        &[],
+        10.into(),
+        &[true, true, true, false],
+        Some(&[
+            Some(HaltCause::DiskReservation),
+            Some(HaltCause::Drain),
+            Some(HaltCause::DiskReservation),
+            Some(HaltCause::MainRed),
+        ]),
+        usize::MAX,
+        false,
+        None,
+        &[],
+    );
+    assert!(report.halted);
+    assert_eq!(report.halt_causes, vec![HaltCause::Drain, HaltCause::DiskReservation]);
+    // The not-held workspace still dispatched, and that outranks the hold.
+    let tick = crate::observability::ops::dispatch::tick_result_with(&report, false);
+    assert_eq!((report.dispatched, tick), (1, "dispatched"));
+
+    // A cause-less caller holds without naming a cause.
+    let mut multi = vec![(OneShotSource(Some(vec![item(9)])), Disp::default())];
+    let report =
+        tick_multi_with_repo_cap(&mut multi, &[], 10.into(), &[true], None, 1, false, None, &[]);
+    assert!(report.halted);
+    assert!(report.halt_causes.is_empty());
+}
+
+/// #11649: the single-workspace loop's cause follows `causes_per_root`'s
+/// precedence, and is `None` exactly when nothing holds the root.
+#[test]
+fn single_root_names_the_highest_precedence_hold() {
+    let root = PathBuf::from("/nonexistent/loom-11649");
+    let cause = |holds| super::single_root(&root, holds);
+    assert_eq!(cause((false, false, false, false)), None);
+    assert_eq!(cause((true, true, true, true)), Some(HaltCause::MainRed));
+    assert_eq!(cause((false, true, true, true)), Some(HaltCause::GatePending));
+    assert_eq!(cause((false, false, true, true)), Some(HaltCause::Breaker));
+    assert_eq!(cause((false, false, true, false)), Some(HaltCause::TokenPool));
+}
+
+/// #11742: a held workspace keeps its own hold's cause even at weight 0 (a
+/// weightless `fleet: maintain` repo reads `maintain_only`, not
+/// `weight_zero`); an unheld weight-0 workspace reads `weight_zero`.
+#[test]
+fn a_hold_cause_wins_over_weight_zero() {
+    let row = |held: bool| {
+        let mut multi = vec![(OneShotSource(Some(vec![item(9)])), Disp::default())];
+        let report = tick_multi_with_repo_cap(
+            &mut multi,
+            &[0],
+            10.into(),
+            &[held],
+            Some(&[held.then_some(HaltCause::MaintainOnly)]),
+            usize::MAX,
+            false,
+            None,
+            &[],
+        );
+        let rows = super::super::ready_queue::finish(&report.queue, &[]);
+        rows.into_iter().next().unwrap()
+    };
+    assert_eq!(row(true).detail.as_deref(), Some("maintain_only"));
+    assert_eq!(row(false).detail.as_deref(), Some("weight_zero"));
+    assert_eq!(row(false).disposition, QueueDisposition::WorkspaceHalted);
 }

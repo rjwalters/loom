@@ -28,36 +28,92 @@
 //! The state probe is [`SweepRegistry::fetch_issue_signals`]'s `closed` field — one
 //! REST `gh api` read on the independent pool, breaker-gated, the same cost
 //! shape as the complexity read this terminal path already pays.
+//!
+//! Issue #10955 adds one more carve-out of the same shape: an issue that did
+//! not carry `loom:issue` when it was claimed does not gain it on release.
+//! See [`prior_label`].
 
 use super::*;
 
+mod prior_label;
+
+/// What a claim release did (#11743).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClaimRelease {
+    /// The release edit ran.
+    Released,
+    /// The issue is `loom:frozen`: no label was touched.
+    Frozen,
+}
+
 impl SweepRegistry {
+    /// The reaper's claim release for the reaped dispatch `sweep_id` (Issue
+    /// #11438): [`restore_label_to_ready`](Self::restore_label_to_ready),
+    /// except when that very dispatch self-reported a no-op release
+    /// ([`noop_release_covers_dispatch`](Self::noop_release_covers_dispatch),
+    /// #8912). Such a sweep removed `loom:building` and deliberately left
+    /// `loom:issue` off to stop a claim/release loop; re-adding it ~25 s later
+    /// re-armed the very loop (loom-ui#3508, #2727). So only the stale
+    /// `loom:building` claim is removed — never a queue label re-added.
+    pub(crate) fn restore_label_after_reap(&self, issue: u32, sweep_id: &str) -> Result<()> {
+        if !self.noop_release_covers_dispatch(issue, sweep_id) {
+            return self.restore_label_to_ready(issue);
+        }
+        log::info!(
+            "sweep_registry: sweep {sweep_id} self-reported a no-op release for #{issue} — \
+             removing the stale `loom:building` claim only, NOT re-adding `loom:issue` (#11438)"
+        );
+        self.run_claim_release_edit(
+            issue,
+            vec![
+                "issue".to_string(),
+                "edit".to_string(),
+                issue.to_string(),
+                "--remove-label".to_string(),
+                "loom:building".to_string(),
+            ],
+        )
+    }
+
     /// [`restore_label_to_ready`](Self::restore_label_to_ready) with the
     /// Issue #9463 closed-state carve-out applied. The label-mutation body
     /// lives here (a sibling module) so the size-ratcheted `guards.rs` only
     /// keeps the delegating entry point.
     pub(crate) fn restore_label_to_ready_with_state_check(&self, issue: u32) -> Result<()> {
-        let blocked = self.issue_has_blocked_label(issue);
-        // Only probe `loom:operator-only` when `loom:blocked` doesn't already
-        // decide the outcome — avoids a redundant `gh` call in the (more
-        // common) blocked path.
-        let operator_only = !blocked && self.issue_has_operator_only_label(issue);
-        let parked = blocked || operator_only;
-        // Only probe PR-ness when a park carve-out doesn't already decide the
-        // outcome — avoids a redundant `gh` call on the parked path.
-        let is_pr = !parked && self.issue_is_pull_request(issue).unwrap_or(false);
-        // Issue #9463: the closed-state probe runs last (only when no other
-        // carve-out already decided against the re-add), so the common
-        // non-restore paths pay nothing and a parked/PR restore pays the
-        // same one probe it always did.
-        let closed = if parked || is_pr {
+        self.restore_label_to_ready_checked(issue).map(|_| ())
+    }
+
+    /// [`restore_label_to_ready_with_state_check`](Self::restore_label_to_ready_with_state_check),
+    /// reporting whether the release found the issue `loom:frozen` and so
+    /// wrote nothing (#11743) — for a caller with a write of its own to skip.
+    pub(crate) fn restore_label_to_ready_checked(&self, issue: u32) -> Result<ClaimRelease> {
+        // #11480: one REST read (state + labels) answers both the park
+        // carve-outs and #9463's closed-state probe, and the shared
+        // `restore_veto` decides the park side for every release path. It
+        // replaces the #4206 (`loom:blocked`) and #4887 (`loom:operator-only`)
+        // one-label GraphQL probes. Fail-open as before: a failed read yields
+        // no labels and no state, so the restore goes ahead.
+        let signals = self.release_issue_signals(issue);
+        let veto = crate::work_finder::restore_veto(&signals.labels, &[]);
+        if veto == Some(crate::work_finder::FROZEN_LABEL) {
+            log::info!(
+                "sweep_registry: #{issue} is `loom:frozen` — leaving every label as it is, \
+                 even the stale `loom:building` claim (#11743)"
+            );
+            return Ok(ClaimRelease::Frozen);
+        }
+        // Only probe PR-ness when a veto doesn't already decide the outcome.
+        let is_pr = veto.is_none() && self.issue_is_pull_request(issue).unwrap_or(false);
+        let closed = if veto.is_some() || is_pr {
             None
         } else {
-            // Reuses #9441's combined issue-signals read (state + labels off
-            // one REST call) instead of a separate probe — same fail-open
-            // contract: `None` falls back to the unconditional restore.
-            self.fetch_issue_signals(issue).closed
+            signals.closed
         };
+        // Issue #10955: last of all, and only when the re-add would otherwise
+        // happen — did the claim take `loom:issue` away in the first place?
+        // Only a positive "no" skips the re-add (see `prior_label`).
+        let never_ready = !(veto.is_some() || is_pr || closed == Some(true))
+            && self.claim_took_ready_label(issue) == Some(false);
         let mut args = vec![
             "issue".to_string(),
             "edit".to_string(),
@@ -65,18 +121,11 @@ impl SweepRegistry {
             "--remove-label".to_string(),
             "loom:building".to_string(),
         ];
-        if blocked {
+        if let Some(label) = veto {
             log::info!(
-                "sweep_registry: restore_label_to_ready for #{issue} found `loom:blocked` \
-                 already present — preserving the operator's park by removing the stale \
-                 `loom:building` claim only, NOT re-adding `loom:issue` (#4206)"
-            );
-        } else if operator_only {
-            log::info!(
-                "sweep_registry: restore_label_to_ready for #{issue} found \
-                 `loom:operator-only` already present — preserving the authoritative \
-                 reroute by removing the stale `loom:building` claim only, NOT re-adding \
-                 `loom:issue` (#4887)"
+                "sweep_registry: restore_label_to_ready for #{issue} found `{label}` — \
+                 preserving that hold by removing the stale `loom:building` claim only, NOT \
+                 re-adding `loom:issue` (#11480; was #4206/#4887)"
             );
         } else if is_pr {
             log::info!(
@@ -91,23 +140,88 @@ impl SweepRegistry {
                  `loom:building` claim only, NOT re-adding the `loom:issue` queue label \
                  to a closed issue."
             );
+        } else if never_ready {
+            log::info!(
+                "sweep_registry: restore_label_to_ready for #{issue} found the issue did \
+                 not carry `loom:issue` when it was claimed — removing the stale \
+                 `loom:building` claim only, NOT adding a queue label it never had (#10955)"
+            );
         } else {
             args.extend(["--add-label".to_string(), "loom:issue".to_string()]);
         }
+        self.run_claim_release_edit(issue, args)
+            .map(|()| ClaimRelease::Released)
+    }
+
+    /// The issue-signals read for a release path's restore veto (#11480).
+    ///
+    /// Unlike [`fetch_issue_signals`](Self::fetch_issue_signals) it is NOT
+    /// skipped while the rate-limit breaker suppresses polling: the one-label
+    /// probes it replaced always ran, and a skipped read would let a release
+    /// re-add `loom:issue` beside a veto label for the whole breaker window.
+    /// One REST call, counted as `restore.issue_signals`. Fail-open: a failed
+    /// read yields no labels and no state.
+    pub(crate) fn release_issue_signals(
+        &self,
+        issue: u32,
+    ) -> outcome_journal::complexity_signal::IssueSignals {
+        use outcome_journal::complexity_signal::{
+            parse_issue_signals, IssueSignals, ISSUE_SIGNALS_JQ,
+        };
+        if self.config.skip_label_flip {
+            return IssueSignals::default();
+        }
+        let path = format!("repos/{{owner}}/{{repo}}/issues/{issue}");
+        match self
+            .gh_read("restore.issue_signals", ["api", path.as_str(), "--jq", ISSUE_SIGNALS_JQ])
+        {
+            Ok(Some(o)) if o.status.success() => {
+                parse_issue_signals(&String::from_utf8_lossy(&o.stdout))
+            }
+            Ok(Some(o)) => {
+                let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                crate::rate_limit_breaker::global_observe_failure(&stderr, "restore_issue_signals");
+                log::warn!(
+                    "sweep_registry: release veto read for #{issue} failed ({}) — releasing \
+                     without it (fail-open, #11480): {stderr}",
+                    o.status
+                );
+                IssueSignals::default()
+            }
+            Ok(None) | Err(_) => {
+                log::warn!(
+                    "sweep_registry: release veto read for #{issue} timed out or could not \
+                     run — releasing without it (fail-open, #11480)"
+                );
+                IssueSignals::default()
+            }
+        }
+    }
+
+    /// Run one claim-release `gh issue edit` (`args`) for `issue`, bounded.
+    fn run_claim_release_edit(&self, issue: u32, mut args: Vec<String>) -> Result<()> {
         // Scoped to the registry's workspace (#3937; LOOM_REPO still overrides)
         // and counted as `restore.label` (#10089). Best-effort during reap, but
         // bounded so a wedged `gh` on the `ListSweeps` / `GetSweepStatus` read
         // path cannot block the registry read indefinitely (Issue #3973).
         args.extend(crate::claim_reconciliation::gh_call::loom_repo_flag());
         let timeout = reap_gh_timeout();
-        if self.gh_write("restore.label", &args)?.is_none() {
-            log::warn!(
-                "sweep_registry: restore_label_to_ready gh for #{issue} exceeded {}s \
-                 and was killed (#3973)",
-                timeout.as_secs()
-            );
+        match self.gh_write("restore.label", &args)? {
+            None => {
+                log::warn!(
+                    "sweep_registry: restore_label_to_ready gh for #{issue} exceeded {}s \
+                     and was killed (#3973)",
+                    timeout.as_secs()
+                );
+                anyhow::bail!("label restore for #{issue} timed out after {}s", timeout.as_secs());
+            }
+            Some(out) if !out.status.success() => anyhow::bail!(
+                "label restore for #{issue} failed ({}): {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+            Some(_) => Ok(()),
         }
-        Ok(())
     }
 }
 
@@ -125,6 +239,12 @@ mod tests {
     /// A fake `gh` satisfying every probe the restore path makes, with a
     /// parameterized `.state` answer, recording every invocation.
     fn fake_gh(dir: &Path, state: &str) -> (PathBuf, PathBuf) {
+        fake_gh_labels(dir, state, "")
+    }
+
+    /// [`fake_gh`] whose issue-signals read also reports `labels` (a JSON
+    /// list body, e.g. `"loom:needs-capability"` quoted).
+    fn fake_gh_labels(dir: &Path, state: &str, labels: &str) -> (PathBuf, PathBuf) {
         let fake_gh = dir.join("fake-gh.sh");
         let gh_log = dir.join("gh-calls.log");
         let script = format!(
@@ -138,7 +258,7 @@ if [ "$1" = "api" ]; then
   case "$*" in
     *".pull_request != null"*) echo "false" ;;
     # #9441's combined issue-signals projection (body/state/closed_at/labels).
-    *".state"*) printf '{{"body":"","state":"{state}","closed_at":null,"labels":[]}}' ;;
+    *".state"*) printf '{{"body":"","state":"{state}","closed_at":null,"labels":[{labels}]}}' ;;
     *) echo "" ;;
   esac
   exit 0
@@ -157,6 +277,39 @@ exit 0
         config.gh_bin = Some(fake_gh.to_path_buf());
         config.skip_label_flip = false; // exercise the real restore path
         SweepRegistry::new(config)
+    }
+
+    /// #11480: a lane veto that is not a skip label (`loom:needs-capability`)
+    /// keeps the claim release from re-arming `loom:issue`; the claim goes.
+    #[test]
+    #[serial_test::serial]
+    fn a_veto_label_keeps_the_queue_label_off_on_claim_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let (fake_gh, gh_log) =
+            fake_gh_labels(dir.path(), "open", r#""loom:building","loom:needs-capability""#);
+        let registry = registry_with(&fake_gh, dir.path());
+
+        registry.restore_label_to_ready(11480).unwrap();
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap();
+        assert!(calls.contains("issue edit 11480 --remove-label loom:building"), "{calls}");
+        assert!(!calls.contains("--add-label loom:issue"), "{calls}");
+    }
+
+    /// #11743: the reaper makes no label write at all to a frozen item, not
+    /// even removing the stale `loom:building` claim.
+    #[test]
+    #[serial_test::serial]
+    fn a_frozen_item_gets_no_label_write_on_claim_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let (fake_gh, gh_log) =
+            fake_gh_labels(dir.path(), "open", r#""loom:building","loom:frozen""#);
+        let registry = registry_with(&fake_gh, dir.path());
+
+        registry.restore_label_to_ready(11743).unwrap();
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap();
+        assert!(!calls.contains("issue edit"), "{calls}");
     }
 
     /// #9463 regression: merge closes the issue, then the sweep exits — the
@@ -214,6 +367,69 @@ exit 0
         assert!(
             calls.contains("--add-label loom:issue"),
             "fail-open: an unverifiable state still restores the queue label: {calls}"
+        );
+    }
+
+    /// Issue #11438: when the reaped dispatch itself self-reported a no-op
+    /// release (#8912's dispatch-scoped record), the release removes only the
+    /// stale `loom:building` claim. Re-adding `loom:issue` ~25 s later re-armed
+    /// the claim/release loop (loom-ui#3508: claim released 09:07:29Z,
+    /// `loom:issue` restored 09:07:55Z, re-claimed 09:10:00Z).
+    #[test]
+    #[serial_test::serial]
+    fn a_self_reported_noop_releases_only_the_stale_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let (fake_gh, gh_log) = fake_gh(dir.path(), "open");
+        let mut registry = registry_with(&fake_gh, dir.path());
+
+        let sweep_id = crate::sweep_registry::test_support::insert_clean_exit_running(
+            &mut registry,
+            114_380,
+            0,
+        );
+        registry.record_noop_release(114_380, Some("no build work".into()));
+        assert!(registry.noop_release_covers_dispatch(114_380, &sweep_id));
+
+        registry
+            .restore_label_after_reap(114_380, &sweep_id)
+            .unwrap();
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap();
+        assert!(
+            calls.contains("issue edit 114380 --remove-label loom:building"),
+            "the stale claim is still removed: {calls}"
+        );
+        assert!(
+            !calls.contains("--add-label loom:issue"),
+            "a self-reported no-op deliberately left `loom:issue` off — re-adding it \
+             re-arms the loop (#11438): {calls}"
+        );
+    }
+
+    /// The guard on the fix: without a self-report the crash-recovery restore
+    /// is byte-identical to `restore_label_to_ready`.
+    #[test]
+    #[serial_test::serial]
+    fn a_plain_reap_restore_is_unchanged_without_a_noop_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let (fake_gh, gh_log) = fake_gh(dir.path(), "open");
+        let mut registry = registry_with(&fake_gh, dir.path());
+
+        let sweep_id = crate::sweep_registry::test_support::insert_clean_exit_running(
+            &mut registry,
+            114_381,
+            0,
+        );
+        assert!(!registry.noop_release_covers_dispatch(114_381, &sweep_id));
+
+        registry
+            .restore_label_after_reap(114_381, &sweep_id)
+            .unwrap();
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap();
+        assert!(
+            calls.contains("issue edit 114381 --remove-label loom:building --add-label loom:issue"),
+            "an ordinary crash-recovery restore still re-queues the issue: {calls}"
         );
     }
 }

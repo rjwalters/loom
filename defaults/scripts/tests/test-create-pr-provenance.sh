@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # test-create-pr-provenance.sh — create-pr.sh appends exactly one hidden
-# `<!-- loom:provenance v1 ... -->` line to the PR body (#9027, D33).
+# `<!-- loom:provenance v1 ... -->` line to the PR body (#9027;
+# contract: 2AMLogic/2am infra/ops/docs/provenance.md).
 #
 # Hermetic: `gh` and the daemon are stubs on PATH / $LOOM_DAEMON_SELF_BIN. The
 # marker's *content* is `loom-daemon provenance pr-marker`'s, covered by the
@@ -71,6 +72,13 @@ if [[ "\$1" == "forge" && "\$2" == "check-open-pr" ]]; then
   printf '%s\n' "\$*" > "\$LOOM_TEST_STUB_DIR/daemon-forge-args.txt"
   exit 1
 fi
+# Likewise the #10476 pre-PR gate receipt probe (\`preflight --check\`):
+# exit 0 (receipt present) silently, outside the provenance call's capture.
+if [[ "\$1" == "preflight" ]]; then
+  exit 0
+fi
+# #10518: the priority-label copy asks too; nothing to copy here.
+if [[ "\$1" == "forge" && "\$2" == "priority-labels" ]]; then cat >/dev/null; exit 0; fi
 printf '%s\n' "\$*" > "\$LOOM_TEST_STUB_DIR/daemon-args.txt"
 cat > "\$LOOM_TEST_STUB_DIR/daemon-stdin.txt"
 echo '$MARKER'
@@ -139,7 +147,7 @@ assert_eq "Closes #42" "$(head -n1 "$STUB_DIR/body.txt")" "T1: original body pre
 assert_eq "provenance pr-marker --body-file - --base-ref origin/main" \
   "$(cat "$STUB_DIR/daemon-args.txt")" "T1: base ref is passed through"
 assert_eq "Closes #42" "$(cat "$STUB_DIR/daemon-stdin.txt")" \
-  "T1: the body goes to the daemon, which derives the D32 story from it"
+  "T1: the body goes to the daemon, which derives the story from it"
 
 # T2: a daemon without the subcommand -> the explicit all-unknown record.
 LOOM_DAEMON_SELF_BIN="$STUB_DIR/daemon-old" run_create_pr --body "Closes #42"

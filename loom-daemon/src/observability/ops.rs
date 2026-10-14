@@ -27,26 +27,39 @@
 //! and idle slots per host, [`stage_dwell`] forge label-stage dwell, and
 //! [`disposition`] (#9222) one span per ready-queue row's disposition, on
 //! transition or periodic refresh. [`ratelimit`] (#10022) exports GitHub
-//! rate-limit breaker trips, quota gauges and breaker skips, and
+//! rate-limit breaker trips, quota gauges (per bucket since W1) and breaker
+//! skips, [`forge_calls`] (W1) the facade's `loom.forge.calls` counter, and
 //! [`redate_chain`] (#10163) #8508 re-date pressure (re-dated PRs, re-dates
-//! per PR, time to land). A new emitter adds a `MetricName`/`SpanName`
+//! per PR, time to land), [`reader_withdrawal`] (W4-A) one
+//! `forge.reader.withdrawn` span per reader withdrawal, and [`reader_spill`]
+//! (W4-B) one `forge.reader.spill` span per read-pool spill-latch
+//! transition. [`ipc_latency`] (#10765) exports IPC request latency by
+//! request kind on its own ticker. [`build_gate`] (#11690) one
+//! `build_gate.run` span per host-side run of `buildGate.command`. A new emitter adds a `MetricName`/`SpanName`
 //! variant and calls the same two functions.
 //!
 //! Tests observe what a seam emitted through the global functions with
 //! [`capture::capture`], a per-thread recorder (test builds only).
 
+pub mod build_gate;
 #[cfg(test)]
 pub mod capture;
+pub mod codex_session;
 pub mod dispatch;
 pub mod disposition;
 pub mod dwell;
+pub mod forge_calls;
 pub mod host;
+pub mod ipc_latency;
 pub mod liveness;
 pub mod lockout;
 pub mod pool_marks;
 pub mod queue;
 pub mod quota;
 pub mod ratelimit;
+pub mod read_shed;
+pub mod reader_spill;
+pub mod reader_withdrawal;
 pub mod redate_chain;
 pub mod stage_dwell;
 pub mod turnaround;
@@ -206,6 +219,13 @@ pub fn emit_record(record: TelemetryRecord) {
     if let Some(sink) = global_ops_sink() {
         sink.emit_record(record);
     }
+}
+
+/// Whether [`emit_record`] would deliver a record from this thread (the same
+/// test as [`spans_exported`]), so a producer can skip building one (#11641).
+#[must_use]
+pub fn records_exported() -> bool {
+    spans_exported()
 }
 
 /// Whether [`emit_span`] would deliver a span from this thread: a global sink

@@ -29,6 +29,7 @@ pub mod audit;
 pub mod context;
 pub mod eligibility;
 pub mod expr;
+pub mod main_cancel;
 pub mod workflow;
 pub mod yaml;
 

@@ -130,7 +130,7 @@ expect "TOC lists the new section"                    "$TOC" "[Backlog Rightsizi
 
 echo ""
 echo "Test group 4: guide.md hands sibling micro-issues to Curator"
-PRIO="$(section "$GUIDE_MD" '^## Tier Labels and Duplicate Checks')"
+PRIO="$(section "$GUIDE_MD" '^## Priority Labels and Duplicate Checks')"
 expect "guide defers sibling micro-issues to Curator" "$PRIO" "sibling micro-issues: leave for Curator"
 expect "guide points at the curator section"          "$PRIO" "\"Backlog Rightsizing\""
 
@@ -142,6 +142,23 @@ echo "Test group 5: generated agent-skill copies carry the same rules"
 SRS="$(section "$CURATOR_SKILL" '^## Backlog Rightsizing')"
 expect "loom-curator skill has the section"           "$SRS" "Consolidation gate — before \`loom:curated\`"
 expect "loom-guide skill has the handoff"             "$(cat "$GUIDE_SKILL")" "sibling micro-issues: leave for Curator"
+
+echo ""
+echo "Test group 6: Curator refuses a PR target before its first claim write (#9929)"
+# Not rightsizing, but the same prompt-lint shape: a trim must not drop the
+# kind probe, and it must precede the `loom:curating` write on the claim path.
+ARGS="$(section "$CURATOR_MD" '^## Argument Handling')"
+expect "kind probe reads the target url"            "$ARGS" "gh issue view <number> --json url"
+expect "a /pull/ url or failed read means refuse"   "$ARGS" "a \`/pull/\` URL or a failed read means refuse"
+probe_line="$(grep -nF -- "--json url --jq .url" <<< "$ARGS" | head -1 | cut -d: -f1)"
+claim_line="$(grep -nF -- "labels[]=loom:curating" <<< "$ARGS" | head -1 | cut -d: -f1)"
+if [[ -n "$probe_line" && -n "$claim_line" && "$probe_line" -lt "$claim_line" ]]; then
+    pass "probe precedes the loom:curating claim write"
+else
+    fail "probe precedes the loom:curating claim write (probe=$probe_line claim=$claim_line)"
+fi
+CLAIMING="$(awk '/^## Claiming Work/{f=1;next} /^## /{f=0} f' "$CURATOR_MD")"
+expect "general claim recipe defers to the kind probe" "$CLAIMING" "kind probe (Argument Handling)"
 
 echo ""
 echo "================================"

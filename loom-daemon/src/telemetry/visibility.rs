@@ -2,8 +2,9 @@
 //!
 //! Every telemetry record that references a repository carries a
 //! [`RepoVisibility`](super::RepoVisibility) tag. Deriving it means asking the
-//! forge whether the repo is private (`gh api repos/{owner}/{repo} --jq
-//! .private`) — a subprocess call far too expensive to pay per emitted record.
+//! forge whether the repo is private (a conditional `gh api --include
+//! repos/{owner}/{repo}` through [`crate::forge_etag_store`], reading
+//! `.private`) — a subprocess call far too expensive to pay per emitted record.
 //! This module memoizes the answer per `owner/repo`, modeled on the exact
 //! "avoid one probe per record" shape [`crate::cpu_headroom`] uses for the
 //! measured idle fraction:
@@ -37,6 +38,26 @@
 //! close that gap: exactly one `warn` line is emitted per repo per outage (not
 //! per record — outages are typically many probe attempts, all deduped to one
 //! line), and exactly one `info` line on recovery.
+//!
+//! # Conditional revalidation (#10512)
+//!
+//! The probe goes through the shared ETag store under the `"visibility-"`
+//! prefix: the `ETag` and body of every `200` persist on disk, so a TTL
+//! expiry (or a daemon restart) revalidates with `If-None-Match` and an
+//! unchanged repo answers a `304` that is free on the core bucket. The TTL is
+//! one hour, so a public/private flip is seen within an hour (it was 5 min);
+//! nothing but a `200` body saying `"private": false` ever raises a repo to
+//! Public.
+//!
+//! # Installation snapshot first (W8)
+//!
+//! [`derive_visibility`] now asks the credential's installation snapshot
+//! ([`crate::forge_repo_facts::installation`]) before any per-repo probe: one
+//! hourly conditional listing per credential instead of one read per repo.
+//! A repo absent from a fresh snapshot, or a snapshot that is stale or failed,
+//! is Private — the per-repo cache's stale-survives fallback does not apply
+//! there. Only a user credential (which has no installation listing) or the
+//! kill switch takes the per-repo probe below.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -49,7 +70,15 @@ use super::RepoVisibility;
 /// changes rarely, so a generous window keeps the forge-probe rate negligible
 /// even under a high record-emission rate. Longer than [`crate::cpu_headroom::
 /// CPU_UTIL_MEMO_TTL`] on purpose: visibility is far more stable than CPU load.
-pub const VISIBILITY_CACHE_TTL: Duration = Duration::from_secs(300);
+/// One hour (#10512, parity with `repo_identity`'s positive TTL): each expiry
+/// is a conditional revalidation, so it is also the bound on how long a
+/// public/private flip goes unseen.
+pub const VISIBILITY_CACHE_TTL: Duration = Duration::from_secs(3600);
+
+/// How long a failed probe backs off when no rate-limit reset is known —
+/// the pre-#10512 5-minute cadence, kept separate from the (longer) answer TTL
+/// so a transient failure on a cold repo is retried as soon as it was before.
+const FAILURE_BACKOFF: Duration = Duration::from_secs(300);
 
 /// One cached visibility answer plus when it was last refreshed (for the TTL gate).
 struct VisibilityEntry {
@@ -80,7 +109,7 @@ fn next_probe_after() -> &'static Mutex<HashMap<String, Instant>> {
 
 /// How long to back off after `failure`. A rate limit waits for the breaker's
 /// reported cooldown end when one is known; everything else (and a rate limit
-/// with no known reset) waits at least [`VISIBILITY_CACHE_TTL`].
+/// with no known reset) waits [`FAILURE_BACKOFF`].
 fn backoff_for(failure: ProbeFailure) -> Duration {
     if failure == ProbeFailure::RateLimited {
         if let Some(until) =
@@ -91,7 +120,7 @@ fn backoff_for(failure: ProbeFailure) -> Duration {
             }
         }
     }
-    VISIBILITY_CACHE_TTL
+    FAILURE_BACKOFF
 }
 
 /// The cached visibility for `owner_repo`, or `None` when nothing has been cached
@@ -212,8 +241,39 @@ where
 /// Blocks when the cache is cold/stale (see [`refresh_visibility_cache`]).
 #[must_use]
 pub fn derive_visibility(owner_repo: &str) -> RepoVisibility {
+    derive_visibility_from(
+        owner_repo,
+        crate::forge_repo_facts::installation::lookup_repo(owner_repo),
+    )
+}
+
+/// [`derive_visibility`] given the installation snapshot's answer (W8): the
+/// snapshot decides when it applies ([`snapshot_visibility`]); only a user
+/// credential (or the kill switch) takes the per-repo probe below.
+fn derive_visibility_from(
+    owner_repo: &str,
+    snapshot: crate::forge_repo_facts::installation::Answer,
+) -> RepoVisibility {
+    if let Some(v) = snapshot_visibility(&snapshot) {
+        return v;
+    }
     refresh_visibility_cache(owner_repo);
     cached_visibility(owner_repo).unwrap_or(RepoVisibility::Private)
+}
+
+/// What the installation snapshot says, or `None` for the per-repo probe.
+/// **Fail-private:** only a FRESH snapshot that lists the repo with
+/// `"private": false` is Public. Absent from the snapshot, a stale or failed
+/// snapshot — all Private, never the per-repo cache's last-known answer.
+fn snapshot_visibility(
+    answer: &crate::forge_repo_facts::installation::Answer,
+) -> Option<RepoVisibility> {
+    use crate::forge_repo_facts::installation::Answer;
+    match answer {
+        Answer::Listed(Some(e)) if !e.private => Some(RepoVisibility::Public),
+        Answer::Listed(_) | Answer::Unavailable => Some(RepoVisibility::Private),
+        Answer::PerRepo | Answer::Disabled => None,
+    }
 }
 
 /// Why a visibility probe failed to positively establish a repo's visibility.
@@ -228,7 +288,7 @@ enum ProbeFailure {
     NonZeroExit,
     /// `gh` exited non-zero and its stderr carried a rate-limit signature (#10087).
     RateLimited,
-    /// `gh` exited `0` but the `.private` output was not a bare `true`/`false`.
+    /// The read answered but its `.private` was not a JSON boolean.
     UnparseableOutput,
 }
 
@@ -243,67 +303,61 @@ impl fmt::Display for ProbeFailure {
     }
 }
 
-/// Probe the forge for a repo's visibility via `gh api repos/{owner}/{repo} --jq
-/// .private`. Returns `Ok(Private)`/`Ok(Public)` on a clean `true`/`false`
-/// answer, and `Err(ProbeFailure)` on any failure (missing/erroring `gh`,
-/// non-boolean output) so [`derive_visibility`] falls back to the private-safe
-/// default rather than caching a guess — and so the caller can name the
-/// failure mode in its log line instead of it being swallowed.
+/// Probe the forge for a repo's visibility: a conditional `gh api --include
+/// repos/{owner}/{repo}` through the shared ETag store (#10512), whose `200`
+/// body is parsed for `.private` and whose `304` serves the stored body.
+/// Returns `Ok(Private)`/`Ok(Public)` on a clean boolean answer, and
+/// `Err(ProbeFailure)` on any failure (missing/erroring `gh`, a `404`, a
+/// non-boolean `.private`) so [`derive_visibility`] falls back to the
+/// private-safe default rather than caching a guess — and so the caller can
+/// name the failure mode in its log line instead of it being swallowed.
+///
+/// The caller string stays `visibility.repo` (#10089 accounting) and the
+/// store names `owner/repo` in the URL with no checkout `cwd`, so the read
+/// runs under the target owner's credential (#5431). The store books the
+/// call, feeds the rate-limit breaker, and honours its suppression.
 fn fetch_visibility_via_gh(owner_repo: &str) -> Result<RepoVisibility, ProbeFailure> {
-    use crate::cmd_out::{CmdOutcome, Unavailable};
-    use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
-    // #5431: this probe carries `owner/repo` in the API path but no
-    // checkout-root `current_dir`, so the facade keys the token off the typed
-    // target's owner. Without it a cross-owner *private* repo 404s under the
-    // root owner's token and is (safely) reported Private even when the
-    // owner's own token could read it. #10089: through the facade, so every
-    // probe — including the failed-probe retries #10087 tracks — is counted
-    // under `visibility.repo`.
-    let target = GhTarget::repo(owner_repo).unwrap_or(GhTarget::None);
-    let path = format!("repos/{owner_repo}");
-    let output = match GhInvocation::new(
-        Operation::new("visibility.repo"),
-        AccessIntent::Read,
-        target,
-        Duration::from_secs(30),
+    use crate::forge_etag_store::{cached_read, ConditionalRead};
+    let gh_bin = std::path::PathBuf::from(crate::gh_invocation::gh_bin());
+    let read = cached_read(
+        ConditionalRead::new("visibility.repo", crate::forge_call_stats::ops::REPO_VIEW),
+        &gh_bin,
+        None,
+        Some(owner_repo),
+        &format!("repos/{owner_repo}"),
+        "visibility-",
     )
-    .forge_op(crate::forge_call_stats::ops::REPO_VIEW)
-    .args(["api", &path, "--jq", ".private"])
-    .run()
-    {
-        CmdOutcome::Ran(output) => output,
-        CmdOutcome::Unavailable(Unavailable::Spawn(_)) => return Err(ProbeFailure::SpawnFailed),
-        CmdOutcome::Unavailable(_) => return Err(ProbeFailure::NonZeroExit),
-    };
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(classify_failure(&stderr));
-    }
-    parse_gh_private(&String::from_utf8_lossy(&output.stdout))
-        .ok_or(ProbeFailure::UnparseableOutput)
+    .map_err(|e| classify_failure(&e.to_string()))?;
+    // A `404` (`body: None`) is the fail-closed path, never cached (#6039).
+    let body = read.body.ok_or(ProbeFailure::NonZeroExit)?;
+    parse_repo_private_json(&body).ok_or(ProbeFailure::UnparseableOutput)
 }
 
-/// Classify a non-zero `gh` exit from its stderr. On a rate-limit signature,
-/// also trip the shared breaker so it supplies the real reset time (#10087).
-fn classify_failure(stderr: &str) -> ProbeFailure {
-    if crate::rate_limit_breaker::indicates_rate_limit(stderr) {
-        let _ = crate::rate_limit_breaker::global_observe_failure(stderr, "telemetry_visibility");
+/// Classify a failed store read from its error text. The store has already
+/// fed the shared breaker (#10087), so this only names the failure mode and
+/// picks the backoff ([`backoff_for`]).
+fn classify_failure(err: &str) -> ProbeFailure {
+    if crate::rate_limit_breaker::indicates_rate_limit(err) || err.contains("rate-limit breaker") {
         ProbeFailure::RateLimited
+    } else if err.starts_with("failed to invoke") {
+        ProbeFailure::SpawnFailed
     } else {
         ProbeFailure::NonZeroExit
     }
 }
 
-/// Parse the `--jq .private` output (`"true"`/`"false"`) into a visibility.
+/// Parse a `repos/{owner}/{repo}` JSON body's `.private` into a visibility.
 /// `true` ⇒ [`RepoVisibility::Private`], `false` ⇒ [`RepoVisibility::Public`],
-/// anything else ⇒ `None` (unparseable — caller falls back to Private). Split
-/// from the subprocess I/O so it is unit-testable without a real `gh`.
+/// anything else (missing, `null`, non-boolean, not JSON) ⇒ `None`
+/// (unparseable — caller falls back to Private). Split from the subprocess
+/// I/O so it is unit-testable without a real `gh`.
 #[must_use]
-fn parse_gh_private(output: &str) -> Option<RepoVisibility> {
-    match output.trim() {
-        "true" => Some(RepoVisibility::Private),
-        "false" => Some(RepoVisibility::Public),
-        _ => None,
+fn parse_repo_private_json(body: &str) -> Option<RepoVisibility> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    if value.get("private")?.as_bool()? {
+        Some(RepoVisibility::Private)
+    } else {
+        Some(RepoVisibility::Public)
     }
 }
 
@@ -373,6 +427,10 @@ fn note_probe_recovered(owner_repo: &str) {
 }
 
 #[cfg(test)]
+#[path = "visibility_snapshot_tests.rs"]
+mod snapshot_tests;
+
+#[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
@@ -384,21 +442,26 @@ mod tests {
     // but distinct keys keep the tests correct under both).
 
     // ------------------------------------------------------------------
-    // parse_gh_private — pure parsing.
+    // parse_repo_private_json — pure parsing.
     // ------------------------------------------------------------------
 
     #[test]
-    fn parse_gh_private_maps_bools() {
-        assert_eq!(parse_gh_private("true\n"), Some(RepoVisibility::Private));
-        assert_eq!(parse_gh_private("false\n"), Some(RepoVisibility::Public));
-        assert_eq!(parse_gh_private("  true  "), Some(RepoVisibility::Private));
+    fn parse_repo_private_json_maps_bools() {
+        let parse = parse_repo_private_json;
+        assert_eq!(parse(r#"{"private":true}"#), Some(RepoVisibility::Private));
+        assert_eq!(parse(r#"{"private":false,"x":1}"#), Some(RepoVisibility::Public));
+        assert_eq!(parse(" {\"private\": true}\n"), Some(RepoVisibility::Private));
     }
 
     #[test]
-    fn parse_gh_private_unparseable_is_none() {
-        assert_eq!(parse_gh_private(""), None);
-        assert_eq!(parse_gh_private("null"), None);
-        assert_eq!(parse_gh_private("not-a-bool"), None);
+    fn parse_repo_private_json_unparseable_is_none() {
+        let parse = parse_repo_private_json;
+        assert_eq!(parse(""), None);
+        assert_eq!(parse("true"), None, "the old --jq output is not a repo body");
+        assert_eq!(parse(r#"{"name":"r"}"#), None, "missing");
+        assert_eq!(parse(r#"{"private":null}"#), None);
+        assert_eq!(parse(r#"{"private":"false"}"#), None, "non-bool");
+        assert_eq!(parse("not json"), None);
     }
 
     // ------------------------------------------------------------------
@@ -521,6 +584,75 @@ mod tests {
             ProbeFailure::RateLimited
         );
         assert_eq!(classify_failure("gh: Not Found (HTTP 404)"), ProbeFailure::NonZeroExit);
+        assert_eq!(
+            classify_failure("rate-limit breaker is suppressing forge calls"),
+            ProbeFailure::RateLimited
+        );
+        assert_eq!(classify_failure("failed to invoke /no/gh"), ProbeFailure::SpawnFailed);
+    }
+
+    // ------------------------------------------------------------------
+    // #10512: the real probe through the shared ETag store.
+    // ------------------------------------------------------------------
+
+    /// A `200 {"private":false}` caches Public; once the entry is past the
+    /// TTL the refresh revalidates with `If-None-Match`, the `304` keeps
+    /// Public and is booked free (`not_modified`). A `404` is never cached
+    /// and backs off (one spawn for three refreshes).
+    #[test]
+    #[serial_test::serial(loom_config_env)]
+    fn stale_entry_revalidates_conditionally_and_a_304_keeps_the_answer() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("gh.log");
+        let gh = tmp.path().join("gh-visibility");
+        let script = format!(
+            r#"#!/bin/sh
+echo "$*" >> {log}
+case "$*" in
+  *missing-10512*) printf 'HTTP/2.0 404 Not Found\r\n\r\n{{"message":"Not Found"}}'; exit 1 ;;
+  *If-None-Match*) printf 'HTTP/2.0 304 Not Modified\r\nEtag: W/"v1"\r\n\r\n'; exit 1 ;;
+esac
+printf 'HTTP/2.0 200 OK\r\nEtag: W/"v1"\r\n\r\n{{"private":false}}'
+"#,
+            log = log.display()
+        );
+        std::fs::write(&gh, script).unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let key = "test-owner/conditional-revalidate-10512";
+        let missing = "test-owner/missing-10512";
+        let sink = tempfile::tempdir().unwrap();
+        std::env::set_var("LOOM_GH_BIN", &gh);
+        crate::forge_call_stats::set_test_sink_dir(Some(sink.path().to_path_buf()));
+
+        refresh_visibility_cache(key);
+        assert_eq!(cached_visibility(key), Some(RepoVisibility::Public));
+        refresh_visibility_cache(key); // fresh: no spawn
+        cache().lock().unwrap().get_mut(key).unwrap().updated_at =
+            Instant::now() - VISIBILITY_CACHE_TTL - Duration::from_secs(1);
+        refresh_visibility_cache(key);
+        for _ in 0..3 {
+            refresh_visibility_cache(missing);
+        }
+
+        let report = crate::forge_call_stats::status_report(chrono::Utc::now(), None);
+        crate::forge_call_stats::set_test_sink_dir(None);
+        std::env::remove_var("LOOM_GH_BIN");
+        assert_eq!(cached_visibility(key), Some(RepoVisibility::Public));
+        assert_eq!(cached_visibility(missing), None, "a 404 is never cached");
+        let argv = std::fs::read_to_string(&log).unwrap();
+        let lines: Vec<&str> = argv.lines().collect();
+        assert_eq!(lines.len(), 3, "200, 304, then one backed-off 404: {argv}");
+        assert!(!lines[0].contains("If-None-Match"), "{argv}");
+        assert!(lines[1].contains(r#"If-None-Match: W/"v1""#), "{argv}");
+        let rows = report.host_window.unwrap_or_default();
+        let sum = |f: fn(&crate::types::ForgeCallCounts) -> u64| -> u64 {
+            rows.iter()
+                .filter(|r| r.caller == "visibility.repo")
+                .map(f)
+                .sum()
+        };
+        assert_eq!((sum(|r| r.ok), sum(|r| r.not_modified)), (1, 1), "{rows:?}");
     }
 
     // ------------------------------------------------------------------

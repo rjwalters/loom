@@ -13,9 +13,9 @@
 //! safety-critical branch. #4381 was a live incident where an update-script
 //! code path silently overwrote a real production binary, and the same
 //! "automation quietly does something destructive to real machine state" risk
-//! applies to the two auto-resolutions here. Do NOT widen either classifier —
+//! applies to the three auto-resolutions here. Do NOT widen any classifier —
 //! not a loose prefix match, not an empty-diff check that misses a rename or a
-//! mode-only change. When genuinely unsure, both must answer `false` so the
+//! mode-only change. When genuinely unsure, each must answer `false` so the
 //! caller falls through to the hard abort.
 
 use std::path::{Path, PathBuf};
@@ -25,6 +25,7 @@ use super::args::{Args, FetchMode};
 use super::out;
 use super::paths;
 use super::util;
+use crate::git_ff_identical;
 
 /// Loom-managed installed-surface prefixes this script may discard local edits
 /// to when auto-resolving.
@@ -159,6 +160,12 @@ pub fn sync_with_origin(repo_root: &Path, args: &Args, state: &mut SyncState) ->
     // forge-supplied `headRefName`, so this is the separator half of the
     // mitigation only: form kept uniform across every sink so a future reader
     // does not have to re-derive which argvs are exposed.
+    // Below the disk floor, skip the fetch like an unreachable origin: an
+    // aborted fetch on a full disk leaves a partial tmp_pack_* behind (#10995).
+    if let Some(reason) = crate::fetch_headroom::skip_reason(repo_root) {
+        out::warn(&format!("note: {reason} — proceeding with local HEAD as-is."));
+        return true;
+    }
     let fetch_ok = if util::have("timeout") {
         Command::new("timeout")
             .arg("5")
@@ -250,8 +257,9 @@ pub fn sync_with_origin(repo_root: &Path, args: &Args, state: &mut SyncState) ->
     classify_and_report(repo_root, &branch, args, state)
 }
 
-/// The three ff-abort branches, in the shell's order: content-identical first,
-/// then all-dirty-managed, then the generic hard abort.
+/// The four ff-abort branches: content-identical first, then
+/// all-dirty-managed, then all-dirty-identical-to-origin (#11539), then the
+/// generic hard abort.
 fn classify_and_report(repo_root: &Path, branch: &str, args: &Args, state: &mut SyncState) -> bool {
     if content_identical(repo_root, branch) {
         out::warn(&format!(
@@ -285,7 +293,8 @@ fn classify_and_report(repo_root: &Path, branch: &str, args: &Args, state: &mut 
             managed.join(" ")
         ));
         if args.auto_resolve_safe_abort {
-            let mut checkout: Vec<&str> = vec!["checkout", "--"];
+            let mut checkout: Vec<&str> =
+                vec![git_ff_identical::LITERAL_PATHSPECS, "checkout", "--"];
             checkout.extend(managed.iter().map(String::as_str));
             let merged = git_inherit(repo_root, &checkout)
                 && git_inherit(
@@ -332,6 +341,37 @@ fn classify_and_report(repo_root: &Path, branch: &str, args: &Args, state: &mut 
         return false;
     }
 
+    if let Some(identical) = dirty_tracked_identical_to_origin(repo_root, branch) {
+        out::warn(&format!(
+            "Fast-forward merge from origin/{branch} was blocked by dirty tracked file(s), but EVERY one of them is already identical to origin/{branch}'s version (nothing would be lost by the fast-forward): {}",
+            identical.join(" ")
+        ));
+        if args.auto_resolve_safe_abort {
+            let checkout = git_ff_identical::discard_args(&identical);
+            let merged = git_inherit(repo_root, &checkout)
+                && git_inherit(
+                    repo_root,
+                    &["merge", "--ff-only", &format!("origin/{branch}"), "--quiet"],
+                );
+            if merged {
+                out::ok(&format!(
+                    "Auto-resolved (--auto-resolve-safe-abort): discarded local edits identical to origin/{branch} and fast-forwarded."
+                ));
+                state.ff_synced = true;
+                return true;
+            }
+            out::err("Auto-resolve (--auto-resolve-safe-abort) failed: discarding the identical edits + fast-forward did not both succeed.");
+            return false;
+        }
+        out::err(&format!(
+            "Safe to resolve: git -C \"{}\" --literal-pathspecs checkout HEAD -- {}",
+            repo_root.display(),
+            identical.join(" ")
+        ));
+        out::err("Re-run with --auto-resolve-safe-abort to perform this automatically, or run the command above by hand.");
+        return false;
+    }
+
     out::err(&format!(
         "Fast-forward merge from origin/{branch} did not apply — local commits have diverged, or a dirty tracked file conflicts with the incoming change."
     ));
@@ -371,6 +411,10 @@ fn git_inherit(repo_root: &Path, args: &[&str]) -> bool {
         .arg("-C")
         .arg(repo_root)
         .args(args)
+        .env(
+            "GIT_REFLOG_ACTION",
+            crate::fleet_sync::checkout_ff::external_change::tag("update"),
+        )
         .status()
         .is_ok_and(|s| s.success())
 }
@@ -491,6 +535,26 @@ fn is_managed_path(repo_root: &Path, path: &str) -> bool {
     false
 }
 
+/// Every TRACKED dirty path, exact: `git status --porcelain -z`
+/// (NUL-separated, never C-quoted; a rename contributes both of its paths),
+/// parsed by [`git_ff_identical::tracked_paths_from_porcelain_z`]. Empty —
+/// so neither auto-resolve class applies — when git fails or a path is not
+/// exact UTF-8.
+fn dirty_tracked_paths(repo_root: &Path) -> Vec<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(git_ff_identical::STATUS_ARGS)
+        .stderr(Stdio::null())
+        .output();
+    match out {
+        Ok(out) if out.status.success() => {
+            git_ff_identical::tracked_paths_from_porcelain_z(&out.stdout).unwrap_or_default()
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// `_ff_abort_all_dirty_tracked_managed` — `Some(paths)` iff at least one
 /// TRACKED file is dirty and EVERY one of them is a managed path.
 ///
@@ -498,35 +562,35 @@ fn is_managed_path(repo_root: &Path, path: &str) -> bool {
 /// unmanaged dirty file alongside managed ones still falls through to the hard
 /// abort.
 fn all_dirty_tracked_managed(repo_root: &Path) -> Option<Vec<String>> {
-    let mut managed = Vec::new();
-    let mut found_any = false;
-    for line in porcelain(repo_root) {
-        if &line[..2.min(line.len())] == "??" {
-            continue;
-        }
-        let mut path = line.get(3..).unwrap_or("").to_string();
-        if let Some(idx) = path.find(" -> ") {
-            path = path[idx + " -> ".len()..].to_string();
-        }
-        // `${path%\"}` then `${path#\"}` — one trailing quote, then one
-        // leading quote, in that order.
-        if path.ends_with('"') {
-            path.pop();
-        }
-        if path.starts_with('"') {
-            path.remove(0);
-        }
-        found_any = true;
-        if !is_managed_path(repo_root, &path) {
-            return None;
-        }
-        managed.push(path);
+    let paths = dirty_tracked_paths(repo_root);
+    if paths.is_empty() || !paths.iter().all(|p| is_managed_path(repo_root, p)) {
+        return None;
     }
-    if found_any {
-        Some(managed)
-    } else {
-        None
-    }
+    Some(paths)
+}
+
+/// #11539: every dirty tracked path already holds `origin/<branch>`'s content,
+/// in the working tree and the index, and local is behind only. The one
+/// implementation lives in [`git_ff_identical`] (#11553).
+fn dirty_tracked_identical_to_origin(repo_root: &Path, branch: &str) -> Option<Vec<String>> {
+    git_ff_identical::all_dirty_tracked_identical_to_origin(
+        repo_root,
+        &format!("origin/{branch}"),
+        dirty_tracked_paths(repo_root),
+        |args| git_stdout(repo_root, args),
+    )
+}
+
+/// `git -C <repo_root> <args>`: raw stdout when it exited 0, else `None`.
+fn git_stdout(repo_root: &Path, args: &[&str]) -> Option<Vec<u8>> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(args)
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    out.status.success().then_some(out.stdout)
 }
 
 /// The resolved `resync-installed.sh`, exposed for the caller's own messages.
@@ -534,6 +598,15 @@ fn all_dirty_tracked_managed(repo_root: &Path) -> Option<Vec<String>> {
 pub fn resync_script(repo_root: &Path) -> Option<PathBuf> {
     paths::resolve_resync_script(repo_root)
 }
+
+// The #11543 tests call the predicate by its original name; the one
+// implementation is `git_ff_identical::all_dirty_tracked_identical_to_origin`.
+#[cfg(test)]
+use dirty_tracked_identical_to_origin as all_dirty_tracked_identical_to_origin;
+
+#[cfg(test)]
+#[path = "sync_tests.rs"]
+mod git_tests;
 
 #[cfg(test)]
 mod tests {

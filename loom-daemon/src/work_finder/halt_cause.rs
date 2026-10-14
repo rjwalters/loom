@@ -23,6 +23,9 @@
 
 use std::path::PathBuf;
 
+pub mod since;
+pub use since::publish;
+
 use super::ready_queue::{self, TickQueueRow};
 use super::WorkItem;
 use crate::main_health_gate::WorkspaceHealthStates;
@@ -57,11 +60,28 @@ pub enum HaltCause {
     /// Actions jobs are not starting (billing failure / spending limit,
     /// #10113). A human org owner must fix it; a code fix cannot.
     CiBilling,
+    /// The root's installed Loom is too old for this daemon or the fleet
+    /// floor and differs from the payload (W3, #10719). Clears on a resync.
+    InstallIncompatible,
+    /// The root's installed Loom needs a newer daemon than this one (W4,
+    /// #10719). Clears when this host has rolled.
+    DaemonTooOld,
+    /// The registry marks the root maintain-only (#11186): the daemon keeps
+    /// its Loom install current and never dispatches into it. An operator's
+    /// choice; it clears only when the mark is lifted.
+    MaintainOnly,
+    /// The repo's measured disk charge does not fit this host's free space
+    /// after the halt floor and the in-flight sweeps' expected growth
+    /// (#11191). Host-local; clears as sweeps finish or space is reclaimed.
+    DiskReservation,
+    /// The root's draw weight is 0 (#11742): it is never drawn, so its ready
+    /// issues wait. An operator's choice; clears when the weight is raised.
+    WeightZero,
 }
 
 impl HaltCause {
     /// Every halt cause, in [`Self::as_str`] wire-token order.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 13] = [
         Self::MainRed,
         Self::GatePending,
         Self::TokenPool,
@@ -70,6 +90,11 @@ impl HaltCause {
         Self::Breaker,
         Self::WriteScope,
         Self::CiBilling,
+        Self::InstallIncompatible,
+        Self::DaemonTooOld,
+        Self::MaintainOnly,
+        Self::DiskReservation,
+        Self::WeightZero,
     ];
 
     /// The cause whose [`Self::as_str`] is `raw`, or `None` when `raw` is not
@@ -97,8 +122,57 @@ impl HaltCause {
             Self::Breaker => "breaker",
             Self::WriteScope => "write_scope",
             Self::CiBilling => "ci_billing",
+            Self::InstallIncompatible => "install_incompatible",
+            Self::DaemonTooOld => "daemon_too_old",
+            Self::MaintainOnly => "maintain_only",
+            Self::DiskReservation => "disk_reservation",
+            Self::WeightZero => "weight_zero",
         }
     }
+
+    /// The short phrase naming this cause in a `workspace_halted` row's
+    /// human-readable `reason` (#11417).
+    #[must_use]
+    pub fn phrase(self) -> &'static str {
+        match self {
+            Self::MainRed => "main red",
+            Self::GatePending => "build gate running",
+            Self::TokenPool => "token pool exhausted",
+            Self::PreflightAdvisory => "pre-flight advisory tripped",
+            Self::Drain => "scheduled drain",
+            Self::Breaker => "host-distress breaker",
+            Self::WriteScope => "no write access to this repo",
+            Self::CiBilling => "CI billing failure",
+            Self::InstallIncompatible => "installed Loom incompatible",
+            Self::DaemonTooOld => "daemon too old for installed Loom",
+            Self::MaintainOnly => "maintain-only workspace",
+            Self::DiskReservation => "disk reservation does not fit",
+            Self::WeightZero => "draw weight 0",
+        }
+    }
+
+    /// The `reason` sentence for a `workspace_halted` row held by `self`.
+    #[must_use]
+    pub fn halted_reason(self) -> String {
+        format!("blocked: repo dispatch held — {}", self.phrase())
+    }
+}
+
+/// `2 token_pool, 1 daemon_too_old`: how many roots each cause holds, in
+/// [`HaltCause::ALL`] order, for the work finder's pre-dispatch hold line.
+/// That slice folds four holds (pre-flight advisory, token pool, write scope
+/// and the #10719 workspace hold), so the line names the ones in force
+/// instead of guessing.
+#[must_use]
+pub fn held_summary(causes: &[Option<HaltCause>]) -> String {
+    let parts: Vec<String> = HaltCause::ALL
+        .iter()
+        .filter_map(|cause| {
+            let n = causes.iter().filter(|c| **c == Some(*cause)).count();
+            (n > 0).then(|| format!("{n} {}", cause.as_str()))
+        })
+        .collect();
+    parts.join(", ")
 }
 
 /// The per-root cause fold — the named-cause counterpart of
@@ -160,6 +234,48 @@ pub fn causes_per_root(
         .collect()
 }
 
+/// The single-workspace loop's cause (#11649): the [`causes_per_root`]
+/// precedence over the holds that loop folds, given as `(main_red,
+/// gate_pending, other_hold, breaker)`. `other_hold` is the breaker OR the
+/// root's token-pool hold, so with the breaker off it names the pool. `None`
+/// exactly when no hold is in force — the loop's `halted` bool.
+#[must_use]
+pub fn single_root(
+    root: &std::path::Path,
+    (main_red, gate_pending, other_hold, breaker): (bool, bool, bool, bool),
+) -> Option<HaltCause> {
+    if main_red {
+        Some(main_red_or_billing(root))
+    } else if gate_pending {
+        Some(HaltCause::GatePending)
+    } else if !other_hold {
+        None
+    } else if breaker {
+        Some(HaltCause::Breaker)
+    } else {
+        Some(HaltCause::TokenPool)
+    }
+}
+
+/// Fold the disk budget's holds (#11191) into the per-root causes: a root no
+/// other hold names, whose disk charge does not fit at the top of the tick,
+/// is held as [`HaltCause::DiskReservation`]. Lowest precedence, so a root
+/// that is red or pool-held still names that cause. No budget: unchanged.
+#[must_use]
+pub fn with_disk_holds(
+    mut causes: Vec<Option<HaltCause>>,
+    disk: Option<&crate::disk_admission::DiskBudget>,
+) -> Vec<Option<HaltCause>> {
+    if let Some(budget) = disk {
+        for (cause, held) in causes.iter_mut().zip(budget.held()) {
+            if cause.is_none() && held {
+                *cause = Some(HaltCause::DiskReservation);
+            }
+        }
+    }
+    causes
+}
+
 /// A halted root's cause: `ci_billing` when its repo owner's Actions jobs are
 /// billing-blocked (#10113), else `main_red`. Attribution only — the root is
 /// held either way. The git remote is resolved only while some owner is
@@ -185,15 +301,32 @@ pub fn record_halted(
     rows: &mut Vec<TickQueueRow>,
     ready: &[WorkItem],
     idx: usize,
-    workspace_priority: u32,
+    workspace_weight: u32,
     red: bool,
     causes: Option<&[Option<HaltCause>]>,
 ) {
     let cause = causes.and_then(|c| c.get(idx).copied()).flatten();
     for item in ready {
-        let key = ready_queue::key_of(idx, workspace_priority, item, red);
+        let key = ready_queue::key_of(idx, workspace_weight, item, red);
         let detail = cause.map(|c| c.as_str().to_string());
         ready_queue::record_skip(rows, key, item, QueueDisposition::WorkspaceHalted, detail);
+    }
+}
+
+/// Record every ready item of a weight-0 root (#11742) as
+/// [`QueueDisposition::WorkspaceHalted`] with the [`HaltCause::WeightZero`]
+/// cause: the draw never picks the root, so no row may stay unresolved.
+pub fn record_weight_zero(rows: &mut Vec<TickQueueRow>, ready: &[WorkItem], idx: usize, red: bool) {
+    let detail = Some(HaltCause::WeightZero.as_str().to_string());
+    for item in ready {
+        let key = ready_queue::key_of(idx, 0, item, red);
+        ready_queue::record_skip(
+            rows,
+            key,
+            item,
+            QueueDisposition::WorkspaceHalted,
+            detail.clone(),
+        );
     }
 }
 

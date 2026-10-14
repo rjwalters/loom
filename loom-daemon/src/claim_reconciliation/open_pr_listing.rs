@@ -19,16 +19,16 @@ use anyhow::Result;
 
 use super::review_conflict::Mergeable;
 use super::MAX_ISSUES_PER_WORKSPACE;
-use crate::forge_pull_listing::{list_open_pulls_cached_as, pull_mergeable_cached_as};
+use crate::forge_pull_listing::{list_open_pulls_cached_as, pull_state_cached_as};
 use crate::rate_limit_breaker::report::{BreakerHandle, FailureContext};
 
 pub use crate::forge_pull_listing::RestPull;
 
-/// Page budget: 3 × 100. A workspace with at most 100 open PRs costs one
-/// request; the headroom keeps a busier repo from truncating a label subset
-/// the per-label listings used to fetch (each capped at
-/// [`MAX_ISSUES_PER_WORKSPACE`]).
-pub(super) const MAX_PAGES: usize = 3;
+/// Page budget: 10 × 100, the same as [`crate::forge_listing::MAX_PAGES`]. A
+/// workspace with at most 100 open PRs costs one request, and unchanged pages
+/// are free `304`s. More open PRs than this is an error, never a silently
+/// truncated listing (#10382: `pr.list-open` is `complete-required`).
+pub(crate) const MAX_PAGES: usize = 10;
 
 /// Every open PR of `root`'s repository (`LOOM_REPO` wins), newest first.
 pub(super) fn list_open_prs(gh_bin: &Path, root: &Path) -> Result<Vec<RestPull>> {
@@ -52,7 +52,9 @@ pub(super) fn with_label(rows: Vec<RestPull>, label: &str) -> Vec<RestPull> {
         .collect()
 }
 
-/// PR `number`'s mergeability via a conditional `GET pulls/{number}`.
+/// PR `number`'s mergeability via a conditional `GET pulls/{number}`, paired
+/// with the head sha of the same response (#10382) — the sha GitHub computed
+/// `mergeable` for, which a verdict must name instead of the listing's head.
 /// `breaker` is the rate-limit breaker the read reports to (production:
 /// [`BreakerHandle::global`], fetched once per pass; `None` = unregistered).
 /// Any failure is [`Mergeable::Unknown`] — "no information", the same answer
@@ -67,22 +69,22 @@ pub(super) fn mergeable_of(
     root: &Path,
     number: u32,
     breaker: Option<&BreakerHandle>,
-) -> Mergeable {
+) -> (Mergeable, Option<String>) {
     if breaker.is_some_and(BreakerHandle::is_suppressed) {
         log::debug!(
             "claim_reconciliation: mergeability of PR #{number} in {} skipped: rate-limit breaker suppressing",
             root.display()
         );
-        return Mergeable::Unknown;
+        return (Mergeable::Unknown, None);
     }
-    match pull_mergeable_cached_as(
+    match pull_state_cached_as(
         "claim_reconciliation.pr_mergeable",
         gh_bin,
         Some(root),
         None,
         number,
     ) {
-        Ok(m) => Mergeable::from_rest(m),
+        Ok(s) => (Mergeable::from_rest(s.mergeable), s.head_sha),
         Err(e) => {
             log::debug!(
                 "claim_reconciliation: mergeability of PR #{number} in {} unknown: {e}",
@@ -95,7 +97,7 @@ pub(super) fn mergeable_of(
                     FailureContext::for_root(root, gh_bin.to_string_lossy()),
                 );
             }
-            Mergeable::Unknown
+            (Mergeable::Unknown, None)
         }
     }
 }

@@ -13,9 +13,10 @@
 //! ([`crate::forge_cached_view::entry_path`]), so the two share one ETag.
 //!
 //! The one read that is NOT conditional is the base branch's required-context
-//! lookup — [`crate::merge_pr::stale_checks::fetch::required_contexts_with`],
-//! shared verbatim with the merge guards so all of them agree about what a
-//! branch requires. It runs only when a verdict needs it, is cached once it
+//! lookup — [`required_contexts`], i.e.
+//! [`crate::merge_pr::stale_checks::fetch::required_contexts_with`], shared
+//! verbatim with the merge guards so
+//! both agree about what a branch requires. It runs only when a verdict needs it, is cached once it
 //! succeeds, is retried on later polls while it fails (#10351), and is
 //! accounted under that implementation's own caller.
 
@@ -26,6 +27,7 @@ use std::time::{Duration, SystemTime};
 use serde_json::{json, Value};
 
 use crate::forge_call_stats::{ops, ForgeOp};
+use crate::forge_denial::{self as denial, Denial};
 use crate::forge_etag_store::{self as store, ConditionalRead, DiskEntry, Target};
 
 /// The `forge_call_stats` caller every read here is recorded under, so
@@ -46,11 +48,26 @@ const PER_PAGE: usize = 100;
 /// Why a read did not produce a body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadError {
-    /// Will not get better by waiting (auth, not found, unprocessable,
+    /// Will not get better by waiting (not found, unprocessable,
     /// unreadable or truncated payload): end the wait with `ERROR`.
     Fatal(String),
     /// A blip (no HTTP answer, 5xx, timeout): retry on the next poll.
     Transient(String),
+    /// GitHub refused the read (401/403/429), classified (#10633): a rate
+    /// limit is retried like [`ReadError::Transient`]; a permission or
+    /// credential refusal ends the wait like [`ReadError::Fatal`] — except
+    /// on the legacy-status read, which degrades (see `forge_wait_checks`).
+    Denied { denial: Denial, why: String },
+}
+
+impl ReadError {
+    /// The one-line reason, whatever the variant.
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        match self {
+            Self::Fatal(w) | Self::Transient(w) | Self::Denied { why: w, .. } => w,
+        }
+    }
 }
 
 /// The PR facts one poll needs.
@@ -58,6 +75,8 @@ pub enum ReadError {
 pub struct PullHead {
     pub sha: String,
     pub base_ref: String,
+    /// `head.ref` — the branch `gh pr checks` names when no checks exist.
+    pub head_ref: Option<String>,
 }
 
 /// Conditional REST reads for one repository.
@@ -67,6 +86,13 @@ pub struct GhReads {
     store_dir: PathBuf,
     target: Target,
     memo: HashMap<String, DiskEntry>,
+    caller: &'static str,
+    /// `false`: no entry is read or written (a caller with no store).
+    persist: bool,
+    /// When the last secondary-limit refusal clears, epoch seconds (#11418).
+    secondary_retry_at: Option<i64>,
+    /// Run before each check-runs page after the first.
+    page_pace: Option<fn()>,
 }
 
 impl GhReads {
@@ -92,7 +118,48 @@ impl GhReads {
             store_dir,
             target,
             memo: HashMap::new(),
+            caller: CALLER,
+            persist: true,
+            secondary_retry_at: None,
+            page_pace: None,
         })
+    }
+
+    /// Read nothing from and write nothing to the store: every read is
+    /// unconditional (the merge guard in a test build with no store).
+    #[must_use]
+    pub fn ephemeral(mut self) -> Self {
+        self.persist = false;
+        self
+    }
+
+    /// Call `pace` before each check-runs page after the first, so a long
+    /// read does not burst (the merge guard's spacing, #11418).
+    #[must_use]
+    pub fn with_page_pacing(mut self, pace: fn()) -> Self {
+        self.page_pace = Some(pace);
+        self
+    }
+
+    /// When GitHub's last secondary-limit refusal to these reads clears
+    /// (see [`denial::retry_at`]), if any.
+    #[must_use]
+    pub fn secondary_retry_at(&self) -> Option<i64> {
+        self.secondary_retry_at
+    }
+
+    /// One conditional `GET` of `url` (a REST path naming this repo),
+    /// persisted under the check-runs prefix like [`Self::check_runs`].
+    pub fn read(&mut self, url: &str, op: ForgeOp) -> Result<String, ReadError> {
+        self.get_checks_entry(url, op)
+    }
+
+    /// Record reads under `caller` instead of [`CALLER`] (the agent `gh`
+    /// front's `gh pr checks`, #10516, shares these reads and their entries).
+    #[must_use]
+    pub fn with_caller(mut self, caller: &'static str) -> Self {
+        self.caller = caller;
+        self
     }
 
     fn nwo(&self) -> &str {
@@ -113,7 +180,11 @@ impl GhReads {
                 .map(String::from)
         };
         match (field("head", "sha"), field("base", "ref")) {
-            (Some(sha), Some(base_ref)) => Ok(PullHead { sha, base_ref }),
+            (Some(sha), Some(base_ref)) => Ok(PullHead {
+                sha,
+                base_ref,
+                head_ref: field("head", "ref"),
+            }),
             _ => Err(ReadError::Fatal("unreadable: pull request has no head.sha/base.ref".into())),
         }
     }
@@ -137,6 +208,9 @@ impl GhReads {
         let mut page = 1;
         while (rows.len() as u64) < total && rows.len() == page * PER_PAGE {
             page += 1;
+            if let Some(pace) = self.page_pace {
+                pace();
+            }
             let body =
                 self.get(&format!("{base}&page={page}"), ops::CI_CHECK_RUNS_FOR_SHA, None)?;
             let more = parse(&body, "check-runs page")?;
@@ -174,6 +248,27 @@ impl GhReads {
         Ok(v)
     }
 
+    /// `GET repos/{o}/{r}/commits/{sha}/check-suites?app_id=…` — the
+    /// GitHub Actions check suites for `sha` (#11389, `forge_wait_checks::no_run`).
+    pub fn actions_suites(&mut self, sha: &str, app_id: u64) -> Result<Value, ReadError> {
+        let url = format!(
+            "repos/{}/commits/{sha}/check-suites?app_id={app_id}&per_page={PER_PAGE}",
+            self.nwo()
+        );
+        let body = self.get_checks_entry(&url, ops::CI_CHECK_RUNS_FOR_SHA)?;
+        parse(&body, "check-suites")
+    }
+
+    /// `GET repos/{o}/{r}/actions/runs?head_sha=…` — the workflow runs on
+    /// `sha`, read only to drop a superseded twin run's check-runs (#11097,
+    /// [`crate::merge_pr::superseded_runs`]). One page: a head with more
+    /// runs than that reads as truncated there, which drops nothing.
+    pub fn workflow_runs(&mut self, sha: &str) -> Result<Value, ReadError> {
+        let url = format!("repos/{}/actions/runs?head_sha={sha}&per_page={PER_PAGE}", self.nwo());
+        let body = self.get_checks_entry(&url, ops::CI_WORKFLOW_RUNS_FOR_SHA)?;
+        parse(&body, "workflow runs")
+    }
+
     /// `GET repos/{o}/{r}` → `default_branch` (SHA mode with no `--base`).
     pub fn default_branch(&mut self) -> Result<String, ReadError> {
         let url = format!("repos/{}", self.nwo());
@@ -188,14 +283,19 @@ impl GhReads {
     /// The base branch's required status-check contexts, plus any notices
     /// (e.g. a plan-gated source) the caller must print.
     pub fn required(&self, base_ref: &str) -> Result<(Vec<String>, Vec<String>), String> {
-        crate::merge_pr::stale_checks::fetch::required_contexts_with(
+        let store = self.persist.then_some(self.store_dir.as_path());
+        crate::merge_pr::stale_checks::fetch::required_contexts_in(
             &self.gh_bin.to_string_lossy(),
             self.nwo(),
             base_ref,
+            store,
         )
     }
 
     fn get_checks_entry(&mut self, url: &str, op: ForgeOp) -> Result<String, ReadError> {
+        if !self.persist {
+            return self.get(url, op, None);
+        }
         let key = store::cache_key(self.cwd.as_deref(), &self.target, url);
         let path = store::entry_path_with_prefix(&self.store_dir, CHECKS_PREFIX, &key);
         self.get(url, op, Some(&path))
@@ -210,7 +310,7 @@ impl GhReads {
                 .cloned()
                 .or_else(|| store::read_disk_entry(p))
         });
-        let site = ConditionalRead::new(CALLER, op);
+        let site = ConditionalRead::new(self.caller, op);
         let etag = prior.as_ref().map(|p| p.etag.as_str());
         let (status, response, stderr) = store::fetch_conditional(
             site,
@@ -241,7 +341,21 @@ impl GhReads {
                 }
                 Ok(r.body)
             }
-            Some(r) if matches!(r.status, 401 | 403 | 404 | 410 | 422) => {
+            Some(r) if matches!(r.status, 401 | 403 | 429) => {
+                let refused = denied(url, &r, &stderr);
+                if matches!(
+                    refused,
+                    ReadError::Denied {
+                        denial: Denial::SecondaryRateLimit,
+                        ..
+                    }
+                ) {
+                    let now = chrono::Utc::now().timestamp();
+                    self.secondary_retry_at = Some(denial::retry_at(&r.ratelimit, now));
+                }
+                Err(refused)
+            }
+            Some(r) if matches!(r.status, 404 | 410 | 422) => {
                 Err(ReadError::Fatal(format!("HTTP {} for {url}", r.status)))
             }
             Some(r) => Err(ReadError::Transient(format!("HTTP {} for {url}", r.status))),
@@ -255,6 +369,42 @@ impl GhReads {
             }
         }
     }
+}
+
+/// A refused read (401/403/429), classified by [`crate::forge_denial`] from
+/// the response body, `gh`'s stderr and the rate-limit headers (#10633):
+/// `HTTP 403 for <url>: permission (needs statuses:read): Resource not
+/// accessible by integration`, or `…: secondary-rate-limit: …`.
+fn denied(url: &str, r: &crate::forge_listing::HttpResponse, stderr: &str) -> ReadError {
+    let text = format!("{}\n{stderr}", r.body);
+    let kind =
+        denial::classify(Some(r.status), &text, Some(&r.ratelimit)).unwrap_or(Denial::Permission);
+    let message = denial::body_message(&r.body);
+    let why = format!(
+        "HTTP {} for {url}: {}",
+        r.status,
+        denial::describe(kind, url, false, message.as_deref())
+    );
+    ReadError::Denied { denial: kind, why }
+}
+
+/// `nwo`'s `base_ref` required status-check contexts (rulesets and classic
+/// branch protection, unioned), plus any notices the caller must surface.
+///
+/// The one required-context lookup: [`GhReads::required`] and the merge
+/// guards both call it, so the wait and the guard cannot disagree about what
+/// a branch requires. An
+/// `Err` is a failed lookup, never "nothing required" (#10351).
+///
+/// # Errors
+///
+/// When either source fails for a reason other than a plan gate.
+pub fn required_contexts(
+    gh_bin: &str,
+    nwo: &str,
+    base_ref: &str,
+) -> Result<(Vec<String>, Vec<String>), String> {
+    crate::merge_pr::stale_checks::fetch::required_contexts_with(gh_bin, nwo, base_ref)
 }
 
 fn parse(body: &str, what: &str) -> Result<Value, ReadError> {

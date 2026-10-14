@@ -7,9 +7,6 @@ use std::process::Command;
 
 #[must_use]
 pub fn enabled(root: &Path) -> bool {
-    if !cfg!(feature = "otlp") {
-        return false;
-    }
     let config = super::read_config(root);
     // Tracing rides the OTLP sink (#4858/#8756): enabled when at least one
     // CONFIGURED exporter is otlp and resolves a valid endpoint of its own.
@@ -82,9 +79,10 @@ pub fn resolve_story(root: &Path, issue: u32) -> Option<StoryRef> {
         }
     };
     Some(StoryRef {
-        // Lowercased so `loom.repo` agrees across hosts whose origins differ
-        // only in case; `story` carries GitHub's own spelling.
-        repo: slug.to_ascii_lowercase(),
+        // GitHub's own spelling (#10637), so `loom.repo` agrees across hosts
+        // whose origins differ only in case and matches `loom.dispatch.*`.
+        // Not an ID input: the story key is the `repo_id`.
+        repo: identity.full_name.clone(),
         story: format!("{}#{issue}", identity.full_name),
         issue,
         context,

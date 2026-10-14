@@ -14,6 +14,7 @@ fn dispatch_event(issue: u32, sweep_id: &str) -> Event {
         kind: SweepKind::Issue(issue),
         runtime: None,
         runtime_source: None,
+        start: None,
         repo: Some("/repos/loom".to_string()),
     }
 }
@@ -217,6 +218,7 @@ fn event_issue_ignores_pr_set_dispatch() {
         kind: SweepKind::PrSet(vec![1, 2]),
         runtime: None,
         runtime_source: None,
+        start: None,
         repo: None,
     };
     assert_eq!(event_issue(&event), None);
@@ -280,12 +282,13 @@ fn sweep_started_carries_the_dispatch_runtime() {
         kind: SweepKind::Issue(7),
         runtime: Some("codex".to_string()),
         runtime_source: None,
+        start: None,
         repo: Some("/repos/loom".to_string()),
     };
     let records =
         map_event_to_records(&event, 7, "rjwalters/loom", RepoVisibility::Public, &mut dispatches);
     match &records[0] {
-        TelemetryRecord::SweepStarted(r) => assert_eq!(r.runtime.as_deref(), Some("codex")),
+        TelemetryRecord::SweepStarted(r) => assert_eq!(r.facts.runtime.as_deref(), Some("codex")),
         other => panic!("expected sweep.started, got {other:?}"),
     }
 
@@ -297,7 +300,7 @@ fn sweep_started_carries_the_dispatch_runtime() {
         &mut dispatches,
     );
     match &records[0] {
-        TelemetryRecord::SweepStarted(r) => assert_eq!(r.runtime, None),
+        TelemetryRecord::SweepStarted(r) => assert_eq!(r.facts.runtime, None),
         other => panic!("expected sweep.started, got {other:?}"),
     }
 }
@@ -899,12 +902,14 @@ async fn collect_managed_repos_reports_every_provisioned_registrys_repo_even_whe
             ManagedRepoEntry {
                 slug: "loom-test-fixture/repo-a".to_string(),
                 visibility: RepoVisibility::Public,
-                priority: Some(0),
+                weight: Some(0),
+                stale_blocked_release: None,
             },
             ManagedRepoEntry {
                 slug: "loom-test-fixture/repo-b".to_string(),
                 visibility: RepoVisibility::Private,
-                priority: None,
+                weight: None,
+                stale_blocked_release: None,
             },
         ],
         "both registered repos are in the roster, each with its derived visibility, \
@@ -1047,6 +1052,7 @@ fn all_other_axes_healthy_inputs(now: DateTime<Utc>, roots: &[&str]) -> health::
         // not about the `tmpfs_visibility` axis.
         tmpfs_visibility: None,
         ci_telemetry: None,
+        fleet_sync: None,
     }
 }
 
@@ -1165,6 +1171,7 @@ fn all_repos_failing_roles_is_not_green_anywhere_while_every_other_axis_is_healt
         captainless_singleton_jobs: Vec::new(),
         exported_kinds: Vec::new(),
         exporters: Vec::new(),
+        otlp_export: None,
         memory: None,
     };
     assert_eq!(

@@ -66,8 +66,8 @@
 //!
 //! - **No secret ever crosses into a `CredentialPreflightReport` or a log
 //!   line.** The minted token is threaded back to the caller *only* via
-//!   [`GithubAppPreflight::minted_gh_token`] (for `main.rs` to publish via
-//!   [`publish_github_app_token`] — see "File-based token delivery (#4458)"
+//!   [`GithubAppPreflight::minted`] (for `main.rs` to publish via
+//!   [`publish_minted`] — see "File-based token delivery (#4458)"
 //!   below) — never through [`log`], never through
 //!   [`crate::types::DaemonStatusReport`]. The report/status surface
 //!   carries only the non-secret fingerprint `app <id> installation <id>`.
@@ -411,11 +411,6 @@ impl RealGithubAppMinter {
     /// [`GithubAppMinter::mint_forced`] (#6171) — the only difference between
     /// the two is whether `--force` is passed to the shell helper.
     fn mint_with_force(&self, owner_repo: &str, force: bool) -> GithubAppOutcome {
-        // #9986: on a `required` host the gateway owns the credential — no
-        // JWT is signed and nothing is requested from api.github.com.
-        if crate::forge_egress::publication::github_credential_forbidden(Some(&self.cwd)) {
-            return GithubAppOutcome::NotConfigured;
-        }
         let script_path_str = self.script_path.to_string_lossy().to_string();
         let timeout = resolve_github_app_mint_timeout(&self.cwd);
         let mut args: Vec<&str> = vec![script_path_str.as_str(), "get-token"];
@@ -784,6 +779,9 @@ pub fn record_forge_credential_success(source: &str) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .record_success(source);
+    if source == CREDENTIAL_SOURCE_PRIMARY {
+        loom_ui::credential_restored(); // #11295
+    }
 }
 
 /// Whether **any** of the daemon's forge credentials is currently within a
@@ -860,11 +858,10 @@ pub fn nwo_from_git_remote(cwd: &Path) -> Option<String> {
         // HTTPS: https://host/owner/repo
         let (_host, p) = rest.split_once('/')?;
         p
-    } else if let Some(rest) = stripped.strip_prefix("http://") {
+    } else {
+        let rest = stripped.strip_prefix("http://")?;
         let (_host, p) = rest.split_once('/')?;
         p
-    } else {
-        return None;
     };
 
     let trimmed = path.trim_matches('/');
@@ -911,15 +908,13 @@ pub fn detect_cross_owner_repos(
 /// [`crate::types::DaemonStatusReport`]) plus the minted token — if any —
 /// for the caller to export as the daemon process's own `GH_TOKEN`.
 ///
-/// `minted_gh_token` is the ONLY channel a token value travels through; it is
+/// `minted` is the ONLY channel a token value travels through; it is
 /// deliberately excluded from [`Self::report`] (and therefore from every log
 /// line and status surface) by construction.
 pub struct GithubAppPreflight {
     pub report: CredentialPreflightReport,
-    pub minted_gh_token: Option<String>,
+    pub minted: Option<Minted>,
 }
-
-pub use crate::forge_egress::publication::gateway_owned_preflight;
 
 /// Runs the full #4430 preflight: attempt a GitHub App mint first (when
 /// `owner_repo` resolved at all); fall through to the byte-identical
@@ -941,17 +936,18 @@ pub fn run_with_github_app(
     let Some(owner_repo) = owner_repo else {
         return GithubAppPreflight {
             report: run(gh_probe),
-            minted_gh_token: None,
+            minted: None,
         };
     };
 
-    match app_minter.mint(owner_repo) {
+    let outcome = app_minter.mint(owner_repo);
+    let minted = Minted::of(&outcome, owner_repo);
+    match outcome {
         GithubAppOutcome::NotConfigured => GithubAppPreflight {
             report: run(gh_probe),
-            minted_gh_token: None,
+            minted: None,
         },
         GithubAppOutcome::Minted {
-            token,
             installation_id,
             app_id,
             ..
@@ -970,7 +966,7 @@ pub fn run_with_github_app(
                     ),
                     Utc::now(),
                 ),
-                minted_gh_token: Some(token),
+                minted,
             }
         }
         GithubAppOutcome::Error(reason) => {
@@ -982,7 +978,7 @@ pub fn run_with_github_app(
             fallback.message = format!("github-app unavailable ({reason}); {}", fallback.message);
             GithubAppPreflight {
                 report: fallback,
-                minted_gh_token: None,
+                minted: None,
             }
         }
     }
@@ -1046,11 +1042,31 @@ pub fn github_app_gh_config_dir(workspace_root: &Path) -> PathBuf {
 /// Static `config.yml` companion `hosts.yml` needs so `gh` skips its
 /// one-time multi-account migration (see module doc above for why that
 /// migration is fatal for a GitHub-App-only credential).
-pub(crate) const GH_CONFIG_YAML: &str = "version: 1\ngit_protocol: https\n";
+const GH_CONFIG_YAML: &str = "version: 1\ngit_protocol: https\n";
+
+/// Build the `hosts.yml` content `gh` expects for `token` on `github.com`.
+/// Split from the file I/O so it is unit-testable without touching disk
+/// (mirrors [`parse_github_app_response`]). `user` is set to
+/// `x-access-token` — the conventional placeholder for a GitHub App
+/// installation token (not a real user account); `gh` does not validate it
+/// against the API, it only uses `oauth_token` for authentication.
+///
+/// `api_host` (gh ≥ 2.100) sends this profile's API traffic to that host
+/// instead of `api.github.com`. Every publisher passes `None` today; it is
+/// the rendering the gateway read profiles will use (2AMLogic/2am#4367 P4).
+pub fn gh_hosts_yaml(token: &str, api_host: Option<&str>) -> String {
+    let mut yaml = format!(
+        "github.com:\n    oauth_token: {token}\n    user: x-access-token\n    git_protocol: https\n"
+    );
+    if let Some(host) = api_host.filter(|h| !h.is_empty()) {
+        yaml.push_str(&format!("    api_host: {host}\n"));
+    }
+    yaml
+}
 
 /// Set `mode` on `path`, a no-op on non-unix targets (the daemon is
 /// unix-only in practice, but this keeps the crate cross-platform-buildable).
-pub(crate) fn set_private_mode(path: &Path, mode: u32) -> std::io::Result<()> {
+fn set_private_mode(path: &Path, mode: u32) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1071,15 +1087,22 @@ pub(crate) fn set_private_mode(path: &Path, mode: u32) -> std::io::Result<()> {
 /// the refresh tick in `main.rs` calls this in place of the old
 /// `std::env::set_var("GH_TOKEN", …)`.
 pub fn publish_github_app_token(config_dir: &Path, token: &str) -> std::io::Result<()> {
-    use crate::forge_egress::publication as egress_pub;
-    let workspace = egress_pub::workspace_of_profile_dir(config_dir);
-    let stance = egress_pub::stance_for(workspace.as_deref());
-    publish_hosts_with_stance(config_dir, token, &stance, workspace.as_deref(), &|w| {
-        crate::forge_egress::assert_for(w).routing
-    })
-}
+    std::fs::create_dir_all(config_dir)?;
+    set_private_mode(config_dir, 0o700)?;
 
-pub use crate::forge_egress::publication::publish_hosts_with_stance;
+    let config_path = config_dir.join("config.yml");
+    if !config_path.exists() {
+        std::fs::write(&config_path, GH_CONFIG_YAML)?;
+        set_private_mode(&config_path, 0o600)?;
+    }
+
+    let hosts_path = config_dir.join("hosts.yml");
+    let tmp_path = config_dir.join("hosts.yml.tmp");
+    std::fs::write(&tmp_path, gh_hosts_yaml(token, None))?;
+    set_private_mode(&tmp_path, 0o600)?;
+    std::fs::rename(&tmp_path, &hosts_path)?;
+    Ok(())
+}
 
 // ============================================================================
 // Per-owner credential delivery (#5401)
@@ -1542,14 +1565,13 @@ pub fn force_refresh_owner_credential_with(
     let owner = owner_of(&owner_repo).to_string();
     let source = credential_source_for_owner(&owner_repo);
     match minter.mint_forced(&owner_repo) {
-        GithubAppOutcome::Minted {
-            token,
-            installation_id,
-            app_id,
+        ref outcome @ GithubAppOutcome::Minted {
+            ref installation_id,
+            ref app_id,
             ..
         } => {
             let owner_dir = github_app_gh_config_dir_for_owner(workspace_root, &owner);
-            match publish_github_app_token(&owner_dir, &token) {
+            match publish_outcome(&owner_dir, outcome, &owner_repo) {
                 Ok(()) => {
                     register_root_gh_config_dir(repo_root, &owner_dir);
                     register_owner_gh_config_dir(&owner, &owner_dir);
@@ -1606,11 +1628,11 @@ pub fn force_refresh_owner_credential(repo_root: &Path) -> bool {
     force_refresh_owner_credential_with(workspace_root, repo_root, &minter)
 }
 
+pub mod loom_ui;
 pub mod pool;
 pub use pool::attach as attach_pool;
-
-#[cfg(test)]
-mod egress_publication_tests;
+mod minted;
+pub use minted::{publish_minted, publish_outcome, Minted};
 
 #[cfg(test)]
 mod tests {
@@ -1824,7 +1846,7 @@ mod tests {
         let minter = FixedMinter(GithubAppOutcome::NotConfigured);
         let result = run_with_github_app(&probe, &minter, None);
         assert_eq!(result.report.mechanism, "GH_TOKEN");
-        assert!(result.minted_gh_token.is_none());
+        assert!(result.minted.is_none());
     }
 
     #[test]
@@ -1840,7 +1862,7 @@ mod tests {
         assert_eq!(result.report.mechanism, direct.mechanism);
         assert_eq!(result.report.fingerprint, direct.fingerprint);
         assert_eq!(result.report.message, direct.message);
-        assert!(result.minted_gh_token.is_none());
+        assert!(result.minted.is_none());
     }
 
     #[test]
@@ -1858,7 +1880,7 @@ mod tests {
         assert_eq!(result.report.mechanism, "github-app");
         assert_eq!(result.report.fingerprint.as_deref(), Some("app 42 installation 999"));
         assert!(!result.report.message.contains("ghs_supersecrettoken"));
-        assert_eq!(result.minted_gh_token.as_deref(), Some("ghs_supersecrettoken"));
+        assert_eq!(result.minted.map(|m| m.token).as_deref(), Some("ghs_supersecrettoken"));
     }
 
     #[test]
@@ -1874,7 +1896,7 @@ mod tests {
         assert!(result.report.ok);
         assert_eq!(result.report.mechanism, "GH_TOKEN");
         assert!(result.report.message.contains("github-app unavailable"));
-        assert!(result.minted_gh_token.is_none());
+        assert!(result.minted.is_none());
     }
 
     #[test]
@@ -2340,14 +2362,22 @@ mod tests {
         // #4458: the format must include `oauth_token` (auth) and
         // `git_protocol` (gh reads this without a network call); `user` is
         // an unvalidated placeholder for a GitHub App token.
-        let yaml = crate::forge_egress::publication::render_hosts_yaml(
-            "ghs_example_token",
-            &crate::forge_egress::publication::Stance::Unconfigured,
-        );
+        let yaml = gh_hosts_yaml("ghs_example_token", None);
         assert!(yaml.contains("oauth_token: ghs_example_token"));
         assert!(yaml.contains("user: x-access-token"));
         assert!(yaml.contains("git_protocol: https"));
         assert!(yaml.starts_with("github.com:\n"));
+    }
+
+    #[test]
+    fn gh_hosts_yaml_golden_shapes_with_and_without_api_host() {
+        let plain = "github.com:\n    oauth_token: ghs_x\n    user: x-access-token\n    git_protocol: https\n";
+        assert_eq!(gh_hosts_yaml("ghs_x", None), plain);
+        assert_eq!(gh_hosts_yaml("ghs_x", Some("")), plain);
+        assert_eq!(
+            gh_hosts_yaml("ghs_x", Some("github-proxy.example.com")),
+            format!("{plain}    api_host: github-proxy.example.com\n")
+        );
     }
 
     #[test]
@@ -2951,6 +2981,10 @@ mod tests {
         // The new token actually landed on disk...
         let hosts = std::fs::read_to_string(expected_dir.join("hosts.yml")).unwrap();
         assert!(hosts.contains("oauth_token: ghs_fresh"));
+        // ...beside the identity it was minted as (#10571).
+        let side = crate::forge_identity::read_sidecar(&expected_dir).unwrap();
+        assert_eq!((side.app_id.as_str(), side.installation_id.as_str()), ("4486636", "151241341"));
+        assert_eq!((side.owner.as_deref(), side.role.as_str()), (Some("2amlogic"), "writer"));
 
         // ...and every consumer that could route this repo's future `gh`
         // calls now finds it: root-keyed (#5401), owner-slug-keyed (#5431),

@@ -83,6 +83,10 @@ pub enum LiveClaimEvidence {
     Journal { pid: u32, repo: String },
     /// A live process rooted in this workspace is running `/loom:sweep <N>`.
     SweepProcess { pid: u32 },
+    /// The issue's agent was paused for a daemon roll and a live pause
+    /// manifest still holds it (#10832): H5 will resume or requeue it, so the
+    /// claim is in force even though no process is running. No pid.
+    PausedForRoll { manifest_id: String },
 }
 
 impl LiveClaimEvidence {
@@ -93,6 +97,7 @@ impl LiveClaimEvidence {
             Self::ClaimLock { pid, .. }
             | Self::Journal { pid, .. }
             | Self::SweepProcess { pid } => *pid,
+            Self::PausedForRoll { .. } => 0,
         }
     }
 }
@@ -109,6 +114,10 @@ impl std::fmt::Display for LiveClaimEvidence {
             Self::SweepProcess { pid } => {
                 write!(f, "a live `/loom:sweep` process (pid {pid})")
             }
+            Self::PausedForRoll { manifest_id } => write!(
+                f,
+                "an agent paused for a daemon roll (pause manifest {manifest_id}, not yet resumed)"
+            ),
         }
     }
 }
@@ -451,6 +460,12 @@ pub fn probe_excluding(
     issue: u32,
     own_untracked_pid: Option<u32>,
 ) -> Option<LiveClaimEvidence> {
+    // #10832: an agent paused for a roll has no live process, and its claim is
+    // still in force until H5 resumes or requeues it. Free while nothing is
+    // armed, which is every process that did not start from a pause.
+    if let Some(manifest_id) = crate::roll_pause::suppress::held_issue(workspace_root, issue) {
+        return Some(LiveClaimEvidence::PausedForRoll { manifest_id });
+    }
     // Both bookkeeping legs verify the recorded PID's argv where the platform
     // allows it ([`pid_is_live_claim_for`]), so a *stale* record whose PID has
     // been recycled by an unrelated process can never wedge the issue.

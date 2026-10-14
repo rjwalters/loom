@@ -158,6 +158,7 @@ pub(crate) fn fixture_registry(workspace: &Path) -> (SweepRegistry, PathBuf) {
   printf 'LOOM_SWEEP_ID=%s\n' "${{LOOM_SWEEP_ID:-unset}}"
   printf 'CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=%s\n' "${{CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS:-unset}}"
   printf 'GH_CONFIG_DIR=%s\n' "${{GH_CONFIG_DIR:-unset}}"
+  printf 'LOOM_LLM_GATEWAY_VK=%s\n' "${{LOOM_LLM_GATEWAY_VK:-unset}}"
 }} >> "{rec}" 2>&1
 exit 0
 "#,
@@ -544,11 +545,14 @@ pub(crate) fn insert_clean_exit_running(
     issue: u32,
     seq: u32,
 ) -> String {
-    let child = Command::new("true")
+    let mut child = Command::new("true")
         .spawn()
         .expect("spawn `true` fixture child");
     let pid = child.id();
-    std::thread::sleep(Duration::from_millis(50));
+    // Block on the child's actual exit (#10726): `Child` caches the status, so
+    // the reaper's later `try_wait()` deterministically sees `Some(0)` even on
+    // a heavily loaded host (a fixed sleep raced the scheduler).
+    child.wait().expect("wait for `true` fixture child");
     let sweep_id = format!("sweep-issue-{issue}-no-progress-{seq}");
     registry.entries.insert(
         sweep_id.clone(),
@@ -1224,6 +1228,10 @@ pub(crate) use git_worktree_fixture::make_dirty_git_worktree;
 // over the file-size ratchet's threshold (`.loom/docs/file-size-policy.md`).
 // It is an inherent method, so there is nothing to re-export here.
 mod activity_window;
+
+// `SweepRegistry::seed_entry_for_test` (Issue #11123) likewise lives in a child
+// module, `seed_entry`, to keep it out of the over-threshold `mod.rs`.
+mod seed_entry;
 
 /// [`make_dirty_git_worktree`] plus the other half of what a fixture worktree
 /// has always meant: **dirty and QUIET** (Issue #8487).
@@ -1908,6 +1916,10 @@ pub(crate) fn park_guard_registry(
              printf '%s\\n' '{state}'\n\
              exit 0\n\
              fi\n\
+             if [[ \"$1\" == \"api\" && \"$*\" == *\"{{state: .state\"* ]]; then\n\
+             printf '%s\\n' '{signals}'\n\
+             exit {rest_exit}\n\
+             fi\n\
              if [[ \"$1\" == \"api\" && \"$2\" == repos/* && \"$2\" != */issues/{linked_pr} ]]; then\n\
              printf '%s\\n' {labels}\n\
              exit {rest_exit}\n\
@@ -1922,6 +1934,13 @@ pub(crate) fn park_guard_registry(
         gql = fake_gh_graphql_arm(graphql_pr, 0),
         state = state_probe_json("open", false),
         labels = rest_labels,
+        // #11480: the claim release reads labels through the issue-signals
+        // projection (`release_issue_signals`), not a one-label probe.
+        signals = serde_json::json!({
+            "state": "open",
+            "closed_at": null,
+            "labels": rest_labels.split_whitespace().collect::<Vec<_>>(),
+        }),
         rest_exit = rest_exit,
         // `rest_labels` model the ISSUE's labels; the linked open PR reports
         // none, so the reaper's PR-side park check (#8689) does not mask the

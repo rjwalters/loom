@@ -2,32 +2,15 @@ use super::*;
 use std::process::Command;
 use std::time::Duration;
 
-/// RAII guard that clears the ambient `LOOM_RUNTIME` env var for the
-/// scope of a test and restores whatever value (if any) it previously
-/// had — including across a mid-test assertion panic, since Rust
-/// unwinds through `Drop`. Some host/dev-container shells export
-/// `LOOM_RUNTIME` (as the `spawn-worker.sh` runtime selector), and
-/// without this guard that ambient value silently outranks the
-/// `runtimes.default` / `runtimes.roles` config precedence this test
-/// exercises (#4739).
-struct ClearedLoomRuntimeEnv(Option<String>);
-
-impl ClearedLoomRuntimeEnv {
-    fn new() -> Self {
-        let prior = std::env::var("LOOM_RUNTIME").ok();
-        std::env::remove_var("LOOM_RUNTIME");
-        Self(prior)
-    }
-}
-
-impl Drop for ClearedLoomRuntimeEnv {
-    fn drop(&mut self) {
-        match self.0.take() {
-            Some(v) => std::env::set_var("LOOM_RUNTIME", v),
-            None => std::env::remove_var("LOOM_RUNTIME"),
-        }
-    }
-}
+// RAII guard that clears the ambient runtime-selection env vars for the scope
+// of a test and restores them on drop. Some host/dev-container shells export
+// `LOOM_RUNTIME` (the `spawn-worker.sh` runtime selector) and every Loom agent
+// session is spawned with it pinned, where that ambient value silently outranks
+// the `runtimes.default` / `runtimes.roles` config precedence these tests
+// exercise (#4739). The local copy this alias replaced cleared only the global
+// var, never the per-role `LOOM_RUNTIME_<ROLE>` pin that decides the same
+// binding (#9360).
+use crate::runtime_selection_test_support::ClearedRuntimeSelectionEnv as ClearedLoomRuntimeEnv;
 
 fn fixture() -> tempfile::TempDir {
     let d = tempfile::tempdir().unwrap();
@@ -360,6 +343,15 @@ fn native_and_shell_conformance_for_every_shipped_pair() {
         };
         for runtime in &runtimes {
             let native = resolve_and_admit(repo, &role, Some(runtime));
+            // #11400: a model profile's `excludedRoles` is a profile axis the
+            // capability checker has no notion of (a bare native runtime is
+            // judged against the default `zai-flash` profile). It is covered
+            // by `runtime_preference::excluded_role_tests`, not this matrix.
+            if native.as_ref().is_err_and(|r| {
+                r.unmet_capabilities == [crate::worker_spawn::profiles::EXCLUDED_ROLE]
+            }) {
+                continue;
+            }
             // A full sweep is one runtime admitted against Builder's
             // (strongest lifecycle) requirements — that is the role the
             // shell checker must be asked about for the `loom`/sweep entry.
@@ -790,6 +782,15 @@ fn native_fixture() -> tempfile::TempDir {
         d.path().join("defaults/runtimes/opencode.json"),
     )
     .unwrap();
+    // #11400: a bare `opencode` launch falls back to the bundled `zai-flash`
+    // profile, which excludes Curator. These tests are about adapter
+    // resolution, so pin a default profile that excludes nothing.
+    fs::create_dir_all(d.path().join(".loom")).unwrap();
+    fs::write(
+        d.path().join(".loom/config.json"),
+        r#"{"runtimes":{"defaultModelProfile":"quick-flash"}}"#,
+    )
+    .unwrap();
     d
 }
 
@@ -811,7 +812,9 @@ fn touch_executable_file(path: &Path) {
 /// `test_deleted_suffix_stripped_when_replacement_exists`: the on-disk
 /// replacement exists; only the readlink target carries the suffix.
 #[test]
+#[serial_test::serial]
 fn native_adapter_admits_through_a_deleted_current_exe_mid_roll() {
+    let _env = ClearedLoomRuntimeEnv::new();
     let d = native_fixture();
     let roll = tempfile::tempdir().unwrap();
     let replacement = roll.path().join("loom-daemon");
@@ -828,6 +831,7 @@ fn native_adapter_admits_through_a_deleted_current_exe_mid_roll() {
         d.path(),
         "curator",
         Some("opencode"),
+        None,
         AdmissionContext::Host,
         || crate::daemon_bin_resolve::resolve_from_current_exe(&deleted, |_| None),
     )
@@ -839,7 +843,9 @@ fn native_adapter_admits_through_a_deleted_current_exe_mid_roll() {
 /// …and the ordinary (non-deleted) case is unchanged: admission resolves
 /// exactly the executable the raw `current_exe()` would have named.
 #[test]
+#[serial_test::serial]
 fn native_adapter_ordinary_current_exe_admits_unchanged() {
+    let _env = ClearedLoomRuntimeEnv::new();
     let d = native_fixture();
     let roll = tempfile::tempdir().unwrap();
     let exe = roll.path().join("loom-daemon");
@@ -849,6 +855,7 @@ fn native_adapter_ordinary_current_exe_admits_unchanged() {
         d.path(),
         "curator",
         Some("opencode"),
+        None,
         AdmissionContext::Host,
         || crate::daemon_bin_resolve::resolve_from_current_exe(&exe, |_| None),
     )
@@ -862,7 +869,9 @@ fn native_adapter_ordinary_current_exe_admits_unchanged() {
 /// both attempts (correctness during a roll, never masking a genuine
 /// missing-binary condition).
 #[test]
+#[serial_test::serial]
 fn native_adapter_fails_closed_naming_both_attempts_when_replacement_is_gone() {
+    let _env = ClearedLoomRuntimeEnv::new();
     let d = native_fixture();
     let roll = tempfile::tempdir().unwrap();
     // Nothing at `roll/loom-daemon`, and the injected PATH lookup finds
@@ -873,6 +882,7 @@ fn native_adapter_fails_closed_naming_both_attempts_when_replacement_is_gone() {
         d.path(),
         "curator",
         Some("opencode"),
+        None,
         AdmissionContext::Host,
         || crate::daemon_bin_resolve::resolve_from_current_exe(&deleted, |_| None),
     )

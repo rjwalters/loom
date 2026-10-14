@@ -1410,31 +1410,16 @@ impl TerminalManager {
         };
 
         let config_dir_str = config_dir.to_string_lossy();
-        let tmp_dir_str = config_dir.join("tmp").to_string_lossy().to_string();
 
-        // Set CLAUDE_CONFIG_DIR on the tmux session
-        let _ = Command::new("tmux")
-            .args(["-L", "loom"])
-            .args([
-                "set-environment",
-                "-t",
-                tmux_session,
-                "CLAUDE_CONFIG_DIR",
-                &config_dir_str,
-            ])
-            .output();
-
-        // Set TMPDIR on the tmux session
-        let _ = Command::new("tmux")
-            .args(["-L", "loom"])
-            .args([
-                "set-environment",
-                "-t",
-                tmux_session,
-                "TMPDIR",
-                &tmp_dir_str,
-            ])
-            .output();
+        // CLAUDE_CONFIG_DIR, TMPDIR, and — because that TMPDIR would
+        // otherwise move it — the host's forge-call sink (W5), all on the
+        // tmux session: one list shared with the manual spawn path.
+        for (key, value) in crate::agent_session::isolation::vars(&config_dir) {
+            let _ = Command::new("tmux")
+                .args(["-L", "loom"])
+                .args(["set-environment", "-t", tmux_session, key, &value])
+                .output();
+        }
 
         log::info!("Set CLAUDE_CONFIG_DIR={config_dir_str} for session {tmux_session}");
     }

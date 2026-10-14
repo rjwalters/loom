@@ -1,16 +1,20 @@
 //! `loom-daemon stashes list` / `retire` handlers (Issue #5693).
 //!
-//! Pure local git/`gh` operation — unlike `Quarantine` (in-memory insta-crash
-//! pauses in a running daemon), everything this command needs lives in the
-//! repo's own `refs/stash` and the forge, so it never touches the daemon's
-//! Unix socket and runs on the sync `handle_cli_command` path.
+//! Unlike `Quarantine` (in-memory insta-crash pauses in a running daemon),
+//! everything this command needs lives in the repo's own `refs/stash` and the
+//! forge, so it runs on the sync `handle_cli_command` path and works with the
+//! daemon down. A live daemon is used only for the issue-state read of a
+//! managed repo (#8876, `issue_state_read`); without one the read is the
+//! standalone path.
 
 use anyhow::Result;
 
+use loom_daemon::issue_state_read::client::{DaemonLink, LocalRead, RoutedLookup, SocketLink};
 use loom_daemon::quarantine_stash_status::StashOrigin;
 use loom_daemon::repo_root::resolve_repo_root;
+use loom_daemon::stash_issue_state::{IssueStateSummary, RecordingLookup};
 use loom_daemon::stash_retirement::{
-    self, AnyStashEntry, DropOutcome, GhIssueStateLookup, PathVerdict, QuarantineStashEntry,
+    self, AnyStashEntry, DropOutcome, IssueStateLookup, PathVerdict, QuarantineStashEntry,
     RetireVerdict, RetirementReport, RETIREMENT_LOG_RELPATH,
 };
 
@@ -31,7 +35,53 @@ pub(crate) fn handle_stashes_command(action: StashesAction) -> Result<()> {
             paths,
             json,
         } => run(&workspace, issue, execute, paths, json),
+        StashesAction::BuildTrees(args) => build_trees(&args),
     }
+}
+
+/// `loom-daemon stashes build-trees` (#11075).
+#[derive(clap::Args)]
+pub(crate) struct BuildTreesArgs {
+    /// Any directory inside the worktree to inspect (default: current
+    /// directory). Directories are printed relative to its top level.
+    #[arg(long, value_name = "PATH", default_value = ".")]
+    workspace: String,
+
+    /// Terminate each directory with NUL instead of a newline.
+    #[arg(short = 'z')]
+    nul: bool,
+
+    /// Read `git status --porcelain` text on stdin and print it without the
+    /// lines that are build-tree content (see
+    /// `generated_artifact::status::filter_status`).
+    #[arg(long, conflicts_with = "nul")]
+    filter_status: bool,
+}
+
+fn build_trees(args: &BuildTreesArgs) -> Result<()> {
+    use loom_daemon::generated_artifact::status;
+    use std::io::{Read, Write};
+
+    let start = std::path::Path::new(&args.workspace);
+    let top = status::worktree_top(start)
+        .ok_or_else(|| anyhow::anyhow!("not inside a git worktree: {}", start.display()))?;
+    let dirs = loom_daemon::generated_artifact::worktree_build_tree_dirs(&top);
+    let mut out = std::io::stdout().lock();
+    if args.filter_status {
+        let mut input = String::new();
+        std::io::stdin().read_to_string(&mut input)?;
+        let kept = status::filter_status(&top, &dirs, &input);
+        if !kept.is_empty() {
+            writeln!(out, "{}", kept.trim_end_matches('\n'))?;
+        }
+    } else {
+        let end = if args.nul { '\0' } else { '\n' };
+        for dir in &dirs {
+            write!(out, "{dir}{end}")?;
+        }
+    }
+    out.flush()?;
+    Ok(())
 }
 
 /// Shared body for `list` (never executes) and `retire` (`execute` from
@@ -46,19 +96,73 @@ fn run(
     json: bool,
 ) -> Result<()> {
     let repo_root = resolve_repo_root(workspace)?;
+    let opts = RunOptions {
+        issue_filter,
+        execute,
+        show_paths,
+        json,
+    };
+    // #8876: the route is chosen once per run (daemon-assisted read, else the
+    // standalone read). Its description goes to stderr so
+    // `--json` stdout stays machine-readable.
+    let link = daemon_link(&repo_root);
+    let local = LocalRead {
+        root: repo_root.clone(),
+    };
+    let mut lookup = RoutedLookup::new(link.as_ref().map(|l| l as &dyn DaemonLink), &local);
+    let result = run_with(&repo_root, &opts, &mut lookup);
+    eprintln!("issue-state route: {}", lookup.route_description());
+    result
+}
 
-    let mut entries = stash_retirement::list_quarantine_stashes(&repo_root)
+/// The daemon link for `repo_root`, or `None` when its `origin` has no
+/// supported slug (then only the standalone read applies).
+fn daemon_link(repo_root: &std::path::Path) -> Option<SocketLink> {
+    let slug = loom_daemon::release_resolve::host::repo_slug(repo_root)?;
+    let socket = super::common::resolve_socket_path().ok()?;
+    Some(SocketLink {
+        socket,
+        root: repo_root.to_path_buf(),
+        slug,
+    })
+}
+
+struct RunOptions {
+    issue_filter: Option<u64>,
+    execute: bool,
+    show_paths: bool,
+    json: bool,
+}
+
+/// [`run`] with the repo root and the issue-state lookup supplied by the
+/// caller (tests pass a fake).
+///
+/// Returns `Err` for a blind run (#8876): at least one issue was looked up
+/// and none could be read. The report is still printed first.
+fn run_with(
+    repo_root: &std::path::Path,
+    opts: &RunOptions,
+    lookup: &mut dyn IssueStateLookup,
+) -> Result<()> {
+    let &RunOptions {
+        issue_filter,
+        execute,
+        show_paths,
+        json,
+    } = opts;
+    let mut entries = stash_retirement::list_quarantine_stashes(repo_root)
         .map_err(|e| anyhow::anyhow!("failed to enumerate quarantine stashes: {e}"))?;
     if let Some(issue) = issue_filter {
         entries.retain(|e| e.issue == Some(issue));
     }
 
+    let mut recorder = RecordingLookup::new(lookup);
     let reports: Vec<RetirementReport> = if entries.is_empty() {
         Vec::new()
     } else {
-        let mut lookup = GhIssueStateLookup::new(repo_root.clone());
-        stash_retirement::plan_and_execute_retirement(&repo_root, &entries, &mut lookup, execute)
+        stash_retirement::plan_and_execute_retirement(repo_root, &entries, &mut recorder, execute)
     };
+    let issue_state = IssueStateSummary::new(&reports, recorder.seen());
 
     // #5512: label every OTHER `refs/stash` entry by origin too — never fed
     // to `plan_and_execute_retirement` above (that call only ever sees the
@@ -68,7 +172,7 @@ fn run(
     // to one issue's quarantine stashes — an unrelated operator/agent/
     // auditor stash is out of scope for that narrower view.
     let other_entries: Vec<AnyStashEntry> = if issue_filter.is_none() {
-        stash_retirement::list_all_stashes(&repo_root)
+        stash_retirement::list_all_stashes(repo_root)
             .map_err(|e| anyhow::anyhow!("failed to enumerate stashes: {e}"))?
             .into_iter()
             .filter(|e| e.origin != StashOrigin::Quarantine)
@@ -77,27 +181,24 @@ fn run(
         Vec::new()
     };
 
-    if reports.is_empty() && other_entries.is_empty() {
-        if json {
-            println!("{{\"quarantine\":[],\"other\":[]}}");
-        } else {
-            println!("no outstanding loom-quarantine: stashes.");
-        }
-        return Ok(());
-    }
-
     if json {
         let payload = serde_json::json!({
             "quarantine": reports,
             "other": other_entries,
+            "issue_state": issue_state,
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else if reports.is_empty() && other_entries.is_empty() {
+        println!("no outstanding loom-quarantine: stashes.");
     } else {
-        render_human(&reports, execute, show_paths);
+        render_human(&reports, &issue_state, execute, show_paths);
         render_other(&other_entries);
     }
 
-    Ok(())
+    match issue_state.blind_message() {
+        Some(message) => Err(anyhow::anyhow!(message)),
+        None => Ok(()),
+    }
 }
 
 /// #5512: print every non-quarantine `refs/stash` entry, labeled by origin
@@ -124,7 +225,12 @@ fn render_other(other: &[AnyStashEntry]) {
     }
 }
 
-fn render_human(reports: &[RetirementReport], execute: bool, show_paths: bool) {
+fn render_human(
+    reports: &[RetirementReport],
+    issue_state: &IssueStateSummary,
+    execute: bool,
+    show_paths: bool,
+) {
     let retire_count = reports
         .iter()
         .filter(|r| matches!(r.verdict, RetireVerdict::Retire { .. }))
@@ -141,6 +247,11 @@ fn render_human(reports: &[RetirementReport], execute: bool, show_paths: bool) {
              {retire_count} retirable entr{plural}.)",
             plural = if retire_count == 1 { "y" } else { "ies" }
         );
+    }
+    if let Some(message) = issue_state.blind_message() {
+        // #8876: one line for the run, ahead of the per-stash lines that
+        // would otherwise read like N unrelated hiccups.
+        println!("BLIND RUN: {message}");
     }
     println!();
 
@@ -230,3 +341,8 @@ fn describe_path_verdict(verdict: &PathVerdict) -> String {
         PathVerdict::NotProvenRecoverable => "NOT provably recoverable".to_string(),
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[path = "stashes_tests.rs"]
+mod tests;

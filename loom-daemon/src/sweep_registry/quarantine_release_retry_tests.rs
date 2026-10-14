@@ -134,3 +134,75 @@ fn attempt_quarantine_release_direct_call_skips_while_rate_limited() {
     assert!(registry.pending_quarantine_release_issues().contains(&555));
     assert!(!registry.quarantine_release_attempts.contains_key(&555));
 }
+
+/// #11480 (loom-ui#1950): the TTL release removes the quarantine's own
+/// `loom:blocked` but does not re-arm `loom:issue` beside another veto; a
+/// plain quarantined item is still handed back.
+#[test]
+fn quarantine_release_respects_the_shared_restore_veto() {
+    for (labels, restores) in [
+        (r#""loom:blocked","loom:needs-capability""#, false),
+        (r#""loom:blocked","loom:operator-only""#, false),
+        (r#""loom:blocked""#, true),
+    ] {
+        // The issue-signals projection; the edit ignores the same stdout.
+        let signals = format!(r#"{{"state":"open","closed_at":null,"labels":[{labels}]}}"#);
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh.log");
+        let fake_gh = install_fake_gh(dir.path(), &gh_log, &signals, 0);
+        let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+        config.gh_bin = Some(fake_gh);
+        config.skip_label_flip = false;
+        let registry = SweepRegistry::new(config);
+
+        assert!(registry.release_quarantine_label(1950));
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap();
+        assert!(calls.contains("issue edit 1950 --remove-label loom:blocked"), "{calls}");
+        assert_eq!(calls.contains("--add-label loom:issue"), restores, "{labels}: {calls}");
+    }
+}
+
+/// #11517 (loom-ui#2980): the quarantine release never re-adds `loom:issue`
+/// beside a live `loom:building` claim, nor onto a closed issue.
+#[test]
+fn quarantine_release_never_requeues_a_claimed_or_closed_issue() {
+    for (state, labels) in [
+        ("open", r#""loom:blocked","loom:building""#),
+        ("closed", r#""loom:blocked""#),
+    ] {
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh.log");
+        let signals = format!(r#"{{"state":"{state}","closed_at":null,"labels":[{labels}]}}"#);
+        let fake_gh = install_fake_gh(dir.path(), &gh_log, &signals, 0);
+        let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+        config.gh_bin = Some(fake_gh);
+        config.skip_label_flip = false;
+        let registry = SweepRegistry::new(config);
+
+        assert!(registry.release_quarantine_label(2980));
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap();
+        assert!(calls.contains("issue edit 2980 --remove-label loom:blocked"), "{calls}");
+        assert!(!calls.contains("--add-label loom:issue"), "{state}: {calls}");
+    }
+}
+
+/// #11743: a frozen item's quarantine release writes nothing, not even the
+/// removal of the quarantine's own `loom:blocked`; it still counts as done.
+#[test]
+fn quarantine_release_writes_nothing_to_a_frozen_item() {
+    let dir = tempdir().unwrap();
+    let gh_log = dir.path().join("gh.log");
+    let signals = r#"{"state":"open","closed_at":null,"labels":["loom:blocked","loom:frozen"]}"#;
+    let fake_gh = install_fake_gh(dir.path(), &gh_log, signals, 0);
+    let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+    config.gh_bin = Some(fake_gh);
+    config.skip_label_flip = false;
+    let registry = SweepRegistry::new(config);
+
+    assert!(registry.release_quarantine_label(11743));
+
+    let calls = std::fs::read_to_string(&gh_log).unwrap();
+    assert!(!calls.contains("issue edit"), "{calls}");
+}

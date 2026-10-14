@@ -179,7 +179,7 @@ esac
 case "$*" in api*'/pulls/'[0-9]*)
   echo mergeable >> '{oks}'
   printf 'HTTP/2.0 200 OK\r\nEtag: W/"m1"\r\n\r\n'
-  echo '{{"mergeable": true}}'
+  echo '{{"mergeable": true, "head": {{"sha": "x"}}}}'
   exit 0 ;;
 esac
 case "$*" in api*'issues?labels='*)
@@ -384,7 +384,7 @@ fn an_ordinary_mergeable_failure_does_not_trip_the_breaker() {
     let b = mergeable_of(&gh, &root, 2, Some(&handle));
     crate::forge_etag_store::set_test_daemon_store_dir(None);
 
-    assert_eq!((a, b), (Mergeable::Unknown, Mergeable::Unknown));
+    assert_eq!((a, b), ((Mergeable::Unknown, None), (Mergeable::Unknown, None)));
     assert!(!handle.is_suppressed());
     assert_eq!(read_count(&reads), 2);
 }

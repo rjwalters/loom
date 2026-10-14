@@ -167,7 +167,15 @@ pub struct DemandConfig {
     pub non_pr_floor: usize,
     /// `staleSecs` — ledger entries older than this are unobserved.
     pub stale_secs: u64,
+    /// `doctorMaxPerRepo` — the most doctor runs one repository may hold at
+    /// once, sized from that repository's own changes debt (#10632). `1` is
+    /// the classic one instance per `(repository, role)`.
+    pub doctor_max_per_repo: usize,
 }
+
+/// Hard bound on `doctorMaxPerRepo`: a typo cannot point a host's whole
+/// doctor budget at one repository's queue head many times over.
+pub const DOCTOR_MAX_PER_REPO_LIMIT: usize = 8;
 
 impl Default for DemandConfig {
     fn default() -> Self {
@@ -178,6 +186,7 @@ impl Default for DemandConfig {
             reserve: true,
             non_pr_floor: 1,
             stale_secs: 1800,
+            doctor_max_per_repo: 3,
         }
     }
 }
@@ -225,6 +234,8 @@ pub fn parse_demand_config(role_runner_block: &serde_json::Value) -> DemandConfi
         reserve: flag("reserve", d.reserve),
         non_pr_floor: count("nonPrFloor", d.non_pr_floor),
         stale_secs: positive("staleSecs").unwrap_or(d.stale_secs),
+        doctor_max_per_repo: count("doctorMaxPerRepo", d.doctor_max_per_repo)
+            .min(DOCTOR_MAX_PER_REPO_LIMIT),
     }
 }
 
@@ -370,6 +381,26 @@ impl DemandLedger {
     /// [`Self::host_debt`] as of `now`.
     #[must_use]
     pub fn host_debt_at(&self, now: Instant, stale: Duration) -> HostDebt {
+        self.debt_at(None, now, stale)
+    }
+
+    /// `root`'s own debt over its entries no older than `stale` (#10624): the
+    /// per-repo read behind the #9410 build back-off's per-repo WIP limit. The
+    /// same fresh / fail-open rules as [`Self::host_debt`], restricted to one
+    /// root — a root with no fresh entry on an axis reads that axis `None`.
+    #[must_use]
+    pub fn repo_debt(&self, root: &Path, stale: Duration) -> HostDebt {
+        self.repo_debt_at(root, Instant::now(), stale)
+    }
+
+    /// [`Self::repo_debt`] as of `now`.
+    #[must_use]
+    pub fn repo_debt_at(&self, root: &Path, now: Instant, stale: Duration) -> HostDebt {
+        self.debt_at(Some(root), now, stale)
+    }
+
+    /// The aggregate over every root (`only: None`) or one root.
+    fn debt_at(&self, only: Option<&Path>, now: Instant, stale: Duration) -> HostDebt {
         self.reads.fetch_add(1, Ordering::Relaxed);
         let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         let mut debt = HostDebt::default();
@@ -377,7 +408,10 @@ impl DemandLedger {
         // included, so a partially stale axis does not under-count the host
         // debt its width is sized from (#9414).
         let mut last_known = [0usize; DebtAxis::ALL.len()];
-        for ((_, axis), (count, at)) in entries.iter() {
+        for ((_, axis), (count, at)) in entries
+            .iter()
+            .filter(|((r, _), _)| only.is_none_or(|o| o == r))
+        {
             last_known[axis.index()] += count;
             if now.saturating_duration_since(*at) > stale {
                 continue;
@@ -404,7 +438,7 @@ impl DemandLedger {
         entries.retain(|(root, _), _| roots.contains(root));
     }
 
-    /// How many times the host debt has been read.
+    /// How many times the host or a repo debt has been read.
     #[must_use]
     pub fn reads(&self) -> usize {
         self.reads.load(Ordering::Relaxed)
@@ -440,32 +474,45 @@ pub fn count_pr_rows(rows: &[RestIssue]) -> usize {
 /// not merge-eligible". The critical-file hold (#6879) is one of these: it
 /// adds `loom:operator` (`champion-critical-file-hold.md`); there is no
 /// separate `loom:critical-file-hold` label, only a comment marker.
-pub const MERGE_HOLD_LABELS: [&str; 3] = ["loom:blocked", "loom:operator", "loom:operator-only"];
+/// `loom:frozen` (#11743) is in it too: no role touches a frozen PR, and
+/// `champion-pr-merge.md` skips it.
+pub const MERGE_HOLD_LABELS: [&str; 4] = [
+    "loom:blocked",
+    "loom:operator",
+    "loom:operator-only",
+    crate::work_finder::FROZEN_LABEL,
+];
+
+/// The review axis's park set (#11743): only `loom:frozen`, which the Judge's
+/// `pr-queue` drops since #11793. `judge.md`'s queue has no other exclusions.
+const REVIEW_HOLD_LABELS: [&str; 1] = [crate::work_finder::FROZEN_LABEL];
 
 /// Labels whose presence means `axis`'s owning role will not drain the PR.
 /// Each set is defined once, where its role's skip rule lives:
 ///
 /// - Merge: [`MERGE_HOLD_LABELS`] (`champion-pr-merge.md`).
 /// - Changes: [`crate::work_finder::PARK_LABELS`] (`loom:blocked`,
-///   `loom:operator-only`), the set `doctor.md` Priority 2 skips (#9421).
+///   `loom:operator-only`, and since #11743 `loom:frozen`, all from the label
+///   registry), the set `doctor.md` Priority 2 skips (#9421).
 ///   `loom:operator` is deliberately *not* in it: Champion routes stale held
 ///   PRs to Doctor with that label still on, and Doctor drains them (#7660).
 ///   The Doctor-cycle-cap park (`loom:blocked` + `loom:changes-requested`)
 ///   falls in this set. `loom:treating` is a live Doctor claim, not a park,
 ///   so it stays counted.
-/// - Review: none. `judge.md`'s queue has no label exclusions.
-fn axis_park_labels(axis: DebtAxis) -> &'static [&'static str] {
+/// - Review: `loom:frozen` only ([`REVIEW_HOLD_LABELS`], #11743).
+pub(crate) fn axis_park_labels(axis: DebtAxis) -> &'static [&'static str] {
     match axis {
         DebtAxis::Merge => &MERGE_HOLD_LABELS,
         DebtAxis::Changes => &crate::work_finder::PARK_LABELS,
-        DebtAxis::Review => &[],
+        DebtAxis::Review => &REVIEW_HOLD_LABELS,
     }
 }
 
 /// Open PR rows that count as debt on `axis`. PRs the axis's owning role will
 /// not drain are left out ([`axis_park_labels`]): merge debt skips PRs held
 /// for a human ([`MERGE_HOLD_LABELS`]), changes debt skips parked PRs
-/// ([`crate::work_finder::PARK_LABELS`], #9421), review debt is unfiltered.
+/// ([`crate::work_finder::PARK_LABELS`], #9421), review debt skips frozen
+/// PRs (#11743).
 /// Counting undrainable PRs would keep the work finder's build back-off
 /// (#9410) engaged on a host with many of them. Uses the labels already in
 /// the listing rows.
@@ -476,6 +523,28 @@ pub fn count_axis_rows(axis: DebtAxis, rows: &[RestIssue]) -> usize {
         .filter(|r| r.is_pull_request && r.state.eq_ignore_ascii_case("open"))
         .filter(|r| !r.labels.iter().any(|l| parks.contains(&l.as_str())))
         .count()
+}
+
+/// Whether a queue label's listing holds work its role would drain: the
+/// role runner's queue-gate decision (#9435). Pure over `(label, rows)`: it
+/// reads no config, so it does not depend on demand width being enabled.
+///
+/// The merge and changes axes open the gate only on an open PR their role
+/// will drain ([`count_axis_rows`]), so an all-parked `loom:changes-requested`
+/// queue no longer dispatches a Doctor run that finds nothing. A label with no
+/// axis keeps the plain "any row" rule. Review deliberately does not go
+/// through [`count_axis_rows`], which also drops non-PR and non-open rows: it
+/// keeps "any row", less `loom:frozen` rows (#11743), so an all-frozen review
+/// queue no longer dispatches a Judge whose `pr-queue` would serve nothing.
+#[must_use]
+pub fn listing_has_work(label: &str, rows: &[RestIssue]) -> bool {
+    match DebtAxis::for_label(label) {
+        Some(DebtAxis::Review) => rows
+            .iter()
+            .any(|r| !crate::work_finder::is_frozen(&r.labels)),
+        Some(axis) => count_axis_rows(axis, rows) > 0,
+        None => !rows.is_empty(),
+    }
 }
 
 /// Record a queue listing the role runner already made for `root`: a no-op
@@ -510,7 +579,15 @@ pub fn forge_merge_probe() -> DemandProbe {
             DebtAxis::Merge.label(),
             "open",
         )
-        .map(|rows| count_axis_rows(DebtAxis::Merge, &rows))
+        .map(|rows| {
+            // #10212: the same rows, kept for the champion tick's `pick.decision`.
+            crate::observability::pick_decision::record_gate_listing(
+                root,
+                DebtAxis::Merge.label(),
+                &rows,
+            );
+            count_axis_rows(DebtAxis::Merge, &rows)
+        })
         .map_err(|e| e.to_string())
     })
 }
@@ -543,6 +620,24 @@ pub fn record_merge_debt(probe: &DemandProbe, ledger: &DemandLedger, root: &Path
 pub fn width(debt: Option<usize>, cfg: &DemandConfig, phase1_budget: usize) -> usize {
     let upper = cfg.max.min(phase1_budget).max(1);
     debt.map_or(phase1_budget, |d| d.div_ceil(cfg.per_run.max(1)).clamp(1, upper))
+}
+
+/// How many runs of `role` one repository may hold at once (#10632), sized
+/// from **that repository's** own debt (`repo`, a
+/// [`DemandLedger::repo_debt`] reading): doctor gets
+/// `clamp(ceil(repo changes debt / perRun), 1, doctorMaxPerRepo)`; every other
+/// role, and a doctor whose repository's changes axis is unobserved, gets the
+/// classic `1`. The host ceiling, the role's budget and the reservation still
+/// bound every lane, so this only lets a hot repository use slots the host
+/// already allows doctor.
+#[must_use]
+pub fn repo_lanes(role: &str, repo: &HostDebt, cfg: &DemandConfig) -> usize {
+    if role != "doctor" {
+        return 1;
+    }
+    let upper = cfg.doctor_max_per_repo.max(1);
+    repo.axis_width(DebtAxis::Changes)
+        .map_or(1, |d| d.div_ceil(cfg.per_run.max(1)).clamp(1, upper))
 }
 
 /// The slots a PR role wants held: `min(width, roots_with_debt)`, or 0 when
@@ -744,17 +839,37 @@ impl RoleRunGuard {
         budget: usize,
         plan: &ReservationPlan,
     ) -> RoleAdmission {
-        let key = (root, role);
+        Self::admit_lane_with_demand(set, root, role, 1, ceiling, budget, plan)
+    }
+
+    /// [`Self::admit_with_demand`] for a `(root, role)` that may hold up to
+    /// `lanes` runs at once (#10632): the run takes the lowest lane not in
+    /// flight, and is `InProgress` only when every lane is. `lanes = 1` is
+    /// exactly [`Self::admit_with_demand`]. Every lane counts against the host
+    /// ceiling, the role budget and the reservation like any other run.
+    #[must_use]
+    pub fn admit_lane_with_demand(
+        set: InProgressGuard,
+        root: PathBuf,
+        role: &'static str,
+        lanes: usize,
+        ceiling: usize,
+        budget: usize,
+        plan: &ReservationPlan,
+    ) -> RoleAdmission {
+        let key;
         {
             let mut guard = set.lock().unwrap_or_else(PoisonError::into_inner);
-            if guard.contains(&key) {
+            let free = (0..lanes.max(1)).find(|l| !guard.contains(&(root.clone(), role, *l)));
+            let Some(lane) = free else {
                 return RoleAdmission::InProgress;
-            }
+            };
+            key = (root, role, lane);
             let active = guard.len();
             if active >= ceiling {
                 return RoleAdmission::CeilingReached { active, ceiling };
             }
-            let active_of = |r: &str| guard.iter().filter(|(_, x)| *x == r).count();
+            let active_of = |r: &str| guard.iter().filter(|(_, x, _)| *x == r).count();
             let role_active = active_of(role);
             if role_active >= budget {
                 return RoleAdmission::RoleBudgetReached {

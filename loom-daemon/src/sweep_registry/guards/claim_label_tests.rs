@@ -231,10 +231,10 @@ fn claim_label_is_live_foreign_ignores_this_dispatchers_own_flip() {
     );
     assert!(
         !claim_label_is_live_foreign(episode_start, episode_start),
-        "an event at the episode start is this attempt's own flip, not foreign (older-by-slack is the foreign threshold)"
+        "the boundary is strict: only an event strictly older than the episode start is foreign"
     );
     assert!(
-        claim_label_is_live_foreign(episode_start - chrono::Duration::seconds(2), episode_start),
+        claim_label_is_live_foreign(episode_start - chrono::Duration::seconds(1), episode_start),
         "an event predating the episode start, inside the grace, is a live foreign claim"
     );
     assert!(
@@ -299,25 +299,28 @@ fn yield_identity_maps_each_variant_onto_the_dispatch_shape() {
     );
 }
 
-/// Issue #10337 regression: the forge reports `created_at` truncated to whole
-/// seconds while `episode_start` is sub-second, so this dispatcher's own flip
-/// in the same wall-second read as "older" and it yielded to itself.
+/// #10345: own-flip attribution needs BOTH the fleet actor and the flip window.
 #[test]
-fn claim_label_is_live_foreign_ignores_same_second_truncated_own_flip() {
-    use chrono::TimeZone;
-    let episode_start =
-        Utc.with_ymd_and_hms(2026, 10, 5, 0, 40, 26).unwrap() + chrono::Duration::milliseconds(800);
-    let truncated = Utc.with_ymd_and_hms(2026, 10, 5, 0, 40, 26).unwrap();
-    assert!(
-        !claim_label_is_live_foreign(truncated, episode_start),
-        "own flip truncated to the same second must not be foreign"
-    );
-    assert!(
-        !claim_label_is_live_foreign(truncated - chrono::Duration::seconds(1), episode_start),
-        "within clock slack is still own"
-    );
-    assert!(
-        claim_label_is_live_foreign(truncated - chrono::Duration::seconds(5), episode_start),
-        "a genuinely older young label is still foreign"
-    );
+fn claim_event_is_own_flip_requires_fleet_actor_and_window() {
+    use crate::forge_identity::FleetLogins;
+    let fleet = FleetLogins::single("loom-fleet-dispatch");
+    let start = Utc::now();
+    let end = start + chrono::Duration::milliseconds(300);
+    let near = start - chrono::Duration::seconds(1);
+    assert!(claim_event_is_own_flip("loom-fleet-dispatch", near, start, end, &fleet));
+    assert!(claim_event_is_own_flip("loom-fleet-dispatch[bot]", near, start, end, &fleet));
+    assert!(!claim_event_is_own_flip("someone-else", near, start, end, &fleet));
+    assert!(!claim_event_is_own_flip("", near, start, end, &fleet));
+    let far = start - chrono::Duration::seconds(30);
+    assert!(!claim_event_is_own_flip("loom-fleet-dispatch", far, start, end, &fleet));
+}
+
+#[test]
+fn parse_claim_event_takes_newest_and_rejects_bare_timestamps() {
+    let out = b"a\t2026-01-01T00:00:00Z\nb\t2026-01-01T00:00:05Z\n";
+    let (actor, ts) = parse_claim_event(out).unwrap();
+    assert_eq!(actor, "b");
+    assert_eq!(ts.to_rfc3339(), "2026-01-01T00:00:05+00:00");
+    assert!(parse_claim_event(b"2026-01-01T00:00:00Z\n").is_none());
+    assert!(parse_claim_event(b"").is_none());
 }

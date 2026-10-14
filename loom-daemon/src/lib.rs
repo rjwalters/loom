@@ -62,6 +62,11 @@
 //!   test that never touches the environ cannot participate in this class of bug
 //!   at all. Likewise use `tempfile::TempDir` for paths and explicit `.env()` on
 //!   `Command` for child environments.
+//! * **Never let a test reach the machine-wide build slot.** A test that runs
+//!   the build gate, or anything else that calls `build_slot::slot_dir`, holds a
+//!   `build_slot::test_support::BuildSlotEnvGuard` for its whole body. Without
+//!   one the slot resolves to the host's `~/.loom/locks/build-slot`, and
+//!   `slot_dir` panics in test builds rather than touch it (#11014).
 //!
 //! ## When a test truly needs cross-process exclusive state
 //!
@@ -135,17 +140,21 @@ pub mod agent_skills;
 pub mod api_keys_pool;
 pub mod auto_update;
 pub mod autonomy_marker;
+pub mod branch_update;
 pub mod build_slot;
 pub mod calibrate;
 pub mod capability;
 pub mod capacity;
+/// The `loom:cargo-target-dir` guard: deny a cargo build into an unowned target dir (#11582).
+pub mod cargo_target_guard;
 pub mod ci_telemetry;
 pub mod claim_reconciliation;
+pub mod classify_error;
 pub mod cmd_out;
 pub mod codex_sandbox_noop;
 pub mod codex_usage;
 pub mod comment_trust;
-pub mod concierge;
+pub mod config_journal;
 pub mod config_resolver;
 pub mod cpu_headroom;
 pub mod credential_preflight;
@@ -164,22 +173,30 @@ pub mod daemon_update;
 pub mod deep_clean;
 pub mod dep_classify;
 pub mod dep_recheck;
+pub mod disk_admission;
+pub mod disk_footprint;
+pub mod disk_full_halt;
 pub mod disk_headroom;
+pub mod dispatch_tap;
 pub mod docker_image_clean;
+pub mod doctor_escalation;
 pub mod eager_reclaim;
 pub mod epic_state;
 pub mod epic_supervisor;
 pub mod errors;
-pub mod eta;
 pub mod event_bus;
+pub mod fetch_headroom;
 pub mod filing_lock;
 pub mod fleet;
 pub mod fleet_alert;
 pub mod fleet_captain;
+pub mod fleet_outputs;
+pub mod fleet_singletons;
 pub mod fleet_state;
 pub mod fleet_store;
 pub mod fleet_sync;
 pub mod foreign_load;
+pub mod forge_bucket_book;
 pub mod forge_cached_list;
 pub mod forge_cached_view;
 pub mod forge_call_stats;
@@ -189,43 +206,61 @@ pub mod forge_check_open_pr;
 pub mod forge_cmd;
 pub mod forge_comment;
 pub mod forge_contract;
+pub mod forge_denial;
 pub mod forge_disable_auto_merge;
-pub mod forge_egress;
 pub(crate) mod forge_etag_store;
 pub mod forge_events;
+pub mod forge_host;
 pub mod forge_identity;
 pub mod forge_inventory;
 pub mod forge_listing;
 pub mod forge_merge_config;
 pub mod forge_merge_method;
+pub mod forge_merge_queue;
 pub mod forge_parser;
 pub mod forge_pr_congestion;
+pub mod forge_priority_labels;
+pub mod forge_probe;
 pub mod forge_pull_listing;
 pub mod forge_read_pool;
+pub(crate) mod forge_repo_facts;
+pub mod forge_rerun;
 pub mod forge_tree_unchanged;
+pub mod forge_version_only_diff;
 pub mod forge_wait_checks;
+/// Generated content a quarantine must never stash: name-based artifacts and
+/// content-verified cargo build trees (#5690, #11075).
+pub mod generated_artifact;
 pub mod gh_invocation;
 pub mod gh_repo_env;
 pub mod gh_state_probe;
+pub mod git_ff_identical;
 pub mod git_parser;
+pub mod git_tmp_reclaim;
 pub mod git_utils;
 pub mod guard_wiring;
+pub mod guards_status;
 pub mod hard_exclusion;
 pub mod health;
 pub mod health_monitor;
 pub mod host_affinity;
 pub mod host_breaker;
+pub mod host_identity;
+pub mod host_optout;
 pub mod host_pressure;
 pub mod hyperparams;
 pub mod idle_exit;
 pub mod inflight;
 pub mod init;
+pub mod install_compat;
+pub mod install_compat_harness;
 pub mod install_self_check;
 pub mod intake_reconcile;
 pub mod ipc;
 pub mod issue_creation_mutex;
+pub mod issue_state_read;
 pub mod jev_merge_risk;
-pub mod jev_tier;
+pub mod journal;
 pub mod kimi_usage;
 pub mod label_registry;
 pub mod launch_env;
@@ -238,18 +273,20 @@ pub mod live_claim;
 /// run on any spawn of the real `gh` (#10138).
 #[cfg(test)]
 mod live_gh_guard;
+pub mod loom_ui_alerts;
 pub mod main_health_gate;
 pub mod mcp_tool_guard;
 pub mod merge_group_ci;
+pub mod merge_policy;
 pub mod merge_pr;
 pub mod metrics_collector;
 pub mod observability;
 pub mod opencode_usage;
 pub mod operator_decision;
-pub mod operator_levels;
 pub mod operator_stop;
 pub mod orphan_process_reaper;
 pub mod overlap_replay;
+pub mod parent_link;
 pub mod park_record;
 pub mod peer_claims;
 pub mod phase_join;
@@ -258,14 +295,20 @@ pub mod pipeline_snapshot;
 pub mod points_marker;
 pub mod pr_latency;
 pub mod pr_planning;
+pub mod preflight;
 pub mod premise_check;
+pub mod presence;
 pub mod primary_checkout_reaper;
+pub mod priority_pick;
+pub mod private_control_gate;
 pub mod proc_exec;
 pub mod provenance;
 pub mod quarantine_reconciliation;
 pub mod quarantine_stash_status;
 pub mod ram_headroom;
+pub mod ram_peaks;
 pub mod rate_limit_breaker;
+pub mod rebase_guard;
 pub mod reclaim_pr_warning;
 pub mod reconcile_stack;
 /// Ref-operand validation for forge-derived branch names (#9106). A sibling
@@ -275,9 +318,15 @@ pub mod reconcile_stack;
 /// `defaults/scripts/lib/default-branch.sh`.
 pub mod refname;
 pub mod release_fetch;
+pub mod release_provenance;
 pub mod release_resolve;
+pub(crate) mod release_veto;
+pub mod remote_fleet_exec;
+pub mod renovate_labels;
 pub mod repo_root;
 pub mod restart_verify;
+/// Fork-point provenance for `.loom/resync-ignore` pins (#8726).
+pub mod resync_pin;
 pub mod retry_classify;
 /// The `sweep.outcome` rework-event marker protocol (#9444): where the file
 /// lives, the `kind` vocabulary, the substantive/environmental table, and the
@@ -291,27 +340,31 @@ pub mod role_shard;
 pub mod role_tick_telemetry;
 pub mod role_tool_policy;
 pub mod role_validation;
+/// Safe-point pause hook, pause state and resume handles for a daemon roll (#10830).
+pub mod roll_pause;
+/// A Loom-owned `CARGO_TARGET_DIR` per role run under `.loom/targets/` (#8370).
+pub mod run_target_dir;
 pub mod runtime_admission;
 pub mod runtime_launch;
 pub mod runtime_preference;
+#[cfg(test)]
+pub(crate) mod runtime_selection_test_support;
 pub mod safehouse;
-/// Inbound safehouse ChatOps steering (#7893, Phase 3a of #4196). A sibling
-/// module rather than a `safehouse::` submodule: `safehouse.rs` is an
-/// over-threshold file frozen by the file-size ratchet
-/// (`.loom/docs/file-size-policy.md`), and the whole point of the ratchet is
-/// that new code lands in a new module instead.
-pub mod safehouse_chatops;
 pub mod scratch_reclaim;
 pub mod script_helpers;
 /// Content scan for credential-shaped values before commit/push (#9133).
 pub mod secret_scan;
 pub mod self_update;
 pub mod serve;
+pub mod session_reconcile;
+pub mod session_status;
 pub mod shell_budget;
 pub mod short_hash;
+pub mod signoz_read;
 pub mod stale_blocked;
-pub mod star_liveness;
+pub(crate) mod stale_token_retry;
 pub mod startup_adoption;
+pub mod stash_issue_state;
 pub mod stash_retirement;
 /// Root-count-aware cost model for `build_daemon_status` and the `status`/
 /// `health` IPC probes that wait on it (#8163). A sibling module rather than
@@ -319,6 +372,10 @@ pub mod stash_retirement;
 /// frozen by the file-size ratchet, and stating the model once is what keeps
 /// the daemon-side budget and the client-side probe budget from drifting.
 pub mod status_budget;
+/// The named top-level sections of `status --json` and the build phases each
+/// needs (#10787): one list for `--section` parsing, `--help`, the wire request
+/// and the renderer's key filter.
+pub mod status_section;
 /// `points:*` story-point size labels (#9432, epic #9429) — the one parser both
 /// telemetry consumers (`sweep.started` at dispatch, `sweep.outcome` at the
 /// terminal transition) resolve points through, including the daemon-side
@@ -338,10 +395,14 @@ pub mod sweep_registry;
 pub mod sweep_usage;
 pub mod tap_usage;
 pub mod target_dir_gc;
+/// Orphan sweep for Loom-owned and agent-improvised cargo target dirs (#8370).
+pub mod target_orphan_reclaim;
 /// Per-task liveness heartbeats for the daemon's long-running loops (Issue
 /// #10414): the `loom.daemon.task_alive` gauge and `Task liveness:` in status.
 pub mod task_liveness;
 pub mod telemetry;
+pub mod telemetry_join;
+pub mod telemetry_replay;
 pub mod terminal;
 pub mod terminal_restore;
 /// Test-only capturing logger (see module docs) — single-sourced so the crate's
@@ -364,14 +425,20 @@ pub mod tokens_pool;
 pub mod transcript_tokens;
 pub mod types;
 pub mod usage_source;
+/// Is a verdict comment body a rationale at all? (`forge verdict-body-check`, #9258)
+pub mod verdict_body;
 pub mod verdict_equivalence;
+/// The verdict-time gate and label transition behind `post-verdict.sh` (#10581).
+pub mod verdict_gate;
 /// The stale-verdict notice both stale-clear paths post (#9709).
 pub mod verdict_stale_notice;
 pub mod watch_registry;
 pub mod watchdog;
 pub mod watchdog_provisioning_guard;
+pub mod weighted_draw;
 pub mod work_finder;
 pub mod worker_spawn;
+pub mod workspace_hold;
 pub mod workspace_pool;
 pub mod workspace_registry;
 pub mod worktree_activity;

@@ -28,7 +28,7 @@
 //! Three guarantees, matching the issue's acceptance criteria:
 //!
 //! 1. **Typed schema + one structured surface** — [`Hyperparameters`] groups
-//!    the knobs (`dispatch`, `lifecycle`, `rework`) with documented ranges.
+//!    the knobs (`dispatch`, `lifecycle`, `rework`, `champion`) with documented ranges.
 //! 2. **Fail-fast startup validation** — [`startup_init`] resolves the layer,
 //!    rejects unknown keys, wrong types, out-of-range values and the
 //!    contradictory `low >= high` backoff pair *by name*, and aborts daemon
@@ -42,9 +42,14 @@
 //!    run is reproducible from the exact vector it ran under.
 //!
 //! Tranche 1 fields (each a real consumed tunable — see the field docs):
-//! `dispatch.{tickIntervalSecs,maxConcurrent,maxAdmissionsPerTick}`,
+//! `dispatch.{tickIntervalSecs,maxConcurrent,maxAdmissionsPerTick}` (plus
+//! the workspace draw's `dispatch.weightBonus{RedMainFix,VeryImportant,Important}`,
+//! #11742),
 //! `lifecycle.{leaseTtlMinutes,idleExitMinutes}`, and
-//! `rework.{buildBackoffHigh,buildBackoffLow}`. Later tranches migrate the
+//! `rework.{buildBackoffHigh,buildBackoffLow}`. The `champion` group (#10753)
+//! carries Champion's promotion-throughput knobs
+//! (`prSlice,promotionSlice,tier2Cap,tier3Cap,tier3BacklogCap`; since #11512
+//! `tier2Cap` caps no-level promotions and the two `tier3*` caps are unused). Later tranches migrate the
 //! remaining knobs (host breaker, admission brake, merge-train bounds, role
 //! budgets) onto the same surface; the schema, validation and digest
 //! mechanics here are the whole point — adding a field is one struct entry,
@@ -60,6 +65,10 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use crate::config_resolver;
+use crate::priority_pick::{
+    DEFAULT_BONUS_IMPORTANT, DEFAULT_BONUS_RED_MAIN_FIX, DEFAULT_BONUS_VERY_IMPORTANT,
+    WEIGHT_BONUS_RANGE,
+};
 use crate::work_finder::{
     build_backoff::{BuildBackoffConfig, DEFAULT_HIGH, DEFAULT_LOW},
     DEFAULT_MAX_ADMISSIONS_PER_TICK, DEFAULT_WORK_FINDER_INTERVAL_SECS,
@@ -115,6 +124,18 @@ pub struct DispatchParams {
     /// `autonomous.workFinder.maxAdmissionsPerTick`; env:
     /// `LOOM_WORK_FINDER_MAX_ADMISSIONS_PER_TICK`. Range `[1, 64]`.
     pub max_admissions_per_tick: usize,
+    /// Points the workspace draw adds to a repo's `weight` while its next
+    /// candidate is a verified red-main fix (`dispatch.weightBonusRedMainFix`,
+    /// #11742). Source: `priority_pick::DEFAULT_BONUS_RED_MAIN_FIX` (400). No
+    /// legacy config home and no single-knob env. Range `[0, 1000000]`.
+    /// Appended last: field order is the digest's canonical serialization.
+    pub weight_bonus_red_main_fix: u32,
+    /// Points added while the repo has dispatchable `loom:very-important`
+    /// work (`dispatch.weightBonusVeryImportant`, #11742). Default 100.
+    pub weight_bonus_very_important: u32,
+    /// Points added while the repo has dispatchable `loom:important` work
+    /// (`dispatch.weightBonusImportant`, #11742). Default 20.
+    pub weight_bonus_important: u32,
 }
 
 /// Lifecycle timeout tunables — how long Loom waits before treating work or
@@ -139,16 +160,46 @@ pub struct LifecycleParams {
 /// PR debt (issue #9410).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct ReworkParams {
-    /// Engage the back-off when PR debt (review + changes + merge) rises
-    /// strictly above this. Source: `build_backoff::DEFAULT_HIGH` (40).
+    /// Engage a repo's back-off when its own PR debt (review + changes +
+    /// merge) rises strictly above this (per repo since #10624). Source:
+    /// `build_backoff::DEFAULT_HIGH` (40).
     /// Legacy: `autonomous.workFinder.buildBackoff.high`. Range `[1, 100000]`.
     pub build_backoff_high: usize,
-    /// Release the back-off when PR debt falls strictly below this. Source:
-    /// `build_backoff::DEFAULT_LOW` (25). Legacy:
+    /// Release a repo's back-off when its PR debt falls strictly below this.
+    /// Source: `build_backoff::DEFAULT_LOW` (25). Legacy:
     /// `autonomous.workFinder.buildBackoff.low`. Range `[0, 100000)`, and
     /// always `< build_backoff_high` — a crossed pair is a startup error from
     /// this surface (the legacy tier keeps its soft fallback to 40/25).
     pub build_backoff_low: usize,
+}
+
+/// Champion promotion-throughput tunables (issue #10753). Each has a
+/// single-knob env var the Champion shell snippets read
+/// (`LOOM_CHAMPION_*`, shown per field), resolved at the top tier with
+/// `Source::Env` provenance; there is no legacy config tier.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct ChampionParams {
+    /// PR rows processed before the promotion pass runs. Env:
+    /// `LOOM_CHAMPION_PR_SLICE`. Default 10. Range `[1, 1000]`.
+    pub pr_slice: usize,
+    /// Fresh promotion verdicts per pause while PR rows remain. Env:
+    /// `LOOM_CHAMPION_PROMOTION_SLICE`. Default 3. Range `[1, 100]`.
+    pub promotion_slice: usize,
+    /// Promotions per repository per pass of proposals with no priority level
+    /// (the old Tier 2 cap, mapped by population in #11512; the name is kept
+    /// for config compatibility). Env: `LOOM_CHAMPION_TIER2_CAP`. Default 2.
+    /// Range `[0, 100]` (`0` disables).
+    pub tier2_cap: usize,
+    /// The old Tier 3 per-pass cap. Unused since #11512: no priority level
+    /// maps onto Tier 3's population. Still parsed and digested so existing
+    /// config loads. Env: `LOOM_CHAMPION_TIER3_CAP`. Default 1. Range
+    /// `[0, 100]`.
+    pub tier3_cap: usize,
+    /// The old Tier 3 backlog gate. Unused since #11512: keyed on no level it
+    /// counted 46 promoted issues against 5 and froze promotion. Still parsed
+    /// and digested so existing config loads. Env:
+    /// `LOOM_CHAMPION_TIER3_BACKLOG_CAP`. Default 5. Range `[0, 1000]`.
+    pub tier3_backlog_cap: usize,
 }
 
 /// The unified hyperparameter vector: every consolidated operational tunable,
@@ -160,6 +211,7 @@ pub struct Hyperparameters {
     pub dispatch: DispatchParams,
     pub lifecycle: LifecycleParams,
     pub rework: ReworkParams,
+    pub champion: ChampionParams,
 }
 
 impl Default for Hyperparameters {
@@ -169,6 +221,9 @@ impl Default for Hyperparameters {
                 tick_interval_secs: DEFAULT_WORK_FINDER_INTERVAL_SECS,
                 max_concurrent: DEFAULT_WORK_FINDER_MAX_CONCURRENT,
                 max_admissions_per_tick: DEFAULT_MAX_ADMISSIONS_PER_TICK,
+                weight_bonus_red_main_fix: DEFAULT_BONUS_RED_MAIN_FIX,
+                weight_bonus_very_important: DEFAULT_BONUS_VERY_IMPORTANT,
+                weight_bonus_important: DEFAULT_BONUS_IMPORTANT,
             },
             lifecycle: LifecycleParams {
                 lease_ttl_minutes: crate::claim_reconciliation::DEFAULT_LEASE_TTL_MINUTES,
@@ -177,6 +232,13 @@ impl Default for Hyperparameters {
             rework: ReworkParams {
                 build_backoff_high: DEFAULT_HIGH,
                 build_backoff_low: DEFAULT_LOW,
+            },
+            champion: ChampionParams {
+                pr_slice: 10,
+                promotion_slice: 3,
+                tier2_cap: 2,
+                tier3_cap: 1,
+                tier3_backlog_cap: 5,
             },
         }
     }
@@ -312,6 +374,26 @@ const LEASE_TTL_MINUTES_MAX: f64 = 1440.0;
 const IDLE_EXIT_MINUTES_RANGE: (u64, u64) = (1, 10080);
 const BUILD_BACKOFF_HIGH_RANGE: (u64, u64) = (1, 100_000);
 const BUILD_BACKOFF_LOW_RANGE: (u64, u64) = (0, 100_000);
+/// Champion knobs: `(key, single-knob env var, range)`. The three caps admit
+/// `0` because Champion's shell `_cap` honours it (`0` disables that level /
+/// gates no-level promotion shut — promotion-throughput.md); the slices do not.
+const CHAMPION_KEYS: [(&str, &str, (u64, u64)); 5] = [
+    ("prSlice", "LOOM_CHAMPION_PR_SLICE", (1, 1000)),
+    ("promotionSlice", "LOOM_CHAMPION_PROMOTION_SLICE", (1, 100)),
+    ("tier2Cap", "LOOM_CHAMPION_TIER2_CAP", (0, 100)),
+    ("tier3Cap", "LOOM_CHAMPION_TIER3_CAP", (0, 100)),
+    ("tier3BacklogCap", "LOOM_CHAMPION_TIER3_BACKLOG_CAP", (0, 1000)),
+];
+
+/// Parse a `LOOM_CHAMPION_*` value exactly as Champion's shell `_cap` does:
+/// a non-empty all-digit string is the value (`0` included, no range clamp —
+/// the shell applies none); anything else is absent (falls through).
+fn champion_env_value(raw: &str) -> Option<u64> {
+    if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    raw.parse().ok()
+}
 
 /// Validate the hyperparameters layer (config block + env vector): every key
 /// must be known, correctly typed, and in range, and the backoff pair must
@@ -328,7 +410,7 @@ pub fn validate_layer(layer: &Value) -> Vec<Violation> {
         if !layer.is_null() {
             violations.push(Violation::new(
                 "hyperparameters",
-                "must be an object with `dispatch` / `lifecycle` / `rework` groups",
+                "must be an object with `dispatch` / `lifecycle` / `rework` / `champion` groups",
             ));
         }
         return violations;
@@ -338,9 +420,10 @@ pub fn validate_layer(layer: &Value) -> Vec<Violation> {
             "dispatch" => validate_dispatch(keys, &mut violations),
             "lifecycle" => validate_lifecycle(keys, &mut violations),
             "rework" => validate_rework(keys, &mut violations),
+            "champion" => validate_champion(keys, &mut violations),
             unknown => violations.push(Violation::new(
                 format!("hyperparameters.{unknown}"),
-                "unknown group (expected dispatch | lifecycle | rework)",
+                "unknown group (expected dispatch | lifecycle | rework | champion)",
             )),
         }
     }
@@ -375,7 +458,18 @@ fn validate_dispatch(group: &Value, violations: &mut Vec<Violation>) {
         return;
     }
     for (key, _) in group.as_object().into_iter().flatten() {
-        if !matches!(key.as_str(), "tickIntervalSecs" | "maxConcurrent" | "maxAdmissionsPerTick") {
+        if !matches!(
+            key.as_str(),
+            "tickIntervalSecs"
+                | "maxConcurrent"
+                | "maxAdmissionsPerTick"
+                | "weightBonusRedMainFix"
+                | "weightBonusVeryImportant"
+                | "weightBonusImportant"
+                // Retired with the softmax (#11742). Still accepted, and
+                // ignored, so a host config that set it keeps starting.
+                | "drawTemperature"
+        ) {
             violations.push(Violation::new(format!("dispatch.{key}"), "unknown key"));
         }
     }
@@ -388,6 +482,13 @@ fn validate_dispatch(group: &Value, violations: &mut Vec<Violation>) {
         MAX_ADMISSIONS_PER_TICK_RANGE,
         violations,
     );
+    for key in [
+        "weightBonusRedMainFix",
+        "weightBonusVeryImportant",
+        "weightBonusImportant",
+    ] {
+        check_u64(group, "dispatch", key, WEIGHT_BONUS_RANGE, violations);
+    }
 }
 
 fn validate_lifecycle(group: &Value, violations: &mut Vec<Violation>) {
@@ -441,6 +542,21 @@ fn validate_rework(group: &Value, violations: &mut Vec<Violation>) {
     }
 }
 
+fn validate_champion(group: &Value, violations: &mut Vec<Violation>) {
+    if !group.is_null() && !group.is_object() {
+        violations.push(Violation::new("champion", "must be an object"));
+        return;
+    }
+    for (key, _) in group.as_object().into_iter().flatten() {
+        if !CHAMPION_KEYS.iter().any(|(k, _, _)| k == key) {
+            violations.push(Violation::new(format!("champion.{key}"), "unknown key"));
+        }
+    }
+    for (key, _, range) in CHAMPION_KEYS {
+        check_u64(group, "champion", key, range, violations);
+    }
+}
+
 // ============================================================================
 // Resolution with provenance
 // ============================================================================
@@ -449,6 +565,9 @@ fn validate_rework(group: &Value, violations: &mut Vec<Violation>) {
 /// module: a later tier only fills a field the earlier tiers left absent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Source {
+    /// A single-knob env var (today only the `LOOM_CHAMPION_*` knobs report
+    /// this tier — #10753).
+    Env,
     /// `$LOOM_HYPERPARAMS` vector.
     EnvVector,
     /// `.loom/config.json → "hyperparameters"` block.
@@ -464,6 +583,7 @@ impl Source {
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Env => "env",
             Self::EnvVector => "env-vector",
             Self::Config => "config",
             Self::Legacy => "legacy",
@@ -610,6 +730,37 @@ pub fn resolve_effective(root: &Path) -> Resolved {
                 DEFAULT_MAX_ADMISSIONS_PER_TICK as u64,
                 &mut sources,
             ) as usize,
+            // No legacy tier: the keys are new with #11742.
+            weight_bonus_red_main_fix: u32::try_from(pick_u64(
+                vector.as_ref(),
+                &block,
+                "dispatch",
+                "weightBonusRedMainFix",
+                None,
+                u64::from(DEFAULT_BONUS_RED_MAIN_FIX),
+                &mut sources,
+            ))
+            .unwrap_or(DEFAULT_BONUS_RED_MAIN_FIX),
+            weight_bonus_very_important: u32::try_from(pick_u64(
+                vector.as_ref(),
+                &block,
+                "dispatch",
+                "weightBonusVeryImportant",
+                None,
+                u64::from(DEFAULT_BONUS_VERY_IMPORTANT),
+                &mut sources,
+            ))
+            .unwrap_or(DEFAULT_BONUS_VERY_IMPORTANT),
+            weight_bonus_important: u32::try_from(pick_u64(
+                vector.as_ref(),
+                &block,
+                "dispatch",
+                "weightBonusImportant",
+                None,
+                u64::from(DEFAULT_BONUS_IMPORTANT),
+                &mut sources,
+            ))
+            .unwrap_or(DEFAULT_BONUS_IMPORTANT),
         },
         lifecycle: LifecycleParams {
             lease_ttl_minutes: {
@@ -664,6 +815,42 @@ pub fn resolve_effective(root: &Path) -> Resolved {
                 DEFAULT_LOW as u64,
                 &mut sources,
             ) as usize,
+        },
+        champion: {
+            // The `LOOM_CHAMPION_*` single-knob env tier is what Champion's
+            // shell actually consumes, so it outranks the vector/block here
+            // and reports `Source::Env` — the digest then names the values
+            // the role really ran under (#10753).
+            let d = Hyperparameters::default().champion;
+            let mut pick = |key: &str, default: usize| {
+                let env_var = CHAMPION_KEYS
+                    .iter()
+                    .find(|(k, _, _)| *k == key)
+                    .map(|e| e.1);
+                if let Some(n) = env_var
+                    .and_then(|var| std::env::var(var).ok())
+                    .and_then(|raw| champion_env_value(&raw))
+                {
+                    sources.insert(format!("champion.{key}"), Source::Env);
+                    return n as usize;
+                }
+                pick_u64(
+                    vector.as_ref(),
+                    &block,
+                    "champion",
+                    key,
+                    None,
+                    default as u64,
+                    &mut sources,
+                ) as usize
+            };
+            ChampionParams {
+                pr_slice: pick("prSlice", d.pr_slice),
+                promotion_slice: pick("promotionSlice", d.promotion_slice),
+                tier2_cap: pick("tier2Cap", d.tier2_cap),
+                tier3_cap: pick("tier3Cap", d.tier3_cap),
+                tier3_backlog_cap: pick("tier3BacklogCap", d.tier3_backlog_cap),
+            }
         },
     };
     Resolved { params, sources }
@@ -858,6 +1045,21 @@ impl HyperparamsArgs {
             resolved.sources["dispatch.maxAdmissionsPerTick"].as_str()
         );
         println!(
+            "dispatch.weightBonusRedMainFix    = {:>6}  [{}]",
+            resolved.params.dispatch.weight_bonus_red_main_fix,
+            resolved.sources["dispatch.weightBonusRedMainFix"].as_str()
+        );
+        println!(
+            "dispatch.weightBonusVeryImportant = {:>6}  [{}]",
+            resolved.params.dispatch.weight_bonus_very_important,
+            resolved.sources["dispatch.weightBonusVeryImportant"].as_str()
+        );
+        println!(
+            "dispatch.weightBonusImportant     = {:>6}  [{}]",
+            resolved.params.dispatch.weight_bonus_important,
+            resolved.sources["dispatch.weightBonusImportant"].as_str()
+        );
+        println!(
             "lifecycle.leaseTtlMinutes      = {:>6}  [{}]",
             resolved.params.lifecycle.lease_ttl_minutes,
             resolved.sources["lifecycle.leaseTtlMinutes"].as_str()
@@ -877,6 +1079,19 @@ impl HyperparamsArgs {
             resolved.params.rework.build_backoff_low,
             resolved.sources["rework.buildBackoffLow"].as_str()
         );
+        let c = &resolved.params.champion;
+        for (key, value) in [
+            ("prSlice", c.pr_slice),
+            ("promotionSlice", c.promotion_slice),
+            ("tier2Cap", c.tier2_cap),
+            ("tier3Cap", c.tier3_cap),
+            ("tier3BacklogCap", c.tier3_backlog_cap),
+        ] {
+            println!(
+                "champion.{key:<23}= {value:>6}  [{}]",
+                resolved.sources[&format!("champion.{key}")].as_str()
+            );
+        }
         Ok(())
     }
 }

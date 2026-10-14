@@ -1,0 +1,28 @@
+CI Result	fail	9s	https://github.com/rjwalters/loom/actions/runs/37444757119/job/112212276851	
+Daemon Checks	fail	26s	https://github.com/rjwalters/loom/actions/runs/37444757119/job/112209135000	
+Rust Linting & Build Check	fail	2m41s	https://github.com/rjwalters/loom/actions/runs/37444757119/job/112206880943	
+Rust OTLP Feature Build & Test	fail	2m33s	https://github.com/rjwalters/loom/actions/runs/37444757119/job/112206881094	
+Rust OTLP Feature Tests (1/3)	fail	6m47s	https://github.com/rjwalters/loom/actions/runs/37444757119/job/112206881274	
+Rust OTLP Feature Tests (2/3)	fail	6m17s	https://github.com/rjwalters/loom/actions/runs/37444757119/job/112206881136	
+Rust Unit Tests (1/3)	fail	6m3s	https://github.com/rjwalters/loom/actions/runs/37444757119/job/112206881167	
+Rust Unit Tests (2/3)	fail	6m30s	https://github.com/rjwalters/loom/actions/runs/37444757119/job/112206881074	
+Build loom-daemon (debug, shared)	pass	2m29s	https://github.com/rjwalters/loom/actions/runs/37444757119/job/112206880986	
+Codex Adapter Smoke (mocked)	pass	6m51s	https://github.com/rjwalters/loom/actions/runs/37444757119/job/112206881284	
+Detect Changes	pass	5s	https://github.com/rjwalters/loom/actions/runs/37444757119/job/112206786963	
+Install Surface Checks	pass	34s	https://github.com/rjwalters/loom/actions/runs/37444757119/job/112209135020	
+Installer Integration Tests	pass	2m11s	https://github.com/rjwalters/loom/actions/runs/37444757119/job/112209134968	
+Native Port Suites	pass	6m31s	https://github.com/rjwalters/loom/actions/runs/37444757119/job/112209134908	
+Native Port Suites (daemon lifecycle, watchdog)	pass	3m34s	https://github.com/rjwalters/loom/actions/runs/37444757119/job/112209135163	
+Release Build Check	pass	3m53s	https://github.com/rjwalters/loom/actions/runs/37444757119/job/112206881010	
+Repo Hygiene Checks	pass	15s	https://github.com/rjwalters/loom/actions/runs/37444757119/job/112206787401	
+Rust OTLP Feature Tests (3/3)	pass	4m28s	https://github.com/rjwalters/loom/actions/runs/37444757119/job/112206881110	
+Rust Unit Tests (3/3)	pass	4m10s	https://github.com/rjwalters/loom/actions/runs/37444757119/job/112206881112	
+Shell Syntax (macos-latest)	pass	23s	https://github.com/rjwalters/loom/actions/runs/37444757119/job/112206787271	
+Shell Test Suites (hermetic, 1/2)	pass	2m34s	https://github.com/rjwalters/loom/actions/runs/37444757119/job/112206881124	
+Shell Test Suites (hermetic, 2/2)	pass	2m24s	https://github.com/rjwalters/loom/actions/runs/37444757119/job/112206881159	
+Structural Checks	pass	45s	https://github.com/rjwalters/loom/actions/runs/37444757119/job/112206787304	
+Node Packages (MCP server, dashboard)	skipping	0	https://github.com/rjwalters/loom/actions/runs/37444757119/job/112206883316	
+loom-worker Image Smoke Test	skipping	0	https://github.com/rjwalters/loom/actions/runs/37444757119/job/112206884379	
+loom-worker-native Image Smoke Test	skipping	0	https://github.com/rjwalters/loom/actions/runs/37444757119/job/112206883143	
+loom-worker-session Image Smoke Test	skipping	0	https://github.com/rjwalters/loom/actions/runs/37444757119/job/112206882973	
+Shellcheck	pass	3m1s	https://github.com/rjwalters/loom/actions/runs/37444757105/job/112206786165	

@@ -42,12 +42,13 @@ jobs:
     name: Cancel Superseded Runs (same ref)
     # PR events only (#8198), exactly as ci.yml's identically-named job since
     # #7779. The rationale above is entirely about a superseded PR push. On a
-    # push to main (or a scheduled run) there is nothing to supersede:
-    # `github.head_ref` is empty, so REF fell back to `github.ref_name` =
-    # `main`, and this job cancelled every other queued/in_progress main run --
-    # the dominant cause of the cancellation rate in ci.yml, not the
-    # `concurrency:` stanza alone. Each main commit is distinct work that
-    # deserves its own verification.
+    # push to main (or a scheduled run) there is nothing to supersede. Before
+    # #8198 `github.head_ref` was empty on a push, so REF fell back to
+    # `github.ref_name` = `main`, and this job cancelled every other
+    # queued/in_progress main run. Each main commit is distinct work that
+    # deserves its own verification. Since #10670 the step itself also refuses
+    # to reach a main run (no fallback, `pull_request` runs only), and
+    # loom-daemon's `main_cancel` lint pins it.
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     permissions:
@@ -58,14 +59,25 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           WORKFLOW: ${{ github.workflow }}
-          REF: ${{ github.head_ref || github.ref_name }}
+          REF: ${{ github.head_ref }}
           CURRENT_RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
-          echo "Checking for superseded '$WORKFLOW' runs on ref '$REF' (current run: $CURRENT_RUN_ID)"
+          # PR runs only, by construction (#10670), not just by the job's
+          # `if:`: REF is the PR head branch with no `ref_name` fallback, so
+          # it can never resolve to `main`, and the jq filter selects only
+          # `pull_request` runs, so even a fork PR whose head branch is named
+          # `main` cannot reach a push run. A started main run is never
+          # cancelled (ci-principles.md rule 2); the concurrency stanza's
+          # pending-run supersession is the only bound on main.
+          if [[ -z "$REF" ]]; then
+            echo "No PR head ref; nothing to supersede."
+            exit 0
+          fi
+          echo "Checking for superseded '$WORKFLOW' PR runs on ref '$REF' (current run: $CURRENT_RUN_ID)"
           gh run list --repo "$REPO" --workflow "$WORKFLOW" --branch "$REF" \
-            --json databaseId,status --jq \
-            '.[] | select(.status == "queued" or .status == "in_progress") | .databaseId' \
+            --json databaseId,status,event --jq \
+            '.[] | select(.event == "pull_request") | select(.status == "queued" or .status == "in_progress") | .databaseId' \
             | while read -r run_id; do
                 if [[ "$run_id" != "$CURRENT_RUN_ID" ]]; then
                   echo "Cancelling superseded run $run_id (workflow=$WORKFLOW ref=$REF)"

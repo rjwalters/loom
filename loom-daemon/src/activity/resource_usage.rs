@@ -126,6 +126,23 @@ impl ModelPricing {
         }
     }
 
+    /// Build an OpenAI gpt-6 row (Issue #10750): published cached-input rate
+    /// and a single published cache-write rate used for both TTLs.
+    fn openai(
+        input_cost_per_1k: f64,
+        output_cost_per_1k: f64,
+        cache_read_cost_per_1k: f64,
+        cache_write_cost_per_1k: f64,
+    ) -> Self {
+        Self {
+            input_cost_per_1k,
+            output_cost_per_1k,
+            cache_read_cost_per_1k,
+            cache_write_cost_per_1k,
+            cache_write_1h_cost_per_1k: cache_write_cost_per_1k,
+        }
+    }
+
     /// Look up a model in the **compiled** rate card.
     ///
     /// Since #8177 this is the *fallback* tier, not the only one: the same
@@ -188,6 +205,20 @@ impl ModelPricing {
     /// already applies to the OpenCode/GLM trial, and it is why the K2 rows'
     /// cache-write rates are the published cache-miss input price rather than
     /// an invented Anthropic-shaped surcharge (see [`Self::kimi_k2`]).
+    ///
+    /// # OpenAI / Codex rate card (Issue #10750)
+    ///
+    /// Prices verified against <https://platform.openai.com/docs/pricing>
+    /// (Standard tier, short-context columns) on **2026-10-07**. USD per 1k
+    /// tokens. An API LIST-price estimate, not billed cost; long-context and
+    /// Batch/Flex/Fast tiers are not modelled.
+    ///
+    /// | Row | Input | Output | Cache read | Cache write |
+    /// |---|---|---|---|---|
+    /// | `gpt-6.1-sol` | 0.002 | 0.01 | 0.0001 | 0.0025 |
+    /// | `gpt-6-astra` | 0.01 | 0.05 | 0.001 | 0.0125 |
+    /// | `gpt-6-sol` | 0.002 | 0.01 | 0.0002 | 0.0025 |
+    /// | `gpt-6-luna` | 0.0001 | 0.0005 | 0.00001 | 0.000125 |
     ///
     /// # Matching
     ///
@@ -333,6 +364,25 @@ impl ModelPricing {
             // same reason: an unrecognized id is far likelier to be newer than
             // the card than to be a resurrected retired model.
             return Some(Self::kimi_k2(0.000_95, 0.004, 0.000_19));
+        }
+
+        // ---- OpenAI / Codex gpt-6 (Issue #10750) ----------------------------
+        // https://platform.openai.com/docs/pricing, Standard tier, short-context
+        // columns, read 2026-10-07. Published $/MTok / 1000. One cache-write
+        // price is published; it is used for both TTLs. No trailing `gpt-6`
+        // catch-all on purpose: variants differ up to 100x in price, so an
+        // unrecognized one stays unpriced (and WARNs) rather than guessed.
+        if m.contains("gpt-6.1-sol") {
+            return Some(Self::openai(0.002, 0.01, 0.000_1, 0.002_5));
+        }
+        if m.contains("gpt-6-astra") {
+            return Some(Self::openai(0.01, 0.05, 0.001, 0.012_5));
+        }
+        if m.contains("gpt-6-sol") {
+            return Some(Self::openai(0.002, 0.01, 0.000_2, 0.002_5));
+        }
+        if m.contains("gpt-6-luna") {
+            return Some(Self::openai(0.000_1, 0.000_5, 0.000_01, 0.000_125));
         }
 
         // ---- OpenAI --------------------------------------------------------
@@ -786,6 +836,30 @@ mod tests {
 
     /// AC3 of #8564: every Kimi id the pinned CLI can report is on the card,
     /// so none of them silently falls through to the Anthropic Sonnet default.
+    /// OpenAI/Codex ids (Issue #10750).
+    const CODEX_MODEL_IDS: &[&str] = &[
+        "gpt-6.1-sol",
+        "gpt-6-astra",
+        "gpt-6-sol",
+        "gpt-6-luna",
+        "openai/gpt-6.1-sol",
+    ];
+
+    #[test]
+    fn codex_rows_carry_their_published_rates() {
+        let sol = ModelPricing::lookup("gpt-6.1-sol").unwrap();
+        assert!((sol.input_cost_per_1k - 0.002).abs() < f64::EPSILON);
+        assert!((sol.output_cost_per_1k - 0.01).abs() < f64::EPSILON);
+        assert!((sol.cache_read_cost_per_1k - 0.000_1).abs() < f64::EPSILON);
+        let astra = ModelPricing::lookup("gpt-6-astra").unwrap();
+        assert!((astra.output_cost_per_1k - 0.05).abs() < f64::EPSILON);
+        // 6.1-sol and 6-sol are distinct rows with distinct cache-read rates.
+        let sol6 = ModelPricing::lookup("gpt-6-sol").unwrap();
+        assert!((sol6.cache_read_cost_per_1k - 0.000_2).abs() < f64::EPSILON);
+        // An unrecognized gpt-6 variant is deliberately unpriced.
+        assert!(ModelPricing::lookup("gpt-6-nova").is_none());
+    }
+
     #[test]
     fn pricing_card_knows_every_kimi_model_id() {
         for id in KIMI_MODEL_IDS {
@@ -1064,6 +1138,7 @@ mod tests {
     fn parity_model_ids() -> Vec<String> {
         let mut ids: Vec<String> = KNOWN_MODEL_IDS.iter().map(|s| (*s).to_string()).collect();
         ids.extend(KIMI_MODEL_IDS.iter().map(|s| (*s).to_string()));
+        ids.extend(CODEX_MODEL_IDS.iter().map(|s| (*s).to_string()));
         for extra in [
             "OPUS",
             "claude-opus-6",

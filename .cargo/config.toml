@@ -63,6 +63,15 @@ rustflags = [
 # on macOS ARM64. See issue #2298.
 runner = ".cargo/macos-test-runner.sh"
 
+[env]
+# #10607 review S3: every Loom spawn path exports the daemon's real
+# forge-call sink as LOOM_FORGE_CALL_STATS_DIR (W5), so an agent running
+# `cargo test` here would hand it to every `loom-daemon` test binary, and their
+# fake-`gh` rows would land in the production ledger. Empty means "the
+# default under TMPDIR", what these tests saw before W5; a test that wants a
+# sink sets its own.
+LOOM_FORGE_CALL_STATS_DIR = { value = "", force = true }
+
 [alias]
 # Convenient aliases for common tasks
 clippy-all = "clippy --workspace --all-targets --all-features"

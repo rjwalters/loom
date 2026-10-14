@@ -104,7 +104,8 @@ pub enum ApiKeysAction {
     /// Declare (or clear) an account's concurrency cap — the most spawns that
     /// may hold it at once (#8424). An account at its cap is skipped in
     /// favour of another eligible account, and becomes selectable again as
-    /// soon as one of those spawns exits.
+    /// soon as one of those spawns exits. Also declares the plan's quota
+    /// window and token allowance (#11286).
     Limit {
         #[arg(value_name = "PROVIDER")]
         provider: String,
@@ -117,6 +118,22 @@ pub enum ApiKeysAction {
         /// Clear the cap (unbounded again).
         #[arg(long)]
         unlimited: bool,
+        /// The plan's quota window (`<N>[s|m|h|d]`, e.g. `7d` for a weekly
+        /// cap): how long an exhausted seat stays out of selection when the
+        /// provider names no reset time of its own (#11286). Default 6h.
+        #[arg(long, value_name = "DURATION", value_parser = parse_window, conflicts_with = "clear_exhaustion_window")]
+        exhaustion_window: Option<u64>,
+        /// Clear the plan window (back to the 6h default).
+        #[arg(long)]
+        clear_exhaustion_window: bool,
+        /// The plan's token allowance per window (#11286), exported as
+        /// `loom.pool.plan_token_limit` so the dashboard can compute
+        /// utilization. Not enforced.
+        #[arg(long, value_name = "TOKENS", conflicts_with = "clear_plan_token_limit")]
+        plan_token_limit: Option<u64>,
+        /// Clear the plan token allowance.
+        #[arg(long)]
+        clear_plan_token_limit: bool,
         #[arg(long, help = SHARED_VERB_HELP)]
         shared: bool,
         #[arg(long)]
@@ -345,15 +362,36 @@ pub(crate) fn handle_api_keys_command(action: ApiKeysAction, workspace: &str) ->
             name,
             max_concurrent,
             unlimited,
+            exhaustion_window,
+            clear_exhaustion_window,
+            plan_token_limit,
+            clear_plan_token_limit,
             shared,
             json,
         } => {
-            if max_concurrent.is_none() && !unlimited {
-                bail!("pass --max-concurrent <N> to declare a cap, or --unlimited to clear it");
+            let cap = max_concurrent.is_some() || unlimited;
+            let window = exhaustion_window.is_some() || clear_exhaustion_window;
+            let tokens = plan_token_limit.is_some() || clear_plan_token_limit;
+            if !cap && !window && !tokens {
+                bail!(
+                    "pass --max-concurrent <N> / --unlimited, --exhaustion-window <DURATION> / \
+                     --clear-exhaustion-window, or --plan-token-limit <TOKENS> / \
+                     --clear-plan-token-limit"
+                );
             }
             let root = provider_root(&workspace, &provider, shared)?;
-            limits::set_max_concurrent(&root, &provider, &name, max_concurrent)
-                .map_err(anyhow::Error::msg)?;
+            if cap {
+                limits::set_max_concurrent(&root, &provider, &name, max_concurrent)
+                    .map_err(anyhow::Error::msg)?;
+            }
+            if window {
+                limits::set_exhaustion_window(&root, &provider, &name, exhaustion_window)
+                    .map_err(anyhow::Error::msg)?;
+            }
+            if tokens {
+                limits::set_plan_token_limit(&root, &provider, &name, plan_token_limit)
+                    .map_err(anyhow::Error::msg)?;
+            }
             print_account(&registry::describe_account(&root, &provider, &name), json)
         }
         ApiKeysAction::Sync {
@@ -761,13 +799,42 @@ fn print_account(account: &ApiKeyAccount, json: bool) -> Result<()> {
         },
         account
             .max_concurrent
-            .map_or(String::new(), |cap| format!(", maxConcurrent={cap}")),
+            .map_or(String::new(), |cap| format!(", maxConcurrent={cap}"))
+            + &account
+                .exhaustion_window_secs
+                .map_or(String::new(), |secs| format!(", exhaustionWindowSecs={secs}"))
+            + &account
+                .plan_token_limit
+                .map_or(String::new(), |tokens| format!(", planTokenLimit={tokens}")),
         account
             .problem
             .as_ref()
             .map_or(String::new(), |p| format!(", problem={p}")),
     );
     Ok(())
+}
+
+/// `<N>[s|m|h|d]` as seconds (#11286's `--exhaustion-window`). A bare number
+/// is seconds.
+fn parse_window(raw: &str) -> Result<u64, String> {
+    let raw = raw.trim();
+    let (digits, unit) = match raw.char_indices().last() {
+        Some((at, c)) if c.is_ascii_alphabetic() => (&raw[..at], c.to_ascii_lowercase()),
+        _ => (raw, 's'),
+    };
+    let n: u64 = digits
+        .parse()
+        .map_err(|_| format!("{raw:?} is not a duration like 7d, 5h or 3600"))?;
+    let scale = match unit {
+        's' => 1,
+        'm' => 60,
+        'h' => 3600,
+        'd' => 86_400,
+        _ => return Err(format!("{raw:?}: unit must be s, m, h or d")),
+    };
+    n.checked_mul(scale)
+        .filter(|secs| *secs > 0)
+        .ok_or_else(|| format!("{raw:?} must be a positive duration"))
 }
 
 /// Read key material from a file or stdin. Never from argv.
@@ -832,6 +899,20 @@ fn read_key(key_file: Option<&std::path::Path>) -> Result<(Option<String>, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #11286: `--exhaustion-window` takes a unit suffix; zero and junk are
+    /// refused rather than read as "no window".
+    #[test]
+    fn parse_window_reads_unit_suffixed_durations() {
+        assert_eq!(parse_window("7d"), Ok(604_800));
+        assert_eq!(parse_window("5h"), Ok(18_000));
+        assert_eq!(parse_window("90m"), Ok(5_400));
+        assert_eq!(parse_window("3600"), Ok(3_600));
+        assert_eq!(parse_window("45S"), Ok(45));
+        for bad in ["0", "0d", "", "d", "7w", "-1h", "1.5h"] {
+            assert!(parse_window(bad).is_err(), "{bad:?}");
+        }
+    }
 
     #[test]
     fn read_key_accepts_a_bare_value_or_an_env_fragment() {

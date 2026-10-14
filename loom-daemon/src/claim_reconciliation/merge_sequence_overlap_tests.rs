@@ -94,7 +94,9 @@ fn decide(
         calls.set(calls.get() + 1);
         sets.get(&p.number).cloned()
     };
-    let out = with_no_overlap(action, m, pred_state, &c.follower, &c.open, &mut cache, fetch);
+    let conflicts = super::super::conflict::assume_conflict;
+    let (f, open) = (&c.follower, &c.open);
+    let out = with_no_overlap(action, m, pred_state, f, open, &mut cache, fetch, &conflicts);
     (out, calls.get())
 }
 
@@ -351,7 +353,8 @@ fn fake_gh(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
          case \"$1 $2\" in\n\
          'api '*/issues/*) n=\"${{2#*/issues/}}\"; n=\"${{n%%/*}}\"; cat \"{d}/comments-$n.json\" 2>/dev/null || echo '[]' ;;\n\
          'api '*/pulls/*) cat \"{d}/pull-${{2##*/}}.json\" || exit 1 ;;\n\
-         'pr view') cat \"{d}/files-$3.json\" || exit 1 ;;\n\
+         'api --include') n=\"${{3%/files*}}\"; n=\"${{n##*/}}\"; [ -f \"{d}/files-$n.json\" ] || exit 1;\
+           printf 'HTTP/2.0 200 OK\\r\\n\\r\\n'; cat \"{d}/files-$n.json\" ;;\n\
          *) exit 1 ;;\nesac\n",
         log = log.display(),
     );
@@ -408,20 +411,22 @@ fn the_dry_run_lists_disjoint_holds_reads_once_and_writes_nothing() {
     ] {
         let rows: Vec<_> = paths
             .iter()
-            .map(|p| serde_json::json!({"path": p}))
+            .map(|p| serde_json::json!({"filename": p}))
             .collect();
-        write_json(d, &format!("files-{n}.json"), &serde_json::json!({ "files": rows }));
+        write_json(d, &format!("files-{n}.json"), &serde_json::json!(rows));
     }
     let (gh, log) = fake_gh(d);
     let mut cache = TickFiles::default();
-    let out = would_release(&gh, &root, &open, &mut cache);
+    let conflicts = super::super::conflict::assume_conflict;
+    let out = would_release(&gh, &root, &open, &mut cache, &conflicts);
     assert_eq!(out, vec![(20, 10)]);
     let calls = std::fs::read_to_string(&log).unwrap();
     assert!(!calls.contains("pr edit") && !calls.contains("pr comment"), "{calls}");
     for n in [10, 20, 21] {
-        assert!(calls.matches(&format!("pr view {n} ")).count() <= 1, "{calls}");
+        assert!(calls.matches(&format!("pulls/{n}/files")).count() <= 1, "{calls}");
     }
-    assert!(!calls.contains("pr view 22 "), "a manual hold reads no files: {calls}");
+    assert!(!calls.contains("--json files"), "no GraphQL files read (#10382): {calls}");
+    assert!(!calls.contains("pulls/22/files"), "a manual hold reads no files: {calls}");
 }
 
 // --- Property test ---------------------------------------------------------

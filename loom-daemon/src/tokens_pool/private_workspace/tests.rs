@@ -1,5 +1,86 @@
 use super::*;
 
+/// Serializes every test in this module that forks (a `git` fixture, a
+/// `Command::spawn`) or holds an account lease. `fork()` copies every open
+/// descriptor, so a fork racing a held lease keeps the `flock` alive in the
+/// child until it execs and `Lease::acquire` reads busy (issue #10798). One
+/// lock for the forkers and the lease holders, not a global `#[serial]`.
+pub(super) fn fork_guard() -> std::sync::MutexGuard<'static, ()> {
+    static FORK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    FORK_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Re-acquire a lease this test just released, waiting (bounded) for the
+/// release to become visible (#9409, #9394, #9497).
+///
+/// [`fork_guard`] only serializes the forkers in *this* module. Every other
+/// test in the binary that spawns a process (`git`, `sh`, `gh` fixtures, of
+/// which there are thousands) forks too, and its child holds a copy of every
+/// open descriptor — including our close-on-exec lease fd — until it execs.
+/// `flock` belongs to the open file description, so while that child sits
+/// between fork and exec the lock outlives our `drop` and a one-shot
+/// `Lease::acquire` reads busy. That window is microseconds on a quiet host
+/// and stretches under load (a second concurrent `cargo test`, a busy shared
+/// worker), which is why the failure only showed up there. It is not
+/// cross-process contention: every lease root here is a fresh tempdir.
+///
+/// Production tolerates the same transient (a busy dispatch is refused and
+/// retried next tick); a test that asserts "free right after release" must
+/// wait for the stray copy to close, not read once.
+pub(super) fn reacquire(dir: &std::path::Path) -> lease::Lease {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match lease::Lease::acquire(dir) {
+            Ok(lease) => return lease,
+            Err(e) if std::time::Instant::now() >= deadline => {
+                panic!("lease must be free after its holder released it: {e}")
+            }
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+        }
+    }
+}
+
+/// The mechanism [`reacquire`] exists for, pinned deterministically: a child
+/// forked while a lease is held keeps the `flock` alive after the parent drops
+/// it, so a one-shot re-acquire reads busy until the child is gone.
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+fn a_forked_childs_inherited_lease_copy_outlives_the_parents_release() {
+    let _fork = fork_guard();
+    let root = tempfile::tempdir().unwrap();
+    let held = lease::Lease::acquire(root.path()).unwrap();
+    // The child blocks on this pipe instead of sleeping, so it is alive for
+    // exactly as long as the assertion needs and no longer (it holds a copy
+    // of every descriptor in the process, other tests' locks included).
+    let mut fds = [0; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    let [read_end, write_end] = fds;
+    // SAFETY: the child only calls async-signal-safe functions (`read`,
+    // `_exit`), as POSIX requires after `fork` in a multi-threaded process.
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0, "fork failed");
+    if pid == 0 {
+        unsafe {
+            let mut byte = 0u8;
+            libc::read(read_end, std::ptr::addr_of_mut!(byte).cast(), 1);
+            libc::_exit(0);
+        }
+    }
+    drop(held);
+    let busy = lease::Lease::acquire(root.path()).is_err();
+    unsafe {
+        libc::write(write_end, b"x".as_ptr().cast(), 1);
+        libc::close(write_end);
+        libc::close(read_end);
+    }
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+    assert!(busy, "the forked child's descriptor copy must still hold the flock");
+    drop(reacquire(root.path()));
+}
+
 #[test]
 fn forge_credential_username_preserves_basic_auth_and_rejects_protocol_injection() {
     use repository::credential_username;
@@ -81,6 +162,7 @@ impl RepoFixture {
 
 #[test]
 fn independent_clone_reuses_without_alternates_and_keeps_private_worktrees() {
+    let _fork = fork_guard();
     let f = RepoFixture::new();
     let revision = f.prepare().unwrap();
     let repo = f.root.join("repo");
@@ -105,6 +187,7 @@ fn independent_clone_reuses_without_alternates_and_keeps_private_worktrees() {
 
 #[test]
 fn dirty_root_and_dirty_worktree_are_preserved() {
+    let _fork = fork_guard();
     let f = RepoFixture::new();
     f.prepare().unwrap();
     let repo = f.root.join("repo");
@@ -130,6 +213,7 @@ fn dirty_root_and_dirty_worktree_are_preserved() {
 
 #[test]
 fn unpushed_and_detached_commits_survive_refused_reuse() {
+    let _fork = fork_guard();
     let f = RepoFixture::new();
     f.prepare().unwrap();
     let repo = f.root.join("repo");
@@ -147,6 +231,7 @@ fn unpushed_and_detached_commits_survive_refused_reuse() {
 
 #[test]
 fn mismatched_identity_unknown_work_and_alternates_are_refused() {
+    let _fork = fork_guard();
     let mut f = RepoFixture::new();
     f.prepare().unwrap();
     f.args.repository.push_str("-other");
@@ -294,6 +379,7 @@ fn actual_mounts_privilege_and_volume_driver_options_are_enforced() {
 
 #[test]
 fn symlinked_git_objects_and_refs_are_refused_without_modification() {
+    let _fork = fork_guard();
     use std::os::unix::fs::symlink;
     for component in ["objects", "refs"] {
         let f = RepoFixture::new();
@@ -314,6 +400,7 @@ fn symlinked_git_objects_and_refs_are_refused_without_modification() {
 #[test]
 #[serial_test::serial(private_workspace_fork)]
 fn account_lease_is_exclusive_across_role_sweep_interactive_and_repo_claims() {
+    let _fork = fork_guard();
     let root = tempfile::tempdir().unwrap();
     let dir = root.path().join("account-a");
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
@@ -337,7 +424,7 @@ fn account_lease_is_exclusive_across_role_sweep_interactive_and_repo_claims() {
         barrier.wait();
     });
     assert_eq!(winners.load(std::sync::atomic::Ordering::SeqCst), 1);
-    let _a = lease::Lease::acquire(&dir).unwrap();
+    let _a = reacquire(&dir);
     let _b = lease::Lease::acquire(&root.path().join("account-b")).unwrap();
     assert!(lease::Lease::acquire(&dir).is_err());
 }
@@ -345,6 +432,7 @@ fn account_lease_is_exclusive_across_role_sweep_interactive_and_repo_claims() {
 #[test]
 #[serial_test::serial(private_workspace_fork)]
 fn ambiguous_lease_is_durable_and_stopped_container_recovery_retains_last_owner() {
+    let _fork = fork_guard();
     let root = tempfile::tempdir().unwrap();
     let lease = lease::Lease::acquire(root.path()).unwrap();
     let job = lease::Job {
@@ -359,7 +447,7 @@ fn ambiguous_lease_is_durable_and_stopped_container_recovery_retains_last_owner(
     };
     lease.begin(&job).unwrap();
     drop(lease);
-    let lease = lease::Lease::acquire(root.path()).unwrap();
+    let lease = reacquire(root.path());
     assert_eq!(lease::read(root.path()).unwrap().unwrap().owner, "sweep-a");
     let config = Config {
         schema_version: 1,
@@ -382,48 +470,4 @@ fn ambiguous_lease_is_durable_and_stopped_container_recovery_retains_last_owner(
         .unwrap();
     assert!(lease::read(root.path()).unwrap().is_none());
     assert!(root.path().join("last-job.json").exists());
-}
-
-#[test]
-fn gh_credential_helper_is_refused_on_policy_governed_hosts() {
-    use repository::ensure_gh_helper_allowed;
-    assert!(ensure_gh_helper_allowed(false).is_ok());
-    let err = ensure_gh_helper_allowed(true).unwrap_err().to_string();
-    assert!(err.contains("forbids the gh credential helper"), "{err}");
-}
-
-#[test]
-fn policy_governs_host_resolves_and_fails_closed_on_unreadable_policy() {
-    use crate::forge_egress::policy::PolicySources;
-    use repository::policy_governs_host;
-    let dir = tempfile::tempdir().unwrap();
-    let env = |name: &str, body: Option<&str>| {
-        let path = dir.path().join(name);
-        if let Some(body) = body {
-            std::fs::write(&path, body).unwrap();
-        }
-        PolicySources {
-            env_path: Some(path),
-            machine_path: None,
-            repo_path: None,
-        }
-    };
-    // Absent policy -> not governed (the only "no policy" case).
-    assert!(!policy_governs_host(&PolicySources::default()).unwrap());
-    assert!(
-        policy_governs_host(&env("req.json", Some(r#"{"enforcement":{"api":"required"}}"#)))
-            .unwrap()
-    );
-    assert!(
-        !policy_governs_host(&env("obs.json", Some(r#"{"enforcement":{"api":"observe"}}"#)))
-            .unwrap()
-    );
-    // Corrupt or missing-but-named policy -> error, never "not governed".
-    for sources in [
-        env("bad.json", Some("{not json")),
-        env("missing.json", None),
-    ] {
-        let err = policy_governs_host(&sources).unwrap_err().to_string();
-        assert!(err.contains("unreadable") && err.contains(".json"), "{err}");
-    }
 }

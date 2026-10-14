@@ -545,7 +545,9 @@ fn no_injection_leaves_the_contained_dispatch_unchanged() {
 
 // ------------------------------------------------------------ prepare() path
 
-fn selection_with(proxy: Option<ProfileProxy>) -> crate::worker_spawn::profiles::Selection {
+pub(super) fn selection_with(
+    proxy: Option<ProfileProxy>,
+) -> crate::worker_spawn::profiles::Selection {
     crate::worker_spawn::profiles::Selection {
         provider: "anthropic".into(),
         model: "test-model".into(),
@@ -560,11 +562,13 @@ fn selection_with(proxy: Option<ProfileProxy>) -> crate::worker_spawn::profiles:
     }
 }
 
-fn anthropic_proxy() -> ProfileProxy {
+pub(super) fn anthropic_proxy() -> ProfileProxy {
     ProfileProxy {
         upstream: "https://api.anthropic.com".into(),
         header: HeaderStyle::AuthorizationBearer,
         base_url_env: vec!["ANTHROPIC_BASE_URL".into()],
+        observe: false,
+        base_url_config: None,
     }
 }
 
@@ -575,12 +579,11 @@ fn prepare_is_a_no_op_when_the_feature_is_off_or_the_profile_opts_out() {
     let tmp = tempfile::tempdir().unwrap();
     std::env::remove_var("LOOM_NATIVE_CREDENTIAL_PROXY");
     let on = json!({"runtimes":{"containment":{"credentialProxy":true}}});
-    assert!(prepare(tmp.path(), &selection_with(Some(anthropic_proxy())), &json!({}))
-        .unwrap()
-        .is_none());
-    assert!(prepare(tmp.path(), &selection_with(None), &on)
-        .unwrap()
-        .is_none());
+    let proxied = selection_with(Some(anthropic_proxy()));
+    for (selection, config) in [(&proxied, &json!({})), (&selection_with(None), &on)] {
+        let prepared = prepare(tmp.path(), selection, config, "claude").unwrap();
+        assert!(prepared.is_none());
+    }
 }
 
 #[test]
@@ -591,7 +594,8 @@ fn prepare_fails_closed_when_no_credential_resolves() {
     std::env::remove_var("LOOM_NATIVE_CREDENTIAL_PROXY");
     std::env::remove_var("LOOM_TEST_PROXY_KEY_8674");
     let on = json!({"runtimes":{"containment":{"credentialProxy":true}}});
-    let error = prepare(tmp.path(), &selection_with(Some(anthropic_proxy())), &on).unwrap_err();
+    let error =
+        prepare(tmp.path(), &selection_with(Some(anthropic_proxy())), &on, "claude").unwrap_err();
     assert_eq!(error.code, 78);
     assert!(error.message.contains("no credential resolved"), "{}", error.message);
 }
@@ -604,7 +608,7 @@ fn prepare_binds_a_listener_and_hands_the_container_only_a_placeholder() {
     std::env::remove_var("LOOM_NATIVE_CREDENTIAL_PROXY");
     std::env::set_var("LOOM_TEST_PROXY_KEY_8674", "sk-fake-real-credential");
     let on = json!({"runtimes":{"containment":{"credentialProxy":true}}});
-    let prepared = prepare(tmp.path(), &selection_with(Some(anthropic_proxy())), &on)
+    let prepared = prepare(tmp.path(), &selection_with(Some(anthropic_proxy())), &on, "claude")
         .unwrap()
         .expect("substitution should apply");
     std::env::remove_var("LOOM_TEST_PROXY_KEY_8674");
@@ -656,7 +660,7 @@ fn a_multi_variable_profile_cannot_be_proxied() {
         .credentials
         .push(("LOOM_TEST_OTHER_8674".into(), "OTHER".into()));
     let on = json!({"runtimes":{"containment":{"credentialProxy":true}}});
-    let error = prepare(tmp.path(), &selection, &on).unwrap_err();
+    let error = prepare(tmp.path(), &selection, &on, "claude").unwrap_err();
     assert!(error.message.contains("exactly one credential variable"), "{}", error.message);
 }
 
@@ -682,7 +686,7 @@ fn a_declared_but_unmapped_variable_cannot_be_proxied() {
         .credential_sources
         .push("LOOM_TEST_UNMAPPED_8701".into());
     let on = json!({"runtimes":{"containment":{"credentialProxy":true}}});
-    let error = prepare(tmp.path(), &selection, &on).unwrap_err();
+    let error = prepare(tmp.path(), &selection, &on, "claude").unwrap_err();
     assert!(
         error.message.contains("additional credentialEnv variables"),
         "{}",
@@ -692,18 +696,15 @@ fn a_declared_but_unmapped_variable_cannot_be_proxied() {
 
 #[test]
 fn a_malformed_credential_proxy_block_is_refused_at_validation() {
-    let bad = ProfileProxy {
-        upstream: "not-a-url".into(),
-        header: HeaderStyle::XApiKey,
-        base_url_env: Vec::new(),
-    };
+    let mut bad = anthropic_proxy();
+    bad.upstream = "not-a-url".into();
     assert!(bad.validate().is_err());
-    let bad_env = ProfileProxy {
-        upstream: "https://api.anthropic.com".into(),
-        header: HeaderStyle::XApiKey,
-        base_url_env: vec!["not a var name".into()],
-    };
+    let mut bad_env = anthropic_proxy();
+    bad_env.base_url_env = vec!["not a var name".into()];
     assert!(bad_env.validate().is_err());
+    let mut bad_config = anthropic_proxy();
+    bad_config.base_url_config = Some("not a key!".into());
+    assert!(bad_config.validate().is_err());
     assert!(anthropic_proxy().validate().is_ok());
 }
 

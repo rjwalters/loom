@@ -109,12 +109,11 @@ about a specific head SHA, not about the PR as an object.
 (`judge.md` → "Verdict SHA Marker"). `champion-pr-merge.md`'s Verdict-State
 Janitor Part 2 runs `./.loom/scripts/verdict-staleness-guard.sh <PR> --clear`
 on every `loom:pr` candidate **before** the 6 safety criteria:
-- If the marker's SHA still matches the current head (`FRESH`, exit `0`) or no
-  marker exists at all — the verdict predates this convention, or the Judge
-  dropped the marker (`UNVERIFIABLE`, exit `11`, fails safe) → proceed to the
-  safety criteria as before, unless the reason says the markers *could not
-  be authenticated* (#9548): then do NOT merge. Since #6319 Judge's sweep
-  (`--anchor`) and the daemon anchor unmarked verdicts, so exit `11` is rare.
+- If the marker's SHA still matches the current head (`FRESH`, exit `0`) →
+  proceed to the safety criteria. An approval with no trusted marker is
+  `STALE` (exit `12`, re-queued, never anchored: `post-verdict.sh` always
+  marks, so it bypassed the mechanism, #9258); `UNVERIFIABLE` (exit `11`) on
+  a `loom:pr` means markers could not be authenticated (#9548): do NOT merge.
 - If the head has moved since the verdict was rendered (`STALE`, exit `12`)
   → the guard has already cleared `loom:pr` and re-queued the PR as
   `loom:review-requested` with an auditable old→new-SHA comment. **Do not
@@ -245,7 +244,7 @@ the resolution for, and `main` moving again would just repeat the cycle (the
 # Parked set (gh ANDs repeated --label values). Skip any that also carry
 # loom:operator-only — already routed to a human.
 gh pr list --label "loom:blocked" --label "loom:changes-requested" --state open --limit 500 \
-  --json number,title,labels --jq '.[] | "#\(.number) \(.title)"'
+  --json number,title,labels --jq '.[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | "#\(.number) \(.title)"'
 
 # Decide from the FULL history, not the last comment alone.
 gh pr view "$PR_NUMBER" --comments
@@ -309,28 +308,11 @@ gh issue edit <number> --add-label "loom:evaluating"
 
 ### Edge Case 5d: Capacity-Deferral Comments Re-Posted Every Pass for an Unchanged Backlog (#6729)
 
-**Scenario**: A proposal passes all 8 promotion criteria, but `champion-issue-promo.md`'s "Rate Limiting by Tier" caps the promotion (Tier 3: only 1 per iteration and only if fewer than 5 Tier 3 issues are already in the backlog; Tier 2: up to 2 per iteration). This is a **capacity deferral, not a rejection** — no revision is needed, so Edge Case 5c's `VERDICT_MARKER` is never written for it (capacity deferral is explicitly Step 3, not Step 4). Without a guard, every subsequent Champion pass re-derives the same "criteria pass, tier cap still blocks it" conclusion and posts an equivalent "Tier N backlog cap reached — deferring promotion" comment again — observed live as 10 near-identical comments on #6628 over ~22 hours, and 2-3 more on each of #6647/#6649, all citing the SAME five occupant `tier:maintenance` issues.
+**Scenario**: A proposal passes all 8 promotion criteria, but `champion-issue-promo.md`'s "Rate Limiting by Level" caps the promotion (the per-pass no-level cap; the old Tier 2 cap mapped by population, #11512). This is a **capacity deferral, not a rejection**, so Edge Case 5c's `VERDICT_MARKER` is never written. Without a guard every pass posts an equivalent "backlog cap reached" comment again (observed: 10 near-identical comments on #6628 over ~22 hours).
 
-**Handling**: `champion-issue-promo.md`'s "Step 3c: Capacity Deferral" mirrors Edge Case 5c's own mechanism, keyed to a **different** anchor because a capacity deferral has no verdict comment to PATCH a marker onto: the **tier and occupant set** that explains the deferral (`classify-capacity-defer.sh`, sourceable pure helpers `normalize_occupants` / `capacity_fingerprint`). The occupant set (`$OCCUPANTS`/`$tier3_occupants`) is the same one the "Backlog Balance Check" computes and already excludes `loom:operator-only`/`loom:blocked` issues (#7613) — those cannot self-clear, so including them here would pin the fingerprint on a backlog that never actually changes.
+**Handling**: `champion-issue-promo.md`'s "Step 3c: Capacity Deferral" keys a fingerprint to the **level and occupant set** that explains the deferral (`classify-capacity-defer.sh --level <level> --occupants <list>`; pure helpers `normalize_occupants` / `capacity_fingerprint`). A per-pass cap has no standing occupant set, so Step 3c passes `--occupants ""`: the first deferral posts and later ones stay silent. Exit `1` (`POST_COMMENT`): post the deferral comment with its markers; `0` (`SKIP_COMMENT`): post nothing, `--apply` bumped the seen-counter in place; `2`: fail toward posting.
 
-```bash
-# FINGERPRINT is a hash of (tier, sorted-unique occupant set) — NOT of the
-# issue's own title+body (that hash belongs to Edge Case 5c's unrevised-
-# proposal check and answers a different question: "did the PROPOSAL change").
-CAP_RC=0
-./.loom/scripts/classify-capacity-defer.sh --issue "$ISSUE_NUMBER" \
-  --tier "tier:maintenance" --occupants "$OCCUPANTS" --apply || CAP_RC=$?
-```
-
-**Decision**:
-
-| `CAP_RC` | Finding | Action |
-|---|---|---|
-| `1` | `POST_COMMENT` (first deferral on this issue, or the occupant set changed since the last one) | Post the deferral comment, carrying `<!-- champion:capacity-defer:<tier>:<fingerprint> -->` + a seeded `<!-- champion:capacity-defer-seen:<fingerprint>:1 -->` counter |
-| `0` | `SKIP_COMMENT` (same tier, same occupant set as the last capacity-deferral comment on this issue) | Post nothing. `--apply` already bumped the existing comment's seen-counter in place |
-| `2` | Error (unreadable issue, bad arguments) | Fail toward the pre-#6729 behaviour — post the deferral comment as before |
-
-**Rationale**: Same *shape* of fix as Edge Case 5c/#4954 (a fingerprint anchored to the thing that actually changes suppresses a duplicate-comment loop) but a **different** anchor and **no escalation counterpart** — a capacity deferral is never a merits problem, so unlike the N=2 unrevised-proposal escalation there is nothing here for a human to decide, and the condition ends the instant the backlog composition changes, which the very next pass's fingerprint comparison detects for free without any bounded-streak mechanism. Bounding a state that already self-resolves and never needs a human would only reintroduce the noise this edge case exists to close.
+**Rationale**: Same shape as Edge Case 5c (a fingerprint anchored to what actually changes) but **no escalation counterpart**: a capacity deferral is never a merits problem and self-resolves once a later pass has a free slot.
 
 ---
 
@@ -454,7 +436,8 @@ HOLD_BODY=$(jq -r --arg m "<!-- champion:merge-risk-hold -->" \
 # posted after the hold (the instruction must OPEN the comment's leading clause
 # and not be a question — "do not merge anyway" / "is it ok to merge?" do NOT
 # release) | a new head SHA (recorded as `champion:hold-state head=<sha>` in the
-# hold comment) | a new Judge review after the hold.
+# hold comment) | a new Judge review after the hold | a human removing
+# `loom:operator` after the hold (an `unlabeled` event; #11416).
 ```
 
 **Decision**: **Hold stands** — skip the PR for this pass whatever the axes say this tick. A green re-read of an unchanged diff is not a release signal, and Champion's own comments never count as one.
@@ -463,7 +446,7 @@ HOLD_BODY=$(jq -r --arg m "<!-- champion:merge-risk-hold -->" \
 
 **Rationale**: A hold that a later subjective re-read can silently evaporate is not a hold. Because every fleet agent acts under the operator's forge identity, `mergedBy` cannot distinguish a human override from a Champion tick that scored the axes differently — so the comment is the *only* audit trail, and the anti-spam guard that (correctly) suppresses repeat holds was suppressing precisely the comment that would have explained the reversal.
 
-**Action** (single authoritative policy — implemented in `champion-pr-merge.md` → "Safety Criteria → 2. Merge-Risk Judgment → Sticky holds"): see that section for the precheck, the four outcomes, and the reversal-comment template.
+**Action** (single authoritative policy — implemented in `champion-pr-merge.md` → "Safety Criteria → 2. Merge-Risk Judgment → Sticky holds"): see that section for the precheck, its outcomes, and the reversal-comment template. Claim/label machinery is not red by itself; only the documented kept set is (#11416).
 
 ---
 
@@ -641,7 +624,7 @@ EXISTING=$(gh issue list --search "Follow-on from PR #$PR_NUMBER" --limit 500)
 | Proposal whose only recurring finding is an open, non-cycle dependency | Dependency-timing gate (`classify-dependency-block.sh --check-defer`) | **Defer, never escalate** — the condition self-clears when the blocker closes; blocker already closed → re-evaluate rather than escalate on a stale finding (#5664) |
 | Proposal stuck at `loom:operator-only` from a dependency-only escalation whose blocker has since closed | Pass 0 self-healing re-scan (`--check-unescalate --apply`) | Remove `loom:operator-only`, post one fingerprinted un-escalation comment, rejoin evaluation the same pass; merits/cycle/human-applied escalations are never touched (#5664) |
 | Proposal (parked or not) whose blocker is still open but that declares a `## Startable Subset` covering only part of its scope | Sub-issue granularity carve-out ("recurred after closure", #5664) | Criterion 2's dependency finding does not fail the whole issue; promote scoped to the declared subset (`Part of #<issue>`), or un-escalate an already-parked one via `--check-unescalate` (`SUBSET_CARVEOUT: yes`) even while the blocker stays open — `detect-startable-subset.sh` |
-| Proposal passes all 8 criteria but the tier's rate limit blocks promotion this pass | Capacity-deferral idempotency (`classify-capacity-defer.sh`, #6729) | **Post the deferral comment only on first deferral or a changed occupant set** — same tier + same occupant set as the last capacity-deferral comment → skip silently, bump the existing comment's seen-counter in place; no escalation counterpart, the condition self-resolves the moment the composition changes |
+| Proposal passes all 8 criteria but its level's rate limit blocks promotion this pass | Capacity-deferral idempotency (`classify-capacity-defer.sh`, #6729) | **Post the deferral comment only on first deferral or a changed occupant set**; same level + same occupant set → skip silently, bump the seen-counter in place; no escalation counterpart |
 | Test-only changes | Allow | Standard criteria apply |
 | Human holds PR (removes `loom:pr`) | Skip | Not a merge candidate without `loom:pr` |
 | Multiple linked issues | Allow | Verify all closed (each is gated independently by the out-of-band AC gate below) |
@@ -677,9 +660,8 @@ EXISTING=$(gh issue list --search "Follow-on from PR #$PR_NUMBER" --limit 500)
 - Check for webhook delays in GitHub's processing
 
 **Issue not auto-closing after merge**
-- Verify PR body uses correct format: "Closes #123" (not "closes issue #123")
-- Check if issue is in the same repository
-- Manual close may be needed for cross-repo references
+- Verify PR body format: "Closes #123" (not "closes issue #123")
+- Cross-repo references may need a manual close
 
 **Blocked issues not unblocking**
 - Verify dependency format: "Blocked by #123" or "Depends on #123" — markdown
@@ -689,21 +671,21 @@ EXISTING=$(gh issue list --search "Follow-on from PR #$PR_NUMBER" --limit 500)
 - Manual unblock may be needed for complex dependency patterns
 
 **Worktree checkout errors**
-- These are expected when running from a worktree
-- Champion verifies merge via API, not exit code
-- No action needed - merge still succeeds
+- Expected from a worktree; Champion verifies the merge via API, not exit
+  code — no action needed, the merge still succeeds
 
 ### Debugging Commands
 
 ```bash
-# Check PR merge status
-gh pr view <number> --json state,mergeable,statusCheckRollup
+# PR merge + CI status
+gh pr view <number> --json state,mergeable
+loom-daemon forge wait-checks <number> --timeout 20
 
 # View linked issues (uses GitHub's authoritative parser; `Updates #N` is excluded)
 gh pr view <number> --json closingIssuesReferences --jq '.closingIssuesReferences[].number'
 
 # List blocked issues
-gh issue list --label "loom:blocked" --state open --limit 500
+gh issue list --label "loom:blocked" --search "-label:loom:frozen" --state open --limit 500
 
 # Check API rate limit
 gh api rate_limit

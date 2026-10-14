@@ -68,6 +68,9 @@ const TABLE: &[(&str, Reloadability)] = &[
     // inside the tick loop body (`loom-daemon/src/role_runner.rs`), and
     // `loom-daemon status` already reports the live per-root value.
     ("autonomous.roleRunner", Reloadability::Live),
+    // Per-repo approval/merge policy (#11674): `merge_policy::declared` is
+    // read from the effective config on every `fleet.state` export.
+    ("repos", Reloadability::Live),
     // Re-read every multi-workspace work-finder tick since #9060 (the
     // operator ceiling) / #9090 (the per-repo cap) —
     // `ConfiguredMaxReloader::refresh()` in
@@ -80,10 +83,13 @@ const TABLE: &[(&str, Reloadability)] = &[
     // `loom-daemon/src/work_finder/forge.rs` reads
     // `.loom/config.json` directly each time, never cached.
     ("autonomous.workFinder.extraSkipLabels", Reloadability::Live),
+    // Read from config each time a red-main fix is waiting (#10118) —
+    // `main_red_fix::escalate_after`, never cached.
+    ("autonomous.workFinder.redFixEscalateAfterSecs", Reloadability::Live),
     // Everything else under `autonomous.workFinder` — `enabled` (gates
     // whether the loop is spawned at all), `intervalSecs` (the ticker's
-    // fixed period), `maxAdmissionsPerTick`, `hostClass` /
-    // `allowHeavyLocal`, `saturationBrake.*` — is resolved once at daemon
+    // fixed period), `maxAdmissionsPerTick`, `saturationBrake.*` — is
+    // resolved once at daemon
     // bring-up in `daemon_service.rs`'s work-finder startup block, before
     // the loop is spawned.
     ("autonomous.workFinder", Reloadability::RestartRequired),
@@ -150,6 +156,7 @@ mod tests {
         assert_eq!(classify("autonomous.workFinder.maxConcurrent"), Reloadability::Live);
         assert_eq!(classify("autonomous.workFinder.maxConcurrentPerRepo"), Reloadability::Live);
         assert_eq!(classify("autonomous.workFinder.extraSkipLabels"), Reloadability::Live);
+        assert_eq!(classify("autonomous.workFinder.redFixEscalateAfterSecs"), Reloadability::Live);
     }
 
     #[test]

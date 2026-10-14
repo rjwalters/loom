@@ -1,8 +1,9 @@
 //! Config resolution layer (#4039, Epic #3835 Phase 2).
 //!
 //! A single resolver over the tier chain: private/shared defaults, the
-//! legacy `.loom/config.json`, tracked `.loom-project/project.json`, and
-//! ignored `.loom-local/local.json`. See
+//! legacy `.loom/config.json`, tracked `.loom-project/project.json`, the
+//! per-repo fleet tier `.loom-local/fleet-repo.json` (#11738), and ignored
+//! `.loom-local/local.json`. See
 //! `docs/design/config-resolution-tiers.md` for the full design (schema,
 //! precedence table, and how this composes with the existing **env >
 //! config > default** rule used by e.g. the `autonomous` block).
@@ -30,6 +31,22 @@ pub const PROJECT_CONFIG_REL: &str = ".loom-project/project.json";
 /// Repo-relative path to the ignored, host-local config override file.
 /// Empty (absent) in every repo until Phase 3+.
 pub const LOCAL_CONFIG_REL: &str = ".loom-local/local.json";
+
+/// Repo-relative path to the **per-repo fleet tier** (#11738): this repo's
+/// `config` object from the fleet config repo's compiled `fleet.json`
+/// (`repos[].config`), materialized here by the fleet sync
+/// ([`crate::fleet_sync`]). It sits above the repo's committed config
+/// (`.loom/config.json` and `.loom-project/project.json`) so a fleet-wide or
+/// class-wide value reaches a repo even when the repo commits the same key,
+/// and below [`LOCAL_CONFIG_REL`] so the host-local escape hatch still wins.
+///
+/// It lives under `.loom-local/` because that directory is gitignored by
+/// every Loom install, so the materialized file never dirties a tree. The
+/// file is owned by the fleet sync: it is rewritten when the record's
+/// `config` changes and removed when the record has none. Absent on any host
+/// whose fleet store has no per-repo config, in which case resolution is
+/// exactly what it was before this tier existed.
+pub const FLEET_REPO_CONFIG_REL: &str = ".loom-local/fleet-repo.json";
 
 /// Env var overriding the private/shared defaults file location. Set to a
 /// non-empty path to point at an alternate file; set to the empty string to
@@ -221,7 +238,10 @@ pub fn deep_merge(base: &Value, overlay: &Value) -> Value {
 /// 2. Legacy `.loom/config.json` — the sole tier every existing repo has.
 /// 3. Tracked `.loom-project/project.json` — new in #4039; empty until a
 ///    repo migrates (Phase 6).
-/// 4. Ignored `.loom-local/local.json` — new in #4039; host-local override.
+/// 4. Per-repo fleet tier `.loom-local/fleet-repo.json`
+///    ([`FLEET_REPO_CONFIG_REL`], #11738) — written by the fleet sync from
+///    the fleet store's `repos[].config`; beats the repo's committed config.
+/// 5. Ignored `.loom-local/local.json` — new in #4039; host-local override.
 ///
 /// A missing or malformed file at **any** tier soft-fails to that tier
 /// contributing nothing, and this function never aborts the caller. When
@@ -239,9 +259,35 @@ pub fn resolve_effective_config(repo_root: &Path) -> Value {
 
     effective = deep_merge(&effective, &soft_read_json_object(&repo_root.join(LEGACY_CONFIG_REL)));
     effective = deep_merge(&effective, &soft_read_json_object(&repo_root.join(PROJECT_CONFIG_REL)));
+    effective =
+        deep_merge(&effective, &soft_read_json_object(&repo_root.join(FLEET_REPO_CONFIG_REL)));
     effective = deep_merge(&effective, &soft_read_json_object(&repo_root.join(LOCAL_CONFIG_REL)));
 
     effective
+}
+
+/// Tier files that exist but could not contribute (#11029): unreadable,
+/// malformed JSON, or not a JSON object. [`resolve_effective_config`]
+/// soft-fails each of these to `{}`, which is right for most keys but wrong
+/// for "is this a fleet host": a key the dead tier carried (`fleet.repo`)
+/// reads as unset. A missing file is not listed. Returns `(path, why)`.
+#[must_use]
+pub fn unreadable_tiers(repo_root: &Path) -> Vec<(PathBuf, String)> {
+    tier_paths_by_precedence(repo_root)
+        .into_iter()
+        .filter_map(|path| {
+            let text = match std::fs::read_to_string(&path) {
+                Ok(t) => t,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+                Err(e) => return Some((path, e.to_string())),
+            };
+            match serde_json::from_str::<Value>(&text) {
+                Ok(Value::Object(_)) => None,
+                Ok(_) => Some((path, "top level is not a JSON object".to_string())),
+                Err(e) => Some((path, e.to_string())),
+            }
+        })
+        .collect()
 }
 
 /// The tier files consulted by [`resolve_effective_config`], **highest
@@ -257,6 +303,7 @@ pub fn resolve_effective_config(repo_root: &Path) -> Value {
 pub fn tier_paths_by_precedence(repo_root: &Path) -> Vec<PathBuf> {
     let mut paths = vec![
         repo_root.join(LOCAL_CONFIG_REL),
+        repo_root.join(FLEET_REPO_CONFIG_REL),
         repo_root.join(PROJECT_CONFIG_REL),
         repo_root.join(LEGACY_CONFIG_REL),
     ];
@@ -270,7 +317,7 @@ pub fn tier_paths_by_precedence(repo_root: &Path) -> Vec<PathBuf> {
 ///
 /// This exists because a **multi-workspace** daemon makes "which
 /// `.loom/config.json` did that number come from?" a real operator question
-/// (#4512): the effective config is a merge across up to four files, and a knob
+/// (#4512): the effective config is a merge across up to five files, and a knob
 /// that reads as `3` might be a repo's committed value, a host-local override,
 /// or the built-in default. Reporting the provenance alongside the value —
 /// rather than only the value — is the same fix `token_pool_dir` applied to the
@@ -746,6 +793,118 @@ mod tests {
         );
     }
 
+    // ===== per-repo fleet tier (#11738) =====
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_fleet_repo_tier_beats_committed_config_and_project() {
+        let dir = tempdir().unwrap();
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        write(
+            &dir.path().join(LEGACY_CONFIG_REL),
+            r#"{"autonomous": {"roleRunner": {"onIdle": ["auditor"], "keep": 1}}, "a": "legacy"}"#,
+        );
+        write(&dir.path().join(PROJECT_CONFIG_REL), r#"{"a": "project", "b": "project"}"#);
+        write(
+            &dir.path().join(FLEET_REPO_CONFIG_REL),
+            r#"{"autonomous": {"roleRunner": {"onIdle": []}}, "a": "fleet-repo"}"#,
+        );
+        let effective = resolve_effective_config(dir.path());
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        assert_eq!(
+            effective,
+            json!({
+                "autonomous": {"roleRunner": {"onIdle": [], "keep": 1}},
+                "a": "fleet-repo",
+                "b": "project"
+            }),
+            "the fleet's per-repo value wins over a committed one; lists replace; \
+             keys the fleet does not set fall through"
+        );
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_local_beats_fleet_repo_tier() {
+        let dir = tempdir().unwrap();
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        write(&dir.path().join(FLEET_REPO_CONFIG_REL), r#"{"a": "fleet-repo", "c": 1}"#);
+        write(&dir.path().join(LOCAL_CONFIG_REL), r#"{"a": "local"}"#);
+        let effective = resolve_effective_config(dir.path());
+        let src = source_of(dir.path(), "a");
+        let src_c = source_of(dir.path(), "c");
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        assert_eq!(effective, json!({"a": "local", "c": 1}));
+        assert_eq!(src, Some(dir.path().join(LOCAL_CONFIG_REL)));
+        assert_eq!(src_c, Some(dir.path().join(FLEET_REPO_CONFIG_REL)));
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_fleet_repo_tier_null_clears_a_committed_key() {
+        let dir = tempdir().unwrap();
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        write(&dir.path().join(LEGACY_CONFIG_REL), r#"{"guards": {"sqlDdl": true, "x": 1}}"#);
+        write(&dir.path().join(FLEET_REPO_CONFIG_REL), r#"{"guards": {"sqlDdl": null}}"#);
+        let effective = resolve_effective_config(dir.path());
+        let src = source_of(dir.path(), "guards.sqlDdl");
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        assert_eq!(effective, json!({"guards": {"sqlDdl": null, "x": 1}}));
+        assert!(get_path(&effective, "guards.sqlDdl").is_some_and(Value::is_null));
+        // `source_of` skips nulls, as it does for every tier: the committed
+        // file is the highest tier that still *sets* the key.
+        assert_eq!(src, Some(dir.path().join(LEGACY_CONFIG_REL)));
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_source_of_names_the_fleet_repo_tier() {
+        let dir = tempdir().unwrap();
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        write(&dir.path().join(LEGACY_CONFIG_REL), r#"{"autonomous": {"x": 1}}"#);
+        write(&dir.path().join(PROJECT_CONFIG_REL), r#"{"autonomous": {"x": 2}}"#);
+        write(&dir.path().join(FLEET_REPO_CONFIG_REL), r#"{"autonomous": {"x": 3}}"#);
+        let src = source_of(dir.path(), "autonomous.x");
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        assert_eq!(src, Some(dir.path().join(FLEET_REPO_CONFIG_REL)));
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_absent_fleet_repo_tier_leaves_resolution_unchanged() {
+        let dir = tempdir().unwrap();
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        let legacy = r#"{"z": 1, "a": {"y": [1, 2], "b": null}, "m": "x"}"#;
+        write(&dir.path().join(LEGACY_CONFIG_REL), legacy);
+        write(&dir.path().join(PROJECT_CONFIG_REL), r#"{"m": "project"}"#);
+        write(&dir.path().join(LOCAL_CONFIG_REL), r#"{"a": {"y": [3]}}"#);
+        let effective = resolve_effective_config(dir.path());
+        let unreadable = unreadable_tiers(dir.path());
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        // The pre-#11738 chain, merged by hand.
+        let mut want = deep_merge(&json!({}), &serde_json::from_str::<Value>(legacy).unwrap());
+        want = deep_merge(&want, &json!({"m": "project"}));
+        want = deep_merge(&want, &json!({"a": {"y": [3]}}));
+        assert_eq!(
+            serde_json::to_string(&effective).unwrap(),
+            serde_json::to_string(&want).unwrap(),
+            "no fleet-repo file means byte-identical output"
+        );
+        assert!(unreadable.is_empty(), "a missing fleet-repo file is not unreadable");
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_unreadable_tiers_reports_a_malformed_fleet_repo_file() {
+        let dir = tempdir().unwrap();
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        write(&dir.path().join(FLEET_REPO_CONFIG_REL), "[1, 2]");
+        let got = unreadable_tiers(dir.path());
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        assert_eq!(got.len(), 1);
+        assert!(got[0].0.ends_with(FLEET_REPO_CONFIG_REL));
+    }
+
     // ===== get_path =====
 
     #[test]
@@ -834,6 +993,39 @@ mod tests {
         let captain = fleet_captain(dir.path());
         std::env::remove_var(PRIVATE_DEFAULTS_ENV);
         assert_eq!(captain, Some("loom-worker-1".to_string()));
+    }
+
+    /// #11098 Stage 3: the ETA subsystem and its keys are gone. A host config
+    /// that still carries `autonomous.eta.*`, `fleet.etaAuthority`,
+    /// `fleet.etaAuthorityCovers` or `fleet.etaFitRepo` must resolve as usual:
+    /// no panic, no error, the unrelated keys intact, and the only reader of
+    /// the old keys (the deprecated SigNoz endpoint fallback) names its legacy
+    /// fields once so the caller can warn a single time.
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_stale_eta_keys_in_a_host_config_are_ignored() {
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        let dir = tempdir().unwrap();
+        write(
+            &dir.path().join(LEGACY_CONFIG_REL),
+            r#"{
+                "fleet": {"captain": "loom-worker-1", "etaAuthority": "loom-worker-2",
+                          "etaAuthorityCovers": ["a/b"], "etaFitRepo": "a/store"},
+                "autonomous": {"eta": {"enabled": true, "fit": {"enabled": true},
+                    "fleetRefresh": {"signoz": {"endpoint": "http://127.0.0.1:8123",
+                                                "user": "u"}}},
+                               "ciTelemetry": {"enabled": true}}
+            }"#,
+        );
+        let effective = resolve_effective_config(dir.path());
+        let captain = fleet_captain(dir.path());
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        assert_eq!(captain, Some("loom-worker-1".to_string()));
+        assert_eq!(get_path(&effective, "autonomous.ciTelemetry.enabled"), Some(&json!(true)));
+        // The SigNoz reader no longer reads the retired block; it only names it.
+        let endpoint = crate::signoz_read::EndpointConfig::resolve(&effective, None);
+        assert_eq!(endpoint.endpoint, None);
+        assert_eq!(endpoint.ignored, ["autonomous.eta.fleetRefresh.signoz"]);
     }
 
     #[test]
@@ -967,6 +1159,7 @@ mod tests {
             paths,
             vec![
                 root.path().join(LOCAL_CONFIG_REL),
+                root.path().join(FLEET_REPO_CONFIG_REL),
                 root.path().join(PROJECT_CONFIG_REL),
                 root.path().join(LEGACY_CONFIG_REL),
             ]
@@ -1073,5 +1266,19 @@ mod tests {
             effective, expected,
             "Rust resolver diverged from the cross-language conformance fixture's expected.json"
         );
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn unreadable_tiers_lists_malformed_but_not_missing_files() {
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        let dir = tempfile::tempdir().unwrap();
+        assert!(unreadable_tiers(dir.path()).is_empty(), "missing tiers are fine");
+        std::fs::create_dir_all(dir.path().join(".loom")).unwrap();
+        std::fs::write(dir.path().join(LEGACY_CONFIG_REL), "{ not json").unwrap();
+        let got = unreadable_tiers(dir.path());
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        assert_eq!(got.len(), 1);
+        assert!(got[0].0.ends_with(LEGACY_CONFIG_REL));
     }
 }

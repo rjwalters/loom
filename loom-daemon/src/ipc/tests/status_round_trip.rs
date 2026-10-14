@@ -56,7 +56,8 @@ fn test_daemon_status_request_response_round_trip() {
         },
         per_repo: vec![crate::types::RepoStatus {
             root: std::path::PathBuf::from("/repo/a"),
-            priority: 100,
+            maintain_only: None,
+            weight: 100,
             in_flight_count: 0,
             health_gate_halted: true,
             quarantined_issues: vec![101, 202],
@@ -93,7 +94,9 @@ fn test_daemon_status_request_response_round_trip() {
         drain_note: None,
         drain_roll: None,
         drain_paused_by_day: std::collections::BTreeMap::new(),
+        pause_resume: None,
         auto_update_enabled: true,
+        auto_update_mode: Some("fleet floor only (autoUpdate.enabled=false)".to_string()),
         auto_update_last_check: Some(chrono::Utc::now()),
         auto_update_last_roll: Some(chrono::Utc::now()),
         auto_update_consecutive_failures: 2,
@@ -104,8 +107,19 @@ fn test_daemon_status_request_response_round_trip() {
         auto_update_artifact_published_at: Some("2026-09-13T12:00:00Z".to_string()),
         auto_update_stale_repo_ticks: 0,
         auto_update_stale_repo: None,
-        auto_update_roll_window: None,
         task_liveness: Vec::new(),
+        session_containers: Some(crate::session_status::SessionContainersReport {
+            observation: "available".into(),
+            degraded: true,
+            degraded_reason: Some("1 of 1 session seat(s) not serving: agent-1 stopped".into()),
+            accounts: vec![crate::session_status::SeatStatus {
+                account: "agent-1".into(),
+                state: "stopped".into(),
+                degraded: true,
+                ..crate::session_status::SeatStatus::default()
+            }],
+            ..crate::session_status::SessionContainersReport::default()
+        }),
         host_breaker: None,
         admission_brake: None,
         rate_limit_breaker: None,
@@ -126,30 +140,6 @@ fn test_daemon_status_request_response_round_trip() {
             ..Default::default()
         }),
         // #9244 C: a starred issue escalated to the operator must survive the wire.
-        operator_priority_landing: Some(crate::types::StarLivenessReport {
-            at: Some(chrono::Utc::now()),
-            rows: vec![crate::types::StarLandingRow {
-                repo: "o/r".to_string(),
-                issue: 8191,
-                stage: crate::types::LandingStage::NeedsOperator,
-                next_actor: "operator".to_string(),
-                stage_since: None,
-                time_in_stage_secs: 60,
-                pr: Some(9276),
-                blocked_by: None,
-                no_capacity: None,
-                capacity_wait: None,
-                ask: Some(crate::types::OperatorAsk {
-                    kind: crate::types::AskKind::MergeRefused,
-                    key: "merge-refused:pr-9276".to_string(),
-                    text: "reconcile the merge settings".to_string(),
-                }),
-                inherited_from: None,
-                operator_priority_at: None,
-                last_progress_at: None,
-            }],
-            ..Default::default()
-        }),
         role_tick_records: vec![crate::types::RoleTickRecord {
             root: std::path::PathBuf::from("/repo/a"),
             role: "champion".to_string(),
@@ -206,6 +196,11 @@ fn test_daemon_status_request_response_round_trip() {
         )]
         .into_iter()
         .collect(),
+        otlp_export: Some(crate::observability::otlp_health::OtlpExportHealth {
+            state: crate::observability::otlp_health::OtlpExportState::Exempt,
+            detail: Some("robb-studio per 2am#3649".to_string()),
+            since: None,
+        }),
         forge_events: Some(crate::types::ForgeEventsStatus {
             state: crate::types::ForgeEventsState::Backoff,
             endpoint: Some("https://events.internal".to_string()),
@@ -255,19 +250,20 @@ fn test_daemon_status_request_response_round_trip() {
     match back {
         Response::DaemonStatus(r) => {
             assert_eq!(r.token_pool_size, 4);
-            let landing = r
-                .operator_priority_landing
+            let sessions = r
+                .session_containers
                 .as_ref()
-                .expect("landing survives");
-            assert_eq!(landing.rows[0].issue, 8191);
-            assert_eq!(
-                landing.rows[0].ask.as_ref().map(|a| a.kind),
-                Some(crate::types::AskKind::MergeRefused)
-            );
+                .expect("session containers survive");
+            assert!(sessions.degraded);
+            assert_eq!(sessions.accounts[0].state, "stopped");
             assert_eq!(r.token_pool_dir, Some(std::path::PathBuf::from("/repo/a/.loom/tokens")));
             assert_eq!(r.disk_headroom, 10);
             assert_eq!(r.logical_cpus, 8);
             assert!(r.auto_update_enabled);
+            assert_eq!(
+                r.auto_update_mode.as_deref(),
+                Some("fleet floor only (autoUpdate.enabled=false)")
+            );
             assert_eq!(r.auto_update_consecutive_failures, 2);
             assert_eq!(r.auto_update_backoff_secs, Some(120));
             assert_eq!(r.auto_update_note.as_deref(), Some("within settle window"));

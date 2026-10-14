@@ -58,6 +58,10 @@ const MAX_ENTRIES: usize = 4096;
 pub(super) static CLAIM_LABELED: ReadCache<DateTime<Utc>> = ReadCache::new(CLAIM_MAX_AGE);
 /// A claimed PR's newest trusted claim-activity comment since that label.
 pub(super) static CLAIM_ACTIVITY: ReadCache<DateTime<Utc>> = ReadCache::new(CLAIM_MAX_AGE);
+/// A claimed PR's newest trusted Judge-progress comment since that label (#10235).
+pub(super) static JUDGE_ACTIVITY: ReadCache<DateTime<Utc>> = ReadCache::new(CLAIM_MAX_AGE);
+/// A claimed PR's newest claimant head force-push since that label (#10235).
+pub(super) static HEAD_PUSH: ReadCache<DateTime<Utc>> = ReadCache::new(CLAIM_MAX_AGE);
 /// A verdict PR's comment scan: `(latest marker sha, already recorded)`.
 /// Both halves are computed AFTER trusted-author filtering, so a change to
 /// the comment-trust configuration is not seen here until the entry expires.
@@ -66,6 +70,11 @@ pub(super) static VERDICT_SCAN: ReadCache<(Option<String>, bool)> = ReadCache::n
 /// an approximation: a base that advances without the head moving keeps the
 /// cached set until [`MAX_AGE`] (the PR's own diff rarely changes from that).
 pub(super) static CHANGED_FILES: ReadCache<BTreeSet<String>> = ReadCache::new(MAX_AGE);
+
+/// Whether two PR heads conflict under `git merge-tree` (#10350): `true` =
+/// conflict. A function of the two SHAs alone, so it never goes stale; the
+/// expiry only bounds memory.
+pub(super) static PAIR_CONFLICT: ReadCache<bool> = ReadCache::new(MAX_AGE);
 
 /// A closed-over compare of two commit SHAs (`tree_unchanged`): whether the
 /// trees are byte-identical. A function of the two SHAs alone, so it never

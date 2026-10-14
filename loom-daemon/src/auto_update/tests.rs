@@ -8,9 +8,9 @@ use super::artifact_verdict::compare_versions;
 // so this file, already over `.loom/docs/file-size-policy.md`'s threshold,
 // does not grow to hold it. It reuses the fixtures below via `use super::*`.
 mod stale_repo;
-// `IpcDrainTrigger`'s test needs these directly since #8514 moved the trigger
-// itself (and with it the parent's `EventBus`/`DrainState` imports) to the
-// `drain_trigger` sibling.
+// The production trigger's test needs these directly since #8514 moved the
+// trigger itself (and with it the parent's `EventBus`/`DrainState` imports) to
+// a sibling module.
 use crate::event_bus::EventBus;
 use crate::ipc::DrainState;
 use std::fs;
@@ -85,7 +85,7 @@ fn test_config_reads_all_fields() {
     let tmp = tempfile::tempdir().unwrap();
     write_config(
         tmp.path(),
-        r#"{"autonomous": {"autoUpdate": {"enabled": true, "intervalSecs": 120, "settleSecs": 30, "deferDeadlineSecs": 7200, "rollStallDeadlines": 5, "rollStallCooldownSecs": 10800}}}"#,
+        r#"{"autonomous": {"autoUpdate": {"enabled": true, "intervalSecs": 120, "settleSecs": 30, "deferDeadlineSecs": 7200}}}"#,
     );
     assert_eq!(
         read_auto_update_config(tmp.path()),
@@ -94,9 +94,7 @@ fn test_config_reads_all_fields() {
             interval_secs: Some(120),
             settle_secs: Some(30),
             defer_deadline_secs: Some(7200),
-            roll_stall_deadlines: Some(5),
-            roll_stall_cooldown_secs: Some(10_800),
-            roll_window: roll_window::RollWindowConfig::default(),
+            removed_keys: Vec::new(),
         }
     );
 }
@@ -106,16 +104,12 @@ fn test_config_zero_values_dropped_to_none() {
     let tmp = tempfile::tempdir().unwrap();
     write_config(
         tmp.path(),
-        r#"{"autonomous": {"autoUpdate": {"intervalSecs": 0, "settleSecs": 0, "deferDeadlineSecs": 0, "rollStallDeadlines": 0, "rollStallCooldownSecs": 0}}}"#,
+        r#"{"autonomous": {"autoUpdate": {"intervalSecs": 0, "settleSecs": 0, "deferDeadlineSecs": 0}}}"#,
     );
     let cfg = read_auto_update_config(tmp.path());
     assert_eq!(cfg.interval_secs, None);
     assert_eq!(cfg.settle_secs, None);
     assert_eq!(cfg.defer_deadline_secs, None);
-    assert_eq!(cfg.roll_stall_deadlines, None);
-    // #9010: a `0` cooldown would clear a declaration on the tick it was made,
-    // which is #8998's livelock re-entered through the knob.
-    assert_eq!(cfg.roll_stall_cooldown_secs, None);
 }
 
 // ===================================================================
@@ -160,7 +154,8 @@ fn test_config_project_tier_overrides_legacy() {
 // ===================================================================
 
 #[test]
-#[serial]
+// #10954: `TickTuning::resolve` reads this env too, under the same key.
+#[serial(loom_auto_update_env)]
 fn test_resolve_enabled_default_is_false() {
     std::env::remove_var(AUTO_UPDATE_ENABLE_ENV);
     assert!(
@@ -170,7 +165,8 @@ fn test_resolve_enabled_default_is_false() {
 }
 
 #[test]
-#[serial]
+// #10954: `TickTuning::resolve` reads this env too, under the same key.
+#[serial(loom_auto_update_env)]
 fn test_resolve_enabled_config_then_env() {
     std::env::remove_var(AUTO_UPDATE_ENABLE_ENV);
     assert!(resolve_enabled(&AutoUpdateConfig {
@@ -657,6 +653,28 @@ fn test_run_update_script_exit_0_is_success() {
     );
 }
 
+/// #11044: every update the daemon starts carries the invoker marker, so the
+/// script's fleet floor confirmation never prompts or refuses it, and its
+/// stdin is never a terminal it could block on.
+#[test]
+fn test_run_update_script_marks_the_run_as_daemon_started() {
+    let tmp = tempfile::tempdir().unwrap();
+    let s = write_fake_script(
+        tmp.path(),
+        r#"[ "$LOOM_DAEMON_UPDATE_INVOKER" = daemon ] || exit 9; [ -t 0 ] && exit 8; exit 0"#,
+    );
+    assert_eq!(
+        run_update_script(&s, tmp.path(), Duration::from_secs(10), false),
+        RebuildOutcome::Success,
+        "the source-rebuild path"
+    );
+    assert_eq!(
+        run_update_script_with(&s, tmp.path(), Duration::from_secs(10), false, &["--fetch"], None),
+        RebuildOutcome::Success,
+        "the artifact path"
+    );
+}
+
 #[test]
 fn test_run_update_script_exit_1_is_retryable() {
     let tmp = tempfile::tempdir().unwrap();
@@ -746,8 +764,8 @@ struct FakeTrigger {
     calls: Arc<AtomicUsize>,
 }
 
-impl DrainTrigger for FakeTrigger {
-    fn trigger(&self) -> bool {
+impl RollTrigger for FakeTrigger {
+    fn trigger_pause_roll(&self, _target: &RollTarget) -> bool {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.accepted
     }
@@ -1029,19 +1047,18 @@ fn test_run_tick_saturated_host_eventually_rolls_after_defer_deadline() {
 }
 
 // ===================================================================
-// IpcDrainTrigger — the roll routes through #4090's drain primitive
+// IpcRollTrigger — the roll routes through pause-and-roll (#10831)
 // ===================================================================
 
-/// The production trigger genuinely calls [`crate::ipc::handle_drain_request`]
-/// (the #4090 drain path), not a bare restart: on an **unsupervised** host it
-/// is refused (`accepted: false`) and — critically — dispatch is NOT paused
-/// (`is_draining()` stays false), exactly the drain primitive's contract.
-/// The supervised happy path (`is_draining()` true, `evaluate_drain_tick`
-/// completing only at 0 in-flight) is covered by #4090's own ipc.rs tests;
-/// exercising it here would `process::exit` the test runner.
+/// The production trigger starts the pause-and-roll, not a bare restart: on an
+/// **unsupervised** host it is refused (H7 `unsupervised`) and — critically —
+/// dispatch is NOT paused (`is_draining()` stays false). There is no drain
+/// fallback. The supervised path (the H4 pause itself) is covered by
+/// `pause_roll`'s own tests; exercising it here would `process::exit` the
+/// test runner.
 #[tokio::test]
 #[serial(loom_daemon_supervisor)]
-async fn test_ipc_drain_trigger_routes_through_drain_primitive() {
+async fn test_ipc_roll_trigger_refuses_an_unsupervised_host_without_pausing() {
     std::env::remove_var("LOOM_DAEMON_SUPERVISOR");
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
@@ -1055,14 +1072,14 @@ async fn test_ipc_drain_trigger_routes_through_drain_primitive() {
     let pool = Arc::new(WorkspacePool::new(bus.clone(), tokio::runtime::Handle::current()));
     let drain = Arc::new(DrainState::new());
     let trigger =
-        IpcDrainTrigger::new(drain.clone(), pool, root, bus, tokio::runtime::Handle::current());
+        IpcRollTrigger::new(drain.clone(), pool, root, bus, tokio::runtime::Handle::current());
 
-    let accepted = trigger.trigger();
+    let accepted = trigger.trigger_pause_roll(&RollTarget::repo_ahead());
     std::env::remove_var(crate::workspace_registry::REGISTRY_PATH_ENV);
 
-    assert!(!accepted, "unsupervised host must refuse the drain (no bare restart fallback)");
-    assert!(!drain.is_draining(), "a refused drain must not pause dispatch");
-    assert_eq!(drain.generation(), 0, "a refused drain must not bump the drain generation");
+    assert!(!accepted, "unsupervised host must refuse the roll (no bare restart fallback)");
+    assert!(!drain.is_draining(), "a refused roll must not pause dispatch");
+    assert_eq!(drain.generation(), 0, "a refused roll must not bump the drain generation");
 }
 
 // ===================================================================
@@ -1090,9 +1107,10 @@ mod in_flight_gate;
 // already over `.loom/docs/file-size-policy.md`'s threshold, does not grow to
 // hold it. Reuses the fixtures above via `use super::*`.
 mod supersede_tick;
-// Unsatisfiable-drain detection (#8998) — same reason, same fixtures.
-mod roll_stall;
-mod roll_window_tick;
+// Running-version roll basis (#10710).
+mod running_basis;
+// Floor-driven roll targets (#10712).
+mod floor_roll;
 
 const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -1114,6 +1132,7 @@ fn artifact(
         target: Some("aarch64-apple-darwin".to_string()),
         installed_version: installed_version.map(str::to_string),
         installed_sha256: installed_sha.map(str::to_string),
+        on_disk_version: None,
     }
 }
 
@@ -1510,7 +1529,13 @@ impl AutoUpdateProbe for ArtifactFakeProbe {
     fn resolve_artifact(&self) -> ArtifactResolution {
         self.artifact.clone()
     }
-    fn fetch_artifact(&mut self, _low_priority: bool) -> RebuildOutcome {
+    fn fetch_artifact(&mut self, tag: &str, _low_priority: bool) -> RebuildOutcome {
+        // #10709: every artifact roll in this suite must pin the child to the
+        // exact release the verdict compared, never an unpinned `latest`.
+        if let ArtifactResolution::Resolved(info) = &self.artifact {
+            assert_eq!(tag, info.tag, "fetch must pin the verdict's tag");
+            assert!(!tag.is_empty());
+        }
         self.fetch_calls.fetch_add(1, Ordering::SeqCst);
         self.fetch_outcome.clone()
     }

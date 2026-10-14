@@ -23,8 +23,8 @@
 //!
 //! **Strictly observational.** Every write is best-effort: a failure is logged
 //! and swallowed, a corrupt or unreadable file degrades to "fresh ledger +
-//! WARN", and nothing in the #6007 fail-safe policy (`drain_refusal_decision`,
-//! `refuse_roll_deadline`, `abort`) ever *reads* the ledger. It is write-side
+//! WARN", and nothing in the drain state machine (`begin`, `abort`, the pause roll's
+//! transitions) ever *reads* the ledger. It is write-side
 //! only; the one reader is `loom-daemon status`.
 //!
 //! The ledger counts every interval during which the drain flag paused dispatch
@@ -32,7 +32,7 @@
 //! that sets that flag. That includes a `fleet drain` teardown (`then_exit`),
 //! whose pause ends when the daemon exits and stays down.
 
-use super::drain_roll::{paused_secs, MAX_DRAIN_PENDING_BUDGET_SECS};
+use super::drain_status::{paused_secs, MAX_DRAIN_PENDING_BUDGET_SECS};
 use chrono::{DateTime, Days, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;

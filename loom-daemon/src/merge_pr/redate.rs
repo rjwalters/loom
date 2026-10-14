@@ -95,8 +95,10 @@ pub mod attribution;
 pub mod budget;
 pub mod chain_telemetry;
 pub mod report;
+pub mod sync_handoff;
 pub use attribution::Attribution;
 pub use budget::{BudgetConfig, BudgetDecision};
+pub use sync_handoff::SyncConfig;
 
 /// `gh api …`, parameterized on the binary — the injection seam this module's
 /// tests use so a stub `gh` can be passed as a plain function argument instead
@@ -326,6 +328,13 @@ pub enum RemedyOutcome {
         spent: u32,
         retry_after: chrono::DateTime<chrono::Utc>,
     },
+    /// The budget was exhausted, so the base branch was merged into the PR
+    /// (`update-branch`, #10388): a fresh chain starts on the new head. Sync
+    /// `n` of `max` for this PR. No operator hold, no `loom:changes-requested`.
+    SyncedBase { head: String, n: u32, max: u32 },
+    /// The budget was exhausted and the base sync conflicts: the PR got
+    /// `loom:merge-conflict` for Doctor's Priority-1 queue (#10388).
+    SyncConflict { notice_posted: bool },
     /// The branch already moved past `expected_head_sha` before this ran —
     /// no push was attempted. Mirrors `merge-pr.sh`'s #5579 exit-3 contract:
     /// re-evaluate fresh next tick, do not treat this as an error.
@@ -345,9 +354,25 @@ pub enum RemedyOutcome {
 /// happen. A recompute failure is reported on stderr and the generic body is
 /// written instead; it never blocks the remedy.
 pub fn remedy(nwo: &str, branch: &str, expected_head_sha: &str, pr: &str) -> RemedyOutcome {
+    // #10256: never re-date in merge-queue mode. This is the remedy's own
+    // refusal (fail-closed on an unresolvable mode too); the direct-path
+    // freshness guard in merge-pr.sh is deliberately untouched, and Champion
+    // never reaches it in queue mode because it hands off instead.
+    if let Err(why) = crate::forge_merge_queue::lifecycle::redate_permitted(&repo_root()) {
+        return RemedyOutcome::Failed(why);
+    }
     let cfg = BudgetConfig::for_root(&repo_root());
-    remedy_with(&gh_bin(), nwo, branch, expected_head_sha, pr, cfg, chrono::Utc::now(), || {
-        match attribution::recompute(nwo, pr, expected_head_sha) {
+    let sync = SyncConfig::for_root(&repo_root());
+    remedy_with_sync(
+        &gh_bin(),
+        nwo,
+        branch,
+        expected_head_sha,
+        pr,
+        cfg,
+        sync,
+        chrono::Utc::now(),
+        || match attribution::recompute(nwo, pr, expected_head_sha) {
             Ok(a) => Some(a),
             Err(why) => {
                 eprintln!(
@@ -355,8 +380,8 @@ pub fn remedy(nwo: &str, branch: &str, expected_head_sha: &str, pr: &str) -> Rem
                 );
                 None
             }
-        }
-    })
+        },
+    )
 }
 
 /// The repo root (config, App roster, allowlist), not whatever subdirectory
@@ -387,6 +412,7 @@ fn remedy_generic_with(
 /// the #9746 attribution. `attribute` is called at most once, and only once a
 /// push has been decided on (never for a head move, deferral or escalation);
 /// `None` means "write the generic body".
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn remedy_with(
     gh: &str,
@@ -395,6 +421,24 @@ fn remedy_with(
     expected_head_sha: &str,
     pr: &str,
     cfg: BudgetConfig,
+    now: chrono::DateTime<chrono::Utc>,
+    attribute: impl FnOnce() -> Option<Attribution>,
+) -> RemedyOutcome {
+    // Base-sync handoff off: the pre-#10388 contract the older tests pin.
+    let off = SyncConfig { handoffs: 0 };
+    remedy_with_sync(gh, nwo, branch, expected_head_sha, pr, cfg, off, now, attribute)
+}
+
+/// [`remedy_with`] plus the #10388 base-sync handoff allowance.
+#[allow(clippy::too_many_arguments)]
+fn remedy_with_sync(
+    gh: &str,
+    nwo: &str,
+    branch: &str,
+    expected_head_sha: &str,
+    pr: &str,
+    cfg: BudgetConfig,
+    sync: SyncConfig,
     now: chrono::DateTime<chrono::Utc>,
     attribute: impl FnOnce() -> Option<Attribution>,
 ) -> RemedyOutcome {
@@ -442,6 +486,24 @@ fn remedy_with(
         }
         BudgetDecision::Exhausted { spent } => {
             let bodies = crate::comment_trust::records::bodies(&trusted).join("\n");
+            // #10388: spend a base-sync handoff before holding for a human.
+            let used = sync_handoff::handoffs_used(&bodies);
+            if used < sync.handoffs {
+                if let Some(out) = sync_handoff::attempt(
+                    gh,
+                    nwo,
+                    branch,
+                    pr,
+                    &current,
+                    &bodies,
+                    used,
+                    sync.handoffs,
+                    spent,
+                    cfg.budget,
+                ) {
+                    return out;
+                }
+            }
             return escalate(gh, nwo, pr, &current, &bodies, spent, cfg.budget);
         }
     };

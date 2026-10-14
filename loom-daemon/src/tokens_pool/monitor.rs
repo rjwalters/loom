@@ -22,7 +22,10 @@
 //! Ordering policy stays Loom's: `(status_rank, util_7d, util_5h)` using the
 //! [`super::check::status_rank`] vocabulary; the email join to Loom account
 //! names goes through the `index.json` manifest. The monitor dir is overridable
-//! via `LOOM_CLAUDE_MONITOR_DIR` so tests never touch a real `~/.claude-monitor`.
+//! via `LOOM_LLM_MONITOR_DIR` (or the deprecated `LOOM_CLAUDE_MONITOR_DIR`) so
+//! tests never touch a real `~/.llm-monitor` / `~/.claude-monitor`; see
+//! [`claude_monitor_dir`] for the full precedence (issue #8849 — claude-monitor
+//! was renamed llm-monitor in 2.0 and moved its data dir to `~/.llm-monitor`).
 //!
 //! # The join is claude-scoped, and prefers `upstream_id` (design D6b, issue #5608)
 //!
@@ -63,7 +66,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use chrono::{DateTime, Utc};
 
@@ -75,8 +78,6 @@ use super::monitor_ranking_json::{
     ranking_row_upstream_id,
 };
 
-const CLAUDE_MONITOR_DIR_VAR: &str = "LOOM_CLAUDE_MONITOR_DIR";
-const DEFAULT_CLAUDE_MONITOR_DIR: &str = "~/.claude-monitor";
 /// Freshness window (10 min); a `ranking.json` older than this is stale.
 const MONITOR_FRESH_SECONDS: i64 = 600;
 /// Utilization sentinel for absent values so they sort after known (lower)
@@ -106,30 +107,9 @@ pub struct MonitorAccount {
     pub class_utilization: BTreeMap<String, f64>,
 }
 
-/// Resolve the claude-monitor directory: `$LOOM_CLAUDE_MONITOR_DIR` (tilde
-/// expanded), else `~/.claude-monitor`.
-#[must_use]
-pub fn claude_monitor_dir() -> PathBuf {
-    if let Ok(override_dir) = std::env::var(CLAUDE_MONITOR_DIR_VAR) {
-        if !override_dir.trim().is_empty() {
-            return expand_tilde(&override_dir);
-        }
-    }
-    expand_tilde(DEFAULT_CLAUDE_MONITOR_DIR)
-}
-
-fn expand_tilde(raw: &str) -> PathBuf {
-    if let Some(rest) = raw.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
-        }
-    } else if raw == "~" {
-        if let Some(home) = dirs::home_dir() {
-            return home;
-        }
-    }
-    PathBuf::from(raw)
-}
+/// The monitor-dir resolver lives in [`super::monitor_dir`] (issue #8849);
+/// re-exported so `monitor::claude_monitor_dir` stays the public path.
+pub use super::monitor_dir::claude_monitor_dir;
 
 /// Parse an ISO-8601 timestamp (accepting a trailing `Z`) to aware UTC.
 ///
@@ -515,6 +495,9 @@ pub fn run_monitor_check_with_reprobe(
     // CLI table and `--json` render. `MonitorAccount` has no error field by
     // design: `.ranking` never carries one.
     let mut reprobed: HashMap<String, AccountResult> = HashMap::new();
+    // Every account a request was sent for (#8972) — including a re-probe
+    // whose inconclusive result is discarded below.
+    let mut probed: std::collections::HashSet<String> = std::collections::HashSet::new();
     if let Some(reprobe) = reprobe {
         for a in &mut accounts {
             let binding =
@@ -523,6 +506,9 @@ pub fn run_monitor_check_with_reprobe(
                 continue;
             }
             let fresh = reprobe(&a.name);
+            if fresh.probed {
+                probed.insert(a.name.clone());
+            }
             if fresh.status == "error" {
                 // Inconclusive — keep what the monitor said rather than
                 // softening a hard exclusion into an advisory one.
@@ -561,6 +547,10 @@ pub fn run_monitor_check_with_reprobe(
             s7d_reset: a.reset_7d.clone(),
             s5h_reset: a.reset_5h.clone(),
             error: reprobed.get(&a.name).and_then(|r| r.error.clone()),
+            probed: probed.contains(&a.name),
+            // Standing marks are attached by `check::run_check_traced`.
+            bad_mark: None,
+            probe_status: None,
         })
         .collect();
 
@@ -586,6 +576,7 @@ pub fn run_monitor_check_with_reprobe(
 
 #[cfg(test)]
 mod tests {
+    use super::super::monitor_dir::test_env::MonitorDirEnvGuard;
     use super::*;
     use serial_test::serial;
     use std::fs;
@@ -1135,7 +1126,7 @@ mod tests {
     }
 
     // Serialized against its sibling below: both mutate the process-wide
-    // `CLAUDE_MONITOR_DIR_VAR` env var without restoring a prior value, so
+    // monitor-dir override env vars (via `MonitorDirEnvGuard`, #8849), so
     // two non-serial instances can race and one can observe the other's
     // `monitor_dir` override (#5133, same class as
     // `observability::backfill`'s env-seam leak).
@@ -1161,9 +1152,9 @@ mod tests {
             ]),
         );
         // Point the default monitor dir at our fixture via env.
-        std::env::set_var(CLAUDE_MONITOR_DIR_VAR, &monitor_dir);
+        let env_guard = MonitorDirEnvGuard::legacy(&monitor_dir);
         let report = run_monitor_check(&tokens_dir, true, || "2026-01-01T00:00:00Z".to_string());
-        std::env::remove_var(CLAUDE_MONITOR_DIR_VAR);
+        drop(env_guard);
 
         let report = report.unwrap();
         // In-memory report (table display): acct-z is "available".
@@ -1321,9 +1312,9 @@ mod tests {
                 },
             ]),
         );
-        std::env::set_var(CLAUDE_MONITOR_DIR_VAR, &monitor_dir);
+        let env_guard = MonitorDirEnvGuard::legacy(&monitor_dir);
         let report = run_monitor_check(&tokens_dir, true, || "2026-01-01T00:00:00Z".to_string());
-        std::env::remove_var(CLAUDE_MONITOR_DIR_VAR);
+        drop(env_guard);
 
         let report = report.unwrap();
         let a = report.accounts.iter().find(|a| a.name == "acct-a").unwrap();
@@ -1407,7 +1398,7 @@ mod tests {
             r
         };
 
-        std::env::set_var(CLAUDE_MONITOR_DIR_VAR, &monitor_dir);
+        let env_guard = MonitorDirEnvGuard::legacy(&monitor_dir);
         let report = run_monitor_check_with_reprobe(
             &tokens_dir,
             true,
@@ -1415,7 +1406,7 @@ mod tests {
             Utc::now(),
             Some(&reprobe),
         );
-        std::env::remove_var(CLAUDE_MONITOR_DIR_VAR);
+        drop(env_guard);
 
         assert_eq!(
             calls.into_inner(),
@@ -1464,7 +1455,7 @@ mod tests {
             AccountResult::new(name, "available")
         };
 
-        std::env::set_var(CLAUDE_MONITOR_DIR_VAR, &monitor_dir);
+        let env_guard = MonitorDirEnvGuard::legacy(&monitor_dir);
         let report = run_monitor_check_with_reprobe(
             &tokens_dir,
             false,
@@ -1472,7 +1463,7 @@ mod tests {
             Utc::now(),
             Some(&reprobe),
         );
-        std::env::remove_var(CLAUDE_MONITOR_DIR_VAR);
+        drop(env_guard);
 
         assert_eq!(calls.into_inner(), 0);
         let report = report.unwrap();
@@ -1510,7 +1501,7 @@ mod tests {
             AccountResult::new(name, "available")
         };
 
-        std::env::set_var(CLAUDE_MONITOR_DIR_VAR, &monitor_dir);
+        let env_guard = MonitorDirEnvGuard::legacy(&monitor_dir);
         let report = run_monitor_check_with_reprobe(
             &tokens_dir,
             false,
@@ -1518,7 +1509,7 @@ mod tests {
             Utc::now(),
             Some(&reprobe),
         );
-        std::env::remove_var(CLAUDE_MONITOR_DIR_VAR);
+        drop(env_guard);
 
         assert_eq!(calls.into_inner(), 0);
         assert_eq!(report.unwrap().accounts[0].status, "blocked");
@@ -1542,7 +1533,7 @@ mod tests {
             r
         };
 
-        std::env::set_var(CLAUDE_MONITOR_DIR_VAR, &monitor_dir);
+        let env_guard = MonitorDirEnvGuard::legacy(&monitor_dir);
         let report = run_monitor_check_with_reprobe(
             &tokens_dir,
             true,
@@ -1550,7 +1541,7 @@ mod tests {
             Utc::now(),
             Some(&reprobe),
         );
-        std::env::remove_var(CLAUDE_MONITOR_DIR_VAR);
+        drop(env_guard);
 
         let report = report.unwrap();
         let dead = report
@@ -1582,7 +1573,7 @@ mod tests {
             r
         };
 
-        std::env::set_var(CLAUDE_MONITOR_DIR_VAR, &monitor_dir);
+        let env_guard = MonitorDirEnvGuard::legacy(&monitor_dir);
         let report = run_monitor_check_with_reprobe(
             &tokens_dir,
             true,
@@ -1590,7 +1581,7 @@ mod tests {
             Utc::now(),
             Some(&reprobe),
         );
-        std::env::remove_var(CLAUDE_MONITOR_DIR_VAR);
+        drop(env_guard);
 
         let report = report.unwrap();
         assert_eq!(report.accounts[0].name, "acct-dead", "lowest 7d utilization sorts first");
@@ -1610,9 +1601,9 @@ mod tests {
         let monitor_dir = tmp.path().join("monitor");
         write_overdue_fixture(&tokens_dir, &monitor_dir, -chrono::Duration::days(8));
 
-        std::env::set_var(CLAUDE_MONITOR_DIR_VAR, &monitor_dir);
+        let env_guard = MonitorDirEnvGuard::legacy(&monitor_dir);
         let report = run_monitor_check(&tokens_dir, false, || "2026-01-01T00:00:00Z".to_string());
-        std::env::remove_var(CLAUDE_MONITOR_DIR_VAR);
+        drop(env_guard);
 
         let report = report.unwrap();
         let dead = report

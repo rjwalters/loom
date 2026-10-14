@@ -202,7 +202,9 @@ static STARTUP_COST_LOGGED: AtomicBool = AtomicBool::new(false);
 /// for, without cross-referencing source.
 pub fn record_status_build(total: Duration, root_count: usize, phases: &StatusBuildPhases) {
     let budget = status_build_budget(root_count);
-    if !STARTUP_COST_LOGGED.swap(true, Ordering::Relaxed) {
+    // A section-scoped build that walked no root (#10787) has no per-root
+    // cost to report; the one-time line waits for a build that did.
+    if root_count > 0 && !STARTUP_COST_LOGGED.swap(true, Ordering::Relaxed) {
         let per_root = total
             .checked_div(u32::try_from(root_count).unwrap_or(u32::MAX).max(1))
             .unwrap_or_default();

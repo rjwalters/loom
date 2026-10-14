@@ -72,7 +72,13 @@
 //! # Surfacing (scope-limited)
 //!
 //! A red `main` is surfaced by **loud logging** (daemon log): the offending
-//! command, its exit reason, and a tail of its captured output. Auto-revert of
+//! command, its exit reason, and a tail of its captured output. Since #11766
+//! it can also be surfaced on the forge (opt-in, off by default): the work
+//! finder files one `loom:very-important` fix issue per red repo (and closes
+//! it once green;
+//! [`crate::work_finder::main_red_autofile`]). The gate loop feeds it each
+//! logged verdict, with the red output tail, through
+//! `log_transition_for_root`. Auto-revert of
 //! the offending PR (via `merge-pr.sh` / the Auditor cron) is an explicit
 //! non-goal for this issue — halting + surfacing is the hard requirement.
 //! No new event-bus topic is introduced (the six-topic taxonomy is frozen and
@@ -100,6 +106,10 @@ use owned_paths::{
     BUILD_ARTIFACT_LOCKFILE_BASENAMES, INSTALLED_SURFACE_PREFIXES, INSTALL_METADATA_PATH,
     LOOM_OWNED_PREFIXES,
 };
+
+// `WorkspaceHealthStates::find` (#11565) lives in its own sibling module for
+// the same reason: this file is frozen by the file-size ratchet.
+mod workspace_find;
 
 /// Ceiling for a `git` invocation made by the main-health gate.
 ///
@@ -1099,6 +1109,9 @@ pub enum UnevaluatedClass {
     /// ([`crate::credential_preflight::resolve_forge_credential_stale_grace`])
     /// expires and normal fail-safe evaluation resumes.
     ForgeCredentialStale,
+    /// The checkout's volume was below the disk floor, so the pre-run fetch was
+    /// skipped rather than risk leaving a partial `tmp_pack_*` behind (#10995).
+    LowDisk,
 }
 
 impl UnevaluatedClass {
@@ -1116,6 +1129,7 @@ impl UnevaluatedClass {
             Self::SpawnFailure => "spawn-failure",
             Self::ContradictedByForgeCi => "contradicted-by-forge-ci",
             Self::ForgeCredentialStale => "forge-credential-stale",
+            Self::LowDisk => "low-disk",
         }
     }
 }
@@ -1910,15 +1924,11 @@ fn diff_touches_globs(
     // Make sure the local repo actually has both commits to diff — a cheap,
     // idempotent fetch. The caller already knows `main` moved, so this is not
     // extra work beyond what a real run would have paid anyway.
-    let _ = Command::new("git")
-        // `--` before the ref operand (#9106 mitigation B, #9479) — both names
-        // are crate constants here, so this is form, not a live exposure.
-        .args(["fetch", GATE_REMOTE, "--", GATE_BRANCH])
-        .current_dir(repo_root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    // `--` before the ref operand (#9106 mitigation B, #9479) — both names
+    // are crate constants here, so this is form, not a live exposure. Skipped
+    // below the disk floor (#10995): the diff below then fails on a missing
+    // object and the caller fails safe by running the gate.
+    crate::fetch_headroom::fetch_quietly(repo_root, &["fetch", GATE_REMOTE, "--", GATE_BRANCH]);
     let mut cmd = Command::new("git");
     cmd.args(["diff", "--name-only", &format!("{from_sha}..{to_sha}")])
         .current_dir(repo_root)
@@ -1941,7 +1951,7 @@ fn diff_touches_globs(
 /// `*.sh`). A pattern containing no `/` matches by **basename** anywhere in
 /// the tree (so `*.rs` matches `loom-daemon/src/main.rs`); a pattern
 /// containing `/` matches the full path.
-fn glob_matches(pattern: &str, path: &str) -> bool {
+pub(crate) fn glob_matches(pattern: &str, path: &str) -> bool {
     let candidate = if pattern.contains('/') {
         path
     } else {
@@ -2173,7 +2183,8 @@ pub(crate) fn run_gate_tick_with_fns(
     // is what makes an injected answer actually cover the whole tick.
     let mut runner = CommandGateRunner::new(run_config, repo_root.to_path_buf())
         .with_credential_freshness(Box::new(FnCredentialFreshness(credential_stale)));
-    let outcome = runner.run_gate();
+    // #11690: the run is one `build_gate.run` span (a no-op without an ops sink).
+    let outcome = crate::observability::ops::build_gate::main_health(tier, || runner.run_gate());
     match &outcome {
         GateOutcome::Green { .. } | GateOutcome::Red { .. } => {
             // Record which tier produced this verdict so the status/log tier
@@ -2345,8 +2356,7 @@ fn run_git(repo_root: &Path, args: &[&str]) -> std::result::Result<(String, Stri
     // Every caller still fails safe — any `Err` skips the gate — so the
     // `Result` shape is deliberately unchanged; only the duplicate execution
     // management goes away.
-    let mut cmd = Command::new("git");
-    cmd.args(args).current_dir(repo_root).stdin(Stdio::null());
+    let cmd = crate::fleet_sync::checkout_ff::external_change::git_cmd("gate", repo_root, args);
     let outcome = run_command(cmd, GIT_GATE_TIMEOUT);
     if outcome.succeeded() {
         Ok((outcome.stdout_trimmed(), outcome.stderr_trimmed()))
@@ -2457,7 +2467,14 @@ pub fn prepare_workspace_to_origin_main(repo_root: &Path) -> PrepOutcome {
         }
     }
 
-    // 3. Fetch origin/main.
+    // 3. Fetch origin/main — unless the checkout's volume is below the disk
+    // floor, where an aborted fetch leaves a partial tmp_pack_* behind
+    // (#10995). That skip is LowDisk, never GitFailure: it says nothing about
+    // `main`.
+    if let Some(reason) = crate::fetch_headroom::skip_reason(repo_root) {
+        let class = UnevaluatedClass::LowDisk;
+        return PrepOutcome::Skip { class, reason };
+    }
     // `--` before the ref operand (#9106 mitigation B, #9479).
     if let Err(e) = run_git(repo_root, &["fetch", GATE_REMOTE, "--", GATE_BRANCH]) {
         return PrepOutcome::Skip {
@@ -3115,6 +3132,7 @@ fn log_transition_for_root(
     outcome: &GateOutcome,
     halted: bool,
 ) {
+    crate::work_finder::main_red_autofile::note_gate_outcome(root, outcome);
     let r = root.display();
     match transition {
         HealthTransition::EnteredHalt => log::error!(

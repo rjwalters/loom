@@ -108,10 +108,17 @@ A missing or `null` field means "unknown".
 
 - `on.merge_group: types: [checks_requested]` is added. The `push` and
   `pull_request` triggers are unchanged.
-- Every path-filtered job's condition admits `merge_group` exactly like `push`:
+- Every path-filtered job's condition admits `merge_group` unconditionally:
   `github.event_name == 'push' || github.event_name == 'merge_group' ||
   needs.changes.outputs.<group> == 'true'`. A merge group therefore runs the
   full suite. `changes` stays PR-only and carries the marker.
+- The image jobs (`worker-base-image` and the three image smokes) are the one
+  exception on `push` (#10825, [ci-principles](ci-principles.md) rule 3).
+  Their condition puts `github.event_name == 'merge_group' ||` first, so a
+  merge group still runs them unconditionally, while a push runs them only
+  when the push-only `changes-push` job finds an image input or fails.
+  `changes-push` never runs on a PR or a merge group, so the audit does not
+  count it as a relied-on suite.
 - The concurrency group for a merge-group run is keyed on
   `merge_group.head_sha`, so it can never share a group with a PR run, with
   `main`, or with another merge group. `cancel-in-progress` stays true only
@@ -125,7 +132,9 @@ A missing or `null` field means "unknown".
 - Regression tests in `loom-daemon/src/merge_group_ci/tests.rs` audit this
   repository's own workflows against `.loom/config.json`'s required checks.
   They also assert that every job still runs on `push` and may still run on a
-  PR.
+  PR. The exceptions are named explicitly: `changes-push` (push-only), and the
+  four image jobs, which must not be `Skipped` on push and must `Run` on
+  `merge_group`.
 
 ## Enablement prerequisites (all required, in order)
 
@@ -188,8 +197,10 @@ The findings:
   SHA. Removing that `push` run would be a separate, evidence-gated change and
   is **not** made here: `main` verification stays (rule 2).
 - **Interaction to watch in the pilot:** `version-bump-on-merge.yml` pushes
-  directly to `main` after merges. In a queue-enabled repository, each such
-  push moves the base under every queued entry. The pilot repository must
+  directly to `main`, at most once per `RELEASE_MIN_INTERVAL` (24 h by
+  default, #11174; see [`release-cadence.md`](release-cadence.md)). In a
+  queue-enabled repository, each such push moves the base under every queued
+  entry. The pilot repository must
   either route that bump through the queue or measure the rebuild churn it
   causes.
 

@@ -314,6 +314,31 @@ pub fn global_status_snapshot() -> IdleExitStatusSnapshot {
         .map_or_else(IdleExitStatusSnapshot::default, |s| s.snapshot())
 }
 
+/// [`global_status_snapshot`] as the `status` payload's
+/// [`crate::types::IdleExitStatus`] (moved here from `ipc.rs`, a frozen
+/// ledger entry, by #10600).
+#[must_use]
+pub fn status_report() -> crate::types::IdleExitStatus {
+    let snap = global_status_snapshot();
+    crate::types::IdleExitStatus {
+        enabled: snap.enabled,
+        eligible: snap.eligible,
+        trigger: snap
+            .trigger
+            .map(IdleExitTrigger::as_str)
+            .map(str::to_string),
+        idle_minutes: snap.idle_minutes,
+        in_flight_sweeps: snap.in_flight_sweeps,
+        active_role_runs: snap.active_role_runs,
+        healthy_tokens: snap.healthy_tokens,
+        total_tokens: snap.total_tokens,
+        idle_elapsed_secs: snap.idle_elapsed_secs,
+        starved_elapsed_secs: snap.starved_elapsed_secs,
+        starvation_enabled: snap.starvation_enabled,
+        observed_at: snap.observed_at,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IdleExitMarker {
     pub exited_at: DateTime<Utc>,

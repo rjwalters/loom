@@ -24,7 +24,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use loom_daemon::park_record::{self, ParkRecord};
+use loom_daemon::park_record::{self, BlockerRef, ParkRecord};
 
 #[derive(clap::Subcommand)]
 pub(crate) enum ParkRecordCommand {
@@ -61,9 +61,10 @@ pub(crate) struct ApplyArgs {
     #[arg(long, value_name = "N")]
     pub pr: Option<u64>,
 
-    /// The open blocker(s). Repeatable; comma-separated accepted.
-    #[arg(long = "blocked-by", value_name = "N", num_args = 1.., value_delimiter = ',')]
-    pub blocked_by: Vec<u64>,
+    /// The open blocker(s): `N`, `#N` (this repo) or `OWNER/REPO#N` (another
+    /// repo). Repeatable; comma-separated accepted.
+    #[arg(long = "blocked-by", value_name = "REF", num_args = 1.., value_delimiter = ',')]
+    pub blocked_by: Vec<BlockerRef>,
 
     /// Why. Required when no `--blocked-by` is given (e.g. `operator`), so a
     /// park with no named blocker is a deliberate choice.
@@ -89,11 +90,11 @@ pub(crate) struct ApplyArgs {
 
 #[derive(clap::Args)]
 pub(crate) struct RenderArgs {
-    /// The blocker(s), as issue/PR numbers. Repeatable, and comma-separated
+    /// The blocker(s): `N`, `#N` or `OWNER/REPO#N`. Repeatable, and comma-separated
     /// values are accepted. Omit to render an explicit "blocker unstated"
     /// record, which is still attributable and dated — unlike silence.
-    #[arg(long = "blocked-by", value_name = "N", num_args = 1.., value_delimiter = ',')]
-    pub blocked_by: Vec<u64>,
+    #[arg(long = "blocked-by", value_name = "REF", num_args = 1.., value_delimiter = ',')]
+    pub blocked_by: Vec<BlockerRef>,
 
     /// Who is applying the park — a role name (`doctor`, `champion`, `curator`)
     /// or `human`.
@@ -157,6 +158,7 @@ impl ApplyArgs {
         use loom_daemon::park_record::apply::{apply, ApplyRequest};
         let req = ApplyRequest {
             number: self.issue.or(self.pr).unwrap_or_default(),
+            repo: self.repo.clone(),
             blocked_by: self.blocked_by,
             reason: self.reason,
             by: self.by,
@@ -190,13 +192,22 @@ impl ParseArgs {
                 "{}",
                 serde_json::json!({
                     "records": rows,
-                    "blockers": blockers,
+                    // Local blockers stay bare numbers (unchanged); qualified ones are
+                    // `OWNER/REPO#N` strings.
+                    "blockers": blockers.iter().map(|b| match &b.repo {
+                        None => serde_json::json!(b.number),
+                        Some(_) => serde_json::json!(b.to_string()),
+                    }).collect::<Vec<_>>(),
                     "declared": !records.is_empty(),
                 })
             );
         } else {
-            for n in &blockers {
-                println!("{n}");
+            for b in &blockers {
+                // Bare number for a local blocker (unchanged), qualified otherwise.
+                match &b.repo {
+                    None => println!("{}", b.number),
+                    Some(_) => println!("{b}"),
+                }
             }
         }
 
@@ -211,7 +222,8 @@ impl ParseArgs {
 
 fn record_json(r: &ParkRecord) -> serde_json::Value {
     serde_json::json!({
-        "blocker": r.blocker,
+        "blocker": r.blocker.as_ref().map(|b| b.number),
+        "blocker_repo": r.blocker.as_ref().and_then(|b| b.repo.clone()),
         "by": r.by,
         "at": r.at,
         "reason": r.reason,

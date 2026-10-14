@@ -46,6 +46,17 @@
 //! every other Phase-1 decision (release, void, expiry, stall) is returned
 //! unchanged.
 //!
+//! **Transitive readiness (#10465).** An approved predecessor is not
+//! necessarily *landable*: `loom:pr` can sit on a PR that is itself
+//! `loom:sequenced` behind a non-ready PR, or that is `loom:operator` (which
+//! is also where an exhausted re-date budget ends up). Holding a ready PR
+//! behind it saves no rebase and costs hours, so [`demote_unlandable`]
+//! derives, from the listing and the already-read markers, which PRs sit
+//! behind a non-ready chain and tags them in memory with
+//! [`NOT_LANDABLE_LABEL`]; [`ready`] then treats them as not ready, so rules
+//! 1-3 above all become transitive. Hard (human) holds are untouched, as
+//! before: only the predicate for *predecessors* changes.
+//!
 //! "Ready" is read from labels only: CI state and mergeability are not in the
 //! open-PR listing, and fetching them per PR per tick would spend the API
 //! budget #10332 is reducing. `loom:ci-failure` is the CI proxy the fleet
@@ -64,8 +75,67 @@ pub const APPROVED_LABEL: &str = "loom:pr";
 
 /// Labels that make an approved PR not ready to land: a review finding, a
 /// red CI run, or a block.
-pub const NOT_READY_LABELS: [&str; 3] =
-    ["loom:changes-requested", "loom:ci-failure", "loom:blocked"];
+pub const NOT_READY_LABELS: [&str; 5] = [
+    "loom:changes-requested",
+    "loom:ci-failure",
+    "loom:blocked",
+    // Parked for a human; a re-date budget that ran out lands here (#10465).
+    "loom:operator",
+    NOT_LANDABLE_LABEL,
+];
+
+/// In-memory only (never written to the forge): set by [`demote_unlandable`]
+/// on an approved PR that is `loom:sequenced` behind a PR that is not ready
+/// (#10465).
+pub const NOT_LANDABLE_LABEL: &str = "loom-internal:behind-unready-chain";
+
+/// Tag every PR that sits behind a non-ready chain with
+/// [`NOT_LANDABLE_LABEL`]. A PR is demoted when it carries the hold label,
+/// has a trusted marker in `markers`, and its marker's predecessor is open in
+/// `prs` and is not (transitively) ready. A hold with no marker (manual), a
+/// predecessor outside the listing, and a cycle all keep today's reading
+/// (fail toward the pre-#10465 behavior). Non-mutating; returns the tagged
+/// copy.
+#[must_use]
+pub fn demote_unlandable(
+    prs: &[SequencePr],
+    markers: &BTreeMap<u32, SequenceMarker>,
+) -> Vec<SequencePr> {
+    let by_number: BTreeMap<u32, &SequencePr> = prs.iter().map(|p| (p.number, p)).collect();
+    fn landable(
+        n: u32,
+        by_number: &BTreeMap<u32, &SequencePr>,
+        markers: &BTreeMap<u32, SequenceMarker>,
+        seen: &mut Vec<u32>,
+    ) -> bool {
+        let Some(pr) = by_number.get(&n) else {
+            return true;
+        };
+        if !ready(pr) {
+            return false;
+        }
+        if seen.contains(&n) || !pr.has(super::SEQUENCE_LABEL) {
+            return true;
+        }
+        let Some(m) = markers.get(&n) else {
+            return true;
+        };
+        seen.push(n);
+        landable(m.after, by_number, markers, seen)
+    }
+    prs.iter()
+        .map(|p| {
+            let mut out = p.clone();
+            if ready(p)
+                && p.has(super::SEQUENCE_LABEL)
+                && !landable(p.number, &by_number, markers, &mut Vec::new())
+            {
+                out.labels.push(NOT_LANDABLE_LABEL.to_string());
+            }
+            out
+        })
+        .collect()
+}
 
 /// Is `pr` ready to land: Judge-approved, with no label saying otherwise?
 #[must_use]
@@ -141,8 +211,9 @@ pub fn with_readiness(
 #[must_use]
 pub fn release_reason(marker: &SequenceMarker) -> String {
     format!(
-        "#{} is not ready to land (no `loom:pr` verdict, or it carries `loom:changes-requested`, \
-         `loom:ci-failure` or `loom:blocked`) — ready work is not held behind it (#10371), and \
+        "#{} is not ready to land (no `loom:pr` verdict, it carries `loom:changes-requested`, \
+         `loom:ci-failure`, `loom:blocked` or `loom:operator`, or it is itself sequenced behind a \
+         PR that is not ready, #10465) — ready work is not held behind it (#10371), and \
          the order is re-derived from current readiness on the next tick",
         marker.after
     )

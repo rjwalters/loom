@@ -116,18 +116,6 @@ fn tree_compare_of_two_shas_is_spent_once_and_counted() {
     assert_eq!(calls(&rows, "forge.tree_compare"), 3, "{rows:?}");
 }
 
-#[test]
-fn snapshot_and_complexity_reads_are_counted() {
-    let tmp = tempfile::tempdir().unwrap();
-    let gh = stub(tmp.path(), "gh-body", "echo 'no marker here'");
-    let mut body = Some("x".to_string());
-    let rows = rows_after(|| {
-        body = crate::sweep_registry::fetch_issue_complexity(&gh, tmp.path(), 5);
-    });
-    assert_eq!(body, None);
-    assert_eq!(calls(&rows, "model.issue_body"), 1, "{rows:?}");
-}
-
 // ---- #10089 increment 3: daemon tick readers + sweep_registry family ----
 
 #[test]
@@ -171,7 +159,13 @@ fn watch_probe_is_counted_and_keeps_its_classification() {
 #[serial(loom_config_env)]
 fn worktree_ops_probes_are_counted_and_keep_their_classification() {
     let tmp = tempfile::tempdir().unwrap();
-    let gh = stub(tmp.path(), "gh-closed", "echo closed");
+    // W6: a root the repo facts cannot model (here: not a checkout) reads
+    // through gh's placeholder, unconditional, so the stub prints the body.
+    let gh = stub(
+        tmp.path(),
+        "gh-closed",
+        r#"echo '{"number":7,"state":"closed","closed_at":"2026-10-06T00:00:00Z"}'"#,
+    );
     std::env::set_var("LOOM_GH_BIN", &gh);
     let (mut state, mut closed_at, mut building) = (None, None, None);
     let rows = rows_after(|| {
@@ -181,7 +175,7 @@ fn worktree_ops_probes_are_counted_and_keep_their_classification() {
     });
     std::env::remove_var("LOOM_GH_BIN");
     assert_eq!(state.as_deref(), Some("CLOSED"));
-    assert_eq!(closed_at, Some(Some("closed".to_string())));
+    assert_eq!(closed_at, Some(Some("2026-10-06T00:00:00Z".to_string())));
     assert_eq!(building, Some(true), "non-JSON stdout is a parse error");
     assert_eq!(calls(&rows, "worktree.issue_state_rest"), 1, "{rows:?}");
     assert_eq!(calls(&rows, "worktree.issue_closed_at"), 1, "{rows:?}");
@@ -191,7 +185,10 @@ fn worktree_ops_probes_are_counted_and_keep_their_classification() {
 #[test]
 fn reclaim_open_pr_probe_is_counted() {
     let tmp = tempfile::tempdir().unwrap();
-    let gh = stub(tmp.path(), "gh-pr", "echo '[{\"number\":12}]'");
+    // #10382: REST `pulls?head=` — a row on another head is filtered out.
+    let json = r#"[{"number":11,"state":"open","head":{"ref":"main"}},{"number":12,"state":"open","head":{"ref":"feature/issue-5"}}]"#;
+    let body = format!("printf 'HTTP/2.0 200 OK\\r\\n\\r\\n'; echo '{json}'");
+    let gh = stub(tmp.path(), "gh-pr", &body);
     let mut pr = None;
     let rows = rows_after(|| {
         pr = Some(crate::reclaim_pr_warning::open_pr_on_issue_branch(&gh, tmp.path(), 5));

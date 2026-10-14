@@ -23,6 +23,9 @@
 #   (z5) sliding window cursor + own-yield guard retained
 #   (z6)/(z7) a loop with no lease stops after two consecutive misses; a hit
 #        in between resets the count
+#   (y8) #10348: verb absent => probed once, 0 state reads, renewal unchanged
+#   (y9) #10348: dispatched marker + verb => 0 state reads, check gets "open",
+#        renewal continues, loop still ends when the watched pid dies
 #
 # With LEASE_RENEWER_DAEMON=<built loom-daemon> the stub hands `lease renewer`
 # to the real binary and (r1)-(r4) run end to end: closed issue, concurrent
@@ -81,7 +84,9 @@ if [[ "${GH_TOKEN:-}" == ghs_app* && -f "$D/app-fail-$method" ]]; then
   exit 1
 fi
 if [[ "$method" == "GET" && "$path" == repos/*/issues/*/comments* ]]; then
-  echo "$path" >> "$D/list-calls.log"; cat "$D/comments.json"; exit 0
+  echo "$path" >> "$D/list-calls.log"
+  [[ ! -f "$D/comments-fail" ]] || { echo "stub gh: HTTP 502 comments read failed" >&2; exit 1; }
+  cat "$D/comments.json"; exit 0
 fi
 if [[ "$method" == "GET" && "$path" == repos/*/issues/[0-9]* ]]; then
   echo "$path" >> "$D/state-calls.log"
@@ -117,7 +122,7 @@ unset GH_TOKEN GITHUB_TOKEN LOOM_PERSONAL_GH_TOKEN LOOM_TERMINAL_ID LOOM_HOST_ID
 reset_state() {
     rm -f "$STUB_DIR"/comments.json "$STUB_DIR"/issue-state* "$STUB_DIR"/state-calls.log \
         "$STUB_DIR"/list-calls.log "$STUB_DIR"/patch-calls.log "$STUB_DIR"/renewer-* "$STUB_DIR"/r2-out.* \
-        "$STUB_DIR"/cred.log "$STUB_DIR"/app-* "$STUB_DIR"/forge-token-args.log "$STUB_DIR"/z-*.log
+        "$STUB_DIR"/comments-fail "$STUB_DIR"/cred.log "$STUB_DIR"/app-* "$STUB_DIR"/forge-token-args.log "$STUB_DIR"/z-*.log
     rm -rf "$LOOM_LEASE_RENEW_STATE_DIR" 2> /dev/null || true
     echo "[$Y_LEASE]" > "$STUB_DIR/comments.json"
 }
@@ -380,6 +385,27 @@ N="$(patch_n)"
 assert_eq "4" "$?" "(z5) a yield inside the sliding window still trips the own-yield guard"
 assert_eq "$N" "$(patch_n)" "(z5) ...and nothing is PATCHed"
 
+# (z5b) a transient failure of the CACHED window read is not a cache miss: no
+# --paginate re-list, no PATCH of an unverified target, the cache is kept (exit 1).
+reset_state
+touch "$STUB_DIR/comments-fail"
+OUT="$("$SCRIPT" renew-once 10229 --host y-host --sweep-id y-sweep --cached-lease 42@2026-10-01T05:00:00Z 2>&1)"
+assert_eq "1" "$?" "(z5b) a failed window read fails the cycle (exit 1), it is not a miss"
+assert_eq "1" "$(wc -l < "$STUB_DIR/list-calls.log" | tr -d ' ')" "(z5b) exactly one read, no re-list"
+assert_eq "true" "$(yb grep -q 'comments?since=' "$STUB_DIR/list-calls.log")" "(z5b) and it was the one-page since-window"
+assert_eq "0" "$(patch_n)" "(z5b) nothing was PATCHed"
+assert_eq "false" "$([[ "$OUT" == *"lease-cache="* ]] && echo true || echo false)" "(z5b) no cache token is reported, so the loop keeps its previous one"
+
+# (z2b) an App that cannot READ (404: not installed) falls back to the caller's
+# credential for the read, tagged; the PATCH is not guessed to fail with it.
+reset_state
+echo ghs_app > "$STUB_DIR/app-token"
+echo 404 > "$STUB_DIR/app-fail-GET"
+OUT="$("$SCRIPT" renew-once 10229 --host y-host --sweep-id y-sweep 2>&1)"
+assert_eq "0" "$?" "(z2b) renewal succeeds after the App read attempt fails"
+assert_eq "true" "$([[ "$OUT" == *"lease-credential=ambient-fallback: the read call failed"* ]] && echo true || echo false)" "(z2b) the read fallback is tagged"
+assert_eq "PATCH tok=ghs_app-write cred=app" "$(grep '^PATCH' "$STUB_DIR/cred.log" | sed 's/ repos[^ ]*//')" "(z2b) the PATCH still ran on the writer App"
+
 # (z6) no lease to renew: the loop stops after two consecutive misses instead
 # of paying a --paginate listing every interval forever; the parent lives on.
 reset_state
@@ -406,6 +432,32 @@ wait_patches 2
 assert_eq "true" "$([[ "$(patch_n)" -ge 2 ]] && yb alive "$LOOP" || echo false)" "(z7) one miss then hits: the loop survives and renews"
 kill "$LOOP" "$WATCH" 2> /dev/null
 wait "$WATCH" 2> /dev/null
+
+# (y8) #10348: verb absent -> one probe, no state read, no check/claim, renews.
+reset_state
+touch "$STUB_DIR/renewer-absent"
+sleep 30 &
+WATCH=$!
+LOOP="$(start_loop 10229 "$WATCH")"
+wait_patches 3
+kill "$LOOP" "$WATCH" 2> /dev/null
+assert_eq "0" "$(cat "$STUB_DIR/state-calls.log" 2> /dev/null | wc -l | tr -d ' ')" "(y8) no state read when the daemon lacks the verb"
+assert_eq "true" "$([[ "$(patch_n)" -ge 3 ]] && echo true || echo false)" "(y8) renewal unchanged without the verb"
+# #10203's per-start `sanitize-exec --check` probe is a separate verb; exclude it.
+assert_eq "1" "$(grep -v 'sanitize-exec' "$STUB_DIR/renewer-args.log" 2> /dev/null | grep -c 'lease renewer')" "(y8) the verb is probed once per start, not per cycle"
+
+# (y9) #10348: dispatched start -> no state read, still gated, ends with the watch pid.
+reset_state
+sleep 30 &
+WATCH=$!
+LOOP="$(LOOM_SWEEP_LEASE_RENEW_SOURCE=dispatch start_loop 10229 "$WATCH")"
+wait_patches 3
+assert_eq "0" "$(cat "$STUB_DIR/state-calls.log" 2> /dev/null | wc -l | tr -d ' ')" "(y9) dispatched start spends no state read"
+assert_eq "true" "$([[ "$(grep -c -- '--issue-state open$' "$STUB_DIR/renewer-args.log")" -ge 2 ]] && echo true || echo false)" "(y9) check still runs each cycle with a non-empty state"
+assert_eq "true" "$([[ "$(patch_n)" -ge 3 ]] && echo true || echo false)" "(y9) renewal continues"
+kill "$WATCH" 2> /dev/null
+sleep 2.5
+assert_eq "false" "$(yb alive "$LOOP")" "(y9) loop ends when the watched pid dies"
 
 echo ""
 echo "Results: $TESTS_PASSED/$TESTS_RUN passed"

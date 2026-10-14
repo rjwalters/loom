@@ -478,6 +478,9 @@ pub struct EpicSupervisor<S: EpicSource, D: EpicDispatcher> {
     /// scheduled drain pauses new epic-child dispatch just like a red `main`.
     /// Absent (the default / test path) means the supervisor is never drained.
     drain_flag: Option<Arc<AtomicBool>>,
+    /// The workspace this supervisor serves, so a W3/W4 hold on it (#10719)
+    /// can stop its tick. `None` for a supervisor with no workspace identity.
+    hold_root: Option<PathBuf>,
 }
 
 impl<S: EpicSource, D: EpicDispatcher> EpicSupervisor<S, D> {
@@ -495,6 +498,7 @@ impl<S: EpicSource, D: EpicDispatcher> EpicSupervisor<S, D> {
             bus: None,
             health_state: None,
             drain_flag: None,
+            hold_root: None,
         }
     }
 
@@ -511,6 +515,14 @@ impl<S: EpicSource, D: EpicDispatcher> EpicSupervisor<S, D> {
     #[must_use]
     pub fn with_health_gate(mut self, health_state: Arc<MainHealthState>) -> Self {
         self.health_state = Some(health_state);
+        self
+    }
+
+    /// Name the workspace this supervisor serves (#10719): while it is held
+    /// (W3/W4) the tick dispatches nothing. Builder-style; returns `self`.
+    #[must_use]
+    pub fn with_hold_root(mut self, root: PathBuf) -> Self {
+        self.hold_root = Some(root);
         self
     }
 
@@ -551,6 +563,14 @@ impl<S: EpicSource, D: EpicDispatcher> EpicSupervisor<S, D> {
             .drain_flag
             .as_ref()
             .is_some_and(|f| f.load(Ordering::Relaxed));
+        // #10719: a held workspace dispatches nothing — `dispatch_role` runs the
+        // held checkout's spawn script directly, outside the registry guard.
+        if role_spawn::tick_held(self.hold_root.as_deref()) {
+            return Ok(TickReport {
+                halted: true,
+                ..TickReport::default()
+            });
+        }
         if health_halted || drained {
             log::warn!(
                 "epic_supervisor: {} — skipping tick (no epic dispatch)",
@@ -1119,11 +1139,15 @@ pub fn spawn_multi_supervisor_thread(
                             // Per-repo main-health gate (#3930): each root gets
                             // its own halt state, so a red `main` in repo A halts
                             // only A's epic dispatch, never the siblings'.
-                            let supervisor =
-                                EpicSupervisor::new(source, dispatcher, IssueCreationMutex::new())
-                                    .with_event_bus(event_bus.clone())
-                                    .with_health_gate(health_states.get_or_create(root))
-                                    .with_drain_flag(drain_flag.clone());
+                            let supervisor = EpicSupervisor::new(
+                                source,
+                                dispatcher,
+                                IssueCreationMutex::for_root(root),
+                            )
+                            .with_event_bus(event_bus.clone())
+                            .with_health_gate(health_states.get_or_create(root))
+                            .with_drain_flag(drain_flag.clone())
+                            .with_hold_root(root.clone());
                             roots.push(root.clone());
                             supervisors.push(supervisor);
                             log::info!("epic_supervisor: watching workspace {}", root.display());
@@ -1138,17 +1162,17 @@ pub fn spawn_multi_supervisor_thread(
                     }
                 }
 
-                // Cross-repo priority ordering (#3946): reorder the parallel
-                // `roots` / `supervisors` vectors by workspace priority (lower =
-                // higher priority) before ticking, so higher-tier repos' epics
-                // are advanced/dispatched ahead of lower-tier ones. The sort is
-                // stable, so repos sharing a tier keep their provisioning order,
+                // Cross-repo ordering (#3946, #11742): reorder the parallel
+                // `roots` / `supervisors` vectors by workspace draw weight
+                // (higher first) before ticking, so heavier repos' epics are
+                // advanced/dispatched ahead of lighter ones. The sort is
+                // stable, so repos sharing a weight keep their provisioning order,
                 // and each supervisor's per-epic ledger moves with it (ownership
                 // is transferred through the drain/collect below).
                 if supervisors.len() > 1 {
                     let mut paired: Vec<(PathBuf, EpicSupervisor<_, _>)> =
                         roots.drain(..).zip(supervisors.drain(..)).collect();
-                    paired.sort_by_key(|(root, _)| registry.priority_of(root));
+                    paired.sort_by_key(|(root, _)| std::cmp::Reverse(registry.weight_of(root)));
                     for (root, supervisor) in paired {
                         roots.push(root);
                         supervisors.push(supervisor);
@@ -1192,6 +1216,9 @@ pub fn spawn_multi_supervisor_thread(
 // Concrete runtime adapters (forge-backed source + spawn dispatcher)
 // ============================================================================
 
+// #10743: the singleton role-dispatch command, testable without spawning.
+mod role_spawn;
+
 /// Concrete [`EpicSource`] / [`EpicDispatcher`] implementations that wire the
 /// supervisor to the live forge (`gh`) and the daemon's [`SweepRegistry`].
 ///
@@ -1206,7 +1233,6 @@ pub mod forge {
     use anyhow::{anyhow, Context, Result};
     use serde::Deserialize;
     use std::path::PathBuf;
-    use std::process::{Command, Stdio};
     use std::sync::{Arc, Mutex};
 
     /// The `loom:epic-phase` child marker embedded in a child issue body,
@@ -1307,9 +1333,10 @@ pub mod forge {
             // ETag-cached REST listing (#4428): unchanged epic sets cost zero
             // rate limit (304). REST reports state lowercase (`"open"` vs
             // GraphQL's `"OPEN"`) — `EpicSnapshot::is_open` compares
-            // case-insensitively, so both forms are safe. The `pull_request`
-            // filter keeps the pre-#4428 issue-only semantics.
-            let rows = crate::forge_listing::list_issues_cached_as(
+            // case-insensitively, so both forms are safe. The issues-only
+            // listing keeps the pre-#4428 semantics (#9929: PR rows must
+            // never reach an issue-targeting consumer).
+            let rows = crate::forge_listing::list_issues_only_cached_as(
                 "epic_supervisor",
                 &self.gh_bin,
                 self.cwd.as_deref(),
@@ -1319,7 +1346,6 @@ pub mod forge {
             )?;
             Ok(rows
                 .into_iter()
-                .filter(|r| !r.is_pull_request)
                 .map(|r| GhIssue {
                     number: r.number,
                     // REST `body` is nullable; the GraphQL-era parse defaulted
@@ -1414,6 +1440,11 @@ pub mod forge {
                     .map_err(|e| anyhow!("sweep registry mutex poisoned: {e}"))?;
                 reg.config().workspace_root.clone()
             };
+            // #10719: `spawn_bin` is this checkout's own script, and this path
+            // never reaches the registry guard `dispatch_sweep` passes. The
+            // tick skips a held workspace first; this is the refusal at the
+            // spawn itself, for a hold set mid-tick or any other caller.
+            crate::workspace_hold::guard(&repo_root)?;
             let (model, source) = crate::sweep_registry::resolve_dispatch_model(&repo_root, None);
             log::info!(
                 "epic_supervisor: dispatching {} for epic #{epic} with model={model} (source={})",
@@ -1422,15 +1453,8 @@ pub mod forge {
             );
             // Spawn-and-wait: the burst must complete before we return so the
             // supervisor's #3707 guard genuinely serializes it.
-            let mut cmd = Command::new(&self.spawn_bin);
-            cmd.arg("-p")
-                .arg(&shape.prompt)
-                .arg("--model")
-                .arg(&model)
-                .arg("--dangerously-skip-permissions")
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
+            let mut cmd =
+                super::role_spawn::command(&self.spawn_bin, &repo_root, epic, shape, &model);
             let status = cmd.status().with_context(|| {
                 format!(
                     "failed to spawn {} for {} on epic #{epic}",
@@ -1463,6 +1487,7 @@ pub mod forge {
                 crate::sweep_registry::DispatchModel::Request(None),
                 None,
                 None,
+                crate::sweep_registry::DispatchOrigin::EpicSupervisor,
             )
             .map(|_| ())
         }

@@ -27,6 +27,7 @@
 //! deliverable, and a role that only commented has not acted.
 
 use super::*;
+use crate::sweep_registry::park_hold::HoldGate;
 
 /// Marker prefix on every comment this module posts, so the per-attempt notes
 /// and the hold notice are machine-identifiable (and greppable) the way
@@ -92,6 +93,9 @@ pub(crate) enum PrlessHoldOutcome {
     VetoedOpenPr,
     /// Label flips are disabled (hermetic fixture) — no forge state to touch.
     VetoedNoForge,
+    /// The issue is `loom:frozen` (#11743): nothing is written, not even the
+    /// hold. The tally stands; the freeze keeps it out of dispatch anyway.
+    VetoedFrozen,
     /// The `loom:blocked` write did not land and could not be confirmed
     /// (Issue #9239). **The hold did not happen**: the issue is still a
     /// dispatch candidate, so the tally must not record it as held and no
@@ -179,6 +183,12 @@ impl SweepRegistry {
              it — if the issue's scope no longer exists on `main`, say so and rescope or close it \
              rather than retrying."
         );
+        // #11743: this note is the one prless write with no label read on its
+        // path, so it pays one. Fail-open like the rest of this module: a
+        // failed read posts the note as before.
+        if self.frozen_blocks_write(issue, "PR-less attempt note") {
+            return;
+        }
         self.post_prless_comment(issue, &body, "attempt note");
     }
 
@@ -242,7 +252,11 @@ impl SweepRegistry {
         // issue that was still a live dispatch candidate: observed on
         // `2AMLogic/sky130-sar-adc#121`, seven hold notices over four days,
         // two different bot accounts, and not one `loom:blocked` label event.
-        if let Err(failure) = self.write_prless_hold_label(issue) {
+        let written = self.write_prless_hold_label(issue);
+        if written == Ok(HoldGate::Frozen) {
+            return PrlessHoldOutcome::VetoedFrozen;
+        }
+        if let Err(failure) = written {
             log::error!(
                 "sweep_registry: PR-less hold for #{issue} FAILED to apply `loom:blocked` after \
                  {consecutive} consecutive PR-less releases — the issue is NOT parked and remains \
@@ -298,7 +312,9 @@ impl SweepRegistry {
     /// Apply the hold's `loom:blocked` label and report **honestly** whether
     /// the park actually happened (Issue #9239).
     ///
-    /// Three bounded steps, in order, stopping at the first success:
+    /// First the body park record (`reason="pr-less hold"`, `by=daemon`,
+    /// #10161), through [`Self::record_daemon_hold`]. Then three bounded steps,
+    /// in order, stopping at the first success:
     ///
     /// 1. The combined flip — `--add-label loom:blocked --remove-label
     ///    loom:issue` — which is what a healthy hold does in one call.
@@ -315,17 +331,28 @@ impl SweepRegistry {
     ///
     /// A **timeout** is never retried — it means `gh` is wedged, and this runs
     /// inside `reap_once` on the `ListSweeps` / `GetSweepStatus` read path
-    /// whose per-call budget (#3973) is 5s. The worst case here is two fast
-    /// rejections plus one probe; the wedged case still costs exactly one
-    /// timeout, as before.
+    /// whose per-call budget (#3973) is 5s. The worst case here is the
+    /// record's read and write, two fast rejections, and one probe; the wedged
+    /// case still costs exactly one timeout, as before (a timed-out record
+    /// ends the attempt before any label edit).
     ///
     /// Fails **closed**: an unconfirmable label is reported as a failed hold.
     /// The cost of a false "failed" is one more spaced-out dispatch attempt
     /// (the backoff window is armed either way); the cost of a false "applied"
     /// is #9239 itself.
-    fn write_prless_hold_label(&self, issue: u32) -> Result<(), String> {
+    fn write_prless_hold_label(&self, issue: u32) -> Result<HoldGate, String> {
+        // The body park record goes first (#10161), so the park is named for
+        // `check-stale-blocked`. A refused record still lets
+        // the label follow: the label is the deliverable. A timed-out record
+        // means `gh` is wedged, so it ends the attempt here, the same as a
+        // timed-out label edit below (see `sweep_registry::park_hold`). Its
+        // read also answers `loom:frozen` (#11743): then nothing is written.
+        let reason = crate::sweep_registry::park_hold::PRLESS_HOLD_REASON;
+        if self.record_daemon_hold(issue, reason)? == HoldGate::Frozen {
+            return Ok(HoldGate::Frozen);
+        }
         let first = match self.run_prless_hold_edit(issue, true) {
-            Ok(()) => return Ok(()),
+            Ok(()) => return Ok(HoldGate::Proceed),
             Err(HoldEditFailure::TimedOut(detail)) => {
                 // Wedged `gh`: no retry, no probe — just report it truthfully.
                 return Err(detail);
@@ -344,7 +371,7 @@ impl SweepRegistry {
                      add-only retry; `loom:issue` may still be present, which the work finder's \
                      park-label filter already skips (#9239)"
                 );
-                return Ok(());
+                return Ok(HoldGate::Proceed);
             }
             Err(failure) => failure,
         };
@@ -353,7 +380,7 @@ impl SweepRegistry {
                 "sweep_registry: PR-less hold label writes for #{issue} both failed, but the \
                  issue already carries `loom:blocked` — the park stands (#9239)"
             );
-            return Ok(());
+            return Ok(HoldGate::Proceed);
         }
         Err(format!("{}; add-only retry also failed: {}", first.detail(), second.detail()))
     }
@@ -720,6 +747,35 @@ mod tests {
             "a closed issue does not contradict the tally — the record stands"
         );
         assert_eq!(reg.prless_release_count(7893), 2);
+    }
+
+    /// #11743: the attempt note is the one PR-less write with no label read
+    /// on its path, so it reads the labels first and posts nothing on a
+    /// `loom:frozen` issue (the hold itself is covered in `park_hold`'s tests).
+    #[test]
+    #[serial]
+    fn the_attempt_note_is_not_posted_on_a_frozen_issue() {
+        let dir = tempdir().unwrap();
+        std::env::remove_var("LOOM_REPO");
+        let (mut reg, gh_log) = forge_registry(dir.path(), "open", "", "");
+        let reads = crate::sweep_registry::frozen_write::test_support::wrap_label_reads(
+            &mut reg,
+            dir.path(),
+            Some("loom:issue\nloom:frozen"),
+        );
+
+        reg.record_prless_release(7893, "first failure");
+        reg.record_prless_release(7893, "second failure");
+
+        assert!(!reg.prless_retry_held(7893), "still one short of the threshold");
+        assert!(
+            std::fs::read_to_string(&reads)
+                .unwrap_or_default()
+                .contains("/issues/7893 "),
+            "the note read the labels first"
+        );
+        assert!(gh_calls_starting_with(&gh_log, "issue comment ").is_empty());
+        assert!(gh_calls_starting_with(&gh_log, "issue edit ").is_empty());
     }
 
     /// #7972 AC3 on the forge side (#8728): the second consecutive PR-less

@@ -87,3 +87,44 @@ scripts/tests/test-spawn-worker.sh
 scripts/urgent-flip-guard.sh
 scripts/tests/test-urgent-flip-guard.sh
 scripts/tests/test-guide-urgency-rank.sh
+
+# #11098 (Stage 3) — the ETA subsystem moved to loom-ui and was deleted from
+# Loom; its operator reference went with it.
+docs/eta.md
+
+# #11087 — mail removed from Loom; human asks are labels only, so the
+# mail-send command, its inbox reference and its test went with it.
+commands/loom/mail-send.md
+docs/inbox-mail.md
+scripts/tests/test-inbox-mail.sh
+
+# #11112 (slice 2) — the Concierge role (safehouse room intent -> daemon
+# verbs) removed with the Matrix integration; operators steer through labels
+# and issues. Its generated .agents/skills/loom-concierge/ mirror has no
+# retired-list arm (resync_agent_skills is marker-gated, #8673).
+roles/concierge.md
+roles/concierge.json
+commands/loom/concierge.md
+
+# #11664 (P2 of #11659) — the complexity-tier gate, replaced by the points gate
+# in loom-daemon curation-complete (#11663).
+scripts/require-complexity-marker.sh
+scripts/tests/test-require-complexity-marker.sh
+
+# #11665 (P3 of #11659, PR A) — tier-2.5 Builder routing by the Curator's
+# complexity tier, deleted with the Jev tier shadow; story points are the only
+# sizing signal and do not route.
+scripts/resolve-tier-model.sh
+scripts/tests/test-resolve-tier-model.sh
+
+# #11707 (PR #11724, 2026-10-13) — the chain-head merge lock (#10428/#10478)
+# removed from merge-pr.sh; its dedicated shell suite goes with it.
+scripts/tests/test-merge-pr-chain-lock.sh
+
+# #11790 (2026-10-13) — the forge egress policy
+# (forge_egress/: reader, guard, doctor, managed-launcher wiring) removed; its
+# doc and the shell suites that pinned its shell halves go with it.
+docs/forge-egress.md
+scripts/tests/test-resync-installed-egress-doctor.sh
+scripts/tests/test-spawn-claude-managed-gh.sh
+hooks/tests/test-guard-forge-egress.sh

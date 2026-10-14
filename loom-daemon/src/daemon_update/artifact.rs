@@ -115,7 +115,11 @@ fn parse_gh_repo_slug(url: &str) -> String {
 }
 
 /// `fetch_resolve_latest` — read-only resolution, no downloads.
-pub fn fetch_resolve_latest(repo_root: &Path) -> Resolution {
+///
+/// `pinned_tag` (#10709) resolves exactly that release instead of the newest
+/// one, so the auto-update roll installs the release its verdict compared.
+/// `None` is the newest-release resolution, unchanged.
+pub fn fetch_resolve_latest(repo_root: &Path, pinned_tag: Option<&str>) -> Resolution {
     let mut r = Resolution {
         target: String::new(),
         repo_slug: String::new(),
@@ -150,22 +154,57 @@ pub fn fetch_resolve_latest(repo_root: &Path) -> Resolution {
         return r;
     }
 
-    let tag = gh_release_view(&r.repo_slug, "tagName", ".tagName").unwrap_or_default();
+    let slug = r.repo_slug.clone();
+    let view = |fields: &str, jq: &str| gh_release_view(&slug, pinned_tag, fields, jq);
+    let explain = |tag: &str, target: &str| {
+        crate::release_resolve::explain_no_artifact(repo_root, &slug, tag, target)
+    };
+    resolve_release(&mut r, pinned_tag, &view, &explain);
+    r
+}
+
+/// The release half of [`fetch_resolve_latest`], with the forge reads factored
+/// out so the tag/asset logic is testable without `gh` (#10709).
+///
+/// `view(fields, jq)` is `gh release view [<pinned_tag>] --json <fields> --jq
+/// <jq>` for `r.repo_slug`; `explain(tag, target)` is the #8654 reason for a
+/// release that lacks this host's artifact.
+fn resolve_release(
+    r: &mut Resolution,
+    pinned_tag: Option<&str>,
+    view: &dyn Fn(&str, &str) -> Option<String>,
+    explain: &dyn Fn(&str, &str) -> Option<String>,
+) {
+    let tag = view("tagName", ".tagName").unwrap_or_default();
     if tag.is_empty() {
-        r.reason = format!(
-            "'gh release view' found no latest release for {} (no Releases yet, an unreachable/rate-limited API, or an auth failure)",
-            r.repo_slug
-        );
-        return r;
+        r.reason = match pinned_tag {
+            Some(pinned) => format!(
+                "found no release tagged {pinned} for {} (no such tag, an unreachable/rate-limited API, or an auth failure)",
+                r.repo_slug
+            ),
+            None => format!(
+                "'gh release view' found no latest release for {} (no Releases yet, an unreachable/rate-limited API, or an auth failure)",
+                r.repo_slug
+            ),
+        };
+        return;
+    }
+    if let Some(pinned) = pinned_tag {
+        // Defensive: `gh release view <tag>` names the release it read. A
+        // different tag would mean installing something other than the pin.
+        if tag != pinned {
+            r.reason = format!("asked for release {pinned} but the forge returned {tag}");
+            return;
+        }
     }
     r.latest_tag = tag.clone();
     r.latest_version = util::extract_version(&tag);
     if r.latest_version.is_empty() {
         r.reason = format!("could not parse a semver version out of release tag '{tag}'");
-        return r;
+        return;
     }
 
-    let assets = gh_release_view(&r.repo_slug, "assets", ".assets[].name").unwrap_or_default();
+    let assets = view("assets", ".assets[].name").unwrap_or_default();
     let bin_name = format!("loom-daemon-{}", r.target);
     let sha_name = format!("{bin_name}.sha256");
     // `grep -qxF` — a WHOLE-LINE, fixed-string match. A substring match would
@@ -181,20 +220,18 @@ pub fn fetch_resolve_latest(repo_root: &Path) -> Resolution {
         // all — otherwise it always degrades to *some* reason, so the flat
         // fallback below is a belt-and-suspenders default, not the common
         // case.
-        r.reason =
-            crate::release_resolve::explain_no_artifact(repo_root, &r.repo_slug, &tag, &r.target)
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| {
-                    format!(
-                "release {tag} has no artifact for target {} (checked for {bin_name} + {sha_name})",
-                r.target
-            )
-                });
-        return r;
+        r.reason = explain(&tag, &r.target)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                format!(
+                    "release {tag} has no artifact for target {} (checked for {bin_name} + {sha_name})",
+                    r.target
+                )
+            });
+        return;
     }
 
     r.ok = true;
-    r
 }
 
 fn uname_or_question(flag: &str) -> String {
@@ -209,17 +246,28 @@ fn uname_or_question(flag: &str) -> String {
         .unwrap_or_else(|| "?".to_string())
 }
 
-fn gh_release_view(slug: &str, fields: &str, jq: &str) -> Option<String> {
+fn gh_release_view(slug: &str, tag: Option<&str>, fields: &str, jq: &str) -> Option<String> {
     use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
     // #10089: through the facade, so the read is counted and bounded.
     let op = Operation::new("release.view");
     let timeout = std::time::Duration::from_secs(60);
     let outcome = GhInvocation::new(op, AccessIntent::Read, GhTarget::None, timeout)
         .forge_op(crate::forge_call_stats::ops::RELEASE_RESOLVE_AND_FETCH)
-        .args(["release", "view", "--json", fields, "-R", slug, "--jq", jq])
+        .args(release_view_args(slug, tag, fields, jq))
         .run();
     let ran = outcome.ok_output()?;
     Some(String::from_utf8_lossy(&ran.stdout).trim_end().to_string())
+}
+
+/// The `gh` argv for one release read: the newest release when `tag` is
+/// `None` (byte-for-byte the pre-#10709 argv), exactly `tag` otherwise.
+fn release_view_args(slug: &str, tag: Option<&str>, fields: &str, jq: &str) -> Vec<String> {
+    let mut args = vec!["release".to_string(), "view".to_string()];
+    args.extend(tag.map(str::to_string));
+    for a in ["--json", fields, "-R", slug, "--jq", jq] {
+        args.push(a.to_string());
+    }
+    args
 }
 
 /// Why `fetch_and_verify_artifact` did not produce a binary.
@@ -247,7 +295,9 @@ pub fn fetch_and_verify_artifact(
     repo_slug: &str,
     tag: &str,
 ) -> Result<FetchedArtifact, FetchFailure> {
-    use crate::release_fetch::{fetch_and_verify, FetchInputs, FetchOutcome};
+    use crate::release_fetch::{
+        evidence, fetch_and_verify_with_evidence, FetchInputs, FetchOutcome, SignaturePolicy,
+    };
 
     let bin_name = format!("loom-daemon-{target}");
     let sha_name = format!("{bin_name}.sha256");
@@ -263,7 +313,11 @@ pub fn fetch_and_verify_artifact(
         cosign_oidc_issuer_env: std::env::var("LOOM_DAEMON_UPDATE_COSIGN_OIDC_ISSUER").ok(),
     };
 
-    match fetch_and_verify(&inputs) {
+    // #10474: every verdict, in both policy modes, lands in the durable
+    // signature-evidence journal (best-effort; never changes the verdict).
+    let (outcome, record) = fetch_and_verify_with_evidence(&inputs, &SignaturePolicy::from_env());
+    let _ = evidence::record(repo_root, &record);
+    match outcome {
         FetchOutcome::Verified {
             artifact,
             checksum_line,
@@ -318,6 +372,156 @@ mod tests {
         for (url, expected) in cases {
             assert_eq!(parse_gh_repo_slug(url), expected, "{url}");
         }
+    }
+
+    /// A forge with one release per tag (the first entry is the newest),
+    /// answering `view` exactly as `gh release view [<tag>]` would.
+    fn forge<'a>(
+        releases: &'a [(&'a str, &'a [&'a str])],
+        pinned: Option<&'a str>,
+        seen: &'a std::cell::RefCell<Vec<String>>,
+    ) -> impl Fn(&str, &str) -> Option<String> + 'a {
+        move |fields, _jq| {
+            seen.borrow_mut().push(fields.to_string());
+            let (tag, assets) = match pinned {
+                None => releases.first()?,
+                Some(p) => releases.iter().find(|(t, _)| *t == p)?,
+            };
+            Some(match fields {
+                "tagName" => (*tag).to_string(),
+                _ => assets.join("\n"),
+            })
+        }
+    }
+
+    fn fresh() -> Resolution {
+        Resolution {
+            target: "x86_64-unknown-linux-gnu".to_string(),
+            repo_slug: "rjwalters/loom".to_string(),
+            latest_tag: String::new(),
+            latest_version: String::new(),
+            ok: false,
+            reason: String::new(),
+        }
+    }
+
+    const FULL: &[&str] = &[
+        "loom-daemon-x86_64-unknown-linux-gnu",
+        "loom-daemon-x86_64-unknown-linux-gnu.sha256",
+    ];
+    const NO_LINUX: &[&str] = &["loom-daemon-aarch64-apple-darwin"];
+    const RELEASES: &[(&str, &[&str])] = &[
+        ("v0.19.831", FULL),
+        ("v0.19.830", FULL),
+        ("v0.19.829", NO_LINUX),
+    ];
+    const NO_EXPLAIN: &dyn Fn(&str, &str) -> Option<String> = &|_, _| None;
+
+    #[test]
+    fn a_pinned_tag_resolves_that_release_not_the_newest() {
+        let seen = std::cell::RefCell::new(Vec::new());
+        let mut r = fresh();
+        resolve_release(
+            &mut r,
+            Some("v0.19.830"),
+            &forge(RELEASES, Some("v0.19.830"), &seen),
+            NO_EXPLAIN,
+        );
+        assert!(r.ok, "{}", r.reason);
+        assert_eq!(r.latest_tag, "v0.19.830");
+        assert_eq!(r.latest_version, "0.19.830");
+    }
+
+    #[test]
+    fn no_pin_resolves_the_newest_release_as_before() {
+        let seen = std::cell::RefCell::new(Vec::new());
+        let mut r = fresh();
+        resolve_release(&mut r, None, &forge(RELEASES, None, &seen), NO_EXPLAIN);
+        assert!(r.ok, "{}", r.reason);
+        assert_eq!(r.latest_tag, "v0.19.831");
+        assert_eq!(*seen.borrow(), ["tagName", "assets"]);
+    }
+
+    #[test]
+    fn a_pinned_tag_that_does_not_exist_fails_naming_the_tag() {
+        let seen = std::cell::RefCell::new(Vec::new());
+        let mut r = fresh();
+        resolve_release(
+            &mut r,
+            Some("v0.91.816"),
+            &forge(RELEASES, Some("v0.91.816"), &seen),
+            NO_EXPLAIN,
+        );
+        assert!(!r.ok);
+        assert!(r.latest_tag.is_empty(), "nothing resolved");
+        assert!(r.reason.contains("no release tagged v0.91.816"), "{}", r.reason);
+    }
+
+    #[test]
+    fn a_pinned_release_without_this_targets_asset_fails_rather_than_falling_to_another() {
+        let seen = std::cell::RefCell::new(Vec::new());
+        let mut r = fresh();
+        resolve_release(
+            &mut r,
+            Some("v0.19.829"),
+            &forge(RELEASES, Some("v0.19.829"), &seen),
+            NO_EXPLAIN,
+        );
+        assert!(!r.ok);
+        assert!(
+            r.reason
+                .contains("release v0.19.829 has no artifact for target x86_64-unknown-linux-gnu"),
+            "{}",
+            r.reason
+        );
+        // The #8654 explanation still wins when it has one.
+        let mut r = fresh();
+        let explain: &dyn Fn(&str, &str) -> Option<String> =
+            &|tag, target| Some(format!("{tag}/{target}: still uploading"));
+        resolve_release(
+            &mut r,
+            Some("v0.19.829"),
+            &forge(RELEASES, Some("v0.19.829"), &seen),
+            explain,
+        );
+        assert_eq!(r.reason, "v0.19.829/x86_64-unknown-linux-gnu: still uploading");
+    }
+
+    #[test]
+    fn a_forge_answer_for_a_different_tag_is_refused() {
+        let mut r = fresh();
+        let wrong: &dyn Fn(&str, &str) -> Option<String> = &|fields, _| {
+            Some(if fields == "tagName" {
+                "v0.19.831".to_string()
+            } else {
+                FULL.join("\n")
+            })
+        };
+        resolve_release(&mut r, Some("v0.19.830"), wrong, NO_EXPLAIN);
+        assert!(!r.ok);
+        assert!(r.reason.contains("asked for release v0.19.830"), "{}", r.reason);
+    }
+
+    #[test]
+    fn the_gh_argv_is_unchanged_without_a_tag_and_names_the_tag_with_one() {
+        assert_eq!(
+            release_view_args("o/r", None, "tagName", ".tagName"),
+            ["release", "view", "--json", "tagName", "-R", "o/r", "--jq", ".tagName"]
+        );
+        assert_eq!(
+            release_view_args("o/r", Some("v1.2.3"), "assets", ".assets[].name"),
+            [
+                "release",
+                "view",
+                "v1.2.3",
+                "--json",
+                "assets",
+                "-R",
+                "o/r",
+                "--jq",
+                ".assets[].name"
+            ]
+        );
     }
 
     #[test]

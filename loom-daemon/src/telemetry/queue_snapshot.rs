@@ -61,24 +61,17 @@ pub struct QueueSnapshotRow {
     #[serde(default)]
     pub visibility: RepoVisibility,
     pub issue: u32,
-    pub workspace_priority: u32,
-    /// Deprecated (#9244): always `false`. `loom:urgent` no longer affects
-    /// dispatch order; kept on the wire for one release.
+    pub workspace_weight: u32,
+    /// Deprecated (#9244): always `false`. Its label was deleted in #11105;
+    /// kept on the wire only for compatibility.
     pub urgent: bool,
-    /// Whether the issue is starred (`loom:operator-priority`, #9244), which
-    /// sorts it ahead of all other work.
+    /// The issue's priority level (#11510): `default`, `important` or
+    /// `very-important` (the ready-queue row's `level`; a blocked row reads
+    /// its own labels). Absent (an older daemon) reads as `default`.
     #[serde(default)]
-    pub operator_priority: bool,
-    /// When it was starred (RFC 3339), when known. Absent for an unstarred
-    /// issue, or a starred one ordered by its `created_at` fallback.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub operator_priority_at: Option<String>,
+    pub level: crate::priority_pick::Level,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
-    /// The `tier:*` label, which is informational only and does not affect
-    /// dispatch order.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tier: Option<String>,
     pub disposition: QueueDisposition,
     /// `running` / `ready` / `blocked`.
     pub state: String,
@@ -88,14 +81,19 @@ pub struct QueueSnapshotRow {
     /// number (`open_pr`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// Why a `workspace_halted` row is held (#11417): the closed
+    /// `work_finder::halt_cause` vocabulary, same tokens as the SigNoz
+    /// `loom.queue.halt_cause` attribute. Absent on other dispositions and
+    /// when the cause is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub halt_cause: Option<String>,
     /// The dispatch-plan fields (Issue #9288), flattened beside `rank`:
-    /// `position`, `plan_state`, `keys`, `gate`, `in_slice`, `hot`,
-    /// `owning_shard`, `repo_cap`. The `keys` names are the seven
-    /// `candidate_keys` (#9244, #10307): `operator_priority_level`,
-    /// `operator_priority`, `operator_priority_at`,
-    /// `main_red_fix`, `workspace_priority`, `created_at`, `number` (this
-    /// row's `issue`). `main_red_fix` and `number` are not otherwise
-    /// `QueueSnapshotRow` fields, so `keys` is the only place they appear.
+    /// `position`, `plan_state`, `keys`, `gate`, `hot`, `owning_shard`,
+    /// `repo_cap` (`in_slice` is retired and absent since #11682). The `keys` names are the four
+    /// `candidate_keys` (#11508, #11547): `main_red_fix` (bool, true only for
+    /// a verified red-main fix while its repo's `main` is red), `level`
+    /// (0 default, 1 `loom:important`, 2 `loom:very-important`),
+    /// `created_at`, `number` (this row's `issue`).
     #[serde(flatten, default)]
     pub plan: RowPlan,
 }
@@ -121,6 +119,16 @@ pub struct QueueSnapshotRecord {
     /// Workspaces in `listing_failed` whose slug could not be resolved.
     #[serde(default)]
     pub listing_failed_unresolved: usize,
+    /// Repos whose ready listing came back partial on this tick (#11139: a
+    /// later page failed, the page cap, a mid-walk change). Some of their
+    /// rows are present, but not all: a missing row is not evidence the
+    /// issue left the queue. The snapshot is whole only when this,
+    /// `listing_failed` and both `*_unresolved` counters are empty/zero.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub listing_incomplete: Vec<QueueRepoRef>,
+    /// Workspaces in `listing_incomplete` whose slug could not be resolved.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub listing_incomplete_unresolved: usize,
     pub rows: Vec<QueueSnapshotRow>,
     /// Rows dropped because their repo slug could not be resolved.
     #[serde(default)]
@@ -132,39 +140,30 @@ pub struct QueueSnapshotRecord {
     /// shard posture, scope and key ordering. Absent from a pre-#9288 daemon.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<DispatchPlanContext>,
-    /// The landing state of every starred issue this host watches, and of
-    /// every blocker inheriting a star (#9244 C), in starred-at order. A
-    /// separate list rather than fields on `rows`: `rows` is what the work
-    /// finder did with its ready listing this tick, and most starred issues
-    /// (building, in review, parked) are not in it. Join on `(repo, issue)`.
-    /// Absent from older daemons and when nothing is starred.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub operator_priority_landing: Vec<QueueLandingRow>,
-}
-
-/// One starred issue's landing state, with its repo's visibility tag (the
-/// same anti-leak rule as [`QueueSnapshotRow`]). Every text field is
-/// templated by the daemon; no forge free text is carried.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct QueueLandingRow {
-    #[serde(flatten)]
-    pub row: crate::types::StarLandingRow,
-    #[serde(default)]
-    pub visibility: RepoVisibility,
 }
 
 /// `detail` survives only for dispositions whose detail is structured: the
 /// park label, the open PR, a `labelled_blocked` row's allowlisted hold
-/// labels (#8957), and a `workspace_halted` row's closed-vocabulary hold
+/// labels (#8957), a `deferred_file_overlap` row's shared `## Affected Files`
+/// paths (#9781; the daemon formats `file overlap: <paths>`, never forge free
+/// text), and a `workspace_halted` row's closed-vocabulary hold
 /// cause (#9017 — `main_red`, `gate_pending`, `token_pool`, …, emitted by
-/// `work_finder::halt_cause`, never free-form text).
+/// `work_finder::halt_cause`, never free-form text), and an `already_landed`
+/// row's evidence (#11429: `forge_closed` or `journal_landed`).
 #[must_use]
 pub fn exportable_detail(disposition: QueueDisposition, detail: Option<&str>) -> Option<String> {
     match disposition {
         QueueDisposition::Parked
         | QueueDisposition::OpenPr
         | QueueDisposition::LabelledBlocked
-        | QueueDisposition::WorkspaceHalted => detail.map(str::to_string),
+        | QueueDisposition::DeferredFileOverlap
+        | QueueDisposition::WorkspaceHalted
+        | QueueDisposition::AlreadyLanded => detail.map(str::to_string),
         _ => None,
     }
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if signature
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }

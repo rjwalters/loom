@@ -34,6 +34,8 @@ fn clear_env() {
         "LOOM_SWEEP_CONTAINER_RESERVED_MEMORY_MB",
         "LOOM_SWEEP_CLAIM_OWNED",
         "CARGO_TARGET_DIR",
+        "CARGO_PROFILE_DEV_DEBUG",
+        "CARGO_PROFILE_TEST_DEBUG",
         "KIMI_CODE_HOME",
         "KIMI_MODEL_API_KEY",
         "LOOM_NATIVE_CONTAINMENT",
@@ -494,6 +496,57 @@ fn a_cargo_cache_inside_the_workspace_is_not_mounted_twice() {
 }
 
 #[test]
+fn a_host_set_debuginfo_choice_is_forwarded_by_name_into_the_container() {
+    // #11190: the in-container seam keeps a CARGO_PROFILE_*_DEBUG it sees as
+    // ambient. If the passthrough dropped the host's value, that seam would
+    // inject its line-tables-only default over the operator's own choice.
+    let _g = env_lock();
+    clear_env();
+    std::env::set_var("LOOM_TEST_ASSUME_DOCKER", "1");
+    std::env::set_var("CARGO_PROFILE_DEV_DEBUG", "full");
+    std::env::set_var("CARGO_PROFILE_TEST_DEBUG", "full");
+    let args = build(&profile(None, Some("1g")), &[]);
+    for name in ["CARGO_PROFILE_DEV_DEBUG", "CARGO_PROFILE_TEST_DEBUG"] {
+        assert!(
+            args.windows(2).any(|w| w[0] == "-e" && w[1] == name),
+            "{name} must be forwarded by name: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a.starts_with(&format!("{name}="))),
+            "{name} goes by name, so docker reads the host value as is: {args:?}"
+        );
+    }
+    clear_env();
+    std::env::remove_var("LOOM_TEST_ASSUME_DOCKER");
+}
+
+#[test]
+fn a_set_but_empty_debuginfo_variable_is_not_forwarded_into_the_container() {
+    // #11190: `-e NAME` would hand the container the host's EMPTY value, and
+    // cargo fails every build on `CARGO_PROFILE_DEV_DEBUG=` rather than
+    // reading it as unset. A non-empty sibling is still forwarded.
+    let _g = env_lock();
+    clear_env();
+    std::env::set_var("LOOM_TEST_ASSUME_DOCKER", "1");
+    std::env::set_var("CARGO_PROFILE_DEV_DEBUG", "");
+    std::env::set_var("CARGO_PROFILE_TEST_DEBUG", "full");
+    let args = build(&profile(None, Some("1g")), &[]);
+    assert!(
+        !args
+            .iter()
+            .any(|a| a.starts_with("CARGO_PROFILE_DEV_DEBUG")),
+        "an empty value must not be forwarded, by name or by value: {args:?}"
+    );
+    assert!(
+        args.windows(2)
+            .any(|w| w[0] == "-e" && w[1] == "CARGO_PROFILE_TEST_DEBUG"),
+        "the non-empty one still goes by name: {args:?}"
+    );
+    clear_env();
+    std::env::remove_var("LOOM_TEST_ASSUME_DOCKER");
+}
+
+#[test]
 fn host_only_paths_are_not_forwarded_into_the_container() {
     assert!(!forwarded_by_name("LOOM_OPENCODE_BIN"));
     assert!(!forwarded_by_name("LOOM_PI_BIN"));
@@ -509,6 +562,8 @@ fn host_only_paths_are_not_forwarded_into_the_container() {
     assert!(forwarded_by_name("LOOM_WORK_ORIGIN"));
     assert!(forwarded_by_name("LOOM_SWEEP_CLAIM_OWNED"));
     assert!(forwarded_by_name("GH_TOKEN"));
+    assert!(forwarded_by_name("CARGO_PROFILE_DEV_DEBUG"));
+    assert!(forwarded_by_name("CARGO_PROFILE_TEST_DEBUG"));
 }
 
 #[test]
@@ -542,5 +597,74 @@ fn an_unbounded_cpu_axis_emits_no_flag_at_all() {
     let args = build(&profile(None, Some("1g")), &[]);
     assert!(!args.iter().any(|a| a == "--cpus"), "{args:?}");
     assert!(!args.iter().any(|a| a.starts_with("loom.dispatch.cpus")), "{args:?}");
+    std::env::remove_var("LOOM_TEST_ASSUME_DOCKER");
+}
+
+/// #10607: the agent `gh` front's sink (the daemon's) is named to the
+/// container, and its `contained/` subdirectory — never the whole sink — is
+/// mounted read-write there, so its rows outlive `--rm`.
+#[test]
+fn the_agent_front_sink_is_parity_mounted_read_write_and_named() {
+    let _g = env_lock();
+    clear_env();
+    std::env::set_var("LOOM_TEST_ASSUME_DOCKER", "1");
+    let host = tempfile::tempdir().unwrap();
+    let sink = host.path().join("loom-forge-call-stats");
+    crate::forge_call_stats::set_test_sink_dir(Some(sink.clone()));
+    let args = build(&profile(None, Some("1g")), &[]);
+    crate::forge_call_stats::set_test_sink_dir(None);
+    let spec = format!("{}/contained:{}", sink.display(), sink.display());
+    assert!(args.contains(&spec), "a read-write mount of contained/ only: {args:?}");
+    assert!(!args.contains(&format!("{0}:{0}", sink.display())), "never the whole sink");
+    let assign = format!("LOOM_FORGE_CALL_STATS_DIR={}", sink.display());
+    assert!(args.contains(&assign), "{args:?}");
+    assert!(sink.is_dir(), "created owner-only before docker could make it root-owned");
+    // Off: neither.
+    let args = build(&profile(None, Some("1g")), &[]);
+    std::env::remove_var("LOOM_TEST_ASSUME_DOCKER");
+    assert!(!args.iter().any(|a| a.contains("loom-forge-call-stats")), "{args:?}");
+}
+
+/// #10607 review S1, the containment path: the sink comes from the same
+/// variable it is mounted by, so an existing directory is only inspected.
+/// One that is not a sink — a private dir with a `.bashrc`, a 0755 home, a
+/// group-writable dir — is neither mounted nor assigned, and is left exactly
+/// as it was (no chmod, no purge of its files).
+#[cfg(unix)]
+#[test]
+fn a_sink_dir_that_is_not_a_sink_is_neither_mounted_nor_assigned_nor_changed() {
+    use std::os::unix::fs::PermissionsExt;
+    let _g = env_lock();
+    clear_env();
+    std::env::set_var("LOOM_TEST_ASSUME_DOCKER", "1");
+    let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    let cases: [(u32, &str); 3] = [
+        (0o700, ".bashrc"),
+        (0o755, ".profile"),
+        (0o770, "notes.txt"),
+    ];
+    for (dir_mode, file) in cases {
+        let home = tempfile::tempdir().unwrap();
+        let foreign = home.path().join(file);
+        std::fs::write(&foreign, "keep me").unwrap();
+        std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(dir_mode)).unwrap();
+        crate::forge_call_stats::set_test_sink_dir(Some(home.path().to_path_buf()));
+        let args = build(&profile(None, Some("1g")), &[]);
+        crate::forge_call_stats::set_test_sink_dir(None);
+        let d = home.path().display().to_string();
+        assert!(
+            !args.iter().any(|a| a.ends_with(&format!(":{d}"))),
+            "{dir_mode:o}: mounted {args:?}"
+        );
+        assert!(!home.path().join("contained").exists(), "{dir_mode:o}: created a subdir");
+        assert!(
+            !args
+                .iter()
+                .any(|a| a.starts_with("LOOM_FORGE_CALL_STATS_DIR=")),
+            "{dir_mode:o}: assigned {args:?}"
+        );
+        assert_eq!(mode(home.path()), dir_mode, "the refused directory's mode is untouched");
+        assert_eq!(std::fs::read_to_string(&foreign).unwrap(), "keep me", "{dir_mode:o}: purged");
+    }
     std::env::remove_var("LOOM_TEST_ASSUME_DOCKER");
 }

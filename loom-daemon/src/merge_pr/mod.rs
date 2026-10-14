@@ -75,6 +75,10 @@
 //! nothing pending". It answers only inside the forge contract and refuses
 //! the rest, which the shell treats as still pending.
 //!
+//! [`superseded_runs`] narrows that READ (#11097): when one push fired two
+//! runs of the same workflow on one head, the superseded twin's check-runs
+//! are dropped before classification, so its residue cannot fail a green tree.
+//!
 //! [`check_runs_streak`] is the OTHER classification the same poll loop makes
 //! on a FAILED fetch attempt (#6389, an #8191 slice): whether a confirmed
 //! HTTP 404 — both the attempt and its retry-once agreeing — has now repeated
@@ -159,6 +163,15 @@
 //! irreversible steps (`git worktree remove --force`, `git branch -D`). The
 //! `git` invocation itself stays in the shell; only the parse moved.
 //!
+//! [`worktree_teardown`] is the step every cleanup guard here exists to
+//! protect: the `git worktree remove --force` itself, with #6372's single
+//! prune-and-retry and its failure diagnosis. It fails toward removing
+//! nothing, like every guard in front of it.
+//!
+//! [`usage`] is `merge-pr.sh --help`'s text — the option list and the
+//! exit-code table role prompts branch on — byte-frozen against the retired
+//! `show_help` heredoc. Pure data; it fails open to a one-line usage.
+//!
 //! [`issue_close_gate`] is [`worktrees`]'s neighbour at the same post-merge
 //! choke point, one level up: whether the issue a worktree/branch belongs to
 //! is actually finished, so the async-close-race guard (#4186) does not
@@ -235,33 +248,62 @@
 //! `branch_has_landed`'s verdict (#7812) are both already answered by the
 //! caller and passed in; this module owns only the two-input decision and its
 //! byte-frozen message text, consolidating three copies into one.
+//!
+//! [`retarget_children`] is not a port — it is #9372's gate in front of the
+//! post-merge remote-branch delete: a bare ref delete makes GitHub CLOSE every
+//! open PR based on that branch (unrecoverably), so each open child is
+//! retargeted onto the parent's base first, and the branch is kept whenever
+//! that cannot be confirmed.
+//!
+//! [`closed_by_merge`] is not a port either, and `merge-pr.sh` does not call
+//! it: it answers "did THIS merge close the issue?" for Champion Step 4's
+//! negated-reference reopen (#8942), which used to undo any close it found.
+
+//! [`pr_state`] is the gate that opens the whole flow once the PR is fetched
+//! (#8191 slice): already merged (exit 0) versus closed unmerged (refuse)
+//! versus carry on. Merged wins over closed, since a merged PR also reads
+//! `state: closed`. The shell acts on a positively received verdict; a lost
+//! one falls back to the retired shell predicate (as `revalidate-head` does).
 
 pub mod check_runs_rollup;
 pub mod check_runs_streak;
 pub mod checks_failure;
+pub mod ci_result;
 pub mod cleanup_paths;
 pub mod closed_building;
+pub mod closed_by_merge;
 pub mod consolidate;
 pub mod dirty_guard;
+pub mod discovered_worktree;
 pub mod head_sync;
 pub mod hold_state;
 pub mod issue_close_gate;
 pub mod labels;
 pub mod loom_pr_guard;
+pub mod merge_route;
 pub mod mergeable_recheck;
 pub mod partial_comment;
 pub mod partial_conflict;
 pub mod partial_reset;
+pub mod poll_wait;
+pub mod pr_state;
 pub mod reconcile;
 pub mod redate;
 pub mod refs;
 pub mod remove_gate;
 pub mod response;
+pub mod retarget_children;
+pub mod retries_used;
+pub mod revalidate_head;
 pub mod sequence;
 pub mod stacked_children;
 pub mod stale_checks;
+pub mod superseded_runs;
 pub mod tree_checks;
+pub mod usage;
 pub mod version_policy;
+pub mod workflow_scope;
 pub mod worktree_preserve;
+pub mod worktree_teardown;
 pub mod worktrees;
 pub mod zero_checks;

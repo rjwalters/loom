@@ -2,7 +2,7 @@
 //! invisible to the gate, the same record from a trusted author must count,
 //! and an author the forge did not report is untrusted.
 
-use super::{strip_markers, trusted_inputs};
+use super::{parse_graphql_comments, strip_markers, trusted_inputs};
 use crate::comment_trust::TrustPolicy;
 use crate::forge_identity::FleetLogins;
 use crate::premise_check::record::last_chunk_with_marker;
@@ -119,4 +119,94 @@ fn strip_markers_removes_every_marker_line_and_nothing_else() {
     assert!(!out.contains("loom:premise-check"));
     assert!(last_chunk_with_marker(&[out.as_str()]).is_none());
     assert_eq!(strip_markers("no markers\nhere"), "no markers\nhere");
+}
+
+// ---------------------------------------------------------------------------
+// #10025: the GraphQL fallback for the comment/author reads must feed the
+// same trust filter, with GraphQL's author spelling (`__typename: "Bot"`,
+// bare login) judged exactly as the REST listing's `x[bot]`.
+// ---------------------------------------------------------------------------
+
+/// One `gh api graphql --paginate` page for an issue by `issue_author`.
+fn graphql_page(issue_author: &Value, comments: &[(Value, &str)]) -> String {
+    let nodes: Vec<Value> = comments
+        .iter()
+        .map(|(author, body)| {
+            let mut n = author.clone();
+            n["body"] = json!(body);
+            n
+        })
+        .collect();
+    let mut issue = issue_author.clone();
+    issue["comments"] =
+        json!({"pageInfo": {"hasNextPage": false, "endCursor": null}, "nodes": nodes});
+    json!({"data": {"repository": {"issue": issue}}}).to_string()
+}
+
+fn gql_fleet_app() -> Value {
+    json!({"author": {"login": "loom-fleet-dispatch", "__typename": "Bot"}, "authorAssociation": "NONE"})
+}
+
+fn gql_outsider() -> Value {
+    json!({"author": {"login": "drive-by", "__typename": "User"}, "authorAssociation": "CONTRIBUTOR"})
+}
+
+fn gql_owner() -> Value {
+    json!({"author": {"login": "rjwalters", "__typename": "User"}, "authorAssociation": "OWNER"})
+}
+
+fn gql_finds_record(stdout: &str, body: &str) -> bool {
+    let (listing, object) = parse_graphql_comments(stdout.as_bytes()).expect("parses");
+    finds_record(&listing, &object, body)
+}
+
+#[test]
+fn graphql_fallback_honours_trusted_and_ignores_untrusted_records() {
+    // The fleet App, as GraphQL spells it, and an insider: both count.
+    for author in [gql_fleet_app(), gql_owner()] {
+        let page = graphql_page(&gql_owner(), &[(author.clone(), MARKER)]);
+        assert!(gql_finds_record(&page, "prose"), "{author}");
+    }
+    // An outsider's well-formed record is invisible.
+    let page = graphql_page(&gql_owner(), &[(gql_outsider(), MARKER)]);
+    assert!(!gql_finds_record(&page, "prose"));
+    // A user who registered the App's bare slug is not the App.
+    let impostor = json!({"author": {"login": "loom-fleet-dispatch", "__typename": "User"}, "authorAssociation": "NONE"});
+    let page = graphql_page(&gql_owner(), &[(impostor, MARKER)]);
+    assert!(!gql_finds_record(&page, "prose"));
+    // A deleted (null) author is untrusted.
+    let ghost = json!({"author": null, "authorAssociation": "NONE"});
+    let page = graphql_page(&gql_owner(), &[(ghost, MARKER)]);
+    assert!(!gql_finds_record(&page, "prose"));
+}
+
+#[test]
+fn graphql_fallback_judges_the_body_author() {
+    let body = format!("prose\n{MARKER}\n");
+    assert!(gql_finds_record(&graphql_page(&gql_owner(), &[]), &body));
+    assert!(gql_finds_record(&graphql_page(&gql_fleet_app(), &[]), &body));
+    assert!(!gql_finds_record(&graphql_page(&gql_outsider(), &[]), &body));
+}
+
+#[test]
+fn graphql_fallback_concatenates_pages_and_rejects_errors() {
+    let first = graphql_page(&gql_owner(), &[(gql_outsider(), "old")]);
+    let second = graphql_page(&gql_owner(), &[(gql_fleet_app(), MARKER)]);
+    let (listing, _) = parse_graphql_comments(format!("{first}{second}").as_bytes()).unwrap();
+    let all: Vec<Value> = serde_json::from_slice(&listing).unwrap();
+    assert_eq!(all.len(), 2, "both pages' comments survive");
+    assert!(gql_finds_record(&format!("{first}\n{second}"), "prose"));
+
+    // No comments is a readable, empty listing — not "could not read".
+    let (listing, _) = parse_graphql_comments(graphql_page(&gql_owner(), &[]).as_bytes()).unwrap();
+    assert_eq!(listing, b"[]");
+
+    for bad in [
+        r#"{"errors":[{"message":"API rate limit already exceeded"}]}"#,
+        r#"{"data":{"repository":{"issue":null}}}"#,
+        "",
+        "not json",
+    ] {
+        assert!(parse_graphql_comments(bad.as_bytes()).is_none(), "{bad}");
+    }
 }
