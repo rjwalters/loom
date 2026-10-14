@@ -32,14 +32,17 @@ use super::pick_journal::{
 };
 use crate::forge_listing::RestIssue;
 use crate::role_runner::RoleTickOutcome;
+use crate::step_dispatch::item_draw::{DrawRecord, Exclusion, ITEM_DRAW_SEED_SCHEME};
 use crate::telemetry::kinds::pick_decision::{
     source, split_into_chunks, PickAction, PickCandidate, PickDecisionRecord, PickDraw,
-    PickDrawCandidate, PickLane, PickQueueSkip, PickSkipReason, PickSortKey, PickTick, PickVerdict,
-    PickViDemotion, PickWorkspaceDraw, CHUNK_BYTES, WORK_FINDER_ROLE,
+    PickDrawCandidate, PickItemDraw, PickItemDrawStep, PickItemExclusion, PickLane, PickQueueSkip,
+    PickSkipReason, PickSortKey, PickTick, PickVerdict, PickViDemotion, PickWorkspaceDraw,
+    CHUNK_BYTES, WORK_FINDER_ROLE,
 };
 use crate::telemetry::{RoleTickResult, TelemetryRecord};
 use crate::types::{QueueDisposition, WorkFinderTickSummary};
 use crate::work_finder::halt_cause::HaltCause;
+use crate::work_finder::step_item::Lane;
 use crate::work_finder::vi_cap::ViDemotion;
 use crate::work_finder::workspace_draw::{self, DrawLog};
 
@@ -311,6 +314,92 @@ pub fn workspace_draw_record(
         seed_scheme: log.seed_inputs.as_ref().map(|i| i.scheme.to_string()),
         seed_minute: log.seed_inputs.as_ref().map(|i| i.minute.to_string()),
         seed_host: log.seed_inputs.as_ref().map(|i| i.host.clone()),
+    }
+}
+
+/// One workspace's item draws (#11896), as [`item_draw_record`] reads them.
+#[derive(Debug, Clone, Copy)]
+pub struct ItemDrawWorkspace<'a> {
+    /// The forge slug: the `repo` the record names and the seed's
+    /// `workspace` input.
+    pub repo: &'a str,
+    /// [`Weighing::excluded`](crate::step_dispatch::item_draw::Weighing::excluded).
+    pub excluded: &'a std::collections::BTreeMap<Exclusion, usize>,
+    /// The draws taken, in order.
+    pub draws: &'a [DrawRecord],
+}
+
+/// The step engine's item draws for one tick (#11896) as `pick.decision`
+/// carries them: the `loom-draw/v2` seed inputs shared by every workspace,
+/// the weight-0 counts by reason and every draw's weight terms. `None` when
+/// no workspace was drawn.
+#[must_use]
+pub fn item_draw_record(
+    minute: u64,
+    host: &str,
+    tick_counter: u64,
+    workspaces: &[ItemDrawWorkspace<'_>],
+) -> Option<PickItemDraw> {
+    if workspaces.is_empty() {
+        return None;
+    }
+    let excluded = workspaces
+        .iter()
+        .flat_map(|w| {
+            w.excluded
+                .iter()
+                .map(|(&reason, &count)| PickItemExclusion {
+                    repo: w.repo.to_string(),
+                    reason: reason.as_str().to_string(),
+                    skip_reason: PickSkipReason::from_exclusion(reason),
+                    count,
+                })
+        })
+        .collect();
+    let draws: Vec<PickItemDrawStep> = workspaces
+        .iter()
+        .flat_map(|w| {
+            w.draws.iter().map(|d| {
+                let c = &d.picked;
+                PickItemDrawStep {
+                    repo: w.repo.to_string(),
+                    draw_index: d.draw_index,
+                    seed: d.seed.to_string(),
+                    pool_size: d.pool_size,
+                    total_weight: d.total_weight,
+                    roll: d.roll,
+                    number: c.target(),
+                    issue: c.item.issue,
+                    pr: c.item.pr,
+                    step: c.step.as_str().to_string(),
+                    weight: c.terms.weight,
+                    actionable: c.terms.actionable,
+                    priority: c.terms.priority,
+                    level: c.terms.level.as_str().to_string(),
+                    lane: lane_name(c.item.lane).to_string(),
+                    age_permille: c.terms.age_permille,
+                    age_minutes: c.terms.age_minutes,
+                    age_source: c.terms.age_source.as_str().to_string(),
+                }
+            })
+        })
+        .collect();
+    Some(PickItemDraw {
+        seed_scheme: ITEM_DRAW_SEED_SCHEME.to_string(),
+        seed_minute: minute.to_string(),
+        seed_host: host.to_string(),
+        tick_counter: tick_counter.to_string(),
+        draws_total: draws.len(),
+        excluded,
+        draws,
+    })
+}
+
+fn lane_name(lane: Lane) -> &'static str {
+    match lane {
+        Lane::Normal => "normal",
+        Lane::RedMain => "red_main",
+        Lane::Capability => "capability",
     }
 }
 
