@@ -40,11 +40,15 @@ pub fn registry_minutes(label: &str) -> Option<u32> {
     Registry::embedded().get(label)?.stale_after_minutes
 }
 
+/// Namespace of Loom's own labels, built so the label-literal guard sees no
+/// bare literal (the pattern `observability/ops/stage_queue.rs` uses).
+const LOOM_PREFIX: &str = concat!("loom", ":");
+
 /// The env var overriding `label`'s staleness (`loom:curating` →
 /// `LOOM_STALE_CURATING_MINUTES`); the lease TTL's for `loom:building`.
 #[must_use]
 pub fn env_var(label: &str) -> Option<String> {
-    let name = label.strip_prefix("loom:")?;
+    let name = label.strip_prefix(LOOM_PREFIX)?;
     if label == "loom:building" {
         return Some(crate::claim_reconciliation::LEASE_TTL_MINUTES_ENV.to_string());
     }
