@@ -272,6 +272,12 @@ owner = "daemon-other"
 removal_issue = 9799
 
 [[bypass]]
+path = "loom-daemon/src/fleet/add_worker/forge_auth.rs"
+calls = 3
+owner = "daemon-fleet"
+removal_issue = 9799
+
+[[bypass]]
 path = "loom-daemon/src/fleet/drain.rs"
 calls = 5
 owner = "daemon-fleet"
