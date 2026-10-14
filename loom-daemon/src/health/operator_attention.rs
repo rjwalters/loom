@@ -105,7 +105,7 @@ pub fn assess_operator_attention(inputs: &HealthInputs) -> HealthSection {
     let mut conflicting_total: Option<usize> = None;
     let mut oldest_days: Option<i64> = None;
     let mut issues_total: Option<usize> = None;
-    // Champion's holds at `loom:pr` + `loom:blocked` (#11905): details only,
+    // Held approvals, `loom:pr` + `loom:blocked` by label (#11905): details only,
     // so the summary line and every existing key are unchanged.
     let mut champion_total: Option<usize> = None;
     let mut failed: Vec<String> = Vec::new();

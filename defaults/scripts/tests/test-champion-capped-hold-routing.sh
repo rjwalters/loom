@@ -95,6 +95,12 @@ else
     fail "the comment must open with the marker: $BODY"
 fi
 assert_contains "$BODY" 'remove both `loom:blocked` and `loom:operator` to release the hold' "names the release"
+FIRST=$(head -n 1 <<<"$OUT")
+if [[ "$FIRST" == "gh pr edit 42 --add-label loom:operator" ]]; then
+    pass "the label goes on before the comment (a failed label write leaves no marker)"
+else
+    fail "loom:operator must be added first, got: $FIRST"
+fi
 assert_lacks "$OUT" "loom:blocked" "never edits loom:blocked"
 
 echo "Test 3: the marker stands -> no comment, no label (idempotent)"

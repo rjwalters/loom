@@ -317,7 +317,7 @@ fn health_mask_fetches_every_read_axis_but_not_building() {
     );
 }
 
-/// #11905: Champion's holds at `loom:pr` + `loom:blocked` are counted beside
+/// #11905: held approvals (`loom:pr` + `loom:blocked`, any actor's park) are counted beside
 /// `operator_held`, never overlapping it, from the `loom:pr` listing
 /// `approved` already reads (one listing, no extra call).
 #[test]
@@ -362,4 +362,22 @@ fn champion_held_counts_held_approvals_without_overlapping_operator_held() {
     failed.fail("loom:pr");
     let snap = failed.source().fetch(failed.root());
     assert_eq!(snap.champion_held, None, "a failed read is never 0 held");
+}
+
+/// #11905 review: the full-page GraphQL fallback filters as the REST path
+/// does: any blocked-hold name (OR), every operator-hold name excluded.
+#[test]
+fn the_champion_held_fallback_matches_the_rest_filter() {
+    let q = super::champion_held_search_query();
+    assert!(q.contains("label:loom:pr "), "{q}");
+    let blocked = q
+        .split(' ')
+        .find(|t| t.starts_with("label:") && t.contains("loom:blocked"))
+        .unwrap_or_default();
+    assert!(blocked.contains("loom:needs-capability"), "{q}");
+    assert!(
+        q.contains("-label:loom:operator ") || q.ends_with("-label:loom:operator"),
+        "{q}"
+    );
+    assert!(q.contains("-label:loom:operator-only"), "{q}");
 }

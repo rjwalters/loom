@@ -182,7 +182,7 @@ fn a_many_repo_sample_survives_the_per_record_bound() {
     );
 }
 
-/// #11905: Champion's holds at `loom:pr` + `loom:blocked` are their own
+/// #11905: held approvals (`loom:pr` + `loom:blocked`, by label) are their own
 /// state, so they stay visible once they leave `loom:operator`; an
 /// operator-held approval is not counted twice.
 #[test]

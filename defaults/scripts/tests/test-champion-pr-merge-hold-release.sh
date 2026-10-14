@@ -270,6 +270,10 @@ FIX_COMMENTS="[$HOLD_COMMENT, $REC_COMMENT]"
 FIX_EVENTS=$(UNLABELED=loom:operator unlabeled_event "2026-10-10T12:00:00Z")
 OUT=$(run_precheck)
 assert_contains "$OUT" "BLOCKED=true PRIOR=true MANUAL=false" "the inbox clearing is not release (e)"
+assert_contains "$OUT" "PARK park-record apply --pr 10280 --reason champion merge-risk hold --by champion" "the missing loom:blocked is repaired instead"
+FIX_EVENTS=$(unlabeled_event "2026-10-10T12:00:00Z")
+OUT=$(run_precheck)
+assert_contains "$OUT" "MANUAL=true" "a human loom:blocked removal still releases after the recommendation"
 FIX_EVENTS=$(UNLABELED=loom:operator unlabeled_event "2026-10-10T03:00:00Z")
 OUT=$(run_precheck)
 assert_contains "$OUT" "MANUAL=true" "a loom:operator removal before the recommendation still releases"
