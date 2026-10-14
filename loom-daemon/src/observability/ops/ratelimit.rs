@@ -608,6 +608,8 @@ pub async fn record(workspace_root: &Path) {
     let _ = tokio::task::spawn_blocking(move || crate::forge_call_stats::ingest::tick(now_s)).await;
     emit_chunked(sink, super::forge_calls::drain_points(), since);
     sink.emit_metrics_since(super::forge_calls::drain_event_points(), since);
+    // 2am#4367 P5: mirror reads, delivered changes and wake latency.
+    sink.emit_metrics_since(super::forge_mirror::drain_points(), since);
     let root = workspace_root.to_path_buf();
     let sampled = tokio::task::spawn_blocking(move || {
         let host = probe_host(&root);

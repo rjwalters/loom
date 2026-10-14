@@ -103,14 +103,11 @@ pub fn fetch_queue(root: &Path, gh: &Path, role: PrRole) -> Result<Vec<Value>> {
         for row in &mut rows {
             if has_label(row, "loom:pr")
                 && !has_label(row, "loom:changes-requested")
-                && ![
-                    "loom:operator",
-                    "loom:operator-only",
-                    "loom:blocked",
-                    "loom:treating",
-                ]
-                .iter()
-                .any(|l| has_label(row, l))
+                && !crate::work_finder::OPERATOR_HOLD_NAMES
+                    .iter()
+                    .chain(crate::work_finder::PR_LANE_PARK_LABELS.iter())
+                    .chain(&["loom:treating"])
+                    .any(|l| has_label(row, l))
             {
                 let number = row["number"].as_u64().context("PR number missing")?;
                 row["mergeable"] = read(root, gh, ops::PR_VIEW_STATE, &format!("pulls/{number}"))?

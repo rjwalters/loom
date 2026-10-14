@@ -103,7 +103,15 @@ impl Default for Thresholds {
 /// Labels that park a PR out of any bundling consideration — the same
 /// "a human / a hold is involved" set the merge path already respects. A
 /// held PR is *counted* (it is queue depth) but is never a bundle candidate.
-pub const HOLD_LABELS: &[&str] = &["loom:operator", "loom:operator-only", "loom:blocked"];
+///
+/// Derived (#11795): `loom:operator` and `loom:blocked`, each with the
+/// retired names that fold into it.
+pub static HOLD_LABELS: crate::label_registry::LabelSet =
+    crate::label_registry::LabelSet::new(|| {
+        let mut v = crate::work_finder::OPERATOR_HOLD_NAMES.to_vec();
+        v.extend(crate::work_finder::BLOCKED_HOLD_NAMES.iter().copied());
+        v
+    });
 
 /// One queued (approved) PR, as far as Phase 1 needs to know it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

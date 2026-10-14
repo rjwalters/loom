@@ -123,9 +123,20 @@ fn push_unique(v: &mut Vec<String>, s: &str) {
     }
 }
 
+/// `label` with a retired name read as its replacement (#11795): an
+/// `--also-label loom:operator-only` from a not-yet-updated caller adds
+/// `loom:operator`, never a retired name. A retired label with no replacement
+/// maps to `""`, which `push_unique` drops.
+fn current_name(label: &str) -> &str {
+    match crate::label_registry::Registry::embedded().get_retired(label) {
+        Some(r) => r.replaced_by.as_deref().unwrap_or(""),
+        None => label,
+    }
+}
+
 /// `apply`. Refuses before ANY forge call when the input is invalid; writes
 /// the body before applying any label, so a failed body edit never leaves a
-/// `loom:operator-decision` label on a free-prose body.
+/// `loom:operator` decision label on a free-prose body.
 pub fn apply(
     forge: &mut dyn Forge,
     input: &str,
@@ -139,7 +150,7 @@ pub fn apply(
     };
     let mut wanted = vec![DECISION_LABEL.to_string()];
     for l in &req.also_labels {
-        push_unique(&mut wanted, l);
+        push_unique(&mut wanted, current_name(l.trim()));
     }
 
     match &req.target {

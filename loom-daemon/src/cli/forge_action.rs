@@ -360,7 +360,7 @@ pub(crate) enum ForgeAction {
         audit_comment: bool,
 
         /// The explicit-hold label found on the PR (`loom:operator`,
-        /// `loom:blocked`, `loom:operator-only`), if any. Shapes the audit
+        /// `loom:blocked`, or a retired hold name), if any. Shapes the audit
         /// comment's wording only — it never suppresses the disarm, which can
         /// only prevent a merge and therefore enforces a hold rather than
         /// undoing it. An empty value means "not held".

@@ -27,8 +27,8 @@ pub(super) const MAX_DEPENDENCY_READS: usize = 50;
 pub(crate) enum ParkKind {
     /// Remaining work is blocked on other issues: `loom:blocked`.
     Blocked,
-    /// Remaining work is a human gate (or we cannot tell):
-    /// `loom:operator-only` + `loom:operator-decision`.
+    /// Remaining work is a human gate (or we cannot tell): `loom:operator`
+    /// (#11795; before it, `loom:operator-only` + `loom:operator-decision`).
     HumanGate,
 }
 
@@ -37,7 +37,21 @@ impl ParkKind {
     pub(super) fn labels(self) -> &'static [&'static str] {
         match self {
             Self::Blocked => &["loom:blocked"],
-            Self::HumanGate => &["loom:operator-only", "loom:operator-decision"],
+            Self::HumanGate => &[crate::work_finder::OPERATOR_HOLD_LABEL],
+        }
+    }
+
+    /// Labels a lift of this park removes: [`Self::labels`] plus the names an
+    /// older daemon applied for the same park (#11795), so a hold recorded
+    /// before the fold still lifts cleanly. Callers remove only those present.
+    pub(super) fn lift_labels(self) -> &'static [&'static str] {
+        match self {
+            Self::Blocked => self.labels(),
+            Self::HumanGate => &[
+                crate::work_finder::OPERATOR_HOLD_LABEL,
+                "loom:operator-only",
+                "loom:operator-decision",
+            ],
         }
     }
 

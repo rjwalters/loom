@@ -106,159 +106,14 @@ pub const CHECK_INTERVAL: Duration = Duration::from_secs(60);
 /// never be committed, even by a stale install (#7818).
 pub const DIR_NAME: &str = "gh-config-gateway";
 
-/// Where an owner's key is read from. Holds a location, never a key.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum KeyRef {
-    /// `ssm://<parameter>`.
-    Ssm(String),
-    /// `file:<path>`.
-    File(PathBuf),
-}
-
-impl KeyRef {
-    /// Parse `ssm://<parameter>` or `file:<path>`.
-    ///
-    /// # Errors
-    ///
-    /// Any other shape, or an empty location.
-    pub fn parse(spec: &str) -> Result<Self, String> {
-        let spec = spec.trim();
-        if let Some(p) = spec.strip_prefix("ssm://") {
-            let p = p.trim();
-            return if p.is_empty() {
-                Err("ssm:// needs a parameter name".into())
-            } else {
-                Ok(Self::Ssm(p.to_string()))
-            };
-        }
-        if let Some(p) = spec.strip_prefix("file:") {
-            let p = p.trim();
-            return if p.is_empty() {
-                Err("file: needs a path".into())
-            } else {
-                Ok(Self::File(PathBuf::from(p)))
-            };
-        }
-        Err("use file:<path> or ssm://<parameter>".into())
-    }
-
-    /// Read the key. The error names the source, never the value.
-    ///
-    /// # Errors
-    ///
-    /// When the source cannot be read, or holds no plausible key.
-    pub fn read(&self, region: Option<&str>) -> Result<String, String> {
-        use crate::telemetry_join::{credential_source, Credential, CredentialSpec};
-        let fetched = match self {
-            Self::Ssm(p) => {
-                // An explicit region always: a daemon's environment often
-                // has none, and the AWS CLI would then fail or guess.
-                let region = region.ok_or_else(|| {
-                    format!(
-                        "an ssm:// key ref needs a region: set {CONFIG_KEY}.region, or \
-                         AWS_REGION / AWS_DEFAULT_REGION in the daemon's environment"
-                    )
-                })?;
-                ssm_get(p, region)?
-            }
-            Self::File(p) => {
-                match credential_source(&CredentialSpec::File { path: p.clone() }, None)
-                    .credential()
-                {
-                    Ok(Credential::Bearer(key)) => key,
-                    Ok(_) => {
-                        return Err("the source does not hold a single-line gateway key".into())
-                    }
-                    Err(e) => return Err(e.to_string()),
-                }
-            }
-        };
-        if valid_key(&fetched) {
-            Ok(fetched)
-        } else {
-            Err("the source does not hold a single-line gateway key".into())
-        }
-    }
-}
-
-/// `aws ssm get-parameter` for `parameter` in `region`, decrypted. Only the
-/// parameter's name and the region are on the command line, never a value;
-/// an error names the parameter and the exit, never the output.
-fn ssm_get(parameter: &str, region: &str) -> Result<String, String> {
-    let mut cmd = std::process::Command::new("aws");
-    cmd.args(ssm_args(parameter, region))
-        .stdin(std::process::Stdio::null());
-    match crate::proc_exec::run_bounded(cmd, SSM_TIMEOUT) {
-        Ok(crate::proc_exec::Completion::Exited(out)) if out.status.success() => {
-            Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-        }
-        Ok(crate::proc_exec::Completion::Exited(out)) => Err(format!(
-            "aws ssm get-parameter {parameter} ({region}) exited {}",
-            out.status.code().unwrap_or(-1)
-        )),
-        Ok(_) => Err(format!("aws ssm get-parameter {parameter} ({region}) timed out")),
-        Err(e) => Err(format!("aws ssm get-parameter {parameter}: {e}")),
-    }
-}
-
-/// The `aws` argv of [`ssm_get`].
-#[must_use]
-pub fn ssm_args(parameter: &str, region: &str) -> Vec<String> {
-    [
-        "ssm",
-        "get-parameter",
-        "--name",
-        parameter,
-        "--with-decryption",
-        "--region",
-        region,
-        "--query",
-        "Parameter.Value",
-        "--output",
-        "text",
-    ]
-    .iter()
-    .map(|s| (*s).to_string())
-    .collect()
-}
-
-/// Deadline for one SSM read.
-const SSM_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// The region an `ssm://` ref is read in: `forge.gateway.region`, else
-/// `AWS_REGION`, else `AWS_DEFAULT_REGION` (the AWS CLI's own order), each
-/// only when it is a plausible region name. `None` refuses `ssm://` refs.
-#[must_use]
-pub fn resolve_region(
-    configured: Option<&str>,
-    env: &dyn Fn(&str) -> Option<String>,
-) -> Option<String> {
-    configured
-        .map(str::to_string)
-        .or_else(|| env("AWS_REGION"))
-        .or_else(|| env("AWS_DEFAULT_REGION"))
-        .map(|r| r.trim().to_string())
-        .filter(|r| valid_region(r))
-}
-
-/// `us-east-1`-shaped: lowercase letters, digits and dashes.
-#[must_use]
-pub fn valid_region(r: &str) -> bool {
-    (4..=32).contains(&r.len())
-        && r.contains('-')
-        && r.bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-}
-
-/// A key is one token of URL-safe characters: anything else could not be
-/// written into `hosts.yml` as-is.
-#[must_use]
-pub fn valid_key(key: &str) -> bool {
-    (16..=512).contains(&key.len())
-        && key
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"-_.~+/=".contains(&b))
-}
+// The key ref and the SSM read are shared with `forge.mirror`
+// (crate::key_ref, crate::aws_ssm); re-exported so this module's callers and
+// tests keep their paths.
+pub use crate::aws_ssm::{
+    first_line, parse_aws_profile, resolve_region, ssm_args, ssm_command, valid_aws_profile,
+    valid_region, AwsAccess, AwsProfile, AWS_IDENTITY_ENV,
+};
+pub use crate::key_ref::{valid_key, KeyRef};
 
 /// `forge.gateway`, validated.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -270,13 +125,18 @@ pub struct GatewayConfig {
     /// `forge.gateway.region`: the AWS region `ssm://` refs are read in,
     /// when set (else the environment's, [`resolve_region`]).
     pub region: Option<String>,
+    /// `forge.gateway.awsProfile`: a named profile for `ssm://` reads, for
+    /// a host whose relay-key grant is not its instance role. Unset, the
+    /// read runs as the instance role; invalid, `ssm://` refs are refused
+    /// ([`crate::aws_ssm`]).
+    pub aws_profile: AwsProfile,
 }
 
 impl GatewayConfig {
     /// A stable digest of what the profiles depend on, keys excluded.
     #[must_use]
     pub fn fingerprint(&self) -> String {
-        format!("{}|{:?}|{:?}", self.api_host, self.key_refs, self.region)
+        format!("{}|{:?}|{:?}|{:?}", self.api_host, self.key_refs, self.region, self.aws_profile)
     }
 }
 
@@ -288,27 +148,7 @@ impl GatewayConfig {
 ///
 /// A reason the origin is refused.
 pub fn api_host_of(origin: &str) -> Result<String, String> {
-    let o = origin.trim();
-    let host = match o.split_once("://") {
-        Some(("https", rest)) => rest,
-        Some((scheme, _)) => return Err(format!("origin must be https, not {scheme}")),
-        None => o,
-    };
-    let host = host.strip_suffix('/').unwrap_or(host).to_ascii_lowercase();
-    // `github.com.` is GitHub too: compare and store without the root dot.
-    let host = host.strip_suffix('.').unwrap_or(&host).to_string();
-    let ok = host.contains('.')
-        && !host.starts_with(['.', '-'])
-        && host
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-');
-    if !ok {
-        return Err("origin must be a bare host name or https://<host>".into());
-    }
-    if host == "github.com" || host.ends_with(".github.com") {
-        return Err("origin must be the gateway, not GitHub".into());
-    }
-    Ok(host)
+    crate::key_ref::https_host(origin, "the gateway")
 }
 
 /// Parse `forge.gateway` from the effective config. `None` when it is
@@ -374,11 +214,13 @@ pub fn parse(effective: &Value) -> (Option<GatewayConfig>, Vec<String>) {
             None
         }
     };
+    let aws_profile = parse_aws_profile(block, CONFIG_KEY, &mut warnings);
     (
         Some(GatewayConfig {
             api_host,
             key_refs,
             region,
+            aws_profile,
         }),
         warnings,
     )

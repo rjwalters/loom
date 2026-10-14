@@ -1007,12 +1007,12 @@ impl SweepRegistry {
     /// [`PARK_LABELS`]: crate::work_finder::PARK_LABELS
     pub(crate) fn first_park_label_in(&self, issue: u32, labels: &[String]) -> Option<String> {
         // `PARK_LABELS` order, not forge order, so the refusal is deterministic
-        // when an issue carries both. `loom:blocked` sorts first, so an item
-        // carrying it never reaches the exemption below.
+        // when an issue carries both. `loom:blocked` sorts first, and the
+        // exemption itself vetoes every non-operator park.
         let park = crate::work_finder::PARK_LABELS
             .iter()
             .find(|park| labels.iter().any(|l| l == *park))?;
-        if **park == *crate::capability::OPERATOR_ONLY_LABEL
+        if crate::work_finder::OPERATOR_HOLD_NAMES.contains(park)
             && self.mechanical_capability_exempt(issue, labels)
         {
             return None;
@@ -1020,10 +1020,11 @@ impl SweepRegistry {
         Some((*park).to_string())
     }
 
-    /// True when `issue` is a `loom:operator-mechanical` item whose declared
+    /// True when `issue` is a mechanical operator hold whose declared
     /// `<!-- loom:capability=<name> -->` requirements (#6892) are **fully** held
-    /// by this host, and it may therefore be dispatched into the propose-mode
-    /// lane instead of parked by `loom:operator-only` (#6893, AC1).
+    /// by this host and whose body carries no decision block, so it may be
+    /// dispatched into the propose-mode lane instead of parked by
+    /// `loom:operator` (#6893, AC1; re-keyed on the body by #11795).
     ///
     /// Fails closed at every step, in this order — each `false` leaves the park
     /// in force:
@@ -1031,24 +1032,25 @@ impl SweepRegistry {
     /// 1. **This host declared no capabilities** (the default: no
     ///    `LOOM_WORKER_CAPABILITIES`). Checked first and cheapest, so the common
     ///    path costs one `BTreeSet::is_empty` and **zero extra forge calls**.
-    /// 2. **The labels are not the mechanical shape** — the other three
-    ///    `loom:operator-only` sub-kinds, `loom:blocked`, `loom:needs-capability`
-    ///    and `loom:operator` are all refused here, from the labels this guard
-    ///    already fetched. Still no extra forge call.
+    /// 2. **The labels are not the lane's shape** — no operator hold, or a
+    ///    veto beside it (`loom:blocked` under any name, `loom:frozen`, a
+    ///    decision by label), refused from the labels this guard already
+    ///    fetched. Still no extra forge call.
     /// 3. **The body could not be read** — a `gh` failure/timeout means we could
     ///    not see the declaration, and an unreadable declaration is treated
     ///    exactly like an absent one. Note this is the *opposite* of the
     ///    surrounding guard's fail-**open** convention, and deliberately so: for
     ///    the guard, failing open means "dispatch normally"; here, failing open
     ///    would mean "override a human's park on a hunch."
-    /// 4. **The declaration is empty, unrecognized, or not fully held** — see
+    /// 4. **The body carries a decision block, or the declaration is empty,
+    ///    unrecognized, or not fully held** — see
     ///    [`crate::capability::route_mechanical`].
     ///
     /// The body read (step 3) is a second REST call on the same endpoint as
     /// [`current_labels_via_rest`](Self::current_labels_via_rest), reached only
     /// by items that already passed steps 1 and 2 — i.e. essentially never,
-    /// unless a host has opted into the lane *and* is looking at a mechanical
-    /// item.
+    /// unless a host has opted into the lane *and* is looking at an operator
+    /// hold.
     fn mechanical_capability_exempt(&self, issue: u32, labels: &[String]) -> bool {
         let held = crate::capability::held_capabilities();
         if held.is_empty() || !crate::capability::labels_eligible_for_capability_lane(labels) {
@@ -1057,14 +1059,14 @@ impl SweepRegistry {
         let Some(body) = self.issue_body_via_rest(issue) else {
             log::info!(
                 "issue #{issue}: could not read the body to check its capability declaration; \
-                 keeping the `loom:operator-only` park (#6893 fails closed)"
+                 keeping the `loom:operator` park (#6893 fails closed)"
             );
             return false;
         };
         let routing = crate::capability::route_mechanical(labels, Some(&body), &held);
         if routing.is_dispatchable() {
             log::info!(
-                "issue #{issue}: `loom:operator-mechanical` capability declaration is satisfied by \
+                "issue #{issue}: the operator hold's capability declaration is satisfied by \
                  this host; dispatching into the PROPOSE-ONLY lane (#6893 AC4 — the worker \
                  produces commands/a PR for an operator to approve, never live execution)"
             );
@@ -1072,8 +1074,8 @@ impl SweepRegistry {
         }
         if let crate::capability::MechanicalRouting::MissingCapabilities { missing } = &routing {
             log::info!(
-                "issue #{issue}: `loom:operator-mechanical` declares capability/ies this host does \
-                 not hold ({}); keeping the `loom:operator-only` park (#6893)",
+                "issue #{issue}: the operator hold declares capability/ies this host does \
+                 not hold ({}); keeping the `loom:operator` park (#6893)",
                 missing.join(", ")
             );
         }

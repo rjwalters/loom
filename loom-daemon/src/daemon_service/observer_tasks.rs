@@ -38,6 +38,10 @@ pub struct ObserverHandles {
     /// Feed poll loop, `None` when the forge event feed is off or
     /// unprovisioned (ADR-0021, #8765).
     pub forge_events: Option<tokio::task::JoinHandle<()>>,
+    /// The GitHub state mirror's task (2am#4367 P5): re-reads `forge.mirror`
+    /// every minute, publishes the live mirror for the discovery reads and
+    /// pulls its change stream as wakes. Only reads config while unset.
+    pub forge_mirror: tokio::task::JoinHandle<()>,
     /// Codex session-container watch (#10455): always on, independent of
     /// telemetry, so a down container is WARNed on every host. Zero docker
     /// calls on a host with no session-managed Codex account.
@@ -63,7 +67,7 @@ pub fn spawn(
         workspace_root.to_path_buf(),
         bus,
         Instant::now(),
-        workspace_pool,
+        workspace_pool.clone(),
     );
     // OTLP-export health (#11353): evaluate once at start so a host with no
     // OTLP exporter says so immediately, even when no collector runs to
@@ -81,6 +85,15 @@ pub fn spawn(
     let forge_events_config = forge_events::read_config(workspace_root);
     let forge_events = forge_events::spawn_task(&forge_events_config, bus);
 
+    // GitHub state mirror (2am#4367 P5): discovery reads and change-stream
+    // wakes. Inert (config re-reads only) while `forge.mirror` is unset; a
+    // wake is a `forge.event` prompt the armed early-tick consumers act on.
+    let forge_mirror = loom_daemon::forge_mirror::wake::spawn(
+        workspace_root.to_path_buf(),
+        bus.clone(),
+        workspace_pool.clone(),
+    );
+
     // Codex session-container watch (#10455). Observe-only like the two
     // above: it logs, publishes a snapshot and feeds the gauge; it changes no
     // dispatch path. Selection reads what it publishes (#10660), so mark this
@@ -92,6 +105,7 @@ pub fn spawn(
     ObserverHandles {
         observability,
         forge_events,
+        forge_mirror,
         codex_session,
     }
 }

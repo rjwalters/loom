@@ -59,7 +59,7 @@ pub trait Deps {
     /// # Errors
     ///
     /// A reason that never contains the key.
-    fn read_key(&self, r: &KeyRef, region: Option<&str>) -> Result<String, String>;
+    fn read_key(&self, r: &KeyRef, aws: &super::AwsAccess<'_>) -> Result<String, String>;
 }
 
 struct RealDeps;
@@ -93,8 +93,8 @@ impl Deps for RealDeps {
         Some((path, v))
     }
 
-    fn read_key(&self, r: &KeyRef, region: Option<&str>) -> Result<String, String> {
-        r.read(region)
+    fn read_key(&self, r: &KeyRef, aws: &super::AwsAccess<'_>) -> Result<String, String> {
+        r.read(aws, super::CONFIG_KEY)
     }
 }
 
@@ -234,9 +234,13 @@ impl Refresher {
         let region = super::resolve_region(cfg.region.as_deref(), &|k| {
             std::env::var(k).ok().filter(|v| !v.is_empty())
         });
+        let aws = super::AwsAccess {
+            region: region.as_deref(),
+            profile: &cfg.aws_profile,
+        };
         for (owner, r) in &cfg.key_refs {
             let dir = base.join(owner);
-            let result = deps.read_key(r, region.as_deref()).and_then(|key| {
+            let result = deps.read_key(r, &aws).and_then(|key| {
                 publish_profile(&dir, &key, &cfg.api_host).map_err(|e| e.to_string())
             });
             match result {
