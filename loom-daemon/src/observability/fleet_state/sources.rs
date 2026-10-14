@@ -272,22 +272,17 @@ fn curated_listing_with(
 /// One repo's open `label` issues: number to creation instant.
 type LabelListing = BTreeMap<u32, Option<DateTime<Utc>>>;
 
-/// Labels that take an open issue out of the eligible pending queue (#11955):
-/// the skip/park holds and the proposal labels.
-const INELIGIBLE_LABELS: [&str; 5] = [
-    "loom:skip",
-    "loom:park",
-    "loom:architect",
-    "loom:hermit",
-    "loom:auditor",
-];
-
 /// Whether an issue bearing `labels` counts toward the eligible pending
-/// queue depth (#11955). Pure.
+/// queue depth (#11955): it carries no skip/park label (the registry-derived
+/// [`crate::work_finder::SKIP_LABELS`], a superset of `PARK_LABELS`, so the
+/// holds under every name) and no proposal label
+/// ([`crate::premise_check::scope::PROPOSAL_LABELS`]). Pure.
 pub(super) fn is_eligible<S: AsRef<str>>(labels: &[S]) -> bool {
-    !labels
-        .iter()
-        .any(|l| INELIGIBLE_LABELS.contains(&l.as_ref()))
+    !labels.iter().any(|l| {
+        let l = l.as_ref();
+        crate::work_finder::SKIP_LABELS.contains(&l)
+            || crate::premise_check::scope::PROPOSAL_LABELS.contains(&l)
+    })
 }
 
 /// [`curated_listing_with`] for any issue label (`loom:triage`, #11398), plus

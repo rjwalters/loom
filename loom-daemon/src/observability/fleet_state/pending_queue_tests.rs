@@ -33,14 +33,20 @@ fn skip_park_and_proposal_labels_are_ineligible() {
     assert!(is_eligible(&["loom:curated", "loom:important"]));
     assert!(is_eligible::<&str>(&[]));
     for label in [
-        "loom:skip",
-        "loom:park",
+        "loom:blocked",
+        "loom:operator",
+        "loom:frozen",
+        "loom:operator-only",
+        "loom:epic",
         "loom:architect",
         "loom:hermit",
         "loom:auditor",
     ] {
         assert!(!is_eligible(&["loom:triage", label]), "{label}");
     }
+    // Not real Loom labels: only the registry's skip/park set counts.
+    assert!(is_eligible(&["loom:triage", "loom:skip"]));
+    assert!(is_eligible(&["loom:triage", "loom:park"]));
 }
 
 #[test]
