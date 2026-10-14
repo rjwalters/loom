@@ -542,7 +542,7 @@ fn verify_rendered_script_is_valid_shell() {
 }
 
 #[test]
-fn daemon_watchdog_step_reruns_loom_daemon_start_from_the_workspace_root() {
+fn daemon_watchdog_step_heals_only_from_the_workspace_root() {
     // #5343: the step must cd into the SAME workspace root `daemon-unit`
     // pinned as WorkingDirectory=, then re-run the already-cloned
     // loom-daemon-start.sh (never a second hand-rolled watchdog
@@ -553,8 +553,8 @@ fn daemon_watchdog_step_reruns_loom_daemon_start_from_the_workspace_root() {
         "daemon-watchdog must cd into the primary workspace root:\n{script}"
     );
     assert!(
-        script.contains("$HOME/.local/share/loom/defaults/scripts/cli/loom-daemon-start.sh"),
-        "daemon-watchdog must re-run the already-cloned loom-daemon-start.sh:\n{script}"
+        script.contains("/defaults/scripts/cli/loom-daemon-start.sh\" --heal-watchdog-only"),
+        "daemon-watchdog must run loom-daemon-start.sh --heal-watchdog-only (2am#4484):\n{script}"
     );
 }
 

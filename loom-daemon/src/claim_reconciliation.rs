@@ -421,6 +421,8 @@ pub fn resolve_stale_reviewing_minutes() -> f64 {
         .ok()
         .and_then(|s| s.parse::<f64>().ok())
         .filter(|v| *v > 0.0)
+        // #11898: the label registry's `stale_after_minutes` is the default.
+        .or_else(|| crate::claim_liveness::registry_minutes("loom:reviewing").map(f64::from))
         .unwrap_or(DEFAULT_STALE_REVIEWING_MINUTES)
 }
 
@@ -434,6 +436,7 @@ pub fn resolve_stale_treating_minutes() -> f64 {
         .ok()
         .and_then(|s| s.parse::<f64>().ok())
         .filter(|v| *v > 0.0)
+        .or_else(|| crate::claim_liveness::registry_minutes("loom:treating").map(f64::from))
         .unwrap_or(DEFAULT_STALE_TREATING_MINUTES)
 }
 

@@ -149,6 +149,8 @@ pub mod capacity;
 pub mod cargo_target_guard;
 pub mod champion_hold;
 pub mod ci_telemetry;
+/// Claim liveness from the label registry's `stale_after_minutes` (#11898).
+pub mod claim_liveness;
 pub mod claim_reconciliation;
 pub mod classify_error;
 pub mod cmd_out;

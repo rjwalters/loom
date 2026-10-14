@@ -75,6 +75,12 @@ impl Sampler {
                 sweep_id,
                 ..
             } => (*issue, Some(sweep_id)),
+            // A step's identity is sampled from the registry (`sample`), not
+            // replayed from a dispatch event: it has no lifecycle row (#11898).
+            Event::SweepGlobalDispatch {
+                kind: SweepKind::Step { .. } | SweepKind::PrSet(_),
+                ..
+            } => return,
             Event::SweepPhase { issue, .. } => (*issue, None),
             _ => return,
         };

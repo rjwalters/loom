@@ -103,3 +103,143 @@ fn a_live_step_occupies_its_item_and_is_excluded_from_sweep_restarts() {
     assert_eq!(reg.watchdog_once(Duration::ZERO), 0);
     assert_eq!(reg.review_stall_watchdog_once(Duration::ZERO), 0);
 }
+
+/// M7: the step's own dispatch label, stamped up to a clock skew after the
+/// step's local start, is not another claimant's; a label well after it is.
+#[test]
+fn the_builder_label_check_tolerates_clock_skew() {
+    let start = Utc::now();
+    let own = start + chrono::Duration::seconds(45);
+    assert!(!label_reapplied_after(own, start));
+    assert!(!label_reapplied_after(start - chrono::Duration::seconds(3), start));
+    assert!(label_reapplied_after(start + chrono::Duration::minutes(5), start));
+}
+
+fn role_lease_row(id: u64, sweep: &str) -> String {
+    let at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    format!(
+        r#"{{"id":{id},"updated_at":"{at}","body":"<!-- loom:pr-lease role=judge host=h sweep={sweep} -->"}}"#
+    )
+}
+
+/// B1: a non-Builder step's claim is judged by the role-keyed lease's sweep
+/// identity, never by label time.
+#[test]
+fn a_judge_steps_claim_is_held_elsewhere_only_when_another_sweep_holds_the_lease() {
+    let dir = tempdir().unwrap();
+    let mine = "step-judge-21-1";
+    let reg = crate::sweep_registry::test_support::fixture_registry_with_lease_gh(
+        dir.path(),
+        &role_lease_row(5, mine),
+        0,
+    );
+    assert!(!reg.step_lease_held_elsewhere(21, StepRole::Judge, mine));
+    assert!(reg.step_lease_held_elsewhere(21, StepRole::Judge, "step-judge-21-0"));
+    // No live lease of the role on the item (a Doctor asking): not held.
+    assert!(!reg.step_lease_held_elsewhere(21, StepRole::Doctor, mine));
+
+    let dir = tempdir().unwrap();
+    let peer_first = format!("{}\n{}", role_lease_row(4, "peer"), role_lease_row(5, mine));
+    let reg = crate::sweep_registry::test_support::fixture_registry_with_lease_gh(
+        dir.path(),
+        &peer_first,
+        0,
+    );
+    assert!(
+        reg.step_lease_held_elsewhere(21, StepRole::Judge, mine),
+        "the earlier lease wins"
+    );
+
+    // Unreadable: fail-open, so the claim is restored.
+    let dir = tempdir().unwrap();
+    let reg =
+        crate::sweep_registry::test_support::fixture_registry_with_lease_gh(dir.path(), "", 1);
+    assert!(!reg.step_lease_held_elsewhere(21, StepRole::Judge, "anyone"));
+}
+
+/// Review item 5: a PR step's roll requeue gives back only its own claim. A
+/// peer that took the role's lease during the roll window keeps the PR.
+#[test]
+fn a_pr_step_requeue_after_a_roll_checks_the_claim_is_still_its_own() {
+    let mine = "step-doctor-22-1";
+    let dir = tempdir().unwrap();
+    let peer = format!(
+        "{}\n{}",
+        role_lease_row(3, "peer-doctor").replace("role=judge", "role=doctor"),
+        role_lease_row(5, mine).replace("role=judge", "role=doctor"),
+    );
+    let reg =
+        crate::sweep_registry::test_support::fixture_registry_with_lease_gh(dir.path(), &peer, 0);
+    assert!(reg
+        .roll_pr_step_claim_still_ours(22, StepRole::Doctor, mine)
+        .is_err());
+
+    let dir = tempdir().unwrap();
+    let own = role_lease_row(5, mine).replace("role=judge", "role=doctor");
+    let reg =
+        crate::sweep_registry::test_support::fixture_registry_with_lease_gh(dir.path(), &own, 0);
+    assert!(reg
+        .roll_pr_step_claim_still_ours(22, StepRole::Doctor, mine)
+        .is_ok());
+}
+
+/// A registry whose fake `gh` serves `lease_rows` for comment reads and
+/// appends every other call's arguments to the returned write log.
+fn registry_logging_writes(dir: &std::path::Path, lease_rows: &str) -> (SweepRegistry, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let log = dir.join("gh-calls.log");
+    let fake_gh = dir.join("fake-gh-logging.sh");
+    let script = format!(
+        "#!/usr/bin/env bash\n\
+         if [[ \"$1\" == \"repo\" && \"$2\" == \"view\" ]]; then printf 'rjwalters/loom\\n'; exit 0; fi\n\
+         if [[ \"$1\" == \"api\" && \"$*\" == *\"/comments\"* ]]; then printf '%s' '{rows}'; exit 0; fi\n\
+         printf '%s\\n' \"$*\" >> '{log}'\n\
+         exit 1\n",
+        rows = crate::comment_trust::records::with_fleet_author(lease_rows)
+            .replace('\'', "'\\''"),
+        log = log.display(),
+    );
+    std::fs::write(&fake_gh, script).unwrap();
+    std::fs::set_permissions(&fake_gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut reg = crate::sweep_registry::test_support::fixture_registry_with_lease_gh(dir, "", 0);
+    reg.config.gh_bin = Some(fake_gh);
+    (reg, log)
+}
+
+/// Judge blocker 1: a dead step's claim restored at startup is subject to the
+/// same held-elsewhere check as the reaper's. A live peer lease means no
+/// forge write; without one the restore does write.
+#[test]
+fn a_startup_restore_leaves_a_peer_held_claim_alone() {
+    let mine = "step-judge-31-1";
+    let dir = tempdir().unwrap();
+    let (mut reg, log) = registry_logging_writes(dir.path(), &role_lease_row(3, "peer-judge"));
+    reg.restore_dead_step_at_startup(31, StepRole::Judge, mine, Utc::now());
+    assert!(
+        std::fs::read_to_string(&log).unwrap_or_default().is_empty(),
+        "a live peer lease means nothing is written"
+    );
+
+    let dir = tempdir().unwrap();
+    let (mut reg, log) = registry_logging_writes(dir.path(), &role_lease_row(5, mine));
+    reg.restore_dead_step_at_startup(31, StepRole::Judge, mine, Utc::now());
+    assert!(
+        !std::fs::read_to_string(&log).unwrap_or_default().is_empty(),
+        "its own lease (or none) lets the restore write"
+    );
+}
+
+/// Should-fix: a PR step's own claim label lands after its start (the role
+/// prompt applies it), so the roll requeue judges by the lease alone.
+#[test]
+fn a_pr_step_roll_requeue_ignores_label_time() {
+    let mine = "step-doctor-23-1";
+    let dir = tempdir().unwrap();
+    let own = role_lease_row(5, mine).replace("role=judge", "role=doctor");
+    let reg =
+        crate::sweep_registry::test_support::fixture_registry_with_lease_gh(dir.path(), &own, 0);
+    // No lease-independent label read exists any more: the lease alone decides.
+    assert!(reg
+        .roll_pr_step_claim_still_ours(23, StepRole::Doctor, mine)
+        .is_ok());
+}

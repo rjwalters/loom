@@ -76,6 +76,9 @@ pub(crate) struct RenewLoopArgs {
     pub(crate) pr: u64,
     #[arg(long, value_enum)]
     pub(crate) role: Role,
+    /// The lease's step (#11898), when it names one.
+    #[arg(long)]
+    pub(crate) step: Option<loom_daemon::step_role::StepRole>,
     #[arg(long)]
     pub(crate) host: String,
     #[arg(long)]
@@ -201,7 +204,7 @@ pub(crate) fn decide(
     clocks: Clocks,
     owner_code: i32,
     pr_state: Option<&(bool, Vec<String>)>,
-    label: &str,
+    label: Option<&str>,
     misses: &mut u32,
 ) -> Step {
     if !watch_alive {
@@ -225,6 +228,11 @@ pub(crate) fn decide(
     if !open {
         return Step::Stop("the PR is closed");
     }
+    // A claim with no label (the Champion merge step, #11898) has no
+    // label-absence backstop: the session, the cap and the item's state stop it.
+    let Some(label) = label else {
+        return Step::Renew;
+    };
     if labels.iter().any(|l| l == label) {
         *misses = 0;
         return Step::Renew;
@@ -300,6 +308,7 @@ pub(crate) fn spawn(
     command
         .args(["lease", "pr", "renew-loop", &ctx.common.pr.to_string()])
         .args(["--role", ctx.me.role.as_str()])
+        .args(ctx.me.step.map(|s| format!("--step={s}")))
         .args(["--host", &ctx.me.host, "--sweep-id", &ctx.me.sweep])
         .args(["--comment-id", &comment_id.to_string()])
         .args(["--watch-pid", &watch_pid.to_string()])
@@ -363,6 +372,7 @@ pub(crate) fn run_loop(args: &RenewLoopArgs) {
         role: args.role,
         host: args.host.clone(),
         sweep: args.sweep_id.clone(),
+        step: args.step,
     };
     let say = |line: &str| note(&root, args.pr, args.role, line);
     let store = Store::from_env();
@@ -425,14 +435,8 @@ pub(crate) fn run_loop(args: &RenewLoopArgs) {
             since_renewal_secs: wall_secs(now, last_renewed),
             ttl_secs: u64::try_from(ttl.num_seconds()).unwrap_or(0),
         };
-        let mut step = decide(
-            watch_alive,
-            clocks,
-            owner_code,
-            state.as_ref(),
-            me.role.claim_label(),
-            &mut misses,
-        );
+        let mut step =
+            decide(watch_alive, clocks, owner_code, state.as_ref(), me.claim_label(), &mut misses);
         if step == Step::Renew {
             let rows = gh.read_rows(args.pr, &policy);
             let state = rows

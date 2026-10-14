@@ -133,6 +133,18 @@ impl StepRole {
             .find(|r| r.claim_label() == Some(label))
     }
 
+    /// The step and item a step's sweep id names (`step-<role>-<item>-<ts>`,
+    /// optionally `-r<n>` for a roll resume; `generate_sweep_id`). The kind
+    /// is recoverable from the id alone, so a lock's owner says whether its
+    /// holder is a step (#11898: startup adoption). Pure.
+    #[must_use]
+    pub fn parse_sweep_id(id: &str) -> Option<(StepRole, u32)> {
+        let mut parts = id.strip_prefix("step-")?.split('-');
+        let role = parts.next()?.parse().ok()?;
+        let item = parts.next()?.parse().ok()?;
+        Some((role, item))
+    }
+
     /// The `/loom:<role> <item>` prompt a fresh step session starts with.
     #[must_use]
     pub fn prompt(self, item: u32) -> String {

@@ -18,10 +18,35 @@
 use super::*;
 use crate::step_role::StepRole;
 
+/// Slack between a Builder step's locally recorded start and the forge's
+/// `labeled` time. GitHub stamps whole seconds and host clocks drift, so the
+/// claim label this step's own dispatch applied just before the spawn can
+/// read as up to a clock-skew later than the start. Only a label applied
+/// beyond the slack is another claimant's. (Slack in the other direction,
+/// `started_at - 60s`, would read the step's own label as foreign and leave
+/// every dead Builder step's claim stranded.)
+pub(crate) const LABEL_CLOCK_SKEW_SECS: i64 = 60;
+
+/// Whether a claim label stamped `labeled_at` was re-applied by another
+/// claimant after a step that started at `started_at`. Pure.
+#[must_use]
+pub(crate) fn label_reapplied_after(labeled_at: DateTime<Utc>, started_at: DateTime<Utc>) -> bool {
+    labeled_at > started_at + chrono::Duration::seconds(LABEL_CLOCK_SKEW_SECS)
+}
+
 impl SweepRegistry {
     /// Release a finished step's claim. Returns `true` when the claim is held
-    /// elsewhere (a newer local lock owner, or a claim label re-applied on the
-    /// forge after this step started), in which case no label is written.
+    /// elsewhere, in which case no label is written:
+    ///
+    /// - a newer local owner of the step's claim lock;
+    /// - for a Builder step, `loom:building` re-applied on the forge more than
+    ///   [`LABEL_CLOCK_SKEW_SECS`] after the step started (the issue sweep's
+    ///   cross-host check, with slack for the forge's whole-second stamps and
+    ///   host drift);
+    /// - for every other step, the role's earliest live lease on the item
+    ///   held by another sweep ([`Self::step_lease_held_elsewhere`]). The
+    ///   label is no evidence there: the daemon pre-takes only the role-keyed
+    ///   lease, and the role prompt applies the label itself, later.
     pub(crate) fn release_dead_step(
         &mut self,
         sweep_id: &str,
@@ -34,12 +59,8 @@ impl SweepRegistry {
         } else {
             self.release_lock_owned(item, sweep_id).retained()
         };
-        let held_elsewhere = retained
-            || (!self.config.skip_label_flip
-                && role.claim_label().is_some_and(|label| {
-                    self.fetch_label_applied_at(item, label)
-                        .is_some_and(|at| at > started_at)
-                }));
+        let held_elsewhere =
+            retained || self.step_claim_held_elsewhere(item, role, sweep_id, started_at);
         if held_elsewhere {
             log::info!(
                 "sweep_registry: {role} step {sweep_id} on #{item} ended, but its claim is held \
@@ -61,6 +82,64 @@ impl SweepRegistry {
             self.note_label_flip(item);
         }
         false
+    }
+
+    /// Whether another claimant holds a step's item on the forge (#11898), the
+    /// forge half of every step release (the reaper's, startup's, a roll
+    /// requeue's):
+    ///
+    /// - Builder: `loom:building` re-applied more than
+    ///   [`LABEL_CLOCK_SKEW_SECS`] after the step started;
+    /// - every other role: the role's earliest live lease held by another
+    ///   sweep. Its label is no evidence: the daemon pre-takes only the lease,
+    ///   and the role prompt applies the label itself, later.
+    ///
+    /// Fail-open (`false`) when the forge cannot answer, and with forge
+    /// writes off.
+    pub(crate) fn step_claim_held_elsewhere(
+        &self,
+        item: u32,
+        role: StepRole,
+        sweep_id: &str,
+        started_at: DateTime<Utc>,
+    ) -> bool {
+        if self.config.skip_label_flip {
+            return false;
+        }
+        match role {
+            StepRole::Builder => self
+                .fetch_label_applied_at(item, "loom:building")
+                .is_some_and(|at| label_reapplied_after(at, started_at)),
+            StepRole::Curator
+            | StepRole::ChampionPromote
+            | StepRole::Judge
+            | StepRole::Doctor
+            | StepRole::ChampionMerge => self.step_lease_held_elsewhere(item, role, sweep_id),
+        }
+    }
+
+    /// Whether a PR step's claim on `pr` is still the paused run `sweep_id`'s
+    /// to give back after a roll (#11898): no other sweep holds the role's
+    /// earliest live lease. A peer Judge or Doctor that claimed the PR during
+    /// the roll window keeps it. Decided by lease identity, never label time:
+    /// the role prompt applies `loom:reviewing` / `loom:treating` itself,
+    /// after the daemon's lease, so a label time would strand a normal step.
+    /// Builder steps never come here (they hold an issue, not a PR), so the
+    /// label-time path of the shared check, which needs a start time, is
+    /// never taken; `now` stands in for it.
+    ///
+    /// # Errors
+    /// Why the claim is no longer this run's.
+    pub(crate) fn roll_pr_step_claim_still_ours(
+        &self,
+        pr: u32,
+        role: StepRole,
+        sweep_id: &str,
+    ) -> std::result::Result<(), String> {
+        if self.step_claim_held_elsewhere(pr, role, sweep_id, Utc::now()) {
+            return Err(format!("another sweep holds the live {role} claim"));
+        }
+        Ok(())
     }
 
     /// The terminal transition of a step the reaper (or a cancel) found dead:

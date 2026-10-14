@@ -31,6 +31,7 @@ fn who(role: Role, sweep: &str) -> Identity {
         role,
         host: "host-a1b2c3d4".into(),
         sweep: sweep.into(),
+        step: None,
     }
 }
 
@@ -233,41 +234,44 @@ fn the_renewer_stops_and_skips_on_the_right_signals() {
     let ok = lease_renewer_exit_renew();
     let mut m = 0;
     assert_eq!(
-        decide(true, fresh(10, 100), ok, Some(&open), "loom:treating", &mut m),
+        decide(true, fresh(10, 100), ok, Some(&open), Some("loom:treating"), &mut m),
         Step::Renew
     );
     assert!(matches!(
-        decide(false, fresh(10, 100), ok, Some(&open), "loom:treating", &mut m),
+        decide(false, fresh(10, 100), ok, Some(&open), Some("loom:treating"), &mut m),
         Step::Stop(_)
     ));
     assert!(matches!(
-        decide(true, fresh(100, 100), ok, Some(&open), "loom:treating", &mut m),
+        decide(true, fresh(100, 100), ok, Some(&open), Some("loom:treating"), &mut m),
         Step::Stop(_)
     ));
     assert!(matches!(
-        decide(true, fresh(10, 100), 3, Some(&open), "loom:treating", &mut m),
+        decide(true, fresh(10, 100), 3, Some(&open), Some("loom:treating"), &mut m),
         Step::Stop(_)
     ));
     assert!(matches!(
-        decide(true, fresh(10, 100), ok, Some(&closed), "loom:treating", &mut m),
+        decide(true, fresh(10, 100), ok, Some(&closed), Some("loom:treating"), &mut m),
         Step::Stop(_)
     ));
-    assert_eq!(decide(true, fresh(10, 100), ok, None, "loom:treating", &mut m), Step::Skip);
+    assert_eq!(
+        decide(true, fresh(10, 100), ok, None, Some("loom:treating"), &mut m),
+        Step::Skip
+    );
     // The label must be gone for LABEL_MISS_LIMIT consecutive cycles.
     m = 0;
     for _ in 1..LABEL_MISS_LIMIT {
         assert_eq!(
-            decide(true, fresh(10, 100), ok, Some(&bare), "loom:treating", &mut m),
+            decide(true, fresh(10, 100), ok, Some(&bare), Some("loom:treating"), &mut m),
             Step::Skip
         );
     }
     assert!(matches!(
-        decide(true, fresh(10, 100), ok, Some(&bare), "loom:treating", &mut m),
+        decide(true, fresh(10, 100), ok, Some(&bare), Some("loom:treating"), &mut m),
         Step::Stop(_)
     ));
     m = 1;
     assert_eq!(
-        decide(true, fresh(10, 100), ok, Some(&open), "loom:treating", &mut m),
+        decide(true, fresh(10, 100), ok, Some(&open), Some("loom:treating"), &mut m),
         Step::Renew
     );
     assert_eq!(m, 0, "a present label resets the streak");
@@ -295,18 +299,21 @@ fn the_renewer_stops_once_its_last_renewal_is_a_ttl_old_by_the_wall_clock() {
     // Inside the TTL less the margin: renew.
     let limit = i64::try_from(900 - RENEW_MARGIN_SECS).unwrap();
     assert_eq!(
-        decide(true, at(limit - 1), ok, Some(&open), "loom:treating", &mut m),
+        decide(true, at(limit - 1), ok, Some(&open), Some("loom:treating"), &mut m),
         Step::Renew
     );
     // At or past it, even with the PR open and labelled and the forge
     // unreadable: stop, never renew.
     for since in [limit, 900, 20 * 60, 3 * 3600] {
         assert!(
-            matches!(decide(true, at(since), ok, None, "loom:treating", &mut m), Step::Stop(_)),
+            matches!(
+                decide(true, at(since), ok, None, Some("loom:treating"), &mut m),
+                Step::Stop(_)
+            ),
             "{since}"
         );
         assert!(matches!(
-            decide(true, at(since), ok, Some(&open), "loom:treating", &mut m),
+            decide(true, at(since), ok, Some(&open), Some("loom:treating"), &mut m),
             Step::Stop(_)
         ));
     }
@@ -316,13 +323,13 @@ fn the_renewer_stops_once_its_last_renewal_is_a_ttl_old_by_the_wall_clock() {
         ttl_secs: 60,
         ..fresh(10, 14_400)
     };
-    assert_eq!(decide(true, short, ok, Some(&open), "loom:treating", &mut m), Step::Renew);
+    assert_eq!(decide(true, short, ok, Some(&open), Some("loom:treating"), &mut m), Step::Renew);
     let short = Clocks {
         since_renewal_secs: 45,
         ..short
     };
     assert!(matches!(
-        decide(true, short, ok, Some(&open), "loom:treating", &mut m),
+        decide(true, short, ok, Some(&open), Some("loom:treating"), &mut m),
         Step::Stop(_)
     ));
 }
@@ -342,7 +349,14 @@ fn the_age_cap_and_the_renewal_age_are_wall_clock() {
     let open = (true, vec!["loom:reviewing".to_string()]);
     let mut m = 0;
     assert_eq!(
-        decide(true, clocks, lease_renewer_exit_renew(), Some(&open), "loom:reviewing", &mut m),
+        decide(
+            true,
+            clocks,
+            lease_renewer_exit_renew(),
+            Some(&open),
+            Some("loom:reviewing"),
+            &mut m
+        ),
         Step::Stop("the age cap passed")
     );
     assert_eq!(wall_secs(woke, started), 5 * 3600);
@@ -364,7 +378,14 @@ fn a_woken_renewer_never_revives_an_expired_lease_a_peer_has_since_claimed() {
     };
     let mut m = 0;
     assert!(matches!(
-        decide(true, woke, lease_renewer_exit_renew(), Some(&open), "loom:treating", &mut m),
+        decide(
+            true,
+            woke,
+            lease_renewer_exit_renew(),
+            Some(&open),
+            Some("loom:treating"),
+            &mut m
+        ),
         Step::Stop(_)
     ));
     // …and the forge guard stops it independently: B holds the claim.
@@ -412,7 +433,14 @@ fn the_wall_clock_is_rechecked_immediately_before_the_patch() {
     };
     let mut m = 0;
     assert_eq!(
-        decide(true, checked, lease_renewer_exit_renew(), Some(&open), "loom:treating", &mut m),
+        decide(
+            true,
+            checked,
+            lease_renewer_exit_renew(),
+            Some(&open),
+            Some("loom:treating"),
+            &mut m
+        ),
         Step::Renew
     );
     assert_eq!(pre_patch_guard(now(), last_renewed, 900), Step::Renew);
@@ -503,7 +531,7 @@ case " $* " in
     printf '{{"id":%s,"updated_at":"%s","body":"%s",%s}}\n' "$cid" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$first" '{AUTHOR}' >> "$D/rows.tmp"
     mv "$D/rows.tmp" "$D/rows" ;;
   *"/check-runs"*) [ -f "$D/checks" ] || exit 1; cat "$D/checks" ;;
-  *"/pulls/"*) cat "$D/pull" 2>/dev/null || echo "" ;;
+  *"/pulls/"*) echo "$*" >> "$D/pulled"; cat "$D/pull" 2>/dev/null || echo "" ;;
   *"/comments"*)
     n=$(cat "$D/reads" 2>/dev/null || echo 0); echo $((n + 1)) > "$D/reads"
     if [ "$n" -ge 1 ] && [ -f "$D/late" ]; then cat "$D/late" >> "$D/rows"; rm "$D/late"; fi
@@ -533,6 +561,7 @@ fn ctx(dir: &Path, me: Identity) -> Ctx {
         common: Common {
             pr: 77,
             role: me.role,
+            step: me.step,
             watch_pid: None,
             sweep_id: Some(me.sweep.clone()),
             workspace: dir.to_path_buf(),
@@ -646,6 +675,7 @@ fn on(host: &str, sweep: &str) -> Identity {
         role: Role::Judge,
         host: host.into(),
         sweep: sweep.into(),
+        step: None,
     }
 }
 
@@ -876,4 +906,183 @@ fn prompt_lease_gates_proceed_only_on_exit_0_or_2() {
         }
         assert_eq!(text.matches(GATE).count(), gates, "{name}: gate count");
     }
+}
+
+// ---- step claims (#11898) -------------------------------------------------
+
+#[test]
+fn a_champion_lease_defaults_to_the_merge_step_and_carries_no_label() {
+    let me = Identity::new(Role::Champion, "host-a".into(), "s".into(), None).unwrap();
+    assert_eq!(me.step, Some(StepRole::ChampionMerge));
+    assert_eq!(me.claim_label(), None);
+    let marker = me.lease_marker();
+    assert!(marker.ends_with("step=champion_merge -->"), "{marker}");
+    assert_eq!(parse_record(&marker), Some(Record::Lease(me.clone())));
+    // The yield record keeps the step inside the identity's fields.
+    assert_eq!(parse_record(&me.yield_marker(&me)), Some(Record::Yield(me)));
+}
+
+#[test]
+fn step_leases_name_their_claim_label() {
+    let promote =
+        Identity::new(Role::Champion, "h".into(), "s".into(), Some(StepRole::ChampionPromote))
+            .unwrap();
+    assert_eq!(promote.claim_label(), Some("loom:evaluating"));
+    let curator = Identity::new(Role::Curator, "h".into(), "s".into(), None).unwrap();
+    assert_eq!(curator.claim_label(), Some("loom:curating"));
+    assert!(curator
+        .lease_marker()
+        .starts_with("<!-- loom:pr-lease role=curator host=h"));
+    assert!(Identity::new(Role::Judge, "h".into(), "s".into(), Some(StepRole::Curator)).is_err());
+}
+
+/// An older binary's three-token marker still parses (no step), and a step
+/// lease keys apart from a stepless one of the same identity.
+#[test]
+fn the_step_token_is_additive() {
+    let old = who(Role::Judge, "s");
+    assert_eq!(parse_record(&old.lease_marker()), Some(Record::Lease(old.clone())));
+    let stepped =
+        Identity::new(Role::Judge, old.host.clone(), "s".into(), Some(StepRole::Judge)).unwrap();
+    // Ownership is (role, host, sweep): the step is metadata (#11950 review).
+    assert_eq!(stepped, old);
+    assert_ne!(stepped.step, old.step);
+    let marker = stepped.lease_marker();
+    let tokens: Vec<&str> = marker.split_whitespace().collect();
+    assert_eq!(tokens[2..5], ["role=judge", "host=host-a1b2c3d4", "sweep=s"]);
+}
+
+#[test]
+fn a_labelless_claim_renews_without_a_label_check() {
+    let open = (true, Vec::<String>::new());
+    let mut m = 0;
+    assert_eq!(
+        decide(true, fresh(10, 100), lease_renewer_exit_renew(), Some(&open), None, &mut m),
+        Step::Renew
+    );
+    let closed = (false, Vec::<String>::new());
+    assert!(matches!(
+        decide(true, fresh(10, 100), lease_renewer_exit_renew(), Some(&closed), None, &mut m),
+        Step::Stop(_)
+    ));
+}
+
+/// The daemon's lib-side reader of this family (a dead step's lease holder,
+/// #11898) agrees with this module's parser on every record shape.
+#[test]
+fn the_lib_role_lease_reader_agrees_with_parse_record() {
+    use loom_daemon::sweep_registry::step_lease_owner::{parse_role_lease, RoleLeaseKind};
+    let me = Identity::new(Role::Champion, "host-a".into(), "s1".into(), None).unwrap();
+    let peer = who(Role::Judge, "s2");
+    let bodies = [
+        me.lease_marker(),
+        me.yield_marker(&peer),
+        me.released_marker(),
+        peer.lease_marker(),
+        peer.released_marker_with(" head=abc verdict=none"),
+    ];
+    for body in bodies {
+        let (kind, holder) = match parse_record(&body).unwrap() {
+            Record::Lease(h) => (RoleLeaseKind::Lease, h),
+            Record::Yield(h) => (RoleLeaseKind::Yield, h),
+            Record::Released(h) => (RoleLeaseKind::Released, h),
+        };
+        let lib = parse_role_lease(&body).unwrap();
+        assert_eq!(lib.kind, kind, "{body}");
+        assert_eq!(
+            (lib.role.as_str(), lib.host.as_str(), lib.sweep.as_str()),
+            (holder.role.as_str(), holder.host.as_str(), holder.sweep.as_str()),
+            "{body}"
+        );
+    }
+}
+
+/// #11950 review: a Champion that claimed with `--step champion_promote`
+/// fences and releases its own lease with plain `--role champion` (default
+/// step `champion_merge`) from the same host and sweep.
+#[test]
+fn a_step_less_fence_and_release_find_the_sessions_stepped_lease() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    let claimed = Identity::new(
+        Role::Champion,
+        "host-a".into(),
+        "run-1".into(),
+        Some(StepRole::ChampionPromote),
+    )
+    .unwrap();
+    assert_eq!(ctx(dir.path(), claimed.clone()).claim(), EXIT_HELD);
+    let plain = Identity::new(Role::Champion, "host-a".into(), "run-1".into(), None).unwrap();
+    assert_eq!(plain.step, Some(StepRole::ChampionMerge), "the default step differs");
+    assert_eq!(ctx(dir.path(), plain.clone()).fence(), EXIT_HELD, "own lease, not a peer's");
+    assert_eq!(ctx(dir.path(), plain.clone()).check(), EXIT_HELD);
+    assert_eq!(ctx(dir.path(), plain).release(), EXIT_HELD);
+    // The released marker keeps the lease's own step.
+    assert!(
+        patched(dir.path()).contains(&claimed.released_marker()),
+        "{}",
+        patched(dir.path())
+    );
+    // And the claim is free at once for a peer Champion.
+    let peer = Identity::new(Role::Champion, "host-b".into(), "run-2".into(), None).unwrap();
+    assert_eq!(ctx(dir.path(), peer).check(), EXIT_HELD);
+}
+
+/// #11950 review: a reap with no step (the role runner's) reaps a stepped lease.
+#[test]
+fn a_step_less_reap_reaps_a_stepped_lease() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    let stepped =
+        Identity::new(Role::Judge, "host-a".into(), "run-1".into(), Some(StepRole::Judge)).unwrap();
+    fs::write(dir.path().join("rows"), live_row(100, &stepped)).unwrap();
+    let plain = Identity::new(Role::Judge, "host-a".into(), "run-1".into(), None).unwrap();
+    assert_eq!(ctx(dir.path(), plain).reap("timeout"), EXIT_HELD);
+    let patch = patched(dir.path());
+    assert!(patch.contains("repos/acme/widgets/issues/comments/100"), "{patch}");
+    assert!(
+        patch.contains("loom:pr-lease-released role=judge host=host-a sweep=run-1 step=judge"),
+        "{patch}"
+    );
+}
+
+/// The issue-scoped leases never read a PR head on release (it would 404).
+#[test]
+fn an_issue_scoped_release_reads_no_pr_head() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    let curator = Identity::new(Role::Curator, "host-a".into(), "run-1".into(), None).unwrap();
+    fs::write(dir.path().join("rows"), live_row(100, &curator)).unwrap();
+    assert_eq!(ctx(dir.path(), curator.clone()).release(), EXIT_HELD);
+    assert!(patched(dir.path()).contains(&curator.released_marker()));
+    assert!(!dir.path().join("pulled").exists(), "no PR read for a Curator lease");
+}
+
+/// #11950 review: the lib-side holder reader (a dead step's restore) and this
+/// module agree that ownership ignores the step: a stepped lease yielded by a
+/// step-less record of the same session holds nothing on either side, and the
+/// next lease is the holder on both.
+#[test]
+fn the_lib_and_bin_lease_holders_agree_when_steps_differ() {
+    use loom_daemon::sweep_registry::step_lease_owner::{earliest_live_holder, RoleLeaseRow};
+    let stepped =
+        Identity::new(Role::Judge, "host-a".into(), "run-1".into(), Some(StepRole::Judge)).unwrap();
+    let plain = Identity::new(Role::Judge, "host-a".into(), "run-1".into(), None).unwrap();
+    let next = Identity::new(Role::Judge, "host-b".into(), "run-2".into(), None).unwrap();
+    let rows = vec![
+        row(1, 1, stepped.lease_marker()),
+        row(2, 1, next.lease_marker()),
+        row(3, 1, plain.yield_marker(&next)),
+    ];
+    let bin = live_leases(&rows, Role::Judge, now(), ttl());
+    assert_eq!(bin.first().map(|l| l.holder.sweep.as_str()), Some("run-2"));
+    let lib_rows: Vec<RoleLeaseRow> = rows
+        .iter()
+        .map(|r| RoleLeaseRow {
+            id: r.id,
+            updated_at: r.updated_at,
+            body: r.body.clone(),
+        })
+        .collect();
+    assert_eq!(earliest_live_holder(&lib_rows, "judge", now(), ttl()).as_deref(), Some("run-2"));
 }
