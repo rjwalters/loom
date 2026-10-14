@@ -80,8 +80,7 @@ check_backlog_balance() {
   echo "=== Backlog Level Balance ==="
   # Promoted (loom:issue/loom:building), unheld (#7613) issues, by level; holds: champion-common.md "Hold set".
   HOLDS=$(loom-daemon labels list --property hold --with-retired 2>/dev/null || printf 'loom:blocked\nloom:operator\nloom:frozen'); export HOLDS
-  promoted_json=$( { gh issue list --label="loom:issue" --state=open --limit 500 --json number,labels
-    gh issue list --label="loom:building" --state=open --limit 500 --json number,labels; } |
+  promoted_json=$(for L in issue building; do gh issue list --label="loom:$L" --state=open --limit 500 --json number,labels; done |
     jq -s '($ENV.HOLDS | split("\n")) as $h | add | unique_by(.number) |
     [.[] | select([.labels[].name] | any(IN($h[])) | not) |
     {number, level: ([.labels[].name] | if index("loom:very-important") then "loom:very-important"
