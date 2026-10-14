@@ -321,17 +321,9 @@ pub(super) fn inherited_lease(dir: &Path) -> Result<Option<lease::Lease>> {
 /// `git@host:path` remote written as `https://host/path` and any `.git`
 /// suffix dropped. `None` when it cannot be read.
 fn logical_repository(root: &Path) -> Option<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["remote", "get-url", "origin"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let remote = String::from_utf8(output.stdout).ok()?;
-    let remote = remote.trim();
+    // Bounded (#9715): a hung `git` must not stall the launch.
+    let remote = crate::forge_cmd::get_remote_url(root)?;
+    let remote = remote.as_str();
     let normalized = if let Some(ssh) = remote.strip_prefix("git@") {
         let (host, path) = ssh.split_once(':')?;
         format!("https://{host}/{path}")

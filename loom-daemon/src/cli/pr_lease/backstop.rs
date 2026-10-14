@@ -114,6 +114,26 @@ pub(crate) fn release_fields(
     }
 }
 
+/// The fields the reap of a terminated Judge appends (#11931): the no-verdict
+/// record, `reaped=<reason>` added, when the PR is still waiting for review
+/// with no verdict; else nothing. Unlike [`release_fields`] there is no CI
+/// exemption: a pass the role runner killed at its timeout ceiling spent the
+/// whole ceiling, and is exactly the re-run the backstop exists to bound.
+pub(crate) fn reaped_release_fields(
+    role: Role,
+    state: Option<(bool, String, Vec<String>)>,
+    reason: &str,
+) -> String {
+    match state {
+        Some((open, head, labels))
+            if role == Role::Judge && backstop::ended_without_verdict(open, &labels) =>
+        {
+            backstop::reaped_fields(&head, &labels, reason)
+        }
+        _ => String::new(),
+    }
+}
+
 /// When the backstop's hold on this PR ends, from its trusted lease `rows`
 /// and its live `(open, head, labels)`; `None` when not held. Pure.
 pub(crate) fn hold(

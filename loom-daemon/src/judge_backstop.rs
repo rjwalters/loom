@@ -23,6 +23,12 @@
 //! <!-- loom:pr-lease-released role=judge host=<h> sweep=<s> head=<sha> verdict=none labels=<digest> -->
 //! ```
 //!
+//! A Judge run the role runner terminates at its timeout ceiling never
+//! reaches its release; the daemon reaps its lease instead (#11931,
+//! [`crate::pr_lease_reap`]) and writes the same record with `reaped=timeout`
+//! appended, whatever the head's CI is doing — a pass that burned the whole
+//! ceiling counts toward [`MAX_PER_WINDOW`] like any other.
+//!
 //! The comment's own forge `updated_at` is when. No extra comment is posted,
 //! and older readers of the marker read only its first three tokens, so they
 //! are unaffected. The record lives on the PR, so every host sees it.
@@ -204,6 +210,23 @@ pub fn ended_without_verdict<S: AsRef<str>>(open: bool, labels: &[S]) -> bool {
 #[must_use]
 pub fn released_fields<S: AsRef<str>>(head: &str, labels: &[S]) -> String {
     format!(" head={head} verdict=none labels={}", label_digest(labels))
+}
+
+/// The fields the daemon's reap of a terminated Judge appends (#11931): the
+/// no-verdict record plus `reaped=<reason>`. `reason` is reduced to
+/// `[a-z0-9]` so it can never break the marker.
+#[must_use]
+pub fn reaped_fields<S: AsRef<str>>(head: &str, labels: &[S], reason: &str) -> String {
+    let reason: String = reason
+        .chars()
+        .filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        .collect();
+    let reason = if reason.is_empty() {
+        "unknown"
+    } else {
+        &reason
+    };
+    format!("{} reaped={reason}", released_fields(head, labels))
 }
 
 /// One no-verdict record: the head and label digest the pass left behind.
