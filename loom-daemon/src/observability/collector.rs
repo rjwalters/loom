@@ -576,6 +576,14 @@ fn event_issue(event: &Event) -> Option<u32> {
             kind: SweepKind::Issue(issue),
             ..
         } => Some(*issue),
+        // A step is not `sweep.*` telemetry (#11898): it ends with no
+        // `sweep.issue.*.exited`/`.crashed` (its outcome is the step ledger's,
+        // C15e), so a `sweep.started` would stay in flight forever. Its
+        // dispatch telemetry is the spawn's own `loom.dispatch.step` (#11906).
+        Event::SweepGlobalDispatch {
+            kind: SweepKind::Step { .. } | SweepKind::PrSet(_),
+            ..
+        } => None,
         Event::SweepPhase { issue, .. }
         | Event::SweepExited { issue, .. }
         | Event::SweepCrashed { issue, .. } => Some(*issue),

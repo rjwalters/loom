@@ -199,6 +199,7 @@ impl ClaimAd {
             remaining_secs: Some(remaining_secs),
             pool_key: Some(pool_key),
             consecutive: None,
+            step: None,
         }
     }
 
@@ -232,6 +233,7 @@ impl ClaimAd {
             remaining_secs: Some(remaining_secs),
             pool_key: None,
             consecutive: Some(consecutive),
+            step: None,
         }
     }
 
@@ -258,6 +260,7 @@ impl ClaimAd {
             remaining_secs: None,
             pool_key: Some(pool_key),
             consecutive: None,
+            step: None,
         }
     }
 }

@@ -88,6 +88,11 @@ const MARKER_FILES: &[(&str, &str)] = &[
         "sweep_registry/guards.rs",
         "writer; reader in read_lease_comments (FETCH_SITES)",
     ),
+    (
+        "sweep_registry/lease_step.rs",
+        "writer (moved from guards.rs, #11898); pure second-line step parser over a body \
+         guards.rs's trusted read_lease_comments already returned",
+    ),
     ("sweep_registry/fast_fail_park.rs", "writer (quarantine park comment, #11854)"),
     ("sweep_registry/quarantine.rs", "writer"),
     (
@@ -136,6 +141,12 @@ const FETCH_SITES: &[(&str, &str, &str)] = &[
         "TrustPolicy::for_root(root).trusted_bodies(",
     ),
     ("sweep_registry/guards.rs", "read_lease_comments", "policy.trusted_ndjson("),
+    // #11898: a dead step's role-keyed lease holder.
+    (
+        "sweep_registry/step_lease_owner.rs",
+        "read_role_lease_rows",
+        "policy.trusted_ndjson(",
+    ),
     // #9062: the PR timeline read carries base-conflict flag comments.
     (
         "sweep_registry/outcome_journal/label_timeline.rs",

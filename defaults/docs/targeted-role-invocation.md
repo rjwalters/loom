@@ -162,11 +162,17 @@ without a sweep around it gets neither unless the engine does both.
 
 ## Gaps left to other work
 
-- **A Curator lease.** `loom:curating` has no lease record, so a live
-  Curator's claim is told from a dead one only by the 30-minute idle clock.
-  The step engine's "`step` field on leases" work adds an issue lease with
-  `step=curator`; until then the label plus `claim-staleness.sh` is the
-  claim.
+- **The Curator prompt does not take its lease yet.** #11898 added the
+  Curator lease: `loom-daemon lease pr claim <N> --role curator` (marker
+  `<!-- loom:pr-lease role=curator host=… sweep=… step=curator -->` when a step
+  claims it). It is role-keyed, like the Judge and Doctor leases, rather than
+  an issue-path `loom:lease`, because every issue-path reader assumes one
+  claim per number: a live Curator lease would read as a peer to the Builder
+  that follows it. The step engine's spawn (#11906) takes it for a daemon
+  Curator step, with `LOOM_SWEEP_CLAIM_OWNED`. An attended or role-runner
+  `/loom:curator <N>` still claims by label, with `claim-staleness.sh` and
+  `stale_after_minutes` (`loom:curating`, 30) as the liveness, until its
+  prompt is taught the lease.
 - **The classifier itself.** Nothing reads `LOOM_STEP_OUTCOME` or the
   post-state table yet. The step-outcome ledger implements them.
 - **Doctor** was out of this audit's scope (it was already targeted). Its PR

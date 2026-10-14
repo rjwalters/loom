@@ -98,6 +98,7 @@ pub use brakes::{
 
 mod coordination_idle;
 mod fast_fail_tally;
+mod steps;
 pub use coordination_idle::{
     resolve_advertise_activity_window, ADVERTISE_ACTIVITY_WINDOW_ENV,
     DEFAULT_ADVERTISE_ACTIVITY_WINDOW,
@@ -528,6 +529,12 @@ pub struct ClaimAd {
     /// not inflate anyone's threshold, and the receiver's own local tally is
     /// still exact.
     pub consecutive: Option<u32>,
+    /// The step an [`ClaimKind::Advertise`]/[`ClaimKind::Retract`] ad claims
+    /// (#11898): `issue` is then the step's item (an issue, or a PR for a PR
+    /// step), and the claim is `(item, step)`. `None` for an issue sweep and
+    /// every other lane. Additive: an older peer ignores the key and reads the
+    /// ad as a claim on `issue`, which is the item the step holds.
+    pub step: Option<crate::step_role::StepRole>,
 }
 
 impl ClaimAd {
@@ -544,6 +551,7 @@ impl ClaimAd {
             remaining_secs: None,
             pool_key: None,
             consecutive: None,
+            step: None,
         }
     }
 
@@ -560,6 +568,7 @@ impl ClaimAd {
             remaining_secs: None,
             pool_key: None,
             consecutive: None,
+            step: None,
         }
     }
 
@@ -587,6 +596,7 @@ impl ClaimAd {
             remaining_secs: None,
             pool_key: None,
             consecutive: None,
+            step: None,
         }
     }
 
@@ -609,6 +619,7 @@ impl ClaimAd {
             remaining_secs: None,
             pool_key: None,
             consecutive: None,
+            step: None,
         }
     }
 
@@ -627,6 +638,7 @@ impl ClaimAd {
             remaining_secs: None,
             pool_key: None,
             consecutive: None,
+            step: None,
         }
     }
 
@@ -655,6 +667,7 @@ impl ClaimAd {
             remaining_secs: Some(remaining_secs),
             pool_key: None,
             consecutive: None,
+            step: None,
         }
     }
 
@@ -680,6 +693,7 @@ impl ClaimAd {
             remaining_secs: Some(remaining_secs),
             pool_key: None,
             consecutive: None,
+            step: None,
         }
     }
 
@@ -702,6 +716,7 @@ impl ClaimAd {
             remaining_secs: None,
             pool_key: None,
             consecutive: None,
+            step: None,
         }
     }
 
@@ -720,6 +735,7 @@ impl ClaimAd {
             "remaining_secs": self.remaining_secs,
             "pool_key": self.pool_key,
             "consecutive": self.consecutive,
+            "step": self.step,
         })
         .to_string()
     }
@@ -789,6 +805,13 @@ impl ClaimAd {
             .get("consecutive")
             .and_then(Value::as_u64)
             .and_then(|c| u32::try_from(c).ok());
+        // `step` is new as of #11898: absent (any older peer, any non-step
+        // ad) or an unknown role name degrades to `None`, a plain claim on
+        // `issue`, rather than rejecting the ad.
+        let step = obj
+            .get("step")
+            .and_then(Value::as_str)
+            .and_then(|s| s.parse().ok());
         if repo.is_empty() || host.is_empty() {
             return None;
         }
@@ -803,6 +826,7 @@ impl ClaimAd {
             remaining_secs,
             pool_key,
             consecutive,
+            step,
         })
     }
 
@@ -964,6 +988,8 @@ struct ClaimEntry {
     /// **Local** [`Instant`] at which this daemon observed the ad — the TTL
     /// clock. Never the advertiser's wall clock.
     received_at: Instant,
+    /// The step the peer claims the item for (#11898), `None` for a sweep.
+    step: Option<crate::step_role::StepRole>,
 }
 
 /// One live peer claim, rendered for external observability (Issue #5921):
@@ -1441,6 +1467,7 @@ impl PeerClaimView {
                         host: ad.host.clone(),
                         pid: ad.pid,
                         received_at: now,
+                        step: ad.step,
                     },
                 );
             }
@@ -2134,6 +2161,7 @@ mod tests {
             remaining_secs: None,
             pool_key: None,
             consecutive: None,
+            step: None,
         }
     }
 
