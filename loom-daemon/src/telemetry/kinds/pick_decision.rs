@@ -561,6 +561,16 @@ pub struct PickDecisionRecord {
     /// header repeats on every chunk; `draws` is the chunk's in-order slice.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub item_draw: Option<PickItemDraw>,
+    /// A completed work-finder tick's canonical dispatch result (#11840):
+    /// exactly the `loom.dispatch.result` token
+    /// [`crate::observability::ops::dispatch::tick_result`] classified from
+    /// the tick's own report (`dispatched`, `halted_<cause>`, `halted`,
+    /// `saturation_held`, `error`, `build_backoff_held`, `no_eligible_work`,
+    /// `capacity_full`, `all_skipped`). Repeats on every chunk. Absent on
+    /// role ticks and on older daemons' records: absence means unavailable,
+    /// never idle or ready. Additive beside the legacy `outcome`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_result: Option<String>,
 }
 
 /// One repository's lane computation (#10630): `lanes = clamp(ceil(debt / k),
@@ -648,6 +658,7 @@ impl PickDecisionRecord {
             lanes: Vec::new(),
             repo: None,
             item_draw: None,
+            dispatch_result: None,
         }
     }
 
@@ -676,6 +687,14 @@ impl PickDecisionRecord {
     #[must_use]
     pub fn with_item_draw(mut self, draw: Option<PickItemDraw>) -> Self {
         self.item_draw = draw;
+        self
+    }
+
+    /// Attach the work-finder tick's canonical dispatch result (#11840), as
+    /// the caller classified it once from the tick's report.
+    #[must_use]
+    pub fn with_dispatch_result(mut self, result: Option<&str>) -> Self {
+        self.dispatch_result = result.map(str::to_string);
         self
     }
 
@@ -716,7 +735,7 @@ enum PickChunkEntry {
 /// Split `record` into chunks whose JSON is at most `max_bytes` each (one
 /// chunk, unchanged but for `chunk_index: 0, chunk_count: 1`, when it fits).
 /// Every chunk repeats the header (`role`, `host`, `tick_id`, the tick
-/// bounds, `outcome`, `candidates_total`, `candidate_source`,
+/// bounds, `outcome`, `dispatch_result`, `candidates_total`, `candidate_source`,
 /// `decisions_observed`, and `workspace_draw.seed` / `draws_total` /
 /// `seed_scheme` / `seed_minute` / `seed_host`); the
 /// `candidates`, `skipped`, `acted`, `workspace_draw.draws` and
