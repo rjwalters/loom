@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # test-warn-operator-gated.sh - Unit tests for warn-operator-gated.sh (#5137)
 #
-# The `all` sentinel's aggressive candidate taxonomy hard-skips only
-# loom:operator-only; every other open issue is a build candidate, even one
-# whose body declares operator-gating in prose without carrying the label.
+# The `all` sentinel's aggressive candidate taxonomy hard-skips only the hold
+# labels; every other open issue is a build candidate, even one
+# whose body declares operator-gating in prose without carrying a label.
 # This scans each candidate's already-fetched body for (1) instruction-shaped
 # operator-gate phrases and (2) a declared Depends on / Requires #A dependency
-# that itself carries loom:operator-only — annotating (never skipping,
+# that itself carries an operator-gate label (the registry's `operator_gate`
+# property, loom:operator when no daemon answers, #11795) — annotating (never skipping,
 # never mutating labels) at the confirmation gate.
 #
 # Strategy (mirrors test-warn-out-of-set-deps.sh): warn-operator-gated.sh
@@ -134,6 +135,19 @@ echo "stub gh: unhandled args: $*" >&2
 exit 1
 STUB
 chmod +x "$STUB_DIR/gh"
+
+# Stub loom-daemon: `labels list --property operator_gate` prints
+# $LOOM_TEST_GATE_LABELS when set, else fails so the script uses its fallback.
+cat > "$STUB_DIR/loom-daemon" <<'STUB'
+#!/usr/bin/env bash
+if [[ "$1 $2 $3 $4" == "labels list --property operator_gate" && -n "${LOOM_TEST_GATE_LABELS:-}" ]]; then
+  printf '%s\n' "$LOOM_TEST_GATE_LABELS"
+  exit 0
+fi
+exit 2
+STUB
+chmod +x "$STUB_DIR/loom-daemon"
+unset LOOM_DAEMON_BIN LOOM_TEST_GATE_LABELS
 export LOOM_TEST_STUB_DIR="$STUB_DIR"
 export PATH="$STUB_DIR:$PATH"
 
@@ -260,32 +274,34 @@ assert_contains "$out" $'83\t⚠ body declares operator-gating: "operator task"'
 
 # =====================================================================
 echo
-echo "--- Signal 2: dependency on a loom:operator-only issue annotates the candidate ---"
+echo "--- Signal 2: dependency on a loom:operator issue annotates the candidate (fallback set) ---"
 
 echo 'Depends on #4 (the FamilySearch extract in the operator queue)' > "$STUB_DIR/body-88.txt"
-echo 'loom:operator-only' > "$STUB_DIR/labels-4.txt"
+echo 'loom:operator' > "$STUB_DIR/labels-4.txt"
 out="$(run_warn "88")"
-assert_contains "$out" $'88\t⚠ depends on #4, which is loom:operator-only' \
-    "candidate depending on a loom:operator-only issue is flagged"
+assert_contains "$out" $'88\t⚠ depends on #4, which is loom:operator' \
+    "candidate depending on a loom:operator issue is flagged (no daemon answer -> fallback)"
 
 # =====================================================================
 echo
-echo "--- Signal 2 (#5817): dependency on a loom:needs-capability issue annotates the candidate ---"
+echo "--- Signal 2 (#11795): the gate set comes from the registry when the daemon answers ---"
 
 echo 'Depends on #5 (waiting on a capability request)' > "$STUB_DIR/body-92.txt"
-echo 'loom:needs-capability' > "$STUB_DIR/labels-5.txt"
+echo 'loom:blocked' > "$STUB_DIR/labels-5.txt"
 out="$(run_warn "92")"
-assert_contains "$out" $'92\t⚠ depends on #5, which is loom:needs-capability' \
-    "candidate depending on a loom:needs-capability issue is flagged"
+assert_eq "" "$out" "loom:blocked is not in the fallback gate set"
+out="$(LOOM_TEST_GATE_LABELS=$'loom:operator\nloom:blocked' run_warn "92")"
+assert_contains "$out" $'92\t⚠ depends on #5, which is loom:blocked' \
+    "a label the registry's operator_gate property names is flagged"
 
 # =====================================================================
 echo
-echo "--- Dependency on a NON-operator-only issue does NOT annotate ---"
+echo "--- Dependency on a NON-gated issue does NOT annotate ---"
 
 echo 'Depends on #9' > "$STUB_DIR/body-89.txt"
 echo 'loom:issue' > "$STUB_DIR/labels-9.txt"
 out="$(run_warn "89")"
-assert_eq "" "$out" "dependency without loom:operator-only produces no annotation"
+assert_eq "" "$out" "dependency without an operator-gate label produces no annotation"
 
 # =====================================================================
 echo
@@ -316,7 +332,7 @@ assert_contains "$out" $'96\t⚠ title declares operator-gating: "Operator-only"
 
 # =====================================================================
 echo
-echo "--- No matching phrase and no operator-only dependency -> silent ---"
+echo "--- No matching phrase and no gated dependency -> silent ---"
 
 echo 'This issue requires 100-200 ground-truth labels on handwriting crops.' > "$STUB_DIR/body-64.txt"
 out="$(run_warn "64")"
@@ -338,24 +354,24 @@ echo
 echo "--- A candidate matching BOTH signals prints two lines ---"
 
 echo 'This is operator-gated. Also Depends on #4.' > "$STUB_DIR/body-90.txt"
-echo 'loom:operator-only' > "$STUB_DIR/labels-4.txt"
+echo 'loom:operator' > "$STUB_DIR/labels-4.txt"
 out="$(run_warn "90")"
 assert_contains "$out" $'90\t⚠ body declares operator-gating: "operator-gated"' \
     "#90 phrase signal present"
-assert_contains "$out" $'90\t⚠ depends on #4, which is loom:operator-only' \
+assert_contains "$out" $'90\t⚠ depends on #4, which is loom:operator' \
     "#90 dependency signal also present"
 
 # =====================================================================
 echo
-echo "--- A dependency carrying BOTH labels prints one line per label (#5817) ---"
+echo "--- A dependency carrying two gate labels prints one line per label (#5817) ---"
 
 echo 'Depends on #6' > "$STUB_DIR/body-93.txt"
-echo 'loom:operator-only,loom:needs-capability' > "$STUB_DIR/labels-6.txt"
-out="$(run_warn "93")"
-assert_contains "$out" $'93\t⚠ depends on #6, which is loom:operator-only' \
-    "#93 flagged for the loom:operator-only label on #6"
-assert_contains "$out" $'93\t⚠ depends on #6, which is loom:needs-capability' \
-    "#93 flagged for the loom:needs-capability label on #6"
+echo 'loom:operator,loom:blocked' > "$STUB_DIR/labels-6.txt"
+out="$(LOOM_TEST_GATE_LABELS=$'loom:operator\nloom:blocked' run_warn "93")"
+assert_contains "$out" $'93\t⚠ depends on #6, which is loom:operator' \
+    "#93 flagged for the loom:operator label on #6"
+assert_contains "$out" $'93\t⚠ depends on #6, which is loom:blocked' \
+    "#93 flagged for the loom:blocked label on #6"
 
 # =====================================================================
 echo

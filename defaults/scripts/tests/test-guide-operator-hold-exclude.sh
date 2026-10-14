@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# test-guide-operator-only-exclude.sh - Regression test for issues #6941,
+# test-guide-operator-hold-exclude.sh - Regression test for issues #6941,
 # #7071, #9244 and #11103.
 #
 # #6941 / #7071: guide.md's "Finding Work" ready-queue search must exclude
@@ -74,9 +74,9 @@ if [[ ! -f "$GUIDE_MD" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-echo "Test 1: the ready-queue search excludes building, operator-only and blocked"
-assert_grep '\-label:loom:building \-label:loom:operator-only \-label:loom:blocked' "$GUIDE_MD" \
-    "the ready-queue search term excludes loom:building, loom:operator-only, and loom:blocked"
+echo "Test 1: the ready-queue search excludes building, operator and blocked"
+assert_grep '\-label:loom:building \-label:loom:operator \-label:loom:blocked' "$GUIDE_MD" \
+    "the ready-queue search term excludes loom:building, loom:operator, and loom:blocked"
 
 # ---------------------------------------------------------------------------
 echo ""

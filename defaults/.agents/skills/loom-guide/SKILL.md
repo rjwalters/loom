@@ -173,16 +173,16 @@ Writes stay literal `gh` (so the guard hooks still see them). Full policy:
 
 ```bash
 # Find all human-approved issues ready for work (exclude building issues,
-# loom:operator-only issues, and loom:blocked issues — #6941: labels.yml
-# documents loom:operator-only as "sweep skips", so Builder can never act on
+# loom:operator issues, and loom:blocked issues — #6941: labels.yml
+# documents loom:operator as "sweep skips", so Builder can never act on
 # one, exactly like loom:blocked; #7071: loom:blocked itself was never
 # excluded here even though a curated issue can carry both loom:issue and
 # loom:blocked simultaneously — neither must ever surface as
 # ready work).
 # NOTE: gh ANDs --label values, so `--label "!loom:building"` matches a literal
 # label no issue carries and silently returns an empty set. Exclude building,
-# operator-only, and blocked issues with raw search terms instead.
-"$GH_READ" issue list --label "loom:issue" --search "-label:loom:building -label:loom:operator-only -label:loom:blocked -label:loom:frozen" --state open --json number,title,labels,body
+# operator, and blocked issues with raw search terms instead.
+"$GH_READ" issue list --label "loom:issue" --search "-label:loom:building -label:loom:operator -label:loom:blocked -label:loom:frozen" --state open --json number,title,labels,body
 ```
 
 ## Priority Labels and Duplicate Checks
@@ -1845,14 +1845,14 @@ render_plan_body() {
     --jq 'sort_by(.number) | .[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | "- **#\(.number)**: \(.title)"')
   imp=$("$GH_READ" issue list --label "loom:important" --state open --limit 200 --json number,title,labels \
     --jq 'sort_by(.number) | .[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | "- **#\(.number)**: \(.title)"')
-  # #7008: exclude loom:operator-only (a human-only decision, not buildable
+  # #7008: exclude loom:operator (a human-only decision, not buildable
   # by automation) the same way the "Finding Work" search does; `ready` also
   # excludes loom:building (an issue already claimed is no longer "ready").
   # #7071: also exclude loom:blocked — a curated issue can carry both
   # loom:issue and loom:blocked at once (Curator applies loom:blocked
   # pre-approval, and a dependency-driven block can land on an
   # already-approved issue too), and it is exactly as unbuildable as
-  # loom:operator-only, so it must never render as "Ready" either.
+  # loom:operator, so it must never render as "Ready" either.
   #
   # #7083: `ready_json` is fetched here as raw JSON (not pre-formatted
   # bullets) because it still needs one more filter below — issues already
@@ -1861,9 +1861,9 @@ render_plan_body() {
   # can only be derived once `approved_json` (fetched further down) is in
   # hand, so the final bullet-formatted `ready` is assembled after it.
   local ready_json
-  ready_json=$("$GH_READ" issue list --label "loom:issue" --search "-label:loom:building -label:loom:operator-only -label:loom:blocked -label:loom:frozen" --state open --limit 200 --json number,title \
+  ready_json=$("$GH_READ" issue list --label "loom:issue" --search "-label:loom:building -label:loom:operator -label:loom:blocked -label:loom:frozen" --state open --limit 200 --json number,title \
     --jq 'sort_by(.number)')
-  building=$("$GH_READ" issue list --label "loom:building" --search "-label:loom:operator-only -label:loom:frozen" --state open --limit 200 --json number,title \
+  building=$("$GH_READ" issue list --label "loom:building" --search "-label:loom:operator -label:loom:frozen" --state open --limit 200 --json number,title \
     --jq 'sort_by(.number) | .[] | "- **#\(.number)**: \(.title)"')
   review=$("$GH_READ" pr list --label "loom:review-requested" --state open --limit 200 --json number,title,labels \
     --jq 'sort_by(.number) | .[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | "- **#\(.number)**: \(.title)"')

@@ -216,7 +216,7 @@
 #
 # --clear is suppressed (DECISION stays STALE, CLEARED=0) when the PR carries
 # an explicit hold label — `loom:blocked`, `loom:operator`, or
-# `loom:operator-only`. Those mark a PR a human (or Champion's capped-PR
+# `loom:frozen` (the three holds, #11795). Those mark a PR a human (or Champion's capped-PR
 # recovery pass) deliberately took out of automated flow; silently re-queueing
 # it for review would undo that decision. Callers must still treat the verdict
 # as untrustworthy: STALE is STALE whether or not it was cleared.
@@ -394,10 +394,12 @@ has_label() { printf '%s\n' "$LABELS" | grep -qx -- "$1"; }
 # The explicit-hold labels: a PR an operator (or Champion's capped-PR recovery
 # pass) deliberately took out of automated flow. Echoes the first one present,
 # or nothing. Shared by --clear (step 5) and --anchor (step 3b) so the two
-# write paths can never disagree about what "parked" means.
+# write paths can never disagree about what "parked" means. The set is the
+# registry's three holds (#11795); label_literal_guard.rs pins it between the
+# registry's `park` and `hold` properties.
 hold_label() {
   local held
-  for held in "loom:blocked" "loom:operator" "loom:operator-only" "loom:frozen"; do
+  for held in "loom:blocked" "loom:operator" "loom:frozen"; do
     if has_label "$held"; then echo "$held"; return 0; fi
   done
   echo ""

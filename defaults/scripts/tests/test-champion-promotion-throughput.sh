@@ -134,7 +134,7 @@ cat >"$FIXTURE_DIR/issues.json" <<'JSON'
  {"number":103,"labels":[{"name":"loom:issue"},{"name":"loom:curated"}]},
  {"number":104,"labels":[{"name":"loom:curated"}]},
  {"number":105,"labels":[{"name":"loom:hermit"}]},
- {"number":107,"labels":[{"name":"loom:issue"},{"name":"loom:operator-only"}]},
+ {"number":107,"labels":[{"name":"loom:issue"},{"name":"loom:operator"}]},
  {"number":108,"labels":[{"name":"loom:building"},{"name":"loom:blocked"}]},
  {"number":201,"labels":[{"name":"loom:issue"},{"name":"loom:very-important"}]},
  {"number":301,"labels":[{"name":"loom:issue"},{"name":"loom:important"}]},
@@ -208,7 +208,7 @@ else
     # Negative control: drop the held-issue exclusion (#7613). The same
     # fixture must then count the two held issues, or the occupant
     # assertions above prove nothing.
-    sed 's/select(\[\.labels\[\]\.name\] | any(IN("loom:operator-only","loom:blocked","loom:frozen")) | not) |//' \
+    sed 's/select(\[\.labels\[\]\.name\] | any(IN("loom:operator","loom:blocked","loom:frozen")) | not) |//' \
         "$FIXTURE_DIR/balance.sh" >"$FIXTURE_DIR/balance-old.sh"
     if cmp -s "$FIXTURE_DIR/balance.sh" "$FIXTURE_DIR/balance-old.sh"; then
         fail "negative control: could not strip the held-issue filter (has the block changed shape?)"
