@@ -88,12 +88,12 @@ the same place as `loom:frozen`, writing nothing:
 Every targeted step ends in exactly one class. The class decides what the
 step-outcome ledger does next, so the four must be told apart:
 
-| Class | Meaning | Ledger effect (proposed) |
+| Class | Meaning | Ledger effect (#11900) |
 |---|---|---|
 | `verdict` | The role reached a decision that moved the item: Judge approved or requested changes, Builder opened a PR or parked the issue, Curator curated, parked or closed it | none; the next step comes from the labels |
-| `noop` | The role took (or evaluated) the item and found nothing to do | the existing per-item no-op cooldown |
-| `refused` | The item was not this step's to act on: wrong kind, wrong state, a skip label, a fresh peer claim, or the pool gate | none for a state refusal (the item must be re-classified); a short cooldown for `pool_gate` and `claimed` |
-| `failed` | The step did not complete for a reason unrelated to the item's state: a crash, a probe that could not answer, a claim left held | the fast-fail ladder |
+| `noop` | The role took (or evaluated) the item and found nothing to do | a cooldown per `(item, step)`, of the issue-keyed no-op cooldown's default length (1 h); `ci_pending` does not count toward the repeat cap |
+| `refused` | The item was not this step's to act on: wrong kind, wrong state, a skip label, a fresh peer claim, or the pool gate | a short cooldown for `pool_gate` and `claimed`; `claim_lost` redraws (counted). A state refusal re-classifies the item; a second identical one in a row on the same `(item, step)` arms the refusal cooldown, doubling to 24 h. No refusal counts toward the repeat cap |
+| `failed` | The step did not complete for a reason unrelated to the item's state: a crash, a probe that could not answer, a claim left held | fast, issue step: the fast-fail ladder; fast, PR step: the ledger's own doubling window (never the issue quarantine); slow: counted toward the repeat cap only |
 
 ### How the daemon tells them apart
 
@@ -173,8 +173,12 @@ without a sweep around it gets neither unless the engine does both.
   `/loom:curator <N>` still claims by label, with `claim-staleness.sh` and
   `stale_after_minutes` (`loom:curating`, 30) as the liveness, until its
   prompt is taught the lease.
-- **The classifier itself.** Nothing reads `LOOM_STEP_OUTCOME` or the
-  post-state table yet. The step-outcome ledger implements them.
+- **The classifier's forge reads.** The step-outcome ledger (#11900,
+  `loom-daemon/src/step_dispatch/outcome_ledger.rs`) parses
+  `LOOM_STEP_OUTCOME` and `CHAMPION-STEP`, applies the post-state rule
+  (`classify`) and maps each class to its effect. Computing each role's
+  post-state from the forge is the step spawn's (#11906), as is the Builder
+  no-op release above.
 - **Doctor** was out of this audit's scope (it was already targeted). Its PR
   Fix Mode has no kind probe: it should take gate 2 of the Judge row.
 - **The Judge lane assigner** hands fallback rows to `/loom:judge <PR>`. The

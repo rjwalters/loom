@@ -203,7 +203,7 @@ impl PickSkipReason {
         use PassReason as P;
         match exclusion {
             Exclusion::PoolExhausted => Self::Quota,
-            Exclusion::BuildBackoff => Self::Backoff,
+            Exclusion::BuildBackoff | Exclusion::CoolingDown => Self::Backoff,
             Exclusion::Pass(reason) => match reason {
                 P::Frozen | P::Operator | P::HardExclusion => Self::OperatorHold,
                 P::Claimed | P::Queued => Self::InFlight,

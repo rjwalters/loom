@@ -1034,6 +1034,7 @@ impl SweepRegistry {
             | peer_claims::ClaimKind::PrlessReleaseArmed
             | peer_claims::ClaimKind::PoolHoldArmed
             | peer_claims::ClaimKind::PoolHoldCleared
+            | peer_claims::ClaimKind::StepCooldownArmed
             | peer_claims::ClaimKind::Heartbeat => return,
         };
         if let Err(e) = tx.try_send(ad) {
@@ -1077,13 +1078,12 @@ impl SweepRegistry {
         let host = host_identity();
         let pid = std::process::id();
         let ts = Utc::now().to_rfc3339();
-        let remaining_secs = remaining.as_secs();
         let ad = match kind {
             peer_claims::ClaimKind::NoopCooldownArmed => {
-                ClaimAd::noop_cooldown_armed(issue, repo, host, pid, ts, remaining_secs)
+                ClaimAd::noop_cooldown_armed(issue, repo, host, pid, ts, remaining.as_secs())
             }
             peer_claims::ClaimKind::DispatchBackoffArmed => {
-                ClaimAd::dispatch_backoff_armed(issue, repo, host, pid, ts, remaining_secs)
+                ClaimAd::dispatch_backoff_armed(issue, repo, host, pid, ts, remaining.as_secs())
             }
             // Unreachable: every call site below passes one of the two kinds
             // above.

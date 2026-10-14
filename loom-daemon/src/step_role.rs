@@ -23,8 +23,8 @@
 //! keep-or-close, Champion re-evaluate, Champion hold re-evaluation, …). Each
 //! of those runs as one of the six roles here: keep-or-close as
 //! [`StepRole::Curator`], re-evaluate as [`StepRole::ChampionPromote`], hold
-//! re-evaluation as [`StepRole::ChampionMerge`]. Unifying the two enums, or
-//! adding `From<Step> for StepRole`, is left to the child that lands second.
+//! re-evaluation as [`StepRole::ChampionMerge`]. `From<Step> for StepRole`
+//! is that fold (#11900); the two enums stay separate.
 //!
 //! # Wire form
 //!
@@ -152,6 +152,23 @@ impl StepRole {
     }
 }
 
+/// The classifier's finer step folded onto the role that runs it (the module
+/// doc's "Relation to the item classifier"): the outcome ledger (#11900) keys
+/// on `(item, StepRole)`, the same pair a step claim and its peer ad carry.
+impl From<crate::work_finder::step_item::Step> for StepRole {
+    fn from(step: crate::work_finder::step_item::Step) -> Self {
+        use crate::work_finder::step_item::Step;
+        match step {
+            Step::Curator | Step::CuratorKeepOrClose => StepRole::Curator,
+            Step::ChampionPromote | Step::ChampionReevaluate => StepRole::ChampionPromote,
+            Step::Builder => StepRole::Builder,
+            Step::Judge => StepRole::Judge,
+            Step::Doctor => StepRole::Doctor,
+            Step::ChampionMerge | Step::ChampionHoldReevaluate => StepRole::ChampionMerge,
+        }
+    }
+}
+
 impl std::fmt::Display for StepRole {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
@@ -183,6 +200,28 @@ mod tests {
             assert_eq!(role.as_str().parse::<StepRole>().unwrap(), role);
         }
         assert!("sweep".parse::<StepRole>().is_err());
+    }
+
+    /// Every classifier step folds onto the role whose claim it takes.
+    #[test]
+    fn classifier_steps_fold_onto_their_role() {
+        use crate::work_finder::step_item::Step;
+        let table = [
+            (Step::Curator, StepRole::Curator),
+            (Step::CuratorKeepOrClose, StepRole::Curator),
+            (Step::ChampionPromote, StepRole::ChampionPromote),
+            (Step::ChampionReevaluate, StepRole::ChampionPromote),
+            (Step::Builder, StepRole::Builder),
+            (Step::Judge, StepRole::Judge),
+            (Step::Doctor, StepRole::Doctor),
+            (Step::ChampionMerge, StepRole::ChampionMerge),
+            (Step::ChampionHoldReevaluate, StepRole::ChampionMerge),
+        ];
+        for (step, role) in table {
+            assert_eq!(StepRole::from(step), role, "{step:?}");
+            assert_eq!(step.role(), role.role_name());
+            assert_eq!(step.acts_on_pr(), role.acts_on_pr(), "{step:?}");
+        }
     }
 
     /// Design §5's restore table, row by row.

@@ -169,10 +169,13 @@ A Builder restore with a verified open linked PR writes no label: the issue keep
 |---|---|
 | landed (`verdict:closed`) | Reclassify the item. No more Builder steps. |
 | `noop` | Cooldown per `(item, step)` |
-| fast `failed` | The #11872 ladder |
-| Champion re-evaluation left the item held or blocked | Ladder from 6 h to 7 d, **stored on the forge** in the park record or hold marker |
+| fast `failed` | Issue steps: the #11872 ladder. PR steps (Judge, Doctor, Champion merge): a ledger-local doubling window capped at 24 h, never the issue quarantine |
+| Champion re-evaluation left the item held or blocked | Ladder from 6 h to 7 d, **stored on the forge**: a `<!-- loom:reeval step=… rung=… next=… -->` line in the item's body, beside its park record or under its hold marker |
+| `refused`, `pool_gate` or `claimed` | A short cooldown per `(item, step)`, in force before the next tick |
+| `refused`, `claim_lost` | Redraw; counted |
+| any other `refused` | Reclassify the item |
 
-Short cooldowns are local and broadcast, bounded at 24 h (`sweep_registry/dispatch/landed_cooldown.rs:32`).
+**Bounds on repeats.** The ledger's repeat cap allows at most 3 runs of one `(item, step)` in 24 h without a state change, counting only steps that worked the item: a verdict, a `noop` other than `ci_pending`, and a `failed` (#11900). The outcomes it excludes have their own brakes. `ci_pending` gets the 1 h noop window. `pool_gate` and `claimed` get the 10 min refusal cooldown. A state refusal costs nothing the first time, but a second identical one in a row arms the refusal cooldown, doubling to 24 h. A `claim_lost` redraw never ran. The cap's run history is per host and in memory, so across N hosts the fleet-wide bound is about 2N + 1 runs. Short cooldowns are local and broadcast (`step_cooldown_armed`), bounded at 24 h on both ends (`step_dispatch/outcome_ledger.rs` `MAX_SHORT_COOLDOWN`, which the landed cooldown shares). The draw reads them, and the forge ladder's due times, as part of `actionable` (#11900).
 
 ## 6. Champion: promotion and merge
 
