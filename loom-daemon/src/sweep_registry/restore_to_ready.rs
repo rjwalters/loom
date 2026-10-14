@@ -41,6 +41,7 @@ use super::*;
 
 mod open_pr_veto;
 mod prior_label;
+mod step_restore;
 
 /// What a claim release did (#11743).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

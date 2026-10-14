@@ -364,8 +364,14 @@ impl SweepRegistry {
         self.entries
             .values()
             .filter(|info| {
-                matches!(info.kind, SweepKind::Issue(n) if n == issue)
-                    && matches!(info.state, SweepState::Running | SweepState::Pending)
+                // A Builder step self-reports its no-op release like the
+                // sweep's Builder does (#11898).
+                matches!(
+                    info.kind,
+                    SweepKind::Issue(n)
+                        | SweepKind::Step { item: n, role: crate::step_role::StepRole::Builder }
+                        if n == issue
+                ) && matches!(info.state, SweepState::Running | SweepState::Pending)
             })
             .max_by_key(|info| info.started_at)
             .map(|info| info.sweep_id.clone())

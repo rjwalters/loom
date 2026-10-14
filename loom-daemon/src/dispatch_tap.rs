@@ -183,11 +183,14 @@ pub fn validate_request(
     })?;
     let issue = match (kind, &tap) {
         (SweepKind::Issue(issue), _) => u64::from(*issue),
-        (SweepKind::PrSet(_), None) => return Ok(Planned::Nothing),
-        (SweepKind::PrSet(_), Some(_)) => {
+        (SweepKind::PrSet(_) | SweepKind::Step { .. }, None) => return Ok(Planned::Nothing),
+        // A step resolves its runtime through its role's resolvers (#11898
+        // design §4.4), never the issue-keyed tap.
+        (SweepKind::PrSet(_) | SweepKind::Step { .. }, Some(_)) => {
             return Err(Box::new(Response::Error {
                 message: "dispatch_sweep: runtime/modelProfile is only supported for issue \
-                          sweeps (a PR-set sweep has no issue to key the override on)"
+                          sweeps (a PR-set sweep has no issue to key the override on, and a \
+                          step uses its role's resolvers)"
                     .to_string(),
             }))
         }

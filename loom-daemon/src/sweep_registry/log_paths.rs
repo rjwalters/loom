@@ -23,4 +23,16 @@ impl SweepRegistry {
             .logs_dir()
             .join(format!("sweep-prs-{joined}.log"))
     }
+
+    /// The `Step` counterpart (#11898): one log per item and step role, so a
+    /// Judge step's log never interleaves with its issue's Builder log.
+    pub(crate) fn compute_step_log_path(
+        &self,
+        item: u32,
+        role: crate::step_role::StepRole,
+    ) -> PathBuf {
+        self.config
+            .logs_dir()
+            .join(format!("step-{role}-{item}.log"))
+    }
 }

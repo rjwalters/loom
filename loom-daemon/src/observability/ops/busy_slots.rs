@@ -25,7 +25,9 @@
 //! Absent, never a guessed zero: no occupancy reading, no `sweep` point; no
 //! role-runner guard in the process, no role points. A PR-set sweep
 //! (`/loom:sweep --prs`, dispatched only by hand) is in neither pool and is
-//! not counted.
+//! not counted. A step (`SweepKind::Step`, #11898) draws from the sweep pool
+//! (design #11894 §4.4), so it is in the tick's occupancy and counted under
+//! `role="sweep"`, one slot per step, whatever its role.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;

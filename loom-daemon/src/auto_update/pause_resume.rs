@@ -1217,3 +1217,7 @@ pub(crate) mod test_support;
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[path = "pause_resume/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "pause_resume/step_tests.rs"]
+mod step_tests;

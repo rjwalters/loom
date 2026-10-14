@@ -93,11 +93,12 @@ impl SweepRegistry {
                 self.start_facts.insert(sweep_id.clone(), facts.clone());
                 Some(Box::new(facts))
             }
-            _ => None,
+            // A step's start facts are the step spawn's (#11906).
+            (SweepKind::Issue(_) | SweepKind::Step { .. } | SweepKind::PrSet(_), _) => None,
         };
         let curator_issue = match (&kind, &start) {
             (SweepKind::Issue(issue), Some(_)) => Some(*issue),
-            _ => None,
+            (SweepKind::Issue(_) | SweepKind::Step { .. } | SweepKind::PrSet(_), _) => None,
         };
         self.emit_event(Event::SweepGlobalDispatch {
             sweep_id: sweep_id.clone(),
