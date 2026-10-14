@@ -63,13 +63,19 @@ pub struct IntakeRow {
     pub author: Option<String>,
 }
 
+/// Whether `label` is in the `loom:*` namespace.
+#[must_use]
+pub(super) fn is_loom_label(label: &str) -> bool {
+    label.starts_with("loom:")
+}
+
 /// Issue numbers that need `loom:triage`: no `loom:*` label, old enough, oldest
 /// first, at most `cap`.
 #[must_use]
 pub fn select_unlabeled(rows: &[IntakeRow], now: DateTime<Utc>, cap: usize) -> Vec<u32> {
     let mut picked: Vec<&IntakeRow> = rows
         .iter()
-        .filter(|r| !r.labels.iter().any(|l| l.starts_with("loom:")))
+        .filter(|r| !r.labels.iter().any(|l| is_loom_label(l)))
         .filter(|r| {
             r.created_at
                 .is_none_or(|c| now - c >= Duration::seconds(MIN_AGE_SECS))

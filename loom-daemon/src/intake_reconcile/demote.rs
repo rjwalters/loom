@@ -74,7 +74,7 @@ pub fn window_secs() -> i64 {
 #[must_use]
 pub fn demote_eligible(labels: &[String]) -> bool {
     let mut any = false;
-    for l in labels.iter().filter(|l| l.starts_with("loom:")) {
+    for l in labels.iter().filter(|l| super::is_loom_label(l)) {
         if DEMOTE_LABELS.contains(&l.as_str()) {
             any = true;
         } else if !DEMOTE_COMPANIONS.contains(&l.as_str()) {

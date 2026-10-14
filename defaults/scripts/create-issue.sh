@@ -210,23 +210,14 @@ while [[ $# -gt 0 ]]; do
         # Issues enter at loom:triage (#11820, operator ruling 2026-10-13):
         # opening one as loom:issue or loom:curated skips Curator admission.
         # Refused here, before any forge call.
-        case "$_l" in
-          loom:issue | loom:curated)
-            echo "create-issue.sh: refusing --label $_l: issues enter at loom:triage" \
-              "and reach $_l through Curator admission. Use --label loom:triage" \
-              "(or no --label: the default is loom:triage)." >&2
-            exit 2
-            ;;
-        esac
+        [[ "$_l" =~ ^loom:(issue|curated)$ ]] && {
+          echo "create-issue.sh: refusing --label $_l: issues enter at loom:triage and reach $_l through Curator admission. Use --label loom:triage (or no --label: the default)." >&2; exit 2; }
         [[ -n "$_l" ]] && LABELS+=("$_l")
       done
       shift 2
       ;;
     --repo | -R) REPO_NWO="${2:-}"; shift 2 ;;
-    --force | --skip-duplicate-check)
-      SKIP_DUP_CHECK=true
-      shift
-      ;;
+    --force | --skip-duplicate-check) SKIP_DUP_CHECK=true; shift ;;
     --parent) PARENT="${2:-}"; shift 2 ;;
     --duplicate-threshold)
       DUP_THRESHOLD="${2:-}"

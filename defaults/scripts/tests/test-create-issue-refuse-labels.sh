@@ -2,7 +2,7 @@
 # test-create-issue-refuse-labels.sh — create-issue.sh refuses to open an
 # issue as `loom:issue` or `loom:curated` (#11820).
 #
-# Operator ruling (2026-10-13, 2AMLogic/2am#4408): issues enter at
+# Operator ruling (2026-10-13): issues enter at
 # `loom:triage`. One opened as `loom:issue`/`loom:curated` skips intake, the
 # Curator and approval. The daemon's intake reconcile demotes such issues
 # after the fact; this script refuses them up front.
