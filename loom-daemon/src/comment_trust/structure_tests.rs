@@ -87,8 +87,8 @@ const MARKER_FILES: &[(&str, &str)] = &[
         "sweep_registry/guards.rs",
         "writer; reader in read_lease_comments (FETCH_SITES)",
     ),
+    ("sweep_registry/fast_fail_park.rs", "writer (quarantine park comment, #11854)"),
     ("sweep_registry/quarantine.rs", "writer"),
-    ("sweep_registry/fast_fail_park.rs", "writer (#11854 park comment)"),
     (
         "sweep_registry/outcome_journal/label_timeline.rs",
         "#9062 timeline flag rows, trusted via policy.trusts_json in parse_label_events",
