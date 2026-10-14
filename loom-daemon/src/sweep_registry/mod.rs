@@ -118,6 +118,7 @@ pub use model::generate_sweep_id;
 mod config_paths;
 mod decline_cooldown;
 mod dispatch;
+mod fast_fail_fleet;
 mod fast_fail_park;
 mod frozen_write;
 mod guards;
