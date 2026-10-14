@@ -428,30 +428,31 @@ fn set_claim_event_now(ws: &Path, actor: &str) {
     std::fs::write(&fake_gh, patched).unwrap();
 }
 
-/// **#10345 AC3.** A leaseless yield whose `loom:building` event was created by
-/// this daemon's own fleet identity inside its own flip window is a phantom:
-/// the label is reverted (`loom:building` removed, `loom:issue` restored) as
-/// part of the standdown.
+/// #10337: a whole-second own event can predate the subsecond episode start.
+/// Reuse the flip-anchored fixture from #10345; an attributed own claim must
+/// retain a live sweep instead of yielding and then cleaning up its own label.
 #[test]
 #[serial]
-fn leaseless_yield_to_own_flip_reverts_the_phantom_label() {
+fn dispatch_proceeds_past_its_own_truncated_building_flip() {
     let dir = tempdir().unwrap();
     let (mut registry, gh_log, spawn_log, _store) = lease_order_dispatch_registry(dir.path(), &[]);
     set_claim_event_now(dir.path(), "loom-fleet-dispatch");
 
-    let err = registry
-        .dispatch(&SweepKind::Issue(10345), None, None, None, None)
-        .expect_err("a leaseless label inside the own flip window still yields");
-    assert!(err.downcast_ref::<LeaseOrderDispatchError>().is_some(), "got: {err:#}");
-    assert!(!spawn_log.exists(), "no builder may spawn");
+    let outcome = registry
+        .dispatch(&SweepKind::Issue(10337), None, None, None, None)
+        .expect("an attributed own building flip must not make dispatch yield to itself");
+    assert!(outcome.was_new);
+    assert!(
+        wait_for_contents(&spawn_log, "spawned", FIXTURE_CHILD_WAIT_MS),
+        "the builder must spawn for the dispatcher's own claim"
+    );
+    assert_eq!(registry.len(), 1, "the dispatched sweep must remain live");
     let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
     assert!(
-        gh_calls.contains("--remove-label loom:building"),
-        "the phantom loom:building must be removed; gh log: {gh_calls}"
-    );
-    assert!(
-        gh_calls.contains("--add-label loom:issue"),
-        "loom:issue must be restored; gh log: {gh_calls}"
+        !gh_calls.contains("loom:lease-yield")
+            && !gh_calls.contains("--remove-label loom:building")
+            && !gh_calls.contains("--add-label loom:issue"),
+        "an own claim must stay building without yielding or resetting; gh log: {gh_calls}"
     );
 }
 
@@ -462,7 +463,7 @@ fn leaseless_yield_to_own_flip_reverts_the_phantom_label() {
 fn leaseless_yield_to_a_foreign_actor_keeps_the_label() {
     let dir = tempdir().unwrap();
     let (mut registry, gh_log, spawn_log, _store) = lease_order_dispatch_registry(dir.path(), &[]);
-    set_claim_event(dir.path(), "some-human", 1);
+    set_claim_event_now(dir.path(), "some-human");
 
     let err = registry
         .dispatch(&SweepKind::Issue(10346), None, None, None, None)
@@ -475,6 +476,62 @@ fn leaseless_yield_to_a_foreign_actor_keeps_the_label() {
             && !gh_calls.contains("--add-label loom:issue"),
         "a foreign hand-claim's label must be left intact; gh log: {gh_calls}"
     );
+}
+
+/// Sharing a forge actor does not make a peer's lease this dispatcher's own.
+#[test]
+#[serial]
+fn own_window_fleet_label_does_not_override_a_foreign_lease() {
+    let dir = tempdir().unwrap();
+    let (mut registry, gh_log, spawn_log, store) = lease_order_dispatch_registry(dir.path(), &[]);
+    set_claim_event_now(dir.path(), "loom-fleet-dispatch");
+    seed_renewed_lease(&store, "<!-- loom:lease host=peer-host sweep=peer-sweep -->", 1, 1);
+    let err = registry
+        .dispatch(&SweepKind::Issue(10348), None, None, None, None)
+        .expect_err("same-window fleet actor must not override the peer's earlier lease");
+    let lease_err = err.downcast_ref::<LeaseOrderDispatchError>().unwrap();
+    assert_eq!(lease_err.earliest_host, "peer-host");
+    assert!(!spawn_log.exists());
+    let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+    assert!(calls.contains("loom:lease-yield"));
+    assert!(!calls.contains("--remove-label loom:building"));
+}
+
+/// A later read must not waive the label guard on missing ownership evidence.
+#[test]
+#[serial]
+fn own_window_label_keeps_yield_when_fresh_lease_evidence_changes() {
+    for mode in ["foreign", "empty", "unreadable"] {
+        let dir = tempdir().unwrap();
+        let (mut registry, gh_log, spawn_log, store) =
+            lease_order_dispatch_registry(dir.path(), &[]);
+        set_claim_event_now(dir.path(), "loom-fleet-dispatch");
+        let peer = dir.path().join("late-peer.jsonl");
+        seed_renewed_lease(&peer, "<!-- loom:lease host=peer-host sweep=peer-sweep -->", 1, 1);
+        let flag = dir.path().join("attribution-started");
+        let action = match mode {
+            "foreign" => format!("cat '{}' >> '{}'", peer.display(), store.display()),
+            "empty" => format!(": > '{}'", store.display()),
+            _ => format!("touch '{}'", flag.display()),
+        };
+        let fake = dir.path().join("fake-gh.sh");
+        let script = std::fs::read_to_string(&fake).unwrap();
+        let hook = format!(
+            "#!/usr/bin/env bash\n\
+             if [[ \"$*\" == *\"/timeline\"* && \"$*\" == *max_by* ]]; then {action}; fi\n\
+             if [[ \"$*\" == *\"/comments\"* && -f '{}' ]]; then exit 1; fi\n",
+            flag.display(),
+        );
+        std::fs::write(&fake, script.replacen("#!/usr/bin/env bash\n", &hook, 1)).unwrap();
+        let err = registry
+            .dispatch(&SweepKind::Issue(10349), None, None, None, None)
+            .expect_err("own actor/time cannot override missing or foreign lease evidence");
+        assert!(err.downcast_ref::<LeaseOrderDispatchError>().is_some(), "{mode}: {err:#}");
+        assert!(!spawn_log.exists(), "{mode}: must not spawn");
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(calls.contains("loom:lease-yield"), "{mode}: must yield");
+        assert!(!calls.contains("--remove-label loom:building"), "{mode}: retain label");
+    }
 }
 
 /// The shared bot identity at an unrelated time is another lane's claim.

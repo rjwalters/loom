@@ -1649,8 +1649,8 @@ impl SweepRegistry {
     /// [`LeaseOrderDecision::YieldToLeaselessClaim`] — see
     /// [`SweepRegistry::resolve_leaseless_claim_order`] for why a bare label is
     /// evidence only now that Phase 2 leases every compliant lane, and
-    /// [`claim_label::claim_label_is_live_foreign`] for why the event this
-    /// dispatcher's own flip just created cannot trigger it.
+    /// [`claim_label::claim_label_is_live_foreign`] for the timestamp predicate.
+    /// Dispatch separately verifies an own flip before honoring a leaseless yield.
     ///
     /// The leg is additive and changes nothing when a lease comment IS found:
     /// with any foreign record in-window the comment-order verdict stands

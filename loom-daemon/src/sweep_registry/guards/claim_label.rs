@@ -192,12 +192,11 @@ pub(crate) fn is_sole_claimant(in_window: &[&LeaseComment], host: &str, sweep_id
 /// (Issue #9453 Phase 3.1). Pure, so the two properties it encodes can be
 /// pinned without a `gh` fixture:
 ///
-/// - **Foreign**: strictly OLDER than `episode_start`. This dispatcher captures
-///   `episode_start` immediately *before* its own label flip, so the event its
-///   own flip creates is always newer — without this leg every uncontested
-///   dispatch would yield to itself. (When the label was already present, the
-///   flip is a no-op that creates no event at all, so the newest event remains
-///   the foreign claimant's.)
+/// - **Potentially foreign**: strictly OLDER than `episode_start`. Forge
+///   timestamps truncate to whole seconds, so even an own flip can match.
+///   Dispatch only waives that candidate using the actor/window/lease proof in
+///   [`SweepRegistry::leaseless_yield_is_own_phantom`], never a time-only slack.
+///   An already-present label creates no new event when flipped.
 /// - **Live**: no older than [`LEASELESS_CLAIM_LABEL_GRACE_SECS`]. An older
 ///   label is the shape a finished or abandoned claim leaves behind, and
 ///   yielding to it forever would wedge redispatch — the same anti-wedge
@@ -268,14 +267,14 @@ impl SweepRegistry {
         parse_claim_event(&output.stdout)
     }
 
-    /// Whether a leaseless yield's `loom:building` label is *provably* this
-    /// dispatcher's own phantom (Issue #10345), so it may be reverted.
+    /// Whether a candidate leaseless yield refers to this dispatcher's own
+    /// flip (#10345), so dispatch can proceed without yielding to itself (#10337).
     ///
     /// Requires: the newest label event is attributable to this dispatcher's
     /// flip ([`claim_event_is_own_flip`]), AND a fresh lease-comment read shows
-    /// no lease record other than this sweep's own. FAIL-CLOSED: every
-    /// unverifiable read returns `false` (keep the label, as before #10345) so
-    /// a real hand-claim's mutex (#5270/#9453) is never destroyed on a guess.
+    /// this sweep's own lease and no foreign record. FAIL-CLOSED: an empty or
+    /// unverifiable read returns `false`; retain the yield and label so a real
+    /// hand-claim's mutex (#5270/#9453) is never overridden on a guess.
     pub(crate) fn leaseless_yield_is_own_phantom(
         &self,
         issue: u32,
@@ -294,9 +293,10 @@ impl SweepRegistry {
         let Some(comments) = self.read_lease_comments(issue) else {
             return false;
         };
-        comments
-            .iter()
-            .all(|c| c.host == host && c.sweep_id == sweep_id)
+        !comments.is_empty()
+            && comments
+                .iter()
+                .all(|c| c.host == host && c.sweep_id == sweep_id)
     }
 }
 
