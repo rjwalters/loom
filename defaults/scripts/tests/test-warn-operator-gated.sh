@@ -314,9 +314,9 @@ assert_contains "$out" $'94\t⚠ depends on #6, which is loom:operator-only' \
 out="$(LOOM_TEST_GATE_LABELS=$'loom:operator\nloom:operator-only' run_warn "94")"
 assert_contains "$out" $'94\t⚠ depends on #6, which is loom:operator-only' \
     "--with-retired: the registry's retired alias is flagged"
-out="$(LOOM_TEST_GATE_LABELS_OLD=$'loom:operator-only' run_warn "94")"
+out="$(LOOM_TEST_GATE_LABELS_OLD=$'loom:operator' run_warn "94")"
 assert_contains "$out" $'94\t⚠ depends on #6, which is loom:operator-only' \
-    "a pre-#11795 daemon (no --with-retired) is asked again without the flag"
+    "a pre-#11795 daemon (no --with-retired) falls back to the set naming the retired base label"
 
 # The real registry, when a built daemon is available: --with-retired must
 # answer loom:operator plus its retired aliases, and only those.

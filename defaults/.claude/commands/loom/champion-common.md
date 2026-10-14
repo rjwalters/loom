@@ -142,6 +142,21 @@ PR Lifecycle:
 (created) -> loom:review-requested -> [Judge] -> loom:pr -> [Champion merges] -> (merged)
 ```
 
+### Hold set (#11795)
+
+Champion's hold filters read the registry, never a hand list: until `labels
+migrate` reaches an item it may still carry a retired hold name, which must
+still count as held (#11843 drops `--with-retired`). The fallback is for a
+daemon without the flag. Each block that filters on holds starts with:
+
+```bash
+HOLDS=$(loom-daemon labels list --property hold --with-retired 2>/dev/null || printf 'loom:blocked\nloom:operator\nloom:frozen'); export HOLDS
+OP_HOLDS=$(loom-daemon labels list --property operator_gate --with-retired 2>/dev/null || echo loom:operator); export OP_HOLDS
+```
+
+and matches with `($ENV.HOLDS | split("\n")) as $h | ... IN($h[])` (`$o` for
+`OP_HOLDS`, the operator holds alone).
+
 ---
 
 ## Notes
@@ -405,8 +420,9 @@ against the **dependent** issue/PR being evaluated in the current repo
 DEPENDENT_ISSUE=<the issue/PR being evaluated, in the CURRENT repo>
 
 # Terminal state check first — never re-comment or re-tally once a human owns this.
+OP_HOLDS=$(loom-daemon labels list --property operator_gate --with-retired 2>/dev/null || echo loom:operator); export OP_HOLDS  # "Hold set" above
 ALREADY_ROUTED=$(gh issue view "$DEPENDENT_ISSUE" --json labels --jq \
-  '.labels[] | select(.name=="loom:operator")' 2>/dev/null)
+  '($ENV.OP_HOLDS | split("\n")) as $o | .labels[] | select(.name | IN($o[]))' 2>/dev/null)
 if [ -n "$ALREADY_ROUTED" ]; then
   # Stays unconditional HERE (#5664). champion-issue-promo.md's equivalent
   # short-circuit became conditional so a dependency-only escalation can

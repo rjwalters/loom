@@ -395,11 +395,14 @@ has_label() { printf '%s\n' "$LABELS" | grep -qx -- "$1"; }
 # pass) deliberately took out of automated flow. Echoes the first one present,
 # or nothing. Shared by --clear (step 5) and --anchor (step 3b) so the two
 # write paths can never disagree about what "parked" means. The set is the
-# registry's three holds (#11795); label_literal_guard.rs pins it between the
-# registry's `park` and `hold` properties.
+# registry's holds plus the retired names `labels migrate` has not moved yet
+# (#11795; #11843 drops --with-retired). The fallback (missing or older daemon)
+# is pinned by label_literal_guard.rs between the registry's `park` and `hold`
+# properties.
 hold_label() {
   local held
-  for held in "loom:blocked" "loom:operator" "loom:frozen"; do
+  # requires-daemon: labels optional   a missing or older binary takes the fallback list
+  for held in $("${LOOM_DAEMON_BIN:-loom-daemon}" labels list --property hold --with-retired 2>/dev/null || echo loom:blocked loom:operator loom:frozen loom:operator-only loom:operator-decision loom:operator-mechanical loom:operator-blocked loom:needs-capability); do
     if has_label "$held"; then echo "$held"; return 0; fi
   done
   echo ""

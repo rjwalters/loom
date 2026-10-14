@@ -187,9 +187,12 @@ PRIOR_REJECTIONS=$(printf '%s\n' "$EPIC_JSON" | jq \
 # A human owns the epic when it carries ANY of the three labels 0c's close-branch
 # criterion 3 refuses to close past (#7734, #11795): loom:operator is Step 4's
 # own terminal state and an operator's park; loom:blocked / loom:frozen are
-# parks, which escalating would silently undo. All three end the pass identically.
+# parks, which escalating would silently undo. All end the pass identically.
+# Registry sets: champion-common.md "Hold set".
+HOLDS=$(loom-daemon labels list --property hold --with-retired 2>/dev/null || printf 'loom:blocked\nloom:operator\nloom:frozen'); export HOLDS
+OP_HOLDS=$(loom-daemon labels list --property operator_gate --with-retired 2>/dev/null || echo loom:operator); export OP_HOLDS
 HELD_BY=$(printf '%s\n' "$EPIC_JSON" | jq -r \
-  '[.labels[].name | select(. == "loom:operator" or . == "loom:blocked" or . == "loom:frozen")] | join(",")')
+  '($ENV.HOLDS | split("\n")) as $h | [.labels[].name | select(IN($h[]))] | join(",")')
 ALREADY_ROUTED=$([ -n "$HELD_BY" ] && echo yes || echo no)
 SKIP_STREAK=0            # silent skips already recorded for THIS body revision
 ESCALATE_UNREVISED=no    # set to yes to bypass re-evaluation and go straight to Step 4's escalation
@@ -239,7 +242,7 @@ elif printf '%s\n' "$EPIC_JSON" | jq -e --arg m "$VERDICT_MARKER" \
   BOT_UNESCALATABLE=$(printf '%s\n' "$EPIC_JSON" | jq -e \
     '.comments[] | select(.body | contains("<!-- champion:proposal-escalated -->"))' >/dev/null && echo yes || echo no)
   UNPARKED_AT=$(gh api "repos/{owner}/{repo}/issues/$EPIC_NUMBER/timeline" --paginate \
-    --jq '.[] | select(.event == "unlabeled" and .label.name == "loom:operator") | .created_at' \
+    --jq '($ENV.OP_HOLDS | split("\n")) as $o | .[] | select(.event == "unlabeled" and (.label.name | IN($o[]))) | .created_at' \
     | sort | tail -n 1)
   # Unknown inputs fail OPEN, never closed (#7965): an empty VERDICT_CREATED_AT
   # is a failed REST re-read, and `> ""` would match ANY historical un-park.

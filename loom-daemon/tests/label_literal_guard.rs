@@ -348,7 +348,7 @@ fn verdict_staleness_guard_hold_set_is_bounded_by_the_registry() {
 /// replacement).
 #[test]
 fn warn_operator_gated_dep_labels_are_operator_gate_labels() {
-    let anchor = Regex::new(r"for dep_label in ").expect("regex");
+    let anchor = Regex::new(r"--property operator_gate --with-retired").expect("regex");
     let set = loop_label_set("warn-operator-gated.sh", &anchor);
     assert!(!set.is_empty());
     let gate = names_with_retired("operator_gate");

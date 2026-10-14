@@ -78,11 +78,12 @@ promoted (`loom:issue` / `loom:building`), unheld (#7613) issues per level.
 ```bash
 check_backlog_balance() {
   echo "=== Backlog Level Balance ==="
-  # Promoted (loom:issue/loom:building), unheld (#7613) issues, by level; loom:frozen dropped too.
+  # Promoted (loom:issue/loom:building), unheld (#7613) issues, by level; holds: champion-common.md "Hold set".
+  HOLDS=$(loom-daemon labels list --property hold --with-retired 2>/dev/null || printf 'loom:blocked\nloom:operator\nloom:frozen'); export HOLDS
   promoted_json=$( { gh issue list --label="loom:issue" --state=open --limit 500 --json number,labels
     gh issue list --label="loom:building" --state=open --limit 500 --json number,labels; } |
-    jq -s 'add | unique_by(.number) |
-    [.[] | select([.labels[].name] | any(IN("loom:operator","loom:blocked","loom:frozen")) | not) |
+    jq -s '($ENV.HOLDS | split("\n")) as $h | add | unique_by(.number) |
+    [.[] | select([.labels[].name] | any(IN($h[])) | not) |
     {number, level: ([.labels[].name] | if index("loom:very-important") then "loom:very-important"
       elif index("loom:important") then "loom:important" else "default" end)}]')
   _occupants() { printf '%s' "$promoted_json" | jq -r --arg l "$1" \
@@ -767,16 +768,18 @@ VERDICT_MARKER="<!-- champion:proposal-verdict:body-$BODY_HASH -->"
 # reaching Step 4. Step 4 reuses these same variables.
 PRIOR_REJECTIONS=$(printf '%s\n' "$ISSUE_JSON" | jq \
   '[.comments[] | select(.body | contains("Champion Review: NEEDS REVISION"))] | length')
-# A human owns the proposal when it carries ANY of the three holds (#8245,
-# #11795): loom:operator is Step 4's own terminal state and an operator's
-# park; loom:blocked / loom:frozen are parks, which escalating would silently
-# undo. All three end the pass identically.
+# A human owns the proposal when it carries ANY hold (#8245, #11795):
+# loom:operator is Step 4's own terminal state and an operator's park;
+# loom:blocked / loom:frozen are parks, which escalating would silently undo.
+# All end the pass identically. Registry sets: champion-common.md "Hold set".
+HOLDS=$(loom-daemon labels list --property hold --with-retired 2>/dev/null || printf 'loom:blocked\nloom:operator\nloom:frozen'); export HOLDS
+OP_HOLDS=$(loom-daemon labels list --property operator_gate --with-retired 2>/dev/null || echo loom:operator); export OP_HOLDS
 HELD_BY=$(printf '%s\n' "$ISSUE_JSON" | jq -r \
-  '[.labels[].name | select(. == "loom:operator" or . == "loom:blocked" or . == "loom:frozen")] | join(",")')
+  '($ENV.HOLDS | split("\n")) as $h | [.labels[].name | select(IN($h[]))] | join(",")')
 ALREADY_ROUTED=$([ -n "$HELD_BY" ] && echo yes || echo no)
-# The self-healing un-escalation below can only ever clear loom:operator, so
-# it is gated on that ONE label — never on the whole set.
-OPERATOR_PRESENT=$(printf '%s\n' "$ISSUE_JSON" | jq -e '.labels[] | select(.name=="loom:operator")' >/dev/null && echo yes || echo no)
+# The self-healing un-escalation below can only ever clear the operator hold,
+# so it is gated on that hold alone (OP_HOLDS) — never on the whole set.
+OPERATOR_PRESENT=$(printf '%s\n' "$ISSUE_JSON" | jq -e '($ENV.OP_HOLDS | split("\n")) as $o | .labels[] | select(.name | IN($o[]))' >/dev/null && echo yes || echo no)
 SKIP_STREAK=0            # silent skips already recorded for THIS body revision
 ESCALATE_UNREVISED=no    # set to yes to bypass re-evaluation and go straight to Step 4's escalation
 FORCE_REEVALUATE=no      # set to yes when an escalation was just undone (#5664)
@@ -842,7 +845,7 @@ if [ "$FORCE_REEVALUATE" = "no" ] && printf '%s\n' "$ISSUE_JSON" | jq -e --arg m
   BOT_UNESCALATED_AT=$(printf '%s\n' "$ISSUE_JSON" | jq -r \
     '[.comments[] | select(.body | contains("<!-- champion:proposal-unescalated")) | .createdAt] | max // ""')
   UNPARKED_AT=$(gh api "repos/{owner}/{repo}/issues/$ISSUE_NUMBER/timeline" --paginate \
-    --jq '.[] | select(.event == "unlabeled" and .label.name == "loom:operator") | .created_at' \
+    --jq '($ENV.OP_HOLDS | split("\n")) as $o | .[] | select(.event == "unlabeled" and (.label.name | IN($o[]))) | .created_at' \
     | sort | tail -n 1)
   # Unknown inputs fail OPEN, never closed (#7965's rule): an empty
   # VERDICT_CREATED_AT is a failed REST re-read, and `> ""` matches ANY un-park.

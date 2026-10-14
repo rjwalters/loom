@@ -99,13 +99,14 @@ for it, #4966):
 > than looping forever — see Pass 0b for the bound.
 
 ```bash
-# Level, then oldest first (#11103)
+# Level, then oldest first (#11103); holds: champion-common.md "Hold set"
+HOLDS=$(loom-daemon labels list --property hold --with-retired 2>/dev/null || printf 'loom:blocked\nloom:operator\nloom:frozen'); export HOLDS
 gh issue list \
   --label="loom:curated" \
   --state=open \
   --limit=500 \
   --json number,title,body,labels,comments,createdAt \
-  --jq 'sort_by([([.labels[].name] | if index("loom:very-important") then 0 elif index("loom:important") then 1 else 2 end), .createdAt]) | .[] | select([.labels[].name] | any(IN("loom:evaluating","loom:operator","loom:blocked","loom:issue","loom:building","loom:needs-revision","loom:frozen")) | not) |
+  --jq '($ENV.HOLDS | split("\n")) as $h | sort_by([([.labels[].name] | if index("loom:very-important") then 0 elif index("loom:important") then 1 else 2 end), .createdAt]) | .[] | select([.labels[].name] | any(IN("loom:evaluating","loom:issue","loom:building","loom:needs-revision") or IN($h[])) | not) |
   "#\(.number) \(.title)"'
 ```
 
@@ -124,13 +125,14 @@ required) and `title`/`body` fetch:
 
 ```bash
 # Architect proposals, Hermit proposals, Auditor bug reports
+HOLDS=$(loom-daemon labels list --property hold --with-retired 2>/dev/null || printf 'loom:blocked\nloom:operator\nloom:frozen'); export HOLDS
 for P in architect hermit auditor; do
 gh issue list \
   --label="loom:$P" \
   --state=open \
   --limit=500 \
   --json number,title,body,labels,comments,createdAt \
-  --jq 'sort_by([([.labels[].name] | if index("loom:very-important") then 0 elif index("loom:important") then 1 else 2 end), .createdAt]) | .[] | select([.labels[].name] | any(IN("loom:evaluating","loom:operator","loom:blocked","loom:issue","loom:building","loom:needs-revision","loom:frozen")) | not) |
+  --jq '($ENV.HOLDS | split("\n")) as $h | sort_by([([.labels[].name] | if index("loom:very-important") then 0 elif index("loom:important") then 1 else 2 end), .createdAt]) | .[] | select([.labels[].name] | any(IN("loom:evaluating","loom:issue","loom:building","loom:needs-revision") or IN($h[])) | not) |
   "#\(.number) \(.title) ['"$P"']"'
 done
 ```

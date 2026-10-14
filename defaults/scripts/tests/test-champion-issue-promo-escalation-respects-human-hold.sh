@@ -119,12 +119,14 @@ guard_block() {
 }
 
 # Every `loom:*` label literally named in the line(s) deriving the hold decision:
-# the HELD_BY assignment and its jq continuation, or -- on the pre-fix form --
-# the single-label ALREADY_ROUTED assignment.
+# the HOLDS assignment (since #11795 the registry query, whose literal names are
+# its older-daemon fallback), the HELD_BY assignment and its jq continuation,
+# or -- on the pre-fix form -- the single-label ALREADY_ROUTED assignment.
 hold_labels_of() {
     guard_block "$1" \
         | cut -f2- \
         | awk '
+            /^HOLDS=/ { print }
             /^HELD_BY=/ || /^ALREADY_ROUTED=\$\(printf/ { grab = 2 }
             grab > 0 { print; grab-- }
         ' \
@@ -132,15 +134,26 @@ hold_labels_of() {
         | LC_ALL=C sort -u
 }
 
-# 0 if the guard block reads the timeline for an `unlabeled loom:operator`
-# event, compares it against a verdict `created_at`, and derives OPERATOR_RULED
+# 0 if the hold sets come from the registry with the retired names included
+# (#11795): HOLDS from `--property hold --with-retired`, OP_HOLDS from
+# `--property operator_gate --with-retired`, and HELD_BY matching $ENV.HOLDS.
+has_registry_hold_sets() {
+    local block
+    block="$(guard_block "$1" | cut -f2-)"
+    grep -qE '^HOLDS=\$\(loom-daemon labels list --property hold --with-retired' <<<"$block" \
+        && grep -qE '^OP_HOLDS=\$\(loom-daemon labels list --property operator_gate --with-retired' <<<"$block" \
+        && grep -qF '$ENV.HOLDS' <<<"$block"
+}
+
+# 0 if the guard block reads the timeline for an `unlabeled` event of any
+# operator-hold name (OP_HOLDS, retired names included since #11795), compares it against a verdict `created_at`, and derives OPERATOR_RULED
 # from that comparison; 1 otherwise.
 has_unpark_check() {
     local block
     block="$(guard_block "$1" | cut -f2-)"
     grep -qE 'issues/\$ISSUE_NUMBER/timeline' <<<"$block" \
         && grep -qE '\.event == "unlabeled"' <<<"$block" \
-        && grep -qE '\.label\.name == "loom:operator"' <<<"$block" \
+        && grep -qE '\.label\.name \| IN\(\$o\[\]\)' <<<"$block" \
         && grep -qE 'VERDICT_CREATED_AT=.*created_at' <<<"$block" \
         && grep -qE 'UNPARKED_AT.*>.*VERDICT_CREATED_AT' <<<"$block" \
         && grep -qE '^ *OPERATOR_RULED=yes' <<<"$block"
@@ -195,14 +208,16 @@ cat >"$FIXTURE_DIR/post-fix.md" <<'EOF'
 
 ```bash
 PRIOR_REJECTIONS=$(printf '%s\n' "$ISSUE_JSON" | jq '[.comments[]] | length')
+HOLDS=$(loom-daemon labels list --property hold --with-retired 2>/dev/null || printf 'loom:blocked\nloom:operator\nloom:frozen'); export HOLDS
+OP_HOLDS=$(loom-daemon labels list --property operator_gate --with-retired 2>/dev/null || echo loom:operator); export OP_HOLDS
 HELD_BY=$(printf '%s\n' "$ISSUE_JSON" | jq -r \
-  '[.labels[].name | select(. == "loom:operator" or . == "loom:blocked" or . == "loom:frozen")] | join(",")')
+  '($ENV.HOLDS | split("\n")) as $h | [.labels[].name | select(IN($h[]))] | join(",")')
 ALREADY_ROUTED=$([ -n "$HELD_BY" ] && echo yes || echo no)
 OPERATOR_RULED=no
 if true; then
   VERDICT_CREATED_AT=$(printf '%s\n' "$VERDICT_COMMENT" | jq -r '.created_at // ""')
   UNPARKED_AT=$(gh api "repos/{owner}/{repo}/issues/$ISSUE_NUMBER/timeline" --paginate \
-    --jq '.[] | select(.event == "unlabeled" and .label.name == "loom:operator") | .created_at' \
+    --jq '($ENV.OP_HOLDS | split("\n")) as $o | .[] | select(.event == "unlabeled" and (.label.name | IN($o[]))) | .created_at' \
     | sort | tail -n 1)
   if [ -n "$UNPARKED_AT" ] && [[ "$UNPARKED_AT" > "$VERDICT_CREATED_AT" ]]; then
     OPERATOR_RULED=yes
@@ -231,6 +246,16 @@ if has_unpark_check "$FIXTURE_DIR/pre-fix.md"; then
 else
     pass "a guard with no timeline un-park check is reported"
 fi
+if has_registry_hold_sets "$FIXTURE_DIR/pre-fix.md"; then
+    fail "pre-fix fixture (literal hold label) was accepted as registry-derived (lint is vacuous)"
+else
+    pass "a guard with a hand-listed hold set is reported"
+fi
+if has_registry_hold_sets "$FIXTURE_DIR/post-fix.md"; then
+    pass "a guard reading the registry's hold sets (retired names included) is recognised"
+else
+    fail "post-fix fixture: the registry hold-set lint did not recognise it"
+fi
 if has_bot_attribution_probe "$FIXTURE_DIR/post-fix.md"; then
     fail "a fixture with no BOT_UNESCALATED_AT was accepted as having the bot-attribution probe (lint is vacuous)"
 else
@@ -245,9 +270,14 @@ if [[ ! -f "$PROMO" ]]; then
 else
     GUARD_LABELS="$(hold_labels_of "$PROMO")"
     if [[ "$GUARD_LABELS" == "$EXPECTED_HOLD_LABELS" ]]; then
-        pass "the guard's HELD_BY check names loom:blocked, loom:operator, loom:frozen"
+        pass "the guard's hold set (fallback) names loom:blocked, loom:operator, loom:frozen"
     else
         fail "guard hold labels are not the expected three:"$'\n'"$(tr '\n' ' ' <<<"$GUARD_LABELS")"
+    fi
+    if has_registry_hold_sets "$PROMO"; then
+        pass "the guard derives HOLDS / OP_HOLDS from the registry with retired names (#11795)"
+    else
+        fail "the guard does not derive its hold sets from the registry with --with-retired (#11795)"
     fi
     BLOCK="$(guard_block "$PROMO" | cut -f2-)"
     if grep -qE '^ALREADY_ROUTED=\$\(\[ -n "\$HELD_BY" \]' <<<"$BLOCK"; then
@@ -274,7 +304,7 @@ echo ""
 echo "Test 3: the guard reads the timeline un-park, fails open on unknown inputs, and orders its branches correctly"
 if [[ -f "$PROMO" ]]; then
     if has_unpark_check "$PROMO"; then
-        pass "guard reads unlabeled loom:operator from the timeline and compares it to VERDICT_CREATED_AT"
+        pass "guard reads an unlabeled operator-hold event from the timeline and compares it to VERDICT_CREATED_AT"
     else
         fail "guard is missing the timeline un-park check"
     fi
@@ -366,7 +396,31 @@ cat >"$RUN_DIR/.loom/scripts/classify-dependency-block.sh" <<'STUB'
 #!/usr/bin/env bash
 exit "$(cat "$LOOM_TEST_FIX/unesc-rc" 2>/dev/null || echo 1)"
 STUB
-chmod +x "$RUN_DIR/bin/gh" "$RUN_DIR/bin/gh-read" "$RUN_DIR/.loom/scripts/classify-dependency-block.sh"
+# `loom-daemon` stub: answers `labels list --property <p> --with-retired` from
+# $RUN_DIR/registry-<p> (the real registry's answer when a built daemon is
+# available, else the #11795 sets), and fails like an older binary when
+# $LOOM_TEST_OLD_DAEMON is set, so the guard's literal fallback is exercised.
+cat >"$RUN_DIR/bin/loom-daemon" <<'STUB'
+#!/usr/bin/env bash
+[ -n "${LOOM_TEST_OLD_DAEMON:-}" ] && { echo "error: unexpected argument '--with-retired'" >&2; exit 2; }
+if [ "$1 $2 $3" = "labels list --property" ] && [ "${5:-}" = "--with-retired" ] && [ -f "$LOOM_TEST_RUN/registry-$4" ]; then
+  exec cat "$LOOM_TEST_RUN/registry-$4"
+fi
+exit 2
+STUB
+REAL_DAEMON="${LOOM_TEST_REAL_DAEMON:-${LOOM_DAEMON_BIN:-}}"
+for prop in hold operator_gate; do
+    if [[ -n "$REAL_DAEMON" && -x "$REAL_DAEMON" ]]; then
+        "$REAL_DAEMON" labels list --property "$prop" --with-retired >"$RUN_DIR/registry-$prop"
+    elif [[ "$prop" == "hold" ]]; then
+        printf '%s\n' loom:blocked loom:operator loom:frozen loom:operator-only loom:operator-decision \
+            loom:operator-mechanical loom:operator-blocked loom:needs-capability >"$RUN_DIR/registry-$prop"
+    else
+        printf '%s\n' loom:operator loom:operator-only loom:operator-decision loom:operator-mechanical \
+            loom:operator-blocked >"$RUN_DIR/registry-$prop"
+    fi
+done
+chmod +x "$RUN_DIR/bin/gh" "$RUN_DIR/bin/gh-read" "$RUN_DIR/bin/loom-daemon" "$RUN_DIR/.loom/scripts/classify-dependency-block.sh"
 
 # Extract the shipped guard block, neutralise its `<number>` placeholder, and
 # append a trailer that reports the flags the rest of the file consumes.
@@ -388,6 +442,7 @@ run_guard() {
     ( cd "$RUN_DIR" \
         && PATH="$RUN_DIR/bin:$PATH" \
            LOOM_TEST_FIX="$1" \
+           LOOM_TEST_RUN="$RUN_DIR" \
            GH_READ="$RUN_DIR/bin/gh-read" \
            bash ./guard.sh 2>&1 ) | grep '^RESULT '
 }
@@ -513,6 +568,48 @@ else
         pass "4f: a human un-park strictly newer than a prior bot un-escalation marker sets OPERATOR_RULED=yes and does NOT escalate"
     else
         fail "4f: expected OPERATOR_RULED=yes / ESCALATE_UNREVISED=no, got:"$'\n'"$OUT"
+    fi
+
+    # --- 4g/4h. #11795 transition: a proposal carrying ONLY a retired hold
+    # name (not yet moved by `labels migrate`) is still held: routed, never
+    # tallied or escalated. Champion's own pre-fold N=2 escalations are the
+    # bulk of these.
+    for retired in loom:operator-only loom:operator-blocked; do
+        F="$RUN_DIR/fix/retired-${retired#loom:}"
+        make_fixture "$F" "[{\"name\":\"$retired\"}]" "$VIEW_COMMENTS" '[]' "$REST_COMMENTS" 1
+        OUT="$(run_guard "$F")"
+        if [[ "$(result_of "$OUT" ALREADY_ROUTED)" == "yes" \
+           && "$(result_of "$OUT" ESCALATE_UNREVISED)" == "no" ]]; then
+            pass "4g: only $retired (unmigrated) sets ALREADY_ROUTED=yes and does NOT escalate"
+        else
+            fail "4g: only $retired: expected ALREADY_ROUTED=yes / ESCALATE_UNREVISED=no, got:"$'\n'"$OUT"
+        fi
+    done
+
+    # --- 4i. A human removing a RETIRED operator-hold name after this
+    # revision's rejection is a ruling too (the pre-fold un-park).
+    TL_RETIRED_UNPARK="$(jq -nc --arg t "$UNPARK_TS" \
+        '[{event:"unlabeled", label:{name:"loom:operator-only"}, created_at:$t}]')"
+    F="$RUN_DIR/fix/human-ruled-retired"
+    make_fixture "$F" '[]' "$VIEW_COMMENTS" "$TL_RETIRED_UNPARK" "$REST_COMMENTS" 1
+    OUT="$(run_guard "$F")"
+    if [[ "$(result_of "$OUT" OPERATOR_RULED)" == "yes" \
+       && "$(result_of "$OUT" ESCALATE_UNREVISED)" == "no" ]]; then
+        pass "4i: removing an unmigrated loom:operator-only after the rejection sets OPERATOR_RULED=yes"
+    else
+        fail "4i: expected OPERATOR_RULED=yes / ESCALATE_UNREVISED=no, got:"$'\n'"$OUT"
+    fi
+
+    # --- 4j. A daemon too old for --with-retired: the literal fallback still
+    # holds a loom:operator proposal.
+    F="$RUN_DIR/fix/old-daemon"
+    make_fixture "$F" '[{"name":"loom:operator"}]' "$VIEW_COMMENTS" '[]' "$REST_COMMENTS" 1
+    OUT="$(LOOM_TEST_OLD_DAEMON=1 run_guard "$F")"
+    if [[ "$(result_of "$OUT" ALREADY_ROUTED)" == "yes" \
+       && "$(result_of "$OUT" ESCALATE_UNREVISED)" == "no" ]]; then
+        pass "4j: with an older daemon the fallback hold set still routes a loom:operator proposal"
+    else
+        fail "4j: expected ALREADY_ROUTED=yes / ESCALATE_UNREVISED=no, got:"$'\n'"$OUT"
     fi
 fi
 

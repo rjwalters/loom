@@ -122,13 +122,15 @@ guard_block() {
 }
 
 # Every `loom:*` label literally named in the line(s) that derive the guard's
-# hold decision: the HELD_BY assignment and its jq continuation line, or -- on
-# the pre-#7734 form -- the single-label ALREADY_ROUTED assignment. Sorted,
-# unique, one per line.
+# hold decision: the HOLDS assignment (since #11795 a registry query whose
+# literal names are its older-daemon fallback), the HELD_BY assignment and its
+# jq continuation line, or -- on the pre-#7734 form -- the single-label
+# ALREADY_ROUTED assignment. Sorted, unique, one per line.
 hold_labels_of() {
     guard_block "$1" \
         | cut -f2- \
         | awk '
+            /^HOLDS=/ { print }
             /^HELD_BY=/ || /^ALREADY_ROUTED=\$\(printf/ { grab = 2 }
             grab > 0 { print; grab-- }
         ' \
@@ -144,15 +146,15 @@ criterion3_labels_of() {
         | LC_ALL=C sort -u
 }
 
-# 0 if the guard block reads the timeline for an `unlabeled loom:operator`
-# event, compares it against a verdict `created_at`, and derives OPERATOR_RULED
+# 0 if the guard block reads the timeline for an `unlabeled` event of any
+# operator-hold name (OP_HOLDS, retired names included since #11795), compares it against a verdict `created_at`, and derives OPERATOR_RULED
 # from that comparison; 1 otherwise.
 has_unpark_check() {
     local block
     block="$(guard_block "$1" | cut -f2-)"
     grep -qE 'issues/\$EPIC_NUMBER/timeline' <<<"$block" \
         && grep -qE '\.event == "unlabeled"' <<<"$block" \
-        && grep -qE '\.label\.name == "loom:operator"' <<<"$block" \
+        && grep -qE '\.label\.name \| IN\(\$o\[\]\)' <<<"$block" \
         && grep -qE 'VERDICT_CREATED_AT=.*created_at' <<<"$block" \
         && grep -qE 'UNPARKED_AT.*>.*VERDICT_CREATED_AT' <<<"$block" \
         && grep -qE '^ *OPERATOR_RULED=yes' <<<"$block"
@@ -218,8 +220,10 @@ cat >"$FIXTURE_DIR/post-fix.md" <<'EOF'
 
 ```bash
 PRIOR_REJECTIONS=$(printf '%s\n' "$EPIC_JSON" | jq '[.comments[]] | length')
+HOLDS=$(loom-daemon labels list --property hold --with-retired 2>/dev/null || printf 'loom:blocked\nloom:operator\nloom:frozen'); export HOLDS
+OP_HOLDS=$(loom-daemon labels list --property operator_gate --with-retired 2>/dev/null || echo loom:operator); export OP_HOLDS
 HELD_BY=$(printf '%s\n' "$EPIC_JSON" | jq -r \
-  '[.labels[].name | select(. == "loom:operator" or . == "loom:blocked" or . == "loom:frozen")] | join(",")')
+  '($ENV.HOLDS | split("\n")) as $h | [.labels[].name | select(IN($h[]))] | join(",")')
 ALREADY_ROUTED=$([ -n "$HELD_BY" ] && echo yes || echo no)
 OPERATOR_RULED=no
 if [ "$ALREADY_ROUTED" = "yes" ]; then
@@ -227,7 +231,7 @@ if [ "$ALREADY_ROUTED" = "yes" ]; then
 elif true; then
   VERDICT_CREATED_AT=$(printf '%s\n' "$VERDICT_COMMENT" | jq -r '.created_at // ""')
   UNPARKED_AT=$(gh api "repos/{owner}/{repo}/issues/$EPIC_NUMBER/timeline" --paginate \
-    --jq '.[] | select(.event == "unlabeled" and .label.name == "loom:operator") | .created_at' \
+    --jq '($ENV.OP_HOLDS | split("\n")) as $o | .[] | select(.event == "unlabeled" and (.label.name | IN($o[]))) | .created_at' \
     | sort | tail -n 1)
   if [ -n "$UNPARKED_AT" ] && [[ "$UNPARKED_AT" > "$VERDICT_CREATED_AT" ]]; then
     OPERATOR_RULED=yes
@@ -260,7 +264,7 @@ if true; then
   BOT_UNESCALATABLE=$(printf '%s\n' "$EPIC_JSON" | jq -e \
     '.comments[] | select(.body | contains("<!-- champion:proposal-escalated -->"))' >/dev/null && echo yes || echo no)
   UNPARKED_AT=$(gh api "repos/{owner}/{repo}/issues/$EPIC_NUMBER/timeline" --paginate \
-    --jq '.[] | select(.event == "unlabeled" and .label.name == "loom:operator") | .created_at' \
+    --jq '($ENV.OP_HOLDS | split("\n")) as $o | .[] | select(.event == "unlabeled" and (.label.name | IN($o[]))) | .created_at' \
     | sort | tail -n 1)
   if [ -n "$UNPARKED_AT" ] && [ -n "$VERDICT_CREATED_AT" ] && [ "$BOT_UNESCALATABLE" = "no" ] \
      && [[ "$UNPARKED_AT" > "$VERDICT_CREATED_AT" ]]; then

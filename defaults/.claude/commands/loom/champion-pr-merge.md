@@ -2334,8 +2334,9 @@ for blocked in $BLOCKED_ISSUES; do
     # human's to break, and re-walking it every pass buys nothing. One cached
     # label read (backlog observation, not arbitration) replaces up to
     # --max-nodes forge reads. Cached("$GH_READ") — see "Cached forge reads".
+    OP_HOLDS=$(loom-daemon labels list --property operator_gate --with-retired 2>/dev/null || echo loom:operator); export OP_HOLDS  # champion-common.md "Hold set"
     ALREADY_ROUTED=$("$GH_READ" issue view "$blocked" --json labels \
-      --jq '[.labels[].name] | index("loom:operator") // empty')
+      --jq '($ENV.OP_HOLDS | split("\n")) as $o | [.labels[].name | select(IN($o[]))] | first // empty')
 
     if [ -z "$ALREADY_ROUTED" ]; then
       CYCLE_RC=0
@@ -2951,17 +2952,18 @@ This pass **never merges anything and never closes anything**. For each parked P
 
 ```bash
 # Cached ("$GH_READ") — queue discovery; each parked PR is re-read live
-# before any action is taken on it.
+# before any action is taken on it. Operator holds: champion-common.md "Hold set".
+OP_HOLDS=$(loom-daemon labels list --property operator_gate --with-retired 2>/dev/null || echo loom:operator); export OP_HOLDS
 "$GH_READ" pr list \
   --label "loom:blocked" \
   --label "loom:changes-requested" \
   --state open \
   --limit 500 \
   --json number,title,updatedAt,labels \
-  --jq '.[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | "#\(.number) \(.title)"'
+  --jq '($ENV.OP_HOLDS | split("\n")) as $o | .[] | select(any(.labels[]?.name; . == "loom:frozen" or IN($o[])) | not) | "#\(.number) \(.title)"'
 ```
 
-**Skip any PR that also carries `loom:operator`** — a previous pass (or a human) already routed it out to the operator; do not re-decide it. Process the remaining PRs oldest first.
+**The query skips any PR that also carries an operator hold** — a previous pass (or a human) already routed it out to the operator; do not re-decide it. Process the remaining PRs oldest first.
 
 Two more entry guards, checked against the thread in Step 2 before any decision is made:
 

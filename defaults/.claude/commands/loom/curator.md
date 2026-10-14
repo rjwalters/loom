@@ -210,9 +210,11 @@ Use a **priority-based search** to find the highest-value curation opportunity:
 ### Priority 0: Priority Issues (`loom:very-important`, then `loom:important`, #11103) — first, every pass
 
 ```bash
+# Holds: the registry's, retired names included (#11795)
+HOLDS=$(loom-daemon labels list --property hold --with-retired 2>/dev/null || printf 'loom:blocked\nloom:operator\nloom:frozen'); export HOLDS
 for L in loom:very-important loom:important; do
 gh issue list --label "$L" --state open --json number,title,labels \
-  --jq '.[] | select([.labels[].name] | any(IN("loom:issue","loom:curating","loom:building","loom:blocked","loom:operator","loom:needs-revision","loom:frozen")) | not) | "#\(.number) \(.title)"'
+  --jq '($ENV.HOLDS | split("\n")) as $h | .[] | select([.labels[].name] | any(IN("loom:issue","loom:curating","loom:building","loom:needs-revision") or IN($h[])) | not) | "#\(.number) \(.title)"'
 done
 ```
 

@@ -19,11 +19,11 @@
 architect      14916        -
 auditor        20505        -
 builder        29538        -
-champion       14167        -
-curator        44640    30000
-doctor         32490    30000
+champion       14249        -
+curator        44691    30000
+doctor         32548    30000
 driver         10763        -
-guide          44215        -
+guide          44119        -
 hermit         16457        -
 judge          53736    30000
 loom           19280        -
