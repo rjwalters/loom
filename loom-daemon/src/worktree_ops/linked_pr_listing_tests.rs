@@ -119,7 +119,13 @@ fn linked_issues_agrees_with_the_per_issue_classifier() {
     branch_only.head_ref = Some("feature/issue-123".to_string());
     let mut fork_branch = fork(pr(21, "unrelated"));
     fork_branch.head_ref = Some("feature/issue-123".to_string());
+    let mut zero_padded = pr(22, "no phrase");
+    zero_padded.head_ref = Some("feature/issue-0123".to_string());
+    let mut plus_signed = pr(23, "no phrase");
+    plus_signed.head_ref = Some("feature/issue-+123".to_string());
     let rows = [
+        zero_padded,
+        plus_signed,
         pr(10, "Closes #123 and part of #124"),
         pr(11, "Part of #1234"),
         pr(12, "See #123"),
@@ -134,7 +140,7 @@ fn linked_issues_agrees_with_the_per_issue_classifier() {
             let one =
                 classify_open_linked_pr_rows(std::slice::from_ref(row), issue, REPO, &policy());
             assert_eq!(
-                linked.contains(&issue),
+                linked.contains_key(&issue),
                 one == OpenPrProbe::Open(row.number),
                 "PR #{} / issue #{issue}",
                 row.number

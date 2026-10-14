@@ -54,7 +54,7 @@ use crate::claim_reconciliation::open_pr_listing::MAX_PAGES;
 use crate::comment_trust::TrustPolicy;
 use crate::forge_pull_listing::{list_open_pulls_cached_within, RestPull};
 
-use super::gh::{linkage_phrase_regex, OpenPrProbe};
+use super::gh::{linkage_phrase_regex, LinkageKind, OpenPrProbe};
 use super::naming::branch_name;
 
 /// Leg 0 for `issue` in `owner_repo` (`owner/name`): `Some(Open(pr))` /
@@ -211,32 +211,31 @@ pub(crate) fn classify_open_linked_pr_rows(
 }
 
 /// Every issue one open PR links to under [`classify_open_linked_pr_rows`]'s
-/// rules, ascending: the issues its body names with a linking phrase
-/// ([`super::gh::linkage_refs`], the same phrase families as
+/// rules, by issue number, with how it links: the issues its body names with
+/// a linking phrase ([`super::gh::linkage_refs`], the same phrase families as
 /// [`linkage_phrase_regex`]), plus the Builder branch's issue when the head is
-/// in this same repo. Nothing for a fork PR by a known-untrusted author
-/// (H14). The step engine's item join (#11895, design #11894) reads it, so
-/// the join and the open-PR guard cannot disagree on what links.
+/// in this same repo. The branch counts only when [`branch_name`] reproduces
+/// it exactly (`feature/issue-0123` names no issue), and it links as
+/// [`LinkageKind::Closes`]: it is that issue's Builder PR. Nothing for a fork
+/// PR by a known-untrusted author (H14). The step engine's item join (#11895,
+/// design #11894) reads it, so the join and the open-PR guard cannot disagree
+/// on what links.
 #[must_use]
 pub(crate) fn linked_issues(
     body: Option<&str>,
     head_ref: Option<&str>,
     same_repo: bool,
     known_untrusted: bool,
-) -> std::collections::BTreeSet<u32> {
+) -> std::collections::BTreeMap<u32, LinkageKind> {
+    let mut linked = std::collections::BTreeMap::new();
     if !same_repo && known_untrusted {
-        return std::collections::BTreeSet::new();
+        return linked;
     }
-    let mut linked: std::collections::BTreeSet<u32> = body
-        .map(|b| {
-            super::gh::linkage_refs(b)
-                .into_iter()
-                .map(|(n, _)| n)
-                .collect()
-        })
-        .unwrap_or_default();
-    if same_repo {
-        linked.extend(head_ref.and_then(super::naming::issue_from_branch));
+    linked.extend(body.map(super::gh::linkage_refs).unwrap_or_default());
+    let branch_issue =
+        head_ref.and_then(|h| super::naming::issue_from_branch(h).filter(|&n| branch_name(n) == h));
+    if let (true, Some(n)) = (same_repo, branch_issue) {
+        linked.insert(n, LinkageKind::Closes);
     }
     linked
 }

@@ -7,11 +7,18 @@
 //! are the open-PR guard's ([`crate::worktree_ops::linked_pr_listing`]): a
 //! `Closes` / `Part of` phrase in the PR body, or the Builder branch
 //! `feature/issue-N` in this same repo, with a fork PR by a known-untrusted
-//! author never linking. An issue joins its **lowest-numbered** linked PR, as
-//! the guard answers. A PR that joins no issue (no link, an issue not in the
-//! listing, or a second PR on an issue that already joined one) is its own
-//! item. A PR linking several issues joins the lowest of them; the others see
-//! [`PassReason::SharedPr`], so one PR is never two items.
+//! author never linking.
+//!
+//! A PR joins the issue it **closes**: its lowest-numbered closing link (a
+//! closing keyword, or the Builder branch), and only when it has none, its
+//! lowest link of any kind. So a phase PR (`Closes #child`, `Part of #epic`)
+//! joins the child even when the epic has the lower number. An issue joins
+//! the lowest-numbered PR that joined it. A PR that joins no listed issue, or
+//! a second PR joining an issue that already has one, is its own item. An
+//! issue a PR links without joining it (the epic above, or the second issue of
+//! a PR closing two) has an open PR that is another item's:
+//! [`PassReason::SharedPr`], so one PR is never two items and the issue never
+//! gets a Builder.
 //!
 //! A **step** is one role session that advances one item by one stage. This
 //! module answers, for every item, which step its state calls for, or why it
@@ -34,10 +41,10 @@
 //!
 //! | Item state | Verdict |
 //! |---|---|
-//! | `loom:frozen` (either side) | pass `frozen` |
-//! | `loom:operator`, or a retired name that folds into it (either side) | pass `operator` |
+//! | `loom:frozen` (the PR or **any** open issue it links) | pass `frozen` |
+//! | `loom:operator`, or a retired name that folds into it (the same) | pass `operator` |
 //! | another hard exclusion (`external`) | pass `hard_exclusion` |
-//! | a claim label (see below) | pass `claimed` |
+//! | a claim label (see below), on the PR or any open issue it links | pass `claimed` |
 //! | PR in GitHub's merge queue | pass `queued` |
 //! | issue's linked PR is another item's | pass `shared_pr` |
 //! | PR `loom:sequenced` | pass `sequenced` |
@@ -50,18 +57,28 @@
 //! | PR `loom:pr` | Champion merge |
 //! | PR with none of those | pass `no_stage` |
 //! | issue `loom:epic` | pass `epic` |
+//! | a proposal label (`loom:architect`, `loom:hermit`, `loom:auditor`) without `loom:curated` | pass `proposal` |
 //! | issue `loom:issue` + `loom:blocked`, capability-only park, every capability held | Builder (capability lane) |
 //! | the same, a capability not held | pass `capability_missing` |
-//! | `loom:curated` (or a proposal label) + `loom:blocked`, **dependency park**, every blocker closed | Champion re-evaluate |
+//! | `loom:curated` + `loom:blocked`, **dependency park**, every blocker closed | Champion re-evaluate |
 //! | any other blocked issue | pass `blocked` |
 //! | landed: a merged **closing** PR, issue still open | Curator keep-or-close |
 //! | `loom:decision-malformed` | Curator |
 //! | `loom:issue` | Builder |
-//! | `loom:curated`, `loom:architect`, `loom:hermit`, `loom:auditor` | Champion promote |
+//! | `loom:curated` | Champion promote |
 //! | `loom:triage`, or no stage label | Curator |
+//!
+//! The design's "cooling down" row is not here: cooldowns are local draw
+//! state (the outcome ledger), applied by the draw (#11896), not by this
+//! classifier.
 //!
 //! Notes on the rules that are easy to get wrong:
 //!
+//! - **Proposals.** `loom:architect`, `loom:hermit` and `loom:auditor`
+//!   proposals stay on Champion's non-item interval run (design #11894 §6),
+//!   so they pass here like `loom:epic`. A proposal that also carries
+//!   `loom:curated` is curated work and gets Champion promote: the non-item
+//!   run must not act on curated issues.
 //! - **Landed.** Only a merged PR that *closes* the issue lands it. A merged
 //!   `Part of #N` PR is a phase of unfinished work, so the issue keeps its
 //!   stage (the same rule as [`super::landed_prefilter`]). A landing Curator
@@ -78,8 +95,9 @@
 //!   issue's `loom:building` is **not** a claim: it stays on the issue until
 //!   the closing merge (#6199), so reading it as one would pass every PR.
 //! - **Markers** come from trusted comments only ([`crate::comment_trust`], as
-//!   #11885 reads the revise and verdict markers): the caller passes the
-//!   pre-computed [`PullMarkers`] / [`IssueMarkers`], never raw comments.
+//!   #11885 reads the revise and verdict markers): [`IssueMarkers`] and
+//!   [`PullMarkers`] are built from a [`TrustedComments`], which only a trust
+//!   policy can produce, never from raw comments.
 //!   Champion's promotion verdict marker is deliberately not an input: a
 //!   promotion verdict is terminal (#11860), and Champion `--issue` reads the
 //!   marker itself to go straight to Step 4's bound. Passing a curated issue
@@ -101,6 +119,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::label_registry::Registry;
+use crate::worktree_ops::gh::LinkageKind;
 use crate::worktree_ops::linked_pr_listing::linked_issues;
 
 // ============================================================================
@@ -337,6 +356,7 @@ pub enum ItemState {
     Landed,
     Blocked,
     Epic,
+    Proposal,
     ReviewRequested,
     ChangesRequested,
     Approved,
@@ -414,6 +434,7 @@ pub enum PassReason {
     Blocked,
     CapabilityMissing,
     Epic,
+    Proposal,
     NoStage,
 }
 
@@ -437,67 +458,107 @@ pub enum Lane {
 /// issue order, then PR-only items in PR order.
 #[must_use]
 pub fn classify(inputs: &Inputs) -> Vec<Item> {
-    let open: BTreeSet<u32> = inputs.issues.iter().map(|i| i.number).collect();
-    // Each issue's lowest-numbered linked PR, as the open-PR guard answers.
-    let mut issue_pr: BTreeMap<u32, &PullInput> = BTreeMap::new();
-    for pr in &inputs.pulls {
-        for n in linked_issues(
-            pr.body.as_deref(),
-            pr.head_ref.as_deref(),
-            pr.same_repo,
-            pr.author_untrusted,
-        ) {
-            if !open.contains(&n) {
-                continue;
-            }
-            let slot = issue_pr.entry(n).or_insert(pr);
-            if pr.number < slot.number {
-                *slot = pr;
-            }
-        }
-    }
-    // A PR joins the lowest issue that picked it; the others share it.
-    let mut pr_owner: BTreeMap<u32, u32> = BTreeMap::new();
-    for (&issue, pr) in &issue_pr {
-        pr_owner.entry(pr.number).or_insert(issue);
-    }
-
-    let mut issues: Vec<&IssueInput> = inputs.issues.iter().collect();
-    issues.sort_by_key(|i| i.number);
+    let by_number: BTreeMap<u32, &IssueInput> =
+        inputs.issues.iter().map(|i| (i.number, i)).collect();
     let mut pulls: Vec<&PullInput> = inputs.pulls.iter().collect();
     pulls.sort_by_key(|p| p.number);
-
-    let mut items = Vec::with_capacity(issues.len() + pulls.len());
-    for issue in issues {
-        let pr = issue_pr.get(&issue.number).copied();
-        let shared = pr.is_some_and(|p| pr_owner.get(&p.number) != Some(&issue.number));
-        items.push(classify_item(Some(issue), pr, shared, inputs));
+    // Each PR's links to listed open issues.
+    let links: BTreeMap<u32, BTreeMap<u32, LinkageKind>> = pulls
+        .iter()
+        .map(|p| {
+            let linked = linked_issues(
+                p.body.as_deref(),
+                p.head_ref.as_deref(),
+                p.same_repo,
+                p.author_untrusted,
+            );
+            let open = linked
+                .into_iter()
+                .filter(|(n, _)| by_number.contains_key(n))
+                .collect();
+            (p.number, open)
+        })
+        .collect();
+    // issue -> the lowest PR that joined it; issue -> the lowest PR linking it.
+    let mut joined: BTreeMap<u32, u32> = BTreeMap::new();
+    let mut linking: BTreeMap<u32, u32> = BTreeMap::new();
+    for p in &pulls {
+        let l = &links[&p.number];
+        if let Some(owner) = join_target(l) {
+            joined.entry(owner).or_insert(p.number);
+        }
+        for &n in l.keys() {
+            linking.entry(n).or_insert(p.number);
+        }
     }
-    for pr in pulls {
-        if !pr_owner.contains_key(&pr.number) {
-            items.push(classify_item(None, Some(pr), false, inputs));
+    let primary: BTreeSet<u32> = joined.values().copied().collect();
+    let pr_of = |n: u32| pulls.iter().copied().find(|p| p.number == n);
+    // The PR's linked open issues, for the hold and claim passes.
+    let linked_of = |pr: &PullInput| -> Vec<&IssueInput> {
+        links[&pr.number]
+            .keys()
+            .filter_map(|n| by_number.get(n).copied())
+            .collect()
+    };
+
+    let mut items = Vec::with_capacity(by_number.len() + pulls.len());
+    for (&n, &issue) in &by_number {
+        let item = if let Some(pr) = joined.get(&n).and_then(|&p| pr_of(p)) {
+            let mut linked = linked_of(pr);
+            linked.retain(|i| i.number != n);
+            linked.insert(0, issue);
+            classify_item(Some(issue), Some(pr), false, &linked, inputs)
+        } else if let Some(pr) = linking.get(&n).and_then(|&p| pr_of(p)) {
+            classify_item(Some(issue), Some(pr), true, &[issue], inputs)
+        } else {
+            classify_item(Some(issue), None, false, &[issue], inputs)
+        };
+        items.push(item);
+    }
+    for pr in &pulls {
+        if !primary.contains(&pr.number) {
+            items.push(classify_item(None, Some(pr), false, &linked_of(pr), inputs));
         }
     }
     items
 }
 
+/// The issue a PR with links `l` joins: its lowest closing link, else its
+/// lowest link of any kind.
+fn join_target(l: &BTreeMap<u32, LinkageKind>) -> Option<u32> {
+    l.iter()
+        .find(|(_, k)| **k == LinkageKind::Closes)
+        .or_else(|| l.iter().next())
+        .map(|(n, _)| *n)
+}
+
 /// Classify one joined item. `shared`: the PR is another issue's item.
+/// `linked`: every open issue whose holds and claims bind the item (its own
+/// issue, and every other open issue its PR links).
 fn classify_item(
     issue: Option<&IssueInput>,
     pr: Option<&PullInput>,
     shared: bool,
+    linked: &[&IssueInput],
     inputs: &Inputs,
 ) -> Item {
     let issue_labels = issue
         .map(|i| canonical_labels(&i.labels))
         .unwrap_or_default();
+    let linked_labels: Vec<Vec<String>> =
+        linked.iter().map(|i| canonical_labels(&i.labels)).collect();
     let pr_labels = pr.map(|p| canonical_labels(&p.labels)).unwrap_or_default();
     let lane = if inputs.repo.main_red && issue.is_some_and(|i| i.red_fix) {
         Lane::RedMain
     } else {
         Lane::Normal
     };
-    let (state, verdict) = decide(issue, &issue_labels, pr, &pr_labels, shared, inputs);
+    let labels = Labels {
+        issue: &issue_labels,
+        linked: &linked_labels,
+        pr: &pr_labels,
+    };
+    let (state, verdict) = decide(issue, pr, &labels, shared, inputs);
     let lane = match verdict {
         Verdict::Step(Step::Builder) if state == ItemState::Blocked => Lane::Capability,
         _ => lane,
@@ -512,29 +573,39 @@ fn classify_item(
     }
 }
 
+/// One item's canonical labels.
+struct Labels<'a> {
+    /// The item's own issue.
+    issue: &'a [String],
+    /// Every open issue whose holds and claims bind the item.
+    linked: &'a [Vec<String>],
+    /// The item's PR.
+    pr: &'a [String],
+}
+
 /// The §4.1 table, in order (module docs).
 fn decide(
     issue: Option<&IssueInput>,
-    issue_labels: &[String],
     pr: Option<&PullInput>,
-    pr_labels: &[String],
+    labels: &Labels<'_>,
     shared: bool,
     inputs: &Inputs,
 ) -> (ItemState, Verdict) {
     use PassReason as P;
     let pass = |s: ItemState, r: PassReason| (s, Verdict::Pass(r));
-    let either = |f: &dyn Fn(&[String]) -> bool| f(issue_labels) || f(pr_labels);
+    let any = |f: &dyn Fn(&[String]) -> bool| f(labels.pr) || labels.linked.iter().any(|l| f(l));
 
-    if either(&|l| has(l, FROZEN)) {
+    if any(&|l| has(l, FROZEN)) {
         return pass(ItemState::Frozen, P::Frozen);
     }
-    if either(&|l| super::is_operator_hold(l)) {
+    if any(&|l| super::is_operator_hold(l)) {
         return pass(ItemState::Operator, P::Operator);
     }
-    if either(&crate::hard_exclusion::is_hard_excluded) {
+    if any(&crate::hard_exclusion::is_hard_excluded) {
         return pass(ItemState::Excluded, P::HardExclusion);
     }
-    if is_claimed(issue_labels, pr.is_some()) || is_claimed(pr_labels, true) {
+    let pr_open = pr.is_some();
+    if is_claimed(labels.pr, true) || labels.linked.iter().any(|l| is_claimed(l, pr_open)) {
         return pass(ItemState::Claimed, P::Claimed);
     }
     if let Some(pr) = pr {
@@ -544,12 +615,12 @@ fn decide(
         if shared {
             return pass(ItemState::SharedPr, P::SharedPr);
         }
-        return decide_pr(pr, pr_labels);
+        return decide_pr(pr, labels.pr);
     }
     let Some(issue) = issue else {
         return pass(ItemState::NoStage, P::NoStage);
     };
-    decide_issue(issue, issue_labels, &inputs.host)
+    decide_issue(issue, labels.issue, &inputs.host)
 }
 
 /// The PR rows of the table.
@@ -591,6 +662,9 @@ fn decide_issue(issue: &IssueInput, labels: &[String], host: &HostInput) -> (Ite
     if has(labels, super::EPIC_LABEL) {
         return pass(ItemState::Epic, PassReason::Epic);
     }
+    if is_proposal(labels) && !has(labels, CURATED) {
+        return pass(ItemState::Proposal, PassReason::Proposal);
+    }
     if super::is_blocked_hold(labels) {
         if issue.park == ParkKind::Capability && has(labels, READY) {
             let held = !issue.capabilities.is_empty()
@@ -604,7 +678,7 @@ fn decide_issue(issue: &IssueInput, labels: &[String], host: &HostInput) -> (Ite
                 pass(ItemState::Blocked, PassReason::CapabilityMissing)
             };
         }
-        if is_proposal(labels) && issue.park == ParkKind::Dependency && issue.blockers_closed {
+        if has(labels, CURATED) && issue.park == ParkKind::Dependency && issue.blockers_closed {
             return step(ItemState::Blocked, Step::ChampionReevaluate);
         }
         return pass(ItemState::Blocked, PassReason::Blocked);
@@ -616,7 +690,7 @@ fn decide_issue(issue: &IssueInput, labels: &[String], host: &HostInput) -> (Ite
         step(ItemState::DecisionMalformed, Step::Curator)
     } else if has(labels, READY) {
         step(ItemState::Ready, Step::Builder)
-    } else if is_proposal(labels) {
+    } else if has(labels, CURATED) {
         step(ItemState::Curated, Step::ChampionPromote)
     } else if has(labels, TRIAGE) {
         step(ItemState::Triage, Step::Curator)
@@ -633,17 +707,15 @@ fn is_landed(issue: &IssueInput) -> bool {
         .any(|l| l.kind == LinkKind::Closes && !issue.markers.landed_kept.contains(&l.pr))
 }
 
-/// A Champion promotion candidate: `loom:curated`, or a proposal label
-/// Champion promotes directly (the registry's `champion_path` labels, less the
-/// epic container).
+/// A proposal label (the registry's `champion_path` labels, less the epic
+/// container): `loom:architect`, `loom:hermit`, `loom:auditor`.
 fn is_proposal(labels: &[String]) -> bool {
-    has(labels, CURATED)
-        || labels.iter().any(|l| {
-            l != super::EPIC_LABEL
-                && Registry::embedded()
-                    .get(l)
-                    .is_some_and(|d| d.property("champion_path") == Some(true))
-        })
+    labels.iter().any(|l| {
+        l != super::EPIC_LABEL
+            && Registry::embedded()
+                .get(l)
+                .is_some_and(|d| d.property("champion_path") == Some(true))
+    })
 }
 
 /// A live claim among `labels`: any registry `claim` label, except the issue's
@@ -689,8 +761,9 @@ fn has(labels: &[String], label: &str) -> bool {
 
 /// The kind of park `body` declares for an item carrying `labels`.
 ///
-/// A hold record wins over a dependency record beside it (fail closed: a
-/// quarantined issue with a stale `Blocked by:` line is still quarantined).
+/// A hold record wins over a dependency record or capability markers beside
+/// it (fail closed: a quarantined issue with a stale `Blocked by:` line or a
+/// capability marker is still quarantined).
 #[must_use]
 pub fn park_kind(labels: &[String], body: Option<&str>) -> ParkKind {
     use crate::capability::{route_mechanical, MechanicalRouting};
@@ -699,16 +772,7 @@ pub fn park_kind(labels: &[String], body: Option<&str>) -> ParkKind {
     let Some(body) = body else {
         return ParkKind::None;
     };
-    if matches!(
-        route_mechanical(labels, Some(body), &BTreeSet::new()),
-        MechanicalRouting::MissingCapabilities { .. }
-    ) {
-        return ParkKind::Capability;
-    }
     let records = crate::park_record::parse(body);
-    if records.is_empty() {
-        return ParkKind::None;
-    }
     let reason_is = |want: &str| {
         records
             .iter()
@@ -720,8 +784,15 @@ pub fn park_kind(labels: &[String], body: Option<&str>) -> ParkKind {
         ParkKind::PrlessHold
     } else if crate::champion_hold::body_declares_hold(body) {
         ParkKind::ChampionHold
+    } else if matches!(
+        route_mechanical(labels, Some(body), &BTreeSet::new()),
+        MechanicalRouting::MissingCapabilities { .. }
+    ) {
+        ParkKind::Capability
     } else if records.iter().any(|r| r.blocker.is_some()) {
         ParkKind::Dependency
+    } else if records.is_empty() {
+        ParkKind::None
     } else {
         ParkKind::Unstated
     }
@@ -739,13 +810,84 @@ pub fn declared_capabilities(body: &str) -> Vec<String> {
     }
 }
 
-impl PullMarkers {
-    /// From a PR's **trusted** comment bodies, oldest first.
+/// Comment bodies a trust policy believes, oldest first.
+///
+/// The only way to build one outside tests is [`TrustedComments::filtered`],
+/// which applies [`crate::comment_trust`]'s rules (#9548). The marker
+/// constructors take this type, so a marker from an untrusted author (prose,
+/// not state) cannot reach the classifier by accident.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TrustedComments(Vec<String>);
+
+impl TrustedComments {
+    /// The bodies of the comments in `comments` (REST or GraphQL comment
+    /// objects, oldest first) that `policy` trusts.
     #[must_use]
-    pub fn from_trusted<C: AsRef<str>>(trusted: &[C]) -> Self {
+    pub fn filtered(
+        policy: &crate::comment_trust::TrustPolicy,
+        comments: Vec<serde_json::Value>,
+    ) -> Self {
+        Self(crate::comment_trust::records::bodies(&policy.filter(comments)))
+    }
+
+    /// The trusted bodies, oldest first.
+    #[must_use]
+    pub fn bodies(&self) -> &[String] {
+        &self.0
+    }
+}
+
+/// Champion's revise marker for an issue `title` + `body`
+/// (`champion-issue-promo.md`: `printf '%s\n%s'` of the two after the shell's
+/// `$(...)` strips their trailing newlines, SHA-256, first 16 hex).
+#[must_use]
+pub fn revise_marker(title: &str, body: &str) -> String {
+    let text = format!("{}\n{}", title.trim_end_matches('\n'), body.trim_end_matches('\n'));
+    format!("<!-- champion:revise:body-{} -->", crate::short_hash::short_sha16(&text))
+}
+
+/// The merged PRs named by landed route markers
+/// ([`super::landed_prefilter::route_marker`]) in `text`.
+fn landed_route_prs(text: &str) -> Vec<u32> {
+    const OPEN: &str = "<!-- loom:landed-route pr=";
+    text.match_indices(OPEN)
+        .filter_map(|(at, _)| {
+            let rest = &text[at + OPEN.len()..];
+            let end = rest.find(" -->")?;
+            rest[..end].parse().ok()
+        })
+        .collect()
+}
+
+impl IssueMarkers {
+    /// From an issue's trusted comments and its current `title` and `body`:
+    /// the send-back stands while a revise marker names the current text
+    /// (#11860), and every landed route marker is a kept landing.
+    #[must_use]
+    pub fn from_trusted(trusted: &TrustedComments, title: &str, body: &str) -> Self {
+        let marker = revise_marker(title, body);
+        let mut landed_kept: Vec<u32> = trusted
+            .bodies()
+            .iter()
+            .flat_map(|c| landed_route_prs(c))
+            .collect();
+        landed_kept.sort_unstable();
+        landed_kept.dedup();
         Self {
-            champion_hold: crate::champion_hold::standing_hold(trusted).is_some(),
-            doctor_cycle_capped: crate::champion_hold::doctor_cycle_capped(trusted),
+            send_back: trusted.bodies().iter().any(|c| c.contains(&marker)),
+            landed_kept,
+        }
+    }
+}
+
+impl PullMarkers {
+    /// From a PR's trusted comments.
+    #[must_use]
+    pub fn from_trusted(trusted: &TrustedComments) -> Self {
+        let bodies = trusted.bodies();
+        Self {
+            champion_hold: crate::champion_hold::standing_hold(bodies).is_some(),
+            doctor_cycle_capped: crate::champion_hold::doctor_cycle_capped(bodies),
         }
     }
 }

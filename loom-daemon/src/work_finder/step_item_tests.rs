@@ -97,6 +97,7 @@ fn the_fixture_covers_every_step_pass_and_park_kind() {
         PassReason::Blocked,
         PassReason::CapabilityMissing,
         PassReason::Epic,
+        PassReason::Proposal,
         PassReason::NoStage,
     ];
     for p in passes {
@@ -189,17 +190,55 @@ fn park_kind_and_capabilities_read_a_capability_only_park() {
     let named = "<!-- loom:capability=host-sudo -->\n\
                  <!-- loom:park Blocked by: #12 by=builder at=2026-10-14T00:00:00Z -->";
     assert_eq!(park_kind(&blocked, Some(named)), ParkKind::Dependency);
+    // A hold record beside capability markers keeps the hold's kind.
+    let held =
+        format!("{body}\n{}", render_hold_record(QUARANTINE_HOLD_REASON, "2026-10-14T00:00:00Z"));
+    assert_eq!(park_kind(&blocked, Some(&held)), ParkKind::Quarantine);
+}
+
+fn trusted(bodies: &[&str]) -> TrustedComments {
+    TrustedComments(bodies.iter().map(|b| (*b).to_string()).collect())
 }
 
 #[test]
 fn pull_markers_come_from_trusted_comments() {
-    assert_eq!(PullMarkers::from_trusted::<&str>(&[]), PullMarkers::default());
+    assert_eq!(PullMarkers::from_trusted(&trusted(&[])), PullMarkers::default());
     let hold = format!("{CRITICAL_FILE_HOLD_MARKER}\nheld");
-    let marked = PullMarkers::from_trusted(&[hold.as_str()]);
+    let marked = PullMarkers::from_trusted(&trusted(&[&hold]));
     assert!(marked.champion_hold && !marked.doctor_cycle_capped);
     let cap = format!("{DOCTOR_CYCLE_CAP_MARKER}\ncapped");
-    let capped = PullMarkers::from_trusted(&[hold.as_str(), cap.as_str()]);
+    let capped = PullMarkers::from_trusted(&trusted(&[&hold, &cap]));
     assert!(capped.champion_hold && capped.doctor_cycle_capped);
+}
+
+#[test]
+fn trusted_comments_drop_untrusted_authors() {
+    let policy = crate::comment_trust::TrustPolicy::new(
+        crate::forge_identity::FleetLogins::of(&crate::forge_identity::Roster::default()),
+        None,
+        Vec::new(),
+    );
+    let comments = vec![
+        serde_json::json!({"body": "insider", "user": {"login": "a", "type": "User"}, "author_association": "MEMBER"}),
+        serde_json::json!({"body": "outsider", "user": {"login": "b", "type": "User"}, "author_association": "NONE"}),
+    ];
+    assert_eq!(TrustedComments::filtered(&policy, comments).bodies(), ["insider".to_string()]);
+}
+
+#[test]
+fn issue_markers_read_the_send_back_and_kept_landings() {
+    let marker = revise_marker("Title", "Body\n");
+    // The shell's `$(...)` strips trailing newlines before hashing.
+    assert_eq!(marker, revise_marker("Title\n", "Body"));
+    assert!(marker.starts_with("<!-- champion:revise:body-") && marker.len() == 26 + 16 + 4);
+    let review = format!("Champion Review: NEEDS REVISION\n{marker}");
+    let route = format!("{}\nback to Curator", super::super::landed_prefilter::route_marker(902));
+    let m = IssueMarkers::from_trusted(&trusted(&[&review, &route]), "Title", "Body");
+    assert!(m.send_back);
+    assert_eq!(m.landed_kept, vec![902]);
+    // A revision changes the body, so the send-back is answered.
+    let revised = IssueMarkers::from_trusted(&trusted(&[&review]), "Title", "Body\n## Revision");
+    assert!(!revised.send_back);
 }
 
 #[test]

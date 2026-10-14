@@ -263,7 +263,7 @@
       ]
     },
     {
-      "name": "a proposal label (loom:architect): Champion promote",
+      "name": "a proposal label (loom:architect) stays on Champion's non-item run: pass",
       "inputs": {
         "issues": [
           {
@@ -278,6 +278,31 @@
       "expected": [
         {
           "issue": 21,
+          "pr": null,
+          "state": "proposal",
+          "verdict": {
+            "pass": "proposal"
+          }
+        }
+      ]
+    },
+    {
+      "name": "a proposal that is also loom:curated is curated work: Champion promote",
+      "inputs": {
+        "issues": [
+          {
+            "number": 29,
+            "labels": [
+              "loom:hermit",
+              "loom:curated"
+            ]
+          }
+        ],
+        "pulls": []
+      },
+      "expected": [
+        {
+          "issue": 29,
           "pr": null,
           "state": "curated",
           "verdict": {
@@ -1241,6 +1266,256 @@
           "state": "shared_pr",
           "verdict": {
             "pass": "shared_pr"
+          }
+        }
+      ]
+    },
+    {
+      "name": "phase PR (Closes #child, Part of #epic, epic lower): the PR joins the child it closes; the epic shares it",
+      "inputs": {
+        "issues": [
+          {
+            "number": 80,
+            "labels": [
+              "loom:epic"
+            ]
+          },
+          {
+            "number": 81,
+            "labels": [
+              "loom:building"
+            ]
+          }
+        ],
+        "pulls": [
+          {
+            "number": 530,
+            "labels": [
+              "loom:review-requested"
+            ],
+            "same_repo": true,
+            "body": "Closes #81\nPart of #80"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "issue": 80,
+          "pr": 530,
+          "state": "shared_pr",
+          "verdict": {
+            "pass": "shared_pr"
+          }
+        },
+        {
+          "issue": 81,
+          "pr": 530,
+          "state": "review_requested",
+          "verdict": {
+            "step": "judge"
+          }
+        }
+      ]
+    },
+    {
+      "name": "phase PR, a hold on the child: the item passes",
+      "inputs": {
+        "issues": [
+          {
+            "number": 82,
+            "labels": [
+              "loom:epic"
+            ]
+          },
+          {
+            "number": 83,
+            "labels": [
+              "loom:building",
+              "loom:operator"
+            ]
+          }
+        ],
+        "pulls": [
+          {
+            "number": 531,
+            "labels": [
+              "loom:review-requested"
+            ],
+            "same_repo": true,
+            "body": "Part of #82\nCloses #83"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "issue": 82,
+          "pr": 531,
+          "state": "shared_pr",
+          "verdict": {
+            "pass": "shared_pr"
+          }
+        },
+        {
+          "issue": 83,
+          "pr": 531,
+          "state": "operator",
+          "verdict": {
+            "pass": "operator"
+          }
+        }
+      ]
+    },
+    {
+      "name": "phase PR, a hold on the epic: the child's item passes too",
+      "inputs": {
+        "issues": [
+          {
+            "number": 84,
+            "labels": [
+              "loom:epic",
+              "loom:frozen"
+            ]
+          },
+          {
+            "number": 85,
+            "labels": [
+              "loom:building"
+            ]
+          }
+        ],
+        "pulls": [
+          {
+            "number": 532,
+            "labels": [
+              "loom:review-requested"
+            ],
+            "same_repo": true,
+            "body": "Closes #85\nPart of #84"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "issue": 84,
+          "pr": 532,
+          "state": "frozen",
+          "verdict": {
+            "pass": "frozen"
+          }
+        },
+        {
+          "issue": 85,
+          "pr": 532,
+          "state": "frozen",
+          "verdict": {
+            "pass": "frozen"
+          }
+        }
+      ]
+    },
+    {
+      "name": "phase PR, a claim on the epic (not loom:building): the child's item passes",
+      "inputs": {
+        "issues": [
+          {
+            "number": 86,
+            "labels": [
+              "loom:epic",
+              "loom:curating"
+            ]
+          },
+          {
+            "number": 87,
+            "labels": [
+              "loom:building"
+            ]
+          }
+        ],
+        "pulls": [
+          {
+            "number": 533,
+            "labels": [
+              "loom:review-requested"
+            ],
+            "same_repo": true,
+            "body": "Closes #87\nPart of #86"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "issue": 86,
+          "pr": 533,
+          "state": "claimed",
+          "verdict": {
+            "pass": "claimed"
+          }
+        },
+        {
+          "issue": 87,
+          "pr": 533,
+          "state": "claimed",
+          "verdict": {
+            "pass": "claimed"
+          }
+        }
+      ]
+    },
+    {
+      "name": "a zero-padded or signed branch name links no issue",
+      "inputs": {
+        "issues": [
+          {
+            "number": 88,
+            "labels": [
+              "loom:issue"
+            ]
+          }
+        ],
+        "pulls": [
+          {
+            "number": 534,
+            "labels": [
+              "loom:review-requested"
+            ],
+            "same_repo": true,
+            "body": "x",
+            "head_ref": "feature/issue-088"
+          },
+          {
+            "number": 535,
+            "labels": [
+              "loom:review-requested"
+            ],
+            "same_repo": true,
+            "body": "x",
+            "head_ref": "feature/issue-+88"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "issue": 88,
+          "pr": null,
+          "state": "ready",
+          "verdict": {
+            "step": "builder"
+          }
+        },
+        {
+          "issue": null,
+          "pr": 534,
+          "state": "review_requested",
+          "verdict": {
+            "step": "judge"
+          }
+        },
+        {
+          "issue": null,
+          "pr": 535,
+          "state": "review_requested",
+          "verdict": {
+            "step": "judge"
           }
         }
       ]
