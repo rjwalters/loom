@@ -816,7 +816,8 @@ impl SweepRegistry {
             SweepKind::Issue(issue) => Some(issue),
             // A cancelled step releases its claim per role (#11898).
             SweepKind::Step { item, role } => {
-                self.release_dead_step(sweep_id, *item, *role, started_at);
+                let end = super::step_spawn::capture::StepEnd::Cancelled;
+                self.release_dead_step(sweep_id, *item, *role, started_at, end);
                 None
             }
             SweepKind::PrSet(_) => None,
@@ -989,6 +990,8 @@ impl SweepRegistry {
         // crash-path SIGTERM (Issue #4980). Cheap early-return when nothing is
         // pending; never blocks (the grace is deadline-based, not slept).
         self.escalate_pending_group_reaps();
+        // #11906 (B3): a step past its role's timeout is killed and released.
+        changes += self.reap_step_timeouts();
 
         // Snapshot keys + pids first so we can borrow mutably below.
         // Capture started_at so we can compute durations for Exited events.

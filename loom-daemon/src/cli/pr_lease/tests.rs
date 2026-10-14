@@ -994,3 +994,8 @@ fn the_lib_role_lease_reader_agrees_with_parse_record() {
         );
     }
 }
+
+// ---- a daemon step's pre-taken lease (#11906) ---------------------------
+
+#[path = "step_claim_tests.rs"]
+mod step_claim;

@@ -145,10 +145,19 @@ impl StepRole {
         Some((role, item))
     }
 
-    /// The `/loom:<role> <item>` prompt a fresh step session starts with.
+    /// The prompt a fresh step session starts with: `/loom:<role> <item>`,
+    /// except Champion, whose targeted modes take a flag naming the item's
+    /// kind (`champion-targeted.md`): `--pr N` for a merge, `--issue N` for a
+    /// promotion. A bare `/loom:champion N` is refused there (#11906).
     #[must_use]
     pub fn prompt(self, item: u32) -> String {
-        format!("/loom:{} {item}", self.role_name())
+        match self {
+            StepRole::ChampionMerge => format!("/loom:champion --pr {item}"),
+            StepRole::ChampionPromote => format!("/loom:champion --issue {item}"),
+            StepRole::Curator | StepRole::Builder | StepRole::Judge | StepRole::Doctor => {
+                format!("/loom:{} {item}", self.role_name())
+            }
+        }
     }
 }
 
@@ -243,6 +252,8 @@ mod tests {
         assert!(!StepRole::ChampionPromote.acts_on_pr());
         assert!(StepRole::ChampionMerge.acts_on_pr());
         assert_eq!(StepRole::Judge.prompt(42), "/loom:judge 42");
+        assert_eq!(StepRole::ChampionMerge.prompt(42), "/loom:champion --pr 42");
+        assert_eq!(StepRole::ChampionPromote.prompt(7), "/loom:champion --issue 7");
     }
 }
 

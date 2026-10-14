@@ -19,6 +19,11 @@ runs, on what, and how the step ends.
 | `--non-item` | **Non-item pass**: every queue except curated issues and `loom:pr` PRs |
 | anything else, or two of the above | Refuse: print `Error: /loom:champion takes --pr N, --issue N or --non-item` and stop. Touch nothing |
 
+A Champion lease held by your own `$LOOM_SWEEP_ID` (a daemon step pre-takes
+it with `step=champion_merge` or `step=champion_promote`) is yours, never a
+concurrent claim, the same override `LEASE_ALREADY_HELD` has in `builder.md`:
+`--issue N` still adds `loom:evaluating` itself.
+
 `N` must be a positive integer. A targeted step **skips "Finding Work"** and the
 batch-wide passes (Pass 0b, 0c, the Held-PR Census and digest): those belong
 to `--non-item` and the batch pass. `loom:frozen` on the item: report it and

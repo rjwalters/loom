@@ -65,6 +65,16 @@ Why each gate sits where it does:
   The never-overridable tokens (`TARGET_IS_PR`, `CLOSED`, `FROZEN`,
   `OPERATOR`, `OPEN_PR`) refuse whoever claimed. A step engine that pre-claims a Builder
   step must export the same `LOOM_SWEEP_CLAIM_OWNED=<N>`, or not pre-claim.
+- **The step engine pre-takes only the lease for every other role (#11906).**
+  Judge, Doctor, Curator and Champion read a fresh claim label as another
+  agent's, so for their steps the daemon takes the role-keyed lease alone
+  (`lease pr claim --role <role> --step <step>`, under the step's sweep id)
+  and the prompt applies its own label. The session's `lease pr claim`
+  (no `--step`) resolves the same sweep id (`LOOM_TERMINAL_ID`), and a lease
+  is owned by role, host and sweep (the step is metadata), so it re-attaches
+  to that lease (exit 0) rather than standing down. A
+  lease held by `$LOOM_SWEEP_ID` is the session's own: each prompt says so
+  beside its claim, the same override `LEASE_ALREADY_HELD` has for Builder.
 - **An operator's explicit word overrides a claim, never a category.** An
   attended `/loom:builder <N>` told to resume or force a claim (the
   operator's own crashed run, say) passes `BUILDING` / `LEASE_ALREADY_HELD` /
@@ -173,8 +183,10 @@ without a sweep around it gets neither unless the engine does both.
   `/loom:curator <N>` still claims by label, with `claim-staleness.sh` and
   `stale_after_minutes` (`loom:curating`, 30) as the liveness, until its
   prompt is taught the lease.
-- **The classifier itself.** Nothing reads `LOOM_STEP_OUTCOME` or the
-  post-state table yet. The step-outcome ledger implements them.
+- **The classifier itself.** The step spawn (#11906) reads a step's last
+  `LOOM_STEP_OUTCOME` line from its log into its end record and role-tick
+  capture; nothing applies the post-state table yet. The step-outcome ledger
+  implements it.
 - **Doctor** was out of this audit's scope (it was already targeted). Its PR
   Fix Mode has no kind probe: it should take gate 2 of the Judge row.
 - **The Judge lane assigner** hands fallback rows to `/loom:judge <PR>`. The
