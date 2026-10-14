@@ -2700,9 +2700,10 @@ exit 0
             5,
             "expected the flip (1 call) + restore (#11480's one issue-signals read for the \
              shared veto and #9463's closed state — the fake `gh` prints nothing, so it fails \
-             open — Issue #4653's `is_pr` probe's `resolve_owner_repo` lookup, which bails \
-             before a second `gh api` call, Issue #10955's label-history read, then the \
-             edit — 4 calls) to invoke gh five times total; got cwds: {cwds:?}"
+             open, and #11852's open-PR probe is skipped for an unverified state — Issue \
+             #4653's `is_pr` `resolve_owner_repo` lookup, which bails, Issue #10955's \
+             label-history read, then the edit — 4 calls) to invoke gh 5 times; got cwds: \
+             {cwds:?}"
         );
         for cwd in &cwds {
             let got = std::fs::canonicalize(cwd).unwrap();

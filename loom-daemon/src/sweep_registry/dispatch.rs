@@ -2359,9 +2359,13 @@ impl SweepRegistry {
             //     arrived yet): a host that proceeded past 2.95 still gets
             //     caught — and logged — here when the collision is confirmed
             //     against the forge's own label state.
-            if let Some(CollisionClass::Collision { labels }) =
-                self.detect_and_record_collision(issue_number)
-            {
+            //     Not for a crash resume (#11852): the `loom:building` it sees
+            //     is the crashed sweep's own, kept while its PR is open.
+            let collision = resume_bypass_pr
+                .is_none()
+                .then(|| self.detect_and_record_collision(issue_number))
+                .flatten();
+            if let Some(CollisionClass::Collision { labels }) = collision {
                 log::warn!(
                     "sweep_registry: BACKING OFF dispatch of issue #{issue_number} — the \
                      pre-flip forge-label read confirmed another host already claimed it \
@@ -2405,6 +2409,17 @@ impl SweepRegistry {
                     //     from a lane that published no lease record — which
                     //     `yield_identity` reports through this same channel.
                     let decision = self.resolve_lease_order(issue_number, &sweep_id, episode_start);
+                    // #11852: a crash resume re-claims the issue's own
+                    // `loom:building`, kept while its PR is open — not a
+                    // foreign leaseless claim. Lease-comment order still counts.
+                    let decision = match decision {
+                        LeaseOrderDecision::YieldToLeaselessClaim { .. }
+                            if resume_bypass_pr.is_some() =>
+                        {
+                            LeaseOrderDecision::Proceed
+                        }
+                        other => other,
+                    };
                     if matches!(decision, LeaseOrderDecision::YieldToLeaselessClaim { .. }) {
                         leaseless_flip_window = Some((episode_start, Utc::now()));
                     }
