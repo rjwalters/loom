@@ -34,11 +34,12 @@ use crate::forge_listing::RestIssue;
 use crate::role_runner::RoleTickOutcome;
 use crate::telemetry::kinds::pick_decision::{
     source, split_into_chunks, PickAction, PickCandidate, PickDecisionRecord, PickDraw,
-    PickDrawCandidate, PickSkipReason, PickSortKey, PickTick, PickVerdict, PickViDemotion,
-    PickWorkspaceDraw, CHUNK_BYTES, WORK_FINDER_ROLE,
+    PickDrawCandidate, PickQueueSkip, PickSkipReason, PickSortKey, PickTick, PickVerdict,
+    PickViDemotion, PickWorkspaceDraw, CHUNK_BYTES, WORK_FINDER_ROLE,
 };
 use crate::telemetry::{RoleTickResult, TelemetryRecord};
 use crate::types::{QueueDisposition, WorkFinderTickSummary};
+use crate::work_finder::halt_cause::HaltCause;
 use crate::work_finder::vi_cap::ViDemotion;
 use crate::work_finder::workspace_draw::{self, DrawLog};
 
@@ -125,6 +126,22 @@ fn exporting() -> bool {
     super::ops::global_ops_sink().is_some()
 }
 
+/// The part of a ready-queue row's `detail` a record may carry: a
+/// file-overlap deferral's shared paths (#9781, daemon-templated from parsed
+/// paths) and a halted row's cause token, only when it is in the closed
+/// [`HaltCause`] vocabulary (#11811). Every other detail (e.g. free-form
+/// dispatch-error text) is dropped.
+fn exportable_detail(disposition: QueueDisposition, detail: Option<&str>) -> Option<String> {
+    let detail = detail?;
+    match disposition {
+        QueueDisposition::DeferredFileOverlap => Some(detail.to_string()),
+        QueueDisposition::WorkspaceHalted => {
+            HaltCause::from_wire(detail).map(|c| c.as_str().to_string())
+        }
+        _ => None,
+    }
+}
+
 /// The work finder's decision for one completed tick, from its published
 /// summary. `resolve` maps a row's repo (a workspace root path or a
 /// `workspace #N` placeholder) to the `repo` the record carries.
@@ -160,17 +177,16 @@ pub fn work_finder_record(
                     value,
                 }),
             };
-            let verdict = match (PickSkipReason::from_disposition(row.disposition), &row.detail) {
-                (None, _) => PickVerdict::Acted("dispatched"),
-                // #9781: a file-overlap deferral names the shared paths. Only
-                // this disposition's detail is carried: it is daemon-templated
-                // from parsed paths, unlike free-form dispatch-error text.
-                (Some(reason), Some(detail))
-                    if row.disposition == QueueDisposition::DeferredFileOverlap =>
-                {
-                    PickVerdict::SkippedWithDetail(reason, detail.clone())
-                }
-                (Some(reason), _) => PickVerdict::Skipped(reason),
+            let verdict = match PickSkipReason::from_disposition(row.disposition) {
+                None => PickVerdict::Acted("dispatched"),
+                // #11811: the un-collapsed disposition and hold expiry ride
+                // beside the closed-set reason.
+                Some(reason) => PickVerdict::SkippedQueue(PickQueueSkip {
+                    reason,
+                    disposition: row.disposition,
+                    detail: exportable_detail(row.disposition, row.detail.as_deref()),
+                    held_until: row.plan.held_until,
+                }),
             };
             (candidate, verdict)
         })
