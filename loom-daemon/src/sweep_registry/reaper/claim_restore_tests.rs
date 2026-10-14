@@ -765,3 +765,64 @@ fn cancel_prset_does_not_restore_label() {
              got gh invocations: {gh_calls:?}"
     );
 }
+
+/// Issue #11852 (veto enabled): a sweep that opened its PR and then died holding a
+/// checkpoint gets its stale `loom:building` claim removed, but NOT
+/// `loom:issue` re-added — the open PR is the review lane's, and a queue label
+/// beside it is one every dispatch tick must refuse. The crash resume (#4256)
+/// still runs: its dispatch re-claims with `loom:building` and never needed
+/// `loom:issue` (#7873's `NotYetApproved` pre-flip verdict proceeds).
+#[test]
+#[serial]
+fn reap_with_checkpoint_and_open_pr_does_not_requeue_but_still_resumes() {
+    let _veto = crate::sweep_registry::restore_to_ready::open_pr_veto::VetoEnabled::new();
+    let tmp = tempdir().unwrap();
+    let ws = tmp.path();
+    std::env::set_var("LOOM_REPO", "rjwalters/loom");
+    let (mut reg, gh_log) = open_pr_guard_registry(ws, "11853", 0, false);
+
+    write_checkpoint(&reg, 11852, "builder-done");
+    insert_dead_running_entry(&mut reg, 11852, "sweep-issue-11852-crashed");
+
+    let changed = reg.reap_once();
+    assert!(changed >= 1);
+
+    let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+    assert!(
+        calls.contains("issue edit 11852 --remove-label loom:building"),
+        "the dead sweep's claim is still released; got: {calls:?}"
+    );
+    assert!(
+        !calls.contains("--add-label loom:issue"),
+        "an issue whose sweep opened a PR must not go back to the queue (#11852); got: {calls:?}"
+    );
+    let resumed = running_issue_sweep_id(&reg, 11852);
+    assert!(resumed.is_some(), "the crash resume still dispatches without `loom:issue`");
+    assert_ne!(resumed.unwrap(), "sweep-issue-11852-crashed");
+    std::env::remove_var("LOOM_REPO");
+}
+
+/// The guard on #11852: the same crash with no open PR (pre-PR phase, empty
+/// closes-graph) still restores `loom:issue`, as before.
+#[test]
+#[serial]
+fn reap_with_checkpoint_and_no_open_pr_still_requeues() {
+    let _veto = crate::sweep_registry::restore_to_ready::open_pr_veto::VetoEnabled::new();
+    let tmp = tempdir().unwrap();
+    let ws = tmp.path();
+    std::env::set_var("LOOM_REPO", "rjwalters/loom");
+    let (mut reg, gh_log) = open_pr_guard_registry(ws, "", 0, false);
+
+    write_checkpoint(&reg, 11857, "builder");
+    insert_dead_running_entry(&mut reg, 11857, "sweep-issue-11857-crashed");
+
+    let changed = reg.reap_once();
+    assert!(changed >= 1);
+
+    let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+    assert!(
+        calls.contains("issue edit 11857 --remove-label loom:building --add-label loom:issue"),
+        "a crash with no open PR is re-queued as before; got: {calls:?}"
+    );
+    std::env::remove_var("LOOM_REPO");
+}

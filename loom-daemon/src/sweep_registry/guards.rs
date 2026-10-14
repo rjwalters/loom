@@ -2656,7 +2656,10 @@ exit 0
     /// global cwd would race). The `current_dir` fix makes the recorded cwd
     /// equal to `workspace_root` regardless of where the process itself sits,
     /// which is exactly the invariant under test.
+    // Serial: a concurrent test that sets `LOOM_REPO` would let the repo
+    // lookups resolve and change the call count.
     #[test]
+    #[serial_test::serial]
     fn label_flips_run_in_registry_workspace_root() {
         // `recorder` stands in for the daemon process's cwd repo; the flips
         // must NOT resolve here. `registry_root` is the non-default workspace.
