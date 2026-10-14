@@ -251,7 +251,10 @@ pub fn work_finder_record(
         .collect();
     let outcome = if summary.dispatched > 0 {
         "dispatched"
-    } else if summary.halted {
+    } else if summary.halted_fully() {
+        // #11857: a partial hold (one held root among healthy ones with
+        // candidates) is not a halt; the outcome follows the rows, as the
+        // `loom.dispatch.tick` result does.
         "halted"
     } else if summary.queue.is_empty() {
         "idle"
